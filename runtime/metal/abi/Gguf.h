@@ -37,6 +37,23 @@
 // Apple9 register tile: four simdgroups of GGUF_REGISTER_COLUMNS columns.
 #define GGUF_REGISTER_COLUMNS 16u
 #define GGUF_REGISTER_THREADS (GGUF_TILE_COLUMNS / GGUF_REGISTER_COLUMNS * 32u)
+// Column tile (kernels/common/gguf_column_tile.h): a GEMV of at most
+// GGUF_COLUMN_ROWS live rows in registers, which the MoE expert tiles run for
+// an expert's only tile of that many rows and ops::Linear for a decode step of
+// that many live rows (kernels/decode/linear_gguf_column.metal):
+// GGUF_COLUMN_SPLITS simdgroups of 32 columns, one a lane, each summing its
+// part of K.
+#define GGUF_COLUMN_ROWS 2u
+#define GGUF_COLUMN_SPLITS 8u
+#define GGUF_COLUMN_THREADS (GGUF_COLUMN_SPLITS * 32u)
+struct GgufColumnParams {
+  uint32_t rows;        // live rows, 1 to GGUF_COLUMN_ROWS
+  uint32_t input_size;  // K
+  uint32_t out_stride;  // columns of a destination row
+  uint32_t out_offset;  // first destination column of the tensor
+  uint32_t format;      // the tensor's GGUF_FMT_*, a one-pass gate/up's both tensors'
+};
+static_assert(sizeof(GgufColumnParams) == 20, "GGUF column parameters are 20 bytes on both sides");
 
 // The register tile's activations, Table16 (kernels/common/gguf_sgmatrix.h):
 // per eight-row tile of `width` inputs, the X^T table of width * 8 bfloat,

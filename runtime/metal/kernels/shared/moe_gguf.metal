@@ -64,10 +64,10 @@ template [[host_name("moe_expert_gguf_m32_down_s2")]] kernel MoeExpertGgufKernel
 __attribute__((noinline)) void moe_gate_up_column(device bfloat *x, uint rows, uint K, uint N, MoeGgufSegment s,
                                                   uint origin, uint simd_lane, threadgroup half2 *table, bool up,
                                                   threadgroup bfloat *gate, device bfloat *output, ulong out) {
-  float sums[MOE_GGUF_COLUMN_ROWS];
+  float sums[GGUF_COLUMN_ROWS];
   moe_formats<4>()(s.format, [&](auto f) {
-    column_dot<decltype(f), MOE_GGUF_COLUMN_ROWS>(x, rows, K, s.w0, s.w1, s.meta, origin + simd_lane, 0, K / 32, table,
-                                                  sums);
+    column_dot<decltype(f), GGUF_COLUMN_ROWS>(x, rows, K, s.w0, s.w1, s.meta, origin + simd_lane, 0, K / 32, table,
+                                              sums);
   });
   if (!up)
     for (uint row = 0; row < rows; ++row) gate[row * GGUF_STAGED_COLUMNS + simd_lane] = bfloat(sums[row]);

@@ -1,6 +1,6 @@
 // GGUF projections: plan validation and dispatch (kernels/shared/gguf_linear.metal,
-// kernels/prefill/gguf_prefill_int8.metal, kernels/decode/linear_gguf_sgmatrix.metal);
-// KernelSelection.cpp picks the plans.
+// kernels/prefill/gguf_prefill_int8.metal, kernels/decode/linear_gguf_sgmatrix.metal,
+// kernels/decode/linear_gguf_column.metal); KernelSelection.cpp picks the plans.
 #include "Linear.hpp"
 
 #include "metal/abi/ExecutionGeometry.h"
@@ -129,14 +129,23 @@ void LinearPlan::requireConfiguration() const {
   const bool decode = workload_.phase == LinearPhase::Decode;
   if (c.spread && c.tile != LinearTile::GgufStaged)
     throw std::invalid_argument("only the staged block tile spreads its walks");
-  if (c.oneGateUpPass && (c.tile != LinearTile::GgufStaged || !decode || workload_.epilogue != LinearEpilogue::GateUp))
-    throw std::invalid_argument("only a staged block gate/up decode runs gate and up in one pass");
+  if (c.oneGateUpPass && ((c.tile != LinearTile::GgufStaged && c.tile != LinearTile::GgufColumn) || !decode ||
+                          workload_.epilogue != LinearEpilogue::GateUp))
+    throw std::invalid_argument("only a staged or column block gate/up decode runs gate and up in one pass");
   if (c.sixteenRows && (c.tile != LinearTile::GgufStaged || !decode || workload_.rows != SPLASH_TARGET_VERIFY_ROWS))
     throw std::invalid_argument("only a staged one-lane block decode runs the 16-row tile");
   if (c.decodeInt8 &&
       (c.tile != LinearTile::GgufStaged || !decode || !decodeInt8TakesSplits(k, c.splits) || storageRows() < 16))
     throw std::invalid_argument("only a staged block decode of 16 or 32 rows and whole PQ2_0 blocks per split runs "
                                 "int8 activations");
+  if (c.tile == LinearTile::GgufColumn) {
+    // The column tile reads the live rows alone, a gate/up pair's both
+    // tensors in one pass, and splits K inside its threadgroup alone.
+    if (!decode || !workload_.liveRows || workload_.liveRows > GGUF_COLUMN_ROWS || c.splits != 1 ||
+        c.oneGateUpPass != (workload_.epilogue == LinearEpilogue::GateUp))
+      throw std::invalid_argument("the column block decode tile takes up to GGUF_COLUMN_ROWS live rows, unsplit");
+    return;
+  }
   if (c.tile == LinearTile::GgufRegister) {
     // Split boundaries fall on coefficient units, of 64 inputs at the fewest
     // (quant_register_unit); addGgufRegister checks each segment's.
@@ -157,7 +166,7 @@ void LinearPlan::requireConfiguration() const {
 }
 
 uint32_t LinearPlan::storageRows() const noexcept {
-  if (config_.tile == LinearTile::GgufRegister) return workload_.rows;
+  if (config_.tile == LinearTile::GgufRegister || config_.tile == LinearTile::GgufColumn) return workload_.rows;
   if (config_.tile == LinearTile::GgufPrefill || config_.tile == LinearTile::GgufPrefillInt8)
     return (workload_.rows + GGUF_PREFILL_ROWS - 1) / GGUF_PREFILL_ROWS * GGUF_PREFILL_ROWS;
   return stagedStorageRows(workload_.rows, config_.sixteenRows);
@@ -165,6 +174,8 @@ uint32_t LinearPlan::storageRows() const noexcept {
 
 LinearScratchSize LinearPlan::scratchSize() const noexcept {
   const auto [n, k] = workload_.matrix;
+  // The column tile sums K's parts in its threadgroup alone.
+  if (config_.tile == LinearTile::GgufColumn) return {};
   // Register tile: the Table16 table and sums, and split, [lane][split][row]
   // [column] partials and one counter per 64-column tile, which covers every
   // lane.
@@ -260,6 +271,7 @@ void Linear::addGguf(metal::CommandGraph &graph, const LinearBuffers &b,
   case LinearTile::GgufStaged: addGgufStaged(graph, b, p, plan, gate); break;
   case LinearTile::GgufPrefill: addGgufPrefill(graph, b, p, plan); break;
   case LinearTile::GgufPrefillInt8: addGgufPrefillInt8(graph, b, p, plan); break;
+  case LinearTile::GgufColumn: addGgufColumn(graph, b, p, plan, gate); break;
   }
 }
 
@@ -493,6 +505,31 @@ void Linear::addGgufRegister(metal::CommandGraph &graph, const LinearBuffers &b,
               GgufDecodeParams{k, config.splits, n, s.columnOffset, 0}, grid, {GGUF_REGISTER_THREADS, 1, 1});
   };
   addDecodeTensor(b, w.epilogue, segments.front(), gate, tensor);
+}
+
+// One dispatch per tensor, a gate/up pair's both in one (onePassTensors), each
+// threadgroup 32 of the tensor's columns over the live rows.
+void Linear::addGgufColumn(metal::CommandGraph &graph, const LinearBuffers &b, const Projection &p,
+                           const LinearPlan &plan, const Projection *gate) const {
+  const LinearWorkload w = plan.workload();
+  const auto add = [&](std::string name, std::vector<metal::MetalBuffer> bindings, const QuantizedSegment &s) {
+    graph.add(std::move(name), std::move(bindings),
+              GgufColumnParams{w.liveRows, w.matrix.inputSize, w.matrix.outputSize, s.columnOffset, s.formatId},
+              {s.outputSize / 32, 1, 1}, {GGUF_COLUMN_THREADS, 1, 1});
+  };
+  if (gate) {
+    const auto [g, u] = onePassTensors(p, *gate);
+    add("gguf_column_gate_up", {b.input, g.plane0, g.plane1Slot(), g.meta, b.output, u.plane0, u.plane1Slot(), u.meta},
+        u);
+    return;
+  }
+  for (const QuantizedSegment &s : p.blocks().segments) {
+    if (w.epilogue == LinearEpilogue::Residual) {
+      add("gguf_column_r", {b.input, s.plane0, s.plane1Slot(), s.meta, b.output, b.residual}, s);
+      continue;
+    }
+    add(kernelInstance("gguf_column_a", plan.destination()), {b.input, s.plane0, s.plane1Slot(), s.meta, b.output}, s);
+  }
 }
 
 // Float segments of a projection (QuantizedSegment::isFloat): a float projection

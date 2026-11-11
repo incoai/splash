@@ -20,6 +20,8 @@ namespace {
 void validate(LinearWorkload w) {
   if (!w.matrix.outputSize || w.matrix.outputSize % 64 || !w.matrix.inputSize || w.matrix.inputSize % 64)
     throw std::invalid_argument("invalid linear matrix");
+  if (w.liveRows > w.rows || (w.phase == LinearPhase::Prefill && w.liveRows))
+    throw std::invalid_argument("a decode workload's live rows are some of its rows");
   if (w.phase == LinearPhase::Prefill) {
     if (!w.rows || w.rows > SPLASH_PREFILL_TOKEN_BUDGET ||
         w.epilogue == LinearEpilogue::GateUp)
@@ -32,10 +34,10 @@ void validate(LinearWorkload w) {
   }
 }
 
-LinearWorkload decode(LinearMatrix matrix, uint32_t lanes, LinearEpilogue epilogue) {
+LinearWorkload decode(LinearMatrix matrix, uint32_t lanes, LinearEpilogue epilogue, uint32_t liveRows = 0) {
   if (!lanes || lanes > SPLASH_MAXIMUM_BATCH_WIDTH)
     throw std::invalid_argument("invalid linear decode batch width");
-  return {matrix, lanes * SPLASH_TARGET_VERIFY_ROWS, LinearPhase::Decode, epilogue};
+  return {matrix, lanes * SPLASH_TARGET_VERIFY_ROWS, LinearPhase::Decode, epilogue, liveRows};
 }
 
 // LinearScratch::rotated bytes of `rows` bf16 rows of `width` inputs, which
@@ -182,8 +184,8 @@ LinearPlan Linear::plan(LinearWorkload w, const Projection &p, const Projection 
 }
 
 LinearPlan Linear::decodePlan(const Projection &p, uint32_t lanes, LinearEpilogue epilogue,
-                              const Projection *gate) const {
-  return plan(decode({p.outputSize, p.inputSize}, lanes, epilogue), p, gate);
+                              const Projection *gate, uint32_t liveRows) const {
+  return plan(decode({p.outputSize, p.inputSize}, lanes, epilogue, liveRows), p, gate);
 }
 LinearPlan Linear::prefillPlan(const Projection &p, uint32_t rows, LinearEpilogue epilogue,
                                uint32_t chunkRows) const {

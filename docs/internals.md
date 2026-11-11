@@ -508,6 +508,19 @@ The rules:
    runs a staged plan of at least `decodeInt8FromRows` rows (16 on Apple10 and
    Apple11, one lane's 16-row plan among them; never on Apple9) whose K splits
    keep whole PQ2_0 blocks on those tiles, at the plan's splits and passes.
+   A decode step names how many of its leading rows are live
+   (`LinearWorkload::liveRows`, any number up to its rows; 0 for all of them),
+   and the plan picks the tile by them: a step of at most `GGUF_COLUMN_ROWS`
+   (2) live rows runs the column tile on every device
+   (`kernels/decode/linear_gguf_column.metal`): each lane one column of a GEMV
+   in registers over the live rows alone (the MoE expert tiles' column tile,
+   `kernels/common/gguf_column_tile.h`), eight simdgroups of a threadgroup
+   splitting K and adding their parts in order, a gate/up pair of one format
+   in one pass. A step of more live rows, or a gate/up pair of two formats,
+   plans as a step of all its rows. On the M5 Max a [2048 x 6144] af4g64
+   projection at one live row takes 18.4 us on the column tile and 28 us on
+   the staged tile. The language models name no live rows today, every lane
+   verifying its draft's eight rows, so none of their plans changes.
 3. *Float projection.* The accelerator tile runs where the device has one,
    from `minimumRows` rows and a grid of its tiles of at least half the class's
    half tiles per core for BF16 values, F32 values or a quantized format's rows.
@@ -808,7 +821,7 @@ block's the expert store's floor and elastic chunks of its size (`model/ExpertCh
 [Streamed experts](server.md#streamed-experts)). The staged tile runs gate and up in one pass, a
 gate and an up simdgroup on the same columns, bitwise the two passes' intermediate; the simdgroups
 share one pair table where gate and up share their routed and their shared formats.
-An expert's only tile of at most `MOE_GGUF_COLUMN_ROWS` live rows runs on the column tile
+An expert's only tile of at most `GGUF_COLUMN_ROWS` live rows runs on the column tile
 (`kernels/common/gguf_column_tile.h`) rather than the staged one, and the two sum a row's
 products in different orders: a route's output depends on how many rows the step routes to its
 expert, so decode results of GGUF MoE targets, the 35B's included, are not invariant to the
@@ -927,8 +940,9 @@ format's up and the prefill tiles, each output inside the fp64 bound of
 `GgufFormatReference.hpp`, the one-pass gate/up bitwise against the two passes at the same K
 split, one lane on the staged 16-row tile bitwise against the 8-row tile, and, where the device
 row takes int8 activations, rotated PQ2_0 on the int8 tiles within the fp32 rounding of the exact
-products of their codes, lanes and pass modes bitwise, and a non-finite input's row alone not
-finite; and
+products of their codes, lanes and pass modes bitwise, a non-finite input's row alone not
+finite, and a step of one or two live rows on the column tile in every format and in fused
+triples within the bound, its rows past the live ones unread and unwritten; and
 `gguf-moe`: the float projections on both float tiles and the MoE layer on every GGUF
 plan, the staged 8- and 32-row tiles, in every format as each routed and shared expert tensor,
 against fp64, bitwise against the full grids and two gate/up passes, and with the experts in

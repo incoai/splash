@@ -85,7 +85,11 @@ enum class LinearEpilogue : uint8_t { None, Residual, GateUp, UpWithGate };
 // 64-input group into the scratch table, against the weights' exact codes
 // (kernels/prefill/gguf_prefill_int8.metal); not exact, unsplit, the prefill
 // tile's storage rows.
-enum class LinearTile : uint8_t { GgufStaged, GgufPrefill, GgufRegister, GgufPrefillInt8 };
+// GgufColumn: a decode step of at most GGUF_COLUMN_ROWS live rows
+// (LinearWorkload::liveRows) as a GEMV in registers, each lane one column,
+// reading the live rows alone (kernels/decode/linear_gguf_column.metal);
+// unsplit across threadgroups, a gate/up pair of one format in one pass.
+enum class LinearTile : uint8_t { GgufStaged, GgufPrefill, GgufRegister, GgufPrefillInt8, GgufColumn };
 // The decode tiles hold at most a full decode batch.
 inline constexpr uint32_t kMaximumDecodeTileRows = SPLASH_MAXIMUM_BATCH_WIDTH * SPLASH_TARGET_VERIFY_ROWS;
 // The staged tile's tallest height, which holds prefill chunks of up to this
@@ -110,6 +114,12 @@ struct LinearWorkload final {
   uint32_t rows = 0;
   LinearPhase phase = LinearPhase::Decode;
   LinearEpilogue epilogue = LinearEpilogue::None;
+  // Decode: how many of the step's leading rows are live, any number up to its
+  // rows (0: all of them); the plan picks its tile by them (selectProjection).
+  // The others carry whatever the buffers hold and are never read back, so a
+  // plan of at most GGUF_COLUMN_ROWS live rows (GgufColumn) neither reads nor
+  // writes them; the other tiles compute every row of their lanes.
+  uint32_t liveRows = 0;
   auto operator<=>(const LinearWorkload &) const = default;
 };
 
@@ -125,7 +135,8 @@ struct LinearConfig final {
   bool spread = false;
   // GgufStaged gate/up decode: gate and up in one dispatch whose simdgroups
   // each stage both tensors' 32 columns (gguf_decode_<format>_m<rows>_gate_up,
-  // gate and up in one format), instead of a gate pass and an up pass.
+  // gate and up in one format), instead of a gate pass and an up pass; a
+  // GgufColumn gate/up always.
   bool oneGateUpPass = false;
   // GgufStaged one-lane decode: the 16-row tile over two lanes of storage
   // (LinearPlan::storageRows), whose padding lane's rows it computes and
@@ -280,9 +291,11 @@ public:
   // does.
   [[nodiscard]] LinearPlan prefillPlan(const Projection &projection, uint32_t rows,
                                        LinearEpilogue epilogue, uint32_t chunkRows = 0) const;
+  // The lanes' leading `liveRows` rows are live (LinearWorkload::liveRows;
+  // 0: all of them).
   [[nodiscard]] LinearPlan decodePlan(const Projection &projection, uint32_t lanes,
                                       LinearEpilogue epilogue = LinearEpilogue::None,
-                                      const Projection *gate = nullptr) const;
+                                      const Projection *gate = nullptr, uint32_t liveRows = 0) const;
   // The scratch of every decode plan of a projection of `shape`: each lane
   // count, the None, Residual and GateUp epilogues and every tile the device
   // may run them on, and the rotated rows of a full decode batch.
@@ -344,6 +357,8 @@ private:
   void addGgufRegister(metal::CommandGraph &graph, const LinearBuffers &buffers,
                        const Projection &projection, const LinearPlan &plan,
                        const Projection *gate) const;
+  void addGgufColumn(metal::CommandGraph &graph, const LinearBuffers &buffers, const Projection &projection,
+                     const LinearPlan &plan, const Projection *gate) const;
   void addGgufFloatSegments(metal::CommandGraph &graph, const LinearBuffers &buffers,
                             const Projection &projection, const LinearPlan &plan) const;
   KernelCalibration calibration_;

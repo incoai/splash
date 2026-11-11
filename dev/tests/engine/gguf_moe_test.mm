@@ -23,7 +23,7 @@
 //   pass inside the fp64 interval its numerics allow, the block's output, a
 //   row's output bitwise equal at every lane count and chunk of one tile where
 //   its routes run the same tile kinds (the staged expert passes run an
-//   expert's only tile of at most MOE_GGUF_COLUMN_ROWS live rows on the column
+//   expert's only tile of at most GGUF_COLUMN_ROWS live rows on the column
 //   tile; the rows so compared are counted) and at every repeat of a run (a
 //   set's first plan also on fresh scratch, where every row must compare), the
 //   output of the live tiles' grids bitwise that of every tile's with the gate

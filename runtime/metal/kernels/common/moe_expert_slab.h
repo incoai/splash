@@ -15,10 +15,10 @@ inline uint moe_matmul_rows(uint rows, uint tile_rows) {
   return min(tile_rows, rows <= 8 ? 8u : rows <= 16 ? 16u : tile_rows);
 }
 // The staged expert passes run an expert's only tile of at most
-// MOE_GGUF_COLUMN_ROWS live rows on the column tile (moe_column_tile in
+// GGUF_COLUMN_ROWS live rows on the column tile (moe_column_tile in
 // abi/MoE.h). The two tiles sum a row's products in different orders, so a
 // route's output depends on how many rows the step routes to its expert, up to
-// MOE_GGUF_COLUMN_ROWS on the column tile and more on the staged tile: decode
+// GGUF_COLUMN_ROWS on the column tile and more on the staged tile: decode
 // results of GGUF MoE models on the staged tile are not batch-invariant, since
 // a row's experts see the other rows of its step (its lane's draft rows and the
 // other lanes'). The grouping's atomics order an expert's routes over its

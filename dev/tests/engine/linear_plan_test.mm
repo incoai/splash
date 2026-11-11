@@ -839,7 +839,8 @@ void ggufPlans() {
       [&] {
         (void)Linear::plan(down, {.tile = LinearTile::GgufStaged, .oneGateUpPass = true}, FloatOutput::BFloat16);
       },
-      "only a staged block gate/up decode runs gate and up in one pass", "a residual plan ran gate/up in one pass");
+      "only a staged or column block gate/up decode runs gate and up in one pass",
+      "a residual plan ran gate/up in one pass");
   // The 16-row tile holds one lane's decode rows on the staged tile only.
   for (const auto &[w, config] :
        {std::pair{down, LinearConfig{.tile = LinearTile::GgufRegister, .sixteenRows = true}},
@@ -865,6 +866,63 @@ void ggufPlans() {
             "int8 activations took another tile, rows, phase or a split of a PQ2_0 block");
   rejects([&] { (void)Linear::plan(chunk, {.tile = LinearTile::GgufPrefill, .spread = true}, FloatOutput::BFloat16); },
           "only the staged block tile spreads its walks", "the prefill tile spread its walks");
+}
+
+// A decode step of one or two live rows runs the column tile on every device and format, unsplit, without scratch,
+// at the rows of its lanes, a gate/up pair of one format in one pass and one of two formats as more rows run it; a
+// step of more live rows, or of all rows, as before. The column tile takes no prefill chunk, no split and no more
+// live rows.
+void columnPlans() {
+  for (const auto [family, cores] : {std::pair{9U, 10U}, {10U, 32U}, {11U, 12U}})
+    for (uint32_t format = 0; format < GGUF_FMT_COUNT; ++format)
+      for (const uint32_t k : {2048U, 4096U}) {
+        if (k % quant_column_unit(kQuantFormats[format].block_elements)) continue;
+        const Linear linear = gpu(family, cores);
+        const Projection up = blockProjection(4096, k, 1, format), gate = blockProjection(4096, k, 1, format);
+        const uint32_t other = format == GGUF_FMT_Q4K ? GGUF_FMT_Q80 : GGUF_FMT_Q4K;
+        const Projection mixed = blockProjection(4096, k, 1, other);
+        for (uint32_t lanes = 1; lanes <= SPLASH_MAXIMUM_BATCH_WIDTH; ++lanes)
+          for (const LinearEpilogue e : {LinearEpilogue::None, LinearEpilogue::Residual, LinearEpilogue::GateUp})
+            for (uint32_t live = 1; live <= lanes * SPLASH_TARGET_VERIFY_ROWS; ++live) {
+              const bool gateUp = e == LinearEpilogue::GateUp;
+              const LinearWorkload w{{4096, k}, lanes * SPLASH_TARGET_VERIFY_ROWS, LinearPhase::Decode, e, live};
+              const LinearPlan plan = linear.plan(w, up, gateUp ? &gate : nullptr);
+              const LinearConfig c = plan.configuration();
+              const bool column = live <= GGUF_COLUMN_ROWS;
+              const LinearWorkload all{w.matrix, w.rows, w.phase, e};
+              if (!column) {
+                require(c == linear.plan(all, up, gateUp ? &gate : nullptr).configuration(),
+                        "a step of more live rows plans as one of all its rows");
+                continue;
+              }
+              require(c.tile == LinearTile::GgufColumn && c.splits == 1 && c.oneGateUpPass == gateUp,
+                      "a step of one or two live rows runs the column tile");
+              require(plan.storageRows() == w.rows && sameScratch(plan.scratchSize(), {}) &&
+                          plan.gateScratchBytes() == 0 && plan.input() == LinearInput::Plain,
+                      "the column tile stores its lanes' rows and takes no scratch");
+              if (gateUp)
+                require(linear.plan(w, up, &mixed).configuration() ==
+                            linear.plan(all, up, &mixed).configuration(),
+                        "a gate/up pair of two formats plans as a step of all its rows");
+            }
+      }
+  const LinearWorkload one{{4096, 2048}, 8, LinearPhase::Decode, LinearEpilogue::None, 1};
+  for (const auto &[w, config, rule] :
+       {std::tuple{LinearWorkload{{4096, 2048}, 8, LinearPhase::Prefill, LinearEpilogue::None},
+                   LinearConfig{.tile = LinearTile::GgufColumn}, "a prefill chunk"},
+        {LinearWorkload{{4096, 2048}, 8, LinearPhase::Decode, LinearEpilogue::None},
+         LinearConfig{.tile = LinearTile::GgufColumn}, "a step of all its rows"},
+        {LinearWorkload{{4096, 2048}, 8, LinearPhase::Decode, LinearEpilogue::None, GGUF_COLUMN_ROWS + 1},
+         LinearConfig{.tile = LinearTile::GgufColumn}, "more live rows"},
+        {one, LinearConfig{.tile = LinearTile::GgufColumn, .splits = 2}, "a split"}})
+    rejects([&] { (void)Linear::plan(w, config, FloatOutput::BFloat16); },
+            "the column block decode tile takes up to GGUF_COLUMN_ROWS live rows, unsplit",
+            std::string("the column tile ran ") + rule);
+  rejects([&] { (void)gpu(10, 32).plan({{4096, 2048}, 8, LinearPhase::Prefill, LinearEpilogue::None, 1}); },
+          "a decode workload's live rows are some of its rows", "a prefill chunk named live rows");
+  rejects([&] { (void)gpu(10, 32).plan({{4096, 2048}, 8, LinearPhase::Decode, LinearEpilogue::None, 9}); },
+          "a decode workload's live rows are some of its rows", "a step named more live rows than it holds");
+  std::cout << "column plans: ok\n";
 }
 
 // A rotated projection's scratch holds the bf16 rotated rows of a full decode
@@ -1543,6 +1601,7 @@ int main(int argc, char **argv) {
     require(argc == 2, "usage: linear-plan <production.metallib|--cpu>");
     ggufPlans();
     scratchBoundsRotated();
+    columnPlans();
     ggufCoreLaws();
     floatOutputPlans();
     smallApple9StagesShortPrefillChunks();

@@ -167,6 +167,13 @@ LinearConfig bf16Projection(const KernelCalibration &calibration, LinearWorkload
   const uint32_t lanes = w.rows / SPLASH_TARGET_VERIFY_ROWS;
   const bool gateUp = w.epilogue == LinearEpilogue::GateUp,
              onePass = gateUp && unit.oneFormat && cores >= p.onePassFromCores;
+  // A step of at most GGUF_COLUMN_ROWS live rows runs the column tile, which
+  // reads them alone, a gate/up pair of one format in one pass: the staged and
+  // register tiles compute every row of their lanes. A [2048 x 6144] af4g64
+  // projection at one live row takes 18.4 us on it, 28 us on the staged tile
+  // (M5 Max).
+  if (w.liveRows && w.liveRows <= GGUF_COLUMN_ROWS && (!gateUp || unit.oneFormat))
+    return {.tile = LinearTile::GgufColumn, .oneGateUpPass = gateUp};
   if (unit.registerTakes &&
       registers(p.decodeRegister, unit.formatClass, lanes, (onePass ? 2 : 1) * uint64_t{n / GGUF_TILE_COLUMNS},
                 cores))

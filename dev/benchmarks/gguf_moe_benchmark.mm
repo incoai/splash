@@ -7,7 +7,7 @@
 // - decode steps of one to four lanes of 8 rows on the device's plan, each row routed to top-k experts drawn at random
 //   from all of them (random) or, per lane of 8 rows, from a pool of three times top-k (pooled: the rows of a verify
 //   sharing their experts), with the share of the plan's expert tiles that run the column tile (an expert's only tile
-//   of MOE_GGUF_COLUMN_ROWS live rows or fewer);
+//   of GGUF_COLUMN_ROWS live rows or fewer);
 // - prefill chunks of 64 to 2048 rows routed at random;
 // - every dispatch of the 2048-row chunk and of the 8- and 32-row steps replayed as its own command.
 // Each command runs layers of their own routes and buffers over one set of weights larger than the system cache, so a
