@@ -150,23 +150,27 @@ void testARefusedRestoreGivesTheFailure() {
   }
 }
 
+// A store of streamed experts as weight memory: a release gives back its
+// floor, which a restore takes back in one admission (model::ExpertStore).
+struct Store final : model::WeightMemory {
+  static constexpr uint64_t kFloorBytes = 1ULL << 28;
+  bool held = true;
+  [[nodiscard]] bool released() const noexcept override { return !held; }
+  void release() override { held = false; }
+  bool restore(const metal::AllocationAdmission &admit) override {
+    if (const metal::AllocationResult admitted = admit(kFloorBytes, [] {}); !admitted)
+      throw metal::MetalAllocationError("the floor was refused", admitted.failure);
+    held = true;
+    return true;
+  }
+};
+
 // Through ReleasableMemory, a store part after the images comes back in one
 // admission of its own, after the last image: the floor and its staging
 // alone (model::ExpertStore::restore), as the part takes them.
 void testTheStorePartComesBackInOneAdmissionAfterTheImages() {
   Weights weights;
-  constexpr uint64_t kFloorBytes = 1ULL << 28;
-  struct Store final : model::WeightMemory {
-    bool held = true;
-    [[nodiscard]] bool released() const noexcept override { return !held; }
-    void release() override { held = false; }
-    bool restore(const metal::AllocationAdmission &admit) override {
-      if (const metal::AllocationResult admitted = admit(kFloorBytes, [] {}); !admitted)
-        throw metal::MetalAllocationError("the floor was refused", admitted.failure);
-      held = true;
-      return true;
-    }
-  } store;
+  Store store;
   ReleasableMemory memory({&weights, &store}, std::nullopt);
   Admission admission;
   WeightResidency residency({.weights = &memory, .admit = admission.admit()});
@@ -177,8 +181,38 @@ void testTheStorePartComesBackInOneAdmissionAfterTheImages() {
     steps.push_back(residency.restore(1.0).kind);
   require(steps == std::vector<Kind>{Kind::Progress, Kind::Progress, Kind::Progress, Kind::Restored} &&
               admission.granted == std::vector<uint64_t>{Weights::kImageBytes, Weights::kImageBytes,
-                                                         Weights::kImageBytes, kFloorBytes},
+                                                         Weights::kImageBytes, Store::kFloorBytes},
           "the store did not come back in one admission after the images");
+}
+
+// An image written on its thread (model::WeightImages) is a step of the
+// restore until the call after its end: the residency reports it written,
+// through ReleasableMemory too, the completion notifier set on the residency
+// reaches it, and the store after the images comes back only once the last
+// image's write ended.
+void testAnImageWrittenOnItsThreadEndsBeforeTheNextPart() {
+  Weights weights;
+  weights.writes = true;
+  Store store;
+  ReleasableMemory memory({&weights, &store}, std::nullopt);
+  WeightResidency residency({.weights = &memory, .admit = test::admitAll});
+  require(residency.release(0.0, true, false), "the weights were not released");
+  uint32_t ends = 0;
+  residency.setCompletionNotifier([&ends] { ++ends; });
+  std::vector<Kind> steps;
+  while (!residency.held()) {
+    steps.push_back(residency.restore(1.0).kind);
+    require(residency.writing() == weights.writing() && memory.writing() == weights.writing(),
+            "the residency did not report the image being written");
+    if (residency.writing()) {
+      require(store.released(), "the store came back while an image was written");
+      weights.endWrite();
+    }
+  }
+  require(steps == std::vector<Kind>{Kind::Progress, Kind::Progress, Kind::Progress, Kind::Progress,
+                                     Kind::Restored} &&
+              ends == Weights::kImages && weights.restores == Weights::kImages && store.held,
+          "the restore did not follow each image's write before the next part");
 }
 
 } // namespace
@@ -191,6 +225,7 @@ int main(int argc, char **argv) {
       {"testARefusedRestoreGivesTheFailure", testARefusedRestoreGivesTheFailure},
       {"testTheStorePartComesBackInOneAdmissionAfterTheImages",
        testTheStorePartComesBackInOneAdmissionAfterTheImages},
+      {"testAnImageWrittenOnItsThreadEndsBeforeTheNextPart", testAnImageWrittenOnItsThreadEndsBeforeTheNextPart},
   };
   const test::TestGroup groups[] = {{"residency", kTests}};
   return test::runTests("weight-residency", groups, argc, argv);

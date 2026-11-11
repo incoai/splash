@@ -100,33 +100,46 @@ struct StatusMark: View {
     /// When the model began to start, where the slide starts lined up.
     let since: Date
     var size: CGFloat = 14
+    /// The look it shows, which follows `look` on an animation of its own.
+    @State private var shown: MarkLook
+
+    init(look: MarkLook, since: Date, size: CGFloat = 14) {
+        self.look = look
+        self.since = since
+        self.size = size
+        _shown = State(initialValue: look)
+    }
 
     var body: some View {
         Group {
-            if look == .failed {
+            if shown == .failed {
                 Image(systemName: "exclamationmark.triangle.fill")
                     .symbolRenderingMode(.multicolor)
                     .font(.system(size: size - 1))
             } else {
-                TimelineView(.animation(minimumInterval: 1.0 / 30, paused: look != .loading || Motion.reduced)) { context in
+                TimelineView(.animation(minimumInterval: 1.0 / 30, paused: shown != .loading || Motion.reduced)) { context in
                     let spread = spread(at: context.date)
                     ZStack {
                         SplashMark(spread: spread)
-                            .fill(look == .off ? HierarchicalShapeStyle.tertiary : .secondary)
-                            .opacity(look == .on || look == .asleep ? 0 : 1)
+                            .fill(shown == .off ? HierarchicalShapeStyle.tertiary : .secondary)
+                            .opacity(shown == .on || shown == .asleep ? 0 : 1)
                         SplashMark(spread: spread)
                             .fill(.splash)
-                            .opacity(look == .on ? 1 : look == .asleep ? 0.4 : 0)
+                            .opacity(shown == .on ? 1 : shown == .asleep ? 0.4 : 0)
                     }
                     .frame(width: size, height: size)
                 }
             }
         }
         .frame(width: size + 2, height: size + 2)
-        .animation(Motion.glide ?? Motion.quick, value: look)
-        // Its look changes its pose and color, not its place, which moves with the views beside
-        // it: SwiftUI otherwise animates where each part of it draws with its look.
-        .geometryGroup()
+        // Its pose and color change on an animation of their own in the update after the one
+        // that changes its look, where its place changes with the views beside it, as they do:
+        // animated in that same update, the mark moved on its look's animation, and trailed the
+        // composer's words as a switch moved them, over their first letter. Its own animation, not
+        // one around it, so that a pose changes as smoothly where what is around it changes at
+        // once, as the Server's control bar does.
+        .animation(Motion.glide ?? Motion.quick, value: shown)
+        .onChange(of: look) { _, look in shown = look }
         .accessibilityHidden(true)
     }
 
@@ -134,7 +147,7 @@ struct StatusMark: View {
     /// serving, the surface alone otherwise; risen throughout with Reduce Motion.
     private func spread(at date: Date) -> Double {
         if Motion.reduced { return 1 }
-        switch look {
+        switch shown {
         case .loading:
             let wave = sin(Double.pi * date.timeIntervalSince(since) / 1.6)
             return wave * wave

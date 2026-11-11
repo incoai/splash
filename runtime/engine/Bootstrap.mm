@@ -57,6 +57,8 @@ std::string_view runtimeBootstrapStageName(RuntimeBootstrapStage stage) {
     return "model_creation";
   case RuntimeBootstrapStage::MaximumPrefill:
     return "maximum_prefill";
+  case RuntimeBootstrapStage::PrefillRowClasses:
+    return "prefill_row_classes";
   case RuntimeBootstrapStage::DecodeWarmup:
     return "decode_warmup";
   case RuntimeBootstrapStage::CompositeStateRestore:
@@ -196,8 +198,10 @@ ServingRuntime::~ServingRuntime() {
 
 void ServingRuntime::announceReady() {
   // The per-operation guard RuntimeResources installed is only for startup:
-  // once Ready, the engine meets memory pressure between its ticks.
+  // once Ready, the engine meets memory pressure between its ticks, and the
+  // backend counts each pipeline the warmups did not create.
   resources_->backend().setOperationGuard({});
+  resources_->backend().beginServing();
   nativeLoop_->announceReady(ready_);
   resources_->beginServing();
 }
@@ -215,6 +219,7 @@ std::string ServingRuntime::statusJson() {
                       .metalMemory = backend.memoryStats(),
                       .metalHealthy = healthy,
                       .metalFailureReason = healthy ? std::string{} : backend.unhealthyReason(),
+                      .pipelinesCreatedWhileServing = backend.pipelinesCreatedWhileServing(),
                       .memoryGovernor = resources_->memoryGovernor().snapshot(),
                       .aneFfn = resources_->aneFfnSnapshot(),
                       .thermalState = thermalState_.state(),
@@ -239,9 +244,19 @@ void ServingRuntime::sampleThermalState() {
 }
 
 RuntimeBootstrapReport ServingRuntime::requireWarmup(
-    const EngineMemoryPlan &memoryPlan, model::RuntimeModel &modelRuntime, KvPool &kvPool,
+    const EngineMemoryPlan &memoryPlan, std::span<const uint32_t> prefillRowClasses,
+    model::RuntimeModel &modelRuntime, KvPool &kvPool, WarmupProgress progress,
     ActualMemoryReporter memoryReporter) {
   RuntimeBootstrapReport report = reportForPlan(memoryPlan);
+  // Its steps: the prefill of the most rows, one of each row class, each
+  // decode width and the state restore, each counted done as it ends.
+  protocol::WarmingEvent warming{.steps = static_cast<uint32_t>(prefillRowClasses.size()) +
+                                          model::ExecutionLimits::maximumBatchWidth + 2};
+  progress(warming);
+  const auto ended = [&] {
+    ++warming.stepsDone;
+    progress(warming);
+  };
   auto run = [&](RuntimeBootstrapStage stage, WarmupStepStatus &status,
                  auto &&operation, bool optional = false) {
     model::WarmupStepResult result;
@@ -250,6 +265,7 @@ RuntimeBootstrapReport ServingRuntime::requireWarmup(
     } catch (const metal::MetalAllocationError &error) {
       if (optional) {
         status = WarmupStepStatus::MemoryLimited;
+        ended();
         return model::WarmupStepResult{};
       }
       report.resourceFailure = resourceAllocationFailure(error.failure());
@@ -279,6 +295,7 @@ RuntimeBootstrapReport ServingRuntime::requireWarmup(
       fail(report, stage, std::move(message));
     }
     status = WarmupStepStatus::Complete;
+    ended();
     return result;
   };
 
@@ -290,6 +307,14 @@ RuntimeBootstrapReport ServingRuntime::requireWarmup(
               return modelRuntime.warmupPrefill(model::ExecutionLimits::prefillTokenBudget);
             });
     report.warmup.maximumPrefillDetail = maximumPrefill.detail;
+    // A pipeline is created the first time a dispatch names it, so a class of
+    // prefill chunk no warmup ran would create its kernels while its request
+    // waited: 19 s cold for the 27B's first 17-row chunk on a 16-core Apple9
+    // plan. A class needs no memory the prefill of the most rows did not, and
+    // is required as that one is.
+    for (const uint32_t rows : prefillRowClasses)
+      run(RuntimeBootstrapStage::PrefillRowClasses, report.warmup.prefillRowClasses,
+          [&] { return modelRuntime.warmupPrefill(rows); });
     const auto &budget = memoryPlan.breakdown();
     // Startup exercises only widths that fit this budget. This is not a
     // serving concurrency limit: the engine still admits lanes dynamically.
@@ -304,6 +329,7 @@ RuntimeBootstrapReport ServingRuntime::requireWarmup(
           (width > 1 && report.warmup.decodeBatches[width - 2] ==
                             WarmupStepStatus::MemoryLimited)) {
         report.warmup.decodeBatches[width - 1] = WarmupStepStatus::MemoryLimited;
+        ended();
         continue;
       }
       run(RuntimeBootstrapStage::DecodeWarmup,
@@ -469,12 +495,13 @@ std::unique_ptr<ServingRuntime> ServingRuntime::start(
          std::string("native loop creation failed: ") + error.what());
   }
 
-  nativeLoop->announceWarming();
   RuntimeResources *resourcesPointer = resources.get();
   model::RuntimeModel *modelPointer = modelRuntime.get();
   NativeRuntime *loopPointer = nativeLoop.get();
   RuntimeBootstrapReport report = requireWarmup(
-      resources->memoryPlan(), *modelRuntime, resources->kvPool(),
+      resources->memoryPlan(), resources->modelContext().operators.prefillRowClasses(),
+      *modelRuntime, resources->kvPool(),
+      [loopPointer](const protocol::WarmingEvent &event) { loopPointer->announceWarming(event); },
       [resourcesPointer, modelPointer, loopPointer, pressure = config.resources.memoryPressure] {
         // Audit every attempted warmup before reclaiming idle buffers.
         // Wider batches and cache memory grow on demand after Ready.

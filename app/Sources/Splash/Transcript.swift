@@ -12,15 +12,18 @@ final class Transcript {
     var askAgain: () -> Void = {}
 
     let page: WebPage
-    private let images = ChatImages()
+    private let images: ChatImages
     /// What the page shows, or will once it has loaded: the conversation as kept, and the reply
     /// that streams in it, in place of its last message.
     private var shown: TranscriptPage?
     private var reply: TranscriptMessage?
 
-    init(runtime: Runtime) {
+    /// A transcript of conversations whose attachments are kept in `attachments`.
+    init(runtime: Runtime, attachments: URL) {
+        images = ChatImages(folder: attachments)
         page = WebPage("transcript", in: "Transcript", runtime: runtime,
-                       glyphs: ["again": Glyph("arrow.clockwise", size: 12)], schemes: [ChatImages.scheme: images])
+                       glyphs: ["again": Glyph("arrow.clockwise", size: 12), "document": Glyph("doc.text", size: 20, weight: .light)],
+                       schemes: [ChatImages.scheme: images])
         page.receive = { [weak self] message in
             if message["askAgain"] != nil { self?.askAgain() }
         }
@@ -119,7 +122,15 @@ struct TranscriptMessage: Encodable, Equatable {
     let text: String
     let reasoning: String
     /// The user's images, sent as the addresses the page loads them from (`ChatImages`).
-    let images: [Data]
+    let images: [Attachment]
+    /// The user's PDFs, as their chips show them.
+    let documents: [Document]
+
+    struct Document: Encodable, Equatable {
+        let name: String
+        /// Its pages and size, as its chip shows them.
+        let details: String
+    }
     let error: String?
     /// The line over a reply, if it has one.
     let line: ReplyLine?
@@ -133,7 +144,8 @@ struct TranscriptMessage: Encodable, Equatable {
         role = message.role
         text = message.text
         reasoning = message.reasoning
-        images = message.images
+        images = (message.attachments ?? []).filter { $0.kind == .image }
+        documents = (message.attachments ?? []).filter { $0.kind == .pdf }.map { Document(name: $0.name ?? "PDF", details: $0.details) }
         error = message.error
         line = message.role == .assistant ? ReplyLine(message, live: live, asleep: asleep) : nil
         self.live = live != nil
@@ -143,7 +155,7 @@ struct TranscriptMessage: Encodable, Equatable {
     }
 
     private enum CodingKeys: CodingKey {
-        case id, role, text, reasoning, images, error, line, live, details
+        case id, role, text, reasoning, images, documents, error, line, live, details
     }
 
     func encode(to encoder: any Encoder) throws {
@@ -153,6 +165,7 @@ struct TranscriptMessage: Encodable, Equatable {
         try container.encode(text, forKey: .text)
         try container.encode(reasoning, forKey: .reasoning)
         try container.encode(images.indices.map { ChatImages.url(message: id, index: $0) }, forKey: .images)
+        try container.encode(documents, forKey: .documents)
         try container.encode(error, forKey: .error)
         try container.encode(line, forKey: .line)
         try container.encode(live, forKey: .live)
@@ -211,35 +224,42 @@ extension ReplyLine {
 }
 
 /// The user's images in the Chat, which the page loads as chat-image://MESSAGE/INDEX: those of the
-/// conversation it shows, from what the app holds, so that the data sent to the page holds no
-/// image, nor its comparisons of a message as last drawn, and an image is sent once, as it shows.
+/// conversation it shows, read from their files as they show, so that the data sent to the page
+/// holds no image, nor its comparisons of a message as last drawn.
 @MainActor
 final class ChatImages: NSObject, WKURLSchemeHandler {
     nonisolated static let scheme = "chat-image"
 
+    /// Where the attachments are kept.
+    let folder: URL
     /// The images of the conversation shown, by message.
-    var images: [UUID: [Data]] = [:]
+    var images: [UUID: [Attachment]] = [:]
+
+    init(folder: URL) {
+        self.folder = folder
+    }
 
     /// Where the page loads the image at `index` of `message`.
     nonisolated static func url(message: UUID, index: Int) -> String {
         "\(scheme)://\(message.uuidString)/\(index)"
     }
 
-    /// The image `url` names, if it names one of the conversation shown.
-    func image(_ url: URL) -> Data? {
+    /// The image `url` names, if it names one of the conversation shown, and its data.
+    func image(_ url: URL) -> (attachment: Attachment, data: Data)? {
         guard url.scheme == Self.scheme, let message = url.host().flatMap(UUID.init(uuidString:)),
-              let index = Int(url.lastPathComponent), let images = images[message], images.indices.contains(index)
+              let index = Int(url.lastPathComponent), let images = images[message], images.indices.contains(index),
+              let data = try? Data(contentsOf: folder.appending(path: images[index].file))
         else { return nil }
-        return images[index]
+        return (images[index], data)
     }
 
     func webView(_ webView: WKWebView, start task: any WKURLSchemeTask) {
         guard let url = task.request.url, let image = image(url) else {
             return task.didFailWithError(URLError(.fileDoesNotExist))
         }
-        task.didReceive(URLResponse(url: url, mimeType: ChatClient.mediaType(image), expectedContentLength: image.count,
+        task.didReceive(URLResponse(url: url, mimeType: image.attachment.type, expectedContentLength: image.data.count,
                                     textEncodingName: nil))
-        task.didReceive(image)
+        task.didReceive(image.data)
         task.didFinish()
     }
 

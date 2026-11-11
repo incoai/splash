@@ -6,6 +6,7 @@ requests that keep failing the engine."""
 import math
 import signal
 import threading
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 
@@ -204,27 +205,45 @@ class RestartPolicy:
         )
 
 
+# How long a quarantined request is refused, in time the Mac is awake. Every
+# request the engine had started at both failures is refused, not only the
+# one that caused them, so with several lanes a refusal can fall on a request
+# that did nothing, whose retries (the same request but for what its
+# fingerprint leaves out) would fail until the server restarts. Let back, a
+# request that does fail the engine costs at most two failures an hour: one
+# while still a suspect, two once a later failure has replaced the suspects.
+QUARANTINE_SECONDS = 3600.0
+
+
 class Quarantine:
-    """Refuses a request, until the server restarts, whose fingerprint was
-    among the started requests at each of the last two engine failures a
-    request may have caused. A failure no request could have caused neither
-    adds to the suspects nor clears them."""
+    """Refuses a request, for QUARANTINE_SECONDS, whose fingerprint was among
+    the started requests at each of the last two engine failures a request
+    may have caused. A failure no request could have caused neither adds to
+    the suspects nor clears them."""
 
     def __init__(self):
         self._lock = threading.Lock()
         self._suspects: frozenset[bytes] = frozenset()
+        # Each refused fingerprint and when it is let back (time.monotonic).
         # Replaced, never changed in place, so refuses() reads it unlocked.
-        self._refused: frozenset[bytes] = frozenset()
+        self._refused: dict[bytes, float] = {}
 
     def refuses(self, fingerprint: bytes) -> bool:
-        return fingerprint in self._refused
+        return time.monotonic() < self._refused.get(fingerprint, -math.inf)
 
     def after(self, started: frozenset[bytes]) -> frozenset[bytes]:
         """Counts a failure a request may have caused, with the fingerprints
         of the requests the engine had started; returns those it now
         refuses."""
         with self._lock:
-            refused = (self._suspects & started) - self._refused
-            self._refused |= refused
+            now = time.monotonic()
+            refused = {
+                fingerprint: until
+                for fingerprint, until in self._refused.items()
+                if now < until
+            }
+            newly = (self._suspects & started) - refused.keys()
+            refused.update(dict.fromkeys(newly, now + QUARANTINE_SECONDS))
+            self._refused = refused
             self._suspects = started
-            return refused
+            return frozenset(newly)

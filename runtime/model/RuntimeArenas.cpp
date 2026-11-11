@@ -114,21 +114,24 @@ prefillTensorBytes(const RuntimeGeometry &geometry,
       bytesFor<uint16_t>(uint64_t{geometry.target.attentionKvHeads} *
                          kRaggedAttentionRows *
                          geometry.target.attentionHeadDimension));
-  // The split partials and counters and the rotated rows of the largest
-  // prefill plan, the draft's context projections' too.
+  // The split partials and counters, the rotated rows and the int8 tile's
+  // codes and scales of the largest prefill plan: the target's, and the
+  // draft's context projections' on the draft's plans.
+  ops::LinearScratchSize linear;
+  for (const auto &projection : geometry.target.prefillProjections)
+    linear.include(operators.linear().prefillScratchSize(projection));
   const auto &draft = geometry.draft;
-  std::vector<ops::ProjectionShape> prefillProjections = geometry.target.prefillProjections;
-  prefillProjections.push_back({draft.hiddenSize, draft.targetHiddenSize()});
-  prefillProjections.push_back({draft.contextKvSize(), draft.hiddenSize});
-  for (const auto &projection : prefillProjections) {
-    const ops::LinearScratchSize linear = operators.linear().prefillScratchSize(projection);
-    put(PrefillTensor::LinearPartials, linear.partials);
-    put(PrefillTensor::LinearCounters, linear.counters);
-    put(PrefillTensor::LinearRotated, linear.rotated);
-  }
+  for (const ops::ProjectionShape projection :
+       {ops::ProjectionShape{draft.hiddenSize, draft.targetHiddenSize()}, {draft.contextKvSize(), draft.hiddenSize}})
+    linear.include(operators.draftLinear().prefillScratchSize(projection));
+  put(PrefillTensor::LinearPartials, linear.partials);
+  put(PrefillTensor::LinearCounters, linear.counters);
+  put(PrefillTensor::LinearTable, linear.input);
+  put(PrefillTensor::LinearSums, linear.sums);
+  put(PrefillTensor::LinearRotated, linear.rotated);
   if (geometry.target.ffnKind == QwenFfnKind::SparseMoe) {
     const ops::MoeWorkspace workspace =
-        operators.moePrefillWorkspace(geometry.target.moeBlockShape(), geometry.target.moeFormats, kPrefillRows);
+        operators.moePrefillWorkspace(geometry.target.moeBlockShape(), geometry.target.moeRouterFormat, kPrefillRows);
     for (size_t field = 0; field < ops::kMoeScratchFields.size(); ++field)
       put(moeScratchTensor<PrefillTensor>(field),
           workspace.*ops::kMoeScratchFields[field].bytes);
@@ -312,7 +315,7 @@ decodeTensorBytes(const RuntimeGeometry &geometry,
           decodeChunkLayerBytes(geometry));
   if (geometry.target.ffnKind == QwenFfnKind::SparseMoe) {
     const ops::MoeWorkspace workspace =
-        operators.moeDecodeWorkspacePerLane(geometry.target.moeBlockShape(), geometry.target.moeFormats);
+        operators.moeDecodeWorkspacePerLane(geometry.target.moeBlockShape(), geometry.target.moeRouterFormat);
     for (size_t field = 0; field < ops::kMoeScratchFields.size(); ++field)
       put(moeScratchTensor<DecodeTensor>(field),
           workspace.*ops::kMoeScratchFields[field].bytes);
@@ -342,17 +345,24 @@ ops::LinearScratchSize DecodeArena::linearScratchSize(
        {d.hiddenSize, d.attentionSize},
        {d.intermediateSize, d.hiddenSize}, {d.hiddenSize, d.intermediateSize},
        {d.selectorRank, d.hiddenSize}, {d.hiddenSize, d.targetHiddenSize()}})
-    result.include(operators.linear().decodeScratchSize(shape));
+    result.include(operators.draftLinear().decodeScratchSize(shape));
   return result;
 }
 
 uint64_t decodeArenaBytes(const RuntimeGeometry &geometry,
                          const ops::ExecutionPlans &operators) {
-  return checkedAdd(decodeArenaBaseBytes(geometry, operators),
-                    checkedAdd(DecodeArena::gateScratchBytes(geometry, operators),
-                               DecodeArena::linearScratchSize(geometry, operators).bytes(),
-                               "linear decode scratch"),
-                    "planned gate scratch");
+  // Metal allocates a buffer in whole host pages and the memory ledger
+  // charges what it allocates, so the arena allocates each scratch buffer
+  // beside its base in whole pages and the plan counts them so: counted as
+  // the fields' sum, Qwen3.8-Flash-Next's 122,880 bytes of linear sums took
+  // 131,072, and the 8,192 bytes the plan left out cost one request's KV a
+  // whole extent, 8,192 tokens of its context at --max-memory 9.4G.
+  const ops::LinearScratchSize linear = DecodeArena::linearScratchSize(geometry, operators);
+  uint64_t bytes = decodeArenaBaseBytes(geometry, operators);
+  for (const uint64_t scratch : {DecodeArena::gateScratchBytes(geometry, operators), linear.input, linear.sums,
+                                 linear.partials, linear.counters, linear.rotated})
+    bytes = checkedAdd(bytes, alignUp(scratch), "decode scratch");
+  return bytes;
 }
 
 uint64_t plannedDecodeBytes(const RuntimeGeometry &geometry,

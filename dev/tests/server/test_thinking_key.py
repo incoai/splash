@@ -11,7 +11,13 @@ from unittest import mock
 
 from cryptography.fernet import Fernet
 
-from dev.tests.server_fixtures import FakeRuntime, Harness, Plan, main_args
+from dev.tests.server_fixtures import (
+    FakeRuntime,
+    Harness,
+    Plan,
+    console_written,
+    main_args,
+)
 from server import server as api
 from server.thinking import ThinkingCodec, ThinkingKeyError, load_thinking_key
 
@@ -158,6 +164,7 @@ class ThinkingKeyTests(unittest.TestCase):
             self.assertRaisesRegex(SystemExit, "1"),
         ):
             api.main()
+        console_written()
         self.assertIn("invalid key file", stderr.getvalue())
         tokenizer.assert_not_called()
         runtime.assert_not_called()
