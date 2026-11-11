@@ -1,0 +1,5 @@
+# Separate environment; never installed by normal Splash setup.
+torch==2.13.0
+transformers==5.15.1
+safetensors==0.8.0
+PyYAML==6.0.3
