@@ -1,14 +1,23 @@
 import concurrent.futures
 import http.client
 import json
+import os
 import queue
 import socket
+import stat
+import tempfile
 import threading
 import time
 import unittest
 from unittest import mock
 
-from dev.tests.server_fixtures import FakeRuntime, HarnessTestCase, Plan, chat_body
+from dev.tests.server_fixtures import (
+    FakeRuntime,
+    Harness,
+    HarnessTestCase,
+    Plan,
+    chat_body,
+)
 from server import connections, serve_options
 from server import server as api
 
@@ -891,6 +900,52 @@ class HttpTransportTests(HarnessTestCase):
         self.assertEqual(admission.stats(), {"active": 0, "capacity": 1})
         with self.assertRaisesRegex(RuntimeError, "without acquisition"):
             admission.release()
+
+
+class UnixSocketTests(HarnessTestCase):
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory(dir="/tmp")
+        self.addCleanup(directory.cleanup)
+        self.path = os.path.join(directory.name, "splash.sock")
+
+    def get(self, path, host="127.0.0.1:18081"):
+        connection = socket.socket(socket.AF_UNIX)
+        connection.settimeout(3)
+        connection.connect(self.path)
+        connection.sendall(
+            f"GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n".encode()
+        )
+        reply = b""
+        while chunk := connection.recv(65536):
+            reply += chunk
+        connection.close()
+        head, _, body = reply.partition(b"\r\n\r\n")
+        return int(head.split()[1]), body
+
+    def test_serves_on_a_unix_socket_and_removes_it_on_close(self):
+        harness = Harness(FakeRuntime(), host=f"unix:{self.path}")
+        try:
+            self.assertTrue(stat.S_ISSOCK(os.lstat(self.path).st_mode))
+            code, body = self.get("/status")
+            self.assertEqual(code, 200)
+            instance = json.loads(body)["instance"]
+            self.assertEqual(
+                (instance["host"], instance["port"]), (f"unix:{self.path}", None)
+            )
+            self.assertEqual(self.get("/health", host="localhost")[0], 200)
+            self.assertEqual(self.get("/health", host="evil.example")[0], 403)
+        finally:
+            harness.close()
+        self.assertFalse(os.path.exists(self.path))
+
+    def test_replaces_a_stale_socket_but_not_a_live_one(self):
+        stale = socket.socket(socket.AF_UNIX)
+        stale.bind(self.path)
+        stale.close()
+        self.harness(FakeRuntime(), host=f"unix:{self.path}")
+        self.assertEqual(self.get("/health")[0], 200)
+        with self.assertRaises(OSError):
+            api.FrontendServer((f"unix:{self.path}", 0), None)
 
 
 if __name__ == "__main__":

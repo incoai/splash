@@ -132,7 +132,7 @@ paths for `--model-dir`, `--draft-model` and `--mmproj`.
 | `--language-only` | Off | Skip vision loading; image and PDF input is rejected. See [vision](models.md#vision). |
 | `--offline` | Off | Start the installed model without asking the Hub, as `HF_HUB_OFFLINE=1` does. See [revisions](#revisions). |
 | `--port` | `SPLASH_PORT` or `8000` | HTTP port. |
-| `--host` | `127.0.0.1` | HTTP bind address. See [network and authentication](#network-and-authentication). |
+| `--host` | `127.0.0.1` | HTTP bind address, or `unix:PATH` for a UNIX socket. See [network and authentication](#network-and-authentication). |
 | `--allowed-host` | No extra names | Additional HTTP Host name, e.g. `mymac.local`; repeatable. |
 | `--allowed-origin` | No other origin | Origin whose pages may call the API from a browser or webview, e.g. `tauri://localhost`; `'*'` for any; repeatable. |
 | `--api-key` | `SPLASH_API_KEY` or none | Require this key, as a bearer token or `x-api-key`, on every route but the chat page, `/health` and `/ready`. |
@@ -193,6 +193,13 @@ listener or allowlist client IPs. A request that names the server any other way
 gets 403 with the `--allowed-host` flag that would accept it; the check keeps out
 web pages that rebind a DNS name to this address. The chat page works over plain
 HTTP from another machine too.
+
+`--host unix:PATH` listens on a UNIX socket at `PATH` instead of a TCP port, so
+the socket's file permissions decide who connects; `--port` still names the
+server's lock and record. The server replaces a socket left behind by one that
+exited, refuses to start beside a live one, and removes its socket when it
+stops. Clients connect with, e.g., `curl --unix-socket PATH http://localhost/health`,
+and the Host check applies as it does over TCP.
 
 Set `SPLASH_API_KEY` in the server and agent shells to require authentication;
 `serve --api-key KEY` overrides the server's environment value. Every request
