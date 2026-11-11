@@ -9,6 +9,7 @@
 #include "model/KvHistoryStream.hpp"
 #include "model/ModelPools.hpp"
 #include "model/QwenState.hpp"
+#include "model/PromptLookup.hpp"
 #include "model/QwenTarget.hpp"
 #include "model/RuntimeArenas.hpp"
 #include "model/SpilledKvReads.hpp"
@@ -396,6 +397,7 @@ struct Runtime::Impl {
     // The draft proposals the lane's thinking end replaced, which its
     // speculation counts leave out.
     uint32_t endDrafts = 0;
+    bool promptLookup = false;
     // Why the lane's selection is unusable (invalidSelection), found before
     // any lane commits.
     std::string failure;
@@ -460,6 +462,7 @@ struct Runtime::Impl {
   std::vector<std::weak_ptr<const HeldState>> stateHolds;
   std::array<PageTableBinding, kLaneCount> pageTableBindings{};
   ModelTelemetry counters;
+  bool experimentalPromptLookup = false;
   ops::Sampling sampling;
   std::unique_ptr<QwenTarget> targetModel;
   DFlashDraft draftModel;
@@ -2116,6 +2119,26 @@ struct Runtime::Impl {
                     draftModel.decodeStorageLanes(lanes));
   }
 
+  std::optional<PromptLookup::Proposal> promptLookup(Request &entry, uint32_t width) {
+    if (!experimentalPromptLookup || width != 1) return std::nullopt;
+    const bool dense = std::visit([](const auto &layout) {
+      return layout.ffnKind != QwenFfnKind::SparseMoe;
+    }, model.descriptor.target);
+    if (!dense || aneFfn ||
+        model.expertStore() || historyStream || verifyBudget || !entry.images.empty() ||
+        samplingEnabled(entry) || entry.constraint != ConstraintMode::None ||
+        samplingPenalties(entry).active() || entry.thinking || !entry.pendingToken ||
+        !states.layout().target.layers || states.layout().target.auxiliaryBytes)
+      return std::nullopt;
+    ++counters.promptLookupSearches;
+    const auto started = AwakeClock::now();
+    auto proposal = PromptLookup::find(entry.tokens, *entry.pendingToken);
+    counters.promptLookupSearchWallSeconds +=
+        std::chrono::duration<double>(AwakeClock::now() - started).count();
+    if (proposal) ++counters.promptLookupHits;
+    return proposal;
+  }
+
   // The draft's proposals for each lane and how many rows of its block it
   // verifies, at most maximumRows[lane] (its retention limit), by the
   // acceptance model and the costs of `constrained` cycles of its lane count.
@@ -2515,6 +2538,11 @@ struct Runtime::Impl {
       const uint32_t accepted =
           std::min(laneResult.accepted, laneResult.retained - 1);
       const uint32_t verified = laneResult.verifyRows - 1;
+      if (laneResult.promptLookup) {
+        ++counters.promptLookupBypassedCycles;
+        counters.promptLookupProposedTokens += verified;
+        counters.promptLookupAcceptedTokens += accepted;
+      }
       results.push_back({entry.id,
                          0,
                          std::move(output),
@@ -2744,6 +2772,12 @@ Runtime::Runtime(RuntimeContext context)
 Runtime::~Runtime() = default;
 
 void Runtime::checkHealth() { impl_->backend.checkHealth(); }
+
+void Runtime::experimentalPromptLookup(bool enabled) {
+  if (!impl_->requests.empty() || impl_->backend.commandInFlight())
+    throw std::logic_error("prompt lookup changes only while the runtime is idle");
+  impl_->experimentalPromptLookup = enabled;
+}
 
 void Runtime::beginColdRequest(const ModelRequest &request,
                                uint32_t stateLane) {
@@ -3280,13 +3314,26 @@ Runtime::decodeAsync(const BatchPlan &plan,
       impl_->decodeArena->batchSlice(DecodeTensor::RopeSin, width),
       impl_->decodeArena->batchSlice(DecodeTensor::DraftRopeCos, width),
       impl_->decodeArena->batchSlice(DecodeTensor::DraftRopeSin, width));
-  impl_->encodeBatchEmbedding(commandGraph, DecodeTensor::DraftInputTokens,
-                              DecodeTensor::DraftHidden0, width);
-  impl_->draftModel.addMaskRows(commandGraph, impl_->decodeArena->batchSlice(DecodeTensor::DraftHidden0, width),
-                                width);
-  impl_->encodeDraftBatchGraph(commandGraph, entries,
-                               {logicalPositions.data(), width},
-                               {maximumRetained.data(), width}, constrained);
+  const auto lookup = impl_->promptLookup(*entries.front(), width);
+  if (lookup) {
+    static_assert(PromptLookup::kProposalTokens == kDraftProposalTokens);
+    // prepareDecodeLane already wrote DraftInputTokens[0], the only draft
+    // input the target's verify-input kernel reads. No draft hidden or logits
+    // feed the target. Its own embedding, verify and both commits stay below.
+    std::copy(lookup->begin(), lookup->end(), contents<uint32_t>(
+        impl_->decodeArena->get(0, DecodeTensor::ProposedTokens), "lookup proposals"));
+    *contents<uint32_t>(impl_->decodeArena->get(0, DecodeTensor::VerifyRows),
+                        "lookup verify rows") = maximumRetained[0];
+    lanes.front().promptLookup = true;
+  } else {
+    impl_->encodeBatchEmbedding(commandGraph, DecodeTensor::DraftInputTokens,
+                                DecodeTensor::DraftHidden0, width);
+    impl_->draftModel.addMaskRows(commandGraph, impl_->decodeArena->batchSlice(DecodeTensor::DraftHidden0, width),
+                                  width);
+    impl_->encodeDraftBatchGraph(commandGraph, entries,
+                                 {logicalPositions.data(), width},
+                                 {maximumRetained.data(), width}, constrained);
+  }
   std::shared_ptr<SpilledKvReads> reads = impl_->decodeReads(items);
   // The weights it reads on demand and the spilled K/V its reads bring.
   WorkCount count({}, impl_->model.expertStore(), reads);
@@ -3795,6 +3842,12 @@ std::unique_ptr<RuntimeModel> createRuntime(RuntimeContext context) {
 }
 
 #ifdef SPLASH_RUNTIME_INSTRUMENTATION
+void RuntimeInstrumentation::promptLookupForNextCycle(Runtime &runtime, bool enabled) {
+  if (runtime.impl_->backend.commandInFlight())
+    throw std::logic_error("lookup oracle changes only at a command boundary");
+  runtime.impl_->experimentalPromptLookup = enabled;
+}
+
 std::vector<uint32_t> RuntimeInstrumentation::lastTableRows(const Runtime &runtime, uint32_t lane) {
   return runtime.impl_->targetModel->verifyTableRows(lane);
 }
