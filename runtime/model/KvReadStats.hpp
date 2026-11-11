@@ -55,9 +55,11 @@ struct KvReadStats final {
 // The hot block cache as /status reports it: its memory, target and floor,
 // its slots per layer and the lanes that hold a floor, everything its commands' resolves did,
 // and how long a resolve, a read and its host steps took
-// (metal::HostStepTiming).
+// (metal::HostStepTiming); and the page table it holds, which the memory
+// audit counts (KvBlockCache::tableBytes).
 struct KvBlockCacheStats final {
   uint64_t bytes = 0;
+  uint64_t tableBytes = 0;
   uint64_t targetBytes = 0;
   uint64_t floorBytes = 0;
   uint32_t slotsPerLayer = 0;
@@ -78,13 +80,15 @@ struct KvStreamResult final {
 // layers, pages and bytes they read, the staging they hold and its buffers,
 // how long a layer's reads took from their start to their last page, which
 // with the bytes gives the streams' bandwidth, and how long commands waited
-// on them.
+// on them; and the buffers' page tables, which the memory audit counts
+// (KvHistoryStream::tableBytes).
 struct KvHistoryStreamStats final {
   uint64_t commands = 0;
   uint64_t layers = 0;
   uint64_t pages = 0;
   uint64_t bytes = 0;
   uint64_t stagingBytes = 0;
+  uint64_t tableBytes = 0;
   uint32_t buffers = 0;
   LatencyStats read, wait;
 };

@@ -69,30 +69,44 @@ job, with its output appended to a log in `~/Library/Logs/Splash`:
 `install/models.py --model ID prepare --json-progress` downloads a model, and
 `splash serve --model ID --port PORT --offline` serves an installed one, with
 the launch options picked in the app that differ from the server's defaults,
-ready once the port's lock names that process and `/health` answers; stopping
-is Ctrl+C's SIGINT to the group. Switching models stops one server and starts
+ready once that process's serve record says it is; while the engine warms up,
+the record counts its steps, and the Server shows them with why the first
+start after an update takes a couple of minutes
+([Warmup and pipelines](internals.md#warmup-and-pipelines)); stopping
+is Ctrl+C's SIGINT to the group. When a server ends unasked, as a start that
+fails or a server that stops restarting its engine does, the app shows the
+failure its serve record names. Switching models stops one server and starts
 the next. The app starts nothing by itself: its window opens on the Server,
-where models download, start and switch, beside the Chat. The toolbar's switch
+where models download, start and switch, beside the Chat; the menu bar's panel
+and the Chat's composer start and switch them too. The toolbar's switch
 opens the Chat, whose sidebar of conversations ⌘B hides, and the Server's
 button at its end the Server: it shows the model that runs, a spinner while
 one starts and a ring for a download's progress. Models, locks and
 downloads are the ones a packaged `splash` uses, in `~/Library/Application
-Support/Splash` and the Hugging Face cache. The app offers
+Support/Splash` and the Hugging Face cache, where the user's login shell has it:
+as it launches, the app reads that shell's Hugging Face variables, the cache's
+and the token's among them, for every program it runs. The app offers
 `install/suggested-models.tsv`, per model the variant meant for the Mac's
 memory with its download size and a few words about the model, and starts
-coding agents with `splash AGENT --port PORT` in Terminal, in a folder the user
-picks, from a script that holds the running server's API key and removes itself
-as it starts. Its launch options are every option `splash serve` takes but the
+coding agents with `splash AGENT --port PORT`, typed into a new terminal of the
+window's drawer in the folder the agents work in, the last one chosen, whose
+environment holds the running server's API key. Its launch options are every option `splash serve` takes but the
 ones of one model (`--revision`, `--draft-model`, `--mmproj`) and the ones it
 sets itself, from one table (`LaunchOption.all`) the tests hold to `splash
 serve --help`. It offers a model only those its family can use, and passes
 no other: at launch it runs `install/families.py`, which reports for each
-family, from the engine's `families` command and the options' own needs
-(`ServeOption.needs`), the options none of its models can use and the context
-they serve; a model's family is its assembly record's, and a model whose
-family is not known yet gets every option. The API key reaches the server as
-`SPLASH_API_KEY`, from the
-Keychain, and nothing starts while the Keychain does not give it. The server
+family it serves, from the engine's `families` command and the options' own
+needs (`ServeOption.needs`), the options none of its models can use and the
+context they serve; a model's family is its assembly record's, and a model
+whose family is not known yet gets every option. It offers only the models of
+those families: one of another, which a newer or development build installs
+into the models folder every Splash on the Mac shares, could only fail to
+start. The API key reaches the server as
+`SPLASH_API_KEY`, from the Keychain, which takes it as its field is left or
+a start uses it, and nothing starts while the Keychain does not give it. Copy
+API Address gives the loopback address, or, while the server listens on all
+networks, this Mac's `.local` name, which the app then adds to its Host
+names. The server
 stops as SIGTERM stops it once the app has ended, by a crash too, since the app
 passes its process ID as `SPLASH_APP_PID`; the app's next launch stops one still
 running, as it does a download, by the process ID and start time it keeps. An
@@ -102,17 +116,41 @@ still runs the download command above; it leaves any other process alone and
 forgets the record. It serves model files on this Mac
 the user adds with `splash serve --model local/NAME
 --model-dir PATH`, NAME being the file's or folder's name made a repository
-name, and at launch it runs `install/cached.py`. While a model runs, the Server
-shows its context limit, from `/v1/models`, and its `/status`: requests,
+name, with the `--mmproj` and `--draft-model` their row's menu chooses, and at
+launch it runs `install/cached.py`. Since it starts models `--offline`, an
+installed model's menu checks it for updates, which `prepare` installs, and
+deletes it with `install/models.py remove`. While a model runs, the Server
+shows its context limit, from `/v1/models`, and its `/status`, asked every 2 s,
+or every 10 s while neither the window nor the menu bar's panel is open: requests,
 answering and prompt speed, time to first token, the tokens generated, read and
-taken from the cache, and the Metal memory it holds, with each request's line
-of the server's log, folded. Its chat is its own, not the chat page: it streams
+taken from the cache, and the Metal memory it holds, with a row for each
+request, folded: from the server's line that starts it or the status that has it
+first, how far it has read its prompt or answered, or why it waits, back too
+where the engine suspends it, until the line that ends it, which names it by
+the same id, or a status no longer has it. A start that fails
+says why, as its serve record
+has it, the log keeping the starts before it; one that failed for want of
+memory offers the start that would fit, under a memory limit that holds the
+model or with the context length on Auto. Its chat is its own, not the chat page: it streams
 `/v1/chat/completions` and keeps each conversation as a JSON file in
-`~/Library/Application Support/Splash/Chats`, so a conversation outlives a
-switch of models. The window's drawer, ⌘J or the toolbar's terminal button,
-holds terminals, each the user's login shell in the home folder, through
-SwiftTerm, and the server's and the downloads' logs as they are written. Its
-icon is `app/AppIcon.icon`, an Icon Composer document
+`~/Library/Application Support/Splash/Chats`, its attachments as files of their
+own in that folder's `Attachments`, so a conversation outlives a switch of
+models. A message attaches images and PDFs, a PDF shown by its name and pages,
+where the model takes them, and is held back where the limits `/v1/models`
+gives leave them out; one the server refuses goes back to the composer, with
+why. A chat takes the title the model sums its first exchange up
+in, asked in the background without thinking. The list puts the pinned chats
+first, the last pinned at the top, then the others by day; a chat's menu, at
+its row's end or its title in the toolbar, pins, renames and deletes it, and
+the row's Select picks chats, or all of them, to delete at once. The window's
+drawer, ⌘J or the toolbar's terminal button,
+holds terminals, each the user's login shell in the home folder, or for a coding
+agent in its folder, through
+SwiftTerm, and the server's and the downloads' logs as they are written.
+Quitting stops what runs. A quit from ⌘Q, the menus or the Dock asks first
+where it would cut off requests the model is answering, a download or a program
+a terminal runs; one from a script, the system as it logs out, a signal or an
+update quits at once. Its icon is `app/AppIcon.icon`, an Icon Composer document
 `actool` compiles, which needs the full Xcode; its mark, three arcs of water
 springing from a rippled surface, is the menu bar's too (`SplashMark`), and the
 chat page's (`server/favicon.svg`). `swift test --package-path app` runs its
@@ -131,7 +169,7 @@ the release key, an EdDSA key whose public half is `SPARKLE_PUBLIC_KEY` there,
 or, to replace a lost release key, the app's Developer ID. An app built while
 `SPARKLE_PUBLIC_KEY` is empty checks for nothing. Sparkle asks on the second
 launch whether to check by itself, once a day, and installs an update by
-quitting the app as its Quit command does, which stops what runs first.
+quitting the app, which stops what runs first, without asking.
 `package_app.py` puts `Sparkle.framework` in `Contents/Frameworks` without its
 XPC services, which only a sandboxed app needs, and signs its installer, its
 progress app and the framework before the app.

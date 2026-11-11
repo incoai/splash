@@ -27,7 +27,6 @@
 #include "metal/abi/Gguf.h"
 #include "metal/kernels/common/gguf_sgmatrix.h"
 #include "metal/kernels/common/gguf_tile.h"
-#include "metal/kernels/common/moe_expert_slab.h"
 #include "metal/kernels/common/quant_formats.h"
 #include "metal/kernels/common/sgmatrix.h"
 #include "metal/kernels/common/split_reduce.h"
@@ -418,51 +417,3 @@ GGUF_SG_FUSED(3)
 GGUF_SG_FUSED(4)
 #undef GGUF_SG_FUSED
 #undef GGUF_SG_SEGMENT
-
-// MoE experts (ops/MoE.cpp): threadgroup (x, y) computes 64 columns of grouped 8-row tile y from its Table16 tile
-// (kernels/shared/moe.metal) with the weights of the tile's expert (moe_gguf_segment), the routed ones in the chunks of
-// the table at the index after the parameters (metal/abi/MoE.h), of a block whose shared expert is Shared slices (each
-// instance's slices suffix, ops::kCompiledMoeRoutings), in the format the tile picks at run time (within 1.6% of
-// per-format kernels). No K splits, so no partials or counters. aux is the gate of the up pass. Grid (column tiles,
-// expert tiles), GGUF_REGISTER_THREADS threads.
-template <GgufEpilogue Ep, uint Shared>
-inline void gguf_sg_expert(device const bfloat *table, device const float *sums, device const MoeTileDescriptor *tiles,
-                           device const uint *tile_count, device uchar *sw0, device uchar *sw1, device uchar *smeta,
-                           device bfloat *out, device const bfloat *aux, device const uint *slots,
-                           constant MoeGgufExpertParams &p, constant ulong *chunks, uint2 tg, uint tid, uint sg,
-                           uint lane, threadgroup bfloat2 *lut, threadgroup float2 *coefs, threadgroup uint *arrival) {
-  if (tg.y >= *tile_count) return;
-  const MoeGgufSegment s = moe_gguf_segment<Shared>(tiles[tg.y].expert, p, slots, chunks, sw0, sw1, smeta);
-  const uint K = p.input_size, N = p.output_size;
-  const ulong rows = ulong(tg.y) * 8;
-  const GgufDecodeParams q{K, 1, N, 0, 0};
-  quant_register_format_switch(s.format, [&](auto format) {
-    typedef decltype(format) F;
-    quant_pair_table<F>(lut, tid, GGUF_REGISTER_THREADS);
-    gguf_sg::decode<F, 1, Ep>(
-        table + rows * K, sums + tg.y * table16_sums_per_tile(K), s.w0, s.w1, s.meta, out + rows * N, nullptr, nullptr,
-        aux + rows * N, q, uint2(tg.x, 0), tid, sg, lane, lut, reinterpret_cast<threadgroup gguf_sg::Coef<F> *>(coefs),
-        arrival);
-  });
-}
-#define GGUF_SG_EXPERT(Name, EP, Shared)                                                                            \
-  kernel void Name(device const bfloat *table [[buffer(0)]], device const float *sums [[buffer(1)]],              \
-                   device const MoeTileDescriptor *tiles [[buffer(2)]], device const uint *tile_count [[buffer(3)]], \
-                   device uchar *sw0 [[buffer(4)]], device uchar *sw1 [[buffer(5)]],                                \
-                   device uchar *smeta [[buffer(6)]], device bfloat *out [[buffer(7)]],                             \
-                   device const bfloat *aux [[buffer(8)]], device const uint *slots [[buffer(9)]],                  \
-                   constant MoeGgufExpertParams &p [[buffer(10)]], constant ulong *chunks [[buffer(11)]],           \
-                   uint2 tg [[threadgroup_position_in_grid]],                                                       \
-                   uint tid [[thread_index_in_threadgroup]], uint sg [[simdgroup_index_in_threadgroup]],            \
-                   uint lane [[thread_index_in_simdgroup]]) {                                                       \
-    threadgroup bfloat2 lut[kQuantPairTableEntries];                                                                \
-    threadgroup float2 coefs[gguf_sg::kCoefFloat2s];                                                                \
-    threadgroup uint arrival;                                                                                       \
-    gguf_sg_expert<EP, Shared>(table, sums, tiles, tile_count, sw0, sw1, smeta, out, aux, slots, p, chunks, tg, tid, \
-                               sg, lane, lut, coefs, &arrival);                                                     \
-  }
-GGUF_SG_EXPERT(moe_expert_gguf_sg_a, EpNone, 1)
-GGUF_SG_EXPERT(moe_expert_gguf_sg_g, EpUpWithGate, 1)
-GGUF_SG_EXPERT(moe_expert_gguf_sg_a_s2, EpNone, 2)
-GGUF_SG_EXPERT(moe_expert_gguf_sg_g_s2, EpUpWithGate, 2)
-#undef GGUF_SG_EXPERT

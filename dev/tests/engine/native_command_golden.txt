@@ -28,6 +28,8 @@ image_patches_rounded | --max-image-pixels 1000000 | auto auto --max-image-patch
 image_patches_default | --max-image-pixels 4194304 | auto auto
 idle_sleep | --allow-idle-sleep | auto auto --idle-sleep allow
 disable_ane | --disable-ane | auto auto --ane off
+activations_bf16 | --activations bf16 | auto auto --activations bf16
+activations_auto | --activations auto | auto auto
 verify_rows_all | --verify-rows all | auto auto --verify-rows all
 verify_rows_auto | --verify-rows auto | auto auto
 kv_format_default | --kv-format int8 | auto auto

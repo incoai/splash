@@ -381,6 +381,44 @@ void testLoopWakesForAnEngineDeadline() {
           "loop did not wake for the request deadline");
 }
 
+// While a part of the weights is written on its thread, the loop answers a
+// status request through the pipes, as the server's liveness probe asks it to
+// within supervision::kLoopStall; the write's end, signalled from that thread
+// through the loop's completion notifier, wakes the loop without any input,
+// and the restore goes on at once.
+void testTheLoopAnswersWhileTheWeightsAreWritten() {
+  Harness harness;
+  test::Weights &weights = harness.weights;
+  weights.writes = true;
+  harness.loop.announceReady(protocol::peer::kTestReady);
+  require(harness.loop.receive(protocol::peer::serialize(protocol::ReleaseRequestFrame{1})) && weights.released(),
+          "the weights were not released");
+  writeAll(harness.pipes.input[1], protocol::peer::serialize(requestFrame(7, 30'000'000)));
+  // Whether, within 5 s, `restores` images have been taken back, the last of
+  // them still being written.
+  const auto writingImage = [&weights](uint32_t restores) {
+    const auto limit = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (!(weights.restores == restores && weights.writing()) && std::chrono::steady_clock::now() < limit)
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    return weights.restores == restores && weights.writing();
+  };
+  auto loop = start(harness);
+  if (!writingImage(1))
+    abandon("the loop did not start writing the first image");
+  wakeWithStatusRequest(harness, 9);
+  const bool answered = awaitStatus(harness.pipes.output[0], 9, std::chrono::seconds(5));
+  const bool answeredWhileWriting = answered && weights.writing();
+  bool woke = true;
+  for (uint32_t image = 2; image <= test::Weights::kImages; ++image) {
+    weights.endWrite();
+    woke = woke && writingImage(image);
+  }
+  harness.transport.requestShutdown();
+  require(finish(loop) == engine::NativeProcessExit::CleanEof, "the loop did not end cleanly");
+  require(answeredWhileWriting, "the loop did not answer status while an image was written");
+  require(woke, "the end of an image's write did not wake the loop");
+}
+
 // While the loop spends longer in one pass than the server waits for a write
 // to progress, the reader takes a 1 MiB frame without stalling its writer;
 // the loop then handles it and the frame after it, in order.
@@ -723,6 +761,7 @@ int main() {
     testControlWaitsForTheCommandInFlight();
     testLoopRecordsItsLongestTick();
     testLoopWakesForAnEngineDeadline();
+    testTheLoopAnswersWhileTheWeightsAreWritten();
     testReaderReadsWhileTheLoopIsBusy();
     testQueueBoundStopsTheWriter();
     testShutdownAndTheTransportsEndStopTheReader();

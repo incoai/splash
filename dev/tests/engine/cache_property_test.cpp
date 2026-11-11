@@ -13,7 +13,9 @@
 #include <iterator>
 #include <map>
 #include <memory>
+#include <optional>
 #include <random>
+#include <set>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -67,8 +69,9 @@ private:
   bool disk_;
 };
 
-// One randomized run of the tiered block store: requests publish, spill, restore, convert and end
-// beside reclaims, quota and failing transfers; every step checks Cache::checkInvariants.
+// One randomized run of the tiered block store: requests publish, spill, restore, convert, release and end
+// beside reclaims, quota and failing transfers; every step checks Cache::checkInvariants. A run that spills does
+// so under --kv-spill always in half the runs (CacheSpillPolicy::always).
 class Run final {
 public:
   // With peeks, random claims count the walk's units and take them too
@@ -79,8 +82,8 @@ public:
       : random_(seed), windowed_(windowed), peeks_(peeks), usedStates_(usedStates),
         tier_(chance(50)),
         budget_(std::make_shared<model::DiskBudget>(kSlots * 100)),
-        cache_(pool_, &tier_, budget_,
-               windowed ? std::nullopt : std::optional(CacheSpillPolicy{pick(0, 2), pick(1, 2)}),
+        spill_(windowed ? std::nullopt : std::optional(CacheSpillPolicy{pick(0, 2), pick(1, 2), chance(50)})),
+        cache_(pool_, &tier_, budget_, spill_,
                windowed ? std::optional(CacheWindowPolicy{pick(1, 3)}) : std::nullopt) {
     tier_.budget = budget_;
     tier_.transferLimit = 64;
@@ -98,7 +101,7 @@ public:
   }
 
   void step() {
-    switch (pick(0, peeks_ ? 14 : 13)) {
+    switch (pick(0, peeks_ ? 17 : 16)) {
     case 0: start(); break;
     case 1: case 2: grow(); break;
     case 3: static_cast<void>(cache_.writeThrough()); break;
@@ -117,7 +120,10 @@ public:
     case 11: command(); break;
     case 12: persist(); break;
     case 13: failWrites(); break;
-    case 14: checkTake(); break;
+    case 14: release(); break;
+    case 15: countReleases(); break;
+    case 16: releaseExtents(); break;
+    case 17: checkTake(); break;
     }
     cache_.checkInvariants();
   }
@@ -128,6 +134,10 @@ public:
   // those offered as needing no write the same: a short one of those is one
   // of the classes checkTake names.
   uint64_t exactUnits = 0, shortUnits = 0, exactNoWrite = 0, shortNoWrite = 0;
+  // Releases of whole extents for bytes (releaseExtents): those taken, those whose last extent the free Full pages
+  // beside completed, those beside transfers in flight, and those that freed less than their count where the runway
+  // held less than an extent before, or where the runway's refill was refused and moved fewer pages.
+  uint64_t extentReleases = 0, besideReleases = 0, inFlightReleases = 0, shortRunwayReleases = 0, refusedReleases = 0;
 
   // Every request ends, every transfer lands, and nothing leaks: the pool's
   // pages and the tier's slots belong to the cache's blocks alone.
@@ -508,6 +518,143 @@ private:
     if (cache_.convertToSpill(idOf(*request), kMaximumPages)) request->mode = KvMode::Spill;
   }
 
+  // Guard: a claim releases a Spill request's oldest pages whose copies
+  // landed, for bytes or in place (Cache::releasePages), by a random rule: the
+  // requests it takes pages from, the request among them, and in half the
+  // steps the chain a Resident start on a base prompt's prefix restores, which
+  // it keeps. It moves no more than were clean, for bytes only where free
+  // Index and Full pages can empty an extent, and every page it moves is one
+  // each holder may read through its index and the rule lets the claim take:
+  // past every holder's dense history and short of its window, no Resident
+  // request's, none of a request the rule leaves out and none on the kept
+  // chain; and it gives Index pages only to the holders of the oldest page it
+  // counted. The KV cache's invariants check each had its copy.
+  void release() {
+    Request *request = anyRequest();
+    if (!spill_ || !request || request->mode != KvMode::Spill) return;
+    const uint64_t id = idOf(*request);
+    if (waiting(id)) return;
+    std::set<uint64_t> released{id};
+    for (const auto &[each, _] : requests_)
+      if (chance(50)) released.insert(each);
+    std::optional<CacheProbe> start;
+    if (chance(50)) {
+      const std::span<const uint32_t> base = bases_[pick(0, static_cast<uint32_t>(bases_.size()) - 1)];
+      start = cache_.probe(base.first(pick(1, kMaximumPages - 2) * KvCache::pageTokens + 1), {});
+    }
+    const std::span<const uint64_t> kept = start ? start->restoredChain() : std::span<const uint64_t>{};
+    const ReleaseRule rule{.takesFrom = [&](uint64_t holder) { return released.contains(holder); }, .kept = kept};
+    const auto indexPages = [&] {
+      std::set<std::pair<uint64_t, uint32_t>> pages;
+      for (const auto &[each, _] : requests_) {
+        const std::span<const uint32_t> table = cache_.pageTable(each).pages;
+        for (uint32_t index = 0; index < table.size(); ++index)
+          if (pool_.form(table[index]) == kv::PageForm::Index) pages.insert({each, index});
+      }
+      return pages;
+    };
+    const std::set<std::pair<uint64_t, uint32_t>> before = indexPages();
+    const engine::Cache::ReleasablePages releasable = cache_.releasablePages(id, rule);
+    const uint32_t freeBefore =
+        pool_.freePageCount(kv::PageForm::Index) + pool_.freePageCount(kv::PageForm::Full);
+    const bool inPlace = chance(50);
+    const uint32_t moved = cache_.releasePages(id, pick(1, 4), inPlace, rule);
+    require(moved <= releasable.clean, "a release moved " + std::to_string(moved) + " pages of " +
+                                           std::to_string(releasable.clean) + " whose copies landed");
+    require(inPlace || !moved || freeBefore >= pool_.extentPages(),
+            "a release for bytes moved pages where it could empty no Full extent");
+    for (const auto &[holder, index] : indexPages()) {
+      if (before.contains({holder, index})) continue;
+      const Request &held = requests_.at(holder);
+      require(held.mode == KvMode::Spill, "a release moved a page a Resident request holds");
+      require(index >= spill_->densePages && index + spill_->windowPages < held.pages,
+              "a release moved a page of a holder's dense history or window");
+      require(released.contains(holder), "a release moved a page a request it does not take pages from holds");
+      require(std::ranges::count(kept, cache_.blockAt(holder, (index + 1) * KvCache::pageTokens)) == 0,
+              "a release moved a page of the chain a start keeps");
+      require(std::ranges::count(releasable.holders, holder) != 0,
+              "a release gave Index pages to a request that does not hold its oldest page");
+    }
+  }
+
+  // Guard: a count of releases of Spill requests in turn, each of the whole
+  // extents of its pages whose copies landed, as a claim's units for bytes
+  // count them (ReleaseCount), never counts more than their takes in
+  // turn free: each request's count stays within the clean pages it holds
+  // when its take comes, a page several hold counting for the first, and a
+  // take gives a request its first Index pages only where a count named it.
+  // Counted for each request alone, a prefix two hold counts twice.
+  void countReleases() {
+    std::vector<uint64_t> order;
+    for (const auto &[id, request] : requests_)
+      if (request.mode == KvMode::Spill && !waiting(id) && chance(70)) order.push_back(id);
+    std::shuffle(order.begin(), order.end(), random_);
+    const ReleaseRule rule{.takesFrom = [&](uint64_t holder) { return std::ranges::count(order, holder) != 0; }};
+    const uint32_t extent = pool_.extentPages();
+    engine::ReleaseCount count;
+    std::vector<engine::Cache::ReleasablePages> counted;
+    for (const uint64_t id : order) {
+      counted.push_back(cache_.releasablePages(id, rule, count));
+      const uint32_t whole = counted.back().clean / extent;
+      cache_.countRelease(id, {.pages = whole * extent, .extents = whole}, false, rule, count);
+    }
+    std::set<uint64_t> named;
+    for (size_t each = 0; each < order.size(); ++each) {
+      const uint32_t pages = counted[each].clean / extent * extent;
+      const uint32_t clean = cache_.releasablePages(order[each], rule).clean;
+      require(clean >= pages, "a count of releases counted " + std::to_string(pages) + " pages of request " +
+                                  std::to_string(order[each]) + ", which held " + std::to_string(clean) +
+                                  " clean when its take came");
+      if (pages) named.insert(counted[each].holders.begin(), counted[each].holders.end());
+      std::set<uint64_t> reading;
+      for (const auto &[id, _] : requests_)
+        if (cache_.holdsIndexPages(id)) reading.insert(id);
+      static_cast<void>(cache_.releasePages(order[each], pages, false, rule));
+      for (const auto &[id, _] : requests_)
+        require(reading.contains(id) || !cache_.holdsIndexPages(id) || named.contains(id),
+                "a take gave request " + std::to_string(id) + " its first Index pages, whose reads no count named");
+    }
+  }
+
+  // A release of a Spill request's pages whose copies landed, in whole
+  // extents and the one the free Full pages beside complete
+  // (Cache::releaseBeside), as a claim's unit for bytes takes it
+  // (EngineVictims::releases), frees the bytes that unit counts of the
+  // extents it empties (Cache::releaseMoves), each page of them its Full
+  // bytes less its Index page's, wherever the Index runway held an extent
+  // before it, transfers in flight or not: its moves empty that many Full
+  // extents, none a page in transfer pins, which leave, and refill the runway
+  // an extent at a time. Short of the runway, its refill takes an Index
+  // extent more; a refused refill moves fewer pages: those are counted apart.
+  void releaseExtents() {
+    Request *request = anyRequest();
+    if (!spill_ || !request || request->mode != KvMode::Spill) return;
+    const uint64_t id = idOf(*request);
+    if (waiting(id)) return;
+    const uint32_t extent = pool_.extentPages();
+    const uint32_t beside = cache_.releaseBeside({});
+    const engine::Cache::ReleaseMoves moves =
+        cache_.releaseMoves(cache_.releasablePages(id, {}).clean, false, {.beside = beside});
+    if (!moves.pages) return;
+    const bool runway = pool_.freePageCount(kv::PageForm::Index) >= extent;
+    const bool inFlight = tier_.inFlight() != 0;
+    const uint64_t before = pool_.allocatedBytes();
+    const uint32_t moved = cache_.releasePages(id, moves.pages, false, {}, {}, beside);
+    const uint64_t freed = before - std::min(before, pool_.allocatedBytes());
+    const uint64_t counted = uint64_t{moves.extents} * extent *
+                             (storage_.bytesPerPage(kv::PageForm::Full) - storage_.bytesPerPage(kv::PageForm::Index));
+    ++extentReleases;
+    besideReleases += moves.pages < moves.extents * extent;
+    inFlightReleases += inFlight;
+    if (freed >= counted) return;
+    ++(moved < moves.pages ? refusedReleases : shortRunwayReleases);
+    require(moved < moves.pages || !runway,
+            "a release of " + std::to_string(moves.extents) + " extents of pages, moving " + std::to_string(moved) +
+                " beside " + std::to_string(beside) + " free Full pages" +
+                (inFlight ? " and transfers in flight" : "") + " with the runway whole, freed " +
+                std::to_string(freed) + " B of the " + std::to_string(counted) + " its count gives them");
+  }
+
   // A read of a spilled block fails. The engine applies the results of the
   // command that read it while the command, and what it read, lives on: the
   // lane ends and the block's copy is given up.
@@ -567,6 +714,7 @@ private:
   KvPool pool_{storage_, 4};
   test::TestKvTier tier_;
   std::shared_ptr<model::DiskBudget> budget_;
+  std::optional<CacheSpillPolicy> spill_;
   engine::Cache cache_;
   std::shared_ptr<Shelf> shelf_ = std::make_shared<Shelf>(Shelf{.budget = budget_});
   std::array<std::vector<uint32_t>, 3> bases_;
@@ -579,7 +727,8 @@ private:
 // Seeds 1..plainSeeds plain and 1..windowedSeeds windowed, plus windowed seed 9454 (a poisoned
 // block's write lands after its subtree left).
 void testRandomRuns(uint32_t plainSeeds, uint32_t windowedSeeds) {
-  const auto check = [](uint32_t seed, bool windowed) {
+  uint64_t releases = 0, beside = 0, inFlight = 0, shortRunway = 0, refused = 0;
+  const auto check = [&](uint32_t seed, bool windowed) {
     Run run(seed, windowed);
     try {
       for (int step = 0; step < 600; ++step)
@@ -591,13 +740,21 @@ void testRandomRuns(uint32_t plainSeeds, uint32_t windowedSeeds) {
       throw std::runtime_error(std::string(windowed ? "windowed " : "") + "seed " + std::to_string(seed) + ": " +
                                error.what());
     }
+    releases += run.extentReleases;
+    beside += run.besideReleases;
+    inFlight += run.inFlightReleases;
+    shortRunway += run.shortRunwayReleases;
+    refused += run.refusedReleases;
   };
   for (const bool windowed : {false, true})
     for (uint32_t seed = 1; seed <= (windowed ? windowedSeeds : plainSeeds); ++seed)
       check(seed, windowed);
   check(9454, true);
   std::cout << "cache property runs ok: " << plainSeeds << " plain seeds, " << windowedSeeds
-            << " windowed and windowed seed 9454\n";
+            << " windowed and windowed seed 9454; " << releases << " releases of whole extents, " << beside
+            << " of them completed by free pages beside, " << inFlight << " beside transfers in flight; of all, "
+            << shortRunway << " freed less than counted with the runway short of an extent and " << refused
+            << " with its refill refused\n";
 }
 
 // The same runs with random claims counted and taken (checkTake), again with requests using the states they resume

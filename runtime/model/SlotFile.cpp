@@ -645,13 +645,6 @@ bool SlotFile::stop(Backing &backing) noexcept {
 
 bool SlotFile::persistent() const noexcept { return backing_->persistent; }
 
-std::optional<struct statfs> SlotFile::volume() const noexcept {
-  struct statfs status {};
-  if (::fstatfs(backing_->descriptor, &status) < 0)
-    return std::nullopt;
-  return status;
-}
-
 uint64_t SlotFile::allocatedBytes() const noexcept {
   uint64_t bytes = 0;
   for (const int descriptor : {backing_->descriptor, backing_->records}) {

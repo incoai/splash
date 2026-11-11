@@ -17,6 +17,10 @@ class APIError(Exception):
         self.code = code
         # The seconds a retry status invites the client to wait (Retry-After).
         self.retry_after = retry_after
+        # Whether the console has its line: the backend logs the end of a
+        # request the engine took, a failure included, under the engine's
+        # id, and the HTTP handler does not log that failure again.
+        self.logged = False
 
 
 class RequestValidationError(APIError):

@@ -43,10 +43,6 @@ kv::Layout withoutIndex(kv::Layout layout) {
   return layout;
 }
 
-uint32_t extentsFor(uint64_t slots, uint32_t extentSlots) noexcept {
-  return static_cast<uint32_t>((slots + extentSlots - 1) / extentSlots);
-}
-
 } // namespace
 
 struct KvBlockCache::Impl {
@@ -93,7 +89,7 @@ struct KvBlockCache::Impl {
   }
   // required(n), in whole extents.
   [[nodiscard]] uint32_t floorExtents(uint32_t lanes) const noexcept {
-    return lanes ? extentsFor(uint64_t{lanes + 1} * laneSlots, extentSlots) : 0;
+    return KvBlockCache::floorExtents(lanes, laneSlots, pages.extentPages());
   }
   // Allocates extents up to `held` extents under one admission of `admit`,
   // or none of them.
@@ -152,11 +148,11 @@ KvBlockCache::Impl::Impl(metal::MetalBackend &backend, metal::AllocationAdmissio
                          const kv::Layout &layout, uint32_t extentPages, const KvBlockCacheOptions &options)
     : backend(backend), admission(admission), format(checked(layout, extentPages, options).format),
       readers(options.readers), laneSlots(options.laneSlots), extentSlots(extentPages << kPlaceBits),
-      targetExtents(static_cast<uint32_t>(options.targetBytes /
-                                          (uint64_t{extentPages} * layout.kvBytesPerModelPage()))),
+      targetExtents(KvBlockCache::targetExtents(layout, extentPages, options.targetBytes)),
       pages(backend, std::move(admission), withoutIndex(layout),
-            std::max(targetExtents, floorExtents(kLanes)) * extentPages, extentPages),
-      locationPages(backend.allocateBuffer(uint64_t{pages.pageCount()} * sizeof(SplashKvPage),
+            static_cast<uint32_t>(KvBlockCache::mostPages(layout, extentPages, options.laneSlots, options.targetBytes)),
+            extentPages),
+      locationPages(backend.allocateBuffer(tableBytes(layout, options.laneSlots, options.targetBytes),
                                            metal::BufferStorage::Shared, "kv-block-cache/location-pages")),
       recordBytes(format.recordBytes()), zeros(recordBytes),
       directory(layout.attentionLayers, SlotRecycler(0)) {}
@@ -426,6 +422,7 @@ KvBlockCacheStats KvBlockCache::stats() const {
   const Impl &impl = *impl_;
   const uint64_t extentBytes = impl.pages.extentBytes();
   return {.bytes = impl.extents * extentBytes,
+          .tableBytes = impl.locationPages.sizeBytes(),
           .targetBytes = impl.targetExtents * extentBytes,
           .floorBytes = impl.floorExtents(impl.floorLanes()) * extentBytes,
           .slotsPerLayer = impl.extents * impl.extentSlots,

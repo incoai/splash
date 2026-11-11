@@ -3,8 +3,9 @@ import SwiftTerm
 import SwiftUI
 
 /// What the drawer under the window's content holds (`WithDrawer`): terminals, each running the
-/// program `shell` names as it starts, in the home folder, and the logs of what the app runs. Whether it shows,
-/// and its height, are the window's (`AppState.showsDrawer`), as the sidebar's are.
+/// program `shell` names as it starts, in the home folder or a coding agent's project folder, and
+/// the logs of what the app runs. Whether it shows, and its height, are the window's
+/// (`AppState.showsDrawer`), as the sidebar's are.
 @MainActor @Observable
 final class Drawer {
     enum Part: Hashable { case terminal, logs }
@@ -15,6 +16,12 @@ final class Drawer {
     private(set) var terminals: [TerminalSession] = []
     var terminal: TerminalSession.ID?
     var log = LogSource.server
+    /// The terminal whose close waits for an answer: it runs a program, which closing ends.
+    var closing: TerminalSession.ID?
+    /// Called as the last terminal goes, for the window to close the drawer (`AppState`).
+    @ObservationIgnored var emptied: () -> Void = {}
+    /// The log's text while the drawer shows it, for Find… (`find`).
+    @ObservationIgnored weak var logText: NSTextView?
 
     init(shell: @escaping () -> Shell) {
         self.shell = shell
@@ -24,6 +31,14 @@ final class Drawer {
         terminals.append(session)
         terminal = session.id
         part = .terminal
+        // A shell that exits cleanly, as `exit` ends it, takes its tab with it, as in Terminal; one
+        // that fails stays, dimmed, with what it said.
+        session.exitedCleanly = { [weak self, id = session.id] in self?.close(id) }
+    }
+
+    /// Closes terminal `id`, or asks first where it runs a program, which closing ends (`closing`).
+    func askToClose(_ id: TerminalSession.ID) {
+        if terminals.first(where: { $0.id == id })?.runsProgram == true { closing = id } else { close(id) }
     }
 
     /// Ends terminal `id`'s shell and takes its tab away.
@@ -31,12 +46,36 @@ final class Drawer {
         guard let index = terminals.firstIndex(where: { $0.id == id }) else { return }
         terminals.remove(at: index).end()
         if terminal == id { terminal = terminals[safe: min(index, terminals.count - 1)]?.id }
+        if terminals.isEmpty { emptied() }
+    }
+
+    /// Shows the find bar of what the drawer shows, its terminal or its log, which takes the
+    /// keyboard.
+    func find() {
+        let view: NSView? = part == .terminal ? terminals.first { $0.id == terminal }?.view : logText
+        guard let view, let window = view.window, window.makeFirstResponder(view) else { return NSSound.beep() }
+        view.showFindBar()
+    }
+
+    /// Whether the keyboard is in the drawer, as `window` has it: with a terminal, each of which is
+    /// the drawer's, or its log, or the find bar of either; or with nothing, as when the terminal
+    /// that had it has closed. The drawer gives the composer the keyboard as it hides only then
+    /// (`WithDrawer`).
+    func hasKeyboard(in window: NSWindow?) -> Bool {
+        guard let responder = window?.firstResponder as? NSView else { return true }
+        let log = logText.map { $0.enclosingScrollView ?? $0 }
+        return sequence(first: responder, next: \.superview).contains { $0 is TypingTerminalView || $0 === log }
     }
 
     /// Ends every shell at once, for a quit that goes on to wait for the model or a download to
     /// stop. Any other end of the app hangs them up (`TerminalSession`).
     func endAll() {
         terminals.forEach { $0.end() }
+    }
+
+    /// How many terminals run a program besides their shell, which a quit ends (`AppState.QuitCost`).
+    var runningPrograms: Int {
+        terminals.count { $0.runsProgram }
     }
 }
 
@@ -68,23 +107,26 @@ struct Shell {
     }
 }
 
-/// A shell in a pseudo-terminal, as Terminal opens one, in the home folder, with the app's own
-/// environment (`Runtime.userEnvironment`), and Option typing what the keyboard layout gives, as
-/// there. Its view outlives the drawer's, so that a terminal keeps what it shows while the drawer
-/// is closed or the window shows another part.
+/// A shell in a pseudo-terminal, as Terminal opens one, in the home folder or a coding agent's
+/// project folder (`AppState.open`), with the app's own environment (`Runtime.userEnvironment`),
+/// and Option typing what the keyboard layout gives, as there. Its view outlives the drawer's, so
+/// that a terminal keeps what it shows while the drawer is closed or the window shows another part.
 @MainActor @Observable
 final class TerminalSession: Identifiable {
     let id = UUID()
-    /// What the shell calls itself, its title escape, or the home folder's name until it does.
+    /// What the shell calls itself, its title escape, or its folder's name until it does.
     private(set) var title: String
     private(set) var ended = false
-    @ObservationIgnored let view: LocalProcessTerminalView
+    @ObservationIgnored let view: TypingTerminalView
     @ObservationIgnored private var delegate: Delegate?
+    /// Called as the shell exits with no error (`Drawer.add`).
+    @ObservationIgnored var exitedCleanly: () -> Void = {}
 
-    init(shell: Shell, environment: [String: String]) {
-        let folder = URL.homeDirectory
+    /// Starts `shell` in `folder`, typing `typing` into it once, as a command a user typed at its
+    /// first prompt.
+    init(shell: Shell, environment: [String: String], folder: URL = .homeDirectory, typing: String? = nil) {
         title = folder.lastPathComponent
-        view = LocalProcessTerminalView(frame: NSRect(x: 0, y: 0, width: 640, height: 280))
+        view = TypingTerminalView(frame: NSRect(x: 0, y: 0, width: 640, height: 280))
         view.font = .monospacedSystemFont(ofSize: 12, weight: .regular)
         view.optionAsMetaKey = false
         let delegate = Delegate(self)
@@ -100,6 +142,7 @@ final class TerminalSession: Identifiable {
         // Only the app holds the terminal's master, not the shells started after this one, nor what
         // they leave running: the app's end hangs this shell up, however it ends.
         _ = fcntl(view.process.childfd, F_SETFD, FD_CLOEXEC)
+        if let typing { view.type(typing) }
     }
 
     /// Paints it in the window's appearance: the text and background of a text view.
@@ -110,6 +153,15 @@ final class TerminalSession: Identifiable {
             view.nativeBackgroundColor = NSColor.textBackgroundColor.usingColorSpace(.sRGB) ?? .textBackgroundColor
             view.caretColor = NSColor.controlAccentColor
         }
+    }
+
+    /// Whether a program other than the shell has the terminal, as a coding agent has it while it
+    /// runs: the terminal's foreground process group is not the shell's, which a shell at its
+    /// prompt holds itself.
+    var runsProgram: Bool {
+        guard !ended, view.process.shellPid != 0 else { return false }
+        let group = tcgetpgrp(view.process.childfd)
+        return group > 0 && group != view.process.shellPid
     }
 
     /// Hangs the shell up, as closing a terminal window does, which ends it and its jobs, and
@@ -142,13 +194,55 @@ final class TerminalSession: Identifiable {
 
         func hostCurrentDirectoryUpdate(source: TerminalView, directory: String?) {}
 
+        /// `exitCode` is the shell's status as `waitpid` gives it: 0 where it exited with no error.
         func processTerminated(source: TerminalView, exitCode: Int32?) {
             session?.ended = true
+            if exitCode == 0 { session?.exitedCleanly() }
         }
     }
 }
 
-/// A log the drawer shows: the server's, which each start begins again, and the downloads'.
+/// A terminal view that types a line into its shell as the shell first reads one: once its line
+/// editor takes the terminal (no canonical input), as zsh, bash and fish do to show their prompt,
+/// so that the line shows once, at the prompt, rather than echoed ahead of what the shell prints
+/// as it starts too; or after 5 s, for a shell without one, where a shell whose start outlasts
+/// them only has the line echoed ahead of what it prints.
+final class TypingTerminalView: LocalProcessTerminalView {
+    private var typing: String?
+    /// Whether it takes the keyboard as it moves into a window, once.
+    var takesKeyboard = false
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        guard takesKeyboard, window != nil else { return }
+        takesKeyboard = false
+        // Once the window has set itself up, which gives the keyboard to its content as it opens.
+        DispatchQueue.main.async { [weak self] in
+            guard let self, let window else { return }
+            window.makeFirstResponder(self)
+        }
+    }
+
+    func type(_ line: String) {
+        typing = line + "\n"
+        DispatchQueue.main.asyncAfter(deadline: .now() + 5) { [weak self] in self?.typeNow() }
+    }
+
+    override func dataReceived(slice: ArraySlice<UInt8>) {
+        super.dataReceived(slice: slice)
+        guard typing != nil else { return }
+        var settings = termios()
+        if tcgetattr(process.childfd, &settings) == 0, settings.c_lflag & tcflag_t(ICANON) == 0 { typeNow() }
+    }
+
+    private func typeNow() {
+        guard let typing else { return }
+        self.typing = nil
+        send(txt: typing)
+    }
+}
+
+/// A log the drawer shows: the server's and the downloads', which each download begins again.
 enum LogSource: String, CaseIterable {
     case server = "Server", downloads = "Downloads"
 
@@ -160,27 +254,85 @@ struct WithDrawer<Content: View>: View {
     @Environment(AppState.self) private var state
     @FocusState private var focused: Bool
     @ViewBuilder let content: Content
+    /// The room the content and the drawer share.
+    @State private var room: CGFloat = 0
+    /// Its AppKit view, for the window whose keyboard it gives back as it hides.
+    @State private var anchor = Anchor()
+
+    /// The tallest the drawer is: 640 points, leaving the content 240 at least, once the room is
+    /// measured.
+    private var tallest: CGFloat { room == 0 ? 640 : max(120, min(640, room - 240)) }
 
     var body: some View {
         let shown = state.showsDrawer
+        let height = min(state.drawerHeight, tallest)
         VStack(spacing: 0) {
+            // Nothing in the content or the drawer animates with the slide (`Slide`).
             content
+                .transaction(value: shown) { $0.animation = nil }
             // Closed, it keeps its place and its height, clipped to none, its terminals and their
-            // views with it; the keyboard leaves it.
-            DrawerView()
-                .frame(height: state.drawerHeight)
+            // views with it; the keyboard leaves it. Its tabs keep to its top edge, with no
+            // terminal under them too.
+            DrawerView(tallest: tallest)
+                .frame(height: height, alignment: .top)
                 .focused($focused)
-                .frame(height: shown ? state.drawerHeight : 0, alignment: .top)
-                .clipped()
+                .transaction(value: shown) { $0.animation = nil }
+                .modifier(Slide(shown: shown ? 1 : 0, height: height))
                 .allowsHitTesting(shown)
                 .accessibilityHidden(!shown)
         }
-        .onChange(of: shown) { if !shown { focused = false } }
+        // It slides as it shows and hides, the content giving it room. The change is animated here
+        // rather than where it is made: there it came in one turn after changes made without an
+        // animation, as a closing terminal's, which SwiftUI then updated the window for at once,
+        // reading the drawer as it was, and missed its closing.
+        .animation(Motion.settle, value: shown)
+        // The keyboard leaves it only where it is in it, for the composer: a terminal that exits
+        // while chat search or a rename field has it leaves it there.
+        .onChange(of: shown) {
+            if !shown && state.drawer.hasKeyboard(in: anchor.view?.window) {
+                focused = false
+                state.returnKeyboard()
+            }
+        }
+        .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { room = $0 }
+        .background(ViewAnchor { anchor.view = $0 })
+    }
+
+    /// A view's AppKit view, held by reference: taking it changes no state the view reads.
+    private final class Anchor {
+        weak var view: NSView?
+    }
+}
+
+/// The drawer's height as it slides, `shown` of `height`: one value SwiftUI animates, laying
+/// the window out again at each frame, so that what is above the drawer and in it moves with
+/// its edge whatever animates in it. Animating the views moved by the change instead moved each
+/// as it would animate: the Server's control bar, whose words change at once, jumped to where
+/// the drawer was going, over the screen, ahead of its own background and the drawer, and the
+/// tab of the terminal the drawer opened with faded in under the New Terminal button sliding
+/// past it.
+private struct Slide: ViewModifier, @preconcurrency Animatable {
+    var shown: CGFloat
+    let height: CGFloat
+
+    var animatableData: CGFloat {
+        get { shown }
+        set { shown = newValue }
+    }
+
+    func body(content: Content) -> some View {
+        content
+            // In whole points, so that the content's bottom and the drawer's edge, each rounded to
+            // the screen's pixels on its own, keep together through the slide.
+            .frame(height: (height * shown).rounded(), alignment: .top)
+            .clipped()
     }
 }
 
 private struct DrawerView: View {
     @Environment(AppState.self) private var state
+    /// The tallest the drawer is in the window it is in.
+    let tallest: CGFloat
     @State private var dragged: CGFloat?
     /// The terminal with the keyboard: the one shown, picked in the drawer shown; none otherwise.
     /// One value for them all moves the keyboard from the terminal hidden to the one shown in one
@@ -200,9 +352,9 @@ private struct DrawerView: View {
                         .pointerStyle(.frameResize(position: .top))
                         .gesture(DragGesture(minimumDistance: 1, coordinateSpace: .global)
                             .onChanged { value in
-                                let start = dragged ?? state.drawerHeight
+                                let start = dragged ?? min(state.drawerHeight, tallest)
                                 if dragged == nil { dragged = start }
-                                state.drawerHeight = min(max(start - value.translation.height, 120), 640)
+                                state.drawerHeight = min(max(start - value.translation.height, 120), tallest)
                             }
                             .onEnded { _ in dragged = nil })
                 }
@@ -224,6 +376,7 @@ private struct DrawerView: View {
                     }
                     .buttonStyle(.hover)
                     .help("Show in Finder")
+                    .accessibilityLabel("Show in Finder")
                 }
                 Button {
                     state.toggleDrawer()
@@ -232,6 +385,7 @@ private struct DrawerView: View {
                 }
                 .buttonStyle(.hover)
                 .help("Hide (⌘J)")
+                .accessibilityLabel("Hide Terminal and Logs")
             }
             .padding(.horizontal, 12)
             .frame(height: 36)
@@ -241,16 +395,19 @@ private struct DrawerView: View {
                 // its view and what it shows.
                 ForEach(drawer.terminals) { session in
                     let picked = drawer.part == .terminal && drawer.terminal == session.id
-                    TerminalPane(session: session, focused: $focused)
+                    TerminalPane(session: session, focused: $focused, shown: shown == session.id)
                         .opacity(picked ? 1 : 0)
                         .allowsHitTesting(picked)
                         .accessibilityHidden(!picked)
                 }
-                if drawer.part == .logs {
-                    LogText(url: drawer.log.url(in: state))
+                // Only while it shows: hidden, it would follow its file and lay its text out
+                // again at each change of the window's width. Shown, it has the keyboard.
+                if state.showsDrawer && drawer.part == .logs {
+                    LogText(url: drawer.log.url(in: state)) { drawer.logText = $0 }
                         .id(drawer.log)
                 }
             }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
         .background(.background)
         .onChange(of: shown, initial: true) { focused = shown }
@@ -261,39 +418,62 @@ private struct DrawerView: View {
 private struct TerminalTabs: View {
     @Environment(AppState.self) private var state
 
+    /// The New Terminal button's place in the strip.
+    private static let end = "New Terminal"
+
     var body: some View {
         let drawer = state.drawer
-        ScrollView(.horizontal, showsIndicators: false) {
-            HStack(spacing: 4) {
-                ForEach(drawer.terminals) { session in
-                    let picked = drawer.terminal == session.id
-                    HStack(spacing: 6) {
-                        Button { drawer.terminal = session.id } label: {
-                            Text(session.title)
-                                .lineLimit(1)
-                                .truncationMode(.middle)
-                                .frame(maxWidth: 160)
-                                .foregroundStyle(session.ended ? .tertiary : picked ? .primary : .secondary)
+        ScrollViewReader { proxy in
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 4) {
+                    ForEach(drawer.terminals) { session in
+                        let picked = drawer.terminal == session.id
+                        HStack(spacing: 6) {
+                            Button { drawer.terminal = session.id } label: {
+                                Text(session.title)
+                                    .lineLimit(1)
+                                    .truncationMode(.middle)
+                                    .frame(maxWidth: 160)
+                                    .foregroundStyle(session.ended ? .tertiary : picked ? .primary : .secondary)
+                            }
+                            .buttonStyle(.plain)
+                            Button { drawer.askToClose(session.id) } label: {
+                                Image(systemName: "xmark").font(.system(size: 9, weight: .semibold))
+                            }
+                            .buttonStyle(.plain)
+                            .foregroundStyle(.secondary)
+                            .help("Close Terminal")
+                            .accessibilityLabel("Close Terminal")
                         }
-                        .buttonStyle(.plain)
-                        Button { drawer.close(session.id) } label: {
-                            Image(systemName: "xmark").font(.system(size: 9, weight: .semibold))
-                        }
-                        .buttonStyle(.plain)
-                        .foregroundStyle(.secondary)
-                        .help("Close Terminal")
+                        .font(.callout)
+                        .padding(.horizontal, 10)
+                        .frame(height: 26)
+                        .background(picked ? AnyShapeStyle(.quaternary) : AnyShapeStyle(.clear), in: .capsule)
+                        .id(session.id)
                     }
-                    .font(.callout)
-                    .padding(.horizontal, 10)
-                    .frame(height: 26)
-                    .background(picked ? AnyShapeStyle(.quaternary) : AnyShapeStyle(.clear), in: .capsule)
+                    Button { state.newTerminal() } label: {
+                        Image(systemName: "plus")
+                    }
+                    .buttonStyle(.hover)
+                    .help("New Terminal")
+                    .accessibilityLabel("New Terminal")
+                    .id(Self.end)
                 }
-                Button { state.newTerminal() } label: {
-                    Image(systemName: "plus")
-                }
-                .buttonStyle(.hover)
-                .help("New Terminal")
             }
+            // The tab picked shows, past the tabs that fill the drawer's width, as one added does,
+            // the last, with New Terminal after it: they stayed out of view at the strip's end.
+            .onChange(of: drawer.terminal, initial: true) { _, id in
+                guard let id else { return }
+                proxy.scrollTo(id == drawer.terminals.last?.id ? AnyHashable(Self.end) : AnyHashable(id))
+            }
+        }
+        .confirmationDialog("Close this terminal?", isPresented: Binding(
+            get: { drawer.closing != nil }, set: { if !$0 { drawer.closing = nil } })) {
+            Button("Close", role: .destructive) {
+                if let id = drawer.closing { drawer.close(id) }
+            }
+        } message: {
+            Text("A program is running in it. Closing the terminal ends the program.")
         }
         Spacer(minLength: 0)
     }
@@ -305,9 +485,11 @@ private struct TerminalTabs: View {
 private struct TerminalPane: View {
     let session: TerminalSession
     let focused: FocusState<TerminalSession.ID?>.Binding
+    /// Whether it is the terminal the drawer shows.
+    let shown: Bool
 
     var body: some View {
-        Hosted(session: session)
+        Hosted(session: session, shown: shown)
             .focused(focused, equals: session.id)
             .padding(EdgeInsets(top: 6, leading: 10, bottom: 4, trailing: 4))
             .background(Color(nsColor: .textBackgroundColor))
@@ -315,12 +497,16 @@ private struct TerminalPane: View {
 
     private struct Hosted: NSViewRepresentable {
         let session: TerminalSession
+        let shown: Bool
 
         func makeNSView(context: Context) -> NSView {
             let container = NSView()
             session.view.removeFromSuperview()
             session.view.frame = container.bounds
             session.view.autoresizingMask = [.width, .height]
+            // Shown as its window opens, as ⌘J opens one, it takes the keyboard once in it: the
+            // drawer's focus can't give it before.
+            session.view.takesKeyboard = shown
             container.addSubview(session.view)
             return container
         }
@@ -334,9 +520,11 @@ private struct TerminalPane: View {
 /// A log file, read only, as it grows: the lines that start in its last `limit` bytes at first,
 /// then what is written to it, the line being written as far as it is, the oldest lines going an
 /// eighth of `limit` at a time past it; ⌘F finds in it. It keeps its place as it changes (`LogScrollView`). A file written
-/// again from its start, as the server's log is at each start, is read again from there.
+/// again from its start, as the downloads' log is at each download, is read again from there.
 struct LogText: NSViewRepresentable {
     let url: URL
+    /// Given its text view as it shows, which then takes the keyboard.
+    var shows: (NSTextView) -> Void = { _ in }
 
     /// How much of a log it holds: 512 KiB of its end at first, then as many UTF-16 units, which
     /// are never more than the bytes they decode from.
@@ -345,6 +533,8 @@ struct LogText: NSViewRepresentable {
     func makeNSView(context: Context) -> LogScrollView {
         let scroll = LogScrollView()
         context.coordinator.follow(url, in: scroll)
+        shows(scroll.text)
+        DispatchQueue.main.async { scroll.window?.makeFirstResponder(scroll.text) }
         return scroll
     }
 
