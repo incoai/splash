@@ -1897,14 +1897,15 @@ Unless that covers what the claim lacks, nothing is taken. Otherwise it takes
 the units one at a time, each found again from the head of its source as it
 stands, until what they freed now and as their transfers land covers the need
 (`MemoryLedger::take`). A lone claim (`ClaimSpec::lone`), an `InService` claim
-that can wait and lacks bytes with no other lane in service, its lane's or a
-start's, takes them whatever the count, and waits while it takes something: no
-lane yields for it, and the count adds up each unit in whole extents of its
-own, so their takes can free more together. Of two distinct prompts at the
-wall, the shorter, alone in decode once the other yielded, counted 219 MiB of
-the 290 MiB its hot block floor lacked in the pages the other left cached and
-its own release, where their takes free 316.5 MiB, and it failed having taken
-nothing. A unit whose take frees nothing is passed over: a
+whose refusal ends its lane (a lane's start, its KV growth or its reads, never
+a state it captures, which goes on without its buffers) that can wait and lacks
+bytes with no other lane in service, takes them whatever the count, and waits
+while it takes something: no lane yields for it, and the count adds up each unit
+in whole extents of its own, so their takes can free more together. Of two
+distinct prompts at the wall, the shorter, alone in decode once the other
+yielded, counted its hot block floor an extent short of what the pages the other
+left cached and its own release free together, 97.5 MiB, and it failed having
+taken nothing. A unit whose take frees nothing is passed over: a
 transfer in flight may hold it, or nothing of it is left. A claim met only by
 units that land later (a write it started, a conversion's copies, a lane's pages
 whose copies land) waits for them (`Pending`) and is retried as they land; one

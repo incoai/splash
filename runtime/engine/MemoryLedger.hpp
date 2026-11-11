@@ -99,9 +99,10 @@ struct ClaimSpec final {
   // margin once none meets the refusal (MemoryGovernor::free). It releases
   // its own lane's landed pages, as that next command would (takeRights).
   bool laneNeeds = false;
-  // An InService claim with no other lane in service, its own lane's or a
-  // start's (Engine::anotherResident): no lane yields for it, so short of
-  // what it lacks it takes what the order gives (MemoryLedger::free).
+  // An InService claim whose refusal ends its lane, with no other lane in
+  // service: a lane's start, its KV growth or its reads (Engine::allocate).
+  // No lane yields for it, so short of what it lacks it takes what the
+  // order gives (MemoryLedger::free).
   bool lone = false;
 };
 

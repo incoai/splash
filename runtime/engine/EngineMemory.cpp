@@ -862,8 +862,7 @@ ClaimSpec Engine::claimFor(const Request &active, ClaimClass cls) const {
           .requestId = active.request.id,
           .rank = rankOf(active),
           .reach = cls == ClaimClass::InService ? growthClass(active) : ReclaimClass::Ordinary,
-          .priority = active.request.priority,
-          .lone = cls == ClaimClass::InService && !anotherResident(active.request.id)};
+          .priority = active.request.priority};
 }
 
 bool Engine::yieldsBefore(const Request &a, const Request &b) const {

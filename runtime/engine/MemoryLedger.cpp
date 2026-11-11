@@ -763,7 +763,7 @@ FreeResult MemoryLedger::free(ClaimId claimId, const Need &need, uint64_t freeBy
     // A lone claim (ClaimSpec::lone) lacking bytes takes what the order gives
     // whatever the count: no lane yields for it, and the count adds up each
     // unit in whole extents of its own, so their takes can free more together
-    // (316.5 MiB where a lane alone in decode counted 219 MiB).
+    // (an extent more, 97.5 MiB, for a Flash-Next lane alone in decode).
     const bool lone = spec.lone && canWait && lack.bytes && most.bytes;
     if (most.covered || lone) {
       const uint64_t refusals = refusals_;

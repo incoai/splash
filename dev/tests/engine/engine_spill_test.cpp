@@ -3003,18 +3003,11 @@ void testTwoLanesThatDivergeFromOnePrefixCompleteWhereEachDoesAlone() {
   require(failed.empty(), "lanes failed at limits where each lane completes alone" + failed);
 }
 
-// Two distinct Spill prompts at the memory wall complete where each completes alone. With Flash-Next's prefill groups
-// (256 pages: a Spill lane keeps 514 pages Full) and its 8,192-row commands of six passes, a 2,740-page prompt and,
-// submitted while its first command runs, a 2,483-page one: the second has fewer rows left than the first past that
-// command, so it leads the next command and starts beside the first at once (Scheduler::prefillAdmissionOrder); one
-// page longer, it waits, queued, until the first's prefill ends, and both complete from 690 MB. Started together they
-// prefill side by side, each command's claim releasing the other's landed pages down to its floor; at the shorter's
-// decode its 390 MiB hot block floor is short, and the prefilling lane yields. Alone, the decoding lane's claim counted
-// the pages the yielded lane left cached and its own release in whole extents of each, at 700 MB 219 MiB of the 290 MiB
-// it lacked, where their takes free 316.5 MiB, and the lane failed capacity_exhausted from 690 to 720 MB having taken
-// nothing: a lone claim takes what the order gives (ClaimSpec::lone). On Qwen3.8-Flash-Next Q2_0 at --max-memory 9.4G
-// on a 48 GB M5 Pro, prompts of 87,682 and 79,475 tokens 0.5 s apart (15 rows the second's lead) failed so, where
-// 86,902 and 78,993 (283 rows the first's) completed and 1.6.0 completed both.
+// Two distinct Spill prompts at the memory wall complete where each completes alone. The second, leading the next
+// command (Scheduler::prefillAdmissionOrder), prefills beside the first; at its decode the first yields, and the
+// second, then alone, counted the pages the first left cached and its own release in whole extents of each, short of
+// what their takes free together: having taken nothing, it failed capacity_exhausted from 690 MB, where each completes
+// alone. A lone claim takes what the order gives whatever the count (ClaimSpec::lone).
 void testTwoDistinctSpillPromptsAtTheWallCompleteWhereEachDoesAlone() {
   Spilling::Pages pages = FlashNextLanes::kPages;
   pages.groupPages = 4 * model::ExecutionLimits::prefillTokenBudget / KvCache::pageTokens;
@@ -3050,12 +3043,10 @@ void testTwoDistinctSpillPromptsAtTheWallCompleteWhereEachDoesAlone() {
   require(failed.empty(), "two Spill prompts failed at limits where each completes alone" + failed);
 }
 
-// A Spill lane alone on the chain another lane left cached completes where it completes from an idle engine. Lane 1,
-// 2,241 pages of one context and 501 of its own, runs alone to its end, which it reaches from 685 MB, and leaves its
-// pages cached; then lane 2, the context and 251 pages of its own, runs alone on the chain it reuses. At 670 MB its
-// claim for its 390 MiB hot block floor counted lane 1's cached pages and its own release in whole extents of each,
-// short of what it lacked, and the lane failed capacity_exhausted having taken nothing, where from an idle engine it
-// completes: a lone claim takes what the order gives (ClaimSpec::lone).
+// A Spill lane alone on the chain another lane left cached completes where it completes from an idle engine. Its claim
+// for its hot block floor counted the cached pages and its own release in whole extents of each, short of what it
+// lacked, and having taken nothing it failed capacity_exhausted at 670 MB: a lone claim takes what the order gives
+// whatever the count (ClaimSpec::lone).
 void testALaneAloneOnTheChainAnotherLeftCompletesWhereItDoesFromIdle() {
   Spilling::Pages pages = FlashNextLanes::kPages;
   pages.groupPages = 4 * model::ExecutionLimits::prefillTokenBudget / KvCache::pageTokens;
@@ -3092,9 +3083,8 @@ void testALaneAloneOnTheChainAnotherLeftCompletesWhereItDoesFromIdle() {
 
 // A lone Spill lane fails capacity_exhausted only past what it holds alone, and then without waiting out its resource
 // wait: its claim takes what the order gives and waits while its writes are in flight, after which nothing else holds
-// memory it could get. A 2,740-page prompt completes from 690 MB; at 680 MB its 390 MiB hot block floor still lacks
-// 1.4 MiB once the lane's pages are released down to its floor. Where its copies never land, its wait ends with its
-// resource wait's limit; where they fail, the SSD cache's file takes no more writes, and it fails at once.
+// memory it could get. Where its copies never land, its wait ends at the resource wait's limit; where they fail, the
+// SSD cache's file takes no more writes, and it fails at once. The prompt completes from 690 MB.
 void testALoneLaneFailsOnlyPastWhatItHoldsAlone() {
   Spilling::Pages pages = FlashNextLanes::kPages;
   pages.groupPages = 4 * model::ExecutionLimits::prefillTokenBudget / KvCache::pageTokens;
