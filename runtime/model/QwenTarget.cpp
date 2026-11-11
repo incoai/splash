@@ -86,6 +86,8 @@ uint32_t QwenTarget::decodeStorageLanes(uint32_t lanes) const {
   return storageRows / kVerifyRows;
 }
 
+void QwenTarget::addInsideCapture(metal::CommandGraph &, metal::MetalBuffer, metal::MetalBuffer) const {}
+
 void QwenTarget::prepareVerifyLane(uint32_t, uint64_t, const QwenTargetRequest &) {}
 
 std::vector<uint32_t> QwenTarget::verifyTableRows(uint32_t) const { return {}; }

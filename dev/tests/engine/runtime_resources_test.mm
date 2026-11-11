@@ -1009,6 +1009,61 @@ void testARestoreAfterTheOtherWarmupsCreatesNothing(const char *metallibPath) {
           "a restore after the start's other warmups created pipelines: " + log);
 }
 
+// A verify's kernels follow its lanes' history, which the decode warmups'
+// is short of: past 7.2K tokens Apple10's INT8 attention scores INT8 queries
+// (verify_attention_q8q_split; no Apple9 GPU does). After the start's
+// warmups, a request of 8K tokens creates no pipeline: each decode warmup
+// created its verify's after the longest history.
+void testALongRequestAfterTheWarmupsCreatesNothing(const char *metallibPath) {
+  const test::TemporaryDirectory root("splash-long-request-pipelines");
+  RuntimeResourcesConfig config = loadableConfig(metallibPath, root.path(), "long-request-pipelines-test");
+  std::unique_ptr<RuntimeResources> resources;
+  static_cast<void>(test::capturedStderr([&] { resources = RuntimeResources::create(config, 0); }));
+  const EngineMemoryBreakdown &budget = resources->memoryPlan().breakdown();
+  std::unique_ptr<model::RuntimeModel> runtime;
+  require(static_cast<bool>(resources->memoryGovernor().allocationAdmission()(
+              budget.sharedPrefillBytes + budget.sharedDecodeBytes,
+              [&] { runtime = model::createRuntime(resources->modelContext()); })),
+          "the runtime's arenas were refused");
+  const KvPool::RunwayHold runway(resources->kvPool());
+  static_cast<void>(runtime->warmupPrefill(model::ExecutionLimits::prefillTokenBudget));
+  for (const uint32_t rows : resources->modelContext().operators.prefillRowClasses())
+    static_cast<void>(runtime->warmupPrefill(rows));
+  static_cast<void>(runtime->warmupDecodeBatch(1));
+  metal::MetalBackend &backend = resources->backend();
+  backend.beginServing();
+  // The prompt's pages repeat the runway's: what its attention reads does
+  // not matter here.
+  constexpr uint32_t chunk = model::ExecutionLimits::prefillTokenBudget, history = 4 * chunk;
+  const std::vector<uint32_t> prompt(history, 7);
+  std::vector<uint32_t> pages((history + model::ExecutionLimits::targetVerifyRows + kv::kPageTokens - 1) /
+                              kv::kPageTokens);
+  for (uint32_t page = 0; page < pages.size(); ++page) pages[page] = page % model::ExecutionLimits::warmupKvPages;
+  auto &executor = dynamic_cast<model::Runtime &>(*runtime);
+  constexpr uint64_t id = 736;
+  const std::string log = test::capturedStderr([&] {
+    executor.beginColdRequest({.id = id, .prompt = prompt, .maxNewTokens = 16}, 0);
+    for (uint32_t position = 0; position < history; position += chunk) {
+      ModelBatchItem item{
+          .requestId = id, .logicalPosition = position, .tokenCount = chunk, .pageTable = pages, .pageTableRevision = 1};
+      item.inputTokens = std::span(prompt).subspan(position, chunk);
+      const auto prefilled = executor.prefill({.kind = WorkKind::Prefill, .items = {{id, chunk}}},
+                                              std::span<const ModelBatchItem>(&item, 1));
+      require(prefilled.size() == 1 && prefilled[0].failure.empty() && prefilled[0].outputTokens.empty(),
+              "a chunk of the long request failed or ended it");
+    }
+    const ModelBatchItem item{
+        .requestId = id, .logicalPosition = history, .pageTable = pages, .pageTableRevision = 1};
+    const auto decoded = executor.decode({.kind = WorkKind::Decode, .items = {{id, 0}}},
+                                         std::span<const ModelBatchItem>(&item, 1));
+    require(decoded.size() == 1 && decoded[0].failure.empty() && !decoded[0].outputTokens.empty(),
+            "the long request's decode failed");
+    executor.end(id);
+  });
+  require(backend.pipelinesCreatedWhileServing() == 0,
+          "a request of 8K tokens after the start's warmups created pipelines: " + log);
+}
+
 // The SSD cache holds no write back unless a write budget is set; one that
 // is set starts with a quarter of a day's.
 void testWriteBudgetOnlyWhenSet(const char *metallibPath) {
@@ -1954,6 +2009,7 @@ int main(int argc, char **argv) {
       testStartChecksTheReserveWithWhatItServes(argv[1]);
       testYarnRuntime(argv[1]);
       testARestoreAfterTheOtherWarmupsCreatesNothing(argv[1]);
+      testALongRequestAfterTheWarmupsCreatesNothing(argv[1]);
       testWriteBudgetOnlyWhenSet(argv[1]);
       testStaleCachesGoAtEveryStart(argv[1]);
       testMadeCacheRootStaysOutOfBackups(argv[1]);
