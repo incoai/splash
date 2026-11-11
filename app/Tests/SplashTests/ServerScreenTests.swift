@@ -758,6 +758,68 @@ extension ServerScreenTests {
     }
 }
 
+/// A grouped page whose first section grows as a test says, and under it a row with a button that
+/// is enabled as it grows, as the suggestions' Download buttons are as a first download ends.
+@MainActor @Observable final class ButtonSample {
+    var grown = false
+}
+
+private struct ButtonSampleSections: View {
+    let sample: ButtonSample
+
+    var body: some View {
+        Group {
+            GroupedSection { Color.green.frame(height: sample.grown ? 320 : 20) }
+            GroupedSection {
+                LabeledContent {
+                    Button("Download") {}.disabled(!sample.grown)
+                } label: {
+                    Text("Model")
+                }
+            }
+        }
+        .animation(Motion.settle, value: sample.grown)
+    }
+}
+
+extension ServerScreenTests {
+    /// A labeled control moves with its row as one: as the row moves down, the button's title
+    /// stays on its bezel and in line with the row's label. The suggestions' Download buttons drew
+    /// their titles some 20 points under their bezels as the first download's end moved them.
+    @Test func aLabeledButtonMovesWithItsRowAsOne() async throws {
+        let sample = ButtonSample()
+        let (state, folder) = AppState.forTests()
+        defer { try? FileManager.default.removeItem(at: folder) }
+        let window = await Snapshot.window(GroupedPage(column: 640) { ButtonSampleSections(sample: sample) }.environment(state),
+                                           size: ServerPictures.size, appearance: .aqua)
+        defer { window.orderOut(nil) }
+        pump(0.3)
+        /// The middle, in points from the window's top, of the dark pixels from `left` to `right`
+        /// points in, in the page's part.
+        func middle(_ picture: NSBitmapImageRep, _ left: CGFloat, _ right: CGFloat) -> CGFloat? {
+            let rows = Self.page(picture, of: window, left: left, right: right), bytes = picture.bitsPerPixel / 8
+            let dark = rows.indices.filter { y in
+                stride(from: 0, to: rows[y].count - 2, by: bytes).contains { i in
+                    (Int(rows[y][rows[y].startIndex + i]) + Int(rows[y][rows[y].startIndex + i + 1]) + Int(rows[y][rows[y].startIndex + i + 2])) / 3 < 110
+                }
+            }
+            guard let first = dark.first, let last = dark.last else { return nil }
+            return CGFloat(first + last) / 2 / (CGFloat(picture.pixelsHigh) / window.frame.height)
+        }
+        let change = try await Self.pictures(of: window) { sample.grown = true }
+        // The row's label, at the column's start, and the button's title, at its end.
+        func apart(_ picture: NSBitmapImageRep) -> CGFloat? {
+            guard let label = middle(picture, 110, 300), let title = middle(picture, 560, 730) else { return nil }
+            return title - label
+        }
+        let settled = try #require(apart(change.after))
+        // A frame that still draws the button's title dimmed, as it was disabled, has no dark title.
+        let drawn = change.drawn.compactMap { apart($0.picture) }
+        #expect(drawn.count >= change.drawn.count / 2 && drawn.allSatisfy { abs($0 - settled) <= 2 },
+                "the button's title was \(drawn) points under the row's label, \(settled) once still")
+    }
+}
+
 /// The Server screen drawn to `server-*.png` in `SPLASH_APP_SNAPSHOTS`, light and dark, for people
 /// to review its look with the models of a Mac that has a few: at its top, and scrolled so that its
 /// first rows would be where the toolbar is.

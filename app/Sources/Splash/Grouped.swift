@@ -135,7 +135,10 @@ struct GroupedLabeledContent: LabeledContentStyle {
         HStack(alignment: .firstTextBaseline) {
             configuration.label
             Spacer(minLength: 16)
-            configuration.content.frame(height: Grouped.line)
+            // Moving with its row as one (`geometryGroup`): a button's title, redrawn as it was
+            // enabled, as the suggestions' Download buttons are as a first download ends, left its
+            // bezel for where the row ends up as the row moved down.
+            configuration.content.frame(height: Grouped.line).geometryGroup()
         }
     }
 }
