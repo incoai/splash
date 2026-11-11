@@ -36,8 +36,11 @@ enum Motion {
     /// How a section or a row of a page comes and goes as the state changes: one that goes, goes
     /// at once, and one that comes fades in within `settle` once what makes room for it has moved,
     /// so that nothing fades over what moves; in a switch of models a row faded out over the rows
-    /// moving into its place, and one faded in over those still moving away.
+    /// moving into its place, and one faded in over those still moving away. One that goes is
+    /// hidden at once, unanimated: left as it was (`identity`), it stayed drawn where it was until
+    /// the change's animations ended, as the suggestion downloaded first on the first run did,
+    /// over the rows moving into its place and the download's row fading in there.
     static var comingAndGoing: AnyTransition {
-        .asymmetric(insertion: .opacity.animation(settle?.delay(settleSeconds)), removal: .identity)
+        .asymmetric(insertion: .opacity.animation(settle?.delay(settleSeconds)), removal: .opacity.animation(nil))
     }
 }

@@ -640,6 +640,53 @@ extension ServerScreenTests {
     }
 }
 
+extension ServerScreenTests {
+    /// On the first run, the suggestion downloaded goes from the page at once: once the page has
+    /// moved to make room for the download's row, nothing of it shows where it was. It stayed drawn
+    /// there, over the download's row fading in, until the change's animations ended.
+    @Test func theFirstDownloadsSuggestionGoesAtOnce() async throws {
+        let fake = try FakeRuntime("splash-first-download", launcher: "stepped_server")
+        defer { try? FileManager.default.removeItem(at: fake.root) }
+        try FileManager.default.copyItem(at: Showcase.runtime.suggestedModels, to: Runtime(root: fake.root).suggestedModels)
+        try "print('\(Self.realisticFamilies)')".write(to: fake.root.appending(path: "install/families.py"), atomically: true, encoding: .utf8)
+        // An installer that downloads until the test ends.
+        try "import time\nwhile True:\n    time.sleep(0.05)\n".write(to: fake.root.appending(path: "install/models.py"), atomically: true, encoding: .utf8)
+        let state = fake.state(keychain: Keychain(service: "Splash Tests"))
+        defer { state.quit() }
+        await state.launch()
+        try await waitFor(!state.findingCachedModels, "the look through the cache")
+        let suggestion = try #require(state.catalog.suggestions(memory: Catalog.memory).first)
+        let window = await Snapshot.window(MainView().environment(state), size: ServerPictures.size, appearance: .aqua)
+        defer { window.orderOut(nil) }
+        pump(0.5)
+        let start = ContinuousClock.now
+        state.download(suggestion.id)
+        var drawn: [NSBitmapImageRep] = []
+        while ContinuousClock.now < start + .milliseconds(700) {
+            pump(0.03)
+            // Once the page has moved, `settle`.
+            if ContinuousClock.now > start + .milliseconds(350) { drawn.append(try #require(await Snapshot.picture(of: window))) }
+        }
+        pump(1)
+        let after = try #require(await Snapshot.picture(of: window))
+        /// Whether `picture` has dark text where the settled page has none, in the download's row
+        /// under its bar, where the suggestion's name was.
+        func stale(_ picture: NSBitmapImageRep) -> Bool {
+            let scale = CGFloat(picture.pixelsHigh) / window.frame.height, bytes = picture.bitsPerPixel / 8
+            func light(_ p: NSBitmapImageRep, _ x: Int, _ y: Int) -> Int {
+                let pixel = p.bitmapData! + y * p.bytesPerRow + x * bytes
+                return (Int(pixel[0]) + Int(pixel[1]) + Int(pixel[2])) / 3
+            }
+            return (Int(212 * scale)..<Int(260 * scale)).contains { y in
+                (Int(110 * scale)..<Int(400 * scale)).contains { x in light(picture, x, y) < 100 && light(after, x, y) > 220 }
+            }
+        }
+        #expect(!drawn.isEmpty)
+        let shown = drawn.filter(stale).count
+        #expect(shown == 0, "the suggestion downloaded showed in \(shown) of \(drawn.count) frames after the page moved")
+    }
+}
+
 /// The Server screen drawn to `server-*.png` in `SPLASH_APP_SNAPSHOTS`, light and dark, for people
 /// to review its look with the models of a Mac that has a few: at its top, and scrolled so that its
 /// first rows would be where the toolbar is.
