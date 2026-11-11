@@ -163,8 +163,8 @@ void DFlashDraft::addContextPrefill(
     if (span.ring.size() != layout.layers)
       throw std::invalid_argument("draft prefill ring layer mismatch");
   }
-  operators_.linear().addPrefill(graph, buffers.capturedTargetHidden, weights_.contextProjection,
-                                 buffers.projected, rows, buffers.linearScratch);
+  operators_.draftLinear().addPrefill(graph, buffers.capturedTargetHidden, weights_.contextProjection,
+                                      buffers.projected, rows, buffers.linearScratch);
   ops::Normalization::addRms(graph, buffers.projected, weights_.hiddenNorm, buffers.hidden, layout.hiddenSize,
                              rows);
   const uint64_t rowBytes = uint64_t{layout.hiddenSize} * sizeof(uint16_t);
@@ -203,8 +203,8 @@ void DFlashDraft::addContextKv(metal::CommandGraph &graph,
                                std::span<const DFlashPrefillSpan> spans) const {
   const DFlashDraftLayout &layout = weights_.layout;
   for (uint32_t layer = 0; layer < layout.layers; ++layer) {
-    operators_.linear().addPrefill(graph, buffers.hidden, contextKvProjections_[layer], buffers.contextKv, rows,
-                                   buffers.linearScratch);
+    operators_.draftLinear().addPrefill(graph, buffers.hidden, contextKvProjections_[layer], buffers.contextKv, rows,
+                                        buffers.linearScratch);
     for (const DFlashPrefillSpan &span : spans) {
       const uint64_t kvOffset =
           uint64_t{span.compactRow} * layout.contextKvSize() * sizeof(uint16_t);
@@ -227,7 +227,7 @@ void DFlashDraft::addContextKv(metal::CommandGraph &graph,
 }
 
 uint32_t DFlashDraft::decodeStorageLanes(uint32_t lanes) const {
-  const ops::Linear &linear = operators_.linear();
+  const ops::Linear &linear = operators_.draftLinear();
   const uint32_t rows = lanes * ExecutionLimits::draftQueryRows;
   uint32_t storageRows = rows;
   const auto include = [&](const ops::Projection &p) {
@@ -258,7 +258,7 @@ void DFlashDraft::addDecode(
   const uint32_t rows = lanes * ExecutionLimits::draftQueryRows;
   const auto attentionPlan =
       operators_.draftAttention(layout.attentionShape(), lanes);
-  const ops::Linear &linear = operators_.linear();
+  const ops::Linear &linear = operators_.draftLinear();
   const ops::LinearScratch &scratch = buffers.linearScratch;
 
   for (uint32_t layer = 0; layer < layout.layers; ++layer) {
@@ -331,11 +331,15 @@ void DFlashDraft::addDecode(
 
   // The final norm feeds the shared vocabulary head and then the selector;
   // the selector reuses whatever table the head leaves when the layouts match.
-  const ops::LinearPlan headPlan = linear.decodePlan(vocabularyProjection, lanes);
+  // The head is the target's weights, so it runs on the target's plans, as
+  // its scratch is sized (DecodeArena::linearScratchSize): only the draft's
+  // own projections keep bf16 activations.
+  const ops::Linear &target = operators_.linear();
+  const ops::LinearPlan headPlan = target.decodePlan(vocabularyProjection, lanes);
   const ops::PreparedInput finalHidden = ops::Normalization::addRms(
       graph, buffers.hidden[weights_.layout.layers & 1], weights_.finalNorm,
       buffers.finalHidden, layout.hiddenSize, rows, scratch, headPlan.input());
-  const ops::PreparedInput afterHead = linear.add(
+  const ops::PreparedInput afterHead = target.add(
       graph, {.input = buffers.finalHidden, .output = buffers.logits, .scratch = scratch, .prepared = finalHidden},
       vocabularyProjection, headPlan);
   linear.add(graph,
@@ -361,7 +365,7 @@ void DFlashDraft::addContextCommit(
   }
   const DFlashDraftLayout &layout = weights_.layout;
   const uint32_t rows = lanes * ExecutionLimits::targetVerifyRows;
-  const ops::Linear &linear = operators_.linear();
+  const ops::Linear &linear = operators_.draftLinear();
   const ops::LinearScratch &scratch = buffers.linearScratch;
   linear.add(graph, {.input = buffers.capturedTargetHidden, .output = buffers.projected, .scratch = scratch},
              weights_.contextProjection, linear.decodePlan(weights_.contextProjection, lanes));

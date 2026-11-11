@@ -326,6 +326,19 @@ struct Layout final {
     }
     return static_cast<uint32_t>(best);
   }
+  // The most `bytes(extentPages)` gives over every extent size above, for
+  // memory sized before a pool's extent is known: allocated at that most, or
+  // within it in the pool's extents, it holds whichever the pool takes. In
+  // Qwen3.8-Flash-Next's BF16 extents, 1,024 pages take 1,152 in extents of
+  // 192 and 1,120 in the largest, of 224.
+  template <class Bytes>
+  [[nodiscard]] constexpr uint64_t mostOverExtents(const Bytes &bytes) const {
+    uint64_t most = 0;
+    const uint32_t step = extentAlignmentPages();
+    for (uint64_t extent = minimumExtentPages(); step && extent && extent <= maximumExtentPages(); extent += step)
+      most = std::max<uint64_t>(most, bytes(static_cast<uint32_t>(extent)));
+    return most;
+  }
 
   bool operator==(const Layout &) const = default;
 };

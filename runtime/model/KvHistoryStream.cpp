@@ -20,9 +20,6 @@
 namespace splash::model {
 namespace {
 
-// A staging page per page of the longest sequence.
-constexpr uint64_t kMostPages = (uint64_t{kv::kMaximumPhysicalTokens} + kv::kPageTokens - 1) / kv::kPageTokens;
-
 // Staging's pages: one layer of the pool's K/V, at the pool's places in an
 // extent.
 kv::Layout oneLayer(kv::Layout layout) {
@@ -125,11 +122,11 @@ KvHistoryStream::Impl::Impl(metal::MetalBackend &backend, metal::AllocationAdmis
                             kv::SlotFormat format, uint32_t buffers)
     : format(checked(layout, format, readers.get(), buffers)), readers(std::move(readers)), buffers(buffers),
       admission(admission), layerBytes(this->format.layerRange(0).bytes) {
-  const uint64_t pages = (kMostPages + extentPages - 1) / extentPages * extentPages;
+  const uint64_t pages = KvHistoryStream::stagedPages(extentPages);
   for (uint32_t buffer = 0; buffer < buffers; ++buffer) {
     staging.push_back(std::make_unique<kv::PageStorage>(backend, admission, oneLayer(layout),
                                                         static_cast<uint32_t>(pages), extentPages));
-    tables.push_back(backend.allocateBuffer(pages * sizeof(SplashKvPage), metal::BufferStorage::Shared,
+    tables.push_back(backend.allocateBuffer(tableBytes(layout), metal::BufferStorage::Shared,
                                             "kv-history/table-" + std::to_string(buffer)));
   }
   counts.buffers = buffers;
@@ -366,6 +363,7 @@ KvHistoryStreamStats KvHistoryStream::stats() const {
   const Impl &impl = *impl_;
   KvHistoryStreamStats result = impl.counts;
   result.stagingBytes = impl.extents * impl.buffers * impl.staging.front()->extentBytes();
+  for (const metal::MetalBuffer &table : impl.tables) result.tableBytes += table.sizeBytes();
   result.read = impl.readTimes.snapshot();
   result.wait = impl.waits.snapshot();
   return result;

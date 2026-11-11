@@ -1,10 +1,25 @@
 import Foundation
+import Synchronization
+
+/// What the user's login shell sets for Hugging Face (`Runtime.readShellSettings`), read once the
+/// app launches, which every copy of a runtime shares.
+final class ShellSettings: Sendable {
+    private let store = Mutex<[String: String]>([:])
+
+    var values: [String: String] { store.withLock { $0 } }
+
+    func set(_ values: [String: String]) {
+        store.withLock { $0 = values }
+    }
+}
 
 /// The Splash runtime the app runs: the packaged release tree inside the app bundle, or, for
 /// development, the tree `SPLASH_RUNTIME` names (a packaged tree or a source checkout). Its layout
 /// and data folders are the ones `install/paths.py` resolves.
 struct Runtime: Sendable {
     let root: URL
+    /// The Hugging Face settings of the user's login shell, once read (`readShellSettings`).
+    let shellSettings = ShellSettings()
 
     static func locate() -> Runtime? {
         let candidates = [
@@ -45,6 +60,11 @@ struct Runtime: Sendable {
         scriptCommand("install/models.py", ["--model", model, "prepare", "--json-progress"])
     }
 
+    /// The command line of the installer removing `model`, an installed one.
+    func removeCommand(_ model: String) -> [String] {
+        scriptCommand("install/models.py", ["--model", model, "remove"])
+    }
+
     /// Whether `pid` runs this runtime's installer as an app starts it (`installCommand`), for any
     /// model, as the kernel keeps its arguments; `splash serve` runs it with others. Its program is
     /// left out: an interpreter can start another in its place, under the same ID and arguments,
@@ -73,8 +93,81 @@ struct Runtime: Sendable {
     /// writing bytecode.
     var environment: [String: String] {
         var environment = userEnvironment
+        // Where the Hugging Face cache is, the token and the like, as `splash` in a terminal has them.
+        environment.merge(shellSettings.values) { $1 }
         environment["PYTHONNOUSERSITE"] = "1"
         return environment
+    }
+
+    /// The Hugging Face settings of the user's login shell, which an app doesn't get, as `shell`
+    /// has them started as a terminal starts it, interactive: the variables `takesShellSetting`
+    /// names, such as where the cache is and the token. They come through a pipe, never a file,
+    /// and the shell gives those alone (`shellSettingsCommand`), so that no other variable, a
+    /// secret among them, leaves it. None where it gives none within `limit`, which then stops it:
+    /// the launch waits for this, and 5 s outlasts an rc file that loads a version manager.
+    @MainActor
+    static func readShellSettings(_ shell: Shell, environment: [String: String] = ProcessInfo.processInfo.environment,
+                                  limit: Duration = .seconds(5)) async -> [String: String] {
+        var ends: [Int32] = [-1, -1]
+        guard pipe(&ends) == 0 else { return [:] }
+        // Neither end goes to another program the app starts; the shell gets the writing end as
+        // its output.
+        for end in ends { _ = fcntl(end, F_SETFD, FD_CLOEXEC) }
+        let output = PipeOutput(ends[0])
+        let marker = "SPLASH-SHELL-SETTINGS"
+        let script = "printf '\\0\(marker)\\0'; \(shellSettingsCommand); printf '\(marker)\\0'"
+        let (ended, end) = AsyncStream<Int32>.makeStream()
+        let child = try? ChildProcess(command: [shell.path] + shell.arguments + ["-i", "-l", "-c", script],
+                                      environment: environment, output: ends[1], exited: { end.yield($0); end.finish() })
+        close(ends[1])
+        guard let child else {
+            _ = output.finish()
+            return [:]
+        }
+        let timer = Task { @MainActor in
+            try await Task.sleep(for: limit)
+            child.stop(SIGKILL, killAfter: .zero)
+        }
+        var status: Int32?
+        for await code in ended { status = code }
+        timer.cancel()
+        let data = output.finish()
+        guard status == 0 else { return [:] }
+        return shellSettings(in: data, between: marker)
+    }
+
+    /// Whether the app takes the login shell's variable `name`: those the Hugging Face tools read,
+    /// by their `HF_` and `HUGGINGFACE_` prefixes, the token's older name, and where caches go,
+    /// which holds the Hugging Face cache unless `HF_HOME` says otherwise.
+    nonisolated static func takesShellSetting(_ name: String) -> Bool {
+        shellSettingPrefixes.contains { name.hasPrefix($0) } || shellSettingNames.contains(name)
+    }
+
+    private nonisolated static let shellSettingPrefixes = ["HF_", "HUGGINGFACE_"]
+    private nonisolated static let shellSettingNames = ["HUGGING_FACE_HUB_TOKEN", "XDG_CACHE_HOME"]
+
+    /// The command the login shell runs to give the variables the app takes, each `NAME=value`
+    /// and a NUL: zsh, which every Mac has, picks them by name from the environment the shell
+    /// gives it, whatever their values hold, newlines or other bytes.
+    nonisolated static var shellSettingsCommand: String {
+        let pattern = (shellSettingPrefixes + shellSettingNames.map { $0 + "=" }).joined(separator: "|")
+        return #"/bin/zsh -f -c 'print -rN -- ${(M)${(0)"$(/usr/bin/env -0)"}:#("# + pattern + #")*}'"#
+    }
+
+    /// The variables the app takes of the NUL-terminated records between two `marker` records,
+    /// whatever the shell printed around them.
+    nonisolated static func shellSettings(in output: Data, between marker: String) -> [String: String] {
+        let records = output.split(separator: 0, omittingEmptySubsequences: false).map { String(decoding: $0, as: UTF8.self) }
+        guard let start = records.firstIndex(of: marker),
+              let end = records[(start + 1)...].firstIndex(of: marker)
+        else { return [:] }
+        var settings: [String: String] = [:]
+        for record in records[(start + 1)..<end] {
+            guard let equals = record.firstIndex(of: "=") else { continue }
+            let name = String(record[..<equals])
+            if takesShellSetting(name) { settings[name] = String(record[record.index(after: equals)...]) }
+        }
+        return settings
     }
 
     /// The app's own environment (an app does not get the shell's), without an API key the server
@@ -161,8 +254,8 @@ struct Runtime: Sendable {
         return (try? JSONDecoder().decode(Owner.self, from: data))?.pid
     }
 
-    /// What the launcher serving `port`, or the server it runs as, last wrote of its start
-    /// (`server/serve_record.py`), beside the port's lock; nil before one has.
+    /// What the launcher serving `port`, or the server it runs as, last wrote of its start or its
+    /// stop (`server/serve_record.py`), beside the port's lock; nil before one has.
     func serveRecord(port: Int) -> ServeRecord? {
         guard let data = try? Data(contentsOf: locks.appending(path: "serve-\(port).json")) else { return nil }
         return try? JSONDecoder().decode(ServeRecord.self, from: data)
@@ -184,9 +277,51 @@ struct Runtime: Sendable {
     }
 }
 
+/// A pipe's reading end, read as data comes, on a queue of its own, so that its writer never
+/// waits on a full pipe.
+private final class PipeOutput: @unchecked Sendable {
+    private let descriptor: Int32
+    private let queue = DispatchQueue(label: "PipeOutput")
+    private let source: DispatchSourceRead
+    /// What came, on the queue alone.
+    private var data = Data()
+
+    init(_ descriptor: Int32) {
+        self.descriptor = descriptor
+        _ = fcntl(descriptor, F_SETFL, O_NONBLOCK)
+        source = DispatchSource.makeReadSource(fileDescriptor: descriptor, queue: queue)
+        source.setEventHandler { [weak self] in self?.read() }
+        source.setCancelHandler { close(descriptor) }
+        source.resume()
+    }
+
+    /// What came, once the writer has ended, and the pipe closed: read as far as it holds data
+    /// rather than to its end, which a program the writer left running can hold off.
+    func finish() -> Data {
+        queue.sync {
+            read()
+            source.cancel()
+            return data
+        }
+    }
+
+    private func read() {
+        var buffer = [UInt8](repeating: 0, count: 1 << 16)
+        while !source.isCancelled {
+            let count = Darwin.read(descriptor, &buffer, buffer.count)
+            // At its end, which every writer has closed, it is read no more: the source would go
+            // on firing.
+            if count == 0 { source.cancel() }
+            guard count > 0 else { return }
+            data.append(contentsOf: buffer[..<count])
+        }
+    }
+}
+
 /// What a launcher writes of its start, as itself or as the server it runs as: the process, the
-/// phase of its start, and, for a start that failed, why: the class of the failure, with what it
-/// needed against what it had for a shortfall, and its message.
+/// phase of its start, while warming how far the warm-up is, and, for a server that ended on a
+/// failure, at its start or once ready, why: the class of the failure, with what it needed against
+/// what it had for a shortfall, and its message.
 struct ServeRecord: Decodable, Equatable {
     /// Starting; loading the model's weights; running the model once (warming); answering; or
     /// failed.
@@ -194,10 +329,17 @@ struct ServeRecord: Decodable, Equatable {
         case starting, loading, warming, ready, failed
     }
 
+    /// The steps of the engine's warm-up done, of all, as it begins and as each step ends: a step
+    /// is one of the commands it runs, not a share of its time.
+    struct Warmup: Decodable, Equatable {
+        let steps_done: Int
+        let steps: Int
+    }
+
     struct Failure: Decodable, Equatable {
         /// The class of the failure: a `StartFailureKind` name, lowercased, which the engine, the
-        /// launcher or the server writes, or the frontend's own "port", "upgrade" or "install"
-        /// (`server/serve_record.py`).
+        /// launcher or the server writes, or the frontend's own "port", "upgrade", "install" or
+        /// "stopped" (`server/serve_record.py`).
         let kind: String
         let message: String
         /// What bounds a memory or context shortfall: "device_memory", "max_memory" or "disk".
@@ -209,6 +351,7 @@ struct ServeRecord: Decodable, Equatable {
 
     let pid: Int32
     let phase: Phase
+    let warmup: Warmup?
     let failure: Failure?
 }
 
@@ -223,6 +366,10 @@ struct InstalledModel: Identifiable, Hashable, Sendable {
     /// Its family, as its assembly record names it; nil for model files on this Mac not prepared yet.
     var family: String?
 
+    /// Whether it is model files on this Mac that are a GGUF file, or a folder holding one besides
+    /// a projector, as they were measured; the vision projector they may be given is a GGUF's.
+    var gguf = false
+
     /// Whether it is model files on this Mac rather than a model Splash installed.
     var local: Bool { id.hasPrefix("/") }
 
@@ -236,6 +383,10 @@ struct InstalledModel: Identifiable, Hashable, Sendable {
         let bytes = files.reduce(Int64(0)) { total, file in
             total + Int64((try? file.resolvingSymlinksInPath().resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0)
         }
-        return InstalledModel(id: path, bytes: bytes)
+        var model = InstalledModel(id: path, bytes: bytes)
+        model.gguf = files.contains {
+            $0.pathExtension.lowercased() == "gguf" && !$0.lastPathComponent.localizedCaseInsensitiveContains("mmproj")
+        }
+        return model
     }
 }

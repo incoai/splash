@@ -443,6 +443,7 @@ class ThinkingEndTextTests(unittest.TestCase):
             server.main()
         self.assertEqual(raised.exception.code, 1)
         http.server_activate.assert_not_called()
+        fixtures.console_written()
         return stderr.getvalue(), native, backend
 
     def test_startup_refuses_a_text_before_starting_the_native_worker(self):

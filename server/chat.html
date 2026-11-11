@@ -77,9 +77,14 @@
   #empty { position: fixed; top: calc(50% - 58px); left: calc(var(--sidebar) + (100vw - var(--sidebar)) / 2); transform: translateX(-50%); font-size: 25px; font-weight: 600; letter-spacing: -.025em; transition: left var(--sidebar-duration) ease }
   .message { margin: 28px 0; overflow-wrap: anywhere }
   .user { width: fit-content; max-width: 80%; margin-left: auto; padding: 10px 16px; border-radius: 20px; background: var(--bubble); white-space: pre-wrap }
-  .user-images { display: flex; flex-wrap: wrap; gap: 8px }
-  .user-text + .user-images { margin-top: 9px }
-  .user-images img { display: block; width: min(240px, 100%); max-height: 240px; border-radius: 12px; object-fit: cover }
+  .user-attachments { display: flex; flex-wrap: wrap; gap: 8px }
+  .user-text + .user-attachments { margin-top: 9px }
+  .user-attachments img { display: block; width: min(240px, 100%); max-height: 240px; border-radius: 12px; object-fit: cover }
+  .user-file, .attachment-file { display: flex; flex-direction: column; justify-content: center; min-width: 0; padding: 8px 12px; border: 1px solid var(--border); border-radius: 12px; background: var(--composer); line-height: 1.3; white-space: nowrap }
+  .user-file { max-width: 240px }
+  .file-name { overflow: hidden; text-overflow: ellipsis; font-size: 13px }
+  .file-detail { color: var(--muted); font-size: 11px }
+  .file-detail.error { color: #d33 }
   .assistant { padding: 0 4px }
   .content blockquote { margin: 0 0 1em; padding-left: 14px; border-left: 2px solid var(--border); color: var(--muted) }
   .content hr { margin: 1.5em 0; border: 0; border-top: 1px solid var(--border) }
@@ -119,9 +124,11 @@
   #attachments { display: flex; gap: 8px; overflow-x: auto; padding: 2px 0 8px }
   #attachments:empty { display: none }
   .attachment { position: relative; width: 58px; height: 58px; flex: none }
+  .attachment.pdf { width: auto; max-width: 200px }
+  .attachment-file { height: 100% }
   .attachment img, .attachment-status { width: 100%; height: 100%; border: 1px solid var(--border); border-radius: 12px; object-fit: cover }
   .attachment-status { display: grid; place-items: center; padding: 4px; background: var(--bubble); text-align: center; font-size: 11px; line-height: 1.2 }
-  .remove-image { position: absolute; top: -5px; right: -5px; display: grid; width: 20px; height: 20px; place-items: center; border-radius: 50%; color: #fff; background: #333; font-size: 15px; line-height: 1 }
+  .remove-attachment { position: absolute; top: -5px; right: -5px; display: grid; width: 20px; height: 20px; place-items: center; border-radius: 50%; color: #fff; background: #333; font-size: 15px; line-height: 1 }
   textarea { display: block; width: 100%; max-height: 180px; padding: 6px 0; resize: none; border: 0; outline: 0; background: transparent }
   textarea::placeholder { color: var(--muted) }
   .toolbar { display: flex; flex: none; align-items: center; gap: 5px }
@@ -199,12 +206,12 @@
 <main><div id="chat"></div></main>
 <form id="form">
   <button id="scroll-bottom" type="button" hidden aria-label="Jump to latest message">&#8595; Jump to latest</button>
-  <button id="attach" type="button" aria-label="Add images" title="Add images">
+  <button id="attach" type="button" aria-label="Add images or PDFs" title="Add images or PDFs">
     <svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg>
   </button>
-  <input id="image-input" type="file" accept="image/*" multiple hidden>
+  <input id="file-input" type="file" accept="image/*,application/pdf" multiple hidden>
   <div class="composer">
-    <div id="attachments" aria-label="Attached images"></div>
+    <div id="attachments" aria-label="Attachments"></div>
     <textarea id="input" rows="1" placeholder="Message Splash" autofocus></textarea>
   </div>
   <div class="toolbar">
@@ -228,7 +235,7 @@
   const form = $('#form');
   const input = $('#input');
   const attachmentsBox = $('#attachments');
-  const imageInput = $('#image-input');
+  const fileInput = $('#file-input');
   const attach = $('#attach');
   const thinking = $('#thinking');
   const effort = $('#effort');
@@ -286,8 +293,11 @@
   let attachments = [];
   let controller;
   let followResponse = false;
-  // Until /v1/models says otherwise; a text-only model takes no images.
+  // Until /v1/models says otherwise; a text-only model takes no images and no PDFs.
   let imagesAccepted = true;
+  let pdfsAccepted = true;
+  // What a request may carry, as /v1/models says; null until it does.
+  let limits = null;
 
   selectEffort();
 
@@ -300,8 +310,8 @@
     if (response.status === 401) credentials.hidden = false;
   }
 
-  // What the served model takes, as /v1/models reports it: images or text
-  // alone, and the efforts it tells apart.
+  // What the served model takes, as /v1/models reports it: images and PDFs or
+  // text alone, what a request may carry, and the efforts it tells apart.
   async function loadModel() {
     try {
       const response = await fetch('/v1/models', {headers: authorization()});
@@ -311,8 +321,11 @@
       const modalities = model?.input_modalities;
       if (!Array.isArray(modalities)) return;
       imagesAccepted = modalities.includes('image');
-      attach.hidden = !imagesAccepted;
-      if (!imagesAccepted) clearAttachments();
+      pdfsAccepted = modalities.includes('pdf');
+      limits = model.limits ?? null;
+      attach.hidden = !imagesAccepted && !pdfsAccepted;
+      attachments = attachments.filter(attachment => takes(attachment.type));
+      renderAttachments();
       showEfforts(model.reasoning);
     } catch { /* The server still rejects input the model cannot take. */ }
   }
@@ -363,13 +376,26 @@
     catch { /* Chat still works if browser storage is full or disabled. */ return false; }
   }
 
+  // What a message says in place of an image or a PDF that isn't kept.
+  function notSaved(part) {
+    return {type: 'text', text: part.type === 'image_url' ? '[Image not saved]' : `[${part.file?.filename || 'PDF'} not saved]`};
+  }
+
+  // A saved question's text, images and PDFs; an image or a PDF that can't be
+  // read back says so in its place, so the question stays with its answer.
   function cleanUserContent(content) {
     if (typeof content === 'string') return content;
     if (!Array.isArray(content)) return null;
     const clean = content.flatMap(part => {
       if (part?.type === 'text' && typeof part.text === 'string') return [{type: 'text', text: part.text}];
       const url = part?.type === 'image_url' ? part.image_url?.url : null;
-      return typeof url === 'string' && url.startsWith('data:image/') ? [{type: 'image_url', image_url: {url}}] : [];
+      if (typeof url === 'string' && url.startsWith('data:image/')) return [{type: 'image_url', image_url: {url}}];
+      const file = part?.type === 'file' ? part.file : null;
+      if (typeof file?.file_data === 'string' && file.file_data.startsWith('data:application/pdf;base64,')) {
+        const filename = typeof file.filename === 'string' ? file.filename : 'PDF';
+        return [{type: 'file', file: {filename, file_data: file.file_data}}];
+      }
+      return part?.type === 'image_url' || part?.type === 'file' ? [notSaved(part)] : [];
     });
     return clean.length ? clean : null;
   }
@@ -393,7 +419,11 @@
         if (!conversation || typeof conversation.id !== 'string' || seen.has(conversation.id) ||
             typeof conversation.title !== 'string' || !Number.isFinite(conversation.updated) ||
             !Array.isArray(conversation.messages)) return [];
-        const messages = conversation.messages.map(cleanMessage).filter(Boolean);
+        // A question and its answer go together where either can't be read, so
+        // the turns still alternate, as a model's chat template needs them to.
+        const read = conversation.messages.map(cleanMessage);
+        const messages = read.filter((message, index) => message &&
+          (message.role === 'user' ? read[index + 1] !== null : read[index - 1]?.role === 'user'));
         if (!messages.length) return [];
         seen.add(conversation.id);
         return [{id: conversation.id, title: conversation.title, updated: conversation.updated, messages}];
@@ -401,31 +431,39 @@
     } catch { return []; }
   }
 
-  function hasImages(conversation) {
+  function hasAttachments(conversation) {
     return conversation.messages.some(message => Array.isArray(message.content) &&
-      message.content.some(part => part.type === 'image_url'));
+      message.content.some(part => part.type === 'image_url' || part.type === 'file'));
   }
 
-  function withoutImages(conversation) {
-    const messages = conversation.messages.map(message => Array.isArray(message.content) ? {
-      ...message,
-      content: message.content.map(part => part.type === 'image_url' ? {type: 'text', text: '[Image not saved]'} : part)
-    } : message);
+  function withoutAttachments(conversation) {
+    const messages = conversation.messages.map(message => Array.isArray(message.content)
+      ? {...message, content: message.content.map(part => part.type === 'image_url' || part.type === 'file' ? notSaved(part) : part)}
+      : message);
     return {...conversation, messages};
   }
 
   function save() {
     conversations.sort((a, b) => b.updated - a.updated);
     conversations = conversations.slice(0, 20);
+    // A text past the browser's longest string is as unsaved as a full store.
+    const saved = value => {
+      try {
+        return storageSet(storeKey, JSON.stringify(value));
+      } catch {
+        return false;
+      }
+    };
     // Browser storage holds a few MB per site, which one photo can fill. Rather
     // than fail every later save, store the newest chats that fit, each with its
-    // images if they still fit and without them otherwise, so a photo too large
-    // to store does not cost older chats theirs. The open page keeps its images.
-    if (!storageSet(storeKey, JSON.stringify(conversations))) {
+    // images and PDFs if they still fit and without them otherwise, so a photo
+    // too large to store does not cost older chats theirs. The open page keeps
+    // its attachments.
+    if (!saved(conversations)) {
       const stored = [];
       for (const conversation of conversations) {
-        const candidates = hasImages(conversation) ? [conversation, withoutImages(conversation)] : [conversation];
-        const fitting = candidates.find(candidate => storageSet(storeKey, JSON.stringify([...stored, candidate])));
+        const candidates = hasAttachments(conversation) ? [conversation, withoutAttachments(conversation)] : [conversation];
+        const fitting = candidates.find(candidate => saved([...stored, candidate]));
         if (!fitting) break;
         stored.push(fitting);
       }
@@ -446,11 +484,31 @@
   }
 
   function userParts(content) {
-    if (typeof content === 'string') return {text: content, images: []};
+    if (typeof content === 'string') return {text: content, images: [], files: []};
     return {
       text: content.filter(part => part.type === 'text').map(part => part.text).join('\n'),
-      images: content.filter(part => part.type === 'image_url').map(part => part.image_url.url)
+      images: content.filter(part => part.type === 'image_url').map(part => part.image_url.url),
+      files: content.filter(part => part.type === 'file').map(part => part.file.filename || 'PDF')
     };
+  }
+
+  // A PDF's chip: its name over what more it says, which an error shows in red.
+  function fileChip(className, name, detail, error = false) {
+    const chip = document.createElement('span');
+    chip.className = className;
+    const title = document.createElement('span');
+    title.className = 'file-name';
+    title.textContent = name;
+    const more = document.createElement('span');
+    more.className = error ? 'file-detail error' : 'file-detail';
+    more.textContent = detail;
+    chip.append(title, more);
+    return chip;
+  }
+
+  function size(bytes) {
+    const [value, unit] = bytes < 1e6 ? [bytes / 1e3, 'kilobyte'] : [bytes / 1e6, 'megabyte'];
+    return new Intl.NumberFormat(undefined, {style: 'unit', unit, maximumFractionDigits: bytes < 1e6 ? 0 : 1}).format(value);
   }
 
   function requestMessages() {
@@ -571,22 +629,23 @@
     const box = message.role === 'assistant' ? assistantBox(message, live) : document.createElement('div');
     if (message.role !== 'assistant') {
       box.className = `message ${message.role}`;
-      const {text, images} = userParts(message.content);
+      const {text, images, files} = userParts(message.content);
       if (text) {
         const content = document.createElement('div');
         content.className = 'user-text';
         content.textContent = text;
         box.append(content);
       }
-      if (images.length) {
+      if (images.length || files.length) {
         const gallery = document.createElement('div');
-        gallery.className = 'user-images';
+        gallery.className = 'user-attachments';
         images.forEach(url => {
           const image = document.createElement('img');
           image.src = url;
           image.alt = 'Attached image';
           gallery.append(image);
         });
+        files.forEach(name => gallery.append(fileChip('user-file', name, 'PDF')));
         box.append(gallery);
       }
     }
@@ -704,22 +763,29 @@
   function renderAttachments() {
     attachmentsBox.replaceChildren();
     attachments.forEach(attachment => {
+      const pdf = attachment.type === 'application/pdf';
       const item = document.createElement('div');
-      item.className = 'attachment';
-      const name = attachment.name || 'Attached image';
-      item.title = name;
-      const preview = document.createElement(attachment.url ? 'img' : 'span');
-      if (attachment.url) {
+      item.className = pdf ? 'attachment pdf' : 'attachment';
+      const name = attachment.name || (pdf ? 'Attached PDF' : 'Attached image');
+      const limit = overLimit(attachment);
+      item.title = limit ? `${name} is larger than the model’s ${size(limit)} limit` : name;
+      const status = attachment.error ? 'Read failed' : limit ? 'Too large' : null;
+      let preview;
+      if (pdf) {
+        preview = fileChip('attachment-file', name, status ?? size(attachment.bytes), Boolean(status));
+      } else if (attachment.url && !status) {
+        preview = document.createElement('img');
         preview.src = attachment.url;
         preview.alt = name;
       } else {
-        preview.className = `attachment-status${attachment.error ? ' error' : ''}`;
-        preview.textContent = attachment.error ? 'Read failed' : 'Loading…';
+        preview = document.createElement('span');
+        preview.className = `attachment-status${status ? ' error' : ''}`;
+        preview.textContent = status ?? 'Loading…';
         preview.setAttribute('role', 'status');
       }
       const remove = document.createElement('button');
       remove.type = 'button';
-      remove.className = 'remove-image';
+      remove.className = 'remove-attachment';
       remove.setAttribute('aria-label', `Remove ${name}`);
       remove.textContent = '\u00d7';
       remove.addEventListener('click', () => {
@@ -734,11 +800,23 @@
 
   function clearAttachments() {
     attachments = [];
-    imageInput.value = '';
+    fileInput.value = '';
     renderAttachments();
   }
 
-  function readImage(file) {
+  // Whether the model takes a file of `type`: an image or a PDF.
+  function takes(type) {
+    return type === 'application/pdf' ? pdfsAccepted : type.startsWith('image/') && imagesAccepted;
+  }
+
+  // The limit, from /v1/models, that an image or a PDF is larger than; the
+  // server checks the rest, a PDF's pages among them, and says why it refuses.
+  function overLimit(attachment) {
+    const limit = attachment.type === 'application/pdf' ? limits?.pdf_bytes : limits?.image_bytes;
+    return limit !== undefined && attachment.bytes > limit ? limit : null;
+  }
+
+  function readFile(file) {
     return new Promise((resolve, reject) => {
       const reader = new FileReader();
       reader.onload = () => resolve(reader.result);
@@ -747,17 +825,20 @@
     });
   }
 
-  async function addImages(files) {
-    const images = Array.from(files).filter(file => file.type.startsWith('image/'));
-    if (!images.length) return;
+  // Attaches the images and PDFs the model takes, read in the order chosen;
+  // one over its limit stays unread, to be taken off.
+  async function addFiles(files) {
+    const taken = Array.from(files).filter(file => takes(file.type));
+    if (!taken.length) return;
     // Readers update stable entries, even if rollback moves them to a new draft.
-    const selected = images.map(file => ({name: file.name, url: null, error: false}));
+    const selected = taken.map(file => ({name: file.name, type: file.type, bytes: file.size, url: null, error: false}));
     attachments.push(...selected);
     renderAttachments();
-    await Promise.all(images.map(async (file, index) => {
+    await Promise.all(taken.map(async (file, index) => {
       const attachment = selected[index];
+      if (overLimit(attachment)) return;
       try {
-        attachment.url = await readImage(file);
+        attachment.url = await readFile(file);
       } catch {
         attachment.error = true;
       }
@@ -767,7 +848,7 @@
 
   function canSend() {
     return Boolean(input.value.trim() || attachments.length) &&
-      attachments.every(attachment => attachment.url);
+      attachments.every(attachment => attachment.url && !overLimit(attachment));
   }
 
   function updateComposer() {
@@ -829,7 +910,9 @@
     const pendingAttachments = attachments;
     const content = pendingAttachments.length ? [
       ...(text ? [{type: 'text', text}] : []),
-      ...pendingAttachments.map(attachment => ({type: 'image_url', image_url: {url: attachment.url}}))
+      ...pendingAttachments.map(attachment => attachment.type === 'application/pdf'
+        ? {type: 'file', file: {filename: attachment.name, file_data: attachment.url}}
+        : {type: 'image_url', image_url: {url: attachment.url}})
     ] : text;
     input.value = '';
     attachments = [];
@@ -900,21 +983,20 @@
     chosenEffort = effort.value;
     storageSet(effortKey, effort.value);
   });
-  attach.addEventListener('click', () => imageInput.click());
-  imageInput.addEventListener('change', () => {
-    if (imagesAccepted) addImages(imageInput.files).catch(console.error);
-    imageInput.value = '';
+  attach.addEventListener('click', () => fileInput.click());
+  fileInput.addEventListener('change', () => {
+    addFiles(fileInput.files).catch(console.error);
+    fileInput.value = '';
   });
   input.addEventListener('paste', event => {
-    // Without image input the browser pastes as usual.
-    if (!imagesAccepted) return;
-    const images = Array.from(event.clipboardData?.items || [])
-      .filter(item => item.type.startsWith('image/'))
+    // What the model doesn't take pastes as the browser pastes it.
+    const files = Array.from(event.clipboardData?.items || [])
+      .filter(item => takes(item.type))
       .map(item => item.getAsFile())
       .filter(Boolean);
-    if (!images.length) return;
+    if (!files.length) return;
     if (!event.clipboardData.getData('text/plain')) event.preventDefault();
-    addImages(images).catch(console.error);
+    addFiles(files).catch(console.error);
   });
   input.addEventListener('input', () => { resize(); updateComposer(); });
   input.addEventListener('keydown', event => {

@@ -80,7 +80,12 @@ enum class LinearEpilogue : uint8_t { None, Residual, GateUp, UpWithGate };
 // GgufRegister: the exact register tile on bf16 8x8 matrix operations
 // (Apple9), over an activation table, every request lane in one threadgroup,
 // optional K splits.
-enum class LinearTile : uint8_t { GgufStaged, GgufPrefill, GgufRegister };
+// GgufPrefillInt8: prefill chunks of MLX affine 4- and 5-bit g64 weights
+// (quant_prefill_int8_format) in int8 activations, quantized per row and
+// 64-input group into the scratch table, against the weights' exact codes
+// (kernels/prefill/gguf_prefill_int8.metal); not exact, unsplit, the prefill
+// tile's storage rows.
+enum class LinearTile : uint8_t { GgufStaged, GgufPrefill, GgufRegister, GgufPrefillInt8 };
 // The decode tiles hold at most a full decode batch.
 inline constexpr uint32_t kMaximumDecodeTileRows = SPLASH_MAXIMUM_BATCH_WIDTH * SPLASH_TARGET_VERIFY_ROWS;
 // The staged tile's tallest height, which holds prefill chunks of up to this
@@ -93,6 +98,11 @@ inline constexpr uint32_t kMaximumStagedPrefillRows = 64;
 // 64 rows runs the 64-row tile.
 [[nodiscard]] constexpr uint32_t stagedTileRows(uint32_t rows) noexcept {
   return rows <= 8 ? 8 : rows <= 16 ? 16 : rows <= 32 ? 32 : 64;
+}
+// The rows a staged plan of `rows` rows stores: its tile's, or 16 for one
+// lane on the 16-row tile (LinearConfig::sixteenRows).
+[[nodiscard]] constexpr uint32_t stagedStorageRows(uint32_t rows, bool sixteenRows) noexcept {
+  return sixteenRows ? 16 : stagedTileRows(rows);
 }
 
 struct LinearWorkload final {
@@ -121,6 +131,11 @@ struct LinearConfig final {
   // (LinearPlan::storageRows), whose padding lane's rows it computes and
   // discards, instead of the 8-row tile.
   bool sixteenRows = false;
+  // GgufStaged decode of rotated PQ2_0 segments in int8 activations: the
+  // rotated input as int8 rows, one scale per row and rotation block
+  // (gguf_rotate_int8), into the int8 tiles (gguf_decode_int8_pq20_m<rows>_*)
+  // at the plan's storage rows, splits, spread and passes.
+  bool decodeInt8 = false;
   [[nodiscard]] constexpr bool validSplits() const noexcept {
     return splits && splits <= kMaximumSplits && !(splits & (splits - 1));
   }
@@ -131,7 +146,8 @@ struct LinearConfig final {
 // allocation and restored by each completed split dispatch. Never share this
 // workspace between concurrent command streams.
 struct LinearScratch final {
-  // The register tile's Table16 table and its sums.
+  // The register tile's Table16 table and its sums; the int8 prefill tile's
+  // codes and scales.
   metal::MetalBuffer input;
   metal::MetalBuffer sums;
   metal::MetalBuffer partials;
@@ -154,7 +170,6 @@ struct PrefillFfnBuffers final {
 };
 struct LinearScratchSize final {
   uint64_t input = 0, sums = 0, partials = 0, counters = 0, rotated = 0;
-  [[nodiscard]] uint64_t bytes() const noexcept { return input + sums + partials + counters + rotated; }
   // Grows each field to hold `other`'s too.
   LinearScratchSize &include(const LinearScratchSize &other) noexcept {
     input = std::max(input, other.input);
@@ -168,10 +183,13 @@ struct LinearScratchSize final {
 
 // The activation layout a decode plan reads: the producer's bf16 rows, or an
 // X^T table with fp32 row sums in LinearScratch that a producer can emit
-// alongside its ordinary output.
+// alongside its ordinary output; or the int8 prefill tile's codes, which only
+// that tile writes, for a next plan over the same rows (a SwiGLU's up after
+// its gate).
 enum class LinearInput : uint8_t {
-  Plain,    // bf16 [rows][K]
-  Table16,  // the register tile's table, sums per 16 and 32 inputs (kernels/common/gguf_sgmatrix.h)
+  Plain,        // bf16 [rows][K]
+  Table16,      // the register tile's table, sums per 16 and 32 inputs (kernels/common/gguf_sgmatrix.h)
+  PrefillInt8,  // the int8 prefill tile's codes and scales per 64 inputs (kernels/prefill/gguf_prefill_int8.metal)
 };
 // Scratch bytes a producer writes for `rows` rows of `width` inputs.
 [[nodiscard]] constexpr uint64_t tableBytes(uint32_t width, uint64_t rows) noexcept {
@@ -230,12 +248,22 @@ struct LinearBuffers final {
   PreparedInput prepared{};
 };
 
+// Whether plans may round activations to int8 where an int8-activation path
+// takes them, a precision choice made once per runtime (ExecutionPlans) beside
+// the device's measured KernelCalibration: the int8 prefill and decode tiles
+// (selectProjection) and INT8 attention queries (PagedAttention). Off keeps
+// every activation bf16; on, the GPU's int8 matmul, twice its bf16 rate, takes
+// about a quarter off Qwen3.8-27B MLX 4-bit prefill.
+enum class Int8Activations : uint8_t { Off, On };
+
 // Owns projection pipeline selection and dispatch. Plans follow the device's
-// KernelCalibration (KernelSelection.cpp).
+// KernelCalibration and the runtime's Int8Activations (KernelSelection.cpp),
+// which ExecutionPlans also gives its attention plans.
 class Linear final {
 public:
-  explicit Linear(const DeviceCapabilities &device) noexcept;
+  explicit Linear(const DeviceCapabilities &device, Int8Activations int8Activations) noexcept;
   [[nodiscard]] const KernelCalibration &calibration() const noexcept { return calibration_; }
+  [[nodiscard]] Int8Activations int8Activations() const noexcept { return int8Activations_; }
 
   [[nodiscard]] LinearPlan plan(LinearWorkload workload) const;
   // The plan of `workload` for the projection, into its destination type; a gate/up plan also runs `gate`.
@@ -246,9 +274,12 @@ public:
   // pair's among them.
   [[nodiscard]] uint32_t decodeStorageRows(uint32_t rows, ProjectionShape shape) const;
   // The plans of this projection's matrix. A decode plan's input() is the
-  // layout its producer writes.
+  // layout its producer writes. A prefill plan of `rows` rows of a chunk of
+  // `chunkRows` (0: `rows`) takes the chunk's tile kind and K splits, at the
+  // staged height of its own rows, which compute each row as the chunk's plan
+  // does.
   [[nodiscard]] LinearPlan prefillPlan(const Projection &projection, uint32_t rows,
-                                       LinearEpilogue epilogue) const;
+                                       LinearEpilogue epilogue, uint32_t chunkRows = 0) const;
   [[nodiscard]] LinearPlan decodePlan(const Projection &projection, uint32_t lanes,
                                       LinearEpilogue epilogue = LinearEpilogue::None,
                                       const Projection *gate = nullptr) const;
@@ -258,7 +289,9 @@ public:
   [[nodiscard]] LinearScratchSize decodeScratchSize(ProjectionShape shape) const;
   // The scratch of every prefill chunk and epilogue of a projection of
   // `shape`: the split partials and counters of the chunks that run the
-  // staged tile (LinearGguf.cpp), and the rotated rows of a full chunk.
+  // staged tile (LinearGguf.cpp), the rotated rows of a full chunk, and where
+  // the device runs the int8 prefill tile on the shape's formats, its codes
+  // and scales of a full chunk.
   [[nodiscard]] LinearScratchSize prefillScratchSize(ProjectionShape shape) const;
   // The tile of a float projection of `rows` rows into `outputSize` columns
   // of rows in `formatId` (QuantizedSegment::rows) on this device
@@ -273,21 +306,22 @@ public:
                     const Projection &projection, const LinearPlan &plan,
                     const Projection *gate = nullptr) const;
 
-  // The projections of `rows` rows through their own matrix. `scratch` holds
-  // the partials and counters of split plans (the chunks the staged tile
-  // runs, ProjectionCalibration::stagedPrefillRows); reused serially within
-  // one command stream, as in decode.
+  // The projections of `rows` rows through their own matrix, on the plans of
+  // a chunk of `chunkRows` rows (prefillPlan). `scratch` holds the partials
+  // and counters of split plans (the chunks the staged tile runs,
+  // ProjectionCalibration::stagedPrefillRows); reused serially within one
+  // command stream, as in decode.
   void addPrefill(metal::CommandGraph &graph, metal::MetalBuffer input, const Projection &projection,
-                  metal::MetalBuffer output, uint32_t rows, LinearScratch scratch = {}) const;
-  void addPrefillUpWithGate(metal::CommandGraph &graph, metal::MetalBuffer input, const Projection &up,
-                            metal::MetalBuffer gateScratch, metal::MetalBuffer output, uint32_t rows,
-                            LinearScratch scratch) const;
+                  metal::MetalBuffer output, uint32_t rows, LinearScratch scratch = {},
+                  uint32_t chunkRows = 0) const;
   void addPrefillResidual(metal::CommandGraph &graph, metal::MetalBuffer input, const Projection &projection,
                           metal::MetalBuffer residual, metal::MetalBuffer output, uint32_t rows,
-                          LinearScratch scratch) const;
-  // output = residual + down(silu(gate x) * up x) of `rows` normalized rows.
+                          LinearScratch scratch, uint32_t chunkRows = 0) const;
+  // output = residual + down(silu(gate x) * up x) of `rows` normalized rows;
+  // up takes what gate's plan leaves of x in the scratch table.
   void addPrefillSwiGlu(metal::CommandGraph &graph, const SwiGluProjections &ffn, const PrefillFfnBuffers &buffers,
-                        metal::MetalBuffer residual, metal::MetalBuffer output, uint32_t rows) const;
+                        metal::MetalBuffer residual, metal::MetalBuffer output, uint32_t rows,
+                        uint32_t chunkRows = 0) const;
 
 private:
   // The partials and counters a dispatch of `splits` K partitions binds: the
@@ -305,12 +339,15 @@ private:
                      const Projection *gate) const;
   void addGgufPrefill(metal::CommandGraph &graph, const LinearBuffers &buffers,
                       const Projection &projection, const LinearPlan &plan) const;
+  void addGgufPrefillInt8(metal::CommandGraph &graph, const LinearBuffers &buffers,
+                          const Projection &projection, const LinearPlan &plan) const;
   void addGgufRegister(metal::CommandGraph &graph, const LinearBuffers &buffers,
                        const Projection &projection, const LinearPlan &plan,
                        const Projection *gate) const;
   void addGgufFloatSegments(metal::CommandGraph &graph, const LinearBuffers &buffers,
                             const Projection &projection, const LinearPlan &plan) const;
   KernelCalibration calibration_;
+  Int8Activations int8Activations_;
 };
 
 } // namespace splash::ops

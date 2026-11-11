@@ -573,7 +573,7 @@ void runShortOfMemory(engine::Cache &cache, test::TestKvTier &tier, engine::Memo
   cacheBlocksUnderDiskStates(cache, 1);
   engine::MemoryLedger &ledger = governor.ledger();
   const engine::ClaimId claim = ledger.open({});
-  const engine::FreeResult freed = ledger.free(claim, {.pages = 1}, 0, false);
+  const engine::FreeResult freed = ledger.free(claim, {.pages = 1}, 0, MemoryPressure::Normal);
   ledger.close(claim);
   require(freed.outcome == engine::FreeOutcome::Pending && governor.copyDemand(),
           "the written state's leaf was not demoted as a unit that lands later");

@@ -20,8 +20,9 @@ struct MainView: View {
             .navigationTitle("Splash")
             .toolbar(removing: .title)
             // No band of its own behind the toolbar, which the window puts there once a transcript
-            // scrolls under it, over the sidebar too: the sidebar runs up to the window's top,
-            // and a transcript draws its own line under the toolbar.
+            // scrolls under it, over the sidebar too: the sidebar runs up to the window's top. A
+            // page that scrolls ends at the toolbar instead, under its line (`toolbarLine`), so
+            // that nothing it scrolls reads through the toolbar's controls.
             .toolbarBackgroundVisibility(.hidden, for: .windowToolbar)
             .toolbar {
                 if state.available {
@@ -30,21 +31,9 @@ struct MainView: View {
                     ToolbarItem(placement: .navigation) { SectionSwitch() }
                         .sharedBackgroundVisibility(.hidden)
                 }
-                // At the toolbar's end, clear of the sidebar: what the Chat makes, then the Server,
-                // last in every part, where an item that came and went with the part would leave it
-                // in place.
+                // At the toolbar's end, clear of the sidebar: the terminal's button, then the
+                // Server's, last in every part.
                 ToolbarSpacer(.flexible)
-                if state.available && state.section == .chat {
-                    ToolbarItem {
-                        Button {
-                            state.chats.newChat()
-                            state.draft.focus()
-                        } label: {
-                            Label("New Chat", systemImage: "square.and.pencil")
-                        }
-                        .help("New Chat (⌘N)")
-                    }
-                }
                 if state.available {
                     ToolbarItem {
                         Button { state.toggleDrawer() } label: {
@@ -59,21 +48,49 @@ struct MainView: View {
             .onChange(of: state.status) { _, status in
                 AccessibilityNotification.Announcement(status).post()
             }
-            // The Chat's page loads with the window, so that the Chat shows at once.
-            .onAppear { state.transcript.page.load() }
+            // The Chat's page loads with the window, so that the Chat shows at once; while the window
+            // is open, the server's status is asked often (`AppState.windowShows`).
+            .onAppear {
+                state.transcript.page.load()
+                state.windowShows = true
+            }
+            .onDisappear { state.windowShows = false }
     }
 
     @ViewBuilder private var content: some View {
         if let blocker = state.blocker {
             ContentUnavailableView(blocker.title, systemImage: blocker.symbol, description: Text(blocker.message))
         } else if !state.launched {
-            ProgressView().controlSize(.small).frame(maxWidth: .infinity, maxHeight: .infinity)
+            VStack(spacing: 10) {
+                ProgressView().controlSize(.small)
+                if let wait = state.launchWait {
+                    Text(wait).font(.callout).foregroundStyle(.secondary)
+                }
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
         } else {
             switch state.section {
             case .server: ServerView()
             case .chat: ChatScreen()
             }
         }
+    }
+}
+
+extension View {
+    /// The line under the window's toolbar, over the top of a page that scrolls and ends there: the
+    /// line the window draws over a scroll view that reaches under its toolbar, which no page does
+    /// (`MainView`).
+    func toolbarLine() -> some View {
+        overlay(alignment: .top) { ToolbarLine() }
+    }
+}
+
+private struct ToolbarLine: View {
+    @Environment(\.displayScale) private var displayScale
+
+    var body: some View {
+        Rectangle().fill(.separator).frame(height: 1 / displayScale)
     }
 }
 
@@ -155,12 +172,13 @@ struct Segments<Value: Hashable>: View {
     }
 }
 
+/// The width of the Chat's sidebar, its divider's point not included.
+let sidebarWidth: CGFloat = 280
+
 /// The Chat's sidebar beside its content, a column of the window's height, up through the toolbar,
 /// that slides away as the toolbar's button and ⌘B hide it. Hidden, it keeps its place in the
 /// window at no width, with what was typed in it and how far it scrolled; the keyboard leaves it.
 struct WithSidebar<Side: View, Content: View>: View {
-    static var width: CGFloat { 280 }
-
     @Environment(AppState.self) private var state
     @FocusState private var focused: Bool
     @ViewBuilder let side: Side
@@ -170,7 +188,7 @@ struct WithSidebar<Side: View, Content: View>: View {
         let shown = state.showsSidebar
         HStack(spacing: 0) {
             HStack(spacing: 0) {
-                side.frame(width: Self.width)
+                side.frame(width: sidebarWidth)
                 // Up through the toolbar, as far as the sidebar's background goes.
                 Divider().ignoresSafeArea(edges: .top)
             }
@@ -182,7 +200,12 @@ struct WithSidebar<Side: View, Content: View>: View {
             .accessibilityHidden(!shown)
             content
         }
-        .onChange(of: shown) { if !shown { focused = false } }
+        .onChange(of: shown) {
+            if !shown {
+                focused = false
+                state.returnKeyboard()
+            }
+        }
     }
 }
 
@@ -192,18 +215,23 @@ extension AppState {
         drawer.add(TerminalSession(shell: drawer.shell(), environment: runtime.userEnvironment))
     }
 
-    /// Opens or closes the drawer, sliding; opened on the terminals, it starts one where there is
-    /// none.
+    /// Opens or closes the drawer, which slides (`WithDrawer`); opened on the terminals, it starts one
+    /// where there is none.
     func toggleDrawer() {
-        withAnimation(Motion.settle) { showsDrawer.toggle() }
+        showsDrawer.toggle()
         if showsDrawer && drawer.part == .terminal && drawer.terminals.isEmpty { newTerminal() }
+    }
+
+    /// Closes the drawer.
+    func hideDrawer() {
+        showsDrawer = false
     }
 
     /// Opens the drawer on `part`.
     func showDrawer(_ part: Drawer.Part) {
         drawer.part = part
         if part == .terminal && drawer.terminals.isEmpty { newTerminal() }
-        withAnimation(Motion.settle) { showsDrawer = true }
+        showsDrawer = true
     }
 
     /// Opens the drawer on `log`.
@@ -215,6 +243,15 @@ extension AppState {
     /// Hides the sidebar shown, or shows the one hidden, sliding.
     func toggleSidebar() {
         withAnimation(Motion.settle) { showsSidebar.toggle() }
+    }
+
+    /// Whether the drawer shows one of its terminals, which has the keyboard.
+    var terminalShows: Bool { showsDrawer && drawer.part == .terminal }
+
+    /// Gives the keyboard to the Chat's composer as what had it hides: the drawer, its last
+    /// terminal, the sidebar. The Server has nothing to type into; its window keeps it.
+    func returnKeyboard() {
+        if section == .chat { draft.focus() }
     }
 }
 
@@ -247,7 +284,13 @@ extension AppState {
     /// start and a download's progress; the button's help says the step and the percentage, the
     /// Server and the menu bar's panel the speed.
     var serverTitle: String {
-        if installer.running { return "Downloading…" }
+        if installer.running {
+            return switch installer.work {
+            case .removal: "Deleting…"
+            case .check where installer.progress == nil: "Checking…"
+            default: "Downloading…"
+            }
+        }
         guard let name = server.model.map(catalog.name(of:)) else { return "Server" }
         switch server.phase {
         case .starting, .ready, .stopping: return name
