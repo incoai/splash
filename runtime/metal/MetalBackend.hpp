@@ -486,11 +486,12 @@ public:
   // as it would, but encodes and commits nothing.
   void preparePipelines(std::span<const ComputeDispatch> dispatches);
   // The engine is Ready. A pipeline is created the first time a dispatch
-  // names it, on the submitting thread, which waits while Metal compiles it
-  // if the shader cache is cold: 19 s for the 27B's first 17-row prefill
-  // chunk on a 16-core Apple9 plan. Startup warmup creates the pipelines its
-  // commands name; each one created from here on is counted, and logged once
-  // with its name, function constants and time.
+  // names it, a command's new ones together, and the submitting thread waits
+  // while Metal compiles them if the shader cache is cold: 19 s for the 27B's
+  // first 17-row prefill chunk on a 16-core Apple9 plan, one at a time.
+  // Startup warmup creates the pipelines its commands name; each one created
+  // from here on is counted, and logged once with its name, function
+  // constants and time.
   void beginServing() noexcept;
   [[nodiscard]] uint64_t pipelinesCreatedWhileServing() const noexcept;
 

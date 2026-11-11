@@ -506,14 +506,19 @@ any of this.
 ### Warmup and pipelines
 
 Metal creates a kernel's pipeline, one for each set of its function constants
-(a fused projection's formats), the first time a dispatch names it, on the
-thread that submits the command, which is the serving loop's: a request whose
-command names a kernel no earlier command did waits while its pipeline is
-created, and so does every status request behind it. With a warm shader cache
-that is a load of milliseconds; cold, after an install or a macOS update, it
-is a compile, and the 27B's first 17-row chunk waited 19 s for its kernels on
-an M5 Max planned as a 16-core Apple9 GPU. So before Ready the start runs a
-command of each kind serving runs, through every projection
+(a fused projection's formats), the first time a dispatch names it, while the
+thread that submits the command, which is the serving loop's, waits: a request
+whose command names a kernel no earlier command did waits while its pipeline
+is created, and so does every status request behind it. With a warm shader
+cache that is a load of milliseconds; cold, after an install or a macOS
+update, it is a compile, and the 27B's first 17-row chunk waited 19 s for its
+kernels, created one at a time, on an M5 Max planned as a 16-core Apple9 GPU.
+Metal compiles side by side, so the backend creates a command's new pipelines
+together, at most 4 at once, each compilation holding memory of its own
+(`MetalBackend::Impl::kPipelinesCreatedAtOnce`): the 27B's cold start took 49 s
+on an M5 Max, against 129 s one at a time.
+So before Ready the start runs a command of each kind serving runs, through
+every projection
 (`ServingRuntime::requireWarmup`):
 
 - a prefill of the most rows, 2048, and one of each class of chunk whose
@@ -555,7 +560,7 @@ step ends ([Native protocol](#native-protocol)); the server prints each
 (`Warming up · 3 of 11 steps`) and writes it to its serve record, from which
 the app shows the start's progress and why it can take long. The steps count
 commands, not time; the first start after an update, which creates every
-pipeline, spent 118 s before Ready for the 27B and 134 s for Flint on a 48 GB
+pipeline, spent 56 s before Ready for the 27B and 145 s for Flint on a 48 GB
 M5 Pro, where later starts take about 14 s.
 
 ### GGUF tiles
