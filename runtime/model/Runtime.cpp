@@ -1788,6 +1788,27 @@ struct Runtime::Impl {
     backend.preparePipelines(graph.dispatches());
   }
 
+  // Creates the pipelines of a verify of `entries`, each after the longest
+  // history the target serves, without running it (Runtime::warmupDecodeBatch).
+  // The lanes' inputs are prepared for that history; the next decode prepares
+  // its own.
+  void prepareLongestVerify(std::span<Request *const> entries) {
+    const uint32_t history = geometry.target.contextTokens() - kDecodeRows;
+    const std::vector<uint32_t> tokens(history);
+    const std::vector<uint32_t> pages((history + kDecodeRows + kv::kPageTokens - 1) / kv::kPageTokens);
+    std::vector<ModelBatchItem> items(entries.size());
+    for (uint32_t lane = 0; lane < entries.size(); ++lane) {
+      QwenTargetRequest request = targetRequest(*entries[lane]);
+      request.tokens = tokens;
+      targetModel->prepareVerifyLane(lane, history, request);
+      items[lane] = {.requestId = entries[lane]->id, .logicalPosition = history, .pageTable = pages};
+    }
+    SpilledKvReads reads;
+    CommandGraph graph;
+    encodeTargetVerifyBatchForward(graph, entries, items, reads);
+    backend.preparePipelines(graph.dispatches());
+  }
+
   // The draft's context of chunk `index` of a command's chunks: the rows its
   // parts capture go into their lanes' rings and windows. A state captured
   // inside the command takes into its window the rows its lane's parts
@@ -3582,6 +3603,16 @@ WarmupStepResult Runtime::warmupDecodeBatch(uint32_t width) {
           "decode warmup B" + std::to_string(width) +
           " mismatch [results=" + std::to_string(decoded.size()) + "]");
     }
+    // A verify's kernels follow its lanes' history, and these lanes' is
+    // short: past 7.2K tokens Apple10's INT8 attention scores INT8 queries
+    // (the 27B's first 10.7K-token request created verify_attention_q8q_split
+    // while serving, 97 ms on the 48 GB M5 Pro), and past 2,048 Flash-Next's
+    // indexer selects blocks. Each choice has one threshold, so each decode
+    // warmup also creates the pipelines of its verify after the longest
+    // history.
+    std::array<Impl::Request *, ExecutionLimits::maximumBatchWidth> entries{};
+    for (uint32_t lane = 0; lane < width; ++lane) entries[lane] = &impl_->request(firstId + lane);
+    impl_->prepareLongestVerify(std::span(entries).first(width));
     for (uint32_t lane = 0; lane < width; ++lane) {
       lanes.push_back({std::move(decoded[lane]),
                        impl_->request(firstId + lane).pendingToken,

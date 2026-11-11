@@ -537,15 +537,19 @@ every projection
   draft rebuild a restored lane's first chunk begins with, which no other
   command runs, so a memory-limited restore warmup leaves none of its kernels
   to serving;
-- a decode of each width the memory plan holds, and a state restore;
+- a decode of each width the memory plan holds, and a state restore. Each
+  decode also creates, without running it, its verify after the longest
+  history the target serves: each choice a verify's history makes has one
+  threshold, whose other side the decodes' short history does not take,
+  INT8 queries past 7.2K tokens on Apple10 and Flash-Next's sparse attention
+  past 2,048 (its indexer's scoring and selection, and the attention's block
+  lists, which a prefill past 2,048 tokens runs too);
 
 and it prepares the sampling kernels' dispatches without running them
 (`MetalBackend::preparePipelines`). What memory keeps from running
 (`warmup.memory_limited_steps` in `/status`) stays cold, as do the paths no
-warmup takes: a decode width the host refused or the plan does not hold, a
-decode after enough history to score INT8 queries, an image, KV on the SSD,
-and Flash-Next's sparse attention, which a sequence takes past 2,048 tokens
-(its indexer's scoring and selection, and the attention's block lists).
+warmup takes: a decode width the host refused or the plan does not hold, an
+image and KV on the SSD.
 From Ready on the backend counts each pipeline it creates
 (`metal.pipelines_created_while_serving`) and logs it once, with its name, its
 function constants and how long it took: as a warning where that was 100 ms or
