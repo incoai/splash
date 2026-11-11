@@ -687,6 +687,77 @@ extension ServerScreenTests {
     }
 }
 
+/// A grouped page of the launch options between sections, the one under them with a red row.
+private struct LaunchOptionsSample: View {
+    var body: some View {
+        Group {
+            GroupedSection { ForEach(0..<8, id: \.self) { Text("Row \($0)") } }
+            LaunchOptions()
+            GroupedSection { Color.red.frame(height: 40) } header: { Text("Below") }
+            GroupedSection { ForEach(0..<4, id: \.self) { Text("Last \($0)") } }
+        }
+    }
+}
+
+extension ServerScreenTests {
+    /// The height, in points from the window's top, of the first row of `picture` that shows red
+    /// in the page's part.
+    static func redTop(_ picture: NSBitmapImageRep, of window: NSWindow) -> CGFloat? {
+        let scale = CGFloat(picture.pixelsHigh) / window.frame.height, bytes = picture.bitsPerPixel / 8
+        let top = Int(((window.frame.height - window.contentLayoutRect.maxY) * scale).rounded(.up))
+        let rows = page(picture, of: window)
+        return rows.firstIndex { row in
+            stride(from: 0, to: row.count - 2, by: bytes).contains { i in
+                let c = (0..<3).map { Int(row[row.startIndex + i + $0]) }
+                return c[0] - c[1] > 60 && c[0] - c[2] > 60
+            }
+        }.map { CGFloat($0 + top) / scale }
+    }
+
+    /// Opening Advanced with the page at its end moves nothing under the launch options up: the
+    /// options it opens push the section under them down. The frame after the click drew the
+    /// card without Advanced's row, the section under it moved up by the row's height, as the
+    /// switches among the options came in.
+    @Test func openingAdvancedAtThePagesEndMovesNothingUp() async throws {
+        let (state, folder) = AppState.forTests()
+        defer { try? FileManager.default.removeItem(at: folder) }
+        let window = await Snapshot.window(GroupedPage(column: 640) { LaunchOptionsSample() }.environment(state),
+                                           size: ServerPictures.size, appearance: .aqua)
+        defer { window.orderOut(nil) }
+        pump(0.3)
+        let scroll = try #require(window.contentView?.pageScroll)
+        let end = try #require(scroll.documentView).frame.height - scroll.contentView.bounds.height + scroll.contentInsets.bottom
+        scroll.scroll(by: end - scroll.contentView.bounds.minY)
+        pump(0.3)
+        // The disclosure's row: its chevron at the row's start, a gap, then its title.
+        let picture = try #require(await Snapshot.picture(of: window))
+        let scale = CGFloat(picture.pixelsHigh) / window.frame.height, bytes = picture.bitsPerPixel / 8
+        func dark(_ x: CGFloat, _ y: Int) -> Bool {
+            let p = picture.bitmapData! + y * picture.bytesPerRow + Int(x * scale) * bytes
+            return (Int(p[0]) + Int(p[1]) + Int(p[2])) / 3 < 170
+        }
+        func any(_ from: CGFloat, _ to: CGFloat, _ y: Int) -> Bool { stride(from: from, through: to, by: 1 / scale).contains { dark($0, y) } }
+        let matching = (0..<picture.pixelsHigh).filter { any(119, 127, $0) && !any(129, 133, $0) && any(135, 142, $0) }
+        // Bands of rows at least 4 points tall; the last one's middle.
+        let bands = matching.reduce(into: [[Int]]()) { bands, y in
+            if let last = bands.last?.last, last == y - 1 { bands[bands.count - 1].append(y) } else { bands.append([y]) }
+        }.filter { $0.count >= Int(4 * scale) }
+        let chevron = try #require(bands.last.map { $0[$0.count / 2] })
+        let point = NSPoint(x: 170, y: window.frame.height - CGFloat(chevron) / scale)
+        let closed = scroll.documentView!.frame.height
+        let change = try await Self.pictures(of: window) {
+            for type in [NSEvent.EventType.leftMouseDown, .leftMouseUp] {
+                window.sendEvent(NSEvent.mouseEvent(with: type, location: point, modifierFlags: [], timestamp: ProcessInfo.processInfo.systemUptime,
+                                                    windowNumber: window.windowNumber, context: nil, eventNumber: 0, clickCount: 1, pressure: 1)!)
+            }
+        }
+        let before = try #require(Self.redTop(change.before, of: window))
+        let tops = change.drawn.map { Self.redTop($0.picture, of: window) }
+        #expect(scroll.documentView!.frame.height > closed + 300, "Advanced opened")
+        #expect(tops.allSatisfy { ($0 ?? .infinity) >= before - 1 }, "the section under the disclosure, at \(before), was drawn at \(tops)")
+    }
+}
+
 /// The Server screen drawn to `server-*.png` in `SPLASH_APP_SNAPSHOTS`, light and dark, for people
 /// to review its look with the models of a Mac that has a few: at its top, and scrolled so that its
 /// first rows would be where the toolbar is.

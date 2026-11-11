@@ -150,6 +150,11 @@ struct GroupedSwitch: ToggleStyle {
                 .labelsHidden()
                 .toggleStyle(.switch)
                 .controlSize(.mini)
+                // In a control's line, as a labeled control's is, not at the height the switch of
+                // AppKit's gives: switches coming in with Advanced, asked theirs as they were
+                // made, laid the card out a row short for the frame after the click, the
+                // sections under it jumping up by as much.
+                .frame(height: Grouped.line)
         }
         .accessibilityRepresentation { Toggle(isOn: configuration.$isOn) { configuration.label } }
     }
