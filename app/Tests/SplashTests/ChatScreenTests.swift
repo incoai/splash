@@ -146,6 +146,76 @@ extension ChatScreenTests {
 }
 
 extension ChatScreenTests {
+    /// The list's rows never draw over each other as chats move between its groups and go: a chat
+    /// pinned or unpinned goes from its place at once and fades into its new one once the rows
+    /// have made room, and one deleted goes at once, as the rows under it close its gap. Pinned,
+    /// a chat slid to its new place over the rows it passed; deleted, it faded out under the row
+    /// moving into its place; and with the list scrolled, a row put aside above the screen flew
+    /// from the list's foot to its top over every row. In every frame, each line of ink in the list
+    /// is one title tall, as no two titles overlap.
+    @Test func theListsRowsNeverDrawOverEachOther() async throws {
+        let folder = FileManager.default.temporaryDirectory.appending(path: "splash-chat-list-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: folder) }
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        let titles = ["Weekly groceries", "Release notes", "Why is the sea salty?", "Kyoto in spring", "Bread recipe",
+                      "Explain KV cache paging", "SwiftUI transactions", "Birthday ideas", "Tax questions", "Garden planning",
+                      "Rust lifetimes", "Marathon training", "Moving checklist", "Night sky settings", "Old project ideas",
+                      "Learning Japanese", "Laptop comparison", "Wedding speech", "Cover letter", "Sourdough starter"]
+        let days = [9, 3, 0, 0, 1, 3, 4, 5, 6, 10, 12, 15, 20, 25, 40, 60, 90, 120, 200, 300]
+        for (index, title) in titles.enumerated() {
+            let conversation = Conversation(title: title, updated: .now - Double(days[index] * 86_400 + index * 60),
+                                            messages: [ChatMessage(role: .user, text: title), ChatMessage(role: .assistant, text: "Yes.")],
+                                            pinned: index < 2 ? .now - Double(index * 60) : nil)
+            try JSONEncoder().encode(conversation).write(to: folder.appending(path: "\(conversation.id.uuidString).json"))
+        }
+        let state = AppState.forTests(in: folder)
+        func id(_ title: String) throws -> UUID { try #require(state.chats.conversations.first { $0.title == title }).id }
+        state.chats.selection = try id("Why is the sea salty?")
+        state.section = .chat
+        let window = await Snapshot.window(ChatScreen().environment(state), size: CGSize(width: 900, height: 600), appearance: .aqua)
+        defer { window.orderOut(nil) }
+        pump(0.5)
+        // The list under the search field, across the rows' titles.
+        let list = CGRect(x: 18, y: 140, width: 240, height: 440)
+        /// The tallest line of ink in the list in `picture`, in points: dark gray pixels, titles
+        /// and the groups' names, which the open row's highlight is lighter than.
+        func tallest(_ picture: NSBitmapImageRep) -> CGFloat {
+            let scale = CGFloat(picture.pixelsHigh) / window.frame.height, color = Self.colors(of: picture)
+            var run = 0, longest = 0
+            for y in Int(list.minY * scale)..<Int(list.maxY * scale) {
+                let inked = (Int(list.minX * scale)..<Int(list.maxX * scale)).contains { x in
+                    let (r, g, b) = color(x, y)
+                    return max(r, g, b) - min(r, g, b) < 0.08 && (r + g + b) / 3 < 0.75
+                }
+                run = inked ? run + 1 : 0
+                longest = max(longest, run)
+            }
+            return CGFloat(longest) / scale
+        }
+        func check(_ what: String, _ change: () throws -> Void) async throws {
+            var thrown: (any Error)?
+            let frames = try await Self.frames(of: window) { do { try change() } catch { thrown = error } }
+            if let thrown { throw thrown }
+            let line = max(tallest(frames.before), tallest(frames.after)) + 2
+            let drawn = frames.drawn.map(tallest)
+            #expect(drawn.allSatisfy { $0 <= line }, "\(what): the tallest line of ink per frame \(drawn), a title's \(line)")
+        }
+        try await check("pinning a chat of yesterday") { state.chats.pin(try id("Bread recipe"), true) }
+        try await check("unpinning it") { state.chats.pin(try id("Bread recipe"), false) }
+        try await check("deleting a chat") { state.chats.delete([try id("Birthday ideas")]) }
+        // Scrolled so that the pinned and today's chats are above the screen.
+        func scrollViews(in view: NSView) -> [NSScrollView] {
+            view.subviews.flatMap { ($0 as? NSScrollView).map { [$0] + scrollViews(in: $0) } ?? scrollViews(in: $0) }
+        }
+        let content = try #require(window.contentView)
+        let sidebar = try #require(scrollViews(in: content).first { $0.convert($0.bounds, to: nil).maxX <= 282 })
+        sidebar.scroll(by: 200)
+        pump(0.3)
+        try await check("pinning a chat above the screen") { state.chats.pin(try id("Kyoto in spring"), true) }
+    }
+}
+
+extension ChatScreenTests {
     /// The text view of the composer in `window`, where it lies in the window.
     static func field(in window: NSWindow) throws -> CGRect {
         func textViews(in view: NSView) -> [NSTextView] {
