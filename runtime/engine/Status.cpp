@@ -612,7 +612,8 @@ void writeScheduler(json::Writer &w, const engine::EngineSnapshot &core) {
     });
     w.field("decode_gap_target_ms", scheduler.decodeGapTargetMilliseconds).key("contended_prefill_ms");
     writeLatency(w, scheduler.contendedPrefill);
-    w.field("prefill_units", scheduler.prefillUnits)
+    w.field("finishing_prefill_advances", scheduler.finishingPrefillAdvances)
+        .field("prefill_units", scheduler.prefillUnits)
         .field("pass_commands", scheduler.passCommands)
         .field("abandoned_pass_commands", scheduler.abandonedPassCommands)
         .field("bound_cuts", scheduler.boundCuts)

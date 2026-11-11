@@ -115,6 +115,7 @@ struct SchedulerSnapshot final {
   // model::CommandLimits::indexPageLanes lanes whose history may hold Index
   // pages.
   uint64_t prefillUnits = 0;
+  uint64_t finishingPrefillAdvances = 0;
   uint64_t passCommands = 0;
   uint64_t abandonedPassCommands = 0;
   uint64_t boundCuts = 0;
@@ -142,7 +143,9 @@ struct SchedulerSnapshot final {
 // passes before any other prefill but one of a higher priority. Decode takes
 // the ready lanes of one priority and stage, constrained or not, without
 // waiting for more, so it runs only the four real M8/M16/M24/M32 shapes,
-// between a command's passes too.
+// between a command's passes too. A whole finishing command of at most 256 rows
+// past existing prefixes may advance once against two Foreground decoders past
+// eight output tokens. Its time stays owed; another advance waits for repayment.
 class Scheduler final {
 public:
   Scheduler(SchedulerConfig config, const model::PrefillWorkSource &work);
@@ -232,6 +235,7 @@ private:
     DecodeStage decodeStage = DecodeStage::Regular;
     uint64_t order = 0;
     uint64_t lastDecodeDispatch = 0;
+    uint64_t committedTokens = 0;
     // The prefill commands of its priority in a row that served later
     // arrivals and not it, up to kMaximumOvertakes, at which it is overdue;
     // none once a command serves it or its prompt completes.
@@ -260,6 +264,7 @@ private:
     uint32_t indexPageConflicts = 0;
   };
 
+  void end(uint64_t requestId, Phase phase);
   [[nodiscard]] Request &get(uint64_t requestId);
   [[nodiscard]] const Request &get(uint64_t requestId) const;
   [[nodiscard]] static bool terminal(Phase phase) noexcept;
@@ -311,11 +316,12 @@ private:
   [[nodiscard]] std::optional<Planned> planPrefill(std::vector<Lane> ready) const;
   [[nodiscard]] std::optional<BatchPlan> nextPrefill(const PlanInputs &in) const;
   [[nodiscard]] std::optional<BatchPlan> nextDecode(std::span<const uint64_t> excluded) const;
+  [[nodiscard]] bool finishesSmallPrefill(const BatchPlan &plan, const BatchPlan &decode) const;
   // Debt is owed only to requests that decode or wait for a mask: once the
   // last one leaves, a later decoder starts without it.
   void dropStaleDecodeDebt() noexcept;
   // A prompt that completed leaves its aging behind.
-  static void promptCompleted(Request &request) noexcept;
+  static void promptCompleted(Request &request) noexcept { request.overtaken = 0; }
 
   SchedulerConfig config_;
   const model::PrefillWorkSource &work_;
@@ -336,6 +342,7 @@ private:
   // (not those waiting for a mask): equal-priority decode runs until its
   // commands' wall time has worked it off.
   double decodeDebtMilliseconds_ = 0.0;
+  bool finishingPrefillAdvanced_ = false;
   std::optional<WorkKind> lastCommittedKind_;
   // A prefill command as it ran: its rows, the attention pairs of its
   // heaviest layer, its rows' time over its passes and in its heaviest, and

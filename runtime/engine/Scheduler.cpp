@@ -19,6 +19,10 @@ constexpr uint32_t kFloorRows = 512;
 // one short prompt.
 constexpr uint32_t kMaximumOvertakes = model::ExecutionLimits::maximumBatchWidth - 1;
 
+bool pending(Phase phase) noexcept {
+  return phase == Phase::Queued || phase == Phase::WaitingResources || phase == Phase::WaitingPrefix;
+}
+
 // A command excludes at most the lanes of a full batch: a linear search.
 bool listed(std::span<const uint64_t> ids, uint64_t id) noexcept {
   return std::find(ids.begin(), ids.end(), id) != ids.end();
@@ -80,9 +84,7 @@ void Scheduler::submit(RequestSpec request) {
 
 void Scheduler::resourcesReady(uint64_t id, uint32_t processed) {
   Request &request = get(id);
-  if (request.phase != Phase::Queued &&
-      request.phase != Phase::WaitingResources &&
-      request.phase != Phase::WaitingPrefix) {
+  if (!pending(request.phase)) {
     throw std::logic_error("only queued work can be admitted");
   }
   if (processed > request.spec.prefillTokens) {
@@ -133,18 +135,14 @@ void Scheduler::resumeFromResources(uint64_t id, uint32_t processed,
 void Scheduler::deferAdmission(uint64_t id) {
   Request &request = get(id);
   if (request.suspended ||
-      (request.phase != Phase::Queued &&
-       request.phase != Phase::WaitingResources &&
-       request.phase != Phase::WaitingPrefix))
+      (!pending(request.phase)))
     throw std::logic_error("only unstarted work can wait for scheduling");
   request.phase = Phase::Queued;
 }
 
 void Scheduler::waitForResources(uint64_t id) {
   Request &request = get(id);
-  if (request.phase != Phase::Queued &&
-      request.phase != Phase::WaitingResources &&
-      request.phase != Phase::WaitingPrefix) {
+  if (!pending(request.phase)) {
     throw std::logic_error("resident request cannot wait before admission");
   }
   request.phase = Phase::WaitingResources;
@@ -153,9 +151,7 @@ void Scheduler::waitForResources(uint64_t id) {
 void Scheduler::waitForPrefix(uint64_t id) {
   Request &request = get(id);
   if (request.suspended ||
-      (request.phase != Phase::Queued &&
-       request.phase != Phase::WaitingResources &&
-       request.phase != Phase::WaitingPrefix)) {
+      (!pending(request.phase))) {
     throw std::logic_error("only unstarted requests can wait for a prefix");
   }
   request.phase = Phase::WaitingPrefix;
@@ -170,25 +166,16 @@ void Scheduler::maskReady(uint64_t id) {
   request.phase = Phase::Decode;
 }
 
-void Scheduler::cancel(uint64_t id) {
+void Scheduler::cancel(uint64_t id) { end(id, Phase::Cancelled); }
+
+void Scheduler::finish(uint64_t id) { end(id, Phase::Completed); }
+
+void Scheduler::fail(uint64_t id) { end(id, Phase::Failed); }
+
+void Scheduler::end(uint64_t id, Phase phase) {
   Request &request = get(id);
   if (!terminal(request.phase))
-    request.phase = Phase::Cancelled;
-  dropStaleDecodeDebt();
-}
-
-void Scheduler::finish(uint64_t id) {
-  Request &request = get(id);
-  if (!terminal(request.phase))
-    request.phase = Phase::Completed;
-  dropStaleDecodeDebt();
-}
-
-void Scheduler::fail(uint64_t id) {
-  Request &request = get(id);
-  if (terminal(request.phase))
-    return;
-  request.phase = Phase::Failed;
+    request.phase = phase;
   dropStaleDecodeDebt();
 }
 
@@ -206,9 +193,7 @@ std::vector<uint64_t> Scheduler::admissionOrder() const {
   std::vector<const Request *> ready;
   ready.reserve(requests_.size());
   for (const auto &[_, request] : requests_) {
-    if (request.phase == Phase::Queued ||
-        request.phase == Phase::WaitingResources ||
-        request.phase == Phase::WaitingPrefix) {
+    if (pending(request.phase)) {
       ready.push_back(&request);
     }
   }
@@ -226,8 +211,7 @@ std::vector<uint64_t> Scheduler::prefillAdmissionOrder(std::span<const PrefillAd
   const auto unstarted = [&](const PrefillAdmission &entry) {
     const Request &value = get(entry.requestId);
     if (value.suspended ||
-        (value.phase != Phase::Queued && value.phase != Phase::WaitingResources &&
-         value.phase != Phase::WaitingPrefix) ||
+        (!pending(value.phase)) ||
         entry.cachedTokens >= value.spec.prefillTokens)
       throw std::logic_error("invalid pending prefill admission");
     return lane(value, entry.cachedTokens, in);
@@ -360,12 +344,17 @@ std::optional<BatchPlan> Scheduler::next(const PlanInputs &in) const {
                                              : std::move(prefill);
   }
 
-  // Prefill and decode use different Metal graphs and cannot share one
-  // command. Honor request priority first. Then decode runs while
-  // prefill owes it time, and otherwise the kinds alternate at command
-  // boundaries so equal-priority work cannot starve.
-  if (decodeDebtMilliseconds_ > 0.0)
+  // Priority precedes debt. Apart from a bounded finishing advance, decode
+  // repays owed time before command-boundary alternation gives equal-priority
+  // prefill another turn. The two kinds use different Metal graphs.
+  if (decodeDebtMilliseconds_ > 0.0) {
+    // A small finishing turn gives its first token without waiting for an
+    // earlier prefill's entire debt. Borrow once, retain every millisecond
+    // owed, and let decode repay it before another advance.
+    if (!finishingPrefillAdvanced_ && decode->width() > 1 && finishesSmallPrefill(*prefill, *decode))
+      return prefill;
     return decode;
+  }
   return lastCommittedKind_ == WorkKind::Decode ? std::move(prefill)
                                                  : std::move(decode);
 }
@@ -556,6 +545,22 @@ std::optional<Scheduler::Planned> Scheduler::planPrefill(std::vector<Lane> ready
   return result;
 }
 
+bool Scheduler::finishesSmallPrefill(const BatchPlan &plan, const BatchPlan &decode) const {
+  if (plan.kind != WorkKind::Prefill || plan.pass || plan.passes != 1 || plan.empty() ||
+      get(plan.items.front().requestId).spec.priority != RequestPriority::Foreground)
+    return false;
+  if (!std::ranges::all_of(decode.items, [&](const BatchItem &item) { return get(item.requestId).committedTokens >= 8; }))
+    return false;
+  uint64_t rows = 0;
+  for (const BatchItem &item : plan.items) {
+    const Request &request = get(item.requestId);
+    if (!item.promptOffset || item.tokenCount != request.spec.prefillTokens - item.promptOffset)
+      return false;
+    rows += item.tokenCount;
+  }
+  return rows <= kMinimumPrefillRows * model::ExecutionLimits::maximumBatchWidth;
+}
+
 std::optional<BatchPlan> Scheduler::nextDecode(std::span<const uint64_t> excluded) const {
   std::vector<const Request *> ready;
   for (const auto &[id, request] : requests_) {
@@ -633,8 +638,7 @@ void Scheduler::commit(const BatchPlan &plan, const PlanInputs &in) {
       youngestServed = std::max(youngestServed, get(item.requestId).order);
     for (auto &[id, request] : requests_) {
       if (request.spec.priority != priority || request.suspended || listed(in.excluded, id) ||
-          (request.phase != Phase::Queued && request.phase != Phase::WaitingResources &&
-           request.phase != Phase::WaitingPrefix && request.phase != Phase::Prefill))
+          (!pending(request.phase) && request.phase != Phase::Prefill))
         continue;
       if (holds(plan.items, id))
         request.overtaken = 0;
@@ -652,6 +656,13 @@ void Scheduler::commit(const BatchPlan &plan, const PlanInputs &in) {
   if (prefill && !plan.pass) {
     const std::vector<model::PrefillLane> lanes = prefillLanes(plan.items, in);
     command_ = {.rows = static_cast<uint32_t>(rowsOf(lanes)), .pairs = layerPairs(lanes)};
+  }
+  const auto displaced = prefill && decodeDebtMilliseconds_ > 0.0 && !finishingPrefillAdvanced_ &&
+                                 priority == RequestPriority::Foreground ? nextDecode(in.excluded) : std::nullopt;
+  if (displaced && displaced->width() > 1 && get(displaced->items.front().requestId).spec.priority == priority &&
+      finishesSmallPrefill(plan, *displaced)) {
+    finishingPrefillAdvanced_ = true;
+    ++counters_.finishingPrefillAdvances;
   }
   activeContended_ = prefill && contended(priority);
   excluded_.assign(in.excluded.begin(), in.excluded.end());
@@ -676,6 +687,7 @@ void Scheduler::complete(const BatchPlan &plan, std::span<const StepResult> resu
       throw std::logic_error("completion request order changed");
     }
     Request &request = get(item.requestId);
+    request.committedTokens += result.committedTokens;
     if (prefill && plan.pass + 1 < plan.passes) {
       // A pass before the last consumes nothing and ends no lane: one that
       // ends meanwhile stays in the command to its last pass.
@@ -750,6 +762,8 @@ void Scheduler::complete(const BatchPlan &plan, std::span<const StepResult> resu
       decodeDebtMilliseconds_ += decodeShare_ * wallMilliseconds;
     }
   }
+  if (decodeDebtMilliseconds_ == 0.0)
+    finishingPrefillAdvanced_ = false;
   dropStaleDecodeDebt();
   excluded_.clear();
   active_.reset();
@@ -762,18 +776,16 @@ void Scheduler::abandoned() {
   ++counters_.abandonedPassCommands;
 }
 
-void Scheduler::promptCompleted(Request &request) noexcept {
-  request.overtaken = 0;
-}
-
 void Scheduler::dropStaleDecodeDebt() noexcept {
   const bool decoding = std::any_of(
       requests_.begin(), requests_.end(), [](const auto &entry) {
         return entry.second.phase == Phase::Decode ||
                entry.second.phase == Phase::WaitingMask;
       });
-  if (!decoding)
+  if (!decoding) {
     decodeDebtMilliseconds_ = 0.0;
+    finishingPrefillAdvanced_ = false;
+  }
 }
 
 Phase Scheduler::phase(uint64_t id) const { return get(id).phase; }
@@ -784,39 +796,19 @@ bool Scheduler::suspended(uint64_t id) const { return get(id).suspended; }
 
 uint64_t Scheduler::submissionOrder(uint64_t id) const { return get(id).order; }
 
-uint32_t Scheduler::promptProcessed(uint64_t id) const {
-  return get(id).promptProcessed;
-}
+uint32_t Scheduler::promptProcessed(uint64_t id) const { return get(id).promptProcessed; }
 
 SchedulerSnapshot Scheduler::snapshot() const noexcept {
   SchedulerSnapshot result = counters_;
   result.contendedPrefill = contendedPrefill_.snapshot();
   for (const auto &[_, request] : requests_) {
-    switch (request.phase) {
-    case Phase::Queued:
-      ++result.queued;
-      break;
-    case Phase::WaitingResources:
-      ++result.waitingResources;
-      break;
-    case Phase::WaitingPrefix:
-      ++result.waitingPrefix;
-      break;
-    case Phase::Prefill:
-      ++result.prefilling;
-      break;
-    case Phase::Decode:
-      ++result.decoding;
-      break;
-    case Phase::WaitingMask:
-      ++result.waitingMask;
-      break;
-    case Phase::Completed:
-    case Phase::Cancelled:
-    case Phase::Failed:
-      ++result.terminal;
-      break;
-    }
+    result.queued += request.phase == Phase::Queued;
+    result.waitingResources += request.phase == Phase::WaitingResources;
+    result.waitingPrefix += request.phase == Phase::WaitingPrefix;
+    result.prefilling += request.phase == Phase::Prefill;
+    result.decoding += request.phase == Phase::Decode;
+    result.waitingMask += request.phase == Phase::WaitingMask;
+    result.terminal += terminal(request.phase);
   }
   return result;
 }
