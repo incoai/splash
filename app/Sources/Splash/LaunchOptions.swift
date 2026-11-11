@@ -162,10 +162,15 @@ private struct OptionRow: View {
             .onHover { hovered = $0 }
             if let warning = option.warning(state.options)
                 ?? value.wrappedValue.flatMap({ family.refusal(option.flag, $0) ?? family.caution(option.flag, $0) }) {
+                // As a row of the page comes and goes, a warning in place of another too: it faded
+                // in over the rows moving down to make room for it, and out under those moving up
+                // into its place.
                 Label(warning, systemImage: "exclamationmark.triangle.fill")
                     .font(.callout)
                     .foregroundStyle(.secondary)
                     .symbolRenderingMode(.multicolor)
+                    .id(warning)
+                    .transition(Motion.comingAndGoing)
             }
         }
     }

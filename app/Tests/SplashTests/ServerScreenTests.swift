@@ -383,6 +383,98 @@ extension ServerScreenTests {
     }
 }
 
+extension ServerScreenTests {
+    /// The page of `window` drawn through `change`: as drawn before it, every 30 ms or so for 0.3 s
+    /// after it, each with how long after, and once it has stopped changing, which a slow Mac
+    /// reaches long after the animations' length.
+    static func pictures(of window: NSWindow, through change: () -> Void) async throws
+        -> (before: NSBitmapImageRep, drawn: [(at: Duration, picture: NSBitmapImageRep)], after: NSBitmapImageRep) {
+        let before = try #require(await Snapshot.picture(of: window))
+        let start = ContinuousClock.now
+        change()
+        var drawn: [(at: Duration, picture: NSBitmapImageRep)] = []
+        for _ in 0..<10 {
+            pump(0.03)
+            drawn.append((ContinuousClock.now - start, try #require(await Snapshot.picture(of: window))))
+        }
+        var after = try #require(await Snapshot.picture(of: window))
+        for _ in 0..<40 {
+            pump(0.25)
+            let next = try #require(await Snapshot.picture(of: window))
+            if next.bitmapData.map({ Data(bytes: $0, count: next.bytesPerRow * next.pixelsHigh) })
+                == after.bitmapData.map({ Data(bytes: $0, count: after.bytesPerRow * after.pixelsHigh) }) { break }
+            after = next
+        }
+        return (before, drawn, after)
+    }
+
+    /// The pixels of `picture`, of `window`, in the page's part between the toolbar and the control
+    /// bar, from `left` to `right` points in from the window's left edge, a row at a time.
+    static func page(_ picture: NSBitmapImageRep, of window: NSWindow, left: CGFloat = 0, right: CGFloat? = nil) -> [Data] {
+        let scale = CGFloat(picture.pixelsHigh) / window.frame.height
+        let top = Int(((window.frame.height - window.contentLayoutRect.maxY) * scale).rounded(.up))
+        let bottom = Int((window.frame.height - 80) * scale)
+        let bytes = picture.bitsPerPixel / 8
+        let from = Int(left * scale) * bytes, to = Int((right ?? window.frame.width) * scale) * bytes
+        guard let data = picture.bitmapData else { return [] }
+        return (top..<bottom).map { Data(bytes: data + $0 * picture.bytesPerRow + from, count: to - from) }
+    }
+
+    /// Whether `picture` shows a warning sign's yellow anywhere in the page's part.
+    static func showsWarning(_ picture: NSBitmapImageRep, of window: NSWindow) -> Bool {
+        let bytes = picture.bitsPerPixel / 8
+        return page(picture, of: window).contains { row in
+            stride(from: 0, to: row.count - 2, by: bytes).contains { i in
+                let (r, g, b) = (Int(row[row.startIndex + i]), Int(row[row.startIndex + i + 1]), Int(row[row.startIndex + i + 2]))
+                return r > 180 && g > 130 && b < r - 100
+            }
+        }
+    }
+
+    /// The window of the Server screen of `state`, the model `picked` picked, drawn.
+    static func serverWindow(_ state: AppState, picked: String, appearance: NSAppearance.Name = .aqua) async -> NSWindow {
+        state.selection = picked
+        let window = await Snapshot.window(MainView().environment(state), size: ServerPictures.size, appearance: appearance)
+        pump(0.5)
+        return window
+    }
+
+    /// Qwen's and Flint's families as the runtime reports them: Flint without Text only, the
+    /// thinking options and the others its models can't use, and serving at most its window; the
+    /// Qwen families stretch theirs with YaRN.
+    static let realisticFamilies = {
+        let flint = ServeSettingsTests.flint.unusable.sorted().map { "\"\($0)\"" }.joined(separator: ", ")
+        let moe = ServeSettingsTests.moe.unusable.sorted().map { "\"\($0)\"" }.joined(separator: ", ")
+        let qwen = #""context_tokens": 262144, "max_context_tokens": 1010000"#
+        return #"{"Qwen3.8-27B": {"unusable": ["--disable-ane", "--expert-memory", "--ple-memory", "--sparse-kv-memory"], \#(qwen)}, "#
+            + #""Qwen3.6-35B-A3B": {"unusable": [\#(moe)], \#(qwen)}, "#
+            + #""Flint": {"unusable": [\#(flint)], "context_tokens": 262144, "max_context_tokens": 262144}}"#
+    }()
+
+    /// A launch option's warning comes and goes as a row of the page does: a context past the
+    /// model's window shows YaRN's caution only once the rows under it have moved down, and set
+    /// back to Auto, the caution goes at once, the rows under it moving up into its place. It
+    /// faded in over the rows still moving and out under those moving into its place.
+    @Test func anOptionsWarningComesAndGoesAsARowDoes() async throws {
+        let fake = try FakeRuntime("splash-option-warning", launcher: "stepped_server")
+        defer { try? FileManager.default.removeItem(at: fake.root) }
+        let state = try await Self.launchedWithModels(fake, families: Self.realisticFamilies)
+        defer { state.quit() }
+        let window = await Self.serverWindow(state, picked: "mlx-community/Qwen3.8-27B-4bit")
+        defer { window.orderOut(nil) }
+        // Past the window of 256K, short of the most, 1M.
+        let coming = try await Self.pictures(of: window) { state.options["--max-context"] = "524288" }
+        #expect(Self.showsWarning(coming.after, of: window), "the caution shows once the rows have moved")
+        // Drawn within the rows' move, `settle` (0.24 s).
+        let moving = coming.drawn.filter { $0.at < .milliseconds(200) }
+        let early = moving.filter { Self.showsWarning($0.picture, of: window) }.count
+        #expect(!moving.isEmpty && early == 0, "the caution showed in \(early) of \(moving.count) frames as the rows moved down")
+        let going = try await Self.pictures(of: window) { state.options["--max-context"] = nil }
+        let shown = going.drawn.filter { Self.showsWarning($0.picture, of: window) }.count
+        #expect(shown == 0, "the caution showed in \(shown) of \(going.drawn.count) frames after it went")
+    }
+}
+
 /// The Server screen drawn to `server-*.png` in `SPLASH_APP_SNAPSHOTS`, light and dark, for people
 /// to review its look with the models of a Mac that has a few: at its top, and scrolled so that its
 /// first rows would be where the toolbar is.
