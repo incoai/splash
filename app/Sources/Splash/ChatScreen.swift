@@ -304,7 +304,6 @@ private struct ChatList<Actions: View>: View {
     @State private var query = ""
     /// When the day groups were made; a new day makes them again, the app open past midnight.
     @State private var today = Date.now
-    @State private var places = Places()
 
     var body: some View {
         let chats = state.chats
@@ -392,14 +391,14 @@ private struct ChatList<Actions: View>: View {
     }
 
     /// The conversations in their groups, the latest first in each, the open one held highlighted.
-    /// A chat that moves, pinned, unpinned or sent to, goes from its place at once and fades into
-    /// its new one, as a new one does, and one deleted goes at once (`Motion.comingAndGoing`); the
-    /// rows around them take their places at once. Sliding to its new place, a chat drew over the
-    /// rows it passed, and one coming or going faded over the rows moving.
+    /// The list takes each change at once, as a lazy stack can: a chat pinned, unpinned, sent to or
+    /// new shows at once in its new place, one deleted goes at once, and the rows around them take
+    /// their places. Sliding to its new place, a chat drew over the rows it passed; one coming or
+    /// going faded over the rows moving; and with nothing moving, one that came after the others
+    /// had moved left its place empty for a quarter of a second first.
     private func list(_ shown: [Conversation]) -> some View {
         let chats = state.chats
         let sections = ChatSection.of(shown, now: today)
-        let moves = places.moves(sections)
         // A lazy stack, not a sidebar list, whose source-list rows AppKit insets further: with
         // every row laid out, showing the Chat took 160 ms with 500 chats and 550 with 2,000,
         // against 30 to 50 lazily. Its rows don't slide: scrolled, it moved a row it had put aside
@@ -415,9 +414,8 @@ private struct ChatList<Actions: View>: View {
                         .padding(.top, section.id == sections.first?.id ? 6 : 14)
                         .padding(.bottom, 2)
                         .accessibilityAddTraits(.isHeader)
-                        .transition(Motion.comingAndGoing)
-                    ForEach(section.chats.map { Place(chat: $0, group: section.group, moves: moves[$0.id] ?? 0) }) { place in
-                        let conversation = place.chat, id = conversation.id
+                    ForEach(section.chats) { conversation in
+                        let id = conversation.id
                         ChatRow(conversation: conversation, open: chats.selection == id, picked: picked.map { $0.contains(id) },
                                 answering: chats.streaming == id) {
                             if picked == nil {
@@ -433,55 +431,14 @@ private struct ChatList<Actions: View>: View {
                                 Button("Select") { picked = [id] }
                             }
                         }
-                        .transition(Motion.comingAndGoing)
                     }
                 }
             }
             .padding(.horizontal, 10)
             .padding(.vertical, 4)
         }
-    }
-}
-
-/// A chat's row where it is: a row of its own in each group, and anew each time the chat moves up in one.
-private struct Place: Identifiable {
-    struct ID: Hashable {
-        let chat: UUID
-        let group: ChatSection.Group
-        let moves: Int
-    }
-
-    let chat: Conversation
-    let group: ChatSection.Group
-    /// How many times the chat has moved up in its group (`Places`).
-    let moves: Int
-    var id: ID { ID(chat: chat.id, group: group, moves: moves) }
-}
-
-/// The order of the chats in each group of the list as it was last drawn, to tell the chats that
-/// move up in their group, as a chat sent to moves to the top of Today, from those that make room
-/// for them. Kept apart from what the list draws: it changes as the list is drawn.
-@MainActor
-private final class Places {
-    private var order: [ChatSection.Group: [UUID]] = [:]
-    private var moved: [UUID: Int] = [:]
-
-    /// How many times each chat has moved up in its group, `sections` as the list draws them now:
-    /// once more for each that comes before a chat it came after, of the chats there before too.
-    func moves(_ sections: [ChatSection]) -> [UUID: Int] {
-        var order: [ChatSection.Group: [UUID]] = [:]
-        for section in sections {
-            let now = section.chats.map(\.id)
-            let before = self.order[section.group] ?? []
-            let kept = Set(before).intersection(now)
-            let was = Dictionary(uniqueKeysWithValues: before.filter(kept.contains).enumerated().map { ($1, $0) })
-            for (place, id) in now.filter(kept.contains).enumerated() where place < was[id] ?? place {
-                moved[id, default: 0] += 1
-            }
-            order[section.group] = now
-        }
-        self.order = order
-        return moved
+        // At once, whatever else changes with it, as the server's stage animates the window (`MainView`).
+        .animation(nil, value: sections.map { $0.chats.map(\.id) })
     }
 }
 

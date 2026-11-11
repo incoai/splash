@@ -194,13 +194,13 @@ extension ChatScreenTests {
 }
 
 extension ChatScreenTests {
-    /// The list's rows never draw over each other as chats move between its groups and go: a chat
-    /// pinned or unpinned goes from its place at once and fades into its new one once the rows
-    /// have made room, and one deleted goes at once, as the rows under it close its gap. Pinned,
-    /// a chat slid to its new place over the rows it passed; deleted, it faded out under the row
-    /// moving into its place; and with the list scrolled, a row put aside above the screen flew
-    /// from the list's foot to its top over every row. In every frame, each line of ink in the list
-    /// is one title tall, as no two titles overlap.
+    /// The list takes each change at once, its rows never drawn over each other: a chat pinned or unpinned shows
+    /// at once in its new place, one deleted goes at once, and the rows around them take their places. Pinned, a
+    /// chat slid to its new place over the rows it passed; deleted, it faded out under the row moving into its
+    /// place; with the list scrolled, a row put aside above the screen flew from the list's foot to its top over
+    /// every row; and with the rows snapping, one that came left its new place empty for a quarter of a second
+    /// before it faded in. Every frame drawn after a change shows the list as it ends, each line of ink one title
+    /// tall.
     @Test func theListsRowsNeverDrawOverEachOther() async throws {
         let folder = FileManager.default.temporaryDirectory.appending(path: "splash-chat-list-\(UUID().uuidString)")
         defer { try? FileManager.default.removeItem(at: folder) }
@@ -240,6 +240,12 @@ extension ChatScreenTests {
             }
             return CGFloat(longest) / scale
         }
+        /// The list in `picture`, a row of pixels at a time.
+        func rows(_ picture: NSBitmapImageRep) -> [Data] {
+            let scale = CGFloat(picture.pixelsHigh) / window.frame.height, data = picture.bitmapData!
+            let start = Int(list.minX * scale) * picture.bitsPerPixel / 8, length = Int(list.width * scale) * picture.bitsPerPixel / 8
+            return (Int(list.minY * scale)..<Int(list.maxY * scale)).map { Data(bytes: data + $0 * picture.bytesPerRow + start, count: length) }
+        }
         func check(_ what: String, _ change: () throws -> Void) async throws {
             var thrown: (any Error)?
             let frames = try await Self.frames(of: window) { do { try change() } catch { thrown = error } }
@@ -247,6 +253,9 @@ extension ChatScreenTests {
             let line = max(tallest(frames.before), tallest(frames.after)) + 2
             let drawn = frames.drawn.map(tallest)
             #expect(drawn.allSatisfy { $0 <= line }, "\(what): the tallest line of ink per frame \(drawn), a title's \(line)")
+            let ending = rows(frames.after)
+            let unlike = frames.drawn.map { zip(rows($0), ending).count { $0 != $1 } }
+            #expect(unlike.allSatisfy { $0 == 0 }, "\(what): rows of pixels unlike the list as it ends, per frame: \(unlike)")
         }
         try await check("pinning a chat of yesterday") { state.chats.pin(try id("Bread recipe"), true) }
         try await check("unpinning it") { state.chats.pin(try id("Bread recipe"), false) }
