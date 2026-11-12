@@ -59,6 +59,9 @@ PRODUCTION_AIRS := $(addprefix $(METAL_BUILD)/, \
 KERNEL_HEADERS := $(sort $(wildcard runtime/metal/abi/*.h \
 	runtime/metal/kernels/common/*.h runtime/metal/abi/video/*.h \
 	runtime/metal/kernels/video/common/*.h))
+# The video engine's request preparation reproduces MLX's arithmetic bit for
+# bit, and compiles as MLX's metallib does, without fast math.
+VIDEO_PREP_AIRS := $(filter $(METAL_BUILD)/video/prep/%,$(PRODUCTION_AIRS))
 # macOS 26.4 is the tested floor: the engine refuses older systems at
 # startup, and every binary and metallib records it. The MPP kernels need
 # macOS 26.2 or newer, and MPP chooses its code path by this target.
@@ -199,6 +202,11 @@ $(METAL_BUILD)/%.air: runtime/metal/kernels/%.metal $(KERNEL_HEADERS) \
 		| $(METAL_BUILD)
 	@mkdir -p $(dir $@)
 	$(RUN_CONFIGURED) $(METAL) $(PROD_METALFLAGS) -c $< -o $@
+
+$(VIDEO_PREP_AIRS): $(METAL_BUILD)/%.air: runtime/metal/kernels/%.metal \
+		$(KERNEL_HEADERS) | $(METAL_BUILD)
+	@mkdir -p $(dir $@)
+	$(RUN_CONFIGURED) $(METAL) $(PROD_METALFLAGS) -fno-fast-math -c $< -o $@
 
 $(LIB): $(PRODUCTION_AIRS)
 	$(RUN_CONFIGURED) $(METALLIB) $(BUILD_INPUTS) -o $@
