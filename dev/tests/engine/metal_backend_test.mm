@@ -89,6 +89,59 @@ ComputeDispatch addition(const MetalBuffer &buffer, const uint32_t &count,
             {1, 1, 1}, {1, 1, 1}};
 }
 
+template <size_t Words>
+uint32_t addOwnedParameters(CommandGraph &graph, const MetalBuffer &output,
+                            const MetalBuffer &grid, uint32_t seed) {
+    std::array<uint32_t, Words> parameters;
+    parameters[0] = Words - 1;
+    uint32_t sum = 0;
+    for (size_t index = 1; index < Words; ++index) parameters[index] = seed + index;
+    for (size_t index = 1; index < Words; ++index) sum += parameters[index];
+    if (seed % 4 == 0)
+        graph.add("test_parameter_bytes", {output}, parameters, {1, 1, 1}, {1, 1, 1});
+    else if (seed % 4 == 1)
+        graph.add("test_parameter_bytes", std::vector<MetalBuffer>{output}, parameters, {1, 1, 1}, {1, 1, 1});
+    else if (seed % 4 == 2)
+        graph.add("test_parameter_bytes", {output}, parameters, {1, 1, 1}, {grid, 0}, {1, 1, 1});
+    else
+        graph.add("test_parameter_bytes", std::vector<MetalBuffer>{output}, parameters, {1, 1, 1},
+                  {grid, 0}, {1, 1, 1});
+    parameters.fill(0);
+    return sum;
+}
+
+void graphOwnsParametersAfterMoves(const std::string &metallibPath) {
+    MetalBackend backend(metallibPath);
+    constexpr uint32_t count = 1024;
+    const MetalBuffer output = sharedBuffer(backend, count * sizeof(uint32_t));
+    const MetalBuffer grid = sharedBuffer(backend, 3 * sizeof(uint32_t));
+    std::fill_n(static_cast<uint32_t *>(grid.contents()), 3, 1u);
+    std::array<uint32_t, count> expected;
+    const auto append = [&](CommandGraph &graph, uint32_t index) {
+        const MetalBuffer row = backend.view(output, index * sizeof(uint32_t), sizeof(uint32_t));
+        const uint32_t seed = 1009 * index;
+        switch ((index / 4) % 4) {
+        case 0: expected[index] = addOwnedParameters<3>(graph, row, grid, seed); break;
+        case 1: expected[index] = addOwnedParameters<32>(graph, row, grid, seed); break;
+        case 2: expected[index] = addOwnedParameters<33>(graph, row, grid, seed); break;
+        case 3: expected[index] = addOwnedParameters<129>(graph, row, grid, seed); break;
+        }
+    };
+    CommandGraph graph;
+    for (uint32_t index = 0; index < 3 * count / 4; ++index) append(graph, index);
+    CommandGraph moved(std::move(graph)), assigned;
+    append(assigned, count - 1);
+    assigned = std::move(moved);
+    append(graph, count - 1);
+    append(moved, count - 1);
+    graph = CommandGraph();
+    moved = CommandGraph();
+    for (uint32_t index = 3 * count / 4; index < count; ++index) append(assigned, index);
+    (void)backend.submitCommandAsync(assigned.dispatches()).wait();
+    require(std::equal(expected.begin(), expected.end(), static_cast<const uint32_t *>(output.contents())),
+            "a graph did not own its parameters through growth and moves");
+}
+
 struct TemporaryMetallib final {
     TemporaryMetallib()
         : path((std::filesystem::temp_directory_path() /
@@ -3342,6 +3395,7 @@ std::string metallib;
 // test-sanitizers-metal also runs under ThreadSanitizer.
 std::span<const splash::test::TestCase> behaviourTests() {
     static constexpr splash::test::TestCase kTests[] = {
+        {"graphOwnsParametersAfterMoves", [] { graphOwnsParametersAfterMoves(metallib); }},
         {"testACommandOutOfMemoryIsClassed", [] { testACommandOutOfMemoryIsClassed(); }},
         {"completionDoesNotWaitForMemoryTelemetry", [] { completionDoesNotWaitForMemoryTelemetry(metallib); }},
         {"terminalCommandRecovers", [] { terminalCommandRecovers(metallib, false); }},

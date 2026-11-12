@@ -174,6 +174,7 @@ TEST_TARGET_SAMPLING_TEST := $(ENGINE_TEST_BUILD)/target-sampling
 TEST_VISION_METAL_TEST := $(ENGINE_TEST_BUILD)/vision-metal
 TEST_VISION_ATTENTION_TEST := $(ENGINE_TEST_BUILD)/vision-attention
 TEST_BACKEND_BENCHMARK := $(ENGINE_TEST_BUILD)/backend-benchmark
+TEST_COMMAND_GRAPH_BENCHMARK := $(ENGINE_TEST_BUILD)/command-graph-benchmark
 TEST_DECODE_PROFILE := $(ENGINE_TEST_BUILD)/decode-profile
 TEST_TEACHER_LOGITS := $(ENGINE_TEST_BUILD)/teacher-logits
 TEST_ATTENTION_SWEEP := $(ENGINE_TEST_BUILD)/attention-sweep
@@ -308,7 +309,7 @@ TEST_CONFIG_TARGETS := $(filter-out $(LIB) $(HOST_STEP_LIB),$(sort $(TEST_CPU_TA
 	$(TEST_Q8_AIR) $(TEST_Q8_KERNEL_AIRS) $(TEST_RESIDENCY_AIR) $(TEST_HOST_STEP_AIR) $(TEST_METAL_BACKEND_AIR) \
 	$(TEST_GGUF_DEQUANT_AIR) $(TEST_GGUF_MOE_AIR)
 # Benchmarks and tools that build with the production flags.
-PRODUCTION_FLAG_TOOLS := $(TEST_BACKEND_BENCHMARK) $(WEIGHT_DIGESTS)
+PRODUCTION_FLAG_TOOLS := $(TEST_BACKEND_BENCHMARK) $(TEST_COMMAND_GRAPH_BENCHMARK) $(WEIGHT_DIGESTS)
 SANITIZER_CONFIG_TARGETS := $(TEST_SLOT_FILE_ASAN) $(TEST_SLOT_FILE_TSAN) \
 	$(TEST_KV_SLOT_FORMAT_ASAN) \
 	$(TEST_KV_PAGE_TIER_HOST_ASAN) $(TEST_KV_PAGE_TIER_HOST_TSAN) \
@@ -535,6 +536,10 @@ $(TEST_MODEL_CONFIGURATION) $(TEST_DRAFT_PREPARATION) $(TEST_GGUF_PROJECTION) $(
 		$(ENGINE_LINKFLAGS) -o $@
 
 # Tools built with the production flags.
+$(TEST_COMMAND_GRAPH_BENCHMARK): dev/benchmarks/command_graph_benchmark.cpp $(ENGINE_LIBRARY) \
+		| $(ENGINE_TEST_BUILD)
+	$(RUN_CONFIGURED) $(CXX) $(ENGINE_CXXFLAGS) $< $(ENGINE_LIBRARY) $(ENGINE_LINKFLAGS) -o $@
+
 $(WEIGHT_DIGESTS): dev/tools/weight_digests.mm \
 		dev/tools/LoadOptions.hpp $(ENGINE_LIBRARY)
 
@@ -748,7 +753,7 @@ test-real: preflight $(TARGET) $(TEST_MODEL_RUNTIME_ORACLE) \
 		--spill-buffers 2 $(ORACLE_ARGS)
 	$(TEST_MODEL_RUNTIME_ORACLE) $(LIB) "$(MODEL_ROOT)" --spill-tokens 32768 --spill-window 64 $(ORACLE_ARGS)
 
-.PHONY: benchmark-backend \
+.PHONY: benchmark-backend benchmark-command-graph \
 	benchmark-decode-profile benchmark-attention-sweep \
 	benchmark-gguf-projection benchmark-gguf-moe teacher-logits
 # decode-profile replays the installed model's prefill and decode commands as
@@ -788,6 +793,9 @@ benchmark-gguf-moe: $(TEST_GGUF_MOE_BENCHMARK) $(LIB)
 
 benchmark-backend: preflight $(TARGET) $(TEST_BACKEND_BENCHMARK) $(LIB)
 	$(TEST_BACKEND_BENCHMARK) $(LIB) "$(MODEL_ROOT)"
+
+benchmark-command-graph: $(TEST_COMMAND_GRAPH_BENCHMARK)
+	$(TEST_COMMAND_GRAPH_BENCHMARK)
 
 # CPU tests that also run under the sanitizers: each is built three times
 # from the same sources, once as the CPU tests above are and once under each
