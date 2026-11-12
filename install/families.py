@@ -143,6 +143,43 @@ class VideoFamily:
     # license files an assembly links, where it has them.
     license: str
     license_files: tuple
+    # A clip's frame rate, its frames frame_period n + frame_offset
+    # (runtime/video/ops/Geometry.cpp holds the engine's copy), and OpenAI's
+    # `seconds` (of the video API): the whole numbers a clip takes and the
+    # default.
+    fps: int
+    frame_period: int
+    frame_offset: int
+    seconds: range
+    default_seconds: str
+    # OpenAI's `size`, WIDTHxHEIGHT: a canvas of a tier, by its short edge,
+    # both sides multiples of canvas_step and the long edge at most twice the
+    # short (the engine's ops::canvasTier); the named canvases, any other of
+    # a tier rendering too, and the default.
+    canvas_tiers: tuple
+    canvas_step: int
+    sizes: tuple
+    size: str
+    # The presentation's text rows (one prefill pass of the text encoder),
+    # and the text encoder's vision tokens, for the server's prompt layout.
+    max_text_tokens: int
+    vision_start: int
+    vision_end: int
+    image_pad: int
+    video_pad: int
+    # Ref2VA references as the server normalizes them: their audio's
+    # sampling rate, the canvas rule per tier and Pika's limits.
+    sample_rate: int
+    reference_tiers: dict
+    aspect_range: tuple
+    max_source_seconds: float
+    video_seconds: tuple
+    max_total_video_seconds: float
+    max_images: int
+    max_videos: int
+    max_audio: int
+    max_references: int
+    min_video_frames: int
 
 
 # Pika H3 Flex, whose adapters and Ref2VA base the pika variants read, and
@@ -246,6 +283,47 @@ H3 = VideoFamily(
         "https://huggingface.co/MiniMaxAI/MiniMax-H3/blob/main/LICENSE"
     ),
     license_files=("LICENSE", "NOTICE"),
+    # A whole number of seconds from 4 to 15 (Pika's `--duration`, 5 to 15,
+    # and 4). A clip of s seconds has the smallest 17 n + 5 frames at least
+    # s x 24 at 24 fps (Pika's align_num_frames): 4, 5, 7, 10 and 15 s are
+    # 107, 124, 175, 243 and 362.
+    fps=24,
+    frame_period=17,
+    frame_offset=5,
+    seconds=range(4, 16),
+    default_seconds="5",
+    # 768p and 480p.
+    canvas_tiers=(768, 480),
+    canvas_step=32,
+    sizes=("1344x768", "768x1344", "832x480", "864x480", "480x832"),
+    size="1344x768",
+    # Pika H3 Flex's MAX_TEXT_TOKENS: a prompt and its labels, and a clip
+    # from keyframes as a whole; a Ref2VA presentation's vision rows run past
+    # it up to the engine's bound (Ready max_context_tokens).
+    max_text_tokens=2048,
+    # Qwen3-VL's <|vision_start|>, <|vision_end|>, <|image_pad|> and
+    # <|video_pad|>.
+    vision_start=151652,
+    vision_end=151653,
+    image_pad=151655,
+    video_pad=151656,
+    sample_rate=32000,
+    # Pika's DEFAULT_TIER_RULES of the tiers Splash renders, by the canvas's
+    # short edge: the canvas rule a reference video follows (short edge, area
+    # budget) and an image reference's short edge.
+    reference_tiers={
+        480: (480, 832 * 480, 1024),
+        768: (768, 1344 * 768, 2048),
+    },
+    aspect_range=(1 / 4, 4.0),
+    max_source_seconds=16.0,
+    video_seconds=(2.0, 15.0),
+    max_total_video_seconds=15.0,
+    max_images=9,
+    max_videos=3,
+    max_audio=3,
+    max_references=12,
+    min_video_frames=22,
 )
 
 

@@ -21,6 +21,7 @@ from dev.tests.install.test_video import ENCODER_SHARDS, LICENSE, qk_norm, tree
 from dev.tests.installer_fixtures import FakeHub, selection
 from install import assembly, conversion, fasth3, h3, hub, models, upstream, video
 from install.families import H3, PIKA
+from server import videos
 
 RELEASE, BASE = "1" * 40, fasth3.LORA_BASE
 COMMITS = {H3.release: RELEASE, H3.encoder: "2" * 40, fasth3.STUDENT_8: "3" * 40,
@@ -472,6 +473,13 @@ class FastH3InstallTest(unittest.TestCase):
             {"name": "tuned", "references": False, "qkfix": [45, 48, 49]} | spec,
         )
         self.assertEqual(assembly.verify(self.models / f"{H3.release}:tuned"), record)
+        # It is served as a shipped variant is: the engine runs dit-tuned.
+        rows = videos.installed_variants(self.models / f"{H3.release}:tuned")
+        request = videos.parse_request({"prompt": "x"}, (H3.release,), rows)
+        self.assertEqual(list(rows), ["tuned"])
+        self.assertEqual(
+            (request.dit, videos.clip(request, (1,))[0]), ("tuned", "tuned")
+        )
         schedule = spec["schedule"] | {"sampler": "dpm"}
         for model, given, error in (
             ("pika-6", spec, "pika-6 is a variant Splash ships"),

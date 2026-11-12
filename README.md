@@ -107,6 +107,35 @@ reported by the API. Omit `--draft-model` to use the family's draft from the
 Hub cache, or add `--mmproj /models/mmproj-BF16.gguf` for a GGUF's vision.
 See [local model files](docs/models.md#local-model-files) for details.
 
+## Video
+
+`splash serve --model MiniMaxAI/MiniMax-H3` serves MiniMax-H3, text to video
+with audio (768p: 1344×768 or 768×1344; 480p: 832×480, 864×480 or
+480×832; 24 fps, 4 to 15 s), optionally from a first frame
+and a last frame, through OpenAI's video API, as
+an instance of its own: run a language model beside it on another `--port`.
+It needs an M5 with 48 GB. The first start converts MiniMax's release into
+the engine's int8 format as it reads it (about 83 GB), once. The model ID
+without a variant installs Pika H3 Flex's 6-step variant, `:pika-6`, and an
+installation made before keeps the variant it holds;
+`MiniMaxAI/MiniMax-H3:vdn-8`, OpenVDN's 8-step variant, takes 28 GB on disk
+beside the text encoder's package (27.92 GB), which every installation links,
+and `:vdn-50`, the 50-step one, is a model of its own (29 GB more). The weights are under the MiniMax H3 Community License, which does
+not license their use in the EU, UK, Republic of Korea or the USA.
+
+```bash
+curl http://127.0.0.1:8000/v1/videos -H 'Content-Type: application/json' \
+  -d '{"prompt": "A golden retriever runs along a beach at sunset.", "seconds": "5", "size": "832x480"}'
+curl http://127.0.0.1:8000/v1/videos -F prompt='The dog turns to the camera.' \
+  -F input_reference=@first.png -F last_frame=@last.png   # last_frame is optional
+curl http://127.0.0.1:8000/v1/videos/VIDEO_ID/content -o clip.mp4
+```
+
+Without a server, `splash generate --model MiniMaxAI/MiniMax-H3[:VARIANT] --prompt "..." --out clip.mp4 [--seconds 4..15] [--size WIDTHxHEIGHT] [--seed N] [--preview] [--no-audio] [--first-frame IMAGE [--last-frame IMAGE]]` writes one clip.
+With a `splash serve` of a video model running on its `--port` (default 8000), `splash generate` sends the clip to that server as a job and writes the same mp4.
+
+[Video details](docs/video.md)
+
 ## Settings
 
 Memory and context are sized automatically, up to the model's native context

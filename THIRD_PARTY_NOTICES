@@ -303,6 +303,8 @@ Ref2VA base, which the installer reads from Pika H3 Flex's repository and
 converts (install/fasth3.py); none is part of Splash. They are Model Derivatives of MiniMax
 H3 under the MiniMax H3 Community License Agreement, Copyright (c) 2026
 Mellis, Inc.
+The reference decoding and normalization of server/references.py follow
+Pika H3 Flex's example code (pika_h3.core.media, pika_h3.core.conditioning).
 Apache License, Version 2.0 (http://www.apache.org/licenses/LICENSE-2.0).
 
 Qwen3-VL-32B-Instruct (https://huggingface.co/Qwen/Qwen3-VL-32B-Instruct)
@@ -311,6 +313,20 @@ The video text encoder runs Qwen3-VL-32B-Instruct's weights, which are not
 part of Splash: the installer reads mlx-community's MLX conversion
 (https://huggingface.co/mlx-community/Qwen3-VL-32B-Instruct-8bit). Apache
 License, Version 2.0 (http://www.apache.org/licenses/LICENSE-2.0).
+
+diffusers (https://github.com/huggingface/diffusers)
+
+The reference video normalization of server/references.py follows diffusers'
+MiniMaxH3Ref2VASetupStep. Apache License, Version 2.0
+(http://www.apache.org/licenses/LICENSE-2.0).
+
+PyAV (https://github.com/PyAV-Org/PyAV)
+
+server/references.py decodes reference videos and audio with PyAV, which
+Splash does not distribute: it is optional, and the user installs it
+(av==19.0.2). Its binary wheels bundle FFmpeg and the libraries it links,
+among them libx264 and libx265; PyAV, FFmpeg and each of those libraries are
+under their own licenses.
 
 BigVGAN (https://github.com/NVIDIA/BigVGAN)
 

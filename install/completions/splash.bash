@@ -11,10 +11,10 @@ _splash() {
     cur=${COMP_WORDS[COMP_CWORD]}
     prev=${COMP_WORDS[COMP_CWORD-1]}
     if [[ $COMP_CWORD -eq 1 ]]; then
-        COMPREPLY=($(compgen -W 'serve install claude codex opencode hermes pi' -- "$cur"))
+        COMPREPLY=($(compgen -W 'serve generate install claude codex opencode hermes pi' -- "$cur"))
         return 0
     fi
-    [[ ${COMP_WORDS[1]} == serve || ${COMP_WORDS[1]} == install ]] || return 0
+    [[ ${COMP_WORDS[1]} == serve || ${COMP_WORDS[1]} == generate || ${COMP_WORDS[1]} == install ]] || return 0
     for ((i=2; i<COMP_CWORD; i++)); do
         [[ ${COMP_WORDS[i]} == -- ]] && return 0
     done
@@ -32,7 +32,7 @@ _splash() {
         option=$prev prefix=$cur
     fi
     case $option in
-        --model-dir|--draft-model|--mmproj|--spec)
+        --model-dir|--draft-model|--mmproj|--out|--first-frame|--last-frame|--reference|--spec)
             # compgen -f run in this shell, unlike the subshell below, has
             # readline treat these candidates as file names: quoted, with a
             # directory's ending in '/'. Bash 3.2 has no compopt, and complete's

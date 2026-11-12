@@ -1,5 +1,129 @@
 # Video
 
+`splash serve --model MiniMaxAI/MiniMax-H3` serves MiniMax-H3, a text to
+video and audio model, as its own instance: its server answers
+[OpenAI's video API](https://platform.openai.com/docs/api-reference/videos)
+and no language model's routes, which answer 404; chat and video together
+are two instances on two ports. The two share the model layer, the
+installer's inspection, publication and assemblies, and the server's HTTP
+handling; the video model has an engine process of its own
+([figure](video-serving.svg)). It runs on an M5 (Apple10
+GPU) with 48 GB.
+
+## Video API
+
+| Route | Answer |
+| --- | --- |
+| `POST /v1/videos` | a queued video object |
+| `GET /v1/videos/{id}` | the video object |
+| `GET /v1/videos/{id}/content` | the mp4; `?variant=preview` the TAEH3 preview once decoded |
+| `GET /v1/videos` | a list (`limit` up to 100, `order`, `after`) |
+| `DELETE /v1/videos/{id}` | forgets the job, cancelling it at its next step |
+
+`POST` takes JSON, or the multipart form OpenAI's SDK sends: `prompt`,
+`model`, `seconds` (a whole number from `4` to `15`, `5` the default:
+Pika's `--duration` choices and `4`; the smallest 17 n + 5 frames at least
+seconds x 24 at 24 fps, Pika's `align_num_frames`, such as 107, 124, 175, 243
+and 362 frames for 4, 5, 7, 10 and 15 s; the golden-clip tests' server also
+takes `3`, 73 frames, under `SPLASH_GOLDEN_CLIPS=1`) and `size` (`1344x768`, the
+default, or another canvas of
+[the 768p and 480p tiers](#video-canvases), such as `832x480`), and
+Splash's `variant` (the installed one: `vdn-8`, `vdn-50`, `fasth3-8`, `fasth3-4`, `pika-6` or `pika-ref2va-6`), `seed`, `steps` (0 or the variant's: its adaLN tables are those of
+its schedule), `preview` (false) and `audio` (true). OpenAI's
+`input_reference`, a PNG or JPEG file field, is the clip's first frame, and
+Splash's `last_frame`, another (with `input_reference`), its last; the server
+puts each on the request's canvas as the model's MLX port does
+(`images.keyframe`: an image of that size as it is, otherwise the first frame
+stretched and the last scaled to cover and centre-cropped, LANCZOS; stored
+RGB, alpha dropped, no EXIF rotation). The video object has OpenAI's fields,
+and `phase`, `variant`, `seed`, `preview` (ready) and `phases`, each completed
+phase's seconds and the engine's peak footprint. Errors have the OpenAI
+shape: `video_queue_full` (503) past four queued jobs, `video_not_ready`
+(409) for content not yet decoded, `not_found` and `model_not_found` (404).
+
+A Ref2VA job (Pika H3 Flex's reference-conditioned video and audio) takes
+`references` in place of keyframes: a file field of the multipart body,
+repeated, in the order the prompt numbers them (`<Picture i>`, `<Video k>`,
+`<Audio j>`, each kind counted on its own). Its content type gives its kind:
+`image/png` or `image/jpeg` an image, `video/mp4`, `video/quicktime` or
+`video/webm` a video with its soundtrack, `audio/mpeg`, `audio/wav`,
+`audio/mp4` (M4A) or `audio/aac` an audio clip (a voice or music reference);
+any other type is a 400. JSON bodies take no references (the keyframes too
+are multipart files only). The server decodes and normalizes them as Pika's
+`pika_h3.core` does (`server/references.py`): PyAV (`av`, the library Pika
+uses, pinned to its version) decodes a video's rgb24 frames for at most 16 s
+at its average rate and resamples a soundtrack or an audio clip to 32 kHz
+stereo; PIL decodes an image (RGB, no EXIF rotation). Reference video and
+audio need PyAV, which Splash does not ship; install it with
+`<python> -m pip install av==19.0.2`, `<python>` the interpreter Splash runs
+(without it such a request is a 400 naming that command). A video goes onto the
+24 fps grid (each frame held until the next one's slot), is truncated to the
+clip's frame count and LANCZOS-resized to the canvas its own aspect ratio
+resolves to on the clip's tier (480p: short edge 480 within 832 x 480 pixels;
+768p: 768 within 1344 x 768); an image is LANCZOS-resized to the tier's
+reference short edge (1024 at 480p, 2048 at 768p, upscaled, no area cap,
+both sides rounded to 32); a soundtrack or an audio clip is truncated to
+round(frames / 24 x 32000) samples. Pika's limits hold: at most 9 images, 3
+videos and 3 audio clips, 12 in all; each video and each audio clip 2 to 15 s
+of decoded source, and the videos 15 s at most in all, the audio clips
+likewise; a video at least 22 frames once normalized; an image or a video
+among them; aspect ratios within 1:4 and 4:1. References are refused with
+`input_reference` or `last_frame`, and condition the `pika-ref2va-6` variant
+alone, which a request with references takes when it names none (another
+variant is a 400 naming it, and `pika-ref2va-6` refuses a request without
+references). The presentation (`ref2va_presentation`) holds at most 2,048
+text rows (Pika's `MAX_TEXT_TOKENS`) and, with its vision rows, at most the
+bound the engine's Ready announces (32,768); a request without references
+keeps its whole presentation within 2,048. An audio clip's samples and an
+audio reference's labels are those of Pika's `decode_audio_stereo` and
+diffusers' `_build_presentation`.
+
+Jobs run one at a time in their order of arrival; the mp4s and previews of
+finished jobs stay in a 4 GB store, the oldest evicted first.
+
+`splash generate --model MiniMaxAI/MiniMax-H3 --prompt ... --out clip.mp4`
+installs the model as `serve` does and runs one clip on its engine without a
+server (`python -m server.videos`): its flags are the `POST` fields, checked
+by the same `parse_request`, `--first-frame` and `--last-frame` the image
+files of `input_reference` and `last_frame`, `--reference FILE`, repeated in
+presentation order, the files of `references` (each one's kind from its
+leading bytes, else its extension); progress goes to stderr, each line with
+the engine's peak footprint,
+`--preview` writes `clip.preview.mp4` once decoded, and Ctrl+C cancels at the
+next step.
+
+## Video canvases
+
+A canvas belongs to a tier by its short edge: 768p or 480p. Within a tier
+any width and height that are multiples of 32 (one DiT token is 2 × 2
+latent pixels of 16 × 16 px), with the long edge at most twice the short,
+render; the server and the engine refuse others (400; the engine's
+`ops::canvasTier`). These are the named canvases:
+
+| `size` | Tier | Token grid | Rows per latent frame | VSA tiles, 5 s (partial) | Video VAE tiles |
+| --- | --- | --- | ---: | ---: | ---: |
+| `1344x768` (16:9, default) | 768p | 42 × 24 | 1,008 | 660 (120) | 4 × 7 |
+| `768x1344` (9:16) | 768p | 24 × 42 | 1,008 | 660 (120) | 7 × 4 |
+| `832x480` (FastVideo's) | 480p | 26 × 15 | 390 | 280 (118) | 3 × 4 |
+| `864x480` (mlx-serve's) | 480p | 27 × 15 | 405 | 280 (118) | 3 × 5 |
+| `480x832` | 480p | 15 × 26 | 390 | 280 (118) | 4 × 3 |
+
+Everything a request derives from its canvas comes from the token grid,
+per request: the packed rows (text, keyframes of one latent frame's rows
+each, audio, latent frames × grid), the (t, h, w) positions and RoPE, the
+window softmax's key-range table (its window of 5-frame chunks, radius 1,
+is temporal), FastH3's tile map (4 × 4 × 4 cubes, partial on any axis: a
+480p grid's 15 rows end in cubes of 3), the activation plan, the video
+VAE's 256 px tiles on both axes (encoder and decoder), the TAEH3 preview
+and the mp4's bit rate (0.8 bits per pixel and frame). No weight or adaLN
+table depends on the canvas: the tables depend on the variant's timesteps
+alone, so one conversion serves every canvas. The device's execution
+constants (`runtime/video/metal/DeviceProfile.hpp`) were tuned at 768p and run 480p
+unchanged; those a 480p tuning pass should revisit are marked there. A
+480p clip's DiT has 0.39-0.40 of the rows of the 768p clip of its length:
+5 s at 832×480 plans 1.7 GB of activations (VDN-H3) against 3.8 GB at
+1344×768.
+
 ## Video installation
 
 The model's assembly is of target format `h3-video` (`install/video.py`).
@@ -14,6 +138,10 @@ entry and assembly, and so are FastVideo's FastH3 students, `:fasth3-8` and
 without a variant installs `H3.default_variant`, `:pika-6`, unless its
 selection link holds an installation, which keeps its variant. A server
 serves the variant it installed.
+A request without `variant` is served `H3.default_variant` by an assembly
+of several that holds it, else the first.
+Installation and `splash generate` print the license's name, its excluded
+territories and its URL; the assembly links the release's `LICENSE`.
 
 The installer converts the variant into the engine's images (the int8
 format `h3-w8a8-vdn-v1`, [Kernels](internals.md#kernels)) as it reads its sources at
@@ -176,6 +304,43 @@ of the presentation (`text_encoder_qk_norm_mrope`: an image's pads at (s,
 s + row, s + column) of its merged grid); a text-only prompt runs the
 text-only commands.
 
+Ref2VA's presentation (diffusers `MiniMaxH3Ref2VATextEncoderStep`, built by
+`server/videos.ref2va_presentation`) adds reference videos: per video
+`<Video k>: ` (after `<Audio j>: ` when it carries sound) and, per pair of
+its 2 fps samples, `<t seconds>` and a block of `<|video_pad|>`, one per
+merged token of a frame. `TextEncoder::videoBlockFrames` (and the server's
+`video_blocks`) pick the pairs as `_sample_video_condition_frames` does: of a
+reference normalized to 24 fps, every 12th frame, the last repeated to an
+even count; 124 frames give (0, 12), (24, 36), ..., (120, 120) at 0.25, 1.25,
+..., 5.0 s, rendered `<0.2 seconds>` ... `<5.0 seconds>` (Python's `{:.1f}`).
+A video block is an `Image` whose `rgb2` is the pair's second frame: the
+tower patchifies the two frames over the temporal patch
+(`h3_vision_patchify_pair`) and otherwise runs it as an image, which is what
+Qwen3-VL does for a video (attention within each frame pair, the position
+embedding and 2D RoPE repeated per pair); its M-RoPE positions are an
+image block's (`get_rope_index` splits a video grid per merged frame, the
+timestamps between are text). Past 2,048 rows (one prefill pass) the
+linears run a pass of 2,048 rows at a time, the norms, rotation and
+attention over every row (`kMaximumPresentationTokens`, 32,768); a prompt
+within one pass runs the one-pass commands.
+
+A first frame, and a last frame, condition the clip as the model's FL2VA
+checkpoint does: the video VAE's encoder turns each into 1,008 latent rows,
+noised to t = 0.999, which join the DiT's sequence after the text, stay fixed
+through the denoising and take a fourth adaLN slot per block. The text
+encoder sees MiniMax-H3's presentation of the request, as the release's
+FL2VA pipeline and Pika H3 Flex build it (`server/videos.presentation`): per
+keyframe, the first frame's and then the last's, the label `<Picture i>: `
+and a vision block (`<|vision_start|>`, one `<|image_pad|>` per 2 x 2 merged
+16-pixel patch of the keyframe on the canvas, 390 at 832x480 and 1,008 at
+1344x768, `<|vision_end|>`), then the prompt, with no chat template and no
+special tokens; the block's rows are tagged as video (tag 0) for the DiT.
+`SPLASH_VIDEO_PROMPT_ONLY=1` keeps the earlier presentation, the prompt
+alone, which the reference first-frame clip was made with
+(`test-video-first-frame-real` sets it). A presentation is at most 2,048
+tokens, so a 1344x768 clip from a first and a last frame (2 x 1,010 vision
+rows and two labels) leaves 16 tokens for the prompt.
+
 The FastH3 variants (`runtime/video/model/FastH3.hpp`) run the same stages.
 Their DiT replaces VDN-H3's window softmax and linear branch by FastVideo's
 Video Sparse Attention on 64-token tiles (`ops/VsaTable`, `ops/VsaAttention`,
@@ -227,6 +392,29 @@ The DiT's `manifest.json` names its adapters, `"adapters": [{"path": P,
 "scale": S}]` (one at a time; entries that are not objects, VDN-H3's names of
 the adapters merged at conversion, are none), and `video-golden` takes
 `--adapter PATH[:SCALE]` or `--no-adapter` in their place.
+
+`pika-6` is MiniMax-H3's base DiT with Pika H3 Flex's FL2VA adapter
+(`Pika-Labs/Pika-H3-Flex`): the base converted in FastH3's block layout
+with a zero compression gate at VSA sparsity 0, i.e. dense attention
+(`install/fasth3.py`, its spec in `install/families.py`), and Pika's released sampler: six forwards
+at the knots 1000, 750, 500, 250, 100, 40 (shifts 12 / 3, sigmas in float64
+then fp32), one forward each (CFG 1), x0 = x + sigma v and, but after the
+last forward, x' = (1 - sigma') x0 + sigma' eps with fresh noise per step,
+video then audio, from the request's second stream (seed + 1, MLX draws:
+Pika's are CUDA Philox, so only the first forward matches a reference
+bit for bit in its inputs; `video-golden --renoise NPZ` takes another
+sampler's noise). Its contract lives in the DiT's manifest
+(`schedule.sampler: renoise`, `sigma_precision: float64`). The base keeps
+the release's fp32 modules in fp32 (time embedder, patch projections, output
+heads; `LoraStudent(keep_f32=True)`), as Pika runs them: rounded to bf16, as a
+FastVideo student holds them, they move half the adaLN table entries by a
+bf16 ulp and the step-0 velocity by 4-8 points of relRMS against a reference
+run of Pika's pipeline. Its attention is dense (`vsa.attention`, [Video engine](#video-engine)).
+The installer converts it into `dit-pika-6/`, its adapter in
+`dit-pika-6/adapter/` (the manifest's relative path), with the release's
+`vae/`, `audio/`, `preview/`, `tokenizer/`, `LICENSE` and `NOTICE`. Its golden test is `dev/tests/video_real.py engine
+--golden-final FINAL --golden-step0 STEP0` on the 3 s golden clip (the first
+forward's velocity and the six-step latents byte for byte).
 
 `splash install MiniMaxAI/MiniMax-H3:NAME --spec FILE` installs a checkpoint
 of MiniMax-H3's DiT that Splash does not ship as the variant NAME, by the
@@ -365,3 +553,55 @@ reference and one DiT block on synthetic weights against a reference implementat
 the geometry, key-range table, tile map, video VAE plan and activation
 plan derived from its grid (`video_canvas_test.mm`), and the adaLN tables' host time
 embedder against an fp64 reference (`video_temb_test.mm`).
+`dev/tests/server/test_video_references.py` checks the server's references
+(kinds, limits, normalization, the variant, the multipart field, the
+presentation and the wire frame) on synthetic media; with
+`SPLASH_REF2VA_RECORD_SHOP` (a Ref2VA example's inputs, a video, two images
+and a prompt, with a reference run's saved `conditioning.npz` of them) and
+`SPLASH_REF2VA_TOKENIZER` it requires the server's token ids identical to the
+saved ones.
+
+The real-model tests compare the engine with a reference directory,
+`VIDEO_REFERENCES`: a reference implementation's run of the same prompt,
+seed and canvas. The reference directory and the Ref2VA example's inputs are
+not part of the repository; `dev/tests/video_real.py` requires
+`--references`, and the targets below refuse to run unless
+`VIDEO_REFERENCES` names a directory. The tests read from it:
+
+| File | Holds | Read by |
+| --- | --- | --- |
+| `prompts/golden.npz` | the golden prompt's token ids (`ids`) and hidden states (`hidden`) | every target |
+| `golden_3s_c5r1_both/final.npz` | the 3 s golden clip's latents | `test-video-real`, `test-video-http-real` |
+| `golden_ref/frames.npy` | the 3 s golden clip's RGB frames | `test-video-real`, `test-video-http-real`; frame 0 for `test-video-first-frame-real` |
+| `golden_i2v_3s/final.npz` | the latents of the 3 s golden clip from frame 0 | `test-video-first-frame-real` (`VIDEO_FIRST_FRAME_FINAL`) |
+
+With the weights, `VIDEO_REFERENCES`, and `VIDEO_ROOT` a prepared model (by
+default the selection link of `VIDEO_MODEL`, `MiniMaxAI/MiniMax-H3:vdn-8`,
+not the `:pika-6` a plain `splash serve --model MiniMaxAI/MiniMax-H3`
+installs) or `VIDEO_CONVERTED` a directory of images converted before:
+
+```sh
+make test-video-real VIDEO_REFERENCES=... VIDEO_CONVERTED=...
+make test-video-http-real VIDEO_REFERENCES=... VIDEO_CONVERTED=... VIDEO_SECONDS=15
+make test-video-first-frame-real VIDEO_REFERENCES=... VIDEO_CONVERTED=...
+make test-video-canvas-real VIDEO_REFERENCES=... VIDEO_CONVERTED=... VIDEO_SIZE=832x480 VIDEO_SECONDS=5
+```
+
+The tests run the golden-clip engine (`dev/tools/video_golden.mm`): the
+model's runtime with the text encoding replaced by the golden prompt's saved
+hidden states and the denoising and decoding followed by writing their
+latents and frames. `test-video-real` requires the 3 s golden clip's latents
+and frames byte-identical to the reference directory's, then cancels a clip;
+for a FastH3 variant, `dev/tests/video_real.py engine --golden-final FINAL`
+requires the latents of a reference clip of the same variant.
+`test-video-http-real` does the same through `/v1/videos`, deletes a running
+job, then runs a clip of `VIDEO_SECONDS` from the server's tokenizer and the
+engine's encoder. `test-video-first-frame-real` sends the golden frames'
+first frame as a PNG `input_reference` and requires the clip's latents
+byte-identical to `VIDEO_FIRST_FRAME_FINAL` (default
+`VIDEO_REFERENCES/golden_i2v_3s/final.npz`). `test-video-canvas-real` makes
+a clip of the golden prompt on `VIDEO_SIZE` for `VIDEO_SECONDS` and reports
+each phase's time, the wall time and the engine's peak footprint;
+`VIDEO_KEEP` keeps its latents and frames for a comparison with another
+engine's clip of the same canvas, seed and noise. The reports go to
+`build/release/video-*.json`.

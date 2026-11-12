@@ -244,6 +244,7 @@ class CompletionTests(unittest.TestCase):
                 ["splash", ""],
                 [
                     "serve",
+                    "generate",
                     "install",
                     "claude",
                     "codex",
@@ -253,6 +254,7 @@ class CompletionTests(unittest.TestCase):
                 ],
             ),
             (["splash", "co"], ["codex"]),
+            (["splash", "generate", "--model", "community/l"], [LOCAL[1]]),
             (
                 ["splash", "serve", "--model", ""],
                 sorted((*SUGGESTED, *LOCAL, *UPSTREAM)),
@@ -634,6 +636,7 @@ class CompletionTests(unittest.TestCase):
                 sorted(
                     (
                         "serve",
+                        "generate",
                         "install",
                         "claude",
                         "codex",
@@ -644,6 +647,7 @@ class CompletionTests(unittest.TestCase):
                 ),
             ),
             ("splash co", ["codex"]),
+            ("splash generate --model community/l", [LOCAL[1]]),
             ("splash serve --model ", models),
             ("splash serve --model community/l", [LOCAL[1]]),
             ("splash serve --model=community/l", [f"--model={LOCAL[1]}"]),
