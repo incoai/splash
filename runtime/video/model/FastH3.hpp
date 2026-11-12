@@ -32,7 +32,7 @@ inline constexpr char kFastH3Format[] = "h3-w8a8-fasth3-v1";
 // names format kFastH3Format. A directory without manifest.json holds a VDN-H3 DiT (scratch of the installer's
 // adaLN tabulation).
 [[nodiscard]] bool isFastH3(const std::string &ditDir);
-// The directory of a DiT under the weights, by its name (the request's): dit-<name>.
+// The directory of a DiT under the weights, by its name (the request's, wire::validDitName): dit-<name>.
 [[nodiscard]] std::string ditDirectory(std::string_view dit);
 
 // How a step moves the latents from the forward's velocity v at sigma to the next rung's sigma'.
