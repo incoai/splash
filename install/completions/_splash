@@ -7,17 +7,17 @@ _splash() {
     local word helper
     local -a models
     if (( CURRENT == 2 )); then
-        compadd -- serve claude codex opencode hermes pi
+        compadd -- serve generate install claude codex opencode hermes pi
         return
     fi
-    [[ $words[2] == serve ]] || return 0
+    [[ $words[2] == (serve|generate|install) ]] || return 0
     for word in "${words[@]:2:$(( CURRENT - 3 ))}"; do
         [[ $word == -- ]] && return 0
     done
-    if [[ $words[CURRENT-1] == (--model-dir|--draft-model|--mmproj) ]]; then
+    if [[ $words[CURRENT-1] == (--model-dir|--draft-model|--mmproj|--out|--first-frame|--last-frame|--reference|--spec) ]]; then
         _files
         return
-    elif [[ $words[CURRENT] == (--model-dir|--draft-model|--mmproj)=* ]]; then
+    elif [[ $words[CURRENT] == (--model-dir|--draft-model|--mmproj|--out|--first-frame|--last-frame|--reference|--spec)=* ]]; then
         compset -P '*='
         _files
         return

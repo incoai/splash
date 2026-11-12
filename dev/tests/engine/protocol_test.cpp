@@ -212,6 +212,32 @@ RequestFrame exampleIgnoreEosRequest() {
   return request;
 }
 
+const VideoRequestFrame kVideoRequest{92, "turbo",
+                                      VideoOutputPreview | VideoOutputAudio,
+                                      73, 1344, 768, 0, 42, {5, 6, 7}, {}, {}, {}};
+
+VideoRequestFrame exampleKeyframeRequest() {
+  VideoRequestFrame request{92, "turbo", VideoOutputAudio, 73, 4, 2, 0, 42, {5}, {}, {}, {}};
+  for (uint8_t index = 0; index < 24; ++index) {
+    request.firstFrame.push_back(index);
+    request.lastFrame.push_back(static_cast<uint8_t>(255 - index));
+  }
+  return request;
+}
+
+// A Ref2VA clip of a 4 x 2 canvas from a 2 x 2 video of two frames with a
+// soundtrack of three samples, a 2 x 1 image and an audio reference of one
+// sample.
+VideoRequestFrame exampleReferenceRequest() {
+  VideoRequestFrame request{92, "pika-ref2va-6", VideoOutputAudio, 73, 4, 2, 0, 7, {5, 6}, {}, {}, {}};
+  VideoReference video{VideoReferenceKind::Video, 2, 2, 2, {}, {0.5f, -0.25f, 1.0f, 0.0f, -1.0f, 0.125f}};
+  for (uint8_t index = 0; index < 24; ++index) video.pixels.push_back(static_cast<uint8_t>(3 * index));
+  VideoReference image{VideoReferenceKind::Image, 1, 2, 1, {9, 8, 7, 6, 5, 4}, {}};
+  VideoReference audio{VideoReferenceKind::Audio, 0, 0, 0, {}, {0.75f, -0.5f}};
+  request.references = {video, image, audio};
+  return request;
+}
+
 RequestFrame exampleProgressRequest() {
   RequestFrame request = exampleRequest();
   request.flags = kReturnProgressFlag;
@@ -231,6 +257,15 @@ const std::vector<std::pair<std::string, ClientMessage>> &clientMessages() {
       {"status_request", StatusRequestFrame{808}},
       {"release_request", ReleaseRequestFrame{808}},
       {"stop", StopFrame{91}},
+      {"video_request", kVideoRequest},
+      // The default DiT's clip without audio or preview.
+      {"video_request_default",
+       VideoRequestFrame{92, "default", 0, 73, 1344, 768, 50, 42,
+                         {0xffffffffU}, {}, {}, {}}},
+      // A clip of a 4 x 2 canvas from its first and last frames.
+      {"video_request_keyframes", exampleKeyframeRequest()},
+      // A Ref2VA clip from a video with its soundtrack and an image.
+      {"video_request_references", exampleReferenceRequest()},
   };
   return messages;
 }
@@ -241,6 +276,9 @@ const std::vector<std::pair<std::string, EngineEvent>> &engineEvents() {
        ReadyEvent{4, 524'288, false, 248'320, {248'044, 248'046}, 9}},
       {"ready_vision", ReadyEvent{4, 524'288, true, 150'144,
                                   {150'001, 150'003, 150'005, 150'018}, 9}},
+      {"ready_video", ReadyEvent{.maxConcurrentRequests = 1,
+                                 .maxContextTokens = 2048,
+                                 .video = true}},
       {"start_failed_memory",
        StartFailedEvent{StartFailureKind::MemoryBudget,
                         {ShortfallBound::MaxMemory, 10'858'659'840ULL,
@@ -285,6 +323,11 @@ const std::vector<std::pair<std::string, EngineEvent>> &engineEvents() {
                   "stream framing cannot be trusted"}},
       {"status_json",
        StatusJsonEvent{808, "{\n  \"schema_version\": 6, \"ready\": true\n}"}},
+      {"video_progress",
+       VideoProgressEvent{92, VideoPhase::Denoise, 3, 8, 312'000'000, 15'200'000'000}},
+      {"video_output",
+       VideoOutputEvent{92, VideoOutputKind::Video, 73, 345'000'000,
+                        {0, 0, 0, 24, 'f', 't', 'y', 'p'}}},
   };
   return events;
 }
@@ -364,7 +407,8 @@ void testRequestRoundTrip() {
 }
 
 // A request's error carries its id, so the stream survives it.
-void expectRequestIssue(std::string_view test, const RequestFrame &invalid,
+template <typename Frame>
+void expectRequestIssue(std::string_view test, const Frame &invalid,
                         IssueCode code,
                         const ProtocolLimits &limits = kLimits) {
   auto decoded = decodeClient(peer::serialize(invalid), limits);
@@ -386,6 +430,51 @@ void expectEventIssue(std::string_view test, const EngineEvent &invalid,
           serialized.issue->failureClass == FailureClass::EngineUnhealthy);
     CHECK(test, serialized.issue->code == code);
   }
+}
+
+// A video request needs a prompt, frames and a DiT name; its progress
+// a step within its steps, its output an mp4.
+void testVideoFrameRejections() {
+  constexpr std::string_view test = "video frame rejections";
+  VideoRequestFrame empty = kVideoRequest, noFrames = empty, unnamed = empty, parent = empty, upper = empty;
+  empty.promptTokens.clear();
+  noFrames.frames = 0;
+  unnamed.dit.clear();
+  parent.dit = "..";
+  upper.dit = "Turbo";
+  expectRequestIssue(test, empty, IssueCode::LimitExceeded);
+  expectRequestIssue(test, noFrames, IssueCode::InvalidCount);
+  for (const VideoRequestFrame &name : {unnamed, parent, upper})
+    expectRequestIssue(test, name, IssueCode::InvalidEnumValue);
+  // A keyframe holds the canvas's height x width x 3 bytes.
+  VideoRequestFrame keyframe = exampleKeyframeRequest();
+  keyframe.lastFrame.pop_back();
+  expectRequestIssue(test, keyframe, IssueCode::InvalidPayloadLength);
+  // A reference holds frames x height x width x 3 bytes; an image is one
+  // frame without a soundtrack; a kind is an image or a video.
+  VideoRequestFrame pixels = exampleReferenceRequest(), imageFrames = pixels,
+                    imageSound = pixels, kind = pixels, tooMany = pixels;
+  pixels.references[0].pixels.pop_back();
+  expectRequestIssue(test, pixels, IssueCode::InvalidPayloadLength);
+  imageFrames.references[1].frames = 2;
+  imageFrames.references[1].pixels.resize(12);
+  expectRequestIssue(test, imageFrames, IssueCode::InvalidCount);
+  imageSound.references[1].soundtrack = {0.0f, 0.0f};
+  expectRequestIssue(test, imageSound, IssueCode::InvalidCount);
+  kind.references[1].kind = static_cast<VideoReferenceKind>(3);
+  expectRequestIssue(test, kind, IssueCode::InvalidEnumValue);
+  tooMany.references.resize(kMaxVideoReferences + 1, tooMany.references[1]);
+  expectRequestIssue(test, tooMany, IssueCode::LimitExceeded);
+  // An audio reference is a soundtrack alone.
+  VideoRequestFrame silent = exampleReferenceRequest(), framed = silent;
+  silent.references[2].soundtrack.clear();
+  expectRequestIssue(test, silent, IssueCode::InvalidCount);
+  framed.references[2].frames = 1;
+  expectRequestIssue(test, framed, IssueCode::InvalidCount);
+  expectEventIssue(test, VideoProgressEvent{92, VideoPhase::Denoise, 9, 8},
+                   IssueCode::InvalidCount);
+  expectEventIssue(test, VideoOutputEvent{92, VideoOutputKind::Video, 73, 0, {}},
+                   IssueCode::LimitExceeded);
 }
 
 void testScoreRequestAndDoneLogits() {
@@ -764,6 +853,15 @@ void testMalformedPayloadClassification() {
   auto undefinedConstraint = valid;
   undefinedConstraint[kFrameHeaderBytes + request_offset::constraint] = 2;
   expect(undefinedConstraint, IssueCode::InvalidEnumValue);
+
+  // A video request's DiT name: its length (payload byte 8) past the bytes
+  // that follow, or a byte outside validDitName's (the name at byte 43).
+  auto longName = peer::serialize(kVideoRequest);
+  longName[kFrameHeaderBytes + 8] = 0xff;
+  expect(longName, IssueCode::InvalidPayloadLength);
+  auto highName = peer::serialize(kVideoRequest);
+  highName[kFrameHeaderBytes + 43] = 0x80;
+  expect(highName, IssueCode::InvalidEnumValue);
 }
 
 // Every rejection of a request's prompt or image spans is that request's own
@@ -1080,6 +1178,21 @@ void testFailureTaxonomy() {
                    IssueCode::InvalidCount);
   expectEventIssue(test, ReadyEvent{4, 4096, false, 64, {1}, 0},
                    IssueCode::InvalidCount);
+  // A video model's engine names no vocabulary, stop tokens or mask rows,
+  // but its capacities still.
+  CHECK(test, serializeEvent(ReadyEvent{.maxConcurrentRequests = 1,
+                                        .maxContextTokens = 2048,
+                                        .video = true},
+                             kLimits));
+  expectEventIssue(test,
+                   ReadyEvent{.maxConcurrentRequests = 1, .video = true},
+                   IssueCode::InvalidCount);
+  expectEventIssue(test,
+                   ReadyEvent{.maxConcurrentRequests = 1,
+                              .maxContextTokens = 2048,
+                              .stopTokens = {1},
+                              .video = true},
+                   IssueCode::InvalidCount);
   StartFailedEvent unknownKind;
   unknownKind.kind = static_cast<StartFailureKind>(9);
   expectEventIssue(test, unknownKind, IssueCode::InvalidEnumValue);
@@ -1225,6 +1338,7 @@ int main(int argc, char **argv) {
   try {
     testGoldenVectors(argv[1]);
     testRequestRoundTrip();
+    testVideoFrameRejections();
     testScoreRequestAndDoneLogits();
     testClientAndEventStreams();
     testOneByteIncrementalParsing();

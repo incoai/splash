@@ -316,7 +316,7 @@ class FakeHub:
         path = self.snapshot(repo_id, revision) / filename
         return str(path) if path.is_file() else None
 
-    def open(self, path, mode, *, revision, block_size):
+    def open(self, path, mode, *, revision, block_size, **options):
         owner, name, filename = path.split("/", 2)
         self.range_reads.append(path)
         return (self.remote / owner / name / revision / filename).open(mode)

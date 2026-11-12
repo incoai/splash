@@ -170,6 +170,55 @@ test-release-real: preflight $(TARGET) agent-preflight verify-build-identity
 	TRANSFORMERS_VERBOSITY=error $(PYTHON) dev/tests/agent_real.py $(AGENT_ARGS) \
 		--http-smoke
 
+# The video model (docs/video.md): VIDEO_ROOT, the MiniMax-H3 a
+# selection prepared (by default `splash serve --model VIDEO_MODEL`'s,
+# install/families.py H3.release's vdn-8 variant), or VIDEO_CONVERTED, a
+# directory of images converted before, which the tests prepare first;
+# and VIDEO_REFERENCES, the reference directory (the golden prompt's hidden
+# states, latents and frames), which is not part of this repository and has no
+# default. VIDEO_SECONDS is the length of
+# the clip of the server's own text encoder. VIDEO_FIRST_FRAME_FINAL is the
+# reference latents (final.npz) of the 3 s golden clip from golden frame 0
+# (docs/video.md, Video tests).
+VIDEO_MODEL ?= $(shell $(PYTHON) -c 'from install.families import H3; print(H3.release + ":vdn-8")')
+VIDEO_ROOT ?= $(shell $(PYTHON) install/models.py --model "$(VIDEO_MODEL)" link)
+VIDEO_CONVERTED ?=
+VIDEO_REFERENCES ?=
+VIDEO_SECONDS ?= 3
+VIDEO_SIZE ?= 1344x768
+VIDEO_KEEP ?=
+VIDEO_FIRST_FRAME_FINAL ?= $(VIDEO_REFERENCES)/golden_i2v_3s/final.npz
+VIDEO_ARGS = --model "$(VIDEO_MODEL)" --references "$(VIDEO_REFERENCES)" \
+	--engine "$(VIDEO_GOLDEN)" --metallib "$(LIB)" \
+	$(if $(VIDEO_CONVERTED),--converted "$(VIDEO_CONVERTED)",--model-root "$(VIDEO_ROOT)")
+
+.PHONY: video-references test-video-real test-video-http-real test-video-first-frame-real \
+	test-video-canvas-real
+video-references:
+	@test -d "$(VIDEO_REFERENCES)" || { \
+		echo "error: set VIDEO_REFERENCES to the reference directory" >&2; \
+		exit 1; \
+	}
+
+test-video-real: install-development $(TARGET) $(VIDEO_GOLDEN) video-references
+	$(PYTHON) dev/tests/video_real.py engine $(VIDEO_ARGS) \
+		--output build/release/video-engine.json
+
+test-video-http-real: install-development $(TARGET) $(VIDEO_GOLDEN) video-references
+	TRANSFORMERS_VERBOSITY=error $(PYTHON) dev/tests/video_real.py http $(VIDEO_ARGS) \
+		--seconds "$(VIDEO_SECONDS)" --output build/release/video-http.json
+
+# The reference first-frame clip encodes the prompt alone: the server
+# keeps that presentation under SPLASH_VIDEO_PROMPT_ONLY=1 (server/videos.py).
+test-video-first-frame-real: install-development $(TARGET) $(VIDEO_GOLDEN) video-references
+	SPLASH_VIDEO_PROMPT_ONLY=1 TRANSFORMERS_VERBOSITY=error $(PYTHON) dev/tests/video_real.py first-frame $(VIDEO_ARGS) \
+		--first-frame-final "$(VIDEO_FIRST_FRAME_FINAL)" --output build/release/video-first-frame.json
+
+test-video-canvas-real: install-development $(TARGET) $(VIDEO_GOLDEN) video-references
+	$(PYTHON) dev/tests/video_real.py canvas $(VIDEO_ARGS) --size "$(VIDEO_SIZE)" \
+		--seconds "$(VIDEO_SECONDS)" $(if $(VIDEO_KEEP),--keep "$(VIDEO_KEEP)") \
+		--output build/release/video-canvas-$(VIDEO_SIZE)-$(VIDEO_SECONDS)s.json
+
 # BASELINE is a checkout whose build/ holds another build's splash.metallib,
 # engine-tests/backend-benchmark and engine-tests/weight-digests: this build
 # is compared with it on this machine in ABBA order, and so are their weight

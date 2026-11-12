@@ -261,6 +261,11 @@ class PackageTests(unittest.TestCase):
                     with self.subTest(path=f"{folder}/{path.name}"):
                         self.assertIn(path.name, shipped.get(folder, ()))
 
+    def test_the_release_requirements_leave_pyav_out(self):
+        # PyAV's wheels bundle FFmpeg: the user installs it (server/references.py).
+        pins = (package.ROOT / "install/requirements.txt").read_text().splitlines()
+        self.assertNotIn("av", {pin.split("==")[0].lower() for pin in pins})
+
     def test_the_installer_names_the_archive_make_package_builds(self):
         macos_min = re.search(
             r"^MACOS_MIN_VERSION := (\S+)$",

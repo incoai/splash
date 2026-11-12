@@ -1,5 +1,6 @@
 """The model families Splash serves, the DFlash2 draft released for each and
-the chat format the server reads and writes each one's output in.
+the chat format the server reads and writes each one's output in; and the
+video model's family, H3, its installer's and server's constants.
 
 A target's family is the one the engine finds its configuration to describe,
 by the rules it holds every start to (upstream.check_model), never its
@@ -92,6 +93,238 @@ FAMILIES = (
 def named(name):
     """The family called name, or None."""
     return next((family for family in FAMILIES if family.name == name), None)
+
+
+@dataclass(frozen=True)
+class Variant:
+    """A DiT a model ID's variant installs: its denoising steps, its images'
+    directory, dit-<dit> (h3.STAGES; FastH3's by the variant's name), the
+    repository the recipe reads with the release, the recipe, h3.py or
+    fasth3.py, and for fasth3.py's spec-driven mode the spec (fasth3.SPEC:
+    name, checkpoint, adapter, schedule, references, qkfix), which the
+    entry's key names."""
+
+    steps: int
+    dit: str
+    companion: str
+    recipe: str = "h3"
+    spec: dict | None = None
+
+
+@dataclass(frozen=True)
+class VideoFamily:
+    # The family's name, and the target format of its assemblies
+    # (install/video.py; assembly.TARGET_FORMATS and the engine name it too).
+    name: str
+    target_format: str
+    # The release Splash installs it from, the file that marks a repository
+    # as the release, and the folder its tokenizer/ lies in.
+    release: str
+    release_index: str
+    tokenizer_prefix: str
+    # The variants a model ID names; a model ID without one keeps the variant
+    # its installation holds, or else installs default_variant, which a
+    # server serves where it holds more than one.
+    variants: dict
+    default_variant: str
+    # The text encoder's checkpoint, the decoder layers of it the engine
+    # reads, and its package's name, in the package's entry key
+    # (video.encoder_package).
+    encoder: str
+    encoder_layers: int
+    encoder_package: str
+    # The image directories the engine reads beside the variants' DiTs, and
+    # in a DiT's directory the adaLN tables of its schedule and its manifest,
+    # which names the weights' format.
+    images: tuple
+    adaln: str
+    dit_manifest: str
+    # Printed at installation and by `splash generate`, and the release's
+    # license files an assembly links, where it has them.
+    license: str
+    license_files: tuple
+    # A clip's frame rate, its frames frame_period n + frame_offset
+    # (runtime/video/ops/Geometry.cpp holds the engine's copy), and OpenAI's
+    # `seconds` (of the video API): the whole numbers a clip takes and the
+    # default.
+    fps: int
+    frame_period: int
+    frame_offset: int
+    seconds: range
+    default_seconds: str
+    # OpenAI's `size`, WIDTHxHEIGHT: a canvas of a tier, by its short edge,
+    # both sides multiples of canvas_step and the long edge at most twice the
+    # short (the engine's ops::canvasTier); the named canvases, any other of
+    # a tier rendering too, and the default.
+    canvas_tiers: tuple
+    canvas_step: int
+    sizes: tuple
+    size: str
+    # The presentation's text rows (one prefill pass of the text encoder),
+    # and the text encoder's vision tokens, for the server's prompt layout.
+    max_text_tokens: int
+    vision_start: int
+    vision_end: int
+    image_pad: int
+    video_pad: int
+    # Ref2VA references as the server normalizes them: their audio's
+    # sampling rate, the canvas rule per tier and Pika's limits.
+    sample_rate: int
+    reference_tiers: dict
+    aspect_range: tuple
+    max_source_seconds: float
+    video_seconds: tuple
+    max_total_video_seconds: float
+    max_images: int
+    max_videos: int
+    max_audio: int
+    max_references: int
+    min_video_frames: int
+
+
+# Pika H3 Flex, whose adapters and Ref2VA base the pika variants read, and
+# its released sampler (pika_h3.core.sampler's DEFAULT_KNOTS): six forwards at its
+# knots, shifts 12 / 3, sigmas in float64 then fp32, fresh noise after each
+# forward but the last from the request's seed + 1.
+PIKA = "Pika-Labs/Pika-H3-Flex"
+PIKA_SCHEDULE = {
+    "rungs": [1000, 750, 500, 250, 100, 40],
+    "video_shift": 12.0,
+    "audio_shift": 3.0,
+    "sampler": "renoise",
+    "sigma_precision": "float64",
+    "renoise_seed_offset": 1,
+    "source": "Pika-Labs/Pika-H3-Flex src/pika_h3/core/sampler.py DEFAULT_KNOTS, "
+    "schedules.H3SigmaSchedule, sampling.few_step_trajectory (renoise)",
+}
+
+H3 = VideoFamily(
+    name="MiniMax-H3",
+    target_format="h3-video",
+    # MiniMax's release, of bf16 weights.
+    release="MiniMaxAI/MiniMax-H3",
+    release_index="FL2VA/model_index.json",
+    tokenizer_prefix="FL2VA/",
+    variants={
+        # The OpenVDN stages the recipe reads with the release.
+        "vdn-8": Variant(8, "turbo", "OpenVDN/vdn-minimax-h3"),
+        "vdn-50": Variant(50, "default", "OpenVDN/vdn-minimax-h3"),
+        # FastH3's: the 8-step student, and the LoRA bundle of the 4-step
+        # one, which applies to the release's transformer (fasth3.py).
+        "fasth3-8": Variant(
+            8, "fasth3-8", "FastVideo/FastVideo-FastH3-8-Step-V2", "fasth3"
+        ),
+        "fasth3-4": Variant(
+            4, "fasth3-4", "FastVideo/FastVideo-FastH3-4-step-Preview-v1-LoRA", "fasth3"
+        ),
+        # Pika H3 Flex: the release's base DiT (FL2VA's transformer at the
+        # commit Pika's adapters were trained on) with its FL2VA adapter at
+        # run time (runtime/video/model/Adapter.hpp); and MiniMax-H3's Ref2VA
+        # base (Pika's re-sharded transformer_ref/, diffusers names) with
+        # Pika's ref2va adapter, the variant of Ref2VA requests
+        # (references). Both are specs of fasth3.py's recipe.
+        "pika-6": Variant(
+            6,
+            "pika-6",
+            PIKA,
+            "fasth3",
+            {
+                "name": "pika-6",
+                "checkpoint": {
+                    "repo": "MiniMaxAI/MiniMax-H3",
+                    "revision": "42ed227ee7df40d41602854ae760620d6eb651fe",
+                    "prefix": "FL2VA/transformer/",
+                },
+                "adapter": {
+                    "file": "fl2va/adapter.safetensors",
+                    "name": "default",
+                    "alpha": 128.0,
+                },
+                "schedule": PIKA_SCHEDULE,
+                "references": False,
+                "qkfix": [45, 48, 49],
+            },
+        ),
+        "pika-ref2va-6": Variant(
+            6,
+            "pika-ref2va-6",
+            PIKA,
+            "fasth3",
+            {
+                "name": "pika-ref2va-6",
+                "checkpoint": {
+                    "repo": PIKA,
+                    "revision": None,
+                    "prefix": "transformer_ref/",
+                },
+                "adapter": {
+                    "file": "ref2va/adapter.safetensors",
+                    "name": "default",
+                    "alpha": 128.0,
+                },
+                "schedule": PIKA_SCHEDULE,
+                "references": True,
+                "qkfix": [45, 48, 49],
+            },
+        ),
+    },
+    default_variant="pika-6",
+    # Qwen3-VL-32B's MLX checkpoint: decoder layers 0 to 49
+    # (TextEncoder::kLayers: MiniMax-H3 conditions on hidden_states[50]).
+    encoder="mlx-community/Qwen3-VL-32B-Instruct-8bit",
+    encoder_layers=50,
+    encoder_package="qwen3-vl-encoder-package-v1",
+    images=("vae", "audio", "preview"),
+    adaln="adaln.safetensors",
+    dit_manifest="manifest.json",
+    license=(
+        "MiniMax-H3 weights are under the MiniMax H3 Community License (not "
+        "licensed for use in the EU, UK, Republic of Korea or the USA): "
+        "https://huggingface.co/MiniMaxAI/MiniMax-H3/blob/main/LICENSE"
+    ),
+    license_files=("LICENSE", "NOTICE"),
+    # A whole number of seconds from 4 to 15 (Pika's `--duration`, 5 to 15,
+    # and 4). A clip of s seconds has the smallest 17 n + 5 frames at least
+    # s x 24 at 24 fps (Pika's align_num_frames): 4, 5, 7, 10 and 15 s are
+    # 107, 124, 175, 243 and 362.
+    fps=24,
+    frame_period=17,
+    frame_offset=5,
+    seconds=range(4, 16),
+    default_seconds="5",
+    # 768p and 480p.
+    canvas_tiers=(768, 480),
+    canvas_step=32,
+    sizes=("1344x768", "768x1344", "832x480", "864x480", "480x832"),
+    size="1344x768",
+    # Pika H3 Flex's MAX_TEXT_TOKENS: a prompt and its labels, and a clip
+    # from keyframes as a whole; a Ref2VA presentation's vision rows run past
+    # it up to the engine's bound (Ready max_context_tokens).
+    max_text_tokens=2048,
+    # Qwen3-VL's <|vision_start|>, <|vision_end|>, <|image_pad|> and
+    # <|video_pad|>.
+    vision_start=151652,
+    vision_end=151653,
+    image_pad=151655,
+    video_pad=151656,
+    sample_rate=32000,
+    # Pika's DEFAULT_TIER_RULES of the tiers Splash renders, by the canvas's
+    # short edge: the canvas rule a reference video follows (short edge, area
+    # budget) and an image reference's short edge.
+    reference_tiers={
+        480: (480, 832 * 480, 1024),
+        768: (768, 1344 * 768, 2048),
+    },
+    aspect_range=(1 / 4, 4.0),
+    max_source_seconds=16.0,
+    video_seconds=(2.0, 15.0),
+    max_total_video_seconds=15.0,
+    max_images=9,
+    max_videos=3,
+    max_audio=3,
+    max_references=12,
+    min_video_frames=22,
+)
 
 
 # The fact a model's family must have for an option of the launcher's own,
