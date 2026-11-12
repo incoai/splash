@@ -30,10 +30,17 @@ def main():
 
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--shader-validation", action="store_true")
+    parser.add_argument("--screen", action="store_true")
+    parser.add_argument("--holdout", action="store_true")
+    parser.add_argument("--confirm", action="store_true")
+    parser.add_argument("--nonuniform-weights", action="store_true")
+    parser.add_argument("--seed", type=int, default=817)
     parser.add_argument(
         "--output", type=Path, default=ROOT / "build/experiments/draft-fusion"
     )
     args = parser.parse_args()
+    if not 0 <= args.seed <= 0xFFFFFFFF:
+        parser.error("seed must fit uint32")
     out = args.output.resolve()
     out.mkdir(parents=True, exist_ok=True)
     command(
@@ -106,7 +113,13 @@ def main():
         (out / "stderr.log").open("w") as error,
     ):
         subprocess.run(
-            [str(out / "benchmark"), str(out / "experiment.metallib")],
+            [str(out / "benchmark"), str(out / "experiment.metallib")]
+            + (["--validate-only"] if args.shader_validation else [])
+            + (["--screen"] if args.screen else [])
+            + (["--holdout"] if args.holdout else [])
+            + (["--confirm"] if args.confirm else [])
+            + (["--nonuniform-weights"] if args.nonuniform_weights else [])
+            + ["--seed", str(args.seed)],
             cwd=ROOT,
             env=env,
             stdout=output,
@@ -119,11 +132,14 @@ def main():
     for case in raw["cases"]:
         for variant in case.get("variants", [case]):
             rounds = variant["rounds_abba_us"]
+            if not rounds:
+                continue
             result = abba.compare_samples(zip(*rounds))
             result["blocks"] = [abba.compare(*r) for r in rounds]
             result["case"] = {
                 k: v for k, v in case.items() if k not in ("variants", "rounds_abba_us")
             }
+            result["baseline_mode"] = variant.get("baseline", "production")
             if "mode" in variant:
                 result["mode"] = variant["mode"]
             comparisons.append(result)
@@ -142,6 +158,10 @@ def main():
             ["xcrun", "clang++", "--version"], text=True
         ).splitlines()[0],
         "shader_validation": args.shader_validation,
+        "seed": args.seed,
+        "holdout": args.holdout,
+        "confirmation_pack4_only": args.confirm,
+        "nonuniform_norm_weights": args.nonuniform_weights,
         "sha256": {
             str(p.relative_to(ROOT)) if p.is_relative_to(ROOT) else str(p): digest(p)
             for p in (
