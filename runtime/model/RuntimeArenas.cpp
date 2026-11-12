@@ -115,15 +115,16 @@ prefillTensorBytes(const RuntimeGeometry &geometry,
                          kRaggedAttentionRows *
                          geometry.target.attentionHeadDimension));
   // The split partials and counters, the rotated rows and the int8 tile's
-  // codes and scales of the largest prefill plan: the target's, and the
+  // codes and scales of the largest prefill plan: the target's, and any
   // draft's context projections' on the draft's plans.
   ops::LinearScratchSize linear;
   for (const auto &projection : geometry.target.prefillProjections)
     linear.include(operators.linear().prefillScratchSize(projection));
   const auto &draft = geometry.draft;
-  for (const ops::ProjectionShape projection :
-       {ops::ProjectionShape{draft.hiddenSize, draft.targetHiddenSize()}, {draft.contextKvSize(), draft.hiddenSize}})
-    linear.include(operators.draftLinear().prefillScratchSize(projection));
+  if (draft.present())
+    for (const ops::ProjectionShape projection :
+         {ops::ProjectionShape{draft.hiddenSize, draft.targetHiddenSize()}, {draft.contextKvSize(), draft.hiddenSize}})
+      linear.include(operators.draftLinear().prefillScratchSize(projection));
   put(PrefillTensor::LinearPartials, linear.partials);
   put(PrefillTensor::LinearCounters, linear.counters);
   put(PrefillTensor::LinearTable, linear.input);
@@ -181,8 +182,11 @@ std::array<uint64_t, decodeTensorCount>
 decodeTensorBytes(const RuntimeGeometry &geometry,
                   const ops::ExecutionPlans &operators) {
   std::array<uint64_t, decodeTensorCount> result{};
+  // A model without a draft has no draft tensors: the draft dimensions size
+  // them to nothing, and its attention none.
   const auto draftWorkspace =
-      operators.draftAttentionWorkspacePerLane(geometry.draft.attentionShape());
+      geometry.draft.present() ? operators.draftAttentionWorkspacePerLane(geometry.draft.attentionShape())
+                               : ops::DraftAttentionWorkspace{};
   const auto samplingWorkspace = ops::Sampling::workspace(kDecodeRows);
   const auto selectorWorkspace = ops::DraftSelector::workspace(kDraftProposalTokens);
   auto put = [&](DecodeTensor tensor, uint64_t bytes) {
@@ -340,6 +344,8 @@ ops::LinearScratchSize DecodeArena::linearScratchSize(
   ops::LinearScratchSize result;
   // Includes the vocabulary head shared with the draft.
   for (const auto &p : geometry.target.decodeProjections) result.include(operators.linear().decodeScratchSize(p));
+  if (!d.present())
+    return result;
   for (const ops::ProjectionShape shape : {ops::ProjectionShape{d.dynamicSize, d.hiddenSize},
        {d.qkvSize, d.hiddenSize}, {d.contextKvSize(), d.hiddenSize},
        {d.hiddenSize, d.attentionSize},

@@ -66,6 +66,11 @@ class ModelFamily:
     # loads from the target repository unless --language-only. The models of
     # a family without one serve text only, whatever their repository holds.
     vision: bool = True
+    # Whether the family's models serve without a draft (--draft-model none).
+    # Flint's do not: its vocabulary keeps no mask token of its own and its
+    # target no GDN state, which the engine needs of a model without a draft
+    # (ModelDescriptor.mm inspectModelRoot).
+    draftless: bool = True
 
 
 FAMILIES = (
@@ -84,8 +89,15 @@ FAMILIES = (
         QWEN,
         QWEN_SAMPLING,
     ),
-    # It has no vision tower.
-    ModelFamily("Flint", "incoai/Flint-DFlash2", FLINT, FLINT_SAMPLING, vision=False),
+    # It has no vision tower, and serves only with a draft.
+    ModelFamily(
+        "Flint",
+        "incoai/Flint-DFlash2",
+        FLINT,
+        FLINT_SAMPLING,
+        vision=False,
+        draftless=False,
+    ),
 )
 
 
