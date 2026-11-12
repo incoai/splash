@@ -140,6 +140,26 @@ LAYERS: tuple[tuple[str, tuple[str, ...], tuple[str, ...]], ...] = (
     ),
     ("engine", ("runtime/engine/",), ("model interface", "shared")),
     (
+        "video model",
+        ("runtime/video/model/",),
+        (
+            "video ops",
+            "video metal",
+            "model interface",
+            "model",
+            "ops",
+            "metal",
+            "kernels",
+            "shared",
+        ),
+    ),
+    (
+        "video ops",
+        ("runtime/video/ops/",),
+        ("video metal", "metal", "kernels", "shared"),
+    ),
+    ("video metal", ("runtime/video/metal/",), ("metal", "kernels")),
+    (
         "model interface",
         tuple(sorted(f"runtime/{header}" for header in ENGINE_MODEL_BOUNDARY)),
         ("ops", "metal", "kernels", "shared"),
