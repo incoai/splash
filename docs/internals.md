@@ -10,6 +10,9 @@
 - `runtime/ops/` and `runtime/metal/`: operators and Metal kernels.
 - `runtime/ane/`: the Neural Engine client, on the private AppleNeuralEngine
   framework, and the handoff of a Metal command's work to it.
+- `runtime/video/`: the video model's engine beside `runtime/engine/`: its
+  runtime, stages, model, operators and Metal encoding
+  ([Video engine](video.md#video-engine)).
 - `install/`: launcher, client configuration and model installation.
 - `dev/`: maintained tests, benchmarks and build/release tools.
 
@@ -887,6 +890,16 @@ and the decode-only value tables in `runtime/metal/abi/QuantTables.h`, which no 
 depends on; weight loading's repack ABI is `runtime/metal/abi/GgufRepack.h`. The tables are
 llama.cpp's and the decoding follows its Metal kernels: both keep llama.cpp's MIT notice in
 `THIRD_PARTY_NOTICES`, which the release archive ships.
+
+`QuantFormat.h` also defines the video model's int8 format, `QUANT_VIDEO_W8` (`h3-w8a8-vdn-v1`),
+which its DiT manifests and its installer's recipe name
+([Video installation](video.md#video-installation)). It is no `kQuantFormats` row: no MDGG0001
+tiles and no decoder in the LLM GEMMs. A [N, K] weight is dense row-major int8 with one fp32 scale
+per output row (absmax / 127, rounded half to even) after a Hadamard rotation of its inputs in
+groups of 128 with splitmix64 signs (seed `0x48335138`), as the video GEMMs read it, and the
+producers quantize the activations so per token (`runtime/metal/kernels/video/common/quant.h`).
+The DiT and VAE readers refuse manifests that name another format or seed, and a test holds the
+converters' constants to the header.
 
 The tests' CPU reference (`dev/tests/engine/GgufFormatReference.hpp`) must reproduce the golden
 hashes of upstream GGML's dequantization (llama.cpp 7ab4ee7; for PQ2_0, which upstream lacks,
@@ -2604,6 +2617,21 @@ counters include:
   past what the cache changed.
 
 ## Native protocol
+
+A video model's engine takes `VideoRequest` and `Cancel` frames and answers with
+`VideoProgress`, `VideoOutput` and `Error` events ([Video engine](video.md#video-engine)); its
+Ready sets `FeatureVideo` in the features byte, beside `FeatureVision`, and may leave the
+vocabulary size, stop tokens and mask rows zero or empty, which only a Ready with
+`FeatureVideo` may. A `VideoRequest` names its DiT: a u8 length after the request id, the
+name's bytes after the fixed fields (1 to 64 of a-z, 0-9, `.`, `_` and `-`, without `..`:
+`validDitName`, `valid_dit_name`), and the engine runs `dit-<name>/` in the format its
+`manifest.json` names (none: VDN-H3). It carries up to 12 Ref2VA references after its
+keyframes: a header each after the prompt tokens (u8 kind: 0 image, 1 video, 2 audio; u32
+frames, width and height, 0 for audio; u64 soundtrack samples), then each one's uint8 RGB
+frames and its fp32 stereo samples at 32 kHz, as the server normalized them; its payload may
+reach 4 GiB (`kAbsoluteMaxVideoRequestPayloadBytes`, which only a video model's engine accepts:
+`ProtocolLimits::maxVideoRequestPayloadBytes`), as three 15 s 768p reference videos take 3.4
+GB.
 
 The engine receives `ignore_eos` as bit 0 of the request frame's flags word and
 `return_progress` as bit 1; the word rejects undefined bits.

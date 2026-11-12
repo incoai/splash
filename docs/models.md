@@ -607,7 +607,8 @@ model's source options (`--revision`, `--draft-model`, `--language-only`,
 - `target`: a GGUF file, any part of a split GGUF naming all its parts,
   which lie beside it; or a directory whose root holds an MLX model or else
   GGUF targets of one name ([GGUF targets](#gguf-targets)), beside any
-  projectors named `mmproj`.
+  projectors named `mmproj`; or a directory of the video model
+  ([Video](video.md)), which takes no other argument.
 - `draft`: the directory of a DFlash2 draft ([Drafts](#drafts)). Without
   one, the family's released draft is taken from the Hugging Face cache, at
   the commit last recorded there for its default branch, as `hf download

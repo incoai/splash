@@ -28,7 +28,7 @@ if __name__ == "__main__" and not __package__:
 # exists.
 from server import diagnostics, serve_options, serve_record
 
-from . import clients, paths
+from . import clients, families, paths
 from . import models as model_artifacts
 
 ROOT = paths.ROOT
@@ -173,7 +173,7 @@ def _ensure_runtime():
         raise LauncherError(str(error), serve_record.DEVICE) from None
 
 
-def _ensure_installed(selection):
+def _ensure_installed(selection, spec=None):
     _ensure_runtime()
     command = [
         str(paths.PYTHON),
@@ -187,6 +187,7 @@ def _ensure_installed(selection):
     for flag, value in (
         ("--revision", selection.revision),
         ("--draft-model", selection.draft_model),
+        ("--spec", spec),
     ):
         if value is not None:
             command[-1:-1] = [flag, value]
@@ -329,6 +330,18 @@ def _prepare_start(args):
     return selection.link
 
 
+def _share_installation(installation):
+    """Hold the installation lock shared, as every server does; an upgrade
+    holds it exclusively."""
+    try:
+        fcntl.flock(installation, fcntl.LOCK_SH | fcntl.LOCK_NB)
+    except BlockingIOError:
+        raise LauncherError(
+            "Splash is being upgraded; wait for the upgrade to finish",
+            serve_record.UPGRADE,
+        ) from None
+
+
 def _server(args, model_dir, record):
     """The server's command line and environment."""
     # The server package of this installation, from any working directory:
@@ -463,6 +476,19 @@ def _renders_later_system(port):
     outcome = template.get("later_system") if isinstance(template, dict) else None
     outcomes = list(outcome.values()) if isinstance(outcome, dict) else [outcome]
     return all(outcome in ("native", "patched") for outcome in outcomes)
+
+
+def install(args):
+    """Install the model as serve does, and start nothing: a variant of
+    MiniMax-H3 that Splash does not ship from its spec file too (--spec)."""
+    for number in STOP_SIGNALS:
+        signal.signal(number, _interrupt)
+    RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
+    with (RUNTIME_DIR / "serve.lock").open("a+") as installation:
+        _share_installation(installation)
+        selection = model_artifacts.Selection.of(paths.MODELS, args.model)
+        _ensure_installed(selection, args.spec)
+    return 0
 
 
 def coding_client(args):
@@ -647,6 +673,26 @@ def parse_args(argv=None):
         f"HTTP port (default: SPLASH_PORT or {serve_options.DEFAULT_PORT})",
     )
     serve_options.add_serve_arguments(server, groups)
+    installer = commands.add_parser(
+        "install",
+        help="install a model as serve does; no server starts",
+        description="Install a model as serve does; no server starts. A "
+        f"checkpoint of {families.H3.release}'s DiT that Splash does not ship "
+        "installs as a variant of the name you give it, from a JSON spec "
+        "(docs/video.md, Video installation).",
+        epilog=f"Example:\n  splash install {families.H3.release}:my-finetune "
+        "--spec my-finetune.json",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    installer.add_argument(
+        "model", type=serve_options.parse_model_id, metavar="OWNER/REPO[:VARIANT]"
+    )
+    installer.add_argument(
+        "--spec",
+        type=_local_path,
+        metavar="FILE",
+        help="the variant's spec: checkpoint, adapter, schedule, references, qkfix",
+    )
     for name in clients.INSTALL_URLS:
         client = commands.add_parser(
             name,
@@ -666,6 +712,12 @@ def parse_args(argv=None):
             client_args = client_args[1:]
     else:
         args = parser.parse_args(argv)
+    if args.command == "install":
+        # install takes no --port: its refusals end here.
+        if client_args:
+            parser.error("arguments after -- are only supported for coding clients")
+        args.client_args = client_args
+        return args
     # An explicit --port wins; SPLASH_PORT is read only without one.
     args.explicit_port = args.port is not None
     if not args.explicit_port:
@@ -731,7 +783,8 @@ def main(argv=None):
             )
         raise
     try:
-        return serve(args) if args.command == "serve" else coding_client(args)
+        command = {"serve": serve, "install": install}.get(args.command, coding_client)
+        return command(args)
     except LauncherError as error:
         if not error.said:
             subject = f"{error.subject}: " if error.subject else ""

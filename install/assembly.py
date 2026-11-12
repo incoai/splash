@@ -1,13 +1,16 @@
 """Assemblies: the directories upstream models are served from.
 
 An assembly is models/.resolved/<SHA-256 of its record>: links to its source
-snapshots' files (hub.py) and to metadata derived from a GGUF
-(models/.metadata/<key>), and model.json, the record naming its sources and
-the identity of every linked file. It never changes once published.
-Selection links point to assemblies; one that no selection links and no
-server holds is collected.
+snapshots' files (hub.py) and to what is derived from them, metadata derived
+from a GGUF (models/.metadata/<key>) or weights a recipe converted
+(models/.converted/<key>, conversion.py), and model.json, the record naming
+its sources and the identity of every linked file. It never changes once
+published. Selection links point to assemblies; one that no selection links
+and no server holds is collected, and so is a derived entry no assembly
+links.
 
-The paths an assembly links, and what reads each:
+The paths a language model's assembly links, and what reads each (a video
+model's: video.py):
   config.json            the target configuration: the MLX config.json, or
                          the one derived from the GGUF (ModelDescriptor.mm
                          inspectSourceModel)
@@ -38,13 +41,29 @@ import hashlib
 import os
 import shutil
 import tempfile
+import time
+from contextlib import contextmanager
 from pathlib import Path
 
-from . import families, gguf, hub, models
+from . import conversion, families, gguf, hub, models
 
 GGUF_VISION = "vision/mmproj.gguf"
-TARGET_FORMATS = ("mlx-affine", "gguf")
+# Each target format's record: the keys it adds and the sources it names, a
+# language model's target and DFlash2 draft, or a video model's target and
+# text encoder (video.py).
+TARGET_FORMATS = {
+    "mlx-affine": (set(), {"target", "draft"}),
+    "gguf": ({"metadata"}, {"target", "draft"}),
+    "h3-video": ({"video"}, {"target", "encoder"}),
+}
 VISION_FORMATS = ("none", "safetensors", "gguf")
+# The entries derived from sources, under the models root: a GGUF's metadata,
+# and converted weights.
+CONVERTED = ".converted"
+DERIVED = (".metadata", CONVERTED)
+# A conversion's staging (converting) that no process holds is kept this long
+# after its last change, for an installation to resume.
+RESUMABLE_SECONDS = 7 * 24 * 3600
 RECORD_KEYS = {
     "version",
     "model",
@@ -122,10 +141,10 @@ def file_record(path: Path, recorded=None):
     }
     if recorded and all(recorded[key] == value for key, value in record.items()):
         return record | {"digest": recorded["digest"]}
-    return record | {"digest": _digest(path)}
+    return record | {"digest": digest(path)}
 
 
-def _digest(path):
+def digest(path):
     """A Hub cache file's name in blobs/: the digest the Hub publishes for it,
     the Git blob SHA-1 of a small file (40 hex digits) or the SHA-256 of an
     LFS file (64). Any other file's SHA-256."""
@@ -138,7 +157,7 @@ def _digest(path):
 
 
 def _digest_of(path, digest):
-    """path's content digest in the scheme of digest (_digest)."""
+    """path's content digest in the scheme of digest (the function digest)."""
     if len(digest) == 64:
         return models.sha256(path)
     size = path.stat().st_size
@@ -172,19 +191,26 @@ def verify(assembly: Path, *, full=False):
 
 def _well_formed(record):
     gguf_target = record.get("target_format") == "gguf"
+    target_format = record.get("target_format")
+    extra, source_names = (
+        TARGET_FORMATS.get(target_format, (None, None))
+        if isinstance(target_format, str)
+        else (None, None)
+    )
     sources = record.get("sources")
     files = record.get("files")
     return (
-        set(record) == RECORD_KEYS | ({"metadata"} if gguf_target else set())
+        extra is not None
+        and set(record) == RECORD_KEYS | extra
         and type(record["version"]) is int
         and record["version"] == 1
         and isinstance(record["model"], str)
         and isinstance(record["family"], str)
-        and record["target_format"] in TARGET_FORMATS
         and record["vision_format"] in VISION_FORMATS
         and (not gguf_target or models.is_hex_digest(record["metadata"], 64))
+        and isinstance(record.get("video", {}), dict)
         and isinstance(sources, dict)
-        and set(sources) == {"target", "draft"}
+        and set(sources) == source_names
         and all(
             isinstance(source, dict)
             and set(source) == {"repo", "revision"}
@@ -353,6 +379,65 @@ def _check_metadata(entry):
             raise models.ModelError("prepared GGUF metadata changed: " + name)
 
 
+@contextmanager
+def converting(models_root: Path, key):
+    """The staging folder of the converted entry key,
+    .converted/<ENTRY_STAGING><key>, held by this process (its .lock) for the
+    block: what an interrupted conversion wrote is resumed, and a conversion
+    of the same key elsewhere is waited for. Written outside the
+    installation lock; converted publishes it."""
+    stage = models_root / CONVERTED / f"{models.ENTRY_STAGING}{key}"
+    stage.mkdir(parents=True, exist_ok=True)
+    with (stage / ".lock").open("a+b") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            print(
+                "Another installation is converting these weights; waiting...",
+                flush=True,
+            )
+            fcntl.flock(lock, fcntl.LOCK_EX)
+        yield stage
+
+
+def converted(models_root: Path, key, stage=None):
+    """The files, by entry path, of the converted entry key: an existing one
+    if it checks, else the staging folder stage of a completed conversion,
+    published by one rename. Call it under the installation lock."""
+    entry = models_root / CONVERTED / key
+    try:
+        _check_converted(entry)
+    except (models.ModelError, OSError) as error:
+        if stage is None or not (stage / conversion.FILES).is_file():
+            raise models.ModelError(f"no converted weights {key}: {error}") from None
+        if entry.exists():
+            print(f"Replacing the damaged {entry}: {error}", flush=True)
+            shutil.rmtree(entry)
+        os.rename(stage, entry)
+        (entry / ".lock").unlink()
+        _check_converted(entry)
+    if stage is not None and stage.exists():
+        shutil.rmtree(stage)
+    return {name: entry / name for name in models.read_json(entry / conversion.FILES)}
+
+
+def is_converted(models_root: Path, key):
+    """Whether the converted entry key is there and checks."""
+    try:
+        _check_converted(models_root / CONVERTED / key)
+    except (models.ModelError, OSError):
+        return False
+    return True
+
+
+def _check_converted(entry):
+    """Raise unless a converted entry holds the files its FILES lists, of
+    their sizes."""
+    for name, size in models.read_json(entry / conversion.FILES).items():
+        if not models.is_safe_path(name) or (entry / name).stat().st_size != size:
+            raise models.ModelError("converted weights changed: " + name)
+
+
 def hold(path: Path):
     """The assembly path names, an assembly or a selection link to one, and
     what holds it: its model.json opened under a shared lock, which keeps
@@ -382,10 +467,12 @@ def hold(path: Path):
     return assembly, record
 
 
-def is_held(assembly: Path) -> bool:
-    """Whether a server holds the assembly (hold)."""
+def is_held(assembly: Path, lock="model.json") -> bool:
+    """Whether a process holds the entry by its model.json: a server the
+    assembly it serves (hold), or by lock: a conversion its staging
+    (converting)."""
     try:
-        with (assembly / "model.json").open("rb") as record:
+        with (assembly / lock).open("rb") as record:
             fcntl.flock(record, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError:
         return True
@@ -398,8 +485,9 @@ def collect_garbage(models_root: Path, *, updating=False) -> int:
     """Remove what no installation uses, and return the bytes this frees in
     the Hub cache: assemblies that no selection links and no server holds,
     with the files of their Hub snapshots no remaining assembly links
-    (hub.release); metadata entries the remaining assemblies do not link;
-    and staging an interrupted installation left. Each is a directory
+    (hub.release); derived entries the remaining assemblies do not link;
+    and staging an interrupted installation left, but a conversion's while
+    it is held or resumable (RESUMABLE_SECONDS). Each is a directory
     (_directories): anything else there, such as the .DS_Store Finder
     leaves, is not an installation's. A remaining assembly whose record
     cannot be read links files no one can tell, so then no Hub cache file
@@ -407,11 +495,12 @@ def collect_garbage(models_root: Path, *, updating=False) -> int:
     written. An update (updating) leaves a snapshot another tool may share
     whole (hub.release). It only frees space: a failure is a warning
     (models.freeing), and the rest goes on."""
-    resolved, derived = models_root / ".resolved", models_root / ".metadata"
+    resolved = models_root / ".resolved"
+    derived = [models_root / name for name in DERIVED]
     links = models.selection_links(models_root)
     linked = {link.resolve() for link in links}
     # The records of the assemblies removed; the files the others link, and
-    # whether their records name them all; the metadata entries they link.
+    # whether their records name them all; the derived entries they link.
     gone, kept, known, used = [], set(), True, set()
     for assembly in _directories(resolved.glob("*")):
         if assembly not in linked and not is_held(assembly):
@@ -433,12 +522,18 @@ def collect_garbage(models_root: Path, *, updating=False) -> int:
                 known = False
                 continue
             kept.add(Path(path))
-            if Path(path).is_relative_to(derived):
-                used.add(Path(path).relative_to(derived).parts[0])
-    for entry in _directories(derived.glob("*")):
-        if entry.name not in used:
-            with models.freeing():
-                shutil.rmtree(entry)
+            for root in derived:
+                if Path(path).is_relative_to(root):
+                    used.add(root / Path(path).relative_to(root).parts[0])
+    for root in derived:
+        for entry in _directories(root.glob("*")):
+            if entry.name.startswith(models.ENTRY_STAGING) and root.name == CONVERTED:
+                recent = time.time() - entry.stat().st_mtime < RESUMABLE_SECONDS
+                if recent or is_held(entry, ".lock"):
+                    continue
+            if entry not in used and not is_held(entry):
+                with models.freeing():
+                    shutil.rmtree(entry)
     for stage in _directories(models_root.glob(f"*/{models.LINK_STAGING}*")):
         with models.freeing():
             shutil.rmtree(stage)

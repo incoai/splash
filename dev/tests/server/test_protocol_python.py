@@ -109,6 +109,36 @@ def example_progress_request():
     return replace(example_request(), flags=p.RequestFlag.RETURN_PROGRESS)
 
 
+VIDEO_REQUEST = p.VideoRequestFrame(
+    92, "turbo", p.VideoOutputFlag.PREVIEW | p.VideoOutputFlag.AUDIO,
+    73, 1344, 768, 0, 42, (5, 6, 7),
+)  # fmt: skip
+# The default DiT's clip without audio or preview.
+VIDEO_DEFAULT_REQUEST = replace(
+    VIDEO_REQUEST, dit="default", outputs=p.VideoOutputFlag(0),
+    steps=50, prompt_tokens=(0xFFFFFFFF,),
+)  # fmt: skip
+# A clip of a 4 x 2 canvas from its first and last frames.
+VIDEO_KEYFRAME_REQUEST = p.VideoRequestFrame(
+    92, "turbo", p.VideoOutputFlag.AUDIO, 73, 4, 2, 0, 42, (5,),
+    bytes(range(24)), bytes(255 - n for n in range(24)),
+)  # fmt: skip
+
+
+# A Ref2VA clip of a 4 x 2 canvas from a 2 x 2 video of two frames with a
+# soundtrack of three samples, a 2 x 1 image and an audio reference of one
+# sample.
+VIDEO_REFERENCE_REQUEST = p.VideoRequestFrame(
+    92, "pika-ref2va-6", p.VideoOutputFlag.AUDIO, 73, 4, 2, 0, 7, (5, 6),
+    references=(
+        p.VideoReference(p.VideoReferenceKind.VIDEO, 2, 2, 2, bytes(3 * n for n in range(24)),
+                         struct.pack("<6f", 0.5, -0.25, 1.0, 0.0, -1.0, 0.125)),
+        p.VideoReference(p.VideoReferenceKind.IMAGE, 1, 2, 1, bytes((9, 8, 7, 6, 5, 4))),
+        p.VideoReference(p.VideoReferenceKind.AUDIO, 0, 0, 0, b"", struct.pack("<2f", 0.75, -0.5)),
+    ),
+)  # fmt: skip
+
+
 def client_messages():
     return {
         "request": example_request(),
@@ -123,6 +153,10 @@ def client_messages():
         "status_request": p.StatusRequestFrame(808),
         "release_request": p.ReleaseRequestFrame(808),
         "stop": p.StopFrame(91),
+        "video_request": VIDEO_REQUEST,
+        "video_request_default": VIDEO_DEFAULT_REQUEST,
+        "video_request_keyframes": VIDEO_KEYFRAME_REQUEST,
+        "video_request_references": VIDEO_REFERENCE_REQUEST,
     }
 
 
@@ -132,6 +166,7 @@ def engine_events():
         "ready_vision": p.ReadyEvent(
             4, 524_288, True, 150_144, 9, (150_001, 150_003, 150_005, 150_018)
         ),
+        "ready_video": p.ReadyEvent(1, 2048, False, 0, 0, (), video=True),
         "start_failed_memory": p.StartFailedEvent(
             p.StartFailureKind.MEMORY_BUDGET,
             p.ShortfallBound.MAX_MEMORY,
@@ -212,6 +247,12 @@ def engine_events():
         ),
         "status_json": p.StatusJsonEvent(
             808, b'{\n  "schema_version": 6, "ready": true\n}'
+        ),
+        "video_progress": p.VideoProgressEvent(
+            92, p.VideoPhase.DENOISE, 3, 8, 312_000_000, 15_200_000_000
+        ),
+        "video_output": p.VideoOutputEvent(
+            92, p.VideoOutputKind.VIDEO, 73, 345_000_000, b"\x00\x00\x00\x18ftyp"
         ),
     }
 
@@ -368,6 +409,52 @@ class ProtocolPythonTests(unittest.TestCase):
             p.IssueCode.INVALID_PAYLOAD_LENGTH,
             lambda: decode_event(bytes(ready)),
         )
+
+    def test_video_frames_are_validated(self):
+        for code, change in (
+            (p.IssueCode.LIMIT_EXCEEDED, {"prompt_tokens": ()}),
+            (p.IssueCode.INVALID_COUNT, {"frames": 0}),
+            (p.IssueCode.INVALID_ENUM_VALUE, {"outputs": p.VideoOutputFlag(4)}),
+            (p.IssueCode.INVALID_ENUM_VALUE, {"dit": ""}),
+            (p.IssueCode.INVALID_ENUM_VALUE, {"dit": ".."}),
+            (p.IssueCode.INVALID_ENUM_VALUE, {"dit": "Turbo"}),
+            (p.IssueCode.INVALID_COUNT, {"first_frame": bytes(23)}),
+        ):
+            with self.subTest(change=change):
+                invalid = replace(VIDEO_REQUEST, **change)
+                self.assert_protocol_error(p.FailureClass.REQUEST_ERROR, code,
+                                           lambda: p.serialize_message(invalid))  # fmt: skip
+        video, image, audio = VIDEO_REFERENCE_REQUEST.references
+        for code, references in (
+            (p.IssueCode.INVALID_COUNT, (replace(video, pixels=bytes(23)),)),
+            (p.IssueCode.INVALID_COUNT, (replace(image, frames=2, pixels=bytes(12)),)),
+            (p.IssueCode.INVALID_COUNT, (replace(image, soundtrack=bytes(8)),)),
+            (p.IssueCode.INVALID_COUNT, (replace(video, soundtrack=bytes(12)),)),
+            (p.IssueCode.INVALID_ENUM_VALUE, (replace(image, kind=3),)),
+            (p.IssueCode.INVALID_COUNT, (replace(audio, soundtrack=b""),)),
+            (p.IssueCode.INVALID_COUNT, (replace(audio, frames=1),)),
+            (p.IssueCode.LIMIT_EXCEEDED, (image,) * (p.MAX_VIDEO_REFERENCES + 1)),
+        ):
+            with self.subTest(references=len(references), code=code):
+                invalid = replace(VIDEO_REFERENCE_REQUEST, references=references)
+                self.assert_protocol_error(p.FailureClass.REQUEST_ERROR, code,
+                                           lambda: p.serialize_message(invalid))  # fmt: skip
+        self.assert_fatal_event(p.IssueCode.INVALID_COUNT,
+                                p.VideoProgressEvent(92, p.VideoPhase.DENOISE, 9, 8, 0, 0))  # fmt: skip
+        self.assert_fatal_event(p.IssueCode.LIMIT_EXCEEDED,
+                                p.VideoOutputEvent(92, p.VideoOutputKind.VIDEO, 73, 0, b""))  # fmt: skip
+
+    def test_a_video_engine_ready_names_no_tokens(self):
+        """A video model's Ready may leave out the vocabulary, the mask rows
+        and the stop tokens, but not its capacities (protocol_test.cpp)."""
+        ready = p.ReadyEvent(1, 2048, False, 0, 0, (), video=True)
+        self.assertEqual(decode_event(native_peer.serialize_event(ready)), ready)
+        for event in (
+            p.ReadyEvent(1, 0, False, 0, 0, (), video=True),
+            p.ReadyEvent(1, 2048, False, 0, 0, (1,), video=True),
+        ):
+            with self.subTest(event=event):
+                self.assert_fatal_event(p.IssueCode.INVALID_COUNT, event)
 
     def test_progress_wire_validation(self):
         # A request asks for its prompt's progress with a flag bit.
@@ -1114,7 +1201,7 @@ class ProtocolPythonTests(unittest.TestCase):
             p.IssueCode.INVALID_COUNT, p.ReadyEvent(0, 4096, False, 64, 9, (1,))
         )
         self.assert_fatal_event(
-            p.IssueCode.INVALID_ENUM_VALUE, p.ReadyEvent(4, 4096, 2, 64, 9, (1,))
+            p.IssueCode.INVALID_ENUM_VALUE, p.ReadyEvent(4, 4096, 4, 64, 9, (1,))
         )
 
     def test_unnamed_request_failures_are_fatal(self):
