@@ -28,7 +28,7 @@ import subprocess
 import sys
 import tempfile
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path, PurePosixPath
 
 if __name__ == "__main__" and not __package__:
@@ -255,7 +255,8 @@ def selection_links(models: Path):
 
 @dataclass(frozen=True)
 class Selection:
-    """What --model and its source options select, and its selection link."""
+    """What --model and its source options select, and its selection link;
+    spec, a video variant's spec (--spec, install/video.py)."""
 
     model: str
     repo_id: str
@@ -265,6 +266,7 @@ class Selection:
     draft_model: str | None
     models_root: Path
     link: Path
+    spec: dict | None = None
 
     @classmethod
     def of(
@@ -372,6 +374,12 @@ def parse_args(argv=None):
     )
     parser.add_argument("--revision", help="optional upstream branch, tag or commit")
     parser.add_argument(
+        "--spec",
+        type=Path,
+        help="a JSON spec of a MiniMax-H3 checkpoint Splash does not ship, "
+        "installed as the variant MiniMaxAI/MiniMax-H3:NAME (install/video.py)",
+    )
+    parser.add_argument(
         "--draft-model",
         type=parse_draft_model,
         help="the DFlash2 draft's repository or local directory, in place of the "
@@ -417,6 +425,12 @@ def main(argv=None):
         # sent while it starts is not lost; it arrives here.
         signal.pthread_sigmask(signal.SIG_UNBLOCK, (signal.SIGINT, signal.SIGTERM))
         if args.command == "prepare":
+            if args.spec:
+                from .families import H3
+
+                if selection.repo_id != H3.release or selection.variant is None:
+                    raise ModelError(f"--spec installs a variant {H3.release}:NAME")
+                selection = replace(selection, spec=read_json(args.spec))
             if args.json_progress:
                 hub.report_json_progress()
             outcome = upstream.prepare(selection)
