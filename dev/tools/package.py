@@ -32,6 +32,10 @@ INSTALL_FILES = (
     "local.py",
     "cached.py",
     "gguf.py",
+    "video.py",
+    "conversion.py",
+    "h3.py",
+    "fasth3.py",
     "requirements.txt",
     "suggested-models.tsv",
 )

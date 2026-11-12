@@ -1,5 +1,116 @@
 # Video
 
+## Video installation
+
+The model's assembly is of target format `h3-video` (`install/video.py`).
+The family's constants, which the installer and the server read, are one
+row, `H3`, in `install/families.py`.
+Splash installs MiniMax-H3 from MiniMax's release, `MiniMaxAI/MiniMax-H3`,
+one variant per installation (`H3.variants`): `:vdn-8`, OpenVDN's 8-step
+VDN-H3 stage, and `:vdn-50`, its
+50-step stage, are models of their own, each with its own selection link,
+entry and assembly, and so are FastVideo's FastH3 students, `:fasth3-8` and
+`:fasth3-4`, and Pika H3 Flex's `:pika-6` and `:pika-ref2va-6`. The model ID
+without a variant installs `H3.default_variant`, `:pika-6`, unless its
+selection link holds an installation, which keeps its variant. A server
+serves the variant it installed.
+
+The installer converts the variant into the engine's images (the int8
+format `h3-w8a8-vdn-v1`, [Kernels](internals.md#kernels)) as it reads its sources at
+their default branches' commits: the release's FL2VA transformer, VAEs and
+tokenizer, and `OpenVDN/vdn-minimax-h3` (the stage's linear branch and LoRA
+adapters); TAEH3, the preview decoder, is read from
+`github.com/madebyollin/taehv` at a pinned commit and checked by its SHA-256.
+`install/conversion.py` runs a recipe's units, `install/h3.py` is
+MiniMax-H3's: each unit names the tensors it reads, which the driver reads by
+HTTP range requests of the safetensors files (`hub.Repository.open`, the
+header first, then each run of adjacent tensors in chunks of 64 MB, eight at
+a time), so no source file lands on disk, while the unit before it converts.
+The adaLN tables of the variant's schedule are tabulated by the engine
+(`splash video-adaln`, on the GPU) from the blocks' adaLN bases, read into
+scratch first. About 83 GB are read; the disk holds at most about 29 GB for
+`vdn-8`.
+
+FastH3's variants have their own recipe, `install/fasth3.py` (int8 format
+`h3-w8a8-fasth3-v1`). `:fasth3-8` reads the student
+`FastVideo/FastVideo-FastH3-8-Step-V2` (bf16 shards, 69 GB) and its contract
+(`fastvideo_inference.json` and the scheduler configs). `:fasth3-4` reads the
+release's transformer shards with the LoRA bundle
+`FastVideo/FastVideo-FastH3-4-step-Preview-v1-LoRA` (`vsa-datafree`, 5.3 GB),
+refusing a release whose shards are not the bundle's base's, and, at a pinned
+commit, the contract of the student the bundle was taken from. A block holds
+its int8 linears with the VSA compression gate and its adaLN table of the
+trained schedule; its keyframe-timestep row goes to scratch for
+`splash video-adaln`. Every file but the manifest is byte for byte a
+reference conversion's of the same sources.
+
+The images are a derived entry, `.converted/<key>`, keyed by the SHA-256 of
+the content IDs the Hub reports for every file the recipe reads, the recipe
+and the DiT, as a GGUF's metadata is a `.metadata` entry. A conversion writes
+into `.converted/.loading-<key>`, holding its `.lock`: each unit's files are
+fsynced and published by rename, so an interrupted conversion resumes at the
+first unit not written, and a second installation of the key waits for the
+first. Once every unit is written, its `files.json` lists the files and
+their sizes, and the publication renames the staging into the entry under
+the installation lock, as it publishes the assembly that links it. Garbage
+collection removes an entry no assembly links, and a conversion's staging
+that no process holds and that has not changed for a week. The record's
+sources are the release and the text encoder; `video` adds the variants, the
+entry's key, the commits of the companion repository and of the files the
+recipe pins, and the text encoder's package (`encoder`: its entry's key and
+the shards it links, trims and leaves out). A start
+finds the entry of the files it lists and converts nothing, so a commit that
+changes none of them installs at once; without the Hub, it starts from the
+entry the installation records.
+
+| Path | Holds |
+| --- | --- |
+| `weights/dit-<dit>/` | the DiT (`turbo` for `vdn-8`, `default` for `vdn-50`, the variant's name for FastH3): 50 int8 blocks, 3 QKFIX blocks, globals, patch projections, prep inputs, adaLN tables and `manifest.json`; 24.8 or 26.1 GB |
+| `weights/vae/` | the video VAE's int8 decoder and its encoder of a clip's keyframes, 2.8 GB |
+| `weights/audio/`, `weights/preview/` | the audio VAE's decoder and TAEH3's, 0.3 GB |
+| `tokenizer/`, `LICENSE` | FL2VA's tokenizer, which the server encodes prompts with, and the license, from the release's snapshot |
+| `encoder/` | the text encoder's package of `mlx-community/Qwen3-VL-32B-Instruct-8bit` at its default branch's commit, as a draft is: only what the engine reads, 27.92 GB of the repository's 36.00 GB (below) |
+
+The text encoder's package holds what `model/TextEncoder` and
+`model/VisionTowerWeights` read of the checkpoint, 1,604 tensors: decoder
+layers 0-49 (1,250), the token table (`embed_tokens` codes, scales and
+biases) and the vision tower (351 bf16 tensors), with `config.json`; layers
+50-63, the final norm and `lm_head` (354 tensors) are not installed. The
+installer reads each shard's header (range requests, or the Hub cache) and
+classifies it by its tensors' names, at any width: a shard of only read
+tensors is downloaded and linked as it is, a shard of none is never
+downloaded, and a shard of both is rewritten with only the read tensors
+(names, dtypes, shapes and bytes as they are, in the shard's order, under its
+`__metadata__`, by range reads) into a derived entry of its own,
+`.converted/<package key>`, under the same file name, with a
+`model.safetensors.index.json` of the package. The key is the SHA-256 of the
+content IDs of the shards the package holds, the trimming's name
+(`qwen3-vl-encoder-package-v1`) and the layer count, so a start whose shards
+did not change writes nothing, and one without the Hub uses the package its
+installation records. The engine scans the shards' headers
+(`SafetensorsCheckpoint`) and reads no index; the repositories' own index
+names a bf16 checkpoint's 14 shards, none of which they hold, and is not
+linked. The layer 49 / 50 boundary falls inside a shard at every width, and
+the final norm and `lm_head` share the last shard with layers past 49 only:
+
+| Width | Repository | Package | Linked shards | Trimmed shard (tensors kept / held) | Left out |
+| --- | ---: | ---: | --- | --- | --- |
+| 4-bit | 19.62 GB | 15.34 GB | 1-2, 10.68 GB | 3: 4.66 GB (425 / 494) | 4 |
+| 6-bit | 27.81 GB | 21.63 GB | 1-4, 21.31 GB | 5: 0.32 GB (9 / 331) | 6 |
+| 8-bit | 36.00 GB | 27.92 GB | 1-5, 26.75 GB | 6: 1.18 GB (53 / 256) | 7 |
+
+A Hub cache that already holds a repository's every shard keeps them (the
+installation pins the commit's snapshot); the package then adds its trimmed
+shard beside them, and the saving is the left-out and trimmed shards' once
+the cache holds only what the package links.
+
+`prepare_local_model` takes a directory of images converted before
+(`dit-<dit>/` of one variant or more, `vae/`, `audio/`, `preview/`, and
+`tokenizer/` with `LICENSE`), and links its files as they are; the encoder's
+package comes from the Hugging Face cache: the one an assembly of the models
+root records for that commit, or one planned from the cached shards. A local
+copy of the release is refused.
+
 ## Video engine
 
 The engine process of an h3-video assembly (`runtime/video/VideoRuntime.hpp`)
@@ -81,6 +192,16 @@ FastVideo's pipeline conditions any MiniMax-H3 DiT, which they were not
 trained for: the keyframe rows, fixed at timestep 0.999, are a dense prefix
 segment of the tile map.
 
+A FastH3-layout DiT whose manifest says `"vsa": {"attention": "dense"}`
+(sparsity 0, no compression gate: `pika-6`'s base, written so by
+`install/fasth3.py` for a spec) runs dense attention on the same kernels
+(`ops::VsaSpec::dense`): the QKV GEMM without the gate rows (the QKFIX
+blocks skip the int8 GEMM and its producer altogether), no tile means,
+routing or compressed output, and every 64-row chunk of the tile order
+attends to all rows with the int8 QK^T / fp16 PV fine stage (VSA's flags
+bit 1), QKFIX's fp16 QK and split term unchanged. The plan drops the gate,
+coarse-stage and selection tensors (0.5 GB at 1344x768 5 s).
+
 ## Runtime adapters
 
 A DiT can run a LoRA adapter at run time instead of having it merged at
@@ -98,6 +219,30 @@ GEMM reads an unrotated copy of A. The token refiner adds its adapter in the
 prep as PEFT does (bf16 linears, then the bf16 add). The adapter's A and B
 stay resident in bf16 (Pika H3 Flex FL2VA: 1.28 GB). Without an adapter the
 plain kernels run, unchanged: the golden tests' latents stay byte-identical.
+
+An adapter is converted once, at installation (`install/fasth3.py`
+`lora_units`, format `h3-lora-v1`, into the DiT's `adapter/`), from a spec's
+PEFT safetensors, zero-padded to rank 128.
+The DiT's `manifest.json` names its adapters, `"adapters": [{"path": P,
+"scale": S}]` (one at a time; entries that are not objects, VDN-H3's names of
+the adapters merged at conversion, are none), and `video-golden` takes
+`--adapter PATH[:SCALE]` or `--no-adapter` in their place.
+
+`splash install MiniMaxAI/MiniMax-H3:NAME --spec FILE` installs a checkpoint
+of MiniMax-H3's DiT that Splash does not ship as the variant NAME, by the
+same recipe, from a JSON spec of the form `pika-6`'s in
+`install/families.py`: `checkpoint` (`repo`, `prefix`, and a `revision`
+unless it is the adapter's repository; native or diffusers names), an
+optional `adapter` (`file`, `name`, `alpha`, and `repo` where it is not the
+checkpoint's), `schedule` (`rungs`, `video_shift`, `audio_shift`,
+`sampler`, `sigma_precision`, optionally `renoise_seed_offset`),
+`references` (false by default) and `qkfix` (45, 48, 49 by default). The
+installer refuses a NAME a shipped variant has, a field it does not know,
+and what the recipe refuses (`fasth3.check_spec`, the checkpoint's shapes,
+the adapter's rank and targets, the QK gains), each in one line; the
+installation records the spec, so the model ID installs again without the
+file. The installer checks structure only and has no quality threshold: a
+spec that passes every check can still give poor clips.
 
 The `_lora_post` GEMMs compute the up-projection tile after the K loop, so
 its accumulators are not live through it (fc1 + SwiGLU keeps the gate
@@ -193,6 +338,23 @@ prints the dense DiT's activation plan for the sequence: 3.7 GB for the
 example's 39,729 rows at 832x480 and 10.4 GB for 111,057 at 1344x768, against
 1.4 GB and 3.3 GB for text-to-video, and the refiner's scratch (1.8 and
 5.9 GB, released before the DiT).
+
+The installer converts the Ref2VA DiT as a spec of `install/fasth3.py`'s
+recipe: `MiniMaxAI/MiniMax-H3:pika-ref2va-6` reads Pika's `transformer_ref/`
+(diffusers names) and its ref2va adapter from the Hub, writes each block's
+adaLN row of t = 1 to scratch, from which `splash video-adaln` writes the
+references' tables, and converts the audio VAE's encoder
+(`audio/audio_enc_f16.bin`). The layout check runs on its assembly
+(ASSEMBLY below).
+
+```sh
+build/engine-tests/video-ref2va-layout DUMP --forward ASSEMBLY --metallib LIB --out DIR
+```
+
+`--forward` runs `Prep::run` on the dump's `prompt_embeds`, tags and
+reference latents, puts the dumped condition rows (`step0.npz`, augmented
+with Pika's noise) and initial noise in place of the engine's draws, and
+compares one DiT forward's target velocities with `step0_velocity.npz`.
 
 ## Video tests
 

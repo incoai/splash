@@ -296,6 +296,15 @@ preparation (runtime/video/model/Prep.mm), the audio VAE decoder
 install/h3.py follow this MLX port of MiniMax H3. Apache License, Version 2.0
 (http://www.apache.org/licenses/LICENSE-2.0).
 
+Pika H3 Flex (https://huggingface.co/Pika-Labs/Pika-H3-Flex)
+
+The pika-6 and pika-ref2va-6 variants run Pika H3 Flex's adapters and its
+Ref2VA base, which the installer reads from Pika H3 Flex's repository and
+converts (install/fasth3.py); none is part of Splash. They are Model Derivatives of MiniMax
+H3 under the MiniMax H3 Community License Agreement, Copyright (c) 2026
+Mellis, Inc.
+Apache License, Version 2.0 (http://www.apache.org/licenses/LICENSE-2.0).
+
 Qwen3-VL-32B-Instruct (https://huggingface.co/Qwen/Qwen3-VL-32B-Instruct)
 
 The video text encoder runs Qwen3-VL-32B-Instruct's weights, which are not
