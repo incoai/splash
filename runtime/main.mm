@@ -7,6 +7,7 @@
 #include "engine/Json.hpp"
 #include "engine/NativeArguments.hpp"
 #include "model/ModelDescriptor.hpp"
+#include "video/VideoRuntime.hpp"
 
 #include <IOKit/pwr_mgt/IOPMLib.h>
 #include <dispatch/dispatch.h>
@@ -155,6 +156,8 @@ void printUsage(std::string_view executable) {
       " [--activations auto|bf16] [--relaunch-context TOKENS] [--ple-memory BYTES|auto|off]"
       " [--expert-memory BYTES|auto|off] [--sparse-kv-memory BYTES|auto]"
       " [--kv-spill always] [--kv-window-trim on|off] [--verify-rows auto|all]");
+  writeStderrLine("       " + command + " serve-native VIDEO_MODEL_DIRECTORY");
+  writeStderrLine("       " + command + " video-adaln WEIGHTS NAME TRANSFORMER [STEPS]");
   writeStderrLine("       " + command + " model-check mlx-affine none|safetensors CONFIG [DRAFT_CONFIG]");
   writeStderrLine("       " + command + " model-check gguf none|gguf CONFIG GGUF_HEADERS [DRAFT_CONFIG]");
   writeStderrLine("       " + command + " device-check");
@@ -511,6 +514,10 @@ int main(int argc, char **argv) {
         return splash::checkModel(argc, argv);
       if (command == "families")
         return splash::printFamilies(argc);
+      if (command == "video-adaln")
+        return splash::video::tabulateAdaLn(splash::executablePath().parent_path() / "splash.metallib", argc, argv);
+      if (command == "serve-native" && argc > 2 && splash::video::servesVideo(argv[2]))
+        return splash::video::serve(splash::executablePath().parent_path() / "splash.metallib", argc, argv);
       if (command == "serve-native")
         return splash::serveNative(argc, argv);
       throw splash::engine::UsageError(command.empty() ? std::string("expected a command")
