@@ -3,7 +3,7 @@ production is server/protocol.py."""
 
 import json
 import struct
-from dataclasses import replace
+from dataclasses import astuple, replace
 
 from server import protocol as wire
 
@@ -12,6 +12,8 @@ _REQUEST = struct.Struct("<QBBQQIIIffIffffQIIIQQIII")
 _IMAGE_SPAN = struct.Struct("<IIIIQQ")
 _MASK_RESPONSE = struct.Struct("<QQI")
 _ID = struct.Struct("<Q")
+_VIDEO_REQUEST = struct.Struct("<QBBIIIIQBII")
+_VIDEO_REFERENCE = struct.Struct("<BIIIQ")
 
 
 def request_frame(**overrides) -> wire.RequestFrame:
@@ -68,7 +70,7 @@ def _event_payload(event: wire.EngineEvent) -> tuple[wire.FrameType, bytes]:
                 f"<IIBIII{len(event.stop_token_ids)}I",
                 event.max_concurrent_requests,
                 event.max_context_tokens,
-                event.vision,
+                event.vision | event.video << 1,
                 event.vocabulary_size,
                 event.mask_rows,
                 len(event.stop_token_ids),
@@ -144,6 +146,13 @@ def _event_payload(event: wire.EngineEvent) -> tuple[wire.FrameType, bytes]:
             return wire.FrameType.STATUS_JSON, _ID.pack(
                 event.correlation_id
             ) + event.json
+        case wire.VideoProgressEvent():
+            return wire.FrameType.VIDEO_PROGRESS, struct.pack(
+                "<QBIIQQ", *astuple(event)
+            )
+        case wire.VideoOutputEvent():
+            *header, mp4 = astuple(event)
+            return wire.FrameType.VIDEO_OUTPUT, struct.pack("<QBIQ", *header) + mp4
     raise TypeError(f"{type(event).__name__} is not an engine event")
 
 
@@ -236,6 +245,36 @@ def decode_client_frame(frame_type: int, payload: bytes) -> wire.ClientMessage:
             return wire.ReleaseRequestFrame(*_ID.unpack(payload))
         case wire.FrameType.STOP:
             return wire.StopFrame(*_ID.unpack(payload))
+        case wire.FrameType.VIDEO_REQUEST:
+            fields = _VIDEO_REQUEST.unpack_from(payload)
+            number, name, outputs, *clip, keyframes, count, refs = fields
+            at = _VIDEO_REQUEST.size + name
+            dit = bytes(payload[_VIDEO_REQUEST.size : at]).decode()
+            tokens = _words(payload, at, count)
+            at += 4 * count
+            headers = []
+            for _ in range(refs):
+                headers.append(_VIDEO_REFERENCE.unpack_from(payload, at))
+                at += _VIDEO_REFERENCE.size
+            # The keyframes after the reference headers, each height x width
+            # x 3 bytes, then each reference's pixels and soundtrack.
+            canvas = clip[1] * clip[2] * 3
+            frames = []
+            for flag in wire.VideoKeyframeFlag:
+                size = canvas if keyframes & flag else 0
+                frames.append(bytes(payload[at : at + size]))
+                at += size
+            references = []
+            for kind, n, width, height, samples in headers:
+                pixels = bytes(payload[at : at + n * height * width * 3])
+                at += len(pixels)
+                sound = bytes(payload[at : at + 8 * samples])
+                at += len(sound)
+                references.append(wire.VideoReference(wire.VideoReferenceKind(kind), n, width,
+                                                      height, pixels, sound))  # fmt: skip
+            return wire.VideoRequestFrame(number, dit,
+                                          wire.VideoOutputFlag(outputs), *clip, tokens, *frames,
+                                          tuple(references))  # fmt: skip
     raise ValueError(f"frame type {frame_type:#06x} is not a client frame")
 
 

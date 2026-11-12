@@ -173,6 +173,23 @@ TEST_DRAFT_SELECTOR_TEST := $(ENGINE_TEST_BUILD)/draft-selector
 TEST_TARGET_SAMPLING_TEST := $(ENGINE_TEST_BUILD)/target-sampling
 TEST_VISION_METAL_TEST := $(ENGINE_TEST_BUILD)/vision-metal
 TEST_VISION_ATTENTION_TEST := $(ENGINE_TEST_BUILD)/vision-attention
+TEST_TEXT_ENCODER_TEST := $(ENGINE_TEST_BUILD)/text-encoder
+TEST_VIDEO_SYNTHETIC_TEST := $(ENGINE_TEST_BUILD)/video-synthetic
+# FastH3's tile map and rung schedules, on the CPU (video_vsa_table_test.mm).
+TEST_VIDEO_VSA_TABLE := $(ENGINE_TEST_BUILD)/video-vsa-table
+# Every canvas tier's geometry and request tables, on the CPU (video_canvas_test.mm).
+TEST_VIDEO_CANVAS := $(ENGINE_TEST_BUILD)/video-canvas
+# The adaLN tables' host time embedder against an fp64 reference, on the CPU (video_temb_test.mm).
+TEST_VIDEO_TEMB := $(ENGINE_TEST_BUILD)/video-temb
+# The production kernels and the synthetic weights' fill (video_synthetic.metal)
+# in one library, which the synthetic forward runs on.
+TEST_VIDEO_SYNTHETIC_AIR := $(ENGINE_TEST_BUILD)/video-synthetic.air
+TEST_VIDEO_SYNTHETIC_LIB := $(ENGINE_TEST_BUILD)/video-synthetic.metallib
+# The video engine of the golden-clip tests (dev/tools/video_golden.mm).
+VIDEO_GOLDEN := $(ENGINE_TEST_BUILD)/video-golden
+# Ref2VA row layout against a Pika H3 Flex dump, on the CPU (dev/tools/video_ref2va_layout.mm):
+#   video-ref2va-layout DUMP_DIRECTORY
+VIDEO_REF2VA_LAYOUT := $(ENGINE_TEST_BUILD)/video-ref2va-layout
 TEST_BACKEND_BENCHMARK := $(ENGINE_TEST_BUILD)/backend-benchmark
 TEST_DECODE_PROFILE := $(ENGINE_TEST_BUILD)/decode-profile
 TEST_TEACHER_LOGITS := $(ENGINE_TEST_BUILD)/teacher-logits
@@ -220,7 +237,8 @@ TEST_DISK_SPACE := $(ENGINE_TEST_BUILD)/disk-space
 TEST_PERSISTENT_CACHE := $(ENGINE_TEST_BUILD)/persistent-cache
 
 TEST_CPU_TARGETS := $(TEST_SLOT_FILE) $(TEST_SPARSE_ROW_STORE) $(TEST_SSD_READERS) $(TEST_SLOT_RECYCLER) \
-	$(TEST_EXPERT_CHUNK_LAYOUT) $(TEST_VERIFY_BUDGET) \
+	$(TEST_EXPERT_CHUNK_LAYOUT) $(TEST_VIDEO_VSA_TABLE) $(TEST_VIDEO_CANVAS) $(TEST_VIDEO_TEMB) \
+	$(TEST_VERIFY_BUDGET) \
 	$(TEST_CACHE_DIRECTORY) $(TEST_DISK_SPACE) $(TEST_LEGACY_WEIGHT_CACHE) $(TEST_VISION_PREPARATION) $(TEST_SAFETENSORS_CHECKPOINT) $(TEST_WEIGHT_SOURCE) $(TEST_OPERATOR_WORKSPACE) \
 	$(TEST_MODEL_CONFIGURATION) $(TEST_FAMILY_VALUES) \
 	$(TEST_KV_SLOT_FORMAT) $(TEST_KV_PAGE_TIER_HOST) \
@@ -293,6 +311,8 @@ TEST_METAL_TARGETS := $(TEST_DRAFT_PREPARATION) \
 	$(TEST_TARGET_SAMPLING_TEST) \
 	$(TEST_VISION_METAL_TEST) \
 	$(TEST_VISION_ATTENTION_TEST) \
+	$(TEST_TEXT_ENCODER_TEST) \
+	$(TEST_VIDEO_SYNTHETIC_TEST) $(TEST_VIDEO_SYNTHETIC_LIB) \
 	$(TEST_METAL_BACKEND_TEST) \
 	$(TEST_HANDOFF_TEST) \
 	$(TEST_PRESSURE_SERVING) \
@@ -306,7 +326,8 @@ TEST_CONFIG_TARGETS := $(filter-out $(LIB) $(HOST_STEP_LIB),$(sort $(TEST_CPU_TA
 	$(TEST_DECODE_PROFILE) $(TEST_TEACHER_LOGITS) $(TEST_ATTENTION_SWEEP) \
 	$(TEST_GGUF_PROJECTION_BENCHMARK) $(TEST_GGUF_MOE_BENCHMARK) \
 	$(TEST_Q8_AIR) $(TEST_Q8_KERNEL_AIRS) $(TEST_RESIDENCY_AIR) $(TEST_HOST_STEP_AIR) $(TEST_METAL_BACKEND_AIR) \
-	$(TEST_GGUF_DEQUANT_AIR) $(TEST_GGUF_MOE_AIR)
+	$(TEST_GGUF_DEQUANT_AIR) $(TEST_GGUF_MOE_AIR) $(TEST_VIDEO_SYNTHETIC_AIR) $(VIDEO_GOLDEN) \
+	$(VIDEO_REF2VA_LAYOUT)
 # Benchmarks and tools that build with the production flags.
 PRODUCTION_FLAG_TOOLS := $(TEST_BACKEND_BENCHMARK) $(WEIGHT_DIGESTS)
 SANITIZER_CONFIG_TARGETS := $(TEST_SLOT_FILE_ASAN) $(TEST_SLOT_FILE_TSAN) \
@@ -484,6 +505,8 @@ $(TEST_TARGET_SAMPLING_TEST): dev/tests/engine/target_sampling_metal_test.mm \
 		$(ENGINE_LIBRARY) $(LIB)
 $(TEST_VISION_ATTENTION_TEST): dev/tests/engine/vision_attention_metal_test.mm \
 		$(ENGINE_LIBRARY) $(LIB)
+$(TEST_TEXT_ENCODER_TEST): dev/tests/engine/text_encoder_metal_test.mm \
+		$(ENGINE_LIBRARY) $(LIB)
 $(TEST_Q8_METAL_TEST): dev/tests/engine/q8_paged_kv_metal_test.mm
 $(TEST_Q8_STORAGE_TEST): dev/tests/engine/q8_page_storage_test.mm \
 		$(ENGINE_LIBRARY)
@@ -526,13 +549,29 @@ $(TEST_MODEL_CONFIGURATION) $(TEST_DRAFT_PREPARATION) $(TEST_GGUF_PROJECTION) $(
 		$(TEST_DFLASH_BATCH_CONTROL_TEST) $(TEST_DRAFT_ATTENTION_TEST) \
 		$(TEST_GDN_DECODE_TEST) $(TEST_DRAFT_SELECTOR_TEST) \
 		$(TEST_TARGET_SAMPLING_TEST) $(TEST_VISION_ATTENTION_TEST) \
-		$(TEST_Q8_METAL_TEST) $(TEST_Q8_STORAGE_TEST) $(TEST_ATTENTION_VARIANTS) \
+		$(TEST_TEXT_ENCODER_TEST) $(TEST_Q8_METAL_TEST) $(TEST_Q8_STORAGE_TEST) $(TEST_ATTENTION_VARIANTS) \
 		$(TEST_METAL_BACKEND_TEST) $(TEST_HANDOFF_TEST) $(TEST_PRESSURE_SERVING) $(TEST_VISION_ENCODER_TEST) \
 		$(TEST_MODEL_RUNTIME_ORACLE) \
 		$(TEST_DECODE_PROFILE) $(TEST_TEACHER_LOGITS) $(TEST_ATTENTION_SWEEP) \
 		$(TEST_GGUF_PROJECTION_BENCHMARK) $(TEST_GGUF_MOE_BENCHMARK): | $(ENGINE_TEST_BUILD)
 	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) -fobjc-arc $(TEST_INPUTS) \
 		$(ENGINE_LINKFLAGS) -o $@
+
+# The video engine's synthetic forward and the golden-clip tests' engine
+# compile as the engine's host code does (VIDEO_OBJCXXFLAGS) and link the video
+# library and the engine library under it, whose Metal backend and weight
+# readers it runs on, and its mp4 writer's frameworks.
+$(TEST_VIDEO_SYNTHETIC_TEST): dev/tests/engine/video_synthetic_metal_test.mm \
+		dev/tests/engine/VideoSynthetic.mm dev/tests/engine/VideoSynthetic.hpp \
+		dev/tests/engine/VideoSyntheticABI.h
+$(VIDEO_GOLDEN): dev/tools/video_golden.mm dev/tools/Numpy.cpp dev/tools/Numpy.hpp
+$(VIDEO_REF2VA_LAYOUT): dev/tools/video_ref2va_layout.mm dev/tools/Numpy.cpp dev/tools/Numpy.hpp
+$(TEST_VIDEO_VSA_TABLE): dev/tests/engine/video_vsa_table_test.mm dev/tests/engine/FastVideoTiles.hpp
+$(TEST_VIDEO_CANVAS): dev/tests/engine/video_canvas_test.mm dev/tests/engine/FastVideoTiles.hpp
+$(TEST_VIDEO_TEMB): dev/tests/engine/video_temb_test.mm
+$(TEST_VIDEO_SYNTHETIC_TEST) $(VIDEO_GOLDEN) $(VIDEO_REF2VA_LAYOUT) $(TEST_VIDEO_VSA_TABLE) $(TEST_VIDEO_CANVAS) $(TEST_VIDEO_TEMB): $(VIDEO_LIBRARY) $(ENGINE_LIBRARY) | $(ENGINE_TEST_BUILD)
+	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) -ffp-contract=off -fobjc-arc $(filter %.mm %.cpp,$^) \
+		$(VIDEO_LIBRARY) $(ENGINE_LIBRARY) $(ENGINE_LINKFLAGS) $(VIDEO_LINKFLAGS) -o $@
 
 # Tools built with the production flags.
 $(WEIGHT_DIGESTS): dev/tools/weight_digests.mm \
@@ -555,7 +594,10 @@ $(TEST_BACKEND_BENCHMARK): dev/benchmarks/backend_benchmark.mm \
 $(TEST_Q8_AIR): dev/tests/engine/q8_page_format_oracle.metal runtime/metal/abi/ExecutionGeometry.h
 $(TEST_METAL_BACKEND_AIR): dev/tests/engine/metal_backend_test.metal
 
-$(TEST_Q8_AIR) $(TEST_METAL_BACKEND_AIR): | $(ENGINE_TEST_BUILD)
+$(TEST_VIDEO_SYNTHETIC_AIR): dev/tests/engine/video_synthetic.metal dev/tests/engine/VideoSyntheticABI.h \
+	runtime/metal/abi/video/Layout.h
+
+$(TEST_Q8_AIR) $(TEST_METAL_BACKEND_AIR) $(TEST_VIDEO_SYNTHETIC_AIR): | $(ENGINE_TEST_BUILD)
 	$(RUN_CONFIGURED) $(METAL) $(TEST_METALFLAGS) -c $(filter %.metal,$^) -o $@
 
 $(ENGINE_TEST_BUILD)/kernels/%.air: runtime/metal/kernels/%.metal \
@@ -585,9 +627,10 @@ $(TEST_HOST_STEP_LIB): $(TEST_HOST_STEP_AIR)
 # metal_backend_test.metal's copies, and gguf_moe_test.metal's gate and up
 # passes apart. It relinks whenever the production library does.
 $(TEST_PRODUCTION_LIB): $(PRODUCTION_AIRS) $(TEST_METAL_BACKEND_AIR) $(TEST_GGUF_MOE_AIR) $(LIB)
+$(TEST_VIDEO_SYNTHETIC_LIB): $(PRODUCTION_AIRS) $(TEST_VIDEO_SYNTHETIC_AIR) $(LIB)
 
 $(TEST_GGUF_DEQUANT_LIB) $(TEST_Q8_LIB) $(TEST_Q8_ATTENTION_LIB) $(TEST_METAL_BACKEND_LIB) \
-		$(TEST_PRODUCTION_LIB) $(TEST_HOST_STEP_LIB):
+		$(TEST_PRODUCTION_LIB) $(TEST_HOST_STEP_LIB) $(TEST_VIDEO_SYNTHETIC_LIB):
 	$(RUN_CONFIGURED) $(METALLIB) $(filter %.air,$^) -o $@
 
 .PHONY: verify-build-identity
@@ -617,6 +660,9 @@ test-engine-cpu: $(TEST_CPU_TARGETS) $(TEST_ATTENTION_SWEEP) $(TEST_BACKEND_BENC
 	$(ENGINE_CPU_STEP) $(TEST_SSD_READERS)
 	$(ENGINE_CPU_STEP) $(TEST_SLOT_RECYCLER)
 	$(ENGINE_CPU_STEP) $(TEST_EXPERT_CHUNK_LAYOUT)
+	$(ENGINE_CPU_STEP) $(TEST_VIDEO_VSA_TABLE)
+	$(ENGINE_CPU_STEP) $(TEST_VIDEO_CANVAS)
+	$(ENGINE_CPU_STEP) $(TEST_VIDEO_TEMB)
 	$(ENGINE_CPU_STEP) $(TEST_VERIFY_BUDGET)
 	$(ENGINE_CPU_STEP) $(TEST_CACHE_DIRECTORY)
 	$(ENGINE_CPU_STEP) $(TEST_DISK_SPACE)
@@ -706,6 +752,8 @@ test-engine-metal: $(TEST_METAL_TARGETS)
 	$(METAL_TEST_ENV) $(TEST_TARGET_SAMPLING_TEST) $(LIB)
 	$(METAL_TEST_ENV) $(TEST_VISION_METAL_TEST) $(LIB)
 	$(METAL_TEST_ENV) $(TEST_VISION_ATTENTION_TEST) $(LIB)
+	$(METAL_TEST_ENV) $(TEST_TEXT_ENCODER_TEST) $(LIB)
+	$(TEST_VIDEO_SYNTHETIC_TEST) $(TEST_VIDEO_SYNTHETIC_LIB)
 	$(METAL_TEST_ENV) $(TEST_METAL_BACKEND_TEST) $(TEST_METAL_BACKEND_LIB)
 	$(METAL_TEST_ENV) $(TEST_HANDOFF_TEST) $(TEST_METAL_BACKEND_LIB)
 	$(METAL_TEST_ENV) $(TEST_PRESSURE_SERVING) $(LIB)
