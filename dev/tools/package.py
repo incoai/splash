@@ -79,7 +79,9 @@ SERVER_FILES = (
     "crash_trace.py",
     "supervision.py",
     "serve_record.py",
+    "videos.py",
     "video_protocol.py",
+    "references.py",
     "chat.html",
     "favicon.svg",
 )

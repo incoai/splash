@@ -8,22 +8,23 @@ function __splash_models
     and $helper
 end
 
-# As in Bash and Zsh: only the value of --model, and only after `splash serve`.
+# As in Bash and Zsh: only the value of --model, and only after `splash serve`
+# or `splash generate`.
 function __splash_model_value
     set -l words (commandline -opc)
-    test "$words[2]" = serve
+    contains -- "$words[2]" serve generate
     and not string match -qr -- '^-[^=]*$' (commandline -ct)
 end
 
 function __splash_local_file_value
     set -l words (commandline -opc)
-    contains -- "$words[2]" serve install; or return 1
+    contains -- "$words[2]" serve generate install; or return 1
     contains -- -- $words[3..-1]; and return 1
-    contains -- "$words[-1]" --model-dir --draft-model --mmproj --spec
-    or string match -qr -- '^--(model-dir|draft-model|mmproj|spec)=' (commandline -ct)
+    contains -- "$words[-1]" --model-dir --draft-model --mmproj --out --first-frame --last-frame --reference --spec
+    or string match -qr -- '^--(model-dir|draft-model|mmproj|out|first-frame|last-frame|reference|spec)=' (commandline -ct)
 end
 
 complete -c splash -f
-complete -c splash -n 'test (count (commandline -opc)) -eq 1' -a 'serve install claude codex opencode hermes pi'
+complete -c splash -n 'test (count (commandline -opc)) -eq 1' -a 'serve generate install claude codex opencode hermes pi'
 complete -c splash -n __splash_model_value -l model -x -a '(__splash_models)'
 complete -c splash -n __splash_local_file_value -F

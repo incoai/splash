@@ -138,8 +138,8 @@ struct VideoRequestFrame {
   uint64_t seed = 0;
   std::vector<uint32_t> promptTokens;
   // Keyframes (first-frame and first-and-last-frame conditioning), each
-  // empty or uint8 RGB [height][width][3], already on the clip's canvas:
-  // the first frame anchors the clip's first
+  // empty or uint8 RGB [height][width][3], already on the clip's canvas
+  // (server/images.py keyframe): the first frame anchors the clip's first
   // latent frame, the last frame its last.
   std::vector<uint8_t> firstFrame;
   std::vector<uint8_t> lastFrame;

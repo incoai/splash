@@ -136,8 +136,8 @@ class VideoReferenceKind(IntEnum):
 
 @dataclass(slots=True, frozen=True)
 class VideoReference:
-    """A Ref2VA reference of a video request, as the server normalized it:
-    an image at its tier size, a video's frames at
+    """A Ref2VA reference of a video request, as the server normalized it
+    (references.normalize): an image at its tier size, a video's frames at
     24 fps, truncated to the clip, on its tier canvas, with its soundtrack,
     or an audio reference, a soundtrack alone (frames, width and height 0,
     no pixels)."""
@@ -172,7 +172,7 @@ class VideoRequestFrame:
     seed: int
     prompt_tokens: tuple[int, ...]
     # Keyframes, each empty or uint8 RGB [height][width][3] already on the
-    # canvas: the first frame anchors the clip's first
+    # canvas (images.keyframe): the first frame anchors the clip's first
     # latent frame, the last frame its last.
     first_frame: bytes = b""
     last_frame: bytes = b""
