@@ -13,10 +13,11 @@ import math
 import struct
 import sys
 from dataclasses import dataclass, fields
+from dataclasses import field as dataclass_field
 from enum import IntEnum, IntFlag
 from typing import TypeAlias
 
-PROTOCOL_VERSION = 13
+PROTOCOL_VERSION = 14
 # A frame is its header, the magic, the protocol version, the frame type and
 # the payload length, then the payload.
 FRAME_HEADER_BYTES = 16
@@ -34,6 +35,12 @@ MAX_IMAGE_PATCHES = 16384
 # Image pixels travel inside the request frame; a multi-image agent turn can
 # carry well over 64 MiB of resized RGB bytes.
 MAX_FRAME_PAYLOAD_BYTES = 256 * 1024 * 1024
+# A video request carries its Ref2VA references' normalized frames (three 15 s
+# reference videos on a 768p canvas are 3.4 GB of RGB); a video model's
+# engine takes VideoRequest frames up to this.
+MAX_VIDEO_REQUEST_PAYLOAD_BYTES = 4 * 1024 * 1024 * 1024
+# The references a video request carries at most (Pika H3 Flex's 12).
+MAX_VIDEO_REFERENCES = 12
 MAX_STATUS_JSON_BYTES = 32 * 1024 * 1024
 MAX_ERROR_STRING_BYTES = 1024 * 1024
 MAX_PROMPT_TOKENS = 1 << 20
@@ -54,7 +61,8 @@ _REQUEST_END = struct.Struct("<Q")
 _MASK_RESPONSE = struct.Struct("<QQI")
 _STATUS_REQUEST = struct.Struct("<Q")
 _RELEASE_REQUEST = struct.Struct("<Q")
-# Concurrent requests, context, vision, vocabulary, mask rows, stop count.
+# Concurrent requests, context, features (ReadyFeature), vocabulary, mask
+# rows, stop count.
 _READY = struct.Struct("<IIBIII")
 _START = struct.Struct("<QII")
 _PROMPT_PROGRESS = struct.Struct("<QIQ")
@@ -67,6 +75,10 @@ _STATUS_JSON = struct.Struct("<Q")
 _START_FAILED = struct.Struct("<BBQQII")
 # Steps done, steps.
 _WARMING = struct.Struct("<II")
+_VIDEO_REQUEST = struct.Struct("<QBBIIIIQBII")
+_VIDEO_REFERENCE = struct.Struct("<BIIIQ")
+_VIDEO_PROGRESS = struct.Struct("<QBIIQQ")
+_VIDEO_OUTPUT = struct.Struct("<QBIQ")
 
 assert (
     array.array("I").itemsize == 4
@@ -83,6 +95,10 @@ assert _ERROR.size == 22
 assert _STATUS_JSON.size == 8
 assert _START_FAILED.size == 26
 assert _WARMING.size == 8
+assert _VIDEO_REQUEST.size == 43
+assert _VIDEO_REFERENCE.size == 21
+assert _VIDEO_PROGRESS.size == 33
+assert _VIDEO_OUTPUT.size == 21
 
 REQUEST_FIXED_BYTES = _REQUEST.size
 IMAGE_SPAN_BYTES = _IMAGE_SPAN.size
@@ -95,6 +111,7 @@ class FrameType(IntEnum):
     STATUS_REQUEST = 0x0004
     RELEASE_REQUEST = 0x0005
     STOP = 0x0006
+    VIDEO_REQUEST = 0x0007
 
     READY = 0x0100
     START = 0x0101
@@ -106,6 +123,8 @@ class FrameType(IntEnum):
     PROMPT_PROGRESS = 0x0108
     START_FAILED = 0x0109
     WARMING = 0x010A
+    VIDEO_PROGRESS = 0x010B
+    VIDEO_OUTPUT = 0x010C
 
 
 # The frame types the engine sends; the others are the server's.
@@ -121,6 +140,8 @@ _EVENT_TYPES = frozenset(
         FrameType.PROMPT_PROGRESS,
         FrameType.START_FAILED,
         FrameType.WARMING,
+        FrameType.VIDEO_PROGRESS,
+        FrameType.VIDEO_OUTPUT,
     }
 )
 
@@ -349,6 +370,11 @@ class WarmingEvent:
     steps: int
 
 
+class ReadyFeature(IntFlag):
+    VISION = 1 << 0
+    VIDEO = 1 << 1
+
+
 @dataclass(slots=True, frozen=True)
 class ReadyEvent:
     max_concurrent_requests: int
@@ -363,6 +389,131 @@ class ReadyEvent:
     vocabulary_size: int
     mask_rows: int
     stop_token_ids: tuple[int, ...]
+    # The engine serves a video model: it takes VideoRequestFrames and
+    # cancels, max_context_tokens bounds a video prompt's tokens, and the
+    # vocabulary, mask rows and stop tokens may be zero or empty.
+    video: bool = False
+
+
+# A video request names the DiT it runs on: a directory name under the
+# weights, 1 to 64 of a-z, 0-9, ".", "_" and "-", without ".."
+# (runtime/engine/Protocol.hpp validDitName).
+MAX_DIT_NAME_BYTES = 64
+_DIT_NAME_CHARACTERS = frozenset("abcdefghijklmnopqrstuvwxyz0123456789._-")
+
+
+def valid_dit_name(name: object) -> bool:
+    return (
+        isinstance(name, str)
+        and 0 < len(name) <= MAX_DIT_NAME_BYTES
+        and set(name) <= _DIT_NAME_CHARACTERS
+        and ".." not in name
+    )
+
+
+class VideoOutputFlag(IntFlag):
+    PREVIEW = 1 << 0
+    AUDIO = 1 << 1
+
+
+_VIDEO_OUTPUT_BITS = int(VideoOutputFlag.PREVIEW | VideoOutputFlag.AUDIO)
+
+
+class VideoKeyframeFlag(IntFlag):
+    FIRST = 1 << 0
+    LAST = 1 << 1
+
+
+class VideoReferenceKind(IntEnum):
+    IMAGE = 0
+    VIDEO = 1
+    AUDIO = 2
+
+
+@dataclass(slots=True, frozen=True)
+class VideoReference:
+    """A Ref2VA reference of a video request, as the server normalized it
+    (references.normalize): an image at its tier size, a video's frames at
+    24 fps, truncated to the clip, on its tier canvas, with its soundtrack,
+    or an audio reference, a soundtrack alone (frames, width and height 0,
+    no pixels)."""
+
+    kind: VideoReferenceKind
+    # An image's frames are 1, an audio reference's 0.
+    frames: int
+    width: int
+    height: int
+    # uint8 RGB [frames][height][width][3], any bytes-like object.
+    pixels: bytes = dataclass_field(repr=False)
+    # Little-endian fp32 [2][samples] at 32 kHz: a video's soundtrack (empty:
+    # none), an audio reference's samples.
+    soundtrack: bytes = dataclass_field(default=b"", repr=False)
+
+
+@dataclass(slots=True, frozen=True)
+class VideoRequestFrame:
+    """One clip of a video model, of a prompt of the text encoder's token
+    ids. Answered by VideoProgressEvents, then the clip's VideoOutputEvent,
+    or an ErrorEvent."""
+
+    request_id: int
+    # The DiT's name (valid_dit_name): its weights' dit-<name>/.
+    dit: str
+    outputs: VideoOutputFlag
+    frames: int
+    width: int
+    height: int
+    # Denoising steps: a VDN-H3 DiT's; a FastH3 DiT's 0 or its rungs'.
+    steps: int
+    seed: int
+    prompt_tokens: tuple[int, ...]
+    # Keyframes, each empty or uint8 RGB [height][width][3] already on the
+    # canvas (images.keyframe): the first frame anchors the clip's first
+    # latent frame, the last frame its last.
+    first_frame: bytes = b""
+    last_frame: bytes = b""
+    # Ref2VA references in presentation order; none with keyframes.
+    references: tuple[VideoReference, ...] = ()
+
+
+class VideoPhase(IntEnum):
+    ENCODE = 1
+    PREPARE = 2
+    DENOISE = 3
+    PREVIEW = 4
+    DECODE = 5
+    AUDIO = 6
+    MUX = 7
+
+
+@dataclass(slots=True, frozen=True)
+class VideoProgressEvent:
+    """A phase has done `step` of its `steps`: step 0 starts it, `steps`
+    completes it; its time so far and the engine's peak footprint."""
+
+    request_id: int
+    phase: VideoPhase
+    step: int
+    steps: int
+    elapsed_micros: int
+    peak_footprint_bytes: int
+
+
+class VideoOutputKind(IntEnum):
+    VIDEO = 0
+    PREVIEW = 1
+
+
+@dataclass(slots=True, frozen=True)
+class VideoOutputEvent:
+    """An mp4 of the request: the preview, or the clip, which ends it."""
+
+    request_id: int
+    output: VideoOutputKind
+    frames: int
+    # From the request's arrival.
+    wall_micros: int
+    mp4: bytes
 
 
 @dataclass(slots=True, frozen=True)
@@ -499,6 +650,7 @@ ClientMessage: TypeAlias = (
     | StatusRequestFrame
     | ReleaseRequestFrame
     | StopFrame
+    | VideoRequestFrame
 )
 EngineEvent: TypeAlias = (
     ReadyEvent
@@ -511,6 +663,8 @@ EngineEvent: TypeAlias = (
     | StatusJsonEvent
     | StartFailedEvent
     | WarmingEvent
+    | VideoProgressEvent
+    | VideoOutputEvent
 )
 
 
@@ -699,6 +853,12 @@ def _payload_bounds(frame_type: FrameType) -> tuple[int, int]:
             bounds = (_START_FAILED.size, _START_FAILED.size + MAX_ERROR_STRING_BYTES)
         case FrameType.WARMING:
             bounds = (_WARMING.size, _WARMING.size)
+        case FrameType.VIDEO_REQUEST:
+            return _VIDEO_REQUEST.size, MAX_VIDEO_REQUEST_PAYLOAD_BYTES
+        case FrameType.VIDEO_PROGRESS:
+            bounds = (_VIDEO_PROGRESS.size, _VIDEO_PROGRESS.size)
+        case FrameType.VIDEO_OUTPUT:
+            bounds = (_VIDEO_OUTPUT.size, MAX_FRAME_PAYLOAD_BYTES)
     return bounds[0], min(bounds[1], MAX_FRAME_PAYLOAD_BYTES)
 
 
@@ -1056,6 +1216,151 @@ def request_fingerprint(request: RequestFrame) -> bytes:
     return digest.digest()
 
 
+def _video_request_frame(request: VideoRequestFrame) -> bytearray:
+    try:
+        request_id = _u64(request.request_id, "video request id")
+        if not request_id:
+            raise ValueError("video request id must be non-zero")
+    except ValueError as error:
+        _fail_request(IssueCode.INVALID_REQUEST_ID, str(error))
+    try:
+        if not valid_dit_name(request.dit):
+            raise ValueError(
+                "video DiT name is 1 to 64 of a-z, 0-9, '.', '_' and '-', without '..'"
+            )
+        dit = request.dit.encode()
+        outputs = request.outputs
+        if not isinstance(outputs, VideoOutputFlag) or outputs & ~_VIDEO_OUTPUT_BITS:
+            raise ValueError("video outputs are not defined by native protocol")
+        frames = _u32(request.frames, "video frames")
+        width = _u32(request.width, "video width")
+        height = _u32(request.height, "video height")
+        steps = _u32(request.steps, "video steps")
+        seed = _u64(request.seed, "video seed")
+        tokens = _words(request.prompt_tokens, "prompt tokens")
+    except ValueError as error:
+        _fail_request(IssueCode.INVALID_ENUM_VALUE, str(error), request_id)
+    if not frames or not width or not height:
+        _fail_request(
+            IssueCode.INVALID_COUNT,
+            "a video request needs frames, a width and a height",
+            request_id,
+        )
+    if not tokens or len(tokens) > MAX_PROMPT_TOKENS:
+        _fail_request(
+            IssueCode.LIMIT_EXCEEDED,
+            "a video prompt holds 1 token or more, within the prompt limit",
+            request_id,
+        )
+    keyframes = (request.first_frame, request.last_frame)
+    if any(len(pixels) not in (0, width * height * 3) for pixels in keyframes):
+        _fail_request(
+            IssueCode.INVALID_COUNT,
+            "a keyframe holds height x width x 3 bytes",
+            request_id,
+        )
+    flags = VideoKeyframeFlag(0)
+    for flag, pixels in zip(VideoKeyframeFlag, keyframes):
+        if pixels:
+            flags |= flag
+    references = _video_references(request.references, request_id)
+    payload_bytes = (
+        _VIDEO_REQUEST.size
+        + len(dit)
+        + 4 * len(tokens)
+        + _VIDEO_REFERENCE.size * len(references)
+        + sum(map(len, keyframes))
+        + sum(len(pixels) + len(sound) for _, pixels, sound in references)
+    )
+    if issue := _payload_length_issue(FrameType.VIDEO_REQUEST, payload_bytes):
+        _fail_request(issue.code, issue.message, request_id)
+    frame = _frame(FrameType.VIDEO_REQUEST, payload_bytes)
+    _VIDEO_REQUEST.pack_into(
+        frame,
+        FRAME_HEADER_BYTES,
+        request_id,
+        len(dit),
+        int(outputs),
+        frames,
+        width,
+        height,
+        steps,
+        seed,
+        int(flags),
+        len(tokens),
+        len(references),
+    )
+    at = FRAME_HEADER_BYTES + _VIDEO_REQUEST.size
+    frame[at : at + len(dit)] = dit
+    at += len(dit)
+    frame[at : at + 4 * len(tokens)] = memoryview(tokens).cast("B")
+    at += 4 * len(tokens)
+    for header, _, _ in references:
+        _VIDEO_REFERENCE.pack_into(frame, at, *header)
+        at += _VIDEO_REFERENCE.size
+    # The variable parts: the keyframes, then each reference's pixels and
+    # soundtrack, each copied once.
+    for part in (*keyframes, *(b for _, p, s in references for b in (p, s))):
+        frame[at : at + len(part)] = part
+        at += len(part)
+    return frame
+
+
+def _video_references(references, request_id):
+    """Each reference's header fields and its pixels and soundtrack as byte
+    views, checked as the engine checks them."""
+    if len(references) > MAX_VIDEO_REFERENCES:
+        _fail_request(
+            IssueCode.LIMIT_EXCEEDED,
+            f"a video request holds at most {MAX_VIDEO_REFERENCES} references",
+            request_id,
+        )
+    checked = []
+    for reference in references:
+        try:
+            kind = _enum_value(
+                reference.kind, VideoReferenceKind, "video reference kind"
+            )
+            frames = _u32(reference.frames, "reference frames")
+            width = _u32(reference.width, "reference width")
+            height = _u32(reference.height, "reference height")
+            pixels = memoryview(reference.pixels).cast("B")
+            sound = memoryview(reference.soundtrack).cast("B")
+        except (TypeError, ValueError) as error:
+            _fail_request(IssueCode.INVALID_ENUM_VALUE, str(error), request_id)
+        image = kind == VideoReferenceKind.IMAGE
+        if kind == VideoReferenceKind.AUDIO:
+            if frames or width or height or not len(sound):
+                _fail_request(
+                    IssueCode.INVALID_COUNT,
+                    "an audio reference is a soundtrack without frames",
+                    request_id,
+                )
+        elif (
+            not frames
+            or not width
+            or not height
+            or (image and (frames != 1 or len(sound)))
+        ):
+            _fail_request(
+                IssueCode.INVALID_COUNT,
+                "a video reference needs frames, a width and a height; an "
+                "image is one frame without a soundtrack",
+                request_id,
+            )
+        if len(pixels) != frames * height * width * 3 or len(sound) % 8:
+            _fail_request(
+                IssueCode.INVALID_COUNT,
+                "a video reference holds frames x height x width x 3 bytes and "
+                "a stereo soundtrack",
+                request_id,
+            )
+        checked.append(
+            ((int(kind), frames, width, height, len(sound) // 8), pixels, sound)
+        )
+    return checked
+
+
 def serialize_message(message: ClientMessage) -> bytearray:
     """Validate and serialize one client message as a whole frame, built in
     one buffer: a request's image pixels are copied once."""
@@ -1072,6 +1377,8 @@ def serialize_message(message: ClientMessage) -> bytearray:
             return _release_request_frame(message)
         if isinstance(message, StopFrame):
             return _request_end_frame(FrameType.STOP, message.request_id)
+        if isinstance(message, VideoRequestFrame):
+            return _video_request_frame(message)
     except MemoryError as error:
         raise ProtocolError(
             _allocation_issue("allocation failed while serializing a client frame")
@@ -1167,23 +1474,37 @@ def _decode_event(frame: Frame) -> EngineEvent:
             _fatal(IssueCode.INVALID_COUNT, "warming steps are invalid")
         return WarmingEvent(steps_done, steps)
     if frame_type is FrameType.READY:
-        concurrent, context, vision, vocabulary, rows, stop_count = _READY.unpack_from(
-            payload
+        concurrent, context, features, vocabulary, rows, stop_count = (
+            _READY.unpack_from(payload)
         )
         stops = _tail(payload, _READY.size, stop_count, "I", "stop token", 0)
-        if vision > 1:
-            _fatal(IssueCode.INVALID_ENUM_VALUE, "ready vision must be a boolean")
-        if not concurrent or not context or not vocabulary or not rows or not stops:
+        if features & ~int(ReadyFeature.VISION | ReadyFeature.VIDEO):
+            _fatal(IssueCode.INVALID_ENUM_VALUE, "ready features are not defined")
+        video = bool(features & ReadyFeature.VIDEO)
+        # A video model's engine has no vocabulary, stop tokens or masks to name.
+        if (
+            not concurrent
+            or not context
+            or (not video and (not vocabulary or not rows or not stops))
+        ):
             _fatal(
                 IssueCode.INVALID_COUNT,
                 "ready event capacities and stop tokens must be non-zero",
             )
-        if max(stops) >= vocabulary:
+        if stops and max(stops) >= vocabulary:
             _fatal(
                 IssueCode.INVALID_COUNT,
                 "ready event stop token is outside the vocabulary",
             )
-        return ReadyEvent(concurrent, context, bool(vision), vocabulary, rows, stops)
+        return ReadyEvent(
+            concurrent,
+            context,
+            bool(features & ReadyFeature.VISION),
+            vocabulary,
+            rows,
+            stops,
+            video,
+        )
     if frame_type is FrameType.START_FAILED:
         kind, bound, required, budget, plan_context, message_bytes = (
             _START_FAILED.unpack_from(payload)
@@ -1383,6 +1704,39 @@ def _decode_event(frame: Frame) -> EngineEvent:
         if not json:
             _fatal(IssueCode.LIMIT_EXCEEDED, "status JSON is empty")
         return StatusJsonEvent(correlation_id, json)
+    if frame_type is FrameType.VIDEO_PROGRESS:
+        request_id, phase, step, steps, elapsed, peak = _VIDEO_PROGRESS.unpack(payload)
+        if not request_id or phase not in VideoPhase._value2member_map_:
+            _fatal(
+                IssueCode.INVALID_ENUM_VALUE,
+                "video progress request id or phase is invalid",
+                request_id,
+            )
+        if not steps or step > steps:
+            _fatal(
+                IssueCode.INVALID_COUNT,
+                "video progress steps must be 1 or more, its step at most them",
+                request_id,
+            )
+        return VideoProgressEvent(
+            request_id, VideoPhase(phase), step, steps, elapsed, peak
+        )
+    if frame_type is FrameType.VIDEO_OUTPUT:
+        request_id, output, frames, wall = _VIDEO_OUTPUT.unpack_from(payload)
+        if not request_id or output not in VideoOutputKind._value2member_map_:
+            _fatal(
+                IssueCode.INVALID_ENUM_VALUE,
+                "video output request id or kind is invalid",
+                request_id,
+            )
+        mp4 = payload[_VIDEO_OUTPUT.size :]
+        if not frames or not mp4:
+            _fatal(
+                IssueCode.LIMIT_EXCEEDED,
+                "video output must hold frames and an mp4",
+                request_id,
+            )
+        return VideoOutputEvent(request_id, VideoOutputKind(output), frames, wall, mp4)
     _fatal(IssueCode.UNKNOWN_FRAME_TYPE, "frame type is not a native protocol event")
 
 

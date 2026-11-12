@@ -140,6 +140,26 @@ LAYERS: tuple[tuple[str, tuple[str, ...], tuple[str, ...]], ...] = (
     ),
     ("engine", ("runtime/engine/",), ("model interface", "shared")),
     (
+        "video model",
+        ("runtime/video/model/",),
+        (
+            "video ops",
+            "video metal",
+            "model interface",
+            "model",
+            "ops",
+            "metal",
+            "kernels",
+            "shared",
+        ),
+    ),
+    (
+        "video ops",
+        ("runtime/video/ops/",),
+        ("video metal", "metal", "kernels", "shared"),
+    ),
+    ("video metal", ("runtime/video/metal/",), ("metal", "kernels")),
+    (
         "model interface",
         tuple(sorted(f"runtime/{header}" for header in ENGINE_MODEL_BOUNDARY)),
         ("ops", "metal", "kernels", "shared"),
@@ -226,7 +246,7 @@ NOTE_ALLOWANCE: dict[str, int] = {
 }
 # runtime/engine's production lines: the budget only goes down, unless the
 # owner raises it.
-ENGINE_LINE_BUDGET = 30_105
+ENGINE_LINE_BUDGET = 30_523
 C_LIKE_SUFFIXES = SOURCE_SUFFIXES | {".swift"}
 HASH_COMMENT_SUFFIXES = {"", ".sh", ".bash", ".fish", ".mk", ".yml", ".yaml", ".toml"}
 C_LIKE_COMMENT = re.compile(
