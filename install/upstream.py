@@ -25,7 +25,7 @@ from contextlib import suppress
 from dataclasses import dataclass, replace
 from pathlib import Path
 
-from . import assembly, families, gguf, hub, models
+from . import assembly, families, gguf, hub, models, video
 
 # The tokenizer files an MLX target may supply, linked when present.
 TOKENIZER_FILES = (
@@ -721,6 +721,11 @@ def prepare(selection):
         with hub.as_model_errors(f"cannot install {selection.model}"):
             manifest = models.read_json(target.file("manifest.json"))
         models.refuse_package(selection.model, manifest)
+    if (
+        video.is_source(target.files)
+        or (installed or {}).get("target_format") == families.H3.target_format
+    ):
+        return video.prepare(selection, target, installed)
     if installed is not None and target.revision == installed_commit:
         return _start_installed(selection, target, installed)
     return _install_commit(selection, target, installed)
@@ -1041,14 +1046,16 @@ def assembly_record(model, target, repo, draft, installed=None):
     return record
 
 
-def publish(models_root, link, record, files, *, keep_tower=False):
+def publish(models_root, link, record, files, derive=None, *, keep_tower=False):
     """Publish the assembly of record and files (assembly path -> source
     file) at link, a selection link under models_root, and return it, or
     with keep_tower the assembly link names where that has the commit's
     tower. A file the assembly it replaces records, unchanged since, is not
     read again for its digest (assembly.file_record); any other is read
     before the installation lock is taken, which other installations and
-    starting servers wait for, and its record is taken again under the lock."""
+    starting servers wait for, and its record is taken again under the lock.
+    derive() gives, under the lock, more such files: a derived entry's,
+    which it publishes (assembly.converted)."""
     models_root.mkdir(parents=True, exist_ok=True)
     # One record per linked file, however many assembly paths link it.
     records = _file_records(assembly.recorded(link), set(files.values()))
@@ -1075,6 +1082,9 @@ def publish(models_root, link, record, files, *, keep_tower=False):
             )
             files = files | derived
             records |= _file_records(previous, derived.values())
+        if derived_files := derive and derive():
+            files = files | derived_files
+            records |= _file_records(previous, derived_files.values())
         record["files"] = {name: records[path] for name, path in sorted(files.items())}
         # A new installation requires its pins before it is published; its
         # older pins are retired once it is, in the repositories the

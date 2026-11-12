@@ -242,7 +242,15 @@ class CompletionTests(unittest.TestCase):
         cases = (
             (
                 ["splash", ""],
-                ["serve", "claude", "codex", "opencode", "hermes", "pi"],
+                [
+                    "serve",
+                    "install",
+                    "claude",
+                    "codex",
+                    "opencode",
+                    "hermes",
+                    "pi",
+                ],
             ),
             (["splash", "co"], ["codex"]),
             (
@@ -370,6 +378,25 @@ class CompletionTests(unittest.TestCase):
                 self.assertEqual(
                     shlex.split(result), ["splash", "serve", flag, "local target.gguf"]
                 )
+
+    def test_install_completes_its_spec_file(self):
+        _, directory = self.layout()
+        (self.root / "my spec.json").touch()
+        for shell in bash_paths():
+            with self.subTest(shell=shell):
+                self.assertEqual(
+                    self.bash_complete(
+                        shell,
+                        directory / "splash.bash",
+                        ["splash", "install", "--spec", "my"],
+                        cwd=self.root,
+                    ),
+                    ["my spec.json"],
+                )
+        result = self.shell_tab(directory / "_splash", "splash install --spec my\\ s")
+        self.assertEqual(
+            shlex.split(result), ["splash", "install", "--spec", "my spec.json"]
+        )
 
     @unittest.skipUnless(FISH, "fish is not installed")
     def test_fish_completes_local_model_paths_with_spaces(self):
@@ -604,7 +631,17 @@ class CompletionTests(unittest.TestCase):
         cases = (
             (
                 "splash ",
-                sorted(("serve", "claude", "codex", "opencode", "hermes", "pi")),
+                sorted(
+                    (
+                        "serve",
+                        "install",
+                        "claude",
+                        "codex",
+                        "opencode",
+                        "hermes",
+                        "pi",
+                    )
+                ),
             ),
             ("splash co", ["codex"]),
             ("splash serve --model ", models),
