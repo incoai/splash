@@ -6,12 +6,18 @@
 #define SPLASH_DRAFT_QUERY_ROWS 8u
 #define SPLASH_DRAFT_PROPOSAL_TOKENS 7u
 #define SPLASH_TARGET_VERIFY_ROWS 8u
+// The longest draft block the engine serves (the trained proposal length of
+// the longest compiled draft variant): the whole-block decode tensors and
+// the speculative K/V scratch size for it, while the verify kernels run the
+// ABI's 8-row sub-passes over it.
+#define SPLASH_DRAFT_BLOCK_ROWS_LIMIT 16u
+#define SPLASH_DRAFT_BLOCK_PROPOSALS_LIMIT (SPLASH_DRAFT_BLOCK_ROWS_LIMIT - 1u)
 // The KV ceiling: four times the targets' native window of 262,144 tokens,
 // which holds the most context YaRN serves them
 // (QwenTargetDimensions::yarnContextTokens).
 #define SPLASH_MAXIMUM_CONTEXT_TOKENS 1048576u
 #define SPLASH_SPECULATIVE_SCRATCH_TOKENS                                  \
-  (SPLASH_TARGET_VERIFY_ROWS - 1u)
+  (SPLASH_DRAFT_BLOCK_PROPOSALS_LIMIT)
 #define SPLASH_MAXIMUM_PHYSICAL_KV_TOKENS                                  \
   (SPLASH_MAXIMUM_CONTEXT_TOKENS + SPLASH_SPECULATIVE_SCRATCH_TOKENS)
 #define SPLASH_MAXIMUM_BATCH_WIDTH 4u

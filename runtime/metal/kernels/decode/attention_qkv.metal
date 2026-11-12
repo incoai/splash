@@ -17,7 +17,7 @@ inline void full_qkv_decode_phase(
   constexpr uint Stride = SPLASH_VERIFY_CHUNK_STRIDE;
   uint batch = group.y;
   constexpr ulong kv_lane_stride = ulong(KHeads) * Stride * HeadDim;
-  FullPrefillParams lane_params{Rows, Stride};
+  FullPrefillParams lane_params{Rows, Stride, 0};
   full_qkv_storage_phase<QHeads, KHeads, HeadDim, RotaryPairs, Gated>(
       qkv + ulong(batch) * Rows * PackedStride, q_norm, k_norm,
       rope_cos + ulong(batch) * Rows * RotaryPairs,

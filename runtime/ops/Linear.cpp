@@ -25,17 +25,24 @@ void validate(LinearWorkload w) {
         (w.epilogue == LinearEpilogue::GateUp || w.epilogue == LinearEpilogue::ClampedGateUp))
       throw std::invalid_argument("invalid linear prefill workload");
   } else {
-    if (!w.rows || w.rows % SPLASH_TARGET_VERIFY_ROWS ||
-        w.rows > SPLASH_TARGET_VERIFY_ROWS * SPLASH_MAXIMUM_BATCH_WIDTH ||
+    if (!w.rows || w.rows > SPLASH_TARGET_VERIFY_ROWS * SPLASH_MAXIMUM_BATCH_WIDTH ||
+        (w.rows % SPLASH_TARGET_VERIFY_ROWS && w.rows != 1) ||
         w.epilogue == LinearEpilogue::UpWithGate)
       throw std::invalid_argument("invalid linear decode workload");
   }
 }
 
-LinearWorkload decode(LinearMatrix matrix, uint32_t lanes, LinearEpilogue epilogue) {
+LinearWorkload decode(LinearMatrix matrix, uint32_t lanes, LinearEpilogue epilogue, uint32_t rows) {
   if (!lanes || lanes > SPLASH_MAXIMUM_BATCH_WIDTH)
     throw std::invalid_argument("invalid linear decode batch width");
-  return {matrix, lanes * SPLASH_TARGET_VERIFY_ROWS, LinearPhase::Decode, epilogue};
+  // rows 0 keeps the ABI's block: a whole-block head passes its own count.
+  // An initial selection's head runs one row per lane; a whole block's
+  // carries lanes x the block's rows. Both are whole rows per lane.
+  if (!rows)
+    rows = lanes * SPLASH_TARGET_VERIFY_ROWS;
+  if (rows % lanes)
+    throw std::invalid_argument("invalid linear decode rows");
+  return {matrix, rows, LinearPhase::Decode, epilogue};
 }
 
 // LinearScratch::rotated bytes of `rows` bf16 rows of `width` inputs.
@@ -182,8 +189,8 @@ LinearPlan Linear::plan(LinearWorkload w, const Projection &p, const Projection 
 }
 
 LinearPlan Linear::decodePlan(const Projection &p, uint32_t lanes, LinearEpilogue epilogue,
-                              const Projection *gate) const {
-  return plan(decode({p.outputSize, p.inputSize}, lanes, epilogue), p, gate);
+                              const Projection *gate, uint32_t rows) const {
+  return plan(decode({p.outputSize, p.inputSize}, lanes, epilogue, rows), p, gate);
 }
 LinearPlan Linear::prefillPlan(const Projection &p, uint32_t rows, LinearEpilogue epilogue) const {
   return plan({{p.outputSize, p.inputSize}, rows, LinearPhase::Prefill, epilogue}, p);
@@ -195,7 +202,8 @@ LinearScratchSize Linear::decodeScratchSize(ProjectionShape shape) const {
     for (const auto epilogue : {LinearEpilogue::None, LinearEpilogue::Residual, LinearEpilogue::GateUp,
                                 LinearEpilogue::ClampedGateUp})
       bound.include(
-          ggufDecodeScratchSize(decode({shape.outputSize, shape.inputSize}, lanes, epilogue), shape.registerFormats));
+          ggufDecodeScratchSize(decode({shape.outputSize, shape.inputSize}, lanes, epilogue, 0),
+                                shape.registerFormats));
   // Decode plans store at most every lane's rows.
   if (shape.rotated) bound.rotated = rotatedBytes(shape.inputSize, kMaximumDecodeTileRows);
   return bound;

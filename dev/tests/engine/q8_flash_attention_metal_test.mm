@@ -88,18 +88,22 @@ const std::vector<Shape> kShapes = [] {
 using splash::test::require;
 
 void testContract() {
+  // The speculative scratch holds the longest served block's proposals past
+  // the logical ceiling (SPLASH_DRAFT_BLOCK_PROPOSALS_LIMIT); the boundary
+  // is the last committed position whose whole block fits it.
+  const uint32_t scratch = SPLASH_DRAFT_BLOCK_PROPOSALS_LIMIT;
   ChunkedPrefillParams finalCycle{
-      splash::kv::kMaximumLogicalTokens - 1, kRows, kStride,
-      (splash::kv::kMaximumPhysicalTokens + kPageTokens - 1) / kPageTokens, {}};
+      splash::kv::kMaximumLogicalTokens + scratch - kRows, kRows, kStride,
+      (splash::kv::kMaximumPhysicalTokens + kPageTokens - 1) / kPageTokens, 0, {}};
   require(chunkedPrefillValidationError(finalCycle).empty(),
           "the final cycle's verification rows exceeded physical KV scratch");
   require(verifyAttentionSplits(0) == kVerifySplits &&
               verifyAttentionSplits(16 * 1024) == kVerifySplits + 1 &&
               verifyAttentionSplits(131072) == kVerifyMaximumSplits,
           "verify split scaling departed from one split per 16 visible pages");
-  ++finalCycle.committed_tokens;
+  finalCycle.committed_tokens += 1;
   require(chunkedPrefillValidationError(finalCycle) == "context_out_of_range",
-          "physical KV scratch exceeded its fixed seven-row allowance");
+          "physical KV scratch exceeded its block-row allowance");
 }
 
 id<MTLBuffer> makeBuffer(id<MTLDevice> device, uint64_t bytes) {
@@ -543,7 +547,7 @@ Dispatch dispatch(id<MTLDevice> device, id<MTLCommandQueue> queue,
   std::array<VerifyAttentionParams, 4> params{};
   for (uint32_t lane = 0; lane < params.size(); ++lane)
     params[lane] = {data.params.committed_tokens, data.params.page_table_entries, data.params.kv, splits, splits,
-                    blocks.stride, blocks.stride ? kQsaJunkLists + lane : 0};
+                    blocks.stride, blocks.stride ? kQsaJunkLists + lane : 0, 0};
   id<MTLCommandBuffer> command = [queue commandBuffer];
   id<MTLComputeCommandEncoder> encoder = [command computeCommandEncoder];
   [encoder setComputePipelineState:split];
@@ -917,7 +921,7 @@ void checkReduce(id<MTLDevice> device, id<MTLCommandQueue> queue,
   const uint32_t pages = splits * splitTokens / 32;
   id<MTLBuffer> verify;
   if (activeRows == kRows) {
-    const VerifyAttentionParams params{committed, pages, {1, 0}, splits, splits, 0, 0};
+    const VerifyAttentionParams params{committed, pages, {1, 0}, splits, splits, 0, 0, 0};
     verify = reduce("verify", params);
     check(verify);
   }

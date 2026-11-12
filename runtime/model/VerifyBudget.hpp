@@ -21,8 +21,8 @@ namespace splash::model {
 
 class VerifyBudget final {
 public:
-  static constexpr uint32_t kPositions = SPLASH_DRAFT_PROPOSAL_TOKENS;
-  static constexpr uint32_t kBlockRows = SPLASH_DRAFT_QUERY_ROWS;
+  static constexpr uint32_t kPositions = SPLASH_DRAFT_BLOCK_PROPOSALS_LIMIT;
+  static constexpr uint32_t kBlockRows = SPLASH_DRAFT_BLOCK_ROWS_LIMIT;
   static constexpr uint32_t kLanes = SPLASH_MAXIMUM_BATCH_WIDTH;
   static constexpr uint32_t kRefitCycles = 64;
   static constexpr uint32_t kLabels = 4096;

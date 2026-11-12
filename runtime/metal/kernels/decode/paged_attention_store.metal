@@ -9,8 +9,10 @@ inline void splash_store_verify_phase(
     constant SplashChunkedPrefillParams *params,
     threadgroup float *maxima, uint group, uint thread_index, uint simd_lane,
     uint simd_group) {
-  constexpr uint Rows = SPLASH_TARGET_VERIFY_ROWS;
-  constexpr uint GroupsPerLane = 2 * Rows * KVHeads;
+  // Every lane's sub-pass runs the same row count, so the grid-wide rows
+  // come from the first lane's parameters.
+  const uint Rows = params[0].chunk_tokens;
+  const uint GroupsPerLane = 2 * Rows * KVHeads;
   uint batch = group / GroupsPerLane;
   uint local_group = group % GroupsPerLane;
   constant SplashChunkedPrefillParams &lane_params = params[batch];

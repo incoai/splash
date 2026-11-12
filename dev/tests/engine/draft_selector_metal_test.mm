@@ -353,6 +353,7 @@ void confidenceIgnoresDraws(MetalBackend &backend) {
 // its maximum.
 void verifyRowsChoice(MetalBackend &backend) {
   Random random(0xb0d9e7);
+  const DraftSelector selector(4096, SPLASH_DRAFT_CANDIDATES);
   MetalBuffer confidence = allocate(backend, kLanes * kPositions * sizeof(float));
   MetalBuffer verifyRows = allocate(backend, kLanes * sizeof(uint32_t));
   for (uint32_t trial = 0; trial < 400; ++trial) {
@@ -380,7 +381,7 @@ void verifyRowsChoice(MetalBackend &backend) {
     for (uint32_t &maximum : maximumRows)
       maximum = 1 + random.next() % kRows;
     CommandGraph graph;
-    DraftSelector::addVerifyRows(graph, confidence, verifyRows, model, maximumRows);
+    selector.addVerifyRows(graph, confidence, verifyRows, model, maximumRows);
     static_cast<void>(backend.submitCommandAsync(graph.dispatches()).wait());
     const auto *chosen = static_cast<const uint32_t *>(verifyRows.contents());
     if (model.everyRow) {
@@ -496,11 +497,11 @@ void bufferExtents(MetalBackend &backend) {
   const MetalBuffer verifyRows = allocate(backend, uint64_t{lanes} * sizeof(uint32_t));
   requireExtent(backend, buffers.confidence, uint64_t{lanes} * kPositions * 4, 4, "proposal confidence",
                 [&](CommandGraph &graph, const MetalBuffer &buffer) {
-                  DraftSelector::addVerifyRows(graph, buffer, verifyRows, VerifyRowsModel{}, maximumRows);
+                  selector.addVerifyRows(graph, buffer, verifyRows, VerifyRowsModel{}, maximumRows);
                 });
   requireExtent(backend, verifyRows, uint64_t{lanes} * 4, 4, "verify rows",
                 [&](CommandGraph &graph, const MetalBuffer &buffer) {
-                  DraftSelector::addVerifyRows(graph, buffers.confidence, buffer, VerifyRowsModel{}, maximumRows);
+                  selector.addVerifyRows(graph, buffers.confidence, buffer, VerifyRowsModel{}, maximumRows);
                 });
 }
 
@@ -534,12 +535,12 @@ void invalidRequests(MetalBackend &backend) {
           "invalid draft selector batch", "anchors without a policy each were accepted");
   const MetalBuffer verifyRows = allocate(backend, kLanes * sizeof(uint32_t));
   const MetalBuffer confidence = allocate(backend, kLanes * kPositions * sizeof(float));
-  rejects([&] { DraftSelector::addVerifyRows(graph, confidence, verifyRows, {}, {}); },
+  rejects([&] { selector.addVerifyRows(graph, confidence, verifyRows, {}, {}); },
           "invalid draft verify rows batch", "verify rows of no lane were encoded");
-  rejects([&] { DraftSelector::addVerifyRows(graph, confidence, verifyRows, {}, std::array<uint32_t, 5>{8, 8, 8, 8, 8}); },
+  rejects([&] { selector.addVerifyRows(graph, confidence, verifyRows, {}, std::array<uint32_t, 5>{8, 8, 8, 8, 8}); },
           "invalid draft verify rows batch", "verify rows of five lanes were encoded");
   for (const uint32_t maximum : {0U, kRows + 1})
-    rejects([&] { DraftSelector::addVerifyRows(graph, confidence, verifyRows, {}, std::array{maximum}); },
+    rejects([&] { selector.addVerifyRows(graph, confidence, verifyRows, {}, std::array{maximum}); },
             "invalid draft verify rows maximum", "a maximum of verify rows outside a block was accepted");
   VerifyRowsModel valid;
   valid.everyRow = false;
@@ -556,12 +557,12 @@ void invalidRequests(MetalBackend &backend) {
                                        std::pair{intercept, "invalid draft verify rows model"},
                                        std::pair{zero, "invalid draft verify rows cost"},
                                        std::pair{negative, "invalid draft verify rows cost"}})
-    rejects([&] { DraftSelector::addVerifyRows(graph, confidence, verifyRows, model, two); }, message,
+    rejects([&] { selector.addVerifyRows(graph, confidence, verifyRows, model, two); }, message,
             "an invalid verify rows model was accepted");
   require(graph.empty(), "invalid draft selector request encoded a graph");
   // Costs outside the totals the lanes may verify are not read.
   CommandGraph encoded;
-  DraftSelector::addVerifyRows(encoded, confidence, verifyRows, valid, two);
+  selector.addVerifyRows(encoded, confidence, verifyRows, valid, two);
   require(!encoded.empty(), "a valid verify rows model was not encoded");
 }
 

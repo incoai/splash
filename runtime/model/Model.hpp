@@ -632,7 +632,7 @@ struct ExecutionLimits final {
   static constexpr uint32_t speculativeScratchTokens = SPLASH_SPECULATIVE_SCRATCH_TOKENS;
   // One step emits at most its retained verify rows plus a terminal anchor
   // (a stop token or the last budgeted token) that never receives a KV row.
-  static constexpr uint32_t maximumStepTokens = targetVerifyRows + 1;
+  static constexpr uint32_t maximumStepTokens = SPLASH_DRAFT_BLOCK_ROWS_LIMIT + 1;
   // Direct finite-option scoring (SemIf/Jev): a score-only request carries
   // 2..255 distinct token ids and returns their raw final-position logits.
   static constexpr uint32_t minimumScoreOptions = 2;

@@ -211,12 +211,13 @@ struct Fixture final {
   void advance(std::span<const uint32_t> pending) {
     std::swap(current, next);
     for (uint32_t lane = 0; lane < kMaxLanes; ++lane)
-      tapeLanes[lane] = {tapeLanes[lane].stepSlot, tapeLanes[lane].pendingSlot, pending[lane]};
+      tapeLanes[lane] = {tapeLanes[lane].stepSlot, tapeLanes[lane].pendingSlot,
+                         pending[lane], 0, 0};
   }
 
   GdnDecodeBuffers decodeBuffers(uint32_t layer) const {
-    return {packedLayer[layer], convWeights, current, next, tape, tapeLanes,
-            decayWeights, timeBias, mixerNorm, hidden};
+    return {packedLayer[layer], convWeights, current, next, tape, {},
+            tapeLanes, decayWeights, timeBias, mixerNorm, hidden};
   }
 
   // Row `token` of lane `lane` in layer `layer` of the packed projection.
@@ -769,6 +770,7 @@ void replayAcrossBatches(MetalBackend &backend, const GdnShape &shape, bool floa
         auto &tape = fixture->tapeLanes[stateLane];
         std::swap(tape.pendingSlot, tape.stepSlot);
         tape.pendingRows = retained;
+        tape.secondRows = 0;
       }
     }
   }
@@ -1077,12 +1079,12 @@ void rejectsInvalid(MetalBackend &backend) {
   // More rows than a step's pending; a step's tape misaligned, or overlapping
   // the pending tape of its own lane or of another, or another lane's step.
   const uint64_t tape = fixture.tapeBytes;
-  for (const std::array<GdnTapeLane, 2> lanes :
-       {std::array{GdnTapeLane{0, tape, kRows + 1}, GdnTapeLane{2 * tape, 3 * tape, 0}},
-        std::array{GdnTapeLane{0, tape + 8, 0}, GdnTapeLane{2 * tape, 3 * tape, 0}},
-        std::array{GdnTapeLane{0, tape - 16, 0}, GdnTapeLane{2 * tape, 3 * tape, 0}},
-        std::array{GdnTapeLane{0, tape, 0}, GdnTapeLane{2 * tape, 16, 0}},
-        std::array{GdnTapeLane{0, tape, 0}, GdnTapeLane{3 * tape, tape + 16, 0}}})
+  for (const auto &lanes :
+       {std::array{GdnTapeLane{0, tape, kRows + 1, 0, 0}, GdnTapeLane{2 * tape, 3 * tape, 0, 0, 0}},
+        std::array{GdnTapeLane{0, tape + 8, 0, 0, 0}, GdnTapeLane{2 * tape, 3 * tape, 0, 0, 0}},
+        std::array{GdnTapeLane{0, tape - 16, 0, 0, 0}, GdnTapeLane{2 * tape, 3 * tape, 0, 0, 0}},
+        std::array{GdnTapeLane{0, tape, 0, 0, 0}, GdnTapeLane{2 * tape, 16, 0, 0, 0}},
+        std::array{GdnTapeLane{0, tape, 0, 0, 0}, GdnTapeLane{3 * tape, tape + 16, 0, 0, 0}}})
     rejects(
         [&] {
           auto buffers = fixture.decodeBuffers(0);

@@ -41,6 +41,9 @@ class DraftAttentionPlan final {
 public:
   [[nodiscard]] DraftAttentionShape shape() const noexcept { return shape_; }
   [[nodiscard]] uint32_t lanes() const noexcept { return lanes_; }
+  // The rows a cycle drafts (the compiled variant's block; the ABI's 8
+  // unless the served draft's variant states more).
+  [[nodiscard]] uint32_t rows() const noexcept { return rows_; }
   // The compiled draft geometry the plan runs on (metal/abi/DraftAttention.h).
   [[nodiscard]] const SplashDraftVariant &variant() const noexcept {
     return *variant_;
@@ -49,12 +52,13 @@ public:
 
 private:
   DraftAttentionPlan(DraftAttentionShape shape, const SplashDraftVariant &variant,
-                     uint32_t lanes)
-      : shape_(shape), variant_(&variant), lanes_(lanes) {}
+                     uint32_t lanes, uint32_t rows)
+      : shape_(shape), variant_(&variant), lanes_(lanes), rows_(rows) {}
 
   DraftAttentionShape shape_;
   const SplashDraftVariant *variant_;
   uint32_t lanes_;
+  uint32_t rows_;
 
   friend class DraftAttention;
 };
@@ -91,7 +95,8 @@ struct DraftDecodeAttentionBuffers final {
 class DraftAttention final {
 public:
   [[nodiscard]] static DraftAttentionPlan plan(DraftAttentionShape shape,
-                                               uint32_t lanes);
+                                               uint32_t lanes,
+                                               uint32_t rows = SPLASH_DRAFT_QUERY_ROWS);
 
   static void addConvolution(metal::CommandGraph &graph,
                              DraftConvolutionBuffers buffers,

@@ -1035,11 +1035,15 @@ void run(const std::string &metallib) {
     // its state, which neither a snapshot, a restore nor a prefill step reads.
     storage.updateLengths(0, {2'048, 0, 2'048, 2'048});
     const uint32_t parity = storage.metadata(0).activeParity;
-    for (const uint32_t retained : {0U, model::ExecutionLimits::targetVerifyRows + 1})
-      rejects([&] { storage.swapDecodeParity(0, retained); }, "a decode step retains one to all of its rows",
+    // The macro's name collides with a member in this scope; spell the limit.
+    for (const uint32_t retained : {0U, 16u + 1u})
+      rejects([&] { storage.swapDecodeParity(0, retained, 0, 0, 0); },
+              "a decode step retains one to all of its rows",
               "a decode step retained no rows or more than its rows");
-    storage.swapDecodeParity(0, 3);
-    require(storage.metadata(0).pendingRows == 3 && storage.metadata(0).activeParity != parity,
+    storage.swapDecodeParity(0, 3, 0, 0, 0);
+    require(storage.metadata(0).pendingRows == 3 && storage.metadata(0).activeParity != parity &&
+                storage.metadata(0).pendingRowsSecond == 0 &&
+                storage.metadata(0).tapePending == 0,
             "a decode step's swap lost its retained rows");
     rejects([&] { static_cast<void>(storage.snapshot(0)); }, "Qwen lane state has decoded rows pending",
             "a snapshot read a cell without its retained rows");
@@ -1049,7 +1053,7 @@ void run(const std::string &metallib) {
             "Qwen lane state has decoded rows pending", "a restore overwrote a cell with pending rows");
     rejects([&] { storage.swapParity(0); }, "Qwen lane state has decoded rows pending",
             "a prefill step followed a decode step's pending rows");
-    storage.swapDecodeParity(0, model::ExecutionLimits::targetVerifyRows);
+    storage.swapDecodeParity(0, model::ExecutionLimits::targetVerifyRows, 0, 0, 0);
     require(storage.metadata(0).pendingRows == model::ExecutionLimits::targetVerifyRows &&
                 storage.metadata(0).activeParity == parity,
             "the next decode step's swap did not take its own retained rows");

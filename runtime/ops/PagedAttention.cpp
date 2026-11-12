@@ -382,7 +382,7 @@ void PagedAttention::addPrefillProjection(
   requireBytes(queries, staging.rowBytes(queryHeads / layout.kvHeads, layout.headDimension), "attention query");
   requireBytes(chunkKeys, staging.rowBytes(1, layout.headDimension), "attention key");
   requireBytes(chunkValues, staging.valueBytes(layout.headDimension), "attention value");
-  const FullPrefillParams params{tokens, stride};
+  const FullPrefillParams params{tokens, stride, 0};
   graph.add(qkNormKernel(projectionKernel("prefill", kernel, variant), queryNorm, keyNorm, layout.headDimension),
             projectionBindings(kernel, variant, tokens, std::move(packed), queryNorm, keyNorm, std::move(ropeCos),
                                std::move(ropeSin), std::move(queries), std::move(chunkKeys),
@@ -401,7 +401,7 @@ void PagedAttention::addPrefillGate(
                Staging{layout.kvHeads, stride, tokens}.rowBytes(queryHeads / layout.kvHeads, layout.headDimension),
                "attention row");
   requireBytes(hidden, uint64_t{tokens} * queryHeads * layout.headDimension * 2, "attention hidden");
-  const FullPrefillParams params{tokens, stride};
+  const FullPrefillParams params{tokens, stride, 0};
   const metal::DispatchSize groups{gateGroups(tokens, queryHeads, layout.headDimension), 1, 1};
   if (!kernel.gated) {
     graph.add(kernelName("prefill", "gather", kernel.suffix), {std::move(attention), std::move(hidden)}, params,
@@ -474,7 +474,7 @@ kv::ChunkedPrefillParams PagedAttention::prefillParams(
     throw std::overflow_error("KV logical position exceeds kernel ABI");
   kv::ChunkedPrefillParams params{static_cast<uint32_t>(logicalPosition),
                                   chunkTokens, chunkStride, pageTableEntries,
-                                  {}};
+                                  0, {}};
   const std::string_view error = kv::chunkedPrefillValidationError(params);
   if (!error.empty())
     throw std::invalid_argument(std::string(error));
@@ -482,9 +482,13 @@ kv::ChunkedPrefillParams PagedAttention::prefillParams(
 }
 
 kv::ChunkedPrefillParams PagedAttention::verifyParams(uint64_t logicalPosition,
-                                                      uint32_t pageTableEntries) {
-  return prefillParams(logicalPosition, kv::kVerifyRows,
-                       kv::kVerifyChunkStride, pageTableEntries);
+                                                      uint32_t pageTableEntries,
+                                                      uint32_t rowBase) {
+  kv::ChunkedPrefillParams params = prefillParams(logicalPosition, kv::kVerifyRows,
+                                                  kv::kVerifyChunkStride,
+                                                  pageTableEntries);
+  params.row_base = rowBase;
+  return params;
 }
 
 void PagedAttention::addPrefillStore(
@@ -588,7 +592,7 @@ void PagedAttention::addVerify(metal::CommandGraph &graph, SplashKvLayer layer,
     stores[lane].kv = layer;
     attention[lane] = {chunk.committed_tokens, chunk.page_table_entries, layer,
                        plan.laneSplits[lane], plan.splits, blocks.stride,
-                       blocks.list + lane};
+                       blocks.list + lane, chunk.row_base};
   }
   const auto tables = laneBindings(buffers.pageTables.first(plan.lanes));
   std::vector<metal::MetalBuffer> store{buffers.chunkKeys, buffers.chunkValues};

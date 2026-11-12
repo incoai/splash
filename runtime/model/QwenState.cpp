@@ -430,13 +430,25 @@ void QwenStateStorage::swapParity(uint32_t index) {
   current.metadata.activeParity ^= 1;
 }
 
-void QwenStateStorage::swapDecodeParity(uint32_t index, uint32_t retainedRows) {
+void QwenStateStorage::swapDecodeParity(uint32_t index, uint32_t retainedRows,
+                                        uint32_t secondRows, uint32_t stepSlot,
+                                        uint32_t secondSlot) {
   Lane &current = lane(index);
   requireAssigned(current);
-  if (!retainedRows || retainedRows > ExecutionLimits::targetVerifyRows)
+  if (!retainedRows || retainedRows > SPLASH_DRAFT_BLOCK_ROWS_LIMIT ||
+      secondRows >= SPLASH_DRAFT_BLOCK_ROWS_LIMIT || stepSlot > 2 ||
+      secondSlot > 2)
     throw std::invalid_argument("a decode step retains one to all of its rows");
   current.metadata.activeParity ^= 1;
-  current.metadata.pendingRows = retainedRows;
+  current.metadata.tapePending = stepSlot;
+  current.metadata.pendingRows = std::min(retainedRows, ExecutionLimits::targetVerifyRows);
+  current.metadata.tapePendingSecond = secondSlot;
+  current.metadata.pendingRowsSecond =
+      retainedRows > ExecutionLimits::targetVerifyRows
+          ? retainedRows - ExecutionLimits::targetVerifyRows
+          : 0;
+  if (current.metadata.pendingRowsSecond != secondRows)
+    throw std::invalid_argument("a decode step's second segment contradicts its rows");
 }
 
 std::shared_ptr<const QwenCompositeState>
@@ -666,7 +678,7 @@ void QwenStateStorage::requireAssigned(const Lane &current) {
 
 void QwenStateStorage::requireCommitted(const Lane &current) {
   requireAssigned(current);
-  if (current.metadata.pendingRows)
+  if (current.metadata.pendingRows || current.metadata.pendingRowsSecond)
     throw std::logic_error("Qwen lane state has decoded rows pending");
 }
 

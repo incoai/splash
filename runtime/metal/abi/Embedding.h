@@ -10,10 +10,14 @@
 struct VerifyInputBatchParams {
   uint32_t vocabulary;
   uint32_t rows;
+  // The batch's lanes, for the sub-pass-ordered copy of the same rows: a
+  // 16-row verify's target layers run two 8-row sub-passes, each gathering
+  // its rows from a contiguous slice.
+  uint32_t lanes;
 };
 
-static_assert(sizeof(VerifyInputBatchParams) == 8,
-              "Verify input parameters are 8 bytes on both sides");
+static_assert(sizeof(VerifyInputBatchParams) == 12,
+              "Verify input parameters are 12 bytes on both sides");
 
 struct DraftMaskRowsParams {
   uint32_t width;

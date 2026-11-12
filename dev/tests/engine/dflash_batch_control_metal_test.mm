@@ -119,6 +119,8 @@ void runWidth(MetalBackend &backend, uint32_t width,
   }
 
   AcceptBatchParams params{};
+  params.proposal_tokens = kProposals;
+  params.verify_rows = kRows;
   std::copy(remainingReference.begin(), remainingReference.end(),
             std::begin(params.remaining));
   std::ranges::copy(stops.ids, params.stop_tokens);
@@ -230,7 +232,8 @@ void verifyInputExtents(MetalBackend &backend) {
   constexpr uint32_t lanes = 3, vocabulary = 1003;
   const std::array buffers{shared(backend, lanes * kRows * 4, "draft-input"),
                            shared(backend, lanes * kProposals * 4, "proposed"),
-                           shared(backend, lanes * kRows * 4, "verify-input")};
+                           shared(backend, lanes * kRows * 4, "verify-input"),
+                           shared(backend, lanes * kRows * 4, "verify-input passes")};
   for (const auto &[index, bytes, what] :
        {std::tuple{size_t{0}, uint64_t{(lanes - 1) * kRows + 1} * 4, "draft input token"},
         std::tuple{size_t{1}, uint64_t{lanes * kProposals} * 4, "proposed token"},
@@ -238,7 +241,7 @@ void verifyInputExtents(MetalBackend &backend) {
     requireExtent(backend, buffers[index], bytes, 4, what, [&](CommandGraph &graph, const MetalBuffer &view) {
       auto changed = buffers;
       changed[index] = view;
-      Embedding::addVerifyInput(graph, changed[0], changed[1], changed[2], vocabulary, lanes,
+      Embedding::addVerifyInput(graph, changed[0], changed[1], changed[2], changed[3], vocabulary, lanes,
                                 SPLASH_TARGET_VERIFY_ROWS);
     });
 }

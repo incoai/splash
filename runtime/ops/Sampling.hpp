@@ -149,8 +149,13 @@ struct AcceptanceBuffers final {
 class Sampling final {
 public:
   // The draft's kept candidates the acceptance and the draw read: the
-  // shipped drafts keep 16, Ripple's 32.
-  explicit Sampling(uint32_t vocabulary, uint32_t draftCandidates);
+  // shipped drafts keep 16, Ripple's 32. `verifyRows` is the served draft's
+  // block (the rows a cycle drafts and the target verifies): the shipped
+  // drafts' 8, a 16-row variant's 16.
+  explicit Sampling(uint32_t vocabulary, uint32_t draftCandidates,
+                    uint32_t verifyRows = SPLASH_TARGET_VERIFY_ROWS);
+  [[nodiscard]] uint32_t verifyRows() const noexcept { return verifyRows_; }
+  [[nodiscard]] uint32_t proposalTokens() const noexcept { return verifyRows_ - 1; }
 
   // Exact scratch/output bytes for the fixed precompiled sampling ABI.
   // Counts may cover one lane or a batch of lanes; the operator owns sharding.
@@ -241,6 +246,9 @@ private:
   uint32_t vocabulary_ = 0;
   uint32_t draftCandidates_ = SPLASH_DRAFT_CANDIDATES;
   uint32_t maskWords_ = 0;
+  // The served draft's block: the rows a cycle drafts and the target
+  // verifies (the shipped drafts' 8, a 16-row variant's 16).
+  uint32_t verifyRows_ = SPLASH_TARGET_VERIFY_ROWS;
 };
 
 } // namespace splash::ops

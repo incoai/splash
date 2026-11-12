@@ -516,7 +516,8 @@ int main(int argc, char **argv) {
       // Every row's head, so the comparison holds all four positions.
       for (uint32_t row = 0; row < kRows; ++row)
         ops::RowCopy::add(graph, finalHidden[0], {row, kHidden, 0}, headInput, {row, kHidden, 0}, 1, kHidden);
-      target->addHeadBatch(graph, headInput, finalHidden0, logitsBuffer, 1, decodeArena.linearScratch());
+      target->addHeadBatch(graph, headInput, finalHidden0, logitsBuffer, 1, kVerifyRows,
+                           decodeArena.linearScratch());
       static_cast<void>(backend.submitCommandAsync(graph.dispatches()).wait());
       logits = logitsBuffer;
     });

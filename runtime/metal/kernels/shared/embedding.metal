@@ -49,7 +49,8 @@ kernel void verify_input_tokens(
     device const uint *draft_input [[buffer(0)]],
     device const uint *draft_tokens [[buffer(1)]],
     device uint *verify_input [[buffer(2)]],
-    constant VerifyInputBatchParams &params [[buffer(3)]],
+    device uint *verify_input_passes [[buffer(3)]],
+    constant VerifyInputBatchParams &params [[buffer(4)]],
     uint index [[thread_position_in_grid]]) {
   uint batch = index / params.rows;
   uint row = index % params.rows;
@@ -57,6 +58,11 @@ kernel void verify_input_tokens(
                    ? draft_input[batch * params.rows]
                    : draft_tokens[batch * (params.rows - 1u) + row - 1];
   verify_input[index] = min(token, params.vocabulary - 1u);
+  // The same rows in sub-pass order: row r of lane b is the r / 8-th
+  // sub-pass's row r % 8, at that sub-pass's slice of the batch.
+  const uint sub = SPLASH_TARGET_VERIFY_ROWS;
+  verify_input_passes[(row / sub) * params.lanes * sub + batch * sub +
+                      row % sub] = min(token, params.vocabulary - 1u);
 }
 
 // Each lane's mask rows of its draft input, rows 1 to params.rows - 1 (the

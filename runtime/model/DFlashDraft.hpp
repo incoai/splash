@@ -278,6 +278,8 @@ public:
                     const ops::DraftSelectorBuffers &buffers,
                     std::span<const uint32_t> anchors,
                     std::span<const ops::SamplingPolicy> policies) const;
+  [[nodiscard]] const ops::DraftSelector &selector() const noexcept { return selector_; }
+  [[nodiscard]] uint32_t rows() const noexcept { return weights_.layout.rows; }
   // Sets each of `lanes` lanes' mask rows of the draft input `rows` (all but
   // its anchor's, row 0 of its draftQueryRows) to the mask embedding the
   // checkpoint ships; without one they keep the target table's row.

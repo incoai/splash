@@ -12,6 +12,7 @@
 #include "ops/MoE.hpp"
 #include "ops/Normalization.hpp"
 #include "ops/PagedAttention.hpp"
+#include "ops/RowCopy.hpp"
 
 #include <algorithm>
 #include <array>
@@ -336,6 +337,9 @@ struct QwenTargetVerifyBuffers final {
   metal::MetalBuffer ropeSin;
   metal::MetalBuffer ropeInverseFrequencies;
   metal::MetalBuffer capturedTargetHidden;
+  // The lanes' whole-block rows of the last layer's output, which the
+  // sub-passes' assemblies build for a 16-row block's head.
+  metal::MetalBuffer headInput;
   metal::MetalBuffer finalHidden;
   metal::MetalBuffer logits;
   metal::MetalBuffer denseGateScratch;
@@ -489,23 +493,33 @@ public:
   virtual void prepareVerifyLane(uint32_t lane, uint64_t position, const QwenTargetRequest &request);
   // A verify's layers and head over `lanes` lanes, whose blocks on Index
   // pages it reads through `spilled` (the command's SpilledKvReads).
+  // Verifies one sub-pass of the lanes' blocks: the pass's rows are
+  // chunks[lane].row_base..+8 of each lane's whole block of `blockRows`
+  // rows (the served draft's; 8 makes the pass the whole block, which the
+  // shipped drafts run). The pass's rows end in buffers.headInput, scattered
+  // into the lanes' whole-block rows; the pass that completes the block
+  // assembles the head's input and runs it over all blockRows rows.
   virtual void addVerify(
       metal::CommandGraph &graph, QwenTargetVerifyBuffers buffers,
       const kv::PageStorage &kv, SpilledKvReads &spilled,
       std::span<const kv::ChunkedPrefillParams> chunks,
-      uint32_t lanes) const = 0;
+      uint32_t lanes, uint32_t blockRows = SPLASH_TARGET_VERIFY_ROWS) const = 0;
   // The head over `lanes` lanes of targetVerifyRows rows of the last layer's
   // output, as verify ends: one sweep of the vocabulary projection for every
   // lane.
+  // The head over `rows` rows of `lanes` lanes: a verify's whole block
+  // (lanes x blockRows) or an initial selection's one row per lane.
   virtual void addHeadBatch(metal::CommandGraph &graph, metal::MetalBuffer hidden,
                             metal::MetalBuffer finalHidden, metal::MetalBuffer logits,
-                            uint32_t lanes, ops::LinearScratch scratch) const = 0;
+                            uint32_t lanes, uint32_t rows,
+                            ops::LinearScratch scratch) const = 0;
   // The verify input tokens addEmbedding then gathers: each lane's anchor,
   // row 0 of its draft input, and the draft's proposals; then the inputs the
   // target makes of them itself.
   virtual void addVerifyInput(metal::CommandGraph &graph, metal::MetalBuffer draftInput,
                               metal::MetalBuffer proposals,
-                              metal::MetalBuffer verifyInput, uint32_t lanes,
+                              metal::MetalBuffer verifyInput,
+                              metal::MetalBuffer verifyInputPasses, uint32_t lanes,
                               uint32_t rows) const;
   virtual void addEmbedding(metal::CommandGraph &graph, metal::MetalBuffer tokens,
                             metal::MetalBuffer hidden, uint32_t rows) const;
@@ -565,6 +579,10 @@ protected:
     std::optional<ops::MoePlan> moe{};
     uint32_t gdnLayer = 0;
     uint32_t attentionLayer = 0;
+    // The block row this pass's first row is, and the whole block's rows
+    // (the served draft's), which the captures and the head scatter into.
+    uint32_t rowBase = 0;
+    uint32_t blockRows = SPLASH_TARGET_VERIFY_ROWS;
   };
 
   // Where a mixer's output projection writes: `rows`, adding the projection
@@ -657,12 +675,14 @@ protected:
                       BlockOutput output, const ops::AttentionBlocks &blocks = {}) const;
   // The input the decode plan of `projection` over `lanes` lanes reads, a
   // table its producer writes or plain rows.
-  [[nodiscard]] ops::LinearInput decodeInput(const ops::Projection &projection, uint32_t lanes) const;
+  [[nodiscard]] ops::LinearInput decodeInput(const ops::Projection &projection, uint32_t lanes,
+                                             uint32_t rows = 0) const;
   // A decode projection over `lanes` lanes through its own plan; `prepared`
-  // describes the table its producer wrote for the plan's input.
+  // describes the table its producer wrote for the plan's input. `rows`
+  // overrides the plan's rows (a whole-block head's lanes x blockRows).
   void addDecodeProjection(metal::CommandGraph &graph, metal::MetalBuffer input, const ops::Projection &projection,
                            metal::MetalBuffer output, uint32_t lanes, ops::LinearScratch scratch,
-                           ops::PreparedInput prepared = {}) const;
+                           ops::PreparedInput prepared = {}, uint32_t rows = 0) const;
   // The FFNs of a layer whose residual is one row of hiddenSize values: each
   // reads the RMS norm `norm` of the mixer's `residual` rows and adds its
   // output to them into `output`. A dense SwiGLU, in a prefill on the
@@ -682,13 +702,15 @@ protected:
   // `finalNorm`, into `finalHidden`, as addHeadBatch takes them.
   void addNormalizedHead(metal::CommandGraph &graph, const ops::NormWeights &finalNorm, metal::MetalBuffer hidden,
                          metal::MetalBuffer finalHidden, metal::MetalBuffer logits, uint32_t lanes,
-                         ops::LinearScratch scratch) const;
+                         uint32_t rows, ops::LinearScratch scratch) const;
   // Copies `rows` rows of a layer's output rows, from row `sourceRow` of
   // `output`, into capture slot `slot` of the captured hidden rows from row
   // `destinationRow`: the draft's capture of a layer whose output is one row
-  // of hiddenSize values.
+  // of hiddenSize values. A verify sub-pass's rows scatter into the lanes'
+  // whole-block rows with `lanes` (rows per lane, lane stride).
   void addCapture(metal::CommandGraph &graph, uint32_t slot, metal::MetalBuffer output, uint32_t sourceRow,
-                  metal::MetalBuffer captured, uint32_t destinationRow, uint32_t rows) const;
+                  metal::MetalBuffer captured, uint32_t destinationRow, uint32_t rows,
+                  ops::RowLanes lanes = {}) const;
   // Each of a prefill step's captures of layer `index`'s output rows, when
   // the draft reads the layer: capture(slot, source row, destination row,
   // rows) of the captured hidden rows' slot `slot`.

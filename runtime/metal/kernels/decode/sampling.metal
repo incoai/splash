@@ -62,10 +62,10 @@ inline TargetRow selected_row(device const float *logits,
                               constant TargetSamplingParams &params, uint s) {
   const uint lane = selected_lane(params, s);
   const uint index = s % params.rows;
-  return {logits + (ulong(lane) * SPLASH_TARGET_VERIFY_ROWS +
+  return {logits + (ulong(lane) * params.lane_rows +
                     params.logits_row + index) *
                        params.vocabulary,
-          token_mask + (ulong(lane) * (SPLASH_TARGET_VERIFY_ROWS + 1) +
+          token_mask + (ulong(lane) * (params.lane_rows + 1) +
                         params.mask_row + index) *
                            params.mask_words,
           (params.constrained_mask & (1u << lane)) != 0,
@@ -975,7 +975,7 @@ inline void penalize_token(device float *logits, device const uint *words,
     return;
   device float *column =
       logits +
-      (ulong(params.logits_lane[entry]) * SPLASH_TARGET_VERIFY_ROWS +
+      (ulong(params.logits_lane[entry]) * params.lane_rows +
        params.row_offset) * params.vocabulary +
       token;
   for (uint row = 0; row < params.rows; ++row) {
@@ -1013,9 +1013,9 @@ kernel void decode_sample_penalize_verify(
   if (token >= params.vocabulary || entry >= params.entries)
     return;
   device const uint *inputs =
-      input_tokens + ulong(params.logits_lane[entry]) * SPLASH_TARGET_VERIFY_ROWS;
+      input_tokens + ulong(params.logits_lane[entry]) * params.lane_rows;
   uint drafted = 0;
-  for (uint row = 1; row < SPLASH_TARGET_VERIFY_ROWS; ++row)
+  for (uint row = 1; row < params.rows; ++row)
     drafted |= uint(inputs[row] == token) << row;
   penalize_token(logits, words, token, entry, drafted, params);
 }
@@ -1073,13 +1073,14 @@ inline void simd_best_head(float value, uint token, thread float &best,
       device const float *logits [[buffer(0)]],                               \
     device uint *partial_ids [[buffer(1)]],                                   \
     device float *partial_values [[buffer(2)]],                               \
-    constant uint &vocabulary [[buffer(3)]],                                  \
+    constant SelectorBatchParams &params [[buffer(3)]],                       \
     uint group [[threadgroup_position_in_grid]],                              \
     uint thread_index [[thread_index_in_threadgroup]],                        \
     uint lane [[thread_index_in_simdgroup]],                                  \
     uint simd_group [[simdgroup_index_in_threadgroup]]) {                     \
-  constexpr uint Rows = SPLASH_DRAFT_QUERY_ROWS;                              \
-  constexpr uint Positions = SPLASH_DRAFT_PROPOSAL_TOKENS;                    \
+  const uint Rows = params.rows;                                              \
+  const uint Positions = params.positions;                                    \
+  const uint vocabulary = params.vocabulary;                                  \
   constexpr uint Shards = SPLASH_DRAFT_SAMPLING_SHARDS;                       \
   constexpr uint K = candidate_count;                                              \
   constexpr uint VectorTokens = 4, ChunkVectors = 16;                         \
@@ -1251,8 +1252,8 @@ inline void top16_merge_shards(device const uint *partial_ids,
     uint threads [[threads_per_threadgroup]],                                 \
     uint lane [[thread_index_in_simdgroup]],                                  \
     uint simd_group [[simdgroup_index_in_threadgroup]]) {                     \
-  constexpr uint Rows = SPLASH_DRAFT_QUERY_ROWS;                              \
-  constexpr uint Positions = SPLASH_DRAFT_PROPOSAL_TOKENS;                    \
+  const uint Rows = params.rows;                                              \
+  const uint Positions = params.positions;                                    \
   constexpr uint Shards = SPLASH_DRAFT_SAMPLING_SHARDS;                       \
   constexpr uint Candidates = candidate_count;                                     \
   constexpr uint Rank = SPLASH_DRAFT_SELECTOR_RANK;                           \
@@ -1341,7 +1342,7 @@ inline void top16_merge_shards(device const uint *partial_ids,
     device float *confidence [[buffer(6)]],                                   \
     constant SelectorBatchParams &params [[buffer(7)]],                       \
     uint batch [[thread_position_in_grid]]) {                                 \
-  constexpr ulong Positions = SPLASH_DRAFT_PROPOSAL_TOKENS;                   \
+  const ulong Positions = params.positions;                                   \
   constexpr ulong Shards = SPLASH_DRAFT_SAMPLING_SHARDS;                      \
   constexpr ulong Candidates = candidate_count;                                    \
   candidates += batch * Positions * Candidates;                               \
@@ -1423,7 +1424,7 @@ kernel void draft_verify_rows(device const float *confidence [[buffer(0)]],
                               device uint *verify_rows [[buffer(1)]],
                               constant VerifyRowsParams &params [[buffer(2)]],
                               uint index [[thread_position_in_grid]]) {
-  constexpr uint Positions = SPLASH_DRAFT_PROPOSAL_TOKENS;
+  const uint Positions = params.positions;
   constexpr uint Lanes = SPLASH_MAXIMUM_BATCH_WIDTH;
   if (index != 0)
     return;
@@ -1434,8 +1435,8 @@ kernel void draft_verify_rows(device const float *confidence [[buffer(0)]],
     total += rows[lane];
   }
   if (params.every_row == 0) {
-    float survivals[Lanes * Positions];
-    uint owners[Lanes * Positions];
+    float survivals[Lanes * SPLASH_DRAFT_BLOCK_PROPOSALS_LIMIT];
+    uint owners[Lanes * SPLASH_DRAFT_BLOCK_PROPOSALS_LIMIT];
     uint count = 0;
     for (uint lane = 0; lane < params.lanes; ++lane) {
       float survival = 1.0f;
@@ -1519,9 +1520,9 @@ inline void accept_sampled_lane(device const uint *draft_tokens,
                                 device uint *output_tokens,
                                 device uint &retained,
                                 device uint &accepted_count,
-                                AcceptParams params) {
+                                AcceptParams params, uint proposals) {
   uint accepted = 0;
-  while (accepted < SPLASH_DRAFT_PROPOSAL_TOKENS) {
+  while (accepted < proposals) {
     uint token = draft_tokens[accepted];
     float q = sparse_lookup(draft_ids + accepted * Candidates,
                             draft_probs + accepted * Candidates,
@@ -1643,7 +1644,7 @@ kernel void decode_sample_thinking_cutoff(
   if (params.waiting_mask & (1u << lane)) {
     // The lane's mask rows, as selected_row reads them.
     device const uint *masks =
-        token_mask + (ulong(lane) * (SPLASH_TARGET_VERIFY_ROWS + 1) +
+        token_mask + (ulong(lane) * (params.lane_rows + 1) +
                       params.mask_row) *
                          params.mask_words;
     const uint start = params.tokens[lane][0];
@@ -1683,7 +1684,7 @@ kernel void decode_draft_thinking_cutoff(
   if (params.row[lane] != 0 || (params.waiting_mask & (1u << lane)))
     return;
   for (uint r = 0; r < min(params.count[lane], params.drafted_rows); ++r)
-    proposed_tokens[lane * SPLASH_DRAFT_PROPOSAL_TOKENS + r] =
+    proposed_tokens[lane * params.drafted_rows + r] =
         params.tokens[lane][r];
 }
 
@@ -1691,9 +1692,9 @@ inline void accept_greedy_lane(device const uint *draft_tokens,
                                device uint *target_tokens,
                                device uint &retained,
                                device uint &accepted_count,
-                               AcceptParams params) {
+                               AcceptParams params, uint proposals) {
   uint accepted = 0;
-  while (accepted < SPLASH_DRAFT_PROPOSAL_TOKENS &&
+  while (accepted < proposals &&
          draft_tokens[accepted] == target_tokens[accepted]) {
     ++accepted;
   }
@@ -1720,20 +1721,22 @@ inline void accept_greedy_lane(device const uint *draft_tokens,
   uint remaining = min(params.remaining[batch], verify_rows[batch]);          \
   AcceptParams lane_params{remaining, params.stop_tokens};                    \
   device const uint *lane_draft =                                             \
-      draft_tokens + batch * SPLASH_DRAFT_PROPOSAL_TOKENS;                    \
+      draft_tokens + batch * params.proposal_tokens;                          \
   device uint *lane_target =                                                  \
-      target_tokens + batch * SPLASH_TARGET_VERIFY_ROWS;                      \
+      target_tokens + batch * params.verify_rows;                             \
   if (params.sampling_mask & (1u << batch)) {                                 \
     accept_sampled_lane<Candidates>(                                     \
         lane_draft,                                                           \
-        draft_ids + batch * SPLASH_DRAFT_PROPOSAL_TOKENS * Candidates,        \
-        draft_probs + batch * SPLASH_DRAFT_PROPOSAL_TOKENS * Candidates,      \
-        target_rows + batch * SPLASH_TARGET_VERIFY_ROWS,                      \
+        draft_ids + batch * params.proposal_tokens * Candidates,              \
+        draft_probs + batch * params.proposal_tokens * Candidates,            \
+        target_rows + batch * params.verify_rows,                      \
         uniforms + batch * SPLASH_SAMPLING_UNIFORMS, lane_target,             \
-        retained[batch], accepted_count[batch], lane_params);                 \
+        retained[batch], accepted_count[batch], lane_params,                  \
+        params.proposal_tokens);                                              \
   } else {                                                                    \
     accept_greedy_lane(lane_draft, lane_target, retained[batch],              \
-                       accepted_count[batch], lane_params);                   \
+                       accepted_count[batch], lane_params,                    \
+                       params.proposal_tokens);                               \
   }                                                                           \
 }
 DECODE_ACCEPT_DFLASH_KERNEL(decode_accept_dflash, SPLASH_DRAFT_CANDIDATES)

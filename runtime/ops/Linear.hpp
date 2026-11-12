@@ -266,7 +266,8 @@ public:
                                        LinearEpilogue epilogue) const;
   [[nodiscard]] LinearPlan decodePlan(const Projection &projection, uint32_t lanes,
                                       LinearEpilogue epilogue = LinearEpilogue::None,
-                                      const Projection *gate = nullptr) const;
+                                      const Projection *gate = nullptr,
+                                      uint32_t rows = 0) const;
   // The scratch of every decode plan of a projection of `shape`: each lane
   // count, the None, Residual and GateUp epilogues and every tile the device
   // may run them on, and the rotated rows of a full decode batch.

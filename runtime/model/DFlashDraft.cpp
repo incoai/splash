@@ -156,7 +156,7 @@ DFlashDraft::DFlashDraft(const DFlashDraftWeights &weights,
                          const ops::ExecutionPlans &operators)
     : weights_(weights), backend_(backend), operators_(operators),
       selector_(weights.layout.vocabularySize,
-                weights.layout.candidates),
+                weights.layout.candidates, weights.layout.rows),
       contextKvProjections_(contextKvRows(backend, weights)) {}
 
 void DFlashDraft::addSelection(
@@ -252,7 +252,7 @@ void DFlashDraft::addContextKv(metal::CommandGraph &graph,
 
 uint32_t DFlashDraft::decodeStorageLanes(uint32_t lanes) const {
   const ops::Linear &linear = operators_.linear();
-  const uint32_t rows = lanes * ExecutionLimits::draftQueryRows;
+  const uint32_t rows = lanes * weights_.layout.rows;
   uint32_t storageRows = rows;
   const auto include = [&](const ops::Projection &p) {
     storageRows = std::max(storageRows, linear.decodeStorageRows(rows, p.shape()));
@@ -265,7 +265,7 @@ uint32_t DFlashDraft::decodeStorageLanes(uint32_t lanes) const {
   include(weights_.contextProjection);
   include(weights_.selectorProjection);
   for (const ops::Projection &p : contextKvProjections_) include(p);
-  return storageRows / ExecutionLimits::draftQueryRows;
+  return storageRows / weights_.layout.rows;
 }
 
 void DFlashDraft::addDecode(
@@ -279,9 +279,9 @@ void DFlashDraft::addDecode(
     throw std::invalid_argument("invalid draft decode batch");
   }
   const DFlashDraftLayout &layout = weights_.layout;
-  const uint32_t rows = lanes * ExecutionLimits::draftQueryRows;
+  const uint32_t rows = lanes * layout.rows;
   const auto attentionPlan =
-      operators_.draftAttention(layout.attentionShape(), lanes);
+      operators_.draftAttention(layout.attentionShape(), lanes, layout.rows);
   const ops::Linear &linear = operators_.linear();
   const ops::LinearScratch &scratch = buffers.linearScratch;
 
@@ -384,7 +384,7 @@ void DFlashDraft::addContextCommit(
     throw std::invalid_argument("invalid draft context batch");
   }
   const DFlashDraftLayout &layout = weights_.layout;
-  const uint32_t rows = lanes * ExecutionLimits::targetVerifyRows;
+  const uint32_t rows = lanes * layout.rows;
   const ops::Linear &linear = operators_.linear();
   const ops::LinearScratch &scratch = buffers.linearScratch;
   linear.add(graph, {.input = buffers.capturedTargetHidden, .output = buffers.projected, .scratch = scratch},

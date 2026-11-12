@@ -38,8 +38,9 @@ VerifyAttentionPlan ExecutionPlans::verifyAttention(
 }
 
 DraftAttentionPlan ExecutionPlans::draftAttention(DraftAttentionShape shape,
-                                                 uint32_t lanes) const {
-  return DraftAttention::plan(shape, lanes);
+                                                 uint32_t lanes,
+                                                 uint32_t rows) const {
+  return DraftAttention::plan(shape, lanes, rows);
 }
 
 MoePlan ExecutionPlans::moePrefill(MoeShape shape, const MoeFormats &formats, uint32_t rows) const {
@@ -68,8 +69,8 @@ AttentionWorkspace ExecutionPlans::verifyAttentionWorkspacePerLane(
 // The draft workspace is linear in the lanes: one lane's is every width's
 // share.
 DraftAttentionWorkspace ExecutionPlans::draftAttentionWorkspacePerLane(
-    DraftAttentionShape shape) const {
-  return DraftAttention::plan(shape, 1).workspace();
+    DraftAttentionShape shape, uint32_t rows) const {
+  return DraftAttention::plan(shape, 1, rows).workspace();
 }
 
 MoeWorkspace ExecutionPlans::moePrefillWorkspace(MoeShape shape, const MoeFormats &formats,

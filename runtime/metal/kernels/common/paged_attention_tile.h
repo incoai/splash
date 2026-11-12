@@ -52,11 +52,12 @@ inline bool splash_prefill_attention_contract_valid(
 inline bool splash_verify_attention_contract_valid(
     constant SplashVerifyAttentionParams &params) {
   return params.page_table_entries >=
-             (params.committed_tokens + SPLASH_TARGET_VERIFY_ROWS +
-              SplashKvPageTokens - 1) /
+             (params.committed_tokens + params.row_base +
+              SPLASH_TARGET_VERIFY_ROWS + SplashKvPageTokens - 1) /
                  SplashKvPageTokens &&
          params.kv.extent_pages > 0 &&
-         ulong(params.committed_tokens) + SPLASH_TARGET_VERIFY_ROWS <=
+         ulong(params.committed_tokens) + params.row_base +
+                 SPLASH_TARGET_VERIFY_ROWS <=
              ulong(SPLASH_MAXIMUM_PHYSICAL_KV_TOKENS) &&
          params.split_count > 0 &&
          params.split_count <= SplashVerifyMaximumSplits &&
@@ -87,8 +88,8 @@ inline SplashAttentionTile splash_verify_attention_tile(
     return {};
   const ulong head = ulong(batch) * KVHeads + kv_head;
   return {head * SPLASH_VERIFY_CHUNK_STRIDE * QueryHeadsPerKVHead * HeadDim,
-          head * lane.slot_splits, lane.committed_tokens, SPLASH_TARGET_VERIFY_ROWS,
-          lane.split_count, true};
+          head * lane.slot_splits, lane.committed_tokens + lane.row_base,
+          SPLASH_TARGET_VERIFY_ROWS, lane.split_count, true};
 }
 
 template <uint KVHeads, uint QueryHeadsPerKVHead, uint HeadDim>

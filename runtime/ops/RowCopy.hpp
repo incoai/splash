@@ -18,13 +18,20 @@ struct RowRegion final {
 // last prefill row into the head's input, a capture layer's output into its
 // slot of the draft's captured target hidden rows, and an image's embedding
 // rows over its placeholder rows of a prefill chunk's hidden rows.
+struct RowLanes final {
+  // With `rows` set, the destination's rows group `rows` to a lane
+  // `stride` apart (a 16-row verify's sub-pass scatter); 0 copies flat.
+  uint32_t rows = 0;
+  uint32_t stride = 0;
+};
+
 class RowCopy final {
 public:
   // Copies `rows` rows of `width` values from `source` at `from` to
   // `destination` at `to`.
   static void add(metal::CommandGraph &graph, metal::MetalBuffer source,
                   RowRegion from, metal::MetalBuffer destination, RowRegion to,
-                  uint32_t rows, uint32_t width);
+                  uint32_t rows, uint32_t width, RowLanes lanes = {});
 };
 
 } // namespace splash::ops

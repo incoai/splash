@@ -274,8 +274,11 @@ metal::MetalBuffer RippleTarget::addPrefillEnd(PrefillStep &step) const {
 
 void RippleTarget::addVerify(metal::CommandGraph &graph, QwenTargetVerifyBuffers buffers, const kv::PageStorage &kv,
                              SpilledKvReads &spilled, std::span<const kv::ChunkedPrefillParams> chunks,
-                             uint32_t lanes) const {
+                             uint32_t lanes, uint32_t blockRows) const {
   VerifyStep step = verifyStep(graph, buffers, kv, spilled, chunks, lanes);
+  step.blockRows = blockRows;
+  const bool wholeBlock = blockRows == SPLASH_TARGET_VERIFY_ROWS;
+  const uint32_t headRows = wholeBlock ? step.rows : lanes * blockRows;
   for (uint32_t index = 0; index < geometry_.layers; ++index) {
     const RippleLayerWeights &layer = weights_.layers[index];
     const metal::MetalBuffer input = buffers.hidden[index & 1], output = buffers.hidden[(index & 1) ^ 1];
@@ -292,18 +295,26 @@ void RippleTarget::addVerify(metal::CommandGraph &graph, QwenTargetVerifyBuffers
                        geometry_.hiddenSize);
     addVerifyFfn(step, layer, buffers.attentionOutput, output);
     if (const auto slot = geometry_.captureSlot(index))
-      addCapture(step.graph, *slot, output, 0, buffers.capturedTargetHidden, 0, step.rows);
+      addCapture(step.graph, *slot, output, 0, buffers.capturedTargetHidden,
+                 step.rowBase, step.rows, {SPLASH_TARGET_VERIFY_ROWS, blockRows});
   }
   requireLayerPartition(step.gdnLayer, step.attentionLayer);
-  addHeadBatch(step.graph, buffers.hidden[geometry_.layers & 1], buffers.finalHidden, buffers.logits, step.lanes,
-               buffers.linearScratch);
+  // The pass's rows join the lanes' whole-block rows for the head, which the
+  // pass that completes the block runs over all of them.
+  if (!wholeBlock)
+    ops::RowCopy::add(step.graph, buffers.hidden[geometry_.layers & 1], {0, geometry_.hiddenSize, 0},
+                      buffers.headInput, {step.rowBase, geometry_.hiddenSize, 0}, step.rows,
+                      geometry_.hiddenSize, {SPLASH_TARGET_VERIFY_ROWS, blockRows});
+  if (chunks.front().row_base + SPLASH_TARGET_VERIFY_ROWS >= blockRows)
+    addHeadBatch(step.graph, wholeBlock ? buffers.hidden[geometry_.layers & 1] : buffers.headInput,
+                 buffers.finalHidden, buffers.logits, step.lanes, headRows, buffers.linearScratch);
 }
 
 void RippleTarget::addHeadBatch(metal::CommandGraph &graph, metal::MetalBuffer hidden,
                                 metal::MetalBuffer finalHidden, metal::MetalBuffer logits, uint32_t lanes,
-                                ops::LinearScratch scratch) const {
+                                uint32_t rows, ops::LinearScratch scratch) const {
   addNormalizedHead(graph, weights_.finalNorm, std::move(hidden), std::move(finalHidden), std::move(logits),
-                    lanes, scratch);
+                    lanes, rows, scratch);
 }
 
 QwenTargetScratchBytes qwenTargetScratchBytes(const RippleWeights &, const QwenTargetGeometry &geometry,

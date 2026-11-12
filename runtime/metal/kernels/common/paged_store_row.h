@@ -13,13 +13,13 @@ constant uint SplashChunkMaximumPhysicalTokens =
 
 inline bool
 splash_chunk_contract_valid(constant SplashChunkedPrefillParams &params) {
-  uint required_pages = (params.committed_tokens + params.chunk_tokens +
-                         SplashKvPageTokens - 1) /
+  uint required_pages = (params.committed_tokens + params.row_base +
+                         params.chunk_tokens + SplashKvPageTokens - 1) /
                         SplashKvPageTokens;
   return params.committed_tokens <= SplashChunkMaximumPhysicalTokens &&
          params.chunk_tokens > 0 &&
          params.chunk_tokens <= SplashChunkMaximumRows &&
-         params.committed_tokens + params.chunk_tokens <=
+         params.committed_tokens + params.row_base + params.chunk_tokens <=
              SplashChunkMaximumPhysicalTokens &&
          params.chunk_stride >= params.chunk_tokens &&
          params.chunk_stride <= SplashChunkMaximumRows &&
@@ -57,7 +57,7 @@ __attribute__((always_inline)) inline void splash_store_kv_row(
     constant SplashChunkedPrefillParams &params, threadgroup float *maxima,
     bool value_tensor, uint head, uint chunk_token, uint dimension,
     uint simd_lane, uint simd_group) {
-  uint logical_token = params.committed_tokens + chunk_token;
+  uint logical_token = params.committed_tokens + params.row_base + chunk_token;
   const SplashKvPage page = page_table[logical_token / SplashKvPageTokens];
   const SplashKvPageTensors<CacheElement> slab =
       SplashKvAddressing<KVHeads, HeadDim, CacheElement>(params.kv, head).page(page);

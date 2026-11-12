@@ -14,12 +14,22 @@ struct GdnConvHistory {
   uint conv_dim;
   uint rows_width;
   uint consumed;
+  // A second segment of rows before `rows` ends: a 16-row verify's second
+  // sub-pass folds the first sub-pass's rows (one tape) beside its own
+  // predecessor's (another), whose conv inputs the step's first rows read.
+  // Null with `first_rows` 0, which reads every row from `rows`.
+  device const bfloat *second_rows = nullptr;
+  uint first_rows = 0;
 
   bfloat at(uint row, uint channel) const {
     constexpr uint Carried = SPLASH_GDN_CONVOLUTION_TAPS - 1;
     const uint source = consumed + row;
-    return source < Carried ? carried[source * conv_dim + channel]
-                            : rows[(source - Carried) * rows_width + channel];
+    if (source < Carried)
+      return carried[source * conv_dim + channel];
+    const uint index = source - Carried;
+    return second_rows && index >= first_rows
+               ? second_rows[(index - first_rows) * rows_width + channel]
+               : rows[index * rows_width + channel];
   }
 };
 
