@@ -56,3 +56,23 @@ struct HyperStreamMeanParams {
 
 static_assert(sizeof(HyperStreamMeanParams) == 24,
               "hyper-connection stream mean parameters are 24 bytes on both sides");
+
+// A control vector's change to every stream of `rows` rows of `streams`
+// streams of `hidden` fp32 values after a steered layer
+// (hyper_connection_steer, model/ControlVector.hpp), with row `layer` of a
+// table of directions of `hidden` fp32 values: each stream h becomes
+// h + scale v (add), or h - scale (h . v) v (project, v of unit length).
+#define HYPER_CONNECTION_STEER_ADD 0u
+#define HYPER_CONNECTION_STEER_PROJECT 1u
+
+struct HyperSteerParams {
+  uint32_t rows;
+  uint32_t hidden;
+  uint32_t streams;
+  uint32_t layer;
+  uint32_t mode;
+  float scale;
+};
+
+static_assert(sizeof(HyperSteerParams) == 24,
+              "hyper-connection steer parameters are 24 bytes on both sides");

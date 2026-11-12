@@ -91,6 +91,11 @@ struct NativeArguments final {
   // an int8-activation path takes them
   // (RuntimeResourcesConfig::int8Activations).
   ops::Int8Activations int8Activations = ops::Int8Activations::On;
+  // --control-vector PATH, with --control-vector-scale SCALE,
+  // --control-vector-layer-range FIRST-LAST and --control-vector-mode
+  // add|project: the control vector the target runs (model/ControlVector.hpp);
+  // no file for none.
+  model::ControlVectorOptions controlVector;
 };
 
 // Reads `serve-native MODEL_DIRECTORY MAX_CONTEXT|auto MAX_MEMORY_BYTES|auto

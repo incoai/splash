@@ -583,6 +583,11 @@ std::string persistentCacheNamespace(const RuntimeCacheIdentity &identity,
   if (const model::RopeScaling &rope = identity.ropeScaling; rope.yarn())
     canonical << "rope yarn " << std::setprecision(std::numeric_limits<double>::max_digits10) << rope.factor
               << ' ' << rope.originalContextTokens << '\n';
+  // A control vector changes every state and page after its first steered
+  // layer; without one the line is left out, so the caches of the stock
+  // model keep their namespace.
+  if (!identity.controlVectorSha256.empty())
+    canonical << "control-vector " << identity.controlVectorSha256 << '\n';
   // 128 bits name it.
   return model::weightDigest(canonical.str()).substr(0, CacheDirectory::kNamespaceDigits);
 }
@@ -842,7 +847,8 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
                                    .expertMemoryBytes = floors && plan.expertBytes ? least : plan.expertBytes,
                                    .expertFloorBytes = plan.expertFloorBytes,
                                    .expertFloorShare = plan.expertFloorShare,
-                                   .readers = readers};
+                                   .readers = readers,
+                                   .controlVector = config.controlVector};
   };
   model::ModelLoadOptions loadOptions;
   try {
@@ -909,6 +915,8 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
       const std::chrono::duration<double> loading = AwakeClock::now() - started;
       logLine("Weights loaded ", again ? "again " : "", "in ", std::fixed, std::setprecision(2), loading.count(),
               " s.");
+      if (const model::ControlVector *vector = loaded.controlVector(); vector && !again)
+        logLine("Control vector: ", vector->describe(), " (", config.controlVector.path.string(), ").");
     } catch (const metal::MetalAllocationError &error) {
       throw RuntimeResourcesError(RuntimeResourceStage::ModelLoading,
                                   error.what(), {},
@@ -1099,6 +1107,8 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
         loaded.manifestFingerprintSha256,
         loaded.targetManifestFingerprint(), config.buildId,
         loaded.targetKvLayout(config.kvFormat), loaded.descriptor.ropeScaling);
+    if (const model::ControlVector *vector = loaded.controlVector())
+      cacheIdentity.controlVectorSha256 = vector->sha256;
   } catch (const std::exception &error) {
     throw RuntimeResourcesError(RuntimeResourceStage::ModelLoading,
                                 error.what(),

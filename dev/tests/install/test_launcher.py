@@ -611,6 +611,11 @@ class LauncherTests(unittest.TestCase):
             "--revision",
             "--draft-model",
             "--mmproj",
+            # A control vector is computed for one model, like its draft.
+            "--control-vector",
+            "--control-vector-scale",
+            "--control-vector-layer-range",
+            "--control-vector-mode",
         }
         self.assertIn("--max-memory", flags)
         table = Path(launcher.__file__).resolve().parents[1] / (

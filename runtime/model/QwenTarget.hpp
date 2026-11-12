@@ -1,5 +1,6 @@
 #pragma once
 
+#include "ControlVector.hpp"
 #include "Model.hpp"
 #include "QwenHybridLayout.hpp"
 #include "RopeScaling.hpp"
@@ -76,6 +77,12 @@ struct QwenTargetWeightsBase {
   std::string manifestFingerprintSha256;
   std::shared_ptr<ExpertStore> experts;
   std::shared_ptr<SparseRowStore> streamedTable;
+  // The control vector on the target's residual after each steered layer's
+  // FFN (--control-vector, model/ControlVector.hpp), if any; a target whose
+  // GGUF inputs a Prism rotation rotated cannot run one, its residual not
+  // the vector's space.
+  std::optional<ControlVector> controlVector;
+  bool inputsRotated = false;
 };
 
 // The weights of a Qwen target of Layout, whose layers the family keeps in
@@ -420,7 +427,7 @@ template <class Weights>
 // blocks are a step's checks and plans, the GDN and attention mixers (one
 // wiring each for prefill and for verify), the FFNs of a residual of one
 // row (a dense SwiGLU and a MoE block's routing and experts), the draft's
-// captures and the normed head; each family composes them into its layers
+// captures, a control vector's steer of that residual and the normed head; each family composes them into its layers
 // and residual: the Qwen3.5 architecture's (Qwen3.8-27B, Qwen3.6-35B-A3B and
 // Flint, model/QwenTarget.cpp) and Qwen3.8-Flash-Next's
 // (model/Qwen4ExpTarget.cpp).
@@ -699,6 +706,13 @@ protected:
   // Copies a step's read rows of its output work, rows 0.. of `compact`, to
   // their rows of `output`; nothing when it outputs every row.
   void addReadRows(const PrefillStep &step, const metal::MetalBuffer &compact, const metal::MetalBuffer &output) const;
+  // The target's control vector (QwenTargetWeightsBase::controlVector) after
+  // layer `index`, where it steers it: on `rows` rows of `residual`, the
+  // layer's output of one row of hiddenSize values its FFN has just written,
+  // before the draft's capture, so the DFlash2 draft reads the outputs the
+  // target runs on. Nothing without a vector or for a layer it leaves alone.
+  void addResidualSteer(metal::CommandGraph &graph, metal::MetalBuffer residual, uint32_t index,
+                        uint32_t rows) const;
   // Each of a prefill step's captures of layer `index`'s output rows, when
   // the draft reads the layer: capture(slot, source row, destination row,
   // rows) of the captured hidden rows' slot `slot`.

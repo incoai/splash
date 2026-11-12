@@ -267,6 +267,7 @@ ENGINE_CPP_SOURCES := \
 	runtime/ops/MoE.cpp \
 	runtime/ops/Normalization.cpp \
 	runtime/ops/HyperConnection.cpp \
+	runtime/ops/ResidualSteer.cpp \
 	runtime/ops/NgramEmbedding.cpp \
 	runtime/ops/BlockIndexer.cpp \
 	runtime/ops/PagedAttention.cpp \
@@ -320,6 +321,7 @@ ENGINE_CPP_SOURCES := \
 	runtime/model/VerifyBudget.cpp \
 	runtime/model/Qwen3_6Moe.cpp \
 	runtime/model/Qwen3_8.cpp \
+	runtime/model/ControlVector.cpp \
 	runtime/model/Qwen4Exp.cpp \
 	runtime/model/Qwen4Steps.cpp \
 	runtime/model/Qwen4ExpTarget.cpp \
