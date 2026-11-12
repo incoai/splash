@@ -113,8 +113,11 @@ using GgufDecodeKernel = void(device bfloat *, device uchar *, device uchar *, d
   GGUF_DECODE(F, f, 8, ep, Ep, Out) GGUF_DECODE(F, f, 16, ep, Ep, Out) GGUF_DECODE(F, f, 32, ep, Ep, Out)
 // Prefill chunks of 33 to 64 rows run the 64-row tile (ops::Linear), whose bf16 epilogues prefill takes.
 #define GGUF_DECODE_ROWS64(F, f, ep, Ep) GGUF_DECODE_ROWS(F, f, ep, Ep, bfloat) GGUF_DECODE(F, f, 64, ep, Ep, bfloat)
+// A whole 16-row block's head projects its logits in fp32, so the float
+// epilogue runs the 64-row tile too.
 #define GGUF_DECODE_FORMAT(F, f)                                                                                  \
   GGUF_DECODE_ROWS64(F, f, a, EpNone) GGUF_DECODE_ROWS(F, f, a_f32, EpNone, float)                                \
+  GGUF_DECODE(F, f, 64, a_f32, EpNone, float)                                                                     \
   GGUF_DECODE_ROWS64(F, f, r, EpResidual) GGUF_DECODE_ROWS64(F, f, g, EpUpWithGate)                  \
   GGUF_DECODE_ROWS64(F, f, c, EpClampedUpWithGate)
 QUANT_FORMATS(GGUF_DECODE_FORMAT)

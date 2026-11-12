@@ -25,7 +25,7 @@ void validate(LinearWorkload w) {
         (w.epilogue == LinearEpilogue::GateUp || w.epilogue == LinearEpilogue::ClampedGateUp))
       throw std::invalid_argument("invalid linear prefill workload");
   } else {
-    if (!w.rows || w.rows > SPLASH_TARGET_VERIFY_ROWS * SPLASH_MAXIMUM_BATCH_WIDTH ||
+    if (!w.rows || w.rows > SPLASH_DRAFT_BLOCK_ROWS_LIMIT * SPLASH_MAXIMUM_BATCH_WIDTH ||
         (w.rows % SPLASH_TARGET_VERIFY_ROWS && w.rows != 1) ||
         w.epilogue == LinearEpilogue::UpWithGate)
       throw std::invalid_argument("invalid linear decode workload");

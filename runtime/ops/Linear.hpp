@@ -94,7 +94,8 @@ enum class LinearEpilogue : uint8_t {
 // optional K splits.
 enum class LinearTile : uint8_t { GgufStaged, GgufPrefill, GgufRegister };
 // The decode tiles hold at most a full decode batch.
-inline constexpr uint32_t kMaximumDecodeTileRows = SPLASH_MAXIMUM_BATCH_WIDTH * SPLASH_TARGET_VERIFY_ROWS;
+inline constexpr uint32_t kMaximumDecodeTileRows =
+    SPLASH_MAXIMUM_BATCH_WIDTH * SPLASH_DRAFT_BLOCK_ROWS_LIMIT;
 // The staged tile's tallest height, which holds prefill chunks of up to this
 // many rows (ProjectionCalibration::stagedPrefillRows).
 inline constexpr uint32_t kMaximumStagedPrefillRows = 64;

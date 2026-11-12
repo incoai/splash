@@ -96,6 +96,11 @@ uint64_t ExecutionPlans::gateUpWorkspace(ProjectionShape shape) const {
     const LinearWorkload workload{{shape.outputSize, shape.inputSize}, lanes * kDecodeRows,
                                   LinearPhase::Decode, LinearEpilogue::GateUp};
     bound = std::max(bound, linear_.plan(workload).gateScratchBytes());
+    // A served draft's whole block runs the head's gate/up pair too.
+    const LinearWorkload block{{shape.outputSize, shape.inputSize},
+                               lanes * SPLASH_DRAFT_BLOCK_ROWS_LIMIT,
+                               LinearPhase::Decode, LinearEpilogue::GateUp};
+    bound = std::max(bound, linear_.plan(block).gateScratchBytes());
   }
   return bound;
 }
