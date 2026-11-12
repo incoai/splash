@@ -184,8 +184,10 @@ void runCase(MetalBackend &backend, uint32_t lanes, DraftAttentionShape shape,
           uint64_t{lanes} * kRows * kAttention);
 
   CommandGraph graph;
+  MetalBuffer result = backend.allocateBuffer(uint64_t{lanes} * kRows * kAttention * 2,
+                                               BufferStorage::Shared, "draft attention");
   DraftAttention::addDecode(graph,
-      {queries, keys, values, queryKeys, queryValues},
+      {queries, keys, values, queryKeys, queryValues, result},
       std::span(cacheLengths).first(lanes), DraftAttention::plan(shape, lanes));
   const auto dispatches = graph.dispatches();
   require(dispatches.size() == 2 &&
@@ -202,19 +204,19 @@ void runCase(MetalBackend &backend, uint32_t lanes, DraftAttentionShape shape,
   rejects(
       [&] {
         DraftAttention::addDecode(mismatched,
-            {queries, keys, values, queryKeys, queryValues},
+            {queries, keys, values, queryKeys, queryValues, result},
             std::span(cacheLengths).first(lanes - 1),
             DraftAttention::plan(shape, lanes));
       },
       "invalid draft attention geometry", "fewer cache lengths than lanes were accepted");
   require(mismatched.empty(), "mismatched cache lengths encoded a graph");
 
-  const auto *output = static_cast<const uint16_t *>(queries.contents());
+  const auto *output = static_cast<const uint16_t *>(result.contents());
+  require(std::equal(input.begin(), input.end(), static_cast<const uint16_t *>(queries.contents())),
+          "draft attention wrote its query input");
   std::vector<float> reference(uint64_t{kGroupRows} * kHeadDim);
   for (uint32_t lane = 0; lane < lanes; ++lane) {
-    // Reference the first and final head, whose ring the NaN tile follows;
-    // all eight execute above.
-    for (const uint32_t head : {0U, kKvHeads - 1}) {
+    for (uint32_t head = 0; head < kKvHeads; ++head) {
       const uint64_t queryOffset =
           uint64_t{lane} * kRows * kAttention + uint64_t{head} * kGroupRows *
                                                     kHeadDim;
@@ -230,7 +232,12 @@ void runCase(MetalBackend &backend, uint32_t lanes, DraftAttentionShape shape,
               (uint64_t{lane} * kKvHeads + head) * kHeadDim * kRows,
           cacheLengths[lane], reference);
       for (uint64_t index = 0; index < reference.size(); ++index) {
-        const float actual = bf16ToFloat(output[queryOffset + index]);
+        const uint64_t groupedRow = index / kHeadDim;
+        const uint64_t token = groupedRow % kRows;
+        const uint64_t queryHead = head * kQueryHeadsPerKv + groupedRow / kRows;
+        const uint64_t outputIndex = (uint64_t{lane} * kRows + token) * kAttention +
+                                     queryHead * kHeadDim + index % kHeadDim;
+        const float actual = bf16ToFloat(output[outputIndex]);
         const float expected = reference[index];
         if (!std::isfinite(actual) ||
             std::fabs(actual - expected) >
@@ -316,7 +323,6 @@ void surroundingPhases(MetalBackend &backend, DraftAttentionShape shape,
   const auto queries = allocate(workspace.groupedQueriesBytes);
   const auto queryKeys = allocate(workspace.queryKeysBytes);
   const auto queryValues = allocate(workspace.queryValuesBytes);
-  const auto rowMajor = allocate(workspace.groupedQueriesBytes);
   const auto queryNorm = allocate(kHeadDim * 2);
   const auto keyNorm = allocate(kHeadDim * 2);
   std::fill_n(static_cast<uint16_t *>(queryNorm.contents()), kHeadDim,
@@ -372,7 +378,6 @@ void surroundingPhases(MetalBackend &backend, DraftAttentionShape shape,
   DraftAttention::addPrepare(graph,
       {qkv, queries, queryNorm, keyNorm, ropeCos, ropeSin, queryKeys,
        queryValues}, plan);
-  DraftAttention::addReorder(graph, queries, rowMajor, plan);
   static_cast<void>(backend.submitCommandAsync(graph.dispatches()).wait());
   require(std::equal(originalQkv.begin(), originalQkv.end(),
                      static_cast<const uint16_t *>(qkv.contents())),
@@ -418,23 +423,7 @@ void surroundingPhases(MetalBackend &backend, DraftAttentionShape shape,
                         packedRow[kAttention + kKvHeads * kHeadDim + h * kHeadDim + d],
                     "draft prepare value copy differs");
       }
-    }
-  const auto *grouped = static_cast<const uint16_t *>(queries.contents());
-  const auto *reordered = static_cast<const uint16_t *>(rowMajor.contents());
-  for (uint32_t lane = 0; lane < lanes; ++lane) {
-    const uint64_t laneOffset = uint64_t{lane} * kRows * kAttention;
-    for (uint32_t row = 0; row < kRows; ++row) {
-      for (uint32_t head = 0; head < shape.queryHeads; ++head) {
-        for (uint32_t dim = 0; dim < kHeadDim; ++dim)
-          require(reordered[laneOffset + row * kAttention + head * kHeadDim +
-                             dim] ==
-                      grouped[laneOffset + (head * kRows + row) * kHeadDim +
-                              dim],
-                  "draft reorder differed from CPU layout reference");
-      }
-    }
   }
-
 }
 
 // The context writers against a CPU ring: a row's key is RMS-normalized,
@@ -801,20 +790,16 @@ void bufferExtents(MetalBackend &backend, DraftAttentionShape shape) {
   std::vector<splash::test::BufferExtent> extents{
       {0, queryRows + uint64_t{lanes} * kKvHeads * kSplits * kPartialBytes, 4, "draft grouped queries"},
       {1, current, 2, "draft query keys"},
-      {2, current, 2, "draft query values"}};
+      {2, current, 2, "draft query values"},
+      {3 + 2 * lanes, queryRows, 2, "draft attention"}};
   for (uint32_t lane = 0; lane < lanes; ++lane) {
     extents.push_back({3 + lane, ring, 2, "draft key ring"});
     extents.push_back({3 + lanes + lane, ring, 2, "draft value ring"});
   }
   const std::array<uint32_t, lanes> lengths{0, 2047, 6000};
   splash::test::requireExtents(backend, extents, [&](CommandGraph &graph, const Buffers &b) {
-    DraftAttention::addDecode(graph, {b[0], rings(b, 3), rings(b, 3 + lanes), b[1], b[2]}, lengths, plan);
+    DraftAttention::addDecode(graph, {b[0], rings(b, 3), rings(b, 3 + lanes), b[1], b[2], b[3 + 2 * lanes]}, lengths, plan);
   });
-  splash::test::requireExtents(backend,
-                               Extents{{0, queryRows, 2, "draft grouped attention"}, {1, queryRows, 2, "draft attention"}},
-                               [&](CommandGraph &graph, const Buffers &b) {
-                                 DraftAttention::addReorder(graph, b[0], b[1], plan);
-                               });
   splash::test::requireExtents(backend,
                                Extents{{0, contextTokens * contextRow, 2, "draft context K/V"},
                                        {1, norm, 2, "draft key norm"},

@@ -397,7 +397,8 @@ inline void draft_attention_split_phase(
 
 // Fixed-order combine of one (lane, head) pair's split partials into the
 // normalized bf16 rows, so the result does not depend on which split
-// finished first or on how many lanes ran.
+// finished first or on how many lanes ran. The eight proposal rows go directly
+// into the projection's row-major input, avoiding a separate layout transfer.
 inline void draft_attention_reduce_phase(device const float *partials,
                                          device bfloat *output,
                                          uint thread_index) {
@@ -426,24 +427,11 @@ inline void draft_attention_reduce_phase(device const float *partials,
     for (uint i = 0; i < Chunk; ++i)
       accumulated[i] += scale * partial[row * D + dim + i];
   }
+  const uint token = row % SPLASH_DRAFT_QUERY_ROWS;
+  const uint head = row / SPLASH_DRAFT_QUERY_ROWS;
   for (uint i = 0; i < Chunk; ++i)
-    output[row * D + dim + i] = bfloat(accumulated[i] / total);
-}
-
-inline void draft_attention_reorder_phase(device const bfloat *grouped,
-                                          device bfloat *row_major, uint group,
-                                          uint thread_index) {
-  constexpr uint Rows = SPLASH_DRAFT_QUERY_ROWS, QHeads = SPLASH_DRAFT_QUERY_HEADS,
-                 HeadDim = SPLASH_DRAFT_HEAD_DIMENSION;
-  const uint element = group * 256 + thread_index;
-  if (element >= Rows * QHeads * HeadDim)
-    return;
-  uint row = element / (QHeads * HeadDim);
-  uint remainder = element % (QHeads * HeadDim);
-  uint query_head = remainder / HeadDim;
-  uint dim = remainder % HeadDim;
-  uint grouped_index = (query_head * Rows + row) * HeadDim + dim;
-  row_major[element] = grouped[grouped_index];
+    output[token * SPLASH_DRAFT_ATTENTION_WIDTH + head * D + dim + i] =
+        bfloat(accumulated[i] / total);
 }
 
 kernel void draft_conv(device const bfloat *input [[buffer(0)]],
@@ -544,8 +532,9 @@ kernel void draft_attention_bf16_split(
 }
 
 kernel void draft_attention_bf16_reduce(
-    device bfloat *queries [[buffer(0)]],
-    constant DraftAttentionBatchParams &params [[buffer(1)]],
+    device const bfloat *queries [[buffer(0)]],
+    device bfloat *output [[buffer(1)]],
+    constant DraftAttentionBatchParams &params [[buffer(2)]],
     uint2 group [[threadgroup_position_in_grid]],
     uint thread_index [[thread_index_in_threadgroup]]) {
   constexpr uint AttentionM = SPLASH_DRAFT_ATTENTION_ROWS, KVHeads = SPLASH_DRAFT_KV_HEADS;
@@ -561,19 +550,6 @@ kernel void draft_attention_bf16_reduce(
           PartialFloats;
   draft_attention_reduce_phase(
       partials,
-      queries + batch * Rows * Attention + group.x * AttentionM * HeadDim,
+      output + batch * Rows * Attention + group.x * (AttentionM / Rows) * HeadDim,
       thread_index);
-}
-
-kernel void draft_attention_reorder(
-    device const bfloat *grouped [[buffer(0)]],
-    device bfloat *row_major [[buffer(1)]],
-    uint2 group [[threadgroup_position_in_grid]],
-    uint thread_index [[thread_index_in_threadgroup]]) {
-  constexpr ulong Rows = SPLASH_DRAFT_QUERY_ROWS;
-  constexpr ulong Attention = SPLASH_DRAFT_ATTENTION_WIDTH;
-  uint batch = group.y;
-  draft_attention_reorder_phase(grouped + batch * Rows * Attention,
-                                row_major + batch * Rows * Attention, group.x,
-                                thread_index);
 }
