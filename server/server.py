@@ -37,7 +37,7 @@ from .backend import (
     ThinkingEndError,
     thinking_end_tokens,
 )
-from .chat_templates import ChatTemplateError, ChatTemplates
+from .chat_templates import ChatTemplateError, ChatTemplates, read_template_file
 from .connections import ConnectionSlots, HttpAdmission, RequestBodyReservation
 from .constraints import (
     ConstraintFactory,
@@ -1218,6 +1218,16 @@ def _native_command(args, model_root, relaunch_context=None):
     return command
 
 
+def _custom_template(path):
+    """The source of the chat template file --chat-template-file names
+    (path), which startup logs with its digest, or None."""
+    if path is None:
+        return None
+    custom = read_template_file(path)
+    print_status(f"Chat template file · {custom.path} · sha256 {custom.sha256}")
+    return custom.source
+
+
 def _raise_descriptor_limit():
     """Raise the soft descriptor limit to DESCRIPTOR_LIMIT, or to the hard
     limit when that is lower; a higher soft limit stays."""
@@ -1333,6 +1343,7 @@ def main():
                 f"{args.model} is not prepared as a model of a family this "
                 "release serves: prepare it again"
             )
+        custom = _custom_template(args.chat_template_file)
         # A tokenizer the loader cannot read fails with whatever its parsers
         # raise, such as a KeyError for a tokenizer.json without added_tokens:
         # each is the model's.
@@ -1349,7 +1360,7 @@ def main():
         thinking_end = thinking_end_tokens(
             tokenizer, args.thinking_end_text, family.chat_format
         )
-        chat_templates = ChatTemplates(tokenizer)
+        chat_templates = ChatTemplates(tokenizer, override=custom)
         print_status(f"Chat template · {chat_templates.describe()}")
         # Unset, a budget ends thinking as the template closes it, so that the
         # next request renders that close back as the tokens the reply ended
