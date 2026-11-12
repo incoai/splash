@@ -30,10 +30,19 @@ def main():
 
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--shader-validation", action="store_true")
+    parser.add_argument("--holdout", action="store_true")
+    parser.add_argument("--confirm", action="store_true")
+    parser.add_argument("--readback-each-run", action="store_true")
+    parser.add_argument("--blocks", type=int, default=8)
+    parser.add_argument("--seed", type=int, default=0)
     parser.add_argument(
         "--output", type=Path, default=ROOT / "build/experiments/gpu-scheduler"
     )
     args = parser.parse_args()
+    if not 1 <= args.blocks <= 128:
+        parser.error("blocks must be between 1 and 128")
+    if not 0 <= args.seed <= 0xFFFFFFFF:
+        parser.error("seed must fit uint32")
     out = args.output.resolve()
     out.mkdir(parents=True, exist_ok=True)
     command(
@@ -106,7 +115,12 @@ def main():
         (out / "stderr.log").open("w") as error,
     ):
         subprocess.run(
-            [str(out / "benchmark"), str(out / "experiment.metallib")],
+            [str(out / "benchmark"), str(out / "experiment.metallib")]
+            + (["--validate-only"] if args.shader_validation else [])
+            + (["--holdout"] if args.holdout else [])
+            + (["--confirm"] if args.confirm else [])
+            + (["--readback-each-run"] if args.readback_each_run else [])
+            + ["--blocks", str(args.blocks), "--seed", str(args.seed)],
             cwd=ROOT,
             env=env,
             stdout=output,
@@ -119,11 +133,22 @@ def main():
     for case in raw["cases"]:
         for variant in case.get("variants", [case]):
             rounds = variant["rounds_abba_us"]
+            if not rounds:
+                continue
             result = abba.compare_samples(zip(*rounds))
             result["blocks"] = [abba.compare(*r) for r in rounds]
             result["case"] = {
                 k: v for k, v in case.items() if k not in ("variants", "rounds_abba_us")
             }
+            for label, key in (
+                ("host_wall", "rounds_abba_wall_us"),
+                ("host_submission", "rounds_abba_submit_us"),
+            ):
+                if variant.get(key):
+                    metric = abba.compare_samples(zip(*variant[key]))
+                    metric["blocks"] = [abba.compare(*r) for r in variant[key]]
+                    result[label] = metric
+            result["baseline_mode"] = variant.get("baseline", "static_eight")
             if "mode" in variant:
                 result["mode"] = variant["mode"]
             comparisons.append(result)
@@ -142,6 +167,11 @@ def main():
             ["xcrun", "clang++", "--version"], text=True
         ).splitlines()[0],
         "shader_validation": args.shader_validation,
+        "seed": args.seed,
+        "holdout": args.holdout,
+        "confirmation_static_three_plain": args.confirm,
+        "readback_each_timed_run": args.readback_each_run,
+        "recorded_blocks": args.blocks,
         "sha256": {
             str(p.relative_to(ROOT)) if p.is_relative_to(ROOT) else str(p): digest(p)
             for p in (
@@ -161,7 +191,7 @@ def main():
         "verdict_counts": dict(collections.Counter(r["verdict"] for r in comparisons)),
         "model_ttft_ms": None,
         "model_tokens_per_second": None,
-        "scope": "Component GPU timing; no model inference or end-to-end efficiency claim.",
+        "scope": "Synthetic DAG: GPU time excludes CPU queue initialization. Host wall includes initialization, submission and wait, excluding validation and graph construction. No model inference or energy claim.",
     }
     (out / "summary.json").write_text(json.dumps(result, indent=2) + "\n")
     print(json.dumps({"output": str(out), "verdict_counts": result["verdict_counts"]}))
