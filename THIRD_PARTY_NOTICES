@@ -288,6 +288,14 @@ FastVideo/FastVideo-FastH3-4-step-Preview-v1-*) are derivatives of MiniMax
 H3 under the MiniMax H3 Community License Agreement; none is part of Splash.
 Apache License, Version 2.0 (http://www.apache.org/licenses/LICENSE-2.0).
 
+minimax-h3-mlx (https://github.com/PipeNetwork/minimax-h3-mlx)
+
+The video VAE tile plan (runtime/video/ops/Geometry.cpp), the request
+preparation (runtime/video/model/Prep.mm), the audio VAE decoder
+(runtime/video/ops/AudioDecoder.mm) and the rotary tables and audio weights of
+install/h3.py follow this MLX port of MiniMax H3. Apache License, Version 2.0
+(http://www.apache.org/licenses/LICENSE-2.0).
+
 BigVGAN (https://github.com/NVIDIA/BigVGAN)
 
 The audio VAE decoder's kernels (runtime/metal/kernels/video/audio) implement
