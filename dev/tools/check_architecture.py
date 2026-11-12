@@ -139,6 +139,7 @@ LAYERS: tuple[tuple[str, tuple[str, ...], tuple[str, ...]], ...] = (
         ("engine", "model interface", "model", "ops", "metal", "kernels", "shared"),
     ),
     ("engine", ("runtime/engine/",), ("model interface", "shared")),
+    ("video protocol", ("runtime/video/protocol/",), ("engine", "shared")),
     (
         "video model",
         ("runtime/video/model/",),
