@@ -75,6 +75,8 @@ struct DraftDecodeAttentionBuffers final {
   std::span<const metal::MetalBuffer> persistentValues;
   metal::MetalBuffer queryKeys;
   metal::MetalBuffer queryValues;
+  // Row-major projection input; may reuse QKV storage after preparation.
+  metal::MetalBuffer output;
 };
 
 class DraftAttention final {
@@ -93,10 +95,6 @@ public:
                         DraftDecodeAttentionBuffers buffers,
                         std::span<const uint32_t> cacheLengths,
                         const DraftAttentionPlan &plan);
-  static void addReorder(metal::CommandGraph &graph,
-                         metal::MetalBuffer grouped,
-                         metal::MetalBuffer rowMajor,
-                         const DraftAttentionPlan &plan);
   // The context writers. A row of contextKv holds its keys, then its values
   // (kvHeads * headDimension each); its normalized, rotated keys and its
   // values go to its position's slot of the ring.

@@ -179,6 +179,7 @@ void DraftAttention::addDecode(
   requireBytes(buffers.groupedQueries, workspace.groupedQueriesBytes, "draft grouped queries");
   requireBytes(buffers.queryKeys, workspace.queryKeysBytes, "draft query keys");
   requireBytes(buffers.queryValues, workspace.queryValuesBytes, "draft query values");
+  requireBytes(buffers.output, queryRowsBytes(plan), "draft attention");
   for (uint32_t lane = 0; lane < lanes; ++lane) {
     if (cacheLengths[lane] > SPLASH_MAXIMUM_CONTEXT_TOKENS)
       throw std::invalid_argument("draft attention cache length exceeds limit");
@@ -196,22 +197,8 @@ void DraftAttention::addDecode(
   bindings.push_back(buffers.queryValues);
   graph.add("draft_attention_bf16_split", std::move(bindings), params,
             {shape.kvHeads, lanes, kSplits});
-  graph.add("draft_attention_bf16_reduce", {buffers.groupedQueries}, params,
+  graph.add("draft_attention_bf16_reduce", {buffers.groupedQueries, buffers.output}, params,
             {shape.kvHeads, lanes, 1});
-}
-
-void DraftAttention::addReorder(metal::CommandGraph &graph,
-                                metal::MetalBuffer grouped,
-                                metal::MetalBuffer rowMajor,
-                                const DraftAttentionPlan &plan) {
-  const auto shape = plan.shape();
-  const uint32_t groups =
-      phaseGroups(uint64_t{kRows} * shape.queryHeads * shape.headDimension);
-  const uint32_t lanes = plan.lanes();
-  requireBytes(grouped, queryRowsBytes(plan), "draft grouped attention");
-  requireBytes(rowMajor, queryRowsBytes(plan), "draft attention");
-  graph.add("draft_attention_reorder", {std::move(grouped), std::move(rowMajor)},
-            {groups, lanes, 1});
 }
 
 void DraftAttention::addContextPrefill(

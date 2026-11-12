@@ -290,10 +290,8 @@ void DFlashDraft::addDecode(
         graph,
         {buffers.attention, buffers.persistentKeys[layer],
          buffers.persistentValues[layer], buffers.queryKeys,
-         buffers.queryValues},
+         buffers.queryValues, buffers.proposalQkv},
         cacheLengths, attentionPlan);
-    ops::DraftAttention::addReorder(graph, buffers.attention,
-                                    buffers.proposalQkv, attentionPlan);
     linear.add(graph, {.input = buffers.proposalQkv, .output = buffers.projected, .scratch = scratch},
                weights.outputProjection, linear.decodePlan(weights.outputProjection, lanes));
     ops::DraftAttention::addConvolution(

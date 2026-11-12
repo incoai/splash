@@ -139,6 +139,16 @@ Compare performance on the same idle Mac with the same model and workload.
 Keep generated reports, profiles, local paths and experiment notes out of the
 source tree and commits.
 
+`make benchmark-draft-attention BASELINE=../splash-baseline` compares the draft
+reduction plus layout transfer with the reduction that writes projection rows
+directly. The baseline must be built from before the fusion. It needs no model
+weights and returns JSON with exact byte parity, stage GPU times and every
+ABBA round at B1–B4: 20 measured rounds after four warmups, with 256 repeated
+stages per command. These synthetic partials measure the replaced stage,
+excluding attention's split pass, other draft work and target verification.
+They do not measure TTFT or model tokens/sec; use `test-performance-real` for
+those, and keep inconclusive comparisons separate from performance passes.
+
 ## Release check
 
 A release is checked once per source identity, and then on each Apple GPU
