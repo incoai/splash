@@ -13,7 +13,7 @@
 // every row takes the highest and is logged untuned; a family below every row throws.
 //
 // Not in the row (compile-time below): the constants that size a buffer in the activation plan or the weight stream
-// or that are kernel formats, and the numerical epsilons,
+// (video/model/MemoryPlan.mm, video/model/WeightStream.mm) or that are kernel formats, and the numerical epsilons,
 // which are not chip tuning.
 #include "metal/DeviceCapabilities.hpp"
 #include "metal/abi/video/LinearABI.h"

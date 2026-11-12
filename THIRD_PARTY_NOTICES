@@ -296,6 +296,13 @@ preparation (runtime/video/model/Prep.mm), the audio VAE decoder
 install/h3.py follow this MLX port of MiniMax H3. Apache License, Version 2.0
 (http://www.apache.org/licenses/LICENSE-2.0).
 
+Qwen3-VL-32B-Instruct (https://huggingface.co/Qwen/Qwen3-VL-32B-Instruct)
+
+The video text encoder runs Qwen3-VL-32B-Instruct's weights, which are not
+part of Splash: the installer reads mlx-community's MLX conversion
+(https://huggingface.co/mlx-community/Qwen3-VL-32B-Instruct-8bit). Apache
+License, Version 2.0 (http://www.apache.org/licenses/LICENSE-2.0).
+
 BigVGAN (https://github.com/NVIDIA/BigVGAN)
 
 The audio VAE decoder's kernels (runtime/metal/kernels/video/audio) implement
