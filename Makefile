@@ -40,20 +40,28 @@ BUILD := build
 TARGET := $(BUILD)/splash
 METAL_BUILD := $(BUILD)/metal
 # Production kernels are grouped by execution phase under
-# runtime/metal/kernels/{prefill,decode,shared}; every .metal file there is
-# compiled into the metallib. Templates both phases instantiate live in
-# kernels/common/, the host/shader contract in runtime/metal/abi/;
-# kernels/host_step.metal builds into a library of its own (HOST_STEP_LIB).
+# runtime/metal/kernels/{prefill,decode,shared}, and the video engine's
+# (runtime/video) under kernels/video, by model part; every .metal file there
+# is compiled into the metallib. Templates both phases instantiate live in
+# kernels/common/ (kernels/video/common/), the host/shader contract in
+# runtime/metal/abi/ (abi/video/); kernels/host_step.metal builds into a
+# library of its own (HOST_STEP_LIB).
 PRODUCTION_KERNEL_SOURCES := $(sort $(wildcard \
 	runtime/metal/kernels/prefill/*.metal \
 	runtime/metal/kernels/decode/*.metal \
-	runtime/metal/kernels/shared/*.metal))
+	runtime/metal/kernels/shared/*.metal \
+	runtime/metal/kernels/video/*.metal \
+	runtime/metal/kernels/video/*/*.metal))
 PRODUCTION_KERNEL_NAMES := \
 	$(patsubst runtime/metal/kernels/%.metal,%,$(PRODUCTION_KERNEL_SOURCES))
 PRODUCTION_AIRS := $(addprefix $(METAL_BUILD)/, \
 	$(addsuffix .air,$(PRODUCTION_KERNEL_NAMES)))
 KERNEL_HEADERS := $(sort $(wildcard runtime/metal/abi/*.h \
-	runtime/metal/kernels/common/*.h))
+	runtime/metal/kernels/common/*.h runtime/metal/abi/video/*.h \
+	runtime/metal/kernels/video/common/*.h))
+# The video engine's request preparation reproduces MLX's arithmetic bit for
+# bit, and compiles as MLX's metallib does, without fast math.
+VIDEO_PREP_AIRS := $(filter $(METAL_BUILD)/video/prep/%,$(PRODUCTION_AIRS))
 # macOS 26.4 is the tested floor: the engine refuses older systems at
 # startup, and every binary and metallib records it. The MPP kernels need
 # macOS 26.2 or newer, and MPP chooses its code path by this target.
@@ -194,6 +202,11 @@ $(METAL_BUILD)/%.air: runtime/metal/kernels/%.metal $(KERNEL_HEADERS) \
 		| $(METAL_BUILD)
 	@mkdir -p $(dir $@)
 	$(RUN_CONFIGURED) $(METAL) $(PROD_METALFLAGS) -c $< -o $@
+
+$(VIDEO_PREP_AIRS): $(METAL_BUILD)/%.air: runtime/metal/kernels/%.metal \
+		$(KERNEL_HEADERS) | $(METAL_BUILD)
+	@mkdir -p $(dir $@)
+	$(RUN_CONFIGURED) $(METAL) $(PROD_METALFLAGS) -fno-fast-math -c $< -o $@
 
 $(LIB): $(PRODUCTION_AIRS)
 	$(RUN_CONFIGURED) $(METALLIB) $(BUILD_INPUTS) -o $@
