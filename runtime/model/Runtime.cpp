@@ -1817,11 +1817,11 @@ struct Runtime::Impl {
   }
 
   // Creates the pipelines of a draft rebuild of `rows` on `lane` without
-  // running it (Runtime::warmupPrefill).
+  // running it (Runtime::warmupPrefill); none where no draft is bound.
   void prepareDraftRebuild(uint32_t lane, uint32_t rows) const {
     CommandGraph graph;
     addDraftRebuild(graph, lane, {0, rows});
-    backend.preparePipelines(graph.dispatches());
+    if (!graph.dispatches().empty()) backend.preparePipelines(graph.dispatches());
   }
 
   // Creates the pipelines only a state captured inside a prefill chunk runs,
