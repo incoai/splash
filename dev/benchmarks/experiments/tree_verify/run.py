@@ -301,7 +301,9 @@ def main():
         "wide_cycles": active,
         "prompts": results,
         "sha256": {
-            str(p.relative_to(ROOT)): hashlib.sha256(p.read_bytes()).hexdigest()
+            (
+                str(p.relative_to(ROOT)) if p.is_relative_to(ROOT) else str(p)
+            ): hashlib.sha256(p.read_bytes()).hexdigest()
             for p in files
         },
     }
