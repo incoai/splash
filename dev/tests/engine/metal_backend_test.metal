@@ -4,7 +4,9 @@ using namespace metal;
 
 kernel void test_parameter_bytes(device uint *output [[buffer(0)]],
                                  constant uint *parameters [[buffer(1)]]) {
-    output[0] = parameters[1] + parameters[parameters[0]];
+    uint sum = 0;
+    for (uint index = 1; index <= parameters[0]; ++index) sum += parameters[index];
+    output[0] = sum;
 }
 
 kernel void test_copy_u32(device const uint *source [[buffer(0)]],

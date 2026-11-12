@@ -138,14 +138,15 @@ private:
   // allocation per dispatch; larger parameters keep their own storage.
   class Payload final {
   public:
-    explicit Payload(size_t bytes) : large_(bytes > small_.size() ? bytes : 0) {}
+    explicit Payload(size_t bytes)
+        : large_(bytes > small_.size() ? std::make_unique_for_overwrite<std::byte[]>(bytes) : nullptr) {}
     [[nodiscard]] std::byte *data() noexcept {
-      return large_.empty() ? small_.data() : large_.data();
+      return large_ ? large_.get() : small_.data();
     }
 
   private:
     alignas(std::max_align_t) std::array<std::byte, 128> small_;
-    std::vector<std::byte> large_;
+    std::unique_ptr<std::byte[]> large_;
   };
 
   template <class Buffers, class Params>

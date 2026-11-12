@@ -90,18 +90,24 @@ ComputeDispatch addition(const MetalBuffer &buffer, const uint32_t &count,
 }
 
 template <size_t Words>
-void addOwnedParameters(CommandGraph &graph, const MetalBuffer &output,
-                        const MetalBuffer &grid, uint32_t seed) {
+uint32_t addOwnedParameters(CommandGraph &graph, const MetalBuffer &output,
+                            const MetalBuffer &grid, uint32_t seed) {
     std::array<uint32_t, Words> parameters;
     parameters[0] = Words - 1;
+    uint32_t sum = 0;
     for (size_t index = 1; index < Words; ++index) parameters[index] = seed + index;
-    if (seed % 3 == 0)
+    for (size_t index = 1; index < Words; ++index) sum += parameters[index];
+    if (seed % 4 == 0)
         graph.add("test_parameter_bytes", {output}, parameters, {1, 1, 1}, {1, 1, 1});
-    else if (seed % 3 == 1)
+    else if (seed % 4 == 1)
         graph.add("test_parameter_bytes", std::vector<MetalBuffer>{output}, parameters, {1, 1, 1}, {1, 1, 1});
-    else
+    else if (seed % 4 == 2)
         graph.add("test_parameter_bytes", {output}, parameters, {1, 1, 1}, {grid, 0}, {1, 1, 1});
+    else
+        graph.add("test_parameter_bytes", std::vector<MetalBuffer>{output}, parameters, {1, 1, 1},
+                  {grid, 0}, {1, 1, 1});
     parameters.fill(0);
+    return sum;
 }
 
 void graphOwnsParametersAfterMoves(const std::string &metallibPath) {
@@ -114,18 +120,22 @@ void graphOwnsParametersAfterMoves(const std::string &metallibPath) {
     const auto append = [&](CommandGraph &graph, uint32_t index) {
         const MetalBuffer row = backend.view(output, index * sizeof(uint32_t), sizeof(uint32_t));
         const uint32_t seed = 1009 * index;
-        switch (index % 4) {
-        case 0: addOwnedParameters<3>(graph, row, grid, seed); expected[index] = 2 * seed + 3; break;
-        case 1: addOwnedParameters<32>(graph, row, grid, seed); expected[index] = 2 * seed + 32; break;
-        case 2: addOwnedParameters<33>(graph, row, grid, seed); expected[index] = 2 * seed + 33; break;
-        case 3: addOwnedParameters<129>(graph, row, grid, seed); expected[index] = 2 * seed + 129; break;
+        switch ((index / 4) % 4) {
+        case 0: expected[index] = addOwnedParameters<3>(graph, row, grid, seed); break;
+        case 1: expected[index] = addOwnedParameters<32>(graph, row, grid, seed); break;
+        case 2: expected[index] = addOwnedParameters<33>(graph, row, grid, seed); break;
+        case 3: expected[index] = addOwnedParameters<129>(graph, row, grid, seed); break;
         }
     };
     CommandGraph graph;
     for (uint32_t index = 0; index < 3 * count / 4; ++index) append(graph, index);
     CommandGraph moved(std::move(graph)), assigned;
+    append(assigned, count - 1);
     assigned = std::move(moved);
+    append(graph, count - 1);
+    append(moved, count - 1);
     graph = CommandGraph();
+    moved = CommandGraph();
     for (uint32_t index = 3 * count / 4; index < count; ++index) append(assigned, index);
     (void)backend.submitCommandAsync(assigned.dispatches()).wait();
     require(std::equal(expected.begin(), expected.end(), static_cast<const uint32_t *>(output.contents())),

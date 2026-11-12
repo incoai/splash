@@ -139,6 +139,17 @@ Compare performance on the same idle Mac with the same model and workload.
 Keep generated reports, profiles, local paths and experiment notes out of the
 source tree and commits.
 
+`make benchmark-command-graph` needs no model or GPU. It measures CPU graph
+construction for 650 dispatches with eight empty bindings and small, large
+and mixed parameter payloads, checks every parameter word, and reports the
+median of 80 builds after 20 warmups. A separate untimed build counts C++
+allocation calls and cumulative requested bytes, including transient
+allocations; those bytes are neither peak memory nor RSS. To compare a change,
+compile the same `dev/benchmarks/command_graph_benchmark.cpp` against each
+revision and run the binaries in ABBA order. These synthetic results measure
+graph construction, not TTFT or serving throughput; use `test-performance-real`
+for those.
+
 ## Release check
 
 A release is checked once per source identity, and then on each Apple GPU
