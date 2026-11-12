@@ -2,11 +2,13 @@
 
 #include "MetalBackend.hpp"
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <deque>
 #include <functional>
+#include <initializer_list>
 #include <memory>
 #include <span>
 #include <stdexcept>
@@ -39,18 +41,23 @@ public:
     push(std::move(pipeline), std::move(buffers), groups, threads);
   }
 
+  void add(std::string pipeline, std::initializer_list<MetalBuffer> buffers,
+           DispatchSize groups, DispatchSize threads = {kDefaultThreads, 1, 1}) {
+    push(std::move(pipeline), buffers, groups, threads);
+  }
+
   template <class Params>
   void add(std::string pipeline, std::vector<MetalBuffer> buffers,
            const Params &params, DispatchSize groups,
            DispatchSize threads = {kDefaultThreads, 1, 1}) {
-    static_assert(std::is_trivially_copyable_v<Params>,
-                  "dispatch parameters must be plain data");
-    payloads_.emplace_back(sizeof(Params));
-    std::memcpy(payloads_.back().data(), &params, sizeof(Params));
-    ComputeDispatch &dispatch =
-        push(std::move(pipeline), std::move(buffers), groups, threads);
-    dispatch.bytes.push_back({static_cast<uint32_t>(dispatch.buffers.size()),
-                              payloads_.back().data(), sizeof(Params)});
+    addParameters(std::move(pipeline), std::move(buffers), params, groups, threads);
+  }
+
+  template <class Params>
+  void add(std::string pipeline, std::initializer_list<MetalBuffer> buffers,
+           const Params &params, DispatchSize groups,
+           DispatchSize threads = {kDefaultThreads, 1, 1}) {
+    addParameters(std::move(pipeline), buffers, params, groups, threads);
   }
 
   // A dispatch of the grid in `grid`, which an earlier dispatch writes
@@ -60,6 +67,14 @@ public:
            const Params &params, DispatchSize groups, IndirectGrid grid,
            DispatchSize threads) {
     add(std::move(pipeline), std::move(buffers), params, groups, threads);
+    dispatches_.back().indirectThreadgroups = std::move(grid);
+  }
+
+  template <class Params>
+  void add(std::string pipeline, std::initializer_list<MetalBuffer> buffers,
+           const Params &params, DispatchSize groups, IndirectGrid grid,
+           DispatchSize threads) {
+    add(std::move(pipeline), buffers, params, groups, threads);
     dispatches_.back().indirectThreadgroups = std::move(grid);
   }
 
@@ -119,16 +134,56 @@ public:
   }
 
 private:
+  // Parameters up to 128 bytes stay in their deque entry, avoiding a heap
+  // allocation per dispatch; larger parameters keep their own storage.
+  class Payload final {
+  public:
+    explicit Payload(size_t bytes) : large_(bytes > small_.size() ? bytes : 0) {}
+    [[nodiscard]] std::byte *data() noexcept {
+      return large_.empty() ? small_.data() : large_.data();
+    }
+
+  private:
+    alignas(std::max_align_t) std::array<std::byte, 128> small_;
+    std::vector<std::byte> large_;
+  };
+
+  template <class Buffers, class Params>
+  void addParameters(std::string pipeline, Buffers &&buffers,
+                     const Params &params, DispatchSize groups, DispatchSize threads) {
+    static_assert(std::is_trivially_copyable_v<Params>,
+                  "dispatch parameters must be plain data");
+    payloads_.emplace_back(sizeof(Params));
+    std::memcpy(payloads_.back().data(), &params, sizeof(Params));
+    ComputeDispatch &dispatch =
+        push(std::move(pipeline), std::forward<Buffers>(buffers), groups, threads);
+    dispatch.bytes.push_back({static_cast<uint32_t>(dispatch.buffers.size()),
+                              payloads_.back().data(), sizeof(Params)});
+  }
+
+  ComputeDispatch &push(std::string pipeline, std::initializer_list<MetalBuffer> buffers,
+                        DispatchSize groups, DispatchSize threads) {
+    ComputeDispatch &dispatch = push(std::move(pipeline), groups, threads);
+    dispatch.buffers.reserve(buffers.size());
+    for (const MetalBuffer &buffer : buffers)
+      dispatch.buffers.push_back({static_cast<uint32_t>(dispatch.buffers.size()), buffer});
+    return dispatch;
+  }
+
   ComputeDispatch &push(std::string pipeline, std::vector<MetalBuffer> buffers,
                         DispatchSize groups, DispatchSize threads) {
+    ComputeDispatch &dispatch = push(std::move(pipeline), groups, threads);
+    dispatch.buffers.reserve(buffers.size());
+    for (uint32_t index = 0; index < buffers.size(); ++index)
+      dispatch.buffers.push_back({index, std::move(buffers[index])});
+    return dispatch;
+  }
+
+  ComputeDispatch &push(std::string pipeline, DispatchSize groups, DispatchSize threads) {
     ComputeDispatch dispatch;
     dispatch.pipelineName = std::move(pipeline);
     dispatch.threadgroups = groups;
     dispatch.threadsPerThreadgroup = threads;
-    dispatch.buffers.reserve(buffers.size());
-    for (uint32_t index = 0; index < buffers.size(); ++index) {
-      dispatch.buffers.push_back({index, std::move(buffers[index])});
-    }
     dispatches_.push_back(std::move(dispatch));
     return dispatches_.back();
   }
@@ -137,7 +192,7 @@ private:
     events_.push_back({dispatches_.size(), std::move(event), value, kind});
   }
 
-  std::deque<std::vector<std::byte>> payloads_;
+  std::deque<Payload> payloads_;
   std::vector<ComputeDispatch> dispatches_;
   std::vector<EventStep> events_;
 };
