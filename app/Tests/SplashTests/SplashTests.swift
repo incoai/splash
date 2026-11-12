@@ -62,6 +62,15 @@ struct ServeSettingsTests {
             == ["serve", "--model", "a/b:Q4", "--port", "8000", "--offline"])
     }
 
+    @Test func treeVerificationIsOptInAndOnlyPassedForSupportedFamilies() throws {
+        let option = try #require(LaunchOption.all.first { $0.flag == "--verify-tree" })
+        #expect(option.arguments(nil).isEmpty && option.arguments("on") == ["--verify-tree", "on"])
+        let settings = ServeSettings(values: ["--verify-tree": "on"])
+        #expect(settings.serveArguments(model: "a/b").suffix(2) == ["--verify-tree", "on"])
+        #expect(settings.usable(by: Self.moe).serveArguments(model: "a/b")
+            == ServeSettings().serveArguments(model: "a/b"))
+    }
+
     @Test func servesFilesOnThisMacUnderANameTheServerTakes() {
         #expect(ServeSettings().serveArguments(model: "/models/My Model-UD-Q4_K_M.gguf")
             == ["serve", "--model", "local/My-Model-UD-Q4_K_M", "--model-dir", "/models/My Model-UD-Q4_K_M.gguf",
@@ -164,9 +173,9 @@ struct ServeSettingsTests {
     /// sparse KV, Neural Engine or thinking switch.
     static let flint = ModelFamily(unusable: ["--language-only", "--state-format", "--ple-memory", "--sparse-kv-memory",
                                               "--disable-ane", "--max-image-pixels", "--default-reasoning-effort",
-                                              "--thinking-token-budget", "--thinking-end-text"],
+                                              "--thinking-token-budget", "--thinking-end-text", "--verify-tree"],
                                    contextTokens: 262_144, maxContextTokens: 262_144)
-    static let moe = ModelFamily(unusable: ["--ple-memory", "--sparse-kv-memory", "--disable-ane"],
+    static let moe = ModelFamily(unusable: ["--ple-memory", "--sparse-kv-memory", "--disable-ane", "--verify-tree"],
                                  contextTokens: 262_144, maxContextTokens: 1_010_000)
 
     @Test func aModelStartsWithoutTheOptionsItsFamilyCannotUse() {
@@ -227,7 +236,7 @@ struct ServeSettingsTests {
     @Test func theContextHintIsTheModels() {
         #expect(ContextLength.message(Self.flint).contains("at most 256K, the model’s own window"))
         #expect(!ContextLength.message(Self.flint).contains("YaRN"))
-        #expect(ContextLength.message(Self.moe).contains("at most 1,010,000. Past the model’s own window, 256K, it stretches it with YaRN"))
+        #expect(ContextLength.message(Self.moe).contains("at most \(1_010_000.formatted()). Past the model’s own window, 256K, it stretches it with YaRN"))
         #expect(ContextLength.message(.unknown).contains("YaRN"))
     }
 
@@ -250,7 +259,7 @@ struct ServeSettingsTests {
         #expect(ContextLength.parse("0") == nil && ContextLength.parse("12.5K") == nil && ContextLength.parse("lots") == nil)
         #expect(ContextLength.title(32768) == "32K tokens")
         #expect(ContextLength.title(1_000_000) == "1M tokens")
-        #expect(ContextLength.title(100_000) == "100,000 tokens")
+        #expect(ContextLength.title(100_000) == "\(100_000.formatted()) tokens")
         // As typed, read back alike.
         #expect([32768, 1_000_000, 100_000].map { ContextLength.parse(ContextLength.text($0)) } == [32768, 1_000_000, 100_000])
     }

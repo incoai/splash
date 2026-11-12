@@ -110,6 +110,7 @@ struct LinearWorkload final {
   uint32_t rows = 0;
   LinearPhase phase = LinearPhase::Decode;
   LinearEpilogue epilogue = LinearEpilogue::None;
+  uint32_t researchFloatMathRows = 0;
   auto operator<=>(const LinearWorkload &) const = default;
 };
 
@@ -287,6 +288,9 @@ public:
   // count, the None, Residual and GateUp epilogues and every tile the device
   // may run them on, and the rotated rows of a full decode batch.
   [[nodiscard]] LinearScratchSize decodeScratchSize(ProjectionShape shape) const;
+  // Research-only: original one-lane plan/configuration, sixteen physical
+  // rows. Include the actual configs instead of doubling all partials.
+  [[nodiscard]] LinearScratchSize researchWideScratchSize(ProjectionShape shape) const;
   // The scratch of every prefill chunk and epilogue of a projection of
   // `shape`: the split partials and counters of the chunks that run the
   // staged tile (LinearGguf.cpp), the rotated rows of a full chunk, and where
@@ -330,7 +334,7 @@ private:
                                                                       uint32_t splits);
   // The scratch of every tile a decode plan of the workload may take, the
   // register tile's where it takes the projection's formats.
-  [[nodiscard]] LinearScratchSize ggufDecodeScratchSize(LinearWorkload workload, bool registerFormats) const;
+  [[nodiscard]] LinearScratchSize ggufDecodeScratchSize(LinearWorkload workload, bool registerFormats,uint32_t researchPhysicalRows=0) const;
   void addGguf(metal::CommandGraph &graph, const LinearBuffers &buffers,
                const Projection &projection, const LinearPlan &plan,
                const Projection *gate) const;

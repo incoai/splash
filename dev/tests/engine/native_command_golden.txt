@@ -32,6 +32,8 @@ activations_bf16 | --activations bf16 | auto auto --activations bf16
 activations_auto | --activations auto | auto auto
 verify_rows_all | --verify-rows all | auto auto --verify-rows all
 verify_rows_auto | --verify-rows auto | auto auto
+verify_tree_off | --verify-tree off | auto auto
+verify_tree_on | --verify-tree on | auto auto --verify-tree on
 kv_format_default | --kv-format int8 | auto auto
 state_format_default | --state-format fp32 | auto auto
 relaunch |  | auto auto --relaunch-context 61433

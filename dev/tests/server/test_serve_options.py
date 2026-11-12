@@ -91,6 +91,9 @@ OPTIONS = {
         {"auto": "auto", "all": "all"},
         ("", "budget", "every", "ALL"),
     ),
+    "--verify-tree": values(
+        "--verify-tree", {"off": "off", "on": "on"}, ("", "auto", "true", "ON")
+    ),
     "--ple-memory": values(
         "--ple-memory",
         {

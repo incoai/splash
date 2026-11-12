@@ -1,4 +1,7 @@
 #include "model/Runtime.hpp"
+#include "metal/abi/ResearchTree.h"
+#include "metal/abi/ResearchTreeWide.h"
+#include "ops/ResearchWideTree.hpp"
 #ifdef SPLASH_RUNTIME_INSTRUMENTATION
 #include "metal/abi/GDN.h"
 #include "model/RuntimeInstrumentation.hpp"
@@ -331,6 +334,15 @@ struct Runtime::Impl {
     std::vector<uint64_t> unreadableBlocks;
     uint32_t promptTokens = 0;
     uint32_t maxNewTokens = 0;
+    bool researchStableAttention = false;
+    bool researchWideCycleCapacity = false;
+    // Moving average of the tokens each cycle retained: where the plain
+    // 8-row cycle already retains nearly every row, a tree adds nothing.
+    // Observe chain acceptance before widening; a low prior makes high-acceptance
+    // streams pay for a speculative tree before there is evidence it can help.
+    float researchRetainedAverage = float(ExecutionLimits::targetVerifyRows);
+    uint32_t researchWideScratchLane = kLaneCount;
+    uint32_t researchInitialPrompt = 0;
     uint32_t generatedTokens = 0;
     SamplingParameters sampling;
     ConstraintMode constraint = ConstraintMode::None;
@@ -581,6 +593,8 @@ struct Runtime::Impl {
   VisionArenaPool visionPool{*this};
   EmbeddingsPool embeddingsPool{*this};
   std::vector<ElasticPool *> pools;
+  bool researchWideEnabled = false;
+  bool researchWideLastUsed = false;
 #ifdef SPLASH_RUNTIME_INSTRUMENTATION
   // Whether commands copy the target's logits before their policy
   // (RuntimeInstrumentation::captureTargetLogits), and the copies, one per
@@ -618,6 +632,7 @@ struct Runtime::Impl {
         decodeArena->batchSlice(DecodeTensor::PenaltyState, kLaneCount);
     if (budgetsVerifyRows(model, value.verifyRows))
       verifyBudget.emplace();
+    researchWideEnabled = value.verifyTree == VerifyTree::On;
     if (ExpertStore *store = model.expertStore())
       pools.push_back(&expertPool.emplace(*store));
     if (blockCache) {
@@ -2061,6 +2076,9 @@ struct Runtime::Impl {
     if (entry.tokens.size() != item.logicalPosition)
       throw std::logic_error("decode token history is not exact");
     static_cast<void>(synchronizedTables(entry, item));
+    entry.researchWideCycleCapacity=item.logicalPosition+16<=uint64_t(item.pageTable.size())*kv::kPageTokens;
+    entry.researchWideScratchLane=kLaneCount;
+    if(researchWideEnabled)for(uint32_t slot=0;slot<kLaneCount;++slot)if(slot!=entry.stateLane&&!states.metadata(slot).assigned()){entry.researchWideScratchLane=slot;break;}
     auto *draftInput = contents<uint32_t>(
         decodeArena->get(lane, DecodeTensor::DraftInputTokens),
         "draft input tokens");
@@ -2188,6 +2206,13 @@ struct Runtime::Impl {
     }
     ops::DraftSelector::addVerifyRows(graph, d(DecodeTensor::VerifyConfidence), d(DecodeTensor::VerifyRows),
                                       verify, maximumRows);
+    if (const auto wide = researchWideFor(entries)) {
+      ops::ResearchWideTree::addSelect(graph, d(DecodeTensor::Candidates), d(DecodeTensor::Unary),
+                                       d(DecodeTensor::TopPartialValues),
+                                       decodeArena->batchSlice(DecodeTensor::ProposedTokens, 3), wide);
+      ops::ResearchWideTree::addRope(graph, decodeArena->batchSlice(DecodeTensor::RopeCos, 2),
+                                     decodeArena->batchSlice(DecodeTensor::RopeSin, 2), wide);
+    }
     sampling.addThinkingDrafts(graph, std::span(policies).first(lanes),
                                d(DecodeTensor::ProposedTokens));
   }
@@ -2200,7 +2225,8 @@ struct Runtime::Impl {
       throw std::invalid_argument("invalid target verify batch");
     }
     const uint32_t lanes = static_cast<uint32_t>(entries.size());
-    const uint32_t storage = targetModel->decodeStorageLanes(lanes);
+    const auto wide=researchWideFor(entries);
+    const uint32_t storage = wide?2:targetModel->decodeStorageLanes(lanes);
     auto d = [&](DecodeTensor tensor) {
       return decodeArena->batchSlice(tensor, storage);
     };
@@ -2236,7 +2262,14 @@ struct Runtime::Impl {
     buffers.chunkKeys = chunkKeys;
     buffers.chunkValues = chunkValues;
     buffers.moe = decodeArena->moeScratch(storage);
-    buffers.verifyRows = decodeArena->batchSlice(DecodeTensor::VerifyRows, lanes);
+    buffers.verifyRows = decodeArena->batchSlice(DecodeTensor::VerifyRows, wide?2:lanes);
+    buffers.researchWideTree=wide;
+    researchWideLastUsed=bool(wide);
+    if(wide){
+      buffers.researchWideGdnTape=decodeArena->researchWideTape(entries[0]->researchWideScratchLane);
+      buffers.researchTreeScratch=decodeArena->batchSlice(DecodeTensor::Intermediate,kLaneCount);
+      if(buffers.researchTreeScratch.sizeBytes()<532480)throw std::logic_error("wide canonical scratch too short");
+    }
     for (uint32_t lane = 0; lane < lanes; ++lane)
       chunks[lane] = ops::PagedAttention::verifyParams(
           items[lane].logicalPosition,
@@ -2271,21 +2304,34 @@ struct Runtime::Impl {
                                      std::span<Request *const> entries) {
     if (entries.empty() || entries.size() > kLaneCount)
       throw std::invalid_argument("invalid target policy batch");
-    const uint32_t lanes = static_cast<uint32_t>(entries.size());
-    std::array<ops::SamplingPolicy, kLaneCount> policies{};
-    std::array<uint32_t, kLaneCount> stateLanes{};
-    for (uint32_t lane = 0; lane < lanes; ++lane) {
-      if (!entries[lane])
-        throw std::invalid_argument("empty target policy lane");
-      policies[lane] = samplingPolicy(*entries[lane]);
-      stateLanes[lane] = entries[lane]->stateLane;
+    const bool wide=bool(researchWideFor(entries));
+    const uint32_t lanes=wide?2:static_cast<uint32_t>(entries.size());
+    std::array<ops::SamplingPolicy,kLaneCount> policies{};
+    std::array<uint32_t,kLaneCount> stateLanes{};
+    for(uint32_t lane=0;lane<lanes;++lane){
+      const auto *entry=entries[wide?0:lane];
+      if(!entry)throw std::invalid_argument("empty target policy lane");
+      policies[lane]=samplingPolicy(*entry);stateLanes[lane]=entry->stateLane;
     }
 #ifdef SPLASH_RUNTIME_INSTRUMENTATION
-    encodeTargetLogitsCapture(graph, lanes, kDecodeRows);
+    encodeTargetLogitsCapture(graph,lanes,kDecodeRows);
 #endif
-    sampling.addVerify(graph, std::span(policies).first(lanes),
-                       samplingBuffers(lanes), geometry.target.stopTokens,
-                       {penaltyTable, std::span(stateLanes).first(lanes)});
+    sampling.addVerify(graph,std::span(policies).first(lanes),samplingBuffers(lanes),geometry.target.stopTokens,{penaltyTable,std::span(stateLanes).first(lanes)},wide);
+  }
+
+  static float researchRetainedLimit() {
+    static const float limit=[]{const char *v=getenv("SPLASH_WIDE_EMA");return v?std::strtof(v,nullptr):6.5F;}();
+    return limit;
+  }
+
+  MetalBuffer researchWideFor(std::span<Request *const> entries) const {
+    if(!researchWideEnabled || entries.size()!=1 || !entries[0]->images.empty() || !entries[0]->researchWideCycleCapacity || entries[0]->researchWideScratchLane>=kLaneCount || states.metadata(entries[0]->researchWideScratchLane).assigned() || !entries[0]->researchStableAttention || entries[0]->maxNewTokens-entries[0]->generatedTokens<8 || entries[0]->constraint!=ConstraintMode::None || entries[0]->thinking || entries[0]->researchRetainedAverage>=researchRetainedLimit() ||
+       samplingPenalties(*entries[0]).active() ||
+       geometry.target.hiddenSize!=5120 || geometry.target.stateLayout.format!=ops::GdnStateFormat::Float32 || kvPages.layout().format!=kv::Format::Int8)
+      return {};
+    auto scratch=decodeArena->get(0,DecodeTensor::ProposalProbs);
+    if(scratch.sizeBytes()<sizeof(ResearchTreeWideState))throw std::logic_error("wide scratch too short");
+    return scratch;
   }
 
   void encodeDraftStateCommitBatch(CommandGraph &graph,
@@ -2334,6 +2380,14 @@ struct Runtime::Impl {
       policies[lane] = samplingPolicy(*lanes[lane]);
     }
     const uint32_t width = static_cast<uint32_t>(lanes.size());
+    if (const auto wide = researchWideFor(lanes)) {
+      ops::ResearchWideTree::addAccept(graph, decodeArena->batchSlice(DecodeTensor::ProposedTokens, 3),
+                                       decodeArena->batchSlice(DecodeTensor::OutputTokens, 2),
+                                       decodeArena->get(0, DecodeTensor::RetainedCount),
+                                       decodeArena->get(0, DecodeTensor::AcceptedCount), wide, maximumRetained[0],
+                                       geometry.target.stopTokens.ids);
+      return;
+    }
     sampling.addAcceptance(
         graph,
         {decodeArena->batchSlice(DecodeTensor::ProposedTokens, width),
@@ -2375,22 +2429,54 @@ struct Runtime::Impl {
                           std::span<const uint32_t> maximumRetained) {
     encodeTargetVerifyBatchPolicy(graph, entries);
     encodeBatchAcceptance(graph, entries, maximumRetained);
+    if (const auto wide = researchWideFor(entries)) {
+      const auto &metadata = states.metadata(entries[0]->stateLane);
+      const auto gs = geometry.target.gdnShape();
+      const ResearchTreeTapeGather tape{decodeArena->gdnTapeSlot(entries[0]->stateLane, metadata.activeParity ^ 1),
+                                        ops::gdnTapeLayerBytes(gs), gs.convolutionDimension,
+                                        (gs.keyHeads + gs.valueHeads) * gs.headDimension, gs.valueHeads,
+                                        geometry.target.stateLayout.layers};
+      ops::ResearchWideTree::addPathCommit(graph, wide, decodeArena->researchWideTape(entries[0]->researchWideScratchLane),
+                                           decodeArena->batchSlice(DecodeTensor::GdnTape, kLaneCount), tape,
+                                           decodeArena->batchSlice(DecodeTensor::CapturedTargetHidden, 2),
+                                           geometry.target.capturedHiddenSize());
+      const auto tables = laneTables(entries[0]->stateLane);
+      for (uint32_t layer = 0; layer < geometry.target.kvLayout.attentionLayers; ++layer) {
+        auto store = ops::PagedAttention::verifyParams(items[0].logicalPosition,
+                                                       static_cast<uint32_t>(items[0].pageTable.size()));
+        store.kv = kvPages.layers()[layer];
+        ops::ResearchWideTree::addKvCommit(graph, wide,
+                                           decodeArena->attentionBatchSlice(DecodeTensor::ChunkKeysBase, layer, 2),
+                                           decodeArena->attentionBatchSlice(DecodeTensor::ChunkValuesBase, layer, 2),
+                                           tables.pages, store);
+      }
+    }
     encodeTargetStateCommit(graph, entries);
     encodeDraftStateCommitBatch(graph, entries, items);
   }
 
   void encodeBatchEmbedding(CommandGraph &graph, DecodeTensor tokens,
-                            DecodeTensor output, uint32_t lanes) {
+                            DecodeTensor output, uint32_t lanes,bool wide=false) {
     if (!lanes || lanes > kLaneCount)
       throw std::invalid_argument("invalid embedding batch width");
-    const uint32_t rows = lanes * kDecodeRows;
-    targetModel->addEmbedding(graph, decodeArena->batchSlice(tokens, lanes),
-                             decodeArena->batchSlice(output, lanes), rows);
+    if(wide&&lanes!=1)throw std::logic_error("wide embedding B1 only");
+    const uint32_t storage=wide?2:lanes;
+    const uint32_t rows=storage*kDecodeRows;
+    targetModel->addEmbedding(graph,decodeArena->batchSlice(tokens,storage),decodeArena->batchSlice(output,storage),rows);
   }
 
-  void encodeBatchVerifyInput(CommandGraph &graph, uint32_t lanes) {
+  void encodeBatchVerifyInput(CommandGraph &graph, uint32_t lanes,bool wide=false) {
     if (!lanes || lanes > kLaneCount)
       throw std::invalid_argument("invalid verify-input batch width");
+    if(wide){
+      if(lanes!=1)throw std::logic_error("wide input B1 only");
+      ops::ResearchWideTree::addInput(graph, decodeArena->get(0, DecodeTensor::DraftInputTokens),
+                                      decodeArena->batchSlice(DecodeTensor::ProposedTokens, 3),
+                                      decodeArena->batchSlice(DecodeTensor::InputTokens, 2),
+                                      decodeArena->batchSlice(DecodeTensor::VerifyRows, 2),
+                                      geometry.target.vocabularySize);
+      return;
+    }
     targetModel->addVerifyInput(
         graph, decodeArena->batchSlice(DecodeTensor::DraftInputTokens, lanes),
         decodeArena->batchSlice(DecodeTensor::ProposedTokens, lanes),
@@ -2418,6 +2504,9 @@ struct Runtime::Impl {
       std::span<DecodeLaneResult> lanes, std::span<const ModelBatchItem> items,
       CommandTiming timing, SpilledKvReads &reads, bool constrained) {
     reads.end();
+    const bool wasWide=items.size()==1&&researchWideLastUsed;
+    uint32_t wideProposals=0;
+    if(wasWide){const auto &tree=*contents<ResearchTreeWideState>(decodeArena->get(0,DecodeTensor::ProposalProbs),"wide metadata");if(tree.node_count<8||tree.node_count>16)throw std::runtime_error("wide real-node count invalid");wideProposals=tree.node_count-1;}
     std::array<std::vector<uint64_t>, kLaneCount> unreadable = unreadableBlocks(reads);
     for (uint32_t lane = 0; lane < items.size(); ++lane) {
       DecodeLaneResult &laneResult = lanes[lane];
@@ -2444,6 +2533,8 @@ struct Runtime::Impl {
           d(DecodeTensor::OutputTokens), "target output tokens");
       laneResult.failure =
           invalidSelection({targetTokens, laneResult.retained}, lane);
+      if (items.size() == 1 && laneResult.request)
+        laneResult.request->researchRetainedAverage += 0.125F * (float(laneResult.retained) - laneResult.request->researchRetainedAverage);
     }
     // A cycle whose every lane commits teaches the verify budget its lanes'
     // labels and its cost.
@@ -2514,7 +2605,7 @@ struct Runtime::Impl {
       // speculation counts the ones the lane verified.
       const uint32_t accepted =
           std::min(laneResult.accepted, laneResult.retained - 1);
-      const uint32_t verified = laneResult.verifyRows - 1;
+      const uint32_t verified = wasWide?wideProposals:laneResult.verifyRows-1;
       results.push_back({entry.id,
                          0,
                          std::move(output),
@@ -2808,6 +2899,7 @@ StateAdmission Runtime::resume(const ModelRequest &request) {
     entry.promptTokens = static_cast<uint32_t>(request.prompt.size());
     entry.tokens.assign(request.prompt.begin(), request.prompt.end());
     entry.maxNewTokens = request.maxNewTokens;
+    entry.researchStableAttention=entry.researchStableAttention&&ops::ResearchWideTree::stablePagePartition(entry.researchInitialPrompt,entry.maxNewTokens);
     entry.images = std::move(images);
     entry.restoredTokens = request.restoredTokens;
     impl_->bindPenalties(entry, request.prompt);
@@ -2828,6 +2920,8 @@ StateAdmission Runtime::beginAt(const ModelRequest &request, uint32_t stateLane)
   entry.promptTokens = static_cast<uint32_t>(request.prompt.size());
   entry.tokens.assign(request.prompt.begin(), request.prompt.end());
   entry.maxNewTokens = request.maxNewTokens;
+    entry.researchInitialPrompt=entry.promptTokens;
+  entry.researchStableAttention=researchTreeRequestEligible(entry.promptTokens,entry.maxNewTokens,request.sampling,request.constraint,request.thinkingBudget!=nullptr,request.flags);
   entry.sampling = request.sampling;
   entry.constraint = request.constraint;
   entry.flags = request.flags;
@@ -3270,14 +3364,26 @@ Runtime::decodeAsync(const BatchPlan &plan,
   }
 
   const std::span<Impl::Request *const> entries(requests.data(), width);
+  const bool wide=bool(impl_->researchWideFor(entries));
+  if(wide&&Impl::samplingEnabled(*entries[0])){
+    // Lane 1's block holds the draws of tree nodes 8..15 (ACCEPTANCE + row).
+    Impl::Request &entry=*entries[0];std::array<float,kSamplingUniformCount> second{};
+    for(float &u:second)u=Impl::nextUniform(entry);
+    std::copy(second.begin(),second.end(),contents<float>(impl_->decodeArena->get(1,DecodeTensor::SamplingUniforms),"wide sampling uniforms"));
+  }
+  const uint32_t targetStorage=wide?2:width;
   const uint32_t ropeRows = width * kDecodeRows;
+  if(wide){
+    auto *positions=contents<uint32_t>(impl_->decodeArena->batchSlice(DecodeTensor::Positions,2),"wide positions");
+    for(uint32_t row=8;row<16;++row){auto rotary=impl_->ropePosition(*entries[0],items[0].logicalPosition+row);std::copy(rotary.begin(),rotary.end(),positions+row*3);}
+  }
   CommandGraph commandGraph;
   impl_->addRopeTables(
       commandGraph,
-      impl_->decodeArena->batchSlice(DecodeTensor::Positions, width), ropeRows,
+      impl_->decodeArena->batchSlice(DecodeTensor::Positions,targetStorage),targetStorage*kDecodeRows,
       impl_->decodeArena->batchSlice(DecodeTensor::DraftPositions, width),
-      ropeRows, impl_->decodeArena->batchSlice(DecodeTensor::RopeCos, width),
-      impl_->decodeArena->batchSlice(DecodeTensor::RopeSin, width),
+      ropeRows, impl_->decodeArena->batchSlice(DecodeTensor::RopeCos,targetStorage),
+      impl_->decodeArena->batchSlice(DecodeTensor::RopeSin,targetStorage),
       impl_->decodeArena->batchSlice(DecodeTensor::DraftRopeCos, width),
       impl_->decodeArena->batchSlice(DecodeTensor::DraftRopeSin, width));
   impl_->encodeBatchEmbedding(commandGraph, DecodeTensor::DraftInputTokens,
@@ -3294,9 +3400,8 @@ Runtime::decodeAsync(const BatchPlan &plan,
     return std::make_unique<Impl::ConstrainedDecodeTicket>(*impl_, std::move(lanes), items, std::move(reads),
                                                            commandGraph, std::move(count), std::move(completion));
   }
-  impl_->encodeBatchVerifyInput(commandGraph, width);
-  impl_->encodeBatchEmbedding(commandGraph, DecodeTensor::InputTokens,
-                              DecodeTensor::Hidden0, width);
+  impl_->encodeBatchVerifyInput(commandGraph,width,wide);
+  impl_->encodeBatchEmbedding(commandGraph,DecodeTensor::InputTokens,DecodeTensor::Hidden0,width,wide);
   impl_->encodeTargetVerifyBatchForward(commandGraph, entries, items, *reads);
   impl_->encodeVerifyCommit(commandGraph, entries, items, {maximumRetained.data(), width});
 
@@ -3795,6 +3900,21 @@ std::unique_ptr<RuntimeModel> createRuntime(RuntimeContext context) {
 }
 
 #ifdef SPLASH_RUNTIME_INSTRUMENTATION
+void RuntimeInstrumentation::setResearchTreeMode(Runtime &runtime,uint32_t mode){
+  if(mode!=0&&mode!=2)throw std::logic_error("tree mode is 0 (chain) or 2 (wide tree)");
+  if(!runtime.impl_->requests.empty())throw std::logic_error("tree mode requires an idle runtime");
+  runtime.impl_->researchWideEnabled=mode==2;
+}
+std::vector<uint32_t> RuntimeInstrumentation::lastResearchWideTreeData(const Runtime &runtime){
+ const auto &impl=*runtime.impl_;if(!impl.researchWideLastUsed)return {};
+ const auto *data=static_cast<const uint32_t*>(impl.decodeArena->get(0,DecodeTensor::ProposalProbs).contents());
+ return {data,data+sizeof(ResearchTreeWideState)/4};
+}
+std::vector<uint32_t> RuntimeInstrumentation::lastResearchWideInputTokens(const Runtime &runtime){
+ const auto &impl=*runtime.impl_;if(!impl.researchWideLastUsed)return {};
+ const auto *data=static_cast<const uint32_t*>(impl.decodeArena->get(0,DecodeTensor::InputTokens).contents());
+ return {data,data+16};
+}
 std::vector<uint32_t> RuntimeInstrumentation::lastTableRows(const Runtime &runtime, uint32_t lane) {
   return runtime.impl_->targetModel->verifyTableRows(lane);
 }

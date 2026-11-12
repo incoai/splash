@@ -507,6 +507,10 @@ extension LaunchOption {
             help: "A MoE model’s greedy and seeded answers repeat when a request runs alone with the same prompts cached, at some cost in speed. A prompt sent again reads from the cache, so its answer can differ.",
             section: .requests, kind: .choice(standard: "Off", choices: [("all", "On")], custom: nil)),
         LaunchOption(
+            flag: "--verify-tree", title: "Tree verification (experimental)",
+            help: "Checks additional candidate continuations on the dense 27B model. Requests it cannot serve this way use standard decoding.",
+            section: .requests, kind: .choice(standard: "Off", choices: [("on", "On")], custom: nil)),
+        LaunchOption(
             flag: "--disable-ane", title: "Neural Engine for long prompts",
             help: "Reads long prompts faster on models that can use it.",
             section: .requests, kind: .toggle(on: false)),

@@ -390,6 +390,7 @@ public:
   Cache(const Cache &) = delete;
   Cache &operator=(const Cache &) = delete;
 
+  void setResearchKeepWriter(bool value){if(!requests_.empty())throw std::logic_error("writer switch requiresidlecache");researchKeepWriter_=value;}
   [[nodiscard]] bool persistent() const noexcept { return persistent_; }
   // A file that stopped taking writes closes the KV tier; existing copies
   // stay readable. KV writes pass the write budget (model::DiskBudget).
@@ -474,7 +475,7 @@ public:
   void invalidateState(uint64_t block) noexcept { states_.invalidate(block); }
   // A request begins in its mode; endRequest returns what remains of its
   // commitment, as suspension does by ending it.
-  void beginRequest(uint64_t requestId, KvMode mode = KvMode::Resident);
+  void beginRequest(uint64_t requestId, KvMode mode = KvMode::Resident,bool retainComputedPages=false);
   void endRequest(uint64_t requestId);
 
   // Spilling. Whether a new Spill request may start, or a Resident one
@@ -929,6 +930,7 @@ private:
   struct Request final {
     std::vector<uint32_t> pages;
     std::vector<uint64_t> cachedBlocks;
+    bool retainComputedPages = false;
     KvMode mode = KvMode::Resident;
     // The last cut (cutPageTable) and the first page changed since, if any.
     uint64_t revision = 0;
@@ -1649,6 +1651,7 @@ private:
   // the passed pages and the tail it unpins (reach).
   [[nodiscard]] bool trims(const Walk &walk) const noexcept;
 
+  bool researchKeepWriter_ = false;
   KvPool &pool_;
   KvTier *tier_;
   std::optional<CacheSpillPolicy> spill_;

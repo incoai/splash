@@ -100,7 +100,7 @@ struct CacheDiskQuota final {
   uint64_t bytes = 0;
 };
 
-struct RuntimeResourcesConfig {
+struct RuntimeResourcesConfig : model::DecodeOptions {
   kv::Format kvFormat = kv::Format::Int8;
   ops::GdnStateFormat stateFormat = ops::GdnStateFormat::Float32;
   std::filesystem::path metallibPath;
@@ -160,14 +160,6 @@ struct RuntimeResourcesConfig {
   // --kv-window-trim off: a windowed target's pages keep every layer's K/V,
   // for validation that trimming changes no output (CacheWindowPolicy::trim).
   bool kvWindowTrim = true;
-  // --verify-rows: the rows of the draft's block a decode cycle verifies
-  // (model::budgetsVerifyRows); a benchmark round verifies every row so that
-  // rounds repeat one another.
-  model::VerifyRows verifyRows = model::VerifyRows::Auto;
-  // --activations: whether the plans may round activations to int8
-  // where an int8-activation path takes them, or keep every activation bf16
-  // (ops::Int8Activations), for the life of the engine (ops::ExecutionPlans).
-  ops::Int8Activations int8Activations = ops::Int8Activations::On;
   // The prefill FFN's Neural Engine split (startAneFfn): off with
   // --disable-ane, and a benchmark round runs the split of the first so that
   // rounds repeat one another.
@@ -370,7 +362,7 @@ private:
                    std::unique_ptr<ops::AneFfn> aneFfn, AneFfnOutcome aneFfnOutcome,
                    std::unique_ptr<model::KvBlockCache> blockCache,
                    std::unique_ptr<model::KvHistoryStream> historyStream, bool spillAlways,
-                   model::VerifyRows verifyRows);
+                   model::DecodeOptions decodeOptions);
   // Takes back the restore points the last process left in a persistent
   // tier (Cache::adopt) and opens its files for this one.
   void adoptPersistentCache();
@@ -406,8 +398,7 @@ private:
   AneFfnOutcome aneFfnOutcome_;
   // --kv-spill always.
   bool spillAlways_ = false;
-  // --verify-rows, which modelContext() passes on.
-  model::VerifyRows verifyRows_ = model::VerifyRows::Auto;
+  model::DecodeOptions decodeOptions_;
   // Ends a probation once it has lasted, unless the process stops first.
   std::thread probation_;
   std::mutex probationMutex_;

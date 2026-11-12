@@ -618,7 +618,7 @@ RuntimeResources::RuntimeResources(
     std::unique_ptr<ops::AneFfn> aneFfn, AneFfnOutcome aneFfnOutcome,
     std::unique_ptr<model::KvBlockCache> blockCache,
     std::unique_ptr<model::KvHistoryStream> historyStream, bool spillAlways,
-    model::VerifyRows verifyRows)
+    model::DecodeOptions decodeOptions)
     : persistentCache_(std::move(persistentCache)),
       backend_(std::move(backend)), readers_(std::move(readers)), model_(std::move(model)),
       operators_(std::move(operators)),
@@ -631,7 +631,7 @@ RuntimeResources::RuntimeResources(
       cache_(std::move(cache)), aneFfn_(std::move(aneFfn)),
       blockCache_(std::move(blockCache)), historyStream_(std::move(historyStream)),
       releasableMemory_({model_.images.get(), model_.expertStore()}, idleSplit(aneFfn_.get())),
-      aneFfnOutcome_(std::move(aneFfnOutcome)), spillAlways_(spillAlways), verifyRows_(verifyRows) {}
+      aneFfnOutcome_(std::move(aneFfnOutcome)), spillAlways_(spillAlways), decodeOptions_(decodeOptions) {}
 
 std::unique_ptr<RuntimeResources>
 RuntimeResources::create(const RuntimeResourcesConfig &config,
@@ -1036,6 +1036,8 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
   }
   ready();
   reportVerifyRows(loaded, config.verifyRows);
+  if (config.verifyTree == model::VerifyTree::On)
+    logLine("Decode cycles verify a tree of candidate rows where the target supports it (--verify-tree on).");
 
   // The automatic tier keeps its staging only where the plan holds the model
   // and the requested context beside it, the parts as they load, or where
@@ -1221,6 +1223,9 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
       windowPolicy = CacheWindowPolicy{.windowPages = kvLayout.windowPages(),
                                        .trim = kvLayout.slimmable() && config.kvWindowTrim};
     auto cache = std::make_unique<engine::Cache>(*kvPool, kvTier.get(), disk.budget, spillPolicy, windowPolicy);
+    // A tree verify keeps the pages a request computed (Cache::setResearchKeepWriter), so that
+    // every cycle of the request reads the one numeric version of its history.
+    cache->setResearchKeepWriter(config.verifyTree == model::VerifyTree::On);
     if (disk.space)
       cache->setDiskMeasure([space = disk.space.get()] { space->measure(); });
     // A target that can spill holds one empty Index extent from the start
@@ -1275,7 +1280,7 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
         std::move(memoryGovernor), startClaim, std::move(startScope), std::move(kvPages), std::move(stateStorage),
         std::move(kvTier), std::move(disk.space), std::move(kvPool), std::move(cache),
         std::move(aneFfn.split), std::move(aneFfn.outcome), std::move(blockCache),
-        std::move(historyStream), config.kvSpillAlways, config.verifyRows));
+        std::move(historyStream), config.kvSpillAlways, config));
     result->adoptPersistentCache();
     return result;
   } catch (const RuntimeResourcesError &) {
@@ -1407,7 +1412,8 @@ model::RuntimeContext RuntimeResources::modelContext() noexcept {
       aneFfn_.get(),
       blockCache_.get(),
       historyStream_.get(),
-      verifyRows_,
+      decodeOptions_.verifyRows,
+      decodeOptions_.verifyTree,
   };
 }
 

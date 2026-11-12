@@ -207,6 +207,12 @@ LinearScratchSize Linear::decodeScratchSize(ProjectionShape shape) const {
   return bound;
 }
 
+LinearScratchSize Linear::researchWideScratchSize(ProjectionShape shape) const {
+  LinearScratchSize bound;
+  for(const auto epilogue:{LinearEpilogue::None,LinearEpilogue::Residual,LinearEpilogue::GateUp})bound.include(ggufDecodeScratchSize(decode({shape.outputSize,shape.inputSize},1,epilogue),shape.registerFormats,16));
+  return bound;
+}
+
 LinearScratchSize Linear::prefillScratchSize(ProjectionShape shape) const {
   LinearScratchSize bound;
   // Prefill plans take split scratch only in chunks that run the staged tile,

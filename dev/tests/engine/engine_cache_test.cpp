@@ -6841,6 +6841,65 @@ void testStagedStateFreesItsCopiedChain() {
   cache.checkInvariants();
 }
 
+// The research policy is a per-request admission choice, off by default.
+// It changes the active request's numeric page version, never the canonical
+// token-keyed cache block. Exercise distinct page content and concurrent leases.
+void testResearchWriterRetentionIsScopedAndReleasesPages() {
+  uint32_t cases=0;
+  for(bool global:{false,true})for(bool eligible:{false,true})for(uint32_t kind=0;kind<4;++kind){
+    if(kind==1)continue; // Existing window policy already promotes the writer; compare it separately below.
+    test::TestKvStorage storage{16,100,1,10,30};KvPool pool{storage,16};
+    test::TestKvTier tier;auto budget=std::make_shared<model::DiskBudget>(6400);tier.budget=budget;
+    const auto spill=kind>=2?std::optional(CacheSpillPolicy{1,1}):std::nullopt;
+    const auto window=kind==1?std::optional(CacheWindowPolicy{2,false}):std::nullopt;
+    engine::Cache cache(pool,kind>=2?&tier:nullptr,kind>=2?budget:nullptr,spill,window);
+    cache.setResearchKeepWriter(global);
+    std::vector<uint32_t> tokens(65);std::iota(tokens.begin(),tokens.end(),1000);
+    cache.beginRequest(1);require(admitTokens(cache,1,64).granted(),"research fixture seed pages denied");
+    auto seed=cache.cutPageTable(1);std::array<uint32_t,2>canonical{seed.pages[0],seed.pages[1]};
+    storage.content[canonical[0]]=111;storage.content[canonical[1]]=222;
+    require(cache.publishCommittedBlocks(1,tokens,64,{})==0,"seed unexpectedly deduplicated");
+    const auto block=cache.blockAt(1,64);cache.endRequest(1);cache.checkInvariants();
+    require(pool.freePageCount()==14,"seed cache did not own exactly two pages");
+    const bool keep=global&&eligible&&kind==0;
+    const auto mode=kind==3?KvMode::Spill:KvMode::Resident;
+    std::array<std::array<uint32_t,2>,2>writers{};
+    for(uint32_t n=0;n<2;++n){const uint64_t id=n+2;cache.beginRequest(id,mode,eligible);
+      rejects([&]{cache.setResearchKeepWriter(!global);},"writer switch requiresidlecache","live cache allowed a global policy switch");
+      require(admitTokens(cache,id,64).granted(),"research writer pages denied");
+      auto before=cache.cutPageTable(id);writers[n]={before.pages[0],before.pages[1]};
+      require(writers[n][0]!=canonical[0]&&writers[n][1]!=canonical[1],"writer was not private before publication");
+      storage.content[writers[n][0]]=333+n;storage.content[writers[n][1]]=444+n;
+      const uint32_t swapped=cache.publishCommittedBlocks(id,tokens,64,{});auto after=cache.cutPageTable(id);
+      require(swapped==(keep?0u:64u),"request/global/mode retention scope is wrong");
+      require(after.revision==(keep?1u:2u),"retention changed page-table revision incorrectly");
+      require(cache.blockAt(id,64)==block,"retention changed token-keyed block identity");
+      for(uint32_t i=0;i<2;++i){require(after.pages[i]==(keep?writers[n][i]:canonical[i]),"active page identity wrong");require(storage.content[after.pages[i]]==(keep?(i?444u+n:333u+n):(i?222u:111u)),"active numeric page version wrong");}
+      require(storage.content[canonical[0]]==111&&storage.content[canonical[1]]==222,"retention mutated canonical KV bytes");
+      cache.checkInvariants();
+    }
+    require(pool.freePageCount()==(keep?10u:14u),"retention live-page accounting wrong");
+    cache.endRequest(2);cache.checkInvariants();
+    if(keep)for(uint32_t i=0;i<2;++i)require(cache.pageTable(3).pages[i]==writers[1][i]&&pool.pageActive(writers[1][i]),"ending peer freed a live writer lease");
+    cache.endRequest(3);cache.checkInvariants();require(pool.freePageCount()==14,"writer pages leaked at request end");
+    cache.setResearchKeepWriter(false);cache.beginRequest(4,KvMode::Resident,true);require(admitTokens(cache,4,64).granted(),"disabled-policy request pages denied");
+    require(cache.publishCommittedBlocks(4,tokens,64,{})==64,"idle reset did not restore default dedup behavior");cache.endRequest(4);cache.checkInvariants();
+    for(bool more=true;more;){more=test::evictStep(cache).gave();more=test::stateStep(cache,engine::ReclaimClass::InUse).gave()||more;static_cast<void>(cache.pollTransfers());}cache.checkInvariants();require(pool.freePageCount()==16,"cache eviction leaked a canonical or writer page");++cases;
+  }
+  // A window already keeps/promotes writers in the legacy policy. Verify
+  // global/request research flags have no effect on its established trace.
+  const auto windowTrace=[&](bool global,bool eligible){
+    test::TestKvStorage storage{16,100,1,0,30};KvPool pool{storage,16};engine::Cache cache(pool,nullptr,nullptr,std::nullopt,CacheWindowPolicy{2,false});cache.setResearchKeepWriter(global);std::vector<uint32_t>tokens(65);std::iota(tokens.begin(),tokens.end(),1000);std::vector<uint64_t>trace;
+    for(uint64_t id=1;id<=3;++id){cache.beginRequest(id,KvMode::Resident,id>1&&eligible);require(admitTokens(cache,id,64).granted(),"window writer fixture denied");for(uint32_t i=0;i<2;++i)storage.content[cache.pageTable(id).pages[i]]=100*id+i;
+      trace.push_back(cache.publishCommittedBlocks(id,tokens,64,{}));const auto t=cache.cutPageTable(id);trace.push_back(t.revision);trace.push_back(cache.blockAt(id,64));for(auto page:t.pages){trace.push_back(page);trace.push_back(storage.content[page]);}trace.push_back(pool.freePageCount());cache.checkInvariants();if(id==1)cache.endRequest(id);
+    }
+    cache.endRequest(2);cache.checkInvariants();for(auto page:cache.pageTable(3).pages){trace.push_back(page);trace.push_back(storage.content[page]);require(pool.pageActive(page),"window peer release freed active page");}cache.endRequest(3);cache.checkInvariants();trace.push_back(pool.freePageCount());for(bool more=true;more;){more=test::evictStep(cache).gave();more=test::stateStep(cache,engine::ReclaimClass::InUse).gave()||more;static_cast<void>(cache.pollTransfers());}cache.checkInvariants();require(pool.freePageCount()==16,"window cache pages leaked");return trace;
+  };
+  const auto referenceWindow=windowTrace(false,false);
+  for(bool global:{false,true})for(bool eligible:{false,true}){require(windowTrace(global,eligible)==referenceWindow,"research flags changed existing window writer/lease policy");++cases;}
+  require(cases==16,"research writer test matrix incomplete");
+}
+
 int main() {
   try {
     testStateInUseGoesLast();
@@ -6929,6 +6988,7 @@ int main() {
     testCacheSaltSeparatesPrompts();
     testProbeCannotCrossCaches();
     testPageTableReportsWhatChanged();
+    testResearchWriterRetentionIsScopedAndReleasesPages();
     testNewPagesTheWorkDoesNotFillComeCleared();
     testCacheLookupAndOneTokenReplay();
     testLazyJunctionMaterialization();

@@ -16,6 +16,9 @@ namespace splash::model {
 // these; production binaries never link it.
 class RuntimeInstrumentation final {
 public:
+  static void setResearchTreeMode(Runtime &runtime,uint32_t mode);
+  [[nodiscard]] static std::vector<uint32_t> lastResearchWideTreeData(const Runtime &runtime);
+  [[nodiscard]] static std::vector<uint32_t> lastResearchWideInputTokens(const Runtime &runtime);
   // The PLE rows the last decode step gathered for batch lane `lane`'s
   // verify rows, each row's heads' in order (Qwen3.8-Flash-Next), until the
   // next decode step; none for a target without them.

@@ -112,6 +112,30 @@ enum class VerifyRows : uint8_t {
   All,
 };
 
+// Whether a dense target's decode cycles verify a tree of candidate
+// continuations (--verify-tree): sixteen rows in one step, the draft's chain
+// plus the likeliest alternatives its selector ranks, where one wide verify
+// then commits the longest path the target's own greedy argmax or sampled
+// draws follow. Every committed token is the target's selection at its path
+// node, so output is that of the chain verify (a sampled request keeps its
+// distribution) but for rounding where the two kernels differ.
+enum class VerifyTree : uint8_t {
+  Off,
+  On,
+};
+
+// Decode policy shared by command parsing and resource assembly. Model
+// execution keeps it for the engine's lifetime; benchmark rounds can request
+// every row so that a greedy or seeded run repeats its output.
+struct DecodeOptions {
+  // --verify-rows auto|all: budget MoE rows, or verify the full block.
+  VerifyRows verifyRows = VerifyRows::Auto;
+  // --verify-tree on|off: sixteen candidate rows where the target supports it.
+  VerifyTree verifyTree = VerifyTree::Off;
+  // --activations auto|bf16: allow int8 activation paths or retain BF16.
+  ops::Int8Activations int8Activations = ops::Int8Activations::On;
+};
+
 // Whether the decode cycles of `model` verify the rows the verify budget
 // chooses (model::VerifyBudget, ops::DraftSelector::addVerifyRows) under
 // `rows`. Each row a MoE target verifies routes its own experts, which a
@@ -135,6 +159,7 @@ struct RuntimeContext final {
   KvBlockCache *blockCache = nullptr;
   KvHistoryStream *historyStream = nullptr;
   VerifyRows verifyRows = VerifyRows::Auto;
+  VerifyTree verifyTree = VerifyTree::Off;
 };
 
 // Validates only the interface between independently defined target and draft
