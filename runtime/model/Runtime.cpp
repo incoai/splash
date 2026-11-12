@@ -338,7 +338,9 @@ struct Runtime::Impl {
     bool researchWideCycleCapacity = false;
     // Moving average of the tokens each cycle retained: where the plain
     // 8-row cycle already retains nearly every row, a tree adds nothing.
-    float researchRetainedAverage = 4.0F;
+    // Observe chain acceptance before widening; a low prior makes high-acceptance
+    // streams pay for a speculative tree before there is evidence it can help.
+    float researchRetainedAverage = float(ExecutionLimits::targetVerifyRows);
     uint32_t researchWideScratchLane = kLaneCount;
     uint32_t researchInitialPrompt = 0;
     uint32_t generatedTokens = 0;
