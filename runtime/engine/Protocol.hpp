@@ -18,7 +18,7 @@
 // pins the bytes both sides agree on.
 namespace splash::protocol {
 
-inline constexpr uint16_t kProtocolVersion = 13;
+inline constexpr uint16_t kProtocolVersion = 14;
 // A frame is its header, the magic "SPLH", the u16 protocol version, the
 // u16 FrameType and the u64 payload length, then the payload.
 inline constexpr size_t kFrameHeaderBytes = 16;
@@ -27,6 +27,11 @@ inline constexpr uint32_t kStatusSchemaVersion = 8;
 // carry well over 64 MiB of resized RGB bytes.
 inline constexpr uint64_t kAbsoluteMaxFramePayloadBytes =
     256ULL * 1024 * 1024;
+// A video request carries its Ref2VA references' normalized frames: three
+// 15 s reference videos on a 768p canvas are 3.4 GB of RGB. A video model's
+// engine raises its VideoRequest bound (ProtocolLimits) up to this.
+inline constexpr uint64_t kAbsoluteMaxVideoRequestPayloadBytes =
+    4ULL * 1024 * 1024 * 1024;
 
 // Every integer, including binary prompt/token words, is little-endian on the
 // wire.
@@ -37,6 +42,7 @@ enum class FrameType : uint16_t {
   StatusRequest = 0x0004,
   ReleaseRequest = 0x0005,
   Stop = 0x0006,
+  VideoRequest = 0x0007,
 
   Ready = 0x0100,
   Start = 0x0101,
@@ -48,6 +54,8 @@ enum class FrameType : uint16_t {
   PromptProgress = 0x0108,
   StartFailed = 0x0109,
   Warming = 0x010A,
+  VideoProgress = 0x010B,
+  VideoOutput = 0x010C,
 };
 
 // Request errors reject one request while preserving the stream.  An
@@ -107,6 +115,10 @@ template <typename T> struct ProtocolResult {
 // and the codec and the frame parser rely on that.
 struct ProtocolLimits {
   uint64_t maxFramePayloadBytes = kAbsoluteMaxFramePayloadBytes;
+  // A VideoRequest's payload bound, at most
+  // kAbsoluteMaxVideoRequestPayloadBytes; 0: maxFramePayloadBytes. A video
+  // model's engine raises it (VideoRuntime), a language model's keeps 0.
+  uint64_t maxVideoRequestPayloadBytes = 0;
   uint64_t maxStatusJsonBytes = 32ULL * 1024 * 1024;
   uint64_t maxErrorStringBytes = 1ULL * 1024 * 1024;
   uint32_t maxPromptTokens = 1U << 20;
@@ -196,9 +208,9 @@ struct RequestFrame {
 //   StatusRequest  u64 correlationId
 //   ReleaseRequest u64 correlationId
 //   Stop           u64 requestId
-//   Ready          u32 maxConcurrentRequests, u32 maxContextTokens, u8 vision,
-//                  u32 vocabularySize, u32 maskRows, u32 stop token count,
-//                  u32 stop tokens
+//   Ready          u32 maxConcurrentRequests, u32 maxContextTokens,
+//                  u8 features (ReadyFeature), u32 vocabularySize,
+//                  u32 maskRows, u32 stop token count, u32 stop tokens
 //   Start          u64 requestId, u32 lane, u32 matchedPromptTokens
 //   PromptProgress u64 requestId, u32 processedTokens, u64 elapsedMicros
 //   Tokens         u64 requestId, u32 sequenceOffset, u32 count, u32 tokens
@@ -216,6 +228,20 @@ struct RequestFrame {
 //   StartFailed    u8 kind, u8 bound, u64 requiredBytes, u64 budgetBytes,
 //                  u32 planContextTokens, u32 message bytes, the message
 //   Warming        u32 stepsDone, u32 steps
+//   VideoRequest   u64 requestId, u8 DiT name bytes, u8 outputs
+//                  (VideoOutputFlag), u32 frames, u32 width, u32 height,
+//                  u32 steps, u64 seed, u8 keyframes (VideoKeyframeFlag), u32
+//                  prompt token count, u32 reference count, the DiT name
+//                  (validDitName), the prompt tokens, per
+//                  reference its header (u8 kind, u32 frames, u32 width,
+//                  u32 height, u64 soundtrack samples), then the first
+//                  frame's and the last frame's pixels, each height x width x
+//                  3 bytes, then per reference its pixels (frames x height x
+//                  width x 3 bytes) and its soundtrack (2 x samples f32)
+//   VideoProgress  u64 requestId, u8 phase, u32 step, u32 steps,
+//                  u64 elapsedMicros, u64 peakFootprintBytes
+//   VideoOutput    u64 requestId, u8 output, u32 frames, u64 wallMicros,
+//                  the mp4
 struct CancelFrame {
   uint64_t requestId = 0;
 
@@ -267,6 +293,12 @@ struct WarmingEvent {
   bool operator==(const WarmingEvent &) const = default;
 };
 
+// The bits of a ReadyEvent's features byte.
+enum ReadyFeature : uint8_t {
+  FeatureVision = 1U << 0,
+  FeatureVideo = 1U << 1,
+};
+
 struct ReadyEvent {
   uint32_t maxConcurrentRequests = 0;
   // The context this start serves: the one asked for, or what its plan holds;
@@ -282,6 +314,10 @@ struct ReadyEvent {
   // The rows of one mask request: before the anchor and after each draft
   // query row (ProtocolLimits::maxSimulationTokens + 1).
   uint32_t maskRows = 0;
+  // The engine serves a video model (VideoRuntime.hpp): it
+  // takes VideoRequests and Cancels, maxContextTokens bounds a video
+  // prompt's tokens, and the fields above may be zero or empty.
+  bool video = false;
 
   bool operator==(const ReadyEvent &) const = default;
 };
@@ -361,6 +397,113 @@ struct ErrorEvent {
   bool operator==(const ErrorEvent &) const = default;
 };
 
+// One clip of a video model, of a prompt of the text encoder's token ids.
+// Answered by VideoProgress events, then the clip's VideoOutput, or an Error.
+// It names the DiT it runs on: a directory name under the weights, 1 to 64
+// of a-z, 0-9, '.', '_' and '-', without ".." (server/protocol.py
+// valid_dit_name).
+inline constexpr size_t kMaxDitNameBytes = 64;
+[[nodiscard]] bool validDitName(std::string_view name);
+enum VideoOutputFlag : uint8_t {
+  VideoOutputPreview = 1U << 0,
+  VideoOutputAudio = 1U << 1,
+};
+// The keyframes a video request carries.
+enum VideoKeyframeFlag : uint8_t {
+  VideoKeyframeFirst = 1U << 0,
+  VideoKeyframeLast = 1U << 1,
+};
+
+// A Ref2VA reference of a video request, as the server normalized it
+// (by Pika H3 Flex's rules): an image at its tier size, a
+// video's frames at 24 fps, truncated to the clip's frame count, on its tier
+// canvas, with its soundtrack at 32 kHz stereo truncated to the clip, or an
+// audio reference, a soundtrack alone (no frames, width or height).
+enum class VideoReferenceKind : uint8_t { Image = 0, Video = 1, Audio = 2 };
+
+struct VideoReference {
+  VideoReferenceKind kind = VideoReferenceKind::Image;
+  // An image's frames are 1, an audio reference's 0.
+  uint32_t frames = 1;
+  uint32_t width = 0;
+  uint32_t height = 0;
+  // uint8 RGB [frames][height][width][3].
+  std::vector<uint8_t> pixels;
+  // fp32 [2][samples] at 32 kHz: a video's soundtrack (empty: none), an
+  // audio reference's samples.
+  std::vector<float> soundtrack;
+
+  bool operator==(const VideoReference &) const = default;
+};
+
+// The references a video request carries at most (Pika H3 Flex's 12).
+inline constexpr uint32_t kMaxVideoReferences = 12;
+
+struct VideoRequestFrame {
+  uint64_t requestId = 0;
+  // The DiT's name (validDitName): its weights' dit-<name>/.
+  std::string dit;
+  // VideoOutputFlag bits: also the preview; the clip with its audio.
+  uint8_t outputs = VideoOutputAudio;
+  uint32_t frames = 0;
+  uint32_t width = 0;
+  uint32_t height = 0;
+  // Denoising steps: a VDN-H3 DiT's; a FastH3 DiT's zero or its rungs'.
+  uint32_t steps = 0;
+  uint64_t seed = 0;
+  std::vector<uint32_t> promptTokens;
+  // Keyframes (first-frame and first-and-last-frame conditioning), each
+  // empty or uint8 RGB [height][width][3], already on the clip's canvas
+  // (server/images.py keyframe): the first frame anchors the clip's first
+  // latent frame, the last frame its last.
+  std::vector<uint8_t> firstFrame;
+  std::vector<uint8_t> lastFrame;
+  // Ref2VA references in presentation order; none with keyframes.
+  std::vector<VideoReference> references;
+
+  bool operator==(const VideoRequestFrame &) const = default;
+};
+
+// The phases of a video request, in their order.
+enum class VideoPhase : uint8_t {
+  Encode = 1,
+  Prepare,
+  Denoise,
+  Preview,
+  Decode,
+  Audio,
+  Mux,
+};
+
+// A phase has done `step` of its `steps` (one but the denoising's), the
+// phase's time so far and the process's peak footprint; step 0 starts it
+// and `steps` completes it.
+struct VideoProgressEvent {
+  uint64_t requestId = 0;
+  VideoPhase phase = VideoPhase::Encode;
+  uint32_t step = 0;
+  uint32_t steps = 1;
+  uint64_t elapsedMicros = 0;
+  uint64_t peakFootprintBytes = 0;
+
+  bool operator==(const VideoProgressEvent &) const = default;
+};
+
+// An mp4 of the request: the preview, once its phase completes, or the clip,
+// which ends the request.
+enum class VideoOutputKind : uint8_t { Video = 0, Preview = 1 };
+
+struct VideoOutputEvent {
+  uint64_t requestId = 0;
+  VideoOutputKind output = VideoOutputKind::Video;
+  uint32_t frames = 0;
+  // From the request's arrival.
+  uint64_t wallMicros = 0;
+  std::vector<uint8_t> mp4;
+
+  bool operator==(const VideoOutputEvent &) const = default;
+};
+
 // JSON is deliberately opaque to the transport: the document carries its
 // own schema_version, and the frame length carries the exact JSON byte count
 // (including whitespace) without line or C-string assumptions.
@@ -431,11 +574,12 @@ struct StartFailedEvent {
 
 using ClientMessage = std::variant<RequestFrame, CancelFrame, MaskResponseFrame,
                                    StatusRequestFrame, ReleaseRequestFrame,
-                                   StopFrame>;
+                                   StopFrame, VideoRequestFrame>;
 using EngineEvent =
     std::variant<ReadyEvent, StartEvent, PromptProgressEvent, TokensEvent,
                  MaskRequestEvent, DoneEvent, ErrorEvent, StatusJsonEvent,
-                 StartFailedEvent, WarmingEvent>;
+                 StartFailedEvent, WarmingEvent, VideoProgressEvent,
+                 VideoOutputEvent>;
 
 struct Frame {
   FrameType type = FrameType::Request;

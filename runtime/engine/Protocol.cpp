@@ -39,6 +39,12 @@ constexpr uint64_t kErrorFixedBytes = 22;
 constexpr uint64_t kStatusJsonFixedBytes = 8;
 constexpr uint64_t kStartFailedFixedBytes = 26;
 constexpr uint64_t kWarmingFixedBytes = 8;
+constexpr uint64_t kVideoRequestFixedBytes = 43;
+// A reference's header: u8 kind, u32 frames, u32 width, u32 height, u64
+// soundtrack samples.
+constexpr uint64_t kVideoReferenceHeaderBytes = 21;
+constexpr uint64_t kVideoProgressFixedBytes = 33;
+constexpr uint64_t kVideoOutputFixedBytes = 21;
 
 struct PayloadBounds {
   uint64_t minimum = 0;
@@ -94,6 +100,14 @@ std::optional<PayloadBounds> payloadBounds(FrameType type,
     return bounded(kStatusRequestFixedBytes, kStatusRequestFixedBytes);
   case FrameType::ReleaseRequest:
     return bounded(kReleaseRequestFixedBytes, kReleaseRequestFixedBytes);
+  case FrameType::VideoRequest:
+    // Its references' frames dominate: a video model's engine raises the
+    // bound (maxVideoRequestPayloadBytes); its prompt count is checked as a
+    // request's own.
+    return PayloadBounds{kVideoRequestFixedBytes,
+                         limits.maxVideoRequestPayloadBytes
+                             ? limits.maxVideoRequestPayloadBytes
+                             : limits.maxFramePayloadBytes};
   default:
     // The engine never receives an event.
     return std::nullopt;
@@ -134,6 +148,7 @@ bool clientFrameType(uint16_t raw, FrameType &type) {
   case FrameType::StatusRequest:
   case FrameType::ReleaseRequest:
   case FrameType::Stop:
+  case FrameType::VideoRequest:
     type = static_cast<FrameType>(raw);
     return true;
   default:
@@ -269,6 +284,7 @@ public:
   }
 
   [[nodiscard]] size_t remaining() const { return bytes_.size() - offset_; }
+  [[nodiscard]] size_t offset() const { return offset_; }
 
 private:
   std::span<const uint8_t> bytes_;
@@ -410,6 +426,76 @@ validateMaskResponse(const MaskResponseFrame &response,
   return std::nullopt;
 }
 
+// The bytes of a keyframe of the request's canvas, height x width x 3; zero
+// when they overflow.
+uint64_t keyframeBytes(const VideoRequestFrame &request) {
+  uint64_t pixels = 0, bytes = 0;
+  if (!checkedMultiply(request.width, request.height, pixels) ||
+      !checkedMultiply(pixels, 3, bytes))
+    return 0;
+  return bytes;
+}
+
+// A reference's pixel bytes, frames x height x width x 3; zero when they
+// overflow.
+uint64_t referencePixelBytes(const VideoReference &reference) {
+  uint64_t pixels = 0, frames = 0, bytes = 0;
+  if (!checkedMultiply(reference.width, reference.height, pixels) ||
+      !checkedMultiply(pixels, reference.frames, frames) ||
+      !checkedMultiply(frames, 3, bytes))
+    return 0;
+  return bytes;
+}
+
+std::optional<ProtocolIssue> validateVideoRequest(const VideoRequestFrame &request,
+                                                  const ProtocolLimits &limits) {
+  if (!request.requestId)
+    return requestIssue(IssueCode::InvalidRequestId, 0,
+                        "video request id must be non-zero");
+  if (!validDitName(request.dit) ||
+      (request.outputs & ~(VideoOutputPreview | VideoOutputAudio)))
+    return requestIssue(IssueCode::InvalidEnumValue, request.requestId,
+                        "video DiT name or outputs are not defined");
+  if (!request.frames || !request.width || !request.height)
+    return requestIssue(IssueCode::InvalidCount, request.requestId,
+                        "a video request needs frames, a width and a height");
+  if (request.promptTokens.empty() ||
+      request.promptTokens.size() > limits.maxPromptTokens)
+    return requestIssue(IssueCode::LimitExceeded, request.requestId,
+                        "a video prompt holds 1 token or more, within the prompt limit");
+  for (const std::vector<uint8_t> *keyframe : {&request.firstFrame, &request.lastFrame})
+    if (!keyframe->empty() && keyframe->size() != keyframeBytes(request))
+      return requestIssue(IssueCode::InvalidCount, request.requestId,
+                          "a keyframe holds height x width x 3 bytes");
+  if (request.references.size() > kMaxVideoReferences)
+    return requestIssue(IssueCode::LimitExceeded, request.requestId,
+                        "a video request holds at most 12 references");
+  for (const VideoReference &reference : request.references) {
+    if (!validEnum(static_cast<uint8_t>(reference.kind),
+                   {VideoReferenceKind::Image, VideoReferenceKind::Video,
+                    VideoReferenceKind::Audio}))
+      return requestIssue(IssueCode::InvalidEnumValue, request.requestId,
+                          "video reference kind is not defined");
+    const bool image = reference.kind == VideoReferenceKind::Image;
+    if (reference.kind == VideoReferenceKind::Audio) {
+      if (reference.frames || reference.width || reference.height ||
+          reference.soundtrack.empty())
+        return requestIssue(IssueCode::InvalidCount, request.requestId,
+                            "an audio reference is a soundtrack without frames");
+    } else if (!reference.frames || !reference.width || !reference.height ||
+               (image && (reference.frames != 1 || !reference.soundtrack.empty())))
+      return requestIssue(IssueCode::InvalidCount, request.requestId,
+                          "a video reference needs frames, a width and a height; "
+                          "an image is one frame without a soundtrack");
+    if (reference.pixels.size() != referencePixelBytes(reference) ||
+        reference.soundtrack.size() % 2)
+      return requestIssue(IssueCode::InvalidCount, request.requestId,
+                          "a video reference holds frames x height x width x 3 "
+                          "bytes and a stereo soundtrack");
+  }
+  return std::nullopt;
+}
+
 ProtocolIssue invalidEvent(IssueCode code, uint64_t requestId,
                            std::string message) {
   return makeIssue(FailureClass::EngineUnhealthy, code, requestId,
@@ -423,8 +509,10 @@ std::optional<ProtocolIssue> validateWarming(const WarmingEvent &event) {
 }
 
 std::optional<ProtocolIssue> validateReady(const ReadyEvent &event) {
+  // A video model's engine has no vocabulary, stop tokens or masks to name.
   if (!event.maxConcurrentRequests || !event.maxContextTokens ||
-      !event.vocabularySize || !event.maskRows || event.stopTokens.empty())
+      (!event.video && (!event.vocabularySize || !event.maskRows ||
+                        event.stopTokens.empty())))
     return invalidEvent(IssueCode::InvalidCount, 0,
                         "ready event capacities and stop tokens must be "
                         "non-zero");
@@ -593,6 +681,38 @@ validateStartFailed(const StartFailedEvent &event,
   return std::nullopt;
 }
 
+std::optional<ProtocolIssue> validateVideoProgress(const VideoProgressEvent &event) {
+  if (!event.requestId)
+    return invalidEvent(IssueCode::InvalidRequestId, 0,
+                        "video progress request id must be non-zero");
+  if (!validEnum(static_cast<uint8_t>(event.phase),
+                 {VideoPhase::Encode, VideoPhase::Prepare, VideoPhase::Denoise,
+                  VideoPhase::Preview, VideoPhase::Decode, VideoPhase::Audio,
+                  VideoPhase::Mux}))
+    return invalidEvent(IssueCode::InvalidEnumValue, event.requestId,
+                        "video phase is not defined");
+  if (!event.steps || event.step > event.steps)
+    return invalidEvent(IssueCode::InvalidCount, event.requestId,
+                        "video progress steps must be 1 or more, its step at most them");
+  return std::nullopt;
+}
+
+std::optional<ProtocolIssue> validateVideoOutput(const VideoOutputEvent &event,
+                                                 const ProtocolLimits &limits) {
+  if (!event.requestId)
+    return invalidEvent(IssueCode::InvalidRequestId, 0,
+                        "video output request id must be non-zero");
+  if (!validEnum(static_cast<uint8_t>(event.output),
+                 {VideoOutputKind::Video, VideoOutputKind::Preview}))
+    return invalidEvent(IssueCode::InvalidEnumValue, event.requestId,
+                        "video output is not defined");
+  if (!event.frames || event.mp4.empty() ||
+      event.mp4.size() > limits.maxFramePayloadBytes - kVideoOutputFixedBytes)
+    return invalidEvent(IssueCode::LimitExceeded, event.requestId,
+                        "video output must hold frames and an mp4 within the frame limit");
+  return std::nullopt;
+}
+
 std::optional<ProtocolIssue> validateStatusJson(const StatusJsonEvent &event,
                                                 const ProtocolLimits &limits) {
   if (event.json.empty() || event.json.size() > limits.maxStatusJsonBytes) {
@@ -621,7 +741,8 @@ EncodedEvent encodeReady(const ReadyEvent &event) {
                   kReadyFixedBytes + event.stopTokens.size() * sizeof(uint32_t));
   writer.u32(event.maxConcurrentRequests);
   writer.u32(event.maxContextTokens);
-  writer.u8(event.vision);
+  writer.u8(static_cast<uint8_t>((event.vision ? FeatureVision : 0) |
+                                 (event.video ? FeatureVideo : 0)));
   writer.u32(event.vocabularySize);
   writer.u32(event.maskRows);
   writer.u32(static_cast<uint32_t>(event.stopTokens.size()));
@@ -753,6 +874,33 @@ EncodedEvent encodeStatusJson(const StatusJsonEvent &event,
   return success(writer.take());
 }
 
+EncodedEvent encodeVideoProgress(const VideoProgressEvent &event) {
+  if (auto issue = validateVideoProgress(event))
+    return failure<std::vector<uint8_t>>(std::move(*issue));
+  Writer writer = frameWriter(FrameType::VideoProgress, kVideoProgressFixedBytes);
+  writer.u64(event.requestId);
+  writer.u8(static_cast<uint8_t>(event.phase));
+  writer.u32(event.step);
+  writer.u32(event.steps);
+  writer.u64(event.elapsedMicros);
+  writer.u64(event.peakFootprintBytes);
+  return success(writer.take());
+}
+
+EncodedEvent encodeVideoOutput(const VideoOutputEvent &event,
+                               const ProtocolLimits &limits) {
+  if (auto issue = validateVideoOutput(event, limits))
+    return failure<std::vector<uint8_t>>(std::move(*issue));
+  Writer writer =
+      frameWriter(FrameType::VideoOutput, kVideoOutputFixedBytes + event.mp4.size());
+  writer.u64(event.requestId);
+  writer.u8(static_cast<uint8_t>(event.output));
+  writer.u32(event.frames);
+  writer.u64(event.wallMicros);
+  writer.raw(event.mp4);
+  return success(writer.take());
+}
+
 ProtocolResult<ClientMessage> decodeRequest(std::vector<uint8_t> &&payload,
                                             const ProtocolLimits &limits) {
   Reader reader(payload);
@@ -853,6 +1001,100 @@ ProtocolResult<ClientMessage> decodeRequest(std::vector<uint8_t> &&payload,
     request.imagePixels = std::move(payload);
   }
   if (auto issue = validateRequest(request, limits)) {
+    return failure<ClientMessage>(std::move(*issue));
+  }
+  return success(ClientMessage{std::move(request)});
+}
+
+ProtocolResult<ClientMessage> decodeVideoRequest(const Frame &frame,
+                                                 const ProtocolLimits &limits) {
+  Reader reader(frame.payload);
+  VideoRequestFrame request;
+  uint8_t nameBytes = 0, keyframes = 0;
+  uint32_t promptCount = 0, referenceCount = 0;
+  if (!reader.u64(request.requestId) || !reader.u8(nameBytes) ||
+      !reader.u8(request.outputs) || !reader.u32(request.frames) ||
+      !reader.u32(request.width) || !reader.u32(request.height) ||
+      !reader.u32(request.steps) || !reader.u64(request.seed) ||
+      !reader.u8(keyframes) || !reader.u32(promptCount) ||
+      !reader.u32(referenceCount)) {
+    return failure<ClientMessage>(
+        makeIssue(FailureClass::ProtocolFatal, IssueCode::InvalidPayloadLength,
+                  0, "video request fixed payload is truncated"));
+  }
+  if (keyframes & ~(VideoKeyframeFirst | VideoKeyframeLast)) {
+    return failure<ClientMessage>(
+        requestIssue(IssueCode::InvalidEnumValue, request.requestId,
+                     "video keyframes are not defined"));
+  }
+  if (referenceCount > kMaxVideoReferences) {
+    return failure<ClientMessage>(
+        requestIssue(IssueCode::LimitExceeded, request.requestId,
+                     "a video request holds at most 12 references"));
+  }
+  const uint64_t canvas = keyframeBytes(request);
+  const uint64_t keyframePixels = canvas * (((keyframes & VideoKeyframeFirst) != 0) +
+                                            ((keyframes & VideoKeyframeLast) != 0));
+  auto mismatch = [&] {
+    return failure<ClientMessage>(requestIssue(
+        IssueCode::InvalidPayloadLength, request.requestId,
+        "video DiT name, prompt count, keyframes or references do not match "
+        "the payload"));
+  };
+  const size_t nameAt = reader.offset();
+  if (!reader.skip(nameBytes))
+    return mismatch();
+  request.dit.assign(
+      reinterpret_cast<const char *>(frame.payload.data()) + nameAt, nameBytes);
+  if (!reader.words(promptCount, request.promptTokens) ||
+      (keyframes && (!canvas || canvas > frame.payload.size())) ||
+      reader.remaining() < referenceCount * kVideoReferenceHeaderBytes)
+    return mismatch();
+  // The references' headers, and the bytes their pixels and soundtracks take.
+  std::vector<uint64_t> samples(referenceCount);
+  uint64_t referenceBytes = 0;
+  request.references.resize(referenceCount);
+  for (uint32_t index = 0; index < referenceCount; ++index) {
+    VideoReference &reference = request.references[index];
+    uint8_t kind = 0;
+    if (!reader.u8(kind) || !reader.u32(reference.frames) ||
+        !reader.u32(reference.width) || !reader.u32(reference.height) ||
+        !reader.u64(samples[index]))
+      return mismatch();
+    reference.kind = static_cast<VideoReferenceKind>(kind);
+    uint64_t sound = 0, bytes = 0;
+    const uint64_t pixels = referencePixelBytes(reference);
+    // An audio reference has no pixels; anything else has some.
+    if ((!pixels && reference.kind != VideoReferenceKind::Audio) ||
+        !checkedMultiply(samples[index], 8, sound) ||
+        !checkedAdd(pixels, sound, bytes) ||
+        !checkedAdd(referenceBytes, bytes, referenceBytes))
+      return mismatch();
+  }
+  uint64_t variable = 0;
+  if (!checkedAdd(keyframePixels, referenceBytes, variable) ||
+      reader.remaining() != variable)
+    return mismatch();
+  const uint8_t *cursor = frame.payload.data() + reader.offset();
+  if (keyframes & VideoKeyframeFirst) {
+    request.firstFrame.assign(cursor, cursor + canvas);
+    cursor += canvas;
+  }
+  if (keyframes & VideoKeyframeLast) {
+    request.lastFrame.assign(cursor, cursor + canvas);
+    cursor += canvas;
+  }
+  for (uint32_t index = 0; index < referenceCount; ++index) {
+    VideoReference &reference = request.references[index];
+    const size_t pixels = static_cast<size_t>(referencePixelBytes(reference));
+    reference.pixels.assign(cursor, cursor + pixels);
+    cursor += pixels;
+    reference.soundtrack.resize(static_cast<size_t>(2 * samples[index]));
+    if (!reference.soundtrack.empty())
+      std::memcpy(reference.soundtrack.data(), cursor, reference.soundtrack.size() * sizeof(float));
+    cursor += reference.soundtrack.size() * sizeof(float);
+  }
+  if (auto issue = validateVideoRequest(request, limits)) {
     return failure<ClientMessage>(std::move(*issue));
   }
   return success(ClientMessage{std::move(request)});
@@ -962,6 +1204,12 @@ std::string_view frameTypeName(FrameType type) {
     return "start_failed";
   case FrameType::Warming:
     return "warming";
+  case FrameType::VideoRequest:
+    return "video_request";
+  case FrameType::VideoProgress:
+    return "video_progress";
+  case FrameType::VideoOutput:
+    return "video_output";
   }
   return "unknown";
 }
@@ -979,6 +1227,15 @@ std::string_view failureClassName(FailureClass failureClass) {
 }
 
 } // namespace
+
+bool validDitName(std::string_view name) {
+  return !name.empty() && name.size() <= kMaxDitNameBytes &&
+         name.find("..") == std::string_view::npos &&
+         std::all_of(name.begin(), name.end(), [](char c) {
+           return (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') ||
+                  c == '.' || c == '_' || c == '-';
+         });
+}
 
 std::optional<ProtocolIssue> validateLimits(const ProtocolLimits &limits) {
   if (limits.maxFramePayloadBytes < kRequestFixedBytes ||
@@ -1003,6 +1260,13 @@ std::optional<ProtocolIssue> validateLimits(const ProtocolLimits &limits) {
     return makeIssue(FailureClass::ProtocolFatal, IssueCode::LimitExceeded, 0,
                      "all configured token, mask, and image limits must be "
                      "non-zero");
+  }
+  if (limits.maxVideoRequestPayloadBytes &&
+      (limits.maxVideoRequestPayloadBytes < kVideoRequestFixedBytes ||
+       limits.maxVideoRequestPayloadBytes > kAbsoluteMaxVideoRequestPayloadBytes)) {
+    return makeIssue(FailureClass::ProtocolFatal, IssueCode::LimitExceeded, 0,
+                     "maxVideoRequestPayloadBytes must be 0 or in [" +
+                         std::to_string(kVideoRequestFixedBytes) + ", 4 GiB]");
   }
   return std::nullopt;
 }
@@ -1081,6 +1345,8 @@ ProtocolResult<ClientMessage> decodeFrame(Frame &&frame,
       return decodeReleaseRequest(frame);
     case FrameType::Stop:
       return decodeRequestEnd<StopFrame>(frame);
+    case FrameType::VideoRequest:
+      return decodeVideoRequest(frame, limits);
     default:
       break;
     }
@@ -1122,6 +1388,10 @@ serializeEvent(const EngineEvent &event, const ProtocolLimits &limits) {
             return encodeStartFailed(value, limits);
           } else if constexpr (std::is_same_v<T, WarmingEvent>) {
             return encodeWarming(value);
+          } else if constexpr (std::is_same_v<T, VideoProgressEvent>) {
+            return encodeVideoProgress(value);
+          } else if constexpr (std::is_same_v<T, VideoOutputEvent>) {
+            return encodeVideoOutput(value, limits);
           } else {
             return encodeStatusJson(value, limits);
           }
