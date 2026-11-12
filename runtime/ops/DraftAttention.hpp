@@ -75,6 +75,7 @@ struct DraftDecodeAttentionBuffers final {
   std::span<const metal::MetalBuffer> persistentValues;
   metal::MetalBuffer queryKeys;
   metal::MetalBuffer queryValues;
+  // Row-major projection input; may reuse QKV storage after preparation.
   metal::MetalBuffer output;
 };
 

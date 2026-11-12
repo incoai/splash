@@ -424,6 +424,63 @@ void surroundingPhases(MetalBackend &backend, DraftAttentionShape shape,
                     "draft prepare value copy differs");
       }
   }
+
+  // The eight proposal rows reuse consumed QKV storage. The dense attention
+  // extent may change; its prepared inputs and the allocation's tail may not.
+  const auto snapshot = [](const MetalBuffer &buffer, uint64_t words) {
+    const auto *begin = static_cast<const uint16_t *>(buffer.contents());
+    return std::vector<uint16_t>(begin, begin + words);
+  };
+  const uint64_t attentionWords = rows * kAttention;
+  const auto preparedQueries = snapshot(queries, attentionWords);
+  const auto preparedKeys = snapshot(queryKeys, workspace.queryKeysBytes / 2);
+  const auto preparedValues = snapshot(queryValues, workspace.queryValuesBytes / 2);
+  const uint64_t ringWords = uint64_t{kKvHeads} * kWindow * kHeadDim;
+  const auto unusedRing = allocate(ringWords * 2);
+  std::fill_n(static_cast<uint16_t *>(unusedRing.contents()), ringWords, uint16_t{0x7FC0});
+  std::array<MetalBuffer, kLanes> rings;
+  rings.fill(unusedRing);
+  const std::array<uint32_t, kLanes> lengths{};
+  const auto attention = backend.view(qkv, 0, attentionWords * 2);
+  CommandGraph reused;
+  DraftAttention::addPrepare(reused,
+      {qkv, queries, queryNorm, keyNorm, ropeCos, ropeSin, queryKeys, queryValues}, plan);
+  DraftAttention::addDecode(reused,
+      {queries, rings, rings, queryKeys, queryValues, attention},
+      std::span(lengths).first(lanes), plan);
+  static_cast<void>(backend.submitCommandAsync(reused.dispatches()).wait());
+  require(std::equal(preparedQueries.begin(), preparedQueries.end(),
+                     static_cast<const uint16_t *>(queries.contents())) &&
+              std::equal(preparedKeys.begin(), preparedKeys.end(),
+                         static_cast<const uint16_t *>(queryKeys.contents())) &&
+              std::equal(preparedValues.begin(), preparedValues.end(),
+                         static_cast<const uint16_t *>(queryValues.contents())),
+          "draft attention changed its prepared input rows");
+  const auto *actual = static_cast<const uint16_t *>(qkv.contents());
+  require(std::equal(originalQkv.begin() + attentionWords, originalQkv.end(), actual + attentionWords),
+          "draft attention wrote beyond its dense output view");
+  std::vector<float> reference(uint64_t{kGroupRows} * kHeadDim);
+  const auto *empty = static_cast<const uint16_t *>(unusedRing.contents());
+  for (uint32_t lane = 0; lane < lanes; ++lane) {
+    for (uint32_t head = 0; head < kKvHeads; ++head) {
+      referenceRows(preparedQueries.data() + (uint64_t{lane} * kKvHeads + head) * kGroupRows * kHeadDim,
+                    empty, empty,
+                    preparedKeys.data() + (uint64_t{lane} * kKvHeads + head) * kRows * kHeadDim,
+                    preparedValues.data() + (uint64_t{lane} * kKvHeads + head) * kHeadDim * kRows,
+                    0, reference);
+      for (uint64_t index = 0; index < reference.size(); ++index) {
+        const uint64_t groupedRow = index / kHeadDim;
+        const uint64_t row = groupedRow % kRows;
+        const uint64_t queryHead = head * kQueryHeadsPerKv + groupedRow / kRows;
+        const uint64_t outputIndex = (uint64_t{lane} * kRows + row) * kAttention +
+                                     queryHead * kHeadDim + index % kHeadDim;
+        const float value = bf16ToFloat(actual[outputIndex]);
+        require(std::isfinite(value) && std::fabs(value - reference[index]) <=
+                    0.02F + 0.02F * std::fabs(reference[index]),
+                "draft attention in reused QKV storage differs from the CPU reference");
+      }
+    }
+  }
 }
 
 // The context writers against a CPU ring: a row's key is RMS-normalized,
