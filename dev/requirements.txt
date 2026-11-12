@@ -1,5 +1,8 @@
 # Installed into the same reproducible environment after requirements.txt.
+# av (PyAV) decodes video and audio references; the release leaves it out,
+# as its wheels bundle FFmpeg, and server/references.py names its pin.
 annotated-types==0.8.0
+av==19.0.2
 distro==1.9.0
 jiter==0.16.0
 openai==2.54.0

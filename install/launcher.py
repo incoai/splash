@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Serve in the foreground, or connect an installed agent to the local server."""
+"""Serve in the foreground, generate one video, or connect an installed agent
+to the local server."""
 
 import argparse
 import contextlib
@@ -8,11 +9,13 @@ import fcntl
 import http.client
 import json
 import os
+import re
 import signal
 import socket
 import subprocess
 import sys
 import tempfile
+import time
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -33,12 +36,17 @@ from . import models as model_artifacts
 
 ROOT = paths.ROOT
 RUNTIME_DIR = paths.RUNTIME
-# Either stops `splash serve` wherever it is. The programs with handlers of
-# their own, the installer it runs and the server it executes, start with
-# them blocked, not ignored, until those handlers are in place, so one sent
-# meanwhile waits for its handler instead of being lost or ending the
-# program in a traceback. make and the device check run with them unblocked.
+# Either stops `splash serve` or `splash generate` wherever it is. The
+# programs with handlers of their own, the installer it runs and the server
+# or clip it executes, start with them blocked, not ignored, until those
+# handlers are in place, so one sent meanwhile waits for its handler instead
+# of being lost or ending the program in a traceback. make and the device
+# check run with them unblocked.
 STOP_SIGNALS = (signal.SIGINT, signal.SIGTERM)
+# How often generate asks a running server for its job, and how long that
+# server may stay silent before generate takes it for stopped.
+POLL_SECONDS = 1.0
+SILENCE_SECONDS = 30.0
 
 
 class LauncherError(RuntimeError):
@@ -146,6 +154,39 @@ def _request_json(path, timeout=2, *, port=serve_options.DEFAULT_PORT):
         http.client.HTTPException,
     ):
         return None
+
+
+def _call(port, path, data=None, content_type=None, method=None, timeout=30):
+    """The body of one request to the server on port, with SPLASH_API_KEY as
+    _request_json sends it: LauncherError with the server's message for an
+    error status, OSError when the server does not answer."""
+    request = urllib.request.Request(_base_url(port) + path, data, method=method)
+    if key := os.environ.get("SPLASH_API_KEY"):
+        request.add_header("Authorization", f"Bearer {key}")
+    if content_type is not None:
+        request.add_header("Content-Type", content_type)
+    try:
+        with _DIRECT.open(request, timeout=timeout) as response:
+            return response.read()
+    except urllib.error.HTTPError as error:
+        with error:
+            if error.code == 401:
+                raise LauncherError(
+                    "Splash authentication failed; set SPLASH_API_KEY to the server's key"
+                ) from None
+            try:
+                message = json.loads(error.read())["error"]["message"]
+            except (
+                OSError,
+                ValueError,
+                LookupError,
+                TypeError,
+                http.client.HTTPException,
+            ):
+                message = f"HTTP {error.code}"
+        raise LauncherError(message) from None
+    except http.client.HTTPException as error:
+        raise OSError(f"the server's answer broke off: {error!r}") from None
 
 
 def _ensure_runtime():
@@ -342,38 +383,66 @@ def _share_installation(installation):
         ) from None
 
 
-def _server(args, model_dir, record):
-    """The server's command line and environment."""
-    # The server package of this installation, from any working directory:
-    # -P keeps the directory, which may hold a package of the same name, off
-    # sys.path, and PYTHONPATH names the root. The server holds the assembly
-    # the selection link names when it starts, and serves from it until it
-    # exits, however an installation advances the link meanwhile.
+def _program(module, model_dir, model, arguments, environment):
+    """The command line and environment of the server package's module on
+    model_dir.
+
+    The server package of this installation, from any working directory: -P
+    keeps the directory, which may hold a package of the same name, off
+    sys.path, and PYTHONPATH names the root. The program holds the assembly
+    an installed model's selection link names when it starts, and runs from
+    it until it exits, however an installation advances the link meanwhile."""
     command = [
         str(paths.PYTHON),
         "-u",
         "-P",
         "-m",
-        "server.server",
+        module,
         str(model_dir),
         "--model",
-        args.model,
+        model,
         "--binary",
         str(paths.BINARY),
-        "--port",
-        str(args.port),
-        "--serve-record",
-        str(record),
-        *serve_options.serve_argv(args),
+        *arguments,
     ]
     environment = dict(
         os.environ,
         PYTHONUNBUFFERED="1",
         TRANSFORMERS_VERBOSITY="error",
         PYTHONPATH=str(ROOT),
-        **serve_options.serve_environment(args),
+        **environment,
     )
     return command, environment
+
+
+def _server(args, model_dir, record):
+    """The server's command line and environment."""
+    return _program(
+        "server.server",
+        model_dir,
+        args.model,
+        [
+            "--port",
+            str(args.port),
+            "--serve-record",
+            str(record),
+            *serve_options.serve_argv(args),
+        ],
+        serve_options.serve_environment(args),
+    )
+
+
+def _exec_server(module, model_dir, model, arguments, environment, held):
+    """Execute the server package's module on model_dir (_program), keeping
+    the held files open across the exec."""
+    command, environment = _program(module, model_dir, model, arguments, environment)
+    for file in held:
+        os.set_inheritable(file.fileno(), True)
+    _flush_console()
+    # The exec resets the handlers; the program unblocks the signals once its
+    # own are in place, past its imports.
+    signal.pthread_sigmask(signal.SIG_BLOCK, STOP_SIGNALS)
+    os.execve(command[0], command, environment)
 
 
 def _serve_lock(port):
@@ -476,6 +545,326 @@ def _renders_later_system(port):
     outcome = template.get("later_system") if isinstance(template, dict) else None
     outcomes = list(outcome.values()) if isinstance(outcome, dict) else [outcome]
     return all(outcome in ("native", "patched") for outcome in outcomes)
+
+
+def _served_model(port, model=None):
+    """The first /v1/models entry of the splash serve holding port's lock
+    (serve), or None when none holds it, or when it still starts a model
+    that is not a video model and generate names a model to run itself."""
+    try:
+        with _serve_lock(port).open() as lock:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_SH | fcntl.LOCK_NB)
+                return None
+            except BlockingIOError:
+                owner = _serve_lock_owner(lock)
+                lock.seek(0)
+                record = lock.read()
+    except FileNotFoundError:
+        return None
+    listing = _request_json("/v1/models", port=port)
+    models = listing.get("data") if isinstance(listing, dict) else None
+    if not isinstance(models, list) or not models or not isinstance(models[0], dict):
+        # A language model still starting leaves --model the local path (owner
+        # is empty unless its record names a model).
+        started = json.loads(record)["model"] if owner else families.H3.release
+        if model is not None and started.partition(":")[0] != families.H3.release:
+            return None
+        raise LauncherError(
+            f"Splash is starting on port {port}{owner}; run generate once it is Ready"
+        )
+    return models[0]
+
+
+def _status(message):
+    # As the clip's program prints one (server/diagnostics.print_status), on
+    # stderr.
+    diagnostics.print_status(message, error=True)
+
+
+def _write_whole(path, data):
+    """Write path at once: a stop or a failure leaves no partial mp4."""
+    with tempfile.NamedTemporaryFile(dir=path.parent, delete=False) as file:
+        try:
+            # The mode path.write_bytes gives, as the clip's program writes it.
+            umask = os.umask(0)
+            os.umask(umask)
+            os.fchmod(file.fileno(), 0o666 & ~umask)
+            file.write(data)
+        except BaseException:
+            os.unlink(file.name)
+            raise
+    try:
+        os.replace(file.name, path)
+    except BaseException:
+        os.unlink(file.name)
+        raise
+
+
+def _generate_on_server(args, served, request):
+    """Run the clip as a job of the video model's server on args.port (POST
+    /v1/videos, server/videos.py), and write its mp4s as the clip's program
+    does."""
+    port, model = args.port, served.get("id")
+    running = f"Splash serves {model} on port {port}"
+    if "video" not in (served.get("output_modalities") or ()):
+        raise LauncherError(f"{running}, a language model, not a video model")
+    repo, _, variant = (args.model or "").partition(":")
+    if args.model is not None and repo != str(model).partition(":")[0]:
+        raise LauncherError(f"{running}, not {args.model}")
+    if variant:
+        request["variant"] = variant
+    if not args.out.parent.is_dir():
+        raise LauncherError(f"{args.out.parent} is not a directory")
+    files = [("input_reference", args.first_frame), ("last_frame", args.last_frame)]
+    files += [("references", path) for path in args.reference]
+    files = [(name, path) for name, path in files if path is not None]
+    body, content_type = json.dumps(request).encode(), "application/json"
+    if files:
+        # The multipart form curl -F sends.
+        boundary = "splash-" + os.urandom(16).hex()
+        content_type, body = f"multipart/form-data; boundary={boundary}", b""
+        for name, value in [*request.items(), *files]:
+            if isinstance(value, Path):
+                # The server finds a reference's type by its bytes or its name.
+                quoted = value.name.replace("\\", "\\\\").replace('"', '\\"')
+                head = (
+                    f'; filename="{quoted}"\r\nContent-Type: application/octet-stream'
+                )
+                value = value.read_bytes()
+            else:
+                value = (
+                    str(value).lower() if isinstance(value, bool) else value
+                ).encode()
+                head = "\r\nContent-Type: text/plain; charset=utf-8"
+            body += f'--{boundary}\r\nContent-Disposition: form-data; name="{name}"{head}\r\n\r\n'.encode()
+            body += value + b"\r\n"
+        body += f"--{boundary}--\r\n".encode()
+    job = None
+    try:
+        job = json.loads(_call(port, "/v1/videos", body, content_type, timeout=600))
+        _status(f"Video · {job['id']} · {running}")
+        started = time.monotonic()
+        preview, shown, silent = args.out.with_suffix(".preview.mp4"), None, None
+        while job["status"] not in ("completed", "failed"):
+            time.sleep(POLL_SECONDS)
+            try:
+                job = json.loads(_call(port, f"/v1/videos/{job['id']}"))
+            except (OSError, ValueError):
+                silent = silent or time.monotonic()
+                if time.monotonic() - silent > SILENCE_SECONDS:
+                    raise LauncherError(f"it stopped answering during {job['id']}")
+                continue
+            silent = None
+            if job["phase"] and (job["phase"], job["progress"]) != shown:
+                shown = job["phase"], job["progress"]
+                elapsed = time.monotonic() - started
+                _status(f"Video · {shown[0]} · {shown[1]}% · {elapsed:.0f} s")
+            if args.preview and job["preview"] and preview:
+                content = f"/v1/videos/{job['id']}/content?variant=preview"
+                _write_whole(preview, _call(port, content))
+                _status(f"Video · preview · {preview}")
+                preview = None
+        if job["status"] == "failed":
+            raise LauncherError((job["error"] or {}).get("message", "the clip failed"))
+        _write_whole(args.out, _call(port, f"/v1/videos/{job['id']}/content"))
+    except StopSignal:
+        # The server cancels a running job at its next step.
+        if job is not None:
+            _status("Video · cancelling at the next step")
+            with contextlib.suppress(OSError, LauncherError):
+                _call(port, f"/v1/videos/{job['id']}", method="DELETE")
+        raise
+    except LauncherError as error:
+        raise LauncherError(f"{running}: {error}") from None
+    # The clip's frames, as the server counts them (videos.clip_frames).
+    frames = int(job["seconds"]) * families.H3.fps
+    while frames % families.H3.frame_period != families.H3.frame_offset:
+        frames += 1
+    wall = job["phases"]["total"]["seconds"]
+    _status(f"Video · {args.out} · {frames} frames · {wall:.1f} s")
+    return 0
+
+
+def _reference_variant():
+    """The H3 variant whose requests take references (the Ref2VA base)."""
+    return next(
+        n for n, v in families.H3.variants.items() if v.spec and v.spec["references"]
+    )
+
+
+def _check_generate(parser, args):
+    """Refuse at once a generate command line that cannot make a clip, which
+    the clip's program or the server would refuse only after an install or
+    an upload: keyframes and references together, a last frame alone, an
+    input that is missing or a directory (a pipe passes), an --out that
+    cannot be written, more references than a request takes, and a variant
+    of MiniMax-H3 named in --model that the request's references do not
+    fit."""
+    H3 = families.H3
+    if args.last_frame is not None and args.first_frame is None:
+        parser.error(
+            "--last-frame needs --first-frame: the clip runs from one to the other"
+        )
+    if args.reference and (args.first_frame or args.last_frame) is not None:
+        parser.error(
+            "--reference cannot be used with --first-frame or --last-frame: "
+            "a clip takes references or keyframes, not both"
+        )
+    inputs = [("--first-frame", args.first_frame), ("--last-frame", args.last_frame)]
+    for flag, path in [*inputs, *(("--reference", p) for p in args.reference)]:
+        if path is not None and not path.exists():
+            parser.error(f"{flag} {path}: no such file")
+        if path is not None and path.is_dir():
+            parser.error(f"{flag} {path} is a directory: name a file")
+    if len(args.reference) > H3.max_references:
+        parser.error(
+            f"--reference: at most {H3.max_references} files ({H3.max_images} images, "
+            f"{H3.max_videos} videos and {H3.max_audio} audio clips)"
+        )
+    if args.out.is_dir():
+        example = args.out / "clip.mp4"
+        parser.error(
+            f"--out {args.out} is a directory: name the mp4, such as {example}"
+        )
+    if not args.out.parent.is_dir():
+        parser.error(f"--out {args.out}: {args.out.parent} is not a directory")
+    repo, _, variant = (args.model or "").partition(":")
+    if repo != H3.release or variant not in H3.variants:
+        return
+    reference = _reference_variant()
+    if variant == reference and not args.reference:
+        parser.error(
+            f"{args.model} takes --reference FILE (an image or a video at least); "
+            f"a clip from the prompt or from keyframes takes {repo}:{H3.default_variant}"
+        )
+    if variant != reference and args.reference:
+        parser.error(
+            f"--reference takes the {reference} variant: --model {repo}:{reference}"
+        )
+
+
+# A request's `seconds` and `size` as server/videos.py takes them
+# (videos.SECONDS_PATTERN, SIZE_PATTERN; clip_seconds and canvas check the
+# rest).
+_SECONDS = re.compile(r"[1-9][0-9]?")
+_SIZE = re.compile(r"([1-9][0-9]{0,4})x([1-9][0-9]{0,4})")
+
+
+class _Seconds(argparse.Action):
+    """Stores --seconds or --duration, and the one given, which a refusal of
+    its value names."""
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        setattr(namespace, self.dest, values)
+        namespace.seconds_flag = option_string
+
+
+def _refuse_before_install(args, selection):
+    """LauncherError for what MiniMax-H3's clip program would refuse only
+    once the model is installed: a length or a canvas outside the server's
+    rules (videos.clip_seconds and videos.canvas, in the words of their
+    refusals), and references for an installation that holds or would
+    install a variant without them. Another model passes, for the program
+    to refuse as it does."""
+    H3 = families.H3
+    if selection.repo_id != H3.release:
+        return
+    flag = getattr(args, "seconds_flag", None) or "--seconds"
+    seconds = args.seconds if args.seconds is not None else H3.default_seconds
+    golden = os.environ.get("SPLASH_GOLDEN_CLIPS") == "1"
+    if not (
+        _SECONDS.fullmatch(seconds)
+        and (int(seconds) in H3.seconds or golden and seconds == "3")
+    ):
+        raise LauncherError(
+            f"{flag} {seconds}: seconds must be a whole number from "
+            f"{H3.seconds[0]} to {H3.seconds[-1]}"
+        )
+    size = args.size if args.size is not None else H3.size
+    match = _SIZE.fullmatch(size)
+    sides = sorted(map(int, match.groups())) if match else None
+    if not (
+        sides
+        and all(side % H3.canvas_step == 0 for side in sides)
+        and sides[0] in H3.canvas_tiers
+        and sides[1] <= 2 * sides[0]
+    ):
+        raise LauncherError(
+            f"--size {size}: size must be WIDTHxHEIGHT of a 768p or 480p canvas: both "
+            "multiples of 32, the short side 768 or 480 and the long at most twice it, "
+            "such as " + ", ".join(H3.sizes)
+        )
+    # A model ID without a variant keeps the one its installation holds, or
+    # installs the default, which takes no references.
+    reference = _reference_variant()
+    weights = selection.link / "weights"
+    if (
+        args.reference
+        and selection.variant is None
+        and (not selection.link.exists() or weights.is_dir())
+        and not (weights / f"dit-{H3.variants[reference].dit}").is_dir()
+    ):
+        raise LauncherError(
+            f"--reference takes the {reference} variant, which {args.model} does not "
+            f"hold: --model {H3.release}:{reference}"
+        )
+
+
+def generate(args):
+    """Send one clip to the video model's splash serve on --port, as a job of
+    its /v1/videos, when one runs there. Else install the model as serve does,
+    then execute one clip of it on its engine (server/videos.py), which
+    refuses a language model; no HTTP server starts. The clip's program exits
+    with the engine's outcome."""
+    for number in STOP_SIGNALS:
+        signal.signal(number, _interrupt)
+    RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
+    # The flags as a POST /v1/videos body, which the program checks as the
+    # server checks one; an absent flag takes the route's default. It reads
+    # the keyframes' and references' files itself.
+    fields = {
+        "prompt": args.prompt,
+        "seconds": args.seconds,
+        "size": args.size,
+        "seed": args.seed,
+        "preview": args.preview,
+        "audio": not args.no_audio,
+    }
+    request = {name: value for name, value in fields.items() if value is not None}
+    served = _served_model(args.port, args.model)
+    # A language model may run beside the video model: --model runs the
+    # clip itself then.
+    video = served is not None and "video" in (served.get("output_modalities") or ())
+    if served is not None and (video or args.model is None):
+        return _generate_on_server(args, served, request)
+    if args.model is None:
+        # The status argparse gives a missing required argument.
+        diagnostics.print_line(
+            f"error: --model is required: no Splash server runs on port {args.port}",
+            error=True,
+        )
+        return 2
+    selection = model_artifacts.Selection.of(paths.MODELS, args.model)
+    _refuse_before_install(args, selection)
+    with (RUNTIME_DIR / "serve.lock").open("a+") as installation:
+        _share_installation(installation)
+        _ensure_installed(selection)
+        arguments = ["--out", str(args.out), "--request", json.dumps(request)]
+        for flag, path in (("--first-frame", args.first_frame),
+                           ("--last-frame", args.last_frame)):  # fmt: skip
+            if path is not None:
+                arguments += [flag, str(path)]
+        for path in args.reference:
+            arguments += ["--reference", str(path)]
+        _exec_server(
+            "server.videos",
+            selection.link,
+            args.model,
+            arguments,
+            {},
+            (installation,),
+        )
 
 
 def install(args):
@@ -631,8 +1020,9 @@ def parse_args(argv=None):
         type=serve_options.parse_model_id,
         required=True,
         metavar="OWNER/REPO[:VARIANT]",
-        help="upstream Hugging Face model, with a GGUF variant after ':' (e.g. :UD-Q4_K_M); "
-        "with --model-dir, the ID reported by the API",
+        help="upstream Hugging Face model, with a GGUF variant after ':' (e.g. :UD-Q4_K_M), "
+        f"or a video model's ({families.H3.release}:vdn-50); with --model-dir, the ID "
+        "reported by the API",
     )
     model.add_argument(
         "--model-dir",
@@ -673,6 +1063,120 @@ def parse_args(argv=None):
         f"HTTP port (default: SPLASH_PORT or {serve_options.DEFAULT_PORT})",
     )
     serve_options.add_serve_arguments(server, groups)
+    H3 = families.H3
+    reference = _reference_variant()
+    generator = commands.add_parser(
+        "generate",
+        help="generate one video clip with a video model",
+        description="Install a video model as serve does and write one clip of a\n"
+        "prompt as an mp4; no server starts. With a splash serve of a video model\n"
+        "on --port, the clip is a job of that server instead. Ctrl+C cancels it\n"
+        "at the next step.",
+        epilog="Examples:\n"
+        "  # From the prompt alone: 5 s at 1344x768\n"
+        f"  splash generate --model {H3.release} --out clip.mp4 \\\n"
+        "    --prompt 'A golden retriever runs along a beach at sunset.'\n"
+        "  # From a first frame (and a last one), portrait, 480p, 8 s\n"
+        f"  splash generate --model {H3.release} --out clip.mp4 --size 480x832 \\\n"
+        "    --seconds 8 --first-frame first.png --last-frame last.png \\\n"
+        "    --prompt 'The dog turns to the camera.'\n"
+        f"  # From references, which take the {reference} variant\n"
+        f"  splash generate --model {H3.release}:{reference} --out clip.mp4 \\\n"
+        "    --reference cat.png --reference street.mp4 \\\n"
+        "    --prompt '<Picture 1> walks into the scene of <Video 1>.'\n\n"
+        "A server serves the one variant it was started with: for references,\n"
+        f"start one with splash serve --model {H3.release}:{reference} --port 8001\n"
+        "and pass --port 8001 here.\n\n"
+        "The mp4 at --out, and the preview beside it, replace files of those\n"
+        "names. Progress goes to stderr. Exit status: 0 once the mp4 is written,\n"
+        "1 when the clip is refused or fails, 2 for a wrong command line, 130 or\n"
+        "143 when Ctrl+C or SIGTERM stops it.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    generator.add_argument(
+        "--model",
+        type=serve_options.parse_model_id,
+        metavar="OWNER/REPO[:VARIANT]",
+        help=f"upstream Hugging Face video model, such as {H3.release} (its "
+        f"variant {H3.default_variant}, or the one installed), "
+        f"{H3.release}:vdn-8 (8 steps) or {H3.release}:{reference} (for "
+        "--reference); with a server on --port, its model by default",
+    )
+    generator.add_argument(
+        "--port",
+        type=_parse_port,
+        help="the port of a running splash serve to send the clip to (default: "
+        f"SPLASH_PORT or {serve_options.DEFAULT_PORT})",
+    )
+    generator.add_argument("--prompt", required=True, help="what the clip shows")
+    generator.add_argument(
+        "--out",
+        type=Path,
+        required=True,
+        metavar="PATH",
+        help="the mp4 to write, replaced if it exists, in a directory that exists",
+    )
+    generator.add_argument(
+        "--seconds",
+        "--duration",
+        dest="seconds",
+        action=_Seconds,
+        metavar="SECONDS",
+        help=f"clip length in whole seconds, {H3.seconds[0]} to {H3.seconds[-1]} "
+        f"({H3.default_seconds} by default)",
+    )
+    generator.add_argument(
+        "--size",
+        metavar="WIDTHxHEIGHT",
+        help="canvas: 768p 1344x768 (the default) or 768x1344, 480p 832x480, "
+        "864x480 or 480x832, or another of either tier (both sides multiples "
+        "of 32, the long at most twice the short)",
+    )
+    generator.add_argument(
+        "--seed",
+        metavar="SEED",
+        help="noise seed, a whole number from 0 to 4294967295 (default 0)",
+    )
+    generator.add_argument(
+        "--preview",
+        action="store_true",
+        help="also write the fast preview, to PATH's stem with .preview.mp4, "
+        "as soon as it is decoded",
+    )
+    generator.add_argument(
+        "--no-audio", action="store_true", help="a clip without its audio track"
+    )
+    generator.add_argument(
+        "--first-frame",
+        type=Path,
+        metavar="IMAGE",
+        help="start the clip from this PNG or JPEG, stretched onto the canvas: "
+        "the canvas does not follow the image, so give a portrait image "
+        "--size 768x1344 or 480x832",
+    )
+    generator.add_argument(
+        "--last-frame",
+        type=Path,
+        metavar="IMAGE",
+        help="end the clip on this PNG or JPEG, scaled to cover the canvas and "
+        "centre-cropped; needs --first-frame",
+    )
+    generator.add_argument(
+        "--reference",
+        type=Path,
+        action="append",
+        default=[],
+        metavar="FILE",
+        help="condition the clip on this image (PNG, JPEG), video (MP4, "
+        "QuickTime, WebM, with its soundtrack) or audio clip (MP3, WAV, M4A, "
+        "AAC), its kind from the file's content; repeat it for more (at most "
+        f"{H3.max_images} images, {H3.max_videos} videos and {H3.max_audio} "
+        f"audio clips, {H3.max_references} in all, an image or a video among "
+        "them). The prompt names "
+        "them per kind in the order given: <Picture 1>, <Video 1>, <Audio 1>, "
+        "...; a video's soundtrack is the next <Audio j>, before its <Video k>. "
+        f"Takes the {reference} variant; not with --first-frame or --last-frame",
+    )
     installer = commands.add_parser(
         "install",
         help="install a model as serve does; no server starts",
@@ -738,7 +1242,9 @@ def parse_args(argv=None):
         if args.mmproj is not None and args.language_only:
             parser.error("--mmproj cannot be used with --language-only")
         serve_options.check_serve_arguments(parser, args)
-    if client_args and args.command == "serve":
+    if args.command == "generate":
+        _check_generate(generator, args)
+    if client_args and args.command in ("serve", "generate"):
         parser.error("arguments after -- are only supported for coding clients")
     args.client_args = client_args
     return args
@@ -783,7 +1289,9 @@ def main(argv=None):
             )
         raise
     try:
-        command = {"serve": serve, "install": install}.get(args.command, coding_client)
+        command = {"serve": serve, "generate": generate, "install": install}.get(
+            args.command, coding_client
+        )
         return command(args)
     except LauncherError as error:
         if not error.said:

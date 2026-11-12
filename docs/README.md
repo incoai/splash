@@ -9,6 +9,8 @@ These documents run from using Splash to working on it:
   tool calls, structured output, images and PDFs, status and errors.
 - [Models](models.md): the model formats Splash loads, drafts, vision, chat
   templates, local model files and Splash packages.
+- [Video](video.md): the video model, MiniMax-H3: its API, canvases,
+  installation, engine, runtime adapters, reference rows and tests.
 - [Internals](internals.md): the code's boundaries, installation, weight
   loading, kernels, sparse attention, Neural Engine prefill, host steps,
   residency, admission and eviction, sliding windows, the disk tier, the native
