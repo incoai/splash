@@ -1,4 +1,4 @@
-// The prompt-lookup index and its auto gate (model::CopySpec.hpp), against
+// The prompt-lookup index and its copy acceptance (model::CopySpec.hpp), against
 // the algorithm PLAN.md ports from dflash_mlx's engine/copyspec.py. The
 // index buffers the prompt and every committed output token and drafts the
 // continuation of the query that is the last five committed tokens plus the
@@ -17,19 +17,13 @@
 // The conservative mode's one-strike rule (PLAN.md "Cycle integration"): a
 // verified copy block that accepted nothing disables the request's index for
 // the rest of the request; LOOKUP MISSES DO NOT COUNT, and only conservative
-// one-strikes (auto is the gate's job). The rule is engine-side; the small
-// driver below pins it over CopySpecState.
+// one-strikes. The rule is engine-side; the small driver below pins it over
+// CopySpecState.
 //
-// The auto gate is the four-phase windowed A/B latch of copyspec.py, driven
-// only through recordCycle/engageCopy/takeReset: measure_off for 24 cycles
-// (suppressed) sets the baseline rate; measure_on probes until six
-// copy-sourced cycles or 48 total; the probe engages exactly when a copy was
-// seen and the probe's rate (commits per cycle cost second) is at least the
-// baseline's (margin 1.0); an engage latches for 200 cycles and then hands
-// out a one-shot reset; a loss sends the gate dormant for
-// 200 * 2^min(consecutiveLosses, 4) cycles (doublings capped at 4, the count
-// reset by any engage) and also hands out the reset, and the measure_off
-// window that follows the dormancy is counted exactly.
+// The copy acceptance is the per-position rate a request's copied proposals
+// earn: each verified copy block counts its accepted proposals as reached
+// acceptances and its first refused proposal, where the verify reached it, as
+// a reached rejection, over a Beta(3, 1) prior.
 #include "TestChecks.hpp"
 #include "model/CopySpec.hpp"
 
@@ -42,7 +36,7 @@
 #include <string>
 #include <vector>
 
-using splash::model::CopySpecAutoGate;
+using splash::model::CopySpecAcceptance;
 using splash::model::CopySpecIndex;
 using splash::model::CopySpecMode;
 using splash::model::CopySpecState;
@@ -95,7 +89,14 @@ void modeStrings() {
   require(copySpecMode("off") == CopySpecMode::Off, "\"off\" is not the off mode");
   require(copySpecMode("conservative") == CopySpecMode::Conservative,
           "\"conservative\" is not the conservative mode");
-  require(copySpecMode("auto") == CopySpecMode::Auto, "\"auto\" is not the auto mode");
+  // auto is gone (its gate reset the verify budget every request shares).
+  bool refused = false;
+  try {
+    static_cast<void>(copySpecMode("auto"));
+  } catch (const std::invalid_argument &) {
+    refused = true;
+  }
+  require(refused, "\"auto\" is still a copyspec mode");
 }
 
 // enabled is len(prompt) > 6 and is computed once at construction: a prompt
@@ -263,7 +264,7 @@ void noteVerifiedBlock(CopySpecState &state, CopySpecMode mode,
 void conservativeOneStrike() {
   const std::vector<uint32_t> prompt{1, 2, 3, 4, 5, 6, 7, 8, 9, 1, 2, 3, 4,
                                      5};
-  CopySpecState state{CopySpecIndex(prompt), false, CopySpecAutoGate{}};
+  CopySpecState state{CopySpecIndex(prompt), false, CopySpecAcceptance{}};
   require(consults(state, CopySpecMode::Conservative),
           "a fresh request does not consult its index");
   require(!consults(state, CopySpecMode::Off), "off consulted the index");
@@ -281,162 +282,52 @@ void conservativeOneStrike() {
           "the one-strike rule damaged the index");
   // LOOKUP MISSES DO NOT COUNT: a fallback cycle that accepted nothing
   // leaves the request enabled.
-  CopySpecState misses{CopySpecIndex(prompt), false, CopySpecAutoGate{}};
+  CopySpecState misses{CopySpecIndex(prompt), false, CopySpecAcceptance{}};
   for (uint32_t cycle = 0; cycle < 4; ++cycle)
     noteVerifiedBlock(misses, CopySpecMode::Conservative, false, 0);
   require(!misses.disabled, "a lookup miss disabled the request");
   // Nor does a copy block that accepted something.
-  CopySpecState accepted{CopySpecIndex(prompt), false, CopySpecAutoGate{}};
+  CopySpecState accepted{CopySpecIndex(prompt), false, CopySpecAcceptance{}};
   noteVerifiedBlock(accepted, CopySpecMode::Conservative, true, 3);
   require(!accepted.disabled, "an accepted copy block disabled the request");
-  // Only conservative one-strikes; auto is the gate's job and off never
-  // drafts at all.
-  for (const CopySpecMode mode : {CopySpecMode::Auto, CopySpecMode::Off}) {
-    CopySpecState other{CopySpecIndex(prompt), false, CopySpecAutoGate{}};
-    noteVerifiedBlock(other, mode, true, 0);
-    require(!other.disabled, "a mode other than conservative one-striked");
-  }
+  // Only conservative one-strikes; off never drafts at all.
+  CopySpecState off{CopySpecIndex(prompt), false, CopySpecAcceptance{}};
+  noteVerifiedBlock(off, CopySpecMode::Off, true, 0);
+  require(!off.disabled, "a mode other than conservative one-striked");
 }
 
-void autoGateConstants() {
-  require(CopySpecAutoGate::kProbeOffCycles == 24,
-          "the measure_off window is not 24 cycles");
-  require(CopySpecAutoGate::kProbeOnMinCopy == 6,
-          "the probe does not end at six copy-sourced cycles");
-  require(CopySpecAutoGate::kProbeOnMaxCycles == 48,
-          "the probe does not end at 48 cycles");
-  require(CopySpecAutoGate::kLatchCycles == 200,
-          "the latch is not 200 cycles");
-  require(CopySpecAutoGate::kBackoffCap == 4,
-          "the backoff exponent is not capped at 4");
+bool near(double value, double expected) {
+  return value > expected - 1.0e-12 && value < expected + 1.0e-12;
 }
 
-// The measure_off window: 24 suppressed cycles set the baseline rate, two
-// commits per 1000 ns here, and the probe starts at the 24th.
-void measureOff(CopySpecAutoGate &gate) {
-  for (uint32_t cycle = 1; cycle <= CopySpecAutoGate::kProbeOffCycles; ++cycle) {
-    require(!gate.engageCopy(),
-            "measure_off consulted the index at cycle " + std::to_string(cycle));
-    gate.recordCycle(false, 2, 1000);
-  }
-  require(gate.engageCopy(), "the probe did not start after 24 cycles");
-}
-
-// Six copy-sourced cycles at one commit per 1000 ns lose the probe (half the
-// baseline rate): the gate goes dormant and hands out its reset once.
-void losingProbe(CopySpecAutoGate &gate) {
-  for (uint32_t copy = 0; copy < CopySpecAutoGate::kProbeOnMinCopy; ++copy)
-    gate.recordCycle(true, 1, 1000);
-  require(!gate.engageCopy(), "a losing probe engaged");
-  require(gate.takeReset(), "a losing probe asked for no reset");
-  require(!gate.takeReset(), "the reset flag is not one-shot");
-}
-
-// The dormancy of `dormant` cycles and the measure_off window after it: the
-// gate may draft again only after dormant + 24 recordCycle calls, exactly.
-void dormantThenProbe(CopySpecAutoGate &gate, uint32_t dormant) {
-  const uint32_t offAgain = dormant + CopySpecAutoGate::kProbeOffCycles;
-  for (uint32_t cycle = 1; cycle <= offAgain; ++cycle) {
-    gate.recordCycle(false, 2, 1000);
-    if (cycle < offAgain)
-      require(!gate.engageCopy(),
-              "the gate left its backoff early at cycle " + std::to_string(cycle));
-  }
-  require(gate.engageCopy(), "the gate did not probe after its backoff");
-}
-
-void autoGatePhases() {
-  // The latch: an equal-rate probe engages (on_rate >= off_rate, margin
-  // 1.0), holds 200 cycles, then hands out one reset and measures again.
-  {
-    CopySpecAutoGate gate;
-    measureOff(gate);
-    for (uint32_t copy = 0; copy < CopySpecAutoGate::kProbeOnMinCopy; ++copy) {
-      require(gate.engageCopy(), "the probe suppressed a cycle before its sixth copy");
-      gate.recordCycle(true, 2, 1000);
-    }
-    require(gate.engageCopy(), "an equal-rate probe did not engage");
-    for (uint32_t cycle = 1; cycle <= CopySpecAutoGate::kLatchCycles; ++cycle) {
-      require(gate.engageCopy(), "the latch ended early at cycle " + std::to_string(cycle));
-      gate.recordCycle(false, 2, 1000);
-    }
-    require(!gate.engageCopy(), "the latch outlived 200 cycles");
-    require(gate.takeReset(), "the latch end asked for no reset");
-    require(!gate.takeReset(), "the reset flag is not one-shot");
-  }
-  // The probe's cycle cap: three copy cycles among 48 decide at the cap,
-  // with the copy cycles carrying the whole window's commits. The latch that
-  // follows ends exactly 200 cycles after the probe's 48th: a probe that
-  // resolved early would end it early too.
-  {
-    CopySpecAutoGate gate;
-    measureOff(gate);
-    for (uint32_t cycle = 1; cycle <= CopySpecAutoGate::kProbeOnMaxCycles;
-         ++cycle) {
-      if (cycle < CopySpecAutoGate::kProbeOnMaxCycles)
-        require(gate.engageCopy(),
-                "the probe ended before its 48th cycle at " + std::to_string(cycle));
-      const bool copy = cycle == 5 || cycle == 20 || cycle == 40;
-      gate.recordCycle(copy, copy ? 16 : 2, 1000);
-    }
-    require(gate.engageCopy(), "a winning probe at the cycle cap did not engage");
-    for (uint32_t cycle = 1; cycle <= CopySpecAutoGate::kLatchCycles; ++cycle) {
-      require(gate.engageCopy(), "the latch ended early at cycle " + std::to_string(cycle));
-      gate.recordCycle(false, 2, 1000);
-    }
-    require(!gate.engageCopy(), "the latch outlived 200 cycles");
-  }
-  // Engage needs a copy seen: a probe whose cycles all tie the baseline but
-  // never used a copy block goes dormant at the cap, for the first backoff.
-  {
-    CopySpecAutoGate gate;
-    measureOff(gate);
-    for (uint32_t cycle = 1; cycle <= CopySpecAutoGate::kProbeOnMaxCycles;
-         ++cycle) {
-      if (cycle < CopySpecAutoGate::kProbeOnMaxCycles)
-        require(gate.engageCopy(),
-                "the probe ended before its 48th cycle at " + std::to_string(cycle));
-      gate.recordCycle(false, 2, 1000);
-    }
-    require(!gate.engageCopy(), "a probe that saw no copy engaged");
-    require(gate.takeReset(), "a losing probe asked for no reset");
-    require(!gate.takeReset(), "the reset flag is not one-shot");
-    dormantThenProbe(gate, CopySpecAutoGate::kLatchCycles);
-  }
-  // The backoff doubles with consecutive losses and caps at 2^4: the dormant
-  // periods are 200, 400, 800, 1600, 3200 and 3200 cycles, each followed by
-  // its own measure_off window of 24.
-  {
-    CopySpecAutoGate gate;
-    measureOff(gate);
-    for (uint32_t loss = 0; loss < 6; ++loss) {
-      losingProbe(gate);
-      const uint32_t dormant =
-          CopySpecAutoGate::kLatchCycles *
-          (1u << std::min(loss, CopySpecAutoGate::kBackoffCap));
-      dormantThenProbe(gate, dormant);
-    }
-  }
-  // An engage resets the losses: after a loss and a winning latch the next
-  // loss starts the backoff over at 200, not at 400.
-  {
-    CopySpecAutoGate gate;
-    measureOff(gate);
-    losingProbe(gate);
-    dormantThenProbe(gate, CopySpecAutoGate::kLatchCycles);
-    for (uint32_t copy = 0; copy < CopySpecAutoGate::kProbeOnMinCopy; ++copy)
-      gate.recordCycle(true, 8, 1000);
-    require(gate.engageCopy(), "a winning probe did not engage");
-    for (uint32_t cycle = 1; cycle <= CopySpecAutoGate::kLatchCycles; ++cycle) {
-      require(gate.engageCopy(), "the latch ended early at cycle " + std::to_string(cycle));
-      gate.recordCycle(false, 2, 1000);
-    }
-    require(!gate.engageCopy(), "the latch outlived 200 cycles");
-    require(gate.takeReset(), "the latch end asked for no reset");
-    measureOff(gate);
-    losingProbe(gate);
-    dormantThenProbe(gate, CopySpecAutoGate::kLatchCycles);
-  }
+void copyAcceptance() {
+  // The prior alone: three accepted to one refused.
+  CopySpecAcceptance fresh;
+  require(near(fresh.rate(), 0.75), "the prior is not Beta(3, 1)");
+  // A fully accepted block of seven: seven reached acceptances, no
+  // rejection, since the verify reached no refused proposal.
+  CopySpecAcceptance full;
+  full.observe(7, 7);
+  require(near(full.rate(), 10.0 / 11.0), "a fully accepted block counted a rejection");
+  // Two of seven accepted: two acceptances and the third proposal's refusal.
+  CopySpecAcceptance partial;
+  partial.observe(7, 2);
+  require(near(partial.rate(), 5.0 / 7.0), "a partly accepted block miscounted");
+  // A copy that keeps verifying one token of seven falls toward one half,
+  // where a block claims fewer rows.
+  CopySpecAcceptance poor;
+  for (uint32_t cycle = 0; cycle < 50; ++cycle)
+    poor.observe(7, 1);
+  require(near(poor.rate(), 53.0 / 104.0), "repeated one-token copies miscounted");
+  // Rows the verify did not reach say nothing: three verified proposals all
+  // accepted are three acceptances, not a rejection at the fourth.
+  CopySpecAcceptance capped;
+  capped.observe(3, 3);
+  require(near(capped.rate(), 6.0 / 7.0), "an unverified proposal counted as refused");
+  // An acceptance count past the verified proposals is clamped to them.
+  CopySpecAcceptance clamped;
+  clamped.observe(2, 5);
+  require(near(clamped.rate(), 5.0 / 6.0), "acceptance past the verified rows counted");
 }
 
 } // namespace
@@ -451,8 +342,7 @@ int main() {
     forbiddenTokenVeto();
     appendCommittedGrowth();
     conservativeOneStrike();
-    autoGateConstants();
-    autoGatePhases();
+    copyAcceptance();
   } catch (const std::exception &error) {
     std::cerr << "copyspec_test: FAIL: " << error.what() << '\n';
     return 1;

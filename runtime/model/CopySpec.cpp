@@ -2,7 +2,6 @@
 
 #include <algorithm>
 #include <stdexcept>
-#include <utility>
 
 namespace splash::model {
 namespace {
@@ -21,16 +20,6 @@ uint64_t hashTokens(const uint32_t *tokens, uint32_t count) {
   return value;
 }
 
-// The rate the gate measures: commits per second of cycle cost, falling
-// back to commits a cycle where a window saw no cost.
-double windowRate(uint64_t commits, uint64_t costNs, uint32_t cycles) {
-  if (costNs)
-    return static_cast<double>(commits) / (static_cast<double>(costNs) / 1.0e9);
-  if (cycles)
-    return static_cast<double>(commits) / static_cast<double>(cycles);
-  return 0.0;
-}
-
 } // namespace
 
 CopySpecMode copySpecMode(std::string_view value) {
@@ -38,9 +27,7 @@ CopySpecMode copySpecMode(std::string_view value) {
     return CopySpecMode::Off;
   if (value == "conservative")
     return CopySpecMode::Conservative;
-  if (value == "auto")
-    return CopySpecMode::Auto;
-  throw std::invalid_argument("copyspec mode must be off, conservative or auto");
+  throw std::invalid_argument("copyspec mode must be off or conservative");
 }
 
 CopySpecIndex::CopySpecIndex(std::span<const uint32_t> promptTokens,
@@ -148,70 +135,15 @@ uint32_t CopySpecIndex::draftAfter(uint32_t stagedFirst, uint32_t maxTokens,
   return count;
 }
 
-bool CopySpecAutoGate::engageCopy() const {
-  return phase_ == Phase::MeasureOn || phase_ == Phase::Engaged;
+void CopySpecAcceptance::observe(uint32_t verified, uint32_t accepted) {
+  accepted = std::min(accepted, verified);
+  accepted_ += accepted;
+  reached_ += accepted < verified ? accepted + 1 : accepted;
 }
 
-void CopySpecAutoGate::recordCycle(bool sourceCopy, uint32_t commitCount,
-                                   uint64_t costNs) {
-  windowCommits_ += commitCount;
-  if (costNs)
-    windowCostNs_ += costNs;
-  ++windowCycles_;
-  if (sourceCopy)
-    ++windowCopies_;
-
-  switch (phase_) {
-  case Phase::MeasureOff:
-    if (windowCycles_ >= kProbeOffCycles) {
-      offRate_ = windowRate(windowCommits_, windowCostNs_, windowCycles_);
-      hasOffRate_ = true;
-      windowCommits_ = windowCostNs_ = 0;
-      windowCycles_ = windowCopies_ = 0;
-      phase_ = Phase::MeasureOn;
-    }
-    break;
-  case Phase::MeasureOn:
-    if (windowCopies_ >= kProbeOnMinCopy ||
-        windowCycles_ >= kProbeOnMaxCycles) {
-      const double onRate =
-          windowRate(windowCommits_, windowCostNs_, windowCycles_);
-      const uint32_t copySeen = windowCopies_;
-      windowCommits_ = windowCostNs_ = 0;
-      windowCycles_ = windowCopies_ = 0;
-      if (!copySeen || !hasOffRate_ || onRate < offRate_) {
-        phase_ = Phase::Dormant;
-        latchRemaining_ =
-            kLatchCycles << std::min(consecutiveLosses_, kBackoffCap);
-        ++consecutiveLosses_;
-        pendingReset_ = true;
-      } else {
-        phase_ = Phase::Engaged;
-        latchRemaining_ = kLatchCycles;
-        consecutiveLosses_ = 0;
-      }
-    }
-    break;
-  case Phase::Engaged:
-    if (--latchRemaining_ == 0) {
-      pendingReset_ = true;
-      phase_ = Phase::MeasureOff;
-      windowCommits_ = windowCostNs_ = 0;
-      windowCycles_ = windowCopies_ = 0;
-    }
-    break;
-  case Phase::Dormant:
-    if (--latchRemaining_ == 0) {
-      phase_ = Phase::MeasureOff;
-      windowCommits_ = windowCostNs_ = 0;
-      windowCycles_ = windowCopies_ = 0;
-    }
-    break;
-  }
-}
-
-bool CopySpecAutoGate::takeReset() {
-  return std::exchange(pendingReset_, false);
+double CopySpecAcceptance::rate() const {
+  return (static_cast<double>(accepted_) + kPriorAccepted) /
+         (static_cast<double>(reached_) + kPriorAccepted + kPriorRejected);
 }
 
 } // namespace splash::model

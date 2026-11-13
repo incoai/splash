@@ -2135,12 +2135,15 @@ struct Runtime::Impl {
 
   // The copied block a request's lookup drafts for a lane's cycle
   // (CopySpecIndex::draftAfter): what followed the window its pending anchor
-  // ends wherever the request's earlier tokens held it. Empty where the lane
-  // drafts with DFlash: a sampled lane, a lane whose thinking is ending, a
-  // request that is off, one-struck or gated out, and a lookup miss.
+  // ends wherever the request's earlier tokens held it, and the request's
+  // measured acceptance of its copies (CopySpecAcceptance), which the block's
+  // confidence reports. Empty where the lane drafts with DFlash: a sampled
+  // lane, a lane in a thinking budget, a request that is off or one-struck,
+  // and a lookup miss.
   struct CopyDraft final {
     uint32_t count = 0;
     std::array<uint32_t, kDraftProposalTokens> tokens{};
+    double acceptance = 0.0;
   };
 
   // The copied block a greedy lane's cycle drafts where the request copies
@@ -2160,44 +2163,36 @@ struct Runtime::Impl {
     copy.count = entry.copySpec->index.draftAfter(
         *entry.pendingToken, std::min(kDraftProposalTokens, maximumRetained - 1),
         geometry.target.stopTokens.tokens(), copy.tokens);
-    // The gate is consulted only where a lookup hit exists: a miss falls
-    // back to DFlash for free whatever the phase.
-    if (copy.count && copyspecMode == CopySpecMode::Auto &&
-        !entry.copySpec->gate.engageCopy())
-      copy.count = 0;
+    copy.acceptance = entry.copySpec->acceptance.rate();
     return copy.count;
   }
 
-  // The lanes whose cycle drafts with a copied block (planCopyDraft): a host
-  // step overwrites their proposals and confidence after the selector's
-  // dispatches and before the verify rows read the confidence, so that
-  // addVerifyRows asks for the whole copied block. A thinking end still wins
-  // the proposals of its lanes (addThinkingDrafts runs after).
-  void encodeCopySpecProposals(CommandGraph &graph,
-                               std::span<const CopyDraft> copies) const {
-    if (std::ranges::none_of(copies,
-                             [](const CopyDraft &copy) { return copy.count; }))
-      return;
-    graph.host([this, copies = std::vector<CopyDraft>(copies.begin(), copies.end())] {
-      for (uint32_t lane = 0; lane < copies.size(); ++lane) {
-        const CopyDraft &copy = copies[lane];
-        if (!copy.count)
-          continue;
-        uint32_t *proposed =
-            contents<uint32_t>(decodeArena->get(lane, DecodeTensor::ProposedTokens),
-                               "proposed tokens");
-        std::copy_n(copy.tokens.begin(), copy.count, proposed);
-        float *confidence =
-            contents<float>(decodeArena->get(lane, DecodeTensor::VerifyConfidence),
-                            "draft proposal confidence");
-        std::fill(confidence, confidence + kDraftProposalTokens, 1.0F);
-      }
-    });
+  // The lanes whose cycle drafts with a copied block (planCopyDraft), as the
+  // fixed proposals the cycle's command writes over the draft's
+  // (DraftSelector::addFixedProposals): the copied tokens, and at each the
+  // confidence `verify` reads as the request's measured acceptance of its
+  // copies, so that a copy claims the rows its acceptance earns and no more.
+  static std::array<ops::FixedProposals, kLaneCount>
+  copiedProposals(std::span<const CopyDraft> copies, const ops::VerifyRowsModel &verify) {
+    std::array<ops::FixedProposals, kLaneCount> fixed{};
+    for (uint32_t lane = 0; lane < copies.size(); ++lane) {
+      const CopyDraft &copy = copies[lane];
+      fixed[lane].count = copy.count;
+      std::copy_n(copy.tokens.begin(), copy.count, fixed[lane].tokens.begin());
+      for (uint32_t position = 0; position < copy.count; ++position)
+        fixed[lane].confidence[position] =
+            ops::DraftSelector::confidenceFor(verify, position, copy.acceptance);
+    }
+    return fixed;
   }
 
   // The draft's proposals for each lane and how many rows of its block it
   // verifies, at most maximumRows[lane] (its retention limit), by the
   // acceptance model and the costs of `constrained` cycles of its lane count.
+  // A lane whose lookup hit takes its copied block instead (copies), which
+  // the command writes over the draft's; where every lane copies, the draft
+  // does not run at all (its rings stay as they are: only the context commit
+  // after the verify writes them).
   void encodeDraftBatchGraph(CommandGraph &graph,
                              std::span<Request *const> entries,
                              std::span<const uint64_t> logicalPositions,
@@ -2215,36 +2210,6 @@ struct Runtime::Impl {
     auto d = [&](DecodeTensor tensor) {
       return decodeArena->batchSlice(tensor, storage);
     };
-    std::array<uint32_t, kLaneCount> cacheLengths{};
-    for (uint32_t lane = 0; lane < lanes; ++lane)
-      cacheLengths[lane] = static_cast<uint32_t>(logicalPositions[lane]);
-
-    DFlashDecodeBuffers buffers;
-    buffers.linearScratch = decodeArena->linearScratch();
-    for (uint32_t hidden = 0; hidden < buffers.hidden.size(); ++hidden) {
-      buffers.hidden[hidden] = d(static_cast<DecodeTensor>(
-          static_cast<uint32_t>(DecodeTensor::DraftHidden0) + hidden));
-    }
-    buffers.normalized = d(DecodeTensor::DraftNormalized);
-    buffers.dynamic = d(DecodeTensor::DraftDynamic);
-    buffers.convolved = d(DecodeTensor::DraftConvolved);
-    buffers.proposalQkv = d(DecodeTensor::DraftProposalQkv);
-    buffers.attention = d(DecodeTensor::DraftAttention);
-    buffers.projected = d(DecodeTensor::DraftProjected);
-    buffers.residual = d(DecodeTensor::DraftResidual);
-    buffers.intermediate = d(DecodeTensor::DraftIntermediate);
-    buffers.finalHidden = d(DecodeTensor::DraftFinalHidden);
-    buffers.logits = d(DecodeTensor::Logits);
-    buffers.selectorHidden = d(DecodeTensor::SelectorHidden);
-    buffers.queryKeys = d(DecodeTensor::DraftQueryKeys);
-    buffers.queryValues = d(DecodeTensor::DraftQueryValues);
-    buffers.ropeCos = d(DecodeTensor::DraftRopeCos);
-    buffers.ropeSin = d(DecodeTensor::DraftRopeSin);
-    buffers.gateScratch = decodeArena->gateScratch();
-    bindDraftRings(entries, buffers.persistentKeys, buffers.persistentValues);
-    draftModel.addDecode(graph, std::move(buffers),
-                         targetModel->vocabularyProjection(),
-                         std::span(cacheLengths).first(lanes));
     std::array<uint32_t, kLaneCount> anchors{};
     std::array<ops::SamplingPolicy, kLaneCount> policies{};
     for (uint32_t lane = 0; lane < lanes; ++lane) {
@@ -2254,20 +2219,55 @@ struct Runtime::Impl {
       anchors[lane] = *entry.pendingToken;
       policies[lane] = samplingPolicy(entry);
     }
-    draftModel.addSelection(
-        graph,
-        {d(DecodeTensor::Logits), d(DecodeTensor::TopPartialIds),
-         d(DecodeTensor::TopPartialValues), d(DecodeTensor::Candidates),
-         d(DecodeTensor::Unary), d(DecodeTensor::SelectorHidden),
-         d(DecodeTensor::SamplingUniforms), d(DecodeTensor::ProposedTokens),
-         d(DecodeTensor::ProposalProbs), d(DecodeTensor::VerifyConfidence)},
-        std::span(anchors).first(lanes), std::span(policies).first(lanes));
-    encodeCopySpecProposals(graph, std::span(copies).first(lanes));
+    if (std::ranges::any_of(copies, [](const CopyDraft &copy) { return !copy.count; })) {
+      std::array<uint32_t, kLaneCount> cacheLengths{};
+      for (uint32_t lane = 0; lane < lanes; ++lane)
+        cacheLengths[lane] = static_cast<uint32_t>(logicalPositions[lane]);
+
+      DFlashDecodeBuffers buffers;
+      buffers.linearScratch = decodeArena->linearScratch();
+      for (uint32_t hidden = 0; hidden < buffers.hidden.size(); ++hidden) {
+        buffers.hidden[hidden] = d(static_cast<DecodeTensor>(
+            static_cast<uint32_t>(DecodeTensor::DraftHidden0) + hidden));
+      }
+      buffers.normalized = d(DecodeTensor::DraftNormalized);
+      buffers.dynamic = d(DecodeTensor::DraftDynamic);
+      buffers.convolved = d(DecodeTensor::DraftConvolved);
+      buffers.proposalQkv = d(DecodeTensor::DraftProposalQkv);
+      buffers.attention = d(DecodeTensor::DraftAttention);
+      buffers.projected = d(DecodeTensor::DraftProjected);
+      buffers.residual = d(DecodeTensor::DraftResidual);
+      buffers.intermediate = d(DecodeTensor::DraftIntermediate);
+      buffers.finalHidden = d(DecodeTensor::DraftFinalHidden);
+      buffers.logits = d(DecodeTensor::Logits);
+      buffers.selectorHidden = d(DecodeTensor::SelectorHidden);
+      buffers.queryKeys = d(DecodeTensor::DraftQueryKeys);
+      buffers.queryValues = d(DecodeTensor::DraftQueryValues);
+      buffers.ropeCos = d(DecodeTensor::DraftRopeCos);
+      buffers.ropeSin = d(DecodeTensor::DraftRopeSin);
+      buffers.gateScratch = decodeArena->gateScratch();
+      bindDraftRings(entries, buffers.persistentKeys, buffers.persistentValues);
+      draftModel.addDecode(graph, std::move(buffers),
+                           targetModel->vocabularyProjection(),
+                           std::span(cacheLengths).first(lanes));
+      draftModel.addSelection(
+          graph,
+          {d(DecodeTensor::Logits), d(DecodeTensor::TopPartialIds),
+           d(DecodeTensor::TopPartialValues), d(DecodeTensor::Candidates),
+           d(DecodeTensor::Unary), d(DecodeTensor::SelectorHidden),
+           d(DecodeTensor::SamplingUniforms), d(DecodeTensor::ProposedTokens),
+           d(DecodeTensor::ProposalProbs), d(DecodeTensor::VerifyConfidence)},
+          std::span(anchors).first(lanes), std::span(policies).first(lanes));
+    }
     ops::VerifyRowsModel verify;
     if (verifyBudget && !verifyBudget->explores(lanes, constrained)) {
       const VerifyBudget::Acceptance &acceptance = verifyBudget->acceptance();
       verify = {acceptance.slope, acceptance.intercepts, verifyBudget->costs(lanes, constrained), false};
     }
+    const std::array<ops::FixedProposals, kLaneCount> copied = copiedProposals(copies, verify);
+    ops::DraftSelector::addFixedProposals(graph, std::span(copied).first(lanes),
+                                          d(DecodeTensor::ProposedTokens),
+                                          d(DecodeTensor::VerifyConfidence));
     ops::DraftSelector::addVerifyRows(graph, d(DecodeTensor::VerifyConfidence), d(DecodeTensor::VerifyRows),
                                       verify, maximumRows);
     sampling.addThinkingDrafts(graph, std::span(policies).first(lanes),
@@ -2528,11 +2528,16 @@ struct Runtime::Impl {
           invalidSelection({targetTokens, laneResult.retained}, lane);
     }
     // A cycle whose every lane commits teaches the verify budget its lanes'
-    // labels and its cost.
+    // labels and its cost; one whose every lane copied skipped the draft
+    // (encodeDraftBatchGraph), so its cost is no drafted cycle's and it
+    // teaches nothing.
     bool commits = true;
-    for (uint32_t lane = 0; lane < items.size(); ++lane)
+    bool drafted = false;
+    for (uint32_t lane = 0; lane < items.size(); ++lane) {
       commits = commits && lanes[lane].failure.empty() && unreadable[lane].empty();
-    if (verifyBudget && commits) {
+      drafted = drafted || !lanes[lane].copiedTokens;
+    }
+    if (verifyBudget && commits && drafted) {
       std::array<VerifyBudget::Lane, kLaneCount> observed{};
       for (uint32_t lane = 0; lane < items.size(); ++lane) {
         const float *confidence = contents<float>(
@@ -2594,28 +2599,16 @@ struct Runtime::Impl {
       commitSelected(entry, {targetTokens, laneResult.retained});
       entry.maskWords.clear();
       entry.verifyMaskInFlight = false;
-      // A copied block's verification teaches the request's copy state, and
-      // a cycle of an auto-gated request its gate (CopySpecAutoGate).
-      if (entry.copySpec) {
-        if (laneResult.copiedTokens) {
-          ++counters.copyspecHits;
-          counters.copyspecTokens += laneResult.copiedTokens;
-          // Conservative is one-strike: a copied block that verified nothing
-          // stops copying for the request. A lookup miss is free and never
-          // strikes.
-          if (copyspecMode == CopySpecMode::Conservative && !laneResult.accepted)
-            entry.copySpec->disabled = true;
-        }
-        if (copyspecMode == CopySpecMode::Auto) {
-          entry.copySpec->gate.recordCycle(
-              laneResult.copiedTokens != 0, laneResult.retained,
-              static_cast<uint64_t>(
-                  std::max(0.0, timing.wallSeconds) * 1.0e9));
-          // On disengage the gate asks for a clean adaptive policy, which
-          // the copied cycles could have distorted.
-          if (entry.copySpec->gate.takeReset() && verifyBudget)
-            verifyBudget.emplace();
-        }
+      // A copied block's verification teaches the request's copy state: its
+      // measured acceptance of copies (CopySpecAcceptance), and conservative's
+      // one strike, where a copied block that verified nothing stops copying
+      // for the request. A lookup miss is free and never strikes.
+      if (entry.copySpec && laneResult.copiedTokens) {
+        ++counters.copyspecHits;
+        counters.copyspecTokens += laneResult.copiedTokens;
+        entry.copySpec->acceptance.observe(laneResult.verifyRows - 1, laneResult.accepted);
+        if (!laneResult.accepted)
+          entry.copySpec->disabled = true;
       }
       // The end replaced the first proposals, which acceptance keeps as far
       // as the lane retains them; the draft proposed the others, and the
@@ -2940,8 +2933,7 @@ StateAdmission Runtime::beginAt(const ModelRequest &request, uint32_t stateLane)
   entry.promptTokens = static_cast<uint32_t>(request.prompt.size());
   entry.tokens.assign(request.prompt.begin(), request.prompt.end());
   if (impl_->copyspecMode != CopySpecMode::Off)
-    entry.copySpec.emplace(
-        CopySpecState{CopySpecIndex{request.prompt}, false, CopySpecAutoGate{}});
+    entry.copySpec.emplace(CopySpecState{CopySpecIndex{request.prompt}, false, {}});
   entry.maxNewTokens = request.maxNewTokens;
   entry.sampling = request.sampling;
   entry.constraint = request.constraint;
@@ -3400,10 +3392,15 @@ Runtime::decodeAsync(const BatchPlan &plan,
       impl_->decodeArena->batchSlice(DecodeTensor::RopeSin, width),
       impl_->decodeArena->batchSlice(DecodeTensor::DraftRopeCos, width),
       impl_->decodeArena->batchSlice(DecodeTensor::DraftRopeSin, width));
-  impl_->encodeBatchEmbedding(commandGraph, DecodeTensor::DraftInputTokens,
-                              DecodeTensor::DraftHidden0, width);
-  impl_->draftModel.addMaskRows(commandGraph, impl_->decodeArena->batchSlice(DecodeTensor::DraftHidden0, width),
-                                width);
+  // The draft's input rows feed only its forward, which a cycle whose every
+  // lane copies skips (encodeDraftBatchGraph).
+  if (std::ranges::any_of(std::span(copyDrafts).first(width),
+                          [](const Impl::CopyDraft &copy) { return !copy.count; })) {
+    impl_->encodeBatchEmbedding(commandGraph, DecodeTensor::DraftInputTokens,
+                                DecodeTensor::DraftHidden0, width);
+    impl_->draftModel.addMaskRows(commandGraph, impl_->decodeArena->batchSlice(DecodeTensor::DraftHidden0, width),
+                                  width);
+  }
   impl_->encodeDraftBatchGraph(commandGraph, entries,
                                {logicalPositions.data(), width},
                                {maximumRetained.data(), width},

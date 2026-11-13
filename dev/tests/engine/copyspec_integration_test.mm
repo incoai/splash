@@ -1,6 +1,7 @@
 // The prompt-lookup (copyspec) cycle end to end through the decode pipeline's
 // own GPU ops: the draft's selection (ops::DraftSelector), the copied block a
-// lookup hit fills in its host step, the verify rows those confidences choose,
+// lookup hit writes over the draft's in the cycle's command
+// (DraftSelector::addFixedProposals), the verify rows those confidences choose,
 // the target's policy and DFlash acceptance (ops::Sampling), and the
 // finalizeDecode invariants on the way out. The two neural forwards are
 // scripted as logits, exactly as the acceptance path's test scripts them; the
@@ -17,10 +18,12 @@
 // constrained lane's copied proposals still go through grammar masking: its
 // target row selects among the tokens its mask admits, so a copied proposal
 // its grammar refuses is never accepted and every retained token is admitted.
-// The lookup lane's confidence is 1 at exactly its copied rows and 0 at the
-// rest (encodeCopySpecProposals' semantics), which the verify-rows rule reads
-// back: under a cost model that pays for every row, exactly the copied rows
-// plus their correction are worth verifying. A lookup miss keeps the draft's
+// The lookup lane's confidence at its copied rows is the one the verify rows'
+// model reads as the request's measured copy acceptance
+// (DraftSelector::confidenceFor, CopySpecAcceptance), and past them the
+// draft's stays: under a cost model that pays for every row, a copy its
+// request keeps accepting verifies its copied rows plus their correction,
+// and one it keeps refusing verifies only its anchor. A lookup miss keeps the draft's
 // block for free, and a block capped below the block width keeps its copied
 // prefix with the correction's row at the end.
 #include "TestBuffers.hpp"
@@ -50,6 +53,7 @@ using splash::metal::BufferStorage;
 using splash::metal::CommandGraph;
 using splash::metal::MetalBackend;
 using splash::metal::MetalBuffer;
+using splash::model::CopySpecAcceptance;
 using splash::model::CopySpecIndex;
 using namespace splash::ops;
 using splash::test::require;
@@ -250,10 +254,11 @@ uint32_t planCopyDraft(const Lane &lane,
 }
 
 // One decode cycle of the batch through the pipeline's own ops: the draft's
-// selection for every lane, the host step that fills the copied block of the
-// lanes whose lookup hit (encodeCopySpecProposals: the copied rows' proposals,
-// confidence 1 at exactly those rows and 0 at the rest), the verify rows
-// those confidences choose, and the target's policy and acceptance. The
+// selection for every lane, the fixed-proposal writer that puts the copied
+// block of the lanes whose lookup hit over the draft's (Runtime.cpp
+// copiedProposals: the copied rows' proposals, at the confidence `model`
+// reads as a fresh request's copy acceptance), the verify rows those
+// confidences choose, and the target's policy and acceptance. The
 // verify input rows are the anchor and the proposals, as the verify-input
 // dispatch writes them. Returns the lanes with their copied counts.
 std::vector<Lane> runCycle(MetalBackend &backend, Batch &batch,
@@ -273,42 +278,42 @@ std::vector<Lane> runCycle(MetalBackend &backend, Batch &batch,
   selector.add(draft, batch.selector, batch.codebooks, anchors, policies);
   static_cast<void>(backend.submitCommandAsync(draft.dispatches()).wait());
 
-  // The host step, and the selector's own block beside it, which lanes
-  // without a copied block must keep exactly.
+  // The selector's own block, which lanes without a copied block, and the
+  // rows past a copied block, must keep exactly.
   const std::vector<uint32_t> selectorProposals(
       batch.proposed(), batch.proposed() + width * kPositions);
   const std::vector<float> selectorConfidence(
       batch.confidences(), batch.confidences() + width * kPositions);
+  std::vector<FixedProposals> fixed(width);
   for (uint32_t lane = 0; lane < width; ++lane) {
     lanes[lane].count = planCopyDraft(lanes[lane], lanes[lane].copied);
-    if (!lanes[lane].count)
-      continue;
-    uint32_t *proposed = batch.proposed() + uint64_t{lane} * kPositions;
-    std::copy_n(lanes[lane].copied.begin(), lanes[lane].count, proposed);
-    float *confidence = batch.confidences() + uint64_t{lane} * kPositions;
-    std::fill(confidence, confidence + lanes[lane].count, 1.0F);
-    std::fill(confidence + lanes[lane].count, confidence + kPositions, 0.0F);
-    for (uint32_t position = 0; position < lanes[lane].count; ++position)
-      require(proposed[position] == lanes[lane].copied[position],
-              "a copied proposal did not overwrite the draft's");
-    for (uint32_t position = lanes[lane].count; position < kPositions;
-         ++position)
-      require(proposed[position] ==
-                  selectorProposals[lane * kPositions + position],
-              "a copy step changed a proposal past its copied rows");
-  }
-  for (uint32_t lane = 0; lane < width; ++lane) {
-    if (lanes[lane].count)
-      continue;
-    for (uint32_t position = 0; position < kPositions; ++position) {
-      require(batch.proposed()[lane * kPositions + position] ==
-                  selectorProposals[lane * kPositions + position],
-              "a lane without a copied block lost the draft's proposals");
-      require(batch.confidences()[lane * kPositions + position] ==
-                  selectorConfidence[lane * kPositions + position],
-              "a lane without a copied block lost the draft's confidence");
+    fixed[lane].count = lanes[lane].count;
+    for (uint32_t position = 0; position < lanes[lane].count; ++position) {
+      fixed[lane].tokens[position] = lanes[lane].copied[position];
+      fixed[lane].confidence[position] =
+          DraftSelector::confidenceFor(model, position, CopySpecAcceptance{}.rate());
     }
   }
+  CommandGraph copy;
+  DraftSelector::addFixedProposals(copy, fixed, batch.selector.proposedTokens, batch.confidence);
+  static_cast<void>(backend.submitCommandAsync(copy.dispatches()).wait());
+  for (uint32_t lane = 0; lane < width; ++lane)
+    for (uint32_t position = 0; position < kPositions; ++position) {
+      const uint32_t index = lane * kPositions + position;
+      if (position < lanes[lane].count) {
+        require(batch.proposed()[index] == lanes[lane].copied[position],
+                "a copied proposal did not overwrite the draft's");
+        require(batch.confidences()[index] == fixed[lane].confidence[position],
+                "a copied confidence did not overwrite the draft's");
+      } else {
+        require(batch.proposed()[index] == selectorProposals[index],
+                lanes[lane].count ? "a copy changed a proposal past its copied rows"
+                                  : "a lane without a copied block lost the draft's proposals");
+        require(batch.confidences()[index] == selectorConfidence[index],
+                lanes[lane].count ? "a copy changed a confidence past its copied rows"
+                                  : "a lane without a copied block lost the draft's confidence");
+      }
+    }
 
   for (uint32_t lane = 0; lane < width; ++lane) {
     uint32_t *inputs = batch.inputs() + uint64_t{lane} * kRows;
@@ -487,14 +492,11 @@ void mixedBatch(MetalBackend &backend, Random &random) {
     require(batch.proposed()[position] == 200 + position,
             "the copied proposal row " + std::to_string(position) +
                 " is not the request's own earlier token");
-    require(batch.confidences()[position] == 1.0F,
+    require(batch.confidences()[position] == 0.75F,
             "the copied confidence row " + std::to_string(position) +
-                " is not 1");
+                " is not a fresh request's copy acceptance");
     requireToken(batch, 0, position, 200 + position, "the copied prefix");
   }
-  for (uint32_t position = 4; position < kPositions; ++position)
-    require(batch.confidences()[position] == 0.0F,
-            "the confidence past the copied rows is not 0");
   require(batch.verifyRows()[0] == 5,
           "the greedy lane verified " + std::to_string(batch.verifyRows()[0]) +
               " rows, not its whole block");
@@ -538,34 +540,40 @@ void mixedBatch(MetalBackend &backend, Random &random) {
 }
 
 // The confidence of a copied block reads back through the verify-rows rule
-// (draft_verify_rows): under a cost model that pays a little more for every
-// row a cycle verifies, exactly the copied rows plus their correction are
-// worth verifying. The rows the request's retention would never allow ask the
-// kernel what the confidence says past the clamp: were any row past the
-// copied ones 1, or any copied row 0, the best assignment would move.
+// (draft_verify_rows) as its request's copy acceptance: under a cost model
+// that pays a little more for every row a cycle verifies, a copy its request
+// keeps accepting is worth its copied rows plus their correction, and one
+// its request keeps refusing only its anchor, where a confidence of 1 would
+// claim the whole block for both. The lane's limit is its copied rows plus
+// one, as Runtime.cpp's min(7, maximumRetained - 1) leaves it.
 void verifyRowsOfACopiedBlock(MetalBackend &backend) {
-  for (const uint32_t count : {2U, 4U}) {
+  VerifyRowsModel model;
+  model.everyRow = false;
+  for (uint32_t rows = 1; rows <= kRows; ++rows)
+    model.costs[rows] = 1.0F + 0.01F * float(rows);
+  const auto chosenRows = [&](uint32_t count, double acceptance, bool claimsAll) {
     MetalBuffer confidence = allocate(backend, kPositions * sizeof(float));
     auto *q = static_cast<float *>(confidence.contents());
-    std::fill_n(q, count, 1.0F);
-    std::fill(q + count, q + kPositions, 0.0F);
-    VerifyRowsModel model;
-    model.everyRow = false;
-    for (uint32_t rows = 1; rows <= kRows; ++rows)
-      model.costs[rows] = 1.0F + 0.01F * float(rows);
+    for (uint32_t position = 0; position < kPositions; ++position)
+      q[position] = claimsAll ? 1.0F : DraftSelector::confidenceFor(model, position, acceptance);
     MetalBuffer verifyRows = allocate(backend, sizeof(uint32_t));
-    const std::array<uint32_t, 1> maximum{kRows};
+    const std::array<uint32_t, 1> maximum{count + 1};
     CommandGraph graph;
-    DraftSelector::addVerifyRows(graph, confidence, verifyRows, model,
-                                 maximum);
+    DraftSelector::addVerifyRows(graph, confidence, verifyRows, model, maximum);
     static_cast<void>(backend.submitCommandAsync(graph.dispatches()).wait());
-    const uint32_t chosen =
-        *static_cast<const uint32_t *>(verifyRows.contents());
-    require(chosen == count + 1,
-            "the verify-rows rule read the block's confidence as " +
-                std::to_string(chosen) + " rows, not its " +
-                std::to_string(count) +
-                " copied rows and their correction");
+    return *static_cast<const uint32_t *>(verifyRows.contents());
+  };
+  for (const uint32_t count : {2U, 4U, kPositions}) {
+    const uint32_t accepted = chosenRows(count, 0.95, false);
+    require(accepted == count + 1,
+            "a well accepted copy verified " + std::to_string(accepted) + " rows, not its " +
+                std::to_string(count) + " copied rows and their correction");
+    const uint32_t refused = chosenRows(count, 0.005, false);
+    require(refused == 1,
+            "a refused copy verified " + std::to_string(refused) + " rows, not its anchor");
+    const uint32_t claimed = chosenRows(count, 0.005, true);
+    require(claimed == count + 1,
+            "a confidence of 1 claimed " + std::to_string(claimed) + " rows, not the whole block");
   }
 }
 
