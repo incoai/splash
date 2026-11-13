@@ -1417,6 +1417,12 @@ def main():
         # The app takes the server for ready from its record alone: one that
         # cannot say so has not started (serve_record).
         serve_record.ready(args.serve_record)
+        # Then it follows the engine: loading again while a failed engine is
+        # relaunched, which loads a whole model, and ready once that serves,
+        # so that what supervises the server from its record sees the load.
+        backend.on_serving = lambda serves: serve_record.entered(
+            args.serve_record, "ready" if serves else "loading"
+        )
         address = f"http://{args.host}:{server.server_port}"
         tokens = served.max_context_tokens
         context = f"{tokens // 1024}K" if tokens % 1024 == 0 else f"{tokens:,}"

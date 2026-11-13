@@ -57,7 +57,11 @@ stopped. While the engine restarts, generation requests get
 503 `engine_recovering`, whose message names the last failure and whose
 `Retry-After` the time until the next bound on the restart's start: when it
 should be ready, as long after its spawn as the start before took, then up to
-30 s more while it waits for memory the Mac refused ([errors](api.md#errors)). An engine whose
+30 s more while it waits for memory the Mac refused ([errors](api.md#errors)).
+The server's serve record (`serve-PORT.json` in its runtime directory, which
+the app reads to follow a start) says `loading` from the failure until the
+restarted engine serves, then `ready` again, with the same pid, so that a
+supervisor reading it sees the restart load a model. An engine whose
 loop leaves a status request unanswered for 30 seconds, while requests are
 pending or during a background status refresh, is failed and restarted by the
 same rules; so is one that leaves a frame unread for 30 seconds. A request the
