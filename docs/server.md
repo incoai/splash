@@ -243,10 +243,11 @@ listens on one; `/status` reports `instance.host` as `unix:PATH` and
 `instance.port` as null. Clients connect with, e.g.,
 `curl --unix-socket PATH http://localhost/health`, and the Host check applies
 as it does over TCP: a request names the server `localhost`, a loopback
-address or an `--allowed-host` name. The agent commands and the desktop app
-reach a server at `127.0.0.1:PORT` alone: for one on a socket, forward a
+address or an `--allowed-host` name. The agent commands reach a server at
+`127.0.0.1:PORT` alone and find none where it listens on a socket: forward a
 loopback TCP port to the socket and give them that port, whose
-`Host: 127.0.0.1:PORT` the relay passes on and the check accepts.
+`Host: 127.0.0.1:PORT` the relay passes on and the check accepts. The desktop
+app serves on TCP alone.
 
 Set `SPLASH_API_KEY` in the server and agent shells to require authentication;
 `serve --api-key KEY` overrides the server's environment value. Every request
