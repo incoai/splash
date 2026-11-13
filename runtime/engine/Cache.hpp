@@ -1414,11 +1414,12 @@ private:
   void dropPoisoned();
   // The KV tier's part of pollTransfers().
   [[nodiscard]] bool pollTierTransfers();
-  // A slot for a new KV copy, replacing older copies while the tier is at its
-  // limit for the draw, and none while that limit cannot hold one; inUse
-  // when a state in use needs the copy. A committed page's draw replaces the
-  // spilled chain of a state in RAM too, once nothing else is left.
-  [[nodiscard]] std::shared_ptr<KvDiskSlot> acquireDiskSlot(model::DiskBudget::Draw draw,
+  // A slot for a new KV copy of a page of the form, replacing older copies
+  // while the tier's limit for the draw has no room for it, and none while
+  // that limit cannot hold it; inUse when a state in use needs the copy. A
+  // committed page's draw replaces the spilled chain of a state in RAM too,
+  // once nothing else is left.
+  [[nodiscard]] std::shared_ptr<KvDiskSlot> acquireDiskSlot(kv::PageForm form, model::DiskBudget::Draw draw,
                                                             bool inUse);
   // Gives up one disk copy for a new copy, in use or not: the oldest
   // redundant one, KV or state, else the oldest that is the only copy, never
@@ -1458,12 +1459,20 @@ private:
   void labelKv(uint64_t block, const std::shared_ptr<KvDiskSlot> &slot);
   // Ordinary states below the block sit on exactly one of its branches.
   [[nodiscard]] bool superseded(uint64_t block) const;
-  // The point persist() copies: its chain, root first, and how many of its
-  // blocks from the root have a copy that landed.
+  // What a copy of the block takes of the quota: its slot's bytes, or
+  // without a copy what a slot of its page's form takes; nothing for a block
+  // with neither, which holds nothing to write.
+  [[nodiscard]] uint64_t copyBytes(uint64_t block) const;
+  // The point persist() copies: its chain, root first, how many of its
+  // blocks from the root have a copy that landed, and what the chain's
+  // copies take of the quota, those still to write by their pages' forms as
+  // the cursor took the chain (a 245K-token chain is 7,656 blocks, walked
+  // once and not at every step).
   struct PersistCursor final {
     uint64_t block = 0;
     std::vector<uint64_t> blocks;
     size_t landed = 0;
+    uint64_t bytes = 0;
   };
   // Whether the restore point persist() copies fits the room it may take.
   // A persistent tier gives up older points for it as a full quota does
@@ -1532,10 +1541,11 @@ private:
   [[nodiscard]] std::shared_ptr<const model::KvPageSources>
   cutSources(const Request &active) const;
 
-  // Spilling (a cache with a spill policy).
-  [[nodiscard]] uint64_t heldSlotBytes() const noexcept {
-    return tier_ ? uint64_t{kv_.heldCopies()} * tier_->slotBytes() : 0;
-  }
+  // Spilling (a cache with a spill policy). Its pages keep every layer (the
+  // constructor), so a page a request commits quota for is written whole
+  // and takes a Full page's slot, as each copy its chain already has does.
+  [[nodiscard]] uint64_t spillSlotBytes() const { return tier_->slotBytes(kv::PageForm::Full); }
+  [[nodiscard]] uint64_t heldSlotBytes() const noexcept { return kv_.heldCopyBytes(); }
   // A Spill request's commitment: locks quota for `pages` slots; false,
   // committing nothing, when active KV's limit cannot hold them beside
   // `unheld` copies it is about to hold.

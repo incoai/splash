@@ -81,7 +81,7 @@ void roundTrips(const std::shared_ptr<model::SsdReaders> &readers, kv::Layout la
       pages.setForm(page, kv::PageForm::Slim);
       pages.setForm(kPages + page, kv::PageForm::Slim);
     }
-    slots.push_back(tier.acquireSlot(cached));
+    slots.push_back(tier.acquireSlot(pages.form(page), cached));
     writes.push_back(tier.demote(page, slots.back(), WriteClass::Reclaim, {}));
     require(writes.back() != nullptr, "a write within the tier's bound was refused");
   }
@@ -96,7 +96,7 @@ void roundTrips(const std::shared_ptr<model::SsdReaders> &readers, kv::Layout la
       pages.setForm(kPages + page, kv::PageForm::Index);
     restores.push_back(tier.restore(slots[page], kPages + page, [&wakes] { wakes.fetch_add(1); }));
   }
-  restores.push_back(tier.restore(tier.acquireSlot(cached), 2 * kPages, {}));
+  restores.push_back(tier.restore(tier.acquireSlot(kv::PageForm::Full, cached), 2 * kPages, {}));
   runUntilReady(tier, restores);
   for (uint32_t page = 0; page < kPages; ++page) {
     const uint32_t into = kPages + page;
@@ -124,7 +124,7 @@ void teardown(const std::shared_ptr<model::SsdReaders> &readers, kv::Layout layo
     std::vector<std::unique_ptr<KvTransfer>> transfers;
     std::vector<std::shared_ptr<engine::KvDiskSlot>> slots;
     for (uint32_t page = 0; page < 8; ++page) {
-      slots.push_back(tier.acquireSlot(cached));
+      slots.push_back(tier.acquireSlot(kv::PageForm::Full, cached));
       transfers.push_back(tier.demote(page, slots.back(), WriteClass::Reclaim, {}));
       require(transfers.back() != nullptr, "a write within the tier's bound was refused");
     }
@@ -137,7 +137,7 @@ void teardown(const std::shared_ptr<model::SsdReaders> &readers, kv::Layout layo
     auto wakes = std::make_unique<std::atomic<uint32_t>>(0);
     {
       Tier tier(pages, format, file, readers);
-      const std::shared_ptr<engine::KvDiskSlot> slot = tier.acquireSlot(cached);
+      const std::shared_ptr<engine::KvDiskSlot> slot = tier.acquireSlot(kv::PageForm::Full, cached);
       std::vector<std::unique_ptr<KvTransfer>> transfers;
       transfers.push_back(tier.demote(0, slot, WriteClass::Reclaim, {}));
       runUntilReady(tier, transfers);

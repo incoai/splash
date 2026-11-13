@@ -321,7 +321,7 @@ void testTheHarnessClockRunsCommandsForTheirTime() {
 void testTheTierLandsTransfersAtItsRate() {
   test::EngineHarness harness({.tier = test::TierOptions{.bytesPerMillisecond = 0.5}});
   test::TestKvTier &tier = *harness.tier;
-  const auto slot = [&] { return tier.acquireSlot(model::DiskBudget::Draw::Cache); };
+  const auto slot = [&] { return tier.acquireSlot(kv::PageForm::Full, model::DiskBudget::Draw::Cache); };
   const std::unique_ptr<engine::KvTransfer> write = tier.demote(3, slot(), engine::WriteClass::Reclaim, {});
   const std::unique_ptr<engine::KvTransfer> read = tier.restore(slot(), 4, {});
   require(tier.nextLanding() == 201.0, "the write is not due a slot's bytes at the rate after it started");

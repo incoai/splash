@@ -1122,7 +1122,7 @@ void testDiskQuotaKeepsTheOnlyCopyAQueuedRequestRestores() {
 // take finds as freeDiskSpace does.
 void testAFullTemporaryQuotaStillDemotesByReplacingItsOldestCopy() {
   test::TestKvTier tier;
-  auto budget = std::make_shared<model::DiskBudget>(2 * tier.slotBytes());
+  auto budget = std::make_shared<model::DiskBudget>(2 * tier.slotBytes(kv::PageForm::Full));
   tier.budget = budget;
   Prefixes prefixes(&tier, true, budget);
   auto control = std::make_shared<TransferControl>();
@@ -1142,7 +1142,7 @@ void testAFullTemporaryQuotaStillDemotesByReplacingItsOldestCopy() {
     require(step(), "the cache did not leave RAM");
   const uint64_t demotions = tier.demotions;
   const uint64_t diskBlocks = prefixes.cache.snapshot().kvTier.diskBlocks;
-  require(budget->usedBytes() + tier.slotBytes() > budget->limitBytes() && diskBlocks == 2 &&
+  require(budget->usedBytes() + tier.slotBytes(kv::PageForm::Full) > budget->limitBytes() && diskBlocks == 2 &&
               !prefixes.cache.stateResident(prefixes.blocks[2]),
           "the quota was not full of two disk-only leaves beside a state on disk");
   const uint32_t freePages = prefixes.pool.freePageCount();
@@ -1223,7 +1223,7 @@ void testALeafWhoseWriteFindsNoSlotGoesWithItsSubtree() {
 void testAWaitingClaimDemotesAWholeChainRunAtOnce() {
   test::TestKvTier tier;
   tier.transferLimit = 64;
-  auto budget = std::make_shared<model::DiskBudget>(16 * tier.slotBytes());
+  auto budget = std::make_shared<model::DiskBudget>(16 * tier.slotBytes(kv::PageForm::Full));
   tier.budget = budget;
   test::TestKvStorage storage{12, 100, 4};
   KvPool pool{storage, 4};
@@ -1857,7 +1857,7 @@ void testQuotaWithoutTheKvTier() {
   KvPool pool{storage, 4};
   engine::Cache cache(pool, nullptr, budget);
   model::SlotFile states(size, budget);
-  auto slot = states.acquire();
+  auto slot = states.acquire(size);
   std::vector<std::byte> source(size, std::byte{1}), restored(size);
   require(slot && states.write(slot, {source}, {})->wait() &&
               states.read(slot, {restored}, {})->wait(),
@@ -1921,7 +1921,7 @@ void testTierOnlyAddsToTierOff() {
 void testAMemoryClaimForAPageTakesACachedPageInPlace() {
   test::TestKvTier tier;
   tier.transferLimit = 64;
-  auto budget = std::make_shared<model::DiskBudget>(16 * tier.slotBytes());
+  auto budget = std::make_shared<model::DiskBudget>(16 * tier.slotBytes(kv::PageForm::Full));
   tier.budget = budget;
   test::TestKvStorage storage{12, 100, 4};
   KvPool pool{storage, 4};
@@ -2404,7 +2404,7 @@ void testLimitBelowASlotMakesNoRoom() {
           "the deepest page the state needs was not written");
   tier.complete();
   require(fixture.cache.pollTransfers(), "the page did not land");
-  budget->setLimitBytes(tier.slotBytes() - 1);
+  budget->setLimitBytes(tier.slotBytes(kv::PageForm::Full) - 1);
   static_cast<void>(test::evictStep(fixture.cache));
   const CacheSnapshot held = fixture.cache.snapshot();
   require(tier.demotions == 1 && !held.kvTier.diskBlocks && !fixture.lookup(129).state,

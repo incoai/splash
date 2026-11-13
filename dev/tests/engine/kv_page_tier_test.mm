@@ -139,7 +139,7 @@ void roundTrip(metal::MetalBackend &backend, engine::MemoryGovernor &governor,
   const uint64_t slotBytes = SlotFile::slotBytesFor(format.payloadBytes());
   auto file = slotFile(format, 2);
   KvPageTier tier(pages, format, file, readers);
-  require(tier.slotBytes() == slotBytes, "tier reports another slot size");
+  require(tier.slotBytes(kv::PageForm::Full) == slotBytes, "tier reports another slot size");
 
   const auto first = fill(pages, pageA, 0x1234567u);
   const auto second = fill(pages, pageB, 0x89abcdefu);
@@ -150,9 +150,9 @@ void roundTrip(metal::MetalBackend &backend, engine::MemoryGovernor &governor,
 
   const auto slottedA = payload(format, pages, pageA);
   const auto slottedB = payload(format, pages, pageB);
-  auto slotA = tier.acquireSlot(cached);
-  auto slotB = tier.acquireSlot(cached);
-  require(slotA && slotB && !tier.acquireSlot(cached), "disk quota was not enforced");
+  auto slotA = tier.acquireSlot(kv::PageForm::Full, cached);
+  auto slotB = tier.acquireSlot(kv::PageForm::Full, cached);
+  require(slotA && slotB && !tier.acquireSlot(kv::PageForm::Full, cached), "disk quota was not enforced");
   auto demoteA = tier.demote(pageA, slotA, WriteClass::Reclaim, {});
   auto demoteB = tier.demote(pageB, slotB, WriteClass::Spill, {});
   require(demoteA && demoteB, "demotions within the tier's limit were refused");
@@ -179,7 +179,7 @@ void roundTrip(metal::MetalBackend &backend, engine::MemoryGovernor &governor,
 
   // A finished transfer holds neither room in the tier nor its slot.
   slotA.reset();
-  require(tier.canDemote(WriteClass::Reclaim) && tier.acquireSlot(cached) != nullptr,
+  require(tier.canDemote(WriteClass::Reclaim) && tier.acquireSlot(kv::PageForm::Full, cached) != nullptr,
           "a released disk slot was not reusable");
   std::cout << "round trip " << kv::formatName(layout.format) << " "
             << layout.attentionLayers << "x" << layout.kvHeads << "x"
@@ -202,7 +202,7 @@ void blockRecords(metal::MetalBackend &backend, engine::MemoryGovernor &governor
   KvPageTier tier(pages, format, slotFile(format, 2), readers);
   static_cast<void>(fill(pages, 3, 0x7e57u));
   const auto slotted = payload(format, pages, 3);
-  auto slot = tier.acquireSlot(cached);
+  auto slot = tier.acquireSlot(kv::PageForm::Full, cached);
   auto written = tier.demote(3, slot, WriteClass::Spill, {});
   require(written != nullptr, "the page was not written");
   runUntilReady(tier, *written);
@@ -228,8 +228,11 @@ void blockRecords(metal::MetalBackend &backend, engine::MemoryGovernor &governor
     return bytes;
   };
   require(restore->finish() && indexOf(index) == indexOf(3), "an Index page did not take its slot's index");
-  rejects([&] { static_cast<void>(tier.demote(index, tier.acquireSlot(cached), WriteClass::Spill, {})); },
-          "only a page that holds its K/V", "an Index page was written to the tier");
+  rejects(
+      [&] {
+        static_cast<void>(tier.demote(index, tier.acquireSlot(kv::PageForm::Full, cached), WriteClass::Spill, {}));
+      },
+      "only a page that holds its K/V", "an Index page was written to the tier");
   std::cout << "block records " << kv::formatName(layout.format) << ": record_bytes=" << format.recordBytes()
             << " pitch=" << format.recordPitch() << '\n';
 }
@@ -253,7 +256,7 @@ void limits(metal::MetalBackend &backend, engine::MemoryGovernor &governor,
   const auto bytes = fill(pages, 9, 0x51a5e5u);
   std::vector<std::unique_ptr<KvTransfer>> writes;
   const auto write = [&](WriteClass kind) {
-    auto started = tier.demote(9, tier.acquireSlot(cached), kind, {});
+    auto started = tier.demote(9, tier.acquireSlot(kv::PageForm::Full, cached), kind, {});
     if (started) writes.push_back(std::move(started));
     return writes.size();
   };
@@ -267,11 +270,11 @@ void limits(metal::MetalBackend &backend, engine::MemoryGovernor &governor,
               !tier.canDemote(WriteClass::Reclaim) && write(WriteClass::Reclaim) == 8,
           "the tier took more writes than its bound");
   // An unwritten slot cannot be restored; the restores beside it can.
-  auto written = tier.acquireSlot(cached);
+  auto written = tier.acquireSlot(kv::PageForm::Full, cached);
   require(file->write(fileSlot(written), {bytes}, {})->wait(), "seeding failed");
   std::vector<std::unique_ptr<KvTransfer>> restores;
   restores.push_back(tier.restore(written, 0, {}));
-  restores.push_back(tier.restore(tier.acquireSlot(cached), 1, {}));
+  restores.push_back(tier.restore(tier.acquireSlot(kv::PageForm::Full, cached), 1, {}));
   restores.push_back(tier.restore(written, 2, {}));
   for (auto &restore : restores) runUntilReady(tier, *restore);
   require(restores[0]->finish() && !restores[1]->finish() && restores[2]->finish() &&
@@ -302,7 +305,7 @@ void allocationFailure(metal::MetalBackend &backend, engine::MemoryGovernor &gov
       auto budget = std::make_shared<DiskBudget>(bytes);
       auto file = std::make_shared<SlotFile>(bytes, budget);
       KvPageTier tier(pages, kv::SlotFormat(layout), file, readers, 1);
-      auto slot = tier.acquireSlot(cached);
+      auto slot = tier.acquireSlot(kv::PageForm::Full, cached);
       const auto payload = fill(pages, 0, 123);
       require(file->write(fileSlot(slot), {payload}, {})->wait(), "fault slot seed failed");
       std::unique_ptr<KvTransfer> transfer;
@@ -356,14 +359,14 @@ void demotionsPassTheWriteBudget(metal::MetalBackend &backend, engine::MemoryGov
   budget->setWriteBudget(slotBytes);
   auto file = std::make_shared<SlotFile>(slotBytes, budget);
   KvPageTier tier(pages, kv::SlotFormat(layout), file, readers);
-  auto first = tier.demote(0, tier.acquireSlot(cached), WriteClass::Reclaim, {});
+  auto first = tier.demote(0, tier.acquireSlot(kv::PageForm::Full, cached), WriteClass::Reclaim, {});
   require(first != nullptr, "a demotion within the write budget was refused");
   runUntilReady(tier, *first);
   require(first->finish(), "the first demotion failed");
   const int64_t spent = budget->writeBudgetBytes();
   require(!budget->admits(false) && spent < 0 && tier.canDemote(WriteClass::Reclaim),
           "the write budget was not spent, or its being spent refused a demotion");
-  auto second = tier.demote(1, tier.acquireSlot(cached), WriteClass::Reclaim, {});
+  auto second = tier.demote(1, tier.acquireSlot(kv::PageForm::Full, cached), WriteClass::Reclaim, {});
   require(second != nullptr, "a demotion was refused while the write budget was spent");
   runUntilReady(tier, *second);
   require(second->finish() &&
@@ -386,7 +389,7 @@ void closedFileRefusesDemotion(metal::MetalBackend &backend, engine::MemoryGover
   const uint64_t slotBytes = SlotFile::slotBytesFor(pages.bytesPerPage());
   auto file = std::make_shared<SlotFile>(slotBytes, std::make_shared<DiskBudget>(4 * slotBytes));
   KvPageTier tier(pages, kv::SlotFormat(layout), file, readers);
-  auto first = tier.acquireSlot(cached);
+  auto first = tier.acquireSlot(kv::PageForm::Full, cached);
   auto stored = tier.demote(0, first, WriteClass::Reclaim, {});
   require(stored != nullptr, "the first demotion was refused");
   runUntilReady(tier, *stored);
@@ -400,13 +403,13 @@ void closedFileRefusesDemotion(metal::MetalBackend &backend, engine::MemoryGover
   rlimit limited = original;
   limited.rlim_cur = slotBytes;
   require(setrlimit(RLIMIT_FSIZE, &limited) == 0, "file limit could not be set");
-  auto failing = tier.demote(1, tier.acquireSlot(cached), WriteClass::Reclaim, {});
+  auto failing = tier.demote(1, tier.acquireSlot(kv::PageForm::Full, cached), WriteClass::Reclaim, {});
   require(failing != nullptr, "a demotion into a new slot was refused");
   runUntilReady(tier, *failing);
   require(setrlimit(RLIMIT_FSIZE, &original) == 0, "file limit restore failed");
   require(!failing->finish(), "a write past the file limit succeeded");
   require(!tier.writable() && !tier.canDemote(WriteClass::Reclaim) &&
-              tier.demote(2, tier.acquireSlot(cached), WriteClass::Reclaim, {}) == nullptr,
+              tier.demote(2, tier.acquireSlot(kv::PageForm::Full, cached), WriteClass::Reclaim, {}) == nullptr,
           "a closed file took a demotion");
   std::cout << "closed file tests passed\n";
 }
@@ -475,7 +478,7 @@ void besideACommand(metal::MetalBackend &backend, engine::MemoryGovernor &govern
   static_cast<void>(backend.submit(write(ownTable, own.size(), ownSeed)));
   const auto expected = contents(pages, restored);
   const auto leaving = fill(pages, demoted, 0xc0ffee11u);
-  auto slot = tier.acquireSlot(cached);
+  auto slot = tier.acquireSlot(kv::PageForm::Full, cached);
   auto demotion = tier.demote(restored, slot, WriteClass::Reclaim, {});
   require(demotion != nullptr, "demotion was refused");
   runUntilReady(tier, *demotion);
@@ -497,7 +500,7 @@ void besideACommand(metal::MetalBackend &backend, engine::MemoryGovernor &govern
     }
     *mismatched = 0;
     static_cast<void>(fill(pages, restored, 0xdeadbeefu + rounds));
-    auto other = tier.acquireSlot(cached);
+    auto other = tier.acquireSlot(kv::PageForm::Full, cached);
     auto ticket = backend.submitCommandAsync(command);
     auto restore = tier.restore(slot, restored, {});
     auto leave = tier.demote(demoted, other, WriteClass::Reclaim, {});
@@ -547,7 +550,7 @@ void teardown(metal::MetalBackend &backend, engine::MemoryGovernor &governor,
     std::vector<std::unique_ptr<KvTransfer>> transfers;
     std::vector<std::shared_ptr<engine::KvDiskSlot>> slots;
     for (uint32_t page = 0; page < 8; ++page) {
-      slots.push_back(tier.acquireSlot(cached));
+      slots.push_back(tier.acquireSlot(kv::PageForm::Full, cached));
       require(slots.back() != nullptr, "the quota did not hold a demotion");
       transfers.push_back(tier.demote(page, slots.back(), WriteClass::Reclaim, {}));
       require(transfers.back() != nullptr, "a demotion within the share was refused");
@@ -588,7 +591,7 @@ void persistentRoundTrip(metal::MetalBackend &backend, engine::MemoryGovernor &g
     second = fill(pages, 1, 0x2468u);
     std::vector<std::shared_ptr<engine::KvDiskSlot>> kept;
     for (uint32_t page = 0; page < 2; ++page) {
-      kept.push_back(tier.acquireSlot(cached));
+      kept.push_back(tier.acquireSlot(kv::PageForm::Full, cached));
       auto demotion = tier.demote(page, kept.back(), WriteClass::Spill, {});
       require(demotion != nullptr, "a demotion was refused");
       tier.label(kept.back(), std::vector<std::byte>(8, std::byte{static_cast<uint8_t>(page + 1)}));

@@ -178,7 +178,7 @@ CacheAdoption Cache::adopt(std::vector<PersistedKv> blocks, std::vector<Persiste
   const StateCacheSnapshot held = states_.snapshot();
   result.states = held.entries;
   result.blocks = kv_.diskBlocks();
-  result.bytes = held.diskBytes + uint64_t{result.blocks} * tier_->slotBytes();
+  result.bytes = held.diskBytes + kv_.diskBytes();
   adoption_ = result;
   return result;
 }
@@ -1887,8 +1887,8 @@ Cache::ChainCopies Cache::chainCopies(uint64_t block) const {
 }
 
 bool Cache::commit(Request &active, uint32_t pages, uint32_t unheld) {
-  if ((pages || unheld) && !diskBudget_->commit(uint64_t{pages} * tier_->slotBytes(),
-                                    heldSlotBytes() + uint64_t{unheld} * tier_->slotBytes()))
+  if ((pages || unheld) && !diskBudget_->commit(uint64_t{pages} * spillSlotBytes(),
+                                    heldSlotBytes() + uint64_t{unheld} * spillSlotBytes()))
     return false;
   active.committedPages += pages;
   return true;
@@ -1904,7 +1904,7 @@ void Cache::returnCommitment(Request &active, uint32_t pages) noexcept {
   if (!pages)
     return;
   active.committedPages -= pages;
-  diskBudget_->uncommit(uint64_t{pages} * tier_->slotBytes());
+  diskBudget_->uncommit(uint64_t{pages} * spillSlotBytes());
 }
 
 void Cache::oweCopies(Request &active, std::span<const uint64_t> blocks) {
@@ -1923,7 +1923,7 @@ uint32_t Cache::writeThrough() {
   // limit, and gives up cached copies for it (acquireDiskSlot), which a
   // size's quota lets fill all of that room.
   if (writeThroughPaused_) {
-    if (heldSlotBytes() + tier_->slotBytes() > diskBudget_->activeLimitBytes())
+    if (heldSlotBytes() + spillSlotBytes() > diskBudget_->activeLimitBytes())
       return started;
     writeThroughPaused_ = false;
   }
@@ -1961,7 +1961,8 @@ bool Cache::writeThrough(Request &active, uint32_t &started) {
       return true;
     // A slot gives up cached copies, never the only copy of a state in use;
     // without one the volume holds no more active KV, for any request.
-    std::shared_ptr<KvDiskSlot> slot = acquireDiskSlot(model::DiskBudget::Draw::Commitment, false);
+    std::shared_ptr<KvDiskSlot> slot =
+        acquireDiskSlot(pool_.form(kv_.page(block)), model::DiskBudget::Draw::Commitment, false);
     if (!slot)
       return false;
     --active.committedPages;
@@ -2391,7 +2392,7 @@ KvSpillSnapshot Cache::spillSnapshot() const {
   result.rewrites = kv_.rewrites();
   result.restore = restoreLatency_.snapshot();
   if (spill_) {
-    result.spilledBytes = uint64_t{result.spilledPages} * tier_->slotBytes();
+    result.spilledBytes = uint64_t{result.spilledPages} * spillSlotBytes();
     result.activeLimitBytes = diskBudget_->activeLimitBytes();
     result.heldBytes = heldSlotBytes();
     result.committedBytes = diskBudget_->committedBytes();
@@ -2492,7 +2493,7 @@ void Cache::checkInvariants() const {
     }
   }
   if (spill_)
-    check(committed * tier_->slotBytes() == diskBudget_->committedBytes(),
+    check(committed * spillSlotBytes() == diskBudget_->committedBytes(),
           "the commitments are the requests'");
   // The trim count, which the window reads bound, counts the pages the
   // trims take.
@@ -2673,8 +2674,8 @@ Cache::LeafReclaim Cache::demoteKv(const Walk &walk, uint64_t block) {
     ++kvTier_.demotionsRefused;
     return room();
   }
-  std::shared_ptr<KvDiskSlot> slot =
-      acquireDiskSlot(model::DiskBudget::Draw::Cache, kvNeededByStateInUse(block));
+  std::shared_ptr<KvDiskSlot> slot = acquireDiskSlot(pool_.form(kv_.page(block)), model::DiskBudget::Draw::Cache,
+                                                     kvNeededByStateInUse(block));
   if (!slot)
     return room();
   // Making room may have taken the states the leaf was kept for; it then
@@ -2703,11 +2704,11 @@ void Cache::labelKv(uint64_t block, const std::shared_ptr<KvDiskSlot> &slot) {
   tier_->label(slot, encodeKvSlotLabel(label, window_.has_value()));
 }
 
-std::shared_ptr<KvDiskSlot> Cache::acquireDiskSlot(model::DiskBudget::Draw draw, bool inUse) {
-  // Making room is no use while the limit cannot hold a slot.
+std::shared_ptr<KvDiskSlot> Cache::acquireDiskSlot(kv::PageForm form, model::DiskBudget::Draw draw, bool inUse) {
+  // Making room is no use while the limit cannot hold the slot.
   if (diskBudget_ &&
       (draw == model::DiskBudget::Draw::Commitment ? diskBudget_->activeLimitBytes()
-                                                   : diskBudget_->limitBytes()) < tier_->slotBytes())
+                                                   : diskBudget_->limitBytes()) < tier_->slotBytes(form))
     return {};
   // A committed page is a request's KV, which comes before any cached copy:
   // once nothing else is left, it takes the spilled chain of a state in RAM
@@ -2715,7 +2716,7 @@ std::shared_ptr<KvDiskSlot> Cache::acquireDiskSlot(model::DiskBudget::Draw draw,
   // holds no state.
   const bool committed = draw == model::DiskBudget::Draw::Commitment;
   for (;;) {
-    if (auto slot = tier_->acquireSlot(draw))
+    if (auto slot = tier_->acquireSlot(form, draw))
       return slot;
     if (!freeDiskSpace(inUse, committed) && !(committed && evictStateOnDiskLeaf()))
       return {};
@@ -2967,7 +2968,7 @@ bool Cache::pollTierTransfers() {
       // The page stays Full until spillWritten moves it.
       if (written) {
         ++spilled_.writeThroughPages;
-        spilled_.writeThroughBytes += tier_->slotBytes();
+        spilled_.writeThroughBytes += spillSlotBytes();
         break;
       }
       ++spilled_.writeThroughFailures;
@@ -2994,8 +2995,11 @@ PersistStatus Cache::persist(uint64_t block) {
     return settled(PersistStatus::Unneeded);
   if (!kvTierWritable())
     return settled(PersistStatus::Refused);
-  if (persisting_.block != block)
-    persisting_ = {block, kv_.chain(block).blocks, 0};
+  if (persisting_.block != block) {
+    persisting_ = {block, kv_.chain(block).blocks, 0, 0};
+    for (const uint64_t id : persisting_.blocks)
+      persisting_.bytes += copyBytes(id);
+  }
   // Waiting for room would hold back the points after this one.
   if (!pointFits(persisting_))
     return settled(PersistStatus::Refused);
@@ -3031,9 +3035,10 @@ PersistStatus Cache::persist(uint64_t block) {
         return settled(PersistStatus::Unneeded);
       if (yields || !tier_->canDemote(WriteClass::Persist))
         return settled(inFlight ? PersistStatus::Started : PersistStatus::Busy);
+      const kv::PageForm form = pool_.form(kv_.page(id));
       std::shared_ptr<KvDiskSlot> slot = persistent_
-                                             ? acquireDiskSlot(model::DiskBudget::Draw::Cache, false)
-                                             : tier_->acquireSlot(model::DiskBudget::Draw::Cache);
+                                             ? acquireDiskSlot(form, model::DiskBudget::Draw::Cache, false)
+                                             : tier_->acquireSlot(form, model::DiskBudget::Draw::Cache);
       // Making room gives up the oldest point, which may be this one: it
       // does not fit then. Otherwise its chain stays whole, as a state needs
       // it. A temporary tier, which makes none, keeps what it copied.
@@ -3071,16 +3076,23 @@ bool Cache::superseded(uint64_t block) const {
   return branches == 1;
 }
 
+uint64_t Cache::copyBytes(uint64_t block) const {
+  if (const std::shared_ptr<KvDiskSlot> slot = kv_.slot(block))
+    return slot->bytes();
+  const uint32_t page = kv_.page(block);
+  return page == KvCache::noPage ? 0 : tier_->slotBytes(pool_.form(page));
+}
+
 bool Cache::pointFits(const PersistCursor &point) const {
   if (!diskBudget_)
     return true;
   const uint64_t limit = diskBudget_->limitBytes();
   if (persistent_)
-    return uint64_t{point.blocks.size()} * tier_->slotBytes() + states_.bytes(point.block) <= limit;
+    return point.bytes + states_.bytes(point.block) <= limit;
   uint64_t lacking = states_.onDisk(point.block) ? 0 : states_.bytes(point.block);
   for (const uint64_t id : point.blocks)
     if (!kv_.slot(id))
-      lacking += tier_->slotBytes();
+      lacking += copyBytes(id);
   const uint64_t taken = diskBudget_->usedBytes() + diskBudget_->committedBytes();
   return taken <= limit && lacking <= limit - taken;
 }
@@ -3120,8 +3132,7 @@ CacheSnapshot Cache::snapshot() const {
     tier.readBytes = diskBudget_->readBytes();
     tier.writtenBytes = diskBudget_->writtenBytes();
   }
-  if (tier_)
-    tier.diskBytes = uint64_t{tier.diskBlocks} * tier_->slotBytes();
+  tier.diskBytes = kv_.diskBytes();
   std::optional<KvWindowSnapshot> window;
   if (window_)
     window = KvWindowSnapshot{.windowPages = window_->windowPages,

@@ -785,7 +785,7 @@ void KvCache::setHeld(Block &entry, bool held) noexcept {
     return;
   entry.held = held;
   if (entry.slot && !entry.foreignCopy)
-    held ? ++heldCopies_ : --heldCopies_;
+    held ? heldCopyBytes_ += entry.slot->bytes() : heldCopyBytes_ -= entry.slot->bytes();
   reindex(entry);
 }
 
@@ -804,11 +804,13 @@ void KvCache::setSlot(uint64_t blockId, std::shared_ptr<KvDiskSlot> slot) {
 void KvCache::giveDiskCopy(Block &entry, std::shared_ptr<KvDiskSlot> slot, kv::PageForm copyForm) {
   setForeignCopy(entry, false);
   const bool changed = static_cast<bool>(entry.slot) != static_cast<bool>(slot);
-  if (changed) {
+  if (changed)
     slot ? ++diskBlocks_ : --diskBlocks_;
-    if (entry.held)
-      slot ? ++heldCopies_ : --heldCopies_;
-  }
+  // The block's copy takes what the new slot does, in place of the old.
+  const uint64_t before = entry.slot ? entry.slot->bytes() : 0, after = slot ? slot->bytes() : 0;
+  diskBytes_ = diskBytes_ - before + after;
+  if (entry.held)
+    heldCopyBytes_ = heldCopyBytes_ - before + after;
   if (slot)
     rewrites_ += std::exchange(entry.copied, true);
   entry.slot = std::move(slot);
@@ -825,7 +827,7 @@ void KvCache::setForeignCopy(Block &entry, bool foreign) noexcept {
     return;
   // Only a copy of what the page holds is active KV.
   if (entry.held)
-    foreign ? --heldCopies_ : ++heldCopies_;
+    foreign ? heldCopyBytes_ -= entry.slot->bytes() : heldCopyBytes_ += entry.slot->bytes();
   if (copyChanged_)
     copyChanged_(entry.id, entry.depth, entry.page, !foreign);
 }
@@ -1041,6 +1043,8 @@ void KvCache::erase(uint64_t blockId) {
   RecencyOrder::unlink(candidate.unneededNode);
   RecencyOrder::unlink(candidate.trimNode);
   forget(candidate);
+  if (disk)
+    diskBytes_ -= candidate.slot->bytes();
   index_.erase(indexed);
   blocks_.erase(blockId);
   ++generation_;
@@ -1150,12 +1154,14 @@ void KvCache::checkInvariants(const std::function<bool(uint64_t blockId)> &state
     if (!holds)
       throw std::logic_error(std::string("KV cache invariant broken: ") + what);
   };
-  uint32_t disk = 0, spilled = 0, heldCopies = 0;
+  uint32_t disk = 0, spilled = 0;
+  uint64_t diskBytes = 0, heldCopyBytes = 0;
   std::unordered_map<uint64_t, std::pair<uint32_t, uint32_t>> children;
   for (const auto &[id, entry] : blocks_) {
     check(entry.id == id, "a block's id");
     disk += entry.slot != nullptr;
-    heldCopies += entry.held && entry.slot && !entry.foreignCopy;
+    diskBytes += entry.slot ? entry.slot->bytes() : 0;
+    heldCopyBytes += entry.held && entry.slot && !entry.foreignCopy ? entry.slot->bytes() : 0;
     // Reads of spilled K/V hold a copy only while a request holds its block
     // or a transfer moves it (Cache::cutPageTable), so a copy quota gives up
     // returns its slot at once. A command's cut names blocks its lanes held,
@@ -1212,8 +1218,9 @@ void KvCache::checkInvariants(const std::function<bool(uint64_t blockId)> &state
     const uint64_t id = blockOnPage_[page];
     check(!id || (blocks_.contains(id) && blocks_.at(id).page == page), "a page names the block on it");
   }
-  check(disk == diskBlocks_ && spilled == indexBlocks_ && heldCopies == heldCopies_,
-        "the counts of copies, spilled blocks and held copies");
+  check(disk == diskBlocks_ && spilled == indexBlocks_ && diskBytes == diskBytes_ &&
+            heldCopyBytes == heldCopyBytes_,
+        "the counts of copies and spilled blocks, and what copies and held copies take of the quota");
   // In a persistent cache each block counts the states on disk at it and
   // below it.
   std::unordered_map<uint64_t, uint32_t> diskStates;

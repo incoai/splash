@@ -145,7 +145,7 @@ void testOffloadAllocationFailure(metal::MetalBackend &backend) {
   require(static_cast<bool>(storage.tryActivateLane(0, 1)), "fault source activation failed");
   storage.updateLengths(0, published(4096));
   auto source = storage.snapshot(0);
-  auto held = file->acquire();
+  auto held = file->acquire(layout.cachedBytes());
   std::vector<std::byte> bytes(layout.cachedBytes());
   struct Result {
     bool failed;

@@ -777,7 +777,7 @@ std::vector<std::vector<std::byte>> writeThreeStates(const model::SlotFile::Pers
   std::vector<std::shared_ptr<model::SlotFile::Slot>> kept;
   std::vector<std::byte> payload(kHostPageBytes, std::byte{1});
   for (uint64_t block = 1; block <= 3; ++block) {
-    kept.push_back(file.acquire());
+    kept.push_back(file.acquire(payload.size()));
     require(file.write(kept.back(), {payload}, {})->wait(), "state slot write failed");
     file.label(kept.back(), encodeLabel(StateLabel{block, 10 * block, KvCache::pageTokens, 0}));
     KvBlockLabel label{block, 0, 10 * block, 0, 0, {}};
