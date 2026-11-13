@@ -147,6 +147,13 @@ void referenceRows(const uint16_t *queries, const uint16_t *keys,
   }
 }
 
+// Where the attention leaves row `row` of a KV head's 32 reference rows, its
+// four query heads' eight proposal rows each, in its lane's rows: they are in
+// [proposal row][query head][dim] order, the output projection's input.
+constexpr uint64_t attentionOffset(uint32_t head, uint64_t row) {
+  return (row % kRows * (kKvHeads * kQueryHeadsPerKv) + head * kQueryHeadsPerKv + row / kRows) * kHeadDim;
+}
+
 void runCase(MetalBackend &backend, uint32_t lanes, DraftAttentionShape shape,
              const std::array<uint32_t, kLanes> &cacheLengths) {
   Random random(0x5eed0000ULL + cacheLengths[0]);
@@ -212,9 +219,9 @@ void runCase(MetalBackend &backend, uint32_t lanes, DraftAttentionShape shape,
   const auto *output = static_cast<const uint16_t *>(queries.contents());
   std::vector<float> reference(uint64_t{kGroupRows} * kHeadDim);
   for (uint32_t lane = 0; lane < lanes; ++lane) {
-    // Reference the first and final head, whose ring the NaN tile follows;
-    // all eight execute above.
-    for (const uint32_t head : {0U, kKvHeads - 1}) {
+    // Every head: the final one's ring is the one the NaN tile follows, and
+    // together the eight write every value of the lane's rows.
+    for (uint32_t head = 0; head < kKvHeads; ++head) {
       const uint64_t laneOffset = uint64_t{lane} * kRows * kAttention;
       const uint64_t queryOffset =
           laneOffset + uint64_t{head} * kGroupRows * kHeadDim;
@@ -232,11 +239,7 @@ void runCase(MetalBackend &backend, uint32_t lanes, DraftAttentionShape shape,
       for (uint64_t index = 0; index < reference.size(); ++index) {
         const uint64_t row = index / kHeadDim;
         const uint64_t dim = index % kHeadDim;
-        const uint64_t proposal = row % kRows;
-        const uint64_t queryHead =
-            uint64_t{head} * (kGroupRows / kRows) + row / kRows;
-        const float actual = bf16ToFloat(
-            output[laneOffset + (proposal * shape.queryHeads + queryHead) * kHeadDim + dim]);
+        const float actual = bf16ToFloat(output[laneOffset + attentionOffset(head, row) + dim]);
         const float expected = reference[index];
         if (!std::isfinite(actual) ||
             std::fabs(actual - expected) >
@@ -421,6 +424,47 @@ void surroundingPhases(MetalBackend &backend, DraftAttentionShape shape,
                             [((uint64_t{lane} * kKvHeads + h) * kHeadDim + d) * kRows + row] ==
                         packedRow[kAttention + kKvHeads * kHeadDim + h * kHeadDim + d],
                     "draft prepare value copy differs");
+      }
+    }
+
+  // The attention over those prepared rows, every lane's ring empty: it only
+  // reads the prepared keys and values, and it replaces the grouped query
+  // rows with its own rows. A ring of NaN shows that an empty ring is unread.
+  const auto snapshot = [](const MetalBuffer &buffer, uint64_t bytes) {
+    const auto *begin = static_cast<const uint16_t *>(buffer.contents());
+    return std::vector<uint16_t>(begin, begin + bytes / 2);
+  };
+  const auto preparedQueries = snapshot(queries, rows * kAttention * 2);
+  const auto preparedKeys = snapshot(queryKeys, workspace.queryKeysBytes);
+  const auto preparedValues = snapshot(queryValues, workspace.queryValuesBytes);
+  const uint64_t ringBytes = uint64_t{kKvHeads} * kWindow * kHeadDim * 2;
+  const auto ring = allocate(ringBytes);
+  auto *const empty = static_cast<uint16_t *>(ring.contents());
+  std::fill_n(empty, ringBytes / 2, uint16_t{0x7FC0});
+  std::array<MetalBuffer, kLanes> rings;
+  rings.fill(ring);
+  const std::array<uint32_t, kLanes> lengths{};
+  CommandGraph attention;
+  DraftAttention::addDecode(attention, {queries, rings, rings, queryKeys, queryValues},
+                            std::span(lengths).first(lanes), plan);
+  static_cast<void>(backend.submitCommandAsync(attention.dispatches()).wait());
+  require(preparedKeys == snapshot(queryKeys, workspace.queryKeysBytes) &&
+              preparedValues == snapshot(queryValues, workspace.queryValuesBytes),
+          "draft attention changed its prepared keys or values");
+  const auto *attended = static_cast<const uint16_t *>(queries.contents());
+  std::vector<float> reference(uint64_t{kGroupRows} * kHeadDim);
+  for (uint32_t lane = 0; lane < lanes; ++lane)
+    for (uint32_t head = 0; head < kKvHeads; ++head) {
+      const uint64_t kvHead = uint64_t{lane} * kKvHeads + head;
+      referenceRows(preparedQueries.data() + kvHead * kGroupRows * kHeadDim, empty, empty,
+                    preparedKeys.data() + kvHead * kRows * kHeadDim,
+                    preparedValues.data() + kvHead * kHeadDim * kRows, 0, reference);
+      for (uint64_t index = 0; index < reference.size(); ++index) {
+        const float actual = bf16ToFloat(attended[uint64_t{lane} * kRows * kAttention +
+                                                  attentionOffset(head, index / kHeadDim) + index % kHeadDim]);
+        require(std::isfinite(actual) &&
+                    std::fabs(actual - reference[index]) <= 0.02F + 0.02F * std::fabs(reference[index]),
+                "draft attention over the prepared rows differs from the CPU reference");
       }
     }
 }
