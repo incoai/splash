@@ -22,7 +22,7 @@ struct ExpertStoreStats final {
   uint64_t liveBytes = 0;
   uint64_t capChunks = 0;
   uint64_t chunks = 0;
-  uint64_t arenaBytes = 0; // the live chunks of every size
+  uint64_t arenaBytes = 0; // the live chunks'
   uint64_t stagingBytes = 0;
   uint64_t slots = 0;    // the live chunks'
   uint64_t experts = 0;  // every block's routed experts
@@ -35,7 +35,7 @@ struct ExpertStoreStats final {
   // a failed load.
   uint64_t releaseUnitBytes = 0;
   uint64_t growUnitBytes = 0;
-  // The bytes of every chunk above the floors, in the order
+  // The bytes of every chunk above the floor, in the order
   // releaseAboveFloor() gives them back (the first is releaseUnitBytes).
   std::vector<uint64_t> releaseUnits;
   // Per ops::MoePhase, at its value (uses[0] prefill, uses[1] decode): the

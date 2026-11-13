@@ -867,6 +867,27 @@ void testOverridesAndRefusals() {
           "floors beyond the budget were planned");
 }
 
+// A table that only streams, DeepSeek-V4.1's Engram tables, streams where its
+// share and the budget would hold it whole, through a store of all of it, and
+// otherwise through at most its share; and through a store of all of it where
+// a setting would load it. (--ple-memory off, of which the table is no part,
+// is refused before planning: RuntimeResources.)
+void testTableThatOnlyStreams() {
+  StreamedMemoryInputs inputs = k35BQ2.inputs(kM5Pro);
+  inputs.table = {.allBytes = 2 * kGiB, .minimumBytes = 16 * kMiB};
+  inputs.tableShareBytes = 4 * kGiB;
+  require(!requirePlan(inputs).tableBytes, "a table its share and the budget hold did not load whole");
+  inputs.table.streamsOnly = true;
+  require(requirePlan(inputs).tableBytes == 2 * kGiB,
+          "a table that only streams did not stream through a store of all of it where its share holds it");
+  inputs.tableShareBytes = 512 * kMiB;
+  const uint64_t automatic = requirePlan(inputs).tableBytes;
+  require(automatic >= 16 * kMiB && automatic <= 512 * kMiB, "a table that only streams took more than its share");
+  inputs.table.setting = {StreamedSetting::Mode::Size, 4 * kGiB};
+  require(requirePlan(inputs).tableBytes == 2 * kGiB,
+          "a table that only streams did not stream through a store that holds all of it");
+}
+
 // A target spills only with a spillable layout that declares its sparse
 // attention and an SSD cache that takes writes, and only where its floors
 // hold an empty Spill request; otherwise it plans as a dense target.
@@ -1216,6 +1237,7 @@ int main() {
     testDense35BContextGrowsWithTheBudget();
     testArenasFollowWhatStreams();
     testOverridesAndRefusals();
+    testTableThatOnlyStreams();
     testSpillNeedsATierAndRoom();
     testSpillHoldsTheArenasOfASpillingRuntime();
     testDiskBoundsTheSpilledContext();

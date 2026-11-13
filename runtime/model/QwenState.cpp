@@ -401,7 +401,9 @@ uint64_t QwenStateStorage::bytes(BufferCounts buffers) const noexcept {
 
 std::optional<uint32_t> QwenStateStorage::statesToActivate() const noexcept {
   const BufferCounts lacked = beyond(kLaneBuffers, idle());
-  if (lacked.rings)
+  // No cached state holds draft rings; a model without a draft has rings of
+  // no bytes, which take nothing.
+  if (lacked.rings && layout_.draft.ringBytes())
     return std::nullopt;
   // A lane takes no cell when its cells have no bytes.
   return std::max(emptyCell_ ? 0 : lacked.cells, lacked.windows);

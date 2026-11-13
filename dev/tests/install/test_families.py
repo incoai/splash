@@ -35,6 +35,13 @@ UNUSABLE = {
         "--thinking-token-budget",
         "--thinking-end-text",
     },
+    "DeepSeek-V4.1-Flash": {
+        "--language-only",
+        "--state-format",
+        "--sparse-kv-memory",
+        "--disable-ane",
+        "--max-image-pixels",
+    },
 }
 
 
@@ -48,16 +55,18 @@ class OptionReportTests(unittest.TestCase):
             {name: set(family["unusable"]) for name, family in report.items()},
             UNUSABLE,
         )
-        # Flint serves its native window alone; YaRN stretches the others'.
+        # Flint and DeepSeek-V4.1-Flash serve their native windows alone; YaRN
+        # stretches the others'.
+        windows = {
+            "Flint": (262144, 262144),
+            "DeepSeek-V4.1-Flash": (1048576, 1048576),
+        }
         self.assertEqual(
             {
                 name: (family["context_tokens"], family["max_context_tokens"])
                 for name, family in report.items()
             },
-            {
-                name: (262144, 262144 if name == "Flint" else 1010000)
-                for name in UNUSABLE
-            },
+            {name: windows.get(name, (262144, 1010000)) for name in UNUSABLE},
         )
         # --max-context takes at most the most context any family serves.
         self.assertEqual(

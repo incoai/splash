@@ -596,7 +596,9 @@ def _encode_score_prompt(app, messages, labels, admit, checkpoint, what):
     try:
         return encode_prompt(
             app.prompt_tokenizer,
-            app.chat_templates.select(None).source,
+            # A scoring prompt holds no image, so the template writes no
+            # placeholder whose marker it would get back.
+            app.request_source(app.chat_templates.select(None).source),
             messages,
             labels,
             chat_format=app.chat_format,

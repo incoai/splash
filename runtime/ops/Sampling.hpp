@@ -187,10 +187,12 @@ public:
                   SamplingBuffers buffers, uint32_t rowOffset,
                   const StopTokens &stopTokens,
                   const PenaltyTable &penalties) const;
+  // `drafted` when the verify rows follow a draft's proposals; a cycle
+  // without a draft draws every row from its distribution alone.
   void addVerify(metal::CommandGraph &graph,
                  std::span<const SamplingPolicy> policies,
                  SamplingBuffers buffers, const StopTokens &stopTokens,
-                 const PenaltyTable &penalties) const;
+                 const PenaltyTable &penalties, bool drafted = true) const;
   void addAcceptance(
       metal::CommandGraph &graph, AcceptanceBuffers buffers,
       std::span<const uint32_t> maximumRetained,

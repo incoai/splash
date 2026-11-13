@@ -42,7 +42,8 @@ inline void moe_gguf_expert_tile(device bfloat *input, device const MoeTileDescr
   const MoeTileDescriptor tile = tiles[t];
   const MoeGgufSegment s =
       moe_gguf_segment<Shared>(tile.expert, p.experts, p.input_size, p.output_size, p.routed_format, p.shared_format,
-                               slots, chunks, p.floor_slots, p.chunk_slots, Projection, sw0, sw1, smeta);
+                               p.routed_slot_bytes, slots, chunks, p.floor_slots, p.chunk_slots, Projection, sw0, sw1,
+                               smeta);
   device bfloat *x = input + ulong(t) * Rows * p.input_size;
   const ulong out = ulong(t) * Rows * p.output_size;
   const uint origin = group.x * GGUF_TILE_COLUMNS + simd_group * GGUF_STAGED_COLUMNS;

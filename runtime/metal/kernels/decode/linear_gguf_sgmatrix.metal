@@ -158,7 +158,7 @@ inline void decode(device const bfloat *table, device const float *sums, device 
                    device coherent(device) float *partials, device atomic_uint *counters,
                    device const bfloat *aux, const GgufDecodeParams p, uint2 tg, uint tid, uint sg,
                    uint lane, threadgroup const bfloat2 *lut, threadgroup Coef<F> *coefs,
-                   threadgroup uint *arrival) {
+                   threadgroup uint *arrival, float swiglu_limit = 0.0f) {
   typedef Shape<F> S;
   typedef Coef<F> C;
   constexpr uint FG = 4 / S::CG;  // fragments per chain
@@ -320,7 +320,7 @@ inline void decode(device const bfloat *table, device const float *sums, device 
 #pragma unroll
       for (uint i = 0; i < 2; ++i) {
         const ulong at = ulong(r * 8 + fn + i) * p.out_stride + column;
-        out[at] = gguf_epilogue<Ep, Out>(acc[r][nf][i], aux, at);
+        out[at] = gguf_epilogue<Ep, Out>(acc[r][nf][i], aux, at, swiglu_limit);
       }
     }
 }

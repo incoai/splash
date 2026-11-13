@@ -68,12 +68,20 @@ private:
   uint64_t actualAllocatedBytes_ = 0;
 };
 
+// The drafts a model decodes with: DFlash2 drafts, and DeepSeek-V4.1-Flash's
+// own block drafter DSpark (model/DSpark.hpp).
+enum class DraftKind : uint8_t { DFlash2, DSpark };
+
 // The dimensions of a DFlash2 draft, as its checkpoint's config.json gives
 // them (ModelDescriptor.mm readDraftLayout): every draft's attention widths
 // and selector are those the kernels are built for; its layers, intermediate
 // size, rotary base and the target layers it reads are its own, and its
-// hidden size and vocabulary its target's.
+// hidden size and vocabulary its target's. A DSpark's (dsparkDraftLayout)
+// states what the runtime sizes it by alone: its layers, the target's widths
+// and vocabulary, its latent as its one KV head, the target layers it reads,
+// its rotary base and its block; its DFlash2 sizes are zero.
 struct DFlashDraftLayout final {
+  DraftKind kind = DraftKind::DFlash2;
   uint32_t layers = 0;
   uint32_t hiddenSize = 0;
   uint32_t vocabularySize = 0;
@@ -89,7 +97,21 @@ struct DFlashDraftLayout final {
   // first targetLayerCount of targetLayers, targetHiddenSize() values a row.
   std::array<uint32_t, ExecutionLimits::maximumDraftTargetLayers> targetLayers{};
   uint32_t targetLayerCount = 0;
+  // A DSpark's block: its anchor's row and the noise rows after it, a
+  // proposal each.
+  uint32_t blockSize = 0;
 
+  // Whether the model has a draft. One installed without (--draft-model none)
+  // has no layers and every size zero, and decodes one token a cycle.
+  [[nodiscard]] constexpr bool present() const noexcept { return layers != 0; }
+  [[nodiscard]] constexpr bool dflash() const noexcept { return present() && kind == DraftKind::DFlash2; }
+  [[nodiscard]] constexpr bool dspark() const noexcept { return present() && kind == DraftKind::DSpark; }
+  // The most rows a decode cycle retains of each lane: its anchor's and each
+  // proposal's (a DSpark's block's), the anchor's alone without a draft.
+  [[nodiscard]] constexpr uint32_t retainedRows() const noexcept {
+    if (!present()) return 1;
+    return dspark() ? blockSize + 1 : ExecutionLimits::targetVerifyRows;
+  }
   [[nodiscard]] constexpr DraftStateLayout stateLayout() const noexcept {
     return {layers, kvHeads, attentionHeadDimension, hiddenSize};
   }

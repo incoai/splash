@@ -3,6 +3,7 @@
 #include "metal/abi/ExecutionGeometry.h"
 #include "metal/abi/Gguf.h"
 #include "metal/abi/MoE.h"
+#include "metal/abi/QuantFormat.h"
 #include "ops/BufferExtent.hpp"
 
 #include <algorithm>
@@ -132,6 +133,7 @@ void addExperts(metal::CommandGraph &graph, const MoeScratch &scratch, const Blo
   const metal::IndirectGrid gateUpGrid{scratch.tileCount, gateUpOffset};
   const metal::IndirectGrid downGrid{scratch.tileCount, downOffset};
   const uint32_t floorSlots = weights.chunks.floorSlots(), chunkSlots = weights.chunks.chunkSlots();
+  const uint32_t slotBytes = weights.chunks.slotBytes();
   const uint32_t hidden = shape.hiddenSize;
   const uint32_t intermediate = shape.expertIntermediateSize;
   const BlockExpertProjection &gate = weights.gate, &up = weights.up, &down = weights.down;
@@ -143,7 +145,8 @@ void addExperts(metal::CommandGraph &graph, const MoeScratch &scratch, const Blo
              up.shared.plane0, up.shared.plane1Slot(), up.shared.meta,
              scratch.expertIntermediate, slots},
             MoeGgufGateUpParams{hidden, intermediate, shape.experts, gate.routed.formatId, gate.shared.formatId,
-                                up.routed.formatId, up.shared.formatId, floorSlots, chunkSlots, range},
+                                up.routed.formatId, up.shared.formatId, floorSlots, chunkSlots, range,
+                                shape.swigluLimit, slotBytes},
             {group.gate_up_columns, tiles, 1}, gateUpGrid, {GGUF_STAGED_THREADS, 1, 1});
   graph.specialize(passFormats<4>({gate.routed.formatId, gate.shared.formatId, up.routed.formatId, up.shared.formatId}));
   graph.addresses(weights.chunks.planes());
@@ -152,7 +155,7 @@ void addExperts(metal::CommandGraph &graph, const MoeScratch &scratch, const Blo
             {scratch.expertIntermediate, scratch.tileDescriptors, scratch.tileCount, down.shared.plane0,
              down.shared.plane1Slot(), down.shared.meta, scratch.expertOutput, slots},
             MoeGgufExpertParams{intermediate, hidden, shape.experts, down.routed.formatId, down.shared.formatId,
-                                floorSlots, chunkSlots, range},
+                                floorSlots, chunkSlots, range, 0.0f, slotBytes},
             {group.down_columns, tiles, 1}, downGrid, {GGUF_STAGED_THREADS, 1, 1});
   graph.specialize(passFormats<2>({down.routed.formatId, down.shared.formatId}));
   graph.addresses(weights.chunks.planes());
@@ -197,7 +200,8 @@ void addStepRouting(metal::CommandGraph &graph, const MoeBuffers &buffers, const
   for (const MoeScratchField &field : kMoeScratchFields)
     requireBytes(scratch.*field.buffer, required.*field.bytes, field.name);
   MoE::addRoutes(graph, buffers.input, weights.router, weights.sharedScalarGate, scratch.groupedInput,
-                 scratch.selectedExperts, scratch.routingWeights, rows, shape, plan.configuration().ggufRouterTile);
+                 scratch.selectedExperts, scratch.routingWeights, rows, shape, plan.configuration().ggufRouterTile,
+                 weights.selectionBias);
   // The expert passes launch the live tiles alone, on grids the grouping
   // writes with the tile count: a one-lane 35B decode step fills a median of
   // 30 of the 65 tiles it could, and the idle ones' threadgroups, returning at
@@ -278,7 +282,7 @@ void MoE::addRouted(metal::CommandGraph &graph, const MoeBuffers &buffers,
 void MoE::addRoutes(metal::CommandGraph &graph, const metal::MetalBuffer &input, const QuantizedSegment &router,
                     const QuantizedSegment &sharedScalarGate, const metal::MetalBuffer &scores,
                     const metal::MetalBuffer &selected, const metal::MetalBuffer &routingWeights, uint32_t rows,
-                    MoeShape shape, FloatTile routerTile) {
+                    MoeShape shape, FloatTile routerTile, const metal::MetalBuffer &selectionBias) {
   // The router's fp32 scores, in the format its checkpoint holds it
   // (BlockMoeWeights), in rows of routerWidth() expert slots, as the select
   // kernel of that width reads, which weights gated shared slices by the
@@ -287,17 +291,25 @@ void MoE::addRoutes(metal::CommandGraph &graph, const metal::MetalBuffer &input,
   addGgufFloat(graph, input, router, scores, rows, width, 0, FloatOutput::Float32, routerTile);
   std::vector<metal::MetalBuffer> bindings{scores};
   if (shape.sharedGate) bindings.insert(bindings.end(), {input, sharedScalarGate.plane0});
+  if (shape.router == MoeRouter::SqrtSoftplusNormalized) {
+    requireBytes(selectionBias, uint64_t{shape.experts} * sizeof(float), "MoE selection bias");
+    bindings.push_back(selectionBias);
+  }
   bindings.insert(bindings.end(), {selected, routingWeights});
   graph.add(routingKernel("moe_route_select_f32", shape, &CompiledMoeRouting::selectSuffix), std::move(bindings),
-            MoeRouteParams{rows, shape.hiddenSize, shape.experts, shape.expertsPerToken}, {rows, 1, 1},
-            {width, 1, 1});
+            MoeRouteParams{rows, shape.hiddenSize, shape.experts, shape.expertsPerToken, shape.routeScale},
+            {rows, 1, 1}, {width, 1, 1});
 }
 
 uint32_t MoE::expertLoadGroups(const MoeExpertLoadParams &params) noexcept {
   uint64_t groups = 0;
-  for (const MoeExpertLoadProjection &projection : params.projections)
-    groups = std::max(groups, (uint64_t{projection.rows} * (projection.columns / 32) + MOE_EXPERT_LOAD_THREADS - 1) /
-                                  MOE_EXPERT_LOAD_THREADS);
+  // A thread a row and native block (moe_expert_load), the rows in whole
+  // tiles.
+  for (const MoeExpertLoadProjection &projection : params.projections) {
+    const uint64_t units = projection.columns / 32 / kQuantFormats[projection.format].meta_groups;
+    const uint64_t rows = (uint64_t{projection.rows} + QUANT_TILE_ROWS - 1) / QUANT_TILE_ROWS * QUANT_TILE_ROWS;
+    groups = std::max(groups, (rows * units + MOE_EXPERT_LOAD_THREADS - 1) / MOE_EXPERT_LOAD_THREADS);
+  }
   return static_cast<uint32_t>(groups);
 }
 
@@ -316,7 +328,7 @@ void MoE::addExpertLoad(metal::CommandGraph &graph, const metal::MetalBuffer &st
 
 ExpertChunks ExpertChunks::of(std::vector<metal::MetalBuffer> planes, uint32_t floorSlots, uint32_t chunkSlots,
                               uint32_t slots, const QuantizedSegment &gate, const QuantizedSegment &up,
-                              const QuantizedSegment &down) {
+                              const QuantizedSegment &down, uint32_t slotBytes) {
   if (planes.empty() || planes.size() % MOE_EXPERT_CHUNK_ADDRESSES ||
       planes.size() > uint64_t{MOE_EXPERT_CHUNK_ADDRESSES} * MOE_EXPERT_MAX_CHUNKS)
     throw std::invalid_argument("MoE expert chunks take 1 to " + std::to_string(MOE_EXPERT_MAX_CHUNKS) + " chunks of " +
@@ -342,14 +354,27 @@ ExpertChunks ExpertChunks::of(std::vector<metal::MetalBuffer> planes, uint32_t f
     const QuantFormat &format = routed->format();
     const uint32_t rows = routed->outputSize / slots;
     const uint32_t groups = routed->inputSize / 32, units = groups / format.meta_groups;
-    for (uint64_t chunk = 0; chunk < count; ++chunk) {
-      const uint32_t chunkHeld = held(chunk);
-      for (const auto &[plane, blocks, unitBytes, what] :
-           {std::tuple{0u, groups, format.plane0_bytes, "plane0"},
-            std::tuple{1u, groups, format.plane1_bytes, "plane1"}, std::tuple{2u, units, format.meta_bytes, "meta"}}) {
+    for (const auto &[plane, blocks, unitBytes, what] :
+         {std::tuple{0u, groups, format.plane0_bytes, "plane0"}, std::tuple{1u, groups, format.plane1_bytes, "plane1"},
+          std::tuple{2u, units, format.meta_bytes, "meta"}}) {
+      // A plane's bytes of a segment of `segmentRows` rows.
+      const auto bytesOf = [&](uint64_t segmentRows) {
+        return segmentRows && unitBytes
+                   ? (quant_tile_index(static_cast<uint32_t>(segmentRows - 1), blocks - 1, blocks) + 1) * unitBytes
+                   : 0;
+      };
+      // Of an expert, which a slot of slotBytes holds with its other planes.
+      const uint64_t expert = bytesOf(rows);
+      if (slotBytes && expert > slotBytes)
+        throw std::invalid_argument(std::string("MoE expert ") + name + " " + what + " takes " +
+                                    std::to_string(expert) + " bytes, more than a slot's " +
+                                    std::to_string(slotBytes));
+      for (uint64_t chunk = 0; chunk < count; ++chunk) {
+        const uint32_t chunkHeld = held(chunk);
         const metal::MetalBuffer &view = planes[chunk * MOE_EXPERT_CHUNK_ADDRESSES + z * 3 + plane];
-        const uint64_t bytes =
-            chunkHeld && unitBytes ? (quant_tile_index(chunkHeld * rows - 1, blocks - 1, blocks) + 1) * unitBytes : 0;
+        const uint64_t bytes = !chunkHeld   ? 0
+                               : slotBytes ? uint64_t{chunkHeld - 1} * slotBytes + expert
+                                           : bytesOf(uint64_t{chunkHeld} * rows);
         if (!view || view.sizeBytes() < bytes)
           throw std::invalid_argument(std::string("MoE expert ") + name + " chunk " + std::to_string(chunk) + " " +
                                       what + (view.sizeBytes() < bytes ? " buffer holds " +
@@ -369,6 +394,7 @@ ExpertChunks ExpertChunks::of(std::vector<metal::MetalBuffer> planes, uint32_t f
   chunks.floorSlots_ = floorSlots;
   chunks.chunkSlots_ = chunkSlots;
   chunks.slots_ = slots;
+  chunks.slotBytes_ = slotBytes;
   chunks.routed_ = {routedOf(gate), routedOf(up), routedOf(down)};
   return chunks;
 }

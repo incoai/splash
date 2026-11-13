@@ -57,12 +57,13 @@ std::optional<Part> resolve(const StreamedPart &part, std::string_view option, s
   const uint64_t bytes = part.setting.bytes;
   switch (part.setting.mode) {
   case StreamedSetting::Mode::Auto:
-    if (part.minimumBytes < part.allBytes) return Part{part.minimumBytes, part.allBytes, true, false};
+    if (part.minimumBytes < part.allBytes || part.streamsOnly)
+      return Part{part.minimumBytes, part.allBytes, true, part.streamsOnly};
     [[fallthrough]];
   case StreamedSetting::Mode::Off:
     return Part{part.allBytes, part.allBytes, false, false};
   case StreamedSetting::Mode::Size:
-    if (bytes >= part.allBytes) return Part{part.allBytes, part.allBytes, false, false};
+    if (bytes >= part.allBytes) return Part{part.allBytes, part.allBytes, false, part.streamsOnly};
     if (bytes < part.minimumBytes) {
       error = std::string(option) + " of " + std::to_string(bytes / kMiB) + " MiB is less than its smallest store, " +
               std::to_string((part.minimumBytes + kMiB - 1) / kMiB) + " MiB";
@@ -294,7 +295,7 @@ StreamedMemoryResult planParts(const StreamedMemoryInputs &in, const Part &exper
   if (table.automatic) {
     const uint64_t take =
         table.charged + static_cast<uint64_t>(std::clamp<int64_t>(rest - allowance(expertsStream), 0, tableShare));
-    plan.tableBytes = take < table.all ? take : 0;
+    plan.tableBytes = take < table.all || table.streams ? take : 0;
   }
   // The second buffer of staged history the readers' memory does not hold
   // (above), where what the stores and the KV allowance leave holds it.

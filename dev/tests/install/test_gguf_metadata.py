@@ -1,4 +1,5 @@
 import contextlib
+import dataclasses
 import io
 import shutil
 import struct
@@ -31,7 +32,7 @@ from dev.tests.installer_fixtures import (
     write_gguf,
     write_target,
 )
-from install import assembly, gguf, hub, models, upstream
+from install import assembly, families, gguf, hub, models, upstream
 
 GGUF_REPO = "unsloth/Qwen3.6-35B-A3B-GGUF"
 
@@ -595,6 +596,20 @@ class GgufMetadataTests(unittest.TestCase):
             models.read_json(chosen.link / "draft" / "config.json"),
             family_config(FLASH_NEXT, "draft/config.json"),
         )
+
+    def test_a_family_without_a_released_draft_installs_without_one(self):
+        repo = "someone/Flash-Next-GGUF"
+        fake = self.flash_next_repository(repo)
+        unreleased = dataclasses.replace(FLASH_NEXT, draft_repo=None)
+        chosen = selection(self.root, repo + ":Q2_0")
+        with mock.patch.object(families, "FAMILIES", (unreleased,)):
+            self.prepare(chosen)
+        self.assertIn(f"{repo}/model-Q2_0.gguf", fake.downloads)
+        record = assembly.verify(chosen.link, full=True)
+        self.assertEqual(
+            record["sources"]["draft"], {"repo": models.NO_DRAFT, "revision": None}
+        )
+        self.assertFalse((chosen.link / "draft").exists())
 
     def test_a_gguf_splash_cannot_serve_is_refused_before_its_projector(self):
         # Another architecture, with a projector Splash would not take either.

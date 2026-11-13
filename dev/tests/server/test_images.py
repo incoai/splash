@@ -352,6 +352,7 @@ class ImageRequestTest(HarnessTestCase):
         from server.latency import LatencyMetrics
 
         app.latencies = LatencyMetrics()
+        app.chat_format = QWEN
         app.backend = SimpleNamespace(
             runtime=SimpleNamespace(capabilities=engine_ready(1024))
         )

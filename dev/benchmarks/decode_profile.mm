@@ -108,7 +108,8 @@ std::vector<uint32_t> pageRange(uint32_t first, uint32_t count) {
 // repeats one sentence, "Write a detailed, multi-paragraph essay about the
 // history of the Roman Empire. ", until the prompt reaches the requested
 // length, and the answer follows an empty think block. Its tokens are the
-// target's tokenizer's: the Qwen families' (one tokenizer) or Flint's.
+// target's tokenizer's: the Qwen families' (one tokenizer), Flint's or
+// DeepSeek-V4.1's.
 struct ChatTokens final {
   std::vector<uint32_t> userHeader;
   std::vector<uint32_t> sentence;
@@ -126,10 +127,17 @@ const ChatTokens kFlintChat{
     .sentence = {7421, 260, 7426, 11, 4519, 12, 41088, 6369, 762, 269, 3476, 297, 269, 10831, 18381, 13, 220},
     // <|assistant|><think></think>
     .assistantHeader = {150004, 150006, 150007}};
+const ChatTokens kDeepSeekChat{
+    // <｜begin▁of▁sentence｜><｜User｜>
+    .userHeader = {0, 128803},
+    .sentence = {21750, 260, 10659, 14, 5665, 44972, 12427, 15795, 943, 270, 3980, 294, 270, 9675, 19738, 16, 223},
+    // <｜Assistant｜></think>
+    .assistantHeader = {128804, 128822}};
 
 std::vector<uint32_t> chatPrompt(const model::ModelDescriptor &descriptor, uint32_t tokens) {
-  const ChatTokens &chat =
-      std::holds_alternative<model::FlintLayout>(descriptor.target) ? kFlintChat : kQwenChat;
+  const ChatTokens &chat = std::holds_alternative<model::FlintLayout>(descriptor.target)        ? kFlintChat
+                           : std::holds_alternative<model::DeepSeek41Layout>(descriptor.target) ? kDeepSeekChat
+                                                                                                : kQwenChat;
   if (tokens < chat.userHeader.size() + chat.assistantHeader.size() + 1)
     throw std::invalid_argument("prompt is too short for a chat request");
   std::vector<uint32_t> prompt = chat.userHeader;

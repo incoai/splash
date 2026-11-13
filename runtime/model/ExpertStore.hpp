@@ -6,28 +6,30 @@
 // routed expert's slot in a table (ops::BlockMoeWeights), so resident and
 // streamed experts run the same kernels.
 //
-// Experts of one size (the formats and shapes of their gate, up and down
-// projections) share its slots, which chunks hold, each a buffer of its own
-// (ops::ExpertChunks, model/ExpertChunkLayout.hpp): the floor chunk holds the
-// size's floor (ExpertStoreOptions::floorBytes, or the floor share of its
-// slots, ExpertStoreOptions::floorShare), and elastic chunks of about 1 GiB
-// each the rest, up to the cap (ExpertStoreOptions::memoryBytes), which start
-// released: the store starts at its floor. While memory is short the store
-// gives its last live elastic chunk back (releaseAboveFloor), its experts
-// moved to free slots below it and the coldest evicted to make room, and
-// once memory is ample takes it back with its slots free (growTowardCap):
-// the live chunks are always the first ones, which the kernels' address
-// tables name alone. The kernels reach the chunks through their GPU
-// addresses, which the backend writes per dispatch and declares resident
-// once per encoder (metal::AddressTable); each chunk an encoder makes
-// resident costs GPU time, so they are few. A size of several blocks
-// streams: its slots are recycled across its blocks by adaptive replacement
-// (SlotRecycler), which keeps the experts decode steps route again and
-// again, and recycles a long prefill chunk's loads first. A size of one
-// block (a layer whose experts take formats no other layer's do, as a
-// dynamic quantization leaves some) holds every one of its experts, in its
-// floor chunk alone: they are read when the store is built or restored, and
-// nothing loads them again.
+// Every block's experts share the slots of one size, the widest expert's: a
+// slot holds every plane of an expert's gate, up and down projections,
+// whatever formats its layer takes (a dynamic quantization mixes them by
+// layer), and the kernels read a slot's expert at its place in its chunk
+// times that size (ops::ExpertChunks::slotBytes). The slots lie in chunks,
+// each a buffer of its own (ops::ExpertChunks, model/ExpertChunkLayout.hpp):
+// the floor chunk holds the floor (ExpertStoreOptions::floorBytes, or the
+// floor share of its slots, ExpertStoreOptions::floorShare), and elastic
+// chunks of about 1 GiB each the rest, up to the cap
+// (ExpertStoreOptions::memoryBytes), which start released: the store starts
+// at its floor. While memory is short the store gives its last live elastic
+// chunk back (releaseAboveFloor), the experts it holds moved to free slots
+// below it and the coldest evicted to make room, and once memory is ample
+// takes it back with its slots free (growTowardCap): the live chunks are
+// always the first ones, which the kernels' address tables name alone. The
+// kernels reach the chunks through their GPU addresses, which the backend
+// writes per dispatch and declares resident once per encoder
+// (metal::AddressTable); each chunk an encoder makes resident costs GPU time,
+// so they are few. A store of several blocks streams: its slots are recycled
+// across its blocks by adaptive replacement (SlotRecycler), which keeps the
+// experts decode steps route again and again, and recycles a long prefill
+// chunk's loads first. A store of one block (a target of one MoE layer) holds
+// every one of its experts, in its floor chunk alone: they are read when the
+// store is built or restored, and nothing loads them again.
 //
 // A streamed block's load runs after its steps' grouping (ops::
 // MoeExpertStream), in rounds: each a host step of the command, which claims
@@ -62,8 +64,8 @@
 // idle (model::WeightMemory): released, every slot is free. A restore takes
 // the floor chunks and the staging back in one part, as memory the next
 // request needs; the elastic chunks stay released for growTowardCap() to take
-// back as memory allows. It reads the experts of the sizes of one block
-// again, and the loads after it every expert they route.
+// back as memory allows. It reads the experts of a store of one block again,
+// and the loads after it every expert they route.
 //
 // Reads run on the engine's SSD readers (model::SsdReaders), which try a
 // failed read once more. A load checks its sources unchanged after it read
@@ -123,29 +125,28 @@ struct StreamedBlocks final {
 struct ExpertStoreOptions final {
   // Every byte the store allocates at its cap: its staging and tables
   // (ExpertStore::fixedBytes), and in the rest the chunks' slots, which hold
-  // at least a block's experts of each size and all of a size of one block.
+  // at least a block's experts, and all of them in a store of one block.
   uint64_t memoryBytes = 0;
   // The floor in the same bytes, what the store keeps however short memory
   // is, from minimumBytes to memoryBytes (all of it for --expert-memory
-  // SIZE, which sets both): each streamed
-  // size's floor is the share of its slots those bytes hold, as memoryBytes'
-  // slots are. Zero for floorShare of each streamed size's slots
-  // (streamedExpertChunkLayout).
+  // SIZE, which sets both): a streamed store's floor is the share of its
+  // slots those bytes hold, as memoryBytes' slots are. Zero for floorShare of
+  // its slots (streamedExpertChunkLayout).
   uint64_t floorBytes = 0;
-  // The share of each streamed size's slots its floor holds where floorBytes
-  // is zero, which the model's plan sets.
+  // The share of a streamed store's slots its floor holds where floorBytes is
+  // zero, which the model's plan sets.
   double floorShare = kExpertFloorShare;
   // The readers its reads run on: the engine's one pool, which the other
   // streamed weights and KV reads share.
   std::shared_ptr<SsdReaders> readers;
   // The most bytes one chunk takes, the floor chunk too: the device's
-  // largest buffer (maxBufferLength) when zero or more. A streamed size whose
-  // slots it holds only in more than MOE_EXPERT_MAX_CHUNKS chunks, and a
-  // size of one block whose experts it does not hold, are refused
+  // largest buffer (maxBufferLength) when zero or more. A streamed store
+  // whose slots it holds only in more than MOE_EXPERT_MAX_CHUNKS chunks, and a
+  // store of one block whose experts it does not hold, are refused
   // (streamedExpertChunkLayout, wholeExpertChunkLayout).
   uint64_t bufferBytes = 0;
-  // About the most bytes a streamed size's elastic chunk takes, unless the
-  // size needs larger ones to fit the expert kernels' table
+  // About the most bytes an elastic chunk of a streamed store takes, unless
+  // its slots need larger ones to fit the expert kernels' table
   // (streamedExpertChunkLayout).
   uint64_t elasticChunkBytes = kExpertElasticChunkBytes;
 };
@@ -153,26 +154,27 @@ struct ExpertStoreOptions final {
 class ExpertStore final : public ops::MoeExpertStream, public WeightMemory {
 public:
   // Allocates the chunks, the staging and the slot tables, and reads the
-  // experts of the sizes of one block. Throws std::invalid_argument when a
-  // block's experts differ from `shape`, when options.memoryBytes, less
-  // the staging and tables (fixedBytes), holds fewer slots than a block's
-  // experts of each streamed size and every expert of a size of one block,
-  // when a streamed size's slots would take more than MOE_EXPERT_MAX_CHUNKS
-  // chunks of the largest buffer (options.bufferBytes or the device's
-  // maxBufferLength), when a size of one block's experts take more than it,
-  // or when options.floorBytes is neither zero nor from the smallest store
-  // (minimumBytes) to options.memoryBytes. The store starts at its floor:
-  // growTowardCap takes the elastic chunks.
+  // experts of a store of one block. Throws std::invalid_argument when a
+  // block's experts differ from `shape`, when options.memoryBytes, less the
+  // staging and tables (fixedBytes), holds fewer slots than a block's experts
+  // in slots of the widest expert's size, when a streamed store's slots would
+  // take more than MOE_EXPERT_MAX_CHUNKS chunks of the largest buffer
+  // (options.bufferBytes or the device's maxBufferLength), when a store of
+  // one block's experts take more than it, or when options.floorBytes is
+  // neither zero nor from the smallest store (minimumBytes) to
+  // options.memoryBytes. The store starts at its floor: growTowardCap takes
+  // the elastic chunks.
   ExpertStore(metal::MetalBackend &backend, StreamedBlocks blocks, ops::MoeShape shape, ExpertStoreOptions options);
   ~ExpertStore() override;
   ExpertStore(const ExpertStore &) = delete;
   ExpertStore &operator=(const ExpertStore &) = delete;
 
-  // Block `block`'s routed segments (the format and size of its size's
-  // slots), chunks and slot table, which `weights` reads them through, and,
-  // when its experts stream, the store, which loads them; the store keeps the
-  // block's router and shared-expert gate, set before, which predict its
-  // routes.
+  // Block `block`'s routed segments (the format and size of its slots in its
+  // layer's formats), chunks (views of them from each of its planes' places
+  // in a slot on, slotBytes apart) and slot table, which `weights` reads them
+  // through, and, when its experts stream, the store, which loads them; the
+  // store keeps the block's router, shared-expert gate and selection bias,
+  // set before, which predict its routes.
   void bind(uint32_t block, ops::BlockMoeWeights &weights);
   void addLoad(metal::CommandGraph &graph, std::span<const ops::MoeLoadPart> parts, uint32_t block,
                const std::function<void()> &beside = {}) const override;
@@ -185,42 +187,38 @@ public:
   // The live chunks and the staging, while no command is in flight;
   // restore() takes the floor chunks and the staging back in one part under
   // `admit`, leaves the elastic chunks to growTowardCap(), and reads the
-  // experts of the sizes of one block again.
+  // experts of a store of one block again.
   [[nodiscard]] bool released() const noexcept override;
   void release() override;
   [[nodiscard]] bool restore(const metal::AllocationAdmission &admit) override;
-  // While memory is short: gives back the last live elastic chunk of the
-  // streamed size with the largest share of its slots above its floor. The
-  // experts it holds move to free slots below it, after as many of the
-  // size's experts as they outnumber those slots are evicted, those its
-  // recycling would recycle first; then no slot table names it, and no
+  // While memory is short: gives back the last live elastic chunk above the
+  // floor. The experts it holds move to free slots below it, after as many
+  // of the store's experts as they outnumber those slots are evicted, those
+  // its recycling would recycle first; then no slot table names it, and no
   // address table from the next command on. Returns the chunk's bytes; zero
-  // when every size is at its floor, while released, while a command is in
-  // flight, and where the store knows a load is unfinished (above). A
-  // reclaim that needs more calls it again. Each chunk it gives back logs a
-  // line: how long it took, the experts moved and evicted, and what the
-  // store holds after.
+  // at the floor, while released, while a command is in flight, and where
+  // the store knows a load is unfinished (above). A reclaim that needs more
+  // calls it again. Each chunk it gives back logs a line: how long it took,
+  // the experts moved and evicted, and what the store holds after.
   [[nodiscard]] uint64_t releaseAboveFloor();
   // While memory is critically short: gives back every elastic chunk above
-  // each size's floor, as releaseAboveFloor() would one at a time, but in
-  // one compaction per size, which moves each expert that stays once rather
-  // than again with each chunk. Returns their bytes, zero where
-  // releaseAboveFloor() gives none; logs a line per size that shrank.
+  // the floor, as releaseAboveFloor() would one at a time, but in one
+  // compaction, which moves each expert that stays once rather than again
+  // with each chunk. Returns their bytes, zero where releaseAboveFloor()
+  // gives none; logs a line when it shrank.
   [[nodiscard]] uint64_t releaseToFloor();
-  // While memory is ample: takes back the next elastic chunk of the streamed
-  // size with the smallest share of its slots above its floor, under
-  // `admit`, its slots free (nothing is read). Its refusal leaves the chunk
-  // released and is returned; at the cap, while released, while a command is
-  // in flight and after a failed load the store stays as it is. Each chunk
-  // it takes back logs a line.
+  // While memory is ample: takes back the next elastic chunk under `admit`,
+  // its slots free (nothing is read). Its refusal leaves the chunk released
+  // and is returned; at the cap, while released, while a command is in flight
+  // and after a failed load the store stays as it is. Each chunk it takes
+  // back logs a line.
   [[nodiscard]] metal::AllocationResult growTowardCap(const metal::AllocationAdmission &admit);
   // The bytes a store of these blocks allocates besides its chunks: its
   // staging, slot tables, jobs and the decode prediction's buffers.
   [[nodiscard]] static uint64_t fixedBytes(const StreamedBlocks &blocks, ops::MoeShape shape);
   // The smallest store of these blocks (ExpertStoreOptions::memoryBytes and
   // floorBytes), which the constructor refuses a byte less than: its fixed
-  // bytes, a block's experts of each streamed size and every expert of a
-  // size of one block.
+  // bytes and a block's experts in slots of the widest expert's size.
   [[nodiscard]] static uint64_t minimumBytes(const StreamedBlocks &blocks, ops::MoeShape shape);
 
 private:

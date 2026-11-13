@@ -56,14 +56,16 @@ template [[host_name("moe_expert_gguf_m32_down_s2")]] kernel MoeExpertGgufKernel
 // and up in different formats) each its own, a kilobyte more threadgroup memory that costs up to 5%. Every thread fills
 // the tables before one barrier (none without a table), so the simdgroups' walks, of different formats, meet no barrier
 // but their own. Each simdgroup parks bf16 of its sums in its stage, which its loop no longer reads, and the up
-// simdgroup writes bf16(up) * silu(gate) as gguf_epilogue<EpUpWithGate> does, so the intermediate is bitwise that of
-// the gate and up passes apart (moe_gguf_expert_tile of projections 0 and 1), which gguf-moe's reference runs.
+// simdgroup writes bf16(up) * silu(gate), both clamped by a SwiGLU limit (splash_swiglu), as
+// gguf_epilogue<EpUpWithGate> does, so the intermediate is bitwise that of the gate and up passes apart
+// (moe_gguf_expert_tile of projections 0 and 1), which gguf-moe's reference runs.
 // The gate/up pass's column tile (moe_column_tile), out of line: inlined in every format, it grew the 32-row kernel
 // until a 10-core M4 (Apple9) under shader validation summed one element of the staged accumulator wrongly, the same
 // kernel right without validation.
 __attribute__((noinline)) void moe_gate_up_column(device bfloat *x, uint rows, uint K, uint N, MoeGgufSegment s,
                                                   uint origin, uint simd_lane, threadgroup half2 *table, bool up,
-                                                  threadgroup bfloat *gate, device bfloat *output, ulong out) {
+                                                  threadgroup bfloat *gate, device bfloat *output, ulong out,
+                                                  float swiglu_limit) {
   float sums[MOE_GGUF_COLUMN_ROWS];
   moe_formats<4>()(s.format, [&](auto f) {
     column_dot<decltype(f), MOE_GGUF_COLUMN_ROWS>(x, rows, K, s.w0, s.w1, s.meta, origin + simd_lane, 0, K / 32, table,
@@ -75,7 +77,8 @@ __attribute__((noinline)) void moe_gate_up_column(device bfloat *x, uint rows, u
   if (up)
     for (uint row = 0; row < rows; ++row)
       output[out + ulong(row) * N + origin + simd_lane] =
-          bfloat(float(bfloat(sums[row])) * splash_silu(float(gate[row * GGUF_STAGED_COLUMNS + simd_lane])));
+          bfloat(splash_swiglu(float(bfloat(sums[row])), float(gate[row * GGUF_STAGED_COLUMNS + simd_lane]),
+                               swiglu_limit));
 }
 // A gate/up simdgroup's staged tile of R rows in format F (moe_expert_gguf_gate_up), out of line as the column tile
 // is: its sums parked as bf16 in `park`, its stage, which its loop no longer reads. Inlined in the pass, a 10-core M4
@@ -110,11 +113,13 @@ kernel void moe_expert_gguf_gate_up(device bfloat *input [[buffer(0)]],
   const MoeTileDescriptor tile = tiles[t];
   const bool up = simd_group == 1;
   const MoeGgufSegment gs = moe_gguf_segment<Shared>(tile.expert, p.experts, p.input_size, p.output_size,
-                                                     p.gate_routed_format, p.gate_shared_format, slots, chunks,
-                                                     p.floor_slots, p.chunk_slots, 0, gsw0, gsw1, gsmeta);
+                                                     p.gate_routed_format, p.gate_shared_format, p.routed_slot_bytes,
+                                                     slots, chunks, p.floor_slots, p.chunk_slots, 0, gsw0, gsw1,
+                                                     gsmeta);
   const MoeGgufSegment us = moe_gguf_segment<Shared>(tile.expert, p.experts, p.input_size, p.output_size,
-                                                     p.up_routed_format, p.up_shared_format, slots, chunks,
-                                                     p.floor_slots, p.chunk_slots, 1, usw0, usw1, usmeta);
+                                                     p.up_routed_format, p.up_shared_format, p.routed_slot_bytes,
+                                                     slots, chunks, p.floor_slots, p.chunk_slots, 1, usw0, usw1,
+                                                     usmeta);
   const uint thread_index = simd_group * 32 + simd_lane;
   bool tables = false;
   moe_formats<4>()(gs.format, [&](auto f) {
@@ -134,7 +139,7 @@ kernel void moe_expert_gguf_gate_up(device bfloat *input [[buffer(0)]],
   threadgroup half *my = stage + simd_group * kStagedSimdgroupStage;
   threadgroup bfloat *gate = reinterpret_cast<threadgroup bfloat *>(stage);
   if (moe_column_tile(tiles, t)) {
-    moe_gate_up_column(x, tile.rows, K, N, s, origin, simd_lane, table, up, gate, output, out);
+    moe_gate_up_column(x, tile.rows, K, N, s, origin, simd_lane, table, up, gate, output, out, p.swiglu_limit);
     return;
   }
   const auto run = [&](auto rows) {
@@ -150,8 +155,8 @@ kernel void moe_expert_gguf_gate_up(device bfloat *input [[buffer(0)]],
     if (up)
       for (uint row = 0; row < R; ++row)
         output[out + ulong(row) * N + origin + simd_lane] =
-            bfloat(float(park[row * GGUF_STAGED_COLUMNS + simd_lane]) *
-                   splash_silu(float(gate[row * GGUF_STAGED_COLUMNS + simd_lane])));
+            bfloat(splash_swiglu(float(park[row * GGUF_STAGED_COLUMNS + simd_lane]),
+                                 float(gate[row * GGUF_STAGED_COLUMNS + simd_lane]), p.swiglu_limit));
   };
   moe_live_rows<Rows>(tile.rows, run);
 }

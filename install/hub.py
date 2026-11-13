@@ -439,6 +439,15 @@ class Repository:
         return cls.local_files(str(path), _paths(path))
 
     @classmethod
+    def local_draft(cls, path):
+        """A local draft: a DFlash2 draft's directory, or a DSpark draft's
+        GGUF file, the one file of its source."""
+        path = Path(path)
+        if path.suffix == ".gguf" and path.is_file():
+            return cls.local_files(str(path), {path.name: path})
+        return cls.local_directory(path)
+
+    @classmethod
     def local_files(cls, name, paths):
         """name, the local files paths maps each file name to, wherever each
         lies."""
@@ -478,8 +487,8 @@ class Repository:
         """name at the commit revision names now; this decides whether the
         Hub is asked.
 
-        Only an absolute path is a local directory (parse_draft_model makes
-        --draft-model absolute; a target is always a Hub ID). installed is the
+        Only an absolute path is local (parse_draft_model makes a --draft-model
+        directory or GGUF absolute; a target is always a Hub ID). installed is the
         commit a verified installation records, whose links name its files
         wherever HF_HUB_CACHE points now; with it, a commit revision (which
         never moves) or HF_HUB_OFFLINE returns that commit, unlisted, without a
@@ -496,7 +505,7 @@ class Repository:
         from huggingface_hub import HfApi, constants
 
         if Path(name).is_absolute():
-            return cls.local_directory(name)
+            return cls.local_draft(name)
         models.validate_repo_id(name)
         if installed and (
             constants.HF_HUB_OFFLINE or models.is_hex_digest(revision, 40)

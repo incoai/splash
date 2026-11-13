@@ -146,6 +146,11 @@ class ReasoningTests(HarnessTestCase):
                 ("low", "medium", "xhigh"),
                 {"high": "xhigh", "max": "xhigh", "minimal": "low"},
             ),
+            # DeepSeek-V4.1's.
+            (
+                ("low", "high", "max"),
+                {"minimal": "low", "medium": "high", "xhigh": "max"},
+            ),
         ):
             tokenizer = TemplateTokenizer(reasoning_template(efforts=accepted))
             app = make_frontend(tokenizer, None, "test-model", 128, 1, 2, vision=True)

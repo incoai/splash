@@ -267,6 +267,12 @@ ENGINE_CPP_SOURCES := \
 	runtime/ops/MoE.cpp \
 	runtime/ops/Normalization.cpp \
 	runtime/ops/HyperConnection.cpp \
+	runtime/ops/ManifoldHyperConnection.cpp \
+	runtime/ops/LatentAttention.cpp \
+	runtime/ops/Engram.cpp \
+	runtime/ops/DSparkMarkov.cpp \
+	runtime/ops/LatentIndex.cpp \
+	runtime/ops/LatentRotation.cpp \
 	runtime/ops/NgramEmbedding.cpp \
 	runtime/ops/BlockIndexer.cpp \
 	runtime/ops/PagedAttention.cpp \
@@ -305,6 +311,10 @@ ENGINE_CPP_SOURCES := \
 	runtime/engine/Status.cpp \
 	runtime/model/WeightStore.cpp \
 	runtime/model/GgufFile.cpp \
+	runtime/model/DeepSeek41.cpp \
+	runtime/model/DeepSeek41Target.cpp \
+	runtime/model/DSpark.cpp \
+	runtime/model/DSparkDraft.cpp \
 	runtime/model/GgufImage.cpp \
 	runtime/model/GgufTarget.cpp \
 	runtime/model/SafetensorsImage.cpp \

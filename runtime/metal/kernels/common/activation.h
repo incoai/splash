@@ -11,6 +11,16 @@ inline float splash_silu(float x) {
 inline float2 splash_silu(float2 x) {
   return x / (1.0f + fast::exp2(-1.44269504089f * x));
 }
+// silu(gate) * up of a SwiGLU whose experts clamp their inputs where limit
+// > 0, as DeepSeek-V4.1's do: up to [-limit, limit] and gate to at most
+// limit. Without the clamp, up * splash_silu(gate).
+inline float splash_swiglu(float up, float gate, float limit) {
+  if (limit > 0.0f) {
+    up = clamp(up, -limit, limit);
+    gate = min(gate, limit);
+  }
+  return up * splash_silu(gate);
+}
 inline float splash_sigmoid(float x) {
   return 1.0f / (1.0f + fast::exp2(-1.44269504089f * x));
 }

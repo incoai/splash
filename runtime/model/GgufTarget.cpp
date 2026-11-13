@@ -61,6 +61,18 @@ GgufTargetLoader::GgufTargetLoader(metal::MetalBackend &backend, WeightImages &i
   planned_->experts = experts;
 }
 
+GgufTargetLoader::GgufTargetLoader(metal::MetalBackend &backend, WeightImages &images,
+                                   const std::vector<std::filesystem::path> &paths,
+                                   const std::function<std::vector<gguf::Image>(const GgufFile &)> &plan,
+                                   uint32_t layers, std::string directory)
+    : backend_(backend), images_(images), planned_(std::make_shared<Planned>(paths)),
+      directory_(std::move(directory)) {
+  planned_->images = plan(planned_->source.file());
+  if (planned_->images.size() < uint64_t{layers} + 2)
+    throw GgufError("a GGUF's plan holds no head or embedding past its layers");
+  planned_->layers = layers;
+}
+
 StreamedBlocks GgufTargetLoader::streamedExperts() const {
   const std::span layers = std::span(planned_->images).first(planned_->layers);
   return {gguf::streamedExperts(layers.subspan(planned_->firstMoeLayer)), planned_,
@@ -90,11 +102,11 @@ std::optional<GgufTargetLoader::StreamedTable> GgufTargetLoader::streamTable() c
       std::make_shared<SparseRowStore>(SparseRowTable{rows.tensor, rows.rows, rows.rowBytes, rows.offset},
                                        openRowReader(std::shared_ptr<const WeightSource>(planned_, &source)),
                                        planned_->table),
-      rows.format, imageRecord(images_, "target/", *plan)};
+      rows.format, imageRecord(images_, directory_, *plan)};
 }
 
 WeightFile GgufTargetLoader::open(size_t index) {
-  return loadImage(backend_, images_, "target/", {planned_, &planned_->images[index]},
+  return loadImage(backend_, images_, directory_, {planned_, &planned_->images[index]},
                    [planned = planned_] { planned->source.checkUnchanged(); });
 }
 

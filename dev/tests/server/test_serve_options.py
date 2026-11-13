@@ -33,8 +33,8 @@ def values(flag, accepted, refused, repeatable=False):
 
 
 # Up to the native window and past it, where the engine serves the context
-# with YaRN, to the 1010000 tokens Qwen validates; K is 1024 tokens and M a
-# million.
+# with YaRN, to the 1048576 tokens DeepSeek-V4.1-Flash's native window holds,
+# the most of any family's; K is 1024 tokens and M a million.
 ACCEPTED_CONTEXTS = {
     "auto": None,
     "100K": 102400,
@@ -46,9 +46,11 @@ ACCEPTED_CONTEXTS = {
     "1m": 1000000,
     "1000000": 1000000,
     "1010000": 1010000,
+    "1024K": 1048576,
+    "1048576": 1048576,
 }
-# Past 1010000 tokens (987K is 1010688), or no count of tokens.
-REFUSED_CONTEXTS = ("0", "-1", "1010001", "987K", "2M", "1.5M", "M", "bad")
+# Past 1048576 tokens (1025K is 1049600), or no count of tokens.
+REFUSED_CONTEXTS = ("0", "-1", "1048577", "1025K", "2M", "1.5M", "M", "bad")
 # Every shared option: accepted arguments with the value they parse to, and
 # refused arguments.
 OPTIONS = {

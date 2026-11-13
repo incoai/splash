@@ -762,9 +762,14 @@ void warmupCovers(const std::string &name, const ExecutionPlans &plans, std::vec
         check("attention " + f + (format == kv::Format::Int8 ? " int8" : " bf16") + " window " +
                   std::to_string(v.windowTokens) + (v.rotated ? " rope" : " nope"),
               kAttentionHistories, [&](uint32_t rows, uint32_t history) {
-                const PrefillAttentionPlan plan =
-                    plans.prefillAttention(rows, history, family.attentionQueryHeads, layout, v);
-                return plan.splitPipeline + " " + plan.reducePipeline;
+                // A layout of no paged attention (DeepSeek-V4.1's latent
+                // attention, whose prefill runs its own kernels) is refused
+                // alike at every chunk, as the golden records it.
+                return attempt([&] {
+                  const PrefillAttentionPlan plan =
+                      plans.prefillAttention(rows, history, family.attentionQueryHeads, layout, v);
+                  return plan.splitPipeline + " " + plan.reducePipeline;
+                });
               });
     }
   });
