@@ -190,8 +190,9 @@ extension ChatScreenTests {
         #expect(Self.unlike(try await picture(), before, in: button, window) > 0, "Stop, since Send")
 
         try FileManager.default.removeItem(at: fake.root.appending(path: "hold"))
-        // The frames through the refusal, and 8 from when the app has it.
-        var refused: [(list: Int, toolbar: Int, composer: CGFloat)] = []
+        // The frames through the refusal, and 8 from when the app has it, each with how many of
+        // its pixels have the yellow of the mark of the line that says why, at the text's start.
+        var refused: [(list: Int, toolbar: Int, composer: CGFloat, mark: Int?)] = []
         let deadline = ContinuousClock.now + .seconds(10)
         var since = 0
         while since < 8 {
@@ -200,8 +201,12 @@ extension ChatScreenTests {
             await Task.yield()
             if state.chats.streaming == nil { since += 1 }
             let drawn = try await picture()
+            let color = Self.colors(of: drawn)
+            let mark = (60..<drawn.pixelsHigh).reduce(0) { count, y in
+                count + (Int(field.minX) - 2..<Int(field.minX) + 22).count { x in color(x, y).0 - color(x, y).2 > 0.08 }
+            }
             refused.append((Self.unlike(drawn, before, in: sidebar, window), Self.unlike(drawn, before, in: toolbar, window),
-                            try Self.field(in: window).minY - field.minY))
+                            try Self.field(in: window).minY - field.minY, since > 0 ? mark : nil))
         }
         #expect(state.draft.notice?.text == "This message is longer than the model’s context." && state.draft.text == FirstMessagePictures.draft)
         #expect(!state.chats.answering && state.canSendDraft)
@@ -211,6 +216,9 @@ extension ChatScreenTests {
         #expect(refused.allSatisfy { $0.list == 0 && $0.toolbar == 0 }, "the list and the toolbar through the refusal: \(refused)")
         // The line that says why, over the text: a line of 12-point text and the 10 points under it.
         #expect(refused.allSatisfy { abs($0.composer) <= 30 }, "the composer's text against where it was, per frame: \(refused.map(\.composer))")
+        // There from the first frame the refusal draws, whole: nothing moves that it would wait for.
+        let marks = refused.compactMap(\.mark)
+        #expect(marks.count == 8 && marks.allSatisfy { $0 > 20 && $0 == marks.last }, "its mark's pixels, per frame from the refusal: \(marks)")
     }
 }
 
@@ -242,6 +250,59 @@ extension ChatScreenTests {
         #expect(frames.allSatisfy { $0.left == (0, 0) }, "pixels of them left where the composer was, per frame: \(frames)")
         #expect(opening.drawn.prefix { $0.ms <= 100 }.count >= 4, "frames within 100 ms of the first: \(opening.drawn.map(\.ms))")
         #expect(opening.drawn.last.map { $0.field < opening.field.minY - 100 } == true, "the composer travelled to the foot")
+    }
+
+    /// The line that says why the server refused a new chat's first message comes back, as the
+    /// new chat opens again from another chat, once the composer has moved to the middle: no
+    /// frame shows its mark while the composer travels there. Coming on the travel's animation,
+    /// it faded in at its place in the middle, over nothing, ahead of the composer coming up
+    /// under it.
+    @Test func theReasonComesBackOnceTheComposerHasMoved() async throws {
+        let fake = try FakeRuntime("splash-chat-reason", launcher: "chat_server")
+        defer { try? FileManager.default.removeItem(at: fake.root) }
+        let state = try await Self.chatting(fake)
+        defer { state.quit() }
+        let window = await Snapshot.window(MainView().environment(state), size: FirstMessagePictures.size, appearance: .aqua)
+        defer { window.orderOut(nil) }
+        state.draft.text = FirstMessagePictures.draft
+        let refuse = fake.root.appending(path: "refuse")
+        FileManager.default.createFile(atPath: refuse.path, contents: nil)
+        state.sendDraft()
+        try await waitFor(state.chats.streaming == nil && state.draft.notice != nil, "the refusal")
+        pump(0.5)
+        let middle = try Self.field(in: window), size = window.frame.size
+        // Down the window under the toolbar, across the line's mark, at the text's start.
+        let strip = CGRect(x: middle.minX - 2, y: 60, width: 24, height: size.height - 60)
+        /// How many of the strip's pixels have the mark's yellow, however faint, as the window draws now.
+        func mark() throws -> Int {
+            let frame = try #require(window.contentView?.superview)
+            let area = frame.convert(CGRect(x: strip.minX, y: size.height - strip.maxY, width: strip.width, height: strip.height), from: nil)
+            let bitmap = try #require(frame.bitmapImageRepForCachingDisplay(in: area))
+            frame.cacheDisplay(in: area, to: bitmap)
+            let color = Self.colors(of: bitmap)
+            return (0..<bitmap.pixelsHigh).reduce(0) { count, y in
+                count + (0..<bitmap.pixelsWide).count { x in
+                    let (r, _, b) = color(x, y)
+                    return r - b > 0.08
+                }
+            }
+        }
+        #expect(try mark() > 20, "the line's mark, before")
+        state.chats.selection = try #require(state.chats.conversations.first { $0.title == "Kyoto in spring" }).id
+        pump(0.8)
+        #expect(try mark() == 0 && Self.field(in: window).minY < middle.minY - 100, "another chat open, the composer at its foot")
+        state.chats.newChat()
+        var frames: [(ms: Int, mark: Int, short: CGFloat)] = []
+        let start = ContinuousClock.now
+        for ms in [0, 25, 50, 75, 100, 150, 200, 240, 300, 400, 600] {
+            while ContinuousClock.now < start + .milliseconds(ms) { pump(0.005) }
+            frames.append((ms, try mark(), middle.minY - (try Self.field(in: window).minY)))
+        }
+        pump(0.6)
+        #expect(try mark() > 20 && Self.field(in: window).minY == middle.minY, "the line again, the composer in the middle")
+        #expect(frames.contains { $0.short > 50 }, "the composer travels: \(frames)")
+        // Within the few points the end of its animation takes.
+        #expect(frames.allSatisfy { $0.mark == 0 || abs($0.short) < 5 }, "the mark's pixels and how far the composer is short of the middle, per frame: \(frames)")
     }
 
     /// The chat's title fades in at its place as its chat opens: every frame the window draws
@@ -410,8 +471,9 @@ extension ChatScreenTests {
 
 /// A new chat's first message drawn to `first-message-*.png` in `SPLASH_APP_SNAPSHOTS`, light and
 /// dark, for people to review its motion, with chats in the list and a draft of several lines, a
-/// picture and a PDF: Send while the server holds the message, its refusal, Send again and Stop,
-/// Send once more, the server taking it and the reply, each at 0, 25, 50, 75 and 100% of `settle`,
+/// picture and a PDF: Send while the server holds the message, its refusal, another chat opened
+/// and the new chat again, Send again and Stop, Send once more, the server taking it and the
+/// reply, each at 0, 25, 50, 75 and 100% of `settle`,
 /// at twice that, once what comes has faded in, and at five times that, 1.2 s, by when a window
 /// drawn off screen shows the button's new glyph too.
 @MainActor
@@ -468,6 +530,11 @@ struct FirstMessagePictures {
             try clear("hold")
             try await until({ state.chats.streaming == nil }, "the refusal")
             await frames("2-refused")
+            // Another chat opened and the new chat again, as their rows in the list open them.
+            state.chats.selection = state.chats.conversations.first { $0.title == "Kyoto in spring" }?.id
+            await frames("2a-other-chat")
+            state.chats.newChat()
+            await frames("2b-new-chat-again")
             signal("hold")
             state.sendDraft()
             await frames("3-send-again")

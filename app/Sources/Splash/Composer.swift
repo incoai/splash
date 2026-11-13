@@ -205,11 +205,11 @@ struct Composer: View {
                     Image(systemName: "exclamationmark.triangle.fill").symbolRenderingMode(.multicolor)
                 }
                 .font(.system(size: 12))
-                .transition(Motion.goingAtOnce)
+                .transition(Motion.overText)
             }
             if !draft.attachments.isEmpty {
                 Attachments(draft: draft, held: held)
-                    .transition(Motion.goingAtOnce)
+                    .transition(Motion.overText)
             }
             ComposerField(text: $draft.text, focusRequests: draft.focusRequests,
                           yields: state.terminalShows, held: held,
