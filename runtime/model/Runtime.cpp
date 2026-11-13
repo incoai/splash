@@ -4,6 +4,7 @@
 #include "model/RuntimeInstrumentation.hpp"
 #endif
 #include "AwakeClock.hpp"
+#include "model/CopySpec.hpp"
 #include "model/ExpertStore.hpp"
 #include "model/KvBlockCache.hpp"
 #include "model/KvHistoryStream.hpp"
@@ -383,6 +384,9 @@ struct Runtime::Impl {
     // the prompt (with any replayed generation) and the emitted output, which
     // the target may read (QwenTargetRequest).
     std::vector<uint32_t> tokens;
+    // The prompt-lookup copy source over `tokens` and the request's copying
+    // policy state (CopySpecIndex), where the mode keeps one.
+    std::optional<CopySpecState> copySpec;
   };
 
   struct DecodeLaneResult final {
@@ -396,6 +400,10 @@ struct Runtime::Impl {
     // The draft proposals the lane's thinking end replaced, which its
     // speculation counts leave out.
     uint32_t endDrafts = 0;
+    // The copied proposals a lookup hit filled the lane's draft block with
+    // (planCopyDraft), which its speculation counts keep; zero where the
+    // draft proposed the block.
+    uint32_t copiedTokens = 0;
     // Why the lane's selection is unusable (invalidSelection), found before
     // any lane commits.
     std::string failure;
@@ -423,6 +431,9 @@ struct Runtime::Impl {
   const LoadedModel &model;
   const RuntimeGeometry geometry;
   const ops::ExecutionPlans &operators;
+  // Whether and how a request's cycles may draft by copying its own earlier
+  // tokens (RuntimeContext::copyspecMode).
+  const CopySpecMode copyspecMode;
   kv::PageStorage &kvPages;
   QwenStateStorage &states;
   std::unique_ptr<PrefillArena> prefillArena;
@@ -595,6 +606,7 @@ struct Runtime::Impl {
                                        value.stateStorage.layout().target.format,
                                        StreamedParts::loaded(value.model, value.blockCache != nullptr))),
         operators(value.operators),
+        copyspecMode(value.copyspecMode),
         kvPages(value.kvPages),
         states(value.stateStorage),
         sampling(geometry.target.vocabularySize),
@@ -1350,9 +1362,14 @@ struct Runtime::Impl {
     }
     // The previous anchor and every selection before the new one are now
     // read (Request::tokens).
+    const size_t committed = entry.tokens.size();
     if (entry.pendingToken) entry.tokens.push_back(*entry.pendingToken);
     entry.tokens.insert(entry.tokens.end(), tokens.begin(), tokens.end() - 1);
     entry.pendingToken = tokens.back();
+    // What the request committed becomes its copy source (CopySpecIndex).
+    if (entry.copySpec)
+      entry.copySpec->index.appendCommitted(
+          std::span(entry.tokens).subspan(committed));
   }
 
   // A selection outside the vocabulary is the sampling kernels' sentinel for a
@@ -2116,6 +2133,68 @@ struct Runtime::Impl {
                     draftModel.decodeStorageLanes(lanes));
   }
 
+  // The copied block a request's lookup drafts for a lane's cycle
+  // (CopySpecIndex::draftAfter): what followed the window its pending anchor
+  // ends wherever the request's earlier tokens held it. Empty where the lane
+  // drafts with DFlash: a sampled lane, a lane whose thinking is ending, a
+  // request that is off, one-struck or gated out, and a lookup miss.
+  struct CopyDraft final {
+    uint32_t count = 0;
+    std::array<uint32_t, kDraftProposalTokens> tokens{};
+  };
+
+  // The copied block a greedy lane's cycle drafts where the request copies
+  // and its lookup hits: at most min(7, maximumRetained - 1) proposals, full
+  // length or none, and no block holding a stop token (draftAfter).
+  uint32_t planCopyDraft(const Request &entry, uint32_t maximumRetained,
+                         CopyDraft &copy) const {
+    copy = {};
+    if (copyspecMode == CopySpecMode::Off || !entry.copySpec ||
+        entry.copySpec->disabled || maximumRetained <= 1)
+      return 0;
+    const ops::SamplingPolicy policy = samplingPolicy(entry);
+    // A sampled lane draws its proposals, and a thinking end replaces its
+    // own: neither block may be overwritten with copies.
+    if (policy.samples() || policy.thinkingCutoff)
+      return 0;
+    copy.count = entry.copySpec->index.draftAfter(
+        *entry.pendingToken, std::min(kDraftProposalTokens, maximumRetained - 1),
+        geometry.target.stopTokens.tokens(), copy.tokens);
+    // The gate is consulted only where a lookup hit exists: a miss falls
+    // back to DFlash for free whatever the phase.
+    if (copy.count && copyspecMode == CopySpecMode::Auto &&
+        !entry.copySpec->gate.engageCopy())
+      copy.count = 0;
+    return copy.count;
+  }
+
+  // The lanes whose cycle drafts with a copied block (planCopyDraft): a host
+  // step overwrites their proposals and confidence after the selector's
+  // dispatches and before the verify rows read the confidence, so that
+  // addVerifyRows asks for the whole copied block. A thinking end still wins
+  // the proposals of its lanes (addThinkingDrafts runs after).
+  void encodeCopySpecProposals(CommandGraph &graph,
+                               std::span<const CopyDraft> copies) const {
+    if (std::ranges::none_of(copies,
+                             [](const CopyDraft &copy) { return copy.count; }))
+      return;
+    graph.host([this, copies = std::vector<CopyDraft>(copies.begin(), copies.end())] {
+      for (uint32_t lane = 0; lane < copies.size(); ++lane) {
+        const CopyDraft &copy = copies[lane];
+        if (!copy.count)
+          continue;
+        uint32_t *proposed =
+            contents<uint32_t>(decodeArena->get(lane, DecodeTensor::ProposedTokens),
+                               "proposed tokens");
+        std::copy_n(copy.tokens.begin(), copy.count, proposed);
+        float *confidence =
+            contents<float>(decodeArena->get(lane, DecodeTensor::VerifyConfidence),
+                            "draft proposal confidence");
+        std::fill(confidence, confidence + kDraftProposalTokens, 1.0F);
+      }
+    });
+  }
+
   // The draft's proposals for each lane and how many rows of its block it
   // verifies, at most maximumRows[lane] (its retention limit), by the
   // acceptance model and the costs of `constrained` cycles of its lane count.
@@ -2123,10 +2202,12 @@ struct Runtime::Impl {
                              std::span<Request *const> entries,
                              std::span<const uint64_t> logicalPositions,
                              std::span<const uint32_t> maximumRows,
+                             std::span<const CopyDraft> copies,
                              bool constrained) {
     if (entries.empty() || entries.size() > kLaneCount ||
         entries.size() != logicalPositions.size() ||
-        entries.size() != maximumRows.size()) {
+        entries.size() != maximumRows.size() ||
+        entries.size() != copies.size()) {
       throw std::invalid_argument("invalid draft decode batch");
     }
     const uint32_t lanes = static_cast<uint32_t>(entries.size());
@@ -2181,6 +2262,7 @@ struct Runtime::Impl {
          d(DecodeTensor::SamplingUniforms), d(DecodeTensor::ProposedTokens),
          d(DecodeTensor::ProposalProbs), d(DecodeTensor::VerifyConfidence)},
         std::span(anchors).first(lanes), std::span(policies).first(lanes));
+    encodeCopySpecProposals(graph, std::span(copies).first(lanes));
     ops::VerifyRowsModel verify;
     if (verifyBudget && !verifyBudget->explores(lanes, constrained)) {
       const VerifyBudget::Acceptance &acceptance = verifyBudget->acceptance();
@@ -2458,7 +2540,10 @@ struct Runtime::Impl {
         std::copy_n(confidence, kDraftProposalTokens, observed[lane].confidence.begin());
         observed[lane].verifyRows = lanes[lane].verifyRows;
         observed[lane].accepted = lanes[lane].accepted;
-        observed[lane].labels = lanes[lane].endDrafts == 0;
+        // A thinking end replaced its proposals, and a lookup copy is not
+        // the draft's: neither lane's outcomes label the acceptance model.
+        observed[lane].labels =
+            lanes[lane].endDrafts == 0 && !lanes[lane].copiedTokens;
       }
       verifyBudget->observe(std::span(observed).first(items.size()), constrained,
                             timing.wallSeconds * 1000.0);
@@ -2509,6 +2594,29 @@ struct Runtime::Impl {
       commitSelected(entry, {targetTokens, laneResult.retained});
       entry.maskWords.clear();
       entry.verifyMaskInFlight = false;
+      // A copied block's verification teaches the request's copy state, and
+      // a cycle of an auto-gated request its gate (CopySpecAutoGate).
+      if (entry.copySpec) {
+        if (laneResult.copiedTokens) {
+          ++counters.copyspecHits;
+          counters.copyspecTokens += laneResult.copiedTokens;
+          // Conservative is one-strike: a copied block that verified nothing
+          // stops copying for the request. A lookup miss is free and never
+          // strikes.
+          if (copyspecMode == CopySpecMode::Conservative && !laneResult.accepted)
+            entry.copySpec->disabled = true;
+        }
+        if (copyspecMode == CopySpecMode::Auto) {
+          entry.copySpec->gate.recordCycle(
+              laneResult.copiedTokens != 0, laneResult.retained,
+              static_cast<uint64_t>(
+                  std::max(0.0, timing.wallSeconds) * 1.0e9));
+          // On disengage the gate asks for a clean adaptive policy, which
+          // the copied cycles could have distorted.
+          if (entry.copySpec->gate.takeReset() && verifyBudget)
+            verifyBudget.emplace();
+        }
+      }
       // The end replaced the first proposals, which acceptance keeps as far
       // as the lane retains them; the draft proposed the others, and the
       // speculation counts the ones the lane verified.
@@ -2807,6 +2915,10 @@ StateAdmission Runtime::resume(const ModelRequest &request) {
     entry.resident = true;
     entry.promptTokens = static_cast<uint32_t>(request.prompt.size());
     entry.tokens.assign(request.prompt.begin(), request.prompt.end());
+    // The recomputed history replaces the copy source wholesale, keeping
+    // the copying policy state (CopySpecState) the request has earned.
+    if (entry.copySpec)
+      entry.copySpec->index.rebuild(request.prompt);
     entry.maxNewTokens = request.maxNewTokens;
     entry.images = std::move(images);
     entry.restoredTokens = request.restoredTokens;
@@ -2827,6 +2939,9 @@ StateAdmission Runtime::beginAt(const ModelRequest &request, uint32_t stateLane)
   entry.id = request.id;
   entry.promptTokens = static_cast<uint32_t>(request.prompt.size());
   entry.tokens.assign(request.prompt.begin(), request.prompt.end());
+  if (impl_->copyspecMode != CopySpecMode::Off)
+    entry.copySpec.emplace(
+        CopySpecState{CopySpecIndex{request.prompt}, false, CopySpecAutoGate{}});
   entry.maxNewTokens = request.maxNewTokens;
   entry.sampling = request.sampling;
   entry.constraint = request.constraint;
@@ -3221,6 +3336,7 @@ Runtime::decodeAsync(const BatchPlan &plan,
 
   const uint32_t width = static_cast<uint32_t>(items.size());
   std::vector<Impl::DecodeLaneResult> lanes(width);
+  std::array<Impl::CopyDraft, kLaneCount> copyDrafts{};
   std::array<Impl::Request *, kLaneCount> requests{};
   std::array<uint64_t, kLaneCount> logicalPositions{};
   std::array<uint32_t, kLaneCount> maximumRetained{};
@@ -3262,6 +3378,10 @@ Runtime::decodeAsync(const BatchPlan &plan,
     laneResult.maximumRetained = std::min(remaining, kDecodeRows);
     if (const auto cutoff = Impl::samplingPolicy(entry).thinkingCutoff)
       laneResult.endDrafts = cutoff->replacedProposals();
+    // A lookup hit replaces the cycle's draft block for the lanes that copy
+    // (planCopyDraft); the rest draft with DFlash as usual.
+    laneResult.copiedTokens =
+        impl_->planCopyDraft(entry, laneResult.maximumRetained, copyDrafts[lane]);
 
     impl_->prepareDecodeLane(entry, item, lane);
     requests[lane] = &entry;
@@ -3286,7 +3406,8 @@ Runtime::decodeAsync(const BatchPlan &plan,
                                 width);
   impl_->encodeDraftBatchGraph(commandGraph, entries,
                                {logicalPositions.data(), width},
-                               {maximumRetained.data(), width}, constrained);
+                               {maximumRetained.data(), width},
+                               {copyDrafts.data(), width}, constrained);
   std::shared_ptr<SpilledKvReads> reads = impl_->decodeReads(items);
   // The weights it reads on demand and the spilled K/V its reads bring.
   WorkCount count({}, impl_->model.expertStore(), reads);

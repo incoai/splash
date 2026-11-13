@@ -122,6 +122,7 @@ window. To set your own limits or cache options, add these to `splash serve`:
 | `--state-format bf16` | Use BF16 recurrent states, half the size. Default: FP32. |
 | `--activations bf16` | Use BF16 activations. Default: auto. |
 | `--disable-ane` | Prefill on the GPU alone. Default: the 27B also uses the Neural Engine. |
+| `--copyspec-mode auto` | Draft from a request's own repeated text: `off` never copies, `conservative` (default) stops after a copied block verifies nothing, `auto` gates copying on measured throughput. |
 | `--max-cache-disk 16G` | Cap the SSD cache (default: auto, up to 32 GiB; `0` turns it off). |
 | `--persistent-cache` | Keep the SSD cache across restarts. Off by default. |
 

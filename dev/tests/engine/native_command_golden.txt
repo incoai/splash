@@ -34,6 +34,9 @@ verify_rows_all | --verify-rows all | auto auto --verify-rows all
 verify_rows_auto | --verify-rows auto | auto auto
 kv_format_default | --kv-format int8 | auto auto
 state_format_default | --state-format fp32 | auto auto
+copyspec_mode_off | --copyspec-mode off | auto auto --copyspec-mode off
+copyspec_mode_auto | --copyspec-mode auto | auto auto --copyspec-mode auto
+copyspec_mode_conservative | --copyspec-mode conservative | auto auto
 relaunch |  | auto auto --relaunch-context 61433
 relaunch_limits | --max-context 100K --max-memory 32G | 102400 34359738368 --relaunch-context 61433
 yarn | --max-context 1M | 1000000 auto

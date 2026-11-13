@@ -2,6 +2,7 @@
 
 #include "engine/Engine.hpp"
 #include "engine/RuntimeResources.hpp"
+#include "model/CopySpec.hpp"
 #include "model/ModelDescriptor.hpp"
 
 #include <cstdint>
@@ -91,6 +92,10 @@ struct NativeArguments final {
   // an int8-activation path takes them
   // (RuntimeResourcesConfig::int8Activations).
   ops::Int8Activations int8Activations = ops::Int8Activations::On;
+  // --copyspec-mode off|conservative|auto: whether a request's decode cycles
+  // may draft by copying the request's own earlier tokens
+  // (RuntimeResourcesConfig::copyspecMode).
+  model::CopySpecMode copyspecMode = model::CopySpecMode::Conservative;
 };
 
 // Reads `serve-native MODEL_DIRECTORY MAX_CONTEXT|auto MAX_MEMORY_BYTES|auto

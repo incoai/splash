@@ -162,6 +162,12 @@ void testServerCommandLines(const char *path) {
       {"kv_format_default", [](NativeArguments &read) { read.kvFormat = kv::Format::Int8; }},
       {"state_format_default",
        [](NativeArguments &read) { read.stateFormat = ops::GdnStateFormat::Float32; }},
+      {"copyspec_mode_off",
+       [](NativeArguments &read) { read.copyspecMode = model::CopySpecMode::Off; }},
+      {"copyspec_mode_auto",
+       [](NativeArguments &read) { read.copyspecMode = model::CopySpecMode::Auto; }},
+      {"copyspec_mode_conservative",
+       [](NativeArguments &read) { read.copyspecMode = model::CopySpecMode::Conservative; }},
       // A relaunch asks for the first engine's context beside that engine's
       // MAX_CONTEXT: it is planned as that engine was, and serves what its
       // plan holds of the context.
@@ -211,7 +217,8 @@ void testServerCommandLines(const char *path) {
            read.neuralEngine == meant.neuralEngine && read.pleMemory == meant.pleMemory &&
            read.expertMemory == meant.expertMemory && read.sparseKvMemory == meant.sparseKvMemory &&
            read.kvSpillAlways == meant.kvSpillAlways && read.kvWindowTrim == meant.kvWindowTrim &&
-           read.verifyRows == meant.verifyRows && read.int8Activations == meant.int8Activations;
+           read.verifyRows == meant.verifyRows && read.int8Activations == meant.int8Activations &&
+           read.copyspecMode == meant.copyspecMode;
   };
   const auto golden = readGolden(path);
   require(golden.size() == changes.size(),
@@ -253,6 +260,22 @@ void testVerifyRows() {
   require(parse(model, {"auto", "auto"}).verifyRows == model::VerifyRows::Auto &&
               parse(model, {"auto", "auto", "--verify-rows", "auto"}).verifyRows == model::VerifyRows::Auto,
           "--verify-rows auto was not the engine's rule");
+}
+
+// --copyspec-mode conservative, the engine's rule, is what the server leaves
+// out; off never copies a request's own earlier tokens and auto gates copying
+// on measured throughput.
+void testCopySpecMode() {
+  const ModelDirectory model;
+  require(parse(model, {"auto", "auto"}).copyspecMode ==
+                  model::CopySpecMode::Conservative &&
+              parse(model, {"auto", "auto", "--copyspec-mode", "conservative"})
+                      .copyspecMode == model::CopySpecMode::Conservative &&
+              parse(model, {"auto", "auto", "--copyspec-mode", "off"})
+                      .copyspecMode == model::CopySpecMode::Off &&
+              parse(model, {"auto", "auto", "--copyspec-mode", "auto"})
+                      .copyspecMode == model::CopySpecMode::Auto,
+          "--copyspec-mode did not reach the arguments as given");
 }
 
 // The stores' memory is the planner's unless set, which the server writes
@@ -310,6 +333,9 @@ void testRefusals() {
     refuses({"auto", "auto", "--activations", value}, "--activations requires auto or bf16");
   for (const char *rows : {"budget", "every", "ALL", ""})
     refuses({"auto", "auto", "--verify-rows", rows}, "--verify-rows requires auto or all");
+  for (const char *mode : {"on", "none", "Conservative", ""})
+    refuses({"auto", "auto", "--copyspec-mode", mode},
+            "--copyspec-mode requires off, conservative or auto");
   // The server passes bytes, auto or off.
   for (const char *size : {"0", "2G", "OFF", ""})
     refuses({"auto", "auto", "--ple-memory", size}, "--ple-memory requires a positive byte count, auto or off");
@@ -419,6 +445,7 @@ int main(int argc, char **argv) {
     testNeuralEngine();
     testInt8Activations();
     testVerifyRows();
+    testCopySpecMode();
     testStreamedMemoryAndSpill();
     testWindowTrim();
     testRefusals();
