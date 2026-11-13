@@ -181,6 +181,7 @@ class Frontend:
         max_image_pixels=image_input.MAX_PIXELS,
         served_model_names=(),
         announce_served_name=False,
+        reasoning_effort=None,
         default_reasoning_effort=None,
         default_thinking_token_budget=None,
         sampling_defaults=None,
@@ -216,6 +217,10 @@ class Frontend:
         # configured from data[0] (splash <client>) requests the name it gets
         # back. Every name stays accepted.
         self.model_names = tuple(dict.fromkeys((self.response_model, model, *names)))
+        # The effort the server gives every chat request in place of whatever
+        # the request says of reasoning (--reasoning-effort); None where each
+        # request's own, or the default below, decides.
+        self.reasoning_effort = reasoning_effort
         if (
             default_reasoning_effort is not None
             and default_reasoning_effort not in REASONING_EFFORTS
@@ -275,12 +280,21 @@ class Frontend:
         return ["text", "image", "pdf"] if self.vision else ["text"]
 
     @property
+    def reasoning_switch(self):
+        """Whether a request's reasoning effort or enable_thinking turns the
+        model's reasoning on and off, as /status reports: where the family's
+        model leaves that to its prompt (ChatFormat.reasoning_switch) and the
+        server has not set every request's effort itself."""
+        return self.chat_format.reasoning_switch and self.reasoning_effort is None
+
+    @property
     def reasoning(self):
         """What /v1/models reports of reasoning: the default template's
         (ChatTemplate.reasoning), with the server's default effort in place of
         the template's own, named by the listed effort it renders like; no
-        efforts for a model that decides itself whether to reason."""
-        if not self.chat_format.reasoning_switch:
+        efforts where a request's effort decides nothing (reasoning_switch),
+        so that a client offers none."""
+        if not self.reasoning_switch:
             return {"thinks": None, "efforts": [], "default": None}
         template = self.chat_templates.select(None)
         reasoning = dict(template.reasoning)
@@ -295,7 +309,8 @@ class Frontend:
         status["capabilities"] = {"max_context_tokens": self.max_context}
         status["vision"] = self.vision
         status["input_modalities"] = self.input_modalities
-        status["reasoning_switch"] = self.chat_format.reasoning_switch
+        status["reasoning_switch"] = self.reasoning_switch
+        status["reasoning_effort"] = self.reasoning_effort
         status["chat_template"] = self.chat_templates.status()
         with self.preparation_lock:
             status["frontend"] = {
@@ -680,6 +695,15 @@ class Frontend:
             raise APIError(
                 400, "chat_template_kwargs enable_thinking must be a boolean"
             )
+        if self.reasoning_effort is not None:
+            # The server's effort is every request's, as though each had sent
+            # it and nothing else of reasoning: it replaces the request's
+            # effort, its enable_thinking, which would outrank an effort, and
+            # a reasoning_effort among its template variables, which would
+            # outrank Splash's own. It follows the request's own checks, so a
+            # malformed field is refused as without it.
+            reasoning_effort, enable_thinking = self.reasoning_effort, None
+            template_kwargs.pop("reasoning_effort", None)
         messages = normalize_messages(body.get("messages"), vision=self.vision)
         tools, tool_policy = normalize_tools(
             body.get("tools"),

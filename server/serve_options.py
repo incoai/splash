@@ -657,6 +657,21 @@ SERVE_OPTIONS = (
         ),
     ),
     ServeOption(
+        "--reasoning-effort",
+        "api",
+        dict(
+            type=parse_reasoning_effort,
+            metavar="EFFORT",
+            help="effort of every Chat, Responses and Messages request, whatever "
+            "the request asks: "
+            + ", ".join(REASONING_EFFORTS[:-1])
+            + f" or {REASONING_EFFORTS[-1]}; none turns thinking off (default: "
+            "SPLASH_REASONING_EFFORT, else each request's own)",
+        ),
+        environment="SPLASH_REASONING_EFFORT",
+        needs="reasoning_switch",
+    ),
+    ServeOption(
         "--default-reasoning-effort",
         "api",
         dict(
@@ -859,6 +874,12 @@ def check_serve_arguments(parser, args):
         )
     if args.cache_dir is not None and not args.persistent_cache:
         parser.error("--cache-dir needs --persistent-cache")
+    if args.reasoning_effort is not None and args.default_reasoning_effort is not None:
+        parser.error(
+            "--default-reasoning-effort (SPLASH_DEFAULT_REASONING_EFFORT) sets "
+            "the effort of requests that set none, and --reasoning-effort "
+            "(SPLASH_REASONING_EFFORT) leaves none: it sets every request's"
+        )
 
 
 def serve_argv(args):

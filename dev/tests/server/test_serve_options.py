@@ -65,6 +65,16 @@ OPTIONS = {
         [(["--announce-served-name", "--served-model-name=local"], True)],
         [["--announce-served-name"]],
     ),
+    "--reasoning-effort": (
+        [([f"--reasoning-effort={effort}"], effort) for effort in REASONING_EFFORTS],
+        [
+            ["--reasoning-effort="],
+            ["--reasoning-effort=off"],
+            ["--reasoning-effort=XHIGH"],
+            # It leaves no request for a default effort to set.
+            ["--reasoning-effort=none", "--default-reasoning-effort=low"],
+        ],
+    ),
     "--default-reasoning-effort": values(
         "--default-reasoning-effort",
         {effort: effort for effort in REASONING_EFFORTS},
@@ -252,6 +262,7 @@ class ServeOptionsTests(unittest.TestCase):
         self.enterContext(mock.patch.dict(os.environ))
         for name in (
             "SPLASH_API_KEY",
+            "SPLASH_REASONING_EFFORT",
             "SPLASH_DEFAULT_REASONING_EFFORT",
             "SPLASH_THINKING_TOKEN_BUDGET",
             "SPLASH_THINKING_END_TEXT",
@@ -292,6 +303,7 @@ class ServeOptionsTests(unittest.TestCase):
 
     def test_both_parsers_check_defaults_from_the_environment(self):
         for name, value, parsed, flag in (
+            ("SPLASH_REASONING_EFFORT", "none", "none", "--reasoning-effort"),
             (
                 "SPLASH_DEFAULT_REASONING_EFFORT",
                 "low",
@@ -342,10 +354,22 @@ class ServeOptionsTests(unittest.TestCase):
                     self.assertEqual(getattr(parse(required), option.dest), [])
 
     def test_launcher_forwards_exactly_what_the_server_parses(self):
+        # Every option at once, but that the effort of every request and the
+        # default effort are refused together: each travels without the other.
+        for left_out in ("--default-reasoning-effort", "--reasoning-effort"):
+            with self.subTest(left_out=left_out):
+                self.forward_all_but(left_out)
+        # Defaults stay with the server, which reads them itself.
+        defaults = launcher.parse_args(LAUNCHER_ARGS)
+        self.assertEqual(serve_options.serve_argv(defaults), [])
+        self.assertEqual(serve_options.serve_environment(defaults), {})
+
+    def forward_all_but(self, left_out):
         launched = [
             *(
                 argument
-                for accepted, _ in OPTIONS.values()
+                for flag, (accepted, _) in OPTIONS.items()
+                if flag != left_out
                 for arguments, _ in accepted[-1:]
                 for argument in arguments
             ),
@@ -364,7 +388,7 @@ class ServeOptionsTests(unittest.TestCase):
             {
                 option.flag
                 for option in serve_options.SERVE_OPTIONS
-                if not option.secret
+                if not option.secret and option.flag != left_out
             },
         )
         self.assertFalse(any("secret-key" in argument for argument in argv))
@@ -375,10 +399,6 @@ class ServeOptionsTests(unittest.TestCase):
             self.assertEqual(
                 getattr(served, option.dest), getattr(args, option.dest), option.flag
             )
-        # Defaults stay with the server, which reads them itself.
-        defaults = launcher.parse_args(LAUNCHER_ARGS)
-        self.assertEqual(serve_options.serve_argv(defaults), [])
-        self.assertEqual(serve_options.serve_environment(defaults), {})
 
     def test_the_launcher_imports_only_the_standard_library(self):
         """The launcher runs before the environment it sets up exists: it,

@@ -186,11 +186,12 @@ class ServerMainTests(unittest.TestCase):
                     status.call_args_list,
                 )
 
-    def main_starting(self, args, runtime, tokenizer=None):
-        """main() over a runtime stand-in, its prints captured: its patches."""
+    def main_starting(self, args, runtime, tokenizer=None, family="Qwen3.8-27B"):
+        """main() over a runtime stand-in, serving a model of `family`, its
+        prints captured: its patches."""
         return (
             mock.patch.object(api, "parse_args", return_value=args),
-            unprepared_hold(),
+            unprepared_hold(family),
             mock.patch.object(api, "load_thinking_key", return_value=None),
             mock.patch.object(
                 api.AutoTokenizer, "from_pretrained", return_value=tokenizer or object()
@@ -448,6 +449,38 @@ class ServerMainTests(unittest.TestCase):
                 self.assertIn(
                     f"error: {failure['message']}", stderr.read_text().splitlines()
                 )
+
+    def test_an_effort_for_every_request_needs_a_model_that_takes_one(self):
+        """--reasoning-effort stops the start of a model that decides itself
+        whether to reason, before its tokenizer loads, as a refusal of the
+        command line; the frontend of a model that takes an effort gets it."""
+        record = Path(self.enterContext(tempfile.TemporaryDirectory())) / "s.json"
+        args = main_args(serve_record=record, reasoning_effort="none")
+        with contextlib.ExitStack() as stack:
+            for patch in self.main_starting(args, mock.Mock(), family="Flint"):
+                stack.enter_context(patch)
+            status = stack.enter_context(mock.patch.object(api, "print_status"))
+            with self.assertRaises(SystemExit):
+                api.main()
+            api.AutoTokenizer.from_pretrained.assert_not_called()
+        message = (
+            "--reasoning-effort cannot set how test-model reasons: a Flint model "
+            "decides each turn whether to reason, whatever effort its prompt names"
+        )
+        status.assert_any_call(f"Error · {message}", error=True)
+        self.assertEqual(
+            json.loads(record.read_text())["failure"],
+            {"kind": "configuration", "message": message},
+        )
+        runtime = mock.Mock()
+        runtime.capabilities = engine_ready(131072)
+        with contextlib.ExitStack() as stack:
+            for patch in self.main_starting(args, runtime):
+                stack.enter_context(patch)
+            stack.enter_context(mock.patch.object(api, "check_capabilities"))
+            stack.enter_context(mock.patch.object(api, "print_status"))
+            api.main()
+            self.assertEqual(api.Frontend.call_args.kwargs["reasoning_effort"], "none")
 
     def test_a_port_the_server_cannot_bind_is_recorded_as_the_port(self):
         record = Path(self.enterContext(tempfile.TemporaryDirectory())) / "s.json"

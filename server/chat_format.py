@@ -19,8 +19,8 @@ THINK_START = "<think>"
 THINK_END = "</think>"
 TOOL_CALL_OPEN = "<tool_call>"
 TOOL_CALL_CLOSE = "</tool_call>"
-# The reasoning efforts a request or --default-reasoning-effort may name,
-# least first.
+# The reasoning efforts a request, --reasoning-effort or
+# --default-reasoning-effort may name, least first.
 REASONING_EFFORTS = ("none", "minimal", "low", "medium", "high", "xhigh", "max")
 
 
