@@ -129,6 +129,37 @@ class ServerRecoveryTests(HarnessTestCase):
                 self.assertEqual(runtime.startup_calls, 1)
                 self.assertEqual(runtime.requests, [])
 
+    def test_the_server_hears_a_relaunch_load_and_serve(self):
+        """Once an engine that served fails, the backend tells the server
+        that it loads until the relaunch serves, as the serve record follows
+        it; a relaunch that stops relaunching tells it nothing more, the
+        server recording why it stopped."""
+        runtime = RecoveringRuntime()
+        backend = self.backend(runtime)
+        heard = []
+        backend.on_serving = heard.append
+        backend.on_stopped = stopped = mock.Mock()
+        with mock.patch.object(backend_api, "print_status"):
+            runtime.fail(backend, served=3600.0)
+            self.assertEqual(heard, [False])
+            self.relaunched(runtime, backend)
+            self.assertEqual(heard, [False, True])
+            runtime.outcomes.put(
+                engine_runtime.EngineStartFailed(
+                    wire.StartFailedEvent(
+                        wire.StartFailureKind.CONFIGURATION,
+                        wire.ShortfallBound.DEVICE_MEMORY,
+                        0,
+                        0,
+                        0,
+                        b"--kv-format bf16 is refused",
+                    )
+                )
+            )
+            runtime.fail(backend, served=3600.0)
+            self.wait_until(lambda: stopped.called)
+        self.assertEqual(heard, [False, True, False])
+
     def test_the_sixth_fast_failure_in_a_row_stops(self):
         """Short-lived failures in a row double the backoff, and the sixth,
         whose wait would have reached the cap, stops the relaunches: requests

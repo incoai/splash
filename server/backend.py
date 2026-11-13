@@ -372,6 +372,11 @@ class NativeBackend:
         # Called once relaunching has stopped for good, with stop_reason,
         # without the lock: the server then exits (server.main).
         self.on_stopped: Callable[[str], None] | None = None
+        # Called under the lock with False once an engine that served has
+        # failed and its relaunch is owed, and with True once the relaunched
+        # engine serves: the serve record follows it (server.main). It must
+        # not block or call the backend.
+        self.on_serving: Callable[[bool], None] | None = None
         # Why the engine cannot serve: its failure, the last failed restart or
         # why restarts stopped.
         self.engine_error = None
@@ -414,6 +419,8 @@ class NativeBackend:
                 self._stop_restarting_locked(self._stop_message(failure))
             else:
                 self.restart_due = time.monotonic() + delay
+                if self.on_serving is not None:
+                    self.on_serving(False)
             stopped = self.stop_reason
             self._ensure_recovery_locked()
         print_status(f"{event} · {failure.message}", error=True)
@@ -560,7 +567,7 @@ class NativeBackend:
         try:
             # It returns once the engine is Ready. The failure listener counts
             # a failure after Ready, even one before wait_ready returns.
-            self.runtime.wait_ready()
+            serves = self.runtime.wait_ready()
         except Exception as error:
             self._failed(
                 "Engine restart failed",
@@ -579,6 +586,8 @@ class NativeBackend:
             # A failure after Ready may already owe the next relaunch.
             if self.restart_due == due:
                 self.restart_due = None
+                if serves and self.on_serving is not None:
+                    self.on_serving(True)
             self.refresh_due = True
 
     def _recovery_retry_after_locked(self):

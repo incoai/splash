@@ -488,6 +488,73 @@ class ServerMainTests(unittest.TestCase):
             api.main()
         self.assertEqual(phases, [(True, {"pid": 4242, "phase": "ready"})])
 
+    def test_the_record_says_loading_while_a_failed_engine_relaunches(self):
+        """Once ready, the record follows the engine: loading from a failure
+        until the relaunched engine serves, then ready again, the same pid,
+        so that what supervises the server from its record, not /status,
+        sees the relaunch load a whole model (it said ready throughout)."""
+        keep_stop_signals(self)
+        record = Path(self.enterContext(tempfile.TemporaryDirectory())) / "s.json"
+        runtime = FakeRuntime()
+        seen = []
+
+        def phase():
+            return json.loads(record.read_text())
+
+        def wait_ready(timeout=None):
+            # The first start's, then the relaunch's, as it loads.
+            if runtime.wait_ready.call_count > 1:
+                seen.append(phase())
+            return True
+
+        runtime.wait_ready = mock.Mock(side_effect=wait_ready)
+        server = mock.Mock(server_port=8000)
+
+        def serve():
+            seen.append(phase())
+            runtime.on_engine_failure(
+                api.engine_runtime.EngineUnhealthy("native protocol reached EOF"),
+                3600.0,
+                frozenset(),
+                lambda: None,
+            )
+            deadline = time.monotonic() + 5
+            while len(seen) < 2 or phase()["phase"] != "ready":
+                self.assertLess(time.monotonic(), deadline)
+                time.sleep(0.01)
+            seen.append(phase())
+
+        server.serve_forever.side_effect = serve
+        with (
+            mock.patch.object(
+                api, "parse_args", return_value=main_args(serve_record=record)
+            ),
+            unprepared_hold(),
+            mock.patch.object(api, "load_thinking_key", return_value=None),
+            mock.patch.object(api.AutoTokenizer, "from_pretrained"),
+            mock.patch.object(api, "validate_tokenizer"),
+            mock.patch.object(api, "ChatTemplates", **NO_THINKING_END),
+            mock.patch.object(
+                api.engine_runtime, "MultiplexedRuntime", return_value=runtime
+            ),
+            mock.patch.object(api, "check_capabilities"),
+            mock.patch.object(api, "ConstraintFactory"),
+            mock.patch.object(api, "Frontend"),
+            mock.patch.object(api, "FrontendServer", return_value=server),
+            mock.patch.object(api, "print_status"),
+            mock.patch.object(backend_api, "print_status"),
+        ):
+            api.main()
+        pid = os.getpid()
+        self.assertEqual(
+            seen,
+            [
+                {"pid": pid, "phase": "ready"},
+                {"pid": pid, "phase": "loading"},
+                {"pid": pid, "phase": "ready"},
+            ],
+        )
+
     def test_a_server_that_stops_restarting_its_engine_exits_saying_why(self):
         """A server whose engine fails past restarting stops as SIGTERM stops
         it, its engine closed, and exits with status 69 (EX_UNAVAILABLE), its
