@@ -215,6 +215,123 @@ extension ChatScreenTests {
 }
 
 extension ChatScreenTests {
+    /// What the composer held goes at once as its chat opens: from the first frame the window
+    /// draws once the server has taken a new chat's first message, nothing of the picture
+    /// attached, nor of the line that said why the server had refused the message before, is
+    /// left where the composer was, while the composer travels to the foot. On the travel's
+    /// animation they faded there, over the transcript, behind the composer moving away.
+    @Test func whatTheComposerHeldGoesAtOnceAsItsChatOpens() async throws {
+        let opening = try await Self.opening("splash-chat-held")
+        // The picture, by its blues, and the mark of the line that says why, by its yellow, however
+        // faint: nothing else there, the composer's ground, its edge or the window's, has a tint.
+        func left(_ picture: NSBitmapImageRep) -> (picture: Int, mark: Int) {
+            let color = Self.colors(of: picture)
+            var blue = 0, yellow = 0
+            for y in 0..<picture.pixelsHigh {
+                for x in 0..<picture.pixelsWide {
+                    let (r, _, b) = color(x, y)
+                    if b - r > 0.08 { blue += 1 }
+                    if r - b > 0.08 { yellow += 1 }
+                }
+            }
+            return (blue, yellow)
+        }
+        let before = left(opening.before.held)
+        #expect(before.picture > 1000 && before.mark > 20, "the picture and the line's mark, before: \(before)")
+        let frames = opening.drawn.map { (ms: $0.ms, left: left($0.held)) }
+        #expect(frames.allSatisfy { $0.left == (0, 0) }, "pixels of them left where the composer was, per frame: \(frames)")
+        #expect(opening.drawn.prefix { $0.ms <= 100 }.count >= 4, "frames within 100 ms of the first: \(opening.drawn.map(\.ms))")
+        #expect(opening.drawn.last.map { $0.field < opening.field.minY - 100 } == true, "the composer travelled to the foot")
+    }
+
+    /// What a window draws as the server takes a new chat's first message, where the change
+    /// shows apart from the composer's travel: over the composer's text at its start, where the
+    /// picture attached and the line that says why are, and in the toolbar from the Chat's switch
+    /// to past the title at its widest, where the chat's title comes (`toolbarPart`).
+    struct Parts {
+        let held: NSBitmapImageRep
+        let toolbar: NSBitmapImageRep
+    }
+
+    /// The toolbar from the Chat's switch, where the toolbar first puts a title, to past the
+    /// title at its widest, 360 points from the sidebar's divider, in the window's points from its
+    /// top left.
+    static let toolbarPart = CGRect(x: 150, y: 0, width: sidebarWidth - 150 + 420, height: 52)
+
+    /// A window on a new chat whose first message, a text of several lines with a picture and a
+    /// PDF, the server refused, so that the composer says why, and what it draws as the server
+    /// takes the message sent again: its parts before, each frame of them from the first the
+    /// window draws of the chat, some 0, 25, 50, 75, 100, 150, 240 and 480 ms after, with how long
+    /// after it was and how high the composer's text is by then, and its parts once still, the
+    /// reply waiting.
+    struct Opening {
+        let before: Parts
+        /// Where the composer's text was before.
+        let field: CGRect
+        var drawn: [(ms: Int, held: NSBitmapImageRep, toolbar: NSBitmapImageRep, field: CGFloat)] = []
+        var still: Parts
+    }
+
+    static func opening(_ name: String) async throws -> Opening {
+        let fake = try FakeRuntime(name, launcher: "chat_server")
+        defer { try? FileManager.default.removeItem(at: fake.root) }
+        let state = try await chatting(fake)
+        defer { state.quit() }
+        let window = await Snapshot.window(MainView().environment(state), size: FirstMessagePictures.size, appearance: .aqua)
+        defer { window.orderOut(nil) }
+        state.draft.text = FirstMessagePictures.draft
+        state.draft.attach([try #require(NSImage(data: Showcase.picture))])
+        state.draft.attach(pdfs: [try Showcase.pdf(pages: 12, at: fake.root.appending(path: "documents/Kyoto itinerary.pdf"))])
+        try await waitFor(state.draft.attachments.count == 2, "the attachments")
+        let refuse = fake.root.appending(path: "refuse"), wait = fake.root.appending(path: "wait")
+        FileManager.default.createFile(atPath: refuse.path, contents: nil)
+        state.sendDraft()
+        try await waitFor(state.chats.streaming == nil && state.draft.notice != nil, "the refusal")
+        try FileManager.default.removeItem(at: refuse)
+        // The reply waits, so that the frames are of the chat opening alone.
+        FileManager.default.createFile(atPath: wait.path, contents: nil)
+        defer { try? FileManager.default.removeItem(at: wait) }
+        pump(0.5)
+        let field = try field(in: window), size = window.frame.size
+        // In the window's points from its top left: 110 points over the text, 64 from its start,
+        // short of the transcript's messages.
+        let held = CGRect(x: field.minX - 2, y: size.height - field.maxY - 110, width: 64, height: 110)
+        let toolbar = toolbarPart
+        /// The window's `rect` as it draws now. Each part alone, as drawing the whole window
+        /// takes some 70 ms, longer than the frames are apart.
+        func picture(_ rect: CGRect) throws -> NSBitmapImageRep {
+            let frame = try #require(window.contentView?.superview)
+            let area = frame.convert(CGRect(x: rect.minX, y: size.height - rect.maxY, width: rect.width, height: rect.height), from: nil)
+            let bitmap = try #require(frame.bitmapImageRepForCachingDisplay(in: area))
+            frame.cacheDisplay(in: area, to: bitmap)
+            return bitmap
+        }
+        func parts() throws -> Parts { Parts(held: try picture(held), toolbar: try picture(toolbar)) }
+        var opening = Opening(before: try parts(), field: field, still: try parts())
+        state.sendDraft()
+        // The server takes the message in a turn of the app's own on the main actor; the window
+        // draws nothing of it until the frames.
+        try await waitFor(state.chats.selection != nil, "the server to take the message")
+        let start = ContinuousClock.now
+        for ms in [0, 25, 50, 75, 100, 150, 240, 480] {
+            while ContinuousClock.now < start + .milliseconds(ms) { pump(0.005) }
+            // What the window's own views queue for the main actor, as the title's place.
+            await Task.yield()
+            let elapsed = (ContinuousClock.now - start).components
+            let drawn = try parts()
+            opening.drawn.append((Int(elapsed.seconds) * 1000 + Int(elapsed.attoseconds / 1_000_000_000_000_000), drawn.held, drawn.toolbar,
+                                  try Self.field(in: window).minY))
+        }
+        for _ in 0..<10 {
+            pump(0.1)
+            await Task.yield()
+        }
+        opening.still = try parts()
+        return opening
+    }
+}
+
+extension ChatScreenTests {
     /// An app on `fake`, a `chat_server`, with a model running and chats of several days in its
     /// list, one pinned, its window to open on a new chat.
     static func chatting(_ fake: FakeRuntime) async throws -> AppState {
