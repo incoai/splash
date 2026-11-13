@@ -3,7 +3,6 @@ handler; each API's handlers, request conversion and answers live in its
 module in dialects/."""
 
 import argparse
-import contextlib
 import errno
 import json
 import math
@@ -15,8 +14,6 @@ import secrets
 import select
 import signal
 import socket
-import socketserver
-import stat
 import sys
 import threading
 import time
@@ -32,7 +29,7 @@ from transformers import AutoTokenizer
 from install import assembly
 from install.models import ModelError
 
-from . import dialects, json_codec, serve_options, serve_record
+from . import dialects, json_codec, serve_options, serve_record, unix_socket
 from . import runtime as engine_runtime
 from .backend import (
     NativeBackend,
@@ -240,6 +237,8 @@ class FrontendHandler(BaseHTTPRequestHandler):
         # The native job submitted last, which a failure cancels.
         self._submitted = None
         self._last_sse_write = time.monotonic()
+        # A UNIX socket's peer is a process on this Mac, whose end closes the
+        # connection, and macOS refuses the TCP options on one.
         keepalive = (
             () if self.request.family == socket.AF_UNIX else TCP_KEEPALIVE_OPTIONS
         )
@@ -1033,20 +1032,6 @@ def path_errors(path):
     return OPENAI_ERRORS
 
 
-def _remove_stale_socket(path):
-    """Unlink a socket at `path` that nothing listens on; a live one stays and
-    the bind then fails."""
-    try:
-        if not stat.S_ISSOCK(os.lstat(path).st_mode):
-            return
-    except FileNotFoundError:
-        return
-    with socket.socket(socket.AF_UNIX) as probe:
-        if probe.connect_ex(path) == 0:
-            return
-    os.unlink(path)
-
-
 class FrontendServer(HTTPServer):
     allow_reuse_address = True
     # Connections the kernel holds until the accept loop takes them. A burst
@@ -1089,7 +1074,7 @@ class FrontendServer(HTTPServer):
         )
         self.api_key = api_key
         self.webui = webui
-        path = serve_options.unix_path(address[0])
+        path = unix_socket.path(address[0])
         bound = () if path is not None else (address[0],)
         self.allowed_hosts = {
             host.lower().rstrip(".")
@@ -1099,6 +1084,8 @@ class FrontendServer(HTTPServer):
         if path is not None:
             self.address_family = socket.AF_UNIX
             address = path
+        # A UNIX socket's hold on its path, from its bind until it closes.
+        self._claim = None
         # As serve_options.parse_allowed_origin returns them.
         self.allowed_origins = frozenset(allowed_origins)
         self.refused_origins = RefusedOriginLog()
@@ -1122,7 +1109,7 @@ class FrontendServer(HTTPServer):
             "pid": os.getpid(),
             "model": self.app.model,
             "host": self.host,
-            "port": None if self.address_family == socket.AF_UNIX else self.server_port,
+            "port": self.server_port,
             "started_at": self.started_at,
         }
         status["http"] = {
@@ -1137,17 +1124,19 @@ class FrontendServer(HTTPServer):
 
     @property
     def host(self):
+        """Where it listens, as --host names it: the address it bound, or a
+        UNIX socket's unix:PATH."""
         if self.address_family == socket.AF_UNIX:
-            return serve_options.UNIX_PREFIX + self.server_address
+            return unix_socket.PREFIX + self.server_address
         return self.server_address[0]
 
     def server_bind(self):
         if self.address_family != socket.AF_UNIX:
             return super().server_bind()
-        _remove_stale_socket(self.server_address)
-        socketserver.TCPServer.server_bind(self)
-        self.server_name = "localhost"
-        self.server_port = 0
+        self._claim = unix_socket.Claim(self.server_address)
+        self._claim.bind(self.socket)
+        # A UNIX socket has no port, which /status reports as none.
+        self.server_port = None
 
     def server_activate(self):
         super().server_activate()
@@ -1200,9 +1189,8 @@ class FrontendServer(HTTPServer):
 
     def server_close(self):
         super().server_close()
-        if self.address_family == socket.AF_UNIX:
-            with contextlib.suppress(OSError):
-                os.unlink(self.server_address)
+        if self._claim is not None:
+            self._claim.close()
         self.connections.stop()
         self.connections.idle.wait(min(2.0, HTTP_IO_TIMEOUT))
 

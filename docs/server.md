@@ -195,11 +195,25 @@ web pages that rebind a DNS name to this address. The chat page works over plain
 HTTP from another machine too.
 
 `--host unix:PATH` listens on a UNIX socket at `PATH` instead of a TCP port, so
-the socket's file permissions decide who connects; `--port` still names the
-server's lock and record. The server replaces a socket left behind by one that
-exited, refuses to start beside a live one, and removes its socket when it
-stops. Clients connect with, e.g., `curl --unix-socket PATH http://localhost/health`,
-and the Host check applies as it does over TCP.
+the server needs no IP networking and file permissions decide who connects: a
+client needs write permission on the socket, which is created under the
+server's umask, and search permission on its directory. A relative `PATH` is
+taken from the directory the server starts in. One server serves a path: it
+holds a lock, `PATH.lock` beside the socket, from before it binds until it has
+removed the socket as it stops. A second server at the path is therefore
+refused, also while the first still loads its model, and the socket a killed
+server left behind is replaced by the next start; a socket another program
+listens on and a file of another kind stay, and the start is refused. `--port`
+names the server's lock and record, `serve-PORT.lock` and `serve-PORT.json` in
+the runtime directory, as it does for every `--host`, so two socket servers
+take two ports though neither listens on one; `/status` reports
+`instance.host` as `unix:PATH` and `instance.port` as null. Clients connect
+with, e.g., `curl --unix-socket PATH http://localhost/health`, and the Host
+check applies as it does over TCP: a request names the server `localhost`, a
+loopback address or an `--allowed-host` name. The agent commands and the
+desktop app reach a server at `127.0.0.1:PORT` alone: for one on a socket,
+forward a loopback TCP port to the socket and give them that port, whose
+`Host: 127.0.0.1:PORT` the relay passes on and the check accepts.
 
 Set `SPLASH_API_KEY` in the server and agent shells to require authentication;
 `serve --api-key KEY` overrides the server's environment value. Every request

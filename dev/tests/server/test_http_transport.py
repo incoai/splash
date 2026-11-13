@@ -1,4 +1,5 @@
 import concurrent.futures
+import errno
 import http.client
 import json
 import os
@@ -9,6 +10,7 @@ import tempfile
 import threading
 import time
 import unittest
+from pathlib import Path
 from unittest import mock
 
 from dev.tests.server_fixtures import (
@@ -946,6 +948,55 @@ class UnixSocketTests(HarnessTestCase):
         self.assertEqual(self.get("/health")[0], 200)
         with self.assertRaises(OSError):
             api.FrontendServer((f"unix:{self.path}", 0), None)
+
+    def test_a_start_refused_at_a_served_path_leaves_its_server_serving(self):
+        """A second server at a path one serves is refused as at an address
+        in use, and the first goes on answering there (the refused one
+        removed the socket as it closed, and the first answered no more)."""
+        self.harness(FakeRuntime(), host=f"unix:{self.path}")
+        with self.assertRaises(OSError) as refused:
+            api.FrontendServer((f"unix:{self.path}", 0), None)
+        self.assertEqual(refused.exception.errno, errno.EADDRINUSE)
+        self.assertEqual(self.get("/health")[0], 200)
+
+    def test_a_server_that_has_not_listened_yet_keeps_its_path(self):
+        """A server binds before its model loads and listens after: a second
+        one started meanwhile is refused, though the first's socket refuses a
+        connection as a leftover does (it took the path, and the first
+        listened on a socket no client could reach)."""
+        first = api.FrontendServer(
+            (f"unix:{self.path}", 0), None, bind_and_activate=False
+        )
+        self.addCleanup(first.server_close)
+        first.server_bind()
+        bound = os.lstat(self.path).st_ino
+        second = api.FrontendServer(
+            (f"unix:{self.path}", 0), None, bind_and_activate=False
+        )
+        with self.assertRaises(OSError):
+            second.server_bind()
+        second.server_close()
+        self.assertEqual(os.lstat(self.path).st_ino, bound)
+        # Once the first has closed, the path is the next server's.
+        first.server_close()
+        self.harness(FakeRuntime(), host=f"unix:{self.path}")
+        self.assertEqual(self.get("/health")[0], 200)
+
+    def test_only_a_socket_nothing_listens_on_is_replaced(self):
+        """A socket another program listens on and a file of another kind
+        stay where they are, and the start is refused."""
+        with socket.socket(socket.AF_UNIX) as listener:
+            listener.bind(self.path)
+            listener.listen()
+            with self.assertRaises(OSError):
+                api.FrontendServer((f"unix:{self.path}", 0), None)
+            with socket.socket(socket.AF_UNIX) as client:
+                client.connect(self.path)
+        os.unlink(self.path)
+        Path(self.path).write_text("kept")
+        with self.assertRaises(OSError):
+            api.FrontendServer((f"unix:{self.path}", 0), None)
+        self.assertEqual(Path(self.path).read_text(), "kept")
 
 
 if __name__ == "__main__":

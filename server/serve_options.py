@@ -32,7 +32,6 @@ DEFAULT_QUEUE_SIZE = 32
 # The port both commands serve on unless --port names another, or for the
 # launcher SPLASH_PORT does.
 DEFAULT_PORT = 8000
-UNIX_PREFIX = "unix:"
 _SIZE_UNITS = {
     unit + suffix: 1024**power
     for power, unit in enumerate(("K", "M", "G"), 1)
@@ -843,13 +842,6 @@ def check_serve_arguments(parser, args):
         )
     if args.cache_dir is not None and not args.persistent_cache:
         parser.error("--cache-dir needs --persistent-cache")
-
-
-def unix_path(host):
-    """The socket path of a --host of unix:PATH, else None."""
-    if host.startswith(UNIX_PREFIX):
-        return host[len(UNIX_PREFIX) :]
-    return None
 
 
 def serve_argv(args):
