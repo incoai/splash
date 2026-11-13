@@ -584,6 +584,40 @@ class QuotedTokenTests(unittest.TestCase):
                 len(job.prompt_tokens),
             )
 
+    def test_a_token_that_adjacent_text_parts_spell_together_is_quoted(self):
+        for family in self.each():
+            if not family.vision:
+                continue
+            boundary = family.chat_format.message_boundary
+
+            def body(*texts):
+                return {
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": [
+                                {
+                                    "type": "image_url",
+                                    "image_url": {"url": fixtures.png_data_url()},
+                                },
+                                *({"type": "text", "text": text} for text in texts),
+                            ],
+                        }
+                    ]
+                }
+
+            written = family.controls(family.tokens(body("It ends at ", WORD, ".")))
+            for cut in range(1, len(boundary)):
+                with self.subTest(cut=cut):
+                    split = body("It ends at " + boundary[:cut], boundary[cut:] + ".")
+                    self.assertEqual(
+                        family.text(split),
+                        family.text(body("It ends at ", WORD, ".")).replace(
+                            WORD, boundary
+                        ),
+                    )
+                    self.assertEqual(family.controls(family.tokens(split)), written)
+
     def test_a_template_must_write_one_pad_for_each_image(self):
         family = laid_out(
             "qwen38", QWEN, QWEN_SPECIAL, QWEN_TAGS, QWEN_SPLITS, nfc=True, vision=True
