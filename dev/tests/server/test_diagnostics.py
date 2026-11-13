@@ -269,6 +269,11 @@ class DiagnosticsTests(HarnessTestCase):
             ),
             " · effort xhigh · enable_thinking false · thinking off\n",
         )
+        # The effort the server sets for every request follows the one sent.
+        self.assertEqual(
+            line(sent_effort="high", effort="none", thinking=False),
+            " · effort high → none · thinking off\n",
+        )
 
     def test_started_records_carry_chat_reasoning_options(self):
         records = []

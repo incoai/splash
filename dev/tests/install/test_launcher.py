@@ -64,6 +64,7 @@ class LauncherTests(unittest.TestCase):
         for name in (
             "SPLASH_PORT",
             "SPLASH_API_KEY",
+            "SPLASH_REASONING_EFFORT",
             "SPLASH_DEFAULT_REASONING_EFFORT",
         ):
             os.environ.pop(name, None)
@@ -647,7 +648,8 @@ class LauncherTests(unittest.TestCase):
 
     def test_the_apps_launch_options_are_the_serve_options(self):
         # The desktop app offers every option of splash serve but those of one
-        # model and those it sets itself, from one table (LaunchOption.all,
+        # model, those it sets itself and the effort of every request, which
+        # it leaves to the command line, from one table (LaunchOption.all,
         # docs/package.md): a flag it keeps that serve no longer takes would
         # fail every start, and a new option would never show.
         with (
@@ -663,6 +665,8 @@ class LauncherTests(unittest.TestCase):
             "--revision",
             "--draft-model",
             "--mmproj",
+            "--chat-template-file",
+            "--reasoning-effort",
         }
         self.assertIn("--max-memory", flags)
         table = Path(launcher.__file__).resolve().parents[1] / (

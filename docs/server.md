@@ -183,9 +183,11 @@ paths for `--model-dir`, `--draft-model` and `--mmproj`.
 | `--cache-dir` | `~/Library/Caches/Splash/prefix-cache` | Where `--persistent-cache` keeps its files; needs `--persistent-cache`. |
 | `--served-model-name` | None | Additional model name the API accepts; repeatable. See [API model aliases](#api-model-aliases). |
 | `--announce-served-name` | Off | Report the first `--served-model-name` in responses; needs `--served-model-name`. |
+| `--reasoning-effort` | `SPLASH_REASONING_EFFORT` or each request's own | Effort of every Chat, Responses and Messages request, whatever the request asks; `none` turns thinking off. See [default reasoning effort](#default-reasoning-effort). |
 | `--default-reasoning-effort` | `SPLASH_DEFAULT_REASONING_EFFORT` or the template's | Effort of Chat and Responses requests that set none. See [default reasoning effort](#default-reasoning-effort). |
 | `--thinking-token-budget` | `SPLASH_THINKING_TOKEN_BUDGET` or none | Thinking tokens of a request that sets no budget. See [thinking token budget](#thinking-token-budget). |
 | `--thinking-end-text` | `SPLASH_THINKING_END_TEXT` or the template's close | Text that ends thinking where a budget runs out, `</think>` its last token; unset, the close the chat template writes after a reasoning. See [thinking token budget](#thinking-token-budget). |
+| `--chat-template-file` | The model's own | A Jinja chat template to render every request with, in place of the model's. See [custom chat templates](models.md#custom-chat-templates). |
 | `--max-request-size` | `128M` | Largest HTTP request body. See [request limits](api.md#request-limits-and-timeouts). |
 | `--max-image-pixels` | `4194304` | Maximum resized pixels per image. An image's vision scratch grows with its patches (pixels / 256), to about 600 MiB at the default. |
 | `--request-timeout` | None | Time a request may take from its arrival; a request's own `timeout` can only shorten it. |
@@ -1135,6 +1137,30 @@ reasoning, and any other reply is all answer
 splash serve --model mlx-community/Qwen3.8-27B-4bit --default-reasoning-effort none
 ```
 
+`--reasoning-effort` (or `SPLASH_REASONING_EFFORT`) sets the effort of every
+request instead, with the same values: each Chat, Responses and Messages
+request, `/apply-template` and token count renders as though it had sent that
+effort and nothing else of reasoning. The effort replaces the request's
+`reasoning_effort` or `reasoning.effort`, the effort of its Messages `thinking`
+and `output_config`, and an `enable_thinking` or `reasoning_effort` among its
+`chat_template_kwargs`; `none` turns thinking off for every request. It is for
+a server whose clients ask for thinking themselves: a Messages request's
+`thinking` outranks the default effort, so a coding agent that sends one on
+every turn thinks on every turn, whatever the default. A malformed field is
+refused with the 400 it gets without the option.
+
+```sh
+splash serve --model mlx-community/Qwen3.8-27B-4bit --reasoning-effort none
+```
+
+It leaves no request for a default effort to set, so the server refuses it
+together with `--default-reasoning-effort`, from either's flag or environment
+variable. A [thinking token budget](#thinking-token-budget), the server's or a
+request's own, still caps the thinking of a request that thinks: the effort
+says whether and how hard a request thinks, the budget for how long. A model
+that decides itself whether to reason takes no effort, so the server refuses to
+start one, such as Flint, with the option.
+
 `/v1/models` reports, as `reasoning`, what efforts do to the model's default
 template, rendered as at startup: `thinks`, whether a request without an effort
 reasons; `efforts`, the efforts besides `none` that the template renders, and
@@ -1143,20 +1169,25 @@ stands in for (`low`, `medium` and `xhigh` for Qwen3.8; none for Qwen3.6, whose
 template switches reasoning on and off alike at every effort); and `default`,
 the one of them a request without an effort renders like,
 `--default-reasoning-effort` in place of the template's (`xhigh` for `high` on
-Qwen3.8). For Flint, whose model decides, `thinks` is `null` and `efforts`
-empty.
+Qwen3.8). Where a request's effort decides nothing, `thinks` is `null` and
+`efforts` empty, so that a client offers none: for Flint, whose model decides,
+and under `--reasoning-effort`, where the server does, and `/status` names its
+effort as `reasoning_effort`.
 
 `/apply-template` uses the same default. Anthropic `thinking` keeps its protocol
 semantics (off when omitted) unless the request's `chat_template_kwargs` set
 `enable_thinking`; judgment endpoints always disable thinking. The
 built-in chat page offers Auto, the efforts `/v1/models` reports and Off, and
-no menu for a model that decides; it sends no effort unless the user picks one.
+no menu where `thinks` is `null`; it sends no effort unless the user picks one.
 
 The console's Started line names the request the engine took, by the id its
 Done, Cancelled or Error line names too, and shows how each chat request
-reasons: the effort it sent, or `absent` and the default it took, its
-`enable_thinking` when it set one, and whether it thinks, as in
-`Started · request 12 · input 2,473 · cached 0 · effort absent → low · thinking on`.
+reasons: the effort it sent, or `absent`; after an arrow, the effort it
+rendered with where the server gave it another, the default or the one
+`--reasoning-effort` sets; its `enable_thinking` when it set one that counted;
+and whether it thinks, as in
+`Started · request 12 · input 2,473 · cached 0 · effort absent → low · thinking on`
+or, under `--reasoning-effort none`, `effort high → none · thinking off`.
 
 A Chat or Messages request's `chat_template_kwargs` are passed to the template
 as variables and outrank the effort, and in Messages `thinking`, so

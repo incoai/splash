@@ -37,7 +37,7 @@ from .backend import (
     ThinkingEndError,
     thinking_end_tokens,
 )
-from .chat_templates import ChatTemplateError, ChatTemplates
+from .chat_templates import ChatTemplateError, ChatTemplates, read_template_file
 from .connections import ConnectionSlots, HttpAdmission, RequestBodyReservation
 from .constraints import (
     ConstraintFactory,
@@ -1297,6 +1297,10 @@ class ListenError(Exception):
     """The HTTP server cannot listen at its address."""
 
 
+class OptionError(Exception):
+    """An option the served model's family cannot follow."""
+
+
 def _start_failed(args, error, failure):
     """End a start that failed, saying why in the log and, for the app, in
     the launcher's serve record (serve_record)."""
@@ -1369,6 +1373,23 @@ def main():
                 f"{args.model} is not prepared as a model of a family this "
                 "release serves: prepare it again"
             )
+        if args.reasoning_effort is not None and not (
+            family.chat_format.reasoning_switch
+        ):
+            # No effort reaches a model that opens its reasoning itself, so
+            # the server cannot set every request's.
+            raise OptionError(
+                f"--reasoning-effort cannot set how {args.model} reasons: a "
+                f"{family.name} model decides each turn whether to reason, "
+                "whatever effort its prompt names"
+            )
+        # A file that cannot be read stops the start before the tokenizer
+        # loads; whether its template serves requests is found with the
+        # tokenizer (ChatTemplates).
+        custom = None
+        if args.chat_template_file is not None:
+            custom = read_template_file(args.chat_template_file)
+            print_status(f"Chat template file · {args.chat_template_file}")
         # A tokenizer the loader cannot read fails with whatever its parsers
         # raise, such as a KeyError for a tokenizer.json without added_tokens:
         # each is the model's.
@@ -1385,7 +1406,7 @@ def main():
         thinking_end = thinking_end_tokens(
             tokenizer, args.thinking_end_text, family.chat_format
         )
-        chat_templates = ChatTemplates(tokenizer)
+        chat_templates = ChatTemplates(tokenizer, override=custom)
         print_status(f"Chat template · {chat_templates.describe()}")
         # Unset, a budget ends thinking as the template closes it, so that the
         # next request renders that close back as the tokens the reply ended
@@ -1456,6 +1477,7 @@ def main():
             response_store=dialects.responses.ResponseStore(),
             served_model_names=args.served_model_name,
             announce_served_name=args.announce_served_name,
+            reasoning_effort=args.reasoning_effort,
             default_reasoning_effort=args.default_reasoning_effort,
             default_thinking_token_budget=args.thinking_token_budget,
         )
@@ -1480,6 +1502,10 @@ def main():
         _start_failed(args, error, serve_record.engine_failure(error.event, str(error)))
     except ListenError as error:
         _start_failed(args, error, serve_record.failure(serve_record.PORT, str(error)))
+    except OptionError as error:
+        _start_failed(
+            args, error, serve_record.failure(serve_record.CONFIGURATION, str(error))
+        )
     except (
         ModelError,
         ChatTemplateError,

@@ -77,9 +77,11 @@ class CacheInfo:
 @dataclass(frozen=True)
 class ReasoningRequest:
     """How a chat request asked to reason: the reasoning effort it sent, None
-    when absent; the effort its template rendered with, the server's default
-    for an absent one and None for the template's own; and its
-    chat_template_kwargs enable_thinking, None when unset."""
+    when absent; the effort its template rendered with, the server's own
+    where it sets every request's, else the server's default for an absent
+    one and None for the template's own; and its chat_template_kwargs
+    enable_thinking, None when unset or when the server's effort replaced
+    it."""
 
     sent: str | None
     effort: str | None

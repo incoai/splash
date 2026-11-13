@@ -521,6 +521,14 @@ reference a remote document, and cannot combine `unevaluatedProperties` with
 final output; it does not inject formatting instructions into the prompt.
 Clients should describe their output requirements in their own messages.
 
+The JSON is the answer's first token where no reasoning comes before it, so a
+small output limit is spent on the value; after reasoning, up to 64 whitespace
+characters may set it apart, as the template's blank line after `</think>`
+does. Between the value's own tokens the model may write up to 64 whitespace
+characters, which takes pretty printing 15 levels deep at four spaces;
+whitespace inside strings is content and unbounded. A required or named tool
+call starts the same way.
+
 ## Images and PDFs
 
 Images arrive inline as base64 `data:` URLs: Chat `image_url` parts, Responses
@@ -704,7 +712,8 @@ fields; additional fields may be added:
 | `maximum_context_tokens` | Declared context limit; available memory may limit admission |
 | `thermal_state` | The Mac's thermal state as macOS reports it: `nominal`, `fair`, `serious` or `critical`. As the Mac heats, its CPU and GPU clocks drop and prefill and decode slow down, on some Macs already at `fair`; readiness ignores it. The engine samples it twice a second and logs each change (`Thermal state: fair → serious`) |
 | `vision`, `input_modalities` | Whether image and PDF input is accepted; `false` and `["text"]` for a model serving without vision |
-| `reasoning_switch` | Whether a request's reasoning effort or `enable_thinking` turns the model's reasoning on and off ([default reasoning effort](server.md#default-reasoning-effort)): `true` for the Qwen families, `false` for Flint, whose model decides each turn |
+| `reasoning_switch` | Whether a request's reasoning effort or `enable_thinking` turns the model's reasoning on and off ([default reasoning effort](server.md#default-reasoning-effort)): `true` for the Qwen families, `false` for Flint, whose model decides each turn, and under `--reasoning-effort`, where the server sets every request's effort |
+| `reasoning_effort` | The effort `--reasoning-effort` gives every request, whatever it asks; `null` without the option |
 | `chat_template.later_system` | `native`, `patched` or `unsupported`: how system messages after the first render (per name for named templates) |
 | `transport.recovering`, `transport.stopped`, `transport.error` | The engine is restarting, or Splash stopped restarting it after a failure a restart would meet again, or after 6 failures in a row, and the server is exiting ([engine restarts](server.md#engine-restarts-and-sleep)); `error` names its failure, the last failed restart, or why restarts stopped |
 | `capabilities.max_context_tokens` | The context the server serves now: the latest engine's, which a restart whose plan holds less may lower until a later one regains it |

@@ -187,11 +187,12 @@ class ServerMainTests(unittest.TestCase):
                     status.call_args_list,
                 )
 
-    def main_starting(self, args, runtime, tokenizer=None):
-        """main() over a runtime stand-in, its prints captured: its patches."""
+    def main_starting(self, args, runtime, tokenizer=None, family="Qwen3.8-27B"):
+        """main() over a runtime stand-in, serving a model of `family`, its
+        prints captured: its patches."""
         return (
             mock.patch.object(api, "parse_args", return_value=args),
-            unprepared_hold(),
+            unprepared_hold(family),
             mock.patch.object(api, "load_thinking_key", return_value=None),
             mock.patch.object(
                 api.AutoTokenizer, "from_pretrained", return_value=tokenizer or object()
@@ -449,6 +450,38 @@ class ServerMainTests(unittest.TestCase):
                 self.assertIn(
                     f"error: {failure['message']}", stderr.read_text().splitlines()
                 )
+
+    def test_an_effort_for_every_request_needs_a_model_that_takes_one(self):
+        """--reasoning-effort stops the start of a model that decides itself
+        whether to reason, before its tokenizer loads, as a refusal of the
+        command line; the frontend of a model that takes an effort gets it."""
+        record = Path(self.enterContext(tempfile.TemporaryDirectory())) / "s.json"
+        args = main_args(serve_record=record, reasoning_effort="none")
+        with contextlib.ExitStack() as stack:
+            for patch in self.main_starting(args, mock.Mock(), family="Flint"):
+                stack.enter_context(patch)
+            status = stack.enter_context(mock.patch.object(api, "print_status"))
+            with self.assertRaises(SystemExit):
+                api.main()
+            api.AutoTokenizer.from_pretrained.assert_not_called()
+        message = (
+            "--reasoning-effort cannot set how test-model reasons: a Flint model "
+            "decides each turn whether to reason, whatever effort its prompt names"
+        )
+        status.assert_any_call(f"Error · {message}", error=True)
+        self.assertEqual(
+            json.loads(record.read_text())["failure"],
+            {"kind": "configuration", "message": message},
+        )
+        runtime = mock.Mock()
+        runtime.capabilities = engine_ready(131072)
+        with contextlib.ExitStack() as stack:
+            for patch in self.main_starting(args, runtime):
+                stack.enter_context(patch)
+            stack.enter_context(mock.patch.object(api, "check_capabilities"))
+            stack.enter_context(mock.patch.object(api, "print_status"))
+            api.main()
+            self.assertEqual(api.Frontend.call_args.kwargs["reasoning_effort"], "none")
 
     def test_a_port_the_server_cannot_bind_is_recorded_as_the_port(self):
         record = Path(self.enterContext(tempfile.TemporaryDirectory())) / "s.json"
@@ -1034,6 +1067,103 @@ class ServerMainTests(unittest.TestCase):
         server.server_close.assert_called_once_with()
         console_written()
         return stderr.getvalue()
+
+
+class CustomTemplateStartupTests(unittest.TestCase):
+    """main()'s custom chat template, the file --chat-template-file names,
+    read before the tokenizer and the engine."""
+
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name).resolve()
+
+    def template(self, name, data):
+        path = self.root / name
+        path.write_bytes(data)
+        return path
+
+    def start(self, args):
+        """main() on args up to serving: the ChatTemplates, tokenizer and
+        runtime types it called, and its status lines."""
+        runtime = mock.Mock()
+        runtime.capabilities = engine_ready(131072)
+        with (
+            mock.patch.object(api, "parse_args", return_value=args),
+            unprepared_hold(),
+            mock.patch.object(api, "load_thinking_key", return_value=None),
+            mock.patch.object(
+                api.AutoTokenizer, "from_pretrained", return_value=object()
+            ) as tokenizer,
+            mock.patch.object(api, "validate_tokenizer"),
+            mock.patch.object(api, "check_capabilities"),
+            mock.patch.object(api, "ChatTemplates", **NO_THINKING_END) as templates,
+            mock.patch.object(
+                api.engine_runtime, "MultiplexedRuntime", return_value=runtime
+            ) as runtime_type,
+            mock.patch.object(api, "NativeBackend"),
+            mock.patch.object(api, "ConstraintFactory"),
+            mock.patch.object(api, "Frontend"),
+            mock.patch.object(
+                api, "FrontendServer", return_value=mock.Mock(server_port=8000)
+            ),
+            mock.patch.object(api.signal, "signal"),
+            mock.patch.object(api, "print_status") as status,
+            contextlib.suppress(SystemExit),
+        ):
+            api.main()
+        return templates, tokenizer, runtime_type, status
+
+    def file_lines(self, status):
+        return [
+            entry.args[0]
+            for entry in status.call_args_list
+            if entry.args[0].startswith("Chat template file")
+        ]
+
+    def test_a_template_file_is_rendered_with(self):
+        data = b"{% for m in messages %}{{ m.content }}{% endfor %}\n"
+        path = self.template("custom template.jinja", data)
+        templates, tokenizer, _, status = self.start(main_args(chat_template_file=path))
+        templates.assert_called_once_with(
+            tokenizer.return_value, override=data.decode()
+        )
+        self.assertEqual(self.file_lines(status), [f"Chat template file · {path}"])
+        # Without one, the tokenizer's templates, and no line.
+        templates, tokenizer, _, status = self.start(main_args())
+        templates.assert_called_once_with(tokenizer.return_value, override=None)
+        self.assertEqual(self.file_lines(status), [])
+
+    def test_a_template_file_it_cannot_use_stops_startup_first(self):
+        # Before the tokenizer loads and the engine starts, and with no
+        # fallback to the model's own templates.
+        for name, path, refusal in (
+            (
+                "an absent file",
+                self.root / "absent.jinja",
+                "cannot read the chat template .*absent.jinja: No such file",
+            ),
+            (
+                "a directory",
+                self.root,
+                "cannot read the chat template .*: Is a directory",
+            ),
+            (
+                "a file that is not UTF-8",
+                self.template("bad.jinja", b"\xff"),
+                "bad.jinja is not UTF-8",
+            ),
+        ):
+            with self.subTest(name):
+                templates, tokenizer, runtime_type, status = self.start(
+                    main_args(chat_template_file=path)
+                )
+                self.assertRegex(
+                    status.call_args_list[-1].args[0], "^Error · .*" + refusal
+                )
+                tokenizer.assert_not_called()
+                templates.assert_not_called()
+                runtime_type.assert_not_called()
 
 
 if __name__ == "__main__":
