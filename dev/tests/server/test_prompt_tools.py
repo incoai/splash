@@ -5,7 +5,7 @@ import time
 import unittest
 from unittest import mock
 
-from tokenizers import Tokenizer, models, pre_tokenizers, processors
+from tokenizers import Tokenizer, models, pre_tokenizers, processors, trainers
 from transformers import PreTrainedTokenizerFast
 
 from dev.tests.server_fixtures import FOREVER, FakeRuntime, Harness, serve_context
@@ -73,30 +73,25 @@ class PromptToolsTests(unittest.TestCase):
         self.post("/apply-template", body)
 
     def setUp(self):
-        vocabulary = {
-            token: index
-            for index, token in enumerate(
-                [
-                    "[UNK]",
-                    "[BOS]",
-                    "[EOS]",
-                    "<think>",
-                    "</think>",
-                    "user",
-                    "assistant",
-                    "hello",
-                    "world",
-                ]
-            )
-        }
-        tokenizer = Tokenizer(models.WordLevel(vocabulary, unk_token="[UNK]"))
-        tokenizer.pre_tokenizer = pre_tokenizers.Whitespace()
+        # Byte-level BPE, as the served families' tokenizers are, with a BOS
+        # the tokenizer adds itself.
+        tokenizer = Tokenizer(models.BPE())
+        tokenizer.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=False)
+        tokenizer.train_from_iterator(
+            ["hello world user assistant"],
+            trainers.BpeTrainer(
+                vocab_size=300,
+                initial_alphabet=pre_tokenizers.ByteLevel.alphabet(),
+                show_progress=False,
+            ),
+        )
+        tokenizer.add_special_tokens(["[BOS]", "[EOS]"])
         tokenizer.post_processor = processors.TemplateProcessing(
-            single="[BOS] $A", special_tokens=[("[BOS]", 1)]
+            single="[BOS] $A",
+            special_tokens=[("[BOS]", tokenizer.token_to_id("[BOS]"))],
         )
         self.tokenizer = PreTrainedTokenizerFast(
             tokenizer_object=tokenizer,
-            unk_token="[UNK]",
             bos_token="[BOS]",
             eos_token="[EOS]",
             additional_special_tokens=["<think>", "</think>"],

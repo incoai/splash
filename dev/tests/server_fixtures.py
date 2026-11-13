@@ -250,6 +250,9 @@ class TemplateTokenizer(FakeTokenizer):
 class CharTokenizer(FakeTokenizer):
     """One token per character, so single-letter answer slots are exact."""
 
+    def __call__(self, text, **kwargs):
+        return {"input_ids": self.encode(text)}
+
     def encode(self, text, **kwargs):
         return [ord(char) for char in text]
 
@@ -261,21 +264,11 @@ class ImagePadTokenizer(FakeTokenizer):
     """Renders one image placeholder per image part like the pinned
     Qwen template, with pad id 50."""
 
-    # Stands for the template: rendering emits the source per image part,
-    # so the frontend's image render marker appears where it replaced it.
+    # Stands for the template: rendering emits the source per image part.
     chat_template = QWEN.image_pad
 
     def __call__(self, text, **kwargs):
-        count = text.count(QWEN.image_pad)
-        width = len(QWEN.image_pad)
-        return {
-            "input_ids": [101, *([50] * count), 102],
-            "offset_mapping": [
-                (0, 1),
-                *((1 + i * width, 1 + (i + 1) * width) for i in range(count)),
-                (len(text) - 1, len(text)),
-            ],
-        }
+        return {"input_ids": [101, *([50] * text.count(QWEN.image_pad)), 102]}
 
     def apply_chat_template(self, messages, **kwargs):
         self.templates.append((messages, kwargs))
