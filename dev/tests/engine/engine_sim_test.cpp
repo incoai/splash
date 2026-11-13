@@ -148,9 +148,10 @@ protocol::RequestFrame frame(uint64_t id, std::vector<uint32_t> tokens, uint32_t
   return result;
 }
 
-// Three workers' prompts: 59,043 tokens first and 12,200 more a round, the
+// Three workers' prompts: 59,043 tokens first and `step` more a round, the
 // workers a few tokens apart; every fourth round resends the previous
-// conversation and 8 tokens more. Output: 1504 tokens, whole commands.
+// conversation and 8 tokens more. Output: `output` tokens, 1504 whole
+// commands of them by default.
 struct ChurnPrompts final {
   uint32_t first = 59'043, step = 12'200;
   std::array<int32_t, 3> offsets{-23, 11, 0};
@@ -317,10 +318,11 @@ struct Serving final {
   protocol::peer::EventReader reader;
 };
 
-// Three closed-loop workers arriving in `order` 0.6 s apart, until
-// `endMilliseconds`; each step observed.
+// Three closed-loop workers sending `prompts`, arriving in `order` 0.6 s
+// apart, until `endMilliseconds`; each step observed.
 struct Churn final {
-  Churn(Serving &serving, std::array<uint32_t, 3> order) : serving(serving) {
+  Churn(Serving &serving, std::array<uint32_t, 3> order, const ChurnPrompts &prompts)
+      : serving(serving), prompts(prompts) {
     for (uint32_t rank = 0; rank < 3; ++rank)
       next[order[rank]] = serving.now() + 600.0 * rank;
   }
@@ -384,9 +386,17 @@ double decodeCommand(const test::TimingProfile &profile, uint32_t decoders, doub
 
 // --- Scenarios -----------------------------------------------------------------------------------------------
 
-// A 15-minute churn through a host episode short of critical pressure keeps
-// the store, turning it at most once a host level, with bounded gaps and waits.
-void testChurnKeepsTheStoreThroughAHostEpisode() {
+// What one churn through the host episode found: its checks' failures, and
+// its requests and longest decode gap against the run's bound.
+struct ChurnEpisode final {
+  std::string failures;
+  size_t finished = 0;
+  double longestGap = 0.0, gapLimit = 0.0;
+};
+
+// A 15-minute churn of `prompts` through a host episode short of critical
+// pressure.
+ChurnEpisode churnThroughAHostEpisode(const ChurnPrompts &prompts) {
   const Machine &machine = kStudio18G;
   constexpr double episode = 300'000.0, warningEnd = 420'000.0, release = 600'000.0, end = 900'000.0;
   constexpr double episodeEnd = release + 60'000.0;
@@ -397,7 +407,7 @@ void testChurnKeepsTheStoreThroughAHostEpisode() {
   Serving serving(machine, {{episode, episodeOther, engine::MemoryPressure::Warning},
                             {warningEnd, episodeOther, engine::MemoryPressure::Normal},
                             {release, machine.otherBytes, engine::MemoryPressure::Normal}});
-  Churn churn(serving, {2, 0, 1});
+  Churn churn(serving, {2, 0, 1}, prompts);
   uint64_t last = serving.experts->state().currentBytes;
   int direction = 0;
   std::map<int, uint32_t> turnsByLevel;  // per level of the host: 1 warning, 2 short, 3 the minute after
@@ -417,22 +427,71 @@ void testChurnKeepsTheStoreThroughAHostEpisode() {
     oldestClaim = std::max(oldestClaim, serving.memory().claims.oldestMilliseconds);
   });
   const engine::EngineSnapshot counts = serving.fixture.loop.statusSnapshot();
-  const double gapLimit = counts.scheduler.decodeGapTargetMilliseconds +
-                          decodeCommand(*machine.profile, 3, double(machine.store.floor) / machine.store.whole, 3);
-  const double longestGap = serving.fixture.loop.metricsSnapshot().decodeGap.maximumMilliseconds;
-  require(churn.finished.size() >= 6, at(machine) + "the churn finished " + std::to_string(churn.finished.size()) +
-                                          " requests in 15 minutes");
-  require(longestGap <= gapLimit, at(machine) + "a decode gap of " + std::to_string(longestGap) +
-                                      " ms passed the run's bound and a decode command, " + std::to_string(gapLimit) +
-                                      " ms");
-  require(oldestClaim < engine::kResourceWaitTimeoutMilliseconds && counts.failed == 0,
-          at(machine) + "a request waited " + std::to_string(oldestClaim) + " ms for memory, or failed");
+  ChurnEpisode result{.finished = churn.finished.size(),
+                      .longestGap = serving.fixture.loop.metricsSnapshot().decodeGap.maximumMilliseconds,
+                      .gapLimit = counts.scheduler.decodeGapTargetMilliseconds +
+                                  decodeCommand(*machine.profile, 3,
+                                                double(machine.store.floor) / machine.store.whole, 3)};
+  const auto check = [&](bool held, const std::string &failure) {
+    if (!held)
+      result.failures += "; " + failure;
+  };
+  check(result.finished >= 6, "the churn finished " + std::to_string(result.finished) + " requests in 15 minutes");
+  check(result.longestGap <= result.gapLimit, "a decode gap of " + std::to_string(result.longestGap) +
+                                                  " ms passed the run's bound and a decode command, " +
+                                                  std::to_string(result.gapLimit) + " ms");
+  check(oldestClaim < engine::kResourceWaitTimeoutMilliseconds && counts.failed == 0,
+        "a request waited " + std::to_string(oldestClaim) + " ms for memory, or failed");
   for (const auto &[level, turns] : turnsByLevel)
-    require(turns <= 1, at(machine) + "the store changed direction " + std::to_string(turns) +
-                            " times at one host level (" + std::to_string(level) + ")");
-  require(!episodeShrank, at(machine) + "the host's episode took a store unit short of critical pressure");
-  note(at(machine) + std::to_string(churn.finished.size()) + " requests, longest decode gap " +
-       std::to_string(longestGap) + " ms of " + std::to_string(gapLimit));
+    check(turns <= 1, "the store changed direction " + std::to_string(turns) + " times at one host level (" +
+                          std::to_string(level) + ")");
+  check(!episodeShrank, "the host's episode took a store unit short of critical pressure");
+  return result;
+}
+
+// The churn keeps the store, turning it at most once a host level, with
+// bounded gaps and waits, in its own workload and in those around it where a
+// lane meets the memory wall: its growth refused, or its conversion to
+// Spill. Its own workload meets no wall, so alone it held the gap bound,
+// which guards decode latency at the wall, nowhere near one: of the 45
+// workloads of rounds of 10,700 to 13,700 tokens and outputs of 904 to 2,404,
+// these 12 meet it, and in 5 a lane that converted right after a prefill
+// pass sat out that command, the next pass running first, a decode gap of
+// 1,068 ms. The 32 others stay below the wall, as its own does, and took
+// 175 s more of the 240 s all 45 take.
+void testChurnKeepsTheStoreThroughAHostEpisode() {
+  const Machine &machine = kStudio18G;
+  constexpr std::array<ChurnPrompts, 13> kWorkloads{{{.step = 10'700, .output = 1504},
+                                                     {.step = 11'200, .output = 1504},
+                                                     {.step = 11'200, .output = 1904},
+                                                     {.step = 11'200, .output = 2404},
+                                                     {.step = 11'600, .output = 1204},
+                                                     {.step = 11'600, .output = 1504},
+                                                     {.step = 11'900, .output = 1504},
+                                                     {.step = 11'900, .output = 2404},
+                                                     {.step = 12'200, .output = 1504},
+                                                     {.step = 12'200, .output = 2404},
+                                                     {.step = 12'500, .output = 1204},
+                                                     {.step = 12'800, .output = 1904},
+                                                     {.step = 13'200, .output = 1904}}};
+  std::string failures;
+  ChurnEpisode longest;
+  ChurnPrompts most;
+  for (const ChurnPrompts &prompts : kWorkloads) {
+    const ChurnEpisode run = churnThroughAHostEpisode(prompts);
+    if (!run.failures.empty())
+      failures += "\n  rounds of " + std::to_string(prompts.step) + " tokens, outputs of " +
+                  std::to_string(prompts.output) + run.failures;
+    if (run.longestGap > longest.longestGap) {
+      longest = run;
+      most = prompts;
+    }
+  }
+  require(failures.empty(), at(machine) + "the churn broke its bounds at" + failures);
+  note(at(machine) + std::to_string(kWorkloads.size()) + " workloads, the longest decode gap " +
+       std::to_string(longest.longestGap) + " ms of " + std::to_string(longest.gapLimit) + " in rounds of " +
+       std::to_string(most.step) + " tokens, outputs of " + std::to_string(most.output) + ", " +
+       std::to_string(longest.finished) + " requests");
 }
 
 // The engine harness running `profile`'s commands on its clock, a pass a
