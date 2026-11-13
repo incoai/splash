@@ -181,6 +181,7 @@ class Frontend:
         max_image_pixels=image_input.MAX_PIXELS,
         served_model_names=(),
         announce_served_name=False,
+        sampling_headers=False,
         default_reasoning_effort=None,
         default_thinking_token_budget=None,
         sampling_defaults=None,
@@ -212,6 +213,8 @@ class Frontend:
             raise ValueError("announce_served_name needs a served model name")
         # The name generation and scoring responses report.
         self.response_model = names[0] if announce_served_name else model
+        # Whether a request's sampling headers set its sampling fields.
+        self.sampling_headers = bool(sampling_headers)
         # /v1/models order: the name responses report first, so a client
         # configured from data[0] (splash <client>) requests the name it gets
         # back. Every name stays accepted.

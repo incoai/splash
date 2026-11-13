@@ -16,6 +16,10 @@ def post_messages(exchange, body, deadline):
     app = exchange.app
     streamed, flags = request_fields.generation(body)
     chat, omitted = to_chat_body(body, thinking_resolver=app.thinking_codec.decode)
+    if app.sampling_headers:
+        # The translation keeps only temperature, top_p and top_k, so the
+        # headers apply to the chat body it produces.
+        chat = request_fields.sampling_from_headers(exchange.headers, chat)
     job = app.prepare(
         chat,
         deadline=deadline,

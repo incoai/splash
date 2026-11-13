@@ -4,6 +4,7 @@ import hashlib
 
 from . import protocol as wire
 from .errors import APIError
+from .metrics import is_finite_number
 
 # The priority a request names, by its lowercase wire name.
 _PRIORITIES = {priority.name.lower(): priority for priority in wire.RequestPriority}
@@ -48,3 +49,30 @@ def cache_salt(body):
         salt.encode("utf-8", "surrogatepass"), digest_size=16, person=b"splash-salt"
     ).digest()
     return int.from_bytes(digest, "little")
+
+
+def sampling_from_headers(headers, body):
+    """Set in body, which is returned, the sampling fields that a request's
+    X-Temperature, X-Presence-Penalty and X-Repetition-Penalty headers name,
+    under --sampling-headers. Claude Code cannot put sampling fields in its
+    body: its only per-request channel is ANTHROPIC_CUSTOM_HEADERS, which adds
+    headers. The temperature header overrides the body; the penalties only
+    fill a body that has none. A value that does not parse, is NaN or is out
+    of range is ignored, so a header never fails a request."""
+    for header, name, accepts, overrides in (
+        ("X-Temperature", "temperature", lambda v: 0 < v <= 2, True),
+        ("X-Presence-Penalty", "presence_penalty", lambda v: -2 <= v <= 2, False),
+        ("X-Repetition-Penalty", "repetition_penalty", lambda v: 0 < v <= 3, False),
+    ):
+        value = headers.get(header)
+        if value is None:
+            continue
+        try:
+            number = float(str(value).strip())
+        except ValueError:
+            continue
+        if not is_finite_number(number) or not accepts(number):
+            continue
+        if overrides or name not in body:
+            body[name] = number
+    return body
