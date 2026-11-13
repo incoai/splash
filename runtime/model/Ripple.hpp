@@ -131,7 +131,7 @@ public:
                                                            QwenPrefillLayers layers, ops::AneFfn *aneFfn) override;
   void addVerify(metal::CommandGraph &graph, QwenTargetVerifyBuffers buffers, const kv::PageStorage &kv,
                  SpilledKvReads &spilled, std::span<const kv::ChunkedPrefillParams> chunks,
-                 uint32_t lanes, uint32_t blockRows) const override;
+                 uint32_t lanes, uint32_t blockRows, uint32_t verifiedRows) const override;
   void addHeadBatch(metal::CommandGraph &graph, metal::MetalBuffer hidden, metal::MetalBuffer finalHidden,
                     metal::MetalBuffer logits, uint32_t lanes, uint32_t rows,
                     ops::LinearScratch scratch) const override;

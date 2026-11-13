@@ -263,14 +263,15 @@ void DraftAttention::addContextCommit(
   if (persistentKeys.size() != kMaximumLanes ||
       persistentValues.size() != kMaximumLanes)
     throw std::invalid_argument("invalid draft context commit geometry");
-  // Each lane commits up to its eight verify rows.
-  requireContextInputs(contextKv, keyNorm, ropeCos, ropeSin,
-                       uint64_t{lanes} * SPLASH_TARGET_VERIFY_ROWS, shape);
+  // Each lane commits up to its block's rows.
   requireBytes(retainedCounts, uint64_t{lanes} * sizeof(uint32_t), "draft retained counts");
   for (uint32_t lane = 0; lane < lanes; ++lane) {
     requireBytes(persistentKeys[lane], ringBytes(shape), "draft key ring");
     requireBytes(persistentValues[lane], ringBytes(shape), "draft value ring");
   }
+  const uint32_t rows = draftVariant(shape).rows;
+  requireContextInputs(contextKv, keyNorm, ropeCos, ropeSin,
+                       uint64_t{lanes} * rows, shape);
   DraftContextBatchParams params{};
   std::copy(startPositions.begin(), startPositions.end(),
             std::begin(params.start_position));
@@ -282,8 +283,7 @@ void DraftAttention::addContextCommit(
   bindings.push_back(std::move(retainedCounts));
   graph.add(std::string("draft_context_kv_commit") + draftVariant(shape).suffix,
             std::move(bindings), params,
-            {uint64_t{lanes} * SPLASH_TARGET_VERIFY_ROWS * shape.kvHeads, 1,
-             1});
+            {uint64_t{lanes} * rows * shape.kvHeads, 1, 1});
 }
 
 uint64_t DraftAttention::contextWindowBytes(uint32_t width, uint32_t window) {

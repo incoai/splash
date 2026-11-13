@@ -503,7 +503,8 @@ public:
       metal::CommandGraph &graph, QwenTargetVerifyBuffers buffers,
       const kv::PageStorage &kv, SpilledKvReads &spilled,
       std::span<const kv::ChunkedPrefillParams> chunks,
-      uint32_t lanes, uint32_t blockRows = SPLASH_TARGET_VERIFY_ROWS) const = 0;
+      uint32_t lanes, uint32_t blockRows = SPLASH_TARGET_VERIFY_ROWS,
+      uint32_t verifiedRows = SPLASH_TARGET_VERIFY_ROWS) const = 0;
   // The head over `lanes` lanes of targetVerifyRows rows of the last layer's
   // output, as verify ends: one sweep of the vocabulary projection for every
   // lane.

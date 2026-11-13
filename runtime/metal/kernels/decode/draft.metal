@@ -112,7 +112,7 @@ inline void draft_qkv_prepare_phase(
   }
 }
 
-template <uint Window>
+template <uint Window, uint Rows>
 inline void draft_context_kv_commit_phase(
     device const bfloat *context_kv, device const bfloat *k_norm,
     device const float *rope_cos, device const float *rope_sin,
@@ -122,7 +122,6 @@ inline void draft_context_kv_commit_phase(
     device const uint *retained, constant DraftContextBatchParams &params,
     uint group, uint thread_index, uint lane, uint simd_group,
     threadgroup float *reductions, threadgroup bfloat *normalized) {
-  constexpr uint Rows = SPLASH_TARGET_VERIFY_ROWS;
   constexpr uint KVHeads = SPLASH_DRAFT_KV_HEADS;
   // A context row's keys and values (draft_context_kv_phase).
   constexpr uint RowWidth = 2 * KVHeads * SPLASH_DRAFT_HEAD_DIMENSION;
@@ -520,7 +519,7 @@ inline void draft_attention_reorder_phase(device const bfloat *grouped,
         group.x, thread_index, lane, simd_group);                              \
   }
 
-#define SPLASH_DRAFT_COMMIT_KERNEL(name, window)                               \
+#define SPLASH_DRAFT_COMMIT_KERNEL(name, window, rows)                         \
   kernel void name(                                                            \
       device const bfloat *context_kv [[buffer(0)]],                           \
       device const bfloat *k_norm [[buffer(1)]],                               \
@@ -540,7 +539,7 @@ inline void draft_attention_reorder_phase(device const bfloat *grouped,
       uint simd_group [[simdgroup_index_in_threadgroup]]) {                    \
     threadgroup float splash_reductions[8];                                   \
     threadgroup bfloat splash_normalized[SPLASH_DRAFT_HEAD_DIMENSION];         \
-    draft_context_kv_commit_phase<(window)>(                                   \
+    draft_context_kv_commit_phase<(window), (rows)>(                           \
         context_kv, k_norm, rope_cos, rope_sin, keys0, keys1, keys2, keys3,    \
         values0, values1, values2, values3, retained, params, group,           \
         thread_index, lane, simd_group, splash_reductions, splash_normalized); \
@@ -659,7 +658,8 @@ inline void draft_attention_reorder_phase(device const bfloat *grouped,
 // The shipped drafts' kernels.
 SPLASH_DRAFT_CONV_KERNEL(draft_conv, SPLASH_DRAFT_CONVOLUTION_TAPS, SPLASH_DRAFT_QUERY_ROWS)
 SPLASH_DRAFT_QKV_KERNEL(draft_attention_qkv, SPLASH_DRAFT_QUERY_HEADS, SPLASH_DRAFT_QUERY_ROWS)
-SPLASH_DRAFT_COMMIT_KERNEL(draft_context_kv_commit, SPLASH_DRAFT_SLIDING_WINDOW)
+SPLASH_DRAFT_COMMIT_KERNEL(draft_context_kv_commit, SPLASH_DRAFT_SLIDING_WINDOW,
+                           SPLASH_DRAFT_QUERY_ROWS)
 SPLASH_DRAFT_SPLIT_KERNEL(draft_attention_bf16_split, SPLASH_DRAFT_QUERY_HEADS,
                           SPLASH_DRAFT_QUERY_HEADS / SPLASH_DRAFT_KV_HEADS,
                           SPLASH_DRAFT_ATTENTION_SPLITS,
@@ -674,7 +674,7 @@ SPLASH_DRAFT_REORDER_KERNEL(draft_attention_reorder, SPLASH_DRAFT_QUERY_HEADS, S
 // threadgroups per KV head, 40 rows each).
 SPLASH_DRAFT_CONV_KERNEL(draft_conv_kv8_h2_d128_w4096_s8, 4, 16)
 SPLASH_DRAFT_QKV_KERNEL(draft_attention_qkv_kv8_h2_d128_w4096_s8, 80, 16)
-SPLASH_DRAFT_COMMIT_KERNEL(draft_context_kv_commit_kv8_h2_d128_w4096_s8, 4096)
+SPLASH_DRAFT_COMMIT_KERNEL(draft_context_kv_commit_kv8_h2_d128_w4096_s8, 4096, 16)
 SPLASH_DRAFT_SPLIT_KERNEL(draft_attention_bf16_split_kv8_h2_d128_w4096_s4, 80, 2,
                           4, 4096, 16)
 SPLASH_DRAFT_REDUCE_KERNEL(draft_attention_bf16_reduce_kv8_h2_d128_s4, 80, 2, 4, 16)

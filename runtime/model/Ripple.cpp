@@ -274,10 +274,13 @@ metal::MetalBuffer RippleTarget::addPrefillEnd(PrefillStep &step) const {
 
 void RippleTarget::addVerify(metal::CommandGraph &graph, QwenTargetVerifyBuffers buffers, const kv::PageStorage &kv,
                              SpilledKvReads &spilled, std::span<const kv::ChunkedPrefillParams> chunks,
-                             uint32_t lanes, uint32_t blockRows) const {
+                             uint32_t lanes, uint32_t blockRows, uint32_t verifiedRows) const {
   VerifyStep step = verifyStep(graph, buffers, kv, spilled, chunks, lanes);
   step.blockRows = blockRows;
   const bool wholeBlock = blockRows == SPLASH_TARGET_VERIFY_ROWS;
+  // The head always covers the whole block: its weight read is flat in rows,
+  // and a single-pass cycle's rows past the verified ones hold stale inputs
+  // the acceptance never reads.
   const uint32_t headRows = wholeBlock ? step.rows : lanes * blockRows;
   for (uint32_t index = 0; index < geometry_.layers; ++index) {
     const RippleLayerWeights &layer = weights_.layers[index];
@@ -305,7 +308,7 @@ void RippleTarget::addVerify(metal::CommandGraph &graph, QwenTargetVerifyBuffers
     ops::RowCopy::add(step.graph, buffers.hidden[geometry_.layers & 1], {0, geometry_.hiddenSize, 0},
                       buffers.headInput, {step.rowBase, geometry_.hiddenSize, 0}, step.rows,
                       geometry_.hiddenSize, {SPLASH_TARGET_VERIFY_ROWS, blockRows});
-  if (chunks.front().row_base + SPLASH_TARGET_VERIFY_ROWS >= blockRows)
+  if (chunks.front().row_base + SPLASH_TARGET_VERIFY_ROWS >= verifiedRows)
     addHeadBatch(step.graph, wholeBlock ? buffers.hidden[geometry_.layers & 1] : buffers.headInput,
                  buffers.finalHidden, buffers.logits, step.lanes, headRows, buffers.linearScratch);
 }

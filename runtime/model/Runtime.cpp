@@ -2202,7 +2202,7 @@ struct Runtime::Impl {
   void encodeTargetVerifyBatchForward(CommandGraph &graph,
                                       std::span<Request *const> entries,
                                       std::span<const ModelBatchItem> items, SpilledKvReads &reads,
-                                      uint32_t blockRows, uint32_t rowBase) {
+                                      uint32_t blockRows, uint32_t rowBase, uint32_t verifiedRows) {
     if (entries.empty() || entries.size() > kLaneCount ||
         entries.size() != items.size()) {
       throw std::invalid_argument("invalid target verify batch");
@@ -2299,7 +2299,7 @@ struct Runtime::Impl {
     }
     buffers.headInput = decodeArena->batchSlice(DecodeTensor::HeadInput, storage);
     targetModel->addVerify(graph, std::move(buffers), kvPages, reads,
-                          std::span(chunks).first(lanes), lanes, blockRows);
+                          std::span(chunks).first(lanes), lanes, blockRows, verifiedRows);
   }
 
   // The verify's sub-passes: each gathers its rows' embeddings from the
@@ -2311,10 +2311,11 @@ struct Runtime::Impl {
                                 std::span<const ModelBatchItem> items, SpilledKvReads &reads,
                                 uint32_t lanes) {
     const uint32_t blockRows = states.layout().draft.rows;
+    // The passes follow the cycle's row cap: a cap at the first sub-pass's
+    // rows verifies one pass, whose lanes' verify rows cannot exceed it.
+    const uint32_t cap = verifyBudget ? verifyBudget->rowCap(lanes, blockRows) : blockRows;
     const uint32_t passes =
-        blockRows > SPLASH_TARGET_VERIFY_ROWS
-            ? blockRows / SPLASH_TARGET_VERIFY_ROWS
-            : 1;
+        cap > SPLASH_TARGET_VERIFY_ROWS ? blockRows / SPLASH_TARGET_VERIFY_ROWS : 1;
     for (uint32_t pass = 0; pass < passes; ++pass) {
       const uint32_t rowBase = pass * SPLASH_TARGET_VERIFY_ROWS;
       targetModel->addEmbedding(
@@ -2335,7 +2336,8 @@ struct Runtime::Impl {
                     decodeArena->batchSlice(DecodeTensor::RopeSin, lanes),
                     decodeArena->batchSlice(DecodeTensor::DraftRopeCos, lanes),
                     decodeArena->batchSlice(DecodeTensor::DraftRopeSin, lanes));
-      encodeTargetVerifyBatchForward(graph, entries, items, reads, blockRows, rowBase);
+      encodeTargetVerifyBatchForward(graph, entries, items, reads, blockRows, rowBase,
+                                     cap);
     }
   }
 
@@ -2537,6 +2539,8 @@ struct Runtime::Impl {
       }
       verifyBudget->observe(std::span(observed).first(items.size()), constrained,
                             timing.wallSeconds * 1000.0);
+      for (uint32_t lane = 0; lane < items.size(); ++lane)
+        verifyBudget->observeAccepted(lanes[lane].accepted);
     }
     if (std::getenv("SPLASH_DEBUG_ACCEPTANCE") != nullptr) {
       static std::atomic<uint64_t> cycle{0};
@@ -3361,8 +3365,10 @@ Runtime::decodeAsync(const BatchPlan &plan,
     Impl::DecodeLaneResult &laneResult = lanes[lane];
     laneResult.request = &entry;
     laneResult.currentAnchor = *entry.pendingToken;
-    laneResult.maximumRetained =
-        std::min(remaining, impl_->states.layout().draft.rows);
+    const uint32_t rowCap = impl_->verifyBudget
+                                ? impl_->verifyBudget->rowCap(lanes.size(), impl_->states.layout().draft.rows)
+                                : impl_->states.layout().draft.rows;
+    laneResult.maximumRetained = std::min(remaining, rowCap);
     if (const auto cutoff = Impl::samplingPolicy(entry).thinkingCutoff)
       laneResult.endDrafts = cutoff->replacedProposals();
 
@@ -3880,7 +3886,10 @@ ModelMemoryPlan plannedRuntimeMemory(const LoadedModel &model,
 bool budgetsVerifyRows(const LoadedModel &model, VerifyRows rows) noexcept {
   const bool moe =
       std::visit([](const auto &layout) { return layout.ffnKind == QwenFfnKind::SparseMoe; }, model.descriptor.target);
-  return moe && rows == VerifyRows::Auto;
+  // A dense target's rows past one verify sub-pass cost a second full pass,
+  // which the budget rations like a MoE's routed rows.
+  const uint32_t blockRows = model.draft.layout.rows;
+  return (moe || blockRows > ExecutionLimits::targetVerifyRows) && rows == VerifyRows::Auto;
 }
 
 std::unique_ptr<RuntimeModel> createRuntime(RuntimeContext context) {

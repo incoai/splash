@@ -221,6 +221,10 @@ private:
     uint32_t maskRow = 0;
     uint32_t uniform = 0;
     uint32_t draftedRows = 0;
+    // The lane stride of the logits and the masks this selection reads: a
+    // whole block's rows for a verify, the head's 8-row block for an
+    // initial selection.
+    uint32_t laneRows = 0;
   };
 
   // Penalizes the row at rowOffset of each penalized lane or, for verify,

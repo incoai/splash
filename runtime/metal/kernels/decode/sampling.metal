@@ -916,7 +916,7 @@ kernel void decode_sample_vocabulary_search(
   /* A drafted row follows its draft token, the next verify input row. */     \
   const bool drafted = index < params.drafted_rows;                           \
   const ulong position =                                                      \
-      ulong(batch) * SPLASH_DRAFT_PROPOSAL_TOKENS + (drafted ? index : 0);    \
+      ulong(batch) * (params.lane_rows - 1u) + (drafted ? index : 0);         \
   uint token;                                                                 \
   float draft_probability;                                                    \
   if (vocabulary_draw(                                                        \

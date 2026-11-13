@@ -198,7 +198,8 @@ void Sampling::addInitial(metal::CommandGraph &graph,
   if (rowOffset >= verifyRows_)
     throw std::invalid_argument("invalid initial sampling row");
   const TargetSamplingParams params =
-      selection(policies, buffers, {1, rowOffset, 0, SPLASH_UNIFORM_INITIAL, 0}, stopTokens);
+      selection(policies, buffers,
+                {1, rowOffset, 0, SPLASH_UNIFORM_INITIAL, 0, SPLASH_TARGET_VERIFY_ROWS}, stopTokens);
   addPenalties(graph, policies, buffers, penalties, rowOffset, false);
   addSelection(graph, params, policies, buffers);
 }
@@ -214,7 +215,7 @@ void Sampling::addVerify(metal::CommandGraph &graph,
   // uniform.
   const TargetSamplingParams params =
       selection(policies, buffers,
-                {verifyRows_, 0, 1, SPLASH_UNIFORM_CORRECTION, verifyRows_ - 1},
+                {verifyRows_, 0, 1, SPLASH_UNIFORM_CORRECTION, verifyRows_ - 1, verifyRows_},
                 stopTokens);
   addPenalties(graph, policies, buffers, penalties, 0, true);
   addSelection(graph, params, policies, buffers);
@@ -227,7 +228,7 @@ TargetSamplingParams Sampling::selection(std::span<const SamplingPolicy> policie
   params.vocabulary = vocabulary_;
   params.mask_words = maskWords_;
   params.rows = rows.rows;
-  params.lane_rows = verifyRows_;
+  params.lane_rows = rows.laneRows ? rows.laneRows : verifyRows_;
   params.logits_row = rows.logitsRow;
   params.mask_row = rows.maskRow;
   params.uniform = rows.uniform;
@@ -260,11 +261,11 @@ TargetSamplingParams Sampling::selection(std::span<const SamplingPolicy> policie
   };
   const SamplingWorkspace greedy = rowsWorkspace(greedyLanes), sampled = rowsWorkspace(sampledLanes);
   requireBytes(buffers.logits,
-               ((lanes - 1) * verifyRows_ + rows.logitsRow + rows.rows) * vocabulary_ * sizeof(float),
+               ((lanes - 1) * params.lane_rows + rows.logitsRow + rows.rows) * vocabulary_ * sizeof(float),
                "sampling logits");
   if (constrainedLanes)
     requireBytes(buffers.constraintMasks,
-                 ((constrainedLanes - 1) * (verifyRows_ + 1) + rows.maskRow + rows.rows) * maskWords_ *
+                 ((constrainedLanes - 1) * (params.lane_rows + 1) + rows.maskRow + rows.rows) * maskWords_ *
                      sizeof(uint32_t),
                  "constraint mask");
   requireBytes(buffers.outputTokens, lanes * rows.rows * sizeof(uint32_t), "sampled token");

@@ -473,8 +473,8 @@ public:
 
   void addVerify(metal::CommandGraph &graph, QwenTargetVerifyBuffers buffers, const kv::PageStorage &kv,
                  SpilledKvReads &spilled, std::span<const kv::ChunkedPrefillParams> chunks,
-                 uint32_t lanes, uint32_t blockRows) const override {
-    if (blockRows != SPLASH_TARGET_VERIFY_ROWS)
+                 uint32_t lanes, uint32_t blockRows, uint32_t verifiedRows) const override {
+    if (blockRows != SPLASH_TARGET_VERIFY_ROWS || verifiedRows != blockRows)
       throw std::invalid_argument("this target verifies its whole 8-row block");
     VerifyStep step = verifyStep(graph, buffers, kv, spilled, chunks, lanes);
     for (uint32_t index = 0; index < geometry_.layers; ++index) {
