@@ -40,8 +40,8 @@ struct ChatContextFlowTests {
             await picture("chat-context-room", state: state)
             let counts = try fixture.counts()
             state.sendDraft()
-            #expect(state.draft.isEmpty)
             try await waitFor(state.chats.streaming == nil)
+            #expect(state.draft.isEmpty)
             #expect(state.chats.current?.messages.last?.text == "Answer")
             let sent = try fixture.sent()
             #expect(sent.count == 1 && sent[0].count == 1)
@@ -196,6 +196,133 @@ struct ChatContextFlowTests {
         }
     }
 
+    /// The first message of a new chat stays in the composer, as it was sent, until the server
+    /// takes it: while the server holds it and once it has refused it, the composer holds the text
+    /// and the attachments it held, with their pictures, Send being Stop meanwhile, and no chat is
+    /// listed, open or written; the refusal adds only why. Sent again and taken, the message is
+    /// the chat's, which opens, listed once, and the composer is empty.
+    @Test func aNewChatsFirstMessageStaysInTheComposerUntilTheServerTakesIt() async throws {
+        try await withServer { fixture in
+            let state = fixture.state
+            state.chats.newChat()
+            state.draft.text = "refuse this"
+            state.draft.attach([try #require(NSImage(data: Showcase.picture))])
+            state.draft.attach(pdfs: [try Showcase.pdf(pages: 2, at: fixture.root.appending(path: "documents/Plan.pdf"))])
+            try await waitFor(state.draft.attachments.count == 2, "the attachments")
+            let before = Composed(state.draft)
+            #expect(before.pictured.count == 1 && state.canSendDraft)
+            let composed = Seen { Composed(state.draft) }
+            let chats = Seen { Chats(state.chats) }
+            let listed = Chats(state.chats)
+
+            try fixture.hold()
+            state.sendDraft()
+            #expect(Composed(state.draft) == before && Chats(state.chats) == listed)
+            #expect(state.chats.sendingFirstMessage && state.chats.answering && !state.canSendDraft && state.showsContext)
+            try await fixture.held()
+            #expect(Composed(state.draft) == before && Chats(state.chats) == listed)
+            #expect(try fixture.written() == [fixture.history.id])
+            try fixture.release()
+            try await waitFor(state.chats.streaming == nil, "the refusal")
+            var refused = before
+            refused.notice = Draft.Notice(text: "Request body too large", conversation: nil)
+            #expect(composed.values == [before, refused] && chats.values == [listed], "through the refusal")
+            #expect(!state.chats.sendingFirstMessage && !state.chats.answering && state.canSendDraft)
+            #expect(try fixture.written() == [fixture.history.id])
+            #expect(before.attachments.allSatisfy { FileManager.default.fileExists(atPath: state.chats.attachments.appending(path: $0.file).path) })
+
+            // What the server takes: the same attachments under other words.
+            state.draft.text = "Summarize the plan and say what the picture adds."
+            let again = Composed(state.draft)
+            #expect(again.notice == nil && again.attachments == before.attachments && again.pictured == before.pictured)
+            try fixture.hold()
+            state.sendDraft()
+            try await fixture.held()
+            #expect(Composed(state.draft) == again && Chats(state.chats) == listed)
+            #expect(try fixture.written() == [fixture.history.id])
+            try fixture.release()
+            try await waitFor(state.chats.streaming == nil, "the reply")
+            let chat = try #require(state.chats.current)
+            #expect(chat.id != fixture.history.id && chat.messages.first?.attachments == before.attachments)
+            #expect(chat.messages.map(\.text) == ["Summarize the plan and say what the picture adds.", "Answer"])
+            #expect(composed.values == [before, refused, again, Composed()], "the composer, through the flow")
+            #expect(chats.values == [listed, Chats(listed: [chat.id, fixture.history.id], open: chat.id)], "listed once, as the server takes it")
+            #expect(Set(try fixture.written()) == [chat.id, fixture.history.id])
+        }
+    }
+
+    /// Stop while the server holds a new chat's first message gives the message back to edit: the
+    /// composer holds it as it did, with nothing to say, and no chat was kept. Another chat opened
+    /// while the server holds the message stays open as the server takes it, the composer empty
+    /// then, the message being the new chat's.
+    @Test func aFirstMessageHeldIsStoppedOrTakenWhereverTheWindowIs() async throws {
+        try await withServer { fixture in
+            let state = fixture.state
+            state.chats.newChat()
+            state.draft.text = "Plan a trip to Kyoto in spring"
+            let before = Composed(state.draft), listed = Chats(state.chats)
+            let composed = Seen { Composed(state.draft) }
+            let chats = Seen { Chats(state.chats) }
+            try fixture.hold()
+            state.sendDraft()
+            try await fixture.held()
+            state.chats.stop()
+            try await waitFor(state.chats.streaming == nil, "the stop")
+            #expect(composed.values == [before] && chats.values == [listed] && state.canSendDraft)
+            #expect(try fixture.sent().isEmpty && fixture.written() == [fixture.history.id])
+
+            state.sendDraft()
+            try await waitFor(state.chats.streaming != nil, "the message sent again")
+            state.chats.selection = fixture.history.id
+            #expect(Composed(state.draft) == before && !state.chats.answering && !state.canSendDraft)
+            try fixture.release()
+            try await waitFor(state.chats.streaming == nil, "the reply")
+            #expect(state.draft.isEmpty && state.chats.selection == fixture.history.id)
+            let new = try #require(state.chats.conversations.first)
+            #expect(new.id != fixture.history.id && new.messages.map(\.text) == ["Plan a trip to Kyoto in spring", "Answer"])
+            #expect(state.chats.conversations.count == 2)
+        }
+    }
+
+    /// A quit while the server holds a new chat's first message writes no chat: what the app
+    /// leaves on disk is what it had.
+    @Test func aQuitWhileTheServerHoldsAFirstMessageWritesNoChat() async throws {
+        try await withServer { fixture in
+            let state = fixture.state
+            state.chats.newChat()
+            state.draft.text = "Plan a trip to Kyoto in spring"
+            try fixture.hold()
+            state.sendDraft()
+            try await fixture.held()
+            #expect(state.quitCost.requests == 1)
+            state.quit()
+            AppDelegate(state: state).applicationWillTerminate(Notification(name: NSApplication.willTerminateNotification))
+            #expect(try fixture.written() == [fixture.history.id])
+            try await waitFor(state.chats.streaming == nil, "the stop")
+            #expect(state.chats.conversations == [fixture.history] && state.draft.text == "Plan a trip to Kyoto in spring")
+            try fixture.release()
+        }
+    }
+
+    /// A later message stopped while the server holds it goes back to the composer, with nothing
+    /// to say, and its chat is as it was, in the list and on disk.
+    @Test func aLaterMessageStoppedBeforeTheServerTakesItGoesBack() async throws {
+        try await withServer { fixture in
+            let state = fixture.state
+            state.draft.text = "Short?"
+            try fixture.hold()
+            state.sendDraft()
+            #expect(state.draft.isEmpty && state.chats.current?.messages.count == 4 && state.chats.answering)
+            try await fixture.held()
+            state.chats.stop()
+            try await waitFor(state.chats.streaming == nil, "the stop")
+            #expect(state.draft.text == "Short?" && state.draft.notice == nil)
+            #expect(state.chats.current == fixture.history && state.chats.conversations == [fixture.history])
+            #expect(try fixture.sent().isEmpty)
+            try fixture.release()
+        }
+    }
+
     /// A chat opened shows its last count at once, while its prompt is counted again, and one not
     /// counted yet an empty ring: the composer's ring never goes as chats open. With the last
     /// count of all alone, it went as each chat opened and came back, fading in, once counted.
@@ -253,6 +380,33 @@ struct ChatContextFlowTests {
     }
 }
 
+/// What the composer holds: its text, what is attached, which attachments show a picture, and what
+/// it says over them.
+private struct Composed: Equatable {
+    var text = ""
+    var attachments: [Splash.Attachment] = []
+    var pictured: Set<UUID> = []
+    var notice: Draft.Notice?
+}
+
+extension Composed {
+    @MainActor init(_ draft: Draft) {
+        self.init(text: draft.text, attachments: draft.attachments, pictured: Set(draft.thumbnails.keys), notice: draft.notice)
+    }
+}
+
+/// What the chats show: those listed, in the list's order, and the open one.
+private struct Chats: Equatable {
+    var listed: [UUID]
+    var open: UUID?
+}
+
+extension Chats {
+    @MainActor init(_ store: ChatStore) {
+        self.init(listed: store.conversations.map(\.id), open: store.selection)
+    }
+}
+
 @MainActor
 private final class ContextFixture {
     let history = Conversation(title: "Saved chat", messages: [ChatMessage(role: .user, text: String(repeating: "h", count: 800)),
@@ -280,6 +434,29 @@ private final class ContextFixture {
     /// The prompts the server was asked to count.
     func counts() throws -> Int {
         try lines("counted.jsonl").count
+    }
+
+    /// Has the server hold the next message before it takes or refuses it.
+    func hold() throws {
+        try? FileManager.default.removeItem(at: root.appending(path: "held"))
+        try Data().write(to: root.appending(path: "hold"))
+    }
+
+    /// Waits until the server holds a message.
+    func held() async throws {
+        try await waitFor(FileManager.default.fileExists(atPath: root.appending(path: "held").path), "the server to hold the message")
+    }
+
+    /// Lets the server go on with the message it holds.
+    func release() throws {
+        try FileManager.default.removeItem(at: root.appending(path: "hold"))
+    }
+
+    /// The chats on disk, by their files' names, once the app has written what it changed so far.
+    func written() throws -> [UUID] {
+        state.chats.flush()
+        return try FileManager.default.contentsOfDirectory(at: root.appending(path: "chats"), includingPropertiesForKeys: nil)
+            .filter { $0.pathExtension == "json" }.compactMap { UUID(uuidString: $0.deletingPathExtension().lastPathComponent) }
     }
 
     private func lines(_ name: String) throws -> [Substring] {

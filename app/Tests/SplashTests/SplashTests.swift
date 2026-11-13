@@ -1640,16 +1640,24 @@ struct ChatTests {
     @MainActor @Test func keepsConversationsInTheirFolder() async throws {
         let folder = FileManager.default.temporaryDirectory.appending(path: "splash-chat-tests-\(UUID().uuidString)")
         defer { try? FileManager.default.removeItem(at: folder) }
+        let server = Process()
+        server.executableURL = URL(filePath: "/usr/bin/python3")
+        server.arguments = [try #require(Bundle.module.path(forResource: "streaming_server", ofType: "py", inDirectory: "Fakes"))]
+        let output = Pipe()
+        server.standardOutput = output
+        try server.run()
+        defer { server.terminate() }
+        let port = try #require(String(data: output.fileHandleForReading.availableData, encoding: .utf8)
+            .flatMap { Int($0.trimmingCharacters(in: .whitespacesAndNewlines)) })
         let store = ChatStore(folder: folder)
         #expect(store.conversations.isEmpty)
-        // Sending to no server fails, and the conversation keeps the question and why.
-        let nowhere = ChatTarget(url: URL(string: "http://127.0.0.1:9")!, model: "a/b", acceptsImages: false, effort: "")
-        store.send("Hello\nthere", attachments: [], to: nowhere)
-        #expect(store.current?.title == "Hello")
+        // A message the server takes makes a conversation, which keeps the question and the answer.
+        store.send("Hello\nthere", attachments: [], to: ChatTarget(url: URL(string: "http://127.0.0.1:\(port)")!, model: "a/b", acceptsImages: false, effort: ""))
         #expect(store.streaming != nil)
-        while store.streaming != nil { try await Task.sleep(for: .milliseconds(20)) }
+        try await waitFor(store.streaming == nil, "the reply to end")
+        #expect(store.current?.title == "Hello")
         let answer = try #require(store.current?.messages.last)
-        #expect(answer.role == .assistant && answer.model == "a/b" && answer.error != nil)
+        #expect(answer.role == .assistant && answer.model == "a/b" && answer.text == "One two three")
         store.rename(store.conversations[0].id, to: "Greeting")
         // Written off the main thread, on disk once flushed, as the app does as it quits.
         store.flush()
@@ -1765,6 +1773,7 @@ struct ChatTests {
             .flatMap { Int($0.trimmingCharacters(in: .whitespacesAndNewlines)) })
         let store = ChatStore(folder: folder)
         store.send("Hello\nthere", attachments: [], to: ChatTarget(url: URL(string: "http://127.0.0.1:\(port)")!, model: "a/b", acceptsImages: false, effort: ""))
+        try await waitFor(store.current != nil, "the server to take the message")
         #expect(store.current?.title == "Hello")
         try await waitFor(store.current?.title == "Greeting the user", "the model's title")
         store.flush()
@@ -1787,6 +1796,7 @@ struct ChatTests {
             .flatMap { Int($0.trimmingCharacters(in: .whitespacesAndNewlines)) })
         let store = ChatStore(folder: folder)
         store.send("Hello", attachments: [], to: ChatTarget(url: URL(string: "http://127.0.0.1:\(port)")!, model: "a/b", acceptsImages: false, effort: ""))
+        try await waitFor(store.current != nil, "the server to take the message")
         let id = try #require(store.current?.id)
         store.rename(id, to: "Mine")
         try await waitFor(store.streaming == nil, "the reply to end")
@@ -1828,6 +1838,7 @@ struct ChatTests {
             .flatMap { Int($0.trimmingCharacters(in: .whitespacesAndNewlines)) })
         let store = ChatStore(folder: folder)
         store.send("Hi", attachments: [], to: ChatTarget(url: URL(string: "http://127.0.0.1:\(port)")!, model: "a/b", acceptsImages: false, effort: ""))
+        try await waitFor(store.selection != nil, "the server to take the message")
         let streaming = try #require(store.streaming)
         #expect(store.selection == streaming)
         store.delete([streaming, gone.id, unread])

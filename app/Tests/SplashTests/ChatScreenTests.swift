@@ -79,9 +79,9 @@ extension ChatScreenTests {
 }
 
 extension ChatScreenTests {
-    /// The first message of a new chat moves the composer to the foot with its Send button, which
-    /// turns into Stop as it goes: in every frame the button keeps its place in the composer's row
-    /// of controls, level with the mark at its start, as the change of its glyph moved it on a
+    /// The first message of a new chat, as the server takes it, moves the composer to the foot
+    /// with its button, Stop since Send: in every frame the button keeps its place in the composer's
+    /// row of controls, level with the mark at its start, as the change of its glyph moved it on a
     /// shorter animation of its own, ahead of the composer.
     @Test func sendMovesWithTheComposer() async throws {
         let fake = try FakeRuntime("splash-chat-send", launcher: "chat_server")
@@ -123,19 +123,219 @@ extension ChatScreenTests {
         let start = try Self.field(in: window).minY
         // The reply waits while the frames are drawn: on a loaded Mac they took long enough for
         // its first words to change the mark, which then matched no color.
-        let hold = fake.root.appending(path: "hold")
-        FileManager.default.createFile(atPath: hold.path, contents: nil)
-        defer { try? FileManager.default.removeItem(at: hold) }
+        let wait = fake.root.appending(path: "wait")
+        FileManager.default.createFile(atPath: wait.path, contents: nil)
+        defer { try? FileManager.default.removeItem(at: wait) }
         state.sendDraft()
+        // The server takes the message in a turn of the app's own on the main actor, which a
+        // test's frames leave no room for; the window draws nothing of it until the frames.
+        try await waitFor(state.chats.selection != nil, "the server to take the message")
         var places: [CGFloat?] = []
         for _ in 0..<10 {
             pump(0.025)
             places.append(try await button())
         }
-        try FileManager.default.removeItem(at: hold)
+        try FileManager.default.removeItem(at: wait)
         #expect(try Self.field(in: window).minY < start - 100, "the composer moved to the foot")
         let end = try #require(places.last ?? nil)
         #expect(places.allSatisfy { $0.map { abs($0 - end) <= 2 } ?? false }, "the button against the mark: \(places)")
+    }
+}
+
+extension ChatScreenTests {
+    /// A new chat's first message leaves the window as it was until the server takes it. While the
+    /// server holds the message, every frame is the window before Send but for the button, Stop
+    /// since; and as the server refuses it, the list and the toolbar stay as they were and the
+    /// composer stays in the middle, saying why over its text. With the chat opened and listed at
+    /// Send, the composer went to the foot, a row came into the list and a title into the toolbar,
+    /// and a refusal took them all back.
+    @Test func aFirstMessageTheServerRefusesLeavesTheWindowAsItWas() async throws {
+        let fake = try FakeRuntime("splash-chat-refused", launcher: "chat_server")
+        defer { try? FileManager.default.removeItem(at: fake.root) }
+        let state = try await Self.chatting(fake)
+        defer { state.quit() }
+        let window = await Snapshot.window(MainView().environment(state), size: FirstMessagePictures.size, appearance: .aqua)
+        defer { window.orderOut(nil) }
+        state.draft.text = FirstMessagePictures.draft
+        state.draft.attach([try #require(NSImage(data: Showcase.picture))])
+        try await waitFor(state.draft.attachments.count == 1, "the attachment")
+        pump(0.5)
+        let field = try Self.field(in: window)
+        let size = window.frame.size
+        // The button's square, at the end of the row of controls under the text.
+        let button = CGRect(x: field.maxX - 40, y: size.height - field.minY, width: 48, height: 50)
+        let sidebar = CGRect(x: 0, y: 60, width: sidebarWidth, height: size.height - 60)
+        let toolbar = CGRect(x: 0, y: 0, width: size.width, height: 50)
+        func picture() async throws -> NSBitmapImageRep { try #require(await Snapshot.picture(of: window)) }
+        let before = try await picture()
+        for step in ["hold", "refuse"] { FileManager.default.createFile(atPath: fake.root.appending(path: step).path, contents: nil) }
+        state.sendDraft()
+        pump(0.03)
+        // Held as it was sent: what is typed meanwhile, or composed by an input method, would be
+        // lost as the chat takes the message.
+        let text = try #require(window.contentView?.firstTextView)
+        text.insertText(" And more.", replacementRange: NSRange(location: NSNotFound, length: 0))
+        text.setMarkedText("zai", selectedRange: NSRange(location: 3, length: 0), replacementRange: NSRange(location: NSNotFound, length: 0))
+        #expect(text.string == FirstMessagePictures.draft && !text.hasMarkedText() && state.draft.text == FirstMessagePictures.draft)
+        // Each frame after a turn of the app's own on the main actor, where it takes in what the
+        // server says.
+        var held: [Int] = []
+        for _ in 0..<8 {
+            pump(0.03)
+            await Task.yield()
+            held.append(Self.unlike(try await picture(), before, in: CGRect(origin: .zero, size: size), but: button, window))
+        }
+        #expect(state.chats.streaming != nil && held.allSatisfy { $0 == 0 },
+                "pixels unlike the window before Send, the button apart, per frame while the server holds the message: \(held)")
+        #expect(Self.unlike(try await picture(), before, in: button, window) > 0, "Stop, since Send")
+
+        try FileManager.default.removeItem(at: fake.root.appending(path: "hold"))
+        // The frames through the refusal, and 8 from when the app has it.
+        var refused: [(list: Int, toolbar: Int, composer: CGFloat)] = []
+        let deadline = ContinuousClock.now + .seconds(10)
+        var since = 0
+        while since < 8 {
+            try #require(ContinuousClock.now < deadline, "timed out waiting for the refusal")
+            pump(0.03)
+            await Task.yield()
+            if state.chats.streaming == nil { since += 1 }
+            let drawn = try await picture()
+            refused.append((Self.unlike(drawn, before, in: sidebar, window), Self.unlike(drawn, before, in: toolbar, window),
+                            try Self.field(in: window).minY - field.minY))
+        }
+        #expect(state.draft.notice?.text == "This message is longer than the model’s context." && state.draft.text == FirstMessagePictures.draft)
+        #expect(!state.chats.answering && state.canSendDraft)
+        // The message is the user's to edit again.
+        text.insertText(" And more.", replacementRange: NSRange(location: NSNotFound, length: 0))
+        #expect(state.draft.text == FirstMessagePictures.draft + " And more." && state.draft.notice == nil)
+        #expect(refused.allSatisfy { $0.list == 0 && $0.toolbar == 0 }, "the list and the toolbar through the refusal: \(refused)")
+        // The line that says why, over the text: a line of 12-point text and the 10 points under it.
+        #expect(refused.allSatisfy { abs($0.composer) <= 30 }, "the composer's text against where it was, per frame: \(refused.map(\.composer))")
+    }
+}
+
+extension ChatScreenTests {
+    /// An app on `fake`, a `chat_server`, with a model running and chats of several days in its
+    /// list, one pinned, its window to open on a new chat.
+    static func chatting(_ fake: FakeRuntime) async throws -> AppState {
+        let chats = [("Kyoto in spring", 0), ("Why is the sea salty?", 0), ("Bread recipe", 1), ("Explain KV cache paging", 3),
+                     ("Release notes", 9), ("Tax questions", 40)]
+        for (index, (title, days)) in chats.enumerated() {
+            let conversation = Conversation(title: title, updated: .now - Double(days * 86_400 + index * 60),
+                                            messages: [ChatMessage(role: .user, text: title), ChatMessage(role: .assistant, text: "Yes.")],
+                                            pinned: title == "Release notes" ? .now : nil)
+            try JSONEncoder().encode(conversation).write(to: fake.chats.appending(path: "\(conversation.id.uuidString).json"))
+        }
+        // Installed, as a model that runs is, so that its name opens the models' menu.
+        try fake.install("example/Model")
+        let state = fake.state(keychain: Keychain(service: "Splash Tests"))
+        await state.launch()
+        state.server.start("example/Model", settings: ServeSettings(values: ["--port": String(fake.port)]))
+        try await waitFor(state.server.phase == .ready, "ready")
+        state.section = .chat
+        return state
+    }
+
+    /// How many pixels of `picture` in `rect`, in `window`'s points from its top left, are unlike
+    /// those of `other`, those in `hole` apart.
+    static func unlike(_ picture: NSBitmapImageRep, _ other: NSBitmapImageRep, in rect: CGRect, but hole: CGRect = .null,
+                       _ window: NSWindow) -> Int {
+        let scale = CGFloat(picture.pixelsHigh) / window.frame.height, size = picture.bitsPerPixel / 8
+        guard let one = picture.bitmapData, let two = other.bitmapData, picture.bytesPerRow == other.bytesPerRow,
+              picture.pixelsHigh == other.pixelsHigh else { return .max }
+        func pixels(_ rect: CGRect) -> (x: Range<Int>, y: Range<Int>) {
+            (max(0, Int(rect.minX * scale))..<min(picture.pixelsWide, Int(rect.maxX * scale)),
+             max(0, Int(rect.minY * scale))..<min(picture.pixelsHigh, Int(rect.maxY * scale)))
+        }
+        let area = pixels(rect), apart = hole.isNull ? nil : pixels(hole)
+        var count = 0
+        for y in area.y {
+            let row = y * picture.bytesPerRow
+            for x in area.x where !(apart.map { $0.x.contains(x) && $0.y.contains(y) } ?? false) {
+                if memcmp(one + row + x * size, two + row + x * size, size) != 0 { count += 1 }
+            }
+        }
+        return count
+    }
+}
+
+/// A new chat's first message drawn to `first-message-*.png` in `SPLASH_APP_SNAPSHOTS`, light and
+/// dark, for people to review its motion, with chats in the list and a draft of several lines, a
+/// picture and a PDF: Send while the server holds the message, its refusal, Send again and Stop,
+/// Send once more, the server taking it and the reply, each at 0, 25, 50, 75 and 100% of `settle`,
+/// at twice that, once what comes has faded in, and at five times that, 1.2 s, by when a window
+/// drawn off screen shows the button's new glyph too.
+@MainActor
+@Suite(.serialized, .enabled(if: Snapshot.directory != nil))
+struct FirstMessagePictures {
+    /// The app's window as it first opens.
+    static let size = CGSize(width: 1120, height: 780)
+    static let draft = """
+        Plan a week in Kyoto in early April for the two of us.
+        We land at Kansai on the 3rd, like walking more than museums, and want one day trip out of the city.
+        Start from the attached itinerary, and say what the picture adds.
+        """
+
+    @Test func aRefusalAStopAndATakeFrameByFrame() async throws {
+        let directory = try #require(Snapshot.directory)
+        for (suffix, appearance) in [("light", NSAppearance.Name.aqua), ("dark", .darkAqua)] {
+            let fake = try FakeRuntime("splash-first-message-pictures", launcher: "chat_server")
+            defer { try? FileManager.default.removeItem(at: fake.root) }
+            let state = try await ChatScreenTests.chatting(fake)
+            defer { state.quit() }
+            state.transcript.page.load()
+            Snapshot.drawsOffScreen(try #require(state.transcript.page.webView))
+            let window = await Snapshot.window(MainView().environment(state), size: Self.size, appearance: appearance)
+            defer { window.orderOut(nil) }
+            state.draft.text = Self.draft
+            state.draft.attach([try #require(NSImage(data: Showcase.picture))])
+            state.draft.attach(pdfs: [try Showcase.pdf(pages: 12, at: fake.root.appending(path: "documents/Kyoto itinerary.pdf"))])
+            try await waitFor(state.draft.attachments.count == 2, "the attachments")
+            pump(0.5)
+            func signal(_ step: String) { FileManager.default.createFile(atPath: fake.root.appending(path: step).path, contents: nil) }
+            func clear(_ step: String) throws { try FileManager.default.removeItem(at: fake.root.appending(path: step)) }
+            func frames(_ name: String, at percents: [Int] = [0, 25, 50, 75, 100, 200, 500]) async {
+                let start = ContinuousClock.now
+                for percent in percents {
+                    while ContinuousClock.now < start + .milliseconds(percent * 24 / 10) { pump(0.005) }
+                    try? await Snapshot.picture(of: window)?.representation(using: .png, properties: [:])?
+                        .write(to: directory.appending(path: "first-message-\(name)-\(percent)-\(suffix).png"))
+                }
+            }
+            /// Waits for `condition`, letting the app's own work on the main actor run meanwhile.
+            func until(_ condition: () -> Bool, _ what: String) async throws {
+                let deadline = ContinuousClock.now + .seconds(30)
+                while !condition() {
+                    try #require(ContinuousClock.now < deadline, "timed out waiting for \(what)")
+                    pump(0.002)
+                    await Task.yield()
+                }
+            }
+            await frames("0-new", at: [0])
+            signal("hold")
+            signal("refuse")
+            state.sendDraft()
+            await frames("1-send")
+            try clear("hold")
+            try await until({ state.chats.streaming == nil }, "the refusal")
+            await frames("2-refused")
+            signal("hold")
+            state.sendDraft()
+            await frames("3-send-again")
+            state.chats.stop()
+            try await until({ state.chats.streaming == nil }, "the stop")
+            await frames("4-stopped")
+            try clear("refuse")
+            signal("wait")
+            state.sendDraft()
+            await frames("5-send-once-more")
+            try clear("hold")
+            try await until({ state.chats.selection != nil }, "the server to take the message")
+            await frames("6-taken")
+            try clear("wait")
+            try await until({ state.chats.streaming == nil && state.chats.current?.title == "A Title" }, "the reply and its title")
+            await frames("7-answered", at: [500])
+        }
     }
 }
 
@@ -375,10 +575,7 @@ extension ChatScreenTests {
 extension ChatScreenTests {
     /// The text view of the composer in `window`, where it lies in the window.
     static func field(in window: NSWindow) throws -> CGRect {
-        func textViews(in view: NSView) -> [NSTextView] {
-            view.subviews.flatMap { ($0 as? NSTextView).map { [$0] } ?? textViews(in: $0) }
-        }
-        let text = try #require(window.contentView.flatMap { textViews(in: $0).first { !$0.isFieldEditor } }?.enclosingScrollView)
+        let text = try #require(window.contentView?.firstTextView?.enclosingScrollView)
         return text.convert(text.bounds, to: nil)
     }
 

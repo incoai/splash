@@ -137,8 +137,15 @@ model or with the context length on Auto. Its chat is its own, not the chat page
 own in that folder's `Attachments`, so a conversation outlives a switch of
 models. A message attaches images and PDFs, a PDF shown by its name and pages,
 where the model takes them, and is held back where the limits `/v1/models`
-gives leave them out; one the server refuses goes back to the composer, with
-why. A chat takes the title the model sums its first exchange up
+gives leave them out. A message is its chat's once the server takes it, which
+it does by starting its response: until then the chat's file and its place in
+the list stay as they were, and a new chat is no conversation yet, listed,
+written and opened only once the server has taken its first message, which
+stays in the composer meanwhile as it was sent, Stop in Send's place. A message
+the server refuses, that never reaches it or that is stopped before it is taken
+changes no chat, and is in the composer again, or still, with why unless it was
+stopped; one that fails after stays in its chat, its answer saying why. A chat
+takes the title the model sums its first exchange up
 in, asked in the background without thinking. The list puts the pinned chats
 first, the last pinned at the top, then the others by day; a chat's menu, at
 its row's end or its title in the toolbar, pins, renames and deletes it, and
