@@ -78,6 +78,14 @@ and kills an engine still running 15 s later; later SIGTERMs are ignored, and a
 second Ctrl+C stops the engine at once. The app stops a server with one signal
 and kills it only after 30 s.
 
+`--engine-failure exit` (or `SPLASH_ENGINE_FAILURE=exit`) makes a failure of an
+engine that was ready end the server instead: it exits with status 75
+(`EX_TEMPFAIL`), and a supervisor such as launchd, systemd or a proxy such as
+llama-swap starts the whole process again, in place of an in-process relaunch.
+Requests that arrive before it exits get 503 `engine_recovering`. A failure
+during startup follows the rules above. Example: `splash serve --model ...
+--engine-failure exit`.
+
 Timeouts and keep-alives count only time the Mac is awake: a request in flight
 when the Mac sleeps continues when it wakes. While requests run, Splash keeps
 the Mac from sleeping automatically, as `caffeinate -i` does; the display may
@@ -158,6 +166,7 @@ paths for `--model-dir`, `--draft-model` and `--mmproj`.
 | `--max-image-pixels` | `4194304` | Maximum resized pixels per image. An image's vision scratch grows with its patches (pixels / 256), to about 600 MiB at the default. |
 | `--request-timeout` | None | Time a request may take from its arrival; a request's own `timeout` can only shorten it. |
 | `--queue-size` | `32` | Requests admitted at once, running or waiting; more get 503 with `Retry-After`. |
+| `--engine-failure` | `SPLASH_ENGINE_FAILURE` or `relaunch` | What a failure of an engine that was ready does: `relaunch` starts a new engine in this server; `exit` stops the server with status 75 so that a supervisor starts it again. See the engine restart rules above. |
 | `--decode-share` | `0.5` | Decode time owed per unit of prefill time while other requests generate. Higher keeps their output faster during a long prompt and slows that prompt; `0` alternates one command each. |
 | `--disable-ane` | Off | Prefill on the GPU alone. By default a dense model's long prompts also use the Neural Engine when that is faster. See [Neural Engine prefill](internals.md#neural-engine-prefill). |
 | `--activations` | `auto` | On M5 and later Macs, whose GPUs multiply int8 at twice their bf16 rate, `auto` rounds activations to int8 where that is faster and leaves the others bf16: prefill chunks of more than 64 rows through a target's MLX 4- and 5-bit weights in groups of 64 (not a MoE model's routed experts), rounded per row and 64 inputs, about a quarter less time to the first token on Qwen3.8-27B MLX 4-bit; a Ternary-Bonsai (rotated PQ2_0) model's decode, 13-16% less time a cycle on a 20-core M5 Pro; and attention over the INT8 KV cache where a split reads 8 pages or more, 4-7% sooner first tokens at 32K-64K (see [KV cache precision](#kv-cache-precision)). `bf16` is a precision opt-out for evaluations and bf16 parity: every activation stays bf16, though a [persistent cache](#persistent-cache) keeps what an `auto` run prefilled, so a parity run starts in a fresh `--cache-dir`. What `auto` costs, as next-token KL against bf16: about 2.2e-3 for Qwen3.8-27B MLX 4-bit's prefill on the GPU alone, 2.8e-4 for Bonsai's decode, and with INT8 queries 1.37x the KL the INT8 KV cache alone gives Qwen3.8-27B. The Neural Engine split, which multiplies its part in int8 whatever this option, has its own switch, `--disable-ane`. See [kernel selection](internals.md#kernel-selection). |

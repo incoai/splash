@@ -518,6 +518,11 @@ extension LaunchOption {
             flag: "--allow-idle-sleep", title: "Keep Mac awake while answering",
             help: "The Mac doesn’t sleep in the middle of an answer; the display still may.",
             section: .requests, kind: .toggle(on: false)),
+        LaunchOption(
+            flag: "--engine-failure", title: "When the engine fails",
+            help: "What a failure of a ready engine does. By default the server starts a new engine in place; Exit stops it so a supervisor can start it again.",
+            section: .requests,
+            kind: .choice(standard: "Relaunch in Place", choices: [("exit", "Exit for the Supervisor")], custom: nil)),
     ]
 
     /// What the options of the SSD cache need: the cache itself.
