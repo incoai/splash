@@ -375,7 +375,8 @@ class LauncherTests(unittest.TestCase):
                     console_written()
                     self.assertEqual(
                         error.getvalue(),
-                        "error: Splash is already serving; stop it with Ctrl+C first\n",
+                        "error: Splash is already serving; stop it with Ctrl+C "
+                        "first, or serve on another --port\n",
                     )
                     self.assertEqual(lock_path.read_bytes(), content)
                     install.assert_not_called()

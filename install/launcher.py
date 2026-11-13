@@ -428,9 +428,11 @@ def serve(args):
         try:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
+            # The port names the lock whatever --host listens on, a UNIX
+            # socket too: a second server takes another.
             raise LauncherError(
                 f"Splash is already serving{_serve_lock_owner(lock)}; "
-                "stop it with Ctrl+C first"
+                "stop it with Ctrl+C first, or serve on another --port"
             ) from None
         lock.seek(0)
         lock.truncate()
