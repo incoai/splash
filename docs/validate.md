@@ -339,8 +339,8 @@ schema, and the client times what a user sees.
 | `ttft` | for each N of `--n`, on a fresh server: N conversations cache an ~8K-token prefix one at a time, then send it with distinct ~300-token suffixes at the same instant, `--rounds` times, each round recording its `/status` counters' changes and the largest `memory_governor.claims` its samples showed; `/status` every 0.5 s |
 | `serve1` | one request at a time on an idle server, cold prompts of about `--sizes` tokens (300, 2K and 14K): time to first token and decode milliseconds per token; the `/status` each request waited idle for, and one after the last |
 | `warm` | per cached depth of `--sizes`, a fresh cold prefix, then 2 discarded and 8 measured ~300-token suffixes after it: the server's prompt time of each (`--trial` picks the texts, the same for every tree); `/status` as `serve1` |
-| `agent` | `--conversations` (4) coding-agent tool loops of `--turns` (12) turns that only grow: every turn all of them send, at the same instant, their conversation with the model's own last reply as an OpenAI client sends it back (its reasoning, its text and its tool call) and the tool's result after it, about `--turn-tokens` (2,000) tokens of source; they share their system prompt, with a guide of as many tokens, and their tool. The next turn starts `--gap` (2) seconds after the last reply; `/status` at each turn's start and after the last turn's writes |
-| `edit` | `--conversations` (2) chats, one request at a time, each a turn, the chats taking turns, `--gap` seconds after each reply: built over `--turns` (8) turns of a user message of about `--turn-tokens` tokens and the model's reply (`build`); then, at the turns a quarter, half and three quarters in, the conversation up to that turn's message sent again (`regenerate`), sent with another message in its place (`edit`), the edited branch taken a turn further (`follow`) and the original conversation, whole, a turn further (`return`); `/status` as `agent` |
+| `agent` | `--conversations` (4) coding-agent tool loops of `--turns` (12) turns that only grow: every turn all of them send, at the same instant, their conversation with the model's own last reply as an OpenAI client sends it back (its reasoning, its text and its tool call) and the tool's result after it, about `--turn-tokens` (1,000) tokens of source; they share their system prompt, with a guide of as many tokens, and their tool. The next turn starts `--gap` (0.5) seconds after the last reply, a tool that returns at once; `/status` at each turn's start and after the last turn's writes |
+| `edit` | `--conversations` (2) chats, one request at a time, each a turn, the chats taking turns, `--gap` (8) seconds after each reply, a user's pace: built over `--turns` (8) turns of a user message of about `--turn-tokens` tokens and the model's reply (`build`); then, at the turns a quarter, half and three quarters in, the conversation up to that turn's message sent again (`regenerate`), sent with another message in its place (`edit`), the edited branch taken a turn further (`follow`) and the original conversation, whole, a turn further (`return`); `/status` as `agent` |
 
 Every request timestamps each content chunk of its stream; its gaps are the
 intervals between consecutive chunks after the first. Each request may take
@@ -356,7 +356,12 @@ stops.
 `agent` and `edit` measure what the SSD cache writes for the prefixes requests
 reuse; run them with the cache options to measure, such as
 `--server-args '--persistent-cache --cache-dir DIR'`, and a `--max-memory`
-under which the cache gives states up, or its reclaims write nothing. Each
+under which the cache gives states up, or its reclaims write nothing. A
+restore point is copied 10 s after its publication unless its conversation
+went on from it first, so `--gap` decides which writes a run measures: at
+`agent`'s default most points are gone on from in time and the states written
+are the reclaims', and at a gap past the delay, such as 15, every point is
+copied, as at `edit`'s. Each
 request records its time to first token, to its first output of any kind (a
 turn may answer with reasoning and a tool call alone), and the server's count
 of its prompt: its tokens, those the cache held (`cached`), those whose KV it

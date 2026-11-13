@@ -556,7 +556,7 @@ def parse_args(argv=None):
         "--gap",
         type=float,
         help="agent, edit: seconds from a turn's last reply to the next turn "
-        f"({clients.TURN_GAP_SECONDS:g})",
+        f"({clients.AGENT_GAP_SECONDS:g}, {clients.EDIT_GAP_SECONDS:g})",
     )
     parser.add_argument(
         "--gpu-idle-percent",

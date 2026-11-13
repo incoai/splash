@@ -1041,14 +1041,23 @@ def run_warm(
 # characters, are 293,626 tokens under the Qwen3.8 tokenizer.
 SOURCE_CHARS_PER_TOKEN = 4.08
 # What each turn adds to a conversation, a tool's result or a user's message,
-# in tokens: a file a coding agent reads.
-TURN_TOKENS = 2000
-# Seconds from a turn's last reply to the next turn's send: the tool's run,
-# or the user's reading. With it an agent turn of the defaults lasts about
-# as long as a conversation's of the deployment whose writes these scenarios
-# were made to measure, 11 s (1,300 requests an hour in 4 conversations).
-TURN_GAP_SECONDS = 2.0
-# That deployment's concurrency, which is also the engine's batch width.
+# in tokens: a coding-agent deployment whose requests found 98 % of their
+# 41K-token prompts cached computed about 820 new tokens a turn.
+TURN_TOKENS = 1000
+# Seconds from an agent turn's last reply to the next turn's send: a tool
+# that returns at once. With it a conversation of the defaults published its
+# next restore point 6.5 s after the last at the median (an M5 Max, Qwen3.8
+# 27B), sooner than the 10 s a point waits for its copy, so the conversations
+# went on from 33 of the 40 points that waited before they fell due and the
+# states written were mostly the reclaims'. A gap past that delay, such as
+# 15 s, measures the copies.
+AGENT_GAP_SECONDS = 0.5
+# The same of an edit turn: a user reading the reply, past the delay, so
+# that every point is copied, as a chat's are (21 of 21 in a chat of 12
+# turns).
+EDIT_GAP_SECONDS = 8.0
+# The reported deployment's concurrency, which is also the engine's batch
+# width.
 AGENT_CONVERSATIONS = 4
 AGENT_TURNS = 12
 # An agent reply: a short reasoning, a sentence and one tool call.
@@ -1402,7 +1411,7 @@ def run_agent(
     conversations: int = AGENT_CONVERSATIONS,
     turns: int = AGENT_TURNS,
     turn_tokens: int = TURN_TOKENS,
-    gap: float = TURN_GAP_SECONDS,
+    gap: float = AGENT_GAP_SECONDS,
     text: str | None = None,
     timeout: float = REQUEST_SECONDS,
 ) -> dict:
@@ -1460,7 +1469,7 @@ def run_edit(
     conversations: int = EDIT_CONVERSATIONS,
     turns: int = EDIT_TURNS,
     turn_tokens: int = TURN_TOKENS,
-    gap: float = TURN_GAP_SECONDS,
+    gap: float = EDIT_GAP_SECONDS,
     text: str | None = None,
     timeout: float = REQUEST_SECONDS,
 ) -> dict:
