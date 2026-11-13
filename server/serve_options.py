@@ -20,6 +20,9 @@ from .chat_format import REASONING_EFFORTS
 from .http_security import validate_api_key
 from .protocol import MAX_THINKING_END_TOKENS
 
+# --reasoning: auto lets each request decide whether it reasons; off makes
+# the server decide that none does.
+REASONING_MODES = ("auto", "off")
 # The most context --max-context takes: the most any family serves
 # (QwenTargetDimensions::maximumContextTokens(), as the engine's families
 # command reports it), YaRN's window of the Qwen targets. The engine refuses
@@ -316,6 +319,12 @@ def parse_api_key(value):
         return validate_api_key(value)
     except ValueError as error:
         raise argparse.ArgumentTypeError(str(error)) from None
+
+
+def parse_reasoning_mode(value):
+    if value not in REASONING_MODES:
+        raise argparse.ArgumentTypeError(f"must be one of {', '.join(REASONING_MODES)}")
+    return value
 
 
 def parse_reasoning_effort(value):
@@ -649,6 +658,19 @@ SERVE_OPTIONS = (
             "it first in /v1/models; /status keeps the loaded model ID (needs "
             "--served-model-name)",
         ),
+    ),
+    ServeOption(
+        "--reasoning",
+        "api",
+        dict(
+            type=parse_reasoning_mode,
+            metavar="MODE",
+            help="off: no request reasons, whatever its reasoning_effort, "
+            "Messages thinking or enable_thinking asks; auto: each request "
+            "decides (default: SPLASH_REASONING, else auto)",
+        ),
+        environment="SPLASH_REASONING",
+        needs="reasoning_switch",
     ),
     ServeOption(
         "--default-reasoning-effort",
