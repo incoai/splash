@@ -244,6 +244,38 @@ extension ChatScreenTests {
         #expect(opening.drawn.last.map { $0.field < opening.field.minY - 100 } == true, "the composer travelled to the foot")
     }
 
+    /// The chat's title fades in at its place as its chat opens: every frame the window draws
+    /// once the server has taken a new chat's first message has ink in the toolbar only where the
+    /// title, its separator and its chevron are once still, after the sidebar's divider. Fading in
+    /// on one animation with the room the toolbar gives it, it came some points from its place and
+    /// cut short, its chevron over its words, and slid to its place as it showed.
+    @Test func theTitleFadesInAtItsPlaceAsItsChatOpens() async throws {
+        let opening = try await Self.opening("splash-chat-title-place")
+        let before = Self.colors(of: opening.before.toolbar), still = Self.colors(of: opening.still.toolbar)
+        let wide = opening.still.toolbar.pixelsWide, high = opening.still.toolbar.pixelsHigh
+        func light(_ color: (Double, Double, Double)) -> Double { (color.0 + color.1 + color.2) / 3 }
+        // Where the title is once still, and a pixel around, for its edges.
+        var place = Set<Int>(), first = Int.max
+        for y in 0..<high {
+            for x in 0..<wide where abs(light(still(x, y)) - light(before(x, y))) > 0.02 {
+                first = min(first, x)
+                for (dx, dy) in [(0, 0), (1, 0), (-1, 0), (0, 1), (0, -1)] { place.insert((y + dy) * wide + x + dx) }
+            }
+        }
+        // Its separator in line with the sidebar's divider, within the point the toolbar rounds to.
+        let divider = Int(sidebarWidth - Self.toolbarPart.minX)
+        #expect(place.count > 500 && abs(first - divider) <= 1, "the title, once still, from \(first), the divider at \(divider)")
+        /// The pixels `picture` inks that are none of the title's once still.
+        func astray(_ picture: NSBitmapImageRep) -> Int {
+            let color = Self.colors(of: picture)
+            return (0..<high).reduce(0) { count, y in
+                count + (0..<wide).count { x in abs(light(color(x, y)) - light(before(x, y))) > 0.06 && !place.contains(y * wide + x) }
+            }
+        }
+        let frames = opening.drawn.map { (ms: $0.ms, astray: astray($0.toolbar)) }
+        #expect(frames.allSatisfy { $0.astray == 0 }, "pixels inked where the title is not once still, per frame: \(frames)")
+    }
+
     /// What a window draws as the server takes a new chat's first message, where the change
     /// shows apart from the composer's travel: over the composer's text at its start, where the
     /// picture attached and the line that says why are, and in the toolbar from the Chat's switch
