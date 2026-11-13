@@ -396,9 +396,11 @@ inline void draft_attention_split_phase(
 }
 
 // Fixed-order combine of one (lane, head) pair's split partials into the
-// normalized bf16 rows in row-major [proposal_row][query_head][dim] order,
-// so the result does not depend on which split finished first or on how many
-// lanes ran and feeds the output projection directly without a reorder pass.
+// normalized bf16 rows, so the result does not depend on which split
+// finished first or on how many lanes ran. The head's 32 rows are its four
+// query heads' eight proposal rows; each goes to its place in the lane's
+// [proposal row][query head][dim] rows, the output projection's input, which
+// take the place of the grouped query rows the splits have read.
 inline void draft_attention_reduce_phase(device const float *partials,
                                          device bfloat *output, uint kv_head,
                                          uint thread_index) {

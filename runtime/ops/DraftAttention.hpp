@@ -70,6 +70,9 @@ struct DraftPrepareBuffers final {
 };
 
 struct DraftDecodeAttentionBuffers final {
+  // The prepared query rows, grouped by query head, and the split partials
+  // behind them. The attention leaves its rows in the query rows' place, in
+  // [row][query head][dimension] order, the output projection's input.
   metal::MetalBuffer groupedQueries;
   std::span<const metal::MetalBuffer> persistentKeys;
   std::span<const metal::MetalBuffer> persistentValues;
