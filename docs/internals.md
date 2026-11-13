@@ -2647,7 +2647,9 @@ warm-up done of all, and again as each step ends
 ([Warmup and pipelines](#warmup-and-pipelines)), then its Ready event when the
 warm-up is done; the server prints the first engine's Warming and writes it to
 its serve record, where the app shows it as the start's Warming up step and
-its progress.
+its progress. A relaunched engine's Warming goes no further: its warm-up is
+part of the recovery, which the record names as one phase from the failure
+on ([serve record](server.md#serve-record)).
 Ready says what the start serves: its lanes, the context it resolved (a
 relaunch may serve less than the first engine did), whether it admits
 images, and the target's vocabulary, stop

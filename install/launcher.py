@@ -26,7 +26,7 @@ if __name__ == "__main__" and not __package__:
 # The options, the record and the console serve shares with the server, in
 # modules of the standard library alone: the launcher runs before .venv
 # exists.
-from server import diagnostics, serve_options, serve_record
+from server import diagnostics, serve_options, serve_record, unix_socket
 
 from . import clients, paths
 from . import models as model_artifacts
@@ -290,7 +290,15 @@ def _check_port(host, port):
     process's listener at a wider or narrower address of the port (0.0.0.0
     or a dual-stack :: beside 127.0.0.1, or the reverse), and the two would
     then split the address's connections, so a listener that accepts one
-    there owns the port too."""
+    there owns the port too. A UNIX socket's path is claimed and bound as the
+    HTTP listener claims and binds it, and given up again."""
+    if (path := unix_socket.path(host)) is not None:
+        with (
+            contextlib.closing(unix_socket.Claim(path)) as claim,
+            socket.socket(socket.AF_UNIX) as probe,
+        ):
+            claim.bind(probe)
+        return
     with socket.socket() as probe:
         probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         probe.bind((host, port))
@@ -313,8 +321,14 @@ def _prepare_start(args):
     try:
         _check_port(args.host, args.port)
     except OSError as error:
+        # A UNIX socket has no port: --host names all of where it listens.
+        address = (
+            args.host
+            if unix_socket.path(args.host) is not None
+            else f"{args.host}:{args.port}"
+        )
         raise LauncherError(
-            f"cannot bind {args.host}:{args.port}: {error}", serve_record.PORT
+            f"cannot bind {address}: {error}", serve_record.PORT
         ) from None
     if args.model_dir is not None:
         return _prepare_local_model(args)
@@ -414,9 +428,11 @@ def serve(args):
         try:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
+            # The port names the lock whatever --host listens on, a UNIX
+            # socket too: a second server takes another.
             raise LauncherError(
                 f"Splash is already serving{_serve_lock_owner(lock)}; "
-                "stop it with Ctrl+C first"
+                "stop it with Ctrl+C first, or serve on another --port"
             ) from None
         lock.seek(0)
         lock.truncate()

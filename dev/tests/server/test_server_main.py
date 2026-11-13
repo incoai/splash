@@ -7,6 +7,7 @@ import os
 import signal
 import subprocess
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -558,6 +559,135 @@ class ServerMainTests(unittest.TestCase):
         server.socket.close.assert_called_once_with()
         server.server_close.assert_called_once_with()
         self.assertEqual(json.loads(record.read_text()), golden | {"pid": os.getpid()})
+
+    def main_relaunching(self, record, serve, relaunch=lambda: None):
+        """main() over a real backend and a runtime stand-in whose engine is
+        relaunched: its patches. `serve(fail)` runs once the server is ready,
+        where fail() fails the engine that serves; `relaunch()` runs as the
+        engine started in its place loads."""
+        runtime = FakeRuntime()
+        starts = []
+
+        def wait_ready():
+            starts.append(None)
+            if len(starts) > 1:
+                relaunch()
+            runtime.ready = True
+            return True
+
+        def fail():
+            runtime.ready = False
+            runtime.on_engine_failure(
+                api.engine_runtime.EngineUnhealthy("native protocol reached EOF"),
+                1.0,
+                frozenset(),
+                lambda: None,
+            )
+
+        runtime.wait_ready = wait_ready
+        server = mock.Mock(server_port=8000)
+        server.serve_forever.side_effect = lambda: serve(fail)
+        return (
+            mock.patch.object(
+                api, "parse_args", return_value=main_args(serve_record=record)
+            ),
+            unprepared_hold(),
+            mock.patch.object(api, "load_thinking_key", return_value=None),
+            mock.patch.object(api.AutoTokenizer, "from_pretrained"),
+            mock.patch.object(api, "validate_tokenizer"),
+            mock.patch.object(api, "ChatTemplates", **NO_THINKING_END),
+            mock.patch.object(
+                api.engine_runtime, "MultiplexedRuntime", return_value=runtime
+            ),
+            mock.patch.object(api, "check_capabilities"),
+            mock.patch.object(api, "ConstraintFactory"),
+            mock.patch.object(api, "Frontend"),
+            mock.patch.object(api, "FrontendServer", return_value=server),
+            mock.patch.object(api, "print_status"),
+            mock.patch.object(backend_api, "print_status"),
+        )
+
+    def wait_until(self, predicate, what):
+        deadline = time.monotonic() + 5
+        while not predicate():
+            if time.monotonic() >= deadline:
+                self.fail(f"{what} within 5 s")
+            time.sleep(0.01)
+
+    def test_the_record_follows_a_relaunch(self):
+        """The record follows the engine's life, not its first start alone:
+        once the engine of a ready server fails it says recovering, as the
+        app reads it (serve_record_recovering_golden.json), while the engine
+        started in its place loads, and ready again once that one serves,
+        under the same pid (it said ready throughout, so that what supervised
+        the server by the file took the relaunch's load for a runaway)."""
+        keep_stop_signals(self)
+        record = Path(self.enterContext(tempfile.TemporaryDirectory())) / "s.json"
+        golden = json.loads(
+            (GOLDEN / "serve_record_recovering_golden.json").read_text()
+        )
+        phases = []
+
+        def read():
+            return json.loads(record.read_text())
+
+        def serve(fail):
+            phases.append(read())
+            fail()
+            self.wait_until(
+                lambda: read()["phase"] == "ready", "the record did not say ready"
+            )
+            phases.append(read())
+
+        with contextlib.ExitStack() as stack:
+            for patch in self.main_relaunching(
+                record, serve, relaunch=lambda: phases.append(read())
+            ):
+                stack.enter_context(patch)
+            api.main()
+        ready = {"pid": os.getpid(), "phase": "ready"}
+        self.assertEqual(phases, [ready, golden | {"pid": os.getpid()}, ready])
+        self.assertEqual(list(record.parent.iterdir()), [record])
+
+    def test_a_ready_server_serves_on_when_its_record_cannot_be_written(self):
+        """A record a ready server cannot write, its directory gone, is a
+        warning line and nothing more: through its engine's failure and the
+        relaunch the server serves on and stops as any other does, where the
+        start's ready record that cannot be written ends the start."""
+        keep_stop_signals(self)
+        directory = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        (directory / "run").mkdir()
+        record = directory / "run/s.json"
+        relaunched = threading.Event()
+        log = self.enterContext(mock.patch("sys.stderr", io.StringIO()))
+        warning = (
+            f" Warning · cannot write the serve record {record}: "
+            "No such file or directory"
+        )
+
+        def warnings():
+            console_written()
+            return log.getvalue().count(warning)
+
+        def serve(fail):
+            (directory / "run").rename(directory / "moved")
+            fail()
+            self.assertTrue(relaunched.wait(5))
+            # One for the failure and one for the relaunch that serves.
+            self.wait_until(lambda: warnings() == 2, "two warnings were not written")
+
+        with contextlib.ExitStack() as stack:
+            for patch in self.main_relaunching(record, serve, relaunch=relaunched.set):
+                stack.enter_context(patch)
+            api.main()
+        self.assertEqual(
+            [line.partition(" ")[2] for line in log.getvalue().splitlines()],
+            [warning.strip()] * 2,
+        )
+        self.assertEqual(
+            json.loads((directory / "moved/s.json").read_text()),
+            {"pid": os.getpid(), "phase": "ready"},
+        )
 
     def test_a_failed_start_whose_record_cannot_be_written_ends_as_it_would(self):
         """With the record's directory gone, a start the server refuses still

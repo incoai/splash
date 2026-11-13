@@ -1,14 +1,26 @@
 import concurrent.futures
+import contextlib
+import errno
 import http.client
 import json
+import os
 import queue
 import socket
+import stat
+import tempfile
 import threading
 import time
 import unittest
+from pathlib import Path
 from unittest import mock
 
-from dev.tests.server_fixtures import FakeRuntime, HarnessTestCase, Plan, chat_body
+from dev.tests.server_fixtures import (
+    FakeRuntime,
+    Harness,
+    HarnessTestCase,
+    Plan,
+    chat_body,
+)
 from server import connections, serve_options
 from server import server as api
 
@@ -891,6 +903,122 @@ class HttpTransportTests(HarnessTestCase):
         self.assertEqual(admission.stats(), {"active": 0, "capacity": 1})
         with self.assertRaisesRegex(RuntimeError, "without acquisition"):
             admission.release()
+
+
+class UnixSocketTests(HarnessTestCase):
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory(dir="/tmp")
+        self.addCleanup(directory.cleanup)
+        self.path = os.path.join(directory.name, "splash.sock")
+
+    def get(self, path, host="127.0.0.1:18081", at=None):
+        connection = socket.socket(socket.AF_UNIX)
+        connection.settimeout(3)
+        connection.connect(at or self.path)
+        connection.sendall(
+            f"GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n".encode()
+        )
+        reply = b""
+        while chunk := connection.recv(65536):
+            reply += chunk
+        connection.close()
+        head, _, body = reply.partition(b"\r\n\r\n")
+        return int(head.split()[1]), body
+
+    def test_serves_on_a_unix_socket_and_removes_it_on_close(self):
+        harness = Harness(FakeRuntime(), host=f"unix:{self.path}")
+        try:
+            self.assertTrue(stat.S_ISSOCK(os.lstat(self.path).st_mode))
+            code, body = self.get("/status")
+            self.assertEqual(code, 200)
+            instance = json.loads(body)["instance"]
+            self.assertEqual(
+                (instance["host"], instance["port"]), (f"unix:{self.path}", None)
+            )
+            self.assertEqual(self.get("/health", host="localhost")[0], 200)
+            self.assertEqual(self.get("/health", host="evil.example")[0], 403)
+        finally:
+            harness.close()
+        self.assertFalse(os.path.exists(self.path))
+
+    def test_replaces_a_stale_socket_but_not_a_live_one(self):
+        stale = socket.socket(socket.AF_UNIX)
+        stale.bind(self.path)
+        stale.close()
+        self.harness(FakeRuntime(), host=f"unix:{self.path}")
+        self.assertEqual(self.get("/health")[0], 200)
+        with self.assertRaises(OSError):
+            api.FrontendServer((f"unix:{self.path}", 0), None)
+
+    def test_a_start_refused_at_a_served_path_leaves_its_server_serving(self):
+        """A second server at a path one serves is refused as at an address
+        in use, and the first goes on answering there (the refused one
+        removed the socket as it closed, and the first answered no more)."""
+        self.harness(FakeRuntime(), host=f"unix:{self.path}")
+        with self.assertRaises(OSError) as refused:
+            api.FrontendServer((f"unix:{self.path}", 0), None)
+        self.assertEqual(refused.exception.errno, errno.EADDRINUSE)
+        self.assertEqual(self.get("/health")[0], 200)
+
+    def test_a_server_that_has_not_listened_yet_keeps_its_path(self):
+        """A server binds before its model loads and listens after: a second
+        one started meanwhile is refused, though the first's socket refuses a
+        connection as a leftover does (it took the path, and the first
+        listened on a socket no client could reach)."""
+        first = api.FrontendServer(
+            (f"unix:{self.path}", 0), None, bind_and_activate=False
+        )
+        self.addCleanup(first.server_close)
+        first.server_bind()
+        bound = os.lstat(self.path).st_ino
+        second = api.FrontendServer(
+            (f"unix:{self.path}", 0), None, bind_and_activate=False
+        )
+        with self.assertRaises(OSError):
+            second.server_bind()
+        second.server_close()
+        self.assertEqual(os.lstat(self.path).st_ino, bound)
+        # Once the first has closed, the path is the next server's.
+        first.server_close()
+        self.harness(FakeRuntime(), host=f"unix:{self.path}")
+        self.assertEqual(self.get("/health")[0], 200)
+
+    def test_only_a_socket_nothing_listens_on_is_replaced(self):
+        """A socket another program listens on and a file of another kind
+        stay where they are, and the start is refused."""
+        with socket.socket(socket.AF_UNIX) as listener:
+            listener.bind(self.path)
+            listener.listen()
+            with self.assertRaises(OSError):
+                api.FrontendServer((f"unix:{self.path}", 0), None)
+            with socket.socket(socket.AF_UNIX) as client:
+                client.connect(self.path)
+        os.unlink(self.path)
+        Path(self.path).write_text("kept")
+        with self.assertRaises(OSError):
+            api.FrontendServer((f"unix:{self.path}", 0), None)
+        self.assertEqual(Path(self.path).read_text(), "kept")
+
+    def test_the_sockets_path_gives_the_host_check_no_name(self):
+        """Over a UNIX socket the server answers to the loopback names and
+        --allowed-host's alone: its path, which no Host header carries, adds
+        none (its first character was accepted as a Host: `s` for a server
+        started at a relative splash.sock)."""
+        self.enterContext(contextlib.chdir(os.path.dirname(self.path)))
+        self.harness(
+            FakeRuntime(), host="unix:splash.sock", allowed_hosts=["relay.example"]
+        )
+        for host, code in (
+            ("s", 403),
+            ("splash.sock", 403),
+            ("localhost:8000", 200),
+            ("[::1]", 200),
+            ("relay.example", 200),
+        ):
+            with self.subTest(host=host):
+                self.assertEqual(
+                    self.get("/health", host=host, at="splash.sock")[0], code
+                )
 
 
 if __name__ == "__main__":

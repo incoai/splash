@@ -52,8 +52,17 @@ REFUSED_CONTEXTS = ("0", "-1", "1010001", "987K", "2M", "1.5M", "M", "bad")
 # Every shared option: accepted arguments with the value they parse to, and
 # refused arguments.
 OPTIONS = {
+    # An address, which the bind checks, or a UNIX socket's path, which
+    # unix: alone does not give.
     "--host": values(
-        "--host", {"0.0.0.0": "0.0.0.0", "mymac.local": "mymac.local"}, ()
+        "--host",
+        {
+            "0.0.0.0": "0.0.0.0",
+            "unix:/tmp/splash.sock": "unix:/tmp/splash.sock",
+            "unix:splash.sock": "unix:splash.sock",
+            "mymac.local": "mymac.local",
+        },
+        ("unix:",),
     ),
     "--served-model-name": values(
         "--served-model-name",

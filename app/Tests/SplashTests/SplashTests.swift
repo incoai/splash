@@ -851,6 +851,24 @@ struct ServerTests {
         let warming = try JSONDecoder().decode(ServeRecord.self, from: Data(contentsOf: Self.goldens.appending(
             path: "server/serve_record_warming_golden.json")))
         #expect(warming.phase == .warming && warming.warmup == ServeRecord.Warmup(steps_done: 3, steps: 9))
+        // A ready server that starts a failed engine again: it has started, and is at no step of
+        // a start.
+        let recovering = try JSONDecoder().decode(ServeRecord.self, from: Data(contentsOf: Self.goldens.appending(
+            path: "server/serve_record_recovering_golden.json")))
+        #expect(recovering.pid == 4242 && recovering.phase == .recovering)
+        #expect(recovering.phase.started && Server.Step(recovering.phase) == nil)
+        #expect(ServeRecord.Phase.ready.started && !ServeRecord.Phase.warming.started && !ServeRecord.Phase.failed.started)
+    }
+
+    /// A phase a later server writes is no news of the server, and its record still reads: the
+    /// process that wrote it and the failure it names (the whole record read as none, so that the
+    /// exit it explained was worded as a crash).
+    @Test func keepsARecordWhosePhaseItDoesNotKnow() throws {
+        let record = try JSONDecoder().decode(ServeRecord.self, from: Data(
+            #"{"pid":4242,"phase":"draining","failure":{"kind":"stopped","message":"why it stopped"}}"#.utf8))
+        #expect(record.pid == 4242 && record.phase == .unknown)
+        #expect(!record.phase.started && Server.Step(record.phase) == nil)
+        #expect(Server.exitProblem(record: record, pid: 4242, port: 8000, holder: nil) == "why it stopped")
     }
 
     @Test func wordsAnExitByItsOwnRecord() throws {
@@ -870,8 +888,9 @@ struct ServerTests {
         let unknown = "It stopped unexpectedly. The log has the details."
         #expect(problem(record, pid: 4243) == unknown)
         #expect(problem(nil, pid: 4242) == unknown)
-        // A start, or a ready server, that crashed or was killed.
-        for phase in ["starting", "ready"] {
+        // A start, or a ready server, its engine serving or being started again, that crashed or
+        // was killed.
+        for phase in ["starting", "ready", "recovering"] {
             let unsaid = try JSONDecoder().decode(ServeRecord.self, from: Data(#"{"pid":4242,"phase":"\#(phase)"}"#.utf8))
             #expect(problem(unsaid, pid: 4242) == unknown)
         }
@@ -958,6 +977,37 @@ struct ServerTests {
         try await waitFor(!server.running, "the end")
         let lines = try String(contentsOf: log, encoding: .utf8).split(separator: "\n")
         #expect(lines.count == 2 && lines[0].hasPrefix("── Starting a/b, ") && lines[1] == "SPLASH_APP_PID=\(getpid())")
+    }
+
+    /// A server whose engine failed as its start ended has started: its record says recovering,
+    /// and the app shows it ready and recovering at once, before any status says so (it read no
+    /// record in a phase it did not know, and showed the start's last step until the relaunch
+    /// served).
+    @MainActor @Test func aServerRecoveringAsItsStartEndsHasStarted() async throws {
+        // A checkout whose Python writes the record of a server that recovers, and runs on.
+        let root = FileManager.default.temporaryDirectory.appending(path: "splash-recovering-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let runtime = Runtime(root: root)
+        for folder in [runtime.python.deletingLastPathComponent(), runtime.locks] {
+            try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        }
+        let record = runtime.locks.appending(path: "serve-0.json").path(percentEncoded: false)
+        try """
+        #!/bin/sh
+        echo "{\\"pid\\":$$,\\"phase\\":\\"recovering\\"}" > '\(record)'
+        while :; do sleep 0.1; done
+
+        """.write(to: runtime.python, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: runtime.python.path)
+        let server = Server(runtime: runtime, log: root.appending(path: "server.log"), defaults: .kept(in: root),
+                            killAfter: .seconds(1))
+        // Its interrupt ends the script, where a wait below fails too.
+        defer { server.stop() }
+        server.start("a/b", settings: ServeSettings(values: ["--port": "0"]))
+        try await waitFor(server.phase == .ready, "the start's end")
+        #expect(server.serving == .recovering && !server.answers)
+        server.stop()
+        try await waitFor(!server.running, "the stop", seconds: 11)
     }
 }
 

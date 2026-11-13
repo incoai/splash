@@ -53,7 +53,8 @@ get 500 `engine_failed` in the same words. What
 runs the server, such as launchd with `KeepAlive`, decides whether to start it
 again, and a new server counts failures from none, so give it a
 `ThrottleInterval` for a cause the next start meets again; the app shows why it
-stopped. While the engine restarts, generation requests get
+stopped. While the engine restarts, the [serve record](#serve-record) says
+`recovering` and generation requests get
 503 `engine_recovering`, whose message names the last failure and whose
 `Retry-After` the time until the next bound on the restart's start: when it
 should be ready, as long after its spawn as the start before took, then up to
@@ -83,6 +84,37 @@ when the Mac sleeps continues when it wakes. While requests run, Splash keeps
 the Mac from sleeping automatically, as `caffeinate -i` does; the display may
 still sleep, and closing the lid or choosing Sleep still sleeps the Mac.
 `serve --allow-idle-sleep` lets it sleep automatically.
+
+### Serve record
+
+`splash serve` writes what it is at to `serve-PORT.json` in the runtime
+directory ([files Splash writes](#files-splash-writes)), beside the lock it
+holds, `serve-PORT.lock`. The record is one JSON object, replaced atomically,
+with the server's `pid` and its `phase`:
+
+| `phase` | The server |
+|---|---|
+| `starting` | Holds the port's lock and prepares the model. |
+| `loading` | Loads the tokenizer, then the engine its weights. |
+| `warming` | Warms the engine up; `warmup` counts `steps_done` of `steps`. |
+| `ready` | Answers requests. |
+| `recovering` | Answers `/status` and refuses generation while it starts a failed engine again ([engine restarts](#engine-restarts-and-sleep)): from the failure, through the wait for the failed engine's exit and the backoff, until the engine started in its place serves. Then `ready` again, with the same `pid`. |
+| `failed` | Has ended: `failure` gives the `kind`, the `message` and, for a shortfall of memory or context, its `bound` and numbers. A start that failed, or, with `kind` `stopped`, a server that stopped restarting its engine. |
+
+The desktop app follows a start by the record. What supervises a server can
+read it instead of polling HTTP: a server that restarts its engine loads the
+whole model again inside the same process, so its memory falls and then grows
+as in a start, and `recovering` tells that load from memory that grows while
+the server should be serving; `/status` says the rest (`transport.recovering`,
+`transport.restarts`, `transport.error`). A restart is one phase, not
+`loading` and `warming` again: those are a process that does not answer yet
+and ends if the phase fails, where a recovering server answers `/status`,
+waits out a backoff before it loads, and retries a restart that failed or
+stops. A server that was stopped or killed leaves its last record, so check
+that the `pid` runs or that the lock is held, and take a phase a later release
+adds for no news. The launcher's `starting` record and the server's first
+`ready` fail the start where they cannot be written; once a server is ready, a
+record it cannot write is a warning in its log, and it serves on.
 
 ### Console
 
@@ -132,7 +164,7 @@ paths for `--model-dir`, `--draft-model` and `--mmproj`.
 | `--language-only` | Off | Skip vision loading; image and PDF input is rejected. See [vision](models.md#vision). |
 | `--offline` | Off | Start the installed model without asking the Hub, as `HF_HUB_OFFLINE=1` does. See [revisions](#revisions). |
 | `--port` | `SPLASH_PORT` or `8000` | HTTP port. |
-| `--host` | `127.0.0.1` | HTTP bind address. See [network and authentication](#network-and-authentication). |
+| `--host` | `127.0.0.1` | HTTP bind address, or `unix:PATH` for a UNIX socket. See [network and authentication](#network-and-authentication). |
 | `--allowed-host` | No extra names | Additional HTTP Host name, e.g. `mymac.local`; repeatable. |
 | `--allowed-origin` | No other origin | Origin whose pages may call the API from a browser or webview, e.g. `tauri://localhost`; `'*'` for any; repeatable. |
 | `--api-key` | `SPLASH_API_KEY` or none | Require this key, as a bearer token or `x-api-key`, on every route but the chat page, `/health` and `/ready`. |
@@ -193,6 +225,29 @@ listener or allowlist client IPs. A request that names the server any other way
 gets 403 with the `--allowed-host` flag that would accept it; the check keeps out
 web pages that rebind a DNS name to this address. The chat page works over plain
 HTTP from another machine too.
+
+`--host unix:PATH` listens on a UNIX socket at `PATH` instead of a TCP port, so
+that the server listens on no IP address and file permissions decide who
+connects: a client needs write permission on the socket, which is created
+under the server's umask, and search permission on its directory. A relative
+`PATH` is taken from the directory the server starts in. One server serves a
+path: it holds a lock, `PATH.lock` beside the socket, from before it binds
+until it has removed the socket as it stops. A second server at the path is
+therefore refused, also while the first still loads its model, and the socket
+a killed server left behind is replaced by the next start; a socket another
+program listens on and a file of another kind stay, and the start is refused.
+`--port` names the server's lock and [record](#serve-record),
+`serve-PORT.lock` and `serve-PORT.json` in the runtime directory, as it does
+for every `--host`, so two socket servers take two ports though neither
+listens on one; `/status` reports `instance.host` as `unix:PATH` and
+`instance.port` as null. Clients connect with, e.g.,
+`curl --unix-socket PATH http://localhost/health`, and the Host check applies
+as it does over TCP: a request names the server `localhost`, a loopback
+address or an `--allowed-host` name. The agent commands reach a server at
+`127.0.0.1:PORT` alone and find none where it listens on a socket: forward a
+loopback TCP port to the socket and give them that port, whose
+`Host: 127.0.0.1:PORT` the relay passes on and the check accepts. The desktop
+app serves on TCP alone.
 
 Set `SPLASH_API_KEY` in the server and agent shells to require authentication;
 `serve --api-key KEY` overrides the server's environment value. Every request
@@ -1023,7 +1078,7 @@ also when a new draft has Splash assemble it again.
 
 | Path | Holds |
 | --- | --- |
-| `~/Library/Application Support/Splash` | The data directory of a packaged install: `models/`, the installed models' links into the Hugging Face cache and the metadata derived from GGUFs; `runtime/`, the locks of running servers; and `thinking.key`, which encrypts the Messages reasoning a response hides. A source checkout keeps the first two in `install/models` and `build/runtime`. |
+| `~/Library/Application Support/Splash` | The data directory of a packaged install: `models/`, the installed models' links into the Hugging Face cache and the metadata derived from GGUFs; `runtime/`, the locks and [serve records](#serve-record) of running servers; and `thinking.key`, which encrypts the Messages reasoning a response hides. A source checkout keeps the first two in `install/models` and `build/runtime`. |
 | Hugging Face cache (`HF_HUB_CACHE`, by default `~/.cache/huggingface/hub`) | Model and draft downloads, with Splash's pins under `refs/splash` and the commit of a default branch as `refs/main` ([revisions](#revisions)). |
 | `~/Library/Caches/Splash/prefix-cache` (`--cache-dir`) | The [persistent cache](#persistent-cache), with `--persistent-cache` only, within the [SSD cache](#ssd-cache)'s limit. Every start removes the caches there that nobody used for 14 days. |
 | `$TMPDIR/splash-cache-*` | The [SSD cache](#ssd-cache)'s files, on by default, without `--persistent-cache`, or when another process holds the persistent cache's directory or it cannot be used: one of KV pages and one of states, together at most about the SSD cache's limit: under `auto` a quarter of the volume's free space beyond its floor, up to 32 GiB, or the size `--max-cache-disk` sets while the volume keeps its floor. Each is unlinked as it is created, so no directory lists it and macOS's storage settings count it as System Data, and its space returns when the engine exits, even after a crash. `--cache-dir` does not move them; they follow `TMPDIR`. |

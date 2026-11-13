@@ -375,7 +375,8 @@ class LauncherTests(unittest.TestCase):
                     console_written()
                     self.assertEqual(
                         error.getvalue(),
-                        "error: Splash is already serving; stop it with Ctrl+C first\n",
+                        "error: Splash is already serving; stop it with Ctrl+C "
+                        "first, or serve on another --port\n",
                     )
                     self.assertEqual(lock_path.read_bytes(), content)
                     install.assert_not_called()
@@ -449,6 +450,57 @@ class LauncherTests(unittest.TestCase):
                     self.assertEqual(result, 1)
                     install.assert_not_called()
                     execute.assert_not_called()
+
+    def test_a_unix_socket_is_bound_and_given_up_before_model_work(self):
+        """A --host of unix:PATH is tried as the server binds it: a free path
+        and one a killed server left its socket at go on, the path left clear
+        for the server, under the port's lock and record; a path a server
+        holds, one still loading too, fails the start before any model work,
+        named without the port it does not listen on, and stays that
+        server's."""
+        with tempfile.TemporaryDirectory(dir="/tmp") as temporary:
+            runtime = Path(temporary) / "runtime"
+            path = Path(temporary) / "splash.sock"
+            arguments = ["serve", "--model", MODEL_ID, "--port", "9123"]
+            arguments += ["--host", f"unix:{path}"]
+            for leftover in (False, True):
+                if leftover:
+                    with socket.socket(socket.AF_UNIX) as killed:
+                        killed.bind(str(path))
+                with (
+                    self.subTest(leftover=leftover),
+                    mock.patch.object(launcher, "RUNTIME_DIR", runtime),
+                    mock.patch.object(launcher, "_ensure_installed") as install,
+                    mock.patch.object(launcher.os, "execve") as execute,
+                ):
+                    self.assertIsNone(launcher.main(arguments))
+                    install.assert_called_once()
+                    served = api.parse_args(server_arguments(execute.call_args.args[1]))
+                    self.assertEqual(served.host, f"unix:{path}")
+                    self.assertEqual(served.serve_record, runtime / "serve-9123.json")
+                    self.assertFalse(path.exists())
+            holder = launcher.unix_socket.Claim(str(path))
+            self.addCleanup(holder.close)
+            with socket.socket(socket.AF_UNIX) as loading:
+                holder.bind(loading)
+                bound = path.lstat().st_ino
+                with (
+                    mock.patch.object(launcher, "RUNTIME_DIR", runtime),
+                    mock.patch.object(launcher, "_ensure_installed") as install,
+                    mock.patch.object(launcher.os, "execve") as execute,
+                    mock.patch("sys.stderr", io.StringIO()) as error,
+                ):
+                    self.assertEqual(launcher.main(arguments), 1)
+                console_written()
+                message = f"cannot bind unix:{path}: [Errno 48] Address already in use"
+                self.assertEqual(error.getvalue(), f"error: {message}\n")
+                install.assert_not_called()
+                execute.assert_not_called()
+                self.assertEqual(path.lstat().st_ino, bound)
+            self.assertEqual(
+                json.loads((runtime / "serve-9123.json").read_text())["failure"],
+                {"kind": "port", "message": message},
+            )
 
     def test_real_port_probe_rejects_a_listener_on_another_address_of_the_port(self):
         # SO_REUSEADDR lets 127.0.0.1 bind beside another process's wildcard
