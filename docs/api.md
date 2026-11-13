@@ -521,6 +521,14 @@ reference a remote document, and cannot combine `unevaluatedProperties` with
 final output; it does not inject formatting instructions into the prompt.
 Clients should describe their output requirements in their own messages.
 
+The JSON is the answer's first token where no reasoning comes before it, so a
+small output limit is spent on the value; after reasoning, up to 64 whitespace
+characters may set it apart, as the template's blank line after `</think>`
+does. Between the value's own tokens the model may write up to 64 whitespace
+characters, which takes pretty printing 15 levels deep at four spaces;
+whitespace inside strings is content and unbounded. A required or named tool
+call starts the same way.
+
 ## Images and PDFs
 
 Images arrive inline as base64 `data:` URLs: Chat `image_url` parts, Responses
