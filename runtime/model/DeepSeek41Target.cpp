@@ -42,8 +42,8 @@ constexpr uint32_t kLatent = LATENT_ATTENTION_DIM;
 
 template <class T> T *contents(const metal::MetalBuffer &buffer) { return static_cast<T *>(buffer.contents()); }
 
-// A float projection (F32, BF16 or Q8_0 as the GGUF stores it) into fp32
-// rows, on the float tile a router runs on.
+// A float projection (F32, BF16 or a quantized type's rows as the GGUF
+// stores it) into fp32 rows, on the float tile a router runs on.
 void addFloatProjection(metal::CommandGraph &graph, const metal::MetalBuffer &input, const ops::Projection &projection,
                         const metal::MetalBuffer &output, uint32_t rows) {
   ops::addGgufFloat(graph, input, projection.blocks().segments.front(), output, rows, projection.outputSize, 0,

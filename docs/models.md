@@ -224,9 +224,11 @@ and the `ple.*` arrays). The installer refuses the layout ISTA-DASLab
 published until October 27, 2026, its Engram tables in a file the backbone
 names (`deepseek41.engram.file`): install the repository's current revision,
 or convert local files with its `convert_ds41_upstream.py`. Its compressors'
-and indexers' projections load as F32, BF16 or Q8_0: the published
+and indexers' projections load as the MoE router does, F32, BF16 or any of
+the linears' quantized formats (not F16) as stored: the published
 quantizations store them as BF16 or, as ggml-org's Q2_K and unsloth's
-UD-Q4_K_XL do, as Q8_0. Its Engram tables load as IQ4_NL alone, so
+UD-Q4_K_XL do, as Q8_0, and orcarouter's abliterated Mix-256G three
+compressor gates as Q5_K. Its Engram tables load as IQ4_NL alone, so
 unsloth's F8_E4M3 Engram part is refused.
 
 BF16 and F16 are formats of the image like the quantized ones, for the tensors

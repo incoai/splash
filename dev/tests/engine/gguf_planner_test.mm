@@ -1172,11 +1172,28 @@ void checkDeepSeek(const std::filesystem::path &directory) {
         }
     check(expected == 11 && copied == expected, "planner copies the Q8_0 compressors and indexers as stored");
   }
-  check(names(planned(deepseekMetadata(g), deepseekTensors(g, ggmlType("Q4_0"))),
-              {"attn_compressor_kv.weight (Q4_0) in 2 layers", "attn_compressor_gate.weight (Q4_0) in 1 layer",
-               "indexer.attn_k.weight (Q4_0) in 2 layers", "indexer.attn_q_b.weight (Q4_0) in 3 layers",
-               "indexer.proj.weight (Q4_0) in 3 layers"}),
-        "planner refuses compressors and indexers of another quantized type");
+  // orcarouter's Mix-256G: a Q5_K gate beside Q8_0 compressors and indexers.
+  const std::vector<Tensor> mixedTensors = deepseekTensors(g, model::ggml::kQ8_0, kQ5_K);
+  const Plan mixed = planned(deepseekMetadata(g), mixedTensors);
+  check(!mixed.error, "planner plans a Q5_K compressor gate" + (mixed.error ? ": " + *mixed.error : ""));
+  if (!mixed.error) {
+    uint32_t gates = 0, copied = 0;
+    for (const Tensor &tensor : mixedTensors)
+      if (tensor.name.ends_with(".attn_compressor_gate.weight")) {
+        ++gates;
+        copied += tensor.type == kQ5_K && asStored(copyIn(mixed, tensor.name), tensor.data);
+      }
+    check(gates == 1 && copied == gates, "planner copies the Q5_K compressor gate as stored");
+  }
+  check(names(planned(deepseekMetadata(g), deepseekTensors(g, model::ggml::kF16)),
+              {"attn_compressor_kv.weight (F16) in 2 layers", "attn_compressor_gate.weight (F16) in 1 layer",
+               "indexer.attn_k.weight (F16) in 2 layers", "indexer.attn_q_b.weight (F16) in 3 layers",
+               "indexer.proj.weight (F16) in 3 layers"}),
+        "planner refuses F16 compressors and indexers");
+  // A row of the indexer's queries (the query rank wide) is no whole Q5_K
+  // block.
+  check(names(planned(deepseekMetadata(g), deepseekTensors(g, kQ5_K)), {"indexer.attn_q_b.weight"}),
+        "planner refuses a compressor or indexer whose rows are no whole blocks of its type");
 
   const auto withKey = [&](const test_gguf::Key &replacement) {
     std::vector<test_gguf::Key> keys = deepseekMetadata(g);

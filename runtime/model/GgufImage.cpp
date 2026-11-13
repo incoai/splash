@@ -78,13 +78,12 @@ bool routerType(uint32_t type) { return floatProjectionType(type) || (quantizedT
 // decode to it.
 bool floatRowType(uint32_t type) { return floatProjectionType(type) || type == ggml::kQ8_0; }
 // A DeepSeek-V4.1 QSA projection (qsaProjection), which the float projection
-// runs in fp32 as stored: a float projection's type, or Q8_0, whose native
-// rows it decodes. Every published quantization of the family stores them as
-// BF16 or Q8_0 (ggml-org's Q2_K, unsloth's UD-Q4_K_XL); the kernel decodes any
-// format a router's may be (routerType), so another needs only this
-// predicate. These are floatRowType's types, but kept as stored, where
-// floatRows decodes them to F32.
-bool qsaProjectionType(uint32_t type) { return floatProjectionType(type) || type == ggml::kQ8_0; }
+// runs in fp32 as stored: a router's types, a float projection's or a
+// quantized one's but F16, whose native rows it decodes. The published
+// quantizations of the family store them as BF16 or Q8_0 (ggml-org's Q2_K,
+// unsloth's UD-Q4_K_XL), and a mixed one a gate as Q5_K (orcarouter's
+// Mix-256G).
+bool qsaProjectionType(uint32_t type) { return routerType(type); }
 
 // The header type of the image of a table a family adds (planImages), beside
 // the layers' 0 and 1 (GDN and full attention) and the head's 2.
@@ -355,14 +354,15 @@ public:
   }
 
   // A DeepSeek-V4.1 compressor or indexer projection [rows, columns] as
-  // stored, which the float projection runs in fp32: F32 or BF16, or Q8_0's
-  // native rows, of whose decoded values it gives the outputs bit for bit.
+  // stored, which the float projection runs in fp32: F32 or BF16, or a
+  // quantized type's native rows, of whose decoded values it gives the
+  // outputs bit for bit.
   void qsaProjection(const std::string &name, uint64_t rows, uint64_t columns) {
     const GgufTensor *tensor = find(name, qsaProjectionType);
     if (!tensor) return;
     if (tensor->rows() != rows || tensor->columns() != columns)
-      throw GgufError("expected an F32, BF16 or Q8_0 [" + std::to_string(rows) + ", " + std::to_string(columns) +
-                      "] tensor: " + name);
+      throw GgufError("expected a [" + std::to_string(rows) + ", " + std::to_string(columns) +
+                      "] compressor or indexer projection: " + name);
     copiedRows(*tensor, storedRowBytes(*tensor));
   }
 

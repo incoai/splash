@@ -31,15 +31,14 @@ ops::Projection floatProjection(WeightFile &file, const BlockTargetFormat &forma
   return projection;
 }
 
-// A compressor or indexer projection as the GGUF stores it, F32, BF16 or
-// Q8_0's native rows (GgufImage.cpp qsaProjection), which the float
-// projection runs into fp32: rows as stored alone, never a repacked tensor's
-// planes, which the planner writes for none of them.
+// A compressor or indexer projection as the GGUF stores it, F32, BF16 or a
+// quantized type's native rows but F16's (GgufImage.cpp qsaProjection), which
+// the float projection runs into fp32: rows as stored alone, never a
+// repacked tensor's planes, which the planner writes for none of them.
 ops::Projection qsaProjection(WeightFile &file, uint32_t outputSize, uint32_t inputSize, std::string_view label) {
   ops::QuantizedSegment segment = readFloatSegment(file, label);
-  if (segment.formatId != ops::QuantizedSegment::kFloat32 && segment.formatId != GGUF_FMT_BF16 &&
-      segment.formatId != GGUF_FMT_Q80)
-    throw WeightStoreError("GGUF tensor is not F32, BF16 or Q8_0: " + std::string(label));
+  if (segment.formatId == GGUF_FMT_F16)
+    throw WeightStoreError("GGUF tensor is F16, which no float projection reads: " + std::string(label));
   if (segment.outputSize != outputSize || segment.inputSize != inputSize)
     throw WeightStoreError("GGUF tensor does not match the layout: " + std::string(label));
   ops::Projection projection{outputSize, inputSize, ops::BlockWeights{{std::move(segment)}}};

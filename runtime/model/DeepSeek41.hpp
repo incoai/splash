@@ -159,9 +159,10 @@ struct DeepSeek41MixWeights final {
 };
 
 // A compressor layer's projections of its inputs into a group's latent, F32,
-// BF16 or Q8_0 as the GGUF stores them, which the float projection runs in
-// fp32: the latents [head dimension, hidden], on a layer of groups of 2
-// tokens the gate whose softmax over a group weighs them, the latent's norm;
+// BF16 or a quantized type's rows as the GGUF stores them, which the float
+// projection runs in fp32: the latents [head dimension, hidden], on a layer
+// of groups of 2 tokens the gate whose softmax over a group weighs them, the
+// latent's norm;
 // then the indexer's key [indexer head dimension, head dimension] of a
 // group's latent and its norm.
 struct DeepSeek41CompressorWeights final {

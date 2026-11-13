@@ -651,10 +651,12 @@ inline std::vector<uint64_t> deepseekEngramPrimes(const model::QwenTargetDimensi
 // Every tensor of the DeepSeek-V4.1 geometry, zero, as the family's GGUFs type
 // them: F32 norms, mixes, biases and Engram gates; Q8_0 projections;
 // compressors and indexers of type `qsa` (BF16, or Q8_0 as llama.cpp's
-// quantizations of the family store them); BF16 routers; Q4_K routed experts; the image router's bias, which text does not
+// quantizations of the family store them), the compressors' gates of type
+// `gate` (theirs, or Q5_K as orcarouter's Mix-256G stores them); BF16
+// routers; Q4_K routed experts; the image router's bias, which text does not
 // read; and the Engram's IQ4_NL tables.
-inline std::vector<Tensor> deepseekTensors(const model::QwenTargetDimensions &g,
-                                           uint32_t qsa = model::ggml::kBF16) {
+inline std::vector<Tensor> deepseekTensors(const model::QwenTargetDimensions &g, uint32_t qsa = model::ggml::kBF16,
+                                           std::optional<uint32_t> gate = {}) {
   const model::DeepSeek41Dimensions &d = g.deepseek;
   std::vector<Tensor> tensors;
   const auto add = [&](std::string name, std::vector<uint64_t> dims, uint32_t type) {
@@ -688,7 +690,7 @@ inline std::vector<Tensor> deepseekTensors(const model::QwenTargetDimensions &g,
     add(p + "attn_sinks.weight", {g.attentionQueryHeads}, kF32);
     if (has(d.compressorLayers, layer)) {
       add(p + "attn_compressor_kv.weight", {hidden, latent}, qsa);
-      if (has(d.pairedLayers, layer)) add(p + "attn_compressor_gate.weight", {hidden, latent}, qsa);
+      if (has(d.pairedLayers, layer)) add(p + "attn_compressor_gate.weight", {hidden, latent}, gate.value_or(qsa));
       add(p + "attn_compressor_norm.weight", {latent}, kF32);
       add(p + "indexer.attn_k.weight", {latent, d.indexerHeadDimension}, qsa);
       add(p + "indexer.k_norm.weight", {d.indexerHeadDimension}, kF32);

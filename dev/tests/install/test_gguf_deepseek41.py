@@ -245,6 +245,19 @@ class DeepSeek41GgufTests(unittest.TestCase):
         self.assertIn(("blk.2.indexer.attn_k.weight", [512, 128], GGML["Q8_0"]), table)
         self.assertIs(self.check(table), DEEPSEEK)
 
+    def test_the_engine_plans_q5_k_compressor_gates(self):
+        # orcarouter's abliterated Mix-256G stores the compressors' gates of
+        # layers 2, 8 and 14 as Q5_K beside Q8_0 compressors and indexers.
+        gates = {f"blk.{layer}.attn_compressor_gate.weight" for layer in (2, 8, 14)}
+        table = [
+            (name, extents, GGML["Q5_K"] if name in gates else kind)
+            for name, extents, kind in tensor_table("gguf-tensors-Q2_K.json")
+        ]
+        self.assertEqual(
+            sum(kind == GGML["Q5_K"] for name, _, kind in table if name in gates), 3
+        )
+        self.assertIs(self.check(table), DEEPSEEK)
+
     def test_the_engine_refuses_what_it_does_not_read(self):
         table = tensor_table()
         without_gate = [t for t in table if t[0] != "blk.2.attn_compressor_gate.weight"]
