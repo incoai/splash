@@ -339,6 +339,8 @@ schema, and the client times what a user sees.
 | `ttft` | for each N of `--n`, on a fresh server: N conversations cache an ~8K-token prefix one at a time, then send it with distinct ~300-token suffixes at the same instant, `--rounds` times, each round recording its `/status` counters' changes and the largest `memory_governor.claims` its samples showed; `/status` every 0.5 s |
 | `serve1` | one request at a time on an idle server, cold prompts of about `--sizes` tokens (300, 2K and 14K): time to first token and decode milliseconds per token; the `/status` each request waited idle for, and one after the last |
 | `warm` | per cached depth of `--sizes`, a fresh cold prefix, then 2 discarded and 8 measured ~300-token suffixes after it: the server's prompt time of each (`--trial` picks the texts, the same for every tree); `/status` as `serve1` |
+| `agent` | `--conversations` (4) coding-agent tool loops of `--turns` (12) turns that only grow: every turn all of them send, at the same instant, their conversation with the model's own last reply as an OpenAI client sends it back (its reasoning, its text and its tool call) and the tool's result after it, about `--turn-tokens` (2,000) tokens of source; they share their system prompt, with a guide of as many tokens, and their tool. The next turn starts `--gap` (2) seconds after the last reply; `/status` at each turn's start and after the last turn's writes |
+| `edit` | `--conversations` (2) chats, one request at a time, each a turn, the chats taking turns, `--gap` seconds after each reply: built over `--turns` (8) turns of a user message of about `--turn-tokens` tokens and the model's reply (`build`); then, at the turns a quarter, half and three quarters in, the conversation up to that turn's message sent again (`regenerate`), sent with another message in its place (`edit`), the edited branch taken a turn further (`follow`) and the original conversation, whole, a turn further (`return`); `/status` as `agent` |
 
 Every request timestamps each content chunk of its stream; its gaps are the
 intervals between consecutive chunks after the first. Each request may take
@@ -346,9 +348,39 @@ intervals between consecutive chunks after the first. Each request may take
 measured on any Mac). A request the client gets no whole answer to is
 unanswered, the server's failure: one the server keeps streaming past that
 time, though its keepalives hold the connection open, or one whose connection
-fails or closes before the stream's `data: [DONE]`. It ends `serve1` and
-`warm`, ends `ttft` as one of its warm-ups and fails its round otherwise; in
-`churn` its client records it, with its chunk times and why, and stops.
+fails or closes before the stream's `data: [DONE]`. It ends `serve1`, `warm`,
+`agent` and `edit`, ends `ttft` as one of its warm-ups and fails its round
+otherwise; in `churn` its client records it, with its chunk times and why, and
+stops.
+
+`agent` and `edit` measure what the SSD cache writes for the prefixes requests
+reuse; run them with the cache options to measure, such as
+`--server-args '--persistent-cache --cache-dir DIR'`, and a `--max-memory`
+under which the cache gives states up, or its reclaims write nothing. Each
+request records its time to first token, to its first output of any kind (a
+turn may answer with reasoning and a tool call alone), and the server's count
+of its prompt: its tokens, those the cache held (`cached`), those whose KV it
+read from cached blocks past them (`deduplicated`) and those it computed. Each
+turn records how far the cache's `/status` counters rose from its send to the
+next turn's: `disk.written_bytes` and `read_bytes`, the states written
+(`state.offloads`), given up and read back, the restore points copied, gone on
+from and refused (`disk.write_behind`), the KV pages demoted, copied ahead and
+restored, the lookups past a lost state, and the tokens reused. After the last
+turn the run reads `/status` until the cache has written nothing for 15 s (at
+most 120 s): the conversations' last restore points are copied 10 s after
+their publication, and that tail is reported apart. The summary, which
+`run.py` notes in `LABEL.out` and `check.py run` prints as readouts, gives the
+bytes written during the turns, per request (one turn of one conversation) and
+per 1,000 prompt tokens, by cause as far as the counters tell: KV pages
+demoted by reclaims, copied ahead for restore points and written through by
+`spill` requests, each at the plan's page size, and the rest, the states,
+which no counter splits between the reclaims that wrote them and the restore
+points' copies; the share of the prompts' tokens the cache held; and each kind
+of turn's median and longest time to first token (`first` and `loop` in
+`agent`). The tool results and user messages are slices of the client
+interpreter's standard library sources, the same for every tree, whose digest
+the summary records; the model's replies, which the conversations send back,
+differ from run to run.
 
 ```sh
 .venv/bin/python -m dev.benchmarks.serving.run --tree TREE --machine m6 \
@@ -388,7 +420,8 @@ directory.
   quiet machine, the two A runs and the two B runs must each be one build,
   and every per-request metric the four share (churn's TTFT, completion latency and
   decode milliseconds per token, ttft's TTFT per concurrency, serve1's TTFT
-  and decode per size, warm's prompt time per depth) must pass the release check's speed rule
+  and decode per size, warm's prompt time per depth, agent's and edit's TTFT
+  per kind of turn) must pass the release check's speed rule
   (`dev/benchmarks/abba.py`).
 
 A run measured nothing and is to be repeated when it did not end with `DONE`
@@ -411,7 +444,8 @@ these do not excuse, notes them.
 | Churn | the run lasted its load window (`--minutes`) and every client completed a request |
 | First token | no answered request (G8 judges unanswered ones) waited for its first token more than twice the prefill time, at the run's own rate (the tokens its answered requests prefilled over the time from the first send to the last answer), of the work the scheduler may put ahead of it: the requests in flight at its send, 24,576 rows of later arrivals (three prefill commands of at most 8,192 rows, the most that may pass over it in a row) and its own prompt, each less its cached tokens; a starvation guard, not a speed check |
 
-G8 applies to every scenario, the others to churn runs. The check also counts
+G8 applies to every scenario, the others to churn runs, and the check of an
+`agent` or `edit` run notes what it measured. The check also counts
 the client gaps past the decode gap target of 500 ms by cause, each taking the
 first of these that the `/status` samples from 2 s before it to 2 s after it
 show: a claim waiting for memory, the experts' size changing, a compaction, a

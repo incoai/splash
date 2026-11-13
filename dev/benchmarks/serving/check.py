@@ -65,6 +65,8 @@ OVERTAKE_ROWS = 3 * 4 * 2048
 # 2.35 times it or more.
 FIRST_TOKEN_MARGIN = 2
 THERMAL_HOT = ("serious", "critical")
+# The scenarios whose runs end in clients.write_summary's summary.
+CONVERSATION_SCENARIOS = ("agent", "edit")
 # A process the run did not start, among the top five by CPU at this share or
 # more, competes with the server and voids a timed comparison (not_quiet):
 # twice the busiest steady system process on the Studio (WindowServer,
@@ -469,6 +471,58 @@ def first_token_waits(run: Run) -> list[tuple[dict, float]]:
     return waits
 
 
+def mebibytes(count: float) -> str:
+    return f"{count / (1 << 20):,.1f} MiB"
+
+
+def write_notes(run: Run) -> list[str]:
+    """An agent or edit run's readouts, from its summary
+    (clients.write_summary): what the SSD cache wrote during the turns, per
+    request and per 1,000 prompt tokens, by cause, and after the last turn;
+    what the requests reused and the cache read back; and each kind of
+    turn's time to first token."""
+    summary = next((e for e in run.events if e.get("kind") == "summary"), None)
+    if summary is None:
+        return []
+    counters, tail = summary["counters"], summary["tail_counters"]
+
+    def by_cause(causes, state_writes):
+        return (
+            f"states {mebibytes(causes['states'])} in {state_writes:g} writes, "
+            f"KV copied ahead {mebibytes(causes['kv_copies'])}, "
+            f"KV demoted {mebibytes(causes['kv_demotions'])}, "
+            f"KV spilled {mebibytes(causes['kv_spill'])}"
+        )
+
+    notes = [
+        f"written: {mebibytes(summary['written_bytes'])} over "
+        f"{summary['requests']} requests, "
+        f"{mebibytes(summary['written_bytes_per_request'] or 0)} a request, "
+        f"{mebibytes(summary['written_bytes_per_1k_prompt_tokens'] or 0)} "
+        "per 1,000 prompt tokens: "
+        + by_cause(summary["written_by_cause"], counters["state.offloads"]),
+        f"written after the last turn: {mebibytes(summary['tail_written_bytes'])}: "
+        + by_cause(summary["tail_written_by_cause"], tail["state.offloads"]),
+        f"restore points: {counters['disk.write_behind.durable']:g} copied, "
+        f"{counters['disk.write_behind.unneeded']:g} gone on from first, "
+        f"{counters['disk.write_behind.refused']:g} refused; after the last turn "
+        f"{tail['disk.write_behind.durable']:g} copied",
+        f"reuse: {(summary['reuse_rate'] or 0):.1%} of "
+        f"{summary['prompt_tokens']} prompt tokens cached, "
+        f"{summary['deduplicated_tokens']} more read from cached KV; "
+        f"{counters['state.disk_hits']:g} states and "
+        f"{counters['disk.kv_restores']:g} KV pages from the SSD "
+        f"({mebibytes(counters['disk.read_bytes'])} read), "
+        f"{counters['cache.lost_state_misses']:g} lookups past a lost state",
+    ]
+    notes += [
+        f"first token, {kind}: median {times['median']:g} ms, max "
+        f"{times['max']:g} ms over {times['n']} requests"
+        for kind, times in summary["ttft_ms"].items()
+    ]
+    return notes
+
+
 def check_run(
     run: Run,
     minutes: float | None = None,
@@ -478,13 +532,17 @@ def check_run(
     """One run on its own: `invalid` reasons, `failures` and `notes`, among
     them why its machine was not quiet. Every run is judged on G8; a churn
     run also on its load window, every client served, G4, G9, the store
-    line and its first tokens' waits (FIRST_TOKEN_MARGIN)."""
+    line and its first tokens' waits (FIRST_TOKEN_MARGIN). An agent or edit
+    run notes what it measured (write_notes)."""
     result = {
         "invalid": invalid(run, build, streamed),
         "failures": g8_failures(run),
         "notes": [f"not quiet: {reason}" for reason in not_quiet(run)],
     }
-    if run.meta.get("scenario", "churn") != "churn":
+    scenario = run.meta.get("scenario", "churn")
+    if scenario in CONVERSATION_SCENARIOS:
+        result["notes"] += write_notes(run)
+    if scenario != "churn":
         return result
     failures, notes = result["failures"], result["notes"]
     if minutes is not None and (run.end is None or run.end["t"] < minutes * 60):
@@ -528,7 +586,7 @@ def metrics(run: Run) -> dict[str, list[float]]:
     """The per-request samples of each lower-is-better metric of a run:
     churn's TTFT, completion latency and decode milliseconds per token,
     ttft's TTFT per concurrency, serve1's TTFT and decode per size, warm's
-    prompt time per depth."""
+    prompt time per depth, agent's and edit's TTFT per kind of turn."""
     found: dict[str, list[float]] = {}
     scenario = run.meta.get("scenario", "churn")
 
@@ -550,6 +608,8 @@ def metrics(run: Run) -> dict[str, list[float]]:
                 f"serve1_{record['size']}_decode_ms_per_token",
                 record.get("decode_ms_per_token"),
             )
+        elif record.get("kind") == "request" and scenario in CONVERSATION_SCENARIOS:
+            add(f"{scenario}_{record['turn_kind']}_ttft_ms", record.get("ttft_ms"))
         elif record.get("kind") == "warm" and not record.get("discarded"):
             add(f"warm_{record['depth']}_prompt_ms", record.get("prompt_ms"))
     return found
