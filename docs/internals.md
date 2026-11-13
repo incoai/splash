@@ -709,7 +709,11 @@ least `following`'s, since it starts as the one before drains. Each threadgroup 
 columns of a K step of the projection's bits per weight (`ProjectionShape::weightBits16`, the
 most a format stores where the formats are unknown, which bounds the scratch), and a split
 grid's threadgroups each also store their fp32 partials of the tile's rows, which the last
-partition reads back. The constants come from sweeps of 2 to 40 threadgroups per core on the
+partition to arrive at the tile's counter reads back (`kernels/common/split_reduce.h`, which
+the register tile's splits and the sampled draw's vocabulary ranges share): every thread
+fences its stores at device scope before its threadgroup arrives, and every thread of the
+last one fences again before it reads, since a barrier orders memory for its own threadgroup
+alone. The constants come from sweeps of 2 to 40 threadgroups per core on the
 32-core M5 Max, the 20-core M5 Pro and the 12-core M6 (`gguf-projection-benchmark`, which times
 a gate/up pair in both pass modes; MLX 4-bit and six GGUF formats at 2048 and 5120 inputs,
 gate/up pairs in MLX 4-bit): time per byte steps up past 10 and 16 threadgroups per core at one
