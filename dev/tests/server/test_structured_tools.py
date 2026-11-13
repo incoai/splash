@@ -628,6 +628,30 @@ class StructuredToolGrammarTest(unittest.TestCase):
                 )
                 self.assert_not_complete(text, thinking=True)
 
+    def test_a_json_answer_starts_at_once_or_after_the_reasoning(self):
+        # Without reasoning the value is the first token; after reasoning,
+        # whitespace may part them.
+        chat_format = replace(QWEN, think_end_id=self.tokenizer.token_to_id("</think>"))
+        for thinking, text, complete in (
+            (False, ANSWER, True),
+            (False, "\n" + ANSWER, False),
+            (False, "    \r\n\n\n" + ANSWER, False),
+            (True, "Plan.</think>" + ANSWER, True),
+            (True, "Plan.</think>\n\n" + ANSWER, True),
+        ):
+            with self.subTest(thinking=thinking, text=text):
+                grammar = tool_schema.json_grammar(
+                    SCHEMA, thinking, chat_format=chat_format
+                )
+                matcher = LLMatcher(self.guidance, grammar)
+                tokens = self.tokenizer.encode(text).ids
+                self.assertEqual(
+                    matcher.validate_tokens(tokens) == len(tokens)
+                    and matcher.consume_tokens(tokens)
+                    and matcher.is_accepting(),
+                    complete,
+                )
+
     def test_thinking_cannot_spell_its_close_in_text(self):
         # The reasoning splitter ends thinking at the first decoded
         # "</think>", so an ordinary-token spelling must not stay in thinking.

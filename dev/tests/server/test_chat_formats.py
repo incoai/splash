@@ -433,6 +433,8 @@ class GlmGrammarTests(unittest.TestCase):
         for text, accepted in (
             ('{"a": 1}', True),
             ('<think>One.</think>{"a": 1}', True),
+            ('<think>One.</think>\n\n{"a": 1}', True),
+            ('\n{"a": 1}', False),
             ('{"a": 1}<think>x</think>', False),
             ('<think>One.</think>{"a": "1"}', False),
         ):
@@ -503,7 +505,7 @@ class QwenGrammarTests(unittest.TestCase):
         )
         self.assertEqual(
             tool_schema.json_grammar({"type": "integer"}, False, chat_format=QWEN),
-            "%llguidance {}\nstart: WS %json "
+            "%llguidance {}\nstart: %json "
             + json.dumps(
                 tool_schema._grammar_compatible_schema({"type": "integer"}),
                 separators=(",", ":"),
