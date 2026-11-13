@@ -2591,7 +2591,10 @@ only the forms it restores.
 transfers under `disk`. Its cumulative `read_bytes` and `written_bytes` count
 bytes transferred by file IO across KV and state files, including partial or
 cancelled transfers. They exclude
-filesystem metadata and physical SSD write amplification. State transfers appear
+filesystem metadata and physical SSD write amplification. Its write rate,
+`written_last_hour_bytes` and `written_last_day_bytes`, is what the write
+budget counts, the host pages of each write submitted, in the last 60 and
+1,440 minutes of the awake clock (`model::DiskBudget::writeRate`). State transfers appear
 under `state` (`disk_bytes`, `offloads`, `disk_hits`, `disk_promotions`). Cache
 counters include:
 

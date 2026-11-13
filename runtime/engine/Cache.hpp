@@ -114,6 +114,9 @@ struct KvTierSnapshot final {
   uint64_t writesDeferredMicroseconds = 0;
   uint64_t readBytes = 0;
   uint64_t writtenBytes = 0;
+  // What the tier's writes took over the last hour and the last day
+  // (model::DiskBudget::writeRate).
+  model::DiskBudget::WriteRate writeRate;
   uint64_t demotions = 0;
   uint64_t demotionFailures = 0;
   // Demotions the tier had no room for; the leaf stayed and the requester

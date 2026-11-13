@@ -4,6 +4,7 @@
 #include "Checked.hpp"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -187,6 +188,27 @@ public:
   // reach the disk (WriteBehind::flush).
   void lift() noexcept { lifted_ = true; }
 
+  // The write rate: what the tier's writes took over the last hour and the
+  // last day, counted as the write budget counts them, in the host pages
+  // each write stores and on its clock, with a write budget or without. The
+  // day's bytes are what a write budget would have had to cover, so they
+  // are the number to set one from and to hold against the drive's rated
+  // endurance; the hour's are what the load of the moment writes, 24 times
+  // which projects a day before one has passed. The cumulative count alone
+  // (writtenBytes) says neither without a second reading and the time
+  // between them: a deployment that read its count after 22 h found 1.85 TB,
+  // 7 times its quota a day. Each window ends now and is exact to a minute
+  // of the clock; a process younger than a window has written all of its
+  // count. Engine thread.
+  struct WriteRate final {
+    uint64_t hourBytes = 0;
+    uint64_t dayBytes = 0;
+  };
+  [[nodiscard]] WriteRate writeRate() const noexcept {
+    const uint64_t minute = minuteAt(clock_());
+    return {chargedWithin(kHourMinutes, minute), chargedWithin(kDayMinutes, minute)};
+  }
+
   // A write of the tier found its volume full (ENOSPC, EDQUOT). The worker
   // that met it only reports it: its file goes on, and what the engine
   // admits does not change until it measures the volume
@@ -226,15 +248,37 @@ private:
   friend class SlotFile;
   static constexpr double kDayMilliseconds = 86'400'000.0;
 
+  static constexpr double kMinuteMilliseconds = 60'000.0;
+  static constexpr uint64_t kHourMinutes = 60;
+  static constexpr uint64_t kDayMinutes = 1440;
+
   // The balance at `now` on the budget's clock.
   [[nodiscard]] double balanceAt(double now) const noexcept {
     return std::min(burstBytes_, balance_ + refillPerMillisecond_ * (now - balanceTime_));
   }
+  [[nodiscard]] static uint64_t minuteAt(double now) noexcept {
+    return static_cast<uint64_t>(now / kMinuteMilliseconds);
+  }
+  // What was charged in the `minutes` minutes of the clock that end with
+  // `minute`. The minutes after the last charge took nothing: their places
+  // still hold what was charged a day before them.
+  [[nodiscard]] uint64_t chargedWithin(uint64_t minutes, uint64_t minute) const noexcept {
+    uint64_t bytes = 0;
+    for (uint64_t ago = minute - chargedMinute_; ago < minutes && ago <= minute; ++ago)
+      bytes += charged_[(minute - ago) % kDayMinutes];
+    return bytes;
+  }
   // The host pages a write stores, as SlotFile::write submits it.
   void charge(uint64_t bytes) noexcept {
+    const double now = clock_();
+    const uint64_t minute = minuteAt(now);
+    // The minutes since the last charge took nothing.
+    for (uint64_t idle = chargedMinute_ + 1; idle <= minute && idle - chargedMinute_ <= kDayMinutes; ++idle)
+      charged_[idle % kDayMinutes] = 0;
+    chargedMinute_ = minute;
+    charged_[minute % kDayMinutes] += bytes;
     if (!refillPerMillisecond_)
       return;
-    const double now = clock_();
     balance_ = balanceAt(now) - static_cast<double>(bytes);
     balanceTime_ = now;
   }
@@ -259,6 +303,11 @@ private:
   double balance_ = 0.0;
   double balanceTime_ = 0.0;
   bool lifted_ = false;
+  // The write rate, on the engine thread: what each of the last day's
+  // minutes of the clock was charged, a minute's at its number modulo the
+  // day's, and the minute of the last charge.
+  std::array<uint64_t, kDayMinutes> charged_{};
+  uint64_t chargedMinute_ = 0;
 };
 
 // One slot a persistent file keeps from an earlier process, as its record

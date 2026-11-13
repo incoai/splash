@@ -514,6 +514,8 @@ void writeDisk(json::Writer &w, const engine::EngineSnapshot &core) {
         .field("writes_deferred_ms", tier.writesDeferredMicroseconds / 1000.0)
         .field("read_bytes", tier.readBytes)
         .field("written_bytes", tier.writtenBytes)
+        .field("written_last_hour_bytes", tier.writeRate.hourBytes)
+        .field("written_last_day_bytes", tier.writeRate.dayBytes)
         .field("kv_blocks", tier.diskBlocks)
         .field("kv_bytes", tier.diskBytes)
         .field("kv_demotions", tier.demotions)

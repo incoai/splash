@@ -3119,6 +3119,7 @@ CacheSnapshot Cache::snapshot() const {
     tier.writesDeferredMicroseconds = diskBudget_->writesDeferredMicroseconds();
     tier.readBytes = diskBudget_->readBytes();
     tier.writtenBytes = diskBudget_->writtenBytes();
+    tier.writeRate = diskBudget_->writeRate();
   }
   if (tier_)
     tier.diskBytes = uint64_t{tier.diskBlocks} * tier_->slotBytes();
