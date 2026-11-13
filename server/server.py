@@ -1414,6 +1414,17 @@ def main():
             serve_record.warming(args.serve_record, event.steps_done, event.steps)
 
         runtime.on_warming = warming
+
+        def engine_recovering(recovering):
+            # The record follows the engine once the server is ready, for
+            # what supervises it by the file (serve_record). It runs on the
+            # thread the change came on, which must not block (follow): a
+            # record that cannot be written is a queued warning line.
+            if recovering:
+                serve_record.recovering(args.serve_record)
+            else:
+                serve_record.recovered(args.serve_record)
+
         backend = NativeBackend(
             runtime,
             tokenizer,
@@ -1453,6 +1464,8 @@ def main():
         # The app takes the server for ready from its record alone: one that
         # cannot say so has not started (serve_record).
         serve_record.ready(args.serve_record)
+        # Told at once of an engine that failed since its Ready.
+        backend.follow(engine_recovering)
         address = (
             server.host
             if server.address_family == socket.AF_UNIX
