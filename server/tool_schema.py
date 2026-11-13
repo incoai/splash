@@ -1014,17 +1014,24 @@ def _reasoning(thinking, chat_format):
 
 def json_grammar(schema, thinking, *, chat_format):
     """The output grammar of a request with a response schema and no tools:
-    the reasoning chat_format lets come first (_reasoning), then the JSON."""
-    think, think_rule = _reasoning(thinking, chat_format)
+    the reasoning chat_format lets come first (_reasoning), then the JSON.
+    Whitespace sets the JSON apart from reasoning only: without reasoning the
+    value starts at the first token, as a model that prefers whitespace would
+    otherwise spend its first tokens on it."""
+    _, think_rule = _reasoning(thinking, chat_format)
+    if think_rule is None:
+        lead = ""
+    else:
+        lead = "think WS " if thinking else "(think WS)? "
     grammar = [
         "%llguidance {}",
-        f"start: {think}WS %json "
+        f"start: {lead}%json "
         + json.dumps(_grammar_compatible_schema(schema), separators=(",", ":")),
     ]
     if think_rule is not None:
         grammar.append(think_rule)
         grammar.append(_text_rule(THINK_END))
-    grammar.append(WHITESPACE_RULE)
+        grammar.append(WHITESPACE_RULE)
     return "\n".join(grammar) + "\n"
 
 

@@ -433,8 +433,27 @@ class GlmGrammarTests(unittest.TestCase):
         for text, accepted in (
             ('{"a": 1}', True),
             ('<think>One.</think>{"a": 1}', True),
+            # Whitespace sets the value apart from reasoning, and without
+            # reasoning the value starts at the first token.
+            ('<think>One.</think>\n\n{"a": 1}', True),
+            ('\n\n{"a": 1}', False),
+            (' {"a": 1}', False),
             ('{"a": 1}<think>x</think>', False),
             ('<think>One.</think>{"a": "1"}', False),
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(self.accepts(grammar, text), accepted)
+
+    def test_a_response_schema_follows_the_required_reasoning(self):
+        grammar = tool_schema.json_grammar(
+            {"type": "object", "properties": {"a": {"type": "integer"}}},
+            True,
+            chat_format=self.chat_format,
+        )
+        for text, accepted in (
+            ('One.</think>{"a": 1}', True),
+            ('One.</think>\n\n{"a": 1}', True),
+            ('{"a": 1}', False),
         ):
             with self.subTest(text=text):
                 self.assertEqual(self.accepts(grammar, text), accepted)
@@ -503,13 +522,11 @@ class QwenGrammarTests(unittest.TestCase):
         )
         self.assertEqual(
             tool_schema.json_grammar({"type": "integer"}, False, chat_format=QWEN),
-            "%llguidance {}\nstart: WS %json "
+            "%llguidance {}\nstart: %json "
             + json.dumps(
                 tool_schema._grammar_compatible_schema({"type": "integer"}),
                 separators=(",", ":"),
             )
-            + "\n"
-            + tool_schema.WHITESPACE_RULE
             + "\n",
         )
 
