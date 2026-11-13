@@ -35,11 +35,11 @@ Tokenizer files and the tokenizer object are never modified.
 
 A custom template, the source of the file --chat-template-file names,
 replaces every template the tokenizer defines, named ones included, and is
-probed as they are. It must render a question at startup: Splash never falls
-back from it to the tokenizer's.
+probed as they are. The probe must find its generation prompt, without which
+it would serve no request: Splash never falls back from it to the
+tokenizer's.
 """
 
-import hashlib
 import json
 import re
 import sys
@@ -98,23 +98,13 @@ LATER_SYSTEM_UNSUPPORTED = (
 
 class ChatTemplateError(ValueError):
     """No chat template Splash can serve: the tokenizer has none, or a custom
-    one cannot be read or rendered."""
-
-
-@dataclass(frozen=True, slots=True)
-class TemplateFile:
-    """A custom chat template, read from its file once: the file's path, its
-    source and the SHA-256 of its bytes."""
-
-    path: Path
-    source: str
-    sha256: str
+    one cannot be read or would serve no request."""
 
 
 def read_template_file(path):
     """The custom chat template in the file at path: its UTF-8 text as
-    written, which Jinja must compile as transformers does. Whether it
-    renders is checked by ChatTemplates."""
+    written. Whether it serves requests is checked by ChatTemplates, which
+    renders it as requests do."""
     try:
         data = Path(path).read_bytes()
     except OSError as error:
@@ -129,14 +119,7 @@ def read_template_file(path):
         ) from None
     if not source.strip():
         raise ChatTemplateError(f"the chat template {path} is empty")
-    try:
-        _SYNTAX.compile(source)
-    except TemplateSyntaxError as error:
-        raise ChatTemplateError(
-            f"the chat template {path} is not a Jinja template Splash renders: "
-            f"line {error.lineno}: {error.message}"
-        ) from None
-    return TemplateFile(Path(path), source, hashlib.sha256(data).hexdigest())
+    return source
 
 
 # What a template that rejects one of the REASONING_EFFORTS renders instead;
@@ -238,12 +221,10 @@ class ChatTemplates:
     chosen once at startup."""
 
     def __init__(self, tokenizer, *, override=None):
-        """override, a custom template's source (TemplateFile), is the one
-        template every request renders with, in place of all the tokenizer
-        defines."""
+        """override, a custom template's source (read_template_file), is the
+        one template every request renders with, in place of all the
+        tokenizer defines."""
         if override is not None:
-            if not isinstance(override, str) or not override.strip():
-                raise ChatTemplateError("the custom chat template is empty")
             named = {None: override}
         else:
             defined = tokenizer.chat_template
@@ -255,13 +236,13 @@ class ChatTemplates:
             if not all(isinstance(source, str) and source for source in named.values()):
                 raise ChatTemplateError("the tokenizer defines no chat template")
         render, encode = _renderer(tokenizer), _encoder(tokenizer)
-        if override is not None:
-            _require_rendering(render, override)
         prepared = {}
         for source in named.values():
             if source not in prepared:
                 prepared[source] = _prepare(render, encode, source)
         self.templates = {name: prepared[source] for name, source in named.items()}
+        if override is not None:
+            _require_generation_prompt(render, self.templates[None])
 
     def select(self, tools):
         """The template the tokenizer itself would choose for this request."""
@@ -333,16 +314,27 @@ def _encoder(tokenizer):
     return encode
 
 
-def _require_rendering(render, source):
-    """Raise unless a custom template renders a question as a request renders
-    one: the probe records what a template rejects, and requests would all
-    fail on one that renders nothing."""
+def _require_generation_prompt(render, template):
+    """Raise unless the probe found a custom template's generation prompt
+    for a request that sets no template option. Every prompt must end with
+    the one the probe found (the frontend's 400 otherwise), so a template
+    without one, or one that cannot render a question at all, would start a
+    server that refuses every chat request."""
+    options = _effort_options(None)
+    if _generation_key(options) in template.generation_prompts:
+        return
     try:
-        render(source, [_ASK], {"add_generation_prompt": True})
+        render(template.source, [_ASK], options)
+    except TemplateSyntaxError as error:
+        reason = f"line {error.lineno}: {error.message}"
     except Exception as error:  # templates raise what they like
-        raise ChatTemplateError(
-            f"the custom chat template cannot render a conversation: {error}"
-        ) from None
+        reason = f"it cannot render a question: {error}"
+    else:
+        reason = (
+            "it must end the prompt of a question, of a follow-up and of a "
+            "tool result with the same generation prompt"
+        )
+    raise ChatTemplateError(f"the custom chat template serves no request: {reason}")
 
 
 def _prepare(render, encode, source):
@@ -745,9 +737,6 @@ class _TagNumbers(Extension):
 _ENVIRONMENT = Environment(
     extensions=["jinja2.ext.loopcontrols", _Generation, _TagNumbers]
 )
-# Compiles a template as transformers' sandbox does, with the same tags and
-# filters, and reports Jinja's own line numbers.
-_SYNTAX = Environment(extensions=["jinja2.ext.loopcontrols", _Generation])
 _STATEMENT_HEAD = re.compile(r"\{%[-+]?\s*")
 
 

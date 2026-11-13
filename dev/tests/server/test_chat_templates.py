@@ -1,5 +1,4 @@
 import copy
-import hashlib
 import json
 import tempfile
 import unittest
@@ -1131,17 +1130,37 @@ class CustomChatTemplateTests(unittest.TestCase):
         self.assertNotEqual(chosen.source, source("qwen36"))
         self.assertTrue(templates.describe().startswith("patched to render"))
 
-    def test_a_custom_template_that_cannot_render_stops_startup(self):
-        # Splash never falls back from a custom template to the tokenizer's.
+    def test_a_custom_template_that_serves_no_request_stops_startup(self):
+        # Splash never falls back from a custom template to the tokenizer's,
+        # and a prompt must end with the generation prompt the probe found.
+        prompts = "a question, of a follow-up and of a tool result"
         for override, refusal in (
-            ("", "the custom chat template is empty"),
-            (" \n", "the custom chat template is empty"),
             (
                 "{{ raise_exception('not this model') }}",
-                "cannot render a conversation: not this model",
+                "serves no request: it cannot render a question: not this model",
             ),
-            ("{{ messages[0].content.missing() }}", "cannot render a conversation"),
-            ("{% for message in messages %}", "cannot render a conversation"),
+            (
+                "{{ messages[0].content.missing() }}",
+                "it cannot render a question: 'str object' has no attribute",
+            ),
+            (
+                "{% for message in messages %}",
+                "serves no request: line 1: Unexpected end of template",
+            ),
+            (
+                "\n{{ messages | no_such_filter }}",
+                "serves no request: line 2: No filter named 'no_such_filter'",
+            ),
+            # It renders, but opens no assistant turn.
+            (self.NATIVE, f"it must end the prompt of {prompts} with the same"),
+            (" \n", f"it must end the prompt of {prompts} with the same"),
+            # It opens one for a question alone.
+            (
+                self.CUSTOM.replace(
+                    "if add_generation_prompt", "if messages | length == 1"
+                ),
+                f"it must end the prompt of {prompts} with the same",
+            ),
         ):
             with (
                 self.subTest(override=override),
@@ -1149,7 +1168,17 @@ class CustomChatTemplateTests(unittest.TestCase):
             ):
                 ChatTemplates(tokenizer(self.NATIVE), override=override)
 
-    def test_a_template_file_is_read_once_as_written(self):
+    def test_a_refused_custom_template_would_refuse_every_request(self):
+        # What startup spares a server: with the same template as the
+        # tokenizer's own, which is not held to it, no request is served.
+        frontend = chat_frontend(self.NATIVE)
+        with self.assertRaisesRegex(APIError, "must end with an assistant generation"):
+            frontend.apply_template(
+                {"messages": [{"role": "user", "content": "Hi"}]},
+                deadline=fixtures.FOREVER,
+            )
+
+    def test_a_template_file_is_read_as_written(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             # Its bytes as written: a byte order mark, CRLF and surrounding
@@ -1157,34 +1186,13 @@ class CustomChatTemplateTests(unittest.TestCase):
             data = b"\xef\xbb\xbf  " + self.CUSTOM.encode() + b"\r\n\r\n"
             path = root / "custom template.jinja"
             path.write_bytes(data)
-            read = read_template_file(path)
-            self.assertEqual(
-                (read.path, read.source, read.sha256),
-                (path, data.decode(), hashlib.sha256(data).hexdigest()),
-            )
-            # transformers' own tags compile.
-            path.write_text(
-                "{% for m in messages %}{% if loop.first %}{% continue %}"
-                "{% endif %}{% generation %}{{ m.content | tojson }}"
-                "{% endgeneration %}{% endfor %}"
-            )
-            read_template_file(path)
+            self.assertEqual(read_template_file(path), data.decode())
             (root / "folder").mkdir()
             for name, data, refusal in (
                 ("absent.jinja", None, "absent.jinja: No such file or directory"),
                 ("folder", None, "folder: Is a directory"),
                 ("latin.jinja", "é".encode("latin-1"), "latin.jinja is not UTF-8"),
                 ("blank.jinja", b" \n\t", "blank.jinja is empty"),
-                (
-                    "open.jinja",
-                    b"{% for message in messages %}",
-                    "open.jinja is not a Jinja template Splash renders: line 1:",
-                ),
-                (
-                    "filter.jinja",
-                    b"\n{{ messages | no_such_filter }}",
-                    "line 2: No filter named 'no_such_filter'",
-                ),
             ):
                 path = root / name
                 if data is not None:
@@ -1194,6 +1202,19 @@ class CustomChatTemplateTests(unittest.TestCase):
                     self.assertRaisesRegex(ChatTemplateError, refusal),
                 ):
                     read_template_file(path)
+
+    def test_a_custom_template_with_transformers_own_tags_serves(self):
+        templates = ChatTemplates(
+            tokenizer(self.NATIVE),
+            override="{% for m in messages %}{% if m.role == 'tool' %}"
+            "{% continue %}{% endif %}{{ m.content | tojson }}{% endfor %}"
+            "{% if add_generation_prompt %}{% generation %}> {% endgeneration %}"
+            "{% endif %}",
+        )
+        text, _tokens = templates.select(None).generation_prompt(
+            {"add_generation_prompt": True}
+        )
+        self.assertEqual(text, "> ")
 
     def test_every_request_path_uses_the_custom_template(self):
         recording = ChatTemplateFrontendTests.OffsetTokenizer(

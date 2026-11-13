@@ -516,14 +516,26 @@ upstream fixtures are in `dev/tests/fixtures/chat_templates/`.
 Jinja file that every request renders with, in place of every template the
 tokenizer defines, `tool_use` included; without it, the tokenizer's templates
 serve as before. The server reads the file once at startup, probes it as it
-probes the tokenizer's, and logs its path and SHA-256 (`Chat template file ·
-...`); a later change to the file takes effect at the next start. A file that
-cannot be read, is not UTF-8, is blank or is not a Jinja template stops
-startup, as does a template that cannot render a question, before any weights
-load; Splash never falls back to the model's templates. The template supplies
-formatting alone: the vocabulary, special tokens and the [chat
-format](#chat-formats) the output is read in remain the model's. Preparation
-is unchanged: a GGUF still needs a chat template of its own.
+probes the tokenizer's, and logs its path (`Chat template file · ...`); a
+later change to the file takes effect at the next start. A file that cannot be
+read, is not UTF-8 or is blank stops startup, as does a template that would
+serve no request, before any weights load: one transformers cannot compile
+(the error names the line), one that cannot render a question, and one whose
+prompts for a question, a follow-up and a tool result do not end with one
+generation prompt, which every request's prompt must end with. Splash never
+falls back to the model's templates.
+
+The template supplies formatting alone: the vocabulary, special tokens and the
+[chat format](#chat-formats) the output is read in remain the model's.
+Whether a request thinks, and what `/v1/models` reports of reasoning, follow
+the generation prompt the template renders for the request's effort, as with
+the model's own. Startup does not check that the template writes the family's
+format, so that is the template's to keep: the server reads tool calls only in
+the family's layout, whatever layout the template shows the model, and serves
+an image only where the template's source holds the family's image
+placeholder (`<|image_pad|>`) and renders one for each image; a request with
+an image fails with a 400 otherwise. Preparation is unchanged: a GGUF still
+needs a chat template of its own.
 
 ## Chat formats
 

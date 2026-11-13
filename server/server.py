@@ -1218,16 +1218,6 @@ def _native_command(args, model_root, relaunch_context=None):
     return command
 
 
-def _custom_template(path):
-    """The source of the chat template file --chat-template-file names
-    (path), which startup logs with its digest, or None."""
-    if path is None:
-        return None
-    custom = read_template_file(path)
-    print_status(f"Chat template file · {custom.path} · sha256 {custom.sha256}")
-    return custom.source
-
-
 def _raise_descriptor_limit():
     """Raise the soft descriptor limit to DESCRIPTOR_LIMIT, or to the hard
     limit when that is lower; a higher soft limit stays."""
@@ -1343,7 +1333,13 @@ def main():
                 f"{args.model} is not prepared as a model of a family this "
                 "release serves: prepare it again"
             )
-        custom = _custom_template(args.chat_template_file)
+        # A file that cannot be read stops the start before the tokenizer
+        # loads; whether its template serves requests is found with the
+        # tokenizer (ChatTemplates).
+        custom = None
+        if args.chat_template_file is not None:
+            custom = read_template_file(args.chat_template_file)
+            print_status(f"Chat template file · {args.chat_template_file}")
         # A tokenizer the loader cannot read fails with whatever its parsers
         # raise, such as a KeyError for a tokenizer.json without added_tokens:
         # each is the model's.

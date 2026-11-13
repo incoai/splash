@@ -1,6 +1,5 @@
 import contextlib
 import dataclasses
-import hashlib
 import io
 import json
 import math
@@ -966,13 +965,7 @@ class CustomTemplateStartupTests(unittest.TestCase):
         templates.assert_called_once_with(
             tokenizer.return_value, override=data.decode()
         )
-        self.assertEqual(
-            self.file_lines(status),
-            [
-                f"Chat template file · {path} · sha256 "
-                + hashlib.sha256(data).hexdigest()
-            ],
-        )
+        self.assertEqual(self.file_lines(status), [f"Chat template file · {path}"])
         # Without one, the tokenizer's templates, and no line.
         templates, tokenizer, _, status = self.start(main_args())
         templates.assert_called_once_with(tokenizer.return_value, override=None)
