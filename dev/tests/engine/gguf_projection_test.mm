@@ -1507,6 +1507,7 @@ void splitVisibility(MetalBackend &backend, const Linear &linear, LinearTile til
 void tokenGather(MetalBackend &backend) {
   constexpr uint32_t kVocabulary = 64, kHidden = 1024;
   const std::vector<uint32_t> tokens{kVocabulary - 1, 0, 17, 17, 42, 3, kVocabulary - 1, 29, 8};
+  uint32_t planeFormats = 0;
   for (int fi = 0; fi < FMT_COUNT; ++fi) {
     const Fmt f = Fmt(fi);
     const std::vector<uint8_t> native = makeNative(f, kVocabulary, kHidden, rng);
@@ -1525,6 +1526,22 @@ void tokenGather(MetalBackend &backend) {
       for (uint32_t k = 0; k < kHidden; ++k) differ += got[r * kHidden + k] != floatToBf16(values[k]);
     }
     if (differ) fail(std::string(fmtName(f)) + " gather: " + std::to_string(differ) + " values differ from bf16(GGML)");
+    if (!Embedding::gathersPlanes(f)) continue;
+    // A tied head's table, the same rows read from the projection's planes: the native gather's bf16 values.
+    const Packed planes = repack(f, native, kVocabulary, kHidden, nullptr);
+    const EmbeddingWeights planeTable(
+        kVocabulary, kHidden,
+        QuantizedSegment::planes(f, kVocabulary, kHidden, upload(backend, planes.w0),
+                                 kQuantFormats[f].plane1_bytes ? upload(backend, planes.w1) : MetalBuffer{},
+                                 upload(backend, planes.meta)));
+    const Guarded fromPlanes(backend, tokens.size() * kHidden * 2, 0xFF);
+    CommandGraph planeGraph;
+    Embedding::add(planeGraph, ids.view, planeTable, fromPlanes.view, uint32_t(tokens.size()));
+    static_cast<void>(backend.submitCommandAsync(planeGraph.dispatches()).wait());
+    if (!fromPlanes.intact()) fail(std::string(fmtName(f)) + " planes gather writes past its output");
+    if (fromPlanes.halves() != got)
+      fail(std::string(fmtName(f)) + " planes gather differs from the gather of its native rows");
+    ++planeFormats;
   }
   for (const auto &[format, hidden] : {std::pair{BF16, kHidden}, std::pair{BF16, 160u}, std::pair{F16, kHidden},
                                       std::pair{F16, 160u}}) {
@@ -1550,8 +1567,9 @@ void tokenGather(MetalBackend &backend) {
     if (differ) fail(name + " gather: " + std::to_string(differ) + " values differ from bf16 of the table's");
   }
   section("token gather: " + std::to_string(FMT_COUNT) +
-          " formats, each value bf16 of GGML's fp32 value, and bf16 and f16 rows of random bits at 1024 and 160 "
-          "values, each value bf16 of the stored one");
+          " formats, each value bf16 of GGML's fp32 value, " + std::to_string(planeFormats) +
+          " of them from a projection's planes as from their rows, and bf16 and f16 rows of random bits at 1024 and "
+          "160 values, each value bf16 of the stored one");
 }
 
 // A streamed table's gather (Qwen4ExpTarget::addPleGather): a SparseRowStore

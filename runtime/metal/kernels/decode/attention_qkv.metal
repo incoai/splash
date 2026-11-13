@@ -79,6 +79,8 @@ VERIFY_ATTENTION_QKV(verify_attention_qkv_kv2_g8_f32, 16, 2, 256, 32, true, floa
 VERIFY_ATTENTION_QKV(verify_attention_qkv_kv2_g12_f32, 24, 2, 256, 32, true, float)
 VERIFY_ATTENTION_QKV(verify_attention_qkv_kv2_g16, 32, 2, 256, 32, true, bfloat)
 VERIFY_ATTENTION_QKV(verify_attention_qkv_kv2_g16_f32, 32, 2, 256, 32, true, float)
+VERIFY_ATTENTION_QKV(verify_attention_qkv_kv4_g4, 16, 4, 256, 32, true, bfloat)
+VERIFY_ATTENTION_QKV(verify_attention_qkv_kv4_g4_f32, 16, 4, 256, 32, true, float)
 // Four KV heads of 128 dimensions without an output gate, their whole heads
 // rotated (64 pairs) or unrotated.
 VERIFY_ATTENTION_QKV(verify_attention_qkv_kv4_g8_d128_f32, 32, 4, 128, 64, false, float)
@@ -124,6 +126,7 @@ VERIFY_ATTENTION_GATE(verify_attention_gate, 24, 4, 256)
 VERIFY_ATTENTION_GATE(verify_attention_gate_kv2_g8, 16, 2, 256)
 VERIFY_ATTENTION_GATE(verify_attention_gate_kv2_g12, 24, 2, 256)
 VERIFY_ATTENTION_GATE(verify_attention_gate_kv2_g16, 32, 2, 256)
+VERIFY_ATTENTION_GATE(verify_attention_gate_kv4_g4, 16, 4, 256)
 #undef VERIFY_ATTENTION_GATE
 
 // A layer without an output gate gathers its attention rows into the
@@ -161,6 +164,7 @@ ATTENTION_GATE_TABLE(verify_attention_gate_table16, 24, 4, 256, gguf_sg::Table16
 ATTENTION_GATE_TABLE(verify_attention_gate_table16_kv2_g8, 16, 2, 256, gguf_sg::Table16)
 ATTENTION_GATE_TABLE(verify_attention_gate_table16_kv2_g12, 24, 2, 256, gguf_sg::Table16)
 ATTENTION_GATE_TABLE(verify_attention_gate_table16_kv2_g16, 32, 2, 256, gguf_sg::Table16)
+ATTENTION_GATE_TABLE(verify_attention_gate_table16_kv4_g4, 16, 4, 256, gguf_sg::Table16)
 #undef ATTENTION_GATE_TABLE
 
 // The gather's rows written as the out-projection's table too.

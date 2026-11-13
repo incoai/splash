@@ -134,10 +134,13 @@ std::vector<uint32_t> referenceTop16(const float *row, uint32_t vocabulary) {
   return order;
 }
 
+// unaryOnly: a draft without codebooks (a DFlash draft's), whose candidates
+// score their unary score alone.
 struct Case final {
   uint32_t vocabulary;
   uint32_t lanes;
   bool sampling;
+  bool unaryOnly = false;
 };
 
 void runCase(MetalBackend &backend, const Case &c) {
@@ -156,9 +159,10 @@ void runCase(MetalBackend &backend, const Case &c) {
             patterns[(row / kRows + row % kRows) % patterns.size()], random);
   const MetalBuffer selectorHidden =
       randomBfloat(backend, uint64_t{rows} * kRank, random, 0.1F);
-  const DraftCodebooks codebooks{
-      randomBfloat(backend, uint64_t{c.vocabulary} * kRank, random, 0.1F),
-      randomBfloat(backend, uint64_t{c.vocabulary} * kRank, random, 0.1F)};
+  const DraftCodebooks codebooks =
+      c.unaryOnly ? DraftCodebooks{}
+                  : DraftCodebooks{randomBfloat(backend, uint64_t{c.vocabulary} * kRank, random, 0.1F),
+                                   randomBfloat(backend, uint64_t{c.vocabulary} * kRank, random, 0.1F)};
   DraftSelectorBuffers buffers{
       logits,
       allocate(backend, workspace.partialIdsBytes),
@@ -182,7 +186,7 @@ void runCase(MetalBackend &backend, const Case &c) {
   }
 
   CommandGraph graph;
-  selector.add(graph, buffers, codebooks, anchors, policies);
+  selector.add(graph, buffers, c.unaryOnly ? nullptr : &codebooks, anchors, policies);
   require(graph.dispatches().size() == 3,
           "draft selector dispatch count changed");
   static_cast<void>(backend.submitCommandAsync(graph.dispatches()).wait());
@@ -197,9 +201,9 @@ void runCase(MetalBackend &backend, const Case &c) {
   const auto *hidden =
       static_cast<const uint16_t *>(selectorHidden.contents());
   const auto *predecessors =
-      static_cast<const uint16_t *>(codebooks.predecessor.contents());
+      c.unaryOnly ? nullptr : static_cast<const uint16_t *>(codebooks.predecessor.contents());
   const auto *successors =
-      static_cast<const uint16_t *>(codebooks.successor.contents());
+      c.unaryOnly ? nullptr : static_cast<const uint16_t *>(codebooks.successor.contents());
   const auto *confidence =
       static_cast<const float *>(buffers.confidence.contents());
 
@@ -228,7 +232,7 @@ void runCase(MetalBackend &backend, const Case &c) {
         const uint32_t candidate =
             std::min(candidates[global * kCandidates + rank], c.vocabulary - 1);
         double edge = 0.0;
-        for (uint32_t dim = 0; dim < kRank; ++dim) {
+        for (uint32_t dim = 0; dim < (c.unaryOnly ? 0 : kRank); ++dim) {
           edge += double(bf16ToFloat(predecessors[uint64_t{predecessor} * kRank + dim])) *
                   bf16ToFloat(hidden[(uint64_t{lane} * kRows + position + 1) * kRank + dim]) *
                   bf16ToFloat(successors[uint64_t{candidate} * kRank + dim]);
@@ -322,7 +326,7 @@ void confidenceIgnoresDraws(MetalBackend &backend) {
     std::fill_n(uniforms, SPLASH_SAMPLING_UNIFORMS, 0.5F);
     uniforms[SPLASH_UNIFORM_PROPOSALS + position] = uniform;
     CommandGraph graph;
-    selector.add(graph, buffers, codebooks, anchors, policies);
+    selector.add(graph, buffers, &codebooks, anchors, policies);
     static_cast<void>(backend.submitCommandAsync(graph.dispatches()).wait());
     const auto *tokens = static_cast<const uint32_t *>(buffers.proposedTokens.contents());
     const auto *confidence = static_cast<const float *>(buffers.confidence.contents());
@@ -473,7 +477,7 @@ void bufferExtents(MetalBackend &backend) {
     requireExtent(backend, buffers.*member, bytes, element, what, [&](CommandGraph &graph, const MetalBuffer &buffer) {
       DraftSelectorBuffers changed = buffers;
       changed.*member = buffer;
-      selector.add(graph, changed, codebooks, anchors, policies);
+      selector.add(graph, changed, &codebooks, anchors, policies);
     });
   for (const auto &[member, what] :
        {std::pair{&DraftCodebooks::predecessor, "draft predecessor codebook"},
@@ -482,7 +486,7 @@ void bufferExtents(MetalBackend &backend) {
                   [&](CommandGraph &graph, const MetalBuffer &buffer) {
                     DraftCodebooks changed = codebooks;
                     changed.*member = buffer;
-                    selector.add(graph, buffers, changed, anchors, policies);
+                    selector.add(graph, buffers, &changed, anchors, policies);
                   });
   // draft_verify_rows reads every lane's confidences and writes its rows.
   const std::array<uint32_t, lanes> maximumRows{kRows, kRows, kRows};
@@ -518,7 +522,7 @@ void invalidRequests(MetalBackend &backend) {
   const std::array<uint32_t, 2> anchors{1, 2};
   const std::array<SamplingPolicy, 1> policies{SamplingPolicy{}};
   CommandGraph graph;
-  rejects([&] { selector.add(graph, buffers, codebooks, anchors, policies); },
+  rejects([&] { selector.add(graph, buffers, &codebooks, anchors, policies); },
           "invalid draft selector batch", "anchors without a policy each were accepted");
   const MetalBuffer verifyRows = allocate(backend, kLanes * sizeof(uint32_t));
   const MetalBuffer confidence = allocate(backend, kLanes * kPositions * sizeof(float));
@@ -566,6 +570,8 @@ int main(int argc, char **argv) {
       for (uint32_t lanes = 1; lanes <= kLanes; ++lanes) {
         runCase(backend, {vocabulary, lanes, false});
         runCase(backend, {vocabulary, lanes, true});
+        runCase(backend, {vocabulary, lanes, false, true});
+        runCase(backend, {vocabulary, lanes, true, true});
       }
     }
     confidenceIgnoresDraws(backend);

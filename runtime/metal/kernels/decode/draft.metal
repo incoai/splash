@@ -152,7 +152,7 @@ inline void draft_attention_split_phase(
     device bfloat *queries, device bfloat *keys, device bfloat *values,
     device bfloat *query_keys, device bfloat *query_values,
     device float *partial, uint value_stride, uint cache_length, uint split,
-    threadgroup float *score_storage, threadgroup float *row_max,
+    bool causal, threadgroup float *score_storage, threadgroup float *row_max,
     threadgroup float *row_sum, threadgroup float *previous_scale,
     uint thread_index, uint lane, uint simd_group) {
   constexpr ushort M = SPLASH_DRAFT_ATTENTION_ROWS, N = 128,
@@ -334,7 +334,9 @@ inline void draft_attention_split_phase(
 
     for (ushort batch = 0; batch < M; batch += 8) {
       ushort matrix_row = batch + simd_group;
-      float score = lane < CurrentN
+      // A causal layer's row reads the draft rows up to its own.
+      bool visible = lane < CurrentN && (!causal || lane <= matrix_row % Rows);
+      float score = visible
                         ? current_raw_scores[matrix_row * CurrentN + lane] *
                               0.08838834765f
                         : -INFINITY;
@@ -537,7 +539,7 @@ kernel void draft_attention_bf16_split(
       query_values + batch * KVHeads * HeadDim * Rows +
           group.x * Rows * HeadDim,
       partials, params.value_stride, params.cache_length[batch], group.z,
-      workspace, workspace + AttentionM * AttentionN,
+      params.causal != 0, workspace, workspace + AttentionM * AttentionN,
       workspace + AttentionM * AttentionN + AttentionM,
       workspace + AttentionM * AttentionN + 2 * AttentionM, thread_index,
       lane, simd_group);

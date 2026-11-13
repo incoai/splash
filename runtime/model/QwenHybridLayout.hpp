@@ -31,6 +31,10 @@ struct QwenTargetDimensions {
   uint32_t layers = 0;
   uint32_t hiddenSize = 0;
   uint32_t vocabularySize = 0;
+  // Whether the head is the token table (a config's tie_word_embeddings):
+  // its checkpoint holds no head of its own, and the head's image is planned
+  // from the table's tensor.
+  bool tiedEmbeddings = false;
   uint32_t packedGdnWidth = 0;
   uint32_t packedFullWidth = 0;
   uint32_t convolutionDimension = 0;

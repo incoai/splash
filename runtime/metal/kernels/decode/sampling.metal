@@ -1310,11 +1310,31 @@ kernel void draft_select_edges(
   }
 }
 
+// One simdgroup per proposal row of a draft without codebooks: its
+// candidates and their unary scores, as draft_select_edges' simdgroup 0
+// merges them, without an edge table.
+kernel void draft_select_candidates(
+    device const uint *partial_ids [[buffer(0)]],
+    device const float *partial_values [[buffer(1)]],
+    device uint *candidates [[buffer(2)]],
+    device float *unary [[buffer(3)]],
+    uint row [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]]) {
+  constexpr uint Candidates = SPLASH_DRAFT_CANDIDATES;
+  float value;
+  uint token;
+  top16_merge_shards(partial_ids, partial_values, row, lane, value, token);
+  if (lane < Candidates) {
+    candidates[row * Candidates + lane] = token;
+    unary[row * Candidates + lane] = value;
+  }
+}
+
 // One thread per lane walks the seven positions: the score of a candidate is
 // its unary score plus the edge from the previously chosen candidate, read
-// from the table draft_select_edges left in the partial-values scratch. It
-// writes the lane's confidence at each position (VerifyRowsParams) as it
-// walks.
+// from the table draft_select_edges left in the partial-values scratch, or
+// its unary score alone (unary_only). It writes the lane's confidence at
+// each position (VerifyRowsParams) as it walks.
 kernel void draft_select_dflash(
     device const uint *candidates [[buffer(0)]],
     device const float *unary [[buffer(1)]],
@@ -1344,7 +1364,7 @@ kernel void draft_select_dflash(
         tables + (position * Candidates + predecessor_index) * Candidates;
     float scores[Candidates];
     for (uint i = 0; i < Candidates; ++i)
-      scores[i] = unary[position * Candidates + i] + edges[i];
+      scores[i] = unary[position * Candidates + i] + (params.unary_only ? 0.0f : edges[i]);
     // The largest of the position's candidate probabilities at temperature
     // 1, before the lane chooses among them.
     float best = scores[0];

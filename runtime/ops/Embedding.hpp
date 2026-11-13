@@ -12,6 +12,10 @@ public:
   static void add(metal::CommandGraph &graph, metal::MetalBuffer tokens,
                   const EmbeddingWeights &table, metal::MetalBuffer output,
                   uint32_t rows);
+  // Whether add gathers a table from the planes of a projection of this
+  // format (EmbeddingWeights' planes): the linear formats of four bits or
+  // more and Q8_0, whose plane values decode as their native rows' do.
+  [[nodiscard]] static bool gathersPlanes(uint32_t formatId) noexcept;
   // A verify step's input tokens, SPLASH_TARGET_VERIFY_ROWS per lane: the
   // lane's anchor, row 0 of its draft input rows, then the draft's
   // SPLASH_DRAFT_PROPOSAL_TOKENS proposals, each clamped into the

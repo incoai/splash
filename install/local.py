@@ -47,7 +47,7 @@ __all__ = ["ModelError", "prepare_local_model"]
 def prepare_local_model(
     target, draft=None, *, mmproj=None, language_only=False, models_dir=paths.MODELS
 ):
-    """Prepare the target and its DFlash2 draft for the server, and return
+    """Prepare the target and its DFlash draft for the server, and return
     the directory the server loads, an absolute pathlib.Path.
 
     target: a GGUF file, any part of a split GGUF naming all of them, which
@@ -55,7 +55,7 @@ def prepare_local_model(
     tokenizer files and a safetensors checkpoint) or else GGUF targets of
     one name, the name's whole file before its split parts, beside any
     vision projector named mmproj.
-    draft: the directory of a DFlash2 draft (config.json and safetensors
+    draft: the directory of a DFlash draft (config.json and safetensors
     weights) trained for the target's family. Without one, the draft
     released for the family is taken from the Hugging Face cache
     (HF_HUB_CACHE), at the commit last recorded there for its default

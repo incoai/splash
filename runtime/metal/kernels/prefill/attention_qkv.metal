@@ -59,6 +59,8 @@ PREFILL_ATTENTION_QKV(prefill_attention_qkv_kv2_g8_f32, 16, 2, 256, 32, true, fl
 PREFILL_ATTENTION_QKV(prefill_attention_qkv_kv2_g12_f32, 24, 2, 256, 32, true, float)
 PREFILL_ATTENTION_QKV(prefill_attention_qkv_kv2_g16, 32, 2, 256, 32, true, bfloat)
 PREFILL_ATTENTION_QKV(prefill_attention_qkv_kv2_g16_f32, 32, 2, 256, 32, true, float)
+PREFILL_ATTENTION_QKV(prefill_attention_qkv_kv4_g4, 16, 4, 256, 32, true, bfloat)
+PREFILL_ATTENTION_QKV(prefill_attention_qkv_kv4_g4_f32, 16, 4, 256, 32, true, float)
 // Four KV heads of 128 dimensions without an output gate, their whole heads
 // rotated (64 pairs) or unrotated.
 PREFILL_ATTENTION_QKV(prefill_attention_qkv_kv4_g8_d128_f32, 32, 4, 128, 64, false, float)
@@ -91,6 +93,7 @@ PREFILL_ATTENTION_GATE(prefill_attention_gate, 24, 4, 256)
 PREFILL_ATTENTION_GATE(prefill_attention_gate_kv2_g8, 16, 2, 256)
 PREFILL_ATTENTION_GATE(prefill_attention_gate_kv2_g12, 24, 2, 256)
 PREFILL_ATTENTION_GATE(prefill_attention_gate_kv2_g16, 32, 2, 256)
+PREFILL_ATTENTION_GATE(prefill_attention_gate_kv4_g4, 16, 4, 256)
 #undef PREFILL_ATTENTION_GATE
 
 // A layer without an output gate gathers its attention rows into the

@@ -580,7 +580,7 @@ def parse_args(argv=None):
     server = commands.add_parser(
         "serve",
         help="run the local server; Ctrl+C stops it",
-        description="Load an upstream or local model with its DFlash2 draft, and serve in the foreground.",
+        description="Load an upstream or local model with its DFlash draft, and serve in the foreground.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "Examples:\n"
@@ -629,7 +629,7 @@ def parse_args(argv=None):
         "--draft-model",
         type=model_artifacts.parse_draft_model,
         metavar="DRAFT",
-        help="DFlash2 draft repository or local directory to use instead of the "
+        help="DFlash draft repository or local directory to use instead of the "
         "automatically selected one (a local directory with --model-dir)",
     )
     model.add_argument(

@@ -16,6 +16,17 @@ StoredRows::StoredRows(metal::MetalBuffer rows, uint32_t formatId) : rows(std::m
 }
 const QuantFormat &StoredRows::format() const noexcept { return kQuantFormats[formatId]; }
 
+bool Embedding::gathersPlanes(uint32_t formatId) noexcept {
+  switch (formatId) {
+  case GGUF_FMT_Q4K: case GGUF_FMT_Q5K: case GGUF_FMT_Q6K: case GGUF_FMT_Q80: return true;
+  default:
+    for (const uint32_t bits : {2u, 3u, 4u, 5u, 6u, 8u})
+      for (const uint32_t group : {32u, 64u, 128u})
+        if (formatId == quant_affine_format_of(bits, group)) return true;
+    return false;
+  }
+}
+
 void Embedding::add(metal::CommandGraph &graph, metal::MetalBuffer tokens,
                     const EmbeddingWeights &table, metal::MetalBuffer output,
                     uint32_t rows) {
@@ -24,13 +35,29 @@ void Embedding::add(metal::CommandGraph &graph, metal::MetalBuffer tokens,
   // Every gather reads `rows` token ids and writes `rows` bf16 rows of the table's width.
   requireBytes(tokens, uint64_t{rows} * sizeof(uint32_t), "embedding token");
   requireBytes(output, uint64_t{rows} * table.inputSize * sizeof(uint16_t), "embedding output");
+  const GgufEmbedParams params{rows, table.outputSize, table.inputSize};
+  if (const QuantizedSegment *planes = table.planes()) {
+    // One thread per chunk of 8 values (kernels/shared/embedding.metal gguf_embedding_planes).
+    if (table.rotation || planes->isFloat() || !gathersPlanes(planes->formatId) || planes->columnOffset ||
+        planes->outputSize < table.outputSize || planes->inputSize != table.inputSize || table.inputSize % 32)
+      throw std::invalid_argument("a token table read from planes takes a projection's planes it gathers");
+    const QuantFormat &format = planes->format();
+    const uint64_t tileRows = (uint64_t{table.outputSize} + QUANT_TILE_ROWS - 1) / QUANT_TILE_ROWS * QUANT_TILE_ROWS,
+                   groups = table.inputSize / 32;
+    requireBytes(planes->plane0, tileRows * groups * format.plane0_bytes, "token table plane0");
+    if (format.plane1_bytes) requireBytes(planes->plane1, tileRows * groups * format.plane1_bytes, "token table plane1");
+    requireBytes(planes->meta, tileRows * groups / format.meta_groups * format.meta_bytes, "token table meta");
+    graph.add(std::string("gguf_embed_planes_") + format.name,
+              {std::move(tokens), planes->plane0, planes->plane1Slot(), planes->meta, std::move(output)}, params,
+              {(uint64_t{rows} * groups * 4 + 255) / 256, 1, 1}, {256, 1, 1});
+    return;
+  }
   const StoredRows &stored = table.rows();
   const QuantFormat &format = stored.format();
   // Every token's row as stored, which the gather reads (kernels/shared/embedding.metal).
   const uint64_t rowBytes = quant_stored_row_bytes(stored.formatId, table.inputSize);
   if (!rowBytes) throw std::invalid_argument("token rows take whole blocks of their format");
   requireBytes(stored.rows, uint64_t{table.outputSize} * rowBytes, "token table");
-  const GgufEmbedParams params{rows, table.outputSize, table.inputSize};
   if (table.rotation) {
     // One threadgroup per rotation block of a row, which gathers the block
     // and inverts its rotation in fp32 (kernels/shared/gguf_rotation.metal).

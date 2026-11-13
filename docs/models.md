@@ -27,14 +27,23 @@ quantized (`VisionLoader.cpp`), are checked only when the model loads.
 `families.FAMILIES` names the draft trained for each family; repository names
 and model-card `base_model` fields play no part. Families of one model type,
 Qwen3.6-35B-A3B and Qwen3.5-122B-A10B (`qwen3_5_moe_text`, GGUF `qwen35moe`),
-are told apart by their sizes, and a fine-tune of either, such as
-Ornith-1.5-35B-A3B or Ornith-1.5-122B, is its family. A layout type
+or Qwen3.8-27B and Qwen3.5-4B (`qwen3_5_text`, GGUF `qwen35`), are told apart
+by their sizes, and a fine-tune of one, such as Ornith-1.5-35B-A3B or
+Ornith-1.5-122B, is its family. Qwen3.5-4B's head is its token table
+(`tie_word_embeddings`, `QwenTargetDimensions::tiedEmbeddings`), whose tensor its
+head's image is planned from. The table is stored once: where the head's format
+is one `ops::Embedding::gathersPlanes` names (the linear formats of four bits or
+more and Q8_0), no `embedding.bin` is planned and the token gather reads the
+head's planes (`gguf::tableInHead`). Its vision tower is smaller than the one the
+vision kernels are built for, so its family serves text only
+(`families.ModelFamily.vision`). A layout type
 (`Qwen3_8.hpp`, `Qwen3_6Moe.hpp`, `Qwen4Exp.hpp`, `Flint.hpp` in
 `runtime/model/`) is an architecture, whose code its families share, and each
 family is a value of it in one list, `model::kFamilies` (`ModelDescriptor.hpp`):
 another size of an architecture is one more value there, built by the
 constructor from a `QwenHybridLayout` its layout type gains with its second
-family (as `Qwen3_6MoeLayout`'s builds `kQwen3_5_122BLayout`), its draft in
+family (as `Qwen3_6MoeLayout`'s builds `kQwen3_5_122BLayout` and
+`Qwen3_8Layout`'s `kQwen3_5_4BLayout`), its draft in
 `families.FAMILIES`, and, for a GDN or attention shape no family had, its kernel
 instances (of bf16 norms only where a family of it loads safetensors) and a row
 of the compiled shapes in `ops/GDN.cpp` or `ops/PagedAttention.cpp`. The kernel
@@ -296,8 +305,10 @@ inputs (next-token KL 2.8e-4 against bf16, 13-16% less time a decode cycle on a
 
 ## Drafts
 
-Every model decodes with a DFlash2 draft. Each family names the repository
-of the DFlash2 checkpoint trained for it (`families.FAMILIES`), which holds
+Every model decodes with a DFlash2 draft, or with z-lab's DFlash draft where
+that is the one released for its family (Qwen3.5-4B's,
+`z-lab/Qwen3.5-4B-DFlash`). Each family names the repository of the draft
+checkpoint trained for it (`families.FAMILIES`), which holds
 it as the release publishes it: `config.json` and BF16 `model.safetensors`
 (or the shards its index names), and `mask_embedding.safetensors` when the
 release ships its mask token's embedding. Installation downloads only those files and follows the repository's default
@@ -318,7 +329,17 @@ its reserved special tokens, 150019 to 150143, as its
 those the kernels are built for, and its block at least their 8 rows, of which a
 cycle drafts the first (the Qwen3.5-122B-A10B draft was trained to fill 16;
 `readDraftLayout` in `ModelDescriptor.mm`); the kernels take any hidden width of
-whole 16-channel convolution groups. A draft's rows after its anchor read the
+whole 16-channel convolution groups. A DFlash draft (`DFlashDraftModel`,
+`model::DraftArchitecture`) is a DFlash2 draft's layers without their
+convolutions and dynamic projections, each adding its attention's and its
+FFN's output to the residual, and without a selector's edges: a proposal is its
+position's own choice among its 16 candidates (`draft_select_candidates`). As
+z-lab's reference reads its config, the rows of its sliding layers attend only
+the draft rows up to their own, and its last, full-attention layer every one;
+its layers attend a 4096-token window, or every key, and the draft reads the
+last 2048 in every layer, so past them its proposals read fewer keys than it
+was trained on, which can lower their acceptance but never changes the
+target's tokens. Its head is the target's, as a DFlash2 draft's is. A draft's rows after its anchor read the
 target's token table row of the mask token, unless its release ships that
 token's BF16 embedding, which they read instead (`DFlashDraft::addMaskRows`):
 `mask_embedding.safetensors`, one tensor `mask_embedding` of the hidden size.
@@ -563,7 +584,7 @@ splash serve --model local/qwen \
 `--model` remains required in `OWNER/REPO[:VARIANT]` form as the API's model
 name; it selects no files and makes no Hub request in this mode. Preparation
 never contacts the Hub, whether or not `--offline` is set. `--draft-model`
-must name a local compatible DFlash2 draft directory; without one, the
+must name a local compatible draft directory; without one, the
 family's released draft must already be in the Hub cache at the commit its
 default branch records, as `hf download REPO` or `splash serve` leaves it. A
 missing draft is refused with its download instruction; it is never downloaded

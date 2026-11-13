@@ -13,6 +13,8 @@
 
 namespace splash::model {
 
+// The Qwen3.5 dense architecture, whose families are sizes of it: Qwen3.8-27B
+// and Qwen3.5-4B (kFamilies).
 struct Qwen3_8Layout final : QwenHybridLayout {
   // Its config's text model type and its GGUFs' architecture; a safetensors
   // checkpoint of it loads too.
@@ -45,8 +47,37 @@ struct Qwen3_8Layout final : QwenHybridLayout {
                           .ffnKind = QwenFfnKind::Dense,
                           .intermediateSize = 17408},
                          "Qwen3.8-27B"} {}
+  // A family of the architecture.
+  constexpr explicit Qwen3_8Layout(const QwenHybridLayout &family) : QwenHybridLayout(family) {}
   bool operator==(const Qwen3_8Layout &) const = default;
 };
+
+// Qwen3.5-4B, whose head is its token table.
+inline constexpr Qwen3_8Layout kQwen3_5_4BLayout{
+    QwenHybridLayout{{.nativeContextTokens = 262'144,
+                      .yarnContextTokens = 1'010'000,
+                      .layers = 32,
+                      .hiddenSize = 2560,
+                      .vocabularySize = 248320,
+                      .tiedEmbeddings = true,
+                      .packedGdnWidth = 12544,
+                      .packedFullWidth = 10240,
+                      .convolutionDimension = 8192,
+                      .gdnKeyHeads = 16,
+                      .gdnValueHeads = 32,
+                      .gdnHeadDimension = 128,
+                      .attentionWidth = 4096,
+                      .attentionQueryHeads = 16,
+                      .attentionKvHeads = 4,
+                      .attentionHeadDimension = 256,
+                      .rotaryPairs = SPLASH_TARGET_ROPE_PAIRS,
+                      .rotaryTheta = 10'000'000.0F,
+                      .fullAttentionPeriod = 4,
+                      .maskToken = 248077,
+                      .stopTokens = {248044, 248046},
+                      .ffnKind = QwenFfnKind::Dense,
+                      .intermediateSize = 9216},
+                     "Qwen3.5-4B"}};
 
 struct Qwen3_8LayerWeights final {
   ops::NormWeights inputNorm;

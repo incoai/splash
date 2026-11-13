@@ -47,7 +47,7 @@ from install import assembly, families, hub, models, paths, upstream
 # tells it apart.
 UNSUPPORTED = (
     "no supported model has this architecture [(]{}[)]; "
-    "supported: Qwen3.8-27B, Qwen3.6-35B-A3B, Qwen3.5-122B-A10B, Qwen3.8-Flash-Next"
+    "supported: Qwen3.8-27B, Qwen3.5-4B, Qwen3.6-35B-A3B, Qwen3.5-122B-A10B, Qwen3.8-Flash-Next"
 )
 
 
@@ -77,17 +77,17 @@ class UpstreamTest(unittest.TestCase):
 
     def test_family_is_identified_by_architecture_not_name(self):
         # The engine's check (its model-check command), with and without the
-        # draft, of each family an MLX checkpoint serves.
+        # draft, of each family an MLX checkpoint serves, with its vision
+        # tower when the family has one.
         for family in families.FAMILIES:
             if family in GGUF_ONLY:
                 continue
             config = mlx_target(self.root / family.name, family) / "config.json"
             draft = draft_dir(self.root / family.name / "draft", family)
+            vision = "safetensors" if family.vision else "none"
             for arguments in ({}, {"draft": draft / "config.json"}):
                 self.assertIs(
-                    upstream.check_model(
-                        "mlx-affine", "safetensors", config, **arguments
-                    ),
+                    upstream.check_model("mlx-affine", vision, config, **arguments),
                     family,
                 )
 
@@ -707,7 +707,7 @@ class UpstreamTest(unittest.TestCase):
             tower(root, "model.visual.")
 
         def other_size(root):
-            mlx_target(root, DENSE, changes={"hidden_size": 2560})
+            mlx_target(root, DENSE, changes={"hidden_size": 4096})
             tower(root, "vision_tower.")
 
         fake = FakeHub(self, self.cache)
@@ -721,10 +721,10 @@ class UpstreamTest(unittest.TestCase):
                 r"GGUF",
             ),
             (
-                "mlx-community/Qwen3.5-4B-MLX-4bit",
+                "mlx-community/Qwen3.5-9B-MLX-4bit",
                 other_size,
                 UNSUPPORTED.format(
-                    "text config hidden_size: safetensors 2560, Qwen3.8-27B 5120"
+                    "text config hidden_size: safetensors 4096, Qwen3.8-27B 5120"
                 ),
             ),
         ):
@@ -1339,7 +1339,7 @@ class UpstreamTest(unittest.TestCase):
             f"Warning: keeping the installed {MODEL}@{'a' * 12}; cannot install "
             f"{MODEL}@{'b' * 40}: no supported model has this architecture (text "
             "config head_dim: safetensors 128, Qwen3.8-27B 256); supported: Qwen3.8-27B, "
-            "Qwen3.6-35B-A3B, Qwen3.5-122B-A10B, Qwen3.8-Flash-Next",
+            "Qwen3.5-4B, Qwen3.6-35B-A3B, Qwen3.5-122B-A10B, Qwen3.8-Flash-Next",
             warnings,
         )
         self.assertEqual(chosen.link.resolve(), installed)

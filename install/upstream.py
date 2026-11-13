@@ -456,7 +456,9 @@ def mlx_target(repo, language_only):
     # keeps it in a subdirectory).
     files |= {"target/" + n: n for n in _weight_files(repo, exclude=VISION_TOWER)}
     vision_format = "none"
-    if not language_only:
+    # A family without a vision tower serves text, whatever the repository
+    # holds (families.ModelFamily.vision).
+    if not language_only and family.vision:
         # The text passed, so a refusal of the tower's processor, shards or
         # configuration refuses the vision alone.
         try:
