@@ -2299,9 +2299,10 @@ closer than a window share the pages of their tails. The cache keeps it so
   persistent restore point only with Full copies of its tail.
 - Each cut of a request's page table checks that every page from the window
   before its published blocks on is Full, always (`Cache::cutPageTable`).
-- A KV slot holds what its page holds when it is written, and its record
-  names the form (`KvSlotLabel`); a restore allocates that form. A restore
-  point persists its tail Full, as RAM holds it.
+- A KV slot holds what its page holds when it is written, takes that much
+  of the SSD cache's quota ([disk tier](#disk-tier)), and its record names
+  the form (`KvSlotLabel`); a restore allocates that form. A restore point
+  persists its tail Full, as RAM holds it.
 
 So no byte a kernel reads changes: a run with trimming off
 (`--kv-window-trim off`, the native argument validation passes) emits the
@@ -2383,7 +2384,8 @@ free space can fall below the floor, as far as a full volume, before the tier
 has given up every copy it holds or the snapshot goes. A limit below what the
 tier holds is met at the next control pass by giving copies up in the order a
 full quota replaces them, never a copy in transfer or the only copy of a state
-in use, and a limit below one slot makes no room at all. Off a local volume, or
+in use, and a limit below what a copy takes makes no room for it at all. Off a
+local volume, or
 one that cannot be measured, the quota is the limit. A persistent tier's limit
 bounds its whole root, and the tier may use all of it: the other caches nobody
 holds, looked at once at start, count among what it holds, and while the root
@@ -2477,9 +2479,11 @@ refused, and once the quota is full a reclaim writes what it takes, as for any
 victim without a copy, giving up redundant copies, those made ahead among them,
 first. A persistent tier copies every point, whether memory has run short or
 not and in use too, so that a start after a crash takes it back, gives up the
-oldest point for it (below), and refuses one larger than its limit. A clean
-stop writes a persistent tier's waiting points, the newest first; a temporary
-tier's copies go with the process.
+oldest point for it (below), and refuses one larger than its limit, counting
+each of its copies at what its slot takes, those still to write by what their
+pages hold (`Cache::pointFits`). A clean stop writes a persistent tier's
+waiting points, the newest first; a temporary tier's copies go with the
+process.
 
 Otherwise writes happen when RAM reclamation selects a victim without a copy.
 States copy through one staging buffer, freeing their RAM immediately. KV
@@ -2529,8 +2533,27 @@ With `--persistent-cache` they are `kv.slots` and `state.slots` in the cache's
 directory, each beside a file of its slots' records, and stay for the next
 start. Otherwise, or when another process holds that directory or it cannot be
 used, they are temporary (`$TMPDIR/splash-cache-*`), unlinked as they are
-created and gone when the engine exits. A full quota of temporary files
-replaces the oldest redundant copy first, then the oldest sole copy, across both
+created and gone when the engine exits. A file's slots are all the size of its
+largest payload, a state or a Full page, each at its index times that size, and
+a slot is acquired for the payload it will hold and counts what it keeps on the
+volume (`SlotFile::quotaBytesFor`): the payload's host pages, which are what
+its write stores and what the write budget charges, so a Slim page's slot
+counts 464 KiB of Flint's 1.59 MiB and the quota holds 3.5 times the Slim
+pages it holds Full ones. The rest of the slot stays a hole, so a file's
+length can pass the quota while its blocks stay within it. The volume does
+not leave it one by itself: APFS allocates the gap before a write that lands
+past what the file held (gaps of 1 to 16 MiB were filled, one of 32 MiB was
+not: 256 payloads of 462 KiB in such slots took 407 MiB, and 116 MiB only once
+each slot had been freed and written again), so a write past the end of what
+the file's slots hold returns the hole before it
+(`SlotFile::Backing::stored`, one `F_PUNCHHOLE`, 14 to 43 us). Nor does it
+keep a hole at the file's end: a write into one has all of it allocated up to
+the write, so when the last slot that holds blocks is freed the file ends with
+the one below that does (`SlotFile::Backing::released`). With both, each
+slot's extents on the volume are its payload's host pages, slot by slot, in a
+3 GiB cache of 5,856 Flint pages; the volume's own count of the file's blocks
+ran 0.5% above them. A full quota of temporary files replaces the oldest
+redundant copy first, then the oldest sole copy, across both
 KV and states; sole copies of states in use, and the KV they restore through,
 make room only for a copy that is itself in use, and last. A persistent tier
 keeps restore points whole instead, since its redundant copies are what the next
@@ -2551,9 +2574,10 @@ no SSD cache (above). Before reclaim takes a state in RAM, only a spilling
 request's page takes the spilled KV under it, the state first, once nothing else
 is left. A freed slot returns its quota at once and its blocks to the volume
 (`F_PUNCHHOLE`) once its file's IO worker finishes the transfer it is in, so the
-two files together occupy about the live slots instead of each keeping its
-high-water mark; `/status` reports that as `disk.file_bytes` beside
-`disk.used_bytes`. Until the punch the other file can take that quota, so
+two files together occupy about what the live slots count instead of each
+keeping its high-water mark; `/status` reports that as `disk.file_bytes`, what
+the slots whose blocks the files hold count, beside `disk.used_bytes`. Until
+the punch the other file can take that quota, so
 allocated blocks can briefly exceed the limit by the slots freed but not yet
 punched, bounded by the transfer each file's worker is in: about 2% of a 10G
 tier in a 25-minute churn run on an M5 Max. A write that finds the volume full
@@ -2562,8 +2586,15 @@ once and shrinks to the new limit. If the volume still shows room above the
 floor, the write met a limit the measure cannot see, such as a volume quota or a
 disk image whose host is full, or the volume filled and freed again; after a
 second such write the tier keeps within what it holds, with one log line, while
-serving continues. On a volume that cannot punch holes the files keep the blocks
-of freed slots, which the runtime reports once; the limit counts them.
+serving continues. A volume that returns no blocks (`F_PUNCHHOLE` fails, as on
+HFS+ and exFAT, which keep no holes at all) keeps in each slot whatever an
+earlier payload or its own allocation put there, so there every slot counts
+whole: each file asks its volume once as it opens, with a punch past its end,
+a punch that fails later counts the slots acquired after it whole too, and the
+runtime reports it once. A quota of 16 Full slots then holds 16 Slim pages on
+24.4 MiB of blocks, where on APFS it holds 56 on 25.4 MiB. The files keep the
+blocks of freed slots there, each up to its high-water mark, and the limit's
+rule counts them as the tier's.
 
 Transfers use `pread`/`pwrite` with `F_NOCACHE`, every one an aligned range.
 Those of the files' IO workers, every write and a state's reads, move whole
@@ -2585,7 +2616,14 @@ back checks the segments it covers: a whole or index restore that fails is a
 miss, and a block or history read that fails is `kv_unreadable` for the
 requests that read it. A KV record of a layout with a sliding window also names
 the form of the page its slot holds (`KvSlotLabel`), and a start takes back
-only the forms it restores.
+only the forms it restores. A slot it takes back counts what one acquired for
+the record's payload does, and as adoption ends every block between one adopted
+payload's host pages and the next one's slot goes back to the volume
+(`SlotFile::finishAdoption`): the slots it leaves behind, and what a file
+whose writer returned no holes holds around its shorter payloads, so such a
+cache, each slot whole on the volume, is taken back as it is and shrinks to its
+payloads' pages at that start (96 slots, two in three Slim: 153 MiB before,
+80 MiB after, every payload matching its record).
 
 `/status` reports the shared quota, its limit, the write budget and KV
 transfers under `disk`. Its cumulative `read_bytes` and `written_bytes` count
