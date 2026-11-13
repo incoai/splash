@@ -1005,7 +1005,7 @@ private:
   // reaches its first state boundary first; what lies past it follows once
   // that state has its buffers (reserveCaptures).
   [[nodiscard]] static uint64_t workEndOf(const Request &active, const BatchItem &scheduled,
-                                          bool prefill) noexcept;
+                                          bool prefill, uint32_t decodeRows) noexcept;
   // Beside a lane of its command that ended, a lane gives that command up in
   // place of its suspension; the next tick plans again either way.
   [[nodiscard]] Prepared yieldLane(Request &lane, uint64_t workEnd,

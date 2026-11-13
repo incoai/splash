@@ -1,3 +1,6 @@
+#include <atomic>
+#include <cstdio>
+#include <cstdlib>
 #include <iostream>
 #include "model/Runtime.hpp"
 #ifdef SPLASH_RUNTIME_INSTRUMENTATION
@@ -2535,6 +2538,21 @@ struct Runtime::Impl {
       verifyBudget->observe(std::span(observed).first(items.size()), constrained,
                             timing.wallSeconds * 1000.0);
     }
+    if (std::getenv("SPLASH_DEBUG_ACCEPTANCE") != nullptr) {
+      static std::atomic<uint64_t> cycle{0};
+      for (uint32_t lane = 0; lane < items.size(); ++lane) {
+        std::fprintf(stderr, "splash: cycle %llu lane %u verify %u accepted %u retained %u draft %s: ",
+                     static_cast<unsigned long long>(cycle.load()), lane, lanes[lane].verifyRows,
+                     lanes[lane].accepted, lanes[lane].retained,
+                     lanes[lane].endDrafts ? "end" : "live");
+        const float *confidence = contents<float>(
+            decodeArena->get(lane, DecodeTensor::VerifyConfidence), "debug confidence");
+        for (uint32_t position = 0; position + 1 < lanes[lane].verifyRows; ++position)
+          std::fprintf(stderr, "%.2f ", confidence[position]);
+        std::fprintf(stderr, "\n");
+      }
+      cycle.fetch_add(1);
+    }
 
     std::vector<ModelStepResult> results;
     results.reserve(items.size());
@@ -3367,8 +3385,11 @@ Runtime::decodeAsync(const BatchPlan &plan,
       impl_->decodeArena->batchSlice(DecodeTensor::RopeSin, width),
       impl_->decodeArena->batchSlice(DecodeTensor::DraftRopeCos, width),
       impl_->decodeArena->batchSlice(DecodeTensor::DraftRopeSin, width));
+  // The draft encodes its whole block: every row's embedding, not the
+  // ABI's 8-row sub-pass the target's verify gathers use.
   impl_->encodeBatchEmbedding(commandGraph, DecodeTensor::DraftInputTokens,
-                              DecodeTensor::DraftHidden0, width);
+                              DecodeTensor::DraftHidden0, width,
+                              width * impl_->states.layout().draft.rows);
   impl_->draftModel.addMaskRows(commandGraph, impl_->decodeArena->batchSlice(DecodeTensor::DraftHidden0, width),
                                 width);
   impl_->encodeDraftBatchGraph(commandGraph, entries,

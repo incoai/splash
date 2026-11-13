@@ -216,7 +216,7 @@ uint64_t Engine::copyDemandBytes() const {
     if (!active.lane || active.pendingEnd)
       continue;
     const Phase phase = scheduler_.phase(id);
-    uint64_t end = active.exactTokens.size() + model::ExecutionLimits::targetVerifyRows;
+    uint64_t end = active.exactTokens.size() + 2 * model_.draftRows();
     if (phase == Phase::Prefill)
       end = std::min<uint64_t>(scheduler_.promptProcessed(id) + rows, active.promptTokens);
     else if (phase != Phase::Decode)
@@ -522,7 +522,8 @@ std::optional<Engine::Denied> Engine::reserveReads(Request &active, const BatchI
   const auto memory = allocate([&] { return model_.reserveSpilledReads(id, need); }, spec, Refusal::Waits);
   if (memory.admission.granted())
     return std::nullopt;
-  return Denied{id, workEndOf(active, scheduled, plan.prefill), memory.denial, std::nullopt,
+  return Denied{id, workEndOf(active, scheduled, plan.prefill, model_.draftRows()),
+                    memory.denial, std::nullopt,
                 plan.prefill ? "prefill history staging" : "hot KV cache"};
 }
 

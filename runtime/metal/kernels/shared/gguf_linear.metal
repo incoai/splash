@@ -192,7 +192,9 @@ using GgufDecodeGateUpKernel = void(device bfloat *, device uchar *, device ucha
                                     device atomic_uint *, constant GgufDecodeParams &, uint2, uint);
 #define GGUF_DECODE_GATE_UP(F, f, R) \
   template [[host_name("gguf_decode_" #f "_m" #R "_gate_up")]] kernel GgufDecodeGateUpKernel gguf_decode_gate_up<F, R>;
-#define GGUF_DECODE_GATE_UP_FORMAT(F, f) GGUF_DECODE_GATE_UP(F, f, 8) GGUF_DECODE_GATE_UP(F, f, 16) GGUF_DECODE_GATE_UP(F, f, 32)
+#define GGUF_DECODE_GATE_UP_FORMAT(F, f) \
+  GGUF_DECODE_GATE_UP(F, f, 8) GGUF_DECODE_GATE_UP(F, f, 16) GGUF_DECODE_GATE_UP(F, f, 32) \
+  GGUF_DECODE_GATE_UP(F, f, 64)
 QUANT_FORMATS(GGUF_DECODE_GATE_UP_FORMAT)
 #undef GGUF_DECODE_GATE_UP_FORMAT
 #undef GGUF_DECODE_GATE_UP

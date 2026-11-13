@@ -289,7 +289,8 @@ void DFlashDraft::addDecode(
     const uint32_t current = layer & 1;
     const uint32_t next = current ^ 1;
     const DFlashDraftLayerWeights &weights = weights_.layers[layer];
-    const ops::LinearPlan attentionDynamicPlan = linear.decodePlan(weights.attentionDynamic, lanes);
+    const ops::LinearPlan attentionDynamicPlan =
+        linear.decodePlan(weights.attentionDynamic, lanes, ops::LinearEpilogue::None, nullptr, rows);
     const ops::PreparedInput attentionNormalized = ops::Normalization::addRms(
         graph, buffers.hidden[current], weights.inputNorm, buffers.normalized,
         layout.hiddenSize, rows, scratch, attentionDynamicPlan.input());
@@ -303,7 +304,8 @@ void DFlashDraft::addDecode(
          buffers.hidden[current], buffers.convolved},
         attentionPlan, ops::DraftConvolutionStage::Prepare);
     linear.add(graph, {.input = buffers.convolved, .output = buffers.proposalQkv, .scratch = scratch},
-               weights.qkvProjection, linear.decodePlan(weights.qkvProjection, lanes));
+               weights.qkvProjection,
+               linear.decodePlan(weights.qkvProjection, lanes, ops::LinearEpilogue::None, nullptr, rows));
     ops::DraftAttention::addPrepare(
         graph,
         {buffers.proposalQkv, buffers.attention, weights.queryNorm,
@@ -319,13 +321,15 @@ void DFlashDraft::addDecode(
     ops::DraftAttention::addReorder(graph, buffers.attention,
                                     buffers.proposalQkv, attentionPlan);
     linear.add(graph, {.input = buffers.proposalQkv, .output = buffers.projected, .scratch = scratch},
-               weights.outputProjection, linear.decodePlan(weights.outputProjection, lanes));
+               weights.outputProjection,
+               linear.decodePlan(weights.outputProjection, lanes, ops::LinearEpilogue::None, nullptr, rows));
     ops::DraftAttention::addConvolution(
         graph,
         {buffers.projected, buffers.dynamic, weights.attentionConvolution,
          buffers.hidden[current], buffers.residual},
         attentionPlan, ops::DraftConvolutionStage::Residual);
-    const ops::LinearPlan mlpDynamicPlan = linear.decodePlan(weights.mlpDynamic, lanes);
+    const ops::LinearPlan mlpDynamicPlan =
+        linear.decodePlan(weights.mlpDynamic, lanes, ops::LinearEpilogue::None, nullptr, rows);
     const ops::PreparedInput mlpNormalized = ops::Normalization::addRms(
         graph, buffers.residual, weights.postAttentionNorm, buffers.normalized,
         layout.hiddenSize, rows, scratch, mlpDynamicPlan.input());
@@ -342,10 +346,12 @@ void DFlashDraft::addDecode(
                {.input = buffers.convolved, .output = buffers.intermediate, .gateScratch = buffers.gateScratch,
                 .scratch = scratch},
                weights.upProjection,
-               linear.decodePlan(weights.upProjection, lanes, ops::LinearEpilogue::GateUp, &weights.gateProjection),
+               linear.decodePlan(weights.upProjection, lanes, ops::LinearEpilogue::GateUp,
+                                 &weights.gateProjection, rows),
                &weights.gateProjection);
     linear.add(graph, {.input = buffers.intermediate, .output = buffers.projected, .scratch = scratch},
-               weights.downProjection, linear.decodePlan(weights.downProjection, lanes));
+               weights.downProjection,
+               linear.decodePlan(weights.downProjection, lanes, ops::LinearEpilogue::None, nullptr, rows));
     ops::DraftAttention::addConvolution(
         graph,
         {buffers.projected, buffers.dynamic, weights.mlpConvolution,
@@ -355,7 +361,8 @@ void DFlashDraft::addDecode(
 
   // The final norm feeds the shared vocabulary head and then the selector;
   // the selector reuses whatever table the head leaves when the layouts match.
-  const ops::LinearPlan headPlan = linear.decodePlan(vocabularyProjection, lanes);
+  const ops::LinearPlan headPlan =
+      linear.decodePlan(vocabularyProjection, lanes, ops::LinearEpilogue::None, nullptr, rows);
   const ops::PreparedInput finalHidden = ops::Normalization::addRms(
       graph, buffers.hidden[weights_.layout.layers & 1], weights_.finalNorm,
       buffers.finalHidden, layout.hiddenSize, rows, scratch, headPlan.input());
@@ -365,7 +372,8 @@ void DFlashDraft::addDecode(
   linear.add(graph,
              {.input = buffers.finalHidden, .output = buffers.selectorHidden, .scratch = scratch,
               .prepared = afterHead},
-             weights_.selectorProjection, linear.decodePlan(weights_.selectorProjection, lanes));
+             weights_.selectorProjection,
+             linear.decodePlan(weights_.selectorProjection, lanes, ops::LinearEpilogue::None, nullptr, rows));
 }
 
 void DFlashDraft::addMaskRows(metal::CommandGraph &graph, metal::MetalBuffer rows, uint32_t lanes) const {
@@ -388,17 +396,20 @@ void DFlashDraft::addContextCommit(
   const ops::Linear &linear = operators_.linear();
   const ops::LinearScratch &scratch = buffers.linearScratch;
   linear.add(graph, {.input = buffers.capturedTargetHidden, .output = buffers.projected, .scratch = scratch},
-             weights_.contextProjection, linear.decodePlan(weights_.contextProjection, lanes));
+             weights_.contextProjection,
+             linear.decodePlan(weights_.contextProjection, lanes, ops::LinearEpilogue::None, nullptr, rows));
   // Every layer's key and value projection reads the same normalized rows,
   // prepared for the first layer's plan.
-  ops::LinearPlan kvPlan = linear.decodePlan(contextKvProjections_[0], lanes);
+  ops::LinearPlan kvPlan =
+      linear.decodePlan(contextKvProjections_[0], lanes, ops::LinearEpilogue::None, nullptr, rows);
   ops::PreparedInput hidden = ops::Normalization::addRms(
       graph, buffers.projected, weights_.hiddenNorm, buffers.hidden, layout.hiddenSize, rows,
       scratch, kvPlan.input());
 
   for (uint32_t layer = 0; layer < layout.layers; ++layer) {
     const ops::Projection &projection = contextKvProjections_[layer];
-    if (layer) kvPlan = linear.decodePlan(projection, lanes);
+    if (layer)
+      kvPlan = linear.decodePlan(projection, lanes, ops::LinearEpilogue::None, nullptr, rows);
     hidden = linear.add(graph,
                         {.input = buffers.hidden, .output = buffers.contextKv, .scratch = scratch,
                          .prepared = hidden},

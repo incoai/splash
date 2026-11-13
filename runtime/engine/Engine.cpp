@@ -1560,7 +1560,7 @@ Engine::Prepared Engine::prepare(const BatchPlan &plan, std::vector<ModelBatchIt
     Request &active = request(scheduled.requestId);
     if (!active.lane)
       throw std::logic_error("scheduled request is not resident");
-    const std::optional<Denied> kv = growLane(active, workEndOf(active, scheduled, prefill), context);
+    const std::optional<Denied> kv = growLane(active, workEndOf(active, scheduled, prefill, model_.draftRows()), context);
     if (commandTaken())
       return Prepared::Replan;
     if (kv)
@@ -1736,8 +1736,8 @@ std::vector<LaneShape> Engine::laneShapes(std::span<const PrefillAdmission> cand
 }
 
 uint64_t Engine::workEndOf(const Request &active, const BatchItem &scheduled,
-                           bool prefill) noexcept {
-  uint64_t workEnd = active.exactTokens.size() + model::ExecutionLimits::targetVerifyRows;
+                           bool prefill, uint32_t decodeRows) noexcept {
+  uint64_t workEnd = active.exactTokens.size() + 2 * decodeRows;
   if (prefill) {
     workEnd = scheduled.promptOffset + scheduled.tokenCount;
     if (active.stateBoundaryCursor < active.stateBoundaries.size())
