@@ -867,7 +867,7 @@ static void testWritesCountOverTheLastHourAndDay() {
   SlotFile file(size, budget);
   const std::vector<std::byte> half(size / 2, std::byte{1});
   const auto rate = [&] { return budget->writeRate(); };
-  const auto write = [&] { require(file.write(file.acquire(), {half}, {})->wait(), "a slot write failed"); };
+  const auto write = [&] { require(file.write(file.acquire(half.size()), {half}, {})->wait(), "a slot write failed"); };
   require(!rate().hourBytes && !rate().dayBytes, "a tier that wrote nothing had a write rate");
   write();
   require(rate().hourBytes == size && rate().dayBytes == size,
