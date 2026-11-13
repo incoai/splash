@@ -506,12 +506,19 @@ final class AppState {
         contextRequest.flatMap(chatContext.usage(for:)).flatMap { $0.fits ? nil : $0 }
     }
 
-    /// Sends the draft to the running model, leaving the composer empty.
+    /// Sends the draft to the running model. The composer gives the message up as it shows in its
+    /// conversation (`ChatStore.send`): at once in an open one, and in a new chat, which has none,
+    /// once the server has taken it and the chat opens. Until then the composer holds a new chat's
+    /// first message as it was sent, so that a refusal leaves the window as it was, the composer
+    /// saying why: with the chat opened and listed at Send, a refusal took the composer to the
+    /// conversation's foot and back, and a row into the list and out.
     func sendDraft() {
         guard canSendDraft, let target else { return }
-        let message = draft.take()
+        let message = draft.message
         chats.send(message.text, attachments: message.attachments, to: target) { [weak self] refused in
             self?.draft.restore(refused)
+        } taken: { [weak self] in
+            self?.draft.take()
         }
     }
 

@@ -107,9 +107,15 @@ private struct ChatTitle<Actions: View>: View {
         // kept the item at the width it first had, the title's alone, and the room added once its place was known
         // drew past the item's edge, where clicks don't reach.
         .fixedSize()
-        // Fading in once it has its place, as the toolbar sizes the item to it.
-        .opacity(place == nil ? 0 : 1)
+        // Once it has its place, its room and its width take it within `settle`, as the toolbar sizes the item to
+        // them, and it fades in after, as what comes into a page does once what makes room for it has moved
+        // (`Motion.comingAndGoing`). Fading in on one animation with them, it came some points from its place, cut to
+        // the least window's width, and slid and widened as it showed: of the frames drawn 55, 78 and 101 ms after a
+        // new chat's first message was taken, each had some 100 pixels of it where the title, once still, has none.
+        // Its room and width changed at once instead, the toolbar left the item at its first width, the title over
+        // the switch before it, in one window of two.
         .animation(Motion.settle, value: place == nil)
+        .animation(Motion.settle?.delay(Motion.settleSeconds)) { $0.opacity(place == nil ? 0 : 1) }
         .background(ToolbarProbe { place = $0 })
         // Along with the sidebar as it slides.
         .animation(Motion.settle, value: state.showsSidebar)
