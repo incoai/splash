@@ -280,6 +280,34 @@ void testMeasureOfRealFiles() {
           "a full network volume did not keep the tier within what it held");
 }
 
+// What a tier's files hold on their volume, which every measure reads and the limit's rule counts
+// as the tier's, is what its slots count of the quota and their records: a quota filled with
+// payloads a quarter of a slot long holds four times as many as its slots, on no more blocks.
+void testFilesHoldWhatTheirSlotsCount() {
+  const test::TemporaryDirectory directory("splash-disk-space-held");
+  constexpr uint64_t quota = 8 * kMiB;
+  auto budget = std::make_shared<model::DiskBudget>(quota);
+  auto file = std::make_shared<model::SlotFile>(
+      kMiB, budget,
+      model::SlotFile::Persistence{directory.path() / "kv.slots", directory.path() / "kv.records", {}, 8});
+  file->finishAdoption();
+  DiskSpace space(budget, kSize, {file}, reads(localVolume(500 * kGiB)));
+  const std::vector<std::byte> payload(kMiB / 4, std::byte{1});
+  require(file->quotaBytesFor(payload.size()) == kMiB / 4, "a slot does not count its payload's host pages");
+  std::vector<std::shared_ptr<model::SlotFile::Slot>> slots;
+  for (auto slot = file->acquire(payload.size()); slot; slot = file->acquire(payload.size())) {
+    require(file->write(slot, {payload}, {})->wait(), "the tier could not write within its quota");
+    slots.push_back(std::move(slot));
+  }
+  require(file->synchronize({})->wait(), "the tier's file did not synchronize");
+  space.measure();
+  // The records are a header's block and a block of 32 records.
+  require(slots.size() == 32 && budget->usedBytes() == quota && space.heldBytes() >= quota &&
+              space.heldBytes() <= quota + kHostPageBytes,
+          "the tier's files hold other than what its slots count on the volume");
+  file->seal();
+}
+
 // Two other caches in a fresh root, a MiB of slots each, the first older.
 std::vector<CacheDirectory::Idle> otherCaches(const std::filesystem::path &root) {
   long when = 1000000000;
@@ -385,6 +413,7 @@ int main() {
     testSnapshotCostsAtMostAThird();
     testAutomaticStart();
     testMeasureOfRealFiles();
+    testFilesHoldWhatTheirSlotsCount();
     testOtherCachesGoFirst();
     testRemovedCachesStopCounting();
     testOtherCachesGoAsTheTierGrows();
