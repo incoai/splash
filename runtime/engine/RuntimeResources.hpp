@@ -170,9 +170,9 @@ struct RuntimeResourcesConfig {
   // (ops::Int8Activations), for the life of the engine (ops::ExecutionPlans).
   ops::Int8Activations int8Activations = ops::Int8Activations::On;
   // --copyspec-mode: whether a request's decode cycles may draft by copying
-  // the request's own earlier tokens (model::CopySpecMode); a benchmark round
-  // turns it off so that rounds repeat one another.
-  model::CopySpecMode copyspecMode = model::CopySpecMode::Conservative;
+  // the request's own earlier tokens (model::CopySpecMode); off unless asked
+  // for, so a benchmark round's outputs repeat one another.
+  model::CopySpecMode copyspecMode = model::CopySpecMode::Off;
   // The prefill FFN's Neural Engine split (startAneFfn): off with
   // --disable-ane, and a benchmark round runs the split of the first so that
   // rounds repeat one another.
@@ -414,7 +414,7 @@ private:
   // --verify-rows, which modelContext() passes on.
   model::VerifyRows verifyRows_ = model::VerifyRows::Auto;
   // --copyspec-mode, which modelContext() passes on.
-  model::CopySpecMode copyspecMode_ = model::CopySpecMode::Conservative;
+  model::CopySpecMode copyspecMode_ = model::CopySpecMode::Off;
   // Ends a probation once it has lasted, unless the process stops first.
   std::thread probation_;
   std::mutex probationMutex_;

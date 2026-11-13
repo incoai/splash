@@ -798,13 +798,12 @@ SERVE_OPTIONS = (
         "--copyspec-mode",
         "requests",
         dict(
-            choices=("off", "conservative", "auto"),
-            default="conservative",
-            help="prompt-lookup drafting of a request's own earlier tokens: off "
-            "never copies, conservative copies until a copied block verifies "
-            "nothing, which stops copying for the rest of the request, and auto "
-            "gates copying on the throughput it measures (default: "
-            "conservative)",
+            choices=("off", "conservative"),
+            default="off",
+            help="prompt-lookup drafting of a request's own earlier tokens, "
+            "off unless asked for: off never copies, conservative copies until "
+            "a copied block verifies nothing, which stops copying for the rest "
+            "of the request (default: off)",
         ),
         engine=EngineArgument("--copyspec-mode"),
     ),

@@ -92,10 +92,10 @@ struct NativeArguments final {
   // an int8-activation path takes them
   // (RuntimeResourcesConfig::int8Activations).
   ops::Int8Activations int8Activations = ops::Int8Activations::On;
-  // --copyspec-mode off|conservative|auto: whether a request's decode cycles
-  // may draft by copying the request's own earlier tokens
-  // (RuntimeResourcesConfig::copyspecMode).
-  model::CopySpecMode copyspecMode = model::CopySpecMode::Conservative;
+  // --copyspec-mode off|conservative: whether a request's decode cycles
+  // may draft by copying the request's own earlier tokens; off unless asked
+  // for (RuntimeResourcesConfig::copyspecMode).
+  model::CopySpecMode copyspecMode = model::CopySpecMode::Off;
 };
 
 // Reads `serve-native MODEL_DIRECTORY MAX_CONTEXT|auto MAX_MEMORY_BYTES|auto

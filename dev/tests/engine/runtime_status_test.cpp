@@ -344,6 +344,8 @@ StatusInputs representativeStatus() {
   executorTelemetry.stateHeldImageBytes = 7;
   executorTelemetry.imageRowsBytes = 8;
   executorTelemetry.aneFfnReruns = 1;
+  executorTelemetry.copyspecHits = 4;
+  executorTelemetry.copyspecTokens = 12;
   executorTelemetry.verifyBudget = true;
   const AneFfnSnapshot aneFfn{AneFfnSnapshot::State::Stopped,
                               "an evaluation did not complete within 2 s",
@@ -409,6 +411,8 @@ void testCleanRuntimeStatus(const char *goldenPath) {
                   std::string::npos &&
               tokenMajorStatus.find("\"value_layout\":\"token_major\"") != std::string::npos,
           "token-major values were reported dimension-major");
+  require(status.json().find("\"copyspec_hits\":4,\"copyspec_tokens\":12") != std::string::npos,
+          "status lost the prompt-lookup copying counters");
 
   StatusInputs unmeasuredInputs = status;
   unmeasuredInputs.sample.telemetry = {};

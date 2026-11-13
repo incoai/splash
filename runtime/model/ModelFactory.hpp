@@ -137,8 +137,8 @@ struct RuntimeContext final {
   KvHistoryStream *historyStream = nullptr;
   VerifyRows verifyRows = VerifyRows::Auto;
   // Whether a request's decode cycles may draft by copying the request's own
-  // earlier tokens (--copyspec-mode).
-  CopySpecMode copyspecMode = CopySpecMode::Conservative;
+  // earlier tokens (--copyspec-mode); off unless asked for.
+  CopySpecMode copyspecMode = CopySpecMode::Off;
 };
 
 // Validates only the interface between independently defined target and draft
