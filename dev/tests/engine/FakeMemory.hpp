@@ -76,6 +76,14 @@ public:
       throw std::logic_error("fake memory released more than " + std::string(holder) + " holds");
     change(holder, -static_cast<int64_t>(bytes));
   }
+  // From now on the device holds `bytes` of Metal memory outside the
+  // backend's buffers (pipelines, driver allocations, other code in the
+  // process) beside what the fakes hold; the host's readings count only
+  // theirs.
+  void holdUntracked(uint64_t bytes) {
+    untracked_ = bytes;
+    metalStatistics().deviceCurrentAllocatedBytes = total_ + untracked_;
+  }
 
   [[nodiscard]] uint64_t held(std::string_view holder) const noexcept {
     const auto found = holders_.find(holder);
@@ -148,6 +156,7 @@ private:
     total_ += bytes;
     metalStatistics().allocatedBytes = total_;
     metalStatistics().peakAllocatedBytes = std::max(metalStatistics().peakAllocatedBytes, total_);
+    metalStatistics().deviceCurrentAllocatedBytes = total_ + untracked_;
     peak_ = std::max(peak_, total_);
     notePeak();
     changes_.push_back({now_, std::string(holder), bytes, total_});
@@ -161,6 +170,7 @@ private:
   Config config_;
   std::map<std::string, uint64_t, std::less<>> holders_;
   uint64_t total_ = 0;
+  uint64_t untracked_ = 0;
   uint64_t peak_ = 0;
   uint64_t peakOverHost_ = 0;
   uint64_t other_ = 0;

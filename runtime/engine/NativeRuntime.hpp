@@ -83,8 +83,8 @@ public:
     core_.setCompletionNotifier(std::move(notifier));
   }
 
-  // Sends Warming, before announceReady, once the engine holds its weights.
-  void announceWarming();
+  // Sends the warm-up's `progress`, before announceReady, once the engine holds its weights.
+  void announceWarming(const protocol::WarmingEvent &progress);
   // Sends `ready` (readyEventFor), once, and starts the idle release's count.
   void announceReady(const protocol::ReadyEvent &ready);
 

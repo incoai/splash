@@ -78,7 +78,9 @@ def prepare_local_model(
     that one. The server holds the directory it serves until it exits, and
     takes models_dir's installation lock to hold it when it starts, so it
     needs write access there; a directory a later preparation no longer
-    returns is removed only once no server holds it.
+    returns is removed only once no server holds it, with the files of its
+    Hub snapshots no other installation links, unless another tool shares
+    the snapshot.
 
     A ModelError, "cannot prepare TARGET: REASON", refuses the files Splash
     cannot serve without a download (a missing file, an unsupported format,

@@ -47,20 +47,27 @@ final class ChatContext {
     struct Request: Equatable, Sendable {
         let history: [ChatMessage]
         let text: String
-        let images: [Data]
+        let attachments: [Attachment]
         let target: ChatTarget
         /// A restarted model may use another tokenizer even under the same name.
         var started: Date? = nil
+        /// Where the attachments are kept (`ChatStore.attachments`).
+        let files: URL
+        /// The conversation whose prompt it is, nil for a new chat's.
+        var conversation: UUID? = nil
 
         var messages: [ChatMessage] {
-            history + (text.isEmpty && images.isEmpty ? [] : [ChatMessage(role: .user, text: text, images: images)])
+            history + (text.isEmpty && attachments.isEmpty ? []
+                : [ChatMessage(role: .user, text: text, attachments: attachments.isEmpty ? nil : attachments)])
         }
     }
 
     typealias Counter = @Sendable (Request) async throws -> Int
 
-    /// The last prompt counted, and its count.
-    private(set) var counted: (request: Request, usage: ContextUsage)?
+    /// The last prompt counted in each conversation, by its id, nil for a new chat, and its count:
+    /// a chat opened again shows its last count at once, while its next prompt is counted. With
+    /// the last prompt of all alone, the ring went as each chat opened and came back once counted.
+    private(set) var counted: [UUID?: (request: Request, usage: ContextUsage)] = [:]
     @ObservationIgnored private let counter: Counter
     @ObservationIgnored private let delay: Duration
     /// The prompt being counted, or waiting for typing to pause.
@@ -68,37 +75,41 @@ final class ChatContext {
     @ObservationIgnored private var task: Task<Void, Never>?
 
     init(delay: Duration = .milliseconds(300),
-         counter: @escaping Counter = { try await ChatClient.countTokens($0.messages, with: $0.target) }) {
+         counter: @escaping Counter = { try await ChatClient.countTokens($0.messages, with: $0.target, files: $0.files) }) {
         self.delay = delay
         self.counter = counter
     }
 
     /// The count of exactly `request`, nil until it is counted.
     func usage(for request: Request) -> ContextUsage? {
-        counted.flatMap { $0.request == request ? $0.usage : nil }
+        counted[request.conversation].flatMap { $0.request == request ? $0.usage : nil }
     }
 
-    /// The count to show for a conversation of `history` with `target`: the last one, while the
+    /// The count to show for `conversation`, of `history`, with `target`: its last one, while the
     /// next is counted, a reply streams or another reasoning effort is chosen, as long as the
     /// conversation has only grown since by the draft counted and its reply, or had its last answer
-    /// asked again.
-    func shown(history: [ChatMessage], target: ChatTarget, started: Date?) -> ContextUsage? {
-        guard let counted, counted.request.target.sameModel(as: target), counted.request.started == started
-        else { return nil }
-        let base = counted.request.history
-        let grown = history.dropFirst(base.count)
-        // A new chat's count shows only on the chat its message started: other chats share its
-        // empty history. Message ids tell any other conversation apart.
-        let sent = history.starts(with: base) && grown.count <= 2 && (!base.isEmpty || grown.first.map {
-            $0.role == .user && $0.text == counted.request.text && $0.images == counted.request.images
-        } ?? true)
-        let askedAgain = base.last?.role == .assistant && history.count == base.count
-            && history.dropLast().elementsEqual(base.dropLast())
-        return sent || askedAgain ? counted.usage : nil
+    /// asked again; for a conversation a new chat's message started, the new chat's.
+    func shown(in conversation: UUID?, history: [ChatMessage], target: ChatTarget, started: Date?) -> ContextUsage? {
+        for key in [conversation, nil] {
+            guard let counted = counted[key], counted.request.target.sameModel(as: target), counted.request.started == started
+            else { continue }
+            let base = counted.request.history
+            let grown = history.dropFirst(base.count)
+            // A new chat's count shows only on the chat its message started: other chats share its
+            // empty history. Message ids tell any other conversation apart.
+            let sent = history.starts(with: base) && grown.count <= 2 && (!base.isEmpty || grown.first.map {
+                $0.role == .user && $0.text == counted.request.text && ($0.attachments ?? []) == counted.request.attachments
+            } ?? true)
+            let askedAgain = base.last?.role == .assistant && history.count == base.count
+                && history.dropLast().elementsEqual(base.dropLast())
+            if sent || askedAgain { return counted.usage }
+        }
+        return nil
     }
 
-    /// Counts `request` once typing pauses, in place of the prompt counted before; nil counts
-    /// nothing. A count that fails leaves none: the server checks every prompt it is sent.
+    /// Counts `request` once typing pauses, in place of the prompt counted before in its
+    /// conversation; nil counts nothing. A count that fails leaves none there: the server checks
+    /// every prompt it is sent.
     func refresh(_ request: Request?) {
         guard request != pending else { return }
         task?.cancel()
@@ -110,7 +121,7 @@ final class ChatContext {
             guard (try? await Task.sleep(for: delay)) != nil else { return }
             let count = try? await counter(request)
             guard let self, !Task.isCancelled, pending == request else { return }
-            counted = count.map { (request, ContextUsage(input: $0, limit: limit)) }
+            counted[request.conversation] = count.map { (request, ContextUsage(input: $0, limit: limit)) }
         }
     }
 }

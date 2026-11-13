@@ -6,8 +6,8 @@ by the rules it holds every start to (upstream.check_model), never its
 repository's name.
 
 Run as a script, it reports what each family makes of the options of
-`splash serve`, which the desktop app reads as it launches to offer a model
-only the options it can use (option_report):
+`splash serve`, which the desktop app reads as it launches to offer only the
+models of these families, each only the options it can use (option_report):
 
     python install/families.py
 """
