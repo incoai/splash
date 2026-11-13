@@ -61,6 +61,7 @@ from .http_security import (
     OriginRefused,
     RefusedOriginLog,
     authenticate,
+    socket_hosts,
     validate_headers,
 )
 from .images import MAX_IMAGE_BYTES
@@ -305,9 +306,9 @@ class FrontendHandler(BaseHTTPRequestHandler):
             min(self._unread_body, self.server.max_request_bytes)
         )
         try:
-            allowed_hosts = self.server.allowed_hosts | {
-                self.connection.getsockname()[0].lower()
-            }
+            allowed_hosts = self.server.allowed_hosts | socket_hosts(
+                self.connection.getsockname()
+            )
             self._allow_origin = validate_headers(
                 self.headers, allowed_hosts, self.server.allowed_origins
             )
@@ -1075,17 +1076,22 @@ class FrontendServer(HTTPServer):
         self.api_key = api_key
         self.webui = webui
         path = unix_socket.path(address[0])
-        bound = () if path is not None else (address[0],)
-        self.allowed_hosts = {
-            host.lower().rstrip(".")
-            for host in (*allowed_hosts, *bound, "localhost", "127.0.0.1", "::1")
-            if host not in ("0.0.0.0", "::")
-        }
         if path is not None:
             self.address_family = socket.AF_UNIX
             address = path
         # A UNIX socket's hold on its path, from its bind until it closes.
         self._claim = None
+        self.allowed_hosts = {
+            host.lower().rstrip(".")
+            for host in (
+                *allowed_hosts,
+                *socket_hosts(address),
+                "localhost",
+                "127.0.0.1",
+                "::1",
+            )
+            if host not in ("0.0.0.0", "::")
+        }
         # As serve_options.parse_allowed_origin returns them.
         self.allowed_origins = frozenset(allowed_origins)
         self.refused_origins = RefusedOriginLog()

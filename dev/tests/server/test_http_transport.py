@@ -1,4 +1,5 @@
 import concurrent.futures
+import contextlib
 import errno
 import http.client
 import json
@@ -910,10 +911,10 @@ class UnixSocketTests(HarnessTestCase):
         self.addCleanup(directory.cleanup)
         self.path = os.path.join(directory.name, "splash.sock")
 
-    def get(self, path, host="127.0.0.1:18081"):
+    def get(self, path, host="127.0.0.1:18081", at=None):
         connection = socket.socket(socket.AF_UNIX)
         connection.settimeout(3)
-        connection.connect(self.path)
+        connection.connect(at or self.path)
         connection.sendall(
             f"GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n".encode()
         )
@@ -997,6 +998,27 @@ class UnixSocketTests(HarnessTestCase):
         with self.assertRaises(OSError):
             api.FrontendServer((f"unix:{self.path}", 0), None)
         self.assertEqual(Path(self.path).read_text(), "kept")
+
+    def test_the_sockets_path_gives_the_host_check_no_name(self):
+        """Over a UNIX socket the server answers to the loopback names and
+        --allowed-host's alone: its path, which no Host header carries, adds
+        none (its first character was accepted as a Host: `s` for a server
+        started at a relative splash.sock)."""
+        self.enterContext(contextlib.chdir(os.path.dirname(self.path)))
+        self.harness(
+            FakeRuntime(), host="unix:splash.sock", allowed_hosts=["relay.example"]
+        )
+        for host, code in (
+            ("s", 403),
+            ("splash.sock", 403),
+            ("localhost:8000", 200),
+            ("[::1]", 200),
+            ("relay.example", 200),
+        ):
+            with self.subTest(host=host):
+                self.assertEqual(
+                    self.get("/health", host=host, at="splash.sock")[0], code
+                )
 
 
 if __name__ == "__main__":
