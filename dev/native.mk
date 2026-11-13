@@ -895,9 +895,11 @@ ASAN_TEST_ENV := ASAN_OPTIONS=detect_leaks=0:halt_on_error=1 \
 TSAN_TEST_ENV := TSAN_OPTIONS=halt_on_error=1
 # engine-sim under the sanitizers runs every scenario but those too long for
 # them: testRegrowthAfterABurstTakesOnlyCacheThatFreesNow runs past 5 minutes
-# under ThreadSanitizer, where the others take at most 1.5. test-engine-cpu
-# runs every scenario.
-ENGINE_SIM_SANITIZER_SKIPPED := sim/testRegrowthAfterABurstTakesOnlyCacheThatFreesNow
+# under ThreadSanitizer, and testChurnKeepsItsBoundsWhereLanesConvert's 19
+# churns take about 2 each there, where each of the others takes at most 2.
+# test-engine-cpu runs every scenario.
+ENGINE_SIM_SANITIZER_SKIPPED := sim/testRegrowthAfterABurstTakesOnlyCacheThatFreesNow \
+	sim/testChurnKeepsItsBoundsWhereLanesConvert
 # The names of sim binary $(1)'s scenarios but the skipped ones, for --filter.
 engine_sim_sanitizer_scenarios = "$$($(1) --list | grep -v -x -F $(foreach name,$(ENGINE_SIM_SANITIZER_SKIPPED),-e $(name)) | paste -s -d , -)"
 test-sanitizers: $(SANITIZER_CONFIG_TARGETS)

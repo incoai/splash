@@ -148,10 +148,10 @@ protocol::RequestFrame frame(uint64_t id, std::vector<uint32_t> tokens, uint32_t
   return result;
 }
 
-// Three workers' prompts: 59,043 tokens first and `step` more a round, the
+// Three workers' prompts: `first` tokens first and `step` more a round, the
 // workers a few tokens apart; every fourth round resends the previous
-// conversation and 8 tokens more. Output: `output` tokens, 1504 whole
-// commands of them by default.
+// conversation and 8 tokens more. Output: `output` tokens. By default 59,043,
+// 12,200 and 1504, whole commands.
 struct ChurnPrompts final {
   uint32_t first = 59'043, step = 12'200;
   std::array<int32_t, 3> offsets{-23, 11, 0};
@@ -449,49 +449,74 @@ ChurnEpisode churnThroughAHostEpisode(const ChurnPrompts &prompts) {
   return result;
 }
 
-// The churn keeps the store, turning it at most once a host level, with
-// bounded gaps and waits, in its own workload and in those around it where a
-// lane meets the memory wall: its growth refused, or its conversion to
-// Spill. Its own workload meets no wall, so alone it held the gap bound,
-// which guards decode latency at the wall, nowhere near one: of the 45
-// workloads of rounds of 10,700 to 13,700 tokens and outputs of 904 to 2,404,
-// these 12 meet it, and in 5 a lane that converted right after a prefill
-// pass sat out that command, the next pass running first, a decode gap of
-// 1,068 ms. The 32 others stay below the wall, as its own does, and took
-// 175 s more of the 240 s all 45 take.
-void testChurnKeepsTheStoreThroughAHostEpisode() {
+// A workload of the churn, for a failure's message and a note.
+std::string describe(const ChurnPrompts &prompts) {
+  return "a first prompt of " + std::to_string(prompts.first) + " tokens, rounds of " + std::to_string(prompts.step) +
+         ", outputs of " + std::to_string(prompts.output);
+}
+
+// The churn through the host episode in each of `workloads` keeps the store, turning it at most once a host level,
+// with bounded gaps and waits; a failure names every workload that broke a check.
+void churnsKeepTheirBounds(std::span<const ChurnPrompts> workloads) {
   const Machine &machine = kStudio18G;
-  constexpr std::array<ChurnPrompts, 13> kWorkloads{{{.step = 10'700, .output = 1504},
-                                                     {.step = 11'200, .output = 1504},
-                                                     {.step = 11'200, .output = 1904},
-                                                     {.step = 11'200, .output = 2404},
-                                                     {.step = 11'600, .output = 1204},
-                                                     {.step = 11'600, .output = 1504},
-                                                     {.step = 11'900, .output = 1504},
-                                                     {.step = 11'900, .output = 2404},
-                                                     {.step = 12'200, .output = 1504},
-                                                     {.step = 12'200, .output = 2404},
-                                                     {.step = 12'500, .output = 1204},
-                                                     {.step = 12'800, .output = 1904},
-                                                     {.step = 13'200, .output = 1904}}};
   std::string failures;
   ChurnEpisode longest;
   ChurnPrompts most;
-  for (const ChurnPrompts &prompts : kWorkloads) {
+  for (const ChurnPrompts &prompts : workloads) {
     const ChurnEpisode run = churnThroughAHostEpisode(prompts);
     if (!run.failures.empty())
-      failures += "\n  rounds of " + std::to_string(prompts.step) + " tokens, outputs of " +
-                  std::to_string(prompts.output) + run.failures;
+      failures += "\n  " + describe(prompts) + run.failures;
     if (run.longestGap > longest.longestGap) {
       longest = run;
       most = prompts;
     }
   }
   require(failures.empty(), at(machine) + "the churn broke its bounds at" + failures);
-  note(at(machine) + std::to_string(kWorkloads.size()) + " workloads, the longest decode gap " +
-       std::to_string(longest.longestGap) + " ms of " + std::to_string(longest.gapLimit) + " in rounds of " +
-       std::to_string(most.step) + " tokens, outputs of " + std::to_string(most.output) + ", " +
-       std::to_string(longest.finished) + " requests");
+  note(at(machine) + std::to_string(workloads.size()) + " workloads, the longest decode gap " +
+       std::to_string(longest.longestGap) + " ms of " + std::to_string(longest.gapLimit) + " at " + describe(most) +
+       ", " + std::to_string(longest.finished) + " requests");
+}
+
+// A 15-minute churn through a host episode short of critical pressure keeps
+// the store, turning it at most once a host level, with bounded gaps and
+// waits, in a workload where a lane converts to Spill owing its copies
+// (testChurnKeepsItsBoundsWhereLanesConvert): the cheapest of four under
+// ThreadSanitizer, which runs this scenario alone of the churn's, 115 s
+// against 117 for the churn's own workload.
+void testChurnKeepsTheStoreThroughAHostEpisode() {
+  constexpr ChurnPrompts kWorkload{.first = 56'043};
+  churnsKeepTheirBounds(std::span(&kWorkload, 1));
+}
+
+// The same churn in every workload around its own in which a lane converts to
+// Spill, the decision at the memory wall the decode gap bound guards there,
+// and in its own, which takes none: of the 45 of rounds of 10,700 to 13,700
+// tokens and the 40 of first prompts of 53,043 to 65,043, both with outputs
+// of 904 to 2,404, the one above and these 18. In the 11 whose lane's history
+// had its copies, 7 broke the bound while the lane sat out the command it
+// converted in, and in the 8 whose lane owed them, 5 while the next pass ran
+// before the copies landed, at up to 1,069 ms against 838.
+void testChurnKeepsItsBoundsWhereLanesConvert() {
+  constexpr std::array<ChurnPrompts, 19> kWorkloads{{{},
+                                                     {.step = 10'700, .output = 1504},
+                                                     {.step = 11'200, .output = 1504},
+                                                     {.step = 11'200, .output = 1904},
+                                                     {.step = 11'600, .output = 1204},
+                                                     {.step = 11'600, .output = 1504},
+                                                     {.step = 11'900, .output = 1504},
+                                                     {.step = 12'500, .output = 1204},
+                                                     {.step = 12'800, .output = 1904},
+                                                     {.step = 13'200, .output = 1904},
+                                                     {.first = 53'043, .output = 1204},
+                                                     {.first = 53'043, .output = 1504},
+                                                     {.first = 54'543, .output = 1204},
+                                                     {.first = 57'543, .output = 1204},
+                                                     {.first = 57'543, .output = 1504},
+                                                     {.first = 63'543, .output = 1204},
+                                                     {.first = 63'543, .output = 1904},
+                                                     {.first = 65'043, .output = 1504},
+                                                     {.first = 65'043, .output = 1904}}};
+  churnsKeepTheirBounds(kWorkloads);
 }
 
 // The engine harness running `profile`'s commands on its clock, a pass a
@@ -942,6 +967,7 @@ std::span<const test::TestCase> simTests() {
   static constexpr test::TestCase kTests[] = {
       {"testLongPromptBesideTwoDecoders", testLongPromptBesideTwoDecoders},
       {"testChurnKeepsTheStoreThroughAHostEpisode", testChurnKeepsTheStoreThroughAHostEpisode},
+      {"testChurnKeepsItsBoundsWhereLanesConvert", testChurnKeepsItsBoundsWhereLanesConvert},
       {"testRegrowthAfterABurstTakesOnlyCacheThatFreesNow", testRegrowthAfterABurstTakesOnlyCacheThatFreesNow},
       {"testCriticalTakesTheMarginASecondAndKeepsTheResumePoint",
        testCriticalTakesTheMarginASecondAndKeepsTheResumePoint},
