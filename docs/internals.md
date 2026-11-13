@@ -244,6 +244,22 @@ instead of mixing two versions. A start logs `Weights loaded in N s.`; loading
 reads the sources at about the speed of the disk that holds them
 ([upstream loading](../dev/benchmarks/upstream-loading.md#loading-time)).
 
+A start plans its memory before the weights load, and its arenas rest on
+the target's formats ([memory and context](server.md#memory-and-context)), so it
+first reads the target from its images unwritten: `WeightImages` loaded while
+released reserves each image, a buffer of no memory whose views are handles
+of their sizes, and the image's file reads the bytes its readers parse, its
+header and descriptors, from the image's plan (`gguf::Image::fills`). The
+target's loader and readers run as for a load and give every projection its
+formats and sizes (`model::plannedTargetGeometry`): the routed experts read
+with their layers' reserved images, which make no store, and a table that
+may stream streams through its smallest row cache, as its whole image may
+exceed the largest buffer, which a reservation is held to as well. The read
+writes nothing and holds no memory once done; while it runs, only the tables
+its readers fill on the host, the resident experts' slot table and a rotated
+GGUF's signs, a page each. A restore writes an image loaded while released
+as one released after it loaded.
+
 At load time the engine validates the GGUF metadata, including the data
 alignment (`general.alignment`, a power of two of 8 or more, as the GGUF spec
 requires: the repack reads blocks as words) and the rotary embedding and norm
@@ -1686,7 +1702,7 @@ target with an SSD cache that takes writes), else 0.85 of its slots;
 `--expert-memory` sets it exactly. The stores are sized before the start
 knows whether the run spills; a store above its smallest size laid out for a
 spill the final plan does not make loads again at 0.85, while one at its
-smallest size is all its floor at either share (`holdsStores` in
+smallest size is all its floor at either share (`keepsFloor` in
 `runtime/engine/RuntimeResources.mm`). No claim takes the store below its
 floor.
 After the host's pass a pool grows one unit, an elastic store chunk of about
