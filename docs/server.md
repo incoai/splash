@@ -703,6 +703,18 @@ cache off. A full cache keeps the only copy of the prefix the newest
 conversation resumes from and of those that requests waiting to start will
 resume from: only a spilling request's KV displaces them.
 
+The quota counts what the cache's files keep on the volume: for each cached
+state and KV page, the 16 KiB pages its bytes fill. A page of a model with
+sliding-window layers holds only the other layers' KV once every window has
+passed it, for Flint 14 of its 49 layers, 464 KiB where a whole page takes
+1.59 MiB, so the same quota holds 3.5 times as many tokens of such pages as of
+whole ones. A file keeps a whole page's room for each copy and leaves the
+part a copy does not fill unallocated, so its length (`ls -l`) can pass the
+quota while the space it takes (`du`) stays within it. That needs a volume
+that gives the unused part of a file back, as APFS does; on one that does not,
+such as HFS+ or exFAT, every copy counts a whole page's or state's room, and
+the log says so once.
+
 State writes stage through a buffer of one state (64 MiB for 35B, 153 MiB for
 27B) that the memory plan sets aside within `--max-memory`; on a 24 GB Mac
 serving 27B that costs 4,096 tokens of context. A size sets it aside whatever
@@ -746,11 +758,14 @@ cause repeated reads and writes.
 Startup prints one line: where the files are, the limit and why, the write
 budget when one is set, and that `--max-cache-disk 0` turns the cache off.
 `/status` reports under `disk` the quota (`capacity_bytes`), what the volume
-leaves of it now (`limit_bytes`), `used_bytes`, `volume_available_bytes`, what
-holds writes back (`writes_gated`: `no`, `budget`, or `closed` once a file
-stopped taking writes), `write_budget_bytes`, the bytes the next state's
-write not in use may take now, and `writes_deferred_ms`, how long writes held
-back for SSD reads a step waited for. Without a write budget `writes_gated` is
+leaves of it now (`limit_bytes`), what its copies count of it (`used_bytes`,
+of which the KV pages' `kv_bytes` over `kv_blocks` pages), what the files
+keep on the volume by the same count (`file_bytes`),
+`volume_available_bytes`, what holds writes back (`writes_gated`: `no`,
+`budget`, or `closed` once a file stopped taking writes),
+`write_budget_bytes`, the bytes the next state's write not in use may take
+now, and `writes_deferred_ms`, how long writes held back for SSD reads a step
+waited for. Without a write budget `writes_gated` is
 never `budget` and `write_budget_bytes` is 0. It counts the KV pages copied
 ahead (`kv_copies`), and under `write_behind` the restore points queued for
 their copies, the one being copied among them (`waiting`), copied
