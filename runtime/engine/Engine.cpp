@@ -662,8 +662,12 @@ bool Engine::admitQueued(double now) {
   // record each wait of a request the scheduler would start as a failed
   // admission would. The first wanted start that waits for a lane takes one
   // from the lowest-priority resident below it, if there is one: the order
-  // is by priority, so no later request has one to take. The next pass
-  // admits it, above the lane it suspended. A request waiting for a prefix
+  // is by priority, so no later request has one to take. The pass then runs
+  // again at once, in the engine as the suspension left it, and admits the
+  // start above the lane it suspended, so the tick's command is the start's:
+  // left to the next tick's pass, a Foreground prompt under four Background
+  // decodes waited out one more command of the three that remained, 63 ms at
+  // a 27B's command times on a 32-core M5 Max. A request waiting for a prefix
   // takes none: it would leave the freed lane to the suspended one, which
   // would resume into it and replay for nothing.
   const bool lanesFull =
@@ -766,8 +770,11 @@ bool Engine::admitQueued(double now) {
       if (lanesFull) {
         if (!laneSought) {
           laneSought = true;
-          if (preemptBelow(active.request.priority, now))
+          if (preemptBelow(active.request.priority, now)) {
+            // The suspension is this pass's progress, whatever the next admits.
+            static_cast<void>(admitQueued(now));
             return true;
+          }
         }
         waitForLane(id, active);
       } else if (admit(active, now)) {
