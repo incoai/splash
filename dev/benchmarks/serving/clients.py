@@ -1,6 +1,6 @@
 """The serving benchmark's clients: what they send, what they record.
 
-Four scenarios drive a running server over HTTP, stdlib only, so that they
+Six scenarios drive a running server over HTTP, stdlib only, so that they
 measure every tree the same way (1.5.0, main and the candidate serve the same
 OpenAI API but different /status documents):
 
@@ -17,6 +17,18 @@ OpenAI API but different /status documents):
   server's prompt time of each (the prefill-splits measurement's protocol).
   serve1 and warm record the /status each request waited idle for, and the
   one after the last.
+- agent: N conversations, each a coding agent's tool loop that only grows:
+  every turn all of them send, at the same instant, their conversation so
+  far with the model's own last reply (its reasoning and its tool call, as
+  an OpenAI client sends them back) and the tool's result after it.
+- edit: N chats built turn by turn, one request at a time, then branched
+  from the middle: an earlier turn regenerated, the same turn edited, the
+  edited branch followed, and the original conversation taken up again.
+  agent and edit measure what the SSD cache writes for the prefixes requests
+  reuse: the /status at each turn's send is their sample, each turn reports
+  its counters' changes, and the summary the bytes written a turn and per
+  1,000 prompt tokens by cause, the prefix reuse rate and the time to first
+  token of each kind of turn.
 
 Every request timestamps each content chunk of its stream, so a request's
 gaps, the intervals between consecutive chunks after its first, are measured
@@ -122,7 +134,8 @@ def gap_summary(chunks: list[float], run_start: float) -> dict:
 
 class Stream:
     """One streamed chat completion: its HTTP status, content chunk times
-    (appended to `chunks` as they arrive), text, usage and the server's own
+    (appended to `chunks` as they arrive), text, reasoning and tool calls,
+    when the first of any of them came (`began`), usage and the server's own
     metrics, and why the server failed it: the body of an HTTP error, or the
     error event of a stream it had begun, which keeps status 200 (the server
     sends it, then [DONE], when the request fails after its first event).
@@ -144,6 +157,9 @@ class Stream:
     ):
         self.chunks: list[float] = [] if chunks is None else chunks
         self.text: list[str] = []
+        self.reasoning: list[str] = []
+        self.calls: list[dict] = []
+        self.began: float | None = None
         self.usage: dict = {}
         self.metrics: dict = {}
         self.error_body = ""
@@ -177,15 +193,39 @@ class Stream:
                 self.usage = event.get("usage") or self.usage
                 self.metrics = event.get("metrics") or self.metrics
                 for choice in event.get("choices", []):
-                    piece = (choice.get("delta") or {}).get("content")
+                    delta = choice.get("delta") or {}
+                    piece, thought = (
+                        delta.get("content"),
+                        delta.get("reasoning_content"),
+                    )
+                    calls = delta.get("tool_calls") or []
+                    if piece or thought or calls:
+                        self.began = self.began or time.time()
                     if piece:
                         self.chunks.append(time.time())
                         self.text.append(piece)
+                    if thought:
+                        self.reasoning.append(thought)
+                    for call in calls:
+                        self.call_delta(call)
             if not finished and not self.error_body:
                 raise ConnectionError("the stream ended before its data: [DONE]")
         finally:
             connection.close()
             self.ended = time.time()
+
+    def call_delta(self, delta: dict) -> None:
+        """Adds a tool call's delta to its call: the first names it, the
+        later ones carry its arguments' JSON text piece by piece."""
+        while len(self.calls) <= delta.get("index", 0):
+            self.calls.append(
+                {"type": "function", "function": {"name": "", "arguments": ""}}
+            )
+        call, function = self.calls[delta.get("index", 0)], delta.get("function") or {}
+        if delta.get("id"):
+            call["id"] = delta["id"]
+        call["function"]["name"] += function.get("name") or ""
+        call["function"]["arguments"] += function.get("arguments") or ""
 
     @property
     def ok(self) -> bool:
@@ -195,6 +235,17 @@ class Stream:
     @property
     def first(self) -> float | None:
         return self.chunks[0] if self.chunks else None
+
+    def message(self) -> dict:
+        """The reply as an OpenAI client sends it back in the conversation:
+        its content, its reasoning, and its tool calls with their arguments
+        as the JSON text the server streamed."""
+        message = {"role": "assistant", "content": "".join(self.text)}
+        if self.reasoning:
+            message["reasoning_content"] = "".join(self.reasoning)
+        if self.calls:
+            message["tool_calls"] = self.calls
+        return message
 
 
 class Recorder:
@@ -609,9 +660,13 @@ def wait_idle(port: int, settle: float, timeout: float = 600) -> dict:
         time.sleep(0.25)
 
 
-def counter_deltas(before: dict, after: dict) -> dict:
+def counter_deltas(
+    before: dict, after: dict, counters=TTFT_COUNTERS, gauges=TTFT_GAUGES
+) -> dict:
+    """How much each of `counters` rose between two /status documents,
+    those both report, and each of `gauges` in the later one."""
     out = {}
-    for path in TTFT_COUNTERS:
+    for path in counters:
         a, b = dig(before, path), dig(after, path)
         if isinstance(a, (int, float)) and isinstance(b, (int, float)):
             out[path] = round(b - a, 3)
@@ -621,9 +676,32 @@ def counter_deltas(before: dict, after: dict) -> dict:
     )
     if routed:
         out["expert_prefill_hit_rate"] = round(1 - read / routed, 4)
-    for path in TTFT_GAUGES:
+    for path in gauges:
         out[path] = dig(after, path)
     return out
+
+
+def send_together(port: int, bodies: list[str], timeout: float) -> list:
+    """Sends the requests at the same instant, each on a connection of its
+    own (Stream's barrier), and returns each one's Stream, or the exception
+    that ended it."""
+    barrier, streams = threading.Barrier(len(bodies)), [None] * len(bodies)
+
+    def send(i):
+        try:
+            streams[i] = Stream(port, bodies[i], timeout, barrier=barrier)
+        except Exception as error:  # its caller fails the requests and says why
+            # A sender that failed before the barrier releases the others
+            # waiting there.
+            barrier.abort()
+            streams[i] = error
+
+    threads = [threading.Thread(target=send, args=(i,)) for i in range(len(bodies))]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    return streams
 
 
 def largest_claims(claims: list) -> dict | None:
@@ -714,27 +792,11 @@ def run_ttft(
                 digest.update(json.dumps(messages).encode())
             before = wait_idle(port, settle)
             claims.clear()
-            barrier, streams = threading.Barrier(n), [None] * n
-
-            def send(i, requests=requests, barrier=barrier, streams=streams):
-                try:
-                    streams[i] = Stream(
-                        port,
-                        ttft_body(model, requests[i], TTFT_MAX_TOKENS),
-                        timeout,
-                        barrier=barrier,
-                    )
-                except Exception as error:  # the round fails and says why
-                    # A sender that failed before the barrier releases the
-                    # others waiting there.
-                    barrier.abort()
-                    streams[i] = error
-
-            threads = [threading.Thread(target=send, args=(i,)) for i in range(n)]
-            for thread in threads:
-                thread.start()
-            for thread in threads:
-                thread.join()
+            streams = send_together(
+                port,
+                [ttft_body(model, messages, TTFT_MAX_TOKENS) for messages in requests],
+                timeout,
+            )
             after = wait_idle(port, 0)
             failures = [
                 str(s)[:300]
@@ -970,3 +1032,504 @@ def run_warm(
         recorder.emit("end")
     finally:
         recorder.close()
+
+
+# ------------------------------------------------------- agent and edit
+
+
+# Characters of ttft_corpus per token: Python 3.12.13's sources, 1,198,901
+# characters, are 293,626 tokens under the Qwen3.8 tokenizer.
+SOURCE_CHARS_PER_TOKEN = 4.08
+# What each turn adds to a conversation, a tool's result or a user's message,
+# in tokens: a coding-agent deployment whose requests found 98 % of their
+# 41K-token prompts cached computed about 820 new tokens a turn.
+TURN_TOKENS = 1000
+# Seconds from an agent turn's last reply to the next turn's send: a tool
+# that returns at once. With it a conversation of the defaults published its
+# next restore point 6.5 s after the last at the median (an M5 Max, Qwen3.8
+# 27B), sooner than the 10 s a point waits for its copy, so the conversations
+# went on from 33 of the 40 points that waited before they fell due and the
+# states written were mostly the reclaims'. A gap past that delay, such as
+# 15 s, measures the copies.
+AGENT_GAP_SECONDS = 0.5
+# The same of an edit turn: a user reading the reply, past the delay, so
+# that every point is copied, as a chat's are (21 of 21 in a chat of 12
+# turns).
+EDIT_GAP_SECONDS = 8.0
+# The reported deployment's concurrency, which is also the engine's batch
+# width.
+AGENT_CONVERSATIONS = 4
+AGENT_TURNS = 12
+# An agent reply: a short reasoning, a sentence and one tool call.
+AGENT_THINKING_TOKENS = 128
+AGENT_OUTPUT_TOKENS = 384
+AGENT_SYSTEM = (
+    "You are a coding agent reviewing a Python code base. Read the module you "
+    "are given with the read_file tool, one part per call, and after every "
+    "part call the tool again for the next one until you are told to stop. "
+    "Before each call, say in one sentence what the part you just read does."
+)
+AGENT_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "read_file",
+        "description": "Read one part of the module under review.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "part": {
+                    "type": "integer",
+                    "description": "The part to read, counting from 0.",
+                }
+            },
+            "required": ["part"],
+        },
+    },
+}
+EDIT_CONVERSATIONS = 2
+EDIT_TURNS = 8
+EDIT_OUTPUT_TOKENS = 128
+# /status counters whose change each turn reports, and gauges read after it:
+# what the SSD cache wrote and read, the counts that tell its writes apart,
+# and what the requests reused.
+WRITE_COUNTERS = (
+    "disk.written_bytes",
+    "disk.read_bytes",
+    "disk.kv_demotions",
+    "disk.kv_demotions_refused",
+    "disk.kv_copies",
+    "disk.kv_restores",
+    "disk.write_behind.durable",
+    "disk.write_behind.unneeded",
+    "disk.write_behind.refused",
+    "kv_spill.write_through.bytes",
+    "state.publications",
+    "state.offloads",
+    "state.offload_failures",
+    "state.evictions",
+    "state.checkpoint_evictions",
+    "state.disk_hits",
+    "state.disk_promotions",
+    "cache.hits",
+    "cache.cold_misses",
+    "cache.kv_hit_tokens",
+    "cache.kv_disk_hit_tokens",
+    "cache.reused_tokens",
+    "cache.deduplicated_kv_tokens",
+    "cache.lost_state_misses",
+    "cache.lazy_junctions",
+    "cache.disk_state_publications",
+)
+WRITE_GAUGES = (
+    "memory_pressure",
+    "disk.used_bytes",
+    "disk.written_last_hour_bytes",
+    "disk.write_behind.waiting",
+    "disk.kv_blocks",
+    "state.entries",
+    "state.bytes",
+    "state.disk_bytes",
+    "kv.pages_cache",
+)
+# After its last turn a run goes on reading /status until the cache has
+# written nothing for TAIL_QUIET_SECONDS, at most TAIL_LIMIT_SECONDS: a
+# restore point is copied 10 s after its publication at the earliest
+# (WriteBehind's delay), so the conversations' last points are written after
+# the last turn, and one may wait for the copy before it.
+TAIL_QUIET_SECONDS = 15.0
+TAIL_LIMIT_SECONDS = 120.0
+TAIL_POLL_SECONDS = 1.0
+
+
+def material(text: str, slot: int, tokens: int) -> str:
+    """About `tokens` tokens of the corpus: slot after slot takes it in
+    order, and starts over at its end."""
+    chars = int(tokens * SOURCE_CHARS_PER_TOKEN)
+    return excerpt(text, slot * chars % max(1, len(text) - 2 * chars), chars)
+
+
+def written_by_cause(deltas: dict, page_bytes: int) -> dict:
+    """The bytes the cache wrote in a window, by what wrote them as far as
+    /status counts it: the KV pages reclaims demoted, those copied ahead for
+    restore points and those Spill requests wrote through, each a page of
+    `page_bytes`, and the rest, the states, which no counter splits between
+    the reclaims that wrote them and the restore points' copies."""
+    causes = {
+        "kv_demotions": deltas.get("disk.kv_demotions", 0) * page_bytes,
+        "kv_copies": deltas.get("disk.kv_copies", 0) * page_bytes,
+        "kv_spill": deltas.get("kv_spill.write_through.bytes", 0),
+    }
+    # A page's write counts in the bytes as it is written and in its counter
+    # once it has landed, so a window may count a page it did not finish.
+    states = deltas.get("disk.written_bytes", 0) - sum(causes.values())
+    return {"states": max(0, states), **causes}
+
+
+def write_summary(
+    requests: list[dict], turns: list[dict], tail: dict, page_bytes: int
+) -> dict:
+    """What a conversation scenario measured, from its request records, its
+    turns' counter changes and those after the last turn (the tail): the
+    bytes the cache wrote during the turns, per request (one turn of one
+    conversation) and per 1,000 prompt tokens, by cause, and after them; the
+    share of the prompts' tokens the cache held (the reuse rate); and each
+    kind of turn's time to first token. A rate whose denominator is zero is
+    None."""
+
+    def total(records, key):
+        return sum(record.get(key) or 0 for record in records)
+
+    during = {path: total(turns, path) for path in WRITE_COUNTERS}
+    prompt, written = total(requests, "prompt"), during["disk.written_bytes"]
+    first_tokens: dict[str, list[float]] = {}
+    for record in requests:
+        first_tokens.setdefault(record["turn_kind"], []).append(record["ttft_ms"])
+    return {
+        "turns": len(turns),
+        "requests": len(requests),
+        "prompt_tokens": prompt,
+        "cached_tokens": total(requests, "cached"),
+        "deduplicated_tokens": total(requests, "deduplicated"),
+        "reuse_rate": round(total(requests, "cached") / prompt, 4) if prompt else None,
+        "written_bytes": written,
+        "written_bytes_per_request": round(written / len(requests))
+        if requests
+        else None,
+        "written_bytes_per_1k_prompt_tokens": round(written * 1000 / prompt)
+        if prompt
+        else None,
+        "written_by_cause": written_by_cause(during, page_bytes),
+        "tail_written_bytes": tail.get("disk.written_bytes", 0),
+        "tail_written_by_cause": written_by_cause(tail, page_bytes),
+        "counters": during,
+        "tail_counters": {path: tail.get(path, 0) for path in WRITE_COUNTERS},
+        "ttft_ms": {
+            kind: {
+                "n": len(samples),
+                "median": round(statistics.median(samples), 1),
+                "max": max(samples),
+            }
+            for kind, samples in first_tokens.items()
+        },
+    }
+
+
+class Turns:
+    """A conversation scenario's turns. Each sends its requests at the same
+    instant and lasts until `gap` seconds after the last of them was
+    answered; the /status read then ends it and begins the next. Records
+    LABEL.events.jsonl (start, each request, each turn with its counters'
+    changes, the tail, the summary, end) and LABEL.status.jsonl (the /status
+    at each turn's start and after the tail). Each request may take `timeout`
+    seconds (Stream)."""
+
+    def __init__(
+        self,
+        port: int,
+        directory: str,
+        label: str,
+        scenario: str,
+        gap: float,
+        timeout: float,
+        **parameters,
+    ):
+        self.port, self.gap, self.timeout = port, gap, timeout
+        self.model = served_model(port)
+        self.recorder = Recorder(directory, label)
+        self.requests: list[dict] = []
+        self.turns: list[dict] = []
+        self.digest = hashlib.sha256()
+        self.recorder.emit(
+            "start",
+            scenario=scenario,
+            model=self.model,
+            python=sys.version.split()[0],
+            gap=gap,
+            **parameters,
+        )
+        self.status = wait_idle(port, 0)
+        self.page_bytes = dig(self.status, "memory_plan.model.kv_page_bytes") or 0
+        self.recorder.sample(self.status, turn=0)
+
+    def material(self, text: str, slot: int, tokens: int) -> str:
+        """material(), counted in the digest of what the scenario itself
+        sends: the model's replies, which it sends back, differ from run to
+        run."""
+        piece = material(text, slot, tokens)
+        self.digest.update(piece.encode())
+        return piece
+
+    def turn(self, kind: str, requests: list[tuple[int, str]]) -> list[Stream]:
+        """One turn of `kind`: the bodies of `requests`, each with its
+        conversation, sent at the same instant. Returns their streams once
+        the turn is recorded. A request the server failed, or answered
+        without a token, raises RequestFailed; one whose stream failed
+        raises what failed it."""
+        index = len(self.turns)
+        streams = send_together(self.port, [body for _, body in requests], self.timeout)
+        for (conversation, _), stream in zip(requests, streams):
+            if isinstance(stream, Exception):
+                raise stream
+            if not stream.ok or stream.began is None:
+                raise RequestFailed(
+                    f"{kind} turn {index}, conversation {conversation}: "
+                    f"{stream.status} {stream.error_body}"
+                )
+        records = [
+            {
+                "turn": index,
+                "turn_kind": kind,
+                "conv": conversation,
+                **turn_request_record(stream, self.recorder),
+            }
+            for (conversation, _), stream in zip(requests, streams)
+        ]
+        for record in records:
+            self.recorder.emit("request", **record)
+        time.sleep(self.gap)
+        status = get_json(self.port, "/status")
+        self.recorder.sample(status, turn=index + 1)
+        record = {
+            "turn": index,
+            "turn_kind": kind,
+            "requests": len(records),
+            "window_s": [
+                min(r["sent_s"] for r in records),
+                self.recorder.seconds(),
+            ],
+            "prompt": sum(r["prompt"] or 0 for r in records),
+            "cached": sum(r["cached"] or 0 for r in records),
+            **counter_deltas(self.status, status, WRITE_COUNTERS, WRITE_GAUGES),
+        }
+        self.recorder.emit("turn", **record)
+        self.requests += records
+        self.turns.append(record)
+        self.status = status
+        return streams
+
+    def finish(self) -> dict:
+        """Waits for the cache's writes after the last turn (the tail), then
+        records and returns the summary."""
+        started = quiet = time.time()
+        status = self.status
+        while (
+            time.time() - quiet < TAIL_QUIET_SECONDS
+            and time.time() - started < TAIL_LIMIT_SECONDS
+        ):
+            time.sleep(TAIL_POLL_SECONDS)
+            latest = get_json(self.port, "/status")
+            if dig(latest, "disk.written_bytes") != dig(status, "disk.written_bytes"):
+                quiet = time.time()
+            status = latest
+        tail = counter_deltas(self.status, status, WRITE_COUNTERS, WRITE_GAUGES)
+        self.recorder.sample(status, tail=True)
+        self.recorder.emit("tail", seconds=round(time.time() - started, 1), **tail)
+        summary = {
+            **write_summary(self.requests, self.turns, tail, self.page_bytes),
+            "material_sha256": self.digest.hexdigest()[:16],
+        }
+        self.recorder.emit("summary", **summary)
+        self.recorder.emit("end")
+        return summary
+
+    def close(self) -> None:
+        self.recorder.close()
+
+
+def turn_request_record(stream: Stream, recorder: Recorder) -> dict:
+    """ttft_request_record's fields, the first token being the first output
+    of any kind (an agent's turn may answer with reasoning and a tool call
+    alone), and what else the server counted of the request: the tokens
+    whose KV it read from cached blocks past its cached prefix, its
+    reasoning tokens and its tool calls."""
+    return {
+        **ttft_request_record(stream, recorder),
+        "first_s": recorder.seconds(stream.began),
+        "ttft_ms": round((stream.began - stream.sent) * 1000, 1),
+        "deduplicated": dig(stream.metrics, "cache.deduplicated_tokens"),
+        "reasoning": dig(stream.usage, "completion_tokens_details.reasoning_tokens"),
+        "calls": len(stream.calls),
+    }
+
+
+def agent_conversation(guide: str, conversation: int) -> list[dict]:
+    """A conversation's start: the system prompt every conversation of the
+    agent shares, with its guide, and the conversation's own task."""
+    return [
+        {
+            "role": "system",
+            "content": f"{AGENT_SYSTEM}\n\nThe code base's guide follows.\n\n{guide}",
+        },
+        {
+            "role": "user",
+            "content": f"Task {conversation}: review module {conversation}. "
+            "Begin with part 0.",
+        },
+    ]
+
+
+def agent_step(stream: Stream, conversation: int, turn: int, part: str) -> list[dict]:
+    """What a turn adds to its conversation: the model's reply as the client
+    sends it back, then the part it is to read next, as the result of each
+    tool call it made or, after a reply that made none, as the user's next
+    message, so that the conversation grows the same either way."""
+    listing = f"# module {conversation}, part {turn}\n{part}"
+    if not stream.calls:
+        return [
+            stream.message(),
+            {"role": "user", "content": f"{listing}\n\nGo on with the next part."},
+        ]
+    return [
+        stream.message(),
+        *(
+            {"role": "tool", "tool_call_id": call.get("id", ""), "content": listing}
+            for call in stream.calls
+        ),
+    ]
+
+
+def agent_body(model: str, messages: list[dict]) -> str:
+    return json.dumps(
+        {
+            "model": model,
+            "messages": messages,
+            "tools": [AGENT_TOOL],
+            "max_tokens": AGENT_OUTPUT_TOKENS,
+            "temperature": 0,
+            "reasoning_effort": "low",
+            "thinking_token_budget": AGENT_THINKING_TOKENS,
+            "stream": True,
+            "stream_options": {"include_usage": True},
+        }
+    )
+
+
+def run_agent(
+    port: int,
+    directory: str,
+    label: str,
+    conversations: int = AGENT_CONVERSATIONS,
+    turns: int = AGENT_TURNS,
+    turn_tokens: int = TURN_TOKENS,
+    gap: float = AGENT_GAP_SECONDS,
+    text: str | None = None,
+    timeout: float = REQUEST_SECONDS,
+) -> dict:
+    """The agent scenario against a fresh server: `conversations` tool loops
+    of `turns` turns, each turn adding the model's reply and a tool result
+    of about `turn_tokens` tokens to every conversation. They share their
+    system prompt, a guide of `turn_tokens` tokens in it, and their tool, as
+    one agent's conversations do. Returns the summary (write_summary)."""
+    text = ttft_corpus() if text is None else text
+    run = Turns(
+        port,
+        directory,
+        label,
+        "agent",
+        gap,
+        timeout,
+        conversations=conversations,
+        turns=turns,
+        turn_tokens=turn_tokens,
+    )
+    try:
+        guide = run.material(text, 0, turn_tokens)
+        chats = [agent_conversation(guide, c) for c in range(conversations)]
+        for turn in range(turns):
+            streams = run.turn(
+                "first" if turn == 0 else "loop",
+                [(c, agent_body(run.model, chat)) for c, chat in enumerate(chats)],
+            )
+            for c, (chat, stream) in enumerate(zip(chats, streams)):
+                part = run.material(text, 1 + turn * conversations + c, turn_tokens)
+                chat += agent_step(stream, c, turn, part)
+        return run.finish()
+    finally:
+        run.close()
+
+
+def edit_depths(turns: int) -> list[int]:
+    """The earlier turns an edit run goes back to: those a quarter, half and
+    three quarters into the conversation, past its first."""
+    return sorted({turns * quarter // 4 for quarter in (1, 2, 3)} - {0})
+
+
+def edit_user(conversation: int, turn: int, part: str, revised: bool) -> dict:
+    return {
+        "role": "user",
+        "content": f"Chat {conversation}, part {turn}{', revised' if revised else ''}. "
+        f"An excerpt:\n\n{part}\n\nIn one sentence, what does it do?",
+    }
+
+
+def run_edit(
+    port: int,
+    directory: str,
+    label: str,
+    conversations: int = EDIT_CONVERSATIONS,
+    turns: int = EDIT_TURNS,
+    turn_tokens: int = TURN_TOKENS,
+    gap: float = EDIT_GAP_SECONDS,
+    text: str | None = None,
+    timeout: float = REQUEST_SECONDS,
+) -> dict:
+    """The edit scenario against a fresh server, one request at a time, each
+    a turn of its own, the conversations taking turns. `conversations` chats
+    are built over `turns` turns (build), each a user message of about
+    `turn_tokens` tokens and the model's reply. Then, for each of
+    edit_depths' turns: the conversation up to that turn's user message is
+    sent again (regenerate); it is sent with another message in that one's
+    place (edit); the edited branch goes on for a turn (follow); and the
+    original conversation, whole, goes on for one (return). Returns the
+    summary (write_summary)."""
+    if not edit_depths(turns):
+        raise ValueError("an edit run needs an earlier turn to go back to: 2 turns")
+    text = ttft_corpus() if text is None else text
+    run = Turns(
+        port,
+        directory,
+        label,
+        "edit",
+        gap,
+        timeout,
+        conversations=conversations,
+        turns=turns,
+        turn_tokens=turn_tokens,
+    )
+    # The user messages each conversation has asked so far.
+    asked = [0] * conversations
+
+    def user(c, turn, revised=False):
+        asked[c] += 1
+        part = run.material(text, asked[c] * conversations + c, turn_tokens)
+        return edit_user(c, turn, part, revised)
+
+    def ask(kind, c, messages):
+        (stream,) = run.turn(
+            kind, [(c, ttft_body(run.model, messages, EDIT_OUTPUT_TOKENS))]
+        )
+        return stream.message()
+
+    try:
+        chats: list[list[dict]] = [[] for _ in range(conversations)]
+        for turn in range(turns):
+            for c, chat in enumerate(chats):
+                chat.append(user(c, turn))
+                chat.append(ask("build", c, chat))
+        for depth in edit_depths(turns):
+            for c, chat in enumerate(chats):
+                ask("regenerate", c, chat[: 2 * depth + 1])
+            branches = [
+                chat[: 2 * depth] + [user(c, depth, revised=True)]
+                for c, chat in enumerate(chats)
+            ]
+            for c, branch in enumerate(branches):
+                branch.append(ask("edit", c, branch))
+            for c, branch in enumerate(branches):
+                ask("follow", c, branch + [user(c, depth + 1)])
+            for c, chat in enumerate(chats):
+                chat.append(user(c, len(chat) // 2))
+                chat.append(ask("return", c, chat))
+        return run.finish()
+    finally:
+        run.close()

@@ -808,7 +808,14 @@ holds writes back (`writes_gated`: `no`, `budget`, or `closed` once a file
 stopped taking writes), `write_budget_bytes`, the bytes the next state's
 write not in use may take now, and `writes_deferred_ms`, how long writes held
 back for SSD reads a step waited for. Without a write budget `writes_gated` is
-never `budget` and `write_budget_bytes` is 0. It counts the KV pages copied
+never `budget` and `write_budget_bytes` is 0. `written_last_hour_bytes` and
+`written_last_day_bytes` are the cache's write rate: what its writes took over
+the last hour and the last day the Mac was awake, counted as the write budget
+counts them, with a budget or without. The day's bytes are the number to set
+`--max-cache-disk-writes` from and to hold against the drive's rated
+endurance; 24 times the hour's projects them for the load of the moment. Each
+is exact to a minute, and a server that has run for less than an hour or a day
+has written all of its count. It counts the KV pages copied
 ahead (`kv_copies`), and under `write_behind` the restore points queued for
 their copies, the one being copied among them (`waiting`), copied
 (`durable`), gone on from first (`unneeded`) and not copied for want of room

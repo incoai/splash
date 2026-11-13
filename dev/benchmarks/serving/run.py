@@ -56,7 +56,7 @@ from dev.benchmarks.serving import clients
 
 # The test Macs, and any other (a release gate runner).
 MACHINES = ("studio", "m5", "m6", "mini", "other")
-SCENARIOS = ("churn", "ttft", "serve1", "warm")
+SCENARIOS = ("churn", "ttft", "serve1", "warm", "agent", "edit")
 READY_TIMEOUT_SECONDS = 900
 # A server that ignores SIGINT this long gets SIGTERM, then SIGKILL (a server
 # under memory pressure once ignored SIGINT), and a process it started, its
@@ -535,6 +535,30 @@ def parse_args(argv=None):
         "--trial", type=int, default=1, help="warm: the trial, which picks the texts"
     )
     parser.add_argument(
+        "--conversations",
+        type=int,
+        help=f"agent, edit: the conversations ({clients.AGENT_CONVERSATIONS}, "
+        f"{clients.EDIT_CONVERSATIONS})",
+    )
+    parser.add_argument(
+        "--turns",
+        type=int,
+        help="agent: each conversation's turns; edit: those a conversation is "
+        f"built over ({clients.AGENT_TURNS}, {clients.EDIT_TURNS})",
+    )
+    parser.add_argument(
+        "--turn-tokens",
+        type=int,
+        help="agent: the tokens of each tool result; edit: of each user message "
+        f"({clients.TURN_TOKENS})",
+    )
+    parser.add_argument(
+        "--gap",
+        type=float,
+        help="agent, edit: seconds from a turn's last reply to the next turn "
+        f"({clients.AGENT_GAP_SECONDS:g}, {clients.EDIT_GAP_SECONDS:g})",
+    )
+    parser.add_argument(
         "--gpu-idle-percent",
         type=int,
         help="wait until the GPU is this idle before the run (the machine's recorded idle level)",
@@ -569,6 +593,18 @@ def parse_args(argv=None):
         args.environment[key] = int(value)
     args.levels = [int(x) for x in args.n.split(",")]
     args.size_list = [int(x) for x in args.sizes.split(",")]
+    # The conversation scenarios' own options: those left out take the
+    # scenario's defaults.
+    args.conversation_options = {
+        name: value
+        for name, value in (
+            ("conversations", args.conversations),
+            ("turns", args.turns),
+            ("turn_tokens", args.turn_tokens),
+            ("gap", args.gap),
+        )
+        if value is not None
+    }
     return args
 
 
@@ -603,6 +639,9 @@ def main(argv=None) -> int:
         "order": args.order_list if args.scenario == "churn" else None,
         "repeat": args.repeat,
         "env": args.environment,
+        "conversation_options": args.conversation_options
+        if args.scenario in ("agent", "edit")
+        else None,
         "client_python": sys.version.split()[0],
         "tools_root": str(Path(__file__).resolve().parents[3]),
         "started": time.time(),
@@ -707,6 +746,20 @@ def main(argv=None) -> int:
                         sizes=args.size_list,
                         timeout=args.request_seconds,
                     )
+                elif args.scenario in ("agent", "edit"):
+                    scenario = (
+                        clients.run_agent
+                        if args.scenario == "agent"
+                        else clients.run_edit
+                    )
+                    summary = scenario(
+                        args.port,
+                        str(out),
+                        part,
+                        timeout=args.request_seconds,
+                        **args.conversation_options,
+                    )
+                    note(f"{part} summary {json.dumps(summary)}")
                 else:
                     clients.run_warm(
                         args.port,

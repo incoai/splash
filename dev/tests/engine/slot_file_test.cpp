@@ -604,6 +604,47 @@ static void testWritesDrawOnTheWriteBudget() {
 }
 
 // A write that hits a full volume (ENOSPC, EDQUOT) only reports it; the file keeps taking writes.
+// The write rate counts what every write took, with a write budget or without, over the last hour
+// and the last day of the budget's clock.
+static void testWritesCountOverTheLastHourAndDay() {
+  constexpr size_t size = kHostPageBytes;
+  constexpr double kMinute = 60'000.0, kHour = 60 * kMinute, kDay = 24 * kHour;
+  // A clock that has run for days, as the awake clock has when an engine starts.
+  double now = 3 * kDay + 17 * kMinute;
+  auto budget = std::make_shared<DiskBudget>(64 * size, [&now] { return now; });
+  SlotFile file(size, budget);
+  const std::vector<std::byte> half(size / 2, std::byte{1});
+  const auto rate = [&] { return budget->writeRate(); };
+  const auto write = [&] { require(file.write(file.acquire(), {half}, {})->wait(), "a slot write failed"); };
+  require(!rate().hourBytes && !rate().dayBytes, "a tier that wrote nothing had a write rate");
+  write();
+  require(rate().hourBytes == size && rate().dayBytes == size,
+          "half a page's payload did not count as the page its write stores");
+  now += 30 * kMinute;
+  write();
+  write();
+  require(rate().hourBytes == 3 * size && rate().dayBytes == 3 * size, "the last hour lost a write");
+  now += 45 * kMinute;
+  require(rate().hourBytes == 2 * size && rate().dayBytes == 3 * size,
+          "a write 75 minutes old still counted in the last hour, or left the last day");
+  now += 30 * kMinute;
+  require(!rate().hourBytes && rate().dayBytes == 3 * size, "an idle hour had a write rate");
+  // A day and a minute after the first write, while the day still holds the others.
+  now += kDay - 105 * kMinute + kMinute;
+  require(rate().dayBytes == 2 * size, "a write more than a day old still counted in the last day");
+  write();
+  require(rate().hourBytes == size && rate().dayBytes == 3 * size,
+          "a write a day after the first did not count beside those the day still holds");
+  now += 5 * kDay;
+  require(!rate().hourBytes && !rate().dayBytes, "writes days old still counted");
+  write();
+  require(rate().hourBytes == size && rate().dayBytes == size,
+          "a write after idle days counted those of the days before");
+  budget->setWriteBudget(4 * size);
+  write();
+  require(rate().hourBytes == 2 * size, "a write budget changed what the write rate counts");
+}
+
 static void testFullVolumeIsReported() {
   constexpr size_t size = kHostPageBytes;
   auto budget = std::make_shared<DiskBudget>(4 * size);
@@ -1059,6 +1100,7 @@ int main() {
     testAdoptionCountsPastTheQuota();
     testTheLimitBoundsLiveSlots();
     testWritesDrawOnTheWriteBudget();
+    testWritesCountOverTheLastHourAndDay();
     testFullVolumeIsReported();
     testReadAtReadsAlignedUnits();
     testReadAtBesideTheWorker();
