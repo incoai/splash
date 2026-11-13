@@ -347,7 +347,7 @@ std::optional<BatchPlan> Scheduler::next(const PlanInputs &in) const {
   auto decode = nextDecode(in.excluded);
   auto prefill = nextPrefill(in);
   if (!decode)
-    return prefill;
+    return prefill && waitsForDecoders(*prefill, in) ? std::nullopt : prefill;
   if (!prefill)
     return decode;
 
@@ -368,6 +368,37 @@ std::optional<BatchPlan> Scheduler::next(const PlanInputs &in) const {
     return decode;
   return lastCommittedKind_ == WorkKind::Decode ? std::move(prefill)
                                                  : std::move(decode);
+}
+
+bool Scheduler::waitsForDecoders(const BatchPlan &prefill, const PlanInputs &in) const {
+  // A decoder whose memory is on its way back, its own copies after its
+  // conversion to Spill, is a decoder still: the decode share protects its
+  // gap as it does a ready one's. Run instead, the next unit put a second
+  // pass into its gap where the copies its release needed landed in 94 ms,
+  // 1,063 ms against the 838 ms of a pass and a decode command (engine-sim's
+  // Studio churn); waiting, 686 ms. The debt bounds the wait, 235 ms after a
+  // 471 ms pass there, so slower copies cost prefill no more than its share.
+  const RequestPriority priority = get(prefill.items.front().requestId).spec.priority;
+  const bool owed = decodeDebtMilliseconds_ > 0.0 && std::ranges::any_of(in.landing, [&](uint64_t id) {
+                      const auto found = requests_.find(id);
+                      return found != requests_.end() && found->second.phase == Phase::Decode &&
+                             found->second.spec.priority <= priority &&
+                             found->second.lastDecodeDispatch <= prefillDispatchOrder_;
+                    });
+  if (!owed)
+    return false;
+  if (!heldSince_)
+    heldSince_ = in.now;
+  // Until the end holdEndMilliseconds gives, the engine's wakeup, compared as
+  // the same sum: now less the start can round below the debt there, as it
+  // did 236.7 ms past 741,483.8 s, and the wait would not end at its wakeup.
+  return in.now < *heldSince_ + decodeDebtMilliseconds_;
+}
+
+std::optional<double> Scheduler::holdEndMilliseconds() const noexcept {
+  if (!heldSince_)
+    return std::nullopt;
+  return *heldSince_ + decodeDebtMilliseconds_;
 }
 
 std::optional<BatchPlan> Scheduler::nextPrefill(const PlanInputs &in) const {
@@ -608,6 +639,15 @@ void Scheduler::commit(const BatchPlan &plan, const PlanInputs &in) {
                 : plan.pass || (plan.passes > 1 && !prefill))
     throw std::logic_error("batch no longer matches scheduler state");
   const RequestPriority priority = get(plan.items.front().requestId).spec.priority;
+  // The time the next prefill unit waited for a decoder whose memory lands
+  // worked the debt off, as that decoder's decode would have
+  // (waitsForDecoders).
+  if (heldSince_) {
+    decodeDebtMilliseconds_ = std::max(0.0, decodeDebtMilliseconds_ - std::max(0.0, in.now - *heldSince_));
+    heldSince_.reset();
+  }
+  if (prefill)
+    prefillDispatchOrder_ = decodeDispatchOrder_;
   if (prefill && !plan.pass) {
     counters_.passCommands += plan.passes > 1;
     ++counters_.prefillBatches;

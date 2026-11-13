@@ -1759,7 +1759,9 @@ page in the Index runway, an extent kept while spilling is possible
 Spill lane's (below, `Engine::EngineVictims::take`): at once those whose copies
 landed, a chain it restored or the copies written ahead, so the lane runs in
 the command it converts for; its claim waits only for the copies its
-conversion starts, and releases those pages as they land. Waiting for the
+conversion starts, and releases those pages as they land, which a decoding
+lane's next prefill unit waits for within the decode share ([prefill and
+decode scheduling](#prefill-and-decode-scheduling)). Waiting for the
 claim's retry instead, a decoding lane beside a prefill in passes lost the
 decode command after a pass and its gap held two passes, 1,066 ms against the
 838 ms of one pass and a decode command in engine-sim's Studio churn, where
@@ -2214,8 +2216,15 @@ last pass, which commits nothing of it, and a command all of whose requests
 have ended stops at once.
 While requests of the same or a higher priority
 decode (a lane waiting for its token mask is owed nothing), each prefill unit owes them
-decode time, `--decode-share` times its own, before the next one runs. These
-policies do not extend client deadlines.
+decode time, `--decode-share` times its own, before the next one runs. A decoding lane
+whose memory is on its way back, as its own copies are after its conversion to Spill,
+is owed it too: while the debt lasts, the next unit waits for that memory where the
+lane has not decoded since the last unit began, whose gap the unit would hold a
+second unit of, and the wait works the debt off as the lane's decode would, so it
+lasts at most the debt whatever the memory takes (`Scheduler::waitsForDecoders`). In
+engine-sim's Studio churn a lane whose conversion started 2,321 copies waited 94 ms
+for those its release needed, a decode gap of 686 ms where the next 471 ms pass made
+it 1,063 ms; that pass owes 235 ms. These policies do not extend client deadlines.
 
 ### Resource waits
 

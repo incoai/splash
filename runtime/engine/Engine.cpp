@@ -347,10 +347,12 @@ bool Engine::tick(double now) {
   progressed = admitQueued(now) || progressed;
   sweepTerminal(now);
   // Lanes that wait for memory on its way back cannot run before it lands;
-  // the command runs the other lanes meanwhile. A plan whose lanes all wait
-  // adds them, and each plan prepare sends back adds those it refused or held
-  // back, so each attempt plans without at least one more lane, or with a
-  // lane's rows cut at a state boundary, or after a lane's one conversion.
+  // the command runs the other lanes meanwhile, but for a prefill unit that
+  // waits for its decoders among them (Scheduler::waitsForDecoders). A plan
+  // whose lanes all wait adds them, and each plan prepare sends back adds
+  // those it refused or held back, so each attempt plans without at least
+  // one more lane, or with a lane's rows cut at a state boundary, or after a
+  // lane's one conversion.
   std::vector<uint64_t> excluded, refused;
   for (const auto &[id, active] : requests_)
     if (active.lane && active.resourceWait.pending && !resourceRetryReady(active, now))
@@ -371,7 +373,15 @@ bool Engine::tick(double now) {
     settleEndedBetweenPasses();
     // Planning reads the lanes' shapes as they are now, before every plan.
     const std::vector<LaneShape> shapes = laneShapes();
-    const PlanInputs in{.excluded = excluded, .shapes = shapes, .passes = passCommand_.progress()};
+    std::vector<uint64_t> landing;
+    for (const uint64_t id : excluded)
+      if (const auto found = requests_.find(id); found != requests_.end() && found->second.resourceWait.pending)
+        landing.push_back(id);
+    const PlanInputs in{.excluded = excluded,
+                        .shapes = shapes,
+                        .passes = passCommand_.progress(),
+                        .landing = landing,
+                        .now = now};
     const std::optional<BatchPlan> plan = scheduler_.next(in);
     if (!plan)
       break;
@@ -422,7 +432,8 @@ bool Engine::tick(double now) {
         if (std::ranges::find(refused, id) == refused.end())
           waiting.push_back(id);
       const std::vector<LaneShape> committed = laneShapes();
-      scheduler_.commit(*plan, {.excluded = waiting, .shapes = committed, .passes = passCommand_.progress()});
+      scheduler_.commit(*plan,
+                        {.excluded = waiting, .shapes = committed, .passes = passCommand_.progress(), .now = now});
       // A command in passes keeps its items and their captures for its
       // later passes (prepare), and its progress for planning.
       if (plan->passes > 1 && !plan->pass)
@@ -562,6 +573,11 @@ std::optional<double> Engine::nextWakeupMilliseconds() const {
     // Copies ahead wait while a claim waits, which a step of the engine shows.
     if (const std::optional<double> persist = writeBehind_.nextWakeup(); persist && (!result || *persist < *result))
       result = persist;
+    // A prefill unit that waits for a decoder whose memory lands runs once
+    // the decode time it owes has passed, if the memory has not landed.
+    if (const std::optional<double> hold = scheduler_.holdEndMilliseconds();
+        hold && !pending_ && (!result || *hold < *result))
+      result = hold;
   }
   // Admission retries run only between commands, and only for the requests
   // admission tries; those held behind one refused memory have no retry time
