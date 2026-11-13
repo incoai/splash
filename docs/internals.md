@@ -1755,10 +1755,18 @@ less an Index page, less the first lane's hot block floor
 (`Model::hotFloorBytes`), cover the missing bytes: about 46K tokens on
 Qwen3.8-Flash-Next. It needs the SSD cache's quota for its pages and a free
 page in the Index runway, an extent kept while spilling is possible
-(`Engine::spillLanded`). Its claim then waits for its copies and releases its
-pages as they land (below), and it follows the Spill rules ([KV on the
-SSD](server.md#kv-on-the-ssd)): a prefill goes on as a Spill lane's, its
-later commands planned in that shape. No other claim converts a lane.
+(`Engine::spillLanded`). The conversion's take then releases its pages as a
+Spill lane's (below, `Engine::EngineVictims::take`): at once those whose copies
+landed, a chain it restored or the copies written ahead, so the lane runs in
+the command it converts for; its claim waits only for the copies its
+conversion starts, and releases those pages as they land. Waiting for the
+claim's retry instead, a decoding lane beside a prefill in passes lost the
+decode command after a pass and its gap held two passes, 1,066 ms against the
+838 ms of one pass and a decode command in engine-sim's Studio churn, where
+the cache had copied every page of its history. It then follows the Spill
+rules ([KV on the SSD](server.md#kv-on-the-ssd)): a prefill goes on as a
+Spill lane's, its later commands planned in that shape. No other claim
+converts a lane.
 
 **Releases** (`Engine::EngineVictims::releases`, `Cache::releasePages`). A Spill
 lane writes each committed page to the SSD cache and keeps it Full, so it

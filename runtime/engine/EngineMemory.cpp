@@ -1033,8 +1033,8 @@ std::vector<Victim> Engine::EngineVictims::conversions(const VictimQuery &query)
   const Engine &engine = engine_;
   std::vector<Victim> units;
   // Only the claimant's own lane converts (TakeRights::convertLane). Its
-  // claim's retries release its pages into the Index runway, so with none
-  // free nothing converts.
+  // claim releases its pages into the Index runway, so with none free
+  // nothing converts.
   const uint64_t id = query.rights.convertLane;
   if (!id || !engine.config_.spill.capable || engine.cache_.spillGate() != SpillGate::Open ||
       !engine.cache_.freePages(kv::PageForm::Index))
@@ -1132,14 +1132,26 @@ FreeResult Engine::EngineVictims::take(const VictimQuery &query, const Victim &v
     if (const uint64_t bytes = engine.model_.releaseIdleBuffer(keepLaneStart))
       return {FreeOutcome::Met, bytes};
     return {};
-  case VictimKind::Conversion:
-    // Its Full pages as peek counted them, which the claim's retries
-    // release once their copies land.
-    if (engine.convertToSpill(engine.request(victim.key)))
-      return {.outcome = FreeOutcome::Pending,
-              .laterBytes = victim.bytes,
-              .pages = query.need.form == victim.form ? victim.pages : 0};
-    return {};
+  case VictimKind::Conversion: {
+    // Converted, the lane's pages free memory as any Spill lane's do, by
+    // their release (below): at once those whose copies landed, as a chain
+    // it restored has them where the cache wrote that point behind (2,464
+    // of a churn lane's 2,464 pages in engine-sim), so the lane runs in the
+    // command it converts for. Waiting for the claim's retry instead cost it
+    // that command and its decode gap a prefill pass more: 1,066 ms against
+    // the 838 ms of one pass and a decode command. Short of copies the claim
+    // waits for those its conversion starts, its Full pages as peek counted
+    // them, which its retries release once they land.
+    if (!engine.convertToSpill(engine.request(victim.key)))
+      return {};
+    for (const Victim &unit : releases(query))
+      if (unit.key == victim.key && !unit.later)
+        if (const FreeResult released = take(query, unit); released.gave())
+          return released;
+    return {.outcome = FreeOutcome::Pending,
+            .laterBytes = victim.bytes,
+            .pages = query.need.form == victim.form ? victim.pages : 0};
+  }
   case VictimKind::Release: {
     // Pages whose copies land free nothing yet: the claim waits for them.
     if (victim.later)

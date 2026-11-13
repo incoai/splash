@@ -867,11 +867,13 @@ what memory holds, as a dense target's is.
   lacks: what spilling the pages only it holds frees, past its first 2,048
   tokens and its last 64 pages, less the hot block cache's floor its
   decode's reads need (390 MiB), which takes a request of about 46K tokens
-  or more. It waits while its pages' copies land, and its growth then gives
-  back the memory of those it lacks, as below; a prefix restored from the
-  SSD cache has its copies already. From then on it is a spilling request
-  like any other, a prefill going on as one's. No other request and no
-  shortage of the host's makes a request spill. When other memory is short,
+  or more. Its pages whose copies have landed, as a prefix restored from the
+  SSD cache or copied ahead has them, give back the memory it lacks at once,
+  as below, so it misses no step; it waits only while the copies it starts
+  land, its growth then giving back the memory of those it lacks. From then
+  on it is a spilling request like any other, a prefill going on as one's.
+  No other request and no shortage of the host's makes a request spill.
+  When other memory is short,
   a state, a spilling request's reads, or the host's, what can go goes in a
   fixed order: a cached prefix, the caches the model rebuilds, the pages of
   spilling requests (below; for the host only under macOS's warning or

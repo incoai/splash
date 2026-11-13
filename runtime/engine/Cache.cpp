@@ -1847,8 +1847,9 @@ bool Cache::convertToSpill(uint64_t requestId, uint32_t pages) {
   active.spillOrder = ++spillSequence_;
   oweCopies(active, active.cachedBlocks);
   // The blocks it shares with Spill requests may spill now, and its own
-  // writes start at once: its retry releases what lands, and its blocks
-  // whose copies landed before, as a chain it restored has them, at once.
+  // writes start at once: its claim releases its blocks whose copies landed
+  // before, as a chain it restored or the copies written ahead have them,
+  // at once, and its retries what lands.
   rescanSpills();
   static_cast<void>(writeThrough());
   return true;

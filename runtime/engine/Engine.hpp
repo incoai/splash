@@ -888,7 +888,9 @@ private:
   // passes, on a target that can spill with the tier open and its quota
   // holding the lane's pages, and only where the pages it would spill free,
   // net of the first lane's hot block floor its decode reads, cover what the
-  // claim lacks; its claim's retries release its pages as their copies land.
+  // claim lacks; its take releases at once its pages whose copies landed,
+  // as a release does, and its claim's retries the rest as their copies
+  // land.
   // The command between its passes gives back the buffers of the states it
   // would capture, which the model's pool releases at once; its lanes that
   // ended are left to settleEndedBetweenPasses. Last, for in-service KV
@@ -1003,8 +1005,8 @@ private:
   // (`restoring`) counted; false when it cannot (no SSD cache, the tier
   // closed, its quota short, or a lane already Spill) or must not: a lane
   // of the command between its passes, which reads all its lanes' history
-  // from memory. Its claim's retries release its pages as their copies land
-  // (EngineVictims::releases).
+  // from memory. Its claim releases its pages whose copies landed at once,
+  // and its retries the rest as their copies land (EngineVictims::take).
   [[nodiscard]] bool convertToSpill(Request &request);
   // What a lane does about memory it could not get. Pending memory returns
   // by itself: the lane waits (the ledger finds it, its own lanes' owed
