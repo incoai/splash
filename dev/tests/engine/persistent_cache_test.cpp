@@ -117,12 +117,13 @@ struct Process final {
   KvPool pool{storage, 8};
   test::TestKvTier tier;
   std::shared_ptr<Shelf> shelf = std::make_shared<Shelf>();
+  bool windowed;
   engine::Cache cache;
 
   explicit Process(bool persistent, std::shared_ptr<model::DiskBudget> budget = nullptr,
                    std::optional<CacheSpillPolicy> spill = std::nullopt,
                    std::optional<CacheWindowPolicy> window = std::nullopt)
-      : tier(persistent), cache(pool, &tier, std::move(budget), spill, window) {
+      : tier(persistent), windowed(window.has_value()), cache(pool, &tier, std::move(budget), spill, window) {
     storage.budgetPages = 8;
     tier.capacity = 16;
     tier.transferLimit = 8;
@@ -176,12 +177,15 @@ struct Process final {
   [[nodiscard]] std::vector<std::vector<std::byte>> kvLabels() const { return tier.labels(); }
   [[nodiscard]] std::vector<std::vector<std::byte>> stateLabels() const { return labels(*shelf); }
 
-  // Takes back what an earlier process's tier recorded.
+  // Takes back what an earlier process's tier recorded, each KV slot as one of the form its
+  // label names.
   CacheAdoption adopt(const std::vector<std::vector<std::byte>> &kv,
                       const std::vector<std::vector<std::byte>> &states) {
     std::vector<PersistedKv> blocks;
-    for (const auto &label : kv)
-      blocks.push_back({label, [this] { return tier.adopt(); }});
+    for (const auto &label : kv) {
+      const auto named = decodeKvSlotLabel(label, windowed);
+      blocks.push_back({label, [this, form = named ? named->form : kv::PageForm::Full] { return tier.adopt(form); }});
+    }
     std::vector<PersistedState> recorded;
     for (const auto &label : states)
       recorded.push_back({label, [this](uint32_t) -> std::shared_ptr<const CompositeState> {
@@ -330,6 +334,49 @@ void testWindowedPointsKeepTheirTailsFull() {
   const CacheAdoption adoption = next.adopt(copies, earlier.stateLabels());
   require(adoption.blocks == 0 && adoption.states == 0 && adoption.dropped == 7,
           "a state whose tail a Slim copy holds was taken back");
+}
+
+// A windowed point's copies count what their slots hold, a Slim page's for its trimmed blocks and
+// a Full page's for its tail: a quota too small for the chain in whole slots keeps it, in a
+// persistent tier and a temporary one, one too small for what it holds refuses it, and the next
+// process takes the copies back at what they count.
+void testWindowedPointsCountWhatTheirCopiesHold() {
+  const std::vector<uint32_t> prompt = promptOf(3000, 6);
+  constexpr CacheWindowPolicy window{2};
+  std::vector<std::vector<std::byte>> copies, states;
+  for (const bool persistent : {false, true}) {
+    // Four Slim copies of 30, two Full ones of 100 and the state's 100 are
+    // 420, where six whole slots and the state would be 700. The tier's
+    // slots draw on the quota, as a slot file's do.
+    const auto budget = std::make_shared<model::DiskBudget>(450);
+    Process process(persistent, budget, std::nullopt, window);
+    process.tier.budget = budget;
+    process.storage.budgetPages = 16;
+    const std::vector<uint64_t> blocks = process.cachePrompt(1, prompt);
+    process.publish(blocks[5]);
+    require(process.cache.trimWindows() == 4, "the blocks past the tail were not trimmed");
+    budget->setLimitBytes(419);
+    require(process.cache.persist(blocks[5]) == PersistStatus::Refused && !process.tier.slots,
+            "a point was copied under a limit that does not hold it");
+    budget->setLimitBytes(450);
+    require(process.persist(blocks[5]) == PersistStatus::Durable,
+            "a quota that holds a point's Slim and Full copies refused it");
+    const KvTierSnapshot tier = process.cache.snapshot().kvTier;
+    require(tier.diskBlocks == 6 && tier.diskBytes == 320 && budget->usedBytes() == 320,
+            "a point's copies did not count what their slots hold");
+    process.cache.checkInvariants();
+    copies = process.kvLabels();
+    states = process.stateLabels();
+  }
+  const auto budget = std::make_shared<model::DiskBudget>(450);
+  Process next(true, budget, std::nullopt, window);
+  next.tier.budget = budget;
+  next.storage.budgetPages = 16;
+  const CacheAdoption adoption = next.adopt(copies, states);
+  require(adoption.blocks == 6 && adoption.states == 1 && adoption.dropped == 0 && adoption.bytes == 420 &&
+              budget->usedBytes() == 320 && next.cache.snapshot().kvTier.diskBytes == 320,
+          "the next process did not take a point's copies back at what they count");
+  next.cache.checkInvariants();
 }
 
 // Blocks recomputed over Slim-only copies get Full copies, so a state published there restores
@@ -1620,6 +1667,7 @@ int main() {
     testCopiesAreLabelled();
     testWindowedCopiesNameTheirForm();
     testWindowedPointsKeepTheirTailsFull();
+    testWindowedPointsCountWhatTheirCopiesHold();
     testRecomputedTailsKeepFullCopies();
     testRestorePointsComeBack();
     testSaltedPointsComeBackUnderTheirSalt();
