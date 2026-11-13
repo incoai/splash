@@ -15,7 +15,7 @@ from dataclasses import dataclass
 from decimal import Decimal
 from pathlib import Path
 
-from . import images, origins
+from . import images, origins, unix_socket
 from .chat_format import REASONING_EFFORTS
 from .http_security import validate_api_key
 from .protocol import MAX_THINKING_END_TOKENS
@@ -294,6 +294,16 @@ def parse_served_model_name(value):
     return value
 
 
+def parse_host(value):
+    """An address to bind, which the bind checks, or unix:PATH with the path
+    of a UNIX socket."""
+    if unix_socket.path(value) == "":
+        raise argparse.ArgumentTypeError(
+            "unix: needs the socket's path, such as unix:/tmp/splash.sock"
+        )
+    return value
+
+
 def parse_allowed_origin(value):
     """An --allowed-origin value as the server compares Origin headers with it."""
     try:
@@ -417,6 +427,7 @@ SERVE_OPTIONS = (
         "--host",
         "network",
         dict(
+            type=parse_host,
             default="127.0.0.1",
             metavar="ADDRESS",
             help="HTTP bind address (default: 127.0.0.1; 0.0.0.0 for all IPv4 "
