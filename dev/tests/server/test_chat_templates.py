@@ -12,7 +12,6 @@ from transformers import PreTrainedTokenizerFast
 
 from dev.tests import server_fixtures as fixtures
 from server import chat_messages, chat_templates
-from server import frontend as request_frontend
 from server.chat_format import QWEN, REASONING_EFFORTS
 from server.chat_templates import (
     LATER_SYSTEM_UNSUPPORTED,
@@ -581,18 +580,6 @@ class ChatTemplateFrontendTests(unittest.TestCase):
             {"role": "system", "content": "Later"},
             {"role": "user", "content": "Again"},
         ]
-        image = {
-            "role": "user",
-            "content": [
-                {"type": "image", "image": "unused"},
-                {"type": "text", "text": "Describe"},
-            ],
-        }
-        # Image rendering swaps the pad token for a marker in that template.
-        chosen_sources = {
-            chosen.source,
-            chosen.source.replace(QWEN.image_pad, request_frontend.IMAGE_RENDER_MARKER),
-        }
         for path, render in (
             (
                 "/apply-template",
@@ -612,12 +599,6 @@ class ChatTemplateFrontendTests(unittest.TestCase):
                     harness, "/v1/messages/count_tokens", {"messages": messages}
                 ),
             ),
-            (
-                "image render",
-                lambda: harness.app._render_image_tokens(
-                    [*messages, image], {"chat_template": chosen.source}
-                ),
-            ),
         ):
             with self.subTest(path=path):
                 harness.tokenizer.templates.clear()
@@ -625,17 +606,11 @@ class ChatTemplateFrontendTests(unittest.TestCase):
                 used = {
                     kwargs["chat_template"] for _, kwargs in harness.tokenizer.templates
                 }
-                self.assertTrue(used)
-                self.assertLessEqual(used, chosen_sources)
+                self.assertEqual(used, {chosen.source})
         prompt = self.post(harness, "/apply-template", {"messages": messages})["prompt"]
         self.assertIn(
             "<|im_start|>system\nLater<|im_end|>\n<|im_start|>user\nAgain", prompt
         )
-        _, _, rendered = harness.app._render_image_tokens(
-            [*messages, image], {"chat_template": chosen.source}
-        )
-        self.assertIn("<|im_start|>system\nLater<|im_end|>", rendered)
-        self.assertIn("<|image_pad|>", rendered)
         self.assertEqual(harness.tokenizer.renderer.chat_template, source("qwen36"))
 
     def test_requests_carry_the_length_of_their_generation_prompt(self):

@@ -81,7 +81,12 @@ in `reasoning_content`, beside `content`, in the message and in each stream
 delta, and an assistant message sent back may carry its `reasoning_content`
 (or `reasoning` text). Message content may hold Responses' `input_text`,
 `output_text` and `input_image` parts too, and a `refusal` part, an assistant's
-refusal, is text. A history tool call whose `arguments` are not a JSON object,
+refusal, is text. What a request sends is text to the model, never one of its
+control tokens: a `<tool_call>`, `<think>` or `<|im_end|>` that a message, a
+tool result, a call or a tool definition spells reaches the model as those
+characters, in every API
+([tokenizer and chat templates](models.md#tokenizer-and-chat-templates)). A
+history tool call whose `arguments` are not a JSON object,
 such as one the output limit cut, is kept as text, so the conversation
 continues. `n` other than 1 and `logprobs: true` return 400.
 
@@ -149,6 +154,9 @@ Splash makes no other edit, so the model reads the conversation as sent.
 and returns `{"prompt":"..."}` using the same template as generation.
 `add_generation_prompt` defaults to true. Image prompts retain textual placeholders;
 raw tokenization does not account for image embeddings (use `count_tokens` for that).
+Nor does it tell a tag a message quotes, which the prompt encodes as text, from
+the template's own: `/tokenize` reads both as the token, so the tokens of a
+returned prompt are the request's only where it quotes none.
 Both endpoints run without inference and share bounded preparation capacity with
 `count_tokens`; they can inspect prompts larger than the serving context limit.
 
@@ -632,8 +640,9 @@ an empty think block, `<think></think>`, and the answer slots are read after it,
 where its answer starts. Besides the row it takes `model`, `timeout`,
 `priority` and `cache_salt` as the generation APIs do ([request
 fields](#request-fields)); other generation controls return errors rather than
-silently changing the scoring protocol. SemIf-derived code retains its MIT
-notice in `server/dialects/scoring.py`.
+silently changing the scoring protocol. A row's text is text to the model, as a
+message's is: evidence that spells `<|im_end|>` ends no turn. SemIf-derived code
+retains its MIT notice in `server/dialects/scoring.py`.
 
 `POST /v1/systemone` requires the served `model`, a string/object/array `state`,
 and a nonempty `questions` map, and takes `cache_salt` as the generation APIs
@@ -770,11 +779,12 @@ cannot avoid model prefill.
 
 Exact-prefix caching reuses model work while the server runs, and across
 restarts with `--persistent-cache` ([persistent cache](server.md#persistent-cache)).
-Text requests also reuse tokenized history at literal message-end boundaries
-when the tokenizer supports independent encoding there. This process-local cache
-retains the newest prefix of up to sixteen conversations, in storage sized for
-four prompts of the served context however Python stores their text (24 bytes a
-token); it falls back to full encoding for other tokenizer pipelines.
+Chat requests also reuse tokenized history at literal message-end boundaries,
+with images and with tags a message quotes as without, where the family's
+boundary is one added token of the tokenizer and no other holds it. This
+process-local cache retains the newest prefix of up to sixteen conversations,
+in storage sized for four prompts of the served context however Python stores
+their text (24 bytes a token).
 `/status.tokenizer_cache` reports its usage: `hits` and `misses` count the
 prompts long enough to look up (4,096 characters through their last message
 end) that found a cached prefix and that did not, and `evictions` the prefixes

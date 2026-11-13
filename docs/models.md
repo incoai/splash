@@ -482,6 +482,46 @@ Responses and Messages history replay an assistant turn as one message whose
 text precedes its calls, the order the chat template renders, even where the
 response wrote text after a call.
 
+Only the chat template writes control tokens. A tokenizer finds the tokens it
+adds beside its vocabulary wherever a prompt spells them: the turn and role
+tokens, `<tool_call>`, `<tool_response>`, `<think>`, an image's
+`<|image_pad|>`. Text that only quotes one, as a tool result showing a
+parser's `tool_call_start = "<tool_call>"` does, would reach the model as the
+token itself, and a `<|im_end|>` in a fetched page as the end of its turn. So
+request preparation marks every added token of the tokenizer, special or not,
+in all that a request gives the template: the content of messages of every
+role, an assistant's reasoning and calls, tool results, tool definitions,
+`chat_template_kwargs`, a PDF's text and a judgment's row. The prompt encodes
+each marked one as its characters, as a tokenizer that had not added it reads
+them, so the tags the template writes itself are the prompt's only control
+tokens, and each `<|image_pad|>` among them is one the template wrote for an
+image. A prompt that quotes nothing encodes as the tokenizer encodes it, token
+for token.
+
+The template renders marked text as any other text, so it finds no tag in a
+request either. Three templates read tags there, and none does once the tag
+is quoted: Qwen's take a user message that is one
+`<tool_response>…</tool_response>` block for a tool's result where they look
+for the last question, Qwen3.6's split an assistant's content at `</think>`,
+and Flint's deletes `<think>` and `</think>` from a message and rewrites its
+role tokens. Each stays the text the client sent. A client sends an
+assistant's reasoning as `reasoning_content` and a tool's result as a `tool`
+message, which the template frames itself. Each text of a request is quoted on
+its own, a message's adjacent text parts as one text: a token that only the
+template's characters complete, such as a call named `x</tool_call` before the
+`>` that Qwen's templates write after a name, is not. A text completion's
+prompt and `/tokenize` are raw text, in which a special-token string is its
+token.
+
+Startup refuses a tokenizer whose added tokens it could not keep out of a
+request's text, before the native runtime starts: one without a
+`tokenizer.json`, one that finds an added token other than as its literal text
+(normalized, stripping the space around it or matching whole words only) or
+adds one of a single character, and one whose pipeline is not byte-level BPE
+behind regex splits with NFC or no normalizer, where the text between two
+added tokens might not encode on its own. The tokenizer Splash derives from a
+GGUF is always one it serves.
+
 `server/chat_templates.py` probes each of the tokenizer's templates, including
 each named variant such as `tool_use`, once at startup, right after the
 tokenizer is validated and before the native runtime starts, so a tokenizer
@@ -559,7 +599,9 @@ its target layout's; the tokens of `</think>`, of `<think>` where the model
 opens its reasoning itself, and of `<tool_call>`; the call syntax; and the
 special token after which prompt tokenization reuses a cached prompt's tokens,
 `<|im_end|>` or `<|assistant|>`. Startup checks that the tokenizer encodes each
-as the format has it. Grammars write reasoning and calls as the format lays
+as the format has it, and that it can keep its added tokens out of a request's
+text ([tokenizer and chat templates](#tokenizer-and-chat-templates)). Grammars
+write reasoning and calls as the format lays
 them out: Flint's optional think block may come before any constrained output,
 and its tags, which the grammar compiler takes as tokens rather than text, are
 written as their tokens. A model that opens its reasoning itself closes it
