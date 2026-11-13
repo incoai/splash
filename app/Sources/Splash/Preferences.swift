@@ -471,6 +471,12 @@ extension LaunchOption {
             help: "Replies and the model list give the first served model name rather than the model’s own.",
             section: .api, kind: .toggle(on: true),
             requires: [Requirement("Needs a served model name.") { $0["--served-model-name"] != nil }]),
+        LaunchOption(
+            flag: "--sampling-default", title: "Sampling defaults",
+            help: "The value of a sampling setting for requests that set none, as name=value, such as temperature=0.7.",
+            section: .api,
+            kind: .text(Value(prompt: "temperature=0.7", message: "Name=value pairs, split at commas.",
+                              parse: { samplingDefaults($0) }), list: true)),
     ]
 
     private static let requests: [LaunchOption] = [
@@ -540,6 +546,16 @@ extension LaunchOption {
                   let value = text.trimmingCharacters(in: .whitespaces).lowercased()
                   return value.wholeMatch(of: /\d+[smh]?/) != nil ? value : nil
               })
+    }
+
+    /// `text` as name=value pairs split at commas and spaces, or nil for anything else.
+    private static let samplingDefaults: @Sendable (String) -> String? = { text in
+        let pairs = items(text)
+        let valid = pairs.allSatisfy { pair in
+            let parts = pair.split(separator: "=", omittingEmptySubsequences: false)
+            return parts.count == 2 && !parts[0].isEmpty && Double(parts[1]) != nil
+        }
+        return !pairs.isEmpty && valid ? pairs.joined(separator: ", ") : nil
     }
 
     private static let whole: @Sendable (String) -> String? = { Int($0.trimmingCharacters(in: .whitespaces)).flatMap { $0 > 0 ? String($0) : nil } }

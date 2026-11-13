@@ -56,7 +56,7 @@ from .errors import (
     field_error,
     remaining_request_time,
 )
-from .frontend import Frontend
+from .frontend import Frontend, accepts_sampling
 from .http_security import (
     OriginRefused,
     RefusedOriginLog,
@@ -1195,9 +1195,21 @@ def parse_args(argv=None):
     serve_options.add_serve_arguments(parser)
     args = parser.parse_args(argv)
     serve_options.check_serve_arguments(parser, args)
+    # Before the engine loads, not when the frontend is built after it: each
+    # value passes the check a request's own value meets (accepts_sampling).
+    for name, value in args.sampling_default:
+        if not accepts_sampling(name, value):
+            parser.error(f"--sampling-default: invalid value {name}={value!r}")
     if not 0 <= args.port <= 65535:
         parser.error("--port must be in [0, 65535]")
     return args
+
+
+def _sampling_defaults(family, args):
+    """What a request gets for each sampling field it leaves out: the
+    family's published sampling, with --sampling-default's values over it,
+    the last of a name winning."""
+    return {**asdict(family.sampling), **dict(args.sampling_default)}
 
 
 def _native_command(args, model_root, relaunch_context=None):
@@ -1403,7 +1415,7 @@ def main():
             constraint_factory=ConstraintFactory(tokenizer, served),
             chat_templates=chat_templates,
             chat_format=family.chat_format,
-            sampling_defaults=asdict(family.sampling),
+            sampling_defaults=_sampling_defaults(family, args),
             max_image_pixels=args.max_image_pixels,
             thinking_codec=thinking_codec,
             response_store=dialects.responses.ResponseStore(),

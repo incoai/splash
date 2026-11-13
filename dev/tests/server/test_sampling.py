@@ -12,9 +12,11 @@ from dev.tests.server_fixtures import (
     make_frontend,
     responses_body,
 )
+from install import families
 from server import backend as backend_api
 from server import frontend as request_frontend
 from server import protocol as native_wire
+from server import server as serve_main
 
 
 class SamplingTests(HarnessTestCase):
@@ -293,6 +295,55 @@ class SamplingTests(HarnessTestCase):
                 with self.subTest(seed=seed):
                     job = app.prepare(chat_body(seed=seed), deadline=FOREVER)
                     self.assertEqual(job.seed, expected)
+
+    def test_sampling_defaults_layer_over_the_familys_published_sampling(self):
+        family = mock.Mock(sampling=families.SamplingDefaults(1.0, 0.95, 20))
+        for pairs, expected in (
+            # None given: the family's alone.
+            ([], {"temperature": 1.0, "top_p": 0.95, "top_k": 20}),
+            # A field the family sets is replaced, one it leaves out is
+            # added, and of two pairs for one name the last wins.
+            (
+                [("temperature", 0.6), ("presence_penalty", 1.5), ("temperature", 0.5)],
+                {
+                    "temperature": 0.5,
+                    "top_p": 0.95,
+                    "top_k": 20,
+                    "presence_penalty": 1.5,
+                },
+            ),
+        ):
+            with self.subTest(pairs=pairs):
+                args = mock.Mock(sampling_default=pairs)
+                self.assertEqual(serve_main._sampling_defaults(family, args), expected)
+
+    def test_sampling_defaults_reach_the_fields_a_request_leaves_out(self):
+        family = mock.Mock(sampling=families.SamplingDefaults(1.0, 0.95, 20))
+        args = mock.Mock(sampling_default=[("temperature", 0.6), ("top_k", 40)])
+        tokenizer = FakeTokenizer()
+        backend = backend_api.NativeBackend(
+            FakeRuntime(), tokenizer, lambda _record: None
+        )
+        self.addCleanup(backend.close)
+        app = make_frontend(
+            tokenizer,
+            backend,
+            "test-model",
+            128,
+            1,
+            2,
+            vision=True,
+            sampling_defaults=serve_main._sampling_defaults(family, args),
+        )
+        body = chat_body()
+        body.pop("temperature")
+        sampling = app.prepare(body, deadline=FOREVER).sampling
+        self.assertEqual(
+            (sampling.temperature, sampling.top_p, sampling.top_k), (0.6, 0.95, 40)
+        )
+        # A request's own value wins over the default.
+        sampling = app.prepare(chat_body(temperature=0.2), deadline=FOREVER).sampling
+        self.assertEqual(sampling.temperature, 0.2)
 
 
 if __name__ == "__main__":
