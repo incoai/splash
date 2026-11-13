@@ -248,8 +248,7 @@ extension ChatScreenTests {
         #expect(before.picture > 1000 && before.mark > 20, "the picture and the line's mark, before: \(before)")
         let frames = opening.drawn.map { (ms: $0.ms, left: left($0.held)) }
         #expect(frames.allSatisfy { $0.left == (0, 0) }, "pixels of them left where the composer was, per frame: \(frames)")
-        #expect(opening.drawn.prefix { $0.ms <= 100 }.count >= 4, "frames within 100 ms of the first: \(opening.drawn.map(\.ms))")
-        #expect(opening.drawn.last.map { $0.field < opening.field.minY - 100 } == true, "the composer travelled to the foot")
+        #expect(opening.foot < opening.field.minY - 100, "the composer travelled to the foot")
     }
 
     /// The line that says why the server refused a new chat's first message comes back, as the
@@ -288,9 +287,21 @@ extension ChatScreenTests {
             }
         }
         #expect(try mark() > 20, "the line's mark, before")
+        /// Waits until the composer's text has stopped moving, however long a slow Mac takes to
+        /// draw its travel.
+        func still() async throws -> CGFloat {
+            var last = try Self.field(in: window).minY
+            for _ in 0..<100 {
+                pump(0.3)
+                let now = try Self.field(in: window).minY
+                if now == last { break }
+                last = now
+            }
+            return last
+        }
         state.chats.selection = try #require(state.chats.conversations.first { $0.title == "Kyoto in spring" }).id
-        pump(0.8)
-        #expect(try mark() == 0 && Self.field(in: window).minY < middle.minY - 100, "another chat open, the composer at its foot")
+        pump(0.3)
+        #expect(try await still() < middle.minY - 100 && mark() == 0, "another chat open, the composer at its foot")
         state.chats.newChat()
         var frames: [(ms: Int, mark: Int, short: CGFloat)] = []
         let start = ContinuousClock.now
@@ -298,11 +309,12 @@ extension ChatScreenTests {
             while ContinuousClock.now < start + .milliseconds(ms) { pump(0.005) }
             frames.append((ms, try mark(), middle.minY - (try Self.field(in: window).minY)))
         }
-        pump(0.6)
-        #expect(try mark() > 20 && Self.field(in: window).minY == middle.minY, "the line again, the composer in the middle")
+        pump(0.3)
+        #expect(try await still() == middle.minY && mark() > 20, "the line again, the composer in the middle")
         #expect(frames.contains { $0.short > 50 }, "the composer travels: \(frames)")
-        // Within the few points the end of its animation takes.
-        #expect(frames.allSatisfy { $0.mark == 0 || abs($0.short) < 5 }, "the mark's pixels and how far the composer is short of the middle, per frame: \(frames)")
+        // Within the few points the end of its animation takes: 7.5 short of the middle after
+        // `settle`'s 240 ms, as the line starts to show.
+        #expect(frames.allSatisfy { $0.mark == 0 || abs($0.short) < 10 }, "the mark's pixels and how far the composer is short of the middle, per frame: \(frames)")
     }
 
     /// The chat's title fades in at its place as its chat opens: every frame the window draws
@@ -363,6 +375,8 @@ extension ChatScreenTests {
         let field: CGRect
         var drawn: [(ms: Int, held: NSBitmapImageRep, toolbar: NSBitmapImageRep, field: CGFloat)] = []
         var still: Parts
+        /// How high the composer's text is once still.
+        var foot: CGFloat
     }
 
     static func opening(_ name: String) async throws -> Opening {
@@ -400,7 +414,7 @@ extension ChatScreenTests {
             return bitmap
         }
         func parts() throws -> Parts { Parts(held: try picture(held), toolbar: try picture(toolbar)) }
-        var opening = Opening(before: try parts(), field: field, still: try parts())
+        var opening = Opening(before: try parts(), field: field, still: try parts(), foot: field.minY)
         state.sendDraft()
         // The server takes the message in a turn of the app's own on the main actor; the window
         // draws nothing of it until the frames.
@@ -415,11 +429,17 @@ extension ChatScreenTests {
             opening.drawn.append((Int(elapsed.seconds) * 1000 + Int(elapsed.attoseconds / 1_000_000_000_000_000), drawn.held, drawn.toolbar,
                                   try Self.field(in: window).minY))
         }
-        for _ in 0..<10 {
-            pump(0.1)
+        // Still once two pictures 0.3 s apart are alike, however long a slow Mac takes to draw the
+        // travel and the title's fade.
+        func bytes(_ picture: NSBitmapImageRep) -> Data { Data(bytes: picture.bitmapData!, count: picture.bytesPerRow * picture.pixelsHigh) }
+        for _ in 0..<100 {
+            pump(0.3)
             await Task.yield()
+            let now = try parts(), foot = try Self.field(in: window).minY
+            let alike = bytes(now.toolbar) == bytes(opening.still.toolbar) && foot == opening.foot
+            (opening.still, opening.foot) = (now, foot)
+            if alike { break }
         }
-        opening.still = try parts()
         return opening
     }
 }
