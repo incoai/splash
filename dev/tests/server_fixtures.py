@@ -915,6 +915,7 @@ def main_args(**overrides):
             "disable_ane": False,
             "activations": "auto",
             "verify_rows": "auto",
+            "copyspec_mode": "off",
             "max_image_pixels": images.MAX_PIXELS,
             "request_timeout": None,
             "queue_size": 1,

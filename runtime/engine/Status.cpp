@@ -641,7 +641,8 @@ void writeActiveRequests(json::Writer &w, const engine::EngineSnapshot &core, bo
   });
 }
 
-void writeMetrics(json::Writer &w, const RuntimeMetricsSnapshot &metrics, const engine::EngineSnapshot &core) {
+void writeMetrics(json::Writer &w, const RuntimeMetricsSnapshot &metrics, const engine::EngineSnapshot &core,
+                  const model::ModelTelemetry &telemetry) {
   w.object([&] {
     w.object("ttft_ms", [&] {
       w.field("p50", metrics.ttftP50Milliseconds)
@@ -679,6 +680,11 @@ void writeMetrics(json::Writer &w, const RuntimeMetricsSnapshot &metrics, const 
         .field("drafted_tokens", metrics.draftedTokens)
         .field("accepted_draft_tokens", metrics.acceptedDraftTokens)
         .field("draft_acceptance_rate", metrics.draftAcceptanceRate)
+        // Decode cycles whose draft block a prompt-lookup copy filled
+        // (model::ModelTelemetry::copyspecHits) and the draft tokens those
+        // blocks proposed.
+        .field("copyspec_hits", telemetry.copyspecHits)
+        .field("copyspec_tokens", telemetry.copyspecTokens)
         .field("capacity_failures", metrics.capacityFailures)
         .field("metal_failures", metrics.metalFailures)
         .key("current_prefill_batch");
@@ -828,7 +834,7 @@ std::string runtimeStatusJson(const StatusStart &start, const StatusSample &samp
           .field("failed", core.failed);
     });
     w.key("metrics");
-    writeMetrics(w, sample.metrics, core);
+    writeMetrics(w, sample.metrics, core, executorTelemetry);
     w.key("warmup");
     writeWarmup(w, start.warmup);
     w.object("metal", [&] {

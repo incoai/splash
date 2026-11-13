@@ -1,6 +1,7 @@
 #pragma once
 
 #include "ops/Vision.hpp"
+#include "CopySpec.hpp"
 #include "DFlashDraft.hpp"
 #include "ExpertChunkLayout.hpp"
 #include "ModelDescriptor.hpp"
@@ -135,6 +136,9 @@ struct RuntimeContext final {
   KvBlockCache *blockCache = nullptr;
   KvHistoryStream *historyStream = nullptr;
   VerifyRows verifyRows = VerifyRows::Auto;
+  // Whether a request's decode cycles may draft by copying the request's own
+  // earlier tokens (--copyspec-mode); off unless asked for.
+  CopySpecMode copyspecMode = CopySpecMode::Off;
 };
 
 // Validates only the interface between independently defined target and draft
