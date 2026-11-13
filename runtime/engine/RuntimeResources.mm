@@ -854,8 +854,8 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
           std::string("model allocated-size plan is invalid: ") + error.what());
     }
   };
-  // The stores the plan gives the parts, the routed experts' store at its
-  // floor.
+  // The stores the plan gives the parts: the routed experts' store at its
+  // cap, which starts at its floor.
   const auto storesOf = [&](const StreamedMemoryPlan &plan) {
     return model::ModelLoadOptions{.streamedTableBytes = plan.tableBytes,
                                    .expertMemoryBytes = plan.expertBytes,

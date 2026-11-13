@@ -168,9 +168,11 @@ loadModel(metal::MetalBackend &backend,
 // images reserved, of no memory and unwritten (WeightImages loaded while
 // released), so every projection has its formats and sizes as a load gives
 // them. Its routed experts read with their layers' images, which make no
-// store; with `streamedTableBytes`, its table streams through a row cache of
-// that many bytes on `readers`, as its whole image may exceed the largest
-// buffer, which a reservation is held to too.
+// store and stay far below the largest buffer, which a reservation is held
+// to too (Flash-Next Q2_0's largest, 743 MiB, of an M5 Max's 21 GiB); with
+// `streamedTableBytes`, its table streams through a row cache of that many
+// bytes on `readers`, as its whole image may exceed that buffer (Flash-Next's
+// 27,466 MiB).
 [[nodiscard]] QwenTargetGeometry plannedTargetGeometry(metal::MetalBackend &backend,
                                                        const std::filesystem::path &root,
                                                        const ModelDescriptor &descriptor,

@@ -156,7 +156,7 @@ uint64_t residentAllowanceBytes(const RuntimeResourcesConfig &config) {
 // bytes an expert.
 void requireArenasPlannedFromTheFiles(metal::MetalBackend &backend, const RuntimeResourcesConfig &config,
                                       std::span<const model::LoadedModel *const> loaded, uint64_t table) {
-  const ops::ExecutionPlans operators(backend.capabilities(), ops::Int8Activations::On);
+  const ops::ExecutionPlans operators(backend.capabilities(), config.int8Activations);
   const metal::MetalMemoryStats before = backend.refreshMemoryStats();
   backend.restartPeaks();
   const model::QwenTargetGeometry planned = model::plannedTargetGeometry(
@@ -180,9 +180,9 @@ void requireArenasPlannedFromTheFiles(metal::MetalBackend &backend, const Runtim
                                          .kv = kv};
         const model::ModelMemoryPlan plan = model::plannedRuntimeMemory(config.model, planned, operators,
                                                                         config.kvFormat, config.stateFormat, parts);
-        for (const model::LoadedModel *model : loaded) {
+        for (const model::LoadedModel *load : loaded) {
           const model::ModelMemoryPlan as =
-              model::plannedRuntimeMemory(*model, operators, config.kvFormat, config.stateFormat, parts);
+              model::plannedRuntimeMemory(*load, operators, config.kvFormat, config.stateFormat, parts);
           require(plan.laneStatePlannedAllocatedBytes == as.laneStatePlannedAllocatedBytes &&
                       plan.sharedPrefillPlannedAllocatedBytes == as.sharedPrefillPlannedAllocatedBytes &&
                       plan.sharedDecodePlannedAllocatedBytes == as.sharedDecodePlannedAllocatedBytes,
@@ -221,7 +221,7 @@ void testStreamableWeightsAreWhatLoads(const RuntimeResourcesConfig &config) {
           "the smallest store did not hold a layer's experts within its bytes");
   const std::array<const model::LoadedModel *, 2> loads{&whole, &streamed};
   requireArenasPlannedFromTheFiles(backend, config, loads, 0);
-  const ops::ExecutionPlans operators(backend.capabilities(), ops::Int8Activations::On);
+  const ops::ExecutionPlans operators(backend.capabilities(), config.int8Activations);
   const auto arenas = [&](model::StreamedParts parts) {
     const model::ModelMemoryPlan plan =
         model::plannedRuntimeMemory(whole, operators, config.kvFormat, config.stateFormat, parts);
