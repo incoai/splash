@@ -498,6 +498,16 @@ void testChurnKeepsTheStoreThroughAHostEpisode() {
 // it converted in, and in 5 owing them, the 4 here and the one above, as the
 // next pass ran before the copies landed. The other 7 take the same two paths
 // within the bound and are left out, 36 s of this scenario's 98.
+// What the bound guards here now is the wait of the prefill's next unit for a
+// decoder whose memory lands (Scheduler::waitsUntil): without it the 5 owing
+// their copies break the bound again, at 1,063 to 1,069 ms. The wait covers
+// the 7 whose history had its copies too: they pass, at the same longest
+// gaps, without the conversion's release of its landed pages
+// (Engine::EngineVictims::take), by which the lane runs in the command it
+// converts for. That release is engine's to guard
+// (testAConversionWithCopiesRunsInTheCommandItConvertsFor), as the wait's end
+// with its lanes and its time is (testAUnitsWaitEndsWithItsLanes,
+// testAUnitsWaitRunsOutWithoutACommand).
 void testChurnKeepsItsBoundsWhereLanesConvert() {
   constexpr std::array<ChurnPrompts, 12> kWorkloads{{{},
                                                      {.step = 11'200, .output = 1504},
