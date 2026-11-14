@@ -9,8 +9,8 @@
 // every dispatch of a prefill command and B1 through B4 DFlash cycles
 // is replayed as its own command and attributed to its pipeline.
 // The fused (unprofiled) GPU time of the same work is reported alongside, so
-// the gap between the sum of parts and the fused command shows how much a
-// cycle pays in dispatch boundaries rather than kernel work. --dispatch-list
+// separate replay changes scheduling and cache behavior. Its difference from
+// normal command timing is not an exact decomposition of dispatch overhead. --dispatch-list
 // writes the attributed B1 cycles' dispatches in order, one line each: index,
 // pipeline and GPU microseconds.
 // With --images it profiles the vision encoder instead, loading only the
@@ -31,6 +31,7 @@
 #include "engine/MemoryGovernor.hpp"
 #include "model/QwenState.hpp"
 #include "tools/LoadOptions.hpp"
+#include "tools/DecodeProfileOptions.hpp"
 
 #import <Foundation/Foundation.h>
 
@@ -41,8 +42,11 @@
 #include <cstdint>
 #include <cstdio>
 #include <filesystem>
+#include <fcntl.h>
+#include <unistd.h>
 #include <iostream>
 #include <map>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -245,11 +249,11 @@ struct Lane final {
 };
 
 void prefill(model::Runtime &executor, Lane &lane,
-             std::span<const uint32_t> prompt) {
+             std::span<const uint32_t> prompt, uint32_t generationReserve) {
   EngineRequest request;
   request.id = lane.id;
   request.prompt.assign(prompt.begin(), prompt.end());
-  request.maxNewTokens = 256;
+  request.maxNewTokens = generationReserve;
   executor.beginColdRequest(request.modelView(), lane.stateLane);
   uint32_t offset = 0;
   while (offset < prompt.size()) {
@@ -322,78 +326,58 @@ int main(int argc, char **argv) {
         std::cerr << "usage: decode-profile METALLIB MODEL_ROOT "
                      "[--prompt-tokens N] [--cycles K] [--kv-format int8|bf16] "
                      "[--state-format fp32|bf16] [--expert-memory SIZE] [--ple-memory SIZE] "
-                     "[--dispatch-list FILE] [--verify-rows auto|all]\n"
+                     "[--dispatch-list FILE] [--verify-rows auto|all] [--activations auto|bf16]\n"
+                     "[--max-memory SIZE] [--max-context N] [--input-tokens FILE] [--report FILE]\n"
+                     "[--require-flash-next] [--config-only]\n"
                      "       decode-profile METALLIB MODEL_ROOT "
                      "--images HxW[,HxW...] [--cycles K]\n";
         return 2;
       }
-      uint32_t promptTokens = 512;
-      uint32_t cycles = 4;
-      kv::Format format = kv::Format::Int8;
-      ops::GdnStateFormat stateFormat = ops::GdnStateFormat::Float32;
-      std::vector<ops::ImageGrid> grids;
-      // Streamed routed experts and PLE table (tools/LoadOptions.hpp).
-      model::ModelLoadOptions loadOptions;
-      bool textOptions = false;
-      std::string dispatchList;
-      model::VerifyRows verifyRows = model::VerifyRows::Auto;
-      for (int index = 3; index < argc; index += 2) {
-        const std::string_view option(argv[index]);
-        if (index + 1 >= argc)
-          throw std::invalid_argument(std::string(option) + " requires a value");
-        if (option == "--prompt-tokens") {
-          promptTokens = parseCount(argv[index + 1], "--prompt-tokens");
-          textOptions = true;
-        } else if (option == "--cycles")
-          cycles = parseCount(argv[index + 1], "--cycles");
-        else if (option == "--kv-format") {
-          const std::string_view value(argv[index + 1]);
-          if (value != "int8" && value != "bf16")
-            throw std::invalid_argument("--kv-format takes int8 or bf16");
-          format = value == "int8" ? kv::Format::Int8 : kv::Format::BFloat16;
-          textOptions = true;
-        } else if (option == "--state-format") {
-          const std::string_view value(argv[index + 1]);
-          if (value != "fp32" && value != "bf16")
-            throw std::invalid_argument("--state-format takes fp32 or bf16");
-          stateFormat = value == "fp32" ? ops::GdnStateFormat::Float32 : ops::GdnStateFormat::BFloat16;
-          textOptions = true;
-        } else if (tools::takeLoadOption(option, argv[index + 1], loadOptions)) {
-          textOptions = true;
-        } else if (option == "--verify-rows") {
-          const std::string_view value(argv[index + 1]);
-          if (value != "auto" && value != "all")
-            throw std::invalid_argument("--verify-rows takes auto or all");
-          verifyRows = value == "all" ? model::VerifyRows::All : model::VerifyRows::Auto;
-          textOptions = true;
-        } else if (option == "--dispatch-list") {
-          dispatchList = argv[index + 1];
-          textOptions = true;
-        } else if (option == "--images")
-          grids = parseGrids(argv[index + 1]);
-        else
-          throw std::invalid_argument("unknown option");
-      }
-      if (!grids.empty() && textOptions)
-        throw std::invalid_argument("--images takes no other option than --cycles");
-
-      metal::MetalBackend backend(argv[1]);
+      std::vector<std::string_view> arguments;
+      for (int i = 3; i < argc; ++i) arguments.emplace_back(argv[i]);
+      const auto options = tools::DecodeProfileOptions::parse(arguments);
+      const uint32_t promptTokens = options.promptTokens, cycles = options.cycles;
+      const kv::Format format = options.kv == "int8" ? kv::Format::Int8 : kv::Format::BFloat16;
+      const ops::GdnStateFormat stateFormat = options.state == "bf16" ? ops::GdnStateFormat::BFloat16 : ops::GdnStateFormat::Float32;
+      const auto grids = options.images.empty() ? std::vector<ops::ImageGrid>{} : parseGrids(options.images);
+      auto loadOptions = options.load;
+      const std::string dispatchList = options.dispatchList;
+      const model::VerifyRows verifyRows = options.verify == "all" ? model::VerifyRows::All : model::VerifyRows::Auto;
+      std::cout << options.json() << '\n';
+      if (options.configOnly) return 0; // Deliberately before Metal, model inspection or any output file.
+      // All later observations are native fixture measurements, never HTTP TTFT.
       const std::filesystem::path root(argv[2]);
+      std::optional<model::ModelDescriptor> checkedDescriptor;
+      if (grids.empty()) {
+        checkedDescriptor = model::inspectModelRoot(root);
+        if (options.contextExplicit) *checkedDescriptor = model::servedFor(std::move(*checkedDescriptor), options.maxContext);
+        if (options.requireFlashNext && !std::holds_alternative<model::Qwen4ExpLayout>(checkedDescriptor->target))
+          throw std::invalid_argument("matched profile requires Flash-Next target geometry");
+        if (uint64_t{promptTokens} + options.generationReserve() > checkedDescriptor->capabilities.maximumContextTokens)
+          throw std::invalid_argument("profile exceeds the model's served context");
+        const auto vocabulary = checkedDescriptor->capabilities.vocabularySize;
+        if (std::any_of(options.tokens.begin(), options.tokens.end(), [vocabulary](auto t) { return t >= vocabulary; }))
+          throw std::invalid_argument("token fixture is outside the model vocabulary");
+        if (options.maxMemory && tools::weightBytes(root, *checkedDescriptor, loadOptions) > options.maxMemory)
+          throw std::invalid_argument("model resident-weight estimate exceeds profiler memory limit");
+      }
+      metal::MetalBackend backend(argv[1]);
       if (!grids.empty()) {
-        std::printf("device %s, %u encodes per image\n",
-                    backend.capabilities().deviceName.c_str(), cycles);
+        std::printf("device %s, %u encodes per image\n", backend.capabilities().deviceName.c_str(), cycles);
         profileImages(backend, root, grids, cycles);
         return 0;
       }
-      // Streamed weights read on a pool of SSD readers, as the engine's do.
       loadOptions.readers = std::make_shared<model::SsdReaders>(model::kSsdReaders);
-      model::LoadedModel model =
-          model::loadModel(backend, root, model::inspectModelRoot(root), loadOptions);
-      ops::ExecutionPlans operators(backend.capabilities(), ops::Int8Activations::On);
+      auto descriptor = std::move(*checkedDescriptor);
+      const uint64_t memoryLimit = options.maxMemory ? options.maxMemory : backend.capabilities().recommendedMaxWorkingSetBytes;
+      if (tools::weightBytes(root, descriptor, loadOptions) > memoryLimit)
+        throw std::invalid_argument("model resident-weight estimate exceeds profiler memory limit");
+      model::LoadedModel model = model::loadModel(backend, root, descriptor, loadOptions);
+      ops::ExecutionPlans operators(backend.capabilities(), options.activations == "bf16" ? ops::Int8Activations::Off : ops::Int8Activations::On);
 
-      // Enough Page32 pages for four lanes of prompt plus generated rows.
+      // Enough Page32 pages for every normal and attribution cycle at four widths.
       const uint32_t pagesPerLane =
-          (promptTokens + 256 + model::ExecutionLimits::targetVerifyRows) /
+          (promptTokens + options.generationReserve() + model::ExecutionLimits::targetVerifyRows) /
               kv::kPageTokens +
           2;
       // Whole extents of the largest size the pool rule picks, as a large
@@ -403,7 +387,7 @@ int main(int argc, char **argv) {
       const uint32_t pageCount =
           (pagesPerLane * 4 + extentPages - 1) / extentPages * extentPages;
       MemoryGovernor governor(
-          backend, backend.capabilities().recommendedMaxWorkingSetBytes, 1, 1,
+          backend, memoryLimit, 1, 1,
           queryHostMemory, 0);
       // Every allocation through the governor is for a claim: the profile's
       // are a start's, one Floor claim for its whole run.
@@ -430,22 +414,22 @@ int main(int argc, char **argv) {
         lanes[index] = {index + 1, index, 0,
                         pageRange(index * pagesPerLane, pagesPerLane)};
       }
-      const std::vector<uint32_t> prompt = chatPrompt(model.descriptor, promptTokens);
+      const std::vector<uint32_t> prompt = options.tokens.empty() ? chatPrompt(model.descriptor, promptTokens) : options.tokens;
 
       // Warm prefill and B1 decode with real work before measuring.
-      prefill(executor, lanes[0], prompt);
+      prefill(executor, lanes[0], prompt, options.generationReserve());
       static_cast<void>(decodeCycle(backend, executor, std::span<Lane>(&lanes[0], 1)));
       executor.end(lanes[0].id);
 
       // Prefill: fused timing first, then the attributed replay. Both cover
       // every chunk of the prompt.
       const double prefillBefore = executor.telemetry().totalPrefillGpuSeconds;
-      prefill(executor, lanes[0], prompt);
+      prefill(executor, lanes[0], prompt, options.generationReserve());
       const double prefillFused =
           executor.telemetry().totalPrefillGpuSeconds - prefillBefore;
       executor.end(lanes[0].id);
       BackendInstrumentation::setDispatchProfiling(backend, true);
-      prefill(executor, lanes[0], prompt);
+      prefill(executor, lanes[0], prompt, options.generationReserve());
       BackendInstrumentation::setDispatchProfiling(backend, false);
       Table prefillTable;
       accumulate(prefillTable,
@@ -453,6 +437,9 @@ int main(int argc, char **argv) {
       print("prefill " + std::to_string(promptTokens) + " rows", prefillTable,
             1.0, prefillFused);
 
+      std::ostringstream cycleReport;
+      cycleReport << "[";
+      bool firstWidth = true;
       auto profileWidth = [&](const char *title, std::span<Lane> active) {
         std::vector<CycleTiming> fused;
         for (uint32_t cycle = 0; cycle < cycles; ++cycle)
@@ -472,6 +459,14 @@ int main(int argc, char **argv) {
                     title, median.gpuSeconds * 1e3, median.wallSeconds * 1e3,
                     static_cast<unsigned long long>(median.commands), tokens / fused.size(),
                     wall * 1e3 / tokens);
+        if (!std::isfinite(wall) || !std::isfinite(median.gpuSeconds) || wall < 0 || median.gpuSeconds < 0)
+          throw std::runtime_error("invalid native timing observation");
+        if (!firstWidth) cycleReport << ',';
+        firstWidth = false;
+        cycleReport << std::setprecision(17) << "{\"lanes\":" << active.size() << ",\"gpu_cycle_median_s\":" << median.gpuSeconds
+                    << ",\"cycle_wall_s\":" << wall << ",\"emitted_tokens\":" << tokens
+                    << ",\"output_tps\":" << (wall > 0 ? tools::profileNumber(tokens / wall) : "null")
+                    << ",\"commands_per_median_cycle\":" << median.commands << ",\"cpu_graph_s\":null}";
         BackendInstrumentation::setDispatchProfiling(backend, true);
         for (uint32_t cycle = 0; cycle < cycles; ++cycle)
           static_cast<void>(decodeCycle(backend, executor, active));
@@ -479,12 +474,12 @@ int main(int argc, char **argv) {
         const std::vector<metal::DispatchTiming> timings =
             BackendInstrumentation::takeDispatchProfile(backend);
         if (!dispatchList.empty() && active.size() == 1) {
-          FILE *file = std::fopen(dispatchList.c_str(), "w");
-          if (!file) throw std::runtime_error("cannot write " + dispatchList);
+          std::ostringstream trace;
+          trace << std::fixed << std::setprecision(2);
           for (size_t index = 0; index < timings.size(); ++index)
-            std::fprintf(file, "%zu %s %.2f\n", index, timings[index].pipelineName.c_str(),
-                         timings[index].gpuSeconds * 1e6);
-          std::fclose(file);
+            trace << index << ' ' << timings[index].pipelineName << ' '
+                  << timings[index].gpuSeconds * 1e6 << '\n';
+          tools::writePrivateProfileOutput(dispatchList, trace.str());
         }
         Table table;
         accumulate(table, timings);
@@ -493,13 +488,19 @@ int main(int argc, char **argv) {
       profileWidth("B1 decode cycle", std::span<Lane>(&lanes[0], 1));
       // Add one lane at a time so M16 and M24 paths are measured too.
       for (uint32_t index = 1; index < lanes.size(); ++index) {
-        prefill(executor, lanes[index], prompt);
+        prefill(executor, lanes[index], prompt, options.generationReserve());
         const std::string title = "B" + std::to_string(index + 1) + " decode cycle";
         profileWidth(title.c_str(), std::span<Lane>(lanes.data(), index + 1));
       }
 
       for (Lane &lane : lanes)
         executor.end(lane.id);
+      if (!options.report.empty()) {
+        const std::string json = "{\"configuration\":" + options.json() + ",\"model_source_identity\":" +
+            tools::profileJsonString(model.descriptor.sourceIdentity) + ",\"effective_memory_limit_bytes\":" + std::to_string(memoryLimit) +
+            ",\"effective_max_context_tokens\":" + std::to_string(model.descriptor.capabilities.maximumContextTokens) + ",\"prefill_fused_gpu_s\":" + tools::profileNumber(prefillFused) + ",\"native_cycles\":" + cycleReport.str() + "]}";
+        tools::writePrivateProfileOutput(options.report, json + "\n");
+      }
       return 0;
     } catch (const std::exception &error) {
       std::cerr << "decode-profile: " << error.what() << '\n';

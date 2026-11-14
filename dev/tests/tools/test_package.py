@@ -499,6 +499,37 @@ class InstallerTests(unittest.TestCase):
             folder.mkdir()
         self.app = self.root / "home/Library/Application Support/Splash/app"
         self.command = self.bin / "splash"
+        # Lifecycle tests use fake releases, so their host platform is a fixture
+        # too. Keep the production installer's platform guard exercised below.
+        commands = self.root / "commands"
+        commands.mkdir(exist_ok=True)
+        self.os_version = commands / "fixture-version"
+        self.os_version.write_text("26.4\n")
+        for name, text in {
+            "uname": '#!/bin/sh\ncase "$1" in -s) echo Darwin;; -m) echo arm64;; *) exit 1;; esac\n',
+            "sw_vers": "#!/bin/sh\ncat " + shlex.quote(str(self.os_version)) + "\n",
+        }.items():
+            command = commands / name
+            command.write_text(text)
+            command.chmod(0o755)
+
+    def test_unsupported_os_is_rejected_before_installation(self):
+        self.os_version.write_text("26.3\n")
+        self.publish("1.0")
+        result = self.install()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("requires macOS 26.4", result.stderr)
+        self.assertFalse(self.app.exists())
+
+    def test_non_apple_silicon_is_rejected_before_installation(self):
+        (self.root / "commands/uname").write_text(
+            '#!/bin/sh\ncase "$1" in -s) echo Darwin;; -m) echo x86_64;; *) exit 1;; esac\n'
+        )
+        self.publish("1.0")
+        result = self.install()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Apple Silicon", result.stderr)
+        self.assertFalse(self.app.exists())
 
     def publish(
         self,
@@ -656,7 +687,7 @@ class InstallerTests(unittest.TestCase):
         self.assertEqual(self.install().returncode, 0)
         self.publish("2.0")
         commands = self.root / "commands"
-        commands.mkdir()
+        commands.mkdir(exist_ok=True)
         proof = self.root / "lock-proof"
         old = self.app / "splash-1.0-arm64-macos26"
         lock = self.app.parent / "runtime/serve.lock"
@@ -793,7 +824,7 @@ class InstallerTests(unittest.TestCase):
         # This curl serves the uploaded files only to requests that carry the
         # token, as the private repo does.
         commands = self.root / "commands"
-        commands.mkdir()
+        commands.mkdir(exist_ok=True)
         curl = commands / "curl"
         curl.write_text(
             f"#!{sys.executable}\n"
