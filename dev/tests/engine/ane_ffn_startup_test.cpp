@@ -622,8 +622,8 @@ void testRefitMovesTheChoice() {
               has(started.log, "Neural Engine FFN split at share 0.21 for chunks of 553 rows or more: 13.6 ms per "
                                "2048-row FFN layer against 20.0 on the GPU alone"),
           "the refitted choice of 7 units did not serve: " + started.log);
-  // Seven units whose 640-row function takes 6.0 ms, against six's 5.5, take chunks of 575 to 640 rows more than 2%
-  // longer, and the split of six serves, prepared again.
+  // Seven units whose 640-row function takes 6.0 ms, against six's 5.5, split chunks from 603 rows, not 553, and the
+  // split of six serves, prepared again.
   fake = {};
   fake.time = [] { return Timings{{14.0 / 34, 9.9673, 23.929}, {27.0 / 34, 4.7526, 46.034}, 15.834}; };
   fake.prepare = [](uint32_t aneUnits, bool timed) {

@@ -207,17 +207,19 @@ void testMinimumRows() {
     rejects([&] { static_cast<void>(minimumRows(timings)); }, "not those of its functions", what + " were taken");
 }
 
-// A split takes no chunk longer than another where each chunk it times, from its own least rows, takes at most 2% longer
-// than the other's: one faster at the most rows and alike elsewhere, or within 2% everywhere, does; one whose 640-row
-// function takes 6.0 ms against 5.5 splits from 603 rows, which leaves chunks of 575 to 602 rows on the GPU alone,
-// 5.62 to 5.88 ms against 5.5, and its own chunks of 603 to 640 rows at 6.0, and does not; nor does one that splits
-// none.
+// A split takes no chunk longer than another where it splits every chunk the other splits, each in at most 2% longer:
+// one faster at the most rows and alike elsewhere, one 1.25% slower at every function, and one whose 640-row function
+// takes 5.3 ms against 5.5, splitting from 533 rows against 553, do; one 3% slower at 1024 rows does not, nor one whose
+// 640-row function takes 6.0 ms, which splits from 603 rows and leaves chunks of 553 to 602 rows to the GPU alone, nor
+// one that splits none.
 void testSlowerNowhere() {
   const ChunkTimings incumbent = functions(0.8, {{640, 5.5}});
   require(slowerNowhere(incumbent, incumbent) && slowerNowhere(functions(0.8, {{640, 5.5}, {2048, 15.0}}), incumbent) &&
-              slowerNowhere(functions(0.81, {{640, 5.6}}), incumbent),
+              slowerNowhere(functions(0.81, {{640, 5.5}}), incumbent) &&
+              slowerNowhere(functions(0.8, {{640, 5.3}}), incumbent),
           "a split no chunk of which took longer was refused");
-  require(!slowerNowhere(functions(0.8, {{640, 6.0}, {2048, 15.0}}), incumbent) &&
+  require(!slowerNowhere(functions(0.8, {{640, 5.5}, {1024, 0.824 * gpuAt(1024)}}), incumbent) &&
+              !slowerNowhere(functions(0.8, {{640, 6.0}, {2048, 15.0}}), incumbent) &&
               !slowerNowhere(functions(0.8, {{2048, 21.0}}), incumbent),
           "a split that took chunks longer was taken");
 }

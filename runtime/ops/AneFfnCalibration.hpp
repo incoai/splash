@@ -87,9 +87,9 @@ struct ChunkTimings final {
 // chunk of the functions splits (AneFfnCalibration.cpp); none when not even
 // a chunk of the most rows does.
 [[nodiscard]] std::optional<uint32_t> minimumRows(const ChunkTimings &timings);
-// Whether the split `candidate` times takes no chunk of the functions' rows
-// more than the timings' noise longer than the split `incumbent` times, each
-// from its own least rows (AneFfnCalibration.cpp).
+// Whether the split `candidate` times splits every chunk the split
+// `incumbent` times splits, none of them more than the timings' noise longer
+// (AneFfnCalibration.cpp).
 [[nodiscard]] bool slowerNowhere(const ChunkTimings &candidate, const ChunkTimings &incumbent);
 
 // What one calibration of the split on this Mac decided, which later starts

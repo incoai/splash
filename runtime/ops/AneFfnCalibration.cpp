@@ -132,27 +132,25 @@ std::optional<uint32_t> minimumRows(const ChunkTimings &timings) {
   return minimum;
 }
 
-// A chunk of each row count costs its function's split layer from the least
-// rows the timings split (minimumRows), the GPU's layer alone below. More
-// units can cost the chunks a full one does not show: Qwen3.8-27B UD-Q4_K_M
-// on an M5 Max took 10 of 34 units on the refitted model, whose full chunk
-// prefilled 1.5-2.0% faster than 9's, but split from 780 rows against 9's
-// 575, which left chunks of 640 and 672 rows 12% slower.
+// The candidate must split every chunk the incumbent splits, each of them in
+// at most kChunkNoise longer, both split layers timed alike: more units can
+// cost chunks a full one does not show. Qwen3.8-27B UD-Q4_K_M on an M5 Max
+// took 10 of 34 units on the refitted model, whose full chunk prefilled
+// 1.5-2.0% faster than 9's but which split from 780 rows against 575, so that
+// chunks of 640 and 672 rows ran 12% slower. Below the incumbent's least
+// rows the candidate splits only what its own least rows allow.
 bool slowerNowhere(const ChunkTimings &candidate, const ChunkTimings &incumbent) {
-  const auto cost = [](const ChunkTimings &timings) {
-    const std::optional<uint32_t> least = minimumRows(timings);
-    const Line gpu = gpuAlone(timings.gpu);
-    return [&timings, least, gpu](uint32_t rows) {
-      const auto function = std::ranges::find_if(timings.functions, [&](const ChunkTimings::Function &timed) {
-        return timed.least <= rows && rows <= timed.rows;
-      });
-      return least && rows >= *least && function != timings.functions.end() ? function->split : gpu(rows);
-    };
+  const std::optional<uint32_t> candidateLeast = minimumRows(candidate), incumbentLeast = minimumRows(incumbent);
+  if (!incumbentLeast) return true;
+  if (!candidateLeast || *candidateLeast > *incumbentLeast) return false;
+  const auto split = [](const ChunkTimings &timings, uint32_t rows) {
+    const auto function = std::ranges::find_if(timings.functions, [&](const ChunkTimings::Function &timed) {
+      return timed.least <= rows && rows <= timed.rows;
+    });
+    return function == timings.functions.end() ? std::numeric_limits<double>::infinity() : function->split;
   };
-  const auto candidateCost = cost(candidate), incumbentCost = cost(incumbent);
-  const uint32_t least = candidate.functions.back().least, most = candidate.functions.front().rows;
-  for (uint32_t rows = least; rows <= most; ++rows)
-    if (!(candidateCost(rows) <= (1.0 + kChunkNoise) * incumbentCost(rows))) return false;
+  for (uint32_t rows = *incumbentLeast; rows <= incumbent.functions.front().rows; ++rows)
+    if (!(split(candidate, rows) <= (1.0 + kChunkNoise) * split(incumbent, rows))) return false;
   return true;
 }
 
