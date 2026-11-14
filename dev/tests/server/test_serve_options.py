@@ -86,6 +86,9 @@ OPTIONS = {
         "--kv-window-trim", {"on": "on", "off": "off"}, ("always", "1")
     ),
     "--disable-ane": ([(["--disable-ane"], True)], []),
+    "--activations": values(
+        "--activations", {"auto": "auto", "bf16": "bf16"}, ("", "on", "off", "BF16")
+    ),
     "--verify-rows": values(
         "--verify-rows",
         {"auto": "auto", "all": "all"},

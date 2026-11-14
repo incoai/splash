@@ -579,9 +579,9 @@ void testSharedPrefillCapacityFailureDoesNotDeadlock() {
           "capacity failure prevented subsequent service");
 }
 
-// A request that fails in an admission pass stays listed until the pass
-// ends; a sibling admitted after it in the same pass plans no junction for
-// it.
+// A request that fails in an admission pass, naming its lane at its start,
+// stays listed until the pass ends; a sibling admitted after it in the same
+// pass plans no junction for it.
 void testSiblingFailedInTheAdmissionPassGetsNoJunction() {
   test::EngineHarness h({.pages = 64});
   Executor &executor = h.model;
@@ -598,6 +598,10 @@ void testSiblingFailedInTheAdmissionPassGetsNoJunction() {
   static_cast<void>(tickAt(h, 1));
   require(events.capacityExhaustedCount == 1 && events.startIds == std::vector<uint64_t>{2},
           "the two requests were not admitted in one pass");
+  const std::string &message = events.failureDetails.front().first;
+  require(message.starts_with("could not allocate request state: ") &&
+              message.find("; the request, a Resident lane of 97 tokens at its start, ") != std::string::npos,
+          "the request alone without its state did not fail naming its lane at its start: " + message);
   h.runUntilIdle();
   const auto &boundaries = executor.plans.at(2).boundaries;
   require(std::none_of(boundaries.begin(), boundaries.end(),
@@ -1432,13 +1436,18 @@ void testStalledSuspensionFailsWithCapacity() {
           "preemption did not identify that the remaining singleton cannot fit");
 
   // Nothing completes between suspension and retry, so suspending again would
-  // only rotate the same two lanes forever.
+  // only rotate the same two lanes forever: the suspended lane fails at its
+  // resume.
   for (double now = 102.0; now < 140.0 && !idle(engine); ++now)
     static_cast<void>(tickAt(h, now));
   require(idle(engine) && events.capacityExhaustedCount == 2 &&
               engine.snapshot().resourceSuspensions == 1 &&
               engine.snapshot().resourceResumptions == 0 && executor.prefillRows == 0,
           "stalled suspension did not converge to a capacity failure");
+  const std::string &message = events.failureDetails.back().first;
+  require(message.find(", a Resident lane of ") != std::string::npos &&
+              message.find(" tokens at its resume, ") != std::string::npos,
+          "the suspended lane did not fail naming its lane at its resume: " + message);
 }
 
 void testTerminalAnchorWithoutKvIsNotCached() {

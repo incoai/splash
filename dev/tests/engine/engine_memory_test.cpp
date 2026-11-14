@@ -3561,7 +3561,7 @@ void testBudgetDenialRetriesAfterRelease() {
 
 // A lane's start keeps the pooled buffers a lane starts from: a need of state buffers would only allocate them
 // again. Its KV the engine's limit refused takes them once nothing else meets it, and fits; under critical pressure
-// KV takes them first.
+// KV takes them first, and its need, which the storage refuses again, logs short, not a met refused again.
 void testAStartKeepsThePooledLaneBuffersItsKvTakesThemLast() {
   constexpr uint64_t kExtent = 4 * 4096;
   enum class Refused { State, KvAtTheLimit, KvCritical };
@@ -3591,8 +3591,17 @@ void testAStartKeepsThePooledLaneBuffersItsKvTakesThemLast() {
       storage.growthBlocked = true;
       host.setPressure(MemoryPressure::Critical);
     }
+    std::vector<std::string> lines;
+    host.governor.ledger().setDecisionLog([&](std::string_view line) { lines.emplace_back(line); });
     engine.submit(request(286, {286}));
     runUntilIdle(engine);
+    if (refused == Refused::KvCritical) {
+      const auto logs = [&](std::string_view text) {
+        return std::ranges::any_of(lines, [&](const std::string &line) { return line.find(text) != std::string::npos; });
+      };
+      require(logs("claim of request 286 needs 0.0 MiB, 1 pages: short") && !logs("yet refused again"),
+              "a KV need free() found short logged as met: " + (lines.empty() ? std::string() : lines.back()));
+    }
     const bool completes = refused == Refused::KvAtTheLimit;
     require(idle(engine) && (events.completedCount == 1) == completes &&
                 events.failures == (completes ? std::vector<std::string>{}
@@ -6210,6 +6219,36 @@ void testReplayPointCopiesCacheBeforeTheExpertStore() {
   executor.reservationRoom = {};
 }
 
+// A lone lane's replay point that no take can meet takes nothing: refused, it goes on without buffers of its own
+// (Refusal::Settled), so its claim is not lone (ClaimSpec::lone) and takes only what meets its need. Refused twice the
+// bytes of the expert store's unit above its floor, until its command is cut there, the store keeps that unit.
+void testALoneReplayPointThatCannotBeMetTakesNothing() {
+  test::TestKvStorage storage(16, 4096, 4);
+  KvPool pool(storage, 0);
+  engine::Cache cache(pool, nullptr, nullptr);
+  Executor executor;
+  Events events;
+  GovernedHost host;
+  engine::Engine engine(host.connect({}), cache, executor, events);
+  guardReleases(storage, engine);
+  Store store(host, executor, 1);
+  reachTheLimit(host);
+  executor.reservationRoom = [&] {
+    if (engine.snapshot().captureCuts)
+      return true;
+    executor.reservationFailure = refusedAtTheLimit(host, 2 * 4 * 4096);
+    return false;
+  };
+  engine.submit(request(3, std::vector<uint32_t>(65, 3)));
+  double now = 1;
+  tickUntil(engine, now, [&] { return idle(engine); }, "the request did not finish");
+  require(events.completedCount == 1 && engine.snapshot().captureCuts == 1 && store.experts.shrinks == 0,
+          "a lone replay point no take could meet took a unit of the expert store: " +
+              std::to_string(store.experts.shrinks) + " shrinks, " +
+              std::to_string(engine.snapshot().captureCuts) + " capture cuts");
+  executor.reservationRoom = {};
+}
+
 // A replay point the host refuses while the only takeable state is still being copied waits for that copy and then
 // passes the host, so a lone prompt runs as one command.
 void testAHostRefusedReplayPointCutsNoCommand() {
@@ -6375,6 +6414,7 @@ std::span<const test::TestCase> memoryTests() {
       {"testPacedPassKeepsInServiceReplayPoint", testPacedPassKeepsInServiceReplayPoint},
       {"testReplayPointTakesTheExpertStoreBeforeWhatIsInUse", testReplayPointTakesTheExpertStoreBeforeWhatIsInUse},
       {"testReplayPointCopiesCacheBeforeTheExpertStore", testReplayPointCopiesCacheBeforeTheExpertStore},
+      {"testALoneReplayPointThatCannotBeMetTakesNothing", testALoneReplayPointThatCannotBeMetTakesNothing},
       {"testAHostRefusedReplayPointCutsNoCommand", testAHostRefusedReplayPointCutsNoCommand},
       {"testCopyAheadOfALeafHoldsARefusalBack", testCopyAheadOfALeafHoldsARefusalBack},
       {"testLoneGrowthWaitsForCopiesAheadAboveTheLeaves", testLoneGrowthWaitsForCopiesAheadAboveTheLeaves},

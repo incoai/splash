@@ -408,13 +408,13 @@ std::optional<uint32_t> QwenStateStorage::statesToActivate() const noexcept {
 }
 
 uint64_t QwenStateStorage::idleBytes(uint32_t evictedStates, bool afterStart, bool keepLane) const noexcept {
-  BufferCounts pooled = afterStart ? beyond(idle(), kStartBuffers) : idle();
+  BufferCounts pooled = afterStart ? beyond(idle(), kLaneBuffers) : idle();
   pooled.cells += evictedStates * kStateBuffers.cells;
   pooled.windows += evictedStates * kStateBuffers.windows;
   return bytes(keepLane ? beyond(pooled, kLaneBuffers) : pooled);
 }
 
-uint64_t QwenStateStorage::startBytes() const noexcept { return bytes(beyond(kStartBuffers, idle())); }
+uint64_t QwenStateStorage::startBytes() const noexcept { return bytes(beyond(kLaneBuffers, idle())); }
 
 void QwenStateStorage::updateLengths(uint32_t index,
                                      QwenLogicalLengths lengths) {

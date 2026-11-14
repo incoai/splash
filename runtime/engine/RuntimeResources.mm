@@ -179,17 +179,6 @@ void reportDiskTier(const DiskSpace &space, const model::DiskBudget &budget, uin
   logLine(line.str());
 }
 
-// The layers' part of what ane::recall() keeps a calibration under: their
-// shapes and formats.
-std::string calibrationKey(std::span<const ops::SwiGluProjections> layers) {
-  std::string key = "ane-ffn calibration";
-  for (const ops::SwiGluProjections &layer : layers)
-    for (const ops::Projection *projection : {layer.gate, layer.up, layer.down})
-      key += " " + std::to_string(projection->outputSize) + "x" + std::to_string(projection->inputSize) + ":g" +
-             std::to_string(projection->blocks().segments.front().formatId);
-  return key;
-}
-
 // The split's part of what the engine gives back while idle, if it runs one.
 std::optional<ReleasableMemory::Split> idleSplit(ops::AneFfn *split) {
   if (!split)
@@ -299,18 +288,29 @@ DiskTier openDiskTier(const RuntimeResourcesConfig &config, const std::string &c
       throw;
     logLine("SSD cache KV storage disabled; state storage remains enabled (", error.what(), ").");
   }
-  // The volume sizes the tier before it takes anything back. A persistent
-  // tier's root holds the other caches nobody holds too.
+  // The volume sizes the tier before it takes anything back, read through
+  // diskVolume, the probe the automatic quota reads it with before the files
+  // open, for the folder they opened in: a persistent tier's root, which holds
+  // the other caches nobody holds too, else the temporary files' directory.
+  // Its links are resolved now, so that a measure after the folder went still
+  // reads the volume that holds the open files.
   std::vector<std::shared_ptr<model::SlotFile>> files{tier.states};
   if (tier.kv)
     files.push_back(tier.kv);
+  const std::filesystem::path directory =
+      tier.persistent.directory ? config.cacheRoot : std::filesystem::temp_directory_path();
+  std::error_code unresolved;
+  std::filesystem::path resolved = std::filesystem::canonical(directory, unresolved);
+  if (unresolved)
+    resolved = directory;
   tier.space = std::make_unique<DiskSpace>(
       tier.budget, config.cacheDisk.automatic, std::move(files),
+      [diskVolume = config.diskVolume, resolved] { return diskVolume(resolved); },
       tier.persistent.directory ? std::move(otherCaches) : std::vector<CacheDirectory::Idle>{});
   reportDiskTier(*tier.space, *tier.budget, config.cacheDiskWritesPerDay,
                  tier.persistent.directory
                      ? "persistent files in " + tier.persistent.directory->path().string()
-                     : "temporary files in " + std::filesystem::temp_directory_path().string(),
+                     : "temporary files in " + directory.string(),
                  tier.kv ? kvSlotBytes : 0, stateBytes);
   return tier;
 }
@@ -890,7 +890,7 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
 
   // One plan owner is used both before allocation and during encoding. The
   // engine lends it to model execution without inspecting its plans.
-  ops::ExecutionPlans operators(device);
+  ops::ExecutionPlans operators(device, config.int8Activations);
   model::LoadedModel loaded;
   // The runtime's lane state and arenas as the model loaded, with its K/V in
   // memory and where it spills.
@@ -1215,7 +1215,8 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
       kvTier = std::make_unique<KvPageTier>(*kvPages, kvFormat, disk.kv, readers);
     std::optional<CacheSpillPolicy> spillPolicy;
     if (spill.enabled)
-      spillPolicy = CacheSpillPolicy{.densePages = spill.densePages, .windowPages = spill.windowPages};
+      spillPolicy = CacheSpillPolicy{
+          .densePages = spill.densePages, .windowPages = spill.windowPages, .always = config.kvSpillAlways};
     // A windowed layout's pages give up their windowed layers' K/V where
     // they can (kv::Layout::slimmable), unless --kv-window-trim off.
     std::optional<CacheWindowPolicy> windowPolicy;
@@ -1228,8 +1229,8 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
     // A target that can spill holds one empty Index extent from the start
     // (the plan's indexRunwayBytes, one extent): a lane's first conversion
     // lands its pages there at the memory wall, where no allocation is
-    // granted. It stays through an idle release of the weights; a walk under
-    // critical pressure may take it, and the next control pass refills it.
+    // granted. It stays through an idle release of the weights, and no claim
+    // takes it, under critical pressure either (TakeRights::Reserves).
     if (spill.enabled)
       if (const metal::AllocationResult runway = kvPool->fillRunway(kv::PageForm::Index); !runway)
         throw metal::MetalAllocationError("the KV pool's Index runway was refused", runway.failure);
@@ -1474,10 +1475,16 @@ ActualMemoryReport RuntimeResources::actualMemoryReport(
     throw std::logic_error("the KV pool and its storage disagree on allocated extents");
   }
   report.kvAllocatedBytes = kvPool_->allocatedBytes();
-  if (blockCache_)
-    report.spilledKvHotBytes = blockCache_->stats().bytes;
-  if (historyStream_)
-    report.spilledKvStagingBytes = historyStream_->stats().stagingBytes;
+  if (blockCache_) {
+    const model::KvBlockCacheStats hot = blockCache_->stats();
+    report.spilledKvHotBytes = hot.bytes;
+    report.spilledKvTableBytes += hot.tableBytes;
+  }
+  if (historyStream_) {
+    const model::KvHistoryStreamStats staging = historyStream_->stats();
+    report.spilledKvStagingBytes = staging.stagingBytes;
+    report.spilledKvTableBytes += staging.tableBytes;
+  }
   report.stateStagingBytes = modelMemory.stateStagingBytes;
   report.aneFfnBytes = aneFfn_ ? aneFfn_->allocatedBytes() : 0;
   if (const auto table = streamedTableStats()) report.streamedTableBytes = table->cacheBytes;
@@ -1510,25 +1517,27 @@ AneFfnModel aneFfnModel(metal::MetalBackend &backend, const model::LoadedModel &
   const auto onArena = [&backend, &loaded, &operators, format](const auto &use) {
     model::withPrefillArena(backend, loaded, operators, format, use);
   };
-  model.time = [&backend, layers, cancelled, onArena] {
+  const ops::Linear &linear = operators.linear();
+  model.time = [&backend, &linear, layers, cancelled, onArena] {
     ops::ane_ffn::Timings timings;
-    onArena([&](const model::QwenTargetPrefillBuffers &buffers) {
-      timings = ops::ane_ffn::Measurement(backend, *layers, buffers.ffn(), buffers.hidden, cancelled).time();
+    onArena([&](const ops::PrefillFfnBuffers &ffn, const std::array<metal::MetalBuffer, 2> &hidden) {
+      timings = ops::ane_ffn::Measurement(backend, linear, *layers, ffn, hidden, cancelled).time();
     });
     return timings;
   };
-  model.prepare = [&backend, layers, cancelled, onArena](uint32_t aneUnits, bool timeChunks) {
+  model.prepare = [&backend, &linear, layers, cancelled, onArena](uint32_t aneUnits, bool timeChunks) {
     AneFfnPrepared prepared;
-    onArena([&](const model::QwenTargetPrefillBuffers &buffers) {
-      prepared.split = std::make_unique<ops::AneFfn>(backend, *layers, aneUnits, cancelled);
-      prepared.error = prepared.split->verify(*layers, buffers.ffn(), buffers.hidden);
+    onArena([&](const ops::PrefillFfnBuffers &ffn, const std::array<metal::MetalBuffer, 2> &hidden) {
+      prepared.split = std::make_unique<ops::AneFfn>(backend, linear, *layers, aneUnits, cancelled);
+      prepared.error = prepared.split->verify(*layers, ffn, hidden);
       if (timeChunks)
         prepared.chunks =
-            ops::ane_ffn::Measurement(backend, *layers, buffers.ffn(), buffers.hidden, cancelled).chunks(*prepared.split);
+            ops::ane_ffn::Measurement(backend, linear, *layers, ffn, hidden, cancelled).chunks(*prepared.split);
     });
     return prepared;
   };
-  const std::string key = calibrationKey(*layers) + " device " + backend.capabilities().deviceName + " macos " +
+  const std::string key = ops::AneFfn::calibrationKey(*layers, linear) + " device " +
+                          backend.capabilities().deviceName + " macos " +
                           [[NSProcessInfo processInfo] operatingSystemVersionString].UTF8String + " build " +
                           std::string(buildId) + " most ";
   model.recall = [key](uint32_t maxAneUnits) -> std::optional<ops::ane_ffn::Calibration> {

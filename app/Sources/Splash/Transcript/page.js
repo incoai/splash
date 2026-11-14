@@ -115,7 +115,8 @@ const page = (() => {
       stopGliding();
       stopEasing();
     }, {passive: true});
-    for (const type of ['pointerup', 'pointercancel']) addEventListener(type, () => { pressed = false; }, {passive: true});
+    // A right click's button comes up on its menu, not the page.
+    for (const type of ['pointerup', 'pointercancel', 'contextmenu']) addEventListener(type, () => { pressed = false; }, {passive: true});
     // A scroll that leaves the scroller where the page put it, while it follows, is the page's own,
     // and keeps the following; any other, the reader's by wheel, keys or a drag of the scroller,
     // follows where it ends at the bottom and stops it elsewhere. The page's own events come a
@@ -199,6 +200,8 @@ const page = (() => {
       stopEasing();
       following = true;
       toBottom();
+      // No scroll comes where the page doesn't move, as for a short conversation.
+      showLatest();
     }
 
     // Keeps `element`, a message, in place where it is above the screen.

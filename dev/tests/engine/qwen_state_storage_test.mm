@@ -719,11 +719,12 @@ void testAttentionOnlyTarget(metal::MetalBackend &backend) {
           "an attention-only storage's buffers outlived it");
 }
 
-// A lane's start and the state it captures allocate startBytes, and the
-// states its claims then evict leave idleBytes after the start to release:
-// they refill the lane's buffers the start took from the pool first. From
-// an empty pool and from pools holding none to two lanes' buffers and none
-// to two states' cells and windows, with none to three states evicted.
+// A lane's start allocates startBytes, the lane's buffers the pool lacks,
+// and the states its claims then evict leave idleBytes after the start to
+// release: they refill the lane's buffers the start took from the pool
+// first. From an empty pool and from pools holding none to two lanes'
+// buffers and none to two states' cells and windows, with none to three
+// states evicted.
 void testStartBytes(metal::MetalBackend &backend) {
   MemoryGovernor governor(backend, backend.capabilities().recommendedMaxWorkingSetBytes, 1, 1,
                           queryHostMemory, 0);
@@ -753,8 +754,7 @@ void testStartBytes(metal::MetalBackend &backend) {
         const uint64_t credited = storage.idleBytes(evicted, true, true);
         const uint64_t before = storage.actualAllocatedBytes();
         require(static_cast<bool>(storage.tryActivateLane(0, 9)), "the start of " + name + " failed");
-        const auto capture = storage.reserve(refusal);
-        require(capture != nullptr && storage.actualAllocatedBytes() == before + charged,
+        require(storage.actualAllocatedBytes() == before + charged,
                 "the start of " + name + " did not allocate what it was charged");
         cached.clear();
         require(releaseAllIdle(storage, true) == credited,

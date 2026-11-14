@@ -82,13 +82,15 @@ RuntimeResourcesConfig budgetConfig(const char *metallibPath, const std::filesys
 // What a start sized: its context, the least memory its plan needs, its
 // arenas, the budget of states and KV, its streamed table's row cache and
 // what the host held back of the streamed stores, its routed experts' store,
-// whether its SSD cache started, its backend's memory, its log and how many
-// times it loaded the weights.
+// whether its SSD cache started and what that cache measured free on its
+// volume, its backend's memory, its log and how many times it loaded the
+// weights.
 struct StreamedStart final {
   uint32_t context = 0;
   uint64_t minimumRequired = 0, arenaBytes = 0, dynamicBudget = 0, table = 0, heldBack = 0;
   std::optional<model::ExpertStoreStats> experts;
   bool tier = false;
+  uint64_t volumeAvailable = 0;
   metal::MetalMemoryStats memory;
   std::string log;
   size_t loads = 0;
@@ -115,7 +117,9 @@ StreamedStart startStreamed(const RuntimeResourcesConfig &config, uint32_t reque
     started.table = budget.streamedTableBytes;
     started.heldBack = budget.hostHeldBackBytes;
     started.experts = resources->streamedExpertStats();
-    started.tier = resources->cache().snapshot().kvTier.capacityBytes != 0;
+    const KvTierSnapshot tier = resources->cache().snapshot().kvTier;
+    started.tier = tier.capacityBytes != 0;
+    started.volumeAvailable = tier.volumeAvailableBytes;
     started.memory = resources->backend().refreshMemoryStats();
   });
   started.loads = occurrences(started.log, "Weights loaded");
@@ -160,7 +164,7 @@ void testStreamableWeightsAreWhatLoads(const RuntimeResourcesConfig &config) {
            loaded.vision.actualAllocatedBytes;
   };
   metal::MetalBackend backend(config.metallibPath.string());
-  const ops::ExecutionPlans operators(backend.capabilities());
+  const ops::ExecutionPlans operators(backend.capabilities(), ops::Int8Activations::On);
   const auto arenas = [&](const model::LoadedModel &loaded, model::StreamedParts parts) {
     const model::ModelMemoryPlan plan =
         model::plannedRuntimeMemory(loaded, operators, kv::Format::Int8, ops::GdnStateFormat::Float32, parts);
@@ -978,6 +982,88 @@ void testYarnRuntime(const char *metallibPath) {
   static_cast<void>(runtime->warmupDecodeBatch(1));
 }
 
+// A restored lane's first chunk begins with its draft rebuild, which only a
+// restore runs, and a start's restore warmup may be memory-limited, as a
+// 16 GB Mac's is. After the start's other warmups, a restore in service
+// creates no pipeline: each prefill warmup created the rebuild's.
+void testARestoreAfterTheOtherWarmupsCreatesNothing(const char *metallibPath) {
+  const test::TemporaryDirectory root("splash-restore-pipelines");
+  RuntimeResourcesConfig config = loadableConfig(metallibPath, root.path(), "restore-pipelines-test");
+  std::unique_ptr<RuntimeResources> resources;
+  static_cast<void>(test::capturedStderr([&] { resources = RuntimeResources::create(config, 0); }));
+  const EngineMemoryBreakdown &budget = resources->memoryPlan().breakdown();
+  std::unique_ptr<model::RuntimeModel> runtime;
+  require(static_cast<bool>(resources->memoryGovernor().allocationAdmission()(
+              budget.sharedPrefillBytes + budget.sharedDecodeBytes,
+              [&] { runtime = model::createRuntime(resources->modelContext()); })),
+          "the runtime's arenas were refused");
+  const KvPool::RunwayHold runway(resources->kvPool());
+  static_cast<void>(runtime->warmupPrefill(model::ExecutionLimits::prefillTokenBudget));
+  for (const uint32_t rows : resources->modelContext().operators.prefillRowClasses())
+    static_cast<void>(runtime->warmupPrefill(rows));
+  static_cast<void>(runtime->warmupDecodeBatch(1));
+  metal::MetalBackend &backend = resources->backend();
+  backend.beginServing();
+  const std::string log = test::capturedStderr([&] { static_cast<void>(runtime->warmupCompositeStateRestore()); });
+  require(backend.pipelinesCreatedWhileServing() == 0,
+          "a restore after the start's other warmups created pipelines: " + log);
+}
+
+// A verify's kernels follow its lanes' history, which the decode warmups'
+// is short of: past 7.2K tokens Apple10's INT8 attention scores INT8 queries
+// (verify_attention_q8q_split; no Apple9 GPU does). After the start's
+// warmups, a request of 8K tokens creates no pipeline: each decode warmup
+// created its verify's after the longest history.
+void testALongRequestAfterTheWarmupsCreatesNothing(const char *metallibPath) {
+  const test::TemporaryDirectory root("splash-long-request-pipelines");
+  RuntimeResourcesConfig config = loadableConfig(metallibPath, root.path(), "long-request-pipelines-test");
+  std::unique_ptr<RuntimeResources> resources;
+  static_cast<void>(test::capturedStderr([&] { resources = RuntimeResources::create(config, 0); }));
+  const EngineMemoryBreakdown &budget = resources->memoryPlan().breakdown();
+  std::unique_ptr<model::RuntimeModel> runtime;
+  require(static_cast<bool>(resources->memoryGovernor().allocationAdmission()(
+              budget.sharedPrefillBytes + budget.sharedDecodeBytes,
+              [&] { runtime = model::createRuntime(resources->modelContext()); })),
+          "the runtime's arenas were refused");
+  const KvPool::RunwayHold runway(resources->kvPool());
+  static_cast<void>(runtime->warmupPrefill(model::ExecutionLimits::prefillTokenBudget));
+  for (const uint32_t rows : resources->modelContext().operators.prefillRowClasses())
+    static_cast<void>(runtime->warmupPrefill(rows));
+  static_cast<void>(runtime->warmupDecodeBatch(1));
+  metal::MetalBackend &backend = resources->backend();
+  backend.beginServing();
+  // The prompt's pages repeat the runway's: what its attention reads does
+  // not matter here.
+  constexpr uint32_t chunk = model::ExecutionLimits::prefillTokenBudget, history = 4 * chunk;
+  const std::vector<uint32_t> prompt(history, 7);
+  std::vector<uint32_t> pages((history + model::ExecutionLimits::targetVerifyRows + kv::kPageTokens - 1) /
+                              kv::kPageTokens);
+  for (uint32_t page = 0; page < pages.size(); ++page) pages[page] = page % model::ExecutionLimits::warmupKvPages;
+  auto &executor = dynamic_cast<model::Runtime &>(*runtime);
+  constexpr uint64_t id = 736;
+  const std::string log = test::capturedStderr([&] {
+    executor.beginColdRequest({.id = id, .prompt = prompt, .maxNewTokens = 16}, 0);
+    for (uint32_t position = 0; position < history; position += chunk) {
+      ModelBatchItem item{
+          .requestId = id, .logicalPosition = position, .tokenCount = chunk, .pageTable = pages, .pageTableRevision = 1};
+      item.inputTokens = std::span(prompt).subspan(position, chunk);
+      const auto prefilled = executor.prefill({.kind = WorkKind::Prefill, .items = {{id, chunk}}},
+                                              std::span<const ModelBatchItem>(&item, 1));
+      require(prefilled.size() == 1 && prefilled[0].failure.empty() && prefilled[0].outputTokens.empty(),
+              "a chunk of the long request failed or ended it");
+    }
+    const ModelBatchItem item{
+        .requestId = id, .logicalPosition = history, .pageTable = pages, .pageTableRevision = 1};
+    const auto decoded = executor.decode({.kind = WorkKind::Decode, .items = {{id, 0}}},
+                                         std::span<const ModelBatchItem>(&item, 1));
+    require(decoded.size() == 1 && decoded[0].failure.empty() && !decoded[0].outputTokens.empty(),
+            "the long request's decode failed");
+    executor.end(id);
+  });
+  require(backend.pipelinesCreatedWhileServing() == 0,
+          "a request of 8K tokens after the start's warmups created pipelines: " + log);
+}
+
 // The SSD cache holds no write back unless a write budget is set; one that
 // is set starts with a quarter of a day's.
 void testWriteBudgetOnlyWhenSet(const char *metallibPath) {
@@ -1167,12 +1253,53 @@ void testAutomaticContextIgnoresTheVolume(const char *metallibPath) {
           "a persistent cache with no room anywhere did not leave the tier off once");
 }
 
+// Once its files open, the SSD cache measures the volume of the folder they
+// opened in, through the probe the start read volumes with: a persistent
+// tier's root, else the temporary files' directory, as for a persistent cache
+// whose root has no room. The probe gives the root, the temporary directory and
+// any other folder volumes of their own.
+void testTheCacheMeasuresItsFilesFolder(const char *metallibPath) {
+  const test::TemporaryDirectory root("splash-measured"), caches("splash-measured-root");
+  RuntimeResourcesConfig config = loadableConfig(metallibPath, root.path(), "measured-test");
+  config.cacheDisk = {.automatic = true};
+  config.cacheRoot = caches.path() / "prefix-cache";
+  std::filesystem::create_directory(config.cacheRoot);
+  constexpr uint64_t kTemporary = 300 * kGiB, kOther = 200 * kGiB;
+  uint64_t rootAvailable = 400 * kGiB;
+  config.diskVolume = [&](const std::filesystem::path &directory) {
+    std::error_code error;
+    return std::optional(localVolume(
+        std::filesystem::equivalent(directory, config.cacheRoot, error)                         ? rootAvailable
+        : std::filesystem::equivalent(directory, std::filesystem::temp_directory_path(), error) ? kTemporary
+                                                                                                : kOther));
+  };
+  // The volume the cache measured, and whether it is persistent.
+  const auto measured = [&] {
+    std::pair<uint64_t, bool> result;
+    static_cast<void>(test::capturedStderr([&] {
+      const CacheSnapshot cache = RuntimeResources::create(config, 0)->cache().snapshot();
+      result = {cache.kvTier.volumeAvailableBytes, cache.persistent};
+    }));
+    return result;
+  };
+  config.persistentCache = true;
+  require(measured() == std::pair{rootAvailable, true}, "a persistent SSD cache did not measure its root's volume");
+  config.persistentCache = false;
+  require(measured() == std::pair{kTemporary, false},
+          "an SSD cache of temporary files did not measure their directory's volume");
+  config.persistentCache = true;
+  rootAvailable = 11 * kGiB;
+  require(measured() == std::pair{kTemporary, false},
+          "a persistent cache whose root had no room did not measure its temporary files' volume");
+}
+
 // A block-sparse target's context past what memory holds spills to the SSD
 // cache, so where the automatic cache's volume has no room for it, a first
 // start serves only what memory holds. A relaunch keeps its first engine's
 // context whatever room the volume has left since, that of a server started
 // with --max-context, which asks for it again, as well: its spilling plan
 // opens the cache's temporary files however little room their volume has.
+// Once its files open, the cache measures the volume the start read for them.
 void testRelaunchKeepsTheSpilledContext(const char *metallibPath) {
   const test::TemporaryDirectory root("splash-relaunch");
   RuntimeResourcesConfig config = flashNextConfig(metallibPath, root.path());
@@ -1181,6 +1308,8 @@ void testRelaunchKeepsTheSpilledContext(const char *metallibPath) {
   // A budget whose memory holds less of the window than spilling does.
   config.maximumMemoryBytes = startStreamed(config).minimumRequired + 512 * kMiB;
   const StreamedStart first = startStreamed(config);
+  require(first.volumeAvailable == 500 * kGiB,
+          "an SSD cache whose files opened did not read the volume its start read to open them");
   require(startStreamed(config, first.context).context >= first.context,
           "a --max-context of the context a start spills for was not held");
   config.diskVolume = reading(localVolume(11 * kGiB));
@@ -1425,6 +1554,25 @@ const MemoryAccountSnapshot *accountOf(const MemoryGovernorSnapshot &memory, std
   return found == memory.accounts.end() ? nullptr : &*found;
 }
 
+// At Ready the plan counts every buffer the backend allocates: the memory
+// audit finds none outside its categories. The governor charges each buffer
+// whole beside the runtime reserves, so a byte the plan leaves out is a byte
+// one request's KV lacks: the decode arena's scratch counted short of its
+// whole pages left Qwen3.8-Flash-Next's context at --max-memory 9.4G a KV
+// extent more than one request could use.
+void testThePlanCountsEveryBuffer(const char *metallibPath) {
+  const test::TemporaryDirectory root("splash-plan-buffers");
+  std::string log;
+  const std::unique_ptr<ServingRuntime> bootstrap =
+      bootstrapOf(loadableConfig(metallibPath, root.path(), "plan-buffers"), log);
+  RuntimeResources &resources = bootstrap->resources();
+  const MemoryAuditResult audit = auditActualMemory(
+      resources.memoryPlan(), resources.actualMemoryReport(bootstrap->modelRuntime().actualRuntimeMemory()));
+  require(audit.valid && !audit.backendUnclassifiedBytes,
+          "the backend holds " + std::to_string(audit.backendUnclassifiedBytes) +
+              " bytes of buffers the memory plan does not count");
+}
+
 // The ledger's accounts sum to what the governor charges: at Ready a start of
 // streamed experts books the KV pages and the lane states as their storage
 // counts them and the expert store as its pool reports it, and the fixed
@@ -1506,6 +1654,65 @@ std::unique_ptr<model::Runtime> runtimeOf(RuntimeResources &resources) {
               [&] { runtime = std::make_unique<model::Runtime>(resources.modelContext()); })),
           "a runtime's arenas were refused");
   return runtime;
+}
+
+// The plan counts every buffer of a start whose KV spills too
+// (testThePlanCountsEveryBuffer): the page tables its readers allocate, the
+// hot block cache's and one for each staging buffer, are the plan's
+// (KvSpillPlan::tableBytes), which holds them beside one request's KV, as a
+// lone start's claim finds them held (ContextBounds::resident). Left out,
+// Qwen3.8-Flash-Next's 589,824 bytes of them and its Index runway cost a lone
+// start the last KV extent the plan advertised wherever the room past it was
+// short of them. The plan is made before the pool's extent is, so the readers
+// size their tables for whichever extent it takes (kv::Layout::
+// mostOverExtents). BF16 KV's extents range widest: under a hot target of
+// 4,196 pages the cache's table, an entry for each page of the target's whole
+// extents, takes a host page more in extents of some sizes than of others,
+// and starts at budgets whose pools take extents of several sizes hold the
+// tables the plan counts.
+void testThePlanCountsTheSpilledKvReadersTables(const char *metallibPath) {
+  const test::TemporaryDirectory root("splash-plan-spill-tables");
+  RuntimeResourcesConfig config = flashNextConfig(metallibPath, root.path());
+  config.cacheDisk = {.automatic = true};
+  config.diskVolume = reading(localVolume(500 * kGiB));
+  // A start of `config` with a lane, whose state the audit counts as a
+  // warmup's; the extent its pool takes.
+  const auto holdsThePlannedTables = [&] {
+    const std::unique_ptr<RuntimeResources> resources = RuntimeResources::create(config, 0);
+    const std::unique_ptr<model::Runtime> runtime = runtimeOf(*resources);
+    const std::vector<uint32_t> prompt(64, 7);
+    ModelRequest request;
+    request.id = 1;
+    request.prompt = prompt;
+    request.maxNewTokens = 1;
+    runtime->beginColdRequest(request, 0);
+    const ActualMemoryReport report = resources->actualMemoryReport(runtime->actualRuntimeMemory());
+    const MemoryAuditResult audit = auditActualMemory(resources->memoryPlan(), report);
+    const EngineMemoryBreakdown &budget = resources->memoryPlan().breakdown();
+    const KvSpillPlan &spill = budget.kvSpill;
+    require(spill.enabled && spill.tableBytes && report.spilledKvTableBytes == spill.tableBytes && audit.valid &&
+                !audit.backendUnclassifiedBytes,
+            "a start that spills " + std::string(kv::formatName(config.kvFormat)) + " KV in extents of " +
+                std::to_string(budget.kvExtentPages) + " pages holds " + std::to_string(report.spilledKvTableBytes) +
+                " bytes of its readers' tables where its plan counts " + std::to_string(spill.tableBytes) +
+                ", and " + std::to_string(audit.backendUnclassifiedBytes) + " bytes the plan does not count (" +
+                audit.message + ")");
+    return budget.kvExtentPages;
+  };
+  config.maximumMemoryBytes = startStreamed(config).minimumRequired + 512 * kMiB;
+  static_cast<void>(holdsThePlannedTables());
+  config.kvFormat = kv::Format::BFloat16;
+  config.maximumMemoryBytes = 0;
+  const uint64_t least = startStreamed(config).minimumRequired;
+  kv::Layout layout = config.model.targetKvLayout;
+  layout.format = config.kvFormat;
+  config.sparseKvMemory = 4'196 * layout.kvBytesPerModelPage();
+  std::set<uint32_t> extents;
+  for (uint64_t step = 0; step < 8; ++step) {
+    config.maximumMemoryBytes = least + 2 * kGiB + step * 7 * kMiB;
+    extents.insert(holdsThePlannedTables());
+  }
+  require(extents.size() > 1, "BF16 starts across budgets took KV extents of one size");
 }
 
 // The bound of one attention layer's pairs a command may compute: a full
@@ -1801,19 +2008,24 @@ int main(int argc, char **argv) {
       testStartGrowsThroughHostPressure(argv[1]);
       testStartChecksTheReserveWithWhatItServes(argv[1]);
       testYarnRuntime(argv[1]);
+      testARestoreAfterTheOtherWarmupsCreatesNothing(argv[1]);
+      testALongRequestAfterTheWarmupsCreatesNothing(argv[1]);
       testWriteBudgetOnlyWhenSet(argv[1]);
       testStaleCachesGoAtEveryStart(argv[1]);
       testMadeCacheRootStaysOutOfBackups(argv[1]);
       testAutomaticTierYieldsToTheContext(argv[1]);
       testAutomaticContextIgnoresTheVolume(argv[1]);
+      testTheCacheMeasuresItsFilesFolder(argv[1]);
       testRelaunchKeepsTheSpilledContext(argv[1]);
       testAStoreKeepsTheFloorOfTheRunsSpill(argv[1]);
       testAnExplicitRelaunchServesItsFirstContext(argv[1]);
       testTableShareHoldsAPromptsIds(argv[1]);
       testTheTableIgnoresTheHostsSpareMemory(argv[1]);
       testEngineFollowsTheGovernor(argv[1]);
+      testThePlanCountsEveryBuffer(argv[1]);
       testDenseRuntimeBoundary(argv[1]);
       testSpilledRuntimeBoundary(argv[1]);
+      testThePlanCountsTheSpilledKvReadersTables(argv[1]);
       {
         const test::TemporaryDirectory root("splash-moe");
         const RuntimeResourcesConfig moe = moeConfig(argv[1], root.path());
