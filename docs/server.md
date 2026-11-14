@@ -236,9 +236,15 @@ under the server's umask, and search permission on its directory. A relative
 `PATH` is taken from the directory the server starts in. One server serves a
 path: it holds a lock, `PATH.lock` beside the socket, from before it binds
 until it has removed the socket as it stops. A second server at the path is
-therefore refused, also while the first still loads its model, and the socket
-a killed server left behind is replaced by the next start; a socket another
-program listens on and a file of another kind stay, and the start is refused.
+therefore refused, also while the first still loads its model. With the lock
+held, no Splash server is behind a socket already at the path, and a start
+replaces one that refuses its connection, as the socket a killed server left
+behind does, and one its sandbox does not let it connect to. A socket that
+accepts a connection stays, as do one whose permissions refuse the server's
+user and a file of another kind, and the start is refused. A sandbox's profile
+must let the server bind `PATH` and accept there, and write `PATH`, which it
+creates and removes, and `PATH.lock`; it may refuse the server a connection
+to `PATH`.
 `--port` names the server's lock and [record](#serve-record),
 `serve-PORT.lock` and `serve-PORT.json` in the runtime directory, as it does
 for every `--host`, so two socket servers take two ports though neither
