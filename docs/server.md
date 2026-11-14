@@ -778,9 +778,12 @@ passed it, for Flint 14 of its 49 layers, 464 KiB where a whole page takes
 1.59 MiB, so the same quota holds 3.5 times as many tokens of such pages as of
 whole ones. A file keeps a whole page's room for each copy and leaves the
 part a copy does not fill unallocated, so its length (`ls -l`) can pass the
-quota while the space it takes (`du`) stays within it, beside up to about
-16 MiB that APFS allocates past the files' ends as they grow and keeps until it
-drops it on its own. That needs a volume
+quota while the space it takes (`du`) stays within it, beside what APFS
+allocates past the files' ends as they grow and keeps until it drops it on its
+own: about 16 MiB past a file that grows by many small writes, and a few
+percent of one that grows by a few large ones (15.8 MiB past two of the 27B's
+153 MiB states; 29.6 MiB past both files, 451.5 MiB long together, in another
+run). That needs a volume
 that gives the unused part of a file back, as APFS does; on one that does not,
 such as HFS+ or exFAT, every copy counts a whole page's or state's room, and
 the log says so once.
@@ -843,7 +846,7 @@ counts them, with a budget or without. The day's bytes are the number to set
 `--max-cache-disk-writes` from and to hold against the drive's rated
 endurance; 24 times the hour's projects them for the load of the moment. Each
 is exact to a minute, and a server that has run for less than an hour or a day
-has written all of its count. It counts the KV pages copied
+has written all of its count. `/status` also counts the KV pages copied
 ahead (`kv_copies`), and under `write_behind` the restore points queued for
 their copies, the one being copied among them (`waiting`), copied
 (`durable`), gone on from first (`unneeded`) and not copied for want of room

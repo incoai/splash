@@ -2444,9 +2444,9 @@ settle at (available - floor) / (tiers + 3) of what was available before them,
 and blocks a local snapshot keeps when such a tier frees them cost it at most a
 third more than it freed. Tiers with sizes on one volume take its room in turn,
 down to the floor, with no margin above it: while a local snapshot keeps the
-blocks such a tier frees, each copy it writes in place of another takes a slot
-of free space, and the copies a measure then has it give up free nothing, so
-free space can fall below the floor, as far as a full volume, before the tier
+blocks such a tier frees, each copy it writes in place of another takes what it
+stores of free space, and the copies a measure then has it give up free nothing,
+so free space can fall below the floor, as far as a full volume, before the tier
 has given up every copy it holds or the snapshot goes. A limit below what the
 tier holds is met at the next control pass by giving copies up in the order a
 full quota replaces them, never a copy in transfer or the only copy of a state
@@ -2629,10 +2629,17 @@ or an `fsync` leaves them, cloning the file drops them. In that cache they
 were 14.5 MiB past the KV file's end and 768 KiB past the state file's, from
 1.1 to 15.8 MiB past the KV file's after each of the ten prompts that filled
 it, and gone within six minutes of the engine's exit; a second run's stayed
-five minutes after it. No slot holds them, so the quota does not count them
+five minutes after it. A file that a few large writes grow keeps more for its
+size: with the 27B's states of 153 MiB, `state.slots` held 8.4 MiB past its end
+with one state (5.5% of its length), in a cache 1.6.1 wrote and in a fresh one
+alike, and 15.8 MiB with two (5.2%), beside 1.9 MiB past a `kv.slots` of 142
+MiB (1.3%); in another run the two files, 451.5 MiB long together, held 29.6
+MiB more than that (6.5%). These are measurements, not a bound: what APFS keeps
+follows how the file grew. No slot holds them, so the quota does not count them
 and the cache cannot give them back; the limit's rule, which reads the files'
 blocks (`DiskSpace::measure`), counts them as the tier's, as it counts the
-records files (1.2 MiB beside those 3 GiB), which hold no slot either. A full
+records files (1.2 MiB beside the Flint cache's 3 GiB), which hold no slot
+either. A full
 quota of temporary files replaces the oldest
 redundant copy first, then the oldest sole copy, across both
 KV and states; sole copies of states in use, and the KV they restore through,
@@ -2672,10 +2679,13 @@ HFS+ and exFAT, which keep no holes at all) keeps in each slot whatever an
 earlier payload or its own allocation put there, so there every slot counts
 whole: each file asks its volume once as it opens, with a punch past its end,
 a punch that fails later counts the slots acquired after it whole too, and the
-runtime reports it once. A quota of 16 Full slots then holds 16 Slim pages on
-24.4 MiB of blocks, where on APFS it holds 56 on 25.4 MiB. The files keep the
-blocks of freed slots there, each up to its high-water mark, and the limit's
-rule counts them as the tier's.
+runtime reports it once. The slot whose punch failed keeps its blocks, which
+`disk.file_bytes` goes on counting: what is written there next counts with
+them, the larger of the two, until a punch returns the range
+(`SlotFile::Backing::back`). A quota of 16 Full slots then holds 16 Slim pages
+on 24.4 MiB of blocks, where on APFS it holds 56 on 25.4 MiB. The files keep
+the blocks of freed slots there, each up to its high-water mark, and the
+limit's rule counts them as the tier's.
 
 Transfers use `pread`/`pwrite` with `F_NOCACHE`, every one an aligned range.
 Those of the files' IO workers, every write and a state's reads, move whole

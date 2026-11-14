@@ -235,8 +235,10 @@ public:
   [[nodiscard]] uint64_t writtenBytes() const noexcept {
     return written_.load(std::memory_order_relaxed);
   }
-  // Bytes the budget's files hold on disk: what each slot written since its
-  // blocks last went back counts (SlotFile::quotaBytesFor).
+  // Bytes the budget's files hold on disk: for each slot's range, what the
+  // slot written there since its blocks last went back counts
+  // (SlotFile::quotaBytesFor), the most of them where a punch failed between
+  // two.
   [[nodiscard]] uint64_t fileBytes() const noexcept {
     return file_.load(std::memory_order_relaxed);
   }
@@ -383,7 +385,9 @@ public:
     uint32_t labelBytes = 0;
   };
 
-  // The slot that holds payloadBytes: writes zero the rest of its page.
+  // The host pages a payload of payloadBytes fills, in bytes: what a write of
+  // it stores, zeros to the end of its last page, and the size of the slots
+  // of a file whose largest payload it is.
   [[nodiscard]] static constexpr uint64_t slotBytesFor(uint64_t payloadBytes) noexcept {
     return alignUp(payloadBytes);
   }

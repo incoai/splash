@@ -379,6 +379,32 @@ void testWindowedPointsCountWhatTheirCopiesHold() {
   next.cache.checkInvariants();
 }
 
+// A copy counts what its slot takes, whatever its block's page holds since: a point copied before
+// its blocks past the tail were trimmed keeps Full copies of them, and a limit that would hold the
+// point by its pages, Slim now, refuses it by its copies.
+void testCopiesCountWhatTheirSlotsTakeAfterATrim() {
+  const std::vector<uint32_t> prompt = promptOf(3100, 6);
+  constexpr CacheWindowPolicy window{2};
+  // Six Full copies of 100 and the state's 100 are 700; four Slim ones and two Full would be 420.
+  const auto budget = std::make_shared<model::DiskBudget>(700);
+  Process process(true, budget, std::nullopt, window);
+  process.tier.budget = budget;
+  process.storage.budgetPages = 16;
+  const std::vector<uint64_t> blocks = process.cachePrompt(1, prompt);
+  process.publish(blocks[5]);
+  require(process.persist(blocks[5]) == PersistStatus::Durable && process.cache.trimWindows() == 4,
+          "a point was not copied whole, or its blocks past the tail were not trimmed after it");
+  const KvTierSnapshot tier = process.cache.snapshot().kvTier;
+  require(tier.diskBlocks == 6 && tier.diskBytes == 600 && budget->usedBytes() == 600,
+          "copies of Full pages stopped counting whole once their pages were trimmed");
+  budget->setLimitBytes(699);
+  require(process.cache.persist(blocks[5]) == PersistStatus::Refused,
+          "a point was counted by what its pages hold, not by what its copies take");
+  budget->setLimitBytes(700);
+  require(process.persist(blocks[5]) == PersistStatus::Durable, "a limit that holds a point's copies refused it");
+  process.cache.checkInvariants();
+}
+
 // Blocks recomputed over Slim-only copies get Full copies, so a state published there restores
 // whole, in this process and the next.
 void testRecomputedTailsKeepFullCopies() {
@@ -1668,6 +1694,7 @@ int main() {
     testWindowedCopiesNameTheirForm();
     testWindowedPointsKeepTheirTailsFull();
     testWindowedPointsCountWhatTheirCopiesHold();
+    testCopiesCountWhatTheirSlotsTakeAfterATrim();
     testRecomputedTailsKeepFullCopies();
     testRestorePointsComeBack();
     testSaltedPointsComeBackUnderTheirSalt();

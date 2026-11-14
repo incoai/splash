@@ -717,6 +717,76 @@ static void testVolumeWithoutHolesCountsWholeSlots() {
   refusingPunches = false;
 }
 
+// A punch that fails leaves its slot's blocks in the file, which goes on counting them, and what
+// is written there next counts with them, the larger of the two: a larger payload stays whole
+// when the file ends below it and when the file grows again, a smaller one leaves the blocks
+// under it counted, and the punch that succeeds returns all of them.
+static void testAFailedPunchLeavesItsBlocksCounted() {
+  constexpr size_t page = kHostPageBytes, size = 4 * page;
+  const std::vector<std::byte> small = patterned(page, 1), whole = patterned(size, 2), other = patterned(size, 3);
+  std::vector<std::byte> output(size), piece(page);
+  {
+    // A page in the lower slot, whose punch fails, then a whole payload there.
+    Directory directory;
+    auto budget = std::make_shared<DiskBudget>(4 * size);
+    SlotFile file(size, budget, directory.persistence());
+    file.finishAdoption();
+    auto lower = file.acquire(page), upper = file.acquire(size);
+    require(file.write(lower, {small}, {})->wait() && file.write(upper, {whole}, {})->wait(), "a slot write failed");
+    refusingPunches = true;
+    lower.reset();
+    // A synchronization completes behind the punch queued before it.
+    const bool refused = file.synchronize({})->wait();
+    refusingPunches = false;
+    require(refused && budget->fileBytes() == page + size, "a slot whose punch failed stopped counting on disk");
+    lower = file.acquire(size);
+    require(lower && file.write(lower, {other}, {})->wait() && budget->fileBytes() == 2 * size &&
+                blocksOf(directory.slots()) == 2 * size,
+            "a payload over what a failed punch left did not count what it holds");
+    // The slot above goes, and the file ends with the whole payload below it.
+    upper.reset();
+    require(file.synchronize({})->wait() && sizeOf(directory.slots()) == size && budget->fileBytes() == size &&
+                file.read(lower, {output}, {})->wait() && output == other,
+            "the file ended short of a payload written over what a failed punch left");
+    // A write past the file's end returns the hole before it, and no more.
+    upper = file.acquire(size);
+    require(upper && file.write(upper, {whole}, {})->wait() && file.read(lower, {output}, {})->wait() &&
+                output == other,
+            "a write past the file's end returned blocks of a payload written over what a failed punch left");
+    file.seal();
+  }
+  // A whole payload in the lower slot, whose punch fails once a page is on its way there: the
+  // page's slot was acquired while the volume returned blocks, so it takes a page of the quota,
+  // and the file goes on counting the whole payload's blocks, which it holds.
+  Directory directory;
+  auto budget = std::make_shared<DiskBudget>(4 * size);
+  SlotFile file(size, budget, directory.persistence());
+  file.finishAdoption();
+  auto lower = file.acquire(size), upper = file.acquire(page);
+  require(file.write(lower, {whole}, {})->wait() && file.write(upper, {small}, {})->wait(), "a slot write failed");
+  // Park the worker in a completion, so the punch runs once the page's write is queued behind it.
+  std::promise<void> reached, release;
+  auto released = release.get_future().share();
+  auto parked = file.synchronize([&] { reached.set_value(); released.wait(); });
+  reached.get_future().wait();
+  lower.reset();
+  lower = file.acquire(page);
+  auto written = file.write(lower, {small}, {});
+  refusingPunches = true;
+  release.set_value();
+  const bool landed = written->wait();
+  refusingPunches = false;
+  require(parked->wait() && landed && budget->usedBytes() == 2 * page && budget->fileBytes() == size + page &&
+              blocksOf(directory.slots()) == size + page && file.read(lower, {piece}, {})->wait() && piece == small,
+          "a smaller payload over what a failed punch left did not read back, or the blocks under it stopped counting");
+  // The punch that succeeds returns the page and what the failed one left under it.
+  lower.reset();
+  require(file.synchronize({})->wait() && budget->fileBytes() == page && blocksOf(directory.slots()) == page &&
+              file.read(upper, {piece}, {})->wait() && piece == small,
+          "a punch after one that failed left blocks counted or on the volume");
+  file.seal();
+}
+
 // A file whose earlier process kept every slot whole on the volume, as one that returned no hole
 // around a shorter payload left it: its records and payloads are what this process writes, so the
 // next one takes them back as they are, counts each by its payload's pages, and returns the rest.
@@ -855,7 +925,6 @@ static void testWritesDrawOnTheWriteBudget() {
   require(file.takesWrite(false) && !budget->admitsAgainAt(), "a lifted budget held a write back");
 }
 
-// A write that hits a full volume (ENOSPC, EDQUOT) only reports it; the file keeps taking writes.
 // The write rate counts what every write took, with a write budget or without, over the last hour
 // and the last day of the budget's clock.
 static void testWritesCountOverTheLastHourAndDay() {
@@ -897,6 +966,7 @@ static void testWritesCountOverTheLastHourAndDay() {
   require(rate().hourBytes == 2 * size, "a write budget changed what the write rate counts");
 }
 
+// A write that hits a full volume (ENOSPC, EDQUOT) only reports it; the file keeps taking writes.
 static void testFullVolumeIsReported() {
   constexpr size_t size = kHostPageBytes;
   auto budget = std::make_shared<DiskBudget>(4 * size);
@@ -1342,6 +1412,7 @@ int main() {
     testSlotsCountTheirPayloads();
     testTheFileEndsWithItsLastSlot();
     testVolumeWithoutHolesCountsWholeSlots();
+    testAFailedPunchLeavesItsBlocksCounted();
     testAdoptionReturnsTheHolesAnEarlierProcessKept();
     testTheLimitBoundsLiveSlots();
     testWritesDrawOnTheWriteBudget();

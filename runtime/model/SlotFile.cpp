@@ -63,9 +63,13 @@ struct SlotFile::Backing {
   // Until a punch fails: the volume returns the blocks of a punched range,
   // so a slot keeps only its payload's host pages (quotaBytesFor).
   std::atomic<bool> volumeReturnsBlocks{true};
-  // Worker-only: what each slot whose blocks the file holds counts in the
-  // budget's file bytes, from a write's first chunk until a punch returns
-  // them; zero for a slot that holds none.
+  // Worker-only: how far from its start each slot's range may hold blocks of
+  // the file, zero for a slot that holds none: what a slot written there
+  // takes of the quota (Slot::bytes), from its write's first chunk until a
+  // punch returns the range, and the most of them when a punch failed
+  // between two, which leaves the earlier one's blocks under what the later
+  // one stores. The budget's file bytes count it, and the file ends with the
+  // last slot's (released).
   std::vector<uint64_t> backed;
   // Worker-only: where what the file's slots hold ends, which is where the
   // file ends (stored, released).
@@ -93,15 +97,16 @@ struct SlotFile::Backing {
   bool load(std::span<std::byte> chunk, off_t offset) const noexcept;
   bool store(std::span<const std::byte> chunk, off_t offset) const noexcept;
 
-  // Counts the blocks of a slot that takes `bytes` of the quota held, unless
-  // the file holds them already.
+  // Counts the blocks slot `index`'s range holds up to `bytes`, what a slot
+  // written there takes of the quota. A range that holds blocks already, an
+  // earlier holder's that a failed punch left, counts what `bytes` adds.
   void back(uint32_t index, uint64_t bytes) {
     if (backed.size() <= index)
       backed.resize(index + 1);
-    if (backed[index])
+    if (backed[index] >= bytes)
       return;
+    budget->file_.fetch_add(bytes - backed[index], std::memory_order_relaxed);
     backed[index] = bytes;
-    budget->file_.fetch_add(bytes, std::memory_order_relaxed);
   }
   // Returns the blocks of a range that holds no payload to the volume
   // (F_PUNCHHOLE); offsets and sizes of slots and of what writes store are

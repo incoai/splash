@@ -479,8 +479,9 @@ def write_notes(run: Run) -> list[str]:
     """An agent or edit run's readouts, from its summary
     (clients.write_summary): what the SSD cache wrote during the turns, per
     request and per 1,000 prompt tokens, by cause, and after the last turn;
-    what the requests reused and the cache read back; and each kind of
-    turn's time to first token."""
+    what the requests reused and the cache read back; each kind of turn's
+    time to first token; and, for a target that writes Slim pages, that the
+    KV by cause counts them whole (clients.written_by_cause)."""
     summary = next((e for e in run.events if e.get("kind") == "summary"), None)
     if summary is None:
         return []
@@ -515,6 +516,13 @@ def write_notes(run: Run) -> list[str]:
         f"({mebibytes(counters['disk.read_bytes'])} read), "
         f"{counters['cache.lost_state_misses']:g} lookups past a lost state",
     ]
+    if summary.get("slim_page_bytes"):
+        notes.append(
+            "KV by cause counts every page at "
+            f"{mebibytes(summary['kv_page_bytes'])}: this target's Slim pages "
+            f"store {mebibytes(summary['slim_page_bytes'])}, so its KV is "
+            "overstated and its states understated"
+        )
     notes += [
         f"first token, {kind}: median {times['median']:g} ms, max "
         f"{times['max']:g} ms over {times['n']} requests"

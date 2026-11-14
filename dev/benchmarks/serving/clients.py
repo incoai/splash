@@ -1156,7 +1156,11 @@ def written_by_cause(deltas: dict, page_bytes: int) -> dict:
     /status counts it: the KV pages reclaims demoted, those copied ahead for
     restore points and those Spill requests wrote through, each a page of
     `page_bytes`, and the rest, the states, which no counter splits between
-    the reclaims that wrote them and the restore points' copies."""
+    the reclaims that wrote them and the restore points' copies. No counter
+    tells a Slim page's write from a whole page's either: a target with
+    sliding-window layers writes less than `page_bytes` for the pages its
+    windows passed, so its KV is overstated here and its states understated
+    (check.write_notes says so of such a run)."""
     causes = {
         "kv_demotions": deltas.get("disk.kv_demotions", 0) * page_bytes,
         "kv_copies": deltas.get("disk.kv_copies", 0) * page_bytes,
@@ -1169,7 +1173,11 @@ def written_by_cause(deltas: dict, page_bytes: int) -> dict:
 
 
 def write_summary(
-    requests: list[dict], turns: list[dict], tail: dict, page_bytes: int
+    requests: list[dict],
+    turns: list[dict],
+    tail: dict,
+    page_bytes: int,
+    slim_page_bytes: int | None = None,
 ) -> dict:
     """What a conversation scenario measured, from its request records, its
     turns' counter changes and those after the last turn (the tail): the
@@ -1177,7 +1185,9 @@ def write_summary(
     conversation) and per 1,000 prompt tokens, by cause, and after them; the
     share of the prompts' tokens the cache held (the reuse rate); and each
     kind of turn's time to first token. A rate whose denominator is zero is
-    None."""
+    None. `kv_page_bytes` is what the causes count a KV page at, and
+    `slim_page_bytes` what a Slim page of the target holds, None for a target
+    without sliding-window layers."""
 
     def total(records, key):
         return sum(record.get(key) or 0 for record in records)
@@ -1202,6 +1212,8 @@ def write_summary(
         if prompt
         else None,
         "written_by_cause": written_by_cause(during, page_bytes),
+        "kv_page_bytes": page_bytes,
+        "slim_page_bytes": slim_page_bytes,
         "tail_written_bytes": tail.get("disk.written_bytes", 0),
         "tail_written_by_cause": written_by_cause(tail, page_bytes),
         "counters": during,
@@ -1252,6 +1264,9 @@ class Turns:
         )
         self.status = wait_idle(port, 0)
         self.page_bytes = dig(self.status, "memory_plan.model.kv_page_bytes") or 0
+        self.slim_page_bytes = dig(
+            self.status, "memory_plan.budget.kv_window.slim_page_bytes"
+        )
         self.recorder.sample(self.status, turn=0)
 
     def material(self, text: str, slot: int, tokens: int) -> str:
@@ -1328,7 +1343,9 @@ class Turns:
         self.recorder.sample(status, tail=True)
         self.recorder.emit("tail", seconds=round(time.time() - started, 1), **tail)
         summary = {
-            **write_summary(self.requests, self.turns, tail, self.page_bytes),
+            **write_summary(
+                self.requests, self.turns, tail, self.page_bytes, self.slim_page_bytes
+            ),
             "material_sha256": self.digest.hexdigest()[:16],
         }
         self.recorder.emit("summary", **summary)

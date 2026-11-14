@@ -952,7 +952,7 @@ private:
     // In a cache whose requests spill, the blocks of its chain it holds on
     // their own pages with a copy of their K/V (holdsCopy): the copies of
     // active KV it holds (holdsActiveKvQuota). Every request holding a block
-    // counts its copy; the quota counts it once (KvCache::heldCopies). A
+    // counts its copy; the quota counts it once (KvCache::heldCopyBytes). A
     // block it keeps a page of its own beside, while a restore fills the
     // block's (KvCache::insert), it does not hold.
     uint32_t heldCopies = 0;
