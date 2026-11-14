@@ -2672,10 +2672,13 @@ HFS+ and exFAT, which keep no holes at all) keeps in each slot whatever an
 earlier payload or its own allocation put there, so there every slot counts
 whole: each file asks its volume once as it opens, with a punch past its end,
 a punch that fails later counts the slots acquired after it whole too, and the
-runtime reports it once. A quota of 16 Full slots then holds 16 Slim pages on
-24.4 MiB of blocks, where on APFS it holds 56 on 25.4 MiB. The files keep the
-blocks of freed slots there, each up to its high-water mark, and the limit's
-rule counts them as the tier's.
+runtime reports it once. The slot whose punch failed keeps its blocks, which
+`disk.file_bytes` goes on counting: what is written there next counts with
+them, the larger of the two, until a punch returns the range
+(`SlotFile::Backing::back`). A quota of 16 Full slots then holds 16 Slim pages
+on 24.4 MiB of blocks, where on APFS it holds 56 on 25.4 MiB. The files keep
+the blocks of freed slots there, each up to its high-water mark, and the
+limit's rule counts them as the tier's.
 
 Transfers use `pread`/`pwrite` with `F_NOCACHE`, every one an aligned range.
 Those of the files' IO workers, every write and a state's reads, move whole
