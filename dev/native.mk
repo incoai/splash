@@ -895,7 +895,7 @@ ASAN_TEST_ENV := ASAN_OPTIONS=detect_leaks=0:halt_on_error=1 \
 TSAN_TEST_ENV := TSAN_OPTIONS=halt_on_error=1
 # engine-sim under the sanitizers runs every scenario but those too long for
 # them: testRegrowthAfterABurstTakesOnlyCacheThatFreesNow runs past 5 minutes
-# under ThreadSanitizer, and testChurnKeepsItsBoundsWhereLanesConvert's 19
+# under ThreadSanitizer, and testChurnKeepsItsBoundsWhereLanesConvert's 12
 # churns take about 2 each there, where each of the others takes at most 2.
 # test-engine-cpu runs every scenario.
 ENGINE_SIM_SANITIZER_SKIPPED := sim/testRegrowthAfterABurstTakesOnlyCacheThatFreesNow \

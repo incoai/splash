@@ -488,33 +488,28 @@ void testChurnKeepsTheStoreThroughAHostEpisode() {
   churnsKeepTheirBounds(std::span(&kWorkload, 1));
 }
 
-// The same churn in every workload around its own in which a lane converts to
-// Spill, the decision at the memory wall the decode gap bound guards there,
-// and in its own, which takes none: of the 45 of rounds of 10,700 to 13,700
-// tokens and the 40 of first prompts of 53,043 to 65,043, both with outputs
-// of 904 to 2,404, the one above and these 18. In the 11 whose lane's history
-// had its copies, 7 broke the bound while the lane sat out the command it
-// converted in, and in the 8 whose lane owed them, 5 while the next pass ran
-// before the copies landed, at up to 1,069 ms against 838.
+// The same churn in its own workload, which converts no lane, and in each
+// workload around it where 1.6.1 broke the decode gap bound as a lane
+// converted to Spill, the decision at the memory wall the bound guards there:
+// of the 45 of rounds of 10,700 to 13,700 tokens and the 40 of first prompts
+// of 53,043 to 65,043, both with outputs of 904 to 2,404, a lane converts in
+// 19 and 1.6.1 broke the bound in 12, at up to 1,069 ms against 838: in the 7
+// here whose lane's history had its copies, as the lane sat out the command
+// it converted in, and in 5 owing them, the 4 here and the one above, as the
+// next pass ran before the copies landed. The other 7 take the same two paths
+// within the bound and are left out, 36 s of this scenario's 98.
 void testChurnKeepsItsBoundsWhereLanesConvert() {
-  constexpr std::array<ChurnPrompts, 19> kWorkloads{{{},
-                                                     {.step = 10'700, .output = 1504},
+  constexpr std::array<ChurnPrompts, 12> kWorkloads{{{},
                                                      {.step = 11'200, .output = 1504},
-                                                     {.step = 11'200, .output = 1904},
-                                                     {.step = 11'600, .output = 1204},
                                                      {.step = 11'600, .output = 1504},
                                                      {.step = 11'900, .output = 1504},
                                                      {.step = 12'500, .output = 1204},
-                                                     {.step = 12'800, .output = 1904},
                                                      {.step = 13'200, .output = 1904},
                                                      {.first = 53'043, .output = 1204},
-                                                     {.first = 53'043, .output = 1504},
                                                      {.first = 54'543, .output = 1204},
                                                      {.first = 57'543, .output = 1204},
                                                      {.first = 57'543, .output = 1504},
                                                      {.first = 63'543, .output = 1204},
-                                                     {.first = 63'543, .output = 1904},
-                                                     {.first = 65'043, .output = 1504},
                                                      {.first = 65'043, .output = 1904}}};
   churnsKeepTheirBounds(kWorkloads);
 }
