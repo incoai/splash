@@ -225,12 +225,13 @@ extension ChatScreenTests {
 extension ChatScreenTests {
     /// A new chat's composer keeps its text in its place as what is over its text comes and goes:
     /// a picture and a PDF attached, the line that says why the server refused the message, gone
-    /// as the text changes, back, and gone with an attachment taken off, the last one taken off.
-    /// In every frame drawn through each, the text starts where it did; what comes grows the
-    /// composer up. Split a third over and two thirds under with the room the window leaves, the
-    /// line that says why moved the text 17 points down and the mark 8 up. A draft as tall as the
-    /// composer takes, with all of that over it, still fits the least window, the mark under the
-    /// toolbar and the button over the window's foot.
+    /// as the text changes, back, a picture attached under it, and gone with an attachment taken
+    /// off, the last ones taken off. In every frame drawn through each, the text starts where it
+    /// did; what comes grows the composer up. Split a third over and two thirds under with the
+    /// room the window leaves, the line that says why moved the text 17 points down and the mark 8
+    /// up. A click on the text reaches it, in the middle and at a conversation's foot. A draft as
+    /// tall as the composer takes, with all of that over it, still fits the least window, the
+    /// mark under the toolbar and the button over the window's foot.
     @Test func aNewChatsTextKeepsItsPlaceAsWhatIsOverItComesAndGoes() async throws {
         let fake = try FakeRuntime("splash-chat-over-text", launcher: "chat_server")
         defer { try? FileManager.default.removeItem(at: fake.root) }
@@ -268,13 +269,25 @@ extension ChatScreenTests {
             }, { state.chats.streaming == nil && state.draft.notice != nil }),
             ("its reason gone as the text changes", { state.draft.text += " " }, { state.draft.notice == nil }),
             ("refused again", { state.sendDraft() }, { state.chats.streaming == nil && state.draft.notice != nil }),
-            ("the PDF taken off, and the reason", { state.draft.remove(at: 1) }, { state.draft.notice == nil && state.draft.attachments.count == 1 }),
-            ("the picture taken off", { state.draft.remove(at: 0) }, { state.draft.attachments.isEmpty }),
+            ("a picture attached under the reason", { state.draft.attach([try #require(NSImage(data: Showcase.picture))]) },
+             { state.draft.attachments.count == 3 && state.draft.notice != nil }),
+            ("the PDF taken off, and the reason", { state.draft.remove(at: 1) }, { state.draft.notice == nil && state.draft.attachments.count == 2 }),
+            ("the pictures taken off", {
+                state.draft.remove(at: 1)
+                state.draft.remove(at: 0)
+            }, { state.draft.attachments.isEmpty }),
         ]
         for (what, change, done) in steps {
             let tops = try await tops(change, until: done)
             #expect(tops.allSatisfy { $0 == start.maxY }, "\(what): the text's top per frame \(tops), before \(start.maxY)")
         }
+        // A click on the text reaches it, the composer in the middle and at a conversation's foot.
+        #expect(try Self.clicksReachTheText(in: window), "in the middle")
+        state.chats.selection = try #require(state.chats.conversations.first { $0.title == "Kyoto in spring" }).id
+        pump(1)
+        #expect(try Self.clicksReachTheText(in: window), "at the foot")
+        state.chats.newChat()
+        pump(1)
 
         // The least window, a draft taller than the composer takes, all of it over the text.
         window.setContentSize(CGSize(width: 800, height: 560))
@@ -298,7 +311,8 @@ extension ChatScreenTests {
         // The mark's middle, over the text's middle; the button's, 14 points in from the text's end.
         let mark = teal(at: field.midX).filter { $0 < window.frame.height - field.maxY }, button = teal(at: field.maxX - 14)
         #expect(mark.count > 5 && mark.allSatisfy { $0 >= 52 }, "the mark, under the toolbar: \(mark.first ?? -1)")
-        #expect(button.count > 5 && button.allSatisfy { $0 < window.frame.height - 1 }, "the button, over the foot: \(button.last ?? -1)")
+        // Over the room the composer keeps under it at the foot: its inset and margin, 36 points.
+        #expect(button.count > 5 && (button.last ?? .infinity) <= window.frame.height - 36, "the button, over the foot: \(button.last ?? -1)")
     }
 
     /// What the composer held goes at once as its chat opens: from the first frame the window
@@ -621,9 +635,10 @@ extension ChatScreenTests {
 
 /// A new chat's first message drawn to `first-message-*.png` in `SPLASH_APP_SNAPSHOTS`, light and
 /// dark, for people to review its motion, with chats in the list and a draft of several lines, a
-/// picture and a PDF: Send while the server holds the message, its refusal, another chat opened
-/// and the new chat again, Send again and Stop, Send once more, the server taking it and the
-/// reply, each at 0, 25, 50, 75 and 100% of `settle`,
+/// picture and a PDF attached to it: Send while the server holds the message, its refusal, another
+/// chat opened and the new chat again, Send again and Stop, Send once more, the server taking it
+/// and the reply, then a new chat with a picture attached and taken off and a draft as tall as the
+/// composer takes, each at 0, 25, 50, 75 and 100% of `settle`,
 /// at twice that, once what comes has faded in, and at five times that, 1.2 s, by when a window
 /// drawn off screen shows the button's new glyph too.
 @MainActor
@@ -649,10 +664,8 @@ struct FirstMessagePictures {
             let window = await Snapshot.window(MainView().environment(state), size: Self.size, appearance: appearance)
             defer { window.orderOut(nil) }
             state.draft.text = Self.draft
-            state.draft.attach([try #require(NSImage(data: Showcase.picture))])
-            state.draft.attach(pdfs: [try Showcase.pdf(pages: 12, at: fake.root.appending(path: "documents/Kyoto itinerary.pdf"))])
-            try await waitFor(state.draft.attachments.count == 2, "the attachments")
             pump(0.5)
+            let pdf = try Showcase.pdf(pages: 12, at: fake.root.appending(path: "documents/Kyoto itinerary.pdf"))
             func signal(_ step: String) { FileManager.default.createFile(atPath: fake.root.appending(path: step).path, contents: nil) }
             func clear(_ step: String) throws { try FileManager.default.removeItem(at: fake.root.appending(path: step)) }
             func frames(_ name: String, at percents: [Int] = [0, 25, 50, 75, 100, 200, 500]) async {
@@ -673,6 +686,12 @@ struct FirstMessagePictures {
                 }
             }
             await frames("0-new", at: [0])
+            state.draft.attach([try #require(NSImage(data: Showcase.picture))])
+            try await until({ state.draft.attachments.count == 1 }, "the picture")
+            await frames("0a-picture")
+            state.draft.attach(pdfs: [pdf])
+            try await until({ state.draft.attachments.count == 2 }, "the PDF")
+            await frames("0b-pdf")
             signal("hold")
             signal("refuse")
             state.sendDraft()
@@ -701,6 +720,22 @@ struct FirstMessagePictures {
             try clear("wait")
             try await until({ state.chats.streaming == nil && state.chats.current?.title == "A Title" }, "the reply and its title")
             await frames("7-answered", at: [500])
+            // A new chat again, a picture attached and taken off, and a draft as tall as the
+            // composer takes with a picture and a PDF, in the window and in the least one.
+            state.chats.newChat()
+            await frames("8-new-chat")
+            state.draft.attach([try #require(NSImage(data: Showcase.picture))])
+            try await until({ state.draft.attachments.count == 1 }, "the picture")
+            await frames("9-picture")
+            state.draft.remove(at: 0)
+            await frames("9a-taken-off")
+            state.draft.text = Array(repeating: "Another line of the plan, to see what fits.", count: 20).joined(separator: "\n")
+            state.draft.attach([try #require(NSImage(data: Showcase.picture))])
+            state.draft.attach(pdfs: [pdf])
+            try await until({ state.draft.attachments.count == 2 }, "the attachments")
+            await frames("10-tall", at: [500])
+            window.setContentSize(CGSize(width: 800, height: 560))
+            await frames("10a-tall-least", at: [500])
         }
     }
 }
@@ -943,6 +978,13 @@ extension ChatScreenTests {
     static func field(in window: NSWindow) throws -> CGRect {
         let text = try #require(window.contentView?.firstTextView?.enclosingScrollView)
         return text.convert(text.bounds, to: nil)
+    }
+
+    /// Whether a click in the middle of the composer's text in `window` goes to its text view.
+    static func clicksReachTheText(in window: NSWindow) throws -> Bool {
+        let content = try #require(window.contentView), field = try field(in: window)
+        let point = try #require(content.superview).convert(NSPoint(x: field.midX, y: field.midY), from: nil)
+        return content.hitTest(point) === content.firstTextView
     }
 
     /// The frames `window` draws through `change`: the one before it, `count` drawn some 30 ms
