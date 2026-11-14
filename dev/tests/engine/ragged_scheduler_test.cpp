@@ -161,7 +161,8 @@ public:
     model::CommandSample sample = test::sampleOf(times);
     if (sampled)
       sampled(sample, plan);
-    scheduler.complete(plan, results, sample);
+    now += times.wallMilliseconds;
+    scheduler.complete(plan, results, sample, now);
     if (plan.kind == WorkKind::Prefill && passes) {
       if (last) {
         passes.reset();
@@ -169,7 +170,6 @@ public:
         passes->plan = scheduler.nextPass(passes->plan);
       }
     }
-    now += times.wallMilliseconds;
     return times.wallMilliseconds;
   }
   double step(double scale = 1.0) { return run(plan(), scale); }
@@ -201,7 +201,7 @@ void completeDecode(Sim &sim, bool finished = false) {
   std::vector<StepResult> results;
   for (const BatchItem &item : plan.items)
     results.push_back({item.requestId, 0, finished, DecodeStage::Regular, 1});
-  sim.scheduler.complete(plan, results, {.wallMilliseconds = 50.0});
+  sim.scheduler.complete(plan, results, {.wallMilliseconds = 50.0}, sim.now);
 }
 
 // Commits a prefill unit and completes it in `sample`'s time, its lanes
@@ -213,7 +213,7 @@ void completePrefill(Sim &sim, const BatchPlan &plan, const model::CommandSample
   for (const BatchItem &item : plan.items)
     results.push_back(
         {item.requestId, plan.pass + 1 == plan.passes ? item.tokenCount : 0, false, DecodeStage::Regular});
-  sim.scheduler.complete(plan, results, sample);
+  sim.scheduler.complete(plan, results, sample, sim.now);
 }
 
 // Rounds that measure turns' commands: an 8K prefix, then a 300-row turn on
@@ -266,7 +266,7 @@ void awaitFirstMask(Sim &sim, uint64_t id) {
   }
   sim.scheduler.commit(prompt, sim.in());
   const std::array result{StepResult{id, prompt.items[0].tokenCount, false, DecodeStage::ApplyInitialMask}};
-  sim.scheduler.complete(prompt, result, {});
+  sim.scheduler.complete(prompt, result, {}, sim.now);
   sim.passes.reset();
   require(sim.scheduler.phase(id) == Phase::WaitingMask, "a constrained prompt did not wait for its first mask");
 }
@@ -321,7 +321,7 @@ void testMaskStagesNeverMix() {
   sim.scheduler.commit(prompts, sim.in());
   const std::array promptResults{StepResult{1, 1, false, DecodeStage::ApplyInitialMask},
                                  StepResult{2, 1, false, DecodeStage::ApplyInitialMask}};
-  sim.scheduler.complete(prompts, promptResults, {});
+  sim.scheduler.complete(prompts, promptResults, {}, sim.now);
   sim.scheduler.maskReady(1);
   const BatchPlan initial = sim.plan();
   require(initial.width() == 1 && initial.items[0].requestId == 1 &&
@@ -329,7 +329,7 @@ void testMaskStagesNeverMix() {
           "a ready first mask did not get its selection plan");
   sim.scheduler.commit(initial, sim.in());
   const std::array selected{StepResult{1, 0, false, DecodeStage::Regular}};
-  sim.scheduler.complete(initial, selected, {});
+  sim.scheduler.complete(initial, selected, {}, sim.now);
   sim.scheduler.maskReady(2);
   const BatchPlan other = sim.plan();
   require(other.width() == 1 && other.items[0].requestId == 2 && other.decodeStage == DecodeStage::ApplyInitialMask,
@@ -363,7 +363,7 @@ void testDecodeRepaysItsShareOfContendedPrefill() {
     for (const BatchItem &item : prefill.items)
       results.push_back({item.requestId, prefill.pass + 1 == prefill.passes ? item.tokenCount : 0, false,
                          DecodeStage::Regular});
-    sim.scheduler.complete(prefill, results, {.wallMilliseconds = 500.0});
+    sim.scheduler.complete(prefill, results, {.wallMilliseconds = 500.0}, sim.now);
     for (uint32_t step = 0; step < (share > 0.0 ? 5u : 1u); ++step)
       completeDecode(sim);
     require(sim.plan().kind == WorkKind::Prefill, "decode did not return the next command once its share was repaid");
@@ -391,55 +391,178 @@ void testExcludedLanesAreNotPlanned() {
   require(sim.plan().kind == WorkKind::Prefill, "a prefill owed decode time to decoders it was planned without");
 }
 
-// A decoder left out as its memory lands, as a lane's copies do after its conversion to Spill, is owed its
-// share as one that decodes: after a unit, which owes it half its time, the next unit waits for it for as long as
-// that unit took, the wait working the debt off, so that it runs once the memory lands within that time, past the
-// debt too, and the unit runs at the end of that time whatever the memory takes, at the very time of the wakeup
-// the scheduler gives, where now less the start rounds below the unit's time (472.1 ms past 741,483.8 s does). A
-// decoder that decoded since the unit holds nothing.
+// Decoder 1 beside prompt 2 after a unit of the prompt that took `unit` ms and ended at `end`, which owes the decoder
+// decode time: the decoder's memory is on its way back from then, as a lane's copies are after its conversion to
+// Spill.
+void awaitMemoryAfterAUnit(Sim &sim, double unit, double end) {
+  sim.decoder(1);
+  sim.lane(2, 0, 200'000);
+  completeDecode(sim);
+  sim.now = end;
+  completePrefill(sim, sim.plan(), {.wallMilliseconds = unit});
+  sim.excluded = sim.landing = {1};
+}
+
+// A decoder left out as its memory lands is owed its share as one that decodes: after a unit, which owes it half its
+// time, the next unit waits for it until the unit has ended for as long as it took, so that the decoder runs once the
+// memory lands within that time, past the debt too, and the unit runs at the end of that time whatever the memory
+// takes, at the very time the scheduler gives, the engine's wakeup (472.1 ms past 741,483.8 s as past 1 s). The time
+// waited works the debt off: after the decoder's one command the unit runs. A decoder that decoded since the unit
+// holds nothing.
 void testADecoderWhoseMemoryLandsHoldsTheNextUnitForAUnit() {
-  // Decoder 1 after a unit of `unit` ms, its memory on its way back from `at`.
-  const auto waiting = [](Sim &sim, double unit, double at) {
-    sim.decoder(1);
-    sim.lane(2, 0, 20'000);
-    completeDecode(sim);
-    completePrefill(sim, sim.plan(), {.wallMilliseconds = unit});
-    sim.excluded = sim.landing = {1};
-    sim.now = at;
-  };
   {
     DenseSim sim(0.5);
-    waiting(sim, 500.0, 1'000.0);
-    require(!sim.next() && sim.scheduler.holdEndMilliseconds() == 1'500.0,
+    awaitMemoryAfterAUnit(sim, 500.0, 1'000.0);
+    require(!sim.next() && sim.scheduler.waitsUntil(sim.in()) == 1'500.0,
             "the next unit did not wait for the decoder whose memory lands, for the time the last unit took");
     sim.now = 1'400.0;
-    require(!sim.next(), "the next unit ran once its debt had passed, before the time the last unit took");
+    require(!sim.next() && sim.scheduler.waitsUntil(sim.in()) == 1'500.0,
+            "the next unit ran once its debt had passed, before the time the last unit took");
     sim.excluded.clear();
     sim.landing.clear();
+    require(!sim.scheduler.waitsUntil(sim.in()), "a unit waits for a decoder that can run");
     const BatchPlan decode = sim.plan();
     require(decode.kind == WorkKind::Decode && decode.items[0].requestId == 1,
             "the decoder whose memory landed past the debt, within the last unit's time, did not run first");
+    // The engine reports the 400 ms the unit waited: of the 250 ms owed nothing is left for a second decode command.
+    sim.scheduler.waited(400.0);
+    completeDecode(sim);
+    require(sim.plan().kind == WorkKind::Prefill, "the time the unit waited did not work the prefill's debt off");
   }
   {
     DenseSim sim(0.5);
-    waiting(sim, 472.1, 741'483.8);
-    require(!sim.next() && sim.scheduler.holdEndMilliseconds(),
-            "the next unit did not wait for the decoder whose memory lands");
-    const double end = *sim.scheduler.holdEndMilliseconds();
-    sim.now = end - 1.0;
+    awaitMemoryAfterAUnit(sim, 472.1, 741'483'800.0);
+    const std::optional<double> end = sim.scheduler.waitsUntil(sim.in());
+    require(!sim.next() && end == 741'483'800.0 + 472.1, "the next unit did not wait for the decoder whose memory lands");
+    sim.now = *end - 1.0;
     require(!sim.next(), "the next unit ran before the last unit's time had passed");
-    sim.now = end;
-    require(sim.plan().kind == WorkKind::Prefill,
+    sim.now = *end;
+    require(sim.plan().kind == WorkKind::Prefill && !sim.scheduler.waitsUntil(sim.in()),
             "the next unit waited past the last unit's time, at its wakeup, for memory that had not landed");
   }
   {
     DenseSim sim(0.5);
-    waiting(sim, 500.0, 1'000.0);
+    awaitMemoryAfterAUnit(sim, 500.0, 1'000.0);
     sim.excluded.clear();
     sim.landing.clear();
     completeDecode(sim);
     sim.excluded = sim.landing = {1};
-    require(sim.plan().kind == WorkKind::Prefill, "a decoder that decoded since the last unit held the next one");
+    require(sim.plan().kind == WorkKind::Prefill && !sim.scheduler.waitsUntil(sim.in()),
+            "a decoder that decoded since the last unit held the next one");
+  }
+}
+
+// The wait ends with its reason, and nothing has to end it: the scheduler gives no time to wake at once no unit
+// waits. With both lanes gone during the wait, as cancelled, none; with the wait run out and its unit left out in
+// turn, as refused its memory at the wall, none, the decoder's memory still on its way. Before, the wait's end
+// stayed, in the past, until a command committed: the engine's loop polled with no timeout, an idle engine's for as
+// long as it stayed idle.
+void testAUnitsWaitEndsWithItsReason() {
+  {
+    DenseSim sim(0.5);
+    awaitMemoryAfterAUnit(sim, 500.0, 1'000.0);
+    require(!sim.next() && sim.scheduler.waitsUntil(sim.in()) == 1'500.0, "the next unit did not wait");
+    for (const uint64_t id : {1, 2}) {
+      sim.scheduler.cancel(id);
+      sim.scheduler.remove(id);
+    }
+    sim.excluded.clear();
+    sim.landing.clear();
+    sim.now = 1'100.0;
+    require(!sim.next() && !sim.scheduler.waitsUntil(sim.in()), "a wait outlived the lanes it was for");
+  }
+  {
+    DenseSim sim(0.5);
+    awaitMemoryAfterAUnit(sim, 500.0, 1'000.0);
+    sim.now = 1'500.0;
+    require(sim.plan().kind == WorkKind::Prefill, "the unit did not run at the wait's end");
+    // Refused its memory, the unit's lane is left out too.
+    sim.excluded = sim.landing = {1, 2};
+    require(!sim.next() && !sim.scheduler.waitsUntil(sim.in()), "a wait that ran out is still given, in the past");
+    sim.now = 4'000.0;
+    require(!sim.next() && !sim.scheduler.waitsUntil(sim.in()), "a wait that ran out is still given, in the past");
+  }
+}
+
+// The wait lasts one unit's time for a prefill unit, whatever commits meanwhile. Two decoders whose memory lands in
+// turn do not start it again: with the second's landed 100 ms in, decoding 50 ms and waiting again, the unit runs
+// 500 ms after the last one ended, not 650. With a decode share of 3, a unit owing three times its time, a decoder
+// whose memory does not land holds each next unit that unit's time and no longer, until the 1,500 ms owed are waited
+// off: three units. A unit that ran while the decoder, which had decoded, was left out owes it nothing more, and is
+// the unit in its gap: the next one waits from that unit's end. And the wait is no longer than a unit beside a
+// decoder is sized to take: after a decoder's own prompt's last command, whole and uncontended at 5,000 ms for its
+// 2,048 rows, the next prompt's first unit, 512 rows, waits the decode gap target, 500 ms.
+void testAUnitsWaitLastsOneUnitsTime() {
+  {
+    DenseSim sim(0.5);
+    sim.decoder(3);
+    awaitMemoryAfterAUnit(sim, 500.0, 1'000.0);
+    sim.excluded = sim.landing = {1, 3};
+    require(!sim.next() && sim.scheduler.waitsUntil(sim.in()) == 1'500.0, "the next unit did not wait");
+    sim.now = 1'100.0;
+    sim.scheduler.waited(100.0);
+    sim.excluded = sim.landing = {1};
+    const BatchPlan decode = sim.plan();
+    require(decode.kind == WorkKind::Decode && decode.items.size() == 1 && decode.items[0].requestId == 3,
+            "the decoder whose memory landed did not run");
+    sim.scheduler.commit(decode, sim.in());
+    sim.now = 1'150.0;
+    sim.scheduler.complete(decode, std::vector<StepResult>{{3, 0, false, DecodeStage::Regular, 1}},
+                           {.wallMilliseconds = 50.0}, sim.now);
+    sim.excluded = sim.landing = {1, 3};
+    require(!sim.next() && sim.scheduler.waitsUntil(sim.in()) == 1'500.0,
+            "a command between began the unit's wait again, or ended it");
+    sim.now = 1'500.0;
+    require(sim.plan().kind == WorkKind::Prefill, "the unit waited past one unit's time");
+  }
+  {
+    DenseSim sim(3.0);
+    awaitMemoryAfterAUnit(sim, 500.0, 1'000.0);
+    uint32_t waits = 0;
+    for (uint32_t unit = 0; unit < 6; ++unit) {
+      if (const std::optional<double> until = sim.scheduler.waitsUntil(sim.in())) {
+        require(!sim.next() && *until == sim.now + 500.0, "a unit that waits was planned, or waits another time");
+        sim.scheduler.waited(*until - sim.now);
+        sim.now = *until;
+        ++waits;
+      }
+      const BatchPlan plan = sim.plan();
+      sim.now += 500.0;
+      completePrefill(sim, plan, {.wallMilliseconds = 500.0});
+    }
+    require(waits == 3, "a decoder whose memory does not land held " + std::to_string(waits) +
+                            " units, not the three whose 1,500 ms its share of 3 owes it");
+  }
+  {
+    DenseSim sim(0.5);
+    sim.decoder(1);
+    sim.lane(2, 0, 200'000);
+    completeDecode(sim);
+    sim.now = 1'000.0;
+    completePrefill(sim, sim.plan(), {.wallMilliseconds = 500.0});
+    completeDecode(sim);
+    sim.excluded = sim.landing = {1};
+    const BatchPlan unit = sim.plan();
+    require(unit.kind == WorkKind::Prefill && !sim.scheduler.waitsUntil(sim.in()),
+            "a decoder that decoded since the last unit held the next one");
+    sim.now = 1'600.0;
+    completePrefill(sim, unit, {.wallMilliseconds = 500.0});
+    require(!sim.next() && sim.scheduler.waitsUntil(sim.in()) == 2'100.0,
+            "the unit after one that ran in the decoder's gap did not wait from that unit's end");
+  }
+  {
+    DenseSim sim(0.5);
+    sim.lane(1, 0, 2'048);
+    sim.now = 5'000.0;
+    completePrefill(sim, sim.plan(), {.wallMilliseconds = 5'000.0});
+    require(sim.scheduler.phase(1) == Phase::Decode, "the prompt did not end in its command");
+    sim.lane(2, 0, 20'000);
+    sim.excluded = sim.landing = {1};
+    require(!sim.next() && sim.scheduler.waitsUntil(sim.in()) == 5'000.0 + kGap,
+            "the next prompt's first unit waits as long as the whole command that ended the decoder's prompt took");
+    sim.now = 5'000.0 + kGap;
+    const BatchPlan unit = sim.plan();
+    require(unit.kind == WorkKind::Prefill && rowsOf(unit) == 512, "the unit beside the decoder was not cut");
   }
 }
 
@@ -542,7 +665,7 @@ void testMaskedLanesShareDecode() {
     sim.scheduler.commit(prompts, sim.in());
     const std::array promptResults{StepResult{1, 1, false, DecodeStage::ApplyInitialMask},
                                    StepResult{2, 1, false, DecodeStage::ApplyInitialMask}};
-    sim.scheduler.complete(prompts, promptResults, {});
+    sim.scheduler.complete(prompts, promptResults, {}, sim.now);
     sim.scheduler.maskReady(1);
     sim.scheduler.maskReady(2);
     if (!selected) {
@@ -1617,7 +1740,7 @@ void testCommandBetweenPassesHoldsItsLanes() {
                 "a command was abandoned while a pass of it ran");
   const std::array results{StepResult{1, 0, false, DecodeStage::Regular},
                            StepResult{2, 0, false, DecodeStage::Regular}};
-  sim.scheduler.complete(first, results, {.wallMilliseconds = 500.0});
+  sim.scheduler.complete(first, results, {.wallMilliseconds = 500.0}, sim.now);
   require(sim.scheduler.phase(1) == Phase::Prefill && sim.scheduler.promptProcessed(1) == 20'000,
           "a pass before a command's last consumed its rows");
   sim.scheduler.abandoned();
@@ -1783,6 +1906,8 @@ constexpr test::TestCase kTests[] = {
     {"testDecodeRepaysItsShareOfContendedPrefill", testDecodeRepaysItsShareOfContendedPrefill},
     {"testExcludedLanesAreNotPlanned", testExcludedLanesAreNotPlanned},
     {"testADecoderWhoseMemoryLandsHoldsTheNextUnitForAUnit", testADecoderWhoseMemoryLandsHoldsTheNextUnitForAUnit},
+    {"testAUnitsWaitEndsWithItsReason", testAUnitsWaitEndsWithItsReason},
+    {"testAUnitsWaitLastsOneUnitsTime", testAUnitsWaitLastsOneUnitsTime},
     {"testPriorityPrecedesWorkKindAlternation", testPriorityPrecedesWorkKindAlternation},
     {"testPrefillCommandContainsOnePriorityTier", testPrefillCommandContainsOnePriorityTier},
     {"testHighestRunnablePriority", testHighestRunnablePriority},

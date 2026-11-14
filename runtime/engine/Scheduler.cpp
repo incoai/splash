@@ -370,7 +370,14 @@ std::optional<BatchPlan> Scheduler::next(const PlanInputs &in) const {
                                                  : std::move(decode);
 }
 
-bool Scheduler::waitsForDecoders(const BatchPlan &prefill, const PlanInputs &in) const {
+std::optional<double> Scheduler::waitsUntil(const PlanInputs &in) const {
+  if (active_ || nextDecode(in.excluded))
+    return std::nullopt;
+  const std::optional<BatchPlan> prefill = nextPrefill(in);
+  return prefill ? waitsForDecoders(*prefill, in) : std::nullopt;
+}
+
+std::optional<double> Scheduler::waitsForDecoders(const BatchPlan &prefill, const PlanInputs &in) const {
   // A decoder whose memory is on its way back, its own copies after its
   // conversion to Spill, is a decoder still: the decode share protects its
   // gap as it does a ready one's. Run instead, the next unit put a second
@@ -381,28 +388,22 @@ bool Scheduler::waitsForDecoders(const BatchPlan &prefill, const PlanInputs &in)
   // decode by a unit it would have waited out anyway, where a shorter wait
   // the memory outlasts adds itself to the gap: with copies ten times slower,
   // waits of the 235 ms the pass owed made the longest gap 1,780 ms, 1,543
-  // without them or with waits of the pass's 471.
+  // without them or with waits of the pass's 471. The wait ends at a time the
+  // last unit set as it ended (complete): it lasts once for that unit,
+  // whatever commits meanwhile, and nothing has to end it.
+  if (!(decodeDebtMilliseconds_ > 0.0) || !(in.now < waitEndMilliseconds_))
+    return std::nullopt;
   const RequestPriority priority = get(prefill.items.front().requestId).spec.priority;
-  const bool owed = decodeDebtMilliseconds_ > 0.0 && std::ranges::any_of(in.landing, [&](uint64_t id) {
-                      const auto found = requests_.find(id);
-                      return found != requests_.end() && found->second.phase == Phase::Decode &&
-                             found->second.spec.priority <= priority &&
-                             found->second.lastDecodeDispatch <= prefillDispatchOrder_;
-                    });
-  if (!owed)
-    return false;
-  if (!heldSince_)
-    heldSince_ = in.now;
-  // Until the end holdEndMilliseconds gives, the engine's wakeup, compared as
-  // the same sum: now less the start can round below the bound there, as it
-  // does 472.1 ms past 741,483.8 s, and the wait would not end at its wakeup.
-  return in.now < *heldSince_ + unitMilliseconds_;
+  const bool owed = std::ranges::any_of(in.landing, [&](uint64_t id) {
+    const auto found = requests_.find(id);
+    return found != requests_.end() && found->second.phase == Phase::Decode &&
+           found->second.spec.priority <= priority && found->second.lastDecodeDispatch <= prefillDispatchOrder_;
+  });
+  return owed ? std::optional(waitEndMilliseconds_) : std::nullopt;
 }
 
-std::optional<double> Scheduler::holdEndMilliseconds() const noexcept {
-  if (!heldSince_)
-    return std::nullopt;
-  return *heldSince_ + unitMilliseconds_;
+void Scheduler::waited(double milliseconds) noexcept {
+  decodeDebtMilliseconds_ = std::max(0.0, decodeDebtMilliseconds_ - std::max(0.0, milliseconds));
 }
 
 std::optional<BatchPlan> Scheduler::nextPrefill(const PlanInputs &in) const {
@@ -643,13 +644,6 @@ void Scheduler::commit(const BatchPlan &plan, const PlanInputs &in) {
                 : plan.pass || (plan.passes > 1 && !prefill))
     throw std::logic_error("batch no longer matches scheduler state");
   const RequestPriority priority = get(plan.items.front().requestId).spec.priority;
-  // The time the next prefill unit waited for a decoder whose memory lands
-  // worked the debt off, as that decoder's decode would have
-  // (waitsForDecoders).
-  if (heldSince_) {
-    decodeDebtMilliseconds_ = std::max(0.0, decodeDebtMilliseconds_ - std::max(0.0, in.now - *heldSince_));
-    heldSince_.reset();
-  }
   if (prefill)
     prefillDispatchOrder_ = decodeDispatchOrder_;
   if (prefill && !plan.pass) {
@@ -704,7 +698,7 @@ void Scheduler::commit(const BatchPlan &plan, const PlanInputs &in) {
 }
 
 void Scheduler::complete(const BatchPlan &plan, std::span<const StepResult> results,
-                         const model::CommandSample &sample) {
+                         const model::CommandSample &sample, double now) {
   if (!active_ || active_->kind != plan.kind ||
       active_->items.size() != plan.items.size() ||
       results.size() != plan.items.size()) {
@@ -792,9 +786,18 @@ void Scheduler::complete(const BatchPlan &plan, std::span<const StepResult> resu
       decodeDebtMilliseconds_ = std::max(0.0, decodeDebtMilliseconds_ - wallMilliseconds);
     else if (owesDecode && decodeShare_ > 0.0) {
       decodeDebtMilliseconds_ += decodeShare_ * wallMilliseconds;
-      unitMilliseconds_ = wallMilliseconds;
     }
   }
+  // The next unit waits for decoders whose memory lands (waitsForDecoders)
+  // until this one has ended for as long as it took, at most the decode gap
+  // target: a unit beside a decoder is sized to that, where the command that
+  // ended a decoder's own prompt ran whole (in ragged-scheduler's case 5,000
+  // ms for 2,048 rows, where the unit after it, cut to 512, takes 1,250). A
+  // unit that ran while the decoder was left out sets it too, though it owes
+  // nothing more: it is the unit in that decoder's gap. An untimed one leaves
+  // no wait.
+  if (prefill)
+    waitEndMilliseconds_ = now + (timed ? std::min(wallMilliseconds, config_.decodeGapMilliseconds) : 0.0);
   dropStaleDecodeDebt();
   excluded_.clear();
   active_.reset();

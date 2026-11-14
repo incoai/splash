@@ -225,6 +225,92 @@ void testAConversionWithCopiesRunsInTheCommandItConvertsFor() {
           "the converted lane did not decode its whole output");
 }
 
+// Decoder 1 beside prompt 2, each command 10 ms: the decoder's step right after a unit of the prompt meets the
+// memory wall, where it converts to Spill owing its copies, none of which lands, so the prompt's next unit waits for
+// them (Scheduler::waitsUntil) up to the 10 ms the unit took. Returns the time of the tick that converted it.
+double convertBesideAPrompt(Spilling &spill) {
+  // Each decode step commits a page of tokens, so each after the first needs a page more.
+  spill.model.decodeTokens = KvCache::pageTokens;
+  spill.model.commandTimes = [](const BatchPlan &, std::span<const ModelBatchItem>) {
+    return test::CommandTimes{.wallMilliseconds = 10.0};
+  };
+  EngineRequest decoder = request(1, std::vector<uint32_t>(7 * KvCache::pageTokens + 25, 1));
+  decoder.maxNewTokens = 4'000;
+  decoder.deadlineMilliseconds = 1e9;
+  EngineRequest prompt = request(2, std::vector<uint32_t>(512 + 12 * 2048, 2));
+  prompt.deadlineMilliseconds = 1e9;
+  spill.engine.submit(std::move(decoder));
+  spill.engine.submit(std::move(prompt));
+  // The wall stands once a unit of the prompt is in flight, its pages allocated, and no Full page is free.
+  double converted = 0.0;
+  uint64_t units = 0;
+  for (uint32_t step = 0; step < 200 && !spill.engine.snapshot().spill.converted; ++step) {
+    converted = spill.now;
+    static_cast<void>(spill.engine.tick(spill.now++));
+    const uint64_t planned = spill.engine.snapshot().scheduler.prefillBatches;
+    if (planned > units && planned >= 2 && spill.engine.commandInFlight() &&
+        !spill.pool.freePageCount(kv::PageForm::Full))
+      spill.storage.budgetPages =
+          static_cast<uint32_t>(spill.storage.allocatedBytes() / spill.storage.bytesPerPage(kv::PageForm::Full));
+    units = planned;
+  }
+  const std::optional<double> wakeup = spill.engine.nextWakeupMilliseconds();
+  require(spill.engine.snapshot().spill.converted == 1 && !spill.engine.commandInFlight() && wakeup &&
+              *wakeup > converted && *wakeup <= converted + 10.0,
+          "the prompt's next unit did not wait, for at most the 10 ms its last one took, for the decoder that "
+          "converted owing its copies");
+  return converted;
+}
+
+// The wait of a prompt's unit for a decoder whose memory lands ends with the lanes it was for: both cancelled during
+// it, the idle engine asks for no wakeup. It asked for the wait's end, a time in the past, until the next command
+// committed, so its loop polled with no timeout for as long as it stayed idle.
+void testAUnitsWaitEndsWithItsLanes() {
+  Spilling spill(400, false, 1'000'000, 0, {4}, {}, {}, false, {.count = 2048});
+  static_cast<void>(convertBesideAPrompt(spill));
+  spill.engine.cancel(1);
+  spill.engine.cancel(2);
+  static_cast<void>(spill.engine.tick(spill.now));
+  std::optional<double> wakeup = spill.engine.nextWakeupMilliseconds();
+  require(!wakeup || *wakeup > spill.now, "the wait's end outlived its lanes: the engine asks to be woken at once");
+  spill.runUntilIdle();
+  for (uint32_t step = 0; step < 50; ++step) {
+    static_cast<void>(spill.engine.tick(spill.now++));
+    spill.tier.complete();
+  }
+  wakeup = spill.engine.nextWakeupMilliseconds();
+  require(idle(spill.engine) && !wakeup,
+          "an idle engine asks to be woken at " + std::to_string(wakeup.value_or(0.0)) + " ms, now " +
+              std::to_string(spill.now));
+}
+
+// The wait runs out with the copies still on their way, and its unit, refused its pages at the wall, cannot run
+// either: the engine asks for no wakeup at a time already past while it waits for the copies, 200 ms here. It asked
+// for the wait's end after 89 of the 98 ticks that did nothing, until the decoder's retry committed a command.
+void testAUnitsWaitRunsOutWithoutACommand() {
+  Spilling spill(400, false, 1'000'000, 0, {4}, {}, {}, false, {.count = 2048});
+  static_cast<void>(convertBesideAPrompt(spill));
+  uint32_t idleTicks = 0, past = 0;
+  for (uint32_t step = 0; step < 200; ++step) {
+    const bool progressed = spill.engine.tick(spill.now);
+    const std::optional<double> wakeup = spill.engine.nextWakeupMilliseconds();
+    const bool nothing = !progressed && !spill.engine.commandInFlight();
+    idleTicks += nothing;
+    past += nothing && wakeup && *wakeup <= spill.now;
+    spill.now += 1.0;
+  }
+  require(idleTicks > 50 && !past,
+          "after " + std::to_string(past) + " of " + std::to_string(idleTicks) +
+              " ticks that did nothing the engine asked to be woken at a time already past");
+  // The wall goes and the copies land: the decoder goes on.
+  spill.storage.budgetPages = 4'096;
+  spill.engine.cancel(2);
+  spill.runUntil([&] { return spill.events.outputs[1].size() >= 400; },
+                 "the decoder did not go on once its copies landed");
+  spill.engine.cancel(1);
+  spill.runUntilIdle();
+}
+
 // A converted lane preempted and resumed stays Spill under its output limit when the quota holds its
 // projection; a quota short of it bounds the resume, and the bound and the end at it count as the
 // converted lane's.
@@ -4559,6 +4645,8 @@ std::span<const test::TestCase> spillTests() {
       {"testConversionSpillsAHistoryWithCopies", testConversionSpillsAHistoryWithCopies},
       {"testAConversionWithCopiesRunsInTheCommandItConvertsFor",
        testAConversionWithCopiesRunsInTheCommandItConvertsFor},
+      {"testAUnitsWaitEndsWithItsLanes", testAUnitsWaitEndsWithItsLanes},
+      {"testAUnitsWaitRunsOutWithoutACommand", testAUnitsWaitRunsOutWithoutACommand},
       {"testAConvertedLaneResumesUnderTheSpillRules", testAConvertedLaneResumesUnderTheSpillRules},
       {"testAConvertedLanesMovesReleaseTheExtentsTheyEmpty", testAConvertedLanesMovesReleaseTheExtentsTheyEmpty},
       {"testALongDecodingLaneConvertsItselfAtTheWall", testALongDecodingLaneConvertsItselfAtTheWall},

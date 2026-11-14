@@ -1226,7 +1226,8 @@ against 0.6 and 1.1 ms), on an M6 the GPU's (1.9 against 1.2 ms), all with
 nearest T's least, from their split's full-chunk layer as the chunks' timings
 below take it; where that fit chooses other units, their split is prepared
 and timed in turn, and serves if it splits every chunk the first splits, none
-of them more than 2% longer, the first otherwise: the refit took Qwen3.8-27B
+of them more than 2% longer, the first otherwise, as where the other split
+cannot be prepared or timed: the refit took Qwen3.8-27B
 UD-Q4_K_M from 9 of its 34 units to 10
 on an M5 Max, whose full chunk prefilled 1.5-2.0% faster but which split
 chunks from 780 rows against 575, so that chunks of 640 and 672 rows ran 12%
@@ -2260,11 +2261,15 @@ whose memory is on its way back, as its own copies are after its conversion to S
 is owed it too: while the prefill owes decode time, the next unit waits for that
 memory where the lane has not decoded since the last unit began, whose gap the unit
 would hold a second unit of, and the wait works the debt off as the lane's decode
-would (`Scheduler::waitsForDecoders`). It lasts at most the time the last unit took:
-memory that lands during a unit makes the lane wait for the unit's end, so a wait as
-long as the unit moves the lane's next decode by a whole unit, which memory landing
-that late would have cost it anyway, where a shorter wait the memory outlasts adds
-itself to the lane's gap. Nothing the engine measures tells beforehand how long the
+would (`Scheduler::waitsUntil`). It ends at the latest once the last unit has ended
+for as long as it took, or for G where it took longer, as the whole command that ends
+a decoder's own prompt does: a time set as that unit ends, so the wait lasts once for
+a unit, whatever commands run meanwhile, and ends with the lanes it is for (the engine
+asks for its wakeup only while a unit waits). Memory that
+lands during a unit makes the lane wait for the unit's end, so a wait as long as the
+unit moves the lane's next decode by a whole unit, which memory landing that late would
+have cost it anyway, where a shorter wait the memory outlasts adds itself to the lane's
+gap. Nothing the engine measures tells beforehand how long the
 memory takes: the SSD cache keeps no write rate, and a claim's wait does not follow
 what it lacks. In engine-sim's Studio churn a lane whose conversion started 2,321
 copies waited 94 ms for those its release needed, a decode gap of 686 ms where the

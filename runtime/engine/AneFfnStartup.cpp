@@ -235,17 +235,31 @@ AneFfnStart decide(const AneFfnModel &model, const AneFfnSetting &setting, Reque
     uint32_t chosen = *first;
     // The chosen split's full chunk, timed nearest T's least, fits u again
     // (ane_ffn::refit); the units that model chooses serve where their split
-    // takes no chunk longer (ane_ffn::slowerNowhere), else the first ones.
+    // is prepared and takes no chunk longer (ane_ffn::slowerNowhere), else
+    // the first ones, whose split prepared: a refitted split that cannot be
+    // prepared or timed, on a backend that serves and in a start that goes
+    // on, says nothing against them. It ended the start with the GPU alone,
+    // nothing remembered, so that every start calibrated again and ended so.
     const std::optional<uint32_t> refitted = choice(
         ane_ffn::refit(fitted, static_cast<double>(*first) / model.units, prepared.chunks.functions.front().split));
     if (refitted && *refitted != *first) {
       const ane_ffn::ChunkTimings firstChunks = std::move(prepared.chunks);
       prepared.split.reset();
-      prepared = timedSplit(*refitted);
-      if (ane_ffn::slowerNowhere(prepared.chunks, firstChunks)) {
+      std::optional<AneFfnPrepared> candidate;
+      try {
+        candidate = timedSplit(*refitted);
+      } catch (const ane::Interrupted &) {
+        throw;
+      } catch (const std::exception &error) {
+        if ((cancelled && cancelled()) || !model.healthy()) throw;
+        logLine("The Neural Engine FFN split's refitted share was not prepared (", error.what(),
+                "); its first share serves.");
+      }
+      if (candidate && ane_ffn::slowerNowhere(candidate->chunks, firstChunks)) {
+        prepared = std::move(*candidate);
         chosen = *refitted;
       } else {
-        prepared.split.reset();
+        candidate.reset();
         prepared = model.prepare(*first, false);
         prepared.chunks = firstChunks;
       }
