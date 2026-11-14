@@ -503,7 +503,24 @@ void checkDenseTarget(MetalBackend &backend, const std::filesystem::path &direct
             weights.tokenEmbedding.outputSize == layout.vocabularySize && weights.tokenEmbedding.inputSize == hidden,
         "GGUF target: token table IQ4_XS blocks of vocabulary x hidden");
   const std::array<uint32_t, 2> captured{1, layout.layers - 1};
-  check(model::qwenTargetGeometry(weights, captured).valid(), "GGUF target: a valid target geometry");
+  const model::QwenTargetGeometry geometry = model::qwenTargetGeometry(weights, captured);
+  check(geometry.valid(), "GGUF target: a valid target geometry");
+  {
+    // Read over released images, each reserved, the target holds no memory
+    // and has the geometry of its load, from which a start plans its arenas
+    // before loading it (model::plannedTargetGeometry).
+    const uint64_t before = backend.memoryStats().allocatedBytes;
+    model::WeightImages reserved(backend, "fixture");
+    reserved.release();
+    model::GgufTargetLoader planned(backend, reserved, model::findTargetGgufs(target), layout.ggufArchitecture,
+                                    layout);
+    const model::QwenTargetGeometry read =
+        model::qwenTargetGeometry(model::loadQwen3_8Weights(backend, layout, planned), captured);
+    check(backend.memoryStats().allocatedBytes == before && read.prefillProjections == geometry.prefillProjections &&
+              read.decodeProjections == geometry.decodeProjections &&
+              read.gateUpProjections == geometry.gateUpProjections && read.moeRouterFormat == geometry.moeRouterFormat,
+          "GGUF target: its reserved images held memory, or gave another geometry than its load");
+  }
   for (uint32_t index = 0; index < weights.layers.size(); ++index) {
     const auto &layer = weights.layers[index];
     const std::string at = "GGUF target layer " + std::to_string(index) + ": ";

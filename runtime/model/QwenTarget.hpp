@@ -731,17 +731,17 @@ private:
 
 // The target of a Qwen3.5-architecture family's weights (Qwen3.8-27B,
 // Qwen3.6-35B-A3B, Flint), whose prefill commands run up to `prefillChunks`
-// chunks, and the step scratch it keeps itself (none: it has no table to
-// stream).
+// chunks, and the step scratch a target of its layout keeps itself (none: it
+// has no table to stream).
 template <class Layout, class Layer>
 [[nodiscard]] std::unique_ptr<QwenTarget> makeQwenTarget(const QwenTargetWeights<Layout, Layer> &weights,
                                                          const QwenTargetGeometry &geometry,
                                                          metal::MetalBackend &backend,
                                                          const ops::ExecutionPlans &operators,
                                                          uint32_t prefillChunks);
-template <class Layout, class Layer>
-[[nodiscard]] QwenTargetScratchBytes qwenTargetScratchBytes(const QwenTargetWeights<Layout, Layer> &,
-                                                            const QwenTargetGeometry &, uint32_t, uint64_t) {
+template <class Layout>
+[[nodiscard]] QwenTargetScratchBytes qwenTargetScratchBytes(const Layout &, const QwenTargetGeometry &, uint32_t,
+                                                            uint64_t) {
   return {};
 }
 

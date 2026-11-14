@@ -35,8 +35,11 @@ using ImageWriter = std::function<void(std::span<uint8_t> bytes, const metal::Me
 
 // An image of a model's weights as its loader plans it: the component it is
 // (such as target/layer-0.bin), the header its file starts with, its size and
-// its writer, and the size its record declares when not that one
-// (gguf::Image::residentBytes: a layer whose routed experts stream).
+// its writer, the size its record declares when not that one
+// (gguf::Image::residentBytes: a layer whose routed experts stream), and the
+// bytes its writer writes that its readers parse, where the plan has them
+// (gguf::Image::fills: its header and descriptors), which its file reads
+// while the image holds no memory (WeightFile).
 struct ImagePlan final {
   std::string component;
   std::string magic;
@@ -45,6 +48,7 @@ struct ImagePlan final {
   uint64_t bytes = 0;
   ImageWriter write;
   uint64_t declaredBytes = 0;
+  std::shared_ptr<const std::vector<gguf::Fill>> planned = {};
 };
 
 // A model's weights in memory: each image in a buffer of its own, written
@@ -71,7 +75,11 @@ public:
   // Waits for an image being written.
   ~WeightImages() override;
 
-  // Allocates the image's buffer, writes it and returns its file.
+  // Allocates the image's buffer, writes it and returns its file. While the
+  // weights are released, the image is reserved instead: its buffer holds no
+  // memory, as the images released before it, and the next restore writes
+  // it, so that its file reads the weights' layout at no memory (its plan's
+  // parsed bytes, ImagePlan::planned). A restore under way refuses a load.
   [[nodiscard]] WeightFile load(ImagePlan image);
   // What every image's file records the sources hold.
   [[nodiscard]] const std::string &contentIdentity() const noexcept { return contentIdentity_; }

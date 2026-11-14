@@ -348,20 +348,19 @@ gives back while memory is short only adds room ([streamed
 experts](#streamed-experts)). A size below the part's smallest store, a
 `--sparse-kv-memory` beyond what the floors leave and a `--ple-memory` size for
 a table that cannot stream are refused, and startup logs how each part was
-sized. Only a loaded model sizes
-the arenas, which rest on its weights' formats and grow where a part
+sized. The arenas rest on the weights' formats and grow where a part
 streams: prefill groups for streamed experts, a step's staged rows for a
-streamed table. One load gives them for whatever streams, so a start loads
-its weights once where the plan without the arenas already loads each part
-as the plan with them does, as for a model with no part to stream, and
-otherwise loads them again with the stores that plan gives (`Weights loaded
-again`): automatic routed experts the first plan streams load at their
-smallest store until then; a store `--expert-memory` sizes loads once. An
-automatic store sized for a run that spills keeps all of it as its floor.
-Where the run then cannot spill (the SSD cache turns off or its KV file does
-not open), the weights load once more for a store above its smallest size,
-whose floor is then 85% of its slots; a store at its smallest size is all its
-floor either way, and the weights do not load again.
+streamed table. The files' headers give them for whatever streams before
+any weight loads: the target's images are read reserved, without memory or a
+write, which gives every projection its formats. So the plan is made before
+the weights load, a model whose floors the budget cannot hold is refused
+before anything loads, and the weights load once (`Weights loaded in N s.`),
+with the stores the plan gives, whatever streams. An automatic store sized for
+a run that spills keeps all of it as its floor. Where the run then cannot
+spill (the SSD cache turns off or its KV file does not open), the weights load
+once more for a store above its smallest size (`Weights loaded again`), whose
+floor is then 85% of its slots; a store at its smallest size is all its floor
+either way, and the weights do not load again.
 
 A block-sparse target serves the window where its floors hold a request of
 that length and the SSD cache has room for its KV, and otherwise the longest
@@ -492,8 +491,7 @@ size with a warning.
   (`streamed_table_bytes`): the governor charges it beside Metal's
   allocations, and the startup memory audit bounds it by the plan and counts
   it toward the hard budget beside Metal's footprint since the weights that
-  serve began to load, not a first load that held the table whole before the
-  plan with the arenas streamed it. It is not released while idle.
+  serve began to load. It is not released while idle.
 - Once the weights that serve loaded, before the engine is ready, the engine
   writes every page of the cache's rows, ids, recency links and index
   (`SparseRowStore::commit`), so that the cache holds all of its host memory

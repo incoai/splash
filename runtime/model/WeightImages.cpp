@@ -17,11 +17,15 @@
 namespace splash::model {
 
 WeightFile WeightImages::load(ImagePlan image) {
-  if (released_) throw std::logic_error("weights load while their memory is released");
-  metal::MetalBuffer buffer = backend_->allocateBuffer(image.bytes, metal::BufferStorage::Shared, image.component);
-  image.write(contentsOf(buffer), buffer);
+  // A restore's writer holds its image in place (restore()).
+  if (released_ && restored_) throw std::logic_error("weights load while a restore is under way");
+  metal::MetalBuffer buffer =
+      released_ ? backend_->reserveBuffer(image.bytes, metal::BufferStorage::Shared, image.component)
+                : backend_->allocateBuffer(image.bytes, metal::BufferStorage::Shared, image.component);
+  if (!released_) image.write(contentsOf(buffer), buffer);
   WeightFile file(*backend_, buffer, image.component, image.magic, image.layer, image.type,
-                  image.declaredBytes ? image.declaredBytes : buffer.sizeBytes(), contentIdentity_);
+                  image.declaredBytes ? image.declaredBytes : buffer.sizeBytes(), contentIdentity_,
+                  std::move(image.planned));
   images_.push_back({std::move(image.component), std::move(buffer), std::move(image.write)});
   return file;
 }
@@ -73,7 +77,7 @@ bool WeightImages::restore(const metal::AllocationAdmission &admit) {
                                         admitted.failure);
     ++restored_;
     // The image stays in place: load(), the only call that adds one, refuses
-    // released weights.
+    // a restore under way.
     auto writing = std::make_unique<Writing>();
     writing->thread = std::thread([&image, &state = *writing, written = written_] {
       try {
