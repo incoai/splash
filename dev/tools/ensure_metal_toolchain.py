@@ -10,7 +10,7 @@ import subprocess
 import tempfile
 from pathlib import Path
 
-ATTEMPTS = 3
+MAX_INSTALL_TRIES = 5
 SOURCE = """#include <metal_stdlib>
 using namespace metal;
 kernel void ci_probe(device bfloat *output [[buffer(0)]],
@@ -78,12 +78,13 @@ def main():
                 flush=True,
             )
             return 0
-        for attempt in range(1, ATTEMPTS + 1):
+        for attempt in range(1, MAX_INSTALL_TRIES + 1):
             print(
-                f"Metal toolchain installation attempt {attempt}/{ATTEMPTS}", flush=True
+                f"Metal toolchain installation attempt {attempt}/{MAX_INSTALL_TRIES}",
+                flush=True,
             )
             installed = run(
-                ["xcodebuild", "-downloadComponent", "MetalToolchain"], timeout=180
+                ["xcodebuild", "-downloadComponent", "MetalToolchain"], timeout=120
             )
             # An installer can return an error after making the tools usable.
             # Conversely, success without a working compiler must remain failure.
@@ -93,10 +94,10 @@ def main():
                     flush=True,
                 )
                 return 0
-            if attempt < ATTEMPTS:
-                run(["sleep", "10"], timeout=15)
+            if attempt < MAX_INSTALL_TRIES:
+                run(["sleep", str(min(15 * 2 ** (attempt - 1), 60))], timeout=65)
     print(
-        "Metal compiler/linker remain unusable after three attempts; inspect the Xcode/SDK and catalog errors above.",
+        "Metal compiler/linker remain unusable after five attempts; inspect the Xcode/SDK and catalog errors above.",
         flush=True,
     )
     return 1

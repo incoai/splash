@@ -158,7 +158,7 @@ and Python compatibility gates. An unconditional component download previously
 failed fetching Apple's MetalToolchain catalog before any project compilation.
 The bootstrap first compiles BF16 Metal 4.0 source with the production deployment
 target and links a nonempty metallib. A usable installation needs no download.
-If the probe fails, it makes at most three timed component-install attempts,
+If the probe fails, it makes at most five timed component-install attempts with bounded backoff,
 reprobes after each attempt (even when the installer exits with an error), and
 fails closed if compilation/linking remain unusable. It logs the selected Xcode
 and SDK without changing global Xcode selection or executing GPU work.

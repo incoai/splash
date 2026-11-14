@@ -94,7 +94,7 @@ class MetalToolchainTests(unittest.TestCase):
     def test_installer_success_alone_cannot_pass_setup(self):
         result, downloads, _ = self.run_bootstrap("success_but_missing")
         self.assertNotEqual(result.returncode, 0)
-        self.assertEqual(downloads, 3)
+        self.assertEqual(downloads, 5)
 
     def test_a_present_shim_or_broken_linker_cannot_pass_setup(self):
         for mode, installed in [
@@ -105,7 +105,7 @@ class MetalToolchainTests(unittest.TestCase):
             with self.subTest(mode=mode):
                 result, downloads, _ = self.run_bootstrap(mode, installed=installed)
                 self.assertNotEqual(result.returncode, 0)
-                self.assertEqual(downloads, 3)
+                self.assertEqual(downloads, 5)
 
 
 if __name__ == "__main__":
