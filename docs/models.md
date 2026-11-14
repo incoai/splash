@@ -580,10 +580,26 @@ the generation prompt the template renders for the request's effort, as with
 the model's own. Startup does not check that the template writes the family's
 format, so that is the template's to keep: the server reads tool calls only in
 the family's layout, whatever layout the template shows the model, and serves
-an image only where the template's source holds the family's image
-placeholder (`<|image_pad|>`) and renders one for each image; a request with
-an image fails with a 400 otherwise. Preparation is unchanged: a GGUF still
-needs a chat template of its own.
+an image only where the template writes the family's image placeholder
+(`<|image_pad|>`) once for each image of the request, in their order. The
+server takes each placeholder among the prompt's tokens for an image's, a
+request's own text being no token, and widens it to that image's tokens; a
+request whose placeholders and images differ in number fails with a 400.
+Preparation is unchanged: a GGUF still needs a chat template of its own.
+
+The template must also write each text of a request as it is given. Request
+preparation sets a mark inside every added token that a text begins and takes
+the marks out of the rendered prompt
+([tokenizer and chat templates](#tokenizer-and-chat-templates)), so a template
+that changes a text's case, cuts it or replaces characters in it leaves a
+broken mark in the prompt: `{{ message.content | upper }}` writes
+`<__SPLASH_QUOTED_…__TOOL_CALL>` where a message quotes `<tool_call>`. One
+that deletes characters inside a text, trims a text before characters of its
+own that would complete a token, or writes a token's first characters itself
+before a text can put together a token the request only quoted. Writing a
+text as JSON (`tojson`), joining it to others, trimming it before a token or a
+line break of the template's own and testing it leave it as it is; a test for
+a tag in a text finds none, as in the model's own templates.
 
 ## Chat formats
 
