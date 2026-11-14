@@ -1021,6 +1021,18 @@ class UnixSocketTests(HarnessTestCase):
             api.FrontendServer((f"unix:{self.path}", 0), None)
         self.assertEqual(Path(self.path).read_text(), "kept")
 
+    def test_a_path_is_103_bytes_long_at_most(self):
+        """macOS takes a socket path of 103 bytes at most: a server serves at
+        one, and a longer one is refused as too long, as the documentation
+        says of both."""
+        directory = os.path.dirname(self.path)
+        longest = os.path.join(directory, "s" * (102 - len(directory)))
+        self.assertEqual(len(os.fsencode(longest)), 103)
+        self.harness(FakeRuntime(), host=f"unix:{longest}")
+        self.assertEqual(self.get("/health", at=longest)[0], 200)
+        with self.assertRaisesRegex(OSError, "AF_UNIX path too long"):
+            api.FrontendServer((f"unix:{longest}s", 0), None)
+
     def test_a_symbolic_link_at_the_path_is_refused_and_stays(self):
         """A symbolic link at the path is refused by name, one that points
         nowhere as one to a leftover socket, and stays with what it points
