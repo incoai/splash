@@ -194,11 +194,13 @@ void sampling() {
                         std::numeric_limits<uint32_t>::max()}) {
     const auto workspace = Sampling::workspace(rows);
     const uint64_t count = rows;
+    // 64 ranges a row: 8 groups of 8 simdgroups at the bracket's 256 threads
+    // (SPLASH_TARGET_VOCABULARY_THREADS), one range a simdgroup.
     require(workspace.argmaxValuesBytes == count * 16 * 4 &&
                 workspace.argmaxIndicesBytes == count * 16 * 4 &&
                 workspace.partialMassesBytes == count * 16 * 12 &&
                 workspace.vocabularyRowsBytes == count * 16 &&
-                workspace.vocabularyRangesBytes == count * 256 * 8 &&
+                workspace.vocabularyRangesBytes == count * 64 * 8 &&
                 workspace.vocabularyArrivalsBytes == count * 4,
             "target sampling workspace changed from the shipped 16-shard ABI");
   }
