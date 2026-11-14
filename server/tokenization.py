@@ -26,8 +26,8 @@ def tokenizable(text):
 
 
 # The mark PromptTokenizer.quote sets after the first character of an added
-# token's text in what a client sent: a text no request can hold, as its 128
-# random bits are drawn when the server starts, and of characters that a
+# token that begins in what a client sent: a text no request can hold, as its
+# 128 random bits are drawn when the server starts, and of characters that a
 # template's JSON or trimming of the text leaves as they are.
 QUOTE = f"__splash_quoted_{secrets.token_hex(16)}__"
 
@@ -100,16 +100,42 @@ def _encodes_segments_alone(backend):
     )
 
 
+def _rest_pattern(rests):
+    """A pattern for what follows an added token's first character where the
+    token begins in a text: the rest of one, each of `rests`, or as much of
+    a rest as the text holds where it ends first, which what follows the
+    text in a prompt could complete. It reads the characters that rests
+    share once: 1 MB of markup takes 1.7 ms with Flint's 144 tokens, where
+    trying each rest in turn took 23 ms."""
+    shared = {}
+    for rest in rests:
+        node = shared
+        for character in rest:
+            node = node.setdefault(character, {})
+        # A token ends here: nothing more to read.
+        node[""] = {}
+
+    def pattern(node):
+        if "" in node:
+            return ""
+        following = "|".join(
+            re.escape(character) + pattern(after) for character, after in node.items()
+        )
+        return rf"(?:\Z|{following})"
+
+    return pattern(shared)
+
+
 class PromptTokenizer:
     """Encodes rendered prompts so that only the chat template's own text
     reads as a token the tokenizer adds (added_tokens). A tokenizer finds an
     added token wherever the text spells it, so one that a message only
     quotes, as a tool result showing a parser's `tool_call_start =
     "<tool_call>"` does, would reach the model as the control token, and a
-    `<|im_end|>` in a document as the end of its turn. `quote` marks each in
-    what a client sent before the template renders it; `encode` reads the
-    template's text between two of the tokens the template wrote as ordinary
-    text, a marked token as its characters.
+    `<|im_end|>` in a document as the end of its turn. `quote` marks each
+    where it begins in what a client sent, before the template renders it;
+    `encode` reads the template's text between two of the tokens the template
+    wrote as ordinary text, a marked token as its characters.
 
     It reuses a cached prompt's tokens up to its last `marker`, the chat
     template's special token at a message boundary
@@ -142,16 +168,16 @@ class PromptTokenizer:
         # holds it.
         self.enabled = [text for text in self.added if marker in text] == [marker]
         self.marker_id = self.added[marker] if self.enabled else None
-        # Where an added token's text begins, to mark it there: for each
-        # first character of one, that character before the rest of any.
+        # Where an added token begins in a text, to mark it there: for each
+        # first character of one, that character before the rest of any, or
+        # before the text's end where that comes first (_rest_pattern).
         rests = {}
         for text in self.added:
-            rests.setdefault(text[0], []).append(re.escape(text[1:]))
+            rests.setdefault(text[0], []).append(text[1:])
         self._begins = [
-            (first, re.compile(f"{re.escape(first)}(?={'|'.join(rest)})"))
+            (first, re.compile(f"{re.escape(first)}(?={_rest_pattern(rest)})"))
             for first, rest in rests.items()
         ]
-        self._marked = r"\g<0>" + QUOTE
         if self.added:
             # Each whole one, the longest first as the tokenizer finds them.
             self._tokens = re.compile(
@@ -173,17 +199,31 @@ class PromptTokenizer:
         self.hits = self.misses = self.reused_tokens = 0
         self.lock = threading.Lock()
 
+    @staticmethod
+    def _marked(begun):
+        """The first character of a token that begins, with the mark after
+        it. A function, as `sub` looks a replacement text up by a hash of
+        its whole pattern at every call: 2 to 4 microseconds for these."""
+        return begun[0] + QUOTE
+
     def quote(self, value):
         """`value`, what a request gives its chat template (messages, tool
         definitions, template variables), with QUOTE inside every added
-        token that a string or a key of it spells, wherever one begins. The
-        template renders the marked text as it renders any other, and no
-        longer finds a tag there itself."""
+        token that a string or a key of it begins: one it spells whole, and
+        one its end cuts off, which what the template writes next could
+        complete, as the `>` Qwen's templates write after a call's name
+        would, or the next of a message's text parts. A U+0000 is U+FFFD
+        first: a text that holds one inside a token spells no token to mark,
+        and a template that deletes the character, as Flint's does, would
+        write the token whole. The template renders the marked text as it
+        renders any other, and no longer finds a tag there itself."""
         if isinstance(value, str):
+            if "\x00" in value:
+                value = value.replace("\x00", "\ufffd")
             for first, begins in self._begins:
                 # Few strings hold the character at all: looking for it
                 # first quotes a 66K-token conversation of 2,600 strings in
-                # 0.4 ms, where the search alone took 2.8 ms.
+                # 0.24 ms, where searching each took 0.40 ms.
                 if first in value:
                     value = begins.sub(self._marked, value)
             return value

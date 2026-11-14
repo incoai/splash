@@ -190,29 +190,11 @@ def normalize_messages(messages, *, vision):
     return normalized
 
 
-def _joined_text(message):
-    """`message` with each run of adjacent text parts of its content as one
-    part."""
-    content = message.get("content")
-    if not isinstance(content, list):
-        return message
-    parts = []
-    for part in content:
-        if part["type"] == "text" and parts and parts[-1]["type"] == "text":
-            parts[-1] = {"type": "text", "text": parts[-1]["text"] + part["text"]}
-        else:
-            parts.append(part)
-    return message if len(parts) == len(content) else {**message, "content": parts}
-
-
 def template_messages(messages):
-    """`messages` as a chat template takes them. Adjacent text parts of a
-    message, which a template writes one after another, are one text, so a
-    tag they spell together is quoted as any tag a text spells
-    (tokenization.PromptTokenizer). A call whose arguments are text, not an
-    object, is kept as text, without presenting it as a complete call."""
+    """Keep a call whose arguments are text, not an object, as text, without
+    presenting it as a complete call."""
     result = []
-    for message in map(_joined_text, messages):
+    for message in messages:
         calls = message.get("tool_calls", [])
         if not any(isinstance(call["function"]["arguments"], str) for call in calls):
             result.append(message)
