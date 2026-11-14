@@ -1307,6 +1307,14 @@ private:
   PassCommand passCommand_{scheduler_, [this](uint64_t id) { return requests_.at(id).pendingEnd.has_value(); }};
   // When the latest command retired, until a tick finds nothing to do.
   std::optional<double> busySinceMilliseconds_;
+  // The next prefill unit's wait for a decoder whose memory lands
+  // (Scheduler::waitsUntil), as the last tick left it: since the tick that
+  // began it, until the scheduler's bound, when the loop wakes. Every tick
+  // takes it and decides again (tick), so it lasts no longer than the wait.
+  struct UnitWait final {
+    double since = 0.0, until = 0.0;
+  };
+  std::optional<UnitWait> unitWait_;
   // The lanes admit() has obtained so far, including those it gave back when
   // the attempt's pages were refused (Request::admission).
   uint64_t admissions_ = 0;

@@ -198,6 +198,20 @@ bool Engine::tick(double now) {
   // however the tick ends, what holds each from now on is as it leaves the
   // engine.
   holds(now);
+  // The wait the last tick left the next prefill unit in, for a decoder whose
+  // memory lands, is this tick's to decide again: one that plans it again
+  // goes on with it, and any other ends it, however it ends, the time it
+  // lasted working the prefill's debt off once the tick has planned, as the
+  // decoder's decode would have (Scheduler::waited).
+  struct WaitEnd final {
+    Engine &engine;
+    std::optional<UnitWait> wait;
+    double now;
+    ~WaitEnd() {
+      if (wait && !engine.unitWait_)
+        engine.scheduler_.waited(std::min(now, wait->until) - wait->since);
+    }
+  } const waitEnd{*this, std::exchange(unitWait_, std::nullopt), now};
   struct Holders final {
     Engine &engine;
     ~Holders() {
@@ -348,7 +362,7 @@ bool Engine::tick(double now) {
   sweepTerminal(now);
   // Lanes that wait for memory on its way back cannot run before it lands;
   // the command runs the other lanes meanwhile, but for a prefill unit that
-  // waits for its decoders among them (Scheduler::waitsForDecoders). A plan
+  // waits for its decoders among them (Scheduler::waitsUntil). A plan
   // whose lanes all wait adds them, and each plan prepare sends back adds
   // those it refused or held back, so each attempt plans without at least
   // one more lane, or with a lane's rows cut at a state boundary, or after a
@@ -383,8 +397,11 @@ bool Engine::tick(double now) {
                         .landing = landing,
                         .now = now};
     const std::optional<BatchPlan> plan = scheduler_.next(in);
-    if (!plan)
+    if (!plan) {
+      if (const std::optional<double> until = scheduler_.waitsUntil(in))
+        unitWait_ = UnitWait{waitEnd.wait ? waitEnd.wait->since : now, *until};
       break;
+    }
     // A command between its passes beside a lane of it that ended (a cancel,
     // a deadline) gives way, whole, to a plan of a higher priority than its
     // own, as at every point a lane yields (yieldsEndedLanes), and the tick
@@ -432,8 +449,7 @@ bool Engine::tick(double now) {
         if (std::ranges::find(refused, id) == refused.end())
           waiting.push_back(id);
       const std::vector<LaneShape> committed = laneShapes();
-      scheduler_.commit(*plan,
-                        {.excluded = waiting, .shapes = committed, .passes = passCommand_.progress(), .now = now});
+      scheduler_.commit(*plan, {.excluded = waiting, .shapes = committed, .passes = passCommand_.progress()});
       // A command in passes keeps its items and their captures for its
       // later passes (prepare), and its progress for planning.
       if (plan->passes > 1 && !plan->pass)
@@ -574,10 +590,9 @@ std::optional<double> Engine::nextWakeupMilliseconds() const {
     if (const std::optional<double> persist = writeBehind_.nextWakeup(); persist && (!result || *persist < *result))
       result = persist;
     // A prefill unit that waits for a decoder whose memory lands runs once
-    // the last unit's time has passed, if the memory has not landed.
-    if (const std::optional<double> hold = scheduler_.holdEndMilliseconds();
-        hold && !pending_ && (!result || *hold < *result))
-      result = hold;
+    // that wait's time has passed, if the memory has not landed.
+    if (unitWait_ && (!result || unitWait_->until < *result))
+      result = unitWait_->until;
   }
   // Admission retries run only between commands, and only for the requests
   // admission tries; those held behind one refused memory have no retry time
@@ -1995,7 +2010,7 @@ void Engine::apply(const Pending &command, std::span<const ModelStepResult> resu
           std::ranges::none_of(plan.items, [&](const BatchItem &item) { return item.requestId == id; })) {
         active.gapSince.prefillMilliseconds += wallMilliseconds;
       }
-  scheduler_.complete(plan, schedulerResults, sample);
+  scheduler_.complete(plan, schedulerResults, sample, now);
   if (plan.kind == WorkKind::Prefill && plan.passes > 1)
     settleEnded(passCommand_.passCompleted(plan));
   events_.batchCompleted(plan.kind, plan.width(), inputTokens, outputTokens,
