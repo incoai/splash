@@ -919,7 +919,11 @@ class LauncherTests(unittest.TestCase):
         """An agent command that finds no ready server at 127.0.0.1:PORT,
         where a server holds the port nonetheless, names it: its PID and
         model, where it listens, a UNIX socket or another address, and its
-        phase as its serve record says, from the start on."""
+        phase as its serve record says, from the start on. Of one that
+        listens where the command asks and says it is ready, it says only
+        that it does not answer, as a server that is stopping does not (it
+        was told that agent commands need a ready server on loopback, which
+        that server said it was)."""
         with (
             tempfile.TemporaryDirectory(dir="/tmp") as temporary,
             socket.socket() as unused,
@@ -946,7 +950,12 @@ class LauncherTests(unittest.TestCase):
                     console_written()
                     refusals[phase] = error.getvalue()
 
-            for host in (f"unix:{temporary}/splash.sock", "192.0.2.1", "127.0.0.1"):
+            for host in (
+                f"unix:{temporary}/splash.sock",
+                "192.0.2.1",
+                "127.0.0.1",
+                "0.0.0.0",
+            ):
                 refusals.clear()
                 with (
                     self.subTest(host=host),
@@ -966,14 +975,21 @@ class LauncherTests(unittest.TestCase):
                     self.assertEqual(
                         list(refusals), ["starting", "loading", "warming", "ready"]
                     )
+                    url = f"http://127.0.0.1:{port}"
                     for phase, said in refusals.items():
+                        named = (
+                            f"(PID {os.getpid()}, model {MODEL_ID}, port {port}, "
+                            f"host {host}, phase {phase})"
+                        )
+                        asked = host in ("127.0.0.1", "0.0.0.0") and phase == "ready"
                         self.assertEqual(
                             said,
-                            f"error: No ready Splash server at http://127.0.0.1:{port}"
-                            f", but Splash is serving (PID {os.getpid()}, model "
-                            f"{MODEL_ID}, port {port}, host {host}, phase {phase})."
-                            " Agent commands connect over TCP on loopback to a "
-                            "server that is ready.\n",
+                            f"error: Splash is serving {named} but does not "
+                            f"answer at {url}: it may be stopping.\n"
+                            if asked
+                            else f"error: No ready Splash server at {url}, but "
+                            f"Splash is serving {named}. Agent commands connect "
+                            "over TCP on loopback to a server that is ready.\n",
                         )
 
     def test_an_exited_servers_lock_names_no_server_nor_another_pids_record_a_phase(

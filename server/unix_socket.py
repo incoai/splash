@@ -39,7 +39,13 @@ class Claim:
     def __init__(self, path):
         self.path = path
         self._bound = False
-        self._lock = open(f"{path}.lock", "a")
+        # Not through a symbolic link, which in a directory others write to
+        # would create, or lock, a file of their choosing.
+        self._lock = open(
+            f"{path}.lock",
+            "a",
+            opener=lambda lock, flags: os.open(lock, flags | os.O_NOFOLLOW, 0o666),
+        )
         try:
             fcntl.flock(self._lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
@@ -47,13 +53,27 @@ class Claim:
             raise OSError(errno.EADDRINUSE, os.strerror(errno.EADDRINUSE)) from None
 
     def bind(self, listener):
-        """Bind `listener` at the path, in place of a socket there that
-        refuses a connection: with the lock held it is no server's that still
-        loads, so it is a leftover. Anything else there stays, a socket that
-        answers or cannot be asked and a file of another kind, and the bind
-        fails as on an address in use."""
+        """Bind `listener` at the path, in place of a socket there that no
+        Splash server is behind. With the lock held none is, one that still
+        loads its model included, so what a connection to the socket meets
+        decides. Refused, nothing listens on it: it is a leftover, as a
+        killed server's. Not permitted (EPERM), the server's sandbox gives it
+        no outbound connection, as a profile that lets it only bind and
+        accept does, and says so of every socket, a leftover among them,
+        which no start could then replace: it goes too. Anything else there
+        stays, and the bind fails as on an address in use: a socket that
+        accepts the connection is another program's listener, one whose
+        permissions refuse this user (EACCES) is not this user's to remove,
+        and a file of another kind (ENOTSOCK) is no socket. A symbolic link
+        at the path is refused before any of it, by name: bind would follow
+        it and leave the socket where it points, which close, removing the
+        link, would not remove."""
+        if os.path.islink(self.path):
+            raise OSError(
+                errno.ELOOP, "the socket's path is a symbolic link", self.path
+            )
         with socket.socket(socket.AF_UNIX) as probe:
-            if probe.connect_ex(self.path) == errno.ECONNREFUSED:
+            if probe.connect_ex(self.path) in (errno.ECONNREFUSED, errno.EPERM):
                 os.unlink(self.path)
         listener.bind(self.path)
         self._bound = True

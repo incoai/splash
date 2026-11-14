@@ -112,10 +112,11 @@ the server should be serving; `/status` says the rest (`transport.recovering`,
 and ends if the phase fails, where a recovering server answers `/status`,
 waits out a backoff before it loads, and retries a restart that failed or
 stops. A server that was stopped or killed leaves its last record, so check
-that the `pid` runs or that the lock is held, and take a phase a later release
-adds for no news. The launcher's `starting` record and the server's first
-`ready` fail the start where they cannot be written; once a server is ready, a
-record it cannot write is a warning in its log, and it serves on.
+that the `pid` runs or that the lock is held, and take a phase you do not
+know, as a later release may add one, for no news of the server. The
+launcher's `starting` record and the server's first `ready` fail the start
+where they cannot be written; once a server is ready, a record it cannot
+write is a warning in its log, and it serves on.
 
 ### Console
 
@@ -232,13 +233,24 @@ HTTP from another machine too.
 `--host unix:PATH` listens on a UNIX socket at `PATH` instead of a TCP port, so
 that the server listens on no IP address and file permissions decide who
 connects: a client needs write permission on the socket, which is created
-under the server's umask, and search permission on its directory. A relative
-`PATH` is taken from the directory the server starts in. One server serves a
-path: it holds a lock, `PATH.lock` beside the socket, from before it binds
-until it has removed the socket as it stops. A second server at the path is
-therefore refused, also while the first still loads its model, and the socket
-a killed server left behind is replaced by the next start; a socket another
-program listens on and a file of another kind stay, and the start is refused.
+under the server's umask, and search permission on its directory. `PATH` is
+at most 103 bytes long, the longest socket path macOS takes; a relative one is
+taken from the directory the server starts in, and may fit where the whole
+path does not. One server serves a path: it holds a lock, `PATH.lock` beside
+the socket, from before it binds until it has removed the socket as it stops.
+A second server at the path is therefore refused, also while the first still
+loads its model. The lock file itself stays, unlocked, after a stop and after
+a start that was refused: one removed could still be held by a server beside
+a new file of its name. With the lock held, no Splash server is behind a
+socket already at the path, and a start replaces one that refuses its
+connection, as the socket a killed server left behind does, and one its
+sandbox does not let it connect to. A socket that accepts a connection stays,
+as do one whose permissions refuse the server's user and a file of another
+kind, and the start is refused. So is a start that finds a symbolic link at
+`PATH` or at `PATH.lock`: the server follows neither. A sandbox's profile must
+let the server bind `PATH` and accept there, and write `PATH`, which it
+creates and removes, and `PATH.lock`; it may refuse the server a connection
+to `PATH`.
 `--port` names the server's lock and [record](#serve-record),
 `serve-PORT.lock` and `serve-PORT.json` in the runtime directory, as it does
 for every `--host`, so two socket servers take two ports though neither
@@ -1305,6 +1317,8 @@ socket or still starts, the refusal names that server as a second `serve` on
 the port does: its PID, model, port, `--host` and the phase of its [serve
 record](#serve-record), as in
 `(PID 4242, model ID, port 8000, host unix:/tmp/splash.sock, phase ready)`.
+Of a server that listens on loopback and whose record says `ready`, the
+refusal says only that it does not answer, as one that is stopping does not.
 Where the environment names a proxy (`http_proxy`, `https_proxy` or
 `all_proxy`, in either case), it adds
 `127.0.0.1`, `localhost` and `::1` to the agent's `NO_PROXY` and `no_proxy`,

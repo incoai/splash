@@ -7,6 +7,8 @@ import os
 import queue
 import socket
 import stat
+import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -21,7 +23,7 @@ from dev.tests.server_fixtures import (
     Plan,
     chat_body,
 )
-from server import connections, serve_options
+from server import connections, document_worker, serve_options
 from server import server as api
 
 
@@ -905,6 +907,25 @@ class HttpTransportTests(HarnessTestCase):
             admission.release()
 
 
+# A Seatbelt profile that gives a process no outbound connection, as one that
+# lets a server only bind and accept gives it none.
+NO_OUTBOUND = "(version 1)(allow default)(deny network-outbound)"
+# Says what a connection to the path it is given meets, then claims the path
+# and binds a socket there as a server does, and gives it up.
+CLAIM = """
+import errno, socket, sys
+from server import unix_socket
+
+path = sys.argv[1]
+with socket.socket(socket.AF_UNIX) as probe:
+    print(errno.errorcode[probe.connect_ex(path)])
+claim = unix_socket.Claim(path)
+with socket.socket(socket.AF_UNIX) as listener:
+    claim.bind(listener)
+claim.close()
+"""
+
+
 class UnixSocketTests(HarnessTestCase):
     def setUp(self):
         directory = tempfile.TemporaryDirectory(dir="/tmp")
@@ -983,9 +1004,10 @@ class UnixSocketTests(HarnessTestCase):
         self.harness(FakeRuntime(), host=f"unix:{self.path}")
         self.assertEqual(self.get("/health")[0], 200)
 
-    def test_only_a_socket_nothing_listens_on_is_replaced(self):
-        """A socket another program listens on and a file of another kind
-        stay where they are, and the start is refused."""
+    def test_a_socket_that_accepts_a_connection_and_another_kind_of_file_stay(self):
+        """A socket that accepts a connection, another program's listener,
+        and a file of another kind stay where they are, and the start is
+        refused."""
         with socket.socket(socket.AF_UNIX) as listener:
             listener.bind(self.path)
             listener.listen()
@@ -998,6 +1020,103 @@ class UnixSocketTests(HarnessTestCase):
         with self.assertRaises(OSError):
             api.FrontendServer((f"unix:{self.path}", 0), None)
         self.assertEqual(Path(self.path).read_text(), "kept")
+
+    def test_a_path_is_103_bytes_long_at_most(self):
+        """macOS takes a socket path of 103 bytes at most: a server serves at
+        one, and a longer one is refused as too long, as the documentation
+        says of both."""
+        directory = os.path.dirname(self.path)
+        longest = os.path.join(directory, "s" * (102 - len(directory)))
+        self.assertEqual(len(os.fsencode(longest)), 103)
+        self.harness(FakeRuntime(), host=f"unix:{longest}")
+        self.assertEqual(self.get("/health", at=longest)[0], 200)
+        with self.assertRaisesRegex(OSError, "AF_UNIX path too long"):
+            api.FrontendServer((f"unix:{longest}s", 0), None)
+
+    def test_a_symbolic_link_at_the_path_is_refused_and_stays(self):
+        """A symbolic link at the path is refused by name, one that points
+        nowhere as one to a leftover socket, and stays with what it points
+        to (bind followed the first and left the socket where it pointed,
+        which the close, removing the link, left behind; the second was
+        removed for a socket of the server's)."""
+        target = self.path + ".elsewhere"
+        for leftover in (False, True):
+            if leftover:
+                with socket.socket(socket.AF_UNIX) as killed:
+                    killed.bind(target)
+            os.symlink(target, self.path)
+            with (
+                self.subTest(leftover=leftover),
+                self.assertRaises(OSError) as refused,
+            ):
+                api.FrontendServer((f"unix:{self.path}", 0), None)
+            self.assertEqual(
+                str(refused.exception),
+                f"[Errno 62] the socket's path is a symbolic link: {self.path!r}",
+            )
+            self.assertEqual(os.readlink(self.path), target)
+            self.assertEqual(os.path.lexists(target), leftover)
+            os.unlink(self.path)
+
+    def test_the_lock_is_not_opened_through_a_symbolic_link(self):
+        """A symbolic link where the lock belongs is not followed: the start
+        is refused, naming it, and the file it points to is not created (the
+        lock was created, and held, wherever the link pointed)."""
+        target = self.path + ".elsewhere"
+        os.symlink(target, self.path + ".lock")
+        with self.assertRaises(OSError) as refused:
+            api.FrontendServer((f"unix:{self.path}", 0), None)
+        self.assertEqual(
+            (refused.exception.errno, refused.exception.filename),
+            (errno.ELOOP, self.path + ".lock"),
+        )
+        self.assertFalse(os.path.lexists(target))
+        self.assertFalse(os.path.lexists(self.path))
+
+    @unittest.skipIf(os.geteuid() == 0, "root connects whatever a socket's mode says")
+    def test_a_socket_this_user_may_not_connect_to_stays(self):
+        """A socket whose permissions refuse this user a connection is not
+        this user's to remove: it stays, its listener still reached there,
+        and the start is refused."""
+        with socket.socket(socket.AF_UNIX) as listener:
+            listener.bind(self.path)
+            listener.listen()
+            os.chmod(self.path, 0)
+            with socket.socket(socket.AF_UNIX) as client:
+                self.assertEqual(client.connect_ex(self.path), errno.EACCES)
+            with self.assertRaises(OSError) as refused:
+                api.FrontendServer((f"unix:{self.path}", 0), None)
+            self.assertEqual(refused.exception.errno, errno.EADDRINUSE)
+            os.chmod(self.path, 0o700)
+            with socket.socket(socket.AF_UNIX) as client:
+                client.connect(self.path)
+
+    @unittest.skipUnless(
+        os.access(document_worker.SANDBOX_EXEC, os.X_OK), "sandbox-exec is needed"
+    )
+    def test_a_socket_its_sandbox_keeps_the_server_from_asking_is_replaced(self):
+        """A server whose sandbox gives it no outbound connection is not
+        permitted to ask the socket at its path, and takes the path all the
+        same: no Splash server is behind the socket while this one holds the
+        lock (the socket a killed server left stayed, and every start after
+        it was refused as at an address in use)."""
+        with socket.socket(socket.AF_UNIX) as killed:
+            killed.bind(self.path)
+        served = subprocess.run(
+            [document_worker.SANDBOX_EXEC, "-p", NO_OUTBOUND]
+            + [sys.executable, "-c", CLAIM, self.path],
+            cwd=api.ROOT,
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        if served.returncode == document_worker.SANDBOX_FAILED:
+            self.skipTest("sandbox-exec cannot apply a profile here")
+        self.assertEqual(
+            (served.stdout, served.returncode), ("EPERM\n", 0), served.stderr
+        )
+        # The claim removed the socket it bound, as a server that stops does.
+        self.assertFalse(os.path.lexists(self.path))
 
     def test_the_sockets_path_gives_the_host_check_no_name(self):
         """Over a UNIX socket the server answers to the loopback names and
