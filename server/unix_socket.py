@@ -39,7 +39,13 @@ class Claim:
     def __init__(self, path):
         self.path = path
         self._bound = False
-        self._lock = open(f"{path}.lock", "a")
+        # Not through a symbolic link, which in a directory others write to
+        # would create, or lock, a file of their choosing.
+        self._lock = open(
+            f"{path}.lock",
+            "a",
+            opener=lambda lock, flags: os.open(lock, flags | os.O_NOFOLLOW, 0o666),
+        )
         try:
             fcntl.flock(self._lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
@@ -58,7 +64,14 @@ class Claim:
         stays, and the bind fails as on an address in use: a socket that
         accepts the connection is another program's listener, one whose
         permissions refuse this user (EACCES) is not this user's to remove,
-        and a file of another kind (ENOTSOCK) is no socket."""
+        and a file of another kind (ENOTSOCK) is no socket. A symbolic link
+        at the path is refused before any of it, by name: bind would follow
+        it and leave the socket where it points, which close, removing the
+        link, would not remove."""
+        if os.path.islink(self.path):
+            raise OSError(
+                errno.ELOOP, "the socket's path is a symbolic link", self.path
+            )
         with socket.socket(socket.AF_UNIX) as probe:
             if probe.connect_ex(self.path) in (errno.ECONNREFUSED, errno.EPERM):
                 os.unlink(self.path)

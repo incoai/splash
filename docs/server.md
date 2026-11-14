@@ -241,10 +241,11 @@ held, no Splash server is behind a socket already at the path, and a start
 replaces one that refuses its connection, as the socket a killed server left
 behind does, and one its sandbox does not let it connect to. A socket that
 accepts a connection stays, as do one whose permissions refuse the server's
-user and a file of another kind, and the start is refused. A sandbox's profile
-must let the server bind `PATH` and accept there, and write `PATH`, which it
-creates and removes, and `PATH.lock`; it may refuse the server a connection
-to `PATH`.
+user and a file of another kind, and the start is refused. So is a start that
+finds a symbolic link at `PATH` or at `PATH.lock`: the server follows neither.
+A sandbox's profile must let the server bind `PATH` and accept there, and
+write `PATH`, which it creates and removes, and `PATH.lock`; it may refuse
+the server a connection to `PATH`.
 `--port` names the server's lock and [record](#serve-record),
 `serve-PORT.lock` and `serve-PORT.json` in the runtime directory, as it does
 for every `--host`, so two socket servers take two ports though neither

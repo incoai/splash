@@ -1021,6 +1021,46 @@ class UnixSocketTests(HarnessTestCase):
             api.FrontendServer((f"unix:{self.path}", 0), None)
         self.assertEqual(Path(self.path).read_text(), "kept")
 
+    def test_a_symbolic_link_at_the_path_is_refused_and_stays(self):
+        """A symbolic link at the path is refused by name, one that points
+        nowhere as one to a leftover socket, and stays with what it points
+        to (bind followed the first and left the socket where it pointed,
+        which the close, removing the link, left behind; the second was
+        removed for a socket of the server's)."""
+        target = self.path + ".elsewhere"
+        for leftover in (False, True):
+            if leftover:
+                with socket.socket(socket.AF_UNIX) as killed:
+                    killed.bind(target)
+            os.symlink(target, self.path)
+            with (
+                self.subTest(leftover=leftover),
+                self.assertRaises(OSError) as refused,
+            ):
+                api.FrontendServer((f"unix:{self.path}", 0), None)
+            self.assertEqual(
+                str(refused.exception),
+                f"[Errno 62] the socket's path is a symbolic link: {self.path!r}",
+            )
+            self.assertEqual(os.readlink(self.path), target)
+            self.assertEqual(os.path.lexists(target), leftover)
+            os.unlink(self.path)
+
+    def test_the_lock_is_not_opened_through_a_symbolic_link(self):
+        """A symbolic link where the lock belongs is not followed: the start
+        is refused, naming it, and the file it points to is not created (the
+        lock was created, and held, wherever the link pointed)."""
+        target = self.path + ".elsewhere"
+        os.symlink(target, self.path + ".lock")
+        with self.assertRaises(OSError) as refused:
+            api.FrontendServer((f"unix:{self.path}", 0), None)
+        self.assertEqual(
+            (refused.exception.errno, refused.exception.filename),
+            (errno.ELOOP, self.path + ".lock"),
+        )
+        self.assertFalse(os.path.lexists(target))
+        self.assertFalse(os.path.lexists(self.path))
+
     @unittest.skipIf(os.geteuid() == 0, "root connects whatever a socket's mode says")
     def test_a_socket_this_user_may_not_connect_to_stays(self):
         """A socket whose permissions refuse this user a connection is not
