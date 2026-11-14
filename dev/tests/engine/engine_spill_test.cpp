@@ -194,6 +194,37 @@ void testConversionSpillsAHistoryWithCopies() {
           "the lane whose history had copies did not spill them when it converted");
 }
 
+// The same lane runs in the command it converts for: its pages whose copies landed release in its conversion's
+// take, so its command leaves the tick in flight. Left to its claim's next retry, the lane sat that command out, and
+// beside a prefill in passes the next pass ran first: a decode gap of 1,066 ms against the 838 ms of a pass and a
+// decode command in engine-sim's churn.
+void testAConversionWithCopiesRunsInTheCommandItConvertsFor() {
+  Spilling spill(400, false, 2'000, 0, {4}, {}, {.limitBytes = 2'000});
+  spill.engine.submit(Spilling::prompt(1, 1, 10, 4'096));
+  spill.runUntil([&] { return spill.events.outputs.contains(1); }, "the first turn did not decode");
+  for (int step = 0; step < 50; ++step) {
+    static_cast<void>(spill.engine.tick(spill.now++));
+    spill.tier.complete();
+  }
+  spill.engine.cancel(1);
+  spill.runUntilIdle();
+  spill.storage.budgetPages = 14;
+  spill.engine.submit(Spilling::prompt(2, 1, 10, 120));
+  // Checked after each tick, the one in which the lane converted.
+  std::optional<bool> ran;
+  spill.runUntil(
+      [&] {
+        if (spill.engine.snapshot().spill.converted == 1)
+          ran = spill.engine.commandInFlight();
+        return ran.has_value();
+      },
+      "the lane did not convert at the wall");
+  require(*ran, "the lane that converted did not run in the command it converted for");
+  spill.runUntilIdle();
+  require(spill.events.usage.contains(2) && spill.events.usage.at(2).second == 120,
+          "the converted lane did not decode its whole output");
+}
+
 // A converted lane preempted and resumed stays Spill under its output limit when the quota holds its
 // projection; a quota short of it bounds the resume, and the bound and the end at it count as the
 // converted lane's.
@@ -4526,6 +4557,8 @@ std::span<const test::TestCase> spillTests() {
       {"testSpillCommitmentCoversTheChainWithoutCopies", testSpillCommitmentCoversTheChainWithoutCopies},
       {"testConversionCommitsTheHistoryWithoutCopies", testConversionCommitsTheHistoryWithoutCopies},
       {"testConversionSpillsAHistoryWithCopies", testConversionSpillsAHistoryWithCopies},
+      {"testAConversionWithCopiesRunsInTheCommandItConvertsFor",
+       testAConversionWithCopiesRunsInTheCommandItConvertsFor},
       {"testAConvertedLaneResumesUnderTheSpillRules", testAConvertedLaneResumesUnderTheSpillRules},
       {"testAConvertedLanesMovesReleaseTheExtentsTheyEmpty", testAConvertedLanesMovesReleaseTheExtentsTheyEmpty},
       {"testALongDecodingLaneConvertsItselfAtTheWall", testALongDecodingLaneConvertsItselfAtTheWall},

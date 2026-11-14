@@ -78,12 +78,16 @@ struct PassProgress final {
 // them back this tick), the shapes of the resident prefill lanes and, for
 // admission, of the candidates, the command between its passes, if any,
 // and, for admission, the admitted requests that restore their prefix from
-// the SSD cache before they run, each from the boundary it restores to.
+// the SSD cache before they run, each from the boundary it restores to;
+// then which of the lanes left out wait for memory on its way back, and the
+// time now, by which a prefill unit waits for decoders among them (next).
 struct PlanInputs final {
   std::span<const uint64_t> excluded;
   std::span<const LaneShape> shapes;
   const PassProgress *passes = nullptr;
   std::span<const PrefillAdmission> restoring;
+  std::span<const uint64_t> landing;
+  double now = 0.0;
 };
 
 struct SchedulerSnapshot final {
@@ -180,8 +184,12 @@ public:
   // The next command, planned without the excluded lanes. While a command is
   // between its passes (in.passes), that is its next pass or decode, as its
   // priority and the decode share order them, or a prefill plan of a higher
-  // priority.
+  // priority. None while the next prefill unit waits for a decoder whose
+  // memory lands (waitsForDecoders).
   [[nodiscard]] std::optional<BatchPlan> next(const PlanInputs &in) const;
+  // When the next prefill unit's wait for a decoder whose memory lands ends,
+  // the last unit's time after it began; none while it does not wait.
+  [[nodiscard]] std::optional<double> holdEndMilliseconds() const noexcept;
   // Whether `plan` is a prefill plan other than the next pass of the command
   // between its passes, which is abandoned before it commits.
   [[nodiscard]] bool abandonsPasses(const BatchPlan &plan, const PlanInputs &in) const;
@@ -311,6 +319,13 @@ private:
   [[nodiscard]] std::optional<Planned> planPrefill(std::vector<Lane> ready) const;
   [[nodiscard]] std::optional<BatchPlan> nextPrefill(const PlanInputs &in) const;
   [[nodiscard]] std::optional<BatchPlan> nextDecode(std::span<const uint64_t> excluded) const;
+  // Whether `prefill` waits, as no decode can run, for a decoder of its
+  // priority or a higher one that waits for memory on its way back and has
+  // not decoded since the last prefill unit began, whose gap the unit would
+  // hold a second unit of: while the prefill owes decode time, which the
+  // wait works off as that decoder's decode would (commit), for at most the
+  // time the last unit took.
+  [[nodiscard]] bool waitsForDecoders(const BatchPlan &prefill, const PlanInputs &in) const;
   // Debt is owed only to requests that decode or wait for a mask: once the
   // last one leaves, a later decoder starts without it.
   void dropStaleDecodeDebt() noexcept;
@@ -334,8 +349,18 @@ private:
   double decodeShare_;
   // Decode time that prefill still owes the lanes that decoded beside it
   // (not those waiting for a mask): equal-priority decode runs until its
-  // commands' wall time has worked it off.
+  // commands' wall time, and the time the next prefill unit waited for
+  // decoders whose memory lands (waitsForDecoders), have worked it off.
   double decodeDebtMilliseconds_ = 0.0;
+  // The wall time of the last prefill unit that owed decode time, which
+  // bounds the next unit's wait for decoders whose memory lands.
+  double unitMilliseconds_ = 0.0;
+  // When the next prefill unit began to wait for such a decoder, until a
+  // command commits.
+  mutable std::optional<double> heldSince_;
+  // The decode dispatch order when the last prefill unit committed: a lane
+  // whose last decode dispatch is no later has not decoded since.
+  uint64_t prefillDispatchOrder_ = 0;
   std::optional<WorkKind> lastCommittedKind_;
   // A prefill command as it ran: its rows, the attention pairs of its
   // heaviest layer, its rows' time over its passes and in its heaviest, and
