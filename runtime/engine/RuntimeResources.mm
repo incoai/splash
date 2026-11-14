@@ -948,6 +948,24 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
           RuntimeResourceStage::MemoryPlanning,
           std::string("model allocated-size plan is invalid: ") + error.what());
     }
+    // The stores were sized beside the arenas the model's files planned
+    // (planArenas), and the engine's plan holds those of the model as it
+    // loaded: one quantity from two sources, which a start requires equal,
+    // for the K/V in memory and where it spills, rather than serve stores
+    // sized for another model's arenas.
+    const auto requirePlanned = [&](uint64_t planned, const model::ModelMemoryPlan &as, const char *runtime) {
+      const uint64_t loadedBytes = as.sharedPrefillPlannedAllocatedBytes + as.sharedDecodePlannedAllocatedBytes;
+      if (planned != loadedBytes)
+        throw RuntimeResourcesError(RuntimeResourceStage::MemoryPlanning,
+                                    std::string("the arenas of ") + runtime + " that the model's files planned, " +
+                                        std::to_string(planned) + " bytes, are not those of the model as it loaded, " +
+                                        std::to_string(loadedBytes) + " bytes");
+    };
+    const bool tableStreams = loaded.streamedTable() != nullptr;
+    requirePlanned(arenaBytes[loaded.expertStore() != nullptr][tableStreams], modelMemoryPlan,
+                   "a runtime whose K/V is in memory");
+    if (kvMaySpill)
+      requirePlanned(spillArenaBytes[tableStreams], spillModelMemoryPlan, "a runtime whose K/V spills");
   };
   load(false);
 
