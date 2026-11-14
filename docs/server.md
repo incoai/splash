@@ -710,7 +710,9 @@ passed it, for Flint 14 of its 49 layers, 464 KiB where a whole page takes
 1.59 MiB, so the same quota holds 3.5 times as many tokens of such pages as of
 whole ones. A file keeps a whole page's room for each copy and leaves the
 part a copy does not fill unallocated, so its length (`ls -l`) can pass the
-quota while the space it takes (`du`) stays within it. That needs a volume
+quota while the space it takes (`du`) stays within it, beside up to about
+16 MiB that APFS allocates past the files' ends as they grow and keeps until it
+drops it on its own. That needs a volume
 that gives the unused part of a file back, as APFS does; on one that does not,
 such as HFS+ or exFAT, every copy counts a whole page's or state's room, and
 the log says so once.

@@ -2550,9 +2550,24 @@ the file's slots hold returns the hole before it
 keep a hole at the file's end: a write into one has all of it allocated up to
 the write, so when the last slot that holds blocks is freed the file ends with
 the one below that does (`SlotFile::Backing::released`). With both, each
-slot's extents on the volume are its payload's host pages, slot by slot, in a
-3 GiB cache of 5,856 Flint pages; the volume's own count of the file's blocks
-ran 0.5% above them. A full quota of temporary files replaces the oldest
+slot's extents on the volume are its payload's host pages, slot by slot: in a
+3 GiB cache of 6,417 Flint pages, `SEEK_DATA` and `F_LOG2PHYS_EXT` map
+3,202,039,808 bytes of the KV file in 8,175 extents, as many as its slots
+count. The file's `st_blocks` ran 0.5% above that, and all of the difference
+lay past the file's end, where the cache writes nothing. APFS allocates ahead
+of a file that grows by writes spread over time: Slim pages written into new
+slots 60 ms apart, each past the end, kept up to 11.3 MiB beyond it, and
+appends of 1 MiB 100 ms apart 768 KiB. It keeps those blocks after the file
+closes until it drops them on its own; a truncation to the file's own length
+or an `fsync` leaves them, cloning the file drops them. In that cache they
+were 14.5 MiB past the KV file's end and 768 KiB past the state file's, from
+1.1 to 15.8 MiB past the KV file's after each of the ten prompts that filled
+it, and gone within six minutes of the engine's exit; a second run's stayed
+five minutes after it. No slot holds them, so the quota does not count them
+and the cache cannot give them back; the limit's rule, which reads the files'
+blocks (`DiskSpace::measure`), counts them as the tier's, as it counts the
+records files (1.2 MiB beside those 3 GiB), which hold no slot either. A full
+quota of temporary files replaces the oldest
 redundant copy first, then the oldest sole copy, across both
 KV and states; sole copies of states in use, and the KV they restore through,
 make room only for a copy that is itself in use, and last. A persistent tier
