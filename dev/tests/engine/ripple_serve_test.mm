@@ -148,7 +148,7 @@ int main(int argc, char **argv) {
     const double loadSeconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - loadBegan).count();
     std::cout << "loaded in " << loadSeconds << " s\n";
 
-    const splash::ops::ExecutionPlans operators(backend.capabilities());
+    const splash::ops::ExecutionPlans operators(backend.capabilities(), ops::Int8Activations::Off);
     engine::MemoryGovernor governor(backend, backend.capabilities().recommendedMaxWorkingSetBytes, 1, 1,
                                     engine::queryHostMemory, 0);
     const test::ClaimScope claim(governor, engine::ClaimClass::Floor);

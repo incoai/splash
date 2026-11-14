@@ -435,7 +435,7 @@ void checkValues(const Outcome &out, const Want &want, const Want &gate, const s
                 withGate(clamped(p, 20.0F), std::clamp(bf16ToFloat(aux[i]), -20.0F, 20.0F)));
           break;
         case LinearEpilogue::ClampedGateUp:
-          check("the gate", i, out.gate[i], projected(gateDots[i], staged));
+          check("the gate", i, out.gate[i], gate(i));
           check("the output", i, out.output[i],
                 withGate(clamped(p, 20.0F), std::clamp(bf16ToFloat(out.gate[i]), -20.0F, 20.0F)));
           break;

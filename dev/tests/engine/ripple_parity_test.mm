@@ -11,6 +11,7 @@
 #include "ops/RowCopy.hpp"
 #include "model/ModelFactory.hpp"
 #include "model/RuntimeArenas.hpp"
+#include "model/Runtime.hpp"
 #include "ops/ExecutionPlans.hpp"
 #include "ops/PagedKv.hpp"
 #include "ops/PageStorage.hpp"
@@ -388,6 +389,12 @@ MetalBuffer upload(MetalBackend &backend, const std::vector<uint32_t> &values, c
   return buffer;
 }
 
+MetalBuffer uploadFloats(MetalBackend &backend, const std::vector<float> &values, const char *label) {
+  MetalBuffer buffer = backend.allocateBuffer(values.size() * 4, BufferStorage::Shared, label);
+  std::memcpy(buffer.contents(), values.data(), values.size() * 4);
+  return buffer;
+}
+
 } // namespace
 
 int main(int argc, char **argv) {
@@ -431,7 +438,7 @@ int main(int argc, char **argv) {
     const std::filesystem::path root("dev/tests/fixtures/ripple-tiny");
     const LoadedModel model = splash::model::loadModel(backend, root, descriptor);
 
-    const ExecutionPlans operators(backend.capabilities());
+    const ExecutionPlans operators(backend.capabilities(), ops::Int8Activations::Off);
     const RuntimeGeometry geometry =
         RuntimeGeometry::from(model, kv::Format::BFloat16, splash::ops::GdnStateFormat::Float32);
     auto target = std::visit(
@@ -458,18 +465,31 @@ int main(int argc, char **argv) {
     const auto expected = reference.logits(tokens);
 
     MetalBuffer logits;
-    model::withPrefillArena(backend, model, operators, kv::Format::BFloat16,
-                            [&](const QwenTargetPrefillBuffers &buffers) {
+    const model::PrefillArena prefillArena(backend, geometry, operators);
+    const model::QwenTargetPrefillBuffers buffers = model::prefillBuffers(prefillArena, 0);
+    {
       CommandGraph graph;
       // The RoPE tables of the chunk's rows, then the scaled embeddings.
       // A row's position is triple {row, row, row} (an image's grid position
       // for a text row), as RoPE::addTables reads.
       const MetalBuffer positions =
           upload(backend, {0, 0, 0, 1, 1, 1, 2, 2, 2, 3, 3, 3}, "rope positions");
-      // A draft table of no rows: the kernel still takes its buffers.
+      // A draft table of no rows: the kernel still takes its buffers. The
+      // inverse frequencies the arena's tensors held, on the host.
       const MetalBuffer none = backend.allocateBuffer(4, BufferStorage::Shared, "unbound");
-      ops::RoPE::addTables(graph, positions, none, buffers.ropeInverseFrequencies, none, buffers.ropeCos,
-                           buffers.ropeSin, none, none,
+      const MetalBuffer inverse = uploadFloats(
+          backend, [] {
+            std::vector<float> values(kPairs);
+            for (uint32_t pair = 0; pair < kPairs; ++pair)
+              values[pair] = std::pow(kTheta, -static_cast<float>(pair) / kPairs);
+            return values;
+          }(), "target inverse frequencies");
+      const MetalBuffer ropeCos =
+          backend.allocateBuffer(uint64_t{kRows} * kPairs * sizeof(float), BufferStorage::Shared, "rope cosine");
+      const MetalBuffer ropeSin =
+          backend.allocateBuffer(uint64_t{kRows} * kPairs * sizeof(float), BufferStorage::Shared, "rope sine");
+      ops::RoPE::addTables(graph, positions, none, inverse, none, ropeCos,
+                           ropeSin, none, none,
                            {.target_rows = kRows, .draft_rows = 0, .target_scale = 1.0F}, kRows, kPairs);
       const MetalBuffer tokenBuffer = upload(backend, tokens, "prefill tokens");
       target->addEmbedding(graph, tokenBuffer, buffers.hidden[0], kRows);
@@ -518,11 +538,19 @@ int main(int argc, char **argv) {
         ops::RowCopy::add(graph, finalHidden[0], {row, kHidden, 0}, headInput, {row, kHidden, 0}, 1, kHidden);
       target->addHeadBatch(graph, headInput, finalHidden0, logitsBuffer, 1, kVerifyRows,
                            decodeArena.linearScratch());
-      static_cast<void>(backend.submitCommandAsync(graph.dispatches()).wait());
-      logits = logitsBuffer;
-    });
+    static_cast<void>(backend.submitCommandAsync(graph.dispatches()).wait());
+    if (const char *ropeDebug = std::getenv("SPLASH_DEBUG_ROPE")) {
+      static_cast<void>(ropeDebug);
+      const auto *cos = static_cast<const float *>(ropeCos.contents());
+      const auto *sin = static_cast<const float *>(ropeSin.contents());
+      for (uint32_t row = 0; row < 2; ++row)
+        std::fprintf(stderr, "rope row %u: cos[0]=%.6f sin[0]=%.6f cos[1]=%.6f sin[1]=%.6f\n",
+                     row, cos[row * kPairs], sin[row * kPairs], cos[row * kPairs + 1], sin[row * kPairs + 1]);
+    }
+    logits = logitsBuffer;
+  }
 
-    // The logits of the last row against the reference's. The engine's
+  // The logits of the last row against the reference's. The engine's
     // path stages bf16 between ops, whose rounding the fp64 reference does
     // not take; the gate holds the pipeline's accumulated rounding, which
     // the report prints.

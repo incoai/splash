@@ -205,7 +205,7 @@ int main(int argc, char **argv) {
     const double loadSeconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - loadBegan).count();
     std::cout << "loaded in " << loadSeconds << " s\n";
 
-    const ExecutionPlans operators(backend.capabilities());
+    const ExecutionPlans operators(backend.capabilities(), ops::Int8Activations::Off);
     const RuntimeGeometry geometry =
         RuntimeGeometry::from(model, kv::Format::BFloat16, splash::ops::GdnStateFormat::Float32);
     auto target = std::visit(

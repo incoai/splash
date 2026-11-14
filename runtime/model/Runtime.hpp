@@ -9,6 +9,8 @@
 
 namespace splash::model {
 
+class PrefillArena;
+
 class RuntimeInstrumentation;
 
 class Runtime final : public RuntimeModel {
@@ -98,4 +100,8 @@ private:
   std::unique_ptr<Impl> impl_;
 };
 
+  // A prefill arena's tensors as the target's prefill commands read them,
+  // for tests that assemble a prefill command directly (model/Runtime.cpp).
+  [[nodiscard]] QwenTargetPrefillBuffers prefillBuffers(const PrefillArena &arena,
+                                                        uint32_t chunk);
 } // namespace splash::model

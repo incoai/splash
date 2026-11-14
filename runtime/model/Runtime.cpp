@@ -247,7 +247,7 @@ DFlashPrefillBuffers draftPrefillBuffers(const PrefillArena &arena, uint32_t chu
 // A prefill arena's tensors as the target's prefill reads them.
 // The buffers of a prefill group's chunk `chunk`: its rows of the group's
 // tensors (prefillGroupTensor), and the arena's others.
-QwenTargetPrefillBuffers prefillBuffers(const PrefillArena &arena, uint32_t chunk) {
+QwenTargetPrefillBuffers prefillBuffersFor(const PrefillArena &arena, uint32_t chunk) {
   QwenTargetPrefillBuffers buffers;
   buffers.linearScratch = prefillScratch(arena);
   buffers.hidden = {arena.get(PrefillTensor::Hidden0, chunk), arena.get(PrefillTensor::Hidden1, chunk)};
@@ -281,6 +281,10 @@ QwenTargetPrefillBuffers prefillBuffers(const PrefillArena &arena, uint32_t chun
 }
 
 } // namespace
+
+QwenTargetPrefillBuffers prefillBuffers(const PrefillArena &arena, uint32_t chunk) {
+  return prefillBuffersFor(arena, chunk);
+}
 
 struct Runtime::Impl {
   // An image by content: the fields a placement's span identifies it by.
@@ -1829,7 +1833,8 @@ struct Runtime::Impl {
     }
     SpilledKvReads reads;
     CommandGraph graph;
-    encodeTargetVerifyBatchForward(graph, entries, items, reads);
+    encodeTargetVerifyBatchForward(graph, entries, items, reads, states.layout().draft.rows,
+                                   SPLASH_TARGET_VERIFY_ROWS, states.layout().draft.rows);
     backend.preparePipelines(graph.dispatches());
   }
 
@@ -3939,11 +3944,12 @@ std::vector<ops::SwiGluProjections> aneFfnLayers(const LoadedModel &model) {
 
 void withPrefillArena(
     MetalBackend &backend, const LoadedModel &model, const ops::ExecutionPlans &operators, kv::Format format,
-    const std::function<void(const QwenTargetPrefillBuffers &)> &use) {
+    const std::function<void(const ops::PrefillFfnBuffers &, const std::array<MetalBuffer, 2> &)> &use) {
   // A prefill arena holds no state cell, so either state format sizes it.
   const PrefillArena arena(backend, RuntimeGeometry::from(model, format, ops::GdnStateFormat::Float32),
                            operators);
-  use(prefillBuffers(arena, 0));
+  const QwenTargetPrefillBuffers buffers = prefillBuffers(arena, 0);
+  use(buffers.ffn(), buffers.hidden);
 }
 
 ModelMemoryPlan plannedRuntimeMemory(const LoadedModel &model,

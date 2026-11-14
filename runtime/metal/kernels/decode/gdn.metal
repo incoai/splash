@@ -453,14 +453,14 @@ inline void gdn_decode_batch_phase(
 // Entries without a table pass null pointers, which skip the write; their Layout only completes the template.
 #define GDN_DECODE_KERNEL(Name, KeyHeads, ValueHeads, HeadDim, ConvDim, PackedWidth, W, State) \
   kernel void Name(GDN_DECODE_BUFFERS(W), \
-      constant GDNDecodeBatchParams &params [[buffer(16)]], GDN_DECODE_THREADS) { \
+      constant GDNDecodeBatchParams &params [[buffer(17)]], GDN_DECODE_THREADS) { \
     GDN_DECODE_BODY(KeyHeads, ValueHeads, HeadDim, ConvDim, PackedWidth, nullptr, nullptr, gguf_sg::Table16, W, State) \
   }
 // The out-projection's table (Layout: gguf_sg::Table16).
 #define GDN_DECODE_TABLE_KERNEL(Name, KeyHeads, ValueHeads, HeadDim, ConvDim, PackedWidth, Layout, W, State) \
   kernel void Name(GDN_DECODE_BUFFERS(W), \
     device bfloat *table [[buffer(17)]], device float *sums [[buffer(18)]], \
-      constant GDNDecodeBatchParams &params [[buffer(18)]], GDN_DECODE_THREADS) { \
+      constant GDNDecodeBatchParams &params [[buffer(19)]], GDN_DECODE_THREADS) { \
     GDN_DECODE_BODY(KeyHeads, ValueHeads, HeadDim, ConvDim, PackedWidth, table, sums, Layout, W, State) \
   }
 // Each entry over an fp32 state and, as Name_bf16_state, a bf16 one.

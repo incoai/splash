@@ -113,7 +113,7 @@ int main(int argc, char **argv) {
 
     const uint32_t lanes = 1;
     CommandGraph project;
-    const Linear linear(backend.capabilities());
+    const Linear linear(backend.capabilities(), splash::ops::Int8Activations::Off);
     const LinearPlan plan = linear.decodePlan(placed, lanes);
     const LinearScratchSize size = plan.scratchSize();
     const auto zeros = [&](uint64_t bytes, const char *label) {

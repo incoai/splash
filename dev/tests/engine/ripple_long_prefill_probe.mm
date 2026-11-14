@@ -88,7 +88,7 @@ int main(int argc, char **argv) {
     const splash::model::ModelDescriptor descriptor = splash::model::inspectModelRoot(root);
     splash::test::require(descriptor.valid(), "the probe's model descriptor is not valid");
     const splash::model::LoadedModel model = splash::model::loadModel(backend, root, descriptor);
-    const splash::ops::ExecutionPlans operators(backend.capabilities());
+    const splash::ops::ExecutionPlans operators(backend.capabilities(), ops::Int8Activations::Off);
 
     const splash::model::RuntimeGeometry geometry = splash::model::RuntimeGeometry::from(
         model, splash::kv::Format::Int8, splash::ops::GdnStateFormat::Float32);

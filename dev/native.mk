@@ -1036,3 +1036,30 @@ $(TEST_RIPPLE_LOAD): dev/tests/engine/ripple_load_test.mm \
 	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) -fobjc-arc $< \
 		$(ENGINE_LIBRARY) $(ENGINE_LINKFLAGS) -o $@
 
+
+# The fast, representative loop for the Ripple serving changes: the suites
+# the touched kernels and runtime paths actually exercise, run concurrently
+# with shader validation off (the full suite keeps it on). A green run here
+# is the signal to iterate; test-engine-metal remains the checkpoint gate.
+.PHONY: test-ripple-fast
+test-ripple-fast: $(TEST_RIPPLE_PARITY) $(TEST_RIPPLE_LOAD) $(TEST_RIPPLE_CHAIN) \
+		$(TEST_RIPPLE_VALUE_MIX) $(TEST_GDN_DECODE_TEST) $(TEST_GDN_METAL_TEST) \
+		$(TEST_DFLASH_BATCH_CONTROL_TEST) $(TEST_DRAFT_ATTENTION_TEST) \
+		$(TEST_DRAFT_SELECTOR_TEST) $(TEST_TARGET_SAMPLING_TEST) $(LIB)
+	@rm -f $(ENGINE_TEST_BUILD)/.ripple-fast-*.log
+	@status=0; \
+	{ $(METAL_TEST_ENV) $(TEST_RIPPLE_PARITY) $(LIB) > $(ENGINE_TEST_BUILD)/.ripple-fast-parity.log 2>&1 & \
+	  $(METAL_TEST_ENV) $(TEST_RIPPLE_LOAD) $(LIB) > $(ENGINE_TEST_BUILD)/.ripple-fast-load.log 2>&1 & \
+	  $(METAL_TEST_ENV) $(TEST_RIPPLE_CHAIN) $(LIB) > $(ENGINE_TEST_BUILD)/.ripple-fast-chain.log 2>&1 & \
+	  $(METAL_TEST_ENV) $(TEST_RIPPLE_VALUE_MIX) $(LIB) > $(ENGINE_TEST_BUILD)/.ripple-fast-valuemix.log 2>&1 & \
+	  $(METAL_TEST_ENV) $(TEST_GDN_DECODE_TEST) $(LIB) > $(ENGINE_TEST_BUILD)/.ripple-fast-gdndecode.log 2>&1 & \
+	  $(METAL_TEST_ENV) $(TEST_GDN_METAL_TEST) $(LIB) > $(ENGINE_TEST_BUILD)/.ripple-fast-gdn.log 2>&1 & \
+	  $(METAL_TEST_ENV) $(TEST_DFLASH_BATCH_CONTROL_TEST) $(LIB) > $(ENGINE_TEST_BUILD)/.ripple-fast-batch.log 2>&1 & \
+	  $(METAL_TEST_ENV) $(TEST_DRAFT_ATTENTION_TEST) $(LIB) > $(ENGINE_TEST_BUILD)/.ripple-fast-draftatt.log 2>&1 & \
+	  $(METAL_TEST_ENV) $(TEST_DRAFT_SELECTOR_TEST) $(LIB) > $(ENGINE_TEST_BUILD)/.ripple-fast-draftsel.log 2>&1 & \
+	  $(METAL_TEST_ENV) $(TEST_TARGET_SAMPLING_TEST) $(LIB) > $(ENGINE_TEST_BUILD)/.ripple-fast-sampling.log 2>&1 & \
+	}; wait; \
+	for log in $(ENGINE_TEST_BUILD)/.ripple-fast-*.log; do \
+	  if grep -q "FAIL\|Assertion\|failed" $$log; then echo "FAIL: $$log"; cat $$log | tail -3; status=1; fi; \
+	  if grep -q "PASS\|ok" $$log; then echo "ok: $$(basename $$log .log)"; fi; \
+	done; exit $$status

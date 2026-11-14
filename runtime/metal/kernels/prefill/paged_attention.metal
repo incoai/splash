@@ -99,11 +99,11 @@ PAGED_PREFILL_SPLIT(prefill_attention_q8q_split_kv2_g16, 2, 16, 256, 0, int8_t, 
 PAGED_PREFILL_SPLIT(prefill_attention_q8q_split_kv4_g8_d128, 4, 8, 128, 0, int8_t, true)
 PAGED_PREFILL_SPLIT(prefill_attention_q8q_split_kv4_g8_d128_w512, 4, 8, 128, 512, int8_t, true)
 // BF16 shares the page loop and reduction, without quantization scales.
-PAGED_PREFILL_SPLIT(prefill_attention_bf16_split, 4, 6, 256, 0, bfloat)
-PAGED_PREFILL_SPLIT(prefill_attention_bf16_split_kv2_g8, 2, 8, 256, 0, bfloat)
-PAGED_PREFILL_SPLIT(prefill_attention_bf16_split_kv2_g16, 2, 16, 256, 0, bfloat)
+PAGED_PREFILL_SPLIT(prefill_attention_bf16_split, 4, 6, 256, 0, bfloat, false)
+PAGED_PREFILL_SPLIT(prefill_attention_bf16_split_kv2_g8, 2, 8, 256, 0, bfloat, false)
+PAGED_PREFILL_SPLIT(prefill_attention_bf16_split_kv2_g16, 2, 16, 256, 0, bfloat, false)
 PAGED_PREFILL_SPLIT(prefill_attention_bf16_split_kv4_g8_d128, 4, 8, 128, 0, bfloat, false)
-PAGED_PREFILL_SPLIT(prefill_attention_bf16_split_kv4_g8_d128_w512, 4, 8, 128, 512, bfloat)
+PAGED_PREFILL_SPLIT(prefill_attention_bf16_split_kv4_g8_d128_w512, 4, 8, 128, 512, bfloat, false)
 // Eight KV heads of 128 over ten query heads each, over the whole history and
 // over a window of the 1023 keys before each row (Ripple's, whose
 // sliding window of 1024 keys includes its own).

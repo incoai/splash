@@ -42,7 +42,6 @@ public:
       uint32_t lanes, uint32_t queryHeads, kv::Layout layout,
       std::span<const uint32_t> historyTokens, AttentionVariant variant = {}) const;
   [[nodiscard]] DraftAttentionPlan draftAttention(
-  [[nodiscard]] DraftAttentionPlan draftAttention(
       DraftAttentionShape shape, uint32_t lanes,
       uint32_t rows = SPLASH_DRAFT_QUERY_ROWS) const;
   // The plans of a MoE target's blocks, whose routers are in `routerFormat`
