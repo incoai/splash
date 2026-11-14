@@ -2629,10 +2629,17 @@ or an `fsync` leaves them, cloning the file drops them. In that cache they
 were 14.5 MiB past the KV file's end and 768 KiB past the state file's, from
 1.1 to 15.8 MiB past the KV file's after each of the ten prompts that filled
 it, and gone within six minutes of the engine's exit; a second run's stayed
-five minutes after it. No slot holds them, so the quota does not count them
+five minutes after it. A file that a few large writes grow keeps more for its
+size: with the 27B's states of 153 MiB, `state.slots` held 8.4 MiB past its end
+with one state (5.5% of its length), in a cache 1.6.1 wrote and in a fresh one
+alike, and 15.8 MiB with two (5.2%), beside 1.9 MiB past a `kv.slots` of 142
+MiB (1.3%); in another run the two files, 451.5 MiB long together, held 29.6
+MiB more than that (6.5%). These are measurements, not a bound: what APFS keeps
+follows how the file grew. No slot holds them, so the quota does not count them
 and the cache cannot give them back; the limit's rule, which reads the files'
 blocks (`DiskSpace::measure`), counts them as the tier's, as it counts the
-records files (1.2 MiB beside those 3 GiB), which hold no slot either. A full
+records files (1.2 MiB beside the Flint cache's 3 GiB), which hold no slot
+either. A full
 quota of temporary files replaces the oldest
 redundant copy first, then the oldest sole copy, across both
 KV and states; sole copies of states in use, and the KV they restore through,
