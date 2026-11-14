@@ -89,7 +89,8 @@ still sleep, and closing the lid or choosing Sleep still sleeps the Mac.
 
 `splash serve` writes what it is at to `serve-PORT.json` in the runtime
 directory ([files Splash writes](#files-splash-writes)), beside the lock it
-holds, `serve-PORT.lock`. The record is one JSON object, replaced atomically,
+holds, `serve-PORT.lock`, in which it names its `pid`, `model`, `port` and
+`--host` as `host`. The record is one JSON object, replaced atomically,
 with the server's `pid` and its `phase`:
 
 | `phase` | The server |
@@ -246,10 +247,10 @@ listens on one; `/status` reports `instance.host` as `unix:PATH` and
 `curl --unix-socket PATH http://localhost/health`, and the Host check applies
 as it does over TCP: a request names the server `localhost`, a loopback
 address or an `--allowed-host` name. The agent commands reach a server at
-`127.0.0.1:PORT` alone and find none where it listens on a socket: forward a
-loopback TCP port to the socket and give them that port, whose
-`Host: 127.0.0.1:PORT` the relay passes on and the check accepts. The desktop
-app serves on TCP alone.
+`127.0.0.1:PORT` alone and find none where it listens on a socket, which their
+refusal names ([agent launchers](#agent-launchers)): forward a loopback TCP
+port to the socket and give them that port, whose `Host: 127.0.0.1:PORT` the
+relay passes on and the check accepts. The desktop app serves on TCP alone.
 
 Set `SPLASH_API_KEY` in the server and agent shells to require authentication;
 `serve --api-key KEY` overrides the server's environment value. Every request
@@ -1294,8 +1295,15 @@ count. Text completions have no reasoning split and refuse a budget with 400.
 Agents must already be installed; `splash claude|opencode|codex|hermes|pi`
 connects to the running server. Arguments pass through, for example
 `splash codex resume --last` or `splash hermes chat -q "Hello"`. `splash`
-reaches the server on loopback without a proxy. Where the environment names a
-proxy (`http_proxy`, `https_proxy` or `all_proxy`, in either case), it adds
+reaches the server on loopback without a proxy, over TCP at
+`http://127.0.0.1:PORT`, once it is ready. Where none answers there but a
+Splash server holds the port, one that listens on another address or a UNIX
+socket or still starts, the refusal names that server as a second `serve` on
+the port does: its PID, model, port, `--host` and the phase of its [serve
+record](#serve-record), as in
+`(PID 4242, model ID, port 8000, host unix:/tmp/splash.sock, phase ready)`.
+Where the environment names a proxy (`http_proxy`, `https_proxy` or
+`all_proxy`, in either case), it adds
 `127.0.0.1`, `localhost` and `::1` to the agent's `NO_PROXY` and `no_proxy`,
 keeping the hosts already there and leaving `*` as it is, so no proxy receives
 the server's key. A proxy set only in macOS system settings is left to that

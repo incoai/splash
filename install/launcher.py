@@ -260,7 +260,16 @@ def _prepare_local_model(args):
     return prepared
 
 
+def _printable(value):
+    """Whether `value` is a string a line can show as it is."""
+    return isinstance(value, str) and value != "" and value.isprintable()
+
+
 def _serve_lock_owner(lock):
+    """The process holding a port's lock, in the words a refusal gives it:
+    its PID, model and port, as serve wrote them in the lock, with its
+    --host where the lock names one and the phase its serve record says
+    where the record is that PID's; nothing for a lock without them."""
     try:
         lock.seek(0)
         owner = json.load(lock)
@@ -272,14 +281,38 @@ def _serve_lock_owner(lock):
     if (
         type(pid) is not int
         or pid <= 0
-        or not isinstance(model, str)
-        or not model
-        or not model.isprintable()
+        or not _printable(model)
         or type(port) is not int
         or not 1 <= port <= 65535
     ):
         return ""
-    return f" (PID {pid}, model {model}, port {port})"
+    words = [f"PID {pid}", f"model {model}", f"port {port}"]
+    if _printable(host := owner.get("host")):
+        words.append(f"host {host}")
+    try:
+        record = json.loads(_serve_record(port).read_bytes())
+    except (OSError, ValueError):
+        record = None
+    if isinstance(record, dict) and record.get("pid") == pid:
+        if _printable(phase := record.get("phase")):
+            words.append(f"phase {phase}")
+    return f" ({', '.join(words)})"
+
+
+def _port_holder(port):
+    """The words _serve_lock_owner gives the process holding `port`'s lock,
+    or None while none holds it: the lock taken shared without waiting,
+    which only a holder refuses, as the app probes it."""
+    try:
+        lock = _serve_lock(port).open()
+    except OSError:
+        return None
+    with lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return _serve_lock_owner(lock)
+    return None
 
 
 def _check_port(host, port):
@@ -436,7 +469,17 @@ def serve(args):
             ) from None
         lock.seek(0)
         lock.truncate()
-        json.dump({"pid": os.getpid(), "model": args.model, "port": args.port}, lock)
+        # With where it listens, which an agent command that finds no server
+        # at 127.0.0.1:PORT names (coding_client).
+        json.dump(
+            {
+                "pid": os.getpid(),
+                "model": args.model,
+                "port": args.port,
+                "host": args.host,
+            },
+            lock,
+        )
         lock.flush()
         # The record is the lock holder's: from here on a start that fails
         # says why in it, as the server, which keeps this pid, does too. A
@@ -485,10 +528,21 @@ def coding_client(args):
     path = clients.find_executable(args.command)
     listing = _request_json("/v1/models", port=args.port)
     if listing is None:
-        message = (
-            f"No ready Splash server at {_base_url(args.port)}. "
-            "Run 'splash serve --model <HF_REPO_ID>' in another terminal first."
-        )
+        holder = _port_holder(args.port)
+        if holder is None:
+            message = (
+                f"No ready Splash server at {_base_url(args.port)}. "
+                "Run 'splash serve --model <HF_REPO_ID>' in another terminal first."
+            )
+        else:
+            # The server holding the port listens elsewhere, on another
+            # address or a UNIX socket, or is not ready yet; a second one
+            # would be refused the port.
+            message = (
+                f"No ready Splash server at {_base_url(args.port)}, but Splash "
+                f"is serving{holder}. Agent commands connect over TCP on "
+                "loopback to a server that is ready."
+            )
         # OpenCode and Hermes have a --port of their own, which goes after --.
         if args.explicit_port:
             message += (

@@ -23,7 +23,7 @@ from dev.tests.server_fixtures import (
     server_arguments,
 )
 from install import launcher
-from server import serve_options
+from server import serve_options, serve_record
 from server import server as api
 
 MODEL_ID = "community/custom-splash"
@@ -201,6 +201,7 @@ class LauncherTests(unittest.TestCase):
                 "pid": os.getpid(),
                 "model": MODEL_ID,
                 "port": serve_options.DEFAULT_PORT,
+                "host": "127.0.0.1",
             }
 
             def check_install(chosen):
@@ -321,7 +322,11 @@ class LauncherTests(unittest.TestCase):
                 "pid": os.getpid(),
                 "model": "mlx-community/Qwen3.8-27B-4bit",
                 "port": 8000,
+                "host": "unix:/tmp/splash.sock",
             }
+            (runtime / "serve-8000.json").write_text(
+                json.dumps({"pid": os.getpid(), "phase": "loading"})
+            )
             with lock_path.open("w+") as held:
                 fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
                 json.dump(owner, held)
@@ -338,6 +343,8 @@ class LauncherTests(unittest.TestCase):
                 self.assertIn(f"PID {os.getpid()}", error.getvalue())
                 self.assertIn("model mlx-community/Qwen3.8-27B-4bit", error.getvalue())
                 self.assertIn("port 8000", error.getvalue())
+                self.assertIn("host unix:/tmp/splash.sock", error.getvalue())
+                self.assertIn("phase loading", error.getvalue())
                 self.assertEqual(json.loads(lock_path.read_text()), owner)
                 probe.assert_not_called()
                 install.assert_not_called()
@@ -907,6 +914,116 @@ class LauncherTests(unittest.TestCase):
                         mentioned,
                     )
         execute.assert_not_called()
+
+    def test_an_agent_command_names_the_server_that_holds_its_port(self):
+        """An agent command that finds no ready server at 127.0.0.1:PORT,
+        where a server holds the port nonetheless, names it: its PID and
+        model, where it listens, a UNIX socket or another address, and its
+        phase as its serve record says, from the start on."""
+        with (
+            tempfile.TemporaryDirectory(dir="/tmp") as temporary,
+            socket.socket() as unused,
+        ):
+            unused.bind(("127.0.0.1", 0))
+            port = unused.getsockname()[1]
+            unused.close()
+            os.environ["SPLASH_PORT"] = str(port)
+            record = launcher.RUNTIME_DIR / f"serve-{port}.json"
+            refusals = {}
+
+            def execute(binary, argv, environment):
+                # The record the server, keeping the launcher's pid, writes as
+                # its start goes on.
+                for phase, write in (
+                    ("starting", lambda: None),
+                    ("loading", lambda: serve_record.entered(record, "loading")),
+                    ("warming", lambda: serve_record.warming(record, 1, 4)),
+                    ("ready", lambda: serve_record.ready(record)),
+                ):
+                    write()
+                    with mock.patch("sys.stderr", io.StringIO()) as error:
+                        self.assertEqual(launcher.main(["claude"]), 1)
+                    console_written()
+                    refusals[phase] = error.getvalue()
+
+            for host in (f"unix:{temporary}/splash.sock", "192.0.2.1", "127.0.0.1"):
+                refusals.clear()
+                with (
+                    self.subTest(host=host),
+                    # Whether the address can be bound is not this test's.
+                    mock.patch.object(launcher, "_check_port"),
+                    mock.patch.object(launcher, "_ensure_installed"),
+                    mock.patch.object(launcher.os, "execve", side_effect=execute),
+                    mock.patch.object(
+                        launcher.clients, "find_executable", return_value="/bin/echo"
+                    ),
+                    mock.patch.object(launcher.os, "execvpe") as agent,
+                ):
+                    self.assertIsNone(
+                        launcher.main(["serve", "--model", MODEL_ID, "--host", host])
+                    )
+                    agent.assert_not_called()
+                    self.assertEqual(
+                        list(refusals), ["starting", "loading", "warming", "ready"]
+                    )
+                    for phase, said in refusals.items():
+                        self.assertEqual(
+                            said,
+                            f"error: No ready Splash server at http://127.0.0.1:{port}"
+                            f", but Splash is serving (PID {os.getpid()}, model "
+                            f"{MODEL_ID}, port {port}, host {host}, phase {phase})."
+                            " Agent commands connect over TCP on loopback to a "
+                            "server that is ready.\n",
+                        )
+
+    def test_an_exited_servers_lock_names_no_server_nor_another_pids_record_a_phase(
+        self,
+    ):
+        """The lock and the record a server that exited leaves name no server
+        to an agent command, and a record of another process's says nothing
+        of the server holding the lock."""
+        with socket.socket() as unused:
+            unused.bind(("127.0.0.1", 0))
+            port = unused.getsockname()[1]
+        os.environ["SPLASH_PORT"] = str(port)
+        lock = launcher.RUNTIME_DIR / f"serve-{port}.lock"
+        lock.write_text(
+            json.dumps(
+                {"pid": 4242, "model": MODEL_ID, "port": port, "host": "192.0.2.1"}
+            )
+        )
+        (launcher.RUNTIME_DIR / f"serve-{port}.json").write_text(
+            json.dumps({"pid": 123, "phase": "ready"})
+        )
+        with (
+            mock.patch.object(
+                launcher.clients, "find_executable", return_value="/bin/echo"
+            ),
+            mock.patch.object(launcher.os, "execvpe") as agent,
+        ):
+            for held in (False, True):
+                with (
+                    self.subTest(held=held),
+                    lock.open() as holder,
+                    mock.patch("sys.stderr", io.StringIO()) as error,
+                ):
+                    if held:
+                        fcntl.flock(holder, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    self.assertEqual(launcher.main(["codex"]), 1)
+                    console_written()
+                    self.assertEqual(
+                        error.getvalue(),
+                        f"error: No ready Splash server at http://127.0.0.1:{port}"
+                        + (
+                            f", but Splash is serving (PID 4242, model {MODEL_ID}, "
+                            f"port {port}, host 192.0.2.1). Agent commands connect "
+                            "over TCP on loopback to a server that is ready.\n"
+                            if held
+                            else ". Run 'splash serve --model <HF_REPO_ID>' in "
+                            "another terminal first.\n"
+                        ),
+                    )
+        agent.assert_not_called()
 
     def test_client_setup_works_while_status_is_unavailable(self):
         class Handler(BaseHTTPRequestHandler):
