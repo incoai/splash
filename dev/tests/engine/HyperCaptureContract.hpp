@@ -12,7 +12,12 @@ inline uint64_t captureProduct(uint64_t a, uint64_t b) {
 }
 inline void validateHyperCapture(const HyperStreamMeanParams &p, const std::array<CaptureRegion, 4> &regions) {
   if (!p.rows || !p.hidden || !p.streams || p.streams > HYPER_CONNECTION_MAXIMUM_STREAMS ||
-      uint64_t{p.column} + p.hidden > p.stride) throw std::invalid_argument("invalid capture geometry");
+      uint64_t{p.column} + p.hidden > p.stride ||
+      // The reference and candidate perform these indices in uint32, even
+      // though the enclosing buffer byte sizes are checked in uint64.
+      uint64_t{p.row} + p.rows - 1 > UINT32_MAX ||
+      uint64_t{p.rows} * p.streams > uint64_t{UINT32_MAX} + 1 ||
+      uint64_t{p.hidden} * p.streams > uint64_t{UINT32_MAX} + 1) throw std::invalid_argument("invalid capture geometry");
   const std::array<uint64_t, 4> need{
     captureProduct(captureProduct(p.rows, p.hidden), uint64_t{p.streams} * 4),
     captureProduct(captureProduct(p.rows, p.hidden), 2),

@@ -27,5 +27,11 @@ int main() {
   bad=p;bad.column=UINT32_MAX;rejects(bad,regions);
   bad=p;bad.row=UINT32_MAX;rejects(bad,regions);
   bad=p;bad.rows=bad.hidden=bad.stride=UINT32_MAX;bad.column=0;rejects(bad,regions);
+  // Generous synthetic capacities isolate index overflow from extent checks.
+  auto huge=regions; for(auto &region:huge) {region.offset=0;region.bytes=region.capacity=UINT64_MAX;}
+  bad=p;bad.row=UINT32_MAX;rejects(bad,huge);
+  bad=p;bad.rows=UINT32_MAX;rejects(bad,huge);
+  bad=p;bad.hidden=UINT32_MAX;bad.column=0;bad.stride=UINT32_MAX;rejects(bad,huge);
+  bad=p;bad.row=UINT32_MAX-7;accepts(bad,huge); // Last row exactly UINT32_MAX.
   std::cout<<count<<" buffer/alias/geometry contract checks passed (no Metal or model).\n";
 }

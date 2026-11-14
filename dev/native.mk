@@ -610,6 +610,8 @@ ENGINE_CPU_FAILED := $(ENGINE_TEST_BUILD)/test-engine-cpu.failed
 ENGINE_CPU_STEP = @step() { echo "$$*"; "$$@" || echo "$$*" >> $(ENGINE_CPU_FAILED); }; step
 test-engine-cpu: $(TEST_CPU_TARGETS) $(TEST_ATTENTION_SWEEP) $(TEST_BACKEND_BENCHMARK)
 	@: > $(ENGINE_CPU_FAILED)
+	$(ENGINE_CPU_STEP) $(TEST_DECODE_PROFILE_OPTIONS)
+	$(ENGINE_CPU_STEP) $(TEST_HYPER_CAPTURE_CONTRACT)
 	$(ENGINE_CPU_STEP) $(TEST_SLOT_FILE)
 	$(ENGINE_CPU_STEP) $(TEST_KV_SLOT_FORMAT)
 	$(ENGINE_CPU_STEP) $(TEST_KV_PAGE_TIER_HOST)
@@ -1002,3 +1004,6 @@ $(TEST_HYPER_CAPTURE_CONTRACT): dev/tests/engine/hyper_capture_contract_test.cpp
 .PHONY: test-hyper-capture-contract
 test-hyper-capture-contract: $(TEST_HYPER_CAPTURE_CONTRACT)
 	$(TEST_HYPER_CAPTURE_CONTRACT)
+
+# Keep model-free development contracts covered by the ordinary CPU CI gate.
+test-engine-cpu: $(TEST_DECODE_PROFILE_OPTIONS) $(TEST_HYPER_CAPTURE_CONTRACT)

@@ -30,13 +30,13 @@ int main(int argc, const char **argv) {
    id<MTLCommandQueue> queue = [device newCommandQueue]; require(queue != nil, "command queue unavailable");
    constexpr uint64_t pad = 128;
    unsigned cases = 0, rejected = 0, negativeControls = 0;
-   for (uint32_t rows : {1u, 5u, 8u, 16u, 24u, 32u}) for (uint32_t hidden : {1u, 255u, 256u, 257u, 2560u}) for (uint32_t slot : {0u, 1u, 3u}) {
+   for (uint32_t streamsCount : {1u, 2u, 3u, 4u}) for (uint32_t rows : {1u, 5u, 8u, 16u, 24u, 32u}) for (uint32_t hidden : {1u, 255u, 256u, 257u, 2560u}) for (uint32_t slot : {0u, 1u, 3u}) {
     @autoreleasepool {
      const uint32_t storageRows = rows == 24 ? 32 : rows;
-     HyperStreamMeanParams p{rows, hidden, 4, 2, hidden * 4, slot * hidden};
-     const uint64_t streamBytes = uint64_t{storageRows} * hidden * 4 * 4;
+     HyperStreamMeanParams p{rows, hidden, streamsCount, 2, hidden * 4, slot * hidden};
+     const uint64_t streamBytes = uint64_t{storageRows} * hidden * streamsCount * 4;
      const uint64_t captureBytes = uint64_t{p.row + storageRows + 1} * p.stride * 2;
-     const std::array<uint64_t, 4> sizes{streamBytes, uint64_t{rows} * hidden * 2, uint64_t{rows} * 4 * 4, captureBytes};
+     const std::array<uint64_t, 4> sizes{streamBytes, uint64_t{rows} * hidden * 2, uint64_t{rows} * streamsCount * 4, captureBytes};
      std::array<id<MTLBuffer>, 4> reference, candidate;
      for (size_t i = 0; i < 4; ++i) {
       reference[i] = [device newBufferWithLength:sizes[i] + pad * 2 options:MTLResourceStorageModeShared];
@@ -50,13 +50,13 @@ int main(int argc, const char **argv) {
      auto *weights = reinterpret_cast<float *>(static_cast<char *>(reference[2].contents) + pad);
      for (uint32_t r = 0; r < rows; ++r) {
       for (uint32_t d = 0; d < hidden; ++d) { branch[r * hidden + d] = bf16(rand(rng));
-       for (uint32_t s = 0; s < 4; ++s) streams[(uint64_t{r} * 4 + s) * hidden + d] = rand(rng); }
-      for (uint32_t s = 0; s < 4; ++s) weights[r * 4 + s] = rand(rng);
+       for (uint32_t s = 0; s < streamsCount; ++s) streams[(uint64_t{r} * streamsCount + s) * hidden + d] = rand(rng); }
+      for (uint32_t s = 0; s < streamsCount; ++s) weights[r * streamsCount + s] = rand(rng);
      }
      // Cancellation and signed-zero/rounding boundaries are deterministic.
-     for (uint32_t s = 0; s < 4; ++s) { streams[uint64_t{s} * hidden] = std::array<float,4>{16777216.f,1.f,-16777216.f,-0.f}[s]; weights[s] = 0; }
+     for (uint32_t s = 0; s < streamsCount; ++s) { streams[uint64_t{s} * hidden] = std::array<float,4>{16777216.f,1.f,-16777216.f,-0.f}[s]; weights[s] = 0; }
      branch[0] = bf16(-0.f);
-     if (hidden > 1) for (uint32_t s = 0; s < 4; ++s) streams[uint64_t{s} * hidden + 1] = std::array<float,4>{1.00390625f, -1.f, 0.0000152587890625f, -0.f}[s];
+     if (hidden > 1) for (uint32_t s = 0; s < streamsCount; ++s) streams[uint64_t{s} * hidden + 1] = std::array<float,4>{1.00390625f, -1.f, 0.0000152587890625f, -0.f}[s];
      for (size_t i = 0; i < 4; ++i) std::memcpy(candidate[i].contents, reference[i].contents, reference[i].length);
      std::array<std::vector<uint8_t>,2> readonly;
      for (size_t i = 0; i < 2; ++i) { auto *b = static_cast<uint8_t *>(reference[i+1].contents); readonly[i].assign(b,b+reference[i+1].length); }
@@ -84,17 +84,20 @@ int main(int argc, const char **argv) {
       [encoder endEncoding]; [command commit]; [command waitUntilCompleted];
       require(command.status == MTLCommandBufferStatusCompleted, "GPU test command failed");
      };
-     const HyperConnectionParams c{rows,hidden,4,0,0};
+     const HyperConnectionParams c{rows,hidden,streamsCount,0,0};
      run(combine,std::array{reference[0],reference[1],reference[2]},&c,sizeof(c));
      run(mean,std::array{reference[0],reference[3]},&p,sizeof(p));
      run(fused,candidate,&p,sizeof(p));
      for (size_t i=0;i<4;++i) require(!std::memcmp(reference[i].contents,candidate[i].contents,reference[i].length), "fused/reference bytes differ (state/capture/padding/guard)");
      for (size_t i=0;i<2;++i) require(!std::memcmp(reference[i+1].contents,readonly[i].data(),readonly[i].size()),"read-only input changed");
+     if (streamsCount == 4) {
      run(bad,candidate,&p,sizeof(p)); // Zero weights keep row-zero state fixed.
      auto *a=static_cast<uint8_t *>(reference[3].contents), *b=static_cast<uint8_t *>(candidate[3].contents);
      const uint64_t at=pad+(uint64_t{p.row}*p.stride+p.column)*2;
      require(std::memcmp(a+at,b+at,2)!=0,"parity fixture failed to detect reordered FP32 reduction");
-     ++negativeControls; ++cases;
+     ++negativeControls;
+     }
+     ++cases;
     }
    }
    std::cout << cases << " exact GPU parity cases, " << rejected << " invalid bindings rejected, " << negativeControls << " faulty reductions detected. Device: " << device.name.UTF8String << ". No model or timing measurements.\n";

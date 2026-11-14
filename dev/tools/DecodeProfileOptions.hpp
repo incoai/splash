@@ -152,6 +152,10 @@ struct DecodeProfileOptions {
         << ",\"verify_rows\":" << profileJsonString(verify) << ",\"requested_max_context_tokens\":" << (contextExplicit ? std::to_string(maxContext) : "null")
         << ",\"fixture_context_bound_tokens\":" << maxContext
         << ",\"requested_memory_bytes\":" << (maxMemory ? std::to_string(maxMemory) : "null")
+        << ",\"expert_memory_bytes\":" << load.expertMemoryBytes
+        << ",\"ple_memory_bytes\":" << load.streamedTableBytes
+        << ",\"generation_reserve_tokens\":" << generationReserve()
+        << ",\"require_flash_next\":" << (requireFlashNext ? "true" : "false")
         << ",\"config_only\":" << (configOnly ? "true" : "false")
         << ",\"fusion_enabled\":false,\"http_ttft_s\":null,\"queue_wait_s\":null,\"ssd_cache_reuse\":null"
         << ",\"limitations\":[\"No HTTP, persistent KV cache, or production admission is exercised.\","

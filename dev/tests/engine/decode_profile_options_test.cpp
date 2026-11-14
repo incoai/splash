@@ -19,6 +19,10 @@ int main() {
   check(parse({"--max-memory", "96G"}).maxMemory == (96ull << 30));
   check(parse({"--config-only"}).configOnly);
   check(parse({"--verify-rows", "all"}).verify == "all");
+  const auto streamed = parse({"--expert-memory", "16G", "--ple-memory", "2G"});
+  check(streamed.json().find("\"expert_memory_bytes\":17179869184") != std::string::npos);
+  check(streamed.json().find("\"ple_memory_bytes\":2147483648") != std::string::npos);
+  check(defaults.json().find("\"generation_reserve_tokens\":296") != std::string::npos);
   rejects({"--activations", "int8"}); rejects({"--state-format", "auto"});
   rejects({"--kv-format", "fp32"}); rejects({"--verify-rows", "guess"});
   rejects({"--max-memory", "0"}); rejects({"--max-memory", "18446744073709551615G"});

@@ -31,7 +31,8 @@ gain.
   an exact Q2_0 installation or production equivalence; pin model/source identity
   and all loaded weight formats separately.
 - `--report FILE` writes a private, exclusively created JSON report after successful
-  text execution. It records requested settings, installation source identity,
+  text execution. It records requested settings (including expert/PLE streaming budgets and generation
+  reserve), installation source identity,
   effective native limits, prefill GPU time, whole-cycle wall/emitted-token
   denominators and per-width command observations. HTTP TTFT, Next Queue wait,
   CPU-only graph time and SSD cache reuse remain unknown, not measured zero.
@@ -100,7 +101,7 @@ Read-only inputs may alias each other; disjoint views of a common buffer remain
 valid. This fixture uses fresh Metal buffers with explicit identity/offset ranges;
 it is not an arbitrary-resource alias proof for future production buffer wrappers.
 
-The 90 cases cover rows 1/5/8/16/24/32, hidden widths 1/255/256/257/2560 and capture
+The 360 cases cover one through four streams, rows 1/5/8/16/24/32, hidden widths 1/255/256/257/2560 and capture
 slots zero/middle/last. B3 has padded B4 storage. Captures use a nonzero row offset
 and wider destination stride. The complete residual, capture, input, guard and
 padding buffers are compared byte-for-byte against the original two GPU kernels.
@@ -108,18 +109,18 @@ Finite random values, deterministic cancellation, signed zero and BF16 rounding
 boundaries are included. NaN payload and infinity behavior are not qualified.
 
 A deliberately reordered FP32 reduction must disagree on the cancellation fixture
-in every case. This proves the observer can detect at least that important fault;
+in all 90 four-stream cases. This proves the observer can detect at least that important fault;
 it does not prove completeness. The fixture collects no elapsed-time data.
 
 ## Validation recorded 2026-11-13
 
 | Check | Result |
 | --- | --- |
-| Profiler parsing, token input and private report output | 56 checks passed; also passed address/undefined-behavior sanitizers |
-| Buffer, alias and geometry contract | 29 checks passed |
+| Profiler parsing, token input and private report output | 59 checks passed; also passed address/undefined-behavior sanitizers |
+| Buffer, alias and geometry contract | 33 checks passed; also passed address/undefined-behavior sanitizers |
 | Real profiler executable with nonexistent model/Metal paths | 11 early-exit CLI cases passed |
-| M5 GPU operator parity | 90 cases passed normally and 90 with Metal shader validation |
-| Invalid bindings / deliberate faulty reductions | 450 rejected / 90 detected in each GPU mode |
+| M5 GPU operator parity | 360 cases passed normally and 360 with Metal shader validation |
+| Invalid bindings / deliberate faulty reductions | 1800 rejected / 90 detected in each GPU mode |
 | Native profiler | Compiled and linked on M5 with command-scoped Xcode 27.2.0 |
 | Runtime architecture / whitespace | Passed; production runtime remains 30105 lines |
 
@@ -131,9 +132,24 @@ Q2_0, 96 GiB RAM, 512 GiB cache, 262144 context, eight queue workers and M4 over
 disabled. Splash and queue health/readiness checks passed; queued/running/failed
 counts were zero at that snapshot.
 
-Raw build output, source/binary SHA-256 hashes and the production health snapshot
-are retained locally in ignored `build/profiling-validation.json`. These results
+Raw build output, source/binary SHA-256 hashes and the latest production health
+snapshot are retained locally in ignored `build/pr-review-validation.json`.
+The earlier implementation receipt remains in `build/profiling-validation.json`. These results
 qualify the development tooling's tested paths and finite operator fixture only.
+
+## Correctness review
+
+The review added bounds for the kernels' uint32 row/stream indices; checking only
+uint64 buffer sizes could otherwise accept dimensions whose device indices wrap.
+Tests isolate those cases with generous synthetic buffer capacities and accept the
+last-row boundary exactly at UINT32_MAX. GPU parity now covers each stream count
+accepted by the contract, rather than only four streams.
+
+Reports now include expert/PLE streaming budgets, generation reserve and the
+Flash-Next matching requirement, so distinct native configurations are visible.
+The two model-free CPU checks also run through the existing `test-engine-cpu` CI
+gate. The GPU fixture remains an explicit development target; these local results
+do not claim that GitHub-hosted Metal validation has passed.
 
 ## Remaining gates
 
