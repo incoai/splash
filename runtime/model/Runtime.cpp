@@ -3286,6 +3286,17 @@ Runtime::prefillAsync(const BatchPlan &plan,
     impl->counters.totalPrefillWallSeconds += timing.wallSeconds;
     impl->counters.lastPrefillGpuSeconds = timing.gpuSeconds;
     impl->counters.totalPrefillGpuSeconds += timing.gpuSeconds;
+    if (std::getenv("SPLASH_DEBUG_PREFILL")) {
+      uint64_t position = 0;
+      uint32_t rows = 0;
+      for (const ModelBatchItem &item : items) {
+        position = item.logicalPosition;
+        rows += item.tokenCount;
+      }
+      std::fprintf(stderr, "splash: prefill chunk at %llu rows %u: gpu %.0f ms wall %.0f ms\n",
+                   static_cast<unsigned long long>(position), rows,
+                   timing.gpuSeconds * 1000.0, timing.wallSeconds * 1000.0);
+    }
     return results;
   };
   const auto submit = [impl, graph = std::make_shared<CommandGraph>(std::move(graph)),
