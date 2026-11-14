@@ -376,8 +376,12 @@ bool Scheduler::waitsForDecoders(const BatchPlan &prefill, const PlanInputs &in)
   // gap as it does a ready one's. Run instead, the next unit put a second
   // pass into its gap where the copies its release needed landed in 94 ms,
   // 1,063 ms against the 838 ms of a pass and a decode command (engine-sim's
-  // Studio churn); waiting, 686 ms. The debt bounds the wait, 235 ms after a
-  // 471 ms pass there, so slower copies cost prefill no more than its share.
+  // Studio churn); waiting, 686 ms. Memory that lands during a unit waits
+  // for its end, so a wait as long as the last unit moves the decoder's next
+  // decode by a unit it would have waited out anyway, where a shorter wait
+  // the memory outlasts adds itself to the gap: with copies ten times slower,
+  // waits of the 235 ms the pass owed made the longest gap 1,780 ms, 1,543
+  // without them or with waits of the pass's 471.
   const RequestPriority priority = get(prefill.items.front().requestId).spec.priority;
   const bool owed = decodeDebtMilliseconds_ > 0.0 && std::ranges::any_of(in.landing, [&](uint64_t id) {
                       const auto found = requests_.find(id);
@@ -390,15 +394,15 @@ bool Scheduler::waitsForDecoders(const BatchPlan &prefill, const PlanInputs &in)
   if (!heldSince_)
     heldSince_ = in.now;
   // Until the end holdEndMilliseconds gives, the engine's wakeup, compared as
-  // the same sum: now less the start can round below the debt there, as it
-  // did 236.7 ms past 741,483.8 s, and the wait would not end at its wakeup.
-  return in.now < *heldSince_ + decodeDebtMilliseconds_;
+  // the same sum: now less the start can round below the bound there, as it
+  // does 472.1 ms past 741,483.8 s, and the wait would not end at its wakeup.
+  return in.now < *heldSince_ + unitMilliseconds_;
 }
 
 std::optional<double> Scheduler::holdEndMilliseconds() const noexcept {
   if (!heldSince_)
     return std::nullopt;
-  return *heldSince_ + decodeDebtMilliseconds_;
+  return *heldSince_ + unitMilliseconds_;
 }
 
 std::optional<BatchPlan> Scheduler::nextPrefill(const PlanInputs &in) const {
@@ -788,6 +792,7 @@ void Scheduler::complete(const BatchPlan &plan, std::span<const StepResult> resu
       decodeDebtMilliseconds_ = std::max(0.0, decodeDebtMilliseconds_ - wallMilliseconds);
     else if (owesDecode && decodeShare_ > 0.0) {
       decodeDebtMilliseconds_ += decodeShare_ * wallMilliseconds;
+      unitMilliseconds_ = wallMilliseconds;
     }
   }
   dropStaleDecodeDebt();

@@ -188,7 +188,7 @@ public:
   // memory lands (waitsForDecoders).
   [[nodiscard]] std::optional<BatchPlan> next(const PlanInputs &in) const;
   // When the next prefill unit's wait for a decoder whose memory lands ends,
-  // the decode time owed from when it began; none while it does not wait.
+  // the last unit's time after it began; none while it does not wait.
   [[nodiscard]] std::optional<double> holdEndMilliseconds() const noexcept;
   // Whether `plan` is a prefill plan other than the next pass of the command
   // between its passes, which is abandoned before it commits.
@@ -323,8 +323,8 @@ private:
   // priority or a higher one that waits for memory on its way back and has
   // not decoded since the last prefill unit began, whose gap the unit would
   // hold a second unit of: while the prefill owes decode time, which the
-  // wait works off as that decoder's decode would (commit), so the wait
-  // lasts at most the debt.
+  // wait works off as that decoder's decode would (commit), for at most the
+  // time the last unit took.
   [[nodiscard]] bool waitsForDecoders(const BatchPlan &prefill, const PlanInputs &in) const;
   // Debt is owed only to requests that decode or wait for a mask: once the
   // last one leaves, a later decoder starts without it.
@@ -352,6 +352,9 @@ private:
   // commands' wall time, and the time the next prefill unit waited for
   // decoders whose memory lands (waitsForDecoders), have worked it off.
   double decodeDebtMilliseconds_ = 0.0;
+  // The wall time of the last prefill unit that owed decode time, which
+  // bounds the next unit's wait for decoders whose memory lands.
+  double unitMilliseconds_ = 0.0;
   // When the next prefill unit began to wait for such a decoder, until a
   // command commits.
   mutable std::optional<double> heldSince_;

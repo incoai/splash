@@ -392,12 +392,12 @@ void testExcludedLanesAreNotPlanned() {
 }
 
 // A decoder left out as its memory lands, as a lane's copies do after its conversion to Spill, is owed its
-// share as one that decodes: after a unit, which owes it half its time, the next unit waits for it, the wait
-// working the debt off, so that it runs once the memory lands within the debt, and the unit runs at the end of
-// the debt whatever the memory takes, at the very time of the wakeup the scheduler gives: engine-sim's churn,
-// with copies ten times slower, waited 236.7 ms from 741,483.8 s, where now less the start rounds below the
-// debt. A decoder that decoded since the unit holds nothing.
-void testADecoderWhoseMemoryLandsHoldsTheNextUnitForItsShare() {
+// share as one that decodes: after a unit, which owes it half its time, the next unit waits for it for as long as
+// that unit took, the wait working the debt off, so that it runs once the memory lands within that time, past the
+// debt too, and the unit runs at the end of that time whatever the memory takes, at the very time of the wakeup
+// the scheduler gives, where now less the start rounds below the unit's time (472.1 ms past 741,483.8 s does). A
+// decoder that decoded since the unit holds nothing.
+void testADecoderWhoseMemoryLandsHoldsTheNextUnitForAUnit() {
   // Decoder 1 after a unit of `unit` ms, its memory on its way back from `at`.
   const auto waiting = [](Sim &sim, double unit, double at) {
     sim.decoder(1);
@@ -410,26 +410,27 @@ void testADecoderWhoseMemoryLandsHoldsTheNextUnitForItsShare() {
   {
     DenseSim sim(0.5);
     waiting(sim, 500.0, 1'000.0);
-    require(!sim.next() && sim.scheduler.holdEndMilliseconds() == 1'250.0,
-            "the next unit did not wait for the decoder whose memory lands, until its share had passed");
-    sim.now = 1'100.0;
+    require(!sim.next() && sim.scheduler.holdEndMilliseconds() == 1'500.0,
+            "the next unit did not wait for the decoder whose memory lands, for the time the last unit took");
+    sim.now = 1'400.0;
+    require(!sim.next(), "the next unit ran once its debt had passed, before the time the last unit took");
     sim.excluded.clear();
     sim.landing.clear();
     const BatchPlan decode = sim.plan();
     require(decode.kind == WorkKind::Decode && decode.items[0].requestId == 1,
-            "the decoder whose memory landed within its share did not run before the next unit");
+            "the decoder whose memory landed past the debt, within the last unit's time, did not run first");
   }
   {
     DenseSim sim(0.5);
-    waiting(sim, 473.4, 741'483.8);
+    waiting(sim, 472.1, 741'483.8);
     require(!sim.next() && sim.scheduler.holdEndMilliseconds(),
             "the next unit did not wait for the decoder whose memory lands");
     const double end = *sim.scheduler.holdEndMilliseconds();
     sim.now = end - 1.0;
-    require(!sim.next(), "the next unit ran before the decoder's share had passed");
+    require(!sim.next(), "the next unit ran before the last unit's time had passed");
     sim.now = end;
     require(sim.plan().kind == WorkKind::Prefill,
-            "the next unit waited past the decoder's share, at its wakeup, for memory that had not landed");
+            "the next unit waited past the last unit's time, at its wakeup, for memory that had not landed");
   }
   {
     DenseSim sim(0.5);
@@ -1781,7 +1782,7 @@ constexpr test::TestCase kTests[] = {
     {"testPrefillAndDecodeAlternateWithoutStarvation", testPrefillAndDecodeAlternateWithoutStarvation},
     {"testDecodeRepaysItsShareOfContendedPrefill", testDecodeRepaysItsShareOfContendedPrefill},
     {"testExcludedLanesAreNotPlanned", testExcludedLanesAreNotPlanned},
-    {"testADecoderWhoseMemoryLandsHoldsTheNextUnitForItsShare", testADecoderWhoseMemoryLandsHoldsTheNextUnitForItsShare},
+    {"testADecoderWhoseMemoryLandsHoldsTheNextUnitForAUnit", testADecoderWhoseMemoryLandsHoldsTheNextUnitForAUnit},
     {"testPriorityPrecedesWorkKindAlternation", testPriorityPrecedesWorkKindAlternation},
     {"testPrefillCommandContainsOnePriorityTier", testPrefillCommandContainsOnePriorityTier},
     {"testHighestRunnablePriority", testHighestRunnablePriority},

@@ -1760,7 +1760,7 @@ Spill lane's (below, `Engine::EngineVictims::take`): at once those whose copies
 landed, a chain it restored or the copies written ahead, so the lane runs in
 the command it converts for; its claim waits only for the copies its
 conversion starts, and releases those pages as they land, which a decoding
-lane's next prefill unit waits for within the decode share ([prefill and
+lane's next prefill unit waits for up to the time of a unit ([prefill and
 decode scheduling](#prefill-and-decode-scheduling)). Waiting for the
 claim's retry instead, a decoding lane beside a prefill in passes lost the
 decode command after a pass and its gap held two passes, 1,066 ms against the
@@ -2218,13 +2218,23 @@ While requests of the same or a higher priority
 decode (a lane waiting for its token mask is owed nothing), each prefill unit owes them
 decode time, `--decode-share` times its own, before the next one runs. A decoding lane
 whose memory is on its way back, as its own copies are after its conversion to Spill,
-is owed it too: while the debt lasts, the next unit waits for that memory where the
-lane has not decoded since the last unit began, whose gap the unit would hold a
-second unit of, and the wait works the debt off as the lane's decode would, so it
-lasts at most the debt whatever the memory takes (`Scheduler::waitsForDecoders`). In
-engine-sim's Studio churn a lane whose conversion started 2,321 copies waited 94 ms
-for those its release needed, a decode gap of 686 ms where the next 471 ms pass made
-it 1,063 ms; that pass owes 235 ms. These policies do not extend client deadlines.
+is owed it too: while the prefill owes decode time, the next unit waits for that
+memory where the lane has not decoded since the last unit began, whose gap the unit
+would hold a second unit of, and the wait works the debt off as the lane's decode
+would (`Scheduler::waitsForDecoders`). It lasts at most the time the last unit took:
+memory that lands during a unit makes the lane wait for the unit's end, so a wait as
+long as the unit moves the lane's next decode by a whole unit, which memory landing
+that late would have cost it anyway, where a shorter wait the memory outlasts adds
+itself to the lane's gap. Nothing the engine measures tells beforehand how long the
+memory takes: the SSD cache keeps no write rate, and a claim's wait does not follow
+what it lacks. In engine-sim's Studio churn a lane whose conversion started 2,321
+copies waited 94 ms for those its release needed, a decode gap of 686 ms where the
+next 471 ms pass made it 1,063 ms, and the waits of five such conversions took 92 to
+94 ms whether their claims lacked 1 MB or 105 MB. With the SSD cache writing at a
+tenth of its rate, the longest gap was 1,543 ms, as with no wait, where waits of the
+235 ms that pass owes made it 1,780 ms: the copies of five of the eight conversions
+outlasted the wait, the GPU idle for the 471 to 474 ms of a pass, and those of three
+landed within it, past the debt. These policies do not extend client deadlines.
 
 ### Resource waits
 

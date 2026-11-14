@@ -574,7 +574,7 @@ std::optional<double> Engine::nextWakeupMilliseconds() const {
     if (const std::optional<double> persist = writeBehind_.nextWakeup(); persist && (!result || *persist < *result))
       result = persist;
     // A prefill unit that waits for a decoder whose memory lands runs once
-    // the decode time it owes has passed, if the memory has not landed.
+    // the last unit's time has passed, if the memory has not landed.
     if (const std::optional<double> hold = scheduler_.holdEndMilliseconds();
         hold && !pending_ && (!result || *hold < *result))
       result = hold;
