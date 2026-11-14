@@ -382,8 +382,10 @@ per 1,000 prompt tokens, by cause as far as the counters tell: KV pages
 demoted by reclaims, copied ahead for restore points and written through by
 `spill` requests, each at the plan's page size, and the rest, the states,
 which no counter splits between the reclaims that wrote them and the restore
-points' copies; the share of the prompts' tokens the cache held; and each kind
-of turn's median and longest time to first token (`first` and `loop` in
+points' copies (a model with sliding-window layers writes its Slim pages
+shorter than that, so its KV is overstated and its states understated, which
+the readouts say); the share of the prompts' tokens the cache held; and each
+kind of turn's median and longest time to first token (`first` and `loop` in
 `agent`). The tool results and user messages are slices of the client
 interpreter's standard library sources, the same for every tree, whose digest
 the summary records; the model's replies, which the conversations send back,

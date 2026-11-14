@@ -1459,12 +1459,14 @@ class FakeCachingServer:
     counts, per request answered, 10 MiB written, of them two KV pages of
     1 MiB copied ahead and the rest one state, and after `requests`
     requests 1 MiB more at each of its next reads past the first, up to
-    `late`."""
+    `late`. With `slim_page_bytes` its plan is a target's whose windows leave
+    Slim pages of that size."""
 
-    def __init__(self, requests=0, late=0, calls=True):
+    def __init__(self, requests=0, late=0, calls=True, slim_page_bytes=None):
         self.lock = threading.Lock()
         self.bodies: list[dict] = []
         self.requests, self.late, self.calls = requests, late, calls
+        self.slim_page_bytes = slim_page_bytes
         self.reads_after = 0
 
     def answer(self, text):
@@ -1487,9 +1489,13 @@ class FakeCachingServer:
             if self.requests and answered == self.requests:
                 self.reads_after += 1
             late = min(self.late, max(0, self.reads_after - 1))
+        window = {"kv_window": {"slim_page_bytes": self.slim_page_bytes}}
         return {
             "requests": {"submitted": answered, "completed": answered},
-            "memory_plan": {"model": {"kv_page_bytes": MIB}},
+            "memory_plan": {
+                "model": {"kv_page_bytes": MIB},
+                "budget": window if self.slim_page_bytes else {},
+            },
             "disk": {
                 "written_bytes": (10 * answered + late) * MIB,
                 "kv_copies": 2 * answered,
@@ -1735,6 +1741,27 @@ class ConversationScenarioTests(unittest.TestCase):
             [json.loads(line).get("turn") for line in samples], [0, 1, 2, 3, None]
         )
 
+    def test_the_check_says_that_slim_pages_count_whole(self):
+        # No counter tells a Slim page's write from a whole page's, so the
+        # KV by cause is overstated for a target that writes them.
+        fake = FakeCachingServer(requests=2, slim_page_bytes=MIB // 4)
+        summary = self.run_scenario(
+            clients.run_agent, fake, "s", conversations=1, turns=2
+        )
+        self.assertEqual(
+            (summary["kv_page_bytes"], summary["slim_page_bytes"]), (MIB, MIB // 4)
+        )
+        directory = Path(self.directory)
+        (directory / "s.out").write_text("DONE\n")
+        (directory / "s.meta.json").write_text(
+            json.dumps({"scenario": "agent", "build_id": "b1"})
+        )
+        self.assertIn(
+            "KV by cause counts every page at 1.0 MiB: this target's Slim pages "
+            "store 0.2 MiB, so its KV is overstated and its states understated",
+            check.check_run(check.Run(directory, "s"))["notes"],
+        )
+
     def test_an_edit_run_branches_from_the_middle_and_returns(self):
         fake = FakeCachingServer()
         self.run_scenario(clients.run_edit, fake, "e", conversations=2, turns=4)
@@ -1838,6 +1865,7 @@ class ConversationScenarioTests(unittest.TestCase):
         self.assertEqual(
             sum(note.startswith("first token, ") for note in notes), 2, notes
         )
+        self.assertFalse(any("Slim" in note for note in notes), notes)
         samples = check.metrics(ran)
         self.assertEqual(
             {name: len(values) for name, values in samples.items()},
