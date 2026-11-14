@@ -329,12 +329,13 @@ extension ChatScreenTests {
         #expect(opening.foot < opening.field.minY - 100, "the composer travelled to the foot")
     }
 
-    /// The line that says why the server refused a new chat's first message comes back, as the
-    /// new chat opens again from another chat, once the composer has moved to the middle: no
-    /// frame shows its mark while the composer travels there. Coming on the travel's animation,
-    /// it faded in at its place in the middle, over nothing, ahead of the composer coming up
-    /// under it.
-    @Test func theReasonComesBackOnceTheComposerHasMoved() async throws {
+    /// The line that says why the server refused a new chat's first message comes back with the
+    /// composer as the new chat opens again from another chat: in every frame that shows its
+    /// mark, the mark is over the composer's text, as far from it as once still, the composer in
+    /// the middle. Coming on the travel's animation, it faded in at its place in the middle, over
+    /// nothing, ahead of the composer coming up under it; once the composer had moved, the
+    /// composer travelled with an empty row for it.
+    @Test func theReasonComesBackWithTheComposer() async throws {
         let fake = try FakeRuntime("splash-chat-reason", launcher: "chat_server")
         defer { try? FileManager.default.removeItem(at: fake.root) }
         let state = try await Self.chatting(fake)
@@ -350,21 +351,27 @@ extension ChatScreenTests {
         let middle = try Self.field(in: window), size = window.frame.size
         // Down the window under the toolbar, across the line's mark, at the text's start.
         let strip = CGRect(x: middle.minX - 2, y: 60, width: 24, height: size.height - 60)
-        /// How many of the strip's pixels have the mark's yellow, however faint, as the window draws now.
-        func mark() throws -> Int {
+        /// How many of the strip's pixels have the mark's yellow, however faint, as the window draws now, and how
+        /// far over the composer's text their middle row is, in points.
+        func mark() throws -> (pixels: Int, over: CGFloat) {
             let frame = try #require(window.contentView?.superview)
             let area = frame.convert(CGRect(x: strip.minX, y: size.height - strip.maxY, width: strip.width, height: strip.height), from: nil)
             let bitmap = try #require(frame.bitmapImageRepForCachingDisplay(in: area))
             frame.cacheDisplay(in: area, to: bitmap)
             let color = Self.colors(of: bitmap)
-            return (0..<bitmap.pixelsHigh).reduce(0) { count, y in
-                count + (0..<bitmap.pixelsWide).count { x in
+            let rows = (0..<bitmap.pixelsHigh).map { y in
+                (0..<bitmap.pixelsWide).count { x in
                     let (r, _, b) = color(x, y)
                     return r - b > 0.08
                 }
             }
+            let inked = rows.indices.filter { rows[$0] > 0 }
+            let scale = CGFloat(bitmap.pixelsHigh) / strip.height
+            let middle = inked.isEmpty ? 0 : strip.minY + CGFloat(inked.first! + inked.last!) / 2 / scale
+            return (rows.reduce(0, +), size.height - (try Self.field(in: window).maxY) - middle)
         }
-        #expect(try mark() > 20, "the line's mark, before")
+        let resting = try mark()
+        #expect(resting.pixels > 20, "the line's mark, before")
         /// Waits until the composer's text has stopped moving, however long a slow Mac takes to
         /// draw its travel.
         func still() async throws -> CGFloat {
@@ -379,20 +386,19 @@ extension ChatScreenTests {
         }
         state.chats.selection = try #require(state.chats.conversations.first { $0.title == "Kyoto in spring" }).id
         pump(0.3)
-        #expect(try await still() < middle.minY - 100 && mark() == 0, "another chat open, the composer at its foot")
+        #expect(try await still() < middle.minY - 100 && mark().pixels == 0, "another chat open, the composer at its foot")
         state.chats.newChat()
-        var frames: [(ms: Int, mark: Int, short: CGFloat)] = []
+        var frames: [(ms: Int, mark: (pixels: Int, over: CGFloat), short: CGFloat)] = []
         let start = ContinuousClock.now
         for ms in [0, 25, 50, 75, 100, 150, 200, 240, 300, 400, 600] {
             while ContinuousClock.now < start + .milliseconds(ms) { pump(0.005) }
             frames.append((ms, try mark(), middle.minY - (try Self.field(in: window).minY)))
         }
         pump(0.3)
-        #expect(try await still() == middle.minY && mark() > 20, "the line again, the composer in the middle")
-        #expect(frames.contains { $0.short > 50 }, "the composer travels: \(frames)")
-        // Within the few points the end of its animation takes: 7.5 short of the middle after
-        // `settle`'s 240 ms, as the line starts to show.
-        #expect(frames.allSatisfy { $0.mark == 0 || abs($0.short) < 10 }, "the mark's pixels and how far the composer is short of the middle, per frame: \(frames)")
+        #expect(try await still() == middle.minY && mark().pixels > 20, "the line again, the composer in the middle")
+        #expect(frames.contains { $0.short > 50 && $0.mark.pixels > 20 }, "the composer travels with the line: \(frames)")
+        #expect(frames.allSatisfy { $0.mark.pixels == 0 || abs($0.mark.over - resting.over) <= 1 },
+                "the mark's pixels, how far over the text, \(resting.over) once still, and how far the composer is short of the middle, per frame: \(frames)")
     }
 
     /// The chat's title fades in at its place as its chat opens: every frame the window draws
@@ -427,13 +433,59 @@ extension ChatScreenTests {
         #expect(frames.allSatisfy { $0.astray == 0 }, "pixels inked where the title is not once still, per frame: \(frames)")
     }
 
+    /// The composer's card is as tall as what it holds as its chat opens: in every frame the window
+    /// draws once the server has taken a new chat's first message, the card is as tall as it is
+    /// once still at the foot, empty, and its row of controls, its button, only ever moves down,
+    /// from where it was. Moving and changing its height on one animation, the card drew empty and
+    /// tall, 240 points shrinking to 110 over the first 60 ms of its travel.
+    @Test func theComposerIsAsTallAsWhatItHoldsAsItsChatOpens() async throws {
+        let opening = try await Self.opening("splash-chat-card")
+        let before = try #require(Self.card(in: opening.before.card), "the card before")
+        let still = try #require(Self.card(in: opening.still.card), "the card once still")
+        #expect(before.height > still.height + 100, "the card before, \(before), and once still, \(still)")
+        let frames = opening.drawn.map { (ms: $0.ms, card: Self.card(in: $0.card)) }
+        #expect(frames.allSatisfy { $0.card.map { abs($0.height - still.height) <= 2 } ?? false },
+                "the card per frame, \(frames), once still \(still)")
+        let buttons = [before.button] + frames.compactMap(\.card?.button)
+        #expect(zip(buttons, buttons.dropFirst()).allSatisfy { $1 >= $0 - 1 }, "its button per frame from before: \(buttons)")
+    }
+
+    /// Where the composer's card is in `strip`, a picture of the window's column at the card's
+    /// end (`Parts.card`): its height, between the rows of its hairline over and under its button,
+    /// in the room at its end, and its button's middle, the row of the mark's color, in the
+    /// window's points from its top; nil where no card is drawn.
+    static func card(in strip: NSBitmapImageRep) -> (height: CGFloat, button: CGFloat)? {
+        let scale = CGFloat(strip.pixelsWide) / cardEnd.width, color = colors(of: strip)
+        let rows = 0..<strip.pixelsHigh
+        let teal = rows.filter { y in
+            let (r, g, b) = color(Int((cardEnd.width - 30) * scale), y)
+            return g - r > 0.3 && b > 0.4
+        }
+        guard let first = teal.first, let last = teal.last else { return nil }
+        // The hairline, a gray between the card's ground and ink, past the end of its row of controls.
+        func hairline(_ y: Int) -> Bool {
+            let (r, g, b) = color(Int((cardEnd.width - 10) * scale), y)
+            return max(r, g, b) - min(r, g, b) < 0.04 && (r + g + b) / 3 > 0.5 && (r + g + b) / 3 < 0.94
+        }
+        guard let top = rows.prefix(first).last(where: hairline), let bottom = rows.suffix(from: last).first(where: hairline)
+        else { return nil }
+        return (CGFloat(bottom - top) / scale, cardEnd.minY + CGFloat(first + last) / 2 / scale)
+    }
+
+    /// The column at the end of the composer's card in a window of `FirstMessagePictures.size`, the
+    /// sidebar shown, from under the toolbar down, in the window's points from its top left: its
+    /// button, 30 points in from the card's end, and the room past it, 10 points in.
+    static let cardEnd = CGRect(x: 1000, y: 52, width: 40, height: FirstMessagePictures.size.height - 52)
+
     /// What a window draws as the server takes a new chat's first message, where the change
     /// shows apart from the composer's travel: over the composer's text at its start, where the
     /// picture attached and the line that says why are, and in the toolbar from the Chat's switch
-    /// to past the title at its widest, where the chat's title comes (`toolbarPart`).
+    /// to past the title at its widest, where the chat's title comes (`toolbarPart`); and the
+    /// column at the composer's end (`cardEnd`).
     struct Parts {
         let held: NSBitmapImageRep
         let toolbar: NSBitmapImageRep
+        let card: NSBitmapImageRep
     }
 
     /// The toolbar from the Chat's switch, where the toolbar first puts a title, to past the
@@ -451,7 +503,7 @@ extension ChatScreenTests {
         let before: Parts
         /// Where the composer's text was before.
         let field: CGRect
-        var drawn: [(ms: Int, held: NSBitmapImageRep, toolbar: NSBitmapImageRep, field: CGFloat)] = []
+        var drawn: [(ms: Int, held: NSBitmapImageRep, toolbar: NSBitmapImageRep, card: NSBitmapImageRep, field: CGFloat)] = []
         var still: Parts
         /// How high the composer's text is once still.
         var foot: CGFloat
@@ -491,7 +543,7 @@ extension ChatScreenTests {
             frame.cacheDisplay(in: area, to: bitmap)
             return bitmap
         }
-        func parts() throws -> Parts { Parts(held: try picture(held), toolbar: try picture(toolbar)) }
+        func parts() throws -> Parts { Parts(held: try picture(held), toolbar: try picture(toolbar), card: try picture(cardEnd)) }
         var opening = Opening(before: try parts(), field: field, still: try parts(), foot: field.minY)
         state.sendDraft()
         // The server takes the message in a turn of the app's own on the main actor; the window
@@ -505,7 +557,7 @@ extension ChatScreenTests {
             let elapsed = (ContinuousClock.now - start).components
             let drawn = try parts()
             opening.drawn.append((Int(elapsed.seconds) * 1000 + Int(elapsed.attoseconds / 1_000_000_000_000_000), drawn.held, drawn.toolbar,
-                                  try Self.field(in: window).minY))
+                                  drawn.card, try Self.field(in: window).minY))
         }
         // Still once two pictures 0.3 s apart are alike, however long a slow Mac takes to draw the
         // travel and the title's fade.

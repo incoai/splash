@@ -207,11 +207,9 @@ struct Composer: View {
                     Image(systemName: "exclamationmark.triangle.fill").symbolRenderingMode(.multicolor)
                 }
                 .font(.system(size: 12))
-                .transition(Motion.overText)
             }
             if !draft.attachments.isEmpty {
                 Attachments(draft: draft, held: held)
-                    .transition(Motion.overText)
             }
             ComposerField(text: $draft.text, focusRequests: draft.focusRequests,
                           yields: state.terminalShows, held: held,
@@ -263,6 +261,13 @@ struct Composer: View {
         .overlay { RoundedRectangle(cornerRadius: 22).strokeBorder(.separator) }
         .shadow(color: .black.opacity(0.06), radius: 14, y: 4)
         .alignmentGuide(.composerTop) { $0[.top] }
+        // What it holds comes and goes at once, and its height with it, whatever else moves: as it
+        // travels between a new chat and a conversation, it is as tall as what it holds then, and
+        // what it holds travels with it. Coming once it had moved, the line that says why left an
+        // empty row as the composer travelled to a new chat opened again, 25 points over its text.
+        .transaction(value: Contents(text: draft.text, attachments: draft.attachments.map(\.id), notice: notice)) {
+            $0.animation = nil
+        }
         .fileImporter(isPresented: $picking, allowedContentTypes: [.image, .pdf], allowsMultipleSelection: true) { result in
             let urls = (try? result.get()) ?? []
             let pdfs = urls.filter { UTType(filenameExtension: $0.pathExtension)?.conforms(to: .pdf) == true }
@@ -282,6 +287,13 @@ struct Composer: View {
     /// The room the composer leaves over what it holds and under its controls: over its text
     /// where nothing is over it (`VerticalAlignment.composerPlain`).
     private static let inset: CGFloat = 12
+
+    /// What the composer holds, which it takes at once.
+    private struct Contents: Equatable {
+        let text: String
+        let attachments: [UUID]
+        let notice: Draft.Notice?
+    }
 
     /// Whether the open chat's request is under way, which Stop stops.
     private var streaming: Bool { state.chats.answering }

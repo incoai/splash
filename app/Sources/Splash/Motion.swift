@@ -13,10 +13,10 @@ import SwiftUI
 ///   pose as a model becomes ready.
 ///
 /// What appears fades in within `settle`, a section or a row of a page once what makes room for it
-/// has moved, and what goes from a page goes at once (`comingAndGoing`), as does what the composer
-/// holds over its text, which comes at once where nothing moves (`overText`); a row's words change
-/// in place, and one check shows at a time. Nothing slides in but the switch's pill, the sidebar and
-/// the drawer. While a reply streams, the page lets its text out over the frames that follow it
+/// has moved, and what goes from a page goes at once (`comingAndGoing`); what the composer holds
+/// comes and goes at once, and travels with it (`Composer`); a row's words change in place, and
+/// one check shows at a time. Nothing slides in but the switch's pill, the sidebar and the drawer.
+/// While a reply streams, the page lets its text out over the frames that follow it
 /// and eases toward the bottom after it, so that its lines slide in (page.js, `paced` and
 /// `follower`); nothing else loops then, as drawing shares the GPU with the model: the reply's
 /// counters change once a second without rolling, and the engine's figures, every 2 s, change in
@@ -43,39 +43,5 @@ enum Motion {
     /// over the rows moving into its place and the download's row fading in there.
     static var comingAndGoing: AnyTransition {
         .asymmetric(insertion: .opacity.animation(settle?.delay(settleSeconds)), removal: .opacity.animation(nil))
-    }
-
-    /// How what the composer holds over its text comes and goes, the line that says why and what
-    /// is attached: as a section of a page does (`comingAndGoing`) where the change moves anything,
-    /// and at once where it moves nothing.
-    /// - One that goes is hidden at once, whatever moves with the change that takes it. As the
-    ///   server took a new chat's first message, they faded within `settle` where the composer had
-    ///   been, over the transcript, while the composer travelled to the foot: in 4 frames drawn in
-    ///   its first 80 ms, the picture attached was still there.
-    /// - One that comes with a change that moves the composer fades in once the composer has
-    ///   moved. As a new chat opened again from another chat, the line that says why its message
-    ///   was refused showed at its place in the middle 50 ms on, the composer coming up under it
-    ///   still 240 points short.
-    /// - One that comes with nothing moving comes at once, as a refusal's reason and a picture
-    ///   attached do: faded in after `settle`, as a page's row is, the line that says why came
-    ///   into a row the composer had left empty that long.
-    static var overText: some Transition { OverText(later: settle?.delay(settleSeconds)) }
-}
-
-/// `Motion.overText`.
-private struct OverText: Transition {
-    /// `settle`, once what moves has moved.
-    let later: Animation?
-
-    func body(content: Content, phase: TransitionPhase) -> some View {
-        content.transaction { transaction in
-            if phase == .didDisappear {
-                transaction.animation = nil
-            } else if transaction.animation != nil {
-                transaction.animation = later
-            }
-        } body: {
-            $0.opacity(phase.isIdentity ? 1 : 0)
-        }
     }
 }

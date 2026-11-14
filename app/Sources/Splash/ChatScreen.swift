@@ -542,6 +542,12 @@ private struct ConversationView: View {
             .padding(.bottom, 24)
             .fixedSize(horizontal: false, vertical: true)
             .frame(height: 0, alignment: .bottom)
+            // As it travels, its foot moves and it stands on it, as tall as what it holds then
+            // (`Composer`), its controls where they were as what was over them goes. Its parts
+            // each moving from where they were to where they go, the card drew empty and as tall
+            // as before, 237 points, for the first 100 ms after the server took a new chat's
+            // first message, its text and what was over it gone; then shrank to 77 as it went.
+            .geometryGroup()
     }
 
     /// `conversation` as the page shows it, Ask Again as the Server allows.
