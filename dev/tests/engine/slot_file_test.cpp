@@ -925,7 +925,6 @@ static void testWritesDrawOnTheWriteBudget() {
   require(file.takesWrite(false) && !budget->admitsAgainAt(), "a lifted budget held a write back");
 }
 
-// A write that hits a full volume (ENOSPC, EDQUOT) only reports it; the file keeps taking writes.
 // The write rate counts what every write took, with a write budget or without, over the last hour
 // and the last day of the budget's clock.
 static void testWritesCountOverTheLastHourAndDay() {
@@ -967,6 +966,7 @@ static void testWritesCountOverTheLastHourAndDay() {
   require(rate().hourBytes == 2 * size, "a write budget changed what the write rate counts");
 }
 
+// A write that hits a full volume (ENOSPC, EDQUOT) only reports it; the file keeps taking writes.
 static void testFullVolumeIsReported() {
   constexpr size_t size = kHostPageBytes;
   auto budget = std::make_shared<DiskBudget>(4 * size);
