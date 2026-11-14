@@ -68,6 +68,26 @@ void testBandwidth() {
           "the ANE's fraction was not clamped to none or all of the bandwidth");
 }
 
+// A split layer timed at another share fits u again where the GPU's part takes the longer there, and T passes through
+// it: here 17 at 0.25 against G 15 and A 10, u = 0.2. Where the ANE's part takes the longer there, it says nothing of u.
+// On the M5 Max, whose ANE's part takes the longer at the low share by default (int8 activations), the low share
+// leaves u at none, and the fit chooses 6 of Qwen3.8-27B's 34 units; the split layer of 6 units, 13.84 ms against G's
+// 13.18, gives u = 0.065, which chooses the 7 a sweep of given shares found fastest (6 prefills 1.4-1.5% slower).
+void testRefit() {
+  const Model lines = fit({0.25, 15, 15}, {0.75, 5, 30});
+  const Model refitted = refit(lines, 0.25, 17);
+  require(near(refitted.u, 0.2) && near(refitted(0.25), 17) && near(refitted(0.5), 20),
+          "the bandwidth's term was not fitted at the share timed");
+  require(refit(refitted, 0.5, 30).u == refitted.u && refit(lines, 0.5, 30).u == 0.0,
+          "a split layer where the ANE's part takes the longer fitted the bandwidth's term");
+  const Timing low{14.0 / 34, 9.9673, 23.929}, high{27.0 / 34, 4.7526, 46.034};
+  const Model m5Max = fit(low, high);
+  require(m5Max.u == 0.0 && choose(m5Max, 15.834, 34, 33) == 6u, "the M5 Max's low share fitted u or chose not 6");
+  const Model atSix = refit(m5Max, 6.0 / 34, 13.84);
+  require(atSix.u > 0.06 && atSix.u < 0.07 && choose(atSix, 15.834, 34, 33) == 7u,
+          "the M5 Max's split layer at 6 units did not choose 7");
+}
+
 // T is least at the units where the GPU's part, slowed by the bandwidth, meets the ANE's, and the units chosen are
 // those whose T, or T a unit either way, is least at its longest: G(s) = 20 - 20 s and A(s) = 40 s meet at s = 1/3,
 // where of 10 units 3 (G 14, A 12; 16 a unit either way) beat 2 (G 16; 18 below) and 4 (A 16; 20 above), and of 100
@@ -260,6 +280,7 @@ int main() {
   try {
     testFit();
     testBandwidth();
+    testRefit();
     testChoice();
     testUnusable();
     testMostUnits();

@@ -55,20 +55,29 @@ double Model::operator()(double share) const noexcept {
 // The model, from the split's layers as they run between stand-ins for the
 // mixer (Measurement). The GPU's part alone gives G at both shares. At the
 // high share, near 0.8, the ANE's part takes the longer on every Mac measured
-// (Qwen3.8-27B's fastest split gives the ANE 8 to 27 of its 34 units): the
-// split layer there is A, which scales with the ANE's channels. Where the
-// GPU's part takes the longer at the low share, the split layer there exceeds
-// it by the bandwidth the ANE's part takes beside it, which gives u (a tenth
-// to a third on an M6). Where the ANE's part takes the longer there, as on an
-// M5 Max, the split layer's excess over A is the ANE's own. Where the ANE's
-// part does not take the longer at the high share, A comes out longer than it
-// is, and the choice smaller.
+// (Qwen3.8-27B's fastest split gives the ANE 7 to 27 of its 34 units): the
+// split layer there is A, which scales with the ANE's channels. The low
+// share's split layer gives u where the GPU's part takes the longer there
+// (refit). Where the ANE's part does not take the longer at the high share,
+// A comes out longer than it is, and the choice smaller.
 Model fit(const Timing &low, const Timing &high) {
   if (!(low.share < high.share)) throw std::invalid_argument("ANE FFN calibration needs a low and a high share");
   const double slope = (high.gpu - low.gpu) / (high.share - low.share);
-  Model model{{low.gpu - slope * low.share, slope}, {0.0, high.split / high.share}};
-  const double gpu = model.gpu(low.share), ane = model.ane(low.share);
-  if (gpu > ane) model.u = std::clamp((low.split - gpu) / ane, 0.0, 1.0);
+  return refit({{low.gpu - slope * low.share, slope}, {0.0, high.split / high.share}}, low.share, low.split);
+}
+
+// Where the GPU's part takes the longer at `share`, the split layer there
+// exceeds it by the bandwidth the ANE's part takes beside it, which gives u (a
+// tenth to a third on an M6, at the low share). Where the ANE's part takes
+// the longer there, the split layer's excess over A is the ANE's own, which
+// says nothing of u. On an M5 Max the ANE's part takes the longer from below
+// 0.4, so the low share leaves u at none, and T a unit short of T's least
+// comes out shorter than it is: Qwen3.8-27B's G(6/34) of 13.2 ms against a
+// split layer of 13.8 there (u = 0.06), which chose 6 units in half the
+// calibrations against the 7 a sweep of given shares found fastest.
+Model refit(Model model, double share, double split) {
+  const double gpu = model.gpu(share), ane = model.ane(share);
+  if (gpu > ane) model.u = std::clamp((split - gpu) / ane, 0.0, 1.0);
   return model;
 }
 

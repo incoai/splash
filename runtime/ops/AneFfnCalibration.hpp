@@ -53,6 +53,12 @@ struct Model final {
 // The model through the timings of a low and a high share
 // (AneFfnCalibration.cpp). Throws unless the low share is the lower.
 [[nodiscard]] Model fit(const Timing &low, const Timing &high);
+// `model` with its bandwidth's term u fit to `split`, a full chunk's split
+// layer timed at `share`, where the GPU's part takes the longer there; the
+// same model where the ANE's part does (AneFfnCalibration.cpp). Calibration
+// fits u so at the low share, then at the units the model first chooses,
+// nearest T's least.
+[[nodiscard]] Model refit(Model model, double share, double split);
 
 // The ANE's channel units, of the `units` the intermediate channels hold, at
 // which chunks split, at most `maxAneUnits` of them: those at which T, or T a

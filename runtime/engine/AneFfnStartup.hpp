@@ -131,8 +131,9 @@ struct AneFfnStart final {
 // until the plan holds a split; then it logs that it sets the split up. The
 // split takes this Mac's calibration of the model within the units the plan
 // holds, once remembered; else it is calibrated: timed, its share chosen
-// (ops::ane_ffn::choose), the split that serves prepared, its chunks timed
-// and the least it takes found (ops::ane_ffn::minimumRows), and the outcome
+// (ops::ane_ffn::choose) and chosen again once its split's chunks are timed
+// (ops::ane_ffn::refit), that share's split prepared, its chunks timed and the
+// least it takes found (ops::ane_ffn::minimumRows), and the outcome
 // remembered, a split or none. The split then judges itself against the GPU
 // alone as calibrated (ops::ane_ffn::Breaker), which forgets the calibration
 // when it trips, so that the next start calibrates again; a given split

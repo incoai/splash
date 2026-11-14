@@ -105,9 +105,11 @@ struct Fake {
   std::optional<Calibration> stored, remembered;
   std::optional<uint32_t> recalled, rememberedMost;
   bool healthy = true;
-  // The calls the start made: of unavailable() and time(), and of prepare() with its arguments.
+  // The calls the start made: of unavailable() and time(), and of prepare() with its arguments, the last and the units
+  // of each.
   uint32_t asked = 0, timings = 0;
   std::optional<std::pair<uint32_t, bool>> prepared;
+  std::vector<uint32_t> preparedUnits;
 
   [[nodiscard]] uint64_t bytes(uint32_t aneUnits) const { return aneUnits * unitBytes; }
   // What the plan holds with the largest split the model could take, the most units whose plan holds any: the
@@ -134,6 +136,7 @@ struct Fake {
     };
     result.prepare = [this](uint32_t aneUnits, bool timeChunks) {
       prepared = {aneUnits, timeChunks};
+      preparedUnits.push_back(aneUnits);
       return prepare(aneUnits, timeChunks);
     };
     result.recall = [this](uint32_t maxAneUnits) {
@@ -584,6 +587,7 @@ void testNoGain() {
               has(started.log, "The GPU runs the prefill FFN alone: no Neural Engine split beats its 14.5 ms per "
                                "2048-row FFN layer by enough (calibrated in "),
           "a share predicted to gain too little split: " + started.log);
+  // The split layer the choice's chunks time refits the model: one slower than the GPU alone predicts no gain.
   fake = {};
   fake.prepare = [](uint32_t, bool) {
     AneFfnPrepared prepared;
@@ -591,11 +595,55 @@ void testNoGain() {
     return prepared;
   };
   started = start(fake);
+  require(started.start.outcome.kind == Kind::NoGain && fake.preparedUnits == std::vector{8u} && fake.remembered &&
+              !fake.remembered->aneUnits && !started.start.plan &&
+              has(started.log, "The GPU runs the prefill FFN alone: no Neural Engine split beats its 19.0 ms per "
+                               "2048-row FFN layer by enough (calibrated in "),
+          "a split layer slower than the GPU alone split: " + started.log);
+  // A model refitted to gain on the GPU alone the shares were timed beside, whose chunks gain nothing on the GPU
+  // alone timed beside them.
+  fake.stored.reset();
+  fake.time = [] {
+    Timings timings = measured();
+    timings.gpuAlone = 25.0;
+    return timings;
+  };
+  started = start(fake);
   require(started.start.outcome.kind == Kind::NoGain && fake.remembered && !fake.remembered->aneUnits &&
               !started.start.plan &&
               has(started.log, "no chunk of the Neural Engine split beats it by enough, 21.0 ms per 2048-row FFN "
                                "layer against 20.0 (calibrated in "),
           "a split of no chunk that gains split: " + started.log);
+}
+
+// The chosen split's chunks time its full chunk nearest T's least, which fits the bandwidth's term where the low share
+// could not: the M5 Max's timings choose 6 units, whose split layer of 13.84 ms chooses 7 (ane_ffn_calibration_test),
+// whose split is prepared, timed, served and remembered instead. One whose refitted model keeps its units is
+// prepared once.
+void testRefitMovesTheChoice() {
+  Fake fake;
+  fake.time = [] { return Timings{{14.0 / 34, 9.9673, 23.929}, {27.0 / 34, 4.7526, 46.034}, 15.834}; };
+  fake.prepare = [](uint32_t aneUnits, bool timed) {
+    AneFfnPrepared prepared;
+    if (timed) prepared.chunks = timedChunks(aneUnits == 6 ? 13.84 : 13.55);
+    prepared.error = 0.025;
+    return prepared;
+  };
+  Started started = start(fake);
+  require(started.start.outcome.kind == Kind::Split && fake.timings == 1 &&
+              fake.preparedUnits == std::vector{6u, 7u} && fake.prepared == std::pair(7u, true) &&
+              fake.remembered && fake.remembered->aneUnits == 7 && fake.remembered->minimumRows == 553 &&
+              started.start.plan && started.start.plan->breakdown().aneFfnBytes == fake.bytes(7) &&
+              has(started.log, "Neural Engine FFN split at share 0.21 for chunks of 553 rows or more: 13.6 ms per "
+                               "2048-row FFN layer against 20.0 on the GPU alone"),
+          "the refitted choice of 7 units did not serve: " + started.log);
+  fake.preparedUnits.clear();
+  fake.stored.reset();
+  fake.time = measured;
+  started = start(fake);
+  require(started.start.outcome.kind == Kind::Split && fake.preparedUnits == std::vector{8u} &&
+              fake.remembered && fake.remembered->aneUnits == 8,
+          "a choice its refitted model keeps was prepared again");
 }
 
 // A start takes this Mac's calibration once remembered: it neither times nor remembers, prepares the remembered units
@@ -677,6 +725,7 @@ int main() {
     testFailures();
     testACommandOutOfMemoryIsCommandMemory();
     testNoGain();
+    testRefitMovesTheChoice();
     testRemembered();
     testGivenShare();
     std::cout << "ane ffn startup tests passed\n";
