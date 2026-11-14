@@ -514,13 +514,12 @@ extension ChatScreenTests {
     /// PDF, the server refused, so that the composer says why, and what it draws as the server
     /// takes the message sent again: its parts before, each frame of them from the first the
     /// window draws of the chat, some 0, 25, 50, 75, 100, 150, 240 and 480 ms after, with how long
-    /// after it was and how high the composer's text is by then, and its parts once still, the
-    /// reply waiting.
+    /// after it was, and its parts once still, the reply waiting.
     struct Opening {
         let before: Parts
         /// Where the composer's text was before.
         let field: CGRect
-        var drawn: [(ms: Int, held: NSBitmapImageRep, toolbar: NSBitmapImageRep, card: NSBitmapImageRep, field: CGFloat)] = []
+        var drawn: [(ms: Int, held: NSBitmapImageRep, toolbar: NSBitmapImageRep, card: NSBitmapImageRep)] = []
         var still: Parts
         /// How high the composer's text is once still.
         var foot: CGFloat
@@ -574,7 +573,7 @@ extension ChatScreenTests {
             let elapsed = (ContinuousClock.now - start).components
             let drawn = try parts()
             opening.drawn.append((Int(elapsed.seconds) * 1000 + Int(elapsed.attoseconds / 1_000_000_000_000_000), drawn.held, drawn.toolbar,
-                                  drawn.card, try Self.field(in: window).minY))
+                                  drawn.card))
         }
         // Still once two pictures 0.3 s apart are alike, however long a slow Mac takes to draw the
         // travel and the title's fade.

@@ -570,8 +570,10 @@ private struct ConversationView: View {
 /// line that says why and what is attached, grows it up, the mark with it, and moves neither its
 /// text nor what is under it: split with it, the line that says why moved the text 17 points down
 /// and the mark 8 up. The composer stands on its foot (`ConversationView.footer`), which the column
-/// places, and tells how far it reaches over it by its guides, inside the window but for a draft
-/// taller than the window holds.
+/// places, and tells how far it reaches over it by its guides. It reaches past the column's top
+/// where it holds more than the column is tall, as a draft taller than the window holds does, or
+/// one of some lines in the 240 points the drawer leaves the Chat at the least (`WithDrawer`): it
+/// stands on its foot still, and a conversation's transcript has no height left.
 private struct ChatColumn: Layout {
     /// Whether it lays a new chat out.
     let newChat: Bool
@@ -598,7 +600,9 @@ private struct ChatColumn: Layout {
             if newChat {
                 page.place(at: CGPoint(x: bounds.midX, y: foot - height), anchor: .bottom, proposal: width)
             } else {
-                page.place(at: bounds.origin, proposal: ProposedViewSize(width: bounds.width, height: foot - height - bounds.minY))
+                // None, not less, where the composer reaches past the column's top.
+                let left = max(0, foot - height - bounds.minY)
+                page.place(at: bounds.origin, proposal: ProposedViewSize(width: bounds.width, height: left))
             }
         }
     }

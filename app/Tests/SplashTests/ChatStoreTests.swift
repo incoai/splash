@@ -270,29 +270,23 @@ extension ChatStoreTests {
         #expect(written(store, in: fake.chats).isEmpty)
     }
 
-    /// Another chat opened while the server holds a new chat's first message stays open: taken,
-    /// the new chat joins the list at its top, and refused, it leaves no trace. The new chat open
-    /// again by then, as New Chat leaves it, the chat taken opens.
+    /// Another chat opened while the server holds a new chat's first message stays open as the
+    /// server takes it: the new chat joins the list at its top. The new chat open again by then,
+    /// as New Chat leaves it, the chat taken opens.
     @Test func anotherChatOpenedMeanwhileStaysOpen() async throws {
-        let fake = try RefusingServer(["refuse", "take", "take"])
+        let fake = try RefusingServer(["take", "take"])
         defer { fake.close() }
         let other = try saved("Bread recipe", ago: 3600, in: fake.chats)
         let store = ChatStore(folder: fake.chats)
         let shown = Seen { Shown(of: store) }
-        var refusals: [ChatStore.Refused] = []
         let there = Shown(listed: [other.id], open: other.id, messages: ["Bread recipe", "Yes."])
-        for outcome in ["refused", "taken"] {
-            store.newChat()
-            store.send("Hello", attachments: [], to: fake.target) { refusals.append($0) }
-            try await waitFor(fake.holding, "the server to hold the message")
-            store.selection = other.id
-            try await fake.proceed()
-            try await waitFor(store.streaming == nil, "the message \(outcome)")
-            #expect(store.selection == other.id)
-            if outcome == "refused" { #expect(Shown(of: store) == there && written(store, in: fake.chats) == [other]) }
-        }
+        store.send("Hello", attachments: [], to: fake.target)
+        try await waitFor(fake.holding, "the server to hold the message")
+        store.selection = other.id
+        try await fake.proceed()
+        try await waitFor(store.streaming == nil, "the reply")
+        #expect(store.selection == other.id)
         let new = try #require(store.conversations.first { $0.id != other.id })
-        #expect(refusals == [ChatStore.Refused(text: "", attachments: [], reason: "Request body too large", conversation: nil)])
         #expect(store.conversations.map(\.id) == [new.id, other.id] && new.messages.map(\.text) == ["Hello", "Answer"])
         // Only ever the other chat's two states, a new chat open or it, until the new one is listed.
         #expect(shown.values.filter { $0.listed == [other.id] }.allSatisfy { $0 == there || $0 == Shown(listed: [other.id]) })
@@ -309,6 +303,120 @@ extension ChatStoreTests {
         try await waitFor(store.streaming == nil, "the reply")
         #expect(store.conversations.count == 3 && store.selection == store.conversations[0].id)
         #expect(store.current?.messages.map(\.text) == ["Again", "Answer"])
+    }
+
+    /// A new chat's first message that comes to nothing opens the new chat again, where the
+    /// composer, which still holds it, says why: refused once another chat is open, its server
+    /// not to be reached, the other chat opened before the connection fails, and stopped from
+    /// elsewhere, as a switch of models stops it, which gives the composer nothing but the
+    /// message it holds, to edit. No chat is kept of it, in the list or on disk. Left under the
+    /// other chat, the message was that chat's to send, its reason unsaid there.
+    @Test func aFirstMessageThatComesBackOpensTheNewChat() async throws {
+        let fake = try RefusingServer(["refuse", "take"])
+        defer { fake.close() }
+        let other = try saved("Bread recipe", ago: 3600, in: fake.chats)
+        let store = ChatStore(folder: fake.chats)
+        let shown = Seen { Shown(of: store) }
+        var refusals: [ChatStore.Refused] = []
+        let there = Shown(listed: [other.id], open: other.id, messages: ["Bread recipe", "Yes."])
+        store.send("Hello", attachments: [], to: fake.target) { refusals.append($0) }
+        try await waitFor(fake.holding, "the server to hold the message")
+        store.selection = other.id
+        try await fake.proceed()
+        try await waitFor(store.streaming == nil, "the refusal")
+        #expect(store.selection == nil && refusals.map(\.reason) == ["Request body too large"])
+
+        // A port nothing listens on, as a server that has just gone leaves it.
+        let nowhere = ChatTarget(url: URL(string: "http://127.0.0.1:\(freePort())")!, model: "a/b", acceptsImages: false, effort: "")
+        store.send("Hello", attachments: [], to: nowhere) { refusals.append($0) }
+        store.selection = other.id
+        try await waitFor(store.streaming == nil, "the connection to fail")
+        #expect(store.selection == nil && refusals.count == 2)
+        #expect(refusals.allSatisfy { $0.text.isEmpty && $0.attachments.isEmpty && $0.conversation == nil && $0.reason?.isEmpty == false })
+
+        store.send("Hello", attachments: [], to: fake.target) { refusals.append($0) }
+        try await waitFor(fake.holding, "the server to hold the message again")
+        store.selection = other.id
+        store.stop()
+        try await waitFor(store.streaming == nil, "the stop")
+        #expect(store.selection == nil && refusals.count == 2)
+        // Only ever the other chat as it was, open or under the new chat.
+        #expect(shown.values.allSatisfy { $0 == there || $0 == Shown(listed: [other.id]) })
+        #expect(shown.values.last == Shown(listed: [other.id]) && written(store, in: fake.chats) == [other])
+    }
+
+    /// A later message that comes to nothing comes back to its chat, which opens again where
+    /// another was opened meanwhile, for the composer to hold it there, and say why: refused, its
+    /// server not to be reached, the other chat opened before the connection fails, and stopped
+    /// from elsewhere, as a switch of models stops it. Left under the chat opened meanwhile, the
+    /// message was that chat's to send, its reason unsaid there. Stopped in its own chat, as Stop
+    /// stops it, its chat stays open. Each time its chat is as it was, in the list and on disk.
+    @Test func aLaterMessageThatComesBackOpensItsChat() async throws {
+        let fake = try RefusingServer(["refuse", "take", "take"])
+        defer { fake.close() }
+        let older = try saved("Bread recipe", ago: 7200, in: fake.chats), newer = try saved("Kyoto in spring", ago: 3600, in: fake.chats)
+        let store = ChatStore(folder: fake.chats)
+        store.selection = older.id
+        var refusals: [ChatStore.Refused] = []
+        store.send("And rye?", attachments: [], to: fake.target) { refusals.append($0) }
+        try await waitFor(fake.holding, "the server to hold the message")
+        store.selection = newer.id
+        try await fake.proceed()
+        try await waitFor(store.streaming == nil, "the refusal")
+        #expect(store.selection == older.id && store.current == older)
+
+        // A port nothing listens on, as a server that has just gone leaves it.
+        let nowhere = ChatTarget(url: URL(string: "http://127.0.0.1:\(freePort())")!, model: "a/b", acceptsImages: false, effort: "")
+        store.send("And rye?", attachments: [], to: nowhere) { refusals.append($0) }
+        store.selection = newer.id
+        try await waitFor(store.streaming == nil, "the connection to fail")
+        #expect(store.selection == older.id && store.current == older)
+
+        // Stopped once another chat is open, then in its own chat.
+        for elsewhere in [true, false] {
+            store.send("And rye?", attachments: [], to: fake.target) { refusals.append($0) }
+            try await waitFor(fake.holding, "the server to hold the message")
+            if elsewhere { store.selection = newer.id }
+            store.stop()
+            try await waitFor(store.streaming == nil, "the stop")
+            #expect(store.selection == older.id && store.current == older)
+            // The request stopped, which the server held, goes on to nothing.
+            try await fake.proceed()
+        }
+        #expect(refusals.map(\.text) == ["And rye?", "And rye?", "And rye?", "And rye?"])
+        #expect(refusals.allSatisfy { $0.conversation == older.id && $0.attachments.isEmpty })
+        #expect(refusals.first?.reason == "Request body too large" && refusals.map { $0.reason != nil } == [true, true, false, false])
+        #expect(store.conversations == [newer, older] && written(store, in: fake.chats) == [newer, older])
+    }
+
+    /// An answer asked again gives back only why it came to nothing: refused once another chat is
+    /// open, it opens its chat again, where the composer says why and the earlier answer shows.
+    /// Stopped from elsewhere, as a switch of models stops it, the chat open by then stays open,
+    /// and nothing goes to the composer, which keeps what it holds and says: the request's end
+    /// alone tells of the stop.
+    @Test func anAnswerAskedAgainOpensItsChatOnlyToSayWhy() async throws {
+        let fake = try RefusingServer(["refuse", "take"])
+        defer { fake.close() }
+        let older = try saved("Bread recipe", ago: 7200, in: fake.chats), newer = try saved("Kyoto in spring", ago: 3600, in: fake.chats)
+        let store = ChatStore(folder: fake.chats)
+        store.selection = older.id
+        var refusals: [ChatStore.Refused] = []
+        store.retry(with: fake.target) { refusals.append($0) }
+        try await waitFor(fake.holding, "the server to hold the answer asked again")
+        store.selection = newer.id
+        try await fake.proceed()
+        try await waitFor(store.streaming == nil, "the refusal")
+        #expect(store.selection == older.id && store.current == older)
+        #expect(refusals == [ChatStore.Refused(text: "", attachments: [], reason: "Request body too large", conversation: older.id)])
+
+        store.retry(with: fake.target) { refusals.append($0) }
+        try await waitFor(fake.holding, "the server to hold the answer asked again")
+        store.selection = newer.id
+        store.stop()
+        try await waitFor(store.streaming == nil, "the stop")
+        #expect(store.selection == newer.id)
+        #expect(refusals.count == 1 && !store.answering)
+        #expect(store.conversations == [newer, older] && written(store, in: fake.chats) == [newer, older])
     }
 
     /// A later message shows in its chat at once, and changes nothing the app keeps until the

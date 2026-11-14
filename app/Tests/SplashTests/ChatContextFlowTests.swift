@@ -323,6 +323,55 @@ struct ChatContextFlowTests {
         }
     }
 
+    /// A message that comes back once another chat is open comes back to its chat, which opens
+    /// again, where the composer holds it, says why and Send sends it: a later message the server
+    /// refuses, back in the composer before what was typed in the other chat meanwhile, which
+    /// stays; a new chat's first message it refuses, which the composer still holds; and a later
+    /// message stopped from elsewhere, as a switch of models stops it, back with nothing to say.
+    /// Left under the chat opened meanwhile, the composer said nothing of why there, its reason
+    /// being about another chat, and Send sent the message there.
+    @Test func aMessageThatComesBackOnceAnotherChatIsOpenOpensItsChat() async throws {
+        try await withServer { fixture in
+            let state = fixture.state
+            state.draft.text = "refuse this"
+            try fixture.hold()
+            state.sendDraft()
+            try await fixture.held()
+            state.chats.newChat()
+            state.draft.text = "Typed in the new chat"
+            try fixture.release()
+            try await waitFor(state.chats.streaming == nil, "the refusal")
+            #expect(state.chats.selection == fixture.history.id && state.chats.current == fixture.history)
+            #expect(state.draft.text == "refuse this\n\nTyped in the new chat")
+            #expect(state.draft.notice == Draft.Notice(text: "Request body too large", conversation: fixture.history.id))
+
+            state.chats.newChat()
+            state.draft.text = "refuse this"
+            try fixture.hold()
+            state.sendDraft()
+            try await fixture.held()
+            state.chats.selection = fixture.history.id
+            try fixture.release()
+            try await waitFor(state.chats.streaming == nil, "the refusal")
+            #expect(state.chats.selection == nil && state.chats.conversations == [fixture.history])
+            #expect(state.draft.text == "refuse this")
+            #expect(state.draft.notice == Draft.Notice(text: "Request body too large", conversation: nil))
+
+            state.chats.selection = fixture.history.id
+            state.draft.text = "Short?"
+            try fixture.hold()
+            state.sendDraft()
+            try await fixture.held()
+            state.chats.newChat()
+            state.chats.stop()
+            try await waitFor(state.chats.streaming == nil, "the stop")
+            #expect(state.chats.selection == fixture.history.id && state.chats.current == fixture.history)
+            #expect(state.draft.text == "Short?" && state.draft.notice == nil)
+            #expect(try fixture.sent().isEmpty && fixture.written() == [fixture.history.id])
+            try fixture.release()
+        }
+    }
+
     /// A chat opened shows its last count at once, while its prompt is counted again, and one not
     /// counted yet an empty ring: the composer's ring never goes as chats open. With the last
     /// count of all alone, it went as each chat opened and came back, fading in, once counted.

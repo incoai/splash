@@ -127,16 +127,13 @@ final class Draft {
         (text.trimmingCharacters(in: .whitespacesAndNewlines), attachments)
     }
 
-    /// Takes the message, leaving the draft empty; its attachments' files are the message's.
-    @discardableResult
-    func take() -> (text: String, attachments: [Attachment]) {
-        defer {
-            text = ""
-            attachments = []
-            thumbnails = [:]
-            notice = nil
-        }
-        return message
+    /// Takes the message out, leaving the draft empty: it is its conversation's from then on
+    /// (`AppState.sendDraft`), and its attachments' files with it.
+    func take() {
+        text = ""
+        attachments = []
+        thumbnails = [:]
+        notice = nil
     }
 
     /// Takes back `refused`, what a request that came to nothing gives back, in its chat: the
@@ -285,8 +282,9 @@ struct Composer: View {
     }
 
     /// The room the composer leaves over what it holds and under its controls: over its text
-    /// where nothing is over it (`VerticalAlignment.composerPlain`).
-    private static let inset: CGFloat = 12
+    /// where nothing is over it (`VerticalAlignment.composerPlain`). No actor's: the guide reads
+    /// it as SwiftUI computes it, which need not be on the main actor.
+    private nonisolated static let inset: CGFloat = 12
 
     /// What the composer holds, which it takes at once.
     private struct Contents: Equatable {

@@ -511,13 +511,15 @@ final class AppState {
     /// once the server has taken it and the chat opens. Until then the composer holds a new chat's
     /// first message as it was sent, so that a refusal leaves the window as it was, the composer
     /// saying why: with the chat opened and listed at Send, a refusal took the composer to the
-    /// conversation's foot and back, and a row into the list and out.
+    /// conversation's foot and back, and a row into the list and out. A message that comes back
+    /// comes back to its chat, which the store opens again where another was opened meanwhile
+    /// (`ChatStore.stream`).
     func sendDraft() {
         guard canSendDraft, let target else { return }
         let message = draft.message
         chats.send(message.text, attachments: message.attachments, to: target) { [weak self] refused in
             self?.draft.restore(refused)
-        } taken: { [weak self] in
+        } shown: { [weak self] in
             self?.draft.take()
         }
     }
