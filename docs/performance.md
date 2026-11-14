@@ -69,6 +69,32 @@ Prefilling a 2,048-token chunk, it runs at 559 tok/s against 374 on the 27B
 and 3,662 against 1,968 on the 35B on the M5 Pro, and at 245 against 193 and
 1,814 against 1,575 on the M3 Max.
 
+## Apple8 (M2)
+
+Apple8 takes the Apple9 kernel plans, whose matrix operations run on the FP32
+pipe it shares. Measured on an M2 Max (38-core GPU, 64 GB, macOS 27.0.1)
+serving Qwen3.8-27B UD-Q4_K_M with its DFlash2 draft, `--max-memory 46G
+--language-only`, greedy, 400 output tokens, medians of three runs:
+
+| Metric | M2 Max |
+| --- | ---: |
+| Decode · code prompt | 30.6 tok/s |
+| Decode · prose prompt | 26.0 tok/s |
+| Decode · 4 concurrent short prompts | 46.9 tok/s |
+| Prefill · 6,430-token prompt | 146 tok/s |
+| Prefill · 25,540-token prompt | 123 tok/s |
+| Cached time to first token · 25.5K replay | 1.0 s |
+| Context at `--max-memory 46G` | 256K tokens |
+
+The prompts are the author's; each prefill is a first, cold send of its
+prompt, and the decode figures are the engine's own
+`predicted_per_second`. A 2,048-row prefill command holds the GPU for about 16
+seconds at the 25.5K rate above, past the few seconds macOS gives a command
+while the display needs the GPU, so a long cold prompt can be aborted with
+`Impacting Interactivity` under desktop load, which fails that request and
+restarts the engine. Bounding each prefill command by its measured time
+removes that, and is not part of this change.
+
 ## Smaller GGUFs on 24 GB Macs
 
 Measured on a 24 GB M6 (12-core GPU), with each model's DFlash2 draft:

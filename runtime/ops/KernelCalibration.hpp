@@ -331,7 +331,10 @@ inline constexpr AttentionCalibration kApple9SmallAttention = [] {
 inline KernelCalibration KernelCalibration::of(const DeviceCapabilities &device) noexcept {
   const uint32_t cores = device.plannedGpuCores();
   const GpuClass gpu = device.gpuClass();
-  if (gpu != GpuClass::Apple9)
+  // Apple8 multiplies on the FP32 pipe as Apple9 does, so it takes Apple9's
+  // rows; a 38-core M2 Max decodes Qwen3.8-27B UD-Q4_K_M at 31 tok/s, 2.8
+  // tokens a cycle.
+  if (gpu == GpuClass::Apple10 || gpu == GpuClass::Apple11)
     return {cores, gpu == GpuClass::Apple11 ? kApple11Projection : kApple10Projection, kApple10FloatTile,
             kApple10Attention};
   const bool small = cores <= kApple9SmallGpuCores;

@@ -1442,9 +1442,9 @@ class LauncherTests(unittest.TestCase):
 
     def test_unsupported_mac_is_refused_before_any_download(self):
         reason = (
-            "Splash needs Apple GPU family 9 or newer (M3 or later) on macOS 26.4 "
-            "or newer; this Mac has Apple M2 Max (Apple GPU family 8) on macOS "
-            "26.4.1 (apple_gpu_family_9_required)"
+            "Splash needs Apple GPU family 8 or newer (M2 or later) on macOS 26.4 "
+            "or newer; this Mac has Apple M1 Max (Apple GPU family 7) on macOS "
+            "26.4.1 (apple_gpu_family_8_required)"
         )
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -1531,7 +1531,7 @@ class LauncherTests(unittest.TestCase):
             program.chmod(0o755)
             return mock.patch.object(launcher.paths, "PYTHON", program)
 
-        unsupported = "Splash needs Apple GPU family 9 or newer (M3 or later)"
+        unsupported = "Splash needs Apple GPU family 8 or newer (M2 or later)"
         for case, setup, arguments, failure, said, output in (
             (
                 "upgrade",

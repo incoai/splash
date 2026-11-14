@@ -1172,16 +1172,16 @@ void testDeviceValidationMessageNamesWhatTheMacHas() {
   require(!device().validationMessage(),
           "the reference device has a validation message");
   const std::string needs =
-      "Splash needs Apple GPU family 9 or newer (M3 or later) on macOS 26.4 "
+      "Splash needs Apple GPU family 8 or newer (M2 or later) on macOS 26.4 "
       "or newer; this Mac has ";
-  DeviceCapabilities m2 = device();
-  m2.deviceName = "Apple M2 Max";
-  m2.appleGpuFamily = 8;
-  m2.macosPatch = 1;
-  require(m2.validationMessage().value_or("") ==
-              needs + "Apple M2 Max (Apple GPU family 8) on macOS 26.4.1 "
-                      "(apple_gpu_family_9_required)",
-          "a family-8 GPU was not named against the family required");
+  DeviceCapabilities m1 = device();
+  m1.deviceName = "Apple M1 Max";
+  m1.appleGpuFamily = 7;
+  m1.macosPatch = 1;
+  require(m1.validationMessage().value_or("") ==
+              needs + "Apple M1 Max (Apple GPU family 7) on macOS 26.4.1 "
+                      "(apple_gpu_family_8_required)",
+          "a family-7 GPU was not named against the family required");
   DeviceCapabilities older = device();
   older.macosMinor = 3;
   require(older.validationMessage().value_or("") ==

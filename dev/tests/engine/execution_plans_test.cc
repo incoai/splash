@@ -60,7 +60,7 @@ void covers(const Workspace &stride, const Workspace &needed, uint32_t lanes,
 }
 
 void baselinePlans() {
-  for (uint32_t family : {9U, 10U, 11U}) {
+  for (uint32_t family : {8U, 9U, 10U, 11U}) {
     const ExecutionPlans plans(device(family), Int8Activations::On);
     const Linear baseline(device(family), Int8Activations::On);
     for (auto matrix : matrices) {
@@ -142,7 +142,7 @@ void int8ActivationsSetting() {
   const kv::Layout layout{1, 2, 256};
   const std::array<uint32_t, 1> history{131072};
   const auto int8Queries = [](const std::string &pipeline) { return pipeline.find("q8q") != std::string::npos; };
-  for (uint32_t family : {9U, 10U, 11U}) {
+  for (uint32_t family : {8U, 9U, 10U, 11U}) {
     const ExecutionPlans on(device(family), Int8Activations::On), off(device(family), Int8Activations::Off);
     const ProjectionCalibration &row = on.calibration().projection, &offRow = off.calibration().projection;
     require(on.linear().int8Activations() == Int8Activations::On &&
@@ -173,7 +173,7 @@ void int8ActivationsSetting() {
 void draftPlans() {
   const Projection context(5120, 25600,
                            BlockWeights{{QuantizedSegment::planes(GGUF_FMT_AF4G64, 5120, 25600, {}, {}, {})}});
-  for (uint32_t family : {9U, 10U, 11U})
+  for (uint32_t family : {8U, 9U, 10U, 11U})
     for (const Int8Activations setting : {Int8Activations::On, Int8Activations::Off}) {
       const ExecutionPlans plans(device(family), setting);
       const Linear &draft = plans.draftLinear(), &target = plans.linear();
@@ -261,10 +261,44 @@ void prefillSplitsFollowTheDeviceRow() {
     }
 }
 
+// Apple8 (M2) multiplies on the FP32 pipe as Apple9 does, so it takes the
+// Apple9 row at every core count, small or large: the plans it installs are
+// the Apple9 device's, for every shape, phase and epilogue.
+void apple8TakesTheApple9Row() {
+  const kv::Layout layout{1, 2, 256};
+  const std::array<uint32_t, 1> history{131072};
+  for (const uint32_t cores : {10U, 32U, 38U}) {
+    DeviceCapabilities m2 = device(8), m3 = device(9);
+    m2.gpuCoreCount = m3.gpuCoreCount = cores;
+    require(m2.gpuClass() == GpuClass::Apple8 && m3.gpuClass() == GpuClass::Apple9,
+            "the GPU family 8 or 9 did not map to its class");
+    const ExecutionPlans apple8(m2, Int8Activations::On), apple9(m3, Int8Activations::On);
+    for (auto matrix : matrices) {
+      for (uint32_t rows : {1U, 64U, 256U, 2048U})
+        for (const auto epilogue : {LinearEpilogue::None, LinearEpilogue::Residual, LinearEpilogue::UpWithGate})
+          require(apple8.linear().plan({matrix, rows, LinearPhase::Prefill, epilogue}).configuration() ==
+                      apple9.linear().plan({matrix, rows, LinearPhase::Prefill, epilogue}).configuration(),
+                  "an Apple8 prefill plan took another row than Apple9's");
+      for (uint32_t lanes = 1; lanes <= 4; ++lanes)
+        for (const auto epilogue : {LinearEpilogue::None, LinearEpilogue::Residual, LinearEpilogue::GateUp})
+          require(apple8.linear().plan({matrix, lanes * SPLASH_TARGET_VERIFY_ROWS, LinearPhase::Decode, epilogue})
+                      .configuration() ==
+                  apple9.linear().plan({matrix, lanes * SPLASH_TARGET_VERIFY_ROWS, LinearPhase::Decode, epilogue})
+                      .configuration(),
+                  "an Apple8 decode plan took another row than Apple9's");
+    }
+    require(apple8.prefillAttention(64, 32768, 16, layout).splitPipeline ==
+                    apple9.prefillAttention(64, 32768, 16, layout).splitPipeline &&
+                apple8.verifyAttention(1, 16, layout, history).splitPipeline ==
+                    apple9.verifyAttention(1, 16, layout, history).splitPipeline,
+            "an Apple8 attention plan took another row than Apple9's");
+  }
+}
+
 // A device that reports no core count gets the plans of kAssumedGpuCores
 // cores, Linear and MoE alike.
 void unknownCoreCount() {
-  for (uint32_t family : {9U, 10U}) {
+  for (uint32_t family : {8U, 9U, 10U}) {
     DeviceCapabilities assumed = device(family);
     assumed.gpuCoreCount = DeviceCapabilities::kAssumedGpuCores;
     const ExecutionPlans unknown(device(family), Int8Activations::On), planned(assumed, Int8Activations::On);
@@ -354,6 +388,7 @@ void invalidLookupsAndContextEdges() {
 int main() {
   try {
     baselinePlans();
+    apple8TakesTheApple9Row();
     int8ActivationsSetting();
     draftPlans();
     ggufMoePlans();

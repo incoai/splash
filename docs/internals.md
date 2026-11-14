@@ -429,8 +429,10 @@ Three pieces choose every kernel configuration, and nothing else in the
 engine or the models branches on the GPU:
 
 - `DeviceCapabilities` (`runtime/metal/DeviceCapabilities.hpp`) describes the
-  device: its class (`gpuClass()`: Apple9, family 9, whose matrix operations
-  share the FP32 pipe; Apple10, family 10, a neural accelerator per core;
+  device: its class (`gpuClass()`: Apple8, family 8, which takes Apple9's
+  rows, its matrix operations sharing the FP32 pipe; Apple9, family 9, whose
+  matrix operations share that pipe; Apple10, family 10, a neural accelerator
+  per core;
   Apple11, family 11 and later, which takes Apple10's rows but for one lane's
   16-row tile from four and a half bits, so what this page says of Apple10
   holds for it unless it names Apple11) and the cores kernel policy plans for
@@ -591,7 +593,8 @@ M5 Pro, where later starts take about 14 s.
 
 Decode runs one of two kernel families, chosen by the device's calibration row
 (`KernelSelection.cpp`). On
-Apple9 (M3, M4) the register tile (`LinearTile::GgufRegister`) runs the kernels of
+Apple8 (M2) and Apple9 (M3, M4) the register tile (`LinearTile::GgufRegister`)
+runs the kernels of
 `runtime/metal/kernels/decode/linear_gguf_sgmatrix.metal`, which feed the codes themselves to
 bf16 matrix operations, each chain of 32 inputs (16 for 16-input scales) closed by its fp32 scale,
 so every output is the bf16 rounding of its fp32-accumulated sum. The coefficient

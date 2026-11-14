@@ -32,8 +32,11 @@
 #define SPLASH_TARGET_SAMPLING_SHARDS 16u
 // Threads of each group that selects a sampled row over the whole
 // vocabulary (decode_sample_vocabulary*); a bracket of at most this many
-// tokens is ordered in threadgroup memory, one token per thread.
-#define SPLASH_TARGET_VOCABULARY_THREADS 1024u
+// tokens is ordered in threadgroup memory, one token per thread. 256 fits
+// every supported family's pipeline: Apple8 caps this kernel's groups at 576
+// on an M2 Ultra (384 under shader validation), and 256 decodes the 27B at
+// 93.6 tok/s there against 90.9 at 512, twelve coding prompts, medians.
+#define SPLASH_TARGET_VOCABULARY_THREADS 256u
 // Groups that share such a row's draw, each over its own slice of the
 // vocabulary, so the eight rows of a lane spread over the GPU's cores.
 #define SPLASH_TARGET_VOCABULARY_GROUPS 8u
