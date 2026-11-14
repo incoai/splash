@@ -13,6 +13,7 @@ from collections import Counter
 from dataclasses import dataclass, replace
 from pathlib import Path
 
+from jinja2 import meta
 from tokenizers import (
     AddedToken,
     Regex,
@@ -28,6 +29,7 @@ from transformers import AutoTokenizer, PreTrainedTokenizerFast
 
 from dev.tests import server_fixtures as fixtures
 from install import assembly, paths
+from server import chat_templates
 from server.chat_format import FLINT, QWEN, ChatFormat
 from server.chat_templates import template_options
 from server.dialects import scoring
@@ -312,26 +314,31 @@ def quoting(quote):
     }
 
 
-def ending(cut):
-    """A Chat request each of whose texts ends with `cut`, where what the
-    template writes after the text follows it: each role's content, an
-    assistant's reasoning, a call's name, argument names and values, and a
-    tool's definition."""
+def texts(before="", after=""):
+    """A Chat request each of whose texts begins with `before` and ends with
+    `after`, in every place a request puts text: each role's content, an
+    assistant's reasoning, a call's name, argument names and values, a
+    tool's result, and the description, parameter names and parameter
+    descriptions of a tool's definition."""
+
+    def text(words):
+        return f"{before}{words}{after}"
+
     return {
         "messages": [
-            {"role": "system", "content": f"Notes end with {cut}"},
-            {"role": "user", "content": f"What follows {cut}"},
+            {"role": "system", "content": text("Notes on the parser")},
+            {"role": "user", "content": text("What does the parser read")},
             {
                 "role": "assistant",
-                "reasoning_content": f"The parser stops at {cut}",
-                "content": f"I will read up to {cut}",
+                "reasoning_content": text("The parser opens a call"),
+                "content": text("I will read the parser"),
                 "tool_calls": [
                     {
                         "id": "call_1",
                         "type": "function",
                         "function": {
-                            "name": f"read{cut}",
-                            "arguments": {f"near{cut}": f"parsers/{cut}"},
+                            "name": text("read"),
+                            "arguments": {text("near"): text("parsers/qwen")},
                         },
                     }
                 ],
@@ -339,21 +346,21 @@ def ending(cut):
             {
                 "role": "tool",
                 "tool_call_id": "call_1",
-                "content": f"tool_call_start = {cut}",
+                "content": text("tool_call_start = 1"),
             },
-            {"role": "user", "content": f"So it is {cut}"},
+            {"role": "user", "content": text("So it is")},
         ],
         "tools": [
             {
                 "type": "function",
                 "function": {
                     "name": "read",
-                    "description": f"Reads a file up to {cut}",
+                    "description": text("Reads a file"),
                     "parameters": {
                         "type": "object",
                         "properties": {
-                            "path": {"type": "string", "description": cut},
-                            f"near{cut}": {"type": "integer"},
+                            "path": {"type": "string", "description": text("A path")},
+                            text("near"): {"type": "integer"},
                         },
                     },
                 },
@@ -672,7 +679,7 @@ class QuotedTokenTests(unittest.TestCase):
         # token of theirs a name leaves it to. Each token is cut before its
         # last character, and the family's boundary everywhere.
         for family in self.each():
-            written = family.controls(family.tokens(ending(WORD)))
+            written = family.controls(family.tokens(texts(after=WORD)))
             boundary = family.chat_format.message_boundary
             cuts = {token[:-1] for token in family.added} | {
                 boundary[:cut] for cut in range(1, len(boundary))
@@ -682,25 +689,88 @@ class QuotedTokenTests(unittest.TestCase):
                     self.assertEqual(
                         self.assert_quoted(
                             family,
-                            ending(cut),
-                            family.text(ending(WORD)).replace(WORD, cut),
+                            texts(after=cut),
+                            family.text(texts(after=WORD)).replace(WORD, cut),
                         ),
                         written,
                     )
+
+    def begun(self, family):
+        """The tails of the family's added tokens that are a token of the
+        prompt where a request's text begins with one, by where the text
+        stands: in every place of a request (texts), and in each variable
+        the family's templates read, as a request sets one. Each tail is the
+        rest of a token after a cut past its first character. A request the
+        server or the template refuses renders nothing: a text has no place
+        there. Empty unless a template itself writes the beginning of a
+        token before a text."""
+        tails = sorted(
+            {token[cut:] for token in family.added for cut in range(1, len(token))}
+        )
+        requests = {"texts": lambda text: texts(before=text)}
+        for template in family.app.chat_templates.templates.values():
+            tree = chat_templates._ENVIRONMENT.parse(template.source)
+            for name in sorted(meta.find_undeclared_variables(tree)):
+                requests[f"variable {name}"] = lambda text, name=name: {
+                    "messages": [{"role": "user", "content": "Hi"}],
+                    "chat_template_kwargs": {name: text},
+                }
+        found = {}
+        for place, request in requests.items():
+            try:
+                written = family.controls(family.tokens(request(WORD)))
+            except APIError:
+                continue
+            completed = {
+                tail
+                for tail in tails
+                if family.controls(family.tokens(request(tail))) != written
+            }
+            if completed:
+                found[place] = completed
+        return found
+
+    def test_no_template_begins_a_token_before_a_text(self):
+        # quote() marks a token where a request's text begins it. One whose
+        # first characters a template wrote itself before a text would be a
+        # token the text only ended, which nothing marks: no template of a
+        # served family writes them, whatever the text and wherever it
+        # stands (docs/models.md states it).
+        for family in self.each():
+            self.assertEqual(self.begun(family), {})
+
+    def test_a_template_that_begins_a_token_before_a_text_is_found(self):
+        # What the test above finds in a template that writes `<`, the first
+        # character of every token, before a call's name and before a
+        # variable of its own: the rest of each token, in both places.
+        tokenizer = bpe_tokenizer(
+            QWEN_SPECIAL,
+            QWEN_TAGS,
+            QWEN_SPLITS,
+            "<|im_start|>system\n<{{ banner }}<|im_end|>\n"
+            "{% for message in messages %}<|im_start|>{{ message.role }}\n"
+            "{{ message.content }}{% for call in message.tool_calls or [] %}"
+            "<{{ call.function.name }}>{% endfor %}<|im_end|>\n{% endfor %}"
+            "{% if add_generation_prompt %}<|im_start|>assistant\n{% endif %}",
+            nfc=True,
+        )
+        family = Served("begins", tokenizer, QWEN, False)
+        rests = {token[1:] for token in family.added}
+        self.assertEqual(self.begun(family), {"texts": rests, "variable banner": rests})
 
     def test_a_token_spelled_around_a_nul_is_no_token(self):
         # Flint's template deletes U+0000 from a message's text, which would
         # write whole a token the text spells around one, where nothing
         # marked it. A request's U+0000 reaches every template as U+FFFD.
         for family in self.each():
-            written = family.controls(family.tokens(ending(WORD)))
+            written = family.controls(family.tokens(texts(after=WORD)))
             for token in sorted(family.added):
                 with self.subTest(token=token):
                     self.assertEqual(
                         self.assert_quoted(
                             family,
-                            ending(token[:2] + "\x00" + token[2:]),
-                            family.text(ending(WORD)).replace(
+                            texts(after=token[:2] + "\x00" + token[2:]),
+                            family.text(texts(after=WORD)).replace(
                                 WORD, token[:2] + "\ufffd" + token[2:]
                             ),
                         ),
