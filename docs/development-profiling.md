@@ -153,7 +153,7 @@ do not claim that GitHub-hosted Metal validation has passed.
 
 ## Hosted CI Metal bootstrap
 
-The production/app and Python jobs use the macOS 26 image with its stable Xcode
+The production/app and Python jobs use the GitHub-hosted macOS 26 image with its stable Xcode
 toolchain; the macOS 27 image selected an Xcode release candidate whose Metal asset
 catalog repeatedly failed. Native sanitizers retain macOS 27 coverage. The 26.4
 production deployment floor is unchanged.
