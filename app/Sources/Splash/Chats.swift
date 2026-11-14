@@ -288,7 +288,8 @@ final class ChatStore {
     /// What a request that came to nothing gives back to the composer, in its conversation, nil
     /// for a new one: the message the composer gave up, where it did, and why the request came to
     /// nothing, unless it was stopped. A new chat's first message, which the composer still
-    /// holds, and a reply asked again give back only why.
+    /// holds, and a reply asked again give back only why. Its chat is the open one by then
+    /// (`stream`).
     struct Refused: Equatable {
         let text: String
         let attachments: [Attachment]
@@ -304,7 +305,7 @@ final class ChatStore {
     /// composer to give it up: at once in an open one, and for a new chat once the server has
     /// taken it. A request the server refuses, that never reaches it or that is stopped before
     /// it takes it leaves the chats as they were, and goes to `refused`, with what the composer
-    /// gave up of it and why.
+    /// gave up of it and why, its chat open again (`stream`).
     func send(_ text: String, attachments: [Attachment], to server: ChatTarget,
               refused: @escaping (Refused) -> Void = { _ in }, taken: @escaping () -> Void = {}) {
         guard streaming == nil else { return }
@@ -348,7 +349,9 @@ final class ChatStore {
     /// Answers the open conversation's last message again, in place of the last answer, which
     /// stays the chat's until the new one says something (`stream`): where the server refuses the
     /// request, or the new answer ends before it says anything, stopped or failed, the earlier
-    /// one shows again, and a refusal or a failure goes to `refused` with why.
+    /// one shows again, and a refusal or a failure goes to `refused` with why, its chat open
+    /// again (`stream`). Stopped, it gives nothing back, and the open chat stays: the request's
+    /// end alone tells of it (`streaming`).
     func retry(with server: ChatTarget, refused: @escaping (Refused) -> Void = { _ in }) {
         guard streaming == nil, var conversation = current, let previous = conversation.messages.last,
               previous.role == .assistant else { return }
@@ -371,8 +374,10 @@ final class ChatStore {
     /// once the server takes the request (`ChatClient.reply`), and an answer asked again once it
     /// says something in the earlier one's place. A request that ends before, refused, failed or
     /// stopped, leaves every chat as it was, and goes to `back` with why, nil for a stop, unless
-    /// its chat was deleted meanwhile, which its message went with. One that ends after leaves
-    /// its answer in the chat, saying why it stopped short.
+    /// its chat was deleted meanwhile, which its message went with. What it gives back, a message
+    /// or why, comes back to its chat, which opens first; an answer asked again with no why, as
+    /// one stopped, gives nothing back, and opens nothing. One that ends after leaves its answer
+    /// in the chat, saying why it stopped short.
     private func stream(_ conversation: Conversation, new: Bool, to server: ChatTarget, instead previous: ChatMessage? = nil,
                         shown: @escaping () -> Void = {}, back: @escaping (String?) -> Void) {
         var conversation = conversation
@@ -428,7 +433,17 @@ final class ChatStore {
             self.reply = nil
             if pending != nil {
                 pending = nil
-                if new || conversations.contains(where: { $0.id == conversation.id }) { back(answer.error) }
+                let listed = conversations.contains { $0.id == conversation.id }
+                guard new || listed else { return }
+                // What comes back comes back to its chat, which opens first, the new chat for a new
+                // chat's first message, which nothing lists: the composer says why in the chat it
+                // is about alone, and Send sends what it holds to the open chat. Under a chat
+                // opened while the server had the message, a message refused came back with its
+                // reason unsaid, and one stopped from elsewhere, as a switch of models stops it,
+                // with nothing said, each for Send to send there. An answer asked again with no
+                // why, as one stopped, gives nothing back, and opens nothing.
+                if previous == nil || answer.error != nil { selection = listed ? conversation.id : nil }
+                back(answer.error)
                 return
             }
             // A reply that ended while the model still thought.
