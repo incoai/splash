@@ -120,6 +120,11 @@ def _base_url(port):
     return f"http://127.0.0.1:{port}"
 
 
+# The --host values under which a server listens at _base_url's address: the
+# default, its name, and every IPv4 address.
+_LOOPBACK_HOSTS = ("127.0.0.1", "localhost", "0.0.0.0")
+
+
 # The server is on this Mac's loopback: requests to it connect directly, so
 # no proxy, the environment's or the system's, receives the server's key.
 _DIRECT = urllib.request.build_opener(urllib.request.ProxyHandler({}))
@@ -266,17 +271,18 @@ def _printable(value):
 
 
 def _serve_lock_owner(lock):
-    """The process holding a port's lock, in the words a refusal gives it:
-    its PID, model and port, as serve wrote them in the lock, with its
-    --host where the lock names one and the phase its serve record says
-    where the record is that PID's; nothing for a lock without them."""
+    """The process holding a port's lock, by the names a refusal words
+    (_words): its PID, model and port, as serve wrote them in the lock, with
+    its --host where the lock names one and the phase its serve record says
+    where the record is that PID's; none for a lock without the first
+    three."""
     try:
         lock.seek(0)
         owner = json.load(lock)
     except (OSError, UnicodeError, ValueError):
-        return ""
+        return {}
     if not isinstance(owner, dict):
-        return ""
+        return {}
     pid, model, port = owner.get("pid"), owner.get("model"), owner.get("port")
     if (
         type(pid) is not int
@@ -285,24 +291,32 @@ def _serve_lock_owner(lock):
         or type(port) is not int
         or not 1 <= port <= 65535
     ):
-        return ""
-    words = [f"PID {pid}", f"model {model}", f"port {port}"]
+        return {}
+    names = {"PID": pid, "model": model, "port": port}
     if _printable(host := owner.get("host")):
-        words.append(f"host {host}")
+        names["host"] = host
     try:
         record = json.loads(_serve_record(port).read_bytes())
     except (OSError, ValueError):
         record = None
     if isinstance(record, dict) and record.get("pid") == pid:
         if _printable(phase := record.get("phase")):
-            words.append(f"phase {phase}")
-    return f" ({', '.join(words)})"
+            names["phase"] = phase
+    return names
+
+
+def _words(owner):
+    """A lock's owner (_serve_lock_owner) in a refusal's words, after
+    "serving"; nothing for a lock that names none."""
+    if not owner:
+        return ""
+    return f" ({', '.join(f'{name} {value}' for name, value in owner.items())})"
 
 
 def _port_holder(port):
-    """The words _serve_lock_owner gives the process holding `port`'s lock,
-    or None while none holds it: the lock taken shared without waiting,
-    which only a holder refuses, as the app probes it."""
+    """The process holding `port`'s lock, as _serve_lock_owner names it, or
+    None while none holds it: the lock taken shared without waiting, which
+    only a holder refuses, as the app probes it."""
     try:
         lock = _serve_lock(port).open()
     except OSError:
@@ -464,7 +478,7 @@ def serve(args):
             # The port names the lock whatever --host listens on, a UNIX
             # socket too: a second server takes another.
             raise LauncherError(
-                f"Splash is already serving{_serve_lock_owner(lock)}; "
+                f"Splash is already serving{_words(_serve_lock_owner(lock))}; "
                 "stop it with Ctrl+C first, or serve on another --port"
             ) from None
         lock.seek(0)
@@ -534,14 +548,23 @@ def coding_client(args):
                 f"No ready Splash server at {_base_url(args.port)}. "
                 "Run 'splash serve --model <HF_REPO_ID>' in another terminal first."
             )
+        elif holder.get("host") in _LOOPBACK_HOSTS and holder.get("phase") == "ready":
+            # It listens where the agent commands ask and its record says
+            # ready, so only that it did not answer is known: a server that
+            # stops closes its listener first and holds the port, its record
+            # still ready, until its engine has stopped.
+            message = (
+                f"Splash is serving{_words(holder)} but does not answer at "
+                f"{_base_url(args.port)}: it may be stopping."
+            )
         else:
             # The server holding the port listens elsewhere, on another
             # address or a UNIX socket, or is not ready yet; a second one
             # would be refused the port.
             message = (
                 f"No ready Splash server at {_base_url(args.port)}, but Splash "
-                f"is serving{holder}. Agent commands connect over TCP on "
-                "loopback to a server that is ready."
+                f"is serving{_words(holder)}. Agent commands connect over TCP "
+                "on loopback to a server that is ready."
             )
         # OpenCode and Hermes have a --port of their own, which goes after --.
         if args.explicit_port:

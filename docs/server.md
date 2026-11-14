@@ -1311,6 +1311,8 @@ socket or still starts, the refusal names that server as a second `serve` on
 the port does: its PID, model, port, `--host` and the phase of its [serve
 record](#serve-record), as in
 `(PID 4242, model ID, port 8000, host unix:/tmp/splash.sock, phase ready)`.
+Of a server that listens on loopback and whose record says `ready`, the
+refusal says only that it does not answer, as one that is stopping does not.
 Where the environment names a proxy (`http_proxy`, `https_proxy` or
 `all_proxy`, in either case), it adds
 `127.0.0.1`, `localhost` and `::1` to the agent's `NO_PROXY` and `no_proxy`,
