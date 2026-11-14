@@ -15,11 +15,10 @@ It reuses cached prefixes and batches concurrent requests automatically.
 ## Quick start
 
 [Download the Splash desktop app](https://github.com/incoai/splash/releases/latest/download/Splash.dmg)
-for an Apple M3 or newer on macOS 26.4 or later, open the disk image and drag
+for an Apple M2 or newer on macOS 26.4 or later, open the disk image and drag
 Splash into Applications.
 
-The command line needs an Apple M2 or newer, macOS 26.4 or later, and
-[Homebrew](https://brew.sh):
+The command line needs the same Mac and [Homebrew](https://brew.sh):
 
 ```bash
 brew install incoai/tap/splash
