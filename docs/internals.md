@@ -1994,7 +1994,12 @@ refused, or waits for scheduling, no suspended request resumes. When every
 lane is taken, or a new request's start is refused memory that no copy being
 written to disk is about to free, the resident of the lowest priority below it
 is suspended for it (`cache.priority_suspensions` in `/status`) and resumes
-once a lane and its memory are free. A new request below the priority of a running lane neither
+once a lane and its memory are free. A request that takes a lane starts in it
+at once: the next command is its prompt's, before any more work of the lanes
+that remain, and a command between its passes that the suspension gave up runs
+again only after it (on a 32-core M5 Max a Foreground prompt under four
+Background decodes starts 63 ms sooner at the 27B's command times, 25 ms at
+the 35B's). A new request below the priority of a running lane neither
 starts nor takes a lane until no lane of that priority runs, since it could not
 run before.
 
