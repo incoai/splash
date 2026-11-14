@@ -1,11 +1,11 @@
 """Exercise the real executable's dry run; no Metal library or model exists."""
 import hashlib
 import json
-from pathlib import Path
 import struct
 import subprocess
 import sys
 import tempfile
+from pathlib import Path
 
 
 def main():
