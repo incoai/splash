@@ -199,10 +199,13 @@ class Stream:
                         delta.get("reasoning_content"),
                     )
                     calls = delta.get("tool_calls") or []
+                    # One reading of the clock per delta, so that a reply
+                    # whose first delta is content began when that chunk came.
+                    now = time.time()
                     if piece or thought or calls:
-                        self.began = self.began or time.time()
+                        self.began = self.began or now
                     if piece:
-                        self.chunks.append(time.time())
+                        self.chunks.append(now)
                         self.text.append(piece)
                     if thought:
                         self.reasoning.append(thought)
