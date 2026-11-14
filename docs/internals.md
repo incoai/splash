@@ -1215,18 +1215,31 @@ staged. It fits `T(s) = max(A(s), G(s) + u·A(s))`
 timings; A, the ANE's part, proportional to its channels through the split
 layer at 0.8, where the ANE's part takes the longer on every Mac measured; and
 u the bandwidth the ANE's part takes from the GPU's beside it, the split
-layer's excess over G at 0.4 where G takes the longer there (on the M6 the
-GPU's part runs a tenth to a third longer beside the ANE's). It takes the units
+layer's excess over G where G takes the longer (on the M6 the GPU's part runs
+a tenth to a third longer beside the ANE's at 0.4). It takes the units
 whose T, or T a unit either way, is least at its longest, since the timings can
 put T's least a unit off: a unit past where the ANE's part takes the longer
 costs the ANE's time per unit, a unit short of it the GPU's, and on an M5 Max
 and an M5 Pro the ANE's is the longer (1.7 ms a unit of the full-chunk layer
 against 0.6 and 1.1 ms), on an M6 the GPU's (1.9 against 1.2 ms), all with
-`--activations bf16`. On Qwen3.8-27B that takes 8 of the 34 units on an M5
-Max, 14-15 on an M5 Pro and 25-26 on an M6 with `--activations bf16`, the best
-each Mac's sweeps measured. By default the int8-activation tile makes the
-GPU's part faster, so the split takes fewer: 10 on a 20-core M5 Pro (the M5
-Max and M6 unmeasured). The split runs if T there gains 5% on the GPU alone. A
+`--activations bf16`. It fits u at 0.4, then again at the units it chose,
+nearest T's least, from their split's full-chunk layer as the chunks' timings
+below take it; where that fit chooses other units, their split is prepared
+and timed in turn, and serves if it splits every chunk the first splits, none
+of them more than 2% longer, the first otherwise: the refit took Qwen3.8-27B
+UD-Q4_K_M from 9 of its 34 units to 10
+on an M5 Max, whose full chunk prefilled 1.5-2.0% faster but which split
+chunks from 780 rows against 575, so that chunks of 640 and 672 rows ran 12%
+slower, and 9 serve. Where the ANE's part takes the longer already
+at 0.4, as on a 32-core M5 Max by default, 0.4 leaves u at none and T short of
+its least comes out too short: half the calibrations of Qwen3.8-27B took 6
+units, which prefill chunks of 1,024 to 2,016 rows 1.4-1.5% slower than 7,
+while the split layer of 6 units (13.8 ms against G's 13.2: u = 0.06) chooses
+7. On Qwen3.8-27B the calibration takes 8 of the 34 units on an M5 Max, 14-15
+on an M5 Pro and 25-26 on an M6 with `--activations bf16`, the best each Mac's
+sweeps measured. By default the int8-activation tile makes the GPU's part
+faster, so the split takes fewer: 10 on a 20-core M5 Pro and 7 on a 32-core M5
+Max (the M6 unmeasured). The split runs if T there gains 5% on the GPU alone. A
 start calibrates the split once for a Mac, a model, a macOS version, an engine
 build, `--activations` and the most units its memory plan holds, and remembers
 what it found (`remembered-*` in the cache directory below): the units, the
@@ -1309,7 +1322,8 @@ on Qwen3.8-27B); `splash serve --disable-ane` keeps the FFN on the GPU, and
 `ane-ffn-calibration`, the fit, the choice, the least chunk, a calibration's
 line of text and the breaker on timings it is given, also under the sanitizers,
 and `ane-ffn-startup`, each outcome of a start on a model it plays, a
-remembered calibration among them, the automatic context, the same in each
+remembered calibration and one whose fit at the units it chose moves them among
+them, the automatic context, the same in each
 where the split may run, and a relaunch's, which holds the first engine's
 context where a calibration made anew would serve another.
 `make test-engine-metal` runs `ane-ffn`: its kernels

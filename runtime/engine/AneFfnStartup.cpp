@@ -218,23 +218,48 @@ AneFfnStart decide(const AneFfnModel &model, const AneFfnSetting &setting, Reque
     }
 
     const ane_ffn::Timings timings = model.time();
-    const std::optional<uint32_t> chosen =
-        ane_ffn::choose(ane_ffn::fit(timings.low, timings.high), timings.gpuAlone, model.units, maxAneUnits);
-    if (!chosen)
+    const auto choice = [&](const ane_ffn::Model &fitted) {
+      return ane_ffn::choose(fitted, timings.gpuAlone, model.units, maxAneUnits);
+    };
+    const ane_ffn::Model fitted = ane_ffn::fit(timings.low, timings.high);
+    const std::optional<uint32_t> first = choice(fitted);
+    if (!first)
       return noGain("no Neural Engine split beats its " + fixed(timings.gpuAlone) + layer +
                     " by enough (calibrated in " + seconds() + ")");
-    AneFfnPrepared prepared = model.prepare(*chosen, true);
+    const auto timedSplit = [&](uint32_t aneUnits) {
+      AneFfnPrepared split = model.prepare(aneUnits, true);
+      if (split.chunks.functions.empty()) throw std::logic_error("the split's chunks were not timed");
+      return split;
+    };
+    AneFfnPrepared prepared = timedSplit(*first);
+    uint32_t chosen = *first;
+    // The chosen split's full chunk, timed nearest T's least, fits u again
+    // (ane_ffn::refit); the units that model chooses serve where their split
+    // takes no chunk longer (ane_ffn::slowerNowhere), else the first ones.
+    const std::optional<uint32_t> refitted = choice(
+        ane_ffn::refit(fitted, static_cast<double>(*first) / model.units, prepared.chunks.functions.front().split));
+    if (refitted && *refitted != *first) {
+      const ane_ffn::ChunkTimings firstChunks = std::move(prepared.chunks);
+      prepared.split.reset();
+      prepared = timedSplit(*refitted);
+      if (ane_ffn::slowerNowhere(prepared.chunks, firstChunks)) {
+        chosen = *refitted;
+      } else {
+        prepared.split.reset();
+        prepared = model.prepare(*first, false);
+        prepared.chunks = firstChunks;
+      }
+    }
     const ane_ffn::ChunkTimings &chunks = prepared.chunks;
-    if (chunks.functions.empty()) throw std::logic_error("the split's chunks were not timed");
     const std::string timed =
         fixed(chunks.functions.front().split) + layer + " against " + fixed(chunks.gpu[1].milliseconds);
     const std::optional<uint32_t> minimumRows = ane_ffn::minimumRows(chunks);
     if (!minimumRows)
       return noGain("no chunk of the Neural Engine split beats it by enough, " + timed + " (calibrated in " +
                     seconds() + ")");
-    const ane_ffn::Calibration made{*chosen, *minimumRows, chunks.gpu};
+    const ane_ffn::Calibration made{chosen, *minimumRows, chunks.gpu};
     take(prepared, made);
-    AneFfnStart start = serve(std::move(prepared), *chosen, *minimumRows, ": " + timed + " on the GPU alone",
+    AneFfnStart start = serve(std::move(prepared), chosen, *minimumRows, ": " + timed + " on the GPU alone",
                               "calibrated");
     model.remember(maxAneUnits, made);
     return start;

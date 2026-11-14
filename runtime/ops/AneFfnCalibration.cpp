@@ -55,20 +55,29 @@ double Model::operator()(double share) const noexcept {
 // The model, from the split's layers as they run between stand-ins for the
 // mixer (Measurement). The GPU's part alone gives G at both shares. At the
 // high share, near 0.8, the ANE's part takes the longer on every Mac measured
-// (Qwen3.8-27B's fastest split gives the ANE 8 to 27 of its 34 units): the
-// split layer there is A, which scales with the ANE's channels. Where the
-// GPU's part takes the longer at the low share, the split layer there exceeds
-// it by the bandwidth the ANE's part takes beside it, which gives u (a tenth
-// to a third on an M6). Where the ANE's part takes the longer there, as on an
-// M5 Max, the split layer's excess over A is the ANE's own. Where the ANE's
-// part does not take the longer at the high share, A comes out longer than it
-// is, and the choice smaller.
+// (Qwen3.8-27B's fastest split gives the ANE 7 to 27 of its 34 units): the
+// split layer there is A, which scales with the ANE's channels. The low
+// share's split layer gives u where the GPU's part takes the longer there
+// (refit). Where the ANE's part does not take the longer at the high share,
+// A comes out longer than it is, and the choice smaller.
 Model fit(const Timing &low, const Timing &high) {
   if (!(low.share < high.share)) throw std::invalid_argument("ANE FFN calibration needs a low and a high share");
   const double slope = (high.gpu - low.gpu) / (high.share - low.share);
-  Model model{{low.gpu - slope * low.share, slope}, {0.0, high.split / high.share}};
-  const double gpu = model.gpu(low.share), ane = model.ane(low.share);
-  if (gpu > ane) model.u = std::clamp((low.split - gpu) / ane, 0.0, 1.0);
+  return refit({{low.gpu - slope * low.share, slope}, {0.0, high.split / high.share}}, low.share, low.split);
+}
+
+// Where the GPU's part takes the longer at `share`, the split layer there
+// exceeds it by the bandwidth the ANE's part takes beside it, which gives u (a
+// tenth to a third on an M6, at the low share). Where the ANE's part takes
+// the longer there, the split layer's excess over A is the ANE's own, which
+// says nothing of u. On an M5 Max the ANE's part takes the longer from below
+// 0.4, so the low share leaves u at none, and T a unit short of T's least
+// comes out shorter than it is: Qwen3.8-27B's G(6/34) of 13.2 ms against a
+// split layer of 13.8 there (u = 0.06), which chose 6 units in half the
+// calibrations against the 7 a sweep of given shares found fastest.
+Model refit(Model model, double share, double split) {
+  const double gpu = model.gpu(share), ane = model.ane(share);
+  if (gpu > ane) model.u = std::clamp((split - gpu) / ane, 0.0, 1.0);
   return model;
 }
 
@@ -121,6 +130,28 @@ std::optional<uint32_t> minimumRows(const ChunkTimings &timings) {
       minimum = rows;
     }
   return minimum;
+}
+
+// The candidate must split every chunk the incumbent splits, each of them in
+// at most kChunkNoise longer, both split layers timed alike: more units can
+// cost chunks a full one does not show. Qwen3.8-27B UD-Q4_K_M on an M5 Max
+// took 10 of 34 units on the refitted model, whose full chunk prefilled
+// 1.5-2.0% faster than 9's but which split from 780 rows against 575, so that
+// chunks of 640 and 672 rows ran 12% slower. Below the incumbent's least
+// rows the candidate splits only what its own least rows allow.
+bool slowerNowhere(const ChunkTimings &candidate, const ChunkTimings &incumbent) {
+  const std::optional<uint32_t> candidateLeast = minimumRows(candidate), incumbentLeast = minimumRows(incumbent);
+  if (!incumbentLeast) return true;
+  if (!candidateLeast || *candidateLeast > *incumbentLeast) return false;
+  const auto split = [](const ChunkTimings &timings, uint32_t rows) {
+    const auto function = std::ranges::find_if(timings.functions, [&](const ChunkTimings::Function &timed) {
+      return timed.least <= rows && rows <= timed.rows;
+    });
+    return function == timings.functions.end() ? std::numeric_limits<double>::infinity() : function->split;
+  };
+  for (uint32_t rows = *incumbentLeast; rows <= incumbent.functions.front().rows; ++rows)
+    if (!(split(candidate, rows) <= (1.0 + kChunkNoise) * split(incumbent, rows))) return false;
+  return true;
 }
 
 std::string Calibration::text() const {
