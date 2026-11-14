@@ -23,6 +23,7 @@
 #include <cstring>
 #include <iostream>
 #include <stdexcept>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -721,6 +722,34 @@ void contextWindow(MetalBackend &backend, uint32_t width) {
   require(invalid.empty(), "an invalid context window transfer encoded a dispatch");
 }
 
+// A decode step's window commit stores the first of a lane's eight context
+// rows, as many as its retained count says, as a store of those rows does,
+// in the slots of their positions across the ring's wrap, and leaves every
+// other slot as it was: for each count of the eight, and none.
+void contextWindowCommit(MetalBackend &backend, uint32_t width) {
+  constexpr uint32_t start = kWindow - 4;
+  const uint64_t windowBytes = DraftAttention::contextWindowBytes(width);
+  Random random(0xc0de3000ULL + width);
+  const MetalBuffer rows = randomBfloat(backend, uint64_t{kRows} * width, random, "draft context rows");
+  const MetalBuffer retained = backend.allocateBuffer(4, BufferStorage::Shared, "draft retained count");
+  const auto allocate = [&](const char *label) {
+    MetalBuffer window = backend.allocateBuffer(windowBytes, BufferStorage::Shared, label);
+    std::memset(window.contents(), 0xA5, windowBytes);
+    return window;
+  };
+  for (uint32_t count = 0; count <= kRows; ++count) {
+    const MetalBuffer committed = allocate("committed window"), stored = allocate("stored window");
+    *static_cast<uint32_t *>(retained.contents()) = count;
+    CommandGraph graph;
+    DraftAttention::addWindowCommit(graph, rows, committed, retained, start, width);
+    if (count)
+      DraftAttention::addWindowStore(graph, rows, stored, count, start, width);
+    static_cast<void>(backend.submitCommandAsync(graph.dispatches()).wait());
+    require(std::memcmp(committed.contents(), stored.contents(), windowBytes) == 0,
+            "a window commit of " + std::to_string(count) + " retained rows is not their store");
+  }
+}
+
 // A state captured at s inside a command over [a, b) starts from the lane's
 // window as the command finds it, copied, and stores the command's rows
 // [a, s) into it as the lane's window takes them: the slots of its positions
@@ -790,7 +819,8 @@ void contextWindowCapturedInside(MetalBackend &backend, uint32_t width) {
 // query rows, the current rows' keys and values, the norms and the RoPE rows;
 // the attention's query rows, followed by the split partials, and each lane's
 // rings; the context writers' key and value rows, norm, RoPE rows, rings and
-// the commit's retained counts.
+// the commit's retained counts; the context windows' rows, windows and a
+// window commit's retained count.
 void bufferExtents(MetalBackend &backend, DraftAttentionShape shape) {
   constexpr uint32_t lanes = 3, contextTokens = 37;
   const auto plan = DraftAttention::plan(shape, lanes);
@@ -883,6 +913,13 @@ void bufferExtents(MetalBackend &backend, DraftAttentionShape shape) {
                                  DraftAttention::addWindowLoad(graph, b[0], b[1], contextTokens, 2040,
                                                                shape.hiddenSize);
                                });
+  splash::test::requireExtents(backend,
+                               Extents{{0, uint64_t{kRows} * shape.hiddenSize * 2, 2, "draft context rows"},
+                                       {1, windowBytes, 1, "draft context window"},
+                                       {2, 4, 4, "draft retained count"}},
+                               [&](CommandGraph &graph, const Buffers &b) {
+                                 DraftAttention::addWindowCommit(graph, b[0], b[1], b[2], 2044, shape.hiddenSize);
+                               });
 }
 
 } // namespace
@@ -900,6 +937,7 @@ int main(int argc, char **argv) {
       contextWriters(backend, shape);
       contextWindow(backend, shape.hiddenSize);
       contextWindowCapturedInside(backend, shape.hiddenSize);
+      contextWindowCommit(backend, shape.hiddenSize);
       runCase(backend, 1, shape, {0, 0, 0, 0});
       runCase(backend, 2, shape, {2048, 2047, 0, 0});
       runCase(backend, 3, shape, {2100, 4094, 6143, 0});

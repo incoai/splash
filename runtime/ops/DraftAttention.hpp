@@ -124,6 +124,14 @@ public:
                              metal::MetalBuffer context,
                              metal::MetalBuffer window, uint32_t rows,
                              uint32_t startPosition, uint32_t width);
+  // Stores the first of a lane's verify rows' context rows, as many as
+  // `retained` counts (its acceptance's count, up to targetVerifyRows), as
+  // addWindowStore does.
+  static void addWindowCommit(metal::CommandGraph &graph,
+                              metal::MetalBuffer context,
+                              metal::MetalBuffer window,
+                              metal::MetalBuffer retained,
+                              uint32_t startPosition, uint32_t width);
   // Loads the rows of positions startPosition on back into `rows` rows.
   static void addWindowLoad(metal::CommandGraph &graph,
                             metal::MetalBuffer window,

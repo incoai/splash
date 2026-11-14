@@ -1,5 +1,6 @@
 #include "metal/abi/KernelABI.h"
 #include "metal/kernels/common/draft_context_kv.h"
+#include "metal/kernels/common/draft_context_window.h"
 #include "metal/kernels/common/lane_bindings.h"
 #include "metal/kernels/common/rms_inverse.h"
 
@@ -138,6 +139,22 @@ kernel void draft_context_kv_commit(
       rope_sin + ulong(batch) * RopeLaneStride, keys, values,
       params.start_position[batch], min(retained[batch], Rows), task,
       thread_index, lane, simd_group, reductions, normalized);
+}
+
+// The first rows of a lane's verify rows, as many as the lane retained
+// (`retained`, its acceptance's count), to the slots of their positions in
+// its context window, which stays current with its rings.
+kernel void draft_context_window_commit(
+    device const bfloat *context [[buffer(0)]], device uchar *window [[buffer(1)]],
+    device const uint *retained [[buffer(2)]],
+    constant DraftContextWindowParams &params [[buffer(3)]],
+    uint threadgroup_index [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]]) {
+  DraftContextGroup at;
+  if (draft_context_group(params, threadgroup_index, simd_group, at) &&
+      at.row < retained[0])
+    draft_context_store(context, window, params, at, lane);
 }
 
 // One split of the attention of one KV head over the 32 query rows of one

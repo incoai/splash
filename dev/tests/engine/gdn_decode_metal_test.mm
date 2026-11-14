@@ -14,6 +14,8 @@
 // bit for bit with independent lanes, with rejected tape rows poisoned. The
 // decode over a bf16 state is checked against the fp32 decode. A lane's step
 // rows past its verify rows change only those rows' outputs, which are zero.
+// A fold of a step's first rows alone stores the state the lane's next step
+// holds when it retained those or more, bit for bit.
 #include "TestBuffers.hpp"
 #include "TestChecks.hpp"
 #include "TestFamilies.hpp"
@@ -1242,7 +1244,129 @@ void rejectsInvalid(MetalBackend &backend) {
                        LinearInput::Plain);
       },
       "norm weight buffer holds", "bf16 norm weights were read as F32");
+  // A fold takes one to all of a step's rows of every layer, from an aligned
+  // tape slot whose layers the tape holds, into a cell as large as the
+  // state's.
+  const MetalBuffer retained = sharedBuffer(backend, 4);
+  const GdnFoldBuffers fold{fixture.next[0], fixture.tape, fixture.slot(0, 1), retained, fixture.current[0]};
+  for (const uint32_t rows : {0U, kRows + 1})
+    rejects([&] { GDN::addFold(graph, fold, shape, kLayers, rows, fixture.cell.strides()); },
+            "invalid GDN fold geometry", "a fold of no rows or more than a step's was accepted");
+  rejects(
+      [&] {
+        GdnFoldBuffers misaligned = fold;
+        misaligned.stepSlot += 8;
+        GDN::addFold(graph, misaligned, shape, kLayers, 1, fixture.cell.strides());
+      },
+      "invalid GDN fold geometry", "a fold of a misaligned tape slot was accepted");
+  rejects([&] { GDN::addFold(graph, fold, shape, 2 * kMaxLanes * kLayers, 1, fixture.cell.strides()); },
+          "GDN tape buffer holds", "a fold read past the tape");
+  rejects(
+      [&] {
+        GdnFoldBuffers small = fold;
+        small.fold = sharedBuffer(backend, fixture.cell.bytes / 2);
+        GDN::addFold(graph, small, shape, kLayers, 1, fixture.cell.strides());
+      },
+      "GDN folded state buffer holds", "a fold wrote past its cell");
   require(graph.empty(), "invalid GDN request partially encoded a graph");
+}
+
+// A fold of a step's first rows alone (GDN::addFold) stores the state the
+// lane's next step holds when the lane retained those rows or more, bit for
+// bit, in every layer: the recurrent state and the convolution rows, over
+// either state format, for each count of a step's rows. The step folds rows
+// of the one before it, so a fold from the state it started from, or from
+// the earlier step's tape slot, stores another state. A lane that retained
+// fewer leaves the fold's cell as it was.
+void foldMatchesTheNextStep(MetalBackend &backend, const GdnShape &shape, GdnStateFormat format) {
+  const std::string what =
+      "fold vh" + std::to_string(shape.valueHeads) + " " + std::string(formatName(format));
+  // Over the first norm type the shape's families store: the fold reads the
+  // tape the step wrote, whichever norms gave its rows.
+  Fixture fixture(backend, shape, 1, familyNorms(shape).front());
+  const Cell cell(shape, format);
+  const uint64_t carried = uint64_t{kCarried} * shape.convolutionDimension * 2;
+  const uint64_t recurrent =
+      uint64_t{shape.valueHeads} * kHeadDim * kHeadDim * elementBytes(format);
+  // The state before the steps: random convolution rows and recurrent
+  // states in the cell's format.
+  Random random(0xF01D + shape.valueHeads);
+  auto *start = static_cast<uint8_t *>(fixture.current[0].contents());
+  for (uint32_t layer = 0; layer < kLayers; ++layer) {
+    auto *rows = reinterpret_cast<uint16_t *>(start + layer * cell.convLayerBytes);
+    for (uint64_t index = 0; index < carried / 2; ++index)
+      rows[index] = floatToBf16(random.unit());
+    uint8_t *state = start + cell.convBytes + layer * cell.recurrentLayerBytes;
+    for (uint64_t index = 0; index < recurrent / elementBytes(format); ++index) {
+      const float value = random.unit() * 0.5F;
+      if (format == GdnStateFormat::BFloat16)
+        reinterpret_cast<uint16_t *>(state)[index] = floatToBf16(value);
+      else
+        reinterpret_cast<float *>(state)[index] = value;
+    }
+  }
+  const auto addStep = [&](CommandGraph &graph, std::span<const MetalBuffer> current,
+                           std::span<const MetalBuffer> next, GdnTapeLane tape) {
+    for (uint32_t layer = 0; layer < kLayers; ++layer) {
+      GdnDecodeBuffers buffers = fixture.decodeBuffers(layer);
+      buffers.currentStates = current;
+      buffers.nextStates = next;
+      buffers.tapeLanes = std::span(&tape, 1);
+      (void)GDN::addDecode(graph, buffers, shape, 1, layer, cell.strides(), GdnHeadOrder::Grouped,
+                           LinearInput::Plain);
+    }
+  };
+  // The step before it leaves its rows in lane 1's slot of parity 1; the
+  // step, over new rows, folds three of them and leaves its own in the slot
+  // of parity 0.
+  fixture.tapeLanes[0] = {fixture.slot(1, 0), fixture.slot(1, 1), 0};
+  CommandGraph before;
+  addStep(before, fixture.current, fixture.next, fixture.tapeLanes[0]);
+  (void)backend.submitCommandAsync(before.dispatches()).wait();
+  const std::array<uint32_t, kMaxLanes> pending{3};
+  fixture.advance(pending);
+  fixture.fillPacked();
+  CommandGraph step;
+  addStep(step, fixture.current, fixture.next, fixture.tapeLanes[0]);
+  (void)backend.submitCommandAsync(step.dispatches()).wait();
+  const uint64_t stepSlot = fixture.tapeLanes[0].stepSlot;
+
+  const MetalBuffer retained = sharedBuffer(backend, 4), fold = sharedBuffer(backend, cell.bytes);
+  std::array<MetalBuffer, kMaxLanes> current, next;
+  current.fill(sharedBuffer(backend, cell.bytes));
+  next.fill(sharedBuffer(backend, cell.bytes));
+  const auto bytes = [](const MetalBuffer &buffer, uint64_t offset) {
+    return static_cast<const uint8_t *>(buffer.contents()) + offset;
+  };
+  for (uint32_t rows = 1; rows <= kRows; ++rows)
+    for (const uint32_t count : {rows - 1, rows, kRows}) {
+      const std::string where =
+          what + " of " + std::to_string(rows) + " rows, " + std::to_string(count) + " retained";
+      std::memset(fold.contents(), 0xA5, cell.bytes);
+      *static_cast<uint32_t *>(retained.contents()) = count;
+      std::memcpy(current[0].contents(), fixture.next[0].contents(), cell.bytes);
+      std::memset(next[0].contents(), 0, cell.bytes);
+      CommandGraph graph;
+      GDN::addFold(graph, {fixture.next[0], fixture.tape, stepSlot, retained, fold}, shape, kLayers,
+                   rows, cell.strides());
+      // The lane's next step, after it retained `rows` rows of this one.
+      addStep(graph, current, next, {stepSlot, fixture.tapeLanes[0].pendingSlot, rows});
+      (void)backend.submitCommandAsync(graph.dispatches()).wait();
+      if (count < rows) {
+        require(std::all_of(bytes(fold, 0), bytes(fold, cell.bytes), [](uint8_t byte) { return byte == 0xA5; }),
+                where + ": a fold of rows the lane did not retain wrote its cell");
+        continue;
+      }
+      for (uint32_t layer = 0; layer < kLayers; ++layer) {
+        const uint64_t rowsAt = layer * cell.convLayerBytes;
+        const uint64_t stateAt = cell.convBytes + layer * cell.recurrentLayerBytes;
+        require(!std::memcmp(bytes(fold, rowsAt), bytes(next[0], rowsAt), carried),
+                where + ": the fold's convolution rows are not the next step's");
+        require(!std::memcmp(bytes(fold, stateAt), bytes(next[0], stateAt), recurrent),
+                where + ": the fold's state is not the next step's");
+      }
+    }
+  std::cout << what << ": each count of a step's rows folds to the next step's state\n";
 }
 
 } // namespace
@@ -1405,6 +1529,9 @@ int main(int argc, char **argv) {
             for (GdnStateFormat format : {GdnStateFormat::Float32, GdnStateFormat::BFloat16})
               partialVerifyRows(backend, shape, lanes, layout, float32,
                                 float32 ? GdnHeadOrder::Tiled : GdnHeadOrder::Grouped, format);
+    for (const GdnShape &shape : kShapes)
+      for (const GdnStateFormat format : {GdnStateFormat::Float32, GdnStateFormat::BFloat16})
+        foldMatchesTheNextStep(backend, shape, format);
     std::cout << "gdn_decode_metal_test: PASS\n";
     return 0;
   } catch (const std::exception &error) {

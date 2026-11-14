@@ -396,6 +396,10 @@ struct Runtime::Impl {
     // The draft proposals the lane's thinking end replaced, which its
     // speculation counts leave out.
     uint32_t endDrafts = 0;
+    // The state its item captures (prepareDecodeCapture), sealed with these
+    // lengths when the lane retains the rows before its boundary.
+    QwenStateReservation *capture = nullptr;
+    QwenLogicalLengths captureLengths;
     // Why the lane's selection is unusable (invalidSelection), found before
     // any lane commits.
     std::string failure;
@@ -1199,7 +1203,8 @@ struct Runtime::Impl {
   // length targetTokens. Unless `reset` starts a new window there, the rows
   // continue the ring, which must hold rows ending at `begin`. A prefill
   // capture also keeps the rows' context in the window (`windowed`), which
-  // stays current if it was; decode commits leave it behind.
+  // stays current if it was, and so does a decode commit where decode
+  // captures states (capturesInDecode); other decode commits leave it behind.
   static QwenLogicalLengths
   advanceDraftContext(const QwenLogicalLengths &previous, uint64_t targetTokens,
                       uint64_t begin, uint64_t end, bool reset, bool windowed) {
@@ -2084,6 +2089,33 @@ struct Runtime::Impl {
     }
   }
 
+  // A target whose commit writes auxiliary state after every retained row
+  // has none of a fold's rows alone to give.
+  bool capturesInDecode() const noexcept { return !geometry.target.stateLayout.auxiliaryBytes; }
+
+  // The state a decode item captures, at most one: at the page boundary
+  // past the lane's position that the rows it may retain reach. Its window
+  // starts as a copy of the lane's as the cycle finds it, whose older rows
+  // the capture's own overwrite (encodeDecodeCaptures), and its lengths are
+  // those of the lane's with the rows before the boundary, a cached state's.
+  void prepareDecodeCapture(const Request &entry, const ModelBatchItem &item,
+                            DecodeLaneResult &laneResult) const {
+    if (item.stateCaptures.empty())
+      return;
+    const StateCapture &capture = item.stateCaptures.front();
+    auto *reservation = dynamic_cast<QwenStateReservation *>(capture.reservation.get());
+    if (item.stateCaptures.size() > 1 || !reservation || !capturesInDecode() ||
+        capture.tokens <= item.logicalPosition ||
+        capture.tokens > item.logicalPosition + laneResult.maximumRetained)
+      throw std::invalid_argument("invalid decode state capture");
+    laneResult.captureLengths =
+        advanceDraftContext(states.metadata(entry.stateLane).lengths, capture.tokens,
+                            item.logicalPosition, capture.tokens, false, true);
+    states.validateLengths(laneResult.captureLengths, true);
+    states.copyWindow(entry.stateLane, *reservation);
+    laneResult.capture = reservation;
+  }
+
   // Batch lanes beyond the active width replay the last active request so
   // every padded M32 lane binds valid state.
   static Request &laneEntry(std::span<Request *const> entries, uint32_t lane) {
@@ -2304,7 +2336,11 @@ struct Runtime::Impl {
     std::array<uint32_t, kLaneCount> startPositions{};
     for (uint32_t lane = 0; lane < lanes; ++lane)
       startPositions[lane] = static_cast<uint32_t>(items[lane].logicalPosition);
+    // Where decode captures states, each lane's window takes the rows it
+    // retained as its rings do, so that it stays current for a capture.
     DFlashContextBuffers buffers;
+    for (uint32_t lane = 0; capturesInDecode() && lane < lanes; ++lane)
+      buffers.windows[lane] = states.window(entries[lane]->stateLane);
     buffers.linearScratch = decodeArena->linearScratch();
     buffers.capturedTargetHidden = d(DecodeTensor::CapturedTargetHidden);
     buffers.projected = d(DecodeTensor::ContextProjected);
@@ -2367,9 +2403,40 @@ struct Runtime::Impl {
     targetModel->addStateCommit(graph, std::move(buffers), width);
   }
 
+  // The state each lane's cycle captures (ModelBatchItem::stateCaptures), at
+  // the page boundary its retained rows reach: the lane's state after the
+  // rows it retained this cycle before the boundary, which its next cycle
+  // would hold had it retained exactly those. The rows a lane retains are
+  // the first of its verify rows, as many as its acceptance counted
+  // (DecodeTensor::RetainedCount): the capture folds the first `rows` of the
+  // verify's tape into the state the verify wrote (QwenTarget::addStateFold)
+  // and stores their context rows, which the draft's commit normalized, in
+  // the state's window. The completion seals the state only where the lane
+  // retained them (finalizeDecode).
+  void encodeDecodeCaptures(CommandGraph &graph, std::span<Request *const> entries,
+                            std::span<const ModelBatchItem> items) {
+    for (uint32_t lane = 0; lane < entries.size(); ++lane) {
+      const uint32_t stateLane = entries[lane]->stateLane;
+      for (const StateCapture &capture : items[lane].stateCaptures) {
+        const uint32_t rows = static_cast<uint32_t>(capture.tokens - items[lane].logicalPosition);
+        const QwenCachedBuffers &state = static_cast<QwenStateReservation &>(*capture.reservation).buffers();
+        targetModel->addStateFold(graph,
+                                  {decodeArena->get(lane, DecodeTensor::RetainedCount), states.next(stateLane).stateBase,
+                                   decodeArena->batchSlice(DecodeTensor::GdnTape, kLaneCount),
+                                   decodeArena->gdnTapeSlot(stateLane, states.metadata(stateLane).activeParity ^ 1),
+                                   state.gdn->buffers().stateBase},
+                                  rows);
+        ops::DraftAttention::addWindowStore(graph, decodeArena->get(lane, DecodeTensor::ContextHidden),
+                                            state.window->buffer(), rows,
+                                            static_cast<uint32_t>(items[lane].logicalPosition),
+                                            geometry.draft.hiddenSize);
+      }
+    }
+  }
+
   // A verify's selection, acceptance and commits, which end its cycle's last
   // command: the target's state commit and the DFlash2 draft's, whose rings
-  // take the rows the lanes retained.
+  // take the rows the lanes retained, and the states the lanes capture.
   void encodeVerifyCommit(CommandGraph &graph, std::span<Request *const> entries,
                           std::span<const ModelBatchItem> items,
                           std::span<const uint32_t> maximumRetained) {
@@ -2377,6 +2444,7 @@ struct Runtime::Impl {
     encodeBatchAcceptance(graph, entries, maximumRetained);
     encodeTargetStateCommit(graph, entries);
     encodeDraftStateCommitBatch(graph, entries, items);
+    encodeDecodeCaptures(graph, entries, items);
   }
 
   void encodeBatchEmbedding(CommandGraph &graph, DecodeTensor tokens,
@@ -2504,7 +2572,7 @@ struct Runtime::Impl {
           entry.stateLane,
           advanceDraftContext(states.metadata(entry.stateLane).lengths,
                               nextLength, items[lane].logicalPosition,
-                              nextLength, false, false));
+                              nextLength, false, capturesInDecode()));
       entry.generatedTokens += laneResult.retained;
       commitSelected(entry, {targetTokens, laneResult.retained});
       entry.maskWords.clear();
@@ -2525,6 +2593,8 @@ struct Runtime::Impl {
       ModelStepResult &result = results.back();
       if (entry.generatedTokens < entry.maxNewTokens)
         emitTerminalAnchor(entry, result);
+      if (laneResult.capture && laneResult.captureLengths.targetTokens <= nextLength)
+        result.capturedStates.push_back(states.seal(*laneResult.capture, laneResult.captureLengths));
     }
 
     counters.lastDecodeGpuSeconds = timing.gpuSeconds;
@@ -3264,6 +3334,7 @@ Runtime::decodeAsync(const BatchPlan &plan,
       laneResult.endDrafts = cutoff->replacedProposals();
 
     impl_->prepareDecodeLane(entry, item, lane);
+    impl_->prepareDecodeCapture(entry, item, laneResult);
     requests[lane] = &entry;
     logicalPositions[lane] = item.logicalPosition;
     maximumRetained[lane] = laneResult.maximumRetained;
@@ -3325,6 +3396,8 @@ std::shared_ptr<StateReservation> Runtime::reserveState(uint64_t requestId, uint
     throw std::invalid_argument("a state boundary is page-aligned");
   return impl_->states.reserve(refusal);
 }
+
+bool Runtime::capturesInDecode() const noexcept { return impl_->capturesInDecode(); }
 
 std::shared_ptr<const CompositeState> Runtime::snapshot(uint64_t requestId) {
   const uint32_t lane = residentLane(requestId);

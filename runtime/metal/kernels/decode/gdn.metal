@@ -23,12 +23,23 @@
 // lane's tape, and the lane's next step folds the retained ones into the
 // state before its own rows. A step reads and writes the state once. Its
 // rows past the lane's verify rows are never retained or read: the scan
-// skips them and their recurrent output is zero.
+// skips them and their recurrent output is zero. A fold alone
+// (gdn_fold_phase) folds some of a step's rows as that next step would, for
+// the state of a page the step's retained rows reach.
 constant uint kDecodeSimdgroups = 8;
 
+// The k, v and gates of one value head's rows a lane folds into its state:
+// a step's pending rows, or the rows a fold alone folds.
+template <uint HeadDim> struct GdnPendingShared {
+  bfloat keys[SPLASH_TARGET_VERIFY_ROWS * HeadDim];
+  bfloat values[SPLASH_TARGET_VERIFY_ROWS * HeadDim];
+  float decay[SPLASH_TARGET_VERIFY_ROWS];
+  bfloat beta[SPLASH_TARGET_VERIFY_ROWS];
+};
+
 // The threadgroup operands of one value head: the rows' prepared q/k, the
-// head's v, the gates and the recurrent output rows, and the k, v and gates
-// of the pending rows, which the head folds into its state first.
+// head's v, the gates and the recurrent output rows, and the pending rows,
+// which the head folds into its state first.
 template <uint HeadDim> struct GdnDecodeShared {
   bfloat queries[SPLASH_TARGET_VERIFY_ROWS * HeadDim];
   bfloat keys[SPLASH_TARGET_VERIFY_ROWS * HeadDim];
@@ -36,10 +47,7 @@ template <uint HeadDim> struct GdnDecodeShared {
   bfloat rows[SPLASH_TARGET_VERIFY_ROWS * HeadDim];
   float decay[SPLASH_TARGET_VERIFY_ROWS];
   bfloat beta[SPLASH_TARGET_VERIFY_ROWS];
-  bfloat pending_keys[SPLASH_TARGET_VERIFY_ROWS * HeadDim];
-  bfloat pending_values[SPLASH_TARGET_VERIFY_ROWS * HeadDim];
-  float pending_decay[SPLASH_TARGET_VERIFY_ROWS];
-  bfloat pending_beta[SPLASH_TARGET_VERIFY_ROWS];
+  GdnPendingShared<HeadDim> pending;
 };
 
 // One layer's tape of one lane's step (metal/abi/GDN.h): the rows'
@@ -61,6 +69,28 @@ inline GdnTape gdn_tape(device uchar *tape, ulong offset) {
           reinterpret_cast<device float *>(layer + gdn_tape_decay_offset(ConvDim, KvWidth)),
           reinterpret_cast<device bfloat *>(
               layer + gdn_tape_beta_offset(ConvDim, KvWidth, ValueHeads))};
+}
+
+// Row `token` of a tape's rows, one value head's k, v and gates of it, to
+// threadgroup memory: one simdgroup per row, channels 32g + lane.
+template <uint KeyHeads, uint ValueHeads, uint HeadDim>
+inline void gdn_load_pending(GdnTape tape, threadgroup GdnPendingShared<HeadDim> &pending,
+                             uint token, uint value_head, uint lane) {
+  constexpr uint KeyWidth = KeyHeads * HeadDim;
+  constexpr uint KvWidth = KeyWidth + ValueHeads * HeadDim;
+  // The head's k and v columns of a tape row.
+  const uint k_column = value_head / (ValueHeads / KeyHeads) * HeadDim + lane;
+  const uint v_column = KeyWidth + value_head * HeadDim + lane;
+  for (uint g = 0; g < HeadDim / 32; ++g) {
+    pending.keys[token * HeadDim + 32 * g + lane] =
+        tape.kv[token * KvWidth + k_column + 32 * g];
+    pending.values[token * HeadDim + 32 * g + lane] =
+        tape.kv[token * KvWidth + v_column + 32 * g];
+  }
+  if (lane == 0) {
+    pending.decay[token] = tape.decay[token * ValueHeads + value_head];
+    pending.beta[token] = tape.beta[token * ValueHeads + value_head];
+  }
 }
 
 // Eight verify rows' conv+SiLU, q/k RMS norms and gates for one value head.
@@ -105,20 +135,9 @@ inline void gdn_decode_prologue(
   const uint k_column = key_head * HeadDim + lane;
   const uint v_column = KeyWidth + value_head * HeadDim + lane;
 
-  if (token < pending) {
-    for (uint g = 0; g < Groups; ++g) {
-      shared.pending_keys[token * HeadDim + 32 * g + lane] =
-          pending_tape.kv[token * KvWidth + k_column + 32 * g];
-      shared.pending_values[token * HeadDim + 32 * g + lane] =
-          pending_tape.kv[token * KvWidth + v_column + 32 * g];
-    }
-    if (lane == 0) {
-      shared.pending_decay[token] =
-          pending_tape.decay[token * ValueHeads + value_head];
-      shared.pending_beta[token] =
-          pending_tape.beta[token * ValueHeads + value_head];
-    }
-  }
+  if (token < pending)
+    gdn_load_pending<KeyHeads, ValueHeads, HeadDim>(pending_tape, shared.pending,
+                                                    token, value_head, lane);
 
   float q[Groups], k[Groups];
   bfloat v[Groups], carry_v[Groups], carry_q[Groups], carry_k[Groups];
@@ -188,6 +207,37 @@ inline void gdn_decode_prologue(
   }
 }
 
+// Folds the first `rows` rows of `pending` into RowsInFlight state rows of a
+// value head (rows value_dim, four fp32 columns per lane), each in the decay,
+// memory, delta, update operation order: the same arithmetic wherever a
+// lane's rows are folded, a step's pending ones or a fold's alone.
+template <uint HeadDim, uint RowsInFlight>
+inline void gdn_fold_rows(thread float (&state)[RowsInFlight][4],
+                          threadgroup const GdnPendingShared<HeadDim> &pending,
+                          uint rows, thread const uint (&value_dim)[RowsInFlight],
+                          uint lane) {
+  for (uint token = 0; token < rows; ++token) {
+    const float d = pending.decay[token];
+    const float b = float(pending.beta[token]);
+    threadgroup const bfloat *key = pending.keys + token * HeadDim + lane * 4;
+    float memory[RowsInFlight];
+    for (uint r = 0; r < RowsInFlight; ++r) {
+      memory[r] = 0.0f;
+      for (uint i = 0; i < 4; ++i) {
+        state[r][i] *= d;
+        memory[r] += state[r][i] * float(key[i]);
+      }
+      memory[r] = simd_sum(memory[r]);
+    }
+    for (uint r = 0; r < RowsInFlight; ++r) {
+      const float delta =
+          (float(pending.values[token * HeadDim + value_dim[r]]) - memory[r]) * b;
+      for (uint i = 0; i < 4; ++i)
+        state[r][i] += float(key[i]) * delta;
+    }
+  }
+}
+
 // Delta-rule recurrence over 128 state rows, four fp32 columns per lane.
 // RowsInFlight rows advance together to overlap their reductions and
 // arithmetic. The pending rows advance the incoming state to the committed
@@ -218,29 +268,7 @@ inline void gdn_decode_scan(device const State *state_in,
     uint value_dim[RowsInFlight];
     for (uint r = 0; r < RowsInFlight; ++r)
       value_dim[r] = (batch + r) * kDecodeSimdgroups + simd_group;
-    for (uint token = 0; token < pending; ++token) {
-      const float d = shared.pending_decay[token];
-      const float b = float(shared.pending_beta[token]);
-      threadgroup const bfloat *key =
-          shared.pending_keys + token * HeadDim + lane * 4;
-      float memory[RowsInFlight];
-      for (uint r = 0; r < RowsInFlight; ++r) {
-        memory[r] = 0.0f;
-        for (uint i = 0; i < 4; ++i) {
-          state[r][i] *= d;
-          memory[r] += state[r][i] * float(key[i]);
-        }
-        memory[r] = simd_sum(memory[r]);
-      }
-      for (uint r = 0; r < RowsInFlight; ++r) {
-        const float delta =
-            (float(shared.pending_values[token * HeadDim + value_dim[r]]) -
-             memory[r]) *
-            b;
-        for (uint i = 0; i < 4; ++i)
-          state[r][i] += float(key[i]) * delta;
-      }
-    }
+    gdn_fold_rows<HeadDim, RowsInFlight>(state, shared.pending, pending, value_dim, lane);
     float upcoming[RowsInFlight][4] = {};
     if (batch + RowsInFlight < Batches) {
       for (uint r = 0; r < RowsInFlight; ++r)
@@ -409,6 +437,76 @@ inline void gdn_decode_batch_phase(
   }
 }
 
+// A lane's state after the first `rows` rows of its step, the one its next
+// step folds when the lane retained exactly those, of one value head of one
+// layer: the rows on the step's tape folded into the state before them (the
+// cell the step wrote, `state`), and the convolution rows they leave, as the
+// next step's prologue carries them, in `fold`, a cell of the same strides.
+// Nothing when the lane retained fewer (`retained`, its acceptance's count).
+// Grid {value heads, layers}.
+template <uint KeyHeads, uint ValueHeads, uint HeadDim, uint ConvDim,
+          uint RowsInFlight, class State>
+inline void gdn_fold_phase(device const uchar *state, device uchar *fold,
+                           device uchar *tape, device const uint *retained,
+                           constant GDNFoldParams &params, uint2 group,
+                           uint lane, uint simd_group,
+                           threadgroup GdnPendingShared<HeadDim> &pending) {
+  constexpr uint HeadsPerKey = ValueHeads / KeyHeads;
+  constexpr uint KeyWidth = KeyHeads * HeadDim;
+  constexpr uint KvWidth = KeyWidth + ValueHeads * HeadDim;
+  constexpr uint Batches = HeadDim / kDecodeSimdgroups;
+  const uint rows = params.rows;
+  if (retained[0] < rows)
+    return;
+  const uint value_head = group.x, layer = group.y;
+  const GdnTape step = gdn_tape<KeyHeads, ValueHeads, HeadDim, ConvDim>(
+      tape, params.step_tape +
+                ulong(layer) * gdn_tape_layer_bytes(ConvDim, KvWidth, ValueHeads));
+  if (simd_group < rows)
+    gdn_load_pending<KeyHeads, ValueHeads, HeadDim>(step, pending, simd_group,
+                                                    value_head, lane);
+  // The head's v channels, and its key head's q and k channels from the first
+  // of the key head's value heads.
+  if (simd_group < SPLASH_GDN_CONVOLUTION_TAPS - 1) {
+    const GdnConvHistory history{
+        reinterpret_cast<device const bfloat *>(state + ulong(layer) * params.conv_layer_bytes),
+        step.inputs, ConvDim, ConvDim, rows};
+    device bfloat *carried =
+        reinterpret_cast<device bfloat *>(fold + ulong(layer) * params.conv_layer_bytes) +
+        simd_group * ConvDim;
+    const uint q_channel = value_head / HeadsPerKey * HeadDim + lane;
+    const uint v_channel = 2 * KeyWidth + value_head * HeadDim + lane;
+    for (uint g = 0; g < HeadDim / 32; ++g) {
+      carried[v_channel + 32 * g] = history.at(simd_group, v_channel + 32 * g);
+      if (value_head % HeadsPerKey == 0) {
+        carried[q_channel + 32 * g] = history.at(simd_group, q_channel + 32 * g);
+        carried[KeyWidth + q_channel + 32 * g] =
+            history.at(simd_group, KeyWidth + q_channel + 32 * g);
+      }
+    }
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  const ulong recurrent = params.convolution_state_bytes + ulong(layer) * params.recurrent_layer_bytes;
+  device const State *state_in = reinterpret_cast<device const State *>(state + recurrent);
+  device State *state_out = reinterpret_cast<device State *>(fold + recurrent);
+  const auto base = [&](uint value_dim) {
+    return (ulong(value_head) * HeadDim + value_dim) * HeadDim + lane * 4;
+  };
+  for (uint batch = 0; batch < Batches; batch += RowsInFlight) {
+    uint value_dim[RowsInFlight];
+    float values[RowsInFlight][4];
+    for (uint r = 0; r < RowsInFlight; ++r) {
+      value_dim[r] = (batch + r) * kDecodeSimdgroups + simd_group;
+      for (uint i = 0; i < 4; ++i)
+        values[r][i] = float(state_in[base(value_dim[r]) + i]);
+    }
+    gdn_fold_rows<HeadDim, RowsInFlight>(values, pending, rows, value_dim, lane);
+    for (uint r = 0; r < RowsInFlight; ++r)
+      for (uint i = 0; i < 4; ++i)
+        state_out[base(value_dim[r]) + i] = State(values[r][i]);
+  }
+}
+
 // W: the norm weights' stored type (float: a GGUF's F32 norms, _f32).
 // verify_rows: each lane's verify rows.
 #define GDN_DECODE_BUFFERS(W) \
@@ -471,6 +569,27 @@ GDN_DECODE_TABLE_ENTRY(verify_gdn_fused_table16_vh64_f32, 16, 64, 128, 12288, 20
 // norms are F32.
 GDN_DECODE_ENTRY(verify_gdn_fused_p16512_f32, 16, 48, 128, 10240, 16512, float)
 GDN_DECODE_TABLE_ENTRY(verify_gdn_fused_table16_p16512_f32, 16, 48, 128, 10240, 16512, gguf_sg::Table16, float)
+
+// The fold of a step's rows alone (GDN::addFold), over an fp32 state and, as
+// Name_bf16_state, a bf16 one. It reads no packed rows, so shapes of one head
+// layout share it.
+#define GDN_FOLD_KERNEL(Name, KeyHeads, ValueHeads, HeadDim, ConvDim, State) \
+  kernel void Name(device const uchar *state [[buffer(0)]], device uchar *fold [[buffer(1)]], \
+      device uchar *tape [[buffer(2)]], device const uint *retained [[buffer(3)]], \
+      constant GDNFoldParams &params [[buffer(4)]], GDN_DECODE_THREADS) { \
+    threadgroup GdnPendingShared<HeadDim> pending; \
+    gdn_fold_phase<KeyHeads, ValueHeads, HeadDim, ConvDim, 2, State>( \
+        state, fold, tape, retained, params, group, lane, simd_group, pending); \
+  }
+#define GDN_FOLD_ENTRY(Name, KeyHeads, ValueHeads, HeadDim, ConvDim) \
+  GDN_FOLD_KERNEL(Name, KeyHeads, ValueHeads, HeadDim, ConvDim, float) \
+  GDN_FOLD_KERNEL(Name##_bf16_state, KeyHeads, ValueHeads, HeadDim, ConvDim, bfloat)
+
+GDN_FOLD_ENTRY(verify_gdn_fold, 16, 48, 128, 10240)
+GDN_FOLD_ENTRY(verify_gdn_fold_vh32, 16, 32, 128, 8192)
+GDN_FOLD_ENTRY(verify_gdn_fold_vh64, 16, 64, 128, 12288)
+#undef GDN_FOLD_ENTRY
+#undef GDN_FOLD_KERNEL
 #undef GDN_DECODE_ENTRY
 #undef GDN_DECODE_TABLE_ENTRY
 #undef GDN_DECODE_KERNEL

@@ -160,6 +160,10 @@ struct DFlashContextBuffers final {
                          ExecutionLimits::maximumBatchWidth>> persistentKeys;
   std::vector<std::array<metal::MetalBuffer,
                          ExecutionLimits::maximumBatchWidth>> persistentValues;
+  // Each lane's context window, which keeps the rows the lane retained as
+  // its rings do; none for a lane whose decode leaves its window behind
+  // (Model::capturesInDecode).
+  std::array<metal::MetalBuffer, ExecutionLimits::maximumBatchWidth> windows;
 };
 
 struct DFlashPrefillSpan final {
@@ -272,6 +276,10 @@ public:
   // checkpoint ships; without one they keep the target table's row.
   void addMaskRows(metal::CommandGraph &graph, metal::MetalBuffer rows, uint32_t lanes) const;
 
+  // A decode step's context rows: those each lane retained to its rings,
+  // and to its window when it has one (DFlashContextBuffers::windows). Its
+  // normalized rows stay in buffers.hidden, which a state the step captures
+  // stores in its own window.
   void addContextCommit(metal::CommandGraph &graph,
                         DFlashContextBuffers buffers,
                         std::span<const uint32_t> startPositions) const;

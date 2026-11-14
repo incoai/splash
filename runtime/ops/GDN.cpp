@@ -98,15 +98,20 @@ void requireGates(const GdnShape &shape, uint64_t rows, const metal::MetalBuffer
   requireBytes(beta, rows * shape.valueHeads * 2, "GDN beta");
 }
 
+// The bytes of a state cell to the end of layer `layer`'s state: its carried
+// rows from layer x convolutionLayerBytes, its recurrent state from
+// convolutionStateBytes + layer x recurrentLayerBytes.
+uint64_t stateBytes(const GdnShape &shape, GdnStateStrides strides, uint32_t layer) {
+  return std::max(uint64_t{layer} * strides.convolutionLayerBytes + carriedBytes(shape),
+                  strides.convolutionStateBytes + uint64_t{layer} * strides.recurrentLayerBytes +
+                      recurrentBytes(shape, strides.format));
+}
+
 // Each running lane's current and next state cells reach the end of layer
-// `layer`'s state: its carried rows from layer x convolutionLayerBytes, its
-// recurrent state from convolutionStateBytes + layer x recurrentLayerBytes.
+// `layer`'s state.
 void requireStates(const GdnShape &shape, GdnStateStrides strides, uint32_t layer, uint32_t lanes,
                    std::span<const metal::MetalBuffer> current, std::span<const metal::MetalBuffer> next) {
-  const uint64_t bytes =
-      std::max(uint64_t{layer} * strides.convolutionLayerBytes + carriedBytes(shape),
-               strides.convolutionStateBytes + uint64_t{layer} * strides.recurrentLayerBytes +
-                   recurrentBytes(shape, strides.format));
+  const uint64_t bytes = stateBytes(shape, strides, layer);
   for (uint32_t lane = 0; lane < lanes; ++lane) {
     requireBytes(current[lane], bytes, "GDN current state");
     requireBytes(next[lane], bytes, "GDN next state");
@@ -254,6 +259,27 @@ PreparedInput GDN::addDecode(metal::CommandGraph &graph, GdnDecodeBuffers buffer
             std::move(bindings), params, {shape.valueHeads, lanes, 1});
   if (!prepare) return {};
   return {buffers.hidden, input};
+}
+
+void GDN::addFold(metal::CommandGraph &graph, GdnFoldBuffers buffers, GdnShape shape,
+                  uint32_t layers, uint32_t rows, GdnStateStrides state) {
+  if (!layers || !rows || rows > SPLASH_TARGET_VERIFY_ROWS || !state.valid() || buffers.stepSlot % 16)
+    throw std::invalid_argument("invalid GDN fold geometry");
+  const CompiledGdn &kernel = compiledGdn(shape);
+  const uint64_t tapeBytes = uint64_t{layers} * gdnTapeLayerBytes(shape);
+  if (buffers.stepSlot > std::numeric_limits<uint64_t>::max() - tapeBytes)
+    throw std::invalid_argument("invalid GDN fold tape");
+  requireBytes(buffers.tape, buffers.stepSlot + tapeBytes, "GDN tape");
+  requireBytes(buffers.retained, sizeof(uint32_t), "GDN retained count");
+  const uint64_t bytes = stateBytes(shape, state, layers - 1);
+  requireBytes(buffers.state, bytes, "GDN state");
+  requireBytes(buffers.fold, bytes, "GDN folded state");
+  const GDNFoldParams params{state.convolutionLayerBytes, state.recurrentLayerBytes,
+                             state.convolutionStateBytes, buffers.stepSlot, rows, 0};
+  graph.add(stateKernel(std::string("verify_gdn_fold") + std::string(kernel.scanSuffix), state.format),
+            {std::move(buffers.state), std::move(buffers.fold), std::move(buffers.tape),
+             std::move(buffers.retained)},
+            params, {shape.valueHeads, layers, 1});
 }
 
 uint64_t gdnTapeLayerBytes(const GdnShape &shape) noexcept {

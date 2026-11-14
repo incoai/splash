@@ -373,6 +373,14 @@ void DFlashDraft::addContextCommit(
   ops::PreparedInput hidden = ops::Normalization::addRms(
       graph, buffers.projected, weights_.hiddenNorm, buffers.hidden, layout.hiddenSize, rows,
       scratch, kvPlan.input());
+  const uint64_t laneBytes = uint64_t{ExecutionLimits::targetVerifyRows} * layout.hiddenSize * sizeof(uint16_t);
+  for (uint32_t lane = 0; lane < lanes; ++lane)
+    if (buffers.windows[lane])
+      ops::DraftAttention::addWindowCommit(graph, backend_.view(buffers.hidden, lane * laneBytes, laneBytes),
+                                           buffers.windows[lane],
+                                           backend_.view(buffers.retainedCounts, lane * sizeof(uint32_t),
+                                                         sizeof(uint32_t)),
+                                           startPositions[lane], layout.hiddenSize);
 
   for (uint32_t layer = 0; layer < layout.layers; ++layer) {
     const ops::Projection &projection = contextKvProjections_[layer];

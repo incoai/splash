@@ -360,6 +360,19 @@ struct QwenTargetCommitBuffers final {
   std::array<metal::MetalBuffer, ExecutionLimits::maximumBatchWidth> auxiliaryOut;
 };
 
+// The GDN state after the first rows of a lane's verify, folded into a cache
+// cell from the verify's tape (addStateFold): the lane's retained count,
+// the cell the verify wrote, which holds the state before its rows, the
+// lanes' decode tapes and the offset of the verify's slot in them, and the
+// cache cell.
+struct QwenTargetFoldBuffers final {
+  metal::MetalBuffer retainedCount;
+  metal::MetalBuffer state;
+  metal::MetalBuffer gdnTape;
+  uint64_t stepSlot = 0;
+  metal::MetalBuffer fold;
+};
+
 // The bytes of a target's own step scratch beside the runtime's arenas, a
 // prefill's and a decode's (qwenTargetScratchBytes).
 struct QwenTargetScratchBytes final {
@@ -511,6 +524,13 @@ public:
   // the verify computed of its rows. None for a target without auxiliary
   // state.
   virtual void addStateCommit(metal::CommandGraph &graph, QwenTargetCommitBuffers buffers, uint32_t lanes) const;
+  // After a verify's acceptance, the GDN state after its first `rows` rows of
+  // one lane, which the lane's next step would hold had the lane retained
+  // exactly those, in a cache cell, when the lane retained that many. None
+  // for a target without GDN layers; a target with auxiliary state, which
+  // its commit writes after every retained row, captures no state in decode
+  // (Model::capturesInDecode).
+  void addStateFold(metal::CommandGraph &graph, QwenTargetFoldBuffers buffers, uint32_t rows) const;
   // The table rows batch lane `lane`'s verify rows of the last step read,
   // each row's in order, for tests (RuntimeInstrumentation::lastTableRows);
   // none for a target that reads no table.

@@ -116,6 +116,17 @@ void QwenTarget::addStateCommit(metal::CommandGraph &, QwenTargetCommitBuffers b
         throw std::invalid_argument("Qwen state commit lane without its auxiliary state");
 }
 
+void QwenTarget::addStateFold(metal::CommandGraph &graph, QwenTargetFoldBuffers buffers, uint32_t rows) const {
+  if (geometry_.stateLayout.auxiliaryBytes)
+    throw std::logic_error("a target with auxiliary state folds no state in decode");
+  if (!geometry_.stateLayout.layers)
+    return;
+  ops::GDN::addFold(graph,
+                    {std::move(buffers.state), std::move(buffers.gdnTape), buffers.stepSlot,
+                     std::move(buffers.retainedCount), std::move(buffers.fold)},
+                    geometry_.gdnShape(), geometry_.stateLayout.layers, rows, geometry_.stateLayout.strides());
+}
+
 void QwenTarget::requireLayers(size_t layers, size_t attentionLayers) const {
   if (layers != geometry_.layers || attentionLayers != geometry_.kvLayout.attentionLayers)
     throw std::invalid_argument("Qwen target weights do not match execution geometry");

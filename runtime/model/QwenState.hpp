@@ -62,7 +62,9 @@ struct QwenLogicalLengths final {
   uint64_t draftBase = 0;
   uint32_t draftLength = 0;
   // Where the rows the context window holds for the rings end: prefill
-  // writes both, decode the rings alone, which leaves the window behind.
+  // writes both, and so does decode where it captures states
+  // (Model::capturesInDecode); other decode writes the rings alone, which
+  // leaves the window behind.
   uint64_t windowEnd = 0;
 
   [[nodiscard]] uint64_t draftEnd() const noexcept {
@@ -138,8 +140,8 @@ struct StateStaging final {
   }
 };
 
-// The buffers of one cached state, taken before a prefill command writes a
-// state into them (QwenStateStorage::reserve). Sealing moves them into that
+// The buffers of one cached state, taken before a command writes a state
+// into them (QwenStateStorage::reserve). Sealing moves them into that
 // state; a reservation dropped unsealed returns them to the pool, which the
 // command's ticket holds off until the GPU is done with them.
 class QwenStateReservation final : public StateReservation {
@@ -303,12 +305,13 @@ public:
 
   // Copies committed state into a pooled or newly admitted cache slot while
   // the lane retains its own cells; it throws for a lane with pending rows,
-  // whose cell does not hold its state (states are published in prefill).
+  // whose cell does not hold its state (a decode cycle folds those rows into
+  // the state it captures instead: ops::GDN::addFold).
   // Returns nullptr on capacity pressure, with nothing allocated; dropping a
   // cached state makes its slot available for retry.
   [[nodiscard]] std::shared_ptr<const QwenCompositeState>
   snapshot(uint32_t lane);
-  // The steps of a snapshot, for a state a prefill command captures
+  // The steps of a snapshot, for a state a command captures
   // (Model::reserveState): reserve() takes a cache slot, or returns nullptr
   // on capacity pressure with nothing allocated and the admission's cause
   // in `refusal`; copyState() copies the lane's committed state into it and

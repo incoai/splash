@@ -359,9 +359,9 @@ struct StateAdmission final {
   [[nodiscard]] bool granted() const noexcept { return lane.has_value(); }
 };
 
-// The buffers of one cached state, taken for a state boundary that a prefill
-// command reaches (Model::reserveState). The command's completion seals them
-// into the state of that boundary; whatever it still holds goes back to the
+// The buffers of one cached state, taken for a state boundary that a command
+// reaches (Model::reserveState). The command's completion seals them into
+// the state of that boundary; whatever it still holds goes back to the
 // model's pool when the last handle goes, which the command's ticket keeps
 // until the GPU is done with them.
 class StateReservation {
@@ -369,10 +369,13 @@ public:
   virtual ~StateReservation() = default;
 };
 
-// A state a prefill command captures: the request's composite state after
-// `tokens` prompt tokens, in `reservation`'s buffers. The command writes the
-// state of a boundary inside it as a command ending there would store it, and
-// its completion copies the state of a boundary at its end.
+// A state a command captures: the request's composite state after `tokens`
+// tokens, in `reservation`'s buffers. A prefill command writes the state of
+// a boundary inside it as a command ending there would store it, and its
+// completion copies the state of a boundary at its end. A decode cycle
+// folds the rows it retained before the boundary into the state before
+// them, as the lane's next cycle would, and its completion seals the state
+// only if the lane retained them.
 struct StateCapture final {
   uint32_t tokens = 0;
   std::shared_ptr<StateReservation> reservation;
@@ -395,7 +398,9 @@ struct ModelBatchItem final {
   std::span<const uint32_t> inputTokens{};
   // A prefill chunk's states to capture, ascending: page-aligned boundaries in
   // (logicalPosition, logicalPosition + tokenCount], each one where the
-  // request's draft context plan leaves a whole draft window.
+  // request's draft context plan leaves a whole draft window. A decode
+  // cycle's: at most one, the page boundary past logicalPosition that the
+  // rows the lane may retain reach (Model::capturesInDecode).
   std::vector<StateCapture> stateCaptures{};
 };
 
@@ -419,7 +424,8 @@ struct ModelStepResult final {
   // requested order. Empty for generation and for cancelled/failed scoring.
   std::vector<float> scoreLogits{};
   // The states of the chunk's stateCaptures, in order, when the chunk
-  // commits; empty when it does not.
+  // commits; empty when it does not. A decode cycle's, only when the lane
+  // retained the rows before its boundary.
   std::vector<std::shared_ptr<const CompositeState>> capturedStates{};
   // Set when the model computed an unusable result for this lane alone: a
   // prefill chunk whose last row is not finite, a non-finite score logit or
@@ -810,12 +816,16 @@ public:
   submit(const BatchPlan &plan, std::span<const ModelBatchItem> items,
          std::function<void()> completion) = 0;
   // Takes the buffers of one cached state for the request's state boundary
-  // at `tokens`, which the prefill command reaching it fills
+  // at `tokens`, which the command reaching it fills
   // (ModelBatchItem::stateCaptures): from the pool, or one admission for
   // what the pool lacks. Null when the governor refuses, which sets
   // `refusal` to the cause; the caller may release a cached state and retry.
   [[nodiscard]] virtual std::shared_ptr<StateReservation>
   reserveState(uint64_t requestId, uint32_t tokens, metal::AllocationFailure &refusal) = 0;
+  // Whether a decode cycle captures the state of the page its retained rows
+  // reach (ModelBatchItem::stateCaptures), which keeps its lanes' draft
+  // context windows current for those states to take.
+  [[nodiscard]] virtual bool capturesInDecode() const noexcept { return false; }
   // Copies the request's committed state at its current page-aligned
   // boundary into the buffers of a cached state, taken as reserveState()
   // takes them: the state of a boundary its prefill command ended at without

@@ -133,6 +133,19 @@ struct GdnDecodeBuffers final {
   LinearScratch linearScratch{};
 };
 
+// A lane's decode step to fold rows of alone (GDN::addFold): the cell the
+// step wrote, which holds the state before its rows, the tape its rows are
+// on (every layer's, from stepSlot), the count of them the lane retained,
+// which the step's acceptance wrote, and the cell the fold writes, of the
+// same strides.
+struct GdnFoldBuffers final {
+  metal::MetalBuffer state;
+  metal::MetalBuffer tape;
+  uint64_t stepSlot = 0;
+  metal::MetalBuffer retained;
+  metal::MetalBuffer fold;
+};
+
 class GDN final {
 public:
   // Each capture, ascending inside the rows, ends one run of the prepare and
@@ -152,6 +165,13 @@ public:
                                  GdnStateStrides state,
                                  GdnHeadOrder order,
                                  LinearInput input);
+  // The state after the first `rows` of a decode step's rows, in each of
+  // `layers` layers: those rows folded into the state before them, and the
+  // convolution rows they leave, in buffers.fold, bit for bit the state the
+  // lane's next step holds when the lane retained exactly those rows. A lane
+  // that retained fewer leaves the fold as it was.
+  static void addFold(metal::CommandGraph &graph, GdnFoldBuffers buffers, GdnShape shape,
+                      uint32_t layers, uint32_t rows, GdnStateStrides state);
 };
 
 } // namespace splash::ops
