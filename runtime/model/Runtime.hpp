@@ -9,6 +9,8 @@
 
 namespace splash::model {
 
+class PrefillArena;
+
 class RuntimeInstrumentation;
 
 class Runtime final : public RuntimeModel {
@@ -17,6 +19,9 @@ public:
   ~Runtime() override;
   void checkHealth() override;
   [[nodiscard]] std::optional<uint32_t> statesToActivate() const noexcept override;
+  // The draft ring's slots the served model's draft keeps (its compiled
+  // variant's window), which its context plans and length checks read.
+  [[nodiscard]] uint32_t draftWindow() const noexcept override;
   [[nodiscard]] uint64_t idleBufferBytes(uint32_t evictedStates, bool afterStart,
                                          bool keepLane) const noexcept override;
   [[nodiscard]] uint64_t startStateBytes() const noexcept override;
@@ -95,4 +100,8 @@ private:
   std::unique_ptr<Impl> impl_;
 };
 
+  // A prefill arena's tensors as the target's prefill commands read them,
+  // for tests that assemble a prefill command directly (model/Runtime.cpp).
+  [[nodiscard]] QwenTargetPrefillBuffers prefillBuffers(const PrefillArena &arena,
+                                                        uint32_t chunk);
 } // namespace splash::model

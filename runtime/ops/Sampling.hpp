@@ -148,7 +148,14 @@ struct AcceptanceBuffers final {
 // stop tokens. The draft's own selector is ops::DraftSelector.
 class Sampling final {
 public:
-  explicit Sampling(uint32_t vocabulary);
+  // The draft's kept candidates the acceptance and the draw read: the
+  // shipped drafts keep 16, Ripple's 32. `verifyRows` is the served draft's
+  // block (the rows a cycle drafts and the target verifies): the shipped
+  // drafts' 8, a 16-row variant's 16.
+  explicit Sampling(uint32_t vocabulary, uint32_t draftCandidates,
+                    uint32_t verifyRows = SPLASH_TARGET_VERIFY_ROWS);
+  [[nodiscard]] uint32_t verifyRows() const noexcept { return verifyRows_; }
+  [[nodiscard]] uint32_t proposalTokens() const noexcept { return verifyRows_ - 1; }
 
   // Exact scratch/output bytes for the fixed precompiled sampling ABI.
   // Counts may cover one lane or a batch of lanes; the operator owns sharding.
@@ -214,6 +221,10 @@ private:
     uint32_t maskRow = 0;
     uint32_t uniform = 0;
     uint32_t draftedRows = 0;
+    // The lane stride of the logits and the masks this selection reads: a
+    // whole block's rows for a verify, the head's 8-row block for an
+    // initial selection.
+    uint32_t laneRows = 0;
   };
 
   // Penalizes the row at rowOffset of each penalized lane or, for verify,
@@ -237,7 +248,11 @@ private:
                     std::span<const SamplingPolicy> policies, const SamplingBuffers &buffers) const;
 
   uint32_t vocabulary_ = 0;
+  uint32_t draftCandidates_ = SPLASH_DRAFT_CANDIDATES;
   uint32_t maskWords_ = 0;
+  // The served draft's block: the rows a cycle drafts and the target
+  // verifies (the shipped drafts' 8, a 16-row variant's 16).
+  uint32_t verifyRows_ = SPLASH_TARGET_VERIFY_ROWS;
 };
 
 } // namespace splash::ops

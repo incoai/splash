@@ -362,7 +362,8 @@ kernel void decode_linear_gguf_prepare(device const bfloat *input [[buffer(0)]],
   GGUF_SG_KERNEL(gguf_decode_sg_##f##_l##L##_a, F, L, EpNone, bfloat)                                \
   GGUF_SG_KERNEL(gguf_decode_sg_##f##_l##L##_a_f32, F, L, EpNone, float)                             \
   GGUF_SG_KERNEL(gguf_decode_sg_##f##_l##L##_r, F, L, EpResidual, bfloat)                            \
-  GGUF_SG_KERNEL(gguf_decode_sg_##f##_l##L##_g, F, L, EpUpWithGate, bfloat)
+  GGUF_SG_KERNEL(gguf_decode_sg_##f##_l##L##_g, F, L, EpUpWithGate, bfloat)                          \
+  GGUF_SG_KERNEL(gguf_decode_sg_##f##_l##L##_c, F, L, EpClampedUpWithGate, bfloat)
 #define GGUF_SG_FORMAT(F, f) \
   GGUF_SG_EPILOGUES(F, f, 1) GGUF_SG_EPILOGUES(F, f, 2) GGUF_SG_EPILOGUES(F, f, 3) GGUF_SG_EPILOGUES(F, f, 4)
 QUANT_REGISTER_FORMATS(GGUF_SG_FORMAT)
@@ -387,7 +388,7 @@ inline void gguf_sg_fused(device const bfloat *table, device const float *sums, 
   device uchar *w0 = s == 0 ? w0a : s == 1 ? w0b : w0c;
   device uchar *w1 = s == 0 ? w1a : s == 1 ? w1b : w1c;
   device uchar *meta = s == 0 ? ma : s == 1 ? mb : mc;
-  const GgufDecodeParams q{p.input_size, p.splits, p.out_stride, p.offset[s], 0};
+  const GgufDecodeParams q{p.input_size, p.splits, p.out_stride, p.offset[s], 0, 0.0f};
   const uint2 local(tg.x - (s == 0 ? 0 : s == 1 ? t0 : t1), tg.y);
   quant_register_format_switch(p.fmt[s], [&](auto format) {
     typedef decltype(format) F;

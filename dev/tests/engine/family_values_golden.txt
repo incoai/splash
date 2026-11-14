@@ -88,3 +88,17 @@ namespace bf16 fp32 b06e435b51f8c94636cf3a72acdcfc26
 state bf16 cell 0 lane 10747904 cached 2359296
 namespace int8 bf16 b0dbac8e4f941ecd3e28c87cc3d2c58a
 namespace bf16 bf16 b06e435b51f8c94636cf3a72acdcfc26
+family Ripple-65B
+facts experts 0 recurrent-state 0 ple-table 0 sparse-kv 0 dense-ffn 1 context 262144..262144
+kv layers 80 heads 8 dimension 128 index 0 window 1023 layers 0xf7bdef7bdef7bdef
+kv int8 page 5406720 index-page 0 slim-page 1081344 alignment 64 extents 64..64
+kv int8 extent-pages 1:0 31:0 32:0 63:0 64:64 127:64 128:64 129:64 255:64 256:64 257:64 511:64 512:64 1000:64 4095:64 4096:64 10000:64 65535:64 65536:64 100000:64 262144:64 1000000:64
+kv bf16 page 10485760 index-page 0 slim-page 2097152 alignment 1 extents 7..19
+kv bf16 extent-pages 1:0 31:15 32:16 63:9 64:16 127:14 128:16 129:16 255:15 256:16 257:16 511:7 512:16 1000:10 4095:13 4096:16 10000:10 65535:15 65536:16 100000:10 262144:16 1000000:10
+state fp32 cell 0 lane 95682560 cached 11796480
+namespace int8 fp32 a3aaf4352060725ce57ef448e6503096
+namespace bf16 fp32 4a0acd9e50c388b85e387d662aecd6b2
+state bf16 cell 0 lane 95682560 cached 11796480
+namespace int8 bf16 a3aaf4352060725ce57ef448e6503096
+namespace bf16 bf16 4a0acd9e50c388b85e387d662aecd6b2
+

@@ -104,6 +104,13 @@ PAGED_PREFILL_SPLIT(prefill_attention_bf16_split_kv2_g8, 2, 8, 256, 0, bfloat, f
 PAGED_PREFILL_SPLIT(prefill_attention_bf16_split_kv2_g16, 2, 16, 256, 0, bfloat, false)
 PAGED_PREFILL_SPLIT(prefill_attention_bf16_split_kv4_g8_d128, 4, 8, 128, 0, bfloat, false)
 PAGED_PREFILL_SPLIT(prefill_attention_bf16_split_kv4_g8_d128_w512, 4, 8, 128, 512, bfloat, false)
+// Eight KV heads of 128 over ten query heads each, over the whole history and
+// over a window of the 1023 keys before each row (Ripple's, whose
+// sliding window of 1024 keys includes its own).
+PAGED_PREFILL_SPLIT(prefill_attention_q8_split_kv8_g10_d128, 8, 10, 128, 0, int8_t, true)
+PAGED_PREFILL_SPLIT(prefill_attention_q8_split_kv8_g10_d128_w1023, 8, 10, 128, 1023, int8_t, true)
+PAGED_PREFILL_SPLIT(prefill_attention_bf16_split_kv8_g10_d128, 8, 10, 128, 0, bfloat, false)
+PAGED_PREFILL_SPLIT(prefill_attention_bf16_split_kv8_g10_d128_w1023, 8, 10, 128, 1023, bfloat, false)
 #undef PAGED_PREFILL_SPLIT
 
 #define PAGED_PREFILL_REDUCE(Name, Heads, Group, HeadDim, Window)              \
@@ -141,6 +148,8 @@ PAGED_PREFILL_SPLIT(prefill_attention_bf16_split_kv4_g8_d128_w512, 4, 8, 128, 51
 PAGED_PREFILL_REDUCE(prefill_attention_reduce, 4, 6, 256, 0)
 PAGED_PREFILL_REDUCE(prefill_attention_reduce_kv2_g8, 2, 8, 256, 0)
 PAGED_PREFILL_REDUCE(prefill_attention_reduce_kv2_g16, 2, 16, 256, 0)
+PAGED_PREFILL_REDUCE(prefill_attention_reduce_kv8_g10_d128, 8, 10, 128, 0)
+PAGED_PREFILL_REDUCE(prefill_attention_reduce_kv8_g10_d128_w1023, 8, 10, 128, 1023)
 PAGED_PREFILL_SINK_REDUCE(prefill_attention_reduce_kv4_g8_d128_sinks, 4, 8, 128, 0)
 PAGED_PREFILL_SINK_REDUCE(prefill_attention_reduce_kv4_g8_d128_w512_sinks, 4, 8, 128, 512)
 #undef PAGED_PREFILL_SINK_REDUCE

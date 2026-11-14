@@ -65,8 +65,9 @@ VerifyAttentionPlan ExecutionPlans::verifyAttention(
 }
 
 DraftAttentionPlan ExecutionPlans::draftAttention(DraftAttentionShape shape,
-                                                 uint32_t lanes) const {
-  return DraftAttention::plan(shape, lanes);
+                                                 uint32_t lanes,
+                                                 uint32_t rows) const {
+  return DraftAttention::plan(shape, lanes, rows);
 }
 
 MoePlan ExecutionPlans::moePrefill(MoeShape shape, uint32_t routerFormat, uint32_t rows) const {
@@ -95,8 +96,8 @@ AttentionWorkspace ExecutionPlans::verifyAttentionWorkspacePerLane(
 // The draft workspace is linear in the lanes: one lane's is every width's
 // share.
 DraftAttentionWorkspace ExecutionPlans::draftAttentionWorkspacePerLane(
-    DraftAttentionShape shape) const {
-  return DraftAttention::plan(shape, 1).workspace();
+    DraftAttentionShape shape, uint32_t rows) const {
+  return DraftAttention::plan(shape, 1, rows).workspace();
 }
 
 MoeWorkspace ExecutionPlans::moePrefillWorkspace(MoeShape shape, uint32_t routerFormat,
@@ -122,6 +123,11 @@ uint64_t ExecutionPlans::gateUpWorkspace(ProjectionShape shape) const {
     const LinearWorkload workload{{shape.outputSize, shape.inputSize}, lanes * kDecodeRows,
                                   LinearPhase::Decode, LinearEpilogue::GateUp};
     bound = std::max(bound, linear_.plan(workload).gateScratchBytes());
+    // A served draft's whole block runs the head's gate/up pair too.
+    const LinearWorkload block{{shape.outputSize, shape.inputSize},
+                               lanes * SPLASH_DRAFT_BLOCK_ROWS_LIMIT,
+                               LinearPhase::Decode, LinearEpilogue::GateUp};
+    bound = std::max(bound, linear_.plan(block).gateScratchBytes());
   }
   return bound;
 }

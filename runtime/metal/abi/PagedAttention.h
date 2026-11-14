@@ -14,10 +14,14 @@
 struct FullPrefillParams {
   uint32_t tokens;
   uint32_t stride;
+  // The staging row the chunk's first row is (a verify sub-pass's block row;
+  // a prefill chunk's is 0). The staging reads and writes start there; the
+  // q/k/v rows and the RoPE tables it reads stay chunk-local.
+  uint32_t row_base;
 };
 
-static_assert(sizeof(FullPrefillParams) == 8,
-              "Full attention prefill parameters are 8 bytes on both sides");
+static_assert(sizeof(FullPrefillParams) == 12,
+              "Full attention prefill parameters are 12 bytes on both sides");
 
 // Each lane holds SPLASH_TARGET_VERIFY_ROWS rows in a chunk staging of
 // SPLASH_VERIFY_CHUNK_STRIDE rows.
@@ -39,11 +43,16 @@ struct SplashChunkedPrefillParams {
   uint32_t chunk_tokens;
   uint32_t chunk_stride;
   uint32_t page_table_entries;
+  // The block row the chunk's first row is: a prefill chunk's and a verify
+  // block's first sub-pass's is 0; the second sub-pass of a 16-row block's
+  // is 8. Rows read the staging from row_base on and land at
+  // committed_tokens + row_base + row.
+  uint32_t row_base;
   SplashKvLayer kv;
 };
 
-static_assert(sizeof(SplashChunkedPrefillParams) == 24,
-              "Chunked store parameters are 24 bytes on both sides");
+static_assert(sizeof(SplashChunkedPrefillParams) == 28,
+              "Chunked store parameters are 28 bytes on both sides");
 
 // The parts a dense paged-attention tile of a GQA group of `group` query heads
 // per KV head runs in (kernels/common/paged_attention_tile.h
@@ -139,8 +148,10 @@ struct SplashPrefillAttentionParams {
 static_assert(sizeof(SplashPrefillAttentionParams) == 36,
               "Prefill attention parameters are 36 bytes on both sides");
 
-// A verify lane attends all its SPLASH_TARGET_VERIFY_ROWS rows, which its
-// queries and output hold in SPLASH_VERIFY_CHUNK_STRIDE rows per KV head.
+// A verify lane attends all its verify rows — the rows of one sub-pass of
+// its block (the shipped 8-row cycles' whole block, the second pass of a
+// 16-row block's rows 8..15) — which its queries and output hold in
+// SPLASH_VERIFY_CHUNK_STRIDE rows per KV head, from `row_base` on.
 struct SplashVerifyAttentionParams {
   uint32_t committed_tokens;
   uint32_t page_table_entries;
@@ -152,10 +163,14 @@ struct SplashVerifyAttentionParams {
   // The lane's block list, which its sparse split and reduce read.
   uint32_t block_stride;
   uint32_t block_list;
+  // The block row this sub-pass's first row is: its queries live
+  // row_base..row_base+rows-1 of the lane's staging and its first row's
+  // position is committed_tokens + row_base.
+  uint32_t row_base;
 };
 
-static_assert(sizeof(SplashVerifyAttentionParams) == 32,
-              "Verify attention parameters are 32 bytes on both sides");
+static_assert(sizeof(SplashVerifyAttentionParams) == 36,
+              "Verify attention parameters are 36 bytes on both sides");
 
 // A prefill whose history has pages that hold only their index reads one
 // layer's history staged (kernels/shared/kv_stage.metal, ops::PagedAttention::

@@ -334,6 +334,7 @@ class StreamingToolCallProjector:
             self._emit_content(self.syntax.call_open + name, events)
             return
         self.state = "arguments"
+        self.arguments_started = False
         self.argument_fragments = []
         self.parameter_count = 0
         self.parameter_names = set()
@@ -355,7 +356,8 @@ class StreamingToolCallProjector:
                 },
             )
         )
-        self._emit_argument("{", events)
+        if not self.syntax.json_arguments:
+            self._emit_argument("{", events)
 
     def _key(self, name):
         separator = "," if self.parameter_count else ""
@@ -412,19 +414,27 @@ class StreamingToolCallProjector:
         self.value_parts = []
         self.state = "arguments"
 
+    def _put_json_arguments(self, text, events):
+        """The arguments' JSON value, streamed as it arrives: it is JSON
+        already, so its text emits as it is."""
+        if text and self.call_id is not None:
+            self._emit_argument(text, events)
+
     def _finish_call(self, events):
-        self._emit_argument("}", events)
-        self.closed_calls.append(
-            {
-                "id": self.call_id,
-                "type": "function",
-                "function": {
-                    "name": self.function_name,
-                    "arguments": "".join(self.argument_fragments),
-                },
-            }
-        )
-        self.call_index += 1
+        if not self.syntax.json_arguments:
+            self._emit_argument("}", events)
+        if self.call_id is not None:
+            self.closed_calls.append(
+                {
+                    "id": self.call_id,
+                    "type": "function",
+                    "function": {
+                        "name": self.function_name,
+                        "arguments": "".join(self.argument_fragments),
+                    },
+                }
+            )
+            self.call_index += 1
         self.call_id = None
         self.function_name = None
         self.argument_fragments = []
@@ -483,6 +493,31 @@ class StreamingToolCallProjector:
                 self._begin_call(name, events)
                 continue
             if self.state == "arguments":
+                if syntax.json_arguments:
+                    # The arguments are one JSON value, streamed as it is
+                    # written, up to the arguments' close; the name's close
+                    # sits before it, and the call's close tag after it, which
+                    # the closing state consumes.
+                    if not self.arguments_started:
+                        if syntax.name_close.startswith(self.pending):
+                            break  # the name's close is still arriving
+                        self.pending = self.pending.removeprefix(
+                            syntax.name_close
+                        )
+                        self.arguments_started = True
+                    start, tag = self._next_tag(syntax.arguments_close)
+                    if tag is None:
+                        held = hold_partial(self.pending, syntax.arguments_close)[1]
+                        self._put_json_arguments(
+                            self.pending[: len(self.pending) - len(held)], events
+                        )
+                        self.pending = held
+                        break
+                    self._put_json_arguments(self.pending[:start], events)
+                    self.pending = self.pending[start + len(tag) :]
+                    self._finish_call(events)
+                    self.state = "closing"
+                    continue
                 # Text between parameters is dropped, but for a tag it may
                 # begin.
                 tags = syntax.argument_tags

@@ -69,10 +69,11 @@ private:
 };
 
 // The dimensions of a DFlash2 draft, as its checkpoint's config.json gives
-// them (ModelDescriptor.mm readDraftLayout): every draft's attention widths
-// and selector are those the kernels are built for; its layers, intermediate
-// size, rotary base and the target layers it reads are its own, and its
-// hidden size and vocabulary its target's.
+// them (ModelDescriptor.mm readDraftLayout): its layers, intermediate size,
+// rotary base and the target layers it reads are its own, its hidden size
+// and vocabulary its target's, and its attention geometry the compiled draft
+// variant its config states (metal/abi/DraftAttention.h), whose kernels run
+// it.
 struct DFlashDraftLayout final {
   uint32_t layers = 0;
   uint32_t hiddenSize = 0;
@@ -85,13 +86,22 @@ struct DFlashDraftLayout final {
   float rotaryTheta = 0.0F;
   uint32_t selectorRank = 0;
   uint32_t kvHeads = 0;
+  // The variant's query heads, ring length, convolution taps, and the
+  // proposal it was trained for: the block's rows a cycle drafts (the target
+  // verifies as many) and the selector's kept candidates, which the variant's
+  // kernels are instantiated with.
+  uint32_t queryHeads = SPLASH_DRAFT_QUERY_HEADS;
+  uint32_t window = SPLASH_DRAFT_SLIDING_WINDOW;
+  uint32_t convolutionTaps = SPLASH_DRAFT_CONVOLUTION_TAPS;
+  uint32_t rows = SPLASH_DRAFT_QUERY_ROWS;
+  uint32_t candidates = SPLASH_DRAFT_CANDIDATES;
   // The target layers whose output rows the draft reads, ascending: the
   // first targetLayerCount of targetLayers, targetHiddenSize() values a row.
   std::array<uint32_t, ExecutionLimits::maximumDraftTargetLayers> targetLayers{};
   uint32_t targetLayerCount = 0;
 
   [[nodiscard]] constexpr DraftStateLayout stateLayout() const noexcept {
-    return {layers, kvHeads, attentionHeadDimension, hiddenSize};
+    return {layers, kvHeads, attentionHeadDimension, hiddenSize, window, rows};
   }
   [[nodiscard]] constexpr std::span<const uint32_t> targetLayerIds() const noexcept {
     return {targetLayers.data(), targetLayerCount};
@@ -99,9 +109,8 @@ struct DFlashDraftLayout final {
   // A row of the target rows it reads: one of hiddenSize values per layer.
   [[nodiscard]] constexpr uint32_t targetHiddenSize() const noexcept { return hiddenSize * targetLayerCount; }
   [[nodiscard]] constexpr ops::DraftAttentionShape attentionShape() const noexcept {
-    return {hiddenSize, dynamicSize, qkvSize, attentionSize,
-            attentionSize / attentionHeadDimension, kvHeads,
-            attentionHeadDimension};
+    return {hiddenSize, dynamicSize, qkvSize, attentionSize, queryHeads,
+            kvHeads, attentionHeadDimension, window, convolutionTaps};
   }
   // The key and value columns of the fused QKV projection, all the context
   // writers read.
@@ -116,11 +125,13 @@ struct DFlashDraftLayout final {
 // `vocabularySize` with `layers` (at least one) layers of `intermediateSize`
 // (a positive multiple of 64), rotary base `rotaryTheta` (positive), reading
 // the target's layers `targetLayers` (ascending, 1 to
-// ExecutionLimits::maximumDraftTargetLayers): its attention widths and
-// selector are those the kernels are built for.
-[[nodiscard]] DFlashDraftLayout draftLayout(uint32_t hiddenSize, uint32_t vocabularySize, uint32_t layers,
-                                            uint32_t intermediateSize, float rotaryTheta,
-                                            std::span<const uint32_t> targetLayers);
+// ExecutionLimits::maximumDraftTargetLayers), of the compiled draft variant
+// `variant` (the shipped drafts' unless a config names another): its
+// attention geometry is the variant's, whose kernels run it.
+[[nodiscard]] DFlashDraftLayout
+draftLayout(uint32_t hiddenSize, uint32_t vocabularySize, uint32_t layers, uint32_t intermediateSize,
+            float rotaryTheta, std::span<const uint32_t> targetLayers,
+            const SplashDraftVariant &variant = SPLASH_DRAFT_VARIANTS[0]);
 
 struct DFlashDecodeBuffers final {
   ops::LinearScratch linearScratch{};
@@ -267,6 +278,8 @@ public:
                     const ops::DraftSelectorBuffers &buffers,
                     std::span<const uint32_t> anchors,
                     std::span<const ops::SamplingPolicy> policies) const;
+  [[nodiscard]] const ops::DraftSelector &selector() const noexcept { return selector_; }
+  [[nodiscard]] uint32_t rows() const noexcept { return weights_.layout.rows; }
   // Sets each of `lanes` lanes' mask rows of the draft input `rows` (all but
   // its anchor's, row 0 of its draftQueryRows) to the mask embedding the
   // checkpoint ships; without one they keep the target table's row.

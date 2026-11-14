@@ -4,6 +4,7 @@
 // quantizes to Q8_0, where a streamed table's rows are, which part of a split
 // GGUF each tensor is read from, and the sources it refuses.
 //   gguf-planner
+#include <iostream>
 #include "GgufFixtures.hpp"
 #include "metal/abi/Gguf.h"
 #include "model/GgufPreparation.hpp"
@@ -873,6 +874,103 @@ void checkSplit(const std::filesystem::path &directory) {
         "planner reads each tensor of a split GGUF from its part into the whole file's images");
 }
 
+// A small Ripple target, its GGUF as the converter writes ricursive's: five
+// blocks, four of which slide over windows of 33 keys under RoPE and the
+// fifth of which attends every key without, each with its gate beside its
+// queries, its value-residual lambda, and a norm after its FFN, whose
+// activations clamp. Its queries and gate are Q4_K, the rest Q8_0, as the
+// release's files mix them.
+model::QwenTargetDimensions rippleGeometry() {
+  model::QwenTargetDimensions g;
+  g.layers = 5;
+  g.hiddenSize = 256;
+  g.vocabularySize = 256;
+  g.packedFullWidth = 3072;  // the queries, their gate, and 2 KV heads of 128
+  g.attentionWidth = 1024;   // eight query heads of 128
+  g.attentionQueryHeads = 8;
+  g.attentionKvHeads = 2;
+  g.attentionHeadDimension = 128;
+  g.attentionGate = true;
+  g.rotaryPairs = 64;
+  g.rotaryTheta = 1e4F;
+  g.slidingWindow = 33;
+  g.slidingLayers = splash::kv::LayerMask{0b10111};
+  g.unrotatedLayers = splash::kv::LayerMask{0b10000};
+  g.fullAttentionPeriod = 1;
+  g.ffnKind = model::QwenFfnKind::Dense;
+  g.intermediateSize = 256;
+  g.embeddingScale = 16.0F;
+  g.swigluClamp = 6.0F;
+  g.valueResidual = true;
+  g.postFfnNorm = true;
+  return g;
+}
+
+void checkRipple(const std::filesystem::path &directory) {
+  const model::QwenTargetDimensions g = rippleGeometry();
+  std::vector<Tensor> tensors = targetTensors(
+      g, {{"attn_q.weight", kQ4_K},     {"attn_gate.weight", kQ4_K}, {"attn_k.weight", kQ8_0},
+          {"attn_v.weight", kQ8_0},     {"attn_output.weight", kQ8_0}, {"ffn_gate.weight", kQ8_0},
+          {"ffn_up.weight", kQ8_0},     {"ffn_down.weight", kQ8_0},  {"output.weight", kQ8_0},
+          {"token_embd.weight", kQ8_0}});
+  randomize(tensors, 1200);
+  const auto path = directory / "ripple.gguf";
+  const auto planned = [&](const std::vector<test_gguf::Key> &keys, const std::vector<Tensor> &written) {
+    splash::test::writeFile(path, test_gguf::file(keys, written));
+    return plan(path, g);
+  };
+  const Plan ripple = planned(metadata(g), tensors);
+  check(!ripple.error && ripple.images.size() == g.layers + 2,
+        "planner plans the Ripple target" + (ripple.error ? ": " + *ripple.error : ""));
+  if (ripple.error) return;
+  for (uint32_t layer = 0; layer < g.layers; ++layer) {
+    const model::gguf::Image &image = ripple.images[layer];
+    const std::string p = "blk." + std::to_string(layer) + ".";
+    const auto *queries = repackOf(image, p + "attn_q.weight");
+    // The packed q interleaves each head's queries with its gate (the
+    // prepare kernel reads them so), head by head over the two tensors.
+    const uint32_t heads = g.attentionWidth / g.attentionHeadDimension;
+    bool interleaved = queries && queries->rows == 2 * g.attentionWidth &&
+                       queries->sources.size() == 2 * heads;
+    for (uint32_t head = 0; interleaved && head < heads; ++head) {
+      interleaved = queries->sources[2 * head].name == p + "attn_q.weight" &&
+                    queries->sources[2 * head].first == head * g.attentionHeadDimension &&
+                    queries->sources[2 * head + 1].name == p + "attn_gate.weight" &&
+                    queries->sources[2 * head + 1].first == head * g.attentionHeadDimension;
+    }
+    check(interleaved,
+          "planner plans layer " + std::to_string(layer) + "'s queries and gate as one projection");
+    check(asStored(copyOf(image, p + "attn_vres_lambda.weight"), tensorNamed(tensors, p + "attn_vres_lambda.weight").data),
+          "planner copies layer " + std::to_string(layer) + "'s value-residual lambda as stored");
+    for (const std::string name : {"attn_norm.weight", "post_attention_norm.weight", "ffn_norm.weight",
+                                   "post_ffw_norm.weight"})
+      check(asStored(copyOf(image, p + name), tensorNamed(tensors, p + name).data),
+            "planner copies the F32 tensor as stored: " + p + name);
+  }
+  // Each key Ripple's metadata holds is held to it, the layer patterns among
+  // the arrays the installer's copy leaves out.
+  const auto withKey = [&](const test_gguf::Key &replacement) {
+    std::vector<test_gguf::Key> keys = metadata(g);
+    for (test_gguf::Key &key : keys)
+      if (key.name == replacement.name) key = replacement;
+    return keys;
+  };
+  check(names(planned(withKey(test_gguf::float32Key("ricursive.embedding_scale", 1.0F)), tensors),
+              {"does not match the target: embedding_scale"}),
+        "planner names an embedding scale of another value");
+  check(names(planned(withKey(test_gguf::float32Key("ricursive.swiglu_clamp", 7.0F)), tensors),
+              {"does not match the target: swiglu_clamp"}),
+        "planner names a clamp of another value");
+  check(names(planned(withKey(test_gguf::uint32Key("ricursive.attention.sliding_window", 34)), tensors),
+              {"does not match the target: attention.sliding_window"}),
+        "planner names a window of another length");
+  check(names(planned(withKey(test_gguf::boolArrayKey("ricursive.attention.sliding_window_pattern",
+                                                      {false, true, true, true, true})),
+                      tensors),
+              {"does not match the target: attention.sliding_window_pattern"}),
+        "planner names a sliding pattern of other layers");
+}
+
 // A small flint target, its GGUF as llama.cpp writes Flint's: four layers
 // that attend, 1 and 2 over a sliding window with RoPE and 0 and 3 over every
 // key without, as its two layer patterns state, each with its sinks after its
@@ -892,8 +990,8 @@ model::QwenTargetDimensions flintGeometry() {
   g.rotaryPairs = 64;
   g.rotaryTheta = 1e4F;
   g.slidingWindow = 33;
-  g.slidingLayers = 0b0110;
-  g.unrotatedLayers = 0b1001;
+  g.slidingLayers = splash::kv::LayerMask{0b0110};
+  g.unrotatedLayers = splash::kv::LayerMask{0b1001};
   g.fullAttentionPeriod = 1;
   g.ffnKind = model::QwenFfnKind::SparseMoe;
   g.intermediateSize = 256;
@@ -1106,6 +1204,7 @@ int main() {
     guarded("planner on a split GGUF", [&] { checkSplit(directory.path()); });
     guarded("planner on Flint", [&] { checkFlint(directory.path()); });
     guarded("planner on NVFP4 activation scales", [&] { checkNvfp4InputScale(directory.path()); });
+    guarded("planner on Ripple", [&] { checkRipple(directory.path()); });
     std::printf("%s (%d failures)\n", failures ? "GGUF planner tests FAILED" : "GGUF planner tests passed", failures);
     return failures ? 1 : 0;
   }

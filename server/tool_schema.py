@@ -14,7 +14,7 @@ from urllib.parse import unquote
 from jsonschema.exceptions import SchemaError
 from llguidance import LLMatcher
 
-from .chat_format import THINK_END, TOOL_CALL_CLOSE, TOOL_CALL_OPEN
+from .chat_format import THINK_END, THINK_START, TOOL_CALL_CLOSE, TOOL_CALL_OPEN
 from .errors import APIError
 from .lru import LRUCache, memoized
 from .schema_validation import (
@@ -820,6 +820,18 @@ _NAME = _lark_regex(rf"[^<> \t\n\r]([^<>\n\r]{{0,{MAX_NAME_LENGTH - 2}}}[^<> \t\
 _RAW_VALUE = "/(?s:.*)/"
 
 
+def _regex_bytes(text):
+    """`text`'s bytes as regex escapes, so a lexer that holds the spelling
+    for another rule (a suffix stop) reads this one cleanly."""
+    return "".join("\\x%02x" % byte for byte in text.encode())
+
+
+def _regex_bytes(text):
+    """`text`'s bytes as regex escapes, so a lexer that holds the spelling
+    for another rule (a suffix stop) reads this one cleanly."""
+    return "".join("\\x%02x" % byte for byte in text.encode())
+
+
 def _tags(syntax, *tags):
     """Tags of `syntax` in a row, as a grammar writes them: each as its token
     where the tags are tokens of the family's tokenizer (Flint's), which the
@@ -872,7 +884,15 @@ def _value_terminals(syntax):
 
 def _free_arguments(syntax):
     """The arguments of a tool that is not strict: parameters in the chat
-    template's tags, each with any name and raw text."""
+    template's tags, each with any name and raw text. A JSON-arguments
+    syntax's are any JSON value."""
+    if syntax.json_arguments:
+        # Any JSON value: the schema llguidance's %json takes for one.
+        return (
+            "%llguidance {}\nstart: %json "
+            + json.dumps({}, separators=(",", ":"))
+            + "\n"
+        )
     key_open, key_close = _key_tags(syntax)
     rules = [
         "%llguidance {}",
@@ -955,7 +975,15 @@ def _parameter_rules(rule, prefix, value_schema, syntax):
 
 def _argument_grammar(schema, syntax):
     """The arguments of a strict tool: the declared parameters in schema
-    order, each required one present, then any others the schema allows."""
+    order, each required one present, then any others the schema allows.
+    A JSON-arguments syntax's arguments are one JSON value of the schema,
+    which a %json rule generates directly."""
+    if syntax.json_arguments:
+        return (
+            "%llguidance {}\nstart: %json "
+            + json.dumps(_grammar_compatible_schema(schema), separators=(",", ":"))
+            + "\n"
+        )
     key_open, key_close = _key_tags(syntax)
     properties = schema["properties"]
     required = schema["required"]
@@ -1004,6 +1032,26 @@ def _reasoning(thinking, chat_format):
     the model opens one itself, an optional block from its opening to its
     close; otherwise none. Each tag is its token, as the template writes it,
     and the text between is TEXT, which cannot spell the close."""
+    if chat_format.tags_are_text:
+        # The tags are text: the reasoning's terminal is a suffix rule, whose
+        # lexeme runs to the close's first spelling and ends with it. A TEXT
+        # terminal and a close literal would not do: the lexer commits the
+        # close's earlier tokens to the TEXT, whose exclusion forbids the
+        # spelling only whole, and the close's last token then satisfies
+        # nothing.
+        close = json.dumps(THINK_END)
+        if thinking:
+            return "think ", f"think[suffix={close}]: /(?s:.*)/"
+        # The model opens its reasoning itself, with the opener as text: an
+        # optional block from the opener through the close.
+        return (
+            "think? ",
+            "think: "
+            + json.dumps(THINK_START)
+            + " think_text\nthink_text[suffix="
+            + close
+            + "]: /(?s:.*)/",
+        )
     close = f"<[{chat_format.think_end_id}]>"
     if thinking:
         return "think ", f"think: TEXT {close}"
@@ -1207,9 +1255,14 @@ def tool_grammar(policy, thinking, response_schema=None, *, chat_format):
             side_grammars.append(
                 {"name": arguments, "lark_grammar": strict_arguments[name]}
             )
+        open_, close_ = (
+            (json.dumps(TOOL_CALL_OPEN), json.dumps(TOOL_CALL_CLOSE))
+            if chat_format.tags_are_text
+            else (TOOL_CALL_OPEN, TOOL_CALL_CLOSE)
+        )
         calls.append(
-            f"call_{index}: {TOOL_CALL_OPEN} {_function_opening(syntax, name)} "
-            f"@{arguments}{closing} {TOOL_CALL_CLOSE}"
+            f"call_{index}: {open_} {_function_opening(syntax, name)} "
+            f"@{arguments}{closing} {close_}"
         )
     call = "(" + " | ".join(f"call_{index}" for index in range(len(calls))) + ")"
     if not calls:
@@ -1234,11 +1287,24 @@ def tool_grammar(policy, thinking, response_schema=None, *, chat_format):
         )
     if think_rule is not None:
         main.append(think_rule)
+    if chat_format.tags_are_text:
+        # The tags are text: the think block's terminal is a suffix rule
+        # (its lexeme runs to the close's first spelling and ends with it),
+        # and a TEXT exclusion of the tags' bytes would prune the shared
+        # lexer's path through them, which the suffix's completion needs.
+        # The lexer prefers the structural literals over TEXT without it.
+        text_rule = r"TEXT: /(?s:.*)/"
+    else:
+        text_rule = (
+            r"TEXT: /(?s:.*)/ & ~/(?s:.*)("
+            + TOOL_CALL_OPEN
+            + r"|<\/think>)(?s:.*)/"
+        )
     main.extend(
         [
             *calls,
             WHITESPACE_RULE,
-            _text_rule(TOOL_CALL_OPEN, THINK_END),
+            text_rule,
         ]
     )
     side_grammars.insert(

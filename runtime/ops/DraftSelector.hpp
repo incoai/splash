@@ -42,9 +42,12 @@ struct DraftSelectorBuffers final {
 // whose lanes verify R rows in all, for R from the lane count to eight rows a
 // lane, in any unit. With everyRow, each lane verifies its maximum instead.
 struct VerifyRowsModel final {
-  static constexpr uint32_t kCosts = SPLASH_DRAFT_QUERY_ROWS * SPLASH_MAXIMUM_BATCH_WIDTH + 1;
+  // The acceptance model and the cycle costs cover the longest served
+  // block; a shorter block's positions read the first of each.
+  static constexpr uint32_t kCosts =
+      SPLASH_DRAFT_BLOCK_ROWS_LIMIT * SPLASH_MAXIMUM_BATCH_WIDTH + 1;
   float slope = 1.0F;
-  std::array<float, SPLASH_DRAFT_PROPOSAL_TOKENS> intercepts{};
+  std::array<float, SPLASH_DRAFT_BLOCK_PROPOSALS_LIMIT> intercepts{};
   std::array<float, kCosts> costs{};
   bool everyRow = true;
 };
@@ -65,22 +68,35 @@ struct DraftCodebooks final {
 // confidence at each position as it walks.
 class DraftSelector final {
 public:
-  explicit DraftSelector(uint32_t vocabulary);
+  // The selector keeps the layout's candidates per proposal position, one
+  // instantiation per count: the shipped drafts keep 16, Ripple's 32.
+  // `rows` is the served draft's block (the rows a cycle drafts): the
+  // shipped drafts' 8, a 16-row variant's 16.
+  explicit DraftSelector(uint32_t vocabulary, uint32_t candidates,
+                         uint32_t rows = SPLASH_DRAFT_QUERY_ROWS);
+  [[nodiscard]] uint32_t rows() const noexcept { return rows_; }
+  [[nodiscard]] uint32_t positions() const noexcept { return rows_ - 1; }
 
   // Exact scratch/output bytes for that many proposal positions.
-  [[nodiscard]] static DraftSelectorWorkspace workspace(uint32_t positions);
+  [[nodiscard]] static DraftSelectorWorkspace workspace(uint32_t positions,
+                                                        uint32_t candidates);
 
   void add(metal::CommandGraph &graph, const DraftSelectorBuffers &buffers,
-           const DraftCodebooks &codebooks, std::span<const uint32_t> anchors,
+           const DraftCodebooks &codebooks, uint32_t candidates,
+           std::span<const uint32_t> anchors,
            std::span<const SamplingPolicy> policies) const;
   // After add: each lane's verify rows (a uint32 per lane in `verifyRows`) by
   // `model` from its confidences, at most maximumRows[lane] of them.
-  static void addVerifyRows(metal::CommandGraph &graph, const metal::MetalBuffer &confidence,
-                            const metal::MetalBuffer &verifyRows, const VerifyRowsModel &model,
-                            std::span<const uint32_t> maximumRows);
+  void addVerifyRows(metal::CommandGraph &graph, const metal::MetalBuffer &confidence,
+                     const metal::MetalBuffer &verifyRows, const VerifyRowsModel &model,
+                     std::span<const uint32_t> maximumRows) const;
 
 private:
   uint32_t vocabulary_ = 0;
+  uint32_t candidates_ = SPLASH_DRAFT_CANDIDATES;
+  // The served draft's block: the rows a cycle drafts (the shipped drafts'
+  // 8, a 16-row variant's 16); its positions are rows - 1.
+  uint32_t rows_ = SPLASH_DRAFT_QUERY_ROWS;
 };
 
 } // namespace splash::ops

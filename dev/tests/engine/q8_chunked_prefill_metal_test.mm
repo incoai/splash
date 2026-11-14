@@ -186,7 +186,7 @@ Case makeCase(id<MTLDevice> device, uint32_t committed, uint32_t chunk,
   const auto geometry = HostKvExtents::spread(2 * pages + 1);
   result.pool = std::make_unique<Pool>(device, geometry);
   result.pageTable = HostKvExtents::mixedPages(geometry, pages, committed + chunk);
-  result.params = {committed, chunk, stride, pages,
+  result.params = {committed, chunk, stride, pages, 0,
                    result.pool->pages->layer(kLayer)};
   require(chunkedPrefillValidationError(result.params).empty(),
           "invalid generated params");
@@ -786,7 +786,7 @@ void testBatchedVerifyStore(id<MTLDevice> device, id<MTLCommandQueue> queue,
   auto *keys = static_cast<BFloat16Bits *>(chunkKeys.contents);
   auto *values = static_cast<BFloat16Bits *>(chunkValues.contents);
   for (uint32_t lane = 0; lane < lanes; ++lane) {
-    params[lane] = {committed, rows, stride, 2, pool.pages->layer(kLayer)};
+    params[lane] = {committed, rows, stride, 2, 0, pool.pages->layer(kLayer)};
     tables[lane] = {ids[lane * 2], ids[lane * 2 + 1]};
     tableBuffers[lane] = makeBuffer(device, 2 * sizeof(SplashKvPage));
     pool.pages->writeTable(tables[lane], tableBuffers[lane].contents);
@@ -875,7 +875,7 @@ void testContract() {
   static_assert(offsetof(PrefillAttentionParams, split_count) == 24);
   static_assert(offsetof(PrefillAttentionParams, block_stride) == 28);
   static_assert(offsetof(PrefillAttentionParams, block_list) == 32);
-  ChunkedPrefillParams params{129, 8, 32, 5, {}};
+  ChunkedPrefillParams params{129, 8, 32, 5, 0, {}};
   require(chunkedPrefillValidationError(params).empty(),
           "partial committed page must be a valid direct-Q8 input");
   require(chunkedPrefillRequiredPages(params) == 5,
@@ -884,18 +884,23 @@ void testContract() {
   require(chunkedPrefillValidationError(params) == "page_table_too_short",
           "short page table was accepted");
 
+  // The speculative scratch holds the longest served block's proposals past
+  // the logical ceiling; the boundary is the last committed position whose
+  // whole block fits it.
+  const uint32_t scratch = SPLASH_DRAFT_BLOCK_PROPOSALS_LIMIT;
   ChunkedPrefillParams finalCycle{
-      splash::kv::kMaximumLogicalTokens - 1,
+      splash::kv::kMaximumLogicalTokens + scratch - splash::kv::kVerifyRows,
       splash::kv::kVerifyRows,
       32,
       (splash::kv::kMaximumPhysicalTokens + kPageTokens - 1) /
           kPageTokens,
+      0,
       {}};
   require(chunkedPrefillValidationError(finalCycle).empty(),
           "the final cycle's verification rows exceeded physical KV scratch");
   ++finalCycle.committed_tokens;
   require(chunkedPrefillValidationError(finalCycle) == "context_out_of_range",
-          "physical KV scratch exceeded its fixed seven-row allowance");
+          "physical KV scratch exceeded its block-row allowance");
 }
 
 void run(const char *libraryPath) {

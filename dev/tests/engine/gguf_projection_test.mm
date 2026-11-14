@@ -31,6 +31,7 @@
 //   64-input coefficient units, which two partitions split into one and two.
 // Every run leaves the padding columns past its segments, the guard bands past its buffers and its counters as they
 // were. The token gather (ops::Embedding) of every format's rows as stored is checked here too.
+#include <iostream>
 #include "GgufFormatReference.hpp"
 #include "LinearNumerics.hpp"
 #include "TestBuffers.hpp"
@@ -117,6 +118,8 @@ const char *epilogueName(LinearEpilogue e) {
     case LinearEpilogue::Residual: return "residual";
     case LinearEpilogue::GateUp: return "gate/up";
     case LinearEpilogue::UpWithGate: return "up-with-gate";
+    case LinearEpilogue::ClampedGateUp: return "clamped gate/up";
+    case LinearEpilogue::ClampedUpWithGate: return "clamped up-with-gate";
   }
   return "?";
 }
@@ -244,6 +247,11 @@ double siluError(double gate) {
   return (2 * (3 + std::floor(2 * t)) + 2 * std::log(2.0) * t + 1 + 2 * 2.5) * 0x1p-24;
 }
 double silu(double g) { return g / (1 + std::exp(-g)); }
+// The clamp a clamped epilogue applies to one activation: to the sum's
+// interval, elementwise.
+Interval clamped(Interval v, float limit) {
+  return {std::max(v.lo, double(-limit)), std::min(v.hi, double(limit))};
+}
 // fl(bf16(up) * silu_gate(gate)): the corners of bf16(up)'s interval times silu's. The fast-math division is only
 // bounded for divisors up to 2^126, which 1 + exp2(t) exceeds from t = 126, and the kernels' fp32 flushes values below
 // its normal range to zero: there either factor, and a product below that range, may be zero.
@@ -333,9 +341,16 @@ struct Operands {
     if (plan.workload().epilogue == LinearEpilogue::UpWithGate) gate = bfloats(backend, auxiliary);
   }
   [[nodiscard]] LinearBuffers bindings(const LinearPlan &plan, const Scratch &scratch) const {
-    const bool residual = plan.workload().epilogue == LinearEpilogue::Residual;
-    return {.input = input.view, .output = output.view, .residual = residual ? aux.view : MetalBuffer{},
-            .gateScratch = gate.view, .scratch = scratch.bindings()};
+    const LinearEpilogue epilogue = plan.workload().epilogue;
+    const bool residual = epilogue == LinearEpilogue::Residual;
+    const bool clamped = epilogue == LinearEpilogue::ClampedGateUp ||
+                         epilogue == LinearEpilogue::ClampedUpWithGate;
+    return {.input = input.view,
+            .output = output.view,
+            .residual = residual ? aux.view : MetalBuffer{},
+            .gateScratch = gate.view,
+            .scratch = scratch.bindings(),
+            .clamp = clamped ? 20.0F : std::numeric_limits<float>::infinity()};
   }
 };
 
@@ -411,6 +426,18 @@ void checkValues(const Outcome &out, const Want &want, const Want &gate, const s
         case LinearEpilogue::GateUp:
           check("the gate", i, out.gate[i], gate(i));
           check("the output", i, out.output[i], withGate(p, bf16ToFloat(out.gate[i])));
+          break;
+        // The clamped epilogues clamp both activations at the plan's
+        // threshold before the silu and the product; the gate scratch holds
+        // its unclamped sums.
+        case LinearEpilogue::ClampedUpWithGate:
+          check("the output", i, out.output[i],
+                withGate(clamped(p, 20.0F), std::clamp(bf16ToFloat(aux[i]), -20.0F, 20.0F)));
+          break;
+        case LinearEpilogue::ClampedGateUp:
+          check("the gate", i, out.gate[i], gate(i));
+          check("the output", i, out.output[i],
+                withGate(clamped(p, 20.0F), std::clamp(bf16ToFloat(out.gate[i]), -20.0F, 20.0F)));
           break;
       }
     }
@@ -1514,7 +1541,7 @@ void tokenGather(MetalBackend &backend) {
     const Guarded ids(backend, tokens.size() * sizeof(uint32_t), 0), output(backend, tokens.size() * kHidden * 2, 0xFF);
     std::memcpy(ids.view.contents(), tokens.data(), ids.bytes);
     CommandGraph graph;
-    Embedding::add(graph, ids.view, table, output.view, uint32_t(tokens.size()));
+    Embedding::add(graph, ids.view, table, output.view, uint32_t(tokens.size()), 1.0F);
     static_cast<void>(backend.submitCommandAsync(graph.dispatches()).wait());
     if (!output.intact()) fail(std::string(fmtName(f)) + " gather writes past its output");
     const std::vector<uint16_t> got = output.halves();
@@ -1536,7 +1563,7 @@ void tokenGather(MetalBackend &backend) {
     const Guarded ids(backend, tokens.size() * sizeof(uint32_t), 0), output(backend, tokens.size() * hidden * 2, 0xFF);
     std::memcpy(ids.view.contents(), tokens.data(), ids.bytes);
     CommandGraph graph;
-    Embedding::add(graph, ids.view, table, output.view, uint32_t(tokens.size()));
+    Embedding::add(graph, ids.view, table, output.view, uint32_t(tokens.size()), 1.0F);
     static_cast<void>(backend.submitCommandAsync(graph.dispatches()).wait());
     if (!output.intact()) fail(name + " gather writes past its output");
     const std::vector<uint16_t> got = output.halves();

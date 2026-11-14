@@ -112,6 +112,12 @@ struct GdnTapeLane final {
   // The previous step's rows the lane retained, which the state does not
   // hold yet: 0 after a prefill or a restore.
   uint32_t pendingRows = 0;
+  // A second segment of pending rows, on its own tape in
+  // GdnDecodeBuffers::secondTape, which fold after the first segment's: a
+  // 16-row verify's first sub-pass leaves its rows there while the second
+  // sub-pass's step folds both. 0 for the shipped 8-row cycles.
+  uint64_t secondSlot = 0;
+  uint32_t secondRows = 0;
 };
 
 [[nodiscard]] uint64_t gdnTapeLayerBytes(const GdnShape &shape) noexcept;
@@ -122,6 +128,7 @@ struct GdnDecodeBuffers final {
   std::span<const metal::MetalBuffer> currentStates;
   std::span<const metal::MetalBuffer> nextStates;
   metal::MetalBuffer tape;
+  metal::MetalBuffer secondTape;
   std::span<const GdnTapeLane> tapeLanes;
   metal::MetalBuffer decayWeights;
   metal::MetalBuffer timeBias;

@@ -28,8 +28,8 @@ namespace splash::engine {
 // (plannedCheckpoints) by default: two draft windows balance recovery
 // granularity and capture work.
 inline constexpr uint32_t kPrefillCheckpointTokens =
-    2 * model::ExecutionLimits::draftContextTokens;
-static_assert(kPrefillCheckpointTokens >= model::ExecutionLimits::draftContextTokens &&
+    2 * model::ExecutionLimits::draftWindowLimit;
+static_assert(kPrefillCheckpointTokens >= model::ExecutionLimits::draftWindowLimit &&
                   kPrefillCheckpointTokens % KvCache::pageTokens == 0,
               "a prefill checkpoint interval spans a draft window and whole KV pages");
 // How long a request waits for memory before it fails, and a resident
@@ -65,8 +65,10 @@ struct EngineConfig final {
   // only where one layer of a group, or a cut at its floor rows, does
   // (Scheduler). Finite and positive.
   double decodeGapMilliseconds = 500.0;
-  // The prefill checkpoint interval and the resource wait limit.
-  uint32_t prefillCheckpointTokens = kPrefillCheckpointTokens;
+  // The prefill checkpoint interval and the resource wait limit. Zero
+  // derives the interval from the served model's draft ring: two of its
+  // draft windows, whole KV pages, at most kPrefillCheckpointTokens.
+  uint32_t prefillCheckpointTokens = 0;
   double resourceWaitTimeoutMilliseconds = kResourceWaitTimeoutMilliseconds;
   // The governor that admits the engine's memory and whose ledger holds
   // the requests' claims on it (ClaimHandle), which connectToGovernor sets.
@@ -1101,7 +1103,7 @@ private:
   // reaches its first state boundary first; what lies past it follows once
   // that state has its buffers (reserveCaptures).
   [[nodiscard]] static uint64_t workEndOf(const Request &active, const BatchItem &scheduled,
-                                          bool prefill) noexcept;
+                                          bool prefill, uint32_t decodeRows) noexcept;
   // Beside a lane of its command that ended, a lane gives that command up in
   // place of its suspension; the next tick plans again either way.
   [[nodiscard]] Prepared yieldLane(Request &lane, uint64_t workEnd,

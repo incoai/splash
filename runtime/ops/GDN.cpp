@@ -207,6 +207,8 @@ PreparedInput GDN::addDecode(metal::CommandGraph &graph, GdnDecodeBuffers buffer
                               state.convolutionStateBytes,
                               {},
                               {},
+                              {},
+                              {},
                               {}};
   // Each lane reads its pending rows' tape of this layer and writes its
   // step's; no step's tape may overlap a tape another lane, or the step's own
@@ -220,13 +222,18 @@ PreparedInput GDN::addDecode(metal::CommandGraph &graph, GdnDecodeBuffers buffer
   const auto overlaps = [&](uint64_t a, uint64_t b) { return a < b + tapeBytes && b < a + tapeBytes; };
   for (uint32_t lane = 0; lane < lanes; ++lane) {
     const GdnTapeLane &tape = buffers.tapeLanes[lane];
-    if (tape.pendingSlot > lastSlot || tape.stepSlot > lastSlot)
+    if (tape.pendingSlot > lastSlot || tape.stepSlot > lastSlot ||
+        tape.secondSlot > lastSlot)
       throw std::invalid_argument("invalid GDN decode tape");
     params.pending_tape[lane] = tape.pendingSlot + layerOffset;
     params.step_tape[lane] = tape.stepSlot + layerOffset;
     params.pending_rows[lane] = tape.pendingRows;
-    if (tape.pendingRows > SPLASH_TARGET_VERIFY_ROWS || params.pending_tape[lane] % 16 ||
-        params.step_tape[lane] % 16)
+    params.second_tape[lane] = tape.secondSlot + layerOffset;
+    params.pending_rows_second[lane] = tape.secondRows;
+    if (tape.pendingRows > SPLASH_TARGET_VERIFY_ROWS ||
+        tape.secondRows > SPLASH_TARGET_VERIFY_ROWS ||
+        params.pending_tape[lane] % 16 || params.step_tape[lane] % 16 ||
+        params.second_tape[lane] % 16)
       throw std::invalid_argument("invalid GDN decode tape");
     for (uint32_t other = 0; other <= lane; ++other)
       if (overlaps(params.step_tape[lane], params.pending_tape[other]) ||
@@ -234,6 +241,8 @@ PreparedInput GDN::addDecode(metal::CommandGraph &graph, GdnDecodeBuffers buffer
           (other != lane && overlaps(params.step_tape[lane], params.step_tape[other])))
         throw std::invalid_argument("invalid GDN decode tape");
     requireBytes(buffers.tape, std::max(params.pending_tape[lane], params.step_tape[lane]) + tapeBytes, "GDN tape");
+    if (params.pending_rows_second[lane])
+      requireBytes(buffers.secondTape, params.second_tape[lane] + tapeBytes, "GDN second tape");
   }
   std::vector<metal::MetalBuffer> bindings{buffers.packed,
                                            buffers.convolutionWeights};
@@ -245,7 +254,8 @@ PreparedInput GDN::addDecode(metal::CommandGraph &graph, GdnDecodeBuffers buffer
   appendLaneBindings(bindings, buffers.currentStates, buffers.nextStates);
   requireStates(shape, state, layer, lanes, buffers.currentStates, buffers.nextStates);
   bindings.insert(bindings.end(),
-                  {buffers.tape, buffers.decayWeights, buffers.timeBias, buffers.mixerNorm.buffer,
+                  {buffers.tape, buffers.secondTape ? buffers.secondTape : buffers.tape,
+                   buffers.decayWeights, buffers.timeBias, buffers.mixerNorm.buffer,
                    buffers.hidden, buffers.verifyRows});
   if (prepare)
     bindings.insert(bindings.end(), {buffers.linearScratch.input, buffers.linearScratch.sums});

@@ -263,7 +263,7 @@ uint32_t Engine::nextCommandPages(const Request &active) const {
   const uint64_t end =
       scheduler_.phase(id) == Phase::Prefill
           ? std::min<uint64_t>(scheduler_.promptProcessed(id) + model_.commandLimits().commandRows, active.promptTokens)
-          : active.exactTokens.size() + model::ExecutionLimits::targetVerifyRows;
+          : active.exactTokens.size() + 2 * model_.draftRows();
   return static_cast<uint32_t>((end + KvCache::pageTokens - 1) / KvCache::pageTokens);
 }
 
@@ -609,7 +609,8 @@ std::optional<Engine::Denied> Engine::reserveReads(Request &active, const BatchI
   const auto memory = allocate([&] { return model_.reserveSpilledReads(id, need); }, spec, Refusal::Waits);
   if (memory.admission.granted())
     return std::nullopt;
-  return Denied{id, workEndOf(active, scheduled, plan.prefill), memory.denial, std::nullopt,
+  return Denied{id, workEndOf(active, scheduled, plan.prefill, model_.draftRows()),
+                    memory.denial, std::nullopt,
                 plan.prefill ? "prefill history staging" : "hot KV cache"};
 }
 

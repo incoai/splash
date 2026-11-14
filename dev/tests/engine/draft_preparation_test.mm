@@ -117,7 +117,8 @@ void checkMaskEmbedding(MetalBackend &backend, const std::filesystem::path &root
       backend.allocateBuffer(rows * rowBytes, splash::metal::BufferStorage::Shared, "draft input rows");
   std::memset(input.contents(), 0xA5, rows * rowBytes);
   splash::metal::CommandGraph graph;
-  ops::Embedding::addDraftMaskRows(graph, draft.maskEmbedding, input, layout.hiddenSize, lanes);
+  ops::Embedding::addDraftMaskRows(graph, draft.maskEmbedding, input, layout.hiddenSize, lanes,
+                                   SPLASH_TARGET_VERIFY_ROWS);
   (void)backend.submitCommandAsync(graph.dispatches()).wait();
   const std::vector<uint8_t> written = bytesOf(model::contentsOf(input));
   bool set = true;

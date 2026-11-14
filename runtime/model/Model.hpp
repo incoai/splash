@@ -297,7 +297,8 @@ struct DispatchDraftCapturePlan final {
 // there.
 [[nodiscard]] DraftContextPlan
 planDraftContext(uint32_t replayBegin, uint32_t replayEnd,
-                 std::span<const uint32_t> materializationBoundaries);
+                 std::span<const uint32_t> materializationBoundaries,
+                 uint32_t draftWindow);
 
 [[nodiscard]] DispatchDraftCapturePlan
 draftCaptureSpansForDispatch(const DraftContextPlan &plan,
@@ -623,12 +624,15 @@ struct ExecutionLimits final {
   static constexpr uint32_t draftProposalTokens = SPLASH_DRAFT_PROPOSAL_TOKENS;
   static constexpr uint32_t targetVerifyRows = SPLASH_TARGET_VERIFY_ROWS;
   static constexpr uint32_t draftContextTokens = SPLASH_DRAFT_SLIDING_WINDOW;
+  // The longest ring the compiled draft variants keep (metal/abi/DraftAttention.h):
+  // correctness reads a model's draft layout's window, engine sizing this.
+  static constexpr uint32_t draftWindowLimit = 4096;
   // The most target layers a DFlash2 draft reads (its target_layer_ids).
   static constexpr uint32_t maximumDraftTargetLayers = 8;
   static constexpr uint32_t speculativeScratchTokens = SPLASH_SPECULATIVE_SCRATCH_TOKENS;
   // One step emits at most its retained verify rows plus a terminal anchor
   // (a stop token or the last budgeted token) that never receives a KV row.
-  static constexpr uint32_t maximumStepTokens = targetVerifyRows + 1;
+  static constexpr uint32_t maximumStepTokens = SPLASH_DRAFT_BLOCK_ROWS_LIMIT + 1;
   // Direct finite-option scoring (SemIf/Jev): a score-only request carries
   // 2..255 distinct token ids and returns their raw final-position logits.
   static constexpr uint32_t minimumScoreOptions = 2;
@@ -863,6 +867,22 @@ public:
   // buffers, and no value when no number of states does (a buffer no cached
   // state holds, such as Qwen's draft rings).
   [[nodiscard]] virtual std::optional<uint32_t> statesToActivate() const noexcept { return 0; }
+  // The draft ring's slots the served model's draft keeps (its compiled
+  // variant's window), which its context plans and length checks read. A
+  // model that does not state its ring keeps the shipped drafts'.
+  [[nodiscard]] virtual uint32_t draftWindow() const noexcept {
+    return SPLASH_DRAFT_SLIDING_WINDOW;
+  }
+  // The rows a draft cycle drafts and its target verifies (the compiled
+  // variant's block): the draft's proposals are rows 1..rows-1 of its input
+  // and the verify runs all rows through the target. The shipped drafts keep
+  // the ABI's 8-row block; a variant trained for longer blocks returns its
+  // own, which the verify kernels compile a geometry for.
+  [[nodiscard]] virtual uint32_t draftRows() const noexcept {
+    return SPLASH_DRAFT_QUERY_ROWS;
+  }
+  [[nodiscard]] uint32_t draftProposalTokens() const noexcept { return draftRows() - 1; }
+  [[nodiscard]] uint32_t targetVerifyRows() const noexcept { return draftRows(); }
   // The bytes releaseIdleBuffer(keepLane), called until it gives none,
   // releases once the cache has let go of `evictedStates` more cached states,
   // whose buffers return to the pool: the pooled buffers, beyond those one

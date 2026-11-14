@@ -556,7 +556,7 @@ void checkSplitCounts(metal::MetalBackend &backend, kv::Format format, bool int8
     std::memset(staging.output.contents(), 0xff, staging.output.sizeBytes());
     std::array<kv::VerifyAttentionParams, 4> params{};
     for (uint32_t lane = 0; lane < 3; ++lane)
-      params[lane] = {histories[lane], uint32_t(data.pages[lane].size()), data.layer, splits, splits, 0, 0};
+      params[lane] = {histories[lane], uint32_t(data.pages[lane].size()), data.layer, splits, splits, 0, 0, 0};
     metal::CommandGraph graph;
     graph.add(plan.splitPipeline,
               {staging.queries, partials, statistics, data.tables[0], data.tables[1], data.tables[2], data.tables[3]},

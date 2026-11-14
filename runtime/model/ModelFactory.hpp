@@ -30,7 +30,7 @@ class QwenStateStorage;
 class SsdReaders;
 class VisionLoader;
 
-using TargetWeights = std::variant<Qwen3_8Weights, Qwen3_6MoeWeights, Qwen4ExpWeights, FlintWeights>;
+using TargetWeights = std::variant<Qwen3_8Weights, Qwen3_6MoeWeights, Qwen4ExpWeights, FlintWeights, RippleWeights>;
 
 // How a model loads beside its descriptor: with streamedTableBytes, the rows
 // of a table the target's GGUF holds (model/ModelSizing.hpp) stream from its
@@ -147,6 +147,7 @@ void requireCompatibleModel(const LoadedModel &model);
 [[nodiscard]] SparseRowStoreOptions streamedTableRows(const Qwen3_8Layout &layout);
 [[nodiscard]] SparseRowStoreOptions streamedTableRows(const Qwen3_6MoeLayout &layout);
 [[nodiscard]] SparseRowStoreOptions streamedTableRows(const FlintLayout &layout);
+[[nodiscard]] SparseRowStoreOptions streamedTableRows(const RippleLayout &layout);
 
 // The vision role's source, planned; null for a model without vision.
 [[nodiscard]] std::unique_ptr<VisionLoader> planVisionLoader(const std::filesystem::path &root,

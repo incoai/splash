@@ -83,14 +83,28 @@ struct QwenLogicalLengths final {
 
 struct QwenLaneMetadata final {
   uint64_t requestId = 0;
+  // The GDN cell parity: current() reads cell `activeParity`, next() writes
+  // the other.
   uint32_t activeParity = 0;
   QwenLogicalLengths lengths;
   // The rows of the lane's last decode step it retained, which its current
-  // cell does not hold: they wait on the lane's tape for its next decode step
-  // (ops::GdnTapeLane). Zero after a prefill step or a restore.
+  // cell does not hold: they wait on the lane's tape for its next decode
+  // step (ops::GdnTapeLane). Zero after a prefill step or a restore. A
+  // 16-row block's rows past the first eight wait on a second tape slot:
+  // `tapePendingSecond` holds them, `pendingRowsSecond` their count.
   uint32_t pendingRows = 0;
+  uint32_t pendingRowsSecond = 0;
+  // The tape slots (gdnTapeSlot) the pending segments wait on; the second
+  // is meaningful only while `pendingRowsSecond` is.
+  uint32_t tapePending = 0;
+  uint32_t tapePendingSecond = 0;
 
   [[nodiscard]] bool assigned() const noexcept { return requestId != 0; }
+  // The tape slot this cycle's first sub-pass's rows go to: neither pending
+  // segment's.
+  [[nodiscard]] uint32_t stepTapeSlot() const noexcept {
+    return (tapePending + (pendingRowsSecond ? 2u : 1u)) % 3u;
+  }
 };
 
 class QwenStateStorage;
@@ -296,10 +310,13 @@ public:
   // next() current. swapParity: a prefill step's, which read the lane's
   // whole state (no pending rows) and holds its every row. swapDecodeParity:
   // a decode step's, which folded the pending rows in and holds the state
-  // before its own rows, `retainedRows` (1 to 8) of which wait on the tape.
+  // before its own rows; `retainedRows` (1 to the served block's rows) wait
+  // on tape slot `stepSlot`, and a 16-row block's rows past the first eight
+  // on `secondSlot` (`secondRows` of them).
   void updateLengths(uint32_t lane, QwenLogicalLengths lengths);
   void swapParity(uint32_t lane);
-  void swapDecodeParity(uint32_t lane, uint32_t retainedRows);
+  void swapDecodeParity(uint32_t lane, uint32_t retainedRows, uint32_t secondRows,
+                        uint32_t stepSlot, uint32_t secondSlot);
 
   // Copies committed state into a pooled or newly admitted cache slot while
   // the lane retains its own cells; it throws for a lane with pending rows,

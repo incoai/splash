@@ -22,20 +22,27 @@ void validate(LinearWorkload w) {
     throw std::invalid_argument("invalid linear matrix");
   if (w.phase == LinearPhase::Prefill) {
     if (!w.rows || w.rows > SPLASH_PREFILL_TOKEN_BUDGET ||
-        w.epilogue == LinearEpilogue::GateUp)
+        (w.epilogue == LinearEpilogue::GateUp || w.epilogue == LinearEpilogue::ClampedGateUp))
       throw std::invalid_argument("invalid linear prefill workload");
   } else {
-    if (!w.rows || w.rows % SPLASH_TARGET_VERIFY_ROWS ||
-        w.rows > SPLASH_TARGET_VERIFY_ROWS * SPLASH_MAXIMUM_BATCH_WIDTH ||
+    if (!w.rows || w.rows > SPLASH_DRAFT_BLOCK_ROWS_LIMIT * SPLASH_MAXIMUM_BATCH_WIDTH ||
+        (w.rows % SPLASH_TARGET_VERIFY_ROWS && w.rows != 1) ||
         w.epilogue == LinearEpilogue::UpWithGate)
       throw std::invalid_argument("invalid linear decode workload");
   }
 }
 
-LinearWorkload decode(LinearMatrix matrix, uint32_t lanes, LinearEpilogue epilogue) {
+LinearWorkload decode(LinearMatrix matrix, uint32_t lanes, LinearEpilogue epilogue, uint32_t rows) {
   if (!lanes || lanes > SPLASH_MAXIMUM_BATCH_WIDTH)
     throw std::invalid_argument("invalid linear decode batch width");
-  return {matrix, lanes * SPLASH_TARGET_VERIFY_ROWS, LinearPhase::Decode, epilogue};
+  // rows 0 keeps the ABI's block: a whole-block head passes its own count.
+  // An initial selection's head runs one row per lane; a whole block's
+  // carries lanes x the block's rows. Both are whole rows per lane.
+  if (!rows)
+    rows = lanes * SPLASH_TARGET_VERIFY_ROWS;
+  if (rows % lanes)
+    throw std::invalid_argument("invalid linear decode rows");
+  return {matrix, rows, LinearPhase::Decode, epilogue};
 }
 
 // LinearScratch::rotated bytes of `rows` bf16 rows of `width` inputs, which
@@ -128,7 +135,10 @@ uint64_t LinearPlan::gateScratchBytes() const noexcept {
   // Gate/up runs as a gate pass into the gate scratch and an up-with-gate
   // pass, but in one pass (LinearConfig::oneGateUpPass).
   const bool needed = workload_.epilogue == LinearEpilogue::UpWithGate ||
-                      (workload_.epilogue == LinearEpilogue::GateUp && !config_.oneGateUpPass);
+                      workload_.epilogue == LinearEpilogue::ClampedUpWithGate ||
+                      ((workload_.epilogue == LinearEpilogue::GateUp ||
+                        workload_.epilogue == LinearEpilogue::ClampedGateUp) &&
+                       !config_.oneGateUpPass);
   return needed ? uint64_t{storageRows()} * workload_.matrix.outputSize * 2 : 0;
 }
 
@@ -150,7 +160,7 @@ uint32_t Linear::decodeStorageRows(uint32_t rows, ProjectionShape shape) const {
   // counts both tensors' columns in one pass and may stage where they do not.
   UnitFormats unit = unitFormats(shape);
   uint32_t storage = 0;
-  for (const auto epilogue : {LinearEpilogue::None, LinearEpilogue::GateUp}) {
+  for (const auto epilogue : {LinearEpilogue::None, LinearEpilogue::GateUp, LinearEpilogue::ClampedGateUp}) {
     const LinearWorkload w{{shape.outputSize, shape.inputSize}, rows, LinearPhase::Decode, epilogue};
     validate(w);
     unit.oneFormat = epilogue == LinearEpilogue::GateUp;
@@ -171,7 +181,8 @@ LinearPlan Linear::plan(LinearWorkload w, const Projection &p, const Projection 
   const std::array<const Projection *, 2> projections{&p, gate};
   // A gate/up pair's 16-row tile follows its tensors' own formats.
   std::array<UnitFormats, 2> tensors{};
-  const bool pair = w.epilogue == LinearEpilogue::GateUp && gate;
+  const bool pair =
+      (w.epilogue == LinearEpilogue::GateUp || w.epilogue == LinearEpilogue::ClampedGateUp) && gate;
   if (pair) tensors = {unitFormats(std::span(&projections[0], 1)), unitFormats(std::span(&projections[1], 1))};
   LinearPlan plan(w,
                   selectProjection(calibration_, int8Activations_, w, unitFormats(projections),
@@ -182,8 +193,8 @@ LinearPlan Linear::plan(LinearWorkload w, const Projection &p, const Projection 
 }
 
 LinearPlan Linear::decodePlan(const Projection &p, uint32_t lanes, LinearEpilogue epilogue,
-                              const Projection *gate) const {
-  return plan(decode({p.outputSize, p.inputSize}, lanes, epilogue), p, gate);
+                              const Projection *gate, uint32_t rows) const {
+  return plan(decode({p.outputSize, p.inputSize}, lanes, epilogue, rows), p, gate);
 }
 LinearPlan Linear::prefillPlan(const Projection &p, uint32_t rows, LinearEpilogue epilogue,
                                uint32_t chunkRows) const {
@@ -199,9 +210,12 @@ LinearPlan Linear::prefillPlan(const Projection &p, uint32_t rows, LinearEpilogu
 LinearScratchSize Linear::decodeScratchSize(ProjectionShape shape) const {
   LinearScratchSize bound;
   for (uint32_t lanes = 1; lanes <= SPLASH_MAXIMUM_BATCH_WIDTH; ++lanes)
-    for (const auto epilogue : {LinearEpilogue::None, LinearEpilogue::Residual, LinearEpilogue::GateUp})
-      bound.include(
-          ggufDecodeScratchSize(decode({shape.outputSize, shape.inputSize}, lanes, epilogue), shape.registerFormats));
+    for (const auto epilogue : {LinearEpilogue::None, LinearEpilogue::Residual, LinearEpilogue::GateUp,
+                                LinearEpilogue::ClampedGateUp})
+      for (const uint32_t rows : {0u, lanes * SPLASH_DRAFT_BLOCK_ROWS_LIMIT})
+        bound.include(
+            ggufDecodeScratchSize(decode({shape.outputSize, shape.inputSize}, lanes, epilogue, rows),
+                                  shape.registerFormats));
   // Decode plans store at most every lane's rows.
   if (shape.rotated) bound.rotated = rotatedBytes(shape.inputSize, kMaximumDecodeTileRows);
   return bound;
@@ -212,7 +226,8 @@ LinearScratchSize Linear::prefillScratchSize(ProjectionShape shape) const {
   // Prefill plans take split scratch only in chunks that run the staged tile,
   // of up to kMaximumStagedPrefillRows rows (LinearGguf.cpp).
   for (uint32_t rows = 1; rows <= kMaximumStagedPrefillRows; ++rows)
-    for (const auto epilogue : {LinearEpilogue::None, LinearEpilogue::Residual, LinearEpilogue::UpWithGate})
+    for (const auto epilogue : {LinearEpilogue::None, LinearEpilogue::Residual, LinearEpilogue::UpWithGate,
+                                LinearEpilogue::ClampedUpWithGate})
       bound.include(plan({{shape.outputSize, shape.inputSize}, rows, LinearPhase::Prefill, epilogue}).scratchSize());
   // Every prefill plan stores at most the token budget.
   static_assert(SPLASH_PREFILL_TOKEN_BUDGET % GGUF_PREFILL_ROWS == 0, "the prefill tiles cover the budget exactly");
@@ -236,7 +251,8 @@ PreparedInput Linear::add(metal::CommandGraph &graph, LinearBuffers b,
     const Projection &p, const LinearPlan &selected, const Projection *gate) const {
   const LinearWorkload w = selected.workload();
   const auto [n, k] = w.matrix;
-  if ((w.epilogue == LinearEpilogue::GateUp) != (gate != nullptr))
+  if ((w.epilogue == LinearEpilogue::GateUp || w.epilogue == LinearEpilogue::ClampedGateUp) !=
+      (gate != nullptr))
     throw std::invalid_argument("a gate/up plan takes a gate projection and no other plan does");
   requireLeadingInputs(selected, p);
   if (gate) requireLeadingInputs(selected, *gate);

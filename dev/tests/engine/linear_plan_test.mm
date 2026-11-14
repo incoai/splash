@@ -378,10 +378,14 @@ void ggufPlans() {
   rejects([&] { (void)Linear::plan(down, {.tile = LinearTile::GgufStaged, .splits = 3}, FloatOutput::BFloat16); },
           "staged block splits take whole 32-input groups", "the staged tile split K three ways");
   // The arena bound, of the shape without its formats, covers every lane's
-  // plan; here the 32-row tile's is the largest, which fused and gate/up
-  // plans share.
+  // plan: the 32-row tile's among the shipped drafts' and a whole 16-row
+  // block's 64-row head, which the served block's plans run.
   const ProjectionShape downShape{5120, 17408};
-  require(linear.decodeScratchSize(downShape).partials == three.scratchSize().partials,
+  const LinearPlan wholeBlock =
+      linear.plan({{5120, 17408}, 64, LinearPhase::Decode, LinearEpilogue::Residual},
+                  blockProjection(5120, 17408, 1));
+  require(linear.decodeScratchSize(downShape).partials ==
+              std::max(three.scratchSize().partials, wholeBlock.scratchSize().partials),
           "GGUF decode scratch bound");
   // Float projections take the neural accelerator tile from 1.5 of its
   // 64 x 32 tiles per core for BF16 values, 2 for F32 values and 3 for a
@@ -437,9 +441,14 @@ void ggufPlans() {
   require(m3.ggufFloatTile(2048, 256, QuantizedSegment::kFloat32) == FloatTile::Simdgroup,
           "Apple9 float projections take the simdgroup tile");
   const LinearScratchSize bound = m3.decodeScratchSize(downShape);
+  const LinearPlan m3WholeBlock =
+      m3.plan({down.matrix, 64, LinearPhase::Decode, LinearEpilogue::Residual}, blockProjection(5120, 17408, 1));
   require(bound.partials ==
-              m3.plan({down.matrix, 32, LinearPhase::Decode, LinearEpilogue::Residual}, blockProjection(5120, 17408, 1))
-                  .scratchSize().partials,
+              std::max(m3.plan({down.matrix, 32, LinearPhase::Decode, LinearEpilogue::Residual},
+                               blockProjection(5120, 17408, 1))
+                           .scratchSize()
+                           .partials,
+                       m3WholeBlock.scratchSize().partials),
           "Apple9 GGUF decode scratch bound");
   // Apple9 stages the IQ2, IQ3_XXS and IQ1 formats wherever the staged tile
   // holds the lanes' rows unpadded, and Q2_K from two lanes. A projection
@@ -874,7 +883,8 @@ void scratchBoundsRotated() {
   const Linear linear = gpu(10, 16);
   for (const bool rotated : {false, true}) {
     const ProjectionShape shape{5120, 17408, rotated};
-    require(linear.decodeScratchSize(shape).rotated == (rotated ? uint64_t{17408} * 32 * 2 : 0) &&
+    require(linear.decodeScratchSize(shape).rotated ==
+                    (rotated ? uint64_t{17408} * kMaximumDecodeTileRows * 2 : 0) &&
                 linear.prefillScratchSize(shape).rotated == (rotated ? uint64_t{17408} * 2048 * 2 : 0),
             "rotated scratch bounds");
   }
@@ -1397,7 +1407,7 @@ void leadingInputViews(metal::MetalBackend &backend) {
     metal::CommandGraph graph;
     (void)linear.add(graph, buffersOf(ggufPlan), gguf, ggufPlan);
     const std::string kernel = leadingInputsInstance("gguf_prefill_q5k_r");
-    const GgufPrefillLeadingParams params{{k, rows, n, 0}, wide};
+    const GgufPrefillLeadingParams params{{k, rows, n, 0, std::numeric_limits<float>::infinity()}, wide};
     require(graph.dispatches().size() == 1, "a view of leading inputs did not encode one dispatch");
     const metal::ComputeDispatch &dispatch = graph.dispatches()[0];
     require(dispatch.pipelineName == kernel && dispatch.bytes.size() == 1 &&

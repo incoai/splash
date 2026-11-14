@@ -71,6 +71,11 @@ constexpr std::array kCompiledAttention{
     CompiledAttention{32, 2, 256, kv::Reads::EveryPage, true, false, 32, false, 0, "_kv2_g16", "_kv2_g8"},
     CompiledAttention{24, 2, 256, kv::Reads::SelectedBlocks, true, false, 32, false, 0, "_kv2_g12", "_kv2_vt"},
     CompiledAttention{32, 4, 128, kv::Reads::EveryPage, false, true, 64, true, 512, "_kv4_g8_d128", "_kv4_d128"},
+    // Ripple's: 80 query heads over 8 KV heads of 128, gated, whose 64 of 80
+    // sliding layers read a window of the 1023 keys before a row (its
+    // sliding window of 1024 keys, its own included) and whose other 16
+    // attend every key without RoPE.
+    CompiledAttention{80, 8, 128, kv::Reads::EveryPage, true, false, 64, true, 1023, "_kv8_g10_d128", "_kv8_d128"},
 };
 
 // Whether a compiled geometry's pages are a layout's: its KV heads, head
@@ -414,7 +419,7 @@ void PagedAttention::addPrefillProjection(
   requireBytes(queries, staging.rowBytes(queryHeads / layout.kvHeads, layout.headDimension), "attention query");
   requireBytes(chunkKeys, staging.rowBytes(1, layout.headDimension), "attention key");
   requireBytes(chunkValues, staging.valueBytes(layout.headDimension), "attention value");
-  const FullPrefillParams params{tokens, stride};
+  const FullPrefillParams params{tokens, stride, 0};
   graph.add(qkNormKernel(projectionKernel("prefill", kernel, variant), queryNorm, keyNorm, layout.headDimension),
             projectionBindings(kernel, variant, tokens, std::move(packed), queryNorm, keyNorm, std::move(ropeCos),
                                std::move(ropeSin), std::move(queries), std::move(chunkKeys),
@@ -433,7 +438,7 @@ void PagedAttention::addPrefillGate(
                Staging{layout.kvHeads, stride, tokens}.rowBytes(queryHeads / layout.kvHeads, layout.headDimension),
                "attention row");
   requireBytes(hidden, uint64_t{tokens} * queryHeads * layout.headDimension * 2, "attention hidden");
-  const FullPrefillParams params{tokens, stride};
+  const FullPrefillParams params{tokens, stride, 0};
   const metal::DispatchSize groups{gateGroups(tokens, queryHeads, layout.headDimension), 1, 1};
   if (!kernel.gated) {
     graph.add(kernelName("prefill", "gather", kernel.suffix), {std::move(attention), std::move(hidden)}, params,
@@ -506,7 +511,7 @@ kv::ChunkedPrefillParams PagedAttention::prefillParams(
     throw std::overflow_error("KV logical position exceeds kernel ABI");
   kv::ChunkedPrefillParams params{static_cast<uint32_t>(logicalPosition),
                                   chunkTokens, chunkStride, pageTableEntries,
-                                  {}};
+                                  0, {}};
   const std::string_view error = kv::chunkedPrefillValidationError(params);
   if (!error.empty())
     throw std::invalid_argument(std::string(error));
@@ -514,9 +519,13 @@ kv::ChunkedPrefillParams PagedAttention::prefillParams(
 }
 
 kv::ChunkedPrefillParams PagedAttention::verifyParams(uint64_t logicalPosition,
-                                                      uint32_t pageTableEntries) {
-  return prefillParams(logicalPosition, kv::kVerifyRows,
-                       kv::kVerifyChunkStride, pageTableEntries);
+                                                      uint32_t pageTableEntries,
+                                                      uint32_t rowBase) {
+  kv::ChunkedPrefillParams params = prefillParams(logicalPosition, kv::kVerifyRows,
+                                                  kv::kVerifyChunkStride,
+                                                  pageTableEntries);
+  params.row_base = rowBase;
+  return params;
 }
 
 void PagedAttention::addPrefillStore(
@@ -620,7 +629,7 @@ void PagedAttention::addVerify(metal::CommandGraph &graph, SplashKvLayer layer,
     stores[lane].kv = layer;
     attention[lane] = {chunk.committed_tokens, chunk.page_table_entries, layer,
                        plan.laneSplits[lane], plan.splits, blocks.stride,
-                       blocks.list + lane};
+                       blocks.list + lane, chunk.row_base};
   }
   const auto tables = laneBindings(buffers.pageTables.first(plan.lanes));
   std::vector<metal::MetalBuffer> store{buffers.chunkKeys, buffers.chunkValues};

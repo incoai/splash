@@ -59,8 +59,8 @@ struct QwenTargetDimensions {
   // (NoPE). The attention kernels compile each such variant
   // (ops::AttentionVariant, QwenTargetGeometry::attentionVariant).
   uint32_t slidingWindow = 0;
-  uint64_t slidingLayers = 0;
-  uint64_t unrotatedLayers = 0;
+  kv::LayerMask slidingLayers{};
+  kv::LayerMask unrotatedLayers{};
   uint32_t fullAttentionPeriod = 0;
   // The token whose row a DFlash2 draft's mask rows read
   // (dflash_config.mask_token_id). A family whose vocabulary keeps none for
@@ -110,6 +110,21 @@ struct QwenTargetDimensions {
   uint32_t pleHeadsPerNgram = 0;
   uint32_t pleHeadDimension = 0;
   uint32_t pleConvolutionTaps = 0;
+  // What a config's max_position_embeddings states, where the family serves a
+  // narrower window than the model claims (Ripple's two million against the
+  // window the family serves): zero for a config that states the served one.
+  uint32_t configNativeContextTokens = 0;
+  // Ripple's additions, which the Qwen families leave neutral: the scale of
+  // the token embeddings and of the rows the value residual mixes (its
+  // embed_scale, the square root of the hidden size), the clamp of the
+  // SwiGLU's gate and up activations (its ffn_clamp_threshold), the value
+  // residual each mixer's v input mixes the scaled embeddings into by a
+  // learned per-layer lambda (its use_valres, whose lambda each GGUF holds),
+  // and the norm after each FFN (its post_ffw_norm).
+  float embeddingScale = 0.0F;
+  float swigluClamp = 0.0F;
+  bool valueResidual = false;
+  bool postFfnNorm = false;
 
   [[nodiscard]] constexpr bool
   isFullAttentionLayer(uint32_t layer) const noexcept {
@@ -161,6 +176,7 @@ struct QwenTargetDimensions {
   [[nodiscard]] constexpr uint32_t pleHeads() const noexcept {
     return pleNgram ? (pleNgram - 1) * pleHeadsPerNgram : 0;
   }
+  [[nodiscard]] constexpr bool hasPle() const noexcept { return pleNgram != 0; }
   [[nodiscard]] constexpr uint32_t pleWidth() const noexcept { return pleHeads() * pleHeadDimension; }
   // The PLE convolution's history: (taps - 1) * dilation rows, the dilation
   // being the n-gram size.

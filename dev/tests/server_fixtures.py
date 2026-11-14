@@ -909,6 +909,7 @@ def main_args(**overrides):
             "idle_release": None,
             "max_cache_disk": None,
             "max_cache_disk_writes": 0,
+            "kv_window_trim": "on",
             "persistent_cache": False,
             "cache_dir": None,
             "decode_share": None,

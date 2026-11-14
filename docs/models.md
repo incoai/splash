@@ -29,8 +29,9 @@ and model-card `base_model` fields play no part. Families of one model type,
 Qwen3.6-35B-A3B and Qwen3.5-122B-A10B (`qwen3_5_moe_text`, GGUF `qwen35moe`),
 are told apart by their sizes, and a fine-tune of either, such as
 Ornith-1.5-35B-A3B or Ornith-1.5-122B, is its family. A layout type
-(`Qwen3_8.hpp`, `Qwen3_6Moe.hpp`, `Qwen4Exp.hpp`, `Flint.hpp` in
-`runtime/model/`) is an architecture, whose code its families share, and each
+(`Qwen3_8.hpp`, `Qwen3_6Moe.hpp`, `Qwen4Exp.hpp`, `Flint.hpp`,
+`Ripple.hpp` in `runtime/model/`) is an architecture, whose code its
+families share, and each
 family is a value of it in one list, `model::kFamilies` (`ModelDescriptor.hpp`):
 another size of an architecture is one more value there, built by the
 constructor from a `QwenHybridLayout` its layout type gains with its second

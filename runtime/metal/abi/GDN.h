@@ -78,11 +78,15 @@ struct GDNDecodeBatchParams {
   // Per lane, byte offsets in the tape buffer of this layer's tape of the
   // lane's previous step (the pending rows) and of this step, and how many
   // rows of the previous step the lane retained and its state does not hold
-  // yet.
+  // yet; with a second segment (a 16-row verify's first sub-pass), its tape
+  // in `second_tape` and its rows in `pending_rows_second`, which fold after
+  // the first segment's.
   uint64_t pending_tape[SPLASH_MAXIMUM_BATCH_WIDTH];
   uint64_t step_tape[SPLASH_MAXIMUM_BATCH_WIDTH];
   uint32_t pending_rows[SPLASH_MAXIMUM_BATCH_WIDTH];
+  uint64_t second_tape[SPLASH_MAXIMUM_BATCH_WIDTH];
+  uint32_t pending_rows_second[SPLASH_MAXIMUM_BATCH_WIDTH];
 };
 
-static_assert(sizeof(GDNDecodeBatchParams) == 112,
+static_assert(sizeof(GDNDecodeBatchParams) == 160,
               "GDN decode parameters are 112 bytes on both sides");

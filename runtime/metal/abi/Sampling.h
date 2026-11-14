@@ -17,10 +17,12 @@
 // l * SPLASH_SAMPLING_UNIFORMS.
 #define SPLASH_UNIFORM_INITIAL 0u
 #define SPLASH_UNIFORM_PROPOSALS 1u
+// The acceptance tests and correction draws index by the longest served
+// block's proposals; a shorter block's positions read the first of each.
 #define SPLASH_UNIFORM_ACCEPTANCE                                          \
-  (SPLASH_UNIFORM_PROPOSALS + SPLASH_DRAFT_PROPOSAL_TOKENS)
+  (SPLASH_UNIFORM_PROPOSALS + SPLASH_DRAFT_BLOCK_PROPOSALS_LIMIT)
 #define SPLASH_UNIFORM_CORRECTION                                          \
-  (SPLASH_UNIFORM_ACCEPTANCE + SPLASH_DRAFT_PROPOSAL_TOKENS)
+  (SPLASH_UNIFORM_ACCEPTANCE + SPLASH_DRAFT_BLOCK_PROPOSALS_LIMIT)
 #define SPLASH_SAMPLING_UNIFORMS (SPLASH_UNIFORM_CORRECTION + 1u)
 
 // The stop tokens a target's selections and acceptance compare
@@ -44,6 +46,9 @@ struct TargetSamplingParams {
   uint32_t vocabulary;
   uint32_t mask_words;
   uint32_t rows;
+  // The whole verify block a lane's rows live in (the served draft's rows):
+  // the lane strides of the logits and the constraint masks.
+  uint32_t lane_rows;
   uint32_t logits_row;
   uint32_t mask_row;
   uint32_t uniform;
@@ -60,7 +65,7 @@ struct TargetSamplingParams {
   uint32_t stop_tokens[SPLASH_STOP_TOKENS];
 };
 
-static_assert(sizeof(TargetSamplingParams) == 120,
+static_assert(sizeof(TargetSamplingParams) == 124,
               "Target sampling parameters are 120 bytes on both sides");
 
 // One shard's share of a sampled row's softmax denominator: the largest
@@ -119,6 +124,7 @@ struct SamplingPenaltyParams {
   uint32_t vocabulary;
   uint32_t rows;
   uint32_t row_offset;
+  uint32_t lane_rows;
   uint32_t entries;
   uint32_t logits_lane[SPLASH_MAXIMUM_BATCH_WIDTH];
   uint32_t table_row[SPLASH_MAXIMUM_BATCH_WIDTH];
@@ -128,7 +134,7 @@ struct SamplingPenaltyParams {
   float frequency[SPLASH_MAXIMUM_BATCH_WIDTH];
 };
 
-static_assert(sizeof(SamplingPenaltyParams) == 112,
+static_assert(sizeof(SamplingPenaltyParams) == 116,
               "Sampling penalty parameters are 112 bytes on both sides");
 
 // One selection's thinking cutoffs (ops::SamplingPolicy::thinkingCutoff), its
@@ -150,6 +156,7 @@ struct ThinkingCutoffParams {
   uint32_t vocabulary;
   uint32_t rows;
   uint32_t drafted_rows;
+  uint32_t lane_rows;
   uint32_t sampling_mask;
   uint32_t waiting_mask;
   uint32_t mask_words;
@@ -162,7 +169,7 @@ struct ThinkingCutoffParams {
   uint32_t tokens[SPLASH_MAXIMUM_BATCH_WIDTH][SPLASH_TARGET_VERIFY_ROWS];
 };
 
-static_assert(sizeof(ThinkingCutoffParams) == 220,
+static_assert(sizeof(ThinkingCutoffParams) == 224,
               "Thinking cutoff parameters are 220 bytes on both sides");
 
 // The batched selector and acceptance kernels' grids cover exactly the
@@ -174,10 +181,14 @@ struct SelectorBatchParams {
   uint32_t lanes;
   uint32_t sampling_mask;
   uint32_t vocabulary;
+  // The served draft's block and its proposal positions per cycle (rows
+  // minus one), the lane strides and grid extents of its selection.
+  uint32_t positions;
+  uint32_t rows;
 };
 
-static_assert(sizeof(SelectorBatchParams) == 44,
-              "Draft selector parameters are 44 bytes on both sides");
+static_assert(sizeof(SelectorBatchParams) == 52,
+              "Draft selector parameters are 52 bytes on both sides");
 
 // The rows of its block each lane of a decode cycle verifies (its verify
 // rows, draft_verify_rows), chosen for the whole batch by expected accepted
@@ -197,21 +208,29 @@ static_assert(sizeof(SelectorBatchParams) == 44,
 // most that many tokens.
 struct VerifyRowsParams {
   float slope;
-  float intercept[SPLASH_DRAFT_PROPOSAL_TOKENS];
-  float cost[SPLASH_DRAFT_QUERY_ROWS * SPLASH_MAXIMUM_BATCH_WIDTH + 1];
+  // The acceptance model and the cycle costs cover the longest served
+  // block; a shorter block's positions read the first of each.
+  float intercept[SPLASH_DRAFT_BLOCK_PROPOSALS_LIMIT];
+  float cost[SPLASH_DRAFT_BLOCK_ROWS_LIMIT * SPLASH_MAXIMUM_BATCH_WIDTH + 1];
   uint32_t lanes;
   uint32_t every_row;
   uint32_t maximum[SPLASH_MAXIMUM_BATCH_WIDTH];
+  // The served draft's proposal positions per cycle (its rows minus one).
+  uint32_t positions;
 };
 
-static_assert(sizeof(VerifyRowsParams) == 188,
-              "Verify rows parameters are 188 bytes on both sides");
+static_assert(sizeof(VerifyRowsParams) == 352,
+              "Verify rows parameters are 352 bytes on both sides");
 
 struct AcceptBatchParams {
   uint32_t remaining[SPLASH_MAXIMUM_BATCH_WIDTH];
   uint32_t stop_tokens[SPLASH_STOP_TOKENS];
   uint32_t sampling_mask;
+  // The block's proposal count and rows (the served draft's), the lane
+  // strides of the draft's proposals and the target's verified rows.
+  uint32_t proposal_tokens;
+  uint32_t verify_rows;
 };
 
-static_assert(sizeof(AcceptBatchParams) == 36,
-              "Batched acceptance parameters are 36 bytes on both sides");
+static_assert(sizeof(AcceptBatchParams) == 44,
+              "Batched acceptance parameters are 44 bytes on both sides");

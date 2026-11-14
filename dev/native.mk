@@ -291,6 +291,7 @@ TEST_METAL_TARGETS := $(TEST_DRAFT_PREPARATION) \
 	$(TEST_GDN_DECODE_TEST) \
 	$(TEST_DRAFT_SELECTOR_TEST) \
 	$(TEST_TARGET_SAMPLING_TEST) \
+	$(TEST_RIPPLE_VALUE_MIX) $(TEST_RIPPLE_LOAD) $(TEST_RIPPLE_CHAIN) $(TEST_RIPPLE_PARITY) \
 	$(TEST_VISION_METAL_TEST) \
 	$(TEST_VISION_ATTENTION_TEST) \
 	$(TEST_METAL_BACKEND_TEST) \
@@ -704,6 +705,10 @@ test-engine-metal: $(TEST_METAL_TARGETS)
 	$(METAL_TEST_ENV) $(TEST_GDN_DECODE_TEST) $(LIB)
 	$(METAL_TEST_ENV) $(TEST_DRAFT_SELECTOR_TEST) $(LIB)
 	$(METAL_TEST_ENV) $(TEST_TARGET_SAMPLING_TEST) $(LIB)
+	$(METAL_TEST_ENV) $(TEST_RIPPLE_VALUE_MIX) $(LIB)
+	$(METAL_TEST_ENV) $(TEST_RIPPLE_LOAD) $(LIB)
+	$(METAL_TEST_ENV) $(TEST_RIPPLE_CHAIN) $(LIB)
+	$(METAL_TEST_ENV) $(TEST_RIPPLE_PARITY) $(LIB)
 	$(METAL_TEST_ENV) $(TEST_VISION_METAL_TEST) $(LIB)
 	$(METAL_TEST_ENV) $(TEST_VISION_ATTENTION_TEST) $(LIB)
 	$(METAL_TEST_ENV) $(TEST_METAL_BACKEND_TEST) $(TEST_METAL_BACKEND_LIB)
@@ -976,3 +981,85 @@ test-sanitizers-metal:
 	$(METAL_TSAN_TEST_ENV) $(METAL_TSAN_BUILD)/engine-tests/expert-store $(METAL_TSAN_BUILD)/splash.metallib
 	$(METAL_TSAN_TEST_ENV) $(METAL_TSAN_BUILD)/engine-tests/metal-backend \
 		$(METAL_TSAN_BUILD)/engine-tests/metal-backend.metallib --filter behaviour/
+
+# The Ripple family's engine tests: the tiny model's load and parity gates,
+# the draft kernels' batch control, and the real model's opt-in harnesses
+# (which take the model root and a prompt's tokens as arguments).
+TEST_RIPPLE_VALUE_MIX := $(ENGINE_TEST_BUILD)/ripple-value-mix
+TEST_RIPPLE_LOAD := $(ENGINE_TEST_BUILD)/ripple-load
+TEST_RIPPLE_CHAIN := $(ENGINE_TEST_BUILD)/ripple-chain
+TEST_RIPPLE_PARITY := $(ENGINE_TEST_BUILD)/ripple-parity
+TEST_RIPPLE_REAL := $(ENGINE_TEST_BUILD)/ripple-real
+TEST_RIPPLE_SERVE := $(ENGINE_TEST_BUILD)/ripple-serve
+TEST_RIPPLE_LONG_PREFILL := $(ENGINE_TEST_BUILD)/ripple-long-prefill
+
+$(TEST_RIPPLE_VALUE_MIX): BUILD_CONFIG := $(TEST_CONFIG_DIGEST)
+$(TEST_RIPPLE_LOAD): BUILD_CONFIG := $(TEST_CONFIG_DIGEST)
+$(TEST_RIPPLE_CHAIN): BUILD_CONFIG := $(TEST_CONFIG_DIGEST)
+$(TEST_RIPPLE_PARITY): BUILD_CONFIG := $(TEST_CONFIG_DIGEST)
+$(TEST_RIPPLE_REAL): BUILD_CONFIG := $(TEST_CONFIG_DIGEST)
+$(TEST_RIPPLE_SERVE): BUILD_CONFIG := $(TEST_CONFIG_DIGEST)
+$(TEST_RIPPLE_LONG_PREFILL): BUILD_CONFIG := $(TEST_CONFIG_DIGEST)
+
+$(TEST_RIPPLE_VALUE_MIX): dev/tests/engine/ripple_value_mix_test.mm \
+		$(ENGINE_LIBRARY) $(LIB) | $(ENGINE_TEST_BUILD)
+	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) -fobjc-arc $< \
+		$(ENGINE_LIBRARY) $(ENGINE_LINKFLAGS) -o $@
+
+$(TEST_RIPPLE_LONG_PREFILL): dev/tests/engine/ripple_long_prefill_probe.mm \
+		$(ENGINE_LIBRARY) $(LIB) | $(ENGINE_TEST_BUILD)
+	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) -fobjc-arc $< \
+		$(ENGINE_LIBRARY) $(ENGINE_LINKFLAGS) -o $@
+
+$(TEST_RIPPLE_SERVE): dev/tests/engine/ripple_serve_test.mm \
+		$(ENGINE_LIBRARY) $(LIB) | $(ENGINE_TEST_BUILD)
+	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) -fobjc-arc $< \
+		$(ENGINE_LIBRARY) $(ENGINE_LINKFLAGS) -o $@
+
+$(TEST_RIPPLE_REAL): dev/tests/engine/ripple_real_test.mm \
+		$(ENGINE_LIBRARY) $(LIB) | $(ENGINE_TEST_BUILD)
+	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) -fobjc-arc $< \
+		$(ENGINE_LIBRARY) $(ENGINE_LINKFLAGS) -o $@
+
+$(TEST_RIPPLE_PARITY): dev/tests/engine/ripple_parity_test.mm \
+		$(ENGINE_LIBRARY) $(LIB) | $(ENGINE_TEST_BUILD)
+	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) -fobjc-arc $< \
+		$(ENGINE_LIBRARY) $(ENGINE_LINKFLAGS) -o $@
+
+$(TEST_RIPPLE_CHAIN): dev/tests/engine/ripple_chain_test.mm \
+		$(ENGINE_LIBRARY) $(LIB) | $(ENGINE_TEST_BUILD)
+	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) -fobjc-arc $< \
+		$(ENGINE_LIBRARY) $(ENGINE_LINKFLAGS) -o $@
+
+$(TEST_RIPPLE_LOAD): dev/tests/engine/ripple_load_test.mm \
+		$(ENGINE_LIBRARY) $(LIB) | $(ENGINE_TEST_BUILD)
+	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) -fobjc-arc $< \
+		$(ENGINE_LIBRARY) $(ENGINE_LINKFLAGS) -o $@
+
+
+# The fast, representative loop for the Ripple serving changes: the suites
+# the touched kernels and runtime paths actually exercise, run concurrently
+# with shader validation off (the full suite keeps it on). A green run here
+# is the signal to iterate; test-engine-metal remains the checkpoint gate.
+.PHONY: test-ripple-fast
+test-ripple-fast: $(TEST_RIPPLE_PARITY) $(TEST_RIPPLE_LOAD) $(TEST_RIPPLE_CHAIN) \
+		$(TEST_RIPPLE_VALUE_MIX) $(TEST_GDN_DECODE_TEST) $(TEST_GDN_METAL_TEST) \
+		$(TEST_DFLASH_BATCH_CONTROL_TEST) $(TEST_DRAFT_ATTENTION_TEST) \
+		$(TEST_DRAFT_SELECTOR_TEST) $(TEST_TARGET_SAMPLING_TEST) $(LIB)
+	@rm -f $(ENGINE_TEST_BUILD)/.ripple-fast-*.log
+	@status=0; \
+	{ $(METAL_TEST_ENV) $(TEST_RIPPLE_PARITY) $(LIB) > $(ENGINE_TEST_BUILD)/.ripple-fast-parity.log 2>&1 & \
+	  $(METAL_TEST_ENV) $(TEST_RIPPLE_LOAD) $(LIB) > $(ENGINE_TEST_BUILD)/.ripple-fast-load.log 2>&1 & \
+	  $(METAL_TEST_ENV) $(TEST_RIPPLE_CHAIN) $(LIB) > $(ENGINE_TEST_BUILD)/.ripple-fast-chain.log 2>&1 & \
+	  $(METAL_TEST_ENV) $(TEST_RIPPLE_VALUE_MIX) $(LIB) > $(ENGINE_TEST_BUILD)/.ripple-fast-valuemix.log 2>&1 & \
+	  $(METAL_TEST_ENV) $(TEST_GDN_DECODE_TEST) $(LIB) > $(ENGINE_TEST_BUILD)/.ripple-fast-gdndecode.log 2>&1 & \
+	  $(METAL_TEST_ENV) $(TEST_GDN_METAL_TEST) $(LIB) > $(ENGINE_TEST_BUILD)/.ripple-fast-gdn.log 2>&1 & \
+	  $(METAL_TEST_ENV) $(TEST_DFLASH_BATCH_CONTROL_TEST) $(LIB) > $(ENGINE_TEST_BUILD)/.ripple-fast-batch.log 2>&1 & \
+	  $(METAL_TEST_ENV) $(TEST_DRAFT_ATTENTION_TEST) $(LIB) > $(ENGINE_TEST_BUILD)/.ripple-fast-draftatt.log 2>&1 & \
+	  $(METAL_TEST_ENV) $(TEST_DRAFT_SELECTOR_TEST) $(LIB) > $(ENGINE_TEST_BUILD)/.ripple-fast-draftsel.log 2>&1 & \
+	  $(METAL_TEST_ENV) $(TEST_TARGET_SAMPLING_TEST) $(LIB) > $(ENGINE_TEST_BUILD)/.ripple-fast-sampling.log 2>&1 & \
+	}; wait; \
+	for log in $(ENGINE_TEST_BUILD)/.ripple-fast-*.log; do \
+	  if grep -q "FAIL\|Assertion\|failed" $$log; then echo "FAIL: $$log"; cat $$log | tail -3; status=1; fi; \
+	  if grep -q "PASS\|ok" $$log; then echo "ok: $$(basename $$log .log)"; fi; \
+	done; exit $$status

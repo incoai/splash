@@ -202,24 +202,28 @@ void sampling() {
                 workspace.vocabularyArrivalsBytes == count * 4,
             "target sampling workspace changed from the shipped 16-shard ABI");
   }
-  for (uint32_t positions : {1U, 7U, 14U, 21U, 28U,
-                             std::numeric_limits<uint32_t>::max()}) {
-    const auto workspace = DraftSelector::workspace(positions);
-    const uint64_t count = positions;
-    // Partial values carry the 16 x 16 edge table of every position behind
-    // the eight shard partials.
-    require(workspace.partialIdsBytes == count * 8 * 16 * 4 &&
-                workspace.partialValuesBytes == count * (8 + 16) * 16 * 4 &&
-                workspace.candidatesBytes == count * 16 * 4 &&
-                workspace.unaryBytes == count * 16 * 4 &&
-                workspace.proposalProbabilitiesBytes == count * 16 * 4,
-            "draft sampling workspace changed from the shipped 8-shard ABI");
-  }
+  for (const uint32_t candidates : {SPLASH_DRAFT_CANDIDATES, 32U})
+    for (uint32_t positions : {1U, 7U, 14U, 21U, 28U,
+                               std::numeric_limits<uint32_t>::max()}) {
+      const auto workspace = DraftSelector::workspace(positions, candidates);
+      const uint64_t count = positions;
+      // Partial values carry the candidates-squared edge table of every
+      // position behind the eight shard partials.
+      require(workspace.partialIdsBytes == count * 8 * candidates * 4 &&
+                  workspace.partialValuesBytes == count * (8 + candidates) * candidates * 4 &&
+                  workspace.candidatesBytes == count * candidates * 4 &&
+                  workspace.unaryBytes == count * candidates * 4 &&
+                  workspace.proposalProbabilitiesBytes == count * candidates * 4,
+              "draft sampling workspace changed from the shipped 8-shard ABI");
+    }
   rejects([] { (void)Sampling::workspace(0); }, "invalid sampling workspace row count",
           "a sampling workspace of no rows was sized");
-  rejects([] { (void)DraftSelector::workspace(0); },
+  rejects([] { (void)DraftSelector::workspace(0, SPLASH_DRAFT_CANDIDATES); },
           "invalid draft selector workspace position count",
           "a draft selector workspace of no positions was sized");
+  rejects([] { (void)DraftSelector::workspace(1, 0); },
+          "invalid draft selector candidate count",
+          "a draft selector workspace of no candidates was sized");
   // A family's stop tokens fill the places the kernels compare, those past
   // its list with SPLASH_NO_TOKEN, which is no stop token.
   using splash::ops::StopTokens;

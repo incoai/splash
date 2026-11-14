@@ -228,7 +228,7 @@ void checkLaneScratch(const model::LoadedModel &loaded) {
       for (const auto matrix : matrices)
         for (uint32_t lanes = 1; lanes <= model::kLaneCount; ++lanes)
           for (auto epilogue : {ops::LinearEpilogue::None, ops::LinearEpilogue::Residual,
-                                ops::LinearEpilogue::GateUp}) {
+                                ops::LinearEpilogue::GateUp, ops::LinearEpilogue::ClampedGateUp}) {
             const auto need = plans.linear().plan({matrix, lanes * model::kDecodeRows,
                 ops::LinearPhase::Decode, epilogue}).scratchSize();
             require(scratch.input >= need.input && scratch.sums >= need.sums && scratch.partials >= need.partials &&

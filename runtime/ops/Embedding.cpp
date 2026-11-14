@@ -18,7 +18,7 @@ const QuantFormat &StoredRows::format() const noexcept { return kQuantFormats[fo
 
 void Embedding::add(metal::CommandGraph &graph, metal::MetalBuffer tokens,
                     const EmbeddingWeights &table, metal::MetalBuffer output,
-                    uint32_t rows) {
+                    uint32_t rows, float scale) {
   if (!rows || !table.outputSize || !table.inputSize)
     throw std::invalid_argument("invalid embedding shape");
   // Every gather reads `rows` token ids and writes `rows` bf16 rows of the table's width.
@@ -30,7 +30,7 @@ void Embedding::add(metal::CommandGraph &graph, metal::MetalBuffer tokens,
   const uint64_t rowBytes = quant_stored_row_bytes(stored.formatId, table.inputSize);
   if (!rowBytes) throw std::invalid_argument("token rows take whole blocks of their format");
   requireBytes(stored.rows, uint64_t{table.outputSize} * rowBytes, "token table");
-  const GgufEmbedParams params{rows, table.outputSize, table.inputSize};
+  const GgufEmbedParams params{rows, table.outputSize, table.inputSize, scale};
   if (table.rotation) {
     // One threadgroup per rotation block of a row, which gathers the block
     // and inverts its rotation in fp32 (kernels/shared/gguf_rotation.metal).
@@ -41,7 +41,8 @@ void Embedding::add(metal::CommandGraph &graph, metal::MetalBuffer tokens,
               params, {table.inputSize / GGUF_ROTATION_BLOCK, rows, 1}, {GGUF_ROTATION_THREADS, 1, 1});
     return;
   }
-  graph.add(std::string("gguf_embed_") + format.name, {std::move(tokens), stored.rows, std::move(output)}, params,
+  graph.add(std::string("gguf_embed_") + format.name + (scale == 1.0F ? "" : "_scaled"),
+            {std::move(tokens), stored.rows, std::move(output)}, params,
             {(rows * table.inputSize + 255) / 256, 1, 1}, {256, 1, 1});
 }
 
@@ -49,30 +50,34 @@ void Embedding::addVerifyInput(metal::CommandGraph &graph,
                                metal::MetalBuffer draftInputTokens,
                                metal::MetalBuffer proposedTokens,
                                metal::MetalBuffer verifyInputTokens,
-                               uint32_t vocabulary, uint32_t lanes) {
-  if (!vocabulary || !lanes || lanes > SPLASH_MAXIMUM_BATCH_WIDTH)
+                               metal::MetalBuffer verifyInputPasses,
+                               uint32_t vocabulary, uint32_t lanes,
+                               uint32_t rows) {
+  if (!vocabulary || !lanes || lanes > SPLASH_MAXIMUM_BATCH_WIDTH ||
+      !rows || rows > SPLASH_DRAFT_BLOCK_ROWS_LIMIT)
     throw std::invalid_argument("invalid verify input batch");
   // A lane's anchor is row 0 of its draft input rows.
-  requireBytes(draftInputTokens, rowBytes(lanes, SPLASH_TARGET_VERIFY_ROWS, 1, sizeof(uint32_t)), "draft input token");
-  requireBytes(proposedTokens, uint64_t{lanes} * SPLASH_DRAFT_PROPOSAL_TOKENS * sizeof(uint32_t), "proposed token");
-  requireBytes(verifyInputTokens, uint64_t{lanes} * SPLASH_TARGET_VERIFY_ROWS * sizeof(uint32_t), "verify input token");
-  const VerifyInputBatchParams params{vocabulary};
+  requireBytes(draftInputTokens, rowBytes(lanes, rows, 1, sizeof(uint32_t)), "draft input token");
+  requireBytes(proposedTokens, uint64_t{lanes} * (rows - 1) * sizeof(uint32_t), "proposed token");
+  requireBytes(verifyInputTokens, uint64_t{lanes} * rows * sizeof(uint32_t), "verify input token");
+  const VerifyInputBatchParams params{vocabulary, rows, lanes};
   graph.add("verify_input_tokens",
             {std::move(draftInputTokens), std::move(proposedTokens),
-             std::move(verifyInputTokens)},
-            params, {uint64_t{lanes} * SPLASH_TARGET_VERIFY_ROWS, 1, 1},
+             std::move(verifyInputTokens), std::move(verifyInputPasses)},
+            params, {uint64_t{lanes} * rows, 1, 1},
             {1, 1, 1});
 }
 
-void Embedding::addDraftMaskRows(metal::CommandGraph &graph, metal::MetalBuffer mask, metal::MetalBuffer rows,
-                                 uint32_t width, uint32_t lanes) {
-  if (!width || !lanes || lanes > SPLASH_MAXIMUM_BATCH_WIDTH)
+void Embedding::addDraftMaskRows(metal::CommandGraph &graph, metal::MetalBuffer mask, metal::MetalBuffer rowsBuffer,
+                                 uint32_t width, uint32_t lanes, uint32_t rows) {
+  if (!width || !lanes || lanes > SPLASH_MAXIMUM_BATCH_WIDTH ||
+      !rows || rows > SPLASH_TARGET_VERIFY_ROWS)
     throw std::invalid_argument("invalid draft mask rows");
   requireBytes(mask, uint64_t{width} * sizeof(uint16_t), "draft mask embedding");
-  requireBytes(rows, uint64_t{lanes} * SPLASH_TARGET_VERIFY_ROWS * width * sizeof(uint16_t), "draft input row");
-  const DraftMaskRowsParams params{width};
-  graph.add("draft_mask_rows", {std::move(mask), std::move(rows)}, params,
-            {(width + 255) / 256, SPLASH_TARGET_VERIFY_ROWS - 1, lanes}, {256, 1, 1});
+  requireBytes(rowsBuffer, uint64_t{lanes} * rows * width * sizeof(uint16_t), "draft input row");
+  const DraftMaskRowsParams params{width, rows};
+  graph.add("draft_mask_rows", {std::move(mask), std::move(rowsBuffer)}, params,
+            {(width + 255) / 256, rows - 1, lanes}, {256, 1, 1});
 }
 
 } // namespace splash::ops

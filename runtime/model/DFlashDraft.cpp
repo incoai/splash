@@ -25,6 +25,14 @@ void requireLayout(const DFlashDraftLayout &layout) {
     throw WeightStoreError("draft selector kernels are compiled for rank " +
                            std::to_string(SPLASH_DRAFT_SELECTOR_RANK));
   }
+  // The proposal the variant's kernels run: the block's rows and the kept
+  // candidates, which the variant's kernels are instantiated with.
+  if (layout.rows != SPLASH_DRAFT_QUERY_ROWS && layout.rows != 16)
+    throw WeightStoreError("draft proposal kernels are compiled for 8 or 16 rows, not " +
+                           std::to_string(layout.rows));
+  if (layout.candidates != SPLASH_DRAFT_CANDIDATES && layout.candidates != 32)
+    throw WeightStoreError("draft selector kernels are compiled for 16 or 32 candidates, not " +
+                           std::to_string(layout.candidates));
 }
 
 // The key and value rows of each layer's fused QKV projection, without a
@@ -60,7 +68,8 @@ std::vector<ops::Projection> contextKvRows(metal::MetalBackend &backend,
 } // namespace
 
 DFlashDraftLayout draftLayout(uint32_t hiddenSize, uint32_t vocabularySize, uint32_t layers,
-                              uint32_t intermediateSize, float rotaryTheta, std::span<const uint32_t> targetLayers) {
+                              uint32_t intermediateSize, float rotaryTheta, std::span<const uint32_t> targetLayers,
+                              const SplashDraftVariant &variant) {
   constexpr uint32_t most = ExecutionLimits::maximumDraftTargetLayers;
   if (targetLayers.empty() || targetLayers.size() > most ||
       std::ranges::adjacent_find(targetLayers, std::ranges::greater_equal{}) != targetLayers.end())
@@ -74,16 +83,22 @@ DFlashDraftLayout draftLayout(uint32_t hiddenSize, uint32_t vocabularySize, uint
   DFlashDraftLayout layout{.layers = layers,
                            .hiddenSize = hiddenSize,
                            .vocabularySize = vocabularySize,
-                           .dynamicSize = draft_dynamic_width(hiddenSize),
-                           .qkvSize = SPLASH_DRAFT_QKV_WIDTH,
-                           .attentionSize = SPLASH_DRAFT_ATTENTION_WIDTH,
+                           .dynamicSize = draft_dynamic_width(hiddenSize, variant.convolution_taps),
+                           .qkvSize = variant.kv_heads * variant.head_dimension * 2 +
+                                      variant.query_heads * variant.head_dimension,
+                           .attentionSize = variant.query_heads * variant.head_dimension,
                            .intermediateSize = intermediateSize,
-                           .attentionHeadDimension = SPLASH_DRAFT_HEAD_DIMENSION,
+                           .attentionHeadDimension = variant.head_dimension,
                            .rotaryTheta = rotaryTheta,
                            .selectorRank = SPLASH_DRAFT_SELECTOR_RANK,
-                           .kvHeads = SPLASH_DRAFT_KV_HEADS,
+                           .kvHeads = variant.kv_heads,
                            .targetLayerCount = static_cast<uint32_t>(targetLayers.size())};
   std::ranges::copy(targetLayers, layout.targetLayers.begin());
+  layout.queryHeads = variant.query_heads;
+  layout.window = variant.window;
+  layout.convolutionTaps = variant.convolution_taps;
+  layout.rows = variant.rows;
+  layout.candidates = variant.candidates;
   requireLayout(layout);
   return layout;
 }
@@ -140,7 +155,8 @@ DFlashDraft::DFlashDraft(const DFlashDraftWeights &weights,
                          metal::MetalBackend &backend,
                          const ops::ExecutionPlans &operators)
     : weights_(weights), backend_(backend), operators_(operators),
-      selector_(weights.layout.vocabularySize),
+      selector_(weights.layout.vocabularySize,
+                weights.layout.candidates, weights.layout.rows),
       contextKvProjections_(contextKvRows(backend, weights)) {}
 
 void DFlashDraft::addSelection(
@@ -149,7 +165,7 @@ void DFlashDraft::addSelection(
     std::span<const ops::SamplingPolicy> policies) const {
   selector_.add(graph, buffers,
                 {weights_.predecessorCodebook, weights_.successorCodebook},
-                anchors, policies);
+                weights_.layout.candidates, anchors, policies);
 }
 
 void DFlashDraft::addContextPrefill(
@@ -172,14 +188,17 @@ void DFlashDraft::addContextPrefill(
                          const metal::MetalBuffer &window) {
     ops::DraftAttention::addWindowStore(graph,
                                         backend_.view(buffers.hidden, compactRow * rowBytes, count * rowBytes),
-                                        window, count, startPosition, layout.hiddenSize);
+                                        window, count, startPosition, layout.hiddenSize,
+                                        ops::draftVariant(layout.attentionShape()));
   };
   for (const DFlashPrefillSpan &span : spans)
-    store(span.compactRow, span.rows, span.startPosition, span.window);
+    if (!getenv("SPLASH_NO_DRAFT_WINDOW"))
+      store(span.compactRow, span.rows, span.startPosition, span.window);
   // Only the window: a cached state keeps no rings.
   for (const DFlashWindowCapture &capture : windowCaptures)
     store(capture.compactRow, capture.rows, capture.startPosition, capture.window);
-  addContextKv(graph, buffers, rows, spans);
+  if (!getenv("SPLASH_NO_DRAFT_KV"))
+    addContextKv(graph, buffers, rows, spans);
 }
 
 void DFlashDraft::addContextRebuild(metal::CommandGraph &graph,
@@ -187,15 +206,20 @@ void DFlashDraft::addContextRebuild(metal::CommandGraph &graph,
                                     const metal::MetalBuffer &window,
                                     std::span<const DFlashDraftRingLayer> ring,
                                     uint32_t rows, uint32_t startPosition) const {
-  static_assert(ExecutionLimits::draftContextTokens <= ExecutionLimits::prefillTokenBudget,
-                "a whole draft window passes through buffers of one prefill chunk's rows");
   const DFlashDraftLayout &layout = weights_.layout;
-  if (!rows || rows > ExecutionLimits::draftContextTokens || ring.size() != layout.layers)
+  if (!rows || rows > layout.window || ring.size() != layout.layers)
     throw std::invalid_argument("invalid draft context rebuild");
-  ops::DraftAttention::addWindowLoad(graph, window, buffers.hidden, rows, startPosition,
-                                     layout.hiddenSize);
-  const DFlashPrefillSpan span{0, rows, startPosition, ring, window};
-  addContextKv(graph, buffers, rows, {&span, 1});
+  // A window longer than a prefill chunk's rows passes through them in
+  // chunks, each loading its rows and computing their keys and values into
+  // the slots their positions name.
+  const SplashDraftVariant &variant = ops::draftVariant(layout.attentionShape());
+  for (uint32_t begin = 0; begin < rows; begin += ExecutionLimits::prefillTokenBudget) {
+    const uint32_t count = std::min(ExecutionLimits::prefillTokenBudget, rows - begin);
+    ops::DraftAttention::addWindowLoad(graph, window, buffers.hidden, count, startPosition + begin,
+                                       layout.hiddenSize, variant);
+    const DFlashPrefillSpan span{0, count, startPosition + begin, ring, window};
+    addContextKv(graph, buffers, count, {&span, 1});
+  }
 }
 
 void DFlashDraft::addContextKv(metal::CommandGraph &graph,
@@ -228,7 +252,7 @@ void DFlashDraft::addContextKv(metal::CommandGraph &graph,
 
 uint32_t DFlashDraft::decodeStorageLanes(uint32_t lanes) const {
   const ops::Linear &linear = operators_.draftLinear();
-  const uint32_t rows = lanes * ExecutionLimits::draftQueryRows;
+  const uint32_t rows = lanes * weights_.layout.rows;
   uint32_t storageRows = rows;
   const auto include = [&](const ops::Projection &p) {
     storageRows = std::max(storageRows, linear.decodeStorageRows(rows, p.shape()));
@@ -241,7 +265,7 @@ uint32_t DFlashDraft::decodeStorageLanes(uint32_t lanes) const {
   include(weights_.contextProjection);
   include(weights_.selectorProjection);
   for (const ops::Projection &p : contextKvProjections_) include(p);
-  return storageRows / ExecutionLimits::draftQueryRows;
+  return storageRows / weights_.layout.rows;
 }
 
 void DFlashDraft::addDecode(
@@ -255,9 +279,9 @@ void DFlashDraft::addDecode(
     throw std::invalid_argument("invalid draft decode batch");
   }
   const DFlashDraftLayout &layout = weights_.layout;
-  const uint32_t rows = lanes * ExecutionLimits::draftQueryRows;
+  const uint32_t rows = lanes * layout.rows;
   const auto attentionPlan =
-      operators_.draftAttention(layout.attentionShape(), lanes);
+      operators_.draftAttention(layout.attentionShape(), lanes, layout.rows);
   const ops::Linear &linear = operators_.draftLinear();
   const ops::LinearScratch &scratch = buffers.linearScratch;
 
@@ -265,7 +289,8 @@ void DFlashDraft::addDecode(
     const uint32_t current = layer & 1;
     const uint32_t next = current ^ 1;
     const DFlashDraftLayerWeights &weights = weights_.layers[layer];
-    const ops::LinearPlan attentionDynamicPlan = linear.decodePlan(weights.attentionDynamic, lanes);
+    const ops::LinearPlan attentionDynamicPlan =
+        linear.decodePlan(weights.attentionDynamic, lanes, ops::LinearEpilogue::None, nullptr, rows);
     const ops::PreparedInput attentionNormalized = ops::Normalization::addRms(
         graph, buffers.hidden[current], weights.inputNorm, buffers.normalized,
         layout.hiddenSize, rows, scratch, attentionDynamicPlan.input());
@@ -279,7 +304,8 @@ void DFlashDraft::addDecode(
          buffers.hidden[current], buffers.convolved},
         attentionPlan, ops::DraftConvolutionStage::Prepare);
     linear.add(graph, {.input = buffers.convolved, .output = buffers.proposalQkv, .scratch = scratch},
-               weights.qkvProjection, linear.decodePlan(weights.qkvProjection, lanes));
+               weights.qkvProjection,
+               linear.decodePlan(weights.qkvProjection, lanes, ops::LinearEpilogue::None, nullptr, rows));
     ops::DraftAttention::addPrepare(
         graph,
         {buffers.proposalQkv, buffers.attention, weights.queryNorm,
@@ -295,13 +321,15 @@ void DFlashDraft::addDecode(
     ops::DraftAttention::addReorder(graph, buffers.attention,
                                     buffers.proposalQkv, attentionPlan);
     linear.add(graph, {.input = buffers.proposalQkv, .output = buffers.projected, .scratch = scratch},
-               weights.outputProjection, linear.decodePlan(weights.outputProjection, lanes));
+               weights.outputProjection,
+               linear.decodePlan(weights.outputProjection, lanes, ops::LinearEpilogue::None, nullptr, rows));
     ops::DraftAttention::addConvolution(
         graph,
         {buffers.projected, buffers.dynamic, weights.attentionConvolution,
          buffers.hidden[current], buffers.residual},
         attentionPlan, ops::DraftConvolutionStage::Residual);
-    const ops::LinearPlan mlpDynamicPlan = linear.decodePlan(weights.mlpDynamic, lanes);
+    const ops::LinearPlan mlpDynamicPlan =
+        linear.decodePlan(weights.mlpDynamic, lanes, ops::LinearEpilogue::None, nullptr, rows);
     const ops::PreparedInput mlpNormalized = ops::Normalization::addRms(
         graph, buffers.residual, weights.postAttentionNorm, buffers.normalized,
         layout.hiddenSize, rows, scratch, mlpDynamicPlan.input());
@@ -318,10 +346,12 @@ void DFlashDraft::addDecode(
                {.input = buffers.convolved, .output = buffers.intermediate, .gateScratch = buffers.gateScratch,
                 .scratch = scratch},
                weights.upProjection,
-               linear.decodePlan(weights.upProjection, lanes, ops::LinearEpilogue::GateUp, &weights.gateProjection),
+               linear.decodePlan(weights.upProjection, lanes, ops::LinearEpilogue::GateUp,
+                                 &weights.gateProjection, rows),
                &weights.gateProjection);
     linear.add(graph, {.input = buffers.intermediate, .output = buffers.projected, .scratch = scratch},
-               weights.downProjection, linear.decodePlan(weights.downProjection, lanes));
+               weights.downProjection,
+               linear.decodePlan(weights.downProjection, lanes, ops::LinearEpilogue::None, nullptr, rows));
     ops::DraftAttention::addConvolution(
         graph,
         {buffers.projected, buffers.dynamic, weights.mlpConvolution,
@@ -335,7 +365,8 @@ void DFlashDraft::addDecode(
   // its scratch is sized (DecodeArena::linearScratchSize): only the draft's
   // own projections keep bf16 activations.
   const ops::Linear &target = operators_.linear();
-  const ops::LinearPlan headPlan = target.decodePlan(vocabularyProjection, lanes);
+  const ops::LinearPlan headPlan =
+      target.decodePlan(vocabularyProjection, lanes, ops::LinearEpilogue::None, nullptr, rows);
   const ops::PreparedInput finalHidden = ops::Normalization::addRms(
       graph, buffers.hidden[weights_.layout.layers & 1], weights_.finalNorm,
       buffers.finalHidden, layout.hiddenSize, rows, scratch, headPlan.input());
@@ -345,13 +376,14 @@ void DFlashDraft::addDecode(
   linear.add(graph,
              {.input = buffers.finalHidden, .output = buffers.selectorHidden, .scratch = scratch,
               .prepared = afterHead},
-             weights_.selectorProjection, linear.decodePlan(weights_.selectorProjection, lanes));
+             weights_.selectorProjection,
+             linear.decodePlan(weights_.selectorProjection, lanes, ops::LinearEpilogue::None, nullptr, rows));
 }
 
 void DFlashDraft::addMaskRows(metal::CommandGraph &graph, metal::MetalBuffer rows, uint32_t lanes) const {
   if (!weights_.maskEmbedding) return;
   ops::Embedding::addDraftMaskRows(graph, weights_.maskEmbedding, std::move(rows), weights_.layout.hiddenSize,
-                                   lanes);
+                                   lanes, weights_.layout.rows);
 }
 
 void DFlashDraft::addContextCommit(
@@ -364,21 +396,24 @@ void DFlashDraft::addContextCommit(
     throw std::invalid_argument("invalid draft context batch");
   }
   const DFlashDraftLayout &layout = weights_.layout;
-  const uint32_t rows = lanes * ExecutionLimits::targetVerifyRows;
+  const uint32_t rows = lanes * layout.rows;
   const ops::Linear &linear = operators_.draftLinear();
   const ops::LinearScratch &scratch = buffers.linearScratch;
   linear.add(graph, {.input = buffers.capturedTargetHidden, .output = buffers.projected, .scratch = scratch},
-             weights_.contextProjection, linear.decodePlan(weights_.contextProjection, lanes));
+             weights_.contextProjection,
+             linear.decodePlan(weights_.contextProjection, lanes, ops::LinearEpilogue::None, nullptr, rows));
   // Every layer's key and value projection reads the same normalized rows,
   // prepared for the first layer's plan.
-  ops::LinearPlan kvPlan = linear.decodePlan(contextKvProjections_[0], lanes);
+  ops::LinearPlan kvPlan =
+      linear.decodePlan(contextKvProjections_[0], lanes, ops::LinearEpilogue::None, nullptr, rows);
   ops::PreparedInput hidden = ops::Normalization::addRms(
       graph, buffers.projected, weights_.hiddenNorm, buffers.hidden, layout.hiddenSize, rows,
       scratch, kvPlan.input());
 
   for (uint32_t layer = 0; layer < layout.layers; ++layer) {
     const ops::Projection &projection = contextKvProjections_[layer];
-    if (layer) kvPlan = linear.decodePlan(projection, lanes);
+    if (layer)
+      kvPlan = linear.decodePlan(projection, lanes, ops::LinearEpilogue::None, nullptr, rows);
     hidden = linear.add(graph,
                         {.input = buffers.hidden, .output = buffers.contextKv, .scratch = scratch,
                          .prepared = hidden},
@@ -401,7 +436,7 @@ DFlashDraftWeights loadDFlashDraftWeights(metal::MetalBackend &backend,
   result.layout = layout;
   result.layers.reserve(layout.layers);
   const uint64_t convolutionBytes = checkedMultiply<WeightStoreError>(
-      checkedMultiply<WeightStoreError>(SPLASH_DRAFT_CONVOLUTION_STAGES * SPLASH_DRAFT_CONVOLUTION_TAPS,
+      checkedMultiply<WeightStoreError>(SPLASH_DRAFT_CONVOLUTION_STAGES * layout.convolutionTaps,
                                         layout.hiddenSize, "draft convolution elements"),
       kBFloat16Bytes, "draft convolution bytes");
   const uint64_t headNormBytes = checkedMultiply<WeightStoreError>(

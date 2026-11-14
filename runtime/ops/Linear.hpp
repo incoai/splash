@@ -67,7 +67,19 @@ struct LinearMatrix final {
 void requireSegmentPlanes(const QuantizedSegment &segment, std::string_view what, uint32_t planeInputs = 0);
 
 enum class LinearPhase : uint8_t { Prefill, Decode };
-enum class LinearEpilogue : uint8_t { None, Residual, GateUp, UpWithGate };
+enum class LinearEpilogue : uint8_t {
+  None,
+  Residual,
+  GateUp,
+  UpWithGate,
+  // The gated product with both activations clamped at the dispatch's
+  // clamp (a family whose SwiGLU clamps): the decode pair's up pass and
+  // the prefill up pass read the unclamped gate scratch and clamp as they
+  // apply it. The one-pass gate/up pair does not run clamped: its two-pass
+  // fallback's scratch costs a gated intermediate's round trip.
+  ClampedGateUp,
+  ClampedUpWithGate
+};
 // The tiles run 64 columns per threadgroup; a one-pass gate/up
 // (LinearConfig::oneGateUpPass) runs 32 columns of both tensors per
 // threadgroup of one simdgroup. The staged tiles, GgufStaged and GgufPrefill,
@@ -87,7 +99,8 @@ enum class LinearEpilogue : uint8_t { None, Residual, GateUp, UpWithGate };
 // tile's storage rows.
 enum class LinearTile : uint8_t { GgufStaged, GgufPrefill, GgufRegister, GgufPrefillInt8 };
 // The decode tiles hold at most a full decode batch.
-inline constexpr uint32_t kMaximumDecodeTileRows = SPLASH_MAXIMUM_BATCH_WIDTH * SPLASH_TARGET_VERIFY_ROWS;
+inline constexpr uint32_t kMaximumDecodeTileRows =
+    SPLASH_MAXIMUM_BATCH_WIDTH * SPLASH_DRAFT_BLOCK_ROWS_LIMIT;
 // The staged tile's tallest height, which holds prefill chunks of up to this
 // many rows (ProjectionCalibration::stagedPrefillRows).
 inline constexpr uint32_t kMaximumStagedPrefillRows = 64;
@@ -246,6 +259,9 @@ struct LinearBuffers final {
   // What the scratch table holds (for example after fused RMSNorm). A plan
   // that reads a table prepares one unless this describes its input.
   PreparedInput prepared{};
+  // The clamped epilogues' threshold, which their params carry to the
+  // kernels; infinity clamps nothing.
+  float clamp = std::numeric_limits<float>::infinity();
 };
 
 // Whether plans may round activations to int8 where an int8-activation path
@@ -282,7 +298,8 @@ public:
                                        LinearEpilogue epilogue, uint32_t chunkRows = 0) const;
   [[nodiscard]] LinearPlan decodePlan(const Projection &projection, uint32_t lanes,
                                       LinearEpilogue epilogue = LinearEpilogue::None,
-                                      const Projection *gate = nullptr) const;
+                                      const Projection *gate = nullptr,
+                                      uint32_t rows = 0) const;
   // The scratch of every decode plan of a projection of `shape`: each lane
   // count, the None, Residual and GateUp epilogues and every tile the device
   // may run them on, and the rotated rows of a full decode batch.

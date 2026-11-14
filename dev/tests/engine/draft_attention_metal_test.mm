@@ -620,7 +620,7 @@ WindowGroup referenceWindowGroup(const uint16_t *values) {
 void contextWindow(MetalBackend &backend, uint32_t width) {
   constexpr uint8_t kUntouched = 0xA5;
   const uint32_t groups = width / 64;
-  const uint64_t windowBytes = DraftAttention::contextWindowBytes(width);
+  const uint64_t windowBytes = DraftAttention::contextWindowBytes(width, kWindow);
   require(windowBytes == uint64_t{kWindow} * (width / 2 + groups * 4), "context window bytes");
   Random random(0xc0de1000ULL + width);
   for (const auto [rows, start] : {std::pair{37U, 6130U}, std::pair{kWindow, 0U}}) {
@@ -637,9 +637,12 @@ void contextWindow(MetalBackend &backend, uint32_t width) {
     MetalBuffer run = backend.allocateBuffer(uint64_t{kRunRows} * width * 2, BufferStorage::Shared,
                                              "draft context loaded run");
     CommandGraph graph;
-    DraftAttention::addWindowStore(graph, input, window, rows, start, width);
-    DraftAttention::addWindowLoad(graph, window, loaded, rows, start, width);
-    DraftAttention::addWindowLoad(graph, window, run, kRunRows, start + kRunBegin, width);
+    DraftAttention::addWindowStore(graph, input, window, rows, start, width,
+                                   SPLASH_DRAFT_VARIANTS[0]);
+    DraftAttention::addWindowLoad(graph, window, loaded, rows, start, width,
+                                  SPLASH_DRAFT_VARIANTS[0]);
+    DraftAttention::addWindowLoad(graph, window, run, kRunRows, start + kRunBegin, width,
+                                  SPLASH_DRAFT_VARIANTS[0]);
     static_cast<void>(backend.submitCommandAsync(graph.dispatches()).wait());
 
     const auto *bytes = static_cast<const uint8_t *>(window.contents());
@@ -680,11 +683,13 @@ void contextWindow(MetalBackend &backend, uint32_t width) {
   CommandGraph invalid;
   const MetalBuffer rows = backend.allocateBuffer(uint64_t{kWindow + 1} * width * 2, BufferStorage::Shared, "rows");
   const MetalBuffer window = backend.allocateBuffer(windowBytes, BufferStorage::Shared, "window");
-  rejects([&] { DraftAttention::addWindowStore(invalid, rows, window, 0, 0, width); },
+  rejects([&] { DraftAttention::addWindowStore(invalid, rows, window, 0, 0, width,
+                                     SPLASH_DRAFT_VARIANTS[0]); },
           "a context window holds one ring's rows", "an empty context window store was accepted");
-  rejects([&] { DraftAttention::addWindowLoad(invalid, window, rows, kWindow + 1, 0, width); },
+  rejects([&] { DraftAttention::addWindowLoad(invalid, window, rows, kWindow + 1, 0, width,
+                                     SPLASH_DRAFT_VARIANTS[0]); },
           "a context window holds one ring's rows", "a load of more rows than a ring was accepted");
-  rejects([&] { static_cast<void>(DraftAttention::contextWindowBytes(width + 32)); },
+  rejects([&] { static_cast<void>(DraftAttention::contextWindowBytes(width + 32, kWindow)); },
           "draft context rows are whole 64-value groups", "a partial context group was accepted");
   require(invalid.empty(), "an invalid context window transfer encoded a dispatch");
 }
@@ -696,7 +701,7 @@ void contextWindow(MetalBackend &backend, uint32_t width) {
 // while the lane's window, which goes on to rows [s, b), has lost the oldest
 // once b passes 2048. Before the window fills and once the ring wraps.
 void contextWindowCapturedInside(MetalBackend &backend, uint32_t width) {
-  const uint64_t windowBytes = DraftAttention::contextWindowBytes(width);
+  const uint64_t windowBytes = DraftAttention::contextWindowBytes(width, kWindow);
   const uint64_t rowBytes = uint64_t{width} * 2;
   const uint64_t codeBytes = width / 2, groupBytes = width / 64 * 4;
   Random random(0xc0de2000ULL + width);
@@ -704,7 +709,8 @@ void contextWindowCapturedInside(MetalBackend &backend, uint32_t width) {
     const MetalBuffer rows = randomBfloat(backend, uint64_t{b} * width, random, "draft context rows");
     const auto store = [&](CommandGraph &graph, uint32_t begin, uint32_t end, const MetalBuffer &window) {
       DraftAttention::addWindowStore(graph, backend.view(rows, begin * rowBytes, (end - begin) * rowBytes),
-                                     window, end - begin, begin, width);
+                                     window, end - begin, begin, width,
+                                     SPLASH_DRAFT_VARIANTS[0]);
     };
     const auto allocate = [&](const char *label) {
       MetalBuffer window = backend.allocateBuffer(windowBytes, BufferStorage::Shared, label);
@@ -840,21 +846,21 @@ void bufferExtents(MetalBackend &backend, DraftAttentionShape shape) {
     DraftAttention::addContextCommit(graph, b[0], b[1], b[2], b[3], rings(b, 5), rings(b, 5 + lanes), b[4], starts,
                                      shape);
   });
-  const uint64_t windowBytes = DraftAttention::contextWindowBytes(shape.hiddenSize);
+  const uint64_t windowBytes = DraftAttention::contextWindowBytes(shape.hiddenSize, SPLASH_DRAFT_SLIDING_WINDOW);
   const uint64_t contextRows = uint64_t{contextTokens} * shape.hiddenSize * 2;
   splash::test::requireExtents(backend,
                                Extents{{0, contextRows, 2, "draft context rows"},
                                        {1, windowBytes, 1, "draft context window"}},
                                [&](CommandGraph &graph, const Buffers &b) {
                                  DraftAttention::addWindowStore(graph, b[0], b[1], contextTokens, 2040,
-                                                                shape.hiddenSize);
+                                                                shape.hiddenSize, SPLASH_DRAFT_VARIANTS[0]);
                                });
   splash::test::requireExtents(backend,
                                Extents{{0, windowBytes, 1, "draft context window"},
                                        {1, contextRows, 2, "draft context rows"}},
                                [&](CommandGraph &graph, const Buffers &b) {
                                  DraftAttention::addWindowLoad(graph, b[0], b[1], contextTokens, 2040,
-                                                               shape.hiddenSize);
+                                                               shape.hiddenSize, SPLASH_DRAFT_VARIANTS[0]);
                                });
 }
 

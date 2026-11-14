@@ -364,9 +364,11 @@ public:
   prefillParams(uint64_t logicalPosition, uint32_t chunkTokens,
                 uint32_t chunkStride, uint32_t pageTableEntries);
   // A verify lane's chunk: its verify rows in kVerifyChunkStride rows of
-  // staging, the only parameters addVerify attends.
+  // staging, the only parameters addVerify attends. `rowBase` is the block
+  // row the sub-pass's first row is (0 for a block's only or first pass).
   [[nodiscard]] static kv::ChunkedPrefillParams
-  verifyParams(uint64_t logicalPosition, uint32_t pageTableEntries);
+  verifyParams(uint64_t logicalPosition, uint32_t pageTableEntries,
+               uint32_t rowBase = 0);
 
   static void addPrefillStore(metal::CommandGraph &graph, SplashKvLayer layer,
                               metal::MetalBuffer chunkKeys,

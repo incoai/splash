@@ -121,6 +121,11 @@ SplitChoice waveSplits(const WaveLaw &law, uint32_t n, uint32_t k, uint32_t rows
 // `columnTiles` column tiles of a unit of `formatClass` (RegisterBoundary).
 bool registers(const RegisterBoundary &boundary, FormatClass formatClass, uint32_t lanes, uint64_t columnTiles,
                uint32_t cores) {
+  // The calibration speaks for one to four 8-row groups (the boundary law
+  // was measured there); a whole 16-row block's wider groups run staged,
+  // whose weight read amortizes over them.
+  if (lanes > 4)
+    return false;
   return 4 * columnTiles * lanes < uint64_t{boundary.belowQuarters[size_t(formatClass)][lanes - 1]} * cores;
 }
 
@@ -165,8 +170,10 @@ LinearConfig bf16Projection(const KernelCalibration &calibration, LinearWorkload
     return {.tile = LinearTile::GgufPrefill};
   }
   const uint32_t lanes = w.rows / SPLASH_TARGET_VERIFY_ROWS;
-  const bool gateUp = w.epilogue == LinearEpilogue::GateUp,
-             onePass = gateUp && unit.oneFormat && cores >= p.onePassFromCores;
+  const bool gateUp = w.epilogue == LinearEpilogue::GateUp ||
+                      w.epilogue == LinearEpilogue::ClampedGateUp,
+             onePass = w.epilogue == LinearEpilogue::GateUp && unit.oneFormat &&
+                       cores >= p.onePassFromCores;
   if (unit.registerTakes &&
       registers(p.decodeRegister, unit.formatClass, lanes, (onePass ? 2 : 1) * uint64_t{n / GGUF_TILE_COLUMNS},
                 cores))

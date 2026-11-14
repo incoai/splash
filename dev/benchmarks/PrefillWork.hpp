@@ -1,5 +1,6 @@
 #pragma once
 
+#include "metal/abi/ExecutionGeometry.h"
 #include "engine/Engine.hpp"
 #include "model/Model.hpp"
 #include "ops/PagedKv.hpp"
@@ -30,8 +31,8 @@ inline uint64_t expectedDraftContextRows(uint32_t promptTokens,
       engine::plannedCheckpoints(restoredTokens, replayBoundary, checkpointTokens);
   if (replayBoundary > restoredTokens)
     boundaries.push_back(replayBoundary);
-  return draftContextRows(
-      planDraftContext(restoredTokens, promptTokens, boundaries));
+  return draftContextRows(planDraftContext(restoredTokens, promptTokens, boundaries,
+                                           SPLASH_DRAFT_SLIDING_WINDOW));
 }
 
 } // namespace splash::benchmark

@@ -360,6 +360,10 @@ extension LaunchOption {
             help: "How the model keeps what it has read in memory. 16-bit takes twice the memory.",
             section: .memory, kind: .choice(standard: "8-bit", choices: [("bf16", "16-bit")], custom: nil)),
         LaunchOption(
+            flag: "--kv-window-trim", title: "KV window trim",
+            help: "Converts a windowed model's past pages to Slim once no row reads them whole (on). Off keeps every page Full.",
+            section: .memory, kind: .toggle(on: true)),
+        LaunchOption(
             flag: "--state-format", title: "Recurrent state",
             help: "How a hybrid model such as Qwen3.6 keeps its state. 16-bit takes half the memory, so twice as many fit.",
             section: .memory, kind: .choice(standard: "32-bit", choices: [("bf16", "16-bit")], custom: nil)),

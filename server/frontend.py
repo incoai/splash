@@ -919,7 +919,14 @@ class Frontend:
         come next, so a tool with more of them than the parser admits fails
         there."""
         chat_format = self.chat_format
-        reasoning = [chat_format.think_end_id] if thinking else []
+        if thinking and chat_format.tags_are_text:
+            # The close of reasoning is text: the prefix carries its tokens,
+            # which the model writes before what the grammar takes over.
+            reasoning = self._tokenize(THINK_END, add_special_tokens=False)[
+                "input_ids"
+            ]
+        else:
+            reasoning = [chat_format.think_end_id] if thinking else []
         return [
             (
                 reasoning

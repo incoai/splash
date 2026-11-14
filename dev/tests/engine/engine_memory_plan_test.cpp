@@ -323,17 +323,17 @@ void testModelProvidedKvGeometry() {
 // fit the budget with no room for another, where on the 12 GiB device the
 // pages priced one by one would take 72 MiB more than it has.
 void testWindowedKvCostsSlimPages() {
-  constexpr uint64_t windowedLayers = [] {
-    uint64_t layers = (uint64_t{1} << 48) - 4;
-    for (uint32_t layer = 5; layer < 48; layer += 4)
-      layers &= ~(uint64_t{1} << layer);
+  constexpr kv::LayerMask windowedLayers = [] {
+    kv::LayerMask layers;
+    for (uint32_t layer = 2; layer < 48; ++layer) layers.set(layer, true);
+    for (uint32_t layer = 5; layer < 48; layer += 4) layers.set(layer, false);
     return layers;
   }();
   ModelMemoryProfile flint = model();
   flint.targetKvLayout = {49, 4, 128, kv::Format::Int8, 0, false, 512, windowedLayers};
   ModelMemoryProfile unwindowed = flint;
   unwindowed.targetKvLayout.windowTokens = 0;
-  unwindowed.targetKvLayout.windowedLayers = 0;
+  unwindowed.targetKvLayout.windowedLayers = {};
   const EngineMemoryPlan windowedPlan = test::requireMemoryPlan(device(), flint);
   const EngineMemoryBreakdown &budget = windowedPlan.breakdown();
   const EngineMemoryBreakdown full = test::requireMemoryPlan(device(), unwindowed).breakdown();

@@ -32,7 +32,10 @@ void RoPE::addTables(
   const std::string kernel = tableKernel(targetPairs);
   if (!rows.target_rows || rows.target_rows > maximumRows ||
       rows.draft_rows > maximumRows) {
-    throw std::invalid_argument("invalid RoPE table row count");
+    throw std::invalid_argument("invalid RoPE table row count: target " +
+                                std::to_string(rows.target_rows) + ", draft " +
+                                std::to_string(rows.draft_rows) + ", maximum " +
+                                std::to_string(maximumRows));
   }
   if (!(rows.target_scale > 0.0F))
     throw std::invalid_argument("invalid target RoPE scale");
@@ -66,7 +69,9 @@ void RoPE::addDraftRangeTables(metal::CommandGraph &graph,
                                metal::MetalBuffer draftSine, uint32_t rows,
                                uint32_t startPosition, uint32_t maximumRows) {
   if (!rows || rows > maximumRows)
-    throw std::invalid_argument("invalid RoPE table row count");
+    throw std::invalid_argument("invalid draft RoPE table row count: rows " +
+                                std::to_string(rows) + ", maximum " +
+                                std::to_string(maximumRows));
   const uint64_t elements = uint64_t{rows} * SPLASH_DRAFT_ROPE_PAIRS;
   requireBytes(draftInverseFrequencies, SPLASH_DRAFT_ROPE_PAIRS * sizeof(float), "draft inverse frequency");
   requireBytes(draftCosine, elements * sizeof(float), "draft RoPE cosine");

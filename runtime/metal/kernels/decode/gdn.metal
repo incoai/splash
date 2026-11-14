@@ -36,10 +36,13 @@ template <uint HeadDim> struct GdnDecodeShared {
   bfloat rows[SPLASH_TARGET_VERIFY_ROWS * HeadDim];
   float decay[SPLASH_TARGET_VERIFY_ROWS];
   bfloat beta[SPLASH_TARGET_VERIFY_ROWS];
-  bfloat pending_keys[SPLASH_TARGET_VERIFY_ROWS * HeadDim];
-  bfloat pending_values[SPLASH_TARGET_VERIFY_ROWS * HeadDim];
-  float pending_decay[SPLASH_TARGET_VERIFY_ROWS];
-  bfloat pending_beta[SPLASH_TARGET_VERIFY_ROWS];
+  // The pending rows fold before the step's; a 16-row verify's second
+  // sub-pass folds the first's rows beside its predecessor's, so the
+  // pending arrays hold twice the step's rows.
+  bfloat pending_keys[2 * SPLASH_TARGET_VERIFY_ROWS * HeadDim];
+  bfloat pending_values[2 * SPLASH_TARGET_VERIFY_ROWS * HeadDim];
+  float pending_decay[2 * SPLASH_TARGET_VERIFY_ROWS];
+  bfloat pending_beta[2 * SPLASH_TARGET_VERIFY_ROWS];
 };
 
 // One layer's tape of one lane's step (metal/abi/GDN.h): the rows'
@@ -78,7 +81,8 @@ template <uint KeyHeads, uint ValueHeads, uint HeadDim, uint ConvDim,
 inline void gdn_decode_prologue(
     device const bfloat *packed, device const bfloat *conv_weights,
     GdnConvHistory history, device bfloat *conv_state_out,
-    GdnTape pending_tape, uint pending, GdnTape step_tape, uint verified,
+    GdnTape pending_tape, GdnTape second_pending_tape, uint pending_a,
+    uint pending_b, GdnTape step_tape, uint verified,
     device const float *a_scale, device const bfloat *dt_bias,
     threadgroup GdnDecodeShared<HeadDim> &shared, uint value_head, uint lane,
     uint simd_group) {
@@ -105,18 +109,26 @@ inline void gdn_decode_prologue(
   const uint k_column = key_head * HeadDim + lane;
   const uint v_column = KeyWidth + value_head * HeadDim + lane;
 
-  if (token < pending) {
+  // The pending rows fold before the step's: the first pending_a of them sit
+  // on the previous step's tape, the rest on the second's (a 16-row verify's
+  // second sub-pass leaves its rows there). The simdgroups copy them in
+  // strides of their count.
+  const uint pending_total = pending_a + pending_b;
+  for (uint row = token; row < pending_total; row += kDecodeSimdgroups) {
+    const bool second = row >= pending_a;
+    const GdnTape source = second ? second_pending_tape : pending_tape;
+    const uint source_row = second ? row - pending_a : row;
     for (uint g = 0; g < Groups; ++g) {
-      shared.pending_keys[token * HeadDim + 32 * g + lane] =
-          pending_tape.kv[token * KvWidth + k_column + 32 * g];
-      shared.pending_values[token * HeadDim + 32 * g + lane] =
-          pending_tape.kv[token * KvWidth + v_column + 32 * g];
+      shared.pending_keys[row * HeadDim + 32 * g + lane] =
+          source.kv[source_row * KvWidth + k_column + 32 * g];
+      shared.pending_values[row * HeadDim + 32 * g + lane] =
+          source.kv[source_row * KvWidth + v_column + 32 * g];
     }
     if (lane == 0) {
-      shared.pending_decay[token] =
-          pending_tape.decay[token * ValueHeads + value_head];
-      shared.pending_beta[token] =
-          pending_tape.beta[token * ValueHeads + value_head];
+      shared.pending_decay[row] =
+          source.decay[source_row * ValueHeads + value_head];
+      shared.pending_beta[row] =
+          source.beta[source_row * ValueHeads + value_head];
     }
   }
 
@@ -347,8 +359,8 @@ inline void gdn_decode_batch_phase(
     device const uchar *current0, device const uchar *current1,
     device const uchar *current2, device const uchar *current3,
     device uchar *next0, device uchar *next1, device uchar *next2,
-    device uchar *next3, device uchar *tape, device const float *a_scale,
-    device const bfloat *dt_bias,
+    device uchar *next3, device uchar *tape, device uchar *second_tape,
+    device const float *a_scale, device const bfloat *dt_bias,
     device const W *gdn_norm_weight, device bfloat *gdn_hidden,
     device const uint *verify_rows, constant GDNDecodeBatchParams &params,
     uint2 group, uint lane, uint simd_group,
@@ -372,19 +384,25 @@ inline void gdn_decode_batch_phase(
       next + params.convolution_state_bytes +
       ulong(params.layer) * params.recurrent_layer_bytes);
 
-  const uint pending = params.pending_rows[batch];
+  const uint pending_a = params.pending_rows[batch];
+  const uint pending_b = params.pending_rows_second[batch];
   const uint verified = verify_rows[batch];
   const GdnTape pending_tape =
       gdn_tape<KeyHeads, ValueHeads, HeadDim, ConvDim>(tape, params.pending_tape[batch]);
+  const GdnTape second_pending_tape =
+      gdn_tape<KeyHeads, ValueHeads, HeadDim, ConvDim>(second_tape, params.second_tape[batch]);
   const GdnTape step_tape =
       gdn_tape<KeyHeads, ValueHeads, HeadDim, ConvDim>(tape, params.step_tape[batch]);
+  const uint pending = pending_a + pending_b;
   const GdnConvHistory history{conv_state_in, pending_tape.inputs, ConvDim,
-                               ConvDim, pending};
+                               ConvDim, pending, second_pending_tape.inputs,
+                               pending_a};
 
   device bfloat *lane_hidden = gdn_hidden + ulong(batch) * Rows * ValueWidth;
   gdn_decode_prologue<KeyHeads, ValueHeads, HeadDim, ConvDim, PackedWidth>(
-      packed, conv_weights, history, conv_state_out, pending_tape, pending,
-      step_tape, verified, a_scale, dt_bias, shared, group.x, lane, simd_group);
+      packed, conv_weights, history, conv_state_out, pending_tape,
+      second_pending_tape, pending_a, pending_b, step_tape, verified,
+      a_scale, dt_bias, shared, group.x, lane, simd_group);
   threadgroup_barrier(mem_flags::mem_threadgroup);
   gdn_decode_scan<HeadDim, RowsInFlight, State>(state_in, state_out, shared,
                                                 pending, verified, group.x,
@@ -418,9 +436,10 @@ inline void gdn_decode_batch_phase(
     device const uchar *current2 [[buffer(4)]], device const uchar *current3 [[buffer(5)]], \
     device uchar *next0 [[buffer(6)]], device uchar *next1 [[buffer(7)]], \
     device uchar *next2 [[buffer(8)]], device uchar *next3 [[buffer(9)]], \
-    device uchar *tape [[buffer(10)]], device const float *a_scale [[buffer(11)]], \
-    device const bfloat *dt_bias [[buffer(12)]], device const W *gdn_norm_weight [[buffer(13)]], \
-    device bfloat *gdn_hidden [[buffer(14)]], device const uint *verify_rows [[buffer(15)]]
+    device uchar *tape [[buffer(10)]], device uchar *second_tape [[buffer(11)]], \
+    device const float *a_scale [[buffer(12)]], \
+    device const bfloat *dt_bias [[buffer(13)]], device const W *gdn_norm_weight [[buffer(14)]], \
+    device bfloat *gdn_hidden [[buffer(15)]], device const uint *verify_rows [[buffer(16)]]
 #define GDN_DECODE_THREADS \
     uint2 group [[threadgroup_position_in_grid]], \
     uint lane [[thread_index_in_simdgroup]], uint simd_group [[simdgroup_index_in_threadgroup]]
@@ -428,20 +447,20 @@ inline void gdn_decode_batch_phase(
     threadgroup GdnDecodeShared<HeadDim> shared; \
     gdn_decode_batch_phase<KeyHeads, ValueHeads, HeadDim, ConvDim, PackedWidth, 2, Layout, W, State>( \
         packed, conv_weights, current0, current1, current2, current3, next0, \
-        next1, next2, next3, tape, a_scale, dt_bias, \
+        next1, next2, next3, tape, second_tape, a_scale, dt_bias, \
         gdn_norm_weight, gdn_hidden, verify_rows, params, group, lane, simd_group, shared, \
         table, sums);
 // Entries without a table pass null pointers, which skip the write; their Layout only completes the template.
 #define GDN_DECODE_KERNEL(Name, KeyHeads, ValueHeads, HeadDim, ConvDim, PackedWidth, W, State) \
   kernel void Name(GDN_DECODE_BUFFERS(W), \
-      constant GDNDecodeBatchParams &params [[buffer(16)]], GDN_DECODE_THREADS) { \
+      constant GDNDecodeBatchParams &params [[buffer(17)]], GDN_DECODE_THREADS) { \
     GDN_DECODE_BODY(KeyHeads, ValueHeads, HeadDim, ConvDim, PackedWidth, nullptr, nullptr, gguf_sg::Table16, W, State) \
   }
 // The out-projection's table (Layout: gguf_sg::Table16).
 #define GDN_DECODE_TABLE_KERNEL(Name, KeyHeads, ValueHeads, HeadDim, ConvDim, PackedWidth, Layout, W, State) \
   kernel void Name(GDN_DECODE_BUFFERS(W), \
-      device bfloat *table [[buffer(16)]], device float *sums [[buffer(17)]], \
-      constant GDNDecodeBatchParams &params [[buffer(18)]], GDN_DECODE_THREADS) { \
+    device bfloat *table [[buffer(17)]], device float *sums [[buffer(18)]], \
+      constant GDNDecodeBatchParams &params [[buffer(19)]], GDN_DECODE_THREADS) { \
     GDN_DECODE_BODY(KeyHeads, ValueHeads, HeadDim, ConvDim, PackedWidth, table, sums, Layout, W, State) \
   }
 // Each entry over an fp32 state and, as Name_bf16_state, a bf16 one.

@@ -190,6 +190,32 @@ public:
     image_.repack(std::move(repack));
   }
 
+  // Two tensors' rows interleaved per head - each head's queries, then its
+  // output gate - as one projection's, which the packed q holds as the
+  // Qwen3.5's fused rows do (Ripple's GGUF keeps the gate beside the queries
+  // in a tensor of its own, whose rows the packed q takes per head).
+  void quantizedPair(const std::string &queries, const std::string &gates, uint64_t rows, uint64_t columns,
+                     uint64_t headRows) {
+    const GgufTensor *q = find(queries, quantizedType);
+    const GgufTensor *gate = find(gates, quantizedType);
+    if (!q || !gate) return;
+    if (q->rows() != rows || q->columns() != columns || gate->rows() != rows || gate->columns() != columns)
+      throw GgufError("unexpected shape for " + queries + " or " + gates);
+    if (rows % headRows) throw GgufError(queries + " does not hold whole heads");
+    const uint32_t format = imageFormat(q->type);
+    if (imageFormat(gate->type) != format)
+      throw GgufError(queries + " and " + gates + " are not of one quantization format");
+    Repack repack = image_.planes(format, 2 * rows, columns, queries);
+    const uint64_t rowBytes = ggufRowBytes(kQuantFormats[format], columns);
+    for (uint64_t head = 0; head < rows / headRows; ++head)
+      for (const GgufTensor *tensor : {q, gate}) {
+        TensorRows source = tensorRows(*tensor, headRows, rowBytes, {}, false);
+        source.first = head * headRows;
+        repack.sources.push_back(std::move(source));
+      }
+    image_.repack(std::move(repack));
+  }
+
   // Rows [N, K] as quantized() repacks them, but of a BF16 or F16 tensor
   // as the Q8_0 rows the reference quantize_row_q8_0_ref writes from its
   // values, which the writer quantizes (TensorRows::ggufFloatRowBytes).
@@ -423,10 +449,14 @@ private:
   // also carry an .input_scale of as many values, the activation scale of
   // NVIDIA's W4A4: a weights-only decode (ours, as llama.cpp's) never reads
   // it, so it is held to that count and recorded as read, unused; beside any
-  // other tensor, or alone, it is refused as unused too.
-  TensorRows tensorRows(const GgufTensor &tensor, uint64_t count, uint64_t rowBytes, RowOrder order = {}) const {
+  // other tensor, or alone, it is refused as unused too. `whole` false reads
+  // a tensor's first rows without a whole-tensor size check (a fused pair's
+  // per-head repack sources).
+  TensorRows tensorRows(const GgufTensor &tensor, uint64_t count, uint64_t rowBytes, RowOrder order = {},
+                        bool whole = true) const {
+    const std::string stem = tensor.name.ends_with(".weight") ? tensor.name.substr(0, tensor.name.size() - 7) : "";
     if (tensor.type != ggml::kNVFP4) {
-      if (!count || count * rowBytes != tensor.bytes) throw GgufError("unexpected size for " + tensor.name);
+      if (whole && (!count || count * rowBytes != tensor.bytes)) throw GgufError("unexpected size for " + tensor.name);
       return {tensor.name, tensor.type, tensor.offset, count, rowBytes, order, &file_.source(tensor.file)};
     }
     const QuantFormat &format = kQuantFormats[GGUF_FMT_NVFP4];
@@ -438,7 +468,6 @@ private:
                       " elements");
     TensorRows rows{tensor.name, QUANT_NVFP4_TYPE, tensor.offset, count, rowBytes, order, &file_.source(tensor.file)};
     rows.ggufNvfp4RowBytes = sourceRowBytes;
-    const std::string stem = tensor.name.ends_with(".weight") ? tensor.name.substr(0, tensor.name.size() - 7) : "";
     const uint64_t values = stem.ends_with("_exps") ? geometry_.experts : 1;
     // The weight's F32 tensor stem + suffix of `values` values, read, or
     // nullptr without one.
@@ -654,11 +683,11 @@ struct FlintGguf final {
     expect("expert_weights_norm", 1);
     expectFloat("expert_weights_scale", 1.0);
     // Every layer attends: a layer's bit is its attention layer's.
-    const auto pattern = [&g](uint64_t mask) {
-      return [&g, mask](std::span<const double> values) {
+    const auto pattern = [&g](const kv::LayerMask &mask) {
+      return [&g, &mask](std::span<const double> values) {
         bool matches = values.size() == g.layers;
         for (uint32_t layer = 0; matches && layer < g.layers; ++layer)
-          matches = values[layer] == double(layer < 64 && (mask >> layer & 1));
+          matches = values[layer] == double(mask.test(layer));
         return matches;
       };
     };
@@ -680,12 +709,69 @@ struct FlintGguf final {
 };
 
 // Calls `use` with what the GGUFs of `architecture` hold: Qwen3.8-Flash-Next's
-// (Qwen4ExpGguf), Flint's (FlintGguf) or the Qwen3.5 hybrid's (HybridGguf).
-// Another architecture is refused, so a layout without a family here fails
-// by name rather than planning as the hybrid.
+// (Qwen4ExpGguf), Flint's (FlintGguf), the Qwen3.5 hybrid's (HybridGguf) or
+// Ripple's (RippleGguf). Another architecture is refused, so a layout without
+// a family here fails by name rather than planning as the hybrid.
+// Ripple's GGUFs (ricursive): the hybrid's mixer and FFN sections with a
+// norm after each FFN, the packed q holding the gate rows as the Qwen3.5's
+// own do, a value-residual lambda a block, and the 4+1 sliding pattern the
+// layout holds and the file's array states. Its planner is to land; the
+// metadata the installer checks and the arrays the planner reads are here.
+struct RippleGguf final {
+  static constexpr std::string_view architecture = "ricursive";
+
+  template <class Expect, class ExpectFloat, class ExpectArray>
+  static void metadata(const Expect &expect, const ExpectFloat &expectFloat, const ExpectArray &expectArray,
+                       const QwenTargetDimensions &g) {
+    expect("attention.sliding_window", g.slidingWindow);
+    expectFloat("embedding_scale", g.embeddingScale);
+    expectFloat("swiglu_clamp", g.swigluClamp);
+    // The 4+1 sliding pattern the layout holds; the installer's copy of the
+    // scalar metadata leaves it out.
+    const auto pattern = [&g](const kv::LayerMask &mask) {
+      return [&g, &mask](std::span<const double> values) {
+        bool matches = values.size() == g.layers;
+        for (uint32_t layer = 0; matches && layer < g.layers; ++layer)
+          matches = values[layer] == double(mask.test(layer));
+        return matches;
+      };
+    };
+    expectArray("attention.sliding_window_pattern", pattern(g.slidingLayers));
+  }
+
+  // A block's sections around its mixer and FFN, the packed q holding each
+  // query head's output gate after its queries, the block's value-residual
+  // lambda beside the mixer, and a norm after each FFN.
+  static void layer(Builder &b, const QwenTargetDimensions &g, uint32_t index) {
+    const std::string p = prefix(index);
+    const uint64_t kvRows = uint64_t{g.attentionKvHeads} * g.attentionHeadDimension;
+    b.floatNorm(p + "attn_norm.weight", g.hiddenSize);
+    b.quantizedPair(p + "attn_q.weight", p + "attn_gate.weight", g.attentionWidth, g.hiddenSize,
+                    g.attentionHeadDimension);
+    b.quantized(p + "attn_k.weight", kvRows, g.hiddenSize);
+    b.quantized(p + "attn_v.weight", kvRows, g.hiddenSize);
+    b.floatNorm(p + "attn_q_norm.weight", g.attentionHeadDimension);
+    b.floatNorm(p + "attn_k_norm.weight", g.attentionHeadDimension);
+    b.quantized(p + "attn_output.weight", g.hiddenSize, g.attentionWidth);
+    b.floatNorm(p + "post_attention_norm.weight", g.hiddenSize);
+    b.floatRows(p + "attn_vres_lambda.weight", 1, 1, false);
+    b.quantized(p + "ffn_gate.weight", g.intermediateSize, g.hiddenSize);
+    b.quantized(p + "ffn_up.weight", g.intermediateSize, g.hiddenSize);
+    b.quantized(p + "ffn_down.weight", g.hiddenSize, g.intermediateSize);
+    b.floatNorm(p + "ffn_norm.weight", g.hiddenSize);
+    b.floatNorm(p + "post_ffw_norm.weight", g.hiddenSize);
+  }
+
+  static void head(Builder &b, const QwenTargetDimensions &g) { b.floatNorm("output_norm.weight", g.hiddenSize); }
+
+  static void tables(const GgufFile &, const QwenTargetDimensions &, PlanOptions, Problems &,
+                     std::vector<Image> &) {}
+};
+
 template <class Use> decltype(auto) withFamily(std::string_view architecture, Use &&use) {
   if (architecture == Qwen4ExpGguf::architecture) return use(Qwen4ExpGguf{});
   if (architecture == FlintGguf::architecture) return use(FlintGguf{});
+  if (architecture == RippleGguf::architecture) return use(RippleGguf{});
   if (std::ranges::find(HybridGguf::architectures, architecture) == HybridGguf::architectures.end())
     throw GgufError("no GGUF family plans architecture " + std::string(architecture));
   return use(HybridGguf{});

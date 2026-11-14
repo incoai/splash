@@ -23,7 +23,7 @@ constexpr double kHealthCheckIntervalMilliseconds = 1000.0;
 constexpr double kMaskWaitMilliseconds = double(supervision::kMaskWait.count());
 // A junction costs a cached state, its capture and up to a draft window of
 // draft-context rows; a later request must save at least that much prefill.
-constexpr uint32_t kMinimumJunctionGain = model::ExecutionLimits::draftContextTokens;
+
 
 constexpr std::string_view kKvUnreadableMessage =
     "KV of an earlier part of the conversation could not be read from the SSD cache";
@@ -1215,12 +1215,26 @@ DraftContextPlan Engine::configureDraftStatePlan(Request &active,
   const uint32_t latestReplayBoundary = replayStateBoundary(active);
   // Plan draft windows before prefill; arbitrary chunk ends do not carry a
   // complete draft state, the point the lane resumes from does. Progress
-  // points remain disposable after restoration.
-  for (const uint32_t checkpoint : plannedCheckpoints(
-           stateBoundary, latestReplayBoundary, config_.prefillCheckpointTokens)) {
+  // points remain disposable after restoration. The interval spans two of
+  // the model's own draft windows, whole KV pages, within the compiled
+  // rings' ceiling, unless the start names one; a junction is worth
+  // capturing from a window of the model's own gain.
+  const uint32_t window = model_.draftWindow();
+  // The interval the checkpoint capture lands at is under investigation for
+  // the long-conversation corruption: SPLASH_CHECKPOINT_INTERVAL overrides.
+  uint32_t configured = config_.prefillCheckpointTokens;
+  if (const char *interval = getenv("SPLASH_CHECKPOINT_INTERVAL"))
+    configured = static_cast<uint32_t>(std::stoul(interval));
+  const uint32_t derived = std::min<uint32_t>(
+      (2u * window + KvCache::pageTokens - 1) / KvCache::pageTokens * KvCache::pageTokens,
+      kPrefillCheckpointTokens);
+  const uint32_t interval = configured ? configured : derived;
+  const uint32_t gain = std::max(model::ExecutionLimits::draftContextTokens, window);
+  for (const uint32_t checkpoint :
+       plannedCheckpoints(stateBoundary, latestReplayBoundary, interval)) {
     addStateBoundary(active, stateBoundary, checkpoint, true, true);
   }
-  if (junctionBoundary >= stateBoundary + kMinimumJunctionGain)
+  if (junctionBoundary >= stateBoundary + gain)
     addStateBoundary(active, stateBoundary, junctionBoundary, false, true);
   addStateBoundary(active, stateBoundary, latestReplayBoundary,
                    latestReplayBoundary != promptReplayBoundary(active), true);
@@ -1252,7 +1266,7 @@ bool Engine::addStateBoundary(Request &active, uint32_t after, uint32_t tokens,
   // boundary before it, from `after` when the lane's draft state is
   // complete there, or whole past `after` (planDraftContext).
   if (!completeAfter && found == remaining &&
-      tokens - after < model::ExecutionLimits::draftContextTokens)
+      tokens - after < std::max(model::ExecutionLimits::draftContextTokens, model_.draftWindow()))
     return false;
   active.stateBoundaries.insert(found, {tokens, disposable});
   return true;
@@ -1280,7 +1294,7 @@ DraftContextPlan Engine::pendingDraftStatePlan(const Request &active,
   boundaries.reserve(active.stateBoundaries.size() - active.stateBoundaryCursor);
   for (size_t i = active.stateBoundaryCursor; i < active.stateBoundaries.size(); ++i)
     boundaries.push_back(active.stateBoundaries[i].tokens);
-  return planDraftContext(stateBoundary, active.replayTokens, boundaries);
+  return planDraftContext(stateBoundary, active.replayTokens, boundaries, model_.draftWindow());
 }
 
 void Engine::discardPendingStateBoundaries(Request &active) noexcept {
@@ -1556,7 +1570,7 @@ Engine::Prepared Engine::prepare(const BatchPlan &plan, std::vector<ModelBatchIt
     Request &active = request(scheduled.requestId);
     if (!active.lane)
       throw std::logic_error("scheduled request is not resident");
-    const std::optional<Denied> kv = growLane(active, workEndOf(active, scheduled, prefill), context);
+    const std::optional<Denied> kv = growLane(active, workEndOf(active, scheduled, prefill, model_.draftRows()), context);
     if (commandTaken())
       return Prepared::Replan;
     if (kv)
@@ -1739,8 +1753,8 @@ std::vector<LaneShape> Engine::laneShapes(std::span<const PrefillAdmission> cand
 }
 
 uint64_t Engine::workEndOf(const Request &active, const BatchItem &scheduled,
-                           bool prefill) noexcept {
-  uint64_t workEnd = active.exactTokens.size() + model::ExecutionLimits::targetVerifyRows;
+                           bool prefill, uint32_t decodeRows) noexcept {
+  uint64_t workEnd = active.exactTokens.size() + 2 * decodeRows;
   if (prefill) {
     workEnd = scheduled.promptOffset + scheduled.tokenCount;
     if (active.stateBoundaryCursor < active.stateBoundaries.size())

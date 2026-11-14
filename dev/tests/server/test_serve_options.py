@@ -82,6 +82,9 @@ OPTIONS = {
     "--state-format": values(
         "--state-format", {"fp32": "fp32", "bf16": "bf16"}, ("fp16", "int8")
     ),
+    "--kv-window-trim": values(
+        "--kv-window-trim", {"on": "on", "off": "off"}, ("always", "1")
+    ),
     "--disable-ane": ([(["--disable-ane"], True)], []),
     "--activations": values(
         "--activations", {"auto": "auto", "bf16": "bf16"}, ("", "on", "off", "BF16")

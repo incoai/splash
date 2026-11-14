@@ -148,6 +148,32 @@ bool VerifyBudget::explores(uint32_t lanes, bool constrained) const {
   return tableCycles_[constrained ? 1 : 0][lanes - 1] % kExploreCycles == kExploreCycles - 1;
 }
 
+uint32_t VerifyBudget::rowCap(uint32_t lanes, uint32_t blockRows) const {
+  static_cast<void>(lanes);
+  if (blockRows <= SPLASH_TARGET_VERIFY_ROWS)
+    return blockRows;
+  return twoPass_ ? blockRows : SPLASH_TARGET_VERIFY_ROWS;
+}
+
+void VerifyBudget::observeAccepted(uint32_t accepted) {
+  // The head's share is what one sub-pass keeps; the tail's is what only
+  // the second sub-pass verifies (accepted past its rows).
+  const uint32_t tail = accepted > SPLASH_TARGET_VERIFY_ROWS
+                            ? accepted - SPLASH_TARGET_VERIFY_ROWS
+                            : 0;
+  acceptedEma_ = 0.8 * acceptedEma_ + 0.2 * accepted;
+  tailEma_ = 0.8 * tailEma_ + 0.2 * tail;
+  const double head = acceptedEma_ - tailEma_;
+  const bool pays = twoPass_ ? tailEma_ > head - 0.5 : tailEma_ > head + 0.5;
+  if (pays != twoPass_) {
+    twoPass_ = pays;
+    logLine("Verify budget: the block's second sub-pass ",
+            twoPass_ ? "pays again" : "stopped paying", " (accepted ",
+            std::fixed, std::setprecision(2), acceptedEma_, " a cycle, ",
+            tailEma_, " past the first sub-pass)");
+  }
+}
+
 void VerifyBudget::observe(std::span<const Lane> lanes, bool constrained, double milliseconds) {
   if (lanes.empty() || lanes.size() > kLanes)
     throw std::invalid_argument("invalid verify budget cycle");

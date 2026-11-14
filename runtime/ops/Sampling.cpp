@@ -48,6 +48,7 @@ ThinkingCutoffs thinkingCutoffs(std::span<const SamplingPolicy> policies, uint32
   params.vocabulary = vocabulary;
   params.rows = rows;
   params.drafted_rows = draftedRows;
+  params.lane_rows = rows;
   params.mask_words = (vocabulary + 31) / 32;
   params.mask_row = maskRow;
   for (uint32_t lane = 0; lane < policies.size(); ++lane) {
@@ -128,10 +129,16 @@ void Sampling::countPenaltyTokens(std::span<uint32_t> words,
     ++words[token];
 }
 
-Sampling::Sampling(uint32_t vocabulary)
-    : vocabulary_(vocabulary), maskWords_((vocabulary + 31) / 32) {
+Sampling::Sampling(uint32_t vocabulary, uint32_t draftCandidates, uint32_t verifyRows)
+    : vocabulary_(vocabulary), draftCandidates_(draftCandidates),
+      maskWords_((vocabulary + 31) / 32), verifyRows_(verifyRows) {
   if (!vocabulary)
     throw std::invalid_argument("invalid sampling geometry");
+  if (draftCandidates_ != SPLASH_DRAFT_CANDIDATES && draftCandidates_ != 32)
+    throw std::invalid_argument("invalid draft candidate count");
+  if (verifyRows_ < SPLASH_TARGET_VERIFY_ROWS ||
+      verifyRows_ > SPLASH_DRAFT_BLOCK_ROWS_LIMIT)
+    throw std::invalid_argument("invalid draft block rows");
 }
 
 void Sampling::addPenalties(metal::CommandGraph &graph,
@@ -141,7 +148,8 @@ void Sampling::addPenalties(metal::CommandGraph &graph,
                             bool verify) const {
   SamplingPenaltyParams params{};
   params.vocabulary = vocabulary_;
-  params.rows = verify ? SPLASH_TARGET_VERIFY_ROWS : 1;
+  params.rows = verify ? verifyRows_ : 1;
+  params.lane_rows = verifyRows_;
   params.row_offset = rowOffset;
   const uint64_t rowBytes = uint64_t{vocabulary_} * sizeof(uint32_t);
   for (uint32_t lane = 0; lane < policies.size(); ++lane) {
@@ -167,7 +175,7 @@ void Sampling::addPenalties(metal::CommandGraph &graph,
   // Entries follow the lanes, so the last one's lane is the highest.
   const uint64_t lanes = uint64_t{params.logits_lane[params.entries - 1]} + 1;
   if (verify)
-    requireBytes(buffers.inputTokens, lanes * SPLASH_TARGET_VERIFY_ROWS * sizeof(uint32_t), "verify input token");
+    requireBytes(buffers.inputTokens, lanes * verifyRows_ * sizeof(uint32_t), "verify input token");
   const metal::DispatchSize groups{
       (vocabulary_ + kPenaltyThreads - 1) / kPenaltyThreads, params.entries, 1};
   if (!verify) {
@@ -187,10 +195,11 @@ void Sampling::addInitial(metal::CommandGraph &graph,
                           const PenaltyTable &penalties) const {
   if (policies.empty() || policies.size() > kMaximumLanes)
     throw std::invalid_argument("invalid sampling batch width");
-  if (rowOffset >= SPLASH_TARGET_VERIFY_ROWS)
+  if (rowOffset >= verifyRows_)
     throw std::invalid_argument("invalid initial sampling row");
   const TargetSamplingParams params =
-      selection(policies, buffers, {1, rowOffset, 0, SPLASH_UNIFORM_INITIAL, 0}, stopTokens);
+      selection(policies, buffers,
+                {1, rowOffset, 0, SPLASH_UNIFORM_INITIAL, 0, SPLASH_TARGET_VERIFY_ROWS}, stopTokens);
   addPenalties(graph, policies, buffers, penalties, rowOffset, false);
   addSelection(graph, params, policies, buffers);
 }
@@ -206,7 +215,7 @@ void Sampling::addVerify(metal::CommandGraph &graph,
   // uniform.
   const TargetSamplingParams params =
       selection(policies, buffers,
-                {SPLASH_TARGET_VERIFY_ROWS, 0, 1, SPLASH_UNIFORM_CORRECTION, SPLASH_DRAFT_PROPOSAL_TOKENS},
+                {verifyRows_, 0, 1, SPLASH_UNIFORM_CORRECTION, verifyRows_ - 1, verifyRows_},
                 stopTokens);
   addPenalties(graph, policies, buffers, penalties, 0, true);
   addSelection(graph, params, policies, buffers);
@@ -219,6 +228,7 @@ TargetSamplingParams Sampling::selection(std::span<const SamplingPolicy> policie
   params.vocabulary = vocabulary_;
   params.mask_words = maskWords_;
   params.rows = rows.rows;
+  params.lane_rows = rows.laneRows ? rows.laneRows : verifyRows_;
   params.logits_row = rows.logitsRow;
   params.mask_row = rows.maskRow;
   params.uniform = rows.uniform;
@@ -251,11 +261,11 @@ TargetSamplingParams Sampling::selection(std::span<const SamplingPolicy> policie
   };
   const SamplingWorkspace greedy = rowsWorkspace(greedyLanes), sampled = rowsWorkspace(sampledLanes);
   requireBytes(buffers.logits,
-               ((lanes - 1) * SPLASH_TARGET_VERIFY_ROWS + rows.logitsRow + rows.rows) * vocabulary_ * sizeof(float),
+               ((lanes - 1) * params.lane_rows + rows.logitsRow + rows.rows) * vocabulary_ * sizeof(float),
                "sampling logits");
   if (constrainedLanes)
     requireBytes(buffers.constraintMasks,
-                 ((constrainedLanes - 1) * (SPLASH_TARGET_VERIFY_ROWS + 1) + rows.maskRow + rows.rows) * maskWords_ *
+                 ((constrainedLanes - 1) * (params.lane_rows + 1) + rows.maskRow + rows.rows) * maskWords_ *
                      sizeof(uint32_t),
                  "constraint mask");
   requireBytes(buffers.outputTokens, lanes * rows.rows * sizeof(uint32_t), "sampled token");
@@ -273,7 +283,8 @@ TargetSamplingParams Sampling::selection(std::span<const SamplingPolicy> policie
     // its proposal position's candidates.
     if (drafted) {
       requireBytes(buffers.inputTokens, (last * rows.rows + drafted + 1) * sizeof(uint32_t), "verify input token");
-      const uint64_t candidates = (last * SPLASH_DRAFT_PROPOSAL_TOKENS + drafted) * SPLASH_DRAFT_CANDIDATES;
+      const uint64_t candidates =
+          (last * (verifyRows_ - 1) + drafted) * draftCandidates_;
       requireBytes(buffers.draftCandidates, candidates * sizeof(uint32_t), "draft candidate");
       requireBytes(buffers.draftProbabilities, candidates * sizeof(float), "draft probability");
     }
@@ -305,7 +316,8 @@ void Sampling::addSelection(metal::CommandGraph &graph, const TargetSamplingPara
               {buffers.logits, buffers.constraintMasks, buffers.partialMasses,
                buffers.vocabularyRows},
               params, {selected, 1, 1}, {kVocabularyThreads, 1, 1});
-    graph.add("decode_sample_vocabulary_draw",
+    graph.add(draftCandidates_ == 32 ? "decode_sample_vocabulary_draw_k32"
+                                     : "decode_sample_vocabulary_draw",
               {buffers.logits, buffers.constraintMasks, buffers.vocabularyRows,
                buffers.inputTokens, buffers.draftCandidates,
                buffers.draftProbabilities, buffers.uniforms,
@@ -337,11 +349,11 @@ void Sampling::addThinkingDrafts(metal::CommandGraph &graph, std::span<const Sam
   // The cutoffs of the verify that follows (addVerify), whose masks the
   // drafts do not read.
   const ThinkingCutoffs cutoffs =
-      thinkingCutoffs(policies, vocabulary_, SPLASH_TARGET_VERIFY_ROWS, SPLASH_DRAFT_PROPOSAL_TOKENS, 1);
+      thinkingCutoffs(policies, vocabulary_, verifyRows_, verifyRows_ - 1, 1);
   if (!cutoffs.draftingLanes)
     return;
   // Such a lane writes its own proposals.
-  requireBytes(proposedTokens, uint64_t{cutoffs.draftingLanes} * SPLASH_DRAFT_PROPOSAL_TOKENS * sizeof(uint32_t),
+  requireBytes(proposedTokens, uint64_t{cutoffs.draftingLanes} * (verifyRows_ - 1) * sizeof(uint32_t),
                "proposed token");
   graph.add("decode_draft_thinking_cutoff", {std::move(proposedTokens)}, cutoffs.params, {policies.size(), 1, 1},
             {1, 1, 1});
@@ -360,7 +372,7 @@ void Sampling::addAcceptance(
   std::ranges::copy(stopTokens.ids, params.stop_tokens);
   for (uint32_t lane = 0; lane < lanes; ++lane) {
     if (!maximumRetained[lane] ||
-        maximumRetained[lane] > SPLASH_TARGET_VERIFY_ROWS)
+        maximumRetained[lane] > verifyRows_)
       throw std::invalid_argument("invalid DFlash retention limit");
     params.remaining[lane] = maximumRetained[lane];
     if (policies[lane].samples())
@@ -370,28 +382,31 @@ void Sampling::addAcceptance(
   // up to the longer of the draft and its retention limit; a sampling lane
   // also its draft's candidates and their probabilities, its rows' target
   // probabilities and its acceptance uniforms (metal/abi/Sampling.h).
-  constexpr uint64_t kProposals = SPLASH_DRAFT_PROPOSAL_TOKENS;
+  const uint64_t kProposals = verifyRows_ - 1;
   requireBytes(buffers.proposedTokens, lanes * kProposals * sizeof(uint32_t), "proposed token");
   requireBytes(buffers.outputTokens,
-               (uint64_t{lanes - 1} * SPLASH_TARGET_VERIFY_ROWS + std::max<uint64_t>(kProposals, maximumRetained.back())) *
+               (uint64_t{lanes - 1} * verifyRows_ + std::max<uint64_t>(kProposals, maximumRetained.back())) *
                    sizeof(uint32_t),
                "target token");
   requireBytes(buffers.retainedCounts, lanes * sizeof(uint32_t), "retained count");
   requireBytes(buffers.acceptedCounts, lanes * sizeof(uint32_t), "accepted count");
   requireBytes(buffers.verifyRows, lanes * sizeof(uint32_t), "verify rows");
   if (const uint64_t sampledLanes = std::bit_width(params.sampling_mask)) {
-    const uint64_t candidates = sampledLanes * kProposals * SPLASH_DRAFT_CANDIDATES;
+    const uint64_t candidates = sampledLanes * kProposals * draftCandidates_;
     requireBytes(buffers.candidates, candidates * sizeof(uint32_t), "draft candidate");
     requireBytes(buffers.proposalProbabilities, candidates * sizeof(float), "draft probability");
     requireBytes(buffers.targetVocabularyRows,
-                 ((sampledLanes - 1) * SPLASH_TARGET_VERIFY_ROWS + kProposals) * sizeof(TargetVocabularyRow),
+                 ((sampledLanes - 1) * verifyRows_ + kProposals) * sizeof(TargetVocabularyRow),
                  "target vocabulary row");
     requireBytes(buffers.uniforms,
                  ((sampledLanes - 1) * SPLASH_SAMPLING_UNIFORMS + SPLASH_UNIFORM_ACCEPTANCE + kProposals) *
                      sizeof(float),
                  "acceptance uniform");
   }
-  graph.add("decode_accept_dflash",
+  params.proposal_tokens = static_cast<uint32_t>(kProposals);
+  params.verify_rows = verifyRows_;
+  graph.add(draftCandidates_ == 32 ? "decode_accept_dflash_k32"
+                                   : "decode_accept_dflash",
             {buffers.proposedTokens, buffers.candidates,
              buffers.proposalProbabilities, buffers.targetVocabularyRows,
              buffers.uniforms, buffers.outputTokens, buffers.retainedCounts,

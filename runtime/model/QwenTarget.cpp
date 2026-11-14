@@ -94,9 +94,10 @@ std::vector<uint32_t> QwenTarget::verifyTableRows(uint32_t) const { return {}; }
 
 void QwenTarget::addVerifyInput(metal::CommandGraph &graph, metal::MetalBuffer draftInput,
                                 metal::MetalBuffer proposals, metal::MetalBuffer verifyInput,
-                                uint32_t lanes) const {
+                                metal::MetalBuffer verifyInputPasses, uint32_t lanes,
+                                uint32_t rows) const {
   ops::Embedding::addVerifyInput(graph, std::move(draftInput), std::move(proposals), std::move(verifyInput),
-                                 geometry_.vocabularySize, lanes);
+                                 std::move(verifyInputPasses), geometry_.vocabularySize, lanes, rows);
 }
 
 void QwenTarget::addEmbedding(metal::CommandGraph &graph,
@@ -104,7 +105,7 @@ void QwenTarget::addEmbedding(metal::CommandGraph &graph,
                               metal::MetalBuffer hidden,
                               uint32_t rows) const {
   ops::Embedding::add(graph, std::move(tokens), weightsBase_.tokenEmbedding, std::move(hidden),
-                      rows);
+                      rows, geometry_.embeddingScale);
 }
 
 void QwenTarget::addStateCommit(metal::CommandGraph &, QwenTargetCommitBuffers buffers, uint32_t lanes) const {
@@ -178,11 +179,14 @@ QwenTarget::VerifyStep QwenTarget::verifyStep(metal::CommandGraph &graph, const 
   for (uint32_t lane = 0; lane < lanes; ++lane) {
     if (geometry_.stateLayout.auxiliaryBytes && !buffers.auxiliary[lane])
       throw std::invalid_argument("Qwen verify lane without its auxiliary state");
-    histories[lane] = chunks[lane].committed_tokens;
+    // The pass's rows see the block's earlier sub-passes' rows in the pages:
+    // the split sizing counts them with the history.
+    histories[lane] = chunks[lane].committed_tokens + chunks[lane].row_base;
   }
   VerifyStep step{graph, buffers, kvLayers, spilled, chunks, lanes, lanes * kVerifyRows,
                   operators_.verifyAttention(lanes, geometry_.attentionQueryHeads, geometry_.kvLayout,
                                              std::span(histories).first(lanes))};
+  step.rowBase = chunks.front().row_base;
   if (const uint32_t window = geometry_.kvLayout.windowTokens)
     step.windowedAttention.emplace(operators_.verifyAttention(lanes, geometry_.attentionQueryHeads,
                                                               geometry_.kvLayout, std::span(histories).first(lanes),
@@ -346,18 +350,19 @@ void QwenTarget::addPrefillMixer(PrefillStep &step, const QwenAttentionWeights &
                    step.rows, b.linearScratch, std::move(output.rows), std::move(residual));
 }
 
-ops::LinearInput QwenTarget::decodeInput(const ops::Projection &projection, uint32_t lanes) const {
-  return operators_.linear().decodePlan(projection, lanes).input();
+ops::LinearInput QwenTarget::decodeInput(const ops::Projection &projection, uint32_t lanes,
+                                         uint32_t rows) const {
+  return operators_.linear().decodePlan(projection, lanes, ops::LinearEpilogue::None, nullptr, rows).input();
 }
 
 void QwenTarget::addDecodeProjection(metal::CommandGraph &graph, metal::MetalBuffer input,
                                      const ops::Projection &projection, metal::MetalBuffer output, uint32_t lanes,
-                                     ops::LinearScratch scratch, ops::PreparedInput prepared) const {
+                                     ops::LinearScratch scratch, ops::PreparedInput prepared, uint32_t rows) const {
   const ops::Linear &linear = operators_.linear();
   linear.add(graph,
              {.input = std::move(input), .output = std::move(output), .scratch = scratch,
               .prepared = std::move(prepared)},
-             projection, linear.decodePlan(projection, lanes));
+             projection, linear.decodePlan(projection, lanes, ops::LinearEpilogue::None, nullptr, rows));
 }
 
 // Each producer emits the table (if any) its consumer's plan reads.
@@ -373,8 +378,8 @@ void QwenTarget::addVerifyMixer(VerifyStep &step, const QwenGdnWeights &mixer, o
   const ops::PreparedInput hidden = ops::GDN::addDecode(
       step.graph,
       {b.gdnPacked, mixer.convolutionWeights, b.currentGdnStates, b.nextGdnStates, b.gdnTape,
-       std::span(b.gdnTapeLanes).first(step.lanes), mixer.decay, mixer.timeBias, mixer.mixerNorm, b.gdnHidden,
-       b.verifyRows, b.linearScratch},
+       {}, std::span(b.gdnTapeLanes).first(step.lanes), mixer.decay, mixer.timeBias,
+       mixer.mixerNorm, b.gdnHidden, b.verifyRows, b.linearScratch},
       geometry_.gdnShape(), step.lanes, layer, geometry_.stateLayout.strides(),
       mixer.outputHeadOrder, outputPlan.input());
   linear.add(step.graph,
@@ -471,22 +476,23 @@ void QwenTarget::addVerifyMoe(VerifyStep &step, const ops::NormWeights &norm, co
 
 void QwenTarget::addNormalizedHead(metal::CommandGraph &graph, const ops::NormWeights &finalNorm,
                                    metal::MetalBuffer hidden, metal::MetalBuffer finalHidden,
-                                   metal::MetalBuffer logits, uint32_t lanes, ops::LinearScratch scratch) const {
+                                   metal::MetalBuffer logits, uint32_t lanes, uint32_t rows,
+                                   ops::LinearScratch scratch) const {
   const ops::PreparedInput normalized =
       ops::Normalization::addRms(graph, std::move(hidden), finalNorm, finalHidden, geometry_.hiddenSize,
-                                 lanes * kVerifyRows, scratch, decodeInput(vocabularyProjection(), lanes));
+                                 rows, scratch, decodeInput(vocabularyProjection(), lanes, rows));
   addDecodeProjection(graph, std::move(finalHidden), vocabularyProjection(), std::move(logits), lanes, scratch,
-                      normalized);
+                      normalized, rows);
 }
 
 void QwenTarget::addCapture(metal::CommandGraph &graph, uint32_t slot, metal::MetalBuffer output,
                             uint32_t sourceRow, metal::MetalBuffer captured, uint32_t destinationRow,
-                            uint32_t rows) const {
+                            uint32_t rows, ops::RowLanes lanes) const {
   const uint32_t width = geometry_.hiddenSize, capturedWidth = geometry_.capturedHiddenSize();
   if (slot >= capturedWidth / width)
     throw std::logic_error("Qwen target capture slot past the captured hidden rows");
   ops::RowCopy::add(graph, std::move(output), {sourceRow, width, 0}, std::move(captured),
-                    {destinationRow, capturedWidth, slot * width}, rows, width);
+                    {destinationRow, capturedWidth, slot * width}, rows, width, lanes);
 }
 
 namespace {
@@ -524,7 +530,9 @@ public:
 
   void addVerify(metal::CommandGraph &graph, QwenTargetVerifyBuffers buffers, const kv::PageStorage &kv,
                  SpilledKvReads &spilled, std::span<const kv::ChunkedPrefillParams> chunks,
-                 uint32_t lanes) const override {
+                 uint32_t lanes, uint32_t blockRows, uint32_t verifiedRows) const override {
+    if (blockRows != SPLASH_TARGET_VERIFY_ROWS || verifiedRows != blockRows)
+      throw std::invalid_argument("this target verifies its whole 8-row block");
     VerifyStep step = verifyStep(graph, buffers, kv, spilled, chunks, lanes);
     for (uint32_t index = 0; index < geometry_.layers; ++index) {
       const Layer &layer = weights_.layers[index];
@@ -545,14 +553,15 @@ public:
         addCapture(step.graph, *slot, output, 0, buffers.capturedTargetHidden, 0, step.rows);
     }
     requireLayerPartition(step.gdnLayer, step.attentionLayer);
-    addHeadBatch(step.graph, buffers.hidden[geometry_.layers & 1], buffers.finalHidden, buffers.logits, step.lanes,
-                 buffers.linearScratch);
+    addHeadBatch(step.graph, buffers.hidden[geometry_.layers & 1], buffers.finalHidden, buffers.logits,
+                 step.lanes, step.rows, buffers.linearScratch);
   }
 
   void addHeadBatch(metal::CommandGraph &graph, metal::MetalBuffer hidden, metal::MetalBuffer finalHidden,
-                    metal::MetalBuffer logits, uint32_t lanes, ops::LinearScratch scratch) const override {
-    addNormalizedHead(graph, weights_.finalNorm, std::move(hidden), std::move(finalHidden), std::move(logits), lanes,
-                      scratch);
+                    metal::MetalBuffer logits, uint32_t lanes, uint32_t rows,
+                    ops::LinearScratch scratch) const override {
+    addNormalizedHead(graph, weights_.finalNorm, std::move(hidden), std::move(finalHidden), std::move(logits),
+                      lanes, rows, scratch);
   }
 
 private:

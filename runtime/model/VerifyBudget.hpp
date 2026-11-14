@@ -21,8 +21,8 @@ namespace splash::model {
 
 class VerifyBudget final {
 public:
-  static constexpr uint32_t kPositions = SPLASH_DRAFT_PROPOSAL_TOKENS;
-  static constexpr uint32_t kBlockRows = SPLASH_DRAFT_QUERY_ROWS;
+  static constexpr uint32_t kPositions = SPLASH_DRAFT_BLOCK_PROPOSALS_LIMIT;
+  static constexpr uint32_t kBlockRows = SPLASH_DRAFT_BLOCK_ROWS_LIMIT;
   static constexpr uint32_t kLanes = SPLASH_MAXIMUM_BATCH_WIDTH;
   static constexpr uint32_t kRefitCycles = 64;
   static constexpr uint32_t kLabels = 4096;
@@ -78,6 +78,13 @@ public:
   [[nodiscard]] std::array<float, kBlockRows * kLanes + 1> costs(uint32_t lanes, bool constrained) const;
   // Whether the next cycle of `lanes` lanes verifies every row.
   [[nodiscard]] bool explores(uint32_t lanes, bool constrained) const;
+  // The rows a cycle of `lanes` lanes may verify: the whole block while the
+  // rows past the first sub-pass pay for the second target pass (their
+  // accepted share passed the first sub-pass's), else the first sub-pass
+  // alone. Explore cycles observe the whole block either way.
+  [[nodiscard]] uint32_t rowCap(uint32_t lanes, uint32_t blockRows) const;
+  // A completed cycle's accepted tokens, for the regime's share.
+  void observeAccepted(uint32_t accepted);
   // A completed cycle and its commands' wall time.
   void observe(std::span<const Lane> lanes, bool constrained, double milliseconds);
 
@@ -113,6 +120,13 @@ private:
   // them, and the awake time (ms) before which no other notice is given.
   uint64_t cuts_ = 0;
   double nextNotice_ = 0.0;
+  // The regime's exponentially weighted accepted tokens: the whole cycle's,
+  // and the second sub-pass's share of them (the accepted past the first
+  // sub-pass's rows). The regime runs the second pass only while that share
+  // exceeds the first's.
+  double acceptedEma_ = 0.0;
+  double tailEma_ = 0.0;
+  bool twoPass_ = true;
 };
 
 } // namespace splash::model
