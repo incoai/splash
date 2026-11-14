@@ -489,14 +489,18 @@ tokens, `<tool_call>`, `<tool_response>`, `<think>`, an image's
 parser's `tool_call_start = "<tool_call>"` does, would reach the model as the
 token itself, and a `<|im_end|>` in a fetched page as the end of its turn. So
 request preparation marks every added token of the tokenizer, special or not,
-in all that a request gives the template: the content of messages of every
-role, an assistant's reasoning and calls, tool results, tool definitions,
-`chat_template_kwargs`, a PDF's text and a judgment's row. The prompt encodes
-each marked one as its characters, as a tokenizer that had not added it reads
-them, so the tags the template writes itself are the prompt's only control
-tokens, and each `<|image_pad|>` among them is one the template wrote for an
-image. A prompt that quotes nothing encodes as the tokenizer encodes it, token
-for token.
+where it begins in all that a request gives the template: the content of
+messages of every role, an assistant's reasoning and calls, tool results, tool
+definitions, `chat_template_kwargs`, a PDF's text and a judgment's row. It
+marks one a text spells whole, and one the text's end cuts off, which the
+characters the template writes next could complete: Qwen's templates write `>`
+after a call's name and after each of its argument's names, so a name ending
+in `<|im_end|` would end the turn, and a message's text parts follow one
+another. The prompt encodes each marked one as its characters, as a tokenizer
+that had not added it reads them, so the tags the template writes itself are
+the prompt's only control tokens, and each `<|image_pad|>` among them is one
+the template wrote for an image. A prompt that quotes nothing encodes as the
+tokenizer encodes it, token for token.
 
 The template renders marked text as any other text, so it finds no tag in a
 request either. Three templates read tags there, and none does once the tag
@@ -506,12 +510,16 @@ for the last question, Qwen3.6's split an assistant's content at `</think>`,
 and Flint's deletes `<think>` and `</think>` from a message and rewrites its
 role tokens. Each stays the text the client sent. A client sends an
 assistant's reasoning as `reasoning_content` and a tool's result as a `tool`
-message, which the template frames itself. Each text of a request is quoted on
-its own, a message's adjacent text parts as one text: a token that only the
-template's characters complete, such as a call named `x</tool_call` before the
-`>` that Qwen's templates write after a name, is not. A text completion's
-prompt and `/tokenize` are raw text, in which a special-token string is its
-token.
+message, which the template frames itself. Flint's template also deletes
+U+0000 from a message, which would write whole a token the text spelled around
+one, where nothing was marked: a U+0000 in a request's text reaches every
+template as U+FFFD. With the templates of the families Splash serves, no text
+of a request is then a token. What remains is a
+[custom template](#custom-chat-templates)'s own doing: one that deletes or
+rewrites characters of a text it is given, or that itself writes the first
+characters of a token before a text, can still put a token together. A text
+completion's prompt and `/tokenize` are raw text, in which a special-token
+string is its token and a U+0000 stays.
 
 Startup refuses a tokenizer whose added tokens it could not keep out of a
 request's text, before the native runtime starts: one without a
@@ -560,8 +568,9 @@ probes the tokenizer's, and logs its path (`Chat template file · ...`); a
 later change to the file takes effect at the next start. A file that cannot be
 read, is not UTF-8 or is blank stops startup, as does a template that would
 serve no request, before any weights load: one transformers cannot compile
-(the error names the line), one that cannot render a question, and one whose
-prompts for a question, a follow-up and a tool result do not end with one
+(the error names the line), one that cannot render a question, a follow-up or
+a tool result (the error names the first of them it cannot, with the
+template's own error), and one whose prompts for the three do not end with one
 generation prompt, which every request's prompt must end with. Splash never
 falls back to the model's templates.
 
@@ -572,10 +581,26 @@ the generation prompt the template renders for the request's effort, as with
 the model's own. Startup does not check that the template writes the family's
 format, so that is the template's to keep: the server reads tool calls only in
 the family's layout, whatever layout the template shows the model, and serves
-an image only where the template's source holds the family's image
-placeholder (`<|image_pad|>`) and renders one for each image; a request with
-an image fails with a 400 otherwise. Preparation is unchanged: a GGUF still
-needs a chat template of its own.
+an image only where the template writes the family's image placeholder
+(`<|image_pad|>`) once for each image of the request, in their order. The
+server takes each placeholder among the prompt's tokens for an image's, a
+request's own text being no token, and widens it to that image's tokens; a
+request whose placeholders and images differ in number fails with a 400.
+Preparation is unchanged: a GGUF still needs a chat template of its own.
+
+The template must also write each text of a request as it is given. Request
+preparation sets a mark inside every added token that a text begins and takes
+the marks out of the rendered prompt
+([tokenizer and chat templates](#tokenizer-and-chat-templates)), so a template
+that changes a text's case, cuts it or replaces characters in it leaves a
+broken mark in the prompt: `{{ message.content | upper }}` writes
+`<__SPLASH_QUOTED_…__TOOL_CALL>` where a message quotes `<tool_call>`. One
+that deletes characters inside a text, trims a text before characters of its
+own that would complete a token, or writes a token's first characters itself
+before a text can put together a token the request only quoted. Writing a
+text as JSON (`tojson`), joining it to others, trimming it before a token or a
+line break of the template's own and testing it leave it as it is; a test for
+a tag in a text finds none, as in the model's own templates.
 
 ## Chat formats
 

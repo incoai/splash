@@ -1126,6 +1126,20 @@ class CustomChatTemplateTests(unittest.TestCase):
                 "\n{{ messages | no_such_filter }}",
                 "serves no request: line 2: No filter named 'no_such_filter'",
             ),
+            # It renders a question, and refuses a later conversation of
+            # the probe: the first it cannot render, with its own error.
+            (
+                "{% for message in messages %}{% if message.role == 'tool' %}"
+                "{{ raise_exception('Only user and assistant roles!') }}{% endif %}"
+                "{% endfor %}" + self.CUSTOM,
+                "serves no request: it cannot render a tool result: "
+                "Only user and assistant roles!",
+            ),
+            (
+                "{% if messages[0].role == 'system' %}"
+                "{{ raise_exception('No system prompt.') }}{% endif %}" + self.CUSTOM,
+                "serves no request: it cannot render a follow-up: No system prompt.",
+            ),
             # It renders, but opens no assistant turn.
             (self.NATIVE, f"it must end the prompt of {prompts} with the same"),
             (" \n", f"it must end the prompt of {prompts} with the same"),

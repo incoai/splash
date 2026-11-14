@@ -318,22 +318,28 @@ def _require_generation_prompt(render, template):
     """Raise unless the probe found a custom template's generation prompt
     for a request that sets no template option. Every prompt must end with
     the one the probe found (the frontend's 400 otherwise), so a template
-    without one, or one that cannot render a question at all, would start a
-    server that refuses every chat request."""
+    without one, or one that cannot render one of the probe's conversations,
+    would start a server that refuses every chat request. The refusal names
+    the first of them the template cannot render, with the template's own
+    error."""
     options = _effort_options(None)
     if _generation_key(options) in template.generation_prompts:
         return
-    try:
-        render(template.source, [_ASK], options)
-    except TemplateSyntaxError as error:
-        reason = f"line {error.lineno}: {error.message}"
-    except Exception as error:  # templates raise what they like
-        reason = f"it cannot render a question: {error}"
-    else:
-        reason = (
-            "it must end the prompt of a question, of a follow-up and of a "
-            "tool result with the same generation prompt"
-        )
+    prompts = [f"of {name}" for name in _FOLLOWED]
+    reason = (
+        f"it must end the prompt {', '.join(prompts[:-1])} and {prompts[-1]} "
+        "with the same generation prompt"
+    )
+    for name, messages in _FOLLOWED.items():
+        try:
+            render(template.source, messages, options)
+        except TemplateSyntaxError as error:
+            reason = f"line {error.lineno}: {error.message}"
+        except Exception as error:  # templates raise what they like
+            reason = f"it cannot render {name}: {error}"
+        else:
+            continue
+        break
     raise ChatTemplateError(f"the custom chat template serves no request: {reason}")
 
 
@@ -464,9 +470,14 @@ _OPTIONS = (
 )
 
 
-# Conversations the generation prompt must be the same for: a question, a
-# follow-up after a reasoned answer, and a tool result.
-_FOLLOWED = ([_ASK], [_SYSTEM, _ASK, _THOUGHT, _NEXT], [_SYSTEM, _ASK, _CALL, _RESULT])
+# Conversations the generation prompt must be the same for, each by what a
+# refusal calls it: a question, a follow-up after a reasoned answer, and a
+# tool result.
+_FOLLOWED = {
+    "a question": [_ASK],
+    "a follow-up": [_SYSTEM, _ASK, _THOUGHT, _NEXT],
+    "a tool result": [_SYSTEM, _ASK, _CALL, _RESULT],
+}
 
 
 def _generation_key(options):
@@ -544,7 +555,7 @@ def _generation_prompt(render, encode, source, options):
     tokens: kept where every probe conversation renders as a prefix of its
     prompt and gains the same non-empty text."""
     texts = set()
-    for messages in _FOLLOWED:
+    for messages in _FOLLOWED.values():
         prompt = _outcome(render, source, messages, options)
         history = _outcome(
             render, source, messages, {**options, "add_generation_prompt": False}

@@ -84,8 +84,11 @@ delta, and an assistant message sent back may carry its `reasoning_content`
 refusal, is text. What a request sends is text to the model, never one of its
 control tokens: a `<tool_call>`, `<think>` or `<|im_end|>` that a message, a
 tool result, a call or a tool definition spells reaches the model as those
-characters, in every API
+characters, in every API, and so does one that a text only begins, such as a
+call's name ending in `<|im_end|` before the `>` the template writes after it
 ([tokenizer and chat templates](models.md#tokenizer-and-chat-templates)). A
+U+0000 in any of them reaches the model as U+FFFD, as a lone surrogate does: a
+template may delete the character, and with it what kept a tag apart. A
 history tool call whose `arguments` are not a JSON object,
 such as one the output limit cut, is kept as text, so the conversation
 continues. `n` other than 1 and `logprobs: true` return 400.
