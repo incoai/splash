@@ -201,9 +201,11 @@ extension ChatScreenTests {
             await Task.yield()
             if state.chats.streaming == nil { since += 1 }
             let drawn = try await picture()
-            let color = Self.colors(of: drawn)
-            let mark = (60..<drawn.pixelsHigh).reduce(0) { count, y in
-                count + (Int(field.minX) - 2..<Int(field.minX) + 22).count { x in color(x, y).0 - color(x, y).2 > 0.08 }
+            let scale = CGFloat(drawn.pixelsHigh) / size.height, color = Self.colors(of: drawn)
+            let mark = (Int(60 * scale)..<drawn.pixelsHigh).reduce(0) { count, y in
+                count + (Int((field.minX - 2) * scale)..<Int((field.minX + 22) * scale)).count { x in
+                    color(x, y).0 - color(x, y).2 > 0.08
+                }
             }
             refused.append((Self.unlike(drawn, before, in: sidebar, window), Self.unlike(drawn, before, in: toolbar, window),
                             try Self.field(in: window).minY - field.minY, since > 0 ? mark : nil))
@@ -434,8 +436,9 @@ extension ChatScreenTests {
             }
         }
         // Its separator in line with the sidebar's divider, within the point the toolbar rounds to.
-        let divider = Int(sidebarWidth - Self.toolbarPart.minX)
-        #expect(place.count > 500 && abs(first - divider) <= 1, "the title, once still, from \(first), the divider at \(divider)")
+        let scale = CGFloat(wide) / Self.toolbarPart.width, from = CGFloat(first) / scale
+        let divider = sidebarWidth - Self.toolbarPart.minX
+        #expect(place.count > 500 && abs(from - divider) <= 1, "the title, once still, from \(from), the divider at \(divider)")
         /// The pixels `picture` inks that are none of the title's once still.
         func astray(_ picture: NSBitmapImageRep) -> Int {
             let color = Self.colors(of: picture)
