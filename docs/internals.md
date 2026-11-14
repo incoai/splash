@@ -2444,9 +2444,9 @@ settle at (available - floor) / (tiers + 3) of what was available before them,
 and blocks a local snapshot keeps when such a tier frees them cost it at most a
 third more than it freed. Tiers with sizes on one volume take its room in turn,
 down to the floor, with no margin above it: while a local snapshot keeps the
-blocks such a tier frees, each copy it writes in place of another takes a slot
-of free space, and the copies a measure then has it give up free nothing, so
-free space can fall below the floor, as far as a full volume, before the tier
+blocks such a tier frees, each copy it writes in place of another takes what it
+stores of free space, and the copies a measure then has it give up free nothing,
+so free space can fall below the floor, as far as a full volume, before the tier
 has given up every copy it holds or the snapshot goes. A limit below what the
 tier holds is met at the next control pass by giving copies up in the order a
 full quota replaces them, never a copy in transfer or the only copy of a state

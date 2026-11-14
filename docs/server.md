@@ -834,7 +834,7 @@ counts them, with a budget or without. The day's bytes are the number to set
 `--max-cache-disk-writes` from and to hold against the drive's rated
 endurance; 24 times the hour's projects them for the load of the moment. Each
 is exact to a minute, and a server that has run for less than an hour or a day
-has written all of its count. It counts the KV pages copied
+has written all of its count. `/status` also counts the KV pages copied
 ahead (`kv_copies`), and under `write_behind` the restore points queued for
 their copies, the one being copied among them (`waiting`), copied
 (`durable`), gone on from first (`unneeded`) and not copied for want of room

@@ -385,7 +385,9 @@ public:
     uint32_t labelBytes = 0;
   };
 
-  // The slot that holds payloadBytes: writes zero the rest of its page.
+  // The host pages a payload of payloadBytes fills, in bytes: what a write of
+  // it stores, zeros to the end of its last page, and the size of the slots
+  // of a file whose largest payload it is.
   [[nodiscard]] static constexpr uint64_t slotBytesFor(uint64_t payloadBytes) noexcept {
     return alignUp(payloadBytes);
   }
