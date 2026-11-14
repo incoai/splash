@@ -568,8 +568,9 @@ probes the tokenizer's, and logs its path (`Chat template file · ...`); a
 later change to the file takes effect at the next start. A file that cannot be
 read, is not UTF-8 or is blank stops startup, as does a template that would
 serve no request, before any weights load: one transformers cannot compile
-(the error names the line), one that cannot render a question, and one whose
-prompts for a question, a follow-up and a tool result do not end with one
+(the error names the line), one that cannot render a question, a follow-up or
+a tool result (the error names the first of them it cannot, with the
+template's own error), and one whose prompts for the three do not end with one
 generation prompt, which every request's prompt must end with. Splash never
 falls back to the model's templates.
 
