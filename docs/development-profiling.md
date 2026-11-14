@@ -153,7 +153,12 @@ do not claim that GitHub-hosted Metal validation has passed.
 
 ## Hosted CI Metal bootstrap
 
-Hosted CI now runs `python3 dev/tools/ensure_metal_toolchain.py` before the native
+The production/app and Python jobs use the macOS 26 image with its stable Xcode
+toolchain; the macOS 27 image selected an Xcode release candidate whose Metal asset
+catalog repeatedly failed. Native sanitizers retain macOS 27 coverage. The 26.4
+production deployment floor is unchanged.
+
+Hosted CI runs `python3 dev/tools/ensure_metal_toolchain.py` before the native
 and Python compatibility gates. An unconditional component download previously
 failed fetching Apple's MetalToolchain catalog before any project compilation.
 The bootstrap first compiles BF16 Metal 4.0 source with the production deployment

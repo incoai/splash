@@ -32,7 +32,8 @@ permissions:
 jobs:
   engine-check:
     name: Production, CPU runtime, native builds and the app
-    runs-on: blacksmith-6vcpu-macos-27
+    # Stable Xcode/Metal image; the macOS 27 image currently selects Xcode RC.
+    runs-on: blacksmith-6vcpu-macos-26
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -64,7 +65,7 @@ jobs:
 
   python-compatibility:
     name: Python compatibility ${{ matrix.python-version }}
-    runs-on: blacksmith-6vcpu-macos-27
+    runs-on: blacksmith-6vcpu-macos-26
     timeout-minutes: 20
     strategy:
       fail-fast: false
