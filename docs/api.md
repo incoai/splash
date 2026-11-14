@@ -128,10 +128,11 @@ found; a system message's `tool_addition` and `tool_removal` blocks change
 them in order: a `tool_definition` adds a tool or replaces the one of its name,
 and a removed tool is left out until a later block adds it again),
 `tool_choice` (`auto`, `any`, `tool` or `none`, with
-`disable_parallel_tool_use`), `stop_sequences`, `temperature`, `top_p`, `top_k`,
-`thinking`, `output_config` and Chat's `chat_template_kwargs`, whose
-`enable_thinking` outranks `thinking`. Otherwise a request reasons only when
-`thinking` sets it: `{"type": "enabled", "budget_tokens": N}` and
+`disable_parallel_tool_use`), `stop_sequences`, the [sampling](#sampling)
+fields, of which Anthropic defines `temperature`, `top_p` and `top_k`, Chat's
+`ignore_eos`, `thinking`, `output_config` and Chat's `chat_template_kwargs`,
+whose `enable_thinking` outranks `thinking`. Otherwise a request reasons only
+when `thinking` sets it: `{"type": "enabled", "budget_tokens": N}` and
 `{"type": "adaptive"}` reason at `output_config.effort`, one of `low`, `medium`,
 `high` (the default), `xhigh` and `max`, while `{"type": "disabled"}` and an
 omitted `thinking` do not. Enabled thinking requires `budget_tokens`, an integer
@@ -225,14 +226,15 @@ the connections it holds cannot exhaust it.
 
 ## Sampling
 
-Chat, text completions and Responses sample with `temperature` (default 1.0, in
-[0, 2]), `top_p` (0.95), `top_k` (20, a positive integer, 0 or -1), `min_p` (0,
-in [0, 1]), `presence_penalty` and `frequency_penalty` (0, in [-2, 2]) and
-`repetition_penalty` (1, positive). The defaults of `temperature`, `top_p` and
-`top_k` are the ones the served model's family publishes (Qwen's, and the same
-numbers in Flint's GGUF release); the publishers set no penalties, so Qwen's
-recommended `presence_penalty` of 1.5 for non-thinking use must be sent
-explicitly. Each field that is out of range returns 400 naming it. As in vLLM, a
+Chat, text completions, Responses and Messages sample with `temperature`
+(default 1.0, in [0, 2]), `top_p` (0.95), `top_k` (20, a positive integer, 0 or
+-1), `min_p` (0, in [0, 1]), `presence_penalty` and `frequency_penalty` (0, in
+[-2, 2]) and `repetition_penalty` (1, positive). The defaults of `temperature`,
+`top_p` and `top_k` are the ones the served model's family publishes (Qwen's,
+and the same numbers in Flint's GGUF release); the publishers set no
+penalties, so Qwen's recommended `presence_penalty` of 1.5 for non-thinking use
+must be sent explicitly. Each field that is out of range returns 400 naming it,
+on every route. As in vLLM, a
 nonzero temperature below 0.01 samples at 0.01, and the penalties rewrite the
 raw logits before temperature, for greedy requests too: repetition divides a
 positive logit and multiplies a negative one for every token of the prompt or of
@@ -246,7 +248,9 @@ the Qwen templates that includes the tool-call syntax every tool-enabled system
 prompt carries, earlier tool calls and reasoning, and the `<think>` markers of
 the generation prompt, so a `repetition_penalty` above 1 can delay tool calls
 and the end of reasoning and change names copied from the context. Anthropic
-Messages defines no penalties and no `min_p`.
+defines no penalties and no `min_p` for Messages; Splash's Messages takes
+them and `logit_bias` as Chat does, with the same 400 for a bad value, so that
+a client whose requests go only to Messages can set them too.
 
 In vLLM's order, after temperature `min_p` first drops every token less
 likely than `min_p` times the most likely one, `top_k` then keeps the most
@@ -331,10 +335,11 @@ of a long request's KV ([KV on the SSD](server.md#kv-on-the-ssd)). An
 invalid value returns 400 naming the field the request sent. Messages refuses
 a final assistant message (prefill) with 400; `count_tokens` still counts it.
 
-Chat and text completions accept `"ignore_eos":true` (default false), as vLLM
-and llama.cpp do: the model never selects its own stop tokens, and a draft
-proposal of one is rejected, so generation runs to its output budget and
-finishes with `length` unless a `stop` string ends it first. Benchmarks use it
+Chat, text completions, Responses and Messages accept `"ignore_eos":true`
+(default false), as vLLM and llama.cpp do: the model never selects its own
+stop tokens, and a draft proposal of one is rejected, so generation runs to its
+output budget and finishes with `length` (Messages' `max_tokens`) unless a stop
+string ends it first. Benchmarks use it
 to generate a fixed number of tokens. Constrained tool calls, output under
 `tool_choice: "none"` and structured output generate under a grammar, which
 decides where the output ends, so combining them with `ignore_eos` returns 400.
