@@ -127,16 +127,13 @@ final class Draft {
         (text.trimmingCharacters(in: .whitespacesAndNewlines), attachments)
     }
 
-    /// Takes the message, leaving the draft empty; its attachments' files are the message's.
-    @discardableResult
-    func take() -> (text: String, attachments: [Attachment]) {
-        defer {
-            text = ""
-            attachments = []
-            thumbnails = [:]
-            notice = nil
-        }
-        return message
+    /// Takes the message out, leaving the draft empty: it is its conversation's from then on
+    /// (`AppState.sendDraft`), and its attachments' files with it.
+    func take() {
+        text = ""
+        attachments = []
+        thumbnails = [:]
+        notice = nil
     }
 
     /// Takes back `refused`, what a request that came to nothing gives back, in its chat: the

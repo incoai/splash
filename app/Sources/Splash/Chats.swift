@@ -301,19 +301,19 @@ final class ChatStore {
     /// conversation, or a new one, to the model `server` serves, and streams its reply into the
     /// conversation. The message is its chat's once the server takes the request (`stream`): an
     /// open conversation shows it at once, and a new chat becomes a conversation, listed, written
-    /// and open, only then. `taken` tells that the message shows in its conversation, for the
+    /// and open, only then. `shown` tells that the message shows in its conversation, for the
     /// composer to give it up: at once in an open one, and for a new chat once the server has
     /// taken it. A request the server refuses, that never reaches it or that is stopped before
     /// it takes it leaves the chats as they were, and goes to `refused`, with what the composer
     /// gave up of it and why, its chat open again (`stream`).
     func send(_ text: String, attachments: [Attachment], to server: ChatTarget,
-              refused: @escaping (Refused) -> Void = { _ in }, taken: @escaping () -> Void = {}) {
+              refused: @escaping (Refused) -> Void = { _ in }, shown: @escaping () -> Void = {}) {
         guard streaming == nil else { return }
         let open = current
         var conversation = open ?? Conversation()
         if conversation.title.isEmpty { conversation.title = Self.firstLine(text, attachments: attachments) }
         conversation.messages.append(ChatMessage(role: .user, text: text, attachments: attachments.isEmpty ? nil : attachments))
-        stream(conversation, new: open == nil, to: server, shown: taken) { reason in
+        stream(conversation, new: open == nil, to: server, shown: shown) { reason in
             if let open {
                 refused(Refused(text: text, attachments: attachments, reason: reason, conversation: open.id))
             } else if let reason {

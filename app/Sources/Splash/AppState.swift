@@ -519,7 +519,7 @@ final class AppState {
         let message = draft.message
         chats.send(message.text, attachments: message.attachments, to: target) { [weak self] refused in
             self?.draft.restore(refused)
-        } taken: { [weak self] in
+        } shown: { [weak self] in
             self?.draft.take()
         }
     }
