@@ -66,10 +66,10 @@ double Measurement::layer(std::span<const SwiGluProjections> layers, uint32_t co
     if (split && !split->begin()) throw std::runtime_error("ANE FFN split stopped (" + split->reason() + ")");
     for (uint32_t index = 0; index < count; ++index) {
       if (split) {
-        linear_.addPrefillSwiGlu(graph, layers[index], ffn_, hidden_[0], hidden_[1], rows);
+        linear_.addSwiGlu(graph, layers[index], ffn_, hidden_[0], hidden_[1], rows);
         split->add(graph, index, ffn_, hidden_[1], hidden_[0], rows);
       } else {
-        linear_.addPrefillSwiGlu(graph, layers[index], ffn_, hidden_[1], hidden_[0], rows);
+        linear_.addSwiGlu(graph, layers[index], ffn_, hidden_[1], hidden_[0], rows);
       }
     }
     const auto start = AwakeClock::now();

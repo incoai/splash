@@ -140,7 +140,7 @@ void checkGateUpLayers() {
     const auto scratch = model::DecodeArena::linearScratchSize(geometry, plans);
     for (uint32_t lanes = 1; lanes <= model::kLaneCount; ++lanes) {
       const auto plan = plans.linear().plan({{up.outputSize, up.inputSize}, lanes * model::kDecodeRows,
-          ops::LinearPhase::Decode, ops::LinearEpilogue::GateUp}, up);
+          ops::LinearEpilogue::GateUp}, up);
       const auto required = plan.scratchSize();
       require(scratch.input >= required.input && scratch.sums >= required.sums &&
                   scratch.partials >= required.partials && scratch.counters >= required.counters,
@@ -149,12 +149,12 @@ void checkGateUpLayers() {
               "the gate/up workspace is too small");
       // The F16 and Q8_0 pair stages, at rows the decode storage of the
       // target's projections holds (QwenTarget::decodeStorageLanes).
-      const auto pair = plans.linear().decodePlan(mixed.upProjection, lanes, ops::LinearEpilogue::GateUp,
-                                                  &mixed.gateProjection);
+      const auto pair = plans.linear().plan(mixed.upProjection, lanes * model::kDecodeRows,
+                                            ops::LinearEpilogue::GateUp, &mixed.gateProjection);
       const auto paired = pair.scratchSize();
       uint32_t storage = 0;
       for (const auto &shape : geometry.target.decodeProjections)
-        storage = std::max(storage, plans.linear().decodeStorageRows(lanes * model::kDecodeRows, shape));
+        storage = std::max(storage, plans.linear().storageRows(lanes * model::kDecodeRows, shape));
       require(pair.configuration().tile == ops::LinearTile::GgufStaged && pair.storageRows() <= storage,
               "a gate/up pair with an F16 gate did not stage within the decode storage");
       require(scratch.input >= paired.input && scratch.sums >= paired.sums && scratch.partials >= paired.partials &&
@@ -165,7 +165,7 @@ void checkGateUpLayers() {
     const auto sizes = model::prefillTensorBytes(geometry, plans);
     for (uint32_t rows : {1U, 8U, 17U, 32U, 33U, 48U, 64U}) {
       const auto required = plans.linear().plan({{up.outputSize, up.inputSize}, rows,
-          ops::LinearPhase::Prefill, ops::LinearEpilogue::None}, up).scratchSize();
+          ops::LinearEpilogue::None}, up).scratchSize();
       require(sizes[uint32_t(model::PrefillTensor::LinearPartials)] >= required.partials &&
                   sizes[uint32_t(model::PrefillTensor::LinearCounters)] >= required.counters,
               "the short-prefill split scratch is too small");
@@ -176,8 +176,10 @@ void checkGateUpLayers() {
 // The prefill arena holds the int8 prefill tile's codes and scales of a full
 // chunk of the target's widest projection the tile takes, wherever the family
 // runs it with int8 activations on, and none for the draft, which prefills on
-// the bf16 tiles: a GGUF target holds none, and Qwen3.8-27B MLX 4-bit its down
-// projection's (17408 inputs), not its draft's context projection's (25600).
+// the bf16 tiles, beside the tables of its plans of up to 32 rows on the
+// decode tiles (Apple9's register tile): a GGUF target holds those tables
+// alone, and Qwen3.8-27B MLX 4-bit its down projection's codes (17408 inputs),
+// not its draft's context projection's (25600).
 void checkPrefillInt8Scratch() {
   for (uint32_t family : {9U, 10U, 11U})
     for (const ops::Int8Activations setting : {ops::Int8Activations::On, ops::Int8Activations::Off}) {
@@ -185,23 +187,35 @@ void checkPrefillInt8Scratch() {
       device.appleGpuFamily = family;
       device.gpuCoreCount = 20;
       const ops::ExecutionPlans plans(device, setting);
-      // The arena's codes and scales for `loaded`.
+      // The arena's codes and scales for `loaded`, and the tables of its plans
+      // on the decode tiles.
       const auto int8Scratch = [&](const model::LoadedModel &loaded) {
         const auto sizes = model::prefillTensorBytes(
             model::RuntimeGeometry::from(loaded, kv::Format::Int8, ops::GdnStateFormat::Float32), plans);
         return std::pair{sizes[uint32_t(model::PrefillTensor::LinearTable)],
                          sizes[uint32_t(model::PrefillTensor::LinearSums)]};
       };
+      const auto tables = [&](const model::LoadedModel &loaded) {
+        const auto geometry = model::RuntimeGeometry::from(loaded, kv::Format::Int8, ops::GdnStateFormat::Float32);
+        ops::LinearScratchSize bound;
+        for (const auto &shape : geometry.target.prefillProjections)
+          bound.include(plans.linear().scratchSize(shape, ops::kMaximumDecodeTileRows));
+        const auto &draft = geometry.draft;
+        for (const ops::ProjectionShape shape : {ops::ProjectionShape{draft.hiddenSize, draft.targetHiddenSize()},
+                                                 {draft.contextKvSize(), draft.hiddenSize}})
+          bound.include(plans.draftLinear().scratchSize(shape, ops::kMaximumDecodeTileRows));
+        return std::pair{bound.input, bound.sums};
+      };
       for (const model::LoadedModel &gguf :
            {loadedModel<model::Qwen3_8Weights>(), loadedModel<model::Qwen3_6MoeWeights>()})
-        require(int8Scratch(gguf) == std::pair<uint64_t, uint64_t>{},
-                "the prefill arena of a GGUF target holds int8 prefill scratch");
+        require(int8Scratch(gguf) == tables(gguf), "the prefill arena of a GGUF target holds int8 prefill scratch");
       const uint32_t down = model::Qwen3_8Layout{}.intermediateSize;
-      const auto [table, sums] =
-          int8Scratch(loadedModel<model::Qwen3_8Weights>({}, test::qwen3_8Draft(), GGUF_FMT_AF4G64));
+      const model::LoadedModel mlx = loadedModel<model::Qwen3_8Weights>({}, test::qwen3_8Draft(), GGUF_FMT_AF4G64);
+      const auto [table, sums] = int8Scratch(mlx);
+      const auto [decodeTable, decodeSums] = tables(mlx);
       const bool int8 = family >= 10 && setting == ops::Int8Activations::On;
-      require(table == (int8 ? gguf_prefill_int8_table_bytes(down, SPLASH_PREFILL_TOKEN_BUDGET) : 0) &&
-                  sums == (int8 ? gguf_prefill_int8_scale_bytes(down, SPLASH_PREFILL_TOKEN_BUDGET) : 0),
+      require(table == std::max<uint64_t>(decodeTable, int8 ? gguf_prefill_int8_table_bytes(down, SPLASH_PREFILL_TOKEN_BUDGET) : 0) &&
+                  sums == std::max<uint64_t>(decodeSums, int8 ? gguf_prefill_int8_scale_bytes(down, SPLASH_PREFILL_TOKEN_BUDGET) : 0),
               "the prefill arena of an MLX target holds other int8 prefill scratch than its down projection's");
     }
 }
@@ -230,7 +244,7 @@ void checkLaneScratch(const model::LoadedModel &loaded) {
           for (auto epilogue : {ops::LinearEpilogue::None, ops::LinearEpilogue::Residual,
                                 ops::LinearEpilogue::GateUp}) {
             const auto need = plans.linear().plan({matrix, lanes * model::kDecodeRows,
-                ops::LinearPhase::Decode, epilogue}).scratchSize();
+                epilogue}).scratchSize();
             require(scratch.input >= need.input && scratch.sums >= need.sums && scratch.partials >= need.partials &&
                         scratch.counters >= need.counters,
                     "decode arena scratch below a lane's plan");

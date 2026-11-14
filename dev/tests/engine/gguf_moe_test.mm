@@ -94,7 +94,6 @@ using splash::ops::MoePlan;
 using splash::ops::MoeShape;
 using splash::ops::LinearEpilogue;
 using splash::ops::LinearMatrix;
-using splash::ops::LinearPhase;
 using splash::ops::LinearPlan;
 using splash::ops::LinearScratch;
 using splash::ops::LinearScratchSize;
@@ -559,20 +558,20 @@ int floatSegments(MetalBackend &backend, uint32_t floatColumns) {
     };
     const LinearMatrix matrix{N, K};
     for (uint32_t lanes = 1; lanes <= 4; ++lanes) {
-      const LinearPlan plan = linear.plan({matrix, lanes * 8, LinearPhase::Decode, LinearEpilogue::None}, full);
+      const LinearPlan plan = linear.plan({matrix, lanes * 8, LinearEpilogue::None}, full);
       const LinearScratch scratch = scratchFor(plan);
       check(lanes * 8, plan.storageRows(), "decode B" + std::to_string(lanes),
             [&](CommandGraph &graph, MetalBuffer input, const Projection &p, MetalBuffer output) {
               static_cast<void>(linear.add(graph, {.input = input, .output = output, .scratch = scratch}, p,
-                                           linear.decodePlan(p, lanes)));
+                                           linear.plan(p, lanes * SPLASH_TARGET_VERIFY_ROWS)));
             });
     }
     for (const uint32_t rows : {1u, 24u, 33u, 263u}) {
-      const LinearPlan plan = linear.plan({matrix, rows, LinearPhase::Prefill, LinearEpilogue::None}, full);
+      const LinearPlan plan = linear.plan({matrix, rows, LinearEpilogue::None}, full);
       const LinearScratch scratch = scratchFor(plan);
       check(rows, plan.storageRows(), "prefill rows=" + std::to_string(rows),
             [&](CommandGraph &graph, MetalBuffer input, const Projection &p, MetalBuffer output) {
-              linear.addPrefill(graph, input, p, output, rows, scratch);
+              linear.addProjection(graph, input, p, output, rows, scratch);
             });
     }
   }
@@ -596,7 +595,7 @@ int floatOnlyChain(MetalBackend &backend) {
   int failures = 0;
   for (uint32_t lanes = 1; lanes <= 4; ++lanes) {
     const uint64_t rows = lanes * 8, bytes = rows * N * 2;
-    const LinearPlan plan = linear.decodePlan(blocks, lanes);
+    const LinearPlan plan = linear.plan(blocks, lanes * SPLASH_TARGET_VERIFY_ROWS);
     const LinearScratchSize size = plan.scratchSize();
     const LinearScratch scratch{zeros(backend, size.input, "chain-table"), zeros(backend, size.sums, "chain-sums"),
                                 zeros(backend, size.partials, "chain-partials"),
@@ -606,7 +605,7 @@ int floatOnlyChain(MetalBackend &backend) {
                       alone = zeros(backend, bytes, "chain-reference");
     CommandGraph graph, reference;
     const PreparedInput prepared =
-        linear.add(graph, {.input = input, .output = scores, .scratch = scratch}, floats, linear.decodePlan(floats, lanes));
+        linear.add(graph, {.input = input, .output = scores, .scratch = scratch}, floats, linear.plan(floats, lanes * SPLASH_TARGET_VERIFY_ROWS));
     static_cast<void>(
         linear.add(graph, {.input = input, .output = chained, .scratch = scratch, .prepared = prepared}, blocks, plan));
     static_cast<void>(backend.submitCommandAsync(graph.dispatches()).wait());

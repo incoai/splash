@@ -126,50 +126,48 @@ std::pair<const QuantizedSegment &, const QuantizedSegment &> onePassTensors(con
 void LinearPlan::requireConfiguration() const {
   const uint32_t k = workload_.matrix.inputSize;
   const LinearConfig &c = config_;
-  const bool decode = workload_.phase == LinearPhase::Decode;
+  const bool decodeTiles = workload_.rows <= kMaximumDecodeTileRows;
   if (c.spread && c.tile != LinearTile::GgufStaged)
     throw std::invalid_argument("only the staged block tile spreads its walks");
-  if (c.oneGateUpPass && ((c.tile != LinearTile::GgufStaged && c.tile != LinearTile::GgufColumn) || !decode ||
+  if (c.oneGateUpPass && ((c.tile != LinearTile::GgufStaged && c.tile != LinearTile::GgufColumn) || !decodeTiles ||
                           workload_.epilogue != LinearEpilogue::GateUp))
-    throw std::invalid_argument("only a staged or column block gate/up decode runs gate and up in one pass");
-  if (c.sixteenRows && (c.tile != LinearTile::GgufStaged || !decode || workload_.rows != SPLASH_TARGET_VERIFY_ROWS))
-    throw std::invalid_argument("only a staged one-lane block decode runs the 16-row tile");
-  if (c.decodeInt8 &&
-      (c.tile != LinearTile::GgufStaged || !decode || !decodeInt8TakesSplits(k, c.splits) || storageRows() < 16))
-    throw std::invalid_argument("only a staged block decode of 16 or 32 rows and whole PQ2_0 blocks per split runs "
+    throw std::invalid_argument("only a staged or column block gate/up on the decode tiles runs gate and up in one pass");
+  if (c.sixteenRows && (c.tile != LinearTile::GgufStaged || workload_.rows > 8))
+    throw std::invalid_argument("only a staged block plan of at most 8 rows runs the 16-row tile");
+  if (c.decodeInt8 && (c.tile != LinearTile::GgufStaged || !decodeTiles || !decodeInt8TakesSplits(k, c.splits)))
+    throw std::invalid_argument("only a staged block plan on the decode tiles of whole PQ2_0 blocks per split runs "
                                 "int8 activations");
   if (c.tile == LinearTile::GgufColumn) {
-    // The column tile reads the live rows alone, a gate/up pair's both
-    // tensors in one pass, and splits K inside its threadgroup alone.
-    if (!decode || !workload_.liveRows || workload_.liveRows > GGUF_COLUMN_ROWS || c.splits != 1 ||
+    // The column tile reads its rows alone, a gate/up pair's both tensors in
+    // one pass, and splits K inside its threadgroup alone.
+    if (workload_.rows > GGUF_COLUMN_ROWS || c.splits != 1 || workload_.epilogue == LinearEpilogue::UpWithGate ||
         c.oneGateUpPass != (workload_.epilogue == LinearEpilogue::GateUp))
-      throw std::invalid_argument("the column block decode tile takes up to GGUF_COLUMN_ROWS live rows, unsplit");
+      throw std::invalid_argument("the column block tile takes up to GGUF_COLUMN_ROWS rows, unsplit, no up-with-gate");
     return;
   }
   if (c.tile == LinearTile::GgufRegister) {
     // Split boundaries fall on coefficient units, of 64 inputs at the fewest
     // (quant_register_unit); addGgufRegister checks each segment's.
-    if (!decode || !c.validSplits() || k / 64 < c.splits)
-      throw std::invalid_argument("the register block decode tile takes a K unit per split");
+    if (!decodeTiles || !c.validSplits() || k / 64 < c.splits)
+      throw std::invalid_argument("the register block tile takes a decode tile's rows and a K unit per split");
     return;
   }
   if (c.tile == LinearTile::GgufPrefill || c.tile == LinearTile::GgufPrefillInt8) {
-    if (decode || c.splits != 1) throw std::invalid_argument("invalid block prefill configuration");
+    if (c.splits != 1) throw std::invalid_argument("invalid block prefill configuration");
     return;
   }
   if (!c.validSplits() || (k / 32) % c.splits)
     throw std::invalid_argument("staged block splits take whole 32-input groups");
-  // Prefill chunks of up to a decode batch run the staged tile and split K as
-  // in decode; longer ones, up to kMaximumStagedPrefillRows, its 64-row tile.
-  if (!decode && workload_.rows > kMaximumStagedPrefillRows)
-    throw std::invalid_argument("the staged block tile runs prefill chunks of up to 64 rows");
+  if (workload_.rows > kMaximumStagedPrefillRows)
+    throw std::invalid_argument("the staged block tile runs plans of up to 64 rows");
 }
 
 uint32_t LinearPlan::storageRows() const noexcept {
-  if (config_.tile == LinearTile::GgufRegister || config_.tile == LinearTile::GgufColumn) return workload_.rows;
+  if (config_.tile == LinearTile::GgufColumn) return workload_.rows;
+  if (config_.tile == LinearTile::GgufRegister) return tableTiles(workload_.rows) * GGUF_TABLE16_ROWS;
   if (config_.tile == LinearTile::GgufPrefill || config_.tile == LinearTile::GgufPrefillInt8)
     return (workload_.rows + GGUF_PREFILL_ROWS - 1) / GGUF_PREFILL_ROWS * GGUF_PREFILL_ROWS;
-  return stagedStorageRows(workload_.rows, config_.sixteenRows);
+  return stagedStorageRows(workload_.rows, config_.sixteenRows, config_.decodeInt8);
 }
 
 LinearScratchSize LinearPlan::scratchSize() const noexcept {
@@ -180,7 +178,7 @@ LinearScratchSize LinearPlan::scratchSize() const noexcept {
   // [column] partials and one counter per 64-column tile, which covers every
   // lane.
   if (config_.tile == LinearTile::GgufRegister) {
-    const uint64_t rows = workload_.rows;
+    const uint64_t rows = storageRows();
     return {tableBytes(k, rows), tableSumsBytes(LinearInput::Table16, k, rows),
             config_.splits > 1 ? config_.splits * rows * n * sizeof(float) : 0,
             config_.splits > 1 ? uint64_t{n / GGUF_TILE_COLUMNS} * sizeof(uint32_t) : 0};
@@ -275,17 +273,14 @@ void Linear::addGguf(metal::CommandGraph &graph, const LinearBuffers &b,
   }
 }
 
-// The staged decode tiles, for decode and prefill chunks of up to
-// ProjectionCalibration::stagedPrefillRows rows: every row of the plan's
-// storage in each threadgroup's tile, grid (64-column tiles, K splits). A
-// projection runs one dispatch, a fused one's segments together
-// (fusedSegments), in decode as in prefill; decode runs gate/up as two passes,
-// or, where selectProjection sets LinearConfig::oneGateUpPass, as one pass over
-// 32-column threadgroups of one simdgroup each, and a prefill chunk with an
-// epilogue runs one dispatch per segment. In int8 activations
-// (LinearConfig::decodeInt8, decode only) the same dispatches run the int8
-// tiles of the segments' one format over the int8 rows of b.input, each K
-// split holding whole blocks of it.
+// The staged tiles, for plans of up to ProjectionCalibration::stagedPrefillRows
+// rows: every row of the plan's storage in each threadgroup's tile, grid
+// (64-column tiles, K splits). A gate/up runs as two passes, or, where
+// selectProjection sets LinearConfig::oneGateUpPass, as one pass over
+// 32-column threadgroups of one simdgroup each. In int8 activations
+// (LinearConfig::decodeInt8) the same dispatches run the int8 tiles of the
+// segments' one format over the int8 rows of b.input, each K split holding
+// whole blocks of it.
 void Linear::addGgufStaged(metal::CommandGraph &graph, const LinearBuffers &b,
                              const Projection &p, const LinearPlan &plan,
                              const Projection *gate) const {
@@ -344,19 +339,6 @@ void Linear::addGgufStaged(metal::CommandGraph &graph, const LinearBuffers &b,
     std::fill(distinct, formats.end(), distinct[-1]);
     graph.specialize(formats);
   };
-  if (w.phase == LinearPhase::Prefill) {
-    // A fused projection's chunk runs its segments in one dispatch, as decode
-    // does: a dispatch costs about 0.045 ms however narrow, and at 8 to 32
-    // rows the 27B's and 35B's fused inputs take 16-56% less time in one
-    // dispatch than in one per segment (32-core M5 Max).
-    if (segments.size() > 1 && w.epilogue == LinearEpilogue::None) {
-      fused();
-      return;
-    }
-    for (const QuantizedSegment &s : segments)
-      tensor(s, epilogueSuffix(w.epilogue), b.output, epilogueInput(b, w.epilogue));
-    return;
-  }
   if (config.oneGateUpPass) {
     const auto [g, u] = onePassTensors(p, *gate);
     graph.add(decodeKernel(config.decodeInt8, u.name(), rows, "gate_up"),
@@ -366,14 +348,21 @@ void Linear::addGgufStaged(metal::CommandGraph &graph, const LinearBuffers &b,
               {u.outputSize / GGUF_STAGED_COLUMNS, splits, 1}, {GGUF_GATE_UP_THREADS, 1, 1});
     return;
   }
-  if (segments.size() == 1) {
-    addDecodeTensor(b, w.epilogue, segments.front(), gate, tensor);
+  // A fused projection's segments run in one dispatch where they take no
+  // epilogue: a dispatch costs about 0.045 ms however narrow, and at 8 to 32
+  // rows the 27B's and 35B's fused inputs take 16-56% less time in one
+  // dispatch than in one per segment (32-core M5 Max). Each segment with an
+  // epilogue runs its own.
+  if (segments.size() > 1 && w.epilogue == LinearEpilogue::None) {
+    fused();
     return;
   }
-  fused();
+  if (w.epilogue == LinearEpilogue::GateUp && segments.size() != 1)
+    throw std::invalid_argument("block gate/up takes single tensors");
+  for (const QuantizedSegment &s : segments) addDecodeTensor(b, w.epilogue, s, gate, tensor);
 }
 
-// The prefill tile, which runs prefill chunks of more than
+// The prefill tile, which runs plans of more than
 // ProjectionCalibration::stagedPrefillRows rows over 128-row tiles: a plain projection in one
 // dispatch per format, over the column tiles of its segments of that format
 // (a fused projection's segments otherwise run as small grids of their own),
@@ -461,15 +450,15 @@ void Linear::addGgufPrefillInt8(metal::CommandGraph &graph, const LinearBuffers 
   }
 }
 
-// All lanes in each threadgroup, decode only: single tensors and gate/up
-// through addDecodeTensor, fused projections through fusedSegments.
+// Every table tile of the plan's rows in each threadgroup: single tensors and
+// gate/up through addDecodeTensor, fused projections through fusedSegments.
 void Linear::addGgufRegister(metal::CommandGraph &graph, const LinearBuffers &b,
                              const Projection &p, const LinearPlan &plan,
                              const Projection *gate) const {
   const LinearWorkload w = plan.workload();
   const LinearConfig config = plan.configuration();
   const auto [n, k] = w.matrix;
-  const uint32_t lanes = w.rows / SPLASH_TARGET_VERIFY_ROWS;
+  const uint32_t lanes = tableTiles(w.rows);
   const std::vector<QuantizedSegment> &segments = p.blocks().segments;
   for (const Projection *q : {&p, gate})
     if (q)
@@ -508,13 +497,13 @@ void Linear::addGgufRegister(metal::CommandGraph &graph, const LinearBuffers &b,
 }
 
 // One dispatch per tensor, a gate/up pair's both in one (onePassTensors), each
-// threadgroup 32 of the tensor's columns over the live rows.
+// threadgroup 32 of the tensor's columns over the plan's rows.
 void Linear::addGgufColumn(metal::CommandGraph &graph, const LinearBuffers &b, const Projection &p,
                            const LinearPlan &plan, const Projection *gate) const {
   const LinearWorkload w = plan.workload();
   const auto add = [&](std::string name, std::vector<metal::MetalBuffer> bindings, const QuantizedSegment &s) {
     graph.add(std::move(name), std::move(bindings),
-              GgufColumnParams{w.liveRows, w.matrix.inputSize, w.matrix.outputSize, s.columnOffset, s.formatId},
+              GgufColumnParams{w.rows, w.matrix.inputSize, w.matrix.outputSize, s.columnOffset, s.formatId},
               {s.outputSize / 32, 1, 1}, {GGUF_COLUMN_THREADS, 1, 1});
   };
   if (gate) {

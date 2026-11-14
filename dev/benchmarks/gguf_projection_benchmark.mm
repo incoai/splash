@@ -284,7 +284,7 @@ int main(int argc, char **argv) {
       const Linear linear(backend.capabilities(), Int8Activations::On);
       std::vector<Case> cases;
       for (const uint32_t rows : prefillRows) {
-        const LinearWorkload w{{N, K}, rows, LinearPhase::Prefill, epilogue};
+        const LinearWorkload w{{N, K}, rows, epilogue};
         const LinearConfig policy = linear.plan(w, ring.front()).configuration();
         const LinearConfig config{.tile = LinearTile::GgufPrefill};
         cases.push_back({"R" + std::to_string(rows), "prefill128", Linear::plan(w, config, FloatOutput::BFloat16),
@@ -307,13 +307,13 @@ int main(int argc, char **argv) {
         }
       }
       for (uint32_t lanes = 1; lanes <= kMaximumLanes && !prefill; ++lanes) {
-        const LinearWorkload w{{N, K}, lanes * kLaneRows, LinearPhase::Decode, epilogue};
+        const LinearWorkload w{{N, K}, lanes * kLaneRows, epilogue};
         const LinearConfig policy =
             linear.plan(w, ring.front(), epilogue == LinearEpilogue::GateUp ? &ring.front() : nullptr).configuration();
         // The staged tile walks K and runs gate/up as the policy's staged plans do (where the device registers a
         // step, those it runs on more lanes).
         const LinearConfig wide =
-            linear.plan({{N, K}, kMaximumDecodeTileRows, LinearPhase::Decode, epilogue}, ring.front(),
+            linear.plan({{N, K}, kMaximumDecodeTileRows, epilogue}, ring.front(),
                         epilogue == LinearEpilogue::GateUp ? &ring.front() : nullptr).configuration();
         for (const LinearTile tile : {LinearTile::GgufRegister, LinearTile::GgufStaged})
           for (uint32_t splits = 1; splits <= LinearConfig::kMaximumSplits; splits *= 2) {
@@ -375,7 +375,7 @@ int main(int argc, char **argv) {
       const ProjectionShape shape = ring.front().shape();
       const LinearScratch scratch{
           zeros(size.input), zeros(size.sums), zeros(size.partials), zeros(size.counters),
-          rotated ? zeros(prefill ? linear.prefillScratchSize(shape).rotated : linear.decodeScratchSize(shape).rotated)
+          rotated ? zeros(prefill ? linear.scratchSize(shape, SPLASH_PREFILL_TOKEN_BUDGET).rotated : linear.scratchSize(shape, kMaximumDecodeTileRows).rotated)
                   : MetalBuffer{}};
       // The register tile's table, prepared by its widest plan, whose plans of fewer rows read its leading tiles.
       PreparedInput table;

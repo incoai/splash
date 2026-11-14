@@ -188,8 +188,8 @@ struct DFlashWindowCapture final {
 
 struct DFlashPrefillBuffers final {
   metal::MetalBuffer capturedTargetHidden;
-  // The split partials and counters of the context projections' chunks the
-  // staged tile runs (Linear::addPrefill).
+  // What the context projections' plans take beside their buffers: split
+  // partials and counters, a table they prepare (Linear::addProjection).
   ops::LinearScratch linearScratch;
   metal::MetalBuffer projected;
   metal::MetalBuffer hidden;
@@ -262,7 +262,7 @@ public:
                          uint32_t rows, uint32_t startPosition) const;
 
   // Lanes of storage the draft's own projections bind in a decode step or
-  // context commit of `lanes` lanes (ops::Linear::decodeStorageRows).
+  // context commit of `lanes` lanes (ops::Linear::storageRows).
   [[nodiscard]] uint32_t decodeStorageLanes(uint32_t lanes) const;
   void addDecode(metal::CommandGraph &graph, DFlashDecodeBuffers buffers,
                  const ops::Projection &vocabularyProjection,

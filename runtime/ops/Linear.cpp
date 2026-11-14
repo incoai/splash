@@ -16,28 +16,15 @@ namespace splash::ops {
 namespace {
 
 // Matrices of whole 64-row tiles (GGUF_TILE_COLUMNS) of whole 64-input spans,
-// whose K is a multiple of a 64-input span (or of its format's superblock).
+// whose K is a multiple of a 64-input span (or of its format's superblock), and
+// up to a prefill chunk's rows. A gate/up pair runs as one plan on the decode
+// tiles alone (LinearEpilogue).
 void validate(LinearWorkload w) {
   if (!w.matrix.outputSize || w.matrix.outputSize % 64 || !w.matrix.inputSize || w.matrix.inputSize % 64)
     throw std::invalid_argument("invalid linear matrix");
-  if (w.liveRows > w.rows || (w.phase == LinearPhase::Prefill && w.liveRows))
-    throw std::invalid_argument("a decode workload's live rows are some of its rows");
-  if (w.phase == LinearPhase::Prefill) {
-    if (!w.rows || w.rows > SPLASH_PREFILL_TOKEN_BUDGET ||
-        w.epilogue == LinearEpilogue::GateUp)
-      throw std::invalid_argument("invalid linear prefill workload");
-  } else {
-    if (!w.rows || w.rows % SPLASH_TARGET_VERIFY_ROWS ||
-        w.rows > SPLASH_TARGET_VERIFY_ROWS * SPLASH_MAXIMUM_BATCH_WIDTH ||
-        w.epilogue == LinearEpilogue::UpWithGate)
-      throw std::invalid_argument("invalid linear decode workload");
-  }
-}
-
-LinearWorkload decode(LinearMatrix matrix, uint32_t lanes, LinearEpilogue epilogue, uint32_t liveRows = 0) {
-  if (!lanes || lanes > SPLASH_MAXIMUM_BATCH_WIDTH)
-    throw std::invalid_argument("invalid linear decode batch width");
-  return {matrix, lanes * SPLASH_TARGET_VERIFY_ROWS, LinearPhase::Decode, epilogue, liveRows};
+  if (!w.rows || w.rows > SPLASH_PREFILL_TOKEN_BUDGET ||
+      (w.epilogue == LinearEpilogue::GateUp && w.rows > kMaximumDecodeTileRows))
+    throw std::invalid_argument("invalid linear workload");
 }
 
 // LinearScratch::rotated bytes of `rows` bf16 rows of `width` inputs, which
@@ -53,8 +40,8 @@ void requireLeadingInputs(const LinearPlan &plan, const Projection &p) {
   if (!p.planeInputs()) return;
   const LinearWorkload w = plan.workload();
   const LinearTile tile = plan.configuration().tile;
-  if (w.phase != LinearPhase::Prefill || w.epilogue != LinearEpilogue::Residual ||
-      (tile != LinearTile::GgufPrefill && tile != LinearTile::GgufPrefillInt8) || p.rotation)
+  if (w.epilogue != LinearEpilogue::Residual || (tile != LinearTile::GgufPrefill && tile != LinearTile::GgufPrefillInt8) ||
+      p.rotation)
     throw std::invalid_argument("a view of leading inputs runs only the quantized prefill residual tiles");
 }
 
@@ -104,17 +91,17 @@ Projection Projection::leadingInputs(uint32_t inputs) const {
   return result;
 }
 
-// Table16 holds its sums per eight-row tile (metal/abi/Gguf.h), a lane's rows.
+// Table16 holds its sums per table tile (metal/abi/Gguf.h).
 uint64_t tableSumsBytes(LinearInput layout, uint32_t width, uint64_t rows) noexcept {
-  return layout == LinearInput::Table16
-             ? rows / SPLASH_TARGET_VERIFY_ROWS * table16_sums_per_tile(width) * sizeof(float)
-             : 0;
+  return layout == LinearInput::Table16 ? tableTiles(static_cast<uint32_t>(rows)) * table16_sums_per_tile(width) *
+                                              sizeof(float)
+                                        : 0;
 }
 
 void requireTableScratch(const LinearScratch &scratch, LinearInput layout, uint32_t width, uint32_t rows) {
-  if (layout == LinearInput::Plain || !rows || rows % SPLASH_TARGET_VERIFY_ROWS || width % 64)
+  if (layout == LinearInput::Plain || !rows || width % 64)
     throw std::invalid_argument("invalid linear table geometry");
-  requireBytes(scratch.input, tableBytes(width, rows), "linear table");
+  requireBytes(scratch.input, tableBytes(width, uint64_t{tableTiles(rows)} * GGUF_TABLE16_ROWS), "linear table");
   requireBytes(scratch.sums, tableSumsBytes(layout, width, rows), "linear table sums");
 }
 
@@ -137,9 +124,10 @@ uint64_t LinearPlan::gateScratchBytes() const noexcept {
 LinearPlan::LinearPlan(LinearWorkload w, LinearConfig config, FloatOutput destination)
     : workload_(w), config_(config), destination_(destination) {
   validate(w);
+  // Only the decode tiles have fp32 instances, of their plain projection.
   if (destination == FloatOutput::Float32 &&
-      (w.phase != LinearPhase::Decode || w.epilogue != LinearEpilogue::None))
-    throw std::invalid_argument("an fp32 destination takes a plain decode projection");
+      (w.rows > kMaximumDecodeTileRows || w.epilogue != LinearEpilogue::None))
+    throw std::invalid_argument("an fp32 destination takes a plain projection on the decode tiles");
   // Kernel names follow the segment formats (LinearGguf.cpp).
   requireConfiguration();
 }
@@ -147,13 +135,15 @@ LinearPlan::LinearPlan(LinearWorkload w, LinearConfig config, FloatOutput destin
 Linear::Linear(const DeviceCapabilities &device, Int8Activations int8Activations) noexcept
     : calibration_(KernelCalibration::of(device)), int8Activations_(int8Activations) {}
 
-uint32_t Linear::decodeStorageRows(uint32_t rows, ProjectionShape shape) const {
+uint32_t Linear::storageRows(uint32_t rows, ProjectionShape shape) const {
   // The None and Residual plans share a tile; a gate/up pair of one format
   // counts both tensors' columns in one pass and may stage where they do not.
+  // Past the decode tiles a pair runs as its tensors' own plans.
   UnitFormats unit = unitFormats(shape);
   uint32_t storage = 0;
   for (const auto epilogue : {LinearEpilogue::None, LinearEpilogue::GateUp}) {
-    const LinearWorkload w{{shape.outputSize, shape.inputSize}, rows, LinearPhase::Decode, epilogue};
+    if (epilogue == LinearEpilogue::GateUp && rows > kMaximumDecodeTileRows) continue;
+    const LinearWorkload w{{shape.outputSize, shape.inputSize}, rows, epilogue};
     validate(w);
     unit.oneFormat = epilogue == LinearEpilogue::GateUp;
     storage = std::max(storage, LinearPlan(w, selectProjection(calibration_, int8Activations_, w, unit)).storageRows());
@@ -183,49 +173,49 @@ LinearPlan Linear::plan(LinearWorkload w, const Projection &p, const Projection 
   return plan;
 }
 
-LinearPlan Linear::decodePlan(const Projection &p, uint32_t lanes, LinearEpilogue epilogue,
-                              const Projection *gate, uint32_t liveRows) const {
-  return plan(decode({p.outputSize, p.inputSize}, lanes, epilogue, liveRows), p, gate);
-}
-LinearPlan Linear::prefillPlan(const Projection &p, uint32_t rows, LinearEpilogue epilogue,
-                               uint32_t chunkRows) const {
-  const LinearWorkload w{{p.outputSize, p.inputSize}, rows, LinearPhase::Prefill, epilogue};
-  if (!chunkRows || chunkRows == rows) return plan(w, p);
-  if (rows > chunkRows) throw std::invalid_argument("a prefill plan takes rows of its chunk");
-  const LinearPlan chunk = plan({w.matrix, chunkRows, LinearPhase::Prefill, epilogue}, p);
+LinearPlan Linear::plan(const Projection &p, uint32_t rows, LinearEpilogue epilogue, const Projection *gate,
+                        uint32_t chunkRows) const {
+  const LinearWorkload w{{p.outputSize, p.inputSize}, rows, epilogue};
+  if (!chunkRows || chunkRows == rows) return plan(w, p, gate);
+  if (rows > chunkRows) throw std::invalid_argument("a plan of a chunk's rows takes rows of its chunk");
+  const LinearPlan chunk = plan({w.matrix, chunkRows, epilogue}, p, gate);
   LinearPlan part(w, chunk.configuration(), chunk.destination());
   part.rotated_ = chunk.rotated_;
   return part;
 }
 
-LinearScratchSize Linear::decodeScratchSize(ProjectionShape shape) const {
+LinearScratchSize Linear::scratchSize(ProjectionShape shape, uint32_t rows) const {
+  if (!rows || rows > SPLASH_PREFILL_TOKEN_BUDGET) throw std::invalid_argument("invalid linear scratch rows");
   LinearScratchSize bound;
-  for (uint32_t lanes = 1; lanes <= SPLASH_MAXIMUM_BATCH_WIDTH; ++lanes)
-    for (const auto epilogue : {LinearEpilogue::None, LinearEpilogue::Residual, LinearEpilogue::GateUp})
-      bound.include(
-          ggufDecodeScratchSize(decode({shape.outputSize, shape.inputSize}, lanes, epilogue), shape.registerFormats));
-  // Decode plans store at most every lane's rows.
-  if (shape.rotated) bound.rotated = rotatedBytes(shape.inputSize, kMaximumDecodeTileRows);
-  return bound;
-}
-
-LinearScratchSize Linear::prefillScratchSize(ProjectionShape shape) const {
-  LinearScratchSize bound;
-  // Prefill plans take split scratch only in chunks that run the staged tile,
-  // of up to kMaximumStagedPrefillRows rows (LinearGguf.cpp).
-  for (uint32_t rows = 1; rows <= kMaximumStagedPrefillRows; ++rows)
+  // Split scratch and tables grow with the rows of the decode tiles, each
+  // count of rows any tile the device may run it on, and of the staged tile up
+  // to kMaximumStagedPrefillRows rows; the prefill tiles never split
+  // (LinearGguf.cpp).
+  const LinearMatrix matrix{shape.outputSize, shape.inputSize};
+  for (uint32_t count = 1; count <= std::min(rows, kMaximumStagedPrefillRows); ++count) {
+    if (count <= kMaximumDecodeTileRows) {
+      for (const auto epilogue : {LinearEpilogue::None, LinearEpilogue::Residual, LinearEpilogue::GateUp})
+        bound.include(ggufDecodeScratchSize({matrix, count, epilogue}, shape.registerFormats));
+      continue;
+    }
     for (const auto epilogue : {LinearEpilogue::None, LinearEpilogue::Residual, LinearEpilogue::UpWithGate})
-      bound.include(plan({{shape.outputSize, shape.inputSize}, rows, LinearPhase::Prefill, epilogue}).scratchSize());
-  // Every prefill plan stores at most the token budget.
+      bound.include(plan({matrix, count, epilogue}).scratchSize());
+  }
+  // A plan stores at most its rows' tiles: the decode tiles' up to
+  // kMaximumDecodeTileRows, the prefill tiles' whole 128-row tiles.
   static_assert(SPLASH_PREFILL_TOKEN_BUDGET % GGUF_PREFILL_ROWS == 0, "the prefill tiles cover the budget exactly");
-  if (shape.rotated) bound.rotated = rotatedBytes(shape.inputSize, SPLASH_PREFILL_TOKEN_BUDGET);
-  // A full chunk's, which the int8 prefill tile holds where it takes the
-  // shape's formats.
-  const LinearWorkload chunk{
-      {shape.outputSize, shape.inputSize}, SPLASH_PREFILL_TOKEN_BUDGET, LinearPhase::Prefill, LinearEpilogue::None};
-  validate(chunk);
-  bound.include(
-      LinearPlan(chunk, selectProjection(calibration_, int8Activations_, chunk, unitFormats(shape))).scratchSize());
+  const uint32_t storage = rows <= kMaximumDecodeTileRows       ? std::max(rows, stagedStorageRows(rows, true))
+                           : rows <= kMaximumStagedPrefillRows ? kMaximumStagedPrefillRows
+                                                                : (rows + GGUF_PREFILL_ROWS - 1) / GGUF_PREFILL_ROWS *
+                                                                      GGUF_PREFILL_ROWS;
+  if (shape.rotated) bound.rotated = rotatedBytes(shape.inputSize, storage);
+  // The most rows' plan, whose codes and scales the int8 prefill tile holds
+  // where it takes the shape's formats.
+  if (rows > kMaximumStagedPrefillRows) {
+    const LinearWorkload most{matrix, rows, LinearEpilogue::None};
+    bound.include(
+        LinearPlan(most, selectProjection(calibration_, int8Activations_, most, unitFormats(shape))).scratchSize());
+  }
   return bound;
 }
 
@@ -267,27 +257,42 @@ PreparedInput Linear::add(metal::CommandGraph &graph, LinearBuffers b,
   return tiled && selected.input() != LinearInput::Plain ? PreparedInput{b.input, selected.input()} : b.prepared;
 }
 
-void Linear::addPrefill(metal::CommandGraph &graph, metal::MetalBuffer input, const Projection &p,
-                        metal::MetalBuffer output, uint32_t rows, LinearScratch scratch, uint32_t chunkRows) const {
+void Linear::addProjection(metal::CommandGraph &graph, metal::MetalBuffer input, const Projection &p,
+                           metal::MetalBuffer output, uint32_t rows, LinearScratch scratch, uint32_t chunkRows) const {
   add(graph, {.input = input, .output = output, .scratch = scratch}, p,
-      prefillPlan(p, rows, LinearEpilogue::None, chunkRows));
+      plan(p, rows, LinearEpilogue::None, nullptr, chunkRows));
 }
-void Linear::addPrefillResidual(metal::CommandGraph &graph, metal::MetalBuffer input, const Projection &p,
-                                metal::MetalBuffer residual, metal::MetalBuffer output, uint32_t rows,
-                                LinearScratch scratch, uint32_t chunkRows) const {
+void Linear::addResidualProjection(metal::CommandGraph &graph, metal::MetalBuffer input, const Projection &p,
+                                   metal::MetalBuffer residual, metal::MetalBuffer output, uint32_t rows,
+                                   LinearScratch scratch, uint32_t chunkRows) const {
   add(graph, {.input = input, .output = output, .residual = residual, .scratch = scratch}, p,
-      prefillPlan(p, rows, LinearEpilogue::Residual, chunkRows));
+      plan(p, rows, LinearEpilogue::Residual, nullptr, chunkRows));
 }
-void Linear::addPrefillSwiGlu(metal::CommandGraph &graph, const SwiGluProjections &ffn,
-                              const PrefillFfnBuffers &b, metal::MetalBuffer residual, metal::MetalBuffer output,
-                              uint32_t rows, uint32_t chunkRows) const {
-  const PreparedInput normalized = add(graph, {.input = b.normalized, .output = b.gateScratch, .scratch = b.scratch},
-                                       *ffn.gate, prefillPlan(*ffn.gate, rows, LinearEpilogue::None, chunkRows));
-  add(graph,
-      {.input = b.normalized, .output = b.intermediate, .gateScratch = b.gateScratch, .scratch = b.scratch,
-       .prepared = normalized},
-      *ffn.up, prefillPlan(*ffn.up, rows, LinearEpilogue::UpWithGate, chunkRows));
-  addPrefillResidual(graph, b.intermediate, *ffn.down, residual, output, rows, b.scratch, chunkRows);
+// A chunk's rows decide whether its plans run the pair as one, so that a plan
+// of some of its rows computes them as the chunk's does.
+LinearInput Linear::swiGluInput(const SwiGluProjections &ffn, uint32_t rows, uint32_t chunkRows) const {
+  if ((chunkRows ? chunkRows : rows) <= kMaximumDecodeTileRows)
+    return plan(*ffn.up, rows, LinearEpilogue::GateUp, ffn.gate, chunkRows).input();
+  return plan(*ffn.gate, rows, LinearEpilogue::None, nullptr, chunkRows).input();
+}
+void Linear::addSwiGlu(metal::CommandGraph &graph, const SwiGluProjections &ffn, const PrefillFfnBuffers &b,
+                       metal::MetalBuffer residual, metal::MetalBuffer output, uint32_t rows, uint32_t chunkRows,
+                       PreparedInput normalized) const {
+  if ((chunkRows ? chunkRows : rows) <= kMaximumDecodeTileRows) {
+    add(graph,
+        {.input = b.normalized, .output = b.intermediate, .gateScratch = b.gateScratch, .scratch = b.scratch,
+         .prepared = normalized},
+        *ffn.up, plan(*ffn.up, rows, LinearEpilogue::GateUp, ffn.gate, chunkRows), ffn.gate);
+  } else {
+    normalized = add(graph,
+                     {.input = b.normalized, .output = b.gateScratch, .scratch = b.scratch, .prepared = normalized},
+                     *ffn.gate, plan(*ffn.gate, rows, LinearEpilogue::None, nullptr, chunkRows));
+    add(graph,
+        {.input = b.normalized, .output = b.intermediate, .gateScratch = b.gateScratch, .scratch = b.scratch,
+         .prepared = normalized},
+        *ffn.up, plan(*ffn.up, rows, LinearEpilogue::UpWithGate, nullptr, chunkRows));
+  }
+  addResidualProjection(graph, b.intermediate, *ffn.down, residual, output, rows, b.scratch, chunkRows);
 }
 
 } // namespace splash::ops

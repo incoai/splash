@@ -163,8 +163,8 @@ void DFlashDraft::addContextPrefill(
     if (span.ring.size() != layout.layers)
       throw std::invalid_argument("draft prefill ring layer mismatch");
   }
-  operators_.draftLinear().addPrefill(graph, buffers.capturedTargetHidden, weights_.contextProjection,
-                                      buffers.projected, rows, buffers.linearScratch);
+  operators_.draftLinear().addProjection(graph, buffers.capturedTargetHidden, weights_.contextProjection,
+                                         buffers.projected, rows, buffers.linearScratch);
   ops::Normalization::addRms(graph, buffers.projected, weights_.hiddenNorm, buffers.hidden, layout.hiddenSize,
                              rows);
   const uint64_t rowBytes = uint64_t{layout.hiddenSize} * sizeof(uint16_t);
@@ -203,8 +203,8 @@ void DFlashDraft::addContextKv(metal::CommandGraph &graph,
                                std::span<const DFlashPrefillSpan> spans) const {
   const DFlashDraftLayout &layout = weights_.layout;
   for (uint32_t layer = 0; layer < layout.layers; ++layer) {
-    operators_.draftLinear().addPrefill(graph, buffers.hidden, contextKvProjections_[layer], buffers.contextKv, rows,
-                                        buffers.linearScratch);
+    operators_.draftLinear().addProjection(graph, buffers.hidden, contextKvProjections_[layer], buffers.contextKv,
+                                           rows, buffers.linearScratch);
     for (const DFlashPrefillSpan &span : spans) {
       const uint64_t kvOffset =
           uint64_t{span.compactRow} * layout.contextKvSize() * sizeof(uint16_t);
@@ -231,7 +231,7 @@ uint32_t DFlashDraft::decodeStorageLanes(uint32_t lanes) const {
   const uint32_t rows = lanes * ExecutionLimits::draftQueryRows;
   uint32_t storageRows = rows;
   const auto include = [&](const ops::Projection &p) {
-    storageRows = std::max(storageRows, linear.decodeStorageRows(rows, p.shape()));
+    storageRows = std::max(storageRows, linear.storageRows(rows, p.shape()));
   };
   for (const DFlashDraftLayerWeights &layer : weights_.layers)
     for (const ops::Projection *p : {&layer.attentionDynamic, &layer.qkvProjection, &layer.outputProjection,
@@ -265,7 +265,7 @@ void DFlashDraft::addDecode(
     const uint32_t current = layer & 1;
     const uint32_t next = current ^ 1;
     const DFlashDraftLayerWeights &weights = weights_.layers[layer];
-    const ops::LinearPlan attentionDynamicPlan = linear.decodePlan(weights.attentionDynamic, lanes);
+    const ops::LinearPlan attentionDynamicPlan = linear.plan(weights.attentionDynamic, rows);
     const ops::PreparedInput attentionNormalized = ops::Normalization::addRms(
         graph, buffers.hidden[current], weights.inputNorm, buffers.normalized,
         layout.hiddenSize, rows, scratch, attentionDynamicPlan.input());
@@ -279,7 +279,7 @@ void DFlashDraft::addDecode(
          buffers.hidden[current], buffers.convolved},
         attentionPlan, ops::DraftConvolutionStage::Prepare);
     linear.add(graph, {.input = buffers.convolved, .output = buffers.proposalQkv, .scratch = scratch},
-               weights.qkvProjection, linear.decodePlan(weights.qkvProjection, lanes));
+               weights.qkvProjection, linear.plan(weights.qkvProjection, rows));
     ops::DraftAttention::addPrepare(
         graph,
         {buffers.proposalQkv, buffers.attention, weights.queryNorm,
@@ -293,13 +293,13 @@ void DFlashDraft::addDecode(
          buffers.queryValues},
         cacheLengths, attentionPlan);
     linear.add(graph, {.input = buffers.attention, .output = buffers.projected, .scratch = scratch},
-               weights.outputProjection, linear.decodePlan(weights.outputProjection, lanes));
+               weights.outputProjection, linear.plan(weights.outputProjection, rows));
     ops::DraftAttention::addConvolution(
         graph,
         {buffers.projected, buffers.dynamic, weights.attentionConvolution,
          buffers.hidden[current], buffers.residual},
         attentionPlan, ops::DraftConvolutionStage::Residual);
-    const ops::LinearPlan mlpDynamicPlan = linear.decodePlan(weights.mlpDynamic, lanes);
+    const ops::LinearPlan mlpDynamicPlan = linear.plan(weights.mlpDynamic, rows);
     const ops::PreparedInput mlpNormalized = ops::Normalization::addRms(
         graph, buffers.residual, weights.postAttentionNorm, buffers.normalized,
         layout.hiddenSize, rows, scratch, mlpDynamicPlan.input());
@@ -316,10 +316,10 @@ void DFlashDraft::addDecode(
                {.input = buffers.convolved, .output = buffers.intermediate, .gateScratch = buffers.gateScratch,
                 .scratch = scratch},
                weights.upProjection,
-               linear.decodePlan(weights.upProjection, lanes, ops::LinearEpilogue::GateUp, &weights.gateProjection),
+               linear.plan(weights.upProjection, rows, ops::LinearEpilogue::GateUp, &weights.gateProjection),
                &weights.gateProjection);
     linear.add(graph, {.input = buffers.intermediate, .output = buffers.projected, .scratch = scratch},
-               weights.downProjection, linear.decodePlan(weights.downProjection, lanes));
+               weights.downProjection, linear.plan(weights.downProjection, rows));
     ops::DraftAttention::addConvolution(
         graph,
         {buffers.projected, buffers.dynamic, weights.mlpConvolution,
@@ -333,7 +333,7 @@ void DFlashDraft::addDecode(
   // its scratch is sized (DecodeArena::linearScratchSize): only the draft's
   // own projections keep bf16 activations.
   const ops::Linear &target = operators_.linear();
-  const ops::LinearPlan headPlan = target.decodePlan(vocabularyProjection, lanes);
+  const ops::LinearPlan headPlan = target.plan(vocabularyProjection, rows);
   const ops::PreparedInput finalHidden = ops::Normalization::addRms(
       graph, buffers.hidden[weights_.layout.layers & 1], weights_.finalNorm,
       buffers.finalHidden, layout.hiddenSize, rows, scratch, headPlan.input());
@@ -343,7 +343,7 @@ void DFlashDraft::addDecode(
   linear.add(graph,
              {.input = buffers.finalHidden, .output = buffers.selectorHidden, .scratch = scratch,
               .prepared = afterHead},
-             weights_.selectorProjection, linear.decodePlan(weights_.selectorProjection, lanes));
+             weights_.selectorProjection, linear.plan(weights_.selectorProjection, rows));
 }
 
 void DFlashDraft::addMaskRows(metal::CommandGraph &graph, metal::MetalBuffer rows, uint32_t lanes) const {
@@ -366,10 +366,10 @@ void DFlashDraft::addContextCommit(
   const ops::Linear &linear = operators_.draftLinear();
   const ops::LinearScratch &scratch = buffers.linearScratch;
   linear.add(graph, {.input = buffers.capturedTargetHidden, .output = buffers.projected, .scratch = scratch},
-             weights_.contextProjection, linear.decodePlan(weights_.contextProjection, lanes));
+             weights_.contextProjection, linear.plan(weights_.contextProjection, rows));
   // Every layer's key and value projection reads the same normalized rows,
   // prepared for the first layer's plan.
-  ops::LinearPlan kvPlan = linear.decodePlan(contextKvProjections_[0], lanes);
+  ops::LinearPlan kvPlan = linear.plan(contextKvProjections_[0], rows);
   ops::PreparedInput hidden = ops::Normalization::addRms(
       graph, buffers.projected, weights_.hiddenNorm, buffers.hidden, layout.hiddenSize, rows,
       scratch, kvPlan.input());
@@ -384,7 +384,7 @@ void DFlashDraft::addContextCommit(
 
   for (uint32_t layer = 0; layer < layout.layers; ++layer) {
     const ops::Projection &projection = contextKvProjections_[layer];
-    if (layer) kvPlan = linear.decodePlan(projection, lanes);
+    if (layer) kvPlan = linear.plan(projection, rows);
     hidden = linear.add(graph,
                         {.input = buffers.hidden, .output = buffers.contextKv, .scratch = scratch,
                          .prepared = hidden},

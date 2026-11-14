@@ -428,8 +428,8 @@ per sequence, its last (the head's input and the finiteness check), unless the
 draft reads that layer. Every row still writes its KV. The tile that holds each
 read row attends as a chunk of its own on the chunk's split count
 (`PagedAttention::prefillTail`), and its gate, o-projection, norm and FFN run
-on the read rows compacted, on the chunk's projection tile kinds and K splits
-(`Linear::prefillPlan` of a chunk's rows), so a dense target's read rows keep
+on the read rows compacted, on the chunk's projection configurations
+(`Linear::plan` of a chunk's rows), so a dense target's read rows keep
 their bits where the GPU runs the layer. A MoE block runs the plan of the read
 rows, whose routes then see
 fewer rows of their experts and sum in another order (abi/MoE.h), so a MoE
@@ -476,51 +476,51 @@ every plan on every device). The KV cache keeps `--kv-format` either way.
 
 The rules:
 
-1. *Projection, prefill.* A chunk of up to `stagedPrefillRows` rows (64 on
-   Apple10 and on Apple9 GPUs of 10 cores or fewer, 32 on larger Apple9 GPUs)
-   runs the staged tile at its rows' height (8, 16, 32 or 64) with
-   `stagedSplits`; a longer one runs the 128-row prefill tile, unsplit, or,
-   with int8 activations on, on a row with `prefillInt8` (Apple10 and Apple11)
-   the [int8-activation tile](#int8-activation-prefill) where it takes every
-   quantized segment. A projection of several segments and no epilogue runs
-   them in one dispatch on the staged tile, in prefill as in decode, and those
-   of each format in one on the 128-row prefill tile; the int8 tile runs a
-   GEMM dispatch per segment beside the quantization of its input, which a
-   SwiGLU's gate and up share. (The segments of a format in one dispatch
-   took the 27B's fused inputs 6-11% less time at 65-128 rows but 1-3% more
-   at 512-2048, 12-core M6.)
-2. *Projection, decode.* The register tile runs where it takes every quantized
-   segment and the unit's `FormatClass` (`GridLookup`: IQ3_XXS, the IQ2 formats
-   and IQ1; `GridLookupOrQ2K`; `UnderFourBits`; `FourBitsOrMore`) is below its
-   `RegisterBoundary`: 4 x column tiles x lanes < belowQuarters x cores, a
-   one-pass-eligible gate/up pair's column tiles counting both tensors'. It
-   splits by `registerSplits`. Otherwise the staged tile runs, split by
+1. *Projection, past the decode tiles.* A plan's rows pick its tile, whatever
+   command runs it. A plan of more rows than the decode tiles hold (32) and up
+   to `stagedPrefillRows` rows (64 on Apple10 and on Apple9 GPUs of 10 cores or
+   fewer, 32 on larger Apple9 GPUs) runs the staged tile at its 64-row height
+   with `stagedSplits`; a longer one runs the 128-row prefill tile, unsplit,
+   or, with int8 activations on, on a row with `prefillInt8` (Apple10 and
+   Apple11) the [int8-activation tile](#int8-activation-prefill) where it takes
+   every quantized segment. A gate/up pair runs there as a gate plan and an up
+   plan that applies silu(gate) (`Linear::addSwiGlu`). A projection of several
+   segments and no epilogue runs them in one dispatch on the staged tile, and
+   those of each format in one on the 128-row prefill tile; the int8 tile runs
+   a GEMM dispatch per segment beside the quantization of its input, which a
+   SwiGLU's gate and up share. (The segments of a format in one dispatch took
+   the 27B's fused inputs 6-11% less time at 65-128 rows but 1-3% more at
+   512-2048, 12-core M6.)
+2. *Projection, decode tiles.* A plan of up to 32 rows, a decode step's or a
+   prompt chunk's, runs them, its rows in table tiles of 8 (the last padded,
+   `tableTiles`). A plan of at most `GGUF_COLUMN_ROWS` (2) rows runs the column
+   tile on every device (`kernels/decode/linear_gguf_column.metal`): each lane
+   one column of a GEMV in registers over those rows alone (the MoE expert
+   tiles' column tile, `kernels/common/gguf_column_tile.h`), eight simdgroups
+   of a threadgroup splitting K and adding their parts in order, a gate/up
+   pair of one format in one pass; on the M5 Max a [2048 x 6144] af4g64
+   projection at one row takes 18.4 us on the column tile and 28 us on the
+   staged tile. Otherwise the register tile runs where it takes every
+   quantized segment and the unit's `FormatClass` (`GridLookup`: IQ3_XXS, the
+   IQ2 formats and IQ1; `GridLookupOrQ2K`; `UnderFourBits`; `FourBitsOrMore`)
+   is below its `RegisterBoundary`: 4 x column tiles x table tiles <
+   belowQuarters x cores, a one-pass-eligible gate/up pair's column tiles
+   counting both tensors'. It splits by `registerSplits`. Otherwise the staged
+   tile runs at the fewest of 8, 16 or 32 rows that hold the plan's, split by
    `stagedSplits` (the Apple10 wave law also picks one or two passes for a
    pair of one format from `onePassFromCores`), its walks spread from
-   `spreadFromCores`, and one unsplit lane on the 16-row tile below
-   `sixteenRowBelowBits16` sixteenths of a bit per weight, and from there
-   under the wave law where its grid runs in as many waves of that tile as of
-   the 8-row tile, `sixteenRowWaves` at most; a pair's only where both its
-   tensors' own plans take it. A unit stages only where every quantized
+   `spreadFromCores`, and a plan of one table tile unsplit on the 16-row tile
+   below `sixteenRowBelowBits16` sixteenths of a bit per weight, and from
+   there under the wave law where its grid runs in as many waves of that tile
+   as of the 8-row tile, `sixteenRowWaves` at most; a pair's only where both
+   its tensors' own plans take it. A unit stages only where every quantized
    segment's class does: dense measurements were taken per projection. With
    int8 activations on, a unit whose quantized segments are all rotated in a
    format the int8 decode tiles take (`UnitFormats::decodeInt8Takes`: PQ2_0)
-   runs a staged plan of at least `decodeInt8FromRows` rows (16 on Apple10 and
-   Apple11, one lane's 16-row plan among them; never on Apple9) whose K splits
-   keep whole PQ2_0 blocks on those tiles, at the plan's splits and passes.
-   A decode step names how many of its leading rows are live
-   (`LinearWorkload::liveRows`, any number up to its rows; 0 for all of them),
-   and the plan picks the tile by them: a step of at most `GGUF_COLUMN_ROWS`
-   (2) live rows runs the column tile on every device
-   (`kernels/decode/linear_gguf_column.metal`): each lane one column of a GEMV
-   in registers over the live rows alone (the MoE expert tiles' column tile,
-   `kernels/common/gguf_column_tile.h`), eight simdgroups of a threadgroup
-   splitting K and adding their parts in order, a gate/up pair of one format
-   in one pass. A step of more live rows, or a gate/up pair of two formats,
-   plans as a step of all its rows. On the M5 Max a [2048 x 6144] af4g64
-   projection at one live row takes 18.4 us on the column tile and 28 us on
-   the staged tile. The language models name no live rows today, every lane
-   verifying its draft's eight rows, so none of their plans changes.
+   runs a staged plan that stores at least `decodeInt8FromRows` rows (16 on
+   Apple10 and Apple11, a 16-row plan among them; never on Apple9) whose K
+   splits keep whole PQ2_0 blocks on those tiles, at the plan's splits and
+   passes; their shortest height is 16 rows.
 3. *Float projection.* The accelerator tile runs where the device has one,
    from `minimumRows` rows and a grid of its tiles of at least half the class's
    half tiles per core for BF16 values, F32 values or a quantized format's rows.
@@ -685,10 +685,10 @@ written slice of the input at once; the MoE experts, prefill, Apple9 and fewer c
 lockstep. There a dense gate/up pair whose tensors share their format may also decode in one
 dispatch (`LinearConfig::oneGateUpPass`), each simdgroup staging both tensors' columns, where
 the staged split law below takes it. Its output is bitwise the two passes' at the same K split;
-where its split differs from the two passes', its sums are reassociated. A step of three request
-lanes runs the 32-row tile over four lanes of storage. On Apple10 one lane runs the 16-row tile
-over two lanes of storage (`LinearConfig::sixteenRows`), its padding lane computed and
-discarded, where its staged plan is unsplit, and an unsplit gate/up pair, in one pass or two,
+where its split differs from the two passes', its sums are reassociated. A plan of 17 to 32 rows
+(three request lanes among them) runs the 32-row tile. On Apple10 a plan of one table tile
+(at most 8 rows, one lane's) runs the 16-row tile (`LinearConfig::sixteenRows`), its padding
+rows computed and discarded, where its staged plan is unsplit, and an unsplit gate/up pair, in one pass or two,
 where both its tensors' own plans do, since they size its storage: the lane's rows are bitwise
 the 8-row tile's, and a wave of most formats takes less time (MPP computes 16-row fragments).
 Below four and a half bits per weight (`sixteenRowBelowBits16`) a lane runs it whatever the
@@ -715,16 +715,17 @@ splits K most (the 35B's, the 122B's and Flash-Next's output projections, 1 to 1
 per core unsplit, in four or eight partitions) the 16-row tile takes 4-36% more time than the
 8-row tile at the same split on a 32-core M5 Max (IQ3_XXS, IQ2_XS and Q2_K, and IQ4_XS where it
 stages), against 2-8% less at 4 to 20 threadgroups per core on the M6 and 7% less to 2% more on
-the 27B's 5120-column projections in four on the M5 Max. Prefill runs the staged kernels on
-every class: the 128-row prefill tile (`LinearTile::GgufPrefill`; on Apple10 and Apple11 the
-[int8-activation tile](#int8-activation-prefill) where it takes the weights), and the staged
-tile for chunks of up to 32 rows. On Apple10 and on Apple9 GPUs of 10 cores or fewer chunks of
-33 to 64 rows run the staged tile's 64-row height too, which reads the weights once where the
-prefill tile costs about as much for 33 rows as for 64 (on the 10-core M4 12-22% less time than
-the prefill tile). A fused projection's staged chunk runs its segments in one dispatch, as
-decode does: a dispatch costs about 0.045 ms however narrow, and at 8 to 32 rows one dispatch
-takes 16-56% less time than one per segment on the 32-core M5 Max and 3-11% less on the 10-core
-M4 for the 27B attention and 35B GDN inputs.
+the 27B's 5120-column projections in four on the M5 Max. A prompt chunk runs the plans of its
+rows like any other command: those of up to 32 rows these decode tiles (the staged tile of its
+rows ran a 17408 x 5120 Q4_K chunk 1.8-2.9x faster than the prefill tile, 16-core M5 Pro); past
+them the 128-row prefill tile (`LinearTile::GgufPrefill`; on Apple10 and Apple11 the
+[int8-activation tile](#int8-activation-prefill) where it takes the weights). On Apple10 and on
+Apple9 GPUs of 10 cores or fewer plans of 33 to 64 rows run the staged tile's 64-row height,
+which reads the weights once where the prefill tile costs about as much for 33 rows as for 64 (on
+the 10-core M4 12-22% less time than the prefill tile). A fused projection's staged plan runs its
+segments in one dispatch: a dispatch costs about 0.045 ms however narrow, and at 8 to 32 rows
+one dispatch takes 16-56% less time than one per segment on the 32-core M5 Max and 3-11% less on
+the 10-core M4 for the 27B attention and 35B GDN inputs.
 
 Apple10's staged tile splits K across threadgroups, and runs a gate/up pair in one pass or two,
 by one wave law (`WaveLaw`, `runtime/ops/KernelSelection.cpp`), for decode steps and short
@@ -941,8 +942,8 @@ format's up and the prefill tiles, each output inside the fp64 bound of
 split, one lane on the staged 16-row tile bitwise against the 8-row tile, and, where the device
 row takes int8 activations, rotated PQ2_0 on the int8 tiles within the fp32 rounding of the exact
 products of their codes, lanes and pass modes bitwise, a non-finite input's row alone not
-finite, and a step of one or two live rows on the column tile in every format and in fused
-triples within the bound, its rows past the live ones unread and unwritten; and
+finite, and a plan of one or two rows on the column tile in every format and in fused
+triples within the bound, the rows past its own unread and unwritten; and
 `gguf-moe`: the float projections on both float tiles and the MoE layer on every GGUF
 plan, the staged 8- and 32-row tiles, in every format as each routed and shared expert tensor,
 against fp64, bitwise against the full grids and two gate/up passes, and with the experts in

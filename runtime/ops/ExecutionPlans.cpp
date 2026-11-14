@@ -28,22 +28,24 @@ void include(Workspace &bound, const Workspace &required,
 ExecutionPlans::ExecutionPlans(const DeviceCapabilities &device, Int8Activations int8Activations)
     : linear_(device, int8Activations), draftLinear_(device, Int8Activations::Off) {}
 
-// A chunk's rows pick its projections' tile, and a staged tile's height names
-// its kernels (gguf_decode_<format>_m<rows>_*), so each height a chunk takes
-// is a class, and the prefill tile one more. Every other kernel a chunk's
-// rows pick today changes once along them (selectFloatTile, selectMoe, the
-// staged norm, the hyper-connection norm's quarters, and the Neural Engine
-// split, which takes no class's first chunk: AneFfn::kMinimumRows), so a
-// chunk of one row and one of the most take both sides. A class no warmup ran
-// created its kernels while its request waited: 19 s for the 27B's cold
-// 17-row chunk on a 16-core Apple9 plan.
+// A chunk's rows pick its projections' tile, and a tile's height names its
+// kernels (gguf_decode_<format>_m<rows>_*, the register tile's _l<tiles>), so
+// each tile and height a chunk takes is a class, and the prefill tile one
+// more. Every other kernel a chunk's rows pick today changes once along them
+// (selectFloatTile, selectMoe, the staged norm, the hyper-connection norm's
+// quarters, and the Neural Engine split, which takes no class's first chunk:
+// AneFfn::kMinimumRows), so a chunk of one row and one of the most take both
+// sides. A class no warmup ran created its kernels while its request waited:
+// 19 s for the 27B's cold 17-row chunk on a 16-core Apple9 plan.
 std::vector<uint32_t> ExecutionPlans::prefillRowClasses() const {
   std::vector<uint32_t> first;
   std::pair<LinearTile, uint32_t> last{};
   for (uint32_t rows = 1; rows <= SPLASH_PREFILL_TOKEN_BUDGET; ++rows) {
-    const LinearPlan plan = linear_.plan({{GGUF_TILE_COLUMNS, GGUF_TILE_COLUMNS}, rows, LinearPhase::Prefill});
+    const LinearPlan plan = linear_.plan({{GGUF_TILE_COLUMNS, GGUF_TILE_COLUMNS}, rows});
     const LinearTile tile = plan.configuration().tile;
-    const std::pair key{tile, tile == LinearTile::GgufStaged ? plan.storageRows() : 0};
+    // Only the staged and register tiles' kernels are named by their height.
+    const bool named = tile == LinearTile::GgufStaged || tile == LinearTile::GgufRegister;
+    const std::pair key{tile, named ? plan.storageRows() : 0};
     if (first.empty() || key != last) first.push_back(rows);
     last = key;
   }
@@ -118,9 +120,8 @@ MoeWorkspace ExecutionPlans::moeDecodeWorkspacePerLane(MoeShape shape, uint32_t 
 
 uint64_t ExecutionPlans::gateUpWorkspace(ProjectionShape shape) const {
   uint64_t bound = 0;
-  for (uint32_t lanes = 1; lanes <= kMaximumLanes; ++lanes) {
-    const LinearWorkload workload{{shape.outputSize, shape.inputSize}, lanes * kDecodeRows,
-                                  LinearPhase::Decode, LinearEpilogue::GateUp};
+  for (uint32_t rows = 1; rows <= kMaximumDecodeTileRows; ++rows) {
+    const LinearWorkload workload{{shape.outputSize, shape.inputSize}, rows, LinearEpilogue::GateUp};
     bound = std::max(bound, linear_.plan(workload).gateScratchBytes());
   }
   return bound;

@@ -247,7 +247,7 @@ void projections(Golden &golden, const std::string &name, const ExecutionPlans &
       const Projection gate = projection(c, set, 1);
       for (uint32_t lanes = 1; lanes <= SPLASH_MAXIMUM_BATCH_WIDTH; ++lanes)
         for (const auto epilogue : {LinearEpilogue::None, LinearEpilogue::Residual, LinearEpilogue::GateUp}) {
-          const LinearWorkload w{{c.n, c.k}, lanes * SPLASH_TARGET_VERIFY_ROWS, LinearPhase::Decode, epilogue};
+          const LinearWorkload w{{c.n, c.k}, lanes * SPLASH_TARGET_VERIFY_ROWS, epilogue};
           decode.add(set.name + " lanes " + std::to_string(lanes) + " e" + std::to_string(unsigned(epilogue)) +
                      ": " + attempt([&] {
                        return describe(linear.plan(w, *p, epilogue == LinearEpilogue::GateUp ? &gate : nullptr));
@@ -255,7 +255,7 @@ void projections(Golden &golden, const std::string &name, const ExecutionPlans &
         }
       for (const uint32_t rows : kPrefillRows)
         for (const auto epilogue : {LinearEpilogue::None, LinearEpilogue::Residual, LinearEpilogue::UpWithGate}) {
-          const LinearWorkload w{{c.n, c.k}, rows, LinearPhase::Prefill, epilogue};
+          const LinearWorkload w{{c.n, c.k}, rows, epilogue};
           prefill.add(set.name + " rows " + std::to_string(rows) + " e" + std::to_string(unsigned(epilogue)) +
                       ": " + attempt([&] { return describe(linear.plan(w, *p)); }));
         }
@@ -265,7 +265,7 @@ void projections(Golden &golden, const std::string &name, const ExecutionPlans &
         Group &int8 = golden.group(name, "projection-decode-int8", c.name);
         for (uint32_t lanes = 1; lanes <= SPLASH_MAXIMUM_BATCH_WIDTH; ++lanes)
           for (const auto epilogue : {LinearEpilogue::None, LinearEpilogue::Residual, LinearEpilogue::GateUp}) {
-            const LinearWorkload w{{c.n, c.k}, lanes * SPLASH_TARGET_VERIFY_ROWS, LinearPhase::Decode, epilogue};
+            const LinearWorkload w{{c.n, c.k}, lanes * SPLASH_TARGET_VERIFY_ROWS, epilogue};
             const bool pair = epilogue == LinearEpilogue::GateUp;
             const std::array<const Projection *, 2> units{&*p, pair ? &gate : nullptr};
             const std::array<UnitFormats, 2> tensors{int8Formats(std::span(&units[0], 1)),
@@ -287,10 +287,10 @@ void projections(Golden &golden, const std::string &name, const ExecutionPlans &
         std::string line = set.name + (rotated ? " rotated" : "") + ":";
         for (uint32_t lanes = 1; lanes <= SPLASH_MAXIMUM_BATCH_WIDTH; ++lanes)
           line += " storage " + attempt([&] {
-            return std::to_string(linear.decodeStorageRows(lanes * SPLASH_TARGET_VERIFY_ROWS, shape));
+            return std::to_string(linear.storageRows(lanes * SPLASH_TARGET_VERIFY_ROWS, shape));
           });
-        line += " decode " + attempt([&] { return describe(linear.decodeScratchSize(shape)); });
-        line += " prefill " + attempt([&] { return describe(linear.prefillScratchSize(shape)); });
+        line += " decode " + attempt([&] { return describe(linear.scratchSize(shape, kMaximumDecodeTileRows)); });
+        line += " prefill " + attempt([&] { return describe(linear.scratchSize(shape, SPLASH_PREFILL_TOKEN_BUDGET)); });
         line += " gate-up " + attempt([&] { return std::to_string(plans.gateUpWorkspace(shape)); });
         shapes.add(line);
       }
@@ -302,13 +302,13 @@ void projections(Golden &golden, const std::string &name, const ExecutionPlans &
         matrix.add("lanes " + std::to_string(lanes) + " e" + std::to_string(unsigned(epilogue)) + ": " +
                    attempt([&] {
                      return describe(linear.plan(
-                         {{c.n, c.k}, lanes * SPLASH_TARGET_VERIFY_ROWS, LinearPhase::Decode, epilogue}));
+                         {{c.n, c.k}, lanes * SPLASH_TARGET_VERIFY_ROWS, epilogue}));
                    }));
     for (const uint32_t rows : kPrefillRows)
       for (const auto epilogue : {LinearEpilogue::None, LinearEpilogue::Residual, LinearEpilogue::UpWithGate})
         matrix.add("rows " + std::to_string(rows) + " e" + std::to_string(unsigned(epilogue)) + ": " +
                    attempt([&] {
-                     return describe(linear.plan({{c.n, c.k}, rows, LinearPhase::Prefill, epilogue}));
+                     return describe(linear.plan({{c.n, c.k}, rows, epilogue}));
                    }));
   }
 }
@@ -579,7 +579,7 @@ Int8Paths int8ActivationsOff(const std::string &name, const ExecutionPlans &on, 
       const std::string label = c.name + " " + set.name;
       for (uint32_t lanes = 1; lanes <= SPLASH_MAXIMUM_BATCH_WIDTH; ++lanes)
         for (const auto epilogue : {LinearEpilogue::None, LinearEpilogue::Residual, LinearEpilogue::GateUp}) {
-          const LinearWorkload w{{c.n, c.k}, lanes * SPLASH_TARGET_VERIFY_ROWS, LinearPhase::Decode, epilogue};
+          const LinearWorkload w{{c.n, c.k}, lanes * SPLASH_TARGET_VERIFY_ROWS, epilogue};
           const Projection *g = epilogue == LinearEpilogue::GateUp ? &gate : nullptr;
           compare(configuration([&] { return on.linear().plan(w, *p, g); }),
                   configuration([&] { return off.linear().plan(w, *p, g); }), label + " decode");
@@ -601,14 +601,19 @@ Int8Paths int8ActivationsOff(const std::string &name, const ExecutionPlans &on, 
         }
       for (const uint32_t rows : kPrefillRows)
         for (const auto epilogue : {LinearEpilogue::None, LinearEpilogue::Residual, LinearEpilogue::UpWithGate}) {
-          const LinearWorkload w{{c.n, c.k}, rows, LinearPhase::Prefill, epilogue};
+          const LinearWorkload w{{c.n, c.k}, rows, epilogue};
           compare(configuration([&] { return on.linear().plan(w, *p); }),
                   configuration([&] { return off.linear().plan(w, *p); }), label + " prefill");
         }
-      const std::string bound = attempt([&] { return describe(off.linear().prefillScratchSize(p->shape())); });
+      // The bound holds the decode tiles' tables of its plans of up to 32
+      // rows either way, and the int8 codes and scales with them on.
+      const std::string bound =
+          attempt([&] { return describe(off.linear().scratchSize(p->shape(), SPLASH_PREFILL_TOKEN_BUDGET)); });
       expect(bound == attempt([&] {
-               LinearScratchSize bf16Bound = on.linear().prefillScratchSize(p->shape());
-               bf16Bound.input = bf16Bound.sums = 0;
+               LinearScratchSize bf16Bound = on.linear().scratchSize(p->shape(), SPLASH_PREFILL_TOKEN_BUDGET);
+               const LinearScratchSize tables = on.linear().scratchSize(p->shape(), kMaximumDecodeTileRows);
+               bf16Bound.input = tables.input;
+               bf16Bound.sums = tables.sums;
                return describe(bf16Bound);
              }),
              label + "'s prefill bound " + bound + " is not its bound with them on less the int8 codes and scales");
@@ -682,7 +687,7 @@ std::optional<std::pair<uint32_t, uint32_t>> unwarmed(std::span<const uint32_t> 
 // request waits: 19 s for the 27B's cold 17-row chunk on a 16-core Apple9
 // plan. So every plan a chunk of 1 to 2048 rows selects is a warmup chunk's:
 // its projections' tile and staged height, whole and of its one read row
-// (Linear::prefillPlan), with the Neural Engine split from any of its least
+// (Linear::plan), with the Neural Engine split from any of its least
 // rows or without it; its float tiles; its MoE blocks' expert and router
 // tiles; and after each of kAttentionHistories, its attention's kernels. Adds each
 // that is not to `misses`. It checks one matrix shape and the columns of
@@ -722,8 +727,8 @@ void warmupCovers(const std::string &name, const ExecutionPlans &plans, std::vec
     for (const auto epilogue : {LinearEpilogue::None, LinearEpilogue::Residual, LinearEpilogue::UpWithGate}) {
       std::vector<uint32_t> whole(SPLASH_PREFILL_TOKEN_BUDGET + 1), read(SPLASH_PREFILL_TOKEN_BUDGET + 1);
       for (uint32_t rows = 1; rows <= SPLASH_PREFILL_TOKEN_BUDGET; ++rows) {
-        whole[rows] = tile(linear.prefillPlan(*p, rows, epilogue));
-        read[rows] = tile(linear.prefillPlan(*p, 1, epilogue, rows));
+        whole[rows] = tile(linear.plan(*p, rows, epilogue));
+        read[rows] = tile(linear.plan(*p, 1, epilogue, nullptr, rows));
       }
       const std::string what = "projection " + set.name + " e" + std::to_string(unsigned(epilogue));
       check(what, noHistory, [&](uint32_t rows, uint32_t) { return whole[rows]; });

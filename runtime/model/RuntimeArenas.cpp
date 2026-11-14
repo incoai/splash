@@ -114,16 +114,17 @@ prefillTensorBytes(const RuntimeGeometry &geometry,
       bytesFor<uint16_t>(uint64_t{geometry.target.attentionKvHeads} *
                          kRaggedAttentionRows *
                          geometry.target.attentionHeadDimension));
-  // The split partials and counters, the rotated rows and the int8 tile's
-  // codes and scales of the largest prefill plan: the target's, and the
-  // draft's context projections' on the draft's plans.
+  // The split partials and counters, the rotated rows, the register tile's
+  // tables of the plans of up to 32 rows and the int8 tile's codes and scales
+  // of a full chunk: the target's, and the draft's context projections' on
+  // the draft's plans.
   ops::LinearScratchSize linear;
   for (const auto &projection : geometry.target.prefillProjections)
-    linear.include(operators.linear().prefillScratchSize(projection));
+    linear.include(operators.linear().scratchSize(projection, kPrefillRows));
   const auto &draft = geometry.draft;
   for (const ops::ProjectionShape projection :
        {ops::ProjectionShape{draft.hiddenSize, draft.targetHiddenSize()}, {draft.contextKvSize(), draft.hiddenSize}})
-    linear.include(operators.draftLinear().prefillScratchSize(projection));
+    linear.include(operators.draftLinear().scratchSize(projection, kPrefillRows));
   put(PrefillTensor::LinearPartials, linear.partials);
   put(PrefillTensor::LinearCounters, linear.counters);
   put(PrefillTensor::LinearTable, linear.input);
@@ -339,13 +340,14 @@ ops::LinearScratchSize DecodeArena::linearScratchSize(
   const auto &d = geometry.draft;
   ops::LinearScratchSize result;
   // Includes the vocabulary head shared with the draft.
-  for (const auto &p : geometry.target.decodeProjections) result.include(operators.linear().decodeScratchSize(p));
+  for (const auto &p : geometry.target.decodeProjections)
+    result.include(operators.linear().scratchSize(p, kLaneCount * kDecodeRows));
   for (const ops::ProjectionShape shape : {ops::ProjectionShape{d.dynamicSize, d.hiddenSize},
        {d.qkvSize, d.hiddenSize}, {d.contextKvSize(), d.hiddenSize},
        {d.hiddenSize, d.attentionSize},
        {d.intermediateSize, d.hiddenSize}, {d.hiddenSize, d.intermediateSize},
        {d.selectorRank, d.hiddenSize}, {d.hiddenSize, d.targetHiddenSize()}})
-    result.include(operators.draftLinear().decodeScratchSize(shape));
+    result.include(operators.draftLinear().scratchSize(shape, kLaneCount * kDecodeRows));
   return result;
 }
 

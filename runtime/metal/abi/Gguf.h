@@ -59,6 +59,9 @@ static_assert(sizeof(GgufColumnParams) == 20, "GGUF column parameters are 20 byt
 // per eight-row tile of `width` inputs, the X^T table of width * 8 bfloat,
 // then the fp32 chain seeds [width / 16][8 rows] and sums [width / 32][8
 // rows]. Each 64-input span holds these values, seeds and sums per tile.
+// A table tile holds GGUF_TABLE16_ROWS rows, the rows the register tile
+// computes together; a plan's rows fill whole tiles, the last padded.
+#define GGUF_TABLE16_ROWS 8u
 #define GGUF_TABLE16_SPAN_INPUTS 64u
 #define GGUF_TABLE16_SPAN_VALUES 512u
 #define GGUF_TABLE16_SPAN_SEEDS 32u

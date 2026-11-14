@@ -68,7 +68,7 @@ void baselinePlans() {
       for (uint32_t lanes = 1; lanes <= 4; ++lanes) {
         for (auto epilogue : {LinearEpilogue::None, LinearEpilogue::Residual,
                               LinearEpilogue::GateUp}) {
-          const LinearWorkload w{matrix, lanes * 8, LinearPhase::Decode, epilogue};
+          const LinearWorkload w{matrix, lanes * 8, epilogue};
           require(plans.linear().plan(w).configuration() ==
                       baseline.plan(w).configuration(),
                   "the plans' decode Linear departed from the device policy");
@@ -82,7 +82,7 @@ void baselinePlans() {
       for (uint32_t rows : {1U, 17U, 2048U})
         for (auto epilogue : {LinearEpilogue::None, LinearEpilogue::Residual,
                               LinearEpilogue::UpWithGate}) {
-          const LinearWorkload w{matrix, rows, LinearPhase::Prefill, epilogue};
+          const LinearWorkload w{matrix, rows, epilogue};
           require(plans.linear().plan(w).configuration() ==
                       baseline.plan(w).configuration(),
                   "the plans' prefill Linear departed from the device policy");
@@ -152,7 +152,7 @@ void int8ActivationsSetting() {
             "the int8-activation setting did not reach the plans' Linear, or moved the device's row");
     const bool int8 = family >= 10;
     const auto tile = [&](const ExecutionPlans &plans) {
-      return plans.linear().prefillPlan(af4, 2048, LinearEpilogue::Residual).configuration().tile;
+      return plans.linear().plan(af4, 2048, LinearEpilogue::Residual).configuration().tile;
     };
     require(tile(on) == (int8 ? LinearTile::GgufPrefillInt8 : LinearTile::GgufPrefill) &&
                 tile(off) == LinearTile::GgufPrefill,
@@ -179,15 +179,15 @@ void draftPlans() {
       const Linear &draft = plans.draftLinear(), &target = plans.linear();
       require(draft.int8Activations() == Int8Activations::Off, "a draft's plans took int8 activations");
       for (uint32_t rows : {1U, 64U, 2048U}) {
-        const LinearConfig own = draft.prefillPlan(context, rows, LinearEpilogue::None).configuration(),
-                           targets = target.prefillPlan(context, rows, LinearEpilogue::None).configuration();
+        const LinearConfig own = draft.plan(context, rows, LinearEpilogue::None).configuration(),
+                           targets = target.plan(context, rows, LinearEpilogue::None).configuration();
         const bool int8 = family >= 10 && setting == Int8Activations::On && rows == 2048;
         require((targets.tile == LinearTile::GgufPrefillInt8) == int8 &&
                     own == (int8 ? LinearConfig{.tile = LinearTile::GgufPrefill} : targets),
                 "a draft's prefill chunk took the int8 prefill tile or left the target's bf16 plan");
       }
       for (uint32_t lanes = 1; lanes <= 4; ++lanes)
-        require(draft.decodePlan(context, lanes).configuration() == target.decodePlan(context, lanes).configuration(),
+        require(draft.plan(context, lanes * SPLASH_TARGET_VERIFY_ROWS).configuration() == target.plan(context, lanes * SPLASH_TARGET_VERIFY_ROWS).configuration(),
                 "a draft's decode plan departed from the target's");
     }
 }
@@ -271,7 +271,7 @@ void unknownCoreCount() {
     for (auto matrix : matrices)
       for (uint32_t lanes = 1; lanes <= 4; ++lanes)
         for (auto epilogue : {LinearEpilogue::None, LinearEpilogue::Residual, LinearEpilogue::GateUp}) {
-          const LinearWorkload w{matrix, lanes * 8, LinearPhase::Decode, epilogue};
+          const LinearWorkload w{matrix, lanes * 8, epilogue};
           require(unknown.linear().plan(w).configuration() == planned.linear().plan(w).configuration(),
                   "an unknown core count planned a decode projection for other than the assumed cores");
         }

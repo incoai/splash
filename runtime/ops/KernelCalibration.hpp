@@ -64,10 +64,11 @@ struct WaveLaw final {
 };
 using SplitLaw = std::variant<TierLaw, WaveLaw>;
 
-// Register tile against the staged tile for a decode step of `lanes` lanes,
-// by the unit's FormatClass: register where 4 * columnTiles * lanes <
-// belowQuarters * cores (in quarter threadgroups per core); kAlways where it
-// takes the formats whatever the grid, 0 never.
+// Register tile against the staged tile for a plan of `tiles` table tiles
+// (8 rows each, a decode lane's verify rows where it was measured), by the
+// unit's FormatClass: register where 4 * columnTiles * tiles < belowQuarters *
+// cores (in quarter threadgroups per core); kAlways where it takes the
+// formats whatever the grid, 0 never.
 struct RegisterBoundary final {
   std::array<std::array<uint32_t, SPLASH_MAXIMUM_BATCH_WIDTH>, kFormatClasses> belowQuarters;
 };
@@ -80,18 +81,18 @@ struct ProjectionCalibration final {
   uint32_t spreadFromCores;
   // From this many cores a gate/up pair of one format may run in one pass.
   uint32_t onePassFromCores;
-  // One unsplit decode lane of fewer bits per weight than this, in
-  // sixteenths, runs the staged 16-row tile; 0 never.
+  // One unsplit table tile of rows (at most 8) of fewer bits per weight than
+  // this, in sixteenths, runs the staged 16-row tile; 0 never.
   uint32_t sixteenRowBelowBits16;
-  // The most waves of the 16-row tile one such lane runs in from there, under
+  // The most waves of the 16-row tile one such plan runs in from there, under
   // a wave law (sixteenRowLane); 0 never.
   uint32_t sixteenRowWaves;
-  // Prefill chunks of up to this many rows run the staged tile
+  // Plans past the decode tiles of up to this many rows run the staged tile
   // (<= kMaximumStagedPrefillRows); longer ones the prefill tile.
   uint32_t stagedPrefillRows;
-  // The staged decode of a unit the int8 decode tiles take
-  // (UnitFormats::decodeInt8Takes) runs them on plans of at least this many
-  // rows (one lane's 16-row plan counts 16).
+  // A staged plan on the decode tiles of a unit the int8 decode tiles take
+  // (UnitFormats::decodeInt8Takes) runs them where it stores at least this
+  // many rows (a 16-row plan counts 16).
   uint32_t decodeInt8FromRows;
   // Longer prefill chunks of a unit the int8 prefill tile takes
   // (UnitFormats::prefillInt8Takes) run that tile, where the family's int8
@@ -216,13 +217,14 @@ inline constexpr uint32_t kApple10SixteenRowBelowBits16 = 72;
 // most waves measured end to end (the 27B's gate/up passes, 17 per core).
 inline constexpr uint32_t kApple10SixteenRowWaves = 2;
 
-// Prefill: 128-row tiles. A chunk of up to 32 rows runs the staged tile of its
-// rows with the decode split law (the prefill tile's outputs up to fp32
-// reassociation, gguf-projection checks it): 1.8-2.9x faster on a 17408 x
-// 5120 Q4_K (16-core M5 Pro). The prefill tile takes as long for 33 rows as
-// for 64, so up to 64 rows run the staged 64-row tile: 6-43% less time on
-// Apple10, 12-22% on a 10-core M4.
-// Larger Apple9 GPUs, unmeasured, keep the prefill tile past 32 rows.
+// Prefill: 128-row tiles. A plan of up to 32 rows runs the decode tiles
+// (KernelSelection.cpp; the staged tile of its rows with the decode split law
+// ran a 17408 x 5120 Q4_K chunk 1.8-2.9x faster than the prefill tile on a
+// 16-core M5 Pro, within fp32 reassociation of its outputs, gguf-projection
+// checks it). The prefill tile takes as long for 33 rows as for 64, so up to
+// 64 rows run the staged 64-row tile: 6-43% less time on Apple10, 12-22% on a
+// 10-core M4. Larger Apple9 GPUs, unmeasured, keep the prefill tile past the
+// decode tiles' 32 rows.
 inline constexpr uint32_t kApple9StagedPrefillRows = SPLASH_MAXIMUM_BATCH_WIDTH * SPLASH_TARGET_VERIFY_ROWS;
 inline constexpr uint32_t kApple9SmallStagedPrefillRows = 64;
 inline constexpr uint32_t kApple10StagedPrefillRows = 64;

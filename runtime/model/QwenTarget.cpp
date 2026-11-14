@@ -82,7 +82,7 @@ uint32_t QwenTarget::decodeStorageLanes(uint32_t lanes) const {
   const uint32_t rows = lanes * kVerifyRows;
   uint32_t storageRows = rows;
   for (const auto &shape : geometry_.decodeProjections)
-    storageRows = std::max(storageRows, operators_.linear().decodeStorageRows(rows, shape));
+    storageRows = std::max(storageRows, operators_.linear().storageRows(rows, shape));
   return storageRows / kVerifyRows;
 }
 
@@ -229,10 +229,10 @@ void addPrefillOutput(const ops::Linear &linear, metal::CommandGraph &graph, met
                       const ops::Projection &projection, uint32_t rows, uint32_t chunkRows,
                       ops::LinearScratch scratch, metal::MetalBuffer output, metal::MetalBuffer residual) {
   if (residual)
-    linear.addPrefillResidual(graph, std::move(hidden), projection, std::move(residual), std::move(output), rows,
-                              scratch, chunkRows);
+    linear.addResidualProjection(graph, std::move(hidden), projection, std::move(residual), std::move(output), rows,
+                                 scratch, chunkRows);
   else
-    linear.addPrefill(graph, std::move(hidden), projection, std::move(output), rows, scratch, chunkRows);
+    linear.addProjection(graph, std::move(hidden), projection, std::move(output), rows, scratch, chunkRows);
 }
 
 } // namespace
@@ -240,8 +240,8 @@ void addPrefillOutput(const ops::Linear &linear, metal::CommandGraph &graph, met
 void QwenTarget::addPrefillMixer(PrefillStep &step, const QwenGdnWeights &mixer, BlockOutput output) const {
   const QwenTargetPrefillBuffers &b = step.buffers;
   const uint32_t layer = step.gdnLayer++;
-  operators_.linear().addPrefill(step.graph, b.normalized, mixer.inputProjection, b.gdnPacked, step.rows,
-                                 b.linearScratch);
+  operators_.linear().addProjection(step.graph, b.normalized, mixer.inputProjection, b.gdnPacked, step.rows,
+                                    b.linearScratch);
   for (const QwenTargetPrefillSequence &sequence : step.sequences) {
     const auto u16 = [&](const metal::MetalBuffer &buffer, uint32_t width) {
       return rowsOf<uint16_t>(buffer, sequence.rowBegin, sequence.rows, width);
@@ -292,8 +292,8 @@ void QwenTarget::addPrefillMixer(PrefillStep &step, const QwenAttentionWeights &
                            uint32_t width) {
     return rowsOf<float>(buffer, sequence.rowBegin, sequence.rows, width);
   };
-  operators_.linear().addPrefill(step.graph, b.normalized, mixer.inputProjection, b.fullPacked, step.rows,
-                                 b.linearScratch);
+  operators_.linear().addProjection(step.graph, b.normalized, mixer.inputProjection, b.fullPacked, step.rows,
+                                    b.linearScratch);
   for (size_t index = 0; index < step.sequences.size(); ++index) {
     const QwenTargetPrefillSequence &sequence = step.sequences[index];
     const uint64_t headBytes = uint64_t{sequence.attentionStride} * geometry_.attentionHeadDimension * sizeof(uint16_t);
@@ -358,7 +358,7 @@ void QwenTarget::addPrefillMixer(PrefillStep &step, const QwenAttentionWeights &
 }
 
 ops::LinearInput QwenTarget::decodeInput(const ops::Projection &projection, uint32_t lanes) const {
-  return operators_.linear().decodePlan(projection, lanes).input();
+  return operators_.linear().plan(projection, lanes * kVerifyRows).input();
 }
 
 void QwenTarget::addDecodeProjection(metal::CommandGraph &graph, metal::MetalBuffer input,
@@ -368,7 +368,7 @@ void QwenTarget::addDecodeProjection(metal::CommandGraph &graph, metal::MetalBuf
   linear.add(graph,
              {.input = std::move(input), .output = std::move(output), .scratch = scratch,
               .prepared = std::move(prepared)},
-             projection, linear.decodePlan(projection, lanes));
+             projection, linear.plan(projection, lanes * kVerifyRows));
 }
 
 // Each producer emits the table (if any) its consumer's plan reads.
@@ -379,8 +379,8 @@ void QwenTarget::addVerifyMixer(VerifyStep &step, const QwenGdnWeights &mixer, o
   const uint32_t layer = step.gdnLayer++;
   addDecodeProjection(step.graph, b.normalized, mixer.inputProjection, b.gdnPacked, step.lanes, b.linearScratch,
                       std::move(normalized));
-  const ops::LinearPlan outputPlan = linear.decodePlan(
-      mixer.outputProjection, step.lanes, output.residual ? ops::LinearEpilogue::Residual : ops::LinearEpilogue::None);
+  const ops::LinearPlan outputPlan = linear.plan(
+      mixer.outputProjection, step.rows, output.residual ? ops::LinearEpilogue::Residual : ops::LinearEpilogue::None);
   const ops::PreparedInput hidden = ops::GDN::addDecode(
       step.graph,
       {b.gdnPacked, mixer.convolutionWeights, b.currentGdnStates, b.nextGdnStates, b.gdnTape,
@@ -419,8 +419,8 @@ void QwenTarget::addVerifyMixer(VerifyStep &step, const QwenAttentionWeights &mi
                                   b.attentionStatistics, b.fullAttention, b.pageTables, mixer.sinks},
                                  step.chunks, variant.windowTokens ? *step.windowedAttention : step.attention,
                                  attended);
-  const ops::LinearPlan outputPlan = linear.decodePlan(
-      mixer.outputProjection, step.lanes, output.residual ? ops::LinearEpilogue::Residual : ops::LinearEpilogue::None);
+  const ops::LinearPlan outputPlan = linear.plan(
+      mixer.outputProjection, step.rows, output.residual ? ops::LinearEpilogue::Residual : ops::LinearEpilogue::None);
   const ops::PreparedInput hidden = ops::PagedAttention::addVerifyGate(
       step.graph, b.fullPacked, b.fullAttention, b.attentionHidden, geometry_.attentionQueryHeads,
       geometry_.kvLayout, step.lanes, b.linearScratch, outputPlan.input());
@@ -440,8 +440,8 @@ void QwenTarget::addPrefillDenseFfn(PrefillStep &step, uint32_t index, const ops
   if (step.aneFfn && step.readRows.empty())
     step.aneFfn->add(step.graph, index, buffers, std::move(residual), std::move(output), rows);
   else
-    operators_.linear().addPrefillSwiGlu(step.graph, ffn, buffers, std::move(residual), std::move(output), rows,
-                                         step.rows);
+    operators_.linear().addSwiGlu(step.graph, ffn, buffers, std::move(residual), std::move(output), rows,
+                                  step.rows);
 }
 
 void QwenTarget::addPrefillMoeRouting(PrefillStep &step, const ops::NormWeights &norm,
@@ -457,8 +457,7 @@ void QwenTarget::addVerifyDenseFfn(VerifyStep &step, const ops::NormWeights &nor
                                    metal::MetalBuffer residual, metal::MetalBuffer output) const {
   const QwenTargetVerifyBuffers &b = step.buffers;
   const ops::Linear &linear = operators_.linear();
-  const ops::LinearPlan gateUpPlan =
-      linear.decodePlan(*ffn.up, step.lanes, ops::LinearEpilogue::GateUp, ffn.gate);
+  const ops::LinearPlan gateUpPlan = linear.plan(*ffn.up, step.rows, ops::LinearEpilogue::GateUp, ffn.gate);
   const ops::PreparedInput normalized =
       ops::Normalization::addRms(step.graph, residual, norm, b.normalized, geometry_.hiddenSize, step.rows,
                                  b.linearScratch, gateUpPlan.input());
@@ -469,7 +468,7 @@ void QwenTarget::addVerifyDenseFfn(VerifyStep &step, const ops::NormWeights &nor
   linear.add(step.graph,
              {.input = b.denseIntermediate, .output = std::move(output), .residual = std::move(residual),
               .scratch = b.linearScratch},
-             *ffn.down, linear.decodePlan(*ffn.down, step.lanes, ops::LinearEpilogue::Residual));
+             *ffn.down, linear.plan(*ffn.down, step.rows, ops::LinearEpilogue::Residual));
 }
 
 void QwenTarget::addVerifyMoe(VerifyStep &step, const ops::NormWeights &norm, const ops::BlockMoeWeights &ffn,
