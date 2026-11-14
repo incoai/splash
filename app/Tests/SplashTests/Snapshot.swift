@@ -59,21 +59,26 @@ enum Snapshot {
               let bitmap = frame.bitmapImageRepForCachingDisplay(in: frame.bounds)
         else { return nil }
         // Each web view's own picture, laid over the window drawn without them, which some
-        // systems draw into it and some don't.
-        var pictures: [(NSImage, NSRect)] = []
+        // systems draw into it and some don't, as faint as the window shows it once pictured: a
+        // transcript going, gone from the window at once, faded in under the composer moving
+        // away, or left the window as its picture was taken, was laid over it whole, the last
+        // where it no longer was.
+        var pictures: [(NSImage, NSRect, CGFloat)] = []
         let webViews = webViews(in: frame)
         for webView in webViews {
             guard let picture = try? await webView.takeSnapshot(configuration: nil) else { continue }
+            let shown = shown(webView, in: frame)
+            guard shown > 0 else { continue }
             var rect = webView.convert(webView.bounds, to: frame)
             if frame.isFlipped { rect.origin.y = frame.bounds.height - rect.maxY }
-            pictures.append((picture, rect))
+            pictures.append((picture, rect, shown))
         }
         for webView in webViews { webView.isHidden = true }
         frame.cacheDisplay(in: frame.bounds, to: bitmap)
         for webView in webViews { webView.isHidden = false }
         NSGraphicsContext.saveGraphicsState()
         NSGraphicsContext.current = NSGraphicsContext(bitmapImageRep: bitmap)
-        for (picture, rect) in pictures { picture.draw(in: rect) }
+        for (picture, rect, shown) in pictures { picture.draw(in: rect, from: .zero, operation: .sourceOver, fraction: shown) }
         NSGraphicsContext.restoreGraphicsState()
         return bitmap
     }
@@ -86,6 +91,19 @@ enum Snapshot {
         guard webView.responds(to: selector) else { return }
         typealias Setter = @convention(c) (WKWebView, Selector, Bool) -> Void
         unsafeBitCast(webView.method(for: selector), to: Setter.self)(webView, selector, false)
+    }
+
+    /// How much of `view` shows in `frame`, as drawn now: its opacity and that of what holds it, 0
+    /// where any of them is hidden or it is out of `frame`.
+    private static func shown(_ view: NSView, in frame: NSView) -> CGFloat {
+        var shown: CGFloat = 1, next: NSView? = view
+        while let view = next {
+            if view === frame { return shown }
+            if view.isHidden { return 0 }
+            shown *= view.alphaValue * CGFloat(view.layer?.presentation()?.opacity ?? view.layer?.opacity ?? 1)
+            next = view.superview
+        }
+        return 0
     }
 
     private static func webViews(in view: NSView) -> [WKWebView] {

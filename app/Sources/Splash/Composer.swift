@@ -196,8 +196,10 @@ struct Composer: View {
     var body: some View {
         let images = state.server.acceptsImages
         let held = state.chats.sendingFirstMessage
+        // The line that says why, in the chat it is about.
+        let notice = draft.notice.flatMap { $0.conversation == state.chats.selection ? $0 : nil }
         VStack(alignment: .leading, spacing: 10) {
-            if let notice = draft.notice, notice.conversation == state.chats.selection {
+            if let notice {
                 // As a reply says why it stopped short.
                 Label {
                     Text(notice.text).foregroundStyle(.secondary)
@@ -205,16 +207,15 @@ struct Composer: View {
                     Image(systemName: "exclamationmark.triangle.fill").symbolRenderingMode(.multicolor)
                 }
                 .font(.system(size: 12))
-                .transition(Motion.overText)
             }
             if !draft.attachments.isEmpty {
                 Attachments(draft: draft, held: held)
-                    .transition(Motion.overText)
             }
             ComposerField(text: $draft.text, focusRequests: draft.focusRequests,
                           yields: state.terminalShows, held: held,
                           placeholder: "Message Splash", submit: state.sendDraft, cancel: stop, acceptsImages: images && !held,
                           attach: { draft.attach($0, unreadable: $1) }, attachPDFs: { draft.attach(pdfs: $0) })
+                .alignmentGuide(.composerPlain) { $0[.top] - Self.inset }
             // As the server's stage changes them (`MainView`), a control that goes goes at once, and
             // one that comes fades in once those beside it have moved, as a row of a page does: as
             // a switch began, the model's words slid over Attach Images fading out.
@@ -254,11 +255,19 @@ struct Composer: View {
             .animation(Motion.settle, value: state.showsContext)
         }
         .padding(.horizontal, 16)
-        .padding(.vertical, 12)
+        .padding(.vertical, Self.inset)
         .background(colorScheme == .dark ? AnyShapeStyle(.fill.tertiary) : AnyShapeStyle(.background),
                     in: .rect(cornerRadius: 22))
         .overlay { RoundedRectangle(cornerRadius: 22).strokeBorder(.separator) }
         .shadow(color: .black.opacity(0.06), radius: 14, y: 4)
+        .alignmentGuide(.composerTop) { $0[.top] }
+        // What it holds comes and goes at once, and its height with it, whatever else moves: as it
+        // travels between a new chat and a conversation, it is as tall as what it holds then, and
+        // what it holds travels with it. Coming once it had moved, the line that says why left an
+        // empty row as the composer travelled to a new chat opened again, 25 points over its text.
+        .transaction(value: Contents(text: draft.text, attachments: draft.attachments.map(\.id), notice: notice)) {
+            $0.animation = nil
+        }
         .fileImporter(isPresented: $picking, allowedContentTypes: [.image, .pdf], allowsMultipleSelection: true) { result in
             let urls = (try? result.get()) ?? []
             let pdfs = urls.filter { UTType(filenameExtension: $0.pathExtension)?.conforms(to: .pdf) == true }
@@ -273,6 +282,17 @@ struct Composer: View {
         }
         // A file that can't be attached is told in the chat it was attached in.
         .onChange(of: state.chats.selection, initial: true) { _, open in draft.conversation = open }
+    }
+
+    /// The room the composer leaves over what it holds and under its controls: over its text
+    /// where nothing is over it (`VerticalAlignment.composerPlain`).
+    private static let inset: CGFloat = 12
+
+    /// What the composer holds, which it takes at once.
+    private struct Contents: Equatable {
+        let text: String
+        let attachments: [UUID]
+        let notice: Draft.Notice?
     }
 
     /// Whether the open chat's request is under way, which Stop stops.
