@@ -282,8 +282,9 @@ struct Composer: View {
     }
 
     /// The room the composer leaves over what it holds and under its controls: over its text
-    /// where nothing is over it (`VerticalAlignment.composerPlain`).
-    private static let inset: CGFloat = 12
+    /// where nothing is over it (`VerticalAlignment.composerPlain`). No actor's: the guide reads
+    /// it as SwiftUI computes it, which need not be on the main actor.
+    private nonisolated static let inset: CGFloat = 12
 
     /// What the composer holds, which it takes at once.
     private struct Contents: Equatable {
