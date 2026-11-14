@@ -151,6 +151,26 @@ The two model-free CPU checks also run through the existing `test-engine-cpu` CI
 gate. The GPU fixture remains an explicit development target; these local results
 do not claim that GitHub-hosted Metal validation has passed.
 
+## Hosted CI Metal bootstrap
+
+Hosted CI now runs `python3 dev/tools/ensure_metal_toolchain.py` before the native
+and Python compatibility gates. An unconditional component download previously
+failed fetching Apple's MetalToolchain catalog before any project compilation.
+The bootstrap first compiles BF16 Metal 4.0 source with the production deployment
+target and links a nonempty metallib. A usable installation needs no download.
+If the probe fails, it makes at most three timed component-install attempts,
+reprobes after each attempt (even when the installer exits with an error), and
+fails closed if compilation/linking remain unusable. It logs the selected Xcode
+and SDK without changing global Xcode selection or executing GPU work.
+
+Six model-free subprocess regression tests cover the existing-toolchain/catalog
+failure, installation, transient failure, installer-error-but-usable-tools,
+installer-success-without-tools, and broken/missing/empty compiler/linker outputs.
+Run them with `python3 -m unittest dev.tests.tools.test_metal_toolchain`.
+The real compile/link probe also passed on the isolated M5 development checkout
+using command-scoped Xcode 27.2.0, without a component download. These local
+checks do not replace successful hosted CI at the reviewed commit.
+
 ## Remaining gates
 
 The candidate is not integrated into `Qwen4ExpTarget`, even behind a runtime flag.
