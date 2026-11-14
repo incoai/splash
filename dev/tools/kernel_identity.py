@@ -8,13 +8,17 @@ a library as an LLVM module of its own, which holds no source path or build
 id. Two functions are identical when their modules' text is, but for the
 module's offset in its library, which the disassembly prints before it, and
 the names of the other symbols a module defines, its internal functions and
-their threadgroup and constant variables, and two kinds of names the C++
-frontend gives a module's types: the numbers of its lambdas' anonymous
-classes (%class.anon.N), and the mangled names of its classes in the
-type-based alias metadata (!"_ZTS..."). C++ names the symbols for their
+their threadgroup and constant variables, and the names a module's types are
+given: the numbers of its lambdas' anonymous classes (%class.anon.N), the
+mangled names of its classes in the type-based alias metadata (!"_ZTS..."),
+and the names of its structs (%struct.X). C++ names the symbols for their
 signatures and numbers the lambdas across the source file, so a template
-value added with its old value renames all three without changing any code;
-each is compared in the order it first appears.
+value added with its old value renames the symbols, the lambdas and the alias
+names without changing any code; and the library's linker gives each struct
+layout the name of the first module's struct of that layout, so a struct of
+an existing layout added anywhere in the library renames it in every kernel
+(GgufColumnParams renamed GgufDecodeParams, five uint32s, in 1,502 kernels).
+Each is compared in the order it first appears.
 
 By default it compares the kernels the decode path may run: every function
 but those named for prefill (prefill_*, gguf_prefill_*), the vision encoder
@@ -45,12 +49,14 @@ DEFINITION = re.compile(
     re.MULTILINE,
 )
 SYMBOL = re.compile(r"@([-\w$.]+)")
-# The names the frontend gives a module's types, which the module's own
-# definitions and metadata spell out: a lambda's anonymous class, and a
-# class's mangled name in the type-based alias metadata.
+# The names a module's types are given, which the module's own definitions and
+# metadata spell out: a lambda's anonymous class, a class's mangled name in the
+# type-based alias metadata, and a struct's name, plain or quoted
+# (%"struct.FmtQ2K::Meta").
 TYPE_NAMES = (
     (re.compile(r"%class\.anon(?:\.\d+)*"), "%class.anon.defined.{}"),
     (re.compile(r'!"_ZTS[^"]*"'), '!"_ZTS.defined.{}"'),
+    (re.compile(r'%(?:struct\.[-\w$.]+|"struct\.[^"]*")'), "%struct.defined.{}"),
 )
 
 
@@ -67,8 +73,8 @@ def library(path: Path) -> Path:
 
 def normalized(name: str, module: str) -> str:
     """Function `name`'s module with every other symbol it defines, and the
-    names of its anonymous classes and of its classes' alias metadata
-    (TYPE_NAMES), renamed for the order in which each first appears."""
+    names of its anonymous classes, of its classes' alias metadata and of its
+    structs (TYPE_NAMES), renamed for the order in which each first appears."""
     defined = {
         function or variable for function, variable in DEFINITION.findall(module)
     } - {name}
