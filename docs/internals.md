@@ -1205,9 +1205,9 @@ against 0.6 and 1.1 ms), on an M6 the GPU's (1.9 against 1.2 ms), all with
 `--activations bf16`. It fits u at 0.4, then again at the units it chose,
 nearest T's least, from their split's full-chunk layer as the chunks' timings
 below take it; where that fit chooses other units, their split is prepared
-and timed in turn, and serves if it takes no chunk of the functions' rows more
-than 2% longer than the first, each split from its own least chunk, the first
-otherwise: the refit took Qwen3.8-27B UD-Q4_K_M from 9 of its 34 units to 10
+and timed in turn, and serves if it splits every chunk the first splits, none
+of them more than 2% longer, the first otherwise: the refit took Qwen3.8-27B
+UD-Q4_K_M from 9 of its 34 units to 10
 on an M5 Max, whose full chunk prefilled 1.5-2.0% faster but which split
 chunks from 780 rows against 575, so that chunks of 640 and 672 rows ran 12%
 slower, and 9 serve. Where the ANE's part takes the longer already
