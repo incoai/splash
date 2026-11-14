@@ -541,6 +541,10 @@ private struct ConversationView: View {
             .padding(.horizontal, 32)
             .padding(.bottom, 24)
             .fixedSize(horizontal: false, vertical: true)
+            // As wide as the column, the composer in its middle, so that its foot starts on a
+            // whole point: a column of an odd width put the foot half a point in, and Stop's glyph,
+            // placed from there, drew a pixel to the right of its place once it had travelled.
+            .frame(maxWidth: .infinity)
             .frame(height: 0, alignment: .bottom)
             // As it travels, its foot moves and it stands on it, as tall as what it holds then
             // (`Composer`), its controls where they were as what was over them goes. Its parts
