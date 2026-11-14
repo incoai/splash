@@ -1226,7 +1226,8 @@ against 0.6 and 1.1 ms), on an M6 the GPU's (1.9 against 1.2 ms), all with
 nearest T's least, from their split's full-chunk layer as the chunks' timings
 below take it; where that fit chooses other units, their split is prepared
 and timed in turn, and serves if it splits every chunk the first splits, none
-of them more than 2% longer, the first otherwise: the refit took Qwen3.8-27B
+of them more than 2% longer, the first otherwise, as where the other split
+cannot be prepared or timed: the refit took Qwen3.8-27B
 UD-Q4_K_M from 9 of its 34 units to 10
 on an M5 Max, whose full chunk prefilled 1.5-2.0% faster but which split
 chunks from 780 rows against 575, so that chunks of 640 and 672 rows ran 12%

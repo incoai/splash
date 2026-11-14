@@ -651,6 +651,61 @@ void testRefitMovesTheChoice() {
           "a choice its refitted model keeps was prepared again");
 }
 
+// A refitted split that cannot be prepared leaves the first, which was: the M5 Max's timings choose 6 units and then
+// 7 (testRefitMovesTheChoice), whose program the Neural Engine refuses, and the split of 6 serves, prepared again, and
+// is remembered, the log saying why. It ended the start with the GPU alone and nothing remembered, so that every
+// later start calibrated again. On a backend that stopped serving, or in a start that was cancelled, the failure
+// ends the start as any other does.
+void testARefittedSplitThatFailsKeepsTheFirst() {
+  const auto timings = [] { return Timings{{14.0 / 34, 9.9673, 23.929}, {27.0 / 34, 4.7526, 46.034}, 15.834}; };
+  Fake fake;
+  fake.time = timings;
+  fake.prepare = [](uint32_t aneUnits, bool timed) {
+    if (aneUnits == 7) throw std::runtime_error("the Neural Engine refused the program of 7 units");
+    AneFfnPrepared prepared;
+    if (timed) prepared.chunks = timedChunks(13.84);
+    prepared.error = 0.025;
+    return prepared;
+  };
+  const Started started = start(fake);
+  require(started.start.outcome.kind == Kind::Split && fake.preparedUnits == std::vector{6u, 7u, 6u} &&
+              fake.prepared == std::pair(6u, false) && fake.remembered && fake.remembered->aneUnits == 6 &&
+              fake.remembered->minimumRows == 553 && started.start.plan &&
+              started.start.plan->breakdown().aneFfnBytes == fake.bytes(6) &&
+              has(started.log, "refitted share was not prepared (the Neural Engine refused the program of 7 units); "
+                               "its first share serves") &&
+              has(started.log, "Neural Engine FFN split at share 0.18 for chunks of 553 rows or more: 13.8 ms per "
+                               "2048-row FFN layer against 20.0 on the GPU alone"),
+          "a refitted split that failed to prepare did not leave the first to serve: " + started.log);
+  fake = {};
+  fake.time = timings;
+  fake.prepare = [&](uint32_t aneUnits, bool timed) {
+    if (aneUnits == 7) {
+      fake.healthy = false;
+      throw std::runtime_error("the backend stopped serving");
+    }
+    AneFfnPrepared prepared;
+    if (timed) prepared.chunks = timedChunks(13.84);
+    return prepared;
+  };
+  rejects([&] { static_cast<void>(start(fake)); }, "stopped serving",
+          "a start went on past a refitted split's failure on a backend that stopped");
+  fake = {};
+  fake.time = timings;
+  bool cancelled = false;
+  fake.prepare = [&](uint32_t aneUnits, bool timed) {
+    if (aneUnits == 7) {
+      cancelled = true;
+      throw std::runtime_error("ANE program was not submitted");
+    }
+    AneFfnPrepared prepared;
+    if (timed) prepared.chunks = timedChunks(13.84);
+    return prepared;
+  };
+  rejects([&] { static_cast<void>(start(fake, {}, {}, [&] { return cancelled; })); }, "not submitted",
+          "a cancelled start went on past a refitted split's failure");
+}
+
 // A start takes this Mac's calibration once remembered: it neither times nor remembers, prepares the remembered units
 // untimed with the remembered least chunk, and says so; a remembered calibration of no split leaves the GPU alone at
 // once. One of more units than the plan holds, or of least rows no function holds, is calibrated again.
@@ -731,6 +786,7 @@ int main() {
     testACommandOutOfMemoryIsCommandMemory();
     testNoGain();
     testRefitMovesTheChoice();
+    testARefittedSplitThatFailsKeepsTheFirst();
     testRemembered();
     testGivenShare();
     std::cout << "ane ffn startup tests passed\n";
