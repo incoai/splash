@@ -214,8 +214,8 @@ extension ChatScreenTests {
         text.insertText(" And more.", replacementRange: NSRange(location: NSNotFound, length: 0))
         #expect(state.draft.text == FirstMessagePictures.draft + " And more." && state.draft.notice == nil)
         #expect(refused.allSatisfy { $0.list == 0 && $0.toolbar == 0 }, "the list and the toolbar through the refusal: \(refused)")
-        // The line that says why, over the text: a line of 12-point text and the 10 points under it.
-        #expect(refused.allSatisfy { abs($0.composer) <= 30 }, "the composer's text against where it was, per frame: \(refused.map(\.composer))")
+        // The line that says why comes over the text, which stays.
+        #expect(refused.allSatisfy { $0.composer == 0 }, "the composer's text against where it was, per frame: \(refused.map(\.composer))")
         // There from the first frame the refusal draws, whole: nothing moves that it would wait for.
         let marks = refused.compactMap(\.mark)
         #expect(marks.count == 8 && marks.allSatisfy { $0 > 20 && $0 == marks.last }, "its mark's pixels, per frame from the refusal: \(marks)")
@@ -223,6 +223,84 @@ extension ChatScreenTests {
 }
 
 extension ChatScreenTests {
+    /// A new chat's composer keeps its text in its place as what is over its text comes and goes:
+    /// a picture and a PDF attached, the line that says why the server refused the message, gone
+    /// as the text changes, back, and gone with an attachment taken off, the last one taken off.
+    /// In every frame drawn through each, the text starts where it did; what comes grows the
+    /// composer up. Split a third over and two thirds under with the room the window leaves, the
+    /// line that says why moved the text 17 points down and the mark 8 up. A draft as tall as the
+    /// composer takes, with all of that over it, still fits the least window, the mark under the
+    /// toolbar and the button over the window's foot.
+    @Test func aNewChatsTextKeepsItsPlaceAsWhatIsOverItComesAndGoes() async throws {
+        let fake = try FakeRuntime("splash-chat-over-text", launcher: "chat_server")
+        defer { try? FileManager.default.removeItem(at: fake.root) }
+        let state = try await Self.chatting(fake)
+        defer { state.quit() }
+        let window = await Snapshot.window(MainView().environment(state), size: FirstMessagePictures.size, appearance: .aqua)
+        defer { window.orderOut(nil) }
+        state.draft.text = FirstMessagePictures.draft
+        pump(0.5)
+        let start = try Self.field(in: window)
+        let refuse = fake.root.appending(path: "refuse")
+        /// The text's top in every frame drawn as `change` is made, until `done` and 0.3 s more.
+        func tops(_ change: () throws -> Void, until done: () -> Bool) async throws -> [CGFloat] {
+            try change()
+            var tops: [CGFloat] = []
+            let deadline = ContinuousClock.now + .seconds(10)
+            var after = 0
+            while after < 15 {
+                try #require(ContinuousClock.now < deadline, "timed out")
+                pump(0.02)
+                await Task.yield()
+                tops.append(try Self.field(in: window).maxY)
+                if done() { after += 1 }
+            }
+            return tops
+        }
+        let steps: [(String, () throws -> Void, () -> Bool)] = [
+            ("a picture attached", { state.draft.attach([try #require(NSImage(data: Showcase.picture))]) },
+             { state.draft.attachments.count == 1 }),
+            ("a PDF attached", { state.draft.attach(pdfs: [try Showcase.pdf(pages: 12, at: fake.root.appending(path: "documents/Kyoto itinerary.pdf"))]) },
+             { state.draft.attachments.count == 2 }),
+            ("refused", {
+                FileManager.default.createFile(atPath: refuse.path, contents: nil)
+                state.sendDraft()
+            }, { state.chats.streaming == nil && state.draft.notice != nil }),
+            ("its reason gone as the text changes", { state.draft.text += " " }, { state.draft.notice == nil }),
+            ("refused again", { state.sendDraft() }, { state.chats.streaming == nil && state.draft.notice != nil }),
+            ("the PDF taken off, and the reason", { state.draft.remove(at: 1) }, { state.draft.notice == nil && state.draft.attachments.count == 1 }),
+            ("the picture taken off", { state.draft.remove(at: 0) }, { state.draft.attachments.isEmpty }),
+        ]
+        for (what, change, done) in steps {
+            let tops = try await tops(change, until: done)
+            #expect(tops.allSatisfy { $0 == start.maxY }, "\(what): the text's top per frame \(tops), before \(start.maxY)")
+        }
+
+        // The least window, a draft taller than the composer takes, all of it over the text.
+        window.setContentSize(CGSize(width: 800, height: 560))
+        state.draft.text = Array(repeating: "Another line of the plan, to see what fits.", count: 20).joined(separator: "\n")
+        state.draft.attach([try #require(NSImage(data: Showcase.picture))])
+        state.draft.attach(pdfs: [try Showcase.pdf(pages: 12, at: fake.root.appending(path: "documents/Kyoto itinerary.pdf"))])
+        try await waitFor(state.draft.attachments.count == 2, "the attachments")
+        state.sendDraft()
+        try await waitFor(state.chats.streaming == nil && state.draft.notice != nil, "the refusal")
+        pump(0.5)
+        let field = try Self.field(in: window)
+        let picture = try #require(await Snapshot.picture(of: window))
+        let scale = CGFloat(picture.pixelsHigh) / window.frame.height, color = Self.colors(of: picture)
+        /// The rows of the mark's color down the window at `x`, in the window's points from its top.
+        func teal(at x: CGFloat) -> [CGFloat] {
+            (0..<picture.pixelsHigh).filter { y in
+                let (r, g, b) = color(Int(x * scale), y)
+                return g - r > 0.3 && b > 0.4
+            }.map { CGFloat($0) / scale }
+        }
+        // The mark's middle, over the text's middle; the button's, 14 points in from the text's end.
+        let mark = teal(at: field.midX).filter { $0 < window.frame.height - field.maxY }, button = teal(at: field.maxX - 14)
+        #expect(mark.count > 5 && mark.allSatisfy { $0 >= 52 }, "the mark, under the toolbar: \(mark.first ?? -1)")
+        #expect(button.count > 5 && button.allSatisfy { $0 < window.frame.height - 1 }, "the button, over the foot: \(button.last ?? -1)")
+    }
+
     /// What the composer held goes at once as its chat opens: from the first frame the window
     /// draws once the server has taken a new chat's first message, nothing of the picture
     /// attached, nor of the line that said why the server had refused the message before, is
