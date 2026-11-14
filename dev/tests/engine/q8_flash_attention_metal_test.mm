@@ -89,6 +89,10 @@ const std::vector<Shape> kShapes = [] {
     if (geometry.reads == splash::kv::Reads::EveryPage)
       shapes.push_back({geometry.kvHeads, geometry.queryHeads / geometry.kvHeads, geometry.reads, true});
   }
+  // Ripple's heads of 128 over ten query heads each: the only Parts=2,
+  // non-power-of-two GQA group (the parity gate caught its prefill).
+  shapes.push_back({8U, 10U, splash::kv::Reads::EveryPage});
+  shapes.push_back({8U, 10U, splash::kv::Reads::EveryPage, true});
   return shapes;
 }();
 

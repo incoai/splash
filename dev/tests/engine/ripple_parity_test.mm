@@ -547,6 +547,70 @@ int main(int argc, char **argv) {
         std::fprintf(stderr, "rope row %u: cos[0]=%.6f sin[0]=%.6f cos[1]=%.6f sin[1]=%.6f\n",
                      row, cos[row * kPairs], sin[row * kPairs], cos[row * kPairs + 1], sin[row * kPairs + 1]);
     }
+    if (std::getenv("SPLASH_DEBUG_STAGES")) {
+      const auto *finalRows = static_cast<const uint16_t *>(finalHidden.front().contents());
+      for (uint32_t row = 0; row < 4; ++row) {
+        double sum = 0.0, lo = 1e9, hi = -1e9;
+        for (uint32_t dim = 0; dim < kHidden; ++dim) {
+          const float value = bf16ToFloat(finalRows[uint64_t{row} * kHidden + dim]);
+          sum += value; lo = std::min<double>(lo, value); hi = std::max<double>(hi, value);
+        }
+        std::fprintf(stderr, "final hidden row %u: mean %.4f min %.4f max %.4f\n",
+                     row, sum / kHidden, lo, hi);
+      }
+      const auto *partials = static_cast<const float *>(buffers.attentionPartials.contents());
+      for (uint32_t fused = 0; fused < 24; ++fused) {
+        double sum = 0.0;
+        for (uint32_t dim = 0; dim < kHidden; ++dim)
+          sum += partials[uint64_t{fused} * kHidden + dim];
+        std::fprintf(stderr, "partials fused %u (row %u head %u): sum %.4f first %.4f\n",
+                     fused, fused / 10, fused % 10, sum, partials[uint64_t{fused} * kHidden]);
+      }
+      const auto *keys = static_cast<const uint16_t *>(buffers.chunkKeys.contents());
+      for (uint32_t head = 0; head < 2; ++head)
+        for (uint32_t row = 0; row < 4; ++row) {
+          double sum = 0.0;
+          const uint64_t base = (uint64_t{head} * sequence.attentionStride + row) * 128;
+          for (uint32_t dim = 0; dim < 128; ++dim)
+            sum += bf16ToFloat(keys[base + dim]);
+          std::fprintf(stderr, "chunkKeys head %u row %u: sum %.4f\n", head, row, sum);
+        }
+      const auto *attn = static_cast<const uint16_t *>(buffers.fullAttention.contents());
+      for (uint32_t row = 0; row < 4; ++row) {
+        double sum = 0.0;
+        for (uint32_t dim = 0; dim < kHidden; ++dim)
+          sum += bf16ToFloat(attn[uint64_t{row} * kHidden + dim]);
+        std::fprintf(stderr, "fullAttention row %u: sum %.4f first %.6f\n",
+                     row, sum, bf16ToFloat(attn[uint64_t{row} * kHidden]));
+      }
+      const uint32_t stride = sequence.attentionStride;
+      const auto *queries = static_cast<const uint16_t *>(buffers.fullQueries.contents());
+      for (uint32_t kvHead = 0; kvHead < 2; ++kvHead)
+        for (uint32_t row = 0; row < 2; ++row)
+          for (uint32_t head = 0; head < 10; ++head) {
+            const uint64_t base = ((uint64_t{kvHead} * stride + row) * 10 + head) * 128;
+            double qsum = 0.0;
+            for (uint32_t dim = 0; dim < 128; ++dim)
+              qsum += bf16ToFloat(queries[base + dim]);
+            std::fprintf(stderr, "queries kv %u row %u head %u: qsum %.4f first %.4f\n",
+                         kvHead, row, head, qsum, bf16ToFloat(queries[base]));
+          }
+      const uint32_t packedWidth = geometry.target.packedFullWidth;
+      const auto *pack = static_cast<const uint16_t *>(buffers.fullPacked.contents());
+      for (uint32_t row = 0; row < 4; ++row) {
+        double sum = 0.0;
+        for (uint32_t dim = 0; dim < packedWidth; ++dim)
+          sum += bf16ToFloat(pack[uint64_t{row} * packedWidth + dim]);
+        std::fprintf(stderr, "fullPacked row %u: sum %.4f\n", row, sum);
+      }
+      const auto *embed = static_cast<const uint16_t *>(buffers.hidden[0].contents());
+      for (uint32_t row = 0; row < 4; ++row) {
+        double sum = 0.0;
+        for (uint32_t dim = 0; dim < kHidden; ++dim)
+          sum += bf16ToFloat(embed[uint64_t{row} * kHidden + dim]);
+        std::fprintf(stderr, "embedding row %u: sum %.4f\n", row, sum);
+      }
+    }
     logits = logitsBuffer;
   }
 

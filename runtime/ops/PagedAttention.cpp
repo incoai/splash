@@ -91,7 +91,10 @@ std::string_view storeSuffix(kv::Layout layout) {
   if (layout.valid())
     for (const CompiledAttention &compiled : kCompiledAttention)
       if (storesLayout(compiled, layout)) return compiled.storeSuffix;
-  throw std::invalid_argument("no KV store kernel for layout");
+  throw std::invalid_argument("no KV store kernel for layout (kvHeads " +
+                              std::to_string(layout.kvHeads) + " dim " + std::to_string(layout.headDimension) +
+                              " vt " + std::to_string(layout.valuesTokenMajor) + " reads " +
+                              std::to_string(unsigned(layout.reads)) + ")");
 }
 
 // The compiled geometry of `queryHeads` over a layout's KV heads that reads
