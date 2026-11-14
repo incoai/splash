@@ -1089,7 +1089,7 @@ void testARestoreAfterTheOtherWarmupsCreatesNothing(const char *metallibPath) {
 
 // A verify's kernels follow its lanes' history, which the decode warmups'
 // is short of: past 7.2K tokens Apple10's INT8 attention scores INT8 queries
-// (verify_attention_q8q_split; no Apple9 GPU does). After the start's
+// (attention_q8q_split; no Apple9 GPU does). After the start's
 // warmups, a request of 8K tokens creates no pipeline: each decode warmup
 // created its verify's after the longest history.
 void testALongRequestAfterTheWarmupsCreatesNothing(const char *metallibPath) {

@@ -1530,12 +1530,11 @@ struct Runtime::Impl {
     return std::make_unique<DeferredMetalTicket>(std::move(command), std::move(finish), WorkCount({}, nullptr));
   }
 
-  ChunkedPrefillParams chunkParams(uint64_t logicalPosition,
-                                   uint32_t chunkTokens, uint32_t chunkStride,
-                                   std::span<const uint32_t> pages) const {
-    return ops::PagedAttention::prefillParams(
-        logicalPosition, chunkTokens, chunkStride,
-        static_cast<uint32_t>(pages.size()));
+  // A sequence of `rows` rows after logicalPosition, staged in whole KV
+  // blocks (kTileRows) per KV head, whose page table holds `pages`.
+  ChunkedPrefillParams chunkParams(uint64_t logicalPosition, uint32_t rows, std::span<const uint32_t> pages) const {
+    return ops::PagedAttention::chunkParams(logicalPosition, rows, (rows + kTileRows - 1) / kTileRows * kTileRows,
+                                            static_cast<uint32_t>(pages.size()));
   }
 
   // A state a lane's prefill command captures
@@ -1553,17 +1552,14 @@ struct Runtime::Impl {
 
   // A lane's rows in a chunk of a prefill command (PrefillChunk): `part`, the
   // rows of the lane's item the chunk runs, with the states they capture;
-  // where they sit among the chunk's rows and in its attention scratch; the
-  // lane's tables; the draft context rows they capture (from captureBegin on
-  // among the chunk's) and their states.
+  // where they sit among the chunk's rows; the lane's tables; the draft
+  // context rows they capture (from captureBegin on among the chunk's) and
+  // their states.
   struct PrefillSequence final {
     Request *entry = nullptr;
     ModelBatchItem part;
     uint32_t lane = 0;
     uint32_t rowBegin = 0;
-    uint32_t attentionStride = 0;
-    uint64_t queryOffset = 0;
-    uint64_t kvOffset = 0;
     uint32_t captureBegin = 0;
     ChunkedPrefillParams chunk;
     LaneTables tables;
@@ -1728,9 +1724,8 @@ struct Runtime::Impl {
         sequence.entry = &entry;
         sequence.lane = lane;
         sequence.rowBegin = chunk.rows;
-        sequence.attentionStride = (part.tokenCount + kTileRows - 1) / kTileRows * kTileRows;
         sequence.captureBegin = chunk.capturedRows;
-        sequence.chunk = chunkParams(part.logicalPosition, part.tokenCount, sequence.attentionStride, item.pageTable);
+        sequence.chunk = chunkParams(part.logicalPosition, part.tokenCount, item.pageTable);
         sequence.tables = tables;
         sequence.captures = activeDraftCaptures(entry, part);
         sequence.stateCaptures = stateCaptures(part, sequence.captures, lengths);
@@ -1752,18 +1747,8 @@ struct Runtime::Impl {
     }
     for (uint32_t c = 0; c < chunks.size(); ++c) {
       PrefillChunk &chunk = chunks[c];
-      uint64_t queryOffset = 0, kvOffset = 0;
-      for (PrefillSequence &sequence : chunk.sequences) {
-        sequence.queryOffset = queryOffset;
-        sequence.kvOffset = kvOffset;
-        const uint64_t headRows = uint64_t{sequence.attentionStride} * geometry.target.attentionHeadDimension;
-        queryOffset += bytesFor<uint16_t>(geometry.target.attentionQueryHeads * headRows);
-        kvOffset += bytesFor<uint16_t>(geometry.target.attentionKvHeads * headRows);
+      for (PrefillSequence &sequence : chunk.sequences)
         writePromptRows(*sequence.entry, sequence.part, sequence.rowBegin, c);
-      }
-      if (queryOffset > prefillArena->get(PrefillTensor::FullQueries).sizeBytes() ||
-          kvOffset > prefillArena->get(PrefillTensor::ChunkKeys).sizeBytes())
-        throw std::logic_error("prefill scratch geometry overflowed");
       auto *draftPositions =
           contents<uint32_t>(prefillArena->get(PrefillTensor::DraftPositions, c), "draft RoPE positions");
       for (const PrefillSequence &sequence : chunk.sequences)
@@ -2004,9 +1989,6 @@ struct Runtime::Impl {
         destination.rows = part.tokenCount;
         destination.tokens = part.inputTokens;
         destination.request = targetRequest(*sequence.entry);
-        destination.attentionStride = sequence.attentionStride;
-        destination.queryOffset = sequence.queryOffset;
-        destination.kvOffset = sequence.kvOffset;
         destination.chunk = sequence.chunk;
         destination.pageTable = sequence.tables.pages;
         destination.indexTable = sequence.tables.index;
@@ -2284,9 +2266,7 @@ struct Runtime::Impl {
     buffers.moe = decodeArena->moeScratch(storage);
     buffers.verifyRows = decodeArena->batchSlice(DecodeTensor::VerifyRows, lanes);
     for (uint32_t lane = 0; lane < lanes; ++lane)
-      chunks[lane] = ops::PagedAttention::verifyParams(
-          items[lane].logicalPosition,
-          static_cast<uint32_t>(items[lane].pageTable.size()));
+      chunks[lane] = chunkParams(items[lane].logicalPosition, kDecodeRows, items[lane].pageTable);
     for (uint32_t lane = 0; lane < kLaneCount; ++lane) {
       Request &entry = laneEntry(entries, lane);
       const LaneTables tables = laneTables(entry.stateLane);
@@ -3712,7 +3692,7 @@ WarmupStepResult Runtime::warmupDecodeBatch(uint32_t width) {
     }
     // A verify's kernels follow its lanes' history, and these lanes' is
     // short: past 7.2K tokens Apple10's INT8 attention scores INT8 queries
-    // (the 27B's first 10.7K-token request created verify_attention_q8q_split
+    // (the 27B's first 10.7K-token request created attention_q8q_split
     // while serving, 97 ms on the 48 GB M5 Pro), and past 2,048 Flash-Next's
     // indexer selects blocks. Each choice has one threshold, so each decode
     // warmup also creates the pipelines of its verify after the longest

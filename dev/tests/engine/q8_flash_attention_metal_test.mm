@@ -26,10 +26,11 @@ using splash::test::HostKvExtents;
 
 namespace {
 
-constexpr uint32_t kStride = 32;
+// A lane's rows, a tile's at most, staged in one KV block per KV head.
+constexpr uint32_t kStride = kPageTokens;
 constexpr uint32_t kQueryStride = kStride;
-constexpr uint32_t kRows = kVerifyRows;
-static_assert(kStride == SPLASH_VERIFY_CHUNK_STRIDE);
+constexpr uint32_t kRows = kAttentionTileRows;
+static_assert(kRows == SPLASH_TARGET_VERIFY_ROWS, "a decode lane's rows are one tile");
 
 // The production GQA geometries, every family's (TestFamilies.hpp). The
 // group size selects the kernel specialization, which the plans name
@@ -58,28 +59,18 @@ struct Shape {
     return {.attentionLayers = 1, .kvHeads = kvHeads, .headDimension = kHeadDimension,
             .valuesTokenMajor = splash::kv::valuesTokenMajorFor(reads), .reads = reads};
   }
-  // A phase's ("verify" or "prefill") split and reduce entries, as its plans
-  // name them.
-  std::string split(std::string_view phase) const {
-    return phase == "verify" ? verifyPlan().splitPipeline : prefillPlan().splitPipeline;
-  }
-  std::string reduce(std::string_view phase) const {
-    return phase == "verify" ? verifyPlan().reducePipeline : prefillPlan().reducePipeline;
-  }
+  // The split and reduce entries, as the plans name them.
+  std::string split() const { return plan().splitPipeline(); }
+  std::string reduce() const { return plan().reducePipeline(); }
 
 private:
-  // The plans' attention row: INT8 queries in every split, or none.
-  splash::ops::AttentionCalibration attention() const {
-    return splash::test::attentionRow(int8Queries ? 1U : splash::ops::kNever);
-  }
-  splash::ops::PrefillAttentionPlan prefillPlan() const {
-    return splash::ops::PagedAttention::prefillPlan(kRows, 0, queryHeads(), layout(), attention(),
-                                                    splash::ops::Int8Activations::On);
-  }
-  splash::ops::VerifyAttentionPlan verifyPlan() const {
-    const std::array<uint32_t, 1> history{0};
-    return splash::ops::PagedAttention::verifyPlan(1, queryHeads(), layout(), history, attention(),
-                                                   splash::ops::Int8Activations::On);
+  // A plan of a lane's rows, with INT8 queries in every split or none.
+  splash::ops::AttentionPlan plan() const {
+    const std::array lane{splash::ops::PagedAttention::chunkParams(0, kRows, kStride, 1)};
+    return splash::ops::PagedAttention::plan(
+        lane, queryHeads(), layout(), splash::test::attentionRow(int8Queries ? 1U : splash::ops::kNever),
+        splash::ops::Int8Activations::On,
+        splash::ops::PagedAttention::workspace(kAttentionMaximumSplits, queryHeads(), layout()));
   }
 };
 const std::vector<Shape> kShapes = [] {
@@ -94,16 +85,27 @@ const std::vector<Shape> kShapes = [] {
 
 using splash::test::require;
 
+// A decode lane's tile: 32 splits until it reads more than 16 pages a split,
+// one per 16 pages after, at most kAttentionMaximumSplits.
+uint32_t laneSplits(uint32_t history) {
+  const std::array lane{splash::ops::PagedAttention::chunkParams(history, kRows, kStride,
+                                                                 (history + kRows + kPageTokens - 1) / kPageTokens)};
+  const splash::kv::Layout layout{.attentionLayers = 1, .kvHeads = 4, .headDimension = kHeadDimension};
+  return splash::ops::PagedAttention::plan(lane, 24, layout, splash::ops::kApple10Attention,
+                                           splash::ops::Int8Activations::On,
+                                           splash::ops::PagedAttention::workspace(kAttentionMaximumSplits, 24, layout))
+      .sequences()[0]
+      .splits;
+}
+
 void testContract() {
   ChunkedPrefillParams finalCycle{
       splash::kv::kMaximumLogicalTokens - 1, kRows, kStride,
-      (splash::kv::kMaximumPhysicalTokens + kPageTokens - 1) / kPageTokens, {}};
+      (splash::kv::kMaximumPhysicalTokens + kPageTokens - 1) / kPageTokens};
   require(chunkedPrefillValidationError(finalCycle).empty(),
           "the final cycle's verification rows exceeded physical KV scratch");
-  require(verifyAttentionSplits(0) == kVerifySplits &&
-              verifyAttentionSplits(16 * 1024) == kVerifySplits + 1 &&
-              verifyAttentionSplits(131072) == kVerifyMaximumSplits,
-          "verify split scaling departed from one split per 16 visible pages");
+  require(laneSplits(0) == 32 && laneSplits(16 * 1024) == 33 && laneSplits(131072) == kAttentionMaximumSplits,
+          "a lane's split scaling departed from one split per 16 visible pages");
   ++finalCycle.committed_tokens;
   require(chunkedPrefillValidationError(finalCycle) == "context_out_of_range",
           "physical KV scratch exceeded its fixed seven-row allowance");
@@ -187,12 +189,12 @@ float queryPattern(uint32_t row, uint32_t head, uint32_t dimension) {
 // starts past the first one's in every extent.
 constexpr uint32_t kLayer = 1;
 
-// One lane's rows after its history. All eight rows run the verify
-// entries; fewer run the prefill entries, which share the page loop and the
-// reduction, as one query tile of the parameters held here.
+// One lane's rows after its history, of one tile, its sequence's parameters
+// held here; a dispatch of several lanes stages each lane's after the one
+// before it.
 struct Case {
   Shape shape;
-  PrefillAttentionParams params;
+  SplashAttentionSequence params;
   // Page ids, and their entries for the kernels.
   std::vector<uint32_t> pageTable;
   id<MTLBuffer> pageTableBuffer;
@@ -249,8 +251,18 @@ Case makeCase(id<MTLDevice> device, Shape shape, uint32_t committed,
   result.pageTable = HostKvExtents::mixedPages(spread, pages, committed + activeRows);
   result.pageTableBuffer = makeBuffer(device, pages * sizeof(SplashKvPage));
   result.pool->writeTable(result.pageTable, result.pageTableBuffer.contents);
-  result.params = {committed, activeRows, kStride, pages,
-                   result.pool->layer(kLayer), splits, 0, 0};
+  result.params = {.committed_tokens = committed,
+                   .rows = activeRows,
+                   .first_row = 0,
+                   .row_begin = 0,
+                   .stage_row = 0,
+                   .chunk_stride = kStride,
+                   .page_table_entries = pages,
+                   .split_count = splits,
+                   .first_tile = 0,
+                   .first_slot = 0,
+                   .block_stride = 0,
+                   .block_list = 0};
   uint64_t queryElements =
       uint64_t{shape.queryHeads()} * kQueryStride * kHeadDimension;
   result.queries = makeBuffer(device, queryElements * sizeof(BFloat16Bits));
@@ -482,38 +494,29 @@ std::vector<BFloat16Bits> cpuReference(const Case &data, bool quantized) {
   return output;
 }
 
-// The verify and prefill split of one geometry, each with its reduction.
+// The split of one geometry and its reduction.
 struct Pipelines {
   std::string splitName;
   id<MTLComputePipelineState> split;
   id<MTLComputePipelineState> reduce;
-  std::string prefillSplitName;
-  id<MTLComputePipelineState> prefillSplit;
-  id<MTLComputePipelineState> prefillReduce;
 };
 
 Pipelines makePipelines(id<MTLDevice> device, id<MTLLibrary> library,
                         Shape shape) {
   Pipelines result;
-  result.splitName = shape.split("verify");
+  result.splitName = shape.split();
   result.split = makePipeline(device, library, result.splitName);
-  result.reduce = makePipeline(device, library, shape.reduce("verify"));
-  result.prefillSplitName = shape.split("prefill");
-  result.prefillSplit = makePipeline(device, library, result.prefillSplitName);
-  result.prefillReduce = makePipeline(device, library, shape.reduce("prefill"));
-  const uint64_t scratch = result.split.staticThreadgroupMemoryLength;
-  std::cout << "pipeline=" << result.splitName << " threadgroup_bytes=" << scratch
+  result.reduce = makePipeline(device, library, shape.reduce());
+  std::cout << "pipeline=" << result.splitName << " threadgroup_bytes=" << result.split.staticThreadgroupMemoryLength
             << (shaderValidationEnabled() ? " (instrumented by shader validation)" : "")
             << '\n';
-  require(scratch == result.prefillSplit.staticThreadgroupMemoryLength,
-          "verify tile left the shared score/probability footprint");
   return result;
 }
 
 // The split, reduce and every scratch buffer of one production-sized
-// dispatch: partials and statistics are the workspace production allocates,
-// which holds [lane][KV head][split] (verify) or [tile][KV head][split]
-// (prefill, one tile) at every split count.
+// dispatch: partials and statistics are the workspace production allocates
+// for its lanes, which holds [lane's tile][KV head][part][split] at every
+// split count.
 struct Dispatch {
   std::vector<uint8_t> output;
   std::vector<uint8_t> partials;
@@ -525,21 +528,22 @@ std::vector<uint8_t> copyOf(id<MTLBuffer> buffer) {
   return {bytes, bytes + buffer.length};
 }
 
-// Every lane of a verify step of `width` lanes attends the case's rows.
+// A dispatch of `width` lanes, each the case's rows after its history: lane
+// l's rows the dispatch's from l x 8 on, its tile the dispatch's tile l and
+// its staging the KV heads after the lanes before it.
 Dispatch dispatch(id<MTLDevice> device, id<MTLCommandQueue> queue,
                   id<MTLComputePipelineState> split,
                   id<MTLComputePipelineState> reduce, const Case &data,
                   uint32_t width) {
   const Shape shape = data.shape;
   const uint32_t splits = data.params.split_count;
-  require(data.params.rows == kRows, "a verify lane attends all its rows");
   const uint64_t laneBytes = data.queries.length;
   id<MTLBuffer> queries = makeBuffer(device, width * laneBytes);
   id<MTLBuffer> output = makeBuffer(device, width * laneBytes);
   // The workspace production allocates for `width` lanes, which holds every
   // split count's slots.
   const splash::ops::AttentionWorkspace workspace =
-      splash::ops::PagedAttention::verifyWorkspace(width, shape.queryHeads(), shape.layout());
+      splash::ops::PagedAttention::workspace(width * kAttentionMaximumSplits, shape.queryHeads(), shape.layout());
   id<MTLBuffer> partials = makeBuffer(device, workspace.partialsBytes);
   id<MTLBuffer> statistics = makeBuffer(device, workspace.statisticsBytes);
   for (uint32_t lane = 0; lane < width; ++lane) {
@@ -549,10 +553,18 @@ Dispatch dispatch(id<MTLDevice> device, id<MTLCommandQueue> queue,
   // With QSA masks every lane attends through a copy of the case's list,
   // lane l's list kQsaJunkLists + l.
   const BlockLists blocks = data.maskWords ? qsaBlockLists(device, data, width) : BlockLists{partials, partials, 0};
-  std::array<VerifyAttentionParams, 4> params{};
-  for (uint32_t lane = 0; lane < params.size(); ++lane)
-    params[lane] = {data.params.committed_tokens, data.params.page_table_entries, data.params.kv, splits, splits,
-                    blocks.stride, blocks.stride ? kQsaJunkLists + lane : 0};
+  SplashAttentionParams params{.sequences = width, .rows = width * data.params.rows, .tiles = width, .padding = 0,
+                               .kv = data.pool->layer(kLayer), .sequence = {}};
+  for (uint32_t lane = 0; lane < width; ++lane) {
+    SplashAttentionSequence &sequence = params.sequence[lane];
+    sequence = data.params;
+    sequence.first_row = sequence.row_begin = lane * data.params.rows;
+    sequence.stage_row = lane * shape.kvHeads * kStride;
+    sequence.first_tile = lane;
+    sequence.first_slot = lane * shape.kvHeads * splits;
+    sequence.block_stride = blocks.stride;
+    sequence.block_list = blocks.stride ? kQsaJunkLists + lane : 0;
+  }
   id<MTLCommandBuffer> command = [queue commandBuffer];
   id<MTLComputeCommandEncoder> encoder = [command computeCommandEncoder];
   [encoder setComputePipelineState:split];
@@ -568,15 +580,13 @@ Dispatch dispatch(id<MTLDevice> device, id<MTLCommandQueue> queue,
     [encoder setBuffer:blocks.lists offset:0 atIndex:paramsIndex++];
     [encoder setBuffer:blocks.counts offset:0 atIndex:paramsIndex++];
   }
-  [encoder setBytes:params.data()
-              length:sizeof(VerifyAttentionParams) * params.size()
-             atIndex:paramsIndex];
+  [encoder setBytes:&params length:sizeof(params) atIndex:paramsIndex];
   // The kernel reaches the extents only through the page entries.
   for (id<MTLBuffer> extent : data.extents)
     [encoder useResource:extent usage:MTLResourceUsageRead];
-  // The sparse split's grid is one-dimensional (ops::PagedAttention::verifyPlan).
-  [encoder dispatchThreadgroups:shape.sparse() ? MTLSizeMake(shape.kvHeads * splits, 1, width)
-                                               : MTLSizeMake(shape.kvHeads * shape.parts(), splits, width)
+  // The sparse split's grid is one-dimensional (AttentionPlan::splitGroups).
+  [encoder dispatchThreadgroups:shape.sparse() ? MTLSizeMake(shape.kvHeads * splits, width, 1)
+                                               : MTLSizeMake(shape.kvHeads * shape.parts(), width, splits)
           threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
   [encoder setComputePipelineState:reduce];
   [encoder setBuffer:partials offset:0 atIndex:0];
@@ -585,62 +595,8 @@ Dispatch dispatch(id<MTLDevice> device, id<MTLCommandQueue> queue,
   paramsIndex = 3;
   if (shape.sparse())
     [encoder setBuffer:blocks.counts offset:0 atIndex:paramsIndex++];
-  [encoder setBytes:params.data()
-              length:sizeof(VerifyAttentionParams) * params.size()
-             atIndex:paramsIndex];
+  [encoder setBytes:&params length:sizeof(params) atIndex:paramsIndex];
   [encoder dispatchThreadgroups:MTLSizeMake(shape.kvHeads, shape.fusedRows(), width)
-          threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
-  [encoder endEncoding];
-  finish(command);
-  return {copyOf(output), copyOf(partials), copyOf(statistics)};
-}
-
-// The case's rows as the one query tile of a prefill chunk.
-Dispatch dispatchPrefill(id<MTLDevice> device, id<MTLCommandQueue> queue,
-                         id<MTLComputePipelineState> split,
-                         id<MTLComputePipelineState> reduce, const Case &data) {
-  const Shape shape = data.shape;
-  const uint32_t splits = data.params.split_count;
-  id<MTLBuffer> output = makeBuffer(device, data.queries.length);
-  // The workspace production allocates for chunks of the tile's rows, which
-  // holds every split count's slots.
-  const splash::ops::AttentionWorkspace workspace =
-      splash::ops::PagedAttention::prefillWorkspace(kRows, shape.queryHeads(), shape.layout());
-  id<MTLBuffer> partials = makeBuffer(device, workspace.partialsBytes);
-  id<MTLBuffer> statistics = makeBuffer(device, workspace.statisticsBytes);
-  // With QSA masks the tile attends through list kQsaJunkLists.
-  const BlockLists blocks = data.maskWords ? qsaBlockLists(device, data, 1) : BlockLists{partials, partials, 0};
-  PrefillAttentionParams params = data.params;
-  params.block_stride = blocks.stride;
-  params.block_list = blocks.stride ? kQsaJunkLists : 0;
-  id<MTLCommandBuffer> command = [queue commandBuffer];
-  id<MTLComputeCommandEncoder> encoder = [command computeCommandEncoder];
-  [encoder setComputePipelineState:split];
-  [encoder setBuffer:data.queries offset:0 atIndex:0];
-  [encoder setBuffer:partials offset:0 atIndex:1];
-  [encoder setBuffer:statistics offset:0 atIndex:2];
-  [encoder setBuffer:data.pageTableBuffer offset:0 atIndex:3];
-  // A sparse split binds the lists and their counts, or without lists
-  // another buffer of the dispatch, of which it reads nothing.
-  NSUInteger paramsIndex = 4;
-  if (shape.sparse()) {
-    [encoder setBuffer:blocks.lists offset:0 atIndex:paramsIndex++];
-    [encoder setBuffer:blocks.counts offset:0 atIndex:paramsIndex++];
-  }
-  [encoder setBytes:&params length:sizeof(params) atIndex:paramsIndex];
-  for (id<MTLBuffer> extent : data.extents)
-    [encoder useResource:extent usage:MTLResourceUsageRead];
-  [encoder dispatchThreadgroups:MTLSizeMake(shape.kvHeads * shape.parts(), 1, splits)
-          threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
-  [encoder setComputePipelineState:reduce];
-  [encoder setBuffer:partials offset:0 atIndex:0];
-  [encoder setBuffer:statistics offset:0 atIndex:1];
-  [encoder setBuffer:output offset:0 atIndex:2];
-  paramsIndex = 3;
-  if (shape.sparse())
-    [encoder setBuffer:blocks.counts offset:0 atIndex:paramsIndex++];
-  [encoder setBytes:&params length:sizeof(params) atIndex:paramsIndex];
-  [encoder dispatchThreadgroups:MTLSizeMake(shape.kvHeads, shape.fusedRows(), 1)
           threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
   [encoder endEncoding];
   finish(command);
@@ -661,7 +617,7 @@ void checkOutput(const Case &data, uint32_t width,
       reinterpret_cast<const BFloat16Bits *>(outputBytes.data());
   const uint64_t laneElements = expectedQ8.size();
   require(outputBytes.size() == width * laneElements * sizeof(BFloat16Bits),
-          "verify output size departed from its lanes");
+          "attention output size departed from its lanes");
   double dot = 0.0;
   double actualSquared = 0.0;
   double expectedSquared = 0.0;
@@ -797,16 +753,14 @@ void requireIdentical(const std::string &pipeline, const Case &data,
 
 // Keep the CPU reference gates and verify that a second independent
 // submission, and the same pages in one extent, produce identical output and
-// scratch. Eight rows run a verify step of `width` lanes; fewer run one
-// prefill tile.
+// scratch, of a dispatch of `width` lanes of the case's rows.
 void runCase(id<MTLDevice> device, id<MTLCommandQueue> queue,
              const Pipelines &pipelines, Shape shape,
              uint32_t committed, uint32_t activeRows, uint32_t width,
-             bool qualityGate = true, uint32_t splits = kVerifySplits,
+             bool qualityGate = true, uint32_t splits = 32,
              bool qsa = false) {
-  require(width >= 1 && width <= 4 &&
-              (activeRows == kRows ||
-               (width == 1 && splits <= SPLASH_PREFILL_ATTENTION_MAXIMUM_SPLITS)),
+  require(width >= 1 && width <= 4 && activeRows >= 1 && activeRows <= kRows &&
+              splits <= kAttentionMaximumSplits,
           "invalid attention case");
   Case data = makeCase(device, shape, committed, activeRows, splits);
   fill(data);
@@ -814,13 +768,8 @@ void runCase(id<MTLDevice> device, id<MTLCommandQueue> queue,
   const Case oneExtent = oneExtentCopy(device, data);
   const std::vector<BFloat16Bits> expectedQ8 = cpuReference(data, true);
   const std::vector<BFloat16Bits> expectedBf16 = cpuReference(data, false);
-  const bool verify = activeRows == kRows;
-  const std::string name = (verify ? pipelines.splitName : pipelines.prefillSplitName) + (qsa ? "_qsa" : "");
-  const auto run = [&](const Case &c) {
-    return verify ? dispatch(device, queue, pipelines.split, pipelines.reduce, c, width)
-                  : dispatchPrefill(device, queue, pipelines.prefillSplit,
-                                    pipelines.prefillReduce, c);
-  };
+  const std::string name = pipelines.splitName + (qsa ? "_qsa" : "");
+  const auto run = [&](const Case &c) { return dispatch(device, queue, pipelines.split, pipelines.reduce, c, width); };
   const Dispatch first = run(data);
   checkOutput(data, width, expectedQ8, expectedBf16, first.output, qualityGate, name);
   const Dispatch repeat = run(data);
@@ -831,10 +780,8 @@ void runCase(id<MTLDevice> device, id<MTLCommandQueue> queue,
 }
 
 // Isolate the merge from QK/PV: large differences in maxima, cancellation,
-// ragged split counts and inactive rows exercise the reduction both entries
-// share. Eight active rows run the verify entry and, up to its split
-// maximum, the prefill entry, whose parameters must lead to the same bits;
-// fewer rows run the prefill entry alone.
+// ragged split counts and inactive rows exercise the reduction of a tile of
+// eight active rows or fewer.
 void checkReduce(id<MTLDevice> device, id<MTLCommandQueue> queue,
                  id<MTLLibrary> library, Shape shape, uint32_t splits,
                  uint32_t activeRows) {
@@ -855,16 +802,16 @@ void checkReduce(id<MTLDevice> device, id<MTLCommandQueue> queue,
         for (uint32_t dim = 0; dim < d; ++dim)
           p[index * d + dim] = float(int((split * 71 + dim * 37 + row * 13) % 257) - 128) * 0.125f;
       }
-  // One phase's merge of the partials into a poisoned output; a sparse
-  // reduce without lists binds another buffer of the dispatch for their
-  // counts, of which it reads nothing.
-  const auto reduce = [&](const char *phase, const auto &params) {
+  // The merge of the partials into a poisoned output; a sparse reduce without
+  // lists binds another buffer of the dispatch for their counts, of which it
+  // reads nothing.
+  const auto reduce = [&](const SplashAttentionParams &params) {
     id<MTLBuffer> output = makeBuffer(device, uint64_t{shape.kvHeads} * kStride *
                                                  shape.queryHeadsPerKvHead * d * 2);
     std::memset(output.contents, 0xa5, output.length);
     id<MTLCommandBuffer> command = [queue commandBuffer];
     id<MTLComputeCommandEncoder> encoder = [command computeCommandEncoder];
-    [encoder setComputePipelineState:makePipeline(device, library, shape.reduce(phase))];
+    [encoder setComputePipelineState:makePipeline(device, library, shape.reduce())];
     [encoder setBuffer:partials offset:0 atIndex:0];
     [encoder setBuffer:stats offset:0 atIndex:1];
     [encoder setBuffer:output offset:0 atIndex:2];
@@ -918,27 +865,26 @@ void checkReduce(id<MTLDevice> device, id<MTLCommandQueue> queue,
                       0xa5a5,
                   "attention merge wrote beyond its eight-row view");
   };
-  // The prefill tile holds as many rows as a verify lane.
-  static_assert(SPLASH_PREFILL_ATTENTION_TILE_ROWS == SPLASH_TARGET_VERIFY_ROWS);
   // A history every split takes a share of: a page each of the page loop's,
   // and of a sparse reduce without lists the least blocks a split takes.
   const uint32_t splitTokens = shape.sparse() ? SPLASH_SPARSE_SPLIT_BLOCKS * SPLASH_ATTENTION_BLOCK_TOKENS : 32;
   const uint32_t committed = splits * splitTokens - activeRows;
   const uint32_t pages = splits * splitTokens / 32;
-  id<MTLBuffer> verify;
-  if (activeRows == kRows) {
-    const VerifyAttentionParams params{committed, pages, {1, 0}, splits, splits, 0, 0};
-    verify = reduce("verify", params);
-    check(verify);
-  }
-  if (splits <= SPLASH_PREFILL_ATTENTION_MAXIMUM_SPLITS) {
-    const PrefillAttentionParams params{committed, activeRows, kStride, pages, {1, 0}, splits, 0, 0};
-    id<MTLBuffer> prefill = reduce("prefill", params);
-    check(prefill);
-    if (verify)
-      require(!std::memcmp(verify.contents, prefill.contents, verify.length),
-              "verify and prefill entries merged the same partials differently");
-  }
+  SplashAttentionParams params{.sequences = 1, .rows = activeRows, .tiles = 1, .padding = 0, .kv = {1, 0},
+                               .sequence = {}};
+  params.sequence[0] = {.committed_tokens = committed,
+                        .rows = activeRows,
+                        .first_row = 0,
+                        .row_begin = 0,
+                        .stage_row = 0,
+                        .chunk_stride = kStride,
+                        .page_table_entries = pages,
+                        .split_count = splits,
+                        .first_tile = 0,
+                        .first_slot = 0,
+                        .block_stride = 0,
+                        .block_list = 0};
+  check(reduce(params));
 }
 
 void run(const char *libraryPath) {
@@ -958,8 +904,7 @@ void run(const char *libraryPath) {
     if (!shape.int8Queries)
       for (uint32_t splits : {1U, 3U, 7U, 32U, 65U, 128U}) {
         checkReduce(device, queue, library, shape, splits, kRows);
-        if (splits <= SPLASH_PREFILL_ATTENTION_MAXIMUM_SPLITS)
-          checkReduce(device, queue, library, shape, splits, 1);
+        checkReduce(device, queue, library, shape, splits, 1);
       }
     const Pipelines pipelines = makePipelines(device, library, shape);
     for (uint32_t width = 1; width <= 4; ++width)
@@ -969,6 +914,7 @@ void run(const char *libraryPath) {
       runCase(device, queue, pipelines, shape, 127, activeRows, 1);
     runCase(device, queue, pipelines, shape, 129, 8, 4);
     runCase(device, queue, pipelines, shape, 421, 3, 1);
+    runCase(device, queue, pipelines, shape, 421, 3, 4);
     // Several pages per split, a partially filled last page, and a history
     // that leaves some splits empty.
     runCase(device, queue, pipelines, shape, 1'100, 8, 2, false);
@@ -979,7 +925,7 @@ void run(const char *libraryPath) {
     runCase(device, queue, pipelines, shape, 4'093, 8, 1, false, 64);
     runCase(device, queue, pipelines, shape, 4'093, 8, 3, false, 65);
     runCase(device, queue, pipelines, shape, 4'093, 8, 2, false,
-            kVerifyMaximumSplits);
+            kAttentionMaximumSplits);
     runCase(device, queue, pipelines, shape, 1'100, 8, 1, false, 1);
     runCase(device, queue, pipelines, shape, 8'192, 5, 1, false);
     runCase(device, queue, pipelines, shape, 32'768, 7, 1, false);
@@ -989,22 +935,22 @@ void run(const char *libraryPath) {
       // rows only; tiles crossing from causal to sparse rows (complete
       // blocks 40 to 42, and only the last row past 40); sparse rows over
       // several units per split, ragged and empty splits.
-      runCase(device, queue, pipelines, shape, 127, 8, 1, true, kVerifySplits, true);
-      runCase(device, queue, pipelines, shape, 160, 8, 2, true, kVerifySplits, true);
-      runCase(device, queue, pipelines, shape, 158, 6, 1, true, kVerifySplits, true);
-      runCase(device, queue, pipelines, shape, 1'100, 8, 2, false, kVerifySplits, true);
+      runCase(device, queue, pipelines, shape, 127, 8, 1, true, 32, true);
+      runCase(device, queue, pipelines, shape, 160, 8, 2, true, 32, true);
+      runCase(device, queue, pipelines, shape, 158, 6, 1, true, 32, true);
+      runCase(device, queue, pipelines, shape, 1'100, 8, 2, false, 32, true);
       runCase(device, queue, pipelines, shape, 1'100, 8, 1, false, 1, true);
-      runCase(device, queue, pipelines, shape, 4'093, 5, 1, false, kVerifySplits, true);
+      runCase(device, queue, pipelines, shape, 4'093, 5, 1, false, 32, true);
       runCase(device, queue, pipelines, shape, 4'093, 8, 3, false, 65, true);
-      runCase(device, queue, pipelines, shape, 32'768, 7, 1, false, kVerifySplits, true);
+      runCase(device, queue, pipelines, shape, 32'768, 7, 1, false, 32, true);
       runCase(device, queue, pipelines, shape, 32'768, 8, 2, false, 65, true);
       // At a long history the sparse kernels agree with the reference
       // through a list, whose count sets a split's share, and without one,
       // over every block as the page loop attends them (past 64K tokens of
       // full attention the bf16 probabilities' rounding alone moves the
       // output past the cosine bound).
-      runCase(device, queue, pipelines, shape, 131'072, 8, 2, false, kVerifyMaximumSplits, true);
-      runCase(device, queue, pipelines, shape, 65'536, 8, 1, false, kVerifyMaximumSplits);
+      runCase(device, queue, pipelines, shape, 131'072, 8, 2, false, kAttentionMaximumSplits, true);
+      runCase(device, queue, pipelines, shape, 65'536, 8, 1, false, kAttentionMaximumSplits);
     }
   }
   std::cout << "q8_flash_attention_metal_test: ok\n";

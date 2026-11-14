@@ -9,41 +9,12 @@
 
 #include "metal/abi/KvExtent.h"
 
-// stride: rows of one KV head's (and one query group's) chunk staging;
-// equals the store's chunk_stride.
-struct FullPrefillParams {
-  uint32_t tokens;
-  uint32_t stride;
-};
-
-static_assert(sizeof(FullPrefillParams) == 8,
-              "Full attention prefill parameters are 8 bytes on both sides");
-
-// Each lane holds SPLASH_TARGET_VERIFY_ROWS rows in a chunk staging of
-// SPLASH_VERIFY_CHUNK_STRIDE rows.
-struct FullDecodeBatchParams {
-  uint32_t lanes;
-};
-
-static_assert(sizeof(FullDecodeBatchParams) == 4,
-              "Full attention verify parameters are 4 bytes on both sides");
-
 // One full-attention layer's paged KV. Every current row is written directly
-// into its final page slot before attention. Prefill and verify both read
-// all visible history from the same paged representation. Decode accepts rows
-// only by advancing committed_tokens; the next command overwrites rejected
-// slots. Page tables hold one SplashKvPage per logical page, and kv places the
-// layer in the pool's extents; the host sets it for each layer it encodes.
-struct SplashChunkedPrefillParams {
-  uint32_t committed_tokens;
-  uint32_t chunk_tokens;
-  uint32_t chunk_stride;
-  uint32_t page_table_entries;
-  SplashKvLayer kv;
-};
-
-static_assert(sizeof(SplashChunkedPrefillParams) == 24,
-              "Chunked store parameters are 24 bytes on both sides");
+// into its final page slot before attention, and every row reads its visible
+// history from the same paged representation. Decode accepts rows only by
+// advancing committed_tokens; the next command overwrites rejected slots.
+// Page tables hold one SplashKvPage per logical page, and kv places the layer
+// in the pool's extents; the host sets it for each layer it encodes.
 
 // The parts a dense paged-attention tile of a GQA group of `group` query heads
 // per KV head runs in (kernels/common/paged_attention_tile.h
@@ -54,6 +25,7 @@ static_assert(sizeof(SplashChunkedPrefillParams) == 24,
 // 512 threads: both parts read the same pages, the second mostly from cache,
 // and the smaller threadgroups keep more of the GPU busy. More parts are
 // slower again at long histories.
+static_assert(SPLASH_ATTENTION_TILE_ROWS == 8, "a tile's parts divide its eight rows");
 #define SPLASH_ATTENTION_TILE_PARTS(group) \
   ((group) <= 8u ? 1u : (group) <= 16u ? 2u : (group) <= 32u ? 4u : 8u)
 
@@ -65,11 +37,10 @@ static_assert(sizeof(SplashChunkedPrefillParams) == 24,
 // ascending order each block of the tile's history that some row attends, as
 // block << SPLASH_ATTENTION_BLOCK_ROW_BITS | a bit per row of the tile that
 // attends it, in lists of block_stride entries with their counts apart. A
-// sparse split reads list block_list (verify: its lane's), or a prefill tile
-// list block_list + tile; without a stride a tile attends to every block of
-// its history.
+// sequence's sparse tile t reads list block_list + t; without a stride a tile
+// attends to every block of its history.
 #define SPLASH_ATTENTION_BLOCK_TOKENS 4u
-#define SPLASH_ATTENTION_BLOCK_ROW_BITS 8u
+#define SPLASH_ATTENTION_BLOCK_ROW_BITS SPLASH_ATTENTION_TILE_ROWS
 // A sparse split takes at least SPLASH_SPARSE_SPLIT_BLOCKS entries of its
 // tile's list, and a list spreads over at least SPLASH_SPARSE_MINIMUM_SPLITS
 // splits while it gives each a partition unit, so that a lane's split count
@@ -83,12 +54,12 @@ static_assert(SPLASH_MAXIMUM_PHYSICAL_KV_TOKENS / SPLASH_ATTENTION_BLOCK_TOKENS 
 
 // A list's blocks may sit outside the tile's page table (ops::AttentionBlocks
 // locations, the blocks a spilled request's hot block cache holds), which the
-// located verify split reads: a location per entry, in an array of the lists'
+// located split reads: a location per entry, in an array of the lists'
 // shape, names a page of the locations' own page table (location >>
 // SPLASH_ATTENTION_LOCATION_BLOCK_BITS) and the block's place in it (the low
 // bits), or is SPLASH_ATTENTION_PAGED for a block whose page the page table
 // holds, at its own place. The locations' pages hold the layer where the
-// tile's `kv` places it, as the pool's do.
+// dispatch's `kv` places it, as the pool's do.
 #define SPLASH_ATTENTION_PAGED 0xffffffffu
 #define SPLASH_ATTENTION_LOCATION_BLOCK_BITS 3u
 
@@ -97,12 +68,11 @@ static_assert(SPLASH_TARGET_KV_BLOCK_TOKENS / SPLASH_ATTENTION_BLOCK_TOKENS ==
               "A location's low bits hold a block's place in its page");
 
 // The block lists of up to SPLASH_MAXIMUM_BATCH_WIDTH sequences of rows (a
-// verify step's lanes, or a prefill chunk's sequences), in tiles of
-// `tile_rows` rows: sequence s's `rows` rows, whose block masks are rows
-// `mask_row` on of the masks, `mask_words` words each, the first at position
-// `first_position`, its last tile holding the rest; its tile t's entries go
-// to list `list` + t, `stride` entries each. A threadgroup of
-// SPLASH_ATTENTION_BLOCK_LIST_THREADS threads lists one tile.
+// command's), in tiles of `tile_rows` rows: sequence s's `rows` rows, whose
+// block masks are rows `mask_row` on of the masks, `mask_words` words each,
+// the first at position `first_position`, its last tile holding the rest; its
+// tile t's entries go to list `list` + t, `stride` entries each. A
+// threadgroup of SPLASH_ATTENTION_BLOCK_LIST_THREADS threads lists one tile.
 #define SPLASH_ATTENTION_BLOCK_LIST_THREADS 256u
 struct SplashAttentionBlockListSequence {
   uint32_t mask_row;
@@ -122,40 +92,54 @@ struct SplashAttentionBlockListParams {
 static_assert(sizeof(SplashAttentionBlockListParams) == 16 + 16 * SPLASH_MAXIMUM_BATCH_WIDTH,
               "Block list parameters are the same size on both sides");
 
-// Prefill divides each query tile's history into balanced splits: the page
-// loop its visible Page32 pages, a sparse split its block list in whole
-// partition units. Split and reduce use the same count and partition rule.
-struct SplashPrefillAttentionParams {
+// One sequence of an attention layer's dispatches (ops::PagedAttention):
+// `rows` rows at positions from committed_tokens, rows first_row on of the
+// dispatch's rows and row_begin on of the layer's packed projection rows;
+// staged from row stage_row on of each staging, a KV head's rows
+// chunk_stride apart (queries and attention rows [KV head][row][query head
+// in group][dimension], keys [KV head][row][dimension], values [KV head]
+// [dimension][row]), and reading its history through the dispatch's page
+// table `s` (its place among the dispatch's sequences), page_table_entries
+// long. Its tiles of SPLASH_ATTENTION_TILE_ROWS rows are the dispatch's from
+// first_tile on; each splits its pages into split_count balanced runs, whose
+// partials take the slots from first_slot (in a tile's parts) on, and a
+// sparse one, tile t of the sequence, attends through list block_list + t of
+// block_stride entries. Split and reduce use the same count and partition
+// rule.
+struct SplashAttentionSequence {
   uint32_t committed_tokens;
   uint32_t rows;
+  uint32_t first_row;
+  uint32_t row_begin;
+  uint32_t stage_row;
   uint32_t chunk_stride;
   uint32_t page_table_entries;
-  SplashKvLayer kv;
   uint32_t split_count;
+  uint32_t first_tile;
+  uint32_t first_slot;
   uint32_t block_stride;
   uint32_t block_list;
 };
 
-static_assert(sizeof(SplashPrefillAttentionParams) == 36,
-              "Prefill attention parameters are 36 bytes on both sides");
+static_assert(sizeof(SplashAttentionSequence) == 48,
+              "Attention sequences are 48 bytes on both sides");
 
-// A verify lane attends all its SPLASH_TARGET_VERIFY_ROWS rows, which its
-// queries and output hold in SPLASH_VERIFY_CHUNK_STRIDE rows per KV head.
-struct SplashVerifyAttentionParams {
-  uint32_t committed_tokens;
-  uint32_t page_table_entries;
+// A dispatch's sequences, in row order: `rows` and `tiles`, their rows' and
+// tiles' sums, size its grids. Their pages hold the layer where `kv` places
+// it in their extents, the same for every sequence of a dispatch, which the
+// GPU reads once for the whole dispatch: with a placement per sequence, the
+// prompt tiles of two KV heads ran up to 7% slower (M5 Max).
+struct SplashAttentionParams {
+  uint32_t sequences;
+  uint32_t rows;
+  uint32_t tiles;
+  uint32_t padding;
   SplashKvLayer kv;
-  // Filled from the plan: this lane's history-scaled split count and the
-  // plan-wide slot stride that every lane's partials use.
-  uint32_t split_count;
-  uint32_t slot_splits;
-  // The lane's block list, which its sparse split and reduce read.
-  uint32_t block_stride;
-  uint32_t block_list;
+  SplashAttentionSequence sequence[SPLASH_MAXIMUM_BATCH_WIDTH];
 };
 
-static_assert(sizeof(SplashVerifyAttentionParams) == 32,
-              "Verify attention parameters are 32 bytes on both sides");
+static_assert(sizeof(SplashAttentionParams) == 24 + 48 * SPLASH_MAXIMUM_BATCH_WIDTH,
+              "Attention parameters are the same size on both sides");
 
 // A prefill whose history has pages that hold only their index reads one
 // layer's history staged (kernels/shared/kv_stage.metal, ops::PagedAttention::

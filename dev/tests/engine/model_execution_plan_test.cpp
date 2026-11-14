@@ -460,11 +460,13 @@ void checkPrefillAttentionHistory() {
   device.appleGpuFamily = 10;
   device.gpuCoreCount = 20;
   const ops::ExecutionPlans plans(device, ops::Int8Activations::On);
-  model::QwenTargetPrefillSequence sequence;
-  sequence.rows = 300;
+  const uint32_t heads = geometry.target.attentionQueryHeads;
+  const kv::Layout &layout = geometry.target.kvLayout;
   const auto splitsAfter = [&](uint32_t history) {
-    sequence.chunk.committed_tokens = history;
-    return model::prefillAttentionPlan(plans, geometry.target, sequence).splits;
+    const std::array chunk{ops::PagedAttention::chunkParams(history, 300, 320, (history + 300 + 31) / 32)};
+    return plans.attention(chunk, heads, layout, plans.sequenceAttentionWorkspace(heads, layout))
+        .sequences()[0]
+        .splits;
   };
   require(splitsAfter(65'536) > splitsAfter(0), "a chunk's attention plan does not follow its history");
 }

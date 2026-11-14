@@ -75,7 +75,7 @@ class BuildIdentityTests(unittest.TestCase):
         self.assertIn("runtime/metal/abi/ExecutionGeometry.h", inputs)
         self.assertIn("runtime/model/Runtime.cpp", inputs)
         self.assertIn("runtime/metal/kernels/decode/linear_gguf_sgmatrix.metal", inputs)
-        self.assertIn("runtime/metal/kernels/prefill/paged_attention.metal", inputs)
+        self.assertIn("runtime/metal/kernels/shared/paged_attention.metal", inputs)
         self.assertIn("runtime/metal/abi/KernelABI.h", inputs)
         self.assertIn("runtime/metal/kernels/common/paged_attention_tile.h", inputs)
         self.assertIn("dev/tools/build_identity.py", inputs)
@@ -367,13 +367,16 @@ class CompileConfigurationTests(unittest.TestCase):
             root = Path(directory)
             self.build_files(root)
             kernel_root = Path("runtime/metal/kernels")
-            # The Q8 tests' kernels: both phases' attention and store, and the
-            # sparse ones.
+            # The Q8 tests' kernels: the attention and store, and the sparse
+            # ones.
             q8_sources = [
-                kernel_root / phase / name
-                for phase in ("prefill", "decode")
-                for name in ("paged_attention.metal", "paged_attention_store.metal")
-            ] + [kernel_root / "shared/sparse_attention.metal"]
+                kernel_root / "shared" / name
+                for name in (
+                    "paged_attention.metal",
+                    "paged_attention_store.metal",
+                    "sparse_attention.metal",
+                )
+            ]
             # Every test library a MetalBackend loads links the kernel that
             # ends residency; q8-attention.metallib is loaded by raw MTLDevice
             # tests.

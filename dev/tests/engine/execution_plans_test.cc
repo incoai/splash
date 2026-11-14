@@ -8,6 +8,7 @@
 #include <stdexcept>
 #include <string>
 #include <utility>
+#include <vector>
 
 namespace {
 using namespace splash;
@@ -45,6 +46,21 @@ constexpr std::array draftFields{
     &DraftAttentionWorkspace::groupedQueriesBytes,
     &DraftAttentionWorkspace::queryKeysBytes,
     &DraftAttentionWorkspace::queryValuesBytes};
+
+// A sequence of `rows` rows after `history` tokens, staged in whole KV
+// blocks, and decode lanes of 8 rows after each of `histories`.
+kv::ChunkedPrefillParams sequenceOf(uint32_t history, uint32_t rows) {
+  return PagedAttention::chunkParams(history, rows, (rows + 31) / 32 * 32, (history + rows + 31) / 32);
+}
+std::vector<kv::ChunkedPrefillParams> lanesAfter(std::span<const uint32_t> histories) {
+  std::vector<kv::ChunkedPrefillParams> lanes;
+  for (const uint32_t history : histories) lanes.push_back(sequenceOf(history, 8));
+  return lanes;
+}
+// The workspace of `lanes` lanes of `stride`'s each.
+AttentionWorkspace workspaceOf(AttentionWorkspace stride, uint32_t lanes) {
+  return {stride.partialsBytes * lanes, stride.statisticsBytes * lanes};
+}
 
 DeviceCapabilities device(uint32_t family = 10) {
   DeviceCapabilities value;
@@ -89,26 +105,28 @@ void baselinePlans() {
         }
     }
     for (const auto &[queryHeads, kvLayout] : attentionShapes) {
-      const auto memory = plans.prefillAttentionWorkspace(2048, queryHeads, kvLayout);
+      const auto chunk = plans.sequenceAttentionWorkspace(queryHeads, kvLayout);
       for (uint32_t rows = 1; rows <= 2048; ++rows)
-        for (const uint32_t history : {0U, 32768U, 1'000'000U})
-          covers(memory, plans.prefillAttention(rows, history, queryHeads, kvLayout).workspace, 1,
-                 attentionFields);
-      const auto stride = plans.verifyAttentionWorkspacePerLane(queryHeads, kvLayout);
+        for (const uint32_t history : {0U, 32768U, 1'000'000U}) {
+          const std::array sequence{sequenceOf(history, rows)};
+          covers(chunk, plans.attention(sequence, queryHeads, kvLayout, chunk).workspace(), 1, attentionFields);
+        }
+      const auto stride = plans.laneAttentionWorkspace(queryHeads, kvLayout);
       for (uint32_t lanes = 1; lanes <= 4; ++lanes) {
         const std::array<uint32_t, 4> histories{0, 31, 2048, 8192};
-        const auto selected = plans.verifyAttention(lanes, queryHeads, kvLayout,
-                                                    std::span(histories).first(lanes));
-        require(selected.splits == 32, "verify baseline changed");
-        covers(stride, selected.workspace, lanes, attentionFields);
+        const auto chunks = lanesAfter(std::span(histories).first(lanes));
+        const auto selected = plans.attention(chunks, queryHeads, kvLayout, workspaceOf(stride, lanes));
+        require(std::ranges::all_of(selected.sequences(), [](const auto &lane) { return lane.splits == 32; }) &&
+                    selected.dispatches().size() == 1,
+                "a decode step's lanes no longer attend in one dispatch of 32 splits");
+        covers(stride, selected.workspace(), lanes, attentionFields);
       }
       {
         const std::array<uint32_t, 1> deep{131072};
-        const auto scaled = plans.verifyAttention(1, queryHeads, kvLayout, deep);
-        require(scaled.splits == kv::kVerifyMaximumSplits &&
-                    scaled.laneSplits[0] == scaled.splits,
-                "verify splits did not scale with history");
-        covers(stride, scaled.workspace, 1, attentionFields);
+        const auto scaled = plans.attention(lanesAfter(deep), queryHeads, kvLayout, stride);
+        require(scaled.sequences()[0].splits == kv::kAttentionMaximumSplits,
+                "a decode lane's splits did not scale with history");
+        covers(stride, scaled.workspace(), 1, attentionFields);
       }
     }
     for (auto shape : draftShapes) {
@@ -157,10 +175,14 @@ void int8ActivationsSetting() {
     require(tile(on) == (int8 ? LinearTile::GgufPrefillInt8 : LinearTile::GgufPrefill) &&
                 tile(off) == LinearTile::GgufPrefill,
             "the int8 prefill tile does not follow the int8-activation setting");
-    require(int8Queries(on.prefillAttention(64, 32768, 16, layout).splitPipeline) == int8 &&
-                !int8Queries(off.prefillAttention(64, 32768, 16, layout).splitPipeline) &&
-                int8Queries(on.verifyAttention(1, 16, layout, history).splitPipeline) == int8 &&
-                !int8Queries(off.verifyAttention(1, 16, layout, history).splitPipeline),
+    const auto queries = [&](const ExecutionPlans &plans, kv::ChunkedPrefillParams sequence) {
+      const std::array sequences{sequence};
+      const auto plan = plans.attention(sequences, 16, layout,
+                                        plans.sequenceAttentionWorkspace(16, layout));
+      return int8Queries(plan.splitPipeline());
+    };
+    require(queries(on, sequenceOf(32768, 64)) == int8 && !queries(off, sequenceOf(32768, 64)) &&
+                queries(on, sequenceOf(history[0], 8)) == int8 && !queries(off, sequenceOf(history[0], 8)),
             "INT8 attention queries do not follow the int8-activation setting");
   }
 }
@@ -240,10 +262,11 @@ void ggufMoePlans() {
           "invalid MoE expert tile configuration", "a decode plan took 32-row tiles");
 }
 
-// A dense prefill tile's history splits follow the device's pages per split
-// (KernelCalibration.hpp): one per 64 pages on Apple9 GPUs of 10 cores or
-// fewer, one per 32 elsewhere. Qwen3.6-35B-A3B's attention: a 512-row chunk
-// after 4K tokens (144 pages) and a 64-row chunk after 32K (1026 pages).
+// A dense tile of a sequence of more than one tile takes a history split per
+// the device's pages per split (KernelCalibration.hpp): one per 64 pages on
+// Apple9 GPUs of 10 cores or fewer, one per 32 elsewhere. Qwen3.6-35B-A3B's
+// attention: a 512-row chunk after 4K tokens (144 pages), at most 4 splits a
+// tile of its 64, and a 64-row chunk after 32K (1026 pages), at most 32.
 void prefillSplitsFollowTheDeviceRow() {
   const kv::Layout layout{1, 2, 256};
   struct Expected final {
@@ -253,8 +276,12 @@ void prefillSplitsFollowTheDeviceRow() {
     for (const auto [family, cores] : {std::pair{9U, 10U}, {9U, 1U}, {9U, 11U}, {9U, 40U}, {10U, 12U}, {10U, 32U}}) {
       DeviceCapabilities capabilities = device(family);
       capabilities.gpuCoreCount = cores;
+      const ExecutionPlans plans(capabilities, Int8Activations::On);
+      const std::array sequence{sequenceOf(history, rows)};
       const uint32_t splits =
-          ExecutionPlans(capabilities, Int8Activations::On).prefillAttention(rows, history, 16, layout).splits;
+          plans.attention(sequence, 16, layout, plans.sequenceAttentionWorkspace(16, layout))
+              .sequences()[0]
+              .splits;
       require(splits == (family == 9 && cores <= 10 ? small : other),
               "a prefill attention plan of family " + std::to_string(family) + ", " + std::to_string(cores) +
                   " cores took " + std::to_string(splits) + " splits");
@@ -284,19 +311,16 @@ void unknownCoreCount() {
 
 void workspaceBounds() {
   const ExecutionPlans plans(device(), Int8Activations::On);
-  const std::array<uint32_t, 4> histories{31, 32, 2049, std::numeric_limits<uint32_t>::max()};
-  rejects([&] { (void)plans.verifyAttention(3, 24, attentionShapes[0].layout, histories); },
-          "invalid verify attention history vector", "a verify plan took more histories than lanes");
-  const auto exact =
-      plans.verifyAttention(3, 24, attentionShapes[0].layout, std::span(histories).first(3));
-  require(exact.laneSplits[3] == 0 && exact.splits == kv::verifyAttentionSplits(2049),
-          "verify policy did not resolve one history per lane");
-  const auto verify = plans.verifyAttentionWorkspacePerLane(24, attentionShapes[0].layout);
+  const std::array<uint32_t, 3> histories{31, 32, 32769};
+  const auto verify = plans.laneAttentionWorkspace(24, attentionShapes[0].layout);
+  const auto exact = plans.attention(lanesAfter(histories), 24, attentionShapes[0].layout, workspaceOf(verify, 3));
+  require(exact.sequences().size() == 3 && exact.sequences()[1].splits == 32 && exact.sequences()[2].splits == 65,
+          "a decode step's plan did not resolve one history per lane");
   require(verify.partialsBytes ==
-                  uint64_t{8} * kv::kVerifyMaximumSplits * 24 * 256 * 4 &&
+                  uint64_t{8} * kv::kAttentionMaximumSplits * 24 * 256 * 4 &&
               verify.statisticsBytes ==
-                  uint64_t{8} * kv::kVerifyMaximumSplits * 24 * 2 * 4,
-          "verify workspace does not cover the maximum split count");
+                  uint64_t{8} * kv::kAttentionMaximumSplits * 24 * 2 * 4,
+          "a decode lane's workspace does not cover the maximum split count");
   // 65 tiles of 8 grouped rows per lane at every width.
   const auto moe = plans.moeDecodeWorkspacePerLane(routedShape, kRouterFormat);
   require(moe.groupedInputBytes == 2129920 && moe.expertOutputBytes == 2129920 &&
@@ -318,19 +342,17 @@ void workspaceBounds() {
 void invalidLookupsAndContextEdges() {
   const ExecutionPlans plans(device(), Int8Activations::On);
   const auto kvLayout = attentionShapes[0].layout;
-  const std::array<uint32_t, 4> histories{0, 1, 2, 3};
-  for (const uint32_t lanes : {0U, UINT32_MAX})
-    rejects([&] { (void)plans.verifyAttention(lanes, 24, kvLayout, histories); },
-            "invalid attention workspace batch width", "a verify plan of no lanes or past a batch was accepted");
-  rejects([&] { (void)plans.verifyAttention(3, 24, kvLayout, std::span(histories).first(2)); },
-          "invalid verify attention history vector", "a verify plan without a history per lane was accepted");
-  rejects([&] { (void)plans.verifyAttention(1, 24, {}, std::span(histories).first(1)); },
-          "no KV store kernel for layout", "a verify plan of an empty KV layout was accepted");
-  rejects([&] { (void)plans.prefillAttention(1, 0, 24, {}); }, "no KV store kernel for layout",
-          "a prefill plan of an empty KV layout was accepted");
-  for (const uint32_t rows : {0U, UINT32_MAX})
-    rejects([&] { (void)plans.prefillAttentionWorkspace(rows, 24, kvLayout); },
-            "invalid attention workspace rows", "a prefill workspace of no rows or past the budget was accepted");
+  const auto workspace = workspaceOf(plans.laneAttentionWorkspace(24, kvLayout), 4);
+  const std::array<uint32_t, 5> histories{0, 1, 2, 3, 4};
+  for (const size_t lanes : {size_t{0}, histories.size()})
+    rejects([&] { (void)plans.attention(lanesAfter(std::span(histories).first(lanes)), 24, kvLayout, workspace); },
+            "invalid attention sequences", "an attention of no sequences or past a batch was accepted");
+  rejects([&] { (void)plans.attention(lanesAfter(std::span(histories).first(1)), 24, {}, workspace); },
+          "no KV store kernel for layout", "an attention plan of an empty KV layout was accepted");
+  rejects([&] { (void)plans.attention(lanesAfter(std::span(histories).first(1)), 24, kvLayout, {}); },
+          "the attention workspace holds no sequence's splits", "an attention plan without a workspace was accepted");
+  rejects([&] { (void)PagedAttention::workspace(0, 24, kvLayout); }, "invalid attention workspace slots",
+          "a workspace of no tile splits was accepted");
   for (const uint32_t lanes : {UINT32_MAX, 0U})
     rejects([&] { (void)plans.moeDecode(routedShape, kRouterFormat, lanes); }, "invalid MoE decode width",
             "a MoE decode of no lanes or past a batch was accepted");
@@ -341,13 +363,12 @@ void invalidLookupsAndContextEdges() {
   rejects([&] { (void)plans.draftAttentionWorkspacePerLane({}); },
           "unsupported compiled draft attention shape", "a draft workspace of an empty shape was accepted");
   std::array<uint32_t, 1> edge{kv::kMaximumPhysicalTokens - 8};
-  const auto finalVerify = plans.verifyAttention(1, 24, kvLayout, edge);
-  require(finalVerify.splits == kv::kVerifyMaximumSplits,
-          "valid final physical verify rows were rejected");
+  const auto finalVerify = plans.attention(lanesAfter(edge), 24, kvLayout, workspace);
+  require(finalVerify.sequences()[0].splits == kv::kAttentionMaximumSplits,
+          "valid final physical decode rows were rejected");
   ++edge[0];
-  rejects([&] { (void)plans.verifyAttention(1, 24, kvLayout, edge); },
-          "verify attention history exceeds physical context",
-          "verify rows past the physical context were accepted");
+  rejects([&] { (void)lanesAfter(edge); }, "context_out_of_range",
+          "decode rows past the physical context were accepted");
 }
 } // namespace
 

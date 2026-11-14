@@ -52,18 +52,11 @@ std::vector<uint32_t> ExecutionPlans::prefillRowClasses() const {
   return first;
 }
 
-PrefillAttentionPlan ExecutionPlans::prefillAttention(
-    uint32_t rows, uint32_t historyTokens, uint32_t queryHeads, kv::Layout layout,
-    AttentionVariant variant) const {
-  return PagedAttention::prefillPlan(rows, historyTokens, queryHeads, layout, calibration().attention,
-                                     linear_.int8Activations(), variant);
-}
-
-VerifyAttentionPlan ExecutionPlans::verifyAttention(
-    uint32_t lanes, uint32_t queryHeads, kv::Layout layout,
-    std::span<const uint32_t> historyTokens, AttentionVariant variant) const {
-  return PagedAttention::verifyPlan(lanes, queryHeads, layout, historyTokens, calibration().attention,
-                                    linear_.int8Activations(), variant);
+AttentionPlan ExecutionPlans::attention(std::span<const kv::ChunkedPrefillParams> sequences, uint32_t queryHeads,
+                                        kv::Layout layout, AttentionWorkspace capacity,
+                                        AttentionVariant variant) const {
+  return PagedAttention::plan(sequences, queryHeads, layout, calibration().attention, linear_.int8Activations(),
+                              capacity, variant);
 }
 
 DraftAttentionPlan ExecutionPlans::draftAttention(DraftAttentionShape shape,
@@ -83,15 +76,12 @@ MoePlan ExecutionPlans::moeDecode(MoeShape shape, uint32_t routerFormat, uint32_
                          selectMoe(calibration(), shape, routerFormat, lanes * kDecodeRows, MoePhase::Decode));
 }
 
-AttentionWorkspace ExecutionPlans::prefillAttentionWorkspace(
-    uint32_t maximumRows, uint32_t queryHeads, kv::Layout layout) const {
-  return PagedAttention::prefillWorkspace(maximumRows, queryHeads, layout);
+AttentionWorkspace ExecutionPlans::sequenceAttentionWorkspace(uint32_t queryHeads, kv::Layout layout) const {
+  return PagedAttention::workspace(kAttentionSequenceSplits, queryHeads, layout);
 }
 
-// The verify bound is linear in the lanes: one lane's is every width's share.
-AttentionWorkspace ExecutionPlans::verifyAttentionWorkspacePerLane(
-    uint32_t queryHeads, kv::Layout layout) const {
-  return PagedAttention::verifyWorkspace(1, queryHeads, layout);
+AttentionWorkspace ExecutionPlans::laneAttentionWorkspace(uint32_t queryHeads, kv::Layout layout) const {
+  return PagedAttention::workspace(kv::kAttentionMaximumSplits, queryHeads, layout);
 }
 
 // The draft workspace is linear in the lanes: one lane's is every width's

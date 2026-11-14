@@ -97,7 +97,7 @@ using Lanes = std::vector<std::shared_ptr<const KvPageSources>>;
 std::vector<std::vector<uint32_t>> resolve(MetalBackend &backend, KvBlockCache &cache, uint32_t layer,
                                            const Lanes &lanes, const std::vector<std::vector<uint32_t>> &blocks,
                                            const std::shared_ptr<KvReadStats> &stats) {
-  constexpr uint32_t kRows = kv::kVerifyRows;
+  constexpr uint32_t kRows = SPLASH_TARGET_VERIFY_ROWS;
   uint32_t history = 0;
   for (const std::vector<uint32_t> &list : blocks)
     if (!list.empty()) history = std::max(history, (list.back() + 1) * SPLASH_ATTENTION_BLOCK_TOKENS);
@@ -565,7 +565,7 @@ template <typename T> void overwrite(const test::AttentionFixture &fixture, uint
 
 template <typename T> void attendsThroughLocations(MetalBackend &backend, kv::Format format) {
   using Tensor = test::AttentionFixturePlan::Tensor;
-  constexpr uint32_t kQueryHeads = 24, kLayer = 1, kRows = kv::kVerifyRows, kTokens = SPLASH_ATTENTION_BLOCK_TOKENS;
+  constexpr uint32_t kQueryHeads = 24, kLayer = 1, kRows = SPLASH_TARGET_VERIFY_ROWS, kTokens = SPLASH_ATTENTION_BLOCK_TOKENS;
   const kv::Layout layout = layoutOf(format);
   const test::AttentionShape shape{kQueryHeads, layout.kvHeads, layout.headDimension, format, true};
   const test::AttentionFixturePlan::Histories histories{1503, 1219};
@@ -574,13 +574,15 @@ template <typename T> void attendsThroughLocations(MetalBackend &backend, kv::Fo
   attended.attentionLayers = 1;
   attended.indexDimension = 0;
   const test::AttentionFixturePlan plan = test::AttentionFixturePlan::make(
-      shape, lanes, kRows, histories, ops::PagedAttention::verifyWorkspace(lanes, kQueryHeads, attended),
+      shape, lanes, kRows, histories,
+      ops::PagedAttention::workspace(lanes * kv::kAttentionMaximumSplits, kQueryHeads, attended),
       {.poolLayers = layout.attentionLayers, .layer = kLayer, .extentPages = kExtentPages});
   test::AttentionFixture fixture(backend, plan, "kv-block-cache-test");
   fixture.fill();
-  const ops::VerifyAttentionPlan verify = ops::PagedAttention::verifyPlan(
-      lanes, kQueryHeads, plan.layout(), std::span(histories).first(lanes), ops::kApple10Attention,
-      ops::Int8Activations::On);
+  const auto chunks = fixture.sequences();
+  const ops::AttentionPlan verify =
+      ops::PagedAttention::plan(std::span(chunks).first(lanes), kQueryHeads, plan.layout(), ops::kApple10Attention,
+                                ops::Int8Activations::On, fixture.workspace());
   // Each row of lane 0 selects every other block of its history besides its
   // own, as QSA's lists do (masks of each lane's rows, a bit a block); lane
   // 1's rows select blocks 1, 2 and 5 of each page, so that a page's read

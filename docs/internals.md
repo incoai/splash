@@ -426,8 +426,8 @@ the exact rule.
 A prefill command's last layer outputs only the rows something reads: one row
 per sequence, its last (the head's input and the finiteness check), unless the
 draft reads that layer. Every row still writes its KV. The tile that holds each
-read row attends as a chunk of its own on the chunk's split count
-(`PagedAttention::prefillTail`), and its gate, o-projection, norm and FFN run
+read row attends on its sequence's split count and kernels
+(`PagedAttention::lastTiles`), and its gate, o-projection, norm and FFN run
 on the read rows compacted, on the chunk's projection configurations
 (`Linear::plan` of a chunk's rows), so a dense target's read rows keep
 their bits where the GPU runs the layer. A MoE block runs the plan of the read
@@ -529,16 +529,20 @@ The rules:
    32-row tiles beyond. One plan per step serves every block, so its router
    follows rule 3 in the format of most blocks' routers (`ops::moeRouterFormat`).
 5. *Attention.* The kernels follow how a layout reads its pages
-   (`kv::Layout::reads`, below). A dense prefill tile takes one history split
-   per `AttentionCalibration::prefillPagesPerSplit` pages its rows read (32,
-   and 64 on Apple9 GPUs of 10 cores or fewer, where 32 made one measured case
-   slower than the shared splits), between the splits shared out over the
-   chunk's tiles and the longest chunk's tiles' ceiling (`PagedAttention.cpp`);
-   a sparse tile reads its list's blocks and keeps the shared splits. With
-   int8 activations on, over INT8 pages a dense split scores INT8 queries
-   (`q8q`) from `AttentionCalibration::int8QueriesFromPages` pages a split of
-   the longest tile or lane reads (8 on Apple10; never on Apple9, whose matrix
-   operations share the FP32 pipe); a verify's lanes share the choice.
+   (`kv::Layout::reads`, below). A sequence of one tile, a decode lane's,
+   takes one history split per 16 pages its rows read, between 32 and 128.
+   Each tile of a longer sequence takes one per
+   `AttentionCalibration::prefillPagesPerSplit` pages its rows read (32, and
+   64 on Apple9 GPUs of 10 cores or fewer, where 32 made one measured case
+   slower than the shared splits), at least 32 shared out over the
+   sequence's tiles and at most 32, nor 256 over its tiles (`PagedAttention.cpp`
+   `attentionSplits`): as many as a tile alone takes made sequences of two to
+   four tiles slower. A sparse sequence of more than one tile reads its
+   lists' blocks and keeps the shared splits. With int8
+   activations on, over INT8 pages a dense split scores INT8 queries (`q8q`)
+   from `AttentionCalibration::int8QueriesFromPages` pages a split of the
+   command's longest tile reads (8 on Apple10; never on Apple9, whose matrix
+   operations share the FP32 pipe); a command's sequences share the choice.
 
 The register-against-staged boundaries are measured table entries, not a
 cost model: the wave law, which describes the Apple10 staged tiles, does not
@@ -980,15 +984,20 @@ device's plans; `GGUF_MOE_ARGS='repack'` times the repack of streamed experts in
 (`moe_expert_load`, 1 to 32 jobs) and of tensors into an image (`gguf_repack`) in the streamed
 formats, each plane checked bytewise against the reference repack.
 
-Target attention runs the geometries of `kCompiledAttention` (`runtime/ops/PagedAttention.cpp`):
+Target attention runs once a layer for every sequence of a command, a decode step's lanes of 8
+rows as a prompt chunk's sequences (`ops::PagedAttention`, `SplashAttentionSequence`): one q/k
+projection, one store and one gate over all their rows, each sequence's staged after the one
+before it, and a split and a reduce for each run of sequences whose tiles' splits fit the
+workspace (`ops::AttentionPlan`), each sequence's split count its own rows' and history's. It
+runs the geometries of `kCompiledAttention` (`runtime/ops/PagedAttention.cpp`):
 query heads over KV heads of a head dimension (`_d128` in the names of 128-wide heads' kernels;
 256 is unnamed) in a value order, each compiled with the variants its layers take, which a layer
 selects with an `ops::AttentionVariant`. Its queries and keys are rotated by the geometry's
 RoPE, or not (NoPE: `qkv…_nope`, which binds no tables); and each row attends its whole history,
 or a window of the keys before it (`…_w512`: a row at position p attends p − 512 to p). A
 windowed split and reduce start at the page of their tile's first row's window start
-(`splash_attention_first_page`), each row masking the keys before its own, and a windowed verify
-lane's or prefill tile's splits stop at the 18 pages such a window reads
+(`splash_attention_first_page`), each row masking the keys before its own, and a windowed tile's
+splits stop at the 18 pages such a window reads
 (`kv::windowAttentionPages`). Over INT8 pages each dense split kernel (`…q8_split…`) also has a
 `…q8q_split…` entry, `q8q` for INT8 queries: it quantizes its tile's queries once (absmax / 127
 per row, by the int8-activation rule) and scores them against the INT8 keys (kernel selection,

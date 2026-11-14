@@ -30,12 +30,9 @@ namespace {
 
 constexpr uint32_t kQueryHeads = 24;
 constexpr uint32_t kQueryHeadsPerKvHead = 6;
-constexpr std::string_view kChunkedPrefillStorePipeline =
-    "prefill_attention_q8_store";
-constexpr std::string_view kPrefillAttentionSplitPipeline =
-    "prefill_attention_q8_split";
-constexpr std::string_view kPrefillAttentionReducePipeline =
-    "prefill_attention_reduce";
+constexpr std::string_view kChunkedPrefillStorePipeline = "attention_q8_store";
+constexpr std::string_view kPrefillAttentionSplitPipeline = "attention_q8_split";
+constexpr std::string_view kPrefillAttentionReducePipeline = "attention_reduce";
 struct AttentionPipelines {
   id<MTLComputePipelineState> split;
   id<MTLComputePipelineState> reduce;
@@ -151,6 +148,8 @@ struct Pool {
 
 struct Case {
   ChunkedPrefillParams params;
+  // The layer's place in the pool's extents.
+  SplashKvLayer layer{};
   // Page ids, and their entries for the kernels.
   std::vector<uint32_t> pageTable;
   id<MTLBuffer> pageTableBuffer;
@@ -186,8 +185,8 @@ Case makeCase(id<MTLDevice> device, uint32_t committed, uint32_t chunk,
   const auto geometry = HostKvExtents::spread(2 * pages + 1);
   result.pool = std::make_unique<Pool>(device, geometry);
   result.pageTable = HostKvExtents::mixedPages(geometry, pages, committed + chunk);
-  result.params = {committed, chunk, stride, pages,
-                   result.pool->pages->layer(kLayer)};
+  result.params = {committed, chunk, stride, pages};
+  result.layer = result.pool->pages->layer(kLayer);
   require(chunkedPrefillValidationError(result.params).empty(),
           "invalid generated params");
   result.pageTableBuffer = makeBuffer(device, pages * sizeof(SplashKvPage));
@@ -199,8 +198,8 @@ Case makeCase(id<MTLDevice> device, uint32_t committed, uint32_t chunk,
   uint64_t queryElements = uint64_t{kQueryHeads} * stride * kHeadDimension;
   result.queries = makeBuffer(device, queryElements * sizeof(BFloat16Bits));
   result.output = makeBuffer(device, queryElements * sizeof(BFloat16Bits));
-  const auto workspace = splash::ops::PagedAttention::prefillWorkspace(
-      chunk, kQueryHeads, {1, kKvHeads, kHeadDimension});
+  const auto workspace = splash::ops::PagedAttention::workspace(splash::ops::kAttentionSequenceSplits, kQueryHeads,
+                                                               {1, kKvHeads, kHeadDimension});
   result.partials = makeBuffer(device, workspace.partialsBytes);
   result.statistics = makeBuffer(device, workspace.statisticsBytes);
   return result;
@@ -272,13 +271,41 @@ void fillCurrent(Case &data, uint32_t variant = 0, uint32_t queryOffset = 0) {
   }
 }
 
+// The case's rows as a dispatch's one sequence (SplashAttentionParams), its
+// tiles taking `splits` history splits each.
+SplashAttentionParams sequenceParams(const Case &data, uint32_t splits = 0) {
+  SplashAttentionParams params{.sequences = 1, .rows = data.params.chunk_tokens,
+                               .tiles = attentionTiles(data.params.chunk_tokens), .padding = 0, .kv = data.layer,
+                               .sequence = {}};
+  params.sequence[0] = {.committed_tokens = data.params.committed_tokens,
+                        .rows = data.params.chunk_tokens,
+                        .first_row = 0,
+                        .row_begin = 0,
+                        .stage_row = 0,
+                        .chunk_stride = data.params.chunk_stride,
+                        .page_table_entries = data.params.page_table_entries,
+                        .split_count = splits,
+                        .first_tile = 0,
+                        .first_slot = 0,
+                        .block_stride = 0,
+                        .block_list = 0};
+  return params;
+}
+
+// A dispatch of one sequence binds its page table in every sequence's place.
+void setPageTables(id<MTLComputeCommandEncoder> encoder, id<MTLBuffer> table, NSUInteger first) {
+  for (NSUInteger index = first; index < first + SPLASH_MAXIMUM_BATCH_WIDTH; ++index)
+    [encoder setBuffer:table offset:0 atIndex:index];
+}
+
 void encodeStore(id<MTLComputeCommandEncoder> encoder,
                  id<MTLComputePipelineState> pipeline, const Case &data) {
+  const SplashAttentionParams params = sequenceParams(data);
   [encoder setComputePipelineState:pipeline];
   [encoder setBuffer:data.chunkKeys offset:0 atIndex:0];
   [encoder setBuffer:data.chunkValues offset:0 atIndex:1];
-  [encoder setBuffer:data.pageTableBuffer offset:0 atIndex:2];
-  [encoder setBytes:&data.params length:sizeof(data.params) atIndex:3];
+  setPageTables(encoder, data.pageTableBuffer, 2);
+  [encoder setBytes:&params length:sizeof(params) atIndex:6];
   data.pool->use(encoder, MTLResourceUsageWrite);
   [encoder dispatchThreadgroups:MTLSizeMake(
                                      2 * kKvHeads * data.params.chunk_tokens,
@@ -286,36 +313,40 @@ void encodeStore(id<MTLComputeCommandEncoder> encoder,
              threadsPerThreadgroup:MTLSizeMake(kHeadDimension, 1, 1)];
 }
 
+// The case's plan in a prompt chunk's workspace.
+splash::ops::AttentionPlan planOf(const Case &data) {
+  const std::array sequence{data.params};
+  const splash::kv::Layout layout{1, kKvHeads, kHeadDimension};
+  return splash::ops::PagedAttention::plan(
+      sequence, kQueryHeads, layout, splash::ops::kApple10Attention, splash::ops::Int8Activations::Off,
+      splash::ops::PagedAttention::workspace(splash::ops::kAttentionSequenceSplits, kQueryHeads, layout));
+}
+
 void encodeAttention(id<MTLComputeCommandEncoder> encoder,
                      const AttentionPipelines &pipelines, const Case &data,
-                     const PrefillAttentionParams *overrideParams = nullptr) {
-  const auto plan = splash::ops::PagedAttention::prefillPlan(
-      data.params.chunk_tokens, data.params.committed_tokens, kQueryHeads, {1, kKvHeads, kHeadDimension},
-      splash::ops::kApple10Attention, splash::ops::Int8Activations::Off);
-  require(plan.workspace.partialsBytes <= data.partials.length &&
-              plan.workspace.statisticsBytes <= data.statistics.length,
+                     const SplashAttentionParams *overrideParams = nullptr) {
+  const auto plan = planOf(data);
+  require(plan.workspace().partialsBytes <= data.partials.length &&
+              plan.workspace().statisticsBytes <= data.statistics.length,
           "attention splits exceed the shared arena");
-  const PrefillAttentionParams params = overrideParams ? *overrideParams :
-      PrefillAttentionParams{data.params.committed_tokens, data.params.chunk_tokens,
-                              data.params.chunk_stride, data.params.page_table_entries,
-                              data.params.kv, plan.splits, 0, 0};
+  const SplashAttentionParams params =
+      overrideParams ? *overrideParams : sequenceParams(data, plan.sequences()[0].splits);
+  const auto split = plan.splitGroups(plan.dispatches()[0]), reduce = plan.reduceGroups(plan.dispatches()[0]);
   [encoder setComputePipelineState:pipelines.split];
   [encoder setBuffer:data.queries offset:0 atIndex:0];
   [encoder setBuffer:data.partials offset:0 atIndex:1];
   [encoder setBuffer:data.statistics offset:0 atIndex:2];
-  [encoder setBuffer:data.pageTableBuffer offset:0 atIndex:3];
-  [encoder setBytes:&params length:sizeof(params) atIndex:4];
+  setPageTables(encoder, data.pageTableBuffer, 3);
+  [encoder setBytes:&params length:sizeof(params) atIndex:7];
   data.pool->use(encoder, MTLResourceUsageRead);
-  [encoder dispatchThreadgroups:MTLSizeMake(plan.splitGroups.x, plan.splitGroups.y,
-                                           plan.splitGroups.z)
+  [encoder dispatchThreadgroups:MTLSizeMake(split.x, split.y, split.z)
              threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
   [encoder setComputePipelineState:pipelines.reduce];
   [encoder setBuffer:data.partials offset:0 atIndex:0];
   [encoder setBuffer:data.statistics offset:0 atIndex:1];
   [encoder setBuffer:data.output offset:0 atIndex:2];
   [encoder setBytes:&params length:sizeof(params) atIndex:3];
-  [encoder dispatchThreadgroups:MTLSizeMake(plan.reduceGroups.x, plan.reduceGroups.y,
-                                           plan.reduceGroups.z)
+  [encoder dispatchThreadgroups:MTLSizeMake(reduce.x, reduce.y, reduce.z)
              threadsPerThreadgroup:MTLSizeMake(kHeadDimension, 1, 1)];
 }
 
@@ -457,8 +488,8 @@ std::vector<uint32_t> chunkReferenceRows(const Case &data) {
   // Both sides of a query-tile boundary and the first/last Page32 causal
   // boundaries in this chunk. Keep long-history scalar work bounded to nine
   // rows; the caller still checks every active output and inactive guard.
-  add(kPrefillAttentionTileRows - 1);
-  add(kPrefillAttentionTileRows);
+  add(kAttentionTileRows - 1);
+  add(kAttentionTileRows);
   const uint32_t firstPageEnd = kPageTokens - 1 - committed % kPageTokens;
   add(firstPageEnd);
   add(firstPageEnd + 1);
@@ -606,7 +637,7 @@ void testChunkReference(id<MTLDevice> device, id<MTLCommandQueue> queue,
           output, output + data.output.length / sizeof(BFloat16Bits));
       // The reduction writes every row of the chunk's query tiles, zeros
       // past the chunk, and nothing beyond them.
-      const uint32_t tiledRows = prefillAttentionTiles(chunk) * kPrefillAttentionTileRows;
+      const uint32_t tiledRows = attentionTiles(chunk) * kAttentionTileRows;
       const auto validateCoverage = [&] {
         for (uint32_t head = 0; head < kQueryHeads; ++head)
           for (uint32_t row = 0; row < rows; ++row)
@@ -696,17 +727,11 @@ void testChunkReference(id<MTLDevice> device, id<MTLCommandQueue> queue,
 void testInvalidAttentionParams(id<MTLDevice> device, id<MTLCommandQueue> queue,
                                 const AttentionPipelines &attention) {
   Case data = makeCase(device, 33, 17, 32);
-  const auto plan = splash::ops::PagedAttention::prefillPlan(
-      data.params.chunk_tokens, data.params.committed_tokens, kQueryHeads, {1, kKvHeads, kHeadDimension},
-      splash::ops::kApple10Attention, splash::ops::Int8Activations::Off);
-  const PrefillAttentionParams valid{
-      data.params.committed_tokens, data.params.chunk_tokens,
-      data.params.chunk_stride, data.params.page_table_entries,
-      data.params.kv, plan.splits, 0, 0};
+  const SplashAttentionParams valid = sequenceParams(data, planOf(data).sequences()[0].splits);
   for (uint32_t invalidField = 0; invalidField < 3; ++invalidField) {
     auto params = valid;
-    if (invalidField == 0) params.split_count = 0;
-    if (invalidField == 1) params.split_count = 33;
+    if (invalidField == 0) params.sequence[0].split_count = 0;
+    if (invalidField == 1) params.sequence[0].split_count = kAttentionMaximumSplits + 1;
     if (invalidField == 2) params.kv.extent_pages = 0;
     for (id<MTLBuffer> buffer : {data.partials, data.statistics, data.output})
       std::memset(buffer.contents, 0xa5, buffer.length);
@@ -762,8 +787,10 @@ void testCommitIndexOverwrite(id<MTLDevice> device,
   }
 }
 
-void testBatchedVerifyStore(id<MTLDevice> device, id<MTLCommandQueue> queue,
-                            id<MTLComputePipelineState> store) {
+// One store of four lanes' eight rows, lane after lane: each lane's rows
+// and staging follow the lanes' before it, its page table its own.
+void testBatchedStore(id<MTLDevice> device, id<MTLCommandQueue> queue,
+                      id<MTLComputePipelineState> store) {
   constexpr uint32_t lanes = 4;
   constexpr uint32_t committed = 31;
   constexpr uint32_t rows = 8;
@@ -780,13 +807,25 @@ void testBatchedVerifyStore(id<MTLDevice> device, id<MTLCommandQueue> queue,
   const std::vector<uint32_t> ids =
       HostKvExtents::mixedPages(geometry, 2 * lanes, lanes);
 
-  std::array<ChunkedPrefillParams, lanes> params{};
+  SplashAttentionParams params{.sequences = lanes, .rows = lanes * rows, .tiles = lanes, .padding = 0,
+                               .kv = pool.pages->layer(kLayer), .sequence = {}};
   std::array<std::array<uint32_t, 2>, lanes> tables{};
   std::array<id<MTLBuffer>, lanes> tableBuffers{};
   auto *keys = static_cast<BFloat16Bits *>(chunkKeys.contents);
   auto *values = static_cast<BFloat16Bits *>(chunkValues.contents);
   for (uint32_t lane = 0; lane < lanes; ++lane) {
-    params[lane] = {committed, rows, stride, 2, pool.pages->layer(kLayer)};
+    params.sequence[lane] = {.committed_tokens = committed,
+                             .rows = rows,
+                             .first_row = lane * rows,
+                             .row_begin = lane * rows,
+                             .stage_row = lane * kKvHeads * stride,
+                             .chunk_stride = stride,
+                             .page_table_entries = 2,
+                             .split_count = 0,
+                             .first_tile = lane,
+                             .first_slot = 0,
+                             .block_stride = 0,
+                             .block_list = 0};
     tables[lane] = {ids[lane * 2], ids[lane * 2 + 1]};
     tableBuffers[lane] = makeBuffer(device, 2 * sizeof(SplashKvPage));
     pool.pages->writeTable(tables[lane], tableBuffers[lane].contents);
@@ -814,7 +853,7 @@ void testBatchedVerifyStore(id<MTLDevice> device, id<MTLCommandQueue> queue,
   [encoder setBuffer:chunkValues offset:0 atIndex:1];
   for (uint32_t lane = 0; lane < lanes; ++lane)
     [encoder setBuffer:tableBuffers[lane] offset:0 atIndex:2 + lane];
-  [encoder setBytes:params.data() length:sizeof(params) atIndex:6];
+  [encoder setBytes:&params length:sizeof(params) atIndex:6];
   pool.use(encoder, MTLResourceUsageWrite);
   [encoder dispatchThreadgroups:MTLSizeMake(
                                      lanes * 2 * rows * kKvHeads, 1, 1)
@@ -846,7 +885,7 @@ void testBatchedVerifyStore(id<MTLDevice> device, id<MTLCommandQueue> queue,
             slab(valueTensor ? SPLASH_KV_VALUE_SCALES : SPLASH_KV_KEY_SCALES))[
             splash_kv_scale_element(0, pageToken)];
         require(std::abs(expectedScale - observedScale) <= 2e-7f,
-                "batched verify store scale differs");
+                "batched store scale differs");
         for (uint32_t dimension = 0; dimension < kHeadDimension;
              ++dimension) {
           const int8_t expected = static_cast<int8_t>(std::clamp(
@@ -858,7 +897,7 @@ void testBatchedVerifyStore(id<MTLDevice> device, id<MTLCommandQueue> queue,
           require(reinterpret_cast<const int8_t *>(
                       slab(valueTensor ? SPLASH_KV_VALUES : SPLASH_KV_KEYS))[index] ==
                       expected,
-                  "batched verify store payload differs");
+                  "batched store payload differs");
         }
       }
     }
@@ -866,16 +905,22 @@ void testBatchedVerifyStore(id<MTLDevice> device, id<MTLCommandQueue> queue,
 }
 
 void testContract() {
-  static_assert(sizeof(PrefillAttentionParams) == 36);
-  static_assert(offsetof(PrefillAttentionParams, committed_tokens) == 0);
-  static_assert(offsetof(PrefillAttentionParams, rows) == 4);
-  static_assert(offsetof(PrefillAttentionParams, chunk_stride) == 8);
-  static_assert(offsetof(PrefillAttentionParams, page_table_entries) == 12);
-  static_assert(offsetof(PrefillAttentionParams, kv) == 16);
-  static_assert(offsetof(PrefillAttentionParams, split_count) == 24);
-  static_assert(offsetof(PrefillAttentionParams, block_stride) == 28);
-  static_assert(offsetof(PrefillAttentionParams, block_list) == 32);
-  ChunkedPrefillParams params{129, 8, 32, 5, {}};
+  static_assert(sizeof(SplashAttentionSequence) == 48);
+  static_assert(offsetof(SplashAttentionSequence, committed_tokens) == 0);
+  static_assert(offsetof(SplashAttentionSequence, rows) == 4);
+  static_assert(offsetof(SplashAttentionSequence, first_row) == 8);
+  static_assert(offsetof(SplashAttentionSequence, row_begin) == 12);
+  static_assert(offsetof(SplashAttentionSequence, stage_row) == 16);
+  static_assert(offsetof(SplashAttentionSequence, chunk_stride) == 20);
+  static_assert(offsetof(SplashAttentionSequence, page_table_entries) == 24);
+  static_assert(offsetof(SplashAttentionSequence, split_count) == 28);
+  static_assert(offsetof(SplashAttentionSequence, first_tile) == 32);
+  static_assert(offsetof(SplashAttentionSequence, first_slot) == 36);
+  static_assert(offsetof(SplashAttentionSequence, block_stride) == 40);
+  static_assert(offsetof(SplashAttentionSequence, block_list) == 44);
+  static_assert(offsetof(SplashAttentionParams, kv) == 16 && offsetof(SplashAttentionParams, sequence) == 24 &&
+                sizeof(SplashAttentionParams) == 24 + 48 * SPLASH_MAXIMUM_BATCH_WIDTH);
+  ChunkedPrefillParams params{129, 8, 32, 5};
   require(chunkedPrefillValidationError(params).empty(),
           "partial committed page must be a valid direct-Q8 input");
   require(chunkedPrefillRequiredPages(params) == 5,
@@ -886,11 +931,10 @@ void testContract() {
 
   ChunkedPrefillParams finalCycle{
       splash::kv::kMaximumLogicalTokens - 1,
-      splash::kv::kVerifyRows,
+      SPLASH_TARGET_VERIFY_ROWS,
       32,
       (splash::kv::kMaximumPhysicalTokens + kPageTokens - 1) /
-          kPageTokens,
-      {}};
+          kPageTokens};
   require(chunkedPrefillValidationError(finalCycle).empty(),
           "the final cycle's verification rows exceeded physical KV scratch");
   ++finalCycle.committed_tokens;
@@ -913,8 +957,6 @@ void run(const char *libraryPath) {
   const AttentionPipelines attention{
       makePipeline(device, library, kPrefillAttentionSplitPipeline.data()),
       makePipeline(device, library, kPrefillAttentionReducePipeline.data())};
-  id<MTLComputePipelineState> verifyStore =
-      makePipeline(device, library, "verify_attention_q8_store");
   id<MTLCommandQueue> queue = [device newCommandQueue];
   testContract();
   testAttentionAndDirectStore(device, queue, store, attention);
@@ -922,7 +964,7 @@ void run(const char *libraryPath) {
   testChunkReference(device, queue, store, attention);
   testInvalidAttentionParams(device, queue, attention);
   testCommitIndexOverwrite(device, queue, store);
-  testBatchedVerifyStore(device, queue, verifyStore);
+  testBatchedStore(device, queue, store);
   std::cout << "q8_chunked_prefill_metal_test: ok\n";
 }
 

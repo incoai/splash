@@ -1,6 +1,7 @@
 #pragma once
 
 #include "metal/abi/PagedAttention.h"
+#include "metal/kernels/common/attention_sequence.h"
 #include "metal/kernels/common/int8_activations.h"
 #include "metal/kernels/common/kv_extent.h"
 #include "metal/kernels/common/kv_paging.h"
@@ -13,7 +14,7 @@ using namespace mpp::tensor_ops;
 // Paged attention over INT8 or BF16 KV. INT8 has one fp32 scale per
 // (token, KV head); BF16 reads the stored values directly. The preceding
 // store writes current rows to their final slots; committed_tokens controls
-// visibility, and the next command overwrites rejected verify rows.
+// visibility, and the next command overwrites a decode step's rejected rows.
 //
 // A threadgroup owns one KV head, query tile (or a part of one,
 // splash_attention_tile_part) and history split. It processes the GQA group
@@ -27,51 +28,24 @@ using namespace mpp::tensor_ops;
 // (splash_attention_combine_splits). Window 0 and no sinks is plain causal
 // attention over the whole history.
 //
-// Prefill and verify share this device-operand page loop.
-constant uint SplashVerifyMaximumSplits =
-    SPLASH_VERIFY_ATTENTION_MAXIMUM_SPLITS;
-constant uint SplashPrefillTileRows = SPLASH_PREFILL_ATTENTION_TILE_ROWS;
-constant uint SplashPrefillMaximumSplits =
-    SPLASH_PREFILL_ATTENTION_MAXIMUM_SPLITS;
+// Every attention dispatch's tiles share this device-operand page loop.
+constant uint SplashAttentionMaximumSplits = SPLASH_ATTENTION_MAXIMUM_SPLITS;
+constant uint SplashAttentionTileRows = SPLASH_ATTENTION_TILE_ROWS;
 
-inline bool splash_prefill_attention_contract_valid(
-    constant SplashPrefillAttentionParams &params) {
-  return params.rows > 0 && params.rows <= SPLASH_PREFILL_TOKEN_BUDGET &&
-         params.chunk_stride >= params.rows &&
-         params.chunk_stride <= SPLASH_PREFILL_TOKEN_BUDGET &&
-         params.chunk_stride % SPLASH_TARGET_KV_BLOCK_TOKENS == 0 &&
-         params.page_table_entries >=
-             (params.committed_tokens + params.rows +
-              SplashKvPageTokens - 1) /
-                 SplashKvPageTokens &&
-         params.kv.extent_pages > 0 && params.split_count > 0 &&
-         params.split_count <= SplashPrefillMaximumSplits &&
-         ulong(params.committed_tokens) + params.rows <=
-             ulong(SPLASH_MAXIMUM_PHYSICAL_KV_TOKENS);
-}
-
-inline bool splash_verify_attention_contract_valid(
-    constant SplashVerifyAttentionParams &params) {
-  return params.page_table_entries >=
-             (params.committed_tokens + SPLASH_TARGET_VERIFY_ROWS +
-              SplashKvPageTokens - 1) /
-                 SplashKvPageTokens &&
-         params.kv.extent_pages > 0 &&
-         ulong(params.committed_tokens) + SPLASH_TARGET_VERIFY_ROWS <=
-             ulong(SPLASH_MAXIMUM_PHYSICAL_KV_TOKENS) &&
-         params.split_count > 0 &&
-         params.split_count <= SplashVerifyMaximumSplits &&
-         params.slot_splits >= params.split_count &&
-         params.slot_splits <= SplashVerifyMaximumSplits;
+// A sequence's tiles run while its rows and splits are within bounds
+// (attention_sequence.h).
+inline bool splash_attention_contract_valid(constant SplashAttentionParams &params,
+                                            constant SplashAttentionSequence &s) {
+  return splash_attention_rows_valid(params, s) && s.split_count > 0 && s.split_count <= SplashAttentionMaximumSplits;
 }
 
 // The query tile a threadgroup owns, of one KV head: the offset of its fused
 // rows in the queries and the output, the position of its first row, its
-// active rows, its history splits and the partial slot of its first split. A
-// verify tile is a lane's eight rows, a prefill tile SplashPrefillTileRows
-// rows of the chunk; a tile whose parameters fail the contract, or past the
-// chunk's rows, is inactive. Split and reduce entries, dense and sparse, take
-// their tiles from here, so they agree on every offset.
+// active rows, its history splits and the partial slot of its first split.
+// A sequence's tile t holds its rows from t SplashAttentionTileRows on; a
+// tile whose sequence fails the contract, or past its rows, is inactive.
+// Split and reduce entries, dense and sparse, take their tiles from here, so
+// they agree on every offset.
 struct SplashAttentionTile {
   ulong offset;
   ulong first_slot;
@@ -82,28 +56,16 @@ struct SplashAttentionTile {
 };
 
 template <uint KVHeads, uint QueryHeadsPerKVHead, uint HeadDim>
-inline SplashAttentionTile splash_verify_attention_tile(
-    constant SplashVerifyAttentionParams &lane, uint kv_head, uint batch) {
-  if (!splash_verify_attention_contract_valid(lane) || kv_head >= KVHeads)
+inline SplashAttentionTile splash_attention_tile(constant SplashAttentionParams &params,
+                                                 constant SplashAttentionSequence &sequence, uint kv_head, uint tile) {
+  const uint start = tile * SplashAttentionTileRows;
+  if (!splash_attention_contract_valid(params, sequence) || kv_head >= KVHeads || start >= sequence.rows)
     return {};
-  const ulong head = ulong(batch) * KVHeads + kv_head;
-  return {head * SPLASH_VERIFY_CHUNK_STRIDE * QueryHeadsPerKVHead * HeadDim,
-          head * lane.slot_splits, lane.committed_tokens, SPLASH_TARGET_VERIFY_ROWS,
-          lane.split_count, true};
-}
-
-template <uint KVHeads, uint QueryHeadsPerKVHead, uint HeadDim>
-inline SplashAttentionTile splash_prefill_attention_tile(
-    constant SplashPrefillAttentionParams &params, uint kv_head, uint tile) {
-  const uint start = tile * SplashPrefillTileRows;
-  if (!splash_prefill_attention_contract_valid(params) || kv_head >= KVHeads ||
-      start >= params.rows)
-    return {};
-  return {(ulong(kv_head) * params.chunk_stride + start) * QueryHeadsPerKVHead *
+  return {(ulong(sequence.stage_row) + ulong(kv_head) * sequence.chunk_stride + start) * QueryHeadsPerKVHead *
               HeadDim,
-          (ulong(tile) * KVHeads + kv_head) * params.split_count,
-          params.committed_tokens + start, min(SplashPrefillTileRows, params.rows - start),
-          params.split_count, true};
+          ulong(sequence.first_slot) + (ulong(tile) * KVHeads + kv_head) * sequence.split_count,
+          sequence.committed_tokens + start, min(SplashAttentionTileRows, sequence.rows - start),
+          sequence.split_count, true};
 }
 
 // Part `part` of a tile run as Parts parts of RowsPerTile / Parts rows each
@@ -310,9 +272,8 @@ inline float splash_attention_query_codes(device const bfloat *queries, device i
 }
 
 // One tile over its split's pages, whose K/V (INT8 with their scales, or
-// BF16) it consumes in place as device tensor operands: the prefill tile of
-// SPLASH_PREFILL_ATTENTION_TILE_ROWS rows and the verify tile of
-// SPLASH_TARGET_VERIFY_ROWS (RowsPerTile). Queries are KV-head-major
+// BF16) it consumes in place as device tensor operands: a tile (or a part of
+// one) of RowsPerTile rows. Queries are KV-head-major
 // [kv head][row][query head in group][dimension], so the tile's fused rows
 // form one contiguous M x D tensor. Each page is reached through its table
 // entry (kv_extent.h).
@@ -456,9 +417,8 @@ inline float splash_row_sink(uint fused_row, device const float *group_sinks) {
 }
 
 // Partials are [slot][fused row][dimension]; statistics are
-// [slot][fused row]{max, sum}. The callers lay slots out as
-// [tile][KV head][part][split] (prefill) and [lane][KV head][part][split]
-// (verify), a sparse tile being one part.
+// [slot][fused row]{max, sum}. The callers lay a sequence's slots out from its
+// first_slot as [tile][KV head][part][split], a sparse tile being one part.
 // Combines the first `written` splits of one fused row in split order, a
 // threadgroup of HeadDim threads, one per output dimension. The statistics
 // are shared by all output dimensions: their weights are computed once per
@@ -481,9 +441,7 @@ inline void splash_attention_combine_splits(
   constexpr bool Sinks = sizeof...(GroupSinks) != 0;
   constexpr uint M = RowsPerTile * QueryHeadsPerKVHead;
   constexpr uint D = HeadDim;
-  static_assert(D >= SPLASH_VERIFY_ATTENTION_MAXIMUM_SPLITS &&
-                    D >= SPLASH_PREFILL_ATTENTION_MAXIMUM_SPLITS,
-                "a thread per split");
+  static_assert(D >= SPLASH_ATTENTION_MAXIMUM_SPLITS, "a thread per split");
   if (fused_row / QueryHeadsPerKVHead >= active_rows) {
     tile_output[fused_row * D + thread_index] = bfloat(0.0f);
     return;

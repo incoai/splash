@@ -1228,23 +1228,24 @@ void producerTableContract(metal::MetalBackend &backend) {
   }
   {
     // The 27B's attention: 24 query heads over 4 KV heads of 256, and the
-    // verify staging of one lane's 8 rows in 32 per KV head.
+    // staging of a lane's 8 rows in 32 per KV head.
     const kv::Layout layout{1, 4, 256};
     const metal::MetalBuffer packed = allocate(backend, kRows * (24 * 2 + 4 * 2) * 256 * 2);
-    const metal::MetalBuffer attention = allocate(backend, 4 * 32 * 6 * 256 * 2);
+    const ops::AttentionStaging staging{.rows = allocate(backend, 4 * 32 * 6 * 256 * 2)};
     const metal::MetalBuffer hidden = allocate(backend, kRows * 24 * 256 * 2);
+    const std::array lane{PagedAttention::chunkParams(0, kRows, 32, 1)};
     metal::CommandGraph graph;
     rejects(
         [&] {
-          (void)PagedAttention::addVerifyGate(graph, packed, attention, hidden, 24, layout, kLanes, {},
-                                              LinearInput::Table16);
+          (void)PagedAttention::addGate(graph, packed, staging, hidden, lane, AttentionRows::Every, 24, layout, {},
+                                        LinearInput::Table16);
         },
         "linear table buffer holds", "the attention gate wrote a table without scratch");
     require(graph.empty() &&
-                PagedAttention::addVerifyGate(graph, packed, attention, hidden, 24, layout, kLanes, {},
-                                              LinearInput::Plain)
+                PagedAttention::addGate(graph, packed, staging, hidden, lane, AttentionRows::Every, 24, layout, {},
+                                        LinearInput::Plain)
                         .layout == LinearInput::Plain &&
-                plainKernel(graph, "verify_attention_gate"),
+                plainKernel(graph, "attention_gate"),
             "the attention gate's table contract");
   }
 }

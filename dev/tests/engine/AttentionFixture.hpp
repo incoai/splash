@@ -5,6 +5,7 @@
 #include "metal/CommandGraph.hpp"
 #include "metal/MetalBackend.hpp"
 #include "metal/abi/KvExtent.h"
+#include "ops/ExecutionPlans.hpp"
 #include "ops/PagedAttention.hpp"
 
 #include <algorithm>
@@ -21,10 +22,10 @@
 #include <vector>
 
 // The paged-attention fixture attention-sweep times: deterministic Page32
-// history of every lane in the extents of a pool, one chunk of rows per lane
-// with its queries, and the production store and attention graph over them;
-// and the move of a block from a page to a block cache that a verify reads
-// through its locations.
+// history of every lane in the extents of a pool, one sequence of rows per
+// lane with its queries, and the production store and attention graph over
+// them; and the move of a block from a page to a block cache that an
+// attention reads through its locations.
 namespace splash::test {
 
 // The target attention layer a fixture holds: its query and KV heads and
@@ -288,36 +289,46 @@ public:
     return true;
   }
 
-  // One store and attention of the fixture's rows, encoded as the runtime
-  // encodes them, through block lists (sparse plans) when `blocks` has them.
-  void addGraph(metal::CommandGraph &graph, const ops::PrefillAttentionPlan &attention,
-                const ops::AttentionBlocks &blocks = {}) const {
-    const kv::ChunkedPrefillParams chunk = ops::PagedAttention::prefillParams(
-        plan_.histories[0], plan_.rows, plan_.stride, plan_.pages[0]);
-    ops::PagedAttention::addPrefillStore(graph, layer_, buffer(Tensor::ChunkKeys),
-                                         buffer(Tensor::ChunkValues), tables_[0], chunk,
-                                         plan_.layout());
-    ops::PagedAttention::addPrefill(graph, layer_, buffer(Tensor::Queries),
-                                    buffer(Tensor::Output), buffer(Tensor::Partials),
-                                    buffer(Tensor::Statistics), tables_[0], chunk, attention,
-                                    blocks, sinks(attention.sinks));
-  }
-  // Each lane's rows are its verify rows, in the verify chunk stride.
-  void addGraph(metal::CommandGraph &graph, const ops::VerifyAttentionPlan &attention,
-                const ops::AttentionBlocks &blocks = {}) const {
-    if (plan_.rows != kv::kVerifyRows || plan_.stride != kv::kVerifyChunkStride)
-      throw std::logic_error(
-          "a verify fixture stages its lanes' verify rows in the verify chunk stride");
+  // Each lane's rows after its history, as the runtime describes a command's
+  // sequences: their staging is the fixture's, lane after lane.
+  [[nodiscard]] std::array<kv::ChunkedPrefillParams, AttentionFixturePlan::kMaximumLanes> sequences() const {
     std::array<kv::ChunkedPrefillParams, AttentionFixturePlan::kMaximumLanes> chunks{};
-    for (uint32_t lane = 0; lane < attention.lanes; ++lane)
-      chunks[lane] =
-          ops::PagedAttention::verifyParams(plan_.histories[lane], plan_.pages[lane]);
-    ops::PagedAttention::addVerify(
-        graph, layer_,
-        {buffer(Tensor::ChunkKeys), buffer(Tensor::ChunkValues), buffer(Tensor::Queries),
-         buffer(Tensor::Partials), buffer(Tensor::Statistics), buffer(Tensor::Output), tables_,
-         sinks(attention.sinks)},
-        std::span(chunks).first(attention.lanes), attention, blocks);
+    for (uint32_t lane = 0; lane < plan_.lanes; ++lane)
+      chunks[lane] = ops::PagedAttention::chunkParams(plan_.histories[lane], plan_.rows, plan_.stride,
+                                                      plan_.pages[lane]);
+    return chunks;
+  }
+  // The workspace the fixture holds, which a plan's dispatches must fit.
+  [[nodiscard]] ops::AttentionWorkspace workspace() const noexcept {
+    return {plan_.sizes[static_cast<size_t>(Tensor::Partials)], plan_.sizes[static_cast<size_t>(Tensor::Statistics)]};
+  }
+  // The plan of every lane's rows on `plans`' device.
+  [[nodiscard]] ops::AttentionPlan attentionPlan(const ops::ExecutionPlans &plans) const {
+    const auto chunks = sequences();
+    return plans.attention(std::span(chunks).first(plan_.lanes), plan_.shape.queryHeads, plan_.layout(), workspace(),
+                           plan_.shape.variant);
+  }
+
+  // One store and attention of every lane's rows, encoded as the runtime
+  // encodes a command's sequences, through block lists (sparse plans) when
+  // `blocks` has them: lane l's tiles from list blocks.list + l x its tiles
+  // on.
+  void addGraph(metal::CommandGraph &graph, const ops::AttentionPlan &attention,
+                const ops::AttentionBlocks &blocks = {}) const {
+    const auto chunks = sequences();
+    const std::span<const kv::ChunkedPrefillParams> lanes = std::span(chunks).first(plan_.lanes);
+    const ops::AttentionStaging staging{buffer(Tensor::Queries), buffer(Tensor::ChunkKeys),
+                                        buffer(Tensor::ChunkValues), buffer(Tensor::Output)};
+    ops::PagedAttention::addStore(graph, layer_, staging, std::span(tables_).first(plan_.lanes), lanes,
+                                  plan_.layout());
+    std::array<ops::AttentionHistory, AttentionFixturePlan::kMaximumLanes> histories{};
+    for (uint32_t lane = 0; lane < plan_.lanes; ++lane) {
+      histories[lane] = {layer_, tables_[lane], blocks};
+      if (blocks.stride) histories[lane].blocks.list += lane * kv::attentionTiles(plan_.rows);
+    }
+    ops::PagedAttention::addAttention(graph, attention, staging, buffer(Tensor::Partials),
+                                      buffer(Tensor::Statistics), lanes, std::span(histories).first(plan_.lanes),
+                                      sinks(attention.sinks));
   }
 
   [[nodiscard]] const AttentionFixturePlan &plan() const noexcept { return plan_; }

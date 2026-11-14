@@ -194,18 +194,20 @@ std::vector<uint32_t> qsaBitmaps(const AttentionFixturePlan &plan, const std::st
 }
 
 // A prefill chunk of `rows` rows on one lane, or the verify rows of `lanes`
-// lanes, all after `history` tokens, with the scratch of the device's plan.
+// lanes, all after `history` tokens, with the workspace the runtime's arena
+// holds for it: a prompt chunk's, or a decode step's of a lane's one tile at
+// the most splits each.
 AttentionFixturePlan casePlan(AttentionShape shape, bool prefill, uint32_t lanes,
                               uint32_t history, uint32_t extentPages, uint32_t rows, const ExecutionPlans &plans) {
   const kv::Layout layout = test::attentionLayout(shape);
   const uint32_t caseLanes = prefill ? 1 : lanes;
   AttentionFixturePlan::Histories histories{};
   std::fill_n(histories.begin(), caseLanes, history);
-  const AttentionWorkspace scratch =
-      prefill ? plans.prefillAttention(rows, history, shape.queryHeads, layout, shape.variant).workspace
-              : plans.verifyAttention(caseLanes, shape.queryHeads, layout, std::span(histories).first(caseLanes),
-                                      shape.variant)
-                    .workspace;
+  AttentionWorkspace scratch = plans.sequenceAttentionWorkspace(shape.queryHeads, layout);
+  if (!prefill) {
+    const AttentionWorkspace lane = plans.laneAttentionWorkspace(shape.queryHeads, layout);
+    scratch = {lane.partialsBytes * caseLanes, lane.statisticsBytes * caseLanes};
+  }
   return AttentionFixturePlan::make(shape, caseLanes, prefill ? rows : kVerifyRows,
                                     histories, scratch, {kLayer + 1, kLayer, extentPages});
 }
@@ -314,8 +316,8 @@ QsaIndexer qsaIndexer(metal::MetalBackend &backend, const AttentionFixturePlan &
 }
 
 // A case's QSA bitmaps (qsaBitmaps, or the indexer's) and the block lists its
-// tiles attend through: one per verify lane, or per prefill tile; with
-// --located, the block cache that its lists' locations name.
+// tiles attend through, one per tile of every lane; with --located, the block
+// cache that its lists' locations name.
 struct QsaBlocks final {
   metal::MetalBuffer bitmaps;
   uint32_t words = 0;
@@ -330,8 +332,8 @@ QsaBlocks qsaBlocks(metal::MetalBackend &backend, const AttentionFixturePlan &pl
                     const std::vector<uint32_t> &bitmaps, uint32_t words, bool indexer, bool located) {
   QsaBlocks result;
   if (!words) return result;
-  result.lists = prefill ? kv::prefillAttentionTiles(plan.rows) : plan.lanes;
-  const uint32_t stride = kVerifyRows * (kQsaTopBlocks + 1);
+  result.lists = plan.lanes * kv::attentionTiles(plan.rows);
+  const uint32_t stride = kv::kAttentionTileRows * (kQsaTopBlocks + 1);
   result.bitmaps = sharedBuffer<uint32_t>(backend, uint64_t{plan.lanes} * plan.rows * words, "attention-sweep-qsa");
   std::ranges::copy(bitmaps, static_cast<uint32_t *>(result.bitmaps.contents()));
   result.words = words;
@@ -345,16 +347,17 @@ QsaBlocks qsaBlocks(metal::MetalBackend &backend, const AttentionFixturePlan &pl
 
 // --located: each listed block of the lanes' complete pages moves from the
 // fixture's pool to a block cache of the pool's layout and extents, at a
-// shuffled place (moveBlock), where the verify reads it through its
+// shuffled place (moveBlock), where the attention reads it through its
 // location; a block of the page its rows write stays SPLASH_ATTENTION_PAGED.
 // The lists are those the case's graph made last, which it makes again alike.
 void locate(metal::MetalBackend &backend, AttentionFixture &fixture, QsaBlocks &qsa) {
   constexpr uint32_t pageBlocks = kv::kPageTokens / kQsaBlockTokens;
   const AttentionFixturePlan &plan = fixture.plan();
   const uint32_t stride = qsa.blocks.stride, extentPages = plan.geometry.extentPages;
+  const uint32_t laneLists = kv::attentionTiles(plan.rows);
   const auto *lists = static_cast<const uint32_t *>(qsa.blocks.lists.contents());
   const auto *counts = static_cast<const uint32_t *>(qsa.blocks.counts.contents());
-  const uint32_t pages = (std::accumulate(counts, counts + plan.lanes, 0U) + pageBlocks - 1) / pageBlocks;
+  const uint32_t pages = (std::accumulate(counts, counts + qsa.lists, 0U) + pageBlocks - 1) / pageBlocks;
   qsa.cache.emplace(backend, plan.poolLayout(), extentPages, (pages + extentPages - 1) / extentPages);
   std::vector<uint32_t> cachePages(qsa.cache->pageCount()), slots(qsa.cache->pageCount() * pageBlocks);
   std::iota(cachePages.begin(), cachePages.end(), 0U);
@@ -365,10 +368,10 @@ void locate(metal::MetalBackend &backend, AttentionFixture &fixture, QsaBlocks &
   qsa.blocks.locations = sharedBuffer<uint32_t>(backend, uint64_t{qsa.lists} * stride, "attention-sweep-locations");
   auto *locations = static_cast<uint32_t *>(qsa.blocks.locations.contents());
   uint32_t placed = 0;
-  for (uint32_t lane = 0; lane < plan.lanes; ++lane)
-    for (uint32_t entry = 0; entry < counts[lane]; ++entry) {
-      const uint32_t block = lists[uint64_t{lane} * stride + entry] >> SPLASH_ATTENTION_BLOCK_ROW_BITS;
-      uint32_t &location = locations[uint64_t{lane} * stride + entry];
+  for (uint32_t list = 0; list < qsa.lists; ++list)
+    for (uint32_t entry = 0, lane = list / laneLists; entry < counts[list]; ++entry) {
+      const uint32_t block = lists[uint64_t{list} * stride + entry] >> SPLASH_ATTENTION_BLOCK_ROW_BITS;
+      uint32_t &location = locations[uint64_t{list} * stride + entry];
       if ((block / pageBlocks + 1) * kv::kPageTokens > plan.histories[lane]) {
         location = SPLASH_ATTENTION_PAGED;
         continue;
@@ -389,8 +392,7 @@ double listEntries(const QsaBlocks &qsa) {
 // The store and attention graph the runtime encodes for a case, after its
 // block lists when it has QSA bitmaps, and the indexer that selects them
 // with --qsa indexer.
-metal::CommandGraph caseGraph(const AttentionFixture &fixture, bool prefill, const QsaBlocks &qsa,
-                              const ExecutionPlans &plans) {
+metal::CommandGraph caseGraph(const AttentionFixture &fixture, const QsaBlocks &qsa, const ExecutionPlans &plans) {
   const AttentionFixturePlan &plan = fixture.plan();
   metal::CommandGraph graph;
   if (const QsaIndexer *indexer = qsa.indexer ? &*qsa.indexer : nullptr) {
@@ -406,19 +408,10 @@ metal::CommandGraph caseGraph(const AttentionFixture &fixture, bool prefill, con
   if (qsa.words) {
     std::vector<BlockListRows> sequences;
     for (uint32_t lane = 0; lane < plan.lanes; ++lane)
-      sequences.push_back({lane * plan.rows, plan.rows, plan.histories[lane], lane});
+      sequences.push_back({lane * plan.rows, plan.rows, plan.histories[lane], lane * kv::attentionTiles(plan.rows)});
     PagedAttention::addBlockLists(graph, qsa.bitmaps, qsa.words, sequences, qsa.blocks);
   }
-  if (prefill)
-    fixture.addGraph(graph,
-                     plans.prefillAttention(plan.rows, plan.histories[0], plan.shape.queryHeads, plan.layout(),
-                                            plan.shape.variant),
-                     qsa.blocks);
-  else
-    fixture.addGraph(graph,
-                     plans.verifyAttention(plan.lanes, plan.shape.queryHeads, plan.layout(),
-                                           std::span(plan.histories).first(plan.lanes), plan.shape.variant),
-                     qsa.blocks);
+  fixture.addGraph(graph, fixture.attentionPlan(plans), qsa.blocks);
   return graph;
 }
 
@@ -478,12 +471,12 @@ std::vector<Case> measure(std::span<metal::MetalBackend *> backends,
         std::make_unique<AttentionFixture>(*backends[i], plan, "attention-sweep-fixture"));
     fixtures.back()->fill();
     blocks.push_back(qsaBlocks(*backends[i], plan, prefill, bitmaps, words, qsa == "indexer", located));
-    graphs.push_back(caseGraph(*fixtures.back(), prefill, blocks.back(), plans));
+    graphs.push_back(caseGraph(*fixtures.back(), blocks.back(), plans));
     if (located) {
       (void)backends[i]->submitCommandAsync(graphs.back().dispatches()).wait();
       const uint64_t paged = outputDigest(*fixtures.back());
       locate(*backends[i], *fixtures.back(), blocks.back());
-      graphs.back() = caseGraph(*fixtures.back(), prefill, blocks.back(), plans);
+      graphs.back() = caseGraph(*fixtures.back(), blocks.back(), plans);
       (void)backends[i]->submitCommandAsync(graphs.back().dispatches()).wait();
       if (outputDigest(*fixtures.back()) != paged)
         throw std::runtime_error("the located verify split changed attention output bits");

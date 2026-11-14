@@ -66,10 +66,10 @@ prefillTensorBytes(const RuntimeGeometry &geometry,
       bytesFor<uint16_t>(uint64_t{geometry.target.attentionQueryHeads} *
                          kRaggedAttentionRows *
                          geometry.target.attentionHeadDimension));
+  // Any one sequence's splits: a chunk's sequences share the workspace in
+  // turn where they do not fit together.
   const ops::AttentionWorkspace attentionWorkspace =
-      operators.prefillAttentionWorkspace(
-          kPrefillRows, geometry.target.attentionQueryHeads,
-          geometry.target.kvLayout);
+      operators.sequenceAttentionWorkspace(geometry.target.attentionQueryHeads, geometry.target.kvLayout);
   put(PrefillTensor::AttentionPartials, attentionWorkspace.partialsBytes);
   put(PrefillTensor::AttentionStatistics, attentionWorkspace.statisticsBytes);
   put(PrefillTensor::AttentionHidden,
@@ -174,7 +174,7 @@ uint64_t gdnTapeSlotBytes(const RuntimeGeometry &geometry) noexcept {
 }
 static uint64_t decodeChunkLayerBytes(const RuntimeGeometry &geometry) noexcept {
   return bytesFor<uint16_t>(uint64_t{geometry.target.attentionKvHeads} *
-                            kv::kVerifyChunkStride *
+                            kTileRows *
                             geometry.target.attentionHeadDimension);
 }
 
@@ -210,16 +210,16 @@ decodeTensorBytes(const RuntimeGeometry &geometry,
       bytesFor<uint16_t>(r * geometry.target.packedFullWidth));
   put(DecodeTensor::FullQueries,
       bytesFor<uint16_t>(uint64_t{geometry.target.attentionQueryHeads} *
-                         kv::kVerifyChunkStride *
+                         kTileRows *
                          geometry.target.attentionHeadDimension));
+  // A step's lanes attend in one dispatch whatever their histories.
   const ops::AttentionWorkspace attentionWorkspace =
-      operators.verifyAttentionWorkspacePerLane(
-          geometry.target.attentionQueryHeads, geometry.target.kvLayout);
+      operators.laneAttentionWorkspace(geometry.target.attentionQueryHeads, geometry.target.kvLayout);
   put(DecodeTensor::AttentionPartials, attentionWorkspace.partialsBytes);
   put(DecodeTensor::AttentionStatistics, attentionWorkspace.statisticsBytes);
   put(DecodeTensor::FullAttention,
       bytesFor<uint16_t>(uint64_t{geometry.target.attentionQueryHeads} *
-                         kv::kVerifyChunkStride *
+                         kTileRows *
                          geometry.target.attentionHeadDimension));
   put(DecodeTensor::AttentionHidden,
       bytesFor<uint16_t>(r * geometry.target.attentionWidth));

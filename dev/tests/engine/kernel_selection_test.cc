@@ -429,19 +429,38 @@ std::string describe(const metal::DispatchSize &size) {
 std::string describe(const AttentionWorkspace &workspace) {
   return std::to_string(workspace.partialsBytes) + "/" + std::to_string(workspace.statisticsBytes);
 }
-std::string describe(const PrefillAttentionPlan &plan) {
-  return plan.splitPipeline + " " + plan.reducePipeline + " tiles " + std::to_string(plan.tiles) + " splits " +
-         std::to_string(plan.splits) + " groups " + describe(plan.splitGroups) + " " + describe(plan.reduceGroups) +
-         " workspace " + describe(plan.workspace) + " sparse " + std::to_string(plan.sparse) + " sinks " +
+std::string describe(const AttentionPlan &plan) {
+  std::string line = plan.splitPipeline() + " " + plan.reducePipeline() + " splits ";
+  for (const AttentionPlan::Sequence &sequence : plan.sequences())
+    line += std::to_string(sequence.splits) + (&sequence == &plan.sequences().back() ? "" : ",");
+  for (const AttentionPlan::Dispatch &dispatch : plan.dispatches())
+    line += " [" + std::to_string(dispatch.sequences) + " tiles " + std::to_string(dispatch.tiles) + " groups " +
+            describe(plan.splitGroups(dispatch)) + " " + describe(plan.reduceGroups(dispatch)) + "]";
+  return line + " workspace " + describe(plan.workspace()) + " sparse " + std::to_string(plan.sparse) + " sinks " +
          std::to_string(plan.sinks);
 }
-std::string describe(const VerifyAttentionPlan &plan) {
-  std::string splits;
-  for (const uint32_t s : plan.laneSplits) splits += std::to_string(s) + ",";
-  return plan.splitPipeline + " " + plan.reducePipeline + " splits " + splits + std::to_string(plan.splits) +
-         " groups " + describe(plan.splitGroups) + " " + describe(plan.reduceGroups) + " workspace " +
-         describe(plan.workspace) + " sparse " + std::to_string(plan.sparse) + " sinks " +
-         std::to_string(plan.sinks);
+
+// A sequence of `rows` rows after `history` tokens, staged in whole KV
+// blocks.
+kv::ChunkedPrefillParams sequenceOf(uint32_t history, uint32_t rows) {
+  return PagedAttention::chunkParams(history, rows, (rows + kv::kPageTokens - 1) / kv::kPageTokens * kv::kPageTokens,
+                                     (history + rows + kv::kPageTokens - 1) / kv::kPageTokens);
+}
+// The plan of a prompt chunk of one sequence, in a prompt chunk's workspace,
+// and of a decode step's lanes of 8 rows after each of `histories`, in
+// theirs.
+AttentionPlan chunkPlan(const ExecutionPlans &plans, uint32_t rows, uint32_t history, uint32_t heads,
+                        const kv::Layout &layout, AttentionVariant v) {
+  const std::array sequence{sequenceOf(history, rows)};
+  return plans.attention(sequence, heads, layout, plans.sequenceAttentionWorkspace(heads, layout), v);
+}
+AttentionPlan stepPlan(const ExecutionPlans &plans, std::span<const uint32_t> histories, uint32_t heads,
+                       const kv::Layout &layout, AttentionVariant v) {
+  std::vector<kv::ChunkedPrefillParams> lanes;
+  for (const uint32_t history : histories) lanes.push_back(sequenceOf(history, SPLASH_TARGET_VERIFY_ROWS));
+  const AttentionWorkspace lane = plans.laneAttentionWorkspace(heads, layout);
+  return plans.attention(lanes, heads, layout,
+                         {lane.partialsBytes * histories.size(), lane.statisticsBytes * histories.size()}, v);
 }
 
 // The rows and the tokens of history the attention plans are planned at.
@@ -486,24 +505,22 @@ void attentionPlans(Golden &golden, const std::string &name, const ExecutionPlan
           for (const uint32_t history : kAttentionHistories)
             prefill.add(variant + " rows " + std::to_string(rows) + " history " + std::to_string(history) + ": " +
                         attempt([&] {
-                          return describe(
-                              plans.prefillAttention(rows, history, family.attentionQueryHeads, layout, v));
+                          return describe(chunkPlan(plans, rows, history, family.attentionQueryHeads, layout, v));
                         }));
         for (uint32_t lanes = 1; lanes <= SPLASH_MAXIMUM_BATCH_WIDTH; ++lanes)
           for (const uint32_t history : kAttentionHistories) {
             const std::vector<uint32_t> each = verifyHistories(lanes, history);
             verify.add(variant + " lanes " + std::to_string(lanes) + " history " + std::to_string(history) + ": " +
                        attempt([&] {
-                         return describe(plans.verifyAttention(lanes, family.attentionQueryHeads, layout, each, v));
+                         return describe(stepPlan(plans, each, family.attentionQueryHeads, layout, v));
                        }));
           }
       }
-      for (const uint32_t rows : {1U, 256U, uint32_t{SPLASH_PREFILL_TOKEN_BUDGET}})
-        workspace.add(fmt + " prefill " + std::to_string(rows) + ": " + attempt([&] {
-                        return describe(plans.prefillAttentionWorkspace(rows, family.attentionQueryHeads, layout));
-                      }));
-      workspace.add(fmt + " verify per lane: " + attempt([&] {
-                      return describe(plans.verifyAttentionWorkspacePerLane(family.attentionQueryHeads, layout));
+      workspace.add(fmt + " prefill chunk: " + attempt([&] {
+                      return describe(plans.sequenceAttentionWorkspace(family.attentionQueryHeads, layout));
+                    }));
+      workspace.add(fmt + " decode per lane: " + attempt([&] {
+                      return describe(plans.laneAttentionWorkspace(family.attentionQueryHeads, layout));
                     }));
     }
   });
@@ -634,13 +651,13 @@ Int8Paths int8ActivationsOff(const std::string &name, const ExecutionPlans &on, 
       for (const AttentionVariant &v : attentionVariants(family)) {
         for (const uint32_t rows : kAttentionRows)
           for (const uint32_t history : kAttentionHistories)
-            compareLines(attempt([&] { return describe(on.prefillAttention(rows, history, heads, layout, v)); }),
-                         attempt([&] { return describe(off.prefillAttention(rows, history, heads, layout, v)); }));
+            compareLines(attempt([&] { return describe(chunkPlan(on, rows, history, heads, layout, v)); }),
+                         attempt([&] { return describe(chunkPlan(off, rows, history, heads, layout, v)); }));
         for (uint32_t lanes = 1; lanes <= SPLASH_MAXIMUM_BATCH_WIDTH; ++lanes)
           for (const uint32_t history : kAttentionHistories) {
             const std::vector<uint32_t> each = verifyHistories(lanes, history);
-            compareLines(attempt([&] { return describe(on.verifyAttention(lanes, heads, layout, each, v)); }),
-                         attempt([&] { return describe(off.verifyAttention(lanes, heads, layout, each, v)); }));
+            compareLines(attempt([&] { return describe(stepPlan(on, each, heads, layout, v)); }),
+                         attempt([&] { return describe(stepPlan(off, each, heads, layout, v)); }));
           }
       }
     }
@@ -767,9 +784,8 @@ void warmupCovers(const std::string &name, const ExecutionPlans &plans, std::vec
         check("attention " + f + (format == kv::Format::Int8 ? " int8" : " bf16") + " window " +
                   std::to_string(v.windowTokens) + (v.rotated ? " rope" : " nope"),
               kAttentionHistories, [&](uint32_t rows, uint32_t history) {
-                const PrefillAttentionPlan plan =
-                    plans.prefillAttention(rows, history, family.attentionQueryHeads, layout, v);
-                return plan.splitPipeline + " " + plan.reducePipeline;
+                const AttentionPlan plan = chunkPlan(plans, rows, history, family.attentionQueryHeads, layout, v);
+                return plan.splitPipeline() + " " + plan.reducePipeline();
               });
     }
   });

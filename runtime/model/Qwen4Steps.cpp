@@ -58,11 +58,10 @@ uint32_t prefillScoreRows(const QwenTargetGeometry &g) {
 }
 
 // The attention's tiles of rows, whose block masks become a block list each
-// (ops::PagedAttention::addBlockLists): a verify lane's rows, or a prefill
-// tile's. A row attends to at most its top blocks and the block of its tail,
-// so a tile's list holds at most this many entries.
-constexpr uint32_t kTileRows = SPLASH_TARGET_VERIFY_ROWS;
-static_assert(kTileRows == SPLASH_PREFILL_ATTENTION_TILE_ROWS, "verify and prefill tiles hold as many rows");
+// (ops::PagedAttention::addBlockLists). A row attends to at most its top
+// blocks and the block of its tail, so a tile's list holds at most this many
+// entries.
+constexpr uint32_t kTileRows = SPLASH_ATTENTION_TILE_ROWS;
 uint32_t listStride(const QwenTargetGeometry &g) { return kTileRows * (g.indexerTopBlocks + 1); }
 
 // The tokens before a lane's verify rows that its rows' n-grams reach.

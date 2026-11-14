@@ -54,7 +54,7 @@ struct QwenAttentionWeights final {
   ops::NormWeights keyNorm;
   ops::Projection outputProjection;
   // The layer's learned sinks, an F32 per query head, of a geometry whose
-  // attention adds them (ops::PrefillAttentionPlan::sinks); none otherwise.
+  // attention adds them (ops::AttentionPlan::sinks); none otherwise.
   metal::MetalBuffer sinks{};
 };
 
@@ -224,9 +224,6 @@ struct QwenTargetPrefillSequence final {
   uint32_t rows = 0;
   std::span<const uint32_t> tokens;
   QwenTargetRequest request;
-  uint32_t attentionStride = 0;
-  uint64_t queryOffset = 0;
-  uint64_t kvOffset = 0;
   kv::ChunkedPrefillParams chunk;
   metal::MetalBuffer pageTable;
   // Its pages' block index, for a layout with one (ops::BlockIndex::tables).
@@ -281,14 +278,6 @@ struct QwenTargetPrefillBuffers final {
     return {normalized, denseGateScratch, denseIntermediate, linearScratch};
   }
 };
-
-// The attention plan of a prefill sequence's rows after the history its
-// chunk committed (sequence.chunk.committed_tokens): of a geometry's whole
-// layers by default, of its sliding layers with their window.
-[[nodiscard]] ops::PrefillAttentionPlan prefillAttentionPlan(const ops::ExecutionPlans &plans,
-                                                            const QwenTargetGeometry &geometry,
-                                                            const QwenTargetPrefillSequence &sequence,
-                                                            ops::AttentionVariant variant = {});
 
 // A chunk of a prefill command: `rows` rows of its lanes' sequences, packed
 // in sequence order, in its own buffers.
@@ -552,11 +541,15 @@ protected:
     uint32_t rows;
     std::span<const SplashKvLayer> kvLayers;
     SpilledKvReads &spilled;
-    // Each sequence's attention plan, which every attention layer runs, and
-    // with a sliding window (kv::Layout::windowTokens) its windowed plan,
+    // Each sequence's chunk and page table, in sequence order, as the
+    // attention layers take them.
+    std::array<kv::ChunkedPrefillParams, ExecutionLimits::maximumBatchWidth> chunks{};
+    std::array<metal::MetalBuffer, ExecutionLimits::maximumBatchWidth> pageTables{};
+    // The sequences' attention plan, which every attention layer runs, and
+    // with a sliding window (kv::Layout::windowTokens) their windowed plan,
     // which the sliding layers run instead.
-    std::vector<ops::PrefillAttentionPlan> attention{};
-    std::vector<ops::PrefillAttentionPlan> windowedAttention{};
+    std::optional<ops::AttentionPlan> attention{};
+    std::optional<ops::AttentionPlan> windowedAttention{};
     std::optional<ops::MoePlan> moe{};
     // The layer's MoE buffers, which its routing (addPrefillLayer), the
     // layer's load and its routed work (addPrefillExperts) share.
@@ -571,6 +564,9 @@ protected:
     [[nodiscard]] uint32_t outputRows() const noexcept {
       return readRows.empty() ? rows : static_cast<uint32_t>(readRows.size());
     }
+    [[nodiscard]] std::span<const kv::ChunkedPrefillParams> attentionSequences() const noexcept {
+      return std::span(chunks).first(sequences.size());
+    }
   };
 
   struct VerifyStep {
@@ -581,9 +577,9 @@ protected:
     std::span<const kv::ChunkedPrefillParams> chunks;
     uint32_t lanes;
     uint32_t rows;
-    ops::VerifyAttentionPlan attention;
+    ops::AttentionPlan attention;
     // With a sliding window, the plan of the sliding layers.
-    std::optional<ops::VerifyAttentionPlan> windowedAttention{};
+    std::optional<ops::AttentionPlan> windowedAttention{};
     std::optional<ops::MoePlan> moe{};
     uint32_t gdnLayer = 0;
     uint32_t attentionLayer = 0;

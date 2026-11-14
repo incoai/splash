@@ -35,12 +35,11 @@ public:
   // prefill attention after each history it plans.
   [[nodiscard]] std::vector<uint32_t> prefillRowClasses() const;
 
-  [[nodiscard]] PrefillAttentionPlan prefillAttention(
-      uint32_t rows, uint32_t historyTokens, uint32_t queryHeads, kv::Layout layout,
-      AttentionVariant variant = {}) const;
-  [[nodiscard]] VerifyAttentionPlan verifyAttention(
-      uint32_t lanes, uint32_t queryHeads, kv::Layout layout,
-      std::span<const uint32_t> historyTokens, AttentionVariant variant = {}) const;
+  // The attention of a command's sequences (PagedAttention::plan) whose
+  // dispatches fit `capacity`, the workspace bound to it.
+  [[nodiscard]] AttentionPlan attention(std::span<const kv::ChunkedPrefillParams> sequences, uint32_t queryHeads,
+                                        kv::Layout layout, AttentionWorkspace capacity,
+                                        AttentionVariant variant = {}) const;
   [[nodiscard]] DraftAttentionPlan draftAttention(
       DraftAttentionShape shape, uint32_t lanes) const;
   // The plans of a MoE target's blocks, whose routers are in `routerFormat`
@@ -51,10 +50,11 @@ public:
   // Bounds cover every row count up to the requested maximum, not just that
   // one. Decode arenas use a per-lane stride of
   // max_B ceil(requiredBytes(B)/B), independently for each scratch field.
-  [[nodiscard]] AttentionWorkspace prefillAttentionWorkspace(
-      uint32_t maximumRows, uint32_t queryHeads, kv::Layout layout) const;
-  [[nodiscard]] AttentionWorkspace verifyAttentionWorkspacePerLane(
-      uint32_t queryHeads, kv::Layout layout) const;
+  // The attention workspace that holds any one sequence's partials, a
+  // prompt chunk's; and a decode lane's, its one tile at the most splits, so
+  // that a step's lanes, their workspaces added, attend in one dispatch.
+  [[nodiscard]] AttentionWorkspace sequenceAttentionWorkspace(uint32_t queryHeads, kv::Layout layout) const;
+  [[nodiscard]] AttentionWorkspace laneAttentionWorkspace(uint32_t queryHeads, kv::Layout layout) const;
   [[nodiscard]] DraftAttentionWorkspace draftAttentionWorkspacePerLane(
       DraftAttentionShape shape) const;
   [[nodiscard]] MoeWorkspace moePrefillWorkspace(

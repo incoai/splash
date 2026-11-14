@@ -20,9 +20,10 @@ INCLUDE = re.compile(r'^\s*#\s*(?:include|import)\s*(["<])([^">]+)[">]', re.MULT
 # Tile, split and kernel-configuration names runtime/ops owns: model/ and
 # engine/ size workspaces through the operators, never through these.
 OPERATOR_WORKSPACE_POLICY_NAMES: tuple[str, ...] = (
-    "prefillAttentionTiles",
-    "kVerifySplits",
-    "kPrefillAttentionTileRows",
+    "attentionTiles",
+    "kAttentionTileRows",
+    "kAttentionMaximumSplits",
+    "kAttentionSequenceSplits",
     "moeMaximumTiles",
     "LinearTile",
     "LinearConfig",

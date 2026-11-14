@@ -20,55 +20,46 @@ using splash::test::attentionRow;
 using splash::test::rejects;
 using splash::test::require;
 
+// A workspace holds tile splits of a geometry's tiles (ops::PagedAttention::
+// workspace): a prompt chunk's arena kAttentionSequenceSplits, which hold the
+// plan of any one sequence of up to the budget's rows after any history, a
+// decode lane's kAttentionMaximumSplits, a lane's one tile at the most
+// splits, so that every lane of a step attends in one dispatch.
 void attention() {
   using namespace splash;
   for (const uint32_t queryHeads : {16U, 24U}) {
     const kv::Layout layout{1, queryHeads == 16 ? 2U : 4U, 256};
-    uint32_t maximumSlots = 0;
-    for (uint32_t rows = 1; rows <= 2048; ++rows) {
-      // Split counts decrease as the M8 tile count grows, so a shorter
-      // request can need more scratch than the exact requested row count;
-      // the longest history takes the most, its 256 tile splits shared out.
-      const uint32_t tiles = (rows + 7) / 8;
-      const uint32_t splits = std::clamp(256U / tiles, 1U, 32U);
-      maximumSlots = std::max(maximumSlots, tiles * splits);
-      const auto workspace = ops::PagedAttention::prefillWorkspace(rows, queryHeads, layout);
-      require(workspace.partialsBytes == uint64_t{maximumSlots} * 8 * queryHeads * 256 * 4,
-              "prefill partial workspace differs from the maximum over actual row counts");
-      require(workspace.statisticsBytes == uint64_t{maximumSlots} * 8 * queryHeads * 2 * 4,
-              "prefill statistics workspace differs from the maximum over actual row counts");
+    const auto slots = [&](uint32_t count) { return ops::PagedAttention::workspace(count, queryHeads, layout); };
+    for (const uint32_t count : {1U, 128U, 256U, 512U})
+      require(slots(count).partialsBytes == uint64_t{count} * 8 * queryHeads * 256 * 4 &&
+                  slots(count).statisticsBytes == uint64_t{count} * 8 * queryHeads * 2 * 4,
+              "an attention workspace is not its tile splits' partials and statistics");
+    const ops::AttentionWorkspace chunk = slots(ops::kAttentionSequenceSplits);
+    require(chunk.partialsBytes == (queryHeads == 24 ? 48U : 32U) * uint64_t{1024 * 1024},
+            "a prompt chunk's attention workspace changed");
+    for (uint32_t rows = 1; rows <= 2048; ++rows)
       for (const uint32_t history : {0U, 65536U, 1'000'000U}) {
-        const auto plan = ops::PagedAttention::prefillPlan(rows, history, queryHeads, layout, ops::kApple10Attention,
-                                                           ops::Int8Activations::Off);
-        require(workspace.partialsBytes >= plan.workspace.partialsBytes &&
-                    workspace.statisticsBytes >= plan.workspace.statisticsBytes,
-                "prefill workspace omitted the plan of its own rows");
+        const std::array sequence{ops::PagedAttention::chunkParams(history, rows, (rows + 31) / 32 * 32,
+                                                                   (history + rows + 31) / 32)};
+        const auto plan = ops::PagedAttention::plan(sequence, queryHeads, layout, ops::kApple10Attention,
+                                                    ops::Int8Activations::Off, chunk);
+        require(plan.dispatches().size() == 1 && plan.workspace().partialsBytes <= chunk.partialsBytes &&
+                    plan.workspace().statisticsBytes <= chunk.statisticsBytes,
+                "a prompt chunk's workspace omitted the plan of a sequence of its rows");
       }
+    std::array<kv::ChunkedPrefillParams, 4> lanes{};
+    for (uint32_t lane = 0; lane < 4; ++lane)
+      lanes[lane] = ops::PagedAttention::chunkParams(1'000'000 - lane, 8, 32, (1'000'008 + 31) / 32);
+    for (uint32_t count = 1; count <= 4; ++count) {
+      const auto plan = ops::PagedAttention::plan(std::span(lanes).first(count), queryHeads, layout,
+                                                  ops::kApple10Attention, ops::Int8Activations::Off,
+                                                  slots(count * kv::kAttentionMaximumSplits));
+      require(plan.dispatches().size() == 1 && plan.dispatches()[0].slots == count * kv::kAttentionMaximumSplits,
+              "a decode step's lanes at the most splits do not attend in one dispatch of their workspace");
     }
-    const auto maximum = ops::PagedAttention::prefillWorkspace(2048, queryHeads, layout);
-    require(maximum.partialsBytes == (queryHeads == 24 ? 48U : 32U) * uint64_t{1024 * 1024},
-            "2048-row prefill partial workspace changed");
-    for (uint32_t lanes = 1; lanes <= 4; ++lanes) {
-      const auto workspace =
-          ops::PagedAttention::verifyWorkspace(lanes, queryHeads, layout);
-      const uint64_t values =
-          uint64_t{lanes} * 8 * kv::kVerifyMaximumSplits * queryHeads;
-      require(workspace.partialsBytes == values * 256 * 4,
-              "verify partial workspace is not sized for the maximum split count");
-      require(workspace.statisticsBytes == values * 2 * 4,
-              "verify statistics workspace is not sized for the maximum split count");
-    }
-    for (const uint32_t rows : {0U, 2049U})
-      rejects([&] { (void)ops::PagedAttention::prefillWorkspace(rows, queryHeads, layout); },
-              "invalid attention workspace rows",
-              "a prefill workspace of no rows or past the budget was sized");
-    for (const uint32_t lanes : {0U, 5U})
-      rejects([&] { (void)ops::PagedAttention::verifyWorkspace(lanes, queryHeads, layout); },
-              "invalid attention workspace batch width",
-              "a verify workspace of no lanes or more than a batch was sized");
-    rejects([&] { (void)ops::PagedAttention::verifyWorkspace(1, 0, layout); },
-            "no paged-attention kernel for layout",
-            "a verify workspace of no query heads was sized");
+    rejects([&] { (void)slots(0); }, "invalid attention workspace slots", "a workspace of no tile splits was sized");
+    rejects([&] { (void)ops::PagedAttention::workspace(1, 0, layout); }, "no paged-attention kernel for layout",
+            "a workspace of no query heads was sized");
   }
 }
 
@@ -80,18 +71,19 @@ void attentionReads() {
   using namespace splash;
   const kv::Layout selected{.attentionLayers = 1, .kvHeads = 2, .headDimension = 256,
                             .valuesTokenMajor = true, .reads = kv::Reads::SelectedBlocks};
-  const std::array<uint32_t, 1> history{4096};
   constexpr ops::Int8Activations off = ops::Int8Activations::Off;
-  require(ops::PagedAttention::prefillPlan(64, 4096, 24, selected, ops::kApple10Attention, off).sparse &&
-              ops::PagedAttention::verifyPlan(1, 24, selected, history, ops::kApple10Attention, off).sparse,
-          "a reader of selected blocks did not plan the sparse kernels");
+  const std::array sequences{ops::PagedAttention::chunkParams(4096, 64, 64, 130),
+                             ops::PagedAttention::chunkParams(4096, 8, 32, 129)};
+  const auto plan = [&](kv::Layout layout) {
+    return ops::PagedAttention::plan(sequences, 24, layout, ops::kApple10Attention, off,
+                                     ops::PagedAttention::workspace(ops::kAttentionSequenceSplits, 24, selected));
+  };
+  require(plan(selected).sparse, "a reader of selected blocks did not plan the sparse kernels");
   kv::Layout everyPage = selected;
   everyPage.reads = kv::Reads::EveryPage;
   require(everyPage.valid(), "a page loop over token-major values is not a layout");
-  rejects([&] { (void)ops::PagedAttention::prefillPlan(64, 4096, 24, everyPage, ops::kApple10Attention, off); },
-          "no paged-attention kernel for layout", "the page loop planned the sparse kernels of token-major values");
-  rejects([&] { (void)ops::PagedAttention::verifyPlan(1, 24, everyPage, history, ops::kApple10Attention, off); },
-          "no paged-attention kernel for layout", "the page loop planned the sparse kernels of token-major values");
+  rejects([&] { (void)plan(everyPage); }, "no paged-attention kernel for layout",
+          "the page loop planned the sparse kernels of token-major values");
   kv::Layout dimensionMajor = selected;
   dimensionMajor.valuesTokenMajor = false;
   require(!dimensionMajor.valid(), "a reader of selected blocks took dimension-major values");
