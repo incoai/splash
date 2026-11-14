@@ -423,3 +423,8 @@ leaves `dev/tests` and `dev/benchmarks` out (`.gitattributes`), and a copy
 that keeps the files' old times leaves make running stale binaries. For a
 gate, delete the test binary before building it and record the commit, an
 empty `git status --porcelain`, the binary's SHA-256 and its test count.
+
+## Development profiler and capture parity checks
+
+[Flash-Next profiling options and the disabled capture-fusion fixture](development-profiling.md)
+describe the model-free checks, native measurement scopes and deferred model gates.

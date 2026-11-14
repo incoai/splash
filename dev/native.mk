@@ -501,7 +501,7 @@ $(TEST_MODEL_RUNTIME_ORACLE): dev/tests/engine/model_runtime_oracle_test.mm \
 # The oracle remembers the split's calibration under the build, as the engine does.
 $(TEST_MODEL_RUNTIME_ORACLE): ENGINE_TEST_CXXFLAGS += -include $(BUILD_ID_HEADER)
 $(TEST_DECODE_PROFILE): dev/benchmarks/decode_profile.mm \
-		dev/tools/LoadOptions.hpp \
+		dev/tools/LoadOptions.hpp dev/tools/DecodeProfileOptions.hpp \
 		$(ENGINE_INSTRUMENTED_METAL_OBJECT) $(ENGINE_LIBRARY) $(LIB)
 $(TEST_TEACHER_LOGITS): dev/benchmarks/teacher_logits.mm \
 		dev/tools/LoadOptions.hpp \
@@ -976,3 +976,29 @@ test-sanitizers-metal:
 	$(METAL_TSAN_TEST_ENV) $(METAL_TSAN_BUILD)/engine-tests/expert-store $(METAL_TSAN_BUILD)/splash.metallib
 	$(METAL_TSAN_TEST_ENV) $(METAL_TSAN_BUILD)/engine-tests/metal-backend \
 		$(METAL_TSAN_BUILD)/engine-tests/metal-backend.metallib --filter behaviour/
+
+# Development-only checks. Neither target loads a model or records timings.
+TEST_DECODE_PROFILE_OPTIONS := $(ENGINE_TEST_BUILD)/decode-profile-options
+TEST_HYPER_CAPTURE_PARITY := $(ENGINE_TEST_BUILD)/hyper-capture-parity
+TEST_HYPER_CAPTURE_AIR := $(ENGINE_TEST_BUILD)/hyper-capture-parity.air
+TEST_HYPER_CAPTURE_LIB := $(ENGINE_TEST_BUILD)/hyper-capture-parity.metallib
+$(TEST_DECODE_PROFILE_OPTIONS): dev/tests/engine/decode_profile_options_test.cpp dev/tools/DecodeProfileOptions.hpp dev/tools/LoadOptions.hpp | $(ENGINE_TEST_BUILD)
+	$(CXX) $(ENGINE_CXXFLAGS) -Idev $< -o $@
+$(TEST_HYPER_CAPTURE_AIR): dev/tests/engine/hyper_capture_parity.metal runtime/metal/kernels/shared/hyper_connection.metal $(KERNEL_HEADERS) | $(ENGINE_TEST_BUILD)
+	$(METAL) $(PROD_METALFLAGS) -c $< -o $@
+$(TEST_HYPER_CAPTURE_LIB): $(TEST_HYPER_CAPTURE_AIR)
+	$(METALLIB) $< -o $@
+$(TEST_HYPER_CAPTURE_PARITY): dev/tests/engine/hyper_capture_parity_test.mm dev/tests/engine/HyperCaptureContract.hpp | $(ENGINE_TEST_BUILD)
+	$(CXX) $(ENGINE_OBJCXXFLAGS) -Idev $< -framework Foundation -framework Metal -o $@
+.PHONY: test-decode-profile-options test-hyper-capture-parity
+test-decode-profile-options: $(TEST_DECODE_PROFILE_OPTIONS)
+	$(TEST_DECODE_PROFILE_OPTIONS)
+test-hyper-capture-parity: $(TEST_HYPER_CAPTURE_PARITY) $(TEST_HYPER_CAPTURE_LIB)
+	$(TEST_HYPER_CAPTURE_PARITY) $(TEST_HYPER_CAPTURE_LIB)
+	MTL_SHADER_VALIDATION=1 $(TEST_HYPER_CAPTURE_PARITY) $(TEST_HYPER_CAPTURE_LIB)
+TEST_HYPER_CAPTURE_CONTRACT := $(ENGINE_TEST_BUILD)/hyper-capture-contract
+$(TEST_HYPER_CAPTURE_CONTRACT): dev/tests/engine/hyper_capture_contract_test.cpp dev/tests/engine/HyperCaptureContract.hpp | $(ENGINE_TEST_BUILD)
+	$(CXX) $(ENGINE_CXXFLAGS) -Idev $< -o $@
+.PHONY: test-hyper-capture-contract
+test-hyper-capture-contract: $(TEST_HYPER_CAPTURE_CONTRACT)
+	$(TEST_HYPER_CAPTURE_CONTRACT)
