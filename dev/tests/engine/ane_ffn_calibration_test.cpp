@@ -207,6 +207,21 @@ void testMinimumRows() {
     rejects([&] { static_cast<void>(minimumRows(timings)); }, "not those of its functions", what + " were taken");
 }
 
+// A split takes no chunk longer than another where each chunk it times, from its own least rows, takes at most 2% longer
+// than the other's: one faster at the most rows and alike elsewhere, or within 2% everywhere, does; one whose 640-row
+// function takes 6.0 ms against 5.5 splits from 603 rows, which leaves chunks of 575 to 602 rows on the GPU alone,
+// 5.62 to 5.88 ms against 5.5, and its own chunks of 603 to 640 rows at 6.0, and does not; nor does one that splits
+// none.
+void testSlowerNowhere() {
+  const ChunkTimings incumbent = functions(0.8, {{640, 5.5}});
+  require(slowerNowhere(incumbent, incumbent) && slowerNowhere(functions(0.8, {{640, 5.5}, {2048, 15.0}}), incumbent) &&
+              slowerNowhere(functions(0.81, {{640, 5.6}}), incumbent),
+          "a split no chunk of which took longer was refused");
+  require(!slowerNowhere(functions(0.8, {{640, 6.0}, {2048, 15.0}}), incumbent) &&
+              !slowerNowhere(functions(0.8, {{2048, 21.0}}), incumbent),
+          "a split that took chunks longer was taken");
+}
+
 // A calibration as a line of text comes back as it was, and one of no split as none; a line of another tag or
 // version, with more or fewer fields, units without least rows or the GPU alone out of order or unusable is not one.
 void testCalibrationText() {
@@ -288,6 +303,7 @@ int main() {
     testUsable();
     testNearestUnits();
     testMinimumRows();
+    testSlowerNowhere();
     testCalibrationText();
     testBreaker();
     std::cout << "ane ffn calibration tests passed\n";

@@ -1204,8 +1204,13 @@ and an M5 Pro the ANE's is the longer (1.7 ms a unit of the full-chunk layer
 against 0.6 and 1.1 ms), on an M6 the GPU's (1.9 against 1.2 ms), all with
 `--activations bf16`. It fits u at 0.4, then again at the units it chose,
 nearest T's least, from their split's full-chunk layer as the chunks' timings
-below take it; the units that fit chooses serve, their split prepared and
-timed in turn where they differ. Where the ANE's part takes the longer already
+below take it; where that fit chooses other units, their split is prepared
+and timed in turn, and serves if it takes no chunk of the functions' rows more
+than 2% longer than the first, each split from its own least chunk, the first
+otherwise: the refit took Qwen3.8-27B UD-Q4_K_M from 9 of its 34 units to 10
+on an M5 Max, whose full chunk prefilled 1.5-2.0% faster but which split
+chunks from 780 rows against 575, so that chunks of 640 and 672 rows ran 12%
+slower, and 9 serve. Where the ANE's part takes the longer already
 at 0.4, as on a 32-core M5 Max by default, 0.4 leaves u at none and T short of
 its least comes out too short: half the calibrations of Qwen3.8-27B took 6
 units, which prefill chunks of 1,024 to 2,016 rows 1.4-1.5% slower than 7,
