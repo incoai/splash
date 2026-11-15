@@ -1,6 +1,7 @@
 #include "AwakeClock.hpp"
 #include "LinearNumerics.hpp"
 #include "PenaltyReference.hpp"
+#include "StateCodecReference.hpp"
 #include "TestChecks.hpp"
 #include "TestKvTier.hpp"
 #include "ane/ProgramInstrumentation.hpp"
@@ -2059,6 +2060,147 @@ void requireCapturesOutliveTheirItems(model::Runtime &executor,
   while (executor.releaseIdleBuffer(false)) {
   }
   std::cout << "captures_outlive_their_items=PASS\n";
+}
+
+// A decode cycle's captured state (Runtime::encodeDecodeCaptures, whose fold
+// stores the state's codes) holds the codes the codec makes of the state the
+// lane itself holds at that page, bit for bit: a cycle that retains exactly
+// the rows before its page captures it, and the lane's next cycle, which
+// folds those rows as the capture did, leaves the lane's cell at that state.
+// Restored, the capture gives that cell's convolution rows and its
+// recurrent state through the codes (StateCodecReference.hpp). Beside it, a
+// prefill of the same tokens captured at the same page: its own arithmetic
+// for the rows past the prompt leaves a state a little off the decode's, so
+// its codes are compared for the record only.
+void requireDecodeCaptureMatchesTheLane(model::Runtime &executor, model::QwenStateStorage &states,
+                                        std::span<const uint32_t> chat) {
+  if (!executor.capturesInDecode()) {
+    std::cout << "decode_capture=SKIP (the target writes auxiliary state with its retained rows)\n";
+    return;
+  }
+  const std::vector<uint32_t> decodePages = pageRange(100, 5), prefillPages = pageRange(105, 5);
+  const auto promptOf = [&](uint32_t length) {
+    std::vector<uint32_t> tokens(length);
+    for (uint32_t index = 0; index < length; ++index)
+      tokens[index] = chat[index % chat.size()];
+    return tokens;
+  };
+  // Request `id` on lane 0 from `length` prompt tokens to its first cycle,
+  // which captures the page at `boundary` when given one; the rows it
+  // retained.
+  const auto firstCycle = [&](uint64_t id, uint32_t length, std::optional<uint32_t> boundary,
+                              std::vector<std::shared_ptr<const CompositeState>> &captured) {
+    const std::vector<uint32_t> tokens = promptOf(length);
+    beginCold(executor, makeRequest(id, tokens, 64), 0);
+    executor.setDraftContextPlan(id, planDraftContext(0, length, {}));
+    const ModelStepResult prefilled = prefillChunk(executor, id, 0, tokens, decodePages);
+    require(prefilled.failure.empty() && prefilled.outputTokens.empty(),
+            "a decode capture's prompt ended right after prefill");
+    const BatchPlan plan{.kind = WorkKind::Decode, .items = {{id, 0}}, .decodeStage = DecodeStage::Regular};
+    ModelBatchItem item = withRevision({id, length, 0, decodePages});
+    if (boundary) {
+      metal::AllocationFailure refusal;
+      item.stateCaptures.push_back({*boundary, executor.reserveState(id, *boundary, refusal)});
+      require(item.stateCaptures.back().reservation != nullptr, "the buffers of a decode capture were refused");
+    }
+    std::vector<ModelStepResult> results = executor.decode(plan, std::span<const ModelBatchItem>(&item, 1));
+    require(results.size() == 1 && results[0].failure.empty() && !results[0].finished,
+            "a decode capture's cycle failed or ended its request");
+    captured = std::move(results[0].capturedStates);
+    return std::pair{static_cast<uint32_t>(states.metadata(0).lengths.targetTokens - length),
+                     std::move(results[0].outputTokens)};
+  };
+  // A prompt whose first cycle retains exactly the rows before a page, the
+  // most of them found, so that the fold takes several rows where it can.
+  uint32_t prompt = 0, boundary = 0;
+  std::vector<std::shared_ptr<const CompositeState>> none;
+  for (const uint32_t page : {96U, 128U})
+    for (uint32_t length = page - 8; length < page; ++length) {
+      const uint32_t retained = firstCycle(440 + length, length, std::nullopt, none).first;
+      executor.end(440 + length);
+      if (length + retained == page && (!prompt || page - length > boundary - prompt)) {
+        prompt = length;
+        boundary = page;
+      }
+    }
+  require(prompt != 0, "no prompt of 88 to 127 tokens had a first cycle that ended at a page");
+  std::vector<std::shared_ptr<const CompositeState>> captured;
+  const auto [retained, generated] = firstCycle(430, prompt, boundary, captured);
+  require(prompt + retained == boundary && captured.size() == 1 && generated.size() >= retained,
+          "the capturing cycle did not retain exactly the rows before its page, as the same cycle did before");
+  // The lane's next cycle folds those rows: its cell is then the state at
+  // the page.
+  const ModelStepResult next = decodeOne(executor, 430, boundary, decodePages);
+  require(next.failure.empty(), "the cycle after a decode capture failed");
+  const model::GdnStateLayout layout = states.layout().target;
+  const std::vector<uint8_t> lane = bytesOf(states.current(0).stateBase);
+  executor.end(430);
+  std::vector<uint32_t> through = promptOf(prompt);
+  through.insert(through.end(), generated.begin(), generated.begin() + retained);
+  // A restore leaves its request a token to prefill.
+  std::vector<uint32_t> probe = through;
+  probe.push_back(chat[boundary % chat.size()]);
+  const StateBytes fromDecode = restoredBytes(executor, states, 432, 2, probe, boundary, captured.front());
+
+  const bool bfloat = layout.format == ops::GdnStateFormat::BFloat16;
+  const uint32_t rows = layout.recurrentGroups * layout.recurrentRows, columns = layout.recurrentColumns;
+  const uint64_t carried = uint64_t{layout.convolutionHistory} * layout.convolutionChannels * 2;
+  const auto values = [&](const std::vector<uint8_t> &cell, uint32_t layer) {
+    const uint8_t *at = cell.data() + layout.convolutionBytes() + uint64_t{layer} * layout.recurrentLayerBytes();
+    std::vector<float> result(uint64_t{rows} * columns);
+    for (uint64_t index = 0; index < result.size(); ++index) {
+      if (bfloat) {
+        uint16_t narrow = 0;
+        std::memcpy(&narrow, at + index * 2, 2);
+        result[index] = test::bf16ToFloat(narrow);
+      } else {
+        std::memcpy(&result[index], at + index * 4, 4);
+      }
+    }
+    return result;
+  };
+  uint64_t differing = 0;
+  for (uint32_t layer = 0; layer < layout.layers; ++layer) {
+    const uint64_t rowsAt = uint64_t{layer} * layout.convolutionLayerBytes();
+    require(std::memcmp(fromDecode.cell.data() + rowsAt, lane.data() + rowsAt, carried) == 0,
+            "a decode capture's convolution rows are not the lane's at its page");
+    // The lane's state through the codec, as a restore of its codes gives it.
+    const std::vector<float> state = values(lane, layer), restored = values(fromDecode.cell, layer);
+    const std::vector<uint8_t> codes = test::stateCodesReference(state.data(), rows, columns);
+    for (uint64_t index = 0; index < state.size(); ++index) {
+      uint16_t scale = 0;
+      std::memcpy(&scale, codes.data() + state_codec_scales_offset(rows, columns) +
+                              index / SPLASH_STATE_CODEC_BLOCK * 2, 2);
+      float expected = static_cast<float>(static_cast<int8_t>(codes[index])) * test::bf16ToFloat(scale);
+      if (bfloat)
+        expected = test::bf16ToFloat(test::floatToBf16(expected));
+      differing += expected != restored[index];
+    }
+  }
+  require(differing == 0, "a decode capture restores " + std::to_string(differing) +
+                              " recurrent values other than the codes of the lane's state at its page");
+
+  // For the record: a prefill of the same tokens captured at the same page.
+  beginCold(executor, makeRequest(431, through, 1), 1);
+  executor.setDraftContextPlan(431, planDraftContext(0, boundary, {}));
+  requireOpen(prefillChunk(executor, 431, 0, std::span(through).first(prompt), prefillPages), "decode capture");
+  const std::array<uint32_t, 1> end{boundary};
+  ModelStepResult rest =
+      prefillChunk(executor, 431, prompt, std::span(through).subspan(prompt), prefillPages, {}, end);
+  require(rest.failure.empty() && rest.capturedStates.size() == 1, "the prefill capture at the page failed");
+  executor.end(431);
+  const StateBytes fromPrefill = restoredBytes(executor, states, 433, 2, probe, boundary, rest.capturedStates.front());
+  SimilarityAccumulator recurrent;
+  for (uint32_t layer = 0; layer < layout.layers; ++layer) {
+    const std::vector<float> left = values(fromDecode.cell, layer), right = values(fromPrefill.cell, layer);
+    for (uint64_t index = 0; index < left.size(); ++index)
+      recurrent.add(left[index], right[index]);
+  }
+  const std::streamsize precision = std::cout.precision(9);
+  std::cout << "decode_capture prompt=" << prompt << " rows=" << retained << " lane_codes_equal=1"
+            << " prefill_recurrent_cos=" << recurrent.result().cosine << '\n';
+  std::cout.precision(precision);
+  std::cout << "decode_capture=PASS\n";
 }
 
 // Fills every byte of a lane's GDN recurrent state, the half of the cell its
@@ -4787,6 +4929,7 @@ int main(int argc, char **argv) {
     requireThinkingEndVerifiesItsTokens(executor, model);
     requireStatesCapturedInsideCommands(executor, backend, pages, states, aneFfn.get(), samplingSeedTokens);
     requireCapturesOutliveTheirItems(executor, states, samplingSeedTokens);
+    requireDecodeCaptureMatchesTheLane(executor, states, samplingSeedTokens);
     requirePrefillGroupMatchesItsChunks(executor, pages, states, samplingSeedTokens,
                                         model.descriptor.hasVision());
     requirePrefillPassesMatchWhole(executor, pages, states, samplingSeedTokens, model.descriptor.hasVision());
