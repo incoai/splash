@@ -431,8 +431,8 @@ AneFfn::AneFfn(metal::MetalBackend &backend, const Linear &linear, std::span<con
 
   for (const SwiGluProjections &source : layers)
     layers_.push_back({{Planes(*source.gate), Planes(*source.up), Planes(*source.down)},
-                       source.gate->leadingRows(backend_, shape_.gpu),
-                       source.up->leadingRows(backend_, shape_.gpu),
+                       source.gate->rows(backend_, {{0, shape_.gpu}}),
+                       source.up->rows(backend_, {{0, shape_.gpu}}),
                        source.down->leadingInputs(shape_.gpu)});
 
   const std::vector<Input> inputs = programInputs(shape_, memory_);

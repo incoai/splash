@@ -401,8 +401,8 @@ the Qwen readers.
 Every source loads into block planes: `Projection`, `BlockMoeWeights` and
 `EmbeddingWeights` (`runtime/ops/Weights.hpp`, `MoE.hpp`) hold them whatever
 the source container, and represent different operator contracts. Arena
-sizing collects each projection's shape and reserves the vocabulary head only
-for decode.
+sizing collects each projection's shape and reserves the vocabulary head, and
+the draft's view of its rows ([Drafts](models.md#drafts)), only for decode.
 
 ## Kernels
 

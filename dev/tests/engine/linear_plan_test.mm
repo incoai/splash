@@ -1179,7 +1179,8 @@ void ggufProjectionMatrix(metal::MetalBackend &backend) {
     require(graph.empty(), "a block projection that is not the plan's tiles encoded a dispatch");
   }
   // A projection with an fp32 destination writes fp32 rows through the
-  // kernel's fp32 instance; the fused kernels have none.
+  // kernel's fp32 instance; the fused kernels have none, so one of several
+  // tensors runs a dispatch of each tensor's, into its own columns.
   Projection head = matching, fused(5120, 17408, BlockWeights{{segment(2560, 0), segment(2560, 2560)}});
   head.destination = fused.destination = FloatOutput::Float32;
   const LinearPlan fp32 = linear.plan({{5120, 17408}, 8}, head);
@@ -1188,12 +1189,27 @@ void ggufProjectionMatrix(metal::MetalBackend &backend) {
   metal::CommandGraph graph;
   rejects([&] { (void)linear.add(graph, buffers, head, fp32); }, "projection output buffer holds",
           "fp32 rows were written into a bf16 output");
-  rejects([&] { (void)linear.add(graph, fp32Buffers, fused, linear.plan({{5120, 17408}, 8}, fused)); },
-          "an fp32 destination takes a single-tensor block projection", "a fused fp32 block projection was accepted");
   require(graph.empty(), "an invalid fp32 block projection encoded a dispatch");
   (void)linear.add(graph, fp32Buffers, head, fp32);
   require(graph.dispatches().size() == 1 && graph.dispatches()[0].pipelineName == "gguf_decode_q4k_m8_a_f32",
           "the fp32 block projection did not encode its fp32 kernel");
+  for (const LinearConfig config : {LinearConfig{.tile = LinearTile::GgufStaged}, {.tile = LinearTile::GgufRegister}}) {
+    const LinearPlan plan = Linear::plan({{5120, 17408}, 8}, config, FloatOutput::Float32);
+    const LinearScratchSize size = plan.scratchSize();
+    LinearBuffers tensors = fp32Buffers;
+    tensors.scratch = {allocate(backend, size.input), allocate(backend, size.sums), allocate(backend, size.partials),
+                       allocate(backend, size.counters)};
+    metal::CommandGraph each;
+    (void)linear.add(each, tensors, fused, plan);
+    const std::string kernel = config.tile == LinearTile::GgufStaged ? "gguf_decode_q4k_m8_a_f32"
+                                                                     : "gguf_decode_sg_q4k_l1_a_f32";
+    std::vector<uint32_t> offsets;
+    for (const metal::ComputeDispatch &dispatch : each.dispatches())
+      if (dispatch.pipelineName == kernel)
+        offsets.push_back(static_cast<const GgufDecodeParams *>(dispatch.bytes.front().data)->out_offset);
+    require(offsets == std::vector<uint32_t>{0, 2560},
+            "an fp32 projection of two tensors did not run " + kernel + " into each one's columns");
+  }
 }
 
 // A producer writes the table its consumer's plan reads into scratch that
@@ -1462,8 +1478,10 @@ void blockExtents(metal::MetalBackend &backend) {
 // shorter or holding only a matrix of the view's own inputs is refused. Every
 // other plan and a rotated view are refused before anything is encoded. The
 // views' factories refuse inputs beyond the projection's or of part of a quant
-// group or meta unit, rows of part of a tile, and float or rotated weights or a
-// view; a view of leading rows holds its planes' first tiles.
+// group or meta unit, rows of part of a tile or past the tensor's, float or
+// rotated weights or a view for leading inputs, and a view of a view's inputs
+// for rows; a view of rows holds its ranges of each plane, or of float rows, in
+// order, with the source's rotation and destination.
 void leadingInputViews(metal::MetalBackend &backend) {
   const Linear linear = gpu(10, 16);
   constexpr uint32_t n = 512, k = 512, wide = 1024, rows = 168;
@@ -1547,7 +1565,7 @@ void leadingInputViews(metal::MetalBackend &backend) {
   // of float or rotated weights or of a view, are refused.
   const Projection wideGguf(n, wide, BlockWeights{{wideSegment}});
   constexpr std::string_view kInputs = "a view of leading inputs takes whole quant groups and meta units";
-  constexpr std::string_view kSource = "views of a projection's planes take one unrotated quantized tensor";
+  constexpr std::string_view kSource = "a view of leading inputs takes one unrotated quantized tensor";
   rejects([&] { (void)wideGguf.leadingInputs(wide + 256); }, kInputs, "a view of more inputs than rows hold");
   rejects([&] { (void)wideGguf.leadingInputs(k + 16); }, kInputs, "a view of part of a quant group");
   rejects([&] { (void)wideGguf.leadingInputs(k + 64); }, kInputs, "a view of part of a Q5_K meta unit");
@@ -1557,20 +1575,45 @@ void leadingInputViews(metal::MetalBackend &backend) {
   rejects([&] { (void)floats.leadingInputs(k); }, kSource, "a view of float weights");
   rejects([&] { (void)rotatedSource.leadingInputs(k); }, kSource, "a view of rotated weights");
   rejects([&] { (void)gguf.leadingInputs(k / 2); }, kSource, "a view of a view");
-  rejects([&] { (void)floats.leadingRows(backend, 256); }, kSource, "a view of the rows of float weights");
+  rejects([&] { (void)gguf.rows(backend, {{0, 256}}); }, "a view of rows takes a projection of one tensor",
+          "a view of the rows of a view of leading inputs");
 
-  // A view of leading rows, whole plane tiles, takes each plane's first tiles.
-  const Projection ggufRows = wideGguf.leadingRows(backend, 256);
-  const QuantizedSegment &segment = ggufRows.blocks().segments.front();
-  require(ggufRows.outputSize == 256 && !ggufRows.planeInputs() && segment.outputSize == 256 &&
-              segment.inputSize == wide &&
-              segment.plane0.sizeBytes() == uint64_t{256} * (wide / 32) * q5k.plane0_bytes &&
-              segment.plane1.sizeBytes() == uint64_t{256} * (wide / 32) * q5k.plane1_bytes &&
-              segment.meta.sizeBytes() == uint64_t{256} * (wide / 32 / q5k.meta_groups) * q5k.meta_bytes,
-          "a view of 256 Q5_K rows does not hold their tile");
-  for (const uint32_t count : {0u, QUANT_TILE_ROWS / 2, n + QUANT_TILE_ROWS})
-    rejects([&] { (void)wideGguf.leadingRows(backend, count); }, "whole plane tiles",
-            "a view of " + std::to_string(count) + " leading rows");
+  // A view of rows, whole plane tiles, takes each plane's tiles of its ranges in order (the leading 256 rows and the
+  // last 128, with an empty range between), and the source's rotation and fp32 destination.
+  Projection source = rotatedSource;
+  source.destination = FloatOutput::Float32;
+  const Projection ggufRows = source.rows(backend, {{0, 256}, {256, 0}, {n - 128, 128}});
+  require(ggufRows.outputSize == 384 && ggufRows.inputSize == wide && !ggufRows.planeInputs() &&
+              ggufRows.rotation.signs.sameView(source.rotation.signs) &&
+              ggufRows.destination == FloatOutput::Float32 && ggufRows.blocks().segments.size() == 2,
+          "a view of two ranges of Q5_K rows is not a projection of their 384 rows");
+  const auto bytes = [&](uint32_t rows) {
+    return std::array<uint64_t, 3>{uint64_t{rows} * (wide / 32) * q5k.plane0_bytes,
+                                   uint64_t{rows} * (wide / 32) * q5k.plane1_bytes,
+                                   uint64_t{rows} * (wide / 32 / q5k.meta_groups) * q5k.meta_bytes};
+  };
+  for (const auto &[index, first, count] : {std::tuple{0U, 0U, 256U}, std::tuple{1U, n - 128, 128U}}) {
+    const QuantizedSegment &segment = ggufRows.blocks().segments[index];
+    const std::array<uint64_t, 3> offset = bytes(first), size = bytes(count);
+    require(segment.outputSize == count && segment.inputSize == wide && segment.columnOffset == index * 256 &&
+                segment.plane0.sameView(backend.view(wideSegment.plane0, offset[0], size[0])) &&
+                segment.plane1.sameView(backend.view(wideSegment.plane1, offset[1], size[1])) &&
+                segment.meta.sameView(backend.view(wideSegment.meta, offset[2], size[2])),
+            "a view of " + std::to_string(count) + " Q5_K rows from " + std::to_string(first) +
+                " does not hold their tiles");
+  }
+  // Float rows lie in row order.
+  const Projection floatRows = floats.rows(backend, {{n - 64, 64}});
+  require(floatRows.blocks().segments.front().isFloat() &&
+              floatRows.blocks().segments.front().plane0.sameView(
+                  backend.view(floats.blocks().segments.front().plane0, uint64_t{n - 64} * wide * 4, 64 * wide * 4)),
+          "a view of 64 float rows does not hold them");
+  for (const Projection::RowRange range :
+       {Projection::RowRange{0, QUANT_TILE_ROWS / 2}, {QUANT_TILE_ROWS / 2, QUANT_TILE_ROWS}, {0, n + QUANT_TILE_ROWS},
+        {n - QUANT_TILE_ROWS, 2 * QUANT_TILE_ROWS}})
+    rejects([&] { (void)wideGguf.rows(backend, {range}); }, "whole QUANT_TILE_ROWS tiles of the tensor's rows",
+            "a view of " + std::to_string(range.count) + " rows from " + std::to_string(range.first));
+  rejects([&] { (void)wideGguf.rows(backend, {{0, 0}}); }, "block projection has no segments", "a view of no rows");
 }
 
 // Each scratch field of a GGUF register plan at its extent and one element

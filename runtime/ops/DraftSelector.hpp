@@ -19,7 +19,7 @@ struct DraftSelectorWorkspace final {
 };
 
 struct DraftSelectorBuffers final {
-  // fp32 [rows][vocabulary].
+  // fp32 [rows][the columns of the draft's vocabulary] (DraftVocabulary).
   metal::MetalBuffer logits;
   metal::MetalBuffer partialIds;
   metal::MetalBuffer partialValues;
@@ -87,6 +87,21 @@ struct DraftTreeLane final {
   uint64_t noise = 0;
 };
 
+// The tokens a draft proposes from, which its logits rows hold in order: the
+// vocabulary's first `leading`, then its tokens from `trailing` to its end.
+// The default holds every token.
+struct DraftVocabulary final {
+  uint32_t leading = 0;
+  uint32_t trailing = 0;
+
+  // The columns of its logits rows in a vocabulary of `vocabulary` tokens.
+  [[nodiscard]] constexpr uint32_t columns(uint32_t vocabulary) const noexcept {
+    return leading + (vocabulary - trailing);
+  }
+  [[nodiscard]] constexpr bool holds(uint32_t token) const noexcept { return token < leading || token >= trailing; }
+  bool operator==(const DraftVocabulary &) const = default;
+};
+
 // The draft's selector codebooks, which score the edge from a proposal
 // position's predecessor candidate to each of its candidates.
 struct DraftCodebooks final {
@@ -111,8 +126,10 @@ public:
   // Exact scratch/output bytes for that many proposal positions.
   [[nodiscard]] static DraftSelectorWorkspace workspace(uint32_t positions);
 
+  // Proposals from `vocabulary`'s tokens, whose logits rows buffers.logits
+  // holds.
   void add(metal::CommandGraph &graph, const DraftSelectorBuffers &buffers, const DraftCodebooks &codebooks,
-           std::span<const DraftTreeLane> lanes) const;
+           DraftVocabulary vocabulary, std::span<const DraftTreeLane> lanes) const;
   // After add: the rows of a decode step of `step.lanes` lanes
   // (VerifyRowsParams), the trees' best rows that the step's rows and its
   // lane cap hold, none past an anchor estimated below `floor`, each lane's

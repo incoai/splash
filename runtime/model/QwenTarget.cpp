@@ -43,6 +43,11 @@ void QwenTargetGeometry::finish(std::span<const ops::BlockMoeWeights *const> moe
   moeRouterFormat = ops::moeRouterFormat(moeBlocks);
   prefillProjections = decodeProjections;
   include(logits);
+  // The draft's head over its subset of the vocabulary: a view of the head's
+  // rows (DFlashDraft), the head's shape over fewer of them.
+  ops::ProjectionShape subset = logits.shape();
+  subset.outputSize = draftVocabulary.columns(vocabularySize);
+  decodeProjections.push_back(subset);
   for (auto *shapes : {&prefillProjections, &decodeProjections, &gateUpProjections}) {
     std::sort(shapes->begin(), shapes->end());
     shapes->erase(std::unique(shapes->begin(), shapes->end()), shapes->end());

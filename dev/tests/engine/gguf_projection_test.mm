@@ -22,6 +22,9 @@
 // - int8 prefill (af4g64, af5g64, where the family runs it): the products of the inputs rounded per row and 64-input
 //   group, also with an outlier input per row, within a bound of the bf16 tile's error, a chunk's last rows at their
 //   own height and a view of leading inputs bitwise, and a non-finite input's row alone not finite;
+// - row views: the fp32 decode of a view of a tensor's leading and last rows (the draft's vocabulary head over its
+//   subset), a dispatch per range, bitwise those columns of the whole tensor's, every format on both decode tiles
+//   and rotated PQ2_0 in bf16 and int8 activations;
 // - split visibility: two projections that share the split scratch, at every pair of K splits either tile's policy
 //   picks for 8-80 cores (the register tile's for Flash-Next's hyper-connection pair too), independent of poisoned
 //   partials;
@@ -1474,6 +1477,77 @@ void leadingInputs(MetalBackend &backend, const Linear &linear) {
           "inputs equal to them repacked");
 }
 
+// ---------------------------------------------------------------- row views
+// A view of rows of a projection's tensor (Projection::rows), as the draft's vocabulary head runs over a subset of its
+// rows (DFlashDraft): its fp32 decode, a dispatch per range of rows, equals bit for bit the same columns of the whole
+// tensor's on the same plan, in every format on both decode tiles and rotated PQ2_0 in bf16 and on the int8 tiles, at
+// one and four lanes, K split in two where the tile takes it.
+void rowViews(MetalBackend &backend, const Linear &linear) {
+  constexpr uint32_t N = 512, K = 2048;
+  // The leading 256 rows and the last 128, as the draft's subset takes the vocabulary's leading and last tokens.
+  constexpr std::array<Projection::RowRange, 2> kRanges{{{0, 256}, {N - 128, 128}}};
+  const std::vector<float> x = activations(Inputs::Dense, kMaximumRows, K);
+  // The fp32 rows a plan of `p` writes from the input rows.
+  const auto logits = [&](const LinearPlan &plan, const Projection &p, const std::string &label) {
+    const uint32_t columns = plan.workload().matrix.outputSize;
+    const Scratch scratch(backend, scratchSize(linear, plan, p));
+    const Guarded input = bfloats(backend, storageRows(x, K, plan.workload().rows, plan.storageRows()));
+    const Guarded output(backend, uint64_t{plan.storageRows()} * columns * sizeof(float), 0xFF);
+    scratch.poison(kPoisonNaN);
+    CommandGraph graph;
+    static_cast<void>(
+        linear.add(graph, {.input = input.view, .output = output.view, .scratch = scratch.bindings()}, p, plan));
+    static_cast<void>(backend.submitCommandAsync(graph.dispatches()).wait());
+    if (!scratch.intact() || !input.intact() || !output.intact())
+      fail(label + ": a counter is not reset or a write past a buffer");
+    const auto *values = static_cast<const uint32_t *>(output.view.contents());
+    return std::vector<uint32_t>(values, values + uint64_t{plan.workload().rows} * columns);
+  };
+  uint32_t cases = 0;
+  const auto compare = [&](Projection whole, LinearConfig config, const std::string &name) {
+    whole.destination = FloatOutput::Float32;
+    const Projection view = whole.rows(backend, {kRanges[0], kRanges[1]});
+    for (const uint32_t lanes : {1U, kMaximumLanes}) {
+      const LinearWorkload all = decode({N, K}, lanes, LinearEpilogue::None),
+                           part = decode({view.outputSize, K}, lanes, LinearEpilogue::None);
+      // The int8 tiles hold 16 rows at the fewest.
+      config.sixteenRows = config.decodeInt8 && lanes == 1;
+      const std::string label = name + " row view L=" + std::to_string(lanes);
+      const std::vector<uint32_t> expected = logits(Linear::plan(all, config, FloatOutput::Float32), whole, label),
+                                  got = logits(Linear::plan(part, config, FloatOutput::Float32), view, label);
+      uint32_t column = 0;
+      for (const Projection::RowRange range : kRanges) {
+        for (uint32_t r = 0; r < all.rows; ++r)
+          if (!std::equal(got.begin() + uint64_t{r} * view.outputSize + column,
+                          got.begin() + uint64_t{r} * view.outputSize + column + range.count,
+                          expected.begin() + uint64_t{r} * N + range.first))
+            fail(label + ": row " + std::to_string(r) + " of rows " + std::to_string(range.first) + "+" +
+                 std::to_string(range.count) + " differs from the whole tensor's");
+        column += range.count;
+      }
+      ++cases;
+    }
+  };
+  for (const LinearTile tile : {LinearTile::GgufRegister, LinearTile::GgufStaged})
+    for (const Fmt f : tileFormats(tile)) {
+      const Tensor t = tensor(backend, f, N, K);
+      const uint32_t splits = takesSplits(tile, f, K, 2) ? 2 : 1;
+      compare(projection({&t}, N), {.tile = tile, .splits = splits}, std::string(tileName(tile)) + " " + fmtName(f));
+    }
+  MetalBuffer signs = test::sharedBuffer(backend, K);
+  for (uint32_t i = 0; i < K; ++i) static_cast<int8_t *>(signs.contents())[i] = rng() & 1 ? 1 : -1;
+  const Tensor pq20 = tensor(backend, PQ20, N, K);
+  Projection rotated = projection({&pq20}, N);
+  rotated.rotation.signs = signs;
+  for (const LinearTile tile : {LinearTile::GgufRegister, LinearTile::GgufStaged})
+    compare(rotated, {.tile = tile, .splits = 2}, std::string("rotated ") + tileName(tile) + " pq2_0");
+  if (linear.calibration().projection.decodeInt8FromRows != kNever)
+    compare(rotated, {.tile = LinearTile::GgufStaged, .splits = 2, .decodeInt8 = true}, "rotated int8 pq2_0");
+  section("row views: " + std::to_string(cases) + " fp32 decodes over the leading and last rows of a tensor (every "
+          "format on both decode tiles, rotated PQ2_0 in bf16 and int8 activations, 1 and 4 lanes) bitwise the whole "
+          "tensor's columns");
+}
+
 // ---------------------------------------------------------------- split visibility
 // Two projections of a decode step run back to back and share one split scratch, as every GGUF projection of a step
 // does, at each pair of K splits the tile's policy (Apple9: register, Apple10: staged) picks for 8-80 cores where it
@@ -1779,6 +1853,7 @@ int main(int argc, char **argv) {
       decodeInt8(backend, linear);
       prefillInt8(backend, linear);
       leadingInputs(backend, linear);
+      rowViews(backend, linear);
       // The 27B out_proj then down, and gdn_in then gate/up: K 6144, 17408 and 5120.
       const SplitOperand out = splitOperand(backend, Q4K, {5120, 6144}, LinearEpilogue::Residual);
       const SplitOperand down = splitOperand(backend, Q6K, {5120, 17408}, LinearEpilogue::Residual);

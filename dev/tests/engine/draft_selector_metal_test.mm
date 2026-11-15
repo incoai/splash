@@ -4,7 +4,10 @@
 // table its double-precision product. The vocabularies cover the production
 // size, an odd size that misaligns the 16-byte vectors and leaves shards
 // with only a few tokens, and one wider than a single register chunk per
-// thread; the logits are fp32, and their order is decided below the bf16
+// thread; over a subset of the vocabulary (DraftVocabulary), its logits rows
+// hold the subset's tokens in order and the candidates are those tokens,
+// whose codebook rows the edges read, the anchor's whether or not the subset
+// holds it. The logits are fp32, and their order is decided below the bf16
 // spacing.
 //
 // The tree each lane grows from the candidates (draft_select_tree) must be a
@@ -37,6 +40,7 @@
 #include "TestChecks.hpp"
 #include "metal/MetalBackend.hpp"
 #include "metal/abi/Sampling.h"
+#include "model/DFlashDraft.hpp"
 #include "ops/DraftSelector.hpp"
 
 #import <Foundation/Foundation.h>
@@ -166,19 +170,20 @@ std::vector<uint32_t> referenceTop16(const float *row, uint32_t vocabulary) {
   return order;
 }
 
-// Every lane's draft rows of `lanes` lanes, a selector's buffers over them
-// and the codebooks, with each lane's tree of up to kBlock rows at lane x
-// kBlock.
+// Every lane's draft rows of `lanes` lanes over `subset` of the vocabulary, a
+// selector's buffers over them and the codebooks, with each lane's tree of up
+// to kBlock rows at lane x kBlock.
 struct Fixture final {
   uint32_t vocabulary = 0;
   uint32_t lanes = 0;
+  DraftVocabulary subset{};
   MetalBuffer logits;
   DraftSelectorBuffers buffers;
   DraftCodebooks codebooks;
 
   [[nodiscard]] const float *logitRow(uint32_t lane, uint32_t position) const {
     return static_cast<const float *>(logits.contents()) +
-           (uint64_t{lane} * kRows + position + 1) * vocabulary;
+           (uint64_t{lane} * kRows + position + 1) * subset.columns(vocabulary);
   }
   [[nodiscard]] const uint32_t *candidates(uint32_t lane) const {
     return static_cast<const uint32_t *>(buffers.candidates.contents()) +
@@ -210,20 +215,21 @@ struct Fixture final {
   }
 };
 
-// Each lane's draft rows of `patterns` (by position) and its selector hidden
-// rows and the codebooks of scale `edgeScale`: the larger, the more an edge
-// moves a candidate's probability.
+// Each lane's draft rows of `patterns` (by position) over `subset` and its
+// selector hidden rows and the codebooks of scale `edgeScale`: the larger,
+// the more an edge moves a candidate's probability.
 Fixture makeFixture(MetalBackend &backend, uint32_t vocabulary, uint32_t lanes, Random &random,
-                    std::span<const Pattern> patterns, float edgeScale) {
+                    std::span<const Pattern> patterns, float edgeScale, DraftVocabulary subset = {}) {
   Fixture f;
   f.vocabulary = vocabulary;
   f.lanes = lanes;
-  const uint32_t rows = lanes * kRows;
+  f.subset = subset;
+  const uint32_t rows = lanes * kRows, columns = subset.columns(vocabulary);
   const auto workspace = DraftSelector::workspace(lanes * kPositions);
-  f.logits = allocate(backend, uint64_t{rows} * vocabulary * sizeof(float));
+  f.logits = allocate(backend, uint64_t{rows} * columns * sizeof(float));
   auto *logitRows = static_cast<float *>(f.logits.contents());
   for (uint32_t row = 0; row < rows; ++row)
-    fillRow(logitRows + uint64_t{row} * vocabulary, vocabulary,
+    fillRow(logitRows + uint64_t{row} * columns, columns,
             patterns[(row / kRows + row % kRows) % patterns.size()], random);
   f.buffers = {f.logits,
                allocate(backend, workspace.partialIdsBytes),
@@ -252,7 +258,7 @@ Fixture makeFixture(MetalBackend &backend, uint32_t vocabulary, uint32_t lanes, 
 
 void run(MetalBackend &backend, const DraftSelector &selector, const Fixture &f, std::span<const DraftTreeLane> lanes) {
   CommandGraph graph;
-  selector.add(graph, f.buffers, f.codebooks, lanes);
+  selector.add(graph, f.buffers, f.codebooks, f.subset, lanes);
   require(graph.dispatches().size() == 3, "draft selector dispatch count changed");
   static_cast<void>(backend.submitCommandAsync(graph.dispatches()).wait());
 }
@@ -569,11 +575,18 @@ void requireTree(const Fixture &f, uint32_t lane, uint32_t anchor, const std::ve
 // the chain selector took, its proposal at each position the candidate of
 // the largest score (unary plus edge, in fp32 as the kernel adds them) after
 // the previous one's, the lowest index among equal ones, and each row's draft
-// probability the largest of its candidates', the chain's confidence.
-void chainCase(MetalBackend &backend, uint32_t vocabulary, uint32_t lanes) {
-  Random random(0x5e1ec7 + uint64_t{vocabulary} * 8 + lanes * 2);
+// probability the largest of its candidates', the chain's confidence. Over
+// `tokens` of the vocabulary the candidates are the tokens of the rows'
+// largest columns.
+void chainCase(MetalBackend &backend, uint32_t vocabulary, uint32_t lanes, DraftVocabulary tokens = {}) {
+  Random random(0x5e1ec7 + uint64_t{vocabulary} * 8 + lanes * 2 + uint64_t{tokens.leading} * 16);
+  const uint32_t columns = tokens.columns(vocabulary);
+  // The token of a logits column.
+  const auto columnToken = [&](uint32_t column) {
+    return column < tokens.leading ? column : column - tokens.leading + tokens.trailing;
+  };
   const std::array patterns{Pattern::Peaked, Pattern::Uniform, Pattern::Ties, Pattern::Sparse};
-  const Fixture f = makeFixture(backend, vocabulary, lanes, random, patterns, 0.1F);
+  const Fixture f = makeFixture(backend, vocabulary, lanes, random, patterns, 0.1F, tokens);
   const DraftSelector selector(vocabulary);
   std::vector<DraftTreeLane> trees;
   for (uint32_t lane = 0; lane < lanes; ++lane)
@@ -589,13 +602,13 @@ void chainCase(MetalBackend &backend, uint32_t vocabulary, uint32_t lanes) {
     require(f.rowCount(lane) == std::min(kBlock, kPositions + 1), "a chain does not hold every position");
     for (uint32_t position = 0; position < kPositions; ++position) {
       const float *row = f.logitRow(lane, position);
-      const auto expected = referenceTop16(row, vocabulary);
+      const auto expected = referenceTop16(row, columns);
       for (uint32_t rank = 0; rank < kCandidates; ++rank) {
         const uint32_t id = f.candidates(lane)[position * kCandidates + rank];
         const float value = f.unary(lane)[position * kCandidates + rank];
         if (rank < expected.size())
-          require(id == expected[rank] && value == row[expected[rank]],
-                  "draft top-16 candidates differ from the exact sorted order");
+          require(id == columnToken(expected[rank]) && value == row[expected[rank]],
+                  "draft top-16 candidates differ from the exact sorted order of their tokens");
         else
           require(id == 0xFFFFFFFFU && value == -INFINITY, "draft top-16 padding lost the empty sentinel");
       }
@@ -1387,8 +1400,16 @@ void bufferExtents(MetalBackend &backend) {
     requireExtent(backend, f.buffers.*member, bytes, element, what, [&](CommandGraph &graph, const MetalBuffer &buffer) {
       DraftSelectorBuffers changed = f.buffers;
       changed.*member = buffer;
-      selector.add(graph, changed, f.codebooks, trees);
+      selector.add(graph, changed, f.codebooks, {}, trees);
     });
+  // Over a subset, a logits row holds its columns.
+  constexpr DraftVocabulary subset{512, 960};
+  requireExtent(backend, f.buffers.logits, uint64_t{lanes} * kRows * subset.columns(vocabulary) * 4, 4, "draft logits",
+                [&](CommandGraph &graph, const MetalBuffer &buffer) {
+                  DraftSelectorBuffers changed = f.buffers;
+                  changed.logits = buffer;
+                  selector.add(graph, changed, f.codebooks, subset, trees);
+                });
   for (const auto &[member, what] :
        {std::pair{&DraftCodebooks::predecessor, "draft predecessor codebook"},
         std::pair{&DraftCodebooks::successor, "draft successor codebook"}})
@@ -1396,7 +1417,7 @@ void bufferExtents(MetalBackend &backend) {
                   [&](CommandGraph &graph, const MetalBuffer &buffer) {
                     DraftCodebooks changed = f.codebooks;
                     changed.*member = buffer;
-                    selector.add(graph, f.buffers, changed, trees);
+                    selector.add(graph, f.buffers, changed, {}, trees);
                   });
   // draft_verify_rows reads every lane's tree and writes the step's rows.
   const StepRows step{lanes, 2 * lanes + 1, 3};
@@ -1418,6 +1439,40 @@ void bufferExtents(MetalBackend &backend) {
     });
 }
 
+// The vocabulary a step proposes from (model::DFlashDraft::vocabulary): the
+// subset while each lane's last kVocabularyWindow tokens, its anchor the last,
+// lie in it, its trailing tokens too; the whole vocabulary from a token
+// outside it until that token has left every lane's window; always the whole
+// vocabulary for a family with no subset.
+void stepVocabulary() {
+  using splash::model::DFlashDraft;
+  constexpr DraftVocabulary subset{512, 960}, whole{};
+  constexpr uint32_t window = DFlashDraft::kVocabularyWindow;
+  const std::vector<uint32_t> inside(200, 7), trailing(200, 1000);
+  std::vector<uint32_t> oldest = inside, past = inside;
+  oldest[inside.size() - (window - 1)] = 600;  // the first token of the window before the anchor
+  past[inside.size() - window] = 600;          // the token before that
+  const auto step = [](DraftVocabulary vocabulary, std::initializer_list<const std::vector<uint32_t> *> histories,
+                       std::initializer_list<uint32_t> anchors) {
+    std::vector<std::span<const uint32_t>> tokens;
+    for (const std::vector<uint32_t> *history : histories) tokens.emplace_back(*history);
+    return DFlashDraft::vocabulary(vocabulary, tokens, std::vector<uint32_t>(anchors));
+  };
+  require(step(subset, {&inside}, {7}) == subset && step(subset, {&trailing}, {1000}) == subset &&
+              step(subset, {&past}, {7}) == subset,
+          "a lane whose window lies in the subset drafted over the whole vocabulary");
+  require(step(subset, {&oldest}, {7}) == whole && step(subset, {&inside}, {600}) == whole,
+          "a lane whose window holds a token outside the subset drafted over it");
+  require(step(subset, {&inside, &oldest}, {7, 7}) == whole,
+          "a step drafted over the subset while one of its lanes' windows leaves it");
+  const std::vector<uint32_t> none;
+  require(step(subset, {&none}, {7}) == subset,
+          "a lane that read nothing but its anchor drafted over the whole vocabulary");
+  require(step(whole, {&inside}, {7}) == whole, "a family without a subset drafted over one");
+  rejects([&] { (void)step(subset, {&inside}, {7, 7}); }, "a draft step's lanes each have tokens and an anchor",
+          "a step of more anchors than token histories was accepted");
+}
+
 void invalidRequests(MetalBackend &backend) {
   rejects([] { DraftSelector(0); }, "invalid draft selector vocabulary",
           "a selector over no vocabulary was accepted");
@@ -1427,10 +1482,16 @@ void invalidRequests(MetalBackend &backend) {
   const Fixture f = makeFixture(backend, vocabulary, 2, random, patterns, 0.1F);
   const DraftSelector selector(vocabulary);
   CommandGraph graph;
-  const auto add = [&](std::span<const DraftTreeLane> lanes) { selector.add(graph, f.buffers, f.codebooks, lanes); };
+  const auto add = [&](std::span<const DraftTreeLane> lanes) {
+    selector.add(graph, f.buffers, f.codebooks, {}, lanes);
+  };
   rejects([&] { add({}); }, "invalid draft selector batch", "a selection of no lane was accepted");
   const std::array<DraftTreeLane, 5> five{};
   rejects([&] { add(five); }, "invalid draft selector batch", "a selection of five lanes was accepted");
+  // Tokens past the vocabulary, a trailing part before the leading one's end, and no tokens.
+  for (const DraftVocabulary tokens : {DraftVocabulary{0, 1025}, DraftVocabulary{600, 500}, DraftVocabulary{0, 1024}})
+    rejects([&] { selector.add(graph, f.buffers, f.codebooks, tokens, std::array{DraftTreeLane{1, 3, 0, 1}}); },
+            "a draft's tokens lie in its vocabulary", "a draft vocabulary outside the selector's was accepted");
   // A tree deeper than a block's rows, a chain past a block's rows after its
   // anchor and more children than the kernel ranks.
   for (const DraftTreeLane &bad : {DraftTreeLane{1, kBlock, 0, 1}, DraftTreeLane{1, 3, kChain + 1, 1},
@@ -1466,11 +1527,19 @@ int main(int argc, char **argv) {
     if (argc != 2)
       throw std::invalid_argument("usage: draft-selector METALLIB");
     MetalBackend backend(argv[1]);
+    stepVocabulary();
     invalidRequests(backend);
     bufferExtents(backend);
     for (const uint32_t vocabulary : {248320U, 1003U, 270005U})
       for (uint32_t lanes = 1; lanes <= kLanes; ++lanes)
         chainCase(backend, vocabulary, lanes);
+    // Subsets: the Qwen families', one of 555 columns that misalign the
+    // vectors, a leading part alone and a trailing part alone.
+    for (const auto &[vocabulary, tokens] :
+         {std::pair{248320U, DraftVocabulary{148288, 248000}}, std::pair{1003U, DraftVocabulary{512, 960}},
+          std::pair{1003U, DraftVocabulary{517, 1003}}, std::pair{1003U, DraftVocabulary{0, 389}}})
+      for (const uint32_t lanes : {1U, kLanes})
+        chainCase(backend, vocabulary, lanes, tokens);
     treesMatchTheReference(backend);
     sampledChildrenDistribution(backend);
     nonFiniteRowDrawsNothing(backend);

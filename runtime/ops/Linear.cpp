@@ -45,10 +45,10 @@ void requireLeadingInputs(const LinearPlan &plan, const Projection &p) {
     throw std::invalid_argument("a view of leading inputs runs only the quantized prefill residual tiles");
 }
 
-// Throws unless views of `p`'s planes can stand for it (takesPlaneViews).
+// Throws unless a view of `p`'s leading inputs can stand for it (takesPlaneViews).
 void requirePlaneViews(const Projection &p) {
   if (p.takesPlaneViews()) return;
-  throw std::invalid_argument("views of a projection's planes take one unrotated quantized tensor, not a view");
+  throw std::invalid_argument("a view of leading inputs takes one unrotated quantized tensor, not a view");
 }
 
 } // namespace
@@ -59,24 +59,44 @@ bool Projection::takesPlaneViews() const noexcept {
 }
 
 // Every plane holds its rows in tiles of QUANT_TILE_ROWS rows, each tile's
-// units in order, so the leading rows' tiles lead it.
-Projection Projection::leadingRows(const metal::MetalBackend &backend, uint32_t rows) const {
-  requirePlaneViews(*this);
-  if (!rows || rows % QUANT_TILE_ROWS || rows > outputSize)
-    throw std::invalid_argument("a view of leading rows takes whole plane tiles of the projection's rows");
-  // The leading rows of a plane of `rowBytes` bytes per row.
-  const auto view = [&](const metal::MetalBuffer &plane, uint64_t rowBytes) {
-    return rowBytes ? backend.view(plane, 0, rows * rowBytes) : metal::MetalBuffer{};
+// units in order, and float rows lie in row order, so the rows of whole tiles
+// are one range of each plane.
+Projection Projection::rows(const metal::MetalBackend &backend, std::initializer_list<RowRange> ranges) const {
+  if (weights_.segments.size() != 1 || planeInputs_)
+    throw std::invalid_argument("a view of rows takes a projection of one tensor, not a view of its inputs");
+  const QuantizedSegment &tensor = weights_.segments.front();
+  // Rows `range` of a plane of `rowBytes` bytes a row.
+  const auto view = [&](const metal::MetalBuffer &plane, uint64_t rowBytes, RowRange range) {
+    return rowBytes ? backend.view(plane, range.first * rowBytes, range.count * rowBytes) : metal::MetalBuffer{};
   };
-  const QuantizedSegment &segment = weights_.segments.front();
-  const QuantFormat &format = segment.format();
-  const uint64_t groups = inputSize / 32;
-  return Projection(rows, inputSize,
-                    BlockWeights{{QuantizedSegment::planes(segment.formatId, rows, inputSize,
-                                                           view(segment.plane0, groups * format.plane0_bytes),
-                                                           view(segment.plane1, groups * format.plane1_bytes),
-                                                           view(segment.meta,
-                                                                groups / format.meta_groups * format.meta_bytes))}});
+  BlockWeights weights;
+  uint32_t columns = 0;
+  for (const RowRange range : ranges) {
+    if (range.first % QUANT_TILE_ROWS || range.count % QUANT_TILE_ROWS ||
+        uint64_t{range.first} + range.count > tensor.outputSize)
+      throw std::invalid_argument("a view of rows takes whole QUANT_TILE_ROWS tiles of the tensor's rows");
+    if (!range.count) continue;
+    QuantizedSegment segment;
+    if (tensor.isFloat()) {
+      segment = QuantizedSegment::rows(tensor.formatId, range.count, inputSize,
+                                       view(tensor.plane0, QuantizedSegment::rowBytes(tensor.formatId, inputSize),
+                                            range));
+    } else {
+      const QuantFormat &format = tensor.format();
+      const uint64_t groups = inputSize / 32;
+      segment = QuantizedSegment::planes(tensor.formatId, range.count, inputSize,
+                                         view(tensor.plane0, groups * format.plane0_bytes, range),
+                                         view(tensor.plane1, groups * format.plane1_bytes, range),
+                                         view(tensor.meta, groups / format.meta_groups * format.meta_bytes, range));
+    }
+    segment.columnOffset = columns;
+    columns += range.count;
+    weights.segments.push_back(std::move(segment));
+  }
+  Projection result(columns, inputSize, std::move(weights));
+  result.destination = destination;
+  result.rotation = rotation;
+  return result;
 }
 
 Projection Projection::leadingInputs(uint32_t inputs) const {

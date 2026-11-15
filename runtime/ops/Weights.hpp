@@ -6,6 +6,7 @@
 #include <compare>
 #include <cstddef>
 #include <cstdint>
+#include <initializer_list>
 #include <stdexcept>
 #include <utility>
 #include <vector>
@@ -189,14 +190,21 @@ public:
             weights ? uint32_t(128 * bytes / weights) : 0, weights && prefillInt8Formats};
   }
 
-  // Views of a projection of one unrotated quantized tensor (Linear.cpp):
-  // over the leading `rows` rows of its planes, whole QUANT_TILE_ROWS tiles;
-  // or over the leading `inputs` inputs of each of its rows, whole quant
+  // Rows [first, first + count) of a projection's weights.
+  struct RowRange final {
+    uint32_t first = 0;
+    uint32_t count = 0;
+  };
+  // Views of a projection of one tensor (Linear.cpp): over the rows of
+  // `ranges`, whole QUANT_TILE_ROWS tiles of them (an empty range holds
+  // none), which become its output columns in order and multiply its input,
+  // rotation and destination as it does; or, of an unrotated quantized
+  // tensor, over the leading `inputs` inputs of each of its rows, whole quant
   // groups and meta units, which reads its planes as they are (planeInputs()).
-  [[nodiscard]] Projection leadingRows(const metal::MetalBackend &backend, uint32_t rows) const;
+  [[nodiscard]] Projection rows(const metal::MetalBackend &backend, std::initializer_list<RowRange> ranges) const;
   [[nodiscard]] Projection leadingInputs(uint32_t inputs) const;
-  // Whether those views take it: its own planes, not a view, of one
-  // unrotated quantized tensor.
+  // Whether the view of leading inputs takes it: its own planes, not a view,
+  // of one unrotated quantized tensor.
   [[nodiscard]] bool takesPlaneViews() const noexcept;
   // The inputs each row of the weight planes holds when the projection reads
   // only their first inputSize, a view of leadingInputs(); zero for

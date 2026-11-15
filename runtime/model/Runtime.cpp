@@ -722,7 +722,8 @@ struct Runtime::Impl {
                                                 geometry.prefillChunks);
                         },
                         value.model.target)),
-        draftModel(value.model.draft, value.backend, operators),
+        draftModel(value.model.draft, value.backend, operators, targetModel->vocabularyProjection(),
+                   geometry.target.draftVocabulary),
         aneFfn(value.aneFfn), blockCache(value.blockCache), historyStream(value.historyStream),
         limits(splash::model::commandLimits(geometry, aneFfn ? aneFfn->minimumRows() : 0)) {
     if (states.layout() != model.stateLayout(states.layout().target.format) ||
@@ -2414,16 +2415,16 @@ struct Runtime::Impl {
     buffers.ropeSin = d(DecodeTensor::DraftRopeSin);
     buffers.gateScratch = decodeArena->gateScratch();
     bindDraftRings(entries, buffers.persistentKeys, buffers.persistentValues);
-    draftModel.addDecode(graph, std::move(buffers),
-                         targetModel->vocabularyProjection(),
-                         std::span(cacheLengths).first(lanes));
     std::array<ops::DraftTreeLane, kLaneCount> trees{};
+    std::array<uint32_t, kLaneCount> anchors{};
+    std::array<std::span<const uint32_t>, kLaneCount> tokens{};
     for (uint32_t lane = 0; lane < lanes; ++lane) {
       Request &entry = laneEntry(entries, lane);
       if (!entry.pendingToken)
         throw std::invalid_argument("draft batch lane has no anchor");
       ops::DraftTreeLane &tree = trees[lane];
-      tree.anchor = *entry.pendingToken;
+      tree.anchor = anchors[lane] = *entry.pendingToken;
+      tokens[lane] = entry.tokens;
       tree.depth = depths[lane];
       // A lane grows a tree beside its host chain, but beside a forced one,
       // whose tokens the target selects (proposeForcedChain); a constrained
@@ -2445,6 +2446,9 @@ struct Runtime::Impl {
         tree.noise = entry.cycleNoise;
       }
     }
+    const ops::DraftVocabulary vocabulary = DFlashDraft::vocabulary(
+        geometry.target.draftVocabulary, std::span(tokens).first(lanes), std::span(anchors).first(lanes));
+    draftModel.addDecode(graph, std::move(buffers), vocabulary, std::span(cacheLengths).first(lanes));
     const ops::DraftSelectorBuffers selection{
         d(DecodeTensor::Logits),          d(DecodeTensor::TopPartialIds),   d(DecodeTensor::TopPartialValues),
         d(DecodeTensor::Candidates),      d(DecodeTensor::Unary),           d(DecodeTensor::SelectorHidden),
@@ -2453,7 +2457,7 @@ struct Runtime::Impl {
         d(DecodeTensor::DraftTreeDraws),  d(DecodeTensor::DraftTreeNext),   d(DecodeTensor::DraftTreeCaps),
         d(DecodeTensor::InputTokens),     d(DecodeTensor::TreeRows),        d(DecodeTensor::LaneLayout),
         d(DecodeTensor::VerifySources)};
-    draftModel.addSelection(graph, selection, std::span(trees).first(lanes));
+    draftModel.addSelection(graph, selection, vocabulary, std::span(trees).first(lanes));
     ops::DraftSelector::addVerifyRows(graph, selection, step, floor);
   }
 

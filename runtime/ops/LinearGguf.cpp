@@ -220,9 +220,6 @@ void Linear::addGguf(metal::CommandGraph &graph, const LinearBuffers &b,
       !unitFormats(std::array<const Projection *, 2>{&p, gate}).decodeInt8Takes)
     throw std::invalid_argument("only a rotated PQ2_0 projection takes int8 activations");
   const std::vector<QuantizedSegment> &segments = p.blocks().segments;
-  // The fused kernels have no fp32 instance.
-  if (plan.destination() == FloatOutput::Float32 && segments.size() > 1)
-    throw std::invalid_argument("an fp32 destination takes a single-tensor block projection");
   if (std::any_of(segments.begin(), segments.end(), [](const QuantizedSegment &s) { return s.isFloat(); })) {
     // The quantized segments, which precede the float ones, run the plan's tiles.
     addGgufFloatSegments(graph, b, p, plan);
@@ -352,8 +349,10 @@ void Linear::addGgufStaged(metal::CommandGraph &graph, const LinearBuffers &b,
   // epilogue: a dispatch costs about 0.045 ms however narrow, and at 8 to 32
   // rows the 27B's and 35B's fused inputs take 16-56% less time in one
   // dispatch than in one per segment (32-core M5 Max). Each segment with an
-  // epilogue runs its own.
-  if (segments.size() > 1 && w.epilogue == LinearEpilogue::None) {
+  // epilogue runs its own, and so does each of fp32 rows (the draft's
+  // vocabulary head over a subset of its rows, DFlashDraft): the fused
+  // kernels write bf16.
+  if (segments.size() > 1 && w.epilogue == LinearEpilogue::None && plan.destination() == FloatOutput::BFloat16) {
     fused();
     return;
   }
@@ -451,7 +450,8 @@ void Linear::addGgufPrefillInt8(metal::CommandGraph &graph, const LinearBuffers 
 }
 
 // Every table tile of the plan's rows in each threadgroup: single tensors and
-// gate/up through addDecodeTensor, fused projections through fusedSegments.
+// gate/up through addDecodeTensor, fused projections through fusedSegments,
+// but into fp32 a dispatch per segment.
 void Linear::addGgufRegister(metal::CommandGraph &graph, const LinearBuffers &b,
                              const Projection &p, const LinearPlan &plan,
                              const Projection *gate) const {
@@ -475,25 +475,32 @@ void Linear::addGgufRegister(metal::CommandGraph &graph, const LinearBuffers &b,
   if (b.prepared.layout != LinearInput::Table16 || !b.prepared.source.sameView(b.input))
     graph.add("decode_linear_gguf_prepare", {b.input, b.scratch.input, b.scratch.sums}, k,
               {k / 32, lanes, 1}, {128, 1, 1});
-  const metal::DispatchSize grid{segmentColumns(p) / GGUF_TILE_COLUMNS, config.splits, 1};
   const std::string suffix = "_l" + std::to_string(lanes);
   const auto [partials, counters] = splitScratch(b, config.splits);
-  if (segments.size() > 1) {
+  // The fused kernel writes bf16, as the staged tile's: fp32 rows of several
+  // tensors run each tensor's own fp32 dispatch.
+  if (segments.size() > 1 && plan.destination() == FloatOutput::BFloat16) {
     std::vector<const QuantizedSegment *> order;
     for (const QuantizedSegment &s : segments) order.push_back(&s);
     std::vector<metal::MetalBuffer> bindings{b.scratch.input, b.scratch.sums};
     const GgufDecodeFusedParams params = fusedSegments(plan, order, bindings);
     bindings.insert(bindings.end(), {b.output, partials, counters});
-    graph.add("gguf_decode_sg_fused" + suffix, std::move(bindings), params, grid, {GGUF_REGISTER_THREADS, 1, 1});
+    graph.add("gguf_decode_sg_fused" + suffix, std::move(bindings), params,
+              {segmentColumns(p) / GGUF_TILE_COLUMNS, config.splits, 1}, {GGUF_REGISTER_THREADS, 1, 1});
     return;
   }
   const auto tensor = [&](const QuantizedSegment &s, char epilogue, const metal::MetalBuffer &output,
                           const metal::MetalBuffer &aux) {
     graph.add(kernelInstance(std::string("gguf_decode_sg_") + s.name() + suffix + "_" + epilogue, plan.destination()),
               {b.scratch.input, b.scratch.sums, s.plane0, s.plane1Slot(), s.meta, output, partials, counters, aux},
-              GgufDecodeParams{k, config.splits, n, s.columnOffset, 0}, grid, {GGUF_REGISTER_THREADS, 1, 1});
+              GgufDecodeParams{k, config.splits, n, s.columnOffset, 0},
+              {s.outputSize / GGUF_TILE_COLUMNS, config.splits, 1}, {GGUF_REGISTER_THREADS, 1, 1});
   };
-  addDecodeTensor(b, w.epilogue, segments.front(), gate, tensor);
+  if (segments.size() == 1) {
+    addDecodeTensor(b, w.epilogue, segments.front(), gate, tensor);
+    return;
+  }
+  for (const QuantizedSegment &s : segments) tensor(s, epilogueSuffix(w.epilogue), b.output, b.output);
 }
 
 // One dispatch per tensor, a gate/up pair's both in one (onePassTensors), each

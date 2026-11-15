@@ -506,6 +506,26 @@ planes, 4 bits in groups of 64 as MLX's affine quantization rounds them, and
 copies every other tensor as stored. The draft runs on the block kernels its
 target's projections run on.
 
+The draft's logits are its target's vocabulary head's, which a cycle runs twice,
+for the draft's proposals and for the target's verify; the draft's pass reads
+only the head's rows of the tokens it may propose (`DFlashDraft`). The Qwen
+families' vocabulary of 248,320 holds English and code first, Chinese from
+95,726 to 148,274, then its other scripts, and its chat, tool and thinking
+tokens from 248,044: a step's draft proposes from its first 148,288 tokens and
+its last 320 (`kQwenDraftVocabulary`, 59.8% of the head's rows) while each of
+its lanes' last 64 tokens, its anchor the last, lie there, and from the whole
+vocabulary otherwise (`DFlashDraft::vocabulary`). The draft proposes no token
+outside the subset (a lane's prompt-lookup chain alone may), so text that
+leaves it, another script or a word of one, drafts over the whole vocabulary
+until 64 tokens have passed inside it. The
+target verifies over its whole head, so a greedy request's output stays the
+target's and a sampled one keeps its exact distribution; only the proposals,
+and with them the tokens a cycle accepts, can change: 99.98% of the tokens
+Qwen3.8-27B and Qwen3.6-35B-A3B committed decoding agents, code and rewrites
+greedily lie in the subset. Flint's vocabulary mixes its scripts through all
+its tokens (its first 98,304 hold 98.1% of English text's tokens and 88.5% of
+Russian text's), so its drafts propose from all of them.
+
 ## Vision
 
 Vision comes from the target repository: MLX's `vision_tower.*` tensors (or

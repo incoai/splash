@@ -57,6 +57,14 @@ std::vector<ops::Projection> contextKvRows(metal::MetalBackend &backend,
   return result;
 }
 
+// The head's rows of the subset's tokens: its leading ones, then its trailing
+// ones; the head itself for the whole vocabulary.
+ops::Projection subsetRows(const metal::MetalBackend &backend, const ops::Projection &head,
+                           ops::DraftVocabulary subset) {
+  if (subset == ops::DraftVocabulary{}) return head;
+  return head.rows(backend, {{0, subset.leading}, {subset.trailing, head.outputSize - subset.trailing}});
+}
+
 } // namespace
 
 DFlashDraftLayout draftLayout(uint32_t hiddenSize, uint32_t vocabularySize, uint32_t layers,
@@ -138,14 +146,40 @@ DFlashContextWindow::~DFlashContextWindow() {
 
 DFlashDraft::DFlashDraft(const DFlashDraftWeights &weights,
                          metal::MetalBackend &backend,
-                         const ops::ExecutionPlans &operators)
+                         const ops::ExecutionPlans &operators,
+                         const ops::Projection &head, ops::DraftVocabulary subset)
     : weights_(weights), backend_(backend), operators_(operators),
-      selector_(weights.layout.vocabularySize),
-      contextKvProjections_(contextKvRows(backend, weights)) {}
+      selector_(weights.layout.vocabularySize), head_(head), subset_(subset),
+      subsetHead_(subsetRows(backend, head, subset)),
+      contextKvProjections_(contextKvRows(backend, weights)) {
+  if (head.outputSize != weights.layout.vocabularySize)
+    throw std::invalid_argument("a draft's head is its vocabulary's");
+}
+
+ops::DraftVocabulary DFlashDraft::vocabulary(ops::DraftVocabulary subset,
+                                             std::span<const std::span<const uint32_t>> tokens,
+                                             std::span<const uint32_t> anchors) {
+  if (tokens.size() != anchors.size())
+    throw std::invalid_argument("a draft step's lanes each have tokens and an anchor");
+  const auto holds = [&](uint32_t token) { return subset.holds(token); };
+  for (size_t lane = 0; lane < anchors.size(); ++lane) {
+    const std::span<const uint32_t> read = tokens[lane];
+    if (!holds(anchors[lane]) ||
+        !std::ranges::all_of(read.last(std::min<size_t>(read.size(), kVocabularyWindow - 1)), holds))
+      return {};
+  }
+  return subset;
+}
+
+const ops::Projection &DFlashDraft::head(ops::DraftVocabulary vocabulary) const {
+  if (vocabulary == subset_) return subsetHead_;
+  if (vocabulary == ops::DraftVocabulary{}) return head_;
+  throw std::invalid_argument("a draft proposes from the whole vocabulary or its subset");
+}
 
 void DFlashDraft::addSelection(metal::CommandGraph &graph, const ops::DraftSelectorBuffers &buffers,
-                               std::span<const ops::DraftTreeLane> lanes) const {
-  selector_.add(graph, buffers, {weights_.predecessorCodebook, weights_.successorCodebook}, lanes);
+                               ops::DraftVocabulary vocabulary, std::span<const ops::DraftTreeLane> lanes) const {
+  selector_.add(graph, buffers, {weights_.predecessorCodebook, weights_.successorCodebook}, vocabulary, lanes);
 }
 
 void DFlashDraft::addContextPrefill(
@@ -237,12 +271,14 @@ uint32_t DFlashDraft::decodeStorageLanes(uint32_t lanes) const {
   include(weights_.contextProjection);
   include(weights_.selectorProjection);
   for (const ops::Projection &p : contextKvProjections_) include(p);
+  // Its view of the head's rows, on the target's plans as the head (addDecode).
+  storageRows = std::max(storageRows, operators_.linear().storageRows(rows, subsetHead_.shape()));
   return storageRows / ExecutionLimits::draftQueryRows;
 }
 
 void DFlashDraft::addDecode(
     metal::CommandGraph &graph, DFlashDecodeBuffers buffers,
-    const ops::Projection &vocabularyProjection,
+    ops::DraftVocabulary vocabulary,
     std::span<const uint32_t> cacheLengths) const {
   const uint32_t lanes = static_cast<uint32_t>(cacheLengths.size());
   if (!lanes || lanes > ExecutionLimits::maximumBatchWidth ||
@@ -329,6 +365,7 @@ void DFlashDraft::addDecode(
   // its scratch is sized (DecodeArena::linearScratchSize): only the draft's
   // own projections keep bf16 activations.
   const ops::Linear &target = operators_.linear();
+  const ops::Projection &vocabularyProjection = head(vocabulary);
   const ops::LinearPlan headPlan = target.plan(vocabularyProjection, rows);
   const ops::PreparedInput finalHidden = ops::Normalization::addRms(
       graph, buffers.hidden[weights_.layout.layers & 1], weights_.finalNorm,

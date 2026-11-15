@@ -244,11 +244,32 @@ loadDFlashDraftWeights(metal::MetalBackend &backend, DraftCheckpointLoader &file
 
 // Builds the draft layer graph and its proposal selection
 // (ops::DraftSelector) from batch buffers and persistent context; the
-// target's sampling and acceptance policy remain outside the model.
+// target's sampling and acceptance policy remain outside the model. Its
+// logits are its target's vocabulary head's, `head`, over the whole
+// vocabulary or over `subset` (QwenTargetDimensions::draftVocabulary), a view
+// of the head's rows that reads that share of its weights.
 class DFlashDraft final {
 public:
   DFlashDraft(const DFlashDraftWeights &weights, metal::MetalBackend &backend,
-               const ops::ExecutionPlans &operators);
+               const ops::ExecutionPlans &operators, const ops::Projection &head,
+               ops::DraftVocabulary subset);
+
+  // A lane's tokens that choose the vocabulary of its steps: the last of the
+  // tokens it read and its anchor (vocabulary).
+  static constexpr uint32_t kVocabularyWindow = 64;
+  // The vocabulary a step proposes from: `subset` while each lane's last
+  // kVocabularyWindow tokens, the tail of `tokens[lane]` and `anchors[lane]`,
+  // lie in it, else the whole vocabulary ({}). A token outside it ends the
+  // draft's proposals there (a lane's lookup chain alone may hold it), so
+  // text that leaves it drafts over the whole vocabulary until a window
+  // passes in it: on 1.6.2, whose cycles verified the draft's chain, French
+  // text, a tenth of whose tokens lie past the Qwen families' subset, kept
+  // 0.2% fewer tokens a cycle than over the whole vocabulary through a window
+  // of 64 (1.2% through 32, 22% with no window), and English agent cycles
+  // drafted 93-100% of theirs over the subset.
+  [[nodiscard]] static ops::DraftVocabulary vocabulary(ops::DraftVocabulary subset,
+                                                       std::span<const std::span<const uint32_t>> tokens,
+                                                       std::span<const uint32_t> anchors);
 
   void addContextPrefill(metal::CommandGraph &graph,
                          DFlashPrefillBuffers buffers, uint32_t rows,
@@ -265,18 +286,21 @@ public:
                          std::span<const DFlashDraftRingLayer> ring,
                          uint32_t rows, uint32_t startPosition) const;
 
-  // Lanes of storage the draft's own projections bind in a decode step of
-  // `lanes` lanes (ops::Linear::storageRows of a draft's block a lane). A
-  // context commit of a step's rows, up to a verify block's a lane, binds
-  // as many lanes of its row tensors, which hold a verify block's rows a
-  // lane: at least the staged tile's rows of any step of `lanes` lanes
-  // (ops::stagedTileRows(T) <= 16 x lanes).
+  // Lanes of storage the draft's own projections, and its view of the head's
+  // rows of its subset, bind in a decode step of `lanes` lanes
+  // (ops::Linear::storageRows of a draft's block a lane; the whole head's are
+  // QwenTarget::headStorageLanes). A context commit of a step's rows, up to a
+  // verify block's a lane, binds as many lanes of its row tensors, which hold
+  // a verify block's rows a lane: at least the staged tile's rows of any step
+  // of `lanes` lanes (ops::stagedTileRows(T) <= 16 x lanes).
   [[nodiscard]] uint32_t decodeStorageLanes(uint32_t lanes) const;
+  // A step's draft layers and its logits over `vocabulary`, the whole
+  // vocabulary or the subset, and its proposals from them.
   void addDecode(metal::CommandGraph &graph, DFlashDecodeBuffers buffers,
-                 const ops::Projection &vocabularyProjection,
+                 ops::DraftVocabulary vocabulary,
                  std::span<const uint32_t> cacheLengths) const;
   void addSelection(metal::CommandGraph &graph, const ops::DraftSelectorBuffers &buffers,
-                    std::span<const ops::DraftTreeLane> lanes) const;
+                    ops::DraftVocabulary vocabulary, std::span<const ops::DraftTreeLane> lanes) const;
   // Sets each of `lanes` lanes' mask rows of the draft input `rows` (all but
   // its anchor's, row 0 of its draftQueryRows) to the mask embedding the
   // checkpoint ships; without one they keep the target table's row.
@@ -299,10 +323,17 @@ private:
   void addContextKv(metal::CommandGraph &graph, const DFlashPrefillBuffers &buffers,
                     uint32_t rows, std::span<const DFlashPrefillSpan> spans) const;
 
+  // The head of the logits over `vocabulary`.
+  [[nodiscard]] const ops::Projection &head(ops::DraftVocabulary vocabulary) const;
+
   const DFlashDraftWeights &weights_;
   metal::MetalBackend &backend_;
   const ops::ExecutionPlans &operators_;
   ops::DraftSelector selector_;
+  const ops::Projection &head_;
+  ops::DraftVocabulary subset_;
+  // The head's rows of the subset's tokens.
+  ops::Projection subsetHead_;
   // Each layer's key and value rows of its QKV projection, views of its
   // planes, which the context writers project with.
   std::vector<ops::Projection> contextKvProjections_;

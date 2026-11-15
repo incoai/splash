@@ -1093,12 +1093,14 @@ inline void simd_best_head(float value, uint token, thread float &best,
 // so nothing below it can be in the row's top-16 and the exact sorted insert
 // only runs for the few survivors. The group then pops its best sixteen in
 // rank order. The (value desc, id asc) order is total, so the partial is the
-// same set in the same order whatever the thread partition.
+// same set in the same order whatever the thread partition; it ranks the
+// row's columns and writes their tokens (SelectorBatchParams), whose order
+// is theirs.
 kernel void draft_select_top16_sharded(
     device const float *logits [[buffer(0)]],
     device uint *partial_ids [[buffer(1)]],
     device float *partial_values [[buffer(2)]],
-    constant uint &vocabulary [[buffer(3)]],
+    constant SelectorBatchParams &params [[buffer(3)]],
     uint group [[threadgroup_position_in_grid]],
     uint thread_index [[thread_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]],
@@ -1108,6 +1110,7 @@ kernel void draft_select_top16_sharded(
   constexpr uint Shards = SPLASH_DRAFT_SAMPLING_SHARDS;
   constexpr uint K = SPLASH_DRAFT_CANDIDATES;
   constexpr uint VectorTokens = 4, ChunkVectors = 16;
+  const uint vocabulary = params.columns;
   uint batch = group / (Positions * Shards);
   uint local = group % (Positions * Shards);
   uint position = local / Shards;
@@ -1217,7 +1220,10 @@ kernel void draft_select_top16_sharded(
       }
     }
     if (thread_index == rank) {
-      partial_ids[group * K + rank] = best_id;
+      // The empty sentinel stays one.
+      partial_ids[group * K + rank] = best_id < params.leading || best_id == 0xffffffffu
+                                          ? best_id
+                                          : best_id - params.leading + params.trailing;
       partial_values[group * K + rank] = best;
     }
     if (head_value == best && head_id == best_id)
