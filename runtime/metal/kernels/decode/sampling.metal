@@ -1788,18 +1788,19 @@ kernel void draft_verify_rows(device const uint *tree_tokens [[buffer(0)]],
     estimates[taken] = estimates[i];
     owners[taken++] = owners[i];
   }
-  // As many of those as maximize the expected tokens per cost.
+  // Of those, in order, each while it raises the expected tokens per cost:
+  // the first that does not ends them, so that a row's admission reads only
+  // the rows before it, never its own descendants (VerifyRowsParams).
   if (!params.every_row) {
     float expected = float(params.lanes);
     float best = expected / params.cost[params.lanes];
     uint kept = 0;
-    for (uint i = 0; i < taken; ++i) {
-      expected += estimates[i];
-      const float value = expected / params.cost[params.lanes + i + 1];
-      if (value > best) {
-        best = value;
-        kept = i + 1;
-      }
+    for (; kept < taken; ++kept) {
+      const float value = (expected + estimates[kept]) / params.cost[params.lanes + kept + 1];
+      if (!(value > best))
+        break;
+      expected += estimates[kept];
+      best = value;
     }
     for (uint i = kept; i < taken; ++i)
       --verified[owners[i]];

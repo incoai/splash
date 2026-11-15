@@ -389,8 +389,13 @@ estimate is what verifying it adds to its lane's expected tokens; one GPU step a
 selector (`draft_verify_rows`) lays out the cycle's rows, a draft block's a
 lane: every lane verifies its anchor and the rows of the largest estimates over
 the batch, a lane's in the order its tree took them and none past a lane's cap,
-as many as the cycle's rows hold or, under the budget, as maximize the expected
-tokens over the cycle's cost at that many rows in all. It numbers a lane's
+as many as the cycle's rows hold or, under the budget, those in order while
+each raises the expected tokens over the cycle's cost at that many rows in all,
+the first that does not ending them: a row's admission then reads only the rows
+before it, not its own descendants, whose estimates follow its draws, which
+keeps a sampled lane's selections draws from the target whatever the cost's
+shape (for a cost convex in the rows it is the most tokens per cost of any
+count). It numbers a lane's
 verify rows in preorder, its likeliest path on its first rows, packs the lanes'
 rows in lane order, the cycle's rows past the verify rows on the first lanes
 under the cap, and writes each lane's rows (`DecodeTensor::LaneLayout`), which

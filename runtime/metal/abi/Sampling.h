@@ -243,8 +243,15 @@ static_assert(sizeof(DraftTreeParams) == 244,
 // estimates of the trees' rows, a lane's in the order its tree took them
 // (each at most its parent's, which comes before it), the earlier lane first
 // among equal ones, none past a lane's cap. With every_row the cycle verifies as many as its rows hold;
-// otherwise as many of those as maximize the expected tokens, its lanes plus
-// the estimates it took, over cost[the rows it verifies in all]. A lane's
+// otherwise those of them, in order, while each raises the expected tokens,
+// its lanes plus the estimates it took, over cost[the rows it verifies in
+// all]: the first that does not ends them. A row's estimates follow the
+// draws of the rows above it, so a row admitted by the rows after it, its
+// own descendants among them, would be verified for its own draws, and its
+// selection would no longer be a draw from the target; the first that does
+// not improve is the most tokens per cost of any count where the cost is
+// convex in the rows, and keeps the admission to the rows before it for any
+// cost. A lane's
 // verify rows are its anchor and the rows it took, numbered in preorder, its
 // likeliest path on its first rows. Lanes' rows are packed in lane order
 // (SplashLaneRows), and the cycle's rows past every lane's verify rows go to

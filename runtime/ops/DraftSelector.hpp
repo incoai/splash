@@ -112,10 +112,10 @@ public:
            std::span<const DraftTreeLane> lanes) const;
   // After add: the rows of a decode step of `step.lanes` lanes
   // (VerifyRowsParams), each lane's verify rows numbered in preorder: the
-  // trees' best rows that the step's rows hold without costs, or as many of
-  // them as give the most expected accepted tokens per cost, where costs[R]
-  // is the cost of a step that verifies R rows in all, for R from the lane
-  // count to the step's rows, in any unit.
+  // trees' best rows that the step's rows hold without costs, or of them, in
+  // order, those while each raises the expected accepted tokens per cost,
+  // where costs[R] is the cost of a step that verifies R rows in all, for R
+  // from the lane count to the step's rows, in any unit.
   static void addVerifyRows(metal::CommandGraph &graph, const DraftSelectorBuffers &buffers, const StepRows &step,
                             std::span<const float> costs);
 

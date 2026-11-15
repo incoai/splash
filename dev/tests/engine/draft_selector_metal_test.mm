@@ -881,12 +881,62 @@ double bestAssignment(const std::vector<DrawnTree> &trees, uint32_t rows, uint32
   return best;
 }
 
-// draft_verify_rows against every assignment of verify rows: for random
-// trees (estimates with exact 0 and repeats, of 1 to kBlock rows), steps of
-// 1 to 4 lanes, every count of rows and cap they allow, and costs (concave,
-// flat, convex and unordered) or none, its choice's expected tokens (per
-// cost) are the best, a lane verifies the first rows its tree took, no lane
-// more than the cap and the lanes no more than the step's rows. The lanes'
+// The verify rows draft_verify_rows takes, in double: every lane's rows past
+// its anchor by estimate (the earlier lane's, then its earlier row, first
+// among equal ones), each the step's rows and the lane's cap leave room for;
+// with costs, of those in order each while it raises the expected tokens per
+// cost, the first that does not ending them. Close where a comparison lay
+// within 1e-5 of its threshold but not on it, which float sums may decide
+// either way.
+struct RuleChoice final {
+  std::vector<uint32_t> verified;
+  bool close = false;
+};
+
+RuleChoice ruleAssignment(const std::vector<DrawnTree> &trees, uint32_t rows, uint32_t cap,
+                          std::span<const float> costs) {
+  const uint32_t lanes = static_cast<uint32_t>(trees.size());
+  std::vector<std::pair<float, uint32_t>> order;
+  for (uint32_t lane = 0; lane < lanes; ++lane)
+    for (uint32_t row = 1; row < trees[lane].estimates.size(); ++row)
+      order.emplace_back(trees[lane].estimates[row], lane);
+  std::stable_sort(order.begin(), order.end(), [](const auto &a, const auto &b) { return a.first > b.first; });
+  RuleChoice choice{std::vector<uint32_t>(lanes, 1U)};
+  std::vector<std::pair<float, uint32_t>> taken;
+  for (const auto &entry : order) {
+    if (lanes + taken.size() >= rows)
+      break;
+    if (choice.verified[entry.second] == cap)
+      continue;
+    ++choice.verified[entry.second];
+    taken.push_back(entry);
+  }
+  if (costs.empty())
+    return choice;
+  double expected = lanes, best = expected / costs[lanes];
+  size_t kept = 0;
+  for (; kept < taken.size(); ++kept) {
+    const double value = (expected + taken[kept].first) / costs[lanes + kept + 1];
+    const double gap = std::fabs(value - best);
+    choice.close = choice.close || (gap > 0.0 && gap <= 1e-5 * best);
+    if (!(value > best))
+      break;
+    expected += taken[kept].first;
+    best = value;
+  }
+  for (size_t i = kept; i < taken.size(); ++i)
+    --choice.verified[taken[i].second];
+  return choice;
+}
+
+// draft_verify_rows against its rule and every assignment of verify rows:
+// for random trees (estimates with exact 0 and repeats, of 1 to kBlock rows),
+// steps of 1 to 4 lanes, every count of rows and cap they allow, and costs
+// (concave, flat, convex and unordered) or none, each lane verifies the rows
+// the rule takes, but where the rule's comparisons lie too close to call; and
+// with a flat or convex cost or none, its choice's expected tokens (per cost)
+// are the best of every assignment. A lane verifies the first rows its tree
+// took, no lane more than the cap and the lanes no more than the step's rows. The lanes'
 // rows fill the step's in lane order, the rows past the verify rows on the
 // first lanes under the cap. A lane's verify rows are numbered in preorder,
 // the earlier-taken child first, with their tokens, depths and ancestors, and
@@ -894,6 +944,7 @@ double bestAssignment(const std::vector<DrawnTree> &trees, uint32_t rows, uint32
 // row before it.
 void verifyRowsLayout(MetalBackend &backend) {
   Random random(0xb0d9e7);
+  uint32_t ruled = 0, checked = 0;
   for (uint32_t trial = 0; trial < 600; ++trial) {
     const uint32_t lanes = 1 + trial % kLanes;
     const bool everyRow = trial % 5 == 4;
@@ -957,10 +1008,21 @@ void verifyRowsLayout(MetalBackend &backend) {
       total += verified[lane];
     }
     require(total <= rows, label + ": the lanes verify more rows than the step holds");
-    const double value = everyRow ? expected : expected / costs[total];
-    const double best = bestAssignment(trees, rows, cap, used);
-    require(value >= best * (1.0 - 1e-5), label + ": draft_verify_rows chose " + std::to_string(value) +
-                                              " where " + std::to_string(best) + " was possible");
+    const RuleChoice rule = ruleAssignment(trees, rows, cap, used);
+    ++ruled;
+    if (!rule.close) {
+      ++checked;
+      for (uint32_t lane = 0; lane < lanes; ++lane)
+        require(verified[lane] == rule.verified[lane],
+                label + ": lane " + std::to_string(lane) + " verifies " + std::to_string(verified[lane]) +
+                    " rows, the rule " + std::to_string(rule.verified[lane]));
+    }
+    if (everyRow || trial % 4 == 1 || trial % 4 == 2) {
+      const double value = everyRow ? expected : expected / costs[total];
+      const double best = bestAssignment(trees, rows, cap, used);
+      require(value >= best * (1.0 - 1e-5), label + ": draft_verify_rows chose " + std::to_string(value) +
+                                                " where " + std::to_string(best) + " was possible");
+    }
 
     // The lanes' rows fill the step's in lane order.
     uint32_t first = 0, left = rows - total;
@@ -1003,6 +1065,46 @@ void verifyRowsLayout(MetalBackend &backend) {
                     (at < kept ? " is not its tree's in preorder" : " does not extend the row before it"));
       }
     }
+  }
+  require(checked * 10 >= ruled * 9, "most trials' rules lay too close to call");
+}
+
+// Under a cost concave in the rows, the verify budget's seed for one lane
+// (0.60, 0.69, 0.85 and 1 at 1, 2, 4 and 8 rows, linear between), a lane's
+// rows of estimates 0.5, 0.25, 0.12, 0.11, 0.10, 0.10 and then 0.10 or 0.09
+// verify the anchor and the first two whatever the last: the third does not
+// raise the expected tokens per cost, and no row is admitted by the rows after
+// it, where the most tokens per cost of any count would take all eight with
+// 0.10 last and three with 0.09.
+void budgetedRowsReadRowsBefore(MetalBackend &backend) {
+  constexpr uint32_t rows = 8;
+  DraftSelectorBuffers b{};
+  b.treeTokens = allocate(backend, uint64_t{kBlock} * 4);
+  b.trees = allocate(backend, uint64_t{kBlock} * sizeof(TreeRow));
+  b.treeScores = allocate(backend, uint64_t{kBlock} * 8);
+  b.treeSizes = allocate(backend, 4);
+  b.inputTokens = allocate(backend, uint64_t{rows} * 4);
+  b.treeRows = allocate(backend, uint64_t{rows} * sizeof(TreeRow));
+  b.laneRows = allocate(backend, sizeof(LaneRows));
+  b.verifyRows = allocate(backend, 4);
+  b.verifySources = allocate(backend, uint64_t{rows} * 4);
+  std::vector<float> costs(kLanes * kBlock + 1, 0.0F);
+  constexpr std::array<float, rows + 1> seed{0.0F, 0.60F, 0.69F, 0.77F, 0.85F, 0.8875F, 0.925F, 0.9625F, 1.0F};
+  std::copy(seed.begin(), seed.end(), costs.begin());
+  static_cast<uint32_t *>(b.treeSizes.contents())[0] = rows;
+  for (const float last : {0.10F, 0.09F}) {
+    const std::array<float, rows> estimates{1.0F, 0.5F, 0.25F, 0.12F, 0.11F, 0.10F, 0.10F, last};
+    for (uint32_t row = 0; row < rows; ++row) {
+      static_cast<uint32_t *>(b.treeTokens.contents())[row] = 100 + row;
+      static_cast<TreeRow *>(b.trees.contents())[row] = chainRow(row);
+      static_cast<float *>(b.treeScores.contents())[2 * row + 1] = estimates[row];
+    }
+    CommandGraph graph;
+    DraftSelector::addVerifyRows(graph, b, {1, rows, rows}, costs);
+    static_cast<void>(backend.submitCommandAsync(graph.dispatches()).wait());
+    const uint32_t verified = *static_cast<const uint32_t *>(b.verifyRows.contents());
+    require(verified == 3, "with " + std::to_string(last) + " last, the lane verifies " + std::to_string(verified) +
+                               " rows, not its anchor and the first two");
   }
 }
 
@@ -1181,6 +1283,7 @@ int main(int argc, char **argv) {
     nonFiniteRowDrawsNothing(backend);
     lowTemperatureDraws(backend);
     forcedChain(backend);
+    budgetedRowsReadRowsBefore(backend);
     verifyRowsLayout(backend);
     verifyRowsAcrossLanes(backend);
     std::cout << "draft_selector_metal_test: PASS\n";
