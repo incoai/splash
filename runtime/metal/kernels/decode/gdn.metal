@@ -3,6 +3,7 @@
 #include "metal/kernels/common/gguf_sgmatrix.h"
 #include "metal/kernels/common/lane_bindings.h"
 #include "metal/kernels/common/rms_inverse.h"
+#include "metal/kernels/common/state_codec.h"
 
 // Decode threadgroups are 256 threads: one simdgroup per verify row in the
 // prologue and the gate, and in the scan the head's 128 state rows strided
@@ -441,7 +442,10 @@ inline void gdn_decode_batch_phase(
 // step folds when the lane retained exactly those, of one value head of one
 // layer: the rows on the step's tape folded into the state before them (the
 // cell the step wrote, `state`), and the convolution rows they leave, as the
-// next step's prologue carries them, in `fold`, a cell of the same strides.
+// next step's prologue carries them, in `fold`, a cached state's cell: the
+// rows at the lane cell's offsets, the recurrent state as the codes
+// ops::StateCodec makes of it as the lane's cell would store it (the codec's
+// arithmetic, common/state_codec.h, on the values the scan's lanes hold).
 // Nothing when the lane retained fewer (`retained`, its acceptance's count).
 // Grid {value heads, layers}.
 template <uint KeyHeads, uint ValueHeads, uint HeadDim, uint ConvDim,
@@ -486,9 +490,12 @@ inline void gdn_fold_phase(device const uchar *state, device uchar *fold,
     }
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
-  const ulong recurrent = params.convolution_state_bytes + ulong(layer) * params.recurrent_layer_bytes;
-  device const State *state_in = reinterpret_cast<device const State *>(state + recurrent);
-  device State *state_out = reinterpret_cast<device State *>(fold + recurrent);
+  device const State *state_in = reinterpret_cast<device const State *>(
+      state + params.convolution_state_bytes + ulong(layer) * params.recurrent_layer_bytes);
+  device char *codes = reinterpret_cast<device char *>(fold + params.convolution_state_bytes +
+                                                       ulong(layer) * params.codes_layer_bytes);
+  device bfloat *scales =
+      reinterpret_cast<device bfloat *>(codes + state_codec_scales_offset(ValueHeads * HeadDim, HeadDim));
   const auto base = [&](uint value_dim) {
     return (ulong(value_head) * HeadDim + value_dim) * HeadDim + lane * 4;
   };
@@ -502,8 +509,8 @@ inline void gdn_fold_phase(device const uchar *state, device uchar *fold,
     }
     gdn_fold_rows<HeadDim, RowsInFlight>(values, pending, rows, value_dim, lane);
     for (uint r = 0; r < RowsInFlight; ++r)
-      for (uint i = 0; i < 4; ++i)
-        state_out[base(value_dim[r]) + i] = State(values[r][i]);
+      state_code_quad<State>(values[r], codes + base(value_dim[r]),
+                             scales + base(value_dim[r]) / SPLASH_STATE_CODEC_BLOCK, lane);
   }
 }
 

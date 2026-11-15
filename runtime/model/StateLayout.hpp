@@ -5,6 +5,7 @@
 #include "metal/abi/ExecutionGeometry.h"
 #include "metal/abi/GDN.h"
 #include "ops/GDN.hpp"
+#include "ops/StateCodec.hpp"
 
 #include <algorithm>
 #include <array>
@@ -17,10 +18,12 @@ namespace splash::model {
 inline constexpr uint32_t kGdnConvolutionTaps = SPLASH_GDN_CONVOLUTION_TAPS;
 
 // Physical state geometry is supplied by the paired target and draft models,
-// and the recurrent state's format by the runtime (--state-format). The
-// engine sees only opaque CompositeState handles and byte accounting. A
-// target without GDN layers keeps only its auxiliary state in a cell, if it
-// has one: its cells may hold nothing.
+// and the running recurrent state's format by the runtime (--state-format).
+// A cached state's cell holds the recurrent layers as int8 codes and bf16
+// scales instead (ops::StateCodec, cachedCellBytes). The engine sees only
+// opaque CompositeState handles and byte accounting. A target without GDN
+// layers keeps only its auxiliary state in a cell, if it has one: its cells
+// may hold nothing.
 struct GdnStateLayout final {
   static constexpr uint32_t bfloat16Bytes = 2;
 
@@ -41,7 +44,8 @@ struct GdnStateLayout final {
                                 recurrentGroups, recurrentRows,
                                 recurrentColumns};
     const auto set = [&](uint32_t dimension) { return !dimension == !layers; };
-    return std::ranges::all_of(dimensions, set) && ops::validFormat(format);
+    return std::ranges::all_of(dimensions, set) && ops::validFormat(format) &&
+           recurrentColumns % SPLASH_STATE_CODEC_BLOCK == 0;
   }
   [[nodiscard]] constexpr uint64_t convolutionLayerBytes() const noexcept {
     return alignUp(uint64_t{convolutionHistory} * convolutionChannels *
@@ -59,6 +63,27 @@ struct GdnStateLayout final {
   }
   [[nodiscard]] constexpr uint64_t cellBytes() const noexcept {
     return convolutionBytes() + recurrentBytes() + alignUp(auxiliaryBytes);
+  }
+  // A cached state's recurrent layer: the codes and scales of every value
+  // head's rows (ops::StateCodec).
+  [[nodiscard]] constexpr uint64_t cachedRecurrentLayerBytes() const noexcept {
+    return alignUp(state_codec_layer_bytes(recurrentGroups * recurrentRows, recurrentColumns));
+  }
+  [[nodiscard]] constexpr uint64_t cachedRecurrentBytes() const noexcept {
+    return uint64_t{layers} * cachedRecurrentLayerBytes();
+  }
+  // A cached state's cell: a lane's, but for its recurrent layers' codes.
+  [[nodiscard]] constexpr uint64_t cachedCellBytes() const noexcept {
+    return convolutionBytes() + cachedRecurrentBytes() + alignUp(auxiliaryBytes);
+  }
+  // The codec between a lane's recurrent layers and a cached state's.
+  [[nodiscard]] constexpr ops::StateCodecShape codecShape() const noexcept {
+    return {layers,
+            recurrentGroups * recurrentRows,
+            recurrentColumns,
+            recurrentLayerBytes(),
+            cachedRecurrentLayerBytes(),
+            format};
   }
   // A cell holds every layer's convolution state, then every layer's
   // recurrent state, then the auxiliary state.
@@ -101,9 +126,9 @@ struct DraftStateLayout final {
 };
 
 // A lane holds two GDN cells, its draft rings and their context window; a
-// cached state one GDN cell and the window, from which a restore that needs
-// the rings computes them again. A cell of no bytes takes no memory
-// (QwenGdnCell).
+// cached state one cached cell (GdnStateLayout::cachedCellBytes) and the
+// window, from which a restore that needs the rings computes them again. A
+// cell of no bytes takes no memory (QwenGdnCell).
 struct CompositeStateLayout final {
   static constexpr uint32_t kLaneGdnCells = 2;
 
@@ -118,7 +143,7 @@ struct CompositeStateLayout final {
            draft.windowBytes();
   }
   [[nodiscard]] constexpr uint64_t cachedBytes() const noexcept {
-    return target.cellBytes() + draft.windowBytes();
+    return target.cachedCellBytes() + draft.windowBytes();
   }
 
   bool operator==(const CompositeStateLayout &) const = default;

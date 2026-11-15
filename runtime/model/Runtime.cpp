@@ -32,6 +32,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <deque>
 #include <iterator>
 #include <limits>
 #include <list>
@@ -1541,9 +1542,9 @@ struct Runtime::Impl {
   // A state a lane's prefill command captures
   // (ModelBatchItem::stateCaptures): the buffers it is written to, which the
   // command's items hold, its row among the lane's rows in its chunk, whether
-  // it lies at the end of the lane's rows in the command, where the
-  // completion copies the lane's state rather than the command writing it,
-  // and the lengths it is sealed with.
+  // it lies at the end of the lane's rows in the command, where the command
+  // writes its codes alone and the completion copies the rest from the lane
+  // (QwenStateStorage::copyBeside), and the lengths it is sealed with.
   struct PrefillStateCapture final {
     QwenStateReservation *reservation = nullptr;
     uint32_t row = 0;
@@ -1619,9 +1620,10 @@ struct Runtime::Impl {
     return result;
   }
 
-  // The states a lane's committed command captured, in order: one at the
-  // command's end takes the lane's new cell and window, as snapshot() does,
-  // and the others the command wrote. Each holds its straddled image rows
+  // The states a lane's committed command captured, in order: the command
+  // wrote each one's codes, and the convolution rows and auxiliary state of
+  // those inside its rows; one at the command's end takes them and the
+  // window from the lane's new cell. Each holds its straddled image rows
   // before the command releases the rows of the images it finished.
   std::vector<std::shared_ptr<const CompositeState>>
   sealStates(const Request &entry, std::span<const PrefillStateCapture> captures) {
@@ -1629,7 +1631,7 @@ struct Runtime::Impl {
     sealed.reserve(captures.size());
     for (const PrefillStateCapture &capture : captures) {
       if (capture.atEnd)
-        states.copyState(entry.stateLane, *capture.reservation);
+        states.copyBeside(entry.stateLane, *capture.reservation);
       sealed.push_back(holdStraddledRows(entry, capture.lengths.targetTokens,
                                          states.seal(*capture.reservation, capture.lengths)));
     }
@@ -1680,7 +1682,8 @@ struct Runtime::Impl {
   }
 
   // The states a sequence of `rows` rows captures inside them, in their
-  // reservations' cells; one at its end is the cell the sequence writes.
+  // reservations' cells; one at its end takes the codes of the state the
+  // sequence writes (QwenTargetPrefillSequence::endCodes).
   static std::vector<QwenTargetStateCapture> insideStateCaptures(std::span<const PrefillStateCapture> captures,
                                                                  uint32_t rows) {
     std::vector<QwenTargetStateCapture> inside;
@@ -1794,10 +1797,12 @@ struct Runtime::Impl {
   }
 
   // Creates the pipelines only a state captured inside a prefill chunk runs,
-  // on `lane`, without running it (Runtime::warmupPrefill).
+  // and the codec's every capture and restore runs, on `lane`, without
+  // running them (Runtime::warmupPrefill).
   void prepareInsideCapture(uint32_t lane) const {
     CommandGraph graph;
     targetModel->addInsideCapture(graph, states.current(lane).auxiliary, states.next(lane).auxiliary);
+    states.addCodecPreparation(graph, lane);
     if (!graph.dispatches().empty()) backend.preparePipelines(graph.dispatches());
   }
 
@@ -1910,12 +1915,15 @@ struct Runtime::Impl {
   // the first token of each lane whose rows end its prompt, and each lane's
   // last row of the final hidden, which a pass before has none of. A
   // lane's GDN and auxiliary state pass from its current cell through its
-  // parts to its next cell, which its last part writes; a part that ends at
-  // a state it captures writes that state's cell, another the next cell or
-  // the arena's scratch cell, whichever the part after it does not write. So
-  // no part writes the cell it reads, and none the lane's current cell; with
-  // one scratch cell, at most one lane's rows run past a chunk
-  // (CommandLimits::lanesPastChunk).
+  // parts to its next cell, which its last part writes; another part writes
+  // the next cell or the arena's scratch cell, whichever the part after it
+  // does not write, but for a part that ends at a state it captures, which
+  // writes the state's convolution rows and auxiliary state into the
+  // state's cached cell, where the part after reads them. So no part writes
+  // the cell it reads, and none the lane's current cell; with one scratch
+  // cell, at most one lane's rows run past a chunk
+  // (CommandLimits::lanesPastChunk). Each part that ends at a state it
+  // captures writes the codes of its recurrent state too.
   PrefillOutputs encodePrefillGraph(CommandGraph &graph, CommandGraph &encodes,
                                     std::span<const ModelBatchItem> items,
                                     std::array<Request *, kLaneCount> &entries, SpilledKvReads &reads,
@@ -1929,6 +1937,10 @@ struct Runtime::Impl {
       for (uint32_t s = 0; s < chunks[c].sequences.size(); ++s) parts[chunks[c].sequences[s].lane].push_back({c, s});
     std::vector<std::vector<const GdnParityBuffers *>> written(chunks.size());
     for (uint32_t c = 0; c < chunks.size(); ++c) written[c].resize(chunks[c].sequences.size());
+    // The cells of the parts that end at a state they capture: the state's
+    // convolution rows and auxiliary state, and the recurrent state of the
+    // cell they write.
+    std::deque<GdnParityBuffers> boundaryCells;
     for (uint32_t lane = 0; lane < lanes; ++lane) {
       const GdnParityBuffers *const next = &states.next(entries[lane]->stateLane);
       // The cell the part after this one writes; none after the last part,
@@ -1940,13 +1952,16 @@ struct Runtime::Impl {
         const PrefillStateCapture *boundary = nullptr;
         for (const PrefillStateCapture &capture : sequence.stateCaptures)
           if (!capture.atEnd && capture.row == sequence.part.tokenCount) boundary = &capture;
-        const GdnParityBuffers *cell = next;
-        if (boundary)
-          cell = &boundary->reservation->buffers().gdn->buffers();
-        else if (after == next)
-          cell = prefillArena->groupCell();
+        const GdnParityBuffers *cell = after == next ? prefillArena->groupCell() : next;
         if (!cell) throw std::logic_error("a prefill group has no scratch cell");
         written[c][s] = after = cell;
+        if (boundary) {
+          const GdnParityBuffers &cached = boundary->reservation->buffers().gdn->buffers();
+          GdnParityBuffers &out = boundaryCells.emplace_back(*cell);
+          out.convolutionLayers = cached.convolutionLayers;
+          out.auxiliary = cached.auxiliary;
+          written[c][s] = &out;
+        }
       }
     }
 
@@ -2002,8 +2017,13 @@ struct Runtime::Impl {
         destination.recurrentOut = out.recurrentLayers;
         destination.auxiliaryIn = in.auxiliary;
         destination.auxiliaryOut = out.auxiliary;
-        // A state at the part's end is the cell it writes.
+        // A state at the part's end takes the codes of the state the part
+        // writes, and the convolution rows and auxiliary state of the cell
+        // it writes them to (above, or sealStates).
         destination.stateCaptures = inside.emplace_back(insideStateCaptures(sequence.stateCaptures, part.tokenCount));
+        for (const PrefillStateCapture &capture : sequence.stateCaptures)
+          if (capture.row == part.tokenCount)
+            destination.endCodes = capture.reservation->buffers().gdn->buffers().recurrentLayers;
         // The rows the draft's context reads.
         destination.captureCount = static_cast<uint32_t>(sequence.captures.size());
         for (uint32_t index = 0; index < sequence.captures.size(); ++index) {
@@ -2409,10 +2429,11 @@ struct Runtime::Impl {
   // would hold had it retained exactly those. The rows a lane retains are
   // the first of its verify rows, as many as its acceptance counted
   // (DecodeTensor::RetainedCount): the capture folds the first `rows` of the
-  // verify's tape into the state the verify wrote (QwenTarget::addStateFold)
-  // and stores their context rows, which the draft's commit normalized, in
-  // the state's window. The completion seals the state only where the lane
-  // retained them (finalizeDecode).
+  // verify's tape into the state the verify wrote and stores the result's
+  // codes in the state's cell (QwenTarget::addStateFold), and their context
+  // rows, which the draft's commit normalized, in the state's window. The
+  // completion seals the state only where the lane retained them
+  // (finalizeDecode).
   void encodeDecodeCaptures(CommandGraph &graph, std::span<Request *const> entries,
                             std::span<const ModelBatchItem> items) {
     for (uint32_t lane = 0; lane < entries.size(); ++lane) {
@@ -3619,8 +3640,10 @@ WarmupStepResult Runtime::warmupPrefill(uint32_t rows) {
     // No warmup captures a state inside its chunk, as a prompt does at a
     // cached boundary inside one: Flash-Next's first such request created
     // ngram_embedding_history while serving (0.6 ms warm on the 48 GB
-    // M5 Pro). So each prefill warmup also creates, without running it, what
-    // such a capture runs on its lane.
+    // M5 Pro), and a restore after the other warmups the codec's
+    // state_quantize and state_dequantize (0.13 and 0.11 ms). So each prefill
+    // warmup also creates, without running them, what such a capture runs
+    // on its lane and the codec.
     impl_->prepareInsideCapture(0);
     end(id);
   } catch (...) {

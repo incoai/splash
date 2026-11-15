@@ -563,10 +563,10 @@ std::string persistentCacheNamespace(const RuntimeCacheIdentity &identity,
             << "gdn " << gdn.layers << ' ' << gdn.convolutionHistory << ' '
             << gdn.convolutionChannels << ' ' << gdn.recurrentGroups << ' ' << gdn.recurrentRows
             << ' ' << gdn.recurrentColumns
-            // fp32 states keep the line they had before states had a format,
-            // so the caches they wrote stay valid; without GDN layers the
-            // format stores nothing.
-            << (gdn.layers && gdn.format == ops::GdnStateFormat::BFloat16 ? " bf16" : "");
+            // A cached state stores its recurrent layers as the codes of
+            // ops::StateCodec, whatever the running format; without GDN
+            // layers there are none.
+            << (gdn.layers ? " codes int8 block " + std::to_string(SPLASH_STATE_CODEC_BLOCK) + " bf16" : "");
   // A family's state after the GDN layers' (Qwen3.8-Flash-Next's PLE history
   // and QSA pending keys, model::QwenHybridLayout::gdnStateLayout).
   if (gdn.auxiliaryBytes) canonical << " auxiliary " << gdn.auxiliaryBytes;

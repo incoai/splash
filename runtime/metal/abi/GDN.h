@@ -88,17 +88,20 @@ static_assert(sizeof(GDNDecodeBatchParams) == 112,
               "GDN decode parameters are 112 bytes on both sides");
 
 // A fold of the first `rows` rows of a lane's step alone (GDN::addFold): the
-// state cells' strides, as in GDNDecodeBatchParams, and the byte offset in
-// the tape buffer of the step's first layer's tape, which the next layers'
-// follow gdn_tape_layer_bytes apart.
+// state cells' strides, as in GDNDecodeBatchParams; the cached cell's
+// recurrent layers' (codes_layer_bytes apart from its convolution_state_bytes,
+// as ops::StateCodec stores them); and the byte offset in the tape buffer of
+// the step's first layer's tape, which the next layers' follow
+// gdn_tape_layer_bytes apart.
 struct GDNFoldParams {
   uint64_t conv_layer_bytes;
   uint64_t recurrent_layer_bytes;
   uint64_t convolution_state_bytes;
+  uint64_t codes_layer_bytes;
   uint64_t step_tape;
   uint32_t rows;
   uint32_t padding;
 };
 
-static_assert(sizeof(GDNFoldParams) == 40,
-              "GDN fold parameters are 40 bytes on both sides");
+static_assert(sizeof(GDNFoldParams) == 48,
+              "GDN fold parameters are 48 bytes on both sides");

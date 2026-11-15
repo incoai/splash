@@ -3,6 +3,7 @@
 #include "tests/engine/AllocationFailure.hpp"
 #include "tests/engine/ClaimScope.hpp"
 #include "model/QwenState.hpp"
+#include "tests/engine/StateCodecReference.hpp"
 #include "tests/engine/TestChecks.hpp"
 
 #include <unistd.h>
@@ -91,6 +92,96 @@ uint64_t releaseAllIdle(model::QwenStateStorage &storage, bool keepLane) {
   return released;
 }
 
+// Fills a lane's cell: arbitrary bytes, but for its recurrent layers, which
+// hold finite values in [-1, 1) for a cached state to code.
+void fillState(const model::GdnParityBuffers &cell, const model::GdnStateLayout &layout, uint64_t seed) {
+  fill(cell.stateBase, seed);
+  uint64_t x = seed * 2 + 1;
+  const uint64_t values = uint64_t{layout.recurrentGroups} * layout.recurrentRows * layout.recurrentColumns;
+  for (const metal::MetalBuffer &layer : cell.recurrentLayers) {
+    auto *state = static_cast<float *>(layer.contents());
+    for (uint64_t i = 0; i < values; ++i) {
+      x ^= x << 13; x ^= x >> 7; x ^= x << 17;
+      state[i] = static_cast<float>(x % 2'000'001) / 1e6F - 1.0F;
+    }
+  }
+}
+
+// The values of a lane's recurrent layers, decoded from the codes a cached
+// state stores of them (ops::StateCodec).
+void decodeRecurrent(std::vector<uint8_t> &cell, const model::GdnStateLayout &layout) {
+  const uint32_t rows = layout.recurrentGroups * layout.recurrentRows, columns = layout.recurrentColumns;
+  for (uint32_t layer = 0; layer < layout.layers; ++layer) {
+    auto *values = reinterpret_cast<float *>(cell.data() + layout.convolutionBytes() +
+                                             uint64_t{layer} * layout.recurrentLayerBytes());
+    const std::vector<uint8_t> codes = test::stateCodesReference(values, rows, columns);
+    const auto *scales = reinterpret_cast<const uint16_t *>(codes.data() + state_codec_scales_offset(rows, columns));
+    for (uint64_t i = 0; i < uint64_t{rows} * columns; ++i)
+      values[i] = static_cast<float>(static_cast<int8_t>(codes[i])) *
+                  test::codecWiden(scales[i / SPLASH_STATE_CODEC_BLOCK]);
+  }
+}
+
+// What a restore of a lane's current state reproduces, in stateImage's
+// order: its cell with its recurrent layers decoded from their codes, and its
+// window.
+std::vector<std::vector<uint8_t>> restoredImage(const model::QwenStateStorage &storage, uint32_t lane) {
+  std::vector<std::vector<uint8_t>> image = stateImage(storage, lane);
+  decodeRecurrent(image[0], storage.layout().target);
+  return image;
+}
+
+// The cached cell a lane's current state stores: its convolution rows, each
+// recurrent layer's codes and its auxiliary state.
+std::vector<uint8_t> cachedImage(const model::QwenStateStorage &storage, uint32_t lane) {
+  const model::GdnStateLayout layout = storage.layout().target;
+  const std::vector<uint8_t> cell = bytesOf(storage.current(lane).stateBase);
+  std::vector<uint8_t> image(layout.cachedCellBytes());
+  std::copy_n(cell.begin(), layout.convolutionBytes(), image.begin());
+  const uint32_t rows = layout.recurrentGroups * layout.recurrentRows;
+  for (uint32_t layer = 0; layer < layout.layers; ++layer) {
+    const auto *values = reinterpret_cast<const float *>(cell.data() + layout.convolutionBytes() +
+                                                         uint64_t{layer} * layout.recurrentLayerBytes());
+    const std::vector<uint8_t> codes = test::stateCodesReference(values, rows, layout.recurrentColumns);
+    std::copy(codes.begin(), codes.end(),
+              image.begin() + layout.convolutionBytes() + uint64_t{layer} * layout.cachedRecurrentLayerBytes());
+  }
+  return image;
+}
+
+// Whether a cached cell holds `image` (cachedImage) where a state is stored:
+// its convolution rows, each layer's codes and scales and its auxiliary
+// state, not the pages' padding after a layer's scales.
+bool holdsCached(const metal::MetalBuffer &cell, const std::vector<uint8_t> &image, const model::GdnStateLayout &layout) {
+  const auto *bytes = static_cast<const uint8_t *>(cell.contents());
+  const auto same = [&](uint64_t offset, uint64_t count) {
+    return std::memcmp(bytes + offset, image.data() + offset, count) == 0;
+  };
+  const uint64_t codes = state_codec_layer_bytes(layout.recurrentGroups * layout.recurrentRows, layout.recurrentColumns);
+  bool held = cell.sizeBytes() == image.size() && same(0, layout.convolutionBytes()) &&
+              same(layout.convolutionBytes() + layout.cachedRecurrentBytes(), layout.auxiliaryBytes);
+  for (uint32_t layer = 0; layer < layout.layers; ++layer)
+    held = held && same(layout.convolutionBytes() + uint64_t{layer} * layout.cachedRecurrentLayerBytes(), codes);
+  return held;
+}
+
+// A block of a recurrent layer's first values that its codes hold exactly:
+// multiples of 2^-10 up to 127 of them, which a block's scale of 2^-10
+// codes as the multiples.
+void markBlock(const metal::MetalBuffer &layer, int32_t seed) {
+  auto *values = static_cast<float *>(layer.contents());
+  for (int32_t i = 0; i < static_cast<int32_t>(SPLASH_STATE_CODEC_BLOCK); ++i)
+    values[i] = static_cast<float>(i ? (seed + 7 * i) % 255 - 127 : 127) / 1024.0F;
+}
+
+bool marked(const metal::MetalBuffer &layer, int32_t seed) {
+  const auto *values = static_cast<const float *>(layer.contents());
+  for (int32_t i = 0; i < static_cast<int32_t>(SPLASH_STATE_CODEC_BLOCK); ++i)
+    if (values[i] != static_cast<float>(i ? (seed + 7 * i) % 255 - 127 : 127) / 1024.0F)
+      return false;
+  return true;
+}
+
 template <typename Ticket> bool finishWhenReady(Ticket &ticket) {
   while (!ticket.ready()) std::this_thread::yield();
   return ticket.finish();
@@ -118,15 +209,20 @@ void testLayoutFormulas() {
                   kStateLayout.laneBytes() ==
               1'424'490'496,
           "four-lane byte formula is wrong");
-  require(kStateLayout.cachedBytes() == 160'038'912,
+  // A cached state's recurrent layer: a byte of code per value and a bf16
+  // scale per 32 of them.
+  require(kTargetState.cachedRecurrentLayerBytes() == 835'584 &&
+              kTargetState.cachedCellBytes() == 43'253'760,
+          "cached recurrent layer formula is wrong");
+  require(kStateLayout.cachedBytes() == 49'152'000,
           "prefix byte formula is wrong");
   // A bf16 recurrent state takes half the bytes; the convolution rows keep
-  // theirs.
+  // theirs, and a cached state its codes.
   model::CompositeStateLayout bfloat = kStateLayout;
   bfloat.target.format = ops::GdnStateFormat::BFloat16;
   require(bfloat.target.recurrentLayerBytes() == 1'572'864 &&
               bfloat.target.convolutionBytes() == 3'145'728 &&
-              bfloat.laneBytes() == 205'127'680 && bfloat.cachedBytes() == 84'541'440,
+              bfloat.laneBytes() == 205'127'680 && bfloat.cachedBytes() == 49'152'000,
           "bf16 state byte formula is wrong");
 }
 
@@ -204,13 +300,13 @@ void testDiskRestore(metal::MetalBackend &backend) {
   const model::GdnParityBuffers &gdn = storage.current(0);
   const metal::MetalBuffer &window = storage.window(0);
   const metal::MetalBuffer &keys = storage.draft(0)[0].keys;
-  // Every byte of the state travels through the file; markers alone would
-  // not notice a misplaced or truncated span.
-  fill(gdn.stateBase, 1);
+  // Every byte of the state travels through the file, its recurrent layers'
+  // as codes; markers alone would not notice a misplaced or truncated span.
+  fillState(gdn, kTargetState, 1);
   word(gdn.stateBase) = 0x12345678;
   fill(window, 2);
   word(window) = 0x0c0c0c0c;
-  const auto images = stateImage(storage, 0);
+  const auto images = restoredImage(storage, 0);
   storage.updateLengths(0, published(4096));
   auto source = storage.snapshot(0);
   auto write = source->offload({});
@@ -219,7 +315,7 @@ void testDiskRestore(metal::MetalBackend &backend) {
   require(disk && !disk->residentBytes(), "disk state retained resident allocation");
   // The write owns its copy: the source buffers are free before it finishes.
   source.reset();
-  require(storage.idleCells() == 1 && storage.idleWindows() == 1 && storage.idleRings() == 0,
+  require(storage.idleCachedCells() == 1 && storage.idleWindows() == 1 && storage.idleRings() == 0,
           "demotion did not return the source buffers at once");
   releaseAllIdle(storage, false);
   require(finishWhenReady(*write), "disk write failed");
@@ -286,11 +382,10 @@ void testDirectDiskSnapshot(metal::MetalBackend &backend) {
   const model::GdnParityBuffers &current = storage.current(0);
   const model::GdnParityBuffers &next = storage.next(0);
   fill(next.stateBase, 8);
-  fill(current.stateBase, 7);
+  fillState(current, kTargetState, 7);
   word(current.stateBase) = 0x0badf00d;
   fill(storage.window(0), 20);
-  const auto inactive = bytesOf(next.stateBase);
-  const auto images = stateImage(storage, 0);
+  const auto images = restoredImage(storage, 0);
   storage.updateLengths(0, published(4096));
   const uint64_t before = storage.actualAllocatedBytes();
   auto write = storage.snapshotToDisk(0, {});
@@ -318,7 +413,10 @@ void testDirectDiskSnapshot(metal::MetalBackend &backend) {
               word(current.stateBase) == 0x0badf00d &&
               storage.metadata(0).lengths.targetTokens == 4096,
           "the disk copy did not reproduce the lane's active state");
-  require(sameBytes(next.stateBase, inactive), "the inactive parity was touched");
+  // The read lands in the inactive parity, which the lane's next
+  // transition writes before it reads it.
+  require(std::memcmp(next.stateBase.contents(), current.stateBase.contents(), kTargetState.convolutionBytes()) == 0,
+          "the read did not land in the lane's other cell");
   disk.reset();
   auto again = storage.snapshotToDisk(0, {});
   require(again != nullptr, "the dropped disk copy did not free its quota");
@@ -379,9 +477,9 @@ void testStateSmallerThanSlot(metal::MetalBackend &backend) {
                                         slotBytes, std::make_shared<model::DiskBudget>(slotBytes)));
     require(static_cast<bool>(storage.tryActivateLane(0, 77)), "lane activation failed");
     const model::GdnParityBuffers &gdn = storage.current(0);
-    fill(gdn.stateBase, 31);
+    fillState(gdn, target, 31);
     fill(storage.window(0), 32);
-    const auto images = stateImage(storage, 0);
+    const auto images = restoredImage(storage, 0);
     storage.updateLengths(0, published(4096));
     auto write = storage.snapshotToDisk(0, {});
     require(write && finishWhenReady(*write), "a state did not reach a larger slot");
@@ -423,10 +521,10 @@ void testPersistentStateComesBack(metal::MetalBackend &backend) {
     require(static_cast<bool>(storage.tryActivateLane(0, 5)), "lane activation failed");
     std::vector<std::shared_ptr<const CompositeState>> kept;
     for (uint64_t seed : {40, 50}) {
-      fill(storage.current(0).stateBase, seed);
+      fillState(storage.current(0), kTargetState, seed);
       fill(storage.window(0), seed + 1);
       if (images.empty())
-        images = stateImage(storage, 0);
+        images = restoredImage(storage, 0);
       storage.updateLengths(0, published(4096));
       auto write = storage.snapshotToDisk(0, {});
       require(write != nullptr, "a state write was refused");
@@ -483,9 +581,9 @@ void testPersistKeepsTheRamCopy(metal::MetalBackend &backend) {
       std::make_shared<model::SlotFile>(kStateSlotBytes,
                                         std::make_shared<model::DiskBudget>(kStateSlotBytes)));
   require(static_cast<bool>(storage.tryActivateLane(0, 7)), "lane activation failed");
-  fill(storage.current(0).stateBase, 60);
+  fillState(storage.current(0), kTargetState, 60);
   fill(storage.window(0), 61);
-  const auto images = stateImage(storage, 0);
+  const auto images = restoredImage(storage, 0);
   storage.updateLengths(0, published(4096));
   const auto source = storage.snapshot(0);
   const uint64_t allocated = storage.actualAllocatedBytes();
@@ -507,12 +605,13 @@ void testPersistKeepsTheRamCopy(metal::MetalBackend &backend) {
 
 // A state a prefill command captures takes its cache slot before the command
 // runs: the pool's buffers, one admission for what the pool lacks, nothing
-// on a refusal, whose cause it reports. copyWindow() fills the slot's window alone and copyState()
-// the lane's whole state. Sealing moves the slot into the cached state, which
-// carries the tier's file and staging as a snapshot does, and leaves the
-// reservation empty: a dropped reservation returns what it still holds, so
-// each buffer goes back to the pool once, and nothing once its storage is
-// gone.
+// on a refusal, whose cause it reports. copyWindow() fills the slot's window
+// alone, copyBeside() its convolution rows and auxiliary state too, and
+// storeState() the lane's whole state, its recurrent layers as their codes.
+// Sealing moves the slot into the cached state, which carries the tier's
+// file and staging as a snapshot does, and leaves the reservation empty: a
+// dropped reservation returns what it still holds, so each buffer goes back
+// to the pool once, and nothing once its storage is gone.
 void testReservations(metal::MetalBackend &backend) {
   MemoryGovernor governor(backend, backend.capabilities().recommendedMaxWorkingSetBytes, 1, 1,
                           queryHostMemory, 0);
@@ -537,10 +636,11 @@ void testReservations(metal::MetalBackend &backend) {
         backend, admit, layout,
         std::make_shared<model::SlotFile>(slotBytes, std::make_shared<model::DiskBudget>(slotBytes)));
     require(static_cast<bool>(storage.tryActivateLane(0, 9)), "lane activation failed");
-    fill(storage.current(0).stateBase, 70);
+    fillState(storage.current(0), layout.target, 70);
     fill(storage.window(0), 71);
     storage.updateLengths(0, published(4096));
-    const auto images = stateImage(storage, 0);
+    const auto images = restoredImage(storage, 0);
+    const std::vector<uint8_t> cached = cachedImage(storage, 0);
     const uint64_t laneBytes = storage.actualAllocatedBytes();
 
     admitNew = false;
@@ -552,31 +652,38 @@ void testReservations(metal::MetalBackend &backend) {
     auto reservation = storage.reserve(refusal);
     require(reservation && refusal == metal::AllocationFailure::None && admissions == 2 &&
                 storage.actualAllocatedBytes() > laneBytes &&
-                storage.idleCells() == 0 && storage.idleWindows() == 0,
+                storage.idleCachedCells() == 0 && storage.idleWindows() == 0,
             "a reservation did not take one admission for its slot");
+    require(reservation->buffers().gdn->buffers().stateBase.sizeBytes() == layout.target.cachedCellBytes(),
+            "a reservation's cell is not a cached cell");
     const uint64_t slotted = storage.actualAllocatedBytes();
     reservation.reset();
-    require(storage.idleCells() == 1 && storage.idleWindows() == 1 &&
+    require(storage.idleCachedCells() == 1 && storage.idleCells() == 0 && storage.idleWindows() == 1 &&
                 storage.actualAllocatedBytes() == slotted,
             "a dropped reservation did not return its slot to the pool");
     admitNew = false;
     reservation = storage.reserve(refusal);
-    require(reservation && storage.idleCells() == 0 && storage.idleWindows() == 0,
+    require(reservation && storage.idleCachedCells() == 0 && storage.idleWindows() == 0,
             "a reservation did not take the pooled slot without an admission");
     admitNew = true;
 
-    // The window alone, then the whole state.
+    // The window alone, then the rest beside the codes, then the whole state.
     const model::QwenCachedBuffers buffers = reservation->buffers();
-    fill(buffers.gdn->buffers().stateBase, 72);
-    const auto cell = bytesOf(buffers.gdn->buffers().stateBase);
+    const model::GdnParityBuffers &slot = buffers.gdn->buffers();
+    fill(slot.stateBase, 72);
+    const auto cell = bytesOf(slot.stateBase);
     storage.copyWindow(0, *reservation);
-    require(sameBytes(buffers.window->buffer(), images[1]) &&
-                sameBytes(buffers.gdn->buffers().stateBase, cell),
+    require(sameBytes(buffers.window->buffer(), images[1]) && sameBytes(slot.stateBase, cell),
             "copyWindow did not copy the lane's window alone");
-    storage.copyState(0, *reservation);
-    require(sameBytes(buffers.gdn->buffers().stateBase, images[0]) &&
-                sameBytes(buffers.window->buffer(), images[1]),
-            "copyState did not copy the lane's cell and window");
+    storage.copyBeside(0, *reservation);
+    const std::vector<uint8_t> beside = bytesOf(slot.stateBase);
+    require(std::equal(beside.begin(), beside.begin() + layout.target.convolutionBytes(), cached.begin()) &&
+                std::equal(beside.begin() + layout.target.convolutionBytes(), beside.end(),
+                           cell.begin() + layout.target.convolutionBytes()),
+            "copyBeside did not copy the lane's convolution rows alone into the cell");
+    storage.storeState(0, *reservation);
+    require(holdsCached(slot.stateBase, cached, layout.target) && sameBytes(buffers.window->buffer(), images[1]),
+            "storeState did not store the lane's convolution rows, codes and window");
 
     // A refused seal leaves the reservation as it was.
     rejects([&] { static_cast<void>(storage.seal(*reservation, {4096, 2048, 2048, 4000})); },
@@ -588,7 +695,7 @@ void testReservations(metal::MetalBackend &backend) {
     rejects([&] { static_cast<void>(storage.seal(*reservation, published(4096))); },
             "composite state buffers are empty", "a reservation was sealed twice");
     reservation.reset();
-    require(storage.idleCells() == 0 && storage.idleWindows() == 0,
+    require(storage.idleCachedCells() == 0 && storage.idleWindows() == 0,
             "a sealed reservation returned the buffers its state holds");
     require(state->canOffload(false), "a sealed state cannot be written to the disk tier");
     auto write = state->offload({});
@@ -602,7 +709,7 @@ void testReservations(metal::MetalBackend &backend) {
     read.reset();
     write.reset();
     state.reset();
-    require(storage.idleCells() == 1 && storage.idleWindows() == 1 &&
+    require(storage.idleCachedCells() == 1 && storage.idleWindows() == 1 &&
                 storage.actualAllocatedBytes() == slotted,
             "a dropped sealed state did not return its slot to the pool once");
 
@@ -685,7 +792,7 @@ void testAttentionOnlyTarget(metal::MetalBackend &backend) {
     require(reservation && admissions == admitted && storage.idleWindows() == 0 &&
                 storage.actualAllocatedBytes() == pooled,
             "an attention-only reservation did not take the pooled window alone");
-    storage.copyState(1, *reservation);
+    storage.storeState(1, *reservation);
     require(sameBytes(reservation->buffers().window->buffer(), window),
             "an attention-only state's copy did not take the lane's window");
     state = storage.seal(*reservation, published(4096));
@@ -860,7 +967,7 @@ void run(const std::string &metallib) {
     // Hot metadata updates must leave every buffer and marker untouched.
     word(storage.current(0).convolutionLayers[0]) = 0x10101010;
     word(storage.next(0).convolutionLayers[0]) = 0x21212121;
-    word(storage.next(0).recurrentLayers[0]) = 0x31313131;
+    markBlock(storage.next(0).recurrentLayers[0], 0x31);
     const uint64_t windowTail = kDraftState.windowBytes() - sizeof(uint32_t);
     word(storage.window(0)) = 0x41414141;
     word(storage.window(0), windowTail) = 0x51515151;
@@ -878,9 +985,10 @@ void run(const std::string &metallib) {
                 word(storage.current(0).convolutionLayers[0]) == 0x21212121,
             "parity swap copied hot state or kept the current cell");
 
-    // Publication copies the lane's active-parity GDN cell and its context
-    // window into a cache slot the governor admits. The lane keeps its own
-    // cells: no address changes, no aliasing, no parity handoff.
+    // Publication stores the lane's active-parity GDN cell, its recurrent
+    // layers as codes, and its context window into a cache slot the governor
+    // admits. The lane keeps its own cells: no address changes, no aliasing,
+    // no parity handoff.
     const uint64_t beforePrefix = backend.memoryStats().allocatedBytes;
     const uint64_t storageBeforePrefix = storage.actualAllocatedBytes();
     void *laneActiveGdnBase = storage.current(0).stateBase.contents();
@@ -905,7 +1013,7 @@ void run(const std::string &metallib) {
     // active cell or window after publication never reach a restore, which
     // leaves the rings to the runtime.
     word(storage.current(0).convolutionLayers[0]) = 0xa1a1a1a1;
-    word(storage.current(0).recurrentLayers[0]) = 0xa2a2a2a2;
+    markBlock(storage.current(0).recurrentLayers[0], 0xa2);
     word(storage.window(0)) = 0xa3a3a3a3;
     word(storage.current(1).convolutionLayers[0]) = 0xb0b0b0b0;
     word(storage.next(1).convolutionLayers[0]) = 0xb1b1b1b1;
@@ -923,7 +1031,7 @@ void run(const std::string &metallib) {
                 storage.draft(1)[0].keys.contents() == destinationDraftBase,
             "restore replaced the destination's buffers");
     require(word(storage.current(1).convolutionLayers[0]) == 0x21212121 &&
-                word(storage.current(1).recurrentLayers[0]) == 0x31313131,
+                marked(storage.current(1).recurrentLayers[0], 0x31),
             "restore did not deliver the pre-mutation GDN snapshot");
     require(word(storage.next(1).convolutionLayers[0]) == 0xb1b1b1b1,
             "restore overwrote inactive parity");
@@ -933,7 +1041,7 @@ void run(const std::string &metallib) {
     require(word(storage.draft(1)[0].keys) == 0xb2b2b2b2,
             "a restore wrote the rings, which the runtime computes from the window");
     require(word(storage.current(0).convolutionLayers[0]) == 0xa1a1a1a1 &&
-                word(storage.current(0).recurrentLayers[0]) == 0xa2a2a2a2 &&
+                marked(storage.current(0).recurrentLayers[0], 0xa2) &&
                 word(storage.window(0)) == 0xa3a3a3a3,
             "restore wrote back into the source lane");
 
@@ -1081,7 +1189,7 @@ void run(const std::string &metallib) {
             "dropped cached state freed its slot instead of pooling it");
     storage.updateLengths(0, lengths);
     word(storage.current(0).convolutionLayers[0]) = 0xe1e1e1e1;
-    word(storage.current(0).recurrentLayers[0]) = 0xe2e2e2e2;
+    markBlock(storage.current(0).recurrentLayers[0], 0xe2);
     word(storage.window(0)) = 0xe3e3e3e3;
     admitNewAllocations = false;
     std::shared_ptr<const QwenCompositeState> pooled = storage.snapshot(0);
@@ -1100,7 +1208,7 @@ void run(const std::string &metallib) {
     require(storage.metadata(1).activeParity == 1 &&
                 storage.metadata(1).lengths == lengths &&
                 word(storage.current(1).convolutionLayers[0]) == 0xe1e1e1e1 &&
-                word(storage.current(1).recurrentLayers[0]) == 0xe2e2e2e2 &&
+                marked(storage.current(1).recurrentLayers[0], 0xe2) &&
                 word(storage.window(1)) == 0xe3e3e3e3,
             "reused cache slot served stale contents");
     require(word(storage.next(1).convolutionLayers[0]) == 0x21212121,
@@ -1135,14 +1243,14 @@ void run(const std::string &metallib) {
     require(idle == kStateLayout.laneBytes() + kStateLayout.cachedBytes(),
             "the idle bytes a dropped state would leave are not the layout's");
     retained.reset();
-    require(storage.idleCells() == 5 && storage.idleRings() == 2 &&
+    require(storage.idleCells() == 4 && storage.idleCachedCells() == 1 && storage.idleRings() == 2 &&
                 storage.idleWindows() == 3 && storage.idleBytes(0, false, true) == idle,
             "dropped cached state did not return its cell and window to the pool");
     // Releasing down to one lane's worth keeps two cells, the rings and a
     // window warm, and frees no less than was counted.
     const uint64_t released = releaseAllIdle(storage, true);
     require(released == observedLaneActual + observedPrefixActual && released >= idle &&
-                storage.idleCells() == 2 && storage.idleRings() == 1 &&
+                storage.idleCells() == 2 && storage.idleCachedCells() == 0 && storage.idleRings() == 1 &&
                 storage.idleWindows() == 1 && storage.idleBytes(0, false, true) == 0,
             "partial idle release did not keep the requested buffers");
     require(releaseAllIdle(storage, false) == observedLaneActual,
@@ -1170,12 +1278,12 @@ void run(const std::string &metallib) {
                 storage.actualAllocatedBytes() == observedLaneActual,
             "an activation asked the governor for its buffers one by one");
     // With one cell, the rings and a window in the pool the lane lacks a
-    // cell: a refusal leaves them pooled, and the retry is admitted that cell
-    // alone.
+    // cell, which no cached state holds: a refusal leaves them pooled, and
+    // the retry is admitted that cell alone.
     storage.releaseLane(0, 505);
     require(storage.releaseOneIdle(false) != 0 && storage.idleCells() == 1 &&
                 storage.idleRings() == 1 && storage.idleWindows() == 1 &&
-                storage.statesToActivate() == 1,
+                !storage.statesToActivate(),
             "fixture pool does not hold one cell, the rings and a window");
     const uint64_t pooledBytes = storage.actualAllocatedBytes();
     admitNewAllocations = false;

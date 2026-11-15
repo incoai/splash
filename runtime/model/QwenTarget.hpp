@@ -196,9 +196,10 @@ struct QwenTargetPrefillCapture final {
 };
 
 // A state a prefill command captures at a row inside it (a state boundary):
-// each GDN layer's convolution and recurrent state, as a command ending at
-// that row stores them, in the views of a cache cell, and the target's
-// auxiliary state (GdnStateLayout::auxiliaryBytes) in the cell's.
+// each GDN layer's convolution state, as a command ending at that row stores
+// it, and the codes of its recurrent state (ops::StateCodec), in the views of
+// a cached cell, and the target's auxiliary state
+// (GdnStateLayout::auxiliaryBytes) in the cell's.
 struct QwenTargetStateCapture final {
   uint32_t row = 0;
   std::span<const metal::MetalBuffer> convolution;
@@ -237,8 +238,13 @@ struct QwenTargetPrefillSequence final {
   std::span<const metal::MetalBuffer> recurrentOut;
   std::array<QwenTargetPrefillCapture, 2> captures{};
   uint32_t captureCount = 0;
-  // In row order, each inside (0, rows).
+  // In row order, each inside (0, rows): a cached state's cell, whose
+  // recurrent views are codes (ops::StateCodec).
   std::span<const QwenTargetStateCapture> stateCaptures;
+  // Every GDN layer's codes of a state cached at the rows' end; none
+  // without one. Its convolution rows and auxiliary state are
+  // convolutionOut's and auxiliaryOut's.
+  std::span<const metal::MetalBuffer> endCodes;
   // The target's auxiliary state before and after the sequence's rows.
   metal::MetalBuffer auxiliaryIn;
   metal::MetalBuffer auxiliaryOut;
@@ -360,11 +366,11 @@ struct QwenTargetCommitBuffers final {
   std::array<metal::MetalBuffer, ExecutionLimits::maximumBatchWidth> auxiliaryOut;
 };
 
-// The GDN state after the first rows of a lane's verify, folded into a cache
-// cell from the verify's tape (addStateFold): the lane's retained count,
-// the cell the verify wrote, which holds the state before its rows, the
-// lanes' decode tapes and the offset of the verify's slot in them, and the
-// cache cell.
+// The GDN state after the first rows of a lane's verify, folded into a cached
+// state's cell from the verify's tape (addStateFold): the lane's retained
+// count, the cell the verify wrote, which holds the state before its rows,
+// the lanes' decode tapes and the offset of the verify's slot in them, and
+// the cached cell, which takes the state's codes.
 struct QwenTargetFoldBuffers final {
   metal::MetalBuffer retainedCount;
   metal::MetalBuffer state;
@@ -526,10 +532,11 @@ public:
   virtual void addStateCommit(metal::CommandGraph &graph, QwenTargetCommitBuffers buffers, uint32_t lanes) const;
   // After a verify's acceptance, the GDN state after its first `rows` rows of
   // one lane, which the lane's next step would hold had the lane retained
-  // exactly those, in a cache cell, when the lane retained that many. None
-  // for a target without GDN layers; a target with auxiliary state, which
-  // its commit writes after every retained row, captures no state in decode
-  // (Model::capturesInDecode).
+  // exactly those, as a cached state stores it (its convolution rows and its
+  // recurrent state's codes, ops::GDN::addFold), when the lane retained that
+  // many. None for a target without GDN layers; a target with auxiliary
+  // state, which its commit writes after every retained row, captures no
+  // state in decode (Model::capturesInDecode).
   void addStateFold(metal::CommandGraph &graph, QwenTargetFoldBuffers buffers, uint32_t rows) const;
   // The table rows batch lane `lane`'s verify rows of the last step read,
   // each row's in order, for tests (RuntimeInstrumentation::lastTableRows);

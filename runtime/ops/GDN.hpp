@@ -91,9 +91,11 @@ struct GdnPrefillBuffers final {
   metal::MetalBuffer hidden;
 };
 
-// A state a prefill captures inside its rows: the convolution carry and the
-// recurrent state after its first `tokens` rows, which it stores in these
-// buffers as a prefill ending there would.
+// A state a prefill caches after its first `tokens` rows: the codes of its
+// recurrent state (ops::StateCodec) in `recurrent` and, for a state inside
+// the rows, the convolution carry in `convolution`, which the prefill stores
+// there as a prefill ending there would and continues from. A state at the
+// rows' end takes its carry from the prefill's convolutionOut.
 struct GdnPrefillCapture final {
   uint32_t tokens = 0;
   metal::MetalBuffer convolution;
@@ -136,8 +138,9 @@ struct GdnDecodeBuffers final {
 // A lane's decode step to fold rows of alone (GDN::addFold): the cell the
 // step wrote, which holds the state before its rows, the tape its rows are
 // on (every layer's, from stepSlot), the count of them the lane retained,
-// which the step's acceptance wrote, and the cell the fold writes, of the
-// same strides.
+// which the step's acceptance wrote, and the cached state's cell the fold
+// writes: the convolution rows at the lane cell's offsets, then each layer's
+// codes (ops::StateCodec).
 struct GdnFoldBuffers final {
   metal::MetalBuffer state;
   metal::MetalBuffer tape;
@@ -148,11 +151,14 @@ struct GdnFoldBuffers final {
 
 class GDN final {
 public:
-  // Each capture, ascending inside the rows, ends one run of the prepare and
-  // scan dispatches, and the next run starts from the state it stored; the
-  // gate then runs once over every row. The scan is sequential, so with an
-  // fp32 state the runs compute what one run does, and a bf16 state is
-  // rounded at each capture as a prefill ending there rounds it.
+  // Each capture inside the rows, ascending, ends one run of the prepare and
+  // scan dispatches; every run stores its state in recurrentOut, which the
+  // next continues from in place, and the convolution carry of a capture in
+  // its buffer; the gate then runs once over every row. A capture's codes
+  // follow the run that ends at it, and a capture at the rows' end, after
+  // every capture inside them, follows the last run. The scan is sequential,
+  // so with an fp32 state the runs compute what one run does, and a bf16
+  // state is rounded at each capture as a prefill ending there rounds it.
   static void addPrefill(metal::CommandGraph &graph, const metal::MetalBackend &backend,
                          GdnPrefillBuffers buffers, GdnShape shape, uint32_t tokens,
                          GdnStateFormat state, GdnHeadOrder order,
@@ -166,12 +172,15 @@ public:
                                  GdnHeadOrder order,
                                  LinearInput input);
   // The state after the first `rows` of a decode step's rows, in each of
-  // `layers` layers: those rows folded into the state before them, and the
-  // convolution rows they leave, in buffers.fold, bit for bit the state the
-  // lane's next step holds when the lane retained exactly those rows. A lane
-  // that retained fewer leaves the fold as it was.
+  // `layers` layers, as a cached state stores it in buffers.fold: those rows
+  // folded into the state before them, the convolution rows they leave as
+  // they are and the recurrent state as its codes, each layer's
+  // codesLayerBytes after the last; bit for bit the rows and the codes
+  // ops::StateCodec makes of the state the lane's next step holds when the
+  // lane retained exactly those rows. A lane that retained fewer leaves the
+  // fold as it was.
   static void addFold(metal::CommandGraph &graph, GdnFoldBuffers buffers, GdnShape shape,
-                      uint32_t layers, uint32_t rows, GdnStateStrides state);
+                      uint32_t layers, uint32_t rows, GdnStateStrides state, uint64_t codesLayerBytes);
 };
 
 } // namespace splash::ops

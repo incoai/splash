@@ -2165,8 +2165,11 @@ retained rows may reach the next whole page reserves that page's state, in one
 attempt that frees nothing for it (`Engine::reserveReplyCapture`); refused, the
 cycle captures none. A decode step leaves the rows it retains on the lane's tape
 for the lane's next step to fold into the GDN state, so the cycle folds the rows
-before the page alone into the state's cell (`ops::GDN::addFold`, the next
-step's arithmetic, which it matches bit for bit), and the state's window is a
+before the page alone and stores the result's codes in the state's cell
+(`ops::GDN::addFold`: the next step's arithmetic, then the codec's, so the
+codes are bit for bit those the codec makes of the state the next step holds;
+it reads the 27B's 144 MiB state and writes 38 MiB, where a fold into a lane's
+cell and the codec after it would move 470 MiB), and the state's window is a
 copy of the lane's plus those rows' context; the completion seals the state only
 where the lane retained those rows. Both writes are one function of the runtime
 (`encodeDecodeCaptures`), which names the rows a lane retained: the first of its

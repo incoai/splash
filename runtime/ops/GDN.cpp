@@ -4,6 +4,7 @@
 #include "metal/abi/GDN.h"
 #include "ops/BufferExtent.hpp"
 #include "ops/LaneBindings.hpp"
+#include "ops/StateCodec.hpp"
 
 #include <algorithm>
 #include <array>
@@ -144,25 +145,35 @@ void GDN::addPrefill(metal::CommandGraph &graph, const metal::MetalBackend &back
   requireBytes(buffers.recurrentOut, recurrentBytes(shape, state), "GDN next recurrent state");
   requireBytes(buffers.recurrentRows, valueRows, "GDN recurrent row");
   requireBytes(buffers.hidden, valueRows, "GDN hidden");
+  // One layer's codes (ops::StateCodec).
+  const StateCodecShape codec{1,
+                              shape.valueHeads * shape.headDimension,
+                              shape.headDimension,
+                              recurrentBytes(shape, state),
+                              state_codec_layer_bytes(shape.valueHeads * shape.headDimension, shape.headDimension),
+                              state};
   uint32_t previous = 0;
   for (const GdnPrefillCapture &capture : captures) {
-    if (capture.tokens <= previous || capture.tokens >= tokens)
-      throw std::invalid_argument("GDN prefill captures are not ascending inside its rows");
+    if (capture.tokens <= previous || capture.tokens > tokens)
+      throw std::invalid_argument("GDN prefill captures are not ascending within its rows");
     previous = capture.tokens;
-    requireBytes(capture.convolution, carriedBytes(shape), "GDN captured convolution state");
-    requireBytes(capture.recurrent, recurrentBytes(shape, state), "GDN captured recurrent state");
+    if (capture.tokens < tokens)
+      requireBytes(capture.convolution, carriedBytes(shape), "GDN captured convolution state");
+    requireBytes(capture.recurrent, codec.codesBytes(), "GDN captured recurrent codes");
   }
+  const bool endCapture = !captures.empty() && captures.back().tokens == tokens;
+  const size_t runs = captures.size() - (endCapture ? 1 : 0) + 1;
   const std::string prepare = std::string("prefill_gdn_prepare") + std::string(kernel.suffix);
   const std::string scan =
       stateKernel(std::string("prefill_gdn_scan") + std::string(kernel.scanSuffix), state);
   metal::MetalBuffer convolution = buffers.convolutionIn;
   metal::MetalBuffer recurrent = buffers.recurrentIn;
+  const metal::MetalBuffer recurrentOut = buffers.recurrentOut;
   uint32_t begin = 0;
-  for (size_t index = 0; index <= captures.size(); ++index) {
-    const bool last = index == captures.size();
+  for (size_t index = 0; index < runs; ++index) {
+    const bool last = index + 1 == runs;
     const uint32_t end = last ? tokens : captures[index].tokens;
     const metal::MetalBuffer convolutionOut = last ? buffers.convolutionOut : captures[index].convolution;
-    const metal::MetalBuffer recurrentOut = last ? buffers.recurrentOut : captures[index].recurrent;
     // The run's rows of a buffer whose rows are `stride` values of `bytes`
     // bytes apart, to the last row's `width` values the kernels read.
     const auto rows = [&](const metal::MetalBuffer &buffer, uint64_t stride, uint64_t width, uint64_t bytes) {
@@ -179,11 +190,15 @@ void GDN::addPrefill(metal::CommandGraph &graph, const metal::MetalBackend &back
                convolution, convolutionOut, queries, keys, values, buffers.decayWeights, buffers.timeBias, decay,
                beta},
               params, {uint64_t{end - begin} * shape.keyHeads, 1, 1}, {shape.headDimension, 1, 1});
+    // A threadgroup loads the rows it carries before it stores them, and no
+    // other one reads or writes those rows, so a run continues in place.
     graph.add(scan,
               {queries, keys, values, decay, beta, recurrent, recurrentOut,
                rows(buffers.recurrentRows, valueWidth(shape), valueWidth(shape), 2)},
               params, {uint64_t{shape.valueHeads} * shape.headDimension / SPLASH_GDN_SCAN_STATE_ROWS, 1, 1},
               {SPLASH_GDN_SCAN_THREADS, 1, 1});
+    if (index < captures.size() && captures[index].tokens == end)
+      StateCodec::addQuantize(graph, recurrentOut, captures[index].recurrent, codec);
     convolution = convolutionOut;
     recurrent = recurrentOut;
     begin = end;
@@ -262,8 +277,10 @@ PreparedInput GDN::addDecode(metal::CommandGraph &graph, GdnDecodeBuffers buffer
 }
 
 void GDN::addFold(metal::CommandGraph &graph, GdnFoldBuffers buffers, GdnShape shape,
-                  uint32_t layers, uint32_t rows, GdnStateStrides state) {
-  if (!layers || !rows || rows > SPLASH_TARGET_VERIFY_ROWS || !state.valid() || buffers.stepSlot % 16)
+                  uint32_t layers, uint32_t rows, GdnStateStrides state, uint64_t codesLayerBytes) {
+  const uint64_t codes = state_codec_layer_bytes(shape.valueHeads * shape.headDimension, shape.headDimension);
+  if (!layers || !rows || rows > SPLASH_TARGET_VERIFY_ROWS || !state.valid() || buffers.stepSlot % 16 ||
+      codesLayerBytes < codes)
     throw std::invalid_argument("invalid GDN fold geometry");
   const CompiledGdn &kernel = compiledGdn(shape);
   const uint64_t tapeBytes = uint64_t{layers} * gdnTapeLayerBytes(shape);
@@ -271,11 +288,14 @@ void GDN::addFold(metal::CommandGraph &graph, GdnFoldBuffers buffers, GdnShape s
     throw std::invalid_argument("invalid GDN fold tape");
   requireBytes(buffers.tape, buffers.stepSlot + tapeBytes, "GDN tape");
   requireBytes(buffers.retained, sizeof(uint32_t), "GDN retained count");
-  const uint64_t bytes = stateBytes(shape, state, layers - 1);
-  requireBytes(buffers.state, bytes, "GDN state");
-  requireBytes(buffers.fold, bytes, "GDN folded state");
+  requireBytes(buffers.state, stateBytes(shape, state, layers - 1), "GDN state");
+  // The cached cell keeps the lane cell's convolution rows where they are.
+  requireBytes(buffers.fold,
+               std::max(uint64_t{layers - 1} * state.convolutionLayerBytes + carriedBytes(shape),
+                        state.convolutionStateBytes + uint64_t{layers - 1} * codesLayerBytes + codes),
+               "GDN folded state");
   const GDNFoldParams params{state.convolutionLayerBytes, state.recurrentLayerBytes,
-                             state.convolutionStateBytes, buffers.stepSlot, rows, 0};
+                             state.convolutionStateBytes, codesLayerBytes, buffers.stepSlot, rows, 0};
   graph.add(stateKernel(std::string("verify_gdn_fold") + std::string(kernel.scanSuffix), state.format),
             {std::move(buffers.state), std::move(buffers.fold), std::move(buffers.tape),
              std::move(buffers.retained)},
