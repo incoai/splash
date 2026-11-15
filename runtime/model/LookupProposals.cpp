@@ -174,4 +174,36 @@ void LookupAcceptance::observe(uint32_t length, std::span<const LookupAgreement>
   }
 }
 
+LookupAgreement lookupAgreement(uint32_t token, uint32_t depth, std::span<const uint32_t> candidates) {
+  constexpr uint32_t kCandidates = SPLASH_DRAFT_CANDIDATES;
+  if ((uint64_t{depth} + 1) * kCandidates > candidates.size())
+    return LookupAgreement::Unknown;
+  const std::span<const uint32_t> at = candidates.subspan(uint64_t{depth} * kCandidates, kCandidates);
+  if (at.front() == token)
+    return LookupAgreement::Top;
+  return std::ranges::find(at, token) != at.end() ? LookupAgreement::Candidate : LookupAgreement::Absent;
+}
+
+LookupOutcome lookupOutcome(std::span<const uint32_t> chain, std::span<const uint32_t> treeTokens,
+                            std::span<const ops::TreeRow> tree, uint32_t verifyRows, std::span<const uint32_t> retained,
+                            std::span<const uint32_t> candidates) {
+  if (verifyRows > treeTokens.size() || verifyRows > tree.size())
+    throw std::invalid_argument("invalid lookup outcome tree");
+  LookupOutcome outcome;
+  uint32_t row = 0;
+  for (uint32_t depth = 0; depth < chain.size() && depth < retained.size(); ++depth) {
+    uint32_t child = 0;
+    for (uint32_t at = row + 1; at < verifyRows && !child; ++at)
+      child = tree[at].parent == row && treeTokens[at] == chain[depth] ? at : 0;
+    if (!child)
+      break;
+    outcome.verified.push_back(lookupAgreement(chain[depth], depth, candidates));
+    if (retained[depth] != chain[depth])
+      break;
+    ++outcome.accepted;
+    row = child;
+  }
+  return outcome;
+}
+
 } // namespace splash::model

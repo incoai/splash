@@ -9,7 +9,10 @@
 // cycle are the offline replay's lookup chains. The estimate is the fitted
 // table until it observes; each accepted token and the rejected one are
 // labels, those past the rejection none; a known agreement's label teaches
-// Unknown too; and counts weigh half as much kHalfLife labels later.
+// Unknown too; and counts weigh half as much kHalfLife labels later. A
+// cycle's outcome follows the chain's rows down the lane's tree, its tokens'
+// agreements with the draft's candidates, to its first rejection, the first
+// token past the verified rows, or past the tokens the lane retained.
 #include "TestChecks.hpp"
 #include "model/LookupProposals.hpp"
 
@@ -358,6 +361,63 @@ void learnsFromOutcomes() {
 
 } // namespace
 
+// A tree whose draft chain is 10, 11, 12 and whose lookup chain, 10, 21, 22,
+// 23, 24, joins its first row and branches after it: rows 0 (the anchor), 1
+// (10), 2 (11 after 1), 3 (21 after 1), 4 (12 after 2), 5 (22 after 3), 6
+// (23 after 5), in the order the selector took them. The draft's candidates:
+// 10 its likeliest at position 0, 21 another of its candidates at 1, 22
+// none of them at 2, 23 another at 3.
+void outcomesOfCycles() {
+  using splash::model::lookupAgreement;
+  using splash::model::lookupOutcome;
+  using splash::ops::TreeRow;
+  constexpr uint32_t kCandidates = SPLASH_DRAFT_CANDIDATES;
+  const std::vector<uint32_t> tokens{1, 10, 11, 21, 12, 22, 23};
+  const std::vector<uint16_t> parents{SPLASH_TREE_ROOT, 0, 1, 1, 2, 3, 5};
+  std::vector<TreeRow> tree(tokens.size());
+  for (uint32_t row = 0; row < tree.size(); ++row)
+    tree[row] = {row ? tree[parents[row]].ancestors | (1U << row) : 1U, parents[row],
+                 static_cast<uint16_t>(row ? tree[parents[row]].depth + 1 : 0)};
+  std::vector<uint32_t> candidates(SPLASH_DRAFT_PROPOSAL_TOKENS * kCandidates);
+  for (uint32_t position = 0; position < SPLASH_DRAFT_PROPOSAL_TOKENS; ++position)
+    for (uint32_t i = 0; i < kCandidates; ++i)
+      candidates[position * kCandidates + i] = 1000 + position * kCandidates + i;
+  candidates[0] = 10;
+  candidates[1 * kCandidates] = 11;
+  candidates[1 * kCandidates + 5] = 21;
+  candidates[2 * kCandidates] = 12;
+  candidates[3 * kCandidates + 15] = 23;
+  require(lookupAgreement(10, 0, candidates) == LookupAgreement::Top &&
+              lookupAgreement(21, 1, candidates) == LookupAgreement::Candidate &&
+              lookupAgreement(22, 2, candidates) == LookupAgreement::Absent &&
+              lookupAgreement(23, 3, candidates) == LookupAgreement::Candidate &&
+              lookupAgreement(1000 + 7 * kCandidates, SPLASH_DRAFT_PROPOSAL_TOKENS, candidates) ==
+                  LookupAgreement::Unknown,
+          "a lookup token's agreement is not its draft candidates'");
+  const std::vector<uint32_t> chain{10, 21, 22, 23, 24};
+  const auto outcome = [&](uint32_t verifyRows, const std::vector<uint32_t> &retained) {
+    return lookupOutcome(chain, tokens, tree, verifyRows, retained, candidates);
+  };
+  using enum LookupAgreement;
+  const auto is = [](const splash::model::LookupOutcome &o, std::vector<LookupAgreement> verified,
+                     uint32_t accepted) { return o.verified == verified && o.accepted == accepted; };
+  // The target follows the chain three tokens, then takes another.
+  require(is(outcome(7, {10, 21, 22, 99}), {Top, Candidate, Absent, Candidate}, 3),
+          "a chain the target left at its fourth token");
+  // Rows 5 and 6, the chain's third and fourth tokens, were not verified.
+  require(is(outcome(5, {10, 21, 22}), {Top, Candidate}, 2), "a chain past the verified rows");
+  // A limit cut the lane's tokens after two.
+  require(is(outcome(7, {10, 21}), {Top, Candidate}, 2), "a chain past the retained tokens");
+  // The target took the draft's second token, then its own.
+  require(is(outcome(7, {10, 11, 12}), {Top, Candidate}, 1), "a chain the target left for the draft's");
+  require(is(outcome(7, {11}), {Top}, 0), "a chain rejected at its first token");
+  require(lookupOutcome(std::vector<uint32_t>{30, 31}, tokens, tree, 7, std::vector<uint32_t>{30, 31}, candidates)
+              .verified.empty(),
+          "a chain the tree does not hold was verified");
+  rejects([&] { static_cast<void>(outcome(8, {10})); }, "invalid lookup outcome tree",
+          "verify rows past the tree were accepted");
+}
+
 int main(int argc, char **argv) {
   try {
     if (argc != 2)
@@ -370,6 +430,7 @@ int main(int argc, char **argv) {
     replaysTheTrace(argv[1]);
     priorTable();
     learnsFromOutcomes();
+    outcomesOfCycles();
   } catch (const std::exception &error) {
     std::cerr << "lookup_proposals_test: FAIL: " << error.what() << '\n';
     return 1;

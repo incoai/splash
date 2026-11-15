@@ -7,6 +7,7 @@
 #include "model/ExpertStore.hpp"
 #include "model/KvBlockCache.hpp"
 #include "model/KvHistoryStream.hpp"
+#include "model/LookupProposals.hpp"
 #include "model/ModelPools.hpp"
 #include "model/QwenState.hpp"
 #include "model/QwenTarget.hpp"
@@ -64,12 +65,6 @@ constexpr std::array<ops::LaneRows, kLaneCount> kDecodeBlocks = [] {
   for (uint32_t lane = 0; lane < kLaneCount; ++lane) blocks[lane] = {lane * kDecodeRows, kDecodeRows};
   return blocks;
 }();
-// The most children a verify row takes from the draft (ops::DraftTreeLane):
-// one, a chain, while the target's verify forward runs a block's rows in
-// order (causal attention, the recurrence over the rows before a row, K/V at
-// the committed tokens plus the row). The selector takes up to
-// SPLASH_TREE_CHILDREN once the forward reads a block's tree.
-constexpr uint32_t kVerifyChildren = 1;
 // A decode cycle's rows over `lanes` lanes: a draft block's a lane, which its
 // selector lays out over the lanes' trees (ops::DraftSelector::addVerifyRows).
 constexpr ops::StepRows decodeStep(uint32_t lanes) noexcept {
@@ -416,6 +411,13 @@ struct Runtime::Impl {
     // the prompt (with any replayed generation) and the emitted output, which
     // the target may read (QwenTargetRequest).
     std::vector<uint32_t> tokens;
+    // Its tokens and its pending one as a lookup index, which its decode
+    // cycles bring up to date (proposeLookup), and the lookup chain its
+    // current cycle verifies beside its draft's tree: the match's length and
+    // the chain's tokens, none without.
+    std::optional<LookupIndex> lookup;
+    uint32_t lookupLength = 0;
+    std::span<const uint32_t> lookupChain;
   };
 
   struct DecodeLaneResult final {
@@ -508,6 +510,8 @@ struct Runtime::Impl {
   // follow where the budget chooses them (budgetsVerifyRows); none where
   // the cycles verify every row.
   std::optional<VerifyBudget> verifyBudget;
+  // The lookup chains' acceptance, which every request's cycles teach.
+  LookupAcceptance lookupAcceptance;
   ops::AneFfn *aneFfn;
   // The readers of spilled K/V, when the target's K/V spills.
   KvBlockCache *blockCache;
@@ -2253,13 +2257,17 @@ struct Runtime::Impl {
       ops::DraftTreeLane &tree = trees[lane];
       tree.anchor = *entry.pendingToken;
       tree.depth = maximumRows[lane] - 1;
-      // A constrained lane verifies a chain, along which its grammar finds
-      // its rows' masks (ConstrainedDecodeTicket).
+      // A lane grows a tree where its target verifies trees, but a
+      // constrained lane a chain, along which its grammar finds its rows'
+      // masks (ConstrainedDecodeTicket).
       const ops::SamplingPolicy policy = samplingPolicy(entry);
-      tree.children = policy.constrained ? 1 : kVerifyChildren;
+      const bool branches = targetModel->verifiesTrees() && !policy.constrained;
+      tree.children = branches ? SPLASH_TREE_CHILDREN : 1;
+      entry.lookupChain = {};
       // A thinking end at the lane's first row is its proposals, a chain the
       // verify selects whatever its logits: no draft row beside it could be
-      // accepted.
+      // accepted. Before its thinking ends, where a cutoff would replace its
+      // later rows' selections, a lane proposes no lookup chain.
       const std::span<const uint32_t> end = policy.thinkingCutoff ? policy.thinkingCutoff->end : std::span<const uint32_t>{};
       if (const uint32_t forced = policy.thinkingCutoff ? policy.thinkingCutoff->replacedProposals() : 0) {
         tree.chain = forced;
@@ -2268,6 +2276,8 @@ struct Runtime::Impl {
                     contents<uint32_t>(decodeArena->get(lane, DecodeTensor::ChainTokens), "chain tokens"));
         std::fill_n(contents<float>(decodeArena->get(lane, DecodeTensor::ChainRates), "chain rates"),
                     forced * SPLASH_TREE_AGREEMENTS, 1.0F);
+      } else if (branches && !policy.thinkingCutoff) {
+        proposeLookup(entry, tree, lane);
       }
     }
     const VerifyBudget::Acceptance &acceptance = verifyBudget ? verifyBudget->acceptance() : VerifyBudget::kPrior;
@@ -2288,6 +2298,40 @@ struct Runtime::Impl {
       costs = verifyBudget->costs(lanes, constrained);
     ops::DraftSelector::addVerifyRows(graph, selection, decodeStep(lanes),
                                       budgets ? std::span<const float>(costs) : std::span<const float>{});
+  }
+
+  // A lane's lookup chain beside its draft's tree: the tokens that followed
+  // the latest earlier occurrence of its latest tokens (LookupIndex), as deep
+  // as its tree may grow, each estimated at its depth and the match's length
+  // for each agreement with the draft (LookupAcceptance), of which the
+  // selector takes its own.
+  void proposeLookup(Request &entry, ops::DraftTreeLane &tree, uint32_t lane) {
+    // The index holds a prefix of the request's tokens and its pending one,
+    // which the request has added to since; one that does not is rebuilt.
+    const auto token = [&](size_t at) { return at < entry.tokens.size() ? entry.tokens[at] : *entry.pendingToken; };
+    if (!entry.lookup || entry.lookup->tokens().size() > entry.tokens.size() + 1 ||
+        (!entry.lookup->tokens().empty() && entry.lookup->tokens().back() != token(entry.lookup->tokens().size() - 1)))
+      entry.lookup.emplace();
+    LookupIndex &index = *entry.lookup;
+    if (index.tokens().size() < entry.tokens.size())
+      index.append(std::span(entry.tokens).subspan(index.tokens().size()));
+    if (index.tokens().size() == entry.tokens.size())
+      index.append({&*entry.pendingToken, 1});
+    const std::span<const uint32_t> chain = index.proposals(std::min(tree.depth, SPLASH_TREE_CHAIN_TOKENS));
+    if (chain.empty())
+      return;
+    const uint32_t length = index.match().length;
+    auto *tokens = contents<uint32_t>(decodeArena->get(lane, DecodeTensor::ChainTokens), "chain tokens");
+    auto *rates = contents<float>(decodeArena->get(lane, DecodeTensor::ChainRates), "chain rates");
+    for (uint32_t depth = 0; depth < chain.size(); ++depth) {
+      tokens[depth] = chain[depth];
+      for (uint32_t agreement = 0; agreement < SPLASH_TREE_AGREEMENTS; ++agreement)
+        rates[depth * SPLASH_TREE_AGREEMENTS + agreement] =
+            lookupAcceptance.rate(length, depth, static_cast<LookupAgreement>(agreement));
+    }
+    tree.chain = static_cast<uint32_t>(chain.size());
+    entry.lookupLength = length;
+    entry.lookupChain = chain;
   }
 
   void encodeTargetVerifyBatchForward(CommandGraph &graph,
@@ -2581,10 +2625,32 @@ struct Runtime::Impl {
                                             laneResult.retainedRows);
     }
     // A cycle whose every lane commits teaches the verify budget its lanes'
-    // labels and its cost.
+    // labels and its cost, and the lookup rates what it verified of its
+    // lanes' lookup chains.
     bool commits = true;
     for (uint32_t lane = 0; lane < items.size(); ++lane)
       commits = commits && lanes[lane].failure.empty() && unreadable[lane].empty();
+    for (uint32_t lane = 0; lane < items.size() && commits; ++lane) {
+      const DecodeLaneResult &laneResult = lanes[lane];
+      Request &entry = *laneResult.request;
+      if (entry.lookupChain.empty())
+        continue;
+      const uint32_t size =
+          std::min(*contents<uint32_t>(decodeArena->get(lane, DecodeTensor::DraftTreeSizes), "draft tree size"),
+                   ExecutionLimits::targetVerifyRows);
+      const std::span<const uint32_t> treeTokens(
+          contents<uint32_t>(decodeArena->get(lane, DecodeTensor::DraftTreeTokens), "draft tree tokens"), size);
+      const std::span<const ops::TreeRow> tree(
+          contents<ops::TreeRow>(decodeArena->get(lane, DecodeTensor::DraftTrees), "draft trees"), size);
+      const std::span<const uint32_t> candidates(
+          contents<uint32_t>(decodeArena->get(lane, DecodeTensor::Candidates), "draft candidates"),
+          uint64_t{kDraftProposalTokens} * SPLASH_DRAFT_CANDIDATES);
+      const LookupOutcome outcome =
+          lookupOutcome(entry.lookupChain, treeTokens, tree, std::min(laneResult.verifyRows, size),
+                        {retainedTokens(laneResult), laneResult.retained}, candidates);
+      if (!outcome.verified.empty())
+        lookupAcceptance.observe(entry.lookupLength, outcome.verified, outcome.accepted);
+    }
     if (verifyBudget && commits) {
       std::array<VerifyBudget::Lane, kLaneCount> observed{};
       const auto *treeTokens =

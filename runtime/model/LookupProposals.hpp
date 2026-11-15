@@ -5,6 +5,8 @@
 // what follows now, which a decode cycle can verify beside the draft's.
 // LookupIndex finds that earlier occurrence; LookupAcceptance estimates how
 // likely the target accepts each token copied from it.
+#include "ops/LaneRows.hpp"
+
 #include <array>
 #include <cstdint>
 #include <span>
@@ -212,5 +214,31 @@ private:
   };
   std::array<std::array<std::array<Count, kAgreements>, kDepthBuckets>, kLengthBuckets> counts_{};
 };
+
+// A lookup token's agreement with the draft's candidates at its depth: the
+// lane's candidates at each proposal position, SPLASH_DRAFT_CANDIDATES a
+// position, most likely first (ops::DraftSelectorBuffers::candidates).
+[[nodiscard]] LookupAgreement lookupAgreement(uint32_t token, uint32_t depth, std::span<const uint32_t> candidates);
+
+// What a decode cycle tells of the lookup chain beside its lane's draft tree
+// (LookupAcceptance::observe): the agreements of the chain's tokens it
+// verified, in depth order, and how many of them the target accepted before
+// its first rejection.
+struct LookupOutcome final {
+  std::vector<LookupAgreement> verified;
+  uint32_t accepted = 0;
+};
+
+// A cycle's lookup outcome from its lane's tree as the selector grew it
+// (each row's token and tree row, metal/abi/VerifyTree.h, in the order it
+// took them, of which the first verifyRows were verified), the tokens the lane
+// retained (the target's selections along its accepted path, none past where
+// its output limit or a stop token cut it) and the draft's candidates
+// (lookupAgreement). A chain token's row is the child of its predecessor's
+// row with its token; the target accepted it where the lane retained it at
+// its depth.
+[[nodiscard]] LookupOutcome lookupOutcome(std::span<const uint32_t> chain, std::span<const uint32_t> treeTokens,
+                                          std::span<const ops::TreeRow> tree, uint32_t verifyRows,
+                                          std::span<const uint32_t> retained, std::span<const uint32_t> candidates);
 
 } // namespace splash::model
