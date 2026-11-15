@@ -2752,8 +2752,8 @@ struct Runtime::Impl {
       output.insert(output.end(), targetTokens,
                     targetTokens + (laneResult.retained - 1));
 
-      // Acceptance retains a chain's first rows.
-      states.swapDecodeParity(entry.stateLane, ops::chainPath(laneResult.retained));
+      // The lane's next step folds the path of rows acceptance retained.
+      states.swapDecodeParity(entry.stateLane, laneResult.retainedRows);
       const uint64_t nextLength =
           items[lane].logicalPosition + laneResult.retained;
       states.updateLengths(
