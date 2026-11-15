@@ -27,33 +27,15 @@ void requireLayout(const DFlashDraftLayout &layout) {
   }
 }
 
-// The key and value rows of each layer's fused QKV projection, without a
-// copy: planes store whole tiles of QUANT_TILE_ROWS rows in row order
-// (metal/abi/QuantFormat.h), so rows from a tile boundary on are one range of
-// each plane.
-std::vector<ops::Projection> contextKvRows(metal::MetalBackend &backend,
+// The key and value rows of each layer's fused QKV projection, a view of its
+// rows (ops::Projection::rows) without a copy.
+std::vector<ops::Projection> contextKvRows(const metal::MetalBackend &backend,
                                            const DFlashDraftWeights &weights) {
   const DFlashDraftLayout &layout = weights.layout;
-  if (layout.attentionSize >= layout.qkvSize ||
-      layout.attentionSize % QUANT_TILE_ROWS) {
-    throw std::invalid_argument(
-        "draft key and value rows do not start at a storage tile");
-  }
   std::vector<ops::Projection> result;
   result.reserve(weights.layers.size());
-  for (const DFlashDraftLayerWeights &layer : weights.layers) {
-    const ops::QuantizedSegment &fused = layer.qkvProjection.blocks().segments.front();
-    const auto rows = [&](const metal::MetalBuffer &plane) {
-      if (!plane) return metal::MetalBuffer{};
-      const uint64_t rowBytes = plane.sizeBytes() / layout.qkvSize;
-      return backend.view(plane, uint64_t{layout.attentionSize} * rowBytes,
-                          uint64_t{layout.contextKvSize()} * rowBytes);
-    };
-    result.emplace_back(layout.contextKvSize(), layout.hiddenSize,
-                        ops::BlockWeights{{ops::QuantizedSegment::planes(
-                            fused.formatId, layout.contextKvSize(), layout.hiddenSize, rows(fused.plane0),
-                            rows(fused.plane1), rows(fused.meta))}});
-  }
+  for (const DFlashDraftLayerWeights &layer : weights.layers)
+    result.push_back(layer.qkvProjection.rows(backend, {{layout.attentionSize, layout.contextKvSize()}}));
   return result;
 }
 
