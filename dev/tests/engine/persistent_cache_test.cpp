@@ -30,6 +30,8 @@
 
 using namespace splash;
 using namespace splash::engine;
+static_assert(boundedCount(0) == 0 && boundedCount(UINT32_MAX) == UINT32_MAX &&
+              boundedCount(uint64_t{UINT32_MAX} + 1) == UINT32_MAX);
 
 namespace {
 
@@ -42,6 +44,7 @@ struct Shelf final {
   std::set<const ShelvedState *> disk;
   uint32_t capacity = 8;
   bool ready = true;
+  bool finishSuccess = true;
   // The state file takes writes; the write budget it shares with the KV
   // tier, if any.
   bool writable = true;
@@ -81,7 +84,7 @@ private:
     Written(std::shared_ptr<Shelf> owner, std::shared_ptr<const CompositeState> copy)
         : shelf(std::move(owner)), disk(std::move(copy)) {}
     bool ready() const noexcept override { return shelf->ready; }
-    bool finish() override { return true; }
+    bool finish() override { return shelf->finishSuccess; }
     const std::shared_ptr<const CompositeState> &state() const noexcept override { return disk; }
     std::shared_ptr<Shelf> shelf;
     std::shared_ptr<const CompositeState> disk;
@@ -214,6 +217,82 @@ void runShortOfMemory(Process &process) {
 
 // A persistent tier labels every KV and state copy with what the next process needs; a temporary
 // tier labels none.
+void testKvCopyRecreationProfiling() {
+  Process process(true);
+  process.shelf->capacity = 1;
+  process.tier.capacity = 1;
+  const auto first = process.cachePrompt(1, promptOf(1000, 1))[0];
+  process.publish(first);
+  require(process.persist(first) == PersistStatus::Durable, "first KV profile copy did not persist");
+  const auto second = process.cachePrompt(2, promptOf(2000, 1))[0];
+  process.publish(second);
+  require(process.persist(second) == PersistStatus::Durable, "second KV profile copy did not persist");
+  auto snap = process.cache.snapshot();
+  require(snap.kvTier.diskReplacements[0] == 1 && snap.kvTier.copyRecreationStarts == 0,
+          "initial KV copy eviction/recreation counters were wrong");
+  require(process.persist(first) == PersistStatus::Durable, "KV copy was not recreated");
+  snap = process.cache.snapshot();
+  require(snap.kvTier.diskReplacements[0] == 2 && snap.kvTier.copyRecreationStarts == 1 &&
+              snap.stateCache.evictions == 0,
+          "KV copy recreation was lost or confused with a state eviction");
+  require(process.persist(first) == PersistStatus::Durable &&
+              process.cache.snapshot().kvTier.copyRecreationStarts == 1,
+          "durable KV reuse was counted as recreation");
+  Process reset(true);
+  require(reset.adopt(process.kvLabels(), process.stateLabels()).states == 1,
+          "profiling fixture was not adopted");
+  const auto adopted = reset.cache.snapshot();
+  require(adopted.kvTier.copyRecreationStarts == 0 && adopted.kvTier.diskReplacements[0] == 0 &&
+              adopted.stateCache.diskCopyDrops == 0 && adopted.stateCache.diskCopyRecreationStarts == 0 &&
+              adopted.stateCache.diskCopyRecreations == 0,
+          "adoption was counted as recreation or profiling leaked across cache lifetimes");
+}
+
+void testCopyReplacementProfiling() {
+  Process process(true);
+  process.shelf->capacity = 1;
+  const auto first = process.cachePrompt(1, promptOf(1000, 1))[0];
+  process.publish(first);
+  require(process.persist(first) == PersistStatus::Durable, "initial profiling state did not persist");
+  const auto second = process.cachePrompt(2, promptOf(2000, 1))[0];
+  process.publish(second);
+  require(process.persist(second) == PersistStatus::Durable, "replacement profiling state did not persist");
+  auto snap = process.cache.snapshot();
+  require(snap.stateCache.diskCopyDrops == 1 && snap.stateCache.evictions == 0 &&
+              snap.stateCache.diskCopyRecreationStarts == 0 && snap.kvTier.diskReplacements[1] == 1,
+          "a redundant state-copy eviction was hidden or counted as a state loss");
+  process.shelf->finishSuccess = false;
+  require(process.cache.persist(first) == PersistStatus::Started, "recreation attempt did not start");
+  process.tier.complete();static_cast<void>(process.cache.pollTransfers());
+  snap = process.cache.snapshot();
+  require(snap.stateCache.diskCopyRecreationStarts == 1 && snap.stateCache.diskCopyRecreations == 0 &&
+              snap.stateCache.offloadFailures == 1,
+          "failed recreation was counted as success or forgotten");
+  process.shelf->finishSuccess = true;
+  require(process.persist(first) == PersistStatus::Durable, "recreation retry did not persist");
+  snap = process.cache.snapshot();
+  require(snap.stateCache.diskCopyRecreationStarts == 2 && snap.stateCache.diskCopyRecreations == 1 &&
+              snap.stateCache.evictions == 0 &&
+              snap.kvTier.copyRecreationStarts == 0,
+          "recreation retry was hidden or existing KV copies were called rewritten");
+  require(process.persist(first) == PersistStatus::Durable &&
+              process.cache.snapshot().stateCache.diskCopyRecreationStarts == 2,
+          "a durable hit was counted as another recreation");
+  // The old entry remains pinned by a reader while a new publication takes
+  // over. Its dropped-copy history must not migrate to the new state.
+  auto resumedPrompt = promptOf(2000, 1);
+  resumedPrompt.push_back(77);
+  auto reader = process.cache.lookup(resumedPrompt, {});
+  require(reader.state.has_value(), "republication fixture has no reader");
+  process.cache.invalidateState(second);
+  process.publish(second);
+  reader = {};
+  require(process.persist(second) == PersistStatus::Durable &&
+              process.cache.snapshot().stateCache.diskCopyRecreationStarts == 2 &&
+              process.cache.snapshot().stateCache.diskCopyRecreations == 1,
+          "invalidated-entry takeover inherited stale recreation history");
+}
+
 void testCopiesAreLabelled() {
   const std::vector<uint32_t> prompt = promptOf(1000, 4);
   for (const bool persistent : {true, false}) {
@@ -820,6 +899,7 @@ void testAdoptionTrimsToTheLimit() {
   Process next(true, budget);
   adoptStates(next, file, kv);
   require(next.cache.snapshot().stateCache.entries == 2 &&
+              next.cache.snapshot().kvTier.diskReplacements[3] == 1 &&
               budget->usedBytes() == 2 * kHostPageBytes,
           "adoption past the limit was not trimmed to it");
   for (uint32_t block = 2; block <= 3; ++block)
@@ -1617,6 +1697,8 @@ void testAPrefixWithoutOwnCopiesHoldsBackNoSpill() {
 
 int main() {
   try {
+    testKvCopyRecreationProfiling();
+    testCopyReplacementProfiling();
     testCopiesAreLabelled();
     testWindowedCopiesNameTheirForm();
     testWindowedPointsKeepTheirTailsFull();
