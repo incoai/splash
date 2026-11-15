@@ -84,7 +84,7 @@ struct SlotFile::Backing {
   // Moves a chunk whole between memory and the slot file at `offset`
   // (moveChunk), counting what moved in the budget's totals.
   bool load(std::span<std::byte> chunk, off_t offset) const noexcept;
-  bool store(std::span<const std::byte> chunk, off_t offset) const noexcept;
+  bool store(std::span<const std::byte> chunk, off_t offset, PayloadWriteKind kind) const noexcept;
   bool record(std::span<const std::byte> bytes, off_t offset, MetadataWriteKind kind) const;
 
   // Marks a slot's blocks held; true when they were not.
@@ -466,11 +466,13 @@ bool SlotFile::Backing::load(std::span<std::byte> chunk, off_t offset) const noe
   });
 }
 
-bool SlotFile::Backing::store(std::span<const std::byte> chunk, off_t offset) const noexcept {
-  return moveChunk(chunk, offset, [this](const std::byte *data, size_t bytes, off_t at) {
+bool SlotFile::Backing::store(std::span<const std::byte> chunk, off_t offset, PayloadWriteKind kind) const noexcept {
+  return moveChunk(chunk, offset, [this, kind](const std::byte *data, size_t bytes, off_t at) {
     const auto count = ::pwrite(descriptor, data, bytes, at);
-    if (count > 0)
+    if (count > 0) {
       budget->written_.fetch_add(count, std::memory_order_relaxed);
+      budget->payload_[static_cast<size_t>(kind)].fetch_add(count, std::memory_order_relaxed);
+    }
     return count;
   });
 }
@@ -867,7 +869,9 @@ void SlotFile::punchHole(uint32_t index) noexcept {
 // go, and the first read of an adopted slot checks them.
 std::shared_ptr<SlotFile::Operation> SlotFile::write(
     std::shared_ptr<Slot> slot, std::vector<std::span<const std::byte>> source,
-    std::function<void()> completion) {
+    std::function<void()> completion, PayloadWriteKind kind) {
+  if (static_cast<size_t>(kind) >= PayloadWrites{}.size())
+    throw std::invalid_argument("unknown payload write origin");
   const uint64_t payloadBytes = totalBytes(source);
   if (!slot || slot->backing_ != backing_ || payloadBytes > backing_->slotBytes ||
       (!backing_->segmentEnds.empty() && payloadBytes != backing_->segmentEnds.back()))
@@ -875,7 +879,7 @@ std::shared_ptr<SlotFile::Operation> SlotFile::write(
   if (!writable())
     return nullptr;
   slot->returnsBlocks_ = true;
-  auto operation = submit([slot, source = std::move(source), payloadBytes](std::span<std::byte> buffer,
+  auto operation = submit([slot, source = std::move(source), payloadBytes, kind](std::span<std::byte> buffer,
                                                                           const std::atomic<bool> &cancelled) {
     Backing &backing = *slot->backing_;
     const off_t start = slotOffset(slot->index_, backing.slotBytes);
@@ -925,7 +929,7 @@ std::shared_ptr<SlotFile::Operation> SlotFile::write(
         chunk = gathered;
       }
       defer();
-      if (!backing.store(chunk, start + static_cast<off_t>(done))) {
+      if (!backing.store(chunk, start + static_cast<off_t>(done), kind)) {
         // A full volume is the volume's, which the engine measures again
         // (DiskBudget::fullReported), and the file goes on. Any other error
         // stops it.

@@ -96,7 +96,7 @@ struct CacheLookupSnapshot final {
 // taking writes.
 enum class DiskWritesGate : uint8_t { No, Budget, Closed };
 
-struct KvTierSnapshot final {
+struct KvTierSnapshot final : model::DiskIoSnapshot {
   // The disk quota shared by KV pages and states, the limit its volume leaves
   // it now, its current use, and the bytes its files occupy on disk.
   uint64_t capacityBytes = 0;
@@ -109,11 +109,6 @@ struct KvTierSnapshot final {
   // What writes not in use may take now; zero once overdrawn, and zero
   // without a write budget, when nothing is held back.
   uint64_t writeBudgetBytes = 0;
-  // How long the files' writes held back for reads a step waited for
-  // (model::DiskBudget::writesDeferredMicroseconds).
-  uint64_t writesDeferredMicroseconds = 0;
-  uint64_t readBytes = 0;
-  uint64_t writtenBytes = 0;
   uint64_t demotions = 0;
   uint64_t demotionFailures = 0;
   // Demotions the tier had no room for; the leaf stayed and the requester
@@ -128,7 +123,6 @@ struct KvTierSnapshot final {
   uint32_t pendingPages = 0;
   uint32_t diskBlocks = 0;
   uint64_t diskBytes = 0;
-  model::MetadataWrites metadataWrites{};
   std::array<uint64_t, 5> diskReplacements{};
   uint64_t copyRecreationStarts = 0;
 };

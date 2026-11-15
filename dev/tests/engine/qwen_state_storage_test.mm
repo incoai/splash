@@ -196,10 +196,11 @@ void testDiskRestore(metal::MetalBackend &backend) {
   MemoryGovernor governor(backend, backend.capabilities().recommendedMaxWorkingSetBytes, 1, 1,
                           queryHostMemory, 0);
   const test::ClaimScope start(governor, ClaimClass::Floor);
+  auto budget = std::make_shared<model::DiskBudget>(kStateSlotBytes);
   model::QwenStateStorage storage(
       backend, governor.allocationAdmission(), kStateLayout,
       std::make_shared<model::SlotFile>(kStateSlotBytes,
-                                        std::make_shared<model::DiskBudget>(kStateSlotBytes)));
+                                        budget));
   require(static_cast<bool>(storage.tryActivateLane(0, 123)), "disk source activation failed");
   const model::GdnParityBuffers &gdn = storage.current(0);
   const metal::MetalBuffer &window = storage.window(0);
@@ -223,6 +224,8 @@ void testDiskRestore(metal::MetalBackend &backend) {
           "demotion did not return the source buffers at once");
   releaseAllIdle(storage, false);
   require(finishWhenReady(*write), "disk write failed");
+  require(budget->writtenBytes() > 0 && budget->ioSnapshot().payloadWrites[2] == budget->writtenBytes(),
+          "state write origin was not passed to SlotFile");
   write.reset();
   const auto beforeRestore = storage.actualAllocatedBytes();
   word(gdn.stateBase) = 0;
@@ -276,10 +279,11 @@ void testDirectDiskSnapshot(metal::MetalBackend &backend) {
   MemoryGovernor governor(backend, backend.capabilities().recommendedMaxWorkingSetBytes, 1, 1,
                           queryHostMemory, 0);
   const test::ClaimScope start(governor, ClaimClass::Floor);
+  auto budget = std::make_shared<model::DiskBudget>(kStateSlotBytes);
   model::QwenStateStorage storage(
       backend, governor.allocationAdmission(), kStateLayout,
       std::make_shared<model::SlotFile>(kStateSlotBytes,
-                                        std::make_shared<model::DiskBudget>(kStateSlotBytes)));
+                                        budget));
   require(storage.canSnapshotToDisk(false), "a state file that holds one state refuses writes");
   require(static_cast<bool>(storage.tryActivateLane(0, 321)), "lane activation failed");
   storage.swapParity(0);
@@ -304,6 +308,8 @@ void testDirectDiskSnapshot(metal::MetalBackend &backend) {
   // The write reads staging, so the lane may move on at once.
   word(current.stateBase) = 0;
   require(finishWhenReady(*write), "direct disk write failed");
+  require(budget->writtenBytes() > 0 && budget->ioSnapshot().payloadWrites[4] == budget->writtenBytes(),
+          "state write origin was not passed to SlotFile");
   write.reset();
   require(storage.snapshotToDisk(0, {}) == nullptr, "a full quota admitted a second state");
 
@@ -478,10 +484,11 @@ void testPersistKeepsTheRamCopy(metal::MetalBackend &backend) {
   MemoryGovernor governor(backend, backend.capabilities().recommendedMaxWorkingSetBytes, 1, 1,
                           queryHostMemory, 0);
   const test::ClaimScope start(governor, ClaimClass::Floor);
+  auto budget = std::make_shared<model::DiskBudget>(kStateSlotBytes);
   model::QwenStateStorage storage(
       backend, governor.allocationAdmission(), kStateLayout,
       std::make_shared<model::SlotFile>(kStateSlotBytes,
-                                        std::make_shared<model::DiskBudget>(kStateSlotBytes)));
+                                        budget));
   require(static_cast<bool>(storage.tryActivateLane(0, 7)), "lane activation failed");
   fill(storage.current(0).stateBase, 60);
   fill(storage.window(0), 61);
@@ -496,6 +503,8 @@ void testPersistKeepsTheRamCopy(metal::MetalBackend &backend) {
           "a persisted state staged its write or gave up its RAM copy");
   require(!source->persist({}), "a second copy was admitted past the quota");
   require(finishWhenReady(*write), "the persisted state's write failed");
+  require(budget->writtenBytes() > 0 && budget->ioSnapshot().payloadWrites[1] == budget->writtenBytes(),
+          "state write origin was not passed to SlotFile");
   fill(storage.current(0).stateBase, 99);
   auto read = storage.beginRestore(0, *write->state(), true, {}, [] {});
   require(read && finishWhenReady(*read) && stateImage(storage, 0) == images &&

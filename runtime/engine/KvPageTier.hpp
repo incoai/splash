@@ -248,7 +248,10 @@ std::unique_ptr<KvTransfer> BasicKvPageTier<Pages>::demote(uint32_t page, std::s
   auto disk = diskSlot(slot);
   auto outcome = std::make_shared<Outcome>();
   auto ticket = std::make_unique<Ticket>(outcome);
-  auto io = file_->write(disk->slot, format_.transferSpans(pages_, page), std::move(completion));
+  constexpr model::PayloadWriteKind kinds[] = {model::PayloadWriteKind::Reclaim,
+      model::PayloadWriteKind::Persist, model::PayloadWriteKind::Spill};
+  auto io = file_->write(disk->slot, format_.transferSpans(pages_, page),
+                         std::move(completion), kinds[static_cast<size_t>(write)]);
   // A file that stopped taking writes since canDemote() refuses this one as
   // canDemote() does from now on.
   if (!io)

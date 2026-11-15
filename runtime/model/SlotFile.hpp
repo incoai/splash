@@ -31,6 +31,16 @@ struct MetadataWriteSnapshot final {
 };
 using MetadataWrites = std::array<MetadataWriteSnapshot, 3>;
 
+// Submission origin, not admission priority: persistence also runs at clean
+// shutdown. Checkpoint captures and unknown callers stay explicit.
+enum class PayloadWriteKind : uint8_t { Unclassified, Persist, Reclaim, Spill, Checkpoint };
+using PayloadWrites = std::array<uint64_t, 5>;
+struct DiskIoSnapshot {
+  uint64_t writesDeferredMicroseconds = 0, readBytes = 0, writtenBytes = 0;
+  MetadataWrites metadataWrites{};
+  PayloadWrites payloadWrites{};
+};
+
 // The disk one cache tier may use, shared by every slot file of the tier.
 // Reservations and releases come from the engine thread and from whoever
 // drops the last handle of a slot. The budget bounds live slots by its
@@ -229,6 +239,12 @@ public:
                 metadata_[i].errors.load(std::memory_order_relaxed)};
     return out;
   }
+  [[nodiscard]] DiskIoSnapshot ioSnapshot() const noexcept {
+    DiskIoSnapshot out{writesDeferredMicroseconds(), readBytes(), writtenBytes(), metadataWrites(), {}};
+    for (size_t i = 0; i < out.payloadWrites.size(); ++i)
+      out.payloadWrites[i] = payload_[i].load(std::memory_order_relaxed);
+    return out;
+  }
   // Bytes the budget's files hold on disk, counting each slot written since
   // its blocks last went back as a whole slot, though a shorter payload
   // stores only its own pages.
@@ -267,6 +283,7 @@ private:
     }
   };
   std::array<MetadataCounter, 3> metadata_;
+  std::array<std::atomic<uint64_t>, 5> payload_{};
   uint64_t capacity_;
   std::atomic<uint64_t> limit_;
   std::atomic<uint64_t> activeLimit_;
@@ -486,7 +503,7 @@ public:
   // it null.
   [[nodiscard]] std::shared_ptr<Operation> write(
       std::shared_ptr<Slot> slot, std::vector<std::span<const std::byte>> source,
-      std::function<void()> completion);
+      std::function<void()> completion, PayloadWriteKind kind = PayloadWriteKind::Unclassified);
   [[nodiscard]] std::shared_ptr<Operation> read(
       std::shared_ptr<Slot> slot, std::vector<std::span<std::byte>> destination,
       std::function<void()> completion);

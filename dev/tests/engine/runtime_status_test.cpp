@@ -160,6 +160,7 @@ StatusInputs representativeStatus() {
   engine.resources.kvTier.copies = 64;
   engine.resources.kvTier.copyRecreationStarts = 11;
   engine.resources.kvTier.metadataWrites = {{{4096, 1, 0}, {128, 3, 1}, {64, 1, 0}}};
+  engine.resources.kvTier.payloadWrites = {10, 40000, 20000, 7000, 880};
   engine.resources.kvTier.diskReplacements = {1, 2, 3, 4, 5};
   engine.resources.stateCache.diskCopyDrops = 6;
   engine.resources.stateCache.diskCopyRecreationStarts = 3;

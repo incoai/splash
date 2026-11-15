@@ -185,13 +185,13 @@ QwenCompositeState::offload(std::function<void()> completion) const {
   if (!canOffload(true)) return {};
   return write(file_, staging_,
                stateSpans(buffers_.gdn->buffers(), buffers_.window->buffer()),
-               layout_, lengths_, std::move(completion));
+               layout_, lengths_, std::move(completion), PayloadWriteKind::Reclaim);
 }
 
 std::unique_ptr<StateOffload> QwenCompositeState::write(
     const std::shared_ptr<SlotFile> &file, const std::shared_ptr<StateStaging> &staging,
     const std::vector<std::span<std::byte>> &spans, CompositeStateLayout layout,
-    QwenLogicalLengths lengths, std::function<void()> completion) {
+    QwenLogicalLengths lengths, std::function<void()> completion, PayloadWriteKind kind) {
   auto disk = file->acquire();
   if (!disk) return {};
   auto result = std::shared_ptr<const QwenCompositeState>(
@@ -204,7 +204,7 @@ std::unique_ptr<StateOffload> QwenCompositeState::write(
   try {
     operation = file->write(
         std::move(disk), {std::span<const std::byte>(staged)},
-        std::move(completion));
+        std::move(completion), kind);
     // Callers check that the file takes writes, and only a failed write of
     // its own closes it: none is in flight beside this one.
     if (!operation)
@@ -229,7 +229,7 @@ QwenCompositeState::persist(std::function<void()> completion) const {
       new QwenCompositeState(layout_, lengths_, file_, disk));
   const auto spans = stateSpans(buffers_.gdn->buffers(), buffers_.window->buffer());
   auto operation = file_->write(std::move(disk), {spans.begin(), spans.end()},
-                                std::move(completion));
+                                std::move(completion), PayloadWriteKind::Persist);
   // As for write(): nothing stops the file between the check and the write.
   if (!operation)
     throw std::logic_error("the state file closed with no state write in flight");
@@ -500,7 +500,7 @@ QwenStateStorage::snapshotToDisk(uint32_t index, std::function<void()> completio
   return QwenCompositeState::write(file_, staging_,
                                    stateSpans(current(index), window(index)),
                                    layout_, source.metadata.lengths,
-                                   std::move(completion));
+                                   std::move(completion), PayloadWriteKind::Checkpoint);
 }
 
 metal::AllocationResult

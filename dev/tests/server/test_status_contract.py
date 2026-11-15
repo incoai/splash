@@ -89,6 +89,12 @@ class StatusContractTests(unittest.TestCase):
         self.assertIn("splash_state_disk_copy_recreations_total 2\n", metrics)
         # Payload bytes keep their original meaning; metadata is not added.
         self.assertIn("splash_disk_written_bytes_total 67890\n", metrics)
+        for kind, count in status["disk"]["payload_written_bytes"].items():
+            self.assertIn(
+                f"splash_disk_payload_{kind}_written_bytes_total {count}\n", metrics
+            )
+        status["disk"].pop("payload_written_bytes")
+        self.assertNotIn("splash_disk_payload_", prometheus_metrics(status))
         for key in ("metadata_writes", "copy_evictions", "kv_copy_recreation_starts"):
             status["disk"].pop(key)
         for key in (

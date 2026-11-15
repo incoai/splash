@@ -109,6 +109,14 @@ PROMETHEUS_SERIES = {
     "splash_disk_write_budget_bytes": ("disk", "write_budget_bytes"),
     "splash_disk_read_bytes_total": ("disk", "read_bytes"),
     "splash_disk_written_bytes_total": ("disk", "written_bytes"),
+    **{
+        f"splash_disk_payload_{kind}_written_bytes_total": (
+            "disk",
+            "payload_written_bytes",
+            kind,
+        )
+        for kind in ("unclassified", "persist", "reclaim", "spill", "checkpoint")
+    },
     # Record-file IO is separate from payload bytes and admission credit.
     **{
         f"splash_disk_metadata_{kind}_{measure}_total": (

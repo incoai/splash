@@ -36,6 +36,7 @@
 static std::atomic<int> failingWrites{0};
 // One metadata-only fault sequence: EINTR; partial then ENOSPC; or zero.
 static std::atomic<int> metadataFault{0};
+static std::atomic<int> payloadFault{0};
 
 extern "C" ssize_t pwrite(int descriptor, const void *data, size_t bytes, off_t offset) {
   if (const int error = failingWrites.load()) {
@@ -44,6 +45,12 @@ extern "C" ssize_t pwrite(int descriptor, const void *data, size_t bytes, off_t 
   }
   using Write = ssize_t (*)(int, const void *, size_t, off_t);
   static const auto next = reinterpret_cast<Write>(::dlsym(RTLD_NEXT, "pwrite"));
+  if (const int mode = payloadFault.exchange(0)) {
+    if (mode == 1) { errno = EINTR; return -1; }
+    if (mode == 2) { payloadFault.store(3); return next(descriptor, data, bytes / 2, offset); }
+    if (mode == 3) { errno = ENOSPC; return -1; }
+    if (mode == 4) return 0;
+  }
   if (metadataFault.load()) {
     char path[4096]{};
     const int saved = errno;
@@ -250,7 +257,8 @@ static void testAlignedRunsMoveDirectly() {
 // A queued direct write cancelled behind a parked worker fails and leaves its slot unreadable.
 static void testCancelledDirectWrite() {
   constexpr size_t size = 3 << 20;
-  SlotFile file(size, std::make_shared<DiskBudget>(size));
+  auto budget = std::make_shared<DiskBudget>(size);
+  SlotFile file(size, budget);
   auto slot = file.acquire();
   std::vector<std::byte> memory;
   const auto source = placeSpans(memory, {{size, true}}).front();
@@ -260,10 +268,11 @@ static void testCancelledDirectWrite() {
   std::vector<std::byte> output(size);
   auto hold = file.read(slot, {output}, [&] { reached.set_value(); released.wait(); });
   reached.get_future().wait();
-  auto cancelled = file.write(slot, {source}, {});
+  auto cancelled = file.write(slot, {source}, {}, splash::model::PayloadWriteKind::Persist);
   cancelled->cancel();
   release.set_value();
   require(hold->wait() && !cancelled->wait(), "a cancelled write of aligned runs succeeded");
+  require(budget->ioSnapshot().payloadWrites[1] == 0, "cancelled queued payload was counted");
   require(file.writable() && !file.read(slot, {output}, {})->wait(),
           "a cancelled write of aligned runs left its slot readable or closed the file");
 }
@@ -1198,8 +1207,49 @@ static void testMetadataWriteAccounting() {
   next.seal();
 }
 
+static void testPayloadWriteOrigins() {
+  using Kind = splash::model::PayloadWriteKind;
+  constexpr size_t page = kHostPageBytes;
+  const std::vector<std::byte> source(page + 1, std::byte{9});
+  auto budget = std::make_shared<DiskBudget>(4 * page);
+  SlotFile first(2 * page, budget), second(2 * page, budget);
+  auto a = first.acquire(), b = second.acquire();
+  for (size_t i = 0; i < 5; ++i) {
+    auto &file = i % 2 ? first : second;
+    auto slot = i % 2 ? a : b;
+    auto op = i == 0 ? file.write(slot, {source}, {})
+                     : file.write(slot, {source}, {}, static_cast<Kind>(i));
+    require(op && op->wait(), "classified write failed");
+    auto counts = budget->ioSnapshot();
+    require(counts.payloadWrites[i] == 2 * page && counts.writtenBytes == (i + 1) * 2 * page,
+            "write origin lost padding or shared-file bytes");
+  }
+  std::vector<std::byte> output(source.size());
+  require(first.read(a, {output}, {})->wait() && output == source, "classified payload changed");
+  uint64_t sum = 0;
+  for (auto bytes : budget->ioSnapshot().payloadWrites) sum += bytes;
+  require(sum == budget->writtenBytes(), "classified bytes did not partition payload writes");
+  rejects([&] { static_cast<void>(first.write(a, {source}, {}, static_cast<Kind>(255))); },
+          "unknown payload write origin", "invalid payload kind accepted");
+  for (int fault : {1, 2, 4}) {
+    auto partial = std::make_shared<DiskBudget>(2 * page);
+    SlotFile file(2 * page, partial);
+    auto slot = file.acquire();
+    const std::vector<std::byte> input(2 * page, std::byte{7});
+    payloadFault.store(fault);
+    const bool ok = file.write(slot, {input}, {}, Kind::Spill)->wait();
+    require(ok == (fault == 1), "payload fault outcome changed");
+    const auto counts = partial->ioSnapshot();
+    const uint64_t expected = fault == 1 ? 2 * page : fault == 2 ? page : 0;
+    require(counts.payloadWrites[3] == expected && counts.writtenBytes == expected,
+            "retry, partial failure or zero write origin was miscounted");
+    require(partial->ioSnapshot().metadataWrites[0].bytes == 0, "payload counted as metadata");
+  }
+}
+
 int main() {
   try {
+    testPayloadWriteOrigins();
     testFailedMetadataHeaderAccounting();
     testAdoptionMetadataClearing();
     testMetadataWriteAccounting();

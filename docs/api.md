@@ -834,3 +834,36 @@ its path, `/v1/systemone`'s included: OpenAI's `server_error` with code
 | 503 | `runtime_busy` | The server could not hand the request's token mask to the engine: its mask queue was full or the engine connection failed; retry. |
 | 504 | `request_timeout` | The request's `timeout`, or `--request-timeout`, ran out. |
 | 505 | `http_version_not_supported` | The request is not HTTP/1.0 or HTTP/1.1. |
+
+#### Payload write origins (profiling)
+
+`disk.payload_written_bytes` splits the existing `disk.written_bytes` by the
+origin of each submitted payload write:
+
+| Field | Origin |
+| --- | --- |
+| `persist` | Optional write-behind KV copies and resident composite-state persistence. Clean shutdown also flushes this path. |
+| `reclaim` | KV demotion and composite-state offload requested to reclaim memory. |
+| `spill` | Active Spill-request KV write-through. |
+| `checkpoint` | Direct composite-state captures to disk, separate from resident-state persistence. |
+| `unclassified` | Other or legacy callers of the shared slot-file writer. |
+
+These are origins, not a new admission policy or an assertion that every byte
+is dispensable. They do not change the write budget, priorities, persistence
+format, crash recovery, or when a write starts. A queued operation retains its
+origin even if it later serves another purpose. State captures remain explicit
+rather than being guessed to be optional or urgent.
+
+The five bounded counters count bytes actually accepted by payload `pwrite`,
+including host-page padding, accepted portions of failed/cancelled operations,
+and repeated payload writes. EINTR, zero returns, refused submissions and
+operations cancelled before writing add no bytes. Reads and record metadata
+remain outside these counters. After writers settle, the five counters sum to
+`disk.written_bytes`; live snapshots read independent atomics and need not
+balance transactionally. Counters reset with native cache resources; exclude
+frontend-instance and `transport.restarts` boundaries when computing deltas.
+Older engines omit this object and its Prometheus series; absence is unknown,
+not zero. These are application IO bytes, not device-host or NAND writes.
+
+The corresponding fixed Prometheus series are
+`splash_disk_payload_{unclassified,persist,reclaim,spill,checkpoint}_written_bytes_total`.

@@ -529,6 +529,10 @@ void writeDisk(json::Writer &w, const engine::EngineSnapshot &core) {
         .field("kv_copies", tier.copies)
         .field("kv_copy_failures", tier.copyFailures);
     w.field("kv_copy_recreation_starts", tier.copyRecreationStarts);
+    w.object("payload_written_bytes", [&] {
+      constexpr json::Key names[] = {"unclassified", "persist", "reclaim", "spill", "checkpoint"};
+      for (size_t i = 0; i < tier.payloadWrites.size(); ++i) w.field(names[i], tier.payloadWrites[i]);
+    });
     w.object("metadata_writes", [&] {
       constexpr json::Key names[] = {"header", "label", "clear"};
       for (size_t i = 0; i < tier.metadataWrites.size(); ++i)

@@ -64,6 +64,28 @@ std::vector<std::byte> indexOf(const test::HostKvPages &pages, uint32_t page) {
   return bytes;
 }
 
+// The host adapter uses the same classified SlotFile writes as the Metal tier.
+void payloadOrigins(const std::shared_ptr<model::SsdReaders> &readers, kv::Layout layout) {
+  test::HostKvPages pages(layout, 1);
+  const kv::SlotFormat format(layout);
+  std::shared_ptr<DiskBudget> budget;
+  Tier tier(pages, format, slotFile(format, 1, budget), readers);
+  pages.fill(0, 1);
+  auto slot = tier.acquireSlot(cached);
+  constexpr WriteClass kinds[] = {WriteClass::Reclaim, WriteClass::Persist, WriteClass::Spill};
+  constexpr size_t indices[] = {2, 1, 3};
+  for (size_t i = 0; i < 3; ++i) {
+    std::vector<std::unique_ptr<KvTransfer>> writes;
+    writes.push_back(tier.demote(0, slot, kinds[i], {}));
+    require(writes.back() != nullptr, "classified demotion refused");
+    runUntilReady(tier, writes);
+    require(writes.back()->finish(), "classified demotion failed");
+    require(budget->ioSnapshot().payloadWrites[indices[i]] == tier.slotBytes(),
+            "KV write class was not passed to SlotFile");
+  }
+  require(budget->writtenBytes() == 3 * tier.slotBytes(), "classified demotion changed total IO");
+}
+
 // Pages round-trip byte for byte (whole, Slim and index restores); a restore of an unwritten slot
 // fails alone.
 void roundTrips(const std::shared_ptr<model::SsdReaders> &readers, kv::Layout layout) {
@@ -165,6 +187,7 @@ int main() {
       for (const kv::Layout layout : {kv::Layout{10, 2, 256, format},
                                       kv::Layout{6, 2, 256, format, 0, false, 512, 0b010110},
                                       kv::Layout{12, 2, 256, format, 128, true, 0, 0, kv::Reads::SelectedBlocks}}) {
+        payloadOrigins(readers, layout);
         roundTrips(readers, layout);
         teardown(readers, layout);
       }

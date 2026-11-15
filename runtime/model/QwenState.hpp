@@ -202,7 +202,7 @@ private:
         const std::shared_ptr<StateStaging> &staging,
         const std::vector<std::span<std::byte>> &spans,
         CompositeStateLayout layout, QwenLogicalLengths lengths,
-        std::function<void()> completion);
+        std::function<void()> completion, PayloadWriteKind kind);
 
   std::shared_ptr<QwenBufferPool> pool_;
   QwenCachedBuffers buffers_;
