@@ -2416,14 +2416,13 @@ struct Runtime::Impl {
     buffers.gateScratch = decodeArena->gateScratch();
     bindDraftRings(entries, buffers.persistentKeys, buffers.persistentValues);
     std::array<ops::DraftTreeLane, kLaneCount> trees{};
-    std::array<uint32_t, kLaneCount> anchors{};
     std::array<std::span<const uint32_t>, kLaneCount> tokens{};
     for (uint32_t lane = 0; lane < lanes; ++lane) {
       Request &entry = laneEntry(entries, lane);
       if (!entry.pendingToken)
         throw std::invalid_argument("draft batch lane has no anchor");
       ops::DraftTreeLane &tree = trees[lane];
-      tree.anchor = anchors[lane] = *entry.pendingToken;
+      tree.anchor = *entry.pendingToken;
       tokens[lane] = entry.tokens;
       tree.depth = depths[lane];
       // A lane grows a tree beside its host chain, but beside a forced one,
@@ -2446,9 +2445,9 @@ struct Runtime::Impl {
         tree.noise = entry.cycleNoise;
       }
     }
-    const ops::DraftVocabulary vocabulary = DFlashDraft::vocabulary(
-        geometry.target.draftVocabulary, std::span(tokens).first(lanes), std::span(anchors).first(lanes));
-    draftModel.addDecode(graph, std::move(buffers), vocabulary, std::span(cacheLengths).first(lanes));
+    const DFlashDraftStep draft = draftModel.step(std::span(cacheLengths).first(lanes),
+                                                  std::span(tokens).first(lanes), std::span(trees).first(lanes));
+    draftModel.addDecode(graph, std::move(buffers), draft);
     const ops::DraftSelectorBuffers selection{
         d(DecodeTensor::Logits),          d(DecodeTensor::TopPartialIds),   d(DecodeTensor::TopPartialValues),
         d(DecodeTensor::Candidates),      d(DecodeTensor::Unary),           d(DecodeTensor::SelectorHidden),
@@ -2457,7 +2456,7 @@ struct Runtime::Impl {
         d(DecodeTensor::DraftTreeDraws),  d(DecodeTensor::DraftTreeNext),   d(DecodeTensor::DraftTreeCaps),
         d(DecodeTensor::InputTokens),     d(DecodeTensor::TreeRows),        d(DecodeTensor::LaneLayout),
         d(DecodeTensor::VerifySources)};
-    draftModel.addSelection(graph, selection, vocabulary, std::span(trees).first(lanes));
+    draftModel.addSelection(graph, selection, draft);
     ops::DraftSelector::addVerifyRows(graph, selection, step, floor);
   }
 
