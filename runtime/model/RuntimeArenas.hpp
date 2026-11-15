@@ -229,8 +229,6 @@ enum class TargetTensor : uint32_t {
   AttentionOutput,
   RopeCos,
   RopeSin,
-  ChunkKeys,
-  ChunkValues,
   // One tensor per ops::kMoeScratchFields entry, in its order (moeScratchTensor).
   MoeScratch,
   MoeScratchLast = MoeScratch + ops::kMoeScratchFields.size() - 1,

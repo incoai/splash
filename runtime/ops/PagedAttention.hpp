@@ -137,12 +137,10 @@ struct AttentionHistory final {
 
 // A layer's staging of its command's sequences (SplashAttentionSequence),
 // each after the one before it, a KV head's rows its chunk_stride apart: the
-// queries and attention rows [KV head][row][query head in group][dimension],
-// keys [KV head][row][dimension] and values [KV head][dimension][row].
+// queries and attention rows [KV head][row][query head in group][dimension].
+// The keys and values go to their pages directly (addProjection).
 struct AttentionStaging final {
   metal::MetalBuffer queries;
-  metal::MetalBuffer keys;
-  metal::MetalBuffer values;
   metal::MetalBuffer rows;
 };
 
@@ -150,7 +148,7 @@ struct AttentionStaging final {
 // s's first row and rows entry s of `layout` (SplashLaneRows,
 // metal/abi/VerifyTree.h: a prompt chunk's as its host writes them, a decode
 // step's as its selector writes them on the device), each at most its
-// chunk's chunk_tokens. The per-row kernels (q/k projection, store, gate)
+// chunk's chunk_tokens. The per-row kernels (q/k projection and store, gate)
 // take a grid of the sequences' rows up to the largest bound, and each
 // sequence's attention tiles are its bound's, whose splits its history and
 // bound plan (PagedAttention::plan); a row or tile past the sequence's rows
@@ -241,8 +239,8 @@ struct BlockListRows final {
 };
 
 // Target attention over paged INT8 or BF16 history, one op for every
-// command: each layer stages its sequences' rows (addProjection), stores
-// their K/V in their pages (addStore), attends them (addAttention) and gates
+// command: each layer stages its sequences' queries and stores their K/V in
+// their pages (addProjection), attends them (addAttention) and gates
 // the attention rows into the out-projection's input rows (addGate), each
 // once for all its sequences, whether a decode step's lanes or a prompt
 // chunk's, each reading the sequences' rows from the command's layout
@@ -289,21 +287,18 @@ public:
 
   // The q/k norms and, for a rotated variant, the RoPE of the sequences'
   // packed projection rows (every query head's queries, and a gated
-  // geometry's gates, then the K and V heads), staged for the store and
-  // attention; a row rotates by its packed row's rows of the RoPE tables
-  // (ops::RoPE). An unrotated variant reads no RoPE tables; ropeCos and
-  // ropeSin may be empty.
+  // geometry's gates, then the K and V heads): their queries staged for the
+  // attention, and their keys and values written into the pages of `layer`,
+  // each sequence's through its page table, in one dispatch before the
+  // attention, which reads them there. A row rotates by its packed row's
+  // rows of the RoPE tables (ops::RoPE). An unrotated variant reads no RoPE
+  // tables; ropeCos and ropeSin may be empty.
   static void addProjection(metal::CommandGraph &graph, metal::MetalBuffer packed, const NormWeights &queryNorm,
                             const NormWeights &keyNorm, metal::MetalBuffer ropeCos, metal::MetalBuffer ropeSin,
-                            const AttentionStaging &staging, std::span<const kv::ChunkedPrefillParams> sequences,
-                            const AttentionRows &rows, uint32_t queryHeads, kv::Layout layout,
-                            AttentionVariant variant = {});
-  // Writes the sequences' staged K/V into the pages of `layer`, each through
-  // its page table, before attention; both stay in one compute encoder.
-  static void addStore(metal::CommandGraph &graph, SplashKvLayer layer, const AttentionStaging &staging,
-                       std::span<const metal::MetalBuffer> pageTables,
-                       std::span<const kv::ChunkedPrefillParams> sequences, const AttentionRows &rows,
-                       kv::Layout layout);
+                            const AttentionStaging &staging, SplashKvLayer layer,
+                            std::span<const metal::MetalBuffer> pageTables,
+                            std::span<const kv::ChunkedPrefillParams> sequences, const AttentionRows &rows,
+                            uint32_t queryHeads, kv::Layout layout, AttentionVariant variant = {});
   // The plan's dispatches over the staged queries into the attention rows,
   // which must not alias, each sequence reading its history where `histories`
   // say. The plan owns the grids; partials and statistics hold its workspace.

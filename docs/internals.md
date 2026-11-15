@@ -493,7 +493,7 @@ collide, and attends a tree row (`SplashAttentionParams::trees`, the dense and
 the sparse splits alike) to its position's window of the history (the
 anchor's position plus its depth) and, of its block, its ancestors and
 itself; a row of a block's second tile reads its ancestors' K/V from the
-slots the store wrote before the attention. After acceptance the cycle moves
+slots the q/k projection wrote before the attention. After acceptance the cycle moves
 each lane's accepted path's K/V to the slots of their depths in every
 attention layer (`ops::PagedAttention::addPathCommit`, reading acceptance's
 `RetainedRows`), which moves nothing for a chain's path. Qwen3.8-Flash-Next's
@@ -1049,8 +1049,8 @@ device's plans; `GGUF_MOE_ARGS='repack'` times the repack of streamed experts in
 formats, each plane checked bytewise against the reference repack.
 
 Target attention runs once a layer for every sequence of a command, a decode step's lanes as a
-prompt chunk's sequences (`ops::PagedAttention`, `SplashAttentionSequence`): one q/k projection,
-one store and one gate over all their rows, each sequence's staged after the one before it, and a
+prompt chunk's sequences (`ops::PagedAttention`, `SplashAttentionSequence`): one q/k projection
+and one gate over all their rows, each sequence's queries staged after the one before it, and a
 split and a reduce for each run of sequences whose tiles' splits fit the workspace
 (`ops::AttentionPlan`), each sequence's split count its own bound's and history's. Every kernel
 reads a sequence's rows from the command's layout (`ops::AttentionRows`, a `SplashLaneRows` a
@@ -1058,9 +1058,13 @@ sequence): a prompt chunk's as its host writes them (`PrefillTensor::LaneLayout`
 as its selector writes them on the device (`DecodeTensor::LaneLayout`), each within its bound, its
 chunk's `chunk_tokens` (a prompt sequence's rows, a decode lane's cap), which sizes everything
 the host lays out for it: its staging, page table, tiles of 8 rows, partial slots and lists. The
-per-row kernels (q/k norm and RoPE, store, gate) take a grid of each sequence's rows up to the
-largest bound, a threadgroup reading its sequence's layout entry once, and a row or tile past its
-sequence's rows writes nothing. It
+per-row kernels (q/k norm and RoPE, gate) take a grid of each sequence's rows up to the largest
+bound, a threadgroup reading its sequence's layout entry once, and a row or tile past its
+sequence's rows writes nothing. The projection's K-head threadgroups also store their row's key
+and value in its page slot through the sequence's page table (`splash_store_kv_slot`: INT8 at a
+scale per row and head of the largest magnitude over 127, or BF16 as it is), so the attention
+reads every row's K/V from the pages with no store of its own: the projection's kernels are
+compiled for each page format (`attention_q8_qkv…`, `attention_bf16_qkv…`). It
 runs the geometries of `kCompiledAttention` (`runtime/ops/PagedAttention.cpp`):
 query heads over KV heads of a head dimension (`_d128` in the names of 128-wide heads' kernels;
 256 is unnamed) in a value order, each compiled with the variants its layers take, which a layer

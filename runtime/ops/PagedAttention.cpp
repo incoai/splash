@@ -30,8 +30,8 @@ uint32_t tileParts(uint32_t queryHeads, kv::Layout layout) {
 // The compiled attention geometries (kernels/shared/attention_qkv.metal,
 // paged_attention.metal, paged_attention_store.metal and
 // sparse_attention.metal): query heads over KV heads of a head dimension and
-// how they read the pages, and their kernels' name suffix, the stores' by KV
-// heads, head dimension and the value order of the reader. The sparse
+// how they read the pages, and their kernels' name suffix, the path commits'
+// by KV heads, head dimension and the value order of the reader. The sparse
 // kernels read selected blocks of token-major values (Qwen3.8-Flash-Next's);
 // the dense page loop reads every page of dimension-major ones. Each
 // geometry's kernels are compiled for:
@@ -75,8 +75,8 @@ bool storesLayout(const CompiledAttention &compiled, kv::Layout layout) {
          kv::valuesTokenMajorFor(compiled.reads) == layout.valuesTokenMajor;
 }
 
-// The KV store kernels' suffix of a layout's KV heads, head dimension and
-// value order.
+// The KV path commit kernels' suffix of a layout's KV heads, head dimension
+// and value order, whose pages a compiled geometry stores.
 std::string_view storeSuffix(kv::Layout layout) {
   if (layout.valid())
     for (const CompiledAttention &compiled : kCompiledAttention)
@@ -175,16 +175,10 @@ struct CommandRows final {
   uint32_t kvHeads = 0;
 
   // The staging's bytes up to the last sequence's last KV head's first
-  // `reach` rows, `width` elements each (queries, keys and attention rows),
-  // or, transposed, of its values.
+  // `reach` rows, `width` elements each (queries and attention rows).
   [[nodiscard]] uint64_t rowBytes(uint64_t width, uint32_t reach) const noexcept {
     return (staged - kvHeads * uint64_t{last.chunk_stride} + (kvHeads - 1) * uint64_t{last.chunk_stride} + reach) *
            width * sizeof(uint16_t);
-  }
-  [[nodiscard]] uint64_t valueBytes(uint32_t headDimension) const noexcept {
-    const uint64_t first = (staged - kvHeads * uint64_t{last.chunk_stride}) * headDimension;
-    return (first + (uint64_t{kvHeads} * headDimension - 1) * last.chunk_stride + last.chunk_tokens) *
-           sizeof(uint16_t);
   }
 };
 CommandRows commandRows(std::span<const kv::ChunkedPrefillParams> sequences, kv::Layout layout) {
@@ -257,15 +251,10 @@ metal::DispatchSize rowGroups(uint64_t groups, const CommandRows &command, size_
 
 // The staging of a command's rows its kernels reach, of `reach` rows of the
 // last sequence's: queries and attention rows hold a KV head's group of query
-// heads a row, keys one head, and values a row per dimension.
+// heads a row.
 void requireStaging(const AttentionStaging &staging, const CommandRows &rows, uint32_t group, kv::Layout layout,
-                    uint32_t reach, bool keys, bool queries) {
-  const uint64_t row = layout.headDimension;
-  if (keys) {
-    requireBytes(staging.keys, rows.rowBytes(row, reach), "attention key");
-    requireBytes(staging.values, rows.valueBytes(layout.headDimension), "attention value");
-  }
-  if (queries) requireBytes(staging.queries, rows.rowBytes(group * row, reach), "attention query");
+                    uint32_t reach) {
+  requireBytes(staging.queries, rows.rowBytes(uint64_t{group} * layout.headDimension, reach), "attention query");
 }
 
 // A packed projection row: every query head's q and, gated, its gate, then
@@ -279,13 +268,14 @@ uint64_t gateBytes(uint64_t rows, const CompiledAttention &compiled) {
 }
 
 // The q/k projection's bindings: the packed rows and norms, a rotated
-// variant's RoPE tables of `rows` rows, then the staging of the queries, keys
-// and values.
+// variant's RoPE tables of `rows` rows, then the staging of the queries and
+// the sequences' page tables, which take the keys and values.
 std::vector<metal::MetalBuffer> projectionBindings(const CompiledAttention &compiled, AttentionVariant variant,
                                                    uint64_t rows, metal::MetalBuffer packed,
                                                    const NormWeights &queryNorm, const NormWeights &keyNorm,
                                                    metal::MetalBuffer ropeCos, metal::MetalBuffer ropeSin,
-                                                   const AttentionStaging &staging) {
+                                                   const AttentionStaging &staging,
+                                                   std::span<const metal::MetalBuffer> pageTables) {
   std::vector<metal::MetalBuffer> bindings{std::move(packed), queryNorm.buffer, keyNorm.buffer};
   if (variant.rotated) {
     const uint64_t bytes = rows * compiled.rotaryPairs * sizeof(float);
@@ -293,7 +283,9 @@ std::vector<metal::MetalBuffer> projectionBindings(const CompiledAttention &comp
     requireBytes(ropeSin, bytes, "attention RoPE sine");
     bindings.insert(bindings.end(), {std::move(ropeCos), std::move(ropeSin)});
   }
-  bindings.insert(bindings.end(), {staging.queries, staging.keys, staging.values});
+  bindings.push_back(staging.queries);
+  const auto tables = laneBindings(pageTables);
+  bindings.insert(bindings.end(), tables.begin(), tables.end());
   return bindings;
 }
 
@@ -450,41 +442,27 @@ kv::ChunkedPrefillParams PagedAttention::chunkParams(uint64_t logicalPosition, u
 void PagedAttention::addProjection(metal::CommandGraph &graph, metal::MetalBuffer packed,
                                    const NormWeights &queryNorm, const NormWeights &keyNorm,
                                    metal::MetalBuffer ropeCos, metal::MetalBuffer ropeSin,
-                                   const AttentionStaging &staging,
+                                   const AttentionStaging &staging, SplashKvLayer layer,
+                                   std::span<const metal::MetalBuffer> pageTables,
                                    std::span<const kv::ChunkedPrefillParams> sequences, const AttentionRows &rows,
                                    uint32_t queryHeads, kv::Layout layout, AttentionVariant variant) {
   const CompiledAttention &kernel = compiledAttention(queryHeads, layout, variant);
   const CommandRows command = commandRows(sequences, layout);
+  if (pageTables.size() != sequences.size())
+    throw std::invalid_argument("a q/k projection takes a page table per sequence");
   requireRows(rows, command, sequences.size());
   requireBytes(packed, uint64_t{rows.rows} * packedWidth(kernel) * 2, "attention q/k/v");
-  requireStaging(staging, command, queryHeads / layout.kvHeads, layout, command.last.chunk_tokens, true, true);
+  requireStaging(staging, command, queryHeads / layout.kvHeads, layout, command.last.chunk_tokens);
+  for (size_t s = 0; s < sequences.size(); ++s) requirePageTable(pageTables[s], sequences[s]);
   std::vector<metal::MetalBuffer> bindings = projectionBindings(
       kernel, variant, rows.rows, std::move(packed), queryNorm, keyNorm, std::move(ropeCos), std::move(ropeSin),
-      staging);
+      staging, pageTables);
   bindings.push_back(rows.layout);
-  graph.add(qkNormKernel(kernelName("qkv", std::string(kernel.suffix) + (variant.rotated ? "" : "_nope")),
+  graph.add(qkNormKernel(kernelName(kernelFormat(layout) + "_qkv",
+                                    std::string(kernel.suffix) + (variant.rotated ? "" : "_nope")),
                          queryNorm, keyNorm, layout.headDimension),
-            std::move(bindings), everyRow(sequences, command, rows),
+            std::move(bindings), everyRow(sequences, command, rows, layer),
             rowGroups(queryHeads + layout.kvHeads, command, sequences.size()), {layout.headDimension, 1, 1});
-}
-
-void PagedAttention::addStore(metal::CommandGraph &graph, SplashKvLayer layer, const AttentionStaging &staging,
-                              std::span<const metal::MetalBuffer> pageTables,
-                              std::span<const kv::ChunkedPrefillParams> sequences, const AttentionRows &rows,
-                              kv::Layout layout) {
-  const std::string store = kernelName(kernelFormat(layout) + "_store", storeSuffix(layout));
-  const CommandRows command = commandRows(sequences, layout);
-  if (pageTables.size() != sequences.size())
-    throw std::invalid_argument("a KV store takes a page table per sequence");
-  requireRows(rows, command, sequences.size());
-  requireStaging(staging, command, 1, layout, command.last.chunk_tokens, true, false);
-  for (size_t s = 0; s < sequences.size(); ++s) requirePageTable(pageTables[s], sequences[s]);
-  const auto tables = laneBindings(pageTables);
-  std::vector<metal::MetalBuffer> bindings{staging.keys, staging.values};
-  bindings.insert(bindings.end(), tables.begin(), tables.end());
-  bindings.push_back(rows.layout);
-  graph.add(store, std::move(bindings), everyRow(sequences, command, rows, layer),
-            rowGroups(uint64_t{2} * layout.kvHeads, command, sequences.size()), {layout.headDimension, 1, 1});
 }
 
 void PagedAttention::addAttention(metal::CommandGraph &graph, const AttentionPlan &plan,
@@ -514,7 +492,7 @@ void PagedAttention::addAttention(metal::CommandGraph &graph, const AttentionPla
   // of rows, which each sequence's stride holds.
   const uint32_t group = plan.queryHeads / plan.layout.kvHeads;
   const uint32_t tileRows = kv::attentionTiles(command.last.chunk_tokens) * kv::kAttentionTileRows;
-  requireStaging(staging, command, group, plan.layout, tileRows, false, true);
+  requireStaging(staging, command, group, plan.layout, tileRows);
   requireBytes(staging.rows, command.rowBytes(uint64_t{group} * plan.layout.headDimension, tileRows),
                "attention output");
   const AttentionWorkspace workspace = plan.workspace();

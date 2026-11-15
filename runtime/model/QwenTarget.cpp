@@ -277,16 +277,13 @@ void QwenTarget::addPrefillMixer(PrefillStep &step, const QwenAttentionWeights &
   if (!step.readRows.empty() && !output.residual)
     throw std::logic_error("a Qwen prefill layer that outputs its read rows alone has no residual rows");
   const std::span<const kv::ChunkedPrefillParams> sequences = step.attentionSequences();
-  const ops::AttentionStaging staging{b.fullQueries, b.chunkKeys, b.chunkValues, b.fullAttention};
+  const ops::AttentionStaging staging{b.fullQueries, b.fullAttention};
   const ops::AttentionRows rows{b.laneRows, step.rows};
   operators_.linear().addProjection(step.graph, b.normalized, mixer.inputProjection, b.fullPacked, step.rows,
                                     b.linearScratch);
   ops::PagedAttention::addProjection(step.graph, b.fullPacked, mixer.queryNorm, mixer.keyNorm, b.ropeCos, b.ropeSin,
-                                     staging, sequences, rows, geometry_.attentionQueryHeads, geometry_.kvLayout,
-                                     variant);
-  ops::PagedAttention::addStore(step.graph, step.kvLayers[layer], staging,
-                                std::span(step.pageTables).first(sequences.size()), sequences, rows,
-                                geometry_.kvLayout);
+                                     staging, step.kvLayers[layer], std::span(step.pageTables).first(sequences.size()),
+                                     sequences, rows, geometry_.attentionQueryHeads, geometry_.kvLayout, variant);
   std::array<ops::AttentionHistory, ExecutionLimits::maximumBatchWidth> histories{};
   for (size_t index = 0; index < step.sequences.size(); ++index) {
     const QwenTargetPrefillSequence &sequence = step.sequences[index];
@@ -369,21 +366,21 @@ void QwenTarget::addVerifyMixer(VerifyStep &step, const QwenAttentionWeights &mi
   const ops::Linear &linear = operators_.linear();
   const uint32_t layer = step.attentionLayer++;
   const ops::AttentionVariant variant = geometry_.attentionVariant(layer);
-  const ops::AttentionStaging staging{b.fullQueries, b.chunkKeys, b.chunkValues, b.fullAttention};
+  const ops::AttentionStaging staging{b.fullQueries, b.fullAttention};
   const ops::AttentionRows rows{b.laneRows, step.rows, b.tree};
+  const std::span<const metal::MetalBuffer> pageTables = std::span(b.pageTables).first(step.lanes);
   addDecodeProjection(step.graph, b.normalized, mixer.inputProjection, b.fullPacked, step.lanes, b.linearScratch,
                       std::move(normalized));
   ops::PagedAttention::addProjection(step.graph, b.fullPacked, mixer.queryNorm, mixer.keyNorm, b.ropeCos, b.ropeSin,
-                                     staging, step.chunks, rows, geometry_.attentionQueryHeads, geometry_.kvLayout,
-                                     variant);
+                                     staging, step.kvLayers[layer], pageTables, step.chunks, rows,
+                                     geometry_.attentionQueryHeads, geometry_.kvLayout, variant);
+  // The lists' located blocks resolve from spilled history pages, which the
+  // projection's stores into the step's own slots do not touch.
   ops::AttentionBlocks attended = blocks;
   if (step.spilled.active()) {
     if (!blocks.stride) throw std::logic_error("a verify over spilled K/V attends without block lists");
     attended = step.spilled.verify(step.graph, layer, blocks);
   }
-  const std::span<const metal::MetalBuffer> pageTables = std::span(b.pageTables).first(step.lanes);
-  ops::PagedAttention::addStore(step.graph, step.kvLayers[layer], staging, pageTables, step.chunks, rows,
-                                geometry_.kvLayout);
   std::array<ops::AttentionHistory, ExecutionLimits::maximumBatchWidth> histories{};
   for (uint32_t lane = 0; lane < step.lanes; ++lane) {
     histories[lane] = {step.kvLayers[layer], pageTables[lane], attended};

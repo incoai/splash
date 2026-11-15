@@ -71,7 +71,7 @@ struct AttentionFixturePlan final {
   // ops::AttentionRows). Table0 is lane 0's page table; every other lane's
   // follows it.
   enum class Tensor : uint32_t {
-    ChunkKeys, ChunkValues, Queries, Output, Partials, Statistics, Sinks, Layout,
+    Queries, Output, Partials, Statistics, Sinks, Layout,
     Table0, Count = Table0 + kMaximumLanes
   };
   using Histories = std::array<uint32_t, kMaximumLanes>;
@@ -147,12 +147,8 @@ struct AttentionFixturePlan final {
     plan.extents = (plan.poolPages + geometry.extentPages - 1) / geometry.extentPages;
     plan.poolBytes =
         uint64_t{plan.extents} * HostKvExtents::extentStride(pool, geometry.extentPages);
-    const uint64_t chunks =
-        uint64_t{lanes} * shape.kvHeads * plan.stride * shape.headDimension * sizeof(uint16_t);
     const uint64_t queries =
         uint64_t{lanes} * shape.queryHeads * plan.stride * shape.headDimension * sizeof(uint16_t);
-    plan.size(Tensor::ChunkKeys, chunks);
-    plan.size(Tensor::ChunkValues, chunks);
     plan.size(Tensor::Queries, queries);
     plan.size(Tensor::Output, queries);
     plan.size(Tensor::Partials, scratch.partialsBytes);
@@ -230,19 +226,19 @@ public:
   }
 
   // Zeroes the allocation, then writes the page tables, the lanes' layout,
-  // every lane's history, chunk and queries. Long histories consult `stop`
-  // every 256 tokens; false when it stopped the fill.
+  // every lane's history and rows' K/V into its pages, the rows' as a q/k
+  // projection stores them before the attention, and their queries. Long
+  // histories consult `stop` every 256 tokens; false when it stopped the
+  // fill.
   bool fill(const std::function<bool()> &stop = {}) {
     std::memset(base_.contents(), 0, plan_.bytes);
     auto *layout = data<SplashLaneRows>(Tensor::Layout);
     for (uint32_t lane = 0; lane < plan_.lanes; ++lane) layout[lane] = {lane * plan_.rows, plan_.rows};
-    auto *chunkKeys = data<uint16_t>(Tensor::ChunkKeys);
-    auto *chunkValues = data<uint16_t>(Tensor::ChunkValues);
     auto *queries = data<uint16_t>(Tensor::Queries);
     const uint32_t dimensions = plan_.shape.headDimension;
     for (uint32_t lane = 0; lane < plan_.lanes; ++lane) {
       pages_.writeTable(pageIds_[lane], tables_[lane]);
-      for (uint32_t token = 0; token < plan_.histories[lane]; ++token) {
+      for (uint32_t token = 0; token < plan_.histories[lane] + plan_.rows; ++token) {
         if (token % 256 == 0 && stop && stop()) return false;
         for (uint32_t head = 0; head < plan_.shape.kvHeads; ++head) {
           const auto key = [&](uint32_t d) {
@@ -271,16 +267,6 @@ public:
         }
       }
       for (uint32_t row = 0; row < plan_.rows; ++row) {
-        for (uint32_t head = 0; head < plan_.shape.kvHeads; ++head) {
-          const uint64_t base =
-              (uint64_t{lane} * plan_.shape.kvHeads + head) * plan_.stride * dimensions;
-          for (uint32_t d = 0; d < dimensions; ++d) {
-            chunkKeys[base + row * dimensions + d] = floatToBf16(
-                float(int((row * 37 + head * 101 + d * 17 + lane * 7) % 255) - 127) * 0.006f);
-            chunkValues[base + uint64_t{d} * plan_.stride + row] = floatToBf16(
-                float(int((row * 53 + head * 79 + d * 29 + lane * 19) % 255) - 127) * 0.007f);
-          }
-        }
         for (uint32_t head = 0; head < plan_.shape.queryHeads; ++head)
           for (uint32_t d = 0; d < dimensions; ++d)
             queries[plan_.queryIndex(lane, head, row, d)] = floatToBf16(
@@ -318,18 +304,15 @@ public:
                            plan_.shape.variant);
   }
 
-  // One store and attention of every lane's rows, encoded as the runtime
-  // encodes a command's sequences, through block lists (sparse plans) when
-  // `blocks` has them: lane l's tiles from list blocks.list + l x its tiles
-  // on.
+  // The attention of every lane's rows, encoded as the runtime encodes a
+  // command's sequences after their q/k projection, through block lists
+  // (sparse plans) when `blocks` has them: lane l's tiles from list
+  // blocks.list + l x its tiles on.
   void addGraph(metal::CommandGraph &graph, const ops::AttentionPlan &attention,
                 const ops::AttentionBlocks &blocks = {}) const {
     const auto chunks = sequences();
     const std::span<const kv::ChunkedPrefillParams> lanes = std::span(chunks).first(plan_.lanes);
-    const ops::AttentionStaging staging{buffer(Tensor::Queries), buffer(Tensor::ChunkKeys),
-                                        buffer(Tensor::ChunkValues), buffer(Tensor::Output)};
-    ops::PagedAttention::addStore(graph, layer_, staging, std::span(tables_).first(plan_.lanes), lanes, rows(),
-                                  plan_.layout());
+    const ops::AttentionStaging staging{buffer(Tensor::Queries), buffer(Tensor::Output)};
     std::array<ops::AttentionHistory, AttentionFixturePlan::kMaximumLanes> histories{};
     for (uint32_t lane = 0; lane < plan_.lanes; ++lane) {
       histories[lane] = {layer_, tables_[lane], blocks};

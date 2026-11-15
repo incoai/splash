@@ -184,9 +184,13 @@ TEST_MODEL_RUNTIME_ORACLE := $(ENGINE_TEST_BUILD)/model-runtime-oracle
 WEIGHT_DIGESTS := $(ENGINE_TEST_BUILD)/weight-digests
 TEST_VISION_ENCODER_TEST := $(ENGINE_TEST_BUILD)/vision-encoder
 TEST_Q8_AIR := $(ENGINE_TEST_BUILD)/q8-paged-kv.air
+# The attention tests' store of K/V they stage themselves, over the
+# production store routine (the q/k projection's): in the Q8 tests' library
+# and the production-and-test one.
+TEST_ATTENTION_STORE_AIR := $(ENGINE_TEST_BUILD)/attention-store-test.air
 TEST_Q8_LIB := $(ENGINE_TEST_BUILD)/q8-paged-kv.metallib
-# Both Q8 tests share the attention and store kernels, the sparse ones
-# included.
+# Both Q8 tests share the attention kernels, the sparse ones included, and the
+# path commit, beside the tests' store.
 TEST_Q8_KERNEL_SOURCES := \
 	runtime/metal/kernels/shared/paged_attention.metal \
 	runtime/metal/kernels/shared/paged_attention_store.metal \
@@ -307,7 +311,7 @@ TEST_CONFIG_TARGETS := $(filter-out $(LIB) $(HOST_STEP_LIB),$(sort $(TEST_CPU_TA
 	$(TEST_DECODE_PROFILE) $(TEST_TEACHER_LOGITS) $(TEST_ATTENTION_SWEEP) \
 	$(TEST_GGUF_PROJECTION_BENCHMARK) $(TEST_GGUF_MOE_BENCHMARK) \
 	$(TEST_Q8_AIR) $(TEST_Q8_KERNEL_AIRS) $(TEST_RESIDENCY_AIR) $(TEST_HOST_STEP_AIR) $(TEST_METAL_BACKEND_AIR) \
-	$(TEST_GGUF_DEQUANT_AIR) $(TEST_GGUF_MOE_AIR)
+	$(TEST_GGUF_DEQUANT_AIR) $(TEST_GGUF_MOE_AIR) $(TEST_ATTENTION_STORE_AIR)
 # Benchmarks and tools that build with the production flags.
 PRODUCTION_FLAG_TOOLS := $(TEST_BACKEND_BENCHMARK) $(WEIGHT_DIGESTS)
 SANITIZER_CONFIG_TARGETS := $(TEST_SLOT_FILE_ASAN) $(TEST_SLOT_FILE_TSAN) \
@@ -469,9 +473,9 @@ $(TEST_QWEN4_KERNELS): dev/tests/engine/qwen4_kernels_test.mm \
 $(TEST_GDN_METAL_TEST): dev/tests/engine/gdn_metal_test.mm \
 		$(ENGINE_LIBRARY) $(LIB)
 $(TEST_ATTENTION_PLAN): dev/tests/engine/paged_attention_plan_test.mm \
-		$(ENGINE_LIBRARY) $(LIB)
+		$(ENGINE_LIBRARY) $(TEST_PRODUCTION_LIB)
 $(TEST_ATTENTION_VARIANTS): dev/tests/engine/attention_variants_metal_test.mm \
-		$(ENGINE_LIBRARY) $(LIB)
+		$(ENGINE_LIBRARY) $(TEST_PRODUCTION_LIB)
 $(TEST_ROPE_TABLES): dev/tests/engine/rope_tables_metal_test.mm \
 		$(ENGINE_LIBRARY) $(LIB)
 $(TEST_LINEAR_PLAN): dev/tests/engine/linear_plan_test.mm \
@@ -558,8 +562,9 @@ $(TEST_BACKEND_BENCHMARK): dev/benchmarks/backend_benchmark.mm \
 # Test kernels, each compiled from its Metal source with the test flags.
 $(TEST_Q8_AIR): dev/tests/engine/q8_page_format_oracle.metal runtime/metal/abi/ExecutionGeometry.h
 $(TEST_METAL_BACKEND_AIR): dev/tests/engine/metal_backend_test.metal
+$(TEST_ATTENTION_STORE_AIR): dev/tests/engine/attention_store_test.metal $(KERNEL_HEADERS)
 
-$(TEST_Q8_AIR) $(TEST_METAL_BACKEND_AIR): | $(ENGINE_TEST_BUILD)
+$(TEST_Q8_AIR) $(TEST_METAL_BACKEND_AIR) $(TEST_ATTENTION_STORE_AIR): | $(ENGINE_TEST_BUILD)
 	$(RUN_CONFIGURED) $(METAL) $(TEST_METALFLAGS) -c $(filter %.metal,$^) -o $@
 
 $(ENGINE_TEST_BUILD)/kernels/%.air: runtime/metal/kernels/%.metal \
@@ -581,14 +586,15 @@ $(TEST_GGUF_DEQUANT_AIR) $(TEST_GGUF_MOE_AIR): $(KERNEL_HEADERS) | $(ENGINE_TEST
 # Test libraries, each linked from the AIRs it lists.
 $(TEST_GGUF_DEQUANT_LIB): $(TEST_GGUF_DEQUANT_AIR) $(TEST_RESIDENCY_AIR)
 $(TEST_Q8_LIB): $(TEST_Q8_AIR) $(TEST_RESIDENCY_AIR)
-$(TEST_Q8_ATTENTION_LIB): $(TEST_Q8_KERNEL_AIRS)
+$(TEST_Q8_ATTENTION_LIB): $(TEST_Q8_KERNEL_AIRS) $(TEST_ATTENTION_STORE_AIR)
 $(TEST_METAL_BACKEND_LIB): $(TEST_METAL_BACKEND_AIR) $(TEST_RESIDENCY_AIR)
 $(TEST_HOST_STEP_LIB): $(TEST_HOST_STEP_AIR)
 # The production kernels and test kernels in one library, for the kernel
 # tests that run test kernels between production dispatches:
 # metal_backend_test.metal's copies, and gguf_moe_test.metal's gate and up
 # passes apart. It relinks whenever the production library does.
-$(TEST_PRODUCTION_LIB): $(PRODUCTION_AIRS) $(TEST_METAL_BACKEND_AIR) $(TEST_GGUF_MOE_AIR) $(LIB)
+$(TEST_PRODUCTION_LIB): $(PRODUCTION_AIRS) $(TEST_METAL_BACKEND_AIR) $(TEST_GGUF_MOE_AIR) $(TEST_ATTENTION_STORE_AIR) \
+		$(LIB)
 
 $(TEST_GGUF_DEQUANT_LIB) $(TEST_Q8_LIB) $(TEST_Q8_ATTENTION_LIB) $(TEST_METAL_BACKEND_LIB) \
 		$(TEST_PRODUCTION_LIB) $(TEST_HOST_STEP_LIB):
@@ -692,8 +698,8 @@ test-engine-metal: $(TEST_METAL_TARGETS)
 	$(METAL_TEST_ENV) $(TEST_KV_HISTORY_STREAM) $(LIB)
 	$(METAL_TEST_ENV) $(TEST_QWEN4_KERNELS) $(LIB)
 	$(TEST_QWEN4_KERNELS) $(LIB) bitwise
-	$(METAL_TEST_ENV) $(TEST_ATTENTION_PLAN) $(LIB)
-	$(METAL_TEST_ENV) $(TEST_ATTENTION_VARIANTS) $(LIB)
+	$(METAL_TEST_ENV) $(TEST_ATTENTION_PLAN) $(TEST_PRODUCTION_LIB)
+	$(METAL_TEST_ENV) $(TEST_ATTENTION_VARIANTS) $(TEST_PRODUCTION_LIB)
 	$(METAL_TEST_ENV) $(TEST_ROPE_TABLES) $(LIB)
 	$(METAL_TEST_ENV) $(TEST_LINEAR_PLAN) $(LIB)
 	$(METAL_TEST_ENV) $(TEST_RESOURCES_TEST) $(LIB)

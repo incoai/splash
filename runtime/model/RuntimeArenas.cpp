@@ -44,10 +44,6 @@ std::array<uint64_t, targetTensorCount> targetTensorBytes(const QwenTargetGeomet
   }
   put(TargetTensor::RopeCos, bytesFor<float>(rows * target.rotaryPairs));
   put(TargetTensor::RopeSin, bytesFor<float>(rows * target.rotaryPairs));
-  put(TargetTensor::ChunkKeys,
-      bytesFor<uint16_t>(uint64_t{target.attentionKvHeads} * stagedRows * target.attentionHeadDimension));
-  put(TargetTensor::ChunkValues,
-      bytesFor<uint16_t>(uint64_t{target.attentionKvHeads} * stagedRows * target.attentionHeadDimension));
   if (target.ffnKind == QwenFfnKind::SparseMoe)
     for (size_t field = 0; field < ops::kMoeScratchFields.size(); ++field)
       put(moeScratchTensor<TargetTensor>(field), shape.moe.*ops::kMoeScratchFields[field].bytes);

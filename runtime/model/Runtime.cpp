@@ -300,8 +300,6 @@ QwenTargetPrefillBuffers targetBuffers(const TargetArena &target, uint32_t chunk
   buffers.attentionOutput = t(TargetTensor::AttentionOutput);
   buffers.ropeCos = t(TargetTensor::RopeCos);
   buffers.ropeSin = t(TargetTensor::RopeSin);
-  buffers.chunkKeys = t(TargetTensor::ChunkKeys);
-  buffers.chunkValues = t(TargetTensor::ChunkValues);
   buffers.moe = target.moeScratch(chunk);
   return buffers;
 }
@@ -2469,8 +2467,6 @@ struct Runtime::Impl {
     buffers.denseGateScratch = decodeArena->gateScratch();
     buffers.gdnPacked = rows(TargetTensor::GdnPacked);
     buffers.gdnTape = decodeArena->batchSlice(DecodeTensor::GdnTape, kLaneCount);
-    buffers.chunkKeys = target.get(TargetTensor::ChunkKeys);
-    buffers.chunkValues = target.get(TargetTensor::ChunkValues);
     buffers.moe = target.moeScratch(0);
     buffers.verifyRows = decodeArena->batchSlice(DecodeTensor::VerifyRows, lanes);
     buffers.tree = decodeArena->batchSlice(DecodeTensor::TreeRows, lanes);

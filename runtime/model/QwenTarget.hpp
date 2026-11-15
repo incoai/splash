@@ -270,8 +270,6 @@ struct QwenTargetPrefillBuffers final {
   metal::MetalBuffer ropeSin;
   // The RoPE inverse frequencies the tables were made of (rotaryPairs).
   metal::MetalBuffer ropeInverseFrequencies;
-  metal::MetalBuffer chunkKeys;
-  metal::MetalBuffer chunkValues;
   // Each sequence's rows of the chunk (SplashLaneRows), as the host writes
   // them, which the attention layers read (ops::AttentionRows).
   metal::MetalBuffer laneRows;
@@ -324,9 +322,6 @@ struct QwenTargetVerifyBuffers final {
   // The lanes' decode tapes (ops::GdnTapeLane).
   metal::MetalBuffer gdnTape;
   std::array<ops::GdnTapeLane, ExecutionLimits::maximumBatchWidth> gdnTapeLanes{};
-  // The staging of every attention layer's keys and values in turn.
-  metal::MetalBuffer chunkKeys;
-  metal::MetalBuffer chunkValues;
   std::array<metal::MetalBuffer, ExecutionLimits::maximumBatchWidth>
       currentGdnStates;
   std::array<metal::MetalBuffer, ExecutionLimits::maximumBatchWidth>

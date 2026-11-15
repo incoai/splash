@@ -8,6 +8,7 @@
 #include "HostKvExtents.hpp"
 #include "LinearNumerics.hpp"
 #include "NormReference.hpp"
+#include "StagedKvStore.hpp"
 #include "TestFamilies.hpp"
 #include "ops/KernelCalibration.hpp"
 #include "ops/LaneRows.hpp"
@@ -170,7 +171,7 @@ void checkSplitRule(uint32_t queryHeads, kv::Layout layout) {
 // workspace, in order, each sequence in one, and keep the splits each takes
 // alone. The plan of their last tiles keeps every sequence's splits and
 // kernels. A decode step's four lanes at the most splits fit four lanes'
-// workspaces in one dispatch.
+// workspaces in one dispatch, and a decode lane of up to 16 rows one lane's.
 void checkGrouping(uint32_t queryHeads, kv::Layout layout) {
   const std::array sequences{sequenceOf(4000, 13), sequenceOf(0, 1), sequenceOf(65'536, 40), sequenceOf(300, 5)};
   const auto together = planOf(sequences, queryHeads, layout);
@@ -211,6 +212,25 @@ void checkGrouping(uint32_t queryHeads, kv::Layout layout) {
   const auto step = planOf(lanes, queryHeads, layout, kBf16, 4 * kv::kAttentionMaximumSplits);
   require(step.dispatches().size() == 1 && step.dispatches()[0].slots == 4 * kv::kAttentionMaximumSplits,
           "a decode step's lanes at the most splits do not attend in one dispatch");
+  // A decode lane of up to SPLASH_TARGET_VERIFY_ROWS rows takes at most a
+  // lane's workspace, kAttentionMaximumSplits tile splits, after any history
+  // up to the longest context: its one tile up to 128 splits, or a 9-16-row
+  // lane's two tiles up to 32 each. Four 16-row lanes at the longest context
+  // attend in one dispatch of four lanes' workspaces.
+  for (uint32_t rows = 1; rows <= SPLASH_TARGET_VERIFY_ROWS; ++rows)
+    for (const uint32_t history : {0U, 65'536U, 131'072U, SPLASH_MAXIMUM_CONTEXT_TOKENS - rows}) {
+      const uint32_t tiles = kv::attentionTiles(rows);
+      const uint32_t splits = planOf(sequenceOf(history, rows), queryHeads, layout).sequences()[0].splits;
+      require(tiles * splits <= kv::kAttentionMaximumSplits && (tiles == 1 || splits <= 32),
+              "a decode lane's splits exceed a lane's workspace: " + std::to_string(rows) + " rows after " +
+                  std::to_string(history));
+    }
+  for (uint32_t lane = 0; lane < 4; ++lane)
+    lanes[lane] = sequenceOf(SPLASH_MAXIMUM_CONTEXT_TOKENS - SPLASH_TARGET_VERIFY_ROWS - lane,
+                             SPLASH_TARGET_VERIFY_ROWS);
+  const auto wide = planOf(lanes, queryHeads, layout, kBf16, 4 * kv::kAttentionMaximumSplits);
+  require(wide.dispatches().size() == 1 && wide.dispatches()[0].slots <= 4 * kv::kAttentionMaximumSplits,
+          "a decode step's 16-row lanes at the longest context do not attend in one dispatch");
   for (const size_t count : {size_t{0}, size_t{5}}) {
     const std::vector<kv::ChunkedPrefillParams> many(count, sequenceOf(0, 8));
     rejects([&] { (void)planOf(many, queryHeads, layout); }, "invalid attention sequences",
@@ -612,7 +632,13 @@ void checkBf16Store(const Case &data, const std::vector<std::vector<std::byte>> 
 }
 
 ops::AttentionStaging stagingOf(const Case &data, const metal::MetalBuffer &output) {
-  return {data.queries, data.keys, data.values, output};
+  return {data.queries, output};
+}
+
+// The case's staged K/V into its pages, as the q/k projection stores rows.
+void addStore(metal::CommandGraph &graph, const Case &data) {
+  test::addStagedStore(graph, data.layer, data.keys, data.values, std::span(data.tables).first(data.lanes),
+                       data.sequences(), data.attentionRows(), data.layout);
 }
 
 void checkBf16StoreEdges(metal::MetalBackend &backend) {
@@ -628,8 +654,7 @@ void checkBf16StoreEdges(metal::MetalBackend &backend) {
     }
     const auto expected = expectedBf16Store(data);
     metal::CommandGraph graph;
-    ops::PagedAttention::addStore(graph, data.layer, stagingOf(data, {}), std::span(data.tables).first(data.lanes),
-                                  data.sequences(), data.attentionRows(), data.layout);
+    addStore(graph, data);
     (void)backend.submitCommandAsync(graph.dispatches()).wait();
     checkBf16Store(data, expected);
   }
@@ -709,8 +734,7 @@ std::vector<uint16_t> run(metal::MetalBackend &backend, Case &data, const Run &h
     how.locate(blocks);
   }
   const size_t first = graph.dispatches().size();
-  ops::PagedAttention::addStore(graph, data.layer, staging, std::span(data.tables).first(data.lanes), data.sequences(),
-                                command, data.layout);
+  addStore(graph, data);
   if (how.stage) std::tie(histories[0].pageTable, histories[0].kv) = how.stage(graph);
   for (uint32_t lane = 0; lane < data.lanes; ++lane) {
     histories[lane].blocks = blocks;
@@ -718,7 +742,7 @@ std::vector<uint16_t> run(metal::MetalBackend &backend, Case &data, const Run &h
   }
   const size_t attention = graph.dispatches().size();
   ops::PagedAttention::addAttention(graph, plan, staging, partials, statistics, data.sequences(), histories, command);
-  require(how.stage || attention == first + 1, "production attention should encode the store alone first");
+  require(how.stage || attention == first + 1, "the case's store should encode one dispatch before the attention");
   // Each planned dispatch runs as a dispatch per run of its sequences that
   // read their layer in one placement (SplashAttentionParams::kv): a split and
   // a reduce each, on the planned dispatch's partial slots.
@@ -1171,19 +1195,28 @@ void checkPackedGate(metal::MetalBackend &backend, uint32_t queryHeads, kv::Layo
   std::cout << "packed gate: q=" << queryHeads << " lanes of 1, 16, 9 and 3 rows of 16 PASS\n";
 }
 
-// The q/k RMS norms, RoPE and V copy of the attention prepare against fp64
-// with norm weights in bf16 or F32 (a GGUF's), of a command's sequences:
+// The q/k RMS norms, RoPE and K/V store of the attention prepare against
+// fp64 with norm weights in bf16 or F32 (a GGUF's), of a command's sequences:
 // three lanes of 8 rows in a KV block each, a chunk of 37 rows in 64, and
 // sequences of 5, 13 and 8 rows. Past the rotary pairs a row holds the norm
 // rounded once to bf16; each rotated value is within an ulp of the fp64
 // rotation of the bf16-rounded norms plus an ulp of the larger input, which
 // covers the fp32 kernel rounding a norm to the other bf16 neighbour and a
-// rotation that cancels.
+// rotation that cancels. The queries are staged; a row's keys and values sit
+// in its page slot after the sequence's committed tokens: BF16 pages hold
+// the keys so and the values' bits, INT8 pages a scale per row and head of
+// the largest magnitude over 127 (that of the bf16 keys or values, within an
+// ulp of the division) and codes of the values over it rounded to nearest
+// (within one of the reference's, for a rounding of the quotient), so a key
+// dequantizes within half a scale of the bound above. No slot past a
+// sequence's rows, nor its staged queries, is written.
 void checkProjection(metal::MetalBackend &backend, uint32_t queryHeads, kv::Layout layout, bool float32,
                      std::span<const kv::ChunkedPrefillParams> sequences, std::span<const uint32_t> laneRows = {}) {
   constexpr uint32_t kDim = 256, kPairs = 32;
   constexpr uint16_t kFill = 0xa5a5;
+  constexpr std::byte kPageFill{0xa5};
   const uint32_t kvHeads = layout.kvHeads, group = queryHeads / kvHeads;
+  const bool int8 = layout.format == kv::Format::Int8;
   // Each sequence's rows of the command: laneRows', or its chunk's.
   std::vector<uint32_t> held;
   uint32_t rows = 0;
@@ -1198,10 +1231,25 @@ void checkProjection(metal::MetalBackend &backend, uint32_t queryHeads, kv::Layo
   auto ropeCos = allocate(backend, uint64_t{rows} * kPairs * 4);
   auto ropeSin = allocate(backend, ropeCos.sizeBytes());
   auto queries = allocate(backend, staged * group * kDim * 2);
-  auto keys = allocate(backend, staged * kDim * 2);
-  auto values = allocate(backend, keys.sizeBytes());
-  for (const metal::MetalBuffer &staging : {queries, keys, values})
-    std::fill_n(static_cast<uint16_t *>(staging.contents()), staging.sizeBytes() / 2, kFill);
+  std::fill_n(static_cast<uint16_t *>(queries.contents()), queries.sizeBytes() / 2, kFill);
+  // Each sequence's pages, one after another, of a pool whose every byte
+  // starts as kPageFill.
+  uint32_t allPages = 0;
+  for (const kv::ChunkedPrefillParams &sequence : sequences) allPages += sequence.page_table_entries;
+  const auto spread = HostKvExtents::spread(allPages);
+  kv::Layout poolLayout = layout;
+  poolLayout.attentionLayers = 1;
+  HostKvExtents pool(backend, poolLayout, spread.extentPages, spread.extents);
+  for (uint32_t extent = 0; extent < pool.extentCount(); ++extent)
+    std::fill(pool.bytes(extent).begin(), pool.bytes(extent).end(), kPageFill);
+  std::vector<std::vector<uint32_t>> pageIds;
+  std::vector<metal::MetalBuffer> tables;
+  for (uint32_t s = 0, first = 0; s < sequences.size(); first += sequences[s++].page_table_entries) {
+    pageIds.emplace_back(sequences[s].page_table_entries);
+    std::iota(pageIds.back().begin(), pageIds.back().end(), first);
+    tables.push_back(allocate(backend, uint64_t{sequences[s].page_table_entries} * sizeof(SplashKvPage)));
+    pool.writeTable(pageIds.back(), tables.back());
+  }
   uint32_t state = 0x2545F491U + queryHeads + rows;
   const auto unit = [&] {
     state = state * 1664525U + 1013904223U;
@@ -1222,62 +1270,136 @@ void checkProjection(metal::MetalBackend &backend, uint32_t queryHeads, kv::Layo
   for (uint32_t s = 0, first = 0; s < sequences.size(); first += held[s++])
     static_cast<SplashLaneRows *>(layoutRows.contents())[s] = {first, held[s]};
   const auto addProjection = [&](metal::CommandGraph &graph, const ops::NormWeights &keyWeights) {
-    ops::PagedAttention::addProjection(graph, packed, queryNorm, keyWeights, ropeCos, ropeSin,
-                                       {queries, keys, values, {}}, sequences, {layoutRows, rows}, queryHeads, layout);
+    ops::PagedAttention::addProjection(graph, packed, queryNorm, keyWeights, ropeCos, ropeSin, {queries, {}},
+                                       pool.layer(0), tables, sequences, {layoutRows, rows}, queryHeads, layout);
   };
   metal::CommandGraph graph;
   addProjection(graph, keyNorm);
   (void)backend.submitCommandAsync(graph.dispatches()).wait();
 
   const auto *queryData = static_cast<const uint16_t *>(queries.contents());
-  const auto *keyData = static_cast<const uint16_t *>(keys.contents());
-  const auto *valueData = static_cast<const uint16_t *>(values.contents());
+  // The bytes of a slot's tensor element of a token's page: keys, values or,
+  // INT8, their scales.
+  const auto element = [&](size_t s, uint32_t token, uint32_t tensor, uint32_t head, uint32_t d) -> const std::byte * {
+    const uint32_t id = pageIds[s][token / 32], slot = token % 32;
+    const auto *page = pool.slab<std::byte>(0, tensor, id);
+    if (tensor == SPLASH_KV_KEY_SCALES || tensor == SPLASH_KV_VALUE_SCALES)
+      return page + splash_kv_scale_element(head, slot) * sizeof(float);
+    const uint64_t index = tensor == SPLASH_KV_KEYS ? splash_kv_key_element(head, slot, d) : pool.valueElement(head, slot, d);
+    return page + index * (int8 ? 1 : 2);
+  };
+  const auto stored = [&](size_t s, uint32_t token, uint32_t tensor, uint32_t head, uint32_t d) {
+    const std::byte *at = element(s, token, tensor, head, d);
+    if (int8) {
+      const std::byte *scale = element(s, token, tensor == SPLASH_KV_KEYS ? SPLASH_KV_KEY_SCALES : SPLASH_KV_VALUE_SCALES,
+                                       head, 0);
+      float factor = 0;
+      std::memcpy(&factor, scale, sizeof(factor));
+      return double(int8_t(*at)) * factor;
+    }
+    uint16_t bits = 0;
+    std::memcpy(&bits, at, sizeof(bits));
+    return double(bf16ToFloat(bits));
+  };
   uint32_t rowBegin = 0;
   uint64_t stageRow = 0;
   for (size_t index = 0; index < sequences.size(); ++index) {
     const kv::ChunkedPrefillParams &sequence = sequences[index];
     const uint32_t stride = sequence.chunk_stride;
-    // Past the sequence's rows, within its bound, no row is staged.
+    // Past the sequence's rows, within its bound, no row is stored or staged.
     for (uint32_t row = held[index]; row < sequence.chunk_tokens; ++row)
       for (uint32_t head = 0; head < kvHeads; ++head) {
+        const uint32_t token = sequence.committed_tokens + row;
         for (uint32_t d = 0; d < kDim; ++d)
-          require(keyData[(stageRow + uint64_t{head} * stride + row) * kDim + d] == kFill &&
-                      valueData[stageRow * kDim + (uint64_t{head} * kDim + d) * stride + row] == kFill,
-                  "the attention prepare staged a key or value past its sequence's rows");
+          require(*element(index, token, SPLASH_KV_KEYS, head, d) == kPageFill &&
+                      *element(index, token, SPLASH_KV_VALUES, head, d) == kPageFill,
+                  "the attention prepare stored a key or value past its sequence's rows");
+        if (int8)
+          require(*element(index, token, SPLASH_KV_KEY_SCALES, head, 0) == kPageFill &&
+                      *element(index, token, SPLASH_KV_VALUE_SCALES, head, 0) == kPageFill,
+                  "the attention prepare stored a scale past its sequence's rows");
         for (uint32_t local = 0; local < group; ++local)
           for (uint32_t d = 0; d < kDim; ++d)
             require(queryData[((stageRow + uint64_t{head} * stride + row) * group + local) * kDim + d] == kFill,
                     "the attention prepare staged a query past its sequence's rows");
       }
     for (uint32_t row = 0; row < held[index]; ++row) {
+      const uint32_t token = sequence.committed_tokens + row;
       const uint64_t packedRow = uint64_t{rowBegin + row} * packedWidth;
       const uint64_t rope = uint64_t{rowBegin + row} * kPairs;
       for (uint32_t head = 0; head < queryHeads + kvHeads; ++head) {
         const bool query = head < queryHeads;
         const uint32_t h = query ? head : head - queryHeads;
         const uint16_t *source = packedData + packedRow + (query ? h * 2 * kDim : 2 * queryHeads * kDim + h * kDim);
-        const uint16_t *out = query ? queryData + (((stageRow + uint64_t{h / group} * stride + row) * group + h % group) *
-                                                   kDim)
-                                    : keyData + (stageRow + uint64_t{h} * stride + row) * kDim;
         const std::vector<double> normalized = test::rmsNorm(source, query ? queryNorm : keyNorm, kDim);
-        for (uint32_t d = 2 * kPairs; d < kDim; ++d)
-          require(test::roundedOnceToBf16(out[d], normalized[d]),
-                  "attention prepare norm differs from the fp64 reference");
+        // The head's bf16 reference: the norm past the pairs, the fp64
+        // rotation within them, and the bound each output keeps to it.
+        std::vector<double> reference(kDim), bound(kDim);
+        for (uint32_t d = 2 * kPairs; d < kDim; ++d) {
+          reference[d] = normalized[d];
+          bound[d] = ulpBf16(float(normalized[d]));
+        }
         for (uint32_t d = 0; d < kPairs; ++d) {
           const double first = bf16ToFloat(floatToBf16(float(normalized[d])));
           const double second = bf16ToFloat(floatToBf16(float(normalized[d + kPairs])));
           const double c = static_cast<const float *>(ropeCos.contents())[rope + d];
-          const double s = static_cast<const float *>(ropeSin.contents())[rope + d];
-          const double rotated[2] = {first * c - second * s, second * c + first * s};
-          for (uint32_t half = 0; half < 2; ++half)
-            require(std::fabs(bf16ToFloat(out[d + half * kPairs]) - rotated[half]) <=
-                        ulpBf16(float(rotated[half])) + ulpBf16(float(std::max(std::fabs(first), std::fabs(second)))),
-                    "attention prepare rotation differs from the fp64 reference");
+          const double sine = static_cast<const float *>(ropeSin.contents())[rope + d];
+          reference[d] = first * c - second * sine;
+          reference[d + kPairs] = second * c + first * sine;
+          const double larger = ulpBf16(float(std::max(std::fabs(first), std::fabs(second))));
+          bound[d] = ulpBf16(float(reference[d])) + larger;
+          bound[d + kPairs] = ulpBf16(float(reference[d + kPairs])) + larger;
         }
-        if (!query)
-          for (uint32_t d = 0; d < kDim; ++d)
-            require(valueData[stageRow * kDim + (uint64_t{h} * kDim + d) * stride + row] == source[kvHeads * kDim + d],
-                    "attention prepare value copy differs");
+        if (query) {
+          const uint16_t *out =
+              queryData + (((stageRow + uint64_t{h / group} * stride + row) * group + h % group) * kDim);
+          for (uint32_t d = 2 * kPairs; d < kDim; ++d)
+            require(test::roundedOnceToBf16(out[d], normalized[d]),
+                    "attention prepare norm differs from the fp64 reference");
+          for (uint32_t d = 0; d < 2 * kPairs; ++d)
+            require(std::fabs(bf16ToFloat(out[d]) - reference[d]) <= bound[d],
+                    "attention prepare rotation differs from the fp64 reference");
+          continue;
+        }
+        // A key and a value of the row and head, as the page stores them.
+        double keyScale = 0, valueScale = 0, keyMaximum = 0, valueMaximum = 0;
+        for (uint32_t d = 0; d < kDim; ++d) {
+          keyMaximum = std::max(keyMaximum, std::fabs(reference[d]) + bound[d]);
+          valueMaximum = std::max(valueMaximum, double(std::fabs(bf16ToFloat(source[kvHeads * kDim + d]))));
+        }
+        if (int8) {
+          float factor = 0;
+          std::memcpy(&factor, element(index, token, SPLASH_KV_KEY_SCALES, h, 0), sizeof(factor));
+          keyScale = factor;
+          std::memcpy(&factor, element(index, token, SPLASH_KV_VALUE_SCALES, h, 0), sizeof(factor));
+          valueScale = factor;
+          require(keyScale <= keyMaximum / 127 * (1 + 1e-6) && keyScale > 0,
+                  "attention prepare key scale exceeds the largest key over 127");
+          require(std::fabs(valueScale - valueMaximum / 127) <= ulpBf16(float(valueMaximum / 127)) / 256,
+                  "attention prepare value scale is not the largest value over 127");
+        }
+        for (uint32_t d = 0; d < kDim; ++d) {
+          const double key = stored(index, token, SPLASH_KV_KEYS, h, d);
+          if (d >= 2 * kPairs && !int8) {
+            uint16_t bits = 0;
+            std::memcpy(&bits, element(index, token, SPLASH_KV_KEYS, h, d), sizeof(bits));
+            require(test::roundedOnceToBf16(bits, normalized[d]), "attention prepare key norm differs from the fp64 reference");
+          } else {
+            require(std::fabs(key - reference[d]) <= bound[d] + 0.51 * keyScale,
+                    "attention prepare key differs from the fp64 reference");
+          }
+          const uint16_t valueBits = source[kvHeads * kDim + d];
+          if (int8) {
+            const double expected = valueScale ? double(bf16ToFloat(valueBits)) / valueScale : 0;
+            require(std::fabs(stored(index, token, SPLASH_KV_VALUES, h, d) / (valueScale ? valueScale : 1) -
+                              std::nearbyint(expected)) <= 1,
+                    "attention prepare value code is not the value's over its scale");
+          } else {
+            uint16_t bits = 0;
+            std::memcpy(&bits, element(index, token, SPLASH_KV_VALUES, h, d), sizeof(bits));
+            require(bits == valueBits, "attention prepare value copy differs");
+          }
+        }
       }
     }
     rowBegin += held[index];
@@ -1294,8 +1416,8 @@ void checkProjection(metal::MetalBackend &backend, uint32_t queryHeads, kv::Layo
               "mixed q/k norm types rejected for the wrong reason");
     }
   }
-  std::cout << "attention prepare: q=" << queryHeads << " sequences=" << sequences.size() << " rows=" << rows
-            << (float32 ? " f32" : " bf16") << " norms PASS\n";
+  std::cout << "attention prepare: q=" << queryHeads << " " << kv::formatName(layout.format)
+            << " sequences=" << sequences.size() << " rows=" << rows << (float32 ? " f32" : " bf16") << " norms PASS\n";
 }
 
 // Each buffer the projection, gate, store and attention reach, at its extent
@@ -1303,8 +1425,9 @@ void checkProjection(metal::MetalBackend &backend, uint32_t queryHeads, kv::Layo
 // in 64 rows per KV head, and a lane's 8 after 2000 in 32. The packed rows
 // (the gates read each row's query heads only), the RoPE rows, the staging up
 // to the last sequence's last KV head's rows (its rows, or the attention's
-// whole tiles of 8; values transposed), the page table of each sequence's
-// visible tokens, and the plan's partials and statistics.
+// whole tiles of 8), the page table of each sequence's visible tokens, which
+// the projection stores the rows' K/V through and the attention reads, and
+// the plan's partials and statistics.
 void bufferExtents(metal::MetalBackend &backend, uint32_t queryHeads, kv::Layout layout) {
   constexpr uint32_t dimension = 256;
   const std::array sequences{ops::PagedAttention::chunkParams(100, 37, 64, 5),
@@ -1314,9 +1437,8 @@ void bufferExtents(metal::MetalBackend &backend, uint32_t queryHeads, kv::Layout
   const uint64_t packedWidth = uint64_t{2 * queryHeads + 2 * kvHeads} * dimension;
   const uint64_t queryWidth = uint64_t{group} * dimension, lastStage = uint64_t{kvHeads} * 64;
   // The staging up to the last sequence's last KV head's first `reach` rows
-  // of `width`, and of values.
+  // of `width`.
   const auto staged = [&](uint32_t reach, uint64_t width) { return (lastStage + (kvHeads - 1) * 32 + reach) * width * 2; };
-  const uint64_t stagedValues = (lastStage * dimension + (uint64_t{kvHeads} * dimension - 1) * 32 + 8) * 2;
   const auto gateRows = [&](uint64_t count) { return ((count - 1) * packedWidth + uint64_t{queryHeads} * 2 * dimension) * 2; };
   const auto pageTable = [](const kv::ChunkedPrefillParams &chunk) {
     return uint64_t{(chunk.committed_tokens + chunk.chunk_tokens + 31) / 32} * sizeof(SplashKvPage);
@@ -1327,6 +1449,7 @@ void bufferExtents(metal::MetalBackend &backend, uint32_t queryHeads, kv::Layout
   using Buffers = std::vector<metal::MetalBuffer>;
   const metal::MetalBuffer packed = allocate(backend, rows * packedWidth * 2), rope = allocate(backend, rows * 32 * 4),
                            staging = allocate(backend, staged(32, queryWidth));
+  const std::array tables{allocate(backend, pageTable(sequences[0])), allocate(backend, pageTable(sequences[1]))};
   // The sequences' rows of the command: 37 from row 0, 8 from row 37.
   const auto layoutOf = [&](std::initializer_list<SplashLaneRows> entries) {
     const metal::MetalBuffer buffer = allocate(backend, entries.size() * sizeof(SplashLaneRows));
@@ -1341,21 +1464,20 @@ void bufferExtents(metal::MetalBackend &backend, uint32_t queryHeads, kv::Layout
                         [&](metal::CommandGraph &graph, const metal::MetalBuffer &view) {
                           const ops::NormWeights query{key ? queryNorm.buffer : view, true},
                               keys{key ? view : keyNorm.buffer, true};
-                          ops::PagedAttention::addProjection(graph, packed, query, keys, rope, rope,
-                                                             {staging, staging, staging, {}}, sequences, command,
-                                                             queryHeads, layout);
+                          ops::PagedAttention::addProjection(graph, packed, query, keys, rope, rope, {staging, {}},
+                                                             {}, tables, sequences, command, queryHeads, layout);
                         });
   test::requireExtents(backend,
                        Extents{{0, rows * packedWidth * 2, 2, "attention q/k/v"},
                                {1, uint64_t{rows} * 32 * 4, 4, "attention RoPE cosine"},
                                {2, uint64_t{rows} * 32 * 4, 4, "attention RoPE sine"},
                                {3, staged(8, queryWidth), 2, "attention query"},
-                               {4, staged(8, dimension), 2, "attention key"},
-                               {5, stagedValues, 2, "attention value"},
+                               {4, pageTable(sequences[0]), sizeof(SplashKvPage), "page table"},
+                               {5, pageTable(sequences[1]), sizeof(SplashKvPage), "page table"},
                                {6, layoutBytes, sizeof(SplashLaneRows), "attention layout"}},
                        [&](metal::CommandGraph &graph, const Buffers &b) {
-                         ops::PagedAttention::addProjection(graph, b[0], queryNorm, keyNorm, b[1], b[2],
-                                                            {b[3], b[4], b[5], {}}, sequences, {b[6], rows},
+                         ops::PagedAttention::addProjection(graph, b[0], queryNorm, keyNorm, b[1], b[2], {b[3], {}},
+                                                            {}, std::span(b).subspan(4, 2), sequences, {b[6], rows},
                                                             queryHeads, layout);
                        });
   const uint32_t width = queryHeads * dimension;
@@ -1390,16 +1512,6 @@ void bufferExtents(metal::MetalBackend &backend, uint32_t queryHeads, kv::Layout
                                                             {layoutOf({{0, 8}, {8, 8}, {16, 8}}), 24},
                                                             ops::AttentionOutput::Every, queryHeads, layout,
                                                             {b[3], b[4], {}, {}}, ops::LinearInput::Table16);
-                       });
-  test::requireExtents(backend,
-                       Extents{{0, staged(8, dimension), 2, "attention key"},
-                               {1, stagedValues, 2, "attention value"},
-                               {2, pageTable(sequences[0]), sizeof(SplashKvPage), "page table"},
-                               {3, pageTable(sequences[1]), sizeof(SplashKvPage), "page table"},
-                               {4, layoutBytes, sizeof(SplashLaneRows), "attention layout"}},
-                       [&](metal::CommandGraph &graph, const Buffers &b) {
-                         ops::PagedAttention::addStore(graph, {}, {.keys = b[0], .values = b[1]},
-                                                       std::span(b).subspan(2, 2), sequences, {b[4], rows}, layout);
                        });
   const auto plan = planOf(sequences, queryHeads, layout);
   test::requireExtents(backend,
@@ -2012,8 +2124,8 @@ int main(int argc, char **argv) {
     attentionBlocks(backend);
     stageEncoding(backend);
     blockListsMatchMasks(backend);
-    // The prepare kernels do not depend on the KV format; their norms are of
-    // each type the geometry's families store.
+    // The prepare kernels store each KV format; their norms are of each type
+    // the geometry's families store.
     const std::array lanes{ops::PagedAttention::chunkParams(0, 8, 32, 1), ops::PagedAttention::chunkParams(9, 8, 32, 1),
                            ops::PagedAttention::chunkParams(31, 8, 32, 2)};
     const std::array chunk{ops::PagedAttention::chunkParams(100, 37, 64, 5)};
@@ -2023,15 +2135,15 @@ int main(int argc, char **argv) {
     const std::array capped{ops::PagedAttention::chunkParams(0, 16, 32, 1), ops::PagedAttention::chunkParams(9, 16, 32, 1),
                             ops::PagedAttention::chunkParams(31, 16, 32, 2), ops::PagedAttention::chunkParams(70, 16, 32, 3)};
     constexpr std::array<uint32_t, 4> cappedRows{1, 16, 9, 3};
-    for (const Geometry geometry : kGeometries)
-      for (bool float32 : splash::test::familyNorms(geometry))
-        for (const std::span<const kv::ChunkedPrefillParams> sequences :
-             {std::span<const kv::ChunkedPrefillParams>(lanes), std::span<const kv::ChunkedPrefillParams>(chunk),
-              std::span<const kv::ChunkedPrefillParams>(mixed)})
-          checkProjection(backend, geometry.queryHeads, geometry.layout(kv::Format::Int8), float32, sequences);
-    for (const Geometry geometry : kGeometries)
-      for (bool float32 : splash::test::familyNorms(geometry))
-        checkProjection(backend, geometry.queryHeads, geometry.layout(kv::Format::Int8), float32, capped, cappedRows);
+    for (auto format : {kv::Format::Int8, kv::Format::BFloat16})
+      for (const Geometry geometry : kGeometries)
+        for (bool float32 : splash::test::familyNorms(geometry)) {
+          for (const std::span<const kv::ChunkedPrefillParams> sequences :
+               {std::span<const kv::ChunkedPrefillParams>(lanes), std::span<const kv::ChunkedPrefillParams>(chunk),
+                std::span<const kv::ChunkedPrefillParams>(mixed)})
+            checkProjection(backend, geometry.queryHeads, geometry.layout(format), float32, sequences);
+          checkProjection(backend, geometry.queryHeads, geometry.layout(format), float32, capped, cappedRows);
+        }
     if (argc == 3 && std::string_view(argv[2]) == "--long") {
       for (auto format : {kv::Format::Int8, kv::Format::BFloat16})
         for (const Geometry geometry : kGeometries)

@@ -367,8 +367,8 @@ class CompileConfigurationTests(unittest.TestCase):
             root = Path(directory)
             self.build_files(root)
             kernel_root = Path("runtime/metal/kernels")
-            # The Q8 tests' kernels: the attention and store, and the sparse
-            # ones.
+            # The Q8 tests' kernels: the attention, the path commit and the
+            # sparse ones, beside the tests' own K/V store.
             q8_sources = [
                 kernel_root / "shared" / name
                 for name in (
@@ -383,11 +383,13 @@ class CompileConfigurationTests(unittest.TestCase):
             residency_source = kernel_root / "shared/residency.metal"
             removed_source = kernel_root / "shared/removed.metal"
             removed_header = kernel_root / "common/removed.h"
+            store_source = Path("dev/tests/engine/attention_store_test.metal")
             for relative in (
                 *q8_sources,
                 residency_source,
                 removed_source,
                 removed_header,
+                store_source,
                 Path("runtime/engine/Status.cpp"),
                 Path("dev/tests/engine/metal_backend_test.metal"),
             ):
@@ -414,6 +416,7 @@ class CompileConfigurationTests(unittest.TestCase):
                 )
                 for source in (*q8_sources, residency_source, removed_source)
             }
+            # The tests' store includes the kernel headers too.
             test_airs = {
                 str(
                     build
@@ -421,7 +424,7 @@ class CompileConfigurationTests(unittest.TestCase):
                     / source.relative_to(kernel_root).with_suffix(".air")
                 )
                 for source in q8_sources
-            }
+            } | {str(build / "engine-tests/attention-store-test.air")}
             residency_air = str(build / "engine-tests/kernels/shared/residency.air")
 
             def rebuild(*selected):

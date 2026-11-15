@@ -30,7 +30,8 @@ namespace {
 
 constexpr uint32_t kQueryHeads = 24;
 constexpr uint32_t kQueryHeadsPerKvHead = 6;
-constexpr std::string_view kChunkedPrefillStorePipeline = "attention_q8_store";
+// The test library's store of the K/V the test stages (attention_store_test.metal).
+constexpr std::string_view kChunkedPrefillStorePipeline = "test_staged_kv_store_q8";
 constexpr std::string_view kPrefillAttentionSplitPipeline = "attention_q8_split";
 constexpr std::string_view kPrefillAttentionReducePipeline = "attention_reduce";
 struct AttentionPipelines {
@@ -311,13 +312,13 @@ void encodeStore(id<MTLComputeCommandEncoder> encoder,
                  id<MTLComputePipelineState> pipeline, const Case &data) {
   const SplashAttentionParams params = sequenceParams(data);
   [encoder setComputePipelineState:pipeline];
-  [encoder setBuffer:data.chunkKeys offset:0 atIndex:0];
-  [encoder setBuffer:data.chunkValues offset:0 atIndex:1];
-  setPageTables(encoder, data.pageTableBuffer, 2);
-  setLayout(encoder, data, 6);
+  setLayout(encoder, data, 0);
+  [encoder setBuffer:data.chunkKeys offset:0 atIndex:1];
+  [encoder setBuffer:data.chunkValues offset:0 atIndex:2];
+  setPageTables(encoder, data.pageTableBuffer, 3);
   [encoder setBytes:&params length:sizeof(params) atIndex:7];
   data.pool->use(encoder, MTLResourceUsageWrite);
-  [encoder dispatchThreadgroups:MTLSizeMake(2 * kKvHeads, data.params.chunk_tokens, 1)
+  [encoder dispatchThreadgroups:MTLSizeMake(kKvHeads, data.params.chunk_tokens, 1)
              threadsPerThreadgroup:MTLSizeMake(kHeadDimension, 1, 1)];
 }
 
@@ -862,14 +863,14 @@ void testBatchedStore(id<MTLDevice> device, id<MTLCommandQueue> queue,
   id<MTLCommandBuffer> command = [queue commandBuffer];
   id<MTLComputeCommandEncoder> encoder = [command computeCommandEncoder];
   [encoder setComputePipelineState:store];
-  [encoder setBuffer:chunkKeys offset:0 atIndex:0];
-  [encoder setBuffer:chunkValues offset:0 atIndex:1];
+  [encoder setBuffer:layout offset:0 atIndex:0];
+  [encoder setBuffer:chunkKeys offset:0 atIndex:1];
+  [encoder setBuffer:chunkValues offset:0 atIndex:2];
   for (uint32_t lane = 0; lane < lanes; ++lane)
-    [encoder setBuffer:tableBuffers[lane] offset:0 atIndex:2 + lane];
-  [encoder setBuffer:layout offset:0 atIndex:6];
+    [encoder setBuffer:tableBuffers[lane] offset:0 atIndex:3 + lane];
   [encoder setBytes:&params length:sizeof(params) atIndex:7];
   pool.use(encoder, MTLResourceUsageWrite);
-  [encoder dispatchThreadgroups:MTLSizeMake(2 * kKvHeads, rows, lanes)
+  [encoder dispatchThreadgroups:MTLSizeMake(kKvHeads, rows, lanes)
              threadsPerThreadgroup:MTLSizeMake(kHeadDimension, 1, 1)];
   [encoder endEncoding];
   finish(command);
