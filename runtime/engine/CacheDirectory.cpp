@@ -66,12 +66,25 @@ bool owned(int directory) noexcept {
          !(status.st_mode & (S_IWGRP | S_IWOTH));
 }
 
+// A signal may interrupt a directory syscall. Retry only that operation,
+// not cache initialization/cleanup. Bound repeated signals so
+// an interrupted startup still reaches the caller's existing failure handling.
+template <class F> int directoryCall(F call) {
+  for (unsigned attempt = 0; attempt < 8; ++attempt) {
+    const int result = call();
+    if (result >= 0 || errno != EINTR)
+      return result;
+  }
+  return -1;
+}
+
 // Makes the directory at path (0700) when missing and opens it; empty when
 // it was removed between the two.
 std::optional<Descriptor> openDirectory(const std::filesystem::path &path, const char *what) {
-  if (::mkdir(path.c_str(), 0700) < 0 && errno != EEXIST)
+  if (directoryCall([&] { return ::mkdir(path.c_str(), 0700); }) < 0 && errno != EEXIST)
     fail(what);
-  Descriptor directory(::open(path.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW));
+  Descriptor directory(directoryCall(
+      [&] { return ::open(path.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW); }));
   if (directory.get() < 0) {
     if (errno == ENOENT)
       return std::nullopt;
