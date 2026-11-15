@@ -494,6 +494,9 @@ void writeState(json::Writer &w, const CacheSnapshot &resources, const model::Mo
         .field("disk_promotions", state.promotions)
         .field("disk_promotions_skipped", state.promotionsSkipped)
         .field("disk_bytes", state.diskBytes)
+        .field("disk_copy_drops", state.diskCopyDrops)
+        .field("disk_copy_recreation_starts", state.diskCopyRecreationStarts)
+        .field("disk_copy_recreations", state.diskCopyRecreations)
         .field("offloads", state.offloads)
         .field("offload_failures", state.offloadFailures)
         .field("invalidations", state.invalidations);
@@ -525,6 +528,19 @@ void writeDisk(json::Writer &w, const engine::EngineSnapshot &core) {
         .field("persistent", resources.persistent)
         .field("kv_copies", tier.copies)
         .field("kv_copy_failures", tier.copyFailures);
+    w.field("kv_copy_recreation_starts", tier.copyRecreationStarts);
+    w.object("metadata_writes", [&] {
+      constexpr json::Key names[] = {"header", "label", "clear"};
+      for (size_t i = 0; i < tier.metadataWrites.size(); ++i)
+        w.object(names[i], [&] {
+          const auto &n = tier.metadataWrites[i];
+          w.field("bytes", n.bytes).field("calls", n.calls).field("syscall_errors", n.errors);
+        });
+    });
+    w.object("copy_evictions", [&] {
+      constexpr json::Key names[] = {"kv_copy", "state_copy", "kv_leaf", "state_only", "state_in_use"};
+      for (size_t i = 0; i < tier.diskReplacements.size(); ++i) w.field(names[i], tier.diskReplacements[i]);
+    });
     w.object("taken_back", [&] {
       w.field("states", resources.adoption.states)
           .field("kv_blocks", resources.adoption.blocks)

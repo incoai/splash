@@ -128,6 +128,9 @@ struct KvTierSnapshot final {
   uint32_t pendingPages = 0;
   uint32_t diskBlocks = 0;
   uint64_t diskBytes = 0;
+  model::MetadataWrites metadataWrites{};
+  std::array<uint64_t, 5> diskReplacements{};
+  uint64_t copyRecreationStarts = 0;
 };
 
 // What a start took back from a persistent tier: the states and KV blocks

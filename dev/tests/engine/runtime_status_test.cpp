@@ -158,6 +158,12 @@ StatusInputs representativeStatus() {
   engine.resources.kvTier.writesDeferredMicroseconds = 2'500;
   engine.resources.persistent = true;
   engine.resources.kvTier.copies = 64;
+  engine.resources.kvTier.copyRecreationStarts = 11;
+  engine.resources.kvTier.metadataWrites = {{{4096, 1, 0}, {128, 3, 1}, {64, 1, 0}}};
+  engine.resources.kvTier.diskReplacements = {1, 2, 3, 4, 5};
+  engine.resources.stateCache.diskCopyDrops = 6;
+  engine.resources.stateCache.diskCopyRecreationStarts = 3;
+  engine.resources.stateCache.diskCopyRecreations = 2;
   engine.resources.adoption = {2, 96, 4096, 1};
   engine.writeBehind = {1, 5, 3, 0};
   // Sliding windows that trim, and a target whose KV can spill: a request

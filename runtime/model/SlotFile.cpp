@@ -85,6 +85,7 @@ struct SlotFile::Backing {
   // (moveChunk), counting what moved in the budget's totals.
   bool load(std::span<std::byte> chunk, off_t offset) const noexcept;
   bool store(std::span<const std::byte> chunk, off_t offset) const noexcept;
+  bool record(std::span<const std::byte> bytes, off_t offset, MetadataWriteKind kind) const;
 
   // Marks a slot's blocks held; true when they were not.
   bool back(uint32_t index) {
@@ -267,12 +268,6 @@ bool moveChunk(Span chunk, off_t offset, Io io) {
   return true;
 }
 
-bool writeAll(int descriptor, std::span<const std::byte> bytes, off_t offset) {
-  return moveChunk(bytes, offset, [descriptor](const std::byte *data, size_t size, off_t at) {
-    return ::pwrite(descriptor, data, size, at);
-  });
-}
-
 bool readAll(int descriptor, std::span<std::byte> bytes, off_t offset) {
   return moveChunk(bytes, offset, [descriptor](std::byte *data, size_t size, off_t at) {
     return ::pread(descriptor, data, size, at);
@@ -453,6 +448,15 @@ uint64_t fileBytes(int descriptor, const char *what) {
 }
 } // namespace
 
+bool SlotFile::Backing::record(std::span<const std::byte> bytes, off_t offset,
+                               MetadataWriteKind kind) const {
+  return moveChunk(bytes, offset, [&](const std::byte *data, size_t size, off_t at) {
+    const auto count = ::pwrite(records, data, size, at);
+    budget->metadata_[static_cast<size_t>(kind)].record(count);
+    return count;
+  });
+}
+
 bool SlotFile::Backing::load(std::span<std::byte> chunk, off_t offset) const noexcept {
   return moveChunk(chunk, offset, [this](std::byte *data, size_t bytes, off_t at) {
     const auto count = ::pread(descriptor, data, bytes, at);
@@ -558,7 +562,7 @@ void SlotFile::open(const Persistence &persistence) {
       found != header) {
     // Written for something else, or new: start empty.
     if (::ftruncate(backing.descriptor, 0) < 0 || ::ftruncate(backing.records, 0) < 0 ||
-        !writeAll(backing.records, header, 0) ||
+        !backing.record(header, 0, MetadataWriteKind::Header) ||
         ::ftruncate(backing.records, kRecordsHeaderBytes) < 0)
       throw std::system_error(errno, std::generic_category(), "reset slot file");
     return;
@@ -713,7 +717,7 @@ void SlotFile::finishAdoption() {
                  stop = recordOffset(end, backing.recordBytes);
            offset < stop;) {
         const auto bytes = std::min<off_t>(stop - offset, static_cast<off_t>(cleared.size()));
-        if (!writeAll(backing.records, std::span(cleared).first(static_cast<size_t>(bytes)), offset)) {
+        if (!backing.record(std::span(cleared).first(static_cast<size_t>(bytes)), offset, MetadataWriteKind::Clear)) {
           reportRecordFailure(errno);
           break;
         }
@@ -744,10 +748,9 @@ void SlotFile::label(std::shared_ptr<Slot> slot, std::vector<std::byte> label) {
       [slot, label = std::move(label)](std::span<std::byte>, const std::atomic<bool> &) {
         const Backing &backing = *slot->backing_;
         if (!slot->written_.load(std::memory_order_relaxed)) return false;
-        return writeAll(backing.records,
-                        encodeRecord(backing.recordBytes, slot->payloadBytes_,
-                                     slot->checksums_, label),
-                        recordOffset(slot->index_, backing.recordBytes));
+        return backing.record(
+            encodeRecord(backing.recordBytes, slot->payloadBytes_, slot->checksums_, label),
+            recordOffset(slot->index_, backing.recordBytes), MetadataWriteKind::Label);
       },
       {}));
 }
@@ -840,8 +843,8 @@ void SlotFile::punchHole(uint32_t index) noexcept {
   // slot, which the next process frees. A record whose clearing failed names
   // a payload that is gone, and its slot's first read fails.
   if (backing.persistent)
-    static_cast<void>(writeAll(backing.records, backing.clearedRecord,
-                               recordOffset(index, backing.recordBytes)));
+    static_cast<void>(backing.record(backing.clearedRecord, recordOffset(index, backing.recordBytes),
+                                     MetadataWriteKind::Clear));
   // Slot offsets and sizes are whole alignment units, so whole blocks.
   fpunchhole_t hole{0, 0, slotOffset(index, backing.slotBytes),
                     static_cast<off_t>(backing.slotBytes)};

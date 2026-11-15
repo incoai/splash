@@ -9,13 +9,14 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from dev.tests import native_peer
-from dev.tests.server_fixtures import FakeRuntime, HarnessTestCase
 from server import backend as backend_api
 from server import protocol as wire
 from server import serve_options, supervision
 from server.chat_format import FLINT, QWEN
 from server.metrics import PROMETHEUS_SERIES, prometheus_metrics
+
+from dev.tests import native_peer
+from dev.tests.server_fixtures import FakeRuntime, HarnessTestCase
 
 # A representative status document, every section of it set, which
 # runtime_status_test.cpp checks the engine writes.
@@ -77,6 +78,27 @@ class StatusContractTests(unittest.TestCase):
                     leaf = leaf[key]
                 self.assertIsNotNone(leaf)
                 self.assertIn(path, paths)
+
+    def test_write_profiling_series_and_older_engines(self):
+        status = json.loads(GOLDEN.read_text())
+        metrics = prometheus_metrics(status)
+        self.assertIn("splash_disk_metadata_label_bytes_total 128\n", metrics)
+        self.assertIn("splash_disk_metadata_label_syscall_errors_total 1\n", metrics)
+        self.assertIn("splash_disk_copy_evictions_state_copy_total 2\n", metrics)
+        self.assertIn("splash_disk_kv_copy_recreation_starts_total 11\n", metrics)
+        self.assertIn("splash_state_disk_copy_recreation_starts_total 3\n", metrics)
+        self.assertIn("splash_state_disk_copy_recreations_total 2\n", metrics)
+        # Payload bytes keep their original meaning; metadata is not added.
+        self.assertIn("splash_disk_written_bytes_total 67890\n", metrics)
+        for key in ("metadata_writes", "copy_evictions", "kv_copy_recreation_starts"):
+            status["disk"].pop(key)
+        for key in ("disk_copy_drops", "disk_copy_recreation_starts", "disk_copy_recreations"):
+            status["state"].pop(key)
+        old = prometheus_metrics(status)
+        self.assertNotIn("splash_disk_metadata_", old)
+        self.assertNotIn("splash_disk_copy_evictions_", old)
+        self.assertNotIn("splash_state_disk_copy_", old)
+        self.assertNotIn("splash_disk_kv_copy_recreation_", old)
 
     def test_accounts_render_with_labels(self):
         status = json.loads(GOLDEN.read_text())
