@@ -13,8 +13,10 @@ using namespace mpp::tensor_ops;
 
 // Paged attention over INT8 or BF16 KV. INT8 has one fp32 scale per
 // (token, KV head); BF16 reads the stored values directly. The preceding
-// store writes current rows to their final slots; committed_tokens controls
-// visibility, and the next command overwrites a decode step's rejected rows.
+// store writes each row's K/V to its row's slot: a prompt row's is final, a
+// decode tree row's is its own row of the block, whose accepted path a commit
+// moves to the slots of its depths; committed_tokens controls visibility,
+// and the next command overwrites a decode step's rejected rows.
 //
 // A threadgroup owns one KV head, query tile (or a part of one,
 // splash_attention_tile_part) and history split. It processes the GQA group

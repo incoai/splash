@@ -10,9 +10,12 @@
 #include "metal/abi/KvExtent.h"
 
 // One full-attention layer's paged KV. Every current row is written directly
-// into its final page slot before attention, and every row reads its visible
-// history from the same paged representation. Decode accepts rows only by
-// advancing committed_tokens; the next command overwrites rejected slots.
+// into a page slot before attention, and every row reads its visible history
+// from the same paged representation. A decode step's rows sit at the slots
+// of their rows of the lane's block; acceptance moves the accepted path's rows
+// to the slots of their depths (SplashKvPathCommitParams), nothing for a
+// chain's, and advances committed_tokens; the next command overwrites the
+// slots past them.
 // Page tables hold one SplashKvPage per logical page, and kv places the layer
 // in the pool's extents; the host sets it for each layer it encodes.
 
@@ -140,6 +143,21 @@ struct SplashAttentionParams {
 
 static_assert(sizeof(SplashAttentionParams) == 24 + 48 * SPLASH_MAXIMUM_BATCH_WIDTH,
               "Attention parameters are the same size on both sides");
+
+// The commit of each lane's accepted path after a decode step
+// (ops::PagedAttention::addPathCommit): a step stores a lane's rows at the
+// slots of their rows of its block, committed_tokens[lane] plus the row, so
+// that siblings never collide, and the path's row at depth k then moves to
+// the slot of its depth, committed_tokens[lane] plus k, in each of the
+// pool's `regions` layer regions in extents of extent_pages pages.
+struct SplashKvPathCommitParams {
+  uint32_t extent_pages;
+  uint32_t regions;
+  uint32_t committed_tokens[SPLASH_MAXIMUM_BATCH_WIDTH];
+};
+
+static_assert(sizeof(SplashKvPathCommitParams) == 8 + 4 * SPLASH_MAXIMUM_BATCH_WIDTH,
+              "Path commit parameters are the same size on both sides");
 
 // A prefill whose history has pages that hold only their index reads one
 // layer's history staged (kernels/shared/kv_stage.metal, ops::PagedAttention::

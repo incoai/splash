@@ -2515,6 +2515,23 @@ struct Runtime::Impl {
         step, maximumRetained, geometry.target.stopTokens);
   }
 
+  // Each lane's accepted path's K/V at the slots of their depths
+  // (ops::PagedAttention::addPathCommit): the verify stored its block's rows
+  // at the slots of their rows, from the lane's position.
+  void encodeKvPathCommit(CommandGraph &graph, std::span<Request *const> entries,
+                          std::span<const ModelBatchItem> items, const ops::StepRows &step) {
+    std::array<MetalBuffer, kLaneCount> tables;
+    std::array<uint32_t, kLaneCount> committed{};
+    for (uint32_t lane = 0; lane < entries.size(); ++lane) {
+      tables[lane] = laneTables(entries[lane]->stateLane).pages;
+      committed[lane] = static_cast<uint32_t>(items[lane].logicalPosition);
+    }
+    const auto lanes = static_cast<uint32_t>(entries.size());
+    ops::PagedAttention::addPathCommit(graph, kvPages.layout(), kvPages.extentPages(), std::span(tables).first(lanes),
+                                       std::span(committed).first(lanes), step.laneCap,
+                                       decodeArena->batchSlice(DecodeTensor::RetainedRows, lanes));
+  }
+
   // The target's commit after acceptance (QwenTarget::addStateCommit): each
   // lane's auxiliary state after its retained rows. The GDN state folds the
   // retained rows into the lane's next step instead.
@@ -2575,13 +2592,15 @@ struct Runtime::Impl {
   }
 
   // A verify's selection, acceptance and commits, which end its cycle's last
-  // command: the target's state commit and the DFlash2 draft's, whose rings
-  // take the rows the lanes retained, and the states the lanes capture.
+  // command: the K/V of the paths the lanes accepted, the target's state
+  // commit and the DFlash2 draft's, whose rings take the rows the lanes
+  // retained, and the states the lanes capture.
   void encodeVerifyCommit(CommandGraph &graph, std::span<Request *const> entries,
                           std::span<const ModelBatchItem> items,
                           std::span<const uint32_t> maximumRetained, const ops::StepRows &step) {
     encodeTargetVerifyBatchPolicy(graph, entries, step);
     encodeBatchAcceptance(graph, entries, maximumRetained, step);
+    encodeKvPathCommit(graph, entries, items, step);
     encodeTargetStateCommit(graph, entries);
     encodeDraftStateCommitBatch(graph, entries, items, step);
     encodeDecodeCaptures(graph, entries, items, step);

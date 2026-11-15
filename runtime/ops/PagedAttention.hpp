@@ -313,6 +313,17 @@ public:
   static void addStageLayer(metal::CommandGraph &graph, SplashKvLayer poolLayer, metal::MetalBuffer poolTable,
                             SplashKvLayer stagedLayer, metal::MetalBuffer stagedTable, uint32_t firstPage,
                             uint32_t pages, kv::Layout layout);
+  // The commit of each lane's accepted path after a decode step stored its
+  // block's rows at the slots of their rows (SplashKvPathCommitParams): in
+  // every attention layer of `layout`, in extents of extentPages pages, the
+  // path's row at depth k moves from committed[lane] plus its row to
+  // committed[lane] plus k, through the lane's page table, which holds the
+  // slots of laneRows rows from committed[lane], the most rows a lane's
+  // block held. `paths` holds each lane's path (a row mask, metal/abi/
+  // VerifyTree.h), as acceptance wrote it; a chain's moves nothing.
+  static void addPathCommit(metal::CommandGraph &graph, kv::Layout layout, uint32_t extentPages,
+                            std::span<const metal::MetalBuffer> pageTables, std::span<const uint32_t> committed,
+                            uint32_t laneRows, const metal::MetalBuffer &paths);
 
 private:
   // Gathers a plan's sequences into dispatches that fit its workspace.

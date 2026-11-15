@@ -512,8 +512,9 @@ enum class DecodeTensor : uint32_t {
   ConstraintMasks,
   OutputTokens,
   RetainedCount,
-  // The mask of each lane's retained rows of its verify block, which
-  // acceptance writes (metal/abi/Sampling.h AcceptBatchParams).
+  // Each lane's accepted path, the mask of its retained rows of its verify
+  // block (metal/abi/VerifyTree.h), which acceptance writes (metal/abi/
+  // Sampling.h AcceptBatchParams) and the K/V path commit reads.
   RetainedRows,
   AcceptedCount,
   VerifyRows,

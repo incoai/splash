@@ -653,6 +653,28 @@ void PagedAttention::addBlockLists(metal::CommandGraph &graph, const metal::Meta
             {tiles, sequences.size(), 1}, {SPLASH_ATTENTION_BLOCK_LIST_THREADS, 1, 1});
 }
 
+void PagedAttention::addPathCommit(metal::CommandGraph &graph, kv::Layout layout, uint32_t extentPages,
+                                   std::span<const metal::MetalBuffer> pageTables,
+                                   std::span<const uint32_t> committed, uint32_t laneRows,
+                                   const metal::MetalBuffer &paths) {
+  const uint32_t lanes = static_cast<uint32_t>(committed.size());
+  if (!lanes || lanes > kMaximumSequences || pageTables.size() != lanes || !extentPages || !laneRows ||
+      laneRows > SPLASH_TARGET_VERIFY_ROWS)
+    throw std::invalid_argument("invalid KV path commit");
+  SplashKvPathCommitParams params{.extent_pages = extentPages, .regions = layout.attentionLayers, .committed_tokens = {}};
+  for (uint32_t lane = 0; lane < lanes; ++lane) {
+    const uint64_t pages = (uint64_t{committed[lane]} + laneRows + kv::kPageTokens - 1) / kv::kPageTokens;
+    requireBytes(pageTables[lane], pages * sizeof(SplashKvPage), "page table");
+    params.committed_tokens[lane] = committed[lane];
+  }
+  requireBytes(paths, uint64_t{lanes} * sizeof(uint32_t), "KV path commit paths");
+  const auto tables = laneBindings(pageTables);
+  std::vector<metal::MetalBuffer> bindings(tables.begin(), tables.end());
+  bindings.push_back(paths);
+  graph.add(kernelName(kernelFormat(layout) + "_commit", storeSuffix(layout)), std::move(bindings), params,
+            {uint64_t{layout.attentionLayers} * layout.kvHeads, lanes, 1}, {layout.headDimension, 1, 1});
+}
+
 void PagedAttention::addStageLayer(metal::CommandGraph &graph, SplashKvLayer poolLayer, metal::MetalBuffer poolTable,
                                    SplashKvLayer stagedLayer, metal::MetalBuffer stagedTable, uint32_t firstPage,
                                    uint32_t pages, kv::Layout layout) {

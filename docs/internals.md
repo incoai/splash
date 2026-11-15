@@ -479,7 +479,12 @@ to the lane's tape, and the lane's next step folds the path it accepted, a
 row mask, into the state. Its kernels hold eight rows of a lane's block and of
 its pending path, or sixteen (`_r16`) for a step whose lanes may hold more
 (`ops::verifyLaneCap`): over a layer's 8-row chains the 16-row kernels took
-13-19% longer (DRAM-cold, an M6), for their threadgroup memory.
+13-19% longer (DRAM-cold, an M6), for their threadgroup memory. Attention
+stores a block's K/V at the slots of its rows, so that siblings never
+collide; after acceptance the cycle moves each lane's accepted path's K/V to
+the slots of their depths in every attention layer
+(`ops::PagedAttention::addPathCommit`, reading acceptance's `RetainedRows`),
+which moves nothing for a chain's path.
 
 ### Kernel selection
 

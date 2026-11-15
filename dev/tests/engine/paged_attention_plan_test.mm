@@ -14,6 +14,7 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <cmath>
 #include <cstring>
 #include <functional>
@@ -1630,6 +1631,106 @@ void ropeTargetScaling(metal::MetalBackend &backend) {
 
 } // namespace
 
+// A decode step's commit of each lane's accepted path
+// (PagedAttention::addPathCommit): in every layer of a pool of three, the
+// path's row at depth k moves from its slot, committed plus its row, to
+// committed plus k: its keys, values and, INT8, both scales, each from the
+// bytes before the commit (lane 1's rows 2, 3 and 7 move to 1, 2 and 3,
+// where row 3's target is row 2's source). Every other byte of the pool stays: the
+// rows the path leaves, lanes whose paths are chains (lane 0 the anchor
+// alone, lane 3 every row) and the layers and heads around the moved ones.
+// Lanes' blocks straddle pages of three extents, through tables of
+// scattered pages.
+void checkPathCommit(metal::MetalBackend &backend, kv::Layout layout) {
+  layout.attentionLayers = 3;
+  const std::string what = std::string("KV path commit ") + std::string(kv::formatName(layout.format)) + " kv" +
+                           std::to_string(layout.kvHeads) + " d" + std::to_string(layout.headDimension) +
+                           (layout.valuesTokenMajor ? " token-major values" : "");
+  constexpr uint32_t kLanes = 4, kRows = SPLASH_TARGET_VERIFY_ROWS;
+  const std::array<uint32_t, kLanes> committed{0, 25, 63, 100};
+  const std::array<uint32_t, kLanes> paths{0b1, 0b10001101, 0b1000001000100001, ops::chainPath(kRows)};
+  std::array<std::vector<uint32_t>, kLanes> pages;
+  uint32_t total = 0;
+  for (uint32_t lane = 0; lane < kLanes; ++lane) total += (committed[lane] + kRows + kv::kPageTokens - 1) / kv::kPageTokens;
+  const HostKvExtents::Geometry geometry = HostKvExtents::spread(total);
+  HostKvExtents pool(backend, layout, geometry.extentPages, geometry.extents);
+  const std::vector<uint32_t> ids = HostKvExtents::mixedPages(geometry, total, 7);
+  std::array<metal::MetalBuffer, kLanes> tables;
+  for (uint32_t lane = 0, next = 0; lane < kLanes; ++lane) {
+    const uint32_t count = (committed[lane] + kRows + kv::kPageTokens - 1) / kv::kPageTokens;
+    pages[lane].assign(ids.begin() + next, ids.begin() + next + count);
+    next += count;
+    tables[lane] = test::sharedBuffer(backend, count * sizeof(SplashKvPage));
+    pool.writeTable(pages[lane], tables[lane]);
+  }
+  std::mt19937 random(layout.kvHeads * 131 + layout.headDimension + layout.valuesTokenMajor);
+  for (uint32_t extent = 0; extent < pool.extentCount(); ++extent)
+    for (std::byte &byte : pool.bytes(extent)) byte = std::byte(random());
+  std::vector<std::vector<std::byte>> expected;
+  for (uint32_t extent = 0; extent < pool.extentCount(); ++extent)
+    expected.emplace_back(pool.bytes(extent).begin(), pool.bytes(extent).end());
+  // The host's moves, from the bytes before them, into `expected`.
+  const uint64_t element = layout.format == kv::Format::Int8 ? 1 : 2;
+  const auto at = [&](std::vector<std::vector<std::byte>> &bytes, uint32_t lane, uint32_t layer, uint32_t tensor,
+                      uint32_t token, uint64_t offset) -> std::byte * {
+    const uint32_t page = pages[lane][token / kv::kPageTokens];
+    const std::byte *slab = pool.slab<std::byte>(layer, tensor, page);
+    const uint32_t extent = page / pool.extentPages();
+    return bytes[extent].data() + (slab - pool.bytes(extent).data()) + offset;
+  };
+  const std::vector<std::vector<std::byte>> before = expected;
+  auto source = before;
+  for (uint32_t lane = 0; lane < kLanes; ++lane)
+    for (uint32_t depth = 0, rows = paths[lane]; rows; ++depth, rows &= rows - 1) {
+      const uint32_t row = static_cast<uint32_t>(std::countr_zero(rows));
+      if (row == depth) continue;
+      const uint32_t from = committed[lane] + row, to = committed[lane] + depth;
+      for (uint32_t layer = 0; layer < layout.attentionLayers; ++layer)
+        for (uint32_t head = 0; head < layout.kvHeads; ++head) {
+          for (uint32_t dimension = 0; dimension < layout.headDimension; ++dimension) {
+            const uint64_t key = splash_kv_key_element(head, 0, dimension, layout.headDimension) * element;
+            std::copy_n(at(source, lane, layer, SPLASH_KV_KEYS, from,
+                           key + uint64_t{from % kv::kPageTokens} * layout.headDimension * element),
+                        element,
+                        at(expected, lane, layer, SPLASH_KV_KEYS, to,
+                           key + uint64_t{to % kv::kPageTokens} * layout.headDimension * element));
+            std::copy_n(at(source, lane, layer, SPLASH_KV_VALUES, from,
+                           pool.valueElement(head, from % kv::kPageTokens, dimension) * element),
+                        element,
+                        at(expected, lane, layer, SPLASH_KV_VALUES, to,
+                           pool.valueElement(head, to % kv::kPageTokens, dimension) * element));
+          }
+          if (layout.format == kv::Format::Int8)
+            for (const uint32_t tensor : {SPLASH_KV_KEY_SCALES, SPLASH_KV_VALUE_SCALES})
+              std::copy_n(at(source, lane, layer, tensor, from,
+                             splash_kv_scale_element(head, from % kv::kPageTokens) * sizeof(float)),
+                          sizeof(float),
+                          at(expected, lane, layer, tensor, to,
+                             splash_kv_scale_element(head, to % kv::kPageTokens) * sizeof(float)));
+        }
+    }
+  const metal::MetalBuffer pathBuffer = test::sharedBuffer(backend, sizeof(paths));
+  std::memcpy(pathBuffer.contents(), paths.data(), sizeof(paths));
+  metal::CommandGraph graph;
+  ops::PagedAttention::addPathCommit(graph, layout, pool.extentPages(), tables, committed, kRows, pathBuffer);
+  (void)backend.submitCommandAsync(graph.dispatches()).wait();
+  for (uint32_t extent = 0; extent < pool.extentCount(); ++extent)
+    require(std::equal(expected[extent].begin(), expected[extent].end(), pool.bytes(extent).begin()),
+            what + ": the pool is not the paths' rows moved to their depths and every other byte as it was");
+  require(expected != before, what + ": no path moved a row");
+  // The tables hold the slots of a block's rows from each lane's position,
+  // a lane's path holds its anchor's and rows of a block.
+  rejects(
+      [&] {
+        metal::CommandGraph refused;
+        const std::array<metal::MetalBuffer, 1> shorter{test::sharedBuffer(backend, sizeof(SplashKvPage))};
+        ops::PagedAttention::addPathCommit(refused, layout, pool.extentPages(), shorter, std::array{31U}, 2,
+                                           pathBuffer);
+      },
+      "page table buffer holds", what + ": a table short of a block's slots was accepted");
+  std::cout << what << ": PASS\n";
+}
+
 int main(int argc, char **argv) {
   try {
     require(argc >= 1 && argc <= 3, "usage: paged-attention-plan [METALLIB [--long]]");
@@ -1645,6 +1746,17 @@ int main(int argc, char **argv) {
     }
     metal::MetalBackend backend(argv[1]);
     checkBf16StoreEdges(backend);
+    for (auto format : {kv::Format::Int8, kv::Format::BFloat16})
+      for (const kv::Layout layout :
+           {kv::Layout{.attentionLayers = 1, .kvHeads = 4, .headDimension = 256},
+            kv::Layout{.attentionLayers = 1, .kvHeads = 2, .headDimension = 256},
+            kv::Layout{.attentionLayers = 1, .kvHeads = 4, .headDimension = 128},
+            kv::Layout{.attentionLayers = 1, .kvHeads = 2, .headDimension = 256, .valuesTokenMajor = true,
+                       .reads = kv::Reads::SelectedBlocks}}) {
+        kv::Layout formatted = layout;
+        formatted.format = format;
+        checkPathCommit(backend, formatted);
+      }
     ropeExtents(backend);
     ropeRangeMatchesPositions(backend);
     ropeTargetScaling(backend);
