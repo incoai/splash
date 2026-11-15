@@ -33,6 +33,8 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
+#include <chrono>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -44,6 +46,7 @@
 #include <iterator>
 #include <limits>
 #include <memory>
+#include <numeric>
 #include <optional>
 #include <random>
 #include <span>
@@ -131,12 +134,15 @@ public:
     const auto next = model::RuntimeInstrumentation::pendingToken(runtime_, result.requestId);
     require(next.has_value(), "penalty probe has no selected continuation");
     const size_t retained = result.outputTokens.size() - result.outputTokensWithoutKv;
-    require(retained > 0 && retained <= model::ExecutionLimits::decodeLaneRows,
-            "penalty probe retention is outside the verified rows");
-    for (size_t index = 0; index < retained; ++index) {
+    // The retained rows are a path of the lane's tree, in depth order.
+    const uint32_t path = model::RuntimeInstrumentation::lastRetainedRows(runtime_, 0);
+    require(retained > 0 && std::popcount(path) == static_cast<int>(retained) && (path & 1),
+            "penalty probe retention is not a path of the verified rows");
+    size_t index = 0;
+    for (uint32_t rows = path; rows; rows &= rows - 1, ++index) {
       const uint32_t selected = index + 1 < retained ? result.outputTokens[index + 1] : *next;
-      row(index, selected);
-      ++counts_.at(selected); // Accepted proposal prefix for the next row.
+      row(std::countr_zero(rows), selected);
+      ++counts_.at(selected); // Accepted path prefix for the next row.
     }
     if (result.outputTokensWithoutKv)
       require(result.outputTokens.back() == *next, "terminal penalty anchor changed");
@@ -750,6 +756,50 @@ std::vector<uint32_t> singletonMasks(std::span<const uint32_t> tokens) {
         1U << (tokens[row] % 32);
   }
   return result;
+}
+
+// The depth of each row of a mask request's tree, its anchor's 0.
+std::vector<uint32_t> maskDepths(const ModelMaskRequest &request) {
+  std::vector<uint32_t> depths(request.simulationTokens.size(), 0);
+  for (size_t row = 1; row < depths.size(); ++row) depths[row] = depths.at(request.parents.at(row)) + 1;
+  return depths;
+}
+
+// The rows of a mask request's tree down `path`, its tokens from the
+// anchor's on; the tree must hold the path.
+std::vector<uint32_t> pathRows(const ModelMaskRequest &request, std::span<const uint32_t> path) {
+  const std::vector<uint32_t> &tokens = request.simulationTokens;
+  require(!path.empty() && !tokens.empty() && tokens.front() == path.front(),
+          "a mask request's anchor is not its path's first token");
+  std::vector<uint32_t> rows{0};
+  for (uint32_t row = 1; row < tokens.size() && rows.size() < path.size(); ++row)
+    if (request.parents.at(row) == rows.back() && tokens[row] == path[rows.size()]) rows.push_back(row);
+  require(rows.size() == path.size(), "a mask request's tree does not hold the committed path");
+  return rows;
+}
+
+// The least token from `from` on that no child of a tree's row is.
+uint32_t unlikeChildren(const ModelMaskRequest &request, uint32_t row, uint32_t from) {
+  for (uint32_t child = 1; child < request.simulationTokens.size(); ++child)
+    if (request.parents.at(child) == row && request.simulationTokens[child] == from)
+      return unlikeChildren(request, row, from + 1);
+  return from;
+}
+
+// Singleton masks of a mask request's tree, one before its anchor and one
+// after each of its rows, that walk it down `path`: before the anchor
+// path[0], after the path's row of depth d path[d + 1], after its last row
+// `after`, which no child of that row may be, so the walk ends there, and
+// `other` after every row off the path.
+std::vector<uint32_t> pathMasks(const ModelMaskRequest &request, std::span<const uint32_t> path, uint32_t after,
+                                uint32_t other) {
+  const std::vector<uint32_t> rows = pathRows(request, path);
+  require(unlikeChildren(request, rows.back(), after) == after, "a path's last token is one of its row's children");
+  std::vector<uint32_t> tokens(request.simulationTokens.size() + 1, other);
+  tokens[0] = path[0];
+  for (size_t depth = 0; depth + 1 < rows.size(); ++depth) tokens[1 + rows[depth]] = path[depth + 1];
+  tokens[1 + rows.back()] = after;
+  return singletonMasks(tokens);
 }
 
 // Gives the request a mask the runtime must take.
@@ -2219,11 +2269,12 @@ void requireNonFiniteRowFailsOnlyItsLane(model::Runtime &executor,
 // generated `count` tokens or finished; each one's generated tokens, its
 // first, the prefill's selection, included, the decode cycle that returned
 // each, and each cycle's anchor, the first token it returned, by index, with
-// its drafted tokens.
+// its drafted tokens and the tokens of the lookup chain it proposed.
 struct JointDecode final {
   std::vector<uint32_t> tokens;
   std::vector<uint32_t> cycles;
   std::vector<std::pair<size_t, uint32_t>> drafts;
+  std::vector<uint32_t> lookups;
 };
 std::vector<JointDecode>
 decodeTogether(model::Runtime &executor, std::span<const uint64_t> ids,
@@ -2254,6 +2305,8 @@ decodeTogether(model::Runtime &executor, std::span<const uint64_t> ids,
               "a joint decode accepted more draft tokens than it drafted");
       JointDecode &decoded = generated[lanes[index]];
       decoded.drafts.emplace_back(decoded.tokens.size(), results[index].draftedTokens);
+      decoded.lookups.push_back(
+          static_cast<uint32_t>(model::RuntimeInstrumentation::lookupChain(executor, ids[lanes[index]]).size()));
       decoded.tokens.insert(decoded.tokens.end(), results[index].outputTokens.begin(),
                             results[index].outputTokens.end());
       decoded.cycles.resize(decoded.tokens.size(), cycle);
@@ -2319,12 +2372,16 @@ void requireThinkingBudgetClosesThinking(model::Runtime &executor) {
           // proposes the end tokens left, a chain of its own, and none of the
           // draft's: the draft's proposals past them guess at its own thinking
           // path, not at the end, so its tree takes none. Every other cycle
-          // proposes the draft's.
+          // proposes the draft's, before the end as many as the thinking
+          // tokens left past its anchor, whose rows the end's cutoff leaves.
           for (const auto &[anchor, drafted] : generated[lane].drafts) {
             const uint32_t committed = static_cast<uint32_t>(anchor) + 1;
             const bool ends = committed >= first && committed < first + length;
-            require(drafted == (ends ? 0 : model::ExecutionLimits::draftProposalTokens),
-                    "a cycle counted the end tokens it proposed as the draft's");
+            const uint32_t proposals = std::min(model::ExecutionLimits::draftProposalTokens,
+                                                committed < first ? first - committed : ~0U);
+            require(drafted == (ends ? 0 : proposals),
+                    "a cycle counted the end tokens it proposed as the draft's, or proposed past the thinking "
+                    "it had left: " + std::to_string(drafted) + " drafted at token " + std::to_string(committed));
           }
         }
         for (const uint64_t id : ids)
@@ -2333,6 +2390,53 @@ void requireThinkingBudgetClosesThinking(model::Runtime &executor) {
     }
   }
   std::cout << "thinking_budget=PASS most_end_cycles=" << mostEndCycles << "\n";
+}
+
+// A lane thinking under a budget proposes its lookup chain as a lane without
+// one does, and grows its tree, no deeper than the thinking tokens it has
+// left: the row at which the budget's end begins selects the end whatever a
+// row below it proposed. The thinking test's prompt, whose reasoning
+// repeats its own words, gives the lane without a budget lookup chains too,
+// which shows the prompt holds them; a lane of five thinking tokens left
+// verifies no more than six rows of a step of sixteen.
+void requireThinkingBudgetKeepsLookupChains(model::Runtime &executor) {
+  const std::vector<uint32_t> &prompt = targetTokens->thinkingPrompt;
+  const std::array<std::vector<uint32_t>, 2> pageTables{pageRange(108, 8), pageRange(116, 8)};
+  const std::array<uint64_t, 2> ids{311, 312};
+  constexpr uint32_t kBudget = 120;
+  for (size_t lane = 0; lane < ids.size(); ++lane) {
+    EngineRequest request = makeRequest(ids[lane], prompt, kBudget + 8);
+    if (!lane)
+      request.thinkingBudget = ThinkingBudget{kBudget, targetTokens->thinkingEnds[0], targetTokens->thinkEnd};
+    beginCold(executor, request, static_cast<uint32_t>(lane));
+    requireOpen(prefillChunk(executor, ids[lane], 0, prompt, pageTables[lane]), "lookup chain fixture");
+  }
+  const auto generated = decodeTogether(executor, ids, static_cast<uint32_t>(prompt.size()), pageTables, kBudget);
+  std::array<uint32_t, 2> chained{};
+  for (size_t lane = 0; lane < ids.size(); ++lane)
+    for (size_t cycle = 0; cycle < generated[lane].drafts.size(); ++cycle) {
+      const size_t anchor = generated[lane].drafts[cycle].first;
+      const uint32_t chain = generated[lane].lookups[cycle];
+      chained[lane] += chain != 0;
+      require(lane || anchor + chain < kBudget, "a lane thinking under a budget proposed a lookup chain past its end");
+    }
+  require(chained[1] != 0, "the lookup chain fixture's prompt gave a lane no lookup chain");
+  require(chained[0] != 0, "a lane thinking under a budget proposed no lookup chain");
+  for (const uint64_t id : ids)
+    executor.end(id);
+  EngineRequest request = makeRequest(313, prompt, 32);
+  request.thinkingBudget = ThinkingBudget{6, targetTokens->thinkingEnds[0], targetTokens->thinkEnd};
+  beginCold(executor, request, 0);
+  requireOpen(prefillChunk(executor, request.id, 0, prompt, pageTables[0]), "thinking tree fixture");
+  model::RuntimeInstrumentation::forceStepRows(executor, model::ExecutionLimits::targetVerifyRows);
+  const ModelStepResult cycle =
+      decodeOne(executor, request.id, static_cast<uint32_t>(prompt.size()), pageTables[0]);
+  model::RuntimeInstrumentation::forceStepRows(executor, std::nullopt);
+  const uint32_t verified = model::RuntimeInstrumentation::lastVerifyRows(executor, 0);
+  require(cycle.failure.empty() && verified > 1 && verified <= 6,
+          "a lane of five thinking tokens left verified " + std::to_string(verified) + " rows");
+  executor.end(request.id);
+  std::cout << "thinking_budget_lookup=PASS cycles_with_chains=" << chained[0] << "/" << chained[1] << "\n";
 }
 
 // Decodes constrained requests together as decodeTogether does, from the
@@ -2372,13 +2476,15 @@ decodeConstrainedTogether(model::Runtime &executor, std::span<const uint64_t> id
     PendingMaskedDecode pending = beginMaskedDecode(executor, plan, items);
     require(pending.maskRequests.size() == lanes.size(), "a constrained joint decode lost a mask request");
     // The rows of a lane's mask: at its anchor's position, then after each
-    // simulated token.
+    // simulated token, at the position past its depth in the lane's tree.
     for (const ModelMaskRequest &request : pending.maskRequests) {
       const size_t index = std::ranges::find(ids, request.requestId) - ids.begin();
       const uint32_t anchor = static_cast<uint32_t>(generated[index].tokens.size());
+      std::vector<uint32_t> depths(request.simulationTokens.size(), 0);
+      for (size_t row = 1; row < depths.size(); ++row) depths[row] = depths.at(request.parents[row]) + 1;
       std::vector<uint32_t> words;
-      for (uint32_t row = 0; row <= request.simulationTokens.size(); ++row)
-        std::ranges::copy(maskAt(index, anchor + row), std::back_inserter(words));
+      std::ranges::copy(maskAt(index, anchor), std::back_inserter(words));
+      for (const uint32_t depth : depths) std::ranges::copy(maskAt(index, anchor + depth + 1), std::back_inserter(words));
       provideMask(executor, request.requestId, words);
     }
     const std::vector<ModelStepResult> results = finishMaskedDecode(std::move(pending));
@@ -2463,12 +2569,18 @@ void requireConstrainedThinkingEndWaitsForItsMask(model::Runtime &executor) {
           // Only a cycle whose anchor is the end's first token or one after
           // it, before the close, proposes the end tokens left, and none of
           // the draft's, whose proposals past them guess at its own thinking
-          // path, not at the end.
+          // path, not at the end. Every other cycle proposes the draft's,
+          // before the budget runs out as many as the thinking tokens left
+          // past its anchor, whose rows the end's cutoff leaves.
+          const uint32_t budgeted = *budgets[lane];
           for (const auto &[anchor, drafted] : generated[lane].drafts) {
             const uint32_t committed = static_cast<uint32_t>(anchor) + 1;
             const bool ends = committed > start && committed < start + length;
-            require(drafted == (ends ? 0 : proposals),
-                    "a constrained cycle counted the end tokens it proposed as the draft's");
+            const uint32_t own = std::min(proposals, committed < budgeted ? budgeted - committed : ~0U);
+            require(drafted == (ends ? 0 : own),
+                    "a constrained cycle counted the end tokens it proposed as the draft's, or proposed past "
+                    "the thinking it had left: " + std::to_string(drafted) + " drafted at token " +
+                        std::to_string(committed));
           }
         }
         for (const uint64_t id : ids)
@@ -2477,6 +2589,28 @@ void requireConstrainedThinkingEndWaitsForItsMask(model::Runtime &executor) {
     }
   }
   std::cout << "constrained_thinking_budget=PASS\n";
+}
+
+// Under --verify-rows all a cycle verifies every row of a draft's block a
+// lane that its output limit leaves: a lane of 2 to 7 tokens left verifies
+// that many rows, drafting one fewer, as its tree holds no more rows than a
+// walk of it may retain (siblings at its depth filled a block of 8).
+void requireCyclesVerifyTheirOutputLeft(model::Runtime &executor) {
+  const std::vector<uint32_t> &prompt = targetTokens->thinkingPrompt;
+  const std::vector<uint32_t> pages = pageRange(108, 4);
+  for (const uint32_t left : {2U, 3U, 5U, 7U}) {
+    EngineRequest request = makeRequest(340 + left, prompt, left);
+    request.flags = RequestIgnoreEndOfSequence;
+    beginCold(executor, request, 0);
+    requireOpen(prefillChunk(executor, request.id, 0, prompt, pages), "an output limit's fixture");
+    const ModelStepResult cycle = decodeOne(executor, request.id, prompt.size(), pages);
+    const uint32_t rows = model::RuntimeInstrumentation::lastVerifyRows(executor, 0);
+    executor.end(request.id);
+    require(rows == left && cycle.draftedTokens == left - 1,
+            "a cycle of " + std::to_string(left) + " tokens left verified " + std::to_string(rows) +
+                " rows and drafted " + std::to_string(cycle.draftedTokens));
+  }
+  std::cout << "output_left_rows=PASS\n";
 }
 
 // A thinking budget of 0 ends thinking from the first token: the first cycle
@@ -3503,11 +3637,12 @@ void requireConstrainedLaneSharesDecode(model::Runtime &executor, const model::Q
   std::cout << "constrained_lane_shares_decode=PASS\n";
 }
 
-// A constrained lane whose output budget leaves it fewer rows than a draft
-// block verifies those rows alone, and its mask request simulates their
-// tokens alone: the runtime takes the masks the server answers it with, one
-// at its anchor and one after each simulated token, and the lane decodes to
-// its budget. Its masks admit every token but the stop tokens.
+// A constrained lane whose output budget leaves it fewer tokens than a draft
+// block's rows verifies a tree no deeper than they, and its mask request
+// simulates its rows' tokens alone: the runtime takes the masks the server
+// answers it with, one at its anchor and one after each simulated token, and
+// the lane decodes to its budget. Its masks admit every token but the stop
+// tokens.
 void requireConstrainedLaneTakesTheMasksItAskedFor(model::Runtime &executor,
                                                    const model::ModelDescriptor &descriptor,
                                                    std::span<const uint32_t> seed) {
@@ -3539,8 +3674,12 @@ void requireConstrainedLaneTakesTheMasksItAskedFor(model::Runtime &executor,
   for (bool finished = false; !finished && tokens.size() < kBudget;) {
     PendingMaskedDecode pending = beginMaskedDecodeOne(executor, request.id, kPromptTokens + tokens.size(), pages);
     require(pending.maskRequests.size() == 1, "a constrained cycle did not ask for its lane's mask");
-    const size_t simulated = pending.maskRequests[0].simulationTokens.size();
-    require(simulated >= 1 && simulated <= kBudget - tokens.size(),
+    // Its tree's rows are no deeper than its output budget leaves.
+    const ModelMaskRequest &asked = pending.maskRequests[0];
+    const size_t simulated = asked.simulationTokens.size();
+    std::vector<uint32_t> depths(simulated, 0);
+    for (size_t row = 1; row < simulated; ++row) depths[row] = depths.at(asked.parents[row]) + 1;
+    require(simulated >= 1 && *std::ranges::max_element(depths) < kBudget - tokens.size(),
             "a constrained cycle simulated rows its lane's output budget does not leave");
     fewest = std::min(fewest, static_cast<uint32_t>(simulated));
     provideMask(executor, request.id, admitting(simulated + 1));
@@ -3553,6 +3692,498 @@ void requireConstrainedLaneTakesTheMasksItAskedFor(model::Runtime &executor,
           "the constrained lane did not decode to its budget on fewer rows than a block's");
   executor.end(request.id);
   std::cout << "constrained_lane_masks_asked_for=PASS fewest_rows=" << fewest << "\n";
+}
+
+// A constrained lane's grammar run, the tokens its grammar forced after the
+// path the lane retained (model::forcedAfter), is its next cycle's proposals
+// alone, as a thinking end is: beside a forced token the draft's rows are
+// dead, so the lane grows no tree beside the run, and in a step of a verify
+// block's rows it verifies its anchor and the run, which its mask request
+// simulates as a chain.
+void requireForcedChainGrowsNoTree(model::Runtime &executor, const model::ModelDescriptor &descriptor,
+                                   std::span<const uint32_t> seed) {
+  constexpr uint32_t kPromptTokens = 64, kBudget = 16;
+  const uint32_t maskWords = targetTokens->maskWords();
+  const ops::StopTokens stops =
+      std::visit([](const auto &layout) { return layout.stopTokens; }, descriptor.target);
+  const auto admitting = [&](size_t rows) {
+    std::vector<uint32_t> words(rows * maskWords, ~0U);
+    for (size_t row = 0; row < rows; ++row)
+      for (const uint32_t stop : stops.tokens())
+        words[row * maskWords + stop / 32] &= ~(1U << (stop % 32));
+    return words;
+  };
+  std::vector<uint32_t> prompt(kPromptTokens), run;
+  for (uint32_t index = 0; index < kPromptTokens; ++index)
+    prompt[index] = seed[(index + 31) % seed.size()];
+  for (const uint32_t token : seed)
+    if (run.size() < 4 && !stops.contains(token))
+      run.push_back(token);
+  EngineRequest request = makeRequest(941, prompt, kBudget);
+  request.constraint = ConstraintMode::TokenMask;
+  const std::vector<uint32_t> pages = pageRange(40, (kPromptTokens + kBudget + kv::kPageTokens - 1) / kv::kPageTokens);
+  beginCold(executor, request, 0);
+  require(prefillChunk(executor, request.id, 0, prompt, pages).nextDecodeStage == DecodeStage::ApplyInitialMask,
+          "a forced run's prompt did not ask for its first mask");
+  provideMask(executor, request.id, admitting(1));
+  static_cast<void>(decodeOne(executor, request.id, kPromptTokens, pages, DecodeStage::ApplyInitialMask));
+  // A cycle of the anchor alone, after which the grammar forces the run: its
+  // selection the run's first token, the run past it the next cycle's chain.
+  model::RuntimeInstrumentation::forceStepRows(executor, 1);
+  PendingMaskedDecode first = beginMaskedDecodeOne(executor, request.id, kPromptTokens, pages);
+  require(first.maskRequests.size() == 1 && first.maskRequests[0].simulationTokens.size() == 1,
+          "a one-row step's mask request simulated other than its anchor");
+  std::vector<uint32_t> words = admitting(2), forced;
+  std::fill_n(words.begin() + maskWords, maskWords, 0U);
+  words[maskWords + run[0] / 32] = 1U << (run[0] % 32);
+  for (const uint32_t token : run) {
+    forced.push_back(1);
+    forced.push_back(token);
+  }
+  const std::optional<std::string> rejected = executor.provideMask(request.id, words, forced);
+  require(!rejected, "the runtime rejected a grammar's forced run: " + rejected.value_or(""));
+  const std::vector<ModelStepResult> taken = finishMaskedDecode(std::move(first));
+  require(taken.size() == 1 && taken[0].failure.empty() && !taken[0].finished, "a forced run's first cycle failed");
+  model::RuntimeInstrumentation::forceStepRows(executor, model::ExecutionLimits::targetVerifyRows);
+  PendingMaskedDecode next = beginMaskedDecodeOne(executor, request.id, kPromptTokens + 1, pages);
+  const ModelMaskRequest asked = next.maskRequests.at(0);
+  bool chain = asked.simulationTokens == run;
+  for (size_t row = 1; row < asked.parents.size(); ++row) chain = chain && asked.parents[row] == row - 1;
+  require(chain, "a lane's forced run grew a tree beside it: its mask request simulated " +
+                     std::to_string(asked.simulationTokens.size()) + " rows");
+  // Its masks admit the run alone, as its grammar's do, and after it every
+  // token but the stop tokens.
+  std::vector<uint32_t> runWords = admitting(asked.simulationTokens.size() + 1);
+  for (size_t at = 1; at < run.size(); ++at) {
+    std::fill_n(runWords.begin() + static_cast<std::ptrdiff_t>(at * maskWords), maskWords, 0U);
+    runWords[at * maskWords + run[at] / 32] = 1U << (run[at] % 32);
+  }
+  provideMask(executor, request.id, runWords);
+  const std::vector<ModelStepResult> done = finishMaskedDecode(std::move(next));
+  model::RuntimeInstrumentation::forceStepRows(executor, std::nullopt);
+  require(done.size() == 1 && done[0].failure.empty() && done[0].outputTokens.size() == run.size(),
+          "a lane did not retain its forced run");
+  executor.end(request.id);
+  std::cout << "forced_chain_grows_no_tree=PASS rows=" << asked.simulationTokens.size() << "\n";
+}
+
+// The tokens a grammar forces, which the server sends with a mask as pairs of
+// a mask row and a token (Runtime::provideMask), are a constrained lane's next
+// host chain where the selection after that row's path begins them: its next
+// cycle's mask request starts with them, a chain from its anchor (parents 0,
+// 1, ...), and the cycle retains them where its masks select them. The lane's
+// first mask, of one row, admits a alone and forces a, then f1 to f3; its
+// first cycle walks a to f3, selects b after f3, and its masks force b, then
+// g1 and g2, after the path's last row (its mask row 4, the row after the
+// deepest retained row); the next cycle starts with b, g1 and g2 and retains
+// them. The tokens occur nowhere in the prompt, which no lookup chain could
+// then propose.
+void requireGrammarChainsAreVerified(model::Runtime &executor, const model::ModelDescriptor &descriptor,
+                                     std::span<const uint32_t> seed) {
+  constexpr uint32_t kPromptTokens = 64, kBudget = 16;
+  const ops::StopTokens stops =
+      std::visit([](const auto &layout) { return layout.stopTokens; }, descriptor.target);
+  std::vector<uint32_t> prompt(kPromptTokens);
+  for (uint32_t index = 0; index < kPromptTokens; ++index) prompt[index] = seed[(index + 31) % seed.size()];
+  // Tokens a, f1 to f3, b, g1, g2, a cycle's last selection and the
+  // selection after every row off a walked path.
+  std::vector<uint32_t> fresh;
+  for (uint32_t token = 1000; fresh.size() < 9; ++token)
+    if (!stops.contains(token) && std::ranges::find(prompt, token) == prompt.end()) fresh.push_back(token);
+  const uint32_t a = fresh[0], b = fresh[4], last = fresh[7], other = fresh[8];
+  const std::vector<uint32_t> first{a, fresh[1], fresh[2], fresh[3]}, second{b, fresh[5], fresh[6]};
+  // Pairs of mask row `row` and each of `tokens`.
+  const auto forcedAt = [](uint32_t row, std::span<const uint32_t> tokens) {
+    std::vector<uint32_t> pairs;
+    for (const uint32_t token : tokens) pairs.insert(pairs.end(), {row, token});
+    return pairs;
+  };
+  const auto answer = [&](uint64_t id, std::span<const uint32_t> words, std::span<const uint32_t> forced) {
+    const std::optional<std::string> rejected = executor.provideMask(id, words, forced);
+    require(!rejected, "grammar chains: the runtime rejected a mask and its forced tokens: " + rejected.value_or(""));
+  };
+  EngineRequest request = makeRequest(945, prompt, kBudget);
+  request.constraint = ConstraintMode::TokenMask;
+  const std::vector<uint32_t> pages = pageRange(40, (kPromptTokens + kBudget + kv::kPageTokens - 1) / kv::kPageTokens);
+  beginCold(executor, request, 0);
+  require(prefillChunk(executor, request.id, 0, prompt, pages).nextDecodeStage == DecodeStage::ApplyInitialMask,
+          "grammar chains: a constrained lane's prompt did not ask for its first mask");
+  answer(request.id, singletonMasks(std::array{a}), forcedAt(0, first));
+  static_cast<void>(decodeOne(executor, request.id, kPromptTokens, pages, DecodeStage::ApplyInitialMask));
+  require(model::RuntimeInstrumentation::pendingToken(executor, request.id) == a,
+          "grammar chains: the first token is not the one its mask admits");
+  // A cycle whose request must start with `chain`, its masks walking it and
+  // selecting `after` past it, with `forced` after its last row; it commits
+  // the chain.
+  uint64_t position = kPromptTokens;
+  const auto cycle = [&](std::span<const uint32_t> chain, uint32_t after, std::span<const uint32_t> forced,
+                         const std::string &label) {
+    PendingMaskedDecode pending = beginMaskedDecodeOne(executor, request.id, position, pages);
+    require(pending.maskRequests.size() == 1, label + ": the constrained cycle did not ask for its lane's mask");
+    const ModelMaskRequest &asked = pending.maskRequests[0];
+    bool starts = asked.simulationTokens.size() >= chain.size();
+    for (uint32_t row = 0; row < chain.size() && starts; ++row)
+      starts = asked.simulationTokens[row] == chain[row] && (!row || asked.parents.at(row) == row - 1);
+    require(starts, label + ": the mask request does not start with the grammar's forced tokens as a chain");
+    // Singleton masks that walk the chain: before the anchor its token,
+    // after each chain row the next one's, after the last `after`, which
+    // none of that row's children is, so the walk ends there, and `other`
+    // after every row off the chain.
+    const auto lastRow = static_cast<uint32_t>(chain.size() - 1);
+    for (uint32_t row = 1; row < asked.simulationTokens.size(); ++row)
+      require(asked.parents.at(row) != lastRow || asked.simulationTokens[row] != after,
+              label + ": a child of the chain's last row is the token selected after it");
+    std::vector<uint32_t> selected(asked.simulationTokens.size() + 1, other);
+    std::ranges::copy(chain, selected.begin());
+    selected[chain.size()] = after;
+    answer(request.id, singletonMasks(selected), forcedAt(lastRow + 1, forced));
+    const std::vector<ModelStepResult> results = finishMaskedDecode(std::move(pending));
+    require(results.size() == 1 && results[0].failure.empty() && !results[0].finished &&
+                std::ranges::equal(results[0].outputTokens, chain),
+            label + ": the cycle did not retain the forced chain");
+    position += chain.size();
+  };
+  // b begins the tokens forced after the first cycle's path, g1 and g2 the
+  // next cycle's chain.
+  cycle(first, b, second, "grammar chains, the first mask's");
+  cycle(second, last, {}, "grammar chains, a verify mask's");
+  executor.end(request.id);
+  std::cout << "grammar_chains_verified=PASS\n";
+}
+
+// A lane whose retained path branches commits what decoding its tokens one
+// row a cycle, a chain, commits. Two, three and four constrained greedy lanes
+// end their prompts two tokens before a page boundary and decode a step of
+// sixteen rows a lane: each lane's masks force its selections down its
+// tree's path through a row's second child, as deep as the tree goes, so the
+// path branches and the path commit moves its rows' K/V across the boundary;
+// each lane captures its state at the boundary where the target captures in
+// decode (Runtime::capturesInDecode). Each lane's tokens are then decoded
+// again alone, one row a cycle, each selection forced to the same token,
+// capturing at the boundary too. A cycle of a row a lane more, and the first
+// selection of a request restored from each capture, give each lane's logits
+// within `bound` (cosine) of the chain's.
+void requireBranchedPathsMatchChains(model::Runtime &executor, const model::ModelDescriptor &descriptor,
+                                     std::span<const uint32_t> seed, double bound) {
+  constexpr uint32_t kBoundary = kv::kPageTokens, kPrompt = kBoundary - 2, kBudget = 32;
+  const uint32_t maskWords = targetTokens->maskWords();
+  const bool captures = executor.capturesInDecode();
+  const ops::StopTokens stops =
+      std::visit([](const auto &layout) { return layout.stopTokens; }, descriptor.target);
+  // Rows' masks admitting every token but the stop tokens; row `row`'s
+  // admitting `token` alone.
+  const auto admitting = [&](size_t rows) {
+    std::vector<uint32_t> words(rows * maskWords, ~0U);
+    for (size_t row = 0; row < rows; ++row)
+      for (const uint32_t stop : stops.tokens())
+        words[row * maskWords + stop / 32] &= ~(1U << (stop % 32));
+    return words;
+  };
+  const auto force = [&](std::vector<uint32_t> &words, size_t row, uint32_t token) {
+    std::fill_n(words.begin() + static_cast<std::ptrdiff_t>(row * maskWords), maskWords, 0U);
+    words[row * maskWords + token / 32] = 1U << (token % 32);
+  };
+  const auto cosine = [](std::span<const float> left, std::span<const float> right) {
+    require(left.size() == right.size() && !left.empty(), "branched paths: logits of two shapes");
+    SimilarityAccumulator accumulator;
+    for (size_t index = 0; index < left.size(); ++index) accumulator.add(left[index], right[index]);
+    return accumulator.result().cosine;
+  };
+  const auto prompt = [&](uint32_t lane) {
+    std::vector<uint32_t> tokens(kPrompt);
+    for (uint32_t index = 0; index < kPrompt; ++index) tokens[index] = seed[(index + 13 * lane) % seed.size()];
+    return tokens;
+  };
+  struct Lane final {
+    uint64_t id = 0;
+    uint32_t index = 0;
+    std::vector<uint32_t> pages;
+    uint64_t position = kPrompt;
+    std::vector<uint32_t> tokens;
+    std::shared_ptr<const CompositeState> capture;
+  };
+  // A lane of prompt `index` in state lane `stateLane` to its first token,
+  // admitted; with `replay`, restored from `capture` at the boundary and its
+  // replayed rows prefilled after it.
+  const auto start = [&](uint64_t id, uint32_t index, uint32_t stateLane, std::vector<uint32_t> pages,
+                         std::span<const uint32_t> replay = {}, std::shared_ptr<const CompositeState> capture = {}) {
+    Lane lane;
+    lane.id = id;
+    lane.index = index;
+    lane.pages = std::move(pages);
+    std::vector<uint32_t> tokens = prompt(index);
+    tokens.insert(tokens.end(), replay.begin(), replay.end());
+    EngineRequest request = makeRequest(id, tokens, kBudget);
+    request.constraint = ConstraintMode::TokenMask;
+    beginCold(executor, request, stateLane);
+    const uint32_t first = capture ? kBoundary : 0;
+    if (capture) restoreActivePrefix(executor, id, static_cast<uint32_t>(tokens.size()), kBoundary, capture);
+    require(prefillChunk(executor, id, first, std::span(tokens).subspan(first), lane.pages).nextDecodeStage ==
+                DecodeStage::ApplyInitialMask,
+            "branched paths: a constrained lane's prompt did not ask for its first mask");
+    provideMask(executor, id, admitting(1));
+    static_cast<void>(decodeOne(executor, id, tokens.size(), lane.pages, DecodeStage::ApplyInitialMask));
+    lane.position = tokens.size();
+    return lane;
+  };
+  // A cycle of the lanes, each item capturing at the boundary while its lane
+  // has not where `capture`; `masks` answers each lane's mask request.
+  const auto cycle = [&](std::vector<Lane> &lanes, bool capture,
+                         const std::function<std::vector<uint32_t>(const Lane &, const ModelMaskRequest &)> &masks) {
+    BatchPlan plan{.kind = WorkKind::Decode, .decodeStage = DecodeStage::Regular};
+    std::vector<ModelBatchItem> items;
+    for (const Lane &lane : lanes) {
+      plan.items.push_back({lane.id, 0});
+      ModelBatchItem item = withRevision({lane.id, lane.position, 0, lane.pages});
+      if (capture && captures && !lane.capture) {
+        metal::AllocationFailure refusal;
+        item.stateCaptures.push_back({kBoundary, executor.reserveState(lane.id, kBoundary, refusal)});
+        require(item.stateCaptures.back().reservation != nullptr, "branched paths: a capture's buffers were refused");
+      }
+      items.push_back(std::move(item));
+    }
+    PendingMaskedDecode pending = beginMaskedDecode(executor, plan, items);
+    items.clear();
+    require(pending.maskRequests.size() == lanes.size(), "branched paths: a lane asked for no mask");
+    for (const ModelMaskRequest &request : pending.maskRequests)
+      provideMask(executor, request.requestId, masks(*std::ranges::find(lanes, request.requestId, &Lane::id), request));
+    const std::vector<ModelStepResult> results = finishMaskedDecode(std::move(pending));
+    require(results.size() == lanes.size(), "branched paths: a cycle lost a lane");
+    for (uint32_t index = 0; index < lanes.size(); ++index) {
+      Lane &lane = lanes[index];
+      const ModelStepResult &result = results[index];
+      require(result.failure.empty() && !result.finished,
+              "branched paths: a cycle failed or ended a lane: " + result.failure +
+                  (result.finished ? " (finished at " + std::to_string(lane.tokens.size()) + " tokens)" : ""));
+      lane.tokens.insert(lane.tokens.end(), result.outputTokens.begin(), result.outputTokens.end());
+      lane.position += result.outputTokens.size() - result.outputTokensWithoutKv;
+      if (!result.capturedStates.empty()) lane.capture = result.capturedStates.front();
+    }
+  };
+  // Each lane's raw logits of its anchor's row, in a cycle of a row a lane
+  // that admits every token.
+  const auto nextLogits = [&](std::vector<Lane> &lanes) {
+    model::RuntimeInstrumentation::forceStepRows(executor, static_cast<uint32_t>(lanes.size()));
+    model::RuntimeInstrumentation::captureTargetLogits(executor, true);
+    static_cast<void>(model::RuntimeInstrumentation::takeTargetLogits(executor));
+    cycle(lanes, false, [&](const Lane &, const ModelMaskRequest &request) {
+      return admitting(request.simulationTokens.size() + 1);
+    });
+    model::RuntimeInstrumentation::captureTargetLogits(executor, false);
+    model::RuntimeInstrumentation::forceStepRows(executor, std::nullopt);
+    return model::RuntimeInstrumentation::takeTargetLogits(executor);
+  };
+  // The logits of a request's first selection after a restore from a lane's
+  // capture, which replays the lane's token at the boundary.
+  const auto restoredLogits = [&](const Lane &lane, uint64_t id) {
+    model::RuntimeInstrumentation::captureTargetLogits(executor, true);
+    static_cast<void>(model::RuntimeInstrumentation::takeTargetLogits(executor));
+    const Lane restored = start(id, lane.index, 0, lane.pages, std::span(lane.tokens).first(kBoundary + 1 - kPrompt),
+                                lane.capture);
+    model::RuntimeInstrumentation::captureTargetLogits(executor, false);
+    executor.end(restored.id);
+    std::vector<std::vector<float>> logits = model::RuntimeInstrumentation::takeTargetLogits(executor);
+    require(logits.size() == 1, "branched paths: a restored request's selection copied no logits");
+    return std::move(logits.front());
+  };
+  for (const uint32_t width : {2U, 3U, 4U}) {
+    const std::string label = "branched paths B" + std::to_string(width);
+    std::vector<Lane> branched;
+    for (uint32_t index = 0; index < width; ++index)
+      branched.push_back(start(1000 + index, index, index, pageRange(100 + 4 * index, 2)));
+    std::vector<uint32_t> forcedPaths(width);
+    model::RuntimeInstrumentation::forceStepRows(executor, width * model::ExecutionLimits::targetVerifyRows);
+    cycle(branched, true, [&](const Lane &lane, const ModelMaskRequest &request) {
+      const std::vector<uint32_t> &parents = request.parents;
+      const auto rows = static_cast<uint32_t>(request.simulationTokens.size());
+      std::vector<std::vector<uint32_t>> children(rows);
+      for (uint32_t row = 1; row < rows; ++row) children.at(parents[row]).push_back(row);
+      // A path forced through a stop token would end its lane: the first
+      // branch with a later child of no stop token, its rows to that child's
+      // descendants down its first children, short of a stop token.
+      const auto stop = [&](uint32_t row) { return row && stops.contains(request.simulationTokens[row]); };
+      std::vector<uint32_t> path;
+      for (uint32_t branch = 0; branch < rows && path.empty(); ++branch) {
+        std::vector<uint32_t> up;
+        for (uint32_t row = branch;; row = parents[row]) {
+          up.insert(up.begin(), row);
+          if (!row) break;
+        }
+        if (std::ranges::any_of(up, stop))
+          continue;
+        for (size_t child = 1; child < children[branch].size() && path.empty(); ++child) {
+          if (stop(children[branch][child]))
+            continue;
+          path = up;
+          for (uint32_t row = children[branch][child];; row = children[row].front()) {
+            path.push_back(row);
+            if (children[row].empty() || stop(children[row].front())) break;
+          }
+        }
+      }
+      require(!path.empty(),
+              label + ": a lane's tree of " + std::to_string(rows) + " rows does not branch short of a stop token");
+      // Each path row selects the next one's token; the last selects freely.
+      std::vector<uint32_t> words = admitting(rows + 1);
+      for (size_t at = 0; at + 1 < path.size(); ++at) force(words, 1 + path[at], request.simulationTokens[path[at + 1]]);
+      for (const uint32_t row : path) forcedPaths[lane.index] |= 1U << row;
+      return words;
+    });
+    model::RuntimeInstrumentation::forceStepRows(executor, std::nullopt);
+    for (uint32_t lane = 0; lane < width; ++lane) {
+      const uint32_t retained = model::RuntimeInstrumentation::lastRetainedRows(executor, lane);
+      require(retained == forcedPaths[lane] && retained != ops::chainPath(std::popcount(retained)) &&
+                  (branched[lane].capture || !captures) && branched[lane].position >= kBoundary,
+              label + ": a lane did not retain its branched path across the boundary, or did not capture there");
+    }
+    const std::vector<std::vector<float>> branchedNext = nextLogits(branched);
+    for (const Lane &lane : branched) executor.end(lane.id);
+    // Each lane's tokens again as a chain, alone, a row a cycle, each
+    // selection forced to the branched lane's next token.
+    for (const Lane &original : branched) {
+      std::vector<Lane> chained{start(1010 + original.index, original.index, 0, pageRange(120, 2))};
+      model::RuntimeInstrumentation::forceStepRows(executor, 1);
+      while (chained.front().position + 1 < original.position)
+        cycle(chained, true, [&](const Lane &lane, const ModelMaskRequest &request) {
+          std::vector<uint32_t> words = admitting(request.simulationTokens.size() + 1);
+          force(words, 1, original.tokens.at(lane.tokens.size() + 1));
+          return words;
+        });
+      model::RuntimeInstrumentation::forceStepRows(executor, std::nullopt);
+      const Lane &chain = chained.front();
+      require(chain.tokens == std::vector<uint32_t>(original.tokens.begin(),
+                                                    original.tokens.begin() +
+                                                        static_cast<std::ptrdiff_t>(chain.tokens.size())) &&
+                  chain.position + 1 == original.position && (chain.capture || !captures),
+              label + ": the chain did not decode the branched lane's tokens");
+      // The chain's anchor is the branched lane's last token: one cycle more
+      // reaches the branched lane's next row.
+      const std::vector<std::vector<float>> chainNext = nextLogits(chained);
+      const double next = cosine(branchedNext.at(original.index), chainNext.at(0));
+      executor.end(chain.id);
+      const double restored =
+          captures ? cosine(restoredLogits(original, 1020), restoredLogits(chain, 1021)) : 1.0;
+      require(next > bound && restored > bound,
+              label + ": lane " + std::to_string(original.index) + "'s next logits are at cosine " +
+                  std::to_string(next) + " and its restored capture's at " + std::to_string(restored) +
+                  " of the chain's");
+    }
+  }
+  std::cout << "branched_paths_match_chains=PASS widths=2,3,4" << (captures ? "" : " (no decode captures)") << '\n';
+}
+
+// A step whose lanes take different rows at the lane cap of 16 computes each
+// lane's rows as the same step of its lanes in the reverse order does, and
+// as a step of that lane alone does. Four greedy lanes of their own prompts
+// are teacher-forced: a thinking budget of no tokens whose end is the lane's
+// continuation, words of the model's thinking end, makes each row select the
+// next forced token and replaces the draft's proposals with them, so a
+// lane's rows are its forced chain, as deep as its output budget leaves, and
+// it retains every one. With budgets of 16, 5, 9 and 12 tokens a step of
+// their 42 rows, at the cap of 16, gives each lane its budget's rows; then
+// the lanes run again in the reverse order, each at another place among the
+// step's rows and in another state lane, and each alone in a step of its
+// rows. Each row's raw logits in the reversed step are the step's in order
+// (a cosine of 1 within 1e-6: the same rows, routed alike); alone, within
+// `aloneBound` (cosine), which takes the rounding of a step of other rows:
+// of its projections' tiles, and of a MoE target's expert tiles, which a
+// lane alone fills with its rows alone.
+void requireMixedStepMatchesLanesAlone(model::Runtime &executor, std::span<const uint32_t> seed, uint32_t vocabulary,
+                                       double aloneBound) {
+  constexpr std::array<uint32_t, 4> kRows{16, 5, 9, 12}, kFirstForced{0, 3, 5, 1};
+  constexpr uint32_t kStepRows = 16 + 5 + 9 + 12;
+  // The thinking end's words, before the token that closes thinking.
+  const std::vector<uint32_t> &words = targetTokens->thinkingEnds[1];
+  struct Lane final {
+    EngineRequest request;
+    std::vector<uint32_t> forced;
+    std::vector<uint32_t> pages;
+  };
+  std::array<Lane, kRows.size()> lanes;
+  for (uint32_t index = 0; index < lanes.size(); ++index) {
+    Lane &lane = lanes[index];
+    std::vector<uint32_t> prompt(40 + 9 * index);
+    for (uint32_t at = 0; at < prompt.size(); ++at) prompt[at] = seed[(at + 7 * index) % seed.size()];
+    require(kFirstForced[index] + kRows[index] < words.size(), "mixed step: the thinking end is too short");
+    lane.forced.assign(words.begin() + kFirstForced[index], words.begin() + kFirstForced[index] + kRows[index]);
+    lane.request = makeRequest(0, std::move(prompt), kRows[index]);
+    std::vector<uint32_t> end = lane.forced;
+    end.push_back(targetTokens->thinkEnd);
+    lane.request.thinkingBudget = ThinkingBudget{0, std::move(end), targetTokens->thinkEnd};
+    lane.pages = pageRange(100 + 4 * index, 4);
+  }
+  // `order`'s lanes in one step of `rows` rows, each request an id of its
+  // own from `firstId`: their raw logits by lane, each its rows' in order.
+  const auto decode = [&](std::span<const uint32_t> order, uint64_t firstId, uint32_t rows) {
+    BatchPlan plan{.kind = WorkKind::Decode, .decodeStage = DecodeStage::Regular};
+    std::vector<ModelBatchItem> items;
+    for (uint32_t index = 0; index < order.size(); ++index) {
+      Lane &lane = lanes[order[index]];
+      lane.request.id = firstId + index;
+      beginCold(executor, lane.request, index);
+      requireOpen(prefillChunk(executor, lane.request.id, 0, lane.request.prompt, lane.pages), "mixed step");
+      plan.items.push_back({lane.request.id, 0});
+      items.push_back(withRevision({lane.request.id, lane.request.prompt.size(), 0, lane.pages}));
+    }
+    model::RuntimeInstrumentation::forceStepRows(executor, rows);
+    model::RuntimeInstrumentation::captureTargetLogits(executor, true);
+    static_cast<void>(model::RuntimeInstrumentation::takeTargetLogits(executor));
+    const std::vector<ModelStepResult> results = executor.decode(plan, items);
+    model::RuntimeInstrumentation::captureTargetLogits(executor, false);
+    model::RuntimeInstrumentation::forceStepRows(executor, std::nullopt);
+    require(results.size() == order.size(), "mixed step: a step lost a lane");
+    for (uint32_t index = 0; index < order.size(); ++index) {
+      const Lane &lane = lanes[order[index]];
+      const uint32_t verified = model::RuntimeInstrumentation::lastVerifyRows(executor, index);
+      require(results[index].failure.empty() && results[index].outputTokens == lane.forced &&
+                  verified == lane.forced.size(),
+              "mixed step: lane " + std::to_string(index) + " of a step of " + std::to_string(rows) +
+                  " rows verified " + std::to_string(verified) + " rows and retained " +
+                  std::to_string(results[index].outputTokens.size()) + " tokens, not its " +
+                  std::to_string(lane.forced.size()) + " forced ones");
+      executor.end(lane.request.id);
+    }
+    std::vector<std::vector<float>> logits = model::RuntimeInstrumentation::takeTargetLogits(executor);
+    require(logits.size() == order.size(), "mixed step: a step copied no logits");
+    std::vector<std::vector<float>> byLane(lanes.size());
+    for (uint32_t index = 0; index < order.size(); ++index) {
+      require(logits[index].size() == uint64_t{kRows[order[index]]} * vocabulary,
+              "mixed step: a lane's logits are not its rows'");
+      byLane[order[index]] = std::move(logits[index]);
+    }
+    return byLane;
+  };
+  // The least cosine of a lane's rows' logits in two steps.
+  const auto leastCosine = [&](const std::vector<float> &left, const std::vector<float> &right, uint32_t rows) {
+    double least = 1.0;
+    for (uint32_t row = 0; row < rows; ++row) {
+      SimilarityAccumulator accumulator;
+      for (uint64_t at = uint64_t{row} * vocabulary; at < uint64_t{row + 1} * vocabulary; ++at)
+        accumulator.add(left[at], right[at]);
+      least = std::min(least, accumulator.result().cosine);
+    }
+    return least;
+  };
+  constexpr std::array<uint32_t, 4> kInOrder{0, 1, 2, 3}, kReversed{3, 2, 1, 0};
+  const std::vector<std::vector<float>> mixed = decode(kInOrder, 1100, kStepRows);
+  const std::vector<std::vector<float>> reversed = decode(kReversed, 1110, kStepRows);
+  double reversedLeast = 1.0, aloneLeast = 1.0;
+  std::string byLane;
+  for (uint32_t index = 0; index < lanes.size(); ++index) {
+    reversedLeast = std::min(reversedLeast, leastCosine(mixed[index], reversed[index], kRows[index]));
+    const std::array<uint32_t, 1> alone{index};
+    const double least = leastCosine(mixed[index], decode(alone, 1120 + index, kRows[index])[index], kRows[index]);
+    aloneLeast = std::min(aloneLeast, least);
+    byLane += (index ? "," : "") + std::to_string(least);
+  }
+  std::cout << "mixed_step rows=16,5,9,12 reversed_least_cosine=" << reversedLeast << " alone_least_cosine=" << byLane
+            << '\n';
+  require(reversedLeast > 1.0 - 1e-6,
+          "mixed step: a lane's logits are at cosine " + std::to_string(reversedLeast) +
+              " of its in the step of its lanes reversed");
+  require(aloneLeast > aloneBound,
+          "mixed step: a lane's logits are at cosine " + std::to_string(aloneLeast) + " of its alone");
+  std::cout << "mixed_step_matches_lanes_alone=PASS\n";
 }
 
 // Under --verify-rows auto a MoE target's decode cycles verify the rows its
@@ -3880,7 +4511,7 @@ public:
     std::vector<ModelBatchItem> items;
     bool indexed = false;
     for (SpillRequest *request : requests) {
-      ensure(*request, request->committed + model::ExecutionLimits::decodeLaneRows);
+      ensure(*request, request->committed + model::ExecutionLimits::targetVerifyRows);
       if (request->holdsIndexPages()) {
         const model::ModelMemoryAdmission floor =
             runtime_->reserveSpilledReads(request->id, {.kind = WorkKind::Decode});
@@ -4148,7 +4779,8 @@ struct SpillRecord final {
 // spills or stays, for the same schedule: four requests, each
 // prefilled in commands of the runtime's prefill group, the first of which
 // ends past the dense history and a fourth of a chunk, then decoded one
-// alone, four together, two and one again, and the one last once more as a
+// alone, four together and two in ragged steps of 16-row lanes, one again,
+// and the one last once more as a
 // Resident turn that holds the pages it spilled alone, which it moves back
 // to Full pages and restores whole from their copies (an un-spill); first
 // with every page Full, then with the first and the third spilling between
@@ -4186,7 +4818,7 @@ void requireSpilledKvMatchesResident(metal::MetalBackend &backend, const model::
                                       const metal::AllocationAdmission &admission, const MemoryGovernor &governor,
                                       kv::Format format, ops::GdnStateFormat stateFormat, const SpillOptions &options) {
   constexpr uint32_t kCycles = 4;
-  constexpr uint32_t kDecodeTokens = (1 + 4 * kCycles) * model::ExecutionLimits::decodeLaneRows;
+  constexpr uint32_t kDecodeTokens = (1 + 4 * kCycles) * model::ExecutionLimits::targetVerifyRows;
   constexpr uint32_t kIntoPage = 13, kLastChunkRows = 10;
   static_assert(kIntoPage + kLastChunkRows < kv::kPageTokens);
   const uint32_t denseTokens = densePagesOf(*model.descriptor.capabilities.sparseKv) * kv::kPageTokens;
@@ -4272,10 +4904,16 @@ void requireSpilledKvMatchesResident(metal::MetalBackend &backend, const model::
     cycles({&requests[0]}, 1);
     require(!requests[0].holdsIndexPages() || (staging && !spill.historyStream().stats().stagingBytes),
             "a decoding lane's floor of the hot block cache did not take the place of the idle staging");
+    // Steps of the wide lane cap, ragged: 42 rows over four lanes and 21 over
+    // two, which their trees' estimates share out, more than 8 rows to some
+    // lane, whose two 8-row tiles take two of the step's block lists.
+    model::RuntimeInstrumentation::forceStepRows(runtime, 42);
     cycles({&requests[0], &requests[1], &requests[2], &requests[3]}, kCycles);
     spill.end(requests[1]);
     spill.end(requests[3]);
+    model::RuntimeInstrumentation::forceStepRows(runtime, 21);
     cycles({&requests[0], &requests[2]}, kCycles);
+    model::RuntimeInstrumentation::forceStepRows(runtime, std::nullopt);
     spill.end(requests[2]);
     cycles({&requests[0]}, kCycles);
     spill.unspill(requests[0]);
@@ -5039,8 +5677,12 @@ int main(int argc, char **argv) {
     requireNonFiniteRowFailsOnlyItsLane(executor, pages, states, backend,
                                         samplingSeedTokens, prompt128);
     requireConstrainedLaneTakesTheMasksItAskedFor(executor, model.descriptor, samplingSeedTokens);
+    requireForcedChainGrowsNoTree(executor, model.descriptor, samplingSeedTokens);
+    requireGrammarChainsAreVerified(executor, model.descriptor, samplingSeedTokens);
     requireThinkingBudgetClosesThinking(executor);
+    requireThinkingBudgetKeepsLookupChains(executor);
     requireConstrainedThinkingEndWaitsForItsMask(executor);
+    requireCyclesVerifyTheirOutputLeft(executor);
     requireThinkingEndVerifiesItsTokens(executor, model);
     requireStatesCapturedInsideCommands(executor, backend, pages, states, aneFfn.get(), samplingSeedTokens);
     requireCapturesOutliveTheirItems(executor, states, samplingSeedTokens);
@@ -5135,6 +5777,12 @@ int main(int argc, char **argv) {
               << partitionedPending.acceptedDraftTokens << '\n';
     executor.end(50);
     executor.end(51);
+    requireBranchedPathsMatchChains(executor, model.descriptor, samplingSeedTokens, bound);
+    // A lane alone in a MoE target's step routes its rows to expert tiles of
+    // its own rows, which sum in another order: Qwen3.8-Flash-Next's lanes
+    // alone keep a cosine of 0.988 to their rows in the step of 42 rows.
+    requireMixedStepMatchesLanesAlone(executor, samplingSeedTokens, model.descriptor.capabilities.vocabularySize,
+                                      sparseMoe ? 0.98 : bound);
 
     // A reusable composite state contains no final hidden. A fresh
     // consumer must replay at least one complete input token; that replay
@@ -5230,16 +5878,16 @@ int main(int argc, char **argv) {
     executor.end(56);
 
     // Every decode runs a draft block's eight rows a lane and verifies those
-    // its output budget leaves: its anchor and the proposals of its tree, no
+    // its output budget leaves: its anchor and the rows of its tree, none
     // deeper than the lane may retain. Compare each budgeted commit with a
-    // constrained cycle that retains the same prefix, rejecting the next
-    // proposal unless all eight rows are retained. The constrained request
-    // has the same budget, so it verifies the same rows, which a MoE target's
-    // expert tiles group alike, and both acceptance paths agree on the GDN
-    // cell, the retained rows and the exact draft ring. Kernel tests cover
-    // the recurrence's FP64 accuracy; this check does not mix prefill and
-    // decode summation orders, whose tiny differences can amplify through the
-    // full model.
+    // constrained cycle that retains the same prefix, its masks walking its
+    // tree down the committed path and rejecting every child of the path's
+    // last row. The constrained request has the same budget, so it verifies
+    // the same rows, which a MoE target's expert tiles group alike, and both
+    // acceptance paths agree on the GDN cell, the retained rows and the exact
+    // draft ring. Kernel tests cover the recurrence's FP64 accuracy; this
+    // check does not mix prefill and decode summation orders, whose tiny
+    // differences can amplify through the full model.
     std::string comparedCounts;
     for (uint32_t outputLimit = 2; outputLimit <= 8; ++outputLimit) {
       uint64_t id = 10 + outputLimit;
@@ -5252,10 +5900,7 @@ int main(int argc, char **argv) {
                        std::span<const uint32_t>(prompt129).subspan(128, 1),
                        pageTable),
           id, 129, pageTable);
-      // The cycle verifies its anchor and the outputLimit - 1 proposals its
-      // budget leaves room for.
-      require(result.draftedTokens == outputLimit - 1,
-              "oracle prompt ended right after prefill, or its cycle verified other rows than its budget leaves");
+      require(result.draftedTokens >= 1, "oracle prompt ended right after prefill");
       require(!result.outputTokens.empty() &&
                   result.outputTokens.size() <= outputLimit,
               "fixed DFlash-8 decode exceeded its output limit");
@@ -5288,22 +5933,17 @@ int main(int argc, char **argv) {
                                   DecodeStage::ApplyInitialMask));
       auto pending =
           beginMaskedDecodeOne(executor, replayId, 129, replayPages);
-      // Its mask request simulates the rows the replay verifies, its anchor
-      // and the proposals its budget leaves room for, and takes a mask at its
-      // anchor and one after each of them.
-      require(pending.maskRequests.size() == 1 &&
-                  pending.maskRequests[0].simulationTokens.size() == outputLimit,
-              "replay proposals were not exposed");
-      const auto &proposed = pending.maskRequests[0].simulationTokens;
-      std::vector<uint32_t> maskTokens(proposed.size() + 1, 100);
-      for (size_t row = 0; row < stored; ++row) {
-        require(proposed[row] == result.outputTokens[row],
-                "replay proposal differs from committed token");
-        maskTokens[row] = result.outputTokens[row];
-      }
-      if (stored < proposed.size())
-        maskTokens[stored] = proposed[stored] == 101 ? 102 : 101;
-      provideMask(executor, replayId, singletonMasks(maskTokens));
+      // Its mask request simulates the rows the replay verifies, the
+      // budgeted cycle's: its anchor and its tree's rows, none deeper than
+      // the proposals its budget leaves room for.
+      require(pending.maskRequests.size() == 1, "replay proposals were not exposed");
+      const ModelMaskRequest &asked = pending.maskRequests[0];
+      require(asked.simulationTokens.size() == result.draftedTokens + 1 &&
+                  std::ranges::max(maskDepths(asked)) < outputLimit,
+              "the cycle verified other rows than its budget leaves");
+      const std::span<const uint32_t> path = std::span(result.outputTokens).first(stored);
+      provideMask(executor, replayId,
+                  pathMasks(asked, path, unlikeChildren(asked, pathRows(asked, path).back(), 101), 100));
       const auto replayed = finishMaskedDecode(std::move(pending));
       require(replayed.size() == 1 &&
                   replayed[0].acceptedDraftTokens == stored - 1 &&
@@ -5360,9 +6000,9 @@ int main(int argc, char **argv) {
       provideMask(executor, replayId, singletonMasks(anchor));
       static_cast<void>(decodeOne(executor, replayId, 129, replayPages,
                                   DecodeStage::ApplyInitialMask));
-      // A cycle's mask allows the budgeted lane's tokens, then at the row
-      // after them its next anchor, or else a token other than the proposal,
-      // which ends the cycle's acceptance there.
+      // A cycle's masks walk its tree down the budgeted lane's path, then
+      // after the path's last row allow its next anchor, or else a token no
+      // child of that row is, which ends the cycle's acceptance there.
       const auto replayCycle = [&](uint64_t start, const ModelStepResult &cycle,
                                    std::optional<uint32_t> next) {
         auto pending =
@@ -5370,23 +6010,10 @@ int main(int argc, char **argv) {
         require(pending.maskRequests.size() == 1 &&
                     pending.maskRequests[0].simulationTokens.size() == 8,
                 "continued replay proposals were not exposed");
-        const auto &proposed = pending.maskRequests[0].simulationTokens;
+        const ModelMaskRequest &asked = pending.maskRequests[0];
         const size_t rows = cycle.outputTokens.size();
-        std::array<uint32_t, 9> maskTokens{};
-        maskTokens.fill(100);
-        for (size_t row = 0; row < rows; ++row) {
-          require(proposed[row] == cycle.outputTokens[row],
-                  "continued replay proposal differs from committed token");
-          maskTokens[row] = cycle.outputTokens[row];
-        }
-        uint32_t after = 101;
-        if (next)
-          after = *next;
-        else if (rows < proposed.size() && proposed[rows] == 101)
-          after = 102;
-        if (rows < maskTokens.size())
-          maskTokens[rows] = after;
-        provideMask(executor, replayId, singletonMasks(maskTokens));
+        const uint32_t after = next ? *next : unlikeChildren(asked, pathRows(asked, cycle.outputTokens).back(), 101);
+        provideMask(executor, replayId, pathMasks(asked, cycle.outputTokens, after, 100));
         const auto replayed = finishMaskedDecode(std::move(pending));
         require(replayed.size() == 1 && replayed[0].outputTokensWithoutKv == 0 &&
                     replayed[0].outputTokens == cycle.outputTokens &&
@@ -5539,9 +6166,9 @@ int main(int argc, char **argv) {
     const auto beforeConstrained = executor.telemetry();
 
     // The constraint handshake exposes the rows the cycle verifies: the
-    // pending anchor and the one proposal its budget of two tokens leaves
-    // room for. The next mask therefore has three rows: the current anchor,
-    // the proposal's position, and one target successor.
+    // pending anchor and its tree's rows, none deeper than the one proposal
+    // its budget of two tokens leaves room for. The next mask therefore has
+    // a row before the anchor and one after each of them.
     EngineRequest constrained = makeRequest(40, prompt129, 2);
     constrained.constraint = ConstraintMode::TokenMask;
     beginCold(executor, constrained, 0);
@@ -5571,39 +6198,39 @@ int main(int argc, char **argv) {
         beginMaskedDecodeOne(executor, 40, 129, pageTable);
     require(verify.maskRequests.size() == 1 &&
                 verify.maskRequests[0].requestId == 40 &&
-                verify.maskRequests[0].simulationTokens.size() == 2 &&
+                verify.maskRequests[0].simulationTokens.size() >= 2 &&
                 verify.maskRequests[0].simulationTokens.front() == anchorA &&
+                std::ranges::max(maskDepths(verify.maskRequests[0])) == 1 &&
                 verify.ticket->ownsMaskWait(40),
             "constraint proposals were not exposed during target forward");
-    uint32_t nextB =
-        verify.maskRequests[0].simulationTokens[1] == 101 ? 102 : 101;
-    std::array<uint32_t, 3> verifyTokens{anchorA, nextB, 103};
-    std::vector<uint32_t> verifyWords = singletonMasks(verifyTokens);
-    require(verifyWords.size() == uint64_t{3} * targetTokens->maskWords(),
-            "the verify did not produce three mask rows");
+    const size_t verifySimulated = verify.maskRequests[0].simulationTokens.size();
+    // A successor that no proposal is.
+    const uint32_t nextB = unlikeChildren(verify.maskRequests[0], 0, 101);
+    std::vector<uint32_t> verifyWords = pathMasks(verify.maskRequests[0], std::array{anchorA}, nextB, 103);
+    require(verifyWords.size() == (verifySimulated + 1) * targetTokens->maskWords(),
+            "the verify did not produce a mask row before its anchor and one after each row");
     provideMask(executor, 40, verifyWords);
     auto constrainedResults = finishMaskedDecode(std::move(verify));
     require(constrainedResults.size() == 1,
             "constrained overlap returned the wrong batch width");
-    // The rejected proposal makes the masked successor the next anchor; as
+    // The rejected proposals make the masked successor the next anchor; as
     // the last budgeted token it is emitted at once, without a KV row. The
-    // cycle verified the anchor and the one proposal its budget leaves room
-    // for.
+    // cycle verified its anchor and its tree's rows.
     ModelStepResult constrainedFirst = std::move(constrainedResults[0]);
     require(constrainedFirst.nextDecodeStage == DecodeStage::Regular &&
                 constrainedFirst.outputTokens ==
                     std::vector<uint32_t>{anchorA, nextB} &&
                 constrainedFirst.outputTokensWithoutKv == 1 &&
                 !constrainedFirst.finished &&
-                constrainedFirst.draftedTokens == 1 &&
+                constrainedFirst.draftedTokens == verifySimulated - 1 &&
                 constrainedFirst.acceptedDraftTokens == 0,
             "constrained verify mask offset is incorrect");
     executor.end(40);
 
-    // Accept two of the three proposals a budget of four tokens lets the
-    // cycle verify and reject the third. The cycle proposes those three, and
-    // its mask request simulates them after its anchor; the verified ones
-    // are counted only after target verification.
+    // Accept two proposals of a path of the three a budget of four tokens
+    // lets the cycle verify and reject the third. The cycle's tree holds
+    // such a path, and its mask request simulates the tree after its anchor;
+    // the verified rows are counted only after target verification.
     EngineRequest perfectConstraint = makeRequest(44, prompt129, 4);
     perfectConstraint.constraint = ConstraintMode::TokenMask;
     beginCold(executor, perfectConstraint, 0);
@@ -5620,19 +6247,20 @@ int main(int argc, char **argv) {
                                 DecodeStage::ApplyInitialMask));
     PendingMaskedDecode perfectPending =
         beginMaskedDecodeOne(executor, 44, 129, pageTable);
-    require(perfectPending.maskRequests.size() == 1 &&
-                perfectPending.maskRequests[0].simulationTokens.size() == 4,
+    require(perfectPending.maskRequests.size() == 1,
             "perfect constraint did not overlap its mask request");
-    uint32_t rejected =
-        perfectPending.maskRequests[0].simulationTokens[3] == 121 ? 122 : 121;
-    std::array<uint32_t, 5> perfectVerify{perfectAnchor,
-                                          perfectPending.maskRequests[0]
-                                              .simulationTokens[1],
-                                          perfectPending.maskRequests[0]
-                                              .simulationTokens[2],
-                                          rejected,
-                                          123};
-    provideMask(executor, 44, singletonMasks(perfectVerify));
+    const ModelMaskRequest &perfectAsked = perfectPending.maskRequests[0];
+    const std::vector<uint32_t> perfectDepths = maskDepths(perfectAsked);
+    // The tree's first row two deep, and the row before it on its path.
+    const auto perfectSecond = static_cast<uint32_t>(std::ranges::find(perfectDepths, 2U) - perfectDepths.begin());
+    require(perfectAsked.simulationTokens.front() == perfectAnchor && std::ranges::max(perfectDepths) <= 3 &&
+                perfectSecond < perfectDepths.size(),
+            "perfect constraint's tree is deeper than its budget leaves or holds no path of two proposals");
+    const std::array perfectPath{perfectAnchor, perfectAsked.simulationTokens[perfectAsked.parents[perfectSecond]],
+                                 perfectAsked.simulationTokens[perfectSecond]};
+    const size_t perfectSimulated = perfectAsked.simulationTokens.size();
+    provideMask(executor, 44,
+                pathMasks(perfectAsked, perfectPath, unlikeChildren(perfectAsked, perfectSecond, 121), 123));
     auto perfectResults = finishMaskedDecode(std::move(perfectPending));
     require(perfectResults.size() == 1,
             "perfect constrained overlap returned the wrong width");
@@ -5640,9 +6268,9 @@ int main(int argc, char **argv) {
     require(perfectResult.nextDecodeStage == DecodeStage::Regular &&
                 perfectResult.outputTokens.size() == 4 &&
                 perfectResult.outputTokensWithoutKv == 1 &&
-                perfectResult.draftedTokens == 3 &&
+                perfectResult.draftedTokens == perfectSimulated - 1 &&
                 perfectResult.acceptedDraftTokens == 2,
-            "constrained acceptance did not report two of three");
+            "constrained acceptance did not report two of its rows");
     executor.end(44);
 
     EngineRequest alternateConstraint = makeRequest(41, prompt129, 1);
@@ -5722,23 +6350,24 @@ int main(int argc, char **argv) {
                 crossInitial[0].nextDecodeStage == DecodeStage::Regular &&
                 crossInitial[1].nextDecodeStage == DecodeStage::Regular,
             "a B2 plan did not select both lanes' first tokens");
-    // Each lane's first cycle keeps its anchor; the masked successor that
-    // rejects the second proposal becomes its next anchor.
+    // Each lane's first cycle keeps its anchor; the masked successor, which
+    // rejects every proposal after it, becomes its next anchor.
     std::array<uint32_t, 2> crossNext{};
     for (uint32_t lane = 0; lane < 2; ++lane) {
       const uint64_t id = 42 + lane;
       PendingMaskedDecode initial = beginMaskedDecodeOne(
           executor, id, 129, lane ? crossPages1 : crossPages0);
-      // Its budget of three tokens leaves its anchor and two proposals.
+      // Its budget of three tokens leaves its anchor and its tree's rows,
+      // none deeper than two proposals.
       require(initial.maskRequests.size() == 1 &&
-                  initial.maskRequests[0].simulationTokens.size() == 3 &&
+                  initial.maskRequests[0].simulationTokens.size() >= 2 &&
                   initial.maskRequests[0].simulationTokens.front() ==
-                      crossAnchors[lane],
+                      crossAnchors[lane] &&
+                  std::ranges::max(maskDepths(initial.maskRequests[0])) <= 2,
               "B1 initial constrained cycle did not draft from its anchor");
-      crossNext[lane] =
-          initial.maskRequests[0].simulationTokens[1] == 112 ? 113 : 112;
-      const std::array<uint32_t, 4> verify{crossAnchors[lane], crossNext[lane], 114, 115};
-      provideMask(executor, id, singletonMasks(verify));
+      crossNext[lane] = unlikeChildren(initial.maskRequests[0], 0, 112);
+      provideMask(executor, id,
+                  pathMasks(initial.maskRequests[0], std::array{crossAnchors[lane]}, crossNext[lane], 114));
       const auto initialResults = finishMaskedDecode(std::move(initial));
       require(initialResults.size() == 1 &&
                   initialResults[0].outputTokens ==
@@ -5758,29 +6387,30 @@ int main(int argc, char **argv) {
                 crossPending.ticket->ownsMaskWait(42) &&
                 crossPending.ticket->ownsMaskWait(43),
             "B2 target forward did not own both constraint masks");
-    // Each lane's budget leaves the B2 cycle its anchor and one proposal.
-    std::array<std::array<uint32_t, 3>, 2> crossVerify{};
+    // Each lane's budget leaves the B2 cycle its anchor and its tree's rows,
+    // none deeper than one proposal; a successor rejects them all.
+    std::array<uint32_t, 2> crossRejected{};
+    std::array<size_t, 2> crossSimulated{};
     for (uint32_t lane = 0; lane < 2; ++lane) {
-      const auto &simulation =
-          crossPending.maskRequests[lane].simulationTokens;
-      require(simulation.size() == 2, "a B2 constrained lane simulated rows its budget does not leave");
-      const uint32_t rejected = simulation[1] == 121 ? 122 : 121;
-      crossVerify[lane] = {crossNext[lane], rejected, 123};
-      provideMask(executor, crossPending.maskRequests[lane].requestId,
-                  singletonMasks(crossVerify[lane]));
+      const ModelMaskRequest &asked = crossPending.maskRequests[lane];
+      crossSimulated[lane] = asked.simulationTokens.size();
+      require(crossSimulated[lane] >= 2 && std::ranges::max(maskDepths(asked)) == 1,
+              "a B2 constrained lane simulated rows its budget does not leave");
+      crossRejected[lane] = unlikeChildren(asked, 0, 121);
+      provideMask(executor, asked.requestId,
+                  pathMasks(asked, std::array{crossNext[lane]}, crossRejected[lane], 123));
     }
     auto crossResults = finishMaskedDecode(std::move(crossPending));
-    // Each lane's budget leaves the B2 cycle its anchor and one proposal to
-    // verify.
+    // Each lane verified its anchor and its tree's rows.
     require(crossResults.size() == 2 &&
                 crossResults[0].outputTokens ==
-                    std::vector<uint32_t>{crossNext[0], crossVerify[0][1]} &&
+                    std::vector<uint32_t>{crossNext[0], crossRejected[0]} &&
                 crossResults[1].outputTokens ==
-                    std::vector<uint32_t>{crossNext[1], crossVerify[1][1]} &&
+                    std::vector<uint32_t>{crossNext[1], crossRejected[1]} &&
                 crossResults[0].outputTokensWithoutKv == 1 &&
                 crossResults[1].outputTokensWithoutKv == 1 &&
-                crossResults[0].draftedTokens == 1 &&
-                crossResults[1].draftedTokens == 1 &&
+                crossResults[0].draftedTokens == crossSimulated[0] - 1 &&
+                crossResults[1].draftedTokens == crossSimulated[1] - 1 &&
                 crossResults[0].acceptedDraftTokens == 0 &&
                 crossResults[1].acceptedDraftTokens == 0,
             "B2 constrained overlap corrupted a lane");
@@ -6581,13 +7211,17 @@ int main(int argc, char **argv) {
           auto pending = beginMaskedDecodeOne(
               executor, sequence.id, sequence.prompt.size(), pageTable);
           // A mask at the anchor and one after each row the cycle simulates.
-          std::vector<uint32_t> forced(pending.maskRequests.front().simulationTokens.size() + 1);
-          for (uint32_t row = 0; row < forced.size(); ++row)
-            forced[row] = 100 + static_cast<uint32_t>(transcript.size()) + row;
+          // Each position's token forced, a row's mask by its depth in the
+          // lane's tree: at the anchor's, then past each simulated token's.
+          const ModelMaskRequest &asked = pending.maskRequests.front();
+          const auto at = [&](size_t position) { return 100 + static_cast<uint32_t>(transcript.size() + position); };
+          std::vector<uint32_t> depths(asked.simulationTokens.size(), 0), forced{at(0)};
+          for (size_t row = 1; row < depths.size(); ++row) depths[row] = depths.at(asked.parents[row]) + 1;
+          for (const uint32_t depth : depths) forced.push_back(at(depth + 1));
           provideMask(executor, sequence.id, singletonMasks(forced));
           result = finishMaskedDecode(std::move(pending)).front();
           for (size_t row = 0; row < result.outputTokens.size(); ++row)
-            require(row < forced.size() && result.outputTokens[row] == forced[row],
+            require(row < forced.size() && result.outputTokens[row] == at(row),
                     "preempted constrained decode violated its provided mask");
         } else {
           result = decodeOne(executor, sequence.id, sequence.prompt.size(),
@@ -6961,9 +7595,9 @@ int main(int argc, char **argv) {
               << (aneFfn && aneFfn->retired() ? " ane_ffn_stopped=" + aneFfn->reason() : std::string()) << '\n';
     require(!aneFfnFault || (aneFfn && aneFfn->retired() && historicalTelemetry.aneFfnReruns == 1),
             "an armed fault did not stop the split once");
-    // The verify budget's cycles, on a MoE target's runtime of its own
+    // The verify budget's cut, on a MoE target's runtime of its own
     // (--verify-rows auto) admitted in the main one's place. A dense
-    // target keeps no budget under auto (budgetsVerifyRows).
+    // target's budget cuts no rows (budgetsVerifyRows).
     if (sparseMoe) {
       runtime.reset();
       context.verifyRows = model::VerifyRows::Auto;
@@ -6972,7 +7606,7 @@ int main(int argc, char **argv) {
       require(static_cast<bool>(budgetArenas), "the budgeted runtime's arenas exceed the oracle Metal budget");
       requireBudgetedCyclesAreWellFormed(*runtime, states, samplingSeedTokens);
     } else {
-      std::cout << "budgeted_cycles=SKIP (a dense target verifies every row; the verify budget does not apply)\n";
+      std::cout << "budgeted_cycles=SKIP (a dense target verifies every row; its verify budget cuts none)\n";
     }
     std::cout << "model_runtime_oracle_test: PASS\n";
     return 0;

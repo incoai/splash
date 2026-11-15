@@ -572,13 +572,13 @@ void testStartupRetryWindowOpensAtFirstFailure() {
 }
 
 // The parser's limits follow the model: prompts and outputs up to the served
-// context, the engine's step and draft query rows, and a mask row of the
-// vocabulary for each draft query and the anchor.
+// context, the engine's step and a lane's most verify rows, and a mask row of
+// the vocabulary for each of those and the anchor.
 void testProtocolLimitsFollowTheModel() {
   model::ModelCapabilities capabilities;
   capabilities.vocabularySize = 248320;
   const protocol::ProtocolLimits limits = protocolLimitsFor(capabilities, 4096);
-  require(limits.maxMaskWords == 7760 * 9 && limits.maxSimulationTokens == 8 &&
+  require(limits.maxMaskWords == 7760 * 17 && limits.maxSimulationTokens == 16 &&
               limits.maxTokenBatch == 17 && limits.maxPromptTokens == 4096 &&
               limits.maxLogicalOutputTokens == 4096,
           "the protocol limits do not follow the model and the served context");
@@ -596,7 +596,7 @@ void testReadyEventForTheServedModel() {
   engine.maxImagePatches = 16384;
   const protocol::ReadyEvent vision =
       readyEventFor(flint, engine, protocolLimitsFor(flint.capabilities, engine.maxContext));
-  require(vision == protocol::ReadyEvent{4, 73721, true, 150144, {150001, 150003, 150005, 150018}, 9},
+  require(vision == protocol::ReadyEvent{4, 73721, true, 150144, {150001, 150003, 150005, 150018}, 17},
           "Ready did not announce what a start serving Flint with images serves");
   model::ModelDescriptor dense;
   dense.target = model::Qwen3_8Layout{};
@@ -605,7 +605,7 @@ void testReadyEventForTheServedModel() {
   engine.maxImagePatches = 0;
   const protocol::ReadyEvent text =
       readyEventFor(dense, engine, protocolLimitsFor(dense.capabilities, engine.maxContext));
-  require(text == protocol::ReadyEvent{4, 262144, false, 248320, {248044, 248046}, 9},
+  require(text == protocol::ReadyEvent{4, 262144, false, 248320, {248044, 248046}, 17},
           "Ready did not announce what a start serving a model without images serves");
 }
 

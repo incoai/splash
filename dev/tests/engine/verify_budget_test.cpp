@@ -4,12 +4,14 @@
 // selected at, with whether that selection is the row's token, a row past
 // the verify rows too, but no row whose draft probability is not one (a row
 // a host chain made, a draft row that is not finite) and none under a row
-// past the selections; a cycle keeps the last kLabels of each policy apart.
+// past the selections, each carrying its row's cap; a cycle keeps the last
+// kLabels of each policy apart.
 // Every kRefitCycles-th cycle refits each model, which must equal an
 // independent undamped Newton solution of the same posterior over its labels,
 // from the online warm start and from the prior alike, and recover the model
 // the labels were drawn from; a refit from the model a fit reached keeps it,
-// and a model whose lanes labeled nothing stays as it was. The
+// and a model whose lanes labeled nothing stays as it was; a label its cap
+// bounds tells the fit nothing, one under its cap moves it. The
 // costs are the seed's shape before any cycle, then the affine fit of the
 // latest cycles of each lane count and kind, positive and nondecreasing, the
 // seed's slope where their rows do not spread; every kExploreCycles-th cycle
@@ -166,37 +168,41 @@ void priorAndExploration() {
 }
 
 // A tree in its selector's order, after a walk that selected 11 at the
-// anchor's row, 14 at row 1 and 16 at row 4, and nothing it kept after that:
+// anchor's row, 14 at row 1 and 16 at row 4, and nothing it kept after that,
+// each label carrying its row's cap:
 //   row 1 (11, under the anchor, 0.6)  on the path, accepted at position 0;
-//   row 2 (12, under the anchor, 0.3)  rejected at position 0;
-//   row 3 (13, under row 1, 0.5)       rejected at position 1;
+//   row 2 (12, under the anchor, 0.3, cap 0.45) rejected at position 0;
+//   row 3 (13, under row 1, 0.5, cap 0.7) rejected at position 1;
 //   row 4 (14, under row 1, a host chain's: no probability) on the path;
 //   row 5 (15, under row 2, 0.4)       its parent off the path: no label;
 //   row 6 (16, under row 4, 0.7)       accepted at position 2, a row past
 //                                      the lane's verify rows or not alike;
 //   row 7 (17, under row 6, 0.2)       under a row past the selections;
-//   rows 8 and 9 (under row 4: NaN and infinity) not probabilities.
+//   rows 8 and 9 (under row 4: NaN and infinity) not probabilities;
+//   row 10 (20, under row 4, 0.25, a NaN cap) no cap.
 void treeLabelsOfAWalk() {
   constexpr uint16_t kRoot = SPLASH_TREE_ROOT;
-  const std::vector<uint32_t> tokens{10, 11, 12, 13, 14, 15, 16, 17, 18, 19};
-  const std::vector<splash::ops::TreeRow> rows{{1, kRoot, 0}, {3, 0, 1},    {5, 0, 1},     {11, 1, 2}, {19, 1, 2},
-                                               {37, 2, 2},    {83, 4, 3},   {211, 6, 4},   {275, 4, 3}, {531, 4, 3}};
-  const std::vector<float> probabilities{1.0F, 0.6F, 0.3F, 0.5F, -1.0F, 0.4F, 0.7F, 0.2F, NAN, INFINITY};
+  const std::vector<uint32_t> tokens{10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20};
+  const std::vector<splash::ops::TreeRow> rows{{1, kRoot, 0}, {3, 0, 1},   {5, 0, 1},   {11, 1, 2},
+                                               {19, 1, 2},    {37, 2, 2},  {83, 4, 3},  {211, 6, 4},
+                                               {275, 4, 3},   {531, 4, 3}, {1043, 4, 3}};
+  const std::vector<float> probabilities{1.0F, 0.6F, 0.3F, 0.5F, -1.0F, 0.4F, 0.7F, 0.2F, NAN, INFINITY, 0.25F};
+  const std::vector<float> caps{1.0F, 1.0F, 0.45F, 0.7F, 1.0F, 1.0F, 1.0F, 1.0F, 1.0F, 1.0F, NAN};
   std::vector<float> scores;
   for (const float probability : probabilities)
     scores.insert(scores.end(), {probability, 0.5F});
   const std::vector<uint32_t> selections{11, 14, 16};
-  const auto labels = VerifyBudget::treeLabels(tokens, rows, scores, selections);
+  const auto labels = VerifyBudget::treeLabels(tokens, rows, scores, caps, selections);
   const std::vector<VerifyBudget::Label> expected{{0, float(logitOf(0.6F)), true},
-                                                  {0, float(logitOf(0.3F)), false},
-                                                  {1, float(logitOf(0.5F)), false},
+                                                  {0, float(logitOf(0.3F)), false, 0.45F},
+                                                  {1, float(logitOf(0.5F)), false, 0.7F},
                                                   {2, float(logitOf(0.7F)), true}};
   require(labels == expected, "a walk's tree labeled " + std::to_string(labels.size()) + " rows, not its own four");
   // The walk's first selection alone labels the anchor's children only.
-  require(VerifyBudget::treeLabels(tokens, rows, scores, std::span(selections).first(1)) ==
+  require(VerifyBudget::treeLabels(tokens, rows, scores, caps, std::span(selections).first(1)) ==
               std::vector<VerifyBudget::Label>(expected.begin(), expected.begin() + 2),
           "a walk of one selection labeled rows below its anchor's children");
-  require(VerifyBudget::treeLabels(tokens, rows, scores, {}).empty(), "a walk of no selection labeled rows");
+  require(VerifyBudget::treeLabels(tokens, rows, scores, caps, {}).empty(), "a walk of no selection labeled rows");
 
   // A cycle keeps a greedy lane's labels and a sampled lane's apart, and
   // without a valid time still labels, leaving the costs alone.
@@ -277,6 +283,23 @@ void fitsTheLabels() {
   require(distance(shrunk, referenceFit(few)) < 2e-4, "the fit of a few labels differs from the reference");
   require(std::fabs(shrunk.slope - VerifyBudget::kPrior.slope) < 0.3, "a few labels moved the slope far");
   refitKeeps(few, shrunk);
+  // Labels whose caps bound their chances (rows a likelier sibling left a
+  // thousandth of its parent's) tell the fit nothing, accepted or not; those
+  // under their caps (a cap of 0.9 over a chance near the fit's 0.5 at no
+  // feature) move it like any.
+  std::vector<VerifyBudget::Label> capped = labels;
+  for (uint32_t position = 0; position < kPositions; ++position)
+    for (const bool accepted : {false, true})
+      capped.push_back({position, 1.0F, accepted, 1.0e-3F});
+  require(distance(VerifyBudget::fit(capped, VerifyBudget::kPrior), parametersOf(cold)) < 1e-9,
+          "labels their caps bound moved the fit");
+  std::vector<VerifyBudget::Label> under = labels;
+  for (int repeat = 0; repeat < 50; ++repeat)
+    under.push_back({0, 0.0F, false, 0.9F});
+  const VerifyBudget::Acceptance lowered = VerifyBudget::fit(under, VerifyBudget::kPrior);
+  require(lowered.intercepts[0] < cold.intercepts[0] - 0.05F,
+          "labels under their caps did not move the fit (intercept " + std::to_string(lowered.intercepts[0]) +
+              " against " + std::to_string(cold.intercepts[0]) + ")");
 }
 
 void learnsTheCosts() {
@@ -419,16 +442,13 @@ void invalidInputs() {
   const std::vector<splash::ops::TreeRow> two{{1, SPLASH_TREE_ROOT, 0}, {3, 0, 1}}, backwards{{1, SPLASH_TREE_ROOT, 0},
                                                                                           {3, 1, 1}};
   const std::vector<uint32_t> tokens{1, 2}, one{1};
-  const std::vector<float> scores{1.0F, 1.0F, 0.5F, 0.5F};
-  for (const auto &[rows, ids, pairs] :
-       {std::tuple{std::span<const splash::ops::TreeRow>{}, std::span<const uint32_t>{}, std::span<const float>{}},
-        std::tuple{std::span<const splash::ops::TreeRow>(two), std::span<const uint32_t>(one),
-                   std::span<const float>(scores)},
-        std::tuple{std::span<const splash::ops::TreeRow>(two), std::span<const uint32_t>(tokens),
-                   std::span<const float>(scores).first(3)},
-        std::tuple{std::span<const splash::ops::TreeRow>(backwards), std::span<const uint32_t>(tokens),
-                   std::span<const float>(scores)}})
-    rejects([&] { static_cast<void>(VerifyBudget::treeLabels(ids, rows, pairs, tokens)); },
+  const std::vector<float> scores{1.0F, 1.0F, 0.5F, 0.5F}, caps{1.0F, 1.0F};
+  using Tree = std::tuple<std::span<const splash::ops::TreeRow>, std::span<const uint32_t>, std::span<const float>,
+                          std::span<const float>>;
+  for (const auto &[rows, ids, pairs, rowCaps] :
+       {Tree{}, Tree{two, one, scores, caps}, Tree{two, tokens, std::span(scores).first(3), caps},
+        Tree{two, tokens, scores, std::span(caps).first(1)}, Tree{backwards, tokens, scores, caps}})
+    rejects([&] { static_cast<void>(VerifyBudget::treeLabels(ids, rows, pairs, rowCaps, tokens)); },
             "invalid verify budget tree", "an impossible tree was labeled");
   for (const uint32_t lanes : {0U, 5U}) {
     rejects([&] { static_cast<void>(budget.costs(lanes, false)); }, "invalid verify budget lane count",
@@ -445,6 +465,11 @@ void invalidInputs() {
   const std::vector<VerifyBudget::Label> infinite{{0, INFINITY, true}};
   rejects([&] { static_cast<void>(VerifyBudget::fit(infinite, VerifyBudget::kPrior)); }, "invalid verify budget label",
           "a label without a finite feature was fit");
+  for (const float cap : {-0.5F, 1.5F, NAN}) {
+    const std::vector<VerifyBudget::Label> uncapped{{0, 0.0F, true, cap}};
+    rejects([&] { static_cast<void>(VerifyBudget::fit(uncapped, VerifyBudget::kPrior)); },
+            "invalid verify budget label", "a label of a cap past [0, 1] was fit");
+  }
 }
 
 // The most expected tokens past the anchors of any assignment of at most e

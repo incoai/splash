@@ -992,9 +992,9 @@ def run_sampling(port: int, model: str, switch: bool = True) -> None:
     penalized greedy, sampled and constrained requests finish side by side with
     an unpenalized one and with sampled ones whose top_k keeps every token or
     which min_p cuts. Greedy output repeats only where decode cycles verify
-    every row (/status verify_rows all), so on a MoE target, whose rows the
-    verify budget chooses unless it serves with --verify-rows all, the two
-    greedy comparisons are left out."""
+    every row and nothing learns (/status verify_rows all), so where the
+    verify budget learns, unless the server serves with --verify-rows all, the
+    two greedy comparisons are left out."""
     repeats = runtime_status(port)["verify_rows"] == "all"
     prompt = "Name the days of the week, three times over, separated by commas."
     penalized = chat_body(

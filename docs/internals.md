@@ -492,10 +492,10 @@ its lane's first chain rotates at its own position; the cycle's start builds
 the draft's rows alone.
 
 A lane's verify block holds up to 16 rows (`SPLASH_TARGET_VERIFY_ROWS`): its
-anchor and the rows proposed after it, a chain or a tree, each row's place in
-it (its ancestors, parent and depth, `metal/abi/VerifyTree.h`) one entry per
-packed row; a decode cycle gives every lane the chain of its draft's eight
-(`ExecutionLimits::decodeLaneRows`) until a cycle chooses each lane's rows. What
+anchor and the rows proposed after it, a tree, each row's place in it (its
+ancestors, parent and depth, `metal/abi/VerifyTree.h`) one entry per packed
+row; a decode cycle gives every lane a draft's block of them
+(`ExecutionLimits::decodeLaneRows`), and a step a test forces up to sixteen. What
 a cycle may hold follows the block's 16 rows: the KV it writes past the context
 (`SPLASH_SPECULATIVE_SCRATCH_TOKENS`, 15), the KV the engine holds for a lane's
 cycle and its reply captures, a block-sparse target's verify rows
@@ -625,9 +625,10 @@ The rules:
    most blocks' routers (`ops::moeRouterFormat`). Either tile's grouped rows
    are the step's routes', packed (`ops::MoeScratch`).
 5. *Attention.* The kernels follow how a layout reads its pages
-   (`kv::Layout::reads`, below). A sequence of one tile, a decode lane's,
-   takes one history split per 16 pages its rows read, between 32 and 128.
-   Each tile of a longer sequence takes one per
+   (`kv::Layout::reads`, below). A sequence of one tile, a decode lane's of
+   up to 8 rows, takes one history split per 16 pages its rows read, between
+   32 and 128. Each tile of a longer sequence, a decode lane's of 9 to 16
+   rows too (two tiles), takes one per
    `AttentionCalibration::prefillPagesPerSplit` pages its rows read (32, and
    64 on Apple9 GPUs of 10 cores or fewer, where 32 made one measured case
    slower than the shared splits), at least 32 shared out over the
@@ -1271,8 +1272,10 @@ selections make, and `pages`), and `--qsa indexer` the indexer itself before
 them; each case reports the mean entries of its lists.
 
 Where some of a verify's listed blocks are on the SSD, a host step after the
-layer's selection resolves each lane's list through the hot block cache
-(`KvBlockCache::addResolve`) into a location per entry: the block's place in
+layer's selection resolves each lane's lists, one a tile of its rows at the
+step's lane cap, the lanes' one after another and a tile past a lane's rows
+empty, through the hot block cache (`KvBlockCache::addResolve`) into a
+location per entry: the block's place in
 the cache, or `SPLASH_ATTENTION_PAGED` for a block its page holds. The located
 split (`AttentionBlocks::locations` and `locationPages`) reads each block where
 its location says, and a command none of whose lanes reads spilled KV encodes

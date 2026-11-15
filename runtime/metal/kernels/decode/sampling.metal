@@ -1392,9 +1392,10 @@ struct TreeHeap {
 };
 
 // A lane's tree as it grows: its rows' tokens, ancestors' masks, parents,
-// depths, draft probabilities, estimates and keys, and of each row the
+// depths, draft probabilities, estimates, caps and keys, and of each row the
 // children its draft drew (their candidate indices, in order; kNoCandidate
-// past them) and its next position's probabilities (DraftTreeParams).
+// past them) with each one's cap, and its next position's probabilities
+// (DraftTreeParams).
 struct TreeRows {
   uint token[kTreeRows];
   uint ancestors[kTreeRows];
@@ -1402,8 +1403,10 @@ struct TreeRows {
   ushort depth[kTreeRows];
   float q[kTreeRows];
   float estimate[kTreeRows];
+  float cap[kTreeRows];
   ulong key[kTreeRows];
   uchar draw[kTreeRows][kTreeChildren];
+  float left[kTreeRows][kTreeChildren];
   float next[kTreeRows][SPLASH_DRAFT_CANDIDATES];
   uint made;
 };
@@ -1516,9 +1519,10 @@ inline float tree_gumbel(ulong key, uint token) {
 // each candidate against the most likely, exp((log q - log q_max) / T), so
 // that its mass is at least 1 at any temperature, and the draws take its
 // stored values, which the target's tests read: a candidate whose weight
-// underflows is never drawn. Each child is estimated at most as the one
-// before it, so that the tree takes a row's children in the order drawn and a
-// cycle verifies a first few of them.
+// underflows is never drawn. Each child's own estimate is at most its cap,
+// what the children drawn before it left of 1 (DraftTreeParams), and the
+// child is estimated at most as the one before it, so that the tree takes a
+// row's children in the order drawn and a cycle verifies a first few of them.
 inline void tree_expand(threadgroup TreeLattice &lattice,
                         threadgroup TreeHeap &heap, threadgroup TreeRows &rows,
                         constant DraftTreeParams &params, uint lane,
@@ -1545,7 +1549,7 @@ inline void tree_expand(threadgroup TreeLattice &lattice,
                   ? log(rows.next[row][i]) + tree_gumbel(rows.key[row], lattice.ids[position][i])
                   : -INFINITY;
   uint taken = 0;
-  float bound = score;
+  float bound = score, left = 1.0f;
   for (uint child = 0; child < children; ++child) {
     uint drawn = SPLASH_DRAFT_CANDIDATES;
     if (temperature == 0.0f) {
@@ -1561,9 +1565,21 @@ inline void tree_expand(threadgroup TreeLattice &lattice,
       return;
     taken |= 1u << drawn;
     rows.draw[row][child] = uchar(drawn);
-    bound = min(bound, score * tree_draft_estimate(params, lane, rows.next[row][drawn], position));
+    rows.left[row][child] = left;
+    const float own = min(tree_draft_estimate(params, lane, rows.next[row][drawn], position), left);
+    left -= own;
+    bound = min(bound, score * own);
     tree_push(heap, bound, tree_info(false, row, position, drawn));
   }
+}
+
+// The cap of the step row `parent` drew to its candidate `index`
+// (tree_expand).
+inline float tree_cap(threadgroup TreeRows &rows, uint parent, uint index) {
+  for (uint child = 0; child < kTreeChildren; ++child)
+    if (rows.draw[parent][child] == index)
+      return rows.left[parent][child];
+  return 1.0f;
 }
 
 // One group per lane builds its tree (DraftTreeParams). Its threads first
@@ -1579,11 +1595,12 @@ inline void tree_expand(threadgroup TreeLattice &lattice,
 // draft probability (scores' x) is that of the draft step that made it, or
 // joined it where a lookup chain's token made it, its token's among the
 // candidates after its parent's; -1 for a chain row no draft step joined,
-// and for every row of a forced chain; its estimate is scores' y. Of each
-// row it also writes the candidate indices of the children it drew, in order
-// (draws, kNoCandidate past them), and its next position's probabilities
-// (next), which a sampled verify row's selection tests
-// (decode_sample_vocabulary_draw).
+// and for every row of a forced chain; its estimate is scores' y, and the
+// cap of that draft step its caps entry (1 for a row it has no draft
+// probability of). Of each row it also writes the candidate indices of the
+// children it drew, in order (draws, kNoCandidate past them), and its next
+// position's probabilities (next), which a sampled verify row's selection
+// tests (decode_sample_vocabulary_draw).
 kernel void draft_select_tree(
     device const uint *candidates [[buffer(0)]],
     device const float *unary [[buffer(1)]],
@@ -1596,7 +1613,8 @@ kernel void draft_select_tree(
     device uint *sizes [[buffer(8)]],
     device uchar *draws [[buffer(9)]],
     device float *next [[buffer(10)]],
-    constant DraftTreeParams &params [[buffer(11)]],
+    device float *caps [[buffer(11)]],
+    constant DraftTreeParams &params [[buffer(12)]],
     uint lane [[threadgroup_position_in_grid]],
     uint thread_index [[thread_index_in_threadgroup]]) {
   constexpr uint Positions = SPLASH_DRAFT_PROPOSAL_TOKENS;
@@ -1664,6 +1682,7 @@ kernel void draft_select_tree(
     rows.depth[0] = 0;
     rows.q[0] = 1.0f;
     rows.estimate[0] = 1.0f;
+    rows.cap[0] = 1.0f;
     rows.key[0] = ulong(params.noise[lane][1]) << 32 | params.noise[lane][0];
     tree_row_clear(rows, 0);
     if (deepest > 0) {
@@ -1672,7 +1691,9 @@ kernel void draft_select_tree(
         tree_push(heap, rates[tree_agreement(lattice, chain[0], 0)],
                   tree_info(true, 0, 0, 0));
     }
-    while (heap.size && rows.made < Rows) {
+    // No more rows than the tokens a walk of the tree may retain.
+    const uint most = min(Rows, deepest + 1);
+    while (heap.size && rows.made < most) {
       const float score = heap.score[0];
       const uint info = heap.info[0];
       tree_pop(heap);
@@ -1697,6 +1718,7 @@ kernel void draft_select_tree(
         // the chain's, and it has no draft probability.
         rows.q[row] = from_chain ? -1.0f : rows.next[parent][index];
         rows.estimate[row] = score;
+        rows.cap[row] = from_chain ? 1.0f : tree_cap(rows, parent, index);
         rows.key[row] = tree_key(rows.key[parent], token);
         tree_row_clear(rows, row);
       } else if (!from_chain && rows.q[row] < 0.0f && !params.forced[lane]) {
@@ -1706,6 +1728,7 @@ kernel void draft_select_tree(
         // decode traces (model::LookupAcceptance::kPrior), and the fit
         // without them learns from the draft's other rows alone.
         rows.q[row] = rows.next[parent][index];
+        rows.cap[row] = tree_cap(rows, parent, index);
       }
       // The row's children lie a step deeper.
       if (position + 1 >= deepest)
@@ -1730,6 +1753,7 @@ kernel void draft_select_tree(
     tree[at] = {rows.ancestors[thread_index], rows.parent[thread_index],
                 rows.depth[thread_index]};
     scores[at] = float2(rows.q[thread_index], rows.estimate[thread_index]);
+    caps[at] = rows.cap[thread_index];
     for (uint child = 0; child < kTreeChildren; ++child)
       draws[at * kTreeChildren + child] = rows.draw[thread_index][child];
     for (uint i = 0; i < Candidates; ++i)

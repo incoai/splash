@@ -121,13 +121,14 @@ public:
   [[nodiscard]] uint64_t floorBytes(uint32_t lanes) const noexcept;
 
   // After `layer`'s block lists: a host step that resolves the entries of
-  // lane l's list, whose pages' sources are lanes[l] (null for a lane none
-  // of whose pages holds only its index), writes their locations to
+  // lane l's lists, the `laneLists` lists of its tiles from blocks.list + l x
+  // laneLists on, whose pages' sources are lanes[l] (null for a lane none of
+  // whose pages holds only its index), writes their locations to
   // `locations` (an array of the lists' shape) and counts into `stats`.
   // Returns the lists with their locations, for the located split.
   [[nodiscard]] ops::AttentionBlocks addResolve(metal::CommandGraph &graph, uint32_t layer,
                                                 std::span<const std::shared_ptr<const KvPageSources>> lanes,
-                                                const ops::AttentionBlocks &blocks,
+                                                const ops::AttentionBlocks &blocks, uint32_t laneLists,
                                                 const metal::MetalBuffer &locations,
                                                 std::shared_ptr<KvReadStats> stats);
   // Once the command completed: the blocks its resolves could not read, each

@@ -829,13 +829,12 @@ SERVE_OPTIONS = (
             choices=("auto", "all"),
             default="auto",
             help="rows of each draft block decode verifies: all verifies every "
-            "row, so a MoE model's greedy and seeded outputs repeat as a dense "
-            "model's do (default: auto, where a verify budget learned from "
-            "earlier cycles chooses a MoE model's rows, which is faster but "
-            "lets those outputs differ from run to run)",
+            "row and learns nothing, so greedy and seeded outputs repeat "
+            "(default: auto, where a verify budget learned from earlier cycles "
+            "sets every model's tree estimates and chooses a MoE model's rows, "
+            "which is faster but lets those outputs differ from run to run)",
         ),
         engine=EngineArgument("--verify-rows"),
-        needs="experts",
     ),
     ServeOption(
         "--allow-idle-sleep",

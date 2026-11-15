@@ -371,13 +371,15 @@ void DFlashDraft::addContextCommit(
   ops::PreparedInput hidden = ops::Normalization::addRms(
       graph, buffers.projected, weights_.hiddenNorm, buffers.hidden, layout.hiddenSize, rows,
       scratch, kvPlan.input());
+  // A lane holds at most the cap's rows and the step's: a one-lane step of
+  // 9 to 15 rows takes the cap of 16.
   for (uint32_t lane = 0; lane < lanes; ++lane)
     if (buffers.windows[lane])
       ops::DraftAttention::addWindowCommit(
           graph, buffers.hidden, buffers.windows[lane],
           backend_.view(buffers.retainedRows, lane * sizeof(uint32_t), sizeof(uint32_t)),
           backend_.view(buffers.laneRows, lane * sizeof(ops::LaneRows), sizeof(ops::LaneRows)), rows,
-          step.laneCap, startPositions[lane], layout.hiddenSize);
+          std::min(step.laneCap, rows), startPositions[lane], layout.hiddenSize);
 
   for (uint32_t layer = 0; layer < layout.layers; ++layer) {
     const ops::Projection &projection = contextKvProjections_[layer];

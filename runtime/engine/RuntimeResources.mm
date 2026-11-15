@@ -429,8 +429,8 @@ void reportVerifyRows(const model::LoadedModel &loaded, model::VerifyRows rows) 
   else if (rows == model::VerifyRows::All)
     logLine("Decode cycles verify every row of the draft's block (--verify-rows all).");
   else
-    logLine("Decode cycles verify every row of the draft's block (--verify-rows auto, as ", loaded.name(),
-            " is dense).");
+    logLine("Decode cycles verify every row of the draft's block by the verify budget's estimates (--verify-rows "
+            "auto, as ", loaded.name(), " is dense): greedy and seeded outputs can differ from run to run.");
 }
 
 // Why a target's long requests keep their KV in memory, empty when they

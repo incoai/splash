@@ -15,7 +15,10 @@
 // through the resolve's locations, with the pool's K/V of its Index pages
 // overwritten, gives the bits it gives through the page tables alone, also
 // once its blocks' copies changed after the cache read them (an adoption,
-// which keeps a block's id) and from cached blocks.
+// which keeps a block's id) and from cached blocks: lanes of one tile at a
+// lane cap of 8, lanes of 12 rows at a cap of 16, whose tiles' lists follow
+// the lanes before them, and lanes of 5 rows at a cap of 16, whose second
+// tile's list is empty.
 #include "AttentionFixture.hpp"
 #include "TestAdmission.hpp"
 #include "TestBuffers.hpp"
@@ -133,7 +136,7 @@ std::vector<std::vector<uint32_t>> resolve(MetalBackend &backend, KvBlockCache &
   const ops::AttentionBlocks lanesBlocks{lists, counts, stride, 0};
   ops::PagedAttention::addBlockLists(graph, masks, words, sequences,
                                      {layout, static_cast<uint32_t>(lanes.size()) * kRows}, lanesBlocks);
-  const ops::AttentionBlocks located = cache.addResolve(graph, layer, lanes, lanesBlocks, locations, stats);
+  const ops::AttentionBlocks located = cache.addResolve(graph, layer, lanes, lanesBlocks, 1, locations, stats);
   require(located.locations.sameView(locations) && located.locationPages && located.lists.sameView(lists) &&
               located.stride == stride,
           "a resolve did not hand its lists on with their locations");
@@ -576,9 +579,13 @@ template <typename T> void overwrite(const test::AttentionFixture &fixture, uint
     }
 }
 
-template <typename T> void attendsThroughLocations(MetalBackend &backend, kv::Format format) {
+// Lanes of `rows` rows at a lane cap of `cap`: each lane's tiles at the cap
+// take their lists after the lanes before it.
+template <typename T>
+void attendsThroughLocations(MetalBackend &backend, kv::Format format, uint32_t rows, uint32_t cap) {
   using Tensor = test::AttentionFixturePlan::Tensor;
-  constexpr uint32_t kQueryHeads = 24, kLayer = 1, kRows = splash::ops::kDecodeLaneRows, kTokens = SPLASH_ATTENTION_BLOCK_TOKENS;
+  constexpr uint32_t kQueryHeads = 24, kLayer = 1, kTokens = SPLASH_ATTENTION_BLOCK_TOKENS;
+  const uint32_t laneLists = kv::attentionTiles(cap);
   const kv::Layout layout = layoutOf(format);
   const test::AttentionShape shape{kQueryHeads, layout.kvHeads, layout.headDimension, format, true};
   const test::AttentionFixturePlan::Histories histories{1503, 1219};
@@ -587,7 +594,7 @@ template <typename T> void attendsThroughLocations(MetalBackend &backend, kv::Fo
   attended.attentionLayers = 1;
   attended.indexDimension = 0;
   const test::AttentionFixturePlan plan = test::AttentionFixturePlan::make(
-      shape, lanes, kRows, histories,
+      shape, lanes, rows, histories,
       ops::PagedAttention::workspace(lanes * kv::kAttentionMaximumSplits, kQueryHeads, attended),
       {.poolLayers = layout.attentionLayers, .layer = kLayer, .extentPages = kExtentPages});
   test::AttentionFixture fixture(backend, plan, "kv-block-cache-test");
@@ -600,13 +607,13 @@ template <typename T> void attendsThroughLocations(MetalBackend &backend, kv::Fo
   // own, as QSA's lists do (masks of each lane's rows, a bit a block); lane
   // 1's rows select blocks 1, 2 and 5 of each page, so that a page's read
   // starts past its first record and passes over records it does not place.
-  const uint32_t visible = std::max(histories[0], histories[1]) + kRows, words = visible / kTokens / 32 + 1;
-  const MetalBuffer masks = test::sharedBuffer(backend, uint64_t{lanes} * kRows * words * sizeof(uint32_t));
+  const uint32_t visible = std::max(histories[0], histories[1]) + rows, words = visible / kTokens / 32 + 1;
+  const MetalBuffer masks = test::sharedBuffer(backend, uint64_t{lanes} * rows * words * sizeof(uint32_t));
   std::memset(masks.contents(), 0, masks.sizeBytes());
   std::vector<ops::BlockListRows> sequences;
   for (uint32_t lane = 0; lane < lanes; ++lane) {
-    for (uint32_t row = 0; row < kRows; ++row) {
-      uint32_t *bits = static_cast<uint32_t *>(masks.contents()) + (uint64_t{lane} * kRows + row) * words;
+    for (uint32_t row = 0; row < rows; ++row) {
+      uint32_t *bits = static_cast<uint32_t *>(masks.contents()) + (uint64_t{lane} * rows + row) * words;
       const uint32_t own = (histories[lane] + row) / kTokens;
       for (uint32_t block = 0; block <= own; ++block) {
         const uint32_t place = block % kPlaces;
@@ -614,17 +621,22 @@ template <typename T> void attendsThroughLocations(MetalBackend &backend, kv::Fo
           bits[block / 32] |= 1u << (block % 32);
       }
     }
-    sequences.push_back({lane, kRows, histories[lane], lane});
+    sequences.push_back({lane, cap, histories[lane], lane * laneLists});
   }
-  const uint32_t stride = visible / kTokens + 1;
-  const ops::AttentionBlocks blocks{test::sharedBuffer(backend, uint64_t{lanes} * stride * sizeof(uint32_t)),
-                                    test::sharedBuffer(backend, lanes * sizeof(uint32_t)), stride, 0};
+  // Lists and counts of no earlier list: a count the lists leave unwritten
+  // names entries past every page.
+  const uint32_t stride = visible / kTokens + 1, lists = lanes * laneLists;
+  const ops::AttentionBlocks blocks{test::sharedBuffer(backend, uint64_t{lists} * stride * sizeof(uint32_t)),
+                                    test::sharedBuffer(backend, lists * sizeof(uint32_t)), stride, 0};
   const auto attend = [&](KvBlockCache *cache, const Lanes &sources, const std::shared_ptr<KvReadStats> &stats) {
+    std::memset(blocks.lists.contents(), 0xff, blocks.lists.sizeBytes());
+    std::memset(blocks.counts.contents(), 0xff, blocks.counts.sizeBytes());
     metal::CommandGraph graph;
     ops::PagedAttention::addBlockLists(graph, masks, words, sequences, fixture.rows(), blocks);
-    const MetalBuffer locations = test::sharedBuffer(backend, uint64_t{lanes} * stride * sizeof(uint32_t));
+    const MetalBuffer locations = test::sharedBuffer(backend, uint64_t{lists} * stride * sizeof(uint32_t));
     fixture.addGraph(graph, verify,
-                     cache ? cache->addResolve(graph, kLayer, sources, blocks, locations, stats) : blocks);
+                     cache ? cache->addResolve(graph, kLayer, sources, blocks, laneLists, locations, stats) : blocks,
+                     laneLists);
     static_cast<void>(backend.submitCommandAsync(graph.command()).wait());
     const auto *output = static_cast<const uint16_t *>(fixture.buffer(Tensor::Output).contents());
     return std::vector<uint16_t>(output, output + fixture.buffer(Tensor::Output).sizeBytes() / sizeof(uint16_t));
@@ -661,15 +673,19 @@ template <typename T> void attendsThroughLocations(MetalBackend &backend, kv::Fo
   auto read = std::make_shared<KvReadStats>();
   require(attend(&cache, earlier, read) != resident, "attention through other copies' bytes did not differ");
   auto stats = std::make_shared<KvReadStats>();
-  require(attend(&cache, sources, stats) == resident && stats->misses == read->misses && !stats->hits,
-          "attention through the resolve's locations differs, or found blocks of the copies before");
+  require(attend(&cache, sources, stats) == resident, "attention through the resolve's locations differs");
+  // A block two of a lane's tiles list is read once, the second a hit.
+  require(stats->misses == read->misses && stats->hits == read->hits,
+          "the resolve found blocks of the copies before");
   auto again = std::make_shared<KvReadStats>();
-  require(attend(&cache, sources, again) == resident && again->hits == stats->misses && !again->misses,
+  require(attend(&cache, sources, again) == resident && again->hits == stats->misses + stats->hits &&
+              !again->misses,
           "attention through cached blocks differs");
   require(stats->misses > indexed && stats->paged && cache.takeFailures().empty(),
           "the located attention read no block or left none to the page table");
-  std::cout << "kv_block_cache_test: located attention " << kv::formatName(format) << ", " << stats->misses
-            << " blocks read, " << stats->paged << " paged PASS\n";
+  std::cout << "kv_block_cache_test: located attention " << kv::formatName(format) << ", lanes of " << rows
+            << " rows at a cap of " << cap << ", " << stats->misses << " blocks read, " << stats->paged
+            << " paged PASS\n";
 }
 
 } // namespace
@@ -688,8 +704,10 @@ int main(int argc, const char *argv[]) {
       growsAsAPool(backend);
       aTargetAtTheFloorsIsRebuildOnly(backend);
       failsTheLanesOfUnreadBlocks(backend);
-      attendsThroughLocations<int8_t>(backend, kv::Format::Int8);
-      attendsThroughLocations<uint16_t>(backend, kv::Format::BFloat16);
+      attendsThroughLocations<int8_t>(backend, kv::Format::Int8, 8, 8);
+      attendsThroughLocations<int8_t>(backend, kv::Format::Int8, 12, 16);
+      attendsThroughLocations<uint16_t>(backend, kv::Format::BFloat16, 12, 16);
+      attendsThroughLocations<uint16_t>(backend, kv::Format::BFloat16, 5, 16);
       refusesWhatItCannotPlace(argv[1]);
       std::cout << "kv_block_cache_test: PASS\n";
     } catch (const std::exception &error) {

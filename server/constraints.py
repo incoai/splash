@@ -90,10 +90,10 @@ class TokenConstraint:
         before a first token (its request's one row). At most Ready's mask
         rows less one of them, as many as a request simulates: the engine
         takes a row and a token for that many after each row of a response
-        (Protocol.cpp's forcedWords), and a grammar forcing 13 tokens in a
-        row, as a named tool call's opening does, would otherwise send an
-        8-token request's response past its frame and close the
-        connection."""
+        (Protocol.cpp's forcedWords), and a grammar's longer forced run
+        would otherwise send a response past its frame and close the
+        connection, as a run of 13 tokens, a named tool call's opening, did
+        an 8-token request's when a request simulated 8 tokens."""
         fill_next_token_bitmask(self.matcher, self.bitmask, row)
         reached[row] = True
         if row or len(forced) == 1:

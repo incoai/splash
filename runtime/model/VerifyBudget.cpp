@@ -63,6 +63,11 @@ double logit(double p) {
   return std::log(p / (1.0 - p));
 }
 
+bool valid(const VerifyBudget::Label &label) {
+  return label.position < VerifyBudget::kPositions && std::isfinite(label.feature) && label.cap >= 0.0F &&
+         label.cap <= 1.0F;
+}
+
 Parameters parametersOf(const VerifyBudget::Acceptance &acceptance) {
   Parameters parameters{acceptance.slope};
   for (uint32_t position = 0; position < VerifyBudget::kPositions; ++position)
@@ -70,12 +75,21 @@ Parameters parametersOf(const VerifyBudget::Acceptance &acceptance) {
   return parameters;
 }
 
+// Whether a label's cap bounds its chance at logit z: then the chance is the
+// cap's, whatever the parameters.
+bool capped(const VerifyBudget::Label &label, double z) { return label.cap < 1.0F && z > logit(label.cap); }
+
 // The negative log posterior, up to a constant.
 double objective(std::span<const VerifyBudget::Label> labels, const Parameters &theta,
                  const Parameters &prior) {
   double value = 0.0;
   for (const VerifyBudget::Label &label : labels) {
     const double z = theta[0] * label.feature + theta[1 + label.position];
+    if (capped(label, z)) {
+      const double cap = std::clamp(double(label.cap), 1.0e-6, 1.0 - 1.0e-6);
+      value -= label.accepted ? std::log(cap) : std::log1p(-cap);
+      continue;
+    }
     // log(1 + e^-margin), the label's negative log-likelihood, stably.
     const double margin = label.accepted ? z : -z;
     value += margin > 0.0 ? std::log1p(std::exp(-margin)) : -margin + std::log1p(std::exp(margin));
@@ -151,9 +165,9 @@ bool VerifyBudget::explores(uint32_t lanes, bool constrained) const {
 
 std::vector<VerifyBudget::Label> VerifyBudget::treeLabels(std::span<const uint32_t> tokens,
                                                          std::span<const ops::TreeRow> rows,
-                                                         std::span<const float> scores,
+                                                         std::span<const float> scores, std::span<const float> caps,
                                                          std::span<const uint32_t> selections) {
-  if (rows.empty() || tokens.size() != rows.size() || scores.size() != 2 * rows.size())
+  if (rows.empty() || tokens.size() != rows.size() || scores.size() != 2 * rows.size() || caps.size() != rows.size())
     throw std::invalid_argument("invalid verify budget tree");
   // Each row's place on the walk's path, the index of its selection (and its
   // depth); none for a row off it. A row under the path's row at place i is a
@@ -172,8 +186,9 @@ std::vector<VerifyBudget::Label> VerifyBudget::treeLabels(std::span<const uint32
     const bool accepted = tokens[row] == selections[at];
     if (accepted)
       place[row] = at + 1;
-    if (const float probability = scores[2 * row]; probability >= 0.0F && probability <= 1.0F)
-      labels.push_back({at, static_cast<float>(logit(probability)), accepted});
+    if (const float probability = scores[2 * row], cap = caps[row];
+        probability >= 0.0F && probability <= 1.0F && cap >= 0.0F && cap <= 1.0F)
+      labels.push_back({at, static_cast<float>(logit(probability)), accepted, cap});
   }
   return labels;
 }
@@ -186,7 +201,7 @@ void VerifyBudget::observe(std::span<const Lane> lanes, bool constrained, double
     if (!lane.verifyRows || lane.verifyRows > kBlockRows)
       throw std::invalid_argument("invalid verify budget lane");
     for (const Label &label : lane.labels)
-      if (label.position >= kPositions || !std::isfinite(label.feature))
+      if (!valid(label))
         throw std::invalid_argument("invalid verify budget label");
     rows += lane.verifyRows;
   }
@@ -245,7 +260,7 @@ std::vector<VerifyBudget::Label> VerifyBudget::labels(bool samples) const {
 
 VerifyBudget::Acceptance VerifyBudget::fit(std::span<const Label> labels, const Acceptance &start) {
   for (const Label &label : labels)
-    if (label.position >= kPositions || !std::isfinite(label.feature))
+    if (!valid(label))
       throw std::invalid_argument("invalid verify budget label");
   const Parameters prior = parametersOf(kPrior);
   Parameters theta = parametersOf(start);
@@ -255,7 +270,10 @@ VerifyBudget::Acceptance VerifyBudget::fit(std::span<const Label> labels, const 
     std::array<Parameters, kParameters> hessian{};
     for (const Label &label : labels) {
       const uint32_t b = 1 + label.position;
-      const double p = 1.0 / (1.0 + std::exp(-(theta[0] * label.feature + theta[b])));
+      const double z = theta[0] * label.feature + theta[b];
+      if (capped(label, z))
+        continue;
+      const double p = 1.0 / (1.0 + std::exp(-z));
       const double residual = p - (label.accepted ? 1.0 : 0.0);
       const double weight = p * (1.0 - p);
       gradient[0] += residual * label.feature;

@@ -1004,7 +1004,7 @@ class SmokeRealTests(unittest.TestCase):
             contextlib.redirect_stdout(io.StringIO()),
         ):
             smoke_real.run_sampling(8000, "test-model")
-        # Where the verify budget chooses the rows, greedy answers need not
+        # Where the verify budget learns, greedy answers need not
         # repeat.
         output = io.StringIO()
         with (

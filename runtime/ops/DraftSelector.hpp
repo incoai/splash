@@ -41,13 +41,16 @@ struct DraftSelectorBuffers final {
   // it drew, in the order drawn (uint8 [SPLASH_TREE_CHILDREN], 0xff past
   // them), and its next position's candidates' probabilities (fp32
   // [SPLASH_DRAFT_CANDIDATES]), which a sampled verify row's selection tests
-  // (metal/abi/Sampling.h).
+  // (metal/abi/Sampling.h); and each row's cap (fp32), at most which the
+  // draft step to it estimated it (DraftTreeParams; 1 for a row of no draft
+  // probability).
   metal::MetalBuffer treeTokens;
   metal::MetalBuffer trees;
   metal::MetalBuffer treeScores;
   metal::MetalBuffer treeSizes;
   metal::MetalBuffer treeDraws;
   metal::MetalBuffer treeNext;
+  metal::MetalBuffer treeCaps;
   // A decode step's rows (ops::StepRows) as addVerifyRows lays them out from
   // the trees: each row's token, its verify input, its tree row, and its
   // source, the row of its lane's tree it is (uint32, SPLASH_NO_TOKEN past a
@@ -69,7 +72,8 @@ struct DraftCalibration final {
 
 // How one lane's tree grows (DraftTreeParams): from its anchor, over a
 // verify block's rows, no row deeper than `depth` (the tokens it may retain
-// less one), with the first `chain` tokens of its host chain and up to
+// less one) nor more rows than depth + 1, with the first `chain` tokens of
+// its host chain and up to
 // `children` children a draft row (none: its rows are its host chain's), its
 // draft steps estimated by `calibration`. A greedy lane (temperature 0) takes
 // a row's most likely candidates; a sampled lane draws them without
@@ -80,7 +84,7 @@ struct DraftTreeLane final {
   uint32_t anchor = 0;
   uint32_t depth = 0;
   uint32_t chain = 0;
-  uint32_t children = 1;
+  uint32_t children = SPLASH_TREE_CHILDREN;
   DraftCalibration calibration{};
   float temperature = 0.0F;
   uint64_t noise = 0;

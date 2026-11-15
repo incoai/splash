@@ -36,6 +36,15 @@ public:
   // (ops::DraftSelector::addVerifyRows), until the next command that
   // selects.
   [[nodiscard]] static uint32_t lastVerifyRows(const Runtime &runtime, uint32_t lane);
+  // The path of the rows batch lane `lane` of the last decode step retained,
+  // a bit a row of its rows from its first (metal/abi/VerifyTree.h): a chain
+  // of r rows is ops::chainPath(r); until the next command that selects.
+  [[nodiscard]] static uint32_t lastRetainedRows(const Runtime &runtime, uint32_t lane);
+  // Every later decode step of a runtime takes `rows` rows, at most a verify
+  // block's a lane and at least a row a lane, each of them verified, in place
+  // of a draft's block a lane, and teaches the verify budget nothing; none
+  // gives the draft's block back.
+  static void forceStepRows(Runtime &runtime, std::optional<uint32_t> rows);
   // While capturing, each command that selects first tokens or verifies
   // copies the rows lastLogits returns, as the target's forward wrote them
   // before the policy rewrites them in place: for each of its batch lanes,
@@ -51,6 +60,9 @@ public:
   // The tokens request `requestId`'s lookup index holds (model::LookupIndex),
   // until its next command or suspension.
   [[nodiscard]] static std::span<const uint32_t> lookupTokens(const Runtime &runtime, uint64_t requestId);
+  // The lookup chain request `requestId`'s latest decode cycle proposed beside
+  // its draft's tree, until its next; none where it proposed none.
+  [[nodiscard]] static std::span<const uint32_t> lookupChain(const Runtime &runtime, uint64_t requestId);
   // The GPU tables of resident request `requestId`'s lane as its last
   // command left them, every entry the lane holds: its page table and, for
   // a layout with a block index, its index table (none without).

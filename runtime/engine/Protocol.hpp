@@ -283,8 +283,8 @@ struct ReadyEvent {
   // generation (its layout's vocabularySize and stopTokens).
   uint32_t vocabularySize = 0;
   std::vector<uint32_t> stopTokens{};
-  // The rows of one mask request: before the anchor and after each draft
-  // query row (ProtocolLimits::maxSimulationTokens + 1).
+  // The rows of one mask request: before the anchor and after each of a
+  // verify block's rows (ProtocolLimits::maxSimulationTokens + 1).
   uint32_t maskRows = 0;
 
   bool operator==(const ReadyEvent &) const = default;

@@ -78,8 +78,6 @@ const ops::Projection &QwenTarget::vocabularyProjection() const noexcept {
   return weightsBase_.logitsProjection;
 }
 
-bool QwenTarget::verifiesTrees() const noexcept { return false; }
-
 uint32_t QwenTarget::decodeStorageLanes(uint32_t lanes) const {
   const uint32_t rows = lanes * kVerifyRows;
   uint32_t storageRows = rows;
@@ -288,11 +286,13 @@ void QwenTarget::addPrefillMixer(PrefillStep &step, const QwenAttentionWeights &
     if (step.spilled.active()) {
       if (blocks.empty() || !blocks.front().stride)
         throw std::logic_error("a decode step over spilled K/V attends without block lists");
-      // The lanes' lists lie in one buffer, each from its own list
-      // (Qwen4ExpTarget::addPrefillQsa), which the reads locate at once.
+      // The lanes' lists lie in one buffer, the lists of each lane's tiles at
+      // the lane cap after the lanes before it (Qwen4ExpTarget::addDecodeQsa),
+      // which the reads locate at once.
       ops::AttentionBlocks command = blocks.front();
       command.list = 0;
-      const ops::AttentionBlocks located = step.spilled.verify(step.graph, layer, command);
+      const ops::AttentionBlocks located =
+          step.spilled.verify(step.graph, layer, command, step.attention->sequences().front().tiles());
       for (size_t index = 0; index < blocks.size(); ++index) {
         attended[index] = located;
         attended[index].list = blocks[index].list;

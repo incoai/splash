@@ -57,13 +57,12 @@ using metal::CommandTiming;
 using metal::MetalBackend;
 using metal::MetalBuffer;
 
-// A decode cycle's rows over `lanes` lanes: a draft block's a lane, which its
-// selector lays out over the lanes' trees (ops::DraftSelector::addVerifyRows).
-// The host's choice of a cycle's rows (VerifyBudget::stepRows) replaces it
-// once the target's kernels read each lane's rows from the layout, not at
-// lane x kDecodeRows.
-constexpr ops::StepRows decodeStep(uint32_t lanes) noexcept {
-  return {lanes, lanes * kDraftRows, ops::verifyLaneCap(lanes * kDraftRows, lanes)};
+// A decode step of `rows` rows over `lanes` lanes (ops::StepRows), whose
+// selector lays them out over the lanes' trees (ops::DraftSelector::
+// addVerifyRows), at the lane cap its rows need: a cycle's are a draft's
+// block a lane, or the rows a test forces (Runtime::Impl::chooseStep).
+constexpr ops::StepRows stepOf(uint32_t lanes, uint32_t rows) noexcept {
+  return {lanes, rows, ops::verifyLaneCap(rows, lanes)};
 }
 // The row a lane selects its first token after a prompt from, lane x
 // decodeLaneRows: the target's LM head runs over decodeLaneRows rows of each
@@ -437,6 +436,15 @@ struct Runtime::Impl {
     std::vector<float> chances;
   };
 
+  // A lane's proposals of a cycle beside its draft's (proposeChain): its
+  // host chain's tokens, and whether they are forced
+  // (ops::DraftTreeLane::forced), which grows no tree of its draft's beside
+  // them.
+  struct LaneProposals final {
+    uint32_t chain = 0;
+    bool forced = false;
+  };
+
   struct DecodeLaneResult final {
     Request *request = nullptr;
     uint32_t retained = 0;
@@ -527,12 +535,15 @@ struct Runtime::Impl {
   ops::Sampling sampling;
   std::unique_ptr<QwenTarget> targetModel;
   DFlashDraft draftModel;
-  // The acceptance model and cycle costs the decode cycles' verify rows
-  // follow where the budget chooses them (budgetsVerifyRows); none where
-  // the cycles verify every row.
+  // The acceptance model every lane's tree estimates follow and the costs
+  // by which a MoE target's GPU budget cuts the rows of a cycle
+  // (budgetsVerifyRows), under --verify-rows auto. None under --verify-rows
+  // all: a cycle then verifies every row of a draft's block a lane and
+  // nothing learns, so that its outputs repeat.
   std::optional<VerifyBudget> verifyBudget;
+  bool cutsVerifyRows = false;
   // The lookup chains' acceptance, which every unconstrained request's
-  // cycles teach, greedy and sampled lanes apart.
+  // cycles teach under --verify-rows auto, greedy and sampled lanes apart.
   LookupAcceptance lookupAcceptance;
   ops::AneFfn *aneFfn;
   // The readers of spilled K/V, when the target's K/V spills.
@@ -648,6 +659,10 @@ struct Runtime::Impl {
   VisionArenaPool visionPool{*this};
   EmbeddingsPool embeddingsPool{*this};
   std::vector<ElasticPool *> pools;
+  // The rows every decode step takes in place of a draft's block a lane,
+  // each of them verified, which such steps do not teach, as a test forces
+  // them (RuntimeInstrumentation::forceStepRows).
+  std::optional<uint32_t> forcedStepRows;
 #ifdef SPLASH_RUNTIME_INSTRUMENTATION
   // Whether commands copy the target's logits before their policy
   // (RuntimeInstrumentation::captureTargetLogits), and the copies, one per
@@ -683,8 +698,9 @@ struct Runtime::Impl {
     decodeArena = std::make_unique<DecodeArena>(backend, geometry, operators);
     penaltyTable =
         decodeArena->batchSlice(DecodeTensor::PenaltyState, kLaneCount);
-    if (budgetsVerifyRows(model, value.verifyRows))
+    if (value.verifyRows == VerifyRows::Auto)
       verifyBudget.emplace();
+    cutsVerifyRows = budgetsVerifyRows(model, value.verifyRows);
     if (ExpertStore *store = model.expertStore())
       pools.push_back(&expertPool.emplace(*store));
     if (blockCache) {
@@ -720,7 +736,8 @@ struct Runtime::Impl {
     CommandGraph graph;
     sampling.addInitial(graph, policies, samplingBuffers(2), std::span(kDecodeFirstRows).first(2),
                         geometry.target.stopTokens, penalties);
-    sampling.addVerify(graph, policies, samplingBuffers(2), decodeStep(2), geometry.target.stopTokens, penalties);
+    sampling.addVerify(graph, policies, samplingBuffers(2), stepOf(2, 2 * kDraftRows), geometry.target.stopTokens,
+                       penalties);
     backend.preparePipelines(graph.dispatches());
   }
 
@@ -1893,10 +1910,11 @@ struct Runtime::Impl {
     if (!graph.dispatches().empty()) backend.preparePipelines(graph.dispatches());
   }
 
-  // Creates the pipelines of a decode step of `entries`, each after the
-  // longest history the target serves before a lane's most rows, without
-  // running it (Runtime::warmupDecodeBatch). The lanes' inputs are prepared
-  // for that history; the next decode prepares its own.
+  // Creates the pipelines of the decode steps of `entries` of each lane
+  // cap's most rows, each lane after the longest history the target serves
+  // before a lane's most rows, without running them
+  // (Runtime::warmupDecodeBatch). The lanes' inputs are prepared for that
+  // history; the next decode prepares its own.
   void prepareLongestVerify(std::span<Request *const> entries) {
     const uint32_t history = geometry.target.contextTokens() - kDecodeRows;
     const std::vector<uint32_t> tokens(history);
@@ -1908,10 +1926,14 @@ struct Runtime::Impl {
       targetModel->prepareVerifyLane(lane, history, request);
       items[lane] = {.requestId = entries[lane]->id, .logicalPosition = history, .pageTable = pages};
     }
-    SpilledKvReads reads;
-    CommandGraph graph;
-    encodeTargetDecodeForward(graph, entries, items, decodeStep(static_cast<uint32_t>(entries.size())), reads);
-    backend.preparePipelines(graph.dispatches());
+    // The largest step of each lane cap.
+    const auto lanes = static_cast<uint32_t>(entries.size());
+    for (const uint32_t rows : {lanes * kDraftRows, lanes * kDecodeRows}) {
+      SpilledKvReads reads;
+      CommandGraph graph;
+      encodeTargetDecodeForward(graph, entries, items, stepOf(lanes, rows), reads);
+      backend.preparePipelines(graph.dispatches());
+    }
   }
 
   // Creates the pipelines of a decode cycle's state capture
@@ -2268,18 +2290,19 @@ struct Runtime::Impl {
                     draftModel.decodeStorageLanes(lanes));
   }
 
-  // The cycle's rows (decodeStep): each lane's tree of the draft's proposals
-  // no deeper than its retention limit, maximumRows[lane] less one, and the
-  // rows of the trees it verifies, by the acceptance model and the costs of
-  // `constrained` cycles of its lane count.
+  // The cycle's step (`step`): each lane's tree of the draft's proposals and
+  // its host chain (`proposals`), no deeper than depths[lane], and the rows
+  // of the trees it verifies, by the acceptance model and, where the budget
+  // cuts them, the costs of `constrained` cycles of its lane count.
   void encodeDraftBatchGraph(CommandGraph &graph,
                              std::span<Request *const> entries,
                              std::span<const uint64_t> logicalPositions,
-                             std::span<const uint32_t> maximumRows,
+                             std::span<const uint32_t> depths,
+                             std::span<const LaneProposals> proposals,
                              bool constrained, const ops::StepRows &step) {
     if (entries.empty() || entries.size() > kLaneCount ||
         entries.size() != logicalPositions.size() ||
-        entries.size() != maximumRows.size()) {
+        entries.size() != depths.size() || entries.size() != proposals.size()) {
       throw std::invalid_argument("invalid draft decode batch");
     }
     const uint32_t lanes = static_cast<uint32_t>(entries.size());
@@ -2324,17 +2347,20 @@ struct Runtime::Impl {
         throw std::invalid_argument("draft batch lane has no anchor");
       ops::DraftTreeLane &tree = trees[lane];
       tree.anchor = *entry.pendingToken;
-      tree.depth = maximumRows[lane] - 1;
-      // A lane grows a tree where its target verifies trees; a constrained
+      tree.depth = depths[lane];
+      // A lane grows a tree beside its host chain, but beside a forced one,
+      // whose tokens the target selects (proposeForcedChain); a constrained
       // lane's grammar finds each row's mask along the row's path
       // (ConstrainedDecodeTicket).
-      const ops::SamplingPolicy policy = samplingPolicy(entry);
-      const bool branches = targetModel->verifiesTrees();
-      tree.children = branches ? SPLASH_TREE_CHILDREN : 1;
+      tree.children = proposals[lane].forced ? 0 : SPLASH_TREE_CHILDREN;
+      tree.chain = std::min(proposals[lane].chain, tree.depth);
+      tree.forced = proposals[lane].forced;
+      entry.lookupChain.resize(std::min<size_t>(entry.lookupChain.size(), tree.chain));
       // Its draft steps' estimates are its policy's acceptance model's, a
       // sampled lane's learned from its verify rows' rejection sampling. A
       // sampled lane draws its rows' children from its draft at its
       // temperature.
+      const ops::SamplingPolicy policy = samplingPolicy(entry);
       const VerifyBudget::Acceptance &acceptance =
           verifyBudget ? verifyBudget->acceptance(policy.samples()) : VerifyBudget::kPrior;
       tree.calibration = {acceptance.slope, acceptance.intercepts};
@@ -2342,55 +2368,54 @@ struct Runtime::Impl {
         tree.temperature = policy.temperature;
         tree.noise = entry.cycleNoise;
       }
-      entry.lookupChain.clear();
-      // A thinking end at the lane's first row is its proposals, a chain the
-      // verify selects whatever its logits: no draft row beside it could be
-      // accepted. Before its thinking ends, where a cutoff would replace its
-      // later rows' selections, a lane proposes no other chain. Its host chain
-      // is otherwise the tokens its grammar forces after its anchor, where it
-      // forces any, or its lookup chain.
-      if (const uint32_t forced = policy.thinkingCutoff ? policy.thinkingCutoff->replacedProposals() : 0) {
-        proposeForcedChain(tree, lane, policy.thinkingCutoff->end.first(forced));
-        tree.children = 0;
-      } else if (branches && !policy.thinkingCutoff) {
-        if (entry.grammarChain.empty())
-          proposeLookup(entry, tree, lane);
-        else
-          proposeForcedChain(tree, lane, entry.grammarChain);
-      }
     }
     const ops::DraftSelectorBuffers selection{
         d(DecodeTensor::Logits),          d(DecodeTensor::TopPartialIds),   d(DecodeTensor::TopPartialValues),
         d(DecodeTensor::Candidates),      d(DecodeTensor::Unary),           d(DecodeTensor::SelectorHidden),
         d(DecodeTensor::ChainTokens),     d(DecodeTensor::ChainRates),      d(DecodeTensor::DraftTreeTokens),
         d(DecodeTensor::DraftTrees),      d(DecodeTensor::DraftTreeScores), d(DecodeTensor::DraftTreeSizes),
-        d(DecodeTensor::DraftTreeDraws),  d(DecodeTensor::DraftTreeNext),   d(DecodeTensor::InputTokens),
-        d(DecodeTensor::TreeRows),        d(DecodeTensor::LaneLayout),      d(DecodeTensor::VerifyRows),
-        d(DecodeTensor::VerifySources)};
+        d(DecodeTensor::DraftTreeDraws),  d(DecodeTensor::DraftTreeNext),   d(DecodeTensor::DraftTreeCaps),
+        d(DecodeTensor::InputTokens),     d(DecodeTensor::TreeRows),        d(DecodeTensor::LaneLayout),
+        d(DecodeTensor::VerifyRows),      d(DecodeTensor::VerifySources)};
     draftModel.addSelection(graph, selection, std::span(trees).first(lanes));
-    // Without the budget, or in a cycle that explores, the cycle verifies as
-    // many of the trees' rows as it holds.
+    // Where the budget does not cut the rows, in a cycle that explores, or
+    // in a forced step, the cycle verifies as many of the trees' rows as its
+    // step holds.
     std::array<float, VerifyBudget::kBlockRows * VerifyBudget::kLanes + 1> costs{};
-    const bool budgets = verifyBudget && !verifyBudget->explores(lanes, constrained);
-    if (budgets)
+    const bool cuts = cutsVerifyRows && !forcedStepRows && !verifyBudget->explores(lanes, constrained);
+    if (cuts)
       costs = verifyBudget->costs(lanes, constrained);
     ops::DraftSelector::addVerifyRows(graph, selection, step,
-                                      budgets ? std::span<const float>(costs) : std::span<const float>{});
+                                      cuts ? std::span<const float>(costs) : std::span<const float>{});
+  }
+
+  // A lane's proposals of a cycle beside its draft's: its host chain of at
+  // most `depth` tokens in the lane's chain rows (DecodeTensor::ChainTokens
+  // and ChainRates). A thinking
+  // end at the lane's first row is its proposals, a chain the verify selects
+  // whatever its logits. Its host chain is otherwise the tokens its grammar
+  // forces after its anchor, where it forces any, or its lookup chain.
+  LaneProposals proposeChain(Request &entry, uint32_t lane, const ops::SamplingPolicy &policy, uint32_t depth) {
+    entry.lookupChain.clear();
+    if (const uint32_t forced = policy.thinkingCutoff ? policy.thinkingCutoff->replacedProposals() : 0)
+      return proposeForcedChain(lane, policy.thinkingCutoff->end.first(forced), depth);
+    return entry.grammarChain.empty() ? proposeLookup(entry, lane, depth)
+                                      : proposeForcedChain(lane, entry.grammarChain, depth);
   }
 
   // A host chain whose every token the target selects once the path before
   // it is accepted, each estimated at 1 for every agreement with the draft:
   // a thinking end, which its cutoff selects, and the tokens a grammar
   // forces, which its masks admit alone (at each of the 847 forced positions
-  // of 15 traced structured outputs of Qwen3.8-27B). A draft step that joins
-  // its row labels nothing: the target accepts it whatever the draft's odds.
-  void proposeForcedChain(ops::DraftTreeLane &tree, uint32_t lane, std::span<const uint32_t> tokens) {
-    tree.chain = static_cast<uint32_t>(std::min<size_t>(tokens.size(), SPLASH_TREE_CHAIN_TOKENS));
-    tree.forced = true;
-    std::copy_n(tokens.begin(), tree.chain,
+  // of 15 traced structured outputs of Qwen3.8-27B). Beside its tokens the
+  // draft's rows are dead, so its lane grows no tree.
+  LaneProposals proposeForcedChain(uint32_t lane, std::span<const uint32_t> tokens, uint32_t depth) {
+    const auto chain = static_cast<uint32_t>(std::min<size_t>({tokens.size(), depth, SPLASH_TREE_CHAIN_TOKENS}));
+    std::copy_n(tokens.begin(), chain,
                 contents<uint32_t>(decodeArena->get(lane, DecodeTensor::ChainTokens), "chain tokens"));
     std::fill_n(contents<float>(decodeArena->get(lane, DecodeTensor::ChainRates), "chain rates"),
-                tree.chain * SPLASH_TREE_AGREEMENTS, 1.0F);
+                chain * SPLASH_TREE_AGREEMENTS, 1.0F);
+    return {chain, true};
   }
 
   // The tokens its grammar forced after mask row `row`'s path, which a
@@ -2404,31 +2429,38 @@ struct Runtime::Impl {
   }
 
   // A lane's lookup chain beside its draft's tree: the tokens that followed
-  // the latest earlier occurrence of its latest tokens (LookupIndex), as deep
-  // as its tree may grow, each estimated at its depth and the match's length
-  // for each agreement with the draft, by its policy's counts
-  // (LookupAcceptance), of which the selector takes its own.
-  void proposeLookup(Request &entry, ops::DraftTreeLane &tree, uint32_t lane) {
+  // the latest earlier occurrence of its latest tokens (LookupIndex), at most
+  // `depth`, each estimated at its depth and the match's length for each
+  // agreement with the draft, by its policy's counts (LookupAcceptance), of
+  // which the selector takes its own.
+  LaneProposals proposeLookup(Request &entry, uint32_t lane, uint32_t depth) {
     const LookupIndex &index = entry.lookup;
     if (index.tokens().size() != entry.tokens.size() + 1 || index.tokens().back() != *entry.pendingToken)
       throw std::logic_error("a lookup index does not hold its request's tokens");
-    const std::span<const uint32_t> chain = index.proposals(std::min(tree.depth, SPLASH_TREE_CHAIN_TOKENS));
+    const std::span<const uint32_t> chain = index.proposals(std::min(depth, SPLASH_TREE_CHAIN_TOKENS));
     if (chain.empty())
-      return;
+      return {};
     const uint32_t length = index.match().length;
     const bool samples = samplingEnabled(entry);
     auto *tokens = contents<uint32_t>(decodeArena->get(lane, DecodeTensor::ChainTokens), "chain tokens");
     auto *rates = contents<float>(decodeArena->get(lane, DecodeTensor::ChainRates), "chain rates");
-    for (uint32_t depth = 0; depth < chain.size(); ++depth) {
-      tokens[depth] = chain[depth];
+    for (uint32_t at = 0; at < chain.size(); ++at) {
+      tokens[at] = chain[at];
       for (uint32_t agreement = 0; agreement < SPLASH_TREE_AGREEMENTS; ++agreement)
-        rates[depth * SPLASH_TREE_AGREEMENTS + agreement] =
-            lookupAcceptance.rate(samples, length, depth, static_cast<LookupAgreement>(agreement));
+        rates[at * SPLASH_TREE_AGREEMENTS + agreement] =
+            lookupAcceptance.rate(samples, length, at, static_cast<LookupAgreement>(agreement));
     }
-    tree.chain = static_cast<uint32_t>(chain.size());
     entry.lookupLength = length;
     // A copy: its index grows when the cycle's selections commit.
     entry.lookupChain.assign(chain.begin(), chain.end());
+    return {static_cast<uint32_t>(chain.size()), false};
+  }
+
+  // A cycle's step over `lanes` lanes: a draft's block a lane, or the rows a
+  // test forces, from a row a lane to a verify block's.
+  ops::StepRows chooseStep(uint32_t lanes) const {
+    return stepOf(lanes, forcedStepRows ? std::clamp(*forcedStepRows, lanes, lanes * kDecodeRows)
+                                        : lanes * kDraftRows);
   }
 
   // A decode step's target forward: the prompt forward over the step's rows
@@ -2537,15 +2569,11 @@ struct Runtime::Impl {
   void encodeBatchAcceptance(CommandGraph &graph,
                              std::span<Request *const> lanes,
                              std::span<const uint32_t> maximumRetained, const ops::StepRows &step) {
+    // The acceptance checks each lane's retention against the step's lane cap
+    // (ops::Sampling::addAcceptance).
     if (lanes.empty() || lanes.size() > kLaneCount ||
-        lanes.size() != maximumRetained.size()) {
+        lanes.size() != maximumRetained.size() || std::ranges::find(lanes, nullptr) != lanes.end()) {
       throw std::invalid_argument("invalid DFlash acceptance batch");
-    }
-    for (uint32_t lane = 0; lane < lanes.size(); ++lane) {
-      if (!lanes[lane] || !maximumRetained[lane] ||
-          maximumRetained[lane] > kDecodeRows) {
-        throw std::invalid_argument("invalid DFlash acceptance lane");
-      }
     }
     const uint32_t width = static_cast<uint32_t>(lanes.size());
     sampling.addAcceptance(
@@ -2738,10 +2766,12 @@ struct Runtime::Impl {
     // labels and its cost, and the lookup rates what it verified of its
     // lanes' lookup chains, but a constrained lane's: its masks reject the
     // copied tokens its grammar forbids, whatever the target would choose.
+    // Under --verify-rows all nothing learns, so that a cycle's trees, and
+    // its rows' results, repeat.
     bool commits = true;
     for (uint32_t lane = 0; lane < items.size(); ++lane)
       commits = commits && lanes[lane].failure.empty() && unreadable[lane].empty();
-    for (uint32_t lane = 0; lane < items.size() && commits; ++lane) {
+    for (uint32_t lane = 0; lane < items.size() && commits && verifyBudget && !forcedStepRows; ++lane) {
       const DecodeLaneResult &laneResult = lanes[lane];
       Request &entry = *laneResult.request;
       if (entry.lookupChain.empty() || entry.constraint == ConstraintMode::TokenMask)
@@ -2762,7 +2792,7 @@ struct Runtime::Impl {
       if (!outcome.verified.empty())
         lookupAcceptance.observe(samplingEnabled(entry), entry.lookupLength, outcome.verified, outcome.accepted);
     }
-    if (verifyBudget && commits) {
+    if (verifyBudget && commits && !forcedStepRows) {
       std::array<VerifyBudget::Lane, kLaneCount> observed{};
       for (uint32_t lane = 0; lane < items.size(); ++lane) {
         const DecodeLaneResult &laneResult = lanes[lane];
@@ -2777,6 +2807,7 @@ struct Runtime::Impl {
             {contents<uint32_t>(decodeArena->get(lane, DecodeTensor::DraftTreeTokens), "draft tree tokens"), size},
             {contents<ops::TreeRow>(decodeArena->get(lane, DecodeTensor::DraftTrees), "draft trees"), size},
             {contents<float>(decodeArena->get(lane, DecodeTensor::DraftTreeScores), "draft tree scores"), 2 * size},
+            {contents<float>(decodeArena->get(lane, DecodeTensor::DraftTreeCaps), "draft tree caps"), size},
             {retainedTokens(laneResult), std::min(laneResult.retained, laneResult.ownSelections)});
       }
       verifyBudget->observe(std::span(observed).first(items.size()), constrained,
@@ -3577,12 +3608,11 @@ Runtime::decodeAsync(const BatchPlan &plan,
     return impl_->submitInitialSelection(items, std::move(completion));
 
   const uint32_t width = static_cast<uint32_t>(items.size());
-  // The cycle's rows, which every one of its commands lays out alike.
-  const ops::StepRows step = decodeStep(width);
   std::vector<Impl::DecodeLaneResult> lanes(width);
   std::array<Impl::Request *, kLaneCount> requests{};
   std::array<uint64_t, kLaneCount> logicalPositions{};
-  std::array<uint32_t, kLaneCount> maximumRetained{};
+  std::array<uint32_t, kLaneCount> maximumRetained{}, depths{};
+  std::array<Impl::LaneProposals, kLaneCount> proposals{};
   // A cycle with a constrained lane waits for the host's masks between its
   // commands (ConstrainedDecodeTicket).
   bool constrained = false;
@@ -3610,15 +3640,33 @@ Runtime::decodeAsync(const BatchPlan &plan,
       Impl::stageSamplingCycle(entry);
       impl_->uploadSamplingUniforms(entry, lane);
     }
-
-    // DFlash has one physical graph: anchor + seven proposal rows. A shorter
-    // output budget, like the rows the lane verifies (budgetsVerifyRows),
-    // only lowers the token-exact commit count; it never changes the Metal
-    // graph shape.
+    // Its tree and host chain, as deep as the rows past its anchor it could
+    // retain whatever the step's rows (its output left, at most a verify
+    // block), and no more of its rows than that depth past its anchor: under
+    // --verify-rows all a lane verifies every row of a draft's block its
+    // output limit leaves.
+    // Under a thinking budget whose end is not due, no deeper than the
+    // thinking it has left: the cutoff's row selects the end whatever its
+    // rows below propose.
+    const ops::SamplingPolicy policy = Impl::samplingPolicy(entry);
+    const std::optional<ops::ThinkingCutoff> &cutoff = policy.thinkingCutoff;
+    depths[lane] = std::min({remaining, kDecodeRows, cutoff && cutoff->row ? cutoff->row + 1 : kDecodeRows}) - 1;
+    proposals[lane] = impl_->proposeChain(entry, lane, policy, depths[lane]);
+    requests[lane] = &entry;
+    logicalPositions[lane] = item.logicalPosition;
+  }
+  // The cycle's rows, which every one of its commands lays out alike.
+  const ops::StepRows step = impl_->chooseStep(width);
+  for (uint32_t lane = 0; lane < width; ++lane) {
+    const ModelBatchItem &item = items[lane];
+    Impl::Request &entry = *requests[lane];
+    const uint32_t remaining = entry.maxNewTokens - entry.generatedTokens;
     Impl::DecodeLaneResult &laneResult = lanes[lane];
     laneResult.request = &entry;
     laneResult.currentAnchor = *entry.pendingToken;
-    laneResult.maximumRetained = std::min(remaining, step.laneCap);
+    // At most the rows the step may give the lane: its cap, and the step's
+    // rows past a row of each other lane.
+    laneResult.maximumRetained = std::min({remaining, step.laneCap, step.rows - (width - 1)});
     if (const auto cutoff = Impl::samplingPolicy(entry).thinkingCutoff) {
       laneResult.endDrafts = cutoff->replacedProposals();
       laneResult.ownSelections = std::min(cutoff->row, ExecutionLimits::targetVerifyRows);
@@ -3626,8 +3674,6 @@ Runtime::decodeAsync(const BatchPlan &plan,
 
     impl_->prepareDecodeLane(entry, item, lane);
     impl_->prepareDecodeCapture(entry, item, laneResult);
-    requests[lane] = &entry;
-    logicalPositions[lane] = item.logicalPosition;
     maximumRetained[lane] = laneResult.maximumRetained;
   }
 
@@ -3643,9 +3689,8 @@ Runtime::decodeAsync(const BatchPlan &plan,
                               width * kDraftRows);
   impl_->draftModel.addMaskRows(commandGraph, impl_->decodeArena->batchSlice(DecodeTensor::DraftHidden0, width),
                                 width);
-  impl_->encodeDraftBatchGraph(commandGraph, entries,
-                               {logicalPositions.data(), width},
-                               {maximumRetained.data(), width}, constrained, step);
+  impl_->encodeDraftBatchGraph(commandGraph, entries, {logicalPositions.data(), width}, {depths.data(), width},
+                               std::span(proposals).first(width), constrained, step);
   std::shared_ptr<SpilledKvReads> reads = impl_->decodeReads(items);
   // The weights it reads on demand and the spilled K/V its reads bring.
   WorkCount count({}, impl_->model.expertStore(), reads);
@@ -4213,6 +4258,14 @@ uint32_t RuntimeInstrumentation::lastVerifyRows(const Runtime &runtime, uint32_t
   return *contents<uint32_t>(runtime.impl_->decodeArena->get(lane, DecodeTensor::VerifyRows), "verify rows");
 }
 
+uint32_t RuntimeInstrumentation::lastRetainedRows(const Runtime &runtime, uint32_t lane) {
+  return *contents<uint32_t>(runtime.impl_->decodeArena->get(lane, DecodeTensor::RetainedRows), "retained rows");
+}
+
+void RuntimeInstrumentation::forceStepRows(Runtime &runtime, std::optional<uint32_t> rows) {
+  runtime.impl_->forcedStepRows = rows;
+}
+
 void RuntimeInstrumentation::captureTargetLogits(Runtime &runtime, bool enabled) {
   runtime.impl_->capturingTargetLogits = enabled;
 }
@@ -4227,6 +4280,10 @@ std::optional<uint32_t> RuntimeInstrumentation::pendingToken(const Runtime &runt
 
 std::span<const uint32_t> RuntimeInstrumentation::lookupTokens(const Runtime &runtime, uint64_t requestId) {
   return runtime.impl_->requests.at(requestId).lookup.tokens();
+}
+
+std::span<const uint32_t> RuntimeInstrumentation::lookupChain(const Runtime &runtime, uint64_t requestId) {
+  return runtime.impl_->requests.at(requestId).lookupChain;
 }
 
 RuntimeInstrumentation::LaneTables RuntimeInstrumentation::laneTables(const Runtime &runtime, uint64_t requestId) {

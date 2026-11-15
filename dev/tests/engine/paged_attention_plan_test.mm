@@ -1800,6 +1800,9 @@ void attentionBlocks(metal::MetalBackend &backend) {
 // own mask row, history and list, in tiles of eight rows, the last partial,
 // up to the end of the 1,010,000 tokens YaRN serves; a list keeps to its
 // stride, and the dispatch refuses a mask shorter than its sequences' rows.
+// A sequence of fewer rows than its bound, a decode lane's under the step's
+// lane cap, lists its rows' tile and gives its bound's tiles past them empty
+// lists.
 void blockListsMatchMasks(metal::MetalBackend &backend) {
   constexpr uint32_t rowBits = SPLASH_ATTENTION_BLOCK_ROW_BITS, blockTokens = SPLASH_ATTENTION_BLOCK_TOKENS;
   constexpr uint32_t tileRows = kv::kAttentionTileRows;
@@ -1886,6 +1889,28 @@ void blockListsMatchMasks(metal::MetalBackend &backend) {
                           ops::PagedAttention::addBlockLists(encoded, mask, words, sequences,
                                                              {view, command.rows}, blocks);
                         });
+  }
+  {
+    // Five rows from 40 of a bound of sixteen, row r naming block r: the
+    // second tile's count goes from no list's to zero, and its entries stay
+    // unwritten.
+    constexpr uint32_t stride = 64, words = 1;
+    const metal::MetalBuffer laneRows = buffer(sizeof(SplashLaneRows)), mask = buffer(uint64_t{5} * words * 4),
+                             listBuffer = buffer(uint64_t{2} * stride * 4), counts = buffer(2 * 4);
+    *static_cast<SplashLaneRows *>(laneRows.contents()) = {0, 5};
+    std::memset(mask.contents(), 0, mask.sizeBytes());
+    for (uint32_t row = 0; row < 5; ++row) static_cast<uint32_t *>(mask.contents())[row * words] = 1U << row;
+    std::memset(listBuffer.contents(), 0xff, listBuffer.sizeBytes());
+    std::memset(counts.contents(), 0xff, counts.sizeBytes());
+    const std::vector<ops::BlockListRows> shorter{{0, 16, 40, 0}};
+    metal::CommandGraph graph;
+    ops::PagedAttention::addBlockLists(graph, mask, words, shorter, {laneRows, 5}, {listBuffer, counts, stride, 0});
+    static_cast<void>(backend.submitCommandAsync(graph.dispatches()).wait());
+    const auto *listed = static_cast<const uint32_t *>(listBuffer.contents());
+    const auto *listCounts = static_cast<const uint32_t *>(counts.contents());
+    require(listCounts[0] == 5 && listCounts[1] == 0 &&
+                std::all_of(listed + stride, listed + 2 * stride, [](uint32_t entry) { return entry == ~0U; }),
+            "a sequence's tile of its bound past its rows did not list nothing");
   }
   const metal::MetalBuffer any = buffer(4096);
   const ops::BlockListRows rows{0, 8, 0, 0};

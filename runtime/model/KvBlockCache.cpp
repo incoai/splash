@@ -78,6 +78,7 @@ struct KvBlockCache::Impl {
     metal::MetalBuffer lists, counts, locations;
     uint32_t stride = 0;
     uint32_t list = 0;
+    uint32_t laneLists = 0;
     std::vector<std::shared_ptr<const KvPageSources>> sources;
   };
 
@@ -225,30 +226,33 @@ void KvBlockCache::Impl::resolve(uint32_t layer, const Resolve &resolve, KvReadS
   ++stats.resolves;
   misses.clear();
   uint32_t pinned = 0;
+  // Every list of each lane's tiles, an empty one past its rows.
   for (uint32_t lane = 0; lane < resolve.sources.size(); ++lane) {
-    const uint64_t list = uint64_t{resolve.list} + lane;
-    const uint32_t entries = std::min(counts[list], resolve.stride);
-    const uint32_t *entry = lists + list * resolve.stride;
-    uint32_t *location = locations + list * resolve.stride;
     const KvPageSources *sources = resolve.sources[lane].get();
-    stats.entries += entries;
-    for (uint32_t index = 0; index < entries; ++index) {
-      const uint32_t block = entry[index] >> SPLASH_ATTENTION_BLOCK_ROW_BITS;
-      const KvPageSource *source = sources ? &(*sources)[block >> kPlaceBits] : nullptr;
-      if (!source || !source->indexed()) {
-        location[index] = SPLASH_ATTENTION_PAGED;
-        ++stats.paged;
-        continue;
-      }
-      if (!source->copy) throw std::logic_error("a page that holds only its index has no tier copy");
-      const uint64_t key = source->copy->id() << kPlaceBits | (block & kPlaceMask);
-      if (const std::optional<uint32_t> slot = slots.find(key)) {
-        pinned += !slots.pinned(*slot, load);
-        slots.touch(*slot, load, false);
-        location[index] = *slot;
-        ++stats.hits;
-      } else {
-        misses.push_back({key, source, block & kPlaceMask, lane, &location[index]});
+    for (uint32_t tile = 0; tile < resolve.laneLists; ++tile) {
+      const uint64_t list = resolve.list + uint64_t{lane} * resolve.laneLists + tile;
+      const uint32_t entries = std::min(counts[list], resolve.stride);
+      const uint32_t *entry = lists + list * resolve.stride;
+      uint32_t *location = locations + list * resolve.stride;
+      stats.entries += entries;
+      for (uint32_t index = 0; index < entries; ++index) {
+        const uint32_t block = entry[index] >> SPLASH_ATTENTION_BLOCK_ROW_BITS;
+        const KvPageSource *source = sources ? &(*sources)[block >> kPlaceBits] : nullptr;
+        if (!source || !source->indexed()) {
+          location[index] = SPLASH_ATTENTION_PAGED;
+          ++stats.paged;
+          continue;
+        }
+        if (!source->copy) throw std::logic_error("a page that holds only its index has no tier copy");
+        const uint64_t key = source->copy->id() << kPlaceBits | (block & kPlaceMask);
+        if (const std::optional<uint32_t> slot = slots.find(key)) {
+          pinned += !slots.pinned(*slot, load);
+          slots.touch(*slot, load, false);
+          location[index] = *slot;
+          ++stats.hits;
+        } else {
+          misses.push_back({key, source, block & kPlaceMask, lane, &location[index]});
+        }
       }
     }
   }
@@ -370,19 +374,19 @@ uint64_t KvBlockCache::floorBytes(uint32_t lanes) const noexcept {
 
 ops::AttentionBlocks KvBlockCache::addResolve(metal::CommandGraph &graph, uint32_t layer,
                                               std::span<const std::shared_ptr<const KvPageSources>> lanes,
-                                              const ops::AttentionBlocks &blocks,
+                                              const ops::AttentionBlocks &blocks, uint32_t laneLists,
                                               const metal::MetalBuffer &locations,
                                               std::shared_ptr<KvReadStats> stats) {
   const Impl &impl = *impl_;
-  const uint64_t entries = (uint64_t{blocks.list} + lanes.size()) * blocks.stride;
-  if (layer >= impl.format.layout().attentionLayers || lanes.empty() || lanes.size() > kLanes || !blocks.stride ||
-      !stats)
+  const uint64_t lists = blocks.list + uint64_t{laneLists} * lanes.size(), entries = lists * blocks.stride;
+  if (layer >= impl.format.layout().attentionLayers || lanes.empty() || lanes.size() > kLanes || !laneLists ||
+      !blocks.stride || !stats)
     throw std::invalid_argument("invalid hot block cache resolve");
   if (!blocks.lists.contents() || !blocks.counts.contents() || !locations.contents() ||
       blocks.lists.sizeBytes() < entries * sizeof(uint32_t) || locations.sizeBytes() < entries * sizeof(uint32_t) ||
-      blocks.counts.sizeBytes() < (uint64_t{blocks.list} + lanes.size()) * sizeof(uint32_t))
+      blocks.counts.sizeBytes() < lists * sizeof(uint32_t))
     throw std::invalid_argument("a resolve's lists, counts and locations are not CPU-visible or too small");
-  Impl::Resolve resolve{blocks.lists, blocks.counts, locations, blocks.stride, blocks.list,
+  Impl::Resolve resolve{blocks.lists, blocks.counts, locations, blocks.stride, blocks.list, laneLists,
                         {lanes.begin(), lanes.end()}};
   // A decode step's resolves come every layer and most end within a
   // millisecond, about as long as an idle GPU takes to come back to speed.

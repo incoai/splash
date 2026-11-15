@@ -552,12 +552,13 @@ enum class DecodeTensor : uint32_t {
   // Each lane's draft tree as the selector grew it, best first
   // (ops::DraftSelectorBuffers): its rows' tokens, tree rows and scores (each
   // row's draft probability and estimate), the children each row drew and
-  // its next position's probabilities, and its size.
+  // its next position's probabilities, its rows' caps, and its size.
   DraftTreeTokens,
   DraftTrees,
   DraftTreeScores,
   DraftTreeDraws,
   DraftTreeNext,
+  DraftTreeCaps,
   DraftTreeSizes,
   // Each lane's host chain of its tree: its tokens and their estimates
   // (DraftTreeParams in metal/abi/Sampling.h), which the host writes.
@@ -570,9 +571,10 @@ enum class DecodeTensor : uint32_t {
   IndexTable,
   // For a target whose K/V spills: where each entry of a verify's block
   // lists reads its block (ops::AttentionBlocks::locations), laid out as the
-  // lists are, a list's stride apart from the batch's first row: a lane's
-  // row holds two 8-row tiles' lists (SparseKvShape::verifyRows), and a
-  // lane's list of an 8-row block, list l, sits in row l / 2.
+  // lists are, a list's stride apart from the batch's first row: a step's
+  // lists are its lanes' 8-row tiles' in lane order (a lane of more than 8
+  // rows has two), list i at i strides, and a lane's row of the tensor holds
+  // two (SparseKvShape::verifyRows).
   Locations,
   // Indexed by state lane, like PageTable: a penalized request's penalty
   // words (ops::Sampling::rebuildPenaltyWords).

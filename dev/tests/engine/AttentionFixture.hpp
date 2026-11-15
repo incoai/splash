@@ -313,15 +313,15 @@ public:
   // The attention of every lane's rows, encoded as the runtime encodes a
   // command's sequences after their q/k projection, through block lists
   // (sparse plans) when `blocks` has them: lane l's tiles from list
-  // blocks.list + l x its tiles on.
+  // blocks.list + l x laneLists on, by default the lists of its tiles.
   void addGraph(metal::CommandGraph &graph, const ops::AttentionPlan &attention,
-                const ops::AttentionBlocks &blocks = {}) const {
+                const ops::AttentionBlocks &blocks = {}, uint32_t laneLists = 0) const {
     const auto chunks = sequences();
     const std::span<const kv::ChunkedPrefillParams> lanes = std::span(chunks).first(plan_.lanes);
     std::array<ops::AttentionHistory, AttentionFixturePlan::kMaximumLanes> histories{};
     for (uint32_t lane = 0; lane < plan_.lanes; ++lane) {
       histories[lane] = {layer_, tables_[lane], blocks};
-      if (blocks.stride) histories[lane].blocks.list += lane * kv::attentionTiles(plan_.rows);
+      if (blocks.stride) histories[lane].blocks.list += lane * (laneLists ? laneLists : kv::attentionTiles(plan_.rows));
     }
     (void)ops::PagedAttention::addAttention(graph, attention, buffer(Tensor::Queries), buffer(Tensor::Partials),
                                             buffer(Tensor::Statistics), lanes, std::span(histories).first(plan_.lanes),

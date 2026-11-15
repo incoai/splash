@@ -40,7 +40,7 @@ struct ChunkedPrefillParams final {
 
 inline constexpr uint32_t kChunkedPrefillMaximumRows = SPLASH_PREFILL_TOKEN_BUDGET;
 // Attention runs each sequence's rows in tiles of kAttentionTileRows, its
-// last holding the rest (a decode lane's rows are one tile), each over at
+// last holding the rest (a decode lane's rows one tile or two), each over at
 // most kAttentionMaximumSplits history splits.
 inline constexpr uint32_t kAttentionTileRows = SPLASH_ATTENTION_TILE_ROWS;
 inline constexpr uint32_t kAttentionMaximumSplits = SPLASH_ATTENTION_MAXIMUM_SPLITS;
@@ -236,7 +236,8 @@ private:
 // A sequence whose rows' block masks become block lists
 // (PagedAttention::addBlockLists): entry `sequence` of the command's layout
 // (AttentionRows), at most `rows` rows (its bound), the first at position
-// `firstPosition`, whose tiles of its bound take the lists from `list` on.
+// `firstPosition`, whose tiles of its bound take the lists from `list` on, a
+// tile past its rows an empty one.
 struct BlockListRows final {
   uint32_t sequence = 0;
   uint32_t rows = 0;

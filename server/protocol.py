@@ -329,8 +329,10 @@ class MaskResponseFrame:
     # Little-endian uint32 words, words_per_mask per mask row.
     mask_words: bytes
     # Pairs of a mask row and a token the grammar forces after the row's
-    # path, the rows ascending and each row's tokens in order, at most
-    # MAX_SIMULATION_TOKENS a row.
+    # path, the rows ascending and each row's tokens in order, at most as
+    # many a row as a request simulates (Ready's mask_rows less one), which
+    # keeps a response within the words the engine takes (Protocol.cpp's
+    # forcedWords).
     forced_tokens: tuple[int, ...]
 
 
@@ -368,8 +370,8 @@ class ReadyEvent:
     # Requests may carry image spans; false for a model serving without vision.
     vision: bool
     # The target's logit rows a token mask covers; the rows of one mask
-    # request, before the anchor and after each draft query row; and the
-    # tokens that end generation.
+    # request, before the anchor and after each of a verify block's rows; and
+    # the tokens that end generation.
     vocabulary_size: int
     mask_rows: int
     stop_token_ids: tuple[int, ...]

@@ -13,8 +13,8 @@
 // listed (the tail bit of a row whose token completes its block names the
 // next block), and every thread takes a contiguous run of their words, so the
 // entries keep block order. A list keeps to its stride whatever the masks
-// hold; a tile past the sequence's rows, or a layout entry past its bound or
-// the command's rows, lists nothing.
+// hold; a tile of the sequence's bound past its rows, or of a layout entry
+// past its bound or the command's rows, lists nothing.
 constant constexpr uint kBlockListThreads = SPLASH_ATTENTION_BLOCK_LIST_THREADS;
 
 // The bits of mask word `w` that name one of the first `blocks` blocks.
@@ -40,8 +40,14 @@ kernel void attention_block_lists(device const uint *mask [[buffer(0)]],
   const uint sequence_rows =
       entry.rows <= s.row_bound && ulong(entry.first) + entry.rows <= p.rows ? entry.rows : 0;
   const uint tile = group.x, first_row = tile * p.tile_rows;
-  if (first_row >= sequence_rows)
+  if (first_row >= sequence_rows) {
+    // A tile of its bound past its rows (a decode lane of fewer rows than
+    // the step's lane cap) has an empty list, which the spilled K/V's
+    // resolve reads with the others (model::KvBlockCache::addResolve).
+    if (tid == 0 && first_row < s.row_bound)
+      counts[s.list + tile] = 0;
     return;
+  }
   const uint rows = min(p.tile_rows, sequence_rows - first_row);
   const uint blocks = splash_sparse_history_blocks(s.first_position + first_row, rows);
   const uint words = min((blocks + 31) / 32, p.mask_words);

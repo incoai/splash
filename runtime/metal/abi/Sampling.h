@@ -210,13 +210,18 @@ static_assert(sizeof(SelectorBatchParams) == 24,
 // candidates after its parent's (the softmax at temperature 1 of their unary
 // scores plus the edge from the parent's candidate), is estimated at
 // sigmoid(slope[l] * logit(q) + intercept[l][p]), the lane's acceptance model
-// (a greedy lane's or a sampled one's, model::VerifyBudget); a step to host
-// chain token d of the lane, chain[l] tokens from the anchor, at its rate for
-// its agreement with the draft at depth d. The tree grows best first by
-// estimate, a draft row taking children[l] candidates and a chain token the
-// next, one row for each token path (a step to a token its parent already has
-// a child of joins that child), until the lane's rows or none past depth
-// depth[l] are left. A greedy lane's row (temperature[l] 0) takes its most
+// (a greedy lane's or a sampled one's, model::VerifyBudget), at most its cap:
+// what the steps its parent drew before it left of 1, as the target selects
+// one token after the parent, so that the children a row's draft step drew
+// have estimates summing to at most its own; a step to host chain token d of
+// the lane, chain[l] tokens from the anchor, at its rate for its agreement
+// with the draft at depth d, beside its parent's drawn children, whose caps
+// it leaves as they are. The tree grows best first by estimate, a draft row
+// taking children[l] candidates and a chain token the next, one row for each
+// token path (a step to a token its parent already has a child of joins that
+// child), until it holds the lane's rows, or depth[l] + 1 rows, as many as
+// the tokens a walk of it may retain, or none no deeper than depth[l] is
+// left. A greedy lane's row (temperature[l] 0) takes its most
 // likely candidates; a sampled lane's draws them without replacement from
 // q_T, the candidates' probabilities at the lane's temperature T, its
 // Gumbel-top-k: the largest log q_T + G, G a Gumbel of the row's key and the
@@ -264,6 +269,9 @@ static_assert(sizeof(DraftTreeParams) == 260,
 // lanes under the cap, the first lane first, each a row of its anchor's token
 // that extends the path of the row before it: no kernel selects, retains or
 // routes through the MoE experts a row past its lane's verify rows.
+// The rows and the cap come from the host before this cycle's draws, so they
+// admit no row by its own draws: a draft's block a lane, or a step a test
+// forces; the costs are those of the rows verified.
 struct VerifyRowsParams {
   float cost[SPLASH_TARGET_VERIFY_ROWS * SPLASH_MAXIMUM_BATCH_WIDTH + 1];
   uint32_t lanes;

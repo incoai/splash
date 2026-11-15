@@ -505,7 +505,7 @@ extension LaunchOption {
                                                                      parse: { Double($0).flatMap { $0 >= 0 ? String($0) : nil } }))),
         LaunchOption(
             flag: "--verify-rows", title: "Repeatable answers",
-            help: "A MoE model’s greedy and seeded answers repeat when a request runs alone with the same prompts cached, at some cost in speed. A prompt sent again reads from the cache, so its answer can differ.",
+            help: "Greedy and seeded answers repeat when a request runs alone with the same prompts cached, at some cost in speed. A prompt sent again reads from the cache, so its answer can differ.",
             section: .requests, kind: .choice(standard: "Off", choices: [("all", "On")], custom: nil)),
         LaunchOption(
             flag: "--disable-ane", title: "Neural Engine for long prompts",

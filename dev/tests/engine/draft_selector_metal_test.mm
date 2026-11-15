@@ -13,7 +13,8 @@
 // host chain, scored by the product of its steps' estimates (a draft step's
 // by its lane's own calibration; a sampled lane's row takes its candidates of
 // the largest log q_T + G, G the Gumbel of the row's key), ranked, one row for each token path, as
-// many as a verify block holds and none deeper than its depth: its tokens,
+// many as a verify block holds and its depth plus one (the tokens a walk of
+// it may retain), and none deeper than its depth: its tokens,
 // parents, depths, ancestors, draft probabilities (a host chain's row takes
 // that of a draft step that joins it, none otherwise, a forced chain's none)
 // and estimates. A tree of one child a row and no chain is the chain the
@@ -190,6 +191,7 @@ struct Fixture final {
   [[nodiscard]] const float *scores() const { return static_cast<const float *>(buffers.treeScores.contents()); }
   [[nodiscard]] const uint8_t *draws() const { return static_cast<const uint8_t *>(buffers.treeDraws.contents()); }
   [[nodiscard]] const float *next() const { return static_cast<const float *>(buffers.treeNext.contents()); }
+  [[nodiscard]] const float *caps() const { return static_cast<const float *>(buffers.treeCaps.contents()); }
   [[nodiscard]] uint32_t rowCount(uint32_t lane) const {
     return static_cast<const uint32_t *>(buffers.treeSizes.contents())[lane];
   }
@@ -230,6 +232,7 @@ Fixture makeFixture(MetalBackend &backend, uint32_t vocabulary, uint32_t lanes, 
                allocate(backend, uint64_t{lanes} * sizeof(uint32_t)),
                allocate(backend, uint64_t{lanes} * kBlock * kChildren),
                allocate(backend, uint64_t{lanes} * kBlock * kCandidates * sizeof(float)),
+               allocate(backend, uint64_t{lanes} * kBlock * sizeof(float)),
                allocate(backend, uint64_t{lanes} * kBlock * sizeof(uint32_t)),
                allocate(backend, uint64_t{lanes} * kBlock * sizeof(TreeRow)),
                allocate(backend, uint64_t{lanes} * sizeof(LaneRows)),
@@ -349,6 +352,9 @@ struct Node final {
   // for a row the selector did not expand.
   std::vector<uint32_t> draws;
   std::vector<double> next;
+  // The cap of the draft step to it: what its parent's earlier draws left of
+  // 1; 1 for a row of no draft probability.
+  double cap = 1.0;
 };
 
 // The brute-force tree of a lane, rows in the order the selector takes them;
@@ -361,6 +367,7 @@ std::optional<std::vector<Node>> referenceTree(const Lattice &l, const DraftTree
     std::vector<uint32_t> path;
     double score;
     bool chain;
+    double cap = 1.0;
   };
   std::vector<Entry> entries;
   // The paths whose sampled expansion drew among keys too close to order.
@@ -390,16 +397,20 @@ std::optional<std::vector<Node>> referenceTree(const Lattice &l, const DraftTree
         auto &[draws, next] = expansions[path];
         for (uint32_t i = 0; i < kCandidates; ++i)
           next.push_back(draftProbability(q, lane, i));
-        // A child is estimated at most as the one drawn before it.
-        double bound = score;
+        // A child's own estimate is at most what the children drawn before
+        // it left of 1, and the child is estimated at most as the one drawn
+        // before it.
+        double bound = score, left = 1.0;
         for (const uint32_t index : taken) {
           if (!(q[index] > 0.0))
             break;
           draws.push_back(index);
           const uint32_t token = l.ids[position][index];
           path.push_back(token);
-          bound = std::min(bound, score * estimate(lane.calibration, draftProbability(q, lane, index), position));
-          entries.push_back({path, bound, false});
+          const double own = std::min(estimate(lane.calibration, draftProbability(q, lane, index), position), left);
+          bound = std::min(bound, score * own);
+          entries.push_back({path, bound, false, left});
+          left -= own;
           if (position + 1 < lane.depth && position + 1 < kPositions)
             expand(path, treeKey(key, token), position + 1, index, bound);
           path.pop_back();
@@ -424,7 +435,7 @@ std::optional<std::vector<Node>> referenceTree(const Lattice &l, const DraftTree
   if (lane.depth > 0)
     expanded(rows[0]);
   std::map<std::vector<uint32_t>, uint32_t> made{{{}, 0}};
-  for (size_t index = 0; index < entries.size() && rows.size() < kBlock; ++index) {
+  for (size_t index = 0; index < entries.size() && rows.size() < std::min(kBlock, lane.depth + 1); ++index) {
     const Entry &entry = entries[index];
     // Float sums decide between paths within this of each other, but for a
     // row's children of one estimate, the bound of the one drawn before,
@@ -455,8 +466,10 @@ std::optional<std::vector<Node>> referenceTree(const Lattice &l, const DraftTree
       Node &row = rows[found->second];
       // A draft step that joins a lookup chain's row gives it its
       // probability; a forced chain's rows keep none.
-      if (!entry.chain && row.q < 0.0 && !lane.forced)
+      if (!entry.chain && row.q < 0.0 && !lane.forced) {
         row.q = drafted();
+        row.cap = entry.cap;
+      }
       if (!entry.chain && row.draws.empty())
         expanded(row);
       continue;
@@ -466,6 +479,7 @@ std::optional<std::vector<Node>> referenceTree(const Lattice &l, const DraftTree
     node.parent = made.at(std::vector<uint32_t>(entry.path.begin(), entry.path.end() - 1));
     node.estimate = entry.score;
     node.q = entry.chain ? -1.0 : drafted();
+    node.cap = entry.chain ? 1.0 : entry.cap;
     if (!entry.chain)
       expanded(node);
     made.emplace(entry.path, static_cast<uint32_t>(rows.size()));
@@ -501,6 +515,9 @@ void requireTree(const Fixture &f, uint32_t lane, uint32_t anchor, const std::ve
     require(std::fabs(e - node.estimate) <= 1e-4 * node.estimate,
             label + ": row " + std::to_string(row) + "'s estimate " + std::to_string(e) + " is not " +
                 std::to_string(node.estimate));
+    require(std::fabs(f.caps()[first + row] - node.cap) <= 1e-5,
+            label + ": row " + std::to_string(row) + "'s cap " + std::to_string(f.caps()[first + row]) + " is not " +
+                std::to_string(node.cap));
     // Its draws, in order, and its next position's probabilities.
     for (uint32_t child = 0; child < kChildren; ++child)
       require(f.draws()[(first + row) * kChildren + child] ==
@@ -594,7 +611,8 @@ void chainCase(MetalBackend &backend, uint32_t vocabulary, uint32_t lanes) {
 // candidates and to tokens the draft does not hold, and run past its
 // positions; their rates and each lane's calibration, the identity or another
 // beside lanes of the other, rank them against the draft's rows. Lanes cut
-// their trees at a depth or take all of their rows.
+// their trees at a depth, and at its rows plus one, or take all of their
+// rows.
 void treesMatchTheReference(MetalBackend &backend) {
   constexpr uint32_t vocabulary = 1003;
   const std::array patterns{Pattern::Peaked};
@@ -703,9 +721,12 @@ void sampledChildrenDistribution(MetalBackend &backend) {
   for (const auto &[children, temperature] : {std::pair{1U, 0.7F}, std::pair{2U, 1.0F}}) {
     std::vector<std::map<std::vector<uint32_t>, uint32_t>> counts(kLanes);
     for (uint32_t runs = 0; runs < kRuns; ++runs) {
+      // A tree as deep as the anchor's children are many holds them and its
+      // anchor (its depth's rows and one), each likelier than their own
+      // children over flat rows.
       std::vector<DraftTreeLane> trees;
       for (uint32_t lane = 0; lane < kLanes; ++lane)
-        trees.push_back({7, 1, 0, children, DraftCalibration{}, temperature,
+        trees.push_back({7, children, 0, children, DraftCalibration{}, temperature,
                          treeHash(uint64_t{runs} * kLanes + lane + 1)});
       run(backend, selector, f, trees);
       for (uint32_t lane = 0; lane < kLanes; ++lane) {
@@ -888,6 +909,34 @@ void chainRowsTheDraftJoins(MetalBackend &backend) {
             "a lookup chain's row the draft joined did not take its draft probability");
     require(f.tokens()[kBlock + 1] == chains[1].tokens[0] && forcedQ == -1.0F,
             "a forced chain's row the draft joined took a draft probability");
+  }
+}
+
+// The estimates of the children a row drew sum to at most its own: of a
+// greedy anchor whose candidates its calibration estimates alike (slope 0),
+// at 0.3 each, each child is estimated at what the children before it left
+// of 1, its cap: 0.3, 0.3, 0.3 and 0.1 of caps 1, 0.7, 0.4 and 0.1, each
+// likelier than any of their own children (0.09), so that a tree as deep as
+// the children are many holds them all (its depth's rows and one).
+void siblingsShareTheirParent(MetalBackend &backend) {
+  constexpr uint32_t vocabulary = 1003;
+  Random random(0x73686172);
+  const std::array patterns{Pattern::Uniform};
+  const Fixture f = makeFixture(backend, vocabulary, 1, random, patterns, 0.1F);
+  const DraftSelector selector(vocabulary);
+  DraftCalibration flat;
+  flat.slope = 0.0F;
+  flat.intercepts.fill(std::log(0.3F / 0.7F));
+  run(backend, selector, f, std::array{DraftTreeLane{7, kChildren, 0, kChildren, flat}});
+  require(f.rowCount(0) == kChildren + 1, "the anchor did not take its children");
+  double left = 1.0;
+  for (uint32_t row = 1; row <= kChildren; ++row) {
+    const double want = std::min(0.3, left);
+    require(std::fabs(f.scores()[2 * row + 1] - want) <= 1e-5 && std::fabs(f.caps()[row] - left) <= 1e-5,
+            "child " + std::to_string(row) + " is estimated at " + std::to_string(f.scores()[2 * row + 1]) +
+                " of cap " + std::to_string(f.caps()[row]) + ", not " + std::to_string(want) + " of " +
+                std::to_string(left));
+    left -= want;
   }
 }
 
@@ -1250,7 +1299,8 @@ void bufferExtents(MetalBackend &backend) {
            {&DraftSelectorBuffers::treeScores, rows * 8, 4, "draft tree score"},
            {&DraftSelectorBuffers::treeSizes, uint64_t{lanes} * 4, 4, "draft tree size"},
            {&DraftSelectorBuffers::treeDraws, rows * kChildren, 1, "draft tree draw"},
-           {&DraftSelectorBuffers::treeNext, rows * kCandidates * 4, 4, "draft tree next"}})
+           {&DraftSelectorBuffers::treeNext, rows * kCandidates * 4, 4, "draft tree next"},
+           {&DraftSelectorBuffers::treeCaps, rows * 4, 4, "draft tree cap"}})
     requireExtent(backend, f.buffers.*member, bytes, element, what, [&](CommandGraph &graph, const MetalBuffer &buffer) {
       DraftSelectorBuffers changed = f.buffers;
       changed.*member = buffer;
@@ -1353,6 +1403,7 @@ int main(int argc, char **argv) {
     forcedChain(backend);
     budgetedRowsReadRowsBefore(backend);
     chainRowsTheDraftJoins(backend);
+    siblingsShareTheirParent(backend);
     verifyRowsLayout(backend);
     verifyRowsAcrossLanes(backend);
     std::cout << "draft_selector_metal_test: PASS\n";

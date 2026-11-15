@@ -52,7 +52,7 @@ does, and `REVISION`, `DRAFT_MODEL` and `LANGUAGE_ONLY=1` as its `--revision`,
 | --- | --- |
 | `verify-models` | the installer's restarts without the Hub, `verify --full`, and the record of the weight images (`dev/tools/installer_restarts.py`, `weight-digests` with `WEIGHT_DIGESTS_ARGS` added, such as `WEIGHT_DIGESTS_ARGS="--expert-memory 7G --ple-memory 2G"` to stream the routed experts and the PLE table, [Release check](#release-check)) |
 | `test-real` | vision parity with the family's fixture in `dev/tests/fixtures/vision-parity/` when the installation serves vision, and the native model runtime oracle, each of its three runs with `ORACLE_ARGS` added (`ORACLE_ARGS="--kv-format bf16"`, `"--expert-memory 16G"` or `"--max-context 1010000"`); for a block-sparse target their spill checks take the default prompts, two staging buffers, and 32K tokens with the default window, sizes that a `--spill-tokens` in `ORACLE_ARGS` replaces in all three (on a 24 GB Mac, `ORACLE_ARGS="--expert-memory 6656M --ple-memory 237M"`; below) |
-| `test-http-real` | the HTTP frontend on an isolated server (`dev/tests/smoke_real.py`), whose greedy comparisons (a penalized greedy request repeats once its prompt is cached, `min_p` 1 answers as greedy) run where `/status` reports `verify_rows` `all`, which on any MoE target takes `HTTP_SMOKE_ARGS="--verify-rows all"`; where `/status` reports `reasoning_switch` `false` (Flint), it gives each request whose answer it checks room for the model's reasoning and leaves out the thinking budget's check; with `HTTP_SMOKE_ARGS="--persistent-cache --max-cache-disk 8G"`, instead of that smoke, the [persistent cache](server.md#persistent-cache) across a restart in a fresh cache directory: a clean stop, a restart that takes the restore point back, and a next turn that restores the prompt from disk; `release-check` runs both |
+| `test-http-real` | the HTTP frontend on an isolated server (`dev/tests/smoke_real.py`), whose greedy comparisons (a penalized greedy request repeats once its prompt is cached, `min_p` 1 answers as greedy) run where `/status` reports `verify_rows` `all`, which takes `HTTP_SMOKE_ARGS="--verify-rows all"`; where `/status` reports `reasoning_switch` `false` (Flint), it gives each request whose answer it checks room for the model's reasoning and leaves out the thinking budget's check; with `HTTP_SMOKE_ARGS="--persistent-cache --max-cache-disk 8G"`, instead of that smoke, the [persistent cache](server.md#persistent-cache) across a restart in a fresh cache directory: a clean stop, a restart that takes the restore point back, and a next turn that restores the prompt from disk; `release-check` runs both |
 | `test-agent-real` | the five official clients through `splash serve` (`dev/tests/agent_real.py`), in `AGENT_SCENARIO` `complete` (the default) or `smoke` |
 | `test-release-real` | the HTTP smoke and all five clients on one `splash serve` |
 | `test-performance-real` | the native decode, partial-prefix and short-prompt benchmark, or with `BASELINE` its ABBA comparison with that build, in which both builds' `weight-digests` take `WEIGHT_DIGESTS_ARGS` (`dev/benchmarks/backend_regression.py`) |
@@ -177,8 +177,8 @@ the other. Per model, `release-check`:
   sources and records in `weights.json` the component, size and SHA-256 of
   every weight image the installation loads (`verify-models`);
 - runs the HTTP smoke, which for a text-only installation checks the 400s
-  instead of images (`test-http-real`), on the default verify rows: on a MoE
-  target it leaves out the greedy comparisons, which run only with
+  instead of images (`test-http-real`), on the default verify rows: it leaves
+  out the greedy comparisons, which run only with
   `HTTP_SMOKE_ARGS="--verify-rows all"`, and says so;
 - stops and restarts a server with a [persistent cache](server.md#persistent-cache),
   and requires the conversation's next turn to restore its prompt from disk
@@ -188,9 +188,9 @@ the other. Per model, `release-check`:
   first to report a [Neural Engine share](internals.md#neural-engine-prefill) running that
   share: output tokens and acceptance must be
   identical (`EXPECT_OUTPUT_CHANGE=1` allows changed outputs with acceptance
-  within 0.02; the benchmark verifies every row (`--verify-rows all`), so a
-  MoE target's outputs repeat and its times measure the backend, not the
-  verify budget of [Drafts](models.md#drafts)), and so must the bytes of the weight images
+  within 0.02; the benchmark verifies every row of a draft's block a lane
+  (`--verify-rows all`), so outputs repeat and its times measure the
+  backend, not the verify budget of [Drafts](models.md#drafts)), and so must the bytes of the weight images
   both load (`dev/benchmarks/weights.py`); decode and prefill GPU time, with the cold
   prefills of short prompts (480 to 2016 tokens, one chunk each), and their wall
   times (decode milliseconds per output token, the cold 14K prefill's wall

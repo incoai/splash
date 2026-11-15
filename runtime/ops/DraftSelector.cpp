@@ -92,6 +92,7 @@ void DraftSelector::add(metal::CommandGraph &graph, const DraftSelectorBuffers &
   requireBytes(buffers.treeSizes, uint64_t{count} * sizeof(uint32_t), "draft tree size");
   requireBytes(buffers.treeDraws, treeRows * SPLASH_TREE_CHILDREN, "draft tree draw");
   requireBytes(buffers.treeNext, treeRows * SPLASH_DRAFT_CANDIDATES * sizeof(float), "draft tree next");
+  requireBytes(buffers.treeCaps, treeRows * sizeof(float), "draft tree cap");
   graph.add("draft_select_top16_sharded",
             {buffers.logits, buffers.partialIds, buffers.partialValues},
             vocabulary_, {uint64_t{count} * kPositions * kShards, 1, 1});
@@ -106,7 +107,7 @@ void DraftSelector::add(metal::CommandGraph &graph, const DraftSelectorBuffers &
   graph.add("draft_select_tree",
             {buffers.candidates, buffers.unary, buffers.partialValues, buffers.chainTokens, buffers.chainRates,
              buffers.treeTokens, buffers.trees, buffers.treeScores, buffers.treeSizes, buffers.treeDraws,
-             buffers.treeNext},
+             buffers.treeNext, buffers.treeCaps},
             tree, {count, 1, 1}, {kPositions * SPLASH_DRAFT_CANDIDATES, 1, 1});
 }
 

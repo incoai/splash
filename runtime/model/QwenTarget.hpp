@@ -455,13 +455,6 @@ public:
   // processes the step's lanes; padding rows read stale activations and write
   // results no active row reads.
   [[nodiscard]] uint32_t decodeStorageLanes(uint32_t lanes) const;
-  // Whether its verify takes a lane's rows as a tree (metal/abi/VerifyTree.h):
-  // each row's attention, recurrence and inputs follow its own path, and its
-  // commits the retained path. A target that does not verifies chains, which
-  // the draft's selector then grows (ops::DraftTreeLane): this one, whose
-  // attention, recurrence and commits take a block's rows in order.
-  [[nodiscard]] virtual bool verifiesTrees() const noexcept;
-
   // A prefill command of one or more chunks (a prefill group), run layer by
   // layer: a layer of each chunk in turn, then the next layer, so that a
   // layer whose experts stream loads the union of the chunks' experts once.

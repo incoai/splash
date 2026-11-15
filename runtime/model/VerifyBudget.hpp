@@ -5,7 +5,8 @@
 // cost, learned online. A draft row's own chance, that the target selects its
 // token where it accepted the row's parent, is logit(p) = slope * logit(q) +
 // intercepts[position] for its draft probability q at its proposal position,
-// and a row's chance its own times its parent's (DraftTreeParams): greedy
+// at most its cap, what its parent's earlier draws left of 1, and a row's
+// chance its own times its parent's (DraftTreeParams): greedy
 // lanes fit theirs to the last kLabels labels of their trees' rows, sampled
 // lanes, whose drawn children their verify rows' rejection sampling accepts,
 // apart. A cycle of R rows
@@ -67,10 +68,13 @@ public:
   // A label: a draft row at proposal position `position` (its depth less
   // one), whose draft probability had logit `feature`, under a parent its
   // lane's walk accepted: whether the target selected the row's token there.
+  // The model's chance of it is at most its `cap`, as its tree's was; where
+  // the cap bounds it, the label tells the fit nothing.
   struct Label final {
     uint32_t position = 0;
     float feature = 0.0F;
     bool accepted = false;
+    float cap = 1.0F;
     bool operator==(const Label &) const = default;
   };
 
@@ -83,17 +87,17 @@ public:
   };
 
   // The labels of a lane's tree, its selector's rows in the order it took
-  // them (ops::DraftSelectorBuffers: each row's token, its tree row and its
-  // scores, pairs of its draft probability and its estimate), after a walk
-  // whose `selections`, the target's, are those of its path's rows in order
-  // from its anchor's: each row whose parent is one of those rows, labeled
-  // with whether the parent's selection is its token, a row past the lane's
-  // verify rows too, but none whose draft probability is not one (a host
-  // chain's row no draft step joined, a forced chain's row, or a draft row
-  // that is not finite).
+  // them (ops::DraftSelectorBuffers: each row's token, its tree row, its
+  // scores, pairs of its draft probability and its estimate, and its cap),
+  // after a walk whose `selections`, the target's, are those of its path's
+  // rows in order from its anchor's: each row whose parent is one of those
+  // rows, labeled with whether the parent's selection is its token, a row
+  // past the lane's verify rows too, but none whose draft probability or cap
+  // is not one (a host chain's row no draft step joined, a forced chain's
+  // row, or a draft row that is not finite).
   [[nodiscard]] static std::vector<Label> treeLabels(std::span<const uint32_t> tokens,
                                                      std::span<const ops::TreeRow> rows,
-                                                     std::span<const float> scores,
+                                                     std::span<const float> scores, std::span<const float> caps,
                                                      std::span<const uint32_t> selections);
 
   // The acceptance model of the lanes that sample, or of the greedy ones.

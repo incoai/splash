@@ -395,9 +395,9 @@ void testAutomaticExpertMemory(RuntimeResourcesConfig config) {
 
 // --verify-rows: by default a MoE target's decode cycles verify the rows the
 // verify budget chooses, whether its routed experts load with their layers or
-// stream from the SSD, and a dense target's every row; `all` verifies every
-// row. The start says which, and the runtime built on what it assembled runs
-// it.
+// stream from the SSD, and a dense target's every row by the budget's
+// estimates; `all` verifies every row and learns nothing. The start says
+// which, and the runtime built on what it assembled runs it.
 void testVerifyRows(const char *metallibPath, RuntimeResourcesConfig moe) {
   struct Started final {
     std::string log;
@@ -434,9 +434,10 @@ void testVerifyRows(const char *metallibPath, RuntimeResourcesConfig moe) {
                "--verify-rows all did not verify every row of a MoE target");
   const test::TemporaryDirectory root("splash-verify-rows");
   requireStart(loadableConfig(metallibPath, root.path(), "verify-rows-test"),
-               "Decode cycles verify every row of the draft's block (--verify-rows auto, as verify-rows-test is "
-               "dense).",
-               false, "a dense target did not verify every row");
+               "Decode cycles verify every row of the draft's block by the verify budget's estimates "
+               "(--verify-rows auto, as verify-rows-test is dense): greedy and seeded outputs can differ from run "
+               "to run.",
+               true, "a dense target did not verify every row by the estimates its budget learns");
 }
 
 // Startup fails at the loader, whose vision weight files are deliberately

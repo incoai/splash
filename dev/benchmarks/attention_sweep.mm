@@ -1,6 +1,7 @@
 // Times Splash's production attention kernels on one layer of Page32 KV
 // across cache lengths, for prefill chunks (2048 rows, or each of --rows), and
-// the DFlash verify batch (8 rows per lane, one and four lanes). Each case builds the same
+// a decode step's lanes (8 rows a lane, or each of --verify-rows up to a lane's
+// 16; one and four lanes). Each case builds the same
 // store + attention graph the executor encodes, reports the fused GPU time of
 // the whole graph and, with each dispatch submitted as its own command, the GPU
 // time of each pipeline over the deterministic synthetic history of
@@ -14,7 +15,7 @@
 //
 // usage: attention-sweep METALLIB [--histories 0,2048,...] [--rows 2048,...]
 //                        [--shapes 27b,35b,122b,fn,flint-window,flint-full]
-//                        [--lanes 1,4] [--repeat N] [--phases both|verify|prefill]
+//                        [--lanes 1,4] [--verify-rows 8,16] [--repeat N] [--phases both|verify|prefill]
 //                        [--compare-metallib PATH] [--kv-format int8|bf16]
 //                        [--extent-pages N] [--qsa shared|independent|overlapping|pages|indexer]
 //                        [--located]
@@ -198,10 +199,10 @@ std::vector<uint32_t> qsaBitmaps(const AttentionFixturePlan &plan, const std::st
   return bits;
 }
 
-// A prefill chunk of `rows` rows on one lane, or the verify rows of `lanes`
-// lanes, all after `history` tokens, with the workspace the runtime's arena
-// holds for it: a prompt chunk's, or a decode step's of a lane's one tile at
-// the most splits each.
+// A prefill chunk of `rows` rows on one lane, or `lanes` lanes of `rows`
+// verify rows each, all after `history` tokens, with the workspace the
+// runtime's arena holds for it: a prompt chunk's, or a decode step's of a
+// lane's tiles at the most splits each.
 AttentionFixturePlan casePlan(AttentionShape shape, bool prefill, uint32_t lanes,
                               uint32_t history, uint32_t extentPages, uint32_t rows, const ExecutionPlans &plans) {
   const kv::Layout layout = test::attentionLayout(shape);
@@ -213,8 +214,7 @@ AttentionFixturePlan casePlan(AttentionShape shape, bool prefill, uint32_t lanes
     const AttentionWorkspace lane = plans.laneAttentionWorkspace(shape.queryHeads, layout);
     scratch = {lane.partialsBytes * caseLanes, lane.statisticsBytes * caseLanes};
   }
-  return AttentionFixturePlan::make(shape, caseLanes, prefill ? rows : kVerifyRows,
-                                    histories, scratch, {kLayer + 1, kLayer, extentPages});
+  return AttentionFixturePlan::make(shape, caseLanes, rows, histories, scratch, {kLayer + 1, kLayer, extentPages});
 }
 
 // The QSA indexer of a case's rows (--qsa indexer): its inputs, as the
@@ -616,7 +616,7 @@ int main(int argc, const char *argv[]) {
     if (argc < 2) {
       std::cerr << "usage: attention-sweep METALLIB [--histories LIST] [--rows LIST] "
                    "[--shapes 27b,35b,122b,fn,flint-window,flint-full] "
-                   "[--lanes LIST] [--repeat N] [--phases both|verify|prefill] "
+                   "[--lanes LIST] [--verify-rows LIST] [--repeat N] [--phases both|verify|prefill] "
                    "[--compare-metallib PATH] [--kv-format int8|bf16] "
                    "[--extent-pages N] [--qsa shared|independent|overlapping|pages|indexer] "
                    "[--located]\n";
@@ -624,7 +624,7 @@ int main(int argc, const char *argv[]) {
     }
     std::vector<uint32_t> histories{0, 2048, 8192, 16384, 32768, 65536, 131072};
     std::vector<uint32_t> lanes{1, 4};
-    std::vector<uint32_t> prefillRows{kPrefillRows};
+    std::vector<uint32_t> prefillRows{kPrefillRows}, verifyRows{kVerifyRows};
     std::vector<std::string> shapes{"27b", "35b"};
     uint32_t repeat = 5;
     // Zero: the largest extent the memory plan picks for the model's K/V
@@ -648,6 +648,8 @@ int main(int argc, const char *argv[]) {
         lanes = parseList(value, 1, kMaximumLanes, option);
       else if (option == "--rows")
         prefillRows = parseList(value, 1, kPrefillRows, option);
+      else if (option == "--verify-rows")
+        verifyRows = parseList(value, 1, SPLASH_TARGET_VERIFY_ROWS, option);
       else if (option == "--repeat")
         repeat = parseCount(value, 1, std::numeric_limits<uint32_t>::max(), option);
       else if (option == "--extent-pages")
@@ -745,7 +747,9 @@ int main(int argc, const char *argv[]) {
           }
         };
         if (phases != "verify") for (uint32_t rows : prefillRows) report(true, 1, rows);
-        if (phases != "prefill") for (uint32_t lane : lanes) report(false, lane, kVerifyRows);
+        if (phases != "prefill")
+          for (uint32_t lane : lanes)
+            for (uint32_t rows : verifyRows) report(false, lane, rows);
       }
     }
     std::cout << "]}\n";

@@ -329,9 +329,11 @@ with every row verified, its draft accepted 2.3 tokens a cycle on code
 without the embedding, 4.7 with it. Every family loads and runs its draft
 alike: a decode cycle drafts eight rows, the anchor and seven proposal
 positions, and the target verifies a tree of the draft's candidates at those
-positions, as many of its rows as the cycle chose for the lane (its verify
-rows, `ops::DraftSelector::addVerifyRows`), none deeper than the lane may still
-retain: the tokens its output budget leaves, at most all eight. A dense target verifies every row up to that limit: its
+positions and of its host chain (below), as many of its rows among a draft's
+block's eight as the cycle chose for the lane (its verify rows,
+`ops::DraftSelector::addVerifyRows`), no more of them, and none deeper, than
+the lane may still retain: the tokens its output budget leaves, to which its
+tree grows, at most sixteen rows. A dense target verifies every row up to that limit: its
 projections read their weights once for all of a cycle's rows, so a row costs it
 little. Each row a MoE target verifies routes its own experts, which a rejected
 row reads for nothing (a Qwen3.8-Flash-Next cycle of one lane routes about 43
@@ -348,20 +350,22 @@ verify and why, and `/status` reports it as `verify_rows`. The selector grows
 each lane's verify rows into a tree over its candidates (`draft_select_tree`):
 from the anchor, best first by the estimate that the target accepts a row's
 path, the product of its steps' estimates, each row taking its most likely
-candidates at the next position as children (one, a chain, while the target's
-verify runs a block's rows in order), and a lane whose thinking end starts at
+candidates at the next position as children, and a lane whose thinking end starts at
 its anchor takes the end as a chain of its own, whose rows the target selects
-whatever its logits. Where the target verifies trees, a lane not thinking
-under a budget also proposes a prompt-lookup chain beside them:
+whatever its logits, and grows no tree beside it: beside a forced token the
+draft's rows are dead. A lane also proposes a prompt-lookup chain beside its
+tree, under a thinking budget no deeper than the thinking it has left, as its
+tree grows no deeper, since the end replaces the selections past it:
 the tokens that followed the latest earlier occurrence of its last three or
 more tokens (`model::LookupIndex`), each estimated by the match's length, its
 depth and whether the draft's candidates there hold it
 (`model::LookupAcceptance`, fit on traced cycles and refined by every
-unconstrained cycle's outcome, greedy and sampled lanes apart: a sampled lane
+unconstrained cycle's outcome under `--verify-rows auto`, greedy and sampled lanes apart: a sampled lane
 accepts a copied token only as often as it draws it); a lookup token that is
 a draft row's joins that row. A
 constrained lane whose grammar forces the tokens after its anchor proposes
-those instead, each estimated at 1: the server finds, with a cycle's masks,
+those instead, each estimated at 1, and as a thinking end grows no tree
+beside them: the server finds, with a cycle's masks,
 the tokens the grammar forces after each row's path, and the next cycle takes
 those of the path the lane retained where its anchor begins them (on 15
 structured outputs of Qwen3.8-27B on a 48 GB M5 Pro, the masks admitted the
@@ -371,11 +375,16 @@ keys only the schema names). A step to a candidate of probability q (the softmax
 temperature 1 of its position's candidates' scores after its parent's) is
 estimated by an online model, logit(p) = slope * logit(q) +
 intercept[position], the probability that the target accepts it once it
-accepted its parent, one model for greedy lanes and one for sampled lanes,
-whose drawn children their verify rows' rejection sampling accepts. The engine refits each every 64
+accepted its parent, at most what the candidates its parent drew before it
+left of 1 (its cap), since the target selects one token after the parent: the
+estimates of the children a row drew sum to at most its own (a host chain's
+child beside them is estimated by its own rate). There is one model for
+greedy lanes and one for sampled lanes, whose drawn children their verify
+rows' rejection sampling accepts. The engine refits each every 64
 cycles on its last 4096 labels: each row of a lane's tree whose parent the
 cycle's walk accepted, labeled with whether the target selected the row's
-token there, a row past the lane's verify rows too (its parent's selection
+token there and carrying the row's cap (a label its cap bounds tells the fit
+nothing), a row past the lane's verify rows too (its parent's selection
 says whether the target would have accepted it), but none whose probability
 is not one (a lookup chain's row that no draft step joined, a row of a chain
 the target selects whatever its logits, or a draft row that is not finite) and
@@ -437,14 +446,14 @@ layers, whose kernels take up to sixteen rows a lane, but their MoE steps route 
 expert (`moe_group_routes_verified`), their GDN recurrence is skipped and its
 output left zero (`verify_gdn_fused`), and no selection, penalty or acceptance
 reads them.
-The budget's costs follow wall time and its acceptance
-model every request's labels, so the rows a cycle verifies depend on the
-machine's timing and on what the server served before, and a MoE row's result
+The budget's acceptance model fits every request's labels, a dense target's
+too, and its costs follow wall time, so the rows a cycle verifies depend on
+what the server served before and on the machine's timing, and a MoE row's result
 depends on which rows share its expert tiles ([Kernels](internals.md#kernels)): under the
 budget the same greedy (temperature 0) or seeded request can give different text
 from run to run, even alone on an idle server ([Sampling](api.md#sampling)); sampled
-outputs keep their exact distribution. With every row verified (a dense target,
-or `--verify-rows all`), the rows a cycle verifies follow its lanes' output
+outputs keep their exact distribution. Under `--verify-rows all` nothing learns
+and every row is verified, so the rows a cycle verifies follow its lanes' output
 budgets alone. The speculation counts ([Output limits and
 streaming](api.md#output-limits-and-streaming)) count the proposals a cycle verified.
 The target writes the outputs of the layers the draft reads for each row it

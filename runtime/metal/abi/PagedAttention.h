@@ -84,7 +84,7 @@ static_assert(SPLASH_TARGET_KV_BLOCK_TOKENS / SPLASH_ATTENTION_BLOCK_TOKENS ==
 // block masks are the masks' rows of its packed rows, `mask_words` words
 // each, the first at position `first_position`, its last tile holding the
 // rest; its tile t's entries go to list `list` + t, `stride` entries each,
-// and a tile past its rows lists nothing. A threadgroup of
+// and a tile of its bound past its rows lists nothing. A threadgroup of
 // SPLASH_ATTENTION_BLOCK_LIST_THREADS threads lists one tile.
 #define SPLASH_ATTENTION_BLOCK_LIST_THREADS 256u
 struct SplashAttentionBlockListSequence {

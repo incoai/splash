@@ -384,11 +384,14 @@ std::vector<ops::AttentionBlocks> Qwen4ExpTarget::addDecodeQsa(PrefillStep &step
   const ops::AttentionBlocks lists{h.qsaLists, h.qsaListCounts, h.listStride, 0, {}, {}, rowMasks};
   ops::BlockIndexer::addTreeSelect(step.graph, queries, blockKeys, h.qsaScores,
                                    rowsOf<uint32_t>(h.qsaMask, 0, step.rows, h.maskWords), rowMasks, tree);
+  // A lane's tiles at the lane cap take their lists after the lanes before
+  // it, as a prompt chunk's sequences' do, a tile past its rows an empty one.
   std::array<ops::BlockListRows, ExecutionLimits::maximumBatchWidth> laneLists{};
   std::vector<ops::AttentionBlocks> blocks(lanes, lists);
-  for (uint32_t lane = 0; lane < lanes; ++lane) {
-    laneLists[lane] = {lane, laneCap, firstPositions[lane], lane};
-    blocks[lane].list = lane;
+  for (uint32_t lane = 0, list = 0; lane < lanes; ++lane) {
+    laneLists[lane] = {lane, laneCap, firstPositions[lane], list};
+    blocks[lane].list = list;
+    list += step.attention->sequences()[lane].tiles();
   }
   ops::PagedAttention::addBlockLists(step.graph, h.qsaMask, h.maskWords, std::span(laneLists).first(lanes),
                                      {b.laneRows, step.rows}, lists);
