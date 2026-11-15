@@ -46,13 +46,57 @@ struct IndexerRows final {
 // `records`, from the rows' raw keys (`keys`, bf16 rows of
 // BLOCK_INDEXER_DIMENSION as the project writes them) and the tokens before
 // lane l's rows from pending[l], its pending keys (BLOCK_INDEXER_PENDING bf16
-// rows).
+// rows). A verify step's records are each lane's of the blocks from its
+// anchor's on that a path of its most rows may complete.
 struct IndexerBlocks final {
   metal::MetalBuffer records;
   std::span<const uint32_t> counts;
   uint32_t laneRecords = 0;
   metal::MetalBuffer keys;
   std::span<const metal::MetalBuffer> pending;
+};
+
+// The indexer's rows of a verify step, whose lanes are blocks of rows from
+// their anchors as the step's proposer lays them out on the device
+// (metal/abi/VerifyTree.h): each lane's rows of the step's `rows` rows from
+// row 0 (SplashLaneRows, in lane order, 1 to laneCap a lane,
+// ops::verifyLaneCap) in `laneRows` and every row's place in its lane's tree
+// (SplashTreeRow) in `tree`; lane l's anchor at logical position anchors[l];
+// and as IndexerRows the index, the budget, and the words of a row's bitmap
+// and its scores, a row of each per row of the step.
+struct IndexerTreeRows final {
+  metal::MetalBuffer laneRows;
+  metal::MetalBuffer tree;
+  uint32_t rows = 0;
+  uint32_t laneCap = 0;
+  std::span<const uint32_t> anchors;
+  BlockIndex index;
+  uint32_t topBlocks = 0;
+  uint32_t maskWords = 0;
+  uint32_t scoreStride = 0;
+};
+
+// The commit after a verify accepted each lane's path, in every attention
+// layer of the step: `layers` layers whose raw keys (`keys`) and block keys
+// (`blockKeys`, BlockIndexer::addTreePool's) are layerRows rows apart from
+// the step's row 0; each lane's accepted path (`paths`, a row mask of its
+// rows a lane, metal/abi/VerifyTree.h), its rows on the device
+// (`laneRows`), its anchor and its pending keys of every layer before and
+// after the step; and each lane's index table, the index of attention layer
+// a a * indexLayerBytes into every entry's plane
+// (kv::PageStorage::indexLayerBytes).
+struct IndexerCommit final {
+  metal::MetalBuffer keys;
+  metal::MetalBuffer blockKeys;
+  uint32_t layers = 0;
+  uint32_t layerRows = 0;
+  metal::MetalBuffer paths;
+  metal::MetalBuffer laneRows;
+  std::span<const uint32_t> anchors;
+  std::span<const metal::MetalBuffer> pendingIn;
+  std::span<const metal::MetalBuffer> pendingOut;
+  std::span<const metal::MetalBuffer> indexTables;
+  uint32_t indexLayerBytes = 0;
 };
 
 struct BlockIndexer final {
@@ -83,22 +127,30 @@ struct BlockIndexer final {
   // row on.
   static void addSelect(metal::CommandGraph &graph, metal::MetalBuffer queries, metal::MetalBuffer scores,
                         uint32_t scoreRows, metal::MetalBuffer mask, const IndexerRows &rows);
+  // A verify step's pool: each of its rows that completes a block pools it
+  // from its path into its block key (bf16 rows of BLOCK_INDEXER_DIMENSION,
+  // a row per row of the step); none goes into the index.
+  static void addTreePool(metal::CommandGraph &graph, const IndexerBlocks &blocks, metal::MetalBuffer blockKeys,
+                          const NormWeights &keyNorm, metal::MetalBuffer inverseFrequencies, float ropeScale,
+                          const IndexerTreeRows &rows);
+  // A verify step's scores and bitmaps: each row's of the blocks complete
+  // before its anchor from the index and of those its path completes from
+  // the step's block keys (addTreePool's), and its bitmap of the blocks of
+  // K/V slots it reads with its row mask (a word per row of the step) of
+  // its block's rows it attends (ops::AttentionBlocks::rowMasks).
+  static void addTreeSelect(metal::CommandGraph &graph, metal::MetalBuffer queries, metal::MetalBuffer blockKeys,
+                            metal::MetalBuffer scores, metal::MetalBuffer mask, metal::MetalBuffer rowMasks,
+                            const IndexerTreeRows &rows);
   // A sequence's pending keys of one layer after its first `retained` rows
   // from `firstPosition`, of which `keys` holds the raw keys: those of the
   // block they leave open, from `keys` and `pendingIn`, its pending keys
   // before them.
   static void addPending(metal::CommandGraph &graph, metal::MetalBuffer keys, metal::MetalBuffer pendingIn,
                          metal::MetalBuffer pendingOut, uint32_t firstPosition, uint32_t retained);
-  // Each verify lane's pending keys of each of `layers` layers after the rows
-  // it retained (`retained`, a count per lane the GPU wrote), from the step's
-  // keys of every layer (`layerRows` rows apart, lane l's laneRows[l] of each
-  // layer's, from position firstPositions[l]) and pendingIn[l], the lane's
-  // pending keys before the step; a lane's layers follow each other in its
-  // pending keys.
-  static void addCommit(metal::CommandGraph &graph, metal::MetalBuffer keys, uint32_t layers, uint32_t layerRows,
-                        std::span<const LaneRows> laneRows, std::span<const uint32_t> firstPositions,
-                        metal::MetalBuffer retained, std::span<const metal::MetalBuffer> pendingIn,
-                        std::span<const metal::MetalBuffer> pendingOut);
+  // The commit after a verify accepted each lane's path: the block keys of
+  // the blocks the path's rows complete into each layer's index, and the
+  // lane's pending keys of each layer after the path.
+  static void addCommit(metal::CommandGraph &graph, const IndexerCommit &commit);
 };
 
 } // namespace splash::ops

@@ -138,7 +138,9 @@ inline void splash_sparse_gather(
 // as in splash_attention_page_softmax. A token counts when the row's
 // bit of its block's entry is set and it is not past the row's causal end,
 // nor, for a tree's row (SplashAttentionTree), a row of its block off its
-// path; rows past the tile's active ones mirror the last active row.
+// path or, through a list, one its row mask (`attended`, the indexer's of
+// the tile's rows) leaves out; rows past the tile's active ones mirror the
+// last active row.
 template <uint QueryHeadsPerKVHead, uint Tokens, uint HeadDim, bool Quantized>
 inline void splash_sparse_softmax_lane(
     threadgroup const float *scores, threadgroup bfloat *probabilities,
@@ -146,7 +148,7 @@ inline void splash_sparse_softmax_lane(
     threadgroup float *previous_scale, threadgroup atomic_uint *rescale,
     threadgroup const float *key_scales, threadgroup const float *value_scales,
     threadgroup const uint *entries, uint first_position, uint active_rows,
-    SplashAttentionTree tree, uint lane_index) {
+    SplashAttentionTree tree, device const uint *attended, uint lane_index) {
   constexpr uint TokensPerLane = 8;
   constexpr uint LanesPerRow = Tokens / TokensPerLane;
   constexpr float Scale = splash_attention_scale<HeadDim>();
@@ -156,9 +158,10 @@ inline void splash_sparse_softmax_lane(
   const uint column = lane_index % LanesPerRow * TokensPerLane;
   const uint row = min(fused_row / QueryHeadsPerKVHead, active_rows - 1);
   const uint causal_end = first_position + row + 1;
-  // Of a tree's block, the row's path: every other token sees all of it.
+  // Of a tree's block, the row's path, through a list only its rows in
+  // blocks the row attends: every other token sees all of it.
   const uint anchor = tree.rows ? tree.anchor : causal_end;
-  const uint ancestors = tree.rows ? tree.rows[row].ancestors : 0u;
+  const uint ancestors = tree.rows ? tree.rows[row].ancestors & (attended ? attended[row] : ~0u) : 0u;
   uint allowed = 0;
 #pragma unroll
   for (uint slot = 0; slot < 2; ++slot) {
@@ -221,8 +224,10 @@ inline void splash_sparse_softmax_lane(
 // One tile over its split's run of its block list (`list`, `count` entries),
 // or with a null list over its history's blocks, writing the split's partials
 // and statistics as the page loop does. The tile's rows are at first_position
-// on, a tree's (`tree`) each masked to its path's rows of its block; queries
-// are its fused rows [row][query head][dimension] of one KV head.
+// on, a tree's (`tree`) each masked to its path's rows of its block and,
+// through a list, to those of them its row mask holds (`attended`, a word
+// per row of the tile, null without a list); queries are its fused rows
+// [row][query head][dimension] of one KV head.
 // A Located tile reads an entry's block where the list's `locations`
 // (metal/abi/PagedAttention.h) name, a place in a page of location_pages,
 // unless the location is SPLASH_ATTENTION_PAGED, and keeps each step block's
@@ -243,7 +248,7 @@ inline void splash_sparse_attention_tile(
     device const SplashKvPage *location_pages, threadgroup uint *places, uint splits,
     uint split, device float *partials, device float *statistics, ulong slot,
     threadgroup SplashSparseScratch<CacheElement, RowsPerTile * QueryHeadsPerKVHead, HeadDim> &scratch,
-    SplashAttentionTree tree, uint thread_index) {
+    SplashAttentionTree tree, device const uint *attended, uint thread_index) {
   constexpr ushort M = RowsPerTile * QueryHeadsPerKVHead;
   constexpr ushort N = SplashSparseStep<CacheElement>::Tokens;
   constexpr uint Blocks = SplashSparseStep<CacheElement>::Blocks;
@@ -352,7 +357,7 @@ inline void splash_sparse_attention_tile(
       splash_sparse_softmax_lane<QueryHeadsPerKVHead, N, HeadDim, Quantized>(
           scratch.scores, scratch.probabilities, scratch.row_max, scratch.row_sum,
           scratch.previous_scale, &scratch.rescale, scratch.key_scales,
-          scratch.value_scales, scratch.entries, first_position, active_rows, tree, lane);
+          scratch.value_scales, scratch.entries, first_position, active_rows, tree, attended, lane);
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (atomic_load_explicit(&scratch.rescale, memory_order_relaxed)) {
 #pragma unroll

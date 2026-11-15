@@ -2543,10 +2543,13 @@ struct Runtime::Impl {
     QwenTargetCommitBuffers buffers;
     buffers.retainedCounts = decodeArena->batchSlice(DecodeTensor::RetainedCount, width);
     buffers.retainedRows = decodeArena->batchSlice(DecodeTensor::RetainedRows, width);
+    buffers.laneRows = decodeArena->batchSlice(DecodeTensor::LaneLayout, width);
+    buffers.indexLayerBytes = kvPages.indexLayerBytes();
     for (uint32_t lane = 0; lane < width; ++lane) {
       Request &entry = laneEntry(lanes, lane);
       buffers.auxiliaryIn[lane] = states.current(entry.stateLane).auxiliary;
       buffers.auxiliaryOut[lane] = states.next(entry.stateLane).auxiliary;
+      buffers.indexTables[lane] = laneTables(entry.stateLane).index;
     }
     targetModel->addStateCommit(graph, std::move(buffers), std::span(kCycleBlocks).first(width));
   }

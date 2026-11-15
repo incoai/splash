@@ -361,13 +361,19 @@ struct QwenVerifyInput final {
 // The auxiliary state after the rows each lane of a verify retained, which
 // its commit writes from the state before the step (addStateCommit). The GDN
 // state folds the rows into the lane's next step instead (ops::GdnTapeLane).
+// For a layout with a block index, each lane's index table and a layer's
+// bytes of the index plane (kv::PageStorage::indexLayerBytes).
 struct QwenTargetCommitBuffers final {
   metal::MetalBuffer retainedCounts;
   // Each lane's accepted path, a row mask of its block (metal/abi/
-  // VerifyTree.h), as acceptance wrote it.
+  // VerifyTree.h), as acceptance wrote it, and its rows of the step as the
+  // device holds them (SplashLaneRows).
   metal::MetalBuffer retainedRows;
+  metal::MetalBuffer laneRows;
   std::array<metal::MetalBuffer, ExecutionLimits::maximumBatchWidth> auxiliaryIn;
   std::array<metal::MetalBuffer, ExecutionLimits::maximumBatchWidth> auxiliaryOut;
+  std::array<metal::MetalBuffer, ExecutionLimits::maximumBatchWidth> indexTables;
+  uint32_t indexLayerBytes = 0;
 };
 
 // The GDN state after the first rows of the path a lane accepted of its

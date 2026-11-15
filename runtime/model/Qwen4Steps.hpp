@@ -33,7 +33,9 @@ class SparseRowStore;
 // keyLayerRows rows apart, which its commit reads), scores of scoreRows rows
 // of scoreStride each, block bitmaps of maskWords words per row, and the
 // block lists of the attention's tiles of rows (listStride entries each,
-// ops::AttentionBlocks) with their counts. A streamed PLE
+// ops::AttentionBlocks) with their counts; a decode step's also its rows'
+// block keys of every attention layer (as its raw keys) and row masks
+// (ops::BlockIndexer::addTreePool, addTreeSelect). A streamed PLE
 // table's step also stages each distinct row it gathers once (pleStaging)
 // and each row id's row there (pleSlots).
 struct Qwen4Scratch final {
@@ -59,6 +61,8 @@ struct Qwen4Scratch final {
   metal::MetalBuffer qsaMask;
   metal::MetalBuffer qsaLists;
   metal::MetalBuffer qsaListCounts;
+  metal::MetalBuffer qsaBlockKeys;
+  metal::MetalBuffer qsaRowMasks;
   uint32_t scoreRows = 0;
   uint32_t scoreStride = 0;
   uint32_t maskWords = 0;
@@ -81,8 +85,9 @@ struct Qwen4Blocks final {
   uint32_t count = 0;
 };
 
-// The QSA blocks a verify step's lanes complete: lane l's counts[l] records
-// from record l * laneRecords of `records`.
+// The QSA blocks a verify step's lanes may complete: lane l's counts[l]
+// records from record l * laneRecords of `records`, those a path of a verify
+// block's most rows completes from the lane's position.
 struct Qwen4LaneBlocks final {
   metal::MetalBuffer records;
   std::array<uint32_t, ExecutionLimits::maximumBatchWidth> counts{};

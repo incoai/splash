@@ -40,6 +40,7 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <cmath>
 #include <cstdlib>
 #include <cstdint>
@@ -712,15 +713,6 @@ void qsaTest(MetalBackend &backend, QsaCase c) {
   MetalBuffer scores = scratch(backend, uint64_t{scoreRows} * stride * 4),
               mask = upload(backend, std::vector<uint32_t>(uint64_t{laneRows} * words, ~0u));
   ops::BlockIndexer::addSelect(graph, queries, scores, scoreRows, mask, qsaRows);
-  // The commit after lane l retained a few of its rows.
-  std::vector<uint32_t> retained;
-  std::vector<MetalBuffer> pendingAfter;
-  for (uint32_t l = 0; l < lanes; ++l) {
-    retained.push_back(1 + (3 * l + c.tokens) % rows);
-    pendingAfter.push_back(lane[l].pending[1]);
-  }
-  ops::BlockIndexer::addCommit(graph, keys, 1, laneRows, blocks, firstPositions, upload(backend, retained),
-                               pendingBefore, pendingAfter);
   run(backend, graph);
 
   // A rotation's angle is the fp32 product the RoPE tables take (the
@@ -752,7 +744,7 @@ void qsaTest(MetalBackend &backend, QsaCase c) {
   for (const uint16_t value : download<uint16_t>(extent, extents * extentBytes / 2)) gotP.push_back(f32(value));
   const auto gotKeys = download<uint16_t>(keys, uint64_t{laneRows} * D);
   const auto gotMask = download<uint32_t>(mask, uint64_t{laneRows} * words);
-  bool okQ = true, okKeys = true, okP = true, okMask = true, okCommit = true;
+  bool okQ = true, okKeys = true, okP = true, okMask = true;
   for (uint32_t l = 0; l < lanes; ++l) {
     const QsaLane &x = lane[l];
     for (uint32_t r = 0; r < rows; ++r)
@@ -772,13 +764,6 @@ void qsaTest(MetalBackend &backend, QsaCase c) {
       const std::vector<double> want = rotate(rmsNorm(mean, knP), 4 * b);
       for (uint32_t d = 0; d < D; ++d) okP &= nearBf16(pooledKey(b)[d], want[d]);
     }
-    // The tokens of the block the retained rows leave open, then zeros.
-    const uint32_t end = x.first + retained[l], open = end / 4 * 4;
-    const auto gotPending = download<uint16_t>(pendingAfter[l], kQsaPendingBytes / 2);
-    for (uint32_t slot = 0; slot < BLOCK_INDEXER_PENDING; ++slot)
-      for (uint32_t d = 0; d < D; ++d)
-        okCommit &= gotPending[slot * D + d] ==
-                    (open + slot < end ? bf16(x.raw[uint64_t{open + slot} * D + d]) : uint16_t{0});
     for (uint32_t r = 0; r < rows; ++r) {
       const uint32_t row = l * rows + r, position = x.first + r, complete = (position + 1) / 4;
       const auto got = [&](uint32_t b) { return bool((gotMask[uint64_t{row} * words + b / 32] >> (b % 32)) & 1); };
@@ -823,137 +808,468 @@ void qsaTest(MetalBackend &backend, QsaCase c) {
                  " rows: normalized mean keys rotated to the block start");
   check(okMask, "QSA select of " + scope + ": dense below the budget, top blocks and the tail block above it" +
                     (c.tied ? ", ties towards the earlier block" : ""));
-  check(okCommit, "QSA commit of " + scope + ": the pending keys after each lane's retained rows");
+}
+
+// The history of a verify lane: `anchor` tokens of random raw keys, pooled
+// by prefill steps into the index of a table of its own, `pages` shuffled
+// pages of one buffer (an entry's page index its page), which hold its
+// anchor's tokens and the step's after them; and its pending keys after
+// them, in pending[0].
+QsaLane qsaHistory(MetalBackend &backend, std::mt19937 &rng, uint32_t anchor, uint32_t pages, MetalBuffer &index,
+                   const NormWeights &keyNorm, const MetalBuffer &invFreq) {
+  QsaLane lane;
+  lane.tokens = lane.first = anchor;
+  lane.raw = randoms(rng, uint64_t{anchor} * kQsaDimension, 1.0f);
+  lane.table.resize(pages);
+  std::iota(lane.table.begin(), lane.table.end(), 0);
+  std::shuffle(lane.table.begin(), lane.table.end(), rng);
+  // Whole 16 KiB pages, so that the index is aligned for the page bits.
+  const uint64_t bytes = (uint64_t{pages} * (kQsaPage / 4) * kQsaDimension * 2 + 16383) / 16384 * 16384;
+  index = backend.allocateBuffer(bytes, BufferStorage::Shared, "qwen4-test-index", BufferReach::Addressed);
+  std::memset(index.contents(), 0, index.sizeBytes());
+  if (index.gpuAddress() & SPLASH_KV_PAGE_INDEX_MASK) throw std::runtime_error("a QSA test index leaves no page bits");
+  std::vector<uint64_t> entries;
+  for (uint32_t page : lane.table) entries.push_back(index.gpuAddress() | page);
+  lane.tableBuffer = upload(backend, entries);
+  backend.setTableReach(lane.tableBuffer, std::span(&index, 1));
+  for (MetalBuffer &pending : lane.pending) pending = upload(backend, std::vector<uint16_t>(kQsaPendingBytes / 2, 0));
+  CommandGraph graph;
+  for (uint32_t from = 0; from < anchor; from += 2048)
+    qsaPrefillStep(backend, graph, lane, from, std::min(2048u, anchor - from), keyNorm, invFreq, 1.0F, 0);
+  if (!graph.empty()) run(backend, graph);
+  return lane;
+}
+
+// A verify lane of the tree kernels: its rows' places in its block's tree
+// from its anchor, and each row's indexer projections before the indexer's
+// norm and RoPE, its query heads (heads x dimension a row) and raw key.
+struct QsaTreeLane final {
+  uint32_t anchor = 0;
+  std::vector<ops::TreeRow> tree;
+  std::vector<float> query, key;
+};
+
+// The tree whose row r follows parents[r] (the anchor's none, -1).
+std::vector<ops::TreeRow> qsaTree(std::span<const int> parents) {
+  std::vector<ops::TreeRow> tree;
+  for (uint32_t row = 0; row < parents.size(); ++row) {
+    const int parent = parents[row];
+    tree.push_back(parent < 0 ? ops::TreeRow{1u, SPLASH_TREE_ROOT, 0}
+                              : ops::TreeRow{tree[parent].ancestors | 1u << row, static_cast<uint16_t>(parent),
+                                             static_cast<uint16_t>(tree[parent].depth + 1)});
+  }
+  return tree;
+}
+
+// The chain of `rows` rows.
+std::vector<ops::TreeRow> qsaChain(uint32_t rows) {
+  std::vector<ops::TreeRow> chain;
+  for (uint32_t row = 0; row < rows; ++row) chain.push_back(ops::chainRow(row));
+  return chain;
+}
+
+// The rows of a tree row's path from the anchor, its ancestors by depth.
+std::vector<uint32_t> qsaPath(const ops::TreeRow &row) {
+  std::vector<uint32_t> path;
+  for (uint32_t rest = row.ancestors; rest; rest &= rest - 1) path.push_back(std::countr_zero(rest));
+  return path;
+}
+
+// The lane whose rows are `rows` of `lane`'s, in that order, as a chain: a
+// path of its tree run one row after another.
+QsaTreeLane qsaChainOf(const QsaTreeLane &lane, std::span<const uint32_t> rows, uint32_t anchor) {
+  constexpr uint32_t D = kQsaDimension, H = BLOCK_INDEXER_HEADS;
+  QsaTreeLane chain{anchor, qsaChain(static_cast<uint32_t>(rows.size())), {}, {}};
+  for (const uint32_t row : rows) {
+    chain.query.insert(chain.query.end(), lane.query.begin() + uint64_t{row} * H * D,
+                       lane.query.begin() + uint64_t{row + 1} * H * D);
+    chain.key.insert(chain.key.end(), lane.key.begin() + uint64_t{row} * D, lane.key.begin() + uint64_t{row + 1} * D);
+  }
+  return chain;
+}
+
+// The tree kernels' outputs of a verify step: the lanes' rows of the step,
+// and each row's queries and raw keys, block key, scores, bitmap and row mask;
+// with a commit, each lane's pending keys after its accepted path (the index
+// its history's).
+struct QsaTreeResult final {
+  std::vector<ops::LaneRows> lanes;
+  uint32_t rows = 0;
+  MetalBuffer queries, keys, blockKeys, scores, mask, rowMasks;
+  std::vector<MetalBuffer> pendingAfter;
+};
+
+// The norms and RoPE of the QSA tree tests: the indexer's query and key norms,
+// and the target's inverse frequencies without YaRN.
+struct QsaWeights final {
+  NormWeights queryNorm, keyNorm;
+  MetalBuffer invFreq;
+};
+
+QsaWeights qsaWeights(MetalBackend &backend, std::mt19937 &rng) {
+  const auto qn = randoms(rng, kQsaDimension, 0.2f), kn = randoms(rng, kQsaDimension, 0.2f);
+  std::vector<float> qnP(kQsaDimension), knP(kQsaDimension), invFreq(32);
+  for (uint32_t d = 0; d < kQsaDimension; ++d) qnP[d] = 1 + qn[d], knP[d] = 1 + kn[d];
+  model::rotaryInverseFrequencies(10'000'000.0f, 32, model::RopeScaling{}, invFreq);
+  return {{upload(backend, qnP), true}, {upload(backend, knP), true}, upload(backend, invFreq)};
+}
+
+// A row of the step's bitmap past the words of a lane's history, poison.
+constexpr uint32_t kQsaPoison = 0xA5A5A5A5u;
+
+// A verify step of the tree kernels over `lanes`, packed one after another
+// from row 0, lane l over histories[l] (its index and pending keys), whose
+// rows attend sparsely past `top` blocks, with bitmaps of `words` words and
+// scores of 32 x words a row. With `paths`, each lane's accepted path, the
+// commit after it.
+QsaTreeResult qsaTreeStep(MetalBackend &backend, std::span<const QsaTreeLane> lanes,
+                          std::span<const QsaLane *const> histories, uint32_t top, uint32_t words,
+                          const QsaWeights &weights, std::span<const uint32_t> paths = {}) {
+  constexpr uint32_t D = kQsaDimension, H = BLOCK_INDEXER_HEADS, kLaneRecords = 4;
+  QsaTreeResult result;
+  uint32_t most = 0;
+  for (const QsaTreeLane &lane : lanes) {
+    result.lanes.push_back({result.rows, static_cast<uint32_t>(lane.tree.size())});
+    result.rows += static_cast<uint32_t>(lane.tree.size());
+    most = std::max(most, static_cast<uint32_t>(lane.tree.size()));
+  }
+  const uint32_t rows = result.rows, stride = words * 32;
+  std::vector<float> query, key;
+  std::vector<ops::TreeRow> tree;
+  std::vector<uint32_t> ropePositions, anchors, counts;
+  std::vector<BlockIndexerBlock> records(lanes.size() * kLaneRecords);
+  std::vector<MetalBuffer> tables, pending;
+  for (uint32_t l = 0; l < lanes.size(); ++l) {
+    const QsaTreeLane &lane = lanes[l];
+    query.insert(query.end(), lane.query.begin(), lane.query.end());
+    key.insert(key.end(), lane.key.begin(), lane.key.end());
+    tree.insert(tree.end(), lane.tree.begin(), lane.tree.end());
+    for (const ops::TreeRow &row : lane.tree) ropePositions.insert(ropePositions.end(), 3, lane.anchor + row.depth);
+    // The blocks a verify block's most rows complete from the anchor on, as
+    // Qwen4Steps writes them.
+    const std::vector<BlockIndexerBlock> laneBlocks = qsaRecords(lane.anchor, SPLASH_TARGET_VERIFY_ROWS);
+    std::ranges::copy(laneBlocks, records.begin() + uint64_t{l} * kLaneRecords);
+    counts.push_back(static_cast<uint32_t>(laneBlocks.size()));
+    anchors.push_back(lane.anchor);
+    tables.push_back(histories[l]->tableBuffer);
+    pending.push_back(histories[l]->pending[0]);
+  }
+  const MetalBuffer laneRows = upload(backend, result.lanes), treeRows = upload(backend, tree);
+  const MetalBuffer cosT = scratch(backend, uint64_t{rows} * 32 * 4), sinT = scratch(backend, uint64_t{rows} * 32 * 4),
+                    draftRope = scratch(backend, SPLASH_DRAFT_ROPE_PAIRS * 4);
+  result.queries = scratch(backend, uint64_t{rows} * H * D * 2);
+  result.keys = scratch(backend, uint64_t{rows} * D * 2);
+  // A row that completes no block keeps no block key: poison, read by none.
+  result.blockKeys = upload(backend, std::vector<uint16_t>(uint64_t{rows} * D, 0x7FC1));
+  result.scores = upload(backend, std::vector<uint32_t>(uint64_t{rows} * stride, kQsaPoison));
+  result.mask = upload(backend, std::vector<uint32_t>(uint64_t{rows} * words, kQsaPoison));
+  result.rowMasks = upload(backend, std::vector<uint32_t>(rows, kQsaPoison));
+  const ops::BlockIndex index{tables, 0};
+  const std::array<ops::LaneRows, 1> allRows{{{0, rows}}};
+  const std::array<uint32_t, 1> noPosition{0};
+  const ops::IndexerRows project{allRows, noPosition, {std::span(tables).first(1), 0}, top, words, stride};
+  const ops::IndexerTreeRows treeRowsOf{laneRows, treeRows, rows, most <= 8 ? 8u : 16u, anchors, index, top, words,
+                                        stride};
+  CommandGraph graph;
+  ops::RoPE::addTables(graph, upload(backend, ropePositions), draftRope, weights.invFreq, draftRope, cosT, sinT,
+                       draftRope, draftRope, {rows, 0, 1.0F}, rows);
+  ops::BlockIndexer::addProject(graph, upload(backend, query), upload(backend, key), weights.queryNorm, cosT, sinT,
+                                result.queries, result.keys, project);
+  ops::BlockIndexer::addTreePool(graph, {upload(backend, records), counts, kLaneRecords, result.keys, pending},
+                                 result.blockKeys, weights.keyNorm, weights.invFreq, 1.0F, treeRowsOf);
+  ops::BlockIndexer::addTreeSelect(graph, result.queries, result.blockKeys, result.scores, result.mask,
+                                   result.rowMasks, treeRowsOf);
+  if (!paths.empty()) {
+    for (uint32_t l = 0; l < lanes.size(); ++l)
+      result.pendingAfter.push_back(upload(backend, std::vector<uint16_t>(kQsaPendingBytes / 2, 0)));
+    ops::BlockIndexer::addCommit(graph, {result.keys, result.blockKeys, 1, rows,
+                                         upload(backend, std::vector<uint32_t>(paths.begin(), paths.end())), laneRows,
+                                         anchors, pending, result.pendingAfter, tables, 0});
+  }
+  run(backend, graph);
+  return result;
+}
+
+// Words `first` on of a row of a step's buffer of `width` words a row.
+std::vector<uint32_t> qsaWords(const MetalBuffer &buffer, uint32_t width, uint32_t row, uint32_t first,
+                               uint32_t count) {
+  const auto all = download<uint32_t>(buffer, uint64_t{row + 1} * width);
+  return {all.begin() + uint64_t{row} * width + first, all.begin() + uint64_t{row} * width + first + count};
+}
+
+bool qsaBit(const std::vector<uint32_t> &bits, uint32_t block) { return (bits[block / 32] >> (block % 32)) & 1u; }
+
+// Whether a verify row's bitmap holds the blocks of an fp64 reference's top
+// blocks of its `complete` complete blocks: its scores from its queries and
+// each block's pooled key (`key(b)`), the top `top` within the fp32
+// rounding of the threshold either way.
+template <class Key>
+bool qsaSelectsTop(const std::vector<float> &queries, const std::vector<uint32_t> &bits, uint32_t complete,
+                   uint32_t top, Key key) {
+  constexpr uint32_t D = kQsaDimension, H = BLOCK_INDEXER_HEADS;
+  if (complete <= top) {
+    for (uint32_t b = 0; b < complete; ++b)
+      if (!qsaBit(bits, b)) return false;
+    return true;
+  }
+  std::vector<std::pair<double, uint32_t>> scored;
+  for (uint32_t b = 0; b < complete; ++b) {
+    const float *k = key(b);
+    double s = 0;
+    for (uint32_t h = 0; h < H; ++h) {
+      double dot = 0;
+      for (uint32_t d = 0; d < D; ++d) dot += double(queries[h * D + d]) * k[d];
+      s += std::max(dot, 0.0);
+    }
+    scored.push_back({s / std::sqrt(double(D)), b});
+  }
+  std::stable_sort(scored.begin(), scored.end(), [](auto a, auto b) { return a.first > b.first; });
+  const double threshold = scored[top - 1].first, near = 1e-4 * std::max(1.0, threshold);
+  uint32_t taken = 0;
+  bool ok = true;
+  for (uint32_t i = 0; i < complete; ++i) {
+    const bool in = qsaBit(bits, scored[i].second);
+    taken += in;
+    if (std::fabs(scored[i].first - threshold) > near) ok &= in == (i < top);
+  }
+  return ok && taken == top;
+}
+
+// A verify block of 16 rows as a tree from an anchor past `anchor` tokens,
+// against each of its paths run as a chain: rows 0 to 9 a chain, row 10 a
+// second child of the anchor (whose packed predecessor, row 9, is not its
+// parent) with a child of its own, rows 12 to 14 a branch off row 3, and row
+// 15 a sibling of row 9. At an anchor of 2 past a block (completing depths 1,
+// 5, 9 and 13) the anchor's block completes on three paths (rows 1 and 10),
+// the next one on two (rows 5 and 13), and the one after it on two (rows 9
+// and 15), each path's of its own tokens. Every row's block key, its scores
+// of every complete block, its blocks below the anchor's, its row mask by
+// depth and its bits from the anchor's block on are its path's chain's, bit
+// for bit; each chain's selections are an fp64 reference's top blocks; and a
+// tree row's bitmap from the anchor's block on names the blocks of its row
+// mask's slots. Then the commit of one path writes the index and pending
+// keys that path's chain's commit does. At an anchor 1 past a block the
+// siblings that complete blocks are rows 2 and 11, and 6 and 14.
+void qsaTreeAsChains(MetalBackend &backend, uint32_t anchor, uint32_t top) {
+  constexpr uint32_t D = kQsaDimension, H = BLOCK_INDEXER_HEADS, rows = 16;
+  std::mt19937 rng(41 + anchor);
+  const QsaWeights weights = qsaWeights(backend, rng);
+  MetalBuffer index;
+  const uint32_t pages = (anchor + rows + kQsaPage - 1) / kQsaPage;
+  QsaLane history = qsaHistory(backend, rng, anchor, pages, index, weights.keyNorm, weights.invFreq);
+  const std::vector<uint8_t> before = download<uint8_t>(index, index.sizeBytes());
+  constexpr std::array<int, rows> kParents{-1, 0, 1, 2, 3, 4, 5, 6, 7, 8, 0, 10, 3, 12, 13, 8};
+  const QsaTreeLane lane{anchor, qsaTree(kParents), randoms(rng, uint64_t{rows} * H * D, 1.0f),
+                         randoms(rng, uint64_t{rows} * D, 1.0f)};
+  const uint32_t words = ((anchor + rows) / 4 + BLOCK_INDEXER_TILE_SLACK + 31) / 32 + 1, stride = words * 32;
+  const std::array<const QsaLane *, 1> histories{&history};
+  // The path committed: row 14's, which completes two blocks of its own.
+  const std::vector<uint32_t> committed = qsaPath(lane.tree[14]);
+  const std::array<uint32_t, 1> treePath{lane.tree[14].ancestors};
+  const QsaTreeResult tree = qsaTreeStep(backend, std::span(&lane, 1), histories, top, words, weights, treePath);
+  const std::vector<uint8_t> treeIndex = download<uint8_t>(index, index.sizeBytes());
+  std::memcpy(index.contents(), before.data(), before.size());
+  // Each leaf's path as a chain; a tree row's chain is the first leaf's that
+  // holds it.
+  std::vector<int> leafOf(rows, -1);
+  std::vector<QsaTreeResult> chains;
+  std::vector<std::vector<uint32_t>> leafPaths;
+  for (uint32_t leaf = 0; leaf < rows; ++leaf) {
+    if (std::ranges::find(kParents, int(leaf)) != kParents.end()) continue;
+    leafPaths.push_back(qsaPath(lane.tree[leaf]));
+    const QsaTreeLane chain = qsaChainOf(lane, leafPaths.back(), anchor);
+    const bool commits = leafPaths.back() == std::vector<uint32_t>(committed.begin(), committed.end());
+    const std::array<uint32_t, 1> chainPath{ops::chainPath(static_cast<uint32_t>(committed.size()))};
+    chains.push_back(qsaTreeStep(backend, std::span(&chain, 1), histories, top, words, weights,
+                                 commits ? std::span<const uint32_t>(chainPath) : std::span<const uint32_t>{}));
+    if (commits) {
+      check(download<uint8_t>(index, index.sizeBytes()) == treeIndex && treeIndex != before &&
+                download<uint16_t>(chains.back().pendingAfter[0], kQsaPendingBytes / 2) ==
+                    download<uint16_t>(tree.pendingAfter[0], kQsaPendingBytes / 2),
+            "QSA tree at " + std::to_string(anchor) + ": the commit of a path writes its chain's index and pending keys");
+      std::memcpy(index.contents(), before.data(), before.size());
+    }
+    for (const uint32_t row : leafPaths.back())
+      if (leafOf[row] < 0) leafOf[row] = static_cast<int>(chains.size() - 1);
+  }
+  const uint32_t history0 = anchor / 4;
+  const auto treeBlockKeys = download<uint16_t>(tree.blockKeys, uint64_t{rows} * D);
+  const auto treeMasks = download<uint32_t>(tree.rowMasks, rows);
+  std::vector<float> pooled;
+  for (const uint16_t value : download<uint16_t>(index, index.sizeBytes() / 2)) pooled.push_back(f32(value));
+  bool okKeys = true, okScores = true, okBits = true, okMasks = true, okReference = true;
+  uint32_t sparseRows = 0, attendedOwn = 0, droppedOwn = 0, differingSiblings = 0;
+  for (uint32_t row = 0; row < rows; ++row) {
+    const ops::TreeRow place = lane.tree[row];
+    const uint32_t depth = place.depth, complete = (anchor + depth + 1) / 4;
+    const QsaTreeResult &chain = chains[leafOf[row]];
+    const std::vector<uint32_t> path = qsaPath(place);
+    // The block key of the row, and its scores of its complete blocks.
+    const auto chainKeys = download<uint16_t>(chain.blockKeys, uint64_t{chain.rows} * D);
+    if ((anchor + depth) % 4 == 3)
+      okKeys &= std::equal(treeBlockKeys.begin() + uint64_t{row} * D, treeBlockKeys.begin() + uint64_t{row + 1} * D,
+                           chainKeys.begin() + uint64_t{depth} * D);
+    if (complete > top) {
+      ++sparseRows;
+      okScores &= qsaWords(tree.scores, stride, row, 0, complete) == qsaWords(chain.scores, stride, depth, 0, complete);
+    }
+    // Its bitmap: below the anchor's block its chain's; from there on the
+    // blocks of its row mask's slots, which by depth are its chain's.
+    const std::vector<uint32_t> treeBits = qsaWords(tree.mask, words, row, 0, words);
+    const std::vector<uint32_t> chainBits = qsaWords(chain.mask, words, depth, 0, words);
+    const uint32_t chainMask = download<uint32_t>(chain.rowMasks, chain.rows)[depth];
+    for (uint32_t b = 0; b < history0; ++b) okBits &= qsaBit(treeBits, b) == qsaBit(chainBits, b);
+    okMasks &= !(treeMasks[row] & ~place.ancestors) && !(chainMask >> (depth + 1));
+    for (uint32_t k = 0; k <= depth; ++k) okMasks &= ((treeMasks[row] >> path[k]) & 1u) == ((chainMask >> k) & 1u);
+    const uint32_t treeWritten = ((anchor + row + 1) / 4 + BLOCK_INDEXER_TILE_SLACK) / 32 + 1;
+    for (uint32_t b = history0; b < treeWritten * 32; ++b) {
+      bool named = false;
+      for (uint32_t rest = treeMasks[row]; rest; rest &= rest - 1) named |= (anchor + std::countr_zero(rest)) / 4 == b;
+      okBits &= qsaBit(treeBits, b) == named;
+    }
+    for (uint32_t b = history0; b < complete; ++b) {
+      const bool attended = (chainMask >> (4 * b + 3 - anchor)) & 1u;
+      attendedOwn += attended;
+      droppedOwn += !attended;
+    }
+    // The chain's selection against the fp64 top blocks: below the anchor's
+    // block the index's pooled keys, from it on its rows' block keys.
+    std::vector<float> rowQueries;
+    for (const uint32_t value : qsaWords(chain.queries, H * D / 2, depth, 0, H * D / 2)) {
+      rowQueries.push_back(f32(uint16_t(value)));
+      rowQueries.push_back(f32(uint16_t(value >> 16)));
+    }
+    std::vector<float> stepKeys;
+    for (const uint16_t value : chainKeys) stepKeys.push_back(f32(value));
+    okReference &= qsaSelectsTop(rowQueries, chainBits, complete, top, [&](uint32_t b) -> const float * {
+      if (b >= history0) return &stepKeys[uint64_t{4 * b + 3 - anchor} * D];
+      const uint32_t page = history.table[b / 8];
+      return &pooled[(uint64_t{page} * 8 + b % 8) * D];
+    });
+  }
+  // Rows of one depth that complete a block hold their own paths' tokens.
+  uint32_t siblings = 0;
+  for (uint32_t a = 0; a < rows; ++a)
+    for (uint32_t b = a + 1; b < rows; ++b)
+      if (lane.tree[a].depth == lane.tree[b].depth && (anchor + lane.tree[a].depth) % 4 == 3) {
+        ++siblings;
+        differingSiblings += !std::equal(treeBlockKeys.begin() + uint64_t{a} * D,
+                                         treeBlockKeys.begin() + uint64_t{a + 1} * D, treeBlockKeys.begin() + uint64_t{b} * D);
+      }
+  const std::string scope = "QSA tree at " + std::to_string(anchor) + " past " + std::to_string(top) + " blocks";
+  check(okKeys && siblings >= 2 && differingSiblings == siblings,
+        scope + ": each block key its path's chain's, " + std::to_string(siblings) + " pairs of siblings' apart");
+  check(okScores && sparseRows > 0, scope + ": each sparse row's scores its path's chain's (" +
+                                        std::to_string(sparseRows) + " rows)");
+  check(okBits && okMasks, scope + ": each row's selection its path's chain's, its bits its row mask's slots");
+  check(okReference && attendedOwn > 0 && (top >= 512 || droppedOwn > 0),
+        scope + ": each chain's top blocks the fp64 reference's, its own blocks among them (" +
+            std::to_string(attendedOwn) + " attended, " + std::to_string(droppedOwn) + " not)");
+}
+
+// A chain of `rows` rows from an anchor past `anchor` tokens that accepts
+// `accepted` of them, against the same tokens decoded one a step, each step's
+// row committed: each row's block key, scores of its complete blocks and
+// bitmap are the step's that decodes it, bit for bit, and the index and
+// pending keys after the chain's commit are those after the last step's.
+void qsaChainAsSequential(MetalBackend &backend, uint32_t anchor, uint32_t rows, uint32_t accepted, uint32_t top) {
+  constexpr uint32_t D = kQsaDimension, H = BLOCK_INDEXER_HEADS;
+  std::mt19937 rng(53 + anchor);
+  const QsaWeights weights = qsaWeights(backend, rng);
+  MetalBuffer index;
+  const QsaLane history =
+      qsaHistory(backend, rng, anchor, (anchor + rows + kQsaPage - 1) / kQsaPage, index, weights.keyNorm,
+                 weights.invFreq);
+  const std::vector<uint8_t> before = download<uint8_t>(index, index.sizeBytes());
+  const QsaTreeLane chain{anchor, qsaChain(rows), randoms(rng, uint64_t{rows} * H * D, 1.0f),
+                          randoms(rng, uint64_t{rows} * D, 1.0f)};
+  const uint32_t words = ((anchor + rows) / 4 + BLOCK_INDEXER_TILE_SLACK + 31) / 32 + 1, stride = words * 32;
+  const std::array<const QsaLane *, 1> histories{&history};
+  const std::array<uint32_t, 1> path{ops::chainPath(accepted)};
+  const QsaTreeResult whole = qsaTreeStep(backend, std::span(&chain, 1), histories, top, words, weights, path);
+  const std::vector<uint8_t> chainIndex = download<uint8_t>(index, index.sizeBytes());
+  std::memcpy(index.contents(), before.data(), before.size());
+  QsaLane decoded = history;
+  bool okKeys = true, okScores = true, okBits = true;
+  for (uint32_t step = 0; step < accepted; ++step) {
+    const std::array<uint32_t, 1> row{step};
+    const QsaTreeLane one = qsaChainOf(chain, row, anchor + step);
+    const std::array<const QsaLane *, 1> current{&decoded};
+    const std::array<uint32_t, 1> anchorOnly{1};
+    const QsaTreeResult single = qsaTreeStep(backend, std::span(&one, 1), current, top, words, weights, anchorOnly);
+    const uint32_t complete = (anchor + step + 1) / 4;
+    if ((anchor + step) % 4 == 3)
+      okKeys &= qsaWords(single.blockKeys, D / 2, 0, 0, D / 2) == qsaWords(whole.blockKeys, D / 2, step, 0, D / 2);
+    if (complete > top)
+      okScores &= qsaWords(single.scores, stride, 0, 0, complete) == qsaWords(whole.scores, stride, step, 0, complete);
+    okBits &= qsaWords(single.mask, words, 0, 0, words) == qsaWords(whole.mask, words, step, 0, words);
+    decoded.pending[0] = single.pendingAfter[0];
+  }
+  const std::string scope = "QSA chain of " + std::to_string(rows) + " rows at " + std::to_string(anchor) + " past " +
+                            std::to_string(top) + " blocks, " + std::to_string(accepted) + " accepted";
+  check(okKeys && okScores && okBits, scope + ": each row's block key, scores and bitmap a step's of one row");
+  check(download<uint8_t>(index, index.sizeBytes()) == chainIndex && chainIndex != before &&
+            download<uint16_t>(decoded.pending[0], kQsaPendingBytes / 2) ==
+                download<uint16_t>(whole.pendingAfter[0], kQsaPendingBytes / 2),
+        scope + ": the commit's index and pending keys the steps' of one row");
 }
 
 // Lanes whose verify blocks hold different row counts, packed one after
 // another (5, 8, 1 and 6 rows from rows 0, 5, 13 and 14) in one dispatch of
-// each indexer kernel, around the sparse budget (lane l's rows end at token
-// 2050 + 61 l), project, pool, select and commit as each lane does alone in a
-// dispatch of its own from row 0: the same queries, keys, pooled keys,
-// bitmaps and pending keys after its retained rows, bit for bit.
+// each tree kernel, around the sparse budget (lane l's anchor at 2045 + 61
+// l), the second a tree with a branch off its anchor: each lane projects,
+// pools, selects and commits a path as it does alone in a dispatch of its own
+// from row 0, the same queries, keys, block keys, scores, bitmaps, row masks,
+// pending keys and index, bit for bit.
 void qsaPackedLanes(MetalBackend &backend) {
+  constexpr uint32_t D = kQsaDimension, H = BLOCK_INDEXER_HEADS, top = 512, lanes = 4;
   std::mt19937 rng(31);
-  constexpr uint32_t D = kQsaDimension, H = BLOCK_INDEXER_HEADS, page = kQsaPage, top = 512, lanes = 4;
-  const std::array<ops::LaneRows, lanes> packed{{{0, 5}, {5, 8}, {13, 1}, {14, 6}}};
-  const std::array<uint32_t, lanes> retained{3, 8, 1, 4};
-  const uint32_t stepRows = 20;
-  std::vector<QsaLane> lane(lanes);
-  uint32_t pages = 0, mostTokens = 0;
+  const QsaWeights weights = qsaWeights(backend, rng);
+  constexpr std::array<int, 8> kBranch{-1, 0, 1, 0, 3, 4, 2, 6};
+  std::vector<QsaTreeLane> lane;
+  std::vector<QsaLane> history;
+  std::vector<MetalBuffer> indexes(lanes);
+  std::vector<std::vector<uint8_t>> before;
+  const std::array<uint32_t, lanes> sizes{5, 8, 1, 6};
   for (uint32_t l = 0; l < lanes; ++l) {
-    QsaLane &x = lane[l];
-    x.tokens = 2050 + 61 * l;
-    x.first = x.tokens - packed[l].rows;
-    x.table.resize((x.tokens + page - 1) / page);
-    std::iota(x.table.begin(), x.table.end(), pages);
-    std::shuffle(x.table.begin(), x.table.end(), rng);
-    pages += static_cast<uint32_t>(x.table.size());
-    mostTokens = std::max(mostTokens, x.tokens);
-    x.raw = randoms(rng, uint64_t{x.tokens} * D, 1.0f);
-    for (MetalBuffer &pending : x.pending) pending = upload(backend, std::vector<uint16_t>(kQsaPendingBytes / 2, 0));
+    const uint32_t anchor = 2045 + 61 * l;
+    history.push_back(qsaHistory(backend, rng, anchor, (anchor + 16 + kQsaPage - 1) / kQsaPage, indexes[l],
+                                 weights.keyNorm, weights.invFreq));
+    before.push_back(download<uint8_t>(indexes[l], indexes[l].sizeBytes()));
+    lane.push_back({anchor, l == 1 ? qsaTree(kBranch) : qsaChain(sizes[l]),
+                    randoms(rng, uint64_t{sizes[l]} * H * D, 1.0f), randoms(rng, uint64_t{sizes[l]} * D, 1.0f)});
   }
-  const uint32_t words = (mostTokens / 4 + 2 + 31) / 32, stride = words * 32;
-  const uint64_t pooledBytes = uint64_t{pages} * (page / 4) * D * 2;
-  MetalBuffer extent = backend.allocateBuffer(pooledBytes, BufferStorage::Shared, "qwen4-test-packed-index",
-                                              BufferReach::Addressed);
-  std::vector<MetalBuffer> tables;
-  std::vector<uint32_t> firstPositions;
-  for (QsaLane &x : lane) {
-    std::vector<uint64_t> entries;
-    for (uint32_t index : x.table) entries.push_back(extent.gpuAddress() | index);
-    x.tableBuffer = upload(backend, entries);
-    backend.setTableReach(x.tableBuffer, std::span(&extent, 1));
-    tables.push_back(x.tableBuffer);
-    firstPositions.push_back(x.first);
+  const uint32_t words = ((2045 + 61 * 3 + 16) / 4 + BLOCK_INDEXER_TILE_SLACK + 31) / 32 + 1, stride = words * 32;
+  // Paths that complete a block: 3 rows of the first lane, the branch's
+  // deepest row, the anchor alone and 4 rows of the last lane.
+  const std::array<uint32_t, lanes> paths{ops::chainPath(3), lane[1].tree[5].ancestors, 1, ops::chainPath(4)};
+  std::vector<const QsaLane *> all;
+  for (const QsaLane &x : history) all.push_back(&x);
+  const QsaTreeResult together = qsaTreeStep(backend, lane, all, top, words, weights, paths);
+  std::vector<std::vector<uint8_t>> pooled;
+  for (uint32_t l = 0; l < lanes; ++l) {
+    pooled.push_back(download<uint8_t>(indexes[l], indexes[l].sizeBytes()));
+    std::memcpy(indexes[l].contents(), before[l].data(), before[l].size());
   }
-  std::vector<float> qnP(D), knP(D), invFreq(32);
-  for (uint32_t d = 0; d < D; ++d) qnP[d] = 1.0f + 0.01f * float(d % 7), knP[d] = 1.0f - 0.01f * float(d % 5);
-  model::rotaryInverseFrequencies(10'000'000.0f, 32, model::RopeScaling{}, invFreq);
-  const NormWeights keyNorm{upload(backend, knP), true}, queryNorm{upload(backend, qnP), true};
-  const MetalBuffer invFreqBuffer = upload(backend, invFreq), draftRope = scratch(backend, SPLASH_DRAFT_ROPE_PAIRS * 4);
-  CommandGraph history;
-  for (QsaLane &x : lane)
-    for (uint32_t from = 0; from < x.first; from += 1021)
-      qsaPrefillStep(backend, history, x, from, std::min(1021u, x.first - from), keyNorm, invFreqBuffer, 1.0F, 0);
-  run(backend, history);
-  const std::vector<uint8_t> before = download<uint8_t>(extent, pooledBytes);
-  const auto query = randoms(rng, uint64_t{stepRows} * H * D, 1.0f);
-
-  // One dispatch of each kernel over `lanesRows`, the lanes `which` at those
-  // rows of fresh step buffers, from the queries and keys of their rows.
-  struct Step final {
-    MetalBuffer queries, keys, mask;
-    std::vector<MetalBuffer> pendingAfter;
-  };
-  const auto step = [&](std::span<const ops::LaneRows> laneRows, std::span<const uint32_t> which) {
-    const uint32_t rows = static_cast<uint32_t>(ops::rowsEnd(laneRows));
-    std::vector<float> stepQuery(uint64_t{rows} * H * D), stepKeys(uint64_t{rows} * D);
-    std::vector<uint32_t> ropePositions(uint64_t{rows} * 3), blockCounts, laneRetained, firsts;
-    std::vector<MetalBuffer> laneTables, pendingBefore;
-    const uint32_t laneRecords = 4;
-    std::vector<BlockIndexerBlock> records(uint64_t{which.size()} * laneRecords);
-    Step result;
-    for (uint32_t i = 0; i < which.size(); ++i) {
-      const uint32_t l = which[i];
-      for (uint32_t r = 0; r < laneRows[i].rows; ++r) {
-        const uint32_t row = laneRows[i].first + r, position = lane[l].first + r;
-        std::copy_n(query.begin() + (uint64_t{packed[l].first} + r) * H * D, H * D,
-                    stepQuery.begin() + uint64_t{row} * H * D);
-        std::copy_n(lane[l].raw.begin() + uint64_t{position} * D, D, stepKeys.begin() + uint64_t{row} * D);
-        std::fill_n(ropePositions.begin() + uint64_t{row} * 3, 3, position);
-      }
-      const std::vector<BlockIndexerBlock> laneBlocks = qsaRecords(lane[l].first, laneRows[i].rows);
-      std::ranges::copy(laneBlocks, records.begin() + uint64_t{i} * laneRecords);
-      blockCounts.push_back(static_cast<uint32_t>(laneBlocks.size()));
-      laneRetained.push_back(retained[l]);
-      firsts.push_back(lane[l].first);
-      laneTables.push_back(tables[l]);
-      pendingBefore.push_back(lane[l].pending[0]);
-      result.pendingAfter.push_back(upload(backend, std::vector<uint16_t>(kQsaPendingBytes / 2, 0)));
-    }
-    const MetalBuffer cosT = scratch(backend, uint64_t{rows} * 32 * 4);
-    const MetalBuffer sinT = scratch(backend, uint64_t{rows} * 32 * 4);
-    result.queries = scratch(backend, uint64_t{rows} * H * D * 2);
-    result.keys = scratch(backend, uint64_t{rows} * D * 2);
-    result.mask = upload(backend, std::vector<uint32_t>(uint64_t{rows} * words, ~0u));
-    const ops::IndexerRows qsaRows{laneRows, firsts, {laneTables, 0}, top, words, stride};
-    CommandGraph graph;
-    ops::RoPE::addTables(graph, upload(backend, ropePositions), draftRope, invFreqBuffer, draftRope, cosT, sinT,
-                         draftRope, draftRope, {rows, 0, 1.0F}, rows);
-    ops::BlockIndexer::addProject(graph, upload(backend, stepQuery), upload(backend, stepKeys), queryNorm, cosT, sinT,
-                                  result.queries, result.keys, qsaRows);
-    ops::BlockIndexer::addPool(graph,
-                               {upload(backend, records), blockCounts, which.size() > 1 ? laneRecords : 0,
-                                result.keys, pendingBefore},
-                               keyNorm, invFreqBuffer, 1.0F, qsaRows);
-    ops::BlockIndexer::addSelect(graph, result.queries, scratch(backend, uint64_t{rows} * stride * 4), rows,
-                                 result.mask, qsaRows);
-    ops::BlockIndexer::addCommit(graph, result.keys, 1, rows, laneRows, firsts, upload(backend, laneRetained),
-                                 pendingBefore, result.pendingAfter);
-    run(backend, graph);
-    return result;
-  };
-  const std::array<uint32_t, lanes> all{0, 1, 2, 3};
-  const Step together = step(packed, all);
-  const std::vector<uint8_t> pooled = download<uint8_t>(extent, pooledBytes);
-  std::memcpy(extent.contents(), before.data(), pooledBytes);
   bool ok = true;
   for (uint32_t l = 0; l < lanes; ++l) {
-    const ops::LaneRows block = packed[l];
-    const std::array<ops::LaneRows, 1> own{{{0, block.rows}}};
-    const Step alone = step(own, std::span(all).subspan(l, 1));
+    const ops::LaneRows block = together.lanes[l];
+    const QsaTreeResult alone =
+        qsaTreeStep(backend, std::span(lane).subspan(l, 1), std::span(all).subspan(l, 1), top, words, weights,
+                    std::span(paths).subspan(l, 1));
     const auto same = [&](const MetalBuffer &packedValues, const MetalBuffer &aloneValues, uint64_t width) {
       const auto a = download<uint32_t>(packedValues, packedValues.sizeBytes() / 4);
       const auto b = download<uint32_t>(aloneValues, aloneValues.sizeBytes() / 4);
       return std::equal(b.begin(), b.begin() + block.rows * width, a.begin() + block.first * width);
     };
     ok &= same(together.queries, alone.queries, H * D / 2) && same(together.keys, alone.keys, D / 2) &&
-          same(together.mask, alone.mask, words);
+          same(together.blockKeys, alone.blockKeys, D / 2) && same(together.scores, alone.scores, stride) &&
+          same(together.mask, alone.mask, words) && same(together.rowMasks, alone.rowMasks, 1);
     ok &= download<uint16_t>(together.pendingAfter[l], kQsaPendingBytes / 2) ==
           download<uint16_t>(alone.pendingAfter[0], kQsaPendingBytes / 2);
+    ok &= download<uint8_t>(indexes[l], indexes[l].sizeBytes()) == pooled[l] && pooled[l] != before[l];
   }
-  ok &= download<uint8_t>(extent, pooledBytes) == pooled && pooled != before;
-  check(ok, "QSA of packed lanes of 5, 8, 1 and 6 rows: each lane's as alone");
+  check(ok, "QSA tree kernels of packed lanes of 5, 8, 1 and 6 rows: each lane's as alone");
 }
 
 // Lanes of different row counts packed one after another (5, 8, 1 and 6
@@ -1004,41 +1320,55 @@ void pleHashPackedLanes(MetalBackend &backend) {
 }
 
 // A target's QSA scratch (model::Qwen4Steps) takes rows to the end of the
-// window it serves: a prefill chunk's and a verify step's last rows at the
-// native window, or at the 1,010,000 tokens YaRN serves at most, by their
+// window it serves: a prefill chunk's last rows, and a verify step's lanes
+// of 8 rows, or of a verify block's 16 from the window's last anchor into
+// the KV slots past it, at the native window, at the 1,010,000 tokens YaRN
+// serves at most and at a window YaRN stretches to 300,020 tokens, where an
+// 8-row tile's slack left a 16-row lane's bitmap a block short, by their
 // ratio to the native window (model::servedFor), whose prefill scores keep
 // the native window's scratch; the native window's scratch refuses rows at
 // the end of YaRN's.
 void qsaScratchCoversWindow(MetalBackend &backend) {
-  constexpr uint32_t kChunk = 2048, kVerify = 8, kLanes = 4;
+  constexpr uint32_t kChunk = 2048, kVerify = 8, kBlock = SPLASH_TARGET_VERIFY_ROWS, kLanes = 4;
   const model::Qwen4ExpWeights weights;
   const std::array<uint32_t, 1> captured{47};
   const model::QwenTargetGeometry native(model::Qwen4ExpLayout{}, captured);
-  model::QwenTargetGeometry scaled = native;
-  scaled.ropeScaling = {1'010'000.0 / 262'144, 262'144};
-  const model::QwenTargetGeometry &yarn = scaled;
+  model::QwenTargetGeometry longest = native, odd = native;
+  longest.ropeScaling = {1'010'000.0 / 262'144, 262'144};
+  odd.ropeScaling = {300'020.0 / 262'144, 262'144};
+  const model::QwenTargetGeometry &yarn = longest, &stretched = odd;
   const MetalBuffer table = scratch(backend, 8);
+  // A prefill chunk's selection, or a verify step's over lanes of `rows`
+  // rows on the device from their anchors at `firsts`.
   const auto selects = [&](const model::Qwen4Scratch &s, uint32_t rows, std::vector<uint32_t> firsts) {
     const std::vector<MetalBuffer> tables(firsts.size(), table);
     std::vector<ops::LaneRows> blocks;
     for (uint32_t lane = 0; lane < firsts.size(); ++lane) blocks.push_back({lane * rows, rows});
     CommandGraph graph;
     try {
-      ops::BlockIndexer::addSelect(graph, s.qsaQueries, s.qsaScores, s.scoreRows, s.qsaMask,
-                               {blocks, firsts, {tables, 0}, 512, s.maskWords, s.scoreStride});
+      if (firsts.size() == 1)
+        ops::BlockIndexer::addSelect(graph, s.qsaQueries, s.qsaScores, s.scoreRows, s.qsaMask,
+                                     {blocks, firsts, {tables, 0}, 512, s.maskWords, s.scoreStride});
+      else
+        ops::BlockIndexer::addTreeSelect(
+            graph, s.qsaQueries, s.qsaBlockKeys, s.qsaScores, s.qsaMask, s.qsaRowMasks,
+            {upload(backend, blocks), upload(backend, std::vector<ops::TreeRow>(blocks.size() * rows)),
+             static_cast<uint32_t>(blocks.size()) * rows, rows, firsts, {tables, 0}, 512, s.maskWords, s.scoreStride});
     } catch (const std::invalid_argument &) {
       return false;
     }
     return !graph.empty();
   };
   uint64_t nativeScores = 0;
-  for (const auto &[geometry, window] : {std::pair{&native, 262'144U}, std::pair{&yarn, 1'010'000U}}) {
+  for (const auto &[geometry, window] :
+       {std::pair{&native, 262'144U}, std::pair{&yarn, 1'010'000U}, std::pair{&stretched, 300'020U}}) {
     const model::Qwen4Steps steps(weights, *geometry, backend, 1);
-    const model::Qwen4Scratch prefill = steps.prefillScratch(0), verify = steps.verifyScratch(kLanes * kVerify);
+    const model::Qwen4Scratch prefill = steps.prefillScratch(0), verify = steps.verifyScratch(kLanes * kBlock);
     const uint64_t scores = uint64_t{prefill.scoreRows} * prefill.scoreStride;
     if (!nativeScores) nativeScores = scores;
     check(geometry->contextTokens() == window && selects(prefill, kChunk, {window - kChunk}) &&
-              selects(verify, kVerify, std::vector<uint32_t>(kLanes, window - kVerify)) && scores <= nativeScores,
+              selects(verify, kVerify, std::vector<uint32_t>(kLanes, window - kVerify)) &&
+              selects(verify, kBlock, std::vector<uint32_t>(kLanes, window - 2)) && scores <= nativeScores,
           "QSA scratch of a " + std::to_string(window) + "-token window: its last rows, within the native scores");
   }
   const model::Qwen4Steps steps(weights, native, backend, 1);
@@ -1046,72 +1376,53 @@ void qsaScratchCoversWindow(MetalBackend &backend) {
         "QSA scratch of the native window refuses the rows of YaRN's");
 }
 
-// A verify step whose rows complete a block and whose lane retains fewer of
+// A verify step whose rows complete a block and whose lane accepts fewer of
 // them, then the next step with other keys for the rejected tokens: the
 // block's pooled key is the next step's, from the pending keys the commit
-// kept and the new rows', on either side of a page.
+// kept and the new rows', on either side of a page; the rejected rows' block
+// never enters the index.
 void qsaRollbackTest(MetalBackend &backend) {
-  std::mt19937 rng(29);
-  constexpr uint32_t D = kQsaDimension, rows = 8;
+  constexpr uint32_t D = kQsaDimension, H = BLOCK_INDEXER_HEADS, rows = 8;
   bool ok = true;
   for (const uint32_t first : {2046u, 2049u, 4093u}) {
-    QsaLane lane;
-    lane.tokens = first + 2 * rows;
-    lane.raw = randoms(rng, uint64_t{lane.tokens} * D, 1.0f);
-    lane.table.resize((lane.tokens + kQsaPage - 1) / kQsaPage);
-    std::iota(lane.table.begin(), lane.table.end(), 0);
-    const uint64_t pooledBytes = uint64_t{lane.table.size()} * (kQsaPage / 4) * D * 2;
-    MetalBuffer extent = backend.allocateBuffer(pooledBytes, BufferStorage::Shared, "qwen4-test-index",
-                                                BufferReach::Addressed);
-    std::vector<uint64_t> entries;
-    for (uint32_t index : lane.table) entries.push_back(extent.gpuAddress() | index);
-    lane.tableBuffer = upload(backend, entries);
-    backend.setTableReach(lane.tableBuffer, std::span(&extent, 1));
-    for (MetalBuffer &pending : lane.pending) pending = upload(backend, std::vector<uint16_t>(kQsaPendingBytes / 2, 0));
-    std::vector<float> knP(D, 1.0f), invFreq(32);
-    for (uint32_t i = 0; i < 32; ++i) invFreq[i] = std::pow(10'000'000.0f, -float(i) / 32);
-    const NormWeights keyNorm{upload(backend, knP), true};
-    const MetalBuffer invFreqBuffer = upload(backend, invFreq);
-    // The tokens before the first verify step.
-    CommandGraph history;
-    qsaPrefillStep(backend, history, lane, 0, first, keyNorm, invFreqBuffer, 1.0F, 0);
-    run(backend, history);
-    // A step of draft keys that retains one row, then the step after it
-    // with the committed keys, which are other keys from its first row on.
-    const auto step = [&](uint32_t from, const std::vector<uint16_t> &keys, uint32_t retained) {
-      const std::array<uint32_t, 1> firsts{from};
-      const std::vector<BlockIndexerBlock> records = qsaRecords(from, rows);
-      const std::array<uint32_t, 1> counts{static_cast<uint32_t>(records.size())};
-      const std::array<ops::LaneRows, 1> stepRows{{{0, rows}}};
-      const MetalBuffer keyBuffer = upload(backend, keys);
-      CommandGraph graph;
-      const ops::IndexerRows qsaRows{stepRows, firsts, {{&lane.tableBuffer, 1}, 0}, 512, 0, 0};
-      ops::BlockIndexer::addPool(graph, {upload(backend, records), counts, 0, keyBuffer, {&lane.pending[0], 1}},
-                                 keyNorm, invFreqBuffer, 1.0F, qsaRows);
-      ops::BlockIndexer::addCommit(graph, keyBuffer, 1, rows, stepRows, firsts,
-                                   upload(backend, std::vector<uint32_t>{retained}), {&lane.pending[0], 1},
-                                   {&lane.pending[1], 1});
-      run(backend, graph);
-      std::swap(lane.pending[0], lane.pending[1]);
+    std::mt19937 rng(29 + first);
+    const QsaWeights weights = qsaWeights(backend, rng);
+    MetalBuffer index;
+    QsaLane lane = qsaHistory(backend, rng, first, (first + 2 * rows + kQsaPage - 1) / kQsaPage, index,
+                              weights.keyNorm, weights.invFreq);
+    const std::vector<float> committed = randoms(rng, uint64_t{2 * rows} * D, 1.0f);
+    const uint32_t words = ((first + 2 * rows) / 4 + BLOCK_INDEXER_TILE_SLACK + 31) / 32 + 1;
+    // A step of `keys` from `from` that accepts `accepted` rows.
+    const auto step = [&](uint32_t from, std::vector<float> keys, uint32_t accepted) {
+      const QsaTreeLane chain{from, qsaChain(rows), randoms(rng, uint64_t{rows} * H * D, 1.0f), std::move(keys)};
+      const std::array<const QsaLane *, 1> histories{&lane};
+      const std::array<uint32_t, 1> path{ops::chainPath(accepted)};
+      lane.pending[0] = qsaTreeStep(backend, std::span(&chain, 1), histories, 512, words, weights, path).pendingAfter[0];
     };
     // The draft's rows after the first, which holds the committed token, are
     // rejected.
-    std::vector<uint16_t> draft = qsaKeys(lane, first, rows);
-    for (uint64_t i = D; i < draft.size(); ++i) draft[i] = bf16(-f32(draft[i]) + 0.5f);
+    std::vector<float> draft(committed.begin(), committed.begin() + uint64_t{rows} * D);
+    for (uint64_t i = D; i < draft.size(); ++i) draft[i] = -draft[i] + 0.5f;
     step(first, draft, 1);
-    step(first + 1, qsaKeys(lane, first + 1, rows), rows);
-    // Every block the two steps complete, from the committed keys alone.
-    const auto gotP = download<uint16_t>(extent, pooledBytes / 2);
+    step(first + 1, std::vector<float>(committed.begin() + D, committed.begin() + uint64_t{rows + 1} * D), rows);
+    // Every block the two steps complete, from the committed keys alone, and
+    // the history's before them.
+    const auto key = [&](uint32_t t) -> const float * {
+      return t < first ? &lane.raw[uint64_t{t} * D] : &committed[uint64_t{t - first} * D];
+    };
+    const auto gotP = download<uint16_t>(index, index.sizeBytes() / 2);
     for (uint32_t b = first / 4; b < (first + 1 + rows) / 4; ++b) {
       std::vector<double> mean(D, 0);
       for (uint32_t t = 4 * b; t < 4 * b + 4; ++t)
-        for (uint32_t d = 0; d < D; ++d) mean[d] += f32(bf16(lane.raw[uint64_t{t} * D + d])) / 4;
+        for (uint32_t d = 0; d < D; ++d) mean[d] += f32(bf16(key(t)[d])) / 4;
       double sum = 0;
       for (double e : mean) sum += e * e;
       const double scale = 1 / std::sqrt(sum / D + 1e-6);
-      // Dimensions past the rotated ones are the normalized mean as it is.
+      // Dimensions past the rotated ones are the normalized mean times the
+      // key norm.
+      const auto norm = download<float>(weights.keyNorm.buffer, D);
       for (uint32_t d = 64; d < D; ++d) {
-        const double want = mean[d] * scale, got = f32(gotP[(uint64_t{lane.table[b / 8]} * 8 + b % 8) * D + d]);
+        const double want = mean[d] * scale * norm[d], got = f32(gotP[(uint64_t{lane.table[b / 8]} * 8 + b % 8) * D + d]);
         ok &= std::fabs(got - want) <= std::fabs(want) / 256 + 2e-4;
       }
     }
@@ -1512,6 +1823,19 @@ int main(int argc, const char *argv[]) {
         // 1,010,000 tokens it serves, past 252,000 blocks.
         qsaTest(backend, {2050, 8, 512, 0, 4, 1021, true});
         qsaTest(backend, {1'010'000, 8, 512, 0, 1, 2047, true});
+        // A verify block's tree against its paths run as chains: past a
+        // small budget, where rows drop blocks of their own, and around
+        // Flash-Next's (2046: rows of depth 2 or less dense, deeper ones
+        // sparse), at anchors 2 and 1 past a block.
+        qsaTreeAsChains(backend, 66, 12);
+        qsaTreeAsChains(backend, 602, 16);
+        qsaTreeAsChains(backend, 2046, 512);
+        qsaTreeAsChains(backend, 4093, 512);
+        // A chain against its rows decoded one a step, on either side of
+        // Flash-Next's budget and of a page, accepting all of it or part.
+        qsaChainAsSequential(backend, 2045, 16, 16, 512);
+        qsaChainAsSequential(backend, 4093, 8, 5, 512);
+        qsaChainAsSequential(backend, 602, 16, 11, 16);
         qsaPackedLanes(backend);
         qsaScratchCoversWindow(backend);
         qsaRollbackTest(backend);

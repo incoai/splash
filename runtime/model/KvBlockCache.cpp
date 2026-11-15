@@ -394,7 +394,10 @@ ops::AttentionBlocks KvBlockCache::addResolve(metal::CommandGraph &graph, uint32
                impl->resume.add(nanoseconds(timing.resumeSeconds));
              },
              metal::HostStepGpu::Awake);
-  return {blocks.lists, blocks.counts, blocks.stride, blocks.list, locations, impl.locationPages};
+  ops::AttentionBlocks located = blocks;
+  located.locations = locations;
+  located.locationPages = impl.locationPages;
+  return located;
 }
 
 std::vector<KvReadFailure> KvBlockCache::takeFailures() {

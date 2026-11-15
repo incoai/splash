@@ -1300,8 +1300,9 @@ void stageEncoding(metal::MetalBackend &backend) {
 // one with them takes none. The lists and counts hold every list the
 // sequences' tiles read, and a plan whose kernels take no lists refuses
 // them. With locations the located split runs, which binds them and their
-// pages after the lists; they hold a location for every entry of the
-// sequences' lists, and need their pages.
+// pages after the row masks; they hold a location for every entry of the
+// sequences' lists, and need their pages. A decode step's tree rows bind
+// their row masks after the counts, a mask per row, which lists need.
 void attentionBlocks(metal::MetalBackend &backend) {
   constexpr uint32_t entries = 40, first = 2;
   const std::array sequences{ops::PagedAttention::chunkParams(100, 37, 64, 5),
@@ -1358,13 +1359,15 @@ void attentionBlocks(metal::MetalBackend &backend) {
       metal::CommandGraph graph, partly;
       attend(graph, {listBuffer, counts, listStride, first});
       attend(partly, {listBuffer, counts, listStride, first}, true);
-      // `after` buffers follow the lists and their counts, which follow the
-      // tree rows' place (another buffer without them).
+      // `after` buffers follow the lists, their counts and the row masks'
+      // place, which follow the tree rows' place (another buffer for each of
+      // the two without tree rows).
       const auto bindsLists = [&](const metal::ComputeDispatch &split, const metal::ComputeDispatch &reduce,
                                   uint32_t after) {
-        return split.buffers.size() == 8 + 2 + after && split.buffers[7].buffer.sameView(partials) &&
+        return split.buffers.size() == 8 + 3 + after && split.buffers[7].buffer.sameView(partials) &&
                split.buffers[8].buffer.sameView(boundLists) && split.buffers[9].buffer.sameView(boundCounts) &&
-               split.bytes.size() == 1 && split.bytes[0].index == 10 + after && reduce.buffers.size() == 4 &&
+               split.buffers[10].buffer.sameView(partials) && split.bytes.size() == 1 &&
+               split.bytes[0].index == 11 + after && reduce.buffers.size() == 4 &&
                reduce.buffers[3].buffer.sameView(boundCounts) && reduce.bytes.size() == 1 &&
                reduce.bytes[0].index == 4;
       };
@@ -1388,8 +1391,8 @@ void attentionBlocks(metal::MetalBackend &backend) {
         metal::CommandGraph located;
         attend(located, {listBuffer, counts, listStride, first, locations, locationPages});
         const metal::ComputeDispatch &split = located.dispatches()[0];
-        require(bindsLists(split, located.dispatches()[1], 2) && split.buffers[10].buffer.sameView(locations) &&
-                    split.buffers[11].buffer.sameView(locationPages) && split.pipelineName == locatedSplitName(layout),
+        require(bindsLists(split, located.dispatches()[1], 2) && split.buffers[11].buffer.sameView(locations) &&
+                    split.buffers[12].buffer.sameView(locationPages) && split.pipelineName == locatedSplitName(layout),
                 "a located split does not bind its lists' locations and their pages before its parameters");
         rejects([&] { attend(refused, {listBuffer, counts, listStride, first, locations, {}}); },
                 "attention block locations need their pages", "block locations without pages were taken");
@@ -1399,6 +1402,31 @@ void attentionBlocks(metal::MetalBackend &backend) {
       }
       require(refused.empty(), "refused block locations encoded a dispatch");
     }
+    // A decode step's tree rows (lanes of 8 rows) bind their row masks after
+    // the lists' counts, which hold a mask per row of the command, or
+    // without lists another buffer of the dispatch.
+    const std::array treeLanes{sequences[1], sequences[2]};
+    const auto treePlan = planOf(treeLanes, queryHeads, layout);
+    const metal::MetalBuffer treeRows = buffer(16 * sizeof(SplashTreeRow)), rowMasks = buffer(16 * 4);
+    const auto attendTree = [&](metal::CommandGraph &graph, ops::AttentionBlocks blocks) {
+      std::array<ops::AttentionHistory, 2> histories{};
+      for (uint32_t s = 0; s < 2; ++s) {
+        histories[s] = {{1, 0}, table, blocks};
+        histories[s].blocks.list += s;
+      }
+      ops::PagedAttention::addAttention(graph, treePlan, {.queries = staging, .rows = staging}, partials, statistics,
+                                        treeLanes, histories, {}, treeRows);
+    };
+    metal::CommandGraph masked, listless, unmasked;
+    attendTree(masked, {listBuffer, counts, entries, first, {}, {}, rowMasks});
+    attendTree(listless, {listBuffer, counts, 0, 0, {}, {}, rowMasks});
+    require(masked.dispatches()[0].buffers[7].buffer.sameView(treeRows) &&
+                masked.dispatches()[0].buffers[10].buffer.sameView(rowMasks) &&
+                listless.dispatches()[0].buffers[10].buffer.sameView(partials),
+            "a sparse split of tree rows does not bind their row masks after its lists' counts");
+    rejects([&] { attendTree(unmasked, {listBuffer, counts, entries, first}); },
+            "attention row masks buffer holds 0 bytes, needs 64", "tree rows took lists without row masks");
+    require(unmasked.empty(), "tree rows' lists without row masks encoded a dispatch");
     test::requireExtent(backend, listBuffer, uint64_t{first + tiles} * entries * 4, 4, "attention block lists",
                         [&](metal::CommandGraph &graph, const metal::MetalBuffer &view) {
                           attend(graph, {view, counts, entries, first});

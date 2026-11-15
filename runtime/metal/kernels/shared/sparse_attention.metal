@@ -117,7 +117,10 @@ inline SplashSparseList splash_sparse_list(device const uint *lists, device cons
 // a two-dimensional one (x the KV head, y the split), which ran up to 1.7x
 // slower on most grids of more than 32 splits. The located split reads each
 // entry's block where the list's locations name. Every split binds the
-// step's tree rows after the page tables, as the dense split does.
+// step's tree rows after the page tables, as the dense split does, and after
+// the lists' counts the row masks of a tree's rows that attend through them
+// (ops::AttentionBlocks::rowMasks, a word per row of the command at the
+// tree rows' places).
 #define SPARSE_SPLIT_BODY(Heads, Group, HeadDim, CacheElement, Located,       \
                           Locations, LocationPages, Places)                    \
     constexpr uint Rows = SPLASH_ATTENTION_TILE_ROWS;                          \
@@ -145,6 +148,10 @@ inline SplashSparseList splash_sparse_list(device const uint *lists, device cons
         tile.splits, split, partials, statistics, tile.first_slot + split,     \
         scratch, splash_attention_tree(params, sequence, tree,                 \
                                        tile.first_position),                   \
+        params.trees && list.entries                                           \
+            ? row_masks + sequence.row_begin +                                 \
+                  (tile.first_position - sequence.committed_tokens)            \
+            : nullptr,                                                         \
         thread_index);
 
 #define SPARSE_SPLIT(Name, Heads, Group, HeadDim, CacheElement)                \
@@ -159,7 +166,8 @@ inline SplashSparseList splash_sparse_list(device const uint *lists, device cons
       device const SplashTreeRow *tree [[buffer(7)]],                          \
       device const uint *lists [[buffer(8)]],                                  \
       device const uint *counts [[buffer(9)]],                                 \
-      constant SplashAttentionParams &params [[buffer(10)]],                   \
+      device const uint *row_masks [[buffer(10)]],                             \
+      constant SplashAttentionParams &params [[buffer(11)]],                   \
       uint3 group [[threadgroup_position_in_grid]],                            \
       uint thread_index [[thread_index_in_threadgroup]]) {                     \
     SPARSE_SPLIT_BODY(Heads, Group, HeadDim, CacheElement, false, nullptr,     \
@@ -167,7 +175,8 @@ inline SplashSparseList splash_sparse_list(device const uint *lists, device cons
   }
 
 // The located split binds the lists' locations and their pages after the
-// lists. The places of a step's blocks take threadgroup memory of their own.
+// row masks. The places of a step's blocks take threadgroup memory of their
+// own.
 #define SPARSE_LOCATED_SPLIT(Name, Heads, Group, HeadDim, CacheElement)        \
   kernel void Name(                                                            \
       device bfloat *queries [[buffer(0)]],                                    \
@@ -180,9 +189,10 @@ inline SplashSparseList splash_sparse_list(device const uint *lists, device cons
       device const SplashTreeRow *tree [[buffer(7)]],                          \
       device const uint *lists [[buffer(8)]],                                  \
       device const uint *counts [[buffer(9)]],                                 \
-      device const uint *locations [[buffer(10)]],                             \
-      device const SplashKvPage *location_pages [[buffer(11)]],                \
-      constant SplashAttentionParams &params [[buffer(12)]],                   \
+      device const uint *row_masks [[buffer(10)]],                             \
+      device const uint *locations [[buffer(11)]],                             \
+      device const SplashKvPage *location_pages [[buffer(12)]],                \
+      constant SplashAttentionParams &params [[buffer(13)]],                   \
       uint3 group [[threadgroup_position_in_grid]],                            \
       uint thread_index [[thread_index_in_threadgroup]]) {                     \
     threadgroup uint places[SplashSparseStep<CacheElement>::Blocks];           \

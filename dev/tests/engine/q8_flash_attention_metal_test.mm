@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
@@ -210,17 +211,25 @@ struct Case {
   uint32_t maskWords = 0;
   // The rows' places as a tree (metal/abi/VerifyTree.h, SplashAttentionParams
   // ::trees): a row sees, of the rows, its ancestors and itself; empty for
-  // rows that attend causally.
+  // rows that attend causally. Through QSA masks a tree's row sees only
+  // those of them its row mask holds (ops::AttentionBlocks::rowMasks).
   std::vector<SplashTreeRow> tree;
+  std::vector<uint32_t> rowMasks;
+  // The token whose patterns each slot's K/V hold and the row whose query
+  // each row holds: themselves, or for a chain of a tree's path its rows'.
+  std::vector<uint32_t> tokens;
+  std::vector<uint32_t> queryRows;
 
+  uint32_t token(uint32_t slot) const { return tokens.empty() ? slot : tokens[slot]; }
+  uint32_t queryRow(uint32_t row) const { return queryRows.empty() ? row : queryRows[row]; }
   bool attends(uint32_t row, uint32_t token) const {
     if (!maskWords) return true;
     const uint32_t block = token / SPLASH_ATTENTION_BLOCK_TOKENS;
     return (mask[uint64_t{row} * maskWords + block / 32] >> (block % 32)) & 1u;
   }
   bool onPath(uint32_t row, uint32_t token) const {
-    return tree.empty() || token < params.committed_tokens ||
-           ((tree[row].ancestors >> (token - params.committed_tokens)) & 1u);
+    const uint32_t visible = tree.empty() ? 0u : tree[row].ancestors & (maskWords ? rowMasks[row] : ~0u);
+    return tree.empty() || token < params.committed_tokens || ((visible >> (token - params.committed_tokens)) & 1u);
   }
 
   uint64_t queryIndex(uint32_t head, uint32_t row, uint32_t dimension) const {
@@ -293,6 +302,7 @@ Case oneExtentCopy(id<MTLDevice> device, const Case &data) {
   result.mask = data.mask;
   result.maskWords = data.maskWords;
   result.tree = data.tree;
+  result.rowMasks = data.rowMasks;
   return result;
 }
 
@@ -396,9 +406,9 @@ void fill(Case &data) {
         for (uint32_t dimension = 0; dimension < kHeadDimension; ++dimension) {
           uint64_t index = logicalIndex(token, head, dimension);
           pageKeys[index] = bfloat16ToFloat(
-              floatToBFloat16(keyPattern(global, head, dimension)));
+              floatToBFloat16(keyPattern(data.token(global), head, dimension)));
           pageValues[index] = bfloat16ToFloat(
-              floatToBFloat16(valuePattern(global, head, dimension)));
+              floatToBFloat16(valuePattern(data.token(global), head, dimension)));
         }
       }
     }
@@ -424,7 +434,7 @@ void fill(Case &data) {
     for (uint32_t row = 0; row < data.params.rows; ++row)
       for (uint32_t dimension = 0; dimension < kHeadDimension; ++dimension)
         queries[data.queryIndex(head, row, dimension)] =
-            floatToBFloat16(queryPattern(row, head, dimension));
+            floatToBFloat16(queryPattern(data.queryRow(row), head, dimension));
 }
 
 float loadKey(const Case &data, uint32_t token, uint32_t head,
@@ -473,7 +483,7 @@ std::vector<BFloat16Bits> cpuReference(const Case &data, bool quantized) {
               quantized
                   ? loadKey(data, token, kvHead, dimension)
                   : bfloat16ToFloat(floatToBFloat16(
-                        keyPattern(token, kvHead, dimension)));
+                        keyPattern(data.token(token), kvHead, dimension)));
           score += double(query) * key;
         }
         weights[token] = data.attends(row, token) && data.onPath(row, token)
@@ -493,7 +503,7 @@ std::vector<BFloat16Bits> cpuReference(const Case &data, bool quantized) {
               quantized
                   ? loadValue(data, token, kvHead, dimension)
                   : bfloat16ToFloat(floatToBFloat16(
-                        valuePattern(token, kvHead, dimension)));
+                        valuePattern(data.token(token), kvHead, dimension)));
           value += weights[token] * storedValue;
         }
         output[data.queryIndex(queryHead, row, dimension)] =
@@ -563,12 +573,18 @@ Dispatch dispatch(id<MTLDevice> device, id<MTLCommandQueue> queue,
   // With QSA masks every lane attends through a copy of the case's list,
   // lane l's list kQsaJunkLists + l.
   const BlockLists blocks = data.maskWords ? qsaBlockLists(device, data, width) : BlockLists{partials, partials, 0};
-  // Each lane's copy of the case's tree, at its rows.
-  id<MTLBuffer> tree = partials;
+  // Each lane's copy of the case's tree and, through QSA masks, its row
+  // masks, at its rows.
+  id<MTLBuffer> tree = partials, rowMasks = partials;
   if (!data.tree.empty()) {
     tree = makeBuffer(device, uint64_t{width} * data.params.rows * sizeof(SplashTreeRow));
     for (uint32_t lane = 0; lane < width; ++lane)
       std::copy(data.tree.begin(), data.tree.end(), static_cast<SplashTreeRow *>(tree.contents) + lane * data.params.rows);
+  }
+  if (!data.rowMasks.empty()) {
+    rowMasks = makeBuffer(device, uint64_t{width} * data.params.rows * sizeof(uint32_t));
+    for (uint32_t lane = 0; lane < width; ++lane)
+      std::copy(data.rowMasks.begin(), data.rowMasks.end(), static_cast<uint32_t *>(rowMasks.contents) + lane * data.params.rows);
   }
   SplashAttentionParams params{.sequences = width, .rows = width * data.params.rows, .tiles = width,
                                .trees = data.tree.empty() ? 0U : 1U,
@@ -592,13 +608,15 @@ Dispatch dispatch(id<MTLDevice> device, id<MTLCommandQueue> queue,
   for (uint32_t index = 3; index < 7; ++index)
     [encoder setBuffer:data.pageTableBuffer offset:0 atIndex:index];
   // A split binds the tree rows, or without them another buffer of the
-  // dispatch, and a sparse split the lists and their counts, or without lists
-  // another buffer of the dispatch, of which it reads nothing.
+  // dispatch, and a sparse split the lists, their counts and the row masks,
+  // or without lists another buffer of the dispatch, of which it reads
+  // nothing.
   [encoder setBuffer:tree offset:0 atIndex:7];
   NSUInteger paramsIndex = 8;
   if (shape.sparse()) {
     [encoder setBuffer:blocks.lists offset:0 atIndex:paramsIndex++];
     [encoder setBuffer:blocks.counts offset:0 atIndex:paramsIndex++];
+    [encoder setBuffer:rowMasks offset:0 atIndex:paramsIndex++];
   }
   [encoder setBytes:&params length:sizeof(params) atIndex:paramsIndex];
   // The kernel reaches the extents only through the page entries.
@@ -771,6 +789,113 @@ void requireIdentical(const std::string &pipeline, const Case &data,
   }
 }
 
+// A tree's rows through QSA lists against its paths run as chains, each row
+// selected as the block indexer selects it (ops::BlockIndexer::addTreeSelect):
+// tree row i at depth d, on the path p_0..p_d, attends the position blocks of
+// a selection of its own; its bitmap names that selection's blocks below the
+// anchor's block, and from there on the blocks of its row mask's slots, the
+// path's rows p_k at positions in blocks it selects. The chain of a leaf's
+// path holds at row k tree row p_k's query, its K/V at the slot of its depth
+// and its selection, so its row k attends the same keys and values at the
+// same positions as tree row p_k. Each tree row's output is its chain row's
+// within rounding, every value of a head's row within a bf16 step of the
+// row's largest: the path's rows sit at other slots than the chain's, and the
+// tree's list (its eight rows' blocks) is longer than a chain's, so its
+// entries fall into other steps and splits and the fp32 sums run in another
+// order: bit for bit at 162 tokens; at 4094, 59% of the values differ, by at
+// most 0.78 of a bf16 step of their row's largest (an M6). Rows 4 and 6
+// branch off rows 0 and 1, so their packed predecessors are not their
+// parents, and a sibling of a row in a block it selects is never among its
+// keys.
+void treeAgainstChains(id<MTLDevice> device, id<MTLCommandQueue> queue, const Pipelines &pipelines, Shape shape,
+                       uint32_t committed, uint32_t splits, bool qualityGate) {
+  constexpr uint32_t kBlockTokens = SPLASH_ATTENTION_BLOCK_TOKENS;
+  constexpr std::array<int, kRows> kParents{-1, 0, 1, 2, 0, 4, 1, 6};
+  std::vector<SplashTreeRow> tree;
+  for (uint32_t row = 0; row < kRows; ++row) {
+    const int parent = kParents[row];
+    tree.push_back(parent < 0 ? SplashTreeRow{1u, SPLASH_TREE_ROOT, 0}
+                              : SplashTreeRow{tree[parent].ancestors | 1u << row, static_cast<uint16_t>(parent),
+                                              static_cast<uint16_t>(tree[parent].depth + 1)});
+  }
+  const uint32_t anchor = committed, history = anchor / kBlockTokens;
+  // Tree row t's selection of position blocks: past kQsaTopBlocks complete
+  // blocks some of the history's by page and some of the block's by row, and
+  // its tail; up to there every block up to its own.
+  const auto selects = [&](uint32_t t, uint32_t block) {
+    const uint32_t complete = (anchor + tree[t].depth + 1) / kBlockTokens;
+    if (complete <= kQsaTopBlocks || block >= complete) return block <= complete;
+    const uint32_t page = block / 8;
+    return block >= history ? (block + t) % 2 == 0 : page % 5 == 0 || (page % 3 == 1 && block % 8 == (t + page) % 8);
+  };
+  // A case's bitmaps and row masks, row r taking tree row of[r]'s selection.
+  const auto setMasks = [&](Case &data, const std::vector<uint32_t> &of) {
+    data.maskWords = (data.params.committed_tokens + data.params.rows) / kBlockTokens / 32 + 2;
+    data.mask.assign(uint64_t{data.params.rows} * data.maskWords, 0u);
+    data.rowMasks.assign(data.params.rows, 0u);
+    for (uint32_t r = 0; r < data.params.rows; ++r) {
+      uint32_t *bits = data.mask.data() + uint64_t{r} * data.maskWords;
+      for (uint32_t block = 0; block < history; ++block)
+        if (selects(of[r], block)) bits[block / 32] |= 1u << (block % 32);
+      uint32_t depth = 0;
+      for (uint32_t rest = data.tree[r].ancestors; rest; rest &= rest - 1, ++depth) {
+        if (!selects(of[r], (anchor + depth) / kBlockTokens)) continue;
+        const uint32_t slot = std::countr_zero(rest), block = (anchor + slot) / kBlockTokens;
+        data.rowMasks[r] |= 1u << slot;
+        bits[block / 32] |= 1u << (block % 32);
+      }
+    }
+  };
+  const std::string name = pipelines.splitName + "_tree_chains";
+  Case whole = makeCase(device, shape, committed, kRows, splits);
+  whole.tree = tree;
+  std::vector<uint32_t> own(kRows);
+  for (uint32_t row = 0; row < kRows; ++row) own[row] = row;
+  setMasks(whole, own);
+  fill(whole);
+  const Dispatch treeRun = dispatch(device, queue, pipelines.split, pipelines.reduce, whole, 1);
+  checkOutput(whole, 1, cpuReference(whole, true), cpuReference(whole, false), treeRun.output, qualityGate, name);
+  const auto *treeOut = reinterpret_cast<const BFloat16Bits *>(treeRun.output.data());
+  uint64_t compared = 0, differing = 0;
+  float worst = 0.0f;
+  for (uint32_t leaf = 0; leaf < kRows; ++leaf) {
+    if (std::find(kParents.begin(), kParents.end(), int(leaf)) != kParents.end()) continue;
+    std::vector<uint32_t> path;
+    for (uint32_t rest = tree[leaf].ancestors; rest; rest &= rest - 1) path.push_back(std::countr_zero(rest));
+    const uint32_t rows = static_cast<uint32_t>(path.size());
+    Case chain = makeCase(device, shape, committed, rows, splits);
+    for (uint32_t row = 0; row < rows; ++row)
+      chain.tree.push_back({(2u << row) - 1u, static_cast<uint16_t>(row ? row - 1 : SPLASH_TREE_ROOT),
+                            static_cast<uint16_t>(row)});
+    for (uint32_t slot = 0; slot < committed + rows; ++slot)
+      chain.tokens.push_back(slot < anchor ? slot : anchor + path[slot - anchor]);
+    chain.queryRows = path;
+    setMasks(chain, path);
+    fill(chain);
+    const Dispatch chainRun = dispatch(device, queue, pipelines.split, pipelines.reduce, chain, 1);
+    checkOutput(chain, 1, cpuReference(chain, true), cpuReference(chain, false), chainRun.output, qualityGate,
+                name + "_leaf" + std::to_string(leaf));
+    const auto *chainOut = reinterpret_cast<const BFloat16Bits *>(chainRun.output.data());
+    for (uint32_t head = 0; head < shape.queryHeads(); ++head)
+      for (uint32_t row = 0; row < rows; ++row) {
+        float largest = 0.0f, difference = 0.0f;
+        for (uint32_t dimension = 0; dimension < kHeadDimension; ++dimension) {
+          const float a = bfloat16ToFloat(treeOut[whole.queryIndex(head, path[row], dimension)]);
+          const float b = bfloat16ToFloat(chainOut[chain.queryIndex(head, row, dimension)]);
+          largest = std::max({largest, std::abs(a), std::abs(b)});
+          difference = std::max(difference, std::abs(a - b));
+          differing += a != b;
+          ++compared;
+        }
+        worst = std::max(worst, difference / (largest / 128.0f));
+      }
+  }
+  std::cout << name << " committed=" << committed << " values=" << compared << " differing=" << differing
+            << " worst_in_bf16_steps_of_the_row=" << worst << '\n';
+  require(worst <= 1.0f, "a tree row's attention departs from its path's chain by more than its rounding");
+}
+
+
 // Keep the CPU reference gates and verify that a second independent
 // submission, and the same pages in one extent, produce identical output and
 // scratch, of a dispatch of `width` lanes of the case's rows.
@@ -794,6 +919,11 @@ void runCase(id<MTLDevice> device, id<MTLCommandQueue> queue,
                            static_cast<uint16_t>(row ? kParents[row] : SPLASH_TREE_ROOT),
                            static_cast<uint16_t>(row ? parent.depth + 1 : 0)});
     }
+    // Through QSA masks, row masks that leave out some of a path's rows: a
+    // third of the rows its parent, a third itself.
+    if (qsa)
+      for (uint32_t row = 0; row < activeRows; ++row)
+        data.rowMasks.push_back(row % 3 == 1 ? ~(1u << kParents[row]) : row % 3 == 2 ? ~(1u << row) : ~0u);
   }
   const Case oneExtent = oneExtentCopy(device, data);
   const std::vector<BFloat16Bits> expectedQ8 = cpuReference(data, true);
@@ -966,9 +1096,12 @@ void run(const char *libraryPath) {
     runCase(device, queue, pipelines, shape, 127, 8, 4, true, 32, false, true);
     runCase(device, queue, pipelines, shape, 4'093, 7, 2, false, 65, false, true);
     if (shape.queryHeadsPerKvHead == 12) {
-      // Tree rows through QSA lists, causal and sparse.
+      // Tree rows through QSA lists and row masks, causal and sparse, and
+      // against their paths as chains.
       runCase(device, queue, pipelines, shape, 160, 8, 2, true, 32, true, true);
       runCase(device, queue, pipelines, shape, 4'093, 8, 3, false, 65, true, true);
+      treeAgainstChains(device, queue, pipelines, shape, 162, 32, true);
+      treeAgainstChains(device, queue, pipelines, shape, 4'094, 65, false);
       // QSA masks: a tile attends only the blocks its list names. Causal
       // rows only; tiles crossing from causal to sparse rows (complete
       // blocks 40 to 42, and only the last row past 40); sparse rows over

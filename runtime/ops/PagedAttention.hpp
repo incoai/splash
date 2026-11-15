@@ -109,7 +109,11 @@ struct AttentionVariant final {
 // sparse plan takes lists. With `locations`, an array of the lists' shape,
 // each entry's block is read where its location names (SPLASH_ATTENTION_PAGED,
 // or a page of locationPages and the block's place in it), as the hot block
-// cache of a request whose K/V spilled gives them (model::KvBlockCache).
+// cache of a request whose K/V spilled gives them (model::KvBlockCache). A
+// decode step's tree rows (PagedAttention::addAttention's `tree`) attend,
+// of the rows of their block in the blocks their lists name, those their
+// row masks hold (`rowMasks`, a bit per row of the block, a word per row of
+// the command, ops::BlockIndexer::addTreeSelect's) and their ancestors.
 struct AttentionBlocks final {
   metal::MetalBuffer lists;
   metal::MetalBuffer counts;
@@ -117,6 +121,7 @@ struct AttentionBlocks final {
   uint32_t list = 0;
   metal::MetalBuffer locations{};
   metal::MetalBuffer locationPages{};
+  metal::MetalBuffer rowMasks{};
 };
 
 // Where a sequence's attention reads its history: the layer's pages, placed

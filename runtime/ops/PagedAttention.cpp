@@ -320,7 +320,7 @@ bool sameLayer(SplashKvLayer a, SplashKvLayer b) { return a.extent_pages == b.ex
 
 bool sameBindings(const AttentionBlocks &a, const AttentionBlocks &b) {
   return a.lists.sameView(b.lists) && a.counts.sameView(b.counts) && a.locations.sameView(b.locations) &&
-         a.locationPages.sameView(b.locationPages);
+         a.locationPages.sameView(b.locationPages) && a.rowMasks.sameView(b.rowMasks);
 }
 
 // A reduce threadgroup combines one fused row's splits, a thread per
@@ -487,9 +487,11 @@ void PagedAttention::addAttention(metal::CommandGraph &graph, const AttentionPla
     requirePageTable(histories[s].pageTable, sequences[s]);
     requireBlocks(histories[s].blocks, plan.sparse, kv::attentionTiles(planned[s].rows));
     // A tree's rows are a block's from its anchor, a bit of a row's
-    // ancestors each.
+    // ancestors each, and through lists their row masks too.
     if (tree && (planned[s].firstTile || planned[s].rows > 32))
       throw std::invalid_argument("attention tree rows take whole blocks of at most 32 rows");
+    if (tree && histories[s].blocks.stride)
+      requireBytes(histories[s].blocks.rowMasks, uint64_t{rows.rows} * sizeof(uint32_t), "attention row masks");
   }
   if (tree) requireBytes(tree, uint64_t{rows.rows} * sizeof(SplashTreeRow), "attention tree rows");
   // The tiles read the queries and write the attention rows in whole tiles
@@ -554,11 +556,13 @@ void PagedAttention::addAttention(metal::CommandGraph &graph, const AttentionPla
     split.push_back(tree ? tree : partials);
     std::vector<metal::MetalBuffer> reduce{partials, statistics, staging.rows};
     if (plan.sparse) {
-      // Without lists a sparse kernel binds another buffer of the dispatch
-      // for them, of which it reads nothing.
+      // Without lists, or without tree rows for the row masks, a sparse
+      // kernel binds another buffer of the dispatch for them, of which it
+      // reads nothing.
       const metal::MetalBuffer &lists = blocks.stride ? blocks.lists : partials;
       const metal::MetalBuffer &counts = blocks.stride ? blocks.counts : partials;
-      split.insert(split.end(), {lists, counts});
+      const metal::MetalBuffer &rowMasks = blocks.stride && tree ? blocks.rowMasks : partials;
+      split.insert(split.end(), {lists, counts, rowMasks});
       if (blocks.locations) split.insert(split.end(), {blocks.locations, blocks.locationPages});
       reduce.push_back(counts);
     }

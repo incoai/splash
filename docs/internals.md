@@ -450,12 +450,14 @@ read the layout on the GPU and take a lane's verify rows alone; the first
 token after a prompt is selected from, and written at, the lane's one row,
 whose layout its selection writes first (`decode_sample_first_rows`), and
 Qwen3.8-Flash-Next's n-gram hash reads it too, hashing a row's n-grams along
-its path. The target's kernels and Qwen3.8-Flash-Next's block indexer address
-each lane's rows by the host's `ops::LaneRows` (the kernels' per-lane
-`first_row` and `rows`), so lanes of different row counts share one dispatch;
-a decode step holds eight rows a lane, which the selector lays out at lane x
-8. A lane's verify block is a tree (`metal/abi/VerifyTree.h`, a row's
-parent, depth and ancestors' mask), which the draft's selector writes with
+its path; so do the GDN decode and Qwen3.8-Flash-Next's block indexer pool,
+selection and commit. The target's other kernels and the block indexer's
+projection address each lane's rows by the host's `ops::LaneRows` (the
+kernels' per-lane `first_row` and `rows`), so lanes of different row counts
+share one dispatch; a decode step holds eight rows a lane, which the selector
+lays out at lane x 8. A lane's verify block is a tree
+(`metal/abi/VerifyTree.h`, a row's parent, depth and ancestors' mask), which
+the draft's selector writes with
 each row's token, its verify input: a row's penalties count the draft tokens
 of its path, a thinking cutoff applies by depth, acceptance follows from the
 anchor the child whose token is its row's selection, and the draft's context
@@ -488,7 +490,9 @@ itself; a row of a block's second tile reads its ancestors' K/V from the
 slots the store wrote before the attention. After acceptance the cycle moves
 each lane's accepted path's K/V to the slots of their depths in every
 attention layer (`ops::PagedAttention::addPathCommit`, reading acceptance's
-`RetainedRows`), which moves nothing for a chain's path.
+`RetainedRows`), which moves nothing for a chain's path. Qwen3.8-Flash-Next's
+block indexer reads the same layout and keeps each row to its path
+([Sparse attention](#sparse-attention)).
 
 ### Kernel selection
 
@@ -1140,15 +1144,41 @@ simdgroup from ballots (`kernels/shared/block_indexer.metal`). The pending keys,
 the raw keys of the up to 3 tokens of the block a sequence has not completed,
 are its state's (after the PLE history in a state cell,
 `QwenTargetDimensions::indexerPendingBytes`): a prefill writes them after its
-rows and at each state it captures, and a verify's commit after the rows the
-lane retained, so a block a rejected row completed is pooled again by the
-next step from the committed tokens. No page holds a raw key. Queries and
+rows and at each state it captures, and a verify's commit after the path the
+lane accepted. No page holds a raw key. Queries and
 pooled keys rotate by the same target RoPE row (`target_rope_pair`, the
 queries' from the step's tables, a pooled key's at its block's first token),
 with YaRN's frequencies and attention factor when YaRN is on. A row's
 scores and bitmap cover every block of the window the model serves; a prefill
 chunk scores its rows in batches that keep the native window's score scratch,
 256 rows at 256K, 64 at 1,010,000.
+
+A prompt's rows are committed as they run, so the blocks they complete go
+into the index. A verify lane is a block of rows from its anchor, a chain or a
+tree whose layout the step's proposer writes on the device (`SplashLaneRows`,
+`SplashTreeRow`), which the verify's indexer kernels read
+(`ops::BlockIndexer::addTreePool`, `addTreeSelect`): a row's position is the
+anchor's plus its depth, so siblings share positions, and a block one of its
+rows completes holds that row's path's tokens. The row pools it from its path
+(its parents' raw keys back to the anchor, then the pending keys) into its own
+block key, and nothing enters the index during the verify. A row scores the
+blocks complete before the anchor from the index, and the blocks its path
+completes from its path's rows' block keys, in a tile of the same MPP product
+whose keys are the lane's rows' block keys; MPP gives a product's element the
+same bits wherever it sits in the tile (qwen4-kernels checks it on Apple9 to
+11), so a chain's rows score and select bit for bit what its tokens decoded
+one a step would. A row's bitmap names the
+blocks of K/V slots it reads: below the anchor's block the blocks it selects,
+from there on the blocks of the slots of its path's rows in blocks it attends,
+which its row mask names (`ops::AttentionBlocks::rowMasks`, a bit per row of
+its lane), and the sparse split keeps a tree row inside those blocks to its
+ancestors that its row mask holds. Since the anchor's block holds the slots of
+the lane's first rows, whose positions fall in it whatever their depths, its
+bit is that block's own. Once acceptance has written each lane's path
+(`RetainedRows`), one commit (`block_indexer_commit`) writes the block keys of
+the path's rows that complete a block into every layer's index and the lane's
+pending keys after the path, so a block a rejected row completed is pooled
+again by a later step from the committed tokens.
 
 A layout whose attention reads the blocks its index selects
 (`kv::Layout::reads`, `Reads::SelectedBlocks`, which the family layout sets
@@ -1160,7 +1190,7 @@ index, and only its pages can spill (`kv::Layout::spillable`). It runs
 kernels compiled for 24 query heads over two KV heads (Qwen3.8-Flash-Next's):
 a query row attends only to the blocks of 4 tokens its block mask names
 within its causal history, the mask a bitmap per row over the history's
-blocks (`metal/abi/PagedAttention.h`). The rows of a tile (a verify lane's 8,
+blocks (`metal/abi/PagedAttention.h`). The rows of a tile (8 of a verify lane's,
 or 8 of a prefill chunk's) attend through one list, the union of
 their blocks in block order, each entry a block and the rows of the tile that
 attend it (`attention_block_lists`, `ops::PagedAttention::addBlockLists`).
