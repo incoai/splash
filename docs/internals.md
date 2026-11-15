@@ -2183,7 +2183,9 @@ that renders the reply otherwise resumes from.
 A reply's state is opportunistic (`StateCache::markReply`): reclaim takes it
 among the units that free for nothing, a checkpoint first in the cache's order,
 and never writes it to the SSD, as only a next prompt that renders the reply
-back resumes there, and a running reply's is replaced a page on. A chat client
+back resumes there, and a running reply's is replaced a page on. A capture at a
+page that holds a checkpoint already, a peer's prefill checkpoint or the state
+an identical earlier turn kept, reuses it as it is. A chat client
 that sends no reasoning back never renders a reasoning reply back: kept as
 ordinary states, the replies of 11 such chats served in turn at a 22 GB limit
 left their follow-ups 1 cached prefix of 22, where 1.6.2 left 18. Each block

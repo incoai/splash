@@ -1105,6 +1105,46 @@ void testRepliesAreKeptOnceAConversationRendersThemBack() {
           "a reclaim wrote the state of a reply too short to be worth a write");
 }
 
+// A capture at a page that holds a checkpoint already reuses it as it is: a
+// retry of turn 2 of a conversation whose replies are kept (2,100 tokens
+// each, rendered back) reaches turn 2's kept state at 4,320 again, and a
+// reclaim while the retry runs writes it rather than dropping it as a
+// running reply's, so turn 3 still resumes there, restored from the SSD
+// tier, and not from turn 2's replay point at 2,208.
+void testReplyCaptureReusesACheckpointAsItIs() {
+  test::EngineHarness h({.pages = 512});
+  Executor &executor = h.model;
+  engine::Engine &engine = h.engine;
+  executor.decodeFinishes = false;
+  executor.offloadTier = std::make_shared<OffloadControl>();
+  executor.offloadTier->ready = true;
+  executor.restoreControl->ready = true;
+  double now = 1;
+  std::vector<uint32_t> first(97);
+  std::iota(first.begin(), first.end(), 1);
+  const std::vector<uint32_t> second = nextTurn(first, 2100);
+  const auto turn = [&](uint64_t id, const std::vector<uint32_t> &prompt) {
+    executor.speculativeCounts[id] = {7, 6};
+    engine.submit(conversationTurn(id, prompt, 2100));
+  };
+  for (const auto &[id, prompt] : {std::pair{uint64_t{1}, first}, std::pair{uint64_t{2}, second}}) {
+    turn(id, prompt);
+    tickUntil(h, now, [&] { return idle(engine); }, "the turn did not complete");
+  }
+  turn(3, second);
+  tickUntil(h, now, [&] {
+    return !engine.commandInFlight() && std::ranges::any_of(executor.captures, [](const Executor::Capture &capture) {
+      return capture.requestId == 3 && capture.tokens == 4320;
+    });
+  }, "the retry did not reach turn 2's kept state");
+  reclaimUpToInUse(h.cache);
+  tickUntil(h, now, [&] { return idle(engine); }, "the retry did not complete");
+  turn(4, nextTurn(second, 2100));
+  tickUntil(h, now, [&] { return idle(engine); }, "turn 3 did not complete");
+  require(h.events.starts.back() == 4320,
+          "a reclaim dropped a kept reply's state that a capture reused as a running reply's");
+}
+
 // A reply cancelled at the wall leaves its last checkpoint opportunistic, as
 // a completed one does: reclaim drops it rather than writing it.
 void testEndedReplyCheckpointIsDroppedAtTheWall() {
@@ -2416,6 +2456,7 @@ std::span<const test::TestCase> requestsTests() {
       {"testReplyCheckpointsAreNotWrittenAtTheWall", testReplyCheckpointsAreNotWrittenAtTheWall},
       {"testCompletedReplyStateIsDroppedAtTheWall", testCompletedReplyStateIsDroppedAtTheWall},
       {"testRepliesAreKeptOnceAConversationRendersThemBack", testRepliesAreKeptOnceAConversationRendersThemBack},
+      {"testReplyCaptureReusesACheckpointAsItIs", testReplyCaptureReusesACheckpointAsItIs},
       {"testEndedReplyCheckpointIsDroppedAtTheWall", testEndedReplyCheckpointIsDroppedAtTheWall},
       {"testPrefillCheckpointIsWrittenAtTheWall", testPrefillCheckpointIsWrittenAtTheWall},
       {"testRetryPublishesNoStateInsideTheGenerationPrompt", testRetryPublishesNoStateInsideTheGenerationPrompt},

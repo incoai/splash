@@ -1981,10 +1981,17 @@ void Engine::apply(const Pending &command, std::span<const ModelStepResult> resu
       const std::vector<LaneCapture> &reached = captures[index];
       if (result.capturedStates.size() > reached.size())
         throw std::logic_error("model returned mismatched captured states");
-      if (!result.capturedStates.empty() &&
-          publishStateBoundary(active, {.tokens = reached.front().tokens, .disposable = true},
-                               result.capturedStates.front(), false, false, now))
-        cache_.markReply(active.latestCheckpoint);
+      if (!result.capturedStates.empty()) {
+        // A capture at a page that holds a checkpoint already, a peer's or
+        // one an identical earlier turn kept, reuses it as it is: only a
+        // fresh publication is the reply's.
+        const bool fresh =
+            !cache_.checkpointState(cache_.blockAt(active.request.id, reached.front().tokens));
+        if (publishStateBoundary(active, {.tokens = reached.front().tokens, .disposable = true},
+                                 result.capturedStates.front(), false, false, now) &&
+            fresh)
+          cache_.markReply(active.latestCheckpoint);
+      }
     }
     const uint64_t completionTokens =
         active.exactTokens.size() - active.promptTokens;
