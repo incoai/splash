@@ -51,12 +51,14 @@ using splash::test::rejects;
 using splash::test::require;
 using splash::test::requireExtent;
 
-constexpr std::array<uint32_t, kLanes> kAllRows{kRows, kRows, kRows, kRows};
+// A lane's block in runWidth: its anchor and its draft's proposals.
+constexpr uint32_t kBlock = kProposals + 1;
+constexpr std::array<uint32_t, kLanes> kAllRows{kBlock, kBlock, kBlock, kBlock};
 // The stop token runWidth places, in the last place the kernel compares.
 constexpr uint32_t kStopToken = 248044;
 constexpr StopTokens kFourStops{248046, 150001, 150003, kStopToken};
 
-// Each lane's verify block of kRows rows as a chain, from row lane x kRows.
+// Each lane's rows of `blocks` as a chain.
 MetalBuffer chainRows(MetalBackend &backend, std::span<const splash::ops::LaneRows> blocks, uint32_t rows) {
   MetalBuffer buffer = shared(backend, uint64_t{rows} * sizeof(splash::ops::TreeRow), "accept-tree");
   auto *tree = contents<splash::ops::TreeRow>(buffer);
@@ -66,10 +68,19 @@ MetalBuffer chainRows(MetalBackend &backend, std::span<const splash::ops::LaneRo
   return buffer;
 }
 
+// `blocks` as a step's proposer writes them on the device (SplashLaneRows).
+MetalBuffer laneRows(MetalBackend &backend, std::span<const splash::ops::LaneRows> blocks) {
+  MetalBuffer buffer = shared(backend, blocks.size() * sizeof(splash::ops::LaneRows), "accept-lane-rows");
+  std::ranges::copy(blocks, contents<splash::ops::LaneRows>(buffer));
+  return buffer;
+}
+
 // Lane stopLane's target selects `stopToken` at row stopRow, also its draft
 // below its accepted rows; acceptance cuts the lane's tokens after it when it
-// is one of `stops`. Each lane's block is a chain: its retained tokens are
-// its first rows' selections, and its retained rows their mask.
+// is one of `stops`. Each lane's block is a chain of kBlock rows from row lane
+// x kBlock, of which it walks its verify rows: its retained tokens are its
+// first rows' selections, its retained rows their mask, and its accepted
+// count the proposals among them.
 void runWidth(MetalBackend &backend, uint32_t width,
               const std::array<uint32_t, kLanes> &acceptedReference,
               const std::array<uint32_t, kLanes> &remainingReference,
@@ -79,10 +90,11 @@ void runWidth(MetalBackend &backend, uint32_t width,
   require(width >= 1 && width <= kLanes, "invalid test width");
   std::array<splash::ops::LaneRows, kLanes> blocks{};
   for (uint32_t lane = 0; lane < kLanes; ++lane)
-    blocks[lane] = {lane * kRows, kRows};
-  MetalBuffer input = shared(backend, kLanes * kRows * sizeof(uint32_t), "accept-input");
-  const MetalBuffer tree = chainRows(backend, blocks, kLanes * kRows);
-  MetalBuffer output = shared(backend, kLanes * kRows * sizeof(uint32_t),
+    blocks[lane] = {lane * kBlock, kBlock};
+  MetalBuffer input = shared(backend, kLanes * kBlock * sizeof(uint32_t), "accept-input");
+  const MetalBuffer tree = chainRows(backend, blocks, kLanes * kBlock);
+  const MetalBuffer lanes = laneRows(backend, blocks);
+  MetalBuffer output = shared(backend, kLanes * kBlock * sizeof(uint32_t),
                               "accept-output");
   MetalBuffer retained =
       shared(backend, kLanes * sizeof(uint32_t), "accept-retained");
@@ -100,46 +112,47 @@ void runWidth(MetalBackend &backend, uint32_t width,
   std::memset(accepted.contents(), 0, accepted.sizeBytes());
   std::memset(retainedRows.contents(), 0, retainedRows.sizeBytes());
   for (uint32_t lane = 0; lane < kLanes; ++lane) {
-    inputTokens[lane * kRows] = 500 + lane;
+    inputTokens[lane * kBlock] = 500 + lane;
     for (uint32_t token = 0; token < kProposals; ++token) {
       const uint32_t proposal = 1000 + lane * 100 + token;
-      inputTokens[lane * kRows + token + 1] = proposal;
-      targetTokens[lane * kRows + token] =
+      inputTokens[lane * kBlock + token + 1] = proposal;
+      targetTokens[lane * kBlock + token] =
           token < acceptedReference[lane] ? proposal : proposal + 50;
     }
-    targetTokens[lane * kRows + kRows - 1] = 9000 + lane;
+    targetTokens[lane * kBlock + kBlock - 1] = 9000 + lane;
   }
 
   if (stopLane < width) {
-    require(stopRow < kRows, "invalid stop row");
-    targetTokens[stopLane * kRows + stopRow] = stopToken;
+    require(stopRow < kBlock, "invalid stop row");
+    targetTokens[stopLane * kBlock + stopRow] = stopToken;
     if (stopRow < acceptedReference[stopLane])
-      inputTokens[stopLane * kRows + stopRow + 1] = stopToken;
+      inputTokens[stopLane * kBlock + stopRow + 1] = stopToken;
   }
-  const std::vector<uint32_t> selected(targetTokens, targetTokens + kLanes * kRows);
+  const std::vector<uint32_t> selected(targetTokens, targetTokens + kLanes * kBlock);
 
   const splash::ops::Sampling sampling(248320);
   CommandGraph graph;
-  sampling.addAcceptance(graph, {input, tree, output, retained, accepted, retainedRows, verifyRows},
-                         std::span(blocks).first(width), std::span(remainingReference).first(width), stops);
+  sampling.addAcceptance(graph, {input, tree, output, retained, accepted, retainedRows, lanes, verifyRows},
+                         {width, width * kBlock, kBlock}, std::span(remainingReference).first(width), stops);
   static_cast<void>(backend.submitCommandAsync(graph.dispatches()).wait());
 
   const auto *retainedCounts = contents<uint32_t>(retained);
   const auto *acceptedCounts = contents<uint32_t>(accepted);
   for (uint32_t lane = 0; lane < width; ++lane) {
-    uint32_t expectedRetained =
-        std::min({acceptedReference[lane] + 1, remainingReference[lane],
-                  verifyRowsReference[lane]});
+    const uint32_t walked = std::min(acceptedReference[lane], verifyRowsReference[lane] - 1);
+    uint32_t expectedRetained = std::min(walked + 1, remainingReference[lane]);
     if (lane == stopLane && stopRow < expectedRetained && stops.contains(stopToken))
       expectedRetained = stopRow + 1;
-    require(acceptedCounts[lane] == acceptedReference[lane],
+    // Where the cap or a stop token cuts the walk, every retained token is an
+    // accepted proposal.
+    require(acceptedCounts[lane] == std::min(walked, expectedRetained),
             "accepted proposal count mismatch");
     require(retainedCounts[lane] == expectedRetained,
             "retained token count mismatch");
     require(contents<uint32_t>(retainedRows)[lane] == (1u << expectedRetained) - 1,
             "a chain's retained rows are not its first ones");
-    require(std::equal(selected.begin() + lane * kRows, selected.begin() + lane * kRows + expectedRetained,
-                       targetTokens + lane * kRows),
+    require(std::equal(selected.begin() + lane * kBlock, selected.begin() + lane * kBlock + expectedRetained,
+                       targetTokens + lane * kBlock),
             "a chain's retained tokens are not its first rows' selections");
   }
 }
@@ -217,9 +230,8 @@ void testRowCopy(MetalBackend &backend) {
 // another (5, 8, 1 and 6 rows from rows 0, 5, 13 and 14), accept their chains
 // as each lane does alone in a block from row 0: the same retained and
 // accepted counts and retained rows. Lane l's target selects its first
-// accepted[l] proposals and then other tokens; it retains at most
-// remaining[l] tokens and its verify rows, and a block checks one proposal
-// fewer than its rows.
+// accepted[l] proposals and then other tokens; it walks its verify rows,
+// which check one proposal fewer, and retains at most remaining[l] tokens.
 void packedLanes(MetalBackend &backend) {
   using splash::ops::LaneRows;
   const std::array<LaneRows, kLanes> packed{{{0, 5}, {5, 8}, {13, 1}, {14, 6}}};
@@ -241,9 +253,12 @@ void packedLanes(MetalBackend &backend) {
   };
   const auto encode = [&](const Run &run, std::span<const LaneRows> blocks, std::span<const uint32_t> limits) {
     const auto &b = run.buffers;
-    const MetalBuffer tree = chainRows(backend, blocks, static_cast<uint32_t>(b[0].sizeBytes() / 4));
+    const uint32_t rows = static_cast<uint32_t>(b[0].sizeBytes() / 4);
+    const MetalBuffer tree = chainRows(backend, blocks, rows);
+    const uint32_t lanes = static_cast<uint32_t>(blocks.size());
     CommandGraph graph;
-    sampling.addAcceptance(graph, {b[0], tree, b[1], b[2], b[3], b[5], b[4]}, blocks, limits, kFourStops);
+    sampling.addAcceptance(graph, {b[0], tree, b[1], b[2], b[3], b[5], laneRows(backend, blocks), b[4]},
+                           {lanes, rows, kRows}, limits, kFourStops);
     static_cast<void>(backend.submitCommandAsync(graph.dispatches()).wait());
   };
   // Lane l's anchor, proposals and target tokens, written from `row` of
@@ -271,8 +286,8 @@ void packedLanes(MetalBackend &backend) {
     require(retained == contents<uint32_t>(alone.buffers[2])[0] && counted == contents<uint32_t>(alone.buffers[3])[0] &&
                 contents<uint32_t>(all.buffers[5])[lane] == contents<uint32_t>(alone.buffers[5])[0],
             label + ": its acceptance differs from alone");
-    require(counted == accepted[lane] &&
-                retained == std::min({accepted[lane] + 1, remaining[lane], verifyRows[lane]}),
+    const uint32_t walked = std::min(accepted[lane], verifyRows[lane] - 1);
+    require(retained == std::min(walked + 1, remaining[lane]) && counted == std::min(walked, retained),
             label + ": accepted " + std::to_string(counted) + " and retained " + std::to_string(retained));
   }
 }
@@ -282,11 +297,11 @@ void packedLanes(MetalBackend &backend) {
 // apart), and each row's selection is one of its children's tokens most of the
 // time, else another token or now and then a stop token; the lane verifies a
 // random number of its rows and retains at most a random number. The walk
-// follows from the anchor the child whose token is the row's selection; it
-// counts every row it reaches as accepted, retains its verified rows' first,
-// at most the limit and none after a stop token, writes their selections
-// from the lane's first row and their mask, its deepest retained row's
-// ancestors.
+// follows from the anchor the child among the verify rows whose token is the
+// row's selection; it retains at most the limit and none after a stop token,
+// writes their selections from the lane's first row and their mask, its
+// deepest retained row's ancestors, and counts the rows it reached past the
+// anchor as accepted, those it retained where it cut the path.
 void treeAcceptance(MetalBackend &backend) {
   using splash::ops::LaneRows;
   using splash::ops::TreeRow;
@@ -303,7 +318,8 @@ void treeAcceptance(MetalBackend &backend) {
   };
   const MetalBuffer input = buffer(kLanes * kRows * 4), tree = buffer(kLanes * kRows * sizeof(TreeRow)),
                     output = buffer(kLanes * kRows * 4), retained = buffer(kLanes * 4), accepted = buffer(kLanes * 4),
-                    retainedRows = buffer(kLanes * 4), verifyRows = buffer(kLanes * 4);
+                    retainedRows = buffer(kLanes * 4), verifyRows = buffer(kLanes * 4),
+                    lanes = laneRows(backend, blocks);
   uint32_t deep = 0;
   for (uint32_t trial = 0; trial < 300; ++trial) {
     std::array<std::array<uint32_t, kRows>, kLanes> parents{}, tokens{}, selections{}, ancestors{};
@@ -350,23 +366,20 @@ void treeAcceptance(MetalBackend &backend) {
       contents<uint32_t>(verifyRows)[lane] = verified[lane];
     }
     CommandGraph graph;
-    sampling.addAcceptance(graph, {input, tree, output, retained, accepted, retainedRows, verifyRows}, blocks, limits,
-                           kFourStops);
+    sampling.addAcceptance(graph, {input, tree, output, retained, accepted, retainedRows, lanes, verifyRows},
+                           {kLanes, kLanes * kRows, kRows}, limits, kFourStops);
     static_cast<void>(backend.submitCommandAsync(graph.dispatches()).wait());
     for (uint32_t lane = 0; lane < kLanes; ++lane) {
       std::vector<uint32_t> path{0};
       for (bool moved = true; moved;) {
         moved = false;
-        for (uint32_t child = path.back() + 1; child < kRows && !moved; ++child)
+        for (uint32_t child = path.back() + 1; child < verified[lane] && !moved; ++child)
           if (parents[lane][child] == path.back() && tokens[lane][child] == selections[lane][path.back()]) {
             path.push_back(child);
             moved = true;
           }
       }
-      uint32_t kept = 0;
-      while (kept < path.size() && path[kept] < verified[lane])
-        ++kept;
-      kept = std::min(kept, limits[lane]);
+      uint32_t kept = std::min(static_cast<uint32_t>(path.size()), limits[lane]);
       for (uint32_t i = 0; i < kept; ++i)
         if (kFourStops.contains(selections[lane][path[i]])) {
           kept = i + 1;
@@ -374,7 +387,8 @@ void treeAcceptance(MetalBackend &backend) {
         }
       deep += kept > 2;
       const std::string label = "tree trial " + std::to_string(trial) + " lane " + std::to_string(lane);
-      require(contents<uint32_t>(accepted)[lane] == path.size() - 1, label + ": accepted count differs");
+      require(contents<uint32_t>(accepted)[lane] == std::min<uint32_t>(path.size() - 1, kept),
+              label + ": accepted count differs");
       require(contents<uint32_t>(retained)[lane] == kept, label + ": retained count differs");
       require(contents<uint32_t>(retainedRows)[lane] == ancestors[lane][path[kept - 1]],
               label + ": retained rows differ");
@@ -402,8 +416,8 @@ int main(int argc, char **argv) {
     }
 
     // Output limits and stop tokens shorten the committed prefix without
-    // changing the physical eight-row graph.  The accepted proposal count is
-    // still seven in every lane; only retained rows move.
+    // changing the physical eight-row graph: a lane whose limit or stop token
+    // cuts its seven accepted proposals counts those it retains.
     constexpr std::array<uint32_t, kLanes> allAccepted{7, 7, 7, 7};
     constexpr std::array<uint32_t, kLanes> shortRemaining{1, 2, 3, 8};
     runWidth(backend, kLanes, allAccepted, shortRemaining, 3, 3);
@@ -413,8 +427,7 @@ int main(int argc, char **argv) {
     // later tokens and the runtime fails it on the sentinel.
     runWidth(backend, kLanes, allAccepted, fullRemaining, 1, 2, kAllRows, SPLASH_NO_TOKEN,
              StopTokens{248044, 248046});
-    // A lane retains at most the rows its verify verified, below its budget
-    // or above it; acceptance still counts every proposal it checked.
+    // A lane walks only its verify rows, below its budget or above it.
     constexpr std::array<uint32_t, kLanes> fewRows{2, 3, 5, 1};
     runWidth(backend, kLanes, allAccepted, fullRemaining, kLanes, 0, fewRows);
     runWidth(backend, kLanes, lowerAccepted, shortRemaining, kLanes, 0, fewRows);

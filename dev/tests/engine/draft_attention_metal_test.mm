@@ -42,6 +42,18 @@ constexpr uint32_t kRows = 8;
 // A lane's RoPE rows, its verify block's positions, of which its draft's rows
 // take the first kRows.
 constexpr uint32_t kRopeRows = SPLASH_TARGET_VERIFY_ROWS;
+
+// Lanes' rows of a step as its proposer writes them on the device
+// (SplashLaneRows), and the step of them: their rows' end and most rows.
+MetalBuffer laneRowsBuffer(MetalBackend &backend, std::span<const LaneRows> lanes) {
+  MetalBuffer buffer =
+      backend.allocateBuffer(lanes.size() * sizeof(LaneRows), BufferStorage::Shared, "draft lane rows");
+  std::ranges::copy(lanes, static_cast<LaneRows *>(buffer.contents()));
+  return buffer;
+}
+StepRows stepOf(std::span<const LaneRows> lanes) {
+  return {static_cast<uint32_t>(lanes.size()), static_cast<uint32_t>(rowsEnd(lanes)), mostRows(lanes)};
+}
 constexpr uint32_t kKvHeads = 8;
 constexpr uint32_t kQueryHeadsPerKv = 4;
 constexpr uint32_t kHeadDim = 128;
@@ -594,10 +606,11 @@ void contextWriters(MetalBackend &backend, DraftAttentionShape shape) {
     laneValues[lane] = lane < kCommitLanes ? ring() : laneValues[0];
   }
   const std::array<LaneRows, kCommitLanes> blocks{{{0, kRows}, {kRows, kRows}, {2 * kRows, kRows}}};
+  const MetalBuffer laneRows = laneRowsBuffer(backend, blocks);
   CommandGraph commit;
   DraftAttention::addContextCommit(commit, laneKv, keyNorm, laneCos, laneSin,
-                                   laneKeys, laneValues, retainedRows, starts,
-                                   blocks, shape);
+                                   laneKeys, laneValues, retainedRows, laneRows,
+                                   starts, stepOf(blocks), shape);
   static_cast<void>(backend.submitCommandAsync(commit.dispatches()).wait());
   for (uint32_t lane = 0; lane < kCommitLanes; ++lane)
     check(laneKeys[lane], laneValues[lane],
@@ -613,15 +626,14 @@ void contextWriters(MetalBackend &backend, DraftAttentionShape shape) {
   // The start positions name the lanes: none, or more than a batch, commit
   // nothing.
   const std::array<uint32_t, kLanes + 1> overfull{};
-  const std::array<LaneRows, kLanes + 1> overfullRows{};
   for (const std::span<const uint32_t> positions :
        {std::span<const uint32_t>(), std::span<const uint32_t>(overfull)})
     rejects(
         [&] {
           DraftAttention::addContextCommit(invalid, laneKv, keyNorm, laneCos,
                                            laneSin, laneKeys, laneValues,
-                                           retainedRows, positions,
-                                           std::span(overfullRows).first(positions.size()), shape);
+                                           retainedRows, laneRows, positions,
+                                           stepOf(blocks), shape);
         },
         "invalid draft batch width",
         "a context commit of no lanes or more than a batch was accepted");
@@ -629,12 +641,12 @@ void contextWriters(MetalBackend &backend, DraftAttentionShape shape) {
           "invalid draft context write partially encoded a graph");
 }
 
-// Lanes whose verify blocks hold different row counts, packed one after
+// Lanes whose rows of a step hold different row counts, packed one after
 // another among the context rows (5, 8, 1 and 6 rows from rows 0, 5, 13 and
 // 14), commit their retained rows (the first 4, all 8, the 1, and 9 clamped
 // to 6) as each lane does alone from row 0: the same rings, bit for bit. A
 // lane's RoPE rows are its verify block's, SPLASH_TARGET_VERIFY_ROWS a lane,
-// whichever rows its block holds.
+// whichever rows it holds.
 void packedContextCommit(MetalBackend &backend, DraftAttentionShape shape) {
   constexpr uint32_t kRowWidth = 2048;
   constexpr uint16_t kUntouched = 0xC2C2;
@@ -669,7 +681,8 @@ void packedContextCommit(MetalBackend &backend, DraftAttentionShape shape) {
   const std::array<MetalBuffer, kLanes> keys = rings(kLanes), values = rings(kLanes);
   CommandGraph commit;
   DraftAttention::addContextCommit(commit, kv, keyNorm, ropeCos, ropeSin, keys, values,
-                                   buffer(sizeof(retained), retained.data()), starts, packed, shape);
+                                   buffer(sizeof(retained), retained.data()), laneRowsBuffer(backend, packed), starts,
+                                   stepOf(packed), shape);
   static_cast<void>(backend.submitCommandAsync(commit.dispatches()).wait());
   const uint64_t ropeLaneBytes = uint64_t{kRopeRows} * kHeadDim / 2 * sizeof(float);
   for (uint32_t lane = 0; lane < kLanes; ++lane) {
@@ -683,7 +696,8 @@ void packedContextCommit(MetalBackend &backend, DraftAttentionShape shape) {
                static_cast<const uint16_t *>(kv.contents()) + uint64_t{block.first} * kRowWidth),
         keyNorm, buffer(ropeLaneBytes, static_cast<const uint8_t *>(ropeCos.contents()) + lane * ropeLaneBytes),
         buffer(ropeLaneBytes, static_cast<const uint8_t *>(ropeSin.contents()) + lane * ropeLaneBytes), laneKeys,
-        laneValues, buffer(sizeof(uint32_t), &retained[lane]), std::span(starts).subspan(lane, 1), own, shape);
+        laneValues, buffer(sizeof(uint32_t), &retained[lane]), laneRowsBuffer(backend, own),
+        std::span(starts).subspan(lane, 1), stepOf(own), shape);
     static_cast<void>(backend.submitCommandAsync(alone.dispatches()).wait());
     require(std::memcmp(keys[lane].contents(), laneKeys[0].contents(), ringElements * 2) == 0 &&
                 std::memcmp(values[lane].contents(), laneValues[0].contents(), ringElements * 2) == 0,
@@ -698,34 +712,39 @@ void packedContextCommit(MetalBackend &backend, DraftAttentionShape shape) {
               !touched(keys[0], starts[0] + 4),
           "packed lanes committed other rows than they retained");
 
-  // A lane that retains a tree's path, rows 0, 2, 5 and 6 of its block of 8
-  // from row 3 of the context rows, commits those rows at its next four
-  // positions, the path's i-th with RoPE row i: the rings of a commit of the
-  // four rows alone, gathered from row 0, bit for bit.
+  // A lane that retains a tree's path, rows 0, 2, 5 and 6 of its 8 rows from
+  // row 3 of the context rows (the second lane of a step, after a lane of 3
+  // rows), commits those rows at its next four positions, the path's i-th
+  // with its RoPE row i: the rings of a commit of the four rows alone,
+  // gathered from row 0, bit for bit.
   constexpr std::array<uint32_t, 4> path{0, 2, 5, 6};
-  const uint32_t pathMask = 0b1100101;
-  const std::array<LaneRows, 1> tree{{{3, 8}}};
-  const std::array<MetalBuffer, kLanes> pathKeys = rings(1), pathValues = rings(1);
+  const std::array<uint32_t, 2> pathMasks{0b1, 0b1100101};
+  const std::array<LaneRows, 2> tree{{{0, 3}, {3, 8}}};
+  const std::array<MetalBuffer, kLanes> pathKeys = rings(2), pathValues = rings(2);
   CommandGraph followed;
   DraftAttention::addContextCommit(followed, kv, keyNorm, ropeCos, ropeSin, pathKeys, pathValues,
-                                   buffer(sizeof(pathMask), &pathMask), std::span(starts).first(1), tree, shape);
+                                   buffer(sizeof(pathMasks), pathMasks.data()), laneRowsBuffer(backend, tree),
+                                   std::span(starts).first(2), stepOf(tree), shape);
   static_cast<void>(backend.submitCommandAsync(followed.dispatches()).wait());
   std::vector<uint16_t> gathered(path.size() * kRowWidth);
   for (uint32_t i = 0; i < path.size(); ++i)
     std::memcpy(gathered.data() + uint64_t{i} * kRowWidth,
-                static_cast<const uint16_t *>(kv.contents()) + uint64_t{tree[0].first + path[i]} * kRowWidth,
+                static_cast<const uint16_t *>(kv.contents()) + uint64_t{tree[1].first + path[i]} * kRowWidth,
                 kRowWidth * 2);
   const uint32_t prefix = (1u << path.size()) - 1;
   const std::array<MetalBuffer, kLanes> chainKeys = rings(1), chainValues = rings(1);
   const std::array<LaneRows, 1> contiguous{{{0, uint32_t(path.size())}}};
   CommandGraph chain;
-  DraftAttention::addContextCommit(chain, buffer(gathered.size() * 2, gathered.data()), keyNorm, ropeCos, ropeSin,
-                                   chainKeys, chainValues, buffer(sizeof(prefix), &prefix),
-                                   std::span(starts).first(1), contiguous, shape);
+  DraftAttention::addContextCommit(
+      chain, buffer(gathered.size() * 2, gathered.data()), keyNorm,
+      buffer(ropeLaneBytes, static_cast<const uint8_t *>(ropeCos.contents()) + ropeLaneBytes),
+      buffer(ropeLaneBytes, static_cast<const uint8_t *>(ropeSin.contents()) + ropeLaneBytes), chainKeys, chainValues,
+      buffer(sizeof(prefix), &prefix), laneRowsBuffer(backend, contiguous), std::span(starts).subspan(1, 1),
+      stepOf(contiguous), shape);
   static_cast<void>(backend.submitCommandAsync(chain.dispatches()).wait());
-  require(std::memcmp(pathKeys[0].contents(), chainKeys[0].contents(), ringElements * 2) == 0 &&
-              std::memcmp(pathValues[0].contents(), chainValues[0].contents(), ringElements * 2) == 0 &&
-              touched(pathKeys[0], starts[0] + 3) && !touched(pathKeys[0], starts[0] + 4),
+  require(std::memcmp(pathKeys[1].contents(), chainKeys[0].contents(), ringElements * 2) == 0 &&
+              std::memcmp(pathValues[1].contents(), chainValues[0].contents(), ringElements * 2) == 0 &&
+              touched(pathKeys[1], starts[1] + 3) && !touched(pathKeys[1], starts[1] + 4),
           "a retained path committed other context rows than its own, in order");
 }
 
@@ -834,17 +853,20 @@ void contextWindow(MetalBackend &backend, uint32_t width) {
   require(invalid.empty(), "an invalid context window transfer encoded a dispatch");
 }
 
-// A decode step's window commit stores the rows a lane retained of its
-// block's eight context rows, the path's in order, as a store of those rows
-// gathered does, in the slots of their positions across the ring's wrap, and
-// leaves every other slot as it was: every chain's first rows, and none; and
-// a tree's path, rows 0, 2, 5 and 6.
+// A decode step's window commit stores the rows a lane retained of its eight
+// context rows, from row 2 of a step's ten, the path's in order, as a store
+// of those rows gathered does, in the slots of their positions across the
+// ring's wrap, and leaves every other slot as it was: every chain's first
+// rows, and none; and a tree's path, rows 0, 2, 5 and 6.
 void contextWindowCommit(MetalBackend &backend, uint32_t width) {
-  constexpr uint32_t start = kWindow - 4;
+  constexpr uint32_t start = kWindow - 4, first = 2, stepRows = first + kRows;
   const uint64_t windowBytes = DraftAttention::contextWindowBytes(width);
   Random random(0xc0de3000ULL + width);
-  const MetalBuffer rows = randomBfloat(backend, uint64_t{kRows} * width, random, "draft context rows");
+  const MetalBuffer rows = randomBfloat(backend, uint64_t{stepRows} * width, random, "draft context rows");
   const MetalBuffer retained = backend.allocateBuffer(4, BufferStorage::Shared, "draft retained rows");
+  const LaneRows lane{first, kRows};
+  MetalBuffer laneRows = backend.allocateBuffer(sizeof(LaneRows), BufferStorage::Shared, "draft lane rows");
+  std::memcpy(laneRows.contents(), &lane, sizeof(lane));
   const auto allocate = [&](uint64_t bytes, const char *label) {
     MetalBuffer buffer = backend.allocateBuffer(bytes, BufferStorage::Shared, label);
     std::memset(buffer.contents(), 0xA5, bytes);
@@ -865,9 +887,9 @@ void contextWindowCommit(MetalBackend &backend, uint32_t width) {
     for (uint32_t row = 0; row < kRows; ++row)
       if (path >> row & 1)
         std::memcpy(static_cast<uint16_t *>(gathered.contents()) + uint64_t{at++} * width,
-                    static_cast<const uint16_t *>(rows.contents()) + uint64_t{row} * width, width * 2);
+                    static_cast<const uint16_t *>(rows.contents()) + uint64_t{first + row} * width, width * 2);
     CommandGraph graph;
-    DraftAttention::addWindowCommit(graph, rows, committed, retained, start, width);
+    DraftAttention::addWindowCommit(graph, rows, committed, retained, laneRows, stepRows, kRows, start, width);
     if (count)
       DraftAttention::addWindowStore(graph, gathered, stored, count, start, width);
     static_cast<void>(backend.submitCommandAsync(graph.dispatches()).wait());
@@ -1016,16 +1038,16 @@ void bufferExtents(MetalBackend &backend, DraftAttentionShape shape) {
              {1, norm, 2, "draft key norm"},
              {2, (uint64_t{lanes - 1} * kRopeRows + kRows) * ropeRow, 4, "draft RoPE cosine"},
              {3, (uint64_t{lanes - 1} * kRopeRows + kRows) * ropeRow, 4, "draft RoPE sine"},
-             {4, uint64_t{lanes} * 4, 4, "draft retained rows"}};
+             {4, uint64_t{lanes} * 4, 4, "draft retained rows"},
+             {5, uint64_t{lanes} * sizeof(LaneRows), sizeof(LaneRows), "draft lane rows"}};
   for (uint32_t lane = 0; lane < lanes; ++lane) {
-    extents.push_back({5 + lane, ring, 2, "draft key ring"});
-    extents.push_back({5 + lanes + lane, ring, 2, "draft value ring"});
+    extents.push_back({6 + lane, ring, 2, "draft key ring"});
+    extents.push_back({6 + lanes + lane, ring, 2, "draft value ring"});
   }
   const std::array<uint32_t, lanes> starts{2044, 0, 4101};
-  const std::array<LaneRows, lanes> blocks{{{0, kRows}, {kRows, kRows}, {2 * kRows, kRows}}};
   splash::test::requireExtents(backend, extents, [&](CommandGraph &graph, const Buffers &b) {
-    DraftAttention::addContextCommit(graph, b[0], b[1], b[2], b[3], rings(b, 5), rings(b, 5 + lanes), b[4], starts,
-                                     blocks, shape);
+    DraftAttention::addContextCommit(graph, b[0], b[1], b[2], b[3], rings(b, 6), rings(b, 6 + lanes), b[4], b[5],
+                                     starts, {lanes, lanes * kRows, kRows}, shape);
   });
   const uint64_t windowBytes = DraftAttention::contextWindowBytes(shape.hiddenSize);
   const uint64_t contextRows = uint64_t{contextTokens} * shape.hiddenSize * 2;
@@ -1046,9 +1068,11 @@ void bufferExtents(MetalBackend &backend, DraftAttentionShape shape) {
   splash::test::requireExtents(backend,
                                Extents{{0, uint64_t{kRows} * shape.hiddenSize * 2, 2, "draft context rows"},
                                        {1, windowBytes, 1, "draft context window"},
-                                       {2, 4, 4, "draft retained rows"}},
+                                       {2, 4, 4, "draft retained rows"},
+                                       {3, sizeof(LaneRows), sizeof(LaneRows), "draft lane rows"}},
                                [&](CommandGraph &graph, const Buffers &b) {
-                                 DraftAttention::addWindowCommit(graph, b[0], b[1], b[2], 2044, shape.hiddenSize);
+                                 DraftAttention::addWindowCommit(graph, b[0], b[1], b[2], b[3], kRows, kRows, 2044,
+                                                                 shape.hiddenSize);
                                });
 }
 

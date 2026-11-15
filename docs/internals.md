@@ -439,20 +439,27 @@ The Neural Engine split, which takes whole chunks, leaves the read rows to the
 GPU, so in a chunk it takes their last FFN rounds as the GPU's alone. On a
 16-core M5 Pro this takes about 2% off the 35B's prefill of 8K tokens.
 
-A decode step's token selection and its penalties and thinking cutoffs,
-acceptance, the draft's tree, its context commit, and
-Qwen3.8-Flash-Next's n-gram hash and block indexer address each lane's rows
-by the lane's first row among the step's packed rows and its row count
-(`ops::LaneRows`, the kernels' per-lane `first_row` and `rows`), so lanes of
-different row counts share one dispatch. A lane's verify block is a tree
-(`metal/abi/VerifyTree.h`, a row's parent, depth and ancestors' mask), which
-the draft's selector writes with each row's token, its verify input: a row's
-penalties count the draft tokens of its path, a thinking cutoff applies by
-depth, acceptance follows from the anchor the child whose token is its row's
-selection, and the draft's context commit takes the retained path's rows in
-order (the mask acceptance writes, `DecodeTensor::RetainedRows`). The first token after a prompt is
-selected from, and written at, the lane's one row. A decode step gives every
-lane eight rows at lane x 8; the draft's own block stays eight rows a lane,
+A decode step's rows are laid out on the GPU by its draft's selector
+(`ops::DraftSelector::addVerifyRows`): each lane's first row among the step's
+packed rows and its row count (`SplashLaneRows`, `DecodeTensor::LaneLayout`),
+and its verify rows, the first of them (`DecodeTensor::VerifyRows`). The
+host fixes only the step's rows and a lane's most (`ops::StepRows`,
+`ops::verifyLaneCap`), which the grids span. The step's token selection and
+its penalties and thinking cutoffs, acceptance and the draft's context commit
+read the layout on the GPU and take a lane's verify rows alone; the first
+token after a prompt is selected from, and written at, the lane's one row,
+whose layout its selection writes first (`decode_sample_first_rows`). The
+target's kernels and Qwen3.8-Flash-Next's n-gram hash and block indexer
+address each lane's rows by the host's `ops::LaneRows` (the kernels' per-lane
+`first_row` and `rows`), so lanes of different row counts share one
+dispatch; a decode step holds eight rows a lane, which the selector lays out at
+lane x 8. A lane's verify block is a tree (`metal/abi/VerifyTree.h`, a row's
+parent, depth and ancestors' mask), which the draft's selector writes with
+each row's token, its verify input: a row's penalties count the draft tokens
+of its path, a thinking cutoff applies by depth, acceptance follows from the
+anchor the child whose token is its row's selection, and the draft's context
+commit takes the retained path's rows in order (the mask acceptance writes,
+`DecodeTensor::RetainedRows`). The draft's own block stays eight rows a lane,
 and a lane's draft RoPE rows hold its verify block's positions, the first eight
 of which the draft's rows take and the context commit one a retained row.
 

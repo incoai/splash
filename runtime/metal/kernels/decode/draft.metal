@@ -117,7 +117,8 @@ kernel void draft_context_kv_commit(
     device bfloat *values2 [[buffer(10)]],
     device bfloat *values3 [[buffer(11)]],
     device const uint *retained_rows [[buffer(12)]],
-    constant DraftContextBatchParams &params [[buffer(13)]],
+    device const SplashLaneRows *lane_rows [[buffer(13)]],
+    constant DraftContextBatchParams &params [[buffer(14)]],
     uint2 group [[threadgroup_position_in_grid]],
     uint thread_index [[thread_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]],
@@ -131,7 +132,7 @@ kernel void draft_context_kv_commit(
   // i is the i-th row the lane retained, its i-th set bit.
   const uint batch = group.y, row = group.x / KVHeads;
   uint path = retained_rows[batch];
-  if (row >= min(uint(popcount(path)), params.rows[batch]))
+  if (row >= min(uint(popcount(path)), lane_rows[batch].rows))
     return;
   for (uint earlier = 0; earlier < row; ++earlier)
     path &= path - 1;
@@ -141,20 +142,22 @@ kernel void draft_context_kv_commit(
   threadgroup float reductions[8];
   threadgroup bfloat normalized[SPLASH_DRAFT_HEAD_DIMENSION];
   draft_context_kv_phase(
-      context_kv + (ulong(params.first_row[batch]) + ctz(path)) * RowWidth,
+      context_kv + (ulong(lane_rows[batch].first) + ctz(path)) * RowWidth,
       k_norm, rope_cos + rope, rope_sin + rope, keys, values,
       params.start_position[batch] + row, group.x % KVHeads, thread_index,
       lane, simd_group, reductions, normalized);
 }
 
-// The rows a lane retained of its verify block (`retained_rows`, its
-// acceptance's mask), in path order, to the slots of their positions in its
-// context window, which stays current with its rings: the path's i-th, its
-// i-th set bit, at the lane's start position plus i.
+// The rows a lane retained of its rows of a decode step (`retained_rows`, its
+// acceptance's mask, among its rows `lane_rows`), in path order, to the slots
+// of their positions in its context window, which stays current with its
+// rings: the path's i-th, its i-th set bit, at the lane's start position plus
+// i.
 kernel void draft_context_window_commit(
     device const bfloat *context [[buffer(0)]], device uchar *window [[buffer(1)]],
     device const uint *retained_rows [[buffer(2)]],
-    constant DraftContextWindowParams &params [[buffer(3)]],
+    device const SplashLaneRows *lane_rows [[buffer(3)]],
+    constant DraftContextWindowParams &params [[buffer(4)]],
     uint threadgroup_index [[threadgroup_position_in_grid]],
     uint lane [[thread_index_in_simdgroup]],
     uint simd_group [[simdgroup_index_in_threadgroup]]) {
@@ -162,12 +165,14 @@ kernel void draft_context_window_commit(
   if (!draft_context_group(params, threadgroup_index, simd_group, at))
     return;
   uint path = retained_rows[0];
-  if (at.row >= uint(popcount(path)))
+  if (at.row >= min(uint(popcount(path)), lane_rows[0].rows))
     return;
   for (uint earlier = 0; earlier < at.row; ++earlier)
     path &= path - 1;
-  // The store reads row at.row of its rows: here the path's, at or past it.
-  draft_context_store(context + (ulong(ctz(path)) - at.row) * params.width, window, params, at, lane);
+  // The store reads row at.row of its rows: here the lane's path row, at or
+  // past it.
+  draft_context_store(context + (ulong(lane_rows[0].first) + ctz(path) - at.row) * params.width, window, params,
+                      at, lane);
 }
 
 // One split of the attention of one KV head over the 32 query rows of one

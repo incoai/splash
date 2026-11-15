@@ -75,4 +75,38 @@ inline void copyLaneRows(std::span<const LaneRows> lanes, uint32_t (&first)[SPLA
   }
 }
 
+// The most rows of a lane's verify block in a decode step of `rows` rows over
+// `lanes` lanes, which the step's proposer chooses on the device within it:
+// eight while the step's rows give each lane no more, the rows the GDN
+// decode kernels of eight rows hold, which took 13-19% less time than those
+// of sixteen over a layer's 8-row chains (DRAM-cold, an M6); else a verify
+// block's most.
+[[nodiscard]] constexpr uint32_t verifyLaneCap(uint32_t rows, uint32_t lanes) noexcept {
+  return rows <= uint64_t{8} * lanes ? 8 : SPLASH_TARGET_VERIFY_ROWS;
+}
+
+// Lane rows as a proposer writes them on the device for the kernels after it
+// (SplashLaneRows).
+static_assert(sizeof(LaneRows) == sizeof(SplashLaneRows));
+
+// A decode step's rows, which its proposer lays out on the device for the
+// kernels after it (SplashLaneRows, ops::DraftSelector::addVerifyRows):
+// `rows` rows over `lanes` lanes, packed in lane order, each lane's 1 to
+// `laneCap` of them (verifyLaneCap). A kernel's grid of a lane's rows spans
+// the cap.
+struct StepRows final {
+  uint32_t lanes = 0;
+  uint32_t rows = 0;
+  uint32_t laneCap = 0;
+};
+
+// Throws unless `step` holds 1 to a batch of lanes of 1 to a verify block's
+// rows each, its rows as many as its lanes may hold.
+inline void requireStepRows(const StepRows &step) {
+  if (!step.lanes || step.lanes > SPLASH_MAXIMUM_BATCH_WIDTH || !step.laneCap ||
+      step.laneCap > SPLASH_TARGET_VERIFY_ROWS || step.rows < step.lanes ||
+      step.rows > uint64_t{step.lanes} * step.laneCap)
+    throw std::invalid_argument("invalid decode step rows");
+}
+
 } // namespace splash::ops

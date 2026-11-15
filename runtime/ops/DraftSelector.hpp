@@ -31,24 +31,32 @@ struct DraftSelectorBuffers final {
   // [lanes][SPLASH_TREE_CHAIN_TOKENS][SPLASH_TREE_AGREEMENTS] estimates.
   metal::MetalBuffer chainTokens;
   metal::MetalBuffer chainRates;
-  // The command's packed rows (ops::LaneRows): each row's token, its verify
-  // input; its tree row (metal/abi/VerifyTree.h); and its scores, fp32 pairs
-  // of its draft probability and its estimate.
+  // Each lane's tree (DraftTreeParams), up to SPLASH_TARGET_VERIFY_ROWS rows
+  // from row lane x SPLASH_TARGET_VERIFY_ROWS in the order the selector took
+  // them, best first: each row's token, its tree row (metal/abi/VerifyTree.h)
+  // and its scores, fp32 pairs of its draft probability and its estimate, the
+  // chance that the target accepts it, which a later step's choice of rows
+  // reads; and uint32 [lanes], the rows each tree holds.
+  metal::MetalBuffer treeTokens;
+  metal::MetalBuffer trees;
+  metal::MetalBuffer treeScores;
+  metal::MetalBuffer treeSizes;
+  // A decode step's rows (ops::StepRows) as addVerifyRows lays them out from
+  // the trees: each row's token, its verify input, and its tree row, packed
+  // in lane order; each lane's rows (SplashLaneRows) and its verify rows
+  // (uint32), the first of them.
   metal::MetalBuffer inputTokens;
   metal::MetalBuffer treeRows;
-  metal::MetalBuffer treeScores;
-  // uint32 [lanes]: the rows each lane's tree holds, which addVerifyRows
-  // narrows to the rows it verifies.
-  metal::MetalBuffer rowCounts;
+  metal::MetalBuffer laneRows;
+  metal::MetalBuffer verifyRows;
 };
 
-// How one lane's tree grows (DraftTreeParams): from its anchor, over its
+// How one lane's tree grows (DraftTreeParams): from its anchor, over a
 // verify block's rows, no row deeper than `depth` (the tokens it may retain
 // less one), with the first `chain` tokens of its host chain and up to
 // `children` children a draft row (none: its rows are its host chain's).
 struct DraftTreeLane final {
   uint32_t anchor = 0;
-  LaneRows block{};
   uint32_t depth = 0;
   uint32_t chain = 0;
   uint32_t children = 1;
@@ -86,14 +94,14 @@ public:
 
   void add(metal::CommandGraph &graph, const DraftSelectorBuffers &buffers, const DraftCodebooks &codebooks,
            std::span<const DraftTreeLane> lanes, const DraftCalibration &calibration) const;
-  // After add: each lane's verify rows (VerifyRowsParams), written over
-  // rowCounts, numbered in preorder over the buffers' rows: every row of its
-  // tree without costs, or the most expected accepted tokens per cost over
-  // the lanes' trees, where costs[R] is the cost of a cycle whose lanes verify
-  // R rows in all, for R from the lane count to their blocks' rows, in any
-  // unit.
-  static void addVerifyRows(metal::CommandGraph &graph, const DraftSelectorBuffers &buffers,
-                            std::span<const float> costs, std::span<const LaneRows> blocks);
+  // After add: the rows of a decode step of `step.lanes` lanes
+  // (VerifyRowsParams), each lane's verify rows numbered in preorder: the
+  // trees' best rows that the step's rows hold without costs, or as many of
+  // them as give the most expected accepted tokens per cost, where costs[R]
+  // is the cost of a step that verifies R rows in all, for R from the lane
+  // count to the step's rows, in any unit.
+  static void addVerifyRows(metal::CommandGraph &graph, const DraftSelectorBuffers &buffers, const StepRows &step,
+                            std::span<const float> costs);
 
 private:
   uint32_t vocabulary_ = 0;

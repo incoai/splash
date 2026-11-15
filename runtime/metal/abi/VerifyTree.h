@@ -29,3 +29,20 @@ struct SplashTreeRow {
 
 static_assert(sizeof(SplashTreeRow) == 8,
               "Verify tree rows are 8 bytes on both sides");
+
+// A row's K/V and its GDN tape row sit at its own row of the block (the
+// block's first position plus the row), so that siblings never collide; its
+// RoPE position is the block's first position plus its depth. A block's
+// accepted path is a row mask of the same form as `ancestors`: the ancestors
+// of the deepest row it accepted.
+
+// A lane's rows of a command's packed rows (ops::LaneRows): `rows` rows from
+// row `first`, as a step's proposer writes them on the device for the
+// kernels after it.
+struct SplashLaneRows {
+  uint32_t first;
+  uint32_t rows;
+};
+
+static_assert(sizeof(SplashLaneRows) == 8,
+              "Lane rows are 8 bytes on both sides");

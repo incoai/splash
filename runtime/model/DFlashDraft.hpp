@@ -155,8 +155,11 @@ struct DFlashContextBuffers final {
   metal::MetalBuffer contextKv;
   metal::MetalBuffer ropeCos;
   metal::MetalBuffer ropeSin;
-  // Each lane's retained rows of its verify block, a mask (acceptance's).
+  // Each lane's retained rows of its rows of the step, a mask
+  // (acceptance's), and its rows of the step (SplashLaneRows, which the
+  // step's proposer writes).
   metal::MetalBuffer retainedRows;
+  metal::MetalBuffer laneRows;
   std::vector<std::array<metal::MetalBuffer,
                          ExecutionLimits::maximumBatchWidth>> persistentKeys;
   std::vector<std::array<metal::MetalBuffer,
@@ -275,16 +278,16 @@ public:
   // checkpoint ships; without one they keep the target table's row.
   void addMaskRows(metal::CommandGraph &graph, metal::MetalBuffer rows, uint32_t lanes) const;
 
-  // A decode step's context rows: those each lane retained of its verify
-  // block (`blocks`, among the target's captured rows), in path order, to its
-  // rings from its start position on, rotated by the lane's RoPE rows (its
-  // block's positions), and to its window when it has one
-  // (DFlashContextBuffers::windows). Its normalized rows stay in
-  // buffers.hidden, which a state the step captures stores in its own window.
+  // A decode step's context rows (`step`, among the target's captured rows):
+  // those each lane retained, in path order, to its rings from its start
+  // position on, rotated by the lane's RoPE rows (its block's positions), and
+  // to its window when it has one (DFlashContextBuffers::windows). Its
+  // normalized rows stay in buffers.hidden, which a state the step captures
+  // stores in its own window.
   void addContextCommit(metal::CommandGraph &graph,
                         DFlashContextBuffers buffers,
                         std::span<const uint32_t> startPositions,
-                        std::span<const ops::LaneRows> blocks) const;
+                        const ops::StepRows &step) const;
 
 private:
   // Each layer's context keys and values of the `rows` context rows in the

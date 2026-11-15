@@ -361,11 +361,15 @@ whose probability is not one, which a draft row that is not finite gives, by
 damped Newton steps under a prior fit to Qwen3.8-Flash-Next's and
 Qwen3.6-35B-A3B's cycles, which also stands before any label. A row's estimate
 is what verifying it adds to its lane's expected tokens; one GPU step after the
-selector (`draft_verify_rows`) gives every lane its anchor and the rows of the
-largest estimates over the batch, a lane's in the order its tree took them, as
-many as maximize the expected tokens over the cycle's cost at that many rows in
-all, and numbers a lane's rows in preorder, its likeliest path on its first
-rows. Whatever its policy a lane proposes the same rows: a sampled lane's
+selector (`draft_verify_rows`) lays out the cycle's rows, a draft block's a
+lane: every lane verifies its anchor and the rows of the largest estimates over
+the batch, a lane's in the order its tree took them and none past a lane's cap,
+as many as the cycle's rows hold or, under the budget, as maximize the expected
+tokens over the cycle's cost at that many rows in all. It numbers a lane's
+verify rows in preorder, its likeliest path on its first rows, packs the lanes'
+rows in lane order, the cycle's rows past the verify rows on the first lanes
+under the cap, and writes each lane's rows (`DecodeTensor::LaneLayout`), which
+the cycle's later kernels read on the GPU. Whatever its policy a lane proposes the same rows: a sampled lane's
 verify rows draw from the target, and its cycle keeps a proposal only where the
 row before it drew that token, so its acceptance stays exact, and its most
 likely proposals are those it keeps most often. The engine takes a cycle's cost at so many rows from the wall times of the
@@ -385,7 +389,8 @@ in agentic use about one cycle in six accepts all seven proposals and one in
 five accepts none. Rows past a lane's verify rows still run the target's
 layers, whose kernels take eight rows a lane, but their MoE steps route no
 expert (`moe_group_routes_verified`), their GDN recurrence is skipped and its
-output left zero (`verify_gdn_fused`), and acceptance retains none of them.
+output left zero (`verify_gdn_fused`), and no selection, penalty or acceptance
+reads them.
 The budget's costs follow wall time and its acceptance
 model every request's labels, so the rows a cycle verifies depend on the
 machine's timing and on what the server served before, and a MoE row's result

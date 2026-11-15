@@ -517,6 +517,9 @@ enum class DecodeTensor : uint32_t {
   RetainedRows,
   AcceptedCount,
   VerifyRows,
+  // Each lane's rows of a step (SplashLaneRows), which the step's selector
+  // writes (ops::DraftSelector::addVerifyRows), or a first token's selection.
+  LaneLayout,
   DraftInputTokens,
   DraftHidden0,
   DraftHidden1,
@@ -534,12 +537,18 @@ enum class DecodeTensor : uint32_t {
   Unary,
   TopPartialIds,
   TopPartialValues,
-  // Each lane's verify block as a tree, a row of metal/abi/VerifyTree.h per
-  // row: chains (ops::chainRow) from the arena's start, then the selector's
-  // trees (ops::DraftSelector), with each row's draft probability and
-  // estimate.
+  // A step's rows' places in their lanes' trees, a row of
+  // metal/abi/VerifyTree.h per row: chains (ops::chainRow) from the arena's
+  // start, then as each step's selector lays them out
+  // (ops::DraftSelector::addVerifyRows).
   TreeRows,
-  TreeScores,
+  // Each lane's draft tree as the selector grew it, best first
+  // (ops::DraftSelectorBuffers): its rows' tokens, tree rows and scores (each
+  // row's draft probability and estimate), and its size.
+  DraftTreeTokens,
+  DraftTrees,
+  DraftTreeScores,
+  DraftTreeSizes,
   // Each lane's host chain of its tree: its tokens and their estimates
   // (DraftTreeParams in metal/abi/Sampling.h), which the host writes.
   ChainTokens,

@@ -351,17 +351,17 @@ void DFlashDraft::addMaskRows(metal::CommandGraph &graph, metal::MetalBuffer row
 
 void DFlashDraft::addContextCommit(
     metal::CommandGraph &graph, DFlashContextBuffers buffers,
-    std::span<const uint32_t> startPositions, std::span<const ops::LaneRows> blocks) const {
+    std::span<const uint32_t> startPositions, const ops::StepRows &step) const {
   const uint32_t lanes = static_cast<uint32_t>(startPositions.size());
-  if (!lanes || lanes > ExecutionLimits::maximumBatchWidth || blocks.size() != lanes ||
+  if (!lanes || lanes > ExecutionLimits::maximumBatchWidth || step.lanes != lanes ||
       buffers.persistentKeys.size() != weights_.layout.layers ||
       buffers.persistentValues.size() != weights_.layout.layers) {
     throw std::invalid_argument("invalid draft context batch");
   }
+  ops::requireStepRows(step);
   const DFlashDraftLayout &layout = weights_.layout;
-  // The context projections run over the target's rows up to the last
-  // block's end.
-  const uint32_t rows = static_cast<uint32_t>(ops::rowsEnd(blocks));
+  // The context projections run over the step's rows.
+  const uint32_t rows = step.rows;
   const ops::Linear &linear = operators_.draftLinear();
   const ops::LinearScratch &scratch = buffers.linearScratch;
   linear.add(graph, {.input = buffers.capturedTargetHidden, .output = buffers.projected, .scratch = scratch},
@@ -372,14 +372,13 @@ void DFlashDraft::addContextCommit(
   ops::PreparedInput hidden = ops::Normalization::addRms(
       graph, buffers.projected, weights_.hiddenNorm, buffers.hidden, layout.hiddenSize, rows,
       scratch, kvPlan.input());
-  const uint64_t laneBytes = uint64_t{ExecutionLimits::targetVerifyRows} * layout.hiddenSize * sizeof(uint16_t);
   for (uint32_t lane = 0; lane < lanes; ++lane)
     if (buffers.windows[lane])
-      ops::DraftAttention::addWindowCommit(graph, backend_.view(buffers.hidden, lane * laneBytes, laneBytes),
-                                           buffers.windows[lane],
-                                           backend_.view(buffers.retainedRows, lane * sizeof(uint32_t),
-                                                         sizeof(uint32_t)),
-                                           startPositions[lane], layout.hiddenSize);
+      ops::DraftAttention::addWindowCommit(
+          graph, buffers.hidden, buffers.windows[lane],
+          backend_.view(buffers.retainedRows, lane * sizeof(uint32_t), sizeof(uint32_t)),
+          backend_.view(buffers.laneRows, lane * sizeof(ops::LaneRows), sizeof(ops::LaneRows)), rows,
+          step.laneCap, startPositions[lane], layout.hiddenSize);
 
   for (uint32_t layer = 0; layer < layout.layers; ++layer) {
     const ops::Projection &projection = contextKvProjections_[layer];
@@ -391,8 +390,8 @@ void DFlashDraft::addContextCommit(
     ops::DraftAttention::addContextCommit(
         graph, buffers.contextKv, weights_.layers[layer].keyNorm, buffers.ropeCos,
         buffers.ropeSin, buffers.persistentKeys[layer],
-        buffers.persistentValues[layer], buffers.retainedRows,
-        startPositions, blocks, layout.attentionShape());
+        buffers.persistentValues[layer], buffers.retainedRows, buffers.laneRows,
+        startPositions, step, layout.attentionShape());
   }
 }
 

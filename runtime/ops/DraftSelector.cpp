@@ -53,30 +53,24 @@ void DraftSelector::add(metal::CommandGraph &graph, const DraftSelectorBuffers &
       throw std::invalid_argument("invalid draft tree calibration");
     tree.intercept[position] = calibration.intercepts[position];
   }
-  std::array<LaneRows, SPLASH_MAXIMUM_BATCH_WIDTH> blocks{};
   for (uint32_t lane = 0; lane < count; ++lane) {
     const DraftTreeLane &l = lanes[lane];
-    // A tree's rows hold its anchor and every row's path below it; a chain
-    // token past the block's rows has no row.
-    if (l.depth >= l.block.rows || l.chain > SPLASH_TREE_CHAIN_TOKENS || l.children > SPLASH_TREE_CHILDREN)
+    // A tree's rows hold its anchor and every row's path below it, a verify
+    // block's rows.
+    if (l.depth >= SPLASH_TARGET_VERIFY_ROWS || l.chain > SPLASH_TREE_CHAIN_TOKENS ||
+        l.children > SPLASH_TREE_CHILDREN)
       throw std::invalid_argument("invalid draft tree lane");
-    blocks[lane] = l.block;
     edges.anchor[lane] = tree.anchor[lane] = l.anchor;
-    tree.first_row[lane] = l.block.first;
-    tree.rows[lane] = l.block.rows;
     tree.depth[lane] = l.depth;
     tree.chain[lane] = l.chain;
     tree.children[lane] = l.children;
   }
-  const std::span<const LaneRows> rows(blocks.data(), count);
-  // A tree row's ancestors are a 32-bit mask of its block's rows.
-  requireLaneRows(rows, SPLASH_TARGET_VERIFY_ROWS);
   // A lane's proposal positions take rows 1-7 of its eight query rows of the
-  // logits and the selector hidden rows.
+  // logits and the selector hidden rows; its tree takes a verify block's rows.
   const DraftSelectorWorkspace workspace = DraftSelector::workspace(count * kPositions);
   const uint64_t queryRows = uint64_t{count} * SPLASH_DRAFT_QUERY_ROWS;
   const uint64_t codebook = uint64_t{vocabulary_} * SPLASH_DRAFT_SELECTOR_RANK * 2;
-  const uint64_t end = rowsEnd(rows);
+  const uint64_t treeRows = uint64_t{count} * SPLASH_TARGET_VERIFY_ROWS;
   requireBytes(buffers.logits, queryRows * vocabulary_ * sizeof(float), "draft logits");
   requireBytes(buffers.partialIds, workspace.partialIdsBytes, "draft selector partial id");
   requireBytes(buffers.partialValues, workspace.partialValuesBytes, "draft selector partial value");
@@ -90,10 +84,10 @@ void DraftSelector::add(metal::CommandGraph &graph, const DraftSelectorBuffers &
   requireBytes(buffers.chainRates,
                uint64_t{count} * SPLASH_TREE_CHAIN_TOKENS * SPLASH_TREE_AGREEMENTS * sizeof(float),
                "draft tree chain rate");
-  requireBytes(buffers.inputTokens, end * sizeof(uint32_t), "verify input token");
-  requireBytes(buffers.treeRows, end * sizeof(TreeRow), "verify tree row");
-  requireBytes(buffers.treeScores, end * 2 * sizeof(float), "verify tree score");
-  requireBytes(buffers.rowCounts, uint64_t{count} * sizeof(uint32_t), "verify tree rows");
+  requireBytes(buffers.treeTokens, treeRows * sizeof(uint32_t), "draft tree token");
+  requireBytes(buffers.trees, treeRows * sizeof(TreeRow), "draft tree row");
+  requireBytes(buffers.treeScores, treeRows * 2 * sizeof(float), "draft tree score");
+  requireBytes(buffers.treeSizes, uint64_t{count} * sizeof(uint32_t), "draft tree size");
   graph.add("draft_select_top16_sharded",
             {buffers.logits, buffers.partialIds, buffers.partialValues},
             vocabulary_, {uint64_t{count} * kPositions * kShards, 1, 1});
@@ -107,38 +101,42 @@ void DraftSelector::add(metal::CommandGraph &graph, const DraftSelectorBuffers &
   // predecessor, before its first thread grows the tree.
   graph.add("draft_select_tree",
             {buffers.candidates, buffers.unary, buffers.partialValues, buffers.chainTokens, buffers.chainRates,
-             buffers.inputTokens, buffers.treeRows, buffers.treeScores, buffers.rowCounts},
+             buffers.treeTokens, buffers.trees, buffers.treeScores, buffers.treeSizes},
             tree, {count, 1, 1}, {kPositions * SPLASH_DRAFT_CANDIDATES, 1, 1});
 }
 
 void DraftSelector::addVerifyRows(metal::CommandGraph &graph, const DraftSelectorBuffers &buffers,
-                                  std::span<const float> costs, std::span<const LaneRows> blocks) {
-  requireLaneRows(blocks, SPLASH_TARGET_VERIFY_ROWS);
-  const uint32_t lanes = static_cast<uint32_t>(blocks.size());
+                                  const StepRows &step, std::span<const float> costs) {
+  requireStepRows(step);
   VerifyRowsParams params{};
-  params.lanes = lanes;
+  params.lanes = step.lanes;
+  params.rows = step.rows;
+  params.lane_cap = step.laneCap;
   params.every_row = costs.empty() ? 1 : 0;
-  copyLaneRows(blocks, params.first_row, params.rows);
-  uint32_t rows = 0;
-  for (const LaneRows &block : blocks)
-    rows += block.rows;
-  // The costs of every total the lanes may verify, from their anchors to
-  // their blocks' rows.
+  // The costs of every total the lanes may verify, from their anchors to the
+  // step's rows.
   if (!costs.empty()) {
-    if (costs.size() <= rows)
+    if (costs.size() <= step.rows)
       throw std::invalid_argument("invalid draft verify rows cost");
-    for (uint32_t total = lanes; total <= rows; ++total) {
+    for (uint32_t total = step.lanes; total <= step.rows; ++total) {
       if (!(std::isfinite(costs[total]) && costs[total] > 0.0F))
         throw std::invalid_argument("invalid draft verify rows cost");
       params.cost[total] = costs[total];
     }
   }
-  const uint64_t end = rowsEnd(blocks);
-  requireBytes(buffers.inputTokens, end * sizeof(uint32_t), "verify input token");
-  requireBytes(buffers.treeRows, end * sizeof(TreeRow), "verify tree row");
-  requireBytes(buffers.treeScores, end * 2 * sizeof(float), "verify tree score");
-  requireBytes(buffers.rowCounts, uint64_t{lanes} * sizeof(uint32_t), "verify tree rows");
-  graph.add("draft_verify_rows", {buffers.inputTokens, buffers.treeRows, buffers.treeScores, buffers.rowCounts},
+  // It reads each lane's tree and writes the step's rows.
+  const uint64_t treeRows = uint64_t{step.lanes} * SPLASH_TARGET_VERIFY_ROWS;
+  requireBytes(buffers.treeTokens, treeRows * sizeof(uint32_t), "draft tree token");
+  requireBytes(buffers.trees, treeRows * sizeof(TreeRow), "draft tree row");
+  requireBytes(buffers.treeScores, treeRows * 2 * sizeof(float), "draft tree score");
+  requireBytes(buffers.treeSizes, uint64_t{step.lanes} * sizeof(uint32_t), "draft tree size");
+  requireBytes(buffers.inputTokens, uint64_t{step.rows} * sizeof(uint32_t), "verify input token");
+  requireBytes(buffers.treeRows, uint64_t{step.rows} * sizeof(TreeRow), "verify tree row");
+  requireBytes(buffers.laneRows, uint64_t{step.lanes} * sizeof(LaneRows), "verify lane rows");
+  requireBytes(buffers.verifyRows, uint64_t{step.lanes} * sizeof(uint32_t), "verify rows");
+  graph.add("draft_verify_rows",
+            {buffers.treeTokens, buffers.trees, buffers.treeScores, buffers.treeSizes, buffers.inputTokens,
+             buffers.treeRows, buffers.laneRows, buffers.verifyRows},
             params, {1, 1, 1}, {1, 1, 1});
 }
 

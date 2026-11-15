@@ -124,6 +124,12 @@ struct SamplingBuffers final {
   // finished: a count every draw returns to zero, where it starts.
   metal::MetalBuffer vocabularyRanges;
   metal::MetalBuffer vocabularyArrivals;
+  // Each lane's rows of the logits (SplashLaneRows) and how many of them,
+  // from the first, it selects (uint32, its verify rows): a decode step's
+  // proposer writes them (ops::DraftSelector::addVerifyRows), and addInitial
+  // a first token's.
+  metal::MetalBuffer laneRows;
+  metal::MetalBuffer verifyRows;
 };
 
 struct AcceptanceBuffers final {
@@ -138,8 +144,9 @@ struct AcceptanceBuffers final {
   metal::MetalBuffer acceptedCounts;
   // Each lane's retained rows, a mask of its block's (AcceptBatchParams).
   metal::MetalBuffer retainedRows;
-  // Each lane's verify rows (ops::DraftSelector), which bound what it
-  // retains.
+  // Each lane's rows of the step (SplashLaneRows) and its verify rows, the
+  // first of them (ops::DraftSelector::addVerifyRows), which it walks.
+  metal::MetalBuffer laneRows;
   metal::MetalBuffer verifyRows;
 };
 
@@ -178,11 +185,11 @@ public:
   // then takes each row's argmax and a sampled lane draws from each row's
   // distribution over the whole vocabulary, row i with the lane's uniform i,
   // both among the tokens the lane admits: the first token after a prompt
-  // from each lane's one row of the logits (`rows`), and every row of each
-  // lane's verify block (`blocks`, at most SPLASH_TARGET_VERIFY_ROWS rows,
-  // its anchor's first). Each selected row's token goes to the output tokens
-  // at its logits row. A lane's rows from its thinking cutoff on then take
-  // the end of thinking. Both run the same kernels (addSelection).
+  // from each lane's one row of the logits (`rows`), and the verify rows of
+  // each lane of a decode step (`step`, as its proposer laid them out in the
+  // buffers' lane rows and verify rows). Each selected row's token goes to the
+  // output tokens at its logits row. A lane's rows from its thinking cutoff on
+  // then take the end of thinking. Both run the same kernels (addSelection).
   void addInitial(metal::CommandGraph &graph,
                   std::span<const SamplingPolicy> policies,
                   SamplingBuffers buffers, std::span<const uint32_t> rows,
@@ -190,42 +197,48 @@ public:
                   const PenaltyTable &penalties) const;
   void addVerify(metal::CommandGraph &graph,
                  std::span<const SamplingPolicy> policies,
-                 SamplingBuffers buffers, std::span<const LaneRows> blocks,
+                 SamplingBuffers buffers, const StepRows &step,
                  const StopTokens &stopTokens,
                  const PenaltyTable &penalties) const;
-  // Each lane's acceptance of its verify block (addVerify's `blocks`) as a
-  // tree: the path its rows' selections follow from its anchor, of which it
-  // retains at most maximumRetained[lane] rows (metal/abi/Sampling.h
+  // Each lane's acceptance of its verify rows of a decode step (addVerify's)
+  // as a tree: the path its rows' selections follow from its anchor, of which
+  // it retains at most maximumRetained[lane] rows (metal/abi/Sampling.h
   // AcceptBatchParams).
-  void addAcceptance(metal::CommandGraph &graph, AcceptanceBuffers buffers, std::span<const LaneRows> blocks,
+  void addAcceptance(metal::CommandGraph &graph, AcceptanceBuffers buffers, const StepRows &step,
                      std::span<const uint32_t> maximumRetained, const StopTokens &stopTokens) const;
 
 private:
   // The rows a selection takes from each lane (metal/abi/Sampling.h
-  // TargetSamplingParams): its rows of the logits and the first's mask row.
+  // TargetSamplingParams): the logits rows its lanes' rows end before, the
+  // most rows of a lane, which its grids span, and the first's mask row.
   struct TargetRows final {
-    std::span<const LaneRows> lanes;
+    uint64_t end = 0;
+    uint32_t laneCap = 0;
     uint32_t maskRow = 0;
   };
 
-  // Penalizes each penalized lane's selected rows, each also counting the
-  // draft tokens its context adds. Policies come from validated requests
+  // The penalties of each penalized lane's selected rows, each also counting
+  // the draft tokens its context adds; throws unless the table and the
+  // buffers hold what they reach. Policies come from validated requests
   // (Model.hpp SamplingParameters::validationError). It follows selection(),
   // whose check of every lane's logits covers those it rewrites.
-  void addPenalties(metal::CommandGraph &graph,
-                    std::span<const SamplingPolicy> policies,
-                    const SamplingBuffers &buffers, const PenaltyTable &table,
-                    std::span<const LaneRows> rows) const;
-  // The parameters that select the rows `rows` names of every lane; throws
+  [[nodiscard]] SamplingPenaltyParams penaltyParams(std::span<const SamplingPolicy> policies,
+                                                    const SamplingBuffers &buffers, const PenaltyTable &table,
+                                                    const TargetRows &rows) const;
+  // Penalizes the lanes penaltyParams() named, if any.
+  void addPenalties(metal::CommandGraph &graph, const SamplingBuffers &buffers, const PenaltyTable &table,
+                    const SamplingPenaltyParams &params) const;
+  // The parameters that select the rows `rows` bounds of every lane; throws
   // unless the buffers hold what the selection's kernels reach, before
   // addInitial or addVerify encodes anything.
   [[nodiscard]] TargetSamplingParams selection(std::span<const SamplingPolicy> policies,
                                                const SamplingBuffers &buffers, const TargetRows &rows,
                                                const StopTokens &stopTokens) const;
-  // Selects the rows `selection` names of its `lanes` lanes, then the end of
-  // thinking at each lane's thinking cutoff among them.
+  // Selects the rows `selection` names of each lane, then the end of thinking
+  // at each lane's thinking cutoff among them.
   void addSelection(metal::CommandGraph &graph, const TargetSamplingParams &selection,
-                    std::span<const SamplingPolicy> policies, const SamplingBuffers &buffers) const;
+                    std::span<const SamplingPolicy> policies, const SamplingBuffers &buffers,
+                    const TargetRows &rows) const;
 
   uint32_t vocabulary_ = 0;
   uint32_t maskWords_ = 0;

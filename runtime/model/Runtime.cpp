@@ -27,6 +27,7 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <chrono>
 #include <cmath>
 #include <cstddef>
@@ -69,6 +70,11 @@ constexpr std::array<ops::LaneRows, kLaneCount> kDecodeBlocks = [] {
 // the committed tokens plus the row). The selector takes up to
 // SPLASH_TREE_CHILDREN once the forward reads a block's tree.
 constexpr uint32_t kVerifyChildren = 1;
+// A decode cycle's rows over `lanes` lanes: a draft block's a lane, which its
+// selector lays out over the lanes' trees (ops::DraftSelector::addVerifyRows).
+constexpr ops::StepRows decodeStep(uint32_t lanes) noexcept {
+  return {lanes, lanes * kDraftRows, ops::verifyLaneCap(lanes * kDraftRows, lanes)};
+}
 constexpr std::array<uint32_t, kLaneCount> kDecodeFirstRows = [] {
   std::array<uint32_t, kLaneCount> rows{};
   for (uint32_t lane = 0; lane < kLaneCount; ++lane) rows[lane] = kDecodeBlocks[lane].first;
@@ -418,8 +424,12 @@ struct Runtime::Impl {
     uint32_t accepted = 0;
     uint32_t currentAnchor = 0;
     uint32_t maximumRetained = 0;
-    // The rows of its block the lane verified (budgetsVerifyRows).
+    // The lane's rows of the cycle as its selector laid them out, the first
+    // of them it verified (budgetsVerifyRows) and the mask of those it
+    // retained (acceptance's, metal/abi/VerifyTree.h).
+    ops::LaneRows rows{};
     uint32_t verifyRows = 0;
+    uint32_t retainedRows = 0;
     // The draft proposals the lane's thinking end replaced, which its
     // speculation counts leave out.
     uint32_t endDrafts = 0;
@@ -684,8 +694,7 @@ struct Runtime::Impl {
     CommandGraph graph;
     sampling.addInitial(graph, policies, samplingBuffers(2), std::span(kDecodeFirstRows).first(2),
                         geometry.target.stopTokens, penalties);
-    sampling.addVerify(graph, policies, samplingBuffers(2), std::span(kDecodeBlocks).first(2),
-                       geometry.target.stopTokens, penalties);
+    sampling.addVerify(graph, policies, samplingBuffers(2), decodeStep(2), geometry.target.stopTokens, penalties);
     backend.preparePipelines(graph.dispatches());
   }
 
@@ -1324,7 +1333,27 @@ struct Runtime::Impl {
             d(DecodeTensor::InputTokens),
             d(DecodeTensor::TreeRows),
             d(DecodeTensor::TargetVocabularyRanges),
-            d(DecodeTensor::TargetVocabularyArrivals)};
+            d(DecodeTensor::TargetVocabularyArrivals),
+            d(DecodeTensor::LaneLayout),
+            d(DecodeTensor::VerifyRows)};
+  }
+
+  // A completed cycle's lane's retained tokens, from its first row.
+  const uint32_t *retainedTokens(const DecodeLaneResult &lane) const {
+    return contents<uint32_t>(decodeArena->batchSlice(DecodeTensor::OutputTokens, kLaneCount),
+                              "target output tokens") +
+           lane.rows.first;
+  }
+
+  // Batch lane `lane`'s rows of the last command that selected (a decode
+  // step's, as its selector laid them out, or a first token's row), checked
+  // against the decode arena's rows.
+  ops::LaneRows laneRows(uint32_t lane) const {
+    const ops::LaneRows rows = *contents<ops::LaneRows>(decodeArena->get(lane, DecodeTensor::LaneLayout), "lane rows");
+    if (!rows.rows || rows.rows > ExecutionLimits::targetVerifyRows ||
+        uint64_t{rows.first} + rows.rows > uint64_t{kLaneCount} * kDecodeRows)
+      throw std::runtime_error("draft selector produced invalid lane rows");
+    return rows;
   }
 
   std::span<uint32_t> penaltyWords(uint32_t stateLane) const {
@@ -1386,19 +1415,21 @@ struct Runtime::Impl {
   // numerical outcome of this request, which it reports as its lane failure
   // (ModelStepResult::failure) so the batch survives. The message counts the
   // row's non-finite logits, which the lane's completed command left in its
-  // logits rows (row k selected token k).
-  [[nodiscard]] std::string invalidSelection(std::span<const uint32_t> tokens,
-                                             uint32_t lane) const {
+  // logits rows: the rows of `path`, a row mask from logits row `first`
+  // (metal/abi/VerifyTree.h), whose k-th selected token k.
+  [[nodiscard]] std::string invalidSelection(std::span<const uint32_t> tokens, uint32_t first,
+                                             uint32_t path) const {
     const auto found = std::ranges::find_if(tokens, [&](uint32_t token) {
       return token >= geometry.target.vocabularySize;
     });
     if (found == tokens.end())
       return {};
+    for (auto earlier = found - tokens.begin(); earlier > 0; --earlier)
+      path &= path - 1;
     const uint32_t vocabulary = geometry.target.vocabularySize;
     const std::span<const float> row(
-        contents<float>(decodeArena->get(lane, DecodeTensor::Logits),
-                        "unselectable logits") +
-            uint64_t(found - tokens.begin()) * vocabulary,
+        contents<float>(decodeArena->batchSlice(DecodeTensor::Logits, kLaneCount), "unselectable logits") +
+            (uint64_t{first} + std::countr_zero(path)) * vocabulary,
         vocabulary);
     uint32_t nan = 0, positive = 0, negative = 0;
     for (const float logit : row) {
@@ -1431,20 +1462,23 @@ struct Runtime::Impl {
 #ifdef SPLASH_RUNTIME_INSTRUMENTATION
   // While capturing, a host step before the policy that copies the logits
   // the target's forward left in each of the command's `lanes` batch lanes:
-  // row 0 for a selection (`rows` 1), the lane's verified rows for a verify.
-  void encodeTargetLogitsCapture(CommandGraph &graph, uint32_t lanes, uint32_t rows) {
+  // its first token's row for a selection, its verify rows as the step's
+  // selector laid them out for a verify.
+  void encodeTargetLogitsCapture(CommandGraph &graph, uint32_t lanes, bool verify) {
     if (!capturingTargetLogits)
       return;
-    graph.host([this, lanes, rows] {
+    graph.host([this, lanes, verify] {
       const uint64_t vocabulary = geometry.target.vocabularySize;
+      const float *logits = contents<float>(decodeArena->batchSlice(DecodeTensor::Logits, kLaneCount), "logits");
       capturedTargetLogits.resize(lanes);
       for (uint32_t lane = 0; lane < lanes; ++lane) {
+        const ops::LaneRows rows = verify ? laneRows(lane) : ops::LaneRows{kDecodeFirstRows[lane], 1};
         const uint32_t copied =
-            rows == 1 ? 1 : *contents<uint32_t>(decodeArena->get(lane, DecodeTensor::VerifyRows), "verify rows");
-        if (!copied || copied > rows)
+            verify ? *contents<uint32_t>(decodeArena->get(lane, DecodeTensor::VerifyRows), "verify rows") : 1;
+        if (!copied || copied > rows.rows)
           throw std::logic_error("captured verify rows are out of range");
-        const float *logits = contents<float>(decodeArena->get(lane, DecodeTensor::Logits), "logits");
-        capturedTargetLogits[lane].assign(logits, logits + copied * vocabulary);
+        const float *first = logits + rows.first * vocabulary;
+        capturedTargetLogits[lane].assign(first, first + copied * vocabulary);
       }
     });
   }
@@ -1478,7 +1512,7 @@ struct Runtime::Impl {
       stateLanes[lane.lane] = lane.entry->stateLane;
     }
 #ifdef SPLASH_RUNTIME_INSTRUMENTATION
-    encodeTargetLogitsCapture(graph, width, 1);
+    encodeTargetLogitsCapture(graph, width, false);
 #endif
     sampling.addInitial(graph, std::span(policies).first(width),
                         samplingBuffers(width), std::span(kDecodeFirstRows).first(width),
@@ -1530,7 +1564,7 @@ struct Runtime::Impl {
         const uint32_t token = initialToken(selection.lane);
         // A failed selection leaves no anchor: the engine ends the request
         // before any output, and the other lanes go on.
-        result.failure = invalidSelection({&token, 1}, selection.lane);
+        result.failure = invalidSelection({&token, 1}, kDecodeFirstRows[selection.lane], 1);
         if (!result.failure.empty()) {
           entry.resultInvalid = true;
           continue;
@@ -1827,14 +1861,15 @@ struct Runtime::Impl {
   // Creates the pipelines of a decode cycle's state capture
   // (encodeDecodeCaptures) on decode lane `lane` and state lane `stateLane`,
   // without running them (Runtime::warmupDecodeBatch): the fold of the
-  // verify's tape into the captured state and the store of its window rows,
-  // which only a cycle whose retained rows reach the page a reply's state is
-  // kept at runs.
+  // verify's tape into the captured state and the commit of its context rows
+  // to the state's window, which only a cycle whose retained rows reach the
+  // page a reply's state is kept at runs.
   void prepareCapturePipelines(uint32_t lane, uint32_t stateLane) const {
     if (!capturesInDecode())
       return;
     CommandGraph graph;
-    encodeCapture(graph, lane, stateLane, states.current(stateLane).stateBase, states.window(stateLane), 1, 0);
+    encodeCapture(graph, lane, stateLane, states.current(stateLane).stateBase, states.window(stateLane), 1, 0,
+                  {1, kDraftRows, ops::verifyLaneCap(kDraftRows, 1)});
     backend.preparePipelines(graph.dispatches());
   }
 
@@ -2161,10 +2196,10 @@ struct Runtime::Impl {
                     draftModel.decodeStorageLanes(lanes));
   }
 
-  // Each lane's verify rows, a tree of the draft's proposals no deeper than
-  // its retention limit, maximumRows[lane] less one, and how many of them it
-  // verifies, by the acceptance model and the costs of `constrained` cycles of
-  // its lane count.
+  // The cycle's rows (decodeStep): each lane's tree of the draft's proposals
+  // no deeper than its retention limit, maximumRows[lane] less one, and the
+  // rows of the trees it verifies, by the acceptance model and the costs of
+  // `constrained` cycles of its lane count.
   void encodeDraftBatchGraph(CommandGraph &graph,
                              std::span<Request *const> entries,
                              std::span<const uint64_t> logicalPositions,
@@ -2217,13 +2252,14 @@ struct Runtime::Impl {
         throw std::invalid_argument("draft batch lane has no anchor");
       ops::DraftTreeLane &tree = trees[lane];
       tree.anchor = *entry.pendingToken;
-      tree.block = kDecodeBlocks[lane];
       tree.depth = maximumRows[lane] - 1;
-      tree.children = kVerifyChildren;
+      // A constrained lane verifies a chain, along which its grammar finds
+      // its rows' masks (ConstrainedDecodeTicket).
+      const ops::SamplingPolicy policy = samplingPolicy(entry);
+      tree.children = policy.constrained ? 1 : kVerifyChildren;
       // A thinking end at the lane's first row is its proposals, a chain the
       // verify selects whatever its logits: no draft row beside it could be
       // accepted.
-      const ops::SamplingPolicy policy = samplingPolicy(entry);
       const std::span<const uint32_t> end = policy.thinkingCutoff ? policy.thinkingCutoff->end : std::span<const uint32_t>{};
       if (const uint32_t forced = policy.thinkingCutoff ? policy.thinkingCutoff->replacedProposals() : 0) {
         tree.chain = forced;
@@ -2236,20 +2272,22 @@ struct Runtime::Impl {
     }
     const VerifyBudget::Acceptance &acceptance = verifyBudget ? verifyBudget->acceptance() : VerifyBudget::kPrior;
     const ops::DraftSelectorBuffers selection{
-        d(DecodeTensor::Logits),     d(DecodeTensor::TopPartialIds), d(DecodeTensor::TopPartialValues),
-        d(DecodeTensor::Candidates), d(DecodeTensor::Unary),         d(DecodeTensor::SelectorHidden),
-        d(DecodeTensor::ChainTokens), d(DecodeTensor::ChainRates),   d(DecodeTensor::InputTokens),
-        d(DecodeTensor::TreeRows),   d(DecodeTensor::TreeScores),    d(DecodeTensor::VerifyRows)};
+        d(DecodeTensor::Logits),          d(DecodeTensor::TopPartialIds),   d(DecodeTensor::TopPartialValues),
+        d(DecodeTensor::Candidates),      d(DecodeTensor::Unary),           d(DecodeTensor::SelectorHidden),
+        d(DecodeTensor::ChainTokens),     d(DecodeTensor::ChainRates),      d(DecodeTensor::DraftTreeTokens),
+        d(DecodeTensor::DraftTrees),      d(DecodeTensor::DraftTreeScores), d(DecodeTensor::DraftTreeSizes),
+        d(DecodeTensor::InputTokens),     d(DecodeTensor::TreeRows),        d(DecodeTensor::LaneLayout),
+        d(DecodeTensor::VerifyRows)};
     draftModel.addSelection(graph, selection, std::span(trees).first(lanes),
                             {acceptance.slope, acceptance.intercepts});
-    // Without the budget, or in a cycle that explores, a lane verifies its
-    // whole tree.
+    // Without the budget, or in a cycle that explores, the cycle verifies as
+    // many of the trees' rows as it holds.
     std::array<float, VerifyBudget::kBlockRows * VerifyBudget::kLanes + 1> costs{};
     const bool budgets = verifyBudget && !verifyBudget->explores(lanes, constrained);
     if (budgets)
       costs = verifyBudget->costs(lanes, constrained);
-    ops::DraftSelector::addVerifyRows(graph, selection, budgets ? std::span<const float>(costs) : std::span<const float>{},
-                                      std::span(kDecodeBlocks).first(lanes));
+    ops::DraftSelector::addVerifyRows(graph, selection, decodeStep(lanes),
+                                      budgets ? std::span<const float>(costs) : std::span<const float>{});
   }
 
   void encodeTargetVerifyBatchForward(CommandGraph &graph,
@@ -2333,11 +2371,10 @@ struct Runtime::Impl {
       stateLanes[lane] = entries[lane]->stateLane;
     }
 #ifdef SPLASH_RUNTIME_INSTRUMENTATION
-    encodeTargetLogitsCapture(graph, lanes, kDecodeRows);
+    encodeTargetLogitsCapture(graph, lanes, true);
 #endif
-    sampling.addVerify(graph, std::span(policies).first(lanes),
-                       samplingBuffers(lanes), std::span(kDecodeBlocks).first(lanes), geometry.target.stopTokens,
-                       {penaltyTable, std::span(stateLanes).first(lanes)});
+    sampling.addVerify(graph, std::span(policies).first(lanes), samplingBuffers(lanes), decodeStep(lanes),
+                       geometry.target.stopTokens, {penaltyTable, std::span(stateLanes).first(lanes)});
   }
 
   void encodeDraftStateCommitBatch(CommandGraph &graph,
@@ -2369,9 +2406,9 @@ struct Runtime::Impl {
     buffers.ropeCos = d(DecodeTensor::DraftRopeCos);
     buffers.ropeSin = d(DecodeTensor::DraftRopeSin);
     buffers.retainedRows = d(DecodeTensor::RetainedRows);
+    buffers.laneRows = d(DecodeTensor::LaneLayout);
     bindDraftRings(entries, buffers.persistentKeys, buffers.persistentValues);
-    draftModel.addContextCommit(graph, std::move(buffers),
-                                std::span(startPositions).first(lanes), std::span(kDecodeBlocks).first(lanes));
+    draftModel.addContextCommit(graph, std::move(buffers), std::span(startPositions).first(lanes), decodeStep(lanes));
   }
 
   void encodeBatchAcceptance(CommandGraph &graph,
@@ -2396,8 +2433,9 @@ struct Runtime::Impl {
          decodeArena->batchSlice(DecodeTensor::RetainedCount, width),
          decodeArena->batchSlice(DecodeTensor::AcceptedCount, width),
          decodeArena->batchSlice(DecodeTensor::RetainedRows, width),
+         decodeArena->batchSlice(DecodeTensor::LaneLayout, width),
          decodeArena->batchSlice(DecodeTensor::VerifyRows, width)},
-        std::span(kDecodeBlocks).first(width), maximumRetained, geometry.target.stopTokens);
+        decodeStep(width), maximumRetained, geometry.target.stopTokens);
   }
 
   // The target's commit after acceptance (QwenTarget::addStateCommit): each
@@ -2430,29 +2468,34 @@ struct Runtime::Impl {
   // retained them (finalizeDecode).
   void encodeDecodeCaptures(CommandGraph &graph, std::span<Request *const> entries,
                             std::span<const ModelBatchItem> items) {
+    const ops::StepRows step = decodeStep(static_cast<uint32_t>(entries.size()));
     for (uint32_t lane = 0; lane < entries.size(); ++lane) {
       for (const StateCapture &capture : items[lane].stateCaptures) {
         const QwenCachedBuffers &state = static_cast<QwenStateReservation &>(*capture.reservation).buffers();
         encodeCapture(graph, lane, entries[lane]->stateLane, state.gdn->buffers().stateBase, state.window->buffer(),
                       static_cast<uint32_t>(capture.tokens - items[lane].logicalPosition),
-                      static_cast<uint32_t>(items[lane].logicalPosition));
+                      static_cast<uint32_t>(items[lane].logicalPosition), step);
       }
     }
   }
 
   // A capture's commands on decode lane `lane` of state lane `stateLane`
-  // (encodeDecodeCaptures): the fold of the first `rows` of the verify's
-  // tape into the GDN state `fold` and the store of their context rows, from
-  // `position`, in the state's `window`.
+  // (encodeDecodeCaptures), in a cycle of `step`: the fold of the first
+  // `rows` of the verify's tape into the GDN state `fold` and the commit of
+  // their context rows, from `position`, to the state's `window`.
   void encodeCapture(CommandGraph &graph, uint32_t lane, uint32_t stateLane, const MetalBuffer &fold,
-                     const MetalBuffer &window, uint32_t rows, uint32_t position) const {
+                     const MetalBuffer &window, uint32_t rows, uint32_t position, const ops::StepRows &step) const {
     targetModel->addStateFold(graph,
                               {decodeArena->get(lane, DecodeTensor::RetainedCount), states.next(stateLane).stateBase,
                                decodeArena->batchSlice(DecodeTensor::GdnTape, kLaneCount),
                                decodeArena->gdnTapeSlot(stateLane, states.metadata(stateLane).activeParity ^ 1), fold},
                               rows);
-    ops::DraftAttention::addWindowStore(graph, decodeArena->get(lane, DecodeTensor::ContextHidden), window, rows,
-                                        position, geometry.draft.hiddenSize);
+    // The window takes the first rows of the lane's retained path, which
+    // its capture holds when the lane retained them.
+    ops::DraftAttention::addWindowCommit(graph, decodeArena->batchSlice(DecodeTensor::ContextHidden, kLaneCount),
+                                         window, decodeArena->get(lane, DecodeTensor::RetainedRows),
+                                         decodeArena->get(lane, DecodeTensor::LaneLayout), step.rows, rows, position,
+                                         geometry.draft.hiddenSize);
   }
 
   // A verify's selection, acceptance and commits, which end its cycle's last
@@ -2519,20 +2562,22 @@ struct Runtime::Impl {
                                                 "GPU accepted draft count");
       laneResult.verifyRows = *contents<uint32_t>(d(DecodeTensor::VerifyRows),
                                                   "GPU verify rows");
-      if (!laneResult.verifyRows || laneResult.verifyRows > kDecodeRows)
+      laneResult.retainedRows = *contents<uint32_t>(d(DecodeTensor::RetainedRows), "GPU retained rows");
+      laneResult.rows = laneRows(lane);
+      if (!laneResult.verifyRows || laneResult.verifyRows > laneResult.rows.rows)
         throw std::runtime_error("draft selector produced invalid verify rows");
-      if (!laneResult.retained || laneResult.retained > std::min(laneResult.verifyRows, laneResult.maximumRetained))
+      if (!laneResult.retained || laneResult.retained > std::min(laneResult.verifyRows, laneResult.maximumRetained) ||
+          std::popcount(laneResult.retainedRows) != static_cast<int>(laneResult.retained) ||
+          !(laneResult.retainedRows & 1) || laneResult.retainedRows >> (laneResult.verifyRows - 1) > 1)
         throw std::runtime_error("target policy produced invalid retention");
-      if (laneResult.accepted >= kDecodeRows)
+      if (laneResult.accepted >= laneResult.verifyRows || laneResult.accepted > laneResult.retained)
         throw std::runtime_error(
             "target accepted more than the draft proposed");
-      // The retained target tokens end with the next anchor. A non-finite
-      // target row can also accept a sentinel draft proposal as an interior
-      // token, so every retained token is checked.
-      const uint32_t *targetTokens = contents<uint32_t>(
-          d(DecodeTensor::OutputTokens), "target output tokens");
-      laneResult.failure =
-          invalidSelection({targetTokens, laneResult.retained}, lane);
+      // The retained target tokens, from the lane's first row, end with the
+      // next anchor. A non-finite target row can also accept a sentinel draft
+      // proposal as an interior token, so every retained token is checked.
+      laneResult.failure = invalidSelection({retainedTokens(laneResult), laneResult.retained}, laneResult.rows.first,
+                                            laneResult.retainedRows);
     }
     // A cycle whose every lane commits teaches the verify budget its lanes'
     // labels and its cost.
@@ -2541,15 +2586,37 @@ struct Runtime::Impl {
       commits = commits && lanes[lane].failure.empty() && unreadable[lane].empty();
     if (verifyBudget && commits) {
       std::array<VerifyBudget::Lane, kLaneCount> observed{};
+      const auto *treeTokens =
+          contents<uint32_t>(decodeArena->batchSlice(DecodeTensor::DraftTreeTokens, kLaneCount), "draft tree tokens");
+      const auto *trees = contents<ops::TreeRow>(decodeArena->batchSlice(DecodeTensor::DraftTrees, kLaneCount),
+                                                 "draft trees");
+      const auto *treeScores =
+          contents<float>(decodeArena->batchSlice(DecodeTensor::DraftTreeScores, kLaneCount), "draft tree scores");
       for (uint32_t lane = 0; lane < items.size(); ++lane) {
-        // A chain's row r + 1 holds its proposal at position r, whose draft
+        const DecodeLaneResult &laneResult = lanes[lane];
+        // The lane's tree is its draft's chain (kVerifyChildren), whose row
+        // r + 1 holds its proposal at position r, of which the draft
         // probability is the confidence there.
-        const float *scores = contents<float>(decodeArena->get(lane, DecodeTensor::TreeScores), "tree scores");
-        for (uint32_t position = 0; position < kDraftProposalTokens; ++position)
-          observed[lane].confidence[position] = scores[2 * (position + 1)];
-        observed[lane].verifyRows = lanes[lane].verifyRows;
-        observed[lane].accepted = lanes[lane].accepted;
-        observed[lane].labels = lanes[lane].endDrafts == 0;
+        const uint64_t tree = uint64_t{lane} * ExecutionLimits::targetVerifyRows;
+        const uint32_t size = std::min(
+            *contents<uint32_t>(decodeArena->get(lane, DecodeTensor::DraftTreeSizes), "draft tree size"),
+            ExecutionLimits::targetVerifyRows);
+        for (uint32_t position = 0; position + 1 < size && position < kDraftProposalTokens; ++position)
+          observed[lane].confidence[position] = treeScores[2 * (tree + position + 1)];
+        // Acceptance walks the lane's verify rows. A lane whose cap or a stop
+        // token cut its path tells nothing of the proposals past what it
+        // retained. Where it accepted every one and retained the target's
+        // token after them, that token also tells whether the target accepts
+        // the proposal after them.
+        const bool whole = laneResult.retained == laneResult.accepted + 1;
+        uint32_t accepted = laneResult.accepted;
+        const uint32_t next = laneResult.verifyRows;
+        if (whole && accepted + 1 == next && next < size && trees[tree + next].parent == next - 1 &&
+            treeTokens[tree + next] == retainedTokens(laneResult)[accepted])
+          ++accepted;
+        observed[lane].verifyRows = laneResult.verifyRows;
+        observed[lane].accepted = accepted;
+        observed[lane].labels = laneResult.endDrafts == 0 && whole;
       }
       verifyBudget->observe(std::span(observed).first(items.size()), constrained,
                             timing.wallSeconds * 1000.0);
@@ -2579,9 +2646,7 @@ struct Runtime::Impl {
                            .failure = std::move(laneResult.failure)});
         continue;
       }
-      const uint32_t *targetTokens =
-          contents<uint32_t>(decodeArena->get(lane, DecodeTensor::OutputTokens),
-                             "target output tokens");
+      const uint32_t *targetTokens = retainedTokens(laneResult);
       std::vector<uint32_t> output;
       output.reserve(laneResult.retained);
       output.push_back(laneResult.currentAnchor);
@@ -2602,7 +2667,9 @@ struct Runtime::Impl {
       entry.verifyMaskInFlight = false;
       // The end replaced the first proposals, which acceptance keeps as far
       // as the lane retains them; the draft proposed the others, and the
-      // speculation counts the ones the lane verified.
+      // speculation counts the ones the lane verified and the accepted ones
+      // before its last retained token, the next anchor (an accepted proposal
+      // only where the output limit or a stop token cut the path).
       const uint32_t accepted =
           std::min(laneResult.accepted, laneResult.retained - 1);
       const uint32_t verified = laneResult.verifyRows - 1;
@@ -2661,17 +2728,24 @@ struct Runtime::Impl {
           entries[lane] = &entry;
           if (!constrained(lane))
             continue;
-          // A constrained lane's block is a chain: its anchor, then its
-          // proposals in order.
-          const uint32_t *rows = contents<uint32_t>(impl_.decodeArena->get(lane, DecodeTensor::InputTokens),
-                                                    "constrained verify rows");
+          // A constrained lane's verify rows are a chain from its first row:
+          // its anchor, then its proposals in order.
+          const ops::LaneRows block = impl_.laneRows(lane);
+          const uint32_t verified =
+              *contents<uint32_t>(impl_.decodeArena->get(lane, DecodeTensor::VerifyRows), "verify rows");
+          if (!verified || verified > block.rows)
+            throw std::runtime_error("draft selector produced invalid verify rows");
+          const uint32_t *rows =
+              contents<uint32_t>(impl_.decodeArena->batchSlice(DecodeTensor::InputTokens, kLaneCount),
+                                 "constrained verify rows") +
+              block.first;
           entry.maskWords.clear();
           entry.verifyMaskInFlight = true;
 
           if (!abandoned_[lane]) {
             ModelMaskRequest request;
             request.requestId = entry.id;
-            request.simulationTokens.assign(rows, rows + kDecodeRows);
+            request.simulationTokens.assign(rows, rows + verified);
             requests_.push_back(std::move(request));
           }
         }
@@ -3153,7 +3227,7 @@ Runtime::prefillAsync(const BatchPlan &plan,
       if (nextLength == entry.promptTokens && !entry.replayingGeneration &&
           entry.scoreTokens.empty() && entry.constraint == ConstraintMode::None) {
         selected = impl->initialToken(lane);
-        if (std::string failure = impl->invalidSelection({&*selected, 1}, lane);
+        if (std::string failure = impl->invalidSelection({&*selected, 1}, kDecodeFirstRows[lane], 1);
             !failure.empty()) {
           // The chunk's state is not committed; the engine ends the
           // request.
@@ -3916,8 +3990,11 @@ std::vector<uint32_t> RuntimeInstrumentation::lastTableRows(const Runtime &runti
 
 std::span<const float> RuntimeInstrumentation::lastLogits(const Runtime &runtime, uint32_t lane) {
   const Runtime::Impl &impl = *runtime.impl_;
-  return {contents<float>(impl.decodeArena->get(lane, DecodeTensor::Logits), "logits"),
-          uint64_t{ExecutionLimits::targetVerifyRows} * impl.geometry.target.vocabularySize};
+  const ops::LaneRows rows = impl.laneRows(lane);
+  const uint64_t vocabulary = impl.geometry.target.vocabularySize;
+  return {contents<float>(impl.decodeArena->batchSlice(DecodeTensor::Logits, kLaneCount), "logits") +
+              rows.first * vocabulary,
+          rows.rows * vocabulary};
 }
 
 std::span<const uint16_t> RuntimeInstrumentation::lastCapturedRows(const Runtime &runtime, uint32_t chunk) {

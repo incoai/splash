@@ -226,6 +226,7 @@ decodeTensorBytes(const RuntimeGeometry &geometry,
   put(DecodeTensor::RetainedRows, sizeof(uint32_t));
   put(DecodeTensor::AcceptedCount, sizeof(uint32_t));
   put(DecodeTensor::VerifyRows, sizeof(uint32_t));
+  put(DecodeTensor::LaneLayout, sizeof(ops::LaneRows));
   // The draft's own rows: its block's, kDraftRows a lane.
   const uint64_t d = kDraftRows;
   put(DecodeTensor::DraftInputTokens, bytesFor<uint32_t>(d));
@@ -256,7 +257,12 @@ decodeTensorBytes(const RuntimeGeometry &geometry,
   put(DecodeTensor::TopPartialIds, selectorWorkspace.partialIdsBytes);
   put(DecodeTensor::TopPartialValues, selectorWorkspace.partialValuesBytes);
   put(DecodeTensor::TreeRows, bytesFor<ops::TreeRow>(r));
-  put(DecodeTensor::TreeScores, bytesFor<float>(2 * r));
+  // A lane's tree takes a verify block's rows.
+  const uint64_t v = ExecutionLimits::targetVerifyRows;
+  put(DecodeTensor::DraftTreeTokens, bytesFor<uint32_t>(v));
+  put(DecodeTensor::DraftTrees, bytesFor<ops::TreeRow>(v));
+  put(DecodeTensor::DraftTreeScores, bytesFor<float>(2 * v));
+  put(DecodeTensor::DraftTreeSizes, sizeof(uint32_t));
   put(DecodeTensor::ChainTokens, bytesFor<uint32_t>(SPLASH_TREE_CHAIN_TOKENS));
   put(DecodeTensor::ChainRates, bytesFor<float>(uint64_t{SPLASH_TREE_CHAIN_TOKENS} * SPLASH_TREE_AGREEMENTS));
   put(DecodeTensor::PageTable, bytesFor<SplashKvPage>(kMaximumPageTableEntries));

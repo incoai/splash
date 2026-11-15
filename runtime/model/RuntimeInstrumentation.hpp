@@ -20,10 +20,11 @@ public:
   // verify rows, each row's heads' in order (Qwen3.8-Flash-Next), until the
   // next decode step; none for a target without them.
   [[nodiscard]] static std::vector<uint32_t> lastTableRows(const Runtime &runtime, uint32_t lane);
-  // The fp32 logits the last command left in batch lane `lane`'s rows, each
-  // the target's vocabulary wide, until the next command: a decode step's
-  // verify rows, or in row 0 the final position of the prefill chunk that
-  // ended a prompt.
+  // The fp32 logits the last command that selected left in batch lane
+  // `lane`'s rows, each the target's vocabulary wide, until the next command:
+  // a decode step's rows as its selector laid them out (its verify rows
+  // first), or the row of the final position of the prefill chunk that ended
+  // a prompt.
   [[nodiscard]] static std::span<const float> lastLogits(const Runtime &runtime, uint32_t lane);
   // The target rows the last prefill command captured for the draft in its
   // chunk `chunk`'s buffer, until the next prefill: bf16 rows of the output
@@ -31,8 +32,9 @@ public:
   // values each, in their order), the captured rows in the order the draft's
   // context plan captured them (a cold prompt's first command: its rows).
   [[nodiscard]] static std::span<const uint16_t> lastCapturedRows(const Runtime &runtime, uint32_t chunk);
-  // The rows of its block batch lane `lane` of the last decode step verified
-  // (ops::DraftSelector::addVerifyRows), until the next decode step.
+  // The rows batch lane `lane` of the last decode step verified
+  // (ops::DraftSelector::addVerifyRows), until the next command that
+  // selects.
   [[nodiscard]] static uint32_t lastVerifyRows(const Runtime &runtime, uint32_t lane);
   // While capturing, each command that selects first tokens or verifies
   // copies the rows lastLogits returns, as the target's forward wrote them

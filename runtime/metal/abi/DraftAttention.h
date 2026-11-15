@@ -77,19 +77,16 @@ static_assert(sizeof(DraftContextParams) == 8,
               "Draft context prefill parameters are 8 bytes on both sides");
 
 // The context commit of each lane's retained rows (the mask acceptance
-// writes, AcceptBatchParams), at most its verify block's rows[l]: the context
-// rows among the block's target rows from row first_row[l], the path's i-th
-// at position start_position[l] + i, rotated by the lane's RoPE row i (a
-// lane's RoPE rows are its verify block's positions, SPLASH_TARGET_VERIFY_ROWS
-// a lane).
+// writes, AcceptBatchParams) of its lane rows (SplashLaneRows): the context
+// rows among the block's target rows, the path's i-th at position
+// start_position[l] + i, rotated by the lane's RoPE row i (a lane's RoPE rows
+// are its verify block's positions, SPLASH_TARGET_VERIFY_ROWS a lane).
 struct DraftContextBatchParams {
   uint32_t start_position[SPLASH_MAXIMUM_BATCH_WIDTH];
-  uint32_t first_row[SPLASH_MAXIMUM_BATCH_WIDTH];
-  uint32_t rows[SPLASH_MAXIMUM_BATCH_WIDTH];
 };
 
-static_assert(sizeof(DraftContextBatchParams) == 48,
-              "Draft context commit parameters are 48 bytes on both sides");
+static_assert(sizeof(DraftContextBatchParams) == 16,
+              "Draft context commit parameters are 16 bytes on both sides");
 
 // A context window holds, per ring slot, the draft's context row, from which
 // every layer's ring keys and values are computed: 4-bit codes over groups of
