@@ -34,6 +34,9 @@
 // volume fails it: the slot file's pwrite is this one in the test binary,
 // which otherwise passes the call on.
 static std::atomic<int> failingWrites{0};
+// One metadata-only fault sequence: EINTR; partial then ENOSPC; or zero.
+static std::atomic<int> metadataFault{0};
+static std::atomic<int> payloadFault{0};
 
 extern "C" ssize_t pwrite(int descriptor, const void *data, size_t bytes, off_t offset) {
   if (const int error = failingWrites.load()) {
@@ -42,6 +45,25 @@ extern "C" ssize_t pwrite(int descriptor, const void *data, size_t bytes, off_t 
   }
   using Write = ssize_t (*)(int, const void *, size_t, off_t);
   static const auto next = reinterpret_cast<Write>(::dlsym(RTLD_NEXT, "pwrite"));
+  if (const int mode = payloadFault.exchange(0)) {
+    if (mode == 1) { errno = EINTR; return -1; }
+    if (mode == 2) { payloadFault.store(3); return next(descriptor, data, bytes / 2, offset); }
+    if (mode == 3) { errno = ENOSPC; return -1; }
+    if (mode == 4) return 0;
+  }
+  if (metadataFault.load()) {
+    char path[4096]{};
+    const int saved = errno;
+    const bool record = ::fcntl(descriptor, F_GETPATH, path) == 0 && std::string_view(path).ends_with("records");
+    errno = saved;
+    if (record) {
+      const int mode = metadataFault.exchange(0);
+      if (mode == 1) { errno = EINTR; return -1; }
+      if (mode == 2) { metadataFault.store(3); return next(descriptor, data, bytes / 2, offset); }
+      if (mode == 3) { errno = ENOSPC; return -1; }
+      if (mode == 4) return 0;
+    }
+  }
   return next(descriptor, data, bytes, offset);
 }
 
@@ -235,7 +257,8 @@ static void testAlignedRunsMoveDirectly() {
 // A queued direct write cancelled behind a parked worker fails and leaves its slot unreadable.
 static void testCancelledDirectWrite() {
   constexpr size_t size = 3 << 20;
-  SlotFile file(size, std::make_shared<DiskBudget>(size));
+  auto budget = std::make_shared<DiskBudget>(size);
+  SlotFile file(size, budget);
   auto slot = file.acquire();
   std::vector<std::byte> memory;
   const auto source = placeSpans(memory, {{size, true}}).front();
@@ -245,10 +268,11 @@ static void testCancelledDirectWrite() {
   std::vector<std::byte> output(size);
   auto hold = file.read(slot, {output}, [&] { reached.set_value(); released.wait(); });
   reached.get_future().wait();
-  auto cancelled = file.write(slot, {source}, {});
+  auto cancelled = file.write(slot, {source}, {}, splash::model::PayloadWriteKind::Persist);
   cancelled->cancel();
   release.set_value();
   require(hold->wait() && !cancelled->wait(), "a cancelled write of aligned runs succeeded");
+  require(budget->ioSnapshot().payloadWrites[1] == 0, "cancelled queued payload was counted");
   require(file.writable() && !file.read(slot, {output}, {})->wait(),
           "a cancelled write of aligned runs left its slot readable or closed the file");
 }
@@ -1044,8 +1068,225 @@ static void testSlotsKeepNoReaders() {
   owner.join();
 }
 
+// Metadata counts actual syscall traffic without consuming payload credit.
+static void testSharedMetadataCounters() {
+  constexpr size_t size = kHostPageBytes;
+  Directory one, two;
+  auto budget = std::make_shared<DiskBudget>(size * 4);
+  SlotFile first(size, budget, one.persistence()), second(size, budget, two.persistence());
+  first.finishAdoption();second.finishAdoption();
+  auto a = first.acquire(), b = second.acquire();
+  const std::vector<std::byte> payload(size, std::byte{5});
+  require(first.write(a, {payload}, {})->wait() && second.write(b, {payload}, {})->wait(),
+          "shared metadata fixture payload failed");
+  for (int i = 0; i < 10; ++i) { first.label(a, labelOf(1));second.label(b, labelOf(2)); }
+  require(first.synchronize({})->wait() && second.synchronize({})->wait(), "shared label workers did not drain");
+  const auto counts = budget->metadataWrites()[1];
+  require(counts.calls == 20 && counts.bytes == 1280 && counts.errors == 0 &&
+              budget->writtenBytes() == size * 2,
+          "shared metadata workers lost counts or contaminated payload accounting");
+  first.seal();second.seal();
+}
+
+// Constructor failures still report accepted metadata bytes, but never charge
+// payload credit or pretend that later metadata categories ran.
+static void testFailedMetadataHeaderAccounting() {
+  for (const int fault : {2, 4}) {
+    Directory directory;
+    auto budget = std::make_shared<DiskBudget>(4 * kHostPageBytes);
+    metadataFault.store(fault);
+    bool failed = false;
+    try { SlotFile file(kHostPageBytes, budget, directory.persistence()); }
+    catch (const std::system_error &error) {
+      failed = true;
+      require(error.code().value() == (fault == 2 ? ENOSPC : EIO), "metadata profiling changed errno");
+    }
+    require(failed && metadataFault.load() == 0, "header fault was not exercised");
+    const auto counts = budget->metadataWrites();
+    require(counts[0].bytes == sizeOf(directory.records()) &&
+                counts[0].calls == (fault == 2 ? 2u : 1u) && counts[0].errors == 1 &&
+                counts[1].calls == 0 && counts[2].calls == 0 && budget->writtenBytes() == 0 &&
+                !budget->writesStopped(),
+            "failed header was miscounted or changed the payload admission policy");
+  }
+}
+
+// Adoption clears gaps below the last adopted index as record IO, not payload
+// IO. The adopted slot's later release is a separate, single clearing write.
+static void testAdoptionMetadataClearing() {
+  Directory directory;
+  constexpr size_t size = kHostPageBytes;
+  const auto persistence = directory.persistence();
+  const std::vector<std::byte> payload(size, std::byte{9});
+  {
+    SlotFile file(size, std::make_shared<DiskBudget>(4 * size), persistence);
+    file.finishAdoption();
+    std::vector<std::shared_ptr<SlotFile::Slot>> kept;
+    for (uint64_t n = 0; n < 3; ++n) {
+      kept.push_back(file.acquire());
+      require(file.write(kept.back(), {payload}, {})->wait(), "adoption metadata fixture write failed");
+      file.label(kept.back(), labelOf(n));
+    }
+    require(file.synchronize({})->wait(), "adoption metadata fixture did not drain");
+    file.seal();
+  }
+  auto budget = std::make_shared<DiskBudget>(4 * size);
+  SlotFile file(size, budget, persistence);
+  require(file.records().size() == 3, "adoption metadata fixture did not recover records");
+  auto last = file.adopt(file.records().back());
+  file.finishAdoption();
+  auto counts = budget->metadataWrites();
+  require(counts[0].calls == 0 && counts[1].calls == 0 && counts[2].bytes == 128 &&
+              counts[2].calls == 1 && counts[2].errors == 0 && budget->writtenBytes() == 0,
+          "adoption gap clearing was missing or counted as payload");
+  std::vector<std::byte> restored(size);
+  require(file.read(last, {restored}, {})->wait() && restored == payload, "adoption clearing damaged retained data");
+  last.reset();
+  require(file.synchronize({})->wait(), "adopted slot release did not drain");
+  counts = budget->metadataWrites();
+  require(counts[2].bytes == 192 && counts[2].calls == 2 && budget->writtenBytes() == 0,
+          "adopted slot clearing was lost or counted twice");
+  file.seal();
+}
+
+static void testMetadataWriteAccounting() {
+  constexpr size_t size = kHostPageBytes;
+  Directory directory;
+  auto persistence = directory.persistence();
+  persistence.labelBytes = 24;
+  auto budget = std::make_shared<DiskBudget>(size * 4, [] { return 0.0; });
+  budget->setWriteBudget(size * 16);
+  const std::vector<std::byte> payload(size, std::byte{7}), label(24, std::byte{2});
+  {
+    SlotFile file(size, budget, persistence);
+    file.finishAdoption();
+    require(budget->metadataWrites()[0].bytes > 0 && budget->writtenBytes() == 0,
+            "record header was missing or charged as payload");
+    auto slot = file.acquire();
+    require(file.write(slot, {payload}, {})->wait(), "metadata fixture payload failed");
+    const auto credit = budget->writeBudgetBytes();
+    for (int n = 0; n < 10; ++n) file.label(slot, label);
+    require(file.synchronize({})->wait(), "metadata fixture did not drain");
+    auto counts = budget->metadataWrites()[1];
+    require(counts.bytes == 640 && counts.calls == 10 && counts.errors == 0 &&
+                budget->writtenBytes() == size && budget->writeBudgetBytes() == credit,
+            "duplicate labels were suppressed, miscounted or changed write admission");
+    for (const int fault : {1, 2, 4}) {
+      counts = budget->metadataWrites()[1];
+      metadataFault.store(fault);
+      file.label(slot, label);
+      require(file.synchronize({})->wait(), "faulted metadata queue did not drain");
+      const auto after = budget->metadataWrites()[1];
+      require(after.bytes - counts.bytes == (fault == 1 ? 64u : fault == 2 ? 32u : 0u) &&
+                  after.calls - counts.calls == (fault == 4 ? 1u : 2u) && after.errors - counts.errors == 1,
+              "metadata retry/partial/zero-byte IO was miscounted");
+    }
+    file.label(slot, label);
+    require(file.synchronize({})->wait() && file.writable(), "metadata retry changed file admission");
+    slot.reset();
+    require(file.synchronize({})->wait(), "slot clearing did not drain");
+    require(budget->metadataWrites()[2].bytes == 64 && budget->metadataWrites()[2].calls == 1,
+            "slot record clear was not counted separately");
+    auto reused = file.acquire();
+    require(file.write(reused, {payload}, {})->wait(), "reused slot write failed");
+    file.label(reused, label);
+    require(file.synchronize({})->wait(), "reused slot label failed");
+    file.seal();
+  }
+  auto nextBudget = std::make_shared<DiskBudget>(size * 4);
+  SlotFile next(size, nextBudget, persistence);
+  require(next.records().size() == 1 && next.records()[0].label == label &&
+              nextBudget->metadataWrites()[0].calls == 0 && nextBudget->metadataWrites()[1].calls == 0,
+          "adoption rewrote records or inherited process counters");
+  auto adopted = next.adopt(next.records()[0]);next.finishAdoption();
+  std::vector<std::byte> output(size);
+  require(next.read(adopted, {output}, {})->wait() && output == payload, "metadata profiling changed recovery");
+  next.label(adopted, label);
+  require(next.synchronize({})->wait() && nextBudget->metadataWrites()[1].bytes == 64 &&
+              nextBudget->writtenBytes() == 0, "adopted labels were suppressed or mixed with payload");
+  next.seal();
+}
+
+static void testPayloadOriginEdges() {
+  using Kind = splash::model::PayloadWriteKind;
+  constexpr size_t size = kHostPageBytes;
+  double now = 0;
+  auto budget = std::make_shared<DiskBudget>(2 * size, [&] { return now; });
+  budget->setWriteBudget(16 * size);
+  SlotFile first(size, budget), second(size, budget);
+  auto a = first.acquire(), b = second.acquire();
+  const auto credit = budget->writeBudgetBytes();
+  require(first.write(a, {}, {}, Kind::Persist)->wait(), "empty payload failed");
+  require(budget->writtenBytes() == 0 && budget->writeBudgetBytes() == credit,
+          "empty payload changed counters or credit");
+  const std::vector<std::byte> bytes(size, std::byte{8});
+  auto one = first.write(a, {bytes}, {}, Kind::Persist);
+  auto two = second.write(b, {bytes}, {}, Kind::Reclaim);
+  require(one->wait() && two->wait(), "parallel slot files failed");
+  const auto counts = budget->ioSnapshot();
+  require(counts.payloadWrites[1] == size && counts.payloadWrites[2] == size &&
+              counts.writtenBytes == 2 * size && budget->writeBudgetBytes() == credit - static_cast<int64_t>(2 * size),
+          "parallel origins changed byte accounting or submission credit");
+  auto fresh = std::make_shared<DiskBudget>(size);
+  require(fresh->writtenBytes() == 0 && fresh->ioSnapshot().payloadWrites == splash::model::PayloadWrites{},
+          "new native resource retained old origin counters");
+  SlotFile closed(size, fresh);
+  auto slot = closed.acquire();
+  payloadFault.store(4);
+  require(!closed.write(slot, {bytes}, {}, Kind::Spill)->wait(), "zero write succeeded");
+  const auto before = fresh->ioSnapshot().payloadWrites;
+  require(!closed.write(slot, {bytes}, {}, Kind::Persist) && fresh->ioSnapshot().payloadWrites == before,
+          "refused write changed accepted-byte counters");
+}
+
+static void testPayloadWriteOrigins() {
+  using Kind = splash::model::PayloadWriteKind;
+  constexpr size_t page = kHostPageBytes;
+  const std::vector<std::byte> source(page + 1, std::byte{9});
+  auto budget = std::make_shared<DiskBudget>(4 * page);
+  SlotFile first(2 * page, budget), second(2 * page, budget);
+  auto a = first.acquire(), b = second.acquire();
+  for (size_t i = 0; i < 5; ++i) {
+    auto &file = i % 2 ? first : second;
+    auto slot = i % 2 ? a : b;
+    auto op = i == 0 ? file.write(slot, {source}, {})
+                     : file.write(slot, {source}, {}, static_cast<Kind>(i));
+    require(op && op->wait(), "classified write failed");
+    auto counts = budget->ioSnapshot();
+    require(counts.payloadWrites[i] == 2 * page && counts.writtenBytes == (i + 1) * 2 * page,
+            "write origin lost padding or shared-file bytes");
+  }
+  std::vector<std::byte> output(source.size());
+  require(first.read(a, {output}, {})->wait() && output == source, "classified payload changed");
+  uint64_t sum = 0;
+  for (auto bytes : budget->ioSnapshot().payloadWrites) sum += bytes;
+  require(sum == budget->writtenBytes(), "classified bytes did not partition payload writes");
+  rejects([&] { static_cast<void>(first.write(a, {source}, {}, static_cast<Kind>(255))); },
+          "unknown payload write origin", "invalid payload kind accepted");
+  for (int fault : {1, 2, 4}) {
+    auto partial = std::make_shared<DiskBudget>(2 * page);
+    SlotFile file(2 * page, partial);
+    auto slot = file.acquire();
+    const std::vector<std::byte> input(2 * page, std::byte{7});
+    payloadFault.store(fault);
+    const bool ok = file.write(slot, {input}, {}, Kind::Spill)->wait();
+    require(ok == (fault == 1), "payload fault outcome changed");
+    const auto counts = partial->ioSnapshot();
+    const uint64_t expected = fault == 1 ? 2 * page : fault == 2 ? page : 0;
+    require(counts.payloadWrites[3] == expected && counts.writtenBytes == expected,
+            "retry, partial failure or zero write origin was miscounted");
+    require(partial->ioSnapshot().metadataWrites[0].bytes == 0, "payload counted as metadata");
+  }
+}
+
 int main() {
   try {
+    testPayloadOriginEdges();
+    testPayloadWriteOrigins();
+    testFailedMetadataHeaderAccounting();
+    testAdoptionMetadataClearing();
+    testMetadataWriteAccounting();
+    testSharedMetadataCounters();
     testFailedWriteStopsWriting();
     testScatteredSpans();
     testAlignedRunsMoveDirectly();

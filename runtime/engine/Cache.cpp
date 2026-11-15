@@ -2742,6 +2742,7 @@ bool Cache::freeDiskSpace(bool inUse, bool active) {
   if (!next)
     return false;
   const uint64_t id = next->at.id;
+  ++kvTier_.diskReplacements[static_cast<size_t>(next->kind)];
   switch (next->kind) {
   case DiskVictim::KvCopy:
     // The copy of a block whose page holds its K/V is redundant; in a
@@ -3103,6 +3104,7 @@ bool Cache::holdsOrdinaryState(uint64_t block) const {
 
 CacheSnapshot Cache::snapshot() const {
   KvTierSnapshot tier = kvTier_;
+  tier.copyRecreationStarts = kv_.rewrites();
   tier.pendingPages = pendingPages(kv::PageForm::Full);
   tier.diskBlocks = kv_.diskBlocks();
   if (diskBudget_) {
@@ -3116,9 +3118,7 @@ CacheSnapshot Cache::snapshot() const {
                                                      : DiskWritesGate::No;
     tier.writeBudgetBytes =
         static_cast<uint64_t>(std::max<int64_t>(0, diskBudget_->writeBudgetBytes()));
-    tier.writesDeferredMicroseconds = diskBudget_->writesDeferredMicroseconds();
-    tier.readBytes = diskBudget_->readBytes();
-    tier.writtenBytes = diskBudget_->writtenBytes();
+    static_cast<model::DiskIoSnapshot &>(tier) = diskBudget_->ioSnapshot();
   }
   if (tier_)
     tier.diskBytes = uint64_t{tier.diskBlocks} * tier_->slotBytes();

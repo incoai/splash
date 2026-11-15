@@ -96,6 +96,7 @@ struct StateCacheSnapshot {
   uint64_t checkpointRetirements = 0;
   // Evictions by a reclaim; rolling retirements are counted separately.
   uint64_t checkpointEvictions = 0;
+  uint64_t diskCopyDrops = 0, diskCopyRecreationStarts = 0, diskCopyRecreations = 0;
 };
 
 struct StateEviction final {
@@ -307,7 +308,7 @@ public:
   [[nodiscard]] bool promotable(uint64_t kvBlock, const CompositeState *source) const noexcept;
   void promote(uint64_t kvBlock, const CompositeState *source,
                std::shared_ptr<const CompositeState> state);
-  void promotionSkipped() noexcept { ++promotionsSkipped_; }
+  void promotionSkipped() noexcept { ++counters_.promotionsSkipped; }
   // The one state write is in flight; its RAM or quota returns when it lands.
   [[nodiscard]] bool writing() const noexcept { return pending_.has_value(); }
   // The bytes of the RAM copy a write ahead of need reads (persist), which a
@@ -329,6 +330,7 @@ private:
     uint64_t lastUsed = 0;
     bool checkpoint = false;
     bool invalid = false;
+    bool diskCopyDropped = false;
     uint64_t publication = 0;
     RecencyOrder::Node ramNode;
     RecencyOrder::Node diskNode;
@@ -426,22 +428,9 @@ private:
   // Unfinished requests per block they resume from. A block may leave
   // before its last user; its ID is never reused.
   std::unordered_map<uint64_t, uint32_t> uses_;
-  uint64_t inUseEvictions_ = 0;
-  uint64_t promotions_ = 0;
-  uint64_t promotionsSkipped_ = 0;
-  uint64_t bytes_ = 0;
-  uint64_t diskBytes_ = 0;
-  uint32_t pinnedEntries_ = 0;
-  uint64_t publications_ = 0;
   mutable uint64_t reclaimVisits_ = 0;
-  uint64_t evictions_ = 0;
+  StateCacheSnapshot counters_;
   uint64_t checkpointEntries_ = 0;
-  uint64_t checkpointBytes_ = 0;
-  uint64_t checkpointRetirements_ = 0;
-  uint64_t checkpointEvictions_ = 0;
-  uint64_t offloads_ = 0;
-  uint64_t offloadFailures_ = 0;
-  uint64_t invalidations_ = 0;
   // Destroyed before entries_: the ticket's disk copy may still be an entry.
   std::optional<PendingOffload> pending_;
 };

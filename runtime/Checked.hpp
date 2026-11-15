@@ -39,6 +39,12 @@ namespace splash {
   return left > right ? left - right : 0;
 }
 
+// A telemetry count narrowed without wrapping.
+[[nodiscard]] constexpr uint32_t boundedCount(uint64_t value) noexcept {
+  constexpr auto limit = std::numeric_limits<uint32_t>::max();
+  return value > limit ? limit : static_cast<uint32_t>(value);
+}
+
 // The sum, or an Error "<what> overflows".
 template <class Error = std::overflow_error>
 [[nodiscard]] uint64_t checkedAdd(uint64_t left, uint64_t right,

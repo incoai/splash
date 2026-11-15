@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <array>
 #include <chrono>
 #include <condition_variable>
 #include <cstddef>
@@ -17,8 +18,28 @@
 #include <span>
 #include <thread>
 #include <vector>
+#include <sys/types.h>
 
 namespace splash::model {
+
+// Actual record-file pwrite calls, separate from payload IO and its admission
+// budget. Errors include EINTR retries and zero-byte writes; bytes count partial
+// successes too. Snapshots of concurrent workers are not transactional.
+enum class MetadataWriteKind : uint8_t { Header, Label, Clear };
+struct MetadataWriteSnapshot final {
+  uint64_t bytes = 0, calls = 0, errors = 0;
+};
+using MetadataWrites = std::array<MetadataWriteSnapshot, 3>;
+
+// Submission origin, not admission priority: persistence also runs at clean
+// shutdown. Checkpoint captures and unknown callers stay explicit.
+enum class PayloadWriteKind : uint8_t { Unclassified, Persist, Reclaim, Spill, Checkpoint };
+using PayloadWrites = std::array<uint64_t, 5>;
+struct DiskIoSnapshot {
+  uint64_t writesDeferredMicroseconds = 0, readBytes = 0, writtenBytes = 0;
+  MetadataWrites metadataWrites{};
+  PayloadWrites payloadWrites{};
+};
 
 // The disk one cache tier may use, shared by every slot file of the tier.
 // Reservations and releases come from the engine thread and from whoever
@@ -41,7 +62,7 @@ namespace splash::model {
 //
 // A write budget that spares the drive is the user's to set (setWriteBudget,
 // --max-cache-disk-writes); without one, the default, every write passes and
-// nothing is held back. With one, every write a file of the tier submits
+// nothing is held back. With one, every payload write a file of the tier submits
 // draws on it: a token bucket of this process, counted at submission in the
 // host pages each write stores, which each start begins full. The budget then
 // decides which states are written: while it is spent, an evicted state is
@@ -202,13 +223,27 @@ public:
   [[nodiscard]] bool writesStopped() const noexcept {
     return stopped_.load(std::memory_order_relaxed);
   }
-  // Cumulative bytes accepted by file IO, including partial/cancelled work.
+  // Cumulative payload bytes accepted by file IO, including partial/cancelled work.
   // This is application IO, not physical SSD traffic or filesystem overhead.
   [[nodiscard]] uint64_t readBytes() const noexcept {
     return read_.load(std::memory_order_relaxed);
   }
   [[nodiscard]] uint64_t writtenBytes() const noexcept {
     return written_.load(std::memory_order_relaxed);
+  }
+  [[nodiscard]] MetadataWrites metadataWrites() const noexcept {
+    MetadataWrites out;
+    for (size_t i = 0; i < out.size(); ++i)
+      out[i] = {metadata_[i].bytes.load(std::memory_order_relaxed),
+                metadata_[i].calls.load(std::memory_order_relaxed),
+                metadata_[i].errors.load(std::memory_order_relaxed)};
+    return out;
+  }
+  [[nodiscard]] DiskIoSnapshot ioSnapshot() const noexcept {
+    DiskIoSnapshot out{writesDeferredMicroseconds(), readBytes(), writtenBytes(), metadataWrites(), {}};
+    for (size_t i = 0; i < out.payloadWrites.size(); ++i)
+      out.payloadWrites[i] = payload_[i].load(std::memory_order_relaxed);
+    return out;
   }
   // Bytes the budget's files hold on disk, counting each slot written since
   // its blocks last went back as a whole slot, though a shorter payload
@@ -239,6 +274,16 @@ private:
     balanceTime_ = now;
   }
 
+  struct MetadataCounter final {
+    std::atomic<uint64_t> bytes{0}, calls{0}, errors{0};
+    void record(ssize_t count) noexcept {
+      calls.fetch_add(1, std::memory_order_relaxed);
+      if (count > 0) bytes.fetch_add(static_cast<uint64_t>(count), std::memory_order_relaxed);
+      else errors.fetch_add(1, std::memory_order_relaxed);
+    }
+  };
+  std::array<MetadataCounter, 3> metadata_;
+  std::array<std::atomic<uint64_t>, 5> payload_{};
   uint64_t capacity_;
   std::atomic<uint64_t> limit_;
   std::atomic<uint64_t> activeLimit_;
@@ -458,7 +503,7 @@ public:
   // it null.
   [[nodiscard]] std::shared_ptr<Operation> write(
       std::shared_ptr<Slot> slot, std::vector<std::span<const std::byte>> source,
-      std::function<void()> completion);
+      std::function<void()> completion, PayloadWriteKind kind = PayloadWriteKind::Unclassified);
   [[nodiscard]] std::shared_ptr<Operation> read(
       std::shared_ptr<Slot> slot, std::vector<std::span<std::byte>> destination,
       std::function<void()> completion);
