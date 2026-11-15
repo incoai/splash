@@ -263,7 +263,7 @@ uint32_t Engine::nextCommandPages(const Request &active) const {
   const uint64_t end =
       scheduler_.phase(id) == Phase::Prefill
           ? std::min<uint64_t>(scheduler_.promptProcessed(id) + model_.commandLimits().commandRows, active.promptTokens)
-          : active.exactTokens.size() + model::ExecutionLimits::decodeLaneRows;
+          : active.exactTokens.size() + model::ExecutionLimits::targetVerifyRows;
   return static_cast<uint32_t>((end + KvCache::pageTokens - 1) / KvCache::pageTokens);
 }
 
@@ -313,8 +313,8 @@ Engine::InMemory Engine::inMemory(const Request &active, const ClaimSpec &spec) 
     return {.admission = SpillAdmission::Waiting};
   // Alone, the KV memory holds bounds its output where it holds a token past
   // the prompt and the rows past it that the decode step verifies
-  // (workEndOf): a lane of T tokens takes the KV of T + 7 at its last step.
-  const uint64_t rows = model::ExecutionLimits::decodeLaneRows - 1;
+  // (workEndOf): a lane of T tokens takes the KV of T + 15 at its last step.
+  const uint64_t rows = model::ExecutionLimits::targetVerifyRows - 1;
   if (room.heldTokens > active.exactTokens.size() + rows)
     return {.admission = SpillAdmission::Resident, .tokens = room.heldTokens - rows};
   return {.room = residentRoom(active, spec, active.exactTokens.size() + rows + 1)};
@@ -790,13 +790,13 @@ void Engine::reserveReplyCapture(Request &active, std::vector<StateCapture> &sta
                                  std::vector<LaneCapture> &captures, bool supersedes) {
   if (!model_.capturesInDecode())
     return;
-  // A cycle retains rows from the tokens the lane holds on, its lane's rows
-  // at most and none past its output limit: one reserved for a page they
+  // A cycle retains rows from the tokens the lane holds on, a verify block's
+  // most at most and none past its output limit: one reserved for a page they
   // cannot reach would hold a state's buffers, 153 MiB for 27B, for nothing.
   const auto held = static_cast<uint32_t>(active.exactTokens.size());
   const uint32_t page = (held / KvCache::pageTokens + 1) * KvCache::pageTokens;
   const uint32_t output = active.outputLimit - (held - active.promptTokens);
-  if (page - held > std::min(model::ExecutionLimits::decodeLaneRows, output))
+  if (page - held > std::min(model::ExecutionLimits::targetVerifyRows, output))
     return;
   std::shared_ptr<StateReservation> buffers;
   static_cast<void>(allocate(

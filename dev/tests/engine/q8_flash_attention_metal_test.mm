@@ -102,7 +102,7 @@ uint32_t laneSplits(uint32_t history) {
 
 void testContract() {
   ChunkedPrefillParams finalCycle{
-      splash::kv::kMaximumLogicalTokens - 1, kRows, kStride,
+      splash::kv::kMaximumLogicalTokens - 1, SPLASH_TARGET_VERIFY_ROWS, kStride,
       (splash::kv::kMaximumPhysicalTokens + kPageTokens - 1) / kPageTokens};
   require(chunkedPrefillValidationError(finalCycle).empty(),
           "the final cycle's verification rows exceeded physical KV scratch");
@@ -110,7 +110,7 @@ void testContract() {
           "a lane's split scaling departed from one split per 16 visible pages");
   ++finalCycle.committed_tokens;
   require(chunkedPrefillValidationError(finalCycle) == "context_out_of_range",
-          "physical KV scratch exceeded its fixed seven-row allowance");
+          "physical KV scratch exceeded its fixed fifteen-row allowance");
 }
 
 id<MTLBuffer> makeBuffer(id<MTLDevice> device, uint64_t bytes) {

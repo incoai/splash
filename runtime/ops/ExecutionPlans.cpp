@@ -1,28 +1,11 @@
 #include "ops/ExecutionPlans.hpp"
 
 #include "metal/abi/Gguf.h"
-#include "ops/LaneRows.hpp"
 
 #include <algorithm>
 #include <utility>
 
 namespace splash::ops {
-namespace {
-
-constexpr uint32_t kMaximumLanes = SPLASH_MAXIMUM_BATCH_WIDTH;
-
-template <typename Workspace, size_t N>
-void include(Workspace &bound, const Workspace &required,
-             const std::array<uint64_t Workspace::*, N> &fields,
-             uint32_t lanes = 1) {
-  for (auto field : fields) {
-    const uint64_t bytes = required.*field;
-    bound.*field = std::max(bound.*field,
-                           bytes / lanes + uint64_t{bytes % lanes != 0});
-  }
-}
-
-} // namespace
 
 ExecutionPlans::ExecutionPlans(const DeviceCapabilities &device, Int8Activations int8Activations)
     : linear_(device, int8Activations), draftLinear_(device, Int8Activations::Off) {}
@@ -82,26 +65,20 @@ DraftAttentionWorkspace ExecutionPlans::draftAttentionWorkspacePerLane(
   return DraftAttention::plan(shape, 1).workspace();
 }
 
-MoeWorkspace ExecutionPlans::moePrefillWorkspace(MoeShape shape, uint32_t routerFormat,
-                                                 uint32_t maximumRows) const {
+MoeWorkspace ExecutionPlans::moeWorkspace(MoeShape shape, uint32_t routerFormat, uint32_t maximumRows) const {
   // Validate the bound before iterating; every row is included even if a
   // future grouped layout's largest field is not monotone in row count.
-  auto bound = moe(shape, routerFormat, maximumRows).workspace();
-  for (uint32_t rows = 1; rows <= maximumRows; ++rows)
-    include(bound, moe(shape, routerFormat, rows).workspace(), kMoeWorkspaceFields);
+  MoeWorkspace bound = moe(shape, routerFormat, maximumRows).workspace();
+  for (uint32_t rows = 1; rows <= maximumRows; ++rows) {
+    const MoeWorkspace required = moe(shape, routerFormat, rows).workspace();
+    for (const auto field : kMoeWorkspaceFields) bound.*field = std::max(bound.*field, required.*field);
+  }
   return bound;
 }
 
-MoeWorkspace ExecutionPlans::moeDecodeWorkspacePerLane(MoeShape shape, uint32_t routerFormat) const {
-  MoeWorkspace bound;
-  for (uint32_t lanes = 1; lanes <= kMaximumLanes; ++lanes)
-    include(bound, moe(shape, routerFormat, lanes * kDecodeLaneRows).workspace(), kMoeWorkspaceFields, lanes);
-  return bound;
-}
-
-uint64_t ExecutionPlans::gateUpWorkspace(ProjectionShape shape) const {
+uint64_t ExecutionPlans::gateUpWorkspace(ProjectionShape shape, uint32_t maximumRows) const {
   uint64_t bound = 0;
-  for (uint32_t rows = 1; rows <= kMaximumDecodeTileRows; ++rows) {
+  for (uint32_t rows = 1; rows <= maximumRows; ++rows) {
     const LinearWorkload workload{{shape.outputSize, shape.inputSize}, rows, LinearEpilogue::GateUp};
     bound = std::max(bound, linear_.plan(workload).gateScratchBytes());
   }

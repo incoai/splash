@@ -309,7 +309,8 @@ void projections(Golden &golden, const std::string &name, const ExecutionPlans &
           });
         line += " decode " + attempt([&] { return describe(linear.scratchSize(shape, kMaximumDecodeTileRows)); });
         line += " prefill " + attempt([&] { return describe(linear.scratchSize(shape, SPLASH_PREFILL_TOKEN_BUDGET)); });
-        line += " gate-up " + attempt([&] { return std::to_string(plans.gateUpWorkspace(shape)); });
+        line += " gate-up " +
+                attempt([&] { return std::to_string(plans.gateUpWorkspace(shape, kMaximumDecodeTileRows)); });
         shapes.add(line);
       }
     }
@@ -431,10 +432,8 @@ void moePlans(Golden &golden, const std::string &name, const ExecutionPlans &pla
         prefill.add(set.name + " rows " + std::to_string(rows) + ": " +
                     attempt([&] { return describe(plans.moe(shape, routerFormat, rows)); }));
       for (const uint32_t rows : {64U, 512U, uint32_t{SPLASH_PREFILL_TOKEN_BUDGET}})
-        workspace.add(set.name + " prefill " + std::to_string(rows) + ":" +
-                      attempt([&] { return describe(plans.moePrefillWorkspace(shape, routerFormat, rows)); }));
-      workspace.add(set.name + " decode per lane:" +
-                    attempt([&] { return describe(plans.moeDecodeWorkspacePerLane(shape, routerFormat)); }));
+        workspace.add(set.name + " up to " + std::to_string(rows) + " rows:" +
+                      attempt([&] { return describe(plans.moeWorkspace(shape, routerFormat, rows)); }));
     }
   });
 }

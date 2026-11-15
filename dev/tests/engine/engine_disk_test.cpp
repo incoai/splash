@@ -827,7 +827,7 @@ void testCopiesAheadWaitForALaneRefusedBesideOthers() {
   tickUntil(engine, now, [&] { return events.outputs.contains(1) && events.outputs.contains(2); },
             "the lanes did not decode");
   const auto needsPage = [&](uint64_t id) {
-    return promptTokens(id) + events.outputs[id].size() + model::ExecutionLimits::decodeLaneRows >
+    return promptTokens(id) + events.outputs[id].size() + model::ExecutionLimits::targetVerifyRows >
            uint64_t{cache.pageTable(id).pages.size()} * KvCache::pageTokens;
   };
   tickUntil(engine, now, [&] { return !engine.commandInFlight() && needsPage(1) && !needsPage(2); },
@@ -892,7 +892,7 @@ void testCopiesAheadWaitNoLongerThanTheWaitsLimit() {
   tickUntil(engine, now, [&] { return events.outputs.contains(1) && events.outputs.contains(2); },
             "the lanes did not decode");
   const auto needsPage = [&](uint64_t id) {
-    return promptTokens(id) + events.outputs[id].size() + model::ExecutionLimits::decodeLaneRows >
+    return promptTokens(id) + events.outputs[id].size() + model::ExecutionLimits::targetVerifyRows >
            uint64_t{cache.pageTable(id).pages.size()} * KvCache::pageTokens;
   };
   tickUntil(engine, now, [&] { return !engine.commandInFlight() && needsPage(1) && !needsPage(2); },
@@ -960,7 +960,7 @@ void testCopiesAheadDoNotWaitForALaneBelowThePriorityThatRuns() {
   decoding(1, 87, RequestPriority::Normal);
   tickUntil(engine, now, [&] { return events.outputs.contains(1); }, "the Normal lane did not decode");
   const auto needsPage = [&] {
-    return 87 + events.outputs[1].size() + model::ExecutionLimits::decodeLaneRows >
+    return 87 + events.outputs[1].size() + model::ExecutionLimits::targetVerifyRows >
            uint64_t{cache.pageTable(1).pages.size()} * KvCache::pageTokens;
   };
   tickUntil(engine, now, [&] { return !engine.commandInFlight() && needsPage(); },
@@ -1017,7 +1017,7 @@ void testARefusalAfterProgressRestartsTheWaitLimit() {
   double now = 1;
   tickUntil(engine, now, [&] { return events.outputs.contains(1); }, "the lane did not decode");
   const auto needsPage = [&] {
-    return 87 + events.outputs[1].size() + model::ExecutionLimits::decodeLaneRows >
+    return 87 + events.outputs[1].size() + model::ExecutionLimits::targetVerifyRows >
            uint64_t{cache.pageTable(1).pages.size()} * KvCache::pageTokens;
   };
   tickUntil(engine, now, [&] { return !engine.commandInFlight() && needsPage(); },
@@ -1182,7 +1182,7 @@ void testCopiesAheadWaitForALaneRefusedDuringARecovery() {
   require(engine.snapshot().prioritySuspensions == 1 && !executor.requests.at(4).resident,
           "the arrival did not suspend lane 4, or it resumed");
   const auto needsPage = [&](uint64_t id) {
-    return promptTokens(id) + events.outputs[id].size() + model::ExecutionLimits::decodeLaneRows >
+    return promptTokens(id) + events.outputs[id].size() + model::ExecutionLimits::targetVerifyRows >
            uint64_t{cache.pageTable(id).pages.size()} * KvCache::pageTokens;
   };
   tickUntil(engine, now, [&] { return !engine.commandInFlight() && needsPage(1) && !needsPage(2); },
@@ -1451,9 +1451,9 @@ void testABatchRefusalOfNothingOnItsWayBackHoldsNoOne() {
   };
   const auto waiting = [&] { return config.governor->snapshot().claims.waiting; };
   // The lane beside it holds four pages; the waiting lane holds two, which
-  // it fills first.
+  // the 16 rows its verify block may hold outgrow first.
   engine.submit(prompt(1, std::vector<uint32_t>(97, 1)));
-  engine.submit(prompt(2, std::vector<uint32_t>(50, 2)));
+  engine.submit(prompt(2, std::vector<uint32_t>(42, 2)));
   double now = 1;
   tickUntil(engine, now, [&] { return outputs(1) && outputs(2); }, "the lanes did not decode");
   // Memory holds what the lanes and the cache have now. Ticks are 150 ms

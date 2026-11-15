@@ -2182,10 +2182,15 @@ struct Runtime::Impl {
   bool capturesInDecode() const noexcept { return !geometry.target.stateLayout.auxiliaryBytes; }
 
   // The state a decode item captures, at most one: at the page boundary
-  // past the lane's position that the rows it may retain reach. Its window
-  // starts as a copy of the lane's as the cycle finds it, whose older rows
-  // the capture's own overwrite (encodeDecodeCaptures), and its lengths are
-  // those of the lane's with the rows before the boundary, a cached state's.
+  // past the lane's position that a verify block's rows may reach within the
+  // lane's output limit. The engine reserves it without knowing the rows the
+  // cycle gives the lane, which the runtime chooses for the cycle, so a
+  // boundary past the rows the cycle may retain is one its acceptance falls
+  // short of: the cycle neither folds nor seals it, and the engine reserves
+  // it again for the next. Its window starts as a copy of the lane's as the
+  // cycle finds it, whose older rows the capture's own overwrite
+  // (encodeDecodeCaptures), and its lengths are those of the lane's with the
+  // rows before the boundary, a cached state's.
   void prepareDecodeCapture(const Request &entry, const ModelBatchItem &item,
                             DecodeLaneResult &laneResult) const {
     if (item.stateCaptures.empty())
@@ -2194,8 +2199,11 @@ struct Runtime::Impl {
     auto *reservation = dynamic_cast<QwenStateReservation *>(capture.reservation.get());
     if (item.stateCaptures.size() > 1 || !reservation || !capturesInDecode() ||
         capture.tokens <= item.logicalPosition ||
-        capture.tokens > item.logicalPosition + laneResult.maximumRetained)
+        capture.tokens > item.logicalPosition + std::min(ExecutionLimits::targetVerifyRows,
+                                                         entry.maxNewTokens - entry.generatedTokens))
       throw std::invalid_argument("invalid decode state capture");
+    if (capture.tokens > item.logicalPosition + laneResult.maximumRetained)
+      return;
     laneResult.captureLengths =
         advanceDraftContext(states.metadata(entry.stateLane).lengths, capture.tokens,
                             item.logicalPosition, capture.tokens, false, true);
@@ -2571,15 +2579,20 @@ struct Runtime::Impl {
   // verify's tape into the state the verify wrote (QwenTarget::addStateFold)
   // and stores their context rows, which the draft's commit normalized, in
   // the state's window. The completion seals the state only where the lane
-  // retained them (finalizeDecode).
+  // retained them (finalizeDecode). A boundary past the rows the lane may
+  // retain this cycle (`maximumRetained`) is none of its cycle's
+  // (prepareDecodeCapture).
   void encodeDecodeCaptures(CommandGraph &graph, std::span<Request *const> entries,
-                            std::span<const ModelBatchItem> items, const ops::StepRows &step) {
+                            std::span<const ModelBatchItem> items, std::span<const uint32_t> maximumRetained,
+                            const ops::StepRows &step) {
     for (uint32_t lane = 0; lane < entries.size(); ++lane) {
       for (const StateCapture &capture : items[lane].stateCaptures) {
+        const uint32_t rows = static_cast<uint32_t>(capture.tokens - items[lane].logicalPosition);
+        if (rows > maximumRetained[lane])
+          continue;
         const QwenCachedBuffers &state = static_cast<QwenStateReservation &>(*capture.reservation).buffers();
         encodeCapture(graph, lane, entries[lane]->stateLane, state.gdn->buffers().stateBase, state.window->buffer(),
-                      static_cast<uint32_t>(capture.tokens - items[lane].logicalPosition),
-                      static_cast<uint32_t>(items[lane].logicalPosition), step);
+                      rows, static_cast<uint32_t>(items[lane].logicalPosition), step);
       }
     }
   }
@@ -2616,7 +2629,7 @@ struct Runtime::Impl {
     encodeKvPathCommit(graph, entries, items, step);
     encodeTargetStateCommit(graph, entries);
     encodeDraftStateCommitBatch(graph, entries, items, step);
-    encodeDecodeCaptures(graph, entries, items, step);
+    encodeDecodeCaptures(graph, entries, items, maximumRetained, step);
   }
 
   // The embedding of the lanes' first `rows` tokens into `output`'s rows (the

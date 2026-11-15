@@ -222,16 +222,19 @@ void checkPrefillInt8Scratch() {
 
 // One decode arena serves every lane count, and a staged plan's partials
 // grow with its rows. The arena must hold every lane's plan of every target
-// and draft projection at the measured core counts.
+// projection and the draft's context projections, over a lane's most rows,
+// and of the draft's own, over its block's, at the measured core counts.
 void checkLaneScratch(const model::LoadedModel &loaded) {
   const auto geometry = model::RuntimeGeometry::from(loaded, kv::Format::Int8, ops::GdnStateFormat::Float32);
   const auto &d = geometry.draft;
-  std::vector<ops::LinearMatrix> matrices{
-      {d.dynamicSize, d.hiddenSize}, {d.qkvSize, d.hiddenSize}, {d.contextKvSize(), d.hiddenSize},
-      {d.hiddenSize, d.attentionSize},
-      {d.intermediateSize, d.hiddenSize}, {d.hiddenSize, d.intermediateSize},
-      {d.selectorRank, d.hiddenSize}, {d.hiddenSize, d.targetHiddenSize()}};
-  for (const auto &p : geometry.target.decodeProjections) matrices.push_back({p.outputSize, p.inputSize});
+  // Each matrix with the rows a lane gives it.
+  std::vector<std::pair<ops::LinearMatrix, uint32_t>> matrices{
+      {{d.dynamicSize, d.hiddenSize}, model::kDraftRows},       {{d.qkvSize, d.hiddenSize}, model::kDraftRows},
+      {{d.hiddenSize, d.attentionSize}, model::kDraftRows},     {{d.intermediateSize, d.hiddenSize}, model::kDraftRows},
+      {{d.hiddenSize, d.intermediateSize}, model::kDraftRows},  {{d.selectorRank, d.hiddenSize}, model::kDraftRows},
+      {{d.contextKvSize(), d.hiddenSize}, model::kDecodeRows}, {{d.hiddenSize, d.targetHiddenSize()}, model::kDecodeRows}};
+  for (const auto &p : geometry.target.decodeProjections)
+    matrices.push_back({{p.outputSize, p.inputSize}, model::kDecodeRows});
   for (uint32_t family : {9U, 10U, 11U})
     for (uint32_t cores : {12U, 20U, 40U}) {
       DeviceCapabilities device;
@@ -239,17 +242,40 @@ void checkLaneScratch(const model::LoadedModel &loaded) {
       device.gpuCoreCount = cores;
       const ops::ExecutionPlans plans(device, ops::Int8Activations::On);
       const auto scratch = model::DecodeArena::linearScratchSize(geometry, plans);
-      for (const auto matrix : matrices)
+      for (const auto &[matrix, laneRows] : matrices)
         for (uint32_t lanes = 1; lanes <= model::kLaneCount; ++lanes)
           for (auto epilogue : {ops::LinearEpilogue::None, ops::LinearEpilogue::Residual,
                                 ops::LinearEpilogue::GateUp}) {
-            const auto need = plans.linear().plan({matrix, lanes * model::kDecodeRows,
-                epilogue}).scratchSize();
+            const auto need = plans.linear().plan({matrix, lanes * laneRows, epilogue}).scratchSize();
             require(scratch.input >= need.input && scratch.sums >= need.sums && scratch.partials >= need.partials &&
                         scratch.counters >= need.counters,
                     "decode arena scratch below a lane's plan");
           }
     }
+}
+
+// A decode step of any rows its lanes may give it, up to four lanes of a
+// verify block's 16, finds its MoE plan's workspace in the decode arena: past
+// 32 rows the 35B's and the 122B's plans take 32-row expert tiles, whose 274
+// tiles at 64 rows a bound of four lanes of 8 rows did not hold.
+void checkDecodeStepMoe(const model::LoadedModel &loaded) {
+  const auto geometry = model::RuntimeGeometry::from(loaded, kv::Format::Int8, ops::GdnStateFormat::Float32);
+  for (uint32_t family : {9U, 10U, 11U}) {
+    DeviceCapabilities device;
+    device.appleGpuFamily = family;
+    device.gpuCoreCount = 20;
+    const ops::ExecutionPlans plans(device, ops::Int8Activations::On);
+    const model::TargetRows step = model::decodeTargetRows(geometry, plans);
+    require(step.rows == model::kLaneCount * model::ExecutionLimits::targetVerifyRows,
+            "the decode arena does not hold four lanes of a verify block's rows");
+    for (uint32_t rows = 1; rows <= step.rows; ++rows) {
+      const ops::MoeWorkspace need =
+          plans.moe(geometry.target.moeBlockShape(), geometry.target.moeRouterFormat, rows).workspace();
+      for (const auto field : ops::kMoeWorkspaceFields)
+        require(step.moe.*field >= need.*field,
+                "the decode arena does not hold the MoE plan of a step of " + std::to_string(rows) + " rows");
+    }
+  }
 }
 
 // The decode arena's plan counts each buffer it allocates in whole host
@@ -316,9 +342,9 @@ void checkIndexTables() {
 // A runtime whose K/V spills (one given the readers of spilled K/V,
 // model::RuntimeContext) runs its prefill commands as groups, which read an
 // attention layer's spilled history once each, and its decode arena holds
-// where its verify's listed blocks are: a lane's list, 8 rows of 512 blocks
-// and the block of each row's tail. The K/V of a target without a block
-// index cannot spill.
+// where its verify's listed blocks are: a lane's list, a verify block's 16
+// rows of 512 blocks and the block of each row's tail. The K/V of a target
+// without a block index cannot spill.
 void checkSpilledKvGeometry() {
   const auto flash = loadedModel<model::Qwen4ExpWeights>();
   const auto resident = model::RuntimeGeometry::from(flash, kv::Format::Int8, ops::GdnStateFormat::Float32);
@@ -328,7 +354,7 @@ void checkSpilledKvGeometry() {
               spilled.prefillChunks == model::kPrefillGroupChunks && spilled.spilledKv == test::sparseKvShape(),
           "a runtime's prefill groups do not follow whether its K/V spills");
   require(!decodeBytes(resident, model::DecodeTensor::Locations) &&
-              decodeBytes(spilled, model::DecodeTensor::Locations) == uint64_t{8} * (512 + 1) * sizeof(uint32_t),
+              decodeBytes(spilled, model::DecodeTensor::Locations) == uint64_t{16} * (512 + 1) * sizeof(uint32_t),
           "a runtime's decode arena does not hold its spilled blocks' locations exactly when its K/V spills");
   for (const model::LoadedModel &loaded :
        {loadedModel<model::Qwen3_8Weights>(), loadedModel<model::Qwen3_6MoeWeights>()})
@@ -493,6 +519,9 @@ int main() {
     checkLaneScratch(loadedModel<model::Qwen3_6MoeWeights>(model::kQwen3_5_122BLayout, test::qwen3_5_122BDraft()));
     checkDecodeArenaPages(loadedModel<model::Qwen3_8Weights>());
     checkDecodeArenaPages(loadedModel<model::Qwen3_6MoeWeights>());
+    checkDecodeStepMoe(loadedModel<model::Qwen3_6MoeWeights>());
+    checkDecodeStepMoe(loadedModel<model::Qwen3_6MoeWeights>(model::kQwen3_5_122BLayout, test::qwen3_5_122BDraft()));
+    checkDecodeStepMoe(loadedModel<model::Qwen4ExpWeights>());
     std::cout << "model execution plans: PASS (three paired geometries)\n";
   } catch (const std::exception &error) {
     std::cerr << error.what() << '\n';

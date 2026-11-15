@@ -1793,7 +1793,7 @@ std::vector<LaneShape> Engine::laneShapes(std::span<const PrefillAdmission> cand
 
 uint64_t Engine::workEndOf(const Request &active, const BatchItem &scheduled,
                            bool prefill) noexcept {
-  uint64_t workEnd = active.exactTokens.size() + model::ExecutionLimits::decodeLaneRows;
+  uint64_t workEnd = active.exactTokens.size() + model::ExecutionLimits::targetVerifyRows;
   if (prefill) {
     workEnd = scheduled.promptOffset + scheduled.tokenCount;
     if (active.stateBoundaryCursor < active.stateBoundaries.size())

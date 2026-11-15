@@ -821,7 +821,7 @@ std::optional<SparseKvShape> sparseKvShape(const QwenHybridLayout &layout) {
   if (layout.kvLayout().reads != kv::Reads::SelectedBlocks) return std::nullopt;
   return SparseKvShape{.blockTokens = layout.indexerBlockTokens,
                        .selectedBlocks = layout.indexerTopBlocks,
-                       .verifyRows = ExecutionLimits::decodeLaneRows,
+                       .verifyRows = ExecutionLimits::targetVerifyRows,
                        .denseHistoryTokens = layout.indexerTokens()};
 }
 

@@ -412,10 +412,11 @@ public:
     std::vector<ModelStepResult> result;
     for (const auto &item : items) {
       requireRows(item, item.logicalPosition);
-      // The production runtime stores a decode lane's rows from the lane's
-      // position; the engine must have covered them with page-table entries.
+      // The production runtime stores a decode lane's rows, up to its verify
+      // block's most, from the lane's position; the engine must have covered
+      // them with page-table entries.
       if (uint64_t{item.pageTable.size()} * engine::KvCache::pageTokens <
-          item.logicalPosition + model::ExecutionLimits::decodeLaneRows) {
+          item.logicalPosition + model::ExecutionLimits::targetVerifyRows) {
         throw std::invalid_argument("page_table_too_short");
       }
       Request &state = requests.at(item.requestId);
@@ -450,7 +451,7 @@ public:
         for (const StateCapture &capture : item.stateCaptures) {
           if (!decodeStateCaptures || !capture.reservation || capture.tokens % engine::KvCache::pageTokens ||
               capture.tokens <= item.logicalPosition ||
-              capture.tokens > item.logicalPosition + std::min(model::ExecutionLimits::decodeLaneRows,
+              capture.tokens > item.logicalPosition + std::min(model::ExecutionLimits::targetVerifyRows,
                                                                limit - state.generated))
             throw std::logic_error("a decode capture lies past the rows its cycle may retain");
           if (capture.tokens > stored)

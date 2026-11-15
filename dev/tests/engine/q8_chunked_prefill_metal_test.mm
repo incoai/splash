@@ -943,7 +943,7 @@ void testContract() {
 
   ChunkedPrefillParams finalCycle{
       splash::kv::kMaximumLogicalTokens - 1,
-      SPLASH_DECODE_LANE_ROWS,
+      SPLASH_TARGET_VERIFY_ROWS,
       32,
       (splash::kv::kMaximumPhysicalTokens + kPageTokens - 1) /
           kPageTokens};
@@ -951,7 +951,7 @@ void testContract() {
           "the final cycle's verification rows exceeded physical KV scratch");
   ++finalCycle.committed_tokens;
   require(chunkedPrefillValidationError(finalCycle) == "context_out_of_range",
-          "physical KV scratch exceeded its fixed seven-row allowance");
+          "physical KV scratch exceeded its fixed fifteen-row allowance");
 }
 
 void run(const char *libraryPath) {

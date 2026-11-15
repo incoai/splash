@@ -1114,7 +1114,7 @@ void testALongRequestAfterTheWarmupsCreatesNothing(const char *metallibPath) {
   // not matter here.
   constexpr uint32_t chunk = model::ExecutionLimits::prefillTokenBudget, history = 4 * chunk;
   const std::vector<uint32_t> prompt(history, 7);
-  std::vector<uint32_t> pages((history + model::ExecutionLimits::decodeLaneRows + kv::kPageTokens - 1) /
+  std::vector<uint32_t> pages((history + model::ExecutionLimits::targetVerifyRows + kv::kPageTokens - 1) /
                               kv::kPageTokens);
   for (uint32_t page = 0; page < pages.size(); ++page) pages[page] = page % model::ExecutionLimits::warmupKvPages;
   auto &executor = dynamic_cast<model::Runtime &>(*runtime);
@@ -1197,6 +1197,61 @@ void testAReplyCaptureAfterTheWarmupsCreatesNothing(const char *metallibPath) {
   require(captured, "the reply's cycle captured no state at its page: " + log);
   require(backend.pipelinesCreatedWhileServing() == 0,
           "a cycle that captured a reply's state after the start's warmups created pipelines: " + log);
+}
+
+// The engine reserves a state to capture in decode at a page up to a verify
+// block's rows ahead (Engine::reserveReplyCapture), not knowing the rows the
+// runtime gives the lane in a cycle. A cycle of 8 rows a lane given a page 12
+// rows ahead captures nothing and fails nothing, as one whose acceptance
+// falls short does; the cycle whose retained rows reach the page seals the
+// state.
+void testADecodeCapturePastItsCycleWaits(const char *metallibPath) {
+  const test::TemporaryDirectory root("splash-decode-capture");
+  RuntimeResourcesConfig config = loadableConfig(metallibPath, root.path(), "decode-capture-test");
+  std::unique_ptr<RuntimeResources> resources;
+  static_cast<void>(test::capturedStderr([&] { resources = RuntimeResources::create(config, 0); }));
+  const EngineMemoryBreakdown &budget = resources->memoryPlan().breakdown();
+  std::unique_ptr<model::RuntimeModel> runtime;
+  require(static_cast<bool>(resources->memoryGovernor().allocationAdmission()(
+              budget.sharedPrefillBytes + budget.sharedDecodeBytes,
+              [&] { runtime = model::createRuntime(resources->modelContext()); })),
+          "the runtime's arenas were refused");
+  const KvPool::RunwayHold runway(resources->kvPool());
+  auto &executor = dynamic_cast<model::Runtime &>(*runtime);
+  require(executor.capturesInDecode(), "the planned model captures no state in decode");
+  // The prompt ends 12 rows before the page; its pages repeat the runway's.
+  constexpr uint32_t page = kv::kPageTokens, promptTokens = page - 12;
+  static_assert(page - promptTokens > model::ExecutionLimits::decodeLaneRows &&
+                    page - promptTokens <= model::ExecutionLimits::targetVerifyRows,
+                "the page lies past a cycle's lane rows and within a verify block's");
+  const std::vector<uint32_t> prompt(promptTokens, 7);
+  std::vector<uint32_t> pages(3);
+  for (uint32_t index = 0; index < pages.size(); ++index) pages[index] = index % model::ExecutionLimits::warmupKvPages;
+  constexpr uint64_t id = 738;
+  const test::ClaimScope claim(resources->memoryGovernor(), ClaimClass::Optional);
+  executor.beginColdRequest({.id = id, .prompt = prompt, .maxNewTokens = 64}, 0);
+  ModelBatchItem chunk{.requestId = id, .tokenCount = promptTokens, .pageTable = pages, .pageTableRevision = 1};
+  chunk.inputTokens = prompt;
+  const auto prefilled = executor.prefill({.kind = WorkKind::Prefill, .items = {{id, promptTokens}}},
+                                          std::span<const ModelBatchItem>(&chunk, 1));
+  require(prefilled.size() == 1 && prefilled[0].failure.empty() && prefilled[0].outputTokens.empty(),
+          "the prompt failed or ended the request");
+  uint64_t position = promptTokens;
+  for (uint32_t cycle = 0; position < page; ++cycle) {
+    require(cycle < page - promptTokens, "the lane's cycles never reached its page");
+    ModelBatchItem item{.requestId = id, .logicalPosition = position, .pageTable = pages, .pageTableRevision = 1};
+    metal::AllocationFailure refusal = metal::AllocationFailure::None;
+    item.stateCaptures.push_back({page, executor.reserveState(id, page, refusal)});
+    require(item.stateCaptures.back().reservation != nullptr, "the state to capture was refused");
+    const auto decoded =
+        executor.decode({.kind = WorkKind::Decode, .items = {{id, 0}}}, std::span<const ModelBatchItem>(&item, 1));
+    require(decoded.size() == 1 && decoded[0].failure.empty(), "a cycle given a page to capture failed");
+    position += decoded[0].outputTokens.size() - decoded[0].outputTokensWithoutKv;
+    require(decoded[0].capturedStates.size() == (position >= page ? 1U : 0U),
+            position >= page ? "the cycle that reached its page sealed no state"
+                             : "a cycle that fell short of its page sealed a state");
+  }
+  executor.end(id);
 }
 
 // The SSD cache holds no write back unless a write budget is set; one that
@@ -1708,6 +1763,50 @@ void testThePlanCountsEveryBuffer(const char *metallibPath) {
               " bytes of buffers the memory plan does not count");
 }
 
+// The decode arena holds a step of four lanes of a verify block's 16 rows,
+// packed: a lane's rows of a row tensor, the step's own or its target's, are
+// those from its first row on, by the tensor's row (fp32 logits of the
+// vocabulary, a token, three rotary positions, a tree row, a hidden row), and
+// every row of a step fits; rows past the step's and a lane's own tensor are
+// refused.
+void testDecodeArenaHoldsAStepsPackedRows(const char *metallibPath) {
+  const test::TemporaryDirectory root("splash-decode-rows");
+  const RuntimeResourcesConfig config = loadableConfig(metallibPath, root.path(), "decode-rows");
+  metal::MetalBackend backend(metallibPath);
+  const model::LoadedModel loaded = model::loadModel(backend, config.modelRoot, config.model);
+  const auto geometry = model::RuntimeGeometry::from(loaded, kv::Format::Int8, ops::GdnStateFormat::Float32);
+  const ops::ExecutionPlans operators(backend.capabilities(), ops::Int8Activations::On);
+  const model::DecodeArena arena(backend, geometry, operators);
+  constexpr uint32_t kStepRows = model::kLaneCount * model::ExecutionLimits::targetVerifyRows;
+  const auto at = [](const metal::MetalBuffer &buffer) { return static_cast<const std::byte *>(buffer.contents()); };
+  // A lane's rows after lanes of 16 and 5.
+  constexpr ops::LaneRows lane{21, 11};
+  const uint64_t hiddenRow = uint64_t{geometry.target.hiddenSize} * sizeof(uint16_t);
+  const std::pair<model::DecodeTensor, uint64_t> rowTensors[] = {
+      {model::DecodeTensor::Logits, uint64_t{geometry.target.vocabularySize} * sizeof(float)},
+      {model::DecodeTensor::InputTokens, sizeof(uint32_t)},
+      {model::DecodeTensor::OutputTokens, sizeof(uint32_t)},
+      {model::DecodeTensor::TreeRows, sizeof(ops::TreeRow)},
+      {model::DecodeTensor::FinalHidden, hiddenRow},
+      {model::DecodeTensor::CapturedTargetHidden, uint64_t{geometry.target.capturedHiddenSize()} * sizeof(uint16_t)}};
+  for (const auto &[tensor, row] : rowTensors) {
+    const metal::MetalBuffer step = arena.batchSlice(tensor, model::kLaneCount);
+    const metal::MetalBuffer rows = arena.rows(tensor, lane);
+    require(step.sizeBytes() == kStepRows * row && arena.rows(tensor, {0, kStepRows}).sizeBytes() == step.sizeBytes() &&
+                at(rows) == at(step) + lane.first * row && rows.sizeBytes() == lane.rows * row,
+            "a lane's rows of a decode row tensor are not its packed rows");
+  }
+  const metal::MetalBuffer hidden = arena.target().get(model::TargetTensor::Hidden0);
+  const metal::MetalBuffer hiddenRows = arena.rows(model::TargetTensor::Hidden0, lane);
+  require(hidden.sizeBytes() == kStepRows * hiddenRow && at(hiddenRows) == at(hidden) + lane.first * hiddenRow &&
+              hiddenRows.sizeBytes() == lane.rows * hiddenRow,
+          "a lane's rows of a target row tensor are not its packed rows");
+  rejects([&] { static_cast<void>(arena.rows(model::DecodeTensor::Logits, {kStepRows - 1, 2})); },
+          "invalid decode step rows", "rows past a decode step's were viewed");
+  rejects([&] { static_cast<void>(arena.rows(model::DecodeTensor::SamplingUniforms, {0, 1})); },
+          "holds no step rows", "a lane's own decode tensor was viewed as a step's rows");
+}
+
 // The ledger's accounts sum to what the governor charges: at Ready a start of
 // streamed experts books the KV pages and the lane states as their storage
 // counts them and the expert store as its pool reports it, and the fixed
@@ -2147,6 +2246,7 @@ int main(int argc, char **argv) {
       testARestoreAfterTheOtherWarmupsCreatesNothing(argv[1]);
       testALongRequestAfterTheWarmupsCreatesNothing(argv[1]);
       testAReplyCaptureAfterTheWarmupsCreatesNothing(argv[1]);
+      testADecodeCapturePastItsCycleWaits(argv[1]);
       testWriteBudgetOnlyWhenSet(argv[1]);
       testStaleCachesGoAtEveryStart(argv[1]);
       testMadeCacheRootStaysOutOfBackups(argv[1]);
@@ -2160,6 +2260,7 @@ int main(int argc, char **argv) {
       testTheTableIgnoresTheHostsSpareMemory(argv[1]);
       testEngineFollowsTheGovernor(argv[1]);
       testThePlanCountsEveryBuffer(argv[1]);
+      testDecodeArenaHoldsAStepsPackedRows(argv[1]);
       testDenseRuntimeBoundary(argv[1]);
       testSpilledRuntimeBoundary(argv[1]);
       testThePlanCountsTheSpilledKvReadersTables(argv[1]);

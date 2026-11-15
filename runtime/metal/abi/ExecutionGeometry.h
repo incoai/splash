@@ -12,21 +12,22 @@
 // takes blocks of 1 to this many rows a lane. Sixteen: a replay of 17,432
 // served cycles estimated trees of up to 16 rows a lane, the draft's
 // proposals with lookup branches, to decode 28% faster than the draft's
-// eight rows on Qwen3.8-27B.
+// eight rows on Qwen3.8-27B. A decode cycle's bounds follow it: the KV a
+// lane's block writes past the context (SPLASH_SPECULATIVE_SCRATCH_TOKENS),
+// the KV the engine holds for a lane's cycle and the decode arena's rows.
 #define SPLASH_TARGET_VERIFY_ROWS 16u
 // The rows a decode cycle verifies of each lane, of the
 // SPLASH_TARGET_VERIFY_ROWS its block may hold: the chain of its anchor and
-// the draft's proposals. A cycle's budget of each lane's rows, which may form
-// a tree, replaces it, and with it the bounds that follow it: the KV a cycle
-// writes past the context (SPLASH_SPECULATIVE_SCRATCH_TOKENS) and the KV the
-// engine holds for a lane's cycle.
+// the draft's proposals, until a cycle's budget chooses each lane's rows.
 #define SPLASH_DECODE_LANE_ROWS (SPLASH_DRAFT_PROPOSAL_TOKENS + 1u)
 // The KV ceiling: four times the targets' native window of 262,144 tokens,
 // which holds the most context YaRN serves them
 // (QwenTargetDimensions::yarnContextTokens).
 #define SPLASH_MAXIMUM_CONTEXT_TOKENS 1048576u
+// The KV slots past the context a decode cycle writes: a lane's block at the
+// context's last position stores its rows from there, 15 past it.
 #define SPLASH_SPECULATIVE_SCRATCH_TOKENS                                  \
-  (SPLASH_DECODE_LANE_ROWS - 1u)
+  (SPLASH_TARGET_VERIFY_ROWS - 1u)
 #define SPLASH_MAXIMUM_PHYSICAL_KV_TOKENS                                  \
   (SPLASH_MAXIMUM_CONTEXT_TOKENS + SPLASH_SPECULATIVE_SCRATCH_TOKENS)
 #define SPLASH_MAXIMUM_BATCH_WIDTH 4u

@@ -68,24 +68,22 @@ TargetRows prefillTargetRows(const RuntimeGeometry &geometry, const ops::Executi
                    .attention = operators.sequenceAttentionWorkspace(target.attentionQueryHeads, target.kvLayout),
                    .moe = {}};
   if (target.ffnKind == QwenFfnKind::SparseMoe)
-    shape.moe = operators.moePrefillWorkspace(target.moeBlockShape(), target.moeRouterFormat, kPrefillRows);
+    shape.moe = operators.moeWorkspace(target.moeBlockShape(), target.moeRouterFormat, kPrefillRows);
   return shape;
 }
 
 TargetRows decodeTargetRows(const RuntimeGeometry &geometry, const ops::ExecutionPlans &operators) {
   const QwenTargetGeometry &target = geometry.target;
-  // Every lane's one tile at the most splits, so a step's lanes attend in one
-  // dispatch whatever their histories, and every lane's MoE routes.
+  // Every lane's tiles at the most splits, so a step's lanes attend in one
+  // dispatch whatever their histories, and the MoE plan of every step of up
+  // to its most rows.
   const ops::AttentionWorkspace lane = operators.laneAttentionWorkspace(target.attentionQueryHeads, target.kvLayout);
-  TargetRows shape{.rows = kLaneCount * kDecodeRows,
+  TargetRows shape{.rows = kDecodeStepRows,
                    .chunks = 1,
                    .attention = {lane.partialsBytes * kLaneCount, lane.statisticsBytes * kLaneCount},
                    .moe = {}};
-  if (target.ffnKind == QwenFfnKind::SparseMoe) {
-    const ops::MoeWorkspace perLane = operators.moeDecodeWorkspacePerLane(target.moeBlockShape(), target.moeRouterFormat);
-    for (const ops::MoeScratchField &field : ops::kMoeScratchFields)
-      shape.moe.*field.bytes = perLane.*field.bytes * kLaneCount;
-  }
+  if (target.ffnKind == QwenFfnKind::SparseMoe)
+    shape.moe = operators.moeWorkspace(target.moeBlockShape(), target.moeRouterFormat, kDecodeStepRows);
   return shape;
 }
 
@@ -185,6 +183,8 @@ decodeTensorBytes(const RuntimeGeometry &geometry,
     auto &size = result[static_cast<uint32_t>(tensor)];
     size = std::max(size, bytes);
   };
+  // A step's packed rows (decodeRowTensor) and a lane's verify block's
+  // positions: kDecodeRows a lane.
   const uint64_t r = kDecodeRows;
   put(DecodeTensor::InputTokens, bytesFor<uint32_t>(r));
   put(DecodeTensor::DraftPositions, bytesFor<uint32_t>(r));
@@ -293,15 +293,19 @@ ops::LinearScratchSize DecodeArena::linearScratchSize(
     const RuntimeGeometry &geometry, const ops::ExecutionPlans &operators) {
   const auto &d = geometry.draft;
   ops::LinearScratchSize result;
-  // Includes the vocabulary head shared with the draft.
+  // A step's rows: the target's projections, the vocabulary head shared with
+  // the draft among them, and the draft's context projections.
   for (const auto &p : geometry.target.decodeProjections)
-    result.include(operators.linear().scratchSize(p, kLaneCount * kDecodeRows));
+    result.include(operators.linear().scratchSize(p, kDecodeStepRows));
+  for (const ops::ProjectionShape shape :
+       {ops::ProjectionShape{d.hiddenSize, d.targetHiddenSize()}, {d.contextKvSize(), d.hiddenSize}})
+    result.include(operators.draftLinear().scratchSize(shape, kDecodeStepRows));
+  // The draft's own block, kDraftRows a lane.
   for (const ops::ProjectionShape shape : {ops::ProjectionShape{d.dynamicSize, d.hiddenSize},
-       {d.qkvSize, d.hiddenSize}, {d.contextKvSize(), d.hiddenSize},
-       {d.hiddenSize, d.attentionSize},
+       {d.qkvSize, d.hiddenSize}, {d.hiddenSize, d.attentionSize},
        {d.intermediateSize, d.hiddenSize}, {d.hiddenSize, d.intermediateSize},
-       {d.selectorRank, d.hiddenSize}, {d.hiddenSize, d.targetHiddenSize()}})
-    result.include(operators.draftLinear().scratchSize(shape, kLaneCount * kDecodeRows));
+       {d.selectorRank, d.hiddenSize}})
+    result.include(operators.draftLinear().scratchSize(shape, kLaneCount * kDraftRows));
   return result;
 }
 

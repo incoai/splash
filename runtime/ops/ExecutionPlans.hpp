@@ -46,21 +46,22 @@ public:
   // routers are in `routerFormat` (moeRouterFormat).
   [[nodiscard]] MoePlan moe(MoeShape shape, uint32_t routerFormat, uint32_t rows) const;
 
-  // Bounds cover every row count up to the requested maximum, not just that
-  // one. Decode arenas use a per-lane stride of
-  // max_B ceil(requiredBytes(B)/B), independently for each scratch field.
   // The attention workspace that holds any one sequence's partials, a
-  // prompt chunk's; and a decode lane's, its one tile at the most splits, so
-  // that a step's lanes, their workspaces added, attend in one dispatch.
+  // prompt chunk's; and a decode lane's, the most split slots a lane of up to
+  // a verify block's rows takes: one tile at the most splits, which a lane of
+  // two tiles' 32 splits each stays within (PagedAttention.cpp,
+  // attentionSplits), so that a step's lanes, their workspaces added, attend
+  // in one dispatch.
   [[nodiscard]] AttentionWorkspace sequenceAttentionWorkspace(uint32_t queryHeads, kv::Layout layout) const;
   [[nodiscard]] AttentionWorkspace laneAttentionWorkspace(uint32_t queryHeads, kv::Layout layout) const;
   [[nodiscard]] DraftAttentionWorkspace draftAttentionWorkspacePerLane(
       DraftAttentionShape shape) const;
-  [[nodiscard]] MoeWorkspace moePrefillWorkspace(
-      MoeShape shape, uint32_t routerFormat, uint32_t maximumRows) const;
-  [[nodiscard]] MoeWorkspace moeDecodeWorkspacePerLane(MoeShape shape, uint32_t routerFormat) const;
-  // This scratch is one whole-command buffer, not a per-lane arena field.
-  [[nodiscard]] uint64_t gateUpWorkspace(ProjectionShape shape) const;
+  // The workspace of every MoE step of 1 to `maximumRows` rows, not just the
+  // most: a prompt chunk's, and a decode step's of its lanes' packed rows.
+  [[nodiscard]] MoeWorkspace moeWorkspace(MoeShape shape, uint32_t routerFormat, uint32_t maximumRows) const;
+  // The gate scratch of every gate/up plan of 1 to `maximumRows` rows of a
+  // pair of `shape`: one whole-command buffer, not a per-lane arena field.
+  [[nodiscard]] uint64_t gateUpWorkspace(ProjectionShape shape, uint32_t maximumRows) const;
 
 private:
   Linear linear_;
