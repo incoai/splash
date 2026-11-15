@@ -2138,27 +2138,52 @@ system prompt, resumes there instead of from the start. It stays only if the
 replay state fits beside it; refused memory, the replay state takes its buffers
 rather than another lane's checkpoint. With the SSD cache it costs a write as
 well: reclaim takes checkpoints first and writes the states it evicts to the
-SSD, this one too (153 MiB for 27B), and one published straight to the SSD,
+SSD, this one too (47 MiB for 27B), and one published straight to the SSD,
 when no RAM slot took it, stays there. These writes draw on the SSD cache's
 write budget when one is set, which drops them while it is spent, a suspended
 request's own too, and a full quota makes room for one by dropping the oldest
 copy, perhaps an older conversation's restore point.
 
-A cached state holds the target's GDN cell and the draft's context window, not
-the draft's rings: the context row of each of the 2048 positions the rings
-cover, from which every draft layer computes its keys and values, in 4-bit
-codes over groups of 64 values with each group's fp16 scale and minimum
+A cached state holds a cached cell of the target's GDN state and the draft's
+context window, not the draft's rings. The cached cell
+(`GdnStateLayout::cachedCellBytes`) keeps every layer's convolution rows and
+the auxiliary state as a lane's cell does, and each layer's recurrent state as
+int8 codes, each block of 32 values of a value row with a bf16 scale, the
+block's largest magnitude over 127 (`ops::StateCodec`): 38 MiB of the 27B's 47
+MiB state, where the FP32 state takes 144 MiB. The codes are made once as a
+state is captured and decoded once as it is restored, so the running state
+keeps its format; the relative error of a decoded state is 0.8 to 0.9% on the
+27B, 35B and Qwen3.8-Flash-Next alike. A row's scale fits GDN, whose decay is per
+head: a scale per key column, across rows of very different size, had 2.4
+times the error and 6 to 10 times the effect on the next-token distributions.
+Lanes and cached states pool their cells apart (`QwenBufferPool`): a cached
+state's eviction returns a cached cell and a window, never a lane's cell, so
+`statesToActivate` counts states only for windows, and `idleBufferBytes` a
+cached cell's bytes for each.
+
+The window is the context row of each of the 2048 positions the rings cover,
+from which every draft layer computes its keys and values, in 4-bit codes over
+groups of 64 values with each group's fp16 scale and minimum
 (`DraftStateLayout::windowBytes`: 5.6 MiB for 27B and 2.25 MiB for 35B, where
 the rings take 40 and 48 MiB). Prefill keeps a lane's window beside its rings;
 a restore that continues the rings computes them from the window again at the
 start of the request's first prefill chunk (`DFlashDraft::addContextRebuild`).
-A prefill chunk writes each state it captures inside its rows
+A prefill chunk captures each state at a row of its rows
 (`ModelBatchItem::stateCaptures`) into buffers reserved before it runs: every
-GDN layer's dispatches stop there to store the state and go on from it, and
-the state's window is a copy of the lane's as the chunk finds it plus the
-chunk's rows before the boundary, since the chunk's later rows take the slots
-of the state's oldest rows in the lane's window. A state at the chunk's end is
-copied from the lane after it.
+GDN layer's dispatches stop at a state inside the rows, store its convolution
+rows in the state's cell and go on from them, while the recurrent state goes
+on in the lane's cell in place, and a dispatch of the codec stores the codes
+of the state the layer reached there; the state's window is a copy of the
+lane's as the chunk finds it plus the chunk's rows before the boundary, since
+the chunk's later rows take the slots of the state's oldest rows in the lane's
+window. A state at the end of a lane's rows in the chunk takes its codes the
+same way; the rest of a state at the command's end is copied from the lane
+after it (`QwenStateStorage::copyBeside`). `snapshot` and a state written
+straight from a lane to the SSD run one command of the codec, and a restore
+one of its decode, between commands: a restore from RAM decodes the cached
+cell into the lane's, and one from the SSD reads the slot into the lane's other
+cell, which the lane's next transition writes before it reads it, and decodes
+it from there, its promoted RAM copy taking the codes as they came.
 
 Decode keeps each lane's window current with its rings too, and a cycle whose
 retained rows may reach the next whole page reserves that page's state, in one

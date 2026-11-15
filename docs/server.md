@@ -701,23 +701,33 @@ KV format.
 
 The linear-attention (GDN) layers of the targets carry a recurrent state,
 which every lane holds and every cached state keeps, in memory and on the SSD.
-Select its storage when starting the server:
+A cached state stores it as int8 codes, each block of 32 values of a row with
+a bf16 scale, whatever format the lanes run in: 47 MiB a state for 27B instead
+of 153 MiB in FP32, 20 MiB for 35B instead of 64 MiB, so memory and the
+[SSD cache](#ssd-cache) hold 3.25 times as many cached states. A restore
+decodes the codes into the lane's state, so a cache hit continues from a state
+a little off the one it cached: restoring 40 cached prompts of code, chat and
+agent transcripts changed 27B's next-token distributions by a mean KL of
+1.1e-4, below the 1.5e-4 by which a cold run of the same prompts already
+differs from a restore of its own state, and the error does not build up over
+a conversation's successive hits.
+
+Select the running state's storage when starting the server:
 
 ```bash
 splash serve --model mlx-community/Qwen3.8-27B-4bit --state-format bf16
 ```
 
-BF16 halves the recurrent state, most of a cached state's bytes, so memory and
-the [SSD cache](#ssd-cache) hold nearly twice as many cached states, and a
-decode step reads and writes half the state. The kernels compute in FP32
-either way and round the state to BF16 where they store it: at the end of each
-prefill chunk, at each state a chunk captures inside it (a replay point,
-junction or checkpoint), and at the end of each decode step. So where a
-prompt's chunks end and its states are captured also changes its state in the
-last bits ([sampling](api.md#sampling)). Restart to switch
-formats; the SSD cache keeps each format's states apart. Omit `--state-format`
-or use `--state-format fp32` for the default, the precision the models'
-configurations ask for.
+BF16 halves the recurrent state each lane holds, and a decode step reads and
+writes half the state. The kernels compute in FP32 either way and round the
+state to BF16 where they store it: at the end of each prefill chunk, at each
+state a chunk captures inside it (a replay point, junction or checkpoint), and
+at the end of each decode step. So where a prompt's chunks end and its states
+are captured also changes its state in the last bits
+([sampling](api.md#sampling)). Cached states take the same codes in either
+format, and the SSD cache keeps them for both. Restart to switch formats. Omit
+`--state-format` or use `--state-format fp32` for the default, the precision
+the models' configurations ask for.
 
 ### SSD cache
 
@@ -790,10 +800,11 @@ that gives the unused part of a file back, as APFS does; on one that does not,
 such as HFS+ or exFAT, every copy counts a whole page's or state's room, and
 the log says so once.
 
-State writes stage through a buffer of one state (64 MiB for 35B, 153 MiB for
+State writes stage through a buffer of one state (20 MiB for 35B, 47 MiB for
 27B) that the memory plan sets aside within `--max-memory`; on a 24 GB Mac
-serving 27B that costs 4,096 tokens of context. A size sets it aside whatever
-it costs, as before, and a quota too small for one state leaves the cache off.
+serving 27B that costs about a thousand tokens of context, the KV of 30 pages.
+A size sets it aside whatever it costs, as before, and a quota too small for
+one state leaves the cache off.
 `auto` sets it aside only where the memory plan holds the model and the
 requested context beside it, and gives it up to the
 [Neural Engine split](internals.md#neural-engine-prefill) where the plan holds the split

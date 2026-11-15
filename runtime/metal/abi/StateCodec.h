@@ -9,7 +9,7 @@
 
 // A cached state stores a GDN layer's recurrent state as int8 codes, each
 // value row's values in blocks of this many that share one bf16 scale, the
-// block's largest magnitude over 127 (ops::StateCodec). Restoring 41 cached
+// block's largest magnitude over 127 (ops::StateCodec). Restoring 40 cached
 // states this way changed the 27B's next-token distributions by a mean KL of
 // 1.1e-4, below the 1.5e-4 a cold run of the same prompts differs by; a
 // scale per value row of 128 had heavier tails on the 35B (KL max 0.15 nats
