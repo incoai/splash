@@ -475,23 +475,28 @@ void pleTest(MetalBackend &backend) {
 }
 
 // A verify block's PLE rows as a tree whose rows' packed predecessors are
-// not their parents: each row's convolution taps its path's convolution
-// inputs (and the history before the anchor), as the chain of its path
-// computes it, and the commit of an accepted path writes the history after
-// that path's rows, a chain's history after the same tokens.
-void pleTreeTest(MetalBackend &backend) {
+// not their parents (row r follows parents[r], row 0 the anchor), at `taps`
+// taps `dilation` rows apart: each row's convolution taps its path's
+// convolution inputs (and the history before the anchor), as the chain of its
+// path computes it, and the commit of the accepted path to each of `leaves`
+// writes the history after that path's rows, a chain's history after the
+// same tokens. With `whole`, the tree has rows deep enough that every tap is
+// their path's, and a leaf's path holds the whole history, which the commit
+// takes from the path alone.
+void pleTreeTest(MetalBackend &backend, std::span<const uint32_t> parents, uint32_t taps, uint32_t dilation,
+                 std::span<const uint32_t> leaves, bool whole) {
   std::mt19937 rng(41);
-  constexpr uint32_t rows = 8, hidden = 256, streams = 4, taps = 4, dilation = 2, width = hidden * streams;
+  constexpr uint32_t hidden = 256, streams = 4, width = hidden * streams;
+  const auto rows = static_cast<uint32_t>(parents.size());
   const ops::NgramShape shape{hidden, streams, taps, dilation};
   const uint32_t history = shape.history();
-  // Row r follows kParents[r]: a chain of four, a branch off row 1, and one
-  // off the anchor.
-  constexpr std::array<uint32_t, rows> kParents{0, 0, 1, 2, 3, 1, 5, 0};
   std::vector<splash::ops::TreeRow> tree(rows);
   for (uint32_t r = 0; r < rows; ++r)
-    tree[r] = r ? splash::ops::TreeRow{tree[kParents[r]].ancestors | 1u << r, static_cast<uint16_t>(kParents[r]),
-                                       static_cast<uint16_t>(tree[kParents[r]].depth + 1)}
+    tree[r] = r ? splash::ops::TreeRow{tree[parents[r]].ancestors | 1u << r, static_cast<uint16_t>(parents[r]),
+                                       static_cast<uint16_t>(tree[parents[r]].depth + 1)}
                 : splash::ops::chainRow(0);
+  const std::string scope = "PLE tree of " + std::to_string(rows) + " rows at " + std::to_string(taps) + " taps " +
+                            std::to_string(dilation) + " apart";
   const auto conv = randoms(rng, rows * width, 1.0f), hist = randoms(rng, history * width, 1.0f),
              gated = randoms(rng, rows * width, 1.0f), x = randoms(rng, rows * width, 1.0f),
              tapsW = randoms(rng, width * taps, 0.4f);
@@ -526,11 +531,16 @@ void pleTreeTest(MetalBackend &backend) {
       okX &= std::fabs(gotX[r * width + c] - want) <= 1e-4 * (1 + std::fabs(want));
       differs |= std::fabs(silu(packed) - silu(sum)) > 1e-2;
     }
-  check(differs, "PLE tree: a row's packed predecessors are not its path's");
-  check(okX, "PLE tree: each row's dilated taps follow its path");
-  // The accepted path of row 6 (rows 0, 1, 5, 6) and of row 4 (a chain of
-  // five).
-  for (const uint32_t leaf : {6u, 4u}) {
+  check(differs, scope + ": a row's packed predecessors are not its path's");
+  check(okX, scope + ": each row's dilated taps follow its path");
+  if (whole) {
+    const bool everyTap = std::ranges::any_of(tree, [&](const ops::TreeRow &row) { return row.depth >= history; });
+    const bool wholeHistory = std::ranges::any_of(
+        leaves, [&](uint32_t leaf) { return uint32_t(std::popcount(tree[leaf].ancestors)) >= history; });
+    check(everyTap && wholeHistory,
+          scope + ": rows whose every tap is their path's, and a path that holds the whole history");
+  }
+  for (const uint32_t leaf : leaves) {
     MetalBuffer committed = scratch(backend, history * width * 2);
     CommandGraph commit;
     ops::NgramEmbedding::addCommit(commit, convBuffer, std::span(&histIn, 1), std::span(&committed, 1),
@@ -542,7 +552,7 @@ void pleTreeTest(MetalBackend &backend) {
     for (uint32_t j = 0; j < history; ++j)
       for (uint32_t c = 0; c < width; ++c)
         ok &= f32(got[j * width + c]) == input(leaf, int(tree[leaf].depth) + 1 - int(history) + int(j), c);
-    check(ok, "PLE tree: the history after the accepted path to row " + std::to_string(leaf));
+    check(ok, scope + ": the history after the accepted path to row " + std::to_string(leaf));
   }
 }
 
@@ -1207,6 +1217,102 @@ void qsaChainAsSequential(MetalBackend &backend, uint32_t anchor, uint32_t rows,
             download<uint16_t>(decoded.pending[0], kQsaPendingBytes / 2) ==
                 download<uint16_t>(whole.pendingAfter[0], kQsaPendingBytes / 2),
         scope + ": the commit's index and pending keys the steps' of one row");
+}
+
+// The commit of a verify step's two attention layers in one dispatch, each
+// layer its own region of every page's index plane (indexLayerBytes apart)
+// and its own history, raw keys, block keys and pending keys: after the
+// accepted path of qsaTreeAsChains' tree to row 14, which completes two
+// blocks of its own at an anchor 2 past a block, each layer's index region
+// and pending keys are its path's chain's committed alone into that layer.
+void qsaCommitLayers(MetalBackend &backend) {
+  constexpr uint32_t D = kQsaDimension, H = BLOCK_INDEXER_HEADS, rows = 16, layers = 2, anchor = 2046, top = 512;
+  std::mt19937 rng(61);
+  const QsaWeights weights = qsaWeights(backend, rng);
+  const uint32_t pages = (anchor + rows + kQsaPage - 1) / kQsaPage;
+  // A layer's region of the index: whole 16 KiB pages, so that a table of
+  // the region keeps its entries' page bits.
+  const uint64_t layerBytes = (uint64_t{pages} * (kQsaPage / 4) * D * 2 + 16383) / 16384 * 16384;
+  MetalBuffer index = backend.allocateBuffer(layers * layerBytes, BufferStorage::Shared, "qwen4-test-index",
+                                             BufferReach::Addressed);
+  std::memset(index.contents(), 0, index.sizeBytes());
+  if (index.gpuAddress() & SPLASH_KV_PAGE_INDEX_MASK) throw std::runtime_error("a QSA test index leaves no page bits");
+  std::vector<uint32_t> order(pages);
+  std::iota(order.begin(), order.end(), 0);
+  std::shuffle(order.begin(), order.end(), rng);
+  // Each layer's history: its own raw keys of the anchor's tokens, pooled
+  // through a table of the layer's region, and its pending keys after them.
+  std::array<QsaLane, layers> history;
+  for (uint32_t layer = 0; layer < layers; ++layer) {
+    QsaLane &lane = history[layer];
+    lane.tokens = lane.first = anchor;
+    lane.raw = randoms(rng, uint64_t{anchor} * D, 1.0f);
+    lane.table = order;
+    std::vector<uint64_t> entries;
+    for (const uint32_t page : order) entries.push_back((index.gpuAddress() + layer * layerBytes) | page);
+    lane.tableBuffer = upload(backend, entries);
+    backend.setTableReach(lane.tableBuffer, std::span(&index, 1));
+    for (MetalBuffer &pending : lane.pending) pending = upload(backend, std::vector<uint16_t>(kQsaPendingBytes / 2, 0));
+    CommandGraph graph;
+    for (uint32_t from = 0; from < anchor; from += 2048)
+      qsaPrefillStep(backend, graph, lane, from, std::min(2048u, anchor - from), weights.keyNorm, weights.invFreq,
+                     1.0F, 0);
+    run(backend, graph);
+  }
+  const std::vector<uint8_t> before = download<uint8_t>(index, index.sizeBytes());
+  constexpr std::array<int, rows> kParents{-1, 0, 1, 2, 3, 4, 5, 6, 7, 8, 0, 10, 3, 12, 13, 8};
+  const std::vector<ops::TreeRow> tree = qsaTree(kParents);
+  const uint32_t leaf = 14, words = ((anchor + rows) / 4 + BLOCK_INDEXER_TILE_SLACK + 31) / 32 + 1;
+  const std::vector<uint32_t> committed = qsaPath(tree[leaf]);
+  // Each layer's verify step of the tree, its rows' raw keys and block keys
+  // and its pending keys before it in its layer's place, then one commit of
+  // the path in both layers.
+  std::array<QsaTreeLane, layers> lanes;
+  std::vector<uint16_t> keys, blockKeys, pendingIn;
+  for (uint32_t layer = 0; layer < layers; ++layer) {
+    lanes[layer] = {anchor, tree, randoms(rng, uint64_t{rows} * H * D, 1.0f), randoms(rng, uint64_t{rows} * D, 1.0f)};
+    const std::array<const QsaLane *, 1> histories{&history[layer]};
+    const QsaTreeResult step = qsaTreeStep(backend, std::span(&lanes[layer], 1), histories, top, words, weights);
+    const std::vector<uint16_t> stepKeys = download<uint16_t>(step.keys, uint64_t{rows} * D),
+                                stepBlockKeys = download<uint16_t>(step.blockKeys, uint64_t{rows} * D),
+                                pending = download<uint16_t>(history[layer].pending[0], kQsaPendingBytes / 2);
+    keys.insert(keys.end(), stepKeys.begin(), stepKeys.end());
+    blockKeys.insert(blockKeys.end(), stepBlockKeys.begin(), stepBlockKeys.end());
+    pendingIn.insert(pendingIn.end(), pending.begin(), pending.end());
+  }
+  const MetalBuffer pendingOut = upload(backend, std::vector<uint16_t>(layers * kQsaPendingBytes / 2, 0));
+  const std::array<ops::LaneRows, 1> laneRows{{{0, rows}}};
+  const std::array<uint32_t, 1> anchors{anchor};
+  const std::array<MetalBuffer, 1> in{upload(backend, pendingIn)}, out{pendingOut}, tables{history[0].tableBuffer};
+  CommandGraph graph;
+  ops::BlockIndexer::addCommit(graph, {upload(backend, keys), upload(backend, blockKeys), layers, rows,
+                                       upload(backend, std::vector<uint32_t>{tree[leaf].ancestors}),
+                                       laneRowsOf(backend, laneRows), anchors, in, out, tables,
+                                       static_cast<uint32_t>(layerBytes)});
+  run(backend, graph);
+  const std::vector<uint8_t> treeIndex = download<uint8_t>(index, index.sizeBytes());
+  const std::vector<uint16_t> treePending = download<uint16_t>(pendingOut, layers * kQsaPendingBytes / 2);
+  // Each layer's chain of the path, committed alone through its region's
+  // table, from the history before the step.
+  std::memcpy(index.contents(), before.data(), before.size());
+  bool pendingSame = true;
+  for (uint32_t layer = 0; layer < layers; ++layer) {
+    const QsaTreeLane chain = qsaChainOf(lanes[layer], committed, anchor);
+    const std::array<const QsaLane *, 1> histories{&history[layer]};
+    const std::array<uint32_t, 1> chainPath{ops::chainPath(static_cast<uint32_t>(committed.size()))};
+    const QsaTreeResult step = qsaTreeStep(backend, std::span(&chain, 1), histories, top, words, weights, chainPath);
+    const std::vector<uint16_t> pending = download<uint16_t>(step.pendingAfter[0], kQsaPendingBytes / 2);
+    pendingSame &= std::equal(pending.begin(), pending.end(),
+                              treePending.begin() + uint64_t{layer} * kQsaPendingBytes / 2);
+  }
+  const std::vector<uint8_t> chainIndex = download<uint8_t>(index, index.sizeBytes());
+  const auto region = [&](const std::vector<uint8_t> &bytes, uint32_t layer) {
+    return std::vector<uint8_t>(bytes.begin() + layer * layerBytes, bytes.begin() + (layer + 1) * layerBytes);
+  };
+  check(treeIndex == chainIndex && region(treeIndex, 0) != region(before, 0) &&
+            region(treeIndex, 1) != region(before, 1),
+        "QSA commit of a tree's path in two layers: each layer's index region its path's chain's");
+  check(pendingSame, "QSA commit of a tree's path in two layers: each layer's pending keys its path's chain's");
 }
 
 // Lanes whose verify blocks hold different row counts, packed one after
@@ -2062,7 +2168,19 @@ int main(int argc, const char *argv[]) {
         hyperTableTest(backend);
         hyperNormKernelsTest(backend, !std::getenv("MTL_SHADER_VALIDATION"));
         pleTest(backend);
-        pleTreeTest(backend);
+        // A chain of four, a branch off row 1 and one off the anchor,
+        // committing the paths of row 6 (rows 0, 1, 5 and 6) and row 4 (a
+        // chain of five).
+        pleTreeTest(backend, std::array<uint32_t, 8>{0, 0, 1, 2, 3, 1, 5, 0}, 4, 2, std::array<uint32_t, 2>{6, 4},
+                    false);
+        // Flash-Next's taps (a history of 9 rows) over a 16-row block: a chain
+        // through row 3 that skips row 4 to run on from row 5 to depth 12, and
+        // a branch off row 1 (rows 4, 14 and 15). Rows 10 to 13 take every tap
+        // from their paths, and the path to row 13 (13 rows) holds the whole
+        // history after it.
+        pleTreeTest(backend,
+                    std::array<uint32_t, 16>{0, 0, 1, 2, 1, 3, 5, 6, 7, 8, 9, 10, 11, 12, 4, 14}, 4, 3,
+                    std::array<uint32_t, 2>{13, 15}, true);
         plePackedLanes(backend);
         plePackedCommit(backend);
         qsaTest(backend, {150, 20, 16, 0, 1, 7});
@@ -2099,6 +2217,7 @@ int main(int argc, const char *argv[]) {
         qsaChainAsSequential(backend, 4093, 8, 5, 512);
         qsaChainAsSequential(backend, 602, 16, 11, 16);
         qsaPackedLanes(backend);
+        qsaCommitLayers(backend);
         qsaProjectPackedLanes(backend);
         qsaScratchCoversWindow(backend);
         qsaRollbackTest(backend);
