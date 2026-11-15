@@ -54,18 +54,22 @@ template <uint HeadDim, uint Rows> struct GdnPendingShared {
 // head's v, the gates, the recurrent output rows and the rows' paths; a
 // tree's coefficients of its rows (gdn_decode_transform), whose transformed
 // queries then take the q/k rows' place; and the pending rows, which the
-// head folds into its state first. A value row is
-// ValueStride apart, two more than a head's, so that a tree's lanes reading
-// one value of every row read distinct banks.
+// head folds into its state first. The v rows are held dimension-major, each
+// dimension's rows in turn (values[dim * Rows + row]): a tree's lanes, a lane
+// a row, read one dimension of every row from consecutive addresses, and a
+// chain one row's at a time. Measured on an M5 Pro over the 27B's and 35B's
+// GDN layers, the 8- and the 16-row kernels: 8-row chains ran 0.4-2.5%
+// faster than the base, 16-row trees 0.4-1.5% faster than with rows of
+// HeadDim values and up to 1.4% faster than with rows padded to HeadDim + 2
+// (0.3% slower in one case of eight), 8-row trees within 1.3% of either.
 template <uint HeadDim, uint Rows> struct GdnDecodeShared {
   static_assert(Rows % kDecodeSimdgroups == 0 && Rows <= SPLASH_TARGET_VERIFY_ROWS && Rows <= 32,
                 "whole rows a simdgroup, and a lane of the simdgroup a row");
-  static constexpr constant uint ValueStride = HeadDim + 2;
   // The rows each simdgroup holds.
   static constexpr constant uint Passes = Rows / kDecodeSimdgroups;
   bfloat queries[Rows * HeadDim];
   bfloat keys[Rows * HeadDim];
-  bfloat values[Rows * ValueStride];
+  bfloat values[HeadDim * Rows];
   bfloat rows[Rows * HeadDim];
   float decay[Rows];
   bfloat beta[Rows];
@@ -151,7 +155,6 @@ inline void gdn_decode_prologue(
   constexpr uint BOffset = ConvDim + ValueWidth;
   constexpr uint AOffset = BOffset + ValueHeads;
   constexpr uint Groups = HeadDim / 32;
-  constexpr uint ValueStride = GdnDecodeShared<HeadDim, Rows>::ValueStride;
   static_assert(HeadDim == 128, "four channels per lane");
   const uint key_head = value_head / HeadsPerKey;
   // The key head's q/k rows and conv carry are shared by HeadsPerKey value
@@ -229,7 +232,7 @@ inline void gdn_decode_prologue(
       if (writes) {
         shared.queries[token * HeadDim + dim] = query;
         shared.keys[token * HeadDim + dim] = key;
-        shared.values[token * ValueStride + dim] = v[g];
+        shared.values[dim * Rows + token] = v[g];
         if (token >= verified)
           shared.rows[token * HeadDim + dim] = bfloat(0.0f);
         step_tape.inputs[token * ConvDim + v_channel + 32 * g] =
@@ -317,7 +320,6 @@ inline void gdn_decode_scan(device const State *state_in,
                             uint pending, uint verified, uint value_head,
                             uint lane, uint simd_group) {
   constexpr uint Batches = HeadDim / kDecodeSimdgroups;
-  constexpr uint ValueStride = GdnDecodeShared<HeadDim, Rows>::ValueStride;
   static_assert(Batches % RowsInFlight == 0, "rows in flight tile the head");
   const auto base = [&](uint batch, uint r) {
     const uint value_dim = (batch + r) * kDecodeSimdgroups + simd_group;
@@ -355,7 +357,7 @@ inline void gdn_decode_scan(device const State *state_in,
         const bool on_path = lane < Rows && (shared.paths[token] >> row & 1);
         const float coefficient = shared.coefficients[token * Rows + row];
         for (uint r = 0; r < RowsInFlight; ++r) {
-          result[r] = on_path ? coefficient * float(shared.values[row * ValueStride + value_dim[r]]) : 0.0f;
+          result[r] = on_path ? coefficient * float(shared.values[value_dim[r] * Rows + row]) : 0.0f;
           for (uint i = 0; i < 4; ++i)
             result[r] += state[r][i] * query[i];
           result[r] = simd_sum(result[r]);
@@ -377,7 +379,7 @@ inline void gdn_decode_scan(device const State *state_in,
         }
         for (uint r = 0; r < RowsInFlight; ++r) {
           const float delta =
-              (float(shared.values[token * ValueStride + value_dim[r]]) -
+              (float(shared.values[value_dim[r] * Rows + token]) -
                memory[r]) *
               b;
           result[r] = 0.0f;
