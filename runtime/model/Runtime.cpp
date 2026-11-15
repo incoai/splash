@@ -2382,9 +2382,11 @@ struct Runtime::Impl {
   // it is accepted, each estimated at 1 for every agreement with the draft:
   // a thinking end, which its cutoff selects, and the tokens a grammar
   // forces, which its masks admit alone (at each of the 847 forced positions
-  // of 15 traced structured outputs of Qwen3.8-27B).
+  // of 15 traced structured outputs of Qwen3.8-27B). A draft step that joins
+  // its row labels nothing: the target accepts it whatever the draft's odds.
   void proposeForcedChain(ops::DraftTreeLane &tree, uint32_t lane, std::span<const uint32_t> tokens) {
     tree.chain = static_cast<uint32_t>(std::min<size_t>(tokens.size(), SPLASH_TREE_CHAIN_TOKENS));
+    tree.forced = true;
     std::copy_n(tokens.begin(), tree.chain,
                 contents<uint32_t>(decodeArena->get(lane, DecodeTensor::ChainTokens), "chain tokens"));
     std::fill_n(contents<float>(decodeArena->get(lane, DecodeTensor::ChainRates), "chain rates"),

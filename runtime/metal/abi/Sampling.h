@@ -222,11 +222,16 @@ static_assert(sizeof(SelectorBatchParams) == 24,
 // Gumbel-top-k: the largest log q_T + G, G a Gumbel of the row's key and the
 // candidate's token, a row's key a hash of its parent's and its token, the
 // anchor's the lane's noise[l] (a 64-bit seed, low word first), so that every
-// row draws with noise of its own. A sampled lane's q is q_T.
+// row draws with noise of its own. A sampled lane's q is q_T. A row's draft
+// probability is the q of the draft step that made it, or joined it where a
+// host chain made it first; a row of a chain whose tokens the target selects
+// whatever its logits (forced[l]: a thinking end, a grammar's forced tokens)
+// has none (-1), as has a chain row no draft step joined.
 struct DraftTreeParams {
   uint32_t anchor[SPLASH_MAXIMUM_BATCH_WIDTH];
   uint32_t depth[SPLASH_MAXIMUM_BATCH_WIDTH];
   uint32_t chain[SPLASH_MAXIMUM_BATCH_WIDTH];
+  uint32_t forced[SPLASH_MAXIMUM_BATCH_WIDTH];
   uint32_t children[SPLASH_MAXIMUM_BATCH_WIDTH];
   uint32_t lanes;
   float slope[SPLASH_MAXIMUM_BATCH_WIDTH];
@@ -235,8 +240,8 @@ struct DraftTreeParams {
   uint32_t noise[SPLASH_MAXIMUM_BATCH_WIDTH][2];
 };
 
-static_assert(sizeof(DraftTreeParams) == 244,
-              "Draft tree parameters are 244 bytes on both sides");
+static_assert(sizeof(DraftTreeParams) == 260,
+              "Draft tree parameters are 260 bytes on both sides");
 
 // The rows of a decode cycle (draft_verify_rows): `rows` rows over its lanes,
 // 1 to lane_cap a lane, laid out from the lanes' trees (DraftTreeParams).

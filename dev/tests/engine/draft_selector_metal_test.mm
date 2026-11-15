@@ -14,11 +14,12 @@
 // by its lane's own calibration; a sampled lane's row takes its candidates of
 // the largest log q_T + G, G the Gumbel of the row's key), ranked, one row for each token path, as
 // many as a verify block holds and none deeper than its depth: its tokens,
-// parents, depths, ancestors, draft probabilities (none for a row a host
-// chain token made) and estimates. A tree of one child a row and no chain is
-// the chain the selector walked before it built trees, token for token, from
-// the same scores. A host chain whose tokens the target selects whatever its
-// logits, with no draft children, takes the first rows. draft_verify_rows
+// parents, depths, ancestors, draft probabilities (a host chain's row takes
+// that of a draft step that joins it, none otherwise, a forced chain's none)
+// and estimates. A tree of one child a row and no chain is the chain the
+// selector walked before it built trees, token for token, from the same
+// scores. A host chain whose tokens the target selects whatever its logits,
+// with no draft children, takes the first rows. draft_verify_rows
 // must choose the verify rows of every lane whose expected tokens (per cost)
 // are the best of every assignment the step's rows and the lanes' cap allow,
 // pack the lanes' rows in lane order with the step's other rows on the first
@@ -436,15 +437,6 @@ std::optional<std::vector<Node>> referenceTree(const Lattice &l, const DraftTree
           !(siblings && after.score == entry.score))
         return std::nullopt;
     }
-    if (const auto found = made.find(entry.path); found != made.end()) {
-      if (!entry.chain && rows[found->second].draws.empty())
-        expanded(rows[found->second]);
-      continue;
-    }
-    Node node;
-    node.path = entry.path;
-    node.parent = made.at(std::vector<uint32_t>(entry.path.begin(), entry.path.end() - 1));
-    node.estimate = entry.score;
     const uint32_t position = static_cast<uint32_t>(entry.path.size()) - 1;
     // A token's candidate index at its position, or none.
     const auto candidate = [&](uint32_t at, uint32_t token) -> int {
@@ -453,9 +445,27 @@ std::optional<std::vector<Node>> referenceTree(const Lattice &l, const DraftTree
       const auto found = std::find(l.ids[at].begin(), l.ids[at].end(), token);
       return found == l.ids[at].end() ? -1 : int(found - l.ids[at].begin());
     };
-    const int own = candidate(position, entry.path.back());
-    const int predecessor = position ? candidate(position - 1, entry.path[position - 1]) : 0;
-    node.q = entry.chain ? -1.0 : draftProbability(l.q[position][predecessor], lane, own);
+    // A draft entry's probability: its token's after its parent's.
+    const auto drafted = [&] {
+      const int own = candidate(position, entry.path.back());
+      const int predecessor = position ? candidate(position - 1, entry.path[position - 1]) : 0;
+      return draftProbability(l.q[position][predecessor], lane, own);
+    };
+    if (const auto found = made.find(entry.path); found != made.end()) {
+      Node &row = rows[found->second];
+      // A draft step that joins a lookup chain's row gives it its
+      // probability; a forced chain's rows keep none.
+      if (!entry.chain && row.q < 0.0 && !lane.forced)
+        row.q = drafted();
+      if (!entry.chain && row.draws.empty())
+        expanded(row);
+      continue;
+    }
+    Node node;
+    node.path = entry.path;
+    node.parent = made.at(std::vector<uint32_t>(entry.path.begin(), entry.path.end() - 1));
+    node.estimate = entry.score;
+    node.q = entry.chain ? -1.0 : drafted();
     if (!entry.chain)
       expanded(node);
     made.emplace(entry.path, static_cast<uint32_t>(rows.size()));
@@ -820,6 +830,64 @@ void forcedChain(MetalBackend &backend) {
     for (uint32_t d = 0; d + 1 < made; ++d)
       rows.push_back({std::vector<uint32_t>(end.begin(), end.begin() + d + 1), d, -1.0, 1.0, {}, {}});
     requireTree(f, lane, trees[lane].anchor, rows, "forced chain lane " + std::to_string(lane));
+  }
+}
+
+// A host chain that copies the draft's likeliest path, at rates above the
+// draft's first step's estimate, makes its first row before the draft's
+// likeliest first step joins it, and the draft's later steps join its other
+// rows: a lookup chain's row takes the probability of the draft step that
+// joins it, a forced chain's (a grammar's forced tokens, with draft children)
+// none, both as the reference has them.
+void chainRowsTheDraftJoins(MetalBackend &backend) {
+  constexpr uint32_t vocabulary = 1003;
+  constexpr float kRate = 0.995F;
+  const std::array patterns{Pattern::Peaked};
+  uint32_t checked = 0;
+  for (uint32_t trial = 0; checked < 8; ++trial) {
+    require(trial < 64, "the reference found too few unambiguous joined chains");
+    Random random(0x6a6f696e + trial);
+    const Fixture f = makeFixture(backend, vocabulary, 2, random, patterns, 0.4F);
+    const DraftSelector selector(vocabulary);
+    std::array trees{DraftTreeLane{random.next() % vocabulary, kBlock - 1, kPositions, 2},
+                     DraftTreeLane{random.next() % vocabulary, kBlock - 1, kPositions, 2}};
+    trees[1].forced = true;
+    run(backend, selector, f, trees);
+    std::array<Chain, 2> chains;
+    bool chainFirst = true;
+    for (uint32_t lane = 0; lane < 2; ++lane) {
+      const Lattice l = latticeOf(f, lane);
+      // The first draft step's estimate is its q, the calibration the
+      // identity: the chain's first row comes first below its rate.
+      chainFirst = chainFirst && l.q[0][0][l.ranked[0][0][0]] < kRate - 0.002;
+      uint32_t predecessor = 0;
+      for (uint32_t d = 0; d < kPositions; ++d) {
+        const uint32_t index = l.ranked[d][predecessor][0];
+        chains[lane].tokens.push_back(l.ids[d][index]);
+        chains[lane].rates.push_back({kRate, kRate, kRate, kRate});
+        predecessor = index;
+      }
+      std::copy(chains[lane].tokens.begin(), chains[lane].tokens.end(), f.chainTokens(lane));
+      std::fill_n(f.chainRates(lane), kPositions * kAgreements, kRate);
+    }
+    if (!chainFirst)
+      continue;
+    run(backend, selector, f, trees);
+    std::array<std::optional<std::vector<Node>>, 2> references;
+    for (uint32_t lane = 0; lane < 2; ++lane)
+      references[lane] = referenceTree(latticeOf(f, lane), trees[lane], chains[lane]);
+    if (!references[0] || !references[1])
+      continue;
+    ++checked;
+    for (uint32_t lane = 0; lane < 2; ++lane)
+      requireTree(f, lane, trees[lane].anchor, *references[lane],
+                  "joined chain trial " + std::to_string(trial) + " lane " + std::to_string(lane));
+    // The chain made row 1, and the draft's likeliest first step joined it.
+    const float lookupQ = f.scores()[2 * 1], forcedQ = f.scores()[2 * (kBlock + 1)];
+    require(f.tokens()[1] == chains[0].tokens[0] && lookupQ > 0.0F && lookupQ <= 1.0F,
+            "a lookup chain's row the draft joined did not take its draft probability");
+    require(f.tokens()[kBlock + 1] == chains[1].tokens[0] && forcedQ == -1.0F,
+            "a forced chain's row the draft joined took a draft probability");
   }
 }
 
@@ -1284,6 +1352,7 @@ int main(int argc, char **argv) {
     lowTemperatureDraws(backend);
     forcedChain(backend);
     budgetedRowsReadRowsBefore(backend);
+    chainRowsTheDraftJoins(backend);
     verifyRowsLayout(backend);
     verifyRowsAcrossLanes(backend);
     std::cout << "draft_selector_metal_test: PASS\n";

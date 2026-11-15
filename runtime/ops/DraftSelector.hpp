@@ -73,7 +73,9 @@ struct DraftCalibration final {
 // `children` children a draft row (none: its rows are its host chain's), its
 // draft steps estimated by `calibration`. A greedy lane (temperature 0) takes
 // a row's most likely candidates; a sampled lane draws them without
-// replacement at its temperature, with the cycle's `noise`.
+// replacement at its temperature, with the cycle's `noise`. A `forced` chain
+// is one whose tokens the target selects whatever its logits, whose rows no
+// draft step joining them gives a draft probability.
 struct DraftTreeLane final {
   uint32_t anchor = 0;
   uint32_t depth = 0;
@@ -82,6 +84,7 @@ struct DraftTreeLane final {
   DraftCalibration calibration{};
   float temperature = 0.0F;
   uint64_t noise = 0;
+  bool forced = false;
 };
 
 // The draft's selector codebooks, which score the edge from a proposal

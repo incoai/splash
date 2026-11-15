@@ -88,8 +88,9 @@ public:
   // whose `selections`, the target's, are those of its path's rows in order
   // from its anchor's: each row whose parent is one of those rows, labeled
   // with whether the parent's selection is its token, a row past the lane's
-  // verify rows too, but none whose draft probability is not one (a row a
-  // host chain made, or a draft row that is not finite).
+  // verify rows too, but none whose draft probability is not one (a host
+  // chain's row no draft step joined, a forced chain's row, or a draft row
+  // that is not finite).
   [[nodiscard]] static std::vector<Label> treeLabels(std::span<const uint32_t> tokens,
                                                      std::span<const ops::TreeRow> rows,
                                                      std::span<const float> scores,

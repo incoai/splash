@@ -377,7 +377,8 @@ cycles on its last 4096 labels: each row of a lane's tree whose parent the
 cycle's walk accepted, labeled with whether the target selected the row's
 token there, a row past the lane's verify rows too (its parent's selection
 says whether the target would have accepted it), but none whose probability
-is not one (a row a lookup chain made, or a draft row that is not finite) and
+is not one (a lookup chain's row that no draft step joined, a row of a chain
+the target selects whatever its logits, or a draft row that is not finite) and
 none under a selection a thinking cutoff made; by damped Newton steps under a
 prior fit to Qwen3.8-Flash-Next's and Qwen3.6-35B-A3B's cycles, which also
 stands before any label. Labels of a tree's rows, not only of its likeliest

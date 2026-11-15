@@ -59,6 +59,7 @@ void DraftSelector::add(metal::CommandGraph &graph, const DraftSelectorBuffers &
     edges.anchor[lane] = tree.anchor[lane] = l.anchor;
     tree.depth[lane] = l.depth;
     tree.chain[lane] = l.chain;
+    tree.forced[lane] = l.forced;
     tree.children[lane] = l.children;
     tree.slope[lane] = l.calibration.slope;
     std::ranges::copy(l.calibration.intercepts, tree.intercept[lane]);

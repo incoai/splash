@@ -1576,12 +1576,14 @@ inline void tree_expand(threadgroup TreeLattice &lattice,
 // are written in the order the tree takes them, lane l's from row l *
 // SPLASH_TARGET_VERIFY_ROWS, so a row's parent comes before it and its
 // estimate is at most its parent's; sizes holds each lane's rows. A row's
-// draft probability (scores' x) is that of the draft step that made it, its
-// token's among the candidates after its parent's, -1 for a row a host chain
-// token made; its estimate is scores' y. Of each row it also writes the
-// candidate indices of the children it drew, in order (draws, kNoCandidate
-// past them), and its next position's probabilities (next), which a sampled
-// verify row's selection tests (decode_sample_vocabulary_draw).
+// draft probability (scores' x) is that of the draft step that made it, or
+// joined it where a lookup chain's token made it, its token's among the
+// candidates after its parent's; -1 for a chain row no draft step joined,
+// and for every row of a forced chain; its estimate is scores' y. Of each
+// row it also writes the candidate indices of the children it drew, in order
+// (draws, kNoCandidate past them), and its next position's probabilities
+// (next), which a sampled verify row's selection tests
+// (decode_sample_vocabulary_draw).
 kernel void draft_select_tree(
     device const uint *candidates [[buffer(0)]],
     device const float *unary [[buffer(1)]],
@@ -1697,6 +1699,13 @@ kernel void draft_select_tree(
         rows.estimate[row] = score;
         rows.key[row] = tree_key(rows.key[parent], token);
         tree_row_clear(rows, row);
+      } else if (!from_chain && rows.q[row] < 0.0f && !params.forced[lane]) {
+        // A draft step that joins a lookup chain's row labels the draft's
+        // calibration like any draft row: such rows, which the draft's top
+        // candidate often is, the target accepted 97-100% of the time in
+        // decode traces (model::LookupAcceptance::kPrior), and the fit
+        // without them learns from the draft's other rows alone.
+        rows.q[row] = rows.next[parent][index];
       }
       // The row's children lie a step deeper.
       if (position + 1 >= deepest)
