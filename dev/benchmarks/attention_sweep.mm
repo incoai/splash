@@ -37,7 +37,11 @@
 // layer does (model/Qwen4ExpTarget.cpp): its rows' query heads and keys, the
 // pooled keys of the blocks they complete, every row's scores of every complete
 // block and its bitmap, over random pooled keys of the history, a lane's rows'
-// indexer queries sharing most of their direction as consecutive tokens' do.
+// indexer queries sharing most of their direction as consecutive tokens' do;
+// a prefill chunk as a prompt's sequence (ops::BlockIndexer::addPool,
+// addSelect), the verify lanes as a verify step whose lanes are chains on the
+// device (addTreePool, addTreeSelect: each row's own blocks pooled into its
+// block key and scored from there).
 // Every case with lists reports their mean entries (the union of a tile's
 // rows' blocks, which its attention reads). Without --qsa the fn tiles attend
 // every block. --located moves each fn verify case's listed blocks of its
@@ -228,6 +232,9 @@ struct QsaIndexer final {
   // kPrefillScoreRows, a verify's all at once.
   uint32_t scoreRows = 0;
   metal::MetalBuffer records, query, key, norm, ropeCos, ropeSin, inverseFrequencies, queries, keys, scores;
+  // A verify's lanes' rows and their tree rows on the device (each lane's
+  // chain), and its rows' block keys and row masks.
+  metal::MetalBuffer laneRows, tree, blockKeys, rowMasks;
 };
 
 // A value in [-1, 1) of `index` under `seed`.
@@ -313,6 +320,17 @@ QsaIndexer qsaIndexer(metal::MetalBackend &backend, const AttentionFixturePlan &
   result.scoreRows = prefill ? 256 : laneRows;
   result.scores = backend.allocateBuffer(uint64_t{result.scoreRows} * stride * sizeof(float),
                                          metal::BufferStorage::Private, "attention-sweep-scores");
+  if (prefill) return result;
+  result.laneRows = sharedBuffer<ops::LaneRows>(backend, lanes, "attention-sweep-lane-rows");
+  result.tree = sharedBuffer<ops::TreeRow>(backend, laneRows, "attention-sweep-tree-rows");
+  for (uint32_t lane = 0; lane < lanes; ++lane)
+    static_cast<ops::LaneRows *>(result.laneRows.contents())[lane] = {lane * rows, rows};
+  for (uint32_t row = 0; row < laneRows; ++row)
+    static_cast<ops::TreeRow *>(result.tree.contents())[row] = ops::chainRow(row % rows);
+  result.blockKeys = backend.allocateBuffer(uint64_t{laneRows} * D * 2, metal::BufferStorage::Private,
+                                            "attention-sweep-block-keys");
+  result.rowMasks = backend.allocateBuffer(uint64_t{laneRows} * 4, metal::BufferStorage::Private,
+                                           "attention-sweep-row-masks");
   return result;
 }
 
@@ -400,14 +418,32 @@ metal::CommandGraph caseGraph(const AttentionFixture &fixture, const QsaBlocks &
     std::vector<ops::LaneRows> lanes;
     for (uint32_t lane = 0; lane < indexer->firstPositions.size(); ++lane)
       lanes.push_back({lane * plan.rows, plan.rows});
-    const ops::IndexerRows rows{lanes, indexer->firstPositions, {indexer->tables, 0}, kQsaTopBlocks, qsa.words,
-                                qsa.words * 32};
+    const ops::IndexerRows sequence{lanes, indexer->firstPositions, {indexer->tables, 0}, kQsaTopBlocks, qsa.words,
+                                    qsa.words * 32};
     BlockIndexer::addProject(graph, indexer->query, indexer->key, {indexer->norm, true}, indexer->ropeCos,
-                             indexer->ropeSin, indexer->queries, indexer->keys, rows);
-    BlockIndexer::addPool(graph,
-                          {indexer->records, indexer->counts, indexer->laneRecords, indexer->keys, indexer->pending},
-                          {indexer->norm, true}, indexer->inverseFrequencies, 1.0F, rows);
-    BlockIndexer::addSelect(graph, indexer->queries, indexer->scores, indexer->scoreRows, qsa.bitmaps, rows);
+                             indexer->ropeSin, indexer->queries, indexer->keys, sequence);
+    if (indexer->tree) {
+      const ops::IndexerTreeRows rows{indexer->laneRows,
+                                      indexer->tree,
+                                      plan.lanes * plan.rows,
+                                      plan.rows,
+                                      indexer->firstPositions,
+                                      {indexer->tables, 0},
+                                      kQsaTopBlocks,
+                                      qsa.words,
+                                      qsa.words * 32};
+      BlockIndexer::addTreePool(graph,
+                                {indexer->records, indexer->counts, indexer->laneRecords, indexer->keys,
+                                 indexer->pending},
+                                indexer->blockKeys, {indexer->norm, true}, indexer->inverseFrequencies, 1.0F, rows);
+      BlockIndexer::addTreeSelect(graph, indexer->queries, indexer->blockKeys, indexer->scores, qsa.bitmaps,
+                                  indexer->rowMasks, rows);
+    } else {
+      BlockIndexer::addPool(graph,
+                            {indexer->records, indexer->counts, indexer->laneRecords, indexer->keys, indexer->pending},
+                            {indexer->norm, true}, indexer->inverseFrequencies, 1.0F, sequence);
+      BlockIndexer::addSelect(graph, indexer->queries, indexer->scores, indexer->scoreRows, qsa.bitmaps, sequence);
+    }
   }
   if (qsa.words) {
     std::vector<BlockListRows> sequences;
