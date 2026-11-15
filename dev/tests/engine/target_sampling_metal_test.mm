@@ -2,8 +2,8 @@
 //
 // The penalty kernels must rewrite exactly the logits of the penalized lanes'
 // prompt and output tokens, within float rounding of the host arithmetic,
-// from each lane's own penalty table row, counting at verify row r the draft
-// tokens of rows 1..r; every other logit stays bitwise. The policy then
+// from each lane's own penalty table row, counting at a row its path's draft
+// tokens but the anchor's; every other logit stays bitwise. The policy then
 // selects from them, among the tokens each lane admits: a greedy row takes
 // its argmax, and a sampled row draws from its distribution over the whole
 // vocabulary (the tokens min_p leaves, the top-k of those, then top-p of
@@ -34,6 +34,7 @@
 #include "metal/abi/Sampling.h"
 
 #include <algorithm>
+#include <bit>
 #include <array>
 #include <cmath>
 #include <cstdint>
@@ -124,6 +125,16 @@ std::vector<uint32_t> initialRows(size_t lanes, uint32_t offset) {
   return result;
 }
 
+// Each lane's verify block of `lanes` as a chain.
+MetalBuffer chainTree(MetalBackend &backend, std::span<const LaneRows> lanes) {
+  MetalBuffer buffer = allocate(backend, rowsEnd(lanes) * sizeof(TreeRow));
+  auto *tree = static_cast<TreeRow *>(buffer.contents());
+  for (const LaneRows &lane : lanes)
+    for (uint32_t row = 0; row < lane.rows; ++row)
+      tree[lane.first + row] = chainRow(row);
+  return buffer;
+}
+
 struct Batch final {
   SamplingBuffers buffers;
   uint32_t vocabulary = 0;
@@ -177,6 +188,7 @@ Batch makeBatch(MetalBackend &backend, uint32_t vocabulary, uint32_t lanes) {
               allocate(backend, space.argmaxValuesBytes),
               allocate(backend, space.argmaxIndicesBytes),
               allocate(backend, uint64_t{rows} * sizeof(uint32_t)),
+              chainTree(backend, blocks(lanes)),
               allocate(backend, space.vocabularyRangesBytes),
               allocate(backend, space.vocabularyArrivalsBytes)},
           vocabulary, rows};
@@ -584,21 +596,11 @@ void penalties(MetalBackend &backend, uint32_t vocabulary, uint32_t lanes,
   }
 }
 
-// Each lane's verify block of `lanes` as a chain.
-MetalBuffer chainTree(MetalBackend &backend, std::span<const LaneRows> lanes) {
-  MetalBuffer buffer = allocate(backend, rowsEnd(lanes) * sizeof(TreeRow));
-  auto *tree = static_cast<TreeRow *>(buffer.contents());
-  for (const LaneRows &lane : lanes)
-    for (uint32_t row = 0; row < lane.rows; ++row)
-      tree[lane.first + row] = chainRow(row);
-  return buffer;
-}
-
 // Acceptance of `lanes` lanes' chains over a batch's verify input and
 // selections, each lane verifying its whole block of kRows rows from lane x
 // kRows.
 AcceptanceBuffers acceptanceBuffers(MetalBackend &backend, const Batch &batch, uint32_t lanes) {
-  return {batch.buffers.inputTokens, chainTree(backend, blocks(lanes)), batch.buffers.outputTokens,
+  return {batch.buffers.inputTokens, batch.buffers.treeRows, batch.buffers.outputTokens,
           allocate(backend, lanes * sizeof(uint32_t)), allocate(backend, lanes * sizeof(uint32_t)),
           allocate(backend, lanes * sizeof(uint32_t)), wholeBlocks(backend, lanes)};
 }
@@ -1176,11 +1178,11 @@ void mixedVerify(MetalBackend &backend, uint32_t lanes, uint32_t samplingMask) {
 }
 
 // Lanes whose verify blocks hold different row counts, packed one after
-// another (5, 8, 1 and 6 rows from rows 0, 5, 13 and 14), draft their
-// thinking ends, take their verify input, select and accept as each lane does
-// alone in a block from row 0, bit for bit: its proposals, input rows,
-// penalized logits, tokens and sampled records, and its retained and
-// accepted counts. The lanes mix greedy and sampled policies, penalties, a
+// another (5, 8, 1 and 6 rows from rows 0, 5, 13 and 14), select and accept
+// as each lane does alone in a block from row 0, bit for bit: its penalized
+// logits, tokens and sampled records, and its retained and accepted counts
+// and rows. A lane whose thinking cutoff is at its first row proposes its end
+// there, as its selector's host chain does. The lanes mix greedy and sampled policies, penalties, a
 // mask, stop exclusion, retention and verify-row limits below a block's rows,
 // and thinking cutoffs at a block's first row and inside one; a block of one
 // row checks no proposal.
@@ -1201,36 +1203,29 @@ void packedLanes(MetalBackend &backend) {
   const MetalBuffer table = penaltyTable(backend, vocabulary);
   Random random(0x7061636b);
 
-  // A batch of `count` lanes and its draft input, proposals and acceptance
-  // buffers.
+  // A batch of `count` lanes and its acceptance buffers.
   struct Run final {
     Batch batch;
-    MetalBuffer draftInput;
-    MetalBuffer proposedTokens;
     AcceptanceBuffers acceptance;
   };
-  const auto makeRun = [&](uint32_t count) {
+  const auto makeRun = [&](uint32_t count, std::span<const LaneRows> rows) {
     Batch batch = makeBatch(backend, vocabulary, count);
+    batch.buffers.treeRows = chainTree(backend, rows);
     AcceptanceBuffers acceptance = acceptanceBuffers(backend, batch, count);
     acceptance.verifyRows = allocate(backend, count * sizeof(uint32_t));
-    return Run{batch, allocate(backend, uint64_t{count} * kRows * sizeof(uint32_t)),
-               allocate(backend, uint64_t{count} * kPositions * sizeof(uint32_t)), acceptance};
+    return Run{batch, acceptance};
   };
   const auto words = [](const MetalBuffer &buffer) { return static_cast<uint32_t *>(buffer.contents()); };
   const auto run = [&](const Run &r, std::span<const SamplingPolicy> lanePolicies, std::span<const LaneRows> rows,
                        std::span<const uint32_t> laneTableRows, std::span<const uint32_t> limits) {
     r.batch.poison();
     CommandGraph graph;
-    sampling.addThinkingDrafts(graph, lanePolicies, rows, r.proposedTokens);
-    Embedding::addVerifyInput(graph, r.draftInput, r.proposedTokens, r.batch.buffers.inputTokens, vocabulary, rows);
     sampling.addVerify(graph, lanePolicies, r.batch.buffers, rows, stops, {table, laneTableRows});
     sampling.addAcceptance(graph, r.acceptance, rows, limits, stops);
     static_cast<void>(backend.submitCommandAsync(graph.dispatches()).wait());
   };
 
-  Run all = makeRun(lanes);
-  // The packed blocks' chains.
-  all.acceptance.treeRows = chainTree(backend, packed);
+  Run all = makeRun(lanes, packed);
   for (uint32_t row = 0; row < all.batch.rows; ++row)
     fillShaped(all.batch.row(row), vocabulary, row % 2 ? Shape::Ties : Shape::Peaked, random);
   for (uint32_t index = 0; index < lanes * (kRows + 1) * all.batch.maskWords(); ++index)
@@ -1238,32 +1233,35 @@ void packedLanes(MetalBackend &backend) {
   for (uint32_t uniform = 0; uniform < lanes * kUniforms; ++uniform)
     all.batch.uniforms()[uniform] = 0.5F * (random.unit() + 1.0F);
   for (uint32_t lane = 0; lane < lanes; ++lane) {
-    words(all.draftInput)[lane * kRows] = 7 + lane;
+    const LaneRows block = packed[lane];
     words(all.acceptance.verifyRows)[lane] = verifyRows[lane];
-    // Each lane's draft proposes its rows' best tokens, but lane 1's third.
-    for (uint32_t position = 0; position < kPositions; ++position) {
-      const uint32_t row = std::min(packed[lane].first + position, all.batch.rows - 1);
-      const uint32_t best = referenceArgmax(all.batch.row(row), vocabulary);
-      words(all.proposedTokens)[lane * kPositions + position] =
-          lane == 1 && position == 2 ? (best + 1) % vocabulary : best;
+    all.batch.inputTokens()[block.first] = 7 + lane;
+    // Each lane's draft proposes its rows' best tokens, but lane 1's third;
+    // a thinking end at a lane's first row takes the end's.
+    const std::optional<ThinkingCutoff> &cutoff = policies[lane].thinkingCutoff;
+    for (uint32_t row = 1; row < block.rows; ++row) {
+      const uint32_t best = referenceArgmax(all.batch.row(block.first + row - 1), vocabulary);
+      all.batch.inputTokens()[block.first + row] =
+          cutoff && row <= cutoff->replacedProposals() ? cutoff->end[row - 1]
+          : lane == 1 && row == 3                     ? (best + 1) % vocabulary
+                                                      : best;
     }
   }
   const std::vector<float> logits(all.batch.logits(), all.batch.logits() + uint64_t{all.batch.rows} * vocabulary);
-  const std::vector<uint32_t> proposals(words(all.proposedTokens), words(all.proposedTokens) + lanes * kPositions);
+  const std::vector<uint32_t> inputs(all.batch.inputTokens(), all.batch.inputTokens() + all.batch.rows);
   run(all, policies, packed, tableRows, retainedLimits);
 
   for (uint32_t lane = 0; lane < lanes; ++lane) {
     const LaneRows block = packed[lane];
-    const Run alone = makeRun(1);
+    const std::array<LaneRows, 1> own{{{0, block.rows}}};
+    const Run alone = makeRun(1, own);
     std::copy_n(logits.begin() + uint64_t{block.first} * vocabulary, uint64_t{block.rows} * vocabulary,
                 alone.batch.logits());
     std::copy_n(all.batch.masks() + uint64_t{lane} * (kRows + 1) * all.batch.maskWords(),
                 (kRows + 1) * all.batch.maskWords(), alone.batch.masks());
     std::copy_n(all.batch.uniforms() + lane * kUniforms, kUniforms, alone.batch.uniforms());
-    std::copy_n(proposals.begin() + lane * kPositions, kPositions, words(alone.proposedTokens));
-    words(alone.draftInput)[0] = words(all.draftInput)[lane * kRows];
+    std::copy_n(inputs.begin() + block.first, block.rows, alone.batch.inputTokens());
     words(alone.acceptance.verifyRows)[0] = verifyRows[lane];
-    const std::array<LaneRows, 1> own{{{0, block.rows}}};
     run(alone, std::span(policies).subspan(lane, 1), own, std::span(tableRows).subspan(lane, 1),
         std::span(retainedLimits).subspan(lane, 1));
 
@@ -1271,10 +1269,6 @@ void packedLanes(MetalBackend &backend) {
     const auto same = [](const auto *packedValues, const auto *aloneValues, uint64_t count) {
       return std::memcmp(packedValues, aloneValues, count * sizeof(*packedValues)) == 0;
     };
-    require(same(words(all.proposedTokens) + lane * kPositions, words(alone.proposedTokens), kPositions),
-            label + ": its thinking end drafted other proposals than alone");
-    require(same(all.batch.inputTokens() + block.first, alone.batch.inputTokens(), block.rows),
-            label + ": its verify input differs from alone");
     require(same(all.batch.row(block.first), alone.batch.logits(), uint64_t{block.rows} * vocabulary),
             label + ": its penalized logits differ from alone");
     require(same(all.batch.outputTokens() + block.first, alone.batch.outputTokens(), block.rows),
@@ -1287,9 +1281,9 @@ void packedLanes(MetalBackend &backend) {
                 words(all.acceptance.retainedRows)[lane] == words(alone.acceptance.retainedRows)[0],
             label + ": its acceptance differs from alone");
   }
-  // The greedy lane accepted the three end tokens its draft took and its
-  // next best token, and the one-row lane, whose row took the end's first
-  // token, none.
+  // The greedy lane accepted the three end tokens it proposed and its next
+  // best token, and the one-row lane, whose row took the end's first token,
+  // none.
   require(words(all.acceptance.acceptedCounts)[0] == 4 && words(all.acceptance.acceptedCounts)[2] == 0 &&
               words(all.acceptance.retainedCounts)[2] == 1 && all.batch.outputTokens()[13] == end[0],
           "packed lanes accepted other than their drafts and ends");
@@ -1562,13 +1556,13 @@ void excludedStopTokens(MetalBackend &backend, uint32_t vocabulary) {
 // drafted that row's end token. A draft token before the cutoff that ended
 // thinking first, the end's last token, which closes thinking, or the other
 // ending token, leaves the rows their own selections, and a cutoff past the
-// selection's rows dispatches nothing. At a lane's row 0 the end tokens
-// replace its draft's proposals before the verify, so acceptance keeps all
-// its rows the end covers, and a row with no selectable logit keeps its
-// sentinel in place of its end token, so the lane still fails. The end of a
-// constrained lane that waits for its mask starts at the first row from its
-// cutoff's on whose mask admits the end's first token, the rows before
-// keeping their own selections, and replaces no proposals.
+// selection's rows dispatches nothing. At a lane's row 0 the end tokens are
+// its proposals (the selector's host chain, ThinkingCutoff::replacedProposals),
+// so acceptance keeps all its rows the end covers, and a row with no
+// selectable logit keeps its sentinel in place of its end token, so the lane
+// still fails. The end of a constrained lane that waits for its mask starts
+// at the first row from its cutoff's on whose mask admits the end's first
+// token, the rows before keeping their own selections, and proposes nothing.
 void thinkingCutoffs(MetalBackend &backend, uint32_t vocabulary) {
   const auto stops = shardEdgeStopTokens(vocabulary);
   const uint32_t close = vocabulary - 3, alsoEnds = vocabulary - 5;
@@ -1599,9 +1593,6 @@ void thinkingCutoffs(MetalBackend &backend, uint32_t vocabulary) {
   };
   const auto cutoffDispatches = [&](const CommandGraph &graph) {
     return dispatches(graph, "decode_sample_thinking_cutoff");
-  };
-  const auto draftDispatches = [&](const CommandGraph &graph) {
-    return dispatches(graph, "decode_draft_thinking_cutoff");
   };
 
   for (const std::vector<uint32_t> &end : ends) {
@@ -1650,12 +1641,17 @@ void thinkingCutoffs(MetalBackend &backend, uint32_t vocabulary) {
   }
 
   const AcceptanceBuffers acceptance = acceptanceBuffers(backend, batch, kLanes);
-  const MetalBuffer proposedTokens = allocate(backend, uint64_t{kLanes} * kPositions * sizeof(uint32_t));
-  auto *proposed = static_cast<uint32_t *>(proposedTokens.contents());
   // A draft token, at verify input row position + 1.
   const auto draft = [&](uint32_t lane, uint32_t position, uint32_t token) {
-    proposed[lane * kPositions + position] = token;
     batch.inputTokens()[lane * kRows + position + 1] = token;
+  };
+  // A lane whose end starts at its row 0 proposes it: its first
+  // replacedProposals() rows after the anchor hold the end's tokens.
+  const auto proposeEnds = [&](std::span<const SamplingPolicy> policies) {
+    for (uint32_t lane = 0; lane < policies.size(); ++lane)
+      if (const auto &cutoff = policies[lane].thinkingCutoff)
+        for (uint32_t row = 1; row < kRows && row <= cutoff->replacedProposals(); ++row)
+          batch.inputTokens()[lane * kRows + row] = cutoff->end[row - 1];
   };
   const std::array<uint32_t, kLanes> maximumRetained{kRows, kRows, kRows, kRows};
   // Acceptance keeps the drafts up to the first one that is not its row's
@@ -1722,11 +1718,6 @@ void thinkingCutoffs(MetalBackend &backend, uint32_t vocabulary) {
             for (uint32_t position = 0; position < kPositions; ++position)
               draft(lane, position, drafts[lane][position]);
           }
-          // Only a lane whose cutoff is at row 0 drafts its end.
-          CommandGraph drafted;
-          sampling.addThinkingDrafts(drafted, policies, blocks(policies.size()), proposedTokens);
-          require(draftDispatches(drafted) == (std::ranges::count(cuts, 0U) ? 1 : 0),
-                  "the ends at row 0 dispatched their drafts other than once");
           batch.poison();
           CommandGraph verify;
           verifyLanes(verify, policies, expected, drafts);
@@ -1781,9 +1772,8 @@ void thinkingCutoffs(MetalBackend &backend, uint32_t vocabulary) {
             for (uint32_t position = 0; position < kPositions; ++position)
               draft(lane, position, drafts[lane][position]);
           }
-          CommandGraph drafted;
-          sampling.addThinkingDrafts(drafted, policies, blocks(policies.size()), proposedTokens);
-          require(draftDispatches(drafted) == 0, "an end that waits for its mask replaced proposals");
+          for (const SamplingPolicy &policy : policies)
+            require(!policy.thinkingCutoff->replacedProposals(), "an end that waits for its mask proposed tokens");
           batch.poison();
           CommandGraph verify;
           verifyLanes(verify, policies, expected, drafts);
@@ -1793,16 +1783,14 @@ void thinkingCutoffs(MetalBackend &backend, uint32_t vocabulary) {
   }
 
   // At row 0, lane 0 has more end tokens left than verify rows, lane 1 three
-  // and lane 3 the close alone; each one's draft proposes its own best
-  // tokens, which the end replaces. Lane 2's end starts at its row 2, which
-  // its draft keeps.
+  // and lane 3 the close alone; each one proposes its end in place of its
+  // draft's best tokens. Lane 2's end starts at its row 2, which its draft
+  // keeps.
   const std::vector<uint32_t> &end = ends.back();
   const std::span<const uint32_t> whole(end);
   const std::array<ThinkingCutoff, kLanes> started{
       ThinkingCutoff{0, whole, alsoEnds}, ThinkingCutoff{0, whole.last(3), alsoEnds},
       ThinkingCutoff{2, whole, alsoEnds}, ThinkingCutoff{0, whole.last(1), alsoEnds}};
-  MetalBuffer draftInput = allocate(backend, uint64_t{kLanes} * kRows * sizeof(uint32_t));
-  auto *anchors = static_cast<uint32_t *>(draftInput.contents());
   for (const uint32_t samplingMask : {0U, 0b0101U, 0b1111U}) {
     std::vector<SamplingPolicy> policies;
     std::array<std::array<uint32_t, kRows>, kLanes> expected{};
@@ -1811,7 +1799,7 @@ void thinkingCutoffs(MetalBackend &backend, uint32_t vocabulary) {
       SamplingPolicy policy{32, (samplingMask >> lane & 1U) ? 0.8F : 0.0F};
       policy.thinkingCutoff = started[lane];
       policies.push_back(policy);
-      anchors[lane * kRows] = 3 + lane;
+      batch.inputTokens()[lane * kRows] = 3 + lane;
       for (uint32_t row = 0; row < kRows; ++row) {
         fill(lane * kRows + row, best(lane * kRows + row));
         expected[lane][row] = best(lane * kRows + row);
@@ -1827,50 +1815,21 @@ void thinkingCutoffs(MetalBackend &backend, uint32_t vocabulary) {
           drafts[lane][index] = cutoff.end[index];
       }
     }
+    proposeEnds(policies);
     batch.poison();
     CommandGraph verify;
-    sampling.addThinkingDrafts(verify, policies, blocks(policies.size()), proposedTokens);
-    require(draftDispatches(verify) == 1, "the started ends dispatched their drafts other than once");
-    Embedding::addVerifyInput(verify, draftInput, proposedTokens, batch.buffers.inputTokens, vocabulary,
-                              blocks(kLanes));
     verifyLanes(verify, policies, expected, drafts);
-    for (uint32_t lane = 0; lane < kLanes; ++lane) {
-      require(std::ranges::equal(std::span(proposed + lane * kPositions, kPositions), drafts[lane]) &&
-                  batch.inputTokens()[lane * kRows] == anchors[lane * kRows] &&
-                  std::ranges::equal(std::span(batch.inputTokens() + lane * kRows + 1, kPositions), drafts[lane]),
-              "an end at row 0 did not replace its lane's draft tokens");
-    }
   }
 
-  // Of constrained lanes at row 0, only those whose ends do not wait replace
-  // their proposals with their ends, lane 1 three and lane 2 seven, and a
-  // batch whose ends all wait dispatches nothing.
+  // Of constrained lanes at row 0, only those whose ends do not wait propose
+  // them, lane 1 three and lane 2 all a verify block's rows after its anchor
+  // hold.
   const std::array<ThinkingCutoff, kLanes> drafting{
       ThinkingCutoff{0, whole, alsoEnds, true}, ThinkingCutoff{0, whole.last(3), alsoEnds},
       ThinkingCutoff{0, whole, alsoEnds}, ThinkingCutoff{0, whole.last(1), alsoEnds, true}};
-  const std::array<uint32_t, kLanes> replaced{0, 3, kPositions, 0};
-  std::vector<SamplingPolicy> draftingPolicies;
-  for (uint32_t lane = 0; lane < kLanes; ++lane) {
-    SamplingPolicy policy{32, 0.0F, 1.0F, true};
-    policy.thinkingCutoff = drafting[lane];
-    draftingPolicies.push_back(policy);
+  const std::array<uint32_t, kLanes> replaced{0, 3, SPLASH_TREE_CHAIN_TOKENS, 0};
+  for (uint32_t lane = 0; lane < kLanes; ++lane)
     require(drafting[lane].replacedProposals() == replaced[lane], "an end counted the wrong replaced proposals");
-    for (uint32_t position = 0; position < kPositions; ++position)
-      proposed[lane * kPositions + position] = best(lane * kRows + position);
-  }
-  CommandGraph replacing;
-  sampling.addThinkingDrafts(replacing, draftingPolicies, blocks(draftingPolicies.size()), proposedTokens);
-  static_cast<void>(backend.submitCommandAsync(replacing.dispatches()).wait());
-  for (uint32_t lane = 0; lane < kLanes; ++lane) {
-    for (uint32_t position = 0; position < kPositions; ++position)
-      require(proposed[lane * kPositions + position] ==
-                  (position < replaced[lane] ? drafting[lane].end[position] : best(lane * kRows + position)),
-              "an end replaced other proposals than those of a lane whose end does not wait");
-  }
-  CommandGraph waiting;
-  sampling.addThinkingDrafts(waiting, std::array{draftingPolicies[0], draftingPolicies[3]}, blocks(2),
-                             proposedTokens);
-  require(draftDispatches(waiting) == 0, "ends that all wait dispatched drafts");
 
   // Lane l's row nonFinite[l] has no selectable logit: it keeps its sentinel,
   // which acceptance retains after the end tokens before it.
@@ -1882,7 +1841,6 @@ void thinkingCutoffs(MetalBackend &backend, uint32_t vocabulary) {
       SamplingPolicy policy{32, (samplingMask >> lane & 1U) ? 0.8F : 0.0F};
       policy.thinkingCutoff = ThinkingCutoff{0, whole, alsoEnds};
       policies.push_back(policy);
-      anchors[lane * kRows] = 3 + lane;
       for (uint32_t row = 0; row < kRows; ++row) {
         fill(lane * kRows + row, best(lane * kRows + row));
         if (row < kPositions)
@@ -1892,11 +1850,9 @@ void thinkingCutoffs(MetalBackend &backend, uint32_t vocabulary) {
       std::fill(values, values + vocabulary, std::numeric_limits<float>::quiet_NaN());
     }
     std::fill(uniforms, uniforms + kLanes * kUniforms, 0.5F);
+    proposeEnds(policies);
     batch.poison();
     CommandGraph verify;
-    sampling.addThinkingDrafts(verify, policies, blocks(policies.size()), proposedTokens);
-    Embedding::addVerifyInput(verify, draftInput, proposedTokens, batch.buffers.inputTokens, vocabulary,
-                              blocks(kLanes));
     sampling.addVerify(verify, policies, batch.buffers, blocks(policies.size()), stops, {});
     sampling.addAcceptance(verify, acceptance, blocks(policies.size()), maximumRetained, stops);
     static_cast<void>(backend.submitCommandAsync(verify.dispatches()).wait());
@@ -1913,10 +1869,8 @@ void thinkingCutoffs(MetalBackend &backend, uint32_t vocabulary) {
   none.thinkingCutoff = ThinkingCutoff{kRows, end, alsoEnds};
   const std::array<SamplingPolicy, 2> uncut{none, SamplingPolicy{}};
   CommandGraph graph;
-  sampling.addThinkingDrafts(graph, uncut, blocks(uncut.size()), proposedTokens);
   sampling.addVerify(graph, uncut, batch.buffers, blocks(uncut.size()), stops, {});
-  require(cutoffDispatches(graph) == 0 && draftDispatches(graph) == 0,
-          "a verify without a cutoff in its rows dispatched one");
+  require(cutoffDispatches(graph) == 0, "a verify without a cutoff in its rows dispatched one");
 
   // Only a constrained lane has masks for its end to wait for, and the
   // kernel reads them at the end's first token, which must be inside the
@@ -2334,6 +2288,95 @@ void nonFiniteRowsSelectTheSentinel(MetalBackend &backend) {
   }
 }
 
+// A verify block as a tree: each row's penalties count the draft tokens of its
+// path, its ancestors' but its anchor's, and not those of the rows before it on
+// other branches; a thinking cutoff gives each row of its depth on its end
+// tokens by depth, but where a token on the row's path up to the cut ended
+// thinking, which leaves that row's subtree its own selections. Lane 0's tree:
+// rows 1 and 2 follow the anchor, rows 3 and 4 row 1, row 5 row 2, rows 6
+// and 7 row 5; its rows repeat tokens across branches, and row 2 holds the
+// close of thinking. Lane 1 is the same tree, sampled.
+void treeSelections(MetalBackend &backend) {
+  constexpr uint32_t vocabulary = 1003;
+  const uint32_t close = vocabulary - 3, alsoEnds = vocabulary - 5;
+  const std::array<uint32_t, 2> end{vocabulary - 6, close};
+  constexpr std::array<uint32_t, kRows> parents{0, 0, 0, 1, 1, 2, 5, 5};
+  Sampling sampling(vocabulary);
+  const Batch batch = makeBatch(backend, vocabulary, 2);
+  auto *tree = static_cast<TreeRow *>(batch.buffers.treeRows.contents());
+  Random random(0x70617468);
+  std::array<uint32_t, kRows> depth{}, ancestors{};
+  for (uint32_t lane = 0; lane < 2; ++lane)
+    for (uint32_t row = 0; row < kRows; ++row) {
+      depth[row] = row ? depth[parents[row]] + 1 : 0;
+      ancestors[row] = (row ? ancestors[parents[row]] : 0U) | (1U << row);
+      tree[lane * kRows + row] = {ancestors[row], static_cast<uint16_t>(row ? parents[row] : SPLASH_TREE_ROOT),
+                                  static_cast<uint16_t>(depth[row])};
+    }
+  const MetalBuffer table = penaltyTable(backend, vocabulary);
+  const std::array<uint32_t, 2> tableRows{1, 2};
+  const SamplingPenalties penalties{1.3F, 0.7F, 0.4F};
+  std::vector<SamplingPolicy> policies{SamplingPolicy{1, 0.0F, 1.0F, false, false, penalties},
+                                       SamplingPolicy{32, 0.8F, 0.95F, false, false, penalties}};
+  for (uint32_t row = 0; row < batch.rows; ++row)
+    fillRow(batch.row(row), vocabulary, random);
+  // Rows 3 and 5 hold the token of row 1, on two branches; row 6 that of
+  // row 5 below it.
+  for (uint32_t lane = 0; lane < 2; ++lane) {
+    uint32_t *inputs = batch.inputTokens() + lane * kRows;
+    const std::vector<uint32_t> best = referenceBest(batch.row(lane * kRows), vocabulary, 8);
+    const std::array<uint32_t, kRows> tokens{7, best[0], close, best[1], best[2], best[0], best[0], best[3]};
+    std::copy(tokens.begin(), tokens.end(), inputs);
+  }
+  for (uint32_t uniform = 0; uniform < 2 * kUniforms; ++uniform)
+    batch.uniforms()[uniform] = 0.5F * (random.unit() + 1.0F);
+  const std::vector<float> original(batch.logits(), batch.logits() + uint64_t{batch.rows} * vocabulary);
+  batch.poison();
+  CommandGraph verify;
+  sampling.addVerify(verify, policies, batch.buffers, blocks(2), kStopTokens, {table, tableRows});
+  static_cast<void>(backend.submitCommandAsync(verify.dispatches()).wait());
+  for (uint32_t lane = 0; lane < 2; ++lane) {
+    const uint32_t *inputs = batch.inputTokens() + lane * kRows;
+    const std::span<uint32_t> words = tableRow(table, vocabulary, tableRows[lane]);
+    for (uint32_t row = 0; row < kRows; ++row)
+      for (uint32_t token = 0; token < vocabulary; ++token) {
+        uint32_t count = words[token] & SPLASH_PENALTY_COUNT_MASK;
+        for (uint32_t path = ancestors[row] & ~1U; path; path &= path - 1)
+          count += inputs[std::countr_zero(path)] == token ? 1U : 0U;
+        const uint64_t at = (uint64_t{lane} * kRows + row) * vocabulary + token;
+        require(penaltyMatches(batch.logits()[at], original[at], count, (words[token] & SPLASH_PENALTY_PROMPT_BIT) != 0,
+                               penalties),
+                "tree row " + std::to_string(row) + " counted other draft tokens than its path's");
+      }
+  }
+
+  // The cut at depth 2: rows 3, 4 (below row 1) and 5 (below row 2, whose
+  // token closes thinking) take end[0]; rows 6 and 7 at depth 3 end[1] but for
+  // the closed branch, whose rows 5-7 keep their own selections.
+  for (SamplingPolicy &policy : policies)
+    policy.thinkingCutoff = ThinkingCutoff{2, end, alsoEnds};
+  std::copy(original.begin(), original.end(), batch.logits());
+  batch.poison();
+  CommandGraph cut;
+  sampling.addVerify(cut, policies, batch.buffers, blocks(2), kStopTokens, {table, tableRows});
+  static_cast<void>(backend.submitCommandAsync(cut.dispatches()).wait());
+  const std::vector<uint32_t> selected(batch.outputTokens(), batch.outputTokens() + batch.rows);
+  for (uint32_t lane = 0; lane < 2; ++lane)
+    for (const uint32_t row : {3U, 4U})
+      require(selected[lane * kRows + row] == end[0], "a row of the cut's depth did not take the end");
+  std::copy(original.begin(), original.end(), batch.logits());
+  batch.poison();
+  CommandGraph uncut;
+  for (SamplingPolicy &policy : policies)
+    policy.thinkingCutoff.reset();
+  sampling.addVerify(uncut, policies, batch.buffers, blocks(2), kStopTokens, {table, tableRows});
+  static_cast<void>(backend.submitCommandAsync(uncut.dispatches()).wait());
+  for (uint32_t lane = 0; lane < 2; ++lane)
+    for (const uint32_t row : {0U, 1U, 2U, 5U, 6U, 7U})
+      require(selected[lane * kRows + row] == batch.outputTokens()[lane * kRows + row],
+              "a row above the cut's depth or below a closed path took the end");
+}
+
 // The host words: prompt bits only when repetition reads them, counts of
 // every selected token (the generated history and the pending anchor), and
 // no token outside the vocabulary or history without a prompt.
@@ -2485,13 +2528,14 @@ int main(int argc, char **argv) {
     minPCuts(backend);
     stage = "speculative acceptance over broad distributions";
     speculativeWholeVocabulary(backend);
-    stage = "over-proposed residual";
     stage = "extreme searches";
     extremeSearches(backend);
     stage = "unconstrained rows ignore masks";
     unconstrainedRowsIgnoreMasks(backend);
     stage = "packed lanes of mixed row counts";
     packedLanes(backend);
+    stage = "tree selections";
+    treeSelections(backend);
     for (const uint32_t vocabulary : {1003U, 248320U}) {
       uint32_t changedSelections = 0;
       for (uint32_t lanes = 1; lanes <= kLanes; ++lanes) {

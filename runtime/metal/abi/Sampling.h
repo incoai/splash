@@ -2,6 +2,7 @@
 
 // Parameter layouts shared by host dispatch code and Metal kernels.
 #include "metal/abi/ExecutionGeometry.h"
+#include "metal/abi/VerifyTree.h"
 #ifdef __METAL_VERSION__
 #include <metal_stdlib>
 #else
@@ -101,7 +102,8 @@ static_assert(sizeof(TargetVocabularyRange) == 8,
 // The penalized lanes of one penalty dispatch. Entry e penalizes its lane's
 // selected rows, rows[e] rows of the logits from first_row[e]
 // (TargetSamplingParams), from the penalty table row table_row[e]; the
-// rows' verify input rows hold its draft tokens. repetition_inverse is
+// rows' verify input rows hold its draft tokens, of which a row's context
+// adds its ancestors' (metal/abi/VerifyTree.h). repetition_inverse is
 // 1 / repetition, saturated to the largest float.
 struct SamplingPenaltyParams {
   uint32_t vocabulary;
@@ -119,18 +121,20 @@ static_assert(sizeof(SamplingPenaltyParams) == 120,
               "Sampling penalty parameters are 120 bytes on both sides");
 
 // One selection's thinking cutoffs (ops::SamplingPolicy::thinkingCutoff), its
-// lanes' rows laid out as in TargetSamplingParams. A lane whose row is below
-// its rows selects its end token tokens[i] at row + i for each i below its
-// count and its rows less row, unless a draft token before that row is close
-// or also_ends, which ended thinking first. The end of a lane in
-// waiting_mask, a constrained one, waits for its mask: its row is instead the
-// first from there whose constraint mask row (mask_row on, of mask_words
-// words, as in TargetSamplingParams) admits tokens[0]. The rows before it keep
-// their own selections, as do all the rows of a selection without one. A row
-// whose selection is the sentinel of a row with no selectable logit (a token
-// outside the vocabulary) keeps it, so the lane still fails. A lane whose row
-// is 0 and whose end does not wait drafts its end tokens before the verify
-// (decode_draft_thinking_cutoff), so acceptance keeps them all.
+// lanes' rows laid out as in TargetSamplingParams and each a row of its
+// block's tree (metal/abi/VerifyTree.h). A lane whose row is below its rows
+// selects its end token tokens[i] at each row of depth row + i, for each i
+// below its count, unless a draft token on the row's path up to depth row is
+// close or also_ends, which ended thinking first. The end of a lane in
+// waiting_mask, a constrained one, whose block is a chain, waits for its mask:
+// its row is instead the first from there whose constraint mask row (mask_row
+// on, of mask_words words, as in TargetSamplingParams) admits tokens[0]. The
+// rows before it keep their own selections, as do all the rows of a selection
+// without one. A row whose selection is the sentinel of a row with no
+// selectable logit (a token outside the vocabulary) keeps it, so the lane
+// still fails. A lane whose row is 0 and whose end does not wait proposes its
+// end tokens as a host chain of its tree (DraftTreeParams), so acceptance keeps
+// them all.
 struct ThinkingCutoffParams {
   uint32_t vocabulary;
   uint32_t waiting_mask;
@@ -161,33 +165,70 @@ struct SelectorBatchParams {
 static_assert(sizeof(SelectorBatchParams) == 24,
               "Draft selector parameters are 24 bytes on both sides");
 
-// The rows of its block each lane of a decode cycle verifies (its verify
-// rows, draft_verify_rows), chosen for the whole batch by expected accepted
-// tokens per unit of the cycle's cost. The selector writes each lane's
-// confidence at each proposal position: the largest probability among the
-// position's candidates (the softmax at temperature 1 of their scores), the
-// probability of the candidate it proposes there. Once the proposals
-// before it are accepted, a proposal is accepted with probability p, where
-// logit(p) = slope * logit(confidence) + intercept[position]; a lane's
-// survival at a position, the product of p up to it, is the probability that
-// its proposals up to it are all accepted, and verifying one more row adds
-// that much to the lane's expected tokens. Every lane verifies its anchor;
-// the rows past it go to the largest survivals over all lanes, as many as
-// maximize the expected tokens over cost[the rows verified in all], none past
-// a lane's maximum. With every_row, each lane verifies its maximum. The
-// verify's MoE steps route the verify rows alone, and acceptance retains at
-// most that many tokens.
-struct VerifyRowsParams {
+// The most tokens a host chain proposes: a verify block's rows after its
+// anchor.
+#define SPLASH_TREE_CHAIN_TOKENS (SPLASH_TARGET_VERIFY_ROWS - 1u)
+// A host chain token's estimates, by its agreement with the draft at its
+// depth (model::LookupAgreement): the draft's most likely candidate there,
+// another of its candidates, none of them, or past the draft's positions.
+#define SPLASH_TREE_AGREEMENTS 4u
+// The most children a tree's draft row takes, its most likely candidates.
+#define SPLASH_TREE_CHILDREN 4u
+
+// The tree each lane's verify block holds (draft_select_tree): rows[l] rows
+// from first_row[l] of the command's packed rows (ops::LaneRows), its anchor's
+// first. A row's estimate is the probability that the target accepts the
+// path to it: the product over the path of its steps' estimates. A step to a
+// draft candidate at proposal position p, of probability q among the
+// position's candidates after its parent's (the softmax at temperature 1 of
+// their unary scores plus the edge from the parent's candidate), is estimated
+// at sigmoid(slope * logit(q) + intercept[p]); a step to host chain token d of
+// the lane, chain[l] tokens from the anchor, at its rate for its agreement
+// with the draft at depth d. The tree grows best first by estimate, a draft
+// row taking its children[l] most likely candidates and a chain token the
+// next, one row for each token path (a step to a token its parent already has
+// a child of joins that child), until the lane's rows or none past depth
+// depth[l] are left. Rows past a lane's tree are chain rows of its anchor.
+struct DraftTreeParams {
+  uint32_t anchor[SPLASH_MAXIMUM_BATCH_WIDTH];
+  uint32_t first_row[SPLASH_MAXIMUM_BATCH_WIDTH];
+  uint32_t rows[SPLASH_MAXIMUM_BATCH_WIDTH];
+  uint32_t depth[SPLASH_MAXIMUM_BATCH_WIDTH];
+  uint32_t chain[SPLASH_MAXIMUM_BATCH_WIDTH];
+  uint32_t children[SPLASH_MAXIMUM_BATCH_WIDTH];
+  uint32_t lanes;
   float slope;
   float intercept[SPLASH_DRAFT_PROPOSAL_TOKENS];
-  float cost[SPLASH_DRAFT_QUERY_ROWS * SPLASH_MAXIMUM_BATCH_WIDTH + 1];
-  uint32_t lanes;
-  uint32_t every_row;
-  uint32_t maximum[SPLASH_MAXIMUM_BATCH_WIDTH];
 };
 
-static_assert(sizeof(VerifyRowsParams) == 188,
-              "Verify rows parameters are 188 bytes on both sides");
+static_assert(sizeof(DraftTreeParams) == 132,
+              "Draft tree parameters are 132 bytes on both sides");
+
+// The rows of its block each lane of a decode cycle verifies (its verify
+// rows, draft_verify_rows): with every_row its tree's, otherwise chosen for
+// the whole batch by expected accepted tokens per unit of the cycle's cost.
+// Its tree's rows after its anchor's (DraftTreeParams), first row_counts[l],
+// estimate the probability that the target accepts each, so verifying one
+// more adds that much to the lane's expected tokens, and a row's estimate is
+// at most its parent's, which comes before it. Every lane verifies its
+// anchor; the rows past it go to the largest estimates over all lanes, a
+// lane's earlier rows first among equal ones, as many as maximize the
+// expected tokens over cost[the rows verified in all], none past a lane's
+// tree. A lane's verify rows are then numbered in preorder, its likeliest path
+// on its first rows, and its rows past them, to rows[l], are chain rows of its
+// anchor. The verify's MoE steps route the verify rows alone, and acceptance
+// retains none past them.
+struct VerifyRowsParams {
+  float cost[SPLASH_TARGET_VERIFY_ROWS * SPLASH_MAXIMUM_BATCH_WIDTH + 1];
+  uint32_t lanes;
+  uint32_t every_row;
+  uint32_t first_row[SPLASH_MAXIMUM_BATCH_WIDTH];
+  uint32_t rows[SPLASH_MAXIMUM_BATCH_WIDTH];
+};
+
+static_assert(sizeof(VerifyRowsParams) ==
+                  4 * (SPLASH_TARGET_VERIFY_ROWS * SPLASH_MAXIMUM_BATCH_WIDTH + 3 + 2 * SPLASH_MAXIMUM_BATCH_WIDTH),
+              "Verify rows parameters are the same size on both sides");
 
 // Acceptance of each lane's verify block, rows[l] rows from first_row[l] of
 // the command's packed rows (ops::LaneRows), as a tree

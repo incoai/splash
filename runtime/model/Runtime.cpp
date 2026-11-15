@@ -63,6 +63,12 @@ constexpr std::array<ops::LaneRows, kLaneCount> kDecodeBlocks = [] {
   for (uint32_t lane = 0; lane < kLaneCount; ++lane) blocks[lane] = {lane * kDecodeRows, kDecodeRows};
   return blocks;
 }();
+// The most children a verify row takes from the draft (ops::DraftTreeLane):
+// one, a chain, while the target's verify forward runs a block's rows in
+// order (causal attention, the recurrence over the rows before a row, K/V at
+// the committed tokens plus the row). The selector takes up to
+// SPLASH_TREE_CHILDREN once the forward reads a block's tree.
+constexpr uint32_t kVerifyChildren = 1;
 constexpr std::array<uint32_t, kLaneCount> kDecodeFirstRows = [] {
   std::array<uint32_t, kLaneCount> rows{};
   for (uint32_t lane = 0; lane < kLaneCount; ++lane) rows[lane] = kDecodeBlocks[lane].first;
@@ -678,9 +684,6 @@ struct Runtime::Impl {
     CommandGraph graph;
     sampling.addInitial(graph, policies, samplingBuffers(2), std::span(kDecodeFirstRows).first(2),
                         geometry.target.stopTokens, penalties);
-    sampling.addThinkingDrafts(
-        graph, policies, std::span(kDecodeBlocks).first(2),
-        decodeArena->batchSlice(DecodeTensor::ProposedTokens, 2));
     sampling.addVerify(graph, policies, samplingBuffers(2), std::span(kDecodeBlocks).first(2),
                        geometry.target.stopTokens, penalties);
     backend.preparePipelines(graph.dispatches());
@@ -1319,6 +1322,7 @@ struct Runtime::Impl {
             d(DecodeTensor::ArgmaxValues),
             d(DecodeTensor::ArgmaxIndices),
             d(DecodeTensor::InputTokens),
+            d(DecodeTensor::TreeRows),
             d(DecodeTensor::TargetVocabularyRanges),
             d(DecodeTensor::TargetVocabularyArrivals)};
   }
@@ -2157,9 +2161,10 @@ struct Runtime::Impl {
                     draftModel.decodeStorageLanes(lanes));
   }
 
-  // The draft's proposals for each lane and how many rows of its block it
-  // verifies, at most maximumRows[lane] (its retention limit), by the
-  // acceptance model and the costs of `constrained` cycles of its lane count.
+  // Each lane's verify rows, a tree of the draft's proposals no deeper than
+  // its retention limit, maximumRows[lane] less one, and how many of them it
+  // verifies, by the acceptance model and the costs of `constrained` cycles of
+  // its lane count.
   void encodeDraftBatchGraph(CommandGraph &graph,
                              std::span<Request *const> entries,
                              std::span<const uint64_t> logicalPositions,
@@ -2205,31 +2210,46 @@ struct Runtime::Impl {
     draftModel.addDecode(graph, std::move(buffers),
                          targetModel->vocabularyProjection(),
                          std::span(cacheLengths).first(lanes));
-    std::array<uint32_t, kLaneCount> anchors{};
-    std::array<ops::SamplingPolicy, kLaneCount> policies{};
+    std::array<ops::DraftTreeLane, kLaneCount> trees{};
     for (uint32_t lane = 0; lane < lanes; ++lane) {
       Request &entry = laneEntry(entries, lane);
       if (!entry.pendingToken)
         throw std::invalid_argument("draft batch lane has no anchor");
-      anchors[lane] = *entry.pendingToken;
-      policies[lane] = samplingPolicy(entry);
+      ops::DraftTreeLane &tree = trees[lane];
+      tree.anchor = *entry.pendingToken;
+      tree.block = kDecodeBlocks[lane];
+      tree.depth = maximumRows[lane] - 1;
+      tree.children = kVerifyChildren;
+      // A thinking end at the lane's first row is its proposals, a chain the
+      // verify selects whatever its logits: no draft row beside it could be
+      // accepted.
+      const ops::SamplingPolicy policy = samplingPolicy(entry);
+      const std::span<const uint32_t> end = policy.thinkingCutoff ? policy.thinkingCutoff->end : std::span<const uint32_t>{};
+      if (const uint32_t forced = policy.thinkingCutoff ? policy.thinkingCutoff->replacedProposals() : 0) {
+        tree.chain = forced;
+        tree.children = 0;
+        std::copy_n(end.begin(), forced,
+                    contents<uint32_t>(decodeArena->get(lane, DecodeTensor::ChainTokens), "chain tokens"));
+        std::fill_n(contents<float>(decodeArena->get(lane, DecodeTensor::ChainRates), "chain rates"),
+                    forced * SPLASH_TREE_AGREEMENTS, 1.0F);
+      }
     }
-    draftModel.addSelection(
-        graph,
-        {d(DecodeTensor::Logits), d(DecodeTensor::TopPartialIds),
-         d(DecodeTensor::TopPartialValues), d(DecodeTensor::Candidates),
-         d(DecodeTensor::Unary), d(DecodeTensor::SelectorHidden),
-         d(DecodeTensor::ProposedTokens), d(DecodeTensor::VerifyConfidence)},
-        std::span(anchors).first(lanes));
-    ops::VerifyRowsModel verify;
-    if (verifyBudget && !verifyBudget->explores(lanes, constrained)) {
-      const VerifyBudget::Acceptance &acceptance = verifyBudget->acceptance();
-      verify = {acceptance.slope, acceptance.intercepts, verifyBudget->costs(lanes, constrained), false};
-    }
-    ops::DraftSelector::addVerifyRows(graph, d(DecodeTensor::VerifyConfidence), d(DecodeTensor::VerifyRows),
-                                      verify, maximumRows);
-    sampling.addThinkingDrafts(graph, std::span(policies).first(lanes), std::span(kDecodeBlocks).first(lanes),
-                               d(DecodeTensor::ProposedTokens));
+    const VerifyBudget::Acceptance &acceptance = verifyBudget ? verifyBudget->acceptance() : VerifyBudget::kPrior;
+    const ops::DraftSelectorBuffers selection{
+        d(DecodeTensor::Logits),     d(DecodeTensor::TopPartialIds), d(DecodeTensor::TopPartialValues),
+        d(DecodeTensor::Candidates), d(DecodeTensor::Unary),         d(DecodeTensor::SelectorHidden),
+        d(DecodeTensor::ChainTokens), d(DecodeTensor::ChainRates),   d(DecodeTensor::InputTokens),
+        d(DecodeTensor::TreeRows),   d(DecodeTensor::TreeScores),    d(DecodeTensor::VerifyRows)};
+    draftModel.addSelection(graph, selection, std::span(trees).first(lanes),
+                            {acceptance.slope, acceptance.intercepts});
+    // Without the budget, or in a cycle that explores, a lane verifies its
+    // whole tree.
+    std::array<float, VerifyBudget::kBlockRows * VerifyBudget::kLanes + 1> costs{};
+    const bool budgets = verifyBudget && !verifyBudget->explores(lanes, constrained);
+    if (budgets)
+      costs = verifyBudget->costs(lanes, constrained);
+    ops::DraftSelector::addVerifyRows(graph, selection, budgets ? std::span<const float>(costs) : std::span<const float>{},
+                                      std::span(kDecodeBlocks).first(lanes));
   }
 
   void encodeTargetVerifyBatchForward(CommandGraph &graph,
@@ -2458,13 +2478,12 @@ struct Runtime::Impl {
     targetModel->addEmbedding(graph, decodeArena->batchSlice(tokens, lanes), output, lanes * rows);
   }
 
+  // The target's own inputs of the verify rows the draft's selector wrote.
   void encodeBatchVerifyInput(CommandGraph &graph, uint32_t lanes) {
     if (!lanes || lanes > kLaneCount)
       throw std::invalid_argument("invalid verify-input batch width");
-    targetModel->addVerifyInput(
-        graph, decodeArena->batchSlice(DecodeTensor::DraftInputTokens, lanes),
-        decodeArena->batchSlice(DecodeTensor::ProposedTokens, lanes),
-        decodeArena->batchSlice(DecodeTensor::InputTokens, lanes), std::span(kDecodeBlocks).first(lanes));
+    targetModel->addVerifyInput(graph, decodeArena->batchSlice(DecodeTensor::InputTokens, lanes),
+                                std::span(kDecodeBlocks).first(lanes));
   }
 
   // A stop token or the last budgeted token needs no target work of its own:
@@ -2500,11 +2519,11 @@ struct Runtime::Impl {
                                                 "GPU accepted draft count");
       laneResult.verifyRows = *contents<uint32_t>(d(DecodeTensor::VerifyRows),
                                                   "GPU verify rows");
-      if (!laneResult.verifyRows || laneResult.verifyRows > laneResult.maximumRetained)
+      if (!laneResult.verifyRows || laneResult.verifyRows > kDecodeRows)
         throw std::runtime_error("draft selector produced invalid verify rows");
-      if (!laneResult.retained || laneResult.retained > laneResult.verifyRows)
+      if (!laneResult.retained || laneResult.retained > std::min(laneResult.verifyRows, laneResult.maximumRetained))
         throw std::runtime_error("target policy produced invalid retention");
-      if (laneResult.accepted > kDraftProposalTokens)
+      if (laneResult.accepted >= kDecodeRows)
         throw std::runtime_error(
             "target accepted more than the draft proposed");
       // The retained target tokens end with the next anchor. A non-finite
@@ -2523,9 +2542,11 @@ struct Runtime::Impl {
     if (verifyBudget && commits) {
       std::array<VerifyBudget::Lane, kLaneCount> observed{};
       for (uint32_t lane = 0; lane < items.size(); ++lane) {
-        const float *confidence = contents<float>(
-            decodeArena->get(lane, DecodeTensor::VerifyConfidence), "draft proposal confidence");
-        std::copy_n(confidence, kDraftProposalTokens, observed[lane].confidence.begin());
+        // A chain's row r + 1 holds its proposal at position r, whose draft
+        // probability is the confidence there.
+        const float *scores = contents<float>(decodeArena->get(lane, DecodeTensor::TreeScores), "tree scores");
+        for (uint32_t position = 0; position < kDraftProposalTokens; ++position)
+          observed[lane].confidence[position] = scores[2 * (position + 1)];
         observed[lane].verifyRows = lanes[lane].verifyRows;
         observed[lane].accepted = lanes[lane].accepted;
         observed[lane].labels = lanes[lane].endDrafts == 0;
@@ -2640,20 +2661,17 @@ struct Runtime::Impl {
           entries[lane] = &entry;
           if (!constrained(lane))
             continue;
-          const uint32_t *proposed = contents<uint32_t>(
-              impl_.decodeArena->get(lane, DecodeTensor::ProposedTokens),
-              "constrained draft proposals");
+          // A constrained lane's block is a chain: its anchor, then its
+          // proposals in order.
+          const uint32_t *rows = contents<uint32_t>(impl_.decodeArena->get(lane, DecodeTensor::InputTokens),
+                                                    "constrained verify rows");
           entry.maskWords.clear();
           entry.verifyMaskInFlight = true;
 
           if (!abandoned_[lane]) {
             ModelMaskRequest request;
             request.requestId = entry.id;
-            request.simulationTokens.reserve(kDecodeRows);
-            request.simulationTokens.push_back(*entry.pendingToken);
-            request.simulationTokens.insert(request.simulationTokens.end(),
-                                            proposed,
-                                            proposed + kDraftProposalTokens);
+            request.simulationTokens.assign(rows, rows + kDecodeRows);
             requests_.push_back(std::move(request));
           }
         }

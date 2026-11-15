@@ -29,27 +29,27 @@ struct SamplingPenalties final {
 };
 
 // Where a lane's thinking budget runs out in a selection: its selected rows
-// from `row` on take the `end` tokens in order, as many as the selection
-// holds, unless a draft token before that row is the last of `end`, which
-// closes thinking, or `alsoEnds`, either of which ended thinking first. A row
-// past the selection's rows cuts nothing in it. At row 0 no draft token comes
-// before the cut, so the end replaces the draft's proposals there too
-// (Sampling::addThinkingDrafts). An end that waits for the mask of a
-// constrained lane starts instead at the first of those rows whose mask
-// admits its first token, the rows before it keeping their own selections;
-// as that is known only at the verify, it replaces no proposals.
+// of depth `row` on (a verify block's tree, metal/abi/VerifyTree.h) take the
+// `end` tokens in order, as many as the selection holds, unless a draft token
+// on the row's path up to depth `row` is the last of `end`, which closes
+// thinking, or `alsoEnds`, either of which ended thinking first. A row past
+// the selection's rows cuts nothing in it. At row 0 no draft token comes
+// before the cut, so the end is the lane's proposals there too: a host chain
+// of its tree (ops::DraftTreeLane). An end that waits for the mask of a
+// constrained lane, whose block is a chain, starts instead at the first of
+// those rows whose mask admits its first token, the rows before it keeping
+// their own selections; as that is known only at the verify, it proposes
+// nothing.
 struct ThinkingCutoff final {
   uint32_t row = 0;
   std::span<const uint32_t> end{};
   uint32_t alsoEnds = 0;
   bool waitsForMask = false;
 
-  // How many of the draft's proposals, from the first, the end replaces:
-  // tokens the draft did not propose.
+  // How many of the lane's proposals, from the first, the end makes: tokens
+  // the draft did not propose.
   [[nodiscard]] uint32_t replacedProposals() const noexcept {
-    return row || waitsForMask
-               ? 0
-               : static_cast<uint32_t>(std::min<size_t>(end.size(), SPLASH_DRAFT_PROPOSAL_TOKENS));
+    return row || waitsForMask ? 0 : static_cast<uint32_t>(std::min<size_t>(end.size(), SPLASH_TREE_CHAIN_TOKENS));
   }
 };
 
@@ -114,9 +114,11 @@ struct SamplingBuffers final {
   metal::MetalBuffer argmaxValues;
   metal::MetalBuffer argmaxIndices;
   // Verify input tokens [rows]: a lane's verify block's first row holds its
-  // anchor and the rows after it its draft tokens, which penalized verify
+  // anchor and the rows after it its draft tokens, and its tree rows
+  // (metal/abi/VerifyTree.h) the paths they lie on, which penalized verify
   // rows and thinking cutoffs read.
   metal::MetalBuffer inputTokens;
+  metal::MetalBuffer treeRows;
   // Per sampled row, the ranges of its draw (TargetVocabularyRange), which
   // the groups that share the draw sum, and how many of those groups have
   // finished: a count every draw returns to zero, where it starts.
@@ -197,16 +199,6 @@ public:
   // AcceptBatchParams).
   void addAcceptance(metal::CommandGraph &graph, AcceptanceBuffers buffers, std::span<const LaneRows> blocks,
                      std::span<const uint32_t> maximumRetained, const StopTokens &stopTokens) const;
-  // After the draft's selection and before the verify reads its proposals,
-  // the proposals of each lane whose thinking cutoff is at row 0, and whose
-  // end does not wait for its mask, take the end tokens the rows of its
-  // verify block (`blocks`, as addVerify takes them) will select, so
-  // acceptance keeps them all. A batch without such a lane dispatches
-  // nothing.
-  void addThinkingDrafts(metal::CommandGraph &graph,
-                         std::span<const SamplingPolicy> policies,
-                         std::span<const LaneRows> blocks,
-                         metal::MetalBuffer proposedTokens) const;
 
 private:
   // The rows a selection takes from each lane (metal/abi/Sampling.h

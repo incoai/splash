@@ -517,7 +517,6 @@ enum class DecodeTensor : uint32_t {
   RetainedRows,
   AcceptedCount,
   VerifyRows,
-  VerifyConfidence,
   DraftInputTokens,
   DraftHidden0,
   DraftHidden1,
@@ -535,10 +534,16 @@ enum class DecodeTensor : uint32_t {
   Unary,
   TopPartialIds,
   TopPartialValues,
-  ProposedTokens,
   // Each lane's verify block as a tree, a row of metal/abi/VerifyTree.h per
-  // row: chains (ops::chainRow) from the arena's start.
+  // row: chains (ops::chainRow) from the arena's start, then the selector's
+  // trees (ops::DraftSelector), with each row's draft probability and
+  // estimate.
   TreeRows,
+  TreeScores,
+  // Each lane's host chain of its tree: its tokens and their estimates
+  // (DraftTreeParams in metal/abi/Sampling.h), which the host writes.
+  ChainTokens,
+  ChainRates,
   PageTable,
   // Indexed by state lane, like PageTable, for a layout with a block index:
   // the entries of the pages' index (kv::PageStorage::writeIndexEntries),

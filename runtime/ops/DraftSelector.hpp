@@ -3,6 +3,7 @@
 #include "metal/CommandGraph.hpp"
 #include "metal/MetalBackend.hpp"
 #include "metal/abi/Sampling.h"
+#include "ops/LaneRows.hpp"
 
 #include <array>
 #include <cstdint>
@@ -25,24 +26,39 @@ struct DraftSelectorBuffers final {
   metal::MetalBuffer candidates;
   metal::MetalBuffer unary;
   metal::MetalBuffer selectorHidden;
-  metal::MetalBuffer proposedTokens;
-  // fp32 [lanes][SPLASH_DRAFT_PROPOSAL_TOKENS]: each lane's confidence at each
-  // proposal position, the largest probability among the position's
-  // candidates (VerifyRowsParams in metal/abi/Sampling.h).
-  metal::MetalBuffer confidence;
+  // Each lane's host chain (DraftTreeParams in metal/abi/Sampling.h): uint32
+  // [lanes][SPLASH_TREE_CHAIN_TOKENS] tokens, and fp32
+  // [lanes][SPLASH_TREE_CHAIN_TOKENS][SPLASH_TREE_AGREEMENTS] estimates.
+  metal::MetalBuffer chainTokens;
+  metal::MetalBuffer chainRates;
+  // The command's packed rows (ops::LaneRows): each row's token, its verify
+  // input; its tree row (metal/abi/VerifyTree.h); and its scores, fp32 pairs
+  // of its draft probability and its estimate.
+  metal::MetalBuffer inputTokens;
+  metal::MetalBuffer treeRows;
+  metal::MetalBuffer treeScores;
+  // uint32 [lanes]: the rows each lane's tree holds, which addVerifyRows
+  // narrows to the rows it verifies.
+  metal::MetalBuffer rowCounts;
 };
 
-// What a decode cycle's verify rows follow (DraftSelector::addVerifyRows,
-// VerifyRowsParams): the acceptance model logit(p) = slope *
-// logit(confidence) + intercepts[position], and costs[R], the cost of a cycle
-// whose lanes verify R rows in all, for R from the lane count to eight rows a
-// lane, in any unit. With everyRow, each lane verifies its maximum instead.
-struct VerifyRowsModel final {
-  static constexpr uint32_t kCosts = SPLASH_DRAFT_QUERY_ROWS * SPLASH_MAXIMUM_BATCH_WIDTH + 1;
+// How one lane's tree grows (DraftTreeParams): from its anchor, over its
+// verify block's rows, no row deeper than `depth` (the tokens it may retain
+// less one), with the first `chain` tokens of its host chain and up to
+// `children` children a draft row (none: its rows are its host chain's).
+struct DraftTreeLane final {
+  uint32_t anchor = 0;
+  LaneRows block{};
+  uint32_t depth = 0;
+  uint32_t chain = 0;
+  uint32_t children = 1;
+};
+
+// The estimate of a draft step of probability q at proposal position p:
+// logit(estimate) = slope * logit(q) + intercepts[p] (DraftTreeParams).
+struct DraftCalibration final {
   float slope = 1.0F;
   std::array<float, SPLASH_DRAFT_PROPOSAL_TOKENS> intercepts{};
-  std::array<float, kCosts> costs{};
-  bool everyRow = true;
 };
 
 // The draft's selector codebooks, which score the edge from a proposal
@@ -56,10 +72,11 @@ struct DraftCodebooks final {
 // metal/kernels/decode/sampling.metal): each lane keeps the
 // SPLASH_DRAFT_CANDIDATES most likely draft tokens of every proposal
 // position, scores each candidate with its edge from the previous position's
-// choice, and walks the SPLASH_DRAFT_PROPOSAL_TOKENS positions greedily,
-// whatever its policy: a sampled lane's acceptance follows the target's
-// draws, which match its most likely proposals most often. It writes each
-// lane's confidence at each position as it walks.
+// candidate, and grows its verify block's rows into a tree over them and its
+// host chain, best first by the estimate that the target accepts each row's
+// path (DraftTreeParams), whatever its policy: a sampled lane's acceptance
+// follows the target's draws. A tree of one child a row and no chain is the
+// draft's most likely chain.
 class DraftSelector final {
 public:
   explicit DraftSelector(uint32_t vocabulary);
@@ -67,13 +84,16 @@ public:
   // Exact scratch/output bytes for that many proposal positions.
   [[nodiscard]] static DraftSelectorWorkspace workspace(uint32_t positions);
 
-  void add(metal::CommandGraph &graph, const DraftSelectorBuffers &buffers,
-           const DraftCodebooks &codebooks, std::span<const uint32_t> anchors) const;
-  // After add: each lane's verify rows (a uint32 per lane in `verifyRows`) by
-  // `model` from its confidences, at most maximumRows[lane] of them.
-  static void addVerifyRows(metal::CommandGraph &graph, const metal::MetalBuffer &confidence,
-                            const metal::MetalBuffer &verifyRows, const VerifyRowsModel &model,
-                            std::span<const uint32_t> maximumRows);
+  void add(metal::CommandGraph &graph, const DraftSelectorBuffers &buffers, const DraftCodebooks &codebooks,
+           std::span<const DraftTreeLane> lanes, const DraftCalibration &calibration) const;
+  // After add: each lane's verify rows (VerifyRowsParams), written over
+  // rowCounts, numbered in preorder over the buffers' rows: every row of its
+  // tree without costs, or the most expected accepted tokens per cost over
+  // the lanes' trees, where costs[R] is the cost of a cycle whose lanes verify
+  // R rows in all, for R from the lane count to their blocks' rows, in any
+  // unit.
+  static void addVerifyRows(metal::CommandGraph &graph, const DraftSelectorBuffers &buffers,
+                            std::span<const float> costs, std::span<const LaneRows> blocks);
 
 private:
   uint32_t vocabulary_ = 0;

@@ -500,11 +500,10 @@ public:
   virtual void addHeadBatch(metal::CommandGraph &graph, metal::MetalBuffer hidden,
                             metal::MetalBuffer finalHidden, metal::MetalBuffer logits,
                             uint32_t lanes, ops::LinearScratch scratch) const = 0;
-  // The verify input tokens addEmbedding then gathers, each lane's in its
-  // verify block of `blocks`: its anchor, row 0 of its draft input, and the
-  // draft's proposals; then the inputs the target makes of them itself.
-  virtual void addVerifyInput(metal::CommandGraph &graph, metal::MetalBuffer draftInput,
-                              metal::MetalBuffer proposals, metal::MetalBuffer verifyInput,
+  // The inputs the target makes itself of its verify input tokens, each
+  // lane's in its verify block of `blocks`, which the draft's selector writes
+  // and addEmbedding gathers: none, but a family's that reads them itself.
+  virtual void addVerifyInput(metal::CommandGraph &graph, metal::MetalBuffer verifyInput,
                               std::span<const ops::LaneRows> blocks) const;
   void addEmbedding(metal::CommandGraph &graph, metal::MetalBuffer tokens,
                     metal::MetalBuffer hidden, uint32_t rows) const;

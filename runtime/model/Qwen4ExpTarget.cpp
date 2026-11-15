@@ -267,10 +267,8 @@ void Qwen4ExpTarget::prepareVerifyLane(uint32_t lane, uint64_t position, const Q
   steps_.prepareVerifyLane(lane, position, request);
 }
 
-void Qwen4ExpTarget::addVerifyInput(metal::CommandGraph &graph, metal::MetalBuffer draftInput,
-                                    metal::MetalBuffer proposals, metal::MetalBuffer verifyInput,
+void Qwen4ExpTarget::addVerifyInput(metal::CommandGraph &graph, metal::MetalBuffer verifyInput,
                                     std::span<const ops::LaneRows> blocks) const {
-  QwenTarget::addVerifyInput(graph, std::move(draftInput), std::move(proposals), verifyInput, blocks);
   steps_.addVerifyInput(graph, std::move(verifyInput), blocks);
 }
 

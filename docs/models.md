@@ -327,11 +327,11 @@ below what the fp16 block scales of Q8_0 and the K-quants hold, so its GGUFs
 read zeros there: on an M5 Max serving unsloth/Ornith-1.5-122B-GGUF:UD-Q4_K_XL
 with every row verified, its draft accepted 2.3 tokens a cycle on code
 without the embedding, 4.7 with it. Every family loads and runs its draft
-alike: a decode cycle drafts eight rows, the anchor and its
-seven proposals, and the target verifies their first rows, as many as the cycle
-chose for the lane (its verify rows, `ops::DraftSelector::addVerifyRows`), never
-more than the lane may still retain: the tokens its output budget leaves, at
-most all eight. A dense target verifies every row up to that limit: its
+alike: a decode cycle drafts eight rows, the anchor and seven proposal
+positions, and the target verifies a tree of the draft's candidates at those
+positions, as many of its rows as the cycle chose for the lane (its verify
+rows, `ops::DraftSelector::addVerifyRows`), none deeper than the lane may still
+retain: the tokens its output budget leaves, at most all eight. A dense target verifies every row up to that limit: its
 projections read their weights once for all of a cycle's rows, so a row costs it
 little. Each row a MoE target verifies routes its own experts, which a rejected
 row reads for nothing (a Qwen3.8-Flash-Next cycle of one lane routes about 43
@@ -344,25 +344,31 @@ one, two and four concurrent agentic requests of 1000 tokens decoded 8.7%, 8.5%
 and 2.1% faster under the budget than with every row verified in GGUF UD-Q4_K_M,
 and 2.1%, 0.9% and 6.0% faster in MLX 4-bit. `--verify-rows all` has every
 target's cycles verify every row. The startup log says which rows the cycles
-verify and why, and `/status` reports it as `verify_rows`. The selector
-proposes each lane's most likely candidate at each position, whatever the
-lane's policy: a sampled lane's verify rows draw from the target, and its cycle
-keeps a proposal only where the row before it drew that token, so its
-acceptance stays exact and its most likely proposals are those it keeps most
-often. The selector writes each lane's confidence at each position, the largest
-of its candidates' probabilities (the softmax at temperature 1 of their scores). An
-online model, logit(p) = slope * logit(confidence) + intercept[position], gives
-the probability that the target accepts a proposal once it accepted those before
-it; the engine refits it every 64 cycles on the last 4096 proposals the target
-accepted or rejected (each lane's up to its first rejection, but none whose
-confidence is not a probability, which a draft row that is not finite gives), by
+verify and why, and `/status` reports it as `verify_rows`. The selector grows
+each lane's verify rows into a tree over its candidates (`draft_select_tree`):
+from the anchor, best first by the estimate that the target accepts a row's
+path, the product of its steps' estimates, each row taking its most likely
+candidates at the next position as children (one, a chain, while the target's
+verify runs a block's rows in order), and a lane whose thinking end starts at
+its anchor takes the end as a chain of its own, whose rows the target selects
+whatever its logits. A step to a candidate of probability q (the softmax at
+temperature 1 of its position's candidates' scores after its parent's) is
+estimated by an online model, logit(p) = slope * logit(q) +
+intercept[position], the probability that the target accepts it once it
+accepted its parent; the engine refits it every 64 cycles on the last 4096
+labels: each proposal of a lane's chain up to its first rejection, but none
+whose probability is not one, which a draft row that is not finite gives, by
 damped Newton steps under a prior fit to Qwen3.8-Flash-Next's and
-Qwen3.6-35B-A3B's cycles, which also stands before any label. A lane's survival
-at a position, the product of p up to it, is what verifying one more row adds to
-its expected tokens; one GPU step after the selector (`draft_verify_rows`) gives
-every lane its anchor and the rows of the largest survivals over the batch, as
+Qwen3.6-35B-A3B's cycles, which also stands before any label. A row's estimate
+is what verifying it adds to its lane's expected tokens; one GPU step after the
+selector (`draft_verify_rows`) gives every lane its anchor and the rows of the
+largest estimates over the batch, a lane's in the order its tree took them, as
 many as maximize the expected tokens over the cycle's cost at that many rows in
-all. The engine takes a cycle's cost at so many rows from the wall times of the
+all, and numbers a lane's rows in preorder, its likeliest path on its first
+rows. Whatever its policy a lane proposes the same rows: a sampled lane's
+verify rows draw from the target, and its cycle keeps a proposal only where the
+row before it drew that token, so its acceptance stays exact, and its most
+likely proposals are those it keeps most often. The engine takes a cycle's cost at so many rows from the wall times of the
 lane count's latest cycles, which for streamed experts include the store's reads
 of its misses: a least-squares line in the rows over about the last 30 cycles,
 its slope shrunk toward the shape the measured targets share, since what a row

@@ -45,8 +45,8 @@ public:
   // The GPU hashes the verify rows' PLE rows, and when the table streams a
   // host step of the command stages them, between the hash and the verify
   // that gathers them.
-  void addVerifyInput(metal::CommandGraph &graph, metal::MetalBuffer draftInput, metal::MetalBuffer proposals,
-                      metal::MetalBuffer verifyInput, std::span<const ops::LaneRows> blocks) const override;
+  void addVerifyInput(metal::CommandGraph &graph, metal::MetalBuffer verifyInput,
+                      std::span<const ops::LaneRows> blocks) const override;
   // Each lane's PLE history and QSA pending keys after its retained rows,
   // from the convolution inputs and keys its verify wrote of its block.
   void addStateCommit(metal::CommandGraph &graph, QwenTargetCommitBuffers buffers,

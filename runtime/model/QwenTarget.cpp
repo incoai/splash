@@ -92,12 +92,7 @@ void QwenTarget::prepareVerifyLane(uint32_t, uint64_t, const QwenTargetRequest &
 
 std::vector<uint32_t> QwenTarget::verifyTableRows(uint32_t) const { return {}; }
 
-void QwenTarget::addVerifyInput(metal::CommandGraph &graph, metal::MetalBuffer draftInput,
-                                metal::MetalBuffer proposals, metal::MetalBuffer verifyInput,
-                                std::span<const ops::LaneRows> blocks) const {
-  ops::Embedding::addVerifyInput(graph, std::move(draftInput), std::move(proposals), std::move(verifyInput),
-                                 geometry_.vocabularySize, blocks);
-}
+void QwenTarget::addVerifyInput(metal::CommandGraph &, metal::MetalBuffer, std::span<const ops::LaneRows>) const {}
 
 void QwenTarget::addEmbedding(metal::CommandGraph &graph,
                               metal::MetalBuffer tokens,

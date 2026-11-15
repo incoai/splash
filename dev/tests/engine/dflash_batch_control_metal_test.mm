@@ -4,7 +4,6 @@
 #include "metal/MetalBackend.hpp"
 #include "metal/abi/Sampling.h"
 #include "model/Model.hpp"
-#include "ops/Embedding.hpp"
 #include "ops/RowCopy.hpp"
 #include "ops/Sampling.hpp"
 #include "ops/LaneRows.hpp"
@@ -17,6 +16,7 @@
 #include <cstdint>
 #include <cstring>
 #include <iostream>
+#include <random>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -29,7 +29,6 @@ using splash::metal::BufferStorage;
 using splash::metal::CommandGraph;
 using splash::metal::MetalBackend;
 using splash::metal::MetalBuffer;
-using splash::ops::Embedding;
 using splash::ops::RowCopy;
 using splash::ops::RowRegion;
 using splash::ops::StopTokens;
@@ -214,51 +213,27 @@ void testRowCopy(MetalBackend &backend) {
                 });
 }
 
-// Each buffer the verify input reaches, at its extent and one element short,
-// for three lanes: each lane's anchor, row 0 of its eight draft input rows,
-// its seven proposals and its eight verify input rows.
-void verifyInputExtents(MetalBackend &backend) {
-  constexpr uint32_t lanes = 3, vocabulary = 1003;
-  const std::array<splash::ops::LaneRows, lanes> blocks{{{0, kRows}, {kRows, kRows}, {2 * kRows, kRows}}};
-  const std::array buffers{shared(backend, lanes * kRows * 4, "draft-input"),
-                           shared(backend, lanes * kProposals * 4, "proposed"),
-                           shared(backend, lanes * kRows * 4, "verify-input")};
-  for (const auto &[index, bytes, what] :
-       {std::tuple{size_t{0}, uint64_t{(lanes - 1) * kRows + 1} * 4, "draft input token"},
-        std::tuple{size_t{1}, uint64_t{lanes * kProposals} * 4, "proposed token"},
-        std::tuple{size_t{2}, uint64_t{lanes * kRows} * 4, "verify input token"}})
-    requireExtent(backend, buffers[index], bytes, 4, what, [&](CommandGraph &graph, const MetalBuffer &view) {
-      auto changed = buffers;
-      changed[index] = view;
-      Embedding::addVerifyInput(graph, changed[0], changed[1], changed[2], vocabulary, blocks);
-    });
-}
-
 // Lanes whose verify blocks hold different row counts, packed one after
-// another (5, 8, 1 and 6 rows from rows 0, 5, 13 and 14), take their verify
-// input and accept their drafts as each lane does alone in a block from row
-// 0: the same input rows, retained and accepted counts. Lane l's target
-// selects its first accepted[l] proposals and then other tokens; it retains
-// at most remaining[l] tokens and its verify rows, and a block checks one
-// proposal fewer than its rows.
+// another (5, 8, 1 and 6 rows from rows 0, 5, 13 and 14), accept their chains
+// as each lane does alone in a block from row 0: the same retained and
+// accepted counts and retained rows. Lane l's target selects its first
+// accepted[l] proposals and then other tokens; it retains at most
+// remaining[l] tokens and its verify rows, and a block checks one proposal
+// fewer than its rows.
 void packedLanes(MetalBackend &backend) {
-  // Every token below is inside the vocabulary, which clamps none.
-  constexpr uint32_t vocabulary = 248320;
   using splash::ops::LaneRows;
   const std::array<LaneRows, kLanes> packed{{{0, 5}, {5, 8}, {13, 1}, {14, 6}}};
   const std::array<uint32_t, kLanes> accepted{3, 7, 0, 5}, remaining{5, 8, 1, 4}, verifyRows{5, 6, 1, 6};
-  const splash::ops::Sampling sampling(vocabulary);
-  // A run of `lanes` lanes' buffers: draft input, proposals, verify input,
-  // target tokens, retained and accepted counts, verify rows and retained
-  // rows.
+  const splash::ops::Sampling sampling(248320);
+  // A run of `lanes` lanes' buffers: verify input, target tokens, retained
+  // and accepted counts, verify rows and retained rows.
   struct Run final {
-    std::array<MetalBuffer, 8> buffers;
+    std::array<MetalBuffer, 6> buffers;
   };
   const auto makeRun = [&](uint32_t lanes, uint32_t rows) {
     Run run;
-    for (const auto &[index, count] : {std::pair{0, lanes * kRows}, std::pair{1, lanes * kProposals},
-                                       std::pair{2, rows}, std::pair{3, rows}, std::pair{4, lanes},
-                                       std::pair{5, lanes}, std::pair{6, lanes}, std::pair{7, lanes}}) {
+    for (const auto &[index, count] : {std::pair{0, rows}, std::pair{1, rows}, std::pair{2, lanes},
+                                       std::pair{3, lanes}, std::pair{4, lanes}, std::pair{5, lanes}}) {
       run.buffers[index] = shared(backend, uint64_t{count} * sizeof(uint32_t), "packed-lanes");
       std::memset(run.buffers[index].contents(), 0, run.buffers[index].sizeBytes());
     }
@@ -266,22 +241,20 @@ void packedLanes(MetalBackend &backend) {
   };
   const auto encode = [&](const Run &run, std::span<const LaneRows> blocks, std::span<const uint32_t> limits) {
     const auto &b = run.buffers;
-    const MetalBuffer tree = chainRows(backend, blocks, static_cast<uint32_t>(b[2].sizeBytes() / 4));
+    const MetalBuffer tree = chainRows(backend, blocks, static_cast<uint32_t>(b[0].sizeBytes() / 4));
     CommandGraph graph;
-    Embedding::addVerifyInput(graph, b[0], b[1], b[2], vocabulary, blocks);
-    sampling.addAcceptance(graph, {b[2], tree, b[3], b[4], b[5], b[7], b[6]}, blocks, limits, kFourStops);
+    sampling.addAcceptance(graph, {b[0], tree, b[1], b[2], b[3], b[5], b[4]}, blocks, limits, kFourStops);
     static_cast<void>(backend.submitCommandAsync(graph.dispatches()).wait());
   };
   // Lane l's anchor, proposals and target tokens, written from `row` of
   // `run`'s rows and lane `at` of its lanes.
   const auto fill = [&](const Run &run, uint32_t lane, uint32_t at, uint32_t row) {
-    contents<uint32_t>(run.buffers[0])[at * kRows] = 500 + lane;
-    for (uint32_t position = 0; position < kProposals; ++position)
-      contents<uint32_t>(run.buffers[1])[at * kProposals + position] = 1000 + lane * 100 + position;
-    for (uint32_t index = 0; index < packed[lane].rows; ++index)
-      contents<uint32_t>(run.buffers[3])[row + index] =
+    for (uint32_t index = 0; index < packed[lane].rows; ++index) {
+      contents<uint32_t>(run.buffers[0])[row + index] = index ? 1000 + lane * 100 + index - 1 : 500 + lane;
+      contents<uint32_t>(run.buffers[1])[row + index] =
           index < accepted[lane] ? 1000 + lane * 100 + index : 9000 + lane * 100 + index;
-    contents<uint32_t>(run.buffers[6])[at] = verifyRows[lane];
+    }
+    contents<uint32_t>(run.buffers[4])[at] = verifyRows[lane];
   };
   const Run all = makeRun(kLanes, 20);
   for (uint32_t lane = 0; lane < kLanes; ++lane) fill(all, lane, lane, packed[lane].first);
@@ -293,24 +266,124 @@ void packedLanes(MetalBackend &backend) {
     const std::array<LaneRows, 1> own{{{0, block.rows}}};
     encode(alone, own, std::span(remaining).subspan(lane, 1));
     const std::string label = "packed lane " + std::to_string(lane);
-    require(std::equal(contents<uint32_t>(all.buffers[2]) + block.first,
-                       contents<uint32_t>(all.buffers[2]) + block.first + block.rows,
-                       contents<uint32_t>(alone.buffers[2])),
-            label + ": its verify input differs from alone");
-    const uint32_t retained = contents<uint32_t>(all.buffers[4])[lane];
-    const uint32_t counted = contents<uint32_t>(all.buffers[5])[lane];
-    require(retained == contents<uint32_t>(alone.buffers[4])[0] && counted == contents<uint32_t>(alone.buffers[5])[0] &&
-                contents<uint32_t>(all.buffers[7])[lane] == contents<uint32_t>(alone.buffers[7])[0],
+    const uint32_t retained = contents<uint32_t>(all.buffers[2])[lane];
+    const uint32_t counted = contents<uint32_t>(all.buffers[3])[lane];
+    require(retained == contents<uint32_t>(alone.buffers[2])[0] && counted == contents<uint32_t>(alone.buffers[3])[0] &&
+                contents<uint32_t>(all.buffers[5])[lane] == contents<uint32_t>(alone.buffers[5])[0],
             label + ": its acceptance differs from alone");
     require(counted == accepted[lane] &&
                 retained == std::min({accepted[lane] + 1, remaining[lane], verifyRows[lane]}),
             label + ": accepted " + std::to_string(counted) + " and retained " + std::to_string(retained));
-    // The anchor, then the proposals the block's rows after it hold.
-    require(contents<uint32_t>(all.buffers[2])[block.first] == 500 + lane &&
-                (block.rows < 2 || contents<uint32_t>(all.buffers[2])[block.first + block.rows - 1] ==
-                                       1000 + lane * 100 + block.rows - 2),
-            label + ": its verify input is not its anchor and proposals");
   }
+}
+
+// Acceptance down random trees against a reference walk. A lane's rows each
+// follow a random earlier row and take tokens of a small alphabet (siblings
+// apart), and each row's selection is one of its children's tokens most of the
+// time, else another token or now and then a stop token; the lane verifies a
+// random number of its rows and retains at most a random number. The walk
+// follows from the anchor the child whose token is the row's selection; it
+// counts every row it reaches as accepted, retains its verified rows' first,
+// at most the limit and none after a stop token, writes their selections
+// from the lane's first row and their mask, its deepest retained row's
+// ancestors.
+void treeAcceptance(MetalBackend &backend) {
+  using splash::ops::LaneRows;
+  using splash::ops::TreeRow;
+  std::mt19937 random(0x74726565);
+  const auto below = [&](uint32_t bound) { return static_cast<uint32_t>(random() % bound); };
+  const splash::ops::Sampling sampling(248320);
+  std::array<LaneRows, kLanes> blocks{};
+  for (uint32_t lane = 0; lane < kLanes; ++lane)
+    blocks[lane] = {lane * kRows, kRows};
+  const auto buffer = [&](uint64_t bytes) {
+    MetalBuffer result = shared(backend, bytes, "tree-acceptance");
+    std::memset(result.contents(), 0, bytes);
+    return result;
+  };
+  const MetalBuffer input = buffer(kLanes * kRows * 4), tree = buffer(kLanes * kRows * sizeof(TreeRow)),
+                    output = buffer(kLanes * kRows * 4), retained = buffer(kLanes * 4), accepted = buffer(kLanes * 4),
+                    retainedRows = buffer(kLanes * 4), verifyRows = buffer(kLanes * 4);
+  uint32_t deep = 0;
+  for (uint32_t trial = 0; trial < 300; ++trial) {
+    std::array<std::array<uint32_t, kRows>, kLanes> parents{}, tokens{}, selections{}, ancestors{};
+    std::array<uint32_t, kLanes> limits{}, verified{};
+    for (uint32_t lane = 0; lane < kLanes; ++lane) {
+      tokens[lane][0] = 500 + lane;
+      ancestors[lane][0] = 1;
+      for (uint32_t row = 1; row < kRows; ++row) {
+        // Deep trees as often as wide ones.
+        parents[lane][row] = trial % 2 ? row - 1 - below(std::min(row, 2U)) : below(row);
+        uint32_t token = 0;
+        for (bool taken = true; taken;) {
+          token = 1000 + below(6);
+          taken = false;
+          for (uint32_t sibling = 1; sibling < row; ++sibling)
+            taken = taken || (parents[lane][sibling] == parents[lane][row] && tokens[lane][sibling] == token);
+        }
+        tokens[lane][row] = token;
+        ancestors[lane][row] = ancestors[lane][parents[lane][row]] | (1U << row);
+      }
+      for (uint32_t row = 0; row < kRows; ++row) {
+        std::vector<uint32_t> children;
+        for (uint32_t child = row + 1; child < kRows; ++child)
+          if (parents[lane][child] == row)
+            children.push_back(child);
+        const uint32_t draw = below(20);
+        selections[lane][row] = draw == 0                       ? kStopToken
+                                : draw < 15 && !children.empty() ? tokens[lane][children[below(children.size())]]
+                                                                 : 2000 + below(1000);
+      }
+      verified[lane] = 1 + below(kRows);
+      limits[lane] = 1 + below(kRows);
+      for (uint32_t row = 0; row < kRows; ++row) {
+        const uint32_t at = lane * kRows + row;
+        contents<uint32_t>(input)[at] = tokens[lane][row];
+        contents<TreeRow>(tree)[at] = {ancestors[lane][row],
+                                       static_cast<uint16_t>(row ? parents[lane][row] : SPLASH_TREE_ROOT),
+                                       static_cast<uint16_t>(row ? contents<TreeRow>(tree)[lane * kRows +
+                                                                                           parents[lane][row]].depth +
+                                                                       1
+                                                                 : 0)};
+        contents<uint32_t>(output)[at] = selections[lane][row];
+      }
+      contents<uint32_t>(verifyRows)[lane] = verified[lane];
+    }
+    CommandGraph graph;
+    sampling.addAcceptance(graph, {input, tree, output, retained, accepted, retainedRows, verifyRows}, blocks, limits,
+                           kFourStops);
+    static_cast<void>(backend.submitCommandAsync(graph.dispatches()).wait());
+    for (uint32_t lane = 0; lane < kLanes; ++lane) {
+      std::vector<uint32_t> path{0};
+      for (bool moved = true; moved;) {
+        moved = false;
+        for (uint32_t child = path.back() + 1; child < kRows && !moved; ++child)
+          if (parents[lane][child] == path.back() && tokens[lane][child] == selections[lane][path.back()]) {
+            path.push_back(child);
+            moved = true;
+          }
+      }
+      uint32_t kept = 0;
+      while (kept < path.size() && path[kept] < verified[lane])
+        ++kept;
+      kept = std::min(kept, limits[lane]);
+      for (uint32_t i = 0; i < kept; ++i)
+        if (kFourStops.contains(selections[lane][path[i]])) {
+          kept = i + 1;
+          break;
+        }
+      deep += kept > 2;
+      const std::string label = "tree trial " + std::to_string(trial) + " lane " + std::to_string(lane);
+      require(contents<uint32_t>(accepted)[lane] == path.size() - 1, label + ": accepted count differs");
+      require(contents<uint32_t>(retained)[lane] == kept, label + ": retained count differs");
+      require(contents<uint32_t>(retainedRows)[lane] == ancestors[lane][path[kept - 1]],
+              label + ": retained rows differ");
+      for (uint32_t i = 0; i < kept; ++i)
+        require(contents<uint32_t>(output)[lane * kRows + i] == selections[lane][path[i]],
+                label + ": a retained token is not its path row's selection");
+    }
+  }
+  require(deep >= 100, "too few walks retained more than two rows");
 }
 
 } // namespace
@@ -346,8 +419,8 @@ int main(int argc, char **argv) {
     runWidth(backend, kLanes, allAccepted, fullRemaining, kLanes, 0, fewRows);
     runWidth(backend, kLanes, lowerAccepted, shortRemaining, kLanes, 0, fewRows);
     testRowCopy(backend);
-    verifyInputExtents(backend);
     packedLanes(backend);
+    treeAcceptance(backend);
     std::cout << "dflash_batch_control_metal_test: PASS\n";
     return 0;
   } catch (const std::exception &error) {

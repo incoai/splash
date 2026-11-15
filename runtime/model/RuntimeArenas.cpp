@@ -226,7 +226,6 @@ decodeTensorBytes(const RuntimeGeometry &geometry,
   put(DecodeTensor::RetainedRows, sizeof(uint32_t));
   put(DecodeTensor::AcceptedCount, sizeof(uint32_t));
   put(DecodeTensor::VerifyRows, sizeof(uint32_t));
-  put(DecodeTensor::VerifyConfidence, bytesFor<float>(kDraftProposalTokens));
   // The draft's own rows: its block's, kDraftRows a lane.
   const uint64_t d = kDraftRows;
   put(DecodeTensor::DraftInputTokens, bytesFor<uint32_t>(d));
@@ -256,8 +255,10 @@ decodeTensorBytes(const RuntimeGeometry &geometry,
   put(DecodeTensor::Unary, selectorWorkspace.unaryBytes);
   put(DecodeTensor::TopPartialIds, selectorWorkspace.partialIdsBytes);
   put(DecodeTensor::TopPartialValues, selectorWorkspace.partialValuesBytes);
-  put(DecodeTensor::ProposedTokens, bytesFor<uint32_t>(kDraftProposalTokens));
   put(DecodeTensor::TreeRows, bytesFor<ops::TreeRow>(r));
+  put(DecodeTensor::TreeScores, bytesFor<float>(2 * r));
+  put(DecodeTensor::ChainTokens, bytesFor<uint32_t>(SPLASH_TREE_CHAIN_TOKENS));
+  put(DecodeTensor::ChainRates, bytesFor<float>(uint64_t{SPLASH_TREE_CHAIN_TOKENS} * SPLASH_TREE_AGREEMENTS));
   put(DecodeTensor::PageTable, bytesFor<SplashKvPage>(kMaximumPageTableEntries));
   if (geometry.target.kvLayout.indexDimension)
     put(DecodeTensor::IndexTable, bytesFor<SplashKvPage>(kMaximumPageTableEntries));

@@ -31,14 +31,12 @@ void requireVocabulary(std::span<const uint32_t> tokens, size_t vocabulary) {
     throw std::invalid_argument("penalty token is outside the vocabulary");
 }
 
-// The thinking cutoffs of a selection of each lane's rows `lanes`, all but a
-// lane's last drafted and their masks from mask row `maskRow` on, and the
-// lanes up to the last one it cuts and up to the last one whose end replaces
-// draft proposals, 0 where it cuts none.
+// The thinking cutoffs of a selection of each lane's rows `lanes`, their
+// masks from mask row `maskRow` on, and the lanes up to the last one it cuts,
+// 0 where it cuts none.
 struct ThinkingCutoffs final {
   ThinkingCutoffParams params{};
   uint32_t cutLanes = 0;
-  uint32_t draftingLanes = 0;
 };
 
 ThinkingCutoffs thinkingCutoffs(std::span<const SamplingPolicy> policies, uint32_t vocabulary,
@@ -73,8 +71,6 @@ ThinkingCutoffs thinkingCutoffs(std::span<const SamplingPolicy> policies, uint32
     params.close[lane] = cutoff->end.back();
     params.also_ends[lane] = cutoff->alsoEnds;
     cutoffs.cutLanes = lane + 1;
-    if (cutoff->replacedProposals())
-      cutoffs.draftingLanes = lane + 1;
   }
   return cutoffs;
 }
@@ -166,7 +162,8 @@ void Sampling::addPenalties(metal::CommandGraph &graph,
   if (!params.entries)
     return;
   requireBytes(buffers.inputTokens, inputEnd * sizeof(uint32_t), "verify input token");
-  graph.add("decode_sample_penalize", {buffers.logits, table.words, buffers.inputTokens}, params,
+  requireBytes(buffers.treeRows, inputEnd * sizeof(TreeRow), "verify tree row");
+  graph.add("decode_sample_penalize", {buffers.logits, table.words, buffers.inputTokens, buffers.treeRows}, params,
             {(vocabulary_ + kPenaltyThreads - 1) / kPenaltyThreads, params.entries, 1}, {kPenaltyThreads, 1, 1});
 }
 
@@ -296,33 +293,18 @@ void Sampling::addSelection(metal::CommandGraph &graph, const TargetSamplingPara
       thinkingCutoffs(policies, vocabulary_, std::span(selected).first(lanes), params.mask_row);
   if (!cutoffs.cutLanes)
     return;
-  // A cut lane reads its draft tokens, those of its rows but its last; a
-  // lane whose end waits for its mask, a constrained one, reads its mask
-  // rows, which selection() checked.
+  // A cut lane reads its rows' tokens and tree rows; a lane whose end waits
+  // for its mask, a constrained one, reads its mask rows, which selection()
+  // checked.
   uint64_t inputEnd = 0;
   for (uint32_t lane = 0; lane < cutoffs.cutLanes; ++lane)
-    if (cutoffs.params.row[lane] < selected[lane].rows && selected[lane].rows > 1)
+    if (cutoffs.params.row[lane] < selected[lane].rows)
       inputEnd = std::max(inputEnd, uint64_t{selected[lane].first} + selected[lane].rows);
   requireBytes(buffers.inputTokens, inputEnd * sizeof(uint32_t), "verify input token");
-  graph.add("decode_sample_thinking_cutoff", {buffers.inputTokens, buffers.constraintMasks, buffers.outputTokens},
-            cutoffs.params, {lanes, 1, 1}, {1, 1, 1});
-}
-
-void Sampling::addThinkingDrafts(metal::CommandGraph &graph, std::span<const SamplingPolicy> policies,
-                                 std::span<const LaneRows> blocks, metal::MetalBuffer proposedTokens) const {
-  if (policies.empty() || policies.size() > kMaximumLanes || blocks.size() != policies.size())
-    throw std::invalid_argument("invalid sampling batch width");
-  requireLaneRows(blocks, SPLASH_TARGET_VERIFY_ROWS);
-  // The cutoffs of the verify that follows (addVerify), whose masks the
-  // drafts do not read.
-  const ThinkingCutoffs cutoffs = thinkingCutoffs(policies, vocabulary_, blocks, 1);
-  if (!cutoffs.draftingLanes)
-    return;
-  // Such a lane writes its own proposals.
-  requireBytes(proposedTokens, uint64_t{cutoffs.draftingLanes} * SPLASH_DRAFT_PROPOSAL_TOKENS * sizeof(uint32_t),
-               "proposed token");
-  graph.add("decode_draft_thinking_cutoff", {std::move(proposedTokens)}, cutoffs.params, {policies.size(), 1, 1},
-            {1, 1, 1});
+  requireBytes(buffers.treeRows, inputEnd * sizeof(TreeRow), "verify tree row");
+  graph.add("decode_sample_thinking_cutoff",
+            {buffers.inputTokens, buffers.constraintMasks, buffers.treeRows, buffers.outputTokens}, cutoffs.params,
+            {lanes, 1, 1}, {1, 1, 1});
 }
 
 void Sampling::addAcceptance(metal::CommandGraph &graph, AcceptanceBuffers buffers, std::span<const LaneRows> blocks,

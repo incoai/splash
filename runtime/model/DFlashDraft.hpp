@@ -269,7 +269,7 @@ public:
                  const ops::Projection &vocabularyProjection,
                  std::span<const uint32_t> cacheLengths) const;
   void addSelection(metal::CommandGraph &graph, const ops::DraftSelectorBuffers &buffers,
-                    std::span<const uint32_t> anchors) const;
+                    std::span<const ops::DraftTreeLane> lanes, const ops::DraftCalibration &calibration) const;
   // Sets each of `lanes` lanes' mask rows of the draft input `rows` (all but
   // its anchor's, row 0 of its draftQueryRows) to the mask embedding the
   // checkpoint ships; without one they keep the target table's row.

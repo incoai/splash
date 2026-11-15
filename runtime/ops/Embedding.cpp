@@ -46,31 +46,6 @@ void Embedding::add(metal::CommandGraph &graph, metal::MetalBuffer tokens,
             {(rows * table.inputSize + 255) / 256, 1, 1}, {256, 1, 1});
 }
 
-void Embedding::addVerifyInput(metal::CommandGraph &graph,
-                               metal::MetalBuffer draftInputTokens,
-                               metal::MetalBuffer proposedTokens,
-                               metal::MetalBuffer verifyInputTokens,
-                               uint32_t vocabulary, std::span<const LaneRows> blocks) {
-  if (!vocabulary)
-    throw std::invalid_argument("invalid verify input batch");
-  // A block's rows after its anchor's take one proposal each.
-  requireLaneRows(blocks, SPLASH_DRAFT_PROPOSAL_TOKENS + 1);
-  const uint64_t lanes = blocks.size();
-  uint64_t proposalEnd = 0;
-  for (uint64_t lane = 0; lane < lanes; ++lane)
-    proposalEnd = std::max(proposalEnd, lane * SPLASH_DRAFT_PROPOSAL_TOKENS + blocks[lane].rows - 1);
-  // A lane's anchor is row 0 of its draft input rows.
-  requireBytes(draftInputTokens, rowBytes(lanes, SPLASH_DRAFT_QUERY_ROWS, 1, sizeof(uint32_t)), "draft input token");
-  requireBytes(proposedTokens, proposalEnd * sizeof(uint32_t), "proposed token");
-  requireBytes(verifyInputTokens, rowsEnd(blocks) * sizeof(uint32_t), "verify input token");
-  VerifyInputBatchParams params{vocabulary, {}, {}};
-  copyLaneRows(blocks, params.first_row, params.rows);
-  graph.add("verify_input_tokens",
-            {std::move(draftInputTokens), std::move(proposedTokens),
-             std::move(verifyInputTokens)},
-            params, {mostRows(blocks), lanes, 1}, {1, 1, 1});
-}
-
 void Embedding::addDraftMaskRows(metal::CommandGraph &graph, metal::MetalBuffer mask, metal::MetalBuffer rows,
                                  uint32_t width, uint32_t lanes) {
   if (!width || !lanes || lanes > SPLASH_MAXIMUM_BATCH_WIDTH)

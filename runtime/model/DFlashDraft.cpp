@@ -144,8 +144,9 @@ DFlashDraft::DFlashDraft(const DFlashDraftWeights &weights,
       contextKvProjections_(contextKvRows(backend, weights)) {}
 
 void DFlashDraft::addSelection(metal::CommandGraph &graph, const ops::DraftSelectorBuffers &buffers,
-                               std::span<const uint32_t> anchors) const {
-  selector_.add(graph, buffers, {weights_.predecessorCodebook, weights_.successorCodebook}, anchors);
+                               std::span<const ops::DraftTreeLane> lanes,
+                               const ops::DraftCalibration &calibration) const {
+  selector_.add(graph, buffers, {weights_.predecessorCodebook, weights_.successorCodebook}, lanes, calibration);
 }
 
 void DFlashDraft::addContextPrefill(

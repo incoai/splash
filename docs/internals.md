@@ -440,15 +440,21 @@ GPU, so in a chunk it takes their last FFN rounds as the GPU's alone. On a
 16-core M5 Pro this takes about 2% off the 35B's prefill of 8K tokens.
 
 A decode step's token selection and its penalties and thinking cutoffs,
-acceptance, verify input, the draft's context commit, and
+acceptance, the draft's tree, its context commit, and
 Qwen3.8-Flash-Next's n-gram hash and block indexer address each lane's rows
 by the lane's first row among the step's packed rows and its row count
 (`ops::LaneRows`, the kernels' per-lane `first_row` and `rows`), so lanes of
-different row counts share one dispatch; every row of a lane's verify block
-but its last checks one draft proposal. The first token after a prompt is
+different row counts share one dispatch. A lane's verify block is a tree
+(`metal/abi/VerifyTree.h`, a row's parent, depth and ancestors' mask), which
+the draft's selector writes with each row's token, its verify input: a row's
+penalties count the draft tokens of its path, a thinking cutoff applies by
+depth, acceptance follows from the anchor the child whose token is its row's
+selection, and the draft's context commit takes the retained path's rows in
+order (the mask acceptance writes, `DecodeTensor::RetainedRows`). The first token after a prompt is
 selected from, and written at, the lane's one row. A decode step gives every
-lane eight rows at lane x 8, and the draft's own block stays eight rows a
-lane, whose RoPE rows the context commit reads.
+lane eight rows at lane x 8; the draft's own block stays eight rows a lane,
+and a lane's draft RoPE rows hold its verify block's positions, the first eight
+of which the draft's rows take and the context commit one a retained row.
 
 ### Kernel selection
 
@@ -2845,14 +2851,14 @@ tokens, the end tokens the engine selects where it runs out, the last of which
 closes thinking, and a second token that also ends it, a call's opening where
 the output may call a tool. The engine counts the thinking tokens it selects,
 and then the end tokens. In the selection where the budget runs out, one small
-dispatch gives that row and those after it the end's tokens, unless a draft
-token before the row ended thinking, so acceptance keeps the draft only where it
-drafted the end. Once no thinking token is left,
+dispatch gives the rows of that depth and deeper the end's tokens, unless a
+draft token on the row's path up to that depth ended thinking, so acceptance
+keeps the draft only where it drafted the end. Once no thinking token is left,
 the end starts at a selection's row 0, before which no draft token can end
-thinking, and a second small dispatch replaces the lane's draft proposals with
-the end tokens left before the verify, so a decode cycle accepts as many of
-them as it verifies; the request's speculation counts leave those proposals
-out. A constrained request's end waits for its grammar: it starts at the first
+thinking, and the end tokens left are the lane's proposals, a chain of its
+tree the selector takes before any draft row (none beside it could be
+accepted), so a decode cycle accepts as many of them as it verifies; the
+request's speculation counts leave those proposals out. A constrained request's end waits for its grammar: it starts at the first
 row from the cut whose mask admits its first token, the rows before it keeping
 their own selections, which the engine counts as thinking past the budget, and
 it replaces no proposals before it has started, as only the verify reads the
