@@ -110,9 +110,9 @@ bool StateCache::reuseStoredState(uint64_t kvBlock, bool checkpoint) {
     throw std::logic_error("composite state outlived its target KV block");
   }
   Entry &entry = found->second;
+  // A checkpoint's reuse leaves its reply as it was; makeOrdinary clears an ordinary one's.
   if (!checkpoint)
     makeOrdinary(kvBlock, entry);
-  entry.reply = Reply::None;
   if (!entry.pins)
     entry.lastUsed = recency_.next();
   reindex(kvBlock, entry);

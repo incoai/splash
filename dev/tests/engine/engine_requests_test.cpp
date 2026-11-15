@@ -1145,6 +1145,41 @@ void testReplyCaptureReusesACheckpointAsItIs() {
           "a reclaim dropped a kept reply's state that a capture reused as a running reply's");
 }
 
+// A capture at a page that holds an opportunistic reply's state reuses it as
+// it is: after an identical retry of a turn whose reply no prompt rendered
+// back (2,100 tokens), which reaches the turn's last state at 2,176 again, a
+// reclaim drops that state as it does after the turn alone, and writes no
+// more to the SSD tier.
+void testRetryLeavesAnOpportunisticReplyOpportunistic() {
+  const auto reclaimed = [](uint64_t turns) {
+    test::EngineHarness h({.pages = 512});
+    Executor &executor = h.model;
+    engine::Engine &engine = h.engine;
+    executor.decodeFinishes = false;
+    executor.offloadTier = std::make_shared<OffloadControl>();
+    executor.offloadTier->ready = true;
+    double now = 1;
+    std::vector<uint32_t> prompt(97);
+    std::iota(prompt.begin(), prompt.end(), 1);
+    for (uint64_t id = 1; id <= turns; ++id) {
+      executor.speculativeCounts[id] = {7, 6};
+      engine.submit(conversationTurn(id, prompt, 2100));
+      tickUntil(h, now, [&] { return idle(engine); }, "the turn did not complete");
+    }
+    require(std::ranges::any_of(executor.captures,
+                                [&](const Executor::Capture &capture) {
+                                  return capture.requestId == turns && capture.tokens == 2176;
+                                }),
+            "a turn did not reach its reply's last page");
+    reclaimUpToInUse(h.cache);
+    return h.cache.snapshot().stateCache;
+  };
+  const StateCacheSnapshot alone = reclaimed(1), retried = reclaimed(2);
+  require(alone.checkpointEvictions == 1 && retried.checkpointEvictions == alone.checkpointEvictions &&
+              retried.checkpointEntries == alone.checkpointEntries && retried.offloads == alone.offloads,
+          "a retry's capture made an opportunistic reply's state one a reclaim keeps and writes");
+}
+
 // A reply cancelled at the wall leaves its last checkpoint opportunistic, as
 // a completed one does: reclaim drops it rather than writing it.
 void testEndedReplyCheckpointIsDroppedAtTheWall() {
@@ -2457,6 +2492,7 @@ std::span<const test::TestCase> requestsTests() {
       {"testCompletedReplyStateIsDroppedAtTheWall", testCompletedReplyStateIsDroppedAtTheWall},
       {"testRepliesAreKeptOnceAConversationRendersThemBack", testRepliesAreKeptOnceAConversationRendersThemBack},
       {"testReplyCaptureReusesACheckpointAsItIs", testReplyCaptureReusesACheckpointAsItIs},
+      {"testRetryLeavesAnOpportunisticReplyOpportunistic", testRetryLeavesAnOpportunisticReplyOpportunistic},
       {"testEndedReplyCheckpointIsDroppedAtTheWall", testEndedReplyCheckpointIsDroppedAtTheWall},
       {"testPrefillCheckpointIsWrittenAtTheWall", testPrefillCheckpointIsWrittenAtTheWall},
       {"testRetryPublishesNoStateInsideTheGenerationPrompt", testRetryPublishesNoStateInsideTheGenerationPrompt},
