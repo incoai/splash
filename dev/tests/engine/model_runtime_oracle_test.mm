@@ -5005,14 +5005,15 @@ int main(int argc, char **argv) {
             "constrained short prefill final hidden is unusable");
     executor.end(56);
 
-    // Every decode executes an anchor plus seven proposal rows and verifies
-    // as many of them as its output budget leaves. Compare each budgeted
-    // commit with a constrained cycle that retains the same prefix, rejecting
-    // the next proposal unless all eight rows are retained. The constrained
-    // request has the same budget, so it verifies the same rows, which a MoE
-    // target's expert tiles group alike, and both acceptance paths agree on
-    // the GDN cell, the retained rows and the exact draft ring. Kernel tests
-    // cover the recurrence's FP64 accuracy; this check does not mix prefill and
+    // Every decode runs a draft block's eight rows a lane and verifies those
+    // its output budget leaves: its anchor and the proposals of its tree, no
+    // deeper than the lane may retain. Compare each budgeted commit with a
+    // constrained cycle that retains the same prefix, rejecting the next
+    // proposal unless all eight rows are retained. The constrained request
+    // has the same budget, so it verifies the same rows, which a MoE target's
+    // expert tiles group alike, and both acceptance paths agree on the GDN
+    // cell, the retained rows and the exact draft ring. Kernel tests cover
+    // the recurrence's FP64 accuracy; this check does not mix prefill and
     // decode summation orders, whose tiny differences can amplify through the
     // full model.
     std::string comparedCounts;
@@ -5063,12 +5064,14 @@ int main(int argc, char **argv) {
                                   DecodeStage::ApplyInitialMask));
       auto pending =
           beginMaskedDecodeOne(executor, replayId, 129, replayPages);
+      // Its mask request simulates the rows the replay verifies, its anchor
+      // and the proposals its budget leaves room for, and takes a mask at its
+      // anchor and one after each of them.
       require(pending.maskRequests.size() == 1 &&
-                  pending.maskRequests[0].simulationTokens.size() == 8,
+                  pending.maskRequests[0].simulationTokens.size() == outputLimit,
               "replay proposals were not exposed");
       const auto &proposed = pending.maskRequests[0].simulationTokens;
-      std::array<uint32_t, 9> maskTokens{};
-      maskTokens.fill(100);
+      std::vector<uint32_t> maskTokens(proposed.size() + 1, 100);
       for (size_t row = 0; row < stored; ++row) {
         require(proposed[row] == result.outputTokens[row],
                 "replay proposal differs from committed token");
@@ -5311,9 +5314,10 @@ int main(int argc, char **argv) {
 
     const auto beforeConstrained = executor.telemetry();
 
-    // The constraint handshake exposes the pending anchor plus all seven
-    // DFlash proposals. The next mask therefore has nine rows: the current
-    // anchor, seven proposal positions, and one target successor.
+    // The constraint handshake exposes the rows the cycle verifies: the
+    // pending anchor and the one proposal its budget of two tokens leaves
+    // room for. The next mask therefore has three rows: the current anchor,
+    // the proposal's position, and one target successor.
     EngineRequest constrained = makeRequest(40, prompt129, 2);
     constrained.constraint = ConstraintMode::TokenMask;
     beginCold(executor, constrained, 0);
@@ -5343,17 +5347,16 @@ int main(int argc, char **argv) {
         beginMaskedDecodeOne(executor, 40, 129, pageTable);
     require(verify.maskRequests.size() == 1 &&
                 verify.maskRequests[0].requestId == 40 &&
-                verify.maskRequests[0].simulationTokens.size() == 8 &&
+                verify.maskRequests[0].simulationTokens.size() == 2 &&
                 verify.maskRequests[0].simulationTokens.front() == anchorA &&
                 verify.ticket->ownsMaskWait(40),
             "constraint proposals were not exposed during target forward");
     uint32_t nextB =
         verify.maskRequests[0].simulationTokens[1] == 101 ? 102 : 101;
-    std::array<uint32_t, 9> verifyTokens{anchorA, nextB, 103, 104, 105,
-                                         106,     107,   108, 109};
+    std::array<uint32_t, 3> verifyTokens{anchorA, nextB, 103};
     std::vector<uint32_t> verifyWords = singletonMasks(verifyTokens);
-    require(verifyWords.size() == uint64_t{9} * targetTokens->maskWords(),
-            "DFlash-8 verify did not produce nine mask rows");
+    require(verifyWords.size() == uint64_t{3} * targetTokens->maskWords(),
+            "the verify did not produce three mask rows");
     provideMask(executor, 40, verifyWords);
     auto constrainedResults = finishMaskedDecode(std::move(verify));
     require(constrainedResults.size() == 1,
@@ -5374,8 +5377,9 @@ int main(int argc, char **argv) {
     executor.end(40);
 
     // Accept two of the three proposals a budget of four tokens lets the
-    // cycle verify and reject the third. The draft always proposes seven;
-    // the verified ones are counted only after target verification.
+    // cycle verify and reject the third. The cycle proposes those three, and
+    // its mask request simulates them after its anchor; the verified ones
+    // are counted only after target verification.
     EngineRequest perfectConstraint = makeRequest(44, prompt129, 4);
     perfectConstraint.constraint = ConstraintMode::TokenMask;
     beginCold(executor, perfectConstraint, 0);
@@ -5393,21 +5397,17 @@ int main(int argc, char **argv) {
     PendingMaskedDecode perfectPending =
         beginMaskedDecodeOne(executor, 44, 129, pageTable);
     require(perfectPending.maskRequests.size() == 1 &&
-                perfectPending.maskRequests[0].simulationTokens.size() == 8,
+                perfectPending.maskRequests[0].simulationTokens.size() == 4,
             "perfect constraint did not overlap its mask request");
     uint32_t rejected =
         perfectPending.maskRequests[0].simulationTokens[3] == 121 ? 122 : 121;
-    std::array<uint32_t, 9> perfectVerify{perfectAnchor,
+    std::array<uint32_t, 5> perfectVerify{perfectAnchor,
                                           perfectPending.maskRequests[0]
                                               .simulationTokens[1],
                                           perfectPending.maskRequests[0]
                                               .simulationTokens[2],
                                           rejected,
-                                          123,
-                                          124,
-                                          125,
-                                          126,
-                                          127};
+                                          123};
     provideMask(executor, 44, singletonMasks(perfectVerify));
     auto perfectResults = finishMaskedDecode(std::move(perfectPending));
     require(perfectResults.size() == 1,
@@ -5505,14 +5505,15 @@ int main(int argc, char **argv) {
       const uint64_t id = 42 + lane;
       PendingMaskedDecode initial = beginMaskedDecodeOne(
           executor, id, 129, lane ? crossPages1 : crossPages0);
+      // Its budget of three tokens leaves its anchor and two proposals.
       require(initial.maskRequests.size() == 1 &&
+                  initial.maskRequests[0].simulationTokens.size() == 3 &&
                   initial.maskRequests[0].simulationTokens.front() ==
                       crossAnchors[lane],
               "B1 initial constrained cycle did not draft from its anchor");
       crossNext[lane] =
           initial.maskRequests[0].simulationTokens[1] == 112 ? 113 : 112;
-      const std::array<uint32_t, 9> verify{
-          crossAnchors[lane], crossNext[lane], 114, 115, 116, 117, 118, 119, 120};
+      const std::array<uint32_t, 4> verify{crossAnchors[lane], crossNext[lane], 114, 115};
       provideMask(executor, id, singletonMasks(verify));
       const auto initialResults = finishMaskedDecode(std::move(initial));
       require(initialResults.size() == 1 &&
@@ -5533,13 +5534,14 @@ int main(int argc, char **argv) {
                 crossPending.ticket->ownsMaskWait(42) &&
                 crossPending.ticket->ownsMaskWait(43),
             "B2 target forward did not own both constraint masks");
-    std::array<std::array<uint32_t, 9>, 2> crossVerify{};
+    // Each lane's budget leaves the B2 cycle its anchor and one proposal.
+    std::array<std::array<uint32_t, 3>, 2> crossVerify{};
     for (uint32_t lane = 0; lane < 2; ++lane) {
       const auto &simulation =
           crossPending.maskRequests[lane].simulationTokens;
+      require(simulation.size() == 2, "a B2 constrained lane simulated rows its budget does not leave");
       const uint32_t rejected = simulation[1] == 121 ? 122 : 121;
-      crossVerify[lane] =
-          {crossNext[lane], rejected, 123, 124, 125, 126, 127, 128, 129};
+      crossVerify[lane] = {crossNext[lane], rejected, 123};
       provideMask(executor, crossPending.maskRequests[lane].requestId,
                   singletonMasks(crossVerify[lane]));
     }
@@ -6340,7 +6342,8 @@ int main(int argc, char **argv) {
         if (constrained) {
           auto pending = beginMaskedDecodeOne(
               executor, sequence.id, sequence.prompt.size(), pageTable);
-          std::array<uint32_t, 9> forced;
+          // A mask at the anchor and one after each row the cycle simulates.
+          std::vector<uint32_t> forced(pending.maskRequests.front().simulationTokens.size() + 1);
           for (uint32_t row = 0; row < forced.size(); ++row)
             forced[row] = 100 + static_cast<uint32_t>(transcript.size()) + row;
           provideMask(executor, sequence.id, singletonMasks(forced));
