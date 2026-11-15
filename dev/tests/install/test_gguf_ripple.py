@@ -83,22 +83,19 @@ def header_values():
     added = {index: text for index, text, _ in ADDED}
     types = [CONTROL if index in added else NORMAL for index in range(len(tokens))]
     pattern = [layer % 5 != 4 for layer in range(LAYERS)]
-    return (
-        scalar_metadata()
-        | {
-            "tokenizer.chat_template": CHAT_TEMPLATE,
-            "ricursive.attention.sliding_window_pattern": pattern,
-            "tokenizer.ggml.model": "gpt2",
-            "tokenizer.ggml.pre": "dbrx",
-            "tokenizer.ggml.tokens": tokens,
-            "tokenizer.ggml.token_type": types,
-            "tokenizer.ggml.merges": ["Ġ t", "i n"],
-            "tokenizer.ggml.bos_token_id": 100257,
-            "tokenizer.ggml.eos_token_id": 100265,
-            "tokenizer.ggml.unknown_token_id": 100257,
-            "tokenizer.ggml.padding_token_id": 100277,
-        }
-    )
+    return scalar_metadata() | {
+        "tokenizer.chat_template": CHAT_TEMPLATE,
+        "ricursive.attention.sliding_window_pattern": pattern,
+        "tokenizer.ggml.model": "gpt2",
+        "tokenizer.ggml.pre": "dbrx",
+        "tokenizer.ggml.tokens": tokens,
+        "tokenizer.ggml.token_type": types,
+        "tokenizer.ggml.merges": ["Ġ t", "i n"],
+        "tokenizer.ggml.bos_token_id": 100257,
+        "tokenizer.ggml.eos_token_id": 100265,
+        "tokenizer.ggml.unknown_token_id": 100257,
+        "tokenizer.ggml.padding_token_id": 100277,
+    }
 
 
 def tensor_table():
@@ -243,9 +240,7 @@ class RippleGgufTests(unittest.TestCase):
         tokenizer = Backend.from_str(files["tokenizer/tokenizer.json"].decode())
         splits = tokenizer.pre_tokenizer.pre_tokenize_str
         # Digits in runs of three.
-        self.assertEqual(
-            [span for _, span in splits("12345")], [(0, 3), (3, 5)]
-        )
+        self.assertEqual([span for _, span in splits("12345")], [(0, 3), (3, 5)])
         # A contraction's split whatever its case: the (?i:) of the release's
         # regex, which a lowercase-only transcription would lose.
         self.assertEqual(
@@ -259,4 +254,3 @@ class RippleGgufTests(unittest.TestCase):
         self.assertEqual(
             tokenizer.encode("<|im_end|>", add_special_tokens=False).ids, [100265]
         )
-

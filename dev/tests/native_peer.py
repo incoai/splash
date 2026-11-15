@@ -8,7 +8,7 @@ from dataclasses import replace
 from server import protocol as wire
 
 _HEADER = struct.Struct("<4sHHQ")
-_REQUEST = struct.Struct("<QBBQQIIIffIffffQIIIQQIII")
+_REQUEST = struct.Struct("<QBBQQIIIffIffffQIIIQQIIII")
 _IMAGE_SPAN = struct.Struct("<IIIIQQ")
 _MASK_RESPONSE = struct.Struct("<QQI")
 _ID = struct.Struct("<Q")
@@ -180,6 +180,7 @@ def _decode_request(payload: bytes) -> wire.RequestFrame:
         thinking_tokens,
         thinking_end_count,
         thinking_also_ends,
+        thinking_marker_count,
     ) = _REQUEST.unpack_from(payload)
     offset = _REQUEST.size
     prompt = _words(payload, offset, prompt_count)
@@ -196,6 +197,8 @@ def _decode_request(payload: bytes) -> wire.RequestFrame:
     offset += pixel_bytes
     scores = _words(payload, offset, score_count)
     thinking_end = _words(payload, offset + 4 * score_count, thinking_end_count)
+    offset += 4 * (score_count + thinking_end_count)
+    thinking_markers = _words(payload, offset, thinking_marker_count)
     return wire.RequestFrame(
         request_id,
         wire.RequestPriority(priority),
@@ -214,7 +217,12 @@ def _decode_request(payload: bytes) -> wire.RequestFrame:
         salt_lo | salt_hi << 64,
         None
         if thinking_tokens == 0xFFFFFFFF
-        else wire.ThinkingBudget(thinking_tokens, thinking_end, thinking_also_ends),
+        else wire.ThinkingBudget(
+            thinking_tokens,
+            thinking_end,
+            thinking_also_ends,
+            thinking_markers,
+        ),
     )
 
 

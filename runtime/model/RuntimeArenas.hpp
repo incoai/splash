@@ -78,6 +78,7 @@ struct RuntimeGeometry final {
     result.target = std::visit(
         [&](const auto &weights) { return qwenTargetGeometry(weights, result.draft.targetLayerIds()); },
         model.target);
+    result.target.verifyRows = std::min(result.target.verifyRows, result.draft.rows);
     result.target.kvLayout = model.targetKvLayout(kvFormat);
     result.target.stateLayout = model.stateLayout(stateFormat).target;
     result.target.ropeScaling = model.descriptor.ropeScaling;
@@ -448,16 +449,6 @@ enum class DecodeTensor : uint32_t {
   // Indexed by state lane, like PageTable: the lane's three decode tape
   // slots (ops::GdnTapeLane), one per tape parity (gdnTapeSlot).
   GdnTape,
-  // The verify input tokens in sub-pass order: a 16-row verify's target
-  // layers run two 8-row sub-passes, whose embedding gathers read
-  // contiguous slices of this.
-  VerifyInputPasses,
-  // The lanes' whole-block rows of the target's last layer's output, which
-  // the sub-passes' assemblies build for the head (DecodeTensor::FinalHidden
-  // reads lane-major whole blocks; the head's input gathers the passes').
-  HeadInput,
-  // The second sub-pass's rows' RoPE positions (three per row).
-  PositionsSecond,
   ChunkKeysBase,
   ChunkValuesBase,
   // One tensor per ops::kMoeScratchFields entry, in its order (moeScratchTensor).
@@ -577,21 +568,6 @@ public:
                          uint64_t{lanes} * sizes_[index]);
   }
 
-  // A whole-batch tensor's rows [row, row + rows) in its flat (per-lane
-  // block-major) layout: a sub-pass's contiguous slice of a pass-ordered
-  // tensor such as VerifyInputPasses.
-  [[nodiscard]] metal::MetalBuffer rowSlice(DecodeTensor tensor, uint32_t row,
-                                            uint32_t rows) const {
-    const uint32_t index = static_cast<uint32_t>(tensor);
-    if (isLayerMajorTensor(tensor))
-      throw std::logic_error("layer-major decode scratch requires a layer view");
-    if (!sizes_[index])
-      return {};
-    const uint64_t rowBytes = sizes_[index] / geometry_.draft.rows;
-    return backend_.view(base_, offsets_[index] + uint64_t{row} * rowBytes,
-                         uint64_t{rows} * rowBytes);
-  }
-
   [[nodiscard]] ops::MoeScratch moeScratch(uint32_t lanes) const {
     ops::MoeScratch scratch;
     for (size_t field = 0; field < ops::kMoeScratchFields.size(); ++field)
@@ -612,21 +588,18 @@ public:
     // present) and the always-dense DFlash draft. Sparse target FFNs use their
     // own route-major arena tensors, but must not remove the draft's scratch.
     const uint64_t draft = operators.gateUpWorkspace(
-        {geometry.draft.intermediateSize, geometry.draft.hiddenSize});
+        {geometry.draft.intermediateSize, geometry.draft.hiddenSize}, geometry.draft.rows);
     uint64_t target = 0;
     for (const auto &p : geometry.target.gateUpProjections)
-      target = std::max(target, operators.gateUpWorkspace(p));
+      target = std::max(target, operators.gateUpWorkspace(p, geometry.target.verifyRows));
     return std::max(target, draft);
   }
 
-  // The offset in batchSlice(DecodeTensor::GdnTape, kLaneCount) of state
-  // lane `stateLane`'s tape slot `parity`: three per lane, because a 16-row
-  // verify's two sub-passes leave both earlier slots holding live pending
-  // rows when the second runs (its own rows go to the third).
+  // The pending and next tape alternate with the lane's two state cells.
   [[nodiscard]] uint64_t gdnTapeSlot(uint32_t stateLane, uint32_t parity) const {
-    if (stateLane >= kLaneCount || parity > 2)
+    if (stateLane >= kLaneCount || parity > 1)
       throw std::out_of_range("invalid GDN tape slot");
-    return (uint64_t{stateLane} * 3 + parity) * gdnTapeSlotBytes(geometry_);
+    return (uint64_t{stateLane} * 2 + parity) * gdnTapeSlotBytes(geometry_);
   }
 
   [[nodiscard]] metal::MetalBuffer attentionBatchSlice(DecodeTensor base,

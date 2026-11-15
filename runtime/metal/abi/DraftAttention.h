@@ -64,6 +64,7 @@ struct SplashDraftVariant {
   uint32_t rows;
   uint32_t candidates;
   const char *suffix;
+  uint32_t full_window = 0;
 };
 inline constexpr SplashDraftVariant SPLASH_DRAFT_VARIANTS[] = {
     // The shipped drafts: 32 query heads over 8 KV heads of 128 dimensions,
@@ -77,7 +78,8 @@ inline constexpr SplashDraftVariant SPLASH_DRAFT_VARIANTS[] = {
     // four-tap convolutions, 16-row proposals of 32 candidates (the draft
     // was trained so), head groups of two query heads (five 32-row
     // threadgroups per KV head), eight split threadgroups.
-    {80, 8, 128, 4096, 4, 8, 5, 16, 32, "_kv8_h2_d128_w4096_s8"},
+    {80, 8, 128, 4096, 4, 8, 5, 16, 32, "_kv8_h2_d128_w4096_s8", 16384},
+    {80, 8, 128, 16384, 4, 8, 5, 16, 32, "_kv8_h2_d128_w16384_s8", 16384},
 };
 #endif
 

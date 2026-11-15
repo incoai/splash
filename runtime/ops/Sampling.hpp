@@ -42,13 +42,16 @@ struct ThinkingCutoff final {
   std::span<const uint32_t> end{};
   uint32_t alsoEnds = 0;
   bool waitsForMask = false;
+  bool opened = true;
+  std::span<const uint32_t> markers{};
+  uint32_t markerState = 0;
 
   // How many of the draft's proposals, from the first, the end replaces:
   // tokens the draft did not propose.
-  [[nodiscard]] uint32_t replacedProposals() const noexcept {
-    return row || waitsForMask
+  [[nodiscard]] uint32_t replacedProposals(uint32_t proposals = SPLASH_DRAFT_PROPOSAL_TOKENS) const noexcept {
+    return row || waitsForMask || (!markers.empty() && !opened)
                ? 0
-               : static_cast<uint32_t>(std::min<size_t>(end.size(), SPLASH_DRAFT_PROPOSAL_TOKENS));
+               : static_cast<uint32_t>(std::min<size_t>(end.size(), proposals));
   }
 };
 

@@ -6,8 +6,6 @@ usage: python prepare_ripple_real.py MODEL_ROOT
        then: python prepare_ripple_real.py MODEL_ROOT --prompt "..."
 """
 
-import json
-import os
 import sys
 from pathlib import Path
 
@@ -48,7 +46,10 @@ def main():
     root = Path(sys.argv[1]).resolve()
     root.mkdir(parents=True, exist_ok=True)
     link(cached_file(GGUF_REPO, GGUF_FILE), root / "target" / "ripple.gguf")
-    link(cached_file(DRAFT_REPO, "model.safetensors"), root / "draft" / "model.safetensors")
+    link(
+        cached_file(DRAFT_REPO, "model.safetensors"),
+        root / "draft" / "model.safetensors",
+    )
 
     tokenizer_path = cached_file(BASE_REPO, "tokenizer.json")
     if "--prompt" not in sys.argv:

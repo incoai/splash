@@ -320,7 +320,7 @@ inline void decode(device const bfloat *table, device const float *sums, device 
 #pragma unroll
       for (uint i = 0; i < 2; ++i) {
         const ulong at = ulong(r * 8 + fn + i) * p.out_stride + column;
-        out[at] = gguf_epilogue<Ep, Out>(acc[r][nf][i], aux, at);
+        out[at] = gguf_epilogue<Ep, Out>(acc[r][nf][i], aux, at, p.clamp);
       }
     }
 }

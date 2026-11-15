@@ -1639,15 +1639,51 @@ kernel void decode_sample_thinking_cutoff(
     device uint *tokens [[buffer(2)]],
     device TargetVocabularyRow *vocabulary_rows [[buffer(3)]],
     constant ThinkingCutoffParams &params [[buffer(4)]],
+    constant uint *marker0 [[buffer(5)]], constant uint *marker1 [[buffer(6)]],
+    constant uint *marker2 [[buffer(7)]], constant uint *marker3 [[buffer(8)]],
     uint lane [[threadgroup_position_in_grid]]) {
   uint row = params.row[lane];
+  const uint first = lane * params.rows;
+  const bool automaton = params.automaton_mask & (1u << lane);
+  constant uint *markers = lane == 0 ? marker0 : lane == 1 ? marker1 : lane == 2 ? marker2 : marker3;
+  constant uint *suffix = nullptr;
+  if (automaton) {
+    uint state = params.marker_state[lane], remaining = row;
+    row = params.rows;
+    for (uint r = 0; r < params.rows; ++r) {
+      if (state >= markers[2] && !remaining) {
+        row = r;
+        // A continuation already forced in the previous command keeps its
+        // selected end; a newly reached cutoff finishes this byte prefix.
+        if (r || params.row[lane]) {
+          const uint matrix = (markers[0] * markers[1] + 3) / 4;
+          suffix = markers + markers[8 + matrix + state];
+        }
+        break;
+      }
+      if (r >= params.drafted_rows) break;
+      const bool was_open = state >= markers[2];
+      const uint token = input_tokens[first + r + 1], entries = markers[7];
+      uint low = 0, high = markers[6];
+      while (low < high) {
+        const uint middle = (low + high) / 2;
+        if ((markers[entries + middle] >> 8) < token) low = middle + 1;
+        else high = middle;
+      }
+      const uint kind = low < markers[6] && (markers[entries + low] >> 8) == token ? markers[entries + low] & 255 : 0;
+      const uint index = state * markers[1] + kind;
+      state = (markers[8 + index / 4] >> (8 * (index % 4))) & 255;
+      if (state >= markers[0]) return;
+      if (was_open) --remaining;
+    }
+  }
   if (params.waiting_mask & (1u << lane)) {
     // The lane's mask rows, as selected_row reads them.
     device const uint *masks =
         token_mask + (ulong(lane) * (params.lane_rows + 1) +
                       params.mask_row) *
                          params.mask_words;
-    const uint start = params.tokens[lane][0];
+    const uint start = suffix ? suffix[1] : params.tokens[lane][0];
     for (; row < params.rows; ++row) {
       if (masks[row * params.mask_words + start / 32] & (1u << (start % 32)))
         break;
@@ -1655,17 +1691,17 @@ kernel void decode_sample_thinking_cutoff(
   }
   if (row >= params.rows)
     return;
-  const uint first = lane * params.rows;
-  for (uint r = 0; r < min(row, params.drafted_rows); ++r) {
+  for (uint r = 0; !automaton && r < min(row, params.drafted_rows); ++r) {
     const uint draft = input_tokens[first + r + 1];
     if (draft == params.close[lane] || draft == params.also_ends[lane])
       return;
   }
-  for (uint i = 0; i < min(params.count[lane], params.rows - row); ++i) {
+  const uint count = suffix ? suffix[0] : params.count[lane];
+  for (uint i = 0; i < min(count, params.rows - row); ++i) {
     // A row with no selectable logit keeps its sentinel, so the lane fails.
     if (tokens[first + row + i] >= params.vocabulary)
       continue;
-    const uint end = params.tokens[lane][i];
+    const uint end = suffix ? suffix[1 + i] : params.tokens[lane][i];
     tokens[first + row + i] = end;
     if ((params.sampling_mask & (1u << lane)) && row + i < params.drafted_rows)
       vocabulary_rows[first + row + i].draft_probability =
@@ -1681,7 +1717,8 @@ kernel void decode_draft_thinking_cutoff(
     device uint *proposed_tokens [[buffer(0)]],
     constant ThinkingCutoffParams &params [[buffer(1)]],
     uint lane [[threadgroup_position_in_grid]]) {
-  if (params.row[lane] != 0 || (params.waiting_mask & (1u << lane)))
+  if (params.row[lane] != 0 || (params.waiting_mask & (1u << lane)) ||
+      ((params.automaton_mask & (1u << lane)) && !(params.opened_mask & (1u << lane))))
     return;
   for (uint r = 0; r < min(params.count[lane], params.drafted_rows); ++r)
     proposed_tokens[lane * params.drafted_rows + r] =

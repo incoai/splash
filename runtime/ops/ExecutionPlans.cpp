@@ -87,10 +87,13 @@ AttentionWorkspace ExecutionPlans::prefillAttentionWorkspace(
   return PagedAttention::prefillWorkspace(maximumRows, queryHeads, layout);
 }
 
-// The verify bound is linear in the lanes: one lane's is every width's share.
+// Verify attention is linear in lanes. Wider native blocks use prefill
+// tiles, so their workspace follows those tiles rather than an eight-row
+// verify's split count.
 AttentionWorkspace ExecutionPlans::verifyAttentionWorkspacePerLane(
-    uint32_t queryHeads, kv::Layout layout) const {
-  return PagedAttention::verifyWorkspace(1, queryHeads, layout);
+    uint32_t queryHeads, kv::Layout layout, uint32_t rows) const {
+  return rows == SPLASH_TARGET_VERIFY_ROWS ? PagedAttention::verifyWorkspace(1, queryHeads, layout)
+                                          : PagedAttention::prefillWorkspace(rows, queryHeads, layout);
 }
 
 // The draft workspace is linear in the lanes: one lane's is every width's
@@ -117,7 +120,7 @@ MoeWorkspace ExecutionPlans::moeDecodeWorkspacePerLane(MoeShape shape, uint32_t 
   return bound;
 }
 
-uint64_t ExecutionPlans::gateUpWorkspace(ProjectionShape shape) const {
+uint64_t ExecutionPlans::gateUpWorkspace(ProjectionShape shape, uint32_t rowsPerLane) const {
   uint64_t bound = 0;
   for (uint32_t lanes = 1; lanes <= kMaximumLanes; ++lanes) {
     const LinearWorkload workload{{shape.outputSize, shape.inputSize}, lanes * kDecodeRows,
@@ -125,7 +128,7 @@ uint64_t ExecutionPlans::gateUpWorkspace(ProjectionShape shape) const {
     bound = std::max(bound, linear_.plan(workload).gateScratchBytes());
     // A served draft's whole block runs the head's gate/up pair too.
     const LinearWorkload block{{shape.outputSize, shape.inputSize},
-                               lanes * SPLASH_DRAFT_BLOCK_ROWS_LIMIT,
+                               lanes * rowsPerLane,
                                LinearPhase::Decode, LinearEpilogue::GateUp};
     bound = std::max(bound, linear_.plan(block).gateScratchBytes());
   }

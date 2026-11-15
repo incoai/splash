@@ -303,7 +303,7 @@ public:
   // The scratch of every decode plan of a projection of `shape`: each lane
   // count, the None, Residual and GateUp epilogues and every tile the device
   // may run them on, and the rotated rows of a full decode batch.
-  [[nodiscard]] LinearScratchSize decodeScratchSize(ProjectionShape shape) const;
+  [[nodiscard]] LinearScratchSize decodeScratchSize(ProjectionShape shape, uint32_t rowsPerLane = SPLASH_TARGET_VERIFY_ROWS) const;
   // The scratch of every prefill chunk and epilogue of a projection of
   // `shape`: the split partials and counters of the chunks that run the
   // staged tile (LinearGguf.cpp), the rotated rows of a full chunk, and where

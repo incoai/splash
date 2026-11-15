@@ -207,17 +207,17 @@ LinearPlan Linear::prefillPlan(const Projection &p, uint32_t rows, LinearEpilogu
   return part;
 }
 
-LinearScratchSize Linear::decodeScratchSize(ProjectionShape shape) const {
+LinearScratchSize Linear::decodeScratchSize(ProjectionShape shape, uint32_t rowsPerLane) const {
   LinearScratchSize bound;
   for (uint32_t lanes = 1; lanes <= SPLASH_MAXIMUM_BATCH_WIDTH; ++lanes)
     for (const auto epilogue : {LinearEpilogue::None, LinearEpilogue::Residual, LinearEpilogue::GateUp,
                                 LinearEpilogue::ClampedGateUp})
-      for (const uint32_t rows : {0u, lanes * SPLASH_DRAFT_BLOCK_ROWS_LIMIT})
+      for (const uint32_t rows : {0u, lanes * rowsPerLane})
         bound.include(
             ggufDecodeScratchSize(decode({shape.outputSize, shape.inputSize}, lanes, epilogue, rows),
                                   shape.registerFormats));
   // Decode plans store at most every lane's rows.
-  if (shape.rotated) bound.rotated = rotatedBytes(shape.inputSize, kMaximumDecodeTileRows);
+  if (shape.rotated) bound.rotated = rotatedBytes(shape.inputSize, rowsPerLane * SPLASH_MAXIMUM_BATCH_WIDTH);
   return bound;
 }
 

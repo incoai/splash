@@ -43,8 +43,13 @@ namespace splash::test {
 [[nodiscard]] inline model::DFlashDraftLayout rippleDraft() {
   constexpr model::RippleLayout target;
   constexpr std::array<uint32_t, 5> targetLayers{1, 20, 39, 58, 77};
-  return model::draftLayout(target.hiddenSize, target.vocabularySize, 5, 40'960, 10'000.0F, targetLayers,
-                            SPLASH_DRAFT_VARIANTS[1]);
+  auto layout = model::draftLayout(target.hiddenSize, target.vocabularySize, 5, 40'960, 10'000.0F, targetLayers,
+                                    SPLASH_DRAFT_VARIANTS[1]);
+  layout.slidingWindow = layout.window;
+  layout.window = 16384;
+  layout.fullAttentionLayers.set(4, true);
+  layout.unrotatedLayers.set(4, true);
+  return layout;
 }
 
 [[nodiscard]] inline model::DFlashDraftLayout flintDraft() {

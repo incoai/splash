@@ -38,6 +38,7 @@
 #include <array>
 #include <charconv>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <filesystem>
@@ -107,7 +108,7 @@ std::vector<uint32_t> pageRange(uint32_t first, uint32_t count) {
 // producing tokens instead of a stop token right after prefill. The user text
 // repeats one sentence, "Write a detailed, multi-paragraph essay about the
 // history of the Roman Empire. ", until the prompt reaches the requested
-// length, and the answer follows an empty think block. Its tokens are the
+// length, and the generation prompt keeps thinking enabled. Its tokens are the
 // target's tokenizer's: the Qwen families' (one tokenizer) or Flint's.
 struct ChatTokens final {
   std::vector<uint32_t> userHeader;
@@ -118,17 +119,25 @@ const ChatTokens kQwenChat{
     // <|im_start|>user\n
     .userHeader = {248045, 846, 198},
     .sentence = {7734, 264, 11346, 11, 7072, 12, 26829, 8627, 883, 279, 3712, 314, 279, 12386, 19825, 13, 220},
-    // <|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n
-    .assistantHeader = {248046, 198, 248045, 74455, 198, 248068, 271, 248069, 271}};
+    // <|im_end|>\n<|im_start|>assistant\n<think>\n
+    .assistantHeader = {248046, 198, 248045, 74455, 198, 248068, 198}};
 const ChatTokens kFlintChat{
     // <|user|>
     .userHeader = {150003},
     .sentence = {7421, 260, 7426, 11, 4519, 12, 41088, 6369, 762, 269, 3476, 297, 269, 10831, 18381, 13, 220},
-    // <|assistant|><think></think>
-    .assistantHeader = {150004, 150006, 150007}};
+    // <|assistant|> (the model opens its reasoning)
+    .assistantHeader = {150004}};
+
+const ChatTokens kRippleChat{
+    // <|im_start|>user\n
+    .userHeader = {100264, 882, 198},
+    .sentence = {3923, 374, 279, 6864, 315, 9822, 30, 83017, 701, 33811, 11, 1243, 4320, 27851, 13, 198},
+    // <|im_end|>\n<|im_start|>assistant\n (the model opens its reasoning)
+    .assistantHeader = {100265, 198, 100264, 78191, 198}};
 
 std::vector<uint32_t> chatPrompt(const model::ModelDescriptor &descriptor, uint32_t tokens) {
   const ChatTokens &chat =
+      std::holds_alternative<model::RippleLayout>(descriptor.target) ? kRippleChat :
       std::holds_alternative<model::FlintLayout>(descriptor.target) ? kFlintChat : kQwenChat;
   if (tokens < chat.userHeader.size() + chat.assistantHeader.size() + 1)
     throw std::invalid_argument("prompt is too short for a chat request");
@@ -245,8 +254,9 @@ struct Lane final {
 };
 
 void prefill(model::Runtime &executor, Lane &lane,
-             std::span<const uint32_t> prompt) {
+             std::span<const uint32_t> prompt, const SamplingParameters &sampling) {
   EngineRequest request;
+  request.sampling = sampling;
   request.id = lane.id;
   request.prompt.assign(prompt.begin(), prompt.end());
   request.maxNewTokens = 256;
@@ -329,6 +339,7 @@ int main(int argc, char **argv) {
       }
       uint32_t promptTokens = 512;
       uint32_t cycles = 4;
+      SamplingParameters sampling{.temperature = 1.0F, .topP = 0.95F, .topK = 20, .seed = 42};
       kv::Format format = kv::Format::Int8;
       ops::GdnStateFormat stateFormat = ops::GdnStateFormat::Float32;
       std::vector<ops::ImageGrid> grids;
@@ -343,6 +354,15 @@ int main(int argc, char **argv) {
           throw std::invalid_argument(std::string(option) + " requires a value");
         if (option == "--prompt-tokens") {
           promptTokens = parseCount(argv[index + 1], "--prompt-tokens");
+          textOptions = true;
+        } else if (option == "--temperature" || option == "--top-p") {
+          const float value = std::stof(argv[index + 1]);
+          if (!std::isfinite(value) || value <= 0 || (option == "--top-p" && value > 1))
+            throw std::invalid_argument("sampling temperature and top-p must be positive; top-p at most one");
+          if (option == "--temperature") sampling.temperature = value; else sampling.topP = value;
+          textOptions = true;
+        } else if (option == "--top-k") {
+          sampling.topK = parseCount(argv[index + 1], "--top-k");
           textOptions = true;
         } else if (option == "--cycles")
           cycles = parseCount(argv[index + 1], "--cycles");
@@ -391,9 +411,11 @@ int main(int argc, char **argv) {
           model::loadModel(backend, root, model::inspectModelRoot(root), loadOptions);
       ops::ExecutionPlans operators(backend.capabilities(), ops::Int8Activations::On);
 
+      std::printf("sampling temperature=%g top_p=%g top_k=%u seed=%llu, thinking enabled\n",
+                  sampling.temperature, sampling.topP, sampling.topK, static_cast<unsigned long long>(sampling.seed));
       // Enough Page32 pages for four lanes of prompt plus generated rows.
       const uint32_t pagesPerLane =
-          (promptTokens + 256 + model::ExecutionLimits::targetVerifyRows) /
+          (promptTokens + 256 + model.descriptor.draft.rows) /
               kv::kPageTokens +
           2;
       // Whole extents of the largest size the pool rule picks, as a large
@@ -433,19 +455,19 @@ int main(int argc, char **argv) {
       const std::vector<uint32_t> prompt = chatPrompt(model.descriptor, promptTokens);
 
       // Warm prefill and B1 decode with real work before measuring.
-      prefill(executor, lanes[0], prompt);
+      prefill(executor, lanes[0], prompt, sampling);
       static_cast<void>(decodeCycle(backend, executor, std::span<Lane>(&lanes[0], 1)));
       executor.end(lanes[0].id);
 
       // Prefill: fused timing first, then the attributed replay. Both cover
       // every chunk of the prompt.
       const double prefillBefore = executor.telemetry().totalPrefillGpuSeconds;
-      prefill(executor, lanes[0], prompt);
+      prefill(executor, lanes[0], prompt, sampling);
       const double prefillFused =
           executor.telemetry().totalPrefillGpuSeconds - prefillBefore;
       executor.end(lanes[0].id);
       BackendInstrumentation::setDispatchProfiling(backend, true);
-      prefill(executor, lanes[0], prompt);
+      prefill(executor, lanes[0], prompt, sampling);
       BackendInstrumentation::setDispatchProfiling(backend, false);
       Table prefillTable;
       accumulate(prefillTable,
@@ -493,7 +515,7 @@ int main(int argc, char **argv) {
       profileWidth("B1 decode cycle", std::span<Lane>(&lanes[0], 1));
       // Add one lane at a time so M16 and M24 paths are measured too.
       for (uint32_t index = 1; index < lanes.size(); ++index) {
-        prefill(executor, lanes[index], prompt);
+        prefill(executor, lanes[index], prompt, sampling);
         const std::string title = "B" + std::to_string(index + 1) + " decode cycle";
         profileWidth(title.c_str(), std::span<Lane>(lanes.data(), index + 1));
       }

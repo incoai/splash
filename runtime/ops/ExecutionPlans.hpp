@@ -55,14 +55,14 @@ public:
   [[nodiscard]] AttentionWorkspace prefillAttentionWorkspace(
       uint32_t maximumRows, uint32_t queryHeads, kv::Layout layout) const;
   [[nodiscard]] AttentionWorkspace verifyAttentionWorkspacePerLane(
-      uint32_t queryHeads, kv::Layout layout) const;
+      uint32_t queryHeads, kv::Layout layout, uint32_t rows = SPLASH_TARGET_VERIFY_ROWS) const;
   [[nodiscard]] DraftAttentionWorkspace draftAttentionWorkspacePerLane(
       DraftAttentionShape shape, uint32_t rows = SPLASH_DRAFT_QUERY_ROWS) const;
   [[nodiscard]] MoeWorkspace moePrefillWorkspace(
       MoeShape shape, uint32_t routerFormat, uint32_t maximumRows) const;
   [[nodiscard]] MoeWorkspace moeDecodeWorkspacePerLane(MoeShape shape, uint32_t routerFormat) const;
   // This scratch is one whole-command buffer, not a per-lane arena field.
-  [[nodiscard]] uint64_t gateUpWorkspace(ProjectionShape shape) const;
+  [[nodiscard]] uint64_t gateUpWorkspace(ProjectionShape shape, uint32_t rowsPerLane = SPLASH_TARGET_VERIFY_ROWS) const;
 
 private:
   Linear linear_;

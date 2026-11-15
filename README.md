@@ -73,6 +73,7 @@ automatically:
 | Ornith-1.5-122B | `unsloth/Ornith-1.5-122B-GGUF:UD-Q4_K_XL` | `ornith-ai/Ornith-1.5-122B-MLX-4bit` |
 | Qwen3.8-Flash-Next | `ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF:Q2_0` | — |
 | Flint | `unsloth/flint-GGUF:UD-Q4_K_XL` | — |
+| Ripple-65B-Preview | `AtomicChat/Ripple-65B-Preview-GGUF:AD-Q4_K_M` | — |
 
 Unsloth GGUF variants span **1–8 bits**, including mixed-precision UD formats
 up to `UD-Q8_K_XL`, whose BF16 tensors load too. Whole-BF16 and F16 models are

@@ -39,6 +39,7 @@ REQUEST_FIELDS = (
     "thinking_tokens",
     "thinking_end_count",
     "thinking_also_ends",
+    "thinking_marker_count",
 )
 assert len(REQUEST_FIELDS) == len(p._REQUEST.format) - 1
 OFFSET = dict(
@@ -525,6 +526,7 @@ class ProtocolPythonTests(unittest.TestCase):
                 request.thinking_budget.tokens,
                 len(request.thinking_budget.end),
                 request.thinking_budget.also_ends,
+                0,
             )
             + struct.pack(f"<{len(request.prompt_tokens)}I", *request.prompt_tokens)
             + struct.pack(p._IMAGE_SPAN.format, *astuple(span))

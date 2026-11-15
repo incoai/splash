@@ -63,6 +63,15 @@ public:
     dispatches_.back().indirectThreadgroups = std::move(grid);
   }
 
+  // Adds graph-owned constants to the last dispatch at an explicit binding.
+  void bytes(uint32_t index, std::span<const uint32_t> words) {
+    if (dispatches_.empty() || words.size_bytes() > 4096)
+      throw std::invalid_argument("dispatch constants exceed 4096 bytes or have no dispatch");
+    payloads_.emplace_back(words.empty() ? sizeof(uint32_t) : words.size_bytes());
+    if (!words.empty()) std::memcpy(payloads_.back().data(), words.data(), words.size_bytes());
+    dispatches_.back().bytes.push_back({index, payloads_.back().data(), payloads_.back().size()});
+  }
+
   // Gives the last dispatch the GPU addresses of `buffers` as a table at the
   // index after its parameter struct (ComputeDispatch::addresses), which it
   // reads, or reads and writes when `writes`.

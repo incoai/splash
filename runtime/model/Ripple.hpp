@@ -58,7 +58,7 @@ struct RippleLayout final : QwenHybridLayout {
   // config's max_position_embeddings states the context the model claims,
   // which the family need not serve (configNativeContextTokens).
   constexpr RippleLayout()
-      : QwenHybridLayout{{.nativeContextTokens = 262'144,
+      : QwenHybridLayout{{.nativeContextTokens = 1'048'576,
                           .yarnContextTokens = 0,
                           .layers = 80,
                           .hiddenSize = 5120,
@@ -131,7 +131,7 @@ public:
                                                            QwenPrefillLayers layers, ops::AneFfn *aneFfn) override;
   void addVerify(metal::CommandGraph &graph, QwenTargetVerifyBuffers buffers, const kv::PageStorage &kv,
                  SpilledKvReads &spilled, std::span<const kv::ChunkedPrefillParams> chunks,
-                 uint32_t lanes, uint32_t blockRows, uint32_t verifiedRows) const override;
+                 uint32_t lanes, uint32_t blockRows) const override;
   void addHeadBatch(metal::CommandGraph &graph, metal::MetalBuffer hidden, metal::MetalBuffer finalHidden,
                     metal::MetalBuffer logits, uint32_t lanes, uint32_t rows,
                     ops::LinearScratch scratch) const override;
@@ -168,7 +168,6 @@ private:
   // The block's clamp, one F32 the clamped FFN epilogues read, and the scaled
   // token embedding rows, which every block's mix reads back and the gather
   // writes once.
-  metal::MetalBuffer clamp_;
   metal::MetalBuffer embedRows_;
 };
 

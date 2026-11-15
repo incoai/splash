@@ -153,7 +153,7 @@ paths for `--model-dir`, `--draft-model` and `--mmproj`.
 | `--announce-served-name` | Off | Report the first `--served-model-name` in responses; needs `--served-model-name`. |
 | `--default-reasoning-effort` | `SPLASH_DEFAULT_REASONING_EFFORT` or the template's | Effort of Chat and Responses requests that set none. See [default reasoning effort](#default-reasoning-effort). |
 | `--thinking-token-budget` | `SPLASH_THINKING_TOKEN_BUDGET` or none | Thinking tokens of a request that sets no budget. See [thinking token budget](#thinking-token-budget). |
-| `--thinking-end-text` | `SPLASH_THINKING_END_TEXT` or the template's close | Text that ends thinking where a budget runs out, `</think>` its last token; unset, the close the chat template writes after a reasoning. See [thinking token budget](#thinking-token-budget). |
+| `--thinking-end-text` | `SPLASH_THINKING_END_TEXT` or the template's close | Text that ends thinking where a budget runs out, ending with `</think>`; unset, the close the chat template writes after a reasoning. See [thinking token budget](#thinking-token-budget). |
 | `--max-request-size` | `128M` | Largest HTTP request body. See [request limits](api.md#request-limits-and-timeouts). |
 | `--max-image-pixels` | `4194304` | Maximum resized pixels per image. An image's vision scratch grows with its patches (pixels / 256), to about 600 MiB at the default. |
 | `--request-timeout` | None | Time a request may take from its arrival; a request's own `timeout` can only shorten it. |
@@ -329,7 +329,9 @@ as Qwen describes for them: the factor is the context over the native window,
 so that the stretched window is the context asked for, such as 2 for
 `--max-context 512K` and about 3.81 for `1M`. Flint's full layers have no RoPE
 to stretch, so its native window is its most, and a longer `--max-context`
-stops its startup. Without `--max-context`, or at 256K or less, YaRN stays off, so
+stops its startup. Ripple also leaves its full layers unrotated and serves
+up to 1,048,576 tokens without YaRN. On Qwen, without `--max-context`, or at
+256K or less, YaRN stays off, so
 answers and the persistent cache are the native window's. The budget must
 hold the context: about a million tokens of the 27B's int8 KV on a 64 GB Mac,
 more of the 35B's, whose KV per token is a third of the 27B's; where it does
@@ -1134,12 +1136,15 @@ request thinks on until the character is complete, a token or a few, and its
 - `--thinking-token-budget N` (or `SPLASH_THINKING_TOKEN_BUDGET`) is the
   server's budget; unset, thinking has no cap.
 - `--thinking-end-text TEXT` (or `SPLASH_THINKING_END_TEXT`) is the server's
-  thinking end: text without the template's special tokens, then `</think>` as
-  its own token, at most 64 tokens in all. The server checks the text with the
+  thinking end: text without the template's special tokens, ending with
+  `</think>`, at most 64 tokens in all. The closing marker may span several
+  tokens, as Ripple's does. The server checks the text with the
   model's tokenizer when it starts, and stops with an error on one that breaks
   these rules. Unset, the end is the close the chat template writes after a
   reasoning, which the server probes at startup: a line break then `</think>`
-  for Qwen's templates, `</think>` alone for Flint's. The next request then
+  for Qwen's templates, `</think>` alone for Flint's, and a line break then
+  `</think>` for Ripple's. Budgets also apply when the model opens the reasoning
+  block itself, as Flint and Ripple do. The next request then
   renders the close of a reply whose thinking the budget ended as the tokens
   the budget selected, so that its prompt keeps to the reply's tokens through
   the cut and can read the reply's cached KV past it; an end that closes

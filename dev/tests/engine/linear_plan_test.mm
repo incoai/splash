@@ -384,7 +384,7 @@ void ggufPlans() {
   const LinearPlan wholeBlock =
       linear.plan({{5120, 17408}, 64, LinearPhase::Decode, LinearEpilogue::Residual},
                   blockProjection(5120, 17408, 1));
-  require(linear.decodeScratchSize(downShape).partials ==
+  require(linear.decodeScratchSize(downShape, 16).partials ==
               std::max(three.scratchSize().partials, wholeBlock.scratchSize().partials),
           "GGUF decode scratch bound");
   // Float projections take the neural accelerator tile from 1.5 of its
@@ -440,7 +440,7 @@ void ggufPlans() {
             "Apple9 GGUF prefill chunks past a decode batch take the prefill tile");
   require(m3.ggufFloatTile(2048, 256, QuantizedSegment::kFloat32) == FloatTile::Simdgroup,
           "Apple9 float projections take the simdgroup tile");
-  const LinearScratchSize bound = m3.decodeScratchSize(downShape);
+  const LinearScratchSize bound = m3.decodeScratchSize(downShape, 16);
   const LinearPlan m3WholeBlock =
       m3.plan({down.matrix, 64, LinearPhase::Decode, LinearEpilogue::Residual}, blockProjection(5120, 17408, 1));
   require(bound.partials ==
@@ -859,7 +859,7 @@ void ggufPlans() {
     rejects([&] { (void)Linear::plan(w, config, FloatOutput::BFloat16); },
             "only a staged one-lane block decode runs the 16-row tile",
             "the 16-row tile took other rows than one decode lane's or another tile");
-  // Int8 activations run on a staged decode plan of 16 or 32 rows whose K splits keep whole PQ2_0 blocks: not on the
+  // Int8 activations run on a staged decode plan of 16 to 64 rows whose K splits keep whole PQ2_0 blocks: not on the
   // register tile, 8 rows, a prefill chunk, or 16 splits of 5120 inputs (160 groups, no multiple of 16 blocks of 4).
   for (const auto &[w, config] :
        {std::pair{LinearWorkload{down.matrix, 16, LinearPhase::Decode, LinearEpilogue::Residual},
@@ -870,7 +870,7 @@ void ggufPlans() {
         {LinearWorkload{{5120, 5120}, 16, LinearPhase::Decode, LinearEpilogue::None},
          LinearConfig{.tile = LinearTile::GgufStaged, .splits = 16, .decodeInt8 = true}}})
     rejects([&] { (void)Linear::plan(w, config, FloatOutput::BFloat16); },
-            "only a staged block decode of 16 or 32 rows and whole PQ2_0 blocks per split runs int8 activations",
+            "only a staged block decode of 16 to 64 rows and whole PQ2_0 blocks per split runs int8 activations",
             "int8 activations took another tile, rows, phase or a split of a PQ2_0 block");
   rejects([&] { (void)Linear::plan(chunk, {.tile = LinearTile::GgufPrefill, .spread = true}, FloatOutput::BFloat16); },
           "only the staged block tile spreads its walks", "the prefill tile spread its walks");
@@ -884,7 +884,7 @@ void scratchBoundsRotated() {
   for (const bool rotated : {false, true}) {
     const ProjectionShape shape{5120, 17408, rotated};
     require(linear.decodeScratchSize(shape).rotated ==
-                    (rotated ? uint64_t{17408} * kMaximumDecodeTileRows * 2 : 0) &&
+                    (rotated ? uint64_t{17408} * SPLASH_TARGET_VERIFY_ROWS * SPLASH_MAXIMUM_BATCH_WIDTH * 2 : 0) &&
                 linear.prefillScratchSize(shape).rotated == (rotated ? uint64_t{17408} * 2048 * 2 : 0),
             "rotated scratch bounds");
   }

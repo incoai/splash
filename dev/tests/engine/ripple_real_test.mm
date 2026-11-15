@@ -12,6 +12,7 @@
 #include "engine/MemoryGovernor.hpp"
 #include "model/ModelFactory.hpp"
 #include "model/Ripple.hpp"
+#include "model/Runtime.hpp"
 #include "model/RuntimeArenas.hpp"
 #include "ops/ExecutionPlans.hpp"
 #include "ops/PageStorage.hpp"
@@ -89,8 +90,10 @@ MetalBuffer prefill(MetalBackend &backend, LoadedModel &model, QwenTarget *targe
                     const std::vector<uint32_t> &pageIds, const std::vector<uint32_t> &tokens,
                     const model::DecodeArena &decodeArena, std::vector<double> &seconds) {
   MetalBuffer logits;
-  model::withPrefillArena(backend, model, operators, kv::Format::BFloat16,
-                           [&](const QwenTargetPrefillBuffers &buffers) {
+  {
+    const auto geometry = model::RuntimeGeometry::from(model, kv::Format::BFloat16, ops::GdnStateFormat::Float32);
+    const model::PrefillArena arena(backend, geometry, operators);
+    const auto buffers = model::prefillBuffers(arena, 0);
     const auto began = std::chrono::steady_clock::now();
     CommandGraph graph;
     std::vector<uint32_t> positions;
@@ -144,10 +147,10 @@ MetalBuffer prefill(MetalBackend &backend, LoadedModel &model, QwenTarget *targe
     logits = backend.allocateBuffer(uint64_t{kVerifyRows} * kVocab * 4, BufferStorage::Shared, "logits");
     splash::ops::RowCopy::add(graph, finalHidden[0], {sequence.rows - 1, kHidden, 0}, headInput, {0, kHidden, 0}, 1,
                               kHidden);
-    target->addHeadBatch(graph, headInput, finalHidden0, logits, 1, decodeArena.linearScratch());
+    target->addHeadBatch(graph, headInput, finalHidden0, logits, 1, kVerifyRows, decodeArena.linearScratch());
     static_cast<void>(backend.submitCommandAsync(graph.dispatches()).wait());
     seconds.push_back(std::chrono::duration<double>(std::chrono::steady_clock::now() - began).count());
-  });
+  }
   return logits;
 }
 

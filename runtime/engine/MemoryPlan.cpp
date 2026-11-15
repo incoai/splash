@@ -223,6 +223,8 @@ std::optional<std::string> ModelMemoryProfile::validationError() const {
       maximumContextTokens > kv::kMaximumLogicalTokens) {
     return "invalid_model_context_length";
   }
+  if (!speculativeTokens || speculativeTokens > model::ExecutionLimits::speculativeScratchTokens)
+    return "invalid_speculative_token_count";
   if (!targetKvLayout.valid()) return "invalid_target_kv_layout";
   if (spill.enabled && !targetKvLayout.spillable()) return "spill_plan_needs_a_spillable_layout";
   if (!ops::validFormat(stateFormat)) return "invalid_state_format";
@@ -468,7 +470,7 @@ evaluateEngineMemoryPlan(const DeviceCapabilities &device,
       .window = model.maximumContextTokens,
       .resident = static_cast<uint32_t>(std::min<uint64_t>(
           model.maximumContextTokens,
-          saturatingSubtract(breakdown.kvCapacityTokens, model::ExecutionLimits::speculativeScratchTokens))),
+          saturatingSubtract(breakdown.kvCapacityTokens, model.speculativeTokens))),
       .spilled = spill.memoryTokens,
       .disk = spill.diskTokens};
   if (!breakdown.kvExtentPages ||

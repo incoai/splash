@@ -899,7 +899,11 @@ class Frontend:
             ),
             chat_format=self.chat_format,
             thinking_token_budget=(
-                budget if thinking and budget is not None and budget < max_new else None
+                budget
+                if (thinking or self.chat_format.model_opens_reasoning)
+                and budget is not None
+                and budget < max_new
+                else None
             ),
             tool_policy=tool_policy,
             response_validator=response_validator,
@@ -922,9 +926,7 @@ class Frontend:
         if thinking and chat_format.tags_are_text:
             # The close of reasoning is text: the prefix carries its tokens,
             # which the model writes before what the grammar takes over.
-            reasoning = self._tokenize(THINK_END, add_special_tokens=False)[
-                "input_ids"
-            ]
+            reasoning = self._tokenize(THINK_END, add_special_tokens=False)["input_ids"]
         else:
             reasoning = [chat_format.think_end_id] if thinking else []
         return [

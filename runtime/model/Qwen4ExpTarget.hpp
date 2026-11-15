@@ -38,7 +38,7 @@ public:
   void prepareVerifyLane(uint32_t lane, uint64_t position, const QwenTargetRequest &request) override;
   void addVerify(metal::CommandGraph &graph, QwenTargetVerifyBuffers buffers, const kv::PageStorage &kv,
                  SpilledKvReads &spilled, std::span<const kv::ChunkedPrefillParams> chunks,
-                 uint32_t lanes, uint32_t blockRows, uint32_t verifiedRows) const override;
+                 uint32_t lanes, uint32_t blockRows) const override;
   // The hidden rows are the final mix, which the head reads as they are.
   void addHeadBatch(metal::CommandGraph &graph, metal::MetalBuffer hidden, metal::MetalBuffer finalHidden,
                     metal::MetalBuffer logits, uint32_t lanes, uint32_t rows,
@@ -47,7 +47,7 @@ public:
   // host step of the command stages them, between the hash and the verify
   // that gathers them.
   void addVerifyInput(metal::CommandGraph &graph, metal::MetalBuffer draftInput, metal::MetalBuffer proposals,
-                      metal::MetalBuffer verifyInput, metal::MetalBuffer verifyInputPasses,
+                      metal::MetalBuffer verifyInput,
                       uint32_t lanes, uint32_t rows) const override;
   // Each lane's PLE history and QSA pending keys after its retained rows,
   // from the convolution inputs and keys its verify wrote.

@@ -49,7 +49,7 @@ inline void draft_conv_phase(device const bfloat *input,
   output[element] = bfloat(value);
 }
 
-template <uint Rows, uint QueryHeads>
+template <uint Rows, uint QueryHeads, bool Rotated>
 inline void draft_qkv_prepare_phase(
     device const bfloat *proposal_qkv, device bfloat *queries,
     device const bfloat *q_norm, device const bfloat *k_norm,
@@ -99,7 +99,9 @@ inline void draft_qkv_prepare_phase(
     if (thread_index < HeadDim)
       head[thread_index] = bfloat(value * inverse * float(weight[thread_index]));
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (thread_index < HeadDim / 2) {
+    if constexpr (!Rotated) {
+      if (thread_index < HeadDim) destination[thread_index] = head[thread_index];
+    } else if (thread_index < HeadDim / 2) {
       float first = float(head[thread_index]);
       float second = float(head[thread_index + HeadDim / 2]);
       float cosine = rope_cos[row * SPLASH_DRAFT_ROPE_PAIRS + thread_index];
@@ -112,7 +114,7 @@ inline void draft_qkv_prepare_phase(
   }
 }
 
-template <uint Window, uint Rows>
+template <uint Window, uint Rows, bool Rotated>
 inline void draft_context_kv_commit_phase(
     device const bfloat *context_kv, device const bfloat *k_norm,
     device const float *rope_cos, device const float *rope_sin,
@@ -130,7 +132,7 @@ inline void draft_context_kv_commit_phase(
   uint task = group % (Rows * KVHeads);
   device bfloat *keys = SPLASH_LANE_BINDING(batch, keys0, keys1, keys2, keys3);
   device bfloat *values = SPLASH_LANE_BINDING(batch, values0, values1, values2, values3);
-  draft_context_kv_phase<Window>(
+  draft_context_kv_phase<Window, Rotated>(
       context_kv + ulong(batch) * Rows * RowWidth, k_norm,
       rope_cos + ulong(batch) * RopeLaneStride,
       rope_sin + ulong(batch) * RopeLaneStride, keys, values,
@@ -486,7 +488,7 @@ inline void draft_attention_reorder_phase(device const bfloat *grouped,
         group.x, thread_index);                                                \
   }
 
-#define SPLASH_DRAFT_QKV_KERNEL(name, queryHeads, rows)                        \
+#define SPLASH_DRAFT_QKV_KERNEL(name, queryHeads, rows, rotated)                        \
   kernel void name(                                                            \
       device const bfloat *proposal_qkv [[buffer(0)]],                         \
       device bfloat *queries [[buffer(1)]],                                    \
@@ -510,7 +512,7 @@ inline void draft_attention_reorder_phase(device const bfloat *grouped,
     uint batch = group.y;                                                      \
     threadgroup float reductions[8];                                           \
     threadgroup bfloat head[SPLASH_DRAFT_HEAD_DIMENSION];                      \
-    draft_qkv_prepare_phase<(rows), (queryHeads)>(                                     \
+    draft_qkv_prepare_phase<(rows), (queryHeads), (rotated)>(                                     \
         proposal_qkv + batch * Rows * Packed,                                  \
         queries + batch * Rows * Attention, q_norm, k_norm,                    \
         rope_cos + batch * RopeStride, rope_sin + batch * RopeStride,          \
@@ -519,7 +521,7 @@ inline void draft_attention_reorder_phase(device const bfloat *grouped,
         group.x, thread_index, lane, simd_group);                              \
   }
 
-#define SPLASH_DRAFT_COMMIT_KERNEL(name, window, rows)                         \
+#define SPLASH_DRAFT_COMMIT_KERNEL(name, window, rows, rotated)                         \
   kernel void name(                                                            \
       device const bfloat *context_kv [[buffer(0)]],                           \
       device const bfloat *k_norm [[buffer(1)]],                               \
@@ -539,7 +541,7 @@ inline void draft_attention_reorder_phase(device const bfloat *grouped,
       uint simd_group [[simdgroup_index_in_threadgroup]]) {                    \
     threadgroup float splash_reductions[8];                                   \
     threadgroup bfloat splash_normalized[SPLASH_DRAFT_HEAD_DIMENSION];         \
-    draft_context_kv_commit_phase<(window), (rows)>(                           \
+    draft_context_kv_commit_phase<(window), (rows), (rotated)>(                           \
         context_kv, k_norm, rope_cos, rope_sin, keys0, keys1, keys2, keys3,    \
         values0, values1, values2, values3, retained, params, group,           \
         thread_index, lane, simd_group, splash_reductions, splash_normalized); \
@@ -647,7 +649,7 @@ inline void draft_attention_reorder_phase(device const bfloat *grouped,
       device bfloat *row_major [[buffer(1)]],                                  \
       uint2 group [[threadgroup_position_in_grid]],                            \
       uint thread_index [[thread_index_in_threadgroup]]) {                     \
-    constexpr ulong Rows = SPLASH_DRAFT_QUERY_ROWS;                            \
+    constexpr ulong Rows = (rows);                            \
     constexpr ulong Attention = (queryHeads)*SPLASH_DRAFT_HEAD_DIMENSION;      \
     uint batch = group.y;                                                      \
     draft_attention_reorder_phase<(rows), (queryHeads)>(                               \
@@ -657,9 +659,9 @@ inline void draft_attention_reorder_phase(device const bfloat *grouped,
 
 // The shipped drafts' kernels.
 SPLASH_DRAFT_CONV_KERNEL(draft_conv, SPLASH_DRAFT_CONVOLUTION_TAPS, SPLASH_DRAFT_QUERY_ROWS)
-SPLASH_DRAFT_QKV_KERNEL(draft_attention_qkv, SPLASH_DRAFT_QUERY_HEADS, SPLASH_DRAFT_QUERY_ROWS)
+SPLASH_DRAFT_QKV_KERNEL(draft_attention_qkv, SPLASH_DRAFT_QUERY_HEADS, SPLASH_DRAFT_QUERY_ROWS, true)
 SPLASH_DRAFT_COMMIT_KERNEL(draft_context_kv_commit, SPLASH_DRAFT_SLIDING_WINDOW,
-                           SPLASH_DRAFT_QUERY_ROWS)
+                           SPLASH_DRAFT_QUERY_ROWS, true)
 SPLASH_DRAFT_SPLIT_KERNEL(draft_attention_bf16_split, SPLASH_DRAFT_QUERY_HEADS,
                           SPLASH_DRAFT_QUERY_HEADS / SPLASH_DRAFT_KV_HEADS,
                           SPLASH_DRAFT_ATTENTION_SPLITS,
@@ -673,8 +675,8 @@ SPLASH_DRAFT_REORDER_KERNEL(draft_attention_reorder, SPLASH_DRAFT_QUERY_HEADS, S
 // ring, four-tap convolutions, and head groups of five query heads (two
 // threadgroups per KV head, 40 rows each).
 SPLASH_DRAFT_CONV_KERNEL(draft_conv_kv8_h2_d128_w4096_s8, 4, 16)
-SPLASH_DRAFT_QKV_KERNEL(draft_attention_qkv_kv8_h2_d128_w4096_s8, 80, 16)
-SPLASH_DRAFT_COMMIT_KERNEL(draft_context_kv_commit_kv8_h2_d128_w4096_s8, 4096, 16)
+SPLASH_DRAFT_QKV_KERNEL(draft_attention_qkv_kv8_h2_d128_w4096_s8, 80, 16, true)
+SPLASH_DRAFT_COMMIT_KERNEL(draft_context_kv_commit_kv8_h2_d128_w4096_s8, 4096, 16, true)
 SPLASH_DRAFT_SPLIT_KERNEL(draft_attention_bf16_split_kv8_h2_d128_w4096_s4, 80, 2,
                           4, 4096, 16)
 SPLASH_DRAFT_REDUCE_KERNEL(draft_attention_bf16_reduce_kv8_h2_d128_s4, 80, 2, 4, 16)
@@ -682,3 +684,17 @@ SPLASH_DRAFT_SPLIT_KERNEL(draft_attention_bf16_split_kv8_h2_d128_w4096_s8, 80, 2
                           8, 4096, 16)
 SPLASH_DRAFT_REDUCE_KERNEL(draft_attention_bf16_reduce_kv8_h2_d128_w4096_s8, 80, 2, 8, 16)
 SPLASH_DRAFT_REORDER_KERNEL(draft_attention_reorder_kv8_h2_d128_w4096_s8, 80, 16)
+
+// NoPE retains normalized heads without reading the rotary tables.
+SPLASH_DRAFT_QKV_KERNEL(draft_attention_qkv_nope, 32, 8, false)
+SPLASH_DRAFT_COMMIT_KERNEL(draft_context_kv_commit_nope, 2048, 8, false)
+SPLASH_DRAFT_QKV_KERNEL(draft_attention_qkv_kv8_h2_d128_w4096_s8_nope, 80, 16, false)
+SPLASH_DRAFT_COMMIT_KERNEL(draft_context_kv_commit_kv8_h2_d128_w4096_s8_nope, 4096, 16, false)
+SPLASH_DRAFT_CONV_KERNEL(draft_conv_kv8_h2_d128_w16384_s8, 4, 16)
+SPLASH_DRAFT_QKV_KERNEL(draft_attention_qkv_kv8_h2_d128_w16384_s8, 80, 16, true)
+SPLASH_DRAFT_QKV_KERNEL(draft_attention_qkv_kv8_h2_d128_w16384_s8_nope, 80, 16, false)
+SPLASH_DRAFT_COMMIT_KERNEL(draft_context_kv_commit_kv8_h2_d128_w16384_s8, 16384, 16, true)
+SPLASH_DRAFT_COMMIT_KERNEL(draft_context_kv_commit_kv8_h2_d128_w16384_s8_nope, 16384, 16, false)
+SPLASH_DRAFT_SPLIT_KERNEL(draft_attention_bf16_split_kv8_h2_d128_w16384_s8, 80, 2, 8, 16384, 16)
+SPLASH_DRAFT_REDUCE_KERNEL(draft_attention_bf16_reduce_kv8_h2_d128_w16384_s8, 80, 2, 8, 16)
+SPLASH_DRAFT_REORDER_KERNEL(draft_attention_reorder_kv8_h2_d128_w16384_s8, 80, 16)

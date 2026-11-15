@@ -163,8 +163,7 @@ struct ServeSettingsTests {
     /// Flint's options, as the runtime reports its family: no vision, recurrent state, PLE table,
     /// sparse KV, Neural Engine or thinking switch.
     static let flint = ModelFamily(unusable: ["--language-only", "--state-format", "--ple-memory", "--sparse-kv-memory",
-                                              "--disable-ane", "--max-image-pixels", "--default-reasoning-effort",
-                                              "--thinking-token-budget", "--thinking-end-text"],
+                                              "--disable-ane", "--max-image-pixels", "--default-reasoning-effort"],
                                    contextTokens: 262_144, maxContextTokens: 262_144)
     static let moe = ModelFamily(unusable: ["--ple-memory", "--sparse-kv-memory", "--disable-ane"],
                                  contextTokens: 262_144, maxContextTokens: 1_010_000)
@@ -187,8 +186,8 @@ struct ServeSettingsTests {
         #expect(settings.differs(from: other, model: "a/b", family: .unknown))
         // The card leaves them out, and the bands of parts left empty.
         #expect(LaunchOptions.options(.memory, for: Self.flint).map(\.flag)
-            == ["--kv-format", "--expert-memory"])
-        #expect(LaunchOptions.options(.memory, for: .unknown).count == 5)
+            == ["--kv-format", "--kv-window-trim", "--expert-memory"])
+        #expect(LaunchOptions.options(.memory, for: .unknown).count == 6)
     }
 
     /// A context length longer than the model picked serves stays kept for a model that serves it,
@@ -203,15 +202,21 @@ struct ServeSettingsTests {
         #expect(Self.flint.refusal("--max-context", "1000000") == "The model picked serves at most 256K tokens; it starts on Auto.")
         #expect(Self.moe.refusal("--max-context", "1000000") == nil && Self.flint.refusal("--max-memory", "1000000G") == nil)
         #expect(ContextLength.parse("1010000") == 1_010_000)
-        #expect(ContextLength.parse("5M") == nil && ContextLength.parse("1010001") == nil)
+        #expect(ContextLength.parse("1024K") == 1_048_576)
+        let ripple = ModelFamily(unusable: ["--default-reasoning-effort"],
+                                 contextTokens: 1_048_576, maxContextTokens: 1_048_576)
+        #expect(ripple.takes("--max-context", "1024K"))
+        #expect(ServeSettings(values: ["--thinking-token-budget": "100"]).usable(by: ripple)
+            .serveArguments(model: "a/b").contains("--thinking-token-budget"))
+        #expect(ContextLength.parse("5M") == nil && ContextLength.parse("1048577") == nil)
     }
 
     /// The app takes the context lengths `splash serve` takes: its ceiling is the server's
-    /// MAX_YARN_CONTEXT_TOKENS.
+    /// MAX_CONTEXT_TOKENS.
     @Test func theAppTakesTheContextLengthsSplashServeTakes() throws {
         let options = URL(filePath: #filePath).deletingLastPathComponent().appending(path: "../../../server/serve_options.py")
         let source = try String(contentsOf: options, encoding: .utf8)
-        let bound = try #require(source.firstMatch(of: /(?m)^MAX_YARN_CONTEXT_TOKENS = ([\d_]+)$/))
+        let bound = try #require(source.firstMatch(of: /(?m)^MAX_CONTEXT_TOKENS = ([\d_]+)$/))
         #expect(Int(bound.1.replacing("_", with: "")) == ContextLength.ceiling)
     }
 

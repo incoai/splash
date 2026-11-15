@@ -102,6 +102,9 @@ template <class Layout, class Layer> struct QwenTargetWeights final : QwenTarget
 // loaded weights add. It describes semantics only; operators remain
 // responsible for choosing device-specific Metal pipelines and compute tiles.
 struct QwenTargetGeometry final : QwenTargetDimensions {
+  // Logical rows per request in one target traversal; attention tiles may
+  // cover fewer rows without rereading the model's projections.
+  uint32_t verifyRows = SPLASH_TARGET_VERIFY_ROWS;
   QwenTargetGeometry() = default;
   // A target of `dimensions` whose DFlash2 draft reads the output rows of
   // `captureLayers` (DFlashDraftLayout::targetLayerIds); more than the
@@ -337,9 +340,6 @@ struct QwenTargetVerifyBuffers final {
   metal::MetalBuffer ropeSin;
   metal::MetalBuffer ropeInverseFrequencies;
   metal::MetalBuffer capturedTargetHidden;
-  // The lanes' whole-block rows of the last layer's output, which the
-  // sub-passes' assemblies build for a 16-row block's head.
-  metal::MetalBuffer headInput;
   metal::MetalBuffer finalHidden;
   metal::MetalBuffer logits;
   metal::MetalBuffer denseGateScratch;
@@ -501,18 +501,13 @@ public:
   virtual void prepareVerifyLane(uint32_t lane, uint64_t position, const QwenTargetRequest &request);
   // A verify's layers and head over `lanes` lanes, whose blocks on Index
   // pages it reads through `spilled` (the command's SpilledKvReads).
-  // Verifies one sub-pass of the lanes' blocks: the pass's rows are
-  // chunks[lane].row_base..+8 of each lane's whole block of `blockRows`
-  // rows (the served draft's; 8 makes the pass the whole block, which the
-  // shipped drafts run). The pass's rows end in buffers.headInput, scattered
-  // into the lanes' whole-block rows; the pass that completes the block
-  // assembles the head's input and runs it over all blockRows rows.
+  // Every projection consumes the native block's rows together; attention
+  // may tile them internally. The head consumes the complete final rows.
   virtual void addVerify(
       metal::CommandGraph &graph, QwenTargetVerifyBuffers buffers,
       const kv::PageStorage &kv, SpilledKvReads &spilled,
       std::span<const kv::ChunkedPrefillParams> chunks,
-      uint32_t lanes, uint32_t blockRows = SPLASH_TARGET_VERIFY_ROWS,
-      uint32_t verifiedRows = SPLASH_TARGET_VERIFY_ROWS) const = 0;
+      uint32_t lanes, uint32_t blockRows = SPLASH_TARGET_VERIFY_ROWS) const = 0;
   // The head over `lanes` lanes of targetVerifyRows rows of the last layer's
   // output, as verify ends: one sweep of the vocabulary projection for every
   // lane.
@@ -528,7 +523,7 @@ public:
   virtual void addVerifyInput(metal::CommandGraph &graph, metal::MetalBuffer draftInput,
                               metal::MetalBuffer proposals,
                               metal::MetalBuffer verifyInput,
-                              metal::MetalBuffer verifyInputPasses, uint32_t lanes,
+                              uint32_t lanes,
                               uint32_t rows) const;
   virtual void addEmbedding(metal::CommandGraph &graph, metal::MetalBuffer tokens,
                             metal::MetalBuffer hidden, uint32_t rows) const;
@@ -595,10 +590,6 @@ protected:
     std::optional<ops::MoePlan> moe{};
     uint32_t gdnLayer = 0;
     uint32_t attentionLayer = 0;
-    // The block row this pass's first row is, and the whole block's rows
-    // (the served draft's), which the captures and the head scatter into.
-    uint32_t rowBase = 0;
-    uint32_t blockRows = SPLASH_TARGET_VERIFY_ROWS;
   };
 
   // Where a mixer's output projection writes: `rows`, adding the projection

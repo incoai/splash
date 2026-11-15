@@ -184,7 +184,7 @@ private:
 
 // ------------------------------------------------------------- the reference
 
-// The pinned block graph (dev/benchmarks/ripple/STEP1-NOTES.md), in double:
+// The block graph in double, independent of the native operators:
 // post-norm blocks, the value residual's mix, per-head query and key norms,
 // the elementwise output gate, the clamped SwiGLU, and NoPE on the full
 // layers. Layer 0 slides (its history here is shorter than the window, so
@@ -360,7 +360,7 @@ struct Reference final {
         const auto upRows = matmul(ffnUp, kIntermediate, kHidden, normed);
         std::vector<double> gated(kIntermediate);
         for (uint32_t element = 0; element < kIntermediate; ++element)
-          gated[element] = silu(clamp(gateRows[element])) * clamp(upRows[element]);
+          gated[element] = silu(std::fmin(gateRows[element], double{kClamp})) * clamp(upRows[element]);
         const auto ffnOut = matmul(ffnDown, kHidden, kIntermediate, gated);
         const auto ffnPost = rmsNorm(ffnOut, postFfw);
         for (uint32_t column = 0; column < kHidden; ++column)
@@ -439,8 +439,11 @@ int main(int argc, char **argv) {
     const LoadedModel model = splash::model::loadModel(backend, root, descriptor);
 
     const ExecutionPlans operators(backend.capabilities(), ops::Int8Activations::Off);
-    const RuntimeGeometry geometry =
+    RuntimeGeometry geometry =
         RuntimeGeometry::from(model, kv::Format::BFloat16, splash::ops::GdnStateFormat::Float32);
+    // Capture the final layer to make every row observable to this oracle.
+    // The production tail path is compared separately below.
+    geometry.target.captureLayerValues[0] = kLayers - 1;
     auto target = std::visit(
         [&](const auto &weights) {
           return makeQwenTarget(weights, geometry.target, backend, operators, geometry.prefillChunks);
@@ -456,8 +459,9 @@ int main(int argc, char **argv) {
     const test::ClaimScope claim(governor, engine::ClaimClass::Floor);
     const kv::Layout kvLayout = model.targetKvLayout(kv::Format::BFloat16);
     const uint32_t extent = kvLayout.minimumExtentPages();
-    kv::PageStorage pages(backend, governor.allocationAdmission(), kvLayout, 2 * extent, extent);
-    require(static_cast<bool>(pages.allocateExtent(0)), "the parity test's page did not allocate");
+    kv::PageStorage pages(backend, governor.allocationAdmission(), kvLayout, 4 * extent, extent);
+    for (uint32_t lane = 0; lane < 4; ++lane)
+      require(static_cast<bool>(pages.allocateExtent(lane)), "the parity test's page did not allocate");
     const std::vector<uint32_t> pageIds{0};
 
     const std::vector<uint32_t> tokens{0, 5, 17, 200};
@@ -467,7 +471,7 @@ int main(int argc, char **argv) {
     MetalBuffer logits;
     const model::PrefillArena prefillArena(backend, geometry, operators);
     const model::QwenTargetPrefillBuffers buffers = model::prefillBuffers(prefillArena, 0);
-    {
+    const auto runPrefill = [&]() {
       CommandGraph graph;
       // The RoPE tables of the chunk's rows, then the scaled embeddings.
       // A row's position is triple {row, row, row} (an image's grid position
@@ -484,10 +488,8 @@ int main(int argc, char **argv) {
               values[pair] = std::pow(kTheta, -static_cast<float>(pair) / kPairs);
             return values;
           }(), "target inverse frequencies");
-      const MetalBuffer ropeCos =
-          backend.allocateBuffer(uint64_t{kRows} * kPairs * sizeof(float), BufferStorage::Shared, "rope cosine");
-      const MetalBuffer ropeSin =
-          backend.allocateBuffer(uint64_t{kRows} * kPairs * sizeof(float), BufferStorage::Shared, "rope sine");
+      const MetalBuffer ropeCos = buffers.ropeCos;
+      const MetalBuffer ropeSin = buffers.ropeSin;
       ops::RoPE::addTables(graph, positions, none, inverse, none, ropeCos,
                            ropeSin, none, none,
                            {.target_rows = kRows, .draft_rows = 0, .target_scale = 1.0F}, kRows, kPairs);
@@ -539,80 +541,9 @@ int main(int argc, char **argv) {
       target->addHeadBatch(graph, headInput, finalHidden0, logitsBuffer, 1, kVerifyRows,
                            decodeArena.linearScratch());
     static_cast<void>(backend.submitCommandAsync(graph.dispatches()).wait());
-    if (const char *ropeDebug = std::getenv("SPLASH_DEBUG_ROPE")) {
-      static_cast<void>(ropeDebug);
-      const auto *cos = static_cast<const float *>(ropeCos.contents());
-      const auto *sin = static_cast<const float *>(ropeSin.contents());
-      for (uint32_t row = 0; row < 2; ++row)
-        std::fprintf(stderr, "rope row %u: cos[0]=%.6f sin[0]=%.6f cos[1]=%.6f sin[1]=%.6f\n",
-                     row, cos[row * kPairs], sin[row * kPairs], cos[row * kPairs + 1], sin[row * kPairs + 1]);
-    }
-    if (std::getenv("SPLASH_DEBUG_STAGES")) {
-      const auto *finalRows = static_cast<const uint16_t *>(finalHidden.front().contents());
-      for (uint32_t row = 0; row < 4; ++row) {
-        double sum = 0.0, lo = 1e9, hi = -1e9;
-        for (uint32_t dim = 0; dim < kHidden; ++dim) {
-          const float value = bf16ToFloat(finalRows[uint64_t{row} * kHidden + dim]);
-          sum += value; lo = std::min<double>(lo, value); hi = std::max<double>(hi, value);
-        }
-        std::fprintf(stderr, "final hidden row %u: mean %.4f min %.4f max %.4f\n",
-                     row, sum / kHidden, lo, hi);
-      }
-      const auto *partials = static_cast<const float *>(buffers.attentionPartials.contents());
-      for (uint32_t fused = 0; fused < 24; ++fused) {
-        double sum = 0.0;
-        for (uint32_t dim = 0; dim < kHidden; ++dim)
-          sum += partials[uint64_t{fused} * kHidden + dim];
-        std::fprintf(stderr, "partials fused %u (row %u head %u): sum %.4f first %.4f\n",
-                     fused, fused / 10, fused % 10, sum, partials[uint64_t{fused} * kHidden]);
-      }
-      const auto *keys = static_cast<const uint16_t *>(buffers.chunkKeys.contents());
-      for (uint32_t head = 0; head < 2; ++head)
-        for (uint32_t row = 0; row < 4; ++row) {
-          double sum = 0.0;
-          const uint64_t base = (uint64_t{head} * sequence.attentionStride + row) * 128;
-          for (uint32_t dim = 0; dim < 128; ++dim)
-            sum += bf16ToFloat(keys[base + dim]);
-          std::fprintf(stderr, "chunkKeys head %u row %u: sum %.4f\n", head, row, sum);
-        }
-      const auto *attn = static_cast<const uint16_t *>(buffers.fullAttention.contents());
-      for (uint32_t row = 0; row < 4; ++row) {
-        double sum = 0.0;
-        for (uint32_t dim = 0; dim < kHidden; ++dim)
-          sum += bf16ToFloat(attn[uint64_t{row} * kHidden + dim]);
-        std::fprintf(stderr, "fullAttention row %u: sum %.4f first %.6f\n",
-                     row, sum, bf16ToFloat(attn[uint64_t{row} * kHidden]));
-      }
-      const uint32_t stride = sequence.attentionStride;
-      const auto *queries = static_cast<const uint16_t *>(buffers.fullQueries.contents());
-      for (uint32_t kvHead = 0; kvHead < 2; ++kvHead)
-        for (uint32_t row = 0; row < 2; ++row)
-          for (uint32_t head = 0; head < 10; ++head) {
-            const uint64_t base = ((uint64_t{kvHead} * stride + row) * 10 + head) * 128;
-            double qsum = 0.0;
-            for (uint32_t dim = 0; dim < 128; ++dim)
-              qsum += bf16ToFloat(queries[base + dim]);
-            std::fprintf(stderr, "queries kv %u row %u head %u: qsum %.4f first %.4f\n",
-                         kvHead, row, head, qsum, bf16ToFloat(queries[base]));
-          }
-      const uint32_t packedWidth = geometry.target.packedFullWidth;
-      const auto *pack = static_cast<const uint16_t *>(buffers.fullPacked.contents());
-      for (uint32_t row = 0; row < 4; ++row) {
-        double sum = 0.0;
-        for (uint32_t dim = 0; dim < packedWidth; ++dim)
-          sum += bf16ToFloat(pack[uint64_t{row} * packedWidth + dim]);
-        std::fprintf(stderr, "fullPacked row %u: sum %.4f\n", row, sum);
-      }
-      const auto *embed = static_cast<const uint16_t *>(buffers.hidden[0].contents());
-      for (uint32_t row = 0; row < 4; ++row) {
-        double sum = 0.0;
-        for (uint32_t dim = 0; dim < kHidden; ++dim)
-          sum += bf16ToFloat(embed[uint64_t{row} * kHidden + dim]);
-        std::fprintf(stderr, "embedding row %u: sum %.4f\n", row, sum);
-      }
-    }
-    logits = logitsBuffer;
-  }
+    return logitsBuffer;
+    };
+    logits = runPrefill();
 
   // The logits of the last row against the reference's. The engine's
     // path stages bf16 between ops, whose rounding the fp64 reference does
@@ -645,6 +576,101 @@ int main(int argc, char **argv) {
     }
     std::sort(deltas.begin(), deltas.end());
     const Delta &worst = deltas.front();
+    // The same final row through the shared tail optimization, with the
+    // actual draft tap before the final layer, must preserve its logits.
+    auto tailGeometry = geometry;
+    tailGeometry.target.captureLayerValues[0] = 0;
+    target = std::visit([&](const auto &weights) {
+      return makeQwenTarget(weights, tailGeometry.target, backend, operators, 1);
+    }, model.target);
+    const auto tailLogits = runPrefill();
+    require(!std::memcmp(static_cast<const float *>(tailLogits.contents()) + (kRows - 1) * kVocab,
+                         static_cast<const float *>(logits.contents()) + (kRows - 1) * kVocab,
+                         kVocab * sizeof(float)), "prefill tail changed the final row's logits");
+
+    // A sixteen-row verify is one target traversal, at each supported batch
+    // width. Distinct lane/token rows expose an accidental eight-row stride.
+    auto verifyGeometry = geometry;
+    verifyGeometry.draft = splash::model::draftLayout(kHidden, kVocab, 1, kIntermediate, kTheta,
+                                                       targetLayers, SPLASH_DRAFT_VARIANTS[1]);
+    verifyGeometry.target.verifyRows = 16;
+    const model::DecodeArena verifyArena(backend, verifyGeometry, operators);
+    auto verifyTarget = std::visit([&](const auto &weights) {
+      return makeQwenTarget(weights, verifyGeometry.target, backend, operators, 1);
+    }, model.target);
+    for (uint32_t lanes = 1; lanes <= 4; ++lanes) {
+      CommandGraph graph;
+      const uint32_t storage = verifyTarget->decodeStorageLanes(lanes);
+      auto d = [&](model::DecodeTensor tensor) { return verifyArena.batchSlice(tensor, storage); };
+      model::QwenTargetVerifyBuffers b;
+      b.linearScratch = verifyArena.linearScratch();
+      b.hidden = {d(model::DecodeTensor::Hidden0), d(model::DecodeTensor::Hidden1)};
+      b.normalized = d(model::DecodeTensor::Normalized);
+      b.denseIntermediate = d(model::DecodeTensor::Intermediate);
+      b.denseGateScratch = verifyArena.gateScratch();
+      b.fullPacked = d(model::DecodeTensor::FullPacked);
+      b.fullQueries = d(model::DecodeTensor::FullQueries);
+      b.fullAttention = d(model::DecodeTensor::FullAttention);
+      b.attentionPartials = d(model::DecodeTensor::AttentionPartials);
+      b.attentionStatistics = d(model::DecodeTensor::AttentionStatistics);
+      b.attentionHidden = d(model::DecodeTensor::AttentionHidden);
+      b.attentionOutput = d(model::DecodeTensor::AttentionOutput);
+      b.ropeCos = d(model::DecodeTensor::RopeCos);
+      b.ropeSin = d(model::DecodeTensor::RopeSin);
+      b.capturedTargetHidden = d(model::DecodeTensor::CapturedTargetHidden);
+      b.finalHidden = d(model::DecodeTensor::FinalHidden);
+      b.logits = d(model::DecodeTensor::Logits);
+      std::vector<MetalBuffer> keys(kLayers), values_(kLayers);
+      for (uint32_t layer = 0; layer < kLayers; ++layer) {
+        keys[layer] = verifyArena.attentionBatchSlice(model::DecodeTensor::ChunkKeysBase, layer, storage);
+        values_[layer] = verifyArena.attentionBatchSlice(model::DecodeTensor::ChunkValuesBase, layer, storage);
+      }
+      b.chunkKeys = keys;
+      b.chunkValues = values_;
+      std::vector<kv::ChunkedPrefillParams> chunks(lanes);
+      std::vector<uint32_t> positions, input;
+      std::vector<std::vector<std::vector<double>>> expectedLanes;
+      for (uint32_t lane = 0; lane < lanes; ++lane) {
+        std::vector<uint32_t> ids;
+        for (uint32_t row = 0; row < 16; ++row) {
+          ids.push_back((row * 13 + lane * 7) % kVocab);
+          positions.insert(positions.end(), {row, row, row});
+        }
+        expectedLanes.push_back(reference.logits(ids));
+        input.insert(input.end(), ids.begin(), ids.end());
+        b.pageTables[lane] = verifyArena.get(lane, model::DecodeTensor::PageTable);
+        const std::vector<uint32_t> page{lane * extent};
+        pages.writeEntries(page, 0, b.pageTables[lane]);
+        chunks[lane] = ops::PagedAttention::prefillParams(0, 16, kv::kVerifyChunkStride, 1);
+      }
+      std::vector<float> inv(kPairs);
+      for (uint32_t pair = 0; pair < kPairs; ++pair) inv[pair] = std::pow(kTheta, -float(pair) / kPairs);
+      const auto none = backend.allocateBuffer(4, BufferStorage::Shared, "unbound");
+      ops::RoPE::addTables(graph, upload(backend, positions, "verify positions"), none,
+                           uploadFloats(backend, inv, "inverse frequencies"), none,
+                           b.ropeCos, b.ropeSin, none, none,
+                           {.target_rows = lanes * 16, .draft_rows = 0, .target_scale = 1.0F}, lanes * 16, kPairs);
+      verifyTarget->addEmbedding(graph, upload(backend, input, "verify tokens"), b.hidden[0], lanes * 16);
+      SpilledKvReads spilled;
+      verifyTarget->addVerify(graph, b, pages, spilled, chunks, lanes, 16);
+      static_cast<void>(backend.submitCommandAsync(graph.dispatches()).wait());
+      const auto *actual = static_cast<const float *>(b.logits.contents());
+      for (uint32_t lane = 0; lane < lanes; ++lane)
+        for (uint32_t row = 0; row < 16; ++row) {
+          double scale = 0;
+          for (double value : expectedLanes[lane][row]) scale += value * value;
+          scale = std::sqrt(scale / kVocab);
+          for (uint32_t token = 0; token < kVocab; ++token) {
+            const double want = expectedLanes[lane][row][token];
+            const float got = actual[(lane * 16 + row) * kVocab + token];
+            if (!std::isfinite(got) || std::fabs(got - want) > 0.015 * scale + 0.025) {
+              std::cerr << "verify lanes " << lanes << " lane " << lane << " row " << row
+                        << " token " << token << ": " << got << " vs " << want << '\n';
+              throw std::runtime_error("sixteen-row target verify diverged from the reference");
+            }
+          }
+        }
+    }
     std::cout << "ripple-parity-test: PASS (worst delta " << worst.delta << " at token " << worst.token
               << " of row " << worst.row << ": " << worst.got << " vs " << worst.want << ")\n";
     return 0;

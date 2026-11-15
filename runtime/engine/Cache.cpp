@@ -1,4 +1,3 @@
-#include <cstdio>
 #include "engine/Cache.hpp"
 
 #include "AwakeClock.hpp"
@@ -427,18 +426,6 @@ uint32_t Cache::publishCommittedBlocks(uint64_t requestId,
   const uint64_t requiredPages =
       (uint64_t{committedTokens} + KvCache::pageTokens - 1) / KvCache::pageTokens;
   if (requiredPages > active.pages.size()) {
-    if (std::getenv("SPLASH_DEBUG_PAGES")) {
-      uint32_t full = 0;
-      for (const uint32_t page : active.pages)
-        full += pool_.form(page) == kv::PageForm::Full;
-      std::fprintf(stderr,
-                   "splash: publish commit %u tokens: exact %zu pages %zu (needed %llu) full %u:",
-                   committedTokens, exactTokens.size(), active.pages.size(),
-                   static_cast<unsigned long long>(requiredPages), full);
-      for (const uint32_t page : active.pages)
-        std::fprintf(stderr, " %d", static_cast<int>(pool_.form(page)));
-      std::fprintf(stderr, "\n");
-    }
     throw std::logic_error("committed KV has no physical request page");
   }
   if (fullBlocks < active.cachedBlocks.size())
@@ -559,10 +546,6 @@ TokenAdmission Cache::ensureTokens(uint64_t requestId, uint64_t tokenCount,
     throw std::invalid_argument("KV target exceeds the page id range");
   const uint32_t needed = static_cast<uint32_t>(needed64);
   const auto previousSize = static_cast<uint32_t>(active.pages.size());
-  if (std::getenv("SPLASH_DEBUG_PAGES") && previousSize < needed)
-    std::fprintf(stderr, "splash: grow request %llu to %llu pages (had %u)\n",
-                 static_cast<unsigned long long>(requestId),
-                 static_cast<unsigned long long>(needed), previousSize);
   if (needed <= previousSize)
     return {};
   std::vector<uint32_t> acquired;

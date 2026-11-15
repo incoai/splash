@@ -110,14 +110,14 @@ StartupRetryWindow::retryUntil(const RuntimeBootstrapReport &failure,
 }
 
 protocol::ProtocolLimits protocolLimitsFor(
-    const model::ModelCapabilities &capabilities, uint32_t maxContext) noexcept {
+    const model::ModelCapabilities &capabilities, uint32_t maxContext, uint32_t draftRows) noexcept {
   protocol::ProtocolLimits limits;
   limits.maxPromptTokens = maxContext;
   limits.maxLogicalOutputTokens = maxContext;
-  limits.maxTokenBatch = model::ExecutionLimits::maximumStepTokens;
-  limits.maxSimulationTokens = model::ExecutionLimits::draftQueryRows;
+  limits.maxTokenBatch = draftRows + 1;
+  limits.maxSimulationTokens = draftRows;
   limits.maxMaskWords = model::maskWordsPerToken(capabilities.vocabularySize) *
-                        (model::ExecutionLimits::draftQueryRows + 1);
+                        (draftRows + 1);
   return limits;
 }
 
@@ -464,7 +464,7 @@ std::unique_ptr<ServingRuntime> ServingRuntime::start(
   // The parser and engine consume the same resolved ceiling. In automatic
   // mode it cannot be known until resource planning has measured the device.
   const protocol::ProtocolLimits limits = protocolLimitsFor(
-      config.resources.model.capabilities, config.nativeLoop.engine.maxContext);
+      config.resources.model.capabilities, config.nativeLoop.engine.maxContext, config.resources.model.draft.rows);
   const protocol::ReadyEvent ready =
       readyEventFor(config.resources.model, config.nativeLoop.engine, limits);
   std::unique_ptr<NativeRuntime> nativeLoop;

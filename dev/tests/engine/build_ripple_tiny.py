@@ -69,9 +69,7 @@ def q8_0(values):
         group = values[start : start + 32]
         scale = max(abs(v) for v in group) / 127.0 or 1e-7
         half = struct.pack("<e", scale)
-        codes = bytes(
-            min(127, max(-128, round(v / scale))) & 0xFF for v in group
-        )
+        codes = bytes(min(127, max(-128, round(v / scale))) & 0xFF for v in group)
         blocks += half + codes
     return blocks
 
@@ -85,7 +83,9 @@ def build_gguf(path):
         tensors.append((name, dims, kind, data))
 
     def q(name, rows, cols):
-        values = [((i * 37 + len(tensors) * 11) % 509 - 254) / 254 for i in range(rows * cols)]
+        values = [
+            ((i * 37 + len(tensors) * 11) % 509 - 254) / 254 for i in range(rows * cols)
+        ]
         tensor(name, [cols, rows], q8_0(values))
 
     def norm(name, width):
@@ -145,6 +145,7 @@ def build_gguf(path):
         "tokenizer.chat_template": "{% for m in messages %}{{ m.content }}{% endfor %}",
     }
     from dev.tests.fixture_files import write_gguf
+
     write_gguf(path, metadata, tensors)
 
 
@@ -155,15 +156,23 @@ def build_draft_checkpoint(path):
 
     def add(name, shape):
         count = math.prod(shape)
-        values = [((i * 37 + len(tensors) * 11) % 509 - 254) / 254 for i in range(count)]
-        tensors[name] = (shape, "BF16", struct.pack(f"<{count}H", *[bf16(v) for v in values]))
+        values = [
+            ((i * 37 + len(tensors) * 11) % 509 - 254) / 254 for i in range(count)
+        ]
+        tensors[name] = (
+            shape,
+            "BF16",
+            struct.pack(f"<{count}H", *[bf16(v) for v in values]),
+        )
 
     for layer in range(DRAFT_LAYERS):
         p = f"layers.{layer}."
         a = p + "self_attn."
         add(p + "input_layernorm.weight", [DRAFT_HIDDEN])
         add(p + "attention_conv.base_kernel", [2, DRAFT_CONV_TAPS, DRAFT_HIDDEN])
-        add(p + "attention_conv.kernel_projection.weight", [DRAFT_DYNAMIC, DRAFT_HIDDEN])
+        add(
+            p + "attention_conv.kernel_projection.weight", [DRAFT_DYNAMIC, DRAFT_HIDDEN]
+        )
         add(a + "q_proj.weight", [DRAFT_ATTENTION_WIDTH, DRAFT_HIDDEN])
         add(a + "k_proj.weight", [DRAFT_KV_WIDTH, DRAFT_HIDDEN])
         add(a + "v_proj.weight", [DRAFT_KV_WIDTH, DRAFT_HIDDEN])
@@ -184,6 +193,7 @@ def build_draft_checkpoint(path):
     add("candidate_selector.successor_codebook", [DRAFT_VOCAB, DRAFT_RANK])
 
     from dev.tests.fixture_files import write_safetensors
+
     write_safetensors(path, tensors)
 
 
@@ -211,7 +221,9 @@ def main():
         "embed_scale": EMBED_SCALE,
         "ffn_clamp_threshold": CLAMP,
         "rope_theta": 10000.0,
-        "layer_types": ["sliding_attention" if s else "full_attention" for s in SLIDING_PATTERN],
+        "layer_types": [
+            "sliding_attention" if s else "full_attention" for s in SLIDING_PATTERN
+        ],
         "bos_token_id": 0,
         "pad_token_id": 2,
         "rms_norm_eps": 1e-6,
@@ -247,10 +259,16 @@ def main():
         },
     }
     (root / "draft" / "config.json").write_text(json.dumps(draft_config, indent=2))
-    (root / "model.json").write_text(json.dumps({
-        "version": 1, "model": "test/ripple-tiny",
-        "target_format": "gguf", "vision_format": "none",
-    }))
+    (root / "model.json").write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "model": "test/ripple-tiny",
+                "target_format": "gguf",
+                "vision_format": "none",
+            }
+        )
+    )
     print(f"ripple-tiny model at {root}")
 
 

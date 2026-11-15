@@ -172,7 +172,7 @@ LinearConfig bf16Projection(const KernelCalibration &calibration, LinearWorkload
   const uint32_t lanes = w.rows / SPLASH_TARGET_VERIFY_ROWS;
   const bool gateUp = w.epilogue == LinearEpilogue::GateUp ||
                       w.epilogue == LinearEpilogue::ClampedGateUp,
-             onePass = w.epilogue == LinearEpilogue::GateUp && unit.oneFormat &&
+             onePass = (w.epilogue == LinearEpilogue::GateUp || w.epilogue == LinearEpilogue::ClampedGateUp) && unit.oneFormat &&
                        cores >= p.onePassFromCores;
   if (unit.registerTakes &&
       registers(p.decodeRegister, unit.formatClass, lanes, (onePass ? 2 : 1) * uint64_t{n / GGUF_TILE_COLUMNS},
@@ -245,9 +245,8 @@ SplitChoice splitsFor(const SplitLaw &law, uint32_t n, uint32_t k, uint32_t rows
 // activations on the plan's last choice, which leaves the rest of it as it is:
 // a chunk on the prefill tile runs the int8 prefill tile where the row has
 // prefillInt8 and the tile takes the unit, and a staged decode plan of at
-// least decodeInt8FromRows rows (one lane's 16-row plan counts 16) whose K
-// splits keep whole PQ2_0 blocks runs the int8 decode tiles where they take
-// the unit, at the plan's rows, splits and passes.
+// least decodeInt8FromRows rows, up to 32, whose K splits keep whole PQ2_0
+// blocks runs int8 decode. At 64 rows bf16 takes 1.6-2.0x less time on M5 Max.
 LinearConfig selectProjection(const KernelCalibration &calibration, Int8Activations int8Activations,
                               LinearWorkload w, const UnitFormats &unit, std::span<const UnitFormats> pairTensors) {
   LinearConfig config = bf16Projection(calibration, w, unit, pairTensors);
@@ -257,7 +256,7 @@ LinearConfig selectProjection(const KernelCalibration &calibration, Int8Activati
     config.tile = LinearTile::GgufPrefillInt8;
   config.decodeInt8 = w.phase == LinearPhase::Decode && config.tile == LinearTile::GgufStaged &&
                       unit.decodeInt8Takes && decodeInt8TakesSplits(w.matrix.inputSize, config.splits) &&
-                      stagedStorageRows(w.rows, config.sixteenRows) >= p.decodeInt8FromRows;
+                      stagedStorageRows(w.rows, config.sixteenRows) >= p.decodeInt8FromRows && w.rows <= 32;
   return config;
 }
 
@@ -276,7 +275,7 @@ std::vector<LinearConfig> decodeConfigurations(const KernelCalibration &calibrat
   if (registers(p.decodeRegister, FormatClass::FourBitsOrMore, w.rows / SPLASH_TARGET_VERIFY_ROWS,
                 n / GGUF_TILE_COLUMNS, cores))
     configurations.push_back(staged(p, n, k, w.rows, 0, cores, Passes::Two));
-  if (w.epilogue == LinearEpilogue::GateUp && cores >= p.onePassFromCores)
+  if ((w.epilogue == LinearEpilogue::GateUp || w.epilogue == LinearEpilogue::ClampedGateUp) && cores >= p.onePassFromCores)
     configurations.push_back(staged(p, n, k, w.rows, 0, cores, Passes::One));
   return configurations;
 }

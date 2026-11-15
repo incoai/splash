@@ -113,11 +113,12 @@ DFlashDraftRing::DFlashDraftRing(
   const metal::MetalBuffer base = backend.allocateBuffer(
       layout.ringBytes(), metal::BufferStorage::Shared, label);
   uint64_t cursor = 0;
-  for (DFlashDraftRingLayer &layer : layers_) {
-    layer.keys = backend.view(base, cursor, layout.tensorBytes());
-    cursor += layout.tensorBytes();
-    layer.values = backend.view(base, cursor, layout.tensorBytes());
-    cursor += layout.tensorBytes();
+  for (uint32_t index = 0; index < layout.layers; ++index) {
+    auto &layer = layers_[index];
+    layer.keys = backend.view(base, cursor, layout.tensorBytes(index));
+    cursor += layout.tensorBytes(index);
+    layer.values = backend.view(base, cursor, layout.tensorBytes(index));
+    cursor += layout.tensorBytes(index);
   }
   if (cursor != layout.ringBytes())
     throw std::logic_error("draft ring accounting mismatch");
@@ -218,7 +219,11 @@ void DFlashDraft::addContextRebuild(metal::CommandGraph &graph,
     ops::DraftAttention::addWindowLoad(graph, window, buffers.hidden, count, startPosition + begin,
                                        layout.hiddenSize, variant);
     const DFlashPrefillSpan span{0, count, startPosition + begin, ring, window};
-    addContextKv(graph, buffers, count, {&span, 1});
+    auto chunk = buffers;
+    const uint64_t ropeRowBytes = uint64_t{layout.attentionHeadDimension / 2} * sizeof(float);
+    chunk.ropeCos = backend_.view(buffers.ropeCos, begin * ropeRowBytes, count * ropeRowBytes);
+    chunk.ropeSin = backend_.view(buffers.ropeSin, begin * ropeRowBytes, count * ropeRowBytes);
+    addContextKv(graph, chunk, count, {&span, 1});
   }
 }
 
@@ -245,7 +250,7 @@ void DFlashDraft::addContextKv(metal::CommandGraph &graph,
           backend_.view(buffers.ropeSin, ropeOffset,
                         uint64_t{span.rows} * (layout.attentionHeadDimension / 2) * sizeof(float)),
           span.ring[layer].keys, span.ring[layer].values, span.rows,
-          span.startPosition, layout.attentionShape());
+          span.startPosition, layout.attentionShape(layer));
     }
   }
 }
@@ -280,14 +285,13 @@ void DFlashDraft::addDecode(
   }
   const DFlashDraftLayout &layout = weights_.layout;
   const uint32_t rows = lanes * layout.rows;
-  const auto attentionPlan =
-      operators_.draftAttention(layout.attentionShape(), lanes, layout.rows);
   const ops::Linear &linear = operators_.draftLinear();
   const ops::LinearScratch &scratch = buffers.linearScratch;
 
   for (uint32_t layer = 0; layer < layout.layers; ++layer) {
     const uint32_t current = layer & 1;
     const uint32_t next = current ^ 1;
+    const auto attentionPlan = operators_.draftAttention(layout.attentionShape(layer), lanes, layout.rows);
     const DFlashDraftLayerWeights &weights = weights_.layers[layer];
     const ops::LinearPlan attentionDynamicPlan =
         linear.decodePlan(weights.attentionDynamic, lanes, ops::LinearEpilogue::None, nullptr, rows);
@@ -422,7 +426,7 @@ void DFlashDraft::addContextCommit(
         graph, buffers.contextKv, weights_.layers[layer].keyNorm, buffers.ropeCos,
         buffers.ropeSin, buffers.persistentKeys[layer],
         buffers.persistentValues[layer], buffers.retainedCounts,
-        startPositions, layout.attentionShape());
+        startPositions, layout.attentionShape(layer));
   }
 }
 

@@ -453,7 +453,7 @@ template <class Family> std::vector<AttentionVariant> attentionVariants(const Fa
   std::vector<AttentionVariant> variants;
   const kv::Layout base = family.kvLayout();
   for (uint32_t a = 0; a < base.attentionLayers; ++a) {
-    const AttentionVariant v{.rotated = a >= 64 || !(family.unrotatedLayers >> a & 1),
+    const AttentionVariant v{.rotated = !family.unrotatedLayers.test(a),
                              .windowTokens = base.windowed(a) ? base.windowTokens : 0};
     if (std::find(variants.begin(), variants.end(), v) == variants.end()) variants.push_back(v);
   }
@@ -651,6 +651,16 @@ void int8ActivationsOff() {
     const std::string name = std::to_string(family) + "," + std::to_string(cores);
     const ExecutionPlans on(device(family, cores), Int8Activations::On),
         off(device(family, cores), Int8Activations::Off);
+    for (const auto [n, k] : {std::pair{40960u, 5120u}, std::pair{5120u, 40960u}}) {
+      const Projection p = projection({"wide-pq2", n, k, 1}, {"pq2", {GGUF_FMT_PQ20}});
+      const std::array<const Projection *, 1> unit{&p};
+      for (const uint32_t rows : {16u, 32u, 48u, 64u}) {
+        const auto config = selectProjection(on.calibration(), Int8Activations::On,
+                                            {{n, k}, rows, LinearPhase::Decode}, int8Formats(unit));
+        test::require(config.decodeInt8 == (family >= 10 && rows <= 32),
+                      name + ": PQ2 decode must use the faster activation format at " + std::to_string(rows));
+      }
+    }
     const Int8Paths paths = int8ActivationsOff(name, on, off);
     const bool int8 = family >= 10;
     if ((paths.prefillTile > 0) != int8 || (paths.decode > 0) != int8 || (paths.queries > 0) != int8)

@@ -67,7 +67,7 @@ void testUnifiedElasticBudget() {
   require(plan.maximumContextTokens() ==
               std::min<uint64_t>(model().maximumContextTokens,
                                  budget.kvCapacityTokens -
-                                     model::ExecutionLimits::speculativeScratchTokens),
+                                     model().speculativeTokens),
           "advertised context exceeds elastic KV capacity");
   const std::string json = test::jsonOf(plan);
   require(json.find("\"dynamic_budget_bytes\"") != std::string::npos &&
@@ -645,7 +645,8 @@ void testDense35BKeepsMainsPlan() {
     require(mains.maximumContextTokens() == context && mains.breakdown().kvCapacityTokens == capacityTokens &&
                 mains.breakdown().contextBounds.bound() != std::string_view("disk") &&
                 test::jsonOf(mains).find("\"kv_spill\":null") != std::string::npos,
-            std::string("the 35B's plan on the ") + mac.name + " is not main's");
+            std::string("the 35B's plan on the ") + mac.name + " is not main's: context=" +
+                std::to_string(mains.maximumContextTokens()) + " capacity=" + std::to_string(mains.breakdown().kvCapacityTokens));
   }
 }
 

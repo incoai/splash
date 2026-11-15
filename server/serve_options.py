@@ -22,9 +22,8 @@ from .protocol import MAX_THINKING_END_TOKENS
 
 # The most context --max-context takes: the most any family serves
 # (QwenTargetDimensions::maximumContextTokens(), as the engine's families
-# command reports it), YaRN's window of the Qwen targets. The engine refuses
-# more than the model's own.
-MAX_YARN_CONTEXT_TOKENS = 1010000
+# command reports it). The engine refuses more than the model's own.
+MAX_CONTEXT_TOKENS = 1048576
 # The suffixes of a --max-context: K, 1024 tokens, and M, a million.
 _CONTEXT_UNITS = {"K": 1024, "M": 1000000}
 DEFAULT_MAX_REQUEST_BYTES = 128 * 1024 * 1024
@@ -91,7 +90,7 @@ def parse_model_id(value):
 
 def parse_max_context(value):
     """'auto' (None), or a token count with an optional _CONTEXT_UNITS suffix,
-    up to MAX_YARN_CONTEXT_TOKENS: the engine serves one past the native
+    up to MAX_CONTEXT_TOKENS: the engine serves one past the native
     window with YaRN."""
     normalized = value.strip().upper()
     if normalized == "AUTO":
@@ -103,9 +102,9 @@ def parse_max_context(value):
         tokens = int(number) * multiplier
     except ValueError:
         tokens = 0
-    if not 1 <= tokens <= MAX_YARN_CONTEXT_TOKENS:
+    if not 1 <= tokens <= MAX_CONTEXT_TOKENS:
         raise argparse.ArgumentTypeError(
-            "must be 'auto' or a token count up to 1010000, such as 100K or 1M "
+            "must be 'auto' or a token count up to 1048576, such as 100K or 1M "
             "(K = 1024 tokens, M = 1000000 tokens)"
         )
     return tokens
@@ -485,7 +484,7 @@ SERVE_OPTIONS = (
             default=None,
             metavar="TOKENS",
             help="context token limit, e.g. 100K or 1M (K = 1024 tokens, M = "
-            "1000000 tokens), up to the model's limit, at most 1010000; past its "
+            "1000000 tokens), up to the model's limit, at most 1048576; past its "
             "native window a model with YaRN turns it on, which is static and "
             "changes answers at every length, so pass more than the native "
             "window only when a request needs it (default: auto, the native "
@@ -686,7 +685,7 @@ SERVE_OPTIONS = (
             "SPLASH_THINKING_TOKEN_BUDGET, else no cap)",
         ),
         environment="SPLASH_THINKING_TOKEN_BUDGET",
-        needs="reasoning_switch",
+        needs="thinking_budget",
     ),
     ServeOption(
         "--thinking-end-text",
@@ -700,7 +699,7 @@ SERVE_OPTIONS = (
             "after a reasoning)",
         ),
         environment="SPLASH_THINKING_END_TEXT",
-        needs="reasoning_switch",
+        needs="thinking_budget",
     ),
     ServeOption(
         "--max-request-size",

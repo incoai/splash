@@ -13,6 +13,7 @@
 #include "engine/MemoryGovernor.hpp"
 #include "model/QwenState.hpp"
 #include "model/RuntimeArenas.hpp"
+#include "model/Runtime.hpp"
 #include "ops/RowCopy.hpp"
 #include "ops/RoPE.hpp"
 
@@ -124,8 +125,9 @@ int main(int argc, char **argv) {
       const uint32_t rows = std::min<uint32_t>(kChunkRows, tokens.size() - position);
       const std::vector<uint32_t> chunkTokens(tokens.begin() + position,
                                               tokens.begin() + position + rows);
-      model::withPrefillArena(backend, model, operators, splash::kv::Format::Int8,
-                              [&](const splash::model::QwenTargetPrefillBuffers &buffers) {
+      {
+        const model::PrefillArena arena(backend, geometry, operators);
+        const auto buffers = model::prefillBuffers(arena, 0);
         const splash::metal::MetalBuffer tokenBuffer = upload(backend, chunkTokens, "prefill tokens");
         const splash::metal::MetalBuffer positionBuffer =
             upload(backend, [&] {
@@ -159,8 +161,8 @@ int main(int argc, char **argv) {
             }};
         sequence.attentionStride =
           (rows + splash::kv::kPageTokens - 1) / splash::kv::kPageTokens * splash::kv::kPageTokens;
-        sequence.queryOffset = position;
-        sequence.kvOffset = position;
+        sequence.queryOffset = 0;
+        sequence.kvOffset = 0;
         sequence.chunk = ops::PagedAttention::prefillParams(
             position, rows, sequence.attentionStride,
             (position + rows + splash::kv::kPageTokens - 1) / splash::kv::kPageTokens);
@@ -187,7 +189,7 @@ int main(int argc, char **argv) {
         if (finiteRow(probeRow.contents(), hidden)) {
           std::cout << "chunk " << chunk << " (rows " << position << ".." << position + rows
                     << "): finite through the whole stack" << std::endl;
-          return;
+          continue;
         }
         std::cout << "chunk " << chunk << " (rows " << position << ".." << position + rows
                   << "): last row NOT FINITE" << std::endl;
@@ -217,7 +219,7 @@ int main(int argc, char **argv) {
         }
         std::cout << "chunk " << chunk << ": the non-finite enters at layer " << lo << std::endl;
         throw std::runtime_error("the probe reproduced the non-finite row");
-      });
+      }
     }
     std::cout << "ripple-long-prefill-probe: every chunk's last row finite\n";
     return 0;

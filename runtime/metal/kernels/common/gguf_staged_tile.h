@@ -18,11 +18,11 @@ constant constexpr uint kStagedStages = GGUF_TILE_COLUMNS / GGUF_STAGED_COLUMNS 
 
 // The destination of a Rows-row tile, zeroed by the caller: returning an initialized cooperative tensor loses its
 // initial values on Apple9 in runtime-format kernels (also with shader validation).
-template <ushort Rows, ushort Cols, ushort KS>
+template <ushort Rows, ushort Cols, ushort KS, ushort Simdgroups = 1>
 inline auto staged_accumulator(device bfloat *input, uint input_size, threadgroup half *stage) {
   auto a = tensor(input, dextents<int, 2>{int(input_size), Rows}, array<int, 2>{1, int(input_size)});
   constexpr auto descriptor = matmul2d_descriptor(Rows, Cols, KS, false, true, false, matmul2d_descriptor::mode::multiply_accumulate);
-  matmul2d<descriptor, execution_simdgroups<1>> operation;
+  matmul2d<descriptor, execution_simdgroups<Simdgroups>> operation;
   auto a0 = a.template slice<KS, Rows>(0, 0);
   tensor<threadgroup half, dextents<int, 2>, tensor_inline> bt0(stage, dextents<int, 2>{KS, Cols}, array<int, 2>{1, KS});
   auto b0 = bt0.slice<KS, Cols>(0, 0);
@@ -188,36 +188,46 @@ template <class F> struct StagedColumn {
   }
 };
 
-// A gate/up pair's decode tile in one simdgroup: the gate's and the up's same GGUF_STAGED_COLUMNS columns over steps
+// A paired tile: the first simdgroup stages the gate's and the up's same GGUF_STAGED_COLUMNS columns over steps
 // [step_begin, step_end) of K from step_first, wrapping (gguf_staged_walk). Each step dequantizes both tensors
 // into their stages (one each), meets at a barrier, loads both tensors' next payloads, runs both matmuls on the step's
 // input and meets again before the stages are rewritten. Each tensor sums its steps in the order of its own decode
 // tile, so gate and up hold the bits of the gate and up passes over the same steps.
-template <class F, ushort Rows, class Acc>
+template <class F, ushort Rows, ushort Simdgroups, class Acc>
 inline void gguf_staged_pair_steps(device bfloat *input, device uchar *gw0, device uchar *gw1, device uchar *gmeta,
                                    device uchar *uw0, device uchar *uw1, device uchar *umeta, uint input_size,
-                                   uint origin, threadgroup half *stage, threadgroup half2 *tl, uint lane,
+                                   uint origin, threadgroup half *stage, threadgroup half2 *tl, uint thread_index,
                                    uint step_begin, uint step_end, uint step_first, thread Acc &gate, thread Acc &up) {
   constexpr ushort Cols = GGUF_STAGED_COLUMNS, KS = GGUF_STAGED_STEP;
   auto a = tensor(input, dextents<int, 2>{int(input_size), Rows}, array<int, 2>{1, int(input_size)});
   constexpr auto descriptor = matmul2d_descriptor(Rows, Cols, KS, false, true, false, matmul2d_descriptor::mode::multiply_accumulate);
-  matmul2d<descriptor, execution_simdgroups<1>> operation;
+  matmul2d<descriptor, execution_simdgroups<Simdgroups>> operation;
   tensor<threadgroup half, dextents<int, 2>, tensor_inline> bt0(stage, dextents<int, 2>{KS, Cols}, array<int, 2>{1, KS});
   tensor<threadgroup half, dextents<int, 2>, tensor_inline> bt1(stage + KS * Cols, dextents<int, 2>{KS, Cols}, array<int, 2>{1, KS});
   auto bg = bt0.slice<KS, Cols>(0, 0), bu = bt1.slice<KS, Cols>(0, 0);
+  const uint lane = thread_index % 32;
+  const bool loader = thread_index < 32;
+  const auto meet = [] {
+    if constexpr (Simdgroups == 1) simdgroup_barrier(mem_flags::mem_threadgroup);
+    else threadgroup_barrier(mem_flags::mem_threadgroup);
+  };
   StagedColumn<F> g, u;
-  g.begin(gw0, gw1, gmeta, input_size, origin, lane, step_first, step_begin < step_end);
-  u.begin(uw0, uw1, umeta, input_size, origin, lane, step_first, step_begin < step_end);
+  if (loader) {
+    g.begin(gw0, gw1, gmeta, input_size, origin, lane, step_first, step_begin < step_end);
+    u.begin(uw0, uw1, umeta, input_size, origin, lane, step_first, step_begin < step_end);
+  }
   // One stage per tensor, rewritten after the step's second barrier, whatever stage the walk names.
   const auto run_step = [&](uint step, uint next, bool more, uint) __attribute__((always_inline)) {
-    g.stage(step, tl, stage, lane);
-    u.stage(step, tl, stage + KS * Cols, lane);
-    simdgroup_barrier(mem_flags::mem_threadgroup);
-    if (more) { g.load(step, next); u.load(step, next); }
+    if (loader) {
+      g.stage(step, tl, stage, lane);
+      u.stage(step, tl, stage + KS * Cols, lane);
+    }
+    meet();
+    if (loader && more) { g.load(step, next); u.load(step, next); }
     auto a_slice = a.template slice<KS, Rows>(step * KS, 0);
     operation.run(a_slice, bg, gate);
     operation.run(a_slice, bu, up);
-    simdgroup_barrier(mem_flags::mem_threadgroup);
+    meet();
   };
   gguf_staged_walk(step_begin, step_end, step_first, run_step);
 }

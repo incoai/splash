@@ -18,7 +18,7 @@ inline Out gguf_epilogue(float v, device const bfloat *aux, ulong at, float clam
   if constexpr (Ep == EpUpWithGate) v = float(bfloat(v)) * splash_silu(float(aux[at]));
   if constexpr (Ep == EpClampedUpWithGate) {
     // An infinity clamps nothing, which an unclamped dispatch's value is.
-    v = splash_silu(fmin(fmax(float(aux[at]), -clamped), clamped)) *
+    v = splash_silu(fmin(float(aux[at]), clamped)) *
         fmin(fmax(float(bfloat(v)), -clamped), clamped);
   }
   return Out(v);

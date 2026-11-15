@@ -46,9 +46,11 @@ ACCEPTED_CONTEXTS = {
     "1m": 1000000,
     "1000000": 1000000,
     "1010000": 1010000,
+    "1024K": 1048576,
+    "1048576": 1048576,
 }
-# Past 1010000 tokens (987K is 1010688), or no count of tokens.
-REFUSED_CONTEXTS = ("0", "-1", "1010001", "987K", "2M", "1.5M", "M", "bad")
+# Past the largest served context, or no count of tokens.
+REFUSED_CONTEXTS = ("0", "-1", "1048577", "1025K", "2M", "1.5M", "M", "bad")
 # Every shared option: accepted arguments with the value they parse to, and
 # refused arguments.
 OPTIONS = {

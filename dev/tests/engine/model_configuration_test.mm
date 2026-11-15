@@ -171,6 +171,7 @@ void testFamilies(const std::filesystem::path &fixtures) {
   // target layers it reads.
   constexpr std::array<uint32_t, 6> ownLayers{5, 19, 33, 47, 61, 63};
   require(inspect(dense.with(&SourceModel::draft, R"("num_hidden_layers": 5)", R"("num_hidden_layers": 3)")
+                      .with(&SourceModel::draft, "\"sliding_attention\",\n    \"sliding_attention\",\n    \"sliding_attention\",\n    \"sliding_attention\",\n    \"sliding_attention\"", "\"sliding_attention\",\n    \"sliding_attention\",\n    \"sliding_attention\"")
                       .with(&SourceModel::draft, R"("intermediate_size": 17408)", R"("intermediate_size": 8192)")
                       .with(&SourceModel::draft, R"("rope_theta": 10000000)", R"("rope_theta": 1000000)")
                       .with(&SourceModel::draft, "61\n", "61,\n      63\n"))
@@ -1078,7 +1079,11 @@ void testRipple(const std::filesystem::path &fixtures) {
   require(rippleDescriptor.valid() && rippleDescriptor.family() == "Ripple-65B" &&
               rippleDescriptor.draft.targetLayerCount == 5 &&
               rippleDescriptor.draft.targetLayers[0] == 1 &&
-              rippleDescriptor.draft.window == 4096 &&
+              rippleDescriptor.draft.window == 16384 &&
+              rippleDescriptor.draft.attentionShape(0).window == 4096 &&
+              rippleDescriptor.draft.attentionShape(0).rotated &&
+              rippleDescriptor.draft.attentionShape(4).window == 16384 &&
+              !rippleDescriptor.draft.attentionShape(4).rotated &&
               rippleDescriptor.draft.queryHeads == 80,
           "a Ripple model made another descriptor");
   for (const uint32_t topK : {8u, 15u}) {
@@ -1175,4 +1180,3 @@ int main(int argc, char **argv) {
     return 1;
   }
 }
-

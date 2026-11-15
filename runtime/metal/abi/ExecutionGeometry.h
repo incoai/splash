@@ -7,9 +7,9 @@
 #define SPLASH_DRAFT_PROPOSAL_TOKENS 7u
 #define SPLASH_TARGET_VERIFY_ROWS 8u
 // The longest draft block the engine serves (the trained proposal length of
-// the longest compiled draft variant): the whole-block decode tensors and
-// the speculative K/V scratch size for it, while the verify kernels run the
-// ABI's 8-row sub-passes over it.
+// the longest compiled draft variant): capacity bounds, independent of the
+// eight-row physical attention tiles. Target projections consume the native
+// verify block together.
 #define SPLASH_DRAFT_BLOCK_ROWS_LIMIT 16u
 #define SPLASH_DRAFT_BLOCK_PROPOSALS_LIMIT (SPLASH_DRAFT_BLOCK_ROWS_LIMIT - 1u)
 // The KV ceiling: four times the targets' native window of 262,144 tokens,

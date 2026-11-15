@@ -140,6 +140,10 @@ class ChatFormat:
     # The template's placeholder for one image, one token, which the server
     # widens to the image's tokens; None for a template without one.
     image_pad: str | None
+    # Prompt-opened and model-opened reasoning are independent of whether
+    # their markers occupy one tokenizer ID or a sequence of ordinary IDs.
+    model_opens_reasoning: bool = False
+    reasoning_separator: str = ""
 
     @property
     def tags_are_text(self):
@@ -154,7 +158,7 @@ class ChatFormat:
         effort or enable_thinking opening the generation prompt's think block
         or leaving it out; a model that opens its reasoning itself decides
         each turn, whatever the request says."""
-        return self.think_start_id is None
+        return not self.model_opens_reasoning
 
     @property
     def calls_end_reasoning(self):
@@ -163,7 +167,7 @@ class ChatFormat:
         generation prompt opened, without closing it; a model that opens its
         reasoning itself closes it before it calls one, so there a call's
         opening is reasoning, as Flint's own parser reads it."""
-        return self.think_start_id is None
+        return not self.model_opens_reasoning
 
 
 # The Qwen families' (Qwen3_8.hpp, Qwen3_6Moe.hpp, Qwen4Exp.hpp):
@@ -183,6 +187,7 @@ QWEN = ChatFormat(
 # that leaves reasoning to the model. Every chat prompt ends with the
 # assistant's role token.
 FLINT = ChatFormat(
+    model_opens_reasoning=True,
     stop_tokens=("<|end_of_text|>", "<|user|>", "<|observation|>", "<|developer|>"),
     think_end_id=150007,
     think_start_id=150006,
@@ -197,6 +202,8 @@ FLINT = ChatFormat(
 # tags as TEXT its tokenizer splits, and lays a call's arguments out as one
 # JSON value.
 RIPPLE = ChatFormat(
+    model_opens_reasoning=True,
+    reasoning_separator="\n",
     stop_tokens=("<|im_end|>", "<|endoftext|>"),
     think_end_id=None,
     think_start_id=None,
@@ -215,4 +222,3 @@ RIPPLE = ChatFormat(
     message_boundary="<|im_end|>",
     image_pad=None,
 )
-

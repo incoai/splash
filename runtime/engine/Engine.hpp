@@ -28,8 +28,8 @@ namespace splash::engine {
 // (plannedCheckpoints) by default: two draft windows balance recovery
 // granularity and capture work.
 inline constexpr uint32_t kPrefillCheckpointTokens =
-    2 * model::ExecutionLimits::draftWindowLimit;
-static_assert(kPrefillCheckpointTokens >= model::ExecutionLimits::draftWindowLimit &&
+    2 * model::ExecutionLimits::draftContextTokens;
+static_assert(kPrefillCheckpointTokens >= model::ExecutionLimits::draftContextTokens &&
                   kPrefillCheckpointTokens % KvCache::pageTokens == 0,
               "a prefill checkpoint interval spans a draft window and whole KV pages");
 // How long a request waits for memory before it fails, and a resident
@@ -65,9 +65,8 @@ struct EngineConfig final {
   // only where one layer of a group, or a cut at its floor rows, does
   // (Scheduler). Finite and positive.
   double decodeGapMilliseconds = 500.0;
-  // The prefill checkpoint interval and the resource wait limit. Zero
-  // derives the interval from the served model's draft ring: two of its
-  // draft windows, whole KV pages, at most kPrefillCheckpointTokens.
+  // Zero derives the checkpoint interval from two served draft windows,
+  // rounded to whole KV pages.
   uint32_t prefillCheckpointTokens = 0;
   double resourceWaitTimeoutMilliseconds = kResourceWaitTimeoutMilliseconds;
   // The governor that admits the engine's memory and whose ledger holds

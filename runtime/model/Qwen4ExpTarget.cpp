@@ -265,10 +265,10 @@ void Qwen4ExpTarget::prepareVerifyLane(uint32_t lane, uint64_t position, const Q
 
 void Qwen4ExpTarget::addVerifyInput(metal::CommandGraph &graph, metal::MetalBuffer draftInput,
                                     metal::MetalBuffer proposals, metal::MetalBuffer verifyInput,
-                                    metal::MetalBuffer verifyInputPasses, uint32_t lanes,
+                                    uint32_t lanes,
                                     uint32_t rows) const {
   QwenTarget::addVerifyInput(graph, std::move(draftInput), std::move(proposals), verifyInput,
-                             std::move(verifyInputPasses), lanes, rows);
+                             lanes, rows);
   // The PLE steps' rows follow the ABI's block: this target's served drafts
   // are the shipped 8-row ones (Qwen4Steps::addVerifyInput sizes the hash
   // rows from ExecutionLimits::targetVerifyRows).
@@ -342,8 +342,8 @@ ops::AttentionBlocks Qwen4ExpTarget::addVerifyQsa(VerifyStep &step, const Qwen4I
 void Qwen4ExpTarget::addVerify(metal::CommandGraph &graph, QwenTargetVerifyBuffers buffers,
                                const kv::PageStorage &kv, SpilledKvReads &spilled,
                                std::span<const kv::ChunkedPrefillParams> chunks, uint32_t lanes,
-                               uint32_t blockRows, uint32_t verifiedRows) const {
-  if (blockRows != SPLASH_TARGET_VERIFY_ROWS || verifiedRows != blockRows)
+                               uint32_t blockRows) const {
+  if (blockRows != SPLASH_TARGET_VERIFY_ROWS)
     throw std::invalid_argument("this target verifies its whole 8-row block");
   VerifyStep step{verifyStep(graph, buffers, kv, spilled, chunks, lanes)};
   const std::vector<uint32_t> offsets = indexOffsets(kv, geometry_.kvLayout.attentionLayers);

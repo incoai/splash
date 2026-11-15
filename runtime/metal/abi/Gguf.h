@@ -26,6 +26,12 @@
 // (LinearConfig::oneGateUpPass): one simdgroup staging the same
 // GGUF_STAGED_COLUMNS columns of both tensors.
 #define GGUF_GATE_UP_THREADS 32u
+// At most 32 rows of each accumulator per simdgroup. Wider pairs share
+// their destinations across simdgroups instead of doubling live accumulators.
+inline constexpr uint32_t gguf_gate_up_simdgroups(uint32_t rows) { return (rows + 31u) / 32u; }
+// INT8 tiles hold integer and folded float sums; wider tiles share those registers.
+inline constexpr uint32_t gguf_int8_simdgroups(uint32_t rows) { return rows > 32u ? 2u : 1u; }
+inline constexpr uint32_t gguf_int8_gate_up_simdgroups(uint32_t rows) { return rows > 32u ? 4u : 1u; }
 // Prefill tile of the staged kernels: GGUF_PREFILL_SIMDGROUPS simdgroups of
 // GGUF_PREFILL_SIMDGROUP_ROWS rows share one stage of GGUF_PREFILL_STEP
 // inputs of the tile's columns, which all threads dequantize.
@@ -122,8 +128,9 @@ struct GgufPrefillInt8Params {
   uint32_t out_offset;        // first destination column of the segment
   uint32_t plane_input_size;  // inputs a row of the planes holds (Projection::leadingInputs), K for none
   uint32_t column_tiles;      // the segment's tiles of GGUF_TILE_COLUMNS columns
+  float clamp;
 };
-static_assert(sizeof(GgufPrefillInt8Params) == 28, "int8 prefill parameters are 28 bytes on both sides");
+static_assert(sizeof(GgufPrefillInt8Params) == 32, "int8 prefill parameters are 32 bytes on both sides");
 // Scratch of `storage` rows of K inputs: the int8 codes in the table, and in
 // the sums buffer float2 [K / 64][storage].
 inline constexpr uint64_t gguf_prefill_int8_table_bytes(uint32_t k, uint64_t storage) {

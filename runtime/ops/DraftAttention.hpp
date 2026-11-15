@@ -21,6 +21,7 @@ struct DraftAttentionShape final {
   // runs on, the shipped drafts' unless a variant's config states otherwise.
   uint32_t window = SPLASH_DRAFT_SLIDING_WINDOW;
   uint32_t convolutionTaps = SPLASH_DRAFT_CONVOLUTION_TAPS;
+  bool rotated = true;
 
   bool operator==(const DraftAttentionShape &) const = default;
 };

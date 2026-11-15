@@ -592,6 +592,7 @@ def require_quantized(headers):
             "quantized variant of the repository"
         )
 
+
 def ripple_text_config(metadata, arch):
     """What Ripple's config.json states beyond the sizes every architecture's
     does, from its header: the FFN's width, the sliding window, the scale of

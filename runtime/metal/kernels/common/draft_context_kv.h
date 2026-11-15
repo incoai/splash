@@ -8,7 +8,7 @@
 // the ring slot of the row's position; the values are copied there. The
 // Window is the ring length of the draft's geometry, which every draft keeps
 // to a compiled variant's (2048 for the shipped drafts, 4096 for Ripple's).
-template <uint Window = SPLASH_DRAFT_SLIDING_WINDOW>
+template <uint Window = SPLASH_DRAFT_SLIDING_WINDOW, bool Rotated = true>
 inline void draft_context_kv_phase(
     device const bfloat *context_kv, device const bfloat *k_norm,
     device const float *rope_cos, device const float *rope_sin,
@@ -39,7 +39,9 @@ inline void draft_context_kv_phase(
     value[ulong(thread_index) * Window] = source[KWidth + thread_index];
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
-  if (thread_index < HeadDim / 2) {
+  if constexpr (!Rotated) {
+    if (thread_index < HeadDim) key[thread_index] = normalized[thread_index];
+  } else if (thread_index < HeadDim / 2) {
     float first = float(normalized[thread_index]);
     float second = float(normalized[thread_index + HeadDim / 2]);
     float cosine = rope_cos[ulong(row) * SPLASH_DRAFT_ROPE_PAIRS + thread_index];

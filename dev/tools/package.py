@@ -45,6 +45,7 @@ SERVER_FILES = (
     "__init__.py",
     "server.py",
     "backend.py",
+    "token_markers.py",
     "constraints.py",
     "output.py",
     "frontend.py",

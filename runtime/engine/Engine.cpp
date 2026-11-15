@@ -21,10 +21,6 @@ constexpr double kHealthCheckIntervalMilliseconds = 1000.0;
 // A mask request the server leaves unanswered for supervision::kMaskWait
 // fails its request; the batch's command slot is not held longer.
 constexpr double kMaskWaitMilliseconds = double(supervision::kMaskWait.count());
-// A junction costs a cached state, its capture and up to a draft window of
-// draft-context rows; a later request must save at least that much prefill.
-
-
 constexpr std::string_view kKvUnreadableMessage =
     "KV of an earlier part of the conversation could not be read from the SSD cache";
 constexpr std::string_view kDiskQuotaTimeoutMessage =
@@ -101,14 +97,9 @@ void Engine::submit(EngineRequest value) {
                   outOfVocabulary)) {
     throw std::invalid_argument("score token is out of vocabulary");
   }
-  if (value.thinkingBudget) {
-    if (const char *reason = value.thinkingBudget->unusable())
+  if (value.thinkingBudget)
+    if (const char *reason = value.thinkingBudget->unusable(config_.vocabularySize))
       throw std::invalid_argument(reason);
-    if (std::any_of(value.thinkingBudget->end.begin(),
-                    value.thinkingBudget->end.end(), outOfVocabulary) ||
-        outOfVocabulary(value.thinkingBudget->alsoEnds))
-      throw std::invalid_argument("thinking end token is out of vocabulary");
-  }
   if (!value.images.empty() && !config_.maxImagePatches) {
     throw std::invalid_argument("this model is serving without vision");
   }
@@ -1215,20 +1206,11 @@ DraftContextPlan Engine::configureDraftStatePlan(Request &active,
   const uint32_t latestReplayBoundary = replayStateBoundary(active);
   // Plan draft windows before prefill; arbitrary chunk ends do not carry a
   // complete draft state, the point the lane resumes from does. Progress
-  // points remain disposable after restoration. The interval spans two of
-  // the model's own draft windows, whole KV pages, within the compiled
-  // rings' ceiling, unless the start names one; a junction is worth
-  // capturing from a window of the model's own gain.
+  // points remain disposable after restoration. The default interval spans
+  // two model draft windows, rounded to whole KV pages.
   const uint32_t window = model_.draftWindow();
-  // The interval the checkpoint capture lands at is under investigation for
-  // the long-conversation corruption: SPLASH_CHECKPOINT_INTERVAL overrides.
-  uint32_t configured = config_.prefillCheckpointTokens;
-  if (const char *interval = getenv("SPLASH_CHECKPOINT_INTERVAL"))
-    configured = static_cast<uint32_t>(std::stoul(interval));
-  const uint32_t derived = std::min<uint32_t>(
-      (2u * window + KvCache::pageTokens - 1) / KvCache::pageTokens * KvCache::pageTokens,
-      kPrefillCheckpointTokens);
-  const uint32_t interval = configured ? configured : derived;
+  const uint32_t interval = config_.prefillCheckpointTokens ? config_.prefillCheckpointTokens :
+      (2u * window + KvCache::pageTokens - 1) / KvCache::pageTokens * KvCache::pageTokens;
   const uint32_t gain = std::max(model::ExecutionLimits::draftContextTokens, window);
   for (const uint32_t checkpoint :
        plannedCheckpoints(stateBoundary, latestReplayBoundary, interval)) {
@@ -1754,7 +1736,7 @@ std::vector<LaneShape> Engine::laneShapes(std::span<const PrefillAdmission> cand
 
 uint64_t Engine::workEndOf(const Request &active, const BatchItem &scheduled,
                            bool prefill, uint32_t decodeRows) noexcept {
-  uint64_t workEnd = active.exactTokens.size() + 2 * decodeRows;
+  uint64_t workEnd = active.exactTokens.size() + decodeRows;
   if (prefill) {
     workEnd = scheduled.promptOffset + scheduled.tokenCount;
     if (active.stateBoundaryCursor < active.stateBoundaries.size())

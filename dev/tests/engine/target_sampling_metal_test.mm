@@ -21,6 +21,7 @@
 // of non-finite logits select the sentinel 0xFFFFFFFF. The host
 // word helpers and the lifecycle that rebuilds a resumed request's words are
 // checked bitwise.
+#include "TokenAutomaton.hpp"
 #include "PenaltyReference.hpp"
 #include "TestBuffers.hpp"
 #include "TestChecks.hpp"
@@ -147,18 +148,18 @@ struct Batch final {
   }
 };
 
-Batch makeBatch(MetalBackend &backend, uint32_t vocabulary, uint32_t lanes) {
-  const uint32_t rows = lanes * kRows;
+Batch makeBatch(MetalBackend &backend, uint32_t vocabulary, uint32_t lanes, uint32_t blockRows = kRows) {
+  const uint32_t rows = lanes * blockRows;
   const auto space = Sampling::workspace(rows);
   const auto proposals =
-      DraftSelector::workspace(lanes * kPositions, SPLASH_DRAFT_CANDIDATES);
+      DraftSelector::workspace(lanes * (blockRows - 1), SPLASH_DRAFT_CANDIDATES);
   return {SamplingBuffers{
               allocate(backend, uint64_t{rows} * vocabulary * sizeof(float)),
               allocate(backend, space.partialMassesBytes),
               allocate(backend, space.vocabularyRowsBytes),
               allocate(backend, uint64_t{lanes} * kUniforms * sizeof(float)),
               allocate(backend,
-                       uint64_t{lanes} * (kRows + 1) * ((vocabulary + 31) / 32) * 4),
+                       uint64_t{lanes} * (blockRows + 1) * ((vocabulary + 31) / 32) * 4),
               allocate(backend, uint64_t{rows} * sizeof(uint32_t)),
               allocate(backend, space.argmaxValuesBytes),
               allocate(backend, space.argmaxIndicesBytes),
@@ -1587,6 +1588,74 @@ void excludedStopTokens(MetalBackend &backend, uint32_t vocabulary) {
 // constrained lane that waits for its mask starts at the first row from its
 // cutoff's on whose mask admits the end's first token, the rows before
 // keeping their own selections, and replaces no proposals.
+// The fixture's pieces merge the second opener byte or close with a newline.
+// A close can also share a token with both its body and its following answer.
+void automatonThinkingCutoffs(MetalBackend &backend) {
+  constexpr uint32_t vocabulary = 512, states = 4, classes = 11;
+  const std::array<std::string_view, 10> pieces{"[", "[\n", "[[", "]", "]\n", "]]\n", "body", " > ", "body]]tail", "junk"};
+  std::vector<uint32_t> program{states, classes, 2, 4, 5, 0, 10, 0};
+  program.resize(8 + (states * classes + 3) / 4);
+  for (uint32_t state = 0; state < states; ++state)
+    for (uint32_t kind = 0; kind < classes; ++kind) {
+      uint32_t next = state;
+      for (const char c : kind ? pieces[kind - 1] : std::string_view("ordinary")) {
+        if (next >= states) break;
+        if (next < 2) next = c == '[' ? next + 1 : 5;
+        else if (c == ']') next = next == 3 ? 4 : 3;
+        else next = 2;
+      }
+      const uint32_t index = state * classes + kind;
+      program[8 + index / 4] |= next << (8 * (index % 4));
+    }
+  const uint32_t offsets = program.size();
+  program.resize(offsets + states);
+  program[offsets + 2] = program.size(); program.insert(program.end(), {2, 23, 23});
+  program[offsets + 3] = program.size(); program.insert(program.end(), {1, 23});
+  program[7] = program.size();
+  for (uint32_t i = 0; i < pieces.size(); ++i) program.push_back(((20 + i) << 8) | (i + 1));
+  const splash::TokenAutomaton automaton(program);
+  require(automaton.valid(vocabulary), "the marker fixture is invalid");
+  const std::vector<uint32_t> end{23, 23};
+  for (const uint32_t block : {8u, 16u})
+    for (uint32_t lanes = 1; lanes <= 4; ++lanes)
+      for (uint32_t scenario = 0; scenario < 7; ++scenario) {
+        Sampling sampling(vocabulary, SPLASH_DRAFT_CANDIDATES, block);
+        const auto batch = makeBatch(backend, vocabulary, lanes, block);
+        std::vector<SamplingPolicy> policies(lanes, SamplingPolicy{1, 0.8F});
+        for (uint32_t lane = 0; lane < lanes; ++lane) {
+          auto cutoff = ThinkingCutoff{2, end, 0};
+          cutoff.markers = program; cutoff.markerState = 0; cutoff.opened = false;
+          std::vector<uint32_t> proposed(block, 26);
+          if (scenario == 0) { proposed[0] = 22; }
+          if (scenario == 1) { cutoff.markerState = 2; cutoff.row = 7; proposed[1] = 23; proposed[2] = 24; }
+          if (scenario == 2) { cutoff.row = 0; }
+          if (scenario == 3) { cutoff.markerState = 3; cutoff.row = 0; cutoff.end = std::span(end).last(1); }
+          if (scenario == 4) { cutoff.markerState = 2; cutoff.row = 9; }
+          if (scenario == 5) { cutoff.markerState = 1; proposed[0] = 21; }
+          if (scenario == 6) { cutoff.markerState = 2; cutoff.row = 2; proposed[1] = 23; }
+          cutoff.opened = automaton.opened(cutoff.markerState);
+          policies[lane].thinkingCutoff = cutoff;
+          auto *input = static_cast<uint32_t *>(batch.buffers.inputTokens.contents());
+          input[lane * block] = 26;
+          for (uint32_t row = 0; row < block; ++row) {
+            if (row + 1 < block) input[lane * block + row + 1] = proposed[row];
+            std::fill(batch.row(lane * block + row), batch.row(lane * block + row) + vocabulary, -10.0F);
+            batch.row(lane * block + row)[40 + row] = 10.0F;
+          }
+        }
+        CommandGraph graph;
+        sampling.addVerify(graph, policies, batch.buffers, StopTokens{500}, {});
+        static_cast<void>(backend.submitCommandAsync(graph.dispatches()).wait());
+        const auto *tokens = static_cast<const uint32_t *>(batch.buffers.outputTokens.contents());
+        const uint32_t at = scenario == 0 || scenario == 5 ? 3 : scenario == 3 ? 0 : scenario == 4 ? 9 : scenario == 6 ? 2 : block;
+        const uint32_t count = scenario == 3 || scenario == 6 ? 1 : 2;
+        for (uint32_t lane = 0; lane < lanes; ++lane)
+          for (uint32_t row = 0; row < block; ++row)
+            require(tokens[lane * block + row] == (row >= at && row < at + count ? 23 : 40 + row),
+                    "a BPE marker cutoff selected the wrong row or suffix");
+      }
+}
+
 void thinkingCutoffs(MetalBackend &backend, uint32_t vocabulary) {
   const auto stops = shardEdgeStopTokens(vocabulary);
   const uint32_t close = vocabulary - 3, alsoEnds = vocabulary - 5;
@@ -1861,7 +1930,7 @@ void thinkingCutoffs(MetalBackend &backend, uint32_t vocabulary) {
     sampling.addThinkingDrafts(verify, policies, acceptance.proposedTokens);
     require(draftDispatches(verify) == 1, "the started ends dispatched their drafts other than once");
     Embedding::addVerifyInput(verify, draftInput, acceptance.proposedTokens, batch.buffers.inputTokens,
-                              batch.buffers.inputTokens, vocabulary, kLanes, kRows);
+                              vocabulary, kLanes, kRows);
     verifyLanes(verify, policies, expected, drafts);
     for (uint32_t lane = 0; lane < kLanes; ++lane) {
       require(std::ranges::equal(std::span(proposed + lane * kPositions, kPositions), drafts[lane]) &&
@@ -1925,7 +1994,7 @@ void thinkingCutoffs(MetalBackend &backend, uint32_t vocabulary) {
     CommandGraph verify;
     sampling.addThinkingDrafts(verify, policies, acceptance.proposedTokens);
     Embedding::addVerifyInput(verify, draftInput, acceptance.proposedTokens, batch.buffers.inputTokens,
-                              batch.buffers.inputTokens, vocabulary, kLanes, kRows);
+                              vocabulary, kLanes, kRows);
     sampling.addVerify(verify, policies, batch.buffers, stops, {});
     sampling.addAcceptance(verify, acceptance, maximumRetained, policies, stops);
     static_cast<void>(backend.submitCommandAsync(verify.dispatches()).wait());
@@ -2658,6 +2727,7 @@ int main(int argc, char **argv) {
       stage = "thinking cutoffs, vocabulary " + std::to_string(vocabulary);
       thinkingCutoffs(backend, vocabulary);
     }
+    automatonThinkingCutoffs(backend);
     for (uint32_t lanes = 1; lanes <= kLanes; ++lanes) {
       for (uint32_t mask = 0; mask < (1U << lanes); ++mask) {
         stage = "mixed verify B" + std::to_string(lanes) + ", sampling mask " +

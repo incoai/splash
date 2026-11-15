@@ -79,11 +79,11 @@ const ops::Projection &QwenTarget::vocabularyProjection() const noexcept {
 }
 
 uint32_t QwenTarget::decodeStorageLanes(uint32_t lanes) const {
-  const uint32_t rows = lanes * kVerifyRows;
+  const uint32_t rows = lanes * geometry_.verifyRows;
   uint32_t storageRows = rows;
   for (const auto &shape : geometry_.decodeProjections)
     storageRows = std::max(storageRows, operators_.linear().decodeStorageRows(rows, shape));
-  return storageRows / kVerifyRows;
+  return storageRows / geometry_.verifyRows;
 }
 
 void QwenTarget::addInsideCapture(metal::CommandGraph &, metal::MetalBuffer, metal::MetalBuffer) const {}
@@ -94,10 +94,10 @@ std::vector<uint32_t> QwenTarget::verifyTableRows(uint32_t) const { return {}; }
 
 void QwenTarget::addVerifyInput(metal::CommandGraph &graph, metal::MetalBuffer draftInput,
                                 metal::MetalBuffer proposals, metal::MetalBuffer verifyInput,
-                                metal::MetalBuffer verifyInputPasses, uint32_t lanes,
+                                uint32_t lanes,
                                 uint32_t rows) const {
   ops::Embedding::addVerifyInput(graph, std::move(draftInput), std::move(proposals), std::move(verifyInput),
-                                 std::move(verifyInputPasses), geometry_.vocabularySize, lanes, rows);
+                                 geometry_.vocabularySize, lanes, rows);
 }
 
 void QwenTarget::addEmbedding(metal::CommandGraph &graph,
@@ -179,14 +179,12 @@ QwenTarget::VerifyStep QwenTarget::verifyStep(metal::CommandGraph &graph, const 
   for (uint32_t lane = 0; lane < lanes; ++lane) {
     if (geometry_.stateLayout.auxiliaryBytes && !buffers.auxiliary[lane])
       throw std::invalid_argument("Qwen verify lane without its auxiliary state");
-    // The pass's rows see the block's earlier sub-passes' rows in the pages:
-    // the split sizing counts them with the history.
+    // Attention sees the committed history before the block.
     histories[lane] = chunks[lane].committed_tokens + chunks[lane].row_base;
   }
   VerifyStep step{graph, buffers, kvLayers, spilled, chunks, lanes, lanes * kVerifyRows,
                   operators_.verifyAttention(lanes, geometry_.attentionQueryHeads, geometry_.kvLayout,
                                              std::span(histories).first(lanes))};
-  step.rowBase = chunks.front().row_base;
   if (const uint32_t window = geometry_.kvLayout.windowTokens)
     step.windowedAttention.emplace(operators_.verifyAttention(lanes, geometry_.attentionQueryHeads,
                                                               geometry_.kvLayout, std::span(histories).first(lanes),
@@ -378,7 +376,7 @@ void QwenTarget::addVerifyMixer(VerifyStep &step, const QwenGdnWeights &mixer, o
   const ops::PreparedInput hidden = ops::GDN::addDecode(
       step.graph,
       {b.gdnPacked, mixer.convolutionWeights, b.currentGdnStates, b.nextGdnStates, b.gdnTape,
-       {}, std::span(b.gdnTapeLanes).first(step.lanes), mixer.decay, mixer.timeBias,
+       std::span(b.gdnTapeLanes).first(step.lanes), mixer.decay, mixer.timeBias,
        mixer.mixerNorm, b.gdnHidden, b.verifyRows, b.linearScratch},
       geometry_.gdnShape(), step.lanes, layer, geometry_.stateLayout.strides(),
       mixer.outputHeadOrder, outputPlan.input());
@@ -530,8 +528,8 @@ public:
 
   void addVerify(metal::CommandGraph &graph, QwenTargetVerifyBuffers buffers, const kv::PageStorage &kv,
                  SpilledKvReads &spilled, std::span<const kv::ChunkedPrefillParams> chunks,
-                 uint32_t lanes, uint32_t blockRows, uint32_t verifiedRows) const override {
-    if (blockRows != SPLASH_TARGET_VERIFY_ROWS || verifiedRows != blockRows)
+                 uint32_t lanes, uint32_t blockRows) const override {
+    if (blockRows != SPLASH_TARGET_VERIFY_ROWS)
       throw std::invalid_argument("this target verifies its whole 8-row block");
     VerifyStep step = verifyStep(graph, buffers, kv, spilled, chunks, lanes);
     for (uint32_t index = 0; index < geometry_.layers; ++index) {

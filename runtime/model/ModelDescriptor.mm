@@ -773,12 +773,42 @@ DFlashDraftLayout readDraftLayout(NSDictionary *draft, const QwenTargetDimension
     if (targetLayers.back() >= target.layers)
       throw std::invalid_argument("draft config target_layer_ids names a layer past the target's");
   }
-  const DFlashDraftLayout layout =
+  DFlashDraftLayout layout =
       draftLayout(target.hiddenSize, target.vocabularySize,
                   requireWhole(draft[@"num_hidden_layers"], "draft config num_hidden_layers"),
                   requireWhole(draft[@"intermediate_size"], "draft config intermediate_size"),
                   requireNumber(rope[@"rope_theta"], "draft config rope_parameters rope_theta").floatValue,
                   targetLayers, *variant);
+  if (draft[@"layer_types"]) {
+    NSArray *types = requireArray(draft, @"layer_types", "draft config layer_types");
+    if (types.count != layout.layers || layout.layers > 128)
+      throw std::invalid_argument("draft config layer_types must name every layer");
+    for (uint32_t layer = 0; layer < layout.layers; ++layer) {
+      if ([types[layer] isEqual:@"full_attention"])
+        layout.fullAttentionLayers.set(layer, true);
+      else if (![types[layer] isEqual:@"sliding_attention"])
+        throw std::invalid_argument("draft config layer_types has an unsupported attention type");
+    }
+    layout.slidingWindow = layout.window;
+    // Full layers use the variant's retention policy independently of the
+    // sliding rings; snapshots keep the shared retained context once.
+    for (uint32_t layer = 0; layer < layout.layers; ++layer)
+      if (layout.fullAttentionLayers.test(layer)) layout.window = std::max(layout.window, variant->full_window);
+    if (layout.window == layout.slidingWindow) {
+      layout.slidingWindow = 0;
+      layout.fullAttentionLayers = {};
+    }
+  }
+  if (draft[@"no_rope_layers"]) {
+    for (id value : requireArray(draft, @"no_rope_layers", "draft config no_rope_layers")) {
+      const uint32_t layer = requireWhole(value, "draft config no_rope_layers index");
+      if (layer >= layout.layers || layer >= 128)
+        throw std::invalid_argument("draft config no_rope_layers names a layer past the draft");
+      layout.unrotatedLayers.set(layer, true);
+    }
+  }
+  for (uint32_t layer = 0; layer < layout.layers; ++layer)
+    static_cast<void>(ops::draftVariant(layout.attentionShape(layer)));
   return layout;
 }
 

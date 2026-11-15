@@ -691,9 +691,7 @@ class RippleFormatTests(unittest.TestCase):
         for text in (THINK_END, TOOL_CALL_CLOSE):
             encoded = tokenizer.encode(text, add_special_tokens=False)
             self.assertTrue(encoded, text)
-            self.assertEqual(
-                tokenizer.decode(encoded, skip_special_tokens=True), text
-            )
+            self.assertEqual(tokenizer.decode(encoded, skip_special_tokens=True), text)
 
     def test_a_tokenizer_that_holds_a_tag_is_refused(self):
         # A tag held as a special token decodes to nothing with the special
@@ -701,12 +699,37 @@ class RippleFormatTests(unittest.TestCase):
         # tag the template wrote.
         backend = ripple_tokenizer().backend_tokenizer
         backend.add_tokens([AddedToken(THINK_END, normalized=False, special=True)])
-        tokenizer = PreTrainedTokenizerFast(tokenizer_object=backend, eos_token="<|im_end|>")
+        tokenizer = PreTrainedTokenizerFast(
+            tokenizer_object=backend, eos_token="<|im_end|>"
+        )
         with self.assertRaisesRegex(
             fixtures.engine_runtime.EngineUnhealthy,
             f"tokenizer must encode '{THINK_END}' and decode it back as text",
         ):
             constraints.validate_tokenizer(tokenizer, ripple_format(tokenizer))
+
+    def test_model_opened_reasoning_preserves_template_separators(self):
+        for size in (1, 2, 7, 100):
+            for reasoning, answer in (
+                ("Let me reason.", "Paris."),
+                ("\nKeep blank lines.\n", "\nParis."),
+            ):
+                splitter = model_output.ReasoningSplitter(False, True, RIPPLE)
+                text = THINK_START + "\n" + reasoning + "\n" + THINK_END + "\n" + answer
+                events = []
+                for start in range(0, len(text), size):
+                    events.extend(splitter.put(text[start : start + size]))
+                events.extend(splitter.finish())
+                self.assertEqual(
+                    "".join(
+                        value for kind, value in events if kind == "reasoning_content"
+                    ),
+                    reasoning,
+                )
+                self.assertEqual(
+                    "".join(value for kind, value in events if kind == "content"),
+                    answer,
+                )
 
     def test_the_real_format_is_ripple_s(self):
         self.assertEqual(RIPPLE.stop_tokens, ("<|im_end|>", "<|endoftext|>"))
@@ -714,22 +737,28 @@ class RippleFormatTests(unittest.TestCase):
         self.assertIsNone(RIPPLE.think_start_id)
         self.assertIsNone(RIPPLE.call_open_id)
         self.assertTrue(RIPPLE.tags_are_text)
-        self.assertTrue(RIPPLE.reasoning_switch)
-        self.assertTrue(RIPPLE.calls_end_reasoning)
+        self.assertFalse(RIPPLE.reasoning_switch)
+        self.assertFalse(RIPPLE.calls_end_reasoning)
         self.assertTrue(RIPPLE.call_syntax.json_arguments)
 
     def test_reasoning_tokens_count_through_the_decoded_stream(self):
         tokenizer = ripple_tokenizer()
         chat_format = ripple_format(tokenizer)
-        ids_of = lambda text: tokenizer.encode(text, add_special_tokens=False)
+
+        def ids_of(text):
+            return tokenizer.encode(text, add_special_tokens=False)
+
         open_ = ids_of(THINK_START + "\n")
         close = ids_of("\n" + THINK_END + "\n")
         body = ids_of("We need the number. Final 4.")
-        call = ids_of(TOOL_CALL_OPEN + "\n")
         # The template's layout newlines, which the splitter's reasoning
         # holds: one after the opener, one before the close.
         cases = (
-            (open_ + body + close, 1 + len(body) + 1, "the body's tokens and the layout's"),
+            (
+                open_ + body + close,
+                1 + len(body) + 1,
+                "the body's tokens and the layout's",
+            ),
             (open_ + body, 1 + len(body), "an unclosed block is all reasoning"),
             (body, 0, "no opener, no reasoning"),
             (open_ + body + close + body, 1 + len(body) + 1, "the close ends it"),
@@ -740,8 +769,11 @@ class RippleFormatTests(unittest.TestCase):
                 open_
                 + ids_of("call ")
                 + ids_of(TOOL_CALL_OPEN + chat_format.call_syntax.name_open),
-                1 + len(ids_of("call ")),
-                "a call's opening ends it",
+                1
+                + len(
+                    ids_of("call " + TOOL_CALL_OPEN + chat_format.call_syntax.name_open)
+                ),
+                "a model-opened block requires its explicit close",
             ),
             (open_[:2], 0, "a cut opener is not reasoning yet"),
         )
@@ -757,7 +789,10 @@ class RippleFormatTests(unittest.TestCase):
     def test_a_prompt_opened_block_counts_from_its_start(self):
         tokenizer = ripple_tokenizer()
         chat_format = ripple_format(tokenizer)
-        ids_of = lambda text: tokenizer.encode(text, add_special_tokens=False)
+
+        def ids_of(text):
+            return tokenizer.encode(text, add_special_tokens=False)
+
         body = ids_of("We need the number. Final 4.")
         close = ids_of("\n" + THINK_END + "\n")
         streamer = backend_api.CallbackStreamer(tokenizer, lambda *_: None)
@@ -807,7 +842,9 @@ class RippleToolOutputTests(unittest.TestCase):
         text = self.call_text("time", {})
         for size in (None, 3, 40):
             with self.subTest(size=size):
-                content, calls, _ = project(text, policy, syntax=RIPPLE.call_syntax, size=size)
+                content, calls, _ = project(
+                    text, policy, syntax=RIPPLE.call_syntax, size=size
+                )
                 self.assertEqual(content, "")
                 self.assertEqual(
                     calls,
@@ -819,6 +856,32 @@ class RippleToolOutputTests(unittest.TestCase):
                         }
                     ],
                 )
+
+    def test_json_whitespace_nesting_and_escaped_markers(self):
+        arguments = {
+            "city": "}\n</tool_call>",
+            "nested": {"values": [1, {"escaped": '\\"'}]},
+        }
+        for envelope in (
+            {"name": "weather", "arguments": arguments},
+            {"arguments": arguments, "name": "weather"},
+        ):
+            for spelling in (
+                json.dumps(envelope, indent=2),
+                json.dumps(envelope, separators=(",", ":")),
+            ):
+                for size in (None, 1, 3, 17):
+                    with self.subTest(size=size, spelling=spelling):
+                        text = TOOL_CALL_OPEN + spelling + TOOL_CALL_CLOSE
+                        content, calls, _ = project(
+                            text, self.policy(), syntax=RIPPLE.call_syntax, size=size
+                        )
+                        self.assertEqual(content, "")
+                        self.assertEqual(len(calls), 1)
+                        self.assertEqual(calls[0]["function"]["name"], "weather")
+                        self.assertEqual(
+                            json.loads(calls[0]["function"]["arguments"]), arguments
+                        )
 
     def test_an_argument_streams_as_it_is_written(self):
         policy = self.policy()
@@ -836,8 +899,12 @@ class RippleToolOutputTests(unittest.TestCase):
         text = self.call_text("weather", {"city": "Paris"})
         # Cut after the arguments' JSON value and its close, before the call's.
         cut = text[: text.index("}") + 2]
-        content, calls, _ = project(cut, policy, syntax=RIPPLE.call_syntax, incomplete=True)
-        self.assertEqual(json.loads(calls[0]["function"]["arguments"]), {"city": "Paris"})
+        content, calls, _ = project(
+            cut, policy, syntax=RIPPLE.call_syntax, incomplete=True
+        )
+        self.assertEqual(
+            json.loads(calls[0]["function"]["arguments"]), {"city": "Paris"}
+        )
 
     def test_the_grammar_generates_a_call(self):
         tokenizer = ripple_tokenizer()
@@ -984,7 +1051,9 @@ class FlintPromptTests(unittest.TestCase):
                 body = fixtures.chat_body(**options)
                 job = frontend.prepare(body, deadline=fixtures.FOREVER)
                 self.assertFalse(job.thinking)
-                self.assertIsNone(job.thinking_token_budget)
+                self.assertEqual(
+                    job.thinking_token_budget, options.get("thinking_token_budget")
+                )
                 self.assertIs(job.chat_format, frontend.chat_format)
                 prompts.add(frontend.apply_template(body, deadline=fixtures.FOREVER))
         self.assertEqual(prompts, {"<|user|>hello<|assistant|>"})
@@ -1156,6 +1225,129 @@ class FlintServingTests(fixtures.HarnessTestCase):
         self.assertIn(
             'call_0: <tool_call> "weather" @free_arguments </tool_call>\n', main
         )
+
+
+class RippleServingTests(fixtures.HarnessTestCase):
+    def harness_for(self, text, **options):
+        tokenizer = ripple_tokenizer()
+        tokenizer.chat_template = (
+            "{% for message in messages %}{{ '<|im_start|>' + message['role'] + '\\n' + message['content'] + '<|im_end|>\\n' }}{% endfor %}"
+            "{% if add_generation_prompt %}{{ '<|im_start|>assistant\\n' }}{% endif %}"
+        )
+        tokens = tokenizer.encode(text, add_special_tokens=False)
+        runtime = fixtures.FakeRuntime(fixtures.Plan([[token] for token in tokens]))
+        harness = self.harness(
+            runtime,
+            tokenizer=tokenizer,
+            chat_format=RIPPLE,
+            max_context=4096,
+            **options,
+        )
+        return harness, runtime
+
+    def test_reasoning_round_trips_all_dialects_complete_and_streamed(self):
+        text = "<think>\nWe need the number.\n</think>\nFinal 4."
+        for path, body in (
+            ("/v1/chat/completions", fixtures.chat_body),
+            ("/v1/responses", fixtures.responses_body),
+            ("/v1/messages", fixtures.anthropic_body),
+        ):
+            for stream in (False, True):
+                with self.subTest(path=path, stream=stream):
+                    harness, runtime = self.harness_for(text)
+                    status, _, payload = harness.request(
+                        "POST",
+                        path,
+                        body(stream=stream, max_tokens=128, max_output_tokens=128),
+                    )
+                    self.assertEqual(status, 200, payload)
+                    events = (
+                        fixtures.stream_events(payload)
+                        if stream
+                        else [json.loads(payload)]
+                    )
+                    encoded = json.dumps(events)
+                    self.assertNotIn("<think>", encoded)
+                    self.assertNotIn("</think>", encoded)
+                    if not stream and path == "/v1/chat/completions":
+                        message = events[0]["choices"][0]["message"]
+                        self.assertEqual(
+                            message["reasoning_content"], "We need the number."
+                        )
+                        self.assertEqual(message["content"], "Final 4.")
+                    if stream and path == "/v1/chat/completions":
+                        deltas = [
+                            event["choices"][0]["delta"]
+                            for event in events
+                            if event.get("choices")
+                        ]
+                        self.assertEqual(
+                            "".join(d.get("reasoning_content") or "" for d in deltas),
+                            "We need the number.",
+                        )
+                        self.assertEqual(
+                            "".join(d.get("content") or "" for d in deltas), "Final 4."
+                        )
+                    self.assertTrue(runtime.requests)
+
+    def test_compact_json_call_streams_nested_arguments(self):
+        text = '<think>\nCheck.\n</think>\n<tool_call>{"name":"weather","arguments":{"city":"Paris","nested":{"tag":"</tool_call>","values":[1,2]}}}</tool_call>'
+        for stream in (False, True):
+            harness, _ = self.harness_for(text)
+            status, _, payload = harness.request(
+                "POST",
+                "/v1/chat/completions",
+                fixtures.chat_body(
+                    stream=stream,
+                    max_tokens=256,
+                    tools=[
+                        {
+                            "type": "function",
+                            "function": {
+                                "name": "weather",
+                                "parameters": {"type": "object"},
+                            },
+                        }
+                    ],
+                ),
+            )
+            self.assertEqual(status, 200, payload)
+            if stream:
+                calls = [
+                    call
+                    for event in fixtures.stream_events(payload)
+                    if event.get("choices")
+                    for call in event["choices"][0]["delta"].get("tool_calls", [])
+                ]
+                arguments = "".join(
+                    call["function"].get("arguments", "") for call in calls
+                )
+                self.assertEqual(
+                    "".join(call["function"].get("name", "") for call in calls),
+                    "weather",
+                )
+            else:
+                call = json.loads(payload)["choices"][0]["message"]["tool_calls"][0]
+                arguments = call["function"]["arguments"]
+                self.assertEqual(call["function"]["name"], "weather")
+            self.assertEqual(
+                json.loads(arguments),
+                {"city": "Paris", "nested": {"tag": "</tool_call>", "values": [1, 2]}},
+            )
+
+    def test_text_budget_carries_a_tokenizer_compiled_marker_program(self):
+        harness, runtime = self.harness_for("<think>\nWe need the number.\n</think>\n4")
+        status, _, payload = harness.request(
+            "POST",
+            "/v1/chat/completions",
+            fixtures.chat_body(max_tokens=128, thinking_token_budget=2),
+        )
+        self.assertEqual(status, 200, payload)
+        budget = runtime.requests[0].frame.thinking_budget
+        self.assertIsNotNone(budget)
+        self.assertTrue(budget.markers)
+        self.assertLessEqual(len(budget.markers) * 4, 4096)
+        self.assertEqual(budget.tokens, 2)
 
 
 class ServedFamilyTests(unittest.TestCase):

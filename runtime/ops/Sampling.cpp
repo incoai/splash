@@ -1,4 +1,5 @@
 #include "ops/Sampling.hpp"
+#include "TokenAutomaton.hpp"
 
 #include "metal/abi/Sampling.h"
 #include "ops/BufferExtent.hpp"
@@ -57,8 +58,16 @@ ThinkingCutoffs thinkingCutoffs(std::span<const SamplingPolicy> policies, uint32
       params.sampling_mask |= uint32_t{1} << lane;
     const std::optional<ThinkingCutoff> &cutoff = policy.thinkingCutoff;
     params.row[lane] = cutoff ? cutoff->row : rows;
-    if (params.row[lane] >= rows)
+    if (cutoff && !cutoff->markers.empty()) {
+      const TokenAutomaton markers(cutoff->markers);
+      if (!markers.valid(vocabulary) || markers.terminal(cutoff->markerState))
+        throw std::invalid_argument("invalid thinking marker automaton or state");
+      params.automaton_mask |= 1u << lane;
+      params.marker_state[lane] = cutoff->markerState;
+      if (markers.opened(cutoff->markerState)) params.opened_mask |= 1u << lane;
+    } else if (params.row[lane] >= rows) {
       continue;
+    }
     if (cutoff->end.empty())
       throw std::invalid_argument("a thinking cutoff has no end");
     if (cutoff->waitsForMask) {
@@ -71,12 +80,12 @@ ThinkingCutoffs thinkingCutoffs(std::span<const SamplingPolicy> policies, uint32
       params.waiting_mask |= uint32_t{1} << lane;
     }
     // The rows from the cutoff's on take as many of its end as they hold.
-    params.count[lane] = static_cast<uint32_t>(std::min<size_t>(cutoff->end.size(), rows - cutoff->row));
+    params.count[lane] = static_cast<uint32_t>(std::min<size_t>(cutoff->end.size(), cutoff->markers.empty() ? rows - cutoff->row : rows));
     std::copy_n(cutoff->end.begin(), params.count[lane], params.tokens[lane]);
     params.close[lane] = cutoff->end.back();
     params.also_ends[lane] = cutoff->alsoEnds;
     cutoffs.cutLanes = lane + 1;
-    if (cutoff->replacedProposals())
+    if (cutoff->replacedProposals(draftedRows))
       cutoffs.draftingLanes = lane + 1;
   }
   return cutoffs;
@@ -340,6 +349,9 @@ void Sampling::addSelection(metal::CommandGraph &graph, const TargetSamplingPara
   graph.add("decode_sample_thinking_cutoff",
             {buffers.inputTokens, buffers.constraintMasks, buffers.outputTokens, buffers.vocabularyRows},
             cutoffs.params, {lanes, 1, 1}, {1, 1, 1});
+  for (uint32_t lane = 0; lane < kMaximumLanes; ++lane)
+      graph.bytes(5 + lane, lane < policies.size() && policies[lane].thinkingCutoff
+                                ? policies[lane].thinkingCutoff->markers : std::span<const uint32_t>{});
 }
 
 void Sampling::addThinkingDrafts(metal::CommandGraph &graph, std::span<const SamplingPolicy> policies,

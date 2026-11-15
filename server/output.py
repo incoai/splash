@@ -1,6 +1,7 @@
 """Incremental model-output parsing, output blocks and final answer
 validation."""
 
+import json
 import re
 from dataclasses import dataclass
 
@@ -8,7 +9,7 @@ from jsonschema.exceptions import ValidationError
 from referencing.exceptions import Unresolvable
 
 from . import json_codec
-from .chat_format import THINK_END, THINK_START, TOOL_CALL_CLOSE
+from .chat_format import THINK_END, THINK_START, TOOL_CALL_CLOSE, TOOL_CALL_OPEN
 from .errors import APIError
 from .schema_validation import SchemaEvaluationError
 from .tool_schema import (
@@ -116,9 +117,11 @@ class ReasoningSplitter:
         self.opening = (
             not thinking
             and chat_format is not None
-            and chat_format.think_start_id is not None
+            and chat_format.model_opens_reasoning
         )
         self.pending = ""
+        self.layout = chat_format.reasoning_separator if chat_format else ""
+        self.lead = False
         # Whether the newlines after </think>, which set the answer apart in
         # the chat template's layout of a turn, are still to be dropped.
         self.separator = False
@@ -127,6 +130,8 @@ class ReasoningSplitter:
             if tool_calls and chat_format.calls_end_reasoning
             else (THINK_END,)
         )
+        if self.layout:
+            self.ends = (self.layout + THINK_END, *self.ends)
 
     def put(self, text):
         if self.opening:
@@ -140,6 +145,12 @@ class ReasoningSplitter:
             if text.startswith(THINK_START):
                 self.reasoning = True
                 text = text[len(THINK_START) :]
+                self.lead = bool(self.layout)
+        if self.lead:
+            if not text:
+                return []
+            text = text.removeprefix(self.layout)
+            self.lead = False
         if not self.reasoning:
             return self._content(text)
         self.pending += text
@@ -152,11 +163,12 @@ class ReasoningSplitter:
             end, marker = min(ends)
             reasoning = self.pending[:end]
             content = self.pending[end:]
-            if marker == THINK_END:
-                content = content[len(THINK_END) :]
+            closing = marker.endswith(THINK_END)
+            if closing:
+                content = content[len(marker) :]
             self.pending = ""
             self.reasoning = False
-            self.separator = marker == THINK_END
+            self.separator = closing
             output = [("reasoning_content", reasoning)] if reasoning else []
             return output + self._content(content)
         ready, self.pending = hold_partial(self.pending, *self.ends)
@@ -164,8 +176,10 @@ class ReasoningSplitter:
 
     def _content(self, text):
         if self.separator:
-            text = text.lstrip("\n")
             if not text:
+                return []
+            text = text.removeprefix(self.layout) if self.layout else text.lstrip("\n")
+            if not self.layout and not text:
                 return []
             self.separator = False
         return [("content", text)]
@@ -264,7 +278,13 @@ class StreamingToolCallProjector:
         # The layout its calls are read in, which a tool policy needs.
         self.syntax = syntax
         self.text_tags = (
-            (syntax.call_open, THINK_END) if policy is not None else (THINK_END,)
+            (
+                ("\n" + TOOL_CALL_OPEN, TOOL_CALL_OPEN, THINK_END)
+                if syntax.json_arguments
+                else (syntax.call_open, THINK_END)
+            )
+            if policy is not None
+            else (THINK_END,)
         )
         self.pending = ""
         self.state = "output" if structured else "content"
@@ -483,7 +503,85 @@ class StreamingToolCallProjector:
                 self.pending = self.pending[start + len(tag) :]
                 if tag != THINK_END:
                     # A call's opening, the other tag.
-                    self.state = "name"
+                    self.state = "json_name" if syntax.json_arguments else "name"
+                continue
+            if self.state == "json_name":
+                # The envelope is JSON: whitespace and escaped names do not
+                # change its meaning. Start streaming once its argument
+                # value begins; other key orders are decoded as a whole.
+                match = re.match(
+                    r'\s*\{\s*"name"\s*:\s*("(?:[^"\\]|\\.)*")\s*,\s*"arguments"\s*:\s*',
+                    self.pending,
+                )
+                if match:
+                    name = json_codec.loads(match[1])
+                    self.pending = self.pending[match.end() :]
+                    self._begin_call(name, events)
+                    self.state = "json_arguments"
+                    self.json_depth = 0
+                    self.json_string = False
+                    self.json_escape = False
+                    self.json_started = False
+                    continue
+                try:
+                    text = self.pending.lstrip()
+                    _, end = json.JSONDecoder().raw_decode(text)
+                    envelope = json_codec.loads(text[:end])
+                except ValueError:
+                    break
+                if (
+                    not isinstance(envelope, dict)
+                    or not isinstance(envelope.get("name"), str)
+                    or "arguments" not in envelope
+                ):
+                    break
+                self._begin_call(envelope["name"], events)
+                self._put_json_arguments(
+                    json_codec.dumps(envelope["arguments"]), events
+                )
+                self.pending = text[end:]
+                self._finish_call(events)
+                self.state = "closing"
+                continue
+            if self.state == "json_arguments":
+                end = None
+                for index, char in enumerate(self.pending):
+                    if self.json_string:
+                        if self.json_escape:
+                            self.json_escape = False
+                        elif char == "\\":
+                            self.json_escape = True
+                        elif char == '"':
+                            self.json_string = False
+                    elif char == '"':
+                        self.json_string = True
+                    elif char in "{[":
+                        self.json_depth += 1
+                        self.json_started = True
+                    elif char in "}]":
+                        self.json_depth -= 1
+                    if (
+                        self.json_started
+                        and not self.json_string
+                        and self.json_depth == 0
+                    ):
+                        end = index + 1
+                        break
+                if end is None:
+                    self._put_json_arguments(self.pending, events)
+                    self.pending = ""
+                    break
+                self._put_json_arguments(self.pending[:end], events)
+                self.pending = self.pending[end:]
+                self._finish_call(events)
+                self.state = "json_end"
+                continue
+            if self.state == "json_end":
+                self.pending = self.pending.lstrip()
+                if not self.pending:
+                    break
+                self.pending = self.pending.removeprefix("}")
+                self.state = "closing"
                 continue
             if self.state == "name":
                 # The character that ends the name stays: the arguments drop
@@ -493,31 +591,6 @@ class StreamingToolCallProjector:
                 self._begin_call(name, events)
                 continue
             if self.state == "arguments":
-                if syntax.json_arguments:
-                    # The arguments are one JSON value, streamed as it is
-                    # written, up to the arguments' close; the name's close
-                    # sits before it, and the call's close tag after it, which
-                    # the closing state consumes.
-                    if not self.arguments_started:
-                        if syntax.name_close.startswith(self.pending):
-                            break  # the name's close is still arriving
-                        self.pending = self.pending.removeprefix(
-                            syntax.name_close
-                        )
-                        self.arguments_started = True
-                    start, tag = self._next_tag(syntax.arguments_close)
-                    if tag is None:
-                        held = hold_partial(self.pending, syntax.arguments_close)[1]
-                        self._put_json_arguments(
-                            self.pending[: len(self.pending) - len(held)], events
-                        )
-                        self.pending = held
-                        break
-                    self._put_json_arguments(self.pending[:start], events)
-                    self.pending = self.pending[start + len(tag) :]
-                    self._finish_call(events)
-                    self.state = "closing"
-                    continue
                 # Text between parameters is dropped, but for a tag it may
                 # begin.
                 tags = syntax.argument_tags
@@ -572,7 +645,15 @@ class StreamingToolCallProjector:
     @property
     def in_call(self):
         """Whether the output so far ends inside a call, past its opening."""
-        return self.state in ("name", "arguments", "parameter", "value")
+        return self.state in (
+            "name",
+            "arguments",
+            "parameter",
+            "value",
+            "json_name",
+            "json_arguments",
+            "json_end",
+        )
 
     def finish(self, incomplete):
         """The content and calls of the output, and the events the stream
@@ -601,7 +682,7 @@ class StreamingToolCallProjector:
             if self.state in ("arguments", "parameter"):
                 self.pending = ""
                 self._finish_call(events)
-        if self.state == "closing":
+        if self.state in ("closing", "json_end"):
             self.pending = ""
             self.state = "content"
         if (

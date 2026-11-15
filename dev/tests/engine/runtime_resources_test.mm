@@ -138,7 +138,7 @@ uint64_t residentAllowanceBytes(const RuntimeResourcesConfig &config) {
   kv::Layout layout = config.model.targetKvLayout;
   layout.format = config.kvFormat;
   const uint64_t tokens = std::min<uint64_t>(config.model.capabilities.maximumContextTokens, 65'536) +
-                          model::ExecutionLimits::speculativeScratchTokens;
+                          config.model.draft.rows - 1;
   const uint64_t pages = (tokens + kv::kPageTokens - 1) / kv::kPageTokens;
   uint64_t budget = pages;
   while (kvCapacityPagesFor(layout, budget) < pages) ++budget;
@@ -428,6 +428,15 @@ void testPersistentCacheNamespace() {
               persistentCacheNamespace(identity('a', "build", kv::Format::Int8), states) != name &&
               persistentCacheNamespace(identity('a', "build", kv::Format::Int8), bfloatStates) != name,
           "other models, layouts or state formats shared a cache namespace");
+  auto widerDraft = model.stateLayout, mixedDraft = model.stateLayout, unrotatedDraft = model.stateLayout;
+  widerDraft.draft.window *= 2;
+  mixedDraft.draft.slidingWindow = 1024;
+  mixedDraft.draft.fullAttentionLayers.set(1, true);
+  unrotatedDraft.draft.unrotatedLayers.set(1, true);
+  require(persistentCacheNamespace(identity('a', "build", kv::Format::Int8), widerDraft) != name &&
+              persistentCacheNamespace(identity('a', "build", kv::Format::Int8), mixedDraft) != name &&
+              persistentCacheNamespace(identity('a', "build", kv::Format::Int8), unrotatedDraft) != name,
+          "different draft windows or positional encodings shared a persistent cache");
   // A dense layout's namespace is the one main (be3b083c) names, with FP32
   // and BF16 states: a change of its lines would leave every 27B's and 35B's
   // persistent cache cold.

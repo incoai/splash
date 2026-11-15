@@ -1,5 +1,6 @@
 #pragma once
 
+#include "TokenAutomaton.hpp"
 #include "metal/abi/ExecutionGeometry.h"
 #include "ops/PagedKv.hpp"
 #include "ops/Vision.hpp"
@@ -120,12 +121,18 @@ struct ThinkingBudget final {
   uint32_t tokens = 0;
   std::vector<uint32_t> end;
   uint32_t alsoEnds = 0;
+  std::vector<uint32_t> markers{};
 
   // Why the target cannot end thinking with this budget: no end tokens, or
   // one before the last that would end thinking itself. Null when it can.
-  [[nodiscard]] const char *unusable() const noexcept {
+  [[nodiscard]] const char *unusable(uint32_t vocabulary = 0xffffffffu) const noexcept {
     if (end.empty())
       return "a thinking budget needs end tokens";
+    if (end.size() > 64) return "thinking end token count must be in [1, 64]";
+    if (alsoEnds >= vocabulary || std::any_of(end.begin(), end.end(), [=](uint32_t token) { return token >= vocabulary; }))
+      return "thinking end token is out of vocabulary";
+    if (!markers.empty())
+      return TokenAutomaton(markers).valid(vocabulary) ? nullptr : "invalid thinking marker automaton";
     if (std::any_of(end.begin(), end.end() - 1,
                     [&](uint32_t token) { return token == end.back() || token == alsoEnds; }))
       return "only the last thinking end token may end thinking";
@@ -626,7 +633,7 @@ struct ExecutionLimits final {
   static constexpr uint32_t draftContextTokens = SPLASH_DRAFT_SLIDING_WINDOW;
   // The longest ring the compiled draft variants keep (metal/abi/DraftAttention.h):
   // correctness reads a model's draft layout's window, engine sizing this.
-  static constexpr uint32_t draftWindowLimit = 4096;
+  static constexpr uint32_t draftWindowLimit = 16384;
   // The most target layers a DFlash2 draft reads (its target_layer_ids).
   static constexpr uint32_t maximumDraftTargetLayers = 8;
   static constexpr uint32_t speculativeScratchTokens = SPLASH_SPECULATIVE_SCRATCH_TOKENS;

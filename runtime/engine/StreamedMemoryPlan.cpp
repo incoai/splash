@@ -25,7 +25,7 @@ constexpr uint32_t kSpillWindowPages = 64;
 uint64_t pagesOf(uint64_t tokens) noexcept { return (tokens + kv::kPageTokens - 1) / kv::kPageTokens; }
 
 // The KV of a context of `tokens` tokens holds its speculative rows too.
-uint64_t kvTokens(uint64_t tokens) noexcept { return tokens + model::ExecutionLimits::speculativeScratchTokens; }
+uint64_t kvTokens(uint64_t tokens, uint32_t speculative) noexcept { return tokens + speculative; }
 
 // `pages` pages of `pageBytes` bytes in whole extents of whichever size a
 // pool of `layout` takes (kv::Layout::mostOverExtents): the plan is made
@@ -95,10 +95,10 @@ struct SpillFloors final {
   uint64_t indexRunwayBytes = 0;
 
   [[nodiscard]] uint64_t stagingBytes(uint64_t tokens, uint32_t buffers) const {
-    return buffers * extentsBytes(in.kvLayout, pagesOf(kvTokens(tokens)), in.kvLayout.bytesPerLayerPage());
+    return buffers * extentsBytes(in.kvLayout, pagesOf(kvTokens(tokens, in.speculativeTokens)), in.kvLayout.bytesPerLayerPage());
   }
   [[nodiscard]] uint64_t bytes(uint64_t tokens, uint32_t buffers) const {
-    return geometry.spillFloorBytes(kvTokens(tokens)) + indexRunwayBytes +
+    return geometry.spillFloorBytes(kvTokens(tokens, in.speculativeTokens)) + indexRunwayBytes +
            readerTableBytes(in, hotFloorBytes, buffers) + std::max(stagingBytes(tokens, buffers), hotFloorBytes);
   }
 };
@@ -259,7 +259,7 @@ StreamedMemoryResult planParts(const StreamedMemoryInputs &in, const Part &exper
     const uint64_t cap = std::min<uint64_t>(in.windowTokens, kResidentAllowanceTokens);
     const uint64_t requested = in.requestedContextTokens;
     const uint64_t tokens = !requested ? cap : spill.enabled ? std::min(cap, requested) : requested;
-    const uint64_t pages = pagesOf(kvTokens(tokens));
+    const uint64_t pages = pagesOf(kvTokens(tokens, in.speculativeTokens));
     uint64_t budget = pages;
     while (kvCapacityPagesFor(layout, budget) < pages) ++budget;
     // A windowed layout's KV beyond its lane's Full pages is Slim, in

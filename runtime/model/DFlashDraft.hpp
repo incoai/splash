@@ -95,13 +95,17 @@ struct DFlashDraftLayout final {
   uint32_t convolutionTaps = SPLASH_DRAFT_CONVOLUTION_TAPS;
   uint32_t rows = SPLASH_DRAFT_QUERY_ROWS;
   uint32_t candidates = SPLASH_DRAFT_CANDIDATES;
+  uint32_t slidingWindow = 0;
+  kv::LayerMask fullAttentionLayers{};
+  kv::LayerMask unrotatedLayers{};
   // The target layers whose output rows the draft reads, ascending: the
   // first targetLayerCount of targetLayers, targetHiddenSize() values a row.
   std::array<uint32_t, ExecutionLimits::maximumDraftTargetLayers> targetLayers{};
   uint32_t targetLayerCount = 0;
 
   [[nodiscard]] constexpr DraftStateLayout stateLayout() const noexcept {
-    return {layers, kvHeads, attentionHeadDimension, hiddenSize, window, rows};
+    return {layers, kvHeads, attentionHeadDimension, hiddenSize, window, rows, slidingWindow, fullAttentionLayers,
+            unrotatedLayers};
   }
   [[nodiscard]] constexpr std::span<const uint32_t> targetLayerIds() const noexcept {
     return {targetLayers.data(), targetLayerCount};
@@ -111,6 +115,12 @@ struct DFlashDraftLayout final {
   [[nodiscard]] constexpr ops::DraftAttentionShape attentionShape() const noexcept {
     return {hiddenSize, dynamicSize, qkvSize, attentionSize, queryHeads,
             kvHeads, attentionHeadDimension, window, convolutionTaps};
+  }
+  [[nodiscard]] constexpr ops::DraftAttentionShape attentionShape(uint32_t layer) const noexcept {
+    auto shape = attentionShape();
+    shape.window = stateLayout().layerWindow(layer);
+    shape.rotated = !unrotatedLayers.test(layer);
+    return shape;
   }
   // The key and value columns of the fused QKV projection, all the context
   // writers read.

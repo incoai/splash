@@ -51,6 +51,12 @@ An MLX target must declare `quantization` in `config.json` in formats it loads
 ([MLX targets](#mlx-targets)). Every start checks the configuration again.
 Remote Python code is not loaded.
 
+Ripple-65B-Preview loads from a GGUF through the same installer and native
+runtime. Its target uses sliding RoPE attention and full attention without
+RoPE, scaled embeddings, value mixing and clamped SwiGLU. Its serving context
+is capped at 1,048,576 tokens. Its model opens its own reasoning block; the
+shared APIs split reasoning and JSON tool calls and support thinking budgets.
+
 ```bash
 splash serve --model mlx-community/Qwen3.6-35B-A3B-4bit
 splash serve --model unsloth/Qwen3.6-35B-A3B-GGUF:UD-Q4_K_M
@@ -314,12 +320,15 @@ ascending, at most eight); its hidden size, vocabulary and mask token are its
 target's (Flint's vocabulary keeps no mask token: a Flint draft chooses one of
 its reserved special tokens, 150019 to 150143, as its
 `dflash_config.mask_token_id`, which the target's layout then holds,
-`QwenTargetDimensions::firstDraftMaskToken`), and its attention (32 query and
-8 KV heads of 128), selector (rank 256, 16 candidates) and 2048-token window are
-those the kernels are built for, and its block at least their 8 rows, of which a
-cycle drafts the first (the Qwen3.5-122B-A10B draft was trained to fill 16;
-`readDraftLayout` in `ModelDescriptor.mm`); the kernels take any hidden width of
-whole 16-channel convolution groups. A draft's rows after its anchor read the
+`QwenTargetDimensions::firstDraftMaskToken`). The usual compiled draft has
+32 query heads, 8 KV heads of dimension 128, a rank-256 selector with 16
+candidates and a 2048-token window. Ripple's compiled variant has 80 query
+heads, 32 selector candidates and a 16-row block: its four sliding layers
+retain 4096 RoPE positions, and its full layer retains 16384 positions without
+RoPE. The context window and KV rings follow each layer's attention shape.
+`readDraftLayout` in `ModelDescriptor.mm` validates the checkpoint against its
+variant; the kernels take any hidden width of whole 16-channel convolution
+groups. A draft's rows after its anchor read the
 target's token table row of the mask token, unless its release ships that
 token's BF16 embedding, which they read instead (`DFlashDraft::addMaskRows`):
 `mask_embedding.safetensors`, one tensor `mask_embedding` of the hidden size.
@@ -328,11 +337,13 @@ below what the fp16 block scales of Q8_0 and the K-quants hold, so its GGUFs
 read zeros there: on an M5 Max serving unsloth/Ornith-1.5-122B-GGUF:UD-Q4_K_XL
 with every row verified, its draft accepted 2.3 tokens a cycle on code
 without the embedding, 4.7 with it. Every family loads and runs its draft
-alike: a decode cycle drafts eight rows, the anchor and its
-seven proposals, and the target verifies their first rows, as many as the cycle
-chose for the lane (its verify rows, `ops::DraftSelector::addVerifyRows`), never
-more than the lane may still retain: the tokens its output budget leaves, at
-most all eight. A dense target verifies every row up to that limit: its
+alike: a decode cycle drafts its variant's block, the anchor followed by
+proposals, and the target verifies their first rows, as many as the cycle chose
+for the lane (its verify rows, `ops::DraftSelector::addVerifyRows`), never more
+than the lane may still retain. Most variants use eight rows; Ripple uses all
+16 in one target traversal, with projections batched across the whole block
+and attention using the shared prefill tiles. Its scheduler and memory plan
+reserve that same block size. A dense target verifies every row up to that limit: its
 projections read their weights once for all of a cycle's rows, so a row costs it
 little. Each row a MoE target verifies routes its own experts, which a rejected
 row reads for nothing (a Qwen3.8-Flash-Next cycle of one lane routes about 43

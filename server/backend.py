@@ -21,6 +21,7 @@ from .errors import APIError, ConstraintError
 from .latency import RequestLatency
 from .metrics import metrics_dict
 from .output import StopSearch
+from .token_markers import compile_markers
 from .tool_schema import ToolPolicy
 
 # Engine outcomes whose message the engine words from its own limits and
@@ -334,7 +335,7 @@ class CallbackStreamer:
             text += piece or ""
             lengths.append(len(text))
             if opened_at is None:
-                if THINK_START in text:
+                if text.startswith(THINK_START):
                     # The model opened its reasoning: the tokens that spelled
                     # the opener count with what came before it, none of it
                     # reasoning.
@@ -407,7 +408,9 @@ class NativeBackend:
         wire.FinishReason.CANCELLED: "cancelled",
     }
 
-    def __init__(self, runtime, tokenizer, request_logger, thinking_end=None):
+    def __init__(
+        self, runtime, tokenizer, request_logger, thinking_end=None, chat_format=None
+    ):
         self.runtime = runtime
         self.tokenizer = tokenizer
         self.request_logger = request_logger
@@ -415,6 +418,10 @@ class NativeBackend:
         # (thinking_end_tokens); None for the close of thinking alone, in
         # each job's chat format.
         self.thinking_end = thinking_end
+        if chat_format is not None and (
+            chat_format.tags_are_text or chat_format.model_opens_reasoning
+        ):
+            _ = self._thinking_markers
         self.active = {}
         self.closing = False
         self.lock = threading.RLock()
@@ -857,6 +864,13 @@ class NativeBackend:
             wire.request_fingerprint(frame),
         )
 
+    @functools.cached_property
+    def _thinking_markers(self):
+        end = self.thinking_end or tuple(
+            self.tokenizer.encode(THINK_END, add_special_tokens=False)
+        )
+        return compile_markers(self.tokenizer, THINK_START, THINK_END, end)
+
     def _thinking_budget(self, job):
         """The engine's cutoff of the thinking a job generates in, which it
         ends with the server's thinking end. The engine's thinking ends at its
@@ -868,11 +882,13 @@ class NativeBackend:
         if job.thinking_token_budget is None:
             return None
         chat_format = job.chat_format
-        if chat_format.tags_are_text:
-            # The engine cuts thinking at a token; the family's close is
-            # text, which the engine cannot see. The reasoning runs to the
-            # model's own close, and the budget's tokens still count.
-            return None
+        if chat_format.tags_are_text or chat_format.model_opens_reasoning:
+            end = self.thinking_end or tuple(
+                self.tokenizer.encode(THINK_END, add_special_tokens=False)
+            )
+            return wire.ThinkingBudget(
+                job.thinking_token_budget, end, 0, markers=self._thinking_markers
+            )
         return wire.ThinkingBudget(
             job.thinking_token_budget,
             self.thinking_end or (chat_format.think_end_id,),

@@ -1275,7 +1275,7 @@ std::vector<uint8_t> windowRows(const std::vector<uint8_t> &window, uint32_t wid
                                 uint64_t slots) {
   const uint64_t codeBytes = width / 2;
   const uint64_t groupBytes = uint64_t{width} / SPLASH_DRAFT_CONTEXT_GROUP * 4;
-  const uint64_t parameters = draft_context_codes_bytes(width, width);
+  const uint64_t parameters = draft_context_codes_bytes(width, slots);
   std::vector<uint8_t> rows;
   for (uint64_t position = boundary - std::min(boundary, slots); position < boundary; ++position) {
     const auto codes = window.begin() + static_cast<std::ptrdiff_t>((position % slots) * codeBytes);
@@ -1298,7 +1298,7 @@ uint64_t requireCapturedWindow(const std::vector<uint8_t> &captured, const std::
   const uint64_t codeBytes = width / 2;
   const uint64_t groupBytes = uint64_t{width} / SPLASH_DRAFT_CONTEXT_GROUP * 4;
   // Every slot's codes come first, then every slot's group parameters.
-  const uint64_t parameters = draft_context_codes_bytes(width, width);
+  const uint64_t parameters = draft_context_codes_bytes(width, window);
   uint64_t found = 0;
   for (uint64_t position = boundary - std::min(boundary, window); position < boundary; ++position) {
     const uint64_t slot = position % window;
@@ -1854,7 +1854,7 @@ void requirePrefillPassesMatchWhole(model::Runtime &executor, const kv::PageStor
       for (uint32_t option = 0; option < model::ExecutionLimits::maximumScoreOptions; ++option)
         request.scoreTokens.push_back(1000 + 37 * option);
       beginCold(executor, request, lane);
-      executor.setDraftContextPlan(ids[lane], planDraftContext(0, laneRows, laneCaptures[lane]));
+      executor.setDraftContextPlan(ids[lane], planDraftContext(0, laneRows, laneCaptures[lane], executor.draftWindow()));
       plan.items.push_back({ids[lane], laneRows});
       ModelBatchItem item = withRevision({ids[lane], 0, laneRows, lanePages[lane]});
       item.inputTokens = tokens.first(laneRows);
@@ -1899,7 +1899,7 @@ void requirePrefillPassesMatchWhole(model::Runtime &executor, const kv::PageStor
       run.lengths = states.metadata(lane).lengths;
       run.cell = bytesOf(states.current(lane).stateBase);
       run.rings = committedState(executor, states, lane).rings;
-      run.windowRows = windowRows(bytesOf(states.window(lane)), width, run.lengths.targetTokens);
+      run.windowRows = windowRows(bytesOf(states.window(lane)), width, run.lengths.targetTokens, executor.draftWindow());
     }
     for (const uint64_t id : ids)
       executor.end(id);
@@ -1907,7 +1907,7 @@ void requirePrefillPassesMatchWhole(model::Runtime &executor, const kv::PageStor
       for (size_t index = 0; index < laneCaptures[lane].size(); ++index) {
         const uint32_t boundary = laneCaptures[lane][index];
         StateBytes state = restoredBytes(executor, states, 560, 0, tokens, boundary, last[lane].capturedStates[index]);
-        state.window = windowRows(state.window, width, boundary);
+        state.window = windowRows(state.window, width, boundary, executor.draftWindow());
         runs[lane].captured.push_back(std::move(state));
       }
     return runs;

@@ -107,8 +107,10 @@ PAGED_PREFILL_SPLIT(prefill_attention_bf16_split_kv4_g8_d128_w512, 4, 8, 128, 51
 // Eight KV heads of 128 over ten query heads each, over the whole history and
 // over a window of the 1023 keys before each row (Ripple's, whose
 // sliding window of 1024 keys includes its own).
-PAGED_PREFILL_SPLIT(prefill_attention_q8_split_kv8_g10_d128, 8, 10, 128, 0, int8_t, true)
-PAGED_PREFILL_SPLIT(prefill_attention_q8_split_kv8_g10_d128_w1023, 8, 10, 128, 1023, int8_t, true)
+PAGED_PREFILL_SPLIT(prefill_attention_q8_split_kv8_g10_d128, 8, 10, 128, 0, int8_t, false)
+PAGED_PREFILL_SPLIT(prefill_attention_q8q_split_kv8_g10_d128, 8, 10, 128, 0, int8_t, true)
+PAGED_PREFILL_SPLIT(prefill_attention_q8q_split_kv8_g10_d128_w1023, 8, 10, 128, 1023, int8_t, true)
+PAGED_PREFILL_SPLIT(prefill_attention_q8_split_kv8_g10_d128_w1023, 8, 10, 128, 1023, int8_t, false)
 PAGED_PREFILL_SPLIT(prefill_attention_bf16_split_kv8_g10_d128, 8, 10, 128, 0, bfloat, false)
 PAGED_PREFILL_SPLIT(prefill_attention_bf16_split_kv8_g10_d128_w1023, 8, 10, 128, 1023, bfloat, false)
 #undef PAGED_PREFILL_SPLIT

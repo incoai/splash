@@ -1296,9 +1296,7 @@ def tool_grammar(policy, thinking, response_schema=None, *, chat_format):
         text_rule = r"TEXT: /(?s:.*)/"
     else:
         text_rule = (
-            r"TEXT: /(?s:.*)/ & ~/(?s:.*)("
-            + TOOL_CALL_OPEN
-            + r"|<\/think>)(?s:.*)/"
+            r"TEXT: /(?s:.*)/ & ~/(?s:.*)(" + TOOL_CALL_OPEN + r"|<\/think>)(?s:.*)/"
         )
     main.extend(
         [

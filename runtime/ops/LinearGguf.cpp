@@ -134,13 +134,13 @@ void LinearPlan::requireConfiguration() const {
   const bool decode = workload_.phase == LinearPhase::Decode;
   if (c.spread && c.tile != LinearTile::GgufStaged)
     throw std::invalid_argument("only the staged block tile spreads its walks");
-  if (c.oneGateUpPass && (c.tile != LinearTile::GgufStaged || !decode || workload_.epilogue != LinearEpilogue::GateUp))
+  if (c.oneGateUpPass && (c.tile != LinearTile::GgufStaged || !decode || (workload_.epilogue != LinearEpilogue::GateUp && workload_.epilogue != LinearEpilogue::ClampedGateUp)))
     throw std::invalid_argument("only a staged block gate/up decode runs gate and up in one pass");
   if (c.sixteenRows && (c.tile != LinearTile::GgufStaged || !decode || workload_.rows != SPLASH_TARGET_VERIFY_ROWS))
     throw std::invalid_argument("only a staged one-lane block decode runs the 16-row tile");
   if (c.decodeInt8 &&
-      (c.tile != LinearTile::GgufStaged || !decode || !decodeInt8TakesSplits(k, c.splits) || storageRows() < 16))
-    throw std::invalid_argument("only a staged block decode of 16 or 32 rows and whole PQ2_0 blocks per split runs "
+      (c.tile != LinearTile::GgufStaged || !decode || !decodeInt8TakesSplits(k, c.splits) || (storageRows() < 16 || storageRows() > 64)))
+    throw std::invalid_argument("only a staged block decode of 16 to 64 rows and whole PQ2_0 blocks per split runs "
                                 "int8 activations");
   if (c.tile == LinearTile::GgufRegister) {
     // Split boundaries fall on coefficient units, of 64 inputs at the fewest
@@ -300,7 +300,7 @@ void Linear::addGgufStaged(metal::CommandGraph &graph, const LinearBuffers &b,
                              plan.destination()),
               {b.input, s.plane0, s.plane1Slot(), s.meta, output, partials, counters, aux},
               GgufDecodeParams{k, splits, n, s.columnOffset, config.spread, b.clamp},
-              {s.outputSize / GGUF_TILE_COLUMNS, splits, 1}, {GGUF_STAGED_THREADS, 1, 1});
+              {s.outputSize / GGUF_TILE_COLUMNS, splits, 1}, {GGUF_STAGED_THREADS * (config.decodeInt8 ? gguf_int8_simdgroups(rows) : 1), 1, 1});
   };
   // A fused projection's segments in one dispatch (gguf_decode_fused_m*),
   // in tile order: segments with the most bytes per tile first, so their
@@ -322,11 +322,11 @@ void Linear::addGgufStaged(metal::CommandGraph &graph, const LinearBuffers &b,
       // The int8 tiles take segments of one format, each format a kernel of its own.
       graph.add(std::string("gguf_decode_int8_") + segments.front().name() + "_fused_m" + std::to_string(rows),
                 std::move(bindings), params, {segmentColumns(p) / GGUF_TILE_COLUMNS, splits, 1},
-                {GGUF_STAGED_THREADS, 1, 1});
+                {GGUF_STAGED_THREADS * (config.decodeInt8 ? gguf_int8_simdgroups(rows) : 1), 1, 1});
       return;
     }
     graph.add("gguf_decode_fused_m" + std::to_string(rows), std::move(bindings), params,
-              {segmentColumns(p) / GGUF_TILE_COLUMNS, splits, 1}, {GGUF_STAGED_THREADS, 1, 1});
+              {segmentColumns(p) / GGUF_TILE_COLUMNS, splits, 1}, {GGUF_STAGED_THREADS * (config.decodeInt8 ? gguf_int8_simdgroups(rows) : 1), 1, 1});
     // The pipeline decodes the segments' formats alone, each once in
     // ascending order and the last repeated to three, so projections of one
     // format set share it (gguf_linear.metal, fused_formats).
@@ -352,11 +352,12 @@ void Linear::addGgufStaged(metal::CommandGraph &graph, const LinearBuffers &b,
   }
   if (config.oneGateUpPass) {
     const auto [g, u] = onePassTensors(p, *gate);
-    graph.add(decodeKernel(config.decodeInt8, u.name(), rows, "gate_up"),
+    graph.add(decodeKernel(config.decodeInt8, u.name(), rows, w.epilogue == LinearEpilogue::ClampedGateUp ? "gate_up_clamped" : "gate_up"),
               {b.input, g.plane0, g.plane1Slot(), g.meta, u.plane0, u.plane1Slot(), u.meta, b.output, partials,
                counters},
               GgufDecodeParams{k, splits, n, u.columnOffset, config.spread, b.clamp},
-              {u.outputSize / GGUF_STAGED_COLUMNS, splits, 1}, {GGUF_GATE_UP_THREADS, 1, 1});
+              {u.outputSize / GGUF_STAGED_COLUMNS, splits, 1},
+              {GGUF_GATE_UP_THREADS * (config.decodeInt8 ? gguf_int8_gate_up_simdgroups(rows) : gguf_gate_up_simdgroups(rows)), 1, 1});
     return;
   }
   if (segments.size() == 1) {
@@ -448,7 +449,7 @@ void Linear::addGgufPrefillInt8(metal::CommandGraph &graph, const LinearBuffers 
               {b.scratch.input, b.scratch.sums, s.plane0, s.plane1Slot(), s.meta, b.output,
                epilogueInput(b, w.epilogue)},
               GgufPrefillInt8Params{k, w.rows, storage, n, s.columnOffset, p.planeInputs() ? p.planeInputs() : k,
-                                    columnTiles},
+                                    columnTiles, b.clamp},
               {GGUF_PREFILL_INT8_WALK, (columnTiles * rowTiles + GGUF_PREFILL_INT8_WALK - 1) / GGUF_PREFILL_INT8_WALK, 1},
               {GGUF_PREFILL_INT8_THREADS, 1, 1});
   }

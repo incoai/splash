@@ -5,6 +5,7 @@
 #include "metal/abi/ExecutionGeometry.h"
 #include "metal/abi/GDN.h"
 #include "ops/GDN.hpp"
+#include "ops/PagedKv.hpp"
 
 #include <algorithm>
 #include <array>
@@ -87,16 +88,25 @@ struct DraftStateLayout final {
   // The rows a draft cycle drafts and the target verifies (the compiled
   // draft variant's block; the ABI's 8 unless the variant states more).
   uint32_t rows = SPLASH_DRAFT_QUERY_ROWS;
+  uint32_t slidingWindow = 0;
+  kv::LayerMask fullAttentionLayers{};
+  kv::LayerMask unrotatedLayers{};
+
+  [[nodiscard]] constexpr uint32_t layerWindow(uint32_t layer) const noexcept {
+    return slidingWindow && !fullAttentionLayers.test(layer) ? slidingWindow : window;
+  }
 
   [[nodiscard]] constexpr bool valid() const noexcept {
     return layers && kvHeads && headDimension && contextWidth && window &&
            contextWidth % SPLASH_DRAFT_CONTEXT_GROUP == 0;
   }
-  [[nodiscard]] constexpr uint64_t tensorBytes() const noexcept {
-    return uint64_t{kvHeads} * window * headDimension * bfloat16Bytes;
+  [[nodiscard]] constexpr uint64_t tensorBytes(uint32_t layer = 0) const noexcept {
+    return uint64_t{kvHeads} * layerWindow(layer) * headDimension * bfloat16Bytes;
   }
   [[nodiscard]] constexpr uint64_t ringBytes() const noexcept {
-    return uint64_t{layers} * 2 * tensorBytes();
+    uint64_t bytes = 0;
+    for (uint32_t layer = 0; layer < layers; ++layer) bytes += 2 * tensorBytes(layer);
+    return bytes;
   }
   [[nodiscard]] constexpr uint64_t windowBytes() const noexcept {
     return draft_context_window_bytes(contextWidth, window);

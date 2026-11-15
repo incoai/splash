@@ -88,7 +88,9 @@ const SplashDraftVariant &draftVariant(const DraftAttentionShape &shape) {
         variant.query_heads * variant.head_dimension,
         variant.query_heads, variant.kv_heads, variant.head_dimension,
         variant.window, variant.convolution_taps};
-    if (shape == compiled)
+    auto dimensions = shape;
+    dimensions.rotated = true;
+    if (dimensions == compiled)
       return variant;
   }
   throw std::invalid_argument("unsupported compiled draft attention shape");
@@ -113,7 +115,7 @@ DraftAttentionPlan DraftAttention::plan(DraftAttentionShape shape,
                                         uint32_t lanes, uint32_t rows) {
   requireLanes(lanes);
   const SplashDraftVariant &variant = draftVariant(shape);
-  if (!rows || rows > SPLASH_DRAFT_BLOCK_ROWS_LIMIT)
+  if (rows != variant.rows)
     throw std::invalid_argument("invalid draft block rows");
   return {shape, variant, lanes, rows};
 }
@@ -170,7 +172,7 @@ void DraftAttention::addPrepare(metal::CommandGraph &graph,
   const uint64_t ropeBytes = uint64_t{lanes} * plan.rows() * SPLASH_DRAFT_ROPE_PAIRS * 4;
   requireBytes(buffers.ropeCos, ropeBytes, "draft RoPE cosine");
   requireBytes(buffers.ropeSin, ropeBytes, "draft RoPE sine");
-  graph.add(std::string("draft_attention_qkv") + plan.variant().suffix,
+  graph.add(std::string("draft_attention_qkv") + plan.variant().suffix + (shape.rotated ? "" : "_nope"),
             {std::move(buffers.qkv), std::move(buffers.groupedQueries),
              std::move(buffers.queryNorm), std::move(buffers.keyNorm),
              std::move(buffers.ropeCos), std::move(buffers.ropeSin),
@@ -243,7 +245,7 @@ void DraftAttention::addContextPrefill(
   requireBytes(keys, ringBytes(shape), "draft key ring");
   requireBytes(values, ringBytes(shape), "draft value ring");
   const DraftContextParams params{tokens, startPosition};
-  graph.add(std::string("prefill_draft_context_kv") + draftVariant(shape).suffix,
+  graph.add(std::string("prefill_draft_context_kv") + draftVariant(shape).suffix + (shape.rotated ? "" : "_nope"),
             {std::move(contextKv), std::move(keyNorm), std::move(ropeCos),
              std::move(ropeSin), std::move(keys), std::move(values)},
             params, {uint64_t{tokens} * shape.kvHeads, 1, 1});
@@ -281,7 +283,7 @@ void DraftAttention::addContextCommit(
   bindings.reserve(2 * kMaximumLanes + 5);
   appendLaneBindings(bindings, persistentKeys, persistentValues);
   bindings.push_back(std::move(retainedCounts));
-  graph.add(std::string("draft_context_kv_commit") + draftVariant(shape).suffix,
+  graph.add(std::string("draft_context_kv_commit") + draftVariant(shape).suffix + (shape.rotated ? "" : "_nope"),
             std::move(bindings), params,
             {uint64_t{lanes} * rows * shape.kvHeads, 1, 1});
 }

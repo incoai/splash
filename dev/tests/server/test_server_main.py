@@ -28,6 +28,7 @@ from server import backend as backend_api
 from server import diagnostics
 from server import protocol as native_wire
 from server import server as api
+from server.chat_format import QWEN
 from server.origins import ANY_ORIGIN
 
 # The goldens the app reads the server's records by.
@@ -121,6 +122,7 @@ class ServerMainTests(unittest.TestCase):
             tokenizer,
             request_logger=diagnostics.print_request,
             thinking_end=None,
+            chat_format=QWEN,
         )
         # No --request-timeout, no deadline.
         self.assertEqual(app_type.call_args.args[3], math.inf)

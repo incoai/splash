@@ -166,11 +166,14 @@ struct ThinkingCutoffParams {
   // The token that closes thinking, the last of the lane's end.
   uint32_t close[SPLASH_MAXIMUM_BATCH_WIDTH];
   uint32_t also_ends[SPLASH_MAXIMUM_BATCH_WIDTH];
-  uint32_t tokens[SPLASH_MAXIMUM_BATCH_WIDTH][SPLASH_TARGET_VERIFY_ROWS];
+  uint32_t tokens[SPLASH_MAXIMUM_BATCH_WIDTH][SPLASH_DRAFT_BLOCK_ROWS_LIMIT];
+  uint32_t automaton_mask;
+  uint32_t marker_state[SPLASH_MAXIMUM_BATCH_WIDTH];
+  uint32_t opened_mask;
 };
 
-static_assert(sizeof(ThinkingCutoffParams) == 224,
-              "Thinking cutoff parameters are 220 bytes on both sides");
+static_assert(sizeof(ThinkingCutoffParams) == 376,
+              "Thinking cutoff parameters are 376 bytes on both sides");
 
 // The batched selector and acceptance kernels' grids cover exactly the
 // dispatch's lanes: per-lane arrays hold those lanes, and entries past them

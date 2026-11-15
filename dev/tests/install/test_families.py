@@ -32,8 +32,6 @@ UNUSABLE = {
         "--disable-ane",
         "--max-image-pixels",
         "--default-reasoning-effort",
-        "--thinking-token-budget",
-        "--thinking-end-text",
     },
     # Ripple decides its reasoning per turn; a thinking budget the server
     # reads through the decoded stream, the efforts its template leaves to
@@ -46,6 +44,7 @@ UNUSABLE = {
         "--ple-memory",
         "--sparse-kv-memory",
         "--verify-rows",
+        "--default-reasoning-effort",
         "--max-image-pixels",
     },
 }
@@ -70,13 +69,17 @@ class OptionReportTests(unittest.TestCase):
                 for name, family in report.items()
             },
             {
-                name: (262144, 262144 if name in ("Flint", "Ripple-65B") else 1010000)
+                name: (
+                    (1048576, 1048576)
+                    if name == "Ripple-65B"
+                    else (262144, 262144 if name == "Flint" else 1010000)
+                )
                 for name in UNUSABLE
             },
         )
         # --max-context takes at most the most context any family serves.
         self.assertEqual(
-            serve_options.MAX_YARN_CONTEXT_TOKENS,
+            serve_options.MAX_CONTEXT_TOKENS,
             max(facts["max_context_tokens"] for facts in engine_facts.values()),
         )
 

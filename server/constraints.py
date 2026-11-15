@@ -11,9 +11,9 @@ from llguidance.numpy import (
     fill_next_token_bitmask_par_with_draft_tokens,
 )
 
+from . import runtime as engine_runtime
 from .chat_format import THINK_END, THINK_START, TOOL_CALL_OPEN
 from .errors import APIError, ConstraintError
-from . import runtime as engine_runtime
 from .lru import LRUCache
 
 
@@ -129,10 +129,11 @@ def validate_tokenizer(tokenizer, chat_format):
             # the output's decoding matches: the tokenizer must encode it and
             # decode it back unchanged, so that a match in the decoded stream
             # is the tag the template wrote.
-            encoded = tokenizer(token, add_special_tokens=False)['input_ids']
-            if not encoded or tokenizer.decode(
-                encoded, skip_special_tokens=True
-            ) != token:
+            encoded = tokenizer(token, add_special_tokens=False)["input_ids"]
+            if (
+                not encoded
+                or tokenizer.decode(encoded, skip_special_tokens=True) != token
+            ):
                 raise engine_runtime.EngineUnhealthy(
                     f"tokenizer must encode {token!r} and decode it back as text"
                 )

@@ -103,16 +103,31 @@ void RippleTarget::addPrefillMixer(PrefillStep &step, const QwenAttentionWeights
         step.spilled.prefill(step.graph, layer, sequence.lane, firstPage,
                              kv::chunkedPrefillRequiredPages(sequence.chunk) - firstPage,
                              {sequence.pageTable, step.kvLayers[layer]});
-    ops::PagedAttention::addPrefill(step.graph, attended.kv, queries, attentionRows, b.attentionPartials,
+    if (step.readRows.empty()) {
+      ops::PagedAttention::addPrefill(step.graph, attended.kv, queries, attentionRows, b.attentionPartials,
                                     b.attentionStatistics, attended.table, sequence.chunk, plans[index],
                                     ops::AttentionBlocks{}, mixer.sinks);
-    ops::PagedAttention::addPrefillGate(
-        step.graph, u16Rows(b.fullPacked, sequence, geometry_.packedFullWidth), attentionRows,
-        u16Rows(b.attentionHidden, sequence, geometry_.attentionWidth), sequence.rows, sequence.attentionStride,
+      ops::PagedAttention::addPrefillGate(
+          step.graph, u16Rows(b.fullPacked, sequence, geometry_.packedFullWidth), attentionRows,
+          u16Rows(b.attentionHidden, sequence, geometry_.attentionWidth), sequence.rows, sequence.attentionStride,
         geometry_.attentionQueryHeads, geometry_.kvLayout);
+      continue;
+    }
+    const uint32_t last = sequence.rows - 1;
+    const auto tail = ops::PagedAttention::prefillTail(plans[index], last);
+    const auto from = [&](const metal::MetalBuffer &buffer, uint32_t row) {
+      return backend_.view(buffer, tail.offsetBytes(row), queryBytes - tail.offsetBytes(row));
+    };
+    ops::PagedAttention::addPrefill(step.graph, attended.kv, from(queries, tail.first),
+                                   from(attentionRows, tail.first), b.attentionPartials, b.attentionStatistics,
+                                   attended.table, tail.chunk(sequence.chunk), tail.plan, {}, mixer.sinks);
+    ops::PagedAttention::addPrefillGate(
+        step.graph, rowsOf<uint16_t>(b.fullPacked, sequence.rowBegin + last, 1, geometry_.packedFullWidth),
+        from(attentionRows, last), rowsOf<uint16_t>(b.attentionHidden, index, 1, geometry_.attentionWidth),
+        1, sequence.attentionStride, geometry_.attentionQueryHeads, geometry_.kvLayout);
   }
-  linear.addPrefill(step.graph, b.attentionHidden, mixer.outputProjection, b.attentionOutput, step.rows,
-                    b.linearScratch);
+  linear.addPrefill(step.graph, b.attentionHidden, mixer.outputProjection, b.attentionOutput, step.outputRows(),
+                    b.linearScratch, step.rows);
 }
 
 // The verify mixers, whose fused and value projections run per lane batch
@@ -121,11 +136,11 @@ void RippleTarget::addVerifyProjectionPair(VerifyStep &step, const QwenAttention
                                            const metal::MetalBuffer &lambda, ops::PreparedInput normalized) const {
   const QwenTargetVerifyBuffers &b = step.buffers;
   addDecodeProjection(step.graph, b.normalized, mixer.inputProjection, b.fullPacked, step.lanes,
-                      b.linearScratch, std::move(normalized));
+                      b.linearScratch, std::move(normalized), step.rows);
   ops::ValueMix::add(step.graph, b.normalized, embedRows_, lambda, b.denseIntermediate, step.rows,
                      geometry_.hiddenSize);
   addDecodeProjection(step.graph, b.denseIntermediate, mixer.valueProjection, b.fullPacked, step.lanes,
-                      b.linearScratch);
+                      b.linearScratch, {}, step.rows);
 }
 
 void RippleTarget::addVerifyMixer(VerifyStep &step, const QwenAttentionWeights &mixer,
@@ -135,25 +150,41 @@ void RippleTarget::addVerifyMixer(VerifyStep &step, const QwenAttentionWeights &
   const uint32_t layer = step.attentionLayer++;
   const ops::AttentionVariant variant = geometry_.attentionVariant(layer);
   addVerifyProjectionPair(step, mixer, lambda, std::move(normalized));
-  ops::PagedAttention::addVerifyProjection(step.graph, b.fullPacked, mixer.queryNorm, mixer.keyNorm, b.ropeCos,
-                                           b.ropeSin, b.fullQueries, b.chunkKeys[layer], b.chunkValues[layer],
-                                           geometry_.attentionQueryHeads, geometry_.kvLayout, step.lanes, variant);
-  ops::AttentionBlocks attended;
-  if (step.spilled.active()) attended = step.spilled.verify(step.graph, layer, ops::AttentionBlocks{});
-  ops::PagedAttention::addVerify(step.graph, step.kvLayers[layer],
-                                 {b.chunkKeys[layer], b.chunkValues[layer], b.fullQueries, b.attentionPartials,
-                                  b.attentionStatistics, b.fullAttention, b.pageTables, mixer.sinks},
-                                 step.chunks, variant.windowTokens ? *step.windowedAttention : step.attention,
-                                 attended);
+  const uint32_t rows = step.rows / step.lanes;
+  const uint32_t stride = kv::kVerifyChunkStride;
+  const uint64_t queryBytes = uint64_t{stride} * geometry_.attentionWidth * sizeof(uint16_t);
+  const uint64_t kvBytes = uint64_t{stride} * geometry_.attentionKvHeads *
+                           geometry_.attentionHeadDimension * sizeof(uint16_t);
+  const auto laneRows = [&](metal::MetalBuffer buffer, uint32_t lane, uint32_t width, uint32_t bytes) {
+    const uint64_t extent = uint64_t{rows} * width * bytes;
+    return backend_.view(buffer, lane * extent, extent);
+  };
+  for (uint32_t lane = 0; lane < step.lanes; ++lane) {
+    const auto packed = laneRows(b.fullPacked, lane, geometry_.packedFullWidth, 2);
+    const auto queries = backend_.view(b.fullQueries, lane * queryBytes, queryBytes);
+    const auto attended = backend_.view(b.fullAttention, lane * queryBytes, queryBytes);
+    const auto keys = backend_.view(b.chunkKeys[layer], lane * kvBytes, kvBytes);
+    const auto values = backend_.view(b.chunkValues[layer], lane * kvBytes, kvBytes);
+    ops::PagedAttention::addPrefillProjection(
+        step.graph, packed, mixer.queryNorm, mixer.keyNorm,
+        laneRows(b.ropeCos, lane, geometry_.rotaryPairs, 4),
+        laneRows(b.ropeSin, lane, geometry_.rotaryPairs, 4), queries, keys, values,
+        rows, stride, geometry_.attentionQueryHeads, geometry_.kvLayout, variant);
+    ops::PagedAttention::addPrefillStore(step.graph, step.kvLayers[layer], keys, values,
+                                        b.pageTables[lane], step.chunks[lane], geometry_.kvLayout);
+    const auto plan = operators_.prefillAttention(rows, step.chunks[lane].committed_tokens,
+                                                 geometry_.attentionQueryHeads, geometry_.kvLayout, variant);
+    ops::PagedAttention::addPrefill(step.graph, step.kvLayers[layer], queries, attended,
+                                   b.attentionPartials, b.attentionStatistics, b.pageTables[lane],
+                                   step.chunks[lane], plan, {}, mixer.sinks);
+    ops::PagedAttention::addPrefillGate(step.graph, packed, attended,
+                                       laneRows(b.attentionHidden, lane, geometry_.attentionWidth, 2),
+                                       rows, stride, geometry_.attentionQueryHeads, geometry_.kvLayout);
+  }
   const ops::Linear &linear = operators_.linear();
-  const ops::LinearPlan outputPlan = linear.decodePlan(mixer.outputProjection, step.lanes);
-  const ops::PreparedInput hidden = ops::PagedAttention::addVerifyGate(
-      step.graph, b.fullPacked, b.fullAttention, b.attentionHidden, geometry_.attentionQueryHeads,
-      geometry_.kvLayout, step.lanes, b.linearScratch, outputPlan.input());
-  linear.add(step.graph,
-             {.input = b.attentionHidden, .output = std::move(output.rows), .scratch = b.linearScratch,
-              .prepared = hidden},
-             mixer.outputProjection, outputPlan);
+  linear.add(step.graph, {.input = b.attentionHidden, .output = std::move(output.rows),
+                          .scratch = b.linearScratch}, mixer.outputProjection,
+             linear.decodePlan(mixer.outputProjection, step.lanes, ops::LinearEpilogue::None, nullptr, step.rows));
 }
 
 // A block's dense SwiGLU, whose gate and up activations clamp at the
@@ -165,15 +196,18 @@ void RippleTarget::addPrefillFfn(PrefillStep &step, const RippleLayerWeights &la
                                  metal::MetalBuffer output) const {
   const QwenTargetPrefillBuffers &b = step.buffers;
   const ops::Linear &linear = operators_.linear();
-  ops::Normalization::addRms(step.graph, ffnIn, layer.ffnNorm, b.normalized, geometry_.hiddenSize, step.rows);
-  linear.addPrefill(step.graph, b.normalized, layer.ffn.gate, b.denseGateScratch, step.rows, b.linearScratch);
+  ops::Normalization::addRms(step.graph, ffnIn, layer.ffnNorm, b.normalized, geometry_.hiddenSize, step.outputRows());
+  const auto prepared = linear.add(step.graph,
+      {.input = b.normalized, .output = b.denseGateScratch, .scratch = b.linearScratch},
+      layer.ffn.gate, linear.prefillPlan(layer.ffn.gate, step.outputRows(), ops::LinearEpilogue::None, step.rows));
   linear.add(step.graph,
              {.input = b.normalized, .output = b.denseIntermediate, .gateScratch = b.denseGateScratch,
-              .scratch = b.linearScratch, .clamp = geometry_.swigluClamp},
-             layer.ffn.up, linear.prefillPlan(layer.ffn.up, step.rows, ops::LinearEpilogue::ClampedUpWithGate));
-  linear.addPrefill(step.graph, b.denseIntermediate, layer.ffn.down, output, step.rows, b.linearScratch);
-  ops::Normalization::addRms(step.graph, output, layer.postFfnNorm, b.normalized, geometry_.hiddenSize, step.rows);
-  ops::ValueMix::sum(step.graph, b.normalized, ffnIn, output, step.rows, geometry_.hiddenSize);
+              .scratch = b.linearScratch, .prepared = prepared, .clamp = geometry_.swigluClamp},
+             layer.ffn.up, linear.prefillPlan(layer.ffn.up, step.outputRows(),
+                                             ops::LinearEpilogue::ClampedUpWithGate, step.rows));
+  linear.addPrefill(step.graph, b.denseIntermediate, layer.ffn.down, output, step.outputRows(), b.linearScratch, step.rows);
+  ops::Normalization::addRms(step.graph, output, layer.postFfnNorm, b.normalized, geometry_.hiddenSize, step.outputRows());
+  ops::ValueMix::sum(step.graph, b.normalized, ffnIn, output, step.outputRows(), geometry_.hiddenSize);
 }
 
 void RippleTarget::addVerifyFfn(VerifyStep &step, const RippleLayerWeights &layer, metal::MetalBuffer ffnIn,
@@ -181,7 +215,7 @@ void RippleTarget::addVerifyFfn(VerifyStep &step, const RippleLayerWeights &laye
   const QwenTargetVerifyBuffers &b = step.buffers;
   const ops::Linear &linear = operators_.linear();
   const ops::LinearPlan gateUpPlan =
-      linear.decodePlan(layer.ffn.up, step.lanes, ops::LinearEpilogue::ClampedGateUp, &layer.ffn.gate);
+      linear.decodePlan(layer.ffn.up, step.lanes, ops::LinearEpilogue::ClampedGateUp, &layer.ffn.gate, step.rows);
   const ops::PreparedInput normalized =
       ops::Normalization::addRms(step.graph, ffnIn, layer.ffnNorm, b.normalized, geometry_.hiddenSize, step.rows,
                                  b.linearScratch, gateUpPlan.input());
@@ -190,7 +224,7 @@ void RippleTarget::addVerifyFfn(VerifyStep &step, const RippleLayerWeights &laye
               .scratch = b.linearScratch, .prepared = normalized, .clamp = geometry_.swigluClamp},
              layer.ffn.up, gateUpPlan, &layer.ffn.gate);
   linear.add(step.graph, {.input = b.denseIntermediate, .output = output, .scratch = b.linearScratch},
-             layer.ffn.down, linear.decodePlan(layer.ffn.down, step.lanes));
+             layer.ffn.down, linear.decodePlan(layer.ffn.down, step.lanes, ops::LinearEpilogue::None, nullptr, step.rows));
   ops::Normalization::addRms(step.graph, output, layer.postFfnNorm, b.normalized, geometry_.hiddenSize, step.rows);
   ops::ValueMix::sum(step.graph, b.normalized, ffnIn, output, step.rows, geometry_.hiddenSize);
 }
@@ -198,6 +232,7 @@ void RippleTarget::addVerifyFfn(VerifyStep &step, const RippleLayerWeights &laye
 // The geometry of a Ripple target's projections: its dense FFNs' gate and up
 // run as one gate/up plan each, and its layers keep no MoE blocks.
 void includeFamilyProjections(QwenTargetGeometry &geometry, const RippleWeights &weights) {
+  geometry.verifyRows = SPLASH_DRAFT_BLOCK_ROWS_LIMIT;
   for (const RippleLayerWeights &layer : weights.layers)
     includeDenseFfn(geometry, layer.ffn.projections());
 }
@@ -211,8 +246,6 @@ RippleTarget::RippleTarget(const RippleWeights &weights, const QwenTargetGeometr
   // The family's SwiGLU clamp, one F32 the clamped FFN epilogues read.
   if (!(geometry_.swigluClamp > 0.0F))
     throw std::invalid_argument("Ripple's SwiGLU clamp is not a positive threshold");
-  clamp_ = backend.allocateBuffer(4, metal::BufferStorage::Shared, "ripple clamp");
-  *static_cast<float *>(clamp_.contents()) = geometry_.swigluClamp;
   // The scaled token embedding rows, which every block's mix reads back: a
   // prefill chunk's or a verify batch's, written once per gather.
   embedRows_ = backend.allocateBuffer(uint64_t{SPLASH_PREFILL_TOKEN_BUDGET} * geometry_.hiddenSize * 2,
@@ -250,18 +283,26 @@ void RippleTarget::addPrefillLayer(PrefillStep &step, uint32_t index) const {
   const RippleLayerWeights &layer = weights_.layers[index];
   const QwenTargetPrefillBuffers &b = step.buffers;
   const metal::MetalBuffer input = b.hidden[index & 1], output = b.hidden[(index & 1) ^ 1];
+  planOutputRows(step, index);
   ops::Normalization::addRms(step.graph, input, layer.inputNorm, b.normalized, geometry_.hiddenSize, step.rows);
   addPrefillMixer(step, std::get<QwenAttentionWeights>(layer.mixer), layer.valueResidualLambda);
-  // The attention branch: its output's norm, then the residual it adds to.
+  metal::MetalBuffer residual = input;
+  if (!step.readRows.empty()) {
+    residual = output;
+    for (uint32_t row = 0; row < step.readRows.size(); ++row)
+      ops::RowCopy::add(step.graph, input, {step.readRows[row], geometry_.hiddenSize, 0},
+                        residual, {row, geometry_.hiddenSize, 0}, 1, geometry_.hiddenSize);
+  }
   ops::Normalization::addRms(step.graph, b.attentionOutput, layer.postAttentionNorm, b.normalized,
-                             geometry_.hiddenSize, step.rows);
-  ops::ValueMix::sum(step.graph, b.normalized, input, b.attentionOutput, step.rows, geometry_.hiddenSize);
-  addPrefillFfn(step, layer, b.attentionOutput, output);
+                             geometry_.hiddenSize, step.outputRows());
+  ops::ValueMix::sum(step.graph, b.normalized, residual, b.attentionOutput, step.outputRows(), geometry_.hiddenSize);
+  addPrefillFfn(step, layer, b.attentionOutput, step.readRows.empty() ? output : input);
 }
 
 const ops::BlockMoeWeights *RippleTarget::moe(uint32_t) const noexcept { return nullptr; }
 
 void RippleTarget::addPrefillExperts(PrefillStep &step, uint32_t index) const {
+  addReadRows(step, step.buffers.hidden[index & 1], step.buffers.hidden[(index & 1) ^ 1]);
   forEachPrefillCapture(step, index, [&](uint32_t slot, uint32_t source, uint32_t destination, uint32_t rows) {
     addCapture(step.graph, slot, step.buffers.hidden[(index & 1) ^ 1], source, step.buffers.captured,
                destination, rows);
@@ -274,21 +315,18 @@ metal::MetalBuffer RippleTarget::addPrefillEnd(PrefillStep &step) const {
 
 void RippleTarget::addVerify(metal::CommandGraph &graph, QwenTargetVerifyBuffers buffers, const kv::PageStorage &kv,
                              SpilledKvReads &spilled, std::span<const kv::ChunkedPrefillParams> chunks,
-                             uint32_t lanes, uint32_t blockRows, uint32_t verifiedRows) const {
+                             uint32_t lanes, uint32_t blockRows) const {
   VerifyStep step = verifyStep(graph, buffers, kv, spilled, chunks, lanes);
-  step.blockRows = blockRows;
-  const bool wholeBlock = blockRows == SPLASH_TARGET_VERIFY_ROWS;
-  // The head always covers the whole block: its weight read is flat in rows,
-  // and a single-pass cycle's rows past the verified ones hold stale inputs
-  // the acceptance never reads.
-  const uint32_t headRows = wholeBlock ? step.rows : lanes * blockRows;
+  if (blockRows > geometry_.verifyRows || chunks.front().row_base)
+    throw std::invalid_argument("Ripple verify requires one complete target traversal");
+  step.rows = lanes * blockRows;
   for (uint32_t index = 0; index < geometry_.layers; ++index) {
     const RippleLayerWeights &layer = weights_.layers[index];
     const metal::MetalBuffer input = buffers.hidden[index & 1], output = buffers.hidden[(index & 1) ^ 1];
     const ops::PreparedInput normalized = ops::Normalization::addRms(
         step.graph, input, layer.inputNorm, buffers.normalized, geometry_.hiddenSize, step.rows,
         buffers.linearScratch, decodeInput(std::get<QwenAttentionWeights>(layer.mixer).inputProjection,
-                                           step.lanes));
+                                           step.lanes, step.rows));
     addVerifyMixer(step, std::get<QwenAttentionWeights>(layer.mixer), layer.valueResidualLambda,
                    std::move(normalized), {buffers.attentionOutput, input});
     // The attention branch: its output's norm, then the residual it adds to.
@@ -299,18 +337,11 @@ void RippleTarget::addVerify(metal::CommandGraph &graph, QwenTargetVerifyBuffers
     addVerifyFfn(step, layer, buffers.attentionOutput, output);
     if (const auto slot = geometry_.captureSlot(index))
       addCapture(step.graph, *slot, output, 0, buffers.capturedTargetHidden,
-                 step.rowBase, step.rows, {SPLASH_TARGET_VERIFY_ROWS, blockRows});
+                 0, step.rows);
   }
   requireLayerPartition(step.gdnLayer, step.attentionLayer);
-  // The pass's rows join the lanes' whole-block rows for the head, which the
-  // pass that completes the block runs over all of them.
-  if (!wholeBlock)
-    ops::RowCopy::add(step.graph, buffers.hidden[geometry_.layers & 1], {0, geometry_.hiddenSize, 0},
-                      buffers.headInput, {step.rowBase, geometry_.hiddenSize, 0}, step.rows,
-                      geometry_.hiddenSize, {SPLASH_TARGET_VERIFY_ROWS, blockRows});
-  if (chunks.front().row_base + SPLASH_TARGET_VERIFY_ROWS >= verifiedRows)
-    addHeadBatch(step.graph, wholeBlock ? buffers.hidden[geometry_.layers & 1] : buffers.headInput,
-                 buffers.finalHidden, buffers.logits, step.lanes, headRows, buffers.linearScratch);
+  addHeadBatch(step.graph, buffers.hidden[geometry_.layers & 1], buffers.finalHidden,
+               buffers.logits, step.lanes, step.rows, buffers.linearScratch);
 }
 
 void RippleTarget::addHeadBatch(metal::CommandGraph &graph, metal::MetalBuffer hidden,

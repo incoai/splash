@@ -550,14 +550,10 @@ std::string persistentCacheNamespace(const RuntimeCacheIdentity &identity,
             // Dimension-major values add nothing, so dense layouts keep the
             // caches they wrote.
             << (kv.valuesTokenMajor ? " values-token-major" : "");
-  // A block index's pooled keys (kv::Layout::indexDimension), bf16, one a
-  // block of SPLASH_ATTENTION_BLOCK_TOKENS tokens. A change to how a block's
-  // key is pooled, normalized or rotated changes this line.
+  // Pooled index keys: change this identity when pooling, normalization or rotation changes.
   if (kv.indexDimension)
     canonical << " index " << kv.indexDimension << " bf16 block " << SPLASH_ATTENTION_BLOCK_TOKENS;
-  // A sliding window (kv::Layout::windowTokens), which also orders a page's
-  // regions in its slot (kv::Layout::region) and labels a slot with its
-  // page's form (KvSlotLabel). A layout without one keeps the line it had.
+  // Sliding windows order the page's regions and its slot label; dense layouts keep their identity.
   if (!kv.windowedLayers.empty()) {
     canonical << " window " << kv.windowTokens << " layers 0x" << std::hex << kv.windowedLayers.words[0];
     if (kv.windowedLayers.words[1]) canonical << "/" << kv.windowedLayers.words[1];
@@ -578,11 +574,15 @@ std::string persistentCacheNamespace(const RuntimeCacheIdentity &identity,
   if (gdn.auxiliaryBytes) canonical << " auxiliary " << gdn.auxiliaryBytes;
   canonical << '\n'
             << "draft " << draft.layers << ' ' << draft.kvHeads << ' ' << draft.headDimension << ' '
-            << SPLASH_DRAFT_SLIDING_WINDOW << '\n'
+            << draft.window << '\n'
             << "context " << draft.contextWidth << " q4 " << SPLASH_DRAFT_CONTEXT_GROUP << '\n';
-  // Without YaRN the line is left out, so the caches written before it
-  // existed stay valid. The factor takes the digits that read back as the
-  // same double, so no two factors share a namespace.
+  if (draft.slidingWindow || !draft.unrotatedLayers.empty()) {
+    canonical << "draft layers";
+    for (uint32_t layer = 0; layer < draft.layers; ++layer)
+      canonical << ' ' << draft.layerWindow(layer) << (draft.unrotatedLayers.test(layer) ? 'n' : 'r');
+    canonical << '\n';
+  }
+  // Native RoPE keeps its identity. A YaRN factor round-trips exactly, so distinct factors never share it.
   if (const model::RopeScaling &rope = identity.ropeScaling; rope.yarn())
     canonical << "rope yarn " << std::setprecision(std::numeric_limits<double>::max_digits10) << rope.factor
               << ' ' << rope.originalContextTokens << '\n';
@@ -802,7 +802,8 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
          .kvSlotBytes = kvSlotBytes,
          .stateSlotBytes = model::SlotFile::slotBytesFor(stateBytes),
          .activeLimitBytes = activeLimitBytes,
-         .groupPages = groupPages});
+         .groupPages = groupPages,
+         .speculativeTokens = config.model.draft.rows - 1});
   };
   // The plan of the parts as configured, which sizes their stores.
   const auto sizingPlan = [&](uint64_t stagingBytes) {
@@ -983,7 +984,7 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
     const uint32_t commandPages = loadOptions.expertMemoryBytes ? groupPages : 0;
     ModelMemoryProfile modelProfile{
         loaded.name(), loaded.maximumContextTokens(), loaded.targetKvLayout(config.kvFormat), footprint,
-        config.stateFormat, streamed.plan ? streamed.plan->spill : KvSpillPlan{}, commandPages};
+        config.stateFormat, streamed.plan ? streamed.plan->spill : KvSpillPlan{}, commandPages, config.model.draft.rows - 1};
     EngineMemoryPlanResult result = evaluateEngineMemoryPlan(device, modelProfile, config.maximumMemoryBytes);
     if (streamed.plan || !result.plan)
       return result;

@@ -198,10 +198,9 @@ decodeTensorBytes(const RuntimeGeometry &geometry,
     auto &size = result[static_cast<uint32_t>(tensor)];
     size = std::max(size, bytes);
   };
-  // The target's per-pass working tensors cover one 8-row verify sub-pass
-  // per lane (the ABI's block); the whole-block tensors below cover the
-  // served block. The per-pass tensors keep kDecodeRows.
-  const uint64_t r = kDecodeRows;
+  // Target working tensors cover its native verify block; draft and policy
+  // tensors cover the served proposal block.
+  const uint64_t r = geometry.target.verifyRows;
   const uint64_t block = blockRows;
   // As in prefill, no GDN scratch without GDN layers.
   const uint64_t gdnRows = geometry.target.stateLayout.layers ? r : 0;
@@ -210,8 +209,6 @@ decodeTensorBytes(const RuntimeGeometry &geometry,
   put(DecodeTensor::Hidden1,
       bytesFor<uint16_t>(r * geometry.target.hiddenSize));
   put(DecodeTensor::InputTokens, bytesFor<uint32_t>(block));
-  put(DecodeTensor::VerifyInputPasses, bytesFor<uint32_t>(block));
-  put(DecodeTensor::HeadInput, bytesFor<uint16_t>(block * geometry.target.hiddenSize));
   put(DecodeTensor::Normalized,
       bytesFor<uint16_t>(r * geometry.target.hiddenSize));
   put(DecodeTensor::GdnHidden,
@@ -228,7 +225,7 @@ decodeTensorBytes(const RuntimeGeometry &geometry,
                          geometry.target.attentionHeadDimension));
   const ops::AttentionWorkspace attentionWorkspace =
       operators.verifyAttentionWorkspacePerLane(
-          geometry.target.attentionQueryHeads, geometry.target.kvLayout);
+          geometry.target.attentionQueryHeads, geometry.target.kvLayout, geometry.target.verifyRows);
   put(DecodeTensor::AttentionPartials, attentionWorkspace.partialsBytes);
   put(DecodeTensor::AttentionStatistics, attentionWorkspace.statisticsBytes);
   put(DecodeTensor::FullAttention,
@@ -240,7 +237,6 @@ decodeTensorBytes(const RuntimeGeometry &geometry,
   put(DecodeTensor::AttentionOutput,
       bytesFor<uint16_t>(r * geometry.target.hiddenSize));
   put(DecodeTensor::Positions, bytesFor<uint32_t>(r * 3));
-  put(DecodeTensor::PositionsSecond, bytesFor<uint32_t>(r * 3));
   put(DecodeTensor::DraftPositions, bytesFor<uint32_t>(block));
   put(DecodeTensor::RopeCos,
       bytesFor<float>(r * geometry.target.rotaryPairs));
@@ -276,7 +272,7 @@ decodeTensorBytes(const RuntimeGeometry &geometry,
       samplingWorkspace.vocabularyArrivalsBytes);
   put(DecodeTensor::SamplingUniforms, bytesFor<float>(kSamplingUniformCount));
   put(DecodeTensor::ConstraintMasks,
-      bytesFor<uint32_t>(uint64_t{ExecutionLimits::maximumStepTokens} *
+      bytesFor<uint32_t>(uint64_t{blockRows + 1} *
                          geometry.maskWords()));
   put(DecodeTensor::OutputTokens, bytesFor<uint32_t>(block));
   put(DecodeTensor::RetainedCount, sizeof(uint32_t));
@@ -322,7 +318,7 @@ decodeTensorBytes(const RuntimeGeometry &geometry,
   put(DecodeTensor::PenaltyState,
       bytesFor<uint32_t>(geometry.target.vocabularySize));
   put(DecodeTensor::GdnPacked, gdnPackedStride(geometry));
-  put(DecodeTensor::GdnTape, 3 * gdnTapeSlotBytes(geometry));
+  put(DecodeTensor::GdnTape, 2 * gdnTapeSlotBytes(geometry));
   put(DecodeTensor::ChunkKeysBase,
       uint64_t{geometry.target.kvLayout.attentionLayers} *
           decodeChunkLayerBytes(geometry));
@@ -355,13 +351,13 @@ ops::LinearScratchSize DecodeArena::linearScratchSize(
   const auto &d = geometry.draft;
   ops::LinearScratchSize result;
   // Includes the vocabulary head shared with the draft.
-  for (const auto &p : geometry.target.decodeProjections) result.include(operators.linear().decodeScratchSize(p));
+  for (const auto &p : geometry.target.decodeProjections) result.include(operators.linear().decodeScratchSize(p, geometry.target.verifyRows));
   for (const ops::ProjectionShape shape : {ops::ProjectionShape{d.dynamicSize, d.hiddenSize},
        {d.qkvSize, d.hiddenSize}, {d.contextKvSize(), d.hiddenSize},
        {d.hiddenSize, d.attentionSize},
        {d.intermediateSize, d.hiddenSize}, {d.hiddenSize, d.intermediateSize},
        {d.selectorRank, d.hiddenSize}, {d.hiddenSize, d.targetHiddenSize()}})
-    result.include(operators.draftLinear().decodeScratchSize(shape));
+    result.include(operators.draftLinear().decodeScratchSize(shape, d.rows));
   return result;
 }
 

@@ -20,7 +20,6 @@ public:
                              metal::MetalBuffer draftInputTokens,
                              metal::MetalBuffer proposedTokens,
                              metal::MetalBuffer verifyInputTokens,
-                             metal::MetalBuffer verifyInputPasses,
                              uint32_t vocabulary, uint32_t lanes,
                              uint32_t rows);
   // Each of `lanes` lanes' mask rows of its `rows` draft input rows of
