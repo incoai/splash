@@ -931,7 +931,7 @@ void testContract() {
 
   ChunkedPrefillParams finalCycle{
       splash::kv::kMaximumLogicalTokens - 1,
-      SPLASH_TARGET_VERIFY_ROWS,
+      SPLASH_DECODE_LANE_ROWS,
       32,
       (splash::kv::kMaximumPhysicalTokens + kPageTokens - 1) /
           kPageTokens};
