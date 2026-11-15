@@ -150,14 +150,14 @@ struct GdnDecodeBuffers final {
 
 // A lane's decode step to fold rows of alone (GDN::addFold): the cell the
 // step wrote, which holds the state before its rows, the tape its rows are
-// on (every layer's, from stepSlot), the count of them the lane retained,
-// which the step's acceptance wrote, and the cell the fold writes, of the
-// same strides.
+// on (every layer's, from stepSlot), the path of them the lane retained, the
+// row mask the step's acceptance wrote (metal/abi/VerifyTree.h), and the cell
+// the fold writes, of the same strides.
 struct GdnFoldBuffers final {
   metal::MetalBuffer state;
   metal::MetalBuffer tape;
   uint64_t stepSlot = 0;
-  metal::MetalBuffer retained;
+  metal::MetalBuffer retainedRows;
   metal::MetalBuffer fold;
 };
 
@@ -181,11 +181,12 @@ public:
                                  GdnStateStrides state,
                                  GdnHeadOrder order,
                                  LinearInput input);
-  // The state after the first `rows` of a decode step's rows, in each of
-  // `layers` layers: those rows folded into the state before them, and the
-  // convolution rows they leave, in buffers.fold, bit for bit the state the
-  // lane's next step holds when the lane retained exactly those rows. A lane
-  // that retained fewer leaves the fold as it was.
+  // The state after the first `rows` rows of the path a lane retained of a
+  // decode step's rows, in each of `layers` layers: those rows folded into
+  // the state before them, and the convolution rows they leave, in
+  // buffers.fold, bit for bit the state the lane's next step holds when the
+  // lane retained exactly those rows. A lane whose path holds fewer leaves the
+  // fold as it was.
   static void addFold(metal::CommandGraph &graph, GdnFoldBuffers buffers, GdnShape shape,
                       uint32_t layers, uint32_t rows, GdnStateStrides state);
 };

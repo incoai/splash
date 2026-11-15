@@ -2247,8 +2247,8 @@ before the page alone into the state's cell (`ops::GDN::addFold`, the next
 step's arithmetic, which it matches bit for bit), and the state's window is a
 copy of the lane's plus those rows' context; the completion seals the state only
 where the lane retained those rows. Both writes are one function of the runtime
-(`encodeDecodeCaptures`), which names the rows a lane retained: the first of its
-verify rows, as many as its acceptance counted. Each such state is a rolling
+(`encodeDecodeCaptures`), which names the rows a lane retained: the path of its
+verify rows its acceptance wrote, whose first rows before the page both take. Each such state is a rolling
 checkpoint of the reply that retires the one before it, which a preempted lane
 resumes from once its KV holds a token past it, and the last, once the request
 ends, is the reply's state: the point a next request whose prompt renders the

@@ -2555,8 +2555,8 @@ struct Runtime::Impl {
   // the page boundary its retained rows reach: the lane's state after the
   // rows it retained this cycle before the boundary, which its next cycle
   // would hold had it retained exactly those. The rows a lane retains are
-  // the first of its verify rows, as many as its acceptance counted
-  // (DecodeTensor::RetainedCount): the capture folds the first `rows` of the
+  // the path of its verify rows its acceptance wrote (DecodeTensor::
+  // RetainedRows): the capture folds the path's first `rows` rows of the
   // verify's tape into the state the verify wrote (QwenTarget::addStateFold)
   // and stores their context rows, which the draft's commit normalized, in
   // the state's window. The completion seals the state only where the lane
@@ -2575,12 +2575,13 @@ struct Runtime::Impl {
 
   // A capture's commands on decode lane `lane` of state lane `stateLane`
   // (encodeDecodeCaptures), in a cycle of `step`: the fold of the first
-  // `rows` of the verify's tape into the GDN state `fold` and the commit of
-  // their context rows, from `position`, to the state's `window`.
+  // `rows` rows of the lane's retained path in the verify's tape into the GDN
+  // state `fold` and the commit of their context rows, from `position`, to
+  // the state's `window`.
   void encodeCapture(CommandGraph &graph, uint32_t lane, uint32_t stateLane, const MetalBuffer &fold,
                      const MetalBuffer &window, uint32_t rows, uint32_t position, const ops::StepRows &step) const {
     targetModel->addStateFold(graph,
-                              {decodeArena->get(lane, DecodeTensor::RetainedCount), states.next(stateLane).stateBase,
+                              {decodeArena->get(lane, DecodeTensor::RetainedRows), states.next(stateLane).stateBase,
                                decodeArena->batchSlice(DecodeTensor::GdnTape, kLaneCount),
                                decodeArena->gdnTapeSlot(stateLane, states.metadata(stateLane).activeParity ^ 1), fold},
                               rows);

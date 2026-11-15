@@ -37,8 +37,8 @@
 // the state before its own rows. A step reads and writes the state once. Its
 // rows past the lane's verify rows are never accepted or read: the
 // recurrence skips them and their recurrent output is zero. A fold alone
-// (gdn_fold_phase) folds some of a step's rows as that next step would, for
-// the state of a page the step's retained rows reach.
+// (gdn_fold_phase) folds the first rows of a step's accepted path as that
+// next step would, for the state of a page the path reaches.
 constant uint kDecodeSimdgroups = 8;
 
 // The k, v and gates of one value head's rows a lane folds into its state,
@@ -602,17 +602,18 @@ inline void gdn_decode_batch_phase(
   }
 }
 
-// A lane's state after the first `rows` rows of its step, the one its next
-// step folds when the lane retained exactly those, of one value head of one
-// layer: the rows on the step's tape folded into the state before them (the
-// cell the step wrote, `state`), and the convolution rows they leave, as the
-// next step's prologue carries them, in `fold`, a cell of the same strides.
-// Nothing when the lane retained fewer (`retained`, its acceptance's count).
+// A lane's state after the first `rows` rows of the path it accepted of its
+// step (`retained_rows`, the row mask its acceptance wrote, metal/abi/
+// VerifyTree.h), the one its next step folds when the lane retained exactly
+// those, of one value head of one layer: those rows of the step's tape folded
+// into the state before them (the cell the step wrote, `state`), and the
+// convolution rows they leave, as the next step's prologue carries them, in
+// `fold`, a cell of the same strides. Nothing when the path holds fewer rows.
 // Grid {value heads, layers}.
 template <uint KeyHeads, uint ValueHeads, uint HeadDim, uint ConvDim,
           uint RowsInFlight, class State>
 inline void gdn_fold_phase(device const uchar *state, device uchar *fold,
-                           device uchar *tape, device const uint *retained,
+                           device uchar *tape, device const uint *retained_rows,
                            constant GDNFoldParams &params, uint2 group,
                            uint lane, uint simd_group,
                            threadgroup GdnPendingShared<HeadDim, SPLASH_TARGET_VERIFY_ROWS> &pending) {
@@ -620,22 +621,22 @@ inline void gdn_fold_phase(device const uchar *state, device uchar *fold,
   constexpr uint KeyWidth = KeyHeads * HeadDim;
   constexpr uint KvWidth = KeyWidth + ValueHeads * HeadDim;
   constexpr uint Batches = HeadDim / kDecodeSimdgroups;
-  const uint rows = params.rows;
-  if (retained[0] < rows)
+  const uint rows = params.rows, path = retained_rows[0];
+  if (uint(popcount(path)) < rows)
     return;
   const uint value_head = group.x, layer = group.y;
   const GdnTape step = gdn_tape<KeyHeads, ValueHeads, HeadDim, ConvDim>(
       tape, params.step_tape +
                 ulong(layer) * gdn_tape_layer_bytes(ConvDim, KvWidth, ValueHeads));
   for (uint token = simd_group; token < rows; token += kDecodeSimdgroups)
-    gdn_load_pending<KeyHeads, ValueHeads, HeadDim, SPLASH_TARGET_VERIFY_ROWS>(step, pending, token, token,
-                                                                             value_head, lane);
+    gdn_load_pending<KeyHeads, ValueHeads, HeadDim, SPLASH_TARGET_VERIFY_ROWS>(
+        step, pending, token, splash_path_row(path, token), value_head, lane);
   // The head's v channels, and its key head's q and k channels from the first
   // of the key head's value heads.
   if (simd_group < SPLASH_GDN_CONVOLUTION_TAPS - 1) {
     const GdnConvHistory history = gdn_conv_history(
         reinterpret_cast<device const bfloat *>(state + ulong(layer) * params.conv_layer_bytes), step.inputs,
-        ConvDim, ConvDim, rows);
+        ConvDim, ConvDim, rows, path);
     device bfloat *carried =
         reinterpret_cast<device bfloat *>(fold + ulong(layer) * params.conv_layer_bytes) +
         simd_group * ConvDim;
@@ -749,11 +750,11 @@ GDN_DECODE_TABLE_ENTRY(verify_gdn_fused_table16_p16512_f32, 16, 48, 128, 10240, 
 // layout share it.
 #define GDN_FOLD_KERNEL(Name, KeyHeads, ValueHeads, HeadDim, ConvDim, State) \
   kernel void Name(device const uchar *state [[buffer(0)]], device uchar *fold [[buffer(1)]], \
-      device uchar *tape [[buffer(2)]], device const uint *retained [[buffer(3)]], \
+      device uchar *tape [[buffer(2)]], device const uint *retained_rows [[buffer(3)]], \
       constant GDNFoldParams &params [[buffer(4)]], GDN_DECODE_THREADS) { \
     threadgroup GdnPendingShared<HeadDim, SPLASH_TARGET_VERIFY_ROWS> pending; \
     gdn_fold_phase<KeyHeads, ValueHeads, HeadDim, ConvDim, 2, State>( \
-        state, fold, tape, retained, params, group, lane, simd_group, pending); \
+        state, fold, tape, retained_rows, params, group, lane, simd_group, pending); \
   }
 #define GDN_FOLD_ENTRY(Name, KeyHeads, ValueHeads, HeadDim, ConvDim) \
   GDN_FOLD_KERNEL(Name, KeyHeads, ValueHeads, HeadDim, ConvDim, float) \

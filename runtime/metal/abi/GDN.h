@@ -88,8 +88,8 @@ struct GDNDecodeBatchParams {
 static_assert(sizeof(GDNDecodeBatchParams) == 112,
               "GDN decode parameters are 112 bytes on both sides");
 
-// A fold of the first `rows` rows of a lane's step alone (GDN::addFold): the
-// state cells' strides, as in GDNDecodeBatchParams, and the byte offset in
+// A fold of the first `rows` rows of a lane's accepted path of its step alone
+// (GDN::addFold): the state cells' strides, as in GDNDecodeBatchParams, and the byte offset in
 // the tape buffer of the step's first layer's tape, which the next layers'
 // follow gdn_tape_layer_bytes apart.
 struct GDNFoldParams {

@@ -286,7 +286,7 @@ void GDN::addFold(metal::CommandGraph &graph, GdnFoldBuffers buffers, GdnShape s
   if (buffers.stepSlot > std::numeric_limits<uint64_t>::max() - tapeBytes)
     throw std::invalid_argument("invalid GDN fold tape");
   requireBytes(buffers.tape, buffers.stepSlot + tapeBytes, "GDN tape");
-  requireBytes(buffers.retained, sizeof(uint32_t), "GDN retained count");
+  requireBytes(buffers.retainedRows, sizeof(uint32_t), "GDN retained rows");
   const uint64_t bytes = stateBytes(shape, state, layers - 1);
   requireBytes(buffers.state, bytes, "GDN state");
   requireBytes(buffers.fold, bytes, "GDN folded state");
@@ -294,7 +294,7 @@ void GDN::addFold(metal::CommandGraph &graph, GdnFoldBuffers buffers, GdnShape s
                              state.convolutionStateBytes, buffers.stepSlot, rows, 0};
   graph.add(stateKernel(std::string("verify_gdn_fold") + std::string(kernel.scanSuffix), state.format),
             {std::move(buffers.state), std::move(buffers.fold), std::move(buffers.tape),
-             std::move(buffers.retained)},
+             std::move(buffers.retainedRows)},
             params, {shape.valueHeads, layers, 1});
 }
 

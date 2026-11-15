@@ -370,13 +370,14 @@ struct QwenTargetCommitBuffers final {
   std::array<metal::MetalBuffer, ExecutionLimits::maximumBatchWidth> auxiliaryOut;
 };
 
-// The GDN state after the first rows of a lane's verify, folded into a cache
-// cell from the verify's tape (addStateFold): the lane's retained count,
-// the cell the verify wrote, which holds the state before its rows, the
-// lanes' decode tapes and the offset of the verify's slot in them, and the
-// cache cell.
+// The GDN state after the first rows of the path a lane accepted of its
+// verify, folded into a cache cell from the verify's tape (addStateFold): the
+// lane's retained rows (the path, a row mask of its block, as acceptance
+// wrote it), the cell the verify wrote, which holds the state before its
+// rows, the lanes' decode tapes and the offset of the verify's slot in them,
+// and the cache cell.
 struct QwenTargetFoldBuffers final {
-  metal::MetalBuffer retainedCount;
+  metal::MetalBuffer retainedRows;
   metal::MetalBuffer state;
   metal::MetalBuffer gdnTape;
   uint64_t stepSlot = 0;

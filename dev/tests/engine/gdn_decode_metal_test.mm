@@ -36,6 +36,7 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -1871,8 +1872,8 @@ void rejectsInvalid(MetalBackend &backend) {
   // A fold takes one to all of a step's rows of every layer, from an aligned
   // tape slot whose layers the tape holds, into a cell as large as the
   // state's.
-  const MetalBuffer retained = sharedBuffer(backend, 4);
-  const GdnFoldBuffers fold{fixture.next[0], fixture.tape, fixture.slot(0, 1), retained, fixture.current[0]};
+  const MetalBuffer retainedRows = sharedBuffer(backend, 4);
+  const GdnFoldBuffers fold{fixture.next[0], fixture.tape, fixture.slot(0, 1), retainedRows, fixture.current[0]};
   for (const uint32_t rows : {0U, kRows + 1})
     rejects([&] { GDN::addFold(graph, fold, shape, kLayers, rows, fixture.cell.strides()); },
             "invalid GDN fold geometry", "a fold of no rows or more than a step's was accepted");
@@ -1895,13 +1896,14 @@ void rejectsInvalid(MetalBackend &backend) {
   require(graph.empty(), "invalid GDN request partially encoded a graph");
 }
 
-// A fold of a step's first rows alone (GDN::addFold) stores the state the
-// lane's next step holds when the lane retained those rows or more, bit for
-// bit, in every layer: the recurrent state and the convolution rows, over
-// either state format, for each count of a step's rows. The step folds rows
-// of the one before it, so a fold from the state it started from, or from
-// the earlier step's tape slot, stores another state. A lane that retained
-// fewer leaves the fold's cell as it was.
+// A fold of the first rows of a step's retained path alone (GDN::addFold)
+// stores the state the lane's next step holds when the lane retained those
+// rows, bit for bit, in every layer: the recurrent state and the convolution
+// rows, over either state format, for each count of a chain's rows and of a
+// tree's path that skips rows, as a capture on a branch takes it. The step
+// folds rows of the one before it, so a fold from the state it started from,
+// or from the earlier step's tape slot, stores another state. A lane whose
+// path holds fewer rows leaves the fold's cell as it was.
 void foldMatchesTheNextStep(MetalBackend &backend, const GdnShape &shape, GdnStateFormat format) {
   const std::string what =
       "fold vh" + std::to_string(shape.valueHeads) + " " + std::string(formatName(format));
@@ -1955,42 +1957,65 @@ void foldMatchesTheNextStep(MetalBackend &backend, const GdnShape &shape, GdnSta
   (void)backend.submitCommandAsync(step.dispatches()).wait();
   const uint64_t stepSlot = fixture.blocks[0].tape.stepSlot, pendingSlot = fixture.blocks[0].tape.pendingSlot;
 
-  const MetalBuffer retained = sharedBuffer(backend, 4), fold = sharedBuffer(backend, cell.bytes);
+  const MetalBuffer retainedRows = sharedBuffer(backend, 4), fold = sharedBuffer(backend, cell.bytes);
   std::array<MetalBuffer, kMaxLanes> current, next;
   current.fill(sharedBuffer(backend, cell.bytes));
   next.fill(sharedBuffer(backend, cell.bytes));
   const auto bytes = [](const MetalBuffer &buffer, uint64_t offset) {
     return static_cast<const uint8_t *>(buffer.contents()) + offset;
   };
-  for (uint32_t rows = 1; rows <= kRows; ++rows)
-    for (const uint32_t count : {rows - 1, rows, kRows}) {
-      const std::string where =
-          what + " of " + std::to_string(rows) + " rows, " + std::to_string(count) + " retained";
-      std::memset(fold.contents(), 0xA5, cell.bytes);
-      *static_cast<uint32_t *>(retained.contents()) = count;
-      std::memcpy(current[0].contents(), fixture.next[0].contents(), cell.bytes);
-      std::memset(next[0].contents(), 0, cell.bytes);
-      CommandGraph graph;
-      GDN::addFold(graph, {fixture.next[0], fixture.tape, stepSlot, retained, fold}, shape, kLayers,
-                   rows, cell.strides());
-      // The lane's next step, after it retained `rows` rows of this one.
-      addStep(graph, current, next, {stepSlot, pendingSlot, chainPath(rows)});
-      (void)backend.submitCommandAsync(graph.dispatches()).wait();
-      if (count < rows) {
-        require(std::all_of(bytes(fold, 0), bytes(fold, cell.bytes), [](uint8_t byte) { return byte == 0xA5; }),
-                where + ": a fold of rows the lane did not retain wrote its cell");
-        continue;
-      }
-      for (uint32_t layer = 0; layer < kLayers; ++layer) {
-        const uint64_t rowsAt = layer * cell.convLayerBytes;
-        const uint64_t stateAt = cell.convBytes + layer * cell.recurrentLayerBytes;
-        require(!std::memcmp(bytes(fold, rowsAt), bytes(next[0], rowsAt), carried),
-                where + ": the fold's convolution rows are not the next step's");
-        require(!std::memcmp(bytes(fold, stateAt), bytes(next[0], stateAt), recurrent),
-                where + ": the fold's state is not the next step's");
-      }
+  // The fold of the first `rows` rows of the path `retained` against the
+  // lane's next step after it retained `first`, those rows. The next step
+  // leaves its own rows in a slot of another lane's, so that the earlier
+  // step's rows stay for the step to run again.
+  const auto check = [&](uint32_t rows, uint32_t retained, uint32_t first, const std::string &where) {
+    std::memset(fold.contents(), 0xA5, cell.bytes);
+    *static_cast<uint32_t *>(retainedRows.contents()) = retained;
+    std::memcpy(current[0].contents(), fixture.next[0].contents(), cell.bytes);
+    std::memset(next[0].contents(), 0, cell.bytes);
+    CommandGraph graph;
+    GDN::addFold(graph, {fixture.next[0], fixture.tape, stepSlot, retainedRows, fold}, shape, kLayers, rows,
+                 cell.strides());
+    addStep(graph, current, next, {stepSlot, fixture.slot(2, 0), first});
+    (void)backend.submitCommandAsync(graph.dispatches()).wait();
+    if (std::popcount(retained) < static_cast<int>(rows)) {
+      require(std::all_of(bytes(fold, 0), bytes(fold, cell.bytes), [](uint8_t byte) { return byte == 0xA5; }),
+              where + ": a fold of rows the lane did not retain wrote its cell");
+      return;
     }
-  std::cout << what << ": each count of a step's rows folds to the next step's state\n";
+    for (uint32_t layer = 0; layer < kLayers; ++layer) {
+      const uint64_t rowsAt = layer * cell.convLayerBytes;
+      const uint64_t stateAt = cell.convBytes + layer * cell.recurrentLayerBytes;
+      require(!std::memcmp(bytes(fold, rowsAt), bytes(next[0], rowsAt), carried),
+              where + ": the fold's convolution rows are not the next step's");
+      require(!std::memcmp(bytes(fold, stateAt), bytes(next[0], stateAt), recurrent),
+              where + ": the fold's state is not the next step's");
+    }
+  };
+  for (uint32_t rows = 1; rows <= kRows; ++rows)
+    for (const uint32_t count : {rows - 1, rows, kRows})
+      check(rows, chainPath(count), chainPath(rows),
+            what + " of " + std::to_string(rows) + " rows, " + std::to_string(count) + " retained");
+  // The step again over the same rows as a tree whose deepest path skips a
+  // branch at every third row: a fold of its path's first rows, for a path
+  // of fewer, as many and more, folds the path's rows of the tape, not the
+  // step's first.
+  static_assert(kRows == 16, "the tree's rows");
+  const BlockTree branched{{0, 0, 0, 2, 1, 3, 5, 4, 6, 8, 7, 9, 11, 10, 12, 14}};
+  for (uint32_t row = 0; row < kRows; ++row) static_cast<TreeRow *>(fixture.tree.contents())[row] = branched.node(row);
+  CommandGraph tree;
+  addStep(tree, fixture.current, fixture.next, {pendingSlot, stepSlot, chainPath(3)});
+  (void)backend.submitCommandAsync(tree.dispatches()).wait();
+  const std::vector<uint32_t> deepest = branched.path(kRows - 1);
+  for (uint32_t rows = 1; rows <= deepest.size(); ++rows) {
+    const uint32_t first = branched.ancestors(deepest[rows - 1]);
+    for (const uint32_t retained : {rows > 1 ? branched.ancestors(deepest[rows - 2]) : 0U, first,
+                                    branched.ancestors(deepest.back())})
+      check(rows, retained, first,
+            what + " of " + std::to_string(rows) + " rows of a branched path, " +
+                std::to_string(std::popcount(retained)) + " retained");
+  }
+  std::cout << what << ": each count of a chain's rows and of a branched path's folds to the next step's state\n";
 }
 
 } // namespace

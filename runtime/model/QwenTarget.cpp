@@ -121,7 +121,7 @@ void QwenTarget::addStateFold(metal::CommandGraph &graph, QwenTargetFoldBuffers 
     return;
   ops::GDN::addFold(graph,
                     {std::move(buffers.state), std::move(buffers.gdnTape), buffers.stepSlot,
-                     std::move(buffers.retainedCount), std::move(buffers.fold)},
+                     std::move(buffers.retainedRows), std::move(buffers.fold)},
                     geometry_.gdnShape(), geometry_.stateLayout.layers, rows, geometry_.stateLayout.strides());
 }
 
