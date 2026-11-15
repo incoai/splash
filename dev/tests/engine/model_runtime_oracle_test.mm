@@ -2299,15 +2299,15 @@ void requireThinkingBudgetClosesThinking(model::Runtime &executor) {
           mostEndCycles = std::max(mostEndCycles, endCycles);
           // A cycle that starts with no thinking token left, its anchor the
           // budget's last thinking token or an end token before the close,
-          // drafted the end tokens left in place of the draft's proposals.
+          // proposes the end tokens left, a chain of its own, and none of the
+          // draft's: the draft's proposals past them guess at its own thinking
+          // path, not at the end, so its tree takes none. Every other cycle
+          // proposes the draft's.
           for (const auto &[anchor, drafted] : generated[lane].drafts) {
             const uint32_t committed = static_cast<uint32_t>(anchor) + 1;
-            const uint32_t replaced =
-                committed >= first && committed < first + length
-                    ? std::min(first + length - committed, model::ExecutionLimits::draftProposalTokens)
-                    : 0;
-            require(drafted == model::ExecutionLimits::draftProposalTokens - replaced,
-                    "a cycle counted the end tokens it drafted as the draft's");
+            const bool ends = committed >= first && committed < first + length;
+            require(drafted == (ends ? 0 : model::ExecutionLimits::draftProposalTokens),
+                    "a cycle counted the end tokens it proposed as the draft's");
           }
         }
         for (const uint64_t id : ids)
@@ -2444,13 +2444,14 @@ void requireConstrainedThinkingEndWaitsForItsMask(model::Runtime &executor) {
           require(cycles[start + length - 1] - cycles[start] + 1 <= 1 + (length - 1 + rows - 1) / rows,
                   "a constrained thinking budget's end took a decode cycle per token");
           // Only a cycle whose anchor is the end's first token or one after
-          // it, before the close, drafted the end tokens left.
+          // it, before the close, proposes the end tokens left, and none of
+          // the draft's, whose proposals past them guess at its own thinking
+          // path, not at the end.
           for (const auto &[anchor, drafted] : generated[lane].drafts) {
             const uint32_t committed = static_cast<uint32_t>(anchor) + 1;
-            const uint32_t replaced =
-                committed > start && committed < start + length ? std::min(start + length - committed, proposals) : 0;
-            require(drafted == proposals - replaced,
-                    "a constrained cycle counted the end tokens it drafted as the draft's");
+            const bool ends = committed > start && committed < start + length;
+            require(drafted == (ends ? 0 : proposals),
+                    "a constrained cycle counted the end tokens it proposed as the draft's");
           }
         }
         for (const uint64_t id : ids)
