@@ -1,5 +1,6 @@
 #include "engine/CacheDirectory.hpp"
 #include "AwakeClock.hpp"
+#include "InterruptedCall.hpp"
 
 #include <fcntl.h>
 #include <sys/file.h>
@@ -53,9 +54,7 @@ private:
 // A namespace's name (CacheDirectory::kNamespaceDigits).
 bool namespaceName(std::string_view name) noexcept {
   return name.size() == CacheDirectory::kNamespaceDigits &&
-         std::all_of(name.begin(), name.end(), [](char character) {
-           return (character >= '0' && character <= '9') || (character >= 'a' && character <= 'f');
-         });
+         name.find_first_not_of("0123456789abcdef") == std::string_view::npos;
 }
 
 // Its files are trusted as this process's own, so nobody else may write
@@ -66,24 +65,12 @@ bool owned(int directory) noexcept {
          !(status.st_mode & (S_IWGRP | S_IWOTH));
 }
 
-// A signal may interrupt a directory syscall. Retry only that operation,
-// not cache initialization/cleanup. Bound repeated signals so
-// an interrupted startup still reaches the caller's existing failure handling.
-template <class F> int directoryCall(F call) {
-  for (unsigned attempt = 0; attempt < 8; ++attempt) {
-    const int result = call();
-    if (result >= 0 || errno != EINTR)
-      return result;
-  }
-  return -1;
-}
-
 // Makes the directory at path (0700) when missing and opens it; empty when
 // it was removed between the two.
 std::optional<Descriptor> openDirectory(const std::filesystem::path &path, const char *what) {
-  if (directoryCall([&] { return ::mkdir(path.c_str(), 0700); }) < 0 && errno != EEXIST)
+  if (retryInterrupted([&] { return ::mkdir(path.c_str(), 0700); }) < 0 && errno != EEXIST)
     fail(what);
-  Descriptor directory(directoryCall(
+  Descriptor directory(retryInterrupted(
       [&] { return ::open(path.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW); }));
   if (directory.get() < 0) {
     if (errno == ENOENT)
@@ -155,8 +142,7 @@ CacheDirectory::open(const std::filesystem::path &root, std::string_view cacheNa
   if (root.has_parent_path())
     std::filesystem::create_directories(root.parent_path());
   if (!openDirectory(root, "open cache root"))
-    throw std::system_error(std::make_error_code(std::errc::no_such_file_or_directory),
-                            "open cache root");
+    throw std::system_error(ENOENT, std::generic_category(), "open cache root");
   const std::filesystem::path path = root / cacheNamespace;
   // A restarting server's new engine can race the end of the old one.
   const auto deadline = AwakeClock::now() + lockWait;
