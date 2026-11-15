@@ -165,6 +165,20 @@ inline void gdn_decode_prologue(
   const uint k_column = key_head * HeadDim + lane;
   const uint v_column = KeyWidth + value_head * HeadDim + lane;
 
+  // The carried rows are loaded before the rows' passes and go to
+  // conv_state_out after them: Apple9 miscompiles a carry loaded and stored
+  // within the first pass (gdn-decode's "convolution carry mismatch" on the
+  // 16-row kernels, an M4 under macOS 26.6), and stored before the passes too
+  // the 35B's 8-row chains took 3.3% longer at one lane and the 27B's 1.0% at
+  // four (an M5 Pro).
+  bfloat carry_v[Groups], carry_q[Groups], carry_k[Groups];
+  if (carrier) {
+    for (uint g = 0; g < Groups; ++g) {
+      carry_v[g] = history.at(simd_group, v_channel + 32 * g);
+      carry_q[g] = shared_writer ? history.at(simd_group, q_channel + 32 * g) : bfloat(0.0f);
+      carry_k[g] = shared_writer ? history.at(simd_group, k_channel + 32 * g) : bfloat(0.0f);
+    }
+  }
   for (uint pass = 0; pass < GdnDecodeShared<HeadDim, Rows>::Passes; ++pass) {
     const uint token = simd_group + pass * kDecodeSimdgroups;
     // Pending row `token` is the pending path's row at that depth.
@@ -190,18 +204,11 @@ inline void gdn_decode_prologue(
     }
     const GdnConvTaps taps = gdn_conv_taps(packed, PackedWidth, history, popcount(path) - 1, path_rows);
     float q[Groups], k[Groups];
-    bfloat v[Groups], carry_v[Groups], carry_q[Groups], carry_k[Groups];
+    bfloat v[Groups];
     for (uint g = 0; g < Groups; ++g) {
       q[g] = float(gdn_conv_silu(taps, conv_weights, q_channel + 32 * g));
       k[g] = float(gdn_conv_silu(taps, conv_weights, k_channel + 32 * g));
       v[g] = gdn_conv_silu(taps, conv_weights, v_channel + 32 * g);
-      if (carrier && !pass) {
-        carry_v[g] = history.at(simd_group, v_channel + 32 * g);
-        carry_q[g] = shared_writer ? history.at(simd_group, q_channel + 32 * g)
-                                   : bfloat(0.0f);
-        carry_k[g] = shared_writer ? history.at(simd_group, k_channel + 32 * g)
-                                   : bfloat(0.0f);
-      }
     }
     GdnGates gates{};
     if (lane == 0)
@@ -245,14 +252,13 @@ inline void gdn_decode_prologue(
       shared.decay[token] = gates.decay;
       shared.paths[token] = path;
     }
-    if (carrier && !pass) {
-      const uint row = simd_group;
-      for (uint g = 0; g < Groups; ++g) {
-        conv_state_out[row * ConvDim + v_channel + 32 * g] = carry_v[g];
-        if (shared_writer) {
-          conv_state_out[row * ConvDim + q_channel + 32 * g] = carry_q[g];
-          conv_state_out[row * ConvDim + k_channel + 32 * g] = carry_k[g];
-        }
+  }
+  if (carrier) {
+    for (uint g = 0; g < Groups; ++g) {
+      conv_state_out[simd_group * ConvDim + v_channel + 32 * g] = carry_v[g];
+      if (shared_writer) {
+        conv_state_out[simd_group * ConvDim + q_channel + 32 * g] = carry_q[g];
+        conv_state_out[simd_group * ConvDim + k_channel + 32 * g] = carry_k[g];
       }
     }
   }
