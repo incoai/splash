@@ -853,11 +853,13 @@ void contextWindow(MetalBackend &backend, uint32_t width) {
   require(invalid.empty(), "an invalid context window transfer encoded a dispatch");
 }
 
-// A decode step's window commit stores the rows a lane retained of its eight
-// context rows, from row 2 of a step's ten, the path's in order, as a store
-// of those rows gathered does, in the slots of their positions across the
-// ring's wrap, and leaves every other slot as it was: every chain's first
-// rows, and none; and a tree's path, rows 0, 2, 5 and 6.
+// A decode step's window commit of k rows stores the first k rows a lane
+// retained of its eight context rows, from row 2 of a step's ten, the path's
+// in order, as a store of those rows gathered does, in the slots of their
+// positions across the ring's wrap, and leaves every other slot as it was:
+// of every chain's first rows, and none, and of a tree's path, rows 0, 2, 5
+// and 6, for every k, the whole path (a cycle's commit) and fewer of its rows
+// (a capture whose page boundary falls inside the path).
 void contextWindowCommit(MetalBackend &backend, uint32_t width) {
   constexpr uint32_t start = kWindow - 4, first = 2, stepRows = first + kRows;
   const uint64_t windowBytes = DraftAttention::contextWindowBytes(width);
@@ -876,9 +878,9 @@ void contextWindowCommit(MetalBackend &backend, uint32_t width) {
   for (uint32_t count = 0; count <= kRows; ++count)
     paths.push_back((1U << count) - 1);
   paths.push_back(0b1100101);
+  const MetalBuffer committed = allocate(windowBytes, "committed window"),
+                    stored = allocate(windowBytes, "stored window");
   for (const uint32_t path : paths) {
-    const MetalBuffer committed = allocate(windowBytes, "committed window"),
-                      stored = allocate(windowBytes, "stored window");
     *static_cast<uint32_t *>(retained.contents()) = path;
     // The path's rows, gathered in order.
     const uint32_t count = static_cast<uint32_t>(std::popcount(path));
@@ -888,13 +890,19 @@ void contextWindowCommit(MetalBackend &backend, uint32_t width) {
       if (path >> row & 1)
         std::memcpy(static_cast<uint16_t *>(gathered.contents()) + uint64_t{at++} * width,
                     static_cast<const uint16_t *>(rows.contents()) + uint64_t{first + row} * width, width * 2);
-    CommandGraph graph;
-    DraftAttention::addWindowCommit(graph, rows, committed, retained, laneRows, stepRows, kRows, start, width);
-    if (count)
-      DraftAttention::addWindowStore(graph, gathered, stored, count, start, width);
-    static_cast<void>(backend.submitCommandAsync(graph.dispatches()).wait());
-    require(std::memcmp(committed.contents(), stored.contents(), windowBytes) == 0,
-            "a window commit of retained rows " + std::to_string(path) + " is not their store");
+    for (uint32_t k = 1; k <= kRows; ++k) {
+      std::memset(committed.contents(), 0xA5, windowBytes);
+      std::memset(stored.contents(), 0xA5, windowBytes);
+      const uint32_t kept = std::min(k, count);
+      CommandGraph graph;
+      DraftAttention::addWindowCommit(graph, rows, committed, retained, laneRows, stepRows, k, start, width);
+      if (kept)
+        DraftAttention::addWindowStore(graph, gathered, stored, kept, start, width);
+      static_cast<void>(backend.submitCommandAsync(graph.dispatches()).wait());
+      require(std::memcmp(committed.contents(), stored.contents(), windowBytes) == 0,
+              "a window commit of the first " + std::to_string(k) + " of retained rows " + std::to_string(path) +
+                  " is not their store");
+    }
   }
 }
 
