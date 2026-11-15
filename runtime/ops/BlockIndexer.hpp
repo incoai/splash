@@ -26,28 +26,39 @@ struct BlockIndex final {
   uint32_t offset = 0;
 };
 
-// The indexer's rows of a dispatch's lanes (a verify step's, or a prefill
-// sequence as one): lane l's query rows lanes[l] of the dispatch's rows (in
-// row order), from logical position firstPositions[l], which attend sparsely
-// past topBlocks complete blocks of the index; bitmaps of maskWords words and
-// scores of scoreStride per row, which cover each row's complete blocks and
-// its tail.
-struct IndexerRows final {
-  std::span<const LaneRows> lanes;
-  std::span<const uint32_t> firstPositions;
-  BlockIndex index;
+// The indexer's rows of a prompt sequence, committed as they run: `rows`
+// rows (its queries', keys' and bitmaps' from their first) from logical
+// position firstPosition, its index through `indexTable`, `indexOffset`
+// bytes into each entry's plane, which attend sparsely past topBlocks
+// complete blocks; bitmaps of maskWords words and scores of scoreStride per
+// row, which cover each row's complete blocks and its tail.
+struct IndexerSequence final {
+  uint32_t rows = 0;
+  uint32_t firstPosition = 0;
+  metal::MetalBuffer indexTable;
+  uint32_t indexOffset = 0;
   uint32_t topBlocks = 0;
   uint32_t maskWords = 0;
   uint32_t scoreStride = 0;
 };
 
-// The blocks a dispatch's lanes' rows complete, which the pool pools: lane
-// l's counts[l] BlockIndexerBlock records from record l * laneRecords of
-// `records`, from the rows' raw keys (`keys`, bf16 rows of
-// BLOCK_INDEXER_DIMENSION as the project writes them) and the tokens before
-// lane l's rows from pending[l], its pending keys (BLOCK_INDEXER_PENDING bf16
-// rows). A verify step's records are each lane's of the blocks from its
-// anchor's on that a path of its most rows may complete.
+// The blocks a prompt sequence's rows complete, which the pool pools into
+// its index: `count` BlockIndexerBlock records of `records`, from the rows'
+// raw keys (`keys`, bf16 rows of BLOCK_INDEXER_DIMENSION as the project
+// writes them) and the tokens before its first row from `pending`, its
+// pending keys (BLOCK_INDEXER_PENDING bf16 rows).
+struct IndexerSequenceBlocks final {
+  metal::MetalBuffer records;
+  uint32_t count = 0;
+  metal::MetalBuffer keys;
+  metal::MetalBuffer pending;
+};
+
+// The blocks a verify step's lanes' rows may complete, which the tree pool
+// pools: lane l's counts[l] BlockIndexerBlock records from record
+// l * laneRecords of `records`, of the blocks from its anchor's on that a
+// path of its most rows may complete, from the rows' raw keys (`keys`) and
+// the tokens before lane l's anchor from pending[l], its pending keys.
 struct IndexerBlocks final {
   metal::MetalBuffer records;
   std::span<const uint32_t> counts;
@@ -62,8 +73,8 @@ struct IndexerBlocks final {
 // row 0 (SplashLaneRows, in lane order, 1 to laneCap a lane,
 // ops::verifyLaneCap) in `laneRows` and every row's place in its lane's tree
 // (SplashTreeRow) in `tree`; lane l's anchor at logical position anchors[l];
-// and as IndexerRows the index, the budget, and the words of a row's bitmap
-// and its scores, a row of each per row of the step.
+// and as a sequence's (IndexerSequence) the lanes' index, the budget, and the
+// words of a row's bitmap and its scores, a row of each per row of the step.
 struct IndexerTreeRows final {
   metal::MetalBuffer laneRows;
   metal::MetalBuffer tree;
@@ -110,23 +121,24 @@ struct BlockIndexer final {
   [[nodiscard]] static bool sparse(uint32_t firstPosition, uint32_t rows, uint32_t topBlocks) noexcept {
     return completeBlocks(firstPosition, rows) > topBlocks;
   }
-  // The indexer's query heads, normalized and rotated (bf16 rows of
-  // BLOCK_INDEXER_HEADS heads), and the rows' raw keys (bf16).
+  // The indexer's query heads of `lanes`' rows (a prompt sequence's as one
+  // lane, or a verify step's lanes, in row order), normalized and rotated by
+  // each row's RoPE table (bf16 rows of BLOCK_INDEXER_HEADS heads), and the
+  // rows' raw keys (bf16).
   static void addProject(metal::CommandGraph &graph, metal::MetalBuffer query, metal::MetalBuffer key,
                          const NormWeights &queryNorm, metal::MetalBuffer ropeCos, metal::MetalBuffer ropeSin,
-                         metal::MetalBuffer queries, metal::MetalBuffer keys, const IndexerRows &rows);
-  // The pooled keys of the blocks the lanes' rows complete, into the index,
-  // rotated by the target's RoPE of `inverseFrequencies` scaled by ropeScale,
-  // as the queries' tables are: YaRN's attention factor, 1 without YaRN.
-  static void addPool(metal::CommandGraph &graph, const IndexerBlocks &blocks, const NormWeights &keyNorm,
-                      metal::MetalBuffer inverseFrequencies, float ropeScale, const IndexerRows &rows);
-  // The rows' scores of their complete blocks' pooled keys and, from them,
-  // their bitmaps. A dispatch of one lane scores its rows in batches of the
-  // score scratch's scoreRows rows; one of several lanes scores every lane's
-  // rows at once, which the scratch must hold from the first lane's first
-  // row on.
+                         metal::MetalBuffer queries, metal::MetalBuffer keys, std::span<const LaneRows> lanes);
+  // The pooled keys of the blocks a prompt sequence's rows complete, into its
+  // index, rotated by the target's RoPE of `inverseFrequencies` scaled by
+  // ropeScale, as the queries' tables are: YaRN's attention factor, 1
+  // without YaRN.
+  static void addPool(metal::CommandGraph &graph, const IndexerSequenceBlocks &blocks, const NormWeights &keyNorm,
+                      metal::MetalBuffer inverseFrequencies, float ropeScale, const IndexerSequence &sequence);
+  // A prompt sequence's rows' scores of their complete blocks' pooled keys
+  // and, from them, their bitmaps, in batches of the score scratch's
+  // scoreRows rows.
   static void addSelect(metal::CommandGraph &graph, metal::MetalBuffer queries, metal::MetalBuffer scores,
-                        uint32_t scoreRows, metal::MetalBuffer mask, const IndexerRows &rows);
+                        uint32_t scoreRows, metal::MetalBuffer mask, const IndexerSequence &sequence);
   // A verify step's pool: each of its rows that completes a block pools it
   // from its path into its block key (bf16 rows of BLOCK_INDEXER_DIMENSION,
   // a row per row of the step); none goes into the index.

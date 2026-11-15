@@ -205,17 +205,14 @@ std::vector<ops::AttentionBlocks> Qwen4ExpTarget::addPrefillQsa(PrefillStep &ste
     return rowsOf<float>(buffer, sequence.rowBegin, sequence.rows, width);
   };
   // A sequence's rows are the whole of the views of them each dispatch takes.
-  std::vector<uint32_t> firstPositions;
-  std::vector<ops::LaneRows> sequenceRows;
-  for (const QwenTargetPrefillSequence &sequence : step.sequences) {
-    firstPositions.push_back(static_cast<uint32_t>(sequence.chunk.committed_tokens));
-    sequenceRows.push_back({0, sequence.rows});
-  }
-  const auto qsaRows = [&](size_t index) {
-    const QwenTargetPrefillSequence &sequence = step.sequences[index];
-    return ops::IndexerRows{std::span(sequenceRows).subspan(index, 1), std::span(firstPositions).subspan(index, 1),
-                            {{&sequence.indexTable, 1}, step.indexOffsets[layer]}, topBlocks, h.maskWords,
-                            h.scoreStride};
+  const auto qsaRows = [&](const QwenTargetPrefillSequence &sequence) {
+    return ops::IndexerSequence{sequence.rows,
+                                static_cast<uint32_t>(sequence.chunk.committed_tokens),
+                                sequence.indexTable,
+                                step.indexOffsets[layer],
+                                topBlocks,
+                                h.maskWords,
+                                h.scoreStride};
   };
   addIndexerProjections(step.graph, linear, b.normalized, indexer, h.indexerQuery, h.indexerKey, step.rows);
   std::vector<ops::AttentionBlocks> blocks(step.sequences.size());
@@ -225,26 +222,26 @@ std::vector<ops::AttentionBlocks> Qwen4ExpTarget::addPrefillQsa(PrefillStep &ste
     const QwenTargetPrefillSequence &sequence = step.sequences[index];
     const metal::MetalBuffer keys = u16Rows(h.qsaKeys, sequence, keyWidth);
     const metal::MetalBuffer pending = steps_.qsaPending(sequence.auxiliaryIn, layer);
+    const ops::IndexerSequence rows = qsaRows(sequence);
+    const std::array<ops::LaneRows, 1> projected{{{0, sequence.rows}}};
     ops::BlockIndexer::addProject(step.graph, f32Rows(h.indexerQuery, sequence, queryWidth),
                                   f32Rows(h.indexerKey, sequence, keyWidth), indexer.queryNorm,
                                   f32Rows(b.ropeCos, sequence, geometry_.rotaryPairs),
                                   f32Rows(b.ropeSin, sequence, geometry_.rotaryPairs),
-                                  u16Rows(h.qsaQueries, sequence, queryWidth), keys, qsaRows(index));
-    ops::BlockIndexer::addPool(step.graph,
-                               {step.blocks[index].records, {&step.blocks[index].count, 1}, 0, keys, {&pending, 1}},
+                                  u16Rows(h.qsaQueries, sequence, queryWidth), keys, projected);
+    ops::BlockIndexer::addPool(step.graph, {step.blocks[index].records, step.blocks[index].count, keys, pending},
                                indexer.keyNorm, b.ropeInverseFrequencies, geometry_.ropeScaling.attentionFactor(),
-                               qsaRows(index));
+                               rows);
     ops::BlockIndexer::addPending(step.graph, keys, pending, steps_.qsaPending(sequence.auxiliaryOut, layer),
-                                  firstPositions[index], sequence.rows);
+                                  rows.firstPosition, sequence.rows);
     for (const QwenTargetStateCapture &capture : sequence.stateCaptures)
       ops::BlockIndexer::addPending(step.graph, keys, pending, steps_.qsaPending(capture.auxiliary, layer),
-                                    firstPositions[index], capture.row);
-    if (!ops::BlockIndexer::sparse(firstPositions[index], sequence.rows, topBlocks)) continue;
+                                    rows.firstPosition, capture.row);
+    if (!ops::BlockIndexer::sparse(rows.firstPosition, sequence.rows, topBlocks)) continue;
     ops::BlockIndexer::addSelect(step.graph, u16Rows(h.qsaQueries, sequence, queryWidth), h.qsaScores, h.scoreRows,
-                                 rowsOf<uint32_t>(h.qsaMask, sequence.rowBegin, sequence.rows, h.maskWords),
-                                 qsaRows(index));
+                                 rowsOf<uint32_t>(h.qsaMask, sequence.rowBegin, sequence.rows, h.maskWords), rows);
     blocks[index] = {h.qsaLists, h.qsaListCounts, h.listStride, lists};
-    sparseRows.push_back({sequence.rowBegin, sequence.rows, firstPositions[index], lists});
+    sparseRows.push_back({sequence.rowBegin, sequence.rows, rows.firstPosition, lists});
     lists += step.attention->sequences()[index].tiles();
   }
   if (!sparseRows.empty())
@@ -310,11 +307,15 @@ ops::AttentionBlocks Qwen4ExpTarget::addVerifyQsa(VerifyStep &step, const Qwen4I
     laneRows[lane] = {lane * kVerifyRows, kVerifyRows};
     sparse = sparse || ops::BlockIndexer::sparse(firstPositions[lane], laneCap, topBlocks);
   }
-  const ops::BlockIndex index{std::span(b.indexTables).first(step.lanes), step.indexOffsets[layer]};
-  const ops::IndexerRows qsa{std::span(laneRows).first(step.lanes), std::span(firstPositions).first(step.lanes),
-                             index, topBlocks, h.maskWords, h.scoreStride};
-  const ops::IndexerTreeRows tree{b.laneRows, b.tree, step.rows, laneCap, std::span(firstPositions).first(step.lanes),
-                                  index, topBlocks, h.maskWords, h.scoreStride};
+  const ops::IndexerTreeRows tree{b.laneRows,
+                                  b.tree,
+                                  step.rows,
+                                  laneCap,
+                                  std::span(firstPositions).first(step.lanes),
+                                  {std::span(b.indexTables).first(step.lanes), step.indexOffsets[layer]},
+                                  topBlocks,
+                                  h.maskWords,
+                                  h.scoreStride};
   const metal::MetalBuffer queries = rowsOf<uint16_t>(h.qsaQueries, 0, step.rows, queryWidth);
   // The layer's keys and block keys, which the commit reads after the last
   // layer, and each lane's pending keys before the step.
@@ -325,7 +326,8 @@ ops::AttentionBlocks Qwen4ExpTarget::addVerifyQsa(VerifyStep &step, const Qwen4I
   ops::BlockIndexer::addProject(step.graph, rowsOf<float>(h.indexerQuery, 0, step.rows, queryWidth),
                                 rowsOf<float>(h.indexerKey, 0, step.rows, keyWidth), indexer.queryNorm,
                                 rowsOf<float>(b.ropeCos, 0, step.rows, geometry_.rotaryPairs),
-                                rowsOf<float>(b.ropeSin, 0, step.rows, geometry_.rotaryPairs), queries, keys, qsa);
+                                rowsOf<float>(b.ropeSin, 0, step.rows, geometry_.rotaryPairs), queries, keys,
+                                std::span(laneRows).first(step.lanes));
   ops::BlockIndexer::addTreePool(step.graph,
                                  {step.blocks.records, std::span(step.blocks.counts).first(step.lanes),
                                   step.blocks.laneRecords, keys, std::span(pending).first(step.lanes)},

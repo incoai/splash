@@ -38,7 +38,7 @@
 // pooled keys of the blocks they complete, every row's scores of every complete
 // block and its bitmap, over random pooled keys of the history, a lane's rows'
 // indexer queries sharing most of their direction as consecutive tokens' do;
-// a prefill chunk as a prompt's sequence (ops::BlockIndexer::addPool,
+// a prefill chunk as a prompt sequence (ops::BlockIndexer::addPool,
 // addSelect), the verify lanes as a verify step whose lanes are chains on the
 // device (addTreePool, addTreeSelect: each row's own blocks pooled into its
 // block key and scored from there).
@@ -418,10 +418,8 @@ metal::CommandGraph caseGraph(const AttentionFixture &fixture, const QsaBlocks &
     std::vector<ops::LaneRows> lanes;
     for (uint32_t lane = 0; lane < indexer->firstPositions.size(); ++lane)
       lanes.push_back({lane * plan.rows, plan.rows});
-    const ops::IndexerRows sequence{lanes, indexer->firstPositions, {indexer->tables, 0}, kQsaTopBlocks, qsa.words,
-                                    qsa.words * 32};
     BlockIndexer::addProject(graph, indexer->query, indexer->key, {indexer->norm, true}, indexer->ropeCos,
-                             indexer->ropeSin, indexer->queries, indexer->keys, sequence);
+                             indexer->ropeSin, indexer->queries, indexer->keys, lanes);
     if (indexer->tree) {
       const ops::IndexerTreeRows rows{indexer->laneRows,
                                       indexer->tree,
@@ -439,8 +437,9 @@ metal::CommandGraph caseGraph(const AttentionFixture &fixture, const QsaBlocks &
       BlockIndexer::addTreeSelect(graph, indexer->queries, indexer->blockKeys, indexer->scores, qsa.bitmaps,
                                   indexer->rowMasks, rows);
     } else {
-      BlockIndexer::addPool(graph,
-                            {indexer->records, indexer->counts, indexer->laneRecords, indexer->keys, indexer->pending},
+      const ops::IndexerSequence sequence{plan.rows, indexer->firstPositions[0], indexer->tables[0], 0,
+                                          kQsaTopBlocks, qsa.words, qsa.words * 32};
+      BlockIndexer::addPool(graph, {indexer->records, indexer->counts[0], indexer->keys, indexer->pending[0]},
                             {indexer->norm, true}, indexer->inverseFrequencies, 1.0F, sequence);
       BlockIndexer::addSelect(graph, indexer->queries, indexer->scores, indexer->scoreRows, qsa.bitmaps, sequence);
     }

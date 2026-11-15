@@ -88,7 +88,7 @@ kernel void block_indexer_project(device const float *query [[buffer(0)]],
                                   device const float *rope_sin [[buffer(4)]],
                                   device bfloat *queries [[buffer(5)]],
                                   device bfloat *keys [[buffer(6)]],
-                                  constant BlockIndexerParams &p [[buffer(7)]],
+                                  constant BlockIndexerProjectParams &p [[buffer(7)]],
                                   uint3 group [[threadgroup_position_in_grid]],
                                   uint tid [[thread_index_in_threadgroup]],
                                   uint lane [[thread_index_in_simdgroup]],
@@ -129,43 +129,32 @@ inline void indexer_pool_store(float sum, BlockIndexerBlock block, device const 
   indexer_rotate_store(mean * scale * key_norm[tid], rotated, cosine, sine, out, tid);
 }
 
-// Threadgroup (block, lane) of 128 threads: the mean of the block's four
-// tokens' raw keys, normalized and rotated to its first token's position.
-// A token from the lane's first row on is a row's of the step; one before it
-// is in the lane's pending keys, whose open block this is.
+// Threadgroup per block of a prompt sequence of 128 threads: the mean of the
+// block's four tokens' raw keys, normalized and rotated to its first token's
+// position, into the sequence's index. A token from the sequence's first row
+// on is a row's; one before it is in the sequence's pending keys, whose open
+// block this is.
 kernel void block_indexer_pool(device const BlockIndexerBlock *blocks [[buffer(0)]],
                                device const bfloat *keys [[buffer(1)]],
-                               device const bfloat *pending0 [[buffer(2)]],
-                               device const bfloat *pending1 [[buffer(3)]],
-                               device const bfloat *pending2 [[buffer(4)]],
-                               device const bfloat *pending3 [[buffer(5)]],
-                               device const float *key_norm [[buffer(6)]],
-                               device const float *inverse_frequencies [[buffer(7)]],
-                               device const SplashKvPage *index_table0 [[buffer(8)]],
-                               device const SplashKvPage *index_table1 [[buffer(9)]],
-                               device const SplashKvPage *index_table2 [[buffer(10)]],
-                               device const SplashKvPage *index_table3 [[buffer(11)]],
-                               constant BlockIndexerParams &p [[buffer(12)]],
-                               uint2 group [[threadgroup_position_in_grid]],
+                               device const bfloat *pending [[buffer(2)]],
+                               device const float *key_norm [[buffer(3)]],
+                               device const float *inverse_frequencies [[buffer(4)]],
+                               device const SplashKvPage *index_table [[buffer(5)]],
+                               constant BlockIndexerSequenceParams &p [[buffer(6)]],
+                               uint index [[threadgroup_position_in_grid]],
                                uint tid [[thread_index_in_threadgroup]],
                                uint lane [[thread_index_in_simdgroup]],
                                uint sg [[simdgroup_index_in_threadgroup]]) {
   threadgroup float scratch[kDimension / 32];
   threadgroup float rotated[kDimension];
   threadgroup float cosine[kPairs], sine[kPairs];
-  const uint index = group.x, batch = group.y;
-  if (!indexer_lane(batch, p.lanes) || index >= p.counts[batch]) return;
-  device const SplashKvPage *index_table =
-      SPLASH_LANE_BINDING(batch, index_table0, index_table1, index_table2, index_table3);
-  device const bfloat *pending = SPLASH_LANE_BINDING(batch, pending0, pending1, pending2, pending3);
-  const BlockIndexerBlock block = blocks[ulong(batch) * p.lane_records + index];
-  const uint first = p.first_position[batch];
-  device const bfloat *lane_keys = keys + ulong(p.first_row[batch]) * kDimension;
+  if (index >= p.blocks) return;
+  const BlockIndexerBlock block = blocks[index];
+  const uint first = p.first_position;
   float sum = 0.0f;
   for (uint t = 0; t < kBlock; ++t) {
     const uint position = block.position + t;
-    sum += float(position >= first ? lane_keys[ulong(position - first) * kDimension + tid]
-                                   : pending[t * kDimension + tid]);
+    sum += float(position >= first ? keys[ulong(position - first) * kDimension + tid] : pending[t * kDimension + tid]);
   }
   indexer_pool_store(sum, block, key_norm, inverse_frequencies, p.rope_scale,
                      indexer_block_key(index_table, p.index_offset, block.position / kBlock), scratch, rotated,
@@ -190,7 +179,7 @@ kernel void block_indexer_pool_tree(device const BlockIndexerBlock *blocks [[buf
                                     device const float *key_norm [[buffer(8)]],
                                     device const float *inverse_frequencies [[buffer(9)]],
                                     device bfloat *block_keys [[buffer(10)]],
-                                    constant BlockIndexerParams &p [[buffer(11)]],
+                                    constant BlockIndexerTreeParams &p [[buffer(11)]],
                                     uint2 group [[threadgroup_position_in_grid]],
                                     uint tid [[thread_index_in_threadgroup]],
                                     uint lane [[thread_index_in_simdgroup]],
@@ -377,37 +366,31 @@ inline void indexer_load_index(threadgroup IndexerScoreTile &tile, device const 
   }
 }
 
-// Threadgroup per tile of kScoreRows rows of a lane by kScoreBlocks blocks:
-// each row's scores of the tile's complete blocks. The scratch holds the
-// dispatch's rows from its first lane's first row, as the queries do; a tile
-// past its lane's rows has none.
+// Threadgroup per tile of kScoreRows rows of a prompt sequence's batch by
+// kScoreBlocks blocks: each row's scores of the tile's complete blocks, in
+// the score scratch's rows from the batch's first; a tile past the batch's
+// rows has none.
 kernel void block_indexer_score(device const bfloat *queries [[buffer(0)]],
-                                device const SplashKvPage *index_table0 [[buffer(1)]],
-                                device const SplashKvPage *index_table1 [[buffer(2)]],
-                                device const SplashKvPage *index_table2 [[buffer(3)]],
-                                device const SplashKvPage *index_table3 [[buffer(4)]],
-                                device float *scores [[buffer(5)]],
-                                constant BlockIndexerParams &p [[buffer(6)]],
-                                uint3 group [[threadgroup_position_in_grid]],
+                                device const SplashKvPage *index_table [[buffer(1)]],
+                                device float *scores [[buffer(2)]],
+                                constant BlockIndexerSequenceParams &p [[buffer(3)]],
+                                uint2 group [[threadgroup_position_in_grid]],
                                 uint tid [[thread_index_in_threadgroup]]) {
   threadgroup IndexerScoreTile tile;
-  const uint row0 = group.y * kScoreRows, block0 = group.x * kScoreBlocks, batch = group.z;
-  if (!indexer_lane(batch, p.lanes) || row0 >= p.rows[batch]) return;
-  const uint rows = p.rows[batch], last = min(rows, row0 + kScoreRows);
+  const uint row0 = group.y * kScoreRows, block0 = group.x * kScoreBlocks;
+  if (row0 >= p.rows) return;
+  const uint last = min(p.rows, row0 + kScoreRows);
   // Rows attend sparsely past top_blocks complete blocks; complete blocks
   // grow with the row.
-  const uint complete = (p.first_position[batch] + p.row_offset + last) / kBlock;
+  const uint complete = (p.first_position + p.row_offset + last) / kBlock;
   if (block0 >= complete || complete <= p.top_blocks) return;
-  indexer_load_queries(tile, queries + (ulong(p.first_row[batch]) + p.row_offset + row0) * kHeads * kDimension,
-                       last - row0, tid);
-  indexer_load_index(tile, SPLASH_LANE_BINDING(batch, index_table0, index_table1, index_table2, index_table3),
-                     p.index_offset, block0, complete, tid);
+  indexer_load_queries(tile, queries + (ulong(p.row_offset) + row0) * kHeads * kDimension, last - row0, tid);
+  indexer_load_index(tile, index_table, p.index_offset, block0, complete, tid);
   indexer_tile_products(tile);
   for (uint index = tid; index < kScoreRows * kScoreBlocks; index += kScoreThreads) {
     const uint r = index / kScoreBlocks, b = index % kScoreBlocks;
-    if (row0 + r >= rows || block0 + b >= complete) continue;
-    scores[(ulong(p.first_row[batch] - p.first_row[0]) + row0 + r) * p.score_stride + block0 + b] =
-        indexer_tile_score(tile, r, b);
+    if (row0 + r >= p.rows || block0 + b >= complete) continue;
+    scores[ulong(row0 + r) * p.score_stride + block0 + b] = indexer_tile_score(tile, r, b);
   }
 }
 
@@ -429,7 +412,7 @@ kernel void block_indexer_score_tree(device const bfloat *queries [[buffer(0)]],
                                      device const SplashKvPage *index_table2 [[buffer(6)]],
                                      device const SplashKvPage *index_table3 [[buffer(7)]],
                                      device float *scores [[buffer(8)]],
-                                     constant BlockIndexerParams &p [[buffer(9)]],
+                                     constant BlockIndexerTreeParams &p [[buffer(9)]],
                                      uint3 group [[threadgroup_position_in_grid]],
                                      uint3 groups [[threadgroups_per_grid]],
                                      uint tid [[thread_index_in_threadgroup]]) {
@@ -629,22 +612,20 @@ inline void indexer_select_row(device const float *s, uint complete, uint words,
   }
 }
 
+// A threadgroup per row of a prompt sequence's batch.
 kernel void block_indexer_select(device const float *scores [[buffer(0)]],
                                  device uint *mask [[buffer(1)]],
-                                 constant BlockIndexerParams &p [[buffer(2)]],
-                                 uint2 group [[threadgroup_position_in_grid]],
+                                 constant BlockIndexerSequenceParams &p [[buffer(2)]],
+                                 uint row [[threadgroup_position_in_grid]],
                                  uint tid [[thread_index_in_threadgroup]],
                                  uint lane [[thread_index_in_simdgroup]],
                                  uint sg [[simdgroup_index_in_threadgroup]]) {
   threadgroup IndexerSelectScratch scratch;
-  const uint batch = group.y;
-  if (!indexer_lane(batch, p.lanes) || group.x >= p.rows[batch]) return;
-  const uint position = p.first_position[batch] + p.row_offset + group.x;
-  const uint complete = (position + 1) / kBlock;
-  indexer_select_row(scores + (ulong(p.first_row[batch] - p.first_row[0]) + group.x) * p.score_stride, complete,
+  if (row >= p.rows) return;
+  const uint complete = (p.first_position + p.row_offset + row + 1) / kBlock;
+  indexer_select_row(scores + ulong(row) * p.score_stride, complete,
                      min(p.mask_words, (complete + BLOCK_INDEXER_TILE_SLACK) / 32 + 1),
-                     mask + (ulong(p.first_row[batch]) + p.row_offset + group.x) * p.mask_words, p.top_blocks,
-                     scratch, tid, lane, sg);
+                     mask + (ulong(p.row_offset) + row) * p.mask_words, p.top_blocks, scratch, tid, lane, sg);
 }
 
 // The same for a verify lane's rows on the device, a row at its anchor's
@@ -661,7 +642,7 @@ kernel void block_indexer_select_tree(device const float *scores [[buffer(0)]],
                                       device const SplashLaneRows *lane_rows [[buffer(2)]],
                                       device uint *mask [[buffer(3)]],
                                       device uint *row_masks [[buffer(4)]],
-                                      constant BlockIndexerParams &p [[buffer(5)]],
+                                      constant BlockIndexerTreeParams &p [[buffer(5)]],
                                       uint2 group [[threadgroup_position_in_grid]],
                                       uint tid [[thread_index_in_threadgroup]],
                                       uint lane [[thread_index_in_simdgroup]],
