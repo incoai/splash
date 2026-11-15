@@ -48,6 +48,9 @@ public:
   // The anchor request `requestId`'s last selection left pending, which its
   // next decode step emits first; none until its first token is selected.
   [[nodiscard]] static std::optional<uint32_t> pendingToken(const Runtime &runtime, uint64_t requestId);
+  // The tokens request `requestId`'s lookup index holds (model::LookupIndex),
+  // until its next command or suspension.
+  [[nodiscard]] static std::span<const uint32_t> lookupTokens(const Runtime &runtime, uint64_t requestId);
   // The GPU tables of resident request `requestId`'s lane as its last
   // command left them, every entry the lane holds: its page table and, for
   // a layout with a block index, its index table (none without).

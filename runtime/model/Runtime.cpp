@@ -420,13 +420,17 @@ struct Runtime::Impl {
     // the prompt (with any replayed generation) and the emitted output, which
     // the target may read (QwenTargetRequest).
     std::vector<uint32_t> tokens;
-    // Its tokens and its pending one as a lookup index, which its decode
-    // cycles bring up to date (proposeLookup), and the lookup chain its
-    // current cycle verifies beside its draft's tree: the match's length and
-    // the chain's tokens, none without.
-    std::optional<LookupIndex> lookup;
+    // Its tokens and its pending one as a lookup index: its prompt's chunks
+    // add theirs while the GPU runs them (followPrompt), its selections
+    // theirs as they commit (commitSelected), so that no decode cycle indexes
+    // (a traced 128K-token prompt takes 9 ms to index on an M5 Max, which
+    // its first cycle's encode spent while every lane waited). A suspension
+    // drops it with the lane, and a resume's replay builds it again.
+    LookupIndex lookup;
+    // The lookup chain its current cycle verifies beside its draft's tree:
+    // the match's length and the chain's tokens, none without.
     uint32_t lookupLength = 0;
-    std::span<const uint32_t> lookupChain;
+    std::vector<uint32_t> lookupChain;
     // The estimates of the rows its draft's tree took in its last cycle past
     // its anchor, best first (DecodeTensor::DraftTreeScores), for the choice
     // of a cycle's rows (VerifyBudget::stepRows); none before its first.
@@ -1432,10 +1436,26 @@ struct Runtime::Impl {
         throw std::logic_error("thinking went past its budget");
     }
     // The previous anchor and every selection before the new one are now
-    // read (Request::tokens).
+    // read (Request::tokens); its lookup index, which holds the previous
+    // anchor, takes every selection.
     if (entry.pendingToken) entry.tokens.push_back(*entry.pendingToken);
     entry.tokens.insert(entry.tokens.end(), tokens.begin(), tokens.end() - 1);
     entry.pendingToken = tokens.back();
+    entry.lookup.append(tokens);
+  }
+
+  // While the GPU runs a prompt chunk that ends at `end`, its request's
+  // lookup index takes the request's tokens through it, those of a state it
+  // restored before its first chunk included, and once the chunk ends the
+  // prompt, the anchor a replayed request kept (Request::lookup). A chunk
+  // run again, or another pass of it, adds nothing.
+  static void followPrompt(Request &entry, uint64_t end) {
+    LookupIndex &index = entry.lookup;
+    const size_t held = index.tokens().size();
+    if (held < end)
+      index.append(std::span(entry.tokens).subspan(held, end - held));
+    if (end == entry.tokens.size() && entry.pendingToken && index.tokens().size() == end)
+      index.append({&*entry.pendingToken, 1});
   }
 
   // A selection outside the vocabulary is the sampling kernels' sentinel for a
@@ -2321,7 +2341,7 @@ struct Runtime::Impl {
         tree.temperature = policy.temperature;
         tree.noise = entry.cycleNoise;
       }
-      entry.lookupChain = {};
+      entry.lookupChain.clear();
       // A thinking end at the lane's first row is its proposals, a chain the
       // verify selects whatever its logits: no draft row beside it could be
       // accepted. Before its thinking ends, where a cutoff would replace its
@@ -2386,17 +2406,9 @@ struct Runtime::Impl {
   // for each agreement with the draft (LookupAcceptance), of which the
   // selector takes its own.
   void proposeLookup(Request &entry, ops::DraftTreeLane &tree, uint32_t lane) {
-    // The index holds a prefix of the request's tokens and its pending one,
-    // which the request has added to since; one that does not is rebuilt.
-    const auto token = [&](size_t at) { return at < entry.tokens.size() ? entry.tokens[at] : *entry.pendingToken; };
-    if (!entry.lookup || entry.lookup->tokens().size() > entry.tokens.size() + 1 ||
-        (!entry.lookup->tokens().empty() && entry.lookup->tokens().back() != token(entry.lookup->tokens().size() - 1)))
-      entry.lookup.emplace();
-    LookupIndex &index = *entry.lookup;
-    if (index.tokens().size() < entry.tokens.size())
-      index.append(std::span(entry.tokens).subspan(index.tokens().size()));
-    if (index.tokens().size() == entry.tokens.size())
-      index.append({&*entry.pendingToken, 1});
+    const LookupIndex &index = entry.lookup;
+    if (index.tokens().size() != entry.tokens.size() + 1 || index.tokens().back() != *entry.pendingToken)
+      throw std::logic_error("a lookup index does not hold its request's tokens");
     const std::span<const uint32_t> chain = index.proposals(std::min(tree.depth, SPLASH_TREE_CHAIN_TOKENS));
     if (chain.empty())
       return;
@@ -2411,7 +2423,8 @@ struct Runtime::Impl {
     }
     tree.chain = static_cast<uint32_t>(chain.size());
     entry.lookupLength = length;
-    entry.lookupChain = chain;
+    // A copy: its index grows when the cycle's selections commit.
+    entry.lookupChain.assign(chain.begin(), chain.end());
   }
 
   // A decode step's target forward: the prompt forward over the step's rows
@@ -3107,6 +3120,10 @@ void Runtime::suspend(uint64_t requestId) {
   impl_->releaseImages(entry);
   entry.draftContextPlan.reset();
   entry.draftRebuild.reset();
+  // Its lookup index goes with its lane, 84 bytes a token of a traced
+  // 128K-token prompt, which a resume's replay indexes again
+  // (Request::lookup).
+  entry.lookup = LookupIndex();
   entry.replayingGeneration |= entry.promptComplete;
   entry.promptComplete = false;
   entry.resident = false;
@@ -3518,18 +3535,26 @@ Runtime::prefillAsync(const BatchPlan &plan,
   WorkCount count(prefillCommandWork(impl_->geometry.target, std::span(lanes).first(items.size()), plan.layer,
                                      plan.passes - plan.pass),
                   impl_->model.expertStore(), reads);
-  if (encodes.empty())
-    return std::make_unique<DeferredMetalTicket>(submit({}), std::move(finish), std::move(count));
-  // The images' encodes, seconds of GPU work on a small GPU, run as a command
-  // of their own, and the command is submitted once they have completed. So
-  // they are timed apart, and the scheduler leaves their time out of the time
-  // it sizes later prefill commands by (Scheduler::complete); and they hold
-  // up no Neural Engine wait: Metal fails an event wait unmet 5 s after its
-  // queue reached it, which it does for the command's first wait, if no host
-  // step comes before it, as the command is submitted, whatever work runs
-  // ahead of it (MetalBackend.hpp, EventStep).
-  return std::make_unique<DeferredMetalTicket>(impl_->backend.submitCommandAsync(encodes.command(), completion),
-                                               submit, std::move(finish), std::move(count));
+  std::unique_ptr<ModelBatchTicket> ticket;
+  if (encodes.empty()) {
+    ticket = std::make_unique<DeferredMetalTicket>(submit({}), std::move(finish), std::move(count));
+  } else {
+    // The images' encodes, seconds of GPU work on a small GPU, run as a
+    // command of their own, and the command is submitted once they have
+    // completed. So they are timed apart, and the scheduler leaves their time
+    // out of the time it sizes later prefill commands by
+    // (Scheduler::complete); and they hold up no Neural Engine wait: Metal
+    // fails an event wait unmet 5 s after its queue reached it, which it
+    // does for the command's first wait, if no host step comes before it, as
+    // the command is submitted, whatever work runs ahead of it
+    // (MetalBackend.hpp, EventStep).
+    ticket = std::make_unique<DeferredMetalTicket>(impl_->backend.submitCommandAsync(encodes.command(), completion),
+                                                   submit, std::move(finish), std::move(count));
+  }
+  // While the GPU runs it, each lane's lookup index takes its chunk's tokens.
+  for (uint32_t lane = 0; lane < items.size(); ++lane)
+    Impl::followPrompt(*entries[lane], items[lane].logicalPosition + items[lane].tokenCount);
+  return ticket;
 }
 
 std::vector<ModelStepResult>
@@ -3843,6 +3868,11 @@ void Runtime::prepareWarmupDecode(uint64_t requestId, uint32_t anchor) {
   auto &entry = impl_->request(requestId);
   entry.pendingToken = anchor;
   entry.generatedTokens = 0;
+  // In its lookup index too, the forced anchor replaces the one its prompt
+  // selected.
+  entry.lookup = LookupIndex();
+  entry.lookup.append(entry.tokens);
+  entry.lookup.append({&anchor, 1});
 }
 
 WarmupStepResult Runtime::warmupPrefill(uint32_t rows) {
@@ -4188,6 +4218,10 @@ std::vector<std::vector<float>> RuntimeInstrumentation::takeTargetLogits(Runtime
 
 std::optional<uint32_t> RuntimeInstrumentation::pendingToken(const Runtime &runtime, uint64_t requestId) {
   return runtime.impl_->requests.at(requestId).pendingToken;
+}
+
+std::span<const uint32_t> RuntimeInstrumentation::lookupTokens(const Runtime &runtime, uint64_t requestId) {
+  return runtime.impl_->requests.at(requestId).lookup.tokens();
 }
 
 RuntimeInstrumentation::LaneTables RuntimeInstrumentation::laneTables(const Runtime &runtime, uint64_t requestId) {

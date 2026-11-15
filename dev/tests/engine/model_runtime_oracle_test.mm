@@ -630,6 +630,23 @@ void requireOpen(const ModelStepResult &prefilled, const char *section) {
           (std::string(section) + ": prompt ended right after prefill").c_str());
 }
 
+// Request `requestId`'s lookup index holds `tokens` (model::LookupIndex).
+void requireLookupIndex(const model::Runtime &executor, uint64_t requestId, std::span<const uint32_t> tokens,
+                        const char *where) {
+  require(std::ranges::equal(model::RuntimeInstrumentation::lookupTokens(executor, requestId), tokens),
+          std::string(where) + ": the lookup index does not hold the request's tokens");
+}
+
+// `history` and the anchor request `requestId` holds pending, if any: what its
+// lookup index holds once its prompt ended.
+std::vector<uint32_t> withAnchor(const model::Runtime &executor, uint64_t requestId,
+                                 std::span<const uint32_t> history) {
+  std::vector<uint32_t> tokens(history.begin(), history.end());
+  if (const auto anchor = model::RuntimeInstrumentation::pendingToken(executor, requestId))
+    tokens.push_back(*anchor);
+  return tokens;
+}
+
 void prefillToken(model::Runtime &executor, uint64_t requestId,
                   uint32_t logicalPosition, uint32_t token,
                   const std::vector<uint32_t> &pageTable) {
@@ -6442,6 +6459,11 @@ int main(int argc, char **argv) {
                                  prompt129, penalties,
                                  kind == RequestKind::Greedy && penalties.active());
       beginCold(executor, sequence, 0);
+      // Its lookup index follows its tokens through every step: none before
+      // its first chunk, a chunk's once it ran, its pending anchor from its
+      // prompt's end, every selection, none once suspended, and all again
+      // after a resume's replay.
+      requireLookupIndex(executor, sequence.id, {}, "a request's start");
       uint32_t stateLane = 0;
       // A penalized request resumes in a state lane other than 0 and decodes
       // in batch lane 0: its penalty words follow the state lane, not the
@@ -6464,6 +6486,7 @@ int main(int argc, char **argv) {
         executor.suspend(sequence.id);
         require(!states.metadata(stateLane).assigned(),
                 "preempted request retained its GDN/draft buffers");
+        requireLookupIndex(executor, sequence.id, {}, "a suspension");
         if (deliverInitialMask) {
           const std::array<uint32_t, 1> anchor{100};
           provideMask(executor, sequence.id, singletonMasks(anchor));
@@ -6476,9 +6499,11 @@ int main(int argc, char **argv) {
                                    std::span(sequence.prompt).first(32),
                                    pageTable),
                       "interrupted state replay");
+          requireLookupIndex(executor, sequence.id, std::span(sequence.prompt).first(32), "an interrupted replay");
           executor.suspend(sequence.id);
           require(!states.metadata(stateLane).assigned(),
                   "repeated preemption retained its state buffers");
+          requireLookupIndex(executor, sequence.id, {}, "a suspension during a replay");
           stateLane = resume();
           executor.setDraftContextPlan(sequence.id, planDraftContext(0, length, {}));
         }
@@ -6486,6 +6511,7 @@ int main(int argc, char **argv) {
             executor, sequence.id, 0, sequence.prompt, pageTable);
         penaltyProbe.initial(replay);
         requireOpen(replay, "regeneration replay emitted historical tokens");
+        requireLookupIndex(executor, sequence.id, withAnchor(executor, sequence.id, sequence.prompt), "a replay");
         if (repeatDuringReplay) {
           const StateSamples rebuilt = sampleCommittedState(backend, states, stateLane);
           // Decode and prefill use different floating-point graphs, so
@@ -6512,12 +6538,15 @@ int main(int argc, char **argv) {
                                  std::span(sequence.prompt).first(32),
                                  pageTable),
                     "unfinished prefill before preemption");
+        requireLookupIndex(executor, sequence.id, std::span(sequence.prompt).first(32), "an unfinished prompt");
         stage = rebuild(false);
       } else {
         const ModelStepResult promptEnd = prefillChunk(
             executor, sequence.id, 0, sequence.prompt, pageTable);
         penaltyProbe.initial(promptEnd);
         requireOpen(promptEnd, "preemption prompt");
+        requireLookupIndex(executor, sequence.id, withAnchor(executor, sequence.id, sequence.prompt),
+                           "a prompt's end");
         stage = promptEnd.nextDecodeStage;
       }
       require(stage == (constrained ? DecodeStage::ApplyInitialMask
@@ -6538,6 +6567,8 @@ int main(int argc, char **argv) {
                       DecodeStage::ApplyInitialMask);
         require(selected.outputTokens.empty(),
                 "the first token's selection emitted a token with budget left");
+        requireLookupIndex(executor, sequence.id, withAnchor(executor, sequence.id, sequence.prompt),
+                           "a first mask's selection");
         stage = selected.nextDecodeStage;
       }
       PreemptionRun run;
@@ -6581,6 +6612,8 @@ int main(int argc, char **argv) {
                 "nonterminal preemption history contains a token without KV");
         sequence.prompt.insert(sequence.prompt.end(), result.outputTokens.begin(),
                                result.outputTokens.end());
+        requireLookupIndex(executor, sequence.id, withAnchor(executor, sequence.id, sequence.prompt),
+                           "a decode cycle");
         if (preemptionMode == 2 && !generationPreempted) {
           run.pendingAnchorIndex = static_cast<uint32_t>(transcript.size());
           require(rebuild(true) == stage,
