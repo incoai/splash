@@ -3141,6 +3141,59 @@ void requireBatchedLanesMatchReordered(model::Runtime &executor, const model::Qw
   std::cout << "batched_lanes_reordered=PASS widths=2,3,4\n";
 }
 
+// Lanes whose prompts end in one prefill command, as a batch's do when it
+// resumes from a cached prefix, share one LM head and one selection: each
+// lane selects its first token, and a score lane reads its logits, from its
+// own first row, which the head computes. Two, three and four lanes end one
+// prompt in a command: every lane selects lane 0's first token, and every
+// score lane reads lane 0's option logits, wherever it sits. Each width ends
+// a prompt of its own, so that no lane finds the logits of its prompt left
+// in a row by an earlier command.
+void requirePromptEndsShareOneHead(model::Runtime &executor, std::span<const uint32_t> seed) {
+  constexpr uint32_t kPromptTokens = 40;
+  const std::vector<uint32_t> options{11, 220, 1683};
+  const std::array<std::vector<uint32_t>, 4> pages{pageRange(80, 2), pageRange(82, 2), pageRange(84, 2),
+                                                   pageRange(86, 2)};
+  uint64_t id = 780;
+  for (const uint32_t width : {2U, 3U, 4U}) {
+    std::vector<uint32_t> prompt(kPromptTokens);
+    for (uint32_t index = 0; index < kPromptTokens; ++index) prompt[index] = seed[(index + 13 * width) % seed.size()];
+    for (const bool scoring : {false, true}) {
+      BatchPlan plan{.kind = WorkKind::Prefill, .decodeStage = DecodeStage::Regular};
+      std::vector<ModelBatchItem> items;
+      for (uint32_t lane = 0; lane < width; ++lane, ++id) {
+        EngineRequest request = makeRequest(id, prompt, scoring ? 0 : 1);
+        if (scoring) request.scoreTokens = options;
+        beginCold(executor, request, lane);
+        plan.items.push_back({id, kPromptTokens});
+        items.push_back(withRevision({.requestId = id, .tokenCount = kPromptTokens, .pageTable = pages[lane]}));
+        items.back().inputTokens = prompt;
+      }
+      const std::vector<ModelStepResult> results = executor.prefill(plan, items);
+      require(results.size() == width, "a prefill of lanes ending one prompt lost a lane");
+      const ModelStepResult &first = results[0];
+      for (uint32_t lane = 0; lane < width; ++lane) {
+        const ModelStepResult &result = results[lane];
+        const std::string which = "lane " + std::to_string(lane) + " of " + std::to_string(width) +
+                                  " ending one prompt in one command";
+        require(result.failure.empty(), which + " failed: " + result.failure);
+        if (!scoring) {
+          require(result.outputTokens.size() == 1 && result.outputTokens == first.outputTokens,
+                  which + " selected another first token than lane 0");
+          continue;
+        }
+        require(result.scoreLogits.size() == options.size(), which + " returned no score logits");
+        for (size_t option = 0; option < options.size(); ++option)
+          require(std::fabs(result.scoreLogits[option] - first.scoreLogits[option]) <=
+                      1e-3F * std::max(1.0F, std::fabs(first.scoreLogits[option])),
+                  which + " read other score logits than lane 0");
+      }
+      for (const ModelBatchItem &item : items) executor.end(item.requestId);
+    }
+  }
+  std::cout << "prompt_ends_share_one_head=PASS widths=2,3,4\n";
+}
+
 // A constrained lane decodes in one command beside an unconstrained one,
 // which asks for no mask: the command waits for the constrained lane's masks
 // alone, and its selection reads them for that lane's rows alone. Under masks
@@ -4826,6 +4879,7 @@ int main(int argc, char **argv) {
                                         model.descriptor.hasVision());
     requirePrefillPassesMatchWhole(executor, pages, states, samplingSeedTokens, model.descriptor.hasVision());
     requireBatchedLanesMatchReordered(executor, states, samplingSeedTokens);
+    requirePromptEndsShareOneHead(executor, samplingSeedTokens);
     requireConstrainedLaneSharesDecode(executor, states, model.descriptor, samplingSeedTokens);
 
 
