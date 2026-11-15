@@ -1307,13 +1307,13 @@ inline uint tree_info(bool chain, uint parent, uint position, uint index) {
   return (chain ? kTreeChain : 0u) | parent << 16 | position << 8 | index;
 }
 
-// The estimate of a draft step of probability q at proposal position p
-// (DraftTreeParams), q kept off 0 and 1 for its logit.
-inline float tree_draft_estimate(constant DraftTreeParams &params, float q,
-                                 uint position) {
+// The estimate of lane l's draft step of probability q at proposal position
+// p (DraftTreeParams), q kept off 0 and 1 for its logit.
+inline float tree_draft_estimate(constant DraftTreeParams &params, uint lane,
+                                 float q, uint position) {
   q = clamp(q, 1.0e-6f, 1.0f - 1.0e-6f);
-  const float z =
-      params.slope * log(q / (1.0f - q)) + params.intercept[position];
+  const float z = params.slope[lane] * log(q / (1.0f - q)) +
+                  params.intercept[lane][position];
   return 1.0f / (1.0f + exp(-z));
 }
 
@@ -1335,14 +1335,15 @@ inline uint tree_agreement(threadgroup TreeLattice &lattice, uint token,
 // A draft row's entries for its most likely children at the next position.
 inline void tree_expand(threadgroup TreeLattice &lattice,
                         threadgroup TreeHeap &heap,
-                        constant DraftTreeParams &params, uint children,
-                        uint row, uint position, uint predecessor,
-                        float score) {
+                        constant DraftTreeParams &params, uint lane,
+                        uint children, uint row, uint position,
+                        uint predecessor, float score) {
   for (uint child = 0; child < children; ++child) {
     const uint index = lattice.likeliest[position][predecessor][child];
     const float q = lattice.probability[position][predecessor][index];
     if (q > 0.0f)
-      tree_push(heap, score * tree_draft_estimate(params, q, position),
+      tree_push(heap,
+                score * tree_draft_estimate(params, lane, q, position),
                 tree_info(false, row, position, index));
   }
 }
@@ -1357,9 +1358,9 @@ inline void tree_expand(threadgroup TreeLattice &lattice,
 // are written in the order the tree takes them, lane l's from row l *
 // SPLASH_TARGET_VERIFY_ROWS, so a row's parent comes before it and its
 // estimate is at most its parent's; sizes holds each lane's rows. A row's
-// draft probability (scores' x) is that of its token among the candidates
-// after its parent's, -1 where either is none of the draft's; its estimate
-// is scores' y.
+// draft probability (scores' x) is that of the draft step that made it, its
+// token's among the candidates after its parent's, -1 for a row a host chain
+// token made; its estimate is scores' y.
 kernel void draft_select_tree(
     device const uint *candidates [[buffer(0)]],
     device const float *unary [[buffer(1)]],
@@ -1440,7 +1441,7 @@ kernel void draft_select_tree(
     rows.q[0] = 1.0f;
     rows.estimate[0] = 1.0f;
     if (deepest > 0) {
-      tree_expand(lattice, heap, params, children, 0, 0, 0, 1.0f);
+      tree_expand(lattice, heap, params, lane, children, 0, 0, 0, 1.0f);
       if (chained)
         tree_push(heap, rates[tree_agreement(lattice, chain[0], 0)],
                   tree_info(true, 0, 0, 0));
@@ -1474,17 +1475,19 @@ kernel void draft_select_tree(
         rows.parent[row] = ushort(parent);
         rows.depth[row] = ushort(position + 1);
         rows.candidate[row] = own;
-        rows.q[row] = own != kNoCandidate && predecessor != kNoCandidate
-                          ? lattice.probability[position][predecessor][own]
-                          : -1.0f;
+        // A row a host chain token made is no draft step: its estimate is
+        // the chain's, and it has no draft probability.
+        rows.q[row] = from_chain
+                          ? -1.0f
+                          : lattice.probability[position][predecessor][own];
         rows.estimate[row] = score;
       }
       // The row's children lie a step deeper.
       if (position + 1 >= deepest)
         continue;
       if (!from_chain && position + 1 < Positions)
-        tree_expand(lattice, heap, params, children, row, position + 1, index,
-                    score);
+        tree_expand(lattice, heap, params, lane, children, row, position + 1,
+                    index, score);
       else if (from_chain && position + 1 < chained)
         tree_push(heap,
                   score *

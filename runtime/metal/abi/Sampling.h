@@ -189,25 +189,26 @@ static_assert(sizeof(SelectorBatchParams) == 24,
 // candidate at proposal position p, of probability q among the position's
 // candidates after its parent's (the softmax at temperature 1 of their unary
 // scores plus the edge from the parent's candidate), is estimated at
-// sigmoid(slope * logit(q) + intercept[p]); a step to host chain token d of
-// the lane, chain[l] tokens from the anchor, at its rate for its agreement
-// with the draft at depth d. The tree grows best first by estimate, a draft
-// row taking its children[l] most likely candidates and a chain token the
-// next, one row for each token path (a step to a token its parent already has
-// a child of joins that child), until the lane's rows or none past depth
-// depth[l] are left.
+// sigmoid(slope[l] * logit(q) + intercept[l][p]), the lane's acceptance model
+// (a greedy lane's or a sampled one's, model::VerifyBudget); a step to host
+// chain token d of the lane, chain[l] tokens from the anchor, at its rate for
+// its agreement with the draft at depth d. The tree grows best first by
+// estimate, a draft row taking its children[l] most likely candidates and a
+// chain token the next, one row for each token path (a step to a token its
+// parent already has a child of joins that child), until the lane's rows or
+// none past depth depth[l] are left.
 struct DraftTreeParams {
   uint32_t anchor[SPLASH_MAXIMUM_BATCH_WIDTH];
   uint32_t depth[SPLASH_MAXIMUM_BATCH_WIDTH];
   uint32_t chain[SPLASH_MAXIMUM_BATCH_WIDTH];
   uint32_t children[SPLASH_MAXIMUM_BATCH_WIDTH];
   uint32_t lanes;
-  float slope;
-  float intercept[SPLASH_DRAFT_PROPOSAL_TOKENS];
+  float slope[SPLASH_MAXIMUM_BATCH_WIDTH];
+  float intercept[SPLASH_MAXIMUM_BATCH_WIDTH][SPLASH_DRAFT_PROPOSAL_TOKENS];
 };
 
-static_assert(sizeof(DraftTreeParams) == 100,
-              "Draft tree parameters are 100 bytes on both sides");
+static_assert(sizeof(DraftTreeParams) == 196,
+              "Draft tree parameters are 196 bytes on both sides");
 
 // The rows of a decode cycle (draft_verify_rows): `rows` rows over its lanes,
 // 1 to lane_cap a lane, laid out from the lanes' trees (DraftTreeParams).

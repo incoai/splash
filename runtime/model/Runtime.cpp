@@ -444,6 +444,10 @@ struct Runtime::Impl {
     // The draft proposals the lane's thinking end replaced, which its
     // speculation counts leave out.
     uint32_t endDrafts = 0;
+    // The rows of its path, from its anchor's, whose selections are its
+    // target's own: every one, or those before a thinking cutoff's row, from
+    // which the cutoff selects the end of thinking.
+    uint32_t ownSelections = ExecutionLimits::targetVerifyRows;
     // The state its item captures (prepareDecodeCapture), sealed with these
     // lengths when the lane retains the rows before its boundary.
     QwenStateReservation *capture = nullptr;
@@ -2272,6 +2276,11 @@ struct Runtime::Impl {
       const ops::SamplingPolicy policy = samplingPolicy(entry);
       const bool branches = targetModel->verifiesTrees() && !policy.constrained;
       tree.children = branches ? SPLASH_TREE_CHILDREN : 1;
+      // Its draft steps' estimates are its policy's acceptance model's: a
+      // sampled lane's follows the target's draws.
+      const VerifyBudget::Acceptance &acceptance =
+          verifyBudget ? verifyBudget->acceptance(policy.samples()) : VerifyBudget::kPrior;
+      tree.calibration = {acceptance.slope, acceptance.intercepts};
       entry.lookupChain = {};
       // A thinking end at the lane's first row is its proposals, a chain the
       // verify selects whatever its logits: no draft row beside it could be
@@ -2289,7 +2298,6 @@ struct Runtime::Impl {
         proposeLookup(entry, tree, lane);
       }
     }
-    const VerifyBudget::Acceptance &acceptance = verifyBudget ? verifyBudget->acceptance() : VerifyBudget::kPrior;
     const ops::DraftSelectorBuffers selection{
         d(DecodeTensor::Logits),          d(DecodeTensor::TopPartialIds),   d(DecodeTensor::TopPartialValues),
         d(DecodeTensor::Candidates),      d(DecodeTensor::Unary),           d(DecodeTensor::SelectorHidden),
@@ -2297,8 +2305,7 @@ struct Runtime::Impl {
         d(DecodeTensor::DraftTrees),      d(DecodeTensor::DraftTreeScores), d(DecodeTensor::DraftTreeSizes),
         d(DecodeTensor::InputTokens),     d(DecodeTensor::TreeRows),        d(DecodeTensor::LaneLayout),
         d(DecodeTensor::VerifyRows)};
-    draftModel.addSelection(graph, selection, std::span(trees).first(lanes),
-                            {acceptance.slope, acceptance.intercepts});
+    draftModel.addSelection(graph, selection, std::span(trees).first(lanes));
     // Without the budget, or in a cycle that explores, the cycle verifies as
     // many of the trees' rows as it holds.
     std::array<float, VerifyBudget::kBlockRows * VerifyBudget::kLanes + 1> costs{};
@@ -2658,37 +2665,20 @@ struct Runtime::Impl {
     }
     if (verifyBudget && commits) {
       std::array<VerifyBudget::Lane, kLaneCount> observed{};
-      const auto *treeTokens =
-          contents<uint32_t>(decodeArena->batchSlice(DecodeTensor::DraftTreeTokens, kLaneCount), "draft tree tokens");
-      const auto *trees = contents<ops::TreeRow>(decodeArena->batchSlice(DecodeTensor::DraftTrees, kLaneCount),
-                                                 "draft trees");
-      const auto *treeScores =
-          contents<float>(decodeArena->batchSlice(DecodeTensor::DraftTreeScores, kLaneCount), "draft tree scores");
       for (uint32_t lane = 0; lane < items.size(); ++lane) {
         const DecodeLaneResult &laneResult = lanes[lane];
-        // The lane's tree is its draft's chain (kVerifyChildren), whose row
-        // r + 1 holds its proposal at position r, of which the draft
-        // probability is the confidence there.
-        const uint64_t tree = uint64_t{lane} * ExecutionLimits::targetVerifyRows;
         const uint32_t size = std::min(
             *contents<uint32_t>(decodeArena->get(lane, DecodeTensor::DraftTreeSizes), "draft tree size"),
             ExecutionLimits::targetVerifyRows);
-        for (uint32_t position = 0; position + 1 < size && position < kDraftProposalTokens; ++position)
-          observed[lane].confidence[position] = treeScores[2 * (tree + position + 1)];
-        // Acceptance walks the lane's verify rows. A lane whose cap or a stop
-        // token cut its path tells nothing of the proposals past what it
-        // retained. Where it accepted every one and retained the target's
-        // token after them, that token also tells whether the target accepts
-        // the proposal after them.
-        const bool whole = laneResult.retained == laneResult.accepted + 1;
-        uint32_t accepted = laneResult.accepted;
-        const uint32_t next = laneResult.verifyRows;
-        if (whole && accepted + 1 == next && next < size && trees[tree + next].parent == next - 1 &&
-            treeTokens[tree + next] == retainedTokens(laneResult)[accepted])
-          ++accepted;
+        // The lane's retained tokens are its target's selections along its
+        // path, which label each row of its tree under one of them.
         observed[lane].verifyRows = laneResult.verifyRows;
-        observed[lane].accepted = accepted;
-        observed[lane].labels = laneResult.endDrafts == 0 && whole;
+        observed[lane].samples = samplingEnabled(*laneResult.request);
+        observed[lane].labels = VerifyBudget::treeLabels(
+            {contents<uint32_t>(decodeArena->get(lane, DecodeTensor::DraftTreeTokens), "draft tree tokens"), size},
+            {contents<ops::TreeRow>(decodeArena->get(lane, DecodeTensor::DraftTrees), "draft trees"), size},
+            {contents<float>(decodeArena->get(lane, DecodeTensor::DraftTreeScores), "draft tree scores"), 2 * size},
+            {retainedTokens(laneResult), std::min(laneResult.retained, laneResult.ownSelections)});
       }
       verifyBudget->observe(std::span(observed).first(items.size()), constrained,
                             timing.wallSeconds * 1000.0);
@@ -3509,8 +3499,10 @@ Runtime::decodeAsync(const BatchPlan &plan,
     laneResult.request = &entry;
     laneResult.currentAnchor = *entry.pendingToken;
     laneResult.maximumRetained = std::min(remaining, step.laneCap);
-    if (const auto cutoff = Impl::samplingPolicy(entry).thinkingCutoff)
+    if (const auto cutoff = Impl::samplingPolicy(entry).thinkingCutoff) {
       laneResult.endDrafts = cutoff->replacedProposals();
+      laneResult.ownSelections = std::min(cutoff->row, ExecutionLimits::targetVerifyRows);
+    }
 
     impl_->prepareDecodeLane(entry, item, lane);
     impl_->prepareDecodeCapture(entry, item, laneResult);

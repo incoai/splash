@@ -35,8 +35,7 @@ DraftSelectorWorkspace DraftSelector::workspace(uint32_t positions) {
 }
 
 void DraftSelector::add(metal::CommandGraph &graph, const DraftSelectorBuffers &buffers,
-                        const DraftCodebooks &codebooks, std::span<const DraftTreeLane> lanes,
-                        const DraftCalibration &calibration) const {
+                        const DraftCodebooks &codebooks, std::span<const DraftTreeLane> lanes) const {
   if (lanes.empty() || lanes.size() > SPLASH_MAXIMUM_BATCH_WIDTH)
     throw std::invalid_argument("invalid draft selector batch");
   const uint32_t count = static_cast<uint32_t>(lanes.size());
@@ -45,14 +44,6 @@ void DraftSelector::add(metal::CommandGraph &graph, const DraftSelectorBuffers &
   edges.vocabulary = vocabulary_;
   DraftTreeParams tree{};
   tree.lanes = count;
-  if (!std::isfinite(calibration.slope))
-    throw std::invalid_argument("invalid draft tree calibration");
-  tree.slope = calibration.slope;
-  for (uint32_t position = 0; position < kPositions; ++position) {
-    if (!std::isfinite(calibration.intercepts[position]))
-      throw std::invalid_argument("invalid draft tree calibration");
-    tree.intercept[position] = calibration.intercepts[position];
-  }
   for (uint32_t lane = 0; lane < count; ++lane) {
     const DraftTreeLane &l = lanes[lane];
     // A tree's rows hold its anchor and every row's path below it, a verify
@@ -60,10 +51,15 @@ void DraftSelector::add(metal::CommandGraph &graph, const DraftSelectorBuffers &
     if (l.depth >= SPLASH_TARGET_VERIFY_ROWS || l.chain > SPLASH_TREE_CHAIN_TOKENS ||
         l.children > SPLASH_TREE_CHILDREN)
       throw std::invalid_argument("invalid draft tree lane");
+    if (!std::isfinite(l.calibration.slope) ||
+        !std::ranges::all_of(l.calibration.intercepts, [](float value) { return std::isfinite(value); }))
+      throw std::invalid_argument("invalid draft tree calibration");
     edges.anchor[lane] = tree.anchor[lane] = l.anchor;
     tree.depth[lane] = l.depth;
     tree.chain[lane] = l.chain;
     tree.children[lane] = l.children;
+    tree.slope[lane] = l.calibration.slope;
+    std::ranges::copy(l.calibration.intercepts, tree.intercept[lane]);
   }
   // A lane's proposal positions take rows 1-7 of its eight query rows of the
   // logits and the selector hidden rows; its tree takes a verify block's rows.

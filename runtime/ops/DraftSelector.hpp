@@ -34,9 +34,10 @@ struct DraftSelectorBuffers final {
   // Each lane's tree (DraftTreeParams), up to SPLASH_TARGET_VERIFY_ROWS rows
   // from row lane x SPLASH_TARGET_VERIFY_ROWS in the order the selector took
   // them, best first: each row's token, its tree row (metal/abi/VerifyTree.h)
-  // and its scores, fp32 pairs of its draft probability and its estimate, the
-  // chance that the target accepts it, which a later step's choice of rows
-  // reads; and uint32 [lanes], the rows each tree holds.
+  // and its scores, fp32 pairs of its draft probability (-1 for a row a host
+  // chain token made) and its estimate, the chance that the target accepts
+  // it, which a later step's choice of rows reads; and uint32 [lanes], the
+  // rows each tree holds.
   metal::MetalBuffer treeTokens;
   metal::MetalBuffer trees;
   metal::MetalBuffer treeScores;
@@ -51,22 +52,24 @@ struct DraftSelectorBuffers final {
   metal::MetalBuffer verifyRows;
 };
 
-// How one lane's tree grows (DraftTreeParams): from its anchor, over a
-// verify block's rows, no row deeper than `depth` (the tokens it may retain
-// less one), with the first `chain` tokens of its host chain and up to
-// `children` children a draft row (none: its rows are its host chain's).
-struct DraftTreeLane final {
-  uint32_t anchor = 0;
-  uint32_t depth = 0;
-  uint32_t chain = 0;
-  uint32_t children = 1;
-};
-
 // The estimate of a draft step of probability q at proposal position p:
 // logit(estimate) = slope * logit(q) + intercepts[p] (DraftTreeParams).
 struct DraftCalibration final {
   float slope = 1.0F;
   std::array<float, SPLASH_DRAFT_PROPOSAL_TOKENS> intercepts{};
+};
+
+// How one lane's tree grows (DraftTreeParams): from its anchor, over a
+// verify block's rows, no row deeper than `depth` (the tokens it may retain
+// less one), with the first `chain` tokens of its host chain and up to
+// `children` children a draft row (none: its rows are its host chain's), its
+// draft steps estimated by `calibration`.
+struct DraftTreeLane final {
+  uint32_t anchor = 0;
+  uint32_t depth = 0;
+  uint32_t chain = 0;
+  uint32_t children = 1;
+  DraftCalibration calibration{};
 };
 
 // The draft's selector codebooks, which score the edge from a proposal
@@ -93,7 +96,7 @@ public:
   [[nodiscard]] static DraftSelectorWorkspace workspace(uint32_t positions);
 
   void add(metal::CommandGraph &graph, const DraftSelectorBuffers &buffers, const DraftCodebooks &codebooks,
-           std::span<const DraftTreeLane> lanes, const DraftCalibration &calibration) const;
+           std::span<const DraftTreeLane> lanes) const;
   // After add: the rows of a decode step of `step.lanes` lanes
   // (VerifyRowsParams), each lane's verify rows numbered in preorder: the
   // trees' best rows that the step's rows hold without costs, or as many of

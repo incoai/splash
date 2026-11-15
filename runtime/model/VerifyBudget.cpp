@@ -149,13 +149,45 @@ bool VerifyBudget::explores(uint32_t lanes, bool constrained) const {
   return tableCycles_[constrained ? 1 : 0][lanes - 1] % kExploreCycles == kExploreCycles - 1;
 }
 
+std::vector<VerifyBudget::Label> VerifyBudget::treeLabels(std::span<const uint32_t> tokens,
+                                                         std::span<const ops::TreeRow> rows,
+                                                         std::span<const float> scores,
+                                                         std::span<const uint32_t> selections) {
+  if (rows.empty() || tokens.size() != rows.size() || scores.size() != 2 * rows.size())
+    throw std::invalid_argument("invalid verify budget tree");
+  // Each row's place on the walk's path, the index of its selection (and its
+  // depth); none for a row off it. A row under the path's row at place i is a
+  // proposal at position i.
+  constexpr uint32_t kOff = UINT32_MAX;
+  std::vector<uint32_t> place(rows.size(), kOff);
+  place[0] = 0;
+  std::vector<Label> labels;
+  for (size_t row = 1; row < rows.size(); ++row) {
+    const uint32_t parent = rows[row].parent;
+    if (parent >= row)
+      throw std::invalid_argument("invalid verify budget tree");
+    const uint32_t at = place[parent];
+    if (at == kOff || at >= selections.size())
+      continue;
+    const bool accepted = tokens[row] == selections[at];
+    if (accepted)
+      place[row] = at + 1;
+    if (const float probability = scores[2 * row]; probability >= 0.0F && probability <= 1.0F)
+      labels.push_back({at, static_cast<float>(logit(probability)), accepted});
+  }
+  return labels;
+}
+
 void VerifyBudget::observe(std::span<const Lane> lanes, bool constrained, double milliseconds) {
   if (lanes.empty() || lanes.size() > kLanes)
     throw std::invalid_argument("invalid verify budget cycle");
   uint32_t rows = 0;
   for (const Lane &lane : lanes) {
-    if (!lane.verifyRows || lane.verifyRows > kBlockRows || lane.accepted > kPositions)
+    if (!lane.verifyRows || lane.verifyRows > kBlockRows)
       throw std::invalid_argument("invalid verify budget lane");
+    for (const Label &label : lane.labels)
+      if (label.position >= kPositions || !std::isfinite(label.feature))
+        throw std::invalid_argument("invalid verify budget label");
     rows += lane.verifyRows;
   }
   const uint32_t count = static_cast<uint32_t>(lanes.size());
@@ -185,32 +217,29 @@ void VerifyBudget::observe(std::span<const Lane> lanes, bool constrained, double
     cost.time = kDecay * cost.time + milliseconds;
     cost.rowsTime = kDecay * cost.rowsTime + rows * milliseconds;
   }
-  // Proposal j is checked against the target's row j, so a lane that
-  // verified r rows labels its proposals up to r - 1, to the first rejection.
   for (const Lane &lane : lanes) {
-    if (!lane.labels)
-      continue;
-    const uint32_t last = std::min({lane.accepted, lane.verifyRows - 1, kPositions - 1});
-    for (uint32_t position = 0; position <= last; ++position) {
-      const float confidence = lane.confidence[position];
-      if (!(confidence >= 0.0F && confidence <= 1.0F))
-        continue;
-      const Label label{position, static_cast<float>(logit(confidence)), position < lane.accepted};
-      if (labels_.size() < kLabels) {
-        labels_.push_back(label);
+    std::vector<Label> &kept = labels_[lane.samples];
+    size_t &next = next_[lane.samples];
+    for (const Label &label : lane.labels) {
+      if (kept.size() < kLabels) {
+        kept.push_back(label);
       } else {
-        labels_[next_] = label;
-        next_ = (next_ + 1) % kLabels;
+        kept[next] = label;
+        next = (next + 1) % kLabels;
       }
     }
   }
-  if (++cycles_ % kRefitCycles == 0 && !labels_.empty())
-    acceptance_ = fit(labels(), acceptance_);
+  if (++cycles_ % kRefitCycles == 0)
+    for (const bool samples : {false, true})
+      if (!labels_[samples].empty())
+        acceptance_[samples] = fit(labels(samples), acceptance_[samples]);
 }
 
-std::vector<VerifyBudget::Label> VerifyBudget::labels() const {
-  std::vector<Label> ordered(labels_.begin() + static_cast<std::ptrdiff_t>(next_), labels_.end());
-  ordered.insert(ordered.end(), labels_.begin(), labels_.begin() + static_cast<std::ptrdiff_t>(next_));
+std::vector<VerifyBudget::Label> VerifyBudget::labels(bool samples) const {
+  const std::vector<Label> &kept = labels_[samples];
+  const auto split = kept.begin() + static_cast<std::ptrdiff_t>(next_[samples]);
+  std::vector<Label> ordered(split, kept.end());
+  ordered.insert(ordered.end(), kept.begin(), split);
   return ordered;
 }
 

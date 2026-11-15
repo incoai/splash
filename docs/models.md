@@ -361,12 +361,23 @@ cycle's outcome); a lookup token that is a draft row's joins that row. A step to
 temperature 1 of its position's candidates' scores after its parent's) is
 estimated by an online model, logit(p) = slope * logit(q) +
 intercept[position], the probability that the target accepts it once it
-accepted its parent; the engine refits it every 64 cycles on the last 4096
-labels: each proposal of a lane's chain up to its first rejection, but none
-whose probability is not one, which a draft row that is not finite gives, by
-damped Newton steps under a prior fit to Qwen3.8-Flash-Next's and
-Qwen3.6-35B-A3B's cycles, which also stands before any label. A row's estimate
-is what verifying it adds to its lane's expected tokens; one GPU step after the
+accepted its parent, one model for greedy lanes and one for sampled lanes,
+whose acceptance follows the target's draws. The engine refits each every 64
+cycles on its last 4096 labels: each row of a lane's tree whose parent the
+cycle's walk accepted, labeled with whether the target selected the row's
+token there, a row past the lane's verify rows too (its parent's selection
+says whether the target would have accepted it), but none whose probability
+is not one (a row a lookup chain made, or a draft row that is not finite) and
+none under a selection a thinking cutoff made; by damped Newton steps under a
+prior fit to Qwen3.8-Flash-Next's and Qwen3.6-35B-A3B's cycles, which also
+stands before any label. Labels of a tree's rows, not only of its likeliest
+chain, keep the estimates of a row's siblings true: over 7,309 greedy traced
+cycles of Qwen3.8-27B, each workload under the fit of the others', trees of
+16 rows grown with the fit of their rows' labels had those rows' estimates
+within 0.012 of the rate the target accepted them at (the mean over tenths of
+the estimate), against 0.021 with the fit of their chains' labels, under
+which rows estimated at 0.15 to 0.45 were accepted at 0.10 to 0.38. A row's
+estimate is what verifying it adds to its lane's expected tokens; one GPU step after the
 selector (`draft_verify_rows`) lays out the cycle's rows, a draft block's a
 lane: every lane verifies its anchor and the rows of the largest estimates over
 the batch, a lane's in the order its tree took them and none past a lane's cap,
