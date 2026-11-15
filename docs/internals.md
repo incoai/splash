@@ -525,9 +525,10 @@ The rules:
    from `minimumRows` rows and a grid of its tiles of at least half the class's
    half tiles per core for BF16 values, F32 values or a quantized format's rows.
 4. *MoE.* Every GPU runs the experts on the staged tile, on 8-row tiles
-   while a prefill chunk's routes average at most one row per expert and
-   32-row tiles beyond. One plan per step serves every block, so its router
-   follows rule 3 in the format of most blocks' routers (`ops::moeRouterFormat`).
+   while a step's routes average at most one row per expert (a decode step's
+   of every family) and 32-row tiles beyond. One plan per step serves every
+   block, so its router follows rule 3 in the format of most blocks' routers
+   (`ops::moeRouterFormat`).
 5. *Attention.* The kernels follow how a layout reads its pages
    (`kv::Layout::reads`, below). A sequence of one tile, a decode lane's,
    takes one history split per 16 pages its rows read, between 32 and 128.
@@ -950,7 +951,8 @@ finite, and a plan of one or two rows on the column tile in every format and in 
 triples within the bound, the rows past its own unread and unwritten; and
 `gguf-moe`: the float projections on both float tiles and the MoE layer on every GGUF
 plan, the staged 8- and 32-row tiles, in every format as each routed and shared expert tensor,
-against fp64, bitwise against the full grids and two gate/up passes, and with the experts in
+against fp64, bitwise against the full grids and two gate/up passes, verify blocks among prompt
+rows routing their verify rows alone, and with the experts in
 permuted slots across a floor chunk and elastic chunks of other, few slots, the last of fewer,
 bitwise as in one chunk, and refuses floor and elastic chunks one unit short, a malformed chunk list
 or chunks made for another block; `gguf-moe-e512` runs all of it at Qwen3.8-Flash-Next's 512 experts

@@ -91,7 +91,7 @@ std::vector<metal::MetalBuffer> Qwen4ExpTarget::addPrefill(metal::CommandGraph &
     step.scratch = steps_.prefillScratch(index);
     step.blocks = begins ? steps_.preparePrefill(index, chunks[index]) : steps_.prefillBlocks(index, chunks[index]);
     step.indexOffsets = offsets;
-    step.ffn = {step.buffers.normalized, step.scratch.zeros, step.scratch.branch, step.buffers.moe, {}};
+    step.ffn = {step.buffers.normalized, step.scratch.zeros, step.scratch.branch, step.buffers.moe, {}, {}};
   }
   if (begins) steps_.readAhead(chunks);
   return addPrefillLayers(std::span(steps), *this, layers);
@@ -379,7 +379,9 @@ void Qwen4ExpTarget::addVerify(metal::CommandGraph &graph, QwenTargetVerifyBuffe
         layer.mixer);
     ops::HyperConnection::addCombine(step.graph, h.streams, h.branch, h.weights, hs, rows);
     addVerifyMix(step, layer.ffnHyper, b.normalized);
-    ops::MoE::add(step.graph, {b.normalized, h.zeros, h.branch, b.moe, b.verifyRows}, layer.ffn, *step.moe);
+    ops::MoE::add(step.graph,
+                  {b.normalized, h.zeros, h.branch, b.moe, std::span(step.verifyBlocks).first(lanes), b.verifyRows},
+                  layer.ffn, *step.moe);
     ops::HyperConnection::addCombine(step.graph, h.streams, h.branch, h.weights, hs, rows);
     if (const auto slot = geometry_.captureSlot(index))
       addStreamCapture(step.graph, geometry_, *slot, h.streams, b.capturedTargetHidden, 0, rows);

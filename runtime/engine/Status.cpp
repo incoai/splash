@@ -104,7 +104,7 @@ const char *writesGatedName(DiskWritesGate gate) noexcept {
 }
 
 // What the streamed stores count by, in the order of their uses
-// (model::SparseRowUse, and ops::MoePhase for model::ExpertStoreStats::uses).
+// (model::SparseRowUse, and model::ExpertStoreStats::uses).
 constexpr std::string_view kStreamedUses[] = {"prefill", "decode"};
 static_assert(std::size(kStreamedUses) == model::kSparseRowUses);
 // The causes of decode gaps past the bound, by GapCause.

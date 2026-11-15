@@ -306,18 +306,20 @@ uint32_t moeRouterFormat(std::span<const BlockMoeWeights *const> blocks) noexcep
 // Every GPU runs the experts on the staged tile: against the register tile, a
 // 35B-shaped layer takes 16-42% less time on a 10-core M4 at one to four
 // decode lanes of random routes; Apple9 GPUs of 11 to 40 cores are
-// unmeasured. Plans run 8-row tiles while a prefill chunk's routes average at
-// most one row per expert (rows * topK <= experts), where 8- and 32-row tiles
-// take the same time, and 32-row tiles beyond, which stream an expert's
-// weights once for up to 32 of its rows (its tiles run 8-, 16- or 32-row
-// matmuls by their live rows, moe_live_rows). The router's float tile follows
-// selectFloatTile by its rows' format.
+// unmeasured. Plans run 8-row tiles while a step's routes average at most one
+// row per expert (rows * topK <= experts), where 8- and 32-row tiles take the
+// same time, and 32-row tiles beyond, which stream an expert's weights once
+// for up to 32 of its rows (its tiles run 8-, 16- or 32-row matmuls by their
+// live rows, moe_live_rows). A decode step's 32 rows route at most as many
+// times as a family has experts (the 35B's and 122B's 256 of 256, Flint's
+// 192 of 256, Qwen3.8-Flash-Next's 320 of 512), so every family decodes on
+// 8-row tiles. The router's float tile follows selectFloatTile by its rows'
+// format.
 MoeConfig selectMoe(const KernelCalibration &calibration, const MoeShape &shape, uint32_t routerFormat,
-                    uint32_t rows, MoePhase phase) noexcept {
+                    uint32_t rows) noexcept {
   MoeConfig config;
-  config.expertTile = phase == MoePhase::Prefill && uint64_t{rows} * shape.expertsPerToken > shape.experts
-                          ? MoeExpertTile::M32
-                          : MoeExpertTile::M8;
+  config.expertTile = uint64_t{rows} * shape.expertsPerToken > shape.experts ? MoeExpertTile::M32
+                                                                              : MoeExpertTile::M8;
   config.ggufRouterTile = selectFloatTile(calibration, rows, shape.experts, routerFormat);
   return config;
 }

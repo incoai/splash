@@ -6,6 +6,7 @@
 #else
 #include <stdint.h>
 #endif
+#include "metal/abi/ExecutionGeometry.h"
 #include "metal/abi/Gguf.h"
 
 // The expert slots of the routing kernels (ops::MoE): a row's router scores
@@ -59,15 +60,22 @@ inline bool moe_column_tile(Tiles tiles, uint32_t t) {
   return tiles[t].rows <= GGUF_COLUMN_ROWS && (t == 0 || tiles[t - 1].expert != tiles[t].expert);
 }
 
+// A step's decode lanes' verify blocks: block b is rows [first_row[b],
+// first_row[b] + rows[b]) of the step, and a block of no rows names none.
+struct MoeVerifyBlocks {
+  uint32_t first_row[SPLASH_MAXIMUM_BATCH_WIDTH];
+  uint32_t rows[SPLASH_MAXIMUM_BATCH_WIDTH];
+};
+
 // The column tiles of the gate/up and down passes, whose grids the grouping
-// writes (MoeTileCount). A verify step's grouping
-// (moe_group_routes_verified*) routes only each lane's verify rows (the draft
-// selector's, SelectorBatchParams): row r is row r % lane_rows of lane
-// r / lane_rows, and the routed routes of a row past its lane's verify rows
-// stay out of every tile with the route row ~0u, which the combine skips. The
-// other groupings route every row and ignore lane_rows. Only a streamed
-// grouping, of a step whose passes run around its load, reads the block's
-// slot table (MoeTileCount) and copies it for the passes beside the load.
+// writes (MoeTileCount). A verified grouping (moe_group_routes_verified*)
+// routes only the first verify_rows[b] rows of each verify block b (the draft
+// selector's, SelectorBatchParams), and every row of no block (a prompt's):
+// the routed routes of a block's row past them stay out of every tile with
+// the route row ~0u, which the combine skips. The other groupings route every
+// row and ignore the blocks. Only a streamed grouping, of a step whose passes
+// run around its load, reads the MoE block's slot table (MoeTileCount) and
+// copies it for the passes beside the load.
 struct MoeGroupParams {
   uint32_t rows;
   uint32_t top_k;
@@ -75,12 +83,12 @@ struct MoeGroupParams {
   uint32_t experts;
   uint32_t gate_up_columns;
   uint32_t down_columns;
-  uint32_t lane_rows;
   uint32_t streamed;
+  struct MoeVerifyBlocks verify;
 };
 
-static_assert(sizeof(MoeGroupParams) == 32,
-              "MoE grouping parameters are 32 bytes on both sides");
+static_assert(sizeof(MoeGroupParams) == 60,
+              "MoE grouping parameters are 60 bytes on both sides");
 
 // What the grouping writes besides the tiles: their count, which every pass
 // over them reads first, the tiles of experts resident before the step's

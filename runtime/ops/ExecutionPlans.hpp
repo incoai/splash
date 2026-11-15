@@ -42,10 +42,9 @@ public:
                                         AttentionVariant variant = {}) const;
   [[nodiscard]] DraftAttentionPlan draftAttention(
       DraftAttentionShape shape, uint32_t lanes) const;
-  // The plans of a MoE target's blocks, whose routers are in `routerFormat`
-  // (moeRouterFormat).
-  [[nodiscard]] MoePlan moePrefill(MoeShape shape, uint32_t routerFormat, uint32_t rows) const;
-  [[nodiscard]] MoePlan moeDecode(MoeShape shape, uint32_t routerFormat, uint32_t lanes) const;
+  // The plan of a step of `rows` rows of a MoE target's blocks, whose
+  // routers are in `routerFormat` (moeRouterFormat).
+  [[nodiscard]] MoePlan moe(MoeShape shape, uint32_t routerFormat, uint32_t rows) const;
 
   // Bounds cover every row count up to the requested maximum, not just that
   // one. Decode arenas use a per-lane stride of

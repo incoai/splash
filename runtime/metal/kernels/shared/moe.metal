@@ -159,15 +159,21 @@ MOE_ROUTE_SELECT_UNGATED_ENTRY(moe_route_select_f32_sigmoid_s2, SPLASH_MOE_EXPER
 #undef MOE_ROUTE_SELECT_ENTRY
 #undef MOE_ROUTE_SELECT_BODY
 
-// Whether a verified grouping leaves routed route `route` out: its row is
-// past its lane's verify rows (MoeGroupParams).
+// Whether a verified grouping leaves routed route `route` out: its row lies
+// in a verify block past the block's verify rows (MoeGroupParams).
 template <uint Shared, bool Verified>
 inline bool moe_unverified_route(device const uint *verify_rows,
                                  constant MoeGroupParams &params, uint route) {
   if (!Verified)
     return false;
   const uint row = route / (params.top_k + Shared);
-  return row % params.lane_rows >= verify_rows[row / params.lane_rows];
+  for (uint block = 0; block < SPLASH_MAXIMUM_BATCH_WIDTH; ++block) {
+    // Wraps past the rows for a row before the block.
+    const uint offset = row - params.verify.first_row[block];
+    if (offset < params.verify.rows[block])
+      return offset >= verify_rows[block];
+  }
+  return false;
 }
 
 // Sorts one command's routes by expert. Tile t covers grouped rows
@@ -180,8 +186,8 @@ inline bool moe_unverified_route(device const uint *verify_rows,
 // experts it marks MOE_SLOT_ABSENT. It writes the tile count with the expert
 // passes' grids (MoeTileCount) and a streamed block's slot table into
 // expert_slots (ops::MoeScratch::expertSlots). Slots threads, one per expert
-// slot. A Verified grouping routes each lane's verify rows alone
-// (MoeGroupParams).
+// slot. A Verified grouping routes its verify blocks' verify rows alone, and
+// every row of no block (MoeGroupParams).
 template <uint Slots, uint Shared, bool Verified>
 inline void moe_group_routes_phase(
     device const uint *selected, device MoeTileDescriptor *tiles, device MoeTileCount *tile_count,
@@ -325,8 +331,8 @@ inline void moe_group_routes_phase(
       uint simd_group [[simdgroup_index_in_threadgroup]]) {                    \
     MOE_GROUP_ROUTES_BODY(Slots, Shared, false, nullptr)                       \
   }
-// A verify step's grouping, which routes each lane's verify rows alone
-// (MoeGroupParams), the uint per lane the draft selector wrote.
+// A grouping of a step with verify blocks, which routes each block's verify
+// rows alone (MoeGroupParams), the uint per block the draft selector wrote.
 #define MOE_GROUP_ROUTES_VERIFIED_ENTRY(Name, Slots, Shared)                   \
   kernel void Name(                                                            \
       device const uint *selected [[buffer(0)]],                               \

@@ -168,7 +168,7 @@ QwenTarget::PrefillStep QwenTarget::prefillStep(metal::CommandGraph &graph, cons
     step.windowedAttention.emplace(operators_.attention(step.attentionSequences(), geometry_.attentionQueryHeads,
                                                         geometry_.kvLayout, workspace, {.windowTokens = window}));
   if (geometry_.ffnKind == QwenFfnKind::SparseMoe)
-    step.moe = operators_.moePrefill(geometry_.moeBlockShape(), geometry_.moeRouterFormat, chunk.rows);
+    step.moe = operators_.moe(geometry_.moeBlockShape(), geometry_.moeRouterFormat, chunk.rows);
   if (aneFfn && aneFfn->splits(chunk.rows)) step.aneFfn = aneFfn;
   return step;
 }
@@ -196,7 +196,8 @@ QwenTarget::VerifyStep QwenTarget::verifyStep(metal::CommandGraph &graph, const 
     step.windowedAttention.emplace(operators_.attention(chunks, geometry_.attentionQueryHeads, geometry_.kvLayout,
                                                         workspace, {.windowTokens = window}));
   if (geometry_.ffnKind == QwenFfnKind::SparseMoe)
-    step.moe = operators_.moeDecode(geometry_.moeBlockShape(), geometry_.moeRouterFormat, lanes);
+    step.moe = operators_.moe(geometry_.moeBlockShape(), geometry_.moeRouterFormat, step.rows);
+  for (uint32_t lane = 0; lane < lanes; ++lane) step.verifyBlocks[lane] = {lane * kVerifyRows, kVerifyRows};
   return step;
 }
 
@@ -208,7 +209,7 @@ void QwenTarget::planOutputRows(PrefillStep &step, uint32_t index) const {
   for (const QwenTargetPrefillSequence &sequence : step.sequences)
     step.readRows.push_back(sequence.rowBegin + sequence.rows - 1);
   if (step.moe)
-    step.moe = operators_.moePrefill(geometry_.moeBlockShape(), geometry_.moeRouterFormat, step.outputRows());
+    step.moe = operators_.moe(geometry_.moeBlockShape(), geometry_.moeRouterFormat, step.outputRows());
 }
 
 void QwenTarget::addReadRows(const PrefillStep &step, const metal::MetalBuffer &compact,
@@ -424,7 +425,7 @@ void QwenTarget::addPrefillMoeRouting(PrefillStep &step, const ops::NormWeights 
                                       metal::MetalBuffer output) const {
   const QwenTargetPrefillBuffers &b = step.buffers;
   ops::Normalization::addRms(step.graph, residual, norm, b.normalized, geometry_.hiddenSize, step.outputRows());
-  step.ffn = {b.normalized, std::move(residual), std::move(output), b.moe, {}};
+  step.ffn = {b.normalized, std::move(residual), std::move(output), b.moe, {}, {}};
   ops::MoE::addRouting(step.graph, step.ffn, ffn, *step.moe);
 }
 
@@ -450,8 +451,10 @@ void QwenTarget::addVerifyMoe(VerifyStep &step, const ops::NormWeights &norm, co
                               metal::MetalBuffer residual, metal::MetalBuffer output) const {
   const QwenTargetVerifyBuffers &b = step.buffers;
   ops::Normalization::addRms(step.graph, residual, norm, b.normalized, geometry_.hiddenSize, step.rows);
-  ops::MoE::add(step.graph, {b.normalized, std::move(residual), std::move(output), b.moe, b.verifyRows}, ffn,
-                *step.moe);
+  ops::MoE::add(step.graph,
+                {b.normalized, std::move(residual), std::move(output), b.moe,
+                 std::span(step.verifyBlocks).first(step.lanes), b.verifyRows},
+                ffn, *step.moe);
 }
 
 void QwenTarget::addNormalizedHead(metal::CommandGraph &graph, const ops::NormWeights &finalNorm,

@@ -136,13 +136,17 @@ void baselinePlans() {
     }
     for (auto shape : moeShapes) {
       const auto stride = plans.moeDecodeWorkspacePerLane(shape, kRouterFormat);
-      require(stride == plans.moeDecode(shape, kRouterFormat, 1).workspace(), "workspace bound changed");
+      require(stride == plans.moe(shape, kRouterFormat, 8).workspace(), "workspace bound changed");
       const auto prefill = plans.moePrefillWorkspace(shape, kRouterFormat, 2048);
       for (uint32_t rows = 1; rows <= 2048; ++rows)
-        covers(prefill, plans.moePrefill(shape, kRouterFormat, rows).workspace(), 1, kMoeWorkspaceFields);
+        covers(prefill, plans.moe(shape, kRouterFormat, rows).workspace(), 1, kMoeWorkspaceFields);
+      // A decode step's plan is its rows': 8-row tiles while they route at
+      // most once per expert, as the routed shape's 32 rows do and the tiny
+      // shapes' 8 do not.
       for (uint32_t lanes = 1; lanes <= 4; ++lanes) {
-        const auto selected = plans.moeDecode(shape, kRouterFormat, lanes);
-        require(selected.tileRows() == 8, "MoE decode baseline changed");
+        const auto selected = plans.moe(shape, kRouterFormat, lanes * 8);
+        require(selected.tileRows() == (lanes * 8 * shape.expertsPerToken > shape.experts ? 32U : 8U),
+                "MoE decode baseline changed");
         covers(stride, selected.workspace(), lanes, kMoeWorkspaceFields);
       }
     }
@@ -215,8 +219,8 @@ void draftPlans() {
 }
 
 // MoE plans run the three expert passes on staged tiles on every GPU: 8-row
-// tiles in decode and while a prefill chunk's routes average at most one row
-// per expert, 32-row tiles past that.
+// tiles while a step's routes average at most one row per expert, as a
+// decode step's of up to four lanes do, 32-row tiles past that.
 void ggufMoePlans() {
   const MoeShape shape = routedShape;
   // A GPU family and the cores its device reports (none: kAssumedGpuCores).
@@ -225,7 +229,7 @@ void ggufMoePlans() {
     capabilities.gpuCoreCount = reportedCores;
     ExecutionPlans plans(capabilities, Int8Activations::On);
     for (uint32_t lanes = 1; lanes <= 4; ++lanes) {
-      const MoePlan plan = plans.moeDecode(shape, kRouterFormat, lanes);
+      const MoePlan plan = plans.moe(shape, kRouterFormat, lanes * 8);
       require(plan.tileRows() == 8 && plan.configuration().ggufRouterTile == FloatTile::Simdgroup,
               "GGUF MoE decode plan left its 8-row tiles");
       covers(plans.moeDecodeWorkspacePerLane(shape, kRouterFormat), plan.workspace(), lanes, kMoeWorkspaceFields);
@@ -240,7 +244,7 @@ void ggufMoePlans() {
           std::pair{uint32_t{GGUF_FMT_AF8G64}, 705U}}) {
       const MoeWorkspace bound = plans.moePrefillWorkspace(shape, routerFormat, 2048);
       for (uint32_t rows : {1U, 8U, 17U, 32U, 33U, 100U, 256U, 257U, 320U, 321U, 448U, 449U, 704U, 705U, 2048U}) {
-        const MoePlan plan = plans.moePrefill(shape, routerFormat, rows);
+        const MoePlan plan = plans.moe(shape, routerFormat, rows);
         const FloatTile router = family != 9 && rows >= first ? FloatTile::NeuralAccelerator : FloatTile::Simdgroup;
         require(plan.tileRows() == (rows <= 32 ? 8U : 32U) && plan.configuration().ggufRouterTile == router,
                 "GGUF MoE prefill plan left its tiles");
@@ -251,15 +255,12 @@ void ggufMoePlans() {
     // their 32-row tiles (26624 grouped rows at 2048 rows).
     MoeWorkspace devicePlans;
     for (uint32_t rows = 1; rows <= 2048; ++rows) {
-      const MoeWorkspace workspace = plans.moePrefill(shape, kRouterFormat, rows).workspace();
+      const MoeWorkspace workspace = plans.moe(shape, kRouterFormat, rows).workspace();
       for (const auto field : kMoeWorkspaceFields) devicePlans.*field = std::max(devicePlans.*field, workspace.*field);
     }
     require(plans.moePrefillWorkspace(shape, kRouterFormat, 2048) == devicePlans,
             "GGUF MoE prefill bound is not the bound of the device's plans");
   }
-  // The kernels exist for 8-row tiles and 32-row prefill tiles only.
-  rejects([&] { (void)MoE::decodePlan(shape, 1, {MoeExpertTile::M32}); },
-          "invalid MoE expert tile configuration", "a decode plan took 32-row tiles");
 }
 
 // A dense tile of a sequence of more than one tile takes a history split per
@@ -303,8 +304,8 @@ void unknownCoreCount() {
                   "an unknown core count planned a decode projection for other than the assumed cores");
         }
     for (uint32_t lanes = 1; lanes <= 4; ++lanes)
-      require(unknown.moeDecode(routedShape, kRouterFormat, lanes).configuration() ==
-                  planned.moeDecode(routedShape, kRouterFormat, lanes).configuration(),
+      require(unknown.moe(routedShape, kRouterFormat, lanes * 8).configuration() ==
+                  planned.moe(routedShape, kRouterFormat, lanes * 8).configuration(),
               "an unknown core count planned a MoE decode step for other than the assumed cores");
   }
 }
@@ -353,10 +354,10 @@ void invalidLookupsAndContextEdges() {
           "the attention workspace holds no sequence's splits", "an attention plan without a workspace was accepted");
   rejects([&] { (void)PagedAttention::workspace(0, 24, kvLayout); }, "invalid attention workspace slots",
           "a workspace of no tile splits was accepted");
-  for (const uint32_t lanes : {UINT32_MAX, 0U})
-    rejects([&] { (void)plans.moeDecode(routedShape, kRouterFormat, lanes); }, "invalid MoE decode width",
-            "a MoE decode of no lanes or past a batch was accepted");
-  rejects([&] { (void)plans.moePrefillWorkspace(routedShape, kRouterFormat, 0); }, "invalid MoE prefill rows",
+  for (const uint32_t rows : {UINT32_MAX, 0U})
+    rejects([&] { (void)plans.moe(routedShape, kRouterFormat, rows); }, "invalid MoE rows",
+            "a MoE step of no rows or past the budget was accepted");
+  rejects([&] { (void)plans.moePrefillWorkspace(routedShape, kRouterFormat, 0); }, "invalid MoE rows",
           "a MoE prefill workspace of no rows was accepted");
   rejects([&] { (void)plans.gateUpWorkspace({256, 32}); }, "invalid linear matrix",
           "a gate/up workspace of a partial 64-input span was accepted");

@@ -144,10 +144,10 @@ void moe() {
                              .sharedGate = false};
   for (const MoeShape shape : {MoeShape{256, 8, 2, 512}, MoeShape{2048, 256, 8, 512}, kSlices}) {
     for (uint32_t rows = 1; rows <= 2048; ++rows)
-      checkMoe(MoE::prefillPlan(shape, rows, {MoeExpertTile::M32}).workspace(), shape, rows, 32);
-    const auto single = MoE::decodePlan(shape, 1, {MoeExpertTile::M8}).workspace();
+      checkMoe(MoE::plan(shape, rows, {MoeExpertTile::M32}).workspace(), shape, rows, 32);
+    const auto single = MoE::plan(shape, 8, {MoeExpertTile::M8}).workspace();
     for (uint32_t lanes = 1; lanes <= 4; ++lanes) {
-      const auto workspace = MoE::decodePlan(shape, lanes, {MoeExpertTile::M8}).workspace();
+      const auto workspace = MoE::plan(shape, lanes * 8, {MoeExpertTile::M8}).workspace();
       checkMoe(workspace, shape, lanes * 8, 8);
       require(workspace.groupedInputBytes <= lanes * single.groupedInputBytes &&
                   workspace.tileDescriptorsBytes <=
@@ -155,25 +155,20 @@ void moe() {
               "batched decode workspace exceeds per-lane allocation bound");
     }
     for (const uint32_t rows : {0U, 2049U})
-      rejects([&] { (void)MoE::prefillPlan(shape, rows, {MoeExpertTile::M32}); },
-              "invalid MoE prefill rows",
-              "a MoE prefill of no rows or past the budget was planned");
-    for (const uint32_t lanes : {0U, 5U})
-      rejects([&] { (void)MoE::decodePlan(shape, lanes, {MoeExpertTile::M8}); },
-              "invalid MoE decode batch width",
-              "a MoE decode of no lanes or more than a batch was planned");
+      rejects([&] { (void)MoE::plan(shape, rows, {MoeExpertTile::M32}); }, "invalid MoE rows",
+              "a MoE step of no rows or past the budget was planned");
   }
-  rejects([] { (void)MoE::prefillPlan({}, 1, {MoeExpertTile::M32}); },
+  rejects([] { (void)MoE::plan({}, 1, {MoeExpertTile::M32}); },
           "invalid MoE workspace shape", "a MoE plan of an empty shape was sized");
   // No kernel routes a softmax router's two shared slices.
   MoeShape uncompiled = kSlices;
   uncompiled.router = MoeRouter::Softmax;
-  rejects([&] { (void)MoE::prefillPlan(uncompiled, 1, {MoeExpertTile::M32}); }, "invalid MoE workspace shape",
+  rejects([&] { (void)MoE::plan(uncompiled, 1, {MoeExpertTile::M32}); }, "invalid MoE workspace shape",
           "a MoE plan of a routing no kernel compiles was sized");
   // Nor a sigmoid router past the experts its kernels route.
   uncompiled = kSlices;
   uncompiled.experts = SPLASH_MOE_EXPERT_SLOTS + 1;
-  rejects([&] { (void)MoE::prefillPlan(uncompiled, 1, {MoeExpertTile::M32}); }, "invalid MoE workspace shape",
+  rejects([&] { (void)MoE::plan(uncompiled, 1, {MoeExpertTile::M32}); }, "invalid MoE workspace shape",
           "a MoE plan of more experts than its routing's kernels route was sized");
 }
 

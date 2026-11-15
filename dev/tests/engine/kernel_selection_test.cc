@@ -408,10 +408,10 @@ void moePlans(Golden &golden, const std::string &name, const ExecutionPlans &pla
       Group &workspace = golden.group(name, "moe-workspace", f);
       for (uint32_t lanes = 1; lanes <= SPLASH_MAXIMUM_BATCH_WIDTH; ++lanes)
         decode.add(set.name + " lanes " + std::to_string(lanes) + ": " +
-                   attempt([&] { return describe(plans.moeDecode(shape, routerFormat, lanes)); }));
+                   attempt([&] { return describe(plans.moe(shape, routerFormat, lanes * 8)); }));
       for (uint32_t rows = 1; rows <= SPLASH_PREFILL_TOKEN_BUDGET; rows += rows < 128 ? 1 : 16)
         prefill.add(set.name + " rows " + std::to_string(rows) + ": " +
-                    attempt([&] { return describe(plans.moePrefill(shape, routerFormat, rows)); }));
+                    attempt([&] { return describe(plans.moe(shape, routerFormat, rows)); }));
       for (const uint32_t rows : {64U, 512U, uint32_t{SPLASH_PREFILL_TOKEN_BUDGET}})
         workspace.add(set.name + " prefill " + std::to_string(rows) + ":" +
                       attempt([&] { return describe(plans.moePrefillWorkspace(shape, routerFormat, rows)); }));
@@ -769,7 +769,7 @@ void warmupCovers(const std::string &name, const ExecutionPlans &plans, std::vec
         if (std::ranges::find(seen, routerFormat) != seen.end()) continue;
         seen.push_back(routerFormat);
         const auto config = [&](uint32_t rows) {
-          return selectMoe(plans.calibration(), shape, routerFormat, rows, MoePhase::Prefill);
+          return selectMoe(plans.calibration(), shape, routerFormat, rows);
         };
         check("moe experts " + f + " " + set.name, noHistory,
               [&](uint32_t rows, uint32_t) { return config(rows).expertTile; });

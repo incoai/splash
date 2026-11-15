@@ -581,6 +581,9 @@ protected:
     // With a sliding window, the plan of the sliding layers.
     std::optional<ops::AttentionPlan> windowedAttention{};
     std::optional<ops::MoePlan> moe{};
+    // Each lane's verify block, its 8 rows from row 8 l, which a MoE routes
+    // up to the lane's verify rows (ops::MoeBuffers::verifyBlocks).
+    std::array<ops::MoeVerifyBlock, ExecutionLimits::maximumBatchWidth> verifyBlocks{};
     uint32_t gdnLayer = 0;
     uint32_t attentionLayer = 0;
   };
@@ -615,7 +618,12 @@ protected:
   // one load of the streamed experts any step's rows route (of the layer's
   // MoE block, moe), and each step's routed work (addPrefillExperts); then,
   // with the last layer, each step's end, which returns its last layer's
-  // output rows (addPrefillEnd).
+  // output rows (addPrefillEnd). The steps share the scratch their expert
+  // passes gather into and write, all but their routing (targetGroupTensor),
+  // so each step's expert work runs through its combine before the next
+  // step's begins: the first step's passes over the experts resident before
+  // the load run beside its reads (ops::MoE::addResident), each later step's
+  // after the step before it.
   template <class Step, class Layers>
   [[nodiscard]] std::vector<metal::MetalBuffer> addPrefillLayers(std::span<Step> steps, const Layers &layers,
                                                                  QwenPrefillLayers range) const {
@@ -631,9 +639,16 @@ protected:
       for (Step &step : steps) layers.addPrefillLayer(step, index);
       if (steps.front().attentionLayer != attentionLayer)
         steps.front().spilled.layerEnd(steps.front().graph, attentionLayer);
-      if (const ops::BlockMoeWeights *ffn = layers.moe(index); ffn && ffn->stream)
-        ffn->stream->addLoad(steps.front().graph, parts, ffn->streamBlock);
-      for (Step &step : steps) layers.addPrefillExperts(step, index);
+      const ops::BlockMoeWeights *ffn = layers.moe(index);
+      const bool streams = ffn && ffn->stream;
+      if (streams)
+        ffn->stream->addLoad(steps.front().graph, parts, ffn->streamBlock, [&] {
+          ops::MoE::addResident(steps.front().graph, steps.front().ffn, *ffn, *steps.front().moe);
+        });
+      for (size_t at = 0; at < steps.size(); ++at) {
+        if (streams && at) ops::MoE::addResident(steps[at].graph, steps[at].ffn, *ffn, *steps[at].moe);
+        layers.addPrefillExperts(steps[at], index);
+      }
     }
     std::vector<metal::MetalBuffer> outputs;
     if (range.end != geometry_.layers) return outputs;
@@ -685,9 +700,9 @@ protected:
   // reads the RMS norm `norm` of the mixer's `residual` rows and adds its
   // output to them into `output`. A dense SwiGLU, in a prefill on the
   // Neural Engine with the step's split of it (layer `index`'s, AneFfn); a
-  // MoE block's routing, whose routed work a prefill adds after the layer's
-  // load (addPrefillLayers, ops::MoE::addRouted with step.ffn), and a verify's
-  // whole block.
+  // MoE block's routing, whose routed work a prefill adds beside and after the
+  // layer's load (addPrefillLayers, ops::MoE::addResident and addRouted with
+  // step.ffn), and a verify's whole block.
   void addPrefillDenseFfn(PrefillStep &step, uint32_t index, const ops::NormWeights &norm,
                           ops::SwiGluProjections ffn, metal::MetalBuffer residual, metal::MetalBuffer output) const;
   void addPrefillMoeRouting(PrefillStep &step, const ops::NormWeights &norm, const ops::BlockMoeWeights &ffn,

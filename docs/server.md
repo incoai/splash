@@ -551,29 +551,31 @@ off` loads every expert, as a SIZE that holds them all does.
   experts go first), and reads them from their
   files into a staging of a decode cycle's experts on the engine's SSD
   readers, and a repack kernel writes them into their slots before the expert
-  passes over them run. A decode step's load is one such round; a prefill
-  command's loads take as many rounds as its rows may route experts, each
-  staging half of the staging while the other half is read ahead. The kernels
-  find every routed expert through a table of its slot and the chunks that
-  hold its slots, so resident experts, one chunk of every expert, and streamed
-  experts run the same kernels.
+  passes over them run. A load of at most a decode cycle's 32 rows (a decode
+  step's, or a prompt chunk's of so few rows) is one such round; a longer
+  prefill command's loads take as many rounds as its rows may route experts,
+  each staging half of the staging while the other half is read ahead. The
+  kernels find every routed expert through a table of its slot and the
+  chunks that hold its slots, so resident experts, one chunk of every expert,
+  and streamed experts run the same kernels.
 - The grouping puts the tiles of the experts already resident first and those
-  a load brings last (their slot-table entry is marked absent). A decode
-  step's expert passes over the resident ones and the shared expert run while
-  its load's host step reads from the SSD, on the grouping's copy of the slot
-  table; the passes over the experts it brought and the combine run after the
-  repack, through a second table of the slots the load routed, which the host
-  step writes and the GPU reads no earlier. Outputs are bitwise the same: each
-  expert's tiles, their kinds and the combine order do not change.
+  a load brings last (their slot-table entry is marked absent). Every
+  command's expert passes over the resident ones and the shared expert, each
+  of its chunks', run while its load's first host step reads from the SSD, on
+  the grouping's copy of the slot table; the passes over the experts it
+  brought and the combine run after the repack, through a second table of the
+  slots the load routed, which the host step writes and the GPU reads no
+  earlier. Outputs are bitwise the same: each expert's tiles, their kinds and
+  the combine order do not change.
 - An expert's rows a GGUF stores as they are are read straight into the
   staging (`F_NOCACHE`, widened to whole 16 KiB pages, which the kernel reads
   without the buffer cache: an M5 Pro reads 460 KiB pieces from four threads
   at 9.3 GB/s instead of 8.1, with less than half the CPU).
 - While the GPU repacks a round or runs a layer, the next round's experts or
   the next block's likely experts are read ahead: those the next block's
-  router picks from this block's input in a decode step; after a long prefill
-  chunk's last repack, one more host step reads nearly all of the next
-  block's into the whole staging. A load takes the read-ahead over without
+  router picks from this block's input in a load of a cycle's rows; after a
+  long prefill chunk's last repack, one more host step reads nearly all of the
+  next block's into the whole staging. A load takes the read-ahead over without
   waiting for its reads of experts it does not route, and a read ahead of an
   expert no load routes may fail without failing anything. A decode step
   loads and predicts only the experts its lanes' verify rows route
@@ -601,7 +603,7 @@ off` loads every expert, as a SIZE that holds them all does.
   cap has as many of the cap's chunks as the slots above its lower floor take,
   at most 7 in a store under 6.7 GiB. A size of one block (layers in formats
   of their own) is one chunk of every expert.
-- A decode step's loads keep the GPU awake through their host steps
+- A load of a cycle's rows keeps the GPU awake through its host step
   ([Host steps](internals.md#host-steps)), so the work after a load starts at once and at
   full clocks rather than after the GPU's wake-up.
 - A prefill command runs a group of up to four chunks of 2048 rows layer by

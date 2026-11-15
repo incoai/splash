@@ -261,10 +261,13 @@ constexpr Tensor moeScratchTensor(size_t field) noexcept {
 // Whether a prefill tensor's rows outlive a layer of a prefill group, which
 // then holds every chunk's: the rows the layers carry (tokens and positions,
 // RoPE, the hidden rows), those of the FFN its routed experts read after the
-// layer's load (input, the mixer's output they add to, the MoE's routing),
-// and those the draft's context reads once every layer ran (the captured
-// target rows, their draft positions and RoPE). A tensor a family does not
-// use holds no rows; a target's own scratch is its own (QwenTarget).
+// layer's load (input, the mixer's output they add to, the MoE's routing and
+// its copy of the slot table), and those the draft's context reads once every
+// layer ran (the captured target rows, their draft positions and RoPE). The
+// chunks share the rest of the MoE scratch, which each chunk's expert passes
+// use from its gather through its combine, one chunk's after another's
+// (QwenTarget::addPrefillLayers). A tensor a family does not use holds no
+// rows; a target's own scratch is its own (QwenTarget).
 [[nodiscard]] constexpr bool prefillGroupTensor(PrefillTensor tensor) noexcept {
   switch (tensor) {
   case PrefillTensor::Hidden0:
@@ -286,7 +289,8 @@ constexpr Tensor moeScratchTensor(size_t field) noexcept {
   }
   for (const auto routing : {&ops::MoeScratch::selectedExperts, &ops::MoeScratch::routingWeights,
                              &ops::MoeScratch::tileDescriptors, &ops::MoeScratch::tileCount,
-                             &ops::MoeScratch::groupedRoutes, &ops::MoeScratch::routeRows})
+                             &ops::MoeScratch::groupedRoutes, &ops::MoeScratch::routeRows,
+                             &ops::MoeScratch::expertSlots})
     for (size_t field = 0; field < ops::kMoeScratchFields.size(); ++field)
       if (ops::kMoeScratchFields[field].buffer == routing && tensor == moeScratchTensor<PrefillTensor>(field))
         return true;

@@ -126,7 +126,7 @@ int timing(MetalBackend &backend, const MoeShape &shape, uint32_t rounds, Fmt ga
   };
   const auto layers = [&](const MoePlan &plan, Routing routing) {
     Layers l;
-    l.buffers.resize(plan.phase() == splash::ops::MoePhase::Decode ? kDecodeLayers : kPrefillLayers);
+    l.buffers.resize(plan.rows() <= 4 * kLaneRows ? kDecodeLayers : kPrefillLayers);
     for (MoeBuffers &b : l.buffers) {
       b.input = bfloatBuffer(backend, input(plan.rows(), routing), "input");
       b.residual = zeros(backend, uint64_t{plan.rows()} * H * 2, "residual");
@@ -166,20 +166,20 @@ int timing(MetalBackend &backend, const MoeShape &shape, uint32_t rounds, Fmt ga
   // Prefill chunks first: they also bring the GPU clocks up for the short decode layers.
   for (const uint32_t rows : kPrefillRows)
     printf("  prefill chunk of %4u rows: %.4f\n", rows,
-           time(layers(plans.moePrefill(shape, routerFormat, rows), Routing::Random)));
+           time(layers(plans.moe(shape, routerFormat, rows), Routing::Random)));
   for (uint32_t lanes = 1; lanes <= 4; ++lanes) {
     printf("  decode %2u rows:", lanes * kLaneRows);
     for (const Routing routing : {Routing::Random, Routing::Pooled}) {
-      const Layers l = layers(plans.moeDecode(shape, routerFormat, lanes), routing);
+      const Layers l = layers(plans.moe(shape, routerFormat, lanes * kLaneRows), routing);
       const double ms = time(l);
       printf(" | %s %.4f (%2.0f%% column)", routing == Routing::Random ? "random" : "pooled", ms, columnShare(l));
     }
     printf("\n");
   }
   // Where the time goes: every dispatch replayed as its own command.
-  for (const auto &[label, plan] : {std::pair{"prefill 2048", plans.moePrefill(shape, routerFormat, 2048)},
-                                    std::pair{"decode 8", plans.moeDecode(shape, routerFormat, 1)},
-                                    std::pair{"decode 32", plans.moeDecode(shape, routerFormat, 4)}}) {
+  for (const auto &[label, plan] : {std::pair{"prefill 2048", plans.moe(shape, routerFormat, 2048)},
+                                    std::pair{"decode 8", plans.moe(shape, routerFormat, kLaneRows)},
+                                    std::pair{"decode 32", plans.moe(shape, routerFormat, 4 * kLaneRows)}}) {
     const Layers l = layers(plan, Routing::Random);
     std::map<std::string, double> spent;
     for (uint32_t i = 0; i < rounds; ++i)
