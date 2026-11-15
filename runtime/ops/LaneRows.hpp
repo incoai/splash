@@ -46,35 +46,6 @@ using TreeRow = SplashTreeRow;
   return most;
 }
 
-// Throws unless `lanes` are one to a batch of lanes, each of at least one row
-// and at most `limit`, where a kernel holds that many a lane.
-inline void requireLaneRows(std::span<const LaneRows> lanes,
-                            uint32_t limit = std::numeric_limits<uint32_t>::max()) {
-  if (lanes.empty() || lanes.size() > SPLASH_MAXIMUM_BATCH_WIDTH)
-    throw std::invalid_argument("lane rows name 1 to a batch of lanes");
-  for (const LaneRows &lane : lanes)
-    if (!lane.rows || lane.rows > limit) throw std::invalid_argument("a lane's rows are out of range");
-}
-
-// Throws unless `lanes`' rows follow each other in row order without
-// overlapping, as a kernel that takes a row's lane to be the last whose first
-// row is at most it reads them.
-inline void requireRowOrder(std::span<const LaneRows> lanes) {
-  for (size_t lane = 1; lane < lanes.size(); ++lane)
-    if (lanes[lane].first < uint64_t{lanes[lane - 1].first} + lanes[lane - 1].rows)
-      throw std::invalid_argument("lane rows overlap or are out of row order");
-}
-
-// The per-lane first_row and rows arrays of a kernel's parameters, zero past
-// `lanes`.
-inline void copyLaneRows(std::span<const LaneRows> lanes, uint32_t (&first)[SPLASH_MAXIMUM_BATCH_WIDTH],
-                         uint32_t (&rows)[SPLASH_MAXIMUM_BATCH_WIDTH]) {
-  for (size_t lane = 0; lane < lanes.size(); ++lane) {
-    first[lane] = lanes[lane].first;
-    rows[lane] = lanes[lane].rows;
-  }
-}
-
 // The rows a decode cycle verifies of each lane (SPLASH_DECODE_LANE_ROWS).
 inline constexpr uint32_t kDecodeLaneRows = SPLASH_DECODE_LANE_ROWS;
 static_assert(kDecodeLaneRows <= SPLASH_TARGET_VERIFY_ROWS);
@@ -117,6 +88,29 @@ inline void requireStepRows(const StepRows &step) {
       step.laneCap > SPLASH_TARGET_VERIFY_ROWS || step.rows < step.lanes ||
       step.rows > uint64_t{step.lanes} * step.laneCap)
     throw std::invalid_argument("invalid decode step rows");
+}
+
+// A command's rows as its layout on the device holds them, a SplashLaneRows
+// a sequence (its first row and rows among the command's packed rows):
+// `sequences` sequences of the command's `rows` rows, each of 1 to `bound`
+// of them. A prompt chunk's host writes its sequences' entries, their bound
+// its longest sequence's rows; a decode step's selector writes its lanes'
+// (StepRows), their bound the cycle's lane cap. A kernel's grid of a
+// sequence's rows spans the bound; a row past its sequence's rows, or a
+// sequence whose rows run past the command's, writes nothing.
+struct LayoutRows final {
+  uint32_t sequences = 0;
+  uint32_t rows = 0;
+  uint32_t bound = 0;
+};
+
+// Throws unless `rows` holds 1 to a batch of sequences of 1 to its bound of
+// rows each, a bound of at most `limit`, its rows as many as its sequences
+// may hold.
+inline void requireLayoutRows(const LayoutRows &rows, uint32_t limit = std::numeric_limits<uint32_t>::max()) {
+  if (!rows.sequences || rows.sequences > SPLASH_MAXIMUM_BATCH_WIDTH || !rows.bound || rows.bound > limit ||
+      rows.rows < rows.sequences || rows.rows > uint64_t{rows.sequences} * rows.bound)
+    throw std::invalid_argument("invalid layout rows");
 }
 
 } // namespace splash::ops

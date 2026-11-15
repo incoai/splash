@@ -59,16 +59,16 @@
 // writes a row's bitmap that far.
 #define BLOCK_INDEXER_TILE_SLACK \
   ((SPLASH_ATTENTION_BLOCK_ROW_BITS - 1u + BLOCK_INDEXER_BLOCK - 1u) / BLOCK_INDEXER_BLOCK)
-// The projection of `lanes` lanes' rows (block_indexer_project): lane l's
-// rows[l] rows from row first_row[l] of the queries and keys, the lanes in
-// row order: a prompt sequence's rows as one, or a verify step's lanes.
+// The projection of a command's `sequences` sequences' rows of its `rows`
+// rows (block_indexer_project): sequence s's rows are entry s of the
+// command's layout (SplashLaneRows), a prompt chunk's sequences' as its host
+// writes them or a verify step's lanes' as its proposer does.
 struct BlockIndexerProjectParams {
-  uint32_t lanes;
-  uint32_t first_row[SPLASH_MAXIMUM_BATCH_WIDTH];
-  uint32_t rows[SPLASH_MAXIMUM_BATCH_WIDTH];
+  uint32_t sequences;
+  uint32_t rows;
 };
 
-static_assert(sizeof(BlockIndexerProjectParams) == 4 + 8 * SPLASH_MAXIMUM_BATCH_WIDTH,
+static_assert(sizeof(BlockIndexerProjectParams) == 8,
               "block indexer projection parameters are the same size on both sides");
 
 // A prompt sequence's dispatch (block_indexer_pool, block_indexer_score,

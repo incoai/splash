@@ -10,6 +10,7 @@
 #include "ops/NgramEmbedding.hpp"
 #include "ops/PageStorage.hpp"
 
+#include <algorithm>
 #include <stdexcept>
 #include <utility>
 #include <variant>
@@ -41,6 +42,15 @@ void addIndexerProjections(metal::CommandGraph &graph, const ops::Linear &linear
   const std::array<ops::FloatProjection, 2> projections{projection(indexer.query, std::move(query)),
                                                         projection(indexer.key, std::move(key))};
   ops::addGgufFloat(graph, std::move(input), projections, rows, ops::FloatOutput::Float32);
+}
+
+// A prompt chunk's rows as its layout holds them
+// (QwenTargetPrefillBuffers::laneRows): its sequences' `rows` rows, each at
+// most the longest's.
+ops::LayoutRows promptRows(std::span<const QwenTargetPrefillSequence> sequences, uint32_t rows) {
+  uint32_t longest = 0;
+  for (const QwenTargetPrefillSequence &sequence : sequences) longest = std::max(longest, sequence.rows);
+  return {static_cast<uint32_t>(sequences.size()), rows, longest};
 }
 
 // Where each attention layer's QSA index sits in the extents of `kv` that
@@ -184,11 +194,12 @@ metal::MetalBuffer Qwen4ExpTarget::addPrefillEnd(PrefillStep &step) const {
   return step.buffers.hidden[1];
 }
 
-// Each sequence's QSA is a dispatch of one lane: its indexer projects its
-// rows, pools the blocks they complete and keeps the keys of the block they
-// leave open, and those of any state captured inside them; a sequence whose
-// rows attend sparsely then selects their blocks, its lists after those of
-// the sequences before it.
+// The indexer projects every sequence's rows in one dispatch, by the chunk's
+// layout; then each sequence's QSA is a dispatch of one: it pools the blocks
+// its rows complete and keeps the keys of the block they leave open, and
+// those of any state captured inside them; a sequence whose rows attend
+// sparsely then selects their blocks, its lists after those of the sequences
+// before it.
 std::vector<ops::AttentionBlocks> Qwen4ExpTarget::addPrefillQsa(PrefillStep &step,
                                                                 const Qwen4IndexerWeights &indexer) const {
   const QwenTargetPrefillBuffers &b = step.buffers;
@@ -199,10 +210,6 @@ std::vector<ops::AttentionBlocks> Qwen4ExpTarget::addPrefillQsa(PrefillStep &ste
   const auto u16Rows = [&](const metal::MetalBuffer &buffer, const QwenTargetPrefillSequence &sequence,
                            uint32_t width) {
     return rowsOf<uint16_t>(buffer, sequence.rowBegin, sequence.rows, width);
-  };
-  const auto f32Rows = [&](const metal::MetalBuffer &buffer, const QwenTargetPrefillSequence &sequence,
-                           uint32_t width) {
-    return rowsOf<float>(buffer, sequence.rowBegin, sequence.rows, width);
   };
   // A sequence's rows are the whole of the views of them each dispatch takes.
   const auto qsaRows = [&](const QwenTargetPrefillSequence &sequence) {
@@ -215,6 +222,13 @@ std::vector<ops::AttentionBlocks> Qwen4ExpTarget::addPrefillQsa(PrefillStep &ste
                                 h.scoreStride};
   };
   addIndexerProjections(step.graph, linear, b.normalized, indexer, h.indexerQuery, h.indexerKey, step.rows);
+  ops::BlockIndexer::addProject(step.graph, rowsOf<float>(h.indexerQuery, 0, step.rows, queryWidth),
+                                rowsOf<float>(h.indexerKey, 0, step.rows, keyWidth), indexer.queryNorm,
+                                rowsOf<float>(b.ropeCos, 0, step.rows, geometry_.rotaryPairs),
+                                rowsOf<float>(b.ropeSin, 0, step.rows, geometry_.rotaryPairs),
+                                rowsOf<uint16_t>(h.qsaQueries, 0, step.rows, queryWidth),
+                                rowsOf<uint16_t>(h.qsaKeys, 0, step.rows, keyWidth), b.laneRows,
+                                promptRows(step.sequences, step.rows));
   std::vector<ops::AttentionBlocks> blocks(step.sequences.size());
   std::vector<ops::BlockListRows> sparseRows;
   uint32_t lists = 0;
@@ -223,12 +237,6 @@ std::vector<ops::AttentionBlocks> Qwen4ExpTarget::addPrefillQsa(PrefillStep &ste
     const metal::MetalBuffer keys = u16Rows(h.qsaKeys, sequence, keyWidth);
     const metal::MetalBuffer pending = steps_.qsaPending(sequence.auxiliaryIn, layer);
     const ops::IndexerSequence rows = qsaRows(sequence);
-    const std::array<ops::LaneRows, 1> projected{{{0, sequence.rows}}};
-    ops::BlockIndexer::addProject(step.graph, f32Rows(h.indexerQuery, sequence, queryWidth),
-                                  f32Rows(h.indexerKey, sequence, keyWidth), indexer.queryNorm,
-                                  f32Rows(b.ropeCos, sequence, geometry_.rotaryPairs),
-                                  f32Rows(b.ropeSin, sequence, geometry_.rotaryPairs),
-                                  u16Rows(h.qsaQueries, sequence, queryWidth), keys, projected);
     ops::BlockIndexer::addPool(step.graph, {step.blocks[index].records, step.blocks[index].count, keys, pending},
                                indexer.keyNorm, b.ropeInverseFrequencies, geometry_.ropeScaling.attentionFactor(),
                                rows);
@@ -300,11 +308,9 @@ ops::AttentionBlocks Qwen4ExpTarget::addVerifyQsa(VerifyStep &step, const Qwen4I
   const uint32_t laneCap = ops::verifyLaneCap(step.rows, step.lanes);
   addIndexerProjections(step.graph, linear, b.normalized, indexer, h.indexerQuery, h.indexerKey, step.rows);
   std::array<uint32_t, ExecutionLimits::maximumBatchWidth> firstPositions{};
-  std::array<ops::LaneRows, ExecutionLimits::maximumBatchWidth> laneRows{};
   bool sparse = false;
   for (uint32_t lane = 0; lane < step.lanes; ++lane) {
     firstPositions[lane] = step.chunks[lane].committed_tokens;
-    laneRows[lane] = {lane * kVerifyRows, kVerifyRows};
     sparse = sparse || ops::BlockIndexer::sparse(firstPositions[lane], laneCap, topBlocks);
   }
   const ops::IndexerTreeRows tree{b.laneRows,
@@ -327,7 +333,7 @@ ops::AttentionBlocks Qwen4ExpTarget::addVerifyQsa(VerifyStep &step, const Qwen4I
                                 rowsOf<float>(h.indexerKey, 0, step.rows, keyWidth), indexer.queryNorm,
                                 rowsOf<float>(b.ropeCos, 0, step.rows, geometry_.rotaryPairs),
                                 rowsOf<float>(b.ropeSin, 0, step.rows, geometry_.rotaryPairs), queries, keys,
-                                std::span(laneRows).first(step.lanes));
+                                b.laneRows, {step.lanes, step.rows, laneCap});
   ops::BlockIndexer::addTreePool(step.graph,
                                  {step.blocks.records, std::span(step.blocks.counts).first(step.lanes),
                                   step.blocks.laneRecords, keys, std::span(pending).first(step.lanes)},

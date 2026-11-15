@@ -232,8 +232,9 @@ struct QsaIndexer final {
   // kPrefillScoreRows, a verify's all at once.
   uint32_t scoreRows = 0;
   metal::MetalBuffer records, query, key, norm, ropeCos, ropeSin, inverseFrequencies, queries, keys, scores;
-  // A verify's lanes' rows and their tree rows on the device (each lane's
-  // chain), and its rows' block keys and row masks.
+  // Each lane's rows on the device (a prefill chunk's one sequence), which
+  // the projection reads; a verify's tree rows (each lane's chain), and its
+  // rows' block keys and row masks.
   metal::MetalBuffer laneRows, tree, blockKeys, rowMasks;
 };
 
@@ -320,11 +321,11 @@ QsaIndexer qsaIndexer(metal::MetalBackend &backend, const AttentionFixturePlan &
   result.scoreRows = prefill ? 256 : laneRows;
   result.scores = backend.allocateBuffer(uint64_t{result.scoreRows} * stride * sizeof(float),
                                          metal::BufferStorage::Private, "attention-sweep-scores");
-  if (prefill) return result;
   result.laneRows = sharedBuffer<ops::LaneRows>(backend, lanes, "attention-sweep-lane-rows");
-  result.tree = sharedBuffer<ops::TreeRow>(backend, laneRows, "attention-sweep-tree-rows");
   for (uint32_t lane = 0; lane < lanes; ++lane)
     static_cast<ops::LaneRows *>(result.laneRows.contents())[lane] = {lane * rows, rows};
+  if (prefill) return result;
+  result.tree = sharedBuffer<ops::TreeRow>(backend, laneRows, "attention-sweep-tree-rows");
   for (uint32_t row = 0; row < laneRows; ++row)
     static_cast<ops::TreeRow *>(result.tree.contents())[row] = ops::chainRow(row % rows);
   result.blockKeys = backend.allocateBuffer(uint64_t{laneRows} * D * 2, metal::BufferStorage::Private,
@@ -415,11 +416,9 @@ metal::CommandGraph caseGraph(const AttentionFixture &fixture, const QsaBlocks &
   const AttentionFixturePlan &plan = fixture.plan();
   metal::CommandGraph graph;
   if (const QsaIndexer *indexer = qsa.indexer ? &*qsa.indexer : nullptr) {
-    std::vector<ops::LaneRows> lanes;
-    for (uint32_t lane = 0; lane < indexer->firstPositions.size(); ++lane)
-      lanes.push_back({lane * plan.rows, plan.rows});
     BlockIndexer::addProject(graph, indexer->query, indexer->key, {indexer->norm, true}, indexer->ropeCos,
-                             indexer->ropeSin, indexer->queries, indexer->keys, lanes);
+                             indexer->ropeSin, indexer->queries, indexer->keys, indexer->laneRows,
+                             {plan.lanes, plan.lanes * plan.rows, plan.rows});
     if (indexer->tree) {
       const ops::IndexerTreeRows rows{indexer->laneRows,
                                       indexer->tree,

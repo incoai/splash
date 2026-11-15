@@ -78,9 +78,12 @@ inline void indexer_rotate_store(float value, threadgroup float *rotated, Table 
   threadgroup_barrier(mem_flags::mem_threadgroup);
 }
 
-// Threadgroup (row, head, lane) of 128 threads: query heads are normalized,
+// Threadgroup (row, head, sequence) of 128 threads, of the sequence's rows
+// its entry of the command's layout holds: query heads are normalized,
 // rotated by the row's RoPE table and written as bf16 [rows][heads][dim];
-// the key head (head == heads) is written raw, bf16, to the row's keys.
+// the key head (head == heads) is written raw, bf16, to the row's keys. A
+// row past its sequence's rows, or a sequence whose rows run past the
+// command's, writes nothing.
 kernel void block_indexer_project(device const float *query [[buffer(0)]],
                                   device const float *key [[buffer(1)]],
                                   device const float *query_norm [[buffer(2)]],
@@ -88,16 +91,19 @@ kernel void block_indexer_project(device const float *query [[buffer(0)]],
                                   device const float *rope_sin [[buffer(4)]],
                                   device bfloat *queries [[buffer(5)]],
                                   device bfloat *keys [[buffer(6)]],
-                                  constant BlockIndexerProjectParams &p [[buffer(7)]],
+                                  device const SplashLaneRows *layout [[buffer(7)]],
+                                  constant BlockIndexerProjectParams &p [[buffer(8)]],
                                   uint3 group [[threadgroup_position_in_grid]],
                                   uint tid [[thread_index_in_threadgroup]],
                                   uint lane [[thread_index_in_simdgroup]],
                                   uint sg [[simdgroup_index_in_threadgroup]]) {
   threadgroup float scratch[kDimension / 32];
   threadgroup float rotated[kDimension];
-  const uint head = group.y, batch = group.z;
-  if (!indexer_lane(batch, p.lanes) || group.x >= p.rows[batch]) return;
-  const ulong row = ulong(p.first_row[batch]) + group.x;
+  const uint head = group.y;
+  if (!indexer_lane(group.z, p.sequences)) return;
+  const SplashLaneRows rows = layout[group.z];
+  if (group.x >= rows.rows || ulong(rows.first) + rows.rows > p.rows) return;
+  const ulong row = ulong(rows.first) + group.x;
   if (head == kHeads) {
     keys[row * kDimension + tid] = bfloat(key[row * kDimension + tid]);
     return;

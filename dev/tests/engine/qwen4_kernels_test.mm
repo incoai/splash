@@ -688,7 +688,7 @@ void qsaTest(MetalBackend &backend, QsaCase c) {
   ops::RoPE::addTables(graph, upload(backend, ropePositions), draftRope, invFreqBuffer, draftRope, cosT, sinT,
                        draftRope, draftRope, {laneRows, 0, ropeScale}, laneRows);
   ops::BlockIndexer::addProject(graph, upload(backend, query), upload(backend, stepKeys), {upload(backend, qnP), true},
-                                cosT, sinT, queries, keys, blocks);
+                                cosT, sinT, queries, keys, laneRowsOf(backend, blocks), {lanes, laneRows, rows});
   constexpr uint32_t scoreRows = 8;
   // Poisoned bitmaps: the select writes every word a tile's lists read.
   MetalBuffer scores = scratch(backend, uint64_t{scoreRows} * stride * 4),
@@ -957,14 +957,14 @@ QsaTreeResult qsaTreeStep(MetalBackend &backend, std::span<const QsaTreeLane> la
   result.scores = upload(backend, std::vector<uint32_t>(uint64_t{rows} * stride, kQsaPoison));
   result.mask = upload(backend, std::vector<uint32_t>(uint64_t{rows} * words, kQsaPoison));
   result.rowMasks = upload(backend, std::vector<uint32_t>(rows, kQsaPoison));
-  const std::array<ops::LaneRows, 1> allRows{{{0, rows}}};
-  const ops::IndexerTreeRows treeRowsOf{laneRows, treeRows, rows, most <= 8 ? 8u : 16u, anchors, {tables, 0}, top,
-                                        words, stride};
+  const uint32_t laneCap = most <= 8 ? 8u : 16u;
+  const ops::IndexerTreeRows treeRowsOf{laneRows, treeRows, rows, laneCap, anchors, {tables, 0}, top, words, stride};
   CommandGraph graph;
   ops::RoPE::addTables(graph, upload(backend, ropePositions), draftRope, weights.invFreq, draftRope, cosT, sinT,
                        draftRope, draftRope, {rows, 0, 1.0F}, rows);
   ops::BlockIndexer::addProject(graph, upload(backend, query), upload(backend, key), weights.queryNorm, cosT, sinT,
-                                result.queries, result.keys, allRows);
+                                result.queries, result.keys, laneRows,
+                                {static_cast<uint32_t>(lanes.size()), rows, laneCap});
   ops::BlockIndexer::addTreePool(graph, {upload(backend, records), counts, kLaneRecords, result.keys, pending},
                                  result.blockKeys, weights.keyNorm, weights.invFreq, 1.0F, treeRowsOf);
   ops::BlockIndexer::addTreeSelect(graph, result.queries, result.blockKeys, result.scores, result.mask,
@@ -1260,6 +1260,77 @@ void qsaPackedLanes(MetalBackend &backend) {
     ok &= download<uint8_t>(indexes[l], indexes[l].sizeBytes()) == pooled[l] && pooled[l] != before[l];
   }
   check(ok, "QSA tree kernels of packed lanes of 5, 8, 1 and 6 rows: each lane's as alone");
+}
+
+// The indexer's projection of a decode step's lanes of 1 to 16 rows, packed
+// one after another at a cycle's caps of 8 and 16 rows a lane, reads each
+// lane's rows from the layout on the device: each lane's queries and keys are
+// its rows' projected alone from row 0, bit for bit, and the step's spare
+// rows, past its rows to its lanes' caps, keep their fills.
+void qsaProjectPackedLanes(MetalBackend &backend) {
+  constexpr uint32_t D = kQsaDimension, H = BLOCK_INDEXER_HEADS, P = SPLASH_TARGET_ROPE_PAIRS;
+  constexpr uint16_t kFill = 0x7FC1;
+  std::mt19937 rng(43);
+  const QsaWeights weights = qsaWeights(backend, rng);
+  struct Projected final {
+    std::vector<uint16_t> queries, keys;
+  };
+  // The rows `rows` of a step's rows of `width` values.
+  const auto rowsOfStep = [](const std::vector<float> &values, ops::LaneRows rows, uint32_t width) {
+    return std::vector<float>(values.begin() + uint64_t{rows.first} * width,
+                              values.begin() + (uint64_t{rows.first} + rows.rows) * width);
+  };
+  // The projection of `lanes` at `cap` rows a lane, into queries and keys of
+  // `slots` rows filled beforehand.
+  const auto project = [&](std::span<const ops::LaneRows> lanes, uint32_t cap, uint32_t slots,
+                           const std::vector<float> &query, const std::vector<float> &key,
+                           const std::vector<float> &cos, const std::vector<float> &sin) {
+    MetalBuffer queries = upload(backend, std::vector<uint16_t>(uint64_t{slots} * H * D, kFill)),
+                keys = upload(backend, std::vector<uint16_t>(uint64_t{slots} * D, kFill));
+    CommandGraph graph;
+    ops::BlockIndexer::addProject(
+        graph, upload(backend, query), upload(backend, key), weights.queryNorm, upload(backend, cos),
+        upload(backend, sin), queries, keys, laneRowsOf(backend, lanes),
+        {static_cast<uint32_t>(lanes.size()), static_cast<uint32_t>(ops::rowsEnd(lanes)), cap});
+    run(backend, graph);
+    return Projected{download<uint16_t>(queries, uint64_t{slots} * H * D), download<uint16_t>(keys, uint64_t{slots} * D)};
+  };
+  const auto filled = [&](const std::vector<uint16_t> &values, uint64_t from) {
+    return std::all_of(values.begin() + from, values.end(), [&](uint16_t value) { return value == kFill; });
+  };
+  struct Case final {
+    uint32_t cap;
+    std::vector<uint32_t> sizes;
+  };
+  const std::array<Case, 3> cases{{{8, {3, 8, 1, 6}}, {16, {16, 1, 9, 12}}, {16, {7, 16}}}};
+  for (const Case &c : cases) {
+    std::vector<ops::LaneRows> lanes;
+    uint32_t rows = 0;
+    for (const uint32_t size : c.sizes) {
+      lanes.push_back({rows, size});
+      rows += size;
+    }
+    const uint32_t slots = static_cast<uint32_t>(lanes.size()) * c.cap;
+    const auto query = randoms(rng, uint64_t{slots} * H * D, 1.0f), key = randoms(rng, uint64_t{slots} * D, 1.0f),
+               cos = randoms(rng, uint64_t{slots} * P, 1.0f), sin = randoms(rng, uint64_t{slots} * P, 1.0f);
+    const Projected packed = project(lanes, c.cap, slots, query, key, cos, sin);
+    bool same = true;
+    for (const ops::LaneRows &lane : lanes) {
+      const std::array<ops::LaneRows, 1> own{{{0, lane.rows}}};
+      const Projected alone = project(own, c.cap, c.cap, rowsOfStep(query, lane, H * D), rowsOfStep(key, lane, D),
+                                      rowsOfStep(cos, lane, P), rowsOfStep(sin, lane, P));
+      same &= std::equal(alone.queries.begin(), alone.queries.begin() + uint64_t{lane.rows} * H * D,
+                         packed.queries.begin() + uint64_t{lane.first} * H * D) &&
+              std::equal(alone.keys.begin(), alone.keys.begin() + uint64_t{lane.rows} * D,
+                         packed.keys.begin() + uint64_t{lane.first} * D);
+    }
+    std::string sizes;
+    for (const uint32_t size : c.sizes) sizes += (sizes.empty() ? "" : ", ") + std::to_string(size);
+    const std::string scope = "QSA projection of lanes of " + sizes + " rows at a cap of " + std::to_string(c.cap);
+    check(same, scope + ": each lane's queries and keys as alone, bit for bit");
+    check(filled(packed.queries, uint64_t{rows} * H * D) && filled(packed.keys, uint64_t{rows} * D),
+          scope + ": the step's spare rows keep their fills");
+  }
 }
 
 // Lanes of different row counts packed one after another (5, 8, 1 and 6
@@ -1824,6 +1895,7 @@ int main(int argc, const char *argv[]) {
         qsaChainAsSequential(backend, 4093, 8, 5, 512);
         qsaChainAsSequential(backend, 602, 16, 11, 16);
         qsaPackedLanes(backend);
+        qsaProjectPackedLanes(backend);
         qsaScratchCoversWindow(backend);
         qsaRollbackTest(backend);
         qsaSelectRefusesNarrowScratch(backend);

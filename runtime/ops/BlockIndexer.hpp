@@ -121,13 +121,16 @@ struct BlockIndexer final {
   [[nodiscard]] static bool sparse(uint32_t firstPosition, uint32_t rows, uint32_t topBlocks) noexcept {
     return completeBlocks(firstPosition, rows) > topBlocks;
   }
-  // The indexer's query heads of `lanes`' rows (a prompt sequence's as one
-  // lane, or a verify step's lanes, in row order), normalized and rotated by
-  // each row's RoPE table (bf16 rows of BLOCK_INDEXER_HEADS heads), and the
-  // rows' raw keys (bf16).
+  // The indexer's query heads of a command's sequences' rows (a prompt
+  // chunk's sequences, or a verify step's lanes) as its layout holds them
+  // (`layout`, a SplashLaneRows a sequence, of `rows`), normalized and
+  // rotated by each row's RoPE table (bf16 rows of BLOCK_INDEXER_HEADS
+  // heads), and the rows' raw keys (bf16), each in its packed row: one
+  // dispatch, whose grid spans the sequences' bound.
   static void addProject(metal::CommandGraph &graph, metal::MetalBuffer query, metal::MetalBuffer key,
                          const NormWeights &queryNorm, metal::MetalBuffer ropeCos, metal::MetalBuffer ropeSin,
-                         metal::MetalBuffer queries, metal::MetalBuffer keys, std::span<const LaneRows> lanes);
+                         metal::MetalBuffer queries, metal::MetalBuffer keys, metal::MetalBuffer layout,
+                         const LayoutRows &rows);
   // The pooled keys of the blocks a prompt sequence's rows complete, into its
   // index, rotated by the target's RoPE of `inverseFrequencies` scaled by
   // ropeScale, as the queries' tables are: YaRN's attention factor, 1

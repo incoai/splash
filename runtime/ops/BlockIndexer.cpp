@@ -58,26 +58,24 @@ BlockIndexerTreeParams treeParams(const IndexerTreeRows &rows) {
 
 void BlockIndexer::addProject(metal::CommandGraph &graph, metal::MetalBuffer query, metal::MetalBuffer key,
                               const NormWeights &queryNorm, metal::MetalBuffer ropeCos, metal::MetalBuffer ropeSin,
-                              metal::MetalBuffer queries, metal::MetalBuffer keys, std::span<const LaneRows> lanes) {
-  // The kernel indexes a lane's rows from its first row, the lanes in row
-  // order.
-  requireLaneRows(lanes);
-  requireRowOrder(lanes);
+                              metal::MetalBuffer queries, metal::MetalBuffer keys, metal::MetalBuffer layout,
+                              const LayoutRows &rows) {
+  requireLayoutRows(rows);
   if (!queryNorm.float32) throw std::invalid_argument("the indexer query norm is not F32");
-  BlockIndexerProjectParams params{.lanes = static_cast<uint32_t>(lanes.size()), .first_row = {}, .rows = {}};
-  copyLaneRows(lanes, params.first_row, params.rows);
-  const uint64_t laneRows = rowsEnd(lanes);
-  requireBytes(query, laneRows * BLOCK_INDEXER_HEADS * BLOCK_INDEXER_DIMENSION * sizeof(float), "indexer query");
-  requireBytes(key, laneRows * BLOCK_INDEXER_DIMENSION * sizeof(float), "indexer key");
+  const uint64_t count = rows.rows;
+  requireBytes(query, count * BLOCK_INDEXER_HEADS * BLOCK_INDEXER_DIMENSION * sizeof(float), "indexer query");
+  requireBytes(key, count * BLOCK_INDEXER_DIMENSION * sizeof(float), "indexer key");
   requireBytes(queryNorm.buffer, BLOCK_INDEXER_DIMENSION * sizeof(float), "indexer query norm");
-  requireBytes(ropeCos, laneRows * SPLASH_TARGET_ROPE_PAIRS * sizeof(float), "indexer RoPE cosine");
-  requireBytes(ropeSin, laneRows * SPLASH_TARGET_ROPE_PAIRS * sizeof(float), "indexer RoPE sine");
-  requireBytes(queries, laneRows * BLOCK_INDEXER_HEADS * BLOCK_INDEXER_DIMENSION * sizeof(uint16_t), "indexer queries");
-  requireBytes(keys, laneRows * kKeyBytes, "indexer keys");
+  requireBytes(ropeCos, count * SPLASH_TARGET_ROPE_PAIRS * sizeof(float), "indexer RoPE cosine");
+  requireBytes(ropeSin, count * SPLASH_TARGET_ROPE_PAIRS * sizeof(float), "indexer RoPE sine");
+  requireBytes(queries, count * BLOCK_INDEXER_HEADS * BLOCK_INDEXER_DIMENSION * sizeof(uint16_t), "indexer queries");
+  requireBytes(keys, count * kKeyBytes, "indexer keys");
+  requireBytes(layout, uint64_t{rows.sequences} * sizeof(SplashLaneRows), "indexer layout");
   graph.add("block_indexer_project",
             {std::move(query), std::move(key), queryNorm.buffer, std::move(ropeCos), std::move(ropeSin),
-             std::move(queries), std::move(keys)},
-            params, {mostRows(lanes), BLOCK_INDEXER_HEADS + 1, params.lanes}, {BLOCK_INDEXER_DIMENSION, 1, 1});
+             std::move(queries), std::move(keys), std::move(layout)},
+            BlockIndexerProjectParams{.sequences = rows.sequences, .rows = rows.rows},
+            {rows.bound, BLOCK_INDEXER_HEADS + 1, rows.sequences}, {BLOCK_INDEXER_DIMENSION, 1, 1});
 }
 
 void BlockIndexer::addPool(metal::CommandGraph &graph, const IndexerSequenceBlocks &blocks,
