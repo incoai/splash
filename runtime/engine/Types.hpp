@@ -190,8 +190,7 @@ public:
   // counted (TtftPart::Rest is 0).
   virtual void firstTokenParts(uint64_t, const TtftParts &) {}
   virtual void tokens(uint64_t requestId, std::span<const uint32_t> tokens) = 0;
-  virtual void maskRequested(uint64_t requestId,
-                             std::span<const uint32_t> simulationTokens) = 0;
+  virtual void maskRequested(const ModelMaskRequest &request) = 0;
   // bounded: a Length end short of the request's maxNewTokens, at a bound
   // of the engine's own (the SSD cache's quota, or the memory a lone lane
   // could not grow past), which ends the response as its context would.

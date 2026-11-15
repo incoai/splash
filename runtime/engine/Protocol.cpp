@@ -483,12 +483,19 @@ std::optional<ProtocolIssue> validateMaskRequest(const MaskRequestEvent &event,
   }
   // An empty simulation sequence is the initial-anchor request and
   // deliberately produces one mask row. During speculative verification
-  // the sequence is [pending_anchor, draft...], so len+1 rows represent
-  // before-anchor and after each simulated token.
+  // the sequence is the verify block's tree, the pending anchor first, so
+  // len+1 rows represent before-anchor and after each token's path.
   if (!event.wordsPerMask ||
-      event.simulationTokens.size() > limits.maxSimulationTokens) {
+      event.simulationTokens.size() > limits.maxSimulationTokens ||
+      event.parents.size() != event.simulationTokens.size()) {
     return invalidEvent(IssueCode::InvalidCount, event.requestId,
                         "mask request dimensions are invalid");
+  }
+  // The first token is the tree's root, and every other follows one before it.
+  for (size_t row = 0; row < event.parents.size(); ++row) {
+    if (row ? event.parents[row] >= row : event.parents[row] != kNoMaskParent)
+      return invalidEvent(IssueCode::InvalidConstraint, event.requestId,
+                          "mask request tokens are not a tree whose parents come first");
   }
   uint64_t maskRows = 0;
   uint64_t totalWords = 0;
@@ -674,13 +681,15 @@ EncodedEvent encodeMaskRequest(const MaskRequestEvent &event,
   Writer writer =
       frameWriter(FrameType::MaskRequest,
                   kMaskRequestFixedBytes +
-                      event.simulationTokens.size() * sizeof(uint32_t));
+                      event.simulationTokens.size() * 2 * sizeof(uint32_t));
   writer.u64(event.requestId);
   writer.u64(event.maskRequestId);
   writer.u32(event.wordsPerMask);
   writer.u32(static_cast<uint32_t>(event.simulationTokens.size()));
   for (uint32_t token : event.simulationTokens)
     writer.u32(token);
+  for (uint32_t parent : event.parents)
+    writer.u32(parent);
   return success(writer.take());
 }
 

@@ -2344,8 +2344,13 @@ Greedy, sampled and constrained requests share decode batches; each lane keeps
 its own sampling policy and RNG, and a greedy lane takes the argmax path in any
 batch. A batch with a constrained lane runs its cycle as three commands around
 the host mask exchange: the draft, the target forward while the server computes
-each constrained lane's masks from its proposals, and the selection, in which
-only the constrained lanes read masks. A mask request the server leaves
+each constrained lane's masks, and the selection, in which only the constrained
+lanes read masks. A lane's mask request carries its verify rows as their tree,
+each row's token and its parent row, and the server's grammar walks it depth
+first in one matcher, consuming a row's token over its parent's state and
+rolling it back after the row's subtree, so each row's mask follows its own
+path; a row whose token the grammar rejects there, and every row below it,
+takes its parent's mask, as the target never accepts it. A mask request the server leaves
 unanswered for 5 s fails that request with the retryable `mask_timeout` (HTTP
 503), so a stalled grammar cannot hold the batch's command.
 
@@ -2937,11 +2942,11 @@ the end starts at a selection's row 0, before which no draft token can end
 thinking, and the end tokens left are the lane's proposals, a chain of its
 tree the selector takes before any draft row (none beside it could be
 accepted), so a decode cycle accepts as many of them as it verifies; the
-request's speculation counts leave those proposals out. A constrained request's end waits for its grammar: it starts at the first
-row from the cut whose mask admits its first token, the rows before it keeping
-their own selections, which the engine counts as thinking past the budget, and
-it replaces no proposals before it has started, as only the verify reads the
-masks. A selection where no budget runs out dispatches nothing more.
+request's speculation counts leave those proposals out. A constrained request's end waits for its grammar: along each row's path it
+starts at the first of the path's rows from the cut whose mask admits its first
+token, the path's rows before it keeping their own selections, which the engine
+counts as thinking past the budget, and it replaces no proposals before it has
+started, as only the verify reads the masks. A selection where no budget runs out dispatches nothing more.
 
 Requests carry the score-token IDs and Done events the selected f32 logits; the
 server and the engine must speak the same native wire version. Scoring requires

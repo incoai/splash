@@ -454,9 +454,18 @@ struct ModelStepResult final {
   bool operator==(const ModelStepResult &) const = default;
 };
 
+// The parent of a mask request's first simulation token, its tree's root.
+inline constexpr uint32_t kNoMaskParent = UINT32_MAX;
+
+// The tokens whose grammar masks a request needs: none for its first token,
+// whose one mask is its grammar's state; for a decode cycle, its verify rows
+// as a tree, each token with its parent's index (kNoMaskParent for the
+// anchor), whose masks are the one before the anchor and one after each
+// token's path.
 struct ModelMaskRequest final {
   uint64_t requestId = 0;
   std::vector<uint32_t> simulationTokens;
+  std::vector<uint32_t> parents;
 };
 
 class ModelBatchTicket {

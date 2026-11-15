@@ -103,12 +103,13 @@ def _event_payload(event: wire.EngineEvent) -> tuple[wire.FrameType, bytes]:
             )
         case wire.MaskRequestEvent():
             return wire.FrameType.MASK_REQUEST, struct.pack(
-                f"<QQII{len(event.simulation_tokens)}I",
+                f"<QQII{len(event.simulation_tokens) + len(event.parents)}I",
                 event.request_id,
                 event.mask_request_id,
                 event.words_per_mask,
                 len(event.simulation_tokens),
                 *event.simulation_tokens,
+                *event.parents,
             )
         case wire.DoneEvent():
             return wire.FrameType.DONE, struct.pack(

@@ -36,10 +36,10 @@ struct SamplingPenalties final {
 // the selection's rows cuts nothing in it. At row 0 no draft token comes
 // before the cut, so the end is the lane's proposals there too: a host chain
 // of its tree (ops::DraftTreeLane). An end that waits for the mask of a
-// constrained lane, whose block is a chain, starts instead at the first of
-// those rows whose mask admits its first token, the rows before it keeping
-// their own selections; as that is known only at the verify, it proposes
-// nothing.
+// constrained lane starts instead, along each row's path, at the first of the
+// path's rows from depth `row` on whose mask admits its first token, the
+// path's rows before it keeping their own selections; as that is known only
+// at the verify, it proposes nothing.
 struct ThinkingCutoff final {
   uint32_t row = 0;
   std::span<const uint32_t> end{};

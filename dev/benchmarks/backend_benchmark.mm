@@ -93,7 +93,7 @@ public:
                               values.end());
   }
 
-  void maskRequested(uint64_t, std::span<const uint32_t>) override {
+  void maskRequested(const ModelMaskRequest &) override {
     throw std::logic_error("unconstrained benchmark requested a token mask");
   }
 

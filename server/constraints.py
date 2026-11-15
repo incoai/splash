@@ -3,24 +3,20 @@
 import threading
 from concurrent.futures import Future, wait
 
-from llguidance import LLExecutor, LLMatcher, LLTokenizer
+from llguidance import LLMatcher, LLTokenizer
 from llguidance.hf import from_tokenizer as guidance_tokenizer
-from llguidance.numpy import (
-    allocate_token_bitmask,
-    fill_next_token_bitmask_par,
-    fill_next_token_bitmask_par_with_draft_tokens,
-)
+from llguidance.numpy import allocate_token_bitmask, fill_next_token_bitmask
 
 from .chat_format import THINK_END, THINK_START, TOOL_CALL_OPEN
 from .errors import APIError, ConstraintError
 from .lru import LRUCache
+from .protocol import NO_PARENT
 from .tokenization import added_tokens
 
 
 class TokenConstraint:
-    def __init__(self, matcher, executor, ready):
+    def __init__(self, matcher, ready):
         self.matcher = matcher
-        self.executor = executor
         # From the engine's Ready: the target's vocabulary, which each mask
         # covers; its stop tokens, which end a grammar's output; and the rows
         # of one mask request, before the anchor and after each simulated
@@ -45,37 +41,50 @@ class TokenConstraint:
         """Checks the tokens generated after the last mask."""
         self._consume_committed()
 
-    def masks(self, simulation_tokens):
+    def masks(self, simulation_tokens, parents):
+        """The grammar's mask before the first simulated token, then one
+        after each token's path: the tokens from the first along their
+        parents to it (protocol.MaskRequestEvent), a verify block's rows as
+        its tree. The grammar walks the tree depth first in one matcher, each
+        token consumed over its parent's state and rolled back after its
+        subtree. A token the grammar rejects there, or a stop token, which
+        ends the output, is a row the target never accepts, nor any row
+        below it; those rows take their parent's mask, which admits a token
+        as every mask must."""
         self._consume_committed()
-        if len(simulation_tokens) >= self.rows:
-            raise ConstraintError("too many simulation tokens")
-        in_range = next(
-            (
-                index
-                for index, token in enumerate(simulation_tokens)
-                if not 0 <= token < self.vocabulary
-            ),
-            len(simulation_tokens),
-        )
-        valid_count = self.matcher.validate_tokens(list(simulation_tokens[:in_range]))
-        valid_tokens = simulation_tokens[:valid_count]
-        if valid_tokens:
-            fill_next_token_bitmask_par_with_draft_tokens(
-                self.executor,
-                [(self.matcher, 0, list(valid_tokens))],
-                self.bitmask,
-            )
-        else:
-            fill_next_token_bitmask_par(
-                self.executor, [(self.matcher, 0)], self.bitmask
-            )
         rows = len(simulation_tokens) + 1
-        valid_rows = valid_count + 1
-        if valid_rows < rows:
-            self.bitmask[valid_rows:rows] = self.bitmask[valid_rows - 1]
-        if not self.bitmask[:valid_rows].any(axis=1).all():
+        if rows > self.rows:
+            raise ConstraintError("too many simulation tokens")
+        # Mask row r + 1 follows token r, and the first token row 0.
+        follows = [0 if parent == NO_PARENT else parent + 1 for parent in parents]
+        children = [[] for _ in range(rows)]
+        for row, parent_row in enumerate(follows, 1):
+            children[parent_row].append(row)
+        fill_next_token_bitmask(self.matcher, self.bitmask, 0)
+        reached = {0}
+        self._walk(0, simulation_tokens, children, reached)
+        # A parent's row comes before its children's.
+        for row in range(1, rows):
+            if row not in reached:
+                self.bitmask[row] = self.bitmask[follows[row - 1]]
+        if not self.bitmask[:rows].any(axis=1).all():
             raise ConstraintError("output grammar has no valid token")
         return self.bitmask[:rows].tobytes()
+
+    def _walk(self, row, tokens, children, reached):
+        """Fills the masks below mask row `row`, whose state the matcher is
+        in, and leaves it there."""
+        for child in children[row]:
+            token = tokens[child - 1]
+            if (
+                0 <= token < self.vocabulary
+                and token not in self.eos_tokens
+                and self.matcher.try_consume_tokens([token])
+            ):
+                fill_next_token_bitmask(self.matcher, self.bitmask, child)
+                reached.add(child)
+                self._walk(child, tokens, children, reached)
+                self.matcher.rollback(1)
 
     def _consume_committed(self):
         with self._lock:
@@ -204,7 +213,6 @@ class ConstraintFactory:
             eos_token=list(ready.stop_token_ids),
             slices=LLTokenizer.json_slices(),
         )
-        self.executor = LLExecutor()
         # Compiled matchers by grammar, within a budget of grammar bytes.
         self.cache = LRUCache(self.CACHE_SOURCE_BYTES, self.CACHE_SIZE)
         self.lock = threading.Lock()
@@ -219,7 +227,7 @@ class ConstraintFactory:
         parser's limits where generation reaches a construct, after the whole
         prompt has been processed."""
         matcher = self._matcher(grammar, timeout, prefixes)
-        return TokenConstraint(matcher.deep_copy(), self.executor, self.ready)
+        return TokenConstraint(matcher.deep_copy(), self.ready)
 
     def _matcher(self, grammar, timeout, prefixes):
         # Compilation uses the frontend's bounded preparation slots. Share

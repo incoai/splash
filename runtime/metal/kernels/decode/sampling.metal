@@ -1956,10 +1956,11 @@ kernel void decode_sample_argmax_reduce(
 }
 
 // After the selection, the thinking cutoff of each lane that has one
-// (ThinkingCutoffParams): its rows of depth row on select its end tokens, or
-// where its end waits for its mask, a chain's rows from the first of those
-// whose mask admits the end's first token. A row's path up to depth row, its
-// anchor excepted, holds the draft tokens before its cut.
+// (ThinkingCutoffParams): each row whose path reaches the path's cut, its row
+// at the depth of the lane's row or, where the lane's end waits for its mask,
+// the first from there whose mask admits the end's first token, selects the
+// end token of its depth past the cut. A row's path up to its cut, its anchor
+// excepted, holds the draft tokens before the cut.
 kernel void decode_sample_thinking_cutoff(
     device const uint *input_tokens [[buffer(0)]],
     device const uint *token_mask [[buffer(1)]],
@@ -1969,37 +1970,39 @@ kernel void decode_sample_thinking_cutoff(
     device const uint *verify_rows [[buffer(5)]],
     constant ThinkingCutoffParams &params [[buffer(6)]],
     uint lane [[threadgroup_position_in_grid]]) {
-  const uint rows = verify_rows[lane];
-  uint row = params.row[lane];
-  if (params.waiting_mask & (1u << lane)) {
-    // The lane's mask rows, as selected_row reads them.
-    device const uint *masks =
-        token_mask + (ulong(lane) * (SPLASH_TARGET_VERIFY_ROWS + 1) +
-                      params.mask_row) *
-                         params.mask_words;
-    const uint start = params.tokens[lane][0];
-    for (; row < rows; ++row) {
-      if (masks[row * params.mask_words + start / 32] & (1u << (start % 32)))
-        break;
-    }
-  }
-  const uint first = lane_rows[lane].first;
+  const uint rows = verify_rows[lane], first = lane_rows[lane].first;
+  const bool waits = (params.waiting_mask & (1u << lane)) != 0;
+  // The lane's mask rows, as selected_row reads them.
+  device const uint *masks =
+      token_mask + (ulong(lane) * (SPLASH_TARGET_VERIFY_ROWS + 1) +
+                    params.mask_row) *
+                       params.mask_words;
+  const uint start = params.tokens[lane][0];
   for (uint at = 0; at < rows; ++at) {
     // A selection of one row, a first token after a prompt, has no tree: its
     // row is its anchor's.
+    const uint path = rows > 1 ? tree[first + at].ancestors : 1u;
     const uint depth = rows > 1 ? uint(tree[first + at].depth) : 0u;
-    if (depth < row || depth - row >= params.count[lane])
+    // The path's rows ascend from its anchor, one a depth; one past the
+    // row's depth where the path holds no cut.
+    uint cut = 0;
+    for (uint walk = path; walk; walk &= walk - 1, ++cut)
+      if (cut >= params.row[lane] &&
+          (!waits || (masks[ctz(walk) * params.mask_words + start / 32] &
+                      (1u << (start % 32)))))
+        break;
+    if (cut > depth || depth - cut >= params.count[lane])
       continue;
     bool ended = false;
-    for (uint path = rows > 1 ? tree[first + at].ancestors & ~1u : 0u; path; path &= path - 1) {
-      const uint before = ctz(path);
+    for (uint walk = path & ~1u; walk; walk &= walk - 1) {
+      const uint before = ctz(walk);
       const uint draft = input_tokens[first + before];
-      ended = ended || (tree[first + before].depth <= row &&
+      ended = ended || (tree[first + before].depth <= cut &&
                         (draft == params.close[lane] || draft == params.also_ends[lane]));
     }
     // A row with no selectable logit keeps its sentinel, so the lane fails.
     if (!ended && tokens[first + at] < params.vocabulary)
-      tokens[first + at] = params.tokens[lane][depth - row];
+      tokens[first + at] = params.tokens[lane][depth - cut];
   }
 }
 

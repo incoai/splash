@@ -2311,11 +2311,11 @@ struct Runtime::Impl {
       ops::DraftTreeLane &tree = trees[lane];
       tree.anchor = *entry.pendingToken;
       tree.depth = maximumRows[lane] - 1;
-      // A lane grows a tree where its target verifies trees, but a
-      // constrained lane a chain, along which its grammar finds its rows'
-      // masks (ConstrainedDecodeTicket).
+      // A lane grows a tree where its target verifies trees; a constrained
+      // lane's grammar finds each row's mask along the row's path
+      // (ConstrainedDecodeTicket).
       const ops::SamplingPolicy policy = samplingPolicy(entry);
-      const bool branches = targetModel->verifiesTrees() && !policy.constrained;
+      const bool branches = targetModel->verifiesTrees();
       tree.children = branches ? SPLASH_TREE_CHILDREN : 1;
       // Its draft steps' estimates are its policy's acceptance model's, a
       // sampled lane's learned from its verify rows' rejection sampling. A
@@ -2887,8 +2887,9 @@ struct Runtime::Impl {
           entries[lane] = &entry;
           if (!constrained(lane))
             continue;
-          // A constrained lane's verify rows are a chain from its first row:
-          // its anchor, then its proposals in order.
+          // A constrained lane's grammar finds its verify rows' masks along
+          // each row's path: the rows' tokens from its first row, its
+          // anchor's first, each with its parent row.
           const ops::LaneRows block = impl_.laneRows(lane);
           const uint32_t verified =
               *contents<uint32_t>(impl_.decodeArena->get(lane, DecodeTensor::VerifyRows), "verify rows");
@@ -2898,13 +2899,17 @@ struct Runtime::Impl {
               contents<uint32_t>(impl_.decodeArena->batchSlice(DecodeTensor::InputTokens, kLaneCount),
                                  "constrained verify rows") +
               block.first;
+          const ops::TreeRow *tree =
+              contents<ops::TreeRow>(impl_.decodeArena->batchSlice(DecodeTensor::TreeRows, kLaneCount),
+                                     "constrained verify tree") +
+              block.first;
           entry.maskWords.clear();
           entry.verifyMaskRows = verified + 1;
 
           if (!abandoned_[lane]) {
-            ModelMaskRequest request;
-            request.requestId = entry.id;
-            request.simulationTokens.assign(rows, rows + verified);
+            ModelMaskRequest request{entry.id, {rows, rows + verified}, {}};
+            for (uint32_t row = 0; row < verified; ++row)
+              request.parents.push_back(row ? tree[row].parent : kNoMaskParent);
             requests_.push_back(std::move(request));
           }
         }

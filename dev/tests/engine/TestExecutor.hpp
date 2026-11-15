@@ -184,7 +184,7 @@ public:
     if (state_->emitted)
       return {};
     state_->emitted = true;
-    return {{state_->requestId, {10, 11, 12, 13, 14, 15, 16, 17}}};
+    return {{state_->requestId, {10, 11, 12, 13, 14, 15, 16, 17}, {kNoMaskParent, 0, 1, 2, 3, 4, 5, 6}}};
   }
   bool ownsMaskWait(uint64_t id) const noexcept override {
     return state_->emitted && id == state_->requestId;

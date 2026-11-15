@@ -2359,7 +2359,9 @@ void nonFiniteRowsSelectTheSentinel(MetalBackend &backend) {
 // path, its ancestors' but its anchor's, and not those of the rows before it on
 // other branches; a thinking cutoff gives each row of its depth on its end
 // tokens by depth, but where a token on the row's path up to the cut ended
-// thinking, which leaves that row's subtree its own selections. Lane 0's tree:
+// thinking, which leaves that row's subtree its own selections, and an end
+// that waits for its mask starts on each path at the path's own first row
+// whose mask admits it. Lane 0's tree:
 // rows 1 and 2 follow the anchor, rows 3 and 4 row 1, row 5 row 2, rows 6
 // and 7 row 5; its rows repeat tokens across branches, and row 2 holds the
 // close of thinking. Lane 1 is the same tree, sampled.
@@ -2443,6 +2445,43 @@ void treeSelections(MetalBackend &backend) {
     for (const uint32_t row : {0U, 1U, 2U, 5U, 6U, 7U})
       require(selected[lane * kRows + row] == batch.outputTokens()[lane * kRows + row],
               "a row above the cut's depth or below a closed path took the end");
+
+  // Where a constrained lane's end waits for its mask, each path cuts at its
+  // first row from the cut's depth whose mask admits the end's first token:
+  // with the cut at depth 1 and row 1's mask refusing that token, the path
+  // through row 1 cuts at rows 3 and 4, and the one through row 2, which here
+  // holds no close, at row 2 itself, whose child row 5 takes end[1] and whose
+  // grandchildren rows 6 and 7, past the end, their own selections.
+  uint32_t *masks = batch.masks();
+  const uint32_t words = batch.maskWords();
+  std::fill_n(masks, uint64_t{2} * kMaskRows * words, ~0U);
+  for (uint32_t lane = 0; lane < 2; ++lane) {
+    // Verify row r reads mask row r + 1.
+    masks[(uint64_t{lane} * kMaskRows + 2) * words + end[0] / 32] &= ~(1U << end[0] % 32);
+    batch.inputTokens()[lane * kRows + 2] = 11;
+  }
+  const std::array<uint32_t, 2> eightRows{8, 8};
+  const auto select = [&] {
+    std::copy(original.begin(), original.end(), batch.logits());
+    batch.poison();
+    CommandGraph graph;
+    sampling.addVerify(graph, policies, batch.buffers, layOut(batch.buffers, blocks(2), eightRows), kStopTokens,
+                       {table, tableRows});
+    static_cast<void>(backend.submitCommandAsync(graph.dispatches()).wait());
+    return std::vector<uint32_t>(batch.outputTokens(), batch.outputTokens() + batch.rows);
+  };
+  for (SamplingPolicy &policy : policies)
+    policy.constrained = true;
+  const std::vector<uint32_t> own = select();
+  for (SamplingPolicy &policy : policies)
+    policy.thinkingCutoff = ThinkingCutoff{1, end, alsoEnds, true};
+  const std::vector<uint32_t> waited = select();
+  // The end token each of the eight rows takes; -1 for its own selection.
+  constexpr std::array<int, 8> takes{-1, -1, 0, 0, 0, 1, -1, -1};
+  for (uint32_t lane = 0; lane < 2; ++lane)
+    for (uint32_t row = 0; row < takes.size(); ++row)
+      require(waited[lane * kRows + row] == (takes[row] < 0 ? own[lane * kRows + row] : end[takes[row]]),
+              "tree row " + std::to_string(row) + "'s waiting end did not start on its own path");
 }
 
 // A sampled verify row's draft children (metal/abi/Sampling.h): its next

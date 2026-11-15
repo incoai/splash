@@ -145,19 +145,19 @@ static_assert(sizeof(SamplingPenaltyParams) == 104,
 
 // One selection's thinking cutoffs (ops::SamplingPolicy::thinkingCutoff) over
 // its lanes' selected rows (TargetSamplingParams), each a row of its block's
-// tree (metal/abi/VerifyTree.h). A lane whose row is below its rows
-// selects its end token tokens[i] at each row of depth row + i, for each i
-// below its count, unless a draft token on the row's path up to depth row is
-// close or also_ends, which ended thinking first. The end of a lane in
-// waiting_mask, a constrained one, whose block is a chain, waits for its mask:
-// its row is instead the first from there whose constraint mask row (mask_row
-// on, of mask_words words, as in TargetSamplingParams) admits tokens[0]. The
-// rows before it keep their own selections, as do all the rows of a selection
-// without one. A row whose selection is the sentinel of a row with no
-// selectable logit (a token outside the vocabulary) keeps it, so the lane
-// still fails. A lane whose row is 0 and whose end does not wait proposes its
-// end tokens as a host chain of its tree (DraftTreeParams), so acceptance keeps
-// them all.
+// tree (metal/abi/VerifyTree.h). A lane whose row is below its rows cuts each
+// row's path at the path's row of depth row: the path's row of depth cut + i
+// selects its end token tokens[i], for each i below its count, unless a draft
+// token on the path up to the cut is close or also_ends, which ended thinking
+// first. The end of a lane in waiting_mask, a constrained one, waits for its
+// mask: a path's cut is instead the first of its rows from depth row on whose
+// constraint mask row (mask_row on, of mask_words words, as in
+// TargetSamplingParams) admits tokens[0], the path's rows before it keeping
+// their own selections, as do all the rows of a path without one. A row whose
+// selection is the sentinel of a row with no selectable logit (a token outside
+// the vocabulary) keeps it, so the lane still fails. A lane whose row is 0 and
+// whose end does not wait proposes its end tokens as a host chain of its tree
+// (DraftTreeParams), so acceptance keeps them all.
 struct ThinkingCutoffParams {
   uint32_t vocabulary;
   uint32_t waiting_mask;

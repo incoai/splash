@@ -793,11 +793,12 @@ class NativeBackend:
             return None
 
         def provide(event):
-            # runtime sends the simulated context sequence, not merely draft
-            # proposals: [] for the initial mask, then [pending anchor,
-            # draft...] for verification. TokenConstraint returns the mask
-            # before the first simulated token and after each token.
-            return job.constraint.masks(event.simulation_tokens)
+            # runtime sends the simulated context, not merely draft
+            # proposals: nothing for the initial mask, then a verify block's
+            # tree, the pending anchor its root. TokenConstraint returns the
+            # mask before the first simulated token and after each token's
+            # path.
+            return job.constraint.masks(event.simulation_tokens, event.parents)
 
         return provide
 

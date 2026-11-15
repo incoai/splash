@@ -73,9 +73,9 @@ class FakeConstraint:
         self.committed = []
         self.finish_calls = 0
 
-    def masks(self, simulation_tokens):
+    def masks(self, simulation_tokens, parents):
         simulation_tokens = tuple(simulation_tokens)
-        self.mask_calls.append(simulation_tokens)
+        self.mask_calls.append((simulation_tokens, tuple(parents)))
         rows = len(simulation_tokens) + 1
         words = tuple(range(1, rows * self.words_per_mask + 1))
         return struct.pack(f"<{len(words)}I", *words)
@@ -213,11 +213,13 @@ class NativeBackendContractTests(unittest.TestCase):
         self.assertEqual(frame.constraint, wire.ConstraintMode.TOKEN_MASK)
         self.assertEqual(request.deadline, job.deadline)
 
-        event = wire.MaskRequestEvent(runtime.calls[0].request_id, 91, 2, (5, 6))
+        event = wire.MaskRequestEvent(
+            runtime.calls[0].request_id, 91, 2, (5, 6), (wire.NO_PARENT, 0)
+        )
         self.assertEqual(
             request.mask_provider(event), array.array("I", (1, 2, 3, 4, 5, 6)).tobytes()
         )
-        self.assertEqual(constraint.mask_calls, [(5, 6)])
+        self.assertEqual(constraint.mask_calls, [((5, 6), (wire.NO_PARENT, 0))])
 
     def test_mask_simulation_empty_and_eight_tokens_produce_one_and_nine_rows(self):
         constraint = FakeConstraint(words_per_mask=2)
@@ -225,15 +227,16 @@ class NativeBackendContractTests(unittest.TestCase):
             make_job(constraint=constraint)
         )
 
-        initial = wire.MaskRequestEvent(1, 20, 2, ())
-        simulation = wire.MaskRequestEvent(1, 21, 2, tuple(range(8)))
+        chain = (wire.NO_PARENT, *range(7))
+        initial = wire.MaskRequestEvent(1, 20, 2, (), ())
+        simulation = wire.MaskRequestEvent(1, 21, 2, tuple(range(8)), chain)
         self.assertEqual(provider(initial), array.array("I", (1, 2)).tobytes())
         self.assertEqual(provider(simulation), array.array("I", range(1, 19)).tobytes())
-        self.assertEqual(constraint.mask_calls, [(), tuple(range(8))])
+        self.assertEqual(constraint.mask_calls, [((), ()), (tuple(range(8)), chain)])
 
         with self.assertRaises(api_errors.ConstraintError):
-            generation_constraints.TokenConstraint(None, None, READY).masks(
-                tuple(range(9))
+            generation_constraints.TokenConstraint(None, READY).masks(
+                tuple(range(9)), (wire.NO_PARENT, *range(8))
             )
 
     def test_release_weights_asks_the_engine_and_returns_its_status(self):
@@ -408,19 +411,24 @@ class NativeBackendContractTests(unittest.TestCase):
         self.assertEqual(request.constraint, wire.ConstraintMode.TOKEN_MASK)
         process.send(wire.StartEvent(request.request_id, 0, 0))
 
-        process.send(wire.MaskRequestEvent(request.request_id, 71, 2, ()))
+        process.send(wire.MaskRequestEvent(request.request_id, 71, 2, (), ()))
         initial = process.stdin.wait_for(wire.MaskResponseFrame)[0]
         self.assertEqual(initial.request_id, request.request_id)
         self.assertEqual(initial.mask_request_id, 71)
         self.assertEqual(initial.mask_words, array.array("I", (1, 2)).tobytes())
 
+        # A verify block's tree: the anchor's two children, the first with a
+        # subtree of its own, travel with their parents.
         simulation = tuple(range(100, 108))
-        process.send(wire.MaskRequestEvent(request.request_id, 72, 2, simulation))
+        parents = (wire.NO_PARENT, 0, 1, 1, 3, 0, 5, 6)
+        process.send(
+            wire.MaskRequestEvent(request.request_id, 72, 2, simulation, parents)
+        )
         verify = process.stdin.wait_for(wire.MaskResponseFrame, count=2)[1]
         self.assertEqual(verify.request_id, request.request_id)
         self.assertEqual(verify.mask_request_id, 72)
         self.assertEqual(verify.mask_words, array.array("I", range(1, 19)).tobytes())
-        self.assertEqual(constraint.mask_calls, [(), simulation])
+        self.assertEqual(constraint.mask_calls, [((), ()), (simulation, parents)])
 
         process.send(
             wire.DoneEvent(
@@ -638,7 +646,7 @@ class NativeBackendContractTests(unittest.TestCase):
 
     def test_token_constraint_consumes_committed_batches_only_at_mask_or_finish(self):
         matcher = FakeMatcher()
-        constraint = generation_constraints.TokenConstraint(matcher, None, READY)
+        constraint = generation_constraints.TokenConstraint(matcher, READY)
         constraint.commit((7, 8))
         constraint.commit((9,))
         self.assertEqual(matcher.consumed, [])

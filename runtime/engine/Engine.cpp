@@ -328,7 +328,7 @@ bool Engine::tick(double now) {
     // runnable without another Metal completion wake.
     pending_->ticket->advance();
     for (ModelMaskRequest &asked : pending_->ticket->takeMaskRequests()) {
-      events_.maskRequested(asked.requestId, asked.simulationTokens);
+      events_.maskRequested(asked);
       request(asked.requestId).maskRequestedMilliseconds = now;
       progressed = true;
     }
@@ -2026,7 +2026,7 @@ void Engine::apply(const Pending &command, std::span<const ModelStepResult> resu
                                 complete, result.nextDecodeStage,
                                 static_cast<uint32_t>(result.outputTokens.size())});
     if (waitsForMask(result.nextDecodeStage)) {
-      events_.maskRequested(active.request.id, {});
+      events_.maskRequested({active.request.id, {}, {}});
       active.maskRequestedMilliseconds = now;
     }
   }

@@ -170,8 +170,11 @@ def engine_events():
         "start": p.StartEvent(91, 2, 4096),
         "prompt_progress": p.PromptProgressEvent(91, 2048, 123456),
         "tokens": p.TokensEvent(91, 17, (10, 11, 12)),
-        "mask_request_initial": p.MaskRequestEvent(91, 6, 4, ()),
-        "mask_request_verify": p.MaskRequestEvent(91, 7, 4, (101, 102, 103)),
+        "mask_request_initial": p.MaskRequestEvent(91, 6, 4, (), ()),
+        # A verify block's tree: the anchor, and two rows that follow it.
+        "mask_request_verify": p.MaskRequestEvent(
+            91, 7, 4, (101, 102, 103), (p.NO_PARENT, 0, 0)
+        ),
         "done": p.DoneEvent(
             91, p.FinishReason.STOP, 4096, 512, 1000, 2000, 3500, (), 64, 350, 280, 50
         ),
@@ -1115,6 +1118,18 @@ class ProtocolPythonTests(unittest.TestCase):
         )
         self.assert_fatal_event(
             p.IssueCode.INVALID_ENUM_VALUE, p.ReadyEvent(4, 4096, 2, 64, 9, (1,))
+        )
+        # A mask request's tokens are a tree: a parent each, the first the
+        # root, and every other one's before it.
+        for parents in ((0, 0), (p.NO_PARENT, 1), (p.NO_PARENT, p.NO_PARENT)):
+            with self.subTest(parents=parents):
+                self.assert_fatal_event(
+                    p.IssueCode.INVALID_CONSTRAINT,
+                    p.MaskRequestEvent(8, 1, 4, (101, 102), parents),
+                )
+        self.assert_fatal_event(
+            p.IssueCode.INVALID_PAYLOAD_LENGTH,
+            p.MaskRequestEvent(8, 1, 4, (101, 102), (p.NO_PARENT,)),
         )
 
     def test_unnamed_request_failures_are_fatal(self):

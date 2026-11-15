@@ -651,7 +651,9 @@ class RuntimeTests(unittest.TestCase):
         stop = process.stdin.wait_for(wire.StopFrame)[0]
         self.assertFalse(call.cancel())
         self.assertFalse(call.stop())
-        process.send(wire.MaskRequestEvent(call.request_id, 89, 2, (5, 6)))
+        process.send(
+            wire.MaskRequestEvent(call.request_id, 89, 2, (5, 6), (wire.NO_PARENT, 0))
+        )
         process.send(
             wire.DoneEvent(call.request_id, wire.FinishReason.STOP, 2, 0, 0, 0, 10, ())
         )
@@ -764,7 +766,11 @@ class RuntimeTests(unittest.TestCase):
             )
         )
 
-        process.send(wire.MaskRequestEvent(call.request_id, 987, 2, (5, 6, 7)))
+        process.send(
+            wire.MaskRequestEvent(
+                call.request_id, 987, 2, (5, 6, 7), (wire.NO_PARENT, 0, 1)
+            )
+        )
         response = process.stdin.wait_for(wire.MaskResponseFrame)[0]
         self.assertTrue(provider_called.is_set())
         self.assertTrue(provider_thread[0].startswith("splash-mask"))
@@ -796,7 +802,11 @@ class RuntimeTests(unittest.TestCase):
                 healthy = runtime.submit(request(40))
 
                 process.send(wire.StartEvent(bad.request_id, 0, 0))
-                process.send(wire.MaskRequestEvent(bad.request_id, 88, 2, (5, 6)))
+                process.send(
+                    wire.MaskRequestEvent(
+                        bad.request_id, 88, 2, (5, 6), (wire.NO_PARENT, 0)
+                    )
+                )
                 cancel = process.stdin.wait_for(wire.CancelFrame)[0]
                 self.assertEqual(cancel.request_id, bad.request_id)
                 process.send(
@@ -837,7 +847,7 @@ class RuntimeTests(unittest.TestCase):
         process = factory.processes[0]
         call = runtime.submit(request(10))
         process.send(wire.StartEvent(call.request_id, 0, 0))
-        process.send(wire.MaskRequestEvent(call.request_id, 88, 2, ()))
+        process.send(wire.MaskRequestEvent(call.request_id, 88, 2, (), ()))
         with self.assertRaisesRegex(
             engine_runtime.ProtocolFatal, "token mask for an unconstrained request"
         ):
@@ -865,11 +875,11 @@ class RuntimeTests(unittest.TestCase):
             )
         )
         process.send(wire.StartEvent(call.request_id, 0, 0))
-        process.send(wire.MaskRequestEvent(call.request_id, 88, 2, ()))
+        process.send(wire.MaskRequestEvent(call.request_id, 88, 2, (), ()))
         process.stdin.wait_for(wire.CancelFrame)
         self.assertTrue(call.end_requested)
         self.assertFalse(call.cancel())
-        process.send(wire.MaskRequestEvent(call.request_id, 89, 2, ()))
+        process.send(wire.MaskRequestEvent(call.request_id, 89, 2, (), ()))
         process.send(
             wire.DoneEvent(
                 call.request_id, wire.FinishReason.CANCELLED, 2, 0, 0, 0, 10, ()
@@ -934,7 +944,9 @@ class RuntimeTests(unittest.TestCase):
             )
         )
         process.send(wire.StartEvent(call.request_id, 0, 0))
-        process.send(wire.MaskRequestEvent(call.request_id, 89, 2, (5, 6)))
+        process.send(
+            wire.MaskRequestEvent(call.request_id, 89, 2, (5, 6), (wire.NO_PARENT, 0))
+        )
         self.assertTrue(provider_started.wait(1.0))
         self.assertTrue(call.cancel())
         cancel = process.stdin.wait_for(wire.CancelFrame)[0]
@@ -979,7 +991,10 @@ class RuntimeTests(unittest.TestCase):
             )
             call._record_start(wire.StartEvent(call.request_id, 0, 0))
             runtime._submit_mask(
-                call, wire.MaskRequestEvent(call.request_id, 89, 2, (5, 6))
+                call,
+                wire.MaskRequestEvent(
+                    call.request_id, 89, 2, (5, 6), (wire.NO_PARENT, 0)
+                ),
             )
             return call
 
@@ -1041,7 +1056,7 @@ class RuntimeTests(unittest.TestCase):
                 )
             )
             process.send(wire.StartEvent(call.request_id, 0, 0))
-            process.send(wire.MaskRequestEvent(call.request_id, 1, 2, ()))
+            process.send(wire.MaskRequestEvent(call.request_id, 1, 2, (), ()))
             return call
 
         def cancelled(call):
