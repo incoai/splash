@@ -46,18 +46,20 @@ using TreeRow = SplashTreeRow;
   return most;
 }
 
-// The rows a decode cycle verifies of each lane (SPLASH_DECODE_LANE_ROWS).
+// The rows a decode cycle verifies of each lane (SPLASH_DECODE_LANE_ROWS),
+// which the GDN decode kernels of a chain hold.
 inline constexpr uint32_t kDecodeLaneRows = SPLASH_DECODE_LANE_ROWS;
-static_assert(kDecodeLaneRows <= SPLASH_TARGET_VERIFY_ROWS);
+static_assert(kDecodeLaneRows <= SPLASH_GDN_CHAIN_ROWS && SPLASH_GDN_CHAIN_ROWS <= SPLASH_TARGET_VERIFY_ROWS,
+              "a decode cycle's lane rows run on the GDN chain kernels");
 
 // The most rows of a lane's verify block in a decode step of `rows` rows over
 // `lanes` lanes, which the step's proposer chooses on the device within it:
-// eight while the step's rows give each lane no more, the rows the GDN
-// decode kernels of eight rows hold, which took 13-19% less time than those
-// of sixteen over a layer's 8-row chains (DRAM-cold, an M6); else a verify
-// block's most.
+// those of the GDN decode kernels of a chain (SPLASH_GDN_CHAIN_ROWS) while
+// the step's rows give each lane no more, which took 13-19% less time than
+// those of sixteen over a layer's 8-row chains (DRAM-cold, an M6); else a
+// verify block's most.
 [[nodiscard]] constexpr uint32_t verifyLaneCap(uint32_t rows, uint32_t lanes) noexcept {
-  return rows <= uint64_t{8} * lanes ? 8 : SPLASH_TARGET_VERIFY_ROWS;
+  return rows <= uint64_t{SPLASH_GDN_CHAIN_ROWS} * lanes ? SPLASH_GDN_CHAIN_ROWS : SPLASH_TARGET_VERIFY_ROWS;
 }
 
 // The path of the first `rows` rows of a chain, a block's rows a row mask

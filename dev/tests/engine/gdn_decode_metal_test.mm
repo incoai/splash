@@ -163,7 +163,7 @@ struct StepBlocks final {
       rows = std::max(rows, blocks[lane].firstRow + blocks[lane].rows);
       cap = std::max(cap, blocks[lane].rows);
     }
-    cap = cap <= kRows / 2 ? kRows / 2 : kRows;
+    cap = cap <= SPLASH_GDN_CHAIN_ROWS ? SPLASH_GDN_CHAIN_ROWS : kRows;
   }
   GdnDecodeBuffers into(GdnDecodeBuffers buffers) const {
     buffers.tapes = std::span(tapes).first(lanes);
@@ -1713,6 +1713,96 @@ void treeRows(MetalBackend &backend, const GdnShape &shape, bool float32, GdnSta
   std::cout << what << ": " << inexact << " of " << compared << " hidden values off their paths' by rounding\n";
 }
 
+// A step of eight rows a lane after one of sixteen: the 8-row kernels fold a
+// lane's pending path of at most eight rows by its rows, which may lie past
+// row 7 of the block before (GDN::addDecode takes them for it). Each lane's
+// 16-row tree accepts the path of its last row past row 7 whose path holds
+// at most eight rows, and a lane of the same state runs that path as a
+// chain; the step of eight new rows a lane after each, folding the tree's
+// path or the chain's rows, on the 8-row kernels, leaves the same cells, tape
+// and hidden rows, bit for bit.
+void chainKernelsFoldPathsPastTheirRows(MetalBackend &backend, const GdnShape &shape, GdnStateFormat format) {
+  constexpr uint32_t kChainRows = SPLASH_GDN_CHAIN_ROWS;
+  const std::string what = std::string("8-row fold of a 16-row path vh") + std::to_string(shape.valueHeads) + " " +
+                           std::string(formatName(format));
+  const bool float32 = familyNorms(shape).front();
+  const Cell cell(shape, format);
+  Random random(0xF0D8 + shape.valueHeads + (format == GdnStateFormat::BFloat16));
+  Fixture tree(backend, shape, kMaxLanes, float32);
+  if (format == GdnStateFormat::BFloat16) narrowCells(tree, cell);
+  std::array<BlockTree, kMaxLanes> trees;
+  std::array<uint32_t, kMaxLanes> accepted{};
+  auto *rows = static_cast<TreeRow *>(tree.tree.contents());
+  for (uint32_t lane = 0; lane < kMaxLanes; ++lane) {
+    trees[lane] = randomTree(random, kRows, kRows);
+    tree.blocks[lane].rows = kRows;
+    for (uint32_t row = 0; row < kRows; ++row) rows[lane * kRows + row] = trees[lane].node(row);
+    for (uint32_t row = kRows; row-- > kChainRows && !accepted[lane];)
+      if (trees[lane].path(row).size() <= kChainRows) accepted[lane] = row;
+    require(accepted[lane], what + ": a lane's tree has no path of at most eight rows past row 7");
+  }
+  std::fill_n(static_cast<uint32_t *>(tree.verifyRows.contents()), kMaxLanes, kRows);
+  decodeStep(backend, tree, cell, tree.blocks);
+  // Each accepted path run as a chain from the tree lane's state.
+  const uint64_t packedRowBytes = uint64_t{shape.packedWidth} * 2;
+  Fixture chain(backend, shape, kMaxLanes, float32);
+  for (uint32_t lane = 0; lane < kMaxLanes; ++lane) {
+    const std::vector<uint32_t> path = trees[lane].path(accepted[lane]);
+    chain.blocks[lane].rows = static_cast<uint32_t>(path.size());
+    std::memcpy(chain.current[lane].contents(), tree.current[lane].contents(), tree.cell.bytes);
+    for (uint32_t layer = 0; layer < kLayers; ++layer)
+      for (uint32_t row = 0; row < path.size(); ++row)
+        std::memcpy(const_cast<uint16_t *>(chain.packedRow(layer, lane, row)), tree.packedRow(layer, lane, path[row]),
+                    packedRowBytes);
+  }
+  chain.chains();
+  decodeStep(backend, chain, cell, chain.blocks);
+  // The next step of eight new rows a lane, which folds the tree's paths and
+  // the chains' rows, on the 8-row kernels.
+  for (Fixture *fixture : {&tree, &chain}) {
+    std::swap(fixture->current, fixture->next);
+    for (uint32_t lane = 0; lane < kMaxLanes; ++lane) {
+      auto &tape = fixture->blocks[lane].tape;
+      const uint32_t path = fixture == &tree ? trees[lane].ancestors(accepted[lane])
+                                             : chainPath(static_cast<uint32_t>(trees[lane].path(accepted[lane]).size()));
+      tape = {tape.stepSlot, tape.pendingSlot, path};
+      fixture->blocks[lane].rows = kChainRows;
+    }
+    std::fill_n(static_cast<uint32_t *>(fixture->verifyRows.contents()), kMaxLanes, kChainRows);
+    fixture->chains();
+    fixture->clear();
+  }
+  tree.fillPacked();
+  std::memcpy(chain.packed.contents(), tree.packed.contents(), tree.packed.sizeBytes());
+  for (const Fixture *fixture : {&tree, &chain}) {
+    CommandGraph graph;
+    const StepBlocks step(backend, fixture->blocks);
+    for (uint32_t layer = 0; layer < kLayers; ++layer)
+      (void)GDN::addDecode(graph, step.into(fixture->decodeBuffers(layer)), shape, layer, cell.strides(),
+                           GdnHeadOrder::Grouped, LinearInput::Plain);
+    for (const auto &dispatch : graph.dispatches())
+      require(!dispatch.pipelineName.ends_with("_r16"), what + ": a step of eight rows a lane ran a 16-row kernel");
+    (void)backend.submitCommandAsync(graph.dispatches()).wait();
+  }
+  const uint64_t hiddenRowBytes = uint64_t{shape.valueHeads} * kHeadDim * 2;
+  for (uint32_t lane = 0; lane < kMaxLanes; ++lane) {
+    const std::string where = what + " lane " + std::to_string(lane);
+    require(!std::memcmp(tree.next[lane].contents(), chain.next[lane].contents(), cell.bytes),
+            where + ": folding a tree's path left another state than folding its chain");
+    require(!std::memcmp(tree.hiddenRow(lane, 0, 0), chain.hiddenRow(lane, 0, 0), kChainRows * hiddenRowBytes),
+            where + ": the step after a tree's path differs from the step after its chain");
+    for (uint32_t layer = 0; layer < kLayers; ++layer)
+      for (uint32_t row = 0; row < kChainRows; ++row)
+        require(tapeRow(tree, tree.blocks[lane].tape.stepSlot, layer, row) ==
+                    tapeRow(chain, chain.blocks[lane].tape.stepSlot, layer, row),
+                where + ": the step after a tree's path left another tape");
+  }
+  std::cout << what << ": paths of rows";
+  for (uint32_t lane = 0; lane < kMaxLanes; ++lane)
+    for (const uint32_t row : trees[lane].path(accepted[lane])) std::cout << (row ? "," : (lane ? " | " : " ")) << row;
+  std::cout << '\n';
+}
+
 // A 16-row chain is two 8-row steps of the same rows with an fp32 state,
 // bit for bit: the first step's rows are the chain's first eight, the step
 // after it, which folds them in and convolves the next eight over their
@@ -1722,7 +1812,8 @@ void treeRows(MetalBackend &backend, const GdnShape &shape, bool float32, GdnSta
 void chainHalves(MetalBackend &backend, const GdnShape &shape, bool float32) {
   const std::string what = std::string("chain halves vh") + std::to_string(shape.valueHeads) +
                            (float32 ? " f32 norm" : " bf16 norm");
-  constexpr uint32_t kHalf = kRows / 2;
+  constexpr uint32_t kHalf = SPLASH_GDN_CHAIN_ROWS;
+  static_assert(2 * kHalf == kRows, "a verify block is two chains of the 8-row kernels");
   const Cell cell(shape);
   Fixture whole(backend, shape, kMaxLanes, float32), halves(backend, shape, kMaxLanes, float32);
   const auto copy = [](const MetalBuffer &from, const MetalBuffer &to) {
@@ -2194,8 +2285,11 @@ int main(int argc, char **argv) {
     for (const GdnShape &shape : kShapes)
       for (bool float32 : familyNorms(shape))
         for (GdnStateFormat format : {GdnStateFormat::Float32, GdnStateFormat::BFloat16})
-          for (const uint32_t blockRows : {kRows / 2, kRows})
+          for (const uint32_t blockRows : {SPLASH_GDN_CHAIN_ROWS, kRows})
             treeRows(backend, shape, float32, format, blockRows);
+    for (const GdnShape &shape : kShapes)
+      for (const GdnStateFormat format : {GdnStateFormat::Float32, GdnStateFormat::BFloat16})
+        chainKernelsFoldPathsPastTheirRows(backend, shape, format);
     for (const GdnShape &shape : kShapes)
       for (bool float32 : familyNorms(shape)) chainHalves(backend, shape, float32);
     std::cout << "gdn_decode_metal_test: PASS\n";

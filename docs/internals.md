@@ -510,9 +510,13 @@ S z + the sum of each path row's value times its coefficient), with no state
 per row, and every row's convolution reads its path's tokens. Every row goes
 to the lane's tape, and the lane's next step folds the path it accepted, a
 row mask, into the state. Its kernels hold eight rows of a lane's block and of
-its pending path, or sixteen (`_r16`) for a step whose lanes may hold more
-(`ops::verifyLaneCap`): over a layer's 8-row chains the 16-row kernels took
-13-19% longer (DRAM-cold, an M6), for their threadgroup memory. Attention
+its pending path (`SPLASH_GDN_CHAIN_ROWS`), or sixteen (`_r16`) for a step
+whose lanes may hold more (`ops::verifyLaneCap`) or one of whose lanes has a
+pending path of more, as a step of eight rows a lane after one of sixteen may
+(`ops::GDN::addDecode`); a pending path of at most eight rows runs on the
+8-row kernels whichever of its block's sixteen rows it holds. Over a layer's
+8-row chains the 16-row kernels took 13-19% longer (DRAM-cold, an M6), for
+their threadgroup memory. Attention
 stores a block's K/V at the slots of its rows, so that siblings never
 collide, and attends a tree row (`SplashAttentionParams::trees`, the dense and
 the sparse splits alike) to its position's window of the history (the

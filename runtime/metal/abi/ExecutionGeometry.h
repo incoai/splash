@@ -20,6 +20,13 @@
 // SPLASH_TARGET_VERIFY_ROWS its block may hold: the chain of its anchor and
 // the draft's proposals, until a cycle's budget chooses each lane's rows.
 #define SPLASH_DECODE_LANE_ROWS (SPLASH_DRAFT_PROPOSAL_TOKENS + 1u)
+// The rows of a lane's verify block and of its pending path that the GDN
+// decode kernels of a chain hold (kernels/decode/gdn.metal, those without
+// _r16, which hold SPLASH_TARGET_VERIFY_ROWS): a decode cycle's lane rows. A
+// step takes them when none of its lanes may hold more rows
+// (ops::verifyLaneCap) and none of its pending paths holds more
+// (ops::GDN::addDecode).
+#define SPLASH_GDN_CHAIN_ROWS 8u
 // The KV ceiling: four times the targets' native window of 262,144 tokens,
 // which holds the most context YaRN serves them
 // (QwenTargetDimensions::yarnContextTokens).
