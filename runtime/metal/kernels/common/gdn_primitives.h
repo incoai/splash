@@ -3,14 +3,7 @@
 #include "metal/abi/KernelABI.h"
 #include "metal/kernels/common/activation.h"
 #include "metal/kernels/common/rms_inverse.h"
-
-// Row `index` of a row mask, lowest first: of a verify block's path
-// (metal/abi/VerifyTree.h), the row at depth `index`.
-inline uint gdn_path_row(uint path, uint index) {
-  for (uint i = 0; i < index; ++i)
-    path &= path - 1;
-  return ctz(path);
-}
+#include "metal/kernels/common/verify_tree.h"
 
 // The convolution inputs before a command's first row: the rows a state
 // cell carries, or after `consumed` rows (in `rows`) the last of those rows
@@ -32,7 +25,7 @@ inline GdnConvHistory gdn_conv_history(device const bfloat *carried, device cons
     const uint source = consumed + row;
     const uint index = source - Carried;
     history.row_of[row] = source < Carried ? carried + source * conv_dim
-                                           : rows + (path ? gdn_path_row(path, index) : index) * rows_width;
+                                           : rows + (path ? splash_path_row(path, index) : index) * rows_width;
   }
   return history;
 }

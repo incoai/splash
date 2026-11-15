@@ -447,13 +447,14 @@ void pleTest(MetalBackend &backend) {
   check(okX, "PLE convolution: streams + gated + silu(dilated taps over the history)");
   check(okH, "PLE convolution: the history after the sequence");
 
-  // The history after a lane's retained rows (a count the GPU holds) and
-  // after a sequence's first rows (one the host knows).
+  // The history after a lane's accepted path of its chain (a row mask the
+  // GPU holds) and after a sequence's first rows (a count the host knows).
   for (uint32_t retained = 1; retained <= rows; retained += 3) {
     MetalBuffer committed = scratch(backend, history * width * 2), captured = scratch(backend, history * width * 2);
     CommandGraph graph3;
-    ops::NgramEmbedding::addCommit(graph3, conv, histIn, committed, upload(backend, std::vector<uint32_t>{retained}),
-                                   shape, rows);
+    ops::NgramEmbedding::addCommit(graph3, conv, histIn, committed,
+                                   upload(backend, std::vector<uint32_t>{splash::ops::chainPath(retained)}), shape,
+                                   rows);
     ops::NgramEmbedding::addHistory(graph3, conv, histIn, captured, shape, retained);
     run(backend, graph3);
     const auto got = download<uint16_t>(committed, history * width);
@@ -467,6 +468,75 @@ void pleTest(MetalBackend &backend) {
       }
     check(ok, "PLE commit: the history after " + std::to_string(retained) + " retained rows");
     check(okHistory, "PLE history: the history after a sequence's first " + std::to_string(retained) + " rows");
+  }
+}
+
+// A verify block's PLE rows as a tree whose rows' packed predecessors are
+// not their parents: each row's convolution taps its path's convolution
+// inputs (and the history before the anchor), as the chain of its path
+// computes it, and the commit of an accepted path writes the history after
+// that path's rows, a chain's history after the same tokens.
+void pleTreeTest(MetalBackend &backend) {
+  std::mt19937 rng(41);
+  constexpr uint32_t rows = 8, hidden = 256, streams = 4, taps = 4, dilation = 2, width = hidden * streams;
+  const ops::NgramShape shape{hidden, streams, taps, dilation};
+  const uint32_t history = shape.history();
+  // Row r follows kParents[r]: a chain of four, a branch off row 1, and one
+  // off the anchor.
+  constexpr std::array<uint32_t, rows> kParents{0, 0, 1, 2, 3, 1, 5, 0};
+  std::vector<splash::ops::TreeRow> tree(rows);
+  for (uint32_t r = 0; r < rows; ++r)
+    tree[r] = r ? splash::ops::TreeRow{tree[kParents[r]].ancestors | 1u << r, static_cast<uint16_t>(kParents[r]),
+                                       static_cast<uint16_t>(tree[kParents[r]].depth + 1)}
+                : splash::ops::chainRow(0);
+  const auto conv = randoms(rng, rows * width, 1.0f), hist = randoms(rng, history * width, 1.0f),
+             gated = randoms(rng, rows * width, 1.0f), x = randoms(rng, rows * width, 1.0f),
+             tapsW = randoms(rng, width * taps, 0.4f);
+  const MetalBuffer convBuffer = upload(backend, bf16s(conv)), histIn = upload(backend, bf16s(hist)),
+                    tapsBuffer = upload(backend, tapsW), gatedBuffer = upload(backend, gated),
+                    streamsBuffer = upload(backend, x);
+  CommandGraph graph;
+  ops::NgramEmbedding::addConvolution(graph, convBuffer, histIn, {}, tapsBuffer, gatedBuffer, streamsBuffer, shape,
+                                      rows, upload(backend, tree));
+  run(backend, graph);
+  const auto gotX = download<float>(streamsBuffer, rows * width);
+  // Input `depth` of row r's path, or before the anchor the history's.
+  const auto input = [&](uint32_t r, int depth, uint32_t c) -> double {
+    if (depth < 0) return f32(bf16(hist[(history + depth) * width + c]));
+    uint32_t row = r;
+    while (tree[row].depth > uint32_t(depth)) row = tree[row].parent;
+    return f32(bf16(conv[row * width + c]));
+  };
+  bool okX = true, differs = false;
+  for (uint32_t r = 0; r < rows; ++r)
+    for (uint32_t c = 0; c < width; ++c) {
+      double sum = 0, packed = 0;
+      for (uint32_t k = 0; k < taps; ++k) {
+        const int back = int((taps - 1 - k) * dilation);
+        sum += tapsW[c * taps + k] * input(r, int(tree[r].depth) - back, c);
+        packed += tapsW[c * taps + k] *
+                  (int(r) - back >= 0 ? f32(bf16(conv[(r - back) * width + c])) : f32(bf16(hist[(history + int(r) - back) * width + c])));
+      }
+      const double want = x[r * width + c] + gated[r * width + c] + silu(sum);
+      okX &= std::fabs(gotX[r * width + c] - want) <= 1e-4 * (1 + std::fabs(want));
+      differs |= std::fabs(silu(packed) - silu(sum)) > 1e-2;
+    }
+  check(differs, "PLE tree: a row's packed predecessors are not its path's");
+  check(okX, "PLE tree: each row's dilated taps follow its path");
+  // The accepted path of row 6 (rows 0, 1, 5, 6) and of row 4 (a chain of
+  // five).
+  for (const uint32_t leaf : {6u, 4u}) {
+    MetalBuffer committed = scratch(backend, history * width * 2);
+    CommandGraph commit;
+    ops::NgramEmbedding::addCommit(commit, convBuffer, histIn, committed,
+                                   upload(backend, std::vector<uint32_t>{tree[leaf].ancestors}), shape, rows);
+    run(backend, commit);
+    const auto got = download<uint16_t>(committed, history * width);
+    bool ok = true;
+    for (uint32_t j = 0; j < history; ++j)
+      for (uint32_t c = 0; c < width; ++c)
+        ok &= f32(got[j * width + c]) == input(leaf, int(tree[leaf].depth) + 1 - int(history) + int(j), c);
+    check(ok, "PLE tree: the history after the accepted path to row " + std::to_string(leaf));
   }
 }
 
@@ -1342,6 +1412,19 @@ void pleExtentsTest(MetalBackend &backend) {
                                  ops::NgramEmbedding::addConvolution(graph, b[0], b[1], b[2], b[3], b[4], b[5], shape,
                                                                      rows);
                                });
+  // A verify block's convolution, along its rows' paths.
+  splash::test::requireExtents(backend,
+                               Extents{{0, inputBytes, 2, "n-gram embedding convolution input"},
+                                       {1, history, 2, "n-gram embedding history"},
+                                       {2, uint64_t{width} * taps * 4, 4, "n-gram embedding convolution taps"},
+                                       {3, floatBytes, 4, "n-gram embedding gated"},
+                                       {4, floatBytes, 4, "n-gram embedding streams"},
+                                       {5, uint64_t{rows} * sizeof(splash::ops::TreeRow), 8,
+                                        "n-gram embedding tree rows"}},
+                               [&](CommandGraph &graph, const Buffers &b) {
+                                 ops::NgramEmbedding::addConvolution(graph, b[0], b[1], {}, b[2], b[3], b[4], shape,
+                                                                     rows, b[5]);
+                               });
   splash::test::requireExtents(backend,
                                Extents{{0, inputBytes, 2, "n-gram embedding convolution input"},
                                        {1, history, 2, "n-gram embedding history"},
@@ -1354,7 +1437,7 @@ void pleExtentsTest(MetalBackend &backend) {
       Extents{{0, uint64_t{splash::ops::kDecodeLaneRows} * width * 2, 2, "n-gram embedding convolution input"},
               {1, history, 2, "n-gram embedding history"},
               {2, history, 2, "n-gram embedding next history"},
-              {3, 4, 4, "n-gram embedding retained rows"}},
+              {3, 4, 4, "n-gram embedding accepted path"}},
       [&](CommandGraph &graph, const Buffers &b) {
         ops::NgramEmbedding::addCommit(graph, b[0], b[1], b[2], b[3], shape, splash::ops::kDecodeLaneRows);
       });
@@ -1409,6 +1492,7 @@ int main(int argc, const char *argv[]) {
         hyperTableTest(backend);
         hyperNormKernelsTest(backend, !std::getenv("MTL_SHADER_VALIDATION"));
         pleTest(backend);
+        pleTreeTest(backend);
         qsaTest(backend, {150, 20, 16, 0, 1, 7});
         // A threshold inside a run of equal scores: fewer other blocks than
         // the budget.

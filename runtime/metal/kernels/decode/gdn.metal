@@ -169,8 +169,8 @@ inline void gdn_decode_prologue(
     const uint token = simd_group + pass * kDecodeSimdgroups;
     // Pending row `token` is the pending path's row at that depth.
     if (token < uint(popcount(pending_path)))
-      gdn_load_pending<KeyHeads, ValueHeads, HeadDim, Rows>(pending_tape, shared.pending, token,
-                                                            gdn_path_row(pending_path, token), value_head, lane);
+      gdn_load_pending<KeyHeads, ValueHeads, HeadDim, Rows>(
+          pending_tape, shared.pending, token, splash_path_row(pending_path, token), value_head, lane);
 
     // A simdgroup past the block's rows computes the block's last row again
     // and writes none of it: it reads no packed row of the next block's, or

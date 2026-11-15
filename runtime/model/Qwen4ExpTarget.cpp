@@ -364,14 +364,16 @@ void Qwen4ExpTarget::addVerify(metal::CommandGraph &graph, QwenTargetVerifyBuffe
       addDecodeProjection(step.graph, h.pleRows, ple.value, h.pleValue, lanes, b.linearScratch);
       ops::NgramEmbedding::addGate(step.graph, h.gate, h.pleValue, h.streams, ple.keyNorm, ple.queryNorm,
                                    ple.convolutionNorm, h.pleGated, h.pleConvolution, ps, rows);
-      // Each lane's rows after its history; the commit writes the history
-      // after its retained rows.
+      // Each lane's rows after its history, each along its path of the
+      // lane's tree; the commit writes the history after the path it
+      // accepts.
       for (uint32_t lane = 0; lane < lanes; ++lane)
         ops::NgramEmbedding::addConvolution(
             step.graph, rowsOf<uint16_t>(h.pleConvolution, lane * kVerifyRows, kVerifyRows, ps.width()),
             b.auxiliary[lane], {}, ple.convolution,
             rowsOf<float>(h.pleGated, lane * kVerifyRows, kVerifyRows, ps.width()),
-            rowsOf<float>(h.streams, lane * kVerifyRows, kVerifyRows, ps.width()), ps, kVerifyRows);
+            rowsOf<float>(h.streams, lane * kVerifyRows, kVerifyRows, ps.width()), ps, kVerifyRows,
+            rowsOf<ops::TreeRow>(b.tree, lane * kVerifyRows, kVerifyRows, 1));
     }
     std::visit(
         [&](const auto &mixer) {
@@ -405,8 +407,9 @@ void Qwen4ExpTarget::addStateCommit(metal::CommandGraph &graph, QwenTargetCommit
                                     std::span<const ops::LaneRows> blocks) const {
   QwenTarget::addStateCommit(graph, buffers, blocks);
   const auto lanes = static_cast<uint32_t>(blocks.size());
-  // Each lane's PLE history and QSA pending keys after its retained rows,
-  // from the convolution inputs and the keys its verify wrote of its block.
+  // Each lane's PLE history after its accepted path and QSA pending keys
+  // after its retained rows, from the convolution inputs and the keys its
+  // verify wrote of its block.
   const ops::NgramShape shape = ngramShape(geometry_);
   const Qwen4Scratch scratch = steps_.verifyScratch(static_cast<uint32_t>(ops::rowsEnd(blocks)));
   const uint64_t rowBytes = uint64_t{shape.width()} * sizeof(uint16_t);
@@ -414,7 +417,7 @@ void Qwen4ExpTarget::addStateCommit(metal::CommandGraph &graph, QwenTargetCommit
     ops::NgramEmbedding::addCommit(
         graph, backend_.view(scratch.pleConvolution, blocks[lane].first * rowBytes, blocks[lane].rows * rowBytes),
         buffers.auxiliaryIn[lane], buffers.auxiliaryOut[lane],
-        backend_.view(buffers.retainedCounts, lane * sizeof(uint32_t), sizeof(uint32_t)), shape, blocks[lane].rows);
+        backend_.view(buffers.retainedRows, lane * sizeof(uint32_t), sizeof(uint32_t)), shape, blocks[lane].rows);
   const uint32_t layers = geometry_.kvLayout.attentionLayers;
   std::array<metal::MetalBuffer, ExecutionLimits::maximumBatchWidth> in, out;
   for (uint32_t lane = 0; lane < lanes; ++lane) {

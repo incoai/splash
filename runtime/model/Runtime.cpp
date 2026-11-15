@@ -2542,6 +2542,7 @@ struct Runtime::Impl {
     const uint32_t width = static_cast<uint32_t>(lanes.size());
     QwenTargetCommitBuffers buffers;
     buffers.retainedCounts = decodeArena->batchSlice(DecodeTensor::RetainedCount, width);
+    buffers.retainedRows = decodeArena->batchSlice(DecodeTensor::RetainedRows, width);
     for (uint32_t lane = 0; lane < width; ++lane) {
       Request &entry = laneEntry(lanes, lane);
       buffers.auxiliaryIn[lane] = states.current(entry.stateLane).auxiliary;

@@ -22,8 +22,8 @@ void requireShape(NgramShape shape) {
 
 uint32_t groups(uint32_t width) { return (width + kThreads - 1) / kThreads; }
 
-NgramEmbeddingParams ngramParams(NgramShape shape, uint32_t rows, bool writeHistory) {
-  return {rows, shape.hidden, shape.streams, shape.taps, shape.dilation, writeHistory ? 1u : 0u};
+NgramEmbeddingParams ngramParams(NgramShape shape, uint32_t rows, bool writeHistory, bool tree = false) {
+  return {rows, shape.hidden, shape.streams, shape.taps, shape.dilation, writeHistory ? 1u : 0u, tree ? 1u : 0u};
 }
 
 // The bytes of `rows` rows of the streams' width, in bf16 (the convolution
@@ -60,9 +60,12 @@ void NgramEmbedding::addGate(metal::CommandGraph &graph, metal::MetalBuffer key,
 void NgramEmbedding::addConvolution(metal::CommandGraph &graph, metal::MetalBuffer convolutionInput,
                                     metal::MetalBuffer historyIn, metal::MetalBuffer historyOut,
                                     metal::MetalBuffer taps, metal::MetalBuffer gated, metal::MetalBuffer streams,
-                                    NgramShape shape, uint32_t rows) {
+                                    NgramShape shape, uint32_t rows, metal::MetalBuffer tree) {
   requireShape(shape);
   const bool writeHistory = static_cast<bool>(historyOut);
+  // A verify block's history follows the path it accepts (addCommit).
+  if (tree && (writeHistory || rows > 32)) throw std::invalid_argument("invalid n-gram embedding tree");
+  if (tree) requireBytes(tree, uint64_t{rows} * sizeof(SplashTreeRow), "n-gram embedding tree rows");
   requireBytes(convolutionInput, bfloat16Rows(shape, rows), "n-gram embedding convolution input");
   requireBytes(historyIn, historyBytes(shape), "n-gram embedding history");
   if (writeHistory) requireBytes(historyOut, historyBytes(shape), "n-gram embedding next history");
@@ -70,10 +73,14 @@ void NgramEmbedding::addConvolution(metal::CommandGraph &graph, metal::MetalBuff
   requireBytes(gated, floatRows(shape, rows), "n-gram embedding gated");
   requireBytes(streams, floatRows(shape, rows), "n-gram embedding streams");
   const uint32_t gridRows = rows + (writeHistory ? shape.history() : 0);
+  // Without a tree the kernel binds another buffer for it, of which it reads
+  // nothing.
+  const bool inTree = static_cast<bool>(tree);
+  metal::MetalBuffer treeRows = inTree ? std::move(tree) : taps;
   graph.add("ngram_embedding_conv",
             {std::move(convolutionInput), historyIn, writeHistory ? historyOut : historyIn, std::move(taps),
-             std::move(gated), std::move(streams)},
-            ngramParams(shape, rows, writeHistory), {gridRows, groups(shape.width()), 1}, {kThreads, 1, 1});
+             std::move(gated), std::move(streams), std::move(treeRows)},
+            ngramParams(shape, rows, writeHistory, inTree), {gridRows, groups(shape.width()), 1}, {kThreads, 1, 1});
 }
 
 void NgramEmbedding::addHistory(metal::CommandGraph &graph, metal::MetalBuffer convolutionInput,
@@ -89,17 +96,17 @@ void NgramEmbedding::addHistory(metal::CommandGraph &graph, metal::MetalBuffer c
 }
 
 void NgramEmbedding::addCommit(metal::CommandGraph &graph, metal::MetalBuffer convolutionInput,
-                               metal::MetalBuffer historyIn, metal::MetalBuffer historyOut, metal::MetalBuffer retained,
+                               metal::MetalBuffer historyIn, metal::MetalBuffer historyOut, metal::MetalBuffer path,
                                NgramShape shape, uint32_t rows) {
   requireShape(shape);
-  if (!rows) throw std::invalid_argument("invalid n-gram embedding commit");
-  // The GPU's count is of the lane's verify rows, any of which it may retain.
+  if (!rows || rows > 32) throw std::invalid_argument("invalid n-gram embedding commit");
+  // The GPU's path is of the lane's verify rows, any of which it may hold.
   requireBytes(convolutionInput, bfloat16Rows(shape, rows), "n-gram embedding convolution input");
   requireBytes(historyIn, historyBytes(shape), "n-gram embedding history");
   requireBytes(historyOut, historyBytes(shape), "n-gram embedding next history");
-  requireBytes(retained, sizeof(uint32_t), "n-gram embedding retained rows");
+  requireBytes(path, sizeof(uint32_t), "n-gram embedding accepted path");
   graph.add("ngram_embedding_commit",
-            {std::move(convolutionInput), std::move(historyIn), std::move(historyOut), std::move(retained)},
+            {std::move(convolutionInput), std::move(historyIn), std::move(historyOut), std::move(path)},
             ngramParams(shape, 0, true), {shape.history(), groups(shape.width()), 1}, {kThreads, 1, 1});
 }
 

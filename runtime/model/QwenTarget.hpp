@@ -363,6 +363,9 @@ struct QwenVerifyInput final {
 // state folds the rows into the lane's next step instead (ops::GdnTapeLane).
 struct QwenTargetCommitBuffers final {
   metal::MetalBuffer retainedCounts;
+  // Each lane's accepted path, a row mask of its block (metal/abi/
+  // VerifyTree.h), as acceptance wrote it.
+  metal::MetalBuffer retainedRows;
   std::array<metal::MetalBuffer, ExecutionLimits::maximumBatchWidth> auxiliaryIn;
   std::array<metal::MetalBuffer, ExecutionLimits::maximumBatchWidth> auxiliaryOut;
 };

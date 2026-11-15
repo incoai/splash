@@ -3,6 +3,7 @@
 #include "metal/kernels/common/activation.h"
 #include "metal/kernels/common/hyper_streams.h"
 #include "metal/kernels/common/rms_inverse.h"
+#include "metal/kernels/common/verify_tree.h"
 
 #include <metal_stdlib>
 
@@ -86,14 +87,18 @@ kernel void ngram_embedding_gate(device const bfloat *key [[buffer(0)]],
 // The depthwise convolution over one sequence's rows: tap k of channel
 // c (taps[c][k]) reads the input (taps - 1 - k) * dilation rows back, before
 // the first row from the history; silu of the sum and the gated values are
-// added to the streams. With write_history, the history after the rows.
+// added to the streams. With write_history, the history after the rows. A
+// verify block's rows (p.tree, a row's place in `tree`) count back along
+// their paths; a prompt's bind another buffer for the tree, which they do
+// not read.
 kernel void ngram_embedding_conv(device const bfloat *input [[buffer(0)]],
                                  device const bfloat *history_in [[buffer(1)]],
                                  device bfloat *history_out [[buffer(2)]],
                                  device const float *taps [[buffer(3)]],
                                  device const float *gated [[buffer(4)]],
                                  device float *streams [[buffer(5)]],
-                                 constant NgramEmbeddingParams &p [[buffer(6)]],
+                                 device const SplashTreeRow *tree [[buffer(6)]],
+                                 constant NgramEmbeddingParams &p [[buffer(7)]],
                                  uint2 group [[threadgroup_position_in_grid]],
                                  uint tid [[thread_index_in_threadgroup]]) {
   const uint width = p.streams * p.hidden;
@@ -104,9 +109,14 @@ kernel void ngram_embedding_conv(device const bfloat *input [[buffer(0)]],
     return t >= 0 ? float(input[ulong(t) * width + c]) : float(history_in[ulong(history + t) * width + c]);
   };
   if (row < p.rows) {
+    // The row's path and depth: a prompt's rows are a chain.
+    const uint path = p.tree ? tree[row].ancestors : 0u;
+    const int depth = p.tree ? int(tree[row].depth) : int(row);
     float sum = 0.0f;
-    for (uint k = 0; k < p.taps; ++k)
-      sum += taps[ulong(c) * p.taps + k] * at(int(row) - int((p.taps - 1 - k) * p.dilation));
+    for (uint k = 0; k < p.taps; ++k) {
+      const int back = depth - int((p.taps - 1 - k) * p.dilation);
+      sum += taps[ulong(c) * p.taps + k] * at(back >= 0 && p.tree ? int(splash_path_row(path, uint(back))) : back);
+    }
     const ulong i = ulong(row) * width + c;
     streams[i] += gated[i] + splash_silu(sum);
   } else if (p.write_history && row - p.rows < uint(history)) {
@@ -117,19 +127,24 @@ kernel void ngram_embedding_conv(device const bfloat *input [[buffer(0)]],
   }
 }
 
-// The history after a sequence's first `rows` rows: its history before,
-// then the convolution inputs; threadgroup (j, y) writes row j's channels
-// from y x kRowThreads on.
+// The history after a sequence's first `rows` rows, or the rows of a
+// verify block's `path` (a row mask, its `rows` rows in order): its history
+// before, then the convolution inputs; threadgroup (j, y) writes row j's
+// channels from y x kRowThreads on.
 inline void ngram_history_rows(device const bfloat *input, device const bfloat *history_in,
                                device bfloat *history_out, constant NgramEmbeddingParams &p, uint rows,
-                               uint2 group, uint tid) {
+                               uint path, uint2 group, uint tid) {
   const uint width = p.streams * p.hidden;
   const uint history = (p.taps - 1) * p.dilation;
   const uint c = group.y * kRowThreads + tid, j = group.x;
   if (c >= width || j >= history) return;
   const int source = int(rows) - int(history) + int(j);
-  history_out[ulong(j) * width + c] = source >= 0 ? input[ulong(source) * width + c]
-                                                  : history_in[ulong(int(history) + source) * width + c];
+  if (source < 0) {
+    history_out[ulong(j) * width + c] = history_in[ulong(int(history) + source) * width + c];
+    return;
+  }
+  const uint row = path ? splash_path_row(path, uint(source)) : uint(source);
+  history_out[ulong(j) * width + c] = input[ulong(row) * width + c];
 }
 
 // The history after a prefill sequence's first p.rows rows (a state captured
@@ -140,19 +155,19 @@ kernel void ngram_embedding_history(device const bfloat *input [[buffer(0)]],
                                     constant NgramEmbeddingParams &p [[buffer(3)]],
                                     uint2 group [[threadgroup_position_in_grid]],
                                     uint tid [[thread_index_in_threadgroup]]) {
-  ngram_history_rows(input, history_in, history_out, p, p.rows, group, tid);
+  ngram_history_rows(input, history_in, history_out, p, p.rows, 0, group, tid);
 }
 
-// The history after a lane's retained rows of a verify step, a count the GPU
-// wrote.
+// The history after a lane's accepted path of its verify block, a row mask
+// the GPU wrote (acceptance's retained rows).
 kernel void ngram_embedding_commit(device const bfloat *input [[buffer(0)]],
                                    device const bfloat *history_in [[buffer(1)]],
                                    device bfloat *history_out [[buffer(2)]],
-                                   device const uint *retained [[buffer(3)]],
+                                   device const uint *path [[buffer(3)]],
                                    constant NgramEmbeddingParams &p [[buffer(4)]],
                                    uint2 group [[threadgroup_position_in_grid]],
                                    uint tid [[thread_index_in_threadgroup]]) {
-  ngram_history_rows(input, history_in, history_out, p, retained[0], group, tid);
+  ngram_history_rows(input, history_in, history_out, p, popcount(path[0]), path[0], group, tid);
 }
 
 // The table rows of each lane's rows of a verify step (model/Qwen4Steps.cpp

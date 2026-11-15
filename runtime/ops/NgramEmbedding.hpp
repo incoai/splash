@@ -10,6 +10,7 @@
 
 #include "metal/CommandGraph.hpp"
 #include "metal/abi/NgramEmbedding.h"
+#include "metal/abi/VerifyTree.h"
 #include "ops/LaneRows.hpp"
 #include "ops/Normalization.hpp"
 
@@ -47,19 +48,24 @@ struct NgramEmbedding final {
                       metal::MetalBuffer streams, const NormWeights &keyNorm, const NormWeights &queryNorm,
                       const NormWeights &convolutionNorm, metal::MetalBuffer gated,
                       metal::MetalBuffer convolutionInput, NgramShape shape, uint32_t rows);
-  // One sequence's rows; writes the history after them unless historyOut is empty.
+  // One sequence's rows; writes the history after them unless historyOut is
+  // empty. With `tree`, the rows' places (a SplashTreeRow a row) of a verify
+  // block of at most 32 rows, whose taps follow each row's path; the commit
+  // then writes its history (addCommit).
   static void addConvolution(metal::CommandGraph &graph, metal::MetalBuffer convolutionInput,
                              metal::MetalBuffer historyIn, metal::MetalBuffer historyOut, metal::MetalBuffer taps,
-                             metal::MetalBuffer gated, metal::MetalBuffer streams, NgramShape shape, uint32_t rows);
+                             metal::MetalBuffer gated, metal::MetalBuffer streams, NgramShape shape, uint32_t rows,
+                             metal::MetalBuffer tree = {});
   // The history after the first `rows` rows of one sequence's prefill (a
   // state captured inside its command).
   static void addHistory(metal::CommandGraph &graph, metal::MetalBuffer convolutionInput,
                          metal::MetalBuffer historyIn, metal::MetalBuffer historyOut, NgramShape shape,
                          uint32_t rows);
-  // The history after a lane's `retained` (a GPU count) rows of its verify
-  // block's `rows` in convolutionInput.
+  // The history after a lane's accepted path (`path`, a row mask the GPU
+  // wrote, metal/abi/VerifyTree.h) of its verify block's `rows` in
+  // convolutionInput.
   static void addCommit(metal::CommandGraph &graph, metal::MetalBuffer convolutionInput,
-                        metal::MetalBuffer historyIn, metal::MetalBuffer historyOut, metal::MetalBuffer retained,
+                        metal::MetalBuffer historyIn, metal::MetalBuffer historyOut, metal::MetalBuffer path,
                         NgramShape shape, uint32_t rows);
   // The table rows of each lane's rows of a verify step (`step`) by the hash
   // `params` describes, whose lane count it sets.
