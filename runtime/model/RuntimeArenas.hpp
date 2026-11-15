@@ -632,7 +632,10 @@ decodeTensorBytes(const RuntimeGeometry &geometry,
 // prefixes hold 16/32/48/64 rows, each the most rows of a step of that many
 // lanes. Lanes are never separated by arena-alignment holes; only whole
 // tensor boundaries are aligned. The target step tensors (decodeTargetRows)
-// follow them.
+// precede them, at the base's start as a prefill arena's: after the lanes'
+// tensors (297 MiB of the 27B's), the 27B's B1 step's 64 down projections
+// took 2-6% longer on a 20-core M5 Pro, 20 to 53 of them up to 14% slower,
+// other layers each run (decode-profile).
 [[nodiscard]] uint64_t decodeArenaBaseBytes(const RuntimeGeometry &geometry,
                                             const ops::ExecutionPlans &operators);
 // The arena's base and its gate and linear scratch buffers, each in whole
@@ -650,10 +653,9 @@ public:
       : backend_(backend), geometry_(std::move(geometry)),
         base_(backend_.allocateBuffer(decodeArenaBaseBytes(geometry_, operators), metal::BufferStorage::Shared,
                                       "qwen-shared-decode")),
-        target_(backend_, base_, laneTensorBytes(geometry_, operators), geometry_.target,
-                decodeTargetRows(geometry_, operators)) {
+        target_(backend_, base_, 0, geometry_.target, decodeTargetRows(geometry_, operators)) {
     auto sizes = decodeTensorBytes(geometry_, operators);
-    uint64_t cursor = 0;
+    uint64_t cursor = TargetArena::bytes(geometry_.target, target_.shape());
     for (uint32_t tensor = 0; tensor < sizes.size(); ++tensor) {
       uint64_t stride = sizes[tensor];
       offsets_[tensor] = cursor;
@@ -667,7 +669,7 @@ public:
       cursor +=
           alignUp(checkedMultiply(stride, kLaneCount, "decode tensor"));
     }
-    if (cursor + TargetArena::bytes(geometry_.target, target_.shape()) != decodeArenaBaseBytes(geometry_, operators))
+    if (cursor != decodeArenaBaseBytes(geometry_, operators))
       throw std::logic_error("decode arena mismatch");
     // Sampled rows' draws return their arrival counts to zero; they start
     // there.
@@ -784,15 +786,6 @@ private:
     if (!bytes) return {};
     const uint64_t row = bytes / kDecodeStepRows;
     return backend_.view(buffer, offset + rows.first * row, rows.rows * row);
-  }
-
-  // The lanes' tensors' bytes, each tensor's aligned, before the target
-  // step tensors.
-  [[nodiscard]] static uint64_t laneTensorBytes(const RuntimeGeometry &geometry, const ops::ExecutionPlans &operators) {
-    uint64_t bytes = 0;
-    for (const uint64_t value : decodeTensorBytes(geometry, operators))
-      bytes = checkedAdd(bytes, alignUp(checkedMultiply(value, kLaneCount, "decode tensor")), "decode arena");
-    return bytes;
   }
 
   metal::MetalBackend &backend_;
