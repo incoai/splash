@@ -111,7 +111,12 @@ PROMETHEUS_SERIES = {
     "splash_disk_written_bytes_total": ("disk", "written_bytes"),
     # Record-file IO is separate from payload bytes and admission credit.
     **{
-        f"splash_disk_metadata_{kind}_{measure}_total": ("disk", "metadata_writes", kind, measure)
+        f"splash_disk_metadata_{kind}_{measure}_total": (
+            "disk",
+            "metadata_writes",
+            kind,
+            measure,
+        )
         for kind in ("header", "label", "clear")
         for measure in ("bytes", "calls", "syscall_errors")
     },
@@ -119,9 +124,15 @@ PROMETHEUS_SERIES = {
         f"splash_disk_copy_evictions_{kind}_total": ("disk", "copy_evictions", kind)
         for kind in ("kv_copy", "state_copy", "kv_leaf", "state_only", "state_in_use")
     },
-    "splash_disk_kv_copy_recreation_starts_total": ("disk", "kv_copy_recreation_starts"),
+    "splash_disk_kv_copy_recreation_starts_total": (
+        "disk",
+        "kv_copy_recreation_starts",
+    ),
     "splash_state_disk_copy_drops_total": ("state", "disk_copy_drops"),
-    "splash_state_disk_copy_recreation_starts_total": ("state", "disk_copy_recreation_starts"),
+    "splash_state_disk_copy_recreation_starts_total": (
+        "state",
+        "disk_copy_recreation_starts",
+    ),
     "splash_state_disk_copy_recreations_total": ("state", "disk_copy_recreations"),
     "splash_cache_hits_total": ("cache", "hits"),
     "splash_cache_cold_misses_total": ("cache", "cold_misses"),
