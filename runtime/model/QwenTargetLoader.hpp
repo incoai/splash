@@ -11,6 +11,7 @@
 #include "ops/Linear.hpp"
 #include "ops/Normalization.hpp"
 
+#include <algorithm>
 #include <cstdint>
 #include <functional>
 #include <initializer_list>
@@ -137,9 +138,12 @@ readQwenTargetWeights(const Layout &layout, Files &&files, const BlockTargetForm
 // dimensions agree with each other: the GDN's where it has GDN layers (and
 // none without), the packed attention rows of every query head's queries and,
 // gated, gates (attentionGate), a MoE target's leading dense layers
-// (intermediateSize wide) before at least one MoE layer, and the sliding and
-// unrotated layers among the attention layers. The image planners hold each
-// tensor to whole plane tiles.
+// (intermediateSize wide) before at least one MoE layer, the sliding and
+// unrotated layers among the attention layers, and its drafts' subset of the
+// vocabulary (draftVocabulary) in it, whole QUANT_TILE_ROWS tiles of its
+// head's rows (DFlashDraft's view of them): a subset past the vocabulary
+// would wrap its logits width. The image planners hold each tensor to whole
+// plane tiles.
 template <class Layout> void requireQwenLayout(const Layout &layout) {
   const auto zero = [](auto... dimensions) { return ((dimensions == 0) || ...); };
   const auto nonzero = [](auto... dimensions) { return ((dimensions != 0) || ...); };
@@ -162,6 +166,13 @@ template <class Layout> void requireQwenLayout(const Layout &layout) {
   const auto attentionMask = [&](uint64_t mask) {
     return layout.attentionLayerCount() >= 64 || !(mask >> layout.attentionLayerCount());
   };
+  const ops::DraftVocabulary &subset = layout.draftVocabulary;
+  const bool draftRowsOutside =
+      subset != ops::DraftVocabulary{} &&
+      (subset.leading > subset.trailing || subset.trailing > layout.vocabularySize ||
+       std::ranges::any_of(subset.rows(layout.vocabularySize), [](ops::Projection::RowRange range) {
+         return range.first % QUANT_TILE_ROWS || range.count % QUANT_TILE_ROWS;
+       }));
   if (routingInconsistent ||
       (gdn ? layout.gdnValueHeads % layout.gdnKeyHeads ||
                  layout.convolutionDimension !=
@@ -172,7 +183,8 @@ template <class Layout> void requireQwenLayout(const Layout &layout) {
                      layout.gdnHeadDimension)) ||
       layout.attentionWidth != layout.attentionQueryHeads * layout.attentionHeadDimension ||
       layout.packedFullWidth != (layout.attentionGate ? 2 : 1) * layout.attentionWidth + kvWidth ||
-      !attentionMask(layout.unrotatedLayers) || !layout.kvLayout().valid() || !layout.gdnStateLayout().valid())
+      !attentionMask(layout.unrotatedLayers) || !layout.kvLayout().valid() || !layout.gdnStateLayout().valid() ||
+      draftRowsOutside)
     throw WeightStoreError("Qwen target layout is inconsistent");
 }
 

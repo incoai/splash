@@ -479,6 +479,29 @@ void checkGdnWidths() {
           "an inconsistent dense layout was accepted");
 }
 
+// A family's drafts' subset of its vocabulary (draftVocabulary) lies in it,
+// whole tiles of its head's rows, or the layout is refused before loading,
+// rather than its logits width wrapping: the Qwen subset over a vocabulary
+// of 1,024 tokens, a part of half a tile and parts that cross. The whole
+// vocabulary fits any.
+void checkDraftVocabulary() {
+  const model::Qwen3_8Layout shipped;
+  auto small = shipped;
+  small.vocabularySize = 1024;
+  rejects([&] { model::requireQwenLayout(small); }, "Qwen target layout is inconsistent",
+          "a subset past the vocabulary was accepted");
+  small.draftVocabulary = {};
+  model::requireQwenLayout(small);
+  auto halfTile = shipped;
+  halfTile.draftVocabulary.leading += QUANT_TILE_ROWS / 2;
+  rejects([&] { model::requireQwenLayout(halfTile); }, "Qwen target layout is inconsistent",
+          "a subset of part of a tile was accepted");
+  auto crossed = shipped;
+  crossed.draftVocabulary = {512, 448};
+  rejects([&] { model::requireQwenLayout(crossed); }, "Qwen target layout is inconsistent",
+          "a subset whose parts cross was accepted");
+}
+
 } // namespace
 
 // A prefill chunk's attention plan follows the history its chunk committed:
@@ -508,6 +531,7 @@ int main() {
     checkUnsizedProjection();
     checkCaptureLayers();
     checkGdnWidths();
+    checkDraftVocabulary();
     checkGateUpLayers();
     checkYarnGeometry();
     checkIndexTables();

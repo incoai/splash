@@ -459,6 +459,8 @@ void checkDenseTarget(MetalBackend &backend, const std::filesystem::path &direct
   layout.layers = 4;
   layout.hiddenSize = 256;
   layout.vocabularySize = 256;
+  // Not the Qwen tokenizer's 248,320 tokens: its draft proposes from all of them.
+  layout.draftVocabulary = {};
   layout.gdnKeyHeads = 1;
   layout.gdnValueHeads = 2;
   layout.gdnHeadDimension = 128;

@@ -618,6 +618,8 @@ template <class Layout = Qwen3_8Layout> Layout syntheticTarget() {
     target.layers = 4;
     target.hiddenSize = 256;
     target.vocabularySize = 256;
+    // Not the Qwen tokenizer's 248,320 tokens: its draft proposes from all of them.
+    target.draftVocabulary = {};
     target.convolutionDimension = 512;
     target.gdnKeyHeads = 2;
     target.gdnValueHeads = 4;
