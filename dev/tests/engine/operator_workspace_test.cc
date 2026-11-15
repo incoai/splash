@@ -105,8 +105,10 @@ void blockIndexReader() {
 
 // Expert ids, route rows, grouped routes and the experts' slots are uint32,
 // routing weights fp32 and activations bf16; a row routes its top k and each
-// shared slice, which fills one tile per tileRows rows. The grouped input
-// first holds the router's fp32 scores, one row of 256 per token.
+// shared slice, which fills one tile per tileRows rows. A route takes a
+// grouped row, and the grouped input and intermediate hold the tileRows - 1
+// rows past them that a tile's matmul may read. The grouped input first holds
+// the router's fp32 scores, one row of 256 per token.
 void checkMoe(splash::ops::MoeWorkspace workspace,
               splash::ops::MoeShape shape, uint32_t rows, uint32_t tileRows) {
   using splash::model::kBFloat16Bytes;
@@ -116,19 +118,18 @@ void checkMoe(splash::ops::MoeWorkspace workspace,
   const uint64_t tiles = std::min(routed / tileRows + shape.experts, routed) +
                          uint64_t{shape.sharedSlices} * ((rows + tileRows - 1) / tileRows);
   require(tiles == splash::ops::moeMaximumTiles(rows, shape, tileRows), "MoE maximum tiles changed from baseline");
-  const uint64_t grouped = tiles * tileRows;
+  const uint64_t read = routes + tileRows - 1;
   require(workspace.selectedExpertsBytes == routes * sizeof(uint32_t) &&
               workspace.routingWeightsBytes == routes * sizeof(float) &&
               workspace.tileDescriptorsBytes == tiles * sizeof(MoeTileDescriptor) &&
               workspace.tileCountBytes == sizeof(MoeTileCount) &&
-              workspace.groupedRoutesBytes == grouped * sizeof(uint32_t) &&
+              workspace.groupedRoutesBytes == routes * sizeof(uint32_t) &&
               workspace.routeRowsBytes == routes * sizeof(uint32_t) &&
               workspace.expertSlotsBytes == uint64_t{shape.experts} * sizeof(uint32_t) &&
-              workspace.groupedInputBytes == std::max(grouped * shape.hiddenSize * kBFloat16Bytes,
+              workspace.groupedInputBytes == std::max(read * shape.hiddenSize * kBFloat16Bytes,
                                                       uint64_t{rows} * kRouterScores * sizeof(float)) &&
-              workspace.expertIntermediateBytes ==
-                  grouped * shape.expertIntermediateSize * kBFloat16Bytes &&
-              workspace.expertOutputBytes == grouped * shape.hiddenSize * kBFloat16Bytes,
+              workspace.expertIntermediateBytes == read * shape.expertIntermediateSize * kBFloat16Bytes &&
+              workspace.expertOutputBytes == routes * shape.hiddenSize * kBFloat16Bytes,
           "MoE workspace changed from baseline");
 }
 

@@ -251,9 +251,10 @@ public:
                        const std::function<void()> &beside = {}) const = 0;
 };
 
-// Grouped-row scratch. Routes are sorted by expert into tiles of tileRows
-// rows; every routed expert may leave one partially filled tile and no tile
-// is empty, and each shared slice fills one tile per tileRows rows.
+// The tiles of a step's routes, sorted by expert into tiles of at most
+// tileRows routes: every routed expert may leave one partially filled tile
+// and no tile is empty, and each shared slice fills one tile per tileRows
+// rows.
 [[nodiscard]] constexpr uint32_t moeMaximumTiles(uint32_t rows, MoeShape shape,
                                                  uint32_t tileRows) noexcept {
   const uint32_t routed = rows * shape.expertsPerToken;
@@ -280,11 +281,14 @@ struct MoeScratch final {
   // rows * routesPerToken() routes: expert ids and fp32 routing weights.
   metal::MetalBuffer selectedExperts;
   metal::MetalBuffer routingWeights;
-  // Sized by moeMaximumTiles(): tile descriptors, the tile count with the
-  // expert passes' grids (MoeTileCount), the route at each grouped row,
-  // each route's grouped row, and the grouped rows' inputs, intermediates and
-  // outputs. The router parks its fp32 scores in groupedInput until the
-  // gather claims it.
+  // The tile descriptors, at most moeMaximumTiles(), and the tile count with
+  // the expert passes' grids (MoeTileCount). Then the grouped rows, one per
+  // route, each tile's following the tile before it's (MoeTileDescriptor):
+  // the route at each grouped row, each route's grouped row, and the grouped
+  // rows' inputs, intermediates and outputs, whatever the tile; the inputs
+  // and intermediates hold tileRows - 1 rows more, which a last tile's matmul
+  // may read past its live rows (moe_expert_slab.h). The router parks its
+  // fp32 scores in groupedInput until the gather claims it.
   metal::MetalBuffer tileDescriptors;
   metal::MetalBuffer tileCount;
   metal::MetalBuffer groupedRoutes;

@@ -5,12 +5,14 @@
 #include "metal/abi/QuantFormat.h"
 #include "metal/kernels/common/moe_expert_chunk.h"
 
-// A grouped expert tile of tile_rows rows (kernels/shared/moe.metal) holds
-// `rows` live rows first, then padding. An expert pass runs the matmul of the
-// smallest of 8, 16 and tile_rows rows that holds the live rows, whose padding
-// rows the grouping marks empty, but for the staged passes' column tiles
-// (moe_column_tile), which run over their live rows alone. The gather fills
-// exactly the rows its passes read: no kernel reads past them.
+// A grouped expert tile of at most tile_rows rows (kernels/shared/moe.metal)
+// holds `rows` live rows from its first grouped row on (MoeTileDescriptor).
+// An expert pass runs the matmul of the smallest of 8, 16 and tile_rows rows
+// that holds the live rows and stores the live rows alone: the rows it reads
+// past them, the next tile's or rows of no tile, which the scratch holds up
+// to tile_rows - 1 past the routes' (ops::MoeScratch), give results it
+// discards. The staged passes' column tiles (moe_column_tile) read their live
+// rows alone.
 inline uint moe_matmul_rows(uint rows, uint tile_rows) {
   return min(tile_rows, rows <= 8 ? 8u : rows <= 16 ? 16u : tile_rows);
 }
@@ -25,10 +27,6 @@ inline uint moe_matmul_rows(uint rows, uint tile_rows) {
 // tiles, so the tiles of an expert run one tile kind, or a route's output would
 // also depend on that order (an expert of nine routes in an 8-row tile and a
 // 1-row tile).
-// The rows of tile t that the staged expert passes read.
-inline uint moe_staged_rows(device const MoeTileDescriptor *tiles, uint t, uint tile_rows) {
-  return moe_column_tile(tiles, t) ? tiles[t].rows : moe_matmul_rows(tiles[t].rows, tile_rows);
-}
 
 // Runs the pass `run` on the matmul rows of a Max-row tile:
 // run(integral_constant<ushort, R>{}) for R = moe_matmul_rows(rows, Max).

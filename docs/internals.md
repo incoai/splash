@@ -620,9 +620,10 @@ The rules:
    half tiles per core for BF16 values, F32 values or a quantized format's rows.
 4. *MoE.* Every GPU runs the experts on the staged tile, on 8-row tiles
    while a step's routes average at most one row per expert (a decode step's
-   of every family) and 32-row tiles beyond. One plan per step serves every
-   block, so its router follows rule 3 in the format of most blocks' routers
-   (`ops::moeRouterFormat`).
+   of up to 32 rows of every family) and 32-row tiles beyond. One plan per
+   step serves every block, so its router follows rule 3 in the format of
+   most blocks' routers (`ops::moeRouterFormat`). Either tile's grouped rows
+   are the step's routes', packed (`ops::MoeScratch`).
 5. *Attention.* The kernels follow how a layout reads its pages
    (`kv::Layout::reads`, below). A sequence of one tile, a decode lane's,
    takes one history split per 16 pages its rows read, between 32 and 128.
@@ -907,7 +908,11 @@ out as column windows (`gguf::TensorRows::windows`), so slice s's rows of each p
 slice s - 1's (`moe_gguf_segment`). The select kernel names the routing's select suffix
 (`moe_route_select_f32_sigmoid_s2`), the grouping and expert passes its slices suffix
 (`moe_group_routes_s2`, `moe_expert_gguf_m8_down_s2`); the softmax router's one gated slice is the
-unsuffixed instances. The expert passes launch the live tiles alone: the grouping kernel writes each
+unsuffixed instances. The grouping packs the tiles' rows, a grouped row per route, each tile's after
+the tile before it's (`MoeTileDescriptor::first_row`): a tile's 8-, 16- or 32-row matmul reads past
+its live rows into the next tile's, or past the last tile into the `tileRows - 1` rows the scratch
+holds past the routes', and stores its live rows alone.
+The expert passes launch the live tiles alone: the grouping kernel writes each
 pass's grid with the tile count, and the pass reads it as an indirect dispatch
 (`ComputeDispatch::indirectThreadgroups`). They find a routed expert through the block's slot table
 and the chunks that hold its slots (`ops::ExpertChunks`): slot s below floor_slots is at place s of

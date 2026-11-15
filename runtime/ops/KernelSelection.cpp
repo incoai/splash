@@ -310,11 +310,12 @@ uint32_t moeRouterFormat(std::span<const BlockMoeWeights *const> blocks) noexcep
 // row per expert (rows * topK <= experts), where 8- and 32-row tiles take the
 // same time, and 32-row tiles beyond, which stream an expert's weights once
 // for up to 32 of its rows (its tiles run 8-, 16- or 32-row matmuls by their
-// live rows, moe_live_rows). A decode step's 32 rows route at most as many
-// times as a family has experts (the 35B's and 122B's 256 of 256, Flint's
-// 192 of 256, Qwen3.8-Flash-Next's 320 of 512), so every family decodes on
-// 8-row tiles. The router's float tile follows selectFloatTile by its rows'
-// format.
+// live rows, moe_live_rows). A decode step of four 16-row lanes routes up to
+// 64 x topK times: past the experts, on 32-row tiles, from 33 rows of the
+// 35B's and 122B's (top 8 of 256), 43 of Flint's (6 of 256) and 52 of
+// Qwen3.8-Flash-Next's (10 of 512); either tile's grouped rows are the
+// step's routes (MoeScratch). The router's float tile follows
+// selectFloatTile by its rows' format.
 MoeConfig selectMoe(const KernelCalibration &calibration, const MoeShape &shape, uint32_t routerFormat,
                     uint32_t rows) noexcept {
   MoeConfig config;

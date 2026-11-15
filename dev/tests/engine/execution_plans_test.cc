@@ -328,11 +328,13 @@ void workspaceBounds() {
           "a decode lane's workspace does not cover the maximum split count");
   // A decode step's, of up to 64 rows: from 33 rows its plans take 32-row
   // tiles, 274 of them at 64 rows (16 full tiles' routes, a partial tile for
-  // each of 256 experts, and two of the shared expert's).
+  // each of 256 experts, and two of the shared expert's), whose grouped rows
+  // are the 576 routes' and, where the passes' matmuls read, the 31 rows a
+  // last tile's may read past its live rows.
   const auto moe = plans.moeWorkspace(routedShape, kRouterFormat, kStepRows);
-  require(moe.groupedInputBytes == 35913728 && moe.expertOutputBytes == 35913728 &&
-              moe.expertIntermediateBytes == 8978432 && moe.groupedRoutesBytes == 35072 &&
-              moe.tileDescriptorsBytes == 2192 && moe.tileCountBytes == 80 && moe.expertSlotsBytes == 1024,
+  require(moe.groupedInputBytes == 607 * 2048 * 2 && moe.expertOutputBytes == 576 * 2048 * 2 &&
+              moe.expertIntermediateBytes == 607 * 512 * 2 && moe.groupedRoutesBytes == 576 * 4 &&
+              moe.tileDescriptorsBytes == 274 * 12 && moe.tileCountBytes == 80 && moe.expertSlotsBytes == 1024,
           "MoE decode workspace changed");
   // The gate pass of the decode tiles' most rows, 64 a gate/up pair runs in two passes.
   require(plans.gateUpWorkspace(gateUp(matrices[0]), kMaximumDecodeTileRows) == 2228224 &&

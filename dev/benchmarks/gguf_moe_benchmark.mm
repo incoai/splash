@@ -10,6 +10,9 @@
 //   of GGUF_COLUMN_ROWS live rows or fewer);
 // - prefill chunks of 64 to 2048 rows routed at random;
 // - every dispatch of the 2048-row chunk and of the 8- and 32-row steps replayed as its own command.
+//   gguf-moe-benchmark <metallib> tiles [35b|flash-next|flint] [rounds] [gate/up format] [down format] [shared format]
+// - steps of 8 to 512 rows on 8- and on 32-row expert tiles (MoeExpertTile, selectMoe's choice), routed at random or,
+//   per lane of 16 rows, from a pool of three times top-k, with the rows each routed expert takes on average.
 // Each command runs layers of their own routes and buffers over one set of weights larger than the system cache, so a
 // layer streams its experts from DRAM: kDecodeLayers per decode step, kPrefillLayers per prefill chunk. Printed are
 // medians of GPU ms per layer over `rounds` (20) commands.
@@ -77,7 +80,7 @@ void allocate(MetalBackend &backend, MoeBuffers &m, const MoePlan &plan) {
 enum class Routing { Random, Pooled };
 
 int timing(MetalBackend &backend, const MoeShape &shape, uint32_t rounds, Fmt gateUpFormat, Fmt downFormat,
-           Fmt sharedFormat) {
+           Fmt sharedFormat, bool tiles) {
   const uint32_t H = shape.hiddenSize, I = shape.expertIntermediateSize, E = shape.experts,
                  topK = shape.expertsPerToken;
   std::mt19937 local(9);
@@ -104,14 +107,14 @@ int timing(MetalBackend &backend, const MoeShape &shape, uint32_t rounds, Fmt ga
   const uint32_t routerFormat = splash::ops::moeRouterFormat(blocks);
   // Rows whose expert e scores 4 x[e]: the first E inputs rank the experts, the row's routes at 1 - 0.05 rank and the
   // others below 0.05.
-  const auto input = [&](uint32_t rows, Routing routing) {
+  const auto input = [&](uint32_t rows, Routing routing, uint32_t laneRows) {
     std::uniform_real_distribution<float> unit(-1.0f, 1.0f);
     std::vector<float> x(uint64_t{rows} * H);
     std::vector<uint32_t> experts(E);
     std::iota(experts.begin(), experts.end(), 0u);
     const uint32_t pool = routing == Routing::Pooled ? kPoolTopK * topK : E;
     for (uint32_t r = 0; r < rows; ++r) {
-      if (routing == Routing::Random || r % kLaneRows == 0) std::shuffle(experts.begin(), experts.end(), local);
+      if (routing == Routing::Random || r % laneRows == 0) std::shuffle(experts.begin(), experts.end(), local);
       std::vector<uint32_t> candidates(experts.begin(), experts.begin() + pool);
       std::shuffle(candidates.begin(), candidates.end(), local);
       for (uint32_t k = 0; k < H; ++k) x[uint64_t{r} * H + k] = bf16(k < E ? 0.05f * unit(local) : unit(local));
@@ -124,11 +127,11 @@ int timing(MetalBackend &backend, const MoeShape &shape, uint32_t rounds, Fmt ga
     std::vector<MoeBuffers> buffers;
     CommandGraph graph;
   };
-  const auto layers = [&](const MoePlan &plan, Routing routing) {
+  const auto layers = [&](const MoePlan &plan, Routing routing, uint32_t laneRows = kLaneRows) {
     Layers l;
-    l.buffers.resize(plan.rows() <= 4 * kLaneRows ? kDecodeLayers : kPrefillLayers);
+    l.buffers.resize(plan.rows() <= (tiles ? 8 : 4) * kLaneRows ? kDecodeLayers : kPrefillLayers);
     for (MoeBuffers &b : l.buffers) {
-      b.input = bfloatBuffer(backend, input(plan.rows(), routing), "input");
+      b.input = bfloatBuffer(backend, input(plan.rows(), routing, laneRows), "input");
       b.residual = zeros(backend, uint64_t{plan.rows()} * H * 2, "residual");
       b.output = zeros(backend, uint64_t{plan.rows()} * H * 2, "output");
       allocate(backend, b, plan);
@@ -163,6 +166,39 @@ int timing(MetalBackend &backend, const MoeShape &shape, uint32_t rounds, Fmt ga
          backend.capabilities().gpuCoreCount, H, I, E, topK,
          shape.router == splash::ops::MoeRouter::Softmax ? "softmax" : "sigmoid", shape.sharedSlices,
          shape.sharedGate ? " gated" : "", fmtName(gateUpFormat), fmtName(downFormat), fmtName(sharedFormat), rounds);
+  if (tiles) {
+    // The rows each expert a step's layers routed takes on average: its routes over its distinct experts.
+    const auto rowsPerExpert = [&](const Layers &l, uint32_t rows) {
+      double sum = 0.0;
+      for (const MoeBuffers &b : l.buffers) {
+        const auto *selected = static_cast<const uint32_t *>(b.scratch.selectedExperts.contents());
+        std::vector<uint8_t> seen(E, 0);
+        uint32_t distinct = 0;
+        for (uint64_t route = 0; route < uint64_t{rows} * topK; ++route)
+          if (selected[route] < E && !seen[selected[route]]++) ++distinct;
+        sum += double(rows) * topK / std::max(distinct, 1u);
+      }
+      return sum / l.buffers.size();
+    };
+    const auto tiled = [&](uint32_t rows, splash::ops::MoeExpertTile tile) {
+      splash::ops::MoeConfig config = plans.moe(shape, routerFormat, rows).configuration();
+      config.expertTile = tile;
+      return MoE::plan(shape, rows, config);
+    };
+    // Warm the clocks as the default mode's prefill chunks do.
+    static_cast<void>(time(layers(plans.moe(shape, routerFormat, 2048), Routing::Random)));
+    printf("  rows | routing | rows per routed expert | M8 ms | M32 ms | M32/M8 | plan's tile\n");
+    for (const uint32_t rows : {8u, 16u, 24u, 32u, 40u, 48u, 56u, 64u, 96u, 128u, 192u, 256u, 512u})
+      for (const Routing routing : {Routing::Random, Routing::Pooled}) {
+        const Layers m8 = layers(tiled(rows, splash::ops::MoeExpertTile::M8), routing, 16);
+        const Layers m32 = layers(tiled(rows, splash::ops::MoeExpertTile::M32), routing, 16);
+        const double eight = time(m8), thirtyTwo = time(m32);
+        printf("  %4u | %s | %5.2f | %.4f | %.4f | %.3f | M%u\n", rows,
+               routing == Routing::Random ? "random" : "pooled", rowsPerExpert(m8, rows), eight, thirtyTwo,
+               thirtyTwo / eight, uint32_t(plans.moe(shape, routerFormat, rows).configuration().expertTile));
+      }
+    return 0;
+  }
   // Prefill chunks first: they also bring the GPU clocks up for the short decode layers.
   for (const uint32_t rows : kPrefillRows)
     printf("  prefill chunk of %4u rows: %.4f\n", rows,
@@ -362,12 +398,17 @@ int main(int argc, const char *argv[]) {
         return 1;
       }
     }
-    const std::string shapeName = argc > 2 ? argv[2] : "35b";
-    const Fmt gateUp = argc > 4 ? fmtNamed(argv[4]) : Q4K, down = argc > 5 ? fmtNamed(argv[5]) : Q5K,
-              shared = argc > 6 ? fmtNamed(argv[6]) : Q80;
-    if (argc < 2 || argc > 7 || (shapeName != "35b" && shapeName != "flash-next" && shapeName != "flint") ||
+    // `tiles` before the shape picks the expert tiles' comparison.
+    std::vector<const char *> args(argv, argv + argc);
+    const bool tiles = args.size() > 2 && std::string(args[2]) == "tiles";
+    if (tiles) args.erase(args.begin() + 2);
+    const size_t count = args.size();
+    const std::string shapeName = count > 2 ? args[2] : "35b";
+    const Fmt gateUp = count > 4 ? fmtNamed(args[4]) : Q4K, down = count > 5 ? fmtNamed(args[5]) : Q5K,
+              shared = count > 6 ? fmtNamed(args[6]) : Q80;
+    if (count < 2 || count > 7 || (shapeName != "35b" && shapeName != "flash-next" && shapeName != "flint") ||
         gateUp == FMT_COUNT || down == FMT_COUNT || shared == FMT_COUNT) {
-      std::cerr << "usage: gguf-moe-benchmark <metallib> [35b|flash-next|flint] [rounds] [gate/up format] "
+      std::cerr << "usage: gguf-moe-benchmark <metallib> [tiles] [35b|flash-next|flint] [rounds] [gate/up format] "
                    "[down format] [shared format]\n";
       return 2;
     }
@@ -380,8 +421,8 @@ int main(int argc, const char *argv[]) {
       shape.sharedGate = false;
     }
     try {
-      MetalBackend backend(argv[1]);
-      return timing(backend, shape, argc > 3 ? std::stoul(argv[3]) : 20, gateUp, down, shared);
+      MetalBackend backend(args[1]);
+      return timing(backend, shape, count > 3 ? std::stoul(args[3]) : 20, gateUp, down, shared, tiles);
     } catch (const std::exception &error) {
       std::cerr << "gguf-moe-benchmark: " << error.what() << '\n';
       return 1;

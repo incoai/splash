@@ -32,18 +32,20 @@ static_assert(sizeof(MoeRouteParams) == 16,
 
 // Every row carries top_k routed experts followed by the slices of the shared
 // expert, ids `experts` on, whose routing weight is the sigmoid of the
-// block's scalar gate or 1 (ops::MoeShape). Routes are sorted by expert: tile
-// t covers grouped rows [t * tile_rows, (t + 1) * tile_rows) of one expert;
-// padding rows carry the route ~0u.
+// block's scalar gate or 1 (ops::MoeShape). Routes are sorted by expert into
+// tiles of at most tile_rows routes of one expert: a tile covers grouped rows
+// [first_row, first_row + rows), each tile's following the tile before it's,
+// a grouped row per route.
 //
 // Written by grouping kernels; the host uses this layout to size storage.
 struct MoeTileDescriptor {
   uint32_t expert;
   uint32_t rows;
+  uint32_t first_row;
 };
 
-static_assert(sizeof(MoeTileDescriptor) == 8,
-              "MoE tile descriptors are 8 bytes on both sides");
+static_assert(sizeof(MoeTileDescriptor) == 12,
+              "MoE tile descriptors are 12 bytes on both sides");
 
 // The staged GGUF expert passes (kernels/shared/moe_gguf.metal) run an
 // expert's only tile of at most GGUF_COLUMN_ROWS live rows on the column tile
@@ -132,13 +134,12 @@ inline uint32_t moe_end_tile(Count count, uint32_t tiles) {
 #define MOE_SLOT_ABSENT 0x80000000u
 
 struct MoeGatherParams {
-  uint32_t tile_rows;
   uint32_t input_size;
   uint32_t routes_per_row;
 };
 
-static_assert(sizeof(MoeGatherParams) == 12,
-              "MoE gather parameters are 12 bytes on both sides");
+static_assert(sizeof(MoeGatherParams) == 8,
+              "MoE gather parameters are 8 bytes on both sides");
 
 // The routed experts of a MoE block sit in slots, which chunks hold: the
 // floor chunk, chunk 0, holds the first floor_slots slots, a store size's

@@ -69,16 +69,19 @@ MoeWorkspace workspaceFor(MoeShape shape, uint32_t rows, uint32_t tileRows) {
     throw std::invalid_argument("invalid MoE workspace shape");
   const uint64_t routes = uint64_t{rows} * shape.routesPerToken();
   const uint32_t tiles = moeMaximumTiles(rows, shape, tileRows);
-  const uint64_t groupedRows = uint64_t{tiles} * tileRows;
+  // A grouped row per route; the grouped input and the intermediate, which
+  // the passes' matmuls read, hold tileRows - 1 rows more, which a last
+  // tile's matmul may read past its live rows (moe_matmul_rows).
+  const uint64_t matmulRows = routes + tileRows - 1;
   // The router's fp32 scores, a row of routerWidth() expert slots per row,
   // live in the grouped input until the gather overwrites them.
   const uint64_t scoreBytes = uint64_t{rows} * shape.routerWidth() * sizeof(float);
   return {routes * sizeof(uint32_t), routes * sizeof(float),
           uint64_t{tiles} * sizeof(MoeTileDescriptor), sizeof(MoeTileCount),
-          groupedRows * sizeof(uint32_t), routes * sizeof(uint32_t), uint64_t{shape.experts} * sizeof(uint32_t),
-          std::max(tableBytes(shape.hiddenSize, groupedRows), scoreBytes),
-          groupedRows * shape.expertIntermediateSize * sizeof(uint16_t),
-          groupedRows * shape.hiddenSize * sizeof(uint16_t)};
+          routes * sizeof(uint32_t), routes * sizeof(uint32_t), uint64_t{shape.experts} * sizeof(uint32_t),
+          std::max(tableBytes(shape.hiddenSize, matmulRows), scoreBytes),
+          matmulRows * shape.expertIntermediateSize * sizeof(uint16_t),
+          routes * shape.hiddenSize * sizeof(uint16_t)};
 }
 
 // The shape's compiled routing (MoeShape::compiledRouting).
@@ -189,7 +192,7 @@ void addGather(metal::CommandGraph &graph, const MoeBuffers &buffers, const MoeP
   graph.add("moe_gather_rows",
             {buffers.input, scratch.groupedRoutes, scratch.tileDescriptors,
              scratch.tileCount, scratch.groupedInput},
-            MoeGatherParams{plan.tileRows(), shape.hiddenSize, shape.routesPerToken()},
+            MoeGatherParams{shape.hiddenSize, shape.routesPerToken()},
             {plan.maximumTiles(), shape.hiddenSize / 256, 1});
 }
 

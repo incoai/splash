@@ -28,9 +28,10 @@
 //   set's first plan also on fresh scratch, where every row must compare), the
 //   output of the live tiles' grids bitwise that of every tile's with the gate
 //   and up passes apart (gguf_moe_test.metal, on the down pass's expert tile),
-//   and the grouping: tiles as each expert's routes fill them, every route's
-//   grouped row naming it back, the padding a tile's matmul reads marked empty
-//   and the rows past it unwritten. Concentrated and skewed router loads on
+//   and the grouping: tiles as each expert's routes fill them, their rows
+//   packed in tile order, every route's grouped row naming it back in a tile
+//   of its expert, and the rows past the tiles' unwritten, though a last
+//   tile's matmul reads them. Concentrated and skewed router loads on
 //   the staged 32-row tiles of one format, at ragged row counts. A step that
 //   routes its verify blocks' verify rows alone, a decode step's lanes or
 //   blocks of 8, 5, 3 and 1 rows among prompt rows, which all route, every
@@ -700,15 +701,30 @@ bool untouched(const void *data, uint64_t bytes) {
   return std::all_of(begin, begin + bytes, [](uint8_t byte) { return byte == kCanary; });
 }
 
+// Each grouped row's tile by the tiles' first rows, UINT32_MAX where none
+// holds it: a step's routes' rows, which no tile's rows pass or share.
+std::vector<uint32_t> rowTiles(const MoeScratch &scratch, const MoePlan &plan, const std::string &label) {
+  const auto *tiles = static_cast<const MoeTileDescriptor *>(scratch.tileDescriptors.contents());
+  const uint32_t tileCount = *static_cast<const uint32_t *>(scratch.tileCount.contents());
+  std::vector<uint32_t> tileOf(uint64_t{plan.rows()} * kRoutes, UINT32_MAX);
+  for (uint32_t tile = 0; tile < tileCount; ++tile)
+    for (uint32_t row = 0; row < tiles[tile].rows; ++row) {
+      const uint64_t grouped = uint64_t{tiles[tile].first_row} + row;
+      require(grouped < tileOf.size() && tileOf[grouped] == UINT32_MAX,
+              label + ": a tile's rows pass the routes' or another tile's");
+      tileOf[grouped] = tile;
+    }
+  return tileOf;
+}
+
 // The grouping of a run whose grouped routes and input held kCanary: as many
-// tiles as each expert's routes fill, every route at a grouped row that names
-// it back in a tile of its expert, the padding rows a tile's matmul reads
-// (moe_matmul_rows: the smallest of 8, 16 and the tile's rows that holds its
-// live rows) marked empty, and the rows past them written neither by the
-// grouping nor by the gather, but where the router's scores, which come first
-// in the grouped input, overwrote them; the passes run their column tiles
-// (columnTile) over the live rows alone, so the gather writes no padding row
-// of those.
+// tiles as each expert's routes fill, their live rows packed in tile order (a
+// tile's first row where the tile before it's end), every route at a grouped
+// row that names it back in a tile of its expert, and the rows past the
+// tiles' written neither by the grouping nor by the gather (the passes'
+// matmuls read up to tileRows - 1 of them past a last tile's live rows), but
+// where the router's scores, which come first in the grouped input, overwrote
+// them.
 void checkGrouping(const MoeScratch &scratch, const MoePlan &plan, const std::string &label) {
   const uint32_t rows = plan.rows(), tileRows = plan.tileRows();
   const auto *selected = static_cast<const uint32_t *>(scratch.selectedExperts.contents());
@@ -717,37 +733,31 @@ void checkGrouping(const MoeScratch &scratch, const MoePlan &plan, const std::st
   const auto *groupedInput = static_cast<const uint8_t *>(scratch.groupedInput.contents());
   const auto *tiles = static_cast<const MoeTileDescriptor *>(scratch.tileDescriptors.contents());
   const uint32_t tileCount = *static_cast<const uint32_t *>(scratch.tileCount.contents());
+  uint32_t packed = 0;
+  for (uint32_t tile = 0; tile < tileCount; ++tile) {
+    require(tiles[tile].rows > 0 && tiles[tile].rows <= tileRows, label + ": invalid tile live row count");
+    require(tiles[tile].first_row == packed, label + ": a tile's rows do not follow the tile before it's");
+    packed += tiles[tile].rows;
+  }
+  const std::vector<uint32_t> tileOf = rowTiles(scratch, plan, label);
   std::array<uint32_t, kExperts + kSharedSlices> routes{};
   for (uint32_t route = 0; route < rows * kRoutes; ++route) {
     require(selected[route] < routes.size(), label + ": invalid selected expert");
     ++routes[selected[route]];
     const uint32_t grouped = routeRows[route];
-    require(grouped < tileCount * tileRows && groupedRoutes[grouped] == route &&
-                tiles[grouped / tileRows].expert == selected[route],
+    require(grouped < packed && groupedRoutes[grouped] == route && tiles[tileOf[grouped]].expert == selected[route],
             label + ": grouped route mapping does not round-trip");
   }
   uint32_t occupied = 0;
   for (const uint32_t count : routes) occupied += (count + tileRows - 1) / tileRows;
   require(tileCount == occupied, label + ": tile count differs from per-expert occupancy");
+  require(untouched(groupedRoutes + packed, scratch.groupedRoutes.sizeBytes() - uint64_t{packed} * sizeof(uint32_t)),
+          label + ": the grouping wrote past the tiles' rows");
   const uint64_t rowBytes = uint64_t{kHidden} * 2,
                  scoreBytes = uint64_t{rows} * kShape.routerWidth() * 4;
-  for (uint32_t tile = 0; tile < tileCount; ++tile) {
-    const uint32_t live = tiles[tile].rows;
-    require(live > 0 && live <= tileRows, label + ": invalid tile live row count");
-    const uint32_t matmul = std::min(tileRows, live <= 8 ? 8u : live <= 16 ? 16u : tileRows);
-    const uint32_t read = moe_column_tile(tiles, tile) ? live : matmul;
-    for (uint32_t row = live; row < matmul; ++row)
-      require(groupedRoutes[tile * tileRows + row] == UINT32_MAX,
-              label + ": padding a tile's matmul reads is not marked empty");
-    for (uint32_t row = matmul; row < tileRows; ++row)
-      require(untouched(groupedRoutes + uint64_t{tile} * tileRows + row, sizeof(uint32_t)),
-              label + ": the grouping wrote past a tile's matmul rows");
-    for (uint32_t row = read; row < tileRows; ++row) {
-      const uint64_t grouped = uint64_t{tile} * tileRows + row;
-      require(grouped * rowBytes < scoreBytes || untouched(groupedInput + grouped * rowBytes, rowBytes),
-              label + ": the gather wrote past the rows a tile's passes read");
-    }
-  }
+  for (uint64_t grouped = packed; grouped < scratch.groupedInput.sizeBytes() / rowBytes; ++grouped)
+    require(grouped * rowBytes < scoreBytes || untouched(groupedInput + grouped * rowBytes, rowBytes),
+            label + ": the gather wrote past the tiles' rows");
 }
 
 // A run's output rows and, per route, whether its expert tile ran the column tile (columnTile, on the staged expert
@@ -756,13 +766,14 @@ struct MoeRun {
   std::vector<uint16_t> output;
   std::vector<bool> column;
 };
-std::vector<bool> columnRoutes(const MoeScratch &scratch, const MoePlan &plan) {
-  const uint32_t routes = plan.rows() * kRoutes, tileRows = plan.tileRows();
+std::vector<bool> columnRoutes(const MoeScratch &scratch, const MoePlan &plan, const std::string &label) {
+  const uint32_t routes = plan.rows() * kRoutes;
   const auto *routeRows = static_cast<const uint32_t *>(scratch.routeRows.contents());
   const auto *tiles = static_cast<const MoeTileDescriptor *>(scratch.tileDescriptors.contents());
+  const std::vector<uint32_t> tileOf = rowTiles(scratch, plan, label);
   std::vector<bool> column(routes);
   for (uint32_t route = 0; route < routes; ++route)
-    column[route] = moe_column_tile(tiles, routeRows[route] / tileRows);
+    column[route] = moe_column_tile(tiles, tileOf[routeRows[route]]);
   return column;
 }
 // The first `rows` rows of two runs: rows whose routes ran the same tile kinds are bitwise equal, as a row's output
@@ -982,7 +993,7 @@ MoeRun runPlan(MetalBackend &backend, const Model &m, Buffers &b, const MoePlan 
                                                std::to_string(c) + " differs from the weighted expert sum");
     }
   }
-  MoeRun result{std::vector<uint16_t>(uint64_t{rows} * kHidden), columnRoutes(b.moe.scratch, plan)};
+  MoeRun result{std::vector<uint16_t>(uint64_t{rows} * kHidden), columnRoutes(b.moe.scratch, plan, label)};
   std::memcpy(result.output.data(), output, result.output.size() * 2);
   // Bitwise the output of the same dispatches again, whose grouping orders each expert's routes anew (its atomics),
   // and of every tile's threadgroups and two gate/up passes.
@@ -1572,10 +1583,11 @@ int verifiedRows(MetalBackend &backend, const std::string &name, uint32_t rows,
     const auto *output = static_cast<const uint16_t *>(b.moe.output.contents());
     const auto *routeRows = static_cast<const uint32_t *>(b.moe.scratch.routeRows.contents());
     const auto *tiles = static_cast<const MoeTileDescriptor *>(b.moe.scratch.tileDescriptors.contents());
+    const std::vector<uint32_t> tileOf = rowTiles(b.moe.scratch, plan, name);
     std::vector<uint32_t> kinds(uint64_t{rows} * kRoutes);
     for (uint32_t route = 0; route < kinds.size(); ++route)
       kinds[route] = routeRows[route] == UINT32_MAX ? UINT32_MAX
-                                                    : uint32_t(moe_column_tile(tiles, routeRows[route] / tileRows));
+                                                    : uint32_t(moe_column_tile(tiles, tileOf[routeRows[route]]));
     return std::pair{std::vector<uint16_t>(output, output + uint64_t{rows} * kHidden), kinds};
   };
   const auto [allOutput, allKinds] = run({});
@@ -1594,6 +1606,9 @@ int verifiedRows(MetalBackend &backend, const std::string &name, uint32_t rows,
   const auto *groupedRoutes = static_cast<const uint32_t *>(scratch.groupedRoutes.contents());
   const auto *tiles = static_cast<const MoeTileDescriptor *>(scratch.tileDescriptors.contents());
   const uint32_t tileCount = *static_cast<const uint32_t *>(scratch.tileCount.contents());
+  for (uint32_t tile = 0, packed = 0; tile < tileCount; packed += tiles[tile++].rows)
+    if (tiles[tile].first_row != packed) fail("a tile's rows do not follow the tile before it's");
+  const std::vector<uint32_t> tileOf = rowTiles(scratch, plan, name);
   std::array<uint32_t, kExperts + kSharedSlices> routes{};
   for (uint32_t route = 0; route < rows * kRoutes; ++route) {
     const uint32_t row = route / kRoutes, slot = route % kRoutes;
@@ -1607,8 +1622,8 @@ int verifiedRows(MetalBackend &backend, const std::string &name, uint32_t rows,
     }
     ++routes[selected[route]];
     const uint32_t grouped = routeRows[route];
-    if (grouped >= tileCount * tileRows || groupedRoutes[grouped] != route ||
-        tiles[grouped / tileRows].expert != selected[route])
+    if (grouped >= tileOf.size() || tileOf[grouped] == UINT32_MAX || groupedRoutes[grouped] != route ||
+        tiles[tileOf[grouped]].expert != selected[route])
       fail("a routed route's grouped row does not round-trip");
   }
   uint32_t occupied = 0;
