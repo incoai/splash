@@ -9,14 +9,13 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+from dev.tests import native_peer
+from dev.tests.server_fixtures import FakeRuntime, HarnessTestCase
 from server import backend as backend_api
 from server import protocol as wire
 from server import serve_options, supervision
 from server.chat_format import FLINT, QWEN
 from server.metrics import PROMETHEUS_SERIES, prometheus_metrics
-
-from dev.tests import native_peer
-from dev.tests.server_fixtures import FakeRuntime, HarnessTestCase
 
 # A representative status document, every section of it set, which
 # runtime_status_test.cpp checks the engine writes.
