@@ -5212,6 +5212,9 @@ void testRunningRequestKeepsItsReplayPoint() {
   engine::Cache resources(pool, nullptr, nullptr);
   Executor executor(2);
   executor.decodeFinishes = false;
+  // Its decode captures no state (Model::capturesInDecode): the point its
+  // next turn resumes from is its prompt's replay point.
+  executor.decodeStateCaptures = false;
   Events events;
   engine::Engine engine(test::engineConfig(), resources, executor, events);
   guardReleases(storage, engine);
@@ -5260,6 +5263,9 @@ void testSuspendedRequestKeepsItsReplayPoint() {
   engine::Cache resources(pool, nullptr, nullptr);
   Executor executor(3);
   executor.decodeFinishes = false;
+  // Its decode captures no state (Model::capturesInDecode): the point the
+  // suspended lane resumes from is its prompt's replay point.
+  executor.decodeStateCaptures = false;
   Events events;
   GovernedHost host;
   EngineConfig config = host.connect({});

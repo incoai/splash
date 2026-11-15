@@ -1135,6 +1135,10 @@ void Engine::completeAdmission(Request &active, CacheLookup &lookup,
     scheduler_.resumeFromResources(active.request.id, resumeBoundary, active.replayTokens);
   active.latestCheckpoint = {};
   active.unprovenState.reset();
+  // A start shows whether its conversation renders replies back; a
+  // suspended lane's resume, through its own reply, shows nothing.
+  if (!resuming)
+    active.rendersReplies = lookup.rendersReply;
   if (lookup.state) {
     active.unprovenState = lookup.state->kvBlock();
     active.latestCheckpoint = cache_.checkpointState(lookup.state->kvBlock());
@@ -1380,17 +1384,6 @@ void Engine::publishReachedStateBoundaries(
              promptProcessed) {
     const Request::StateBoundary objective =
         active.stateBoundaries[active.stateBoundaryCursor++];
-    const bool checkpoint = objective.disposable;
-    // The conversation's next turn resumes from the prompt's replay point. A
-    // rebuilt replay point counts as a replay-state publication, not a
-    // junction.
-    const bool replay = !checkpoint && objective.tokens == promptReplayBoundary(active);
-    uint64_t &failures = checkpoint ? counters_.checkpointPublicationFailures
-                         : replay   ? counters_.replayStatePublicationFailures
-                                    : counters_.junctionMaterializationFailures;
-    uint64_t &publications = checkpoint ? counters_.checkpointPublications
-                             : replay   ? counters_.replayStatePublications
-                                        : counters_.junctionMaterializations;
     // The command captured the state of every boundary it reached, but some
     // checkpoints inside it (below) and one at its end whose buffers were
     // refused (reserveCaptures): refused while the lane held a checkpoint,
@@ -1410,102 +1403,13 @@ void Engine::publishReachedStateBoundaries(
       // A checkpoint the command did not capture: a later state of it
       // retires the checkpoint once published, or the prompt's replay point
       // took its buffers.
-      if (!checkpoint)
+      if (!objective.disposable)
         throw std::logic_error("prefill passed a state boundary it did not capture");
       continue;
     }
     materialized = true;
     endedAtBoundary = objective.tokens == promptProcessed;
-    const uint64_t block = cache_.blockAt(active.request.id, objective.tokens);
-    // A windowed layout's state restores only through a Full tail, which
-    // the command that computed it, or held it in its window, leaves so.
-    if (!cache_.stateTailFull(block)) {
-      ++failures;
-      continue;
-    }
-    // The state is in use before any of the ways below keeps it, so each of
-    // them makes room as work in use.
-    if (replay)
-      active.replayPoint = cache_.useState(block);
-    if (cache_.reuseCompositeState(block, checkpoint)) {
-      // The captured state goes back to the model's pool.
-      ++counters_.deduplicatedStatePublications;
-    } else {
-      // The previous recovery point retires here or after the publication.
-      // Here, before a checkpoint or a junction is published, a resident one
-      // goes, and gives its buffers to the state of a boundary the command
-      // ended at without them (below). One only on disk gives none: it stays
-      // the recovery point until this state is published, and retires after
-      // the publication, as does the one a reused state leaves. No checkpoint
-      // is published while a restore lease pins the one before it. The
-      // prompt's replay point keeps the lane's checkpoint (below).
-      if (checkpoint && checkpointPinned(active)) {
-        ++failures;
-        continue;
-      }
-      const bool resident = cache_.stateResident(active.latestCheckpoint.kvBlock);
-      if (!replay && resident)
-        static_cast<void>(retireCheckpoint(active));
-      // The command has completed, so the state it ended at for its lane's
-      // checkpoint is taken from the lane now. The replay point keeps that
-      // checkpoint only beside buffers of its own; refused them, it takes
-      // the checkpoint's unless a peer still holds it. Then what the ledger
-      // frees for the state's claim (stateClaim).
-      if (fromLane) {
-        bool first = true;
-        recycled = allocate(
-                       [&] {
-                         state = model_.snapshot(active.request.id);
-                         if (!state && std::exchange(first, false) && replay && resident &&
-                             !checkpointShared(active) && retireCheckpoint(active))
-                           state = model_.snapshot(active.request.id);
-                         return StateBuffers{.ok = state != nullptr};
-                       },
-                       stateClaim(active,
-                                  checkpoint ? StateClass::Checkpoint
-                                  : replay   ? StateClass::InUse
-                                             : StateClass::Ordinary,
-                                  false),
-                       Refusal::Settled)
-                       .freed &&
-                   state;
-      }
-      if (state) {
-        cache_.publishCompositeState(block, std::move(state), checkpoint);
-        ++publications;
-        if (recycled)
-          ++counters_.recycledStatePublications;
-      } else if (cache_.reuseStoredState(block, checkpoint)) {
-        // No cache slot takes a RAM copy of a state already on disk.
-        ++counters_.deduplicatedStatePublications;
-      } else if (model_.canSnapshotToDisk(cache_.stateInUse(block)) &&
-                 cache_.publishStateToDisk(
-                     block,
-                     [&](std::function<void()> completion) {
-                       return model_.snapshotToDisk(active.request.id, std::move(completion));
-                     },
-                     checkpoint)) {
-        // No cache slot holds the state; the tier takes it from the lane.
-        ++counters_.diskStatePublications;
-        ++publications;
-      } else {
-        ++failures;
-        continue;
-      }
-    }
-    // The previous recovery point, if the lane still holds one, retires now,
-    // except at the prompt's replay point: there it stays cached, as
-    // disposable as any checkpoint, for a later request that shares the
-    // prompt up to it but not up to the replay point. The lane holds it
-    // until this state is published; a refused publication leaves it the
-    // lane's recovery point, unless it retired above to give this state its
-    // buffers.
-    if (!replay)
-      static_cast<void>(retireCheckpoint(active));
-    active.latestCheckpoint = checkpoint ? cache_.checkpointState(block)
-                                         : StateCheckpoint{};
-    if (!checkpoint)
-      writeBehind_.published(block, objective.tokens, now);
+    publishStateBoundary(active, objective, std::move(state), recycled, fromLane, now);
   }
   if (captured != captures.size())
     throw std::logic_error("prefill captured a state boundary it did not reach");
@@ -1520,6 +1424,113 @@ void Engine::publishReachedStateBoundaries(
     active.stateBoundaries.clear();
     active.stateBoundaryCursor = 0;
   }
+}
+
+bool Engine::publishStateBoundary(Request &active, Request::StateBoundary objective,
+                                  std::shared_ptr<const CompositeState> state, bool recycled,
+                                  bool fromLane, double now) {
+  const bool checkpoint = objective.disposable;
+  // The conversation's next turn resumes from the prompt's replay point. A
+  // rebuilt replay point counts as a replay-state publication, not a
+  // junction.
+  const bool replay = !checkpoint && objective.tokens == promptReplayBoundary(active);
+  uint64_t &failures = checkpoint ? counters_.checkpointPublicationFailures
+                       : replay   ? counters_.replayStatePublicationFailures
+                                  : counters_.junctionMaterializationFailures;
+  uint64_t &publications = checkpoint ? counters_.checkpointPublications
+                           : replay   ? counters_.replayStatePublications
+                                      : counters_.junctionMaterializations;
+  const uint64_t block = cache_.blockAt(active.request.id, objective.tokens);
+  // A windowed layout's state restores only through a Full tail, which
+  // the command that computed it, or held it in its window, leaves so.
+  if (!cache_.stateTailFull(block)) {
+    ++failures;
+    return false;
+  }
+  // The state is in use before any of the ways below keeps it, so each of
+  // them makes room as work in use.
+  if (replay)
+    active.replayPoint = cache_.useState(block);
+  if (cache_.reuseCompositeState(block, checkpoint)) {
+    // The captured state goes back to the model's pool.
+    ++counters_.deduplicatedStatePublications;
+  } else {
+    // The previous recovery point retires here or after the publication.
+    // Here, before a checkpoint or a junction is published, a resident one
+    // goes, and gives its buffers to the state of a boundary the command
+    // ended at without them (below). One only on disk gives none: it stays
+    // the recovery point until this state is published, and retires after
+    // the publication, as does the one a reused state leaves. No checkpoint
+    // is published while a restore lease pins the one before it. The
+    // prompt's replay point keeps the lane's checkpoint (below).
+    if (checkpoint && checkpointPinned(active)) {
+      ++failures;
+      return false;
+    }
+    const bool resident = cache_.stateResident(active.latestCheckpoint.kvBlock);
+    if (!replay && resident)
+      static_cast<void>(retireCheckpoint(active));
+    // The command has completed, so the state it ended at for its lane's
+    // checkpoint is taken from the lane now. The replay point keeps that
+    // checkpoint only beside buffers of its own; refused them, it takes
+    // the checkpoint's unless a peer still holds it. Then what the ledger
+    // frees for the state's claim (stateClaim).
+    if (fromLane) {
+      bool first = true;
+      recycled = allocate(
+                     [&] {
+                       state = model_.snapshot(active.request.id);
+                       if (!state && std::exchange(first, false) && replay && resident &&
+                           !checkpointShared(active) && retireCheckpoint(active))
+                         state = model_.snapshot(active.request.id);
+                       return StateBuffers{.ok = state != nullptr};
+                     },
+                     stateClaim(active,
+                                checkpoint ? StateClass::Checkpoint
+                                : replay   ? StateClass::InUse
+                                           : StateClass::Ordinary,
+                                false),
+                     Refusal::Settled)
+                     .freed &&
+                 state;
+    }
+    if (state) {
+      cache_.publishCompositeState(block, std::move(state), checkpoint);
+      ++publications;
+      if (recycled)
+        ++counters_.recycledStatePublications;
+    } else if (cache_.reuseStoredState(block, checkpoint)) {
+      // No cache slot takes a RAM copy of a state already on disk.
+      ++counters_.deduplicatedStatePublications;
+    } else if (model_.canSnapshotToDisk(cache_.stateInUse(block)) &&
+               cache_.publishStateToDisk(
+                   block,
+                   [&](std::function<void()> completion) {
+                     return model_.snapshotToDisk(active.request.id, std::move(completion));
+                   },
+                   checkpoint)) {
+      // No cache slot holds the state; the tier takes it from the lane.
+      ++counters_.diskStatePublications;
+      ++publications;
+    } else {
+      ++failures;
+      return false;
+    }
+  }
+  // The previous recovery point, if the lane still holds one, retires now,
+  // except at the prompt's replay point: there it stays cached, as
+  // disposable as any checkpoint, for a later request that shares the
+  // prompt up to it but not up to the replay point. The lane holds it
+  // until this state is published; a refused publication leaves it the
+  // lane's recovery point, unless it retired above to give this state its
+  // buffers.
+  if (!replay)
+    static_cast<void>(retireCheckpoint(active));
+  active.latestCheckpoint = checkpoint ? cache_.checkpointState(block)
+                                       : StateCheckpoint{};
+  if (!checkpoint)
+    writeBehind_.published(block, objective.tokens, now);
+  return true;
 }
 
 Engine::Prepared Engine::prepare(const BatchPlan &plan, std::vector<ModelBatchItem> &items,
@@ -1720,6 +1731,11 @@ Engine::Prepared Engine::prepare(const BatchPlan &plan, std::vector<ModelBatchIt
           plan.items[index].promptOffset, ends[index], std::move(states[index]), std::move(captures[index])};
     return Prepared::Replan;
   }
+  // A decoding lane reserves the state its cycle captures
+  // (reserveReplyCapture), which frees nothing for it.
+  for (size_t index = 0; !prefill && plan.decodeStage == DecodeStage::Regular && index < plan.items.size();
+       ++index)
+    reserveReplyCapture(request(plan.items[index].requestId), states[index], captures[index], supersedes);
   // The items come last: making room for a state's buffers may move KV
   // pages out of an extent, which rewrites the page lists of the lanes
   // on them.
@@ -1732,12 +1748,11 @@ Engine::Prepared Engine::prepare(const BatchPlan &plan, std::vector<ModelBatchIt
     item.logicalPosition = prefill ? scheduled.promptOffset : active.exactTokens.size();
     item.tokenCount = scheduled.tokenCount;
     setPageTable(item, cache_.cutPageTable(active.request.id));
-    if (prefill) {
+    if (prefill)
       item.inputTokens =
           std::span<const uint32_t>(active.exactTokens)
               .subspan(scheduled.promptOffset, scheduled.tokenCount);
-      item.stateCaptures = std::move(states[index]);
-    }
+    item.stateCaptures = std::move(states[index]);
     items.push_back(std::move(item));
   }
   return Prepared::Runnable;
@@ -1954,6 +1969,22 @@ void Engine::apply(const Pending &command, std::span<const ModelStepResult> resu
           static_cast<uint32_t>(active.exactTokens.size()) -
           result.outputTokensWithoutKv;
       publishCommittedBlocks(active, storedTokens);
+      // The state of the page the cycle's retained rows reached, if it
+      // captured one: a rolling checkpoint of the reply, which retires the
+      // one before it, and an opportunistic one (Cache::markReply), which
+      // frees first and is never written. The lane's next one replaces it a
+      // page on, and the last one serves only a next prompt that renders the
+      // reply back token for token, which a chat client that sends no
+      // reasoning back never does: kept as ordinary states, the replies of
+      // 11 such chats served in turn at a 22 GB limit left their follow-ups
+      // 1 cached prefix of 22, where 1.6.2, which kept none, left 18.
+      const std::vector<LaneCapture> &reached = captures[index];
+      if (result.capturedStates.size() > reached.size())
+        throw std::logic_error("model returned mismatched captured states");
+      if (!result.capturedStates.empty() &&
+          publishStateBoundary(active, {.tokens = reached.front().tokens, .disposable = true},
+                               result.capturedStates.front(), false, false, now))
+        cache_.markReply(active.latestCheckpoint);
     }
     const uint64_t completionTokens =
         active.exactTokens.size() - active.promptTokens;
@@ -2162,6 +2193,19 @@ void Engine::finishFailure(Request &active, LaneEnd end) {
 
 void Engine::vacateLane(Request &active, bool keepContinuation) {
   const uint64_t id = active.request.id;
+  // An ended request whose prompt rendered an earlier reply back keeps its
+  // own reply's last state (Cache::keepReply), which a reclaim then writes
+  // as any checkpoint: its conversation renders replies back, as agent
+  // clients that send reasoning back do (their follow-ups resumed after the
+  // reply 15 times of 15), so its next turn is likely to resume there too.
+  // Only a reply that saves its next turn the prefill of a point worth a
+  // write over its prompt's replay point (WriteBehind::kMinimumTokens) is
+  // kept: a shorter one recomputes faster than its state writes. Kept, the
+  // 384-token replies of 12 agent conversations at a 27 GB limit wrote 24%
+  // more to the SSD to save 2.4% of their prefill.
+  if (!keepContinuation && active.rendersReplies &&
+      active.exactTokens.size() >= promptReplayBoundary(active) + WriteBehind::kMinimumTokens)
+    cache_.keepReply(active.latestCheckpoint);
   if (passCommand_.holds(id))
     settleEnded(passCommand_.yield());
   discardPendingStateBoundaries(active);

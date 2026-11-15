@@ -323,6 +323,7 @@ CacheLookup Cache::lookup(std::span<const uint32_t> prompt,
     if (result.kvBoundary > result.resumeBoundary() && kv_.stateBelow(blocks.back()))
       result.junctionBoundary = result.kvBoundary;
   }
+  result.rendersReply = std::ranges::any_of(blocks, [&](uint64_t block) { return kv_.heldReply(block); });
   const uint64_t stateBlock = result.state ? result.state->kvBlock() : 0;
   for (auto block = blocks.rbegin(); block != blocks.rend(); ++block) {
     if (*block == stateBlock) break;

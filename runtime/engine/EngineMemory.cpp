@@ -786,6 +786,32 @@ uint32_t Engine::reserveCaptures(Request &active, const BatchItem &item,
   return end - start;
 }
 
+void Engine::reserveReplyCapture(Request &active, std::vector<StateCapture> &states,
+                                 std::vector<LaneCapture> &captures, bool supersedes) {
+  if (!model_.capturesInDecode())
+    return;
+  // A cycle retains rows from the tokens the lane holds on, a verify's at
+  // most and none past its output limit: one reserved for a page they cannot
+  // reach would hold a state's buffers, 153 MiB for 27B, for nothing.
+  const auto held = static_cast<uint32_t>(active.exactTokens.size());
+  const uint32_t page = (held / KvCache::pageTokens + 1) * KvCache::pageTokens;
+  const uint32_t output = active.outputLimit - (held - active.promptTokens);
+  if (page - held > std::min(model::ExecutionLimits::targetVerifyRows, output))
+    return;
+  std::shared_ptr<StateReservation> buffers;
+  static_cast<void>(allocate(
+      [&] {
+        metal::AllocationFailure refusal = metal::AllocationFailure::None;
+        buffers = model_.reserveState(active.request.id, page, refusal);
+        return StateBuffers{.ok = buffers != nullptr, .allocationFailure = refusal};
+      },
+      stateClaim(active, StateClass::Checkpoint, supersedes), Refusal::SettledOnce));
+  if (buffers) {
+    states.push_back({page, std::move(buffers)});
+    captures.push_back({page});
+  }
+}
+
 ClaimSpec Engine::stateClaim(const Request &active, StateClass kind, bool supersedes) const {
   ClaimSpec spec = claimFor(active, kind == StateClass::InUse ? ClaimClass::InService : ClaimClass::Optional);
   spec.supersedes = supersedes;

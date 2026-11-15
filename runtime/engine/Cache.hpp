@@ -46,6 +46,9 @@ struct CacheLookup final {
   // A matched block deeper than the state once held a reusable state that
   // is gone from both tiers.
   bool lostState = false;
+  // A matched block held a reply's state (KvCache::noteReply): the prompt
+  // renders an earlier reply back, as far as that block at least.
+  bool rendersReply = false;
 
   [[nodiscard]] uint32_t resumeBoundary() const noexcept {
     return state ? state->boundary() : 0;
@@ -795,6 +798,9 @@ public:
   [[nodiscard]] bool stateResident(uint64_t kvBlock) const noexcept;
   // False only while this exact disposable publication is pinned.
   bool retireCheckpointState(StateCheckpoint checkpoint) noexcept;
+  // A reply's state, opportunistic or kept (StateCache::markReply).
+  void markReply(StateCheckpoint checkpoint) noexcept { states_.markReply(checkpoint); }
+  void keepReply(StateCheckpoint checkpoint) noexcept { states_.keepReply(checkpoint); }
   // This exact disposable publication is pinned: retireCheckpointState
   // refuses it.
   [[nodiscard]] bool checkpointPinned(StateCheckpoint checkpoint) const noexcept {

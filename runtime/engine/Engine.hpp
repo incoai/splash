@@ -512,6 +512,12 @@ private:
     std::vector<StateBoundary> stateBoundaries;
     size_t stateBoundaryCursor = 0;
     StateCheckpoint latestCheckpoint;
+    // Its prompt rendered an earlier reply back token for token, its start's
+    // match reaching a block that reply's state was captured at
+    // (CacheLookup::rendersReply): its conversation's next prompt is likely
+    // to render its own reply back, so its end keeps that reply's last state
+    // (Cache::keepReply).
+    bool rendersReplies = false;
     // The block of the prompt's replay boundary, where the conversation's
     // next turn resumes: its state is in use from the moment the request
     // reaches, reuses or restores it until the request ends, suspended or not.
@@ -825,6 +831,15 @@ private:
   void publishReachedStateBoundaries(
       Request &request, uint32_t promptProcessed, std::span<const LaneCapture> captures,
       std::span<const std::shared_ptr<const CompositeState>> states, double nowMilliseconds);
+  // Publishes the state of a boundary the lane reached, or reuses the one
+  // cached there: `state`, captured, or without one taken from the lane
+  // (fromLane) or written from it to the disk tier; `recycled` when its
+  // buffers took room reclaimed from cache. The lane's recovery point
+  // retires as the boundary's kind has it. False when the state was
+  // refused.
+  bool publishStateBoundary(Request &request, Request::StateBoundary objective,
+                            std::shared_ptr<const CompositeState> state, bool recycled,
+                            bool fromLane, double nowMilliseconds);
   // Takes what the plan's lanes need to run it as planned, and returns
   // Runnable with its items and captures; or, when that changed what the
   // plan was made from, Replan, the lanes refused added to `excluded`, a
@@ -865,6 +880,13 @@ private:
   // only if the pin has gone by then. Null buffers when refused.
   [[nodiscard]] Reservation reserveCapture(Request &request, StateClass kind, uint32_t tokens,
                                            bool followsCheckpoint, bool supersedes);
+  // Reserves the buffers of the state a decoding lane captures in its next
+  // cycle (Model::capturesInDecode): at the next page past the tokens it
+  // holds, when the rows it may retain reach it. Its claim is a
+  // checkpoint's, in one attempt: refused, the cycle captures none, and
+  // nothing is freed for one.
+  void reserveReplyCapture(Request &request, std::vector<StateCapture> &states,
+                           std::vector<LaneCapture> &captures, bool supersedes);
   // The claim of a state's buffers of class `kind`: the prompt's replay
   // point, the state the request's next turn resumes from, is work in
   // service that may wait for memory on its way back and reaches what is in

@@ -468,8 +468,17 @@ private:
     // As the engine does, a state at a block another request published one
     // at is reused, and one is published only with a tail it restores from.
     if (const uint64_t block = cache_.blockAt(id, pages * KvCache::pageTokens);
-        chance(30) && !cache_.reuseStoredState(block) && cache_.stateTailFull(block))
-      cache_.publishCompositeState(block, std::make_shared<ShelvedState>(shelf_, false), peeks_ && chance(30));
+        chance(30) && !cache_.reuseStoredState(block) && cache_.stateTailFull(block)) {
+      const bool checkpoint = peeks_ && chance(30);
+      cache_.publishCompositeState(block, std::make_shared<ShelvedState>(shelf_, false), checkpoint);
+      // Half the checkpoints are replies' states, which a reply's decode
+      // captures, half of those kept, as its request's end keeps one.
+      if (checkpoint && chance(50)) {
+        cache_.markReply(cache_.checkpointState(block));
+        if (chance(50))
+          cache_.keepReply(cache_.checkpointState(block));
+      }
+    }
   }
 
   // The tier's transfers land, a few of them failing.

@@ -208,6 +208,11 @@ public:
   // block; lookups that find the block without one report a lost state.
   void noteState(uint64_t blockId);
   [[nodiscard]] bool hadState(uint64_t blockId) const;
+  // StateCache notes each block a reply's decode captured a state at
+  // (StateCache::markReply): a prompt that matches it renders that reply
+  // back as far as the block, with its state cached or not.
+  void noteReply(uint64_t blockId);
+  [[nodiscard]] bool heldReply(uint64_t blockId) const;
   // Whether the windowPages blocks that end at this one, its tail, hold
   // every layer's K/V, in RAM (a Full page) or, without a page, in their
   // copy (copyForm): what a state at the block needs to restore.
@@ -480,6 +485,7 @@ private:
     bool foreignCopy = false;
     bool poisoned = false;
     bool hadState = false;
+    bool heldReply = false;
     // The tails of states, each counted once, that hold the block
     // (countState).
     uint32_t windowPins = 0;

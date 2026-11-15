@@ -427,6 +427,10 @@ void KvCache::noteState(uint64_t blockId) { block(blockId).hadState = true; }
 
 bool KvCache::hadState(uint64_t blockId) const { return block(blockId).hadState; }
 
+void KvCache::noteReply(uint64_t blockId) { block(blockId).heldReply = true; }
+
+bool KvCache::heldReply(uint64_t blockId) const { return block(blockId).heldReply; }
+
 bool KvCache::tailFull(uint64_t blockId) const {
   for (uint32_t index = 0; blockId && index < windowPages_; ++index) {
     const Block &entry = block(blockId);

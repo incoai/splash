@@ -442,6 +442,22 @@ public:
         ModelStepResult step{item.requestId, 0, tokens, decodeFinishes,
                              DecodeStage::Regular, 0, 0};
         step.outputTokensWithoutKv = decodeTokensWithoutKv;
+        // A cycle seals the state it captures once the tokens it stores, all
+        // it emits but a terminal anchor, reach its boundary.
+        const uint64_t stored = item.logicalPosition + tokens.size() - decodeTokensWithoutKv;
+        if (item.stateCaptures.size() > 1)
+          throw std::logic_error("a decode cycle captures one state at most");
+        for (const StateCapture &capture : item.stateCaptures) {
+          if (!decodeStateCaptures || !capture.reservation || capture.tokens % engine::KvCache::pageTokens ||
+              capture.tokens <= item.logicalPosition ||
+              capture.tokens > item.logicalPosition + std::min(model::ExecutionLimits::targetVerifyRows,
+                                                               limit - state.generated))
+            throw std::logic_error("a decode capture lies past the rows its cycle may retain");
+          if (capture.tokens > stored)
+            continue;
+          captures.push_back({item.requestId, capture.tokens, stored});
+          step.capturedStates.push_back(seal(static_cast<Reservation &>(*capture.reservation)));
+        }
         if (speculative != speculativeCounts.end()) {
           step.draftedTokens = speculative->second.first;
           step.acceptedDraftTokens = speculative->second.second;
@@ -560,6 +576,7 @@ public:
             .indexPageLanes = 1,
             .streamsWeights = streamedExperts};
   }
+  bool capturesInDecode() const noexcept override { return decodeStateCaptures; }
   // With timing, the profile's work (TimedWork); otherwise the default.
   model::CommandWork prefillWork(std::span<const model::PrefillLane> lanes, uint32_t first,
                                  uint32_t passesLeft) const override {
@@ -819,8 +836,9 @@ public:
   // State reservations granted, and asked for.
   uint32_t reservations = 0;
   uint32_t reservationAttempts = 0;
-  // Each state a prefill step captured: its request, its boundary and the
-  // step's end, past the boundary for one inside the step.
+  // Each state a step captured: its request, its boundary and the step's
+  // end, past the boundary for one inside the step (a decode cycle's: the
+  // tokens it stores).
   struct Capture {
     uint64_t requestId = 0;
     uint32_t tokens = 0;
@@ -837,6 +855,9 @@ public:
   // With it, captured states are OffloadStates, written as the cache lets
   // them leave RAM, their copies landing when it says so.
   std::shared_ptr<OffloadControl> offloadTier;
+  // Its decode cycles capture states (Model::capturesInDecode), as every
+  // target but one with auxiliary state bytes does.
+  bool decodeStateCaptures = true;
   uint32_t deniedReservations = 0;
   std::optional<uint32_t> denyReservationAt;
   uint32_t beginAttempts = 0;

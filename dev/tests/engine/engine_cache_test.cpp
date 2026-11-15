@@ -1488,6 +1488,48 @@ void testPromotionNeverDropsAUniqueState() {
   }
 }
 
+// An opportunistic reply's state frees for nothing: of the oldest
+// checkpoint, the first claim takes its RAM copy with no write, before that
+// of a state the SSD holds. Kept, it is written as any checkpoint, after that
+// RAM copy. No claim takes the newer checkpoint or the resume point.
+void testOpportunisticReplyGoesWithoutAWrite() {
+  for (const bool kept : {false, true}) {
+    CacheFixture fixture;
+    auto control = std::make_shared<TransferControl>();
+    control->ready = true;
+    fixture.cache.publishCompositeState(fixture.blocks[2], std::make_shared<TieredState>(control), false);
+    require(test::stateStep(fixture.cache).gave() && fixture.cache.pollTransfers(), "the state was not written");
+    fixture.cache.publishCompositeState(fixture.blocks[2], std::make_shared<TieredState>(control), false);
+    publishReusable(fixture, fixture.blocks[3], std::make_shared<TieredState>(control));
+    fixture.cache.publishCompositeState(fixture.blocks[0], std::make_shared<TieredState>(control), true);
+    fixture.cache.markReply(fixture.cache.checkpointState(fixture.blocks[0]));
+    if (kept)
+      fixture.cache.keepReply(fixture.cache.checkpointState(fixture.blocks[0]));
+    fixture.cache.publishCompositeState(fixture.blocks[1], std::make_shared<TieredState>(control), true);
+    const uint64_t offloads = fixture.cache.snapshot().stateCache.offloads;
+    // A pool's growth by one state's buffers, which keeps the resume point.
+    engine::MemoryLedger ledger;
+    ledger.addSource(fixture.cache);
+    ledger.setBufferBytes([&control](uint32_t states, bool, bool) { return control->poolBytes(states); });
+    const auto grow = [&] {
+      const engine::ClaimId claim = ledger.open({.cls = ClaimClass::Growth, .timing = NeedTiming::Immediate});
+      const FreeResult freed = ledger.free(claim, {.bytes = 100}, 0, MemoryPressure::Normal);
+      ledger.close(claim);
+      return freed.outcome == FreeOutcome::Met;
+    };
+    require(grow() && fixture.cache.stateResident(fixture.blocks[0]) == kept &&
+                fixture.cache.stateResident(fixture.blocks[2]) != kept,
+            kept ? "a kept reply's state went before a state that frees for nothing"
+                 : "an opportunistic reply's state did not go first");
+    require(grow() && !fixture.cache.stateResident(fixture.blocks[0]) &&
+                !fixture.cache.stateResident(fixture.blocks[2]) && fixture.cache.stateResident(fixture.blocks[1]) &&
+                fixture.cache.stateResident(fixture.blocks[3]),
+            "the second claim did not take the other of the two alone");
+    require(fixture.cache.snapshot().stateCache.offloads - offloads == (kept ? 1U : 0U),
+            kept ? "a kept reply's state went without a write" : "an opportunistic reply's state was written");
+  }
+}
+
 // A republication over a disk-only copy gives the state a RAM copy and keeps
 // the disk copy: its next eviction from RAM costs no write.
 void testRepublicationKeepsTheDiskCopy() {
@@ -6891,6 +6933,7 @@ int main() {
     testDemotionCostsNoSecondState();
     testPromotionIdentityAndDenial();
     testPromotionNeverDropsAUniqueState();
+    testOpportunisticReplyGoesWithoutAWrite();
     testRepublicationKeepsTheDiskCopy();
     testLostStatesAreCounted();
     testDiskReplacementSpansStatesAndKv();

@@ -689,6 +689,44 @@ void testReplayPointsAreWrittenBehind() {
   }
 }
 
+// A turn whose reply's state is kept still leaves its prompt's replay point to the persistent
+// tier: a next prompt that does not render the reply back (a reasoning model's template drops the
+// reply's reasoning) resumes there after a restart. The tier copies both points or the replay
+// point alone; it skips none as superseded.
+void testReplyStateLeavesTheReplayPointWrittenBehind() {
+  test::TestKvStorage storage{1024, 4096, 4};
+  KvPool pool{storage, 0};
+  test::TestKvTier tier(true);
+  tier.transferLimit = 64;
+  tier.capacity = 512;
+  engine::Cache cache(pool, &tier, test::ampleDiskBudget());
+  Executor executor;
+  executor.keptTier = std::make_shared<OffloadControl>();
+  executor.keptTier->ready = true;
+  executor.decodeFinishes = false;
+  Events events;
+  EngineConfig config = test::engineConfig({.maxContext = 102400});
+  engine::Engine engine(config, cache, executor, events);
+  guardReleases(storage, engine);
+  // A 2060-token prompt whose replay point is at 2048 and a 100-token
+  // reply, whose last whole page ends at 2144.
+  EngineRequest turn = request(1, std::vector<uint32_t>(2060, 7));
+  turn.generationPromptTokens = 7;
+  turn.maxNewTokens = 100;
+  engine.submit(std::move(turn));
+  double now = 1;
+  tickUntil(engine, now, [&] { return idle(engine); }, "the turn did not finish");
+  now += 2 * WriteBehind::kDelayMilliseconds;
+  for (uint32_t step = 0; step < 64 && engine.snapshot().writeBehind.waiting; ++step) {
+    tier.complete();
+    static_cast<void>(engine.tick(++now));
+  }
+  const WriteBehindSnapshot behind = engine.snapshot().writeBehind;
+  require(!behind.waiting && behind.durable >= 1, "the turn's points were not written behind");
+  require(behind.unneeded == 0, "the persistent tier skipped the prompt's replay point as superseded by the "
+                                "reply's state");
+}
+
 // A temporary tier copies a point once its request ends, a persistent one while it runs; once
 // copied, a reclaim frees the conversation at once, writing nothing.
 void testFinishedConversationsLeaveAtOnce() {
@@ -2272,6 +2310,7 @@ std::span<const test::TestCase> diskTests() {
       {"testPageShortfallDemotesInBulk", testPageShortfallDemotesInBulk},
       {"testWaitingLaneAlwaysNamesAWakeup", testWaitingLaneAlwaysNamesAWakeup},
       {"testReplayPointsAreWrittenBehind", testReplayPointsAreWrittenBehind},
+      {"testReplyStateLeavesTheReplayPointWrittenBehind", testReplyStateLeavesTheReplayPointWrittenBehind},
       {"testFinishedConversationsLeaveAtOnce", testFinishedConversationsLeaveAtOnce},
       {"testCopiesAheadWaitForALaneRefusedBesideOthers", testCopiesAheadWaitForALaneRefusedBesideOthers},
       {"testCopiesAheadWaitNoLongerThanTheWaitsLimit", testCopiesAheadWaitNoLongerThanTheWaitsLimit},
