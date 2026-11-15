@@ -1205,9 +1205,9 @@ void producerTableContract(metal::MetalBackend &backend) {
     buffers.convolutionWeights = allocate(backend, shape.convolutionDimension * 4 * 2);
     buffers.currentStates = states;
     buffers.nextStates = states;
-    const std::array<GdnTapeLane, kLanes> tapes{GdnTapeLane{0, gdnTapeLayerBytes(shape), 0}};
+    const std::array<GdnDecodeBlock, kLanes> blocks{GdnDecodeBlock{0, kRows, {0, gdnTapeLayerBytes(shape), 0}}};
     buffers.tape = allocate(backend, 2 * gdnTapeLayerBytes(shape));
-    buffers.tapeLanes = tapes;
+    buffers.blocks = blocks;
     buffers.decayWeights = allocate(backend, shape.valueHeads * 4);
     buffers.timeBias = allocate(backend, shape.valueHeads * 2);
     buffers.mixerNorm = {allocate(backend, shape.headDimension * 2)};
@@ -1216,12 +1216,11 @@ void producerTableContract(metal::MetalBackend &backend) {
     metal::CommandGraph graph;
     rejects(
         [&] {
-          (void)GDN::addDecode(graph, buffers, shape, kLanes, 0, strides, GdnHeadOrder::Grouped,
-                               LinearInput::Table16);
+          (void)GDN::addDecode(graph, buffers, shape, 0, strides, GdnHeadOrder::Grouped, LinearInput::Table16);
         },
         "linear table buffer holds", "the GDN decode wrote a table without scratch");
     require(graph.empty() &&
-                GDN::addDecode(graph, buffers, shape, kLanes, 0, strides, GdnHeadOrder::Grouped, LinearInput::Plain)
+                GDN::addDecode(graph, buffers, shape, 0, strides, GdnHeadOrder::Grouped, LinearInput::Plain)
                         .layout == LinearInput::Plain &&
                 plainKernel(graph, "verify_gdn_fused_vh32"),
             "the GDN decode's table contract");

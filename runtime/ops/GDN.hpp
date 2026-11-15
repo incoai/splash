@@ -116,18 +116,28 @@ struct GdnTapeLane final {
 
 [[nodiscard]] uint64_t gdnTapeLayerBytes(const GdnShape &shape) noexcept;
 
+// A lane's block of a decode step's rows: `rows` rows, 1 to
+// SPLASH_TARGET_VERIFY_ROWS, from row firstRow of the step's packed, hidden
+// and table rows on, and the lane's tape, whose first rows they are.
+struct GdnDecodeBlock final {
+  uint32_t firstRow = 0;
+  uint32_t rows = 0;
+  GdnTapeLane tape;
+};
+
 struct GdnDecodeBuffers final {
   metal::MetalBuffer packed;
   metal::MetalBuffer convolutionWeights;
   std::span<const metal::MetalBuffer> currentStates;
   std::span<const metal::MetalBuffer> nextStates;
   metal::MetalBuffer tape;
-  std::span<const GdnTapeLane> tapeLanes;
+  // Each lane's block, ascending in the step's rows, which do not overlap.
+  std::span<const GdnDecodeBlock> blocks;
   metal::MetalBuffer decayWeights;
   metal::MetalBuffer timeBias;
   NormWeights mixerNorm;
   metal::MetalBuffer hidden;
-  // Each lane's verify rows (ops::DraftSelector::addVerifyRows): the step's
+  // Each lane's verify rows (ops::DraftSelector::addVerifyRows): its block's
   // rows past them get zero recurrent output.
   metal::MetalBuffer verifyRows;
   LinearScratch linearScratch{};
@@ -157,11 +167,12 @@ public:
                          GdnPrefillBuffers buffers, GdnShape shape, uint32_t tokens,
                          GdnStateFormat state, GdnHeadOrder order,
                          std::span<const GdnPrefillCapture> captures = {});
+  // The step of buffers.blocks' lanes, 1 to SPLASH_MAXIMUM_BATCH_WIDTH.
   // Also writes the out-projection's `input` table into
-  // buffers.linearScratch when it is not Plain, and throws when the scratch
-  // cannot hold it.
+  // buffers.linearScratch when it is not Plain, the table rows of the blocks'
+  // rows, and throws when the scratch cannot hold it.
   static PreparedInput addDecode(metal::CommandGraph &graph, GdnDecodeBuffers buffers,
-                                 GdnShape shape, uint32_t lanes, uint32_t layer,
+                                 GdnShape shape, uint32_t layer,
                                  GdnStateStrides state,
                                  GdnHeadOrder order,
                                  LinearInput input);

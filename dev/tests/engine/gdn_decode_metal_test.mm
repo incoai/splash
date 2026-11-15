@@ -16,6 +16,8 @@
 // rows past its verify rows change only those rows' outputs, which are zero.
 // A fold of a step's first rows alone stores the state the lane's next step
 // holds when it retained those or more, bit for bit.
+// Lanes whose blocks of a step's rows hold fewer rows than a lane's eight, at
+// any first row, leave what each block run alone leaves.
 #include "TestBuffers.hpp"
 #include "TestChecks.hpp"
 #include "TestFamilies.hpp"
@@ -129,10 +131,11 @@ struct Cell final {
   }
 };
 
-// The mixer norm is bf16, or F32 as a GGUF stores it. Lane l's tape slots
-// are slot(l, 0) and slot(l, 1): a step reads the rows the lane retained from
-// one and leaves its own in the other, and advance() swaps them, with the
-// cells, for the lane's next step.
+// The mixer norm is bf16, or F32 as a GGUF stores it. Lane l's block is rows
+// [8 l, 8 l + 8) of the step, and its tape slots are slot(l, 0) and slot(l,
+// 1): a step reads the rows the lane retained from one and leaves its own in
+// the other, and advance() swaps them, with the cells, for the lane's next
+// step.
 struct Fixture final {
   const GdnShape &shape;
   Cell cell;
@@ -144,7 +147,7 @@ struct Fixture final {
   MetalBuffer verifyRows;
   NormWeights mixerNorm;
   std::array<MetalBuffer, kMaxLanes> current, next;
-  std::array<GdnTapeLane, kMaxLanes> tapeLanes{};
+  std::array<GdnDecodeBlock, kMaxLanes> blocks{};
   std::vector<MetalBuffer> packedLayer;
 
   Fixture(MetalBackend &backend, const GdnShape &geometry, uint32_t laneCount,
@@ -177,7 +180,7 @@ struct Fixture final {
     mixerNorm = makeNormWeights(backend, kHeadDim, float32,
                                 [&](uint32_t) { return random.unit(); });
     for (uint32_t lane = 0; lane < kMaxLanes; ++lane) {
-      tapeLanes[lane] = {slot(lane, 0), slot(lane, 1), 0};
+      blocks[lane] = {lane * kRows, kRows, {slot(lane, 0), slot(lane, 1), 0}};
       current[lane] = alloc(cell.bytes, "gdn current");
       next[lane] = alloc(cell.bytes, "gdn next");
       auto *bytes = static_cast<uint8_t *>(current[lane].contents());
@@ -218,11 +221,11 @@ struct Fixture final {
   void advance(std::span<const uint32_t> pending) {
     std::swap(current, next);
     for (uint32_t lane = 0; lane < kMaxLanes; ++lane)
-      tapeLanes[lane] = {tapeLanes[lane].stepSlot, tapeLanes[lane].pendingSlot, pending[lane]};
+      blocks[lane].tape = {blocks[lane].tape.stepSlot, blocks[lane].tape.pendingSlot, pending[lane]};
   }
 
   GdnDecodeBuffers decodeBuffers(uint32_t layer) const {
-    return {packedLayer[layer], convWeights, current, next, tape, tapeLanes,
+    return {packedLayer[layer], convWeights, current, next, tape, std::span(blocks).first(lanes),
             decayWeights, timeBias, mixerNorm, hidden, verifyRows};
   }
 
@@ -349,7 +352,7 @@ void checkTapeRows(const Fixture &fixture, const StepInputs &step, uint32_t laye
                    const std::string &where) {
   const GdnShape &shape = fixture.shape;
   const uint32_t keyWidth = shape.keyHeads * kHeadDim;
-  const uint64_t slot = fixture.tapeLanes[lane].stepSlot;
+  const uint64_t slot = fixture.blocks[lane].tape.stepSlot;
   for (uint32_t token = 0; token < kRows; ++token) {
     require(!std::memcmp(fixture.tapeInputs(slot, layer, token), step.packed.data() + token * shape.packedWidth,
                          uint64_t{shape.convolutionDimension} * 2),
@@ -374,7 +377,7 @@ void checkGates(const Fixture &fixture, const StepInputs &step, uint32_t layer, 
   const uint32_t bOffset = shape.convolutionDimension +
                            shape.valueHeads * kHeadDim;
   const uint32_t aOffset = bOffset + shape.valueHeads;
-  const uint64_t slot = fixture.tapeLanes[lane].stepSlot;
+  const uint64_t slot = fixture.blocks[lane].tape.stepSlot;
   const auto *decayWeights =
       static_cast<const float *>(fixture.decayWeights.contents());
   const auto *timeBias =
@@ -504,7 +507,7 @@ void checkStep(const Fixture &fixture, const StepInputs &step, uint32_t layer, u
   uint64_t inexact = 0;
   std::vector<double> rows, magnitudes;
   for (uint32_t head = 0; head < shape.valueHeads; ++head) {
-    static_cast<void>(recurrence(fixture, committed, fixture.tapeLanes[lane].stepSlot, layer, head, kRows, &step,
+    static_cast<void>(recurrence(fixture, committed, fixture.blocks[lane].tape.stepSlot, layer, head, kRows, &step,
                                  &rows, &magnitudes));
     for (uint32_t token = 0; token < kRows; ++token) {
       const uint16_t *packed = step.packed.data() + token * shape.packedWidth;
@@ -558,8 +561,8 @@ void requireUntouched(const Fixture &fixture, uint32_t lane,
 
 void encodeDecode(const Fixture &fixture, CommandGraph &graph, const std::string &where) {
   for (uint32_t layer = 0; layer < kLayers; ++layer)
-    require(GDN::addDecode(graph, fixture.decodeBuffers(layer), fixture.shape, fixture.lanes, layer,
-                           fixture.cell.strides(), GdnHeadOrder::Grouped, LinearInput::Plain)
+    require(GDN::addDecode(graph, fixture.decodeBuffers(layer), fixture.shape, layer, fixture.cell.strides(),
+                           GdnHeadOrder::Grouped, LinearInput::Plain)
                     .layout == LinearInput::Plain,
             where + ": plain GDN claimed a table");
 }
@@ -598,7 +601,7 @@ void runDecode(MetalBackend &backend, const GdnShape &shape, uint32_t lanes,
     for (uint32_t lane = 0; lane < kMaxLanes; ++lane)
       retained[lane] = 1 + (base + lane - 1) % kRows;
     for (uint32_t lane = 0; lane < kMaxLanes; ++lane)
-      fixture.tapeLanes[lane].pendingRows = retained[lane];
+      fixture.blocks[lane].tape.pendingRows = retained[lane];
     fixture.clear();
     CommandGraph second;
     encodeDecode(fixture, second, where);
@@ -619,7 +622,7 @@ void runDecode(MetalBackend &backend, const GdnShape &shape, uint32_t lanes,
         const float *state = fixture.cell.recurrent(fixture.cellBytes(fixture.current[lane]), layer);
         for (uint32_t head : heads)
           checkState(fixture, layer, lane, head,
-                     recurrence(fixture, state, fixture.tapeLanes[lane].pendingSlot, layer, head, retained[lane],
+                     recurrence(fixture, state, fixture.blocks[lane].tape.pendingSlot, layer, head, retained[lane],
                                 nullptr, nullptr),
                      stepWhere);
         checkStep(fixture, laterStep(fixture, firstSteps[layer][lane], retained[lane], layer, lane), layer, lane,
@@ -693,12 +696,12 @@ void replayAcrossBatches(MetalBackend &backend, const GdnShape &shape, bool floa
     individual.fillPacked();
     std::array<uint32_t, kMaxLanes> storage{};
     std::array<MetalBuffer, kMaxLanes> current, next;
-    std::array<GdnTapeLane, kMaxLanes> tapes{};
+    std::array<GdnDecodeBlock, kMaxLanes> blocks{};
     for (uint32_t lane = 0; lane < lanes; ++lane) {
       const uint32_t stateLane = storage[lane] = (lane + cycle) % kMaxLanes;
       current[lane] = batched.current[stateLane];
       next[lane] = batched.next[stateLane];
-      tapes[lane] = batched.tapeLanes[stateLane];
+      blocks[lane] = {lane * kRows, kRows, batched.blocks[stateLane].tape};
       for (uint32_t layer = 0; layer < kLayers; ++layer)
         std::memcpy(static_cast<uint16_t *>(batched.packedLayer[layer].contents()) + lane * batched.packedStride,
                     individual.packedRow(layer, stateLane, 0), batched.packedStride * 2);
@@ -716,24 +719,24 @@ void replayAcrossBatches(MetalBackend &backend, const GdnShape &shape, bool floa
       auto buffers = batched.decodeBuffers(layer);
       buffers.currentStates = current;
       buffers.nextStates = next;
-      buffers.tapeLanes = std::span(tapes).first(lanes);
+      buffers.blocks = std::span(blocks).first(lanes);
       if (tables)
         buffers.linearScratch = tables->scratch();
-      prepared = GDN::addDecode(batchGraph, buffers, shape, lanes, layer, batched.cell.strides(), order, layout);
+      prepared = GDN::addDecode(batchGraph, buffers, shape, layer, batched.cell.strides(), order, layout);
       for (uint32_t lane = 0; lane < lanes; ++lane) {
         const uint32_t stateLane = storage[lane];
         auto single = individual.decodeBuffers(layer);
         std::array<MetalBuffer, kMaxLanes> singleCurrent, singleNext;
         singleCurrent.fill(individual.current[stateLane]);
         singleNext.fill(individual.next[stateLane]);
-        const std::array singleTape{individual.tapeLanes[stateLane]};
+        const std::array singleBlock{GdnDecodeBlock{0, kRows, individual.blocks[stateLane].tape}};
         single.packed = backend.view(individual.packedLayer[layer], stateLane * individual.packedStride * 2,
                                      individual.packedStride * 2);
         single.hidden = backend.view(individual.hidden, stateLane * hiddenBytes, hiddenBytes);
         single.currentStates = singleCurrent;
         single.nextStates = singleNext;
-        single.tapeLanes = singleTape;
-        (void)GDN::addDecode(individualGraph, single, shape, 1, layer, individual.cell.strides(), order,
+        single.blocks = singleBlock;
+        (void)GDN::addDecode(individualGraph, single, shape, layer, individual.cell.strides(), order,
                              LinearInput::Plain);
       }
     }
@@ -758,7 +761,7 @@ void replayAcrossBatches(MetalBackend &backend, const GdnShape &shape, bool floa
               where + ": hidden rows changed with batching");
       const uint32_t retained = 1 + (cycle + stateLane) % kRows;
       for (uint32_t layer = 0; layer < kLayers; ++layer) {
-        const uint64_t slot = batched.tapeLanes[stateLane].stepSlot;
+        const uint64_t slot = batched.blocks[stateLane].tape.stepSlot;
         require(!std::memcmp(batched.tapeLayer(slot, layer), individual.tapeLayer(slot, layer), batched.tapeBytes),
                 where + ": step tape changed with batching");
         auto *tape = static_cast<uint8_t *>(batched.tape.contents()) + slot + layer * batched.tapeBytes;
@@ -773,7 +776,7 @@ void replayAcrossBatches(MetalBackend &backend, const GdnShape &shape, bool floa
       }
       for (Fixture *fixture : {&batched, &individual}) {
         std::swap(fixture->current[stateLane], fixture->next[stateLane]);
-        auto &tape = fixture->tapeLanes[stateLane];
+        auto &tape = fixture->blocks[stateLane].tape;
         std::swap(tape.pendingSlot, tape.stepSlot);
         tape.pendingRows = retained;
       }
@@ -791,11 +794,11 @@ void fusedPreparation(MetalBackend &backend, const GdnShape &shape, uint32_t lan
   // encodes anything.
   rejects(
       [&] {
-        GDN::addDecode(reference, fixture.decodeBuffers(0), shape, lanes, 0, fixture.cell.strides(),
+        GDN::addDecode(reference, fixture.decodeBuffers(0), shape, 0, fixture.cell.strides(),
                        GdnHeadOrder::Grouped, layout);
       },
       "linear table buffer holds", what + " wrote a table without scratch");
-  require(GDN::addDecode(reference, fixture.decodeBuffers(0), shape, lanes, 0, fixture.cell.strides(),
+  require(GDN::addDecode(reference, fixture.decodeBuffers(0), shape, 0, fixture.cell.strides(),
                          GdnHeadOrder::Grouped, LinearInput::Plain)
                   .layout == LinearInput::Plain,
           what + " plain kernel claimed a table");
@@ -809,12 +812,12 @@ void fusedPreparation(MetalBackend &backend, const GdnShape &shape, uint32_t lan
   buffers.linearScratch = tables.scratch();
   // A plain consumer gets no table from the scratch it shares.
   CommandGraph unprepared;
-  require(GDN::addDecode(unprepared, buffers, shape, lanes, 0, fixture.cell.strides(),
+  require(GDN::addDecode(unprepared, buffers, shape, 0, fixture.cell.strides(),
                          GdnHeadOrder::Grouped, LinearInput::Plain).layout == LinearInput::Plain,
           what + " claimed a table for a plain consumer");
   CommandGraph fused;
   const PreparedInput prepared =
-      GDN::addDecode(fused, buffers, shape, lanes, 0, fixture.cell.strides(), GdnHeadOrder::Grouped, layout);
+      GDN::addDecode(fused, buffers, shape, 0, fixture.cell.strides(), GdnHeadOrder::Grouped, layout);
   (void)backend.submitCommandAsync(fused.dispatches()).wait();
   require(!std::memcmp(expected.data(), fixture.hidden.contents(), expected.size()),
           what + " changed output");
@@ -834,7 +837,7 @@ void tiledHeadOrder(MetalBackend &backend, const GdnShape &shape, uint32_t lanes
   const uint64_t headBytes = uint64_t{shape.headDimension} * 2;
   const std::string what = caseName("tiled GDN", shape, lanes, layout);
   CommandGraph grouped;
-  require(GDN::addDecode(grouped, fixture.decodeBuffers(0), shape, lanes, 0, fixture.cell.strides(),
+  require(GDN::addDecode(grouped, fixture.decodeBuffers(0), shape, 0, fixture.cell.strides(),
                          GdnHeadOrder::Grouped, LinearInput::Plain)
                   .layout == LinearInput::Plain,
           what + " grouped reference claimed a table");
@@ -850,7 +853,7 @@ void tiledHeadOrder(MetalBackend &backend, const GdnShape &shape, uint32_t lanes
   fixture.clear();
   CommandGraph tiled;
   if (layout == LinearInput::Plain) {
-    require(GDN::addDecode(tiled, fixture.decodeBuffers(0), shape, lanes, 0, fixture.cell.strides(),
+    require(GDN::addDecode(tiled, fixture.decodeBuffers(0), shape, 0, fixture.cell.strides(),
                            GdnHeadOrder::Tiled, LinearInput::Plain).layout == LinearInput::Plain,
             what + " claimed a table");
     (void)backend.submitCommandAsync(tiled.dispatches()).wait();
@@ -859,7 +862,7 @@ void tiledHeadOrder(MetalBackend &backend, const GdnShape &shape, uint32_t lanes
     auto buffers = fixture.decodeBuffers(0);
     buffers.linearScratch = tables.scratch();
     const PreparedInput prepared =
-        GDN::addDecode(tiled, buffers, shape, lanes, 0, fixture.cell.strides(), GdnHeadOrder::Tiled, layout);
+        GDN::addDecode(tiled, buffers, shape, 0, fixture.cell.strides(), GdnHeadOrder::Tiled, layout);
     tables.addReference(tiled, fixture.hidden);
     (void)backend.submitCommandAsync(tiled.dispatches()).wait();
     tables.requireWritten(prepared, fixture.hidden, what);
@@ -884,7 +887,7 @@ void bufferExtents(MetalBackend &backend, const GdnShape &shape, LinearInput lay
   decode.linearScratch = tables.scratch();
   const GdnStateStrides production = fixture.cell.strides();
   const auto encodeDecode = [&](CommandGraph &graph, const GdnDecodeBuffers &buffers, GdnStateStrides strides) {
-    (void)GDN::addDecode(graph, buffers, shape, lanes, layer, strides, GdnHeadOrder::Grouped, layout);
+    (void)GDN::addDecode(graph, buffers, shape, layer, strides, GdnHeadOrder::Grouped, layout);
   };
   const uint64_t rows = uint64_t{lanes} * kRows;
   for (const auto &[member, bytes, element, what] :
@@ -1000,7 +1003,7 @@ void gateMatchesPrefill(MetalBackend &backend, const GdnShape &shape, bool float
   }
 
   CommandGraph decode;
-  require(GDN::addDecode(decode, fixture.decodeBuffers(0), shape, kMaxLanes, 0, fixture.cell.strides(), order,
+  require(GDN::addDecode(decode, fixture.decodeBuffers(0), shape, 0, fixture.cell.strides(), order,
                          LinearInput::Plain)
                   .layout == LinearInput::Plain,
           what + ": plain GDN claimed a table");
@@ -1046,7 +1049,7 @@ void gateMatchesPrefill(MetalBackend &backend, const GdnShape &shape, bool float
     const auto *prefillDecay = static_cast<const float *>(prefill.decay.contents());
     for (uint32_t token = 0; token < kRows; ++token)
       for (uint32_t head = 0; head < shape.valueHeads; ++head)
-        require(fixture.tapeDecay(fixture.tapeLanes[lane].stepSlot, 0, token)[head] == 1.0F &&
+        require(fixture.tapeDecay(fixture.blocks[lane].tape.stepSlot, 0, token)[head] == 1.0F &&
                     prefillDecay[token * shape.valueHeads + head] == 1.0F,
                 where + ": a decay is not one");
     require(!std::memcmp(fixture.cell.recurrent(fixture.cellBytes(fixture.next[lane]), 0), state, stateBytes),
@@ -1116,7 +1119,7 @@ StepsRun runSteps(MetalBackend &backend, const GdnShape &shape, uint32_t lanes, 
       buffers.currentStates = current;
       buffers.nextStates = next;
       if (tables) buffers.linearScratch = tables->scratch();
-      prepared = GDN::addDecode(graph, buffers, shape, lanes, layer, cell.strides(), order, layout);
+      prepared = GDN::addDecode(graph, buffers, shape, layer, cell.strides(), order, layout);
     }
     if (tables) tables->addReference(graph, fixture.hidden);
     (void)backend.submitCommandAsync(graph.dispatches()).wait();
@@ -1166,32 +1169,166 @@ void partialVerifyRows(MetalBackend &backend, const GdnShape &shape, uint32_t la
     }
 }
 
+// Lanes 0, 1 and 2 take blocks of 8, 5 and 3 rows at rows 0, 8 and 13 of a
+// step's 16 rows, the last two in one table tile; they verify 7, 5 and 2 of
+// them, and their next steps fold 5, 3 and 2. Over two steps of every layer
+// from the same inputs, the packed step leaves each lane's state cells, tape
+// and hidden rows as its block run alone does (a one-lane step of its rows
+// from row 0, in buffers of its own), byte for byte, and the out-projection
+// table the reference preparation of those hidden rows; a lane's tape rows
+// past its block's rows, poisoned, and the hidden rows past the last block's
+// stay as they were.
+void raggedBlocks(MetalBackend &backend, const GdnShape &shape, bool float32, GdnHeadOrder order, LinearInput layout,
+                  GdnStateFormat format) {
+  constexpr uint32_t kBlocks = 3, kStepRows = 16;
+  constexpr std::array<uint32_t, kBlocks> kFirst{0, 8, 13}, kBlockRows{8, 5, 3}, kVerify{7, 5, 2};
+  constexpr std::array<uint32_t, kMaxLanes> kRetained{5, 3, 2, 0};
+  const std::string what = caseName("ragged blocks", shape, kBlocks, layout) + (float32 ? " f32 norm" : " bf16 norm") +
+                           (order == GdnHeadOrder::Tiled ? " tiled" : " grouped") + " " +
+                           std::string(formatName(format));
+  const uint32_t width = shape.valueHeads * shape.headDimension;
+  const uint64_t hiddenRowBytes = uint64_t{width} * 2, packedRowBytes = uint64_t{shape.packedWidth} * 2;
+  const Cell cell(shape, format);
+  Fixture packed(backend, shape, kBlocks, float32), alone(backend, shape, kBlocks, float32);
+  for (Fixture *fixture : {&packed, &alone}) {
+    if (format == GdnStateFormat::BFloat16) {
+      // The fixture's fp32 states rounded to bf16, in the cells' bf16 layout.
+      const uint64_t elements = uint64_t{shape.valueHeads} * shape.headDimension * shape.headDimension;
+      for (const MetalBuffer &buffer : fixture->current) {
+        auto *bytes = static_cast<uint8_t *>(buffer.contents());
+        const std::vector<uint8_t> wide(bytes, bytes + fixture->cell.bytes);
+        for (uint32_t layer = 0; layer < kLayers; ++layer) {
+          const float *values = fixture->cell.recurrent(wide.data(), layer);
+          auto *rounded = reinterpret_cast<uint16_t *>(bytes + cell.convBytes + layer * cell.recurrentLayerBytes);
+          for (uint64_t index = 0; index < elements; ++index) rounded[index] = floatToBf16(values[index]);
+        }
+      }
+    }
+    std::memset(fixture->tape.contents(), 0xFF, fixture->tape.sizeBytes());
+    std::memcpy(fixture->verifyRows.contents(), kVerify.data(), sizeof(kVerify));
+  }
+  for (uint32_t lane = 0; lane < kBlocks; ++lane) {
+    packed.blocks[lane].firstRow = kFirst[lane];
+    packed.blocks[lane].rows = kBlockRows[lane];
+  }
+  const auto view = [&](const MetalBuffer &buffer, uint64_t offset, uint64_t bytes) {
+    return backend.view(buffer, offset, bytes);
+  };
+  for (uint32_t step = 0; step < 2; ++step) {
+    const std::string where = what + " step " + std::to_string(step);
+    if (step)
+      for (Fixture *fixture : {&packed, &alone}) {
+        fixture->advance(kRetained);
+        fixture->fillPacked();
+        fixture->clear();
+      }
+    // Each lane's rows of the packed step are its rows of `alone`.
+    for (uint32_t layer = 0; layer < kLayers; ++layer)
+      for (uint32_t lane = 0; lane < kBlocks; ++lane)
+        std::memcpy(static_cast<uint8_t *>(packed.packedLayer[layer].contents()) + kFirst[lane] * packedRowBytes,
+                    alone.packedRow(layer, lane, 0), kBlockRows[lane] * packedRowBytes);
+    std::optional<PreparedTables> tables;
+    std::vector<PreparedTables> laneTables;
+    if (layout != LinearInput::Plain) {
+      tables.emplace(backend, layout, width, kStepRows / kRows);
+      for (uint32_t lane = 0; lane < kBlocks; ++lane) laneTables.emplace_back(backend, layout, width, 1);
+    }
+    CommandGraph packedGraph, aloneGraph;
+    PreparedInput prepared;
+    for (uint32_t layer = 0; layer < kLayers; ++layer) {
+      GdnDecodeBuffers buffers = packed.decodeBuffers(layer);
+      if (tables) buffers.linearScratch = tables->scratch();
+      prepared = GDN::addDecode(packedGraph, buffers, shape, layer, cell.strides(), order, layout);
+      for (uint32_t lane = 0; lane < kBlocks; ++lane) {
+        GdnDecodeBuffers single = alone.decodeBuffers(layer);
+        std::array<MetalBuffer, kMaxLanes> current, next;
+        current.fill(alone.current[lane]);
+        next.fill(alone.next[lane]);
+        const std::array block{GdnDecodeBlock{0, kBlockRows[lane], alone.blocks[lane].tape}};
+        single.packed = view(alone.packedLayer[layer], lane * alone.packedStride * 2, alone.packedStride * 2);
+        single.currentStates = current;
+        single.nextStates = next;
+        single.blocks = block;
+        single.hidden = view(alone.hidden, lane * kRows * hiddenRowBytes, kRows * hiddenRowBytes);
+        single.verifyRows = view(alone.verifyRows, lane * sizeof(uint32_t), sizeof(uint32_t));
+        if (tables) single.linearScratch = laneTables[lane].scratch();
+        (void)GDN::addDecode(aloneGraph, single, shape, layer, cell.strides(), order, layout);
+      }
+    }
+    if (tables) tables->addReference(packedGraph, packed.hidden);
+    (void)backend.submitCommandAsync(packedGraph.dispatches()).wait();
+    (void)backend.submitCommandAsync(aloneGraph.dispatches()).wait();
+    if (tables)
+      tables->requireWritten(prepared, packed.hidden, where);
+    else
+      require(prepared.layout == LinearInput::Plain, where + ": plain GDN claimed a table");
+    for (uint32_t lane = 0; lane < kBlocks; ++lane) {
+      const std::string label = where + " lane " + std::to_string(lane);
+      require(!std::memcmp(packed.next[lane].contents(), alone.next[lane].contents(), cell.bytes),
+              label + ": state cell differs from the block's alone");
+      require(!std::memcmp(packed.hiddenRow(0, kFirst[lane], 0), alone.hiddenRow(lane, 0, 0),
+                           kBlockRows[lane] * hiddenRowBytes),
+              label + ": hidden rows differ from the block's alone");
+      // Each field of the step's tape past the block's rows.
+      const uint64_t slot = packed.blocks[lane].tape.stepSlot;
+      for (uint32_t layer = 0; layer < kLayers; ++layer)
+        for (const auto &[first, rowBytes] :
+             {std::pair{reinterpret_cast<const uint8_t *>(packed.tapeInputs(slot, layer, kBlockRows[lane])),
+                        uint64_t{shape.convolutionDimension} * 2},
+              std::pair{reinterpret_cast<const uint8_t *>(packed.tapeKv(slot, layer, kBlockRows[lane])),
+                        packed.kvWidth * 2},
+              std::pair{reinterpret_cast<const uint8_t *>(packed.tapeDecay(slot, layer, kBlockRows[lane])),
+                        uint64_t{shape.valueHeads} * 4},
+              std::pair{reinterpret_cast<const uint8_t *>(packed.tapeBeta(slot, layer, kBlockRows[lane])),
+                        uint64_t{shape.valueHeads} * 2}})
+          require(std::all_of(first, first + (kRows - kBlockRows[lane]) * rowBytes,
+                              [](uint8_t byte) { return byte == 0xFF; }),
+                  label + ": a tape row past the block's rows was written");
+    }
+    require(!std::memcmp(packed.tape.contents(), alone.tape.contents(), packed.tape.sizeBytes()),
+            where + ": tapes differ from the blocks' alone");
+    const auto *rest = static_cast<const uint8_t *>(packed.hidden.contents()) + kStepRows * hiddenRowBytes;
+    require(std::all_of(rest, rest + (kMaxLanes * kRows - kStepRows) * hiddenRowBytes,
+                        [](uint8_t byte) { return byte == 0; }),
+            where + ": a hidden row past the last block's was written");
+  }
+}
+
 void rejectsInvalid(MetalBackend &backend) {
   const GdnShape &shape = kShapes.front();
   Fixture fixture(backend, shape, 1);
   CommandGraph graph;
-  for (const uint32_t lanes : {0U, kMaxLanes + 1})
-    rejects(
-        [&] {
-          GDN::addDecode(graph, fixture.decodeBuffers(0), shape, lanes, 0,
-                         fixture.cell.strides(), GdnHeadOrder::Grouped, LinearInput::Plain);
-        },
-        "invalid GDN decode geometry", "a GDN decode of no lanes or more than a batch was accepted");
+  const auto encode = [&](const GdnDecodeBuffers &buffers, uint32_t layer = 0) {
+    GDN::addDecode(graph, buffers, shape, layer, fixture.cell.strides(), GdnHeadOrder::Grouped, LinearInput::Plain);
+  };
+  const auto withBlocks = [&](std::span<const GdnDecodeBlock> blocks) {
+    GdnDecodeBuffers buffers = fixture.decodeBuffers(0);
+    buffers.blocks = blocks;
+    encode(buffers);
+  };
+  const std::array<GdnDecodeBlock, kMaxLanes + 1> wide{};
+  for (const size_t lanes : {size_t{0}, wide.size()})
+    rejects([&] { withBlocks(std::span(wide).first(lanes)); }, "invalid GDN decode geometry",
+            "a GDN decode of no lanes or more than a batch was accepted");
   rejects(
       [&] {
-        GDN::addDecode(graph, fixture.decodeBuffers(0),
-                       GdnShape{16, 40, 128, 9216, 14400}, 1, 0,
+        GDN::addDecode(graph, fixture.decodeBuffers(0), GdnShape{16, 40, 128, 9216, 14400}, 0,
                        fixture.cell.strides(), GdnHeadOrder::Grouped, LinearInput::Plain);
       },
       "invalid GDN shape", "an inconsistent GDN shape was accepted");
-  rejects(
-      [&] {
-        auto buffers = fixture.decodeBuffers(0);
-        buffers.tapeLanes = {};
-        GDN::addDecode(graph, buffers, shape, 1, 0, fixture.cell.strides(), GdnHeadOrder::Grouped,
-                       LinearInput::Plain);
-      },
-      "invalid GDN decode geometry", "a GDN decode without a lane's tape was accepted");
+  // A block of no rows or of more than a simdgroup each, one before the
+  // block before it or overlapping it, and one whose rows end past the last
+  // row.
+  const GdnTapeLane first = fixture.blocks[0].tape, second = fixture.blocks[1].tape;
+  for (const std::array<GdnDecodeBlock, 2> blocks :
+       {std::array{GdnDecodeBlock{0, 0, first}, GdnDecodeBlock{8, kRows, second}},
+        std::array{GdnDecodeBlock{0, kRows + 1, first}, GdnDecodeBlock{9, kRows, second}},
+        std::array{GdnDecodeBlock{8, kRows, first}, GdnDecodeBlock{0, kRows, second}},
+        std::array{GdnDecodeBlock{0, 5, first}, GdnDecodeBlock{4, 3, second}},
+        std::array{GdnDecodeBlock{0, kRows, first},
+                   GdnDecodeBlock{std::numeric_limits<uint32_t>::max() - 2, 4, second}}})
+    rejects([&] { withBlocks(blocks); }, "invalid GDN decode geometry",
+            "a GDN decode took a block of no rows, more than a simdgroup's, or out of order");
   // More rows than a step's pending; a step's tape misaligned, or overlapping
   // the pending tape of its own lane or of another, or another lane's step.
   const uint64_t tape = fixture.tapeBytes;
@@ -1203,10 +1340,7 @@ void rejectsInvalid(MetalBackend &backend) {
         std::array{GdnTapeLane{0, tape, 0}, GdnTapeLane{3 * tape, tape + 16, 0}}})
     rejects(
         [&] {
-          auto buffers = fixture.decodeBuffers(0);
-          buffers.tapeLanes = lanes;
-          GDN::addDecode(graph, buffers, shape, 2, 0, fixture.cell.strides(), GdnHeadOrder::Grouped,
-                         LinearInput::Plain);
+          withBlocks(std::array{GdnDecodeBlock{0, kRows, lanes[0]}, GdnDecodeBlock{kRows, kRows, lanes[1]}});
         },
         "invalid GDN decode tape", "a GDN decode took more pending rows than a step's or overlapping tapes");
   // Offset arithmetic must not wrap either when selecting a layer or when
@@ -1218,12 +1352,11 @@ void rejectsInvalid(MetalBackend &backend) {
          {std::pair{nearEnd, 0U}, std::pair{uint64_t{0} - tape, 1U}})
       rejects(
           [&] {
-            auto tapeLanes = fixture.tapeLanes;
-            (pending ? tapeLanes[0].pendingSlot : tapeLanes[0].stepSlot) = slot;
-            auto buffers = fixture.decodeBuffers(layer);
-            buffers.tapeLanes = tapeLanes;
-            GDN::addDecode(graph, buffers, shape, 1, layer, fixture.cell.strides(),
-                           GdnHeadOrder::Grouped, LinearInput::Plain);
+            std::array blocks{fixture.blocks[0]};
+            (pending ? blocks[0].tape.pendingSlot : blocks[0].tape.stepSlot) = slot;
+            GdnDecodeBuffers buffers = fixture.decodeBuffers(layer);
+            buffers.blocks = blocks;
+            encode(buffers, layer);
           },
           "invalid GDN decode tape", "a GDN decode accepted an overflowing tape offset");
   rejects(
@@ -1231,7 +1364,7 @@ void rejectsInvalid(MetalBackend &backend) {
         auto buffers = fixture.decodeBuffers(0);
         buffers.linearScratch.input = sharedBuffer(backend, 16);
         buffers.linearScratch.sums = sharedBuffer(backend, 4);
-        GDN::addDecode(graph, buffers, shape, 1, 0, fixture.cell.strides(), GdnHeadOrder::Grouped,
+        GDN::addDecode(graph, buffers, shape, 0, fixture.cell.strides(), GdnHeadOrder::Grouped,
                        LinearInput::Table16);
       },
       "linear table buffer holds", "a GDN decode wrote a table into short scratch");
@@ -1240,8 +1373,7 @@ void rejectsInvalid(MetalBackend &backend) {
         // F32 weights need twice the bytes of bf16 ones.
         auto buffers = fixture.decodeBuffers(0);
         buffers.mixerNorm.float32 = true;
-        GDN::addDecode(graph, buffers, shape, 1, 0, fixture.cell.strides(), GdnHeadOrder::Grouped,
-                       LinearInput::Plain);
+        encode(buffers);
       },
       "norm weight buffer holds", "bf16 norm weights were read as F32");
   // A fold takes one to all of a step's rows of every layer, from an aligned
@@ -1307,29 +1439,30 @@ void foldMatchesTheNextStep(MetalBackend &backend, const GdnShape &shape, GdnSta
   }
   const auto addStep = [&](CommandGraph &graph, std::span<const MetalBuffer> current,
                            std::span<const MetalBuffer> next, GdnTapeLane tape) {
+    const std::array block{GdnDecodeBlock{0, kRows, tape}};
     for (uint32_t layer = 0; layer < kLayers; ++layer) {
       GdnDecodeBuffers buffers = fixture.decodeBuffers(layer);
       buffers.currentStates = current;
       buffers.nextStates = next;
-      buffers.tapeLanes = std::span(&tape, 1);
-      (void)GDN::addDecode(graph, buffers, shape, 1, layer, cell.strides(), GdnHeadOrder::Grouped,
+      buffers.blocks = block;
+      (void)GDN::addDecode(graph, buffers, shape, layer, cell.strides(), GdnHeadOrder::Grouped,
                            LinearInput::Plain);
     }
   };
   // The step before it leaves its rows in lane 1's slot of parity 1; the
   // step, over new rows, folds three of them and leaves its own in the slot
   // of parity 0.
-  fixture.tapeLanes[0] = {fixture.slot(1, 0), fixture.slot(1, 1), 0};
+  fixture.blocks[0].tape = {fixture.slot(1, 0), fixture.slot(1, 1), 0};
   CommandGraph before;
-  addStep(before, fixture.current, fixture.next, fixture.tapeLanes[0]);
+  addStep(before, fixture.current, fixture.next, fixture.blocks[0].tape);
   (void)backend.submitCommandAsync(before.dispatches()).wait();
   const std::array<uint32_t, kMaxLanes> pending{3};
   fixture.advance(pending);
   fixture.fillPacked();
   CommandGraph step;
-  addStep(step, fixture.current, fixture.next, fixture.tapeLanes[0]);
+  addStep(step, fixture.current, fixture.next, fixture.blocks[0].tape);
   (void)backend.submitCommandAsync(step.dispatches()).wait();
-  const uint64_t stepSlot = fixture.tapeLanes[0].stepSlot;
+  const uint64_t stepSlot = fixture.blocks[0].tape.stepSlot;
 
   const MetalBuffer retained = sharedBuffer(backend, 4), fold = sharedBuffer(backend, cell.bytes);
   std::array<MetalBuffer, kMaxLanes> current, next;
@@ -1350,7 +1483,7 @@ void foldMatchesTheNextStep(MetalBackend &backend, const GdnShape &shape, GdnSta
       GDN::addFold(graph, {fixture.next[0], fixture.tape, stepSlot, retained, fold}, shape, kLayers,
                    rows, cell.strides());
       // The lane's next step, after it retained `rows` rows of this one.
-      addStep(graph, current, next, {stepSlot, fixture.tapeLanes[0].pendingSlot, rows});
+      addStep(graph, current, next, {stepSlot, fixture.blocks[0].tape.pendingSlot, rows});
       (void)backend.submitCommandAsync(graph.dispatches()).wait();
       if (count < rows) {
         require(std::all_of(bytes(fold, 0), bytes(fold, cell.bytes), [](uint8_t byte) { return byte == 0xA5; }),
@@ -1419,7 +1552,7 @@ void bfloatState(MetalBackend &backend, const GdnShape &shape, uint32_t lanes, b
       buffers.currentStates = currentStates;
       buffers.nextStates = nextStates;
       if (tables) buffers.linearScratch = tables->scratch();
-      (void)GDN::addDecode(graph, buffers, shape, lanes, layer, cell.strides(), GdnHeadOrder::Grouped, layout);
+      (void)GDN::addDecode(graph, buffers, shape, layer, cell.strides(), GdnHeadOrder::Grouped, layout);
     }
   };
   const auto bytesOf = [](const MetalBuffer &buffer) {
@@ -1438,7 +1571,7 @@ void bfloatState(MetalBackend &backend, const GdnShape &shape, uint32_t lanes, b
     // The bf16 decode writes them again.
     std::memset(fixture.hidden.contents(), 0, fixture.hidden.sizeBytes());
     for (uint32_t lane = 0; lane < lanes; ++lane)
-      std::memset(static_cast<uint8_t *>(fixture.tape.contents()) + fixture.tapeLanes[lane].stepSlot, 0,
+      std::memset(static_cast<uint8_t *>(fixture.tape.contents()) + fixture.blocks[lane].tape.stepSlot, 0,
                   kLayers * fixture.tapeBytes);
     if (tables) {
       std::memset(tables->table.contents(), 0, tables->table.sizeBytes());
@@ -1475,7 +1608,7 @@ void bfloatState(MetalBackend &backend, const GdnShape &shape, uint32_t lanes, b
   roundStates();
   for (uint32_t base = 1; base <= kRows; ++base) {
     for (uint32_t lane = 0; lane < kMaxLanes; ++lane)
-      fixture.tapeLanes[lane].pendingRows = 1 + (base + lane - 1) % kRows;
+      fixture.blocks[lane].tape.pendingRows = 1 + (base + lane - 1) % kRows;
     step("second step " + std::to_string(base));
   }
   std::cout << where << ": the fp32 decode's rows and its state rounded\n";
@@ -1532,6 +1665,12 @@ int main(int argc, char **argv) {
     for (const GdnShape &shape : kShapes)
       for (const GdnStateFormat format : {GdnStateFormat::Float32, GdnStateFormat::BFloat16})
         foldMatchesTheNextStep(backend, shape, format);
+    for (const GdnShape &shape : kShapes)
+      for (bool float32 : familyNorms(shape))
+        for (LinearInput layout : {LinearInput::Plain, LinearInput::Table16})
+          for (GdnStateFormat format : {GdnStateFormat::Float32, GdnStateFormat::BFloat16})
+            raggedBlocks(backend, shape, float32, float32 ? GdnHeadOrder::Tiled : GdnHeadOrder::Grouped, layout,
+                         format);
     std::cout << "gdn_decode_metal_test: PASS\n";
     return 0;
   } catch (const std::exception &error) {

@@ -194,17 +194,12 @@ void GDN::addPrefill(metal::CommandGraph &graph, const metal::MetalBackend &back
 }
 
 PreparedInput GDN::addDecode(metal::CommandGraph &graph, GdnDecodeBuffers buffers,
-                             GdnShape shape, uint32_t lanes, uint32_t layer,
+                             GdnShape shape, uint32_t layer,
                              GdnStateStrides state, GdnHeadOrder order, LinearInput input) {
-  if (!lanes || lanes > SPLASH_MAXIMUM_BATCH_WIDTH || !state.valid() || buffers.tapeLanes.size() < lanes)
+  const uint32_t lanes = static_cast<uint32_t>(buffers.blocks.size());
+  if (!lanes || lanes > SPLASH_MAXIMUM_BATCH_WIDTH || !state.valid())
     throw std::invalid_argument("invalid GDN decode geometry");
   const CompiledGdn &kernel = compiledGdn(shape);
-  // Lane l's rows of the packed and hidden rows are rows [8 l, 8 l + 8).
-  const uint64_t rows = uint64_t{lanes} * SPLASH_TARGET_VERIFY_ROWS;
-  requireBytes(buffers.packed, packedBytes(shape, rows), "GDN packed");
-  requireMixerWeights(shape, buffers.convolutionWeights, buffers.decayWeights, buffers.timeBias);
-  requireBytes(buffers.hidden, rows * valueWidth(shape) * 2, "GDN hidden");
-  requireBytes(buffers.verifyRows, uint64_t{lanes} * sizeof(uint32_t), "GDN verify rows");
   GDNDecodeBatchParams params{headFlags(shape, order),
                               layer,
                               state.convolutionLayerBytes,
@@ -212,7 +207,26 @@ PreparedInput GDN::addDecode(metal::CommandGraph &graph, GdnDecodeBuffers buffer
                               state.convolutionStateBytes,
                               {},
                               {},
+                              {},
+                              {},
                               {}};
+  // A lane's rows of the packed and hidden rows are its block's, 1 to
+  // SPLASH_TARGET_VERIFY_ROWS of them (a simdgroup each), and the blocks
+  // ascend without overlapping: the step's rows end at the last block's.
+  uint32_t rows = 0;
+  for (uint32_t lane = 0; lane < lanes; ++lane) {
+    const GdnDecodeBlock &block = buffers.blocks[lane];
+    if (!block.rows || block.rows > SPLASH_TARGET_VERIFY_ROWS || block.firstRow < rows ||
+        block.firstRow > std::numeric_limits<uint32_t>::max() - block.rows)
+      throw std::invalid_argument("invalid GDN decode geometry");
+    params.first_row[lane] = block.firstRow;
+    params.rows[lane] = block.rows;
+    rows = block.firstRow + block.rows;
+  }
+  requireBytes(buffers.packed, packedBytes(shape, rows), "GDN packed");
+  requireMixerWeights(shape, buffers.convolutionWeights, buffers.decayWeights, buffers.timeBias);
+  requireBytes(buffers.hidden, uint64_t{rows} * valueWidth(shape) * 2, "GDN hidden");
+  requireBytes(buffers.verifyRows, uint64_t{lanes} * sizeof(uint32_t), "GDN verify rows");
   // Each lane reads its pending rows' tape of this layer and writes its
   // step's; no step's tape may overlap a tape another lane, or the step's own
   // lane, reads or writes.
@@ -224,7 +238,7 @@ PreparedInput GDN::addDecode(metal::CommandGraph &graph, GdnDecodeBuffers buffer
   const uint64_t lastSlot = std::numeric_limits<uint64_t>::max() - layerOffset - tapeBytes;
   const auto overlaps = [&](uint64_t a, uint64_t b) { return a < b + tapeBytes && b < a + tapeBytes; };
   for (uint32_t lane = 0; lane < lanes; ++lane) {
-    const GdnTapeLane &tape = buffers.tapeLanes[lane];
+    const GdnTapeLane &tape = buffers.blocks[lane].tape;
     if (tape.pendingSlot > lastSlot || tape.stepSlot > lastSlot)
       throw std::invalid_argument("invalid GDN decode tape");
     params.pending_tape[lane] = tape.pendingSlot + layerOffset;
@@ -244,8 +258,7 @@ PreparedInput GDN::addDecode(metal::CommandGraph &graph, GdnDecodeBuffers buffer
                                            buffers.convolutionWeights};
   const bool prepare = input != LinearInput::Plain;
   if (prepare)
-    requireTableScratch(buffers.linearScratch, input, shape.valueHeads * shape.headDimension,
-                        lanes * SPLASH_TARGET_VERIFY_ROWS);
+    requireTableScratch(buffers.linearScratch, input, shape.valueHeads * shape.headDimension, rows);
   bindings.reserve(prepare ? 18 : 16);
   appendLaneBindings(bindings, buffers.currentStates, buffers.nextStates);
   requireStates(shape, state, layer, lanes, buffers.currentStates, buffers.nextStates);

@@ -41,11 +41,12 @@ struct GDNGatePrefillParams {
 static_assert(sizeof(GDNGatePrefillParams) == 4,
               "GDN prefill gate parameters are 4 bytes on both sides");
 
-// A decode step leaves its rows on the lane's tape: one layer's holds, each
-// field for every row in turn, the rows' convolution inputs ([conv_dim]
-// bf16), their k then v rows ([key_width + value_width] bf16), decay
-// ([value_heads] fp32) and beta ([value_heads] bf16). The lane's next step
-// folds the rows it retained into the state before its own (GDN::addDecode).
+// A decode step leaves its rows on the lane's tape: one layer's holds room
+// for SPLASH_TARGET_VERIFY_ROWS rows and, each field for every row of the
+// lane's block in turn, the rows' convolution inputs ([conv_dim] bf16), their
+// k then v rows ([key_width + value_width] bf16), decay ([value_heads] fp32)
+// and beta ([value_heads] bf16). The lane's next step folds the rows it
+// retained into the state before its own (GDN::addDecode).
 inline constexpr uint64_t gdn_tape_kv_offset(uint32_t conv_dim) {
   return uint64_t(SPLASH_TARGET_VERIFY_ROWS) * conv_dim * 2;
 }
@@ -82,10 +83,15 @@ struct GDNDecodeBatchParams {
   uint64_t pending_tape[SPLASH_MAXIMUM_BATCH_WIDTH];
   uint64_t step_tape[SPLASH_MAXIMUM_BATCH_WIDTH];
   uint32_t pending_rows[SPLASH_MAXIMUM_BATCH_WIDTH];
+  // Per lane, its block of the step's rows: its first row and its rows, 1 to
+  // SPLASH_TARGET_VERIFY_ROWS. They are its rows of the packed, hidden and
+  // table rows, and its tape's first rows.
+  uint32_t first_row[SPLASH_MAXIMUM_BATCH_WIDTH];
+  uint32_t rows[SPLASH_MAXIMUM_BATCH_WIDTH];
 };
 
-static_assert(sizeof(GDNDecodeBatchParams) == 112,
-              "GDN decode parameters are 112 bytes on both sides");
+static_assert(sizeof(GDNDecodeBatchParams) == 144,
+              "GDN decode parameters are 144 bytes on both sides");
 
 // A fold of the first `rows` rows of a lane's step alone (GDN::addFold): the
 // state cells' strides, as in GDNDecodeBatchParams, and the byte offset in
