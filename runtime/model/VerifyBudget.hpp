@@ -9,6 +9,7 @@
 // capped at the price alone, one 2x stall over clustered rows had 45 of the
 // next 64 cycles verify their anchors alone.
 #include "metal/abi/ExecutionGeometry.h"
+#include "ops/LaneRows.hpp"
 
 #include <array>
 #include <cstdint>
@@ -88,6 +89,24 @@ public:
   [[nodiscard]] static Acceptance fit(std::span<const Label> labels, const Acceptance &start);
   // The shape of a cycle's cost by its rows (a cycle of every row costs 1).
   [[nodiscard]] static double seed(uint32_t lanes, uint32_t rows);
+
+  // A lane's chances for a cycle's choice of rows (stepRows): the estimates
+  // that the target accepts each row its tree would add past its anchor,
+  // best first, at most a verify block's rows past it. They are those its
+  // last cycle's tree took (ops::DraftSelectorBuffers::treeScores), every
+  // row's 1 for a lane without one, merged with this cycle's lookup chain's,
+  // each the product of its tokens' rates to its depth (LookupAcceptance,
+  // whose agreement with the draft the host does not know).
+  [[nodiscard]] static std::vector<float> laneChances(std::span<const float> tree, std::span<const float> lookup);
+  // The rows of a cycle of curves.size() lanes (ops::StepRows): the T, from
+  // the lane count to a verify block's rows a lane and to the costs' end,
+  // with the most expected accepted tokens per costs[T], the fewest rows
+  // among equal ones. A cycle of T rows verifies every lane's anchor and the
+  // T - lanes largest chances over its lanes' curves, none past a lane's
+  // ops::verifyLaneCap(T, lanes) rows, as the GPU's choice of its rows does
+  // (ops::DraftSelector::addVerifyRows) with this cycle's chances.
+  [[nodiscard]] static ops::StepRows stepRows(std::span<const std::vector<float>> curves,
+                                              std::span<const float> costs);
 
 private:
   // The weighted sums of the latest cycles' rows R and times t.

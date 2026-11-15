@@ -10,7 +10,9 @@
 // latest cycles of each lane count and kind, positive and nondecreasing, the
 // seed's slope where their rows do not spread; every kExploreCycles-th cycle
 // of a lane count explores; a stall over rows that cluster leaves the cycles
-// after it their tokens per millisecond.
+// after it their tokens per millisecond. A cycle's rows (stepRows) are the
+// most expected tokens per cost of every assignment of rows to its lanes'
+// chances that its rows and their caps allow, the fewest among equal ones.
 #include "TestChecks.hpp"
 #include "model/VerifyBudget.hpp"
 
@@ -18,6 +20,7 @@
 #include <array>
 #include <cmath>
 #include <cstdint>
+#include <functional>
 #include <iostream>
 #include <random>
 #include <stdexcept>
@@ -407,6 +410,128 @@ void invalidInputs() {
           "a label without a finite feature was fit");
 }
 
+// The most expected tokens past the anchors of any assignment of at most e
+// rows to the lanes, for every e, each lane's a prefix of its curve and at
+// most cap - 1 rows, by brute force.
+std::vector<double> bestAssignments(const std::vector<std::vector<float>> &curves, uint32_t cap) {
+  const size_t lanes = curves.size();
+  std::vector<uint32_t> taken(lanes, 0);
+  std::vector<double> best(lanes * cap + 1, 0.0);
+  for (bool more = true; more;) {
+    uint32_t total = 0;
+    double expected = 0.0;
+    for (size_t lane = 0; lane < lanes; ++lane) {
+      total += taken[lane];
+      for (uint32_t row = 0; row < taken[lane]; ++row)
+        expected += curves[lane][row];
+    }
+    best[total] = std::max(best[total], expected);
+    more = false;
+    for (size_t lane = 0; lane < lanes && !more; ++lane) {
+      if (taken[lane] < std::min<size_t>(curves[lane].size(), cap - 1)) {
+        ++taken[lane];
+        more = true;
+      } else {
+        taken[lane] = 0;
+      }
+    }
+  }
+  for (size_t extra = 1; extra < best.size(); ++extra)
+    best[extra] = std::max(best[extra], best[extra - 1]);
+  return best;
+}
+
+void cycleRowsChoice() {
+  constexpr uint32_t kBlock = SPLASH_TARGET_VERIFY_ROWS;
+  std::mt19937_64 random(0x57e9a1);
+  std::uniform_real_distribution<double> unit(0.0, 1.0);
+  for (uint32_t trial = 0; trial < 240; ++trial) {
+    const uint32_t lanes = 1 + trial % VerifyBudget::kLanes;
+    // Curves of 0 to a block's rows past the anchor, largest first, an exact
+    // 1 or 0 now and then.
+    std::vector<std::vector<float>> curves(lanes);
+    for (std::vector<float> &curve : curves) {
+      curve.resize(random() % kBlock);
+      for (float &chance : curve) {
+        const uint64_t kind = random() % 8;
+        chance = kind == 0 ? 1.0F : kind == 1 ? 0.0F : static_cast<float>(unit(random));
+      }
+      std::ranges::sort(curve, std::greater<>());
+    }
+    // Flat, linear and step-shaped costs over 16-row and 32-row tiles, and
+    // random nondecreasing ones; now and then a table that ends early.
+    const uint32_t ends = trial % 7 == 6 ? lanes + static_cast<uint32_t>(random() % (lanes * (kBlock - 1) + 1))
+                                          : lanes * kBlock;
+    std::vector<float> costs(ends + 1, 0.0F);
+    float level = 1.0F;
+    for (uint32_t rows = lanes; rows <= ends; ++rows) {
+      switch (trial % 4) {
+      case 0: costs[rows] = 1.0F; break;
+      case 1: costs[rows] = 10.0F + 0.4F * float(rows); break;
+      case 2: costs[rows] = rows <= 16 ? 1.0F : rows <= 32 ? 1.1F : 1.6F; break;
+      default: level += static_cast<float>(unit(random)) * 0.1F; costs[rows] = level; break;
+      }
+    }
+    const splash::ops::StepRows got = VerifyBudget::stepRows(curves, costs);
+    double best = 0.0;
+    uint32_t chosen = lanes;
+    std::vector<double> values(ends + 1, 0.0);
+    const std::vector<double> narrow = bestAssignments(curves, splash::ops::verifyLaneCap(lanes, lanes)),
+                              wide = bestAssignments(curves, splash::ops::verifyLaneCap(lanes * kBlock, lanes));
+    for (uint32_t rows = lanes; rows <= ends; ++rows) {
+      const uint32_t cap = splash::ops::verifyLaneCap(rows, lanes);
+      const std::vector<double> &assigned = cap == splash::ops::verifyLaneCap(lanes, lanes) ? narrow : wide;
+      values[rows] = (lanes + assigned[std::min<size_t>(rows - lanes, assigned.size() - 1)]) / costs[rows];
+      if (values[rows] > best * (1.0 + 1e-9)) {
+        best = values[rows];
+        chosen = rows;
+      }
+    }
+    const std::string label = "cycle rows trial " + std::to_string(trial);
+    require(got.lanes == lanes && got.laneCap == splash::ops::verifyLaneCap(got.rows, lanes),
+            label + ": the step's lanes or cap are not its rows'");
+    require(got.rows >= lanes && got.rows <= ends && std::fabs(values[got.rows] - best) <= 1e-9 * best &&
+                got.rows <= chosen,
+            label + ": chose " + std::to_string(got.rows) + " rows where " + std::to_string(chosen) + " give " +
+                std::to_string(best) + " tokens per cost");
+  }
+  // One lane whose tree would take a block's rows, all certain, at a flat
+  // cost: every row of a block.
+  const std::vector<std::vector<float>> certain{std::vector<float>(kBlock - 1, 1.0F)};
+  require(VerifyBudget::stepRows(certain, std::vector<float>(kBlock + 1, 1.0F)).rows == kBlock,
+          "a lane of certain rows at a flat cost did not take a block's rows");
+  // Four lanes of 0.9 a step, whose rows past 32 cost 60% more than those
+  // up to it: 32 rows, eight a lane.
+  std::vector<std::vector<float>> steady(4);
+  for (std::vector<float> &curve : steady)
+    for (uint32_t row = 1; row < kBlock; ++row)
+      curve.push_back(static_cast<float>(std::pow(0.9, row)));
+  std::vector<float> stepped(4 * kBlock + 1);
+  for (uint32_t rows = 4; rows <= 4 * kBlock; ++rows)
+    stepped[rows] = rows <= 32 ? 1.0F : 1.6F;
+  const splash::ops::StepRows steps = VerifyBudget::stepRows(steady, stepped);
+  require(steps.rows == 32 && steps.laneCap == 8, "a cost step past 32 rows did not stop the rows at 32");
+  // A lane's chances: its tree's and its lookup chain's, largest first, at
+  // most a block's rows past its anchor.
+  require(VerifyBudget::laneChances(std::vector<float>{0.9F, 0.5F, 0.2F}, std::vector<float>{0.8F, 0.6F}) ==
+              std::vector<float>{0.9F, 0.8F, 0.6F, 0.5F, 0.2F},
+          "a lane's chances did not merge its tree's and its lookup's");
+  require(VerifyBudget::laneChances(std::vector<float>(kBlock, 0.5F), std::vector<float>(kBlock, 0.7F)).size() ==
+              kBlock - 1,
+          "a lane's chances ran past a block's rows");
+  const std::vector<std::vector<float>> none, five(5);
+  rejects([&] { static_cast<void>(VerifyBudget::stepRows(none, stepped)); }, "invalid cycle rows lanes",
+          "a cycle of no lanes chose rows");
+  rejects([&] { static_cast<void>(VerifyBudget::stepRows(five, stepped)); }, "invalid cycle rows lanes",
+          "a cycle of five lanes chose rows");
+  rejects([&] { static_cast<void>(VerifyBudget::stepRows(steady, std::vector<float>(4, 1.0F))); },
+          "invalid cycle rows cost", "costs that end before the lanes' anchors were taken");
+  std::vector<float> holed = stepped;
+  holed[20] = 0.0F;
+  rejects([&] { static_cast<void>(VerifyBudget::stepRows(steady, holed)); }, "invalid cycle rows cost",
+          "a cost that is not positive was taken");
+}
+
 } // namespace
 
 int main() {
@@ -418,6 +543,7 @@ int main() {
     learnsTheCosts();
     stallOverClusteredRows();
     invalidInputs();
+    cycleRowsChoice();
   } catch (const std::exception &error) {
     std::cerr << "verify_budget_test: FAIL: " << error.what() << '\n';
     return 1;
