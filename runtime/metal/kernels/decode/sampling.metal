@@ -1389,17 +1389,14 @@ struct TreeHeap {
 };
 
 // A lane's tree as it grows: its rows' tokens, ancestors' masks, parents,
-// depths, candidate indices at their positions (kNoCandidate for a chain
-// token the draft does not hold there), draft probabilities, estimates and
-// keys, and of each row the children its draft drew (their candidate
-// indices, in order; kNoCandidate past them) and its next position's
-// probabilities (DraftTreeParams).
+// depths, draft probabilities, estimates and keys, and of each row the
+// children its draft drew (their candidate indices, in order; kNoCandidate
+// past them) and its next position's probabilities (DraftTreeParams).
 struct TreeRows {
   uint token[kTreeRows];
   uint ancestors[kTreeRows];
   ushort parent[kTreeRows];
   ushort depth[kTreeRows];
-  uchar candidate[kTreeRows];
   float q[kTreeRows];
   float estimate[kTreeRows];
   ulong key[kTreeRows];
@@ -1660,7 +1657,6 @@ kernel void draft_select_tree(
     rows.ancestors[0] = 1;
     rows.parent[0] = SPLASH_TREE_ROOT;
     rows.depth[0] = 0;
-    rows.candidate[0] = 0;
     rows.q[0] = 1.0f;
     rows.estimate[0] = 1.0f;
     rows.key[0] = ulong(params.noise[lane][1]) << 32 | params.noise[lane][0];
@@ -1688,20 +1684,13 @@ kernel void draft_select_tree(
                   : 0;
       if (!row) {
         row = rows.made++;
-        uchar own = from_chain ? kNoCandidate : uchar(index);
-        for (uint i = 0; from_chain && position < Positions && i < Candidates;
-             ++i)
-          own = lattice.ids[position][i] == token && own == kNoCandidate
-                    ? uchar(i)
-                    : own;
         rows.token[row] = token;
         rows.ancestors[row] = rows.ancestors[parent] | (1u << row);
         rows.parent[row] = ushort(parent);
         rows.depth[row] = ushort(position + 1);
-        rows.candidate[row] = own;
         // A row a host chain token made is no draft step: its estimate is
         // the chain's, and it has no draft probability.
-        rows.q[row] = from_chain ? -1.0f : rows.next[parent][own];
+        rows.q[row] = from_chain ? -1.0f : rows.next[parent][index];
         rows.estimate[row] = score;
         rows.key[row] = tree_key(rows.key[parent], token);
         tree_row_clear(rows, row);
