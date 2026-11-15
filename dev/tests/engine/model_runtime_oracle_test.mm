@@ -3194,6 +3194,156 @@ void requirePromptEndsShareOneHead(model::Runtime &executor, std::span<const uin
   std::cout << "prompt_ends_share_one_head=PASS widths=2,3,4\n";
 }
 
+// The decoded index fixture (requireDecodedIndexMatchesPrefill): a prompt of
+// two chunks and 17 rows, 40 tokens or more decoded past it, and the pages
+// that hold them from page 0 on.
+constexpr uint32_t kDecodedIndexPrompt = 2 * model::ExecutionLimits::prefillTokenBudget + 17;
+constexpr uint32_t kDecodedIndexTokens = 40;
+constexpr uint32_t kDecodedIndexPages = (kDecodedIndexPrompt + 2 * kDecodedIndexTokens) / kv::kPageTokens + 1;
+
+// A block-sparse target's decode writes its block index
+// (ops::BlockIndexer::addCommit): in every attention layer, the pooled key
+// of each block its accepted paths complete, and the lane's pending keys of
+// the block they leave open; a prefill of the same tokens pools them from its
+// own rows. A greedy decode of 40 tokens or more past a prompt of two chunks
+// and 17 rows (1,028 complete blocks, past Qwen3.8-Flash-Next's budget of
+// 512, so that its rows select through the index it writes), over pages
+// whose index holds poison, then a fresh prefill of its tokens up to the
+// same length on the same pages and lane, its index poisoned again:
+// - each wrote every block of every layer its tokens complete and no other;
+// - the blocks both prefilled in the same chunks are the same bit for bit;
+// - every layer's blocks after them are the prefill's to within the decode's
+//   arithmetic, which differs from the prefill's, and so are the lane's PLE
+//   history and pending keys after them (a row of 128 values each): their
+//   mean cosine at least 0.99 and each one's at least 0.5. A sparse
+//   selection or an expert that one rounding chooses and the other does not
+//   moves a row's later layers: on Qwen3.8-Flash-Next Q2_0 (the 48G, 11-15)
+//   every decoded block kept a cosine above 0.995 but one of the first
+//   cycle's, 0.940 at the least in layers 6 to 11; the 168 blocks after the
+//   two chunks, the prompt's last among them, kept a mean of 0.997 and the
+//   auxiliary rows 0.9997 at the least, where another layer's block of the
+//   same tokens reaches 0.29.
+void requireDecodedIndexMatchesPrefill(model::Runtime &executor, const kv::PageStorage &pages,
+                                       const model::QwenStateStorage &states, std::span<const uint32_t> seed) {
+  const kv::Layout layout = pages.layout();
+  if (!layout.indexDimension) {
+    std::cout << "decoded_index=SKIP (the target keeps no block index)\n";
+    return;
+  }
+  constexpr uint32_t chunk = model::ExecutionLimits::prefillTokenBudget, blockTokens = SPLASH_ATTENTION_BLOCK_TOKENS;
+  constexpr uint16_t kPoison = 0x7FC1;
+  const std::vector<uint32_t> pageTable = pageRange(0, kDecodedIndexPages);
+  require(pages.pageCount() >= pageTable.size(), "the KV pool cannot hold the decoded index fixture");
+  std::vector<uint32_t> prompt(kDecodedIndexPrompt);
+  for (uint32_t index = 0; index < prompt.size(); ++index) prompt[index] = seed[index % seed.size()];
+  // A request's prefill of `tokens` in chunks from row 0.
+  const auto prefill = [&](uint64_t id, std::span<const uint32_t> tokens) {
+    ModelStepResult last;
+    for (uint32_t begin = 0; begin < tokens.size(); begin += chunk)
+      last = prefillChunk(executor, id, begin, tokens.subspan(begin, std::min<size_t>(chunk, tokens.size() - begin)),
+                          pageTable);
+    return last;
+  };
+  // Every layer's index of the fixture's pages: poisoned, or its bytes, page
+  // by page.
+  const auto poison = [&] {
+    for (const uint32_t page : pageTable)
+      for (const std::span<std::byte> layer : pages.indexSpans(page))
+        for (size_t at = 0; at < layer.size(); at += sizeof kPoison)
+          std::memcpy(layer.data() + at, &kPoison, sizeof kPoison);
+  };
+  const auto indexBytes = [&] {
+    std::vector<std::vector<uint8_t>> result(layout.attentionLayers);
+    for (const uint32_t page : pageTable) {
+      const std::vector<std::span<std::byte>> spans = pages.indexSpans(page);
+      for (uint32_t layer = 0; layer < spans.size(); ++layer) {
+        const auto *data = reinterpret_cast<const uint8_t *>(spans[layer].data());
+        result[layer].insert(result[layer].end(), data, data + spans[layer].size());
+      }
+    }
+    return result;
+  };
+  poison();
+  EngineRequest decoding = makeRequest(601, prompt, 2 * kDecodedIndexTokens);
+  decoding.flags = RequestIgnoreEndOfSequence;
+  beginCold(executor, decoding, 0);
+  requireOpen(prefill(601, prompt), "decoded index");
+  std::vector<uint32_t> tokens = prompt;
+  uint64_t position = prompt.size();
+  while (position < prompt.size() + kDecodedIndexTokens) {
+    const ModelStepResult result = decodeOne(executor, 601, position, pageTable);
+    require(result.failure.empty() && !result.finished && !result.outputTokens.empty(),
+            "decoded index: a decode cycle failed or finished");
+    tokens.insert(tokens.end(), result.outputTokens.begin(), result.outputTokens.end());
+    position += result.outputTokens.size() - result.outputTokensWithoutKv;
+  }
+  require(states.metadata(0).lengths.targetTokens == position, "decoded index: the lane's length is not its rows'");
+  const std::vector<std::vector<uint8_t>> decoded = indexBytes();
+  const std::vector<uint8_t> decodedAuxiliary = bytesOf(states.current(0).auxiliary);
+  executor.end(601);
+  const std::vector<uint32_t> history(tokens.begin(), tokens.begin() + static_cast<ptrdiff_t>(position));
+  poison();
+  beginCold(executor, makeRequest(602, history, 1), 0);
+  prefill(602, history);
+  const std::vector<std::vector<uint8_t>> prefilled = indexBytes();
+  const std::vector<uint8_t> prefilledAuxiliary = bytesOf(states.current(0).auxiliary);
+  executor.end(602);
+
+  const uint64_t keyBytes = uint64_t{layout.indexDimension} * sizeof(uint16_t);
+  // The blocks the tokens complete, and of them those the two prefills'
+  // first two chunks complete.
+  const uint64_t blocks = position / blockTokens, sameBlocks = 2 * chunk / blockTokens;
+  const auto key = [&](const std::vector<uint8_t> &bytes, uint64_t block) {
+    return std::vector<uint8_t>(bytes.begin() + static_cast<ptrdiff_t>(block * keyBytes),
+                                bytes.begin() + static_cast<ptrdiff_t>((block + 1) * keyBytes));
+  };
+  const auto poisoned = [&](const std::vector<uint8_t> &bytes, uint64_t block) {
+    const std::vector<uint8_t> values = key(bytes, block);
+    for (size_t at = 0; at < values.size(); at += sizeof kPoison)
+      if (std::memcmp(values.data() + at, &kPoison, sizeof kPoison) != 0) return false;
+    return true;
+  };
+  bool written = true, same = true;
+  // The mean cosine and the least of rows of 128 values.
+  struct Cosines final {
+    double sum = 0.0, least = 1.0;
+    uint64_t count = 0;
+    void add(double cosine) {
+      sum += cosine;
+      least = std::min(least, cosine);
+      ++count;
+    }
+    [[nodiscard]] double mean() const { return count ? sum / static_cast<double>(count) : 0.0; }
+  };
+  Cosines blockCosines, auxiliaryCosines;
+  for (uint32_t layer = 0; layer < layout.attentionLayers; ++layer) {
+    for (uint64_t block = 0; block * keyBytes < decoded[layer].size(); ++block)
+      written = written && poisoned(decoded[layer], block) == (block >= blocks) &&
+                poisoned(prefilled[layer], block) == (block >= blocks);
+    same = same && std::equal(decoded[layer].begin(),
+                              decoded[layer].begin() + static_cast<ptrdiff_t>(sameBlocks * keyBytes),
+                              prefilled[layer].begin());
+    for (uint64_t block = sameBlocks; block < blocks; ++block)
+      blockCosines.add(compareBfloatBytes(key(decoded[layer], block), key(prefilled[layer], block)).cosine);
+  }
+  for (uint64_t row = 0; row + keyBytes <= decodedAuxiliary.size(); row += keyBytes) {
+    const auto rowOf = [&](const std::vector<uint8_t> &bytes) {
+      return std::vector<uint8_t>(bytes.begin() + static_cast<ptrdiff_t>(row),
+                                  bytes.begin() + static_cast<ptrdiff_t>(row + keyBytes));
+    };
+    auxiliaryCosines.add(compareBfloatBytes(rowOf(decodedAuxiliary), rowOf(prefilledAuxiliary)).cosine);
+  }
+  require(written, "decoded index: a decode or prefill left a block its tokens complete unwritten, or wrote another");
+  require(same, "decoded index: the blocks both prefills' same chunks complete differ");
+  require(blockCosines.count && blockCosines.mean() >= 0.99 && blockCosines.least >= 0.5,
+          "decoded index: the blocks after the prompt's first two chunks are not the prefill's");
+  require(auxiliaryCosines.count && auxiliaryCosines.mean() >= 0.99 && auxiliaryCosines.least >= 0.5,
+          "decoded index: the PLE history or pending keys after the decode are not the prefill's");
+  std::cout << "decoded_index=PASS tokens=" << position << " blocks=" << blockCosines.count
+            << " least_cosine=" << blockCosines.least << " mean_cosine=" << blockCosines.mean()
+            << " least_auxiliary_cosine=" << auxiliaryCosines.least << '\n';
+}
+
 // A constrained lane decodes in one command beside an unconstrained one,
 // which asks for no mask: the command waits for the constrained lane's masks
 // alone, and its selection reads them for that lane's rows alone. Under masks
@@ -4563,11 +4713,13 @@ int main(int argc, char **argv) {
     }
 
     // A pool of 128 pages, or the smallest extent if larger, and, where the
-    // target's experts stream, the prefill group fixture's pages, in whole
-    // extents of the size the memory plan would pick for it.
+    // target's experts stream, the prefill group fixture's pages, and with a
+    // block index the decoded index fixture's, in whole extents of the size
+    // the memory plan would pick for it.
     const kv::Layout kvLayout = model.targetKvLayout(format);
     const uint32_t budgetPages = std::max({128U, kvLayout.minimumExtentPages(),
-                                           model.expertStore() ? kGroupFixtureRows / kv::kPageTokens : 0U});
+                                           model.expertStore() ? kGroupFixtureRows / kv::kPageTokens : 0U,
+                                           kvLayout.indexDimension ? kDecodedIndexPages : 0U});
     const uint32_t extentPages = kvLayout.extentPagesFor(budgetPages);
     const uint32_t pageCount = (budgetPages + extentPages - 1) / extentPages * extentPages;
     // What the checks on this pool hold at once beside the plan's fixed
@@ -4881,6 +5033,7 @@ int main(int argc, char **argv) {
     requireBatchedLanesMatchReordered(executor, states, samplingSeedTokens);
     requirePromptEndsShareOneHead(executor, samplingSeedTokens);
     requireConstrainedLaneSharesDecode(executor, states, model.descriptor, samplingSeedTokens);
+    requireDecodedIndexMatchesPrefill(executor, pages, states, samplingSeedTokens);
 
 
     // Compare the active GDN state from one 16-row chunk and two M8 commits
