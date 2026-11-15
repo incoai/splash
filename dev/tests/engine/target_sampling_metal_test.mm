@@ -161,13 +161,18 @@ std::vector<uint32_t> initialRows(size_t lanes, uint32_t offset) {
   return result;
 }
 
+// Each lane's verify block of `lanes` as a chain, in `tree`.
+void writeChains(const MetalBuffer &tree, std::span<const LaneRows> lanes) {
+  auto *rows = static_cast<TreeRow *>(tree.contents());
+  for (const LaneRows &lane : lanes)
+    for (uint32_t row = 0; row < lane.rows; ++row)
+      rows[lane.first + row] = chainRow(row);
+}
+
 // Each lane's verify block of `lanes` as a chain.
 MetalBuffer chainTree(MetalBackend &backend, std::span<const LaneRows> lanes) {
   MetalBuffer buffer = allocate(backend, rowsEnd(lanes) * sizeof(TreeRow));
-  auto *tree = static_cast<TreeRow *>(buffer.contents());
-  for (const LaneRows &lane : lanes)
-    for (uint32_t row = 0; row < lane.rows; ++row)
-      tree[lane.first + row] = chainRow(row);
+  writeChains(buffer, lanes);
   return buffer;
 }
 
@@ -905,8 +910,9 @@ void bufferExtents(MetalBackend &backend) {
     const auto encode = [&](CommandGraph &graph, const SamplingBuffers &buffers, const MetalBuffer &words) {
       sampling.addInitial(graph, policies, buffers, initialRows(policies.size(), 3), kStopTokens, {words, tableRows});
     };
-    // The rows up to row 3 of the last lane's block, the third; the
-    // constrained lane's mask row and the sampled lane's uniform.
+    // The rows up to row 3 of the last lane's block, the third, and their
+    // tree rows, which each lane's root takes; the constrained lane's mask row
+    // and the sampled lane's uniform.
     const auto rows = workspace(2 * kRows + 3 + 1);
     requireExtents({{&SamplingBuffers::logits, (2 * kRows + 3 + 1) * logitsRow, 4, "sampling logits"},
                     {&SamplingBuffers::constraintMasks, (kMaskRows + 1) * maskRow, 4, "constraint mask"},
@@ -921,7 +927,9 @@ void bufferExtents(MetalBackend &backend) {
                     {&SamplingBuffers::vocabularyArrivals, rows[5], 4, "sampling arrival"},
                     {&SamplingBuffers::uniforms, 4, 4, "sampling uniform"},
                     {&SamplingBuffers::laneRows, lanes * sizeof(LaneRows), sizeof(LaneRows), "sampling lane rows"},
-                    {&SamplingBuffers::verifyRows, lanes * 4, 4, "sampling verify rows"}},
+                    {&SamplingBuffers::verifyRows, lanes * 4, 4, "sampling verify rows"},
+                    {&SamplingBuffers::treeRows, (2 * kRows + 3 + 1) * sizeof(TreeRow), sizeof(TreeRow),
+                     "verify tree row"}},
                    [&](CommandGraph &graph, const SamplingBuffers &buffers) { encode(graph, buffers, table); });
     splash::test::requireExtent(backend, table, 3 * logitsRow, 4, "penalty table",
                                 [&](CommandGraph &graph, const MetalBuffer &words) {
@@ -1704,6 +1712,9 @@ void thinkingCutoffs(MetalBackend &backend, uint32_t vocabulary) {
     }
   }
 
+  // The first tokens left their rows their trees' roots; the verifies below
+  // take each lane's block as a chain, as its selector lays it out.
+  writeChains(batch.buffers.treeRows, blocks(kLanes));
   const AcceptanceBuffers acceptance = acceptanceBuffers(backend, batch, kLanes);
   // A draft token, at verify input row position + 1.
   const auto draft = [&](uint32_t lane, uint32_t position, uint32_t token) {

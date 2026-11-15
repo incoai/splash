@@ -150,10 +150,12 @@ SamplingPenaltyParams Sampling::penaltyParams(std::span<const SamplingPolicy> po
     params.presence[entry] = penalties.presence;
     params.frequency[entry] = penalties.frequency;
   }
-  // A lane's rows after its first read their draft tokens and tree rows.
-  if (params.entries && rows.laneCap > 1) {
-    requireBytes(buffers.inputTokens, rows.end * sizeof(uint32_t), "verify input token");
+  // A lane's rows read their tree rows, and its rows after its first their
+  // draft tokens.
+  if (params.entries) {
     requireBytes(buffers.treeRows, rows.end * sizeof(TreeRow), "verify tree row");
+    if (rows.laneCap > 1)
+      requireBytes(buffers.inputTokens, rows.end * sizeof(uint32_t), "verify input token");
   }
   return params;
 }
@@ -186,7 +188,10 @@ void Sampling::addInitial(metal::CommandGraph &graph,
   const TargetRows selected{end, 1, 0};
   const TargetSamplingParams params = selection(policies, buffers, selected, stopTokens);
   const SamplingPenaltyParams penalized = penaltyParams(policies, buffers, penalties, selected);
-  graph.add("decode_sample_first_rows", {buffers.laneRows, buffers.verifyRows}, first, {lanes, 1, 1}, {1, 1, 1});
+  // Each lane's one row is its tree's root.
+  requireBytes(buffers.treeRows, end * sizeof(TreeRow), "verify tree row");
+  graph.add("decode_sample_first_rows", {buffers.laneRows, buffers.verifyRows, buffers.treeRows}, first,
+            {lanes, 1, 1}, {1, 1, 1});
   addPenalties(graph, buffers, penalties, penalized);
   addSelection(graph, params, policies, buffers, selected);
 }

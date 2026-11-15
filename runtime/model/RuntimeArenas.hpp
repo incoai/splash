@@ -544,10 +544,10 @@ enum class DecodeTensor : uint32_t {
   TopPartialIds,
   TopPartialValues,
   // A step's rows' places in their lanes' trees, a row of
-  // metal/abi/VerifyTree.h per row: chains (ops::chainRow) from the arena's
-  // start, then as each step's selector lays them out
-  // (ops::DraftSelector::addVerifyRows), with the row of its lane's tree
-  // each verify row is.
+  // metal/abi/VerifyTree.h per row, as each step's selector lays them out
+  // (ops::DraftSelector::addVerifyRows) or a first token after a prompt its
+  // root (ops::Sampling::addInitial), with the row of its lane's tree each
+  // verify row is.
   TreeRows,
   VerifySources,
   // Each lane's draft tree as the selector grew it, best first
@@ -675,10 +675,6 @@ public:
     const metal::MetalBuffer arrivals =
         batchSlice(DecodeTensor::TargetVocabularyArrivals, kLaneCount);
     std::memset(arrivals.contents(), 0, arrivals.sizeBytes());
-    // Every block verifies a chain until its selector writes a tree.
-    auto *tree = static_cast<ops::TreeRow *>(batchSlice(DecodeTensor::TreeRows, kLaneCount).contents());
-    for (uint32_t row = 0; row < kDecodeStepRows; ++row)
-      tree[row] = ops::chainRow(row % kDecodeRows);
 
     // Each scratch buffer takes whole host pages (decodeArenaBytes).
     const auto allocate = [&](uint64_t bytes, metal::BufferStorage storage, const char *label) {

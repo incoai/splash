@@ -70,8 +70,9 @@ static_assert(sizeof(TargetSamplingParams) == 108,
               "Target sampling parameters are 108 bytes on both sides");
 
 // The selection of each lane's first token after its prompt from its one row
-// of the logits, row[l]: decode_sample_first_rows writes the lane rows and
-// verify rows (TargetSamplingParams) that the selection's kernels read.
+// of the logits, row[l]: decode_sample_first_rows writes the lane rows, verify
+// rows (TargetSamplingParams) and that row's tree row, a tree's root, that
+// the selection's kernels read.
 struct SampleFirstRowsParams {
   uint32_t row[SPLASH_MAXIMUM_BATCH_WIDTH];
 };

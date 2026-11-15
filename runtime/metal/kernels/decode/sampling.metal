@@ -83,16 +83,19 @@ inline TargetRow selected_row(device const float *logits,
           0.0f};
 }
 
-// Each lane's lane rows and verify rows for the selection of its first token
-// after its prompt (SampleFirstRowsParams), one group a lane: its one row of
-// the logits, which the selection's kernels read as a decode cycle's.
+// Each lane's lane rows, verify rows and tree row for the selection of its
+// first token after its prompt (SampleFirstRowsParams), one group a lane: its
+// one row of the logits, a tree's root, which the selection's kernels read as
+// a decode cycle's.
 kernel void decode_sample_first_rows(
     device SplashLaneRows *lane_rows [[buffer(0)]],
     device uint *verify_rows [[buffer(1)]],
-    constant SampleFirstRowsParams &params [[buffer(2)]],
+    device SplashTreeRow *tree [[buffer(2)]],
+    constant SampleFirstRowsParams &params [[buffer(3)]],
     uint lane [[threadgroup_position_in_grid]]) {
   lane_rows[lane] = {params.row[lane], 1};
   verify_rows[lane] = 1;
+  tree[params.row[lane]] = {1u, SPLASH_TREE_ROOT, 0};
 }
 
 // Shares of a row's softmax denominator combined in order: their largest
@@ -1039,7 +1042,7 @@ kernel void decode_sample_penalize(
     return;
   device float *column = logits + ulong(lane.first) * params.vocabulary + token;
   for (uint row = 0; row < rows; ++row) {
-    const uint path = rows > 1 ? tree[lane.first + row].ancestors : 1u;
+    const uint path = tree[lane.first + row].ancestors;
     const uint count = (word & SPLASH_PENALTY_COUNT_MASK) + popcount(drafted & path & ~1u);
     if (!count && !(word & SPLASH_PENALTY_PROMPT_BIT))
       continue;
@@ -1969,10 +1972,8 @@ kernel void decode_sample_thinking_cutoff(
                        params.mask_words;
   const uint start = params.tokens[lane][0];
   for (uint at = 0; at < rows; ++at) {
-    // A selection of one row, a first token after a prompt, has no tree: its
-    // row is its anchor's.
-    const uint path = rows > 1 ? tree[first + at].ancestors : 1u;
-    const uint depth = rows > 1 ? uint(tree[first + at].depth) : 0u;
+    const uint path = tree[first + at].ancestors;
+    const uint depth = tree[first + at].depth;
     // The path's rows ascend from its anchor, one a depth; one past the
     // row's depth where the path holds no cut.
     uint cut = 0;
