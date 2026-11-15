@@ -218,7 +218,9 @@ struct QwenTargetRequest final {
 };
 
 // A lane's rows of a prefill chunk: `tokens`, of positions from
-// chunk.committed_tokens on of `request`.
+// chunk.committed_tokens on of `request`, rows rowBegin to rowBegin + rows of
+// the chunk. A decode step's lane leaves them unset: the step's layout places
+// its rows (ops::LayoutRows), and only a prompt's helpers read them.
 struct QwenTargetPrefillSequence final {
   uint32_t lane = 0;
   uint32_t rowBegin = 0;
@@ -287,10 +289,10 @@ struct QwenTargetPrefillBuffers final {
 // decode tapes (ops::GdnTapeLane); each lane's verify rows, the first of its
 // rows, which alone route a MoE layer (ops::MoeBuffers::verifyRows); the
 // step's rows' places in their lanes' trees (ops::TreeRow), which the GDN and
-// attention layers read; each lane's auxiliary state before the step and its
-// pages' block index, for a layout with one; and the rows the draft reads
-// (the captured layers' rows), the final norm's rows and the logits of every
-// row of the step.
+// attention layers read; and the rows the draft reads (the captured layers'
+// rows), the final norm's rows and the logits of every row of the step. A
+// lane's auxiliary state before the step and its pages' block index are its
+// sequence's (QwenTargetPrefillSequence::auxiliaryIn, indexTable).
 struct QwenTargetDecodeBuffers final {
   ops::StepRows step{};
   std::array<metal::MetalBuffer, ExecutionLimits::maximumBatchWidth> currentGdnStates;
@@ -299,8 +301,6 @@ struct QwenTargetDecodeBuffers final {
   std::array<ops::GdnTapeLane, ExecutionLimits::maximumBatchWidth> gdnTapeLanes{};
   metal::MetalBuffer verifyRows;
   metal::MetalBuffer tree;
-  std::array<metal::MetalBuffer, ExecutionLimits::maximumBatchWidth> auxiliary;
-  std::array<metal::MetalBuffer, ExecutionLimits::maximumBatchWidth> indexTables;
   metal::MetalBuffer capturedTargetHidden;
   metal::MetalBuffer finalHidden;
   metal::MetalBuffer logits;
@@ -427,12 +427,12 @@ template <class Weights>
 // The target the runtime drives: a family's layers over the blocks every
 // Qwen target shares, made for its weights by makeQwenTarget. The shared
 // blocks are a step's checks and plans, the GDN and attention mixers (one
-// wiring each for prefill and for verify), the FFNs of a residual of one
-// row (a dense SwiGLU and a MoE block's routing and experts), the draft's
-// captures and the normed head; each family composes them into its layers
-// and residual: the Qwen3.5 architecture's (Qwen3.8-27B, Qwen3.6-35B-A3B and
-// Flint, model/QwenTarget.cpp) and Qwen3.8-Flash-Next's
-// (model/Qwen4ExpTarget.cpp).
+// wiring for a prompt chunk's and a decode step's rows), the FFNs of a
+// residual of one row (a dense SwiGLU and a MoE block's routing and
+// experts), the draft's captures and the normed head; each family composes
+// them into its layers and residual: the Qwen3.5 architecture's
+// (Qwen3.8-27B, Qwen3.6-35B-A3B and Flint, model/QwenTarget.cpp) and
+// Qwen3.8-Flash-Next's (model/Qwen4ExpTarget.cpp).
 // A family that needs more of a step than the buffers the runtime binds
 // keeps that scratch itself (qwenTargetScratchBytes) and makes its own
 // inputs of the step's tokens; the runtime calls the same functions for
@@ -448,13 +448,13 @@ public:
 
   [[nodiscard]] const ops::Projection &
   vocabularyProjection() const noexcept;
-  // Lanes of storage the tensors of a decode step of `lanes` lanes bind: a
-  // linear tile may hold more rows than the step (LinearPlan::storageRows;
-  // a three-lane GGUF step on the staged tile runs its 32-row tile over four
-  // lanes, a one-lane step may run its 16-row tile over two). Every op still
-  // processes the step's lanes; padding rows read stale activations and write
-  // results no active row reads.
-  [[nodiscard]] uint32_t decodeStorageLanes(uint32_t lanes) const;
+  // Lanes of storage, a draft's block of rows each, the vocabulary
+  // projection binds over a draft step of `lanes` lanes, which runs the
+  // target's head: its tile may hold more rows than the step's
+  // (LinearPlan::storageRows; a three-lane step on the staged tile runs its
+  // 32-row tile over four lanes). The head still processes the step's lanes;
+  // padding rows read stale activations and write results no row reads.
+  [[nodiscard]] uint32_t headStorageLanes(uint32_t lanes) const;
   // A prefill command of one or more chunks (a prefill group), run layer by
   // layer: a layer of each chunk in turn, then the next layer, so that a
   // layer whose experts stream loads the union of the chunks' experts once.
@@ -468,7 +468,10 @@ public:
   // prefill scratch the layers after read on, from another command, with no
   // other prefill between. With the last layer, returns each chunk's buffer
   // of its last layer's output rows, and else nothing; of those only each
-  // sequence's last row is sure to be computed (planOutputRows).
+  // sequence's last row is sure to be computed (planOutputRows). A decode
+  // step's one chunk (QwenTargetPrefillChunk::decode) ends in its own head
+  // over every row and captures every row the draft reads, in the step's
+  // buffers: what this returns of it is unread.
   //
   // With the first layer, it first writes the inputs the target makes of
   // the chunks' tokens on the CPU and stages a streamed table's rows of
@@ -492,8 +495,9 @@ public:
   // commands are encoded.
   virtual void prepareVerifyLane(uint32_t lane, uint64_t position, const QwenTargetRequest &request);
   // The head over `rows` rows of the last layer's output: one sweep of the
-  // vocabulary projection, as a decode step's forward ends (addPrefill with a
-  // decode chunk).
+  // vocabulary projection, over the rows of the first tokens after prompts
+  // (Runtime's initial selections), not a decode step's, whose forward ends
+  // in a head of its own (addPrefill with a decode chunk).
   virtual void addHeadBatch(metal::CommandGraph &graph, metal::MetalBuffer hidden,
                             metal::MetalBuffer finalHidden, metal::MetalBuffer logits,
                             uint32_t rows, ops::LinearScratch scratch) const = 0;

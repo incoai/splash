@@ -397,13 +397,11 @@ struct MoE final {
   // runs the gather and the passes over the tiles of experts resident before
   // the load beside it (addResident, as MoeExpertStream::addLoad's `beside`),
   // the rest after it (addRouted); a resident block's runs all of it after
-  // the routing (addRouted). add runs one step's. Steps that share a load (a
-  // prefill group's chunks, QwenTarget::addPrefillLayers) run their routings,
-  // one load of the union beside the first step's resident work, then each
-  // step's work through its combine before the next step's: they share the
-  // scratch their gathers and passes write, all but their routing.
-  static void add(metal::CommandGraph &graph, const MoeBuffers &buffers,
-                  const BlockMoeWeights &weights, const MoePlan &plan);
+  // the routing (addRouted). Steps that share a load (a prefill group's
+  // chunks, QwenTarget::addPrefillLayers) run their routings, one load of
+  // the union beside the first step's resident work, then each step's work
+  // through its combine before the next step's: they share the scratch their
+  // gathers and passes write, all but their routing.
   static void addRouting(metal::CommandGraph &graph, const MoeBuffers &buffers,
                          const BlockMoeWeights &weights, const MoePlan &plan);
   static void addResident(metal::CommandGraph &graph, const MoeBuffers &buffers,

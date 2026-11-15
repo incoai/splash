@@ -372,7 +372,7 @@ AttentionPlan PagedAttention::plan(std::span<const kv::ChunkedPrefillParams> seq
                                ? 0
                                : readPages(uint64_t{chunk.committed_tokens} + chunk.chunk_tokens,
                                            variant.windowTokens);
-    const uint32_t splits = attentionSplits(tiles, pages, variant.windowTokens, calibration.prefillPagesPerSplit);
+    const uint32_t splits = attentionSplits(tiles, pages, variant.windowTokens, calibration.pagesPerSplit);
     splitReads = std::max(splitReads, (pages + splits - 1) / splits);
     plan.sequences_[plan.sequenceCount_++] = {chunk.chunk_tokens, chunk.committed_tokens, 0, splits};
   }

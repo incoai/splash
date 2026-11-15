@@ -122,8 +122,8 @@ public:
   // stage finishes them for all of its chunks.
   void readAhead(std::span<const QwenTargetPrefillChunk> chunks);
 
-  // The scratch of a decode step's first `rows` rows (the target's storage
-  // rows of the step, QwenTarget::decodeStorageLanes).
+  // The scratch of a decode step's first `rows` rows, which a step's forward
+  // takes at its most rows, a verify block's a lane (Qwen4ExpTarget).
   [[nodiscard]] Qwen4Scratch verifyScratch(uint32_t rows) const;
   // Writes batch lane `lane`'s inputs of its verify rows from `position` on:
   // the tokens before them and the records of the QSA blocks a path of a

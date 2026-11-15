@@ -33,7 +33,7 @@ namespace {
 constexpr uint32_t kStride = kPageTokens;
 constexpr uint32_t kQueryStride = kStride;
 constexpr uint32_t kRows = kAttentionTileRows;
-static_assert(kRows == splash::ops::kDecodeLaneRows, "a decode lane's rows are one tile");
+static_assert(kRows == splash::ops::kNarrowLaneRows, "a lane of the narrow cap's rows is one tile");
 
 // The production GQA geometries, every family's (TestFamilies.hpp). The
 // group size selects the kernel specialization, which the plans name

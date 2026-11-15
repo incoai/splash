@@ -3,10 +3,8 @@
 #include "metal/abi/ExecutionGeometry.h"
 #include "metal/abi/VerifyTree.h"
 
-#include <algorithm>
 #include <cstdint>
 #include <limits>
-#include <span>
 #include <stdexcept>
 
 namespace splash::ops {
@@ -26,46 +24,21 @@ struct LaneRows {
 // one per row of a command's packed rows.
 using TreeRow = SplashTreeRow;
 
-// Row `row` of a chain, which follows row - 1.
-[[nodiscard]] constexpr TreeRow chainRow(uint32_t row) noexcept {
-  return {(2u << row) - 1u, static_cast<uint16_t>(row ? row - 1 : SPLASH_TREE_ROOT), static_cast<uint16_t>(row)};
-}
-
-// One past the last row any of `lanes` holds.
-[[nodiscard]] inline uint64_t rowsEnd(std::span<const LaneRows> lanes) noexcept {
-  uint64_t end = 0;
-  for (const LaneRows &lane : lanes) end = std::max(end, uint64_t{lane.first} + lane.rows);
-  return end;
-}
-
-// The most rows of any of `lanes`, which a grid of a lane's rows by lanes
-// spans.
-[[nodiscard]] inline uint32_t mostRows(std::span<const LaneRows> lanes) noexcept {
-  uint32_t most = 0;
-  for (const LaneRows &lane : lanes) most = std::max(most, lane.rows);
-  return most;
-}
-
-// The rows a decode cycle verifies of each lane (SPLASH_DECODE_LANE_ROWS),
-// which the GDN decode kernels of a chain hold.
-inline constexpr uint32_t kDecodeLaneRows = SPLASH_DECODE_LANE_ROWS;
-static_assert(kDecodeLaneRows <= SPLASH_GDN_CHAIN_ROWS && SPLASH_GDN_CHAIN_ROWS <= SPLASH_TARGET_VERIFY_ROWS,
-              "a decode cycle's lane rows run on the GDN chain kernels");
+// The most rows of a lane at the narrow lane cap (verifyLaneCap), which the
+// narrow GDN decode kernels hold: a draft's block, the most a step of
+// --verify-rows all gives a lane.
+inline constexpr uint32_t kNarrowLaneRows = SPLASH_GDN_NARROW_ROWS;
+static_assert(kNarrowLaneRows == SPLASH_DRAFT_QUERY_ROWS && kNarrowLaneRows <= SPLASH_TARGET_VERIFY_ROWS,
+              "a draft's block runs on the narrow GDN kernels");
 
 // The most rows of a lane's verify block in a decode step of `rows` rows over
 // `lanes` lanes, which the step's proposer chooses on the device within it:
-// those of the GDN decode kernels of a chain (SPLASH_GDN_CHAIN_ROWS) while
+// those of the narrow GDN decode kernels (SPLASH_GDN_NARROW_ROWS) while
 // the step's rows give each lane no more, which took 13-19% less time than
 // those of sixteen over a layer's 8-row chains (DRAM-cold, an M6); else a
 // verify block's most.
 [[nodiscard]] constexpr uint32_t verifyLaneCap(uint32_t rows, uint32_t lanes) noexcept {
-  return rows <= uint64_t{SPLASH_GDN_CHAIN_ROWS} * lanes ? SPLASH_GDN_CHAIN_ROWS : SPLASH_TARGET_VERIFY_ROWS;
-}
-
-// The path of the first `rows` rows of a chain, a block's rows a row mask
-// names as a tree's accepted path does (metal/abi/VerifyTree.h).
-[[nodiscard]] constexpr uint32_t chainPath(uint32_t rows) noexcept {
-  return rows >= 32 ? ~uint32_t{0} : (uint32_t{1} << rows) - 1;
+  return rows <= uint64_t{kNarrowLaneRows} * lanes ? kNarrowLaneRows : SPLASH_TARGET_VERIFY_ROWS;
 }
 
 // Lane rows as a proposer writes them on the device for the kernels after it

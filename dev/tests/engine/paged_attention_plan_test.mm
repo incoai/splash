@@ -1,3 +1,4 @@
+#include "ChainRows.hpp"
 #include "TestBuffers.hpp"
 #include "TestChecks.hpp"
 #include "ops/PagedAttention.hpp"
@@ -61,8 +62,8 @@ using splash::test::require;
 using Geometry = splash::test::AttentionGeometry;
 const std::vector<Geometry> kGeometries = splash::test::familyAttentionGeometries();
 
-// A decode lane's rows, one tile.
-constexpr uint32_t kLaneRows = ops::kDecodeLaneRows;
+// A lane of the narrow cap's rows (a decode lane of up to eight), one tile.
+constexpr uint32_t kLaneRows = ops::kNarrowLaneRows;
 static_assert(kLaneRows == kv::kAttentionTileRows);
 
 // Whether a layout's attention reads the blocks its index selects (the
@@ -2071,7 +2072,7 @@ void checkPathCommit(metal::MetalBackend &backend, kv::Layout layout) {
                            (layout.valuesTokenMajor ? " token-major values" : "");
   constexpr uint32_t kLanes = 4, kRows = SPLASH_TARGET_VERIFY_ROWS;
   const std::array<uint32_t, kLanes> committed{0, 25, 63, 100};
-  const std::array<uint32_t, kLanes> paths{0b1, 0b10001101, 0b1000001000100001, ops::chainPath(kRows)};
+  const std::array<uint32_t, kLanes> paths{0b1, 0b10001101, 0b1000001000100001, test::chainPath(kRows)};
   std::array<std::vector<uint32_t>, kLanes> pages;
   uint32_t total = 0;
   for (uint32_t lane = 0; lane < kLanes; ++lane) total += (committed[lane] + kRows + kv::kPageTokens - 1) / kv::kPageTokens;

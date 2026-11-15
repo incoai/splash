@@ -735,13 +735,8 @@ public:
     const metal::MetalBuffer whole = target_.get(tensor);
     return stepRows(whole, 0, whole ? whole.sizeBytes() : 0, rows);
   }
-  // Lane `lane`'s rows of a target row tensor, kDecodeRows from row
-  // kDecodeRows x lane, and those of the first `lanes` lanes.
-  [[nodiscard]] metal::MetalBuffer laneRows(TargetTensor tensor, uint32_t lane) const {
-    if (lane >= kLaneCount)
-      throw std::out_of_range("invalid decode lane");
-    return rows(tensor, {lane * kDecodeRows, kDecodeRows});
-  }
+  // The rows of a target row tensor that a step of `lanes` lanes may hold,
+  // kDecodeRows a lane.
   [[nodiscard]] metal::MetalBuffer lanesRows(TargetTensor tensor, uint32_t lanes) const {
     if (!lanes || lanes > kLaneCount)
       throw std::out_of_range("invalid decode batch width");

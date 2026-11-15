@@ -30,6 +30,7 @@
 // one block is its floor chunk alone, refused when the largest buffer does not
 // hold it; and a size that would take more chunks than the expert kernels'
 // address table holds is refused.
+#include "MoeStep.hpp"
 #include "MoeFixture.hpp"
 #include "TestAdmission.hpp"
 #include "TestChecks.hpp"
@@ -255,7 +256,7 @@ std::vector<uint16_t> runWeights(MetalBackend &backend, const BlockMoeWeights &w
   std::memset(b.moe.output.contents(), 0, b.moe.output.sizeBytes());
   verifyLanes(backend, b, step);
   CommandGraph graph;
-  MoE::add(graph, b.moe, weights, plan);
+  splash::test::addMoeStep(graph, b.moe, weights, plan);
   static_cast<void>(backend.submitCommandAsync(graph.command()).wait());
   const auto *output = static_cast<const uint16_t *>(b.moe.output.contents());
   return {output, output + uint64_t{plan.rows()} * plan.shape().hiddenSize};
@@ -1663,7 +1664,7 @@ int streamedSkippedLoadAfterShrink(const std::string &metallibPath, const MoeSha
   verifyLanes(backend, b, decode);
   CommandGraph graph;
   graph.host([] { throw std::runtime_error("test step before a load"); });
-  MoE::add(graph, b.moe, streamed[0], decode.plan);
+  splash::test::addMoeStep(graph, b.moe, streamed[0], decode.plan);
   std::string error;
   try {
     static_cast<void>(backend.submitCommandAsync(graph.command()).wait());

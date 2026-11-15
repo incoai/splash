@@ -19,6 +19,7 @@
 //   streams); the GPU PLE hash against the CPU's;
 // - each buffer the hyper-connection and PLE kernels reach, at its extent and
 //   one element short, and their refusal of norms not F32.
+#include "ChainRows.hpp"
 #include "../../../runtime/metal/CommandGraph.hpp"
 #include "../../../runtime/metal/MetalBackend.hpp"
 #include "../../../runtime/model/Qwen4Exp.hpp"
@@ -129,13 +130,13 @@ MetalBuffer laneRowsOf(MetalBackend &backend, std::span<const ops::LaneRows> lan
   return upload(backend, std::vector<ops::LaneRows>(lanes.begin(), lanes.end()));
 }
 MetalBuffer chainsOf(MetalBackend &backend, std::span<const ops::LaneRows> lanes) {
-  std::vector<ops::TreeRow> tree(ops::rowsEnd(lanes));
+  std::vector<ops::TreeRow> tree(splash::test::rowsEnd(lanes));
   for (const ops::LaneRows &lane : lanes)
-    for (uint32_t row = 0; row < lane.rows; ++row) tree[lane.first + row] = ops::chainRow(row);
+    for (uint32_t row = 0; row < lane.rows; ++row) tree[lane.first + row] = splash::test::chainRow(row);
   return upload(backend, tree);
 }
 ops::StepRows stepOf(std::span<const ops::LaneRows> lanes) {
-  return {static_cast<uint32_t>(lanes.size()), static_cast<uint32_t>(ops::rowsEnd(lanes)), ops::mostRows(lanes)};
+  return {static_cast<uint32_t>(lanes.size()), static_cast<uint32_t>(splash::test::rowsEnd(lanes)), splash::test::mostRows(lanes)};
 }
 
 // Flash-Next's mix: HYPER_CONNECTION_MAXIMUM_STREAMS streams of HYPER_CONNECTION_NORM_HIDDEN
@@ -381,7 +382,7 @@ void pleTest(MetalBackend &backend) {
   const auto knP = plus(kn), qnP = plus(qn), cnP = plus(cn);
   // The convolution input of a verify step's rows, which the commit reads.
   MetalBuffer gated = scratch(backend, rows * width * 4),
-              conv = scratch(backend, uint64_t{splash::ops::kDecodeLaneRows} * width * 2);
+              conv = scratch(backend, uint64_t{splash::ops::kNarrowLaneRows} * width * 2);
   MetalBuffer streamsBuffer = upload(backend, x), histIn = upload(backend, bf16s(hist)),
               histOut = scratch(backend, history * width * 2);
   CommandGraph graph;
@@ -456,7 +457,7 @@ void pleTest(MetalBackend &backend) {
     MetalBuffer committed = scratch(backend, history * width * 2), captured = scratch(backend, history * width * 2);
     CommandGraph graph3;
     ops::NgramEmbedding::addCommit(graph3, conv, std::span(&histIn, 1), std::span(&committed, 1),
-                                   upload(backend, std::vector<uint32_t>{splash::ops::chainPath(retained)}), shape,
+                                   upload(backend, std::vector<uint32_t>{splash::test::chainPath(retained)}), shape,
                                    laneRowsOf(backend, sequence), {1, rows, rows});
     ops::NgramEmbedding::addHistory(graph3, conv, histIn, captured, shape, retained);
     run(backend, graph3);
@@ -494,7 +495,7 @@ void pleTreeTest(MetalBackend &backend, std::span<const uint32_t> parents, uint3
   for (uint32_t r = 0; r < rows; ++r)
     tree[r] = r ? splash::ops::TreeRow{tree[parents[r]].ancestors | 1u << r, static_cast<uint16_t>(parents[r]),
                                        static_cast<uint16_t>(tree[parents[r]].depth + 1)}
-                : splash::ops::chainRow(0);
+                : splash::test::chainRow(0);
   const std::string scope = "PLE tree of " + std::to_string(rows) + " rows at " + std::to_string(taps) + " taps " +
                             std::to_string(dilation) + " apart";
   const auto conv = randoms(rng, rows * width, 1.0f), hist = randoms(rng, history * width, 1.0f),
@@ -872,7 +873,7 @@ std::vector<ops::TreeRow> qsaTree(std::span<const int> parents) {
 // The chain of `rows` rows.
 std::vector<ops::TreeRow> qsaChain(uint32_t rows) {
   std::vector<ops::TreeRow> chain;
-  for (uint32_t row = 0; row < rows; ++row) chain.push_back(ops::chainRow(row));
+  for (uint32_t row = 0; row < rows; ++row) chain.push_back(splash::test::chainRow(row));
   return chain;
 }
 
@@ -1084,7 +1085,7 @@ void qsaTreeAsChains(MetalBackend &backend, uint32_t anchor, uint32_t top) {
     leafPaths.push_back(qsaPath(lane.tree[leaf]));
     const QsaTreeLane chain = qsaChainOf(lane, leafPaths.back(), anchor);
     const bool commits = leafPaths.back() == std::vector<uint32_t>(committed.begin(), committed.end());
-    const std::array<uint32_t, 1> chainPath{ops::chainPath(static_cast<uint32_t>(committed.size()))};
+    const std::array<uint32_t, 1> chainPath{splash::test::chainPath(static_cast<uint32_t>(committed.size()))};
     chains.push_back(qsaTreeStep(backend, std::span(&chain, 1), histories, top, words, weights,
                                  commits ? std::span<const uint32_t>(chainPath) : std::span<const uint32_t>{}));
     if (commits) {
@@ -1190,7 +1191,7 @@ void qsaChainAsSequential(MetalBackend &backend, uint32_t anchor, uint32_t rows,
                           randoms(rng, uint64_t{rows} * D, 1.0f)};
   const uint32_t words = ((anchor + rows) / 4 + BLOCK_INDEXER_TILE_SLACK + 31) / 32 + 1, stride = words * 32;
   const std::array<const QsaLane *, 1> histories{&history};
-  const std::array<uint32_t, 1> path{ops::chainPath(accepted)};
+  const std::array<uint32_t, 1> path{splash::test::chainPath(accepted)};
   const QsaTreeResult whole = qsaTreeStep(backend, std::span(&chain, 1), histories, top, words, weights, path);
   const std::vector<uint8_t> chainIndex = download<uint8_t>(index, index.sizeBytes());
   std::memcpy(index.contents(), before.data(), before.size());
@@ -1299,7 +1300,7 @@ void qsaCommitLayers(MetalBackend &backend) {
   for (uint32_t layer = 0; layer < layers; ++layer) {
     const QsaTreeLane chain = qsaChainOf(lanes[layer], committed, anchor);
     const std::array<const QsaLane *, 1> histories{&history[layer]};
-    const std::array<uint32_t, 1> chainPath{ops::chainPath(static_cast<uint32_t>(committed.size()))};
+    const std::array<uint32_t, 1> chainPath{splash::test::chainPath(static_cast<uint32_t>(committed.size()))};
     const QsaTreeResult step = qsaTreeStep(backend, std::span(&chain, 1), histories, top, words, weights, chainPath);
     const std::vector<uint16_t> pending = download<uint16_t>(step.pendingAfter[0], kQsaPendingBytes / 2);
     pendingSame &= std::equal(pending.begin(), pending.end(),
@@ -1343,7 +1344,7 @@ void qsaPackedLanes(MetalBackend &backend) {
   const uint32_t words = ((2045 + 61 * 3 + 16) / 4 + BLOCK_INDEXER_TILE_SLACK + 31) / 32 + 1, stride = words * 32;
   // Paths that complete a block: 3 rows of the first lane, the branch's
   // deepest row, the anchor alone and 4 rows of the last lane.
-  const std::array<uint32_t, lanes> paths{ops::chainPath(3), lane[1].tree[5].ancestors, 1, ops::chainPath(4)};
+  const std::array<uint32_t, lanes> paths{splash::test::chainPath(3), lane[1].tree[5].ancestors, 1, splash::test::chainPath(4)};
   std::vector<const QsaLane *> all;
   for (const QsaLane &x : history) all.push_back(&x);
   const QsaTreeResult together = qsaTreeStep(backend, lane, all, top, words, weights, paths);
@@ -1402,7 +1403,7 @@ void qsaProjectPackedLanes(MetalBackend &backend) {
     ops::BlockIndexer::addProject(
         graph, upload(backend, query), upload(backend, key), weights.queryNorm, upload(backend, cos),
         upload(backend, sin), queries, keys, laneRowsOf(backend, lanes),
-        {static_cast<uint32_t>(lanes.size()), static_cast<uint32_t>(ops::rowsEnd(lanes)), cap});
+        {static_cast<uint32_t>(lanes.size()), static_cast<uint32_t>(splash::test::rowsEnd(lanes)), cap});
     run(backend, graph);
     return Projected{download<uint16_t>(queries, uint64_t{slots} * H * D), download<uint16_t>(keys, uint64_t{slots} * D)};
   };
@@ -1482,7 +1483,7 @@ void plePackedLanes(MetalBackend &backend) {
     ops::NgramEmbedding::addConvolution(
         graph, upload(backend, bf16s(conv)), in, out, tapsBuffer, upload(backend, gated), streamsBuffer, shape,
         laneRowsOf(backend, lanes),
-        {static_cast<uint32_t>(lanes.size()), static_cast<uint32_t>(ops::rowsEnd(lanes)), bound},
+        {static_cast<uint32_t>(lanes.size()), static_cast<uint32_t>(splash::test::rowsEnd(lanes)), bound},
         inTree ? upload(backend, std::vector<ops::TreeRow>(tree.begin(), tree.end())) : MetalBuffer{});
     run(backend, graph);
     Convolved result{download<uint32_t>(streamsBuffer, uint64_t{slots} * width), {}};
@@ -1578,7 +1579,7 @@ void plePackedCommit(MetalBackend &backend) {
     ops::NgramEmbedding::addCommit(
         graph, upload(backend, bf16s(conv)), in, out, upload(backend, std::vector<uint32_t>(paths.begin(), paths.end())),
         shape, laneRowsOf(backend, lanes),
-        {static_cast<uint32_t>(lanes.size()), static_cast<uint32_t>(ops::rowsEnd(lanes)), bound});
+        {static_cast<uint32_t>(lanes.size()), static_cast<uint32_t>(splash::test::rowsEnd(lanes)), bound});
     run(backend, graph);
     std::vector<std::vector<uint16_t>> result;
     for (const MetalBuffer &buffer : out) result.push_back(download<uint16_t>(buffer, historyValues));
@@ -1752,7 +1753,7 @@ void qsaRollbackTest(MetalBackend &backend) {
     const auto step = [&](uint32_t from, std::vector<float> keys, uint32_t accepted) {
       const QsaTreeLane chain{from, qsaChain(rows), randoms(rng, uint64_t{rows} * H * D, 1.0f), std::move(keys)};
       const std::array<const QsaLane *, 1> histories{&lane};
-      const std::array<uint32_t, 1> path{ops::chainPath(accepted)};
+      const std::array<uint32_t, 1> path{splash::test::chainPath(accepted)};
       lane.pending[0] = qsaTreeStep(backend, std::span(&chain, 1), histories, 512, words, weights, path).pendingAfter[0];
     };
     // The draft's rows after the first, which holds the committed token, are
@@ -1839,9 +1840,9 @@ void streamMeanTest(MetalBackend &backend) {
 
 // The PLE hash on the GPU against the same hash on the CPU, as
 // model/Qwen4Steps.cpp's qwen4PleRows computes it, of three lanes of
-// splash::ops::kDecodeLaneRows rows each.
+// splash::ops::kNarrowLaneRows rows each.
 void pleHashTest(MetalBackend &backend) {
-  const uint32_t lanes = 3, laneRows = splash::ops::kDecodeLaneRows, ngram = 3, perNgram = 8, heads = 16, eos = 248044;
+  const uint32_t lanes = 3, laneRows = splash::ops::kNarrowLaneRows, ngram = 3, perNgram = 8, heads = 16, eos = 248044;
   NgramHashParams params{};
   params.ngram = ngram;
   params.heads_per_ngram = perNgram;
@@ -2105,7 +2106,7 @@ void pleExtentsTest(MetalBackend &backend) {
   // Two lanes' commit, each its history before and after its path.
   splash::test::requireExtents(
       backend,
-      Extents{{0, uint64_t{2 * splash::ops::kDecodeLaneRows} * width * 2, 2, "n-gram embedding convolution input"},
+      Extents{{0, uint64_t{2 * splash::ops::kNarrowLaneRows} * width * 2, 2, "n-gram embedding convolution input"},
               {1, history, 2, "n-gram embedding history"},
               {2, history, 2, "n-gram embedding history"},
               {3, history, 2, "n-gram embedding next history"},
@@ -2115,16 +2116,16 @@ void pleExtentsTest(MetalBackend &backend) {
       [&](CommandGraph &graph, const Buffers &b) {
         const std::array<MetalBuffer, 2> in{b[1], b[2]}, out{b[3], b[4]};
         ops::NgramEmbedding::addCommit(graph, b[0], in, out, b[5], shape, b[6],
-                                       {2, 2 * splash::ops::kDecodeLaneRows, splash::ops::kDecodeLaneRows});
+                                       {2, 2 * splash::ops::kNarrowLaneRows, splash::ops::kNarrowLaneRows});
       });
   NgramHashParams params{};
   params.ngram = 3;
   params.heads_per_ngram = 8;
   const uint32_t heads = 16;
-  const std::array<ops::LaneRows, 3> blocks{{{0, splash::ops::kDecodeLaneRows},
-                                             {splash::ops::kDecodeLaneRows, splash::ops::kDecodeLaneRows},
-                                             {2 * splash::ops::kDecodeLaneRows, 3}}};
-  const uint64_t hashRows = 2 * splash::ops::kDecodeLaneRows + 3;
+  const std::array<ops::LaneRows, 3> blocks{{{0, splash::ops::kNarrowLaneRows},
+                                             {splash::ops::kNarrowLaneRows, splash::ops::kNarrowLaneRows},
+                                             {2 * splash::ops::kNarrowLaneRows, 3}}};
+  const uint64_t hashRows = 2 * splash::ops::kNarrowLaneRows + 3;
   splash::test::requireExtents(backend,
                                Extents{{0, hashRows * 4, 4, "n-gram hash token"},
                                        {1, hashRows * sizeof(ops::TreeRow), sizeof(ops::TreeRow),

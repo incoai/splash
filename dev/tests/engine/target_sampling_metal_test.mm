@@ -26,6 +26,7 @@
 // of non-finite logits select the sentinel 0xFFFFFFFF. The host
 // word helpers and the lifecycle that rebuilds a resumed request's words are
 // checked bitwise.
+#include "ChainRows.hpp"
 #include "PenaltyReference.hpp"
 #include "TestBuffers.hpp"
 #include "TestChecks.hpp"
@@ -64,9 +65,15 @@ using splash::metal::MetalBackend;
 using splash::metal::MetalBuffer;
 using namespace splash::ops;
 
-// A decode lane's rows, and its constraint-mask rows (metal/abi/Sampling.h),
-// one more than a verify block's most rows.
-constexpr uint32_t kRows = splash::ops::kDecodeLaneRows;
+// A decode lane's rows: the narrow cap's, or a verify block's where the build
+// defines TARGET_SAMPLING_LANE_ROWS (target-sampling-16), whose rows past the
+// eighth read uniforms, mask rows and paths no lane of the narrow cap reaches;
+// and a lane's constraint-mask rows (metal/abi/Sampling.h), one more than a
+// verify block's most rows.
+#ifndef TARGET_SAMPLING_LANE_ROWS
+#define TARGET_SAMPLING_LANE_ROWS splash::ops::kNarrowLaneRows
+#endif
+constexpr uint32_t kRows = TARGET_SAMPLING_LANE_ROWS;
 constexpr uint32_t kMaskRows = SPLASH_TARGET_VERIFY_ROWS + 1;
 // A lane's tree rows (the selector's draws and next probabilities of each),
 // and the uniforms before its child tests: a verify block's.
@@ -81,9 +88,11 @@ constexpr float kFloatMax = std::numeric_limits<float>::max();
 // SPLASH_NO_TOKEN.
 constexpr StopTokens kStopTokens{1, 2};
 
+using splash::test::chainRow;
 using splash::test::penaltyMatches;
 using splash::test::referencePenalty;
 using splash::test::rejects;
+using splash::test::rowsEnd;
 using splash::test::require;
 
 // As many stop tokens as the kernels compare, two in the first shard of the
@@ -152,12 +161,13 @@ StepRows layOut(const SamplingBuffers &buffers, std::span<const LaneRows> rows,
   return {static_cast<uint32_t>(rows.size()), static_cast<uint32_t>(rowsEnd(rows)), cap};
 }
 
-// Row `offset` of each of `lanes` lanes' blocks, which its first token after
-// a prompt is selected from, and where the selection writes it.
-std::vector<uint32_t> initialRows(size_t lanes, uint32_t offset) {
+// The row each of `lanes` lanes' first token after a prompt is selected
+// from, and where the selection writes it: lane x stride + offset, by
+// default row `offset` of each lane's block of kRows.
+std::vector<uint32_t> initialRows(size_t lanes, uint32_t offset, uint32_t stride = kRows) {
   std::vector<uint32_t> result;
   for (uint32_t lane = 0; lane < lanes; ++lane)
-    result.push_back(lane * kRows + offset);
+    result.push_back(lane * stride + offset);
   return result;
 }
 
@@ -487,7 +497,8 @@ uint32_t draftedCount(const uint32_t *inputs, uint32_t row, uint32_t token) {
 }
 
 // Checks every logit of a lane's rows [first, first + rows) against the
-// originals: penalized from the lane's words, or bitwise unchanged.
+// originals: penalized from the lane's words, or bitwise unchanged. Lane 0's
+// rows are the batch's rows, whatever lane they hold.
 void requirePenalizedRows(const Batch &batch, const std::vector<float> &original,
                           uint32_t lane, uint32_t first, uint32_t rows,
                           std::span<const uint32_t> words,
@@ -609,39 +620,39 @@ void penalties(MetalBackend &backend, uint32_t vocabulary, uint32_t lanes,
     }
   }
 
-  // The first token after each lane's prompt: one row per lane at an
-  // offset, no draft tokens; every other row keeps its logits.
-  constexpr uint32_t kOffset = 5;
-  std::copy(original.begin(), original.end(), batch.logits());
-  batch.poison();
-  CommandGraph initial;
-  sampling.addInitial(initial, policies, batch.buffers, initialRows(policies.size(), kOffset),
-                      kStopTokens, {table, rows});
-  static_cast<void>(backend.submitCommandAsync(initial.dispatches()).wait());
-  for (uint32_t lane = 0; lane < lanes; ++lane) {
-    const SamplingPolicy &policy = policies[lane];
-    const std::string lanePrefix = label + " initial lane " + std::to_string(lane);
-    requirePenalizedRows(batch, original, lane, kOffset, 1, words(lane),
-                         policy.penalties, false, lanePrefix);
-    for (uint32_t row = 0; row < kRows; ++row)
-      if (row != kOffset)
-        requirePenalizedRows(batch, original, lane, row, 1, {}, {}, false,
-                             lanePrefix + ", unselected row");
-    const float *selected = batch.row(lane * kRows + kOffset);
-    const Admission admits{
-        policy.constrained
-            ? batch.masks() + uint64_t{lane} * kMaskRows * batch.maskWords()
-            : nullptr,
-        policy.excludesStopTokens};
-    if (policy.samples())
-      requireInitialDraw(
-          batch, lane, lane * kRows + kOffset,
-          referenceDistribution(selected, vocabulary, policy, admits),
-          lanePrefix);
-    else
-      require(batch.outputTokens()[lane * kRows + kOffset] ==
-                  referenceArgmax(selected, vocabulary, admits),
-              lanePrefix + ": the initial token lost its penalized argmax");
+  // The first token after each lane's prompt: one row per lane, no draft
+  // tokens; every other row keeps its logits. Row = lane, as a command's
+  // heads write their lanes' final hidden (Runtime::submitInitialSelection),
+  // and a row at an offset into blocks of kRows, which the kernels take
+  // alike, reading a lane's state by its lane and a row's by its row.
+  for (const auto &[stride, offset] : {std::pair{1U, 0U}, std::pair{kRows, 5U}}) {
+    const std::vector<uint32_t> selectedRows = initialRows(policies.size(), offset, stride);
+    std::copy(original.begin(), original.end(), batch.logits());
+    batch.poison();
+    CommandGraph initial;
+    sampling.addInitial(initial, policies, batch.buffers, selectedRows, kStopTokens, {table, rows});
+    static_cast<void>(backend.submitCommandAsync(initial.dispatches()).wait());
+    const std::string layout = " at lane x " + std::to_string(stride) + " + " + std::to_string(offset);
+    for (uint32_t row = 0; row < lanes * kRows; ++row)
+      if (std::ranges::find(selectedRows, row) == selectedRows.end())
+        requirePenalizedRows(batch, original, 0, row, 1, {}, {}, false, label + " initial" + layout + ", unselected row");
+    for (uint32_t lane = 0; lane < lanes; ++lane) {
+      const SamplingPolicy &policy = policies[lane];
+      const std::string lanePrefix = label + " initial lane " + std::to_string(lane) + layout;
+      const uint32_t row = selectedRows[lane];
+      requirePenalizedRows(batch, original, 0, row, 1, words(lane), policy.penalties, false, lanePrefix);
+      const float *selected = batch.row(row);
+      const Admission admits{
+          policy.constrained
+              ? batch.masks() + uint64_t{lane} * kMaskRows * batch.maskWords()
+              : nullptr,
+          policy.excludesStopTokens};
+      if (policy.samples())
+        requireInitialDraw(batch, lane, row, referenceDistribution(selected, vocabulary, policy, admits), lanePrefix);
+      else
+        require(batch.outputTokens()[row] == referenceArgmax(selected, vocabulary, admits),
+                lanePrefix + ": the initial token lost its penalized argmax");
+    }
   }
 }
 
@@ -1716,6 +1727,10 @@ void thinkingCutoffs(MetalBackend &backend, uint32_t vocabulary) {
   // take each lane's block as a chain, as its selector lays it out.
   writeChains(batch.buffers.treeRows, blocks(kLanes));
   const AcceptanceBuffers acceptance = acceptanceBuffers(backend, batch, kLanes);
+  // A verify's chain drafts a token at each row after its anchor: at the
+  // draft's positions in a lane of eight rows, and past them in a lane of
+  // sixteen as the selector's chains do.
+  constexpr uint32_t kDrafts = kRows - 1;
   // A draft token, at verify input row position + 1.
   const auto draft = [&](uint32_t lane, uint32_t position, uint32_t token) {
     batch.inputTokens()[lane * kRows + position + 1] = token;
@@ -1732,12 +1747,12 @@ void thinkingCutoffs(MetalBackend &backend, uint32_t vocabulary) {
   // Acceptance keeps the drafts up to the first one that is not its row's
   // token, and that row's token.
   const auto retainedRows = [](std::span<const uint32_t> drafts, std::span<const uint32_t> rows) {
-    const auto mismatch = std::ranges::mismatch(drafts, rows.first(kPositions));
+    const auto mismatch = std::ranges::mismatch(drafts, rows.first(kDrafts));
     return mismatch.in1 == drafts.end() ? kRows : uint32_t(mismatch.in1 - drafts.begin()) + 1;
   };
   const auto verifyLanes = [&](CommandGraph &verify, std::span<const SamplingPolicy> policies,
                                const std::array<std::array<uint32_t, kRows>, kLanes> &expected,
-                               const std::array<std::array<uint32_t, kPositions>, kLanes> &drafts) {
+                               const std::array<std::array<uint32_t, kDrafts>, kLanes> &drafts) {
     std::fill(uniforms, uniforms + kLanes * kUniforms, 0.5F);
     sampling.addVerify(verify, policies, batch.buffers, layOut(batch.buffers, blocks(policies.size())), stops, {});
     require(cutoffDispatches(verify) == 1, "a verify with cutoffs dispatched them other than once");
@@ -1763,7 +1778,7 @@ void thinkingCutoffs(MetalBackend &backend, uint32_t vocabulary) {
           std::vector<SamplingPolicy> policies;
           // The token each lane's row selects, and the lane's draft tokens.
           std::array<std::array<uint32_t, kRows>, kLanes> expected{};
-          std::array<std::array<uint32_t, kPositions>, kLanes> drafts{};
+          std::array<std::array<uint32_t, kDrafts>, kLanes> drafts{};
           for (uint32_t lane = 0; lane < kLanes; ++lane) {
             SamplingPolicy policy{32, (samplingMask >> lane & 1U) ? 0.8F : 0.0F};
             const uint32_t cut = cuts[lane];
@@ -1772,7 +1787,7 @@ void thinkingCutoffs(MetalBackend &backend, uint32_t vocabulary) {
             for (uint32_t row = 0; row < kRows; ++row) {
               fill(lane * kRows + row, best(lane * kRows + row));
               expected[lane][row] = best(lane * kRows + row);
-              if (row < kPositions)
+              if (row < kDrafts)
                 drafts[lane][row] = best(lane * kRows + row);
             }
             // Where thinking ends at a draft token the target agrees with
@@ -1786,11 +1801,11 @@ void thinkingCutoffs(MetalBackend &backend, uint32_t vocabulary) {
               for (uint32_t index = 0; index < end.size() && cut + index < kRows; ++index) {
                 expected[lane][cut + index] = end[index];
                 const bool drafted = kind == Draft::DraftsAll || (kind == Draft::DraftsFirst && index == 0);
-                if (drafted && cut + index < kPositions)
+                if (drafted && cut + index < kDrafts)
                   drafts[lane][cut + index] = end[index];
               }
             }
-            for (uint32_t position = 0; position < kPositions; ++position)
+            for (uint32_t position = 0; position < kDrafts; ++position)
               draft(lane, position, drafts[lane][position]);
           }
           batch.poison();
@@ -1818,7 +1833,7 @@ void thinkingCutoffs(MetalBackend &backend, uint32_t vocabulary) {
                                           std::pair{PerLane{0, 1, 5, 7}, PerLane{kRows, 0, 3, 1}}}) {
           std::vector<SamplingPolicy> policies;
           std::array<std::array<uint32_t, kRows>, kLanes> expected{};
-          std::array<std::array<uint32_t, kPositions>, kLanes> drafts{};
+          std::array<std::array<uint32_t, kDrafts>, kLanes> drafts{};
           std::fill_n(masks, uint64_t{kLanes} * kMaskRows * words, ~0U);
           for (uint32_t lane = 0; lane < kLanes; ++lane) {
             SamplingPolicy policy{32, (samplingMask >> lane & 1U) ? 0.8F : 0.0F, 1.0F, true};
@@ -1827,24 +1842,24 @@ void thinkingCutoffs(MetalBackend &backend, uint32_t vocabulary) {
             for (uint32_t row = 0; row < kRows; ++row) {
               fill(lane * kRows + row, best(lane * kRows + row));
               expected[lane][row] = best(lane * kRows + row);
-              if (row < kPositions)
+              if (row < kDrafts)
                 drafts[lane][row] = best(lane * kRows + row);
             }
             // Verify row r reads mask row r + 1.
             const uint32_t start = std::min(cuts[lane] + waits[lane], kRows);
             for (uint32_t row = cuts[lane]; row < start; ++row)
               refuse(lane, row + 1, end[0]);
-            if (kind == Waiting::EndsWhileWaiting && end.size() > 1 && cuts[lane] < start && start <= kPositions) {
+            if (kind == Waiting::EndsWhileWaiting && end.size() > 1 && cuts[lane] < start && start <= kDrafts) {
               const uint32_t at = start - 1;
               fill(lane * kRows + at, close);
               expected[lane][at] = drafts[lane][at] = close;
             } else {
               for (uint32_t index = 0; index < end.size() && start + index < kRows; ++index)
                 expected[lane][start + index] = end[index];
-              if (kind == Waiting::DraftsFirst && start < kPositions)
+              if (kind == Waiting::DraftsFirst && start < kDrafts)
                 drafts[lane][start] = end[0];
             }
-            for (uint32_t position = 0; position < kPositions; ++position)
+            for (uint32_t position = 0; position < kDrafts; ++position)
               draft(lane, position, drafts[lane][position]);
           }
           for (const SamplingPolicy &policy : policies)
@@ -1869,7 +1884,7 @@ void thinkingCutoffs(MetalBackend &backend, uint32_t vocabulary) {
   for (const uint32_t samplingMask : {0U, 0b0101U, 0b1111U}) {
     std::vector<SamplingPolicy> policies;
     std::array<std::array<uint32_t, kRows>, kLanes> expected{};
-    std::array<std::array<uint32_t, kPositions>, kLanes> drafts{};
+    std::array<std::array<uint32_t, kDrafts>, kLanes> drafts{};
     for (uint32_t lane = 0; lane < kLanes; ++lane) {
       SamplingPolicy policy{32, (samplingMask >> lane & 1U) ? 0.8F : 0.0F};
       policy.thinkingCutoff = started[lane];
@@ -1878,7 +1893,7 @@ void thinkingCutoffs(MetalBackend &backend, uint32_t vocabulary) {
       for (uint32_t row = 0; row < kRows; ++row) {
         fill(lane * kRows + row, best(lane * kRows + row));
         expected[lane][row] = best(lane * kRows + row);
-        if (row < kPositions) {
+        if (row < kDrafts) {
           draft(lane, row, best(lane * kRows + row));
           drafts[lane][row] = best(lane * kRows + row);
         }
@@ -1918,7 +1933,7 @@ void thinkingCutoffs(MetalBackend &backend, uint32_t vocabulary) {
       policies.push_back(policy);
       for (uint32_t row = 0; row < kRows; ++row) {
         fill(lane * kRows + row, best(lane * kRows + row));
-        if (row < kPositions)
+        if (row < kDrafts)
           draft(lane, row, best(lane * kRows + row));
       }
       float *values = batch.row(lane * kRows + nonFinite[lane]);
@@ -2744,6 +2759,21 @@ void childTests(MetalBackend &backend) {
                                              SamplingPolicy{0, 1.0F, 1.0F}, SamplingPolicy{40, 1.3F, 0.9F}};
   Random random(0x63686c64);
   std::mt19937_64 rng(0x63686c64);
+  // A lane of more than eight rows branches at its anchor: its rows from the
+  // ninth hang off row 0 beside row 1, then as a chain, so that rows past the
+  // eighth at depths the draft proposes draw children too (each with its
+  // depth's candidates, which a lane holds once a depth).
+  std::array<uint32_t, kRows> depths{};
+  for (uint32_t row = 0; row < kRows; ++row) depths[row] = row < 8 ? row : row - 7;
+  for (uint32_t lane = 0; lane < kLanes && kRows > 8; ++lane) {
+    auto *tree = static_cast<TreeRow *>(batch.buffers.treeRows.contents()) + lane * kRows;
+    for (uint32_t row = 8; row < kRows; ++row) {
+      const uint32_t parent = row == 8 ? 0 : row - 1;
+      tree[row] = {tree[parent].ancestors | 1U << row, static_cast<uint16_t>(parent),
+                   static_cast<uint16_t>(depths[row])};
+    }
+  }
+  const auto drawsChildren = [&](uint32_t row) { return row + 1 < kRows && depths[row] < kPositions; };
   uint32_t checked = 0, drawn = 0;
   for (uint32_t round = 0; round < 24; ++round) {
     for (uint32_t row = 0; row < batch.rows; ++row)
@@ -2752,17 +2782,27 @@ void childTests(MetalBackend &backend) {
       batch.uniforms()[uniform] = 0.5F * (random.unit() + 1.0F);
     std::vector<std::vector<Children>> rows(kLanes, std::vector<Children>(kRows));
     for (uint32_t lane = 0; lane < kLanes; ++lane)
-      for (uint32_t row = 0; row + 1 < kRows && row < kPositions; ++row) {
+      for (uint32_t row = 0; row < kRows; ++row) {
+        if (!drawsChildren(row))
+          continue;
         Children &children = rows[lane][row];
-        // The row's likeliest tokens and others, all distinct.
-        std::vector<uint32_t> ids = referenceBest(batch.row(lane * kRows + row), vocabulary, 6);
-        while (ids.size() < kCandidates) {
-          const uint32_t id = random.next() % vocabulary;
-          if (std::find(ids.begin(), ids.end(), id) == ids.end())
-            ids.push_back(id);
+        if (depths[row] != row) {
+          // Its depth's row's logits too, whose likeliest tokens are among
+          // the candidates, so that its tests' outcomes follow their
+          // uniforms (of other tokens' it would reject every child).
+          std::copy_n(batch.row(lane * kRows + depths[row]), vocabulary, batch.row(lane * kRows + row));
+          children.ids = rows[lane][depths[row]].ids;
+        } else {
+          // The row's likeliest tokens and others, all distinct.
+          std::vector<uint32_t> ids = referenceBest(batch.row(lane * kRows + row), vocabulary, 6);
+          while (ids.size() < kCandidates) {
+            const uint32_t id = random.next() % vocabulary;
+            if (std::find(ids.begin(), ids.end(), id) == ids.end())
+              ids.push_back(id);
+          }
+          std::shuffle(ids.begin(), ids.end(), rng);
+          std::copy(ids.begin(), ids.end(), children.ids.begin());
         }
-        std::shuffle(ids.begin(), ids.end(), rng);
-        std::copy(ids.begin(), ids.end(), children.ids.begin());
         const bool outside = row == 0 && lane == round % kLanes;
         if (outside)
           children.ids[kCandidates - 1] = 0xffffffffU;
@@ -2776,7 +2816,7 @@ void childTests(MetalBackend &backend) {
         for (double &value : children.q)
           value /= total;
         children.draws = drawChildren(children.q, (round + row + lane) % (kChildren + 1), rng);
-        setChildren(batch, lane, row, row, children);
+        setChildren(batch, lane, row, depths[row], children);
       }
     batch.poison();
     CommandGraph graph;
@@ -2784,7 +2824,9 @@ void childTests(MetalBackend &backend) {
                        {table, tableRows});
     static_cast<void>(backend.submitCommandAsync(graph.dispatches()).wait());
     for (uint32_t lane = 0; lane < kLanes; ++lane)
-      for (uint32_t row = 0; row + 1 < kRows && row < kPositions; ++row) {
+      for (uint32_t row = 0; row < kRows; ++row) {
+        if (!drawsChildren(row))
+          continue;
         const Distribution target = referenceDistribution(batch.row(lane * kRows + row), vocabulary, policies[lane]);
         ++drawn;
         if (target.ambiguousMass > 0.0)

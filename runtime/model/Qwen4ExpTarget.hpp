@@ -70,7 +70,8 @@ private:
   };
   // The family's prefill layers. The streams start as the embedding's rows;
   // every MoE adds its rows to zeros into the branch the next mix adds to the
-  // streams; the final mix goes into buffers.hidden[1].
+  // streams; the final mix goes into buffers.hidden[1], a decode step's into
+  // its final hidden (QwenTargetDecodeBuffers::finalHidden).
   void addPrefillBegin(PrefillStep &step) const;
   [[nodiscard]] bool attends(uint32_t index) const;
   void addPrefillLayer(PrefillStep &step, uint32_t index) const;

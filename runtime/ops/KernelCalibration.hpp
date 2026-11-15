@@ -108,9 +108,9 @@ struct FloatTileCalibration final {
 };
 
 struct AttentionCalibration final {
-  // A dense prefill tile takes one history split per this many pages its
-  // rows read (PagedAttention.cpp).
-  uint32_t prefillPagesPerSplit;
+  // A dense tile of a sequence of tiles, a prompt chunk's or a 9- to 16-row
+  // lane's, takes one history split per this many pages its rows read.
+  uint32_t pagesPerSplit;
   // From this many pages each split of the longest tile or lane reads, a
   // dense split over INT8 pages scores INT8 queries (PagedAttention.cpp).
   uint32_t int8QueriesFromPages;
@@ -296,7 +296,7 @@ inline constexpr FloatTileCalibration kApple10FloatTile{true, 16, 3, 4, 6};
 // of 8 pages or more scores INT8 queries, repaying their quantization once
 // per threadgroup: splits of 1-5 pages took up to 31% more, of 9 less (M6,
 // 20-core M5 Pro).
-inline constexpr AttentionCalibration kApple10Attention{.prefillPagesPerSplit = 32, .int8QueriesFromPages = 8};
+inline constexpr AttentionCalibration kApple10Attention{.pagesPerSplit = 32, .int8QueriesFromPages = 8};
 
 // No Apple9 GPU scores INT8 queries: on a 10-core M4 they took 8-12% longer,
 // its matrix operations sharing the FP32 pipe. Larger Apple9 GPUs, unmeasured,
@@ -312,7 +312,7 @@ inline constexpr AttentionCalibration kApple9Attention = [] {
 // after 4K tokens. Larger Apple9 GPUs, unmeasured, keep 32.
 inline constexpr AttentionCalibration kApple9SmallAttention = [] {
   AttentionCalibration row = kApple9Attention;
-  row.prefillPagesPerSplit = 64;
+  row.pagesPerSplit = 64;
   return row;
 }();
 

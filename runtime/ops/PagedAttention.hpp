@@ -262,7 +262,7 @@ public:
   // dispatches each fit `capacity`, a workspace. Each sequence's tiles take
   // the history splits its rows and the pages its tiles read of its history
   // decide (attentionSplits, PagedAttention.cpp), with the device's
-  // `prefillPagesPerSplit` (AttentionCalibration). With `int8Activations`
+  // `pagesPerSplit` (AttentionCalibration). With `int8Activations`
   // on, the plan's queries score as INT8 against INT8 pages (the dense
   // kernels' q8q entries) where some tile's splits read at least the
   // device's `int8QueriesFromPages` pages each: a command's sequences share

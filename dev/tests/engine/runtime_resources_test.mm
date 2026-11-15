@@ -1222,7 +1222,7 @@ void testADecodeCapturePastItsCycleWaits(const char *metallibPath) {
   require(executor.capturesInDecode(), "the planned model captures no state in decode");
   // The prompt ends 12 rows before the page; its pages repeat the runway's.
   constexpr uint32_t page = kv::kPageTokens, promptTokens = page - 12;
-  static_assert(page - promptTokens > model::ExecutionLimits::decodeLaneRows &&
+  static_assert(page - promptTokens > model::ExecutionLimits::draftQueryRows &&
                     page - promptTokens <= model::ExecutionLimits::targetVerifyRows,
                 "the page lies past a cycle's lane rows and within a verify block's");
   const std::vector<uint32_t> prompt(promptTokens, 7);

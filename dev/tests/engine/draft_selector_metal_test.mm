@@ -26,6 +26,7 @@
 // pack the lanes' rows in lane order with the step's other rows on the first
 // lanes under the cap, and number a lane's verify rows in preorder, the
 // earlier-taken child first.
+#include "ChainRows.hpp"
 #include "LinearNumerics.hpp"
 #include "TestBuffers.hpp"
 #include "TestChecks.hpp"
@@ -62,6 +63,7 @@ using splash::metal::MetalBackend;
 using splash::metal::MetalBuffer;
 using namespace splash::ops;
 using splash::test::bf16ToFloat;
+using splash::test::chainRow;
 using splash::test::floatToBf16;
 
 constexpr uint32_t kRows = SPLASH_DRAFT_QUERY_ROWS;

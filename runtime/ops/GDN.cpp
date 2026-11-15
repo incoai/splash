@@ -28,9 +28,9 @@ uint32_t headFlags(GdnShape shape, GdnHeadOrder order) noexcept {
 static_assert(offsetof(GDNDecodeBatchParams, conv_layer_bytes) == 8);
 
 // The rows of a lane's block and of its pending path the decode kernels hold
-// (kernels/decode/gdn.metal): a chain's (SPLASH_GDN_CHAIN_ROWS), and with
-// _r16 every row of a verify block.
-static_assert(SPLASH_TARGET_VERIFY_ROWS == 16 && SPLASH_GDN_CHAIN_ROWS < SPLASH_TARGET_VERIFY_ROWS,
+// (kernels/decode/gdn.metal): the narrow rows (SPLASH_GDN_NARROW_ROWS), and
+// with _r16 every row of a verify block.
+static_assert(SPLASH_TARGET_VERIFY_ROWS == 16 && SPLASH_GDN_NARROW_ROWS < SPLASH_TARGET_VERIFY_ROWS,
               "the _r16 kernels hold every row of a block");
 
 // The compiled GDN shapes (kernels/prefill/gdn.metal, kernels/decode/gdn.metal),
@@ -271,7 +271,7 @@ PreparedInput GDN::addDecode(metal::CommandGraph &graph, GdnDecodeBuffers buffer
     bindings.insert(bindings.end(), {buffers.linearScratch.input, buffers.linearScratch.sums});
   const std::string name = std::string("verify_gdn_fused") + tableSuffix(input) + std::string(kernel.suffix);
   graph.add(stateKernel(normKernel(name, buffers.mixerNorm, shape.headDimension), state.format) +
-                (most > SPLASH_GDN_CHAIN_ROWS ? "_r16" : ""),
+                (most > SPLASH_GDN_NARROW_ROWS ? "_r16" : ""),
             std::move(bindings), params, {shape.valueHeads, lanes, 1});
   if (!prepare) return {};
   return {buffers.hidden, input};

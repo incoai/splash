@@ -64,16 +64,16 @@ using metal::MetalBuffer;
 constexpr ops::StepRows stepOf(uint32_t lanes, uint32_t rows) noexcept {
   return {lanes, rows, ops::verifyLaneCap(rows, lanes)};
 }
-// The row a lane selects its first token after a prompt from, lane x
-// decodeLaneRows: the target's LM head runs over decodeLaneRows rows of each
-// of the command's lanes (encodeInitialSelections), not over the decode
-// arena's kDecodeRows a lane. The prompt's final row of the hidden goes
-// there, and the selection reads its logits and writes its token there.
-constexpr std::array<uint32_t, kLaneCount> kDecodeFirstRows = [] {
-  std::array<uint32_t, kLaneCount> rows{};
-  for (uint32_t lane = 0; lane < kLaneCount; ++lane) rows[lane] = lane * ExecutionLimits::decodeLaneRows;
+// A lane selects its first token after a prompt from its row of the decode
+// arena, row `lane`: the target's LM head runs over a row of each of the
+// command's lanes (encodeInitialSelections). The prompt's final row of the
+// hidden goes there, and the selection reads its logits and writes its token
+// there. Each of `lanes` lanes' row, for Sampling::addInitial.
+std::vector<uint32_t> laneRowsOf(uint32_t lanes) {
+  std::vector<uint32_t> rows(lanes);
+  std::iota(rows.begin(), rows.end(), 0U);
   return rows;
-}();
+}
 
 // What a command's sample reports of its work (ModelBatchTicket::sample):
 // the work it encodes, with the weights it read on demand as the store's
@@ -734,7 +734,7 @@ struct Runtime::Impl {
     const std::array<uint32_t, 2> stateLanes{0, 1};
     const ops::PenaltyTable penalties{penaltyTable, stateLanes};
     CommandGraph graph;
-    sampling.addInitial(graph, policies, samplingBuffers(2), std::span(kDecodeFirstRows).first(2),
+    sampling.addInitial(graph, policies, samplingBuffers(2), laneRowsOf(2),
                         geometry.target.stopTokens, penalties);
     sampling.addVerify(graph, policies, samplingBuffers(2), stepOf(2, 2 * kDraftRows), geometry.target.stopTokens,
                        penalties);
@@ -1248,10 +1248,10 @@ struct Runtime::Impl {
   }
 
   // A constrained lane keeps its final prompt row, which prefill leaves at
-  // its first row of Hidden0 (kDecodeFirstRows), until its first mask arrives.
+  // its lane's row of Hidden0, until its first mask arrives.
   void captureFinalHidden(Request &entry, uint32_t lane) const {
-    const uint16_t *source = contents<uint16_t>(
-        decodeArena->rows(TargetTensor::Hidden0, {kDecodeFirstRows[lane], 1}), "target final hidden source");
+    const uint16_t *source =
+        contents<uint16_t>(decodeArena->rows(TargetTensor::Hidden0, {lane, 1}), "target final hidden source");
     entry.finalTargetHidden.assign(source,
                                    source + geometry.target.hiddenSize);
   }
@@ -1508,9 +1508,9 @@ struct Runtime::Impl {
            std::to_string(negative) + " -inf of " + std::to_string(vocabulary);
   }
 
-  // A lane of an initial selection, whose final prompt row is at row 0 of
-  // its Hidden0 block: one that selects its first token, or a score lane,
-  // which needs only the logits.
+  // A lane of an initial selection, whose final prompt row is at its lane's
+  // row of Hidden0: one that selects its first token, or a score lane, which
+  // needs only the logits.
   struct InitialSelection final {
     Request *entry = nullptr;
     uint32_t lane = 0;
@@ -1538,7 +1538,7 @@ struct Runtime::Impl {
       const float *logits = contents<float>(decodeArena->batchSlice(DecodeTensor::Logits, kLaneCount), "logits");
       capturedTargetLogits.resize(lanes);
       for (uint32_t lane = 0; lane < lanes; ++lane) {
-        const ops::LaneRows rows = verify ? laneRows(lane) : ops::LaneRows{kDecodeFirstRows[lane], 1};
+        const ops::LaneRows rows = verify ? laneRows(lane) : ops::LaneRows{lane, 1};
         const uint32_t copied =
             verify ? *contents<uint32_t>(decodeArena->get(lane, DecodeTensor::VerifyRows), "verify rows") : 1;
         if (!copied || copied > rows.rows)
@@ -1550,22 +1550,19 @@ struct Runtime::Impl {
   }
 #endif
 
-  // One LM head over the batch's `width` lanes, then one selection of the
-  // first token of every selecting lane from its first row's logits
-  // (kDecodeFirstRows), whose token initialToken() reads. The head computes,
-  // and nothing reads, the other rows of each lane and the lanes not listed;
-  // a lane that does not select takes the argmax of its row. Sampled lanes'
-  // uniforms and constrained lanes' masks are uploaded first.
+  // One LM head over the batch's `width` lanes' rows, row `lane` each,
+  // its tensors bound whole as a decode step's forward binds them, then one
+  // selection of the first token of every selecting lane from its row's
+  // logits, whose token initialToken() reads. The head computes, and nothing
+  // reads, the rows of the lanes not listed; a lane that does not select
+  // takes the argmax of its row. Sampled lanes' uniforms and constrained
+  // lanes' masks are uploaded first.
   void encodeInitialSelections(CommandGraph &graph,
                                std::span<const InitialSelection> lanes,
                                uint32_t width) {
-    const uint32_t storage = targetModel->decodeStorageLanes(width);
-    auto d = [&](DecodeTensor tensor) {
-      return decodeArena->batchSlice(tensor, storage);
-    };
-    targetModel->addHeadBatch(graph, decodeArena->lanesRows(TargetTensor::Hidden0, storage),
-                             d(DecodeTensor::FinalHidden),
-                             d(DecodeTensor::Logits), width * ExecutionLimits::decodeLaneRows,
+    targetModel->addHeadBatch(graph, decodeArena->lanesRows(TargetTensor::Hidden0, kLaneCount),
+                             decodeArena->batchSlice(DecodeTensor::FinalHidden, kLaneCount),
+                             decodeArena->batchSlice(DecodeTensor::Logits, kLaneCount), width,
                              decodeArena->linearScratch());
     if (std::ranges::none_of(lanes, &InitialSelection::select))
       return;
@@ -1581,16 +1578,15 @@ struct Runtime::Impl {
     encodeTargetLogitsCapture(graph, width, false);
 #endif
     sampling.addInitial(graph, std::span(policies).first(width),
-                        samplingBuffers(width), std::span(kDecodeFirstRows).first(width),
+                        samplingBuffers(width), laneRowsOf(width),
                         geometry.target.stopTokens,
                         {penaltyTable, std::span(stateLanes).first(width)});
   }
 
   // The first token encodeInitialSelections() selected for a batch lane: a
-  // selection writes a row's token at its row, the lane's first.
+  // selection writes a row's token at its row, the lane's.
   uint32_t initialToken(uint32_t lane) const {
-    return *contents<uint32_t>(decodeArena->rows(DecodeTensor::OutputTokens, {kDecodeFirstRows[lane], 1}),
-                               "initial tokens");
+    return *contents<uint32_t>(decodeArena->rows(DecodeTensor::OutputTokens, {lane, 1}), "initial tokens");
   }
 
   // Selects the first token of each constrained lane of the plan under the
@@ -1610,7 +1606,7 @@ struct Runtime::Impl {
         throw std::logic_error("initial selection state is invalid");
       }
       std::ranges::copy(entry.finalTargetHidden,
-                        contents<uint16_t>(decodeArena->rows(TargetTensor::Hidden0, {kDecodeFirstRows[lane], 1}),
+                        contents<uint16_t>(decodeArena->rows(TargetTensor::Hidden0, {lane, 1}),
                                            "final prompt hidden"));
       if (samplingEnabled(entry))
         uploadInitialUniform(entry, lane);
@@ -1632,7 +1628,7 @@ struct Runtime::Impl {
         const uint32_t token = initialToken(selection.lane);
         // A failed selection leaves no anchor: the engine ends the request
         // before any output, and the other lanes go on.
-        result.failure = invalidSelection({&token, 1}, kDecodeFirstRows[selection.lane], 1);
+        result.failure = invalidSelection({&token, 1}, selection.lane, 1);
         if (!result.failure.empty()) {
           entry.resultInvalid = true;
           continue;
@@ -2010,7 +2006,7 @@ struct Runtime::Impl {
   }
 
   // A lane whose command finishes its prompt copies the prompt's row of the
-  // final hidden, `lastRow`, to its first row of Hidden0 (kDecodeFirstRows).
+  // final hidden, `lastRow`, to its lane's row of Hidden0.
   // A constrained lane's completion captures that row into finalTargetHidden
   // (captureFinalHidden), which holds it until the first mask. The others
   // share one head: a score lane reads raw logits at the final prompt
@@ -2022,7 +2018,7 @@ struct Runtime::Impl {
       return std::nullopt;
     const uint32_t hidden = geometry.target.hiddenSize;
     ops::RowCopy::add(graph, lastRow, {0, hidden, 0},
-                      decodeArena->rows(TargetTensor::Hidden0, {kDecodeFirstRows[lane], 1}), {0, hidden, 0}, 1,
+                      decodeArena->rows(TargetTensor::Hidden0, {lane, 1}), {0, hidden, 0}, 1,
                       hidden);
     if (entry.constraint != ConstraintMode::None) return std::nullopt;
     const bool scoring = !entry.scoreTokens.empty();
@@ -2284,10 +2280,9 @@ struct Runtime::Impl {
   }
 
   // Lanes of storage a draft step of `lanes` lanes binds: its own
-  // projections' and the target's, whose vocabulary head it shares.
+  // projections' and the target's vocabulary head's, which it shares.
   uint32_t draftStorageLanes(uint32_t lanes) const {
-    return std::max(targetModel->decodeStorageLanes(lanes),
-                    draftModel.decodeStorageLanes(lanes));
+    return std::max(targetModel->headStorageLanes(lanes), draftModel.decodeStorageLanes(lanes));
   }
 
   // The cycle's step (`step`): each lane's tree of the draft's proposals and
@@ -2494,18 +2489,16 @@ struct Runtime::Impl {
       const LaneTables tables = laneTables(entry.stateLane);
       decode.currentGdnStates[lane] = states.current(entry.stateLane).stateBase;
       decode.nextGdnStates[lane] = states.next(entry.stateLane).stateBase;
-      decode.auxiliary[lane] = states.current(entry.stateLane).auxiliary;
-      decode.indexTables[lane] = tables.index;
       if (lane >= lanes) continue;
       const QwenLaneMetadata &metadata = states.metadata(entry.stateLane);
       decode.gdnTapeLanes[lane] = {decodeArena->gdnTapeSlot(entry.stateLane, metadata.activeParity),
                                    decodeArena->gdnTapeSlot(entry.stateLane, metadata.activeParity ^ 1),
                                    metadata.pendingPath};
       sequences[lane] = {.lane = lane,
-                         .rows = step.laneCap,
                          .chunk = chunkParams(items[lane].logicalPosition, step.laneCap, items[lane].pageTable),
                          .pageTable = tables.pages,
-                         .indexTable = tables.index};
+                         .indexTable = tables.index,
+                         .auxiliaryIn = states.current(entry.stateLane).auxiliary};
     }
     const QwenTargetPrefillChunk chunk{buffers, std::span(sequences).first(lanes), step.rows, &decode};
     static_cast<void>(
@@ -3443,7 +3436,7 @@ Runtime::prefillAsync(const BatchPlan &plan,
       if (nextLength == entry.promptTokens && !entry.replayingGeneration &&
           entry.scoreTokens.empty() && entry.constraint == ConstraintMode::None) {
         selected = impl->initialToken(lane);
-        if (std::string failure = impl->invalidSelection({&*selected, 1}, kDecodeFirstRows[lane], 1);
+        if (std::string failure = impl->invalidSelection({&*selected, 1}, lane, 1);
             !failure.empty()) {
           // The chunk's state is not committed; the engine ends the
           // request.
@@ -3480,10 +3473,9 @@ Runtime::prefillAsync(const BatchPlan &plan,
         entry.pendingToken.reset();
         if (!entry.scoreTokens.empty()) {
           // Score-only: read the raw fp32 logits at the final prompt position
-          // (the lane's first row, kDecodeFirstRows) in requested order.
-          const float *row = contents<float>(
-              impl->decodeArena->rows(DecodeTensor::Logits, {kDecodeFirstRows[lane], 1}),
-              "score logits");
+          // (the lane's row) in requested order.
+          const float *row =
+              contents<float>(impl->decodeArena->rows(DecodeTensor::Logits, {lane, 1}), "score logits");
           result.scoreLogits.reserve(entry.scoreTokens.size());
           for (uint32_t token : entry.scoreTokens) {
             const float logit = row[token];

@@ -59,7 +59,7 @@ using namespace splash::engine;
 
 namespace {
 
-constexpr uint32_t kRows = model::ExecutionLimits::decodeLaneRows;
+constexpr uint32_t kRows = model::ExecutionLimits::draftQueryRows;
 
 struct Window final {
   uint32_t end = 0;

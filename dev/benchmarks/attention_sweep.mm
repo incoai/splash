@@ -56,6 +56,7 @@
 // The comparison library loads into a MetalBackend of its own, which needs
 // residency_kick (kernels/shared/residency.metal) in every library it loads:
 // build baselines from a tree that has that kernel.
+#include "../tests/engine/ChainRows.hpp"
 #include "../tests/engine/AttentionFixture.hpp"
 #include "DispatchReplay.hpp"
 #include "metal/CommandGraph.hpp"
@@ -100,7 +101,7 @@ using test::HostKvExtents;
 using test::moveBlock;
 
 constexpr uint32_t kMaximumLanes = SPLASH_MAXIMUM_BATCH_WIDTH;
-constexpr uint32_t kVerifyRows = splash::ops::kDecodeLaneRows;
+constexpr uint32_t kVerifyRows = splash::ops::kNarrowLaneRows;
 constexpr uint32_t kPrefillRows = SPLASH_PREFILL_TOKEN_BUDGET;
 
 // The swept attention layer is the second of the extents' two.
@@ -327,7 +328,7 @@ QsaIndexer qsaIndexer(metal::MetalBackend &backend, const AttentionFixturePlan &
   if (prefill) return result;
   result.tree = sharedBuffer<ops::TreeRow>(backend, laneRows, "attention-sweep-tree-rows");
   for (uint32_t row = 0; row < laneRows; ++row)
-    static_cast<ops::TreeRow *>(result.tree.contents())[row] = ops::chainRow(row % rows);
+    static_cast<ops::TreeRow *>(result.tree.contents())[row] = test::chainRow(row % rows);
   result.blockKeys = backend.allocateBuffer(uint64_t{laneRows} * D * 2, metal::BufferStorage::Private,
                                             "attention-sweep-block-keys");
   result.rowMasks = backend.allocateBuffer(uint64_t{laneRows} * 4, metal::BufferStorage::Private,

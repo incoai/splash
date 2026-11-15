@@ -250,7 +250,7 @@ void projections(Golden &golden, const std::string &name, const ExecutionPlans &
       const Projection gate = projection(c, set, 1);
       for (uint32_t lanes = 1; lanes <= SPLASH_MAXIMUM_BATCH_WIDTH; ++lanes)
         for (const auto epilogue : {LinearEpilogue::None, LinearEpilogue::Residual, LinearEpilogue::GateUp}) {
-          const LinearWorkload w{{c.n, c.k}, lanes * splash::ops::kDecodeLaneRows, epilogue};
+          const LinearWorkload w{{c.n, c.k}, lanes * SPLASH_DRAFT_QUERY_ROWS, epilogue};
           decode.add(set.name + " lanes " + std::to_string(lanes) + " e" + std::to_string(unsigned(epilogue)) +
                      ": " + attempt([&] {
                        return describe(linear.plan(w, *p, epilogue == LinearEpilogue::GateUp ? &gate : nullptr));
@@ -282,7 +282,7 @@ void projections(Golden &golden, const std::string &name, const ExecutionPlans &
           for (const auto epilogue : {LinearEpilogue::None, LinearEpilogue::Residual, LinearEpilogue::GateUp}) {
             // Lanes of 8 rows up to a decode step's four, then the decode tiles' plans of more rows.
             const bool lanes = line <= SPLASH_MAXIMUM_BATCH_WIDTH;
-            const LinearWorkload w{{c.n, c.k}, lanes ? line * splash::ops::kDecodeLaneRows : line, epilogue};
+            const LinearWorkload w{{c.n, c.k}, lanes ? line * SPLASH_DRAFT_QUERY_ROWS : line, epilogue};
             const bool pair = epilogue == LinearEpilogue::GateUp;
             const std::array<const Projection *, 2> units{&*p, pair ? &gate : nullptr};
             const std::array<UnitFormats, 2> tensors{int8Formats(std::span(&units[0], 1)),
@@ -305,7 +305,7 @@ void projections(Golden &golden, const std::string &name, const ExecutionPlans &
         std::string line = set.name + (rotated ? " rotated" : "") + ":";
         for (uint32_t lanes = 1; lanes <= SPLASH_MAXIMUM_BATCH_WIDTH; ++lanes)
           line += " storage " + attempt([&] {
-            return std::to_string(linear.storageRows(lanes * splash::ops::kDecodeLaneRows, shape));
+            return std::to_string(linear.storageRows(lanes * SPLASH_DRAFT_QUERY_ROWS, shape));
           });
         line += " decode " + attempt([&] { return describe(linear.scratchSize(shape, kMaximumDecodeTileRows)); });
         line += " prefill " + attempt([&] { return describe(linear.scratchSize(shape, SPLASH_PREFILL_TOKEN_BUDGET)); });
@@ -321,7 +321,7 @@ void projections(Golden &golden, const std::string &name, const ExecutionPlans &
         matrix.add("lanes " + std::to_string(lanes) + " e" + std::to_string(unsigned(epilogue)) + ": " +
                    attempt([&] {
                      return describe(linear.plan(
-                         {{c.n, c.k}, lanes * splash::ops::kDecodeLaneRows, epilogue}));
+                         {{c.n, c.k}, lanes * SPLASH_DRAFT_QUERY_ROWS, epilogue}));
                    }));
     for (const uint32_t rows : kPrefillRows)
       for (const auto epilogue : {LinearEpilogue::None, LinearEpilogue::Residual, LinearEpilogue::UpWithGate})
@@ -474,7 +474,7 @@ AttentionPlan chunkPlan(const ExecutionPlans &plans, uint32_t rows, uint32_t his
 AttentionPlan stepPlan(const ExecutionPlans &plans, std::span<const uint32_t> histories, uint32_t heads,
                        const kv::Layout &layout, AttentionVariant v) {
   std::vector<kv::ChunkedPrefillParams> lanes;
-  for (const uint32_t history : histories) lanes.push_back(sequenceOf(history, splash::ops::kDecodeLaneRows));
+  for (const uint32_t history : histories) lanes.push_back(sequenceOf(history, SPLASH_DRAFT_QUERY_ROWS));
   const AttentionWorkspace lane = plans.laneAttentionWorkspace(heads, layout);
   return plans.attention(lanes, heads, layout,
                          {lane.partialsBytes * histories.size(), lane.statisticsBytes * histories.size()}, v);
@@ -613,7 +613,7 @@ Int8Paths int8ActivationsOff(const std::string &name, const ExecutionPlans &on, 
       const std::string label = c.name + " " + set.name;
       for (uint32_t lanes = 1; lanes <= SPLASH_MAXIMUM_BATCH_WIDTH; ++lanes)
         for (const auto epilogue : {LinearEpilogue::None, LinearEpilogue::Residual, LinearEpilogue::GateUp}) {
-          const LinearWorkload w{{c.n, c.k}, lanes * splash::ops::kDecodeLaneRows, epilogue};
+          const LinearWorkload w{{c.n, c.k}, lanes * SPLASH_DRAFT_QUERY_ROWS, epilogue};
           const Projection *g = epilogue == LinearEpilogue::GateUp ? &gate : nullptr;
           compare(configuration([&] { return on.linear().plan(w, *p, g); }),
                   configuration([&] { return off.linear().plan(w, *p, g); }), label + " decode");

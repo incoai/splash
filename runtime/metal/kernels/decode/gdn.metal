@@ -730,21 +730,21 @@ inline void gdn_fold_phase(device const uchar *state, device uchar *fold,
       constant GDNDecodeBatchParams &params [[buffer(20)]], GDN_DECODE_THREADS) { \
     GDN_DECODE_BODY(KeyHeads, ValueHeads, HeadDim, ConvDim, PackedWidth, Rows, table, sums, Layout, W, State) \
   }
-// Each entry over an fp32 state and, as Name_bf16_state, a bf16 one, of a
-// chain's rows (SPLASH_GDN_CHAIN_ROWS) and, as ..._r16, of a verify block's.
+// Each entry over an fp32 state and, as Name_bf16_state, a bf16 one, of the
+// narrow rows (SPLASH_GDN_NARROW_ROWS) and, as ..._r16, of a verify block's.
 #define GDN_DECODE_ENTRY(Name, KeyHeads, ValueHeads, HeadDim, ConvDim, PackedWidth, W) \
-  GDN_DECODE_KERNEL(Name, KeyHeads, ValueHeads, HeadDim, ConvDim, PackedWidth, SPLASH_GDN_CHAIN_ROWS, W, float) \
-  GDN_DECODE_KERNEL(Name##_bf16_state, KeyHeads, ValueHeads, HeadDim, ConvDim, PackedWidth, SPLASH_GDN_CHAIN_ROWS, W, \
+  GDN_DECODE_KERNEL(Name, KeyHeads, ValueHeads, HeadDim, ConvDim, PackedWidth, SPLASH_GDN_NARROW_ROWS, W, float) \
+  GDN_DECODE_KERNEL(Name##_bf16_state, KeyHeads, ValueHeads, HeadDim, ConvDim, PackedWidth, SPLASH_GDN_NARROW_ROWS, W, \
                     bfloat) \
   GDN_DECODE_KERNEL(Name##_r16, KeyHeads, ValueHeads, HeadDim, ConvDim, PackedWidth, SPLASH_TARGET_VERIFY_ROWS, W, \
                     float) \
   GDN_DECODE_KERNEL(Name##_bf16_state_r16, KeyHeads, ValueHeads, HeadDim, ConvDim, PackedWidth, \
                     SPLASH_TARGET_VERIFY_ROWS, W, bfloat)
 #define GDN_DECODE_TABLE_ENTRY(Name, KeyHeads, ValueHeads, HeadDim, ConvDim, PackedWidth, Layout, W) \
-  GDN_DECODE_TABLE_KERNEL(Name, KeyHeads, ValueHeads, HeadDim, ConvDim, PackedWidth, SPLASH_GDN_CHAIN_ROWS, Layout, W, \
-                          float) \
+  GDN_DECODE_TABLE_KERNEL(Name, KeyHeads, ValueHeads, HeadDim, ConvDim, PackedWidth, SPLASH_GDN_NARROW_ROWS, Layout, \
+                          W, float) \
   GDN_DECODE_TABLE_KERNEL(Name##_bf16_state, KeyHeads, ValueHeads, HeadDim, ConvDim, PackedWidth, \
-                          SPLASH_GDN_CHAIN_ROWS, Layout, W, bfloat) \
+                          SPLASH_GDN_NARROW_ROWS, Layout, W, bfloat) \
   GDN_DECODE_TABLE_KERNEL(Name##_r16, KeyHeads, ValueHeads, HeadDim, ConvDim, PackedWidth, SPLASH_TARGET_VERIFY_ROWS, \
                           Layout, W, float) \
   GDN_DECODE_TABLE_KERNEL(Name##_bf16_state_r16, KeyHeads, ValueHeads, HeadDim, ConvDim, PackedWidth, \

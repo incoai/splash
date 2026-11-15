@@ -38,7 +38,7 @@ public:
   [[nodiscard]] static uint32_t lastVerifyRows(const Runtime &runtime, uint32_t lane);
   // The path of the rows batch lane `lane` of the last decode step retained,
   // a bit a row of its rows from its first (metal/abi/VerifyTree.h): a chain
-  // of r rows is ops::chainPath(r); until the next command that selects.
+  // of r rows is its first r bits; until the next command that selects.
   [[nodiscard]] static uint32_t lastRetainedRows(const Runtime &runtime, uint32_t lane);
   // Every later decode step of a runtime takes `rows` rows, at most a verify
   // block's a lane and at least a row a lane, each of them verified, in place

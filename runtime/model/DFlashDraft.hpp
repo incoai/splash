@@ -265,8 +265,12 @@ public:
                          std::span<const DFlashDraftRingLayer> ring,
                          uint32_t rows, uint32_t startPosition) const;
 
-  // Lanes of storage the draft's own projections bind in a decode step or
-  // context commit of `lanes` lanes (ops::Linear::storageRows).
+  // Lanes of storage the draft's own projections bind in a decode step of
+  // `lanes` lanes (ops::Linear::storageRows of a draft's block a lane). A
+  // context commit of a step's rows, up to a verify block's a lane, binds
+  // as many lanes of its row tensors, which hold a verify block's rows a
+  // lane: at least the staged tile's rows of any step of `lanes` lanes
+  // (ops::stagedTileRows(T) <= 16 x lanes).
   [[nodiscard]] uint32_t decodeStorageLanes(uint32_t lanes) const;
   void addDecode(metal::CommandGraph &graph, DFlashDecodeBuffers buffers,
                  const ops::Projection &vocabularyProjection,

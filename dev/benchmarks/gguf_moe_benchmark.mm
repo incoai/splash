@@ -22,6 +22,7 @@
 //   at the 35B's expert shape, the 35B's Q4_K/Q5_K pair and Flash-Next's Q2_0 shape: median GPU ms per dispatch over
 //   `rounds` commands of dispatches of their own staging and slots (over 50 MB), native GB/s, and every plane
 //   compared bytewise with the reference repack.
+#include "../tests/engine/MoeStep.hpp"
 #include "../tests/engine/MoeFixture.hpp"
 #include "DispatchReplay.hpp"
 #include "metal/CommandGraph.hpp"
@@ -135,7 +136,7 @@ int timing(MetalBackend &backend, const MoeShape &shape, uint32_t rounds, Fmt ga
       b.residual = zeros(backend, uint64_t{plan.rows()} * H * 2, "residual");
       b.output = zeros(backend, uint64_t{plan.rows()} * H * 2, "output");
       allocate(backend, b, plan);
-      MoE::add(l.graph, b, gguf, plan);
+      splash::test::addMoeStep(l.graph, b, gguf, plan);
     }
     return l;
   };

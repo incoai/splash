@@ -1,3 +1,4 @@
+#include "ChainRows.hpp"
 #include "TestBuffers.hpp"
 #include "TestChecks.hpp"
 #include "metal/CommandGraph.hpp"
@@ -33,7 +34,7 @@ using splash::ops::RowCopy;
 using splash::ops::RowRegion;
 using splash::ops::StopTokens;
 
-constexpr uint32_t kRows = splash::model::ExecutionLimits::decodeLaneRows;
+constexpr uint32_t kRows = splash::model::ExecutionLimits::draftQueryRows;
 constexpr uint32_t kProposals =
     splash::model::ExecutionLimits::draftProposalTokens;
 constexpr uint32_t kLanes =
@@ -64,7 +65,7 @@ MetalBuffer chainRows(MetalBackend &backend, std::span<const splash::ops::LaneRo
   auto *tree = contents<splash::ops::TreeRow>(buffer);
   for (const splash::ops::LaneRows &block : blocks)
     for (uint32_t row = 0; row < block.rows; ++row)
-      tree[block.first + row] = splash::ops::chainRow(row);
+      tree[block.first + row] = splash::test::chainRow(row);
   return buffer;
 }
 

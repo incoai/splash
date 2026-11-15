@@ -1295,9 +1295,9 @@ void rotatedRegisterInput(metal::MetalBackend &backend) {
   const NormWeights norm{allocate(backend, 17408 * 2)};
   const metal::MetalBuffer rows = allocate(backend, uint64_t{32} * 17408 * 2);
   for (uint32_t lanes = 1; lanes <= 4; ++lanes) {
-    const LinearPlan plan = m3.plan(rotated, lanes * splash::ops::kDecodeLaneRows);
+    const LinearPlan plan = m3.plan(rotated, lanes * SPLASH_DRAFT_QUERY_ROWS);
     require(plan.configuration().tile == LinearTile::GgufRegister && plan.input() == LinearInput::Plain &&
-                m3.plan(plain, lanes * splash::ops::kDecodeLaneRows).input() == LinearInput::Table16,
+                m3.plan(plain, lanes * SPLASH_DRAFT_QUERY_ROWS).input() == LinearInput::Table16,
             "a rotated register plan's producer writes a table it discards");
     metal::CommandGraph graph;
     (void)Normalization::addRms(graph, rows, norm, rows, 17408, lanes * 8, scratch, plan.input());
@@ -1317,10 +1317,10 @@ void decodeInt8Setting(metal::MetalBackend &backend) {
   const Linear on = gpu(10, 16), off(simulatedDevice(10, 16), Int8Activations::Off);
   bool int8 = false;
   for (uint32_t lanes = 1; lanes <= SPLASH_MAXIMUM_BATCH_WIDTH; ++lanes) {
-    LinearConfig config = on.plan(rotated, lanes * splash::ops::kDecodeLaneRows).configuration();
+    LinearConfig config = on.plan(rotated, lanes * SPLASH_DRAFT_QUERY_ROWS).configuration();
     int8 |= config.decodeInt8;
     config.decodeInt8 = false;
-    require(off.plan(rotated, lanes * splash::ops::kDecodeLaneRows).configuration() == config,
+    require(off.plan(rotated, lanes * SPLASH_DRAFT_QUERY_ROWS).configuration() == config,
             "int8 activations off moved a rotated PQ2_0 decode plan other than off the int8 tiles");
   }
   require(int8, "no decode plan of a rotated PQ2_0 projection takes int8 activations with them on");
@@ -1583,7 +1583,7 @@ void registerTileExtents(metal::MetalBackend &backend) {
   constexpr uint32_t n = 512, k = 2048, lanes = 2;
   constexpr uint64_t rows = lanes * 8;
   const Projection block(n, k, BlockWeights{{segmentPlanes(backend, GGUF_FMT_Q4K, n, k)}});
-  const LinearPlan plan = m3.plan(block, lanes * splash::ops::kDecodeLaneRows);
+  const LinearPlan plan = m3.plan(block, lanes * SPLASH_DRAFT_QUERY_ROWS);
   const LinearScratchSize scratch = plan.scratchSize();
   require(plan.configuration().tile == LinearTile::GgufRegister && scratch.input && scratch.sums &&
               scratch.partials && scratch.counters,

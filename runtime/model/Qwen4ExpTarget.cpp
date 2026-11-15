@@ -180,15 +180,14 @@ void Qwen4ExpTarget::addPrefillLayer(PrefillStep &step, uint32_t index) const {
     std::vector<metal::MetalBuffer> historyIn, historyOut;
     ops::LayoutRows layoutRows;
     metal::MetalBuffer tree;
+    for (const QwenTargetPrefillSequence &sequence : step.sequences) {
+      historyIn.push_back(sequence.auxiliaryIn);
+      if (!step.decode) historyOut.push_back(sequence.auxiliaryOut);
+    }
     if (const QwenTargetDecodeBuffers *d = step.decode) {
-      historyIn.assign(d->auxiliary.begin(), d->auxiliary.begin() + d->step.lanes);
       layoutRows = {d->step.lanes, d->step.rows, d->step.laneCap};
       tree = d->tree;
     } else {
-      for (const QwenTargetPrefillSequence &sequence : step.sequences) {
-        historyIn.push_back(sequence.auxiliaryIn);
-        historyOut.push_back(sequence.auxiliaryOut);
-      }
       layoutRows = promptRows(step.sequences, rows);
     }
     ops::NgramEmbedding::addConvolution(step.graph, u16Rows(h.pleConvolution, 0, rows, ps.width()), historyIn,
@@ -348,9 +347,11 @@ std::vector<ops::AttentionBlocks> Qwen4ExpTarget::addDecodeQsa(PrefillStep &step
   const uint32_t lanes = d.step.lanes, laneCap = d.step.laneCap;
   addIndexerProjections(step.graph, linear, b.normalized, indexer, h.indexerQuery, h.indexerKey, step.rows);
   std::array<uint32_t, ExecutionLimits::maximumBatchWidth> firstPositions{};
+  std::array<metal::MetalBuffer, ExecutionLimits::maximumBatchWidth> indexTables;
   bool sparse = false;
   for (uint32_t lane = 0; lane < lanes; ++lane) {
     firstPositions[lane] = step.chunks[lane].committed_tokens;
+    indexTables[lane] = step.sequences[lane].indexTable;
     sparse = sparse || ops::BlockIndexer::sparse(firstPositions[lane], laneCap, topBlocks);
   }
   const ops::IndexerTreeRows tree{b.laneRows,
@@ -358,7 +359,7 @@ std::vector<ops::AttentionBlocks> Qwen4ExpTarget::addDecodeQsa(PrefillStep &step
                                   step.rows,
                                   laneCap,
                                   std::span(firstPositions).first(lanes),
-                                  {std::span(d.indexTables).first(lanes), step.indexOffsets[layer]},
+                                  {std::span(indexTables).first(lanes), step.indexOffsets[layer]},
                                   topBlocks,
                                   h.maskWords,
                                   h.scoreStride};
@@ -368,7 +369,7 @@ std::vector<ops::AttentionBlocks> Qwen4ExpTarget::addDecodeQsa(PrefillStep &step
   const metal::MetalBuffer keys = rowsOf<uint16_t>(h.qsaKeys, layer * h.keyLayerRows, step.rows, keyWidth);
   const metal::MetalBuffer blockKeys = rowsOf<uint16_t>(h.qsaBlockKeys, layer * h.keyLayerRows, step.rows, keyWidth);
   std::array<metal::MetalBuffer, ExecutionLimits::maximumBatchWidth> pending;
-  for (uint32_t lane = 0; lane < lanes; ++lane) pending[lane] = steps_.qsaPending(d.auxiliary[lane], layer);
+  for (uint32_t lane = 0; lane < lanes; ++lane) pending[lane] = steps_.qsaPending(step.sequences[lane].auxiliaryIn, layer);
   ops::BlockIndexer::addProject(step.graph, rowsOf<float>(h.indexerQuery, 0, step.rows, queryWidth),
                                 rowsOf<float>(h.indexerKey, 0, step.rows, keyWidth), indexer.queryNorm,
                                 rowsOf<float>(b.ropeCos, 0, step.rows, geometry_.rotaryPairs),

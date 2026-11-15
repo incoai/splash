@@ -1,3 +1,4 @@
+#include "ChainRows.hpp"
 #include "Checked.hpp"
 #include "engine/MemoryGovernor.hpp"
 #include "tests/engine/AllocationFailure.hpp"
@@ -1036,7 +1037,7 @@ void run(const std::string &metallib) {
     storage.updateLengths(0, {2'048, 0, 2'048, 2'048});
     const uint32_t parity = storage.metadata(0).activeParity;
     // A path holds its anchor's row and rows of a block.
-    for (const uint32_t path : {0U, 0b110U, ops::chainPath(model::ExecutionLimits::targetVerifyRows + 1)})
+    for (const uint32_t path : {0U, 0b110U, test::chainPath(model::ExecutionLimits::targetVerifyRows + 1)})
       rejects([&] { storage.swapDecodeParity(0, path); }, "a decode step accepts a path of its rows from its anchor's",
               "a decode step accepted no rows, a path without its anchor or rows past a block's");
     storage.swapDecodeParity(0, 0b1011);
@@ -1050,8 +1051,8 @@ void run(const std::string &metallib) {
             "Qwen lane state has decoded rows pending", "a restore overwrote a cell with pending rows");
     rejects([&] { storage.swapParity(0); }, "Qwen lane state has decoded rows pending",
             "a prefill step followed a decode step's pending rows");
-    storage.swapDecodeParity(0, ops::chainPath(model::ExecutionLimits::targetVerifyRows));
-    require(storage.metadata(0).pendingPath == ops::chainPath(model::ExecutionLimits::targetVerifyRows) &&
+    storage.swapDecodeParity(0, test::chainPath(model::ExecutionLimits::targetVerifyRows));
+    require(storage.metadata(0).pendingPath == test::chainPath(model::ExecutionLimits::targetVerifyRows) &&
                 storage.metadata(0).activeParity == parity,
             "the next decode step's swap did not take its own accepted path");
     rejects([&] { storage.releaseLane(0, 404); }, "Qwen lane owner mismatch",

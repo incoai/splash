@@ -1114,7 +1114,7 @@ private:
       times = timing->times(lanes, plan.layer, plan.passes - plan.pass);
     } else {
       const auto width = static_cast<uint32_t>(items.size());
-      const uint32_t rows = width * model::ExecutionLimits::decodeLaneRows;
+      const uint32_t rows = width * model::ExecutionLimits::draftQueryRows;
       const auto spilling = static_cast<uint32_t>(std::ranges::count_if(
           items, [](const ModelBatchItem &item) { return item.pageSources && item.pageSources->indexPages(); }));
       times = decodeTimes(profile, width, rows, share, spilling);

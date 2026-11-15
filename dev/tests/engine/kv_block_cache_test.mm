@@ -110,7 +110,7 @@ using Lanes = std::vector<std::shared_ptr<const KvPageSources>>;
 std::vector<std::vector<uint32_t>> resolve(MetalBackend &backend, KvBlockCache &cache, uint32_t layer,
                                            const Lanes &lanes, const std::vector<std::vector<uint32_t>> &blocks,
                                            const std::shared_ptr<KvReadStats> &stats) {
-  constexpr uint32_t kRows = splash::ops::kDecodeLaneRows;
+  constexpr uint32_t kRows = splash::ops::kNarrowLaneRows;
   uint32_t history = 0;
   for (const std::vector<uint32_t> &list : blocks)
     if (!list.empty()) history = std::max(history, (list.back() + 1) * SPLASH_ATTENTION_BLOCK_TOKENS);

@@ -147,8 +147,8 @@ void checkGateUpLayers() {
               "the decode arena is below a gate/up layer's scratch");
       require(model::DecodeArena::gateScratchBytes(geometry, plans) >= plan.gateScratchBytes(),
               "the gate/up workspace is too small");
-      // The F16 and Q8_0 pair stages, at rows the decode storage of the
-      // target's projections holds (QwenTarget::decodeStorageLanes).
+      // The F16 and Q8_0 pair stages, at rows the storage of the target's
+      // projections over a step's rows holds (ops::Linear::storageRows).
       const auto pair = plans.linear().plan(mixed.upProjection, lanes * model::kDecodeRows,
                                             ops::LinearEpilogue::GateUp, &mixed.gateProjection);
       const auto paired = pair.scratchSize();

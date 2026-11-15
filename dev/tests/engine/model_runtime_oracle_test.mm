@@ -1,4 +1,5 @@
 #include "AwakeClock.hpp"
+#include "ChainRows.hpp"
 #include "LinearNumerics.hpp"
 #include "PenaltyReference.hpp"
 #include "TestChecks.hpp"
@@ -2361,7 +2362,7 @@ void requireThinkingBudgetClosesThinking(model::Runtime &executor) {
                       " did not end thinking with its end tokens, then go on");
           // A cycle that cuts past its row 0 may return the end's first
           // token alone; each cycle after it returns up to eight of them.
-          constexpr uint32_t rows = model::ExecutionLimits::decodeLaneRows;
+          constexpr uint32_t rows = model::ExecutionLimits::draftQueryRows;
           const std::vector<uint32_t> &cycles = generated[lane].cycles;
           const uint32_t endCycles = cycles[first + length - 1] - cycles[first] + 1;
           require(endCycles <= 1 + (length - 1 + rows - 1) / rows,
@@ -2519,7 +2520,7 @@ void requireConstrainedThinkingEndWaitsForItsMask(model::Runtime &executor) {
   const std::array<std::vector<uint32_t>, 3> pageTables{
       pageRange(108, 4), pageRange(116, 4), pageRange(120, 4)};
   const std::array<uint64_t, 3> ids{311, 312, 313};
-  constexpr uint32_t rows = model::ExecutionLimits::decodeLaneRows;
+  constexpr uint32_t rows = model::ExecutionLimits::draftQueryRows;
   constexpr uint32_t proposals = model::ExecutionLimits::draftProposalTokens;
   for (const std::vector<uint32_t> &end : targetTokens->thinkingEnds) {
     const uint32_t length = static_cast<uint32_t>(end.size());
@@ -2613,6 +2614,61 @@ void requireCyclesVerifyTheirOutputLeft(model::Runtime &executor) {
   std::cout << "output_left_rows=PASS\n";
 }
 
+// A constrained lane's first token at any batch lane: lanes of distinct
+// prompts, greedy, whose masks admit every token and which ignore the end of
+// sequence, so that no first token is a stop that ends its lane, select
+// their first tokens in one plan of two or three lanes
+// (DecodeStage::ApplyInitialMask), in either order, as each selects its own
+// alone, each lane's selection reading its own row, row = lane, of the
+// heads' final hidden (captureFinalHidden, submitInitialSelection).
+void requireConstrainedFirstTokensKeepTheirLanes(model::Runtime &executor) {
+  const std::vector<uint32_t> &base = targetTokens->thinkingPrompt;
+  // The prompt, its reverse, and its second half before its first.
+  std::array<std::vector<uint32_t>, 3> prompts{base, std::vector<uint32_t>(base.rbegin(), base.rend()), base};
+  std::ranges::rotate(prompts[2], prompts[2].begin() + static_cast<std::ptrdiff_t>(base.size() / 2));
+  const std::array<std::vector<uint32_t>, 3> pageTables{pageRange(108, 4), pageRange(116, 4), pageRange(120, 4)};
+  const std::array<uint64_t, 3> ids{331, 332, 333};
+  const auto admitting = [](size_t, uint32_t) { return std::vector<uint32_t>(targetTokens->maskWords(), ~0U); };
+  const auto firstTokens = [&](std::span<const size_t> lanes) {
+    std::vector<uint64_t> laneIds;
+    std::vector<std::vector<uint32_t>> tables;
+    for (size_t index = 0; index < lanes.size(); ++index) {
+      EngineRequest request = makeRequest(ids[lanes[index]], prompts[lanes[index]], 4);
+      request.constraint = ConstraintMode::TokenMask;
+      request.flags = RequestIgnoreEndOfSequence;
+      request.sampling.temperature = 0.0F;
+      beginCold(executor, request, static_cast<uint32_t>(index));
+      require(prefillChunk(executor, request.id, 0, request.prompt, pageTables[lanes[index]]).nextDecodeStage ==
+                  DecodeStage::ApplyInitialMask,
+              "a constrained first token's fixture skipped its first mask");
+      laneIds.push_back(request.id);
+      tables.push_back(pageTables[lanes[index]]);
+    }
+    const auto generated = decodeConstrainedTogether(executor, laneIds, static_cast<uint32_t>(base.size()), tables,
+                                                     1, admitting);
+    std::vector<uint32_t> tokens;
+    for (size_t index = 0; index < lanes.size(); ++index) {
+      require(!generated[index].tokens.empty(), "a constrained lane selected no first token");
+      tokens.push_back(generated[index].tokens.front());
+      executor.end(laneIds[index]);
+    }
+    return tokens;
+  };
+  std::array<uint32_t, 3> alone{};
+  for (size_t lane = 0; lane < alone.size(); ++lane)
+    alone[lane] = firstTokens(std::array{lane}).front();
+  require(alone[0] != alone[1] || alone[1] != alone[2],
+          "the constrained first tokens' prompts all select one token alone, which tells no lane from another");
+  for (const std::vector<size_t> &lanes : {std::vector<size_t>{0, 1}, {1, 0}, {0, 1, 2}, {2, 0, 1}}) {
+    const std::vector<uint32_t> together = firstTokens(lanes);
+    for (size_t index = 0; index < lanes.size(); ++index)
+      require(together[index] == alone[lanes[index]],
+              "a constrained lane's first token at batch lane " + std::to_string(index) + " of " +
+                  std::to_string(lanes.size()) + " is not the one it selects alone");
+  }
+  std::cout << "constrained_first_tokens_keep_their_lanes=PASS\n";
+}
+
 // A thinking budget of 0 ends thinking from the first token: the first cycle
 // verifies the end's first token and every row after it, whose proposals the
 // end's tokens replace. Qwen3.8-Flash-Next's GPU hashes the PLE rows of a
@@ -2621,7 +2677,7 @@ void requireCyclesVerifyTheirOutputLeft(model::Runtime &executor) {
 void requireThinkingEndVerifiesItsTokens(model::Runtime &executor, const model::LoadedModel &model) {
   const std::vector<uint32_t> &prompt = targetTokens->thinkingPrompt;
   const std::vector<uint32_t> &end = targetTokens->thinkingEnds[1];
-  constexpr uint32_t rows = model::ExecutionLimits::decodeLaneRows;
+  constexpr uint32_t rows = model::ExecutionLimits::draftQueryRows;
   const uint32_t length = static_cast<uint32_t>(prompt.size());
   const std::vector<uint32_t> pages = pageRange(108, 4);
   EngineRequest request = makeRequest(321, prompt, 64);
@@ -3509,7 +3565,7 @@ void requireDecodedIndexMatchesPrefill(model::Runtime &executor, const kv::PageS
 void requireConstrainedLaneSharesDecode(model::Runtime &executor, const model::QwenStateStorage &states,
                                         const model::ModelDescriptor &descriptor, std::span<const uint32_t> seed) {
   constexpr uint32_t kPromptTokens = 160;
-  constexpr uint32_t kRows = model::ExecutionLimits::decodeLaneRows;
+  constexpr uint32_t kRows = model::ExecutionLimits::draftQueryRows;
   // Cycles whose masks admit every token, then the forced cycle and the one
   // after it.
   constexpr uint32_t kAdmitting = 3, kCycles = kAdmitting + 2;
@@ -4032,7 +4088,7 @@ void requireBranchedPathsMatchChains(model::Runtime &executor, const model::Mode
     model::RuntimeInstrumentation::forceStepRows(executor, std::nullopt);
     for (uint32_t lane = 0; lane < width; ++lane) {
       const uint32_t retained = model::RuntimeInstrumentation::lastRetainedRows(executor, lane);
-      require(retained == forcedPaths[lane] && retained != ops::chainPath(std::popcount(retained)) &&
+      require(retained == forcedPaths[lane] && retained != test::chainPath(std::popcount(retained)) &&
                   (branched[lane].capture || !captures) && branched[lane].position >= kBoundary,
               label + ": a lane did not retain its branched path across the boundary, or did not capture there");
     }
@@ -4200,7 +4256,7 @@ void requireMixedStepMatchesLanesAlone(model::Runtime &executor, std::span<const
 // cycles the budget prices apart.
 void requireBudgetedCyclesAreWellFormed(model::Runtime &executor, const model::QwenStateStorage &states,
                                         std::span<const uint32_t> seed) {
-  constexpr uint32_t kRows = model::ExecutionLimits::decodeLaneRows;
+  constexpr uint32_t kRows = model::ExecutionLimits::draftQueryRows;
   constexpr uint32_t kExplore = model::VerifyBudget::kExploreCycles;
   constexpr uint32_t kCycles = model::VerifyBudget::kRefitCycles + 1;
   struct Lane final {
@@ -5683,6 +5739,7 @@ int main(int argc, char **argv) {
     requireThinkingBudgetKeepsLookupChains(executor);
     requireConstrainedThinkingEndWaitsForItsMask(executor);
     requireCyclesVerifyTheirOutputLeft(executor);
+    requireConstrainedFirstTokensKeepTheirLanes(executor);
     requireThinkingEndVerifiesItsTokens(executor, model);
     requireStatesCapturedInsideCommands(executor, backend, pages, states, aneFfn.get(), samplingSeedTokens);
     requireCapturesOutliveTheirItems(executor, states, samplingSeedTokens);

@@ -495,7 +495,7 @@ A lane's verify block holds up to 16 rows (`SPLASH_TARGET_VERIFY_ROWS`): its
 anchor and the rows proposed after it, a tree, each row's place in it (its
 ancestors, parent and depth, `metal/abi/VerifyTree.h`) one entry per packed
 row; a decode cycle gives every lane a draft's block of them
-(`ExecutionLimits::decodeLaneRows`), and a step a test forces up to sixteen. What
+(`ExecutionLimits::draftQueryRows`), and a step a test forces up to sixteen. What
 a cycle may hold follows the block's 16 rows: the KV it writes past the context
 (`SPLASH_SPECULATIVE_SCRATCH_TOKENS`, 15), the KV the engine holds for a lane's
 cycle and its reply captures, a block-sparse target's verify rows
@@ -511,7 +511,7 @@ S z + the sum of each path row's value times its coefficient), with no state
 per row, and every row's convolution reads its path's tokens. Every row goes
 to the lane's tape, and the lane's next step folds the path it accepted, a
 row mask, into the state. Its kernels hold eight rows of a lane's block and of
-its pending path (`SPLASH_GDN_CHAIN_ROWS`), or sixteen (`_r16`) for a step
+its pending path (`SPLASH_GDN_NARROW_ROWS`), or sixteen (`_r16`) for a step
 whose lanes may hold more (`ops::verifyLaneCap`) or one of whose lanes has a
 pending path of more, as a step of eight rows a lane after one of sixteen may
 (`ops::GDN::addDecode`); a pending path of at most eight rows runs on the
@@ -629,7 +629,7 @@ The rules:
    up to 8 rows, takes one history split per 16 pages its rows read, between
    32 and 128. Each tile of a longer sequence, a decode lane's of 9 to 16
    rows too (two tiles), takes one per
-   `AttentionCalibration::prefillPagesPerSplit` pages its rows read (32, and
+   `AttentionCalibration::pagesPerSplit` pages its rows read (32, and
    64 on Apple9 GPUs of 10 cores or fewer, where 32 made one measured case
    slower than the shared splits), at least 32 shared out over the
    sequence's tiles and at most 32, nor 256 over its tiles (`PagedAttention.cpp`

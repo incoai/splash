@@ -43,6 +43,7 @@
 //   each slice's passes against the fp64 products of its rows and column
 //   window of the whole expert.
 // Streamed experts (model::ExpertStore) run in expert_store_test.mm.
+#include "MoeStep.hpp"
 #include "../../../runtime/metal/CommandGraph.hpp"
 #include "../../../runtime/metal/MetalBackend.hpp"
 #include "../../../runtime/ops/Linear.hpp"
@@ -566,7 +567,7 @@ int floatSegments(MetalBackend &backend, uint32_t floatColumns) {
       check(lanes * 8, plan.storageRows(), "decode B" + std::to_string(lanes),
             [&](CommandGraph &graph, MetalBuffer input, const Projection &p, MetalBuffer output) {
               static_cast<void>(linear.add(graph, {.input = input, .output = output, .scratch = scratch}, p,
-                                           linear.plan(p, lanes * splash::ops::kDecodeLaneRows)));
+                                           linear.plan(p, lanes * SPLASH_DRAFT_QUERY_ROWS)));
             });
     }
     for (const uint32_t rows : {1u, 24u, 33u, 263u}) {
@@ -598,7 +599,7 @@ int floatOnlyChain(MetalBackend &backend) {
   int failures = 0;
   for (uint32_t lanes = 1; lanes <= 4; ++lanes) {
     const uint64_t rows = lanes * 8, bytes = rows * N * 2;
-    const LinearPlan plan = linear.plan(blocks, lanes * splash::ops::kDecodeLaneRows);
+    const LinearPlan plan = linear.plan(blocks, lanes * SPLASH_DRAFT_QUERY_ROWS);
     const LinearScratchSize size = plan.scratchSize();
     const LinearScratch scratch{zeros(backend, size.input, "chain-table"), zeros(backend, size.sums, "chain-sums"),
                                 zeros(backend, size.partials, "chain-partials"),
@@ -608,7 +609,7 @@ int floatOnlyChain(MetalBackend &backend) {
                       alone = zeros(backend, bytes, "chain-reference");
     CommandGraph graph, reference;
     const PreparedInput prepared =
-        linear.add(graph, {.input = input, .output = scores, .scratch = scratch}, floats, linear.plan(floats, lanes * splash::ops::kDecodeLaneRows));
+        linear.add(graph, {.input = input, .output = scores, .scratch = scratch}, floats, linear.plan(floats, lanes * SPLASH_DRAFT_QUERY_ROWS));
     static_cast<void>(
         linear.add(graph, {.input = input, .output = chained, .scratch = scratch, .prepared = prepared}, blocks, plan));
     static_cast<void>(backend.submitCommandAsync(graph.dispatches()).wait());
@@ -840,7 +841,7 @@ MoeRun runPlan(MetalBackend &backend, const Model &m, Buffers &b, const MoePlan 
   for (const MetalBuffer *buffer : {&b.moe.scratch.groupedRoutes, &b.moe.scratch.groupedInput})
     std::memset(buffer->contents(), kCanary, buffer->sizeBytes());
   CommandGraph graph;
-  MoE::add(graph, b.moe, m.weights, plan);
+  splash::test::addMoeStep(graph, b.moe, m.weights, plan);
   static_cast<void>(backend.submitCommandAsync(graph.dispatches()).wait());
   const auto *selected = static_cast<const uint32_t *>(b.moe.scratch.selectedExperts.contents());
   const auto *routing = static_cast<const float *>(b.moe.scratch.routingWeights.contents());
@@ -1033,7 +1034,7 @@ void bufferExtents(MetalBackend &backend) {
   b.moe.input = zeros(backend, uint64_t{kMaximumRows} * kHidden * 2, "moe-input");
   b.moe.residual = zeros(backend, uint64_t{kMaximumRows} * kHidden * 2, "moe-residual");
   b.moe.output = zeros(backend, uint64_t{kMaximumRows} * kHidden * 2, "moe-output");
-  for (const MoePlan &plan : {MoE::plan(shape, splash::ops::kDecodeLaneRows, MoeConfig{MoeExpertTile::M8}),
+  for (const MoePlan &plan : {MoE::plan(shape, SPLASH_DRAFT_QUERY_ROWS, MoeConfig{MoeExpertTile::M8}),
                               MoE::plan(shape, 33, MoeConfig{MoeExpertTile::M32})}) {
     allocate(backend, b, plan);
     splash::test::requireMoeExtents(backend, b.moe, m.weights, plan);
@@ -1059,7 +1060,7 @@ void bufferExtents(MetalBackend &backend) {
     splash::test::requireExtent(backend, buffer, bytes, element, name, [&](CommandGraph &graph, const MetalBuffer &view) {
       BlockMoeWeights changed = base;
       with(changed, view);
-      MoE::add(graph, b.moe, changed, plan);
+      splash::test::addMoeStep(graph, b.moe, changed, plan);
     });
   };
   for (const auto &[member, name, z] : {std::tuple{&BlockMoeWeights::gate, "gate", 0u},
@@ -1131,7 +1132,7 @@ void bufferExtents(MetalBackend &backend) {
     BlockMoeWeights changed = chunked;
     changed.chunks = chunks;
     CommandGraph graph;
-    splash::test::rejects([&] { MoE::add(graph, b.moe, changed, plan); }, expected,
+    splash::test::rejects([&] { splash::test::addMoeStep(graph, b.moe, changed, plan); }, expected,
                           std::string("a block's MoE with ") + what + " was accepted");
     require(graph.empty(), std::string("a block's MoE with ") + what + " encoded a dispatch");
   }
@@ -1213,7 +1214,7 @@ int moe(MetalBackend &backend) {
         }
       };
       for (uint32_t lanes = 4; lanes >= 1; --lanes) {
-        const MoePlan plan = MoE::plan(shape, lanes * splash::ops::kDecodeLaneRows, MoeConfig{MoeExpertTile::M8});
+        const MoePlan plan = MoE::plan(shape, lanes * SPLASH_DRAFT_QUERY_ROWS, MoeConfig{MoeExpertTile::M8});
         const std::string label = formats + " staged decode B" + std::to_string(lanes);
         const MoeRun run = runPlan(backend, m, b, plan, products, stats, label);
         // A row's result depends on its own routes and the tile kinds they
@@ -1341,7 +1342,7 @@ int nativeRouter(MetalBackend &backend) {
     allocate(backend, b, plan);
     m.weights.router = router;
     CommandGraph graph;
-    MoE::add(graph, b.moe, m.weights, plan);
+    splash::test::addMoeStep(graph, b.moe, m.weights, plan);
     static_cast<void>(backend.submitCommandAsync(graph.dispatches()).wait());
     const uint64_t routes = uint64_t{plan.rows()} * kRoutes * 4, output = uint64_t{plan.rows()} * kHidden * 2;
     std::vector<uint8_t> bytes(2 * routes + output);
@@ -1359,7 +1360,7 @@ int nativeRouter(MetalBackend &backend) {
     std::vector<std::pair<std::string, MoePlan>> plans;
     for (uint32_t lanes = 1; lanes <= 4; ++lanes)
       plans.emplace_back("decode B" + std::to_string(lanes),
-                         MoE::plan(shape, lanes * splash::ops::kDecodeLaneRows, MoeConfig{}));
+                         MoE::plan(shape, lanes * SPLASH_DRAFT_QUERY_ROWS, MoeConfig{}));
     for (const FloatTile tile : {FloatTile::Simdgroup, FloatTile::NeuralAccelerator})
       for (const uint32_t count : {kMaximumRows, 33u, 16u}) {
         MoeConfig config{MoeExpertTile::M32};
@@ -1413,13 +1414,13 @@ int permutedSlots(MetalBackend &backend) {
     allocate(backend, b, plan);
     std::memset(b.moe.output.contents(), 0, b.moe.output.sizeBytes());
     CommandGraph graph;
-    MoE::add(graph, b.moe, model.weights, plan);
+    splash::test::addMoeStep(graph, b.moe, model.weights, plan);
     static_cast<void>(backend.submitCommandAsync(graph.dispatches()).wait());
     const auto *output = static_cast<const uint16_t *>(b.moe.output.contents());
     return std::vector<uint16_t>(output, output + uint64_t{plan.rows()} * kHidden);
   };
   int failures = 0;
-  for (const MoePlan &plan : {MoE::plan(shape, 4 * splash::ops::kDecodeLaneRows, MoeConfig{MoeExpertTile::M8}),
+  for (const MoePlan &plan : {MoE::plan(shape, 4 * SPLASH_DRAFT_QUERY_ROWS, MoeConfig{MoeExpertTile::M8}),
                               MoE::plan(shape, kMaximumRows, MoeConfig{MoeExpertTile::M32})})
     if (run(m, plan) != run(permuted, plan)) {
       printf("  permuted slots, %u rows: the output differs from the identity table's FAIL\n", plan.rows());
@@ -1452,7 +1453,7 @@ int chunkedSlots(MetalBackend &backend) {
     allocate(backend, b, plan);
     std::memset(b.moe.output.contents(), 0, b.moe.output.sizeBytes());
     CommandGraph graph;
-    MoE::add(graph, b.moe, weights, plan);
+    splash::test::addMoeStep(graph, b.moe, weights, plan);
     static_cast<void>(backend.submitCommandAsync(graph.dispatches()).wait());
     const auto *output = static_cast<const uint16_t *>(b.moe.output.contents());
     return std::vector<uint16_t>(output, output + uint64_t{plan.rows()} * kHidden);
@@ -1473,7 +1474,7 @@ int chunkedSlots(MetalBackend &backend) {
       chunked.router = floatSegment(backend, router, kExperts, kHidden);
       std::vector<MoePlan> plans;
       for (uint32_t lanes = 1; lanes <= 4; ++lanes)
-        plans.push_back(MoE::plan(shape, lanes * splash::ops::kDecodeLaneRows, MoeConfig{MoeExpertTile::M8}));
+        plans.push_back(MoE::plan(shape, lanes * SPLASH_DRAFT_QUERY_ROWS, MoeConfig{MoeExpertTile::M8}));
       for (const uint32_t rows : {33u, kMaximumRows})
         plans.push_back(MoE::plan(shape, rows, MoeConfig{MoeExpertTile::M32}));
       int tileFailures = 0;
@@ -1578,7 +1579,7 @@ int verifiedRows(MetalBackend &backend, const std::string &name, uint32_t rows,
     b.moe.laneRows = verifyRows ? layout : MetalBuffer{};
     b.moe.verifyRows = verifyRows;
     CommandGraph graph;
-    MoE::add(graph, b.moe, m.weights, plan);
+    splash::test::addMoeStep(graph, b.moe, m.weights, plan);
     static_cast<void>(backend.submitCommandAsync(graph.dispatches()).wait());
     const auto *output = static_cast<const uint16_t *>(b.moe.output.contents());
     const auto *routeRows = static_cast<const uint32_t *>(b.moe.scratch.routeRows.contents());

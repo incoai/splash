@@ -248,17 +248,6 @@ void MoE::addRouting(metal::CommandGraph &graph, const MoeBuffers &buffers, cons
             std::move(grouping), group, {1, 1, 1}, {shape.routerWidth(), 1, 1});
 }
 
-void MoE::add(metal::CommandGraph &graph, const MoeBuffers &buffers,
-              const BlockMoeWeights &weights, const MoePlan &plan) {
-  addRouting(graph, buffers, weights, plan);
-  if (weights.stream) {
-    const MoeLoadPart part{&buffers, &plan};
-    weights.stream->addLoad(graph, {&part, 1}, weights.streamBlock,
-                            [&] { addResident(graph, buffers, weights, plan); });
-  }
-  addRouted(graph, buffers, weights, plan);
-}
-
 // A streamed block's gather and passes over the experts resident before its
 // load, on the grouping's copy of their slots.
 void MoE::addResident(metal::CommandGraph &graph, const MoeBuffers &buffers,

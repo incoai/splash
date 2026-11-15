@@ -19,9 +19,6 @@
 namespace splash::model {
 namespace {
 
-// The rows a decode step verifies of each of its lanes.
-constexpr uint32_t kVerifyRows = ExecutionLimits::decodeLaneRows;
-
 // A prefill sequence binds every GDN layer's state cells, in and out, and so
 // does each state it captures; with auxiliary state, its cells too.
 void requirePrefillStates(const QwenTargetGeometry &geometry, const QwenTargetPrefillSequence &sequence) {
@@ -78,12 +75,11 @@ const ops::Projection &QwenTarget::vocabularyProjection() const noexcept {
   return weightsBase_.logitsProjection;
 }
 
-uint32_t QwenTarget::decodeStorageLanes(uint32_t lanes) const {
-  const uint32_t rows = lanes * kVerifyRows;
-  uint32_t storageRows = rows;
-  for (const auto &shape : geometry_.decodeProjections)
-    storageRows = std::max(storageRows, operators_.linear().storageRows(rows, shape));
-  return storageRows / kVerifyRows;
+uint32_t QwenTarget::headStorageLanes(uint32_t lanes) const {
+  constexpr uint32_t laneRows = ExecutionLimits::draftQueryRows;
+  return std::max(lanes * laneRows,
+                  operators_.linear().storageRows(lanes * laneRows, vocabularyProjection().shape())) /
+         laneRows;
 }
 
 void QwenTarget::addInsideCapture(metal::CommandGraph &, metal::MetalBuffer, metal::MetalBuffer) const {}
@@ -157,7 +153,7 @@ QwenTarget::PrefillStep QwenTarget::prefillStep(metal::CommandGraph &graph, cons
     const QwenTargetPrefillSequence &sequence = chunk.sequences[index];
     // A decode lane's states are the step's (QwenTargetDecodeBuffers).
     if (!step.decode) requirePrefillStates(geometry_, sequence);
-    else if (geometry_.stateLayout.auxiliaryBytes && !step.decode->auxiliary[index])
+    else if (geometry_.stateLayout.auxiliaryBytes && !sequence.auxiliaryIn)
       throw std::invalid_argument("Qwen decode lane without its auxiliary state");
     step.chunks[index] = sequence.chunk;
     step.pageTables[index] = sequence.pageTable;

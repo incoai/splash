@@ -52,8 +52,9 @@ constexpr uint32_t kQueryHeads = 32, kKvHeads = 4, kGroup = kQueryHeads / kKvHea
 constexpr test::AttentionGeometry kGeometry{kQueryHeads, kKvHeads, kHeadDimension, kv::Reads::EveryPage};
 constexpr uint32_t kWindow = 512, kRotaryPairs = kHeadDimension / 2;
 constexpr uint32_t kPageTokens = kv::kPageTokens;
-// A decode lane's rows, one attention tile.
-constexpr uint32_t kLaneRows = ops::kDecodeLaneRows;
+// A lane of the narrow cap's rows (a decode lane of up to eight), one
+// attention tile.
+constexpr uint32_t kLaneRows = ops::kNarrowLaneRows;
 // The attention layer under test is the second of a pool's two, so its region
 // starts past the first one's in every extent.
 constexpr uint32_t kLayer = 1;

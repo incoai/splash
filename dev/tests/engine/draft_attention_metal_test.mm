@@ -6,6 +6,7 @@
 // exactly one or several splits, and the last slot of the ring, so that tile
 // bounds, the window mask, empty splits and the empty-row softmax guard are
 // all exercised.
+#include "ChainRows.hpp"
 #include "LinearNumerics.hpp"
 #include "TestBuffers.hpp"
 #include "TestChecks.hpp"
@@ -37,6 +38,8 @@ using namespace splash::ops;
 using splash::test::bf16ToFloat;
 using splash::test::floatToBf16;
 using splash::test::ulpBf16;
+using splash::test::mostRows;
+using splash::test::rowsEnd;
 
 constexpr uint32_t kRows = 8;
 // A lane's RoPE rows, its verify block's positions, of which its draft's rows
