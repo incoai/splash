@@ -112,10 +112,13 @@ private:
   bool finished_ = false;
 };
 
-} // namespace
-
-GdnParityBuffers gdnCellBuffers(metal::MetalBackend &backend, metal::MetalBuffer base, const GdnStateLayout &layout) {
-  if (base.sizeBytes() < layout.cellBytes()) throw std::invalid_argument("a GDN cell is larger than its buffer");
+// The views of a cell in `base` whose recurrent layers take
+// `recurrentLayerBytes` each, a lane's or a cached state's.
+GdnParityBuffers cellViews(metal::MetalBackend &backend, metal::MetalBuffer base, const GdnStateLayout &layout,
+                           uint64_t recurrentLayerBytes) {
+  const uint64_t recurrentBytes = uint64_t{layout.layers} * recurrentLayerBytes;
+  if (base.sizeBytes() < layout.convolutionBytes() + recurrentBytes + alignUp(layout.auxiliaryBytes))
+    throw std::invalid_argument("a GDN cell is larger than its buffer");
   GdnParityBuffers cell;
   cell.stateBase = std::move(base);
   cell.convolutionLayers.resize(layout.layers);
@@ -123,35 +126,24 @@ GdnParityBuffers gdnCellBuffers(metal::MetalBackend &backend, metal::MetalBuffer
   for (uint32_t layer = 0; layer < layout.layers; ++layer) {
     cell.convolutionLayers[layer] = backend.view(cell.stateBase, uint64_t{layer} * layout.convolutionLayerBytes(),
                                                  layout.convolutionLayerBytes());
-    cell.recurrentLayers[layer] =
-        backend.view(cell.stateBase, layout.convolutionBytes() + uint64_t{layer} * layout.recurrentLayerBytes(),
-                     layout.recurrentLayerBytes());
+    cell.recurrentLayers[layer] = backend.view(
+        cell.stateBase, layout.convolutionBytes() + uint64_t{layer} * recurrentLayerBytes, recurrentLayerBytes);
   }
   if (layout.auxiliaryBytes)
-    cell.auxiliary = backend.view(cell.stateBase, layout.convolutionBytes() + layout.recurrentBytes(),
-                                  layout.auxiliaryBytes);
+    cell.auxiliary =
+        backend.view(cell.stateBase, layout.convolutionBytes() + recurrentBytes, layout.auxiliaryBytes);
   return cell;
+}
+
+} // namespace
+
+GdnParityBuffers gdnCellBuffers(metal::MetalBackend &backend, metal::MetalBuffer base, const GdnStateLayout &layout) {
+  return cellViews(backend, std::move(base), layout, layout.recurrentLayerBytes());
 }
 
 GdnParityBuffers cachedCellBuffers(metal::MetalBackend &backend, metal::MetalBuffer base,
                                    const GdnStateLayout &layout) {
-  if (base.sizeBytes() < layout.cachedCellBytes())
-    throw std::invalid_argument("a cached GDN cell is larger than its buffer");
-  GdnParityBuffers cell;
-  cell.stateBase = std::move(base);
-  cell.convolutionLayers.resize(layout.layers);
-  cell.recurrentLayers.resize(layout.layers);
-  for (uint32_t layer = 0; layer < layout.layers; ++layer) {
-    cell.convolutionLayers[layer] = backend.view(cell.stateBase, uint64_t{layer} * layout.convolutionLayerBytes(),
-                                                 layout.convolutionLayerBytes());
-    cell.recurrentLayers[layer] =
-        backend.view(cell.stateBase, layout.convolutionBytes() + uint64_t{layer} * layout.cachedRecurrentLayerBytes(),
-                     layout.cachedRecurrentLayerBytes());
-  }
-  if (layout.auxiliaryBytes)
-    cell.auxiliary = backend.view(cell.stateBase, layout.convolutionBytes() + layout.cachedRecurrentBytes(),
-                                  layout.auxiliaryBytes);
-  return cell;
+  return cellViews(backend, std::move(base), layout, layout.cachedRecurrentLayerBytes());
 }
 
 QwenGdnCell::QwenGdnCell(metal::MetalBackend &backend,
@@ -464,9 +456,7 @@ std::optional<uint32_t> QwenStateStorage::statesToActivate() const noexcept {
 
 uint64_t QwenStateStorage::idleBytes(uint32_t evictedStates, bool afterStart, bool keepLane) const noexcept {
   BufferCounts pooled = afterStart ? beyond(idle(), kLaneBuffers) : idle();
-  // A cached cell of no bytes is the empty cell, which no pool holds.
-  if (!emptyCell_)
-    pooled.cachedCells += evictedStates * kStateBuffers.cachedCells;
+  pooled.cachedCells += evictedStates * kStateBuffers.cachedCells;
   pooled.windows += evictedStates * kStateBuffers.windows;
   return bytes(keepLane ? beyond(pooled, kLaneBuffers) : pooled);
 }
@@ -503,14 +493,20 @@ QwenStateStorage::snapshot(uint32_t index) {
 
 std::shared_ptr<const QwenCompositeState>
 QwenStateStorage::snapshot(uint32_t index, QwenLogicalLengths lengths) {
-  // Before anything is allocated; copyState() and seal() check again.
+  return keep(index, lengths, [&](QwenStateReservation &reservation) { storeState(index, reservation); });
+}
+
+std::shared_ptr<const QwenCompositeState>
+QwenStateStorage::keep(uint32_t index, QwenLogicalLengths lengths,
+                       const std::function<void(QwenStateReservation &)> &store) {
+  // Before anything is allocated; `store` and seal() check again.
   requireCommitted(lane(index));
   validateLengths(lengths, true);
   metal::AllocationFailure refusal;
   const std::shared_ptr<QwenStateReservation> reservation = reserve(refusal);
   if (!reservation)
     return nullptr;
-  storeState(index, *reservation);
+  store(*reservation);
   return seal(*reservation, lengths);
 }
 
@@ -732,17 +728,12 @@ GdnParityBuffers QwenStateStorage::landing(uint32_t index) const {
 
 std::shared_ptr<const QwenCompositeState>
 QwenStateStorage::promoteRead(uint32_t index, QwenLogicalLengths lengths) {
-  requireCommitted(lane(index));
-  validateLengths(lengths, true);
-  metal::AllocationFailure refusal;
-  const std::shared_ptr<QwenStateReservation> reservation = reserve(refusal);
-  if (!reservation)
-    return nullptr;
-  if (const uint64_t bytes = layout_.target.cachedCellBytes())
-    std::memcpy(writableContents(reservation->buffers().gdn->buffers().stateBase, "cached GDN state"),
-                writableContents(next(index).stateBase, "landed GDN state"), bytes);
-  copyWindow(index, *reservation);
-  return seal(*reservation, lengths);
+  return keep(index, lengths, [&](QwenStateReservation &reservation) {
+    if (const uint64_t bytes = layout_.target.cachedCellBytes())
+      std::memcpy(writableContents(reservation.buffers().gdn->buffers().stateBase, "cached GDN state"),
+                  writableContents(next(index).stateBase, "landed GDN state"), bytes);
+    copyWindow(index, reservation);
+  });
 }
 
 std::shared_ptr<const CompositeState> QwenStateStorage::adopt(const SlotRecord &record,

@@ -435,6 +435,10 @@ private:
   void restoreLengths(uint32_t lane, QwenLogicalLengths lengths, bool restoreDraft);
   [[nodiscard]] std::shared_ptr<const QwenCompositeState>
   snapshot(uint32_t lane, QwenLogicalLengths lengths);
+  // A cached state of the lane's committed state at `lengths`: a reserved
+  // cache slot that `store` fills, sealed; nullptr on capacity pressure.
+  [[nodiscard]] std::shared_ptr<const QwenCompositeState>
+  keep(uint32_t lane, QwenLogicalLengths lengths, const std::function<void(QwenStateReservation &)> &store);
   // The cached cell a disk state's read lands in: the start of the lane's
   // other cell.
   [[nodiscard]] GdnParityBuffers landing(uint32_t lane) const;
