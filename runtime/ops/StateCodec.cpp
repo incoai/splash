@@ -9,8 +9,8 @@
 namespace splash::ops {
 namespace {
 
-// The kernels' threadgroup (kernels/shared/state_codec.metal).
-constexpr uint32_t kThreads = 256;
+constexpr uint32_t kThreads = metal::CommandGraph::kDefaultThreads;
+static_assert(kThreads % 2 == 0, "a block's two threads share a threadgroup");
 
 StateCodecParams params(const StateCodecShape &shape) {
   return {shape.stateLayerBytes, shape.codesLayerBytes, state_codec_scales_offset(shape.rows, shape.columns),

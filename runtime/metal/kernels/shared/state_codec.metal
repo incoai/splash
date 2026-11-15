@@ -4,9 +4,9 @@
 // The cached form of a GDN state's recurrent layers (ops::StateCodec,
 // common/state_codec.h's arithmetic): one thread per
 // SPLASH_STATE_CODEC_THREAD_VALUES consecutive values of a value row, two
-// threads per block of SPLASH_STATE_CODEC_BLOCK.
+// threads per block of SPLASH_STATE_CODEC_BLOCK, which any even threadgroup
+// width keeps neighbours in one simdgroup.
 
-constant constexpr uint kStateCodecThreads = 256;
 constant constexpr uint kValues = SPLASH_STATE_CODEC_THREAD_VALUES;
 static_assert(SPLASH_STATE_CODEC_BLOCK == 2 * SPLASH_STATE_CODEC_THREAD_VALUES,
               "a block is the values of two neighbouring threads");
@@ -59,16 +59,14 @@ inline void state_dequantize_thread(device const char *codes, device State *stat
   kernel void state_quantize##Suffix(device const State *state [[buffer(0)]],                        \
                                      device char *codes [[buffer(1)]],                               \
                                      constant StateCodecParams &p [[buffer(2)]],                     \
-                                     uint2 group [[threadgroup_position_in_grid]],                   \
-                                     uint local [[thread_index_in_threadgroup]]) {                  \
-    state_quantize_thread<State>(state, codes, p, group.x * kStateCodecThreads + local, group.y);   \
+                                     uint2 position [[thread_position_in_grid]]) {                   \
+    state_quantize_thread<State>(state, codes, p, position.x, position.y);                           \
   }                                                                                                  \
   kernel void state_dequantize##Suffix(device const char *codes [[buffer(0)]],                       \
                                        device State *state [[buffer(1)]],                            \
                                        constant StateCodecParams &p [[buffer(2)]],                   \
-                                       uint2 group [[threadgroup_position_in_grid]],                 \
-                                       uint local [[thread_index_in_threadgroup]]) {                \
-    state_dequantize_thread<State>(codes, state, p, group.x * kStateCodecThreads + local, group.y); \
+                                       uint2 position [[thread_position_in_grid]]) {                 \
+    state_dequantize_thread<State>(codes, state, p, position.x, position.y);                         \
   }
 
 // The running state in fp32 and, as Name_bf16_state, in bf16 (GdnStateFormat).
