@@ -109,18 +109,28 @@ void NgramEmbedding::addHistory(metal::CommandGraph &graph, metal::MetalBuffer c
 }
 
 void NgramEmbedding::addCommit(metal::CommandGraph &graph, metal::MetalBuffer convolutionInput,
-                               metal::MetalBuffer historyIn, metal::MetalBuffer historyOut, metal::MetalBuffer path,
-                               NgramShape shape, uint32_t rows) {
+                               std::span<const metal::MetalBuffer> historyIn,
+                               std::span<const metal::MetalBuffer> historyOut, metal::MetalBuffer paths,
+                               NgramShape shape, metal::MetalBuffer layout, const LayoutRows &rows) {
   requireShape(shape);
-  if (!rows || rows > 32) throw std::invalid_argument("invalid n-gram embedding commit");
-  // The GPU's path is of the lane's verify rows, any of which it may hold.
-  requireBytes(convolutionInput, bfloat16Rows(shape, rows), "n-gram embedding convolution input");
-  requireBytes(historyIn, historyBytes(shape), "n-gram embedding history");
-  requireBytes(historyOut, historyBytes(shape), "n-gram embedding next history");
-  requireBytes(path, sizeof(uint32_t), "n-gram embedding accepted path");
+  // A lane's path is a row mask of its rows.
+  requireLayoutRows(rows, 32);
+  if (historyIn.size() != rows.sequences || historyOut.size() != rows.sequences)
+    throw std::invalid_argument("invalid n-gram embedding commit");
+  // The GPU's paths are of the lanes' verify rows, any of which they may hold.
+  requireBytes(convolutionInput, bfloat16Rows(shape, rows.rows), "n-gram embedding convolution input");
+  for (const metal::MetalBuffer &history : historyIn)
+    requireBytes(history, historyBytes(shape), "n-gram embedding history");
+  for (const metal::MetalBuffer &history : historyOut)
+    requireBytes(history, historyBytes(shape), "n-gram embedding next history");
+  requireBytes(paths, uint64_t{rows.sequences} * sizeof(uint32_t), "n-gram embedding accepted path");
+  requireBytes(layout, uint64_t{rows.sequences} * sizeof(SplashLaneRows), "n-gram embedding layout");
+  const auto in = laneBindings(historyIn), out = laneBindings(historyOut);
   graph.add("ngram_embedding_commit",
-            {std::move(convolutionInput), std::move(historyIn), std::move(historyOut), std::move(path)},
-            ngramParams(shape, 0, true), {shape.history(), groups(shape.width()), 1}, {kThreads, 1, 1});
+            {std::move(convolutionInput), in[0], in[1], in[2], in[3], out[0], out[1], out[2], out[3], std::move(paths),
+             std::move(layout)},
+            ngramParams(shape, rows.rows, true, false, rows.sequences),
+            {shape.history(), groups(shape.width()), rows.sequences}, {kThreads, 1, 1});
 }
 
 void NgramEmbedding::addHash(metal::CommandGraph &graph, NgramHashBuffers buffers, NgramHashParams params,

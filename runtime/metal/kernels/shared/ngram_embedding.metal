@@ -176,16 +176,34 @@ kernel void ngram_embedding_history(device const bfloat *input [[buffer(0)]],
   ngram_history_rows(input, history_in, history_out, p, p.rows, 0, group, tid);
 }
 
-// The history after a lane's accepted path of its verify block, a row mask
-// the GPU wrote (acceptance's retained rows).
+// The history after each lane's accepted path of its verify block, a row
+// mask the GPU wrote (acceptance's retained rows, paths[l]) of the lane's
+// rows its entry of the step's layout holds: threadgroup (j, y, lane), from
+// the lane's history before (history_in l) to its history after
+// (history_out l). A lane whose rows run past the step's writes nothing.
 kernel void ngram_embedding_commit(device const bfloat *input [[buffer(0)]],
-                                   device const bfloat *history_in [[buffer(1)]],
-                                   device bfloat *history_out [[buffer(2)]],
-                                   device const uint *path [[buffer(3)]],
-                                   constant NgramEmbeddingParams &p [[buffer(4)]],
-                                   uint2 group [[threadgroup_position_in_grid]],
+                                   device const bfloat *history_in0 [[buffer(1)]],
+                                   device const bfloat *history_in1 [[buffer(2)]],
+                                   device const bfloat *history_in2 [[buffer(3)]],
+                                   device const bfloat *history_in3 [[buffer(4)]],
+                                   device bfloat *history_out0 [[buffer(5)]],
+                                   device bfloat *history_out1 [[buffer(6)]],
+                                   device bfloat *history_out2 [[buffer(7)]],
+                                   device bfloat *history_out3 [[buffer(8)]],
+                                   device const uint *paths [[buffer(9)]],
+                                   device const SplashLaneRows *layout [[buffer(10)]],
+                                   constant NgramEmbeddingParams &p [[buffer(11)]],
+                                   uint3 group [[threadgroup_position_in_grid]],
                                    uint tid [[thread_index_in_threadgroup]]) {
-  ngram_history_rows(input, history_in, history_out, p, popcount(path[0]), path[0], group, tid);
+  const uint lane = group.z;
+  if (lane >= min(p.sequences, SPLASH_MAXIMUM_BATCH_WIDTH)) return;
+  const SplashLaneRows rows = layout[lane];
+  if (ulong(rows.first) + rows.rows > p.rows) return;
+  const uint path = paths[lane];
+  ngram_history_rows(input + ulong(rows.first) * p.streams * p.hidden,
+                     SPLASH_LANE_BINDING(lane, history_in0, history_in1, history_in2, history_in3),
+                     SPLASH_LANE_BINDING(lane, history_out0, history_out1, history_out2, history_out3), p,
+                     popcount(path), path, group.xy, tid);
 }
 
 // The table rows of each lane's rows of a verify step (model/Qwen4Steps.cpp

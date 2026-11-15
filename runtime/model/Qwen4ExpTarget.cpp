@@ -426,16 +426,16 @@ void Qwen4ExpTarget::addStateCommit(metal::CommandGraph &graph, QwenTargetCommit
                                     std::span<const ops::LaneRows> blocks) const {
   QwenTarget::addStateCommit(graph, buffers, blocks);
   const auto lanes = static_cast<uint32_t>(blocks.size());
-  // Each lane's PLE history after its accepted path, from the convolution
-  // inputs its verify wrote of its block.
+  // Every lane's PLE history after its accepted path in one dispatch, from
+  // the convolution inputs its verify wrote of its rows, by the step's
+  // layout.
   const ops::NgramShape shape = ngramShape(geometry_);
-  const Qwen4Scratch scratch = steps_.verifyScratch(static_cast<uint32_t>(ops::rowsEnd(blocks)));
-  const uint64_t rowBytes = uint64_t{shape.width()} * sizeof(uint16_t);
-  for (uint32_t lane = 0; lane < lanes; ++lane)
-    ops::NgramEmbedding::addCommit(
-        graph, backend_.view(scratch.pleConvolution, blocks[lane].first * rowBytes, blocks[lane].rows * rowBytes),
-        buffers.auxiliaryIn[lane], buffers.auxiliaryOut[lane],
-        backend_.view(buffers.retainedRows, lane * sizeof(uint32_t), sizeof(uint32_t)), shape, blocks[lane].rows);
+  const ops::LayoutRows rows{lanes, static_cast<uint32_t>(ops::rowsEnd(blocks)), ops::mostRows(blocks)};
+  const Qwen4Scratch scratch = steps_.verifyScratch(rows.rows);
+  ops::NgramEmbedding::addCommit(graph, rowsOf<uint16_t>(scratch.pleConvolution, 0, rows.rows, shape.width()),
+                                 std::span(buffers.auxiliaryIn).first(lanes),
+                                 std::span(buffers.auxiliaryOut).first(lanes), buffers.retainedRows, shape,
+                                 buffers.laneRows, rows);
   // Each lane's blocks its accepted path completes into the index, and its
   // QSA pending keys after the path.
   const uint32_t layers = geometry_.kvLayout.attentionLayers;

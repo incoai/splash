@@ -455,9 +455,9 @@ void pleTest(MetalBackend &backend) {
   for (uint32_t retained = 1; retained <= rows; retained += 3) {
     MetalBuffer committed = scratch(backend, history * width * 2), captured = scratch(backend, history * width * 2);
     CommandGraph graph3;
-    ops::NgramEmbedding::addCommit(graph3, conv, histIn, committed,
+    ops::NgramEmbedding::addCommit(graph3, conv, std::span(&histIn, 1), std::span(&committed, 1),
                                    upload(backend, std::vector<uint32_t>{splash::ops::chainPath(retained)}), shape,
-                                   rows);
+                                   laneRowsOf(backend, sequence), {1, rows, rows});
     ops::NgramEmbedding::addHistory(graph3, conv, histIn, captured, shape, retained);
     run(backend, graph3);
     const auto got = download<uint16_t>(committed, history * width);
@@ -533,8 +533,9 @@ void pleTreeTest(MetalBackend &backend) {
   for (const uint32_t leaf : {6u, 4u}) {
     MetalBuffer committed = scratch(backend, history * width * 2);
     CommandGraph commit;
-    ops::NgramEmbedding::addCommit(commit, convBuffer, histIn, committed,
-                                   upload(backend, std::vector<uint32_t>{tree[leaf].ancestors}), shape, rows);
+    ops::NgramEmbedding::addCommit(commit, convBuffer, std::span(&histIn, 1), std::span(&committed, 1),
+                                   upload(backend, std::vector<uint32_t>{tree[leaf].ancestors}), shape,
+                                   laneRowsOf(backend, block), {1, rows, rows});
     run(backend, commit);
     const auto got = download<uint16_t>(committed, history * width);
     bool ok = true;
@@ -1447,6 +1448,80 @@ void plePackedLanes(MetalBackend &backend) {
   }
 }
 
+// The PLE commit of a decode step's lanes of 1 to 16 rows, packed one after
+// another at a cycle's caps of 8 and 16, in one dispatch: each lane's history
+// after its accepted path (a path of its tree, or the first rows of its
+// chain) is its own committed alone from row 0 after its own history, bit for
+// bit.
+void plePackedCommit(MetalBackend &backend) {
+  constexpr uint32_t hidden = 256, streams = 4, taps = 4, dilation = 3, width = hidden * streams;
+  constexpr uint16_t kFill = 0x7FC1;
+  const ops::NgramShape shape{hidden, streams, taps, dilation};
+  const uint64_t historyValues = uint64_t{shape.history()} * width;
+  std::mt19937 rng(53);
+  // The histories `lanes` commit at `bound` rows a lane after `paths`, from
+  // the rows of `conv` and each lane's history before.
+  const auto commit = [&](std::span<const ops::LaneRows> lanes, uint32_t bound, const std::vector<float> &conv,
+                          std::span<const std::vector<float>> histories, std::span<const uint32_t> paths) {
+    std::vector<MetalBuffer> in, out;
+    for (const std::vector<float> &values : histories) {
+      in.push_back(upload(backend, bf16s(values)));
+      out.push_back(upload(backend, std::vector<uint16_t>(historyValues, kFill)));
+    }
+    CommandGraph graph;
+    ops::NgramEmbedding::addCommit(
+        graph, upload(backend, bf16s(conv)), in, out, upload(backend, std::vector<uint32_t>(paths.begin(), paths.end())),
+        shape, laneRowsOf(backend, lanes),
+        {static_cast<uint32_t>(lanes.size()), static_cast<uint32_t>(ops::rowsEnd(lanes)), bound});
+    run(backend, graph);
+    std::vector<std::vector<uint16_t>> result;
+    for (const MetalBuffer &buffer : out) result.push_back(download<uint16_t>(buffer, historyValues));
+    return result;
+  };
+  // A lane's tree and the last row of the path it accepted.
+  struct Lane final {
+    std::vector<ops::TreeRow> tree;
+    uint32_t leaf;
+  };
+  struct Case final {
+    uint32_t cap;
+    std::vector<Lane> lanes;
+  };
+  const std::vector<Case> cases{
+      {8, {{qsaChain(3), 1}, {qsaTree(std::vector<int>{-1, 0, 1, 2, 3, 1, 5, 0}), 6}, {qsaChain(1), 0},
+           {qsaTree(std::vector<int>{-1, 0, 0, 1, 2, 3}), 4}}},
+      {16, {{qsaTree(std::vector<int>{-1, 0, 1, 2, 3, 4, 5, 6, 1, 8, 9, 0, 11, 12, 13, 14}), 10}, {qsaChain(1), 0},
+            {qsaTree(std::vector<int>{-1, 0, 1, 1, 3, 2, 5, 0, 7}), 6}, {qsaChain(12), 11}}},
+      {16, {{qsaTree(std::vector<int>{-1, 0, 0, 1, 2, 3, 4}), 0}, {qsaChain(16), 15}}}};
+  for (const Case &c : cases) {
+    std::vector<ops::LaneRows> lanes;
+    std::vector<uint32_t> paths;
+    uint32_t rows = 0;
+    for (const Lane &lane : c.lanes) {
+      lanes.push_back({rows, static_cast<uint32_t>(lane.tree.size())});
+      rows += static_cast<uint32_t>(lane.tree.size());
+      paths.push_back(lane.tree[lane.leaf].ancestors);
+    }
+    const auto conv = randoms(rng, uint64_t{rows} * width, 1.0f);
+    std::vector<std::vector<float>> histories;
+    for (size_t l = 0; l < lanes.size(); ++l) histories.push_back(randoms(rng, historyValues, 1.0f));
+    const auto packed = commit(lanes, c.cap, conv, histories, paths);
+    bool same = true;
+    for (size_t l = 0; l < lanes.size(); ++l) {
+      const ops::LaneRows lane = lanes[l];
+      const std::array<ops::LaneRows, 1> own{{{0, lane.rows}}};
+      const std::vector<float> laneConv(conv.begin() + uint64_t{lane.first} * width,
+                                        conv.begin() + (uint64_t{lane.first} + lane.rows) * width);
+      same &= commit(own, c.cap, laneConv, std::span(histories).subspan(l, 1), std::span(paths).subspan(l, 1))[0] ==
+              packed[l];
+    }
+    std::string sizes;
+    for (const ops::LaneRows &lane : lanes) sizes += (sizes.empty() ? "" : ", ") + std::to_string(lane.rows);
+    check(same, "PLE commit of lanes of " + sizes + " rows at a cap of " + std::to_string(c.cap) +
+                    ": each lane's history after its path as alone, bit for bit");
+  }
+}
+
 // Lanes of different row counts packed one after another (5, 8, 1 and 6
 // rows from rows 0, 5, 13 and 14) hash their rows as each lane does alone
 // from row 0, each from its own tokens before it, bit for bit.
@@ -1921,14 +1996,20 @@ void pleExtentsTest(MetalBackend &backend) {
                                [&](CommandGraph &graph, const Buffers &b) {
                                  ops::NgramEmbedding::addHistory(graph, b[0], b[1], b[2], shape, rows);
                                });
+  // Two lanes' commit, each its history before and after its path.
   splash::test::requireExtents(
       backend,
-      Extents{{0, uint64_t{splash::ops::kDecodeLaneRows} * width * 2, 2, "n-gram embedding convolution input"},
+      Extents{{0, uint64_t{2 * splash::ops::kDecodeLaneRows} * width * 2, 2, "n-gram embedding convolution input"},
               {1, history, 2, "n-gram embedding history"},
-              {2, history, 2, "n-gram embedding next history"},
-              {3, 4, 4, "n-gram embedding accepted path"}},
+              {2, history, 2, "n-gram embedding history"},
+              {3, history, 2, "n-gram embedding next history"},
+              {4, history, 2, "n-gram embedding next history"},
+              {5, 2 * 4, 4, "n-gram embedding accepted path"},
+              {6, 2 * sizeof(ops::LaneRows), sizeof(ops::LaneRows), "n-gram embedding layout"}},
       [&](CommandGraph &graph, const Buffers &b) {
-        ops::NgramEmbedding::addCommit(graph, b[0], b[1], b[2], b[3], shape, splash::ops::kDecodeLaneRows);
+        const std::array<MetalBuffer, 2> in{b[1], b[2]}, out{b[3], b[4]};
+        ops::NgramEmbedding::addCommit(graph, b[0], in, out, b[5], shape, b[6],
+                                       {2, 2 * splash::ops::kDecodeLaneRows, splash::ops::kDecodeLaneRows});
       });
   NgramHashParams params{};
   params.ngram = 3;
@@ -1983,6 +2064,7 @@ int main(int argc, const char *argv[]) {
         pleTest(backend);
         pleTreeTest(backend);
         plePackedLanes(backend);
+        plePackedCommit(backend);
         qsaTest(backend, {150, 20, 16, 0, 1, 7});
         // A threshold inside a run of equal scores: fewer other blocks than
         // the budget.

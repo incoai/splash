@@ -66,12 +66,16 @@ struct NgramEmbedding final {
   static void addHistory(metal::CommandGraph &graph, metal::MetalBuffer convolutionInput,
                          metal::MetalBuffer historyIn, metal::MetalBuffer historyOut, NgramShape shape,
                          uint32_t rows);
-  // The history after a lane's accepted path (`path`, a row mask the GPU
-  // wrote, metal/abi/VerifyTree.h) of its verify block's `rows` in
-  // convolutionInput.
+  // The history after each lane's accepted path (`paths`, a row mask the GPU
+  // wrote a lane, metal/abi/VerifyTree.h) of its verify block's rows in
+  // convolutionInput, as the step's layout holds them (`layout`, a
+  // SplashLaneRows a lane, of `rows`, at most 32 rows a lane), in one
+  // dispatch: lane l's history before it historyIn[l], after it
+  // historyOut[l].
   static void addCommit(metal::CommandGraph &graph, metal::MetalBuffer convolutionInput,
-                        metal::MetalBuffer historyIn, metal::MetalBuffer historyOut, metal::MetalBuffer path,
-                        NgramShape shape, uint32_t rows);
+                        std::span<const metal::MetalBuffer> historyIn, std::span<const metal::MetalBuffer> historyOut,
+                        metal::MetalBuffer paths, NgramShape shape, metal::MetalBuffer layout,
+                        const LayoutRows &rows);
   // The table rows of each lane's rows of a verify step (`step`) by the hash
   // `params` describes, whose lane count it sets.
   static void addHash(metal::CommandGraph &graph, NgramHashBuffers buffers, NgramHashParams params,
