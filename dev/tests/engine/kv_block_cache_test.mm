@@ -58,9 +58,17 @@ using test::require;
 using test::sourcesOf;
 using test::TestKvCopy;
 
-constexpr uint32_t kExtentPages = 256, kPlaces = 8, kLaneSlots = 1024;
+constexpr uint32_t kExtentPages = 256, kPlaces = 8;
 // An extent's slots per layer.
 constexpr uint32_t kExtentSlots = kExtentPages * kPlaces;
+// The blocks a verify row selects: a lane of 16 rows selects 1,024 slots,
+// beside the floors' spare of eight rows' 512 (SparseKvShape::requiredSlots).
+constexpr uint32_t kSelectedBlocks = 64;
+
+constexpr model::SparseKvShape shapeOf(uint32_t selectedBlocks) {
+  return {.blockTokens = SPLASH_ATTENTION_BLOCK_TOKENS, .selectedBlocks = selectedBlocks,
+          .verifyRows = SPLASH_TARGET_VERIFY_ROWS, .denseHistoryTokens = 0};
+}
 
 constexpr kv::Layout layoutOf(kv::Format format) {
   return {2, 2, 256, format, 128, true, 0, 0, kv::Reads::SelectedBlocks};
@@ -69,9 +77,10 @@ constexpr kv::Layout layoutOf(kv::Format format) {
 uint64_t extentBytes(kv::Layout layout) { return uint64_t{kExtentPages} * layout.kvBytesPerModelPage(); }
 
 KvBlockCache makeCache(MetalBackend &backend, kv::Layout layout, uint32_t targetExtents,
-                       metal::AllocationAdmission admission = test::admitAll, uint32_t laneSlots = kLaneSlots) {
+                       metal::AllocationAdmission admission = test::admitAll,
+                       uint32_t selectedBlocks = kSelectedBlocks) {
   return KvBlockCache(backend, std::move(admission), layout, kExtentPages,
-                      {.laneSlots = laneSlots,
+                      {.shape = shapeOf(selectedBlocks),
                        .targetBytes = targetExtents * extentBytes(layout),
                        .readers = std::make_shared<model::SsdReaders>(8),
                        .format = kv::SlotFormat(layout)});
@@ -317,7 +326,7 @@ void growsAndReleases(MetalBackend &backend) {
   static_cast<void>(resolve(backend, cache, 0, lanes, {blocksOf(0, 256)}, grown));
   require(grown->hits == 200 * kPlaces && grown->misses == 56 * kPlaces, "growing lost the cache's blocks");
   // A second lane's floor fits; giving back what is above the floors, an
-  // extent a call, keeps two lanes' (3,072 slots, two extents), then one
+  // extent a call, keeps two lanes' (2,560 slots, two extents), then one
   // lane's.
   // holdsLane() is the lane's own floor, not room the cache has for one.
   require(!cache.holdsLane(1), "a lane held a floor it was not granted");
@@ -362,7 +371,7 @@ void growsAndReleases(MetalBackend &backend) {
         room -= bytes;
         return test::admitAll(bytes, allocate);
       },
-      2 * kLaneSlots);
+      2 * kSelectedBlocks);
   require(!wide.reserveLane(0).granted() && wide.stats().bytes == 0 && wide.stats().lanes == 0,
           "a refused floor of two extents kept one");
   require(!asked.empty() && asked.back() == 2 * extent,

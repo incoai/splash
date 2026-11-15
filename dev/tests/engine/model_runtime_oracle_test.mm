@@ -3611,7 +3611,7 @@ public:
         states_(backend, admission, model.stateLayout(stateFormat), nullptr),
         readers_(std::make_shared<model::SsdReaders>(model::kSsdReaders)),
         cache_(backend, admission, layout_, extentPages_,
-               {.laneSlots = static_cast<uint32_t>(shape_.laneSlots()), .targetBytes = 0, .readers = readers_,
+               {.shape = shape_, .targetBytes = 0, .readers = readers_,
                 .format = format_}),
         stream_(backend, admission, layout_, extentPages_, readers_, format_, options.buffers),
         tables_{backend.allocateBuffer(lanePages * sizeof(SplashKvPage), metal::BufferStorage::Shared,

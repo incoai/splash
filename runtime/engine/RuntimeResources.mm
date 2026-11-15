@@ -1247,7 +1247,7 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
     if (spill.enabled) {
       blockCache = std::make_unique<model::KvBlockCache>(
           *backend, memoryGovernor->allocationAdmission(), kvLayout, budget.kvExtentPages,
-          model::KvBlockCacheOptions{.laneSlots = static_cast<uint32_t>(spill.laneSlots),
+          model::KvBlockCacheOptions{.shape = *config.model.capabilities.sparseKv,
                                      .targetBytes = spill.hotTargetBytes,
                                      .readers = readers,
                                      .format = kvFormat});

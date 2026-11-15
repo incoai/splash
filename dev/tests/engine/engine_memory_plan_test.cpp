@@ -527,18 +527,18 @@ StreamedMemoryPlan requirePlan(const StreamedMemoryInputs &inputs) {
 }
 
 // One definition of the hot block cache: its floor holds requiredSlots(1)
-// slots a layer, (1 + 1) x a verify block's 16 rows x 512 blocks, in whole
-// extents: eight of Flash-Next's 256-page extents of K/V without the index,
-// 780 MiB.
+// slots a layer, a verify block's 16 rows x 512 blocks and a spare of 8
+// rows', in whole extents: six of Flash-Next's 256-page extents of K/V
+// without the index, 585 MiB.
 void testHotBlockCacheIsDefinedOnce() {
   const model::SparseKvShape shape = test::sparseKvShape();
-  require(shape.laneSlots() == 8'192 && shape.requiredSlots(0) == 0 && shape.requiredSlots(1) == 16'384 &&
-              shape.requiredSlots(4) == 40'960,
-          "the hot block cache's floor is not (lanes + 1) x laneSlots");
+  require(shape.laneSlots() == 8'192 && shape.requiredSlots(0) == 0 && shape.requiredSlots(1) == 12'288 &&
+              shape.requiredSlots(4) == 36'864,
+          "the hot block cache's floor is not lanes x laneSlots and 8 rows' spare");
   const KvSpillPlan spill = requirePlan(kFlashNext.inputs(kM5Pro)).spill;
   const kv::Layout layout = test::sparseKvLayout();
-  require(spill.enabled && spill.laneSlots == 8'192 && spill.hotFloorBytes == 8 * 256 * layout.kvBytesPerModelPage() &&
-              spill.hotFloorBytes == 817'889'280 && spill.hotTargetBytes == spill.hotFloorBytes,
+  require(spill.enabled && spill.laneSlots == 8'192 && spill.hotFloorBytes == 6 * 256 * layout.kvBytesPerModelPage() &&
+              spill.hotFloorBytes == 613'416'960 && spill.hotTargetBytes == spill.hotFloorBytes,
           "the hot floor is not requiredSlots(1) in whole extents");
   require(spill.indexRunwayBytes == 256 * layout.indexBytesPerModelPage() && spill.densePages == 64 &&
               spill.windowPages == 64 && spill.groupPages == 256,

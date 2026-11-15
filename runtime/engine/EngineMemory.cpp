@@ -1083,7 +1083,7 @@ std::vector<Victim> Engine::EngineVictims::conversions(const VictimQuery &query)
   // The gate: the pages it would spill (Full pages no Resident request
   // holds) free Full - Index bytes each; less the first lane's hot block
   // floor its decode then reads through, they must cover what the claim
-  // lacks. On Flash-Next a lane converts from about 46K tokens.
+  // lacks. On Flash-Next a lane converts from about 62K tokens.
   const uint64_t pages = engine.cache_.convertiblePages(id);
   const uint64_t freed = pages * geometry.releasedPageBytes();
   const uint64_t reads = engine.model_.hotFloorBytes(1);
@@ -1188,8 +1188,8 @@ FreeResult Engine::EngineVictims::take(const VictimQuery &query, const Victim &v
     // In place, the pages the claim lacks still. Else what it lacks still in
     // bytes and the first reads of the lanes the pages give Index pages
     // beside it, in whole extents (Cache::releaseMoves), each page freeing
-    // its Full bytes less its Index page's: four extents of pages for a
-    // 390 MiB hot block floor, the free Full pages beside completing the
+    // its Full bytes less its Index page's: six extents of pages for a
+    // 585 MiB hot block floor, the free Full pages beside completing the
     // last where the lane's pages run short (Cache::releaseBeside).
     const bool inPlace = victim.pages != 0;
     uint32_t pages = std::min(query.lackingPages, victim.pages);
@@ -1223,8 +1223,8 @@ FreeResult Engine::EngineVictims::take(const VictimQuery &query, const Victim &v
               id, {engine.scheduler_.phase(id) == Phase::Prefill ? WorkKind::Prefill : WorkKind::Decode,
                    engine.nextCommandPages(engine.requests_.at(id))}));
     // What it frees net of the first reads it gave the lanes, as its count
-    // is: taken gross, a claim of two lanes' releases kept a 390 MiB hot
-    // block floor less for each than it counted. In place an extent more
+    // is: taken gross, a claim of two lanes' releases kept a hot block
+    // floor less for each than it counted. In place an extent more
     // may leave beside the claim's pages (inPlaceMoves).
     const uint64_t created = saturatingSubtract(reads, engine.readsShortfall(releasable.holders));
     const uint64_t freed = saturatingSubtract(saturatingSubtract(before, engine.cache_.allocatedBytes()), created);

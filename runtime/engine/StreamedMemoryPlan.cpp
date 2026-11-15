@@ -79,8 +79,7 @@ std::optional<Part> resolve(const StreamedPart &part, std::string_view option, s
 // tableBytes), as they allocate them: the hot block cache's at a target of
 // `hotTargetBytes` and one for each of `buffers` buffers of staged history.
 uint64_t readerTableBytes(const StreamedMemoryInputs &in, uint64_t hotTargetBytes, uint32_t buffers) {
-  return model::KvBlockCache::tableBytes(in.kvLayout, static_cast<uint32_t>(in.sparseKv->laneSlots()),
-                                         hotTargetBytes) +
+  return model::KvBlockCache::tableBytes(in.kvLayout, *in.sparseKv, hotTargetBytes) +
          buffers * model::KvHistoryStream::tableBytes(in.kvLayout);
 }
 

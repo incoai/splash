@@ -32,7 +32,7 @@ const KvBlockCacheOptions &checked(const kv::Layout &layout, uint32_t extentPage
   if (!layout.spillable()) throw std::invalid_argument("the hot block cache needs a layout that can spill");
   if (options.format.layout() != layout)
     throw std::invalid_argument("the hot block cache's slot format is another layout's");
-  if (!options.readers || !options.laneSlots || !extentPages)
+  if (!options.readers || !options.shape.laneSlots() || !extentPages)
     throw std::invalid_argument("the hot block cache needs readers, lane slots and extents");
   return options;
 }
@@ -89,7 +89,7 @@ struct KvBlockCache::Impl {
   }
   // required(n), in whole extents.
   [[nodiscard]] uint32_t floorExtents(uint32_t lanes) const noexcept {
-    return KvBlockCache::floorExtents(lanes, laneSlots, pages.extentPages());
+    return KvBlockCache::floorExtents(lanes, shape, pages.extentPages());
   }
   // Allocates extents up to `held` extents under one admission of `admit`,
   // or none of them.
@@ -111,7 +111,7 @@ struct KvBlockCache::Impl {
   const metal::AllocationAdmission admission;
   const kv::SlotFormat format;
   const std::shared_ptr<SsdReaders> readers;
-  const uint32_t laneSlots;
+  const SparseKvShape shape;
   const uint32_t extentSlots;
   const uint32_t targetExtents;
   kv::PageStorage pages;
@@ -147,12 +147,12 @@ struct KvBlockCache::Impl {
 KvBlockCache::Impl::Impl(metal::MetalBackend &backend, metal::AllocationAdmission admission,
                          const kv::Layout &layout, uint32_t extentPages, const KvBlockCacheOptions &options)
     : backend(backend), admission(admission), format(checked(layout, extentPages, options).format),
-      readers(options.readers), laneSlots(options.laneSlots), extentSlots(extentPages << kPlaceBits),
+      readers(options.readers), shape(options.shape), extentSlots(extentPages << kPlaceBits),
       targetExtents(KvBlockCache::targetExtents(layout, extentPages, options.targetBytes)),
       pages(backend, std::move(admission), withoutIndex(layout),
-            static_cast<uint32_t>(KvBlockCache::mostPages(layout, extentPages, options.laneSlots, options.targetBytes)),
+            static_cast<uint32_t>(KvBlockCache::mostPages(layout, extentPages, options.shape, options.targetBytes)),
             extentPages),
-      locationPages(backend.allocateBuffer(tableBytes(layout, options.laneSlots, options.targetBytes),
+      locationPages(backend.allocateBuffer(tableBytes(layout, options.shape, options.targetBytes),
                                            metal::BufferStorage::Shared, "kv-block-cache/location-pages")),
       recordBytes(format.recordBytes()), zeros(recordBytes),
       directory(layout.attentionLayers, SlotRecycler(0)) {}
@@ -252,8 +252,8 @@ void KvBlockCache::Impl::resolve(uint32_t layer, const Resolve &resolve, KvReadS
       }
     }
   }
-  // Each lane holding a floor selects at most laneSlots blocks, and the
-  // floors leave laneSlots more: a resolve past them is a bug.
+  // Each lane holding a floor selects at most laneSlots blocks, which the
+  // floors hold, and a spare more: a resolve past them is a bug.
   if (misses.size() > slots.size() - pinned)
     throw std::logic_error("a resolve misses more blocks than the hot block cache has slots it does not use");
   reads.clear();

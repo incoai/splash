@@ -506,14 +506,20 @@ struct SparseKvShape final {
   uint32_t verifyRows = 0;
   uint32_t denseHistoryTokens = 0;
 
-  // The hot block cache of spilled K/V (KvBlockCache) in slots a layer: one
-  // decoding lane's rows select at most laneSlots(), and while `lanes` lanes
-  // decode over Index pages it holds requiredSlots(lanes), one lane's more
-  // than they select, so that two lanes' selections do not thrash it; for
-  // one lane, the size past which more slots save few reads.
+  // The hot block cache of spilled K/V (KvBlockCache) in slots a layer. One
+  // decoding lane's rows select at most laneSlots() blocks, each of which a
+  // resolve must place (KvBlockCache::addResolve throws past the free
+  // slots), so while `lanes` lanes decode over Index pages it holds
+  // requiredSlots(lanes): every lane's laneSlots(), and kSpareRows rows'
+  // blocks more, which keep the lanes' selections from evicting each
+  // other's. Eight rows' 4,096 slots on Qwen3.8-Flash-Next hold a whole
+  // step's: over prompts of 16K to 64K tokens, every lane, attention layer
+  // and cycle, a lane's selections took at most 2,631 slots at 8 rows and
+  // 3,794 at 16, of the 8,192 its 16 rows may select.
+  static constexpr uint32_t kSpareRows = 8;
   [[nodiscard]] constexpr uint64_t laneSlots() const noexcept { return uint64_t{verifyRows} * selectedBlocks; }
   [[nodiscard]] constexpr uint64_t requiredSlots(uint32_t lanes) const noexcept {
-    return lanes ? (uint64_t{lanes} + 1) * laneSlots() : 0;
+    return lanes ? uint64_t{lanes} * laneSlots() + uint64_t{kSpareRows} * selectedBlocks : 0;
   }
   bool operator==(const SparseKvShape &) const = default;
 };

@@ -965,7 +965,7 @@ what memory holds, as a dense target's is.
   from then on rather than yield its lane or fail, where that covers what it
   lacks: what spilling the pages only it holds frees, past its first 2,048
   tokens and its last 64 pages, less the hot block cache's floor its
-  decode's reads need (390 MiB), which takes a request of about 46K tokens
+  decode's reads need (585 MiB), which takes a request of about 62K tokens
   or more. Its pages whose copies have landed, as a prefix restored from the
   SSD cache or copied ahead has them, give back the memory it lacks at once,
   as below, so it misses no step; it waits only while the copies it starts
@@ -1012,14 +1012,15 @@ what memory holds, as a dense target's is.
   selected blocks not in memory into one hot block cache that all requests
   share, a page's in one read from its first missed block to its last on the
   32 SSD readers, and attends them there.
-  The cache holds at least, for n decoding requests, n + 1 times the blocks a
-  request's 8 rows select, 8,192 blocks a layer (390 MiB) for one, taken
+  The cache holds at least, for n decoding requests, the blocks each
+  request's 16 rows select and 8 rows' more, 12,288 blocks a layer (585 MiB)
+  for one, taken
   whole as a request some of whose pages gave their memory back starts decoding,
   by the same release as its first pages give memory back, whichever request's
   claim it was for; `--sparse-kv-memory` raises its target, toward which it
   grows only while a request holds a floor. A decoding request's floor goes only
   with the request. While no request reads above the floor, the cache's memory,
-  up to 975 MiB after the last spilling request ends, is among the first to go
+  up to 1,755 MiB after the last spilling request ends, is among the first to go
   when memory is short, as a cache the model rebuilds. It shares the readers'
   memory with the history staging below, which the plan sets aside the larger
   of, so a target within the staging takes nothing from the expert store.

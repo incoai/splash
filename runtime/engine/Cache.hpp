@@ -562,8 +562,8 @@ public:
   // alone gives a claim that keeps no Full runway. None under --kv-spill
   // always, whose landings count them. Counted in whole extents of its own
   // pages, a lane on a finished lane's prefix gave one extent of its 511
-  // releasable pages beside 3 free ones, and its 390 MiB hot block floor
-  // failed it at a limit where it completes alone, on Qwen3.8-Flash-Next at
+  // releasable pages beside 3 free ones, and its hot block floor failed it
+  // at a limit where it completes alone, on Qwen3.8-Flash-Next at
   // 9.38G and 9.43G.
   [[nodiscard]] uint32_t releaseBeside(const VictimQuery &query) const;
   // A Spill request's pages a release moves to the index form, oldest

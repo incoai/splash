@@ -1916,7 +1916,7 @@ run can spill, a Resident lane, decoding or between the commands of its
 prefill, whose own KV growth the engine's limit refuses converts itself to
 Spill when its eligible pages (`Cache::convertiblePages`) times a Full page
 less an Index page, less the first lane's hot block floor
-(`Model::hotFloorBytes`), cover the missing bytes: about 46K tokens on
+(`Model::hotFloorBytes`), cover the missing bytes: about 62K tokens on
 Qwen3.8-Flash-Next. It needs the SSD cache's quota for its pages and a free
 page in the Index runway, an extent kept while spilling is possible
 (`Engine::spillLanded`). The conversion's take then releases its pages as a
@@ -1955,14 +1955,14 @@ pages, whose Full extents then leave and whose bytes refill the Index runway: a
 page frees its Full bytes less its Index page's, so a growth's 108.5 MB extent
 and a prefill's 40 MB of staging release 512 pages, two extents, on
 Qwen3.8-Flash-Next. Its take gives the claim what it frees net of those reads,
-as its count does: taken gross, a claim of two lanes' releases kept a 390 MiB
+as its count does: taken gross, a claim of two lanes' releases kept a hot block
 floor less for each than it counted. Where the lane's pages run short of a
 whole extent, the free Full pages compaction gathers with them complete it
 (`Cache::releaseBeside`): those of the extents that hold pages, less those the
 claim's attempt takes, and none where the pages only the cache holds would
 complete an extent with them, which its reclaims or its demotions as they land
 count then. Counted without them, a lane on a finished lane's prefix, its 511
-releasable pages beside 3 free ones, lacked the 390 MiB hot block floor it gets
+releasable pages beside 3 free ones, lacked the hot block floor it gets
 alone. It moves pages only where the runway's
 first moves empty a Full extent, and only as many extents of them as compaction
 can empty, since a page in transfer pins its extent (`Cache::releaseMoves`):
