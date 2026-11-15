@@ -342,6 +342,17 @@ struct QwenTargetVerifyBuffers final {
   std::array<metal::MetalBuffer, ExecutionLimits::maximumBatchWidth> auxiliary;
 };
 
+// A decode step's verify input as its draft's selector lays it out on the
+// device (ops::DraftSelector::addVerifyRows): each of the step's rows' token
+// and tree row (metal/abi/VerifyTree.h), each lane's rows of the step
+// (SplashLaneRows), and the step's rows.
+struct QwenVerifyInput final {
+  metal::MetalBuffer tokens;
+  metal::MetalBuffer treeRows;
+  metal::MetalBuffer laneRows;
+  ops::StepRows step{};
+};
+
 // The auxiliary state after the rows each lane of a verify retained, which
 // its commit writes from the state before the step (addStateCommit). The GDN
 // state folds the rows into the lane's next step instead (ops::GdnTapeLane).
@@ -500,11 +511,10 @@ public:
   virtual void addHeadBatch(metal::CommandGraph &graph, metal::MetalBuffer hidden,
                             metal::MetalBuffer finalHidden, metal::MetalBuffer logits,
                             uint32_t lanes, ops::LinearScratch scratch) const = 0;
-  // The inputs the target makes itself of its verify input tokens, each
-  // lane's in its verify block of `blocks`, which the draft's selector writes
-  // and addEmbedding gathers: none, but a family's that reads them itself.
-  virtual void addVerifyInput(metal::CommandGraph &graph, metal::MetalBuffer verifyInput,
-                              std::span<const ops::LaneRows> blocks) const;
+  // The inputs the target makes itself of a step's verify input, which the
+  // draft's selector writes and addEmbedding gathers: none, but a family's
+  // that reads them itself.
+  virtual void addVerifyInput(metal::CommandGraph &graph, const QwenVerifyInput &input) const;
   void addEmbedding(metal::CommandGraph &graph, metal::MetalBuffer tokens,
                     metal::MetalBuffer hidden, uint32_t rows) const;
   // The commit after acceptance of a verify of the lanes of `blocks`, each
@@ -522,10 +532,11 @@ public:
   // its commit writes after every retained row, captures no state in decode
   // (Model::capturesInDecode).
   void addStateFold(metal::CommandGraph &graph, QwenTargetFoldBuffers buffers, uint32_t rows) const;
-  // The table rows batch lane `lane`'s verify rows of the last step read,
-  // each row's in order, for tests (RuntimeInstrumentation::lastTableRows);
-  // none for a target that reads no table.
-  [[nodiscard]] virtual std::vector<uint32_t> verifyTableRows(uint32_t lane) const;
+  // The table rows a lane's rows of the last step read (`rows`, its rows of
+  // the step), each row's in order, for tests
+  // (RuntimeInstrumentation::lastTableRows); none for a target that reads no
+  // table.
+  [[nodiscard]] virtual std::vector<uint32_t> verifyTableRows(const ops::LaneRows &rows) const;
 
 protected:
   QwenTarget(const QwenTargetWeightsBase &weights, const QwenTargetGeometry &geometry, metal::MetalBackend &backend,

@@ -103,24 +103,26 @@ void NgramEmbedding::addCommit(metal::CommandGraph &graph, metal::MetalBuffer co
             ngramParams(shape, 0, true), {shape.history(), groups(shape.width()), 1}, {kThreads, 1, 1});
 }
 
-void NgramEmbedding::addHash(metal::CommandGraph &graph, metal::MetalBuffer tokens, metal::MetalBuffer before,
-                             metal::MetalBuffer indices, NgramHashParams params, std::span<const LaneRows> lanes,
-                             uint32_t heads) {
+void NgramEmbedding::addHash(metal::CommandGraph &graph, NgramHashBuffers buffers, NgramHashParams params,
+                             const StepRows &step, uint32_t heads) {
   if (heads != (params.ngram - 1) * params.heads_per_ngram || heads > NGRAM_EMBEDDING_MAXIMUM_HEADS ||
       params.ngram > NGRAM_EMBEDDING_MAXIMUM_NGRAM)
     throw std::invalid_argument("invalid n-gram hash");
-  // The kernel finds a row's lane by the lanes' first rows.
-  requireLaneRows(lanes);
-  requireRowOrder(lanes);
-  params.lanes = static_cast<uint32_t>(lanes.size());
-  copyLaneRows(lanes, params.first_row, params.rows);
+  // The kernel finds a row's lane by the lanes' first rows on the device.
+  requireStepRows(step);
+  params.lanes = step.lanes;
   // Each lane reads the ngram - 1 tokens before its first row.
-  const uint64_t rows = rowsEnd(lanes);
-  requireBytes(tokens, rows * sizeof(uint32_t), "n-gram hash token");
-  requireBytes(before, uint64_t{params.lanes} * (params.ngram - 1) * sizeof(uint32_t), "n-gram hash prior token");
-  requireBytes(indices, rows * heads * sizeof(uint32_t), "n-gram hash index");
-  graph.add("ngram_embedding_hash", {std::move(tokens), std::move(before), std::move(indices)}, params,
-            {groups(static_cast<uint32_t>(rows)), 1, 1}, {kThreads, 1, 1});
+  const uint64_t rows = step.rows;
+  requireBytes(buffers.tokens, rows * sizeof(uint32_t), "n-gram hash token");
+  requireBytes(buffers.tree, rows * sizeof(TreeRow), "n-gram hash tree row");
+  requireBytes(buffers.laneRows, uint64_t{params.lanes} * sizeof(LaneRows), "n-gram hash lane rows");
+  requireBytes(buffers.before, uint64_t{params.lanes} * (params.ngram - 1) * sizeof(uint32_t),
+               "n-gram hash prior token");
+  requireBytes(buffers.indices, rows * heads * sizeof(uint32_t), "n-gram hash index");
+  graph.add("ngram_embedding_hash",
+            {std::move(buffers.tokens), std::move(buffers.tree), std::move(buffers.laneRows), std::move(buffers.before),
+             std::move(buffers.indices)},
+            params, {groups(step.rows), 1, 1}, {kThreads, 1, 1});
 }
 
 } // namespace splash::ops

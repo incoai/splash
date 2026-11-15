@@ -347,9 +347,7 @@ metal::MetalBuffer Qwen4Steps::priorTokens() const {
   return backend_.view(decode_, decodePriorOffset_, bytesFor<uint32_t>(kLanes * priorCount(geometry_)));
 }
 
-void Qwen4Steps::addVerifyInput(metal::CommandGraph &graph, metal::MetalBuffer tokens,
-                                std::span<const ops::LaneRows> blocks) const {
-  if (blocks.empty() || blocks.size() > kLanes) throw std::invalid_argument("invalid PLE hash");
+void Qwen4Steps::addVerifyInput(metal::CommandGraph &graph, const QwenVerifyInput &input) const {
   const Qwen4ExpLayout &layout = weights_.layout;
   const Qwen4PleHash &hash = weights_.pleHash;
   const uint32_t heads = layout.pleHeads();
@@ -363,9 +361,10 @@ void Qwen4Steps::addVerifyInput(metal::CommandGraph &graph, metal::MetalBuffer t
   std::copy(hash.multipliers.begin(), hash.multipliers.end(), params.multipliers);
   std::copy(hash.headVocabularies.begin(), hash.headVocabularies.end(), params.vocabularies);
   std::copy(hash.headOffsets.begin(), hash.headOffsets.end(), params.offsets);
-  const uint32_t rows = static_cast<uint32_t>(ops::rowsEnd(blocks));
+  const uint32_t rows = input.step.rows;
   const Qwen4Scratch scratch = verifyScratch(rows);
-  ops::NgramEmbedding::addHash(graph, std::move(tokens), priorTokens(), scratch.pleIndices, params, blocks, heads);
+  ops::NgramEmbedding::addHash(graph, {input.tokens, input.treeRows, input.laneRows, priorTokens(), scratch.pleIndices},
+                               params, input.step, heads);
   // A verify step stages a few rows per lane, most of them already in the
   // cache, so its host step is short and keeps the GPU awake
   // (metal::HostStepGpu::Awake).
@@ -375,11 +374,11 @@ void Qwen4Steps::addVerifyInput(metal::CommandGraph &graph, metal::MetalBuffer t
                {}, metal::HostStepGpu::Awake);
 }
 
-std::vector<uint32_t> Qwen4Steps::verifyPleRows(uint32_t lane) const {
-  if (lane >= kLanes) throw std::out_of_range("Qwen3.8-Flash-Next verify lane");
+std::vector<uint32_t> Qwen4Steps::verifyPleRows(const ops::LaneRows &rows) const {
+  if (uint64_t{rows.first} + rows.rows > kStepRows) throw std::out_of_range("Qwen3.8-Flash-Next verify rows");
   const uint32_t heads = geometry_.pleHeads();
   const auto *indices = contents<const uint32_t>(verifyScratch(kStepRows).pleIndices);
-  return {indices + uint64_t{lane} * kVerifyRows * heads, indices + uint64_t{lane + 1} * kVerifyRows * heads};
+  return {indices + uint64_t{rows.first} * heads, indices + (uint64_t{rows.first} + rows.rows) * heads};
 }
 
 // The products stay below 2^63 (readPleHash bounds each multiplier by

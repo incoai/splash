@@ -448,12 +448,13 @@ host fixes only the step's rows and a lane's most (`ops::StepRows`,
 its penalties and thinking cutoffs, acceptance and the draft's context commit
 read the layout on the GPU and take a lane's verify rows alone; the first
 token after a prompt is selected from, and written at, the lane's one row,
-whose layout its selection writes first (`decode_sample_first_rows`). The
-target's kernels and Qwen3.8-Flash-Next's n-gram hash and block indexer
-address each lane's rows by the host's `ops::LaneRows` (the kernels' per-lane
-`first_row` and `rows`), so lanes of different row counts share one
-dispatch; a decode step holds eight rows a lane, which the selector lays out at
-lane x 8. A lane's verify block is a tree (`metal/abi/VerifyTree.h`, a row's
+whose layout its selection writes first (`decode_sample_first_rows`), and
+Qwen3.8-Flash-Next's n-gram hash reads it too, hashing a row's n-grams along
+its path. The target's kernels and Qwen3.8-Flash-Next's block indexer address
+each lane's rows by the host's `ops::LaneRows` (the kernels' per-lane
+`first_row` and `rows`), so lanes of different row counts share one dispatch;
+a decode step holds eight rows a lane, which the selector lays out at lane x
+8. A lane's verify block is a tree (`metal/abi/VerifyTree.h`, a row's
 parent, depth and ancestors' mask), which the draft's selector writes with
 each row's token, its verify input: a row's penalties count the draft tokens
 of its path, a thinking cutoff applies by depth, acceptance follows from the

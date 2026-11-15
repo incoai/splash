@@ -76,7 +76,9 @@ Qwen4ExpTarget::Qwen4ExpTarget(const Qwen4ExpWeights &weights, const QwenTargetG
 
 QwenTargetScratchBytes Qwen4ExpTarget::allocatedScratchBytes() const noexcept { return steps_.allocatedBytes(); }
 
-std::vector<uint32_t> Qwen4ExpTarget::verifyTableRows(uint32_t lane) const { return steps_.verifyPleRows(lane); }
+std::vector<uint32_t> Qwen4ExpTarget::verifyTableRows(const ops::LaneRows &rows) const {
+  return steps_.verifyPleRows(rows);
+}
 
 std::vector<metal::MetalBuffer> Qwen4ExpTarget::addPrefill(metal::CommandGraph &graph,
                                                            std::span<const QwenTargetPrefillChunk> chunks,
@@ -267,9 +269,8 @@ void Qwen4ExpTarget::prepareVerifyLane(uint32_t lane, uint64_t position, const Q
   steps_.prepareVerifyLane(lane, position, request);
 }
 
-void Qwen4ExpTarget::addVerifyInput(metal::CommandGraph &graph, metal::MetalBuffer verifyInput,
-                                    std::span<const ops::LaneRows> blocks) const {
-  steps_.addVerifyInput(graph, std::move(verifyInput), blocks);
+void Qwen4ExpTarget::addVerifyInput(metal::CommandGraph &graph, const QwenVerifyInput &input) const {
+  steps_.addVerifyInput(graph, input);
 }
 
 ops::PreparedInput Qwen4ExpTarget::addVerifyMix(VerifyStep &step, const Qwen4HyperWeights &hyper,

@@ -90,9 +90,9 @@ void QwenTarget::addInsideCapture(metal::CommandGraph &, metal::MetalBuffer, met
 
 void QwenTarget::prepareVerifyLane(uint32_t, uint64_t, const QwenTargetRequest &) {}
 
-std::vector<uint32_t> QwenTarget::verifyTableRows(uint32_t) const { return {}; }
+std::vector<uint32_t> QwenTarget::verifyTableRows(const ops::LaneRows &) const { return {}; }
 
-void QwenTarget::addVerifyInput(metal::CommandGraph &, metal::MetalBuffer, std::span<const ops::LaneRows>) const {}
+void QwenTarget::addVerifyInput(metal::CommandGraph &, const QwenVerifyInput &) const {}
 
 void QwenTarget::addEmbedding(metal::CommandGraph &graph,
                               metal::MetalBuffer tokens,

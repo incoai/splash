@@ -29,6 +29,19 @@ struct NgramShape final {
   [[nodiscard]] constexpr uint32_t history() const noexcept { return (taps - 1) * dilation; }
 };
 
+// The buffers of a verify step's n-gram hash: each of the step's rows' token
+// and tree row (metal/abi/VerifyTree.h), each lane's rows of the step
+// (SplashLaneRows), which the step's proposer writes, the ngram - 1 tokens
+// before each lane's first row (NgramHashParams), and the table rows it
+// writes for each of the step's rows.
+struct NgramHashBuffers final {
+  metal::MetalBuffer tokens;
+  metal::MetalBuffer tree;
+  metal::MetalBuffer laneRows;
+  metal::MetalBuffer before;
+  metal::MetalBuffer indices;
+};
+
 struct NgramEmbedding final {
   static void addGate(metal::CommandGraph &graph, metal::MetalBuffer key, metal::MetalBuffer value,
                       metal::MetalBuffer streams, const NormWeights &keyNorm, const NormWeights &queryNorm,
@@ -48,11 +61,10 @@ struct NgramEmbedding final {
   static void addCommit(metal::CommandGraph &graph, metal::MetalBuffer convolutionInput,
                         metal::MetalBuffer historyIn, metal::MetalBuffer historyOut, metal::MetalBuffer retained,
                         NgramShape shape, uint32_t rows);
-  // The table rows of each lane's verify rows (`lanes`, in row order) by the
-  // hash `params` describes, whose lanes and rows it sets.
-  static void addHash(metal::CommandGraph &graph, metal::MetalBuffer tokens, metal::MetalBuffer before,
-                      metal::MetalBuffer indices, NgramHashParams params, std::span<const LaneRows> lanes,
-                      uint32_t heads);
+  // The table rows of each lane's rows of a verify step (`step`) by the hash
+  // `params` describes, whose lane count it sets.
+  static void addHash(metal::CommandGraph &graph, NgramHashBuffers buffers, NgramHashParams params,
+                      const StepRows &step, uint32_t heads);
 };
 
 } // namespace splash::ops

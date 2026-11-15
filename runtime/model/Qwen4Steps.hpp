@@ -132,14 +132,13 @@ public:
   // state cell's auxiliary state.
   [[nodiscard]] metal::MetalBuffer qsaPending(const metal::MetalBuffer &auxiliary, uint32_t layer,
                                               uint32_t layers = 1) const;
-  // The GPU's PLE rows of each lane's verify rows, its verify block of
-  // `blocks` (in row order), from their tokens and the tokens before each
-  // lane's, and, when the table streams, the host step that stages them.
-  void addVerifyInput(metal::CommandGraph &graph, metal::MetalBuffer tokens,
-                      std::span<const ops::LaneRows> blocks) const;
-  // The PLE rows of batch lane `lane`'s verify rows of the last step, each
-  // row's heads' in order.
-  [[nodiscard]] std::vector<uint32_t> verifyPleRows(uint32_t lane) const;
+  // The GPU's PLE rows of a verify step's rows, each from its token and the
+  // tokens before it on its path, and, when the table streams, the host step
+  // that stages them.
+  void addVerifyInput(metal::CommandGraph &graph, const QwenVerifyInput &input) const;
+  // The PLE rows of a lane's rows of the last step (`rows`), each row's
+  // heads' in order.
+  [[nodiscard]] std::vector<uint32_t> verifyPleRows(const ops::LaneRows &rows) const;
 
 private:
   // A scratch tensor placed in its buffer (Qwen4Steps.cpp tensors()).

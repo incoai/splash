@@ -36,13 +36,15 @@ static_assert(sizeof(NgramEmbeddingParams) == 24,
               "n-gram embedding parameters are 24 bytes on both sides");
 
 // The table rows (the n-gram hash, model/Qwen4Steps.hpp qwen4PleRows) of each
-// of `lanes` lanes' verify rows on the GPU (ngram_embedding_hash): lane l's
-// rows[l] rows from row first_row[l] of the step's rows, in row order, from
-// the rows' tokens and the ngram - 1 tokens before the lane's first row,
-// nearest first (NGRAM_EMBEDDING_NONE for none). The hash mixes the n-grams
-// of 2 to `ngram` tokens, at most NGRAM_EMBEDDING_MAXIMUM_NGRAM, with a
-// multiplier per n-gram position; each n-gram's heads_per_ngram heads take
-// its hash modulo their row counts (`vocabularies`) past their `offsets`.
+// of `lanes` lanes' rows of a verify step on the GPU (ngram_embedding_hash):
+// lane l's rows as the step's proposer lays them out (SplashLaneRows,
+// metal/abi/VerifyTree.h), each row's from its token and the ngram - 1 tokens
+// before it on its path, its tree row's parents' and then the tokens before
+// the lane's first row, nearest first (NGRAM_EMBEDDING_NONE for none). The
+// hash mixes the n-grams of 2 to `ngram` tokens, at most
+// NGRAM_EMBEDDING_MAXIMUM_NGRAM, with a multiplier per n-gram position; each
+// n-gram's heads_per_ngram heads take its hash modulo their row counts
+// (`vocabularies`) past their `offsets`.
 #define NGRAM_EMBEDDING_NONE 0xffffffffu
 #define NGRAM_EMBEDDING_MAXIMUM_NGRAM 3u
 #define NGRAM_EMBEDDING_MAXIMUM_HEADS 16u
@@ -51,12 +53,10 @@ struct NgramHashParams {
   uint32_t ngram;
   uint32_t heads_per_ngram;
   uint32_t eos;
-  uint32_t first_row[SPLASH_MAXIMUM_BATCH_WIDTH];
-  uint32_t rows[SPLASH_MAXIMUM_BATCH_WIDTH];
   uint64_t multipliers[NGRAM_EMBEDDING_MAXIMUM_NGRAM];
   uint32_t vocabularies[NGRAM_EMBEDDING_MAXIMUM_HEADS];
   uint32_t offsets[NGRAM_EMBEDDING_MAXIMUM_HEADS];
 };
 
-static_assert(sizeof(NgramHashParams) == 200,
-              "n-gram hash parameters are 200 bytes on both sides");
+static_assert(sizeof(NgramHashParams) == 168,
+              "n-gram hash parameters are 168 bytes on both sides");

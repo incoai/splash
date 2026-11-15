@@ -120,6 +120,22 @@ void run(MetalBackend &backend, CommandGraph &graph) {
   static_cast<void>(backend.submitCommandAsync(graph.dispatches()).wait());
 }
 
+// Lanes' rows of a verify step as its proposer writes them on the device
+// (SplashLaneRows), each lane's rows as a chain (a SplashTreeRow a row), and
+// the step of them.
+MetalBuffer laneRowsOf(MetalBackend &backend, std::span<const ops::LaneRows> lanes) {
+  return upload(backend, std::vector<ops::LaneRows>(lanes.begin(), lanes.end()));
+}
+MetalBuffer chainsOf(MetalBackend &backend, std::span<const ops::LaneRows> lanes) {
+  std::vector<ops::TreeRow> tree(ops::rowsEnd(lanes));
+  for (const ops::LaneRows &lane : lanes)
+    for (uint32_t row = 0; row < lane.rows; ++row) tree[lane.first + row] = ops::chainRow(row);
+  return upload(backend, tree);
+}
+ops::StepRows stepOf(std::span<const ops::LaneRows> lanes) {
+  return {static_cast<uint32_t>(lanes.size()), static_cast<uint32_t>(ops::rowsEnd(lanes)), ops::mostRows(lanes)};
+}
+
 // Flash-Next's mix: HYPER_CONNECTION_MAXIMUM_STREAMS streams of HYPER_CONNECTION_NORM_HIDDEN
 // values, the hyper-connections' low rank of 320.
 constexpr uint32_t kHidden = HYPER_CONNECTION_NORM_HIDDEN, kStreams = HYPER_CONNECTION_MAXIMUM_STREAMS, kRank = 320;
@@ -891,8 +907,10 @@ void pleHashPackedLanes(MetalBackend &backend) {
   const std::vector<uint32_t> before = {40, 41, NGRAM_EMBEDDING_NONE, NGRAM_EMBEDDING_NONE, eos, 77, 3, eos};
   MetalBuffer indices = scratch(backend, uint64_t{tokens.size()} * heads * 4);
   CommandGraph graph;
-  ops::NgramEmbedding::addHash(graph, upload(backend, tokens), upload(backend, before), indices, params, packed,
-                               heads);
+  ops::NgramEmbedding::addHash(graph,
+                               {upload(backend, tokens), chainsOf(backend, packed), laneRowsOf(backend, packed),
+                                upload(backend, before), indices},
+                               params, stepOf(packed), heads);
   run(backend, graph);
   const auto got = download<uint32_t>(indices, tokens.size() * heads);
   bool ok = true;
@@ -903,8 +921,10 @@ void pleHashPackedLanes(MetalBackend &backend) {
     CommandGraph single;
     const std::vector<uint32_t> laneTokens(tokens.begin() + block.first, tokens.begin() + block.first + block.rows);
     const std::vector<uint32_t> laneBefore(before.begin() + lane * 2, before.begin() + lane * 2 + 2);
-    ops::NgramEmbedding::addHash(single, upload(backend, laneTokens), upload(backend, laneBefore), alone, params, own,
-                                 heads);
+    ops::NgramEmbedding::addHash(single,
+                                 {upload(backend, laneTokens), chainsOf(backend, own), laneRowsOf(backend, own),
+                                  upload(backend, laneBefore), alone},
+                                 params, stepOf(own), heads);
     run(backend, single);
     const auto want = download<uint32_t>(alone, uint64_t{block.rows} * heads);
     ok &= std::equal(want.begin(), want.end(), got.begin() + uint64_t{block.first} * heads);
@@ -1107,8 +1127,10 @@ void pleHashTest(MetalBackend &backend) {
   MetalBuffer indices = scratch(backend, lanes * laneRows * heads * 4);
   const std::array<ops::LaneRows, lanes> blocks{{{0, laneRows}, {laneRows, laneRows}, {2 * laneRows, laneRows}}};
   CommandGraph graph;
-  ops::NgramEmbedding::addHash(graph, upload(backend, tokens), upload(backend, before), indices, params, blocks,
-                               heads);
+  ops::NgramEmbedding::addHash(graph,
+                               {upload(backend, tokens), chainsOf(backend, blocks), laneRowsOf(backend, blocks),
+                                upload(backend, before), indices},
+                               params, stepOf(blocks), heads);
   run(backend, graph);
   const auto got = download<uint32_t>(indices, lanes * laneRows * heads);
   bool ok = true;
@@ -1133,6 +1155,85 @@ void pleHashTest(MetalBackend &backend) {
       }
     }
   check(ok, "PLE hash: GPU rows equal the CPU's");
+}
+
+// A verify block that is a tree hashes each row's n-grams along its path:
+// its parents' tokens up to the anchor, then those before its lane's first
+// row, whatever rows the step packs before it. Lane 0's six rows: 1 and 3
+// follow the anchor, 2 and 5 row 1, 4 row 3, so rows 3 and 5 follow rows
+// other than the rows before them; lane 1, from row 6, a chain of three.
+// The GPU's rows equal a CPU walk of each row's parents, and rows 3 and 5
+// differ from a hash of the rows before them.
+void pleHashTreeRows(MetalBackend &backend) {
+  const uint32_t ngram = 3, perNgram = 8, heads = 16, eos = 248044;
+  NgramHashParams params{};
+  params.ngram = ngram;
+  params.heads_per_ngram = perNgram;
+  params.eos = eos;
+  const uint64_t multipliers[NGRAM_EMBEDDING_MAXIMUM_NGRAM] = {0x9E3779B97F4A7C15ull, 0xC2B2AE3D27D4EB4Full,
+                                                             0x165667B19E3779F9ull};
+  std::copy(std::begin(multipliers), std::end(multipliers), params.multipliers);
+  for (uint32_t h = 0; h < heads; ++h) {
+    params.vocabularies[h] = 19999999 + h * 7919;
+    params.offsets[h] = h * 20000000;
+  }
+  const std::array<ops::LaneRows, 2> lanes{{{0, 6}, {6, 3}}};
+  const std::vector<uint16_t> parents{SPLASH_TREE_ROOT, 0, 1, 0, 3, 1, SPLASH_TREE_ROOT, 0, 1};
+  const std::vector<uint32_t> tokens{100, 101, 102, 103, 104, 105, 200, 201, 202};
+  const std::vector<uint32_t> before{40, 41, 50, NGRAM_EMBEDDING_NONE};
+  std::vector<ops::TreeRow> tree(tokens.size());
+  for (const ops::LaneRows &lane : lanes)
+    for (uint32_t row = 0; row < lane.rows; ++row) {
+      const uint16_t parent = parents[lane.first + row];
+      const ops::TreeRow up = row ? tree[lane.first + parent] : ops::TreeRow{0, 0, 0};
+      tree[lane.first + row] = {(row ? up.ancestors : 0U) | (1U << row), parent,
+                                static_cast<uint16_t>(row ? up.depth + 1 : 0)};
+    }
+  MetalBuffer indices = scratch(backend, uint64_t{tokens.size()} * heads * 4);
+  CommandGraph graph;
+  ops::NgramEmbedding::addHash(
+      graph, {upload(backend, tokens), upload(backend, tree), laneRowsOf(backend, lanes), upload(backend, before), indices},
+      params, stepOf(lanes), heads);
+  run(backend, graph);
+  const auto got = download<uint32_t>(indices, tokens.size() * heads);
+  // A row's heads from its token and the ngram - 1 before it, `previous`.
+  const auto hashed = [&](uint32_t token, std::array<uint32_t, NGRAM_EMBEDDING_MAXIMUM_NGRAM - 1> previous) {
+    std::array<uint64_t, NGRAM_EMBEDDING_MAXIMUM_NGRAM> context{token};
+    bool cut = false;
+    for (uint32_t back = 1; back < ngram; ++back) {
+      cut = cut || previous[back - 1] == NGRAM_EMBEDDING_NONE || previous[back - 1] == eos;
+      context[back] = cut ? eos : previous[back - 1];
+    }
+    std::vector<uint32_t> rowHeads(heads);
+    for (uint32_t gram = 2; gram <= ngram; ++gram) {
+      uint64_t mixed = context[0] * multipliers[0];
+      for (uint32_t j = 1; j < gram; ++j) mixed ^= context[j] * multipliers[j];
+      for (uint32_t g = 0; g < perNgram; ++g) {
+        const uint32_t head = (gram - 2) * perNgram + g;
+        rowHeads[head] = uint32_t(mixed % params.vocabularies[head] + params.offsets[head]);
+      }
+    }
+    return rowHeads;
+  };
+  bool ok = true, branchesDiffer = true;
+  for (uint32_t lane = 0; lane < lanes.size(); ++lane) {
+    const ops::LaneRows block = lanes[lane];
+    for (uint32_t row = 0; row < block.rows; ++row) {
+      std::array<uint32_t, NGRAM_EMBEDDING_MAXIMUM_NGRAM - 1> path{}, packed{};
+      uint32_t at = row;
+      for (uint32_t back = 1; back < ngram; ++back) {
+        const uint32_t depth = tree[block.first + row].depth;
+        if (back <= depth) at = parents[block.first + at];
+        path[back - 1] = back <= depth ? tokens[block.first + at] : before[lane * (ngram - 1) + back - depth - 1];
+        packed[back - 1] = back <= row ? tokens[block.first + row - back] : before[lane * (ngram - 1) + back - row - 1];
+      }
+      const std::vector<uint32_t> want = hashed(tokens[block.first + row], path);
+      ok &= std::equal(want.begin(), want.end(), got.begin() + uint64_t{block.first + row} * heads);
+      if (lane == 0 && (row == 3 || row == 5))
+        branchesDiffer &= hashed(tokens[block.first + row], packed) != want;
+    }
+  }
+  check(ok && branchesDiffer, "PLE hash of a tree: each row's n-grams along its path");
 }
 
 using Extents = std::initializer_list<splash::test::BufferExtent>;
@@ -1266,10 +1367,14 @@ void pleExtentsTest(MetalBackend &backend) {
   const uint64_t hashRows = 2 * SPLASH_TARGET_VERIFY_ROWS + 3;
   splash::test::requireExtents(backend,
                                Extents{{0, hashRows * 4, 4, "n-gram hash token"},
-                                       {1, 3 * 2 * 4, 4, "n-gram hash prior token"},
-                                       {2, hashRows * heads * 4, 4, "n-gram hash index"}},
+                                       {1, hashRows * sizeof(ops::TreeRow), sizeof(ops::TreeRow),
+                                        "n-gram hash tree row"},
+                                       {2, 3 * sizeof(ops::LaneRows), sizeof(ops::LaneRows), "n-gram hash lane rows"},
+                                       {3, 3 * 2 * 4, 4, "n-gram hash prior token"},
+                                       {4, hashRows * heads * 4, 4, "n-gram hash index"}},
                                [&](CommandGraph &graph, const Buffers &b) {
-                                 ops::NgramEmbedding::addHash(graph, b[0], b[1], b[2], params, blocks, heads);
+                                 ops::NgramEmbedding::addHash(graph, {b[0], b[1], b[2], b[3], b[4]}, params,
+                                                              stepOf(blocks), heads);
                                });
   CommandGraph refused;
   const MetalBuffer norm = scratch(backend, uint64_t{width} * 4);
@@ -1329,6 +1434,7 @@ int main(int argc, const char *argv[]) {
         streamMeanTest(backend);
         pleHashTest(backend);
         pleHashPackedLanes(backend);
+        pleHashTreeRows(backend);
         hyperExtentsTest(backend);
         pleExtentsTest(backend);
       }

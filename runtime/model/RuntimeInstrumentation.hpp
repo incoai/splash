@@ -16,8 +16,8 @@ namespace splash::model {
 // these; production binaries never link it.
 class RuntimeInstrumentation final {
 public:
-  // The PLE rows the last decode step gathered for batch lane `lane`'s
-  // verify rows, each row's heads' in order (Qwen3.8-Flash-Next), until the
+  // The PLE rows the last decode step gathered for batch lane `lane`'s rows
+  // of the step, each row's heads' in order (Qwen3.8-Flash-Next), until the
   // next decode step; none for a target without them.
   [[nodiscard]] static std::vector<uint32_t> lastTableRows(const Runtime &runtime, uint32_t lane);
   // The fp32 logits the last command that selected left in batch lane

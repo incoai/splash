@@ -155,26 +155,37 @@ kernel void ngram_embedding_commit(device const bfloat *input [[buffer(0)]],
   ngram_history_rows(input, history_in, history_out, p, retained[0], group, tid);
 }
 
-// The table rows of each lane's verify rows (model/Qwen4Steps.cpp qwen4PleRows
-// on the CPU): heads of the 2- to ngram-gram hashes of the row's token and
-// those before it, cut at EOS or the sequence's start. A thread per row of
-// the step: its lane is the last whose first row is at most it, and a row
-// past that lane's rows hashes nothing.
+// The table rows of each lane's rows of a verify step (model/Qwen4Steps.cpp
+// qwen4PleRows on the CPU): heads of the 2- to ngram-gram hashes of the row's
+// token and those before it on its path, cut at EOS or the sequence's start.
+// A thread per row of the step: its lane is the last whose first row is at
+// most it, and a row past that lane's rows hashes nothing.
 kernel void ngram_embedding_hash(device const uint *tokens [[buffer(0)]],
-                                 device const uint *before [[buffer(1)]],
-                                 device uint *indices [[buffer(2)]],
-                                 constant NgramHashParams &p [[buffer(3)]],
+                                 device const SplashTreeRow *tree [[buffer(1)]],
+                                 device const SplashLaneRows *lane_rows [[buffer(2)]],
+                                 device const uint *before [[buffer(3)]],
+                                 device uint *indices [[buffer(4)]],
+                                 constant NgramHashParams &p [[buffer(5)]],
                                  uint index [[thread_position_in_grid]]) {
   uint lane = 0;
   for (uint l = 1; l < min(p.lanes, uint(SPLASH_MAXIMUM_BATCH_WIDTH)); ++l)
-    lane = index >= p.first_row[l] ? l : lane;
-  if (index < p.first_row[lane] || index - p.first_row[lane] >= p.rows[lane]) return;
-  const uint r = index - p.first_row[lane];
-  // The row's token, then the ngram - 1 tokens before it, EOS from a cut on.
+    lane = index >= lane_rows[l].first ? l : lane;
+  const uint first = lane_rows[lane].first;
+  if (index < first || index - first >= lane_rows[lane].rows) return;
+  // The row's token, then the ngram - 1 tokens before it: its parents' up to
+  // the anchor, then those before the lane's first row; EOS from a cut on.
   ulong context[NGRAM_EMBEDDING_MAXIMUM_NGRAM] = {tokens[index]};
   bool cut = false;
+  uint row = index - first;
+  const uint depth = tree[index].depth;
   for (uint back = 1; back < p.ngram; ++back) {
-    const uint previous = back <= r ? tokens[index - back] : before[lane * (p.ngram - 1) + (back - r - 1)];
+    uint previous;
+    if (back <= depth) {
+      row = tree[first + row].parent;
+      previous = tokens[first + row];
+    } else {
+      previous = before[lane * (p.ngram - 1) + (back - depth - 1)];
+    }
     cut = cut || previous == NGRAM_EMBEDDING_NONE || previous == p.eos;
     context[back] = cut ? p.eos : previous;
   }

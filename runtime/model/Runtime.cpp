@@ -2525,8 +2525,9 @@ struct Runtime::Impl {
   void encodeBatchVerifyInput(CommandGraph &graph, uint32_t lanes) {
     if (!lanes || lanes > kLaneCount)
       throw std::invalid_argument("invalid verify-input batch width");
-    targetModel->addVerifyInput(graph, decodeArena->batchSlice(DecodeTensor::InputTokens, lanes),
-                                std::span(kDecodeBlocks).first(lanes));
+    targetModel->addVerifyInput(graph, {decodeArena->batchSlice(DecodeTensor::InputTokens, lanes),
+                                        decodeArena->batchSlice(DecodeTensor::TreeRows, lanes),
+                                        decodeArena->batchSlice(DecodeTensor::LaneLayout, lanes), decodeStep(lanes)});
   }
 
   // A stop token or the last budgeted token needs no target work of its own:
@@ -3985,7 +3986,7 @@ std::unique_ptr<RuntimeModel> createRuntime(RuntimeContext context) {
 
 #ifdef SPLASH_RUNTIME_INSTRUMENTATION
 std::vector<uint32_t> RuntimeInstrumentation::lastTableRows(const Runtime &runtime, uint32_t lane) {
-  return runtime.impl_->targetModel->verifyTableRows(lane);
+  return runtime.impl_->targetModel->verifyTableRows(runtime.impl_->laneRows(lane));
 }
 
 std::span<const float> RuntimeInstrumentation::lastLogits(const Runtime &runtime, uint32_t lane) {

@@ -45,16 +45,15 @@ public:
   // The GPU hashes the verify rows' PLE rows, and when the table streams a
   // host step of the command stages them, between the hash and the verify
   // that gathers them.
-  void addVerifyInput(metal::CommandGraph &graph, metal::MetalBuffer verifyInput,
-                      std::span<const ops::LaneRows> blocks) const override;
+  void addVerifyInput(metal::CommandGraph &graph, const QwenVerifyInput &input) const override;
   // Each lane's PLE history and QSA pending keys after its retained rows,
   // from the convolution inputs and keys its verify wrote of its block.
   void addStateCommit(metal::CommandGraph &graph, QwenTargetCommitBuffers buffers,
                       std::span<const ops::LaneRows> blocks) const override;
 
-  // The PLE rows of batch lane `lane`'s verify rows of the last step, each
-  // row's heads' in order.
-  [[nodiscard]] std::vector<uint32_t> verifyTableRows(uint32_t lane) const override;
+  // The PLE rows of a lane's rows of the last step, each row's heads' in
+  // order.
+  [[nodiscard]] std::vector<uint32_t> verifyTableRows(const ops::LaneRows &rows) const override;
 
 private:
   // The shared prefill's layer loop runs the family's (QwenTarget::addPrefillLayers).
