@@ -2238,16 +2238,17 @@ to save 2.4% of their prefill. A suspended lane's checkpoints
 stay opportunistic: once they went, the lane replays its reply from its prompt's
 replay point, as one that captured none. A decoding lane's latest state retires
 only once the next is published, beside which its cycle holds that next state's
-reservation, so the pool's idle cells keep one more for each lane that captured
-than for one that captured none once the lanes end (`state.idle_gdn_cells`: 11
-after four lanes' 300-token replies, where 1.6.2 leaves 8), which a claim takes
-first (step 1 above). A target whose state commit writes
-auxiliary state after its retained rows (Qwen3.8-Flash-Next) captures none in
-decode (`Model::capturesInDecode`), and its decode writes the rings alone. A
-target without GDN layers keeps no GDN state: its cells have no bytes, every
-lane and state shares one empty cell that holds no memory, so a lane holds the
-draft's rings and window and a cached state the window alone, and
-`state.idle_gdn_cells` and `idle_cached_cells` stay 0.
+reservation, so once the lanes end the pool holds those reservations' cached
+cells beside the lanes' cells (`state.idle_cached_cells` 2 beside
+`idle_gdn_cells` 8 after four lanes' 300-token replies at a 22 GB limit, where
+1.6.2 leaves 8 cells), which a claim takes first (step 1 above). A target
+whose state commit writes auxiliary state after its retained rows
+(Qwen3.8-Flash-Next) captures none in decode (`Model::capturesInDecode`), and
+its decode writes the rings alone. A target without GDN layers keeps no GDN
+state: its cells have no bytes, every lane and state shares one empty cell
+that holds no memory, so a lane holds the draft's rings and window and a
+cached state the window alone, and `state.idle_gdn_cells` and
+`idle_cached_cells` stay 0.
 
 ### Prefill and decode scheduling
 
