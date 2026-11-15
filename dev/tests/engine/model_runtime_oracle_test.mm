@@ -3282,6 +3282,58 @@ void requireConstrainedLaneSharesDecode(model::Runtime &executor, const model::Q
   std::cout << "constrained_lane_shares_decode=PASS\n";
 }
 
+// A constrained lane whose output budget leaves it fewer rows than a draft
+// block verifies those rows alone, and its mask request simulates their
+// tokens alone: the runtime takes the masks the server answers it with, one
+// at its anchor and one after each simulated token, and the lane decodes to
+// its budget. Its masks admit every token but the stop tokens.
+void requireConstrainedLaneTakesTheMasksItAskedFor(model::Runtime &executor,
+                                                   const model::ModelDescriptor &descriptor,
+                                                   std::span<const uint32_t> seed) {
+  constexpr uint32_t kRows = model::ExecutionLimits::targetVerifyRows;
+  constexpr uint32_t kPromptTokens = 64, kBudget = 5;
+  const uint32_t maskWords = targetTokens->maskWords();
+  const ops::StopTokens stops =
+      std::visit([](const auto &layout) { return layout.stopTokens; }, descriptor.target);
+  const auto admitting = [&](size_t rows) {
+    std::vector<uint32_t> words(rows * maskWords, ~0U);
+    for (size_t row = 0; row < rows; ++row)
+      for (const uint32_t stop : stops.tokens())
+        words[row * maskWords + stop / 32] &= ~(1U << (stop % 32));
+    return words;
+  };
+  std::vector<uint32_t> prompt(kPromptTokens);
+  for (uint32_t index = 0; index < kPromptTokens; ++index)
+    prompt[index] = seed[(index + 29) % seed.size()];
+  EngineRequest request = makeRequest(940, prompt, kBudget);
+  request.constraint = ConstraintMode::TokenMask;
+  const std::vector<uint32_t> pages = pageRange(40, (kPromptTokens + kBudget + kv::kPageTokens - 1) / kv::kPageTokens);
+  beginCold(executor, request, 0);
+  require(prefillChunk(executor, request.id, 0, prompt, pages).nextDecodeStage == DecodeStage::ApplyInitialMask,
+          "a constrained lane's prompt did not ask for its first mask");
+  provideMask(executor, request.id, admitting(1));
+  static_cast<void>(decodeOne(executor, request.id, kPromptTokens, pages, DecodeStage::ApplyInitialMask));
+  std::vector<uint32_t> tokens;
+  uint32_t fewest = kRows;
+  for (bool finished = false; !finished && tokens.size() < kBudget;) {
+    PendingMaskedDecode pending = beginMaskedDecodeOne(executor, request.id, kPromptTokens + tokens.size(), pages);
+    require(pending.maskRequests.size() == 1, "a constrained cycle did not ask for its lane's mask");
+    const size_t simulated = pending.maskRequests[0].simulationTokens.size();
+    require(simulated >= 1 && simulated <= kBudget - tokens.size(),
+            "a constrained cycle simulated rows its lane's output budget does not leave");
+    fewest = std::min(fewest, static_cast<uint32_t>(simulated));
+    provideMask(executor, request.id, admitting(simulated + 1));
+    const std::vector<ModelStepResult> results = finishMaskedDecode(std::move(pending));
+    require(results.size() == 1 && results[0].failure.empty(), "a constrained cycle near its budget failed");
+    tokens.insert(tokens.end(), results[0].outputTokens.begin(), results[0].outputTokens.end());
+    finished = results[0].finished;
+  }
+  require(fewest < kRows && tokens.size() == kBudget,
+          "the constrained lane did not decode to its budget on fewer rows than a block's");
+  executor.end(request.id);
+  std::cout << "constrained_lane_masks_asked_for=PASS fewest_rows=" << fewest << "\n";
+}
+
 // Under --verify-rows auto a MoE target's decode cycles verify the rows its
 // verify budget chooses, which follow the wall times and acceptance of the
 // cycles before them, so that runs need not repeat one another. Each cycle of
@@ -4763,6 +4815,7 @@ int main(int argc, char **argv) {
     }
     requireNonFiniteRowFailsOnlyItsLane(executor, pages, states, backend,
                                         samplingSeedTokens, prompt128);
+    requireConstrainedLaneTakesTheMasksItAskedFor(executor, model.descriptor, samplingSeedTokens);
     requireThinkingBudgetClosesThinking(executor);
     requireConstrainedThinkingEndWaitsForItsMask(executor);
     requireThinkingEndVerifiesItsTokens(executor, model);

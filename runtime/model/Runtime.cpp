@@ -387,10 +387,12 @@ struct Runtime::Impl {
     // logits at these token ids instead of selecting an anchor.
     std::vector<uint32_t> scoreTokens;
     std::vector<uint32_t> maskWords;
-    // Set only while the current scheduler-owned ticket overlaps grammar-mask
-    // computation with target verification. This is model runtime state, not a
-    // scheduler decode stage.
-    bool verifyMaskInFlight = false;
+    // The mask rows the current scheduler-owned ticket asked for while it
+    // overlaps grammar-mask computation with target verification: one at its
+    // anchor and one after each verify row's token its request simulates; 0
+    // while none is in flight. This is model runtime state, not a scheduler
+    // decode stage.
+    uint32_t verifyMaskRows = 0;
     uint64_t rngCounter = 0;
     DecodeStage decodeStage = DecodeStage::Regular;
     std::optional<DraftContextPlan> draftContextPlan;
@@ -2702,7 +2704,7 @@ struct Runtime::Impl {
         // and tokens are not committed, and the engine ends the request,
         // which may run again.
         entry.maskWords.clear();
-        entry.verifyMaskInFlight = false;
+        entry.verifyMaskRows = 0;
         results.push_back({.requestId = entry.id, .unreadableKvBlocks = std::move(unreadable[lane])});
         continue;
       }
@@ -2711,7 +2713,7 @@ struct Runtime::Impl {
         // the request.
         entry.resultInvalid = true;
         entry.maskWords.clear();
-        entry.verifyMaskInFlight = false;
+        entry.verifyMaskRows = 0;
         results.push_back({.requestId = entry.id,
                            .failure = std::move(laneResult.failure)});
         continue;
@@ -2734,7 +2736,7 @@ struct Runtime::Impl {
       entry.generatedTokens += laneResult.retained;
       commitSelected(entry, {targetTokens, laneResult.retained});
       entry.maskWords.clear();
-      entry.verifyMaskInFlight = false;
+      entry.verifyMaskRows = 0;
       // Its tree's estimates past its anchor, best first, for its next
       // cycle's choice of rows.
       const uint32_t size =
@@ -2819,7 +2821,7 @@ struct Runtime::Impl {
                                  "constrained verify rows") +
               block.first;
           entry.maskWords.clear();
-          entry.verifyMaskInFlight = true;
+          entry.verifyMaskRows = verified + 1;
 
           if (!abandoned_[lane]) {
             ModelMaskRequest request;
@@ -3018,7 +3020,7 @@ StateAdmission Runtime::begin(const ModelRequest &request) {
 
 void Runtime::suspend(uint64_t requestId) {
   Impl::Request &entry = impl_->request(requestId);
-  if (!entry.resident || entry.verifyMaskInFlight) {
+  if (!entry.resident || entry.verifyMaskRows) {
     throw std::logic_error("Qwen request cannot be suspended");
   }
   impl_->releaseLane(entry);
@@ -3665,7 +3667,7 @@ std::optional<std::string>
 Runtime::provideMask(uint64_t requestId, std::span<const uint32_t> words) {
   Impl::Request &entry = impl_->request(requestId);
   const bool acceptsMask =
-      waitsForMask(entry.decodeStage) || entry.verifyMaskInFlight;
+      waitsForMask(entry.decodeStage) || entry.verifyMaskRows;
   // Initial-mask replies can race resource preemption. They belong to the
   // host continuation, not the released device state.
   if (entry.constraint != ConstraintMode::TokenMask || !acceptsMask ||
@@ -3673,9 +3675,9 @@ Runtime::provideMask(uint64_t requestId, std::span<const uint32_t> words) {
     throw std::logic_error("request is not waiting for a token mask");
   }
   const uint32_t maskWords = impl_->geometry.maskWords();
-  uint64_t expected = entry.verifyMaskInFlight
-                          ? uint64_t{kDecodeRows + 1} * maskWords
-                          : maskWords;
+  // A verify mask's rows are those its request asked for; an initial mask
+  // has one.
+  const uint64_t expected = uint64_t{std::max(entry.verifyMaskRows, 1U)} * maskWords;
   // The native loop matches each response's word count to its request.
   if (words.size() != expected) {
     throw std::logic_error("token mask has the wrong word count");
@@ -3688,7 +3690,7 @@ Runtime::provideMask(uint64_t requestId, std::span<const uint32_t> words) {
       return "token mask row permits no vocabulary token";
     }
   }
-  if (entry.verifyMaskInFlight) {
+  if (entry.verifyMaskRows) {
     if (!entry.pendingToken || (words[*entry.pendingToken / 32] &
                                 (1U << (*entry.pendingToken % 32))) == 0) {
       return "verify mask is not synchronized to the pending anchor";
