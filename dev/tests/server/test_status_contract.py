@@ -91,7 +91,11 @@ class StatusContractTests(unittest.TestCase):
         self.assertIn("splash_disk_written_bytes_total 67890\n", metrics)
         for key in ("metadata_writes", "copy_evictions", "kv_copy_recreation_starts"):
             status["disk"].pop(key)
-        for key in ("disk_copy_drops", "disk_copy_recreation_starts", "disk_copy_recreations"):
+        for key in (
+            "disk_copy_drops",
+            "disk_copy_recreation_starts",
+            "disk_copy_recreations",
+        ):
             status["state"].pop(key)
         old = prometheus_metrics(status)
         self.assertNotIn("splash_disk_metadata_", old)
