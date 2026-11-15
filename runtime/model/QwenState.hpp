@@ -286,10 +286,10 @@ public:
   void clearDraftRings(uint32_t lane);
 
   // Returns one pooled buffer to macOS, a lane's cell before a cached one,
-  // cells before draft rings and rings before a window, keeping one lane's
-  // buffers when keepLane: what a reclaim step for a denied allocation
-  // releases. Zero when none is left to give. Active lanes and cached states
-  // are never moved or reclaimed.
+  // cells before draft rings and rings before a window, keeping with
+  // keepLane the buffers the next lane starts from (keptForStart): what a
+  // reclaim step for a denied allocation releases. Zero when none is left to
+  // give. Active lanes and cached states are never moved or reclaimed.
   [[nodiscard]] uint64_t releaseOneIdle(bool keepLane) noexcept;
   [[nodiscard]] uint32_t idleCells() const noexcept;
   [[nodiscard]] uint32_t idleCachedCells() const noexcept;
@@ -304,10 +304,10 @@ public:
   // What releaseOneIdle(keepLane), called until it gives none, releases
   // once `evictedStates` more cached states have returned their cached cell
   // and context window to the pool (QwenBufferPool::give), at the layout's
-  // sizes, which each allocation covers: with keepLane a lane keeps two
-  // cells, the draft rings and a window, and cells of no bytes count none.
-  // With `afterStart`, of the pool a lane's activation leaves once it took
-  // its buffers from it first (startBytes).
+  // sizes, which each allocation covers: with keepLane less what the next
+  // lane starts from (keptForStart), and cells of no bytes count none. With
+  // `afterStart`, of the pool a lane's activation leaves once it took its
+  // buffers from it first (startBytes).
   [[nodiscard]] uint64_t idleBytes(uint32_t evictedStates, bool afterStart, bool keepLane) const noexcept;
   // What a lane's activation allocates: its buffers that the idle pool
   // lacks.
@@ -426,6 +426,14 @@ private:
   acquire(BufferCounts counts, std::string_view label, Buffers &buffers, uint64_t extraBytes = 0,
           const std::function<void()> &allocateExtra = {});
   [[nodiscard]] BufferCounts idle() const noexcept;
+  // The pooled buffers keepLane keeps for the next lane's start: a lane's
+  // two cells, draft rings and window while no lane holds its own, and none
+  // beside a lane that does (or one `afterStart` makes), whose own the next
+  // start takes once it ends. A lane's cells serve no cached state, which
+  // takes codes, so another lane's kept beside one in service stayed past
+  // every cached unit a KV admission evicted: after two concurrent chats at
+  // a 22 GB limit, 22 cached 4K-token chats where 24 fit before them.
+  [[nodiscard]] BufferCounts keptForStart(bool keepLane, bool afterStart) const noexcept;
   // The buffers of `count` beyond those of `taken`, each kind apart.
   [[nodiscard]] static BufferCounts beyond(BufferCounts count, BufferCounts taken) noexcept;
   // Their bytes at the layout's sizes.

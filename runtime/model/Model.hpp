@@ -876,8 +876,9 @@ public:
   [[nodiscard]] virtual std::optional<uint32_t> statesToActivate() const noexcept { return 0; }
   // The bytes releaseIdleBuffer(keepLane), called until it gives none,
   // releases once the cache has let go of `evictedStates` more cached states,
-  // whose buffers return to the pool: the pooled buffers, beyond those one
-  // lane starts from with keepLane, at the sizes their layout declares,
+  // whose buffers return to the pool: the pooled buffers, beyond those the
+  // next lane starts from with keepLane (none beside a lane in service, whose
+  // own it takes once that ends), at the sizes their layout declares,
   // which no allocation falls short of. With `afterStart`, of the pool a
   // lane's start leaves (startStateBytes): the evicted states refill the
   // buffers it took from it before any of theirs frees memory. Zero where
@@ -911,8 +912,8 @@ public:
     work.layerAttentionPairs = work.attentionPairs;
     return work;
   }
-  // Releases one pooled state buffer no lane holds (keepLane keeps those one
-  // lane starts from) and returns its bytes; zero when none is idle. One
+  // Releases one pooled state buffer no lane holds (keepLane keeps those the
+  // next lane starts from) and returns its bytes; zero when none is idle. One
   // buffer a call, so a denied allocation that retries between calls frees
   // only what it needs. The model's other idle memory goes through pools().
   [[nodiscard]] virtual uint64_t releaseIdleBuffer(bool keepLane) noexcept = 0;

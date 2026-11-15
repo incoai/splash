@@ -1617,7 +1617,12 @@ Every claim walks one order. A unit the claim's rights (`TakeRights`) do not
 take is skipped, not a stop:
 
 1. Idle state buffers beyond those the next lane starts from, and those
-   too under macOS's critical pressure.
+   too under macOS's critical pressure. Qwen's pool keeps a lane's buffers
+   for the next start only while no lane is in service: beside one that is,
+   whose own the next start takes once it ends, it keeps none, since a lane's
+   cells serve no cached state (after two concurrent chats at a 22 GB limit
+   another lane's kept beside one in service left 22 cached 4K-token chats
+   where 24 fit).
 2. Cached units that free memory now (copied, dead or needing no write, a
    reply's opportunistic state among them), in the cache's one order
    (`Cache::walkFor`).

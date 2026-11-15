@@ -894,6 +894,35 @@ void testStartBytes(metal::MetalBackend &backend) {
   }
 }
 
+// The pool keeps the buffers the next lane starts from only while no lane
+// holds its own: beside a lane in service, a released lane's cells, rings and
+// window are idle bytes that keepLane releases, since the lane in service
+// returns its own for the next start; with no lane in service, keepLane keeps
+// one lane's again. A lane's cells serve no cached state, so kept beside a
+// lane in service they would stay past every cached unit a KV admission
+// evicts.
+void testKeptLaneBesideALaneInService(metal::MetalBackend &backend) {
+  MemoryGovernor governor(backend, backend.capabilities().recommendedMaxWorkingSetBytes, 1, 1, queryHostMemory, 0);
+  const test::ClaimScope start(governor, ClaimClass::Floor);
+  model::QwenStateStorage storage(backend, governor.allocationAdmission(), kStateLayout, nullptr);
+  require(static_cast<bool>(storage.tryActivateLane(0, 1)), "the first lane did not start");
+  const uint64_t lane = storage.actualAllocatedBytes();
+  require(static_cast<bool>(storage.tryActivateLane(1, 2)), "the second lane did not start");
+  storage.releaseLane(1, 2);
+  require(storage.idleBytes(0, false, true) == kStateLayout.laneBytes() &&
+              storage.idleBytes(0, false, false) == kStateLayout.laneBytes(),
+          "beside a lane in service, the pool kept a released lane's buffers for the next start");
+  require(releaseAllIdle(storage, true) == lane && storage.idleCells() == 0 && storage.idleRings() == 0 &&
+              storage.idleWindows() == 0 && storage.actualAllocatedBytes() == lane,
+          "beside a lane in service, keepLane did not release a released lane's buffers");
+  storage.releaseLane(0, 1);
+  require(storage.idleBytes(0, false, true) == 0 && releaseAllIdle(storage, true) == 0 && storage.idleCells() == 2 &&
+              storage.idleRings() == 1 && storage.idleWindows() == 1,
+          "with no lane in service, keepLane did not keep the buffers the next lane starts from");
+  require(releaseAllIdle(storage, false) == lane && storage.actualAllocatedBytes() == 0,
+          "the kept lane's buffers were not reclaimed");
+}
+
 // Captures, demotions, direct writes, RAM and SSD restores, promotions and
 // drops interleaved on four lanes. Every restore reproduces the codes of the
 // state it came from; at every step the storage tracks the lanes', the
@@ -1017,6 +1046,7 @@ void run(const std::string &metallib) {
   testPersistKeepsTheRamCopy(backend);
   testReservations(backend);
   testAttentionOnlyTarget(backend);
+  testKeptLaneBesideALaneInService(backend);
   testAccountingAcrossCapturesAndRestores(backend);
   testStartBytes(backend);
   MemoryGovernor governor(

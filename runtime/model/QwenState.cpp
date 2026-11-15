@@ -399,7 +399,7 @@ void QwenStateStorage::clearDraftRings(uint32_t index) {
 
 uint64_t QwenStateStorage::releaseOneIdle(bool keepLane) noexcept {
   const uint64_t before = backend_.memoryStats().allocatedBytes;
-  const BufferCounts kept = keepLane ? kLaneBuffers : BufferCounts{};
+  const BufferCounts kept = keptForStart(keepLane, false);
   if (idleCells() > kept.cells)
     pool_->cells.pop_back();
   else if (idleCachedCells())
@@ -434,6 +434,13 @@ QwenStateStorage::BufferCounts QwenStateStorage::idle() const noexcept {
   return {idleCells(), idleCachedCells(), idleRings(), idleWindows()};
 }
 
+QwenStateStorage::BufferCounts QwenStateStorage::keptForStart(bool keepLane, bool afterStart) const noexcept {
+  const bool inService = afterStart || std::ranges::any_of(lanes_, [](const Lane &lane) {
+    return lane.metadata.assigned();
+  });
+  return keepLane && !inService ? kLaneBuffers : BufferCounts{};
+}
+
 QwenStateStorage::BufferCounts QwenStateStorage::beyond(BufferCounts count, BufferCounts taken) noexcept {
   const auto left = [](uint32_t of, uint32_t less) { return of - std::min(of, less); };
   return {left(count.cells, taken.cells), left(count.cachedCells, taken.cachedCells), left(count.rings, taken.rings),
@@ -458,7 +465,7 @@ uint64_t QwenStateStorage::idleBytes(uint32_t evictedStates, bool afterStart, bo
   BufferCounts pooled = afterStart ? beyond(idle(), kLaneBuffers) : idle();
   pooled.cachedCells += evictedStates * kStateBuffers.cachedCells;
   pooled.windows += evictedStates * kStateBuffers.windows;
-  return bytes(keepLane ? beyond(pooled, kLaneBuffers) : pooled);
+  return bytes(beyond(pooled, keptForStart(keepLane, afterStart)));
 }
 
 uint64_t QwenStateStorage::startBytes() const noexcept { return bytes(beyond(kLaneBuffers, idle())); }
