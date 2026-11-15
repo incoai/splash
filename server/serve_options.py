@@ -574,8 +574,9 @@ SERVE_OPTIONS = (
         dict(
             choices=("fp32", "bf16"),
             default="fp32",
-            help="recurrent state storage (default: fp32); bf16 halves each "
-            "state, so memory and the SSD cache hold about twice as many",
+            help="recurrent state storage of running requests (default: fp32); "
+            "bf16 halves each one's state, and cached states store int8 codes "
+            "in either format",
         ),
         engine=EngineArgument("--state-format"),
         needs="recurrent_state",

@@ -793,16 +793,16 @@ part a copy does not fill unallocated, so its length (`ls -l`) can pass the
 quota while the space it takes (`du`) stays within it, beside what APFS
 allocates past the files' ends as they grow and keeps until it drops it on its
 own: about 16 MiB past a file that grows by many small writes, and a few
-percent of one that grows by a few large ones (15.8 MiB past two of the 27B's
-153 MiB states; 29.6 MiB past both files, 451.5 MiB long together, in another
-run). That needs a volume
+percent of one that grows by a few large ones (15.8 MiB past two 153 MiB
+states, the 27B's before cached states took int8 codes; 29.6 MiB past both
+files, 451.5 MiB long together, in another run). That needs a volume
 that gives the unused part of a file back, as APFS does; on one that does not,
 such as HFS+ or exFAT, every copy counts a whole page's or state's room, and
 the log says so once.
 
 State writes stage through a buffer of one state (20 MiB for 35B, 47 MiB for
 27B) that the memory plan sets aside within `--max-memory`; on a 24 GB Mac
-serving 27B that costs about a thousand tokens of context, the KV of 30 pages.
+serving 27B that costs about 1,500 tokens of context, the KV of 46 pages.
 A size sets it aside whatever it costs, as before, and a quota too small for
 one state leaves the cache off.
 `auto` sets it aside only where the memory plan holds the model and the
