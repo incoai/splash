@@ -7,11 +7,13 @@
 // keeps values token-major (Qwen3.8-Flash-Next's, for one).
 
 // Threadgroup per tile, group.x the tile and group.y the sequence
-// (SplashAttentionBlockListParams): only the blocks of the tile's history are
+// (SplashAttentionBlockListParams), whose rows are its entry of the
+// command's layout (`layout`): only the blocks of the tile's history are
 // listed (the tail bit of a row whose token completes its block names the
 // next block), and every thread takes a contiguous run of their words, so the
 // entries keep block order. A list keeps to its stride whatever the masks
-// hold.
+// hold; a tile past the sequence's rows, or a layout entry past its bound or
+// the command's rows, lists nothing.
 constant constexpr uint kBlockListThreads = SPLASH_ATTENTION_BLOCK_LIST_THREADS;
 
 // The bits of mask word `w` that name one of the first `blocks` blocks.
@@ -23,7 +25,8 @@ inline uint splash_history_word_bits(uint blocks, uint w) {
 kernel void attention_block_lists(device const uint *mask [[buffer(0)]],
                                   device uint *lists [[buffer(1)]],
                                   device uint *counts [[buffer(2)]],
-                                  constant SplashAttentionBlockListParams &p [[buffer(3)]],
+                                  device const SplashLaneRows *layout [[buffer(3)]],
+                                  constant SplashAttentionBlockListParams &p [[buffer(4)]],
                                   uint2 group [[threadgroup_position_in_grid]],
                                   uint tid [[thread_index_in_threadgroup]],
                                   uint lane [[thread_index_in_simdgroup]],
@@ -32,15 +35,18 @@ kernel void attention_block_lists(device const uint *mask [[buffer(0)]],
   if (group.y >= min(p.sequences, uint(SPLASH_MAXIMUM_BATCH_WIDTH)))
     return;
   const SplashAttentionBlockListSequence s = p.sequence[group.y];
+  const SplashLaneRows entry = layout[s.sequence];
+  const uint sequence_rows =
+      entry.rows <= s.row_bound && ulong(entry.first) + entry.rows <= p.rows ? entry.rows : 0;
   const uint tile = group.x, first_row = tile * p.tile_rows;
-  if (first_row >= s.rows)
+  if (first_row >= sequence_rows)
     return;
-  const uint rows = min(p.tile_rows, s.rows - first_row);
+  const uint rows = min(p.tile_rows, sequence_rows - first_row);
   const uint blocks = splash_sparse_history_blocks(s.first_position + first_row, rows);
   const uint words = min((blocks + 31) / 32, p.mask_words);
   const uint per = (words + kBlockListThreads - 1) / kBlockListThreads;
   const uint w0 = min(tid * per, words), w1 = min(w0 + per, words);
-  device const uint *bits = mask + ulong(s.mask_row + first_row) * p.mask_words;
+  device const uint *bits = mask + (ulong(entry.first) + first_row) * p.mask_words;
   // A tile's rows, unrolled over an entry's row bits, so that each row's word
   // stays in a register; a short last tile's missing rows read as zero.
   constexpr uint RowBits = SPLASH_ATTENTION_BLOCK_ROW_BITS;
@@ -117,10 +123,11 @@ inline SplashSparseList splash_sparse_list(device const uint *lists, device cons
 // a two-dimensional one (x the KV head, y the split), which ran up to 1.7x
 // slower on most grids of more than 32 splits. The located split reads each
 // entry's block where the list's locations name. Every split binds the
-// step's tree rows after the page tables, as the dense split does, and after
-// the lists' counts the row masks of a tree's rows that attend through them
-// (ops::AttentionBlocks::rowMasks, a word per row of the command at the
-// tree rows' places).
+// step's tree rows after the page tables and the command's layout after
+// them, as the dense split does, and after the lists' counts the row masks of
+// a tree's rows that attend through them (ops::AttentionBlocks::rowMasks, a
+// word per row of the command at the tree rows' places); the reduce binds the
+// layout after its output.
 #define SPARSE_SPLIT_BODY(Heads, Group, HeadDim, CacheElement, Located,       \
                           Locations, LocationPages, Places)                    \
     constexpr uint Rows = SPLASH_ATTENTION_TILE_ROWS;                          \
@@ -128,10 +135,11 @@ inline SplashSparseList splash_sparse_list(device const uint *lists, device cons
         scratch;                                                               \
     const uint s = splash_attention_sequence_of_tile(params, group.y);         \
     constant SplashAttentionSequence &sequence = params.sequence[s];           \
+    const SplashAttentionRows rows = splash_attention_rows(layout, params, s); \
     const uint kv_head = group.x % Heads, split = group.x / Heads;             \
     const uint tile_index = group.y - sequence.first_tile;                     \
     const SplashAttentionTile tile =                                           \
-        splash_attention_tile<Heads, Group, HeadDim>(params, sequence,         \
+        splash_attention_tile<Heads, Group, HeadDim>(params, sequence, rows,   \
                                                      kv_head, tile_index);     \
     if (!tile.active || split >= tile.splits)                                  \
       return;                                                                  \
@@ -146,10 +154,10 @@ inline SplashSparseList splash_sparse_list(device const uint *lists, device cons
         params.kv, kv_head, tile.first_position, tile.active_rows,             \
         list.entries, list.count, list.locations, LocationPages, Places,       \
         tile.splits, split, partials, statistics, tile.first_slot + split,     \
-        scratch, splash_attention_tree(params, sequence, tree,                 \
+        scratch, splash_attention_tree(params, sequence, rows, tree,           \
                                        tile.first_position),                   \
         params.trees && list.entries                                           \
-            ? row_masks + sequence.row_begin +                                 \
+            ? row_masks + rows.first +                                         \
                   (tile.first_position - sequence.committed_tokens)            \
             : nullptr,                                                         \
         thread_index);
@@ -164,10 +172,11 @@ inline SplashSparseList splash_sparse_list(device const uint *lists, device cons
       device const SplashKvPage *page_table2 [[buffer(5)]],                    \
       device const SplashKvPage *page_table3 [[buffer(6)]],                    \
       device const SplashTreeRow *tree [[buffer(7)]],                          \
-      device const uint *lists [[buffer(8)]],                                  \
-      device const uint *counts [[buffer(9)]],                                 \
-      device const uint *row_masks [[buffer(10)]],                             \
-      constant SplashAttentionParams &params [[buffer(11)]],                   \
+      device const SplashLaneRows *layout [[buffer(8)]],                       \
+      device const uint *lists [[buffer(9)]],                                  \
+      device const uint *counts [[buffer(10)]],                                \
+      device const uint *row_masks [[buffer(11)]],                             \
+      constant SplashAttentionParams &params [[buffer(12)]],                   \
       uint3 group [[threadgroup_position_in_grid]],                            \
       uint thread_index [[thread_index_in_threadgroup]]) {                     \
     SPARSE_SPLIT_BODY(Heads, Group, HeadDim, CacheElement, false, nullptr,     \
@@ -187,12 +196,13 @@ inline SplashSparseList splash_sparse_list(device const uint *lists, device cons
       device const SplashKvPage *page_table2 [[buffer(5)]],                    \
       device const SplashKvPage *page_table3 [[buffer(6)]],                    \
       device const SplashTreeRow *tree [[buffer(7)]],                          \
-      device const uint *lists [[buffer(8)]],                                  \
-      device const uint *counts [[buffer(9)]],                                 \
-      device const uint *row_masks [[buffer(10)]],                             \
-      device const uint *locations [[buffer(11)]],                             \
-      device const SplashKvPage *location_pages [[buffer(12)]],                \
-      constant SplashAttentionParams &params [[buffer(13)]],                   \
+      device const SplashLaneRows *layout [[buffer(8)]],                       \
+      device const uint *lists [[buffer(9)]],                                  \
+      device const uint *counts [[buffer(10)]],                                \
+      device const uint *row_masks [[buffer(11)]],                             \
+      device const uint *locations [[buffer(12)]],                             \
+      device const SplashKvPage *location_pages [[buffer(13)]],                \
+      constant SplashAttentionParams &params [[buffer(14)]],                   \
       uint3 group [[threadgroup_position_in_grid]],                            \
       uint thread_index [[thread_index_in_threadgroup]]) {                     \
     threadgroup uint places[SplashSparseStep<CacheElement>::Blocks];           \
@@ -213,19 +223,20 @@ SPARSE_LOCATED_SPLIT(attention_bf16_sparse_located_kv2_g12, 2, 12, 256, bfloat)
       device const float *partials [[buffer(0)]],                              \
       device const float *statistics [[buffer(1)]],                            \
       device bfloat *output [[buffer(2)]],                                     \
-      device const uint *counts [[buffer(3)]],                                 \
-      constant SplashAttentionParams &params [[buffer(4)]],                    \
+      device const SplashLaneRows *layout [[buffer(3)]],                       \
+      device const uint *counts [[buffer(4)]],                                 \
+      constant SplashAttentionParams &params [[buffer(5)]],                    \
       uint3 group [[threadgroup_position_in_grid]],                            \
       uint thread_index [[thread_index_in_threadgroup]]) {                     \
     constexpr uint Rows = SPLASH_ATTENTION_TILE_ROWS;                          \
     threadgroup float weights[SplashAttentionMaximumSplits];                   \
     threadgroup float group_values[HeadDim / 32];                              \
-    constant SplashAttentionSequence &sequence =                               \
-        params.sequence[splash_attention_sequence_of_tile(params, group.z)];   \
+    const uint s = splash_attention_sequence_of_tile(params, group.z);         \
+    constant SplashAttentionSequence &sequence = params.sequence[s];           \
     const uint fused_row = group.y, tile_index = group.z - sequence.first_tile; \
-    const SplashAttentionTile tile =                                           \
-        splash_attention_tile<Heads, Group, HeadDim>(params, sequence,         \
-                                                     group.x, tile_index);     \
+    const SplashAttentionTile tile = splash_attention_tile<Heads, Group,       \
+        HeadDim>(params, sequence, splash_attention_rows(layout, params, s),   \
+                 group.x, tile_index);                                         \
     if (!tile.active || fused_row >= Rows * Group || thread_index >= HeadDim)  \
       return;                                                                  \
     const uint count = splash_sparse_list_count(                               \

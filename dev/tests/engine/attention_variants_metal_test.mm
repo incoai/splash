@@ -236,6 +236,8 @@ struct Staging final {
   uint32_t rows;
   uint32_t stride;
   metal::MetalBuffer keys, values, queries, output;
+  // Each lane's rows of the command, lane after lane (SplashLaneRows).
+  metal::MetalBuffer layout;
 
   [[nodiscard]] uint64_t queryIndex(uint32_t lane, uint32_t head, uint32_t row, uint32_t dimension) const {
     return (((uint64_t{lane} * kKvHeads + head / kGroup) * stride + row) * kGroup + head % kGroup) * kHeadDimension +
@@ -245,9 +247,16 @@ struct Staging final {
 
 Staging stage(metal::MetalBackend &backend, const Case &data, uint32_t first, uint32_t rows, uint32_t stride) {
   const uint64_t kvElements = uint64_t{data.lanes} * kKvHeads * stride * kHeadDimension;
-  Staging staging{first, rows, stride, zeroed(backend, kvElements * 2), zeroed(backend, kvElements * 2),
-                  zeroed(backend, kvElements * kGroup * 2), zeroed(backend, kvElements * kGroup * 2)};
-  for (uint32_t lane = 0; lane < data.lanes; ++lane)
+  Staging staging{first,
+                  rows,
+                  stride,
+                  zeroed(backend, kvElements * 2),
+                  zeroed(backend, kvElements * 2),
+                  zeroed(backend, kvElements * kGroup * 2),
+                  zeroed(backend, kvElements * kGroup * 2),
+                  zeroed(backend, uint64_t{data.lanes} * sizeof(SplashLaneRows))};
+  for (uint32_t lane = 0; lane < data.lanes; ++lane) {
+    contents<SplashLaneRows>(staging.layout)[lane] = {lane * rows, rows};
     for (uint32_t row = 0; row < rows; ++row) {
       for (uint32_t head = 0; head < kKvHeads; ++head)
         for (uint32_t dimension = 0; dimension < kHeadDimension; ++dimension) {
@@ -262,6 +271,7 @@ Staging stage(metal::MetalBackend &backend, const Case &data, uint32_t first, ui
           contents<uint16_t>(staging.queries)[staging.queryIndex(lane, head, row, dimension)] =
               floatToBf16(query(lane, head, first + row, dimension));
     }
+  }
   return staging;
 }
 
@@ -437,12 +447,13 @@ metal::CommandGraph encode(const Case &data, const Staging &staging, const ops::
   metal::CommandGraph graph;
   const std::vector<kv::ChunkedPrefillParams> sequences = sequencesOf(data, staging);
   const ops::AttentionStaging staged{staging.queries, staging.keys, staging.values, staging.output};
-  ops::PagedAttention::addStore(graph, data.layer, staged, std::span(data.tables).first(data.lanes), sequences,
+  const ops::AttentionRows rows{staging.layout, data.lanes * staging.rows, tree};
+  ops::PagedAttention::addStore(graph, data.layer, staged, std::span(data.tables).first(data.lanes), sequences, rows,
                                 data.layout);
   std::vector<ops::AttentionHistory> histories;
   for (uint32_t lane = 0; lane < data.lanes; ++lane) histories.push_back({data.layer, data.tables[lane]});
-  ops::PagedAttention::addAttention(graph, plan, staged, partials, statistics, sequences, histories, data.sinks,
-                                    tree);
+  ops::PagedAttention::addAttention(graph, plan, staged, partials, statistics, sequences, histories, rows,
+                                    data.sinks);
   return graph;
 }
 
@@ -461,8 +472,8 @@ void checkPlan(const Case &data, const Staging &staging, const ops::AttentionPla
   const auto &dispatches = graph.dispatches();
   require(dispatches.size() == 3 && dispatches[0].pipelineName == "attention_" + format + "_store_kv4_d128" &&
               dispatches[0].threadsPerThreadgroup.x == kHeadDimension &&
-              dispatches[2].threadsPerThreadgroup.x == kHeadDimension && dispatches[2].buffers.size() == 4 &&
-              dispatches[2].buffers[3].buffer.sameView(data.sinks),
+              dispatches[2].threadsPerThreadgroup.x == kHeadDimension && dispatches[2].buffers.size() == 5 &&
+              dispatches[2].buffers[4].buffer.sameView(data.sinks),
           "the store and reduce run a thread per dimension, the reduce with the sinks");
   for (uint32_t lane = 0; lane < data.lanes; ++lane)
     require(plan.sequences()[lane].splits == test::attentionSplits(staging.rows, data.histories[lane] + staging.first,
@@ -686,13 +697,13 @@ void checkSplitCounts(metal::MetalBackend &backend, kv::Format format, bool int8
       std::memset(partials.contents(), 0xff, partials.sizeBytes());
       std::memset(statistics.contents(), 0xff, statistics.sizeBytes());
       std::memset(staging.output.contents(), 0xff, staging.output.sizeBytes());
-      SplashAttentionParams params{.sequences = data.lanes, .rows = data.lanes * kLaneRows, .tiles = data.lanes,
-                                   .trees = 0, .kv = data.layer, .sequence = {}};
+      SplashAttentionParams params{.sequences = data.lanes, .first_sequence = 0, .rows = data.lanes * kLaneRows,
+                                   .tiles = data.lanes, .trees = 0, .last_rows = 0, .kv = data.layer,
+                                   .sequence = {}};
       for (uint32_t lane = 0; lane < data.lanes; ++lane)
         params.sequence[lane] = {.committed_tokens = sequences[lane].committed_tokens,
-                                 .rows = kLaneRows,
-                                 .first_row = lane * kLaneRows,
-                                 .row_begin = lane * kLaneRows,
+                                 .row_bound = kLaneRows,
+                                 .layout_row = 0,
                                  .stage_row = lane * kKvHeads * kPageTokens,
                                  .chunk_stride = kPageTokens,
                                  .page_table_entries = sequences[lane].page_table_entries,
@@ -705,9 +716,9 @@ void checkSplitCounts(metal::MetalBackend &backend, kv::Format format, bool int8
       // Without tree rows the split binds another buffer in their place.
       graph.add(plan.splitPipeline(),
                 {staging.queries, partials, statistics, data.tables[0], data.tables[1], data.tables[2], data.tables[3],
-                 partials},
+                 partials, staging.layout},
                 params, {kKvHeads, data.lanes, splits});
-      graph.add(plan.reducePipeline(), {partials, statistics, staging.output, data.sinks}, params,
+      graph.add(plan.reducePipeline(), {partials, statistics, staging.output, staging.layout, data.sinks}, params,
                 {kKvHeads, kLaneRows * kGroup, data.lanes}, {kHeadDimension, 1, 1});
       static_cast<void>(backend.submitCommandAsync(graph.dispatches()).wait());
       checkOutput(data, staging, describe(data, "lanes") + " of " + std::to_string(splits) + " splits");
@@ -829,14 +840,17 @@ void checkPlans(metal::MetalBackend &backend) {
   const std::array chunk{ops::PagedAttention::chunkParams(0, 8, 32, 1)};
   const ops::AttentionStaging staging{buffer, buffer, buffer, buffer};
   const std::array histories{ops::AttentionHistory{{1, 0}, buffer}};
+  const ops::AttentionRows rows{buffer, 8};
   const auto plan = planOf(8, 0, kQueryHeads, layout, kWindowed);
   metal::CommandGraph graph;
-  rejects([&] { ops::PagedAttention::addAttention(graph, plan, staging, buffer, buffer, chunk, histories); },
+  rejects([&] { ops::PagedAttention::addAttention(graph, plan, staging, buffer, buffer, chunk, histories, rows); },
           "attention sinks buffer holds", "a plan with sinks encoded without them");
-  rejects([&] { ops::PagedAttention::addAttention(graph, plan, staging, buffer, buffer, chunk, histories, fewSinks); },
-          "attention sinks buffer holds", "a plan with sinks encoded with too few");
   rejects([&] {
-    ops::PagedAttention::addAttention(graph, planOf(8, 0, 24, qwen), staging, buffer, buffer, chunk, histories, sinks);
+    ops::PagedAttention::addAttention(graph, plan, staging, buffer, buffer, chunk, histories, rows, fewSinks);
+  }, "attention sinks buffer holds", "a plan with sinks encoded with too few");
+  rejects([&] {
+    ops::PagedAttention::addAttention(graph, planOf(8, 0, 24, qwen), staging, buffer, buffer, chunk, histories, rows,
+                                      sinks);
   }, "the attention kernels take no sinks", "a plan without sinks encoded with some");
   require(graph.empty(), "a refused attention encoded a dispatch");
   std::cout << "variant plans PASS\n";
@@ -872,16 +886,20 @@ void checkProjection(metal::MetalBackend &backend, bool rotated, bool float32, b
   const ops::NormWeights keyNorm = test::makeNormWeights(backend, kHeadDimension, float32, weight);
   // Each lane a sequence of `rows` rows, staged after the lanes before it.
   std::vector<kv::ChunkedPrefillParams> sequences;
-  for (uint32_t lane = 0; lane < lanes; ++lane)
+  const metal::MetalBuffer layoutRows = zeroed(backend, uint64_t{lanes} * sizeof(SplashLaneRows));
+  for (uint32_t lane = 0; lane < lanes; ++lane) {
     sequences.push_back(ops::PagedAttention::chunkParams(100 * lane, rows, stride, (100 * lane + rows + 31) / 32));
+    contents<SplashLaneRows>(layoutRows)[lane] = {lane * rows, rows};
+  }
   metal::CommandGraph graph;
   ops::PagedAttention::addProjection(graph, packed, queryNorm, keyNorm, ropeCos, ropeSin,
-                                     {queries, keys, values, {}}, sequences, kQueryHeads, layout, variant);
+                                     {queries, keys, values, {}}, sequences, {layoutRows, lanes * rows}, kQueryHeads,
+                                     layout, variant);
   const std::string kernel = std::string("attention_qkv_kv4_g8_d128") + (rotated ? "" : "_nope") +
                              (float32 ? "_f32" : "");
   require(graph.dispatches().size() == 1 && graph.dispatches()[0].pipelineName == kernel &&
               graph.dispatches()[0].threadsPerThreadgroup.x == kHeadDimension &&
-              graph.dispatches()[0].buffers.size() == (rotated ? 8U : 6U),
+              graph.dispatches()[0].buffers.size() == (rotated ? 9U : 7U),
           "the projection runs another kernel or binds tables it does not read");
   static_cast<void>(backend.submitCommandAsync(graph.dispatches()).wait());
   for (uint32_t lane = 0; lane < lanes; ++lane)
@@ -972,21 +990,25 @@ void checkGather(metal::MetalBackend &backend) {
   const kv::Layout layout = layoutOf(kv::Format::Int8);
   const uint32_t width = kQueryHeads * kHeadDimension;
   for (const bool lanesOfEight : {false, true})
-    for (const ops::AttentionRows read : {ops::AttentionRows::Every, ops::AttentionRows::Last}) {
+    for (const ops::AttentionOutput read : {ops::AttentionOutput::Every, ops::AttentionOutput::Last}) {
       const uint32_t lanes = lanesOfEight ? 3 : 1, laneRows = lanesOfEight ? kLaneRows : 37,
                      stride = lanesOfEight ? kPageTokens : 64;
-      const uint32_t rows = read == ops::AttentionRows::Every ? lanes * laneRows : lanes;
+      const uint32_t rows = read == ops::AttentionOutput::Every ? lanes * laneRows : lanes;
       std::vector<kv::ChunkedPrefillParams> sequences;
-      for (uint32_t lane = 0; lane < lanes; ++lane)
+      const metal::MetalBuffer layoutRows = zeroed(backend, uint64_t{lanes} * sizeof(SplashLaneRows));
+      for (uint32_t lane = 0; lane < lanes; ++lane) {
         sequences.push_back(ops::PagedAttention::chunkParams(0, laneRows, stride, (laneRows + 31) / 32));
+        contents<SplashLaneRows>(layoutRows)[lane] = {lane * laneRows, laneRows};
+      }
+      const ops::AttentionRows command{layoutRows, lanes * laneRows};
       const metal::MetalBuffer attention = zeroed(backend, uint64_t{lanes} * kQueryHeads * stride * kHeadDimension * 2);
       for (uint64_t i = 0; i < attention.sizeBytes() / 2; ++i) contents<uint16_t>(attention)[i] = floatToBf16(unit(i));
       const ops::AttentionStaging staging{.rows = attention};
       const metal::MetalBuffer hidden = zeroed(backend, uint64_t{rows} * width * 2);
       // The gather reads no packed row, so it takes none.
       metal::CommandGraph graph;
-      require(ops::PagedAttention::addGate(graph, {}, staging, hidden, sequences, read, kQueryHeads, layout).layout ==
-                  ops::LinearInput::Plain,
+      require(ops::PagedAttention::addGate(graph, {}, staging, hidden, sequences, command, read, kQueryHeads, layout)
+                      .layout == ops::LinearInput::Plain,
               "the plain gather wrote a table");
       require(graph.dispatches().size() == 1 && graph.dispatches()[0].pipelineName == "attention_gather_kv4_g8_d128",
               "the ungated output runs another kernel");
@@ -994,8 +1016,8 @@ void checkGather(metal::MetalBackend &backend) {
       for (uint32_t row = 0; row < rows; ++row)
         for (uint32_t head = 0; head < kQueryHeads; ++head)
           for (uint32_t d = 0; d < kHeadDimension; ++d) {
-            const uint32_t lane = read == ops::AttentionRows::Every ? row / laneRows : row;
-            const uint32_t local = read == ops::AttentionRows::Every ? row % laneRows : laneRows - 1;
+            const uint32_t lane = read == ops::AttentionOutput::Every ? row / laneRows : row;
+            const uint32_t local = read == ops::AttentionOutput::Every ? row % laneRows : laneRows - 1;
             const uint64_t staged =
                 (((uint64_t{lane} * kKvHeads + head / kGroup) * stride + local) * kGroup + head % kGroup) *
                     kHeadDimension +
@@ -1004,7 +1026,7 @@ void checkGather(metal::MetalBackend &backend) {
                         contents<uint16_t>(attention)[staged],
                     "the gather moved an attention row elsewhere or changed it");
           }
-      if (!lanesOfEight || read != ops::AttentionRows::Every) continue;
+      if (!lanesOfEight || read != ops::AttentionOutput::Every) continue;
       const ops::LinearScratch scratch{
           zeroed(backend, ops::tableBytes(width, rows)),
           zeroed(backend, ops::tableSumsBytes(ops::LinearInput::Table16, width, rows)), {}, {}};
@@ -1014,7 +1036,8 @@ void checkGather(metal::MetalBackend &backend) {
       const metal::MetalBuffer tabled = zeroed(backend, hidden.sizeBytes());
       metal::CommandGraph tableGraph;
       const ops::PreparedInput prepared = ops::PagedAttention::addGate(
-          tableGraph, {}, staging, tabled, sequences, read, kQueryHeads, layout, scratch, ops::LinearInput::Table16);
+          tableGraph, {}, staging, tabled, sequences, command, read, kQueryHeads, layout, scratch,
+          ops::LinearInput::Table16);
       require(prepared.layout == ops::LinearInput::Table16 &&
                   tableGraph.dispatches()[0].pipelineName == "attention_gather_table16_kv4_g8_d128",
               "the table gather reported no table");

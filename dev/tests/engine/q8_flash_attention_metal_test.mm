@@ -270,9 +270,8 @@ Case makeCase(id<MTLDevice> device, Shape shape, uint32_t committed,
   result.pageTableBuffer = makeBuffer(device, pages * sizeof(SplashKvPage));
   result.pool->writeTable(result.pageTable, result.pageTableBuffer.contents);
   result.params = {.committed_tokens = committed,
-                   .rows = activeRows,
-                   .first_row = 0,
-                   .row_begin = 0,
+                   .row_bound = activeRows,
+                   .layout_row = 0,
                    .stage_row = 0,
                    .chunk_stride = kStride,
                    .page_table_entries = pages,
@@ -290,7 +289,7 @@ Case makeCase(id<MTLDevice> device, Shape shape, uint32_t committed,
 // The same pages and queries in one extent.
 Case oneExtentCopy(id<MTLDevice> device, const Case &data) {
   Case result = makeCase(device, data.shape, data.params.committed_tokens,
-                         data.params.rows, data.params.split_count, true);
+                         data.params.row_bound, data.params.split_count, true);
   const Layout layout = data.shape.layout();
   const uint64_t dataBytes = layout.dataBytesPerLayerPage();
   const uint64_t scaleBytes = layout.scaleBytesPerLayerPage();
@@ -317,11 +316,11 @@ constexpr uint32_t kQsaJunkLists = 3;
 // rows' history that one of them attends, with their bits.
 std::vector<uint32_t> blockList(const Case &data) {
   constexpr uint32_t kBlockTokens = SPLASH_ATTENTION_BLOCK_TOKENS;
-  const uint32_t history = (data.params.committed_tokens + data.params.rows + kBlockTokens - 1) / kBlockTokens;
+  const uint32_t history = (data.params.committed_tokens + data.params.row_bound + kBlockTokens - 1) / kBlockTokens;
   std::vector<uint32_t> result;
   for (uint32_t block = 0; block < history; ++block) {
     uint32_t rows = 0;
-    for (uint32_t row = 0; row < data.params.rows; ++row)
+    for (uint32_t row = 0; row < data.params.row_bound; ++row)
       rows |= uint32_t(data.attends(row, block * kBlockTokens)) << row;
     if (rows) result.push_back(block << SPLASH_ATTENTION_BLOCK_ROW_BITS | rows);
   }
@@ -340,7 +339,7 @@ struct BlockLists {
 BlockLists qsaBlockLists(id<MTLDevice> device, const Case &data, uint32_t copies) {
   const std::vector<uint32_t> list = blockList(data);
   constexpr uint32_t kBlockTokens = SPLASH_ATTENTION_BLOCK_TOKENS;
-  const uint32_t history = (data.params.committed_tokens + data.params.rows + kBlockTokens - 1) / kBlockTokens;
+  const uint32_t history = (data.params.committed_tokens + data.params.row_bound + kBlockTokens - 1) / kBlockTokens;
   const uint32_t total = copies + 2 * kQsaJunkLists;
   BlockLists result{makeBuffer(device, uint64_t{total} * history * 4), makeBuffer(device, total * 4), history};
   auto *entries = static_cast<uint32_t *>(result.lists.contents);
@@ -367,10 +366,10 @@ BlockLists qsaBlockLists(id<MTLDevice> device, const Case &data, uint32_t copies
 void setQsaMask(Case &data) {
   constexpr uint32_t kBlockTokens = SPLASH_ATTENTION_BLOCK_TOKENS;
   constexpr uint32_t kPageBlocks = kPageTokens / kBlockTokens;
-  const uint32_t visible = data.params.committed_tokens + data.params.rows;
+  const uint32_t visible = data.params.committed_tokens + data.params.row_bound;
   data.maskWords = visible / kBlockTokens / 32 + 2;
-  data.mask.assign(uint64_t{data.params.rows} * data.maskWords, 0u);
-  for (uint32_t row = 0; row < data.params.rows; ++row) {
+  data.mask.assign(uint64_t{data.params.row_bound} * data.maskWords, 0u);
+  for (uint32_t row = 0; row < data.params.row_bound; ++row) {
     uint32_t *bits = data.mask.data() + uint64_t{row} * data.maskWords;
     const uint32_t complete = (data.params.committed_tokens + row + 1) / kBlockTokens;
     for (uint32_t block = 0; block <= complete; ++block) {
@@ -393,7 +392,7 @@ void fill(Case &data) {
   std::vector<float> pageKeys;
   std::vector<float> pageValues;
   auto quantized = std::make_unique<Q8LayerPage>();
-  uint32_t visibleTokens = data.params.committed_tokens + data.params.rows;
+  uint32_t visibleTokens = data.params.committed_tokens + data.params.row_bound;
   uint32_t visiblePages = (visibleTokens + kPageTokens - 1) / kPageTokens;
   for (uint32_t logicalPage = 0; logicalPage < visiblePages; ++logicalPage) {
     uint32_t valid =
@@ -431,7 +430,7 @@ void fill(Case &data) {
 
   auto *queries = static_cast<BFloat16Bits *>(data.queries.contents);
   for (uint32_t head = 0; head < shape.queryHeads(); ++head)
-    for (uint32_t row = 0; row < data.params.rows; ++row)
+    for (uint32_t row = 0; row < data.params.row_bound; ++row)
       for (uint32_t dimension = 0; dimension < kHeadDimension; ++dimension)
         queries[data.queryIndex(head, row, dimension)] =
             floatToBFloat16(queryPattern(data.queryRow(row), head, dimension));
@@ -470,7 +469,7 @@ std::vector<BFloat16Bits> cpuReference(const Case &data, bool quantized) {
       static_cast<const BFloat16Bits *>(data.queries.contents);
   for (uint32_t queryHead = 0; queryHead < shape.queryHeads(); ++queryHead) {
     uint32_t kvHead = queryHead / shape.queryHeadsPerKvHead;
-    for (uint32_t row = 0; row < data.params.rows; ++row) {
+    for (uint32_t row = 0; row < data.params.row_bound; ++row) {
       uint32_t visible = data.params.committed_tokens + row + 1;
       std::vector<double> weights(visible);
       double maximum = -std::numeric_limits<double>::infinity();
@@ -577,22 +576,25 @@ Dispatch dispatch(id<MTLDevice> device, id<MTLCommandQueue> queue,
   // masks, at its rows.
   id<MTLBuffer> tree = partials, rowMasks = partials;
   if (!data.tree.empty()) {
-    tree = makeBuffer(device, uint64_t{width} * data.params.rows * sizeof(SplashTreeRow));
+    tree = makeBuffer(device, uint64_t{width} * data.params.row_bound * sizeof(SplashTreeRow));
     for (uint32_t lane = 0; lane < width; ++lane)
-      std::copy(data.tree.begin(), data.tree.end(), static_cast<SplashTreeRow *>(tree.contents) + lane * data.params.rows);
+      std::copy(data.tree.begin(), data.tree.end(), static_cast<SplashTreeRow *>(tree.contents) + lane * data.params.row_bound);
   }
   if (!data.rowMasks.empty()) {
-    rowMasks = makeBuffer(device, uint64_t{width} * data.params.rows * sizeof(uint32_t));
+    rowMasks = makeBuffer(device, uint64_t{width} * data.params.row_bound * sizeof(uint32_t));
     for (uint32_t lane = 0; lane < width; ++lane)
-      std::copy(data.rowMasks.begin(), data.rowMasks.end(), static_cast<uint32_t *>(rowMasks.contents) + lane * data.params.rows);
+      std::copy(data.rowMasks.begin(), data.rowMasks.end(),
+                static_cast<uint32_t *>(rowMasks.contents) + lane * data.params.row_bound);
   }
-  SplashAttentionParams params{.sequences = width, .rows = width * data.params.rows, .tiles = width,
-                               .trees = data.tree.empty() ? 0U : 1U,
+  SplashAttentionParams params{.sequences = width, .first_sequence = 0, .rows = width * data.params.row_bound,
+                               .tiles = width, .trees = data.tree.empty() ? 0U : 1U, .last_rows = 0,
                                .kv = data.pool->layer(kLayer), .sequence = {}};
+  // Each lane's rows of the command, after the lanes before it.
+  id<MTLBuffer> layout = makeBuffer(device, width * sizeof(SplashLaneRows));
   for (uint32_t lane = 0; lane < width; ++lane) {
+    static_cast<SplashLaneRows *>(layout.contents)[lane] = {lane * data.params.row_bound, data.params.row_bound};
     SplashAttentionSequence &sequence = params.sequence[lane];
     sequence = data.params;
-    sequence.first_row = sequence.row_begin = lane * data.params.rows;
     sequence.stage_row = lane * shape.kvHeads * kStride;
     sequence.first_tile = lane;
     sequence.first_slot = lane * shape.kvHeads * splits;
@@ -608,11 +610,12 @@ Dispatch dispatch(id<MTLDevice> device, id<MTLCommandQueue> queue,
   for (uint32_t index = 3; index < 7; ++index)
     [encoder setBuffer:data.pageTableBuffer offset:0 atIndex:index];
   // A split binds the tree rows, or without them another buffer of the
-  // dispatch, and a sparse split the lists, their counts and the row masks,
-  // or without lists another buffer of the dispatch, of which it reads
-  // nothing.
+  // dispatch, then the layout, and a sparse split the lists, their counts and
+  // the row masks, or without lists another buffer of the dispatch, of which
+  // it reads nothing.
   [encoder setBuffer:tree offset:0 atIndex:7];
-  NSUInteger paramsIndex = 8;
+  [encoder setBuffer:layout offset:0 atIndex:8];
+  NSUInteger paramsIndex = 9;
   if (shape.sparse()) {
     [encoder setBuffer:blocks.lists offset:0 atIndex:paramsIndex++];
     [encoder setBuffer:blocks.counts offset:0 atIndex:paramsIndex++];
@@ -630,7 +633,8 @@ Dispatch dispatch(id<MTLDevice> device, id<MTLCommandQueue> queue,
   [encoder setBuffer:partials offset:0 atIndex:0];
   [encoder setBuffer:statistics offset:0 atIndex:1];
   [encoder setBuffer:output offset:0 atIndex:2];
-  paramsIndex = 3;
+  [encoder setBuffer:layout offset:0 atIndex:3];
+  paramsIndex = 4;
   if (shape.sparse())
     [encoder setBuffer:blocks.counts offset:0 atIndex:paramsIndex++];
   [encoder setBytes:&params length:sizeof(params) atIndex:paramsIndex];
@@ -650,7 +654,7 @@ void checkOutput(const Case &data, uint32_t width,
                  const std::vector<uint8_t> &outputBytes, bool qualityGate,
                  const std::string &label) {
   const Shape shape = data.shape;
-  const uint32_t activeRows = data.params.rows;
+  const uint32_t activeRows = data.params.row_bound;
   const auto *actual =
       reinterpret_cast<const BFloat16Bits *>(outputBytes.data());
   const uint64_t laneElements = expectedQ8.size();
@@ -778,7 +782,7 @@ void requireIdentical(const std::string &pipeline, const Case &data,
               << pipeline << " kv_heads=" << data.shape.kvHeads
               << " group=" << data.shape.queryHeadsPerKvHead
               << " committed=" << data.params.committed_tokens
-              << " active_rows=" << data.params.rows
+              << " active_rows=" << data.params.row_bound
               << " lanes=" << width
               << " splits=" << data.params.split_count << " buffer=" << buffer.name
               << " first_differing_element=" << element << " first=" << value(left)
@@ -830,10 +834,10 @@ void treeAgainstChains(id<MTLDevice> device, id<MTLCommandQueue> queue, const Pi
   };
   // A case's bitmaps and row masks, row r taking tree row of[r]'s selection.
   const auto setMasks = [&](Case &data, const std::vector<uint32_t> &of) {
-    data.maskWords = (data.params.committed_tokens + data.params.rows) / kBlockTokens / 32 + 2;
-    data.mask.assign(uint64_t{data.params.rows} * data.maskWords, 0u);
-    data.rowMasks.assign(data.params.rows, 0u);
-    for (uint32_t r = 0; r < data.params.rows; ++r) {
+    data.maskWords = (data.params.committed_tokens + data.params.row_bound) / kBlockTokens / 32 + 2;
+    data.mask.assign(uint64_t{data.params.row_bound} * data.maskWords, 0u);
+    data.rowMasks.assign(data.params.row_bound, 0u);
+    for (uint32_t r = 0; r < data.params.row_bound; ++r) {
       uint32_t *bits = data.mask.data() + uint64_t{r} * data.maskWords;
       for (uint32_t block = 0; block < history; ++block)
         if (selects(of[r], block)) bits[block / 32] |= 1u << (block % 32);
@@ -965,6 +969,8 @@ void checkReduce(id<MTLDevice> device, id<MTLCommandQueue> queue,
   // The merge of the partials into a poisoned output; a sparse reduce without
   // lists binds another buffer of the dispatch for their counts, of which it
   // reads nothing.
+  id<MTLBuffer> layout = makeBuffer(device, sizeof(SplashLaneRows));
+  *static_cast<SplashLaneRows *>(layout.contents) = {0, activeRows};
   const auto reduce = [&](const SplashAttentionParams &params) {
     id<MTLBuffer> output = makeBuffer(device, uint64_t{shape.kvHeads} * kStride *
                                                  shape.queryHeadsPerKvHead * d * 2);
@@ -975,7 +981,8 @@ void checkReduce(id<MTLDevice> device, id<MTLCommandQueue> queue,
     [encoder setBuffer:partials offset:0 atIndex:0];
     [encoder setBuffer:stats offset:0 atIndex:1];
     [encoder setBuffer:output offset:0 atIndex:2];
-    NSUInteger paramsIndex = 3;
+    [encoder setBuffer:layout offset:0 atIndex:3];
+    NSUInteger paramsIndex = 4;
     if (shape.sparse())
       [encoder setBuffer:partials offset:0 atIndex:paramsIndex++];
     [encoder setBytes:&params length:sizeof(params) atIndex:paramsIndex];
@@ -1030,12 +1037,11 @@ void checkReduce(id<MTLDevice> device, id<MTLCommandQueue> queue,
   const uint32_t splitTokens = shape.sparse() ? SPLASH_SPARSE_SPLIT_BLOCKS * SPLASH_ATTENTION_BLOCK_TOKENS : 32;
   const uint32_t committed = splits * splitTokens - activeRows;
   const uint32_t pages = splits * splitTokens / 32;
-  SplashAttentionParams params{.sequences = 1, .rows = activeRows, .tiles = 1, .trees = 0, .kv = {1, 0},
-                               .sequence = {}};
+  SplashAttentionParams params{.sequences = 1, .first_sequence = 0, .rows = activeRows, .tiles = 1, .trees = 0,
+                               .last_rows = 0, .kv = {1, 0}, .sequence = {}};
   params.sequence[0] = {.committed_tokens = committed,
-                        .rows = activeRows,
-                        .first_row = 0,
-                        .row_begin = 0,
+                        .row_bound = activeRows,
+                        .layout_row = 0,
                         .stage_row = 0,
                         .chunk_stride = kStride,
                         .page_table_entries = pages,

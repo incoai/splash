@@ -108,6 +108,7 @@ prefillTensorBytes(const RuntimeGeometry &geometry,
   put(PrefillTensor::TargetPositions,
       bytesFor<uint32_t>(uint64_t{kPrefillRows} * 3));
   put(PrefillTensor::DraftPositions, bytesFor<uint32_t>(kPrefillRows));
+  put(PrefillTensor::LaneLayout, bytesFor<SplashLaneRows>(kLaneCount));
   put(PrefillTensor::TargetInverseFrequencies,
       bytesFor<float>(geometry.target.rotaryPairs));
   put(PrefillTensor::DraftInverseFrequencies,

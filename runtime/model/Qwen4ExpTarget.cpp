@@ -241,11 +241,11 @@ std::vector<ops::AttentionBlocks> Qwen4ExpTarget::addPrefillQsa(PrefillStep &ste
     ops::BlockIndexer::addSelect(step.graph, u16Rows(h.qsaQueries, sequence, queryWidth), h.qsaScores, h.scoreRows,
                                  rowsOf<uint32_t>(h.qsaMask, sequence.rowBegin, sequence.rows, h.maskWords), rows);
     blocks[index] = {h.qsaLists, h.qsaListCounts, h.listStride, lists};
-    sparseRows.push_back({sequence.rowBegin, sequence.rows, rows.firstPosition, lists});
+    sparseRows.push_back({static_cast<uint32_t>(index), sequence.rows, rows.firstPosition, lists});
     lists += step.attention->sequences()[index].tiles();
   }
   if (!sparseRows.empty())
-    ops::PagedAttention::addBlockLists(step.graph, h.qsaMask, h.maskWords, sparseRows,
+    ops::PagedAttention::addBlockLists(step.graph, h.qsaMask, h.maskWords, sparseRows, {b.laneRows, step.rows},
                                        {h.qsaLists, h.qsaListCounts, h.listStride, 0});
   return blocks;
 }
@@ -340,9 +340,9 @@ ops::AttentionBlocks Qwen4ExpTarget::addVerifyQsa(VerifyStep &step, const Qwen4I
                                    rowsOf<uint32_t>(h.qsaMask, 0, step.rows, h.maskWords), rowMasks, tree);
   std::array<ops::BlockListRows, ExecutionLimits::maximumBatchWidth> laneLists{};
   for (uint32_t lane = 0; lane < step.lanes; ++lane)
-    laneLists[lane] = {lane * kVerifyRows, kVerifyRows, firstPositions[lane], lane};
+    laneLists[lane] = {lane, kVerifyRows, firstPositions[lane], lane};
   ops::PagedAttention::addBlockLists(step.graph, h.qsaMask, h.maskWords, std::span(laneLists).first(step.lanes),
-                                     blocks);
+                                     {b.laneRows, step.rows}, blocks);
   return blocks;
 }
 

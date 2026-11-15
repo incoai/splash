@@ -447,8 +447,8 @@ metal::CommandGraph caseGraph(const AttentionFixture &fixture, const QsaBlocks &
   if (qsa.words) {
     std::vector<BlockListRows> sequences;
     for (uint32_t lane = 0; lane < plan.lanes; ++lane)
-      sequences.push_back({lane * plan.rows, plan.rows, plan.histories[lane], lane * kv::attentionTiles(plan.rows)});
-    PagedAttention::addBlockLists(graph, qsa.bitmaps, qsa.words, sequences, qsa.blocks);
+      sequences.push_back({lane, plan.rows, plan.histories[lane], lane * kv::attentionTiles(plan.rows)});
+    PagedAttention::addBlockLists(graph, qsa.bitmaps, qsa.words, sequences, fixture.rows(), qsa.blocks);
   }
   fixture.addGraph(graph, fixture.attentionPlan(plans), qsa.blocks);
   return graph;

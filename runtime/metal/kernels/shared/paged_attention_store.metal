@@ -16,14 +16,16 @@
 #define SPLASH_STORE_MAXIMA_bfloat(HeadDim) threadgroup float *maxima = nullptr;
 
 // One lane per dimension stores row `row` of a sequence's staged keys or
-// values, KV head `head`, in its final page slot. INT8 derives a per-row
-// scale; BF16 copies the original bits. Slots are addressed inside the head's
-// slab of the page: the page index functions at page zero and head zero.
+// values, KV head `head`, in its page slot, if the sequence holds the row
+// (`live`, of its layout entry, which the loads within its bound do not wait
+// for). INT8 derives a per-row scale; BF16 copies the original bits. Slots
+// are addressed inside the head's slab of the page: the page index functions
+// at page zero and head zero.
 template <uint KVHeads, uint HeadDim, typename CacheElement, bool ValuesTokenMajor>
 __attribute__((always_inline)) inline void splash_store_kv_row(
     device const bfloat *chunk_keys, device const bfloat *chunk_values, device const SplashKvPage *page_table,
     constant SplashAttentionSequence &sequence, SplashKvLayer kv, threadgroup float *maxima, bool value_tensor,
-    uint head, uint row, uint dimension, uint simd_lane, uint simd_group) {
+    uint head, uint row, bool live, uint dimension, uint simd_lane, uint simd_group) {
   const uint logical_token = sequence.committed_tokens + row;
   const SplashKvPage page = page_table[logical_token / SplashKvPageTokens];
   const SplashKvPageTensors<CacheElement> slab =
@@ -35,6 +37,8 @@ __attribute__((always_inline)) inline void splash_store_kv_row(
       value_tensor
           ? chunk_values[staged + (ulong(head) * HeadDim + dimension) * sequence.chunk_stride + row]
           : chunk_keys[staged + (ulong(head) * sequence.chunk_stride + row) * HeadDim + dimension];
+  if (!live)
+    return;
 
   if constexpr (is_same<CacheElement, bfloat>::value) {
     if (value_tensor)
@@ -77,29 +81,27 @@ __attribute__((always_inline)) inline void splash_store_kv_row(
   }
 }
 
-// A threadgroup of HeadDim threads stores one row of one KV head: the keys'
-// rows first, then the values', each KV head by KV head over the dispatch's
-// rows. A row's sequence names its page table among the bindings.
+// A threadgroup of HeadDim threads stores one row of one KV head: group
+// (tensor and KV head, row, sequence) takes the keys' heads first, then the
+// values', of row `row` of the dispatch's sequence, which names its page
+// table among the bindings; a row past the sequence's rows (its layout
+// entry's) writes nothing.
 template <uint KVHeads, uint HeadDim, typename CacheElement, bool ValuesTokenMajor>
 inline void splash_store_phase(device const bfloat *chunk_keys, device const bfloat *chunk_values,
                                device const SplashKvPage *page_table0, device const SplashKvPage *page_table1,
                                device const SplashKvPage *page_table2, device const SplashKvPage *page_table3,
-                               constant SplashAttentionParams &params, threadgroup float *maxima, uint group,
-                               uint thread_index, uint simd_lane, uint simd_group) {
-  const uint rows = params.rows * KVHeads;
-  if (group >= 2 * rows || thread_index >= HeadDim)
-    return;
-  const bool value_tensor = group >= rows;
-  const uint head_row = value_tensor ? group - rows : group;
-  const uint row = head_row % params.rows;
-  const uint s = splash_attention_sequence_of_row(params, row);
+                               device const SplashLaneRows *layout, constant SplashAttentionParams &params,
+                               threadgroup float *maxima, uint3 group, uint thread_index, uint simd_lane,
+                               uint simd_group) {
+  const uint row = group.y, s = group.z;
   constant SplashAttentionSequence &sequence = params.sequence[s];
-  if (!splash_attention_rows_valid(params, sequence) || row - sequence.first_row >= sequence.rows)
+  if (group.x >= 2 * KVHeads || thread_index >= HeadDim || !splash_attention_rows_valid(params, sequence) ||
+      row >= sequence.row_bound)
     return;
   splash_store_kv_row<KVHeads, HeadDim, CacheElement, ValuesTokenMajor>(
       chunk_keys, chunk_values, SPLASH_LANE_BINDING(s, page_table0, page_table1, page_table2, page_table3),
-      sequence, params.kv, maxima, value_tensor, head_row / params.rows, row - sequence.first_row, thread_index,
-      simd_lane, simd_group);
+      sequence, params.kv, maxima, group.x >= KVHeads, group.x % KVHeads, row,
+      row < splash_attention_rows(layout, params, s).rows, thread_index, simd_lane, simd_group);
 }
 
 #define PAGED_ATTENTION_STORE(Name, Heads, HeadDim, CacheElement, ValuesTokenMajor)                              \
@@ -108,15 +110,16 @@ inline void splash_store_phase(device const bfloat *chunk_keys, device const bfl
                    device const SplashKvPage *page_table1 [[buffer(3)]],                                         \
                    device const SplashKvPage *page_table2 [[buffer(4)]],                                         \
                    device const SplashKvPage *page_table3 [[buffer(5)]],                                         \
-                   constant SplashAttentionParams &params [[buffer(6)]],                                         \
-                   uint group [[threadgroup_position_in_grid]],                                                  \
+                   device const SplashLaneRows *layout [[buffer(6)]],                                            \
+                   constant SplashAttentionParams &params [[buffer(7)]],                                         \
+                   uint3 group [[threadgroup_position_in_grid]],                                                 \
                    uint thread_index [[thread_index_in_threadgroup]],                                            \
                    uint simd_lane [[thread_index_in_simdgroup]],                                                 \
                    uint simd_group [[simdgroup_index_in_threadgroup]]) {                                         \
     SPLASH_STORE_MAXIMA_##CacheElement(HeadDim)                                                                  \
     splash_store_phase<Heads, HeadDim, CacheElement, ValuesTokenMajor>(                                          \
-        chunk_keys, chunk_values, page_table0, page_table1, page_table2, page_table3, params, maxima, group,     \
-        thread_index, simd_lane, simd_group);                                                                    \
+        chunk_keys, chunk_values, page_table0, page_table1, page_table2, page_table3, layout, params, maxima,    \
+        group, thread_index, simd_lane, simd_group);                                                             \
   }
 PAGED_ATTENTION_STORE(attention_q8_store, 4, 256, int8_t, false)
 PAGED_ATTENTION_STORE(attention_q8_store_kv2_g8, 2, 256, int8_t, false)

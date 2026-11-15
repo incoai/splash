@@ -67,9 +67,11 @@ struct AttentionFixturePlan final {
   static constexpr uint32_t kMaximumLanes = SPLASH_MAXIMUM_BATCH_WIDTH;
   static constexpr uint64_t kAlignment = 16 * 1024;
   // Sinks: an F32 per query head, which a geometry with learned sinks adds.
-  // Table0 is lane 0's page table; every other lane's follows it.
+  // Layout: each lane's rows of the command (SplashLaneRows,
+  // ops::AttentionRows). Table0 is lane 0's page table; every other lane's
+  // follows it.
   enum class Tensor : uint32_t {
-    ChunkKeys, ChunkValues, Queries, Output, Partials, Statistics, Sinks,
+    ChunkKeys, ChunkValues, Queries, Output, Partials, Statistics, Sinks, Layout,
     Table0, Count = Table0 + kMaximumLanes
   };
   using Histories = std::array<uint32_t, kMaximumLanes>;
@@ -156,6 +158,7 @@ struct AttentionFixturePlan final {
     plan.size(Tensor::Partials, scratch.partialsBytes);
     plan.size(Tensor::Statistics, scratch.statisticsBytes);
     plan.size(Tensor::Sinks, uint64_t{shape.queryHeads} * sizeof(float));
+    plan.size(Tensor::Layout, uint64_t{kMaximumLanes} * sizeof(SplashLaneRows));
     plan.bytes = aligned(plan.poolBytes);
     for (uint64_t size : plan.sizes) {
       const uint64_t allocation = aligned(size);
@@ -226,11 +229,13 @@ public:
       tables_[lane] = tables_[0];
   }
 
-  // Zeroes the allocation, then writes the page tables, every lane's
-  // history, chunk and queries. Long histories consult `stop` every 256
-  // tokens; false when it stopped the fill.
+  // Zeroes the allocation, then writes the page tables, the lanes' layout,
+  // every lane's history, chunk and queries. Long histories consult `stop`
+  // every 256 tokens; false when it stopped the fill.
   bool fill(const std::function<bool()> &stop = {}) {
     std::memset(base_.contents(), 0, plan_.bytes);
+    auto *layout = data<SplashLaneRows>(Tensor::Layout);
+    for (uint32_t lane = 0; lane < plan_.lanes; ++lane) layout[lane] = {lane * plan_.rows, plan_.rows};
     auto *chunkKeys = data<uint16_t>(Tensor::ChunkKeys);
     auto *chunkValues = data<uint16_t>(Tensor::ChunkValues);
     auto *queries = data<uint16_t>(Tensor::Queries);
@@ -298,6 +303,10 @@ public:
                                                       plan_.pages[lane]);
     return chunks;
   }
+  // The command's rows: each lane's rows after the lanes before it.
+  [[nodiscard]] ops::AttentionRows rows() const {
+    return {buffer(Tensor::Layout), plan_.lanes * plan_.rows};
+  }
   // The workspace the fixture holds, which a plan's dispatches must fit.
   [[nodiscard]] ops::AttentionWorkspace workspace() const noexcept {
     return {plan_.sizes[static_cast<size_t>(Tensor::Partials)], plan_.sizes[static_cast<size_t>(Tensor::Statistics)]};
@@ -319,7 +328,7 @@ public:
     const std::span<const kv::ChunkedPrefillParams> lanes = std::span(chunks).first(plan_.lanes);
     const ops::AttentionStaging staging{buffer(Tensor::Queries), buffer(Tensor::ChunkKeys),
                                         buffer(Tensor::ChunkValues), buffer(Tensor::Output)};
-    ops::PagedAttention::addStore(graph, layer_, staging, std::span(tables_).first(plan_.lanes), lanes,
+    ops::PagedAttention::addStore(graph, layer_, staging, std::span(tables_).first(plan_.lanes), lanes, rows(),
                                   plan_.layout());
     std::array<ops::AttentionHistory, AttentionFixturePlan::kMaximumLanes> histories{};
     for (uint32_t lane = 0; lane < plan_.lanes; ++lane) {
@@ -328,7 +337,7 @@ public:
     }
     ops::PagedAttention::addAttention(graph, attention, staging, buffer(Tensor::Partials),
                                       buffer(Tensor::Statistics), lanes, std::span(histories).first(plan_.lanes),
-                                      sinks(attention.sinks));
+                                      rows(), sinks(attention.sinks));
   }
 
   [[nodiscard]] const AttentionFixturePlan &plan() const noexcept { return plan_; }

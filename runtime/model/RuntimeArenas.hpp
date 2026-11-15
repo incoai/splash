@@ -369,6 +369,9 @@ enum class PrefillTensor : uint32_t {
   // A prefill group's scratch GDN cell, which carries the state from a chunk
   // to the next when the lane's cells cannot (Runtime's prefill groups).
   GroupCell,
+  // Each sequence's rows of the chunk (SplashLaneRows), which the host
+  // writes and the attention layers read (ops::AttentionRows).
+  LaneLayout,
   Count,
 };
 
@@ -384,6 +387,7 @@ constexpr uint32_t prefillTensorCount =
 [[nodiscard]] constexpr bool prefillGroupTensor(PrefillTensor tensor) noexcept {
   switch (tensor) {
   case PrefillTensor::InputTokens:
+  case PrefillTensor::LaneLayout:
   case PrefillTensor::TargetPositions:
   case PrefillTensor::Captured:
   case PrefillTensor::DraftPositions:

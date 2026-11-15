@@ -272,6 +272,9 @@ struct QwenTargetPrefillBuffers final {
   metal::MetalBuffer ropeInverseFrequencies;
   metal::MetalBuffer chunkKeys;
   metal::MetalBuffer chunkValues;
+  // Each sequence's rows of the chunk (SplashLaneRows), as the host writes
+  // them, which the attention layers read (ops::AttentionRows).
+  metal::MetalBuffer laneRows;
   ops::MoeScratch moe;
 
   // The dense FFN's buffers among these.

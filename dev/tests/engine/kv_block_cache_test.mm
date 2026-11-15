@@ -108,7 +108,8 @@ std::vector<std::vector<uint32_t>> resolve(MetalBackend &backend, KvBlockCache &
   const MetalBuffer masks = test::sharedBuffer(backend, lanes.size() * kRows * words * sizeof(uint32_t)),
                     lists = test::sharedBuffer(backend, entries * sizeof(uint32_t)),
                     counts = test::sharedBuffer(backend, lanes.size() * sizeof(uint32_t)),
-                    locations = test::sharedBuffer(backend, entries * sizeof(uint32_t));
+                    locations = test::sharedBuffer(backend, entries * sizeof(uint32_t)),
+                    layout = test::sharedBuffer(backend, lanes.size() * sizeof(SplashLaneRows));
   std::memset(masks.contents(), 0, masks.sizeBytes());
   std::memset(locations.contents(), 0xfe, locations.sizeBytes());
   std::vector<ops::BlockListRows> sequences;
@@ -116,11 +117,13 @@ std::vector<std::vector<uint32_t>> resolve(MetalBackend &backend, KvBlockCache &
     for (uint32_t row = 0; row < kRows; ++row)
       for (const uint32_t block : blocks[lane])
         static_cast<uint32_t *>(masks.contents())[(lane * kRows + row) * words + block / 32] |= 1u << (block % 32);
-    sequences.push_back({lane * kRows, kRows, history, lane});
+    static_cast<SplashLaneRows *>(layout.contents())[lane] = {lane * kRows, kRows};
+    sequences.push_back({lane, kRows, history, lane});
   }
   metal::CommandGraph graph;
   const ops::AttentionBlocks lanesBlocks{lists, counts, stride, 0};
-  ops::PagedAttention::addBlockLists(graph, masks, words, sequences, lanesBlocks);
+  ops::PagedAttention::addBlockLists(graph, masks, words, sequences,
+                                     {layout, static_cast<uint32_t>(lanes.size()) * kRows}, lanesBlocks);
   const ops::AttentionBlocks located = cache.addResolve(graph, layer, lanes, lanesBlocks, locations, stats);
   require(located.locations.sameView(locations) && located.locationPages && located.lists.sameView(lists) &&
               located.stride == stride,
@@ -602,14 +605,14 @@ template <typename T> void attendsThroughLocations(MetalBackend &backend, kv::Fo
           bits[block / 32] |= 1u << (block % 32);
       }
     }
-    sequences.push_back({lane * kRows, kRows, histories[lane], lane});
+    sequences.push_back({lane, kRows, histories[lane], lane});
   }
   const uint32_t stride = visible / kTokens + 1;
   const ops::AttentionBlocks blocks{test::sharedBuffer(backend, uint64_t{lanes} * stride * sizeof(uint32_t)),
                                     test::sharedBuffer(backend, lanes * sizeof(uint32_t)), stride, 0};
   const auto attend = [&](KvBlockCache *cache, const Lanes &sources, const std::shared_ptr<KvReadStats> &stats) {
     metal::CommandGraph graph;
-    ops::PagedAttention::addBlockLists(graph, masks, words, sequences, blocks);
+    ops::PagedAttention::addBlockLists(graph, masks, words, sequences, fixture.rows(), blocks);
     const MetalBuffer locations = test::sharedBuffer(backend, uint64_t{lanes} * stride * sizeof(uint32_t));
     fixture.addGraph(graph, verify,
                      cache ? cache->addResolve(graph, kLayer, sources, blocks, locations, stats) : blocks);

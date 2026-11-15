@@ -45,10 +45,11 @@ inline bool splash_attention_contract_valid(constant SplashAttentionParams &para
 // The query tile a threadgroup owns, of one KV head: the offset of its fused
 // rows in the queries and the output, the position of its first row, its
 // active rows, its history splits and the partial slot of its first split.
-// A sequence's tile t holds its rows from t SplashAttentionTileRows on; a
-// tile whose sequence fails the contract, or past its rows, is inactive.
-// Split and reduce entries, dense and sparse, take their tiles from here, so
-// they agree on every offset.
+// A sequence's tile t holds its rows (`rows`, its layout entry's,
+// attention_sequence.h) from t SplashAttentionTileRows on; a tile whose
+// sequence fails the contract, or past its rows (a spare slot of its bound),
+// is inactive. Split and reduce entries, dense and sparse, take their tiles
+// from here, so they agree on every offset.
 struct SplashAttentionTile {
   ulong offset;
   ulong first_slot;
@@ -60,14 +61,15 @@ struct SplashAttentionTile {
 
 template <uint KVHeads, uint QueryHeadsPerKVHead, uint HeadDim>
 inline SplashAttentionTile splash_attention_tile(constant SplashAttentionParams &params,
-                                                 constant SplashAttentionSequence &sequence, uint kv_head, uint tile) {
+                                                 constant SplashAttentionSequence &sequence, SplashAttentionRows rows,
+                                                 uint kv_head, uint tile) {
   const uint start = tile * SplashAttentionTileRows;
-  if (!splash_attention_contract_valid(params, sequence) || kv_head >= KVHeads || start >= sequence.rows)
+  if (!splash_attention_contract_valid(params, sequence) || kv_head >= KVHeads || start >= rows.rows)
     return {};
   return {(ulong(sequence.stage_row) + ulong(kv_head) * sequence.chunk_stride + start) * QueryHeadsPerKVHead *
               HeadDim,
           ulong(sequence.first_slot) + (ulong(tile) * KVHeads + kv_head) * sequence.split_count,
-          sequence.committed_tokens + start, min(SplashAttentionTileRows, sequence.rows - start),
+          sequence.committed_tokens + start, min(SplashAttentionTileRows, rows.rows - start),
           sequence.split_count, true};
 }
 
@@ -101,13 +103,13 @@ struct SplashAttentionTree {
 };
 
 // The tree of a sequence's tile whose first row is at `first_position`, of
-// the dispatch's tree rows.
+// the command's tree rows (a row each of its packed rows).
 inline SplashAttentionTree splash_attention_tree(constant SplashAttentionParams &params,
-                                                 constant SplashAttentionSequence &sequence,
+                                                 constant SplashAttentionSequence &sequence, SplashAttentionRows rows,
                                                  device const SplashTreeRow *tree, uint first_position) {
   if (!params.trees)
     return {nullptr, 0};
-  return {tree + sequence.row_begin + (first_position - sequence.committed_tokens), sequence.committed_tokens};
+  return {tree + rows.first + (first_position - sequence.committed_tokens), sequence.committed_tokens};
 }
 
 // The position a tile's window starts from: its first row's, or a tree's

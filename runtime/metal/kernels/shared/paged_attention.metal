@@ -4,9 +4,10 @@
 // The page loop (splash_paged_attention_tile) over the tiles of a dispatch's
 // sequences (SplashAttentionParams), each tile SPLASH_ATTENTION_TILE_ROWS
 // query rows of one KV head: a decode step's lanes and a prompt chunk's
-// sequences alike, every sequence in one dispatch. A decode step's split
-// binds its tree rows (SplashAttentionParams::trees); a prompt's binds
-// another buffer of the dispatch in their place, of which it reads nothing.
+// sequences alike, every sequence in one dispatch, its rows those of its
+// entry of the command's layout (`layout`). A decode step's split binds its
+// tree rows (SplashAttentionParams::trees); a prompt's binds another buffer
+// of the dispatch in their place, of which it reads nothing.
 
 // Split: KV heads (and each one's tile parts, splash_attention_tile_part)
 // vary first, then the dispatch's tiles, then history splits. A tile's
@@ -17,8 +18,8 @@ inline void splash_attention_split_phase(
     device bfloat *queries, device float *partials, device float *statistics,
     device const SplashKvPage *page_table0, device const SplashKvPage *page_table1,
     device const SplashKvPage *page_table2, device const SplashKvPage *page_table3,
-    device const SplashTreeRow *tree, constant SplashAttentionParams &params, threadgroup float *scores,
-    threadgroup bfloat *probabilities,
+    device const SplashTreeRow *tree, device const SplashLaneRows *layout, constant SplashAttentionParams &params,
+    threadgroup float *scores, threadgroup bfloat *probabilities,
     threadgroup float *row_max, threadgroup float *row_sum, threadgroup float *previous_scale,
     threadgroup atomic_uint *rescale, uint3 group, uint thread_index) {
   constexpr uint Parts = SPLASH_ATTENTION_TILE_PARTS(QueryHeadsPerKVHead);
@@ -26,9 +27,10 @@ inline void splash_attention_split_phase(
   const uint kv_head = group.x / Parts;
   const uint s = splash_attention_sequence_of_tile(params, group.y);
   constant SplashAttentionSequence &sequence = params.sequence[s];
+  const SplashAttentionRows rows = splash_attention_rows(layout, params, s);
   const SplashAttentionTile tile =
       splash_attention_tile_part<QueryHeadsPerKVHead, SPLASH_ATTENTION_TILE_ROWS, Parts, HeadDim>(
-          splash_attention_tile<KVHeads, QueryHeadsPerKVHead, HeadDim>(params, sequence, kv_head,
+          splash_attention_tile<KVHeads, QueryHeadsPerKVHead, HeadDim>(params, sequence, rows, kv_head,
                                                                       group.y - sequence.first_tile),
           group.x % Parts, sequence.split_count);
   if (!tile.active || split >= tile.splits)
@@ -38,7 +40,7 @@ inline void splash_attention_split_phase(
       queries + tile.offset, SPLASH_LANE_BINDING(s, page_table0, page_table1, page_table2, page_table3),
       params.kv, kv_head, tile.first_position, tile.active_rows, tile.splits, split, partials, statistics,
       tile.first_slot + split, scores, probabilities, row_max, row_sum, previous_scale, rescale,
-      splash_attention_tree(params, sequence, tree, tile.first_position), thread_index);
+      splash_attention_tree(params, sequence, rows, tree, tile.first_position), thread_index);
 }
 
 // Reduce: a threadgroup of HeadDim threads per fused row of a tile, group.z
@@ -47,15 +49,16 @@ inline void splash_attention_split_phase(
 template <uint KVHeads, uint QueryHeadsPerKVHead, uint HeadDim, uint Window, class... Sinks>
 inline void splash_attention_reduce_phase(
     device const float *partials, device const float *statistics,
-    device bfloat *output, constant SplashAttentionParams &params, uint3 group,
+    device bfloat *output, device const SplashLaneRows *layout, constant SplashAttentionParams &params, uint3 group,
     uint thread_index, threadgroup float *weights,
     threadgroup float *group_values, Sinks... sinks) {
   constexpr ushort M = SPLASH_ATTENTION_TILE_ROWS * QueryHeadsPerKVHead;
   constexpr ushort D = HeadDim;
   const uint fused_row = group.y;
-  constant SplashAttentionSequence &sequence = params.sequence[splash_attention_sequence_of_tile(params, group.z)];
+  const uint s = splash_attention_sequence_of_tile(params, group.z);
+  constant SplashAttentionSequence &sequence = params.sequence[s];
   const SplashAttentionTile tile = splash_attention_tile<KVHeads, QueryHeadsPerKVHead, HeadDim>(
-      params, sequence, group.x, group.z - sequence.first_tile);
+      params, sequence, splash_attention_rows(layout, params, s), group.x, group.z - sequence.first_tile);
   if (!tile.active || fused_row >= M || thread_index >= D)
     return;
   splash_attention_reduce_row<QueryHeadsPerKVHead, SPLASH_ATTENTION_TILE_ROWS,
@@ -75,7 +78,8 @@ inline void splash_attention_reduce_phase(
       device const SplashKvPage *page_table2 [[buffer(5)]],                                                   \
       device const SplashKvPage *page_table3 [[buffer(6)]],                                                   \
       device const SplashTreeRow *tree [[buffer(7)]],                                                         \
-      constant SplashAttentionParams &params [[buffer(8)]],                                                   \
+      device const SplashLaneRows *layout [[buffer(8)]],                                                      \
+      constant SplashAttentionParams &params [[buffer(9)]],                                                   \
       uint3 group [[threadgroup_position_in_grid]],                                                           \
       uint thread_index [[thread_index_in_threadgroup]]) {                                                    \
     constexpr uint M = Group * SPLASH_ATTENTION_TILE_ROWS / SPLASH_ATTENTION_TILE_PARTS(Group);               \
@@ -87,8 +91,8 @@ inline void splash_attention_reduce_phase(
     threadgroup float previous_scale[M];                                                                      \
     threadgroup atomic_uint rescale;                                                                          \
     splash_attention_split_phase<Heads, Group, HeadDim, Window, CacheElement, Int8Queries>(                   \
-        queries, partials, statistics, page_table0, page_table1, page_table2, page_table3, tree, params,     \
-        scores, probabilities, row_max, row_sum, previous_scale, &rescale, group, thread_index);              \
+        queries, partials, statistics, page_table0, page_table1, page_table2, page_table3, tree, layout,     \
+        params, scores, probabilities, row_max, row_sum, previous_scale, &rescale, group, thread_index);      \
   }
 
 PAGED_ATTENTION_SPLIT(attention_q8_split, 4, 6, 256, 0, int8_t, false)
@@ -118,30 +122,33 @@ PAGED_ATTENTION_SPLIT(attention_bf16_split_kv4_g8_d128_w512, 4, 8, 128, 512, bfl
       device const float *partials [[buffer(0)]],                                                             \
       device const float *statistics [[buffer(1)]],                                                           \
       device bfloat *output [[buffer(2)]],                                                                    \
-      constant SplashAttentionParams &params [[buffer(3)]],                                                   \
-      uint3 group [[threadgroup_position_in_grid]],                                                           \
-      uint thread_index [[thread_index_in_threadgroup]]) {                                                    \
-    threadgroup float weights[SplashAttentionMaximumSplits];                                                  \
-    threadgroup float group_values[HeadDim / 32];                                                             \
-    splash_attention_reduce_phase<Heads, Group, HeadDim, Window>(partials, statistics, output, params, group, \
-                                                                 thread_index, weights, group_values);        \
-  }
-
-// A reduce with learned sinks binds the layer's, an F32 per query head,
-// before its parameters.
-#define PAGED_ATTENTION_SINK_REDUCE(Name, Heads, Group, HeadDim, Window)                                      \
-  kernel void Name(                                                                                           \
-      device const float *partials [[buffer(0)]],                                                             \
-      device const float *statistics [[buffer(1)]],                                                           \
-      device bfloat *output [[buffer(2)]],                                                                    \
-      device const float *sinks [[buffer(3)]],                                                                \
+      device const SplashLaneRows *layout [[buffer(3)]],                                                      \
       constant SplashAttentionParams &params [[buffer(4)]],                                                   \
       uint3 group [[threadgroup_position_in_grid]],                                                           \
       uint thread_index [[thread_index_in_threadgroup]]) {                                                    \
     threadgroup float weights[SplashAttentionMaximumSplits];                                                  \
     threadgroup float group_values[HeadDim / 32];                                                             \
-    splash_attention_reduce_phase<Heads, Group, HeadDim, Window>(partials, statistics, output, params, group, \
-                                                                 thread_index, weights, group_values, sinks); \
+    splash_attention_reduce_phase<Heads, Group, HeadDim, Window>(partials, statistics, output, layout, params, \
+                                                                 group, thread_index, weights, group_values); \
+  }
+
+// A reduce with learned sinks binds the layer's, an F32 per query head,
+// after the layout.
+#define PAGED_ATTENTION_SINK_REDUCE(Name, Heads, Group, HeadDim, Window)                                      \
+  kernel void Name(                                                                                           \
+      device const float *partials [[buffer(0)]],                                                             \
+      device const float *statistics [[buffer(1)]],                                                           \
+      device bfloat *output [[buffer(2)]],                                                                    \
+      device const SplashLaneRows *layout [[buffer(3)]],                                                      \
+      device const float *sinks [[buffer(4)]],                                                                \
+      constant SplashAttentionParams &params [[buffer(5)]],                                                   \
+      uint3 group [[threadgroup_position_in_grid]],                                                           \
+      uint thread_index [[thread_index_in_threadgroup]]) {                                                    \
+    threadgroup float weights[SplashAttentionMaximumSplits];                                                  \
+    threadgroup float group_values[HeadDim / 32];                                                             \
+    splash_attention_reduce_phase<Heads, Group, HeadDim, Window>(partials, statistics, output, layout, params, \
+                                                                 group, thread_index, weights, group_values, \
+                                                                 sinks);                                      \
   }
 PAGED_ATTENTION_REDUCE(attention_reduce, 4, 6, 256, 0)
 PAGED_ATTENTION_REDUCE(attention_reduce_kv2_g8, 2, 8, 256, 0)

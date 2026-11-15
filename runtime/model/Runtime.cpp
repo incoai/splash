@@ -314,6 +314,7 @@ QwenTargetPrefillBuffers prefillBuffers(const PrefillArena &arena, uint32_t chun
   buffers.captured = arena.get(PrefillTensor::Captured, chunk);
   buffers.denseGateScratch = arena.get(PrefillTensor::GateIntermediate);
   buffers.ropeInverseFrequencies = arena.get(PrefillTensor::TargetInverseFrequencies);
+  buffers.laneRows = arena.get(PrefillTensor::LaneLayout, chunk);
   return buffers;
 }
 
@@ -1825,6 +1826,10 @@ struct Runtime::Impl {
     }
     for (uint32_t c = 0; c < chunks.size(); ++c) {
       PrefillChunk &chunk = chunks[c];
+      // Each sequence's rows of the chunk, which its attention layers read.
+      auto *layout = contents<SplashLaneRows>(prefillArena->get(PrefillTensor::LaneLayout, c), "prompt lane rows");
+      for (size_t s = 0; s < chunk.sequences.size(); ++s)
+        layout[s] = {chunk.sequences[s].rowBegin, chunk.sequences[s].part.tokenCount};
       for (PrefillSequence &sequence : chunk.sequences)
         writePromptRows(*sequence.entry, sequence.part, sequence.rowBegin, c);
       auto *draftPositions =

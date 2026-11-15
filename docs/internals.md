@@ -450,14 +450,14 @@ read the layout on the GPU and take a lane's verify rows alone; the first
 token after a prompt is selected from, and written at, the lane's one row,
 whose layout its selection writes first (`decode_sample_first_rows`), and
 Qwen3.8-Flash-Next's n-gram hash reads it too, hashing a row's n-grams along
-its path; so do the GDN decode and Qwen3.8-Flash-Next's block indexer pool,
-selection and commit. The target's other kernels and the block indexer's
-projection address each lane's rows by the host's `ops::LaneRows` (the
-kernels' per-lane `first_row` and `rows`), so lanes of different row counts
-share one dispatch; a decode step holds eight rows a lane, which the selector
-lays out at lane x 8. A lane's verify block is a tree
-(`metal/abi/VerifyTree.h`, a row's parent, depth and ancestors' mask), which
-the draft's selector writes with
+its path; so do the GDN decode, the target's attention (`ops::AttentionRows`)
+and Qwen3.8-Flash-Next's block indexer pool, selection and commit. The
+target's other kernels and the block indexer's projection address each
+lane's rows by the host's `ops::LaneRows` (the kernels' per-lane `first_row`
+and `rows`), so lanes of different row counts share one dispatch; a decode
+step holds eight rows a lane, which the selector lays out at lane x 8. A
+lane's verify block is a tree (`metal/abi/VerifyTree.h`, a row's parent,
+depth and ancestors' mask), which the draft's selector writes with
 each row's token, its verify input: a row's penalties count the draft tokens
 of its path, a thinking cutoff applies by depth, acceptance follows from the
 anchor the child whose token is its row's selection, and the draft's context
@@ -1048,11 +1048,19 @@ device's plans; `GGUF_MOE_ARGS='repack'` times the repack of streamed experts in
 (`moe_expert_load`, 1 to 32 jobs) and of tensors into an image (`gguf_repack`) in the streamed
 formats, each plane checked bytewise against the reference repack.
 
-Target attention runs once a layer for every sequence of a command, a decode step's lanes of 8
-rows as a prompt chunk's sequences (`ops::PagedAttention`, `SplashAttentionSequence`): one q/k
-projection, one store and one gate over all their rows, each sequence's staged after the one
-before it, and a split and a reduce for each run of sequences whose tiles' splits fit the
-workspace (`ops::AttentionPlan`), each sequence's split count its own rows' and history's. It
+Target attention runs once a layer for every sequence of a command, a decode step's lanes as a
+prompt chunk's sequences (`ops::PagedAttention`, `SplashAttentionSequence`): one q/k projection,
+one store and one gate over all their rows, each sequence's staged after the one before it, and a
+split and a reduce for each run of sequences whose tiles' splits fit the workspace
+(`ops::AttentionPlan`), each sequence's split count its own bound's and history's. Every kernel
+reads a sequence's rows from the command's layout (`ops::AttentionRows`, a `SplashLaneRows` a
+sequence): a prompt chunk's as its host writes them (`PrefillTensor::LaneLayout`), a decode step's
+as its selector writes them on the device (`DecodeTensor::LaneLayout`), each within its bound, its
+chunk's `chunk_tokens` (a prompt sequence's rows, a decode lane's cap), which sizes everything
+the host lays out for it: its staging, page table, tiles of 8 rows, partial slots and lists. The
+per-row kernels (q/k norm and RoPE, store, gate) take a grid of each sequence's rows up to the
+largest bound, a threadgroup reading its sequence's layout entry once, and a row or tile past its
+sequence's rows writes nothing. It
 runs the geometries of `kCompiledAttention` (`runtime/ops/PagedAttention.cpp`):
 query heads over KV heads of a head dimension (`_d128` in the names of 128-wide heads' kernels;
 256 is unnamed) in a value order, each compiled with the variants its layers take, which a layer

@@ -1259,16 +1259,19 @@ void producerTableContract(metal::MetalBackend &backend) {
     const ops::AttentionStaging staging{.rows = allocate(backend, 4 * 32 * 6 * 256 * 2)};
     const metal::MetalBuffer hidden = allocate(backend, kRows * 24 * 256 * 2);
     const std::array lane{PagedAttention::chunkParams(0, kRows, 32, 1)};
+    const metal::MetalBuffer laneRows = allocate(backend, sizeof(SplashLaneRows));
+    *static_cast<SplashLaneRows *>(laneRows.contents()) = {0, kRows};
+    const AttentionRows rows{laneRows, kRows};
     metal::CommandGraph graph;
     rejects(
         [&] {
-          (void)PagedAttention::addGate(graph, packed, staging, hidden, lane, AttentionRows::Every, 24, layout, {},
-                                        LinearInput::Table16);
+          (void)PagedAttention::addGate(graph, packed, staging, hidden, lane, rows, AttentionOutput::Every, 24, layout,
+                                        {}, LinearInput::Table16);
         },
         "linear table buffer holds", "the attention gate wrote a table without scratch");
     require(graph.empty() &&
-                PagedAttention::addGate(graph, packed, staging, hidden, lane, AttentionRows::Every, 24, layout, {},
-                                        LinearInput::Plain)
+                PagedAttention::addGate(graph, packed, staging, hidden, lane, rows, AttentionOutput::Every, 24, layout,
+                                        {}, LinearInput::Plain)
                         .layout == LinearInput::Plain &&
                 plainKernel(graph, "attention_gate"),
             "the attention gate's table contract");

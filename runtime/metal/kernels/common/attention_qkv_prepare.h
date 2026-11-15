@@ -6,39 +6,38 @@
 
 // A threadgroup of HeadDim threads normalizes one head of one row of the
 // packed projection: each query head's queries (and, Gated, its output gate
-// after them), then the K and V heads, over the dispatch's rows
-// (SplashAttentionParams), each read from its sequence's packed row and
-// staged at its sequence's staging rows. q_norm and k_norm are read in their
-// stored type W: bfloat for an MLX target's, float for a GGUF's F32 norms.
-// The pairs of dimensions (i, i + RotaryPairs) then rotate by the packed
-// row's RoPE table row of RotaryPairs pairs, the half split of the first
-// 2 x RotaryPairs dimensions: Qwen3.5's first 64, or with HeadDim / 2 pairs
-// the whole head (NeoX's). With no pairs (NoPE) the head is stored as
-// normalized, and no table is read.
+// after them), then the K and V heads; group (head, row, sequence) takes row
+// `row` of the dispatch's sequence (SplashAttentionParams), read from its
+// packed row (the sequence's layout entry, attention_sequence.h) and staged
+// at the sequence's staging rows, and a row past the sequence's rows returns.
+// q_norm and k_norm are read in their stored type W: bfloat for an MLX
+// target's, float for a GGUF's F32 norms. The pairs of dimensions
+// (i, i + RotaryPairs) then rotate by the packed row's RoPE table row of
+// RotaryPairs pairs, the half split of the first 2 x RotaryPairs dimensions:
+// Qwen3.5's first 64, or with HeadDim / 2 pairs the whole head (NeoX's).
+// With no pairs (NoPE) the head is stored as normalized, and no table is read.
 template <uint QHeads, uint KHeads, uint HeadDim, uint RotaryPairs, bool Gated, class W>
 inline void full_qkv_storage_phase(
     device const bfloat *qkv, device const W *q_norm,
     device const W *k_norm, device const float *rope_cos,
     device const float *rope_sin, device bfloat *queries,
     device bfloat *chunk_keys, device bfloat *chunk_values,
-    constant SplashAttentionParams &params, threadgroup float *reductions,
-    threadgroup bfloat *normalized, uint task, uint thread_index, uint lane,
+    device const SplashLaneRows *layout, constant SplashAttentionParams &params,
+    threadgroup float *reductions, threadgroup bfloat *normalized, uint3 group, uint thread_index, uint lane,
     uint simd_group) {
   static_assert(QHeads % KHeads == 0);
   static_assert(2 * RotaryPairs <= HeadDim, "the rotated pairs are dimensions of the head");
   constexpr uint QStride = Gated ? 2 * HeadDim : HeadDim;
   constexpr uint PackedStride = QHeads * QStride + 2 * KHeads * HeadDim;
   constexpr uint QWidth = QHeads * QStride, KWidth = KHeads * HeadDim;
-  uint query_tasks = params.rows * QHeads;
-  bool query = task < query_tasks;
-  uint local_task = query ? task : task - query_tasks;
-  uint heads = query ? QHeads : KHeads;
-  uint row = local_task / heads;
-  uint head_index = local_task % heads;
-  constant SplashAttentionSequence &sequence = params.sequence[splash_attention_sequence_of_row(params, row)];
-  // The row's place in its sequence's staging and its packed row.
-  uint sequence_row = row - sequence.first_row;
-  ulong packed = ulong(sequence.row_begin) + sequence_row;
+  const uint sequence_row = group.y;
+  const SplashAttentionRows rows = splash_attention_rows(layout, params, group.z);
+  if (sequence_row >= rows.rows)
+    return;
+  constant SplashAttentionSequence &sequence = params.sequence[group.z];
+  const bool query = group.x < QHeads;
+  const uint head_index = query ? group.x : group.x - QHeads;
+  const ulong packed = ulong(rows.first) + sequence_row;
   device const bfloat *source =
       query ? qkv + packed * PackedStride + head_index * QStride
             : qkv + packed * PackedStride + QWidth + head_index * HeadDim;
