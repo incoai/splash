@@ -1712,6 +1712,83 @@ void treeRows(MetalBackend &backend, const GdnShape &shape, bool float32, GdnSta
   std::cout << what << ": " << inexact << " of " << compared << " hidden values off their paths' by rounding\n";
 }
 
+// A 16-row chain is two 8-row steps of the same rows with an fp32 state,
+// bit for bit: the first step's rows are the chain's first eight, the step
+// after it, which folds them in and convolves the next eight over their
+// tape, its last eight, on the 8-row kernels against the 16-row ones; and a
+// step after either, folding what each left pending, leaves the same cells,
+// tape and rows.
+void chainHalves(MetalBackend &backend, const GdnShape &shape, bool float32) {
+  const std::string what = std::string("chain halves vh") + std::to_string(shape.valueHeads) +
+                           (float32 ? " f32 norm" : " bf16 norm");
+  constexpr uint32_t kHalf = kRows / 2;
+  const Cell cell(shape);
+  Fixture whole(backend, shape, kMaxLanes, float32), halves(backend, shape, kMaxLanes, float32);
+  const auto copy = [](const MetalBuffer &from, const MetalBuffer &to) {
+    std::memcpy(to.contents(), from.contents(), from.sizeBytes());
+  };
+  copy(whole.packed, halves.packed);
+  for (uint32_t lane = 0; lane < kMaxLanes; ++lane) copy(whole.current[lane], halves.current[lane]);
+  const uint64_t hiddenRowBytes = uint64_t{shape.valueHeads} * kHeadDim * 2;
+  const uint64_t packedRowBytes = uint64_t{shape.packedWidth} * 2;
+  decodeStep(backend, whole, cell, whole.blocks);
+  // Each lane's first eight rows, then its next eight as the next step's
+  // first.
+  for (uint32_t lane = 0; lane < kMaxLanes; ++lane) halves.blocks[lane].rows = kHalf;
+  std::fill_n(static_cast<uint32_t *>(halves.verifyRows.contents()), kMaxLanes, kHalf);
+  decodeStep(backend, halves, cell, halves.blocks);
+  std::vector<uint8_t> firstHidden(static_cast<const uint8_t *>(halves.hidden.contents()),
+                                   static_cast<const uint8_t *>(halves.hidden.contents()) + halves.hidden.sizeBytes());
+  const auto requireRows = [&](const Fixture &half, const std::vector<uint8_t> &hidden, uint32_t from,
+                               const std::string &which) {
+    for (uint32_t lane = 0; lane < kMaxLanes; ++lane) {
+      require(!std::memcmp(hidden.data() + (uint64_t{lane} * kRows) * hiddenRowBytes,
+                           whole.hiddenRow(lane, from, 0), kHalf * hiddenRowBytes),
+              what + ": the " + which + " step's rows are not the chain's");
+      for (uint32_t layer = 0; layer < kLayers; ++layer)
+        for (uint32_t row = 0; row < kHalf; ++row)
+          require(tapeRow(half, half.blocks[lane].tape.stepSlot, layer, row) ==
+                      tapeRow(whole, whole.blocks[lane].tape.stepSlot, layer, from + row),
+                  what + ": the " + which + " step's tape rows are not the chain's");
+    }
+  };
+  requireRows(halves, firstHidden, 0, "first");
+  std::array<uint32_t, kMaxLanes> pending{};
+  pending.fill(kHalf);
+  halves.advance(pending);
+  halves.clear();
+  for (uint32_t layer = 0; layer < kLayers; ++layer)
+    for (uint32_t lane = 0; lane < kMaxLanes; ++lane)
+      std::memmove(const_cast<uint16_t *>(halves.packedRow(layer, lane, 0)), halves.packedRow(layer, lane, kHalf),
+                   kHalf * packedRowBytes);
+  decodeStep(backend, halves, cell, halves.blocks);
+  const std::vector<uint8_t> secondHidden(static_cast<const uint8_t *>(halves.hidden.contents()),
+                                          static_cast<const uint8_t *>(halves.hidden.contents()) +
+                                              halves.hidden.sizeBytes());
+  requireRows(halves, secondHidden, kHalf, "second");
+  // A step after each, of the same new rows.
+  pending.fill(kRows);
+  whole.advance(pending);
+  pending.fill(kHalf);
+  halves.advance(pending);
+  for (Fixture *fixture : {&whole, &halves}) {
+    for (uint32_t lane = 0; lane < kMaxLanes; ++lane) fixture->blocks[lane].rows = kHalf;
+    std::fill_n(static_cast<uint32_t *>(fixture->verifyRows.contents()), kMaxLanes, kHalf);
+    fixture->clear();
+  }
+  whole.fillPacked();
+  copy(whole.packed, halves.packed);
+  decodeStep(backend, whole, cell, whole.blocks);
+  decodeStep(backend, halves, cell, halves.blocks);
+  for (uint32_t lane = 0; lane < kMaxLanes; ++lane) {
+    require(!std::memcmp(whole.next[lane].contents(), halves.next[lane].contents(), cell.bytes),
+            what + ": folding the chain's rows left another state than folding its halves'");
+    require(!std::memcmp(whole.hiddenRow(lane, 0, 0), halves.hiddenRow(lane, 0, 0), kHalf * hiddenRowBytes),
+            what + ": the step after the chain differs from the step after its halves");
+  }
+  std::cout << what << ": a 16-row chain is its two 8-row steps bit for bit\n";
+}
+
 void rejectsInvalid(MetalBackend &backend) {
   const GdnShape &shape = kShapes.front();
   Fixture fixture(backend, shape, 1);
@@ -2094,6 +2171,8 @@ int main(int argc, char **argv) {
         for (GdnStateFormat format : {GdnStateFormat::Float32, GdnStateFormat::BFloat16})
           for (const uint32_t blockRows : {kRows / 2, kRows})
             treeRows(backend, shape, float32, format, blockRows);
+    for (const GdnShape &shape : kShapes)
+      for (bool float32 : familyNorms(shape)) chainHalves(backend, shape, float32);
     std::cout << "gdn_decode_metal_test: PASS\n";
     return 0;
   } catch (const std::exception &error) {
