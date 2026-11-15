@@ -3,6 +3,7 @@
 #include "metal/CommandGraph.hpp"
 #include "metal/abi/ExecutionGeometry.h"
 #include "metal/abi/MoE.h"
+#include "ops/LaneRows.hpp"
 #include "ops/Linear.hpp"
 
 #include <algorithm>
@@ -365,25 +366,19 @@ private:
   MoeWorkspace workspace_;
 };
 
-// A decode lane's verify block of a step's rows: `rows` rows from row
-// firstRow on.
-struct MoeVerifyBlock final {
-  uint32_t firstRow = 0;
-  uint32_t rows = 0;
-};
-
 struct MoeBuffers final {
   metal::MetalBuffer input;
   metal::MetalBuffer residual;
   metal::MetalBuffer output;
   MoeScratch scratch;
-  // A step's decode lanes' verify blocks, up to one per lane, ascending in its
-  // rows without overlapping, and each block's verify rows, a uint32 per
-  // block (the draft selector's, ops::DraftSelector::addVerifyRows): its
-  // routing routes each block's verify rows alone and every row of no block,
-  // a prompt's (moe_group_routes_verified*), and a streamed load predicts the
-  // next MoE block's experts from the rows it routes. None, every row routes.
-  std::span<const MoeVerifyBlock> verifyBlocks;
+  // A step's decode lanes' verify blocks, each a lane's rows, up to one per
+  // lane, ascending in its rows without overlapping, and each block's verify
+  // rows, a uint32 per block (the draft selector's,
+  // ops::DraftSelector::addVerifyRows): its routing routes each block's
+  // verify rows alone and every row of no block, a prompt's
+  // (moe_group_routes_verified*), and a streamed load predicts the next MoE
+  // block's experts from the rows it routes. None, every row routes.
+  std::span<const LaneRows> verifyBlocks;
   metal::MetalBuffer verifyRows;
 };
 

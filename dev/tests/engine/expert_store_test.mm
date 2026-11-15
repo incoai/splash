@@ -86,7 +86,7 @@ using splash::ops::MoeLoadPart;
 using splash::ops::MoePlan;
 using splash::ops::MoeScratch;
 using splash::ops::MoeShape;
-using splash::ops::MoeVerifyBlock;
+using splash::ops::LaneRows;
 using splash::ops::QuantizedSegment;
 using splash::test::MethodReplacement;
 using splash::test::require;
@@ -124,7 +124,7 @@ struct StepPlan final {
   MoePlan plan;
   uint32_t lanes = 0;
   // Each lane's verify block and its rows, from row lane x laneRows.
-  std::array<MoeVerifyBlock, splash::model::ExecutionLimits::maximumBatchWidth> blocks{};
+  std::array<LaneRows, splash::model::ExecutionLimits::maximumBatchWidth> blocks{};
   uint32_t laneRows = 0;
 };
 

@@ -255,13 +255,13 @@ struct ExpertStore::Impl {
   // row but a verify block's past the block's verify rows, which the selector
   // wrote before the step's GPU work ran up to its load.
   struct RoutedRows final {
-    std::vector<ops::MoeVerifyBlock> blocks;
+    std::vector<ops::LaneRows> blocks;
     metal::MetalBuffer verifyRows;
 
     [[nodiscard]] bool routes(uint32_t row) const noexcept {
       const auto *verified = static_cast<const uint32_t *>(verifyRows.contents());
       for (size_t block = 0; block < blocks.size(); ++block)
-        if (const uint32_t offset = row - blocks[block].firstRow; offset < blocks[block].rows)
+        if (const uint32_t offset = row - blocks[block].first; offset < blocks[block].rows)
           return offset < verified[block];
       return true;
     }

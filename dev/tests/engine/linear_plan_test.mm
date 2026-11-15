@@ -1205,7 +1205,7 @@ void producerTableContract(metal::MetalBackend &backend) {
     buffers.convolutionWeights = allocate(backend, shape.convolutionDimension * 4 * 2);
     buffers.currentStates = states;
     buffers.nextStates = states;
-    const std::array<GdnDecodeBlock, kLanes> blocks{GdnDecodeBlock{0, kRows, {0, gdnTapeLayerBytes(shape), 0}}};
+    const std::array<GdnDecodeBlock, kLanes> blocks{GdnDecodeBlock{{0, kRows}, {0, gdnTapeLayerBytes(shape), 0}}};
     buffers.tape = allocate(backend, 2 * gdnTapeLayerBytes(shape));
     buffers.blocks = blocks;
     buffers.decayWeights = allocate(backend, shape.valueHeads * 4);

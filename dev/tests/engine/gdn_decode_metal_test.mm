@@ -180,7 +180,7 @@ struct Fixture final {
     mixerNorm = makeNormWeights(backend, kHeadDim, float32,
                                 [&](uint32_t) { return random.unit(); });
     for (uint32_t lane = 0; lane < kMaxLanes; ++lane) {
-      blocks[lane] = {lane * kRows, kRows, {slot(lane, 0), slot(lane, 1), 0}};
+      blocks[lane] = {{lane * kRows, kRows}, {slot(lane, 0), slot(lane, 1), 0}};
       current[lane] = alloc(cell.bytes, "gdn current");
       next[lane] = alloc(cell.bytes, "gdn next");
       auto *bytes = static_cast<uint8_t *>(current[lane].contents());
@@ -701,7 +701,7 @@ void replayAcrossBatches(MetalBackend &backend, const GdnShape &shape, bool floa
       const uint32_t stateLane = storage[lane] = (lane + cycle) % kMaxLanes;
       current[lane] = batched.current[stateLane];
       next[lane] = batched.next[stateLane];
-      blocks[lane] = {lane * kRows, kRows, batched.blocks[stateLane].tape};
+      blocks[lane] = {{lane * kRows, kRows}, batched.blocks[stateLane].tape};
       for (uint32_t layer = 0; layer < kLayers; ++layer)
         std::memcpy(static_cast<uint16_t *>(batched.packedLayer[layer].contents()) + lane * batched.packedStride,
                     individual.packedRow(layer, stateLane, 0), batched.packedStride * 2);
@@ -729,7 +729,7 @@ void replayAcrossBatches(MetalBackend &backend, const GdnShape &shape, bool floa
         std::array<MetalBuffer, kMaxLanes> singleCurrent, singleNext;
         singleCurrent.fill(individual.current[stateLane]);
         singleNext.fill(individual.next[stateLane]);
-        const std::array singleBlock{GdnDecodeBlock{0, kRows, individual.blocks[stateLane].tape}};
+        const std::array singleBlock{GdnDecodeBlock{{0, kRows}, individual.blocks[stateLane].tape}};
         single.packed = backend.view(individual.packedLayer[layer], stateLane * individual.packedStride * 2,
                                      individual.packedStride * 2);
         single.hidden = backend.view(individual.hidden, stateLane * hiddenBytes, hiddenBytes);
@@ -1208,7 +1208,7 @@ void raggedBlocks(MetalBackend &backend, const GdnShape &shape, bool float32, Gd
     std::memcpy(fixture->verifyRows.contents(), kVerify.data(), sizeof(kVerify));
   }
   for (uint32_t lane = 0; lane < kBlocks; ++lane) {
-    packed.blocks[lane].firstRow = kFirst[lane];
+    packed.blocks[lane].first = kFirst[lane];
     packed.blocks[lane].rows = kBlockRows[lane];
   }
   const auto view = [&](const MetalBuffer &buffer, uint64_t offset, uint64_t bytes) {
@@ -1244,7 +1244,7 @@ void raggedBlocks(MetalBackend &backend, const GdnShape &shape, bool float32, Gd
         std::array<MetalBuffer, kMaxLanes> current, next;
         current.fill(alone.current[lane]);
         next.fill(alone.next[lane]);
-        const std::array block{GdnDecodeBlock{0, kBlockRows[lane], alone.blocks[lane].tape}};
+        const std::array block{GdnDecodeBlock{{0, kBlockRows[lane]}, alone.blocks[lane].tape}};
         single.packed = view(alone.packedLayer[layer], lane * alone.packedStride * 2, alone.packedStride * 2);
         single.currentStates = current;
         single.nextStates = next;
@@ -1321,12 +1321,12 @@ void rejectsInvalid(MetalBackend &backend) {
   // row.
   const GdnTapeLane first = fixture.blocks[0].tape, second = fixture.blocks[1].tape;
   for (const std::array<GdnDecodeBlock, 2> blocks :
-       {std::array{GdnDecodeBlock{0, 0, first}, GdnDecodeBlock{8, kRows, second}},
-        std::array{GdnDecodeBlock{0, kRows + 1, first}, GdnDecodeBlock{9, kRows, second}},
-        std::array{GdnDecodeBlock{8, kRows, first}, GdnDecodeBlock{0, kRows, second}},
-        std::array{GdnDecodeBlock{0, 5, first}, GdnDecodeBlock{4, 3, second}},
-        std::array{GdnDecodeBlock{0, kRows, first},
-                   GdnDecodeBlock{std::numeric_limits<uint32_t>::max() - 2, 4, second}}})
+       {std::array{GdnDecodeBlock{{0, 0}, first}, GdnDecodeBlock{{8, kRows}, second}},
+        std::array{GdnDecodeBlock{{0, kRows + 1}, first}, GdnDecodeBlock{{9, kRows}, second}},
+        std::array{GdnDecodeBlock{{8, kRows}, first}, GdnDecodeBlock{{0, kRows}, second}},
+        std::array{GdnDecodeBlock{{0, 5}, first}, GdnDecodeBlock{{4, 3}, second}},
+        std::array{GdnDecodeBlock{{0, kRows}, first},
+                   GdnDecodeBlock{{std::numeric_limits<uint32_t>::max() - 2, 4}, second}}})
     rejects([&] { withBlocks(blocks); }, "invalid GDN decode geometry",
             "a GDN decode took a block of no rows, more than a simdgroup's, or out of order");
   // More rows than a step's pending; a step's tape misaligned, or overlapping
@@ -1340,7 +1340,7 @@ void rejectsInvalid(MetalBackend &backend) {
         std::array{GdnTapeLane{0, tape, 0}, GdnTapeLane{3 * tape, tape + 16, 0}}})
     rejects(
         [&] {
-          withBlocks(std::array{GdnDecodeBlock{0, kRows, lanes[0]}, GdnDecodeBlock{kRows, kRows, lanes[1]}});
+          withBlocks(std::array{GdnDecodeBlock{{0, kRows}, lanes[0]}, GdnDecodeBlock{{kRows, kRows}, lanes[1]}});
         },
         "invalid GDN decode tape", "a GDN decode took more pending rows than a step's or overlapping tapes");
   // Offset arithmetic must not wrap either when selecting a layer or when
@@ -1439,7 +1439,7 @@ void foldMatchesTheNextStep(MetalBackend &backend, const GdnShape &shape, GdnSta
   }
   const auto addStep = [&](CommandGraph &graph, std::span<const MetalBuffer> current,
                            std::span<const MetalBuffer> next, GdnTapeLane tape) {
-    const std::array block{GdnDecodeBlock{0, kRows, tape}};
+    const std::array block{GdnDecodeBlock{{0, kRows}, tape}};
     for (uint32_t layer = 0; layer < kLayers; ++layer) {
       GdnDecodeBuffers buffers = fixture.decodeBuffers(layer);
       buffers.currentStates = current;

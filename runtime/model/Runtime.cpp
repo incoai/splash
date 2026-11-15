@@ -254,39 +254,46 @@ DFlashPrefillBuffers draftPrefillBuffers(const PrefillArena &arena, uint32_t chu
           arena.get(PrefillTensor::DraftRopeSin, chunk)};
 }
 
-// A prefill arena's tensors as the target's prefill reads them.
-// The buffers of a prefill group's chunk `chunk`: its rows of the group's
-// tensors (prefillGroupTensor), and the arena's others.
-QwenTargetPrefillBuffers prefillBuffers(const PrefillArena &arena, uint32_t chunk) {
+// The target step tensors of `target`'s chunk `chunk` as the target reads
+// them, and the scratch the arena that holds them gives.
+QwenTargetPrefillBuffers targetBuffers(const TargetArena &target, uint32_t chunk) {
   QwenTargetPrefillBuffers buffers;
+  const auto t = [&](TargetTensor tensor) { return target.get(tensor, chunk); };
+  buffers.hidden = {t(TargetTensor::Hidden0), t(TargetTensor::Hidden1)};
+  buffers.normalized = t(TargetTensor::Normalized);
+  buffers.gdnPacked = t(TargetTensor::GdnPacked);
+  buffers.gdnQueries = t(TargetTensor::GdnQueries);
+  buffers.gdnKeys = t(TargetTensor::GdnKeys);
+  buffers.gdnValues = t(TargetTensor::GdnValues);
+  buffers.gdnDecay = t(TargetTensor::GdnDecay);
+  buffers.gdnBeta = t(TargetTensor::GdnBeta);
+  buffers.recurrent = t(TargetTensor::Recurrent);
+  buffers.gdnHidden = t(TargetTensor::GdnHidden);
+  buffers.gdnOutput = t(TargetTensor::GdnOutput);
+  buffers.denseIntermediate = t(TargetTensor::Intermediate);
+  buffers.fullPacked = t(TargetTensor::FullPacked);
+  buffers.fullQueries = t(TargetTensor::FullQueries);
+  buffers.fullAttention = t(TargetTensor::FullAttention);
+  buffers.attentionPartials = t(TargetTensor::AttentionPartials);
+  buffers.attentionStatistics = t(TargetTensor::AttentionStatistics);
+  buffers.attentionHidden = t(TargetTensor::AttentionHidden);
+  buffers.attentionOutput = t(TargetTensor::AttentionOutput);
+  buffers.ropeCos = t(TargetTensor::RopeCos);
+  buffers.ropeSin = t(TargetTensor::RopeSin);
+  buffers.chunkKeys = t(TargetTensor::ChunkKeys);
+  buffers.chunkValues = t(TargetTensor::ChunkValues);
+  buffers.moe = target.moeScratch(chunk);
+  return buffers;
+}
+
+// The buffers of a prefill group's chunk `chunk`: its rows of the group's
+// tensors (targetGroupTensor, prefillGroupTensor), and the arena's others.
+QwenTargetPrefillBuffers prefillBuffers(const PrefillArena &arena, uint32_t chunk) {
+  QwenTargetPrefillBuffers buffers = targetBuffers(arena.target(), chunk);
   buffers.linearScratch = prefillScratch(arena);
-  buffers.hidden = {arena.get(PrefillTensor::Hidden0, chunk), arena.get(PrefillTensor::Hidden1, chunk)};
-  buffers.normalized = arena.get(PrefillTensor::Normalized, chunk);
   buffers.captured = arena.get(PrefillTensor::Captured, chunk);
-  buffers.gdnPacked = arena.get(PrefillTensor::GdnPacked);
-  buffers.gdnQueries = arena.get(PrefillTensor::GdnQueries);
-  buffers.gdnKeys = arena.get(PrefillTensor::GdnKeys);
-  buffers.gdnValues = arena.get(PrefillTensor::GdnValues);
-  buffers.gdnDecay = arena.get(PrefillTensor::GdnDecay);
-  buffers.gdnBeta = arena.get(PrefillTensor::GdnBeta);
-  buffers.recurrent = arena.get(PrefillTensor::Recurrent);
-  buffers.gdnHidden = arena.get(PrefillTensor::GdnHidden);
-  buffers.gdnOutput = arena.get(PrefillTensor::GdnOutput, chunk);
   buffers.denseGateScratch = arena.get(PrefillTensor::GateIntermediate);
-  buffers.denseIntermediate = arena.get(PrefillTensor::Intermediate);
-  buffers.fullPacked = arena.get(PrefillTensor::FullPacked);
-  buffers.fullQueries = arena.get(PrefillTensor::FullQueries);
-  buffers.fullAttention = arena.get(PrefillTensor::FullAttention);
-  buffers.attentionPartials = arena.get(PrefillTensor::AttentionPartials);
-  buffers.attentionStatistics = arena.get(PrefillTensor::AttentionStatistics);
-  buffers.attentionHidden = arena.get(PrefillTensor::AttentionHidden);
-  buffers.attentionOutput = arena.get(PrefillTensor::AttentionOutput, chunk);
-  buffers.ropeCos = arena.get(PrefillTensor::RopeCos, chunk);
-  buffers.ropeSin = arena.get(PrefillTensor::RopeSin, chunk);
   buffers.ropeInverseFrequencies = arena.get(PrefillTensor::TargetInverseFrequencies);
-  buffers.chunkKeys = arena.get(PrefillTensor::ChunkKeys);
-  buffers.chunkValues = arena.get(PrefillTensor::ChunkValues);
-  buffers.moe = arena.moeScratch(chunk);
   return buffers;
 }
 
@@ -1187,8 +1194,7 @@ struct Runtime::Impl {
   // row 0 of its Hidden0 block, until its first mask arrives.
   void captureFinalHidden(Request &entry, uint32_t lane) const {
     const uint16_t *source =
-        contents<uint16_t>(decodeArena->get(lane, DecodeTensor::Hidden0),
-                           "target final hidden source");
+        contents<uint16_t>(decodeArena->laneRows(TargetTensor::Hidden0, lane), "target final hidden source");
     entry.finalTargetHidden.assign(source,
                                    source + geometry.target.hiddenSize);
   }
@@ -1456,7 +1462,7 @@ struct Runtime::Impl {
     auto d = [&](DecodeTensor tensor) {
       return decodeArena->batchSlice(tensor, storage);
     };
-    targetModel->addHeadBatch(graph, d(DecodeTensor::Hidden0),
+    targetModel->addHeadBatch(graph, decodeArena->lanesRows(TargetTensor::Hidden0, storage),
                              d(DecodeTensor::FinalHidden),
                              d(DecodeTensor::Logits), width,
                              decodeArena->linearScratch());
@@ -1502,9 +1508,7 @@ struct Runtime::Impl {
         throw std::logic_error("initial selection state is invalid");
       }
       std::ranges::copy(entry.finalTargetHidden,
-                        contents<uint16_t>(
-                            decodeArena->get(lane, DecodeTensor::Hidden0),
-                            "final prompt hidden"));
+                        contents<uint16_t>(decodeArena->laneRows(TargetTensor::Hidden0, lane), "final prompt hidden"));
       if (samplingEnabled(entry))
         uploadInitialUniform(entry, lane);
       uploadConstraintMasks(lane, entry.maskWords);
@@ -1903,8 +1907,8 @@ struct Runtime::Impl {
     if (entry.replayingGeneration || item.logicalPosition + item.tokenCount != entry.promptTokens)
       return std::nullopt;
     const uint32_t hidden = geometry.target.hiddenSize;
-    ops::RowCopy::add(graph, lastRow, {0, hidden, 0},
-                      decodeArena->get(lane, DecodeTensor::Hidden0), {0, hidden, 0}, 1, hidden);
+    ops::RowCopy::add(graph, lastRow, {0, hidden, 0}, decodeArena->laneRows(TargetTensor::Hidden0, lane),
+                      {0, hidden, 0}, 1, hidden);
     if (entry.constraint != ConstraintMode::None) return std::nullopt;
     const bool scoring = !entry.scoreTokens.empty();
     if (!scoring && samplingEnabled(entry)) uploadInitialUniform(entry, lane);
@@ -2245,37 +2249,37 @@ struct Runtime::Impl {
       return decodeArena->batchSlice(tensor, storage);
     };
 
+    // The target step tensors of the lanes' rows: a row tensor's rows of the
+    // storage lanes, the staging, workspaces and MoE scratch whole.
+    const auto rows = [&](TargetTensor tensor) { return decodeArena->lanesRows(tensor, storage); };
+    const TargetArena &target = decodeArena->target();
     std::array<ChunkedPrefillParams, kLaneCount> chunks{};
-    const uint32_t attentionLayers =
-        geometry.target.kvLayout.attentionLayers;
-    std::vector<MetalBuffer> chunkKeys(attentionLayers);
-    std::vector<MetalBuffer> chunkValues(attentionLayers);
     QwenTargetVerifyBuffers buffers;
     buffers.linearScratch = decodeArena->linearScratch();
-    buffers.hidden = {d(DecodeTensor::Hidden0), d(DecodeTensor::Hidden1)};
-    buffers.normalized = d(DecodeTensor::Normalized);
-    buffers.gdnHidden = d(DecodeTensor::GdnHidden);
-    buffers.gdnOutput = d(DecodeTensor::GdnOutput);
-    buffers.denseIntermediate = d(DecodeTensor::Intermediate);
-    buffers.fullPacked = d(DecodeTensor::FullPacked);
-    buffers.fullQueries = d(DecodeTensor::FullQueries);
-    buffers.attentionPartials = d(DecodeTensor::AttentionPartials);
-    buffers.attentionStatistics = d(DecodeTensor::AttentionStatistics);
-    buffers.fullAttention = d(DecodeTensor::FullAttention);
-    buffers.attentionHidden = d(DecodeTensor::AttentionHidden);
-    buffers.attentionOutput = d(DecodeTensor::AttentionOutput);
-    buffers.ropeCos = d(DecodeTensor::RopeCos);
-    buffers.ropeSin = d(DecodeTensor::RopeSin);
+    buffers.hidden = {rows(TargetTensor::Hidden0), rows(TargetTensor::Hidden1)};
+    buffers.normalized = rows(TargetTensor::Normalized);
+    buffers.gdnHidden = rows(TargetTensor::GdnHidden);
+    buffers.gdnOutput = rows(TargetTensor::GdnOutput);
+    buffers.denseIntermediate = rows(TargetTensor::Intermediate);
+    buffers.fullPacked = rows(TargetTensor::FullPacked);
+    buffers.fullQueries = target.get(TargetTensor::FullQueries);
+    buffers.attentionPartials = target.get(TargetTensor::AttentionPartials);
+    buffers.attentionStatistics = target.get(TargetTensor::AttentionStatistics);
+    buffers.fullAttention = target.get(TargetTensor::FullAttention);
+    buffers.attentionHidden = rows(TargetTensor::AttentionHidden);
+    buffers.attentionOutput = rows(TargetTensor::AttentionOutput);
+    buffers.ropeCos = rows(TargetTensor::RopeCos);
+    buffers.ropeSin = rows(TargetTensor::RopeSin);
     buffers.ropeInverseFrequencies = prefillArena->get(PrefillTensor::TargetInverseFrequencies);
     buffers.capturedTargetHidden = d(DecodeTensor::CapturedTargetHidden);
     buffers.finalHidden = d(DecodeTensor::FinalHidden);
     buffers.logits = d(DecodeTensor::Logits);
     buffers.denseGateScratch = decodeArena->gateScratch();
-    buffers.gdnPacked = d(DecodeTensor::GdnPacked);
+    buffers.gdnPacked = rows(TargetTensor::GdnPacked);
     buffers.gdnTape = decodeArena->batchSlice(DecodeTensor::GdnTape, kLaneCount);
-    buffers.chunkKeys = chunkKeys;
-    buffers.chunkValues = chunkValues;
-    buffers.moe = decodeArena->moeScratch(storage);
+    buffers.chunkKeys = target.get(TargetTensor::ChunkKeys);
+    buffers.chunkValues = target.get(TargetTensor::ChunkValues);
+    buffers.moe = target.moeScratch(0);
     buffers.verifyRows = decodeArena->batchSlice(DecodeTensor::VerifyRows, lanes);
     for (uint32_t lane = 0; lane < lanes; ++lane)
       chunks[lane] = chunkParams(items[lane].logicalPosition, kDecodeRows, items[lane].pageTable);
@@ -2294,12 +2298,6 @@ struct Runtime::Impl {
       buffers.gdnTapeLanes[lane] = {decodeArena->gdnTapeSlot(stateLane, metadata.activeParity),
                                     decodeArena->gdnTapeSlot(stateLane, metadata.activeParity ^ 1),
                                     metadata.pendingRows};
-    }
-    for (uint32_t layer = 0; layer < attentionLayers; ++layer) {
-      chunkKeys[layer] = decodeArena->attentionBatchSlice(
-          DecodeTensor::ChunkKeysBase, layer, storage);
-      chunkValues[layer] = decodeArena->attentionBatchSlice(
-          DecodeTensor::ChunkValuesBase, layer, storage);
     }
     targetModel->addVerify(graph, std::move(buffers), kvPages, reads,
                           std::span(chunks).first(lanes), lanes);
@@ -2459,13 +2457,13 @@ struct Runtime::Impl {
     encodeDecodeCaptures(graph, entries, items);
   }
 
-  void encodeBatchEmbedding(CommandGraph &graph, DecodeTensor tokens,
-                            DecodeTensor output, uint32_t lanes) {
+  // The embedding of the lanes' tokens into `output`'s rows (the target's
+  // hidden rows, or the draft's).
+  void encodeBatchEmbedding(CommandGraph &graph, DecodeTensor tokens, const MetalBuffer &output, uint32_t lanes) {
     if (!lanes || lanes > kLaneCount)
       throw std::invalid_argument("invalid embedding batch width");
     const uint32_t rows = lanes * kDecodeRows;
-    targetModel->addEmbedding(graph, decodeArena->batchSlice(tokens, lanes),
-                             decodeArena->batchSlice(output, lanes), rows);
+    targetModel->addEmbedding(graph, decodeArena->batchSlice(tokens, lanes), output, rows);
   }
 
   void encodeBatchVerifyInput(CommandGraph &graph, uint32_t lanes) {
@@ -2672,7 +2670,7 @@ struct Runtime::Impl {
         const uint32_t width = static_cast<uint32_t>(lanes_.size());
         impl_.encodeBatchVerifyInput(target, width);
         impl_.encodeBatchEmbedding(target, DecodeTensor::InputTokens,
-                                   DecodeTensor::Hidden0, width);
+                                   impl_.decodeArena->lanesRows(TargetTensor::Hidden0, width), width);
         impl_.encodeTargetVerifyBatchForward(
             target, {entries.data(), lanes_.size()}, items_, *reads_);
         submit(target);
@@ -3359,12 +3357,12 @@ Runtime::decodeAsync(const BatchPlan &plan,
       commandGraph,
       impl_->decodeArena->batchSlice(DecodeTensor::Positions, width), ropeRows,
       impl_->decodeArena->batchSlice(DecodeTensor::DraftPositions, width),
-      ropeRows, impl_->decodeArena->batchSlice(DecodeTensor::RopeCos, width),
-      impl_->decodeArena->batchSlice(DecodeTensor::RopeSin, width),
+      ropeRows, impl_->decodeArena->lanesRows(TargetTensor::RopeCos, width),
+      impl_->decodeArena->lanesRows(TargetTensor::RopeSin, width),
       impl_->decodeArena->batchSlice(DecodeTensor::DraftRopeCos, width),
       impl_->decodeArena->batchSlice(DecodeTensor::DraftRopeSin, width));
   impl_->encodeBatchEmbedding(commandGraph, DecodeTensor::DraftInputTokens,
-                              DecodeTensor::DraftHidden0, width);
+                              impl_->decodeArena->batchSlice(DecodeTensor::DraftHidden0, width), width);
   impl_->draftModel.addMaskRows(commandGraph, impl_->decodeArena->batchSlice(DecodeTensor::DraftHidden0, width),
                                 width);
   impl_->encodeDraftBatchGraph(commandGraph, entries,
@@ -3379,7 +3377,7 @@ Runtime::decodeAsync(const BatchPlan &plan,
   }
   impl_->encodeBatchVerifyInput(commandGraph, width);
   impl_->encodeBatchEmbedding(commandGraph, DecodeTensor::InputTokens,
-                              DecodeTensor::Hidden0, width);
+                              impl_->decodeArena->lanesRows(TargetTensor::Hidden0, width), width);
   impl_->encodeTargetVerifyBatchForward(commandGraph, entries, items, *reads);
   impl_->encodeVerifyCommit(commandGraph, entries, items, {maximumRetained.data(), width});
 

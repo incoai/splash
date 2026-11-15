@@ -1,6 +1,7 @@
 #pragma once
 
 #include "metal/CommandGraph.hpp"
+#include "ops/LaneRows.hpp"
 #include "ops/Linear.hpp"
 #include "ops/Normalization.hpp"
 
@@ -116,12 +117,10 @@ struct GdnTapeLane final {
 
 [[nodiscard]] uint64_t gdnTapeLayerBytes(const GdnShape &shape) noexcept;
 
-// A lane's block of a decode step's rows: `rows` rows, 1 to
-// SPLASH_TARGET_VERIFY_ROWS, from row firstRow of the step's packed, hidden
-// and table rows on, and the lane's tape, whose first rows they are.
-struct GdnDecodeBlock final {
-  uint32_t firstRow = 0;
-  uint32_t rows = 0;
+// A lane's block of a decode step's rows (its LaneRows: `rows` rows, 1 to
+// SPLASH_TARGET_VERIFY_ROWS, from row `first` of the step's packed, hidden
+// and table rows on), and the lane's tape, whose first rows they are.
+struct GdnDecodeBlock final : LaneRows {
   GdnTapeLane tape;
 };
 

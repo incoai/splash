@@ -180,9 +180,7 @@ QwenTarget::VerifyStep QwenTarget::verifyStep(metal::CommandGraph &graph, const 
                                               uint32_t lanes) const {
   const std::span<const SplashKvLayer> kvLayers = kv.layers();
   if (!lanes || lanes > ExecutionLimits::maximumBatchWidth || chunks.size() != lanes ||
-      kvLayers.size() != geometry_.kvLayout.attentionLayers ||
-      buffers.chunkKeys.size() != geometry_.kvLayout.attentionLayers ||
-      buffers.chunkValues.size() != geometry_.kvLayout.attentionLayers) {
+      kvLayers.size() != geometry_.kvLayout.attentionLayers) {
     throw std::invalid_argument("invalid Qwen verify batch");
   }
   for (uint32_t lane = 0; lane < lanes; ++lane)
@@ -350,7 +348,7 @@ void QwenTarget::addVerifyMixer(VerifyStep &step, const QwenGdnWeights &mixer, o
   // Lane l's block is its verify rows, rows [8 l, 8 l + 8) of the step.
   std::array<ops::GdnDecodeBlock, ExecutionLimits::maximumBatchWidth> blocks{};
   for (uint32_t lane = 0; lane < step.lanes; ++lane)
-    blocks[lane] = {lane * kVerifyRows, kVerifyRows, b.gdnTapeLanes[lane]};
+    blocks[lane] = {{lane * kVerifyRows, kVerifyRows}, b.gdnTapeLanes[lane]};
   const ops::PreparedInput hidden = ops::GDN::addDecode(
       step.graph,
       {b.gdnPacked, mixer.convolutionWeights, b.currentGdnStates, b.nextGdnStates, b.gdnTape,
@@ -375,7 +373,7 @@ void QwenTarget::addVerifyMixer(VerifyStep &step, const QwenAttentionWeights &mi
   const ops::Linear &linear = operators_.linear();
   const uint32_t layer = step.attentionLayer++;
   const ops::AttentionVariant variant = geometry_.attentionVariant(layer);
-  const ops::AttentionStaging staging{b.fullQueries, b.chunkKeys[layer], b.chunkValues[layer], b.fullAttention};
+  const ops::AttentionStaging staging{b.fullQueries, b.chunkKeys, b.chunkValues, b.fullAttention};
   addDecodeProjection(step.graph, b.normalized, mixer.inputProjection, b.fullPacked, step.lanes, b.linearScratch,
                       std::move(normalized));
   ops::PagedAttention::addProjection(step.graph, b.fullPacked, mixer.queryNorm, mixer.keyNorm, b.ropeCos, b.ropeSin,

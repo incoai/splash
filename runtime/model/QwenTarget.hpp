@@ -321,8 +321,9 @@ struct QwenTargetVerifyBuffers final {
   // The lanes' decode tapes (ops::GdnTapeLane).
   metal::MetalBuffer gdnTape;
   std::array<ops::GdnTapeLane, ExecutionLimits::maximumBatchWidth> gdnTapeLanes{};
-  std::span<const metal::MetalBuffer> chunkKeys;
-  std::span<const metal::MetalBuffer> chunkValues;
+  // The staging of every attention layer's keys and values in turn.
+  metal::MetalBuffer chunkKeys;
+  metal::MetalBuffer chunkValues;
   std::array<metal::MetalBuffer, ExecutionLimits::maximumBatchWidth>
       currentGdnStates;
   std::array<metal::MetalBuffer, ExecutionLimits::maximumBatchWidth>
@@ -585,7 +586,7 @@ protected:
     std::optional<ops::MoePlan> moe{};
     // Each lane's verify block, its 8 rows from row 8 l, which a MoE routes
     // up to the lane's verify rows (ops::MoeBuffers::verifyBlocks).
-    std::array<ops::MoeVerifyBlock, ExecutionLimits::maximumBatchWidth> verifyBlocks{};
+    std::array<ops::LaneRows, ExecutionLimits::maximumBatchWidth> verifyBlocks{};
     uint32_t gdnLayer = 0;
     uint32_t attentionLayer = 0;
   };

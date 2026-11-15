@@ -1519,7 +1519,7 @@ int verifiedRows(MetalBackend &backend, const std::string &name, uint32_t rows,
   // Each row's block, or none for a prompt's row.
   constexpr uint32_t kNoBlock = UINT32_MAX;
   std::vector<uint32_t> blockOf(rows, kNoBlock);
-  std::vector<splash::ops::MoeVerifyBlock> verifyBlocks;
+  std::vector<splash::ops::LaneRows> verifyBlocks;
   for (uint32_t block = 0; block < blocks.size(); ++block) {
     verifyBlocks.push_back({blocks[block].firstRow, blocks[block].rows});
     std::fill_n(blockOf.begin() + blocks[block].firstRow, blocks[block].rows, block);
@@ -1561,8 +1561,8 @@ int verifiedRows(MetalBackend &backend, const std::string &name, uint32_t rows,
   const auto run = [&](const MetalBuffer &verifyRows) {
     allocate(backend, b, plan);
     std::memset(b.moe.output.contents(), 0, b.moe.output.sizeBytes());
-    b.moe.verifyBlocks = verifyRows ? std::span<const splash::ops::MoeVerifyBlock>(verifyBlocks)
-                                    : std::span<const splash::ops::MoeVerifyBlock>();
+    b.moe.verifyBlocks = verifyRows ? std::span<const splash::ops::LaneRows>(verifyBlocks)
+                                    : std::span<const splash::ops::LaneRows>();
     b.moe.verifyRows = verifyRows;
     CommandGraph graph;
     MoE::add(graph, b.moe, m.weights, plan);

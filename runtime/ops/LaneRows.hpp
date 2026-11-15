@@ -16,7 +16,7 @@ namespace splash::ops {
 // selects from. The batched kernels address a lane's rows by these (their
 // parameters' per-lane first_row and rows), so lanes of different row counts
 // share a dispatch.
-struct LaneRows final {
+struct LaneRows {
   uint32_t first = 0;
   uint32_t rows = 0;
 };

@@ -221,17 +221,17 @@ void MoE::addRouting(metal::CommandGraph &graph, const MoeBuffers &buffers, cons
   // Each verify block's rows, from its first row, lie in the step's rows past
   // the block before it.
   MoeGroupParams group = groupParams(plan, weights);
-  const std::span<const MoeVerifyBlock> blocks = buffers.verifyBlocks;
+  const std::span<const LaneRows> blocks = buffers.verifyBlocks;
   if (blocks.size() > SPLASH_MAXIMUM_BATCH_WIDTH)
     throw std::invalid_argument("a MoE step has more verify blocks than lanes");
   uint32_t end = 0;
   for (size_t block = 0; block < blocks.size(); ++block) {
-    const MoeVerifyBlock &verify = blocks[block];
-    if (!verify.rows || verify.firstRow < end || verify.firstRow > rows || verify.rows > rows - verify.firstRow)
+    const LaneRows &verify = blocks[block];
+    if (!verify.rows || verify.first < end || verify.first > rows || verify.rows > rows - verify.first)
       throw std::invalid_argument("MoE verify blocks are not ascending, disjoint blocks of the step's rows");
-    group.verify.first_row[block] = verify.firstRow;
+    group.verify.first_row[block] = verify.first;
     group.verify.rows[block] = verify.rows;
-    end = verify.firstRow + verify.rows;
+    end = verify.first + verify.rows;
   }
   if (!blocks.empty()) requireBytes(buffers.verifyRows, blocks.size() * sizeof(uint32_t), "MoE verify rows");
   MoE::addRoutes(graph, buffers.input, weights.router, weights.sharedScalarGate, scratch.groupedInput,

@@ -370,11 +370,16 @@ void checkArenasWithoutGdnLayers() {
   };
   using model::DecodeTensor;
   using model::PrefillTensor;
-  constexpr std::array gdnPrefill{PrefillTensor::GdnPacked, PrefillTensor::GdnQueries, PrefillTensor::GdnKeys,
-                                  PrefillTensor::GdnValues, PrefillTensor::GdnDecay, PrefillTensor::GdnBeta,
-                                  PrefillTensor::Recurrent, PrefillTensor::GdnHidden, PrefillTensor::GdnOutput,
-                                  PrefillTensor::GroupCell};
-  constexpr std::array gdnDecode{DecodeTensor::GdnHidden, DecodeTensor::GdnOutput, DecodeTensor::GdnTape};
+  using model::TargetTensor;
+  constexpr std::array gdnTarget{TargetTensor::GdnPacked, TargetTensor::GdnQueries, TargetTensor::GdnKeys,
+                                 TargetTensor::GdnValues, TargetTensor::GdnDecay,   TargetTensor::GdnBeta,
+                                 TargetTensor::Recurrent, TargetTensor::GdnHidden,  TargetTensor::GdnOutput};
+  constexpr std::array gdnPrefill{PrefillTensor::GroupCell};
+  constexpr std::array gdnDecode{DecodeTensor::GdnTape};
+  for (const auto rows : {model::prefillTargetRows, model::decodeTargetRows})
+    require(withoutGdn(model::targetTensorBytes(hybrid.target, rows(hybrid, plans)),
+                       model::targetTensorBytes(attentionOnly.target, rows(attentionOnly, plans)), gdnTarget),
+            "the target step tensors without GDN layers are not a hybrid's without its GDN scratch");
   require(withoutGdn(model::prefillTensorBytes(hybrid, plans), model::prefillTensorBytes(attentionOnly, plans),
                      gdnPrefill),
           "the prefill arena without GDN layers is not a hybrid's without its GDN scratch");

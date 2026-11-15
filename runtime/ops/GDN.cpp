@@ -216,12 +216,12 @@ PreparedInput GDN::addDecode(metal::CommandGraph &graph, GdnDecodeBuffers buffer
   uint32_t rows = 0;
   for (uint32_t lane = 0; lane < lanes; ++lane) {
     const GdnDecodeBlock &block = buffers.blocks[lane];
-    if (!block.rows || block.rows > SPLASH_TARGET_VERIFY_ROWS || block.firstRow < rows ||
-        block.firstRow > std::numeric_limits<uint32_t>::max() - block.rows)
+    if (!block.rows || block.rows > SPLASH_TARGET_VERIFY_ROWS || block.first < rows ||
+        block.first > std::numeric_limits<uint32_t>::max() - block.rows)
       throw std::invalid_argument("invalid GDN decode geometry");
-    params.first_row[lane] = block.firstRow;
+    params.first_row[lane] = block.first;
     params.rows[lane] = block.rows;
-    rows = block.firstRow + block.rows;
+    rows = block.first + block.rows;
   }
   requireBytes(buffers.packed, packedBytes(shape, rows), "GDN packed");
   requireMixerWeights(shape, buffers.convolutionWeights, buffers.decayWeights, buffers.timeBias);
