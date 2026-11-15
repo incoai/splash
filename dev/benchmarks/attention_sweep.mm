@@ -396,7 +396,10 @@ metal::CommandGraph caseGraph(const AttentionFixture &fixture, const QsaBlocks &
   const AttentionFixturePlan &plan = fixture.plan();
   metal::CommandGraph graph;
   if (const QsaIndexer *indexer = qsa.indexer ? &*qsa.indexer : nullptr) {
-    const ops::IndexerRows rows{plan.rows, indexer->firstPositions, {indexer->tables, 0}, kQsaTopBlocks, qsa.words,
+    std::vector<ops::LaneRows> lanes;
+    for (uint32_t lane = 0; lane < indexer->firstPositions.size(); ++lane)
+      lanes.push_back({lane * plan.rows, plan.rows});
+    const ops::IndexerRows rows{lanes, indexer->firstPositions, {indexer->tables, 0}, kQsaTopBlocks, qsa.words,
                                 qsa.words * 32};
     BlockIndexer::addProject(graph, indexer->query, indexer->key, {indexer->norm, true}, indexer->ropeCos,
                              indexer->ropeSin, indexer->queries, indexer->keys, rows);

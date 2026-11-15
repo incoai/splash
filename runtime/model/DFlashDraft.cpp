@@ -354,15 +354,17 @@ void DFlashDraft::addMaskRows(metal::CommandGraph &graph, metal::MetalBuffer row
 
 void DFlashDraft::addContextCommit(
     metal::CommandGraph &graph, DFlashContextBuffers buffers,
-    std::span<const uint32_t> startPositions) const {
+    std::span<const uint32_t> startPositions, std::span<const ops::LaneRows> blocks) const {
   const uint32_t lanes = static_cast<uint32_t>(startPositions.size());
-  if (!lanes || lanes > ExecutionLimits::maximumBatchWidth ||
+  if (!lanes || lanes > ExecutionLimits::maximumBatchWidth || blocks.size() != lanes ||
       buffers.persistentKeys.size() != weights_.layout.layers ||
       buffers.persistentValues.size() != weights_.layout.layers) {
     throw std::invalid_argument("invalid draft context batch");
   }
   const DFlashDraftLayout &layout = weights_.layout;
-  const uint32_t rows = lanes * ExecutionLimits::targetVerifyRows;
+  // The context projections run over the target's rows up to the last
+  // block's end.
+  const uint32_t rows = static_cast<uint32_t>(ops::rowsEnd(blocks));
   const ops::Linear &linear = operators_.draftLinear();
   const ops::LinearScratch &scratch = buffers.linearScratch;
   linear.add(graph, {.input = buffers.capturedTargetHidden, .output = buffers.projected, .scratch = scratch},
@@ -393,7 +395,7 @@ void DFlashDraft::addContextCommit(
         graph, buffers.contextKv, weights_.layers[layer].keyNorm, buffers.ropeCos,
         buffers.ropeSin, buffers.persistentKeys[layer],
         buffers.persistentValues[layer], buffers.retainedCounts,
-        startPositions, layout.attentionShape());
+        startPositions, blocks, layout.attentionShape());
   }
 }
 

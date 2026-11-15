@@ -157,14 +157,19 @@ kernel void ngram_embedding_commit(device const bfloat *input [[buffer(0)]],
 
 // The table rows of each lane's verify rows (model/Qwen4Steps.cpp qwen4PleRows
 // on the CPU): heads of the 2- to ngram-gram hashes of the row's token and
-// those before it, cut at EOS or the sequence's start.
+// those before it, cut at EOS or the sequence's start. A thread per row of
+// the step: its lane is the last whose first row is at most it, and a row
+// past that lane's rows hashes nothing.
 kernel void ngram_embedding_hash(device const uint *tokens [[buffer(0)]],
                                  device const uint *before [[buffer(1)]],
                                  device uint *indices [[buffer(2)]],
                                  constant NgramHashParams &p [[buffer(3)]],
                                  uint index [[thread_position_in_grid]]) {
-  if (index >= p.rows) return;
-  const uint lane = index / SPLASH_TARGET_VERIFY_ROWS, r = index % SPLASH_TARGET_VERIFY_ROWS;
+  uint lane = 0;
+  for (uint l = 1; l < min(p.lanes, uint(SPLASH_MAXIMUM_BATCH_WIDTH)); ++l)
+    lane = index >= p.first_row[l] ? l : lane;
+  if (index < p.first_row[lane] || index - p.first_row[lane] >= p.rows[lane]) return;
+  const uint r = index - p.first_row[lane];
   // The row's token, then the ngram - 1 tokens before it, EOS from a cut on.
   ulong context[NGRAM_EMBEDDING_MAXIMUM_NGRAM] = {tokens[index]};
   bool cut = false;

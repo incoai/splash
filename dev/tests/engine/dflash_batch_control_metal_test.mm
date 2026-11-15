@@ -6,6 +6,7 @@
 #include "model/Model.hpp"
 #include "ops/Embedding.hpp"
 #include "ops/RowCopy.hpp"
+#include "ops/Sampling.hpp"
 #include "ops/StopTokens.hpp"
 
 #import <Foundation/Foundation.h>
@@ -120,6 +121,11 @@ void runWidth(MetalBackend &backend, uint32_t width,
   AcceptBatchParams params{};
   std::copy(remainingReference.begin(), remainingReference.end(),
             std::begin(params.remaining));
+  // Each lane's verify block, its eight rows at lane x 8.
+  for (uint32_t lane = 0; lane < kLanes; ++lane) {
+    params.first_row[lane] = lane * kRows;
+    params.rows[lane] = kRows;
+  }
   std::ranges::copy(stops.ids, params.stop_tokens);
   ComputeDispatch dispatch;
   dispatch.pipelineName = "decode_accept_dflash";
@@ -226,6 +232,7 @@ void testRowCopy(MetalBackend &backend) {
 // its seven proposals and its eight verify input rows.
 void verifyInputExtents(MetalBackend &backend) {
   constexpr uint32_t lanes = 3, vocabulary = 1003;
+  const std::array<splash::ops::LaneRows, lanes> blocks{{{0, kRows}, {kRows, kRows}, {2 * kRows, kRows}}};
   const std::array buffers{shared(backend, lanes * kRows * 4, "draft-input"),
                            shared(backend, lanes * kProposals * 4, "proposed"),
                            shared(backend, lanes * kRows * 4, "verify-input")};
@@ -236,8 +243,88 @@ void verifyInputExtents(MetalBackend &backend) {
     requireExtent(backend, buffers[index], bytes, 4, what, [&](CommandGraph &graph, const MetalBuffer &view) {
       auto changed = buffers;
       changed[index] = view;
-      Embedding::addVerifyInput(graph, changed[0], changed[1], changed[2], vocabulary, lanes);
+      Embedding::addVerifyInput(graph, changed[0], changed[1], changed[2], vocabulary, blocks);
     });
+}
+
+// Lanes whose verify blocks hold different row counts, packed one after
+// another (5, 8, 1 and 6 rows from rows 0, 5, 13 and 14), take their verify
+// input and accept their drafts as each lane does alone in a block from row
+// 0: the same input rows, retained and accepted counts. Lane l's target
+// selects its first accepted[l] proposals and then other tokens; it retains
+// at most remaining[l] tokens and its verify rows, and a block checks one
+// proposal fewer than its rows.
+void packedLanes(MetalBackend &backend) {
+  // Every token below is inside the vocabulary, which clamps none.
+  constexpr uint32_t vocabulary = 248320;
+  using splash::ops::LaneRows;
+  const std::array<LaneRows, kLanes> packed{{{0, 5}, {5, 8}, {13, 1}, {14, 6}}};
+  const std::array<uint32_t, kLanes> accepted{3, 7, 0, 5}, remaining{5, 8, 1, 4}, verifyRows{5, 6, 1, 6};
+  const std::array<splash::ops::SamplingPolicy, kLanes> greedy{};
+  const splash::ops::Sampling sampling(vocabulary);
+  // A run of `lanes` lanes' buffers: draft input, proposals, verify input,
+  // target tokens, retained and accepted counts and verify rows.
+  struct Run final {
+    std::array<MetalBuffer, 7> buffers;
+  };
+  const auto makeRun = [&](uint32_t lanes, uint32_t rows) {
+    Run run;
+    for (const auto &[index, count] : {std::pair{0, lanes * kRows}, std::pair{1, lanes * kProposals},
+                                       std::pair{2, rows}, std::pair{3, rows}, std::pair{4, lanes},
+                                       std::pair{5, lanes}, std::pair{6, lanes}}) {
+      run.buffers[index] = shared(backend, uint64_t{count} * sizeof(uint32_t), "packed-lanes");
+      std::memset(run.buffers[index].contents(), 0, run.buffers[index].sizeBytes());
+    }
+    return run;
+  };
+  // Greedy lanes read no candidates, target rows or uniforms.
+  const MetalBuffer unread = shared(backend, 16, "packed-lanes-unread");
+  const auto encode = [&](const Run &run, std::span<const LaneRows> blocks, std::span<const uint32_t> limits) {
+    const auto &b = run.buffers;
+    CommandGraph graph;
+    Embedding::addVerifyInput(graph, b[0], b[1], b[2], vocabulary, blocks);
+    sampling.addAcceptance(graph, {b[1], unread, unread, unread, unread, b[3], b[4], b[5], b[6]}, blocks, limits,
+                           std::span(greedy).first(blocks.size()), kFourStops);
+    static_cast<void>(backend.submitCommandAsync(graph.dispatches()).wait());
+  };
+  // Lane l's anchor, proposals and target tokens, written from `row` of
+  // `run`'s rows and lane `at` of its lanes.
+  const auto fill = [&](const Run &run, uint32_t lane, uint32_t at, uint32_t row) {
+    contents<uint32_t>(run.buffers[0])[at * kRows] = 500 + lane;
+    for (uint32_t position = 0; position < kProposals; ++position)
+      contents<uint32_t>(run.buffers[1])[at * kProposals + position] = 1000 + lane * 100 + position;
+    for (uint32_t index = 0; index < packed[lane].rows; ++index)
+      contents<uint32_t>(run.buffers[3])[row + index] =
+          index < accepted[lane] ? 1000 + lane * 100 + index : 9000 + lane * 100 + index;
+    contents<uint32_t>(run.buffers[6])[at] = verifyRows[lane];
+  };
+  const Run all = makeRun(kLanes, 20);
+  for (uint32_t lane = 0; lane < kLanes; ++lane) fill(all, lane, lane, packed[lane].first);
+  encode(all, packed, remaining);
+  for (uint32_t lane = 0; lane < kLanes; ++lane) {
+    const LaneRows block = packed[lane];
+    const Run alone = makeRun(1, block.rows);
+    fill(alone, lane, 0, 0);
+    const std::array<LaneRows, 1> own{{{0, block.rows}}};
+    encode(alone, own, std::span(remaining).subspan(lane, 1));
+    const std::string label = "packed lane " + std::to_string(lane);
+    require(std::equal(contents<uint32_t>(all.buffers[2]) + block.first,
+                       contents<uint32_t>(all.buffers[2]) + block.first + block.rows,
+                       contents<uint32_t>(alone.buffers[2])),
+            label + ": its verify input differs from alone");
+    const uint32_t retained = contents<uint32_t>(all.buffers[4])[lane];
+    const uint32_t counted = contents<uint32_t>(all.buffers[5])[lane];
+    require(retained == contents<uint32_t>(alone.buffers[4])[0] && counted == contents<uint32_t>(alone.buffers[5])[0],
+            label + ": its acceptance differs from alone");
+    require(counted == accepted[lane] &&
+                retained == std::min({accepted[lane] + 1, remaining[lane], verifyRows[lane]}),
+            label + ": accepted " + std::to_string(counted) + " and retained " + std::to_string(retained));
+    // The anchor, then the proposals the block's rows after it hold.
+    require(contents<uint32_t>(all.buffers[2])[block.first] == 500 + lane &&
+                (block.rows < 2 || contents<uint32_t>(all.buffers[2])[block.first + block.rows - 1] ==
+                                       1000 + lane * 100 + block.rows - 2),
+            label + ": its verify input is not its anchor and proposals");
+  }
 }
 
 } // namespace
@@ -274,6 +361,7 @@ int main(int argc, char **argv) {
     runWidth(backend, kLanes, lowerAccepted, shortRemaining, kLanes, 0, fewRows);
     testRowCopy(backend);
     verifyInputExtents(backend);
+    packedLanes(backend);
     std::cout << "dflash_batch_control_metal_test: PASS\n";
     return 0;
   } catch (const std::exception &error) {

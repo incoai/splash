@@ -29,22 +29,25 @@ GGUF_EMBEDDING_FORMATS(GGUF_EMBEDDING_FORMAT)
 #undef GGUF_EMBEDDING_FORMAT
 #undef GGUF_GATHER
 
-// A verify step's input tokens, SPLASH_TARGET_VERIFY_ROWS per lane: the
-// lane's anchor, row 0 of its draft input, then the draft's proposals, each
-// clamped into the vocabulary.
+// A verify step's input tokens (VerifyInputBatchParams), a grid of a lane's
+// rows by lanes: a lane's anchor, row 0 of its draft input rows (its block of
+// SPLASH_DRAFT_QUERY_ROWS), then its draft's proposals, each clamped into the
+// vocabulary.
 kernel void verify_input_tokens(
     device const uint *draft_input [[buffer(0)]],
     device const uint *draft_tokens [[buffer(1)]],
     device uint *verify_input [[buffer(2)]],
     constant VerifyInputBatchParams &params [[buffer(3)]],
-    uint index [[thread_position_in_grid]]) {
-  uint batch = index / SPLASH_TARGET_VERIFY_ROWS;
-  uint row = index % SPLASH_TARGET_VERIFY_ROWS;
+    uint2 group [[threadgroup_position_in_grid]]) {
+  const uint batch = group.y, row = group.x;
+  if (row >= params.rows[batch])
+    return;
   uint token = row == 0
-                   ? draft_input[batch * SPLASH_TARGET_VERIFY_ROWS]
+                   ? draft_input[batch * SPLASH_DRAFT_QUERY_ROWS]
                    : draft_tokens[batch * SPLASH_DRAFT_PROPOSAL_TOKENS +
                                   row - 1];
-  verify_input[index] = min(token, params.vocabulary - 1u);
+  verify_input[params.first_row[batch] + row] =
+      min(token, params.vocabulary - 1u);
 }
 
 // Each lane's mask rows of its draft input, rows 1 to SPLASH_TARGET_VERIFY_ROWS - 1 (the

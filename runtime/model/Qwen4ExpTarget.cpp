@@ -202,12 +202,16 @@ std::vector<ops::AttentionBlocks> Qwen4ExpTarget::addPrefillQsa(PrefillStep &ste
                            uint32_t width) {
     return rowsOf<float>(buffer, sequence.rowBegin, sequence.rows, width);
   };
+  // A sequence's rows are the whole of the views of them each dispatch takes.
   std::vector<uint32_t> firstPositions;
-  for (const QwenTargetPrefillSequence &sequence : step.sequences)
+  std::vector<ops::LaneRows> sequenceRows;
+  for (const QwenTargetPrefillSequence &sequence : step.sequences) {
     firstPositions.push_back(static_cast<uint32_t>(sequence.chunk.committed_tokens));
+    sequenceRows.push_back({0, sequence.rows});
+  }
   const auto qsaRows = [&](size_t index) {
     const QwenTargetPrefillSequence &sequence = step.sequences[index];
-    return ops::IndexerRows{sequence.rows, std::span(firstPositions).subspan(index, 1),
+    return ops::IndexerRows{std::span(sequenceRows).subspan(index, 1), std::span(firstPositions).subspan(index, 1),
                             {{&sequence.indexTable, 1}, step.indexOffsets[layer]}, topBlocks, h.maskWords,
                             h.scoreStride};
   };
@@ -265,9 +269,9 @@ void Qwen4ExpTarget::prepareVerifyLane(uint32_t lane, uint64_t position, const Q
 
 void Qwen4ExpTarget::addVerifyInput(metal::CommandGraph &graph, metal::MetalBuffer draftInput,
                                     metal::MetalBuffer proposals, metal::MetalBuffer verifyInput,
-                                    uint32_t lanes) const {
-  QwenTarget::addVerifyInput(graph, std::move(draftInput), std::move(proposals), verifyInput, lanes);
-  steps_.addVerifyInput(graph, std::move(verifyInput), lanes);
+                                    std::span<const ops::LaneRows> blocks) const {
+  QwenTarget::addVerifyInput(graph, std::move(draftInput), std::move(proposals), verifyInput, blocks);
+  steps_.addVerifyInput(graph, std::move(verifyInput), blocks);
 }
 
 ops::PreparedInput Qwen4ExpTarget::addVerifyMix(VerifyStep &step, const Qwen4HyperWeights &hyper,
@@ -296,12 +300,14 @@ ops::AttentionBlocks Qwen4ExpTarget::addVerifyQsa(VerifyStep &step, const Qwen4I
   const uint32_t keyWidth = geometry_.indexerHeadDimension, queryWidth = geometry_.indexerHeads * keyWidth;
   addIndexerProjections(step.graph, linear, b.normalized, indexer, h.indexerQuery, h.indexerKey, step.rows);
   std::array<uint32_t, ExecutionLimits::maximumBatchWidth> firstPositions{};
+  std::array<ops::LaneRows, ExecutionLimits::maximumBatchWidth> laneRows{};
   bool sparse = false;
   for (uint32_t lane = 0; lane < step.lanes; ++lane) {
     firstPositions[lane] = step.chunks[lane].committed_tokens;
+    laneRows[lane] = {lane * kVerifyRows, kVerifyRows};
     sparse = sparse || ops::BlockIndexer::sparse(firstPositions[lane], kVerifyRows, topBlocks);
   }
-  const ops::IndexerRows qsa{kVerifyRows, std::span(firstPositions).first(step.lanes),
+  const ops::IndexerRows qsa{std::span(laneRows).first(step.lanes), std::span(firstPositions).first(step.lanes),
                              {std::span(b.indexTables).first(step.lanes), step.indexOffsets[layer]}, topBlocks,
                              h.maskWords, h.scoreStride};
   const metal::MetalBuffer queries = rowsOf<uint16_t>(h.qsaQueries, 0, step.rows, queryWidth);
@@ -397,18 +403,19 @@ void Qwen4ExpTarget::addHeadBatch(metal::CommandGraph &graph, metal::MetalBuffer
 }
 
 void Qwen4ExpTarget::addStateCommit(metal::CommandGraph &graph, QwenTargetCommitBuffers buffers,
-                                    uint32_t lanes) const {
-  QwenTarget::addStateCommit(graph, buffers, lanes);
+                                    std::span<const ops::LaneRows> blocks) const {
+  QwenTarget::addStateCommit(graph, buffers, blocks);
+  const auto lanes = static_cast<uint32_t>(blocks.size());
   // Each lane's PLE history and QSA pending keys after its retained rows,
-  // from the convolution inputs and the keys its verify wrote.
+  // from the convolution inputs and the keys its verify wrote of its block.
   const ops::NgramShape shape = ngramShape(geometry_);
-  const Qwen4Scratch scratch = steps_.verifyScratch(lanes * kVerifyRows);
-  const uint64_t laneBytes = uint64_t{kVerifyRows} * shape.width() * sizeof(uint16_t);
+  const Qwen4Scratch scratch = steps_.verifyScratch(static_cast<uint32_t>(ops::rowsEnd(blocks)));
+  const uint64_t rowBytes = uint64_t{shape.width()} * sizeof(uint16_t);
   for (uint32_t lane = 0; lane < lanes; ++lane)
-    ops::NgramEmbedding::addCommit(graph, backend_.view(scratch.pleConvolution, lane * laneBytes, laneBytes),
-                                   buffers.auxiliaryIn[lane], buffers.auxiliaryOut[lane],
-                                   backend_.view(buffers.retainedCounts, lane * sizeof(uint32_t), sizeof(uint32_t)),
-                                   shape);
+    ops::NgramEmbedding::addCommit(
+        graph, backend_.view(scratch.pleConvolution, blocks[lane].first * rowBytes, blocks[lane].rows * rowBytes),
+        buffers.auxiliaryIn[lane], buffers.auxiliaryOut[lane],
+        backend_.view(buffers.retainedCounts, lane * sizeof(uint32_t), sizeof(uint32_t)), shape, blocks[lane].rows);
   const uint32_t layers = geometry_.kvLayout.attentionLayers;
   std::array<metal::MetalBuffer, ExecutionLimits::maximumBatchWidth> in, out;
   for (uint32_t lane = 0; lane < lanes; ++lane) {
@@ -416,7 +423,7 @@ void Qwen4ExpTarget::addStateCommit(metal::CommandGraph &graph, QwenTargetCommit
     out[lane] = steps_.qsaPending(buffers.auxiliaryOut[lane], 0, layers);
   }
   const auto positions = steps_.verifyPositions(lanes);
-  ops::BlockIndexer::addCommit(graph, scratch.qsaKeys, layers, scratch.keyLayerRows, kVerifyRows,
+  ops::BlockIndexer::addCommit(graph, scratch.qsaKeys, layers, scratch.keyLayerRows, blocks,
                                std::span(positions).first(lanes), buffers.retainedCounts, std::span(in).first(lanes),
                                std::span(out).first(lanes));
 }

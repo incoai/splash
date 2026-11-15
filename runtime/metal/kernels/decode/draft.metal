@@ -118,27 +118,27 @@ kernel void draft_context_kv_commit(
     device bfloat *values3 [[buffer(11)]],
     device const uint *retained [[buffer(12)]],
     constant DraftContextBatchParams &params [[buffer(13)]],
-    uint group [[threadgroup_position_in_grid]],
+    uint2 group [[threadgroup_position_in_grid]],
     uint thread_index [[thread_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]],
     uint simd_group [[simdgroup_index_in_threadgroup]]) {
-  constexpr uint Rows = SPLASH_TARGET_VERIFY_ROWS;
   constexpr uint KVHeads = SPLASH_DRAFT_KV_HEADS;
   // A context row's keys and values (draft_context_kv_phase).
   constexpr uint RowWidth = 2 * KVHeads * SPLASH_DRAFT_HEAD_DIMENSION;
-  constexpr uint RopeLaneStride = Rows * SPLASH_DRAFT_ROPE_PAIRS;
-  uint batch = group / (Rows * KVHeads);
-  uint task = group % (Rows * KVHeads);
+  constexpr uint RopeLaneStride =
+      SPLASH_DRAFT_QUERY_ROWS * SPLASH_DRAFT_ROPE_PAIRS;
+  // A grid of (row, KV head) tasks of a lane's block by lanes.
+  const uint batch = group.y, task = group.x;
   device bfloat *keys = SPLASH_LANE_BINDING(batch, keys0, keys1, keys2, keys3);
   device bfloat *values = SPLASH_LANE_BINDING(batch, values0, values1, values2, values3);
   threadgroup float reductions[8];
   threadgroup bfloat normalized[SPLASH_DRAFT_HEAD_DIMENSION];
   draft_context_kv_phase(
-      context_kv + ulong(batch) * Rows * RowWidth, k_norm,
+      context_kv + ulong(params.first_row[batch]) * RowWidth, k_norm,
       rope_cos + ulong(batch) * RopeLaneStride,
       rope_sin + ulong(batch) * RopeLaneStride, keys, values,
-      params.start_position[batch], min(retained[batch], Rows), task,
-      thread_index, lane, simd_group, reductions, normalized);
+      params.start_position[batch], min(retained[batch], params.rows[batch]),
+      task, thread_index, lane, simd_group, reductions, normalized);
 }
 
 // The first rows of a lane's verify rows, as many as the lane retained

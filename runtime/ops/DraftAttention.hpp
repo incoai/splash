@@ -2,6 +2,7 @@
 
 #include "metal/CommandGraph.hpp"
 #include "metal/abi/ExecutionGeometry.h"
+#include "ops/LaneRows.hpp"
 
 #include <cstdint>
 #include <span>
@@ -105,6 +106,11 @@ public:
       metal::MetalBuffer ropeSin, metal::MetalBuffer keys,
       metal::MetalBuffer values, uint32_t tokens, uint32_t startPosition,
       DraftAttentionShape shape);
+  // Each lane's retained rows (a GPU count), at most its verify block's of
+  // `blocks`: the block's context rows of contextKv, at positions from the
+  // lane's start position, each rotated by its row of the lane's draft
+  // block of the RoPE tables (SPLASH_DRAFT_QUERY_ROWS rows a lane), which
+  // holds the same positions.
   static void addContextCommit(
       metal::CommandGraph &graph, metal::MetalBuffer contextKv,
       metal::MetalBuffer keyNorm, metal::MetalBuffer ropeCos,
@@ -112,7 +118,8 @@ public:
       std::span<const metal::MetalBuffer> persistentKeys,
       std::span<const metal::MetalBuffer> persistentValues,
       metal::MetalBuffer retainedCounts,
-      std::span<const uint32_t> startPositions, DraftAttentionShape shape);
+      std::span<const uint32_t> startPositions, std::span<const LaneRows> blocks,
+      DraftAttentionShape shape);
 
   // A context window: for each slot of a ring, the bf16 context row of
   // `width` values the slot's keys and values are computed from, in 4-bit

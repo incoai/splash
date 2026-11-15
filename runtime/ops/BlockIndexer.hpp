@@ -7,6 +7,7 @@
 
 #include "metal/CommandGraph.hpp"
 #include "metal/abi/BlockIndexer.h"
+#include "ops/LaneRows.hpp"
 #include "ops/Normalization.hpp"
 
 #include <cstdint>
@@ -26,12 +27,13 @@ struct BlockIndex final {
 };
 
 // The indexer's rows of a dispatch's lanes (a verify step's, or a prefill
-// sequence as one): `rows` query rows of each lane, lane l's from logical
-// position firstPositions[l], which attend sparsely past topBlocks complete
-// blocks of the index; bitmaps of maskWords words and scores of scoreStride
-// per row, which cover each row's complete blocks and its tail.
+// sequence as one): lane l's query rows lanes[l] of the dispatch's rows (in
+// row order), from logical position firstPositions[l], which attend sparsely
+// past topBlocks complete blocks of the index; bitmaps of maskWords words and
+// scores of scoreStride per row, which cover each row's complete blocks and
+// its tail.
 struct IndexerRows final {
-  uint32_t rows = 0;
+  std::span<const LaneRows> lanes;
   std::span<const uint32_t> firstPositions;
   BlockIndex index;
   uint32_t topBlocks = 0;
@@ -77,7 +79,8 @@ struct BlockIndexer final {
   // The rows' scores of their complete blocks' pooled keys and, from them,
   // their bitmaps. A dispatch of one lane scores its rows in batches of the
   // score scratch's scoreRows rows; one of several lanes scores every lane's
-  // rows at once, which the scratch must hold.
+  // rows at once, which the scratch must hold from the first lane's first
+  // row on.
   static void addSelect(metal::CommandGraph &graph, metal::MetalBuffer queries, metal::MetalBuffer scores,
                         uint32_t scoreRows, metal::MetalBuffer mask, const IndexerRows &rows);
   // A sequence's pending keys of one layer after its first `retained` rows
@@ -88,13 +91,13 @@ struct BlockIndexer final {
                          metal::MetalBuffer pendingOut, uint32_t firstPosition, uint32_t retained);
   // Each verify lane's pending keys of each of `layers` layers after the rows
   // it retained (`retained`, a count per lane the GPU wrote), from the step's
-  // keys of every layer (`layerRows` rows apart, each lane's `laneRows` rows
-  // from firstPositions[l] after the lanes before it) and pendingIn[l], the
-  // lane's pending keys before the step; a lane's layers follow each other in
-  // its pending keys.
+  // keys of every layer (`layerRows` rows apart, lane l's laneRows[l] of each
+  // layer's, from position firstPositions[l]) and pendingIn[l], the lane's
+  // pending keys before the step; a lane's layers follow each other in its
+  // pending keys.
   static void addCommit(metal::CommandGraph &graph, metal::MetalBuffer keys, uint32_t layers, uint32_t layerRows,
-                        uint32_t laneRows, std::span<const uint32_t> firstPositions, metal::MetalBuffer retained,
-                        std::span<const metal::MetalBuffer> pendingIn,
+                        std::span<const LaneRows> laneRows, std::span<const uint32_t> firstPositions,
+                        metal::MetalBuffer retained, std::span<const metal::MetalBuffer> pendingIn,
                         std::span<const metal::MetalBuffer> pendingOut);
 };
 

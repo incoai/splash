@@ -10,9 +10,11 @@
 
 #include "metal/CommandGraph.hpp"
 #include "metal/abi/NgramEmbedding.h"
+#include "ops/LaneRows.hpp"
 #include "ops/Normalization.hpp"
 
 #include <cstdint>
+#include <span>
 
 namespace splash::ops {
 
@@ -42,12 +44,15 @@ struct NgramEmbedding final {
                          metal::MetalBuffer historyIn, metal::MetalBuffer historyOut, NgramShape shape,
                          uint32_t rows);
   // The history after a lane's `retained` (a GPU count) rows of its verify
-  // step's SPLASH_TARGET_VERIFY_ROWS in convolutionInput.
+  // block's `rows` in convolutionInput.
   static void addCommit(metal::CommandGraph &graph, metal::MetalBuffer convolutionInput,
                         metal::MetalBuffer historyIn, metal::MetalBuffer historyOut, metal::MetalBuffer retained,
-                        NgramShape shape);
+                        NgramShape shape, uint32_t rows);
+  // The table rows of each lane's verify rows (`lanes`, in row order) by the
+  // hash `params` describes, whose lanes and rows it sets.
   static void addHash(metal::CommandGraph &graph, metal::MetalBuffer tokens, metal::MetalBuffer before,
-                      metal::MetalBuffer indices, const NgramHashParams &params, uint32_t heads);
+                      metal::MetalBuffer indices, NgramHashParams params, std::span<const LaneRows> lanes,
+                      uint32_t heads);
 };
 
 } // namespace splash::ops

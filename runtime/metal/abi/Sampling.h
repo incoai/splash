@@ -31,23 +31,24 @@
 #define SPLASH_STOP_TOKENS 4u
 #define SPLASH_NO_TOKEN 0xFFFFFFFFu
 
-// One target-policy dispatch over lanes of SPLASH_TARGET_VERIFY_ROWS logits
-// rows, SPLASH_TARGET_VERIFY_ROWS + 1 constraint-mask rows and
-// SPLASH_SAMPLING_UNIFORMS uniforms each. Selected row s is row s % rows of
-// lane s / rows: its logits row is lane * SPLASH_TARGET_VERIFY_ROWS +
-// logits_row + s % rows, its mask row lane * (SPLASH_TARGET_VERIFY_ROWS + 1) +
-// mask_row + s % rows, and its draw takes uniform
-// lane * SPLASH_SAMPLING_UNIFORMS + uniform; workspaces and output tokens are
-// indexed by s. Rows below drafted_rows follow draft token s % rows (verify
-// input row s % rows + 1).
+// One target-policy dispatch over the selected rows of its lanes, a grid of a
+// lane's rows by lanes: lane l selects rows[l] rows of the logits from row
+// first_row[l] (ops::LaneRows), at most SPLASH_TARGET_VERIFY_ROWS. Its row
+// i, the logits row s = first_row[l] + i, reads mask row
+// l * (SPLASH_TARGET_VERIFY_ROWS + 1) + mask_row + i of the lane's
+// SPLASH_TARGET_VERIFY_ROWS + 1 constraint-mask rows and draws with uniform
+// l * SPLASH_SAMPLING_UNIFORMS + uniform; workspaces, vocabulary rows and
+// output tokens are indexed by s. Every row of a lane but its last follows a
+// draft token: row i of a verify block the draft's proposal i (verify input
+// row s + 1), its last the bonus row after them; a lane of one row (the
+// first token after a prompt) follows none.
 struct TargetSamplingParams {
   uint32_t vocabulary;
   uint32_t mask_words;
-  uint32_t rows;
-  uint32_t logits_row;
   uint32_t mask_row;
   uint32_t uniform;
-  uint32_t drafted_rows;
+  uint32_t first_row[SPLASH_MAXIMUM_BATCH_WIDTH];
+  uint32_t rows[SPLASH_MAXIMUM_BATCH_WIDTH];
   uint32_t top_k[SPLASH_MAXIMUM_BATCH_WIDTH];
   float temperature[SPLASH_MAXIMUM_BATCH_WIDTH];
   float top_p[SPLASH_MAXIMUM_BATCH_WIDTH];
@@ -60,8 +61,8 @@ struct TargetSamplingParams {
   uint32_t stop_tokens[SPLASH_STOP_TOKENS];
 };
 
-static_assert(sizeof(TargetSamplingParams) == 120,
-              "Target sampling parameters are 120 bytes on both sides");
+static_assert(sizeof(TargetSamplingParams) == 140,
+              "Target sampling parameters are 140 bytes on both sides");
 
 // One shard's share of a sampled row's softmax denominator: the largest
 // logit it admits, the sum of exp((logit - maximum) / temperature) over its
@@ -111,16 +112,16 @@ static_assert(sizeof(TargetVocabularyRange) == 8,
 #define SPLASH_PENALTY_PROMPT_BIT 0x80000000u
 #define SPLASH_PENALTY_COUNT_MASK 0x7fffffffu
 
-// The penalized lanes of one penalty dispatch. Each entry names the lane of
-// its logits and the penalty table row it reads; rows penalizes that many
-// rows of the lane's SPLASH_TARGET_VERIFY_ROWS, from row_offset.
-// repetition_inverse is 1 / repetition, saturated to the largest float.
+// The penalized lanes of one penalty dispatch. Entry e penalizes its lane's
+// selected rows, rows[e] rows of the logits from first_row[e]
+// (TargetSamplingParams), from the penalty table row table_row[e]; the
+// rows' verify input rows hold its draft tokens. repetition_inverse is
+// 1 / repetition, saturated to the largest float.
 struct SamplingPenaltyParams {
   uint32_t vocabulary;
-  uint32_t rows;
-  uint32_t row_offset;
   uint32_t entries;
-  uint32_t logits_lane[SPLASH_MAXIMUM_BATCH_WIDTH];
+  uint32_t first_row[SPLASH_MAXIMUM_BATCH_WIDTH];
+  uint32_t rows[SPLASH_MAXIMUM_BATCH_WIDTH];
   uint32_t table_row[SPLASH_MAXIMUM_BATCH_WIDTH];
   float repetition[SPLASH_MAXIMUM_BATCH_WIDTH];
   float repetition_inverse[SPLASH_MAXIMUM_BATCH_WIDTH];
@@ -128,18 +129,18 @@ struct SamplingPenaltyParams {
   float frequency[SPLASH_MAXIMUM_BATCH_WIDTH];
 };
 
-static_assert(sizeof(SamplingPenaltyParams) == 112,
-              "Sampling penalty parameters are 112 bytes on both sides");
+static_assert(sizeof(SamplingPenaltyParams) == 120,
+              "Sampling penalty parameters are 120 bytes on both sides");
 
 // One selection's thinking cutoffs (ops::SamplingPolicy::thinkingCutoff), its
-// rows laid out as in TargetSamplingParams. A lane whose row is below rows
-// selects its end token tokens[i] at row + i for each i below its count and
-// rows - row, unless a draft token before that row is close or also_ends,
-// which ended thinking first; a sampled lane's drafted row then gives its
-// draft token the target probability 1 when it is the row's end token, else
-// 0. The end of a lane in waiting_mask, a constrained one, waits for its
-// mask: its row is instead the first from there whose constraint mask row
-// (mask_row on, of mask_words words, as in TargetSamplingParams) admits
+// lanes' rows laid out as in TargetSamplingParams. A lane whose row is below
+// its rows selects its end token tokens[i] at row + i for each i below its
+// count and its rows less row, unless a draft token before that row is close
+// or also_ends, which ended thinking first; a sampled lane's drafted row then
+// gives its draft token the target probability 1 when it is the row's end
+// token, else 0. The end of a lane in waiting_mask, a constrained one, waits
+// for its mask: its row is instead the first from there whose constraint mask
+// row (mask_row on, of mask_words words, as in TargetSamplingParams) admits
 // tokens[0]. The rows before it keep their own selections, as do all the rows
 // of a selection without one. A row whose selection is the sentinel of a row
 // with no selectable logit (a token outside the vocabulary) keeps it, so the
@@ -148,12 +149,12 @@ static_assert(sizeof(SamplingPenaltyParams) == 112,
 // acceptance keeps them all.
 struct ThinkingCutoffParams {
   uint32_t vocabulary;
-  uint32_t rows;
-  uint32_t drafted_rows;
   uint32_t sampling_mask;
   uint32_t waiting_mask;
   uint32_t mask_words;
   uint32_t mask_row;
+  uint32_t first_row[SPLASH_MAXIMUM_BATCH_WIDTH];
+  uint32_t rows[SPLASH_MAXIMUM_BATCH_WIDTH];
   uint32_t row[SPLASH_MAXIMUM_BATCH_WIDTH];
   uint32_t count[SPLASH_MAXIMUM_BATCH_WIDTH];
   // The token that closes thinking, the last of the lane's end.
@@ -162,8 +163,8 @@ struct ThinkingCutoffParams {
   uint32_t tokens[SPLASH_MAXIMUM_BATCH_WIDTH][SPLASH_TARGET_VERIFY_ROWS];
 };
 
-static_assert(sizeof(ThinkingCutoffParams) == 220,
-              "Thinking cutoff parameters are 220 bytes on both sides");
+static_assert(sizeof(ThinkingCutoffParams) == 244,
+              "Thinking cutoff parameters are 244 bytes on both sides");
 
 // The batched selector and acceptance kernels' grids cover exactly the
 // dispatch's lanes: per-lane arrays hold those lanes, and entries past them
@@ -207,11 +208,17 @@ struct VerifyRowsParams {
 static_assert(sizeof(VerifyRowsParams) == 188,
               "Verify rows parameters are 188 bytes on both sides");
 
+// Acceptance of each lane's draft proposals against its verify block, rows[l]
+// rows from first_row[l] of the output tokens and, for a sampled lane, of the
+// vocabulary rows (TargetSamplingParams): the block's rows but its last check
+// as many proposals, and the lane retains at most remaining[l] tokens.
 struct AcceptBatchParams {
   uint32_t remaining[SPLASH_MAXIMUM_BATCH_WIDTH];
+  uint32_t first_row[SPLASH_MAXIMUM_BATCH_WIDTH];
+  uint32_t rows[SPLASH_MAXIMUM_BATCH_WIDTH];
   uint32_t stop_tokens[SPLASH_STOP_TOKENS];
   uint32_t sampling_mask;
 };
 
-static_assert(sizeof(AcceptBatchParams) == 36,
-              "Batched acceptance parameters are 36 bytes on both sides");
+static_assert(sizeof(AcceptBatchParams) == 68,
+              "Batched acceptance parameters are 68 bytes on both sides");

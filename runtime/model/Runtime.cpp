@@ -55,6 +55,20 @@ using metal::CommandTiming;
 using metal::MetalBackend;
 using metal::MetalBuffer;
 
+// Each decode lane's verify block among a step's rows: its kDecodeRows rows
+// at lane x kDecodeRows, as the decode arena holds them, the first of which
+// a lane selects its first token after a prompt from.
+constexpr std::array<ops::LaneRows, kLaneCount> kDecodeBlocks = [] {
+  std::array<ops::LaneRows, kLaneCount> blocks{};
+  for (uint32_t lane = 0; lane < kLaneCount; ++lane) blocks[lane] = {lane * kDecodeRows, kDecodeRows};
+  return blocks;
+}();
+constexpr std::array<uint32_t, kLaneCount> kDecodeFirstRows = [] {
+  std::array<uint32_t, kLaneCount> rows{};
+  for (uint32_t lane = 0; lane < kLaneCount; ++lane) rows[lane] = kDecodeBlocks[lane].first;
+  return rows;
+}();
+
 // What a command's sample reports of its work (ModelBatchTicket::sample):
 // the work it encodes, with the weights it read on demand as the store's
 // reads moved from before its submission to its completion
@@ -655,12 +669,12 @@ struct Runtime::Impl {
     const std::array<uint32_t, 2> stateLanes{0, 1};
     const ops::PenaltyTable penalties{penaltyTable, stateLanes};
     CommandGraph graph;
-    sampling.addInitial(graph, policies, samplingBuffers(2), 0,
+    sampling.addInitial(graph, policies, samplingBuffers(2), std::span(kDecodeFirstRows).first(2),
                         geometry.target.stopTokens, penalties);
     sampling.addThinkingDrafts(
-        graph, policies,
+        graph, policies, std::span(kDecodeBlocks).first(2),
         decodeArena->batchSlice(DecodeTensor::ProposedTokens, 2));
-    sampling.addVerify(graph, policies, samplingBuffers(2),
+    sampling.addVerify(graph, policies, samplingBuffers(2), std::span(kDecodeBlocks).first(2),
                        geometry.target.stopTokens, penalties);
     backend.preparePipelines(graph.dispatches());
   }
@@ -1460,17 +1474,15 @@ struct Runtime::Impl {
     encodeTargetLogitsCapture(graph, width, 1);
 #endif
     sampling.addInitial(graph, std::span(policies).first(width),
-                        samplingBuffers(width), 0,
+                        samplingBuffers(width), std::span(kDecodeFirstRows).first(width),
                         geometry.target.stopTokens,
                         {penaltyTable, std::span(stateLanes).first(width)});
   }
 
   // The first token encodeInitialSelections() selected for a batch lane: a
-  // selection writes one output token per lane, in lane order.
+  // selection writes a row's token at its row, the lane's first.
   uint32_t initialToken(uint32_t lane) const {
-    return contents<uint32_t>(
-        decodeArena->batchSlice(DecodeTensor::OutputTokens, lane + 1),
-        "initial tokens")[lane];
+    return *contents<uint32_t>(decodeArena->get(lane, DecodeTensor::OutputTokens), "initial tokens");
   }
 
   // Selects the first token of each constrained lane of the plan under the
@@ -2216,7 +2228,7 @@ struct Runtime::Impl {
     }
     ops::DraftSelector::addVerifyRows(graph, d(DecodeTensor::VerifyConfidence), d(DecodeTensor::VerifyRows),
                                       verify, maximumRows);
-    sampling.addThinkingDrafts(graph, std::span(policies).first(lanes),
+    sampling.addThinkingDrafts(graph, std::span(policies).first(lanes), std::span(kDecodeBlocks).first(lanes),
                                d(DecodeTensor::ProposedTokens));
   }
 
@@ -2310,7 +2322,7 @@ struct Runtime::Impl {
     encodeTargetLogitsCapture(graph, lanes, kDecodeRows);
 #endif
     sampling.addVerify(graph, std::span(policies).first(lanes),
-                       samplingBuffers(lanes), geometry.target.stopTokens,
+                       samplingBuffers(lanes), std::span(kDecodeBlocks).first(lanes), geometry.target.stopTokens,
                        {penaltyTable, std::span(stateLanes).first(lanes)});
   }
 
@@ -2345,7 +2357,7 @@ struct Runtime::Impl {
     buffers.retainedCounts = d(DecodeTensor::RetainedCount);
     bindDraftRings(entries, buffers.persistentKeys, buffers.persistentValues);
     draftModel.addContextCommit(graph, std::move(buffers),
-                                std::span(startPositions).first(lanes));
+                                std::span(startPositions).first(lanes), std::span(kDecodeBlocks).first(lanes));
   }
 
   void encodeBatchAcceptance(CommandGraph &graph,
@@ -2375,7 +2387,7 @@ struct Runtime::Impl {
          decodeArena->batchSlice(DecodeTensor::RetainedCount, width),
          decodeArena->batchSlice(DecodeTensor::AcceptedCount, width),
          decodeArena->batchSlice(DecodeTensor::VerifyRows, width)},
-        maximumRetained, std::span(policies).first(width),
+        std::span(kDecodeBlocks).first(width), maximumRetained, std::span(policies).first(width),
         geometry.target.stopTokens);
   }
 
@@ -2394,7 +2406,7 @@ struct Runtime::Impl {
       buffers.auxiliaryIn[lane] = states.current(entry.stateLane).auxiliary;
       buffers.auxiliaryOut[lane] = states.next(entry.stateLane).auxiliary;
     }
-    targetModel->addStateCommit(graph, std::move(buffers), width);
+    targetModel->addStateCommit(graph, std::move(buffers), std::span(kDecodeBlocks).first(width));
   }
 
   // The state each lane's cycle captures (ModelBatchItem::stateCaptures), at
@@ -2462,7 +2474,7 @@ struct Runtime::Impl {
     targetModel->addVerifyInput(
         graph, decodeArena->batchSlice(DecodeTensor::DraftInputTokens, lanes),
         decodeArena->batchSlice(DecodeTensor::ProposedTokens, lanes),
-        decodeArena->batchSlice(DecodeTensor::InputTokens, lanes), lanes);
+        decodeArena->batchSlice(DecodeTensor::InputTokens, lanes), std::span(kDecodeBlocks).first(lanes));
   }
 
   // A stop token or the last budgeted token needs no target work of its own:

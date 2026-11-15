@@ -90,10 +90,11 @@ void NgramEmbedding::addHistory(metal::CommandGraph &graph, metal::MetalBuffer c
 
 void NgramEmbedding::addCommit(metal::CommandGraph &graph, metal::MetalBuffer convolutionInput,
                                metal::MetalBuffer historyIn, metal::MetalBuffer historyOut, metal::MetalBuffer retained,
-                               NgramShape shape) {
+                               NgramShape shape, uint32_t rows) {
   requireShape(shape);
+  if (!rows) throw std::invalid_argument("invalid n-gram embedding commit");
   // The GPU's count is of the lane's verify rows, any of which it may retain.
-  requireBytes(convolutionInput, bfloat16Rows(shape, SPLASH_TARGET_VERIFY_ROWS), "n-gram embedding convolution input");
+  requireBytes(convolutionInput, bfloat16Rows(shape, rows), "n-gram embedding convolution input");
   requireBytes(historyIn, historyBytes(shape), "n-gram embedding history");
   requireBytes(historyOut, historyBytes(shape), "n-gram embedding next history");
   requireBytes(retained, sizeof(uint32_t), "n-gram embedding retained rows");
@@ -103,18 +104,23 @@ void NgramEmbedding::addCommit(metal::CommandGraph &graph, metal::MetalBuffer co
 }
 
 void NgramEmbedding::addHash(metal::CommandGraph &graph, metal::MetalBuffer tokens, metal::MetalBuffer before,
-                             metal::MetalBuffer indices, const NgramHashParams &params, uint32_t heads) {
-  if (!params.rows || heads != (params.ngram - 1) * params.heads_per_ngram || heads > NGRAM_EMBEDDING_MAXIMUM_HEADS ||
+                             metal::MetalBuffer indices, NgramHashParams params, std::span<const LaneRows> lanes,
+                             uint32_t heads) {
+  if (heads != (params.ngram - 1) * params.heads_per_ngram || heads > NGRAM_EMBEDDING_MAXIMUM_HEADS ||
       params.ngram > NGRAM_EMBEDDING_MAXIMUM_NGRAM)
     throw std::invalid_argument("invalid n-gram hash");
-  // Each lane of SPLASH_TARGET_VERIFY_ROWS rows reads the ngram - 1 tokens
-  // before it.
-  const uint64_t lanes = (uint64_t{params.rows} + SPLASH_TARGET_VERIFY_ROWS - 1) / SPLASH_TARGET_VERIFY_ROWS;
-  requireBytes(tokens, uint64_t{params.rows} * sizeof(uint32_t), "n-gram hash token");
-  requireBytes(before, lanes * (params.ngram - 1) * sizeof(uint32_t), "n-gram hash prior token");
-  requireBytes(indices, uint64_t{params.rows} * heads * sizeof(uint32_t), "n-gram hash index");
+  // The kernel finds a row's lane by the lanes' first rows.
+  requireLaneRows(lanes);
+  requireRowOrder(lanes);
+  params.lanes = static_cast<uint32_t>(lanes.size());
+  copyLaneRows(lanes, params.first_row, params.rows);
+  // Each lane reads the ngram - 1 tokens before its first row.
+  const uint64_t rows = rowsEnd(lanes);
+  requireBytes(tokens, rows * sizeof(uint32_t), "n-gram hash token");
+  requireBytes(before, uint64_t{params.lanes} * (params.ngram - 1) * sizeof(uint32_t), "n-gram hash prior token");
+  requireBytes(indices, rows * heads * sizeof(uint32_t), "n-gram hash index");
   graph.add("ngram_embedding_hash", {std::move(tokens), std::move(before), std::move(indices)}, params,
-            {groups(params.rows), 1, 1}, {kThreads, 1, 1});
+            {groups(static_cast<uint32_t>(rows)), 1, 1}, {kThreads, 1, 1});
 }
 
 } // namespace splash::ops

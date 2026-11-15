@@ -439,6 +439,17 @@ The Neural Engine split, which takes whole chunks, leaves the read rows to the
 GPU, so in a chunk it takes their last FFN rounds as the GPU's alone. On a
 16-core M5 Pro this takes about 2% off the 35B's prefill of 8K tokens.
 
+A decode step's token selection and its penalties and thinking cutoffs,
+acceptance, verify input, the draft's context commit, and
+Qwen3.8-Flash-Next's n-gram hash and block indexer address each lane's rows
+by the lane's first row among the step's packed rows and its row count
+(`ops::LaneRows`, the kernels' per-lane `first_row` and `rows`), so lanes of
+different row counts share one dispatch; every row of a lane's verify block
+but its last checks one draft proposal. The first token after a prompt is
+selected from, and written at, the lane's one row. A decode step gives every
+lane eight rows at lane x 8, and the draft's own block stays eight rows a
+lane, whose RoPE rows the context commit reads.
+
 ### Kernel selection
 
 Three pieces choose every kernel configuration, and nothing else in the

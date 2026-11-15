@@ -347,8 +347,9 @@ metal::MetalBuffer Qwen4Steps::priorTokens() const {
   return backend_.view(decode_, decodePriorOffset_, bytesFor<uint32_t>(kLanes * priorCount(geometry_)));
 }
 
-void Qwen4Steps::addVerifyInput(metal::CommandGraph &graph, metal::MetalBuffer tokens, uint32_t lanes) const {
-  if (!lanes || lanes > kLanes) throw std::invalid_argument("invalid PLE hash");
+void Qwen4Steps::addVerifyInput(metal::CommandGraph &graph, metal::MetalBuffer tokens,
+                                std::span<const ops::LaneRows> blocks) const {
+  if (blocks.empty() || blocks.size() > kLanes) throw std::invalid_argument("invalid PLE hash");
   const Qwen4ExpLayout &layout = weights_.layout;
   const Qwen4PleHash &hash = weights_.pleHash;
   const uint32_t heads = layout.pleHeads();
@@ -356,21 +357,21 @@ void Qwen4Steps::addVerifyInput(metal::CommandGraph &graph, metal::MetalBuffer t
       hash.headOffsets.size() != heads)
     throw std::logic_error("PLE hash geometry mismatch");
   NgramHashParams params{};
-  params.rows = lanes * kVerifyRows;
   params.ngram = layout.pleNgram;
   params.heads_per_ngram = layout.pleHeadsPerNgram;
   params.eos = layout.pleEosToken;
   std::copy(hash.multipliers.begin(), hash.multipliers.end(), params.multipliers);
   std::copy(hash.headVocabularies.begin(), hash.headVocabularies.end(), params.vocabularies);
   std::copy(hash.headOffsets.begin(), hash.headOffsets.end(), params.offsets);
-  const Qwen4Scratch scratch = verifyScratch(params.rows);
-  ops::NgramEmbedding::addHash(graph, std::move(tokens), priorTokens(), scratch.pleIndices, params, heads);
+  const uint32_t rows = static_cast<uint32_t>(ops::rowsEnd(blocks));
+  const Qwen4Scratch scratch = verifyScratch(rows);
+  ops::NgramEmbedding::addHash(graph, std::move(tokens), priorTokens(), scratch.pleIndices, params, blocks, heads);
   // A verify step stages a few rows per lane, most of them already in the
   // cache, so its host step is short and keeps the GPU awake
   // (metal::HostStepGpu::Awake).
   if (weights_.streamedTable)
     graph.host([store = weights_.streamedTable, rowBytes = pleRowBytes_, scratch,
-                count = params.rows * heads] { stage(*store, rowBytes, scratch, count, false); },
+                count = rows * heads] { stage(*store, rowBytes, scratch, count, false); },
                {}, metal::HostStepGpu::Awake);
 }
 

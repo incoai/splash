@@ -42,16 +42,17 @@ uint64_t ringBytes(DraftAttentionShape shape) {
   return uint64_t{shape.kvHeads} * kWindow * shape.headDimension * 2;
 }
 
-// What the context writers read for `rows` rows: the key and value rows,
-// the key norm and the rows' RoPE tables (kernels/common/draft_context_kv.h).
+// What the context writers read: the key and value rows up to `rows`, the
+// key norm and the rows' RoPE tables up to `ropeRows`
+// (kernels/common/draft_context_kv.h).
 void requireContextInputs(const metal::MetalBuffer &contextKv,
                           const metal::MetalBuffer &keyNorm,
                           const metal::MetalBuffer &ropeCos,
                           const metal::MetalBuffer &ropeSin, uint64_t rows,
-                          DraftAttentionShape shape) {
+                          uint64_t ropeRows, DraftAttentionShape shape) {
   requireBytes(contextKv, rows * (shape.qkvSize - shape.attentionSize) * 2, "draft context K/V");
   requireBytes(keyNorm, uint64_t{shape.headDimension} * 2, "draft key norm");
-  const uint64_t ropeBytes = rows * SPLASH_DRAFT_ROPE_PAIRS * 4;
+  const uint64_t ropeBytes = ropeRows * SPLASH_DRAFT_ROPE_PAIRS * 4;
   requireBytes(ropeCos, ropeBytes, "draft RoPE cosine");
   requireBytes(ropeSin, ropeBytes, "draft RoPE sine");
 }
@@ -209,7 +210,7 @@ void DraftAttention::addContextPrefill(
   requireCompiledShape(shape);
   if (!tokens)
     throw std::invalid_argument("invalid draft context prefill geometry");
-  requireContextInputs(contextKv, keyNorm, ropeCos, ropeSin, tokens, shape);
+  requireContextInputs(contextKv, keyNorm, ropeCos, ropeSin, tokens, tokens, shape);
   requireBytes(keys, ringBytes(shape), "draft key ring");
   requireBytes(values, ringBytes(shape), "draft value ring");
   const DraftContextParams params{tokens, startPosition};
@@ -226,16 +227,22 @@ void DraftAttention::addContextCommit(
     std::span<const metal::MetalBuffer> persistentKeys,
     std::span<const metal::MetalBuffer> persistentValues,
     metal::MetalBuffer retainedCounts,
-    std::span<const uint32_t> startPositions, DraftAttentionShape shape) {
+    std::span<const uint32_t> startPositions, std::span<const LaneRows> blocks,
+    DraftAttentionShape shape) {
   const auto lanes = static_cast<uint32_t>(startPositions.size());
   requireLanes(lanes);
   requireCompiledShape(shape);
   if (persistentKeys.size() != kMaximumLanes ||
-      persistentValues.size() != kMaximumLanes)
+      persistentValues.size() != kMaximumLanes || blocks.size() != lanes)
     throw std::invalid_argument("invalid draft context commit geometry");
-  // Each lane commits up to its eight verify rows.
-  requireContextInputs(contextKv, keyNorm, ropeCos, ropeSin,
-                       uint64_t{lanes} * SPLASH_TARGET_VERIFY_ROWS, shape);
+  // A row takes its RoPE row of the lane's draft block, which holds kRows.
+  requireLaneRows(blocks, kRows);
+  // Each lane commits up to its block's rows: its context rows among the
+  // lanes' packed rows, its RoPE rows from its draft block's first.
+  uint64_t ropeRows = 0;
+  for (uint32_t lane = 0; lane < lanes; ++lane)
+    ropeRows = std::max(ropeRows, uint64_t{lane} * kRows + blocks[lane].rows);
+  requireContextInputs(contextKv, keyNorm, ropeCos, ropeSin, rowsEnd(blocks), ropeRows, shape);
   requireBytes(retainedCounts, uint64_t{lanes} * sizeof(uint32_t), "draft retained counts");
   for (uint32_t lane = 0; lane < lanes; ++lane) {
     requireBytes(persistentKeys[lane], ringBytes(shape), "draft key ring");
@@ -244,6 +251,7 @@ void DraftAttention::addContextCommit(
   DraftContextBatchParams params{};
   std::copy(startPositions.begin(), startPositions.end(),
             std::begin(params.start_position));
+  copyLaneRows(blocks, params.first_row, params.rows);
   std::vector<metal::MetalBuffer> bindings{
       std::move(contextKv), std::move(keyNorm), std::move(ropeCos),
       std::move(ropeSin)};
@@ -251,8 +259,7 @@ void DraftAttention::addContextCommit(
   appendLaneBindings(bindings, persistentKeys, persistentValues);
   bindings.push_back(std::move(retainedCounts));
   graph.add("draft_context_kv_commit", std::move(bindings), params,
-            {uint64_t{lanes} * SPLASH_TARGET_VERIFY_ROWS * shape.kvHeads, 1,
-             1});
+            {uint64_t{mostRows(blocks)} * shape.kvHeads, lanes, 1});
 }
 
 uint64_t DraftAttention::contextWindowBytes(uint32_t width) {

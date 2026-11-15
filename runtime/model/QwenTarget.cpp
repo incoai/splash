@@ -94,9 +94,9 @@ std::vector<uint32_t> QwenTarget::verifyTableRows(uint32_t) const { return {}; }
 
 void QwenTarget::addVerifyInput(metal::CommandGraph &graph, metal::MetalBuffer draftInput,
                                 metal::MetalBuffer proposals, metal::MetalBuffer verifyInput,
-                                uint32_t lanes) const {
+                                std::span<const ops::LaneRows> blocks) const {
   ops::Embedding::addVerifyInput(graph, std::move(draftInput), std::move(proposals), std::move(verifyInput),
-                                 geometry_.vocabularySize, lanes);
+                                 geometry_.vocabularySize, blocks);
 }
 
 void QwenTarget::addEmbedding(metal::CommandGraph &graph,
@@ -107,11 +107,12 @@ void QwenTarget::addEmbedding(metal::CommandGraph &graph,
                       rows);
 }
 
-void QwenTarget::addStateCommit(metal::CommandGraph &, QwenTargetCommitBuffers buffers, uint32_t lanes) const {
-  if (!lanes || lanes > ExecutionLimits::maximumBatchWidth)
+void QwenTarget::addStateCommit(metal::CommandGraph &, QwenTargetCommitBuffers buffers,
+                                std::span<const ops::LaneRows> blocks) const {
+  if (blocks.empty() || blocks.size() > ExecutionLimits::maximumBatchWidth)
     throw std::invalid_argument("invalid Qwen state commit batch");
   if (geometry_.stateLayout.auxiliaryBytes)
-    for (uint32_t lane = 0; lane < lanes; ++lane)
+    for (uint32_t lane = 0; lane < blocks.size(); ++lane)
       if (!buffers.auxiliaryIn[lane] || !buffers.auxiliaryOut[lane])
         throw std::invalid_argument("Qwen state commit lane without its auxiliary state");
 }

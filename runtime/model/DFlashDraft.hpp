@@ -276,13 +276,16 @@ public:
   // checkpoint ships; without one they keep the target table's row.
   void addMaskRows(metal::CommandGraph &graph, metal::MetalBuffer rows, uint32_t lanes) const;
 
-  // A decode step's context rows: those each lane retained to its rings,
-  // and to its window when it has one (DFlashContextBuffers::windows). Its
+  // A decode step's context rows: those each lane retained of its verify
+  // block (`blocks`, among the target's captured rows) to its rings, from its
+  // start position on, and to its window when it has one
+  // (DFlashContextBuffers::windows); its RoPE rows are its draft block's. Its
   // normalized rows stay in buffers.hidden, which a state the step captures
   // stores in its own window.
   void addContextCommit(metal::CommandGraph &graph,
                         DFlashContextBuffers buffers,
-                        std::span<const uint32_t> startPositions) const;
+                        std::span<const uint32_t> startPositions,
+                        std::span<const ops::LaneRows> blocks) const;
 
 private:
   // Each layer's context keys and values of the `rows` context rows in the

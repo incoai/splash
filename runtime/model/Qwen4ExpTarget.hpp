@@ -46,10 +46,11 @@ public:
   // host step of the command stages them, between the hash and the verify
   // that gathers them.
   void addVerifyInput(metal::CommandGraph &graph, metal::MetalBuffer draftInput, metal::MetalBuffer proposals,
-                      metal::MetalBuffer verifyInput, uint32_t lanes) const override;
+                      metal::MetalBuffer verifyInput, std::span<const ops::LaneRows> blocks) const override;
   // Each lane's PLE history and QSA pending keys after its retained rows,
-  // from the convolution inputs and keys its verify wrote.
-  void addStateCommit(metal::CommandGraph &graph, QwenTargetCommitBuffers buffers, uint32_t lanes) const override;
+  // from the convolution inputs and keys its verify wrote of its block.
+  void addStateCommit(metal::CommandGraph &graph, QwenTargetCommitBuffers buffers,
+                      std::span<const ops::LaneRows> blocks) const override;
 
   // The PLE rows of batch lane `lane`'s verify rows of the last step, each
   // row's heads' in order.

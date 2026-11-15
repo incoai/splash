@@ -4,6 +4,7 @@
 #include "metal/abi/ExecutionGeometry.h"
 #include "metal/abi/Sampling.h"
 #include "metal/MetalBackend.hpp"
+#include "ops/LaneRows.hpp"
 #include "ops/StopTokens.hpp"
 
 #include <algorithm>
@@ -113,8 +114,9 @@ struct SamplingBuffers final {
   metal::MetalBuffer outputTokens;
   metal::MetalBuffer argmaxValues;
   metal::MetalBuffer argmaxIndices;
-  // Verify input tokens [rows]: row 0 of a lane is its anchor, rows 1..7 its
-  // draft tokens, which penalized and sampled verify rows read.
+  // Verify input tokens [rows]: a lane's verify block's first row holds its
+  // anchor and the rows after it its draft tokens, which penalized and
+  // sampled verify rows read.
   metal::MetalBuffer inputTokens;
   // The draft's candidates and their probabilities at each proposal
   // position (AcceptanceBuffers), which a sampled verify row draws its
@@ -150,8 +152,9 @@ class Sampling final {
 public:
   explicit Sampling(uint32_t vocabulary);
 
-  // Exact scratch/output bytes for the fixed precompiled sampling ABI.
-  // Counts may cover one lane or a batch of lanes; the operator owns sharding.
+  // Exact scratch/output bytes for the fixed precompiled sampling ABI, for a
+  // selection whose lanes' rows end before row `rows` (the workspaces are
+  // indexed by logits row); the operator owns sharding.
   [[nodiscard]] static SamplingWorkspace workspace(uint32_t rows);
 
   // A penalized request's penalty words (metal/abi/Sampling.h), rebuilt
@@ -175,56 +178,60 @@ public:
   // LM head's fresh output. Other lanes dispatch nothing new. A greedy lane
   // then takes each row's argmax and a sampled lane draws from each row's
   // distribution over the whole vocabulary, both among the tokens the lane
-  // admits: the first token after a prompt from each lane's row at
-  // rowOffset, and every verify row of a batch. Each selected row's token
-  // goes to the output tokens in order, one per lane for the first token
-  // and eight for verify; acceptance reads a sampled verify row's draft
-  // token probability from the vocabulary rows. A lane's rows from its
-  // thinking cutoff on then take the end of thinking. Both run the same
-  // kernels (addSelection).
+  // admits: the first token after a prompt from each lane's one row of the
+  // logits (`rows`), and every row of each lane's verify block (`blocks`,
+  // at most SPLASH_TARGET_VERIFY_ROWS rows, its anchor's first). Each
+  // selected row's token goes to the output tokens at its logits row;
+  // acceptance reads a sampled verify row's draft token probability from the
+  // vocabulary rows there. A lane's rows from its thinking cutoff on then
+  // take the end of thinking. Both run the same kernels (addSelection).
   void addInitial(metal::CommandGraph &graph,
                   std::span<const SamplingPolicy> policies,
-                  SamplingBuffers buffers, uint32_t rowOffset,
+                  SamplingBuffers buffers, std::span<const uint32_t> rows,
                   const StopTokens &stopTokens,
                   const PenaltyTable &penalties) const;
   void addVerify(metal::CommandGraph &graph,
                  std::span<const SamplingPolicy> policies,
-                 SamplingBuffers buffers, const StopTokens &stopTokens,
+                 SamplingBuffers buffers, std::span<const LaneRows> blocks,
+                 const StopTokens &stopTokens,
                  const PenaltyTable &penalties) const;
+  // Each lane's acceptance of its draft's proposals against the tokens its
+  // verify block selected (addVerify's `blocks`).
   void addAcceptance(
       metal::CommandGraph &graph, AcceptanceBuffers buffers,
+      std::span<const LaneRows> blocks,
       std::span<const uint32_t> maximumRetained,
       std::span<const SamplingPolicy> policies,
       const StopTokens &stopTokens) const;
   // After the draft's selection and before the verify reads its proposals,
   // the proposals of each lane whose thinking cutoff is at row 0, and whose
-  // end does not wait for its mask, take the end tokens its verify rows will
-  // select, so acceptance keeps them all. A batch without such a lane
-  // dispatches nothing.
+  // end does not wait for its mask, take the end tokens the rows of its
+  // verify block (`blocks`, as addVerify takes them) will select, so
+  // acceptance keeps them all. A batch without such a lane dispatches
+  // nothing.
   void addThinkingDrafts(metal::CommandGraph &graph,
                          std::span<const SamplingPolicy> policies,
+                         std::span<const LaneRows> blocks,
                          metal::MetalBuffer proposedTokens) const;
 
 private:
   // The rows a selection takes from each lane (metal/abi/Sampling.h
-  // TargetSamplingParams).
+  // TargetSamplingParams): its rows of the logits, the first's mask row and
+  // the uniform they draw with.
   struct TargetRows final {
-    uint32_t rows = 0;
-    uint32_t logitsRow = 0;
+    std::span<const LaneRows> lanes;
     uint32_t maskRow = 0;
     uint32_t uniform = 0;
-    uint32_t draftedRows = 0;
   };
 
-  // Penalizes the row at rowOffset of each penalized lane or, for verify,
-  // all its rows, each also counting the draft tokens its context adds.
-  // Policies come from validated requests (Model.hpp
-  // SamplingParameters::validationError). It follows selection(), whose
-  // check of every lane's logits covers those it rewrites.
+  // Penalizes each penalized lane's selected rows, each also counting the
+  // draft tokens its context adds. Policies come from validated requests
+  // (Model.hpp SamplingParameters::validationError). It follows selection(),
+  // whose check of every lane's logits covers those it rewrites.
   void addPenalties(metal::CommandGraph &graph,
                     std::span<const SamplingPolicy> policies,
                     const SamplingBuffers &buffers, const PenaltyTable &table,
-                    uint32_t rowOffset, bool verify) const;
+                    std::span<const LaneRows> rows) const;
   // The parameters that select the rows `rows` names of every lane; throws
   // unless the buffers hold what the selection's kernels reach, before
   // addInitial or addVerify encodes anything.

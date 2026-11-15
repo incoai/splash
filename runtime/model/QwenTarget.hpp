@@ -8,6 +8,7 @@
 #include "WeightStore.hpp"
 #include "ops/GDN.hpp"
 #include "ops/ExecutionPlans.hpp"
+#include "ops/LaneRows.hpp"
 #include "ops/Linear.hpp"
 #include "ops/MoE.hpp"
 #include "ops/Normalization.hpp"
@@ -498,21 +499,22 @@ public:
   virtual void addHeadBatch(metal::CommandGraph &graph, metal::MetalBuffer hidden,
                             metal::MetalBuffer finalHidden, metal::MetalBuffer logits,
                             uint32_t lanes, ops::LinearScratch scratch) const = 0;
-  // The verify input tokens addEmbedding then gathers: each lane's anchor,
-  // row 0 of its draft input, and the draft's proposals; then the inputs the
-  // target makes of them itself.
+  // The verify input tokens addEmbedding then gathers, each lane's in its
+  // verify block of `blocks`: its anchor, row 0 of its draft input, and the
+  // draft's proposals; then the inputs the target makes of them itself.
   virtual void addVerifyInput(metal::CommandGraph &graph, metal::MetalBuffer draftInput,
-                              metal::MetalBuffer proposals,
-                              metal::MetalBuffer verifyInput, uint32_t lanes) const;
+                              metal::MetalBuffer proposals, metal::MetalBuffer verifyInput,
+                              std::span<const ops::LaneRows> blocks) const;
   void addEmbedding(metal::CommandGraph &graph, metal::MetalBuffer tokens,
                     metal::MetalBuffer hidden, uint32_t rows) const;
-  // The commit after acceptance of a verify of `lanes` lanes: in the
-  // verify's command after it (addVerify), or for constrained decoding in
-  // the next command, before any other decode step reuses the verify's
-  // scratch. Each lane's auxiliary state after its retained rows, from what
-  // the verify computed of its rows. None for a target without auxiliary
-  // state.
-  virtual void addStateCommit(metal::CommandGraph &graph, QwenTargetCommitBuffers buffers, uint32_t lanes) const;
+  // The commit after acceptance of a verify of the lanes of `blocks`, each
+  // lane's verify block: in the verify's command after it (addVerify), or
+  // for constrained decoding in the next command, before any other decode
+  // step reuses the verify's scratch. Each lane's auxiliary state after its
+  // retained rows, from what the verify computed of its block's rows. None
+  // for a target without auxiliary state.
+  virtual void addStateCommit(metal::CommandGraph &graph, QwenTargetCommitBuffers buffers,
+                              std::span<const ops::LaneRows> blocks) const;
   // After a verify's acceptance, the GDN state after its first `rows` rows of
   // one lane, which the lane's next step would hold had the lane retained
   // exactly those, in a cache cell, when the lane retained that many. None

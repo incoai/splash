@@ -584,10 +584,11 @@ void contextWriters(MetalBackend &backend, DraftAttentionShape shape) {
     laneKeys[lane] = lane < kCommitLanes ? ring() : laneKeys[0];
     laneValues[lane] = lane < kCommitLanes ? ring() : laneValues[0];
   }
+  const std::array<LaneRows, kCommitLanes> blocks{{{0, kRows}, {kRows, kRows}, {2 * kRows, kRows}}};
   CommandGraph commit;
   DraftAttention::addContextCommit(commit, laneKv, keyNorm, laneCos, laneSin,
                                    laneKeys, laneValues, retainedCounts, starts,
-                                   shape);
+                                   blocks, shape);
   static_cast<void>(backend.submitCommandAsync(commit.dispatches()).wait());
   for (uint32_t lane = 0; lane < kCommitLanes; ++lane)
     check(laneKeys[lane], laneValues[lane],
@@ -603,18 +604,89 @@ void contextWriters(MetalBackend &backend, DraftAttentionShape shape) {
   // The start positions name the lanes: none, or more than a batch, commit
   // nothing.
   const std::array<uint32_t, kLanes + 1> overfull{};
+  const std::array<LaneRows, kLanes + 1> overfullRows{};
   for (const std::span<const uint32_t> positions :
        {std::span<const uint32_t>(), std::span<const uint32_t>(overfull)})
     rejects(
         [&] {
           DraftAttention::addContextCommit(invalid, laneKv, keyNorm, laneCos,
                                            laneSin, laneKeys, laneValues,
-                                           retainedCounts, positions, shape);
+                                           retainedCounts, positions,
+                                           std::span(overfullRows).first(positions.size()), shape);
         },
         "invalid draft batch width",
         "a context commit of no lanes or more than a batch was accepted");
   require(invalid.empty(),
           "invalid draft context write partially encoded a graph");
+}
+
+// Lanes whose verify blocks hold different row counts, packed one after
+// another among the context rows (5, 8, 1 and 6 rows from rows 0, 5, 13 and
+// 14), commit their retained rows (4, all 8, the 1, and 9 clamped to 6) as
+// each lane does alone from row 0: the same rings, bit for bit. A lane's RoPE
+// rows are its draft block's, eight a lane, whichever rows its block holds.
+void packedContextCommit(MetalBackend &backend, DraftAttentionShape shape) {
+  constexpr uint32_t kRowWidth = 2048;
+  constexpr uint16_t kUntouched = 0xC2C2;
+  const uint64_t ringElements = uint64_t{kKvHeads} * kWindow * kHeadDim;
+  Random random(0x7061636bULL + shape.hiddenSize);
+  const std::array<LaneRows, kLanes> packed{{{0, 5}, {5, 8}, {13, 1}, {14, 6}}};
+  const std::array<uint32_t, kLanes> starts{2044, 0, 4101, 300}, retained{4, 8, 1, 9};
+  const MetalBuffer keyNorm = randomBfloat(backend, kHeadDim, random, "draft key norm");
+  const MetalBuffer kv = randomBfloat(backend, uint64_t{20} * kRowWidth, random, "draft packed kv");
+  const auto table = [&](bool sine) {
+    const uint64_t count = uint64_t{kLanes} * kRows * kHeadDim / 2;
+    MetalBuffer result = backend.allocateBuffer(count * sizeof(float), BufferStorage::Shared, "draft rope");
+    for (uint64_t i = 0; i < count; ++i)
+      static_cast<float *>(result.contents())[i] = sine ? std::sin(float(i) * 0.29F) : std::cos(float(i) * 0.29F);
+    return result;
+  };
+  const MetalBuffer ropeCos = table(false), ropeSin = table(true);
+  const auto buffer = [&](uint64_t bytes, const void *from) {
+    MetalBuffer result = backend.allocateBuffer(bytes, BufferStorage::Shared, "draft packed commit");
+    if (from)
+      std::memcpy(result.contents(), from, bytes);
+    else
+      std::fill_n(static_cast<uint16_t *>(result.contents()), bytes / 2, kUntouched);
+    return result;
+  };
+  const auto rings = [&](uint32_t count) {
+    std::array<MetalBuffer, kLanes> result;
+    for (uint32_t lane = 0; lane < kLanes; ++lane)
+      result[lane] = lane < count ? buffer(ringElements * 2, nullptr) : result[0];
+    return result;
+  };
+  const std::array<MetalBuffer, kLanes> keys = rings(kLanes), values = rings(kLanes);
+  CommandGraph commit;
+  DraftAttention::addContextCommit(commit, kv, keyNorm, ropeCos, ropeSin, keys, values,
+                                   buffer(sizeof(retained), retained.data()), starts, packed, shape);
+  static_cast<void>(backend.submitCommandAsync(commit.dispatches()).wait());
+  const uint64_t ropeLaneBytes = uint64_t{kRows} * kHeadDim / 2 * sizeof(float);
+  for (uint32_t lane = 0; lane < kLanes; ++lane) {
+    const LaneRows block = packed[lane];
+    const std::array<MetalBuffer, kLanes> laneKeys = rings(1), laneValues = rings(1);
+    const std::array<LaneRows, 1> own{{{0, block.rows}}};
+    CommandGraph alone;
+    DraftAttention::addContextCommit(
+        alone,
+        buffer(uint64_t{block.rows} * kRowWidth * 2,
+               static_cast<const uint16_t *>(kv.contents()) + uint64_t{block.first} * kRowWidth),
+        keyNorm, buffer(ropeLaneBytes, static_cast<const uint8_t *>(ropeCos.contents()) + lane * ropeLaneBytes),
+        buffer(ropeLaneBytes, static_cast<const uint8_t *>(ropeSin.contents()) + lane * ropeLaneBytes), laneKeys,
+        laneValues, buffer(sizeof(uint32_t), &retained[lane]), std::span(starts).subspan(lane, 1), own, shape);
+    static_cast<void>(backend.submitCommandAsync(alone.dispatches()).wait());
+    require(std::memcmp(keys[lane].contents(), laneKeys[0].contents(), ringElements * 2) == 0 &&
+                std::memcmp(values[lane].contents(), laneValues[0].contents(), ringElements * 2) == 0,
+            "packed lane " + std::to_string(lane) + " committed other context rows than alone");
+  }
+  // Lane 3 committed its six rows, clamped from nine, and lane 0 four of its
+  // five: the slot after each lane's last keeps its bits.
+  const auto touched = [&](const MetalBuffer &ring, uint32_t position) {
+    return static_cast<const uint16_t *>(ring.contents())[uint64_t{position % kWindow} * kHeadDim] != kUntouched;
+  };
+  require(touched(keys[3], starts[3] + 5) && !touched(keys[3], starts[3] + 6) && touched(keys[0], starts[0] + 3) &&
+              !touched(keys[0], starts[0] + 4),
+          "packed lanes committed other rows than they retained");
 }
 
 // The context window's reference for one group of 64 values: the codes and
@@ -893,9 +965,10 @@ void bufferExtents(MetalBackend &backend, DraftAttentionShape shape) {
     extents.push_back({5 + lanes + lane, ring, 2, "draft value ring"});
   }
   const std::array<uint32_t, lanes> starts{2044, 0, 4101};
+  const std::array<LaneRows, lanes> blocks{{{0, kRows}, {kRows, kRows}, {2 * kRows, kRows}}};
   splash::test::requireExtents(backend, extents, [&](CommandGraph &graph, const Buffers &b) {
     DraftAttention::addContextCommit(graph, b[0], b[1], b[2], b[3], rings(b, 5), rings(b, 5 + lanes), b[4], starts,
-                                     shape);
+                                     blocks, shape);
   });
   const uint64_t windowBytes = DraftAttention::contextWindowBytes(shape.hiddenSize);
   const uint64_t contextRows = uint64_t{contextTokens} * shape.hiddenSize * 2;
@@ -935,6 +1008,7 @@ int main(int argc, char **argv) {
       for (uint32_t lanes = 1; lanes <= kLanes; ++lanes)
         surroundingPhases(backend, shape, lanes);
       contextWriters(backend, shape);
+      packedContextCommit(backend, shape);
       contextWindow(backend, shape.hiddenSize);
       contextWindowCapturedInside(backend, shape.hiddenSize);
       contextWindowCommit(backend, shape.hiddenSize);

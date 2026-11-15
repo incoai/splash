@@ -87,8 +87,8 @@ kernel void block_indexer_project(device const float *query [[buffer(0)]],
   threadgroup float scratch[kDimension / 32];
   threadgroup float rotated[kDimension];
   const uint head = group.y, batch = group.z;
-  if (group.x >= p.rows || !indexer_lane(batch, p)) return;
-  const ulong row = ulong(batch) * p.rows + group.x;
+  if (!indexer_lane(batch, p) || group.x >= p.rows[batch]) return;
+  const ulong row = ulong(p.first_row[batch]) + group.x;
   if (head == kHeads) {
     keys[row * kDimension + tid] = bfloat(key[row * kDimension + tid]);
     return;
@@ -138,7 +138,7 @@ kernel void block_indexer_pool(device const BlockIndexerBlock *blocks [[buffer(0
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
   const uint first = p.first_position[batch];
-  device const bfloat *lane_keys = keys + ulong(batch) * p.rows * kDimension;
+  device const bfloat *lane_keys = keys + ulong(p.first_row[batch]) * kDimension;
   float sum = 0.0f;
   for (uint t = 0; t < kBlock; ++t) {
     const uint position = block.position + t;
@@ -177,7 +177,8 @@ kernel void block_indexer_pending(device const bfloat *keys [[buffer(0)]],
                                   device bfloat *pending_out [[buffer(2)]],
                                   constant BlockIndexerPendingParams &p [[buffer(3)]],
                                   uint tid [[thread_index_in_threadgroup]]) {
-  indexer_store_pending(keys, pending_in, pending_out, p.first_position[0], min(p.retained[0], p.rows), tid);
+  indexer_store_pending(keys + ulong(p.first_row[0]) * kDimension, pending_in, pending_out, p.first_position[0],
+                        min(p.retained[0], p.rows[0]), tid);
 }
 
 // Threadgroup (layer, lane) of kDimension threads: each layer's pending keys
@@ -199,18 +200,18 @@ kernel void block_indexer_commit(device const bfloat *keys [[buffer(0)]],
   const uint layer = group.x, lane = group.y;
   if (lane >= min(p.lanes, SPLASH_MAXIMUM_BATCH_WIDTH)) return;
   const ulong pending = ulong(layer) * kPending * kDimension;
-  indexer_store_pending(keys + (ulong(layer) * p.layer_rows + ulong(lane) * p.rows) * kDimension,
+  indexer_store_pending(keys + (ulong(layer) * p.layer_rows + p.first_row[lane]) * kDimension,
                         SPLASH_LANE_BINDING(lane, pending_in0, pending_in1, pending_in2, pending_in3) + pending,
                         SPLASH_LANE_BINDING(lane, pending_out0, pending_out1, pending_out2, pending_out3) + pending,
-                        p.first_position[lane], min(retained[lane], p.rows), tid);
+                        p.first_position[lane], min(retained[lane], p.rows[lane]), tid);
 }
 
 // Threadgroup per tile of kScoreRows rows of a lane by kScoreBlocks blocks:
 // the rows' query heads and the blocks' pooled keys, gathered from the
 // index into threadgroup memory, make every head's dot product of the tile
 // in one MPP product, and each row's score of a block sums its heads' relu
-// over sqrt(dimension). The scratch holds the dispatch's rows, lane after
-// lane.
+// over sqrt(dimension). The scratch holds the dispatch's rows from its first
+// lane's first row, as the queries do; a tile past its lane's rows has none.
 constant constexpr uint kScoreRows = BLOCK_INDEXER_SCORE_ROWS;
 constant constexpr uint kScoreBlocks = BLOCK_INDEXER_SCORE_BLOCKS;
 constant constexpr uint kScoreThreads = BLOCK_INDEXER_SCORE_THREADS;
@@ -230,8 +231,8 @@ kernel void block_indexer_score(device const bfloat *queries [[buffer(0)]],
   alignas(16) threadgroup bfloat k[N * D];
   threadgroup float products[M * N];
   const uint row0 = group.y * kScoreRows, block0 = group.x * N, batch = group.z;
-  if (!indexer_lane(batch, p)) return;
-  const uint last = min(p.rows, row0 + kScoreRows);
+  if (!indexer_lane(batch, p) || row0 >= p.rows[batch]) return;
+  const uint rows = p.rows[batch], last = min(rows, row0 + kScoreRows);
   // Rows attend sparsely past top_blocks complete blocks; complete blocks
   // grow with the row.
   const uint complete = (p.first_position[batch] + p.row_offset + last) / kBlock;
@@ -239,10 +240,10 @@ kernel void block_indexer_score(device const bfloat *queries [[buffer(0)]],
   device const SplashKvPage *index_table =
       SPLASH_LANE_BINDING(batch, index_table0, index_table1, index_table2, index_table3);
   device const uint4 *tile_queries = reinterpret_cast<device const uint4 *>(
-      queries + (ulong(batch) * p.rows + p.row_offset + row0) * kHeads * D);
+      queries + (ulong(p.first_row[batch]) + p.row_offset + row0) * kHeads * D);
   for (uint chunk = tid; chunk < M * Chunks; chunk += kScoreThreads)
     reinterpret_cast<threadgroup uint4 *>(q)[chunk] =
-        row0 + chunk / (kHeads * Chunks) < p.rows ? tile_queries[chunk] : uint4(0);
+        row0 + chunk / (kHeads * Chunks) < rows ? tile_queries[chunk] : uint4(0);
   for (uint chunk = tid; chunk < N * Chunks; chunk += kScoreThreads) {
     const uint block = block0 + chunk / Chunks;
     uint4 data = 0;
@@ -266,10 +267,11 @@ kernel void block_indexer_score(device const bfloat *queries [[buffer(0)]],
   threadgroup_barrier(mem_flags::mem_threadgroup);
   for (uint index = tid; index < kScoreRows * N; index += kScoreThreads) {
     const uint r = index / N, b = index % N;
-    if (row0 + r >= p.rows || block0 + b >= complete) continue;
+    if (row0 + r >= rows || block0 + b >= complete) continue;
     float score = 0.0f;
     for (uint h = 0; h < kHeads; ++h) score += max(products[(r * kHeads + h) * N + b], 0.0f);
-    scores[(ulong(batch) * p.rows + row0 + r) * p.score_stride + block0 + b] = score / sqrt(float(D));
+    scores[(ulong(p.first_row[batch] - p.first_row[0]) + row0 + r) * p.score_stride + block0 + b] =
+        score / sqrt(float(D));
   }
 }
 
@@ -344,11 +346,11 @@ kernel void block_indexer_select(device const float *scores [[buffer(0)]],
   threadgroup uint simd_counts[kSelectThreads / 32];
   threadgroup uint threshold[3];
   const uint batch = group.y;
-  if (group.x >= p.rows || !indexer_lane(batch, p)) return;
+  if (!indexer_lane(batch, p) || group.x >= p.rows[batch]) return;
   const uint position = p.first_position[batch] + p.row_offset + group.x;
   const uint complete = (position + 1) / kBlock;
   const uint words = min(p.mask_words, (complete + BLOCK_INDEXER_TILE_SLACK) / 32 + 1);
-  device uint *bits = mask + (ulong(batch) * p.rows + p.row_offset + group.x) * p.mask_words;
+  device uint *bits = mask + (ulong(p.first_row[batch]) + p.row_offset + group.x) * p.mask_words;
   if (complete <= p.top_blocks) {
     // Blocks 0..complete, the tail included; later bits stay clear.
     for (uint w = tid; w < words; w += kSelectThreads) {
@@ -358,7 +360,7 @@ kernel void block_indexer_select(device const float *scores [[buffer(0)]],
     }
     return;
   }
-  device const float *s = scores + (ulong(batch) * p.rows + group.x) * p.score_stride;
+  device const float *s = scores + (ulong(p.first_row[batch] - p.first_row[0]) + group.x) * p.score_stride;
   uint prefix = 0, prefix_mask = 0, wanted = p.top_blocks;
   bool gathered = false, all = false;
   for (int high = 30; high >= 0 && !all; high -= int(kSelectBits)) {
