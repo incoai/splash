@@ -351,7 +351,13 @@ path, the product of its steps' estimates, each row taking its most likely
 candidates at the next position as children (one, a chain, while the target's
 verify runs a block's rows in order), and a lane whose thinking end starts at
 its anchor takes the end as a chain of its own, whose rows the target selects
-whatever its logits. A step to a candidate of probability q (the softmax at
+whatever its logits. Where the target verifies trees, an unconstrained lane
+not thinking under a budget also proposes a prompt-lookup chain beside them:
+the tokens that followed the latest earlier occurrence of its last three or
+more tokens (`model::LookupIndex`), each estimated by the match's length, its
+depth and whether the draft's candidates there hold it
+(`model::LookupAcceptance`, fit on traced cycles and refined by every
+cycle's outcome); a lookup token that is a draft row's joins that row. A step to a candidate of probability q (the softmax at
 temperature 1 of its position's candidates' scores after its parent's) is
 estimated by an online model, logit(p) = slope * logit(q) +
 intercept[position], the probability that the target accepts it once it
