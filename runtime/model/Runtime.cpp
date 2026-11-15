@@ -531,7 +531,8 @@ struct Runtime::Impl {
   // follow where the budget chooses them (budgetsVerifyRows); none where
   // the cycles verify every row.
   std::optional<VerifyBudget> verifyBudget;
-  // The lookup chains' acceptance, which every request's cycles teach.
+  // The lookup chains' acceptance, which every unconstrained request's
+  // cycles teach, greedy and sampled lanes apart.
   LookupAcceptance lookupAcceptance;
   ops::AneFfn *aneFfn;
   // The readers of spilled K/V, when the target's K/V spills.
@@ -2403,8 +2404,8 @@ struct Runtime::Impl {
   // A lane's lookup chain beside its draft's tree: the tokens that followed
   // the latest earlier occurrence of its latest tokens (LookupIndex), as deep
   // as its tree may grow, each estimated at its depth and the match's length
-  // for each agreement with the draft (LookupAcceptance), of which the
-  // selector takes its own.
+  // for each agreement with the draft, by its policy's counts
+  // (LookupAcceptance), of which the selector takes its own.
   void proposeLookup(Request &entry, ops::DraftTreeLane &tree, uint32_t lane) {
     const LookupIndex &index = entry.lookup;
     if (index.tokens().size() != entry.tokens.size() + 1 || index.tokens().back() != *entry.pendingToken)
@@ -2413,13 +2414,14 @@ struct Runtime::Impl {
     if (chain.empty())
       return;
     const uint32_t length = index.match().length;
+    const bool samples = samplingEnabled(entry);
     auto *tokens = contents<uint32_t>(decodeArena->get(lane, DecodeTensor::ChainTokens), "chain tokens");
     auto *rates = contents<float>(decodeArena->get(lane, DecodeTensor::ChainRates), "chain rates");
     for (uint32_t depth = 0; depth < chain.size(); ++depth) {
       tokens[depth] = chain[depth];
       for (uint32_t agreement = 0; agreement < SPLASH_TREE_AGREEMENTS; ++agreement)
         rates[depth * SPLASH_TREE_AGREEMENTS + agreement] =
-            lookupAcceptance.rate(length, depth, static_cast<LookupAgreement>(agreement));
+            lookupAcceptance.rate(samples, length, depth, static_cast<LookupAgreement>(agreement));
     }
     tree.chain = static_cast<uint32_t>(chain.size());
     entry.lookupLength = length;
@@ -2732,14 +2734,15 @@ struct Runtime::Impl {
     }
     // A cycle whose every lane commits teaches the verify budget its lanes'
     // labels and its cost, and the lookup rates what it verified of its
-    // lanes' lookup chains.
+    // lanes' lookup chains, but a constrained lane's: its masks reject the
+    // copied tokens its grammar forbids, whatever the target would choose.
     bool commits = true;
     for (uint32_t lane = 0; lane < items.size(); ++lane)
       commits = commits && lanes[lane].failure.empty() && unreadable[lane].empty();
     for (uint32_t lane = 0; lane < items.size() && commits; ++lane) {
       const DecodeLaneResult &laneResult = lanes[lane];
       Request &entry = *laneResult.request;
-      if (entry.lookupChain.empty())
+      if (entry.lookupChain.empty() || entry.constraint == ConstraintMode::TokenMask)
         continue;
       const uint32_t size =
           std::min(*contents<uint32_t>(decodeArena->get(lane, DecodeTensor::DraftTreeSizes), "draft tree size"),
@@ -2755,7 +2758,7 @@ struct Runtime::Impl {
           lookupOutcome(entry.lookupChain, treeTokens, tree, std::min(laneResult.verifyRows, size),
                         {retainedTokens(laneResult), laneResult.retained}, candidates);
       if (!outcome.verified.empty())
-        lookupAcceptance.observe(entry.lookupLength, outcome.verified, outcome.accepted);
+        lookupAcceptance.observe(samplingEnabled(entry), entry.lookupLength, outcome.verified, outcome.accepted);
     }
     if (verifyBudget && commits) {
       std::array<VerifyBudget::Lane, kLaneCount> observed{};

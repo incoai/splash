@@ -9,10 +9,11 @@
 // cycle are the offline replay's lookup chains. The estimate is the fitted
 // table until it observes; each accepted token and the rejected one are
 // labels, those past the rejection none; a known agreement's label teaches
-// Unknown too; and counts weigh half as much kHalfLife labels later. A
-// cycle's outcome follows the chain's rows down the lane's tree, its tokens'
-// agreements with the draft's candidates, to its first rejection, the first
-// token past the verified rows, or past the tokens the lane retained.
+// Unknown too; counts weigh half as much kHalfLife labels later; and greedy
+// lanes and sampled ones count apart. A cycle's outcome follows the chain's
+// rows down the lane's tree, its tokens' agreements with the draft's
+// candidates, to its first rejection, the first token past the verified
+// rows, or past the tokens the lane retained.
 #include "TestChecks.hpp"
 #include "model/LookupProposals.hpp"
 
@@ -40,6 +41,8 @@ namespace {
 using Match = LookupIndex::Match;
 // The replay's chains: a 32-row lane less its anchor.
 constexpr uint32_t kChain = 31;
+// The acceptance counts of greedy lanes and of lanes that sample.
+constexpr bool kGreedy = false, kSampled = true;
 
 std::string describe(const Match &match) {
   return "(" + std::to_string(match.length) + ", " + std::to_string(match.end) + ")";
@@ -273,7 +276,7 @@ void priorTable() {
   for (const uint32_t length : {3U, 5U, 12U, 20U, 40U, 64U, 5000U})
     for (const uint32_t depth : {0U, 1U, 3U, 6U, 9U, 30U})
       for (uint32_t a = 0; a < LookupAcceptance::kAgreements; ++a)
-        require(acceptance.rate(length, depth, static_cast<LookupAgreement>(a)) ==
+        require(acceptance.rate(kGreedy, length, depth, static_cast<LookupAgreement>(a)) ==
                     table[LookupAcceptance::lengthBucket(length)][LookupAcceptance::depthBucket(depth)][a],
                 "an estimate before any observation was not the table's");
   // The fit's findings: the draft's top candidate is accepted 96% of the
@@ -308,11 +311,11 @@ void learnsFromOutcomes() {
   // rejected, depths 3 and 4 no label.
   const std::array verified{LookupAgreement::Top, LookupAgreement::Absent, LookupAgreement::Candidate,
                             LookupAgreement::Absent, LookupAgreement::Unknown};
-  acceptance.observe(10, verified, 2);
+  acceptance.observe(kGreedy, 10, verified, 2);
   const auto expect = [&](uint32_t depth, LookupAgreement agreement, double accepted, double labels,
                           const std::string &what) {
     const double expected = (accepted + w * cell(10, depth, agreement)) / (labels + w);
-    require(near(acceptance.rate(10, depth, agreement), expected), what);
+    require(near(acceptance.rate(kGreedy, 10, depth, agreement), expected), what);
   };
   expect(0, LookupAgreement::Top, 1, 1, "an accepted token was not a label");
   expect(1, LookupAgreement::Absent, 1, 1, "an accepted absent token was not a label");
@@ -322,41 +325,70 @@ void learnsFromOutcomes() {
   // Depths 2 and 3 share a bucket: one label, the rejection.
   expect(2, LookupAgreement::Unknown, 0, 1, "a known agreement's rejection did not teach Unknown");
   expect(0, LookupAgreement::Unknown, 1, 1, "a known agreement's acceptance did not teach Unknown");
-  require(near(acceptance.rate(20, 0, LookupAgreement::Top), cell(20, 0, LookupAgreement::Top)),
+  require(near(acceptance.rate(kGreedy, 20, 0, LookupAgreement::Top), cell(20, 0, LookupAgreement::Top)),
           "a label taught another length's estimate");
 
   // Every token accepted: no rejection to label.
   LookupAcceptance all;
-  all.observe(3, std::array{LookupAgreement::Unknown, LookupAgreement::Unknown}, 2);
-  require(near(all.rate(3, 1, LookupAgreement::Unknown), (1 + w * cell(3, 1, LookupAgreement::Unknown)) / (1 + w)),
+  all.observe(kGreedy, 3, std::array{LookupAgreement::Unknown, LookupAgreement::Unknown}, 2);
+  require(near(all.rate(kGreedy, 3, 1, LookupAgreement::Unknown),
+               (1 + w * cell(3, 1, LookupAgreement::Unknown)) / (1 + w)),
           "a chain accepted whole lost a label");
   // Nothing verified: nothing learned.
-  all.observe(3, std::span<const LookupAgreement>{}, 0);
-  require(near(all.rate(3, 1, LookupAgreement::Unknown), (1 + w * cell(3, 1, LookupAgreement::Unknown)) / (1 + w)),
+  all.observe(kGreedy, 3, std::span<const LookupAgreement>{}, 0);
+  require(near(all.rate(kGreedy, 3, 1, LookupAgreement::Unknown),
+               (1 + w * cell(3, 1, LookupAgreement::Unknown)) / (1 + w)),
           "an empty outcome changed the counts");
 
   // kHalfLife labels later, one weighs half: at depth 16+ (bucket 5) of
   // length 64, the earlier depth 0 label of length 10 halves.
   LookupAcceptance decaying;
-  decaying.observe(10, std::array{LookupAgreement::Top}, 1);
+  decaying.observe(kGreedy, 10, std::array{LookupAgreement::Top}, 1);
   std::vector<LookupAgreement> elsewhere(64, LookupAgreement::Unknown);
   const auto rounds = static_cast<uint32_t>(LookupAcceptance::kHalfLife) / 64;
   for (uint32_t round = 0; round < rounds; ++round)
-    decaying.observe(64, elsewhere, 64);
-  require(near(decaying.rate(10, 0, LookupAgreement::Top),
+    decaying.observe(kGreedy, 64, elsewhere, 64);
+  require(near(decaying.rate(kGreedy, 10, 0, LookupAgreement::Top),
                (0.5 + w * cell(10, 0, LookupAgreement::Top)) / (0.5 + w)),
           "a label did not weigh half kHalfLife labels later");
   // Many rejections pull an estimate toward none.
   LookupAcceptance rejected;
   for (int round = 0; round < 1000; ++round)
-    rejected.observe(5, std::array{LookupAgreement::Top}, 0);
-  require(rejected.rate(5, 0, LookupAgreement::Top) < 0.01F, "rejections did not lower the estimate");
+    rejected.observe(kGreedy, 5, std::array{LookupAgreement::Top}, 0);
+  require(rejected.rate(kGreedy, 5, 0, LookupAgreement::Top) < 0.01F, "rejections did not lower the estimate");
 
-  rejects([&] { acceptance.observe(2, verified, 0); }, "invalid lookup match length", "a 2-token match was observed");
-  rejects([&] { acceptance.observe(10, std::span(verified).first(2), 3); }, "invalid lookup outcome",
+  rejects([&] { acceptance.observe(kGreedy, 2, verified, 0); }, "invalid lookup match length",
+          "a 2-token match was observed");
+  rejects([&] { acceptance.observe(kGreedy, 10, std::span(verified).first(2), 3); }, "invalid lookup outcome",
           "more tokens accepted than verified");
-  rejects([&] { static_cast<void>(acceptance.rate(2, 0, LookupAgreement::Top)); }, "invalid lookup match length",
+  rejects([&] { static_cast<void>(acceptance.rate(kGreedy, 2, 0, LookupAgreement::Top)); },
+          "invalid lookup match length",
           "a 2-token match had an estimate");
+}
+
+// Greedy lanes and lanes that sample count apart: the outcomes of one leave
+// the other's estimates at the table, and its labels decay its own counts
+// alone.
+void greedyAndSampledLanesCountApart() {
+  using enum LookupAgreement;
+  const auto prior = [](uint32_t length, uint32_t depth, LookupAgreement agreement) {
+    return LookupAcceptance::kPrior[LookupAcceptance::lengthBucket(length)][LookupAcceptance::depthBucket(depth)]
+                                   [static_cast<uint32_t>(agreement)];
+  };
+  LookupAcceptance acceptance;
+  for (int round = 0; round < 100; ++round)
+    acceptance.observe(kSampled, 10, std::array{Top}, 0);
+  require(acceptance.rate(kSampled, 10, 0, Top) < 0.1F, "a sampled lane's rejections did not lower its estimate");
+  require(acceptance.rate(kGreedy, 10, 0, Top) == prior(10, 0, Top) &&
+              acceptance.rate(kGreedy, 10, 0, Unknown) == prior(10, 0, Unknown),
+          "a sampled lane's outcomes moved a greedy lane's estimates");
+  const float sampled = acceptance.rate(kSampled, 10, 0, Top);
+  for (int round = 0; round < 100; ++round)
+    acceptance.observe(kGreedy, 10, std::array{Absent}, 1);
+  require(acceptance.rate(kGreedy, 10, 0, Absent) > 0.9F, "a greedy lane's acceptances did not raise its estimate");
+  require(acceptance.rate(kSampled, 10, 0, Top) == sampled &&
+              acceptance.rate(kSampled, 10, 0, Absent) == prior(10, 0, Absent),
+          "a greedy lane's labels moved or decayed a sampled lane's counts");
 }
 
 } // namespace
@@ -430,6 +462,7 @@ int main(int argc, char **argv) {
     replaysTheTrace(argv[1]);
     priorTable();
     learnsFromOutcomes();
+    greedyAndSampledLanesCountApart();
     outcomesOfCycles();
   } catch (const std::exception &error) {
     std::cerr << "lookup_proposals_test: FAIL: " << error.what() << '\n';

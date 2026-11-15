@@ -141,27 +141,29 @@ uint32_t LookupAcceptance::depthBucket(uint32_t depth) noexcept {
   return std::min(static_cast<uint32_t>(std::bit_width(depth)), kDepthBuckets - 1);
 }
 
-float LookupAcceptance::rate(uint32_t length, uint32_t depth, LookupAgreement agreement) const {
+float LookupAcceptance::rate(bool samples, uint32_t length, uint32_t depth, LookupAgreement agreement) const {
   const uint32_t l = lengthBucket(length), d = depthBucket(depth);
   const auto a = static_cast<uint32_t>(agreement);
-  const Count &count = counts_[l][d][a];
+  const Count &count = counts_[samples][l][d][a];
   return static_cast<float>((count.accepted + kPriorLabels * kPrior[l][d][a]) / (count.labels + kPriorLabels));
 }
 
-void LookupAcceptance::observe(uint32_t length, std::span<const LookupAgreement> verified, uint32_t accepted) {
+void LookupAcceptance::observe(bool samples, uint32_t length, std::span<const LookupAgreement> verified,
+                               uint32_t accepted) {
   const uint32_t l = lengthBucket(length);
   if (accepted > verified.size())
     throw std::invalid_argument("invalid lookup outcome");
   const size_t labels = std::min<size_t>(accepted + 1, verified.size());
   const double decay = std::exp2(-static_cast<double>(labels) / kHalfLife);
-  for (auto &depths : counts_)
+  Counts &counts = counts_[samples];
+  for (auto &depths : counts)
     for (auto &agreements : depths)
       for (Count &count : agreements) {
         count.accepted *= decay;
         count.labels *= decay;
       }
   for (uint32_t depth = 0; depth < labels; ++depth) {
-    auto &cells = counts_[l][depthBucket(depth)];
+    auto &cells = counts[l][depthBucket(depth)];
     const double label = depth < accepted ? 1.0 : 0.0;
     const auto add = [&](LookupAgreement agreement) {
       Count &count = cells[static_cast<uint32_t>(agreement)];

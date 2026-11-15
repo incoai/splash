@@ -357,7 +357,9 @@ the tokens that followed the latest earlier occurrence of its last three or
 more tokens (`model::LookupIndex`), each estimated by the match's length, its
 depth and whether the draft's candidates there hold it
 (`model::LookupAcceptance`, fit on traced cycles and refined by every
-cycle's outcome); a lookup token that is a draft row's joins that row. A
+unconstrained cycle's outcome, greedy and sampled lanes apart: a sampled lane
+accepts a copied token only as often as it draws it); a lookup token that is
+a draft row's joins that row. A
 constrained lane whose grammar forces the tokens after its anchor proposes
 those instead, each estimated at 1: the server finds, with a cycle's masks,
 the tokens the grammar forces after each row's path, and the next cycle takes

@@ -117,9 +117,13 @@ enum class LookupAgreement : uint8_t {
 // accepted the token's parent, from the match's length, the token's depth
 // (0 for the first proposal after the anchor) and its agreement with the
 // draft: a table fitted on decode traces, and on top of it decayed counts of
-// what the engine's own cycles accepted. One serves every request: replaying
-// the traced sessions, counts over a session predicted better than each
-// request's own (0.074 against 0.079 bits a label on the 27B).
+// what the engine's own cycles accepted, greedy lanes' and sampled lanes'
+// apart. A sampled lane accepts a copied token as often as it draws it: one
+// the target ranks first at 0.6, every time on a greedy lane, 60% of the
+// time at temperature 1. Both start from the table, which greedy traces
+// fitted. One serves every request: replaying the traced sessions, counts
+// over a session predicted better than each request's own (0.074 against
+// 0.079 bits a label on the 27B).
 class LookupAcceptance final {
 public:
   // Lengths 3, 4-7, 8-15, 16-31, 32-63 and 64 tokens; depths 0, 1, 2-3, 4-7,
@@ -198,21 +202,24 @@ public:
   [[nodiscard]] static uint32_t depthBucket(uint32_t depth) noexcept;
 
   // The estimate for a token `depth` past the anchor, copied from a match of
-  // `length` tokens.
-  [[nodiscard]] float rate(uint32_t length, uint32_t depth, LookupAgreement agreement) const;
-  // A cycle's outcome for one lookup chain: the agreements of the tokens it
-  // verified, in depth order, and how many of them the target accepted
-  // before its first rejection. Each accepted token and the rejected one is
-  // a label (those past the rejection are none); a label of a known
-  // agreement teaches Unknown too.
-  void observe(uint32_t length, std::span<const LookupAgreement> verified, uint32_t accepted);
+  // `length` tokens, on a lane that samples or a greedy one.
+  [[nodiscard]] float rate(bool samples, uint32_t length, uint32_t depth, LookupAgreement agreement) const;
+  // A cycle's outcome for one lookup chain of a lane that samples or a
+  // greedy one: the agreements of the tokens it verified, in depth order,
+  // and how many of them the target accepted before its first rejection.
+  // Each accepted token and the rejected one is a label (those past the
+  // rejection are none); a label of a known agreement teaches Unknown too.
+  void observe(bool samples, uint32_t length, std::span<const LookupAgreement> verified, uint32_t accepted);
 
 private:
   struct Count final {
     double accepted = 0.0;
     double labels = 0.0;
   };
-  std::array<std::array<std::array<Count, kAgreements>, kDepthBuckets>, kLengthBuckets> counts_{};
+  using Counts = std::array<std::array<std::array<Count, kAgreements>, kDepthBuckets>, kLengthBuckets>;
+  // The greedy lanes' counts and the sampled lanes', each decaying by its
+  // own labels.
+  std::array<Counts, 2> counts_{};
 };
 
 // A lookup token's agreement with the draft's candidates at its depth: the
