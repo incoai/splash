@@ -278,6 +278,19 @@ void testCopyReplacementProfiling() {
   require(process.persist(first) == PersistStatus::Durable &&
               process.cache.snapshot().stateCache.diskCopyRecreationStarts == 2,
           "a durable hit was counted as another recreation");
+  // The old entry remains pinned by a reader while a new publication takes
+  // over. Its dropped-copy history must not migrate to the new state.
+  auto resumedPrompt = promptOf(2000, 1);
+  resumedPrompt.push_back(77);
+  auto reader = process.cache.lookup(resumedPrompt, {});
+  require(reader.state.has_value(), "republication fixture has no reader");
+  process.cache.invalidateState(second);
+  process.publish(second);
+  reader = {};
+  require(process.persist(second) == PersistStatus::Durable &&
+              process.cache.snapshot().stateCache.diskCopyRecreationStarts == 2 &&
+              process.cache.snapshot().stateCache.diskCopyRecreations == 1,
+          "invalidated-entry takeover inherited stale recreation history");
 }
 
 void testCopiesAreLabelled() {

@@ -1079,6 +1079,67 @@ static void testSharedMetadataCounters() {
   first.seal();second.seal();
 }
 
+// Constructor failures still report accepted metadata bytes, but never charge
+// payload credit or pretend that later metadata categories ran.
+static void testFailedMetadataHeaderAccounting() {
+  for (const int fault : {2, 4}) {
+    Directory directory;
+    auto budget = std::make_shared<DiskBudget>(4 * kHostPageBytes);
+    metadataFault.store(fault);
+    bool failed = false;
+    try { SlotFile file(kHostPageBytes, budget, directory.persistence()); }
+    catch (const std::system_error &error) {
+      failed = true;
+      require(error.code().value() == (fault == 2 ? ENOSPC : EIO), "metadata profiling changed errno");
+    }
+    require(failed && metadataFault.load() == 0, "header fault was not exercised");
+    const auto counts = budget->metadataWrites();
+    require(counts[0].bytes == sizeOf(directory.records()) &&
+                counts[0].calls == (fault == 2 ? 2u : 1u) && counts[0].errors == 1 &&
+                counts[1].calls == 0 && counts[2].calls == 0 && budget->writtenBytes() == 0 &&
+                !budget->writesStopped(),
+            "failed header was miscounted or changed the payload admission policy");
+  }
+}
+
+// Adoption clears gaps below the last adopted index as record IO, not payload
+// IO. The adopted slot's later release is a separate, single clearing write.
+static void testAdoptionMetadataClearing() {
+  Directory directory;
+  constexpr size_t size = kHostPageBytes;
+  const auto persistence = directory.persistence();
+  const std::vector<std::byte> payload(size, std::byte{9});
+  {
+    SlotFile file(size, std::make_shared<DiskBudget>(4 * size), persistence);
+    file.finishAdoption();
+    std::vector<std::shared_ptr<SlotFile::Slot>> kept;
+    for (uint64_t n = 0; n < 3; ++n) {
+      kept.push_back(file.acquire());
+      require(file.write(kept.back(), {payload}, {})->wait(), "adoption metadata fixture write failed");
+      file.label(kept.back(), labelOf(n));
+    }
+    require(file.synchronize({})->wait(), "adoption metadata fixture did not drain");
+    file.seal();
+  }
+  auto budget = std::make_shared<DiskBudget>(4 * size);
+  SlotFile file(size, budget, persistence);
+  require(file.records().size() == 3, "adoption metadata fixture did not recover records");
+  auto last = file.adopt(file.records().back());
+  file.finishAdoption();
+  auto counts = budget->metadataWrites();
+  require(counts[0].calls == 0 && counts[1].calls == 0 && counts[2].bytes == 128 &&
+              counts[2].calls == 1 && counts[2].errors == 0 && budget->writtenBytes() == 0,
+          "adoption gap clearing was missing or counted as payload");
+  std::vector<std::byte> restored(size);
+  require(file.read(last, {restored}, {})->wait() && restored == payload, "adoption clearing damaged retained data");
+  last.reset();
+  require(file.synchronize({})->wait(), "adopted slot release did not drain");
+  counts = budget->metadataWrites();
+  require(counts[2].bytes == 192 && counts[2].calls == 2 && budget->writtenBytes() == 0,
+          "adopted slot clearing was lost or counted twice");
+  file.seal();
+}
+
 static void testMetadataWriteAccounting() {
   constexpr size_t size = kHostPageBytes;
   Directory directory;
@@ -1139,6 +1200,8 @@ static void testMetadataWriteAccounting() {
 
 int main() {
   try {
+    testFailedMetadataHeaderAccounting();
+    testAdoptionMetadataClearing();
     testMetadataWriteAccounting();
     testSharedMetadataCounters();
     testFailedWriteStopsWriting();
