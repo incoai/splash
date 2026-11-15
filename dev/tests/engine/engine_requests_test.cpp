@@ -1585,7 +1585,7 @@ void advanceToOverlappedVerify(test::EngineHarness &h, uint64_t requestId) {
               events.maskRequests[0].second.empty(),
           "initial constrained mask request is malformed");
   const std::array<uint32_t, 1> initialMask{1};
-  engine.provideMask(requestId, initialMask);
+  engine.provideMask(requestId, initialMask, {});
   // Its first token is selected, then its first cycle drafts.
   require(tickAt(h, 3) && tickAt(h, 4) && tickAt(h, 5) && tickAt(h, 6),
           "constrained request did not launch overlapped verification");
@@ -1616,7 +1616,7 @@ void testConstrainedLaneSharesDecodeCommand() {
   tickUntil(h, now, [&] { return events.maskRequests.size() == 1; },
             "the constrained prompt did not ask for its first mask");
   const std::array<uint32_t, 1> mask{1};
-  engine.provideMask(1, mask);
+  engine.provideMask(1, mask, {});
   tickUntil(h, now, [&] { return events.maskRequests.size() == 2; },
             "the constrained lane's first cycle did not ask for its verify mask");
   require(engine.commandInFlight() && executor.overlap && executor.overlap->requestId == 1 &&
@@ -1624,10 +1624,10 @@ void testConstrainedLaneSharesDecodeCommand() {
           "the shared command did not wait for the constrained lane's mask");
   const uint32_t provided = executor.providedMasks;
   const size_t unconstrainedTokens = events.outputs[2].size();
-  engine.provideMask(2, mask);
+  engine.provideMask(2, mask, {});
   require(executor.providedMasks == provided && events.failedCount == 0,
           "a mask for the lane that asked for none reached the model");
-  engine.provideMask(1, mask);
+  engine.provideMask(1, mask, {});
   require(tickAt(h, now++) && !engine.commandInFlight() && events.outputs[1] == std::vector<uint32_t>{42} &&
               events.outputs[2].size() > unconstrainedTokens &&
               engine.snapshot().scheduler.decodeBatchesByWidth[1] != 0,
@@ -1668,7 +1668,7 @@ void testDecodeCycleCoversHostWork() {
               events.maskRequests.size() == 1 && !tickAt(h, 130.0),
           "a lane waiting for its first mask kept the engine busy");
   const std::array<uint32_t, 1> mask{1};
-  engine.provideMask(2, mask);
+  engine.provideMask(2, mask, {});
   require(tickAt(h, 140.0) && tickAt(h, 150.0) &&
               events.cycles.back() == std::pair{WorkKind::Decode, 10.0},
           "a decode planned after an idle tick was not timed from its plan");
@@ -1696,7 +1696,7 @@ void testConstrainedPrefillRequestsMaskWithoutDecodeSlot() {
     require(!tickAt(h, now) && !engine.commandInFlight(),
             "a decode plan ran before the first mask arrived");
   const std::array<uint32_t, 1> mask{1};
-  engine.provideMask(1, mask);
+  engine.provideMask(1, mask, {});
   require(tickAt(h, 10) && tickAt(h, 11) && events.emitted == 0 &&
               events.cycles.back().first == WorkKind::Decode &&
               !executor.overlap,
@@ -1715,7 +1715,7 @@ void testConstraintMaskWaitHonorsCancelAndDeadline() {
     advanceToOverlappedVerify(h, 201);
     engine.cancel(201);
     const std::array<uint32_t, 1> lateMask{1};
-    engine.provideMask(201, lateMask);
+    engine.provideMask(201, lateMask, {});
     engine.failRequest(201, LaneOutcome::InvalidMask, "late mask");
     require(executor.overlap->abandoned && tickAt(h, 7) && idle(engine) &&
                 events.completedCount == 1 && events.failedCount == 0 &&
@@ -1760,7 +1760,7 @@ void testUnansweredVerifyMaskFailsOnlyItsRequest() {
               executor.overlap->abandoned && events.failedCount == 0,
           "an unanswered verify mask wait did not end at its limit");
   const std::array<uint32_t, 1> lateMask{1};
-  engine.provideMask(203, lateMask);
+  engine.provideMask(203, lateMask, {});
   require(!executor.overlap->provided,
           "a verify mask that came after the limit reached the model");
   executor.overlap->held = false;
@@ -1793,7 +1793,7 @@ void testUnansweredInitialMaskFails() {
             "the initial mask wait did not schedule its limit");
     if (answered) {
       const std::array<uint32_t, 1> initialMask{1};
-      engine.provideMask(205, initialMask);
+      engine.provideMask(205, initialMask, {});
       require(engine.nextWakeupMilliseconds() == 100'000.0 &&
                   tickAt(h, 5002.0) && events.failedCount == 0,
               "an answered initial mask kept its limit");

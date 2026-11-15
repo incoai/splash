@@ -217,7 +217,7 @@ class RequestLifetimeTests(unittest.TestCase):
                 entered.set()
                 if not release.wait(2):
                     raise TimeoutError("test mask was not released")
-                return b"\xff" * (8 * (len(tokens) + 1))
+                return b"\xff" * (8 * (len(tokens) + 1)), ()
 
         job, cache, held = self.job()
         job.constraint = Constraint()

@@ -78,7 +78,7 @@ class FakeConstraint:
         self.mask_calls.append((simulation_tokens, tuple(parents)))
         rows = len(simulation_tokens) + 1
         words = tuple(range(1, rows * self.words_per_mask + 1))
-        return struct.pack(f"<{len(words)}I", *words)
+        return struct.pack(f"<{len(words)}I", *words), ()
 
     def commit(self, token_ids):
         if self.commit_error is not None:
@@ -217,7 +217,8 @@ class NativeBackendContractTests(unittest.TestCase):
             runtime.calls[0].request_id, 91, 2, (5, 6), (wire.NO_PARENT, 0)
         )
         self.assertEqual(
-            request.mask_provider(event), array.array("I", (1, 2, 3, 4, 5, 6)).tobytes()
+            request.mask_provider(event),
+            (array.array("I", (1, 2, 3, 4, 5, 6)).tobytes(), ()),
         )
         self.assertEqual(constraint.mask_calls, [((5, 6), (wire.NO_PARENT, 0))])
 
@@ -230,8 +231,10 @@ class NativeBackendContractTests(unittest.TestCase):
         chain = (wire.NO_PARENT, *range(7))
         initial = wire.MaskRequestEvent(1, 20, 2, (), ())
         simulation = wire.MaskRequestEvent(1, 21, 2, tuple(range(8)), chain)
-        self.assertEqual(provider(initial), array.array("I", (1, 2)).tobytes())
-        self.assertEqual(provider(simulation), array.array("I", range(1, 19)).tobytes())
+        self.assertEqual(provider(initial), (array.array("I", (1, 2)).tobytes(), ()))
+        self.assertEqual(
+            provider(simulation), (array.array("I", range(1, 19)).tobytes(), ())
+        )
         self.assertEqual(constraint.mask_calls, [((), ()), (tuple(range(8)), chain)])
 
         with self.assertRaises(api_errors.ConstraintError):

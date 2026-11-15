@@ -88,18 +88,18 @@ class TokenConstraintTest(unittest.TestCase):
     def test_draft_rows_stop_following_the_draft_at_its_first_invalid_token(self):
         a, b, c, z, eos = self.a, self.b, self.c, self.z, self.eos
         constraint = self.constraint()
-        self.assertEqual(self.rows(constraint.masks((), ())), [[a]])
+        self.assertEqual(self.rows(constraint.masks((), ())[0]), [[a]])
         self.assertEqual(
-            self.rows(constraint.masks((a, b), chain((a, b)))), [[a], [b, c], [eos]]
+            self.rows(constraint.masks((a, b), chain((a, b)))[0]), [[a], [b, c], [eos]]
         )
         for draft in ((a, z, b), (a, self.ready.vocabulary_size, b), (a, -1, b)):
             with self.subTest(draft=draft):
                 self.assertEqual(
-                    self.rows(constraint.masks(draft, chain(draft))),
+                    self.rows(constraint.masks(draft, chain(draft))[0]),
                     [[a], [b, c], [b, c], [b, c]],
                 )
         # Simulated drafts do not advance the grammar.
-        self.assertEqual(self.rows(constraint.masks((), ())), [[a]])
+        self.assertEqual(self.rows(constraint.masks((), ())[0]), [[a]])
         provide = backend_api.NativeBackend._mask_provider(
             SimpleNamespace(constraint=constraint)
         )
@@ -119,7 +119,7 @@ class TokenConstraintTest(unittest.TestCase):
         parents = (NO_PARENT, 0, 1, 2, 2, 0, 5, 6, 4, 7)
         constraint = self.constraint(self.branching, rows=33)
         self.assertEqual(
-            self.rows(constraint.masks(tokens, parents)),
+            self.rows(constraint.masks(tokens, parents)[0]),
             [
                 [x],  # before the anchor
                 [a, b],  # x
@@ -135,27 +135,35 @@ class TokenConstraintTest(unittest.TestCase):
             ],
         )
         # The walk leaves the grammar where it found it.
-        self.assertEqual(self.rows(constraint.masks((), ())), [[x]])
+        self.assertEqual(self.rows(constraint.masks((), ())[0]), [[x]])
 
     def test_tree_masks_match_a_matcher_copy_per_path(self):
         """On random trees of up to 16 rows over a JSON grammar, each row's
         mask is the one a matcher copied for its path alone finds: the state
-        after the path's tokens up to the first the grammar rejects."""
+        after the path's tokens up to the first the grammar rejects; and so
+        are the tokens the grammar forces after it, none past a rejection
+        and none before the anchor, whose row no cycle ends at."""
         generator = random.Random(1114)
         vocabulary = self.ready.vocabulary_size
         bitmask = allocate_token_bitmask(1, vocabulary)
 
         def reference(path):
+            """The mask after the path's tokens up to the first the grammar
+            rejects, and the tokens it forces after the whole path, none
+            where it rejects one."""
             matcher = self.json.deep_copy()
+            reached = True
             for token in path:
                 if (
                     not 0 <= token < vocabulary
                     or token == self.eos
                     or not matcher.try_consume_tokens([token])
                 ):
+                    reached = False
                     break
             fill_next_token_bitmask(matcher, bitmask, 0)
-            return bitmask[0].copy()
+            forced = tuple(matcher.compute_ff_tokens()) if reached else ()
+            return bitmask[0].copy(), forced
 
         prefix = self.tokenizer.encode('{"id": 1').ids
         constraint = self.constraint(self.json, rows=33)
@@ -166,7 +174,7 @@ class TokenConstraintTest(unittest.TestCase):
                 parent = generator.randrange(row) if row else NO_PARENT
                 path = paths[parent] if row else prefix
                 allowed = np.flatnonzero(
-                    np.unpackbits(reference(path).view(np.uint8), bitorder="little")
+                    np.unpackbits(reference(path)[0].view(np.uint8), bitorder="little")
                 )
                 token = (
                     int(generator.choice(allowed))
@@ -179,13 +187,93 @@ class TokenConstraintTest(unittest.TestCase):
             # Children in any order after their parents, as well as in
             # preorder.
             with self.subTest(trial=trial):
-                masks = np.frombuffer(
-                    constraint.masks(tuple(tokens), tuple(parents)), dtype=np.int32
-                ).reshape(-1, self.width)
+                masks, forced = constraint.masks(tuple(tokens), tuple(parents))
+                masks = np.frombuffer(masks, dtype=np.int32).reshape(-1, self.width)
                 expected = [reference(prefix), *(reference(path) for path in paths)]
                 self.assertTrue(
-                    all(np.array_equal(row, want) for row, want in zip(masks, expected))
+                    all(
+                        np.array_equal(row, want[0])
+                        for row, want in zip(masks, expected)
+                    )
                 )
+                self.assertEqual(
+                    forced,
+                    tuple(
+                        value
+                        for row, (_, tokens) in enumerate(expected[1:], 1)
+                        for token in tokens[:32]
+                        for value in (row, token)
+                    ),
+                )
+
+    def test_rows_carry_the_tokens_their_grammar_forces(self):
+        """Beside its masks, a request gets the tokens the grammar forces
+        after each row's path, as pairs of a row and a token: the rest of
+        "abc!" once "xa" begins it, the rest of "bd!" after "xb", nothing
+        after the free choice that follows "x", and nothing below a token the
+        grammar rejects. A first token's request gets its one row's: the
+        anchor; a verify's, none before the anchor, which every cycle
+        retains."""
+        x, a, b, c, d, z, bang = map(self.tokenizer.token_to_id, "xabcdz!")
+        guidance = grammar_tokenizers()[1]
+        matcher = LLMatcher(
+            guidance, '%llguidance {}\nstart: "x" ("abc" | "bd") "!"\n', log_level=0
+        )
+        constraint = self.constraint(matcher)
+        self.assertEqual(constraint.masks((), ())[1], (0, x))
+        _, forced = constraint.masks((x, a, b, z, b), (NO_PARENT, 0, 1, 1, 0))
+        self.assertEqual(forced, (2, b, 2, c, 2, bang, 3, c, 3, bang, 5, d, 5, bang))
+
+    def test_forced_tokens_fit_the_response_the_engine_takes(self):
+        """The engine takes a row and a token for as many tokens as a
+        request simulates (Ready's mask rows less one) after each row of a
+        response, 144 words where it simulates 8. Under an 8-token chain
+        along a 40-token forced run each of the anchor's and its 7 proposals'
+        rows forces the next 8 tokens; without the bound, 9 rows of up to 32
+        tokens each sent 576 words, past the engine's frame."""
+        run = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMN!"
+        guidance = grammar_tokenizers()[1]
+        matcher = LLMatcher(
+            guidance, f'%llguidance {{}}\nstart: "x" "{run}"\n', log_level=0
+        )
+        tokens = tuple(map(self.tokenizer.token_to_id, "x" + run))
+        constraint = self.constraint(matcher)
+        rows = self.ready.mask_rows
+        _, forced = constraint.masks(tokens[:8], chain(tokens[:8]))
+        self.assertLessEqual(len(forced), 2 * rows * (rows - 1))
+        self.assertEqual(
+            forced,
+            tuple(
+                value
+                for row in range(1, 9)
+                for token in tokens[row : row + 8]
+                for value in (row, token)
+            ),
+        )
+
+    def test_a_rollback_the_grammar_refuses_fails_the_request(self):
+        """A rollback the grammar refused would leave every later sibling's
+        mask and forced tokens computed from the wrong state: the request
+        fails instead."""
+
+        class Stuck:
+            """The matcher, refusing every rollback."""
+
+            def __init__(self, matcher):
+                self.matcher = matcher
+
+            def rollback(self, _count):
+                return False
+
+            def __getattr__(self, name):
+                return getattr(self.matcher, name)
+
+        a, b = self.a, self.b
+        constraint = constraints.TokenConstraint(
+            Stuck(self.matcher.deep_copy()), self.ready
+        )
+        with self.assertRaises(ConstraintError):
+            constraint.masks((a, b), chain((a, b)))
 
     def test_masks_validate_drafts_without_copying_or_advancing_the_matcher(self):
         class Uncopyable:
@@ -204,18 +292,18 @@ class TokenConstraintTest(unittest.TestCase):
         constraint = constraints.TokenConstraint(
             Uncopyable(self.matcher.deep_copy()), self.ready
         )
-        rows = self.rows(constraint.masks((a, b, z, c), (NO_PARENT, 0, 0, 0)))
+        rows = self.rows(constraint.masks((a, b, z, c), (NO_PARENT, 0, 0, 0))[0])
         constraint.commit([a])
-        self.assertEqual(self.rows(constraint.masks((), ())), rows[1:2])
+        self.assertEqual(self.rows(constraint.masks((), ())[0]), rows[1:2])
 
     def test_generated_tokens_advance_the_grammar_and_end_with_eos(self):
         a, b, c, eos = self.a, self.b, self.c, self.eos
         constraint = self.constraint()
         # Committed tokens advance the grammar before its next mask.
         constraint.commit([a])
-        self.assertEqual(self.rows(constraint.masks((), ())), [[b, c]])
+        self.assertEqual(self.rows(constraint.masks((), ())[0]), [[b, c]])
         constraint.commit([b])
-        self.assertEqual(self.rows(constraint.masks((), ())), [[eos]])
+        self.assertEqual(self.rows(constraint.masks((), ())[0]), [[eos]])
         # LLGuidance's bulk API rejects EOS once the grammar has stopped.
         self.assertFalse(constraint.matcher.deep_copy().consume_tokens([eos]))
         constraint.commit([eos])

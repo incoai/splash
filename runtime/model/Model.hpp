@@ -613,6 +613,22 @@ maskWordsPerToken(uint32_t vocabularySize) noexcept {
   return static_cast<uint32_t>((uint64_t{vocabularySize} + 31) / 32);
 }
 
+// The tokens a mask's grammar forces after mask row `row`'s path, from the
+// pairs of a row and a token that came with it (Model::provideMask), past
+// `selection`, which begins them; none where the row forces nothing or the
+// selection is another token.
+[[nodiscard]] inline std::vector<uint32_t> forcedAfter(std::span<const uint32_t> forced, uint32_t row,
+                                                       uint32_t selection) {
+  std::vector<uint32_t> tokens;
+  for (size_t at = 0; at + 1 < forced.size(); at += 2)
+    if (forced[at] == row)
+      tokens.push_back(forced[at + 1]);
+  if (tokens.empty() || tokens.front() != selection)
+    return {};
+  tokens.erase(tokens.begin());
+  return tokens;
+}
+
 // Compile-time ceiling of the one native DFlash execution contract: the
 // kernels' ABI values (metal/abi/ExecutionGeometry.h) under the runtime's
 // names, and limits of the runtime's own. A draft must have been trained for
@@ -930,9 +946,11 @@ public:
   [[nodiscard]] virtual uint64_t releaseIdleBuffer(bool keepLane) noexcept = 0;
   // The model's elastic memories, stable for its lifetime; none by default.
   [[nodiscard]] virtual std::span<ElasticPool *const> pools() noexcept { return {}; }
-  // Why this request's mask is unusable, or nothing when the model took it.
+  // Why this request's mask is unusable, or nothing when the model took it:
+  // its rows' words, and pairs of a mask row and a token its grammar forces
+  // after the row's path, the rows ascending and each row's tokens in order.
   [[nodiscard]] virtual std::optional<std::string>
-  provideMask(uint64_t requestId, std::span<const uint32_t> words) = 0;
+  provideMask(uint64_t requestId, std::span<const uint32_t> words, std::span<const uint32_t> forced) = 0;
   virtual void end(uint64_t requestId) = 0;
 };
 

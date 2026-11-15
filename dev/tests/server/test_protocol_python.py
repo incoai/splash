@@ -117,8 +117,9 @@ def client_messages():
         "request_ignore_eos": example_ignore_eos_request(),
         "request_progress": example_progress_request(),
         "cancel": p.CancelFrame(91),
+        # Mask row 1 forces two tokens after its path, row 2 one.
         "mask_response": p.MaskResponseFrame(
-            91, 7, struct.pack("<3I", 0xFFFFFFFF, 0, 0xA5A5A5A5)
+            91, 7, struct.pack("<3I", 0xFFFFFFFF, 0, 0xA5A5A5A5), (1, 40, 1, 41, 2, 50)
         ),
         "status_request": p.StatusRequestFrame(808),
         "release_request": p.ReleaseRequestFrame(808),
@@ -1158,12 +1159,12 @@ class ProtocolPythonTests(unittest.TestCase):
                 p.FailureClass.PROTOCOL_FATAL,
             ),
             (
-                p.MaskResponseFrame(0, 7, bytes(4)),
+                p.MaskResponseFrame(0, 7, bytes(4), ()),
                 p.IssueCode.INVALID_REQUEST_ID,
                 p.FailureClass.PROTOCOL_FATAL,
             ),
             (
-                p.MaskResponseFrame(91, 0, bytes(4)),
+                p.MaskResponseFrame(91, 0, bytes(4), ()),
                 p.IssueCode.INVALID_REQUEST_ID,
                 p.FailureClass.REQUEST_ERROR,
             ),

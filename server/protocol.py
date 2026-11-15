@@ -42,6 +42,9 @@ MAX_TOKEN_BATCH = 4096
 MAX_SIMULATION_TOKENS = 32
 # The parent of a mask request's first simulation token, its tree's root.
 NO_PARENT = 0xFFFFFFFF
+# The most words of a mask response's forced tokens: a row and a token for as
+# many tokens as a request simulates, after each of its rows.
+MAX_FORCED_WORDS = 2 * (MAX_SIMULATION_TOKENS + 1) * MAX_SIMULATION_TOKENS
 MAX_IMAGE_SPANS = 64
 MAX_MASK_WORDS = 1 << 20
 
@@ -53,7 +56,8 @@ _REQUEST = struct.Struct(_REQUEST_HEAD.format + "IIIffIffffQIIIQQIII")
 _IMAGE_SPAN = struct.Struct("<IIIIQQ")
 # Cancel and Stop: one request id.
 _REQUEST_END = struct.Struct("<Q")
-_MASK_RESPONSE = struct.Struct("<QQI")
+# Request id, mask request id, mask words, forced token words.
+_MASK_RESPONSE = struct.Struct("<QQII")
 _STATUS_REQUEST = struct.Struct("<Q")
 _RELEASE_REQUEST = struct.Struct("<Q")
 # Concurrent requests, context, vision, vocabulary, mask rows, stop count.
@@ -324,6 +328,10 @@ class MaskResponseFrame:
     mask_request_id: int
     # Little-endian uint32 words, words_per_mask per mask row.
     mask_words: bytes
+    # Pairs of a mask row and a token the grammar forces after the row's
+    # path, the rows ascending and each row's tokens in order, at most
+    # MAX_SIMULATION_TOKENS a row.
+    forced_tokens: tuple[int, ...]
 
 
 @dataclass(slots=True, frozen=True)
@@ -676,7 +684,10 @@ def _payload_bounds(frame_type: FrameType) -> tuple[int, int]:
         case FrameType.CANCEL | FrameType.STOP:
             bounds = (_REQUEST_END.size, _REQUEST_END.size)
         case FrameType.MASK_RESPONSE:
-            bounds = (_MASK_RESPONSE.size, _MASK_RESPONSE.size + MAX_MASK_WORDS * 4)
+            bounds = (
+                _MASK_RESPONSE.size,
+                _MASK_RESPONSE.size + (MAX_MASK_WORDS + MAX_FORCED_WORDS) * 4,
+            )
         case FrameType.STATUS_REQUEST:
             bounds = (_STATUS_REQUEST.size, _STATUS_REQUEST.size)
         case FrameType.RELEASE_REQUEST:
@@ -1000,15 +1011,29 @@ def _mask_response_frame(response: MaskResponseFrame) -> bytearray:
         _fail_request(IssueCode.INVALID_REQUEST_ID, str(error), request_id)
     try:
         mask = _mask_payload(response.mask_words)
+        forced = _words(response.forced_tokens, "forced tokens").tobytes()
         if not mask or len(mask) // 4 > MAX_MASK_WORDS:
             raise ValueError("mask response word count exceeds its limit")
+        if len(forced) // 4 > MAX_FORCED_WORDS or len(forced) % 8:
+            raise ValueError(
+                "mask response forced tokens are not pairs within their limit"
+            )
     except ValueError as error:
         _fail_request(IssueCode.LIMIT_EXCEEDED, str(error), request_id)
-    frame = _frame(FrameType.MASK_RESPONSE, _MASK_RESPONSE.size + len(mask))
-    _MASK_RESPONSE.pack_into(
-        frame, FRAME_HEADER_BYTES, request_id, mask_request_id, len(mask) // 4
+    frame = _frame(
+        FrameType.MASK_RESPONSE, _MASK_RESPONSE.size + len(mask) + len(forced)
     )
-    frame[FRAME_HEADER_BYTES + _MASK_RESPONSE.size :] = mask
+    _MASK_RESPONSE.pack_into(
+        frame,
+        FRAME_HEADER_BYTES,
+        request_id,
+        mask_request_id,
+        len(mask) // 4,
+        len(forced) // 4,
+    )
+    start = FRAME_HEADER_BYTES + _MASK_RESPONSE.size
+    frame[start : start + len(mask)] = mask
+    frame[start + len(mask) :] = forced
     return frame
 
 

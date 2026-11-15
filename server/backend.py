@@ -797,7 +797,7 @@ class NativeBackend:
             # proposals: nothing for the initial mask, then a verify block's
             # tree, the pending anchor its root. TokenConstraint returns the
             # mask before the first simulated token and after each token's
-            # path.
+            # path, and the tokens the grammar forces after each.
             return job.constraint.masks(event.simulation_tokens, event.parents)
 
         return provide

@@ -227,8 +227,9 @@ const std::vector<std::pair<std::string, ClientMessage>> &clientMessages() {
       {"request_ignore_eos", exampleIgnoreEosRequest()},
       {"request_progress", exampleProgressRequest()},
       {"cancel", CancelFrame{91}},
+      // Mask row 1 forces two tokens after its path, row 2 one.
       {"mask_response",
-       MaskResponseFrame{91, 7, {0xffffffffU, 0, 0xa5a5a5a5U}}},
+       MaskResponseFrame{91, 7, {0xffffffffU, 0, 0xa5a5a5a5U}, {1, 40, 1, 41, 2, 50}}},
       {"status_request", StatusRequestFrame{808}},
       {"release_request", ReleaseRequestFrame{808}},
       {"stop", StopFrame{91}},
@@ -1134,10 +1135,20 @@ void testUnnamedRequestFailuresAreFatal() {
          FailureClass::ProtocolFatal);
   expect(StopFrame{0}, IssueCode::InvalidRequestId,
          FailureClass::ProtocolFatal);
-  expect(MaskResponseFrame{0, 7, {1}}, IssueCode::InvalidRequestId,
+  expect(MaskResponseFrame{0, 7, {1}, {}}, IssueCode::InvalidRequestId,
          FailureClass::ProtocolFatal);
-  expect(MaskResponseFrame{91, 0, {1}}, IssueCode::InvalidRequestId,
+  expect(MaskResponseFrame{91, 0, {1}, {}}, IssueCode::InvalidRequestId,
          FailureClass::RequestError);
+  // A mask response's forced tokens hold at most a row and a token for each
+  // token of the largest request, after each of its rows: four words where a
+  // request simulates one token.
+  ProtocolLimits oneToken;
+  oneToken.maxSimulationTokens = 1;
+  expect(MaskResponseFrame{91, 7, {1}, {0, 5, 1, 6, 1, 7}}, IssueCode::LimitExceeded,
+         FailureClass::RequestError, oneToken);
+  const auto fits = decodeClient(peer::serialize(MaskResponseFrame{91, 7, {1}, {0, 5, 1, 6}}), oneToken);
+  const std::vector<uint32_t> forced{0, 5, 1, 6};
+  CHECK(test, fits && std::get<MaskResponseFrame>(*fits.value).forcedTokens == forced);
 }
 
 void testInvalidLimitsAndOuterTruncation() {

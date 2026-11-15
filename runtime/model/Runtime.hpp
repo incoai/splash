@@ -62,7 +62,7 @@ public:
   [[nodiscard]] ModelMemoryAdmission reserveSpilledReads(uint64_t requestId, SpilledReadNeed need) override;
   [[nodiscard]] uint64_t releaseIdleBuffer(bool keepLane) noexcept override;
   [[nodiscard]] std::optional<std::string>
-  provideMask(uint64_t requestId, std::span<const uint32_t> words) override;
+  provideMask(uint64_t requestId, std::span<const uint32_t> words, std::span<const uint32_t> forced) override;
   void end(uint64_t requestId) override;
 
   [[nodiscard]] WarmupStepResult warmupPrefill(uint32_t rows) override;

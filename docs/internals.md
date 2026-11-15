@@ -2350,7 +2350,11 @@ each row's token and its parent row, and the server's grammar walks it depth
 first in one matcher, consuming a row's token over its parent's state and
 rolling it back after the row's subtree, so each row's mask follows its own
 path; a row whose token the grammar rejects there, and every row below it,
-takes its parent's mask, as the target never accepts it. A mask request the server leaves
+takes its parent's mask, as the target never accepts it. With the masks come
+the tokens the grammar forces after each row's path, as pairs of a row and a
+token, which the next cycle proposes as its host chain where the path the
+lane retained ends at that row and its anchor begins them
+([Drafts](models.md#drafts)). A mask request the server leaves
 unanswered for 5 s fails that request with the retryable `mask_timeout` (HTTP
 503), so a stalled grammar cannot hold the batch's command.
 

@@ -162,9 +162,12 @@ class RuntimeTests(unittest.TestCase):
             request(
                 300,
                 constraint=wire.ConstraintMode.TOKEN_MASK,
-                mask_provider=lambda event: array(
-                    "I", (1,) * (event.words_per_mask * event.mask_rows)
-                ).tobytes(),
+                mask_provider=lambda event: (
+                    array(
+                        "I", (1,) * (event.words_per_mask * event.mask_rows)
+                    ).tobytes(),
+                    (),
+                ),
             ),
             request(400, priority=wire.RequestPriority.BACKGROUND),
         )
@@ -630,7 +633,9 @@ class RuntimeTests(unittest.TestCase):
 
         def provider(event):
             mask_requests.append(event)
-            return array("I", (1,) * (event.words_per_mask * event.mask_rows)).tobytes()
+            return array(
+                "I", (1,) * (event.words_per_mask * event.mask_rows)
+            ).tobytes(), ()
 
         factory = FakeFactory()
         runtime = engine_runtime.MultiplexedRuntime(
@@ -750,7 +755,7 @@ class RuntimeTests(unittest.TestCase):
             provider_called.set()
             return array(
                 "I", range(1, event.words_per_mask * event.mask_rows + 1)
-            ).tobytes()
+            ).tobytes(), ()
 
         factory = FakeFactory()
         runtime = engine_runtime.MultiplexedRuntime(
@@ -796,7 +801,7 @@ class RuntimeTests(unittest.TestCase):
                     request(
                         30,
                         constraint=wire.ConstraintMode.TOKEN_MASK,
-                        mask_provider=lambda _event, mask=mask: mask,
+                        mask_provider=lambda _event, mask=mask: (mask, ()),
                     )
                 )
                 healthy = runtime.submit(request(40))
@@ -859,7 +864,7 @@ class RuntimeTests(unittest.TestCase):
 
         def provider(event):
             computed.append(event.mask_request_id)
-            return b""
+            return b"", ()
 
         factory = FakeFactory()
         runtime = engine_runtime.MultiplexedRuntime(
@@ -928,7 +933,9 @@ class RuntimeTests(unittest.TestCase):
             provider_started.set()
             provider_release.wait(1.0)
             provider_finished.set()
-            return array("I", (1,) * (event.words_per_mask * event.mask_rows)).tobytes()
+            return array(
+                "I", (1,) * (event.words_per_mask * event.mask_rows)
+            ).tobytes(), ()
 
         factory = FakeFactory()
         runtime = engine_runtime.MultiplexedRuntime(
@@ -971,7 +978,9 @@ class RuntimeTests(unittest.TestCase):
             calls_to_provider.append(event.request_id)
             started.set()
             release.wait(5.0)
-            return array("I", (1,) * (event.words_per_mask * event.mask_rows)).tobytes()
+            return array(
+                "I", (1,) * (event.words_per_mask * event.mask_rows)
+            ).tobytes(), ()
 
         factory = FakeFactory()
         runtime = engine_runtime.MultiplexedRuntime(
@@ -1037,7 +1046,9 @@ class RuntimeTests(unittest.TestCase):
         def provider(event):
             started.set()
             release.wait(5.0)
-            return array("I", (1,) * (event.words_per_mask * event.mask_rows)).tobytes()
+            return array(
+                "I", (1,) * (event.words_per_mask * event.mask_rows)
+            ).tobytes(), ()
 
         factory = FakeFactory()
         runtime = engine_runtime.MultiplexedRuntime(

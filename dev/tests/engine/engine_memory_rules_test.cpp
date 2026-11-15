@@ -75,7 +75,7 @@ void answerMasks(Events &events, Engine &engine, uint64_t id, const std::functio
   for (uint32_t step = 0; step < 2000 && !events.usage.contains(id); ++step) {
     for (; answered < events.maskRequests.size(); ++answered)
       if (events.maskRequests[answered].first == id)
-        engine.provideMask(id, mask);
+        engine.provideMask(id, mask, {});
     tick();
   }
   require(events.usage.contains(id), "the masked request did not finish");
@@ -320,7 +320,7 @@ void testACancelBetweenPassesEndsBesideAHigherPrioritysDecode() {
   const auto answer = [&] {
     for (; answered < passes.events.maskRequests.size(); ++answered)
       if (passes.events.maskRequests[answered].first == 3)
-        passes.engine.provideMask(3, mask);
+        passes.engine.provideMask(3, mask, {});
   };
   answer();
   passes.engine.cancel(2);

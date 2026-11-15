@@ -45,12 +45,16 @@ class TokenConstraint:
         """The grammar's mask before the first simulated token, then one
         after each token's path: the tokens from the first along their
         parents to it (protocol.MaskRequestEvent), a verify block's rows as
-        its tree. The grammar walks the tree depth first in one matcher, each
-        token consumed over its parent's state and rolled back after its
-        subtree. A token the grammar rejects there, or a stop token, which
-        ends the output, is a row the target never accepts, nor any row
-        below it; those rows take their parent's mask, which admits a token
-        as every mask must."""
+        its tree. Beside them, the tokens the grammar forces after the paths
+        the engine reads them for, as the pairs of a row and a token
+        protocol.MaskResponseFrame carries: a cycle whose retained path ends
+        at a row, its anchor's at least, proposes them next, and a first
+        token's request reads its one row. The grammar walks the tree depth
+        first in one matcher, each token consumed over its parent's state and
+        rolled back after its subtree. A token the grammar rejects there, or
+        a stop token, which ends the output, is a row the target never
+        accepts, nor any row below it; those rows take their parent's mask,
+        which admits a token as every mask must, and force nothing."""
         self._consume_committed()
         rows = len(simulation_tokens) + 1
         if rows > self.rows:
@@ -60,19 +64,43 @@ class TokenConstraint:
         children = [[] for _ in range(rows)]
         for row, parent_row in enumerate(follows, 1):
             children[parent_row].append(row)
-        fill_next_token_bitmask(self.matcher, self.bitmask, 0)
-        reached = {0}
-        self._walk(0, simulation_tokens, children, reached)
+        reached, forced = [False] * rows, [()] * rows
+        self._reach(0, reached, forced)
+        self._walk(0, simulation_tokens, children, reached, forced)
         # A parent's row comes before its children's.
         for row in range(1, rows):
-            if row not in reached:
+            if not reached[row]:
                 self.bitmask[row] = self.bitmask[follows[row - 1]]
         if not self.bitmask[:rows].any(axis=1).all():
             raise ConstraintError("output grammar has no valid token")
-        return self.bitmask[:rows].tobytes()
+        # The forced tokens as the mask response carries them: pairs of a
+        # row and a token.
+        pairs = tuple(
+            value
+            for row, tokens in enumerate(forced)
+            for token in tokens
+            for value in (row, token)
+        )
+        return self.bitmask[:rows].tobytes(), pairs
 
-    def _walk(self, row, tokens, children, reached):
-        """Fills the masks below mask row `row`, whose state the matcher is
+    def _reach(self, row, reached, forced):
+        """Mask row `row` of the matcher's state and, where the engine reads
+        them, the tokens the grammar forces there: after each verify row's
+        path (mask rows from 1, as a cycle retains its anchor at least), or
+        before a first token (its request's one row). At most Ready's mask
+        rows less one of them, as many as a request simulates: the engine
+        takes a row and a token for that many after each row of a response
+        (Protocol.cpp's forcedWords), and a grammar forcing 13 tokens in a
+        row, as a named tool call's opening does, would otherwise send an
+        8-token request's response past its frame and close the
+        connection."""
+        fill_next_token_bitmask(self.matcher, self.bitmask, row)
+        reached[row] = True
+        if row or len(forced) == 1:
+            forced[row] = tuple(self.matcher.compute_ff_tokens()[: self.rows - 1])
+
+    def _walk(self, row, tokens, children, reached, forced):
+        """Fills the rows below mask row `row`, whose state the matcher is
         in, and leaves it there."""
         for child in children[row]:
             token = tokens[child - 1]
@@ -81,10 +109,12 @@ class TokenConstraint:
                 and token not in self.eos_tokens
                 and self.matcher.try_consume_tokens([token])
             ):
-                fill_next_token_bitmask(self.matcher, self.bitmask, child)
-                reached.add(child)
-                self._walk(child, tokens, children, reached)
-                self.matcher.rollback(1)
+                self._reach(child, reached, forced)
+                self._walk(child, tokens, children, reached, forced)
+                if not self.matcher.rollback(1):
+                    raise ConstraintError(
+                        "output grammar did not take back a simulated token"
+                    )
 
     def _consume_committed(self):
         with self._lock:

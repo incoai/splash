@@ -739,7 +739,7 @@ std::vector<uint32_t> singletonMasks(std::span<const uint32_t> tokens) {
 void provideMask(model::Runtime &executor, uint64_t requestId,
                  std::span<const uint32_t> words) {
   const std::optional<std::string> rejected =
-      executor.provideMask(requestId, words);
+      executor.provideMask(requestId, words, {});
   require(!rejected, "the runtime rejected a usable token mask: " +
                          rejected.value_or(""));
 }

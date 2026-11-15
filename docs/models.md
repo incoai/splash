@@ -357,7 +357,15 @@ the tokens that followed the latest earlier occurrence of its last three or
 more tokens (`model::LookupIndex`), each estimated by the match's length, its
 depth and whether the draft's candidates there hold it
 (`model::LookupAcceptance`, fit on traced cycles and refined by every
-cycle's outcome); a lookup token that is a draft row's joins that row. A step to a candidate of probability q (the softmax at
+cycle's outcome); a lookup token that is a draft row's joins that row. A
+constrained lane whose grammar forces the tokens after its anchor proposes
+those instead, each estimated at 1: the server finds, with a cycle's masks,
+the tokens the grammar forces after each row's path, and the next cycle takes
+those of the path the lane retained where its anchor begins them (on 15
+structured outputs of Qwen3.8-27B on a 48 GB M5 Pro, the masks admitted the
+forced token alone at every one of 847 forced positions, and the chains
+would add 1.4% to the tokens a cycle accepts, 16% on an answer whose long
+keys only the schema names). A step to a candidate of probability q (the softmax at
 temperature 1 of its position's candidates' scores after its parent's) is
 estimated by an online model, logit(p) = slope * logit(q) +
 intercept[position], the probability that the target accepts it once it

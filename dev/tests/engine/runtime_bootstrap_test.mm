@@ -141,7 +141,7 @@ public:
   }
   std::shared_ptr<const CompositeState> snapshot(uint64_t) override { return {}; }
   uint64_t releaseIdleBuffer(bool) noexcept override { return 0; }
-  std::optional<std::string> provideMask(uint64_t,
+  std::optional<std::string> provideMask(uint64_t, std::span<const uint32_t>,
                                          std::span<const uint32_t>) override {
     return std::nullopt;
   }

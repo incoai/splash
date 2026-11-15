@@ -26,7 +26,7 @@ std::string_view failureClassName(FailureClass failureClass);
 constexpr std::array<uint8_t, 4> kMagic{'S', 'P', 'L', 'H'};
 // Cancel and Stop: one u64 request id.
 constexpr uint64_t kRequestEndFixedBytes = 8;
-constexpr uint64_t kMaskResponseFixedBytes = 20;
+constexpr uint64_t kMaskResponseFixedBytes = 24;
 constexpr uint64_t kStatusRequestFixedBytes = 8;
 constexpr uint64_t kReleaseRequestFixedBytes = 8;
 constexpr uint64_t kReadyFixedBytes = 21;
@@ -38,6 +38,11 @@ constexpr uint64_t kDoneFixedBytes = 62;
 constexpr uint64_t kErrorFixedBytes = 22;
 constexpr uint64_t kStatusJsonFixedBytes = 8;
 constexpr uint64_t kStartFailedFixedBytes = 26;
+// The most words of a mask response's forced tokens: a row and a token for
+// as many tokens as a request simulates, after each of its rows.
+uint64_t forcedWords(const ProtocolLimits &limits) {
+  return 2 * (uint64_t{limits.maxSimulationTokens} + 1) * limits.maxSimulationTokens;
+}
 constexpr uint64_t kWarmingFixedBytes = 8;
 
 struct PayloadBounds {
@@ -85,7 +90,7 @@ std::optional<PayloadBounds> payloadBounds(FrameType type,
   case FrameType::Stop:
     return bounded(kRequestEndFixedBytes, kRequestEndFixedBytes);
   case FrameType::MaskResponse:
-    if (!checkedMultiply(limits.maxMaskWords, sizeof(uint32_t), variable) ||
+    if (!checkedMultiply(limits.maxMaskWords + forcedWords(limits), sizeof(uint32_t), variable) ||
         !checkedAdd(kMaskResponseFixedBytes, variable, maximum)) {
       return std::nullopt;
     }
@@ -889,22 +894,22 @@ ProtocolResult<ClientMessage> decodeMaskResponse(const Frame &frame,
                                                  const ProtocolLimits &limits) {
   Reader reader(frame.payload);
   MaskResponseFrame response;
-  uint32_t wordCount = 0;
+  uint32_t wordCount = 0, forcedCount = 0;
   if (!reader.u64(response.requestId) || !reader.u64(response.maskRequestId) ||
-      !reader.u32(wordCount)) {
+      !reader.u32(wordCount) || !reader.u32(forcedCount)) {
     return failure<ClientMessage>(
         makeIssue(FailureClass::ProtocolFatal, IssueCode::InvalidPayloadLength,
                   0, "mask response fixed payload is truncated"));
   }
-  if (wordCount > limits.maxMaskWords) {
+  if (wordCount > limits.maxMaskWords || forcedCount > forcedWords(limits)) {
     return failure<ClientMessage>(
         requestIssue(IssueCode::LimitExceeded, response.requestId,
                      "mask response word count exceeds its limit"));
   }
   uint64_t expectedBytes = 0;
-  if (!checkedMultiply(wordCount, sizeof(uint32_t), expectedBytes) ||
+  if (!checkedMultiply(uint64_t{wordCount} + forcedCount, sizeof(uint32_t), expectedBytes) ||
       reader.remaining() != expectedBytes ||
-      !reader.words(wordCount, response.maskWords)) {
+      !reader.words(wordCount, response.maskWords) || !reader.words(forcedCount, response.forcedTokens)) {
     return failure<ClientMessage>(
         requestIssue(IssueCode::InvalidPayloadLength, response.requestId,
                      "mask word count does not match the binary payload"));

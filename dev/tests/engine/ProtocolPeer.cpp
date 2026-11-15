@@ -130,7 +130,9 @@ FrameType write(Writer &out, const MaskResponseFrame &response) {
   out.u64(response.requestId);
   out.u64(response.maskRequestId);
   out.u32(static_cast<uint32_t>(response.maskWords.size()));
+  out.u32(static_cast<uint32_t>(response.forcedTokens.size()));
   out.words(response.maskWords);
+  out.words(response.forcedTokens);
   return FrameType::MaskResponse;
 }
 

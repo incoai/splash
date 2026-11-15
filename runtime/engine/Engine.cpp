@@ -158,7 +158,7 @@ void Engine::failRequest(uint64_t id, LaneOutcome outcome, std::string message) 
   settle(request(id), {outcome, std::move(message)});
 }
 
-void Engine::provideMask(uint64_t id, std::span<const uint32_t> words) {
+void Engine::provideMask(uint64_t id, std::span<const uint32_t> words, std::span<const uint32_t> forced) {
   Request &active = request(id);
   const bool ownedByActiveBatch =
       pending_ && pending_->ticket->ownsMaskWait(id);
@@ -168,7 +168,7 @@ void Engine::provideMask(uint64_t id, std::span<const uint32_t> words) {
       (!ownedByActiveBatch && scheduler_.phase(id) != Phase::WaitingMask)) {
     return;
   }
-  if (std::optional<std::string> rejected = model_.provideMask(id, words)) {
+  if (std::optional<std::string> rejected = model_.provideMask(id, words, forced)) {
     settle(active, {LaneOutcome::InvalidMask, std::move(*rejected)});
     return;
   }

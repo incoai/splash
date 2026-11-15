@@ -401,6 +401,12 @@ struct Runtime::Impl {
     // logits at these token ids instead of selecting an anchor.
     std::vector<uint32_t> scoreTokens;
     std::vector<uint32_t> maskWords;
+    // The tokens its grammar forces after each mask row's path, as pairs of
+    // the row and a token (Model::provideMask), and of those after the path
+    // its last selection retained, the ones past that selection, which
+    // begins them: its next cycle's host chain (encodeDraftBatchGraph).
+    std::vector<uint32_t> forcedTokens;
+    std::vector<uint32_t> grammarChain;
     // The mask rows the current scheduler-owned ticket asked for while it
     // overlaps grammar-mask computation with target verification: one at its
     // anchor and one after each verify row's token its request simulates; 0
@@ -1608,6 +1614,7 @@ struct Runtime::Impl {
           continue;
         }
         commitSelected(entry, {&token, 1});
+        keepGrammarChain(entry, 0, token);
         entry.maskWords.clear();
         entry.finalTargetHidden.clear();
         entry.decodeStage = DecodeStage::Regular;
@@ -2332,17 +2339,17 @@ struct Runtime::Impl {
       // A thinking end at the lane's first row is its proposals, a chain the
       // verify selects whatever its logits: no draft row beside it could be
       // accepted. Before its thinking ends, where a cutoff would replace its
-      // later rows' selections, a lane proposes no lookup chain.
-      const std::span<const uint32_t> end = policy.thinkingCutoff ? policy.thinkingCutoff->end : std::span<const uint32_t>{};
+      // later rows' selections, a lane proposes no other chain. Its host chain
+      // is otherwise the tokens its grammar forces after its anchor, where it
+      // forces any, or its lookup chain.
       if (const uint32_t forced = policy.thinkingCutoff ? policy.thinkingCutoff->replacedProposals() : 0) {
-        tree.chain = forced;
+        proposeForcedChain(tree, lane, policy.thinkingCutoff->end.first(forced));
         tree.children = 0;
-        std::copy_n(end.begin(), forced,
-                    contents<uint32_t>(decodeArena->get(lane, DecodeTensor::ChainTokens), "chain tokens"));
-        std::fill_n(contents<float>(decodeArena->get(lane, DecodeTensor::ChainRates), "chain rates"),
-                    forced * SPLASH_TREE_AGREEMENTS, 1.0F);
       } else if (branches && !policy.thinkingCutoff) {
-        proposeLookup(entry, tree, lane);
+        if (entry.grammarChain.empty())
+          proposeLookup(entry, tree, lane);
+        else
+          proposeForcedChain(tree, lane, entry.grammarChain);
       }
     }
     const ops::DraftSelectorBuffers selection{
@@ -2362,6 +2369,29 @@ struct Runtime::Impl {
       costs = verifyBudget->costs(lanes, constrained);
     ops::DraftSelector::addVerifyRows(graph, selection, step,
                                       budgets ? std::span<const float>(costs) : std::span<const float>{});
+  }
+
+  // A host chain whose every token the target selects once the path before
+  // it is accepted, each estimated at 1 for every agreement with the draft:
+  // a thinking end, which its cutoff selects, and the tokens a grammar
+  // forces, which its masks admit alone (at each of the 847 forced positions
+  // of 15 traced structured outputs of Qwen3.8-27B).
+  void proposeForcedChain(ops::DraftTreeLane &tree, uint32_t lane, std::span<const uint32_t> tokens) {
+    tree.chain = static_cast<uint32_t>(std::min<size_t>(tokens.size(), SPLASH_TREE_CHAIN_TOKENS));
+    std::copy_n(tokens.begin(), tree.chain,
+                contents<uint32_t>(decodeArena->get(lane, DecodeTensor::ChainTokens), "chain tokens"));
+    std::fill_n(contents<float>(decodeArena->get(lane, DecodeTensor::ChainRates), "chain rates"),
+                tree.chain * SPLASH_TREE_AGREEMENTS, 1.0F);
+  }
+
+  // The tokens its grammar forced after mask row `row`'s path, which a
+  // selection retained last, past that selection where it begins them: the
+  // lane's next host chain (proposeForcedChain). The server finds them with
+  // the masks, during the target forward: its grammar sees a cycle's anchor
+  // only in that cycle's mask request, after the cycle's draft.
+  static void keepGrammarChain(Request &entry, uint32_t row, uint32_t selection) {
+    entry.grammarChain = forcedAfter(entry.forcedTokens, row, selection);
+    entry.forcedTokens.clear();
   }
 
   // A lane's lookup chain beside its draft's tree: the tokens that followed
@@ -2813,6 +2843,9 @@ struct Runtime::Impl {
                               nextLength, false, capturesInDecode()));
       entry.generatedTokens += laneResult.retained;
       commitSelected(entry, {targetTokens, laneResult.retained});
+      // The mask row after the path of its deepest retained row.
+      keepGrammarChain(entry, static_cast<uint32_t>(std::bit_width(laneResult.retainedRows)),
+                       targetTokens[laneResult.retained - 1]);
       entry.maskWords.clear();
       entry.verifyMaskRows = 0;
       // Its tree's estimates past its anchor, best first, for its next
@@ -3746,7 +3779,7 @@ uint64_t Runtime::releaseIdleBuffer(bool keepLane) noexcept {
 }
 
 std::optional<std::string>
-Runtime::provideMask(uint64_t requestId, std::span<const uint32_t> words) {
+Runtime::provideMask(uint64_t requestId, std::span<const uint32_t> words, std::span<const uint32_t> forced) {
   Impl::Request &entry = impl_->request(requestId);
   const bool acceptsMask =
       waitsForMask(entry.decodeStage) || entry.verifyMaskRows;
@@ -3778,7 +3811,14 @@ Runtime::provideMask(uint64_t requestId, std::span<const uint32_t> words) {
       return "verify mask is not synchronized to the pending anchor";
     }
   }
+  // Its grammar's forced tokens: pairs of a mask row and a vocabulary token,
+  // the rows ascending.
+  for (size_t at = 0; at < forced.size(); at += 2)
+    if (at + 1 == forced.size() || forced[at] >= rows || (at && forced[at] < forced[at - 2]) ||
+        forced[at + 1] >= impl_->geometry.target.vocabularySize)
+      return "forced tokens are not a mask row's tokens of the vocabulary in row order";
   entry.maskWords.assign(words.begin(), words.end());
+  entry.forcedTokens.assign(forced.begin(), forced.end());
   return std::nullopt;
 }
 

@@ -261,7 +261,7 @@ public:
   // generated nothing yet is cancelled; an unknown id is ignored.
   void stop(uint64_t requestId);
   void failRequest(uint64_t requestId, LaneOutcome outcome, std::string message);
-  void provideMask(uint64_t requestId, std::span<const uint32_t> words);
+  void provideMask(uint64_t requestId, std::span<const uint32_t> words, std::span<const uint32_t> forced);
   void setCompletionNotifier(std::function<void()> notifier);
 
   // While the weights are released or being restored (weightsHeld), a tick

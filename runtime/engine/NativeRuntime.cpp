@@ -277,7 +277,7 @@ bool NativeRuntime::handleMask(const protocol::MaskResponseFrame &mask) {
   // Erased before the engine reads the mask: unusable contents fail the
   // request there, and its failure event erases the same entry.
   pendingMasks_.erase(found);
-  core_.provideMask(mask.requestId, mask.maskWords);
+  core_.provideMask(mask.requestId, mask.maskWords, mask.forcedTokens);
   return true;
 }
 

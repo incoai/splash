@@ -730,8 +730,8 @@ public:
       *kvGrowthBlocked = false;
     return released;
   }
-  std::optional<std::string> provideMask(uint64_t id,
-                                         std::span<const uint32_t> words) override {
+  std::optional<std::string> provideMask(uint64_t id, std::span<const uint32_t> words,
+                                         std::span<const uint32_t>) override {
     Request &entry = requests.at(id);
     const bool verify = overlap && overlap->emitted && overlap->requestId == id &&
                         !overlap->provided && !overlap->abandoned;

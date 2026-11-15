@@ -192,7 +192,8 @@ struct RequestFrame {
 // The other payloads, in wire order; counts precede what they count, and
 // the variable parts come last:
 //   Cancel         u64 requestId
-//   MaskResponse   u64 requestId, u64 maskRequestId, u32 count, u32 words
+//   MaskResponse   u64 requestId, u64 maskRequestId, u32 count, u32 forced
+//                  count, u32 words, u32 forced tokens
 //   StatusRequest  u64 correlationId
 //   ReleaseRequest u64 correlationId
 //   Stop           u64 requestId
@@ -226,6 +227,9 @@ struct MaskResponseFrame {
   uint64_t requestId = 0;
   uint64_t maskRequestId = 0;
   std::vector<uint32_t> maskWords;
+  // Pairs of a mask row and a token the grammar forces after the row's
+  // path, the rows ascending and each row's tokens in order.
+  std::vector<uint32_t> forcedTokens;
 
   bool operator==(const MaskResponseFrame &) const = default;
 };

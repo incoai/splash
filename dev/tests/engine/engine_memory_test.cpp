@@ -5188,7 +5188,7 @@ void testRestoreCompletesWhileAConstrainedLaneDecodes() {
   auto step = [&](double now) {
     static_cast<void>(engine.tick(now));
     for (; answered < events.maskRequests.size(); ++answered)
-      engine.provideMask(events.maskRequests[answered].first, mask);
+      engine.provideMask(events.maskRequests[answered].first, mask, {});
     tier.complete();
   };
   EngineRequest decoding = constrainedRequest(1, 1e9);
