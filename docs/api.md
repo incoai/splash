@@ -260,12 +260,15 @@ likely than `min_p` times the most likely one, `top_k` then keeps the most
 likely of the rest, every one when it is 0 or -1 or past the vocabulary, and
 `top_p` then the fewest of those whose probabilities, renormalized over them,
 sum past it. All three apply to the whole vocabulary, exactly, for the first
-token, the verified draft positions and their corrections alike: the sampler
-sums each row's softmax denominator, finds where its distribution ends
-without sorting the vocabulary, and draws over every token the distribution
-keeps. vLLM itself refuses a nonzero `min_p` with speculative decoding; here
-it is one more cut of the target distribution, which acceptance and
-correction read as they read the others, so sampling stays exact. A request
+token and every verified draft position alike: the sampler sums each row's
+softmax denominator, finds where its distribution ends without sorting the
+vocabulary, and draws over every token the distribution keeps, each verify row
+with a uniform of its own; a decode cycle keeps a draft token only where the
+row before it drew that token, and then the draw of the last row it keeps, so
+every token it emits is a draw from the target. vLLM itself refuses a nonzero
+`min_p` with speculative decoding; here it is one more cut of the target
+distribution, which the draws read as they read the others, so sampling stays
+exact. A request
 that keeps only its most likely token, at a `min_p` of 1 or a `top_k` of 1,
 decodes greedily, its draft's proposals too: it selects what sampling would
 but for equally likely tokens, of which it takes the lowest id.

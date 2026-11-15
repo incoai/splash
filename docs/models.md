@@ -344,10 +344,13 @@ one, two and four concurrent agentic requests of 1000 tokens decoded 8.7%, 8.5%
 and 2.1% faster under the budget than with every row verified in GGUF UD-Q4_K_M,
 and 2.1%, 0.9% and 6.0% faster in MLX 4-bit. `--verify-rows all` has every
 target's cycles verify every row. The startup log says which rows the cycles
-verify and why, and `/status` reports it as `verify_rows`. The selector writes
-each lane's confidence at each position, the largest of its candidates'
-probabilities (the softmax at temperature 1 of their scores), which the lane's
-draw there does not change, so a sampled lane's acceptance stays exact. An
+verify and why, and `/status` reports it as `verify_rows`. The selector
+proposes each lane's most likely candidate at each position, whatever the
+lane's policy: a sampled lane's verify rows draw from the target, and its cycle
+keeps a proposal only where the row before it drew that token, so its
+acceptance stays exact and its most likely proposals are those it keeps most
+often. The selector writes each lane's confidence at each position, the largest
+of its candidates' probabilities (the softmax at temperature 1 of their scores). An
 online model, logit(p) = slope * logit(confidence) + intercept[position], gives
 the probability that the target accepts a proposal once it accepted those before
 it; the engine refits it every 64 cycles on the last 4096 proposals the target

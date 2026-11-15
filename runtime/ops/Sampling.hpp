@@ -105,9 +105,8 @@ struct SamplingBuffers final {
   // Per shard of a sampled row, its share of the row's softmax denominator
   // (metal/abi/Sampling.h TargetShardMass).
   metal::MetalBuffer partialMasses;
-  // Per sampled row, where its distribution ends and, for a drafted row,
-  // its draft token's probability (TargetVocabularyRow), which acceptance
-  // reads.
+  // Per sampled row, its largest admitted logit and where its distribution
+  // ends (TargetVocabularyRow), which its draw reads.
   metal::MetalBuffer vocabularyRows;
   metal::MetalBuffer uniforms;
   metal::MetalBuffer constraintMasks;
@@ -115,14 +114,9 @@ struct SamplingBuffers final {
   metal::MetalBuffer argmaxValues;
   metal::MetalBuffer argmaxIndices;
   // Verify input tokens [rows]: a lane's verify block's first row holds its
-  // anchor and the rows after it its draft tokens, which penalized and
-  // sampled verify rows read.
+  // anchor and the rows after it its draft tokens, which penalized verify
+  // rows and thinking cutoffs read.
   metal::MetalBuffer inputTokens;
-  // The draft's candidates and their probabilities at each proposal
-  // position (AcceptanceBuffers), which a sampled verify row draws its
-  // correction's residual from.
-  metal::MetalBuffer draftCandidates;
-  metal::MetalBuffer draftProbabilities;
   // Per sampled row, the ranges of its draw (TargetVocabularyRange), which
   // the groups that share the draw sum, and how many of those groups have
   // finished: a count every draw returns to zero, where it starts.
@@ -131,23 +125,26 @@ struct SamplingBuffers final {
 };
 
 struct AcceptanceBuffers final {
-  metal::MetalBuffer proposedTokens;
-  metal::MetalBuffer candidates;
-  metal::MetalBuffer proposalProbabilities;
-  metal::MetalBuffer targetVocabularyRows;
-  metal::MetalBuffer uniforms;
+  // Verify input tokens [rows]: each row's token (SamplingBuffers).
+  metal::MetalBuffer inputTokens;
+  // The command's rows as each lane's tree [rows] (metal/abi/VerifyTree.h).
+  metal::MetalBuffer treeRows;
+  // The verify's selections [rows], which acceptance rewrites with each
+  // lane's retained tokens from its first row.
   metal::MetalBuffer outputTokens;
   metal::MetalBuffer retainedCounts;
   metal::MetalBuffer acceptedCounts;
+  // Each lane's retained rows, a mask of its block's (AcceptBatchParams).
+  metal::MetalBuffer retainedRows;
   // Each lane's verify rows (ops::DraftSelector), which bound what it
   // retains.
   metal::MetalBuffer verifyRows;
 };
 
 // Target token policy (penalties, min-p/top-k/top-p, constrained selection,
-// stop-token exclusion, greedy argmax) and DFlash acceptance of the draft's
-// proposals; the model only supplies policy, buffers, penalty words and its
-// stop tokens. The draft's own selector is ops::DraftSelector.
+// stop-token exclusion, greedy argmax) and acceptance of a verify block's
+// rows; the model only supplies policy, buffers, penalty words and its stop
+// tokens. The draft's own selector is ops::DraftSelector.
 class Sampling final {
 public:
   explicit Sampling(uint32_t vocabulary);
@@ -177,14 +174,13 @@ public:
   // place first, from its row of the penalty table; the rows must hold the
   // LM head's fresh output. Other lanes dispatch nothing new. A greedy lane
   // then takes each row's argmax and a sampled lane draws from each row's
-  // distribution over the whole vocabulary, both among the tokens the lane
-  // admits: the first token after a prompt from each lane's one row of the
-  // logits (`rows`), and every row of each lane's verify block (`blocks`,
-  // at most SPLASH_TARGET_VERIFY_ROWS rows, its anchor's first). Each
-  // selected row's token goes to the output tokens at its logits row;
-  // acceptance reads a sampled verify row's draft token probability from the
-  // vocabulary rows there. A lane's rows from its thinking cutoff on then
-  // take the end of thinking. Both run the same kernels (addSelection).
+  // distribution over the whole vocabulary, row i with the lane's uniform i,
+  // both among the tokens the lane admits: the first token after a prompt
+  // from each lane's one row of the logits (`rows`), and every row of each
+  // lane's verify block (`blocks`, at most SPLASH_TARGET_VERIFY_ROWS rows,
+  // its anchor's first). Each selected row's token goes to the output tokens
+  // at its logits row. A lane's rows from its thinking cutoff on then take
+  // the end of thinking. Both run the same kernels (addSelection).
   void addInitial(metal::CommandGraph &graph,
                   std::span<const SamplingPolicy> policies,
                   SamplingBuffers buffers, std::span<const uint32_t> rows,
@@ -195,14 +191,12 @@ public:
                  SamplingBuffers buffers, std::span<const LaneRows> blocks,
                  const StopTokens &stopTokens,
                  const PenaltyTable &penalties) const;
-  // Each lane's acceptance of its draft's proposals against the tokens its
-  // verify block selected (addVerify's `blocks`).
-  void addAcceptance(
-      metal::CommandGraph &graph, AcceptanceBuffers buffers,
-      std::span<const LaneRows> blocks,
-      std::span<const uint32_t> maximumRetained,
-      std::span<const SamplingPolicy> policies,
-      const StopTokens &stopTokens) const;
+  // Each lane's acceptance of its verify block (addVerify's `blocks`) as a
+  // tree: the path its rows' selections follow from its anchor, of which it
+  // retains at most maximumRetained[lane] rows (metal/abi/Sampling.h
+  // AcceptBatchParams).
+  void addAcceptance(metal::CommandGraph &graph, AcceptanceBuffers buffers, std::span<const LaneRows> blocks,
+                     std::span<const uint32_t> maximumRetained, const StopTokens &stopTokens) const;
   // After the draft's selection and before the verify reads its proposals,
   // the proposals of each lane whose thinking cutoff is at row 0, and whose
   // end does not wait for its mask, take the end tokens the rows of its
@@ -216,12 +210,10 @@ public:
 
 private:
   // The rows a selection takes from each lane (metal/abi/Sampling.h
-  // TargetSamplingParams): its rows of the logits, the first's mask row and
-  // the uniform they draw with.
+  // TargetSamplingParams): its rows of the logits and the first's mask row.
   struct TargetRows final {
     std::span<const LaneRows> lanes;
     uint32_t maskRow = 0;
-    uint32_t uniform = 0;
   };
 
   // Penalizes each penalized lane's selected rows, each also counting the

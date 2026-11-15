@@ -50,7 +50,7 @@ kernel void verify_input_tokens(
       min(token, params.vocabulary - 1u);
 }
 
-// Each lane's mask rows of its draft input, rows 1 to SPLASH_TARGET_VERIFY_ROWS - 1 (the
+// Each lane's mask rows of its draft input, rows 1 to SPLASH_DRAFT_QUERY_ROWS - 1 (the
 // rows after its anchor), set to the mask embedding the draft's checkpoint ships
 // (ops/Embedding.cpp addDraftMaskRows): x a span of 256 columns, y the mask row, z the lane.
 kernel void draft_mask_rows(
@@ -62,5 +62,5 @@ kernel void draft_mask_rows(
   const uint column = group.x * 256 + thread_index;
   if (column >= params.width)
     return;
-  rows[(ulong(group.z) * SPLASH_TARGET_VERIFY_ROWS + 1 + group.y) * params.width + column] = mask[column];
+  rows[(ulong(group.z) * SPLASH_DRAFT_QUERY_ROWS + 1 + group.y) * params.width + column] = mask[column];
 }

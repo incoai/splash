@@ -173,7 +173,6 @@ static_assert(kVocabularyRanges <= kVocabularyThreads,
 // scale (place_pivots).
 constant constexpr uint kPivots = 15;
 constant constexpr uint kKeyPivots = 4;
-constant constexpr uint kDraftCandidates = SPLASH_DRAFT_CANDIDATES;
 
 // The order of the logits as an unsigned key: a larger logit has a larger
 // key, and -0 and +0, which compare equal, share one. Every logit's key is
@@ -278,20 +277,10 @@ struct VocabularyScratch {
 
 struct DrawScratch {
   uint arrival;
-  // Per range of the draw: the kept weight of its tokens other than the
-  // draft's candidates, one past the last of those with weight, and its
-  // weight in the draw.
-  float range_rest[kVocabularyRanges];
-  uint range_last[kVocabularyRanges];
+  // Per range of the draw: the kept weight of its tokens and one past the
+  // last of them with weight.
   float range_weights[kVocabularyRanges];
-  // The draft's candidates, each listed once: its draft probability, kept
-  // weight, weight in the draw and range.
-  uint draft_ids[kDraftCandidates];
-  float draft_probabilities[kDraftCandidates];
-  float draft_weights[kDraftCandidates];
-  float draft_draw_weights[kDraftCandidates];
-  uint draft_ranges[kDraftCandidates];
-  float kept_mass;
+  uint range_last[kVocabularyRanges];
   uint drawn_range;
   float drawn_target;
   uint drawn_token;
@@ -665,124 +654,44 @@ inline float kept_weight(TargetRow row, OrderBoundary end, uint token) {
   return at_or_before(logit_key(value), token, end) ? row.weight(value) : 0.0f;
 }
 
-// The draft's candidates in one range of the draw, one bit per staged entry.
-inline uint range_candidates(uint range, threadgroup DrawScratch &scratch) {
-  uint held = 0;
-  for (uint index = 0; index < kDraftCandidates; ++index)
-    held |= scratch.draft_ranges[index] == range ? 1u << index : 0u;
-  return held;
-}
-
-// One range's weight in the draw: the kept weight of its tokens other than
-// the draft's candidates, plus its candidates' draw weights.
-inline float range_weight(uint range, threadgroup DrawScratch &scratch) {
-  float weight = scratch.range_rest[range];
-  for (uint held = range_candidates(range, scratch); held; held &= held - 1)
-    weight += scratch.draft_draw_weights[ctz(held)];
-  return weight;
-}
-
-// The last token of a range with weight in the draw, which the draw takes
-// when rounding leaves its target unreached.
-inline uint range_last(uint range, threadgroup DrawScratch &scratch) {
-  uint after = scratch.range_last[range];
-  for (uint held = range_candidates(range, scratch); held; held &= held - 1) {
-    const uint index = ctz(held);
-    if (scratch.draft_draw_weights[index] > 0.0f)
-      after = max(after, scratch.draft_ids[index] + 1);
-  }
-  return after - 1;
-}
-
-// Draws the row's token, shared by its groups; returns true in the group that
-// finishes last, with the drawn token and the draft token's probability. Each
-// kept token weighs its softmax weight; with a draft, each of the draft's
-// candidates weighs its weight less its draft probability times the kept
-// mass, never below zero, so the draw follows the residual distribution
-// acceptance corrects a rejected draft token from (the whole distribution
-// when nothing remains). Each simdgroup of the row's groups sums one range of
-// the vocabulary without the candidates; the last group computes their
-// weights once, adds the ranges in order and walks the one that holds the
-// draw with prefix sums. A range's weight and its walk add the same token
-// weights, so the range the draw picks always has a token to draw.
+// Draws the row's token from its distribution, shared by its groups; returns
+// true in the group that finishes last, with the drawn token. Each kept token
+// weighs its softmax weight. Each simdgroup of the row's groups sums one range
+// of the vocabulary; the last group adds the ranges in order and walks the
+// one that holds the draw with prefix sums. A range's weight and its walk add
+// the same token weights, so the range the draw picks always has a token to
+// draw; a row that keeps no token draws past the vocabulary's end, the
+// sentinel of a row with no selectable logit.
 inline bool vocabulary_draw(
-    TargetRow row, OrderBoundary end, bool drafted, uint draft_token,
-    device const uint *draft_ids, device const float *draft_probabilities,
-    float uniform, device coherent(device) TargetVocabularyRange *ranges,
+    TargetRow row, OrderBoundary end, float uniform,
+    device coherent(device) TargetVocabularyRange *ranges,
     device atomic_uint *arrivals, uint slice, threadgroup DrawScratch &scratch,
-    uint thread_index, uint lane, uint simd_group, thread uint &drawn,
-    thread float &draft_probability) {
+    uint thread_index, uint lane, uint simd_group, thread uint &drawn) {
   const uint range_tokens = (row.vocabulary + kVocabularyRanges * 32 - 1) /
                             (kVocabularyRanges * 32) * 32;
-  if (thread_index < kDraftCandidates) {
-    // A candidate the draft lists twice counts once, as lookups find its
-    // first entry.
-    uint id = drafted ? draft_ids[thread_index] : 0xffffffffu;
-    for (uint earlier = 0; drafted && earlier < thread_index; ++earlier)
-      id = draft_ids[earlier] == id ? 0xffffffffu : id;
-    scratch.draft_ids[thread_index] = id;
-    scratch.draft_ranges[thread_index] =
-        id < row.vocabulary ? id / range_tokens : kVocabularyRanges;
-  }
-  threadgroup_barrier(mem_flags::mem_threadgroup);
   const uint own = slice * kVocabularySimdgroups + simd_group;
   const uint begin = min(own * range_tokens, row.vocabulary);
   const uint finish = min(begin + range_tokens, row.vocabulary);
-  const uint held = range_candidates(own, scratch);
-  float rest = 0.0f;
+  float kept = 0.0f;
   uint after = 0;
   for (uint first = begin; first < finish; first += 32) {
     const uint token = first + lane;
-    float weight = token < finish ? kept_weight(row, end, token) : 0.0f;
-    for (uint bits = held; bits; bits &= bits - 1)
-      weight = scratch.draft_ids[ctz(bits)] == token ? 0.0f : weight;
-    rest += weight;
+    const float weight = token < finish ? kept_weight(row, end, token) : 0.0f;
+    kept += weight;
     after = weight > 0.0f ? token + 1 : after;
   }
-  rest = simd_sum(rest);
+  kept = simd_sum(kept);
   after = simd_max(after);
   if (lane == 0)
-    ranges[own] = {rest, after};
+    ranges[own] = {kept, after};
   if (!split_arrive_last(arrivals, kVocabularyGroups, thread_index,
                          &scratch.arrival))
     return false;
   if (thread_index < kVocabularyRanges) {
     const TargetVocabularyRange measured = ranges[thread_index];
-    scratch.range_rest[thread_index] = measured.rest;
+    scratch.range_weights[thread_index] = measured.weight;
     scratch.range_last[thread_index] = measured.after;
   }
-  if (thread_index < kDraftCandidates) {
-    scratch.draft_probabilities[thread_index] =
-        drafted ? draft_probabilities[thread_index] : 0.0f;
-    scratch.draft_weights[thread_index] =
-        kept_weight(row, end, scratch.draft_ids[thread_index]);
-  }
-  threadgroup_barrier(mem_flags::mem_threadgroup);
-  if (thread_index == 0) {
-    float kept_mass = 0.0f;
-    for (uint range = 0; range < kVocabularyRanges; ++range)
-      kept_mass += scratch.range_rest[range];
-    for (uint index = 0; index < kDraftCandidates; ++index)
-      kept_mass += scratch.draft_weights[index];
-    bool residual = false;
-    for (uint range = 0; drafted && range < kVocabularyRanges; ++range)
-      residual = residual || scratch.range_rest[range] > 0.0f;
-    for (uint index = 0; drafted && index < kDraftCandidates; ++index) {
-      const float left = max(scratch.draft_weights[index] -
-                                 scratch.draft_probabilities[index] * kept_mass,
-                             0.0f);
-      scratch.draft_draw_weights[index] = left;
-      residual = residual || left > 0.0f;
-    }
-    // Without a draft, or with nothing left of its residual, the draw
-    // follows the distribution itself.
-    for (uint index = 0; !residual && index < kDraftCandidates; ++index)
-      scratch.draft_draw_weights[index] = scratch.draft_weights[index];
-    scratch.kept_mass = kept_mass;
-  }
-  threadgroup_barrier(mem_flags::mem_threadgroup);
-  if (thread_index < kVocabularyRanges)
-    scratch.range_weights[thread_index] = range_weight(thread_index, scratch);
   threadgroup_barrier(mem_flags::mem_threadgroup);
   if (thread_index == 0) {
     float total = 0.0f;
@@ -805,24 +714,21 @@ inline bool vocabulary_draw(
     }
     scratch.drawn_range = range_drawn;
     scratch.drawn_target = range_target;
-    scratch.drawn_token = range_last(range_drawn, scratch);
+    // Rounding may leave the target unreached in the range too: its last
+    // token with weight.
+    scratch.drawn_token = scratch.range_last[range_drawn] - 1;
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
   if (simd_group == 0) {
     const uint walked = scratch.drawn_range;
     const uint walk_begin = min(walked * range_tokens, row.vocabulary);
     const uint walk_finish = min(walk_begin + range_tokens, row.vocabulary);
-    const uint walk_held = range_candidates(walked, scratch);
     const float target = scratch.drawn_target;
     float cumulative = 0.0f;
     for (uint first = walk_begin; first < walk_finish; first += 32) {
       const uint token = first + lane;
-      float weight = token < walk_finish ? kept_weight(row, end, token) : 0.0f;
-      for (uint bits = walk_held; bits; bits &= bits - 1) {
-        const uint index = ctz(bits);
-        if (scratch.draft_ids[index] == token)
-          weight = scratch.draft_draw_weights[index];
-      }
+      const float weight =
+          token < walk_finish ? kept_weight(row, end, token) : 0.0f;
       const float prefix = simd_prefix_inclusive_sum(weight);
       const uint hit =
           simd_min(weight > 0.0f && cumulative + prefix > target ? lane : 32u);
@@ -836,8 +742,6 @@ inline bool vocabulary_draw(
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
   drawn = scratch.drawn_token;
-  draft_probability =
-      drafted ? kept_weight(row, end, draft_token) / scratch.kept_mass : 0.0f;
   split_release(arrivals, thread_index);
   return true;
 }
@@ -858,7 +762,7 @@ inline void search_row(TargetRow row, device const TargetShardMass *masses,
       distribution_end(row, min_p, top_k, top_p, merged.sum, merged.admitted,
                        scratch, thread_index, lane, simd_group);
   if (thread_index == 0)
-    record = {merged.maximum, end.key, end.last, 0.0f};
+    record = {merged.maximum, end.key, end.last};
 }
 
 // Where the distribution of each selected row of the sampled lanes ends, one
@@ -885,21 +789,16 @@ kernel void decode_sample_vocabulary_search(
 }
 
 // The draw of each selected row of the sampled lanes, kVocabularyGroups
-// groups per row: the first token after a prompt, a verify row's draft
-// token's probability and the correction a rejection takes or, for the last
-// verify row, which follows the whole draft, its bonus token.
+// groups per row: row i of a lane draws with the lane's uniform i.
 kernel void decode_sample_vocabulary_draw(
     device const float *logits [[buffer(0)]],
     device const uint *token_mask [[buffer(1)]],
-    device TargetVocabularyRow *vocabulary_rows [[buffer(2)]],
-    device const uint *input_tokens [[buffer(3)]],
-    device const uint *draft_ids [[buffer(4)]],
-    device const float *draft_probabilities [[buffer(5)]],
-    device const float *uniforms [[buffer(6)]],
-    device uint *tokens [[buffer(7)]],
-    device coherent(device) TargetVocabularyRange *ranges [[buffer(8)]],
-    device atomic_uint *arrivals [[buffer(9)]],
-    constant TargetSamplingParams &params [[buffer(10)]],
+    device const TargetVocabularyRow *vocabulary_rows [[buffer(2)]],
+    device const float *uniforms [[buffer(3)]],
+    device uint *tokens [[buffer(4)]],
+    device coherent(device) TargetVocabularyRange *ranges [[buffer(5)]],
+    device atomic_uint *arrivals [[buffer(6)]],
+    constant TargetSamplingParams &params [[buffer(7)]],
     uint2 group [[threadgroup_position_in_grid]],
     uint thread_index [[thread_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]],
@@ -909,30 +808,17 @@ kernel void decode_sample_vocabulary_draw(
   if (!selects(params, batch, index, true))
     return;
   const uint s = selected_logits_row(params, batch, index);
-  device TargetVocabularyRow &record = vocabulary_rows[s];
+  const TargetVocabularyRow record = vocabulary_rows[s];
   TargetRow row = selected_row(logits, token_mask, params, batch, index);
   row.maximum = record.maximum;
-  // A drafted row, any of the lane's but its last, follows its draft token,
-  // the next verify input row.
-  const bool drafted = index + 1 < params.rows[batch];
-  const ulong position =
-      ulong(batch) * SPLASH_DRAFT_PROPOSAL_TOKENS + (drafted ? index : 0);
   uint token;
-  float draft_probability;
-  if (vocabulary_draw(
-          row, {record.end_key, record.end_last}, drafted,
-          drafted ? input_tokens[s + 1] : 0u,
-          draft_ids + position * kDraftCandidates,
-          draft_probabilities + position * kDraftCandidates,
-          uniforms[ulong(batch) * SPLASH_SAMPLING_UNIFORMS + params.uniform],
-          ranges + ulong(s) * kVocabularyRanges, arrivals + s,
-          group.x % kVocabularyGroups, scratch, thread_index, lane, simd_group,
-          token, draft_probability) &&
-      thread_index == 0) {
+  if (vocabulary_draw(row, {record.end_key, record.end_last},
+                      uniforms[ulong(batch) * SPLASH_SAMPLING_UNIFORMS + index],
+                      ranges + ulong(s) * kVocabularyRanges, arrivals + s,
+                      group.x % kVocabularyGroups, scratch, thread_index, lane,
+                      simd_group, token) &&
+      thread_index == 0)
     tokens[s] = token;
-    if (drafted)
-      record.draft_probability = draft_probability;
-  }
 }
 
 // Whether no token can be selected for a logit: NaN has no order and -inf
@@ -1298,19 +1184,18 @@ kernel void draft_select_edges(
   }
 }
 
-// One thread per lane walks the seven positions: the score of a candidate is
-// its unary score plus the edge from the previously chosen candidate, read
-// from the table draft_select_edges left in the partial-values scratch. It
-// writes the lane's confidence at each position (VerifyRowsParams) as it
-// walks.
+// One thread per lane walks the seven positions, proposing at each the
+// candidate of the largest score (the lowest among equal ones): its unary
+// score plus the edge from the previous position's proposal, read from the
+// table draft_select_edges left in the partial-values scratch. It writes the
+// lane's confidence at each position (VerifyRowsParams) as it walks.
 kernel void draft_select_dflash(
     device const uint *candidates [[buffer(0)]],
     device const float *unary [[buffer(1)]],
     device const float *partial_values [[buffer(2)]],
-    device const float *uniforms [[buffer(3)]],
-    device uint *tokens [[buffer(4)]], device float *q_probs [[buffer(5)]],
-    device float *confidence [[buffer(6)]],
-    constant SelectorBatchParams &params [[buffer(7)]],
+    device uint *tokens [[buffer(3)]],
+    device float *confidence [[buffer(4)]],
+    constant SelectorBatchParams &params [[buffer(5)]],
     uint batch [[thread_position_in_grid]]) {
   constexpr ulong Positions = SPLASH_DRAFT_PROPOSAL_TOKENS;
   constexpr ulong Shards = SPLASH_DRAFT_SAMPLING_SHARDS;
@@ -1320,12 +1205,9 @@ kernel void draft_select_dflash(
   device const float *tables = partial_values +
                                params.lanes * Positions * Shards * Candidates +
                                batch * Positions * Candidates * Candidates;
-  uniforms += batch * SPLASH_SAMPLING_UNIFORMS;
   tokens += batch * Positions;
-  q_probs += batch * Positions * Candidates;
   confidence += batch * Positions;
 
-  const bool sampling = (params.sampling_mask & (1u << batch)) != 0;
   uint predecessor_index = 0;
   for (uint position = 0; position < Positions; ++position) {
     device const float *edges =
@@ -1334,7 +1216,7 @@ kernel void draft_select_dflash(
     for (uint i = 0; i < Candidates; ++i)
       scores[i] = unary[position * Candidates + i] + edges[i];
     // The largest of the position's candidate probabilities at temperature
-    // 1, before the lane chooses among them.
+    // 1, the proposal's.
     float best = scores[0];
     for (uint i = 1; i < Candidates; ++i)
       best = max(best, scores[i]);
@@ -1343,33 +1225,9 @@ kernel void draft_select_dflash(
       mass += exp(scores[i] - best);
     confidence[position] = 1.0f / mass;
     uint selected = 0;
-    if (sampling) {
-      float maximum = scores[0];
-      for (uint i = 1; i < Candidates; ++i)
-        maximum = max(maximum, scores[i]);
-      float sum = 0.0f;
-      for (uint i = 0; i < Candidates; ++i) {
-        float probability =
-            exp((scores[i] - maximum) / params.temperature[batch]);
-        q_probs[position * Candidates + i] = probability;
-        sum += probability;
-      }
-      float cumulative = 0.0f;
-      selected = Candidates - 1;
-      for (uint i = 0; i < Candidates; ++i) {
-        float probability = q_probs[position * Candidates + i] / sum;
-        q_probs[position * Candidates + i] = probability;
-        cumulative += probability;
-        if (selected == Candidates - 1 &&
-            cumulative > uniforms[SPLASH_UNIFORM_PROPOSALS + position]) {
-          selected = i;
-        }
-      }
-    } else {
-      for (uint i = 1; i < Candidates; ++i) {
-        if (scores[i] > scores[selected])
-          selected = i;
-      }
+    for (uint i = 1; i < Candidates; ++i) {
+      if (scores[i] > scores[selected])
+        selected = i;
     }
     predecessor_index = selected;
     tokens[position] = candidates[position * Candidates + selected];
@@ -1433,70 +1291,6 @@ kernel void draft_verify_rows(device const float *confidence [[buffer(0)]],
   }
   for (uint lane = 0; lane < params.lanes; ++lane)
     verify_rows[lane] = rows[lane];
-}
-
-inline float sparse_lookup(device const uint *ids,
-                           device const float *probabilities, uint count,
-                           uint token) {
-  for (uint i = 0; i < count; ++i) {
-    if (ids[i] == token)
-      return probabilities[i];
-  }
-  return 0.0f;
-}
-
-// One lane's view of AcceptBatchParams, built by decode_accept_dflash: the
-// most tokens it retains, and how many proposals its verify block checks.
-struct AcceptParams {
-  uint remaining;
-  uint drafted;
-  constant uint *stop_tokens;
-};
-
-// Keeps at most params.remaining of the accepted tokens plus the correction,
-// cut after the first stop token, and records the retained and accepted
-// counts.
-inline void finish_acceptance(device const uint *tokens, uint accepted,
-                              AcceptParams params, device uint &retained,
-                              device uint &accepted_count) {
-  accepted_count = accepted;
-  retained = min(accepted + 1, params.remaining);
-  for (uint i = 0; i < retained; ++i) {
-    if (stop_token(params.stop_tokens, tokens[i])) {
-      retained = i + 1;
-      break;
-    }
-  }
-}
-
-// A sampled lane's verify rows carry their draft tokens' target
-// probabilities (TargetVocabularyRow), and its output tokens their draws:
-// the correction a rejection takes or, for the last row, the bonus token.
-// Acceptance overwrites the accepted rows with the draft tokens, so row
-// accepted keeps its draw.
-inline void accept_sampled_lane(device const uint *draft_tokens,
-                                device const uint *draft_ids,
-                                device const float *draft_probs,
-                                device const TargetVocabularyRow *target_rows,
-                                device const float *uniforms,
-                                device uint *output_tokens,
-                                device uint &retained,
-                                device uint &accepted_count,
-                                AcceptParams params) {
-  uint accepted = 0;
-  while (accepted < params.drafted) {
-    uint token = draft_tokens[accepted];
-    float q = sparse_lookup(draft_ids + accepted * kDraftCandidates,
-                            draft_probs + accepted * kDraftCandidates,
-                            kDraftCandidates, token);
-    float p = target_rows[accepted].draft_probability;
-    if (!(uniforms[SPLASH_UNIFORM_ACCEPTANCE + accepted] * q < p))
-      break;
-    output_tokens[accepted] = token;
-    ++accepted;
-  }
-  finish_acceptance(output_tokens, accepted, params, retained,
-                    accepted_count);
 }
 
 // One shard of a greedy row: its admitted token with the largest selectable
@@ -1606,8 +1400,7 @@ kernel void decode_sample_thinking_cutoff(
     device const uint *input_tokens [[buffer(0)]],
     device const uint *token_mask [[buffer(1)]],
     device uint *tokens [[buffer(2)]],
-    device TargetVocabularyRow *vocabulary_rows [[buffer(3)]],
-    constant ThinkingCutoffParams &params [[buffer(4)]],
+    constant ThinkingCutoffParams &params [[buffer(3)]],
     uint lane [[threadgroup_position_in_grid]]) {
   const uint rows = params.rows[lane], drafted = rows - 1;
   uint row = params.row[lane];
@@ -1635,11 +1428,7 @@ kernel void decode_sample_thinking_cutoff(
     // A row with no selectable logit keeps its sentinel, so the lane fails.
     if (tokens[first + row + i] >= params.vocabulary)
       continue;
-    const uint end = params.tokens[lane][i];
-    tokens[first + row + i] = end;
-    if ((params.sampling_mask & (1u << lane)) && row + i < drafted)
-      vocabulary_rows[first + row + i].draft_probability =
-          input_tokens[first + row + i + 1] == end ? 1.0f : 0.0f;
+    tokens[first + row + i] = params.tokens[lane][i];
   }
 }
 
@@ -1658,51 +1447,51 @@ kernel void decode_draft_thinking_cutoff(
         params.tokens[lane][r];
 }
 
-inline void accept_greedy_lane(device const uint *draft_tokens,
-                               device uint *target_tokens,
-                               device uint &retained,
-                               device uint &accepted_count,
-                               AcceptParams params) {
-  uint accepted = 0;
-  while (accepted < params.drafted &&
-         draft_tokens[accepted] == target_tokens[accepted]) {
-    ++accepted;
-  }
-  finish_acceptance(target_tokens, accepted, params, retained,
-                    accepted_count);
-}
-
-kernel void decode_accept_dflash(
-    device const uint *draft_tokens [[buffer(0)]],
-    device const uint *draft_ids [[buffer(1)]],
-    device const float *draft_probs [[buffer(2)]],
-    device const TargetVocabularyRow *target_rows [[buffer(3)]],
-    device const float *uniforms [[buffer(4)]],
-    device uint *target_tokens [[buffer(5)]],
-    device uint *retained [[buffer(6)]],
-    device uint *accepted_count [[buffer(7)]],
-    device const uint *verify_rows [[buffer(8)]],
-    constant AcceptBatchParams &params [[buffer(9)]],
+// Each lane's acceptance (AcceptBatchParams), one thread a lane. The walk
+// follows every row of the lane's block, so its count of accepted proposals
+// is the target's, those a verify budget left unverified included; the lane
+// retains only rows it verified, the walk's first, as a child's row comes
+// after its parent's. Its retained tokens, the selections of the path's rows,
+// go to the output tokens from its first row, each read before an earlier
+// path row's is written there.
+kernel void decode_accept_tree(
+    device const uint *input_tokens [[buffer(0)]],
+    device const SplashTreeRow *tree [[buffer(1)]],
+    device uint *tokens [[buffer(2)]],
+    device uint *retained [[buffer(3)]],
+    device uint *accepted_count [[buffer(4)]],
+    device uint *retained_rows [[buffer(5)]],
+    device const uint *verify_rows [[buffer(6)]],
+    constant AcceptBatchParams &params [[buffer(7)]],
     uint batch [[threadgroup_position_in_grid]]) {
-  // A lane retains at most the rows its verify verified (the selector's
-  // verify rows, SelectorBatchParams); its block's rows but its last check
-  // its proposals.
-  uint remaining = min(params.remaining[batch], verify_rows[batch]);
-  AcceptParams lane_params{remaining, params.rows[batch] - 1,
-                           params.stop_tokens};
-  device const uint *lane_draft =
-      draft_tokens + batch * SPLASH_DRAFT_PROPOSAL_TOKENS;
-  device uint *lane_target = target_tokens + params.first_row[batch];
-  if (params.sampling_mask & (1u << batch)) {
-    accept_sampled_lane(
-        lane_draft,
-        draft_ids + batch * SPLASH_DRAFT_PROPOSAL_TOKENS * kDraftCandidates,
-        draft_probs + batch * SPLASH_DRAFT_PROPOSAL_TOKENS * kDraftCandidates,
-        target_rows + params.first_row[batch],
-        uniforms + batch * SPLASH_SAMPLING_UNIFORMS, lane_target,
-        retained[batch], accepted_count[batch], lane_params);
-  } else {
-    accept_greedy_lane(lane_draft, lane_target, retained[batch],
-                       accepted_count[batch], lane_params);
+  const uint first = params.first_row[batch], rows = params.rows[batch];
+  device const uint *inputs = input_tokens + first;
+  device const SplashTreeRow *nodes = tree + first;
+  device uint *selected = tokens + first;
+  uint path[SPLASH_TARGET_VERIFY_ROWS];
+  path[0] = 0;
+  uint accepted = 0;
+  for (uint row = 0;;) {
+    const uint token = selected[row];
+    uint next = 0;
+    for (uint child = row + 1; child < rows && !next; ++child)
+      next = nodes[child].parent == row && inputs[child] == token ? child : 0;
+    if (!next)
+      break;
+    path[++accepted] = next;
+    row = next;
   }
+  accepted_count[batch] = accepted;
+  uint kept = 0;
+  while (kept <= accepted && path[kept] < verify_rows[batch])
+    ++kept;
+  kept = min(kept, params.remaining[batch]);
+  for (uint i = 0; i < kept; ++i) {
+    const uint token = selected[path[i]];
+    selected[i] = token;
+    if (stop_token(params.stop_tokens, token))
+      kept = i + 1;
+  }
+  retained[batch] = kept;
+  retained_rows[batch] = nodes[path[kept - 1]].ancestors;
 }

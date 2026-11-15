@@ -184,7 +184,7 @@ void sampling() {
     require(workspace.argmaxValuesBytes == count * 16 * 4 &&
                 workspace.argmaxIndicesBytes == count * 16 * 4 &&
                 workspace.partialMassesBytes == count * 16 * 12 &&
-                workspace.vocabularyRowsBytes == count * 16 &&
+                workspace.vocabularyRowsBytes == count * 12 &&
                 workspace.vocabularyRangesBytes == count * 256 * 8 &&
                 workspace.vocabularyArrivalsBytes == count * 4,
             "target sampling workspace changed from the shipped 16-shard ABI");
@@ -198,8 +198,7 @@ void sampling() {
     require(workspace.partialIdsBytes == count * 8 * 16 * 4 &&
                 workspace.partialValuesBytes == count * (8 + 16) * 16 * 4 &&
                 workspace.candidatesBytes == count * 16 * 4 &&
-                workspace.unaryBytes == count * 16 * 4 &&
-                workspace.proposalProbabilitiesBytes == count * 16 * 4,
+                workspace.unaryBytes == count * 16 * 4,
             "draft sampling workspace changed from the shipped 8-shard ABI");
   }
   rejects([] { (void)Sampling::workspace(0); }, "invalid sampling workspace row count",

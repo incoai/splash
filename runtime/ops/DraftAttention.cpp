@@ -15,6 +15,9 @@ namespace {
 
 constexpr uint32_t kMaximumLanes = SPLASH_MAXIMUM_BATCH_WIDTH;
 constexpr uint32_t kRows = SPLASH_DRAFT_QUERY_ROWS;
+// A lane's RoPE rows hold its verify block's positions: its draft's rows take
+// the first kRows, and its context commit one per row it retains.
+constexpr uint32_t kRopeRows = SPLASH_TARGET_VERIFY_ROWS;
 constexpr uint32_t kWindow = SPLASH_DRAFT_SLIDING_WINDOW;
 constexpr uint32_t kThreads = metal::CommandGraph::kDefaultThreads;
 constexpr uint32_t kWindowThreads = SPLASH_DRAFT_CONTEXT_SIMDGROUPS * 32;
@@ -156,7 +159,7 @@ void DraftAttention::addPrepare(metal::CommandGraph &graph,
   requireBytes(buffers.queryValues, workspace.queryValuesBytes, "draft query values");
   requireBytes(buffers.queryNorm, uint64_t{shape.headDimension} * 2, "draft query norm");
   requireBytes(buffers.keyNorm, uint64_t{shape.headDimension} * 2, "draft key norm");
-  const uint64_t ropeBytes = uint64_t{lanes} * kRows * SPLASH_DRAFT_ROPE_PAIRS * 4;
+  const uint64_t ropeBytes = (uint64_t{lanes - 1} * kRopeRows + kRows) * SPLASH_DRAFT_ROPE_PAIRS * 4;
   requireBytes(buffers.ropeCos, ropeBytes, "draft RoPE cosine");
   requireBytes(buffers.ropeSin, ropeBytes, "draft RoPE sine");
   graph.add("draft_attention_qkv",
@@ -226,7 +229,7 @@ void DraftAttention::addContextCommit(
     metal::MetalBuffer ropeSin,
     std::span<const metal::MetalBuffer> persistentKeys,
     std::span<const metal::MetalBuffer> persistentValues,
-    metal::MetalBuffer retainedCounts,
+    metal::MetalBuffer retainedRows,
     std::span<const uint32_t> startPositions, std::span<const LaneRows> blocks,
     DraftAttentionShape shape) {
   const auto lanes = static_cast<uint32_t>(startPositions.size());
@@ -235,15 +238,15 @@ void DraftAttention::addContextCommit(
   if (persistentKeys.size() != kMaximumLanes ||
       persistentValues.size() != kMaximumLanes || blocks.size() != lanes)
     throw std::invalid_argument("invalid draft context commit geometry");
-  // A row takes its RoPE row of the lane's draft block, which holds kRows.
-  requireLaneRows(blocks, kRows);
+  // A retained row takes its RoPE row of the lane's, which holds kRopeRows.
+  requireLaneRows(blocks, kRopeRows);
   // Each lane commits up to its block's rows: its context rows among the
-  // lanes' packed rows, its RoPE rows from its draft block's first.
+  // lanes' packed rows, its RoPE rows from its lane's first.
   uint64_t ropeRows = 0;
   for (uint32_t lane = 0; lane < lanes; ++lane)
-    ropeRows = std::max(ropeRows, uint64_t{lane} * kRows + blocks[lane].rows);
+    ropeRows = std::max(ropeRows, uint64_t{lane} * kRopeRows + blocks[lane].rows);
   requireContextInputs(contextKv, keyNorm, ropeCos, ropeSin, rowsEnd(blocks), ropeRows, shape);
-  requireBytes(retainedCounts, uint64_t{lanes} * sizeof(uint32_t), "draft retained counts");
+  requireBytes(retainedRows, uint64_t{lanes} * sizeof(uint32_t), "draft retained rows");
   for (uint32_t lane = 0; lane < lanes; ++lane) {
     requireBytes(persistentKeys[lane], ringBytes(shape), "draft key ring");
     requireBytes(persistentValues[lane], ringBytes(shape), "draft value ring");
@@ -257,7 +260,7 @@ void DraftAttention::addContextCommit(
       std::move(ropeSin)};
   bindings.reserve(2 * kMaximumLanes + 5);
   appendLaneBindings(bindings, persistentKeys, persistentValues);
-  bindings.push_back(std::move(retainedCounts));
+  bindings.push_back(std::move(retainedRows));
   graph.add("draft_context_kv_commit", std::move(bindings), params,
             {uint64_t{mostRows(blocks)} * shape.kvHeads, lanes, 1});
 }
@@ -284,7 +287,7 @@ void DraftAttention::addWindowCommit(metal::CommandGraph &graph,
                                      uint32_t startPosition, uint32_t width) {
   constexpr uint32_t rows = SPLASH_TARGET_VERIFY_ROWS;
   const metal::DispatchSize groups = windowGroups(context, window, rows, width);
-  requireBytes(retained, sizeof(uint32_t), "draft retained count");
+  requireBytes(retained, sizeof(uint32_t), "draft retained rows");
   graph.add("draft_context_window_commit",
             {std::move(context), std::move(window), std::move(retained)},
             DraftContextWindowParams{rows, startPosition, width}, groups, {kWindowThreads, 1, 1});

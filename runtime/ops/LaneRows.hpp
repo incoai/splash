@@ -1,6 +1,7 @@
 #pragma once
 
 #include "metal/abi/ExecutionGeometry.h"
+#include "metal/abi/VerifyTree.h"
 
 #include <algorithm>
 #include <cstdint>
@@ -20,6 +21,15 @@ struct LaneRows {
   uint32_t first = 0;
   uint32_t rows = 0;
 };
+
+// A row of a decode lane's verify block as a tree (metal/abi/VerifyTree.h),
+// one per row of a command's packed rows.
+using TreeRow = SplashTreeRow;
+
+// Row `row` of a chain, which follows row - 1.
+[[nodiscard]] constexpr TreeRow chainRow(uint32_t row) noexcept {
+  return {(2u << row) - 1u, static_cast<uint16_t>(row ? row - 1 : SPLASH_TREE_ROOT), static_cast<uint16_t>(row)};
+}
 
 // One past the last row any of `lanes` holds.
 [[nodiscard]] inline uint64_t rowsEnd(std::span<const LaneRows> lanes) noexcept {

@@ -3,7 +3,6 @@
 #include "metal/CommandGraph.hpp"
 #include "metal/MetalBackend.hpp"
 #include "metal/abi/Sampling.h"
-#include "ops/Sampling.hpp"
 
 #include <array>
 #include <cstdint>
@@ -16,7 +15,6 @@ struct DraftSelectorWorkspace final {
   uint64_t partialValuesBytes = 0;
   uint64_t candidatesBytes = 0;
   uint64_t unaryBytes = 0;
-  uint64_t proposalProbabilitiesBytes = 0;
 };
 
 struct DraftSelectorBuffers final {
@@ -27,9 +25,7 @@ struct DraftSelectorBuffers final {
   metal::MetalBuffer candidates;
   metal::MetalBuffer unary;
   metal::MetalBuffer selectorHidden;
-  metal::MetalBuffer uniforms;
   metal::MetalBuffer proposedTokens;
-  metal::MetalBuffer proposalProbabilities;
   // fp32 [lanes][SPLASH_DRAFT_PROPOSAL_TOKENS]: each lane's confidence at each
   // proposal position, the largest probability among the position's
   // candidates (VerifyRowsParams in metal/abi/Sampling.h).
@@ -60,9 +56,10 @@ struct DraftCodebooks final {
 // metal/kernels/decode/sampling.metal): each lane keeps the
 // SPLASH_DRAFT_CANDIDATES most likely draft tokens of every proposal
 // position, scores each candidate with its edge from the previous position's
-// choice, and walks the SPLASH_DRAFT_PROPOSAL_TOKENS positions greedily or,
-// for a sampling lane, drawing at its temperature; it writes each lane's
-// confidence at each position as it walks.
+// choice, and walks the SPLASH_DRAFT_PROPOSAL_TOKENS positions greedily,
+// whatever its policy: a sampled lane's acceptance follows the target's
+// draws, which match its most likely proposals most often. It writes each
+// lane's confidence at each position as it walks.
 class DraftSelector final {
 public:
   explicit DraftSelector(uint32_t vocabulary);
@@ -71,8 +68,7 @@ public:
   [[nodiscard]] static DraftSelectorWorkspace workspace(uint32_t positions);
 
   void add(metal::CommandGraph &graph, const DraftSelectorBuffers &buffers,
-           const DraftCodebooks &codebooks, std::span<const uint32_t> anchors,
-           std::span<const SamplingPolicy> policies) const;
+           const DraftCodebooks &codebooks, std::span<const uint32_t> anchors) const;
   // After add: each lane's verify rows (a uint32 per lane in `verifyRows`) by
   // `model` from its confidences, at most maximumRows[lane] of them.
   static void addVerifyRows(metal::CommandGraph &graph, const metal::MetalBuffer &confidence,

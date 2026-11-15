@@ -2846,9 +2846,8 @@ closes thinking, and a second token that also ends it, a call's opening where
 the output may call a tool. The engine counts the thinking tokens it selects,
 and then the end tokens. In the selection where the budget runs out, one small
 dispatch gives that row and those after it the end's tokens, unless a draft
-token before the row ended thinking, and gives a sampled lane's drafted row the
-target probability 1 for a drafted end token and 0 otherwise, so acceptance
-keeps the draft only where it drafted the end. Once no thinking token is left,
+token before the row ended thinking, so acceptance keeps the draft only where it
+drafted the end. Once no thinking token is left,
 the end starts at a selection's row 0, before which no draft token can end
 thinking, and a second small dispatch replaces the lane's draft proposals with
 the end tokens left before the verify, so a decode cycle accepts as many of

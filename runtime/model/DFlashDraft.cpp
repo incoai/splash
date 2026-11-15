@@ -143,13 +143,9 @@ DFlashDraft::DFlashDraft(const DFlashDraftWeights &weights,
       selector_(weights.layout.vocabularySize),
       contextKvProjections_(contextKvRows(backend, weights)) {}
 
-void DFlashDraft::addSelection(
-    metal::CommandGraph &graph, const ops::DraftSelectorBuffers &buffers,
-    std::span<const uint32_t> anchors,
-    std::span<const ops::SamplingPolicy> policies) const {
-  selector_.add(graph, buffers,
-                {weights_.predecessorCodebook, weights_.successorCodebook},
-                anchors, policies);
+void DFlashDraft::addSelection(metal::CommandGraph &graph, const ops::DraftSelectorBuffers &buffers,
+                               std::span<const uint32_t> anchors) const {
+  selector_.add(graph, buffers, {weights_.predecessorCodebook, weights_.successorCodebook}, anchors);
 }
 
 void DFlashDraft::addContextPrefill(
@@ -380,7 +376,7 @@ void DFlashDraft::addContextCommit(
     if (buffers.windows[lane])
       ops::DraftAttention::addWindowCommit(graph, backend_.view(buffers.hidden, lane * laneBytes, laneBytes),
                                            buffers.windows[lane],
-                                           backend_.view(buffers.retainedCounts, lane * sizeof(uint32_t),
+                                           backend_.view(buffers.retainedRows, lane * sizeof(uint32_t),
                                                          sizeof(uint32_t)),
                                            startPositions[lane], layout.hiddenSize);
 
@@ -394,7 +390,7 @@ void DFlashDraft::addContextCommit(
     ops::DraftAttention::addContextCommit(
         graph, buffers.contextKv, weights_.layers[layer].keyNorm, buffers.ropeCos,
         buffers.ropeSin, buffers.persistentKeys[layer],
-        buffers.persistentValues[layer], buffers.retainedCounts,
+        buffers.persistentValues[layer], buffers.retainedRows,
         startPositions, blocks, layout.attentionShape());
   }
 }

@@ -7,9 +7,8 @@
 // than a single register chunk per thread. The logits are fp32, and their
 // order is decided below the bf16 spacing. Each lane's confidence at a
 // position must be the largest softmax probability at temperature 1 of its
-// candidates' scores, which a sampled lane's draw there does not change; and
-// draft_verify_rows must choose the verify rows whose expected tokens per
-// cost are the best of every assignment.
+// candidates' scores; and draft_verify_rows must choose the verify rows whose
+// expected tokens per cost are the best of every assignment.
 #include "LinearNumerics.hpp"
 #include "TestBuffers.hpp"
 #include "TestChecks.hpp"
@@ -137,11 +136,10 @@ std::vector<uint32_t> referenceTop16(const float *row, uint32_t vocabulary) {
 struct Case final {
   uint32_t vocabulary;
   uint32_t lanes;
-  bool sampling;
 };
 
 void runCase(MetalBackend &backend, const Case &c) {
-  Random random(0x5e1ec7 + uint64_t{c.vocabulary} * 8 + c.lanes * 2 + c.sampling);
+  Random random(0x5e1ec7 + uint64_t{c.vocabulary} * 8 + c.lanes * 2);
   const uint32_t rows = c.lanes * kRows;
   const uint32_t positions = c.lanes * kPositions;
   const auto workspace = DraftSelector::workspace(positions);
@@ -166,23 +164,14 @@ void runCase(MetalBackend &backend, const Case &c) {
       allocate(backend, workspace.candidatesBytes),
       allocate(backend, workspace.unaryBytes),
       selectorHidden,
-      allocate(backend,
-               uint64_t{c.lanes} * SPLASH_SAMPLING_UNIFORMS * sizeof(float)),
       allocate(backend, uint64_t{positions} * sizeof(uint32_t)),
-      allocate(backend, workspace.proposalProbabilitiesBytes),
       allocate(backend, uint64_t{positions} * sizeof(float))};
-  auto *uniforms = static_cast<float *>(buffers.uniforms.contents());
-  for (uint32_t index = 0; index < c.lanes * SPLASH_SAMPLING_UNIFORMS; ++index)
-    uniforms[index] = (random.unit() + 1.0F) * 0.5F;
   std::vector<uint32_t> anchors(c.lanes);
-  std::vector<SamplingPolicy> policies(c.lanes);
-  for (uint32_t lane = 0; lane < c.lanes; ++lane) {
+  for (uint32_t lane = 0; lane < c.lanes; ++lane)
     anchors[lane] = random.next() % c.vocabulary;
-    policies[lane] = SamplingPolicy{16, c.sampling ? 0.8F : 0.0F, 1.0F, false};
-  }
 
   CommandGraph graph;
-  selector.add(graph, buffers, codebooks, anchors, policies);
+  selector.add(graph, buffers, codebooks, anchors);
   require(graph.dispatches().size() == 3,
           "draft selector dispatch count changed");
   static_cast<void>(backend.submitCommandAsync(graph.dispatches()).wait());
@@ -192,8 +181,6 @@ void runCase(MetalBackend &backend, const Case &c) {
   const auto *unary = static_cast<const float *>(buffers.unary.contents());
   const auto *tokens =
       static_cast<const uint32_t *>(buffers.proposedTokens.contents());
-  const auto *probabilities =
-      static_cast<const float *>(buffers.proposalProbabilities.contents());
   const auto *hidden =
       static_cast<const uint16_t *>(selectorHidden.contents());
   const auto *predecessors =
@@ -242,42 +229,15 @@ void runCase(MetalBackend &backend, const Case &c) {
           selected = selected == kCandidates ? rank : selected;
       require(selected < kCandidates,
               "draft selector proposed a token outside its candidates");
-      if (c.sampling) {
-        const double maximum = *std::max_element(scores.begin(), scores.end());
-        double sum = 0.0;
-        std::array<double, kCandidates> reference{};
-        for (uint32_t rank = 0; rank < kCandidates; ++rank) {
-          reference[rank] = std::exp((scores[rank] - maximum) / 0.8);
-          sum += reference[rank];
-        }
-        const float uniform = uniforms[lane * SPLASH_SAMPLING_UNIFORMS +
-                                       SPLASH_UNIFORM_PROPOSALS + position];
-        std::array<double, kCandidates> cumulative{};
-        uint32_t expectedSelection = kCandidates - 1;
-        for (uint32_t rank = 0; rank < kCandidates; ++rank) {
-          const float probability = probabilities[global * kCandidates + rank];
-          require(std::fabs(probability - reference[rank] / sum) < 1e-4,
-                  "draft selector probabilities diverged from the softmax");
-          cumulative[rank] = (rank ? cumulative[rank - 1] : 0.0) + reference[rank] / sum;
-          if (expectedSelection == kCandidates - 1 && cumulative[rank] > uniform)
-            expectedSelection = rank;
-        }
-        // A draw within fp32 rounding of the crossed boundary may go either way.
-        const double boundary =
-            std::fabs(cumulative[std::min(selected, expectedSelection)] - uniform);
-        require(selected == expectedSelection || boundary < 1e-5,
-                "draft selector drew a different candidate than the reference");
-      } else {
-        uint32_t expectedSelection = 0;
-        for (uint32_t rank = 1; rank < kCandidates; ++rank)
-          if (scores[rank] > scores[expectedSelection])
-            expectedSelection = rank;
-        // fp32 accumulation over 256 products of magnitude 1e-3 stays far
-        // below this margin; only an exact tie could legitimately differ.
-        require(selected == expectedSelection ||
-                    std::fabs(scores[selected] - scores[expectedSelection]) < 1e-5,
-                "draft selector picked a different greedy candidate");
-      }
+      uint32_t expectedSelection = 0;
+      for (uint32_t rank = 1; rank < kCandidates; ++rank)
+        if (scores[rank] > scores[expectedSelection])
+          expectedSelection = rank;
+      // fp32 accumulation over 256 products of magnitude 1e-3 stays far
+      // below this margin; only an exact tie could legitimately differ.
+      require(selected == expectedSelection ||
+                  std::fabs(scores[selected] - scores[expectedSelection]) < 1e-5,
+              "draft selector picked a different greedy candidate");
       const double maximum = *std::max_element(scores.begin(), scores.end());
       double sum = 0.0;
       for (const double score : scores)
@@ -287,59 +247,6 @@ void runCase(MetalBackend &backend, const Case &c) {
       predecessor = token;
     }
   }
-}
-
-// A sampled lane's confidence at a position does not depend on the candidate
-// it draws there: runs that differ only in one position's proposal uniform
-// write the same confidences up to that position and the same proposals
-// before it, while (over flat candidate scores) drawing different proposals
-// there. So whether a row is verified never depends on its own draw.
-void confidenceIgnoresDraws(MetalBackend &backend) {
-  constexpr uint32_t vocabulary = 1003;
-  Random random(0xd2a35);
-  const auto workspace = DraftSelector::workspace(kPositions);
-  const DraftSelector selector(vocabulary);
-  MetalBuffer logits = allocate(backend, uint64_t{kRows} * vocabulary * sizeof(float));
-  for (uint32_t row = 0; row < kRows; ++row)
-    fillRow(static_cast<float *>(logits.contents()) + uint64_t{row} * vocabulary, vocabulary, Pattern::Uniform,
-            random);
-  const DraftSelectorBuffers buffers{logits,
-                                     allocate(backend, workspace.partialIdsBytes),
-                                     allocate(backend, workspace.partialValuesBytes),
-                                     allocate(backend, workspace.candidatesBytes),
-                                     allocate(backend, workspace.unaryBytes),
-                                     randomBfloat(backend, uint64_t{kRows} * kRank, random, 0.1F),
-                                     allocate(backend, SPLASH_SAMPLING_UNIFORMS * sizeof(float)),
-                                     allocate(backend, kPositions * sizeof(uint32_t)),
-                                     allocate(backend, workspace.proposalProbabilitiesBytes),
-                                     allocate(backend, kPositions * sizeof(float))};
-  const DraftCodebooks codebooks{randomBfloat(backend, uint64_t{vocabulary} * kRank, random, 0.1F),
-                                 randomBfloat(backend, uint64_t{vocabulary} * kRank, random, 0.1F)};
-  const std::array<uint32_t, 1> anchors{7};
-  const std::array policies{SamplingPolicy{16, 1.0F, 1.0F, false}};
-  const auto run = [&](uint32_t position, float uniform) {
-    auto *uniforms = static_cast<float *>(buffers.uniforms.contents());
-    std::fill_n(uniforms, SPLASH_SAMPLING_UNIFORMS, 0.5F);
-    uniforms[SPLASH_UNIFORM_PROPOSALS + position] = uniform;
-    CommandGraph graph;
-    selector.add(graph, buffers, codebooks, anchors, policies);
-    static_cast<void>(backend.submitCommandAsync(graph.dispatches()).wait());
-    const auto *tokens = static_cast<const uint32_t *>(buffers.proposedTokens.contents());
-    const auto *confidence = static_cast<const float *>(buffers.confidence.contents());
-    return std::pair{std::vector<uint32_t>(tokens, tokens + kPositions),
-                     std::vector<float>(confidence, confidence + kPositions)};
-  };
-  uint32_t redrawn = 0;
-  for (uint32_t position = 0; position < kPositions; ++position) {
-    const auto [lowTokens, lowConfidence] = run(position, 0.05F);
-    const auto [highTokens, highConfidence] = run(position, 0.95F);
-    require(std::equal(lowConfidence.begin(), lowConfidence.begin() + position + 1, highConfidence.begin()),
-            "a draw changed the confidence at or before its position");
-    require(std::equal(lowTokens.begin(), lowTokens.begin() + position, highTokens.begin()),
-            "a draw changed the proposals before its position");
-    redrawn += lowTokens[position] != highTokens[position] ? 1 : 0;
-  }
-  require(redrawn >= 5, "the uniforms redrew only " + std::to_string(redrawn) + " proposals");
 }
 
 // draft_verify_rows against every assignment of 1 to maximum rows per lane:
@@ -429,12 +336,11 @@ void verifyRowsChoice(MetalBackend &backend) {
 }
 
 // Each buffer the selector reaches, at its extent and one element short, for
-// three lanes of which the second samples: every lane's eight query rows of
-// logits and selector hidden rows, the workspaces of its seven positions,
-// each codebook's row of every token, and the sampled lanes' proposal
-// uniforms and probabilities up to the second lane's.
+// three lanes: every lane's eight query rows of logits and selector hidden
+// rows, the workspaces of its seven positions, and each codebook's row of
+// every token.
 void bufferExtents(MetalBackend &backend) {
-  constexpr uint32_t vocabulary = 1003, lanes = 3, sampledLanes = 2;
+  constexpr uint32_t vocabulary = 1003, lanes = 3;
   const DraftSelector selector(vocabulary);
   const auto workspace = DraftSelector::workspace(lanes * kPositions);
   const DraftSelectorBuffers buffers{
@@ -444,14 +350,11 @@ void bufferExtents(MetalBackend &backend) {
       allocate(backend, workspace.candidatesBytes),
       allocate(backend, workspace.unaryBytes),
       allocate(backend, uint64_t{lanes} * kRows * kRank * 2),
-      allocate(backend, uint64_t{lanes} * SPLASH_SAMPLING_UNIFORMS * sizeof(float)),
       allocate(backend, uint64_t{lanes} * kPositions * sizeof(uint32_t)),
-      allocate(backend, workspace.proposalProbabilitiesBytes),
       allocate(backend, uint64_t{lanes} * kPositions * sizeof(float))};
   const DraftCodebooks codebooks{allocate(backend, uint64_t{vocabulary} * kRank * 2),
                                  allocate(backend, uint64_t{vocabulary} * kRank * 2)};
   const std::array<uint32_t, lanes> anchors{1, 2, 3};
-  const std::array policies{SamplingPolicy{}, SamplingPolicy{16, 0.8F, 1.0F}, SamplingPolicy{}};
   const uint64_t candidates = uint64_t{lanes} * kPositions * kCandidates;
   for (const auto &[member, bytes, element, what] :
        std::initializer_list<std::tuple<MetalBuffer DraftSelectorBuffers::*, uint64_t, uint64_t, const char *>>{
@@ -464,16 +367,11 @@ void bufferExtents(MetalBackend &backend) {
            {&DraftSelectorBuffers::unary, candidates * 4, 4, "draft candidate score"},
            {&DraftSelectorBuffers::selectorHidden, uint64_t{lanes} * kRows * kRank * 2, 2, "draft selector hidden"},
            {&DraftSelectorBuffers::proposedTokens, uint64_t{lanes} * kPositions * 4, 4, "proposed token"},
-           {&DraftSelectorBuffers::uniforms,
-            ((sampledLanes - 1) * SPLASH_SAMPLING_UNIFORMS + SPLASH_UNIFORM_PROPOSALS + kPositions) * 4, 4,
-            "proposal uniform"},
-           {&DraftSelectorBuffers::proposalProbabilities, uint64_t{sampledLanes} * kPositions * kCandidates * 4, 4,
-            "proposal probability"},
            {&DraftSelectorBuffers::confidence, uint64_t{lanes} * kPositions * 4, 4, "proposal confidence"}})
     requireExtent(backend, buffers.*member, bytes, element, what, [&](CommandGraph &graph, const MetalBuffer &buffer) {
       DraftSelectorBuffers changed = buffers;
       changed.*member = buffer;
-      selector.add(graph, changed, codebooks, anchors, policies);
+      selector.add(graph, changed, codebooks, anchors);
     });
   for (const auto &[member, what] :
        {std::pair{&DraftCodebooks::predecessor, "draft predecessor codebook"},
@@ -482,7 +380,7 @@ void bufferExtents(MetalBackend &backend) {
                   [&](CommandGraph &graph, const MetalBuffer &buffer) {
                     DraftCodebooks changed = codebooks;
                     changed.*member = buffer;
-                    selector.add(graph, buffers, changed, anchors, policies);
+                    selector.add(graph, buffers, changed, anchors);
                   });
   // draft_verify_rows reads every lane's confidences and writes its rows.
   const std::array<uint32_t, lanes> maximumRows{kRows, kRows, kRows};
@@ -509,17 +407,15 @@ void invalidRequests(MetalBackend &backend) {
       allocate(backend, workspace.candidatesBytes),
       allocate(backend, workspace.unaryBytes),
       allocate(backend, uint64_t{kRows} * kRank * 2),
-      allocate(backend, SPLASH_SAMPLING_UNIFORMS * sizeof(float)),
       allocate(backend, kPositions * sizeof(uint32_t)),
-      allocate(backend, workspace.proposalProbabilitiesBytes),
       allocate(backend, kPositions * sizeof(float))};
   const DraftCodebooks codebooks{allocate(backend, uint64_t{1024} * kRank * 2),
                                  allocate(backend, uint64_t{1024} * kRank * 2)};
-  const std::array<uint32_t, 2> anchors{1, 2};
-  const std::array<SamplingPolicy, 1> policies{SamplingPolicy{}};
   CommandGraph graph;
-  rejects([&] { selector.add(graph, buffers, codebooks, anchors, policies); },
-          "invalid draft selector batch", "anchors without a policy each were accepted");
+  rejects([&] { selector.add(graph, buffers, codebooks, std::span<const uint32_t>{}); }, "invalid draft selector batch",
+          "a selection of no lane was accepted");
+  rejects([&] { selector.add(graph, buffers, codebooks, std::array<uint32_t, 5>{1, 2, 3, 4, 5}); },
+          "invalid draft selector batch", "a selection of five lanes was accepted");
   const MetalBuffer verifyRows = allocate(backend, kLanes * sizeof(uint32_t));
   const MetalBuffer confidence = allocate(backend, kLanes * kPositions * sizeof(float));
   rejects([&] { DraftSelector::addVerifyRows(graph, confidence, verifyRows, {}, {}); },
@@ -563,12 +459,9 @@ int main(int argc, char **argv) {
     invalidRequests(backend);
     bufferExtents(backend);
     for (const uint32_t vocabulary : {248320U, 1003U, 270005U}) {
-      for (uint32_t lanes = 1; lanes <= kLanes; ++lanes) {
-        runCase(backend, {vocabulary, lanes, false});
-        runCase(backend, {vocabulary, lanes, true});
-      }
+      for (uint32_t lanes = 1; lanes <= kLanes; ++lanes)
+        runCase(backend, {vocabulary, lanes});
     }
-    confidenceIgnoresDraws(backend);
     verifyRowsChoice(backend);
     std::cout << "draft_selector_metal_test: PASS\n";
     return 0;

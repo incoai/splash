@@ -27,6 +27,9 @@ namespace splash::model {
 
 inline constexpr uint32_t kLaneCount = ExecutionLimits::maximumBatchWidth;
 inline constexpr uint32_t kDecodeRows = ExecutionLimits::targetVerifyRows;
+// The rows of a decode lane's draft block (its query rows), the first of a
+// verify block's positions.
+inline constexpr uint32_t kDraftRows = ExecutionLimits::draftQueryRows;
 // Per-lane sampling uniforms handed to the sampler each cycle, in the
 // layout of metal/abi/Sampling.h.
 inline constexpr uint32_t kSamplingUniformCount = SPLASH_SAMPLING_UNIFORMS;
@@ -509,6 +512,9 @@ enum class DecodeTensor : uint32_t {
   ConstraintMasks,
   OutputTokens,
   RetainedCount,
+  // The mask of each lane's retained rows of its verify block, which
+  // acceptance writes (metal/abi/Sampling.h AcceptBatchParams).
+  RetainedRows,
   AcceptedCount,
   VerifyRows,
   VerifyConfidence,
@@ -529,8 +535,10 @@ enum class DecodeTensor : uint32_t {
   Unary,
   TopPartialIds,
   TopPartialValues,
-  ProposalProbs,
   ProposedTokens,
+  // Each lane's verify block as a tree, a row of metal/abi/VerifyTree.h per
+  // row: chains (ops::chainRow) from the arena's start.
+  TreeRows,
   PageTable,
   // Indexed by state lane, like PageTable, for a layout with a block index:
   // the entries of the pages' index (kv::PageStorage::writeIndexEntries),
@@ -608,6 +616,10 @@ public:
     const metal::MetalBuffer arrivals =
         batchSlice(DecodeTensor::TargetVocabularyArrivals, kLaneCount);
     std::memset(arrivals.contents(), 0, arrivals.sizeBytes());
+    // Every block verifies a chain until its selector writes a tree.
+    auto *tree = static_cast<ops::TreeRow *>(batchSlice(DecodeTensor::TreeRows, kLaneCount).contents());
+    for (uint32_t row = 0; row < kLaneCount * kDecodeRows; ++row)
+      tree[row] = ops::chainRow(row % kDecodeRows);
 
     // Each scratch buffer takes whole host pages (decodeArenaBytes).
     const auto allocate = [&](uint64_t bytes, metal::BufferStorage storage, const char *label) {

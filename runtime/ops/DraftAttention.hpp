@@ -106,18 +106,18 @@ public:
       metal::MetalBuffer ropeSin, metal::MetalBuffer keys,
       metal::MetalBuffer values, uint32_t tokens, uint32_t startPosition,
       DraftAttentionShape shape);
-  // Each lane's retained rows (a GPU count), at most its verify block's of
-  // `blocks`: the block's context rows of contextKv, at positions from the
-  // lane's start position, each rotated by its row of the lane's draft
-  // block of the RoPE tables (SPLASH_DRAFT_QUERY_ROWS rows a lane), which
-  // holds the same positions.
+  // Each lane's retained rows (a GPU mask of its block's rows, which
+  // acceptance writes), at most its verify block's of `blocks`: the path's
+  // context rows among the block's of contextKv, its i-th at the lane's start
+  // position plus i, rotated by the lane's RoPE row i (a lane's RoPE rows
+  // hold its verify block's positions, SPLASH_TARGET_VERIFY_ROWS a lane).
   static void addContextCommit(
       metal::CommandGraph &graph, metal::MetalBuffer contextKv,
       metal::MetalBuffer keyNorm, metal::MetalBuffer ropeCos,
       metal::MetalBuffer ropeSin,
       std::span<const metal::MetalBuffer> persistentKeys,
       std::span<const metal::MetalBuffer> persistentValues,
-      metal::MetalBuffer retainedCounts,
+      metal::MetalBuffer retainedRows,
       std::span<const uint32_t> startPositions, std::span<const LaneRows> blocks,
       DraftAttentionShape shape);
 
@@ -131,9 +131,9 @@ public:
                              metal::MetalBuffer context,
                              metal::MetalBuffer window, uint32_t rows,
                              uint32_t startPosition, uint32_t width);
-  // Stores the first of a lane's verify rows' context rows, as many as
-  // `retained` counts (its acceptance's count, up to targetVerifyRows), as
-  // addWindowStore does.
+  // Stores the context rows a lane retained of its verify block (`retained`,
+  // its acceptance's mask of the block's rows, metal/abi/VerifyTree.h), the
+  // path's i-th at position startPosition + i, as addWindowStore does.
   static void addWindowCommit(metal::CommandGraph &graph,
                               metal::MetalBuffer context,
                               metal::MetalBuffer window,

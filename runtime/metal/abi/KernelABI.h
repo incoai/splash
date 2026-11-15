@@ -13,6 +13,7 @@
 #include "metal/abi/RoPE.h"
 #include "metal/abi/RowCopy.h"
 #include "metal/abi/Sampling.h"
+#include "metal/abi/VerifyTree.h"
 #include "metal/abi/Vision.h"
 #include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
 #include <metal_stdlib>

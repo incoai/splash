@@ -198,8 +198,9 @@ decodeTensorBytes(const RuntimeGeometry &geometry,
       bytesFor<uint16_t>(r * geometry.draft.targetHiddenSize()));
   put(DecodeTensor::DraftQueryKeys, draftWorkspace.queryKeysBytes);
   put(DecodeTensor::DraftQueryValues, draftWorkspace.queryValuesBytes);
-  // Proposal attention and accepted target-hidden injection use the same
-  // eight absolute positions, so one RoPE table per lane is sufficient.
+  // A lane's verify block's positions, the first kDraftRows of which its
+  // draft's rows take and one a retained row of which its context commit
+  // takes, so one RoPE table per lane serves both.
   put(DecodeTensor::DraftRopeCos,
       bytesFor<float>(r * geometry.draftRotaryPairs()));
   put(DecodeTensor::DraftRopeSin,
@@ -222,38 +223,41 @@ decodeTensorBytes(const RuntimeGeometry &geometry,
                          geometry.maskWords()));
   put(DecodeTensor::OutputTokens, bytesFor<uint32_t>(r));
   put(DecodeTensor::RetainedCount, sizeof(uint32_t));
+  put(DecodeTensor::RetainedRows, sizeof(uint32_t));
   put(DecodeTensor::AcceptedCount, sizeof(uint32_t));
   put(DecodeTensor::VerifyRows, sizeof(uint32_t));
   put(DecodeTensor::VerifyConfidence, bytesFor<float>(kDraftProposalTokens));
-  put(DecodeTensor::DraftInputTokens, bytesFor<uint32_t>(r));
+  // The draft's own rows: its block's, kDraftRows a lane.
+  const uint64_t d = kDraftRows;
+  put(DecodeTensor::DraftInputTokens, bytesFor<uint32_t>(d));
   for (uint32_t index = 0; index < 2; ++index) {
     put(static_cast<DecodeTensor>(
             static_cast<uint32_t>(DecodeTensor::DraftHidden0) + index),
-        bytesFor<uint16_t>(r * geometry.draft.hiddenSize));
+        bytesFor<uint16_t>(d * geometry.draft.hiddenSize));
   }
   put(DecodeTensor::DraftNormalized,
-      bytesFor<uint16_t>(r * geometry.draft.hiddenSize));
+      bytesFor<uint16_t>(d * geometry.draft.hiddenSize));
   put(DecodeTensor::DraftDynamic,
-      bytesFor<uint16_t>(r * geometry.draft.dynamicSize));
+      bytesFor<uint16_t>(d * geometry.draft.dynamicSize));
   put(DecodeTensor::DraftConvolved, draftWorkspace.convolutionBytes);
   put(DecodeTensor::DraftProposalQkv, draftWorkspace.qkvBytes);
   put(DecodeTensor::DraftAttention, draftWorkspace.groupedQueriesBytes);
   put(DecodeTensor::DraftProjected,
-      bytesFor<uint16_t>(r * geometry.draft.hiddenSize));
+      bytesFor<uint16_t>(d * geometry.draft.hiddenSize));
   put(DecodeTensor::DraftResidual,
-      bytesFor<uint16_t>(r * geometry.draft.hiddenSize));
+      bytesFor<uint16_t>(d * geometry.draft.hiddenSize));
   put(DecodeTensor::DraftIntermediate,
-      bytesFor<uint16_t>(r * geometry.draft.intermediateSize));
+      bytesFor<uint16_t>(d * geometry.draft.intermediateSize));
   put(DecodeTensor::DraftFinalHidden,
-      bytesFor<uint16_t>(r * geometry.draft.hiddenSize));
+      bytesFor<uint16_t>(d * geometry.draft.hiddenSize));
   put(DecodeTensor::SelectorHidden,
-      bytesFor<uint16_t>(r * geometry.draft.selectorRank));
+      bytesFor<uint16_t>(d * geometry.draft.selectorRank));
   put(DecodeTensor::Candidates, selectorWorkspace.candidatesBytes);
   put(DecodeTensor::Unary, selectorWorkspace.unaryBytes);
   put(DecodeTensor::TopPartialIds, selectorWorkspace.partialIdsBytes);
   put(DecodeTensor::TopPartialValues, selectorWorkspace.partialValuesBytes);
-  put(DecodeTensor::ProposalProbs, selectorWorkspace.proposalProbabilitiesBytes);
   put(DecodeTensor::ProposedTokens, bytesFor<uint32_t>(kDraftProposalTokens));
+  put(DecodeTensor::TreeRows, bytesFor<ops::TreeRow>(r));
   put(DecodeTensor::PageTable, bytesFor<SplashKvPage>(kMaximumPageTableEntries));
   if (geometry.target.kvLayout.indexDimension)
     put(DecodeTensor::IndexTable, bytesFor<SplashKvPage>(kMaximumPageTableEntries));
