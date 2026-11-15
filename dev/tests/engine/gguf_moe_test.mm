@@ -43,6 +43,19 @@
 //   each slice's passes against the fp64 products of its rows and column
 //   window of the whole expert.
 // Streamed experts (model::ExpertStore) run in expert_store_test.mm.
+// `gguf-moe METALLIB float-stress N` runs the native rows' check alone N
+// times, on fresh rows each time, for a failure one run may not show. Run it
+// as test-engine-metal runs the test, under shader validation, beside a
+// second, unvalidated float-stress as load:
+//   gguf-moe production-and-test.metallib float-stress 1000 &
+//   MTL_SHADER_VALIDATION=1 gguf-moe production-and-test.metallib float-stress 20
+//   kill %1
+// With the simdgroup tile's fragment loop ended by a break (MMAs under a loop
+// exit the compiler cannot prove uniform, kernels/shared/gguf_float.metal),
+// one of a simdgroup's sums for the last fragment of native rows came out
+// zero or another fragment's: 16 of 20 iterations failed so on an Apple11 GPU
+// under macOS 27.0 beside the load (alone, far fewer or none), none of 20 on
+// an Apple9 under macOS 26.6. With the fragment skipped instead, none failed.
 #include "MoeStep.hpp"
 #include "../../../runtime/metal/CommandGraph.hpp"
 #include "../../../runtime/metal/MetalBackend.hpp"
@@ -62,6 +75,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <functional>
@@ -1641,12 +1655,20 @@ int laneRowsRoute(MetalBackend &backend, const std::string &name, uint32_t rows,
 
 int main(int argc, const char *argv[]) {
   @autoreleasepool {
-    if (argc != 2) {
-      std::cerr << "usage: gguf-moe <production-and-test.metallib>\n";
+    const bool stress = argc == 4 && std::string(argv[2]) == "float-stress";
+    if (argc != 2 && !stress) {
+      std::cerr << "usage: gguf-moe <production-and-test.metallib> [float-stress <iterations>]\n";
       return 2;
     }
     try {
       MetalBackend backend(argv[1]);
+      if (stress) {
+        const int iterations = std::atoi(argv[3]);
+        int failed = 0;
+        for (int iteration = 0; iteration < iterations; ++iteration) failed += nativeRowWeights(backend) != 0;
+        printf("float-stress: %d of %d iterations failed\n", failed, iterations);
+        return failed ? 1 : 0;
+      }
       bufferExtents(backend);
       const int failures = floatProjection(backend) + bfloat16Weights(backend) + nativeRowWeights(backend) +
                            nativePairs(backend) + floatPairs(backend) +
