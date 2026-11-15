@@ -1,6 +1,9 @@
 #include "model/LookupProposals.hpp"
 
 #include <algorithm>
+#include <bit>
+#include <cmath>
+#include <stdexcept>
 
 namespace splash::model {
 namespace {
@@ -126,6 +129,49 @@ void LookupIndex::extend(uint32_t token) {
   // now ends here.
   for (state = capped_; states_[state].length >= kMinimumMatch; state = states_[state].link)
     states_[state].recent = position;
+}
+
+uint32_t LookupAcceptance::lengthBucket(uint32_t length) {
+  if (length < LookupIndex::kMinimumMatch)
+    throw std::invalid_argument("invalid lookup match length");
+  return std::min(static_cast<uint32_t>(std::bit_width(length)) - 2, kLengthBuckets - 1);
+}
+
+uint32_t LookupAcceptance::depthBucket(uint32_t depth) noexcept {
+  return std::min(static_cast<uint32_t>(std::bit_width(depth)), kDepthBuckets - 1);
+}
+
+float LookupAcceptance::rate(uint32_t length, uint32_t depth, LookupAgreement agreement) const {
+  const uint32_t l = lengthBucket(length), d = depthBucket(depth);
+  const auto a = static_cast<uint32_t>(agreement);
+  const Count &count = counts_[l][d][a];
+  return static_cast<float>((count.accepted + kPriorLabels * kPrior[l][d][a]) / (count.labels + kPriorLabels));
+}
+
+void LookupAcceptance::observe(uint32_t length, std::span<const LookupAgreement> verified, uint32_t accepted) {
+  const uint32_t l = lengthBucket(length);
+  if (accepted > verified.size())
+    throw std::invalid_argument("invalid lookup outcome");
+  const size_t labels = std::min<size_t>(accepted + 1, verified.size());
+  const double decay = std::exp2(-static_cast<double>(labels) / kHalfLife);
+  for (auto &depths : counts_)
+    for (auto &agreements : depths)
+      for (Count &count : agreements) {
+        count.accepted *= decay;
+        count.labels *= decay;
+      }
+  for (uint32_t depth = 0; depth < labels; ++depth) {
+    auto &cells = counts_[l][depthBucket(depth)];
+    const double label = depth < accepted ? 1.0 : 0.0;
+    const auto add = [&](LookupAgreement agreement) {
+      Count &count = cells[static_cast<uint32_t>(agreement)];
+      count.accepted += label;
+      count.labels += 1.0;
+    };
+    add(verified[depth]);
+    if (verified[depth] != LookupAgreement::Unknown)
+      add(LookupAgreement::Unknown);
+  }
 }
 
 } // namespace splash::model

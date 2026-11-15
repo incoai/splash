@@ -1,16 +1,21 @@
-// The lookup proposals' index (model::LookupIndex). After every token
-// appended, its match is what a direct search of the tokens finds: the
-// earlier occurrence of the longest suffix, its length counted up to
-// kLongestMatch, the most recent of the longest, none shorter than
-// kMinimumMatch; on runs of one token, short periods and random tokens
-// alike. Tokens appended at once match as those appended one at a time;
-// matches and proposals reach across the prompt's end; and on two traced
-// requests (the fixture), the proposals at every cycle are the offline
-// replay's lookup chains.
+// The lookup proposals' index and acceptance estimate (model::LookupIndex,
+// model::LookupAcceptance). After every token appended, the index's match is
+// what a direct search of the tokens finds: the earlier occurrence of the
+// longest suffix, its length counted up to kLongestMatch, the most recent of
+// the longest, none shorter than kMinimumMatch; on runs of one token, short
+// periods and random tokens alike. Tokens appended at once match as those
+// appended one at a time; matches and proposals reach across the prompt's
+// end; and on two traced requests (the fixture), the proposals at every
+// cycle are the offline replay's lookup chains. The estimate is the fitted
+// table until it observes; each accepted token and the rejected one are
+// labels, those past the rejection none; a known agreement's label teaches
+// Unknown too; and counts weigh half as much kHalfLife labels later.
 #include "TestChecks.hpp"
 #include "model/LookupProposals.hpp"
 
 #include <algorithm>
+#include <array>
+#include <cmath>
 #include <cstdint>
 #include <fstream>
 #include <iostream>
@@ -18,9 +23,13 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
+using splash::model::LookupAcceptance;
+using splash::model::LookupAgreement;
 using splash::model::LookupIndex;
+using splash::test::rejects;
 using splash::test::require;
 
 namespace {
@@ -248,6 +257,105 @@ void replaysTheTrace(const std::string &path) {
   require(requests == 2 && cycles == 239 && matched == 147, "the fixture did not hold the traced cycles");
 }
 
+void priorTable() {
+  const LookupAcceptance acceptance;
+  using Buckets = std::vector<std::pair<uint32_t, uint32_t>>;
+  for (const auto &[length, bucket] : Buckets{{3, 0}, {4, 1}, {7, 1}, {8, 2}, {15, 2}, {16, 3}, {31, 3}, {32, 4},
+                                              {63, 4}, {64, 5}, {1000000, 5}})
+    require(LookupAcceptance::lengthBucket(length) == bucket, "length " + std::to_string(length) + "'s bucket");
+  for (const auto &[depth, bucket] :
+       Buckets{{0, 0}, {1, 1}, {2, 2}, {3, 2}, {4, 3}, {7, 3}, {8, 4}, {15, 4}, {16, 5}, {1000, 5}})
+    require(LookupAcceptance::depthBucket(depth) == bucket, "depth " + std::to_string(depth) + "'s bucket");
+  const auto &table = LookupAcceptance::kPrior;
+  for (const uint32_t length : {3U, 5U, 12U, 20U, 40U, 64U, 5000U})
+    for (const uint32_t depth : {0U, 1U, 3U, 6U, 9U, 30U})
+      for (uint32_t a = 0; a < LookupAcceptance::kAgreements; ++a)
+        require(acceptance.rate(length, depth, static_cast<LookupAgreement>(a)) ==
+                    table[LookupAcceptance::lengthBucket(length)][LookupAcceptance::depthBucket(depth)][a],
+                "an estimate before any observation was not the table's");
+  // The fit's findings: the draft's top candidate is accepted 96% of the
+  // time or more, more than its other candidates and tokens it lacks; and
+  // without the draft's view, a longer match or a deeper token is no less
+  // likely.
+  const auto top = static_cast<uint32_t>(LookupAgreement::Top);
+  const auto candidate = static_cast<uint32_t>(LookupAgreement::Candidate);
+  const auto absent = static_cast<uint32_t>(LookupAgreement::Absent);
+  const auto unknown = static_cast<uint32_t>(LookupAgreement::Unknown);
+  for (uint32_t l = 0; l < LookupAcceptance::kLengthBuckets; ++l)
+    for (uint32_t d = 0; d < LookupAcceptance::kDepthBuckets; ++d) {
+      const auto &cell = table[l][d];
+      require(cell[top] >= 0.96F && cell[top] > cell[candidate] && cell[top] > cell[absent],
+              "the draft's top candidate was not the likeliest");
+      require((l == 0 || cell[unknown] >= table[l - 1][d][unknown]) &&
+                  (d == 0 || cell[unknown] >= table[l][d - 1][unknown]),
+              "an unknown agreement's estimate fell with length or depth");
+    }
+}
+
+void learnsFromOutcomes() {
+  const auto &table = LookupAcceptance::kPrior;
+  const double w = LookupAcceptance::kPriorLabels;
+  const auto near = [](double a, double b) { return std::fabs(a - b) < 1e-6; };
+  const auto cell = [&](uint32_t length, uint32_t depth, LookupAgreement agreement) {
+    return double{table[LookupAcceptance::lengthBucket(length)][LookupAcceptance::depthBucket(depth)]
+                       [static_cast<uint32_t>(agreement)]};
+  };
+  LookupAcceptance acceptance;
+  // Five tokens verified, two accepted: depths 0 and 1 accepted, depth 2
+  // rejected, depths 3 and 4 no label.
+  const std::array verified{LookupAgreement::Top, LookupAgreement::Absent, LookupAgreement::Candidate,
+                            LookupAgreement::Absent, LookupAgreement::Unknown};
+  acceptance.observe(10, verified, 2);
+  const auto expect = [&](uint32_t depth, LookupAgreement agreement, double accepted, double labels,
+                          const std::string &what) {
+    const double expected = (accepted + w * cell(10, depth, agreement)) / (labels + w);
+    require(near(acceptance.rate(10, depth, agreement), expected), what);
+  };
+  expect(0, LookupAgreement::Top, 1, 1, "an accepted token was not a label");
+  expect(1, LookupAgreement::Absent, 1, 1, "an accepted absent token was not a label");
+  expect(2, LookupAgreement::Candidate, 0, 1, "the rejected token was not a label");
+  expect(3, LookupAgreement::Absent, 0, 0, "a token past the rejection was a label");
+  expect(4, LookupAgreement::Unknown, 0, 0, "a token past the rejection taught Unknown");
+  // Depths 2 and 3 share a bucket: one label, the rejection.
+  expect(2, LookupAgreement::Unknown, 0, 1, "a known agreement's rejection did not teach Unknown");
+  expect(0, LookupAgreement::Unknown, 1, 1, "a known agreement's acceptance did not teach Unknown");
+  require(near(acceptance.rate(20, 0, LookupAgreement::Top), cell(20, 0, LookupAgreement::Top)),
+          "a label taught another length's estimate");
+
+  // Every token accepted: no rejection to label.
+  LookupAcceptance all;
+  all.observe(3, std::array{LookupAgreement::Unknown, LookupAgreement::Unknown}, 2);
+  require(near(all.rate(3, 1, LookupAgreement::Unknown), (1 + w * cell(3, 1, LookupAgreement::Unknown)) / (1 + w)),
+          "a chain accepted whole lost a label");
+  // Nothing verified: nothing learned.
+  all.observe(3, std::span<const LookupAgreement>{}, 0);
+  require(near(all.rate(3, 1, LookupAgreement::Unknown), (1 + w * cell(3, 1, LookupAgreement::Unknown)) / (1 + w)),
+          "an empty outcome changed the counts");
+
+  // kHalfLife labels later, one weighs half: at depth 16+ (bucket 5) of
+  // length 64, the earlier depth 0 label of length 10 halves.
+  LookupAcceptance decaying;
+  decaying.observe(10, std::array{LookupAgreement::Top}, 1);
+  std::vector<LookupAgreement> elsewhere(64, LookupAgreement::Unknown);
+  const auto rounds = static_cast<uint32_t>(LookupAcceptance::kHalfLife) / 64;
+  for (uint32_t round = 0; round < rounds; ++round)
+    decaying.observe(64, elsewhere, 64);
+  require(near(decaying.rate(10, 0, LookupAgreement::Top),
+               (0.5 + w * cell(10, 0, LookupAgreement::Top)) / (0.5 + w)),
+          "a label did not weigh half kHalfLife labels later");
+  // Many rejections pull an estimate toward none.
+  LookupAcceptance rejected;
+  for (int round = 0; round < 1000; ++round)
+    rejected.observe(5, std::array{LookupAgreement::Top}, 0);
+  require(rejected.rate(5, 0, LookupAgreement::Top) < 0.01F, "rejections did not lower the estimate");
+
+  rejects([&] { acceptance.observe(2, verified, 0); }, "invalid lookup match length", "a 2-token match was observed");
+  rejects([&] { acceptance.observe(10, std::span(verified).first(2), 3); }, "invalid lookup outcome",
+          "more tokens accepted than verified");
+  rejects([&] { static_cast<void>(acceptance.rate(2, 0, LookupAgreement::Top)); }, "invalid lookup match length",
+          "a 2-token match had an estimate");
+}
+
 } // namespace
 
 int main(int argc, char **argv) {
@@ -260,6 +368,8 @@ int main(int argc, char **argv) {
     acrossThePromptsEnd();
     appendsAtOnceOrApart();
     replaysTheTrace(argv[1]);
+    priorTable();
+    learnsFromOutcomes();
   } catch (const std::exception &error) {
     std::cerr << "lookup_proposals_test: FAIL: " << error.what() << '\n';
     return 1;
