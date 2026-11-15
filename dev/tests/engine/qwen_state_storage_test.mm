@@ -20,6 +20,7 @@
 #include <iostream>
 #include <limits>
 #include <cstring>
+#include <deque>
 #include <memory>
 #include <optional>
 #include <stdexcept>
@@ -93,32 +94,52 @@ uint64_t releaseAllIdle(model::QwenStateStorage &storage, bool keepLane) {
 }
 
 // Fills a lane's cell: arbitrary bytes, but for its recurrent layers, which
-// hold finite values in [-1, 1) for a cached state to code.
+// hold finite values in [-1, 1), in the layout's format, for a cached state to
+// code.
 void fillState(const model::GdnParityBuffers &cell, const model::GdnStateLayout &layout, uint64_t seed) {
   fill(cell.stateBase, seed);
   uint64_t x = seed * 2 + 1;
   const uint64_t values = uint64_t{layout.recurrentGroups} * layout.recurrentRows * layout.recurrentColumns;
   for (const metal::MetalBuffer &layer : cell.recurrentLayers) {
-    auto *state = static_cast<float *>(layer.contents());
     for (uint64_t i = 0; i < values; ++i) {
       x ^= x << 13; x ^= x >> 7; x ^= x << 17;
-      state[i] = static_cast<float>(x % 2'000'001) / 1e6F - 1.0F;
+      const float value = static_cast<float>(x % 2'000'001) / 1e6F - 1.0F;
+      if (layout.format == ops::GdnStateFormat::BFloat16)
+        static_cast<uint16_t *>(layer.contents())[i] = test::codecBf16(value);
+      else
+        static_cast<float *>(layer.contents())[i] = value;
     }
   }
 }
 
+// A recurrent layer's `count` values at `at`, widened where the layout runs
+// them in bf16.
+std::vector<float> recurrentValues(const uint8_t *at, uint64_t count, const model::GdnStateLayout &layout) {
+  std::vector<float> values(count);
+  for (uint64_t i = 0; i < count; ++i)
+    values[i] = layout.format == ops::GdnStateFormat::BFloat16
+                    ? test::codecWiden(reinterpret_cast<const uint16_t *>(at)[i])
+                    : reinterpret_cast<const float *>(at)[i];
+  return values;
+}
+
 // The values of a lane's recurrent layers, decoded from the codes a cached
-// state stores of them (ops::StateCodec).
+// state stores of them (ops::StateCodec), in the layout's format.
 void decodeRecurrent(std::vector<uint8_t> &cell, const model::GdnStateLayout &layout) {
   const uint32_t rows = layout.recurrentGroups * layout.recurrentRows, columns = layout.recurrentColumns;
   for (uint32_t layer = 0; layer < layout.layers; ++layer) {
-    auto *values = reinterpret_cast<float *>(cell.data() + layout.convolutionBytes() +
-                                             uint64_t{layer} * layout.recurrentLayerBytes());
-    const std::vector<uint8_t> codes = test::stateCodesReference(values, rows, columns);
+    uint8_t *at = cell.data() + layout.convolutionBytes() + uint64_t{layer} * layout.recurrentLayerBytes();
+    const std::vector<float> values = recurrentValues(at, uint64_t{rows} * columns, layout);
+    const std::vector<uint8_t> codes = test::stateCodesReference(values.data(), rows, columns);
     const auto *scales = reinterpret_cast<const uint16_t *>(codes.data() + state_codec_scales_offset(rows, columns));
-    for (uint64_t i = 0; i < uint64_t{rows} * columns; ++i)
-      values[i] = static_cast<float>(static_cast<int8_t>(codes[i])) *
-                  test::codecWiden(scales[i / SPLASH_STATE_CODEC_BLOCK]);
+    for (uint64_t i = 0; i < values.size(); ++i) {
+      const float decoded = static_cast<float>(static_cast<int8_t>(codes[i])) *
+                            test::codecWiden(scales[i / SPLASH_STATE_CODEC_BLOCK]);
+      if (layout.format == ops::GdnStateFormat::BFloat16)
+        reinterpret_cast<uint16_t *>(at)[i] = test::codecBf16(decoded);
+      else
+        reinterpret_cast<float *>(at)[i] = decoded;
+    }
   }
 }
 
@@ -140,9 +161,10 @@ std::vector<uint8_t> cachedImage(const model::QwenStateStorage &storage, uint32_
   std::copy_n(cell.begin(), layout.convolutionBytes(), image.begin());
   const uint32_t rows = layout.recurrentGroups * layout.recurrentRows;
   for (uint32_t layer = 0; layer < layout.layers; ++layer) {
-    const auto *values = reinterpret_cast<const float *>(cell.data() + layout.convolutionBytes() +
-                                                         uint64_t{layer} * layout.recurrentLayerBytes());
-    const std::vector<uint8_t> codes = test::stateCodesReference(values, rows, layout.recurrentColumns);
+    const std::vector<float> values =
+        recurrentValues(cell.data() + layout.convolutionBytes() + uint64_t{layer} * layout.recurrentLayerBytes(),
+                        uint64_t{rows} * layout.recurrentColumns, layout);
+    const std::vector<uint8_t> codes = test::stateCodesReference(values.data(), rows, layout.recurrentColumns);
     std::copy(codes.begin(), codes.end(),
               image.begin() + layout.convolutionBytes() + uint64_t{layer} * layout.cachedRecurrentLayerBytes());
   }
@@ -872,6 +894,113 @@ void testStartBytes(metal::MetalBackend &backend) {
   }
 }
 
+// Captures, demotions, direct writes, RAM and SSD restores, promotions and
+// drops interleaved on four lanes. Every restore reproduces the codes of the
+// state it came from; at every step the storage tracks the lanes', the
+// resident states' and the idle pool's bytes and nothing else; idleBytes()
+// predicts what dropping the states leaves idle, releasing the pool frees
+// exactly that, and every buffer returns once lanes and states are gone. Over
+// a running state in fp32 and in bf16, and a cell whose auxiliary state no
+// page divides.
+void testAccountingAcrossCapturesAndRestores(metal::MetalBackend &backend) {
+  constexpr model::GdnStateLayout kBf16State{48, 3, 10'240, 48, 128, 128, ops::GdnStateFormat::BFloat16};
+  constexpr model::GdnStateLayout kAuxiliaryState{36, 3, 8192, 32, 128, 128, ops::GdnStateFormat::Float32,
+                                                  2'100'003};
+  for (const model::GdnStateLayout &target : {kTargetState, kBf16State, kAuxiliaryState}) {
+    const model::CompositeStateLayout layout{target, kDraftState};
+    const uint64_t slot = model::SlotFile::slotBytesFor(layout.cachedBytes());
+    MemoryGovernor governor(backend, backend.capabilities().recommendedMaxWorkingSetBytes, 1, 1, queryHostMemory, 0);
+    const test::ClaimScope start(governor, ClaimClass::Floor);
+    const uint64_t backendBefore = backend.memoryStats().allocatedBytes;
+    {
+      model::QwenStateStorage storage(
+          backend, governor.allocationAdmission(), layout,
+          std::make_shared<model::SlotFile>(slot, std::make_shared<model::DiskBudget>(12 * slot)));
+      for (uint32_t lane = 0; lane < 4; ++lane)
+        require(static_cast<bool>(storage.tryActivateLane(lane, 100 + lane)), "a lane's activation failed");
+      const uint64_t lanes = storage.actualAllocatedBytes();
+      require(lanes == 4 * layout.laneBytes(), "four lanes did not take four lanes' bytes");
+      struct Kept {
+        std::shared_ptr<const CompositeState> state;
+        std::vector<std::vector<uint8_t>> image; // what restoring it reproduces
+      };
+      std::deque<Kept> ram, disk;
+      uint32_t direct = 0, demotions = 0, ramRestores = 0, diskRestores = 0, promotions = 0;
+      // 36 steps take every path and fill both lists past their bounds.
+      for (uint64_t step = 0; step < 36; ++step) {
+        const uint32_t lane = static_cast<uint32_t>(step % 4);
+        fillState(storage.current(lane), target, step + 1);
+        fill(storage.window(lane), step + 1000);
+        storage.updateLengths(lane, published(4096 + 64 * step));
+        const std::vector<std::vector<uint8_t>> image = restoredImage(storage, lane);
+        if (step % 7 == 6) {
+          // Straight from the lane to the SSD.
+          auto write = storage.snapshotToDisk(lane, {});
+          require(write && finishWhenReady(*write), "a direct disk write failed");
+          disk.push_back({write->state(), image});
+          ++direct;
+        } else if (auto state = storage.snapshot(lane)) {
+          ram.push_back({state, image});
+        }
+        if (step % 3 == 2 && !ram.empty() && ram.front().state->canOffload(false)) {
+          auto write = ram.front().state->offload({});
+          require(write && finishWhenReady(*write), "a demotion failed");
+          disk.push_back({write->state(), ram.front().image});
+          ram.pop_front();
+          ++demotions;
+        }
+        if (step % 4 == 3 && !ram.empty()) {
+          const uint32_t into = (lane + 1) % 4;
+          const Kept &kept = ram[step % ram.size()];
+          require(!storage.beginRestore(into, *kept.state, true, {}, [] {}), "a RAM restore returned a read");
+          require(stateImage(storage, into) == kept.image, "a RAM restore did not reproduce its state's codes");
+          ++ramRestores;
+        }
+        if (step % 5 == 4 && !disk.empty()) {
+          const uint32_t into = (lane + 2) % 4;
+          const Kept kept = disk[step % disk.size()];
+          auto read = storage.beginRestore(into, *kept.state, step % 2 == 0, {}, [] {});
+          require(read && finishWhenReady(*read), "an SSD restore failed");
+          require(stateImage(storage, into) == kept.image, "an SSD restore did not reproduce its state's codes");
+          ++diskRestores;
+          if (auto promoted = read->snapshot()) {
+            const uint32_t other = (into + 1) % 4;
+            require(!storage.beginRestore(other, *promoted, true, {}, [] {}), "a promoted restore returned a read");
+            require(stateImage(storage, other) == kept.image, "a promoted copy did not restore the disk copy's codes");
+            ram.push_back({promoted, kept.image});
+            ++promotions;
+          }
+        }
+        while (ram.size() > 6)
+          ram.pop_front();
+        while (disk.size() > 8)
+          disk.pop_front();
+        uint64_t resident = 0;
+        for (const Kept &kept : ram)
+          resident += kept.state->residentBytes();
+        require(storage.actualAllocatedBytes() == lanes + resident + storage.idleBytes(0, false, false),
+                "step " + std::to_string(step) + ": the storage tracked bytes beside the lanes, states and pool");
+      }
+      require(direct && demotions && ramRestores && diskRestores && promotions,
+              "the sequence left a capture or restore path untried");
+      const uint64_t predicted = storage.idleBytes(static_cast<uint32_t>(ram.size()), false, false);
+      ram.clear();
+      disk.clear();
+      require(storage.idleBytes(0, false, false) == predicted,
+              "idleBytes() did not predict what dropping the states left idle");
+      require(releaseAllIdle(storage, false) == predicted && storage.actualAllocatedBytes() == lanes,
+              "releasing the pool did not free what idleBytes() predicted");
+      for (uint32_t lane = 0; lane < 4; ++lane)
+        storage.releaseLane(lane, 100 + lane);
+      require(releaseAllIdle(storage, false) == lanes && storage.actualAllocatedBytes() == 0 &&
+                  storage.idleCells() == 0 && storage.idleCachedCells() == 0 && storage.idleRings() == 0 &&
+                  storage.idleWindows() == 0,
+              "the lanes' buffers did not all return");
+    }
+    require(backend.memoryStats().allocatedBytes == backendBefore, "the storage left Metal allocations behind");
+  }
+}
+
 void run(const std::string &metallib) {
   using model::QwenCompositeState;
   using model::QwenLogicalLengths;
@@ -888,6 +1017,7 @@ void run(const std::string &metallib) {
   testPersistKeepsTheRamCopy(backend);
   testReservations(backend);
   testAttentionOnlyTarget(backend);
+  testAccountingAcrossCapturesAndRestores(backend);
   testStartBytes(backend);
   MemoryGovernor governor(
       backend, backend.capabilities().recommendedMaxWorkingSetBytes, 1, 1,
