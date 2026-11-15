@@ -742,8 +742,10 @@ that conversation leaves memory at once instead of waiting for its writes.
 Without memory pressure the cache writes nothing ahead, so a Mac whose memory
 never runs short spends no SSD writes on it. Nothing else is copied ahead: not
 the KV a reply adds past the point, which no state resumes from, a shorter
-prompt, which is quicker to compute again, or a progress checkpoint. These
-copies take only the room the cache has free beside its other copies and the
+prompt, which is quicker to compute again, or a progress checkpoint, the state
+where a response's generation ended among them
+([API](api.md#output-limits-and-streaming)). These copies take only the room
+the cache has free beside its other copies and the
 room spilling requests hold for their KV: they give up no copy, a point that
 room cannot hold is not copied, and a full cache gives up the copies of what
 memory still holds first. They wait while the cache reads a prompt back, writes

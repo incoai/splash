@@ -367,6 +367,35 @@ rest of the uncached input, and the prefix cache keeps a prompt as prefill
 computes it, at no cost of its own. So uncached input is `input_tokens` less
 `cached_tokens`, as in Messages, which reports no `cache_creation_input_tokens`.
 
+Every API keeps a response's state where its generation ended: at the last
+32-token page boundary, counted from the start of the prompt, that the prompt
+and its generated tokens reach, beside the state before its generation prompt.
+A next request whose prompt renders that reply back token for token resumes
+there and prefills only what follows that boundary: a Chat client that sends the
+assistant message back as it came, a Responses client that continues with
+`previous_response_id` or sends the output items back, a Messages client that
+sends the assistant turn back. The template decides what it renders: Qwen3.8's
+renders an earlier turn's reasoning by default, Qwen3.6's only after the last
+user message (an agent's tool loop) or with `preserve_thinking`, so a reply
+that reasoned resumes there only when its reasoning is sent back and rendered.
+A next prompt that renders the reply otherwise, as one that leaves out its
+reasoning or a text the model generated as tokens the text does not encode to
+(`Any` `where` for `Anywhere`), resumes from the state before the generation
+prompt. A response cancelled, failed or ended by a `stop` sequence keeps the
+state at the last boundary its generation crossed, which a next prompt that
+renders back the text up to it resumes from. Qwen3.8-Flash-Next keeps no such
+state ([internals](internals.md#replay-points-and-checkpoints)).
+
+Such a state is opportunistic: memory that runs short drops it first, and the
+SSD cache never writes it, so a client that never sends a reply back as it came
+costs the cache nothing. A request whose prompt renders an earlier reply back,
+as far as a page that reply's state was kept at, whether memory still holds that
+state or not, shows that its conversation renders replies back: its own reply's
+state is kept when the reply holds at least 2048 tokens past its prompt's state
+(fewer prefill again faster than their state writes), and memory that runs short
+writes it to the SSD cache as any checkpoint, so the next turn resumes after the
+reply under memory pressure too, and so is the state of each later such turn.
+
 Chat and text completions include a llama-server-style `timings` object, both in
 non-streaming responses and in the final finish-reason chunk of a stream,
 even without `include_usage`. Messages and Responses include the same object

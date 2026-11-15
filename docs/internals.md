@@ -1618,8 +1618,9 @@ take is skipped, not a stop:
 
 1. Idle state buffers beyond those the next lane starts from, and those
    too under macOS's critical pressure.
-2. Cached units that free memory now (copied, dead or needing no write), in
-   the cache's one order (`Cache::walkFor`).
+2. Cached units that free memory now (copied, dead or needing no write, a
+   reply's opportunistic state among them), in the cache's one order
+   (`Cache::walkFor`).
 3. Caches the model rebuilds on use: the vision encoder's scratch, images'
    encoded rows, idle history staging, and the hot block cache while no lane
    reads above its floor.
@@ -1687,8 +1688,9 @@ The resume point is the newest ordinary state in RAM (`StateCache::resumePoint`)
 the one a conversation's next turn most likely resumes from. A claim of no
 certain reuse passes over it; one with it takes it in its recency order, and
 so does the host's pass under critical pressure. Every state a reclaim takes
-from RAM is written to the SSD cache first while the tier takes the write, so
-a resume point that goes keeps its SSD copy: its next turn starts with a
+from RAM, but a reply's opportunistic state (below), is written to the SSD cache
+first while the tier takes the write, so a resume point that goes keeps its SSD
+copy: its next turn starts with a
 restore read rather than a prefill.
 
 The engine's own optional work (the Index runway's refill with no Spill lane in
@@ -1933,7 +1935,8 @@ units that free now past an uncopied one before it waits for that unit's
 write, which stays at the head for copies ahead of need to make.
 
 Reclaim writes every state it evicts to the SSD cache, checkpoints and points
-a conversation went on from too, and the SSD cache keeps them by its own LRU.
+a conversation went on from too, but a reply's opportunistic state, which it
+drops, and the SSD cache keeps them by its own LRU.
 A state's write copies it into the one staging buffer, so while no other write
 holds that buffer its RAM frees at once, and with it the blocks of its chain
 that already have a copy; a claim that cannot wait takes it too. What frees
@@ -2067,7 +2070,10 @@ growth into free room.
 
 A request keeps its reusable model state at the last whole 32-token page before
 its generation prompt, the text a chat template appends to open the reply: the
-next turn may render it differently, so a follow-up resumes from there.
+next turn may render it differently, so a follow-up resumes from there. When it
+ends, it also keeps one at the last whole page of the tokens its reply holds KV
+of (below), where a follow-up whose prompt renders the reply back token for
+token resumes instead.
 
 Until the request ends, suspended or not, that replay point is in use, and so is
 the KV it restores through. When the last request using it ends, the point
@@ -2146,17 +2152,66 @@ codes over groups of 64 values with each group's fp16 scale and minimum
 the rings take 40 and 48 MiB). Prefill keeps a lane's window beside its rings;
 a restore that continues the rings computes them from the window again at the
 start of the request's first prefill chunk (`DFlashDraft::addContextRebuild`).
-Decode writes the rings alone, so states are published only in prefill. A
-prefill chunk writes each state it captures inside its rows
+A prefill chunk writes each state it captures inside its rows
 (`ModelBatchItem::stateCaptures`) into buffers reserved before it runs: every
 GDN layer's dispatches stop there to store the state and go on from it, and
 the state's window is a copy of the lane's as the chunk finds it plus the
 chunk's rows before the boundary, since the chunk's later rows take the slots
 of the state's oldest rows in the lane's window. A state at the chunk's end is
-copied from the lane after it. A target without GDN layers keeps no GDN state:
-its cells have no bytes, every lane and state shares one empty cell that holds
-no memory, so a lane holds the draft's rings and window and a cached state the
-window alone, and `state.idle_gdn_cells` stays 0.
+copied from the lane after it.
+
+Decode keeps each lane's window current with its rings too, and a cycle whose
+retained rows may reach the next whole page reserves that page's state, in one
+attempt that frees nothing for it (`Engine::reserveReplyCapture`); refused, the
+cycle captures none. A decode step leaves the rows it retains on the lane's tape
+for the lane's next step to fold into the GDN state, so the cycle folds the rows
+before the page alone into the state's cell (`ops::GDN::addFold`, the next
+step's arithmetic, which it matches bit for bit), and the state's window is a
+copy of the lane's plus those rows' context; the completion seals the state only
+where the lane retained those rows. Both writes are one function of the runtime
+(`encodeDecodeCaptures`), which names the rows a lane retained: the first of its
+verify rows, as many as its acceptance counted. Each such state is a rolling
+checkpoint of the reply that retires the one before it, which a preempted lane
+resumes from once its KV holds a token past it, and the last, once the request
+ends, is the reply's state: the point a next request whose prompt renders the
+reply back token for token resumes from, that of a reply cancelled or ended by a
+stop sequence too, as far as the prompt renders it back. The prompt's replay
+point stays the point its conversation resumes from, the one reclaim keeps as
+the resume point and the SSD cache copies ahead, which a retry or a next prompt
+that renders the reply otherwise resumes from.
+
+A reply's state is opportunistic (`StateCache::markReply`): reclaim takes it
+among the units that free for nothing, a checkpoint first in the cache's order,
+and never writes it to the SSD, as only a next prompt that renders the reply
+back resumes there, and a running reply's is replaced a page on. A chat client
+that sends no reasoning back never renders a reasoning reply back: kept as
+ordinary states, the replies of 11 such chats served in turn at a 22 GB limit
+left their follow-ups 1 cached prefix of 22, where 1.6.2 left 18. Each block
+such a state was captured at keeps a mark (`KvCache::noteReply`) while the KV
+cache holds it, the state gone or not, and a request whose start's match
+reaches a marked block renders an earlier reply back (`CacheLookup::rendersReply`),
+as agent clients that send their reasoning back do: its end keeps its own
+reply's last state (`StateCache::keepReply`), a checkpoint reclaim writes as
+any, so its next turn resumes there after a reclaim too, from the SSD; each
+later turn that renders the one before back keeps its own, and one that does
+not leaves its reply's opportunistic again. Only a reply that holds at least
+`WriteBehind::kMinimumTokens` past its prompt's replay point is kept, as a
+shorter one recomputes faster than its state writes: kept, the 384-token
+replies of 12 agent conversations at a 27 GB limit wrote 24% more to the SSD
+to save 2.4% of their prefill. A suspended lane's checkpoints
+stay opportunistic: once they went, the lane replays its reply from its prompt's
+replay point, as one that captured none. A decoding lane's latest state retires
+only once the next is published, beside which its cycle holds that next state's
+reservation, so the pool's idle cells keep one more for each lane that captured
+than for one that captured none once the lanes end (`state.idle_gdn_cells`: 11
+after four lanes' 300-token replies, where 1.6.2 leaves 8), which a claim takes
+first (step 1 above). A target whose state commit writes
+auxiliary state after its retained rows (Qwen3.8-Flash-Next) captures none in
+decode (`Model::capturesInDecode`), and its decode writes the rings alone. A
+target without GDN layers keeps no GDN state: its cells have no bytes, every
+lane and state shares one empty cell that holds no memory, so a lane holds the
+draft's rings and window and a cached state the window alone, and
+`state.idle_gdn_cells` stays 0.
 
 ### Prefill and decode scheduling
 
