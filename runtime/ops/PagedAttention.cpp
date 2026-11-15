@@ -235,7 +235,7 @@ kv::AttentionParams everyRow(std::span<const kv::ChunkedPrefillParams> sequences
   kv::AttentionParams params{.sequences = static_cast<uint32_t>(sequences.size()),
                              .rows = rows.rows,
                              .tiles = 0,
-                             .padding = 0,
+                             .trees = 0,
                              .kv = layer,
                              .sequence = {}};
   for (size_t s = 0; s < sequences.size(); ++s) {
@@ -475,7 +475,8 @@ void PagedAttention::addAttention(metal::CommandGraph &graph, const AttentionPla
                                   const AttentionStaging &staging, const metal::MetalBuffer &partials,
                                   const metal::MetalBuffer &statistics,
                                   std::span<const kv::ChunkedPrefillParams> sequences,
-                                  std::span<const AttentionHistory> histories, metal::MetalBuffer sinks) {
+                                  std::span<const AttentionHistory> histories, metal::MetalBuffer sinks,
+                                  metal::MetalBuffer tree) {
   const CommandRows rows = commandRows(sequences, plan.layout);
   const std::span<const AttentionPlan::Sequence> planned = plan.sequences();
   if (planned.size() != sequences.size() || histories.size() != sequences.size())
@@ -485,7 +486,12 @@ void PagedAttention::addAttention(metal::CommandGraph &graph, const AttentionPla
       throw std::invalid_argument("attention sequences do not match the plan");
     requirePageTable(histories[s].pageTable, sequences[s]);
     requireBlocks(histories[s].blocks, plan.sparse, kv::attentionTiles(planned[s].rows));
+    // A tree's rows are a block's from its anchor, a bit of a row's
+    // ancestors each.
+    if (tree && (planned[s].firstTile || planned[s].rows > 32))
+      throw std::invalid_argument("attention tree rows take whole blocks of at most 32 rows");
   }
+  if (tree) requireBytes(tree, uint64_t{rows.rows} * sizeof(SplashTreeRow), "attention tree rows");
   // The tiles read the queries and write the attention rows in whole tiles
   // of rows, which each sequence's stride holds.
   const uint32_t group = plan.queryHeads / plan.layout.kvHeads;
@@ -506,7 +512,7 @@ void PagedAttention::addAttention(metal::CommandGraph &graph, const AttentionPla
     kv::AttentionParams params{.sequences = dispatch.sequences,
                                .rows = 0,
                                .tiles = dispatch.tiles,
-                               .padding = 0,
+                               .trees = tree ? 1U : 0U,
                                .kv = layer,
                                .sequence = {}};
     std::array<metal::MetalBuffer, kMaximumSequences> tables;
@@ -543,6 +549,9 @@ void PagedAttention::addAttention(metal::CommandGraph &graph, const AttentionPla
     const auto bound = laneBindings(std::span(tables).first(dispatch.sequences));
     std::vector<metal::MetalBuffer> split{staging.queries, partials, statistics};
     split.insert(split.end(), bound.begin(), bound.end());
+    // Without tree rows a split binds another buffer of the dispatch for
+    // them, of which it reads nothing.
+    split.push_back(tree ? tree : partials);
     std::vector<metal::MetalBuffer> reduce{partials, statistics, staging.rows};
     if (plan.sparse) {
       // Without lists a sparse kernel binds another buffer of the dispatch

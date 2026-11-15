@@ -116,7 +116,8 @@ inline SplashSparseList splash_sparse_list(device const uint *lists, device cons
 // dispatch's splits: an M5 Max spread this one-dimensional order better than
 // a two-dimensional one (x the KV head, y the split), which ran up to 1.7x
 // slower on most grids of more than 32 splits. The located split reads each
-// entry's block where the list's locations name.
+// entry's block where the list's locations name. Every split binds the
+// step's tree rows after the page tables, as the dense split does.
 #define SPARSE_SPLIT_BODY(Heads, Group, HeadDim, CacheElement, Located,       \
                           Locations, LocationPages, Places)                    \
     constexpr uint Rows = SPLASH_ATTENTION_TILE_ROWS;                          \
@@ -142,7 +143,9 @@ inline SplashSparseList splash_sparse_list(device const uint *lists, device cons
         params.kv, kv_head, tile.first_position, tile.active_rows,             \
         list.entries, list.count, list.locations, LocationPages, Places,       \
         tile.splits, split, partials, statistics, tile.first_slot + split,     \
-        scratch, thread_index);
+        scratch, splash_attention_tree(params, sequence, tree,                 \
+                                       tile.first_position),                   \
+        thread_index);
 
 #define SPARSE_SPLIT(Name, Heads, Group, HeadDim, CacheElement)                \
   kernel void Name(                                                            \
@@ -153,9 +156,10 @@ inline SplashSparseList splash_sparse_list(device const uint *lists, device cons
       device const SplashKvPage *page_table1 [[buffer(4)]],                    \
       device const SplashKvPage *page_table2 [[buffer(5)]],                    \
       device const SplashKvPage *page_table3 [[buffer(6)]],                    \
-      device const uint *lists [[buffer(7)]],                                  \
-      device const uint *counts [[buffer(8)]],                                 \
-      constant SplashAttentionParams &params [[buffer(9)]],                    \
+      device const SplashTreeRow *tree [[buffer(7)]],                          \
+      device const uint *lists [[buffer(8)]],                                  \
+      device const uint *counts [[buffer(9)]],                                 \
+      constant SplashAttentionParams &params [[buffer(10)]],                   \
       uint3 group [[threadgroup_position_in_grid]],                            \
       uint thread_index [[thread_index_in_threadgroup]]) {                     \
     SPARSE_SPLIT_BODY(Heads, Group, HeadDim, CacheElement, false, nullptr,     \
@@ -173,11 +177,12 @@ inline SplashSparseList splash_sparse_list(device const uint *lists, device cons
       device const SplashKvPage *page_table1 [[buffer(4)]],                    \
       device const SplashKvPage *page_table2 [[buffer(5)]],                    \
       device const SplashKvPage *page_table3 [[buffer(6)]],                    \
-      device const uint *lists [[buffer(7)]],                                  \
-      device const uint *counts [[buffer(8)]],                                 \
-      device const uint *locations [[buffer(9)]],                              \
-      device const SplashKvPage *location_pages [[buffer(10)]],                \
-      constant SplashAttentionParams &params [[buffer(11)]],                   \
+      device const SplashTreeRow *tree [[buffer(7)]],                          \
+      device const uint *lists [[buffer(8)]],                                  \
+      device const uint *counts [[buffer(9)]],                                 \
+      device const uint *locations [[buffer(10)]],                             \
+      device const SplashKvPage *location_pages [[buffer(11)]],                \
+      constant SplashAttentionParams &params [[buffer(12)]],                   \
       uint3 group [[threadgroup_position_in_grid]],                            \
       uint thread_index [[thread_index_in_threadgroup]]) {                     \
     threadgroup uint places[SplashSparseStep<CacheElement>::Blocks];           \

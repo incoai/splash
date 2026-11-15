@@ -275,7 +275,7 @@ void fillCurrent(Case &data, uint32_t variant = 0, uint32_t queryOffset = 0) {
 // tiles taking `splits` history splits each.
 SplashAttentionParams sequenceParams(const Case &data, uint32_t splits = 0) {
   SplashAttentionParams params{.sequences = 1, .rows = data.params.chunk_tokens,
-                               .tiles = attentionTiles(data.params.chunk_tokens), .padding = 0, .kv = data.layer,
+                               .tiles = attentionTiles(data.params.chunk_tokens), .trees = 0, .kv = data.layer,
                                .sequence = {}};
   params.sequence[0] = {.committed_tokens = data.params.committed_tokens,
                         .rows = data.params.chunk_tokens,
@@ -337,7 +337,9 @@ void encodeAttention(id<MTLComputeCommandEncoder> encoder,
   [encoder setBuffer:data.partials offset:0 atIndex:1];
   [encoder setBuffer:data.statistics offset:0 atIndex:2];
   setPageTables(encoder, data.pageTableBuffer, 3);
-  [encoder setBytes:&params length:sizeof(params) atIndex:7];
+  // Without tree rows the split binds another buffer in their place.
+  [encoder setBuffer:data.partials offset:0 atIndex:7];
+  [encoder setBytes:&params length:sizeof(params) atIndex:8];
   data.pool->use(encoder, MTLResourceUsageRead);
   [encoder dispatchThreadgroups:MTLSizeMake(split.x, split.y, split.z)
              threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
@@ -807,7 +809,7 @@ void testBatchedStore(id<MTLDevice> device, id<MTLCommandQueue> queue,
   const std::vector<uint32_t> ids =
       HostKvExtents::mixedPages(geometry, 2 * lanes, lanes);
 
-  SplashAttentionParams params{.sequences = lanes, .rows = lanes * rows, .tiles = lanes, .padding = 0,
+  SplashAttentionParams params{.sequences = lanes, .rows = lanes * rows, .tiles = lanes, .trees = 0,
                                .kv = pool.pages->layer(kLayer), .sequence = {}};
   std::array<std::array<uint32_t, 2>, lanes> tables{};
   std::array<id<MTLBuffer>, lanes> tableBuffers{};

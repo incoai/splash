@@ -430,9 +430,10 @@ ops::AttentionPlan planOf(const Case &data, const Staging &staging) {
 }
 
 // The encoding of a case's staged rows: the store, then the attention, as the
-// runtime encodes them.
+// runtime encodes them, a verify's over its tree rows where it has them.
 metal::CommandGraph encode(const Case &data, const Staging &staging, const ops::AttentionPlan &plan,
-                           const metal::MetalBuffer &partials, const metal::MetalBuffer &statistics) {
+                           const metal::MetalBuffer &partials, const metal::MetalBuffer &statistics,
+                           const metal::MetalBuffer &tree = {}) {
   metal::CommandGraph graph;
   const std::vector<kv::ChunkedPrefillParams> sequences = sequencesOf(data, staging);
   const ops::AttentionStaging staged{staging.queries, staging.keys, staging.values, staging.output};
@@ -440,7 +441,8 @@ metal::CommandGraph encode(const Case &data, const Staging &staging, const ops::
                                 data.layout);
   std::vector<ops::AttentionHistory> histories;
   for (uint32_t lane = 0; lane < data.lanes; ++lane) histories.push_back({data.layer, data.tables[lane]});
-  ops::PagedAttention::addAttention(graph, plan, staged, partials, statistics, sequences, histories, data.sinks);
+  ops::PagedAttention::addAttention(graph, plan, staged, partials, statistics, sequences, histories, data.sinks,
+                                    tree);
   return graph;
 }
 
@@ -468,10 +470,11 @@ void checkPlan(const Case &data, const Staging &staging, const ops::AttentionPla
             "a lane's splits are not its rows' and window's");
 }
 
-void run(metal::MetalBackend &backend, const Case &data, const Staging &staging, const ops::AttentionPlan &plan) {
+void run(metal::MetalBackend &backend, const Case &data, const Staging &staging, const ops::AttentionPlan &plan,
+         const metal::MetalBuffer &tree = {}) {
   const metal::MetalBuffer partials = poisoned(backend, plan.workspace().partialsBytes);
   const metal::MetalBuffer statistics = poisoned(backend, plan.workspace().statisticsBytes);
-  const metal::CommandGraph graph = encode(data, staging, plan, partials, statistics);
+  const metal::CommandGraph graph = encode(data, staging, plan, partials, statistics, tree);
   checkPlan(data, staging, plan, graph);
   static_cast<void>(backend.submitCommandAsync(graph.dispatches()).wait());
 }
@@ -528,6 +531,140 @@ void checkVerify(metal::MetalBackend &backend, kv::Format format, bool int8Queri
             << largest << " of its bound PASS\n";
 }
 
+// A verify block's rows as a tree (metal/abi/VerifyTree.h): each row's
+// parent before it, the anchor's none.
+struct Tree final {
+  std::vector<uint32_t> parent;
+
+  [[nodiscard]] std::vector<uint32_t> path(uint32_t row) const {
+    std::vector<uint32_t> rows{row};
+    while (rows.front()) rows.insert(rows.begin(), parent[rows.front()]);
+    return rows;
+  }
+  [[nodiscard]] SplashTreeRow place(uint32_t row) const {
+    uint32_t ancestors = 0;
+    for (const uint32_t on : path(row)) ancestors |= 1U << on;
+    return {ancestors, static_cast<uint16_t>(row ? parent[row] : SPLASH_TREE_ROOT),
+            static_cast<uint16_t>(path(row).size() - 1)};
+  }
+};
+
+// The fp64 attention of tree row `row` of a lane's block after its history,
+// as reference() computes a chain's: its position is the anchor's plus its
+// depth, it attends that position's window of the history and, of the
+// block, its path's rows, whose K/V the store left at the slots of their
+// rows.
+Reference treeReference(const Case &data, const StoredKv &kv, uint32_t lane, const Tree &tree, uint32_t row,
+                        uint32_t head) {
+  const uint32_t history = data.histories[lane], kvHead = head / kGroup;
+  const std::vector<uint32_t> path = tree.path(row);
+  std::vector<uint32_t> tokens;
+  for (uint32_t token = windowStart(data.variant, history + uint32_t(path.size()) - 1); token < history; ++token)
+    tokens.push_back(token);
+  for (const uint32_t on : path) tokens.push_back(history + on);
+  const double sink = contents<float>(data.sinks)[head];
+  std::array<double, kHeadDimension> queries{};
+  for (uint32_t dimension = 0; dimension < kHeadDimension; ++dimension)
+    queries[dimension] = query(lane, head, row, dimension);
+  if (data.int8Queries) {
+    float largest = 0;
+    for (const double value : queries) largest = std::max(largest, float(std::fabs(value)));
+    const test::Int8Block block = test::int8Block(largest);
+    for (double &value : queries) value = double(test::int8Code(float(value), block)) * block.scale;
+  }
+  std::vector<double> scores(tokens.size());
+  double maximum = sink;
+  for (size_t i = 0; i < tokens.size(); ++i) {
+    const double *keys = &kv.keys[kv.index(kvHead, tokens[i], 0)];
+    double score = 0;
+    for (uint32_t dimension = 0; dimension < kHeadDimension; ++dimension) score += queries[dimension] * keys[dimension];
+    scores[i] = score / std::sqrt(double(kHeadDimension));
+    maximum = std::max(maximum, scores[i]);
+  }
+  double denominator = std::exp(sink - maximum);
+  for (double &score : scores) {
+    score = std::exp(score - maximum);
+    denominator += score;
+  }
+  Reference result;
+  for (size_t i = 0; i < tokens.size(); ++i) {
+    const double weight = scores[i] / denominator;
+    const double *values = &kv.values[kv.index(kvHead, tokens[i], 0)];
+    for (uint32_t dimension = 0; dimension < kHeadDimension; ++dimension) {
+      result.output[dimension] += weight * values[dimension];
+      result.mass[dimension] += weight * std::fabs(values[dimension]);
+    }
+  }
+  return result;
+}
+
+// A verify of lanes whose blocks of two tiles' rows are trees, each row
+// against treeReference: a chain, a lookup branch off the draft's third row
+// that runs through the second tile, two children a row, and a random tree,
+// so that rows of the second tile attend ancestors of the first, whose K/V
+// the store wrote before the attention. Without a window the chain's rows
+// are bit for bit those of the same block attended causally.
+void checkTreeVerify(metal::MetalBackend &backend, kv::Format format, bool int8Queries, ops::AttentionVariant variant,
+                     std::span<const uint32_t> histories) {
+  constexpr uint32_t kRows = SPLASH_TARGET_VERIFY_ROWS;
+  static_assert(kRows == 2 * kv::kAttentionTileRows, "a block of two tiles");
+  std::array<uint32_t, 4> lanes{};
+  std::copy(histories.begin(), histories.end(), lanes.begin());
+  const auto count = uint32_t(histories.size());
+  const Case data = makeCase(backend, format, int8Queries, variant, count, kRows, lanes);
+  std::array<Tree, 4> trees;
+  for (uint32_t row = 0; row < kRows; ++row) {
+    trees[0].parent.push_back(row ? row - 1 : 0);
+    trees[1].parent.push_back(row == 8 ? 2 : row ? row - 1 : 0);
+    trees[2].parent.push_back(row ? (row - 1) / 2 : 0);
+    const uint32_t back = std::min(row, 1 + uint32_t((unit(seedOf(4, 3, 0, row, 0)) + 1) * 2) % 4);
+    trees[3].parent.push_back(row ? row - back : 0);
+  }
+  const metal::MetalBuffer tree = zeroed(backend, uint64_t{count} * kRows * sizeof(SplashTreeRow));
+  for (uint32_t lane = 0; lane < count; ++lane)
+    for (uint32_t row = 0; row < kRows; ++row) contents<SplashTreeRow>(tree)[lane * kRows + row] = trees[lane].place(row);
+  const Staging staging = stage(backend, data, 0, kRows, kPageTokens);
+  const ops::AttentionPlan plan = planOf(data, staging);
+  run(backend, data, staging, plan, tree);
+  const std::string what = describe(data, "tree verify");
+  checkStore(data, staging, what);
+  double largest = 0;
+  for (uint32_t lane = 0; lane < count; ++lane) {
+    const uint32_t history = data.histories[lane];
+    const StoredKv kv = stored(data, lane, windowStart(data.variant, history), history + kRows);
+    for (uint32_t row = 0; row < kRows; ++row)
+      for (uint32_t head = 0; head < kQueryHeads; ++head) {
+        const Reference expected = treeReference(data, kv, lane, trees[lane], row, head);
+        for (uint32_t dimension = 0; dimension < kHeadDimension; ++dimension) {
+          const double actual =
+              bf16ToFloat(contents<uint16_t>(staging.output)[staging.queryIndex(lane, head, row, dimension)]);
+          const double bound = expected.mass[dimension] / 256 + ulpBf16(float(expected.output[dimension]));
+          const double error = std::fabs(actual - expected.output[dimension]);
+          if (!(std::isfinite(actual) && error <= bound))
+            throw std::runtime_error(what + ": lane " + std::to_string(lane) + " tree row " + std::to_string(row) +
+                                     " head " + std::to_string(head) + " dimension " + std::to_string(dimension) +
+                                     " is " + std::to_string(actual) + ", the reference " +
+                                     std::to_string(expected.output[dimension]) + " (bound " +
+                                     std::to_string(bound) + ")");
+          largest = std::max(largest, error / bound);
+        }
+      }
+  }
+  if (!variant.windowTokens) {
+    const std::vector<uint16_t> trees16(contents<uint16_t>(staging.output),
+                                        contents<uint16_t>(staging.output) + staging.output.sizeBytes() / 2);
+    run(backend, data, staging, plan);
+    for (uint32_t row = 0; row < kRows; ++row)
+      for (uint32_t head = 0; head < kQueryHeads; ++head)
+        for (uint32_t dimension = 0; dimension < kHeadDimension; ++dimension) {
+          const uint64_t at = staging.queryIndex(0, head, row, dimension);
+          require(trees16[at] == contents<uint16_t>(staging.output)[at],
+                  what + ": a chain's tree rows differ from its causal rows");
+        }
+  }
+  std::cout << what << ": largest error " << largest << " of its bound PASS\n";
+}
+
 // Split and reduce derive the same pages from the window for any split
 // count, so every count the partial workspace holds gives the reference,
 // the reduce combining exactly the splits that wrote: each lane of a decode
@@ -550,7 +687,7 @@ void checkSplitCounts(metal::MetalBackend &backend, kv::Format format, bool int8
       std::memset(statistics.contents(), 0xff, statistics.sizeBytes());
       std::memset(staging.output.contents(), 0xff, staging.output.sizeBytes());
       SplashAttentionParams params{.sequences = data.lanes, .rows = data.lanes * kLaneRows, .tiles = data.lanes,
-                                   .padding = 0, .kv = data.layer, .sequence = {}};
+                                   .trees = 0, .kv = data.layer, .sequence = {}};
       for (uint32_t lane = 0; lane < data.lanes; ++lane)
         params.sequence[lane] = {.committed_tokens = sequences[lane].committed_tokens,
                                  .rows = kLaneRows,
@@ -565,8 +702,10 @@ void checkSplitCounts(metal::MetalBackend &backend, kv::Format format, bool int8
                                  .block_stride = 0,
                                  .block_list = 0};
       metal::CommandGraph graph;
+      // Without tree rows the split binds another buffer in their place.
       graph.add(plan.splitPipeline(),
-                {staging.queries, partials, statistics, data.tables[0], data.tables[1], data.tables[2], data.tables[3]},
+                {staging.queries, partials, statistics, data.tables[0], data.tables[1], data.tables[2], data.tables[3],
+                 partials},
                 params, {kKvHeads, data.lanes, splits});
       graph.add(plan.reducePipeline(), {partials, statistics, staging.output, data.sinks}, params,
                 {kKvHeads, kLaneRows * kGroup, data.lanes}, {kHeadDimension, 1, 1});
@@ -925,6 +1064,11 @@ int main(int argc, char **argv) {
                {0}, {511, 512}, {513, 544, 1023}, {0, 505, 4097, 10000}, {31, 32, 4096, 7}})
         checkVerify(backend, format, int8Queries, kWindowed, histories);
       checkVerify(backend, format, int8Queries, kWhole, std::vector<uint32_t>{0, 31, 1000, 2047});
+      // Tree blocks of two tiles: before, at and past their windows.
+      for (const std::vector<uint32_t> &histories :
+           std::vector<std::vector<uint32_t>>{{0, 505, 4097, 10000}, {511, 512, 513, 544}})
+        checkTreeVerify(backend, format, int8Queries, kWindowed, histories);
+      checkTreeVerify(backend, format, int8Queries, kWhole, std::vector<uint32_t>{0, 31, 1000, 2047});
       checkSplitCounts(backend, format, int8Queries);
       checkWindowWithinHistory(backend, format, int8Queries);
     }

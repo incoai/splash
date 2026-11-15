@@ -4,7 +4,9 @@
 // The page loop (splash_paged_attention_tile) over the tiles of a dispatch's
 // sequences (SplashAttentionParams), each tile SPLASH_ATTENTION_TILE_ROWS
 // query rows of one KV head: a decode step's lanes and a prompt chunk's
-// sequences alike, every sequence in one dispatch.
+// sequences alike, every sequence in one dispatch. A decode step's split
+// binds its tree rows (SplashAttentionParams::trees); a prompt's binds
+// another buffer of the dispatch in their place, of which it reads nothing.
 
 // Split: KV heads (and each one's tile parts, splash_attention_tile_part)
 // vary first, then the dispatch's tiles, then history splits. A tile's
@@ -15,7 +17,8 @@ inline void splash_attention_split_phase(
     device bfloat *queries, device float *partials, device float *statistics,
     device const SplashKvPage *page_table0, device const SplashKvPage *page_table1,
     device const SplashKvPage *page_table2, device const SplashKvPage *page_table3,
-    constant SplashAttentionParams &params, threadgroup float *scores, threadgroup bfloat *probabilities,
+    device const SplashTreeRow *tree, constant SplashAttentionParams &params, threadgroup float *scores,
+    threadgroup bfloat *probabilities,
     threadgroup float *row_max, threadgroup float *row_sum, threadgroup float *previous_scale,
     threadgroup atomic_uint *rescale, uint3 group, uint thread_index) {
   constexpr uint Parts = SPLASH_ATTENTION_TILE_PARTS(QueryHeadsPerKVHead);
@@ -34,7 +37,8 @@ inline void splash_attention_split_phase(
                               CacheElement, Int8Queries>(
       queries + tile.offset, SPLASH_LANE_BINDING(s, page_table0, page_table1, page_table2, page_table3),
       params.kv, kv_head, tile.first_position, tile.active_rows, tile.splits, split, partials, statistics,
-      tile.first_slot + split, scores, probabilities, row_max, row_sum, previous_scale, rescale, thread_index);
+      tile.first_slot + split, scores, probabilities, row_max, row_sum, previous_scale, rescale,
+      splash_attention_tree(params, sequence, tree, tile.first_position), thread_index);
 }
 
 // Reduce: a threadgroup of HeadDim threads per fused row of a tile, group.z
@@ -56,8 +60,8 @@ inline void splash_attention_reduce_phase(
     return;
   splash_attention_reduce_row<QueryHeadsPerKVHead, SPLASH_ATTENTION_TILE_ROWS,
                               SPLASH_ATTENTION_TILE_PARTS(QueryHeadsPerKVHead), HeadDim, Window>(
-      partials, statistics, output, tile, sequence.split_count, fused_row,
-      thread_index, weights, group_values,
+      partials, statistics, output, tile, sequence.split_count, params.trees != 0, sequence.committed_tokens,
+      fused_row, thread_index, weights, group_values,
       splash_group_sinks<QueryHeadsPerKVHead>(group.x, sinks)...);
 }
 
@@ -70,7 +74,8 @@ inline void splash_attention_reduce_phase(
       device const SplashKvPage *page_table1 [[buffer(4)]],                                                   \
       device const SplashKvPage *page_table2 [[buffer(5)]],                                                   \
       device const SplashKvPage *page_table3 [[buffer(6)]],                                                   \
-      constant SplashAttentionParams &params [[buffer(7)]],                                                   \
+      device const SplashTreeRow *tree [[buffer(7)]],                                                         \
+      constant SplashAttentionParams &params [[buffer(8)]],                                                   \
       uint3 group [[threadgroup_position_in_grid]],                                                           \
       uint thread_index [[thread_index_in_threadgroup]]) {                                                    \
     constexpr uint M = Group * SPLASH_ATTENTION_TILE_ROWS / SPLASH_ATTENTION_TILE_PARTS(Group);               \
@@ -82,8 +87,8 @@ inline void splash_attention_reduce_phase(
     threadgroup float previous_scale[M];                                                                      \
     threadgroup atomic_uint rescale;                                                                          \
     splash_attention_split_phase<Heads, Group, HeadDim, Window, CacheElement, Int8Queries>(                   \
-        queries, partials, statistics, page_table0, page_table1, page_table2, page_table3, params, scores,    \
-        probabilities, row_max, row_sum, previous_scale, &rescale, group, thread_index);                      \
+        queries, partials, statistics, page_table0, page_table1, page_table2, page_table3, tree, params,     \
+        scores, probabilities, row_max, row_sum, previous_scale, &rescale, group, thread_index);              \
   }
 
 PAGED_ATTENTION_SPLIT(attention_q8_split, 4, 6, 256, 0, int8_t, false)

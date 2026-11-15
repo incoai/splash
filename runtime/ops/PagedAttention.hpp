@@ -3,6 +3,7 @@
 #include "metal/CommandGraph.hpp"
 #include "metal/abi/ExecutionGeometry.h"
 #include "metal/abi/PagedAttention.h"
+#include "metal/abi/VerifyTree.h"
 #include "ops/KernelCalibration.hpp"
 #include "ops/PagedKv.hpp"
 #include "ops/Linear.hpp"
@@ -280,11 +281,16 @@ public:
   // A dispatch whose sequences read their layer in two placements (`kv`)
   // runs as a dispatch per run of them that reads one.
   // `sinks` holds the layer's learned sinks, an F32 per query head, for a
-  // plan whose reduce adds them (its `sinks`).
+  // plan whose reduce adds them (its `sinks`). With `tree`, a decode step's
+  // tree rows (a SplashTreeRow per row of the command, metal/abi/
+  // VerifyTree.h), each sequence is a lane's block of at most 32 rows whose
+  // rows attend their paths (SplashAttentionParams::trees); without, every
+  // row attends causally.
   static void addAttention(metal::CommandGraph &graph, const AttentionPlan &plan, const AttentionStaging &staging,
                            const metal::MetalBuffer &partials, const metal::MetalBuffer &statistics,
                            std::span<const kv::ChunkedPrefillParams> sequences,
-                           std::span<const AttentionHistory> histories, metal::MetalBuffer sinks = {});
+                           std::span<const AttentionHistory> histories, metal::MetalBuffer sinks = {},
+                           metal::MetalBuffer tree = {});
   // The attention rows `rows` names as the out-projection's input rows: each
   // multiplied by the sigmoid of its query head's gate in its packed row, or
   // for an ungated geometry gathered as they are, reading no packed row.

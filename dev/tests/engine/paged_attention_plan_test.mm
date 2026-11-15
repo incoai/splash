@@ -1358,12 +1358,13 @@ void attentionBlocks(metal::MetalBackend &backend) {
       metal::CommandGraph graph, partly;
       attend(graph, {listBuffer, counts, listStride, first});
       attend(partly, {listBuffer, counts, listStride, first}, true);
-      // `after` buffers follow the lists and their counts.
+      // `after` buffers follow the lists and their counts, which follow the
+      // tree rows' place (another buffer without them).
       const auto bindsLists = [&](const metal::ComputeDispatch &split, const metal::ComputeDispatch &reduce,
                                   uint32_t after) {
-        return split.buffers.size() == 7 + 2 + after && split.buffers[7].buffer.sameView(boundLists) &&
-               split.buffers[8].buffer.sameView(boundCounts) && split.bytes.size() == 1 &&
-               split.bytes[0].index == 9 + after && reduce.buffers.size() == 4 &&
+        return split.buffers.size() == 8 + 2 + after && split.buffers[7].buffer.sameView(partials) &&
+               split.buffers[8].buffer.sameView(boundLists) && split.buffers[9].buffer.sameView(boundCounts) &&
+               split.bytes.size() == 1 && split.bytes[0].index == 10 + after && reduce.buffers.size() == 4 &&
                reduce.buffers[3].buffer.sameView(boundCounts) && reduce.bytes.size() == 1 &&
                reduce.bytes[0].index == 4;
       };
@@ -1387,8 +1388,8 @@ void attentionBlocks(metal::MetalBackend &backend) {
         metal::CommandGraph located;
         attend(located, {listBuffer, counts, listStride, first, locations, locationPages});
         const metal::ComputeDispatch &split = located.dispatches()[0];
-        require(bindsLists(split, located.dispatches()[1], 2) && split.buffers[9].buffer.sameView(locations) &&
-                    split.buffers[10].buffer.sameView(locationPages) && split.pipelineName == locatedSplitName(layout),
+        require(bindsLists(split, located.dispatches()[1], 2) && split.buffers[10].buffer.sameView(locations) &&
+                    split.buffers[11].buffer.sameView(locationPages) && split.pipelineName == locatedSplitName(layout),
                 "a located split does not bind its lists' locations and their pages before its parameters");
         rejects([&] { attend(refused, {listBuffer, counts, listStride, first, locations, {}}); },
                 "attention block locations need their pages", "block locations without pages were taken");

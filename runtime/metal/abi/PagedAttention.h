@@ -132,11 +132,18 @@ static_assert(sizeof(SplashAttentionSequence) == 48,
 // it in their extents, the same for every sequence of a dispatch, which the
 // GPU reads once for the whole dispatch: with a placement per sequence, the
 // prompt tiles of two KV heads ran up to 7% slower (M5 Max).
+// With `trees` nonzero each sequence is a decode lane's block of rows from
+// its anchor, at committed_tokens, a tree (metal/abi/VerifyTree.h) whose row
+// r's place is entry row_begin + r of the split's tree rows: its K/V sit at
+// the slot of its row, as a chain's, and its position is the anchor's plus
+// its depth, so it attends the history of that position's window and, of
+// the block's rows, its ancestors and itself; a tree's tiles read their
+// pages from the anchor's window. Without, rows attend causally.
 struct SplashAttentionParams {
   uint32_t sequences;
   uint32_t rows;
   uint32_t tiles;
-  uint32_t padding;
+  uint32_t trees;
   SplashKvLayer kv;
   SplashAttentionSequence sequence[SPLASH_MAXIMUM_BATCH_WIDTH];
 };

@@ -337,9 +337,9 @@ struct QwenTargetVerifyBuffers final {
   // Each lane's verify rows (ops::DraftSelector::addVerifyRows), which a MoE
   // target's steps route alone (ops::MoeBuffers::verifyRows).
   metal::MetalBuffer verifyRows;
-  // The step's rows' places in their lanes' trees (ops::TreeRow), and each
-  // lane's block of the step's rows as the device holds it (SplashLaneRows),
-  // which the GDN layers read.
+  // The step's rows' places in their lanes' trees (ops::TreeRow), which the
+  // GDN and attention layers read, and each lane's block of the step's rows
+  // as the device holds it (SplashLaneRows), which the GDN layers read.
   metal::MetalBuffer tree;
   metal::MetalBuffer laneRows;
   // Each lane's auxiliary state before the step; the commit writes the one

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "metal/abi/PagedAttention.h"
+#include "metal/abi/VerifyTree.h"
 #include "metal/kernels/common/attention_sequence.h"
 #include "metal/kernels/common/int8_activations.h"
 #include "metal/kernels/common/kv_extent.h"
@@ -90,6 +91,31 @@ inline SplashAttentionTile splash_attention_tile_part(SplashAttentionTile tile, 
           min(Rows, tile.active_rows - first), tile.splits, true};
 }
 
+// A tile of a decode lane's block as a tree (SplashAttentionParams::trees):
+// the place in its tree of the tile's first row, and the slot of the block's
+// anchor, from which the block's rows' K/V sit at the slots of their rows.
+// A prompt's tile has none (null rows) and attends causally.
+struct SplashAttentionTree {
+  device const SplashTreeRow *rows;
+  uint anchor;
+};
+
+// The tree of a sequence's tile whose first row is at `first_position`, of
+// the dispatch's tree rows.
+inline SplashAttentionTree splash_attention_tree(constant SplashAttentionParams &params,
+                                                 constant SplashAttentionSequence &sequence,
+                                                 device const SplashTreeRow *tree, uint first_position) {
+  if (!params.trees)
+    return {nullptr, 0};
+  return {tree + sequence.row_begin + (first_position - sequence.committed_tokens), sequence.committed_tokens};
+}
+
+// The position a tile's window starts from: its first row's, or a tree's
+// anchor's, since a tree row's depth may be less than its row.
+inline uint splash_attention_window_position(bool tree, uint anchor, uint first_position) {
+  return tree ? anchor : first_position;
+}
+
 // Split and reduce derive the same balanced partition of each query tile's
 // visible pages (splash_attention_first_page on). Causal and window masking
 // remain per query row inside each split.
@@ -107,10 +133,11 @@ template <uint Window> inline uint splash_attention_window_start(uint position) 
   return Window && position > Window ? position - Window : 0;
 }
 
-// The first page a tile whose first row is at first_position reads: its
-// first row's window start's, the tile's others starting their windows on it
-// or after it and masking the keys before them. Its pages end with its last
-// row's (splash_attention_pages), and with no window begin at page 0.
+// The first page a tile whose window position (splash_attention_window_position)
+// is first_position reads: that position's window start's, the tile's rows
+// starting their windows on it or after it and masking the keys before them.
+// Its pages end with its last row's (splash_attention_pages), and with no
+// window begin at page 0.
 template <uint Window> inline uint splash_attention_first_page(uint first_position) {
   return splash_attention_window_start<Window>(first_position) / SplashKvPageTokens;
 }
@@ -142,6 +169,10 @@ constant uint SplashAttentionLanesPerRow = 4;
 // flag. Existing threadgroup barriers separate reset, concurrent set, and
 // read; relaxed atomics make the same-value writes safe without changing
 // arithmetic.
+// A tree's row (SplashAttentionTree) attends the history of its position's
+// window, its position the anchor's plus its `depth`, and of the block's
+// rows those its `ancestors` hold, itself among them; only a page that
+// holds rows of the block tests them.
 template <uint QueryHeadsPerKVHead, uint RowsPerTile, uint Window, bool Quantized, typename Score>
 inline void splash_attention_page_softmax(
     threadgroup const Score *scores, float score_scale, threadgroup bfloat *probabilities,
@@ -150,6 +181,7 @@ inline void splash_attention_page_softmax(
     device const float4 *key_scales, device const float4 *value_scales,
     uint token_start,
     uint visible_tokens, uint committed_tokens, uint active_rows,
+    bool tree, uint anchor, uint ancestors, uint depth,
     uint thread_index) {
   constexpr uint N = SplashKvPageTokens;
   constexpr uint FusedRows = RowsPerTile * QueryHeadsPerKVHead;
@@ -169,9 +201,23 @@ inline void splash_attention_page_softmax(
   // with no window its whole history's. Tokens and limit count from start,
   // so one unsigned comparison tests both ends: a token before start wraps
   // past every limit.
-  const uint start = splash_attention_window_start<Window>(causal_end - 1);
+  const uint start = splash_attention_window_start<Window>(tree ? anchor + depth : causal_end - 1);
   const uint limit = min(visible_tokens, causal_end) - start;
   const uint token = token_start + column - start;
+  // Bit j: the lane's token j is a row of the tree's block off the row's
+  // path, which it does not see.
+  uint off_path = 0;
+  if (tree && token_start + N > anchor) {
+#pragma unroll
+    for (uint j = 0; j < TokensPerLane; ++j) {
+      const uint slot = token_start + column + j;
+      off_path |= uint(slot >= anchor && !((ancestors >> min(slot - anchor, 31u)) & 1u)) << j;
+    }
+  }
+  bool seen[TokensPerLane];
+#pragma unroll
+  for (uint j = 0; j < TokensPerLane; ++j)
+    seen[j] = token + j < limit && !((off_path >> j) & 1u);
   threadgroup const vec<Score, 4> *scores4 =
       reinterpret_cast<threadgroup const vec<Score, 4> *>(scores + fused_row * N + column);
   const uint vector = column / 4;
@@ -190,7 +236,7 @@ inline void splash_attention_page_softmax(
   float local_max = -INFINITY;
 #pragma unroll
   for (uint j = 0; j < TokensPerLane; ++j) {
-    score[j] = token + j < limit ? score[j] : -INFINITY;
+    score[j] = seen[j] ? score[j] : -INFINITY;
     local_max = max(local_max, score[j]);
   }
   local_max = max(local_max, simd_shuffle_xor(local_max, 1));
@@ -201,7 +247,7 @@ inline void splash_attention_page_softmax(
   float local_sum = 0.0f;
 #pragma unroll
   for (uint j = 0; j < TokensPerLane; ++j) {
-    probability[j] = token + j < limit ? fast::exp(score[j] - next_max) : 0.0f;
+    probability[j] = seen[j] ? fast::exp(score[j] - next_max) : 0.0f;
     local_sum += probability[j];
   }
   local_sum += simd_shuffle_xor(local_sum, 1);
@@ -222,14 +268,14 @@ inline void splash_attention_page_softmax(
     low_scales = value_scales[vector];
     high_scales = value_scales[vector + 1];
   }
-  const float4 low(token + 0 < limit ? probability[0] * low_scales.x : 0.0f,
-                   token + 1 < limit ? probability[1] * low_scales.y : 0.0f,
-                   token + 2 < limit ? probability[2] * low_scales.z : 0.0f,
-                   token + 3 < limit ? probability[3] * low_scales.w : 0.0f);
-  const float4 high(token + 4 < limit ? probability[4] * high_scales.x : 0.0f,
-                    token + 5 < limit ? probability[5] * high_scales.y : 0.0f,
-                    token + 6 < limit ? probability[6] * high_scales.z : 0.0f,
-                    token + 7 < limit ? probability[7] * high_scales.w : 0.0f);
+  const float4 low(seen[0] ? probability[0] * low_scales.x : 0.0f,
+                   seen[1] ? probability[1] * low_scales.y : 0.0f,
+                   seen[2] ? probability[2] * low_scales.z : 0.0f,
+                   seen[3] ? probability[3] * low_scales.w : 0.0f);
+  const float4 high(seen[4] ? probability[4] * high_scales.x : 0.0f,
+                    seen[5] ? probability[5] * high_scales.y : 0.0f,
+                    seen[6] ? probability[6] * high_scales.z : 0.0f,
+                    seen[7] ? probability[7] * high_scales.w : 0.0f);
   threadgroup bfloat4 *probabilities4 = reinterpret_cast<threadgroup bfloat4 *>(
       probabilities + fused_row * N + column);
   probabilities4[0] = bfloat4(low);
@@ -285,6 +331,9 @@ inline float splash_attention_query_codes(device const bfloat *queries, device i
 // against the INT8 keys, exact in int32 (|sum| < 2^22 at 256 dimensions);
 // the codes live in the threadgroup's own partials slot, which it writes
 // only after its last page.
+// A tree's tile (SplashAttentionTree) masks each row to its path's rows of
+// the block; its K/V, the store's, sit at the slots of their rows before
+// any tile runs, so a row of a later tile reads its ancestors' from them.
 template <uint KVHeads, uint QueryHeadsPerKVHead, uint RowsPerTile, uint HeadDim,
           uint Window, typename CacheElement, bool Int8Queries>
 inline void splash_paged_attention_tile(
@@ -294,16 +343,18 @@ inline void splash_paged_attention_tile(
     threadgroup float *scores, threadgroup bfloat *probabilities,
     threadgroup float *row_max, threadgroup float *row_sum,
     threadgroup float *previous_scale, threadgroup atomic_uint *rescale,
-    uint thread_index) {
+    SplashAttentionTree tree, uint thread_index) {
   constexpr ushort M = RowsPerTile * QueryHeadsPerKVHead;
   constexpr bool Quantized = is_same<CacheElement, int8_t>::value;
   constexpr ushort N = SplashKvPageTokens;
   constexpr ushort D = HeadDim;
+  const bool in_tree = tree.rows != nullptr;
   uint visible_tokens = committed_tokens + active_rows;
   uint pages = splash_attention_pages(visible_tokens);
   uint first_page = 0;
   if constexpr (Window != 0)
-    first_page = splash_attention_first_page<Window>(committed_tokens);
+    first_page = splash_attention_first_page<Window>(
+        splash_attention_window_position(in_tree, tree.anchor, committed_tokens));
   uint per_split = splash_attention_pages_per_split(pages - first_page, splits);
   uint page_begin = first_page + split * per_split;
   if (page_begin >= pages)
@@ -323,6 +374,14 @@ inline void splash_paged_attention_tile(
   if (thread_index < M) {
     row_max[thread_index] = -INFINITY;
     row_sum[thread_index] = 0.0f;
+  }
+  // A tree row's ancestors and depth, for its softmax lanes.
+  uint ancestors = 0, depth = 0;
+  if (in_tree && thread_index < SplashAttentionLanesPerRow * M) {
+    const SplashTreeRow place =
+        tree.rows[min(thread_index / SplashAttentionLanesPerRow / QueryHeadsPerKVHead, active_rows - 1)];
+    ancestors = place.ancestors;
+    depth = place.depth;
   }
   // The query codes are device writes the whole threadgroup reads.
   threadgroup_barrier(Int8Queries ? mem_flags::mem_threadgroup | mem_flags::mem_device
@@ -385,7 +444,7 @@ inline void splash_paged_attention_tile(
         page_score_tile, score_scale, probabilities, row_max, row_sum, previous_scale, rescale,
         reinterpret_cast<device const float4 *>(key_scales),
         reinterpret_cast<device const float4 *>(value_scales), token_start,
-        visible_tokens, committed_tokens, active_rows, thread_index);
+        visible_tokens, committed_tokens, active_rows, in_tree, tree.anchor, ancestors, depth, thread_index);
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (atomic_load_explicit(rescale, memory_order_relaxed)) {
 #pragma unroll
@@ -486,14 +545,15 @@ inline device const float *splash_group_sinks(uint kv_head, device const float *
 // Fused row `fused_row` of a tile run as Parts parts
 // (splash_attention_tile_part) combines the splits of its part's page loop:
 // those that own at least one page wrote their partials, and the partition
-// is recomputed here, of the same Window. A part past the tile's active rows
-// ran no split; its rows are written as zeros.
+// is recomputed here, of the same Window and, for a tree's tile, from the
+// same anchor. A part past the tile's active rows ran no split; its rows are
+// written as zeros.
 template <uint QueryHeadsPerKVHead, uint RowsPerTile, uint Parts, uint HeadDim,
           uint Window, class... GroupSinks>
 inline void splash_attention_reduce_row(
     device const float *partials, device const float *statistics,
     device bfloat *output, SplashAttentionTile whole, uint slot_stride,
-    uint fused_row, uint thread_index, threadgroup float *weights,
+    bool tree, uint anchor, uint fused_row, uint thread_index, threadgroup float *weights,
     threadgroup float *group_values, GroupSinks... group_sinks) {
   constexpr uint PartRows = RowsPerTile / Parts;
   constexpr uint PartM = PartRows * QueryHeadsPerKVHead;
@@ -507,7 +567,7 @@ inline void splash_attention_reduce_row(
   }
   uint pages = splash_attention_pages(tile.first_position + tile.active_rows);
   if constexpr (Window != 0)
-    pages -= splash_attention_first_page<Window>(tile.first_position);
+    pages -= splash_attention_first_page<Window>(splash_attention_window_position(tree, anchor, tile.first_position));
   const uint per_split = splash_attention_pages_per_split(pages, tile.splits);
   const uint written = (pages + per_split - 1) / per_split;
   splash_attention_combine_splits<QueryHeadsPerKVHead, PartRows, HeadDim>(

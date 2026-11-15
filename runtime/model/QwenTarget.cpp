@@ -386,7 +386,7 @@ void QwenTarget::addVerifyMixer(VerifyStep &step, const QwenAttentionWeights &mi
   }
   ops::PagedAttention::addAttention(step.graph, variant.windowTokens ? *step.windowedAttention : step.attention,
                                     staging, b.attentionPartials, b.attentionStatistics, step.chunks,
-                                    std::span(histories).first(step.lanes), mixer.sinks);
+                                    std::span(histories).first(step.lanes), mixer.sinks, b.tree);
   const ops::LinearPlan outputPlan = linear.plan(
       mixer.outputProjection, step.rows, output.residual ? ops::LinearEpilogue::Residual : ops::LinearEpilogue::None);
   const ops::PreparedInput hidden = ops::PagedAttention::addGate(
