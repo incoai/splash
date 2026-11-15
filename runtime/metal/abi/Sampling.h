@@ -156,8 +156,8 @@ struct ThinkingCutoffParams {
   uint32_t tokens[SPLASH_MAXIMUM_BATCH_WIDTH][SPLASH_TARGET_VERIFY_ROWS];
 };
 
-static_assert(sizeof(ThinkingCutoffParams) == 208,
-              "Thinking cutoff parameters are 208 bytes on both sides");
+static_assert(sizeof(ThinkingCutoffParams) == 80 + 16 * SPLASH_TARGET_VERIFY_ROWS,
+              "Thinking cutoff parameters are the same size on both sides");
 
 // The batched selector and acceptance kernels' grids cover exactly the
 // dispatch's lanes: per-lane arrays hold those lanes, and entries past them
