@@ -81,10 +81,10 @@ void baselinePlans() {
     const Linear baseline(device(family), Int8Activations::On);
     for (auto matrix : matrices) {
       uint64_t gateBound = 0;
-      for (uint32_t lanes = 1; lanes <= 4; ++lanes) {
+      for (uint32_t rows = 8; rows <= kMaximumDecodeTileRows; rows += 8) {
         for (auto epilogue : {LinearEpilogue::None, LinearEpilogue::Residual,
                               LinearEpilogue::GateUp}) {
-          const LinearWorkload w{matrix, lanes * 8, epilogue};
+          const LinearWorkload w{matrix, rows, epilogue};
           require(plans.linear().plan(w).configuration() ==
                       baseline.plan(w).configuration(),
                   "the plans' decode Linear departed from the device policy");
@@ -93,7 +93,7 @@ void baselinePlans() {
         }
       }
       require(plans.gateUpWorkspace(gateUp(matrix)) == gateBound &&
-                  gateBound == uint64_t{32} * matrix.outputSize * 2,
+                  gateBound == uint64_t{kMaximumDecodeTileRows} * matrix.outputSize * 2,
               "gate/up workspace disagrees with the baseline's gate pass");
       for (uint32_t rows : {1U, 17U, 2048U})
         for (auto epilogue : {LinearEpilogue::None, LinearEpilogue::Residual,
@@ -328,9 +328,10 @@ void workspaceBounds() {
               moe.expertIntermediateBytes == 532480 && moe.groupedRoutesBytes == 2080 &&
               moe.tileDescriptorsBytes == 520 && moe.tileCountBytes == 80 && moe.expertSlotsBytes == 1024,
           "MoE decode workspace per lane changed");
-  require(plans.gateUpWorkspace(gateUp(matrices[0])) == 1114112 &&
-              plans.gateUpWorkspace(gateUp(matrices[1])) == 393216,
-          "gate/up workspace omitted the B3/B4 gate pass");
+  // The gate pass of the decode tiles' most rows, 64 a gate/up pair runs in two passes.
+  require(plans.gateUpWorkspace(gateUp(matrices[0])) == 2228224 &&
+              plans.gateUpWorkspace(gateUp(matrices[1])) == 786432,
+          "gate/up workspace omitted the gate pass of the decode tiles' 64 rows");
   const auto draft = plans.draftAttentionWorkspacePerLane(draftShapes[0]);
   // Grouped queries per lane plus eight heads x four splits of 32 x 130 fp32
   // attention partials behind them.

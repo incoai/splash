@@ -227,6 +227,8 @@ std::string describe(const LinearScratchSize &s) {
 }
 
 constexpr uint32_t kPrefillRows[] = {1, 8, 9, 16, 17, 24, 32, 33, 48, 64, 65, 128, 512, 2048};
+constexpr uint32_t kWideDecodeRows[] = {40, 48, 56, 64};
+static_assert(kWideDecodeRows[std::size(kWideDecodeRows) - 1] == kMaximumDecodeTileRows);
 
 void projections(Golden &golden, const std::string &name, const ExecutionPlans &plans) {
   const Linear &linear = plans.linear();
@@ -253,6 +255,15 @@ void projections(Golden &golden, const std::string &name, const ExecutionPlans &
                        return describe(linear.plan(w, *p, epilogue == LinearEpilogue::GateUp ? &gate : nullptr));
                      }));
         }
+      // The decode tiles' plans past a decode step of four lanes of 8, up to their 64 rows.
+      for (const uint32_t rows : kWideDecodeRows)
+        for (const auto epilogue : {LinearEpilogue::None, LinearEpilogue::Residual, LinearEpilogue::GateUp}) {
+          const LinearWorkload w{{c.n, c.k}, rows, epilogue};
+          decode.add(set.name + " rows " + std::to_string(rows) + " e" + std::to_string(unsigned(epilogue)) + ": " +
+                     attempt([&] {
+                       return describe(linear.plan(w, *p, epilogue == LinearEpilogue::GateUp ? &gate : nullptr));
+                     }));
+        }
       for (const uint32_t rows : kPrefillRows)
         for (const auto epilogue : {LinearEpilogue::None, LinearEpilogue::Residual, LinearEpilogue::UpWithGate}) {
           const LinearWorkload w{{c.n, c.k}, rows, epilogue};
@@ -263,14 +274,20 @@ void projections(Golden &golden, const std::string &name, const ExecutionPlans &
       // (rotatedUnit).
       if (rotatedUnit(c, set)) {
         Group &int8 = golden.group(name, "projection-decode-int8", c.name);
-        for (uint32_t lanes = 1; lanes <= SPLASH_MAXIMUM_BATCH_WIDTH; ++lanes)
+        std::vector<uint32_t> lines;
+        for (uint32_t lanes = 1; lanes <= SPLASH_MAXIMUM_BATCH_WIDTH; ++lanes) lines.push_back(lanes);
+        lines.insert(lines.end(), std::begin(kWideDecodeRows), std::end(kWideDecodeRows));
+        for (const uint32_t line : lines)
           for (const auto epilogue : {LinearEpilogue::None, LinearEpilogue::Residual, LinearEpilogue::GateUp}) {
-            const LinearWorkload w{{c.n, c.k}, lanes * SPLASH_TARGET_VERIFY_ROWS, epilogue};
+            // Lanes of 8 rows up to a decode step's four, then the decode tiles' plans of more rows.
+            const bool lanes = line <= SPLASH_MAXIMUM_BATCH_WIDTH;
+            const LinearWorkload w{{c.n, c.k}, lanes ? line * SPLASH_TARGET_VERIFY_ROWS : line, epilogue};
             const bool pair = epilogue == LinearEpilogue::GateUp;
             const std::array<const Projection *, 2> units{&*p, pair ? &gate : nullptr};
             const std::array<UnitFormats, 2> tensors{int8Formats(std::span(&units[0], 1)),
                                                      int8Formats(std::span(&units[1], 1))};
-            int8.add("lanes " + std::to_string(lanes) + " e" + std::to_string(unsigned(epilogue)) + ": " +
+            int8.add((lanes ? "lanes " : "rows ") + std::to_string(line) + " e" + std::to_string(unsigned(epilogue)) +
+                     ": " +
                      attempt([&] {
                        const LinearConfig config = selectProjection(
                            plans.calibration(), plans.linear().int8Activations(), w, int8Formats(units),
@@ -622,7 +639,7 @@ Int8Paths int8ActivationsOff(const std::string &name, const ExecutionPlans &on, 
           compare(configuration([&] { return on.linear().plan(w, *p); }),
                   configuration([&] { return off.linear().plan(w, *p); }), label + " prefill");
         }
-      // The bound holds the decode tiles' tables of its plans of up to 32
+      // The bound holds the decode tiles' tables of its plans of up to 64
       // rows either way, and the int8 codes and scales with them on.
       const std::string bound =
           attempt([&] { return describe(off.linear().scratchSize(p->shape(), SPLASH_PREFILL_TOKEN_BUDGET)); });

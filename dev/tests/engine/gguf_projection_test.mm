@@ -77,6 +77,11 @@ using splash::test::floatToBf16;
 namespace {
 
 constexpr uint32_t kLaneRows = 8, kMaximumLanes = 4, kMaximumRows = kLaneRows * kMaximumLanes;
+// The staged tile's lanes of 8 rows, to the decode tiles' 64 rows; the register tile, the one-pass pair and the int8
+// tiles hold kMaximumLanes (kMaximumRegisterRows, kMaximumPairRows, kMaximumInt8Rows).
+constexpr uint32_t kMaximumStagedLanes = kMaximumDecodeTileRows / kLaneRows;
+static_assert(kMaximumRows == kMaximumRegisterRows && kMaximumRows == kMaximumPairRows &&
+              kMaximumRows == kMaximumInt8Rows);
 // Every K split a plan takes: the powers of two up to the largest.
 constexpr uint32_t kSplits[] = {1, 2, 4, 8, 16};
 static_assert(kSplits[std::size(kSplits) - 1] == LinearConfig::kMaximumSplits);
@@ -484,21 +489,23 @@ LinearWorkload decode(LinearMatrix matrix, uint32_t lanes, LinearEpilogue epilog
 
 // ---------------------------------------------------------------- decode
 // One tile and walk on single tensors [512, K] in each of `formats` (gate in the format three further on of those):
-// at every lane count, K split the tile takes and epilogue, on dense and sparse inputs, every output within fp64 and
-// each lane's rows equal to a one-lane projection of them, on the staged tile's 16-row tile too.
+// at every lane count the tile holds (the register tile's four, the staged tile's eight), K split the tile takes and
+// epilogue, on dense and sparse inputs, every output within fp64 and each lane's rows equal to a one-lane projection of
+// them, on the staged tile's 16-row tile too.
 void decodeTile(MetalBackend &backend, const Linear &linear, LinearTile tile, bool spread, uint32_t K,
                 const std::vector<Fmt> &formats) {
   constexpr uint32_t N = 512, columns = N + kPadding;
   const bool staged = tile == LinearTile::GgufStaged;
+  const uint32_t mostLanes = staged ? kMaximumStagedLanes : kMaximumLanes, mostRows = mostLanes * kLaneRows;
   uint32_t mostSplits = 1;
   for (size_t i = 0; i < formats.size(); ++i) {
     const Tensor w = tensor(backend, formats[i], N, K), g = tensor(backend, formats[(i + 3) % formats.size()], N, K);
     const Projection up = projection({&w}, columns), gate = projection({&g}, columns);
     for (const Inputs inputs : {Inputs::Dense, Inputs::Sparse}) {
-      const std::vector<float> x = activations(inputs, kMaximumRows, K);
-      const std::vector<float> residual = residuals(kMaximumRows, columns);
-      const std::vector<Dot> dots = products({&w}, columns, x, kMaximumRows);
-      const std::vector<Dot> gateDots = products({&g}, columns, x, kMaximumRows);
+      const std::vector<float> x = activations(inputs, mostRows, K);
+      const std::vector<float> residual = residuals(mostRows, columns);
+      const std::vector<Dot> dots = products({&w}, columns, x, mostRows);
+      const std::vector<Dot> gateDots = products({&g}, columns, x, mostRows);
       for (const LinearEpilogue epilogue : {LinearEpilogue::None, LinearEpilogue::Residual, LinearEpilogue::GateUp})
         for (const uint32_t splits : kSplits) {
           if (!takesSplits(tile, w.format, K, splits) || !takesSplits(tile, g.format, K, splits)) continue;
@@ -508,7 +515,7 @@ void decodeTile(MetalBackend &backend, const Linear &linear, LinearTile tile, bo
                                    " S=" + std::to_string(splits);
           const Projection *gated = epilogue == LinearEpilogue::GateUp ? &gate : nullptr;
           std::vector<Outcome> lanesAlone;
-          for (uint32_t lane = 0; lane < kMaximumLanes; ++lane) {
+          for (uint32_t lane = 0; lane < mostLanes; ++lane) {
             const std::vector<float> rows(x.begin() + uint64_t{lane} * kLaneRows * K,
                                           x.begin() + uint64_t{lane + 1} * kLaneRows * K);
             const std::vector<float> aux(residual.begin() + uint64_t{lane} * kLaneRows * columns,
@@ -535,7 +542,7 @@ void decodeTile(MetalBackend &backend, const Linear &linear, LinearTile tile, bo
               floatOutput(backend, linear, Linear::plan(one, sixteen, FloatOutput::Float32), up, rows, out,
                           within(dots, staged), N, label);
           }
-          for (uint32_t lanes = 1; lanes <= kMaximumLanes; ++lanes) {
+          for (uint32_t lanes = 1; lanes <= mostLanes; ++lanes) {
             const LinearWorkload wl = decode({columns, K}, lanes, epilogue);
             const LinearPlan plan = Linear::plan(wl, config(tile, splits, spread), FloatOutput::BFloat16);
             const uint32_t storage = plan.storageRows(), rows = wl.rows;
@@ -555,7 +562,7 @@ void decodeTile(MetalBackend &backend, const Linear &linear, LinearTile tile, bo
     }
   }
   section(walkName(tile, spread) + " decode: " + std::to_string(formats.size()) + " formats, K " + std::to_string(K) +
-          ", 1-4 lanes, S 1-" + std::to_string(mostSplits) +
+          ", 1-" + std::to_string(mostLanes) + " lanes, S 1-" + std::to_string(mostSplits) +
           ", plain/residual/gate-up, dense and sparse inputs within fp64, lanes equal to one-lane projections" +
           (staged ? " (one lane on the 16-row tile too)" : "") + ", fp32 plain outputs rounding to bf16's");
 }
@@ -1117,10 +1124,11 @@ void decodeInt8(MetalBackend &backend, const Linear &linear) {
     const MetalBuffer signBuffer = signsOf(K, signs);
     const Tensor t = tensor(backend, PQ20, N, K);
     const Projection p = rotatedProjection({&t}, N, signBuffer), plain = projection({&t}, N);
-    const std::vector<float> x = int8Inputs(kMaximumRows, K, signs);
-    const std::vector<float> residual = residuals(kMaximumRows, N);
-    const Int8Products d = int8Tiles ? int8Products({&t}, N, x, kMaximumRows, signs) : Int8Products{};
-    for (uint32_t lanes = 1; lanes <= kMaximumLanes; ++lanes) {
+    const std::vector<float> x = int8Inputs(kMaximumDecodeTileRows, K, signs);
+    const std::vector<float> residual = residuals(kMaximumDecodeTileRows, N);
+    const Int8Products d = int8Tiles ? int8Products({&t}, N, x, kMaximumDecodeTileRows, signs) : Int8Products{};
+    // The production plans of 8 to 64 rows: in int8 activations up to the int8 tiles' 32, bf16 past them.
+    for (uint32_t lanes = 1; lanes <= kMaximumStagedLanes; ++lanes) {
       const LinearWorkload w = decode({N, K}, lanes, epilogue);
       if (linear.plan(w, plain).configuration().decodeInt8)
         fail("an unrotated PQ2_0 projection takes int8 activations");
@@ -1178,7 +1186,8 @@ void decodeInt8(MetalBackend &backend, const Linear &linear) {
     }
   }
   section("int8 decode (PQ2_0): " + std::to_string(ran) +
-          " plans (single, gate/up in one and two passes, residual, fp32, fused; 1-4 lanes, every split, both walks), "
+          " plans (single, gate/up in one and two passes, residual, fp32, fused; 1-4 lanes, every split, both "
+          "walks), "
           "every value within the fp32 rounding of the exact int8 products, lanes and pass modes bitwise, fp32 "
           "rounding to bf16's; " + std::to_string(production) + " production plans in int8 activations within it; a "
           "non-finite input leaves its row alone not finite");

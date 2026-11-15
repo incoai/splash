@@ -188,30 +188,22 @@ LinearScratchSize Linear::scratchSize(ProjectionShape shape, uint32_t rows) cons
   if (!rows || rows > SPLASH_PREFILL_TOKEN_BUDGET) throw std::invalid_argument("invalid linear scratch rows");
   LinearScratchSize bound;
   // Split scratch and tables grow with the rows of the decode tiles, each
-  // count of rows any tile the device may run it on, and of the staged tile up
-  // to kMaximumStagedPrefillRows rows; the prefill tiles never split
-  // (LinearGguf.cpp).
+  // count of rows any tile the device may run it on; the prefill tiles never
+  // split (LinearGguf.cpp).
   const LinearMatrix matrix{shape.outputSize, shape.inputSize};
-  for (uint32_t count = 1; count <= std::min(rows, kMaximumStagedPrefillRows); ++count) {
-    if (count <= kMaximumDecodeTileRows) {
-      for (const auto epilogue : {LinearEpilogue::None, LinearEpilogue::Residual, LinearEpilogue::GateUp})
-        bound.include(ggufDecodeScratchSize({matrix, count, epilogue}, shape.registerFormats));
-      continue;
-    }
-    for (const auto epilogue : {LinearEpilogue::None, LinearEpilogue::Residual, LinearEpilogue::UpWithGate})
-      bound.include(plan({matrix, count, epilogue}).scratchSize());
-  }
+  for (uint32_t count = 1; count <= std::min(rows, kMaximumDecodeTileRows); ++count)
+    for (const auto epilogue : {LinearEpilogue::None, LinearEpilogue::Residual, LinearEpilogue::GateUp})
+      bound.include(ggufDecodeScratchSize({matrix, count, epilogue}, shape.registerFormats));
   // A plan stores at most its rows' tiles: the decode tiles' up to
   // kMaximumDecodeTileRows, the prefill tiles' whole 128-row tiles.
   static_assert(SPLASH_PREFILL_TOKEN_BUDGET % GGUF_PREFILL_ROWS == 0, "the prefill tiles cover the budget exactly");
-  const uint32_t storage = rows <= kMaximumDecodeTileRows       ? std::max(rows, stagedStorageRows(rows, true))
-                           : rows <= kMaximumStagedPrefillRows ? kMaximumStagedPrefillRows
-                                                                : (rows + GGUF_PREFILL_ROWS - 1) / GGUF_PREFILL_ROWS *
-                                                                      GGUF_PREFILL_ROWS;
+  const uint32_t storage = rows <= kMaximumDecodeTileRows
+                               ? std::max(rows, stagedStorageRows(rows, true))
+                               : (rows + GGUF_PREFILL_ROWS - 1) / GGUF_PREFILL_ROWS * GGUF_PREFILL_ROWS;
   if (shape.rotated) bound.rotated = rotatedBytes(shape.inputSize, storage);
   // The most rows' plan, whose codes and scales the int8 prefill tile holds
   // where it takes the shape's formats.
-  if (rows > kMaximumStagedPrefillRows) {
+  if (rows > kMaximumDecodeTileRows) {
     const LinearWorkload most{matrix, rows, LinearEpilogue::None};
     bound.include(
         LinearPlan(most, selectProjection(calibration_, int8Activations_, most, unitFormats(shape))).scratchSize());

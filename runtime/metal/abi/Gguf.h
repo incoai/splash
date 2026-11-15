@@ -14,11 +14,10 @@
 // The int8 prefill tile's activation group is the MLX weight group of 64
 // inputs (GGUF_PREFILL_INT8_GROUP).
 #define GGUF_TILE_COLUMNS 64u
-// Decode tile of the staged kernels, which also runs prefill chunks of up to
-// 32 rows (64 on Apple10 and on Apple9 GPUs of 10 cores or fewer): two
-// simdgroups, each staging its own
-// GGUF_STAGED_COLUMNS columns GGUF_STAGED_STEP inputs at a time over 8, 16,
-// 32 or 64 rows.
+// Decode tile of the staged kernels, which runs plans of up to 64 rows, a
+// decode step's or a prompt chunk's alike: two simdgroups, each staging its
+// own GGUF_STAGED_COLUMNS columns GGUF_STAGED_STEP inputs at a time over 8,
+// 16, 32 or 64 rows.
 #define GGUF_STAGED_COLUMNS 32u
 #define GGUF_STAGED_STEP 32u
 #define GGUF_STAGED_THREADS (GGUF_TILE_COLUMNS / GGUF_STAGED_COLUMNS * 32u)
@@ -150,11 +149,11 @@ inline constexpr uint64_t gguf_prefill_int8_scale_bytes(uint32_t k, uint64_t sto
   return uint64_t(k / GGUF_PREFILL_INT8_GROUP) * storage * 8u;
 }
 
-// Decode tiles: the register tile, which Apple9 runs but for the projections
-// it stages (ops/LinearGguf.cpp, apple9Stages), and the staged tile, which
-// runs every other decode and prefill chunks of up to 32 rows (64 on
-// Apple10 and on Apple9 GPUs of 10 cores or fewer). One tensor per
-// dispatch, over the dispatch's tiles (grid.x) and K partitions (grid.y).
+// Decode tiles: the register tile, of plans of up to 32 rows where the
+// device's calibration takes it (RegisterBoundary, ops/KernelCalibration.hpp),
+// and the staged tile, of the other plans of up to 64 rows, a decode step's
+// or a prompt chunk's. One tensor per dispatch, over the dispatch's tiles
+// (grid.x) and K partitions (grid.y).
 struct GgufDecodeParams {
   uint32_t input_size;  // K
   uint32_t splits;      // K partitions; 1 = no cross-threadgroup reduction

@@ -75,14 +75,13 @@ enum class LinearEpilogue : uint8_t { None, Residual, GateUp, UpWithGate };
 // (LinearConfig::oneGateUpPass) runs 32 columns of both tensors per
 // threadgroup of one simdgroup. The staged tiles, GgufStaged and GgufPrefill,
 // dequantize the weights into threadgroup memory for matmul2d.
-// GgufStaged: the two-simdgroup staged tile of 8, 16 or 32 rows (a decode
-// tile), or of 64 up to ProjectionCalibration::stagedPrefillRows, each
+// GgufStaged: the two-simdgroup staged tile of 8, 16, 32 or 64 rows, each
 // simdgroup staging its own columns, with optional K splits. GgufPrefill: the
 // 128-row shared-stage prefill tile.
 // GgufRegister: the exact register tile on bf16 8x8 matrix operations
 // (Apple9), over an activation table, all the plan's rows in one threadgroup,
-// optional K splits.
-// GgufPrefillInt8: plans past the staged tile of MLX affine 4- and 5-bit g64
+// up to kMaximumRegisterRows, optional K splits.
+// GgufPrefillInt8: plans past the decode tiles of MLX affine 4- and 5-bit g64
 // weights (quant_prefill_int8_format) in int8 activations, quantized per row
 // and 64-input group into the scratch table, against the weights' exact codes
 // (kernels/prefill/gguf_prefill_int8.metal); not exact, unsplit, the prefill
@@ -92,18 +91,25 @@ enum class LinearEpilogue : uint8_t { None, Residual, GateUp, UpWithGate };
 // (kernels/decode/linear_gguf_column.metal); unsplit across threadgroups, a
 // gate/up pair of one format in one pass.
 enum class LinearTile : uint8_t { GgufStaged, GgufPrefill, GgufRegister, GgufPrefillInt8, GgufColumn };
-// The decode tiles (the staged tile's 8-, 16- and 32-row heights, the
-// register and column tiles) hold up to a full decode batch; a plan of more
-// rows runs the staged 64-row tile or the prefill tiles (selectProjection).
-inline constexpr uint32_t kMaximumDecodeTileRows = SPLASH_MAXIMUM_BATCH_WIDTH * SPLASH_TARGET_VERIFY_ROWS;
+// The decode tiles (the staged tile's 8- to 64-row heights, the register and
+// column tiles) hold a plan of up to 64 rows, a decode step of four lanes of
+// 16; a plan of more rows runs the prefill tiles (selectProjection).
+inline constexpr uint32_t kMaximumDecodeTileRows = 64;
 // The register tile computes its rows in groups of an activation table's tile
-// (Table16, metal/abi/Gguf.h): a plan of r rows stores ⌈r / 8⌉ of them.
+// (Table16, metal/abi/Gguf.h): a plan of r rows stores ⌈r / 8⌉ of them, at
+// most four (its kernels' lanes), so it holds plans of up to 32 rows.
 [[nodiscard]] constexpr uint32_t tableTiles(uint32_t rows) noexcept {
   return (rows + GGUF_TABLE16_ROWS - 1) / GGUF_TABLE16_ROWS;
 }
-// The staged tile's tallest height, which holds plans of up to this many
-// rows (ProjectionCalibration::stagedPrefillRows).
-inline constexpr uint32_t kMaximumStagedPrefillRows = 64;
+inline constexpr uint32_t kMaximumRegisterRows = SPLASH_MAXIMUM_BATCH_WIDTH * GGUF_TABLE16_ROWS;
+// A one-pass gate/up pair's simdgroup holds both tensors' sums of every row:
+// up to 32 rows (kernels/shared/gguf_linear.metal); a plan of more runs the
+// pair in two passes.
+inline constexpr uint32_t kMaximumPairRows = 32;
+// The int8 decode tiles' simdgroups hold their int32 and fp32 sums of every
+// row up to 32 rows; a plan of more keeps bf16 activations on the staged tile
+// (kernels/shared/gguf_linear.metal).
+inline constexpr uint32_t kMaximumInt8Rows = 32;
 // The staged tile that holds `rows` rows: MPP computes 16-row fragments, so
 // the tile holds 8, 16, 32 or 64 rows, the fewest that hold the plan's (24
 // rows run the 32-row tile; a plan of at most 8 may run the 16-row tile,

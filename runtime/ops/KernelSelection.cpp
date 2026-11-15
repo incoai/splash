@@ -11,11 +11,11 @@
 namespace splash::ops {
 namespace {
 
-static_assert(kApple9Projection.stagedPrefillRows <= kMaximumStagedPrefillRows &&
-                  kApple9SmallProjection.stagedPrefillRows <= kMaximumStagedPrefillRows &&
-                  kApple10Projection.stagedPrefillRows <= kMaximumStagedPrefillRows &&
-                  kApple11Projection.stagedPrefillRows <= kMaximumStagedPrefillRows,
-              "the staged tile holds the plans it runs");
+static_assert(kMaximumRegisterRows / GGUF_TABLE16_ROWS == SPLASH_MAXIMUM_BATCH_WIDTH,
+              "a register boundary names each count of table tiles the register tile holds");
+static_assert(kMaximumPairRows <= kMaximumDecodeTileRows && kMaximumRegisterRows <= kMaximumDecodeTileRows &&
+                  kMaximumInt8Rows <= kMaximumDecodeTileRows,
+              "the decode tiles hold every plan the pair, the register tile and the int8 tiles run");
 
 // The register tile runs a unit of any class only at a count of table tiles
 // and grid it runs a unit of FourBitsOrMore at, so that class's boundary
@@ -36,7 +36,6 @@ constexpr bool registerBoundsHold(const RegisterBoundary &boundary) noexcept {
   return true;
 }
 static_assert(registerBoundsHold(kApple9Projection.decodeRegister) &&
-                  registerBoundsHold(kApple9SmallProjection.decodeRegister) &&
                   registerBoundsHold(kApple10Projection.decodeRegister) &&
                   registerBoundsHold(kApple11Projection.decodeRegister),
               "a class registers a grid FourBitsOrMore stages, or a mixed pair stages where its tensors register");
@@ -118,10 +117,12 @@ SplitChoice waveSplits(const WaveLaw &law, uint32_t n, uint32_t k, uint32_t rows
 }
 
 // Whether the register tile runs a plan of `tiles` table tiles over
-// `columnTiles` column tiles of a unit of `formatClass` (RegisterBoundary).
+// `columnTiles` column tiles of a unit of `formatClass` (RegisterBoundary):
+// never past the four it holds.
 bool registers(const RegisterBoundary &boundary, FormatClass formatClass, uint32_t tiles, uint64_t columnTiles,
                uint32_t cores) {
-  return 4 * columnTiles * tiles < uint64_t{boundary.belowQuarters[size_t(formatClass)][tiles - 1]} * cores;
+  return tiles <= kMaximumRegisterRows / GGUF_TABLE16_ROWS &&
+         4 * columnTiles * tiles < uint64_t{boundary.belowQuarters[size_t(formatClass)][tiles - 1]} * cores;
 }
 
 // The staged tile's configuration of `rows` rows.
@@ -146,29 +147,25 @@ bool sixteenRowLane(const ProjectionCalibration &p, uint64_t tiles, uint32_t bit
 }
 
 // A dense GGUF projection's configuration in bf16 activations. A plan of
-// more rows than the decode tiles hold runs the staged tile at its rows'
-// height with stagedSplits up to stagedPrefillRows rows, and past them the
-// prefill tile unsplit. On the decode tiles, a plan runs the column tile at up
-// to GGUF_COLUMN_ROWS rows; else the register tile where it takes every
-// quantized segment and the class's RegisterBoundary holds for its table
-// tiles, a one-pass-eligible gate/up pair's column tiles counting both
-// tensors', splitting by registerSplits; else the staged tile, splitting by
-// stagedSplits (a wave law also picks one or two passes for an eligible
-// pair), its walks spread from spreadFromCores, and a plan of one table tile
-// unsplit on the 16-row tile where sixteenRowLane takes it, a pair's only
-// where both its tensors' own plans take it.
+// more rows than the decode tiles hold runs the prefill tile unsplit. On the
+// decode tiles, a plan runs the column tile at up to GGUF_COLUMN_ROWS rows;
+// else the register tile where it takes every quantized segment and the
+// class's RegisterBoundary holds for its table tiles, a one-pass-eligible
+// gate/up pair's column tiles counting both tensors', splitting by
+// registerSplits; else the staged tile, splitting by stagedSplits (a wave law
+// also picks one or two passes for a pair the one-pass tile holds), its walks
+// spread from spreadFromCores, and a plan of one table tile unsplit on the
+// 16-row tile where sixteenRowLane takes it, a pair's only where both its
+// tensors' own plans take it.
 LinearConfig bf16Projection(const KernelCalibration &calibration, LinearWorkload w, const UnitFormats &unit,
                             std::span<const UnitFormats> pairTensors) {
   const auto [n, k] = w.matrix;
   const ProjectionCalibration &p = calibration.projection;
   const uint32_t cores = calibration.cores;
-  if (w.rows > kMaximumDecodeTileRows) {
-    if (w.rows <= p.stagedPrefillRows) return staged(p, n, k, w.rows, unit.weightBits16, cores, Passes::Two);
-    return {.tile = LinearTile::GgufPrefill};
-  }
+  if (w.rows > kMaximumDecodeTileRows) return {.tile = LinearTile::GgufPrefill};
   const uint32_t tiles = tableTiles(w.rows);
   const bool gateUp = w.epilogue == LinearEpilogue::GateUp,
-             onePass = gateUp && unit.oneFormat && cores >= p.onePassFromCores;
+             onePass = gateUp && unit.oneFormat && cores >= p.onePassFromCores && w.rows <= kMaximumPairRows;
   // A plan of at most GGUF_COLUMN_ROWS rows runs the column tile, which reads
   // them alone, a gate/up pair of one format in one pass: the staged and
   // register tiles compute every row of their tiles. A [2048 x 6144] af4g64
@@ -246,10 +243,11 @@ SplitChoice splitsFor(const SplitLaw &law, uint32_t n, uint32_t k, uint32_t rows
 // The configuration in bf16 activations (bf16Projection), then with int8
 // activations on the plan's last choice, which leaves the rest of it as it is:
 // a plan on the prefill tile runs the int8 prefill tile where the row has
-// prefillInt8 and the tile takes the unit, and a staged plan on the decode
-// tiles that stores at least decodeInt8FromRows rows (a 16-row plan counts
-// 16) and whose K splits keep whole PQ2_0 blocks runs the int8 decode tiles
-// where they take the unit, at the plan's rows, splits and passes.
+// prefillInt8 and the tile takes the unit, and a staged plan that stores at
+// least decodeInt8FromRows rows (a 16-row plan counts 16), at most the int8
+// tiles' kMaximumInt8Rows, and whose K splits keep whole PQ2_0 blocks runs
+// the int8 decode tiles where they take the unit, at the plan's rows, splits
+// and passes.
 LinearConfig selectProjection(const KernelCalibration &calibration, Int8Activations int8Activations,
                               LinearWorkload w, const UnitFormats &unit, std::span<const UnitFormats> pairTensors) {
   LinearConfig config = bf16Projection(calibration, w, unit, pairTensors);
@@ -257,9 +255,10 @@ LinearConfig selectProjection(const KernelCalibration &calibration, Int8Activati
   const ProjectionCalibration &p = calibration.projection;
   if (config.tile == LinearTile::GgufPrefill && p.prefillInt8 && unit.prefillInt8Takes)
     config.tile = LinearTile::GgufPrefillInt8;
-  config.decodeInt8 = w.rows <= kMaximumDecodeTileRows && config.tile == LinearTile::GgufStaged &&
-                      unit.decodeInt8Takes && decodeInt8TakesSplits(w.matrix.inputSize, config.splits) &&
-                      stagedStorageRows(w.rows, config.sixteenRows) >= p.decodeInt8FromRows;
+  const uint32_t storage = stagedStorageRows(w.rows, config.sixteenRows);
+  config.decodeInt8 = config.tile == LinearTile::GgufStaged && unit.decodeInt8Takes &&
+                      decodeInt8TakesSplits(w.matrix.inputSize, config.splits) &&
+                      storage >= p.decodeInt8FromRows && storage <= kMaximumInt8Rows;
   return config;
 }
 
@@ -269,7 +268,8 @@ LinearConfig selectProjection(const KernelCalibration &calibration, Int8Activati
 // weights: the most K partitions of each pass mode, since the law's split
 // never falls with the bits per weight and never rises with the rows (a
 // split's partials grow with its rows alone, the same in either pass mode);
-// and a gate/up pair of one format in one pass where it may.
+// and a gate/up pair of one format in one pass where it may and the one-pass
+// tile holds its rows.
 std::vector<LinearConfig> decodeConfigurations(const KernelCalibration &calibration, LinearWorkload w,
                                                bool registerTakes) {
   const ProjectionCalibration &p = calibration.projection;
@@ -277,7 +277,7 @@ std::vector<LinearConfig> decodeConfigurations(const KernelCalibration &calibrat
   std::vector<LinearConfig> configurations{bf16Projection(calibration, w, {.registerTakes = registerTakes}, {})};
   if (registers(p.decodeRegister, FormatClass::FourBitsOrMore, tableTiles(w.rows), n / GGUF_TILE_COLUMNS, cores))
     configurations.push_back(staged(p, n, k, w.rows, 0, cores, Passes::Two));
-  if (w.epilogue == LinearEpilogue::GateUp && cores >= p.onePassFromCores)
+  if (w.epilogue == LinearEpilogue::GateUp && cores >= p.onePassFromCores && w.rows <= kMaximumPairRows)
     configurations.push_back(staged(p, n, k, w.rows, 0, cores, Passes::One));
   return configurations;
 }

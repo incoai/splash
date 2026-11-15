@@ -129,13 +129,14 @@ void LinearPlan::requireConfiguration() const {
   const bool decodeTiles = workload_.rows <= kMaximumDecodeTileRows;
   if (c.spread && c.tile != LinearTile::GgufStaged)
     throw std::invalid_argument("only the staged block tile spreads its walks");
-  if (c.oneGateUpPass && ((c.tile != LinearTile::GgufStaged && c.tile != LinearTile::GgufColumn) || !decodeTiles ||
-                          workload_.epilogue != LinearEpilogue::GateUp))
-    throw std::invalid_argument("only a staged or column block gate/up on the decode tiles runs gate and up in one pass");
+  if (c.oneGateUpPass && ((c.tile != LinearTile::GgufStaged && c.tile != LinearTile::GgufColumn) ||
+                          workload_.rows > kMaximumPairRows || workload_.epilogue != LinearEpilogue::GateUp))
+    throw std::invalid_argument("only a staged or column block gate/up of up to 32 rows runs gate and up in one pass");
   if (c.sixteenRows && (c.tile != LinearTile::GgufStaged || workload_.rows > 8))
     throw std::invalid_argument("only a staged block plan of at most 8 rows runs the 16-row tile");
-  if (c.decodeInt8 && (c.tile != LinearTile::GgufStaged || !decodeTiles || !decodeInt8TakesSplits(k, c.splits)))
-    throw std::invalid_argument("only a staged block plan on the decode tiles of whole PQ2_0 blocks per split runs "
+  if (c.decodeInt8 && (c.tile != LinearTile::GgufStaged || workload_.rows > kMaximumInt8Rows ||
+                       !decodeInt8TakesSplits(k, c.splits)))
+    throw std::invalid_argument("only a staged block plan of up to 32 rows of whole PQ2_0 blocks per split runs "
                                 "int8 activations");
   if (c.tile == LinearTile::GgufColumn) {
     // The column tile reads its rows alone, a gate/up pair's both tensors in
@@ -148,8 +149,8 @@ void LinearPlan::requireConfiguration() const {
   if (c.tile == LinearTile::GgufRegister) {
     // Split boundaries fall on coefficient units, of 64 inputs at the fewest
     // (quant_register_unit); addGgufRegister checks each segment's.
-    if (!decodeTiles || !c.validSplits() || k / 64 < c.splits)
-      throw std::invalid_argument("the register block tile takes a decode tile's rows and a K unit per split");
+    if (workload_.rows > kMaximumRegisterRows || !c.validSplits() || k / 64 < c.splits)
+      throw std::invalid_argument("the register block tile takes up to four table tiles' rows and a K unit per split");
     return;
   }
   if (c.tile == LinearTile::GgufPrefill || c.tile == LinearTile::GgufPrefillInt8) {
@@ -158,8 +159,7 @@ void LinearPlan::requireConfiguration() const {
   }
   if (!c.validSplits() || (k / 32) % c.splits)
     throw std::invalid_argument("staged block splits take whole 32-input groups");
-  if (workload_.rows > kMaximumStagedPrefillRows)
-    throw std::invalid_argument("the staged block tile runs plans of up to 64 rows");
+  if (!decodeTiles) throw std::invalid_argument("the staged block tile runs plans of up to 64 rows");
 }
 
 uint32_t LinearPlan::storageRows() const noexcept {
@@ -273,8 +273,8 @@ void Linear::addGguf(metal::CommandGraph &graph, const LinearBuffers &b,
   }
 }
 
-// The staged tiles, for plans of up to ProjectionCalibration::stagedPrefillRows
-// rows: every row of the plan's storage in each threadgroup's tile, grid
+// The staged tiles, for plans of up to kMaximumDecodeTileRows rows: every row
+// of the plan's storage in each threadgroup's tile, grid
 // (64-column tiles, K splits). A gate/up runs as two passes, or, where
 // selectProjection sets LinearConfig::oneGateUpPass, as one pass over
 // 32-column threadgroups of one simdgroup each. In int8 activations
@@ -362,8 +362,8 @@ void Linear::addGgufStaged(metal::CommandGraph &graph, const LinearBuffers &b,
   for (const QuantizedSegment &s : segments) addDecodeTensor(b, w.epilogue, s, gate, tensor);
 }
 
-// The prefill tile, which runs plans of more than
-// ProjectionCalibration::stagedPrefillRows rows over 128-row tiles: a plain projection in one
+// The prefill tile, which runs plans of more than kMaximumDecodeTileRows rows
+// over 128-row tiles: a plain projection in one
 // dispatch per format, over the column tiles of its segments of that format
 // (a fused projection's segments otherwise run as small grids of their own),
 // a projection with an epilogue in one dispatch per segment. Rows past the
