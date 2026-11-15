@@ -345,6 +345,20 @@ inline void gdn_decode_scan(device const State *state_in,
     for (uint r = 0; r < RowsInFlight; ++r)
       for (uint i = 0; i < 4; ++i)
         state_out[base(batch, r) + i] = State(state[r][i]);
+    // A tree lane's value of each of the batch's state rows, which the path
+    // term of every row reads: the 16-row kernel reads it once a batch, which
+    // the compiler leaves in the rows' loop beside the stores of their
+    // outputs, and so runs 16-row trees 12-22% faster (an M5 Pro, the 27B's
+    // and 35B's GDN layers, one and four lanes). The 8-row kernel reads it
+    // once a row and only on the row's path. Read outside the path's
+    // condition (once a batch or once a row), its trees ran 10-20% faster on
+    // an M5 Max and 10-13% faster on an M5 Pro, but 13% slower on the M5 Pro
+    // at one lane of the 27B, and its chains 0.5% slower.
+    constexpr bool kValuesOnce = Rows == 16;
+    float lane_values[RowsInFlight];
+    if constexpr (Tree && kValuesOnce)
+      for (uint r = 0; r < RowsInFlight; ++r)
+        lane_values[r] = float(shared.values[value_dim[r] * Rows + lane % Rows]);
     for (uint token = 0; token < Rows; ++token) {
       if (token == verified)
         break;
@@ -357,7 +371,10 @@ inline void gdn_decode_scan(device const State *state_in,
         const bool on_path = lane < Rows && (shared.paths[token] >> row & 1);
         const float coefficient = shared.coefficients[token * Rows + row];
         for (uint r = 0; r < RowsInFlight; ++r) {
-          result[r] = on_path ? coefficient * float(shared.values[value_dim[r] * Rows + row]) : 0.0f;
+          if constexpr (kValuesOnce)
+            result[r] = on_path ? coefficient * lane_values[r] : 0.0f;
+          else
+            result[r] = on_path ? coefficient * float(shared.values[value_dim[r] * Rows + row]) : 0.0f;
           for (uint i = 0; i < 4; ++i)
             result[r] += state[r][i] * query[i];
           result[r] = simd_sum(result[r]);
