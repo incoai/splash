@@ -2123,9 +2123,10 @@ struct Runtime::Impl {
 
   // Writes a lane's inputs that the CPU makes: the anchor at row 0 of the
   // lane's draft input rows (whose other rows the draft's block fills with
-  // mask tokens, and which the verify reads its anchor from), the RoPE
-  // positions of its rows, and the target's own inputs of its verify rows
-  // (QwenTarget::prepareVerifyLane).
+  // mask tokens), the draft's RoPE positions of its rows, and the target's
+  // own inputs of its verify rows (QwenTarget::prepareVerifyLane). The
+  // verify's tokens, the anchor's among them, and its RoPE rows follow the
+  // layout the cycle's selector writes (encodeBatchVerifyInput).
   void prepareDecodeLane(Request &entry, const ModelBatchItem &item,
                          uint32_t lane) {
     if (!entry.resident || !entry.promptComplete || !entry.pendingToken) {
@@ -2150,23 +2151,25 @@ struct Runtime::Impl {
               geometry.target.maskToken);
     targetModel->prepareVerifyLane(lane, item.logicalPosition, targetRequest(entry));
 
-    // The target's RoPE rows are the cycle's packed rows, the lane's
-    // kCycleBlocks; the draft's are its verify block's positions, kDecodeRows
-    // a lane, the draft's rows the first.
-    auto *positions =
-        contents<uint32_t>(decodeArena->batchSlice(DecodeTensor::Positions, kLaneCount), "decode RoPE positions") +
-        uint64_t{kCycleBlocks[lane].first} * 3;
+    // The draft's RoPE rows are its verify block's positions, kDecodeRows a
+    // lane, the draft's rows the first: the draft is a text model over
+    // logical positions.
     auto *draftPositions =
         contents<uint32_t>(decodeArena->get(lane, DecodeTensor::DraftPositions),
                            "decode draft RoPE positions");
-    for (uint32_t row = 0; row < kCycleBlocks[lane].rows; ++row) {
-      const std::array<uint32_t, 3> rotary =
-          ropePosition(entry, item.logicalPosition + row);
-      std::copy(rotary.begin(), rotary.end(), positions + row * 3);
-    }
-    // The draft is a text model over logical positions.
     for (uint32_t row = 0; row < kDecodeRows; ++row)
       draftPositions[row] = static_cast<uint32_t>(item.logicalPosition + row);
+  }
+
+  // Each lane's anchor's RoPE position, from which the target rotates its
+  // verify rows by their depths in its tree (encodeBatchVerifyInput): its
+  // pending token's, a text row after any image, whose three axes are one.
+  static std::array<uint32_t, kLaneCount> anchorPositions(std::span<Request *const> entries,
+                                                         std::span<const ModelBatchItem> items) {
+    std::array<uint32_t, kLaneCount> anchors{};
+    for (size_t lane = 0; lane < entries.size(); ++lane)
+      anchors[lane] = ropePosition(*entries[lane], items[lane].logicalPosition)[0];
+    return anchors;
   }
 
   // A target whose commit writes auxiliary state after every retained row
@@ -2620,11 +2623,19 @@ struct Runtime::Impl {
     targetModel->addEmbedding(graph, decodeArena->batchSlice(tokens, lanes), output, rows);
   }
 
-  // The target's own inputs of the verify rows the draft's selector wrote.
-  void encodeBatchVerifyInput(CommandGraph &graph, const ops::StepRows &step) {
-    targetModel->addVerifyInput(graph, {decodeArena->batchSlice(DecodeTensor::InputTokens, step.lanes),
-                                        decodeArena->batchSlice(DecodeTensor::TreeRows, step.lanes),
-                                        decodeArena->batchSlice(DecodeTensor::LaneLayout, step.lanes), step});
+  // The target's own inputs of the verify rows the draft's selector wrote:
+  // their tokens, and their RoPE rows, each at its lane's anchor's position
+  // (`anchors`, anchorPositions) plus its depth in the lane's tree.
+  void encodeBatchVerifyInput(CommandGraph &graph, const ops::StepRows &step, std::span<const uint32_t> anchors) {
+    const MetalBuffer tree = decodeArena->batchSlice(DecodeTensor::TreeRows, step.lanes);
+    const MetalBuffer layout = decodeArena->batchSlice(DecodeTensor::LaneLayout, step.lanes);
+    targetModel->addVerifyInput(graph, {decodeArena->batchSlice(DecodeTensor::InputTokens, step.lanes), tree,
+                                        layout, step});
+    ops::RoPE::addTreeTables(graph, layout, tree, anchors.first(step.lanes),
+                             prefillArena->get(PrefillTensor::TargetInverseFrequencies),
+                             decodeArena->lanesRows(TargetTensor::RopeCos, step.lanes),
+                             decodeArena->lanesRows(TargetTensor::RopeSin, step.lanes), step,
+                             geometry.target.ropeScaling.attentionFactor(), geometry.target.rotaryPairs);
   }
 
   // A stop token or the last budgeted token needs no target work of its own:
@@ -2865,7 +2876,8 @@ struct Runtime::Impl {
 
         CommandGraph target;
         const uint32_t width = static_cast<uint32_t>(lanes_.size());
-        impl_.encodeBatchVerifyInput(target, step_);
+        impl_.encodeBatchVerifyInput(target, step_,
+                                     anchorPositions(std::span(entries).first(lanes_.size()), items_));
         impl_.encodeBatchEmbedding(target, DecodeTensor::InputTokens,
                                    impl_.decodeArena->lanesRows(TargetTensor::Hidden0, width), width, step_.rows);
         impl_.encodeTargetVerifyBatchForward(
@@ -3555,14 +3567,11 @@ Runtime::decodeAsync(const BatchPlan &plan,
 
   const std::span<Impl::Request *const> entries(requests.data(), width);
   CommandGraph commandGraph;
-  impl_->addRopeTables(
-      commandGraph,
-      impl_->decodeArena->batchSlice(DecodeTensor::Positions, width), step.rows,
-      impl_->decodeArena->batchSlice(DecodeTensor::DraftPositions, width),
-      width * kDecodeRows, impl_->decodeArena->lanesRows(TargetTensor::RopeCos, width),
-      impl_->decodeArena->lanesRows(TargetTensor::RopeSin, width),
-      impl_->decodeArena->batchSlice(DecodeTensor::DraftRopeCos, width),
-      impl_->decodeArena->batchSlice(DecodeTensor::DraftRopeSin, width));
+  // The draft's RoPE rows alone: the target's follow the layout the cycle's
+  // selector writes (encodeBatchVerifyInput).
+  impl_->addRopeTables(commandGraph, {}, 0, impl_->decodeArena->batchSlice(DecodeTensor::DraftPositions, width),
+                       width * kDecodeRows, {}, {}, impl_->decodeArena->batchSlice(DecodeTensor::DraftRopeCos, width),
+                       impl_->decodeArena->batchSlice(DecodeTensor::DraftRopeSin, width));
   impl_->encodeBatchEmbedding(commandGraph, DecodeTensor::DraftInputTokens,
                               impl_->decodeArena->batchSlice(DecodeTensor::DraftHidden0, width), width,
                               width * kDraftRows);
@@ -3579,7 +3588,7 @@ Runtime::decodeAsync(const BatchPlan &plan,
                                                            commandGraph, step, std::move(count),
                                                            std::move(completion));
   }
-  impl_->encodeBatchVerifyInput(commandGraph, step);
+  impl_->encodeBatchVerifyInput(commandGraph, step, Impl::anchorPositions(entries, items));
   impl_->encodeBatchEmbedding(commandGraph, DecodeTensor::InputTokens,
                               impl_->decodeArena->lanesRows(TargetTensor::Hidden0, width), width, step.rows);
   impl_->encodeTargetVerifyBatchForward(commandGraph, entries, items, *reads);

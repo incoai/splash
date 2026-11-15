@@ -490,7 +490,6 @@ private:
 // tensors of its lanes' rows (DecodeArena::target).
 enum class DecodeTensor : uint32_t {
   InputTokens,
-  Positions,
   DraftPositions,
   ContextProjected,
   ContextHidden,

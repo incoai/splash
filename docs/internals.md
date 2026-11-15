@@ -464,7 +464,13 @@ anchor the child whose token is its row's selection, and the draft's context
 commit takes the retained path's rows in order (the mask acceptance writes,
 `DecodeTensor::RetainedRows`). The draft's own block stays eight rows a lane,
 and a lane's draft RoPE rows hold its verify block's positions, the first eight
-of which the draft's rows take and the context commit one a retained row.
+of which the draft's rows take and the context commit one a retained row. The
+target's RoPE rows of a cycle follow the selector's layout: after it, each
+packed row's at its lane's anchor position plus the row's depth
+(`ops::RoPE::addTreeTables`, `rope_build_tree_tables`), as `rope_build_tables`
+makes a row at that position, bit for bit (`rope-tables`), so a tree row off
+its lane's first chain rotates at its own position; the cycle's start builds
+the draft's rows alone.
 
 A lane's verify block holds up to 16 rows (`SPLASH_TARGET_VERIFY_ROWS`): its
 anchor and the rows proposed after it, a chain or a tree, each row's place in
@@ -1064,7 +1070,8 @@ with learned sinks (`reduce…_sinks`) binds the layer's, an F32 per query head,
 which adds each to its row's softmax after the splits, in their order, as a key with no value;
 one without an output gate (`gather`) gives the out-projection its attention rows as they are.
 The RoPE tables are of the target geometry's pairs (`rope_build_tables`, or
-`rope_build_tables_p64` for 64). `make test-engine-metal` runs `attention-variants`, every
+`rope_build_tables_p64` for 64; a decode cycle's `rope_build_tree_tables*`). `make test-engine-metal`
+runs `attention-variants`, every
 variant through the production encoders against fp64, and
 `make benchmark-attention-sweep ATTENTION_SWEEP_ARGS='--shapes flint-window,flint-full'` times
 Flint's two kinds of layers with their sinks: a window of 512 keys with RoPE, and the whole

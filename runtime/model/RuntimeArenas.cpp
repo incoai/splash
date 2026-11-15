@@ -186,7 +186,6 @@ decodeTensorBytes(const RuntimeGeometry &geometry,
   };
   const uint64_t r = kDecodeRows;
   put(DecodeTensor::InputTokens, bytesFor<uint32_t>(r));
-  put(DecodeTensor::Positions, bytesFor<uint32_t>(r * 3));
   put(DecodeTensor::DraftPositions, bytesFor<uint32_t>(r));
   put(DecodeTensor::ContextProjected,
       bytesFor<uint16_t>(r * geometry.draft.hiddenSize));
