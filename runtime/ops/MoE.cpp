@@ -180,7 +180,7 @@ MoeGroupParams groupParams(const MoePlan &plan, const BlockMoeWeights &weights) 
           shape.expertIntermediateSize / GGUF_STAGED_COLUMNS,
           shape.hiddenSize / GGUF_TILE_COLUMNS,
           weights.stream != nullptr,
-          {}};
+          0};
 }
 
 void addGather(metal::CommandGraph &graph, const MoeBuffers &buffers, const MoePlan &plan) {
@@ -218,22 +218,16 @@ void MoE::addRouting(metal::CommandGraph &graph, const MoeBuffers &buffers, cons
   const MoeScratch &scratch = buffers.scratch;
   for (const MoeScratchField &field : kMoeScratchFields)
     requireBytes(scratch.*field.buffer, required.*field.bytes, field.name);
-  // Each verify block's rows, from its first row, lie in the step's rows past
-  // the block before it.
+  // A decode step's lanes' rows and verify rows, which the selector writes
+  // on the device.
   MoeGroupParams group = groupParams(plan, weights);
-  const std::span<const LaneRows> blocks = buffers.verifyBlocks;
-  if (blocks.size() > SPLASH_MAXIMUM_BATCH_WIDTH)
-    throw std::invalid_argument("a MoE step has more verify blocks than lanes");
-  uint32_t end = 0;
-  for (size_t block = 0; block < blocks.size(); ++block) {
-    const LaneRows &verify = blocks[block];
-    if (!verify.rows || verify.first < end || verify.first > rows || verify.rows > rows - verify.first)
-      throw std::invalid_argument("MoE verify blocks are not ascending, disjoint blocks of the step's rows");
-    group.verify.first_row[block] = verify.first;
-    group.verify.rows[block] = verify.rows;
-    end = verify.first + verify.rows;
+  const uint32_t lanes = buffers.lanes;
+  if (lanes > SPLASH_MAXIMUM_BATCH_WIDTH) throw std::invalid_argument("a MoE step has more lanes than a batch");
+  if (lanes) {
+    requireBytes(buffers.laneRows, uint64_t{lanes} * sizeof(SplashLaneRows), "MoE lane rows");
+    requireBytes(buffers.verifyRows, uint64_t{lanes} * sizeof(uint32_t), "MoE verify rows");
   }
-  if (!blocks.empty()) requireBytes(buffers.verifyRows, blocks.size() * sizeof(uint32_t), "MoE verify rows");
+  group.lanes = lanes;
   MoE::addRoutes(graph, buffers.input, weights.router, weights.sharedScalarGate, scratch.groupedInput,
                  scratch.selectedExperts, scratch.routingWeights, rows, shape, plan.configuration().ggufRouterTile);
   // The expert passes launch the live tiles alone, on grids the grouping
@@ -245,8 +239,8 @@ void MoE::addRouting(metal::CommandGraph &graph, const MoeBuffers &buffers, cons
   std::vector<metal::MetalBuffer> grouping{scratch.selectedExperts, scratch.tileDescriptors, scratch.tileCount,
                                            scratch.groupedRoutes, scratch.routeRows, weights.slotTable,
                                            scratch.expertSlots};
-  if (!blocks.empty()) grouping.push_back(buffers.verifyRows);
-  graph.add(routingKernel(blocks.empty() ? "moe_group_routes" : "moe_group_routes_verified", shape,
+  if (lanes) grouping.insert(grouping.end(), {buffers.verifyRows, buffers.laneRows});
+  graph.add(routingKernel(lanes ? "moe_group_routes_verified" : "moe_group_routes", shape,
                           &CompiledMoeRouting::slicesSuffix),
             std::move(grouping), group, {1, 1, 1}, {shape.routerWidth(), 1, 1});
 }

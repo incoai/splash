@@ -239,7 +239,7 @@ struct MoeLoadPart final {
 // block `block`'s steps `parts` and before the expert passes that read the
 // load slot table, what makes the experts their tiles name resident and both
 // tables name their slots; it may read a step's input and the rows it routes
-// (MoeBuffers::input, verifyBlocks). Several steps' parts load the union of
+// (MoeBuffers::input, laneRows). Several steps' parts load the union of
 // their experts at once. `beside` adds the dispatches that run while the load
 // reads (metal::EventStep::beside): they may read the slots of the experts
 // the grouping found resident, which the load leaves as they are, through its
@@ -371,14 +371,15 @@ struct MoeBuffers final {
   metal::MetalBuffer residual;
   metal::MetalBuffer output;
   MoeScratch scratch;
-  // A step's decode lanes' verify blocks, each a lane's rows, up to one per
-  // lane, ascending in its rows without overlapping, and each block's verify
-  // rows, a uint32 per block (the draft selector's,
-  // ops::DraftSelector::addVerifyRows): its routing routes each block's
-  // verify rows alone and every row of no block, a prompt's
-  // (moe_group_routes_verified*), and a streamed load predicts the next MoE
-  // block's experts from the rows it routes. None, every row routes.
-  std::span<const LaneRows> verifyBlocks;
+  // A decode step's `lanes` lanes: each lane's rows of the step, a
+  // SplashLaneRows a lane, and its verify rows, the first of them, a uint32 a
+  // lane, as the draft selector lays them out on the device
+  // (ops::DraftSelector::addVerifyRows). Its routing routes each lane's verify
+  // rows alone and every row of no lane (moe_group_routes_verified*), and a
+  // streamed load predicts the next MoE block's experts from the rows it
+  // routes. A prompt chunk has no lanes: every row routes.
+  uint32_t lanes = 0;
+  metal::MetalBuffer laneRows;
   metal::MetalBuffer verifyRows;
 };
 

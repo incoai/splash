@@ -39,7 +39,7 @@ struct ExpertStoreStats final {
   // releaseAboveFloor() gives them back (the first is releaseUnitBytes).
   std::vector<uint64_t> releaseUnits;
   // Per use (uses[0] a prompt's loads, uses[1] a decode step's, whose steps
-  // route their lanes' verify blocks, ops::MoeBuffers::verifyBlocks): the
+  // route their lanes' verify rows, ops::MoeBuffers::lanes): the
   // blocks loaded, the distinct experts they routed, those not resident and
   // of them those read ahead, the experts read ahead whole (routed or not),
   // the bytes read from the sources (ahead or not, routed or not), and the

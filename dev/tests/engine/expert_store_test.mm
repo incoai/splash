@@ -86,7 +86,6 @@ using splash::ops::MoeLoadPart;
 using splash::ops::MoePlan;
 using splash::ops::MoeScratch;
 using splash::ops::MoeShape;
-using splash::ops::LaneRows;
 using splash::ops::QuantizedSegment;
 using splash::test::MethodReplacement;
 using splash::test::require;
@@ -118,13 +117,13 @@ constexpr uint64_t kSpareBytes = 4096;
 constexpr uint32_t kLaneRows = splash::model::ExecutionLimits::targetVerifyRows;
 
 // A step a block runs: the plan of its rows and, of a decode step, its
-// lanes, whose verify blocks, every row verified (ops::MoeBuffers::
-// verifyBlocks), make its loads a decode step's; a prefill chunk has none.
+// lanes, whose rows, every row verified (ops::MoeBuffers::lanes), make its
+// loads a decode step's; a prefill chunk has none.
 struct StepPlan final {
   MoePlan plan;
   uint32_t lanes = 0;
-  // Each lane's verify block and its rows, from row lane x laneRows.
-  std::array<LaneRows, splash::model::ExecutionLimits::maximumBatchWidth> blocks{};
+  // Each lane's rows of the step, from row lane x laneRows.
+  std::array<SplashLaneRows, splash::model::ExecutionLimits::maximumBatchWidth> blocks{};
   uint32_t laneRows = 0;
 };
 
@@ -235,11 +234,14 @@ void freshRows(MetalBackend &backend, Buffers &b, const MoeShape &shape) {
   b.moe.output = zeros(backend, uint64_t{kMaximumRows} * shape.hiddenSize * 2, "moe-output");
 }
 
-// A step's buffers routing its decode lanes' verify blocks, every row of
-// each, or none.
+// A step's buffers routing its decode lanes' rows, every row of each, or
+// none.
 void verifyLanes(MetalBackend &backend, Buffers &b, const StepPlan &step) {
   const std::vector<uint32_t> verify(step.blocks.size(), step.laneRows);
-  b.moe.verifyBlocks = std::span(step.blocks).first(step.lanes);
+  b.moe.lanes = step.lanes;
+  b.moe.laneRows =
+      step.lanes ? upload(backend, step.blocks.data(), step.blocks.size() * sizeof(SplashLaneRows), "lane-rows")
+                 : MetalBuffer{};
   b.moe.verifyRows =
       step.lanes ? upload(backend, verify.data(), verify.size() * sizeof(uint32_t), "verify-rows") : MetalBuffer{};
 }

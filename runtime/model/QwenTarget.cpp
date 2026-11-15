@@ -105,11 +105,11 @@ void QwenTarget::addEmbedding(metal::CommandGraph &graph,
 }
 
 void QwenTarget::addStateCommit(metal::CommandGraph &, QwenTargetCommitBuffers buffers,
-                                std::span<const ops::LaneRows> blocks) const {
-  if (blocks.empty() || blocks.size() > ExecutionLimits::maximumBatchWidth)
+                                const ops::StepRows &step) const {
+  if (!step.lanes || step.lanes > ExecutionLimits::maximumBatchWidth)
     throw std::invalid_argument("invalid Qwen state commit batch");
   if (geometry_.stateLayout.auxiliaryBytes)
-    for (uint32_t lane = 0; lane < blocks.size(); ++lane)
+    for (uint32_t lane = 0; lane < step.lanes; ++lane)
       if (!buffers.auxiliaryIn[lane] || !buffers.auxiliaryOut[lane])
         throw std::invalid_argument("Qwen state commit lane without its auxiliary state");
 }
@@ -152,9 +152,15 @@ QwenTarget::PrefillStep QwenTarget::prefillStep(metal::CommandGraph &graph, cons
       chunk.rows > ExecutionLimits::prefillTokenBudget)
     throw std::invalid_argument("invalid Qwen prefill chunk");
   PrefillStep step{graph, chunk.buffers, chunk.sequences, chunk.rows, kv.layers(), spilled};
+  step.decode = chunk.decode;
+  if (step.decode && (step.decode->step.lanes != chunk.sequences.size() || step.decode->step.rows != chunk.rows))
+    throw std::invalid_argument("a Qwen decode step's lanes or rows do not match its chunk");
   for (size_t index = 0; index < chunk.sequences.size(); ++index) {
     const QwenTargetPrefillSequence &sequence = chunk.sequences[index];
-    requirePrefillStates(geometry_, sequence);
+    // A decode lane's states are the step's (QwenTargetDecodeBuffers).
+    if (!step.decode) requirePrefillStates(geometry_, sequence);
+    else if (geometry_.stateLayout.auxiliaryBytes && !step.decode->auxiliary[index])
+      throw std::invalid_argument("Qwen decode lane without its auxiliary state");
     step.chunks[index] = sequence.chunk;
     step.pageTables[index] = sequence.pageTable;
   }
@@ -171,36 +177,11 @@ QwenTarget::PrefillStep QwenTarget::prefillStep(metal::CommandGraph &graph, cons
   return step;
 }
 
-QwenTarget::VerifyStep QwenTarget::verifyStep(metal::CommandGraph &graph, const QwenTargetVerifyBuffers &buffers,
-                                              const kv::PageStorage &kv, SpilledKvReads &spilled,
-                                              std::span<const kv::ChunkedPrefillParams> chunks,
-                                              uint32_t lanes) const {
-  const std::span<const SplashKvLayer> kvLayers = kv.layers();
-  if (!lanes || lanes > ExecutionLimits::maximumBatchWidth || chunks.size() != lanes ||
-      kvLayers.size() != geometry_.kvLayout.attentionLayers) {
-    throw std::invalid_argument("invalid Qwen verify batch");
-  }
-  for (uint32_t lane = 0; lane < lanes; ++lane)
-    if (geometry_.stateLayout.auxiliaryBytes && !buffers.auxiliary[lane])
-      throw std::invalid_argument("Qwen verify lane without its auxiliary state");
-  // Each lane is a sequence of its verify rows.
-  const ops::AttentionWorkspace workspace{buffers.attentionPartials.sizeBytes(),
-                                          buffers.attentionStatistics.sizeBytes()};
-  VerifyStep step{graph, buffers, kvLayers, spilled, chunks, lanes, lanes * kVerifyRows,
-                  operators_.attention(chunks, geometry_.attentionQueryHeads, geometry_.kvLayout, workspace)};
-  if (const uint32_t window = geometry_.kvLayout.windowTokens)
-    step.windowedAttention.emplace(operators_.attention(chunks, geometry_.attentionQueryHeads, geometry_.kvLayout,
-                                                        workspace, {.windowTokens = window}));
-  if (geometry_.ffnKind == QwenFfnKind::SparseMoe)
-    step.moe = operators_.moe(geometry_.moeBlockShape(), geometry_.moeRouterFormat, step.rows);
-  for (uint32_t lane = 0; lane < lanes; ++lane) step.verifyBlocks[lane] = {lane * kVerifyRows, kVerifyRows};
-  return step;
-}
-
 void QwenTarget::planOutputRows(PrefillStep &step, uint32_t index) const {
   step.readRows.clear();
-  if (index + 1 != geometry_.layers || !geometry_.isFullAttentionLayer(index) || geometry_.captureSlot(index) ||
-      step.sequences.size() == step.rows)
+  // A decode step reads every row's logits.
+  if (step.decode || index + 1 != geometry_.layers || !geometry_.isFullAttentionLayer(index) ||
+      geometry_.captureSlot(index) || step.sequences.size() == step.rows)
     return;
   for (const QwenTargetPrefillSequence &sequence : step.sequences)
     step.readRows.push_back(sequence.rowBegin + sequence.rows - 1);
@@ -215,84 +196,121 @@ void QwenTarget::addReadRows(const PrefillStep &step, const metal::MetalBuffer &
     ops::RowCopy::add(step.graph, compact, {row, width, 0}, output, {step.readRows[row], width, 0}, 1, width);
 }
 
-namespace {
-
-// A mixer's output projection of a prefill step's `rows` rows of `hidden`,
-// on the plans of its chunk's `chunkRows`.
-void addPrefillOutput(const ops::Linear &linear, metal::CommandGraph &graph, metal::MetalBuffer hidden,
-                      const ops::Projection &projection, uint32_t rows, uint32_t chunkRows,
-                      ops::LinearScratch scratch, metal::MetalBuffer output, metal::MetalBuffer residual) {
-  if (residual)
-    linear.addResidualProjection(graph, std::move(hidden), projection, std::move(residual), std::move(output), rows,
-                                 scratch, chunkRows);
-  else
-    linear.addProjection(graph, std::move(hidden), projection, std::move(output), rows, scratch, chunkRows);
-}
-
-} // namespace
-
-void QwenTarget::addPrefillMixer(PrefillStep &step, const QwenGdnWeights &mixer, BlockOutput output) const {
+// The mixer reads the normalized rows as its input projection's plan takes
+// them (`normalized`, which the norm wrote), and its output projection reads
+// the hidden rows as the decode GDN or the attention gate wrote them for its
+// plan. A decode step's GDN scans each lane's rows along its tree from the
+// lane's state into its tape (ops::GDN::addDecode); a prompt sequence's scans
+// its rows in order from its states into theirs, capturing those inside.
+void QwenTarget::addPrefillMixer(PrefillStep &step, const QwenGdnWeights &mixer, ops::PreparedInput normalized,
+                                 BlockOutput output) const {
   const QwenTargetPrefillBuffers &b = step.buffers;
+  const ops::Linear &linear = operators_.linear();
   const uint32_t layer = step.gdnLayer++;
-  operators_.linear().addProjection(step.graph, b.normalized, mixer.inputProjection, b.gdnPacked, step.rows,
-                                    b.linearScratch);
-  for (const QwenTargetPrefillSequence &sequence : step.sequences) {
-    const auto u16 = [&](const metal::MetalBuffer &buffer, uint32_t width) {
-      return rowsOf<uint16_t>(buffer, sequence.rowBegin, sequence.rows, width);
-    };
-    const auto f32 = [&](const metal::MetalBuffer &buffer, uint32_t width) {
-      return rowsOf<float>(buffer, sequence.rowBegin, sequence.rows, width);
-    };
-    std::vector<ops::GdnPrefillCapture> captures;
-    captures.reserve(sequence.stateCaptures.size());
-    for (const QwenTargetStateCapture &capture : sequence.stateCaptures)
-      captures.push_back({capture.row, capture.convolution[layer], capture.recurrent[layer]});
-    ops::GDN::addPrefill(
-        step.graph, backend_,
-        {u16(b.gdnPacked, geometry_.packedGdnWidth), mixer.convolutionWeights, sequence.convolutionIn[layer],
-         sequence.convolutionOut[layer], u16(b.gdnQueries, geometry_.gdnKeyWidth()),
-         u16(b.gdnKeys, geometry_.gdnKeyWidth()), u16(b.gdnValues, geometry_.attentionWidth), mixer.decay,
-         mixer.timeBias, f32(b.gdnDecay, geometry_.gdnValueHeads), u16(b.gdnBeta, geometry_.gdnValueHeads),
-         sequence.recurrentIn[layer], sequence.recurrentOut[layer], u16(b.recurrent, geometry_.attentionWidth),
-         mixer.mixerNorm, u16(b.gdnHidden, geometry_.attentionWidth)},
-        geometry_.gdnShape(), sequence.rows, geometry_.stateLayout.format, mixer.outputHeadOrder, captures);
+  linear.add(step.graph,
+             {.input = b.normalized, .output = b.gdnPacked, .scratch = b.linearScratch,
+              .prepared = std::move(normalized)},
+             mixer.inputProjection, linear.plan(mixer.inputProjection, step.rows));
+  const ops::LinearPlan outputPlan = linear.plan(
+      mixer.outputProjection, step.rows, output.residual ? ops::LinearEpilogue::Residual : ops::LinearEpilogue::None);
+  ops::PreparedInput hidden;
+  if (const QwenTargetDecodeBuffers *d = step.decode) {
+    hidden = ops::GDN::addDecode(
+        step.graph,
+        {b.gdnPacked, mixer.convolutionWeights, d->currentGdnStates, d->nextGdnStates, d->gdnTape,
+         std::span(d->gdnTapeLanes).first(d->step.lanes), b.laneRows, step.rows, d->step.laneCap, mixer.decay,
+         mixer.timeBias, mixer.mixerNorm, b.gdnHidden, d->verifyRows, d->tree, b.linearScratch},
+        geometry_.gdnShape(), layer, geometry_.stateLayout.strides(), mixer.outputHeadOrder, outputPlan.input());
+  } else {
+    for (const QwenTargetPrefillSequence &sequence : step.sequences) {
+      const auto u16 = [&](const metal::MetalBuffer &buffer, uint32_t width) {
+        return rowsOf<uint16_t>(buffer, sequence.rowBegin, sequence.rows, width);
+      };
+      const auto f32 = [&](const metal::MetalBuffer &buffer, uint32_t width) {
+        return rowsOf<float>(buffer, sequence.rowBegin, sequence.rows, width);
+      };
+      std::vector<ops::GdnPrefillCapture> captures;
+      captures.reserve(sequence.stateCaptures.size());
+      for (const QwenTargetStateCapture &capture : sequence.stateCaptures)
+        captures.push_back({capture.row, capture.convolution[layer], capture.recurrent[layer]});
+      ops::GDN::addPrefill(
+          step.graph, backend_,
+          {u16(b.gdnPacked, geometry_.packedGdnWidth), mixer.convolutionWeights, sequence.convolutionIn[layer],
+           sequence.convolutionOut[layer], u16(b.gdnQueries, geometry_.gdnKeyWidth()),
+           u16(b.gdnKeys, geometry_.gdnKeyWidth()), u16(b.gdnValues, geometry_.attentionWidth), mixer.decay,
+           mixer.timeBias, f32(b.gdnDecay, geometry_.gdnValueHeads), u16(b.gdnBeta, geometry_.gdnValueHeads),
+           sequence.recurrentIn[layer], sequence.recurrentOut[layer], u16(b.recurrent, geometry_.attentionWidth),
+           mixer.mixerNorm, u16(b.gdnHidden, geometry_.attentionWidth)},
+          geometry_.gdnShape(), sequence.rows, geometry_.stateLayout.format, mixer.outputHeadOrder, captures);
+    }
   }
-  addPrefillOutput(operators_.linear(), step.graph, b.gdnHidden, mixer.outputProjection, step.rows, step.rows,
-                   b.linearScratch, std::move(output.rows), std::move(output.residual));
+  linear.add(step.graph,
+             {.input = b.gdnHidden, .output = std::move(output.rows), .residual = std::move(output.residual),
+              .scratch = b.linearScratch, .prepared = std::move(hidden)},
+             mixer.outputProjection, outputPlan);
 }
 
-// A sequence with blocks attends through the lists of its tiles of rows,
-// and one whose history holds Index pages attends staging, which the step's
-// reads of spilled K/V fill with the layer's history and the chunk's pages
-// once stored.
-void QwenTarget::addPrefillMixer(PrefillStep &step, const QwenAttentionWeights &mixer, BlockOutput output,
-                                 std::span<const ops::AttentionBlocks> blocks) const {
+// A sequence with blocks attends through the lists of its tiles of rows. A
+// prompt sequence whose history holds Index pages attends staging, which the
+// step's reads of spilled K/V fill with the layer's history and the chunk's
+// pages once stored; a decode step whose lanes hold Index pages attends
+// through its lists, which those reads locate (SpilledKvReads::verify): its
+// rows that read their page tables read only Full pages (SparseKvShape).
+void QwenTarget::addPrefillMixer(PrefillStep &step, const QwenAttentionWeights &mixer, ops::PreparedInput normalized,
+                                 BlockOutput output, std::span<const ops::AttentionBlocks> blocks) const {
   const QwenTargetPrefillBuffers &b = step.buffers;
+  const ops::Linear &linear = operators_.linear();
   const uint32_t layer = step.attentionLayer++;
   const ops::AttentionVariant variant = geometry_.attentionVariant(layer);
   if (!blocks.empty() && blocks.size() != step.sequences.size())
-    throw std::invalid_argument("Qwen prefill attention blocks do not match its sequences");
+    throw std::invalid_argument("Qwen attention blocks do not match its sequences");
   // A layer that outputs its read rows alone adds its output to their
   // residual rows, which it gathers.
   if (!step.readRows.empty() && !output.residual)
     throw std::logic_error("a Qwen prefill layer that outputs its read rows alone has no residual rows");
   const std::span<const kv::ChunkedPrefillParams> sequences = step.attentionSequences();
   const ops::AttentionStaging staging{b.fullQueries, b.fullAttention};
-  const ops::AttentionRows rows{b.laneRows, step.rows};
-  operators_.linear().addProjection(step.graph, b.normalized, mixer.inputProjection, b.fullPacked, step.rows,
-                                    b.linearScratch);
+  const ops::AttentionRows rows{b.laneRows, step.rows, step.decode ? step.decode->tree : metal::MetalBuffer{}};
+  const std::span<const metal::MetalBuffer> pageTables = std::span(step.pageTables).first(sequences.size());
+  linear.add(step.graph,
+             {.input = b.normalized, .output = b.fullPacked, .scratch = b.linearScratch,
+              .prepared = std::move(normalized)},
+             mixer.inputProjection, linear.plan(mixer.inputProjection, step.rows));
+  // The q/k projection stores each row's key and value in its page slot.
   ops::PagedAttention::addProjection(step.graph, b.fullPacked, mixer.queryNorm, mixer.keyNorm, b.ropeCos, b.ropeSin,
-                                     staging, step.kvLayers[layer], std::span(step.pageTables).first(sequences.size()),
-                                     sequences, rows, geometry_.attentionQueryHeads, geometry_.kvLayout, variant);
+                                     staging, step.kvLayers[layer], pageTables, sequences, rows,
+                                     geometry_.attentionQueryHeads, geometry_.kvLayout, variant);
   std::array<ops::AttentionHistory, ExecutionLimits::maximumBatchWidth> histories{};
-  for (size_t index = 0; index < step.sequences.size(); ++index) {
-    const QwenTargetPrefillSequence &sequence = step.sequences[index];
-    const uint32_t firstPage = sequence.chunk.committed_tokens / kv::kPageTokens;
-    const PrefillKv attended =
-        step.spilled.prefill(step.graph, layer, sequence.lane, firstPage,
-                             kv::chunkedPrefillRequiredPages(sequence.chunk) - firstPage,
-                             {sequence.pageTable, step.kvLayers[layer]});
-    histories[index] = {attended.kv, attended.table, blocks.empty() ? ops::AttentionBlocks{} : blocks[index]};
+  if (step.decode) {
+    std::array<ops::AttentionBlocks, ExecutionLimits::maximumBatchWidth> attended{};
+    std::copy(blocks.begin(), blocks.end(), attended.begin());
+    // The lists' located blocks resolve from spilled history pages, which
+    // the projection's stores into the step's own slots do not touch.
+    if (step.spilled.active()) {
+      if (blocks.empty() || !blocks.front().stride)
+        throw std::logic_error("a decode step over spilled K/V attends without block lists");
+      // The lanes' lists lie in one buffer, each from its own list
+      // (Qwen4ExpTarget::addPrefillQsa), which the reads locate at once.
+      ops::AttentionBlocks command = blocks.front();
+      command.list = 0;
+      const ops::AttentionBlocks located = step.spilled.verify(step.graph, layer, command);
+      for (size_t index = 0; index < blocks.size(); ++index) {
+        attended[index] = located;
+        attended[index].list = blocks[index].list;
+      }
+    }
+    for (size_t index = 0; index < sequences.size(); ++index)
+      histories[index] = {step.kvLayers[layer], pageTables[index], attended[index]};
+  } else {
+    for (size_t index = 0; index < step.sequences.size(); ++index) {
+      const QwenTargetPrefillSequence &sequence = step.sequences[index];
+      const uint32_t firstPage = sequence.chunk.committed_tokens / kv::kPageTokens;
+      const PrefillKv history =
+          step.spilled.prefill(step.graph, layer, sequence.lane, firstPage,
+                               kv::chunkedPrefillRequiredPages(sequence.chunk) - firstPage,
+                               {sequence.pageTable, step.kvLayers[layer]});
+      histories[index] = {history.kv, history.table, blocks.empty() ? ops::AttentionBlocks{} : blocks[index]};
+    }
   }
   // Only each sequence's last row is read (planOutputRows): the tile that
   // holds it attends as in the chunk (lastTiles), and its gated row is read
@@ -302,163 +320,75 @@ void QwenTarget::addPrefillMixer(PrefillStep &step, const QwenAttentionWeights &
   ops::PagedAttention::addAttention(step.graph, lastRows ? ops::PagedAttention::lastTiles(plan) : plan, staging,
                                     b.attentionPartials, b.attentionStatistics, sequences,
                                     std::span(histories).first(sequences.size()), rows, mixer.sinks);
-  ops::PagedAttention::addGate(step.graph, b.fullPacked, staging, b.attentionHidden, sequences, rows,
-                               lastRows ? ops::AttentionOutput::Last : ops::AttentionOutput::Every,
-                               geometry_.attentionQueryHeads, geometry_.kvLayout);
+  const ops::LinearPlan outputPlan =
+      linear.plan(mixer.outputProjection, step.outputRows(),
+                  output.residual ? ops::LinearEpilogue::Residual : ops::LinearEpilogue::None, nullptr, step.rows);
+  const ops::PreparedInput hidden = ops::PagedAttention::addGate(
+      step.graph, b.fullPacked, staging, b.attentionHidden, sequences, rows,
+      lastRows ? ops::AttentionOutput::Last : ops::AttentionOutput::Every, geometry_.attentionQueryHeads,
+      geometry_.kvLayout, b.linearScratch, lastRows ? ops::LinearInput::Plain : outputPlan.input());
   // The read rows' residual rows, gathered into the normalized rows the
   // input projection has read.
   metal::MetalBuffer residual = std::move(output.residual);
-  if (!step.readRows.empty()) {
+  if (lastRows) {
     for (uint32_t row = 0; row < step.readRows.size(); ++row)
       ops::RowCopy::add(step.graph, residual, {step.readRows[row], geometry_.hiddenSize, 0}, b.normalized,
                         {row, geometry_.hiddenSize, 0}, 1, geometry_.hiddenSize);
     residual = b.normalized;
   }
-  addPrefillOutput(operators_.linear(), step.graph, b.attentionHidden, mixer.outputProjection, step.outputRows(),
-                   step.rows, b.linearScratch, std::move(output.rows), std::move(residual));
-}
-
-ops::LinearInput QwenTarget::decodeInput(const ops::Projection &projection, uint32_t lanes) const {
-  return operators_.linear().plan(projection, lanes * kVerifyRows).input();
-}
-
-void QwenTarget::addDecodeProjection(metal::CommandGraph &graph, metal::MetalBuffer input,
-                                     const ops::Projection &projection, metal::MetalBuffer output, uint32_t lanes,
-                                     ops::LinearScratch scratch, ops::PreparedInput prepared) const {
-  const ops::Linear &linear = operators_.linear();
-  linear.add(graph,
-             {.input = std::move(input), .output = std::move(output), .scratch = scratch,
-              .prepared = std::move(prepared)},
-             projection, linear.plan(projection, lanes * kVerifyRows));
-}
-
-// Each producer emits the table (if any) its consumer's plan reads.
-void QwenTarget::addVerifyMixer(VerifyStep &step, const QwenGdnWeights &mixer, ops::PreparedInput normalized,
-                                BlockOutput output) const {
-  const QwenTargetVerifyBuffers &b = step.buffers;
-  const ops::Linear &linear = operators_.linear();
-  const uint32_t layer = step.gdnLayer++;
-  addDecodeProjection(step.graph, b.normalized, mixer.inputProjection, b.gdnPacked, step.lanes, b.linearScratch,
-                      std::move(normalized));
-  const ops::LinearPlan outputPlan = linear.plan(
-      mixer.outputProjection, step.rows, output.residual ? ops::LinearEpilogue::Residual : ops::LinearEpilogue::None);
-  const ops::PreparedInput hidden = ops::GDN::addDecode(
-      step.graph,
-      {b.gdnPacked, mixer.convolutionWeights, b.currentGdnStates, b.nextGdnStates, b.gdnTape,
-       std::span(b.gdnTapeLanes).first(step.lanes), b.laneRows, step.rows, ops::verifyLaneCap(step.rows, step.lanes),
-       mixer.decay, mixer.timeBias, mixer.mixerNorm, b.gdnHidden, b.verifyRows, b.tree, b.linearScratch},
-      geometry_.gdnShape(), layer, geometry_.stateLayout.strides(), mixer.outputHeadOrder, outputPlan.input());
   linear.add(step.graph,
-             {.input = b.gdnHidden, .output = std::move(output.rows), .residual = std::move(output.residual),
+             {.input = b.attentionHidden, .output = std::move(output.rows), .residual = std::move(residual),
               .scratch = b.linearScratch, .prepared = hidden},
              mixer.outputProjection, outputPlan);
 }
 
-// Each lane is a sequence of its verify rows. With `blocks`, each lane's
-// rows attend through its list, list `blocks.list` + lane
-// (ops::AttentionBlocks), whose blocks on Index pages the step's reads of
-// spilled K/V locate. Rows that read their page table instead read only Full
-// pages (SparseKvShape), so a step whose lanes hold Index pages attends
-// through lists.
-void QwenTarget::addVerifyMixer(VerifyStep &step, const QwenAttentionWeights &mixer, ops::PreparedInput normalized,
-                                BlockOutput output, const ops::AttentionBlocks &blocks) const {
-  const QwenTargetVerifyBuffers &b = step.buffers;
-  const ops::Linear &linear = operators_.linear();
-  const uint32_t layer = step.attentionLayer++;
-  const ops::AttentionVariant variant = geometry_.attentionVariant(layer);
-  const ops::AttentionStaging staging{b.fullQueries, b.fullAttention};
-  const ops::AttentionRows rows{b.laneRows, step.rows, b.tree};
-  const std::span<const metal::MetalBuffer> pageTables = std::span(b.pageTables).first(step.lanes);
-  addDecodeProjection(step.graph, b.normalized, mixer.inputProjection, b.fullPacked, step.lanes, b.linearScratch,
-                      std::move(normalized));
-  ops::PagedAttention::addProjection(step.graph, b.fullPacked, mixer.queryNorm, mixer.keyNorm, b.ropeCos, b.ropeSin,
-                                     staging, step.kvLayers[layer], pageTables, step.chunks, rows,
-                                     geometry_.attentionQueryHeads, geometry_.kvLayout, variant);
-  // The lists' located blocks resolve from spilled history pages, which the
-  // projection's stores into the step's own slots do not touch.
-  ops::AttentionBlocks attended = blocks;
-  if (step.spilled.active()) {
-    if (!blocks.stride) throw std::logic_error("a verify over spilled K/V attends without block lists");
-    attended = step.spilled.verify(step.graph, layer, blocks);
-  }
-  std::array<ops::AttentionHistory, ExecutionLimits::maximumBatchWidth> histories{};
-  for (uint32_t lane = 0; lane < step.lanes; ++lane) {
-    histories[lane] = {step.kvLayers[layer], pageTables[lane], attended};
-    if (attended.stride) histories[lane].blocks.list += lane;
-  }
-  ops::PagedAttention::addAttention(step.graph, variant.windowTokens ? *step.windowedAttention : step.attention,
-                                    staging, b.attentionPartials, b.attentionStatistics, step.chunks,
-                                    std::span(histories).first(step.lanes), rows, mixer.sinks);
-  const ops::LinearPlan outputPlan = linear.plan(
-      mixer.outputProjection, step.rows, output.residual ? ops::LinearEpilogue::Residual : ops::LinearEpilogue::None);
-  const ops::PreparedInput hidden = ops::PagedAttention::addGate(
-      step.graph, b.fullPacked, staging, b.attentionHidden, step.chunks, rows, ops::AttentionOutput::Every,
-      geometry_.attentionQueryHeads, geometry_.kvLayout, b.linearScratch, outputPlan.input());
-  linear.add(step.graph,
-             {.input = b.attentionHidden, .output = std::move(output.rows), .residual = std::move(output.residual),
-              .scratch = b.linearScratch, .prepared = hidden},
-             mixer.outputProjection, outputPlan);
-}
-
+// The norm writes the rows as the FFN's first plan takes them (swiGluInput):
+// a decode step's and a short chunk's gate/up plan, a longer chunk's gate.
 void QwenTarget::addPrefillDenseFfn(PrefillStep &step, uint32_t index, const ops::NormWeights &norm,
                                     ops::SwiGluProjections ffn, metal::MetalBuffer residual,
                                     metal::MetalBuffer output) const {
+  const QwenTargetPrefillBuffers &b = step.buffers;
+  const ops::Linear &linear = operators_.linear();
   const uint32_t rows = step.outputRows();
-  ops::Normalization::addRms(step.graph, residual, norm, step.buffers.normalized, geometry_.hiddenSize, rows);
-  const ops::PrefillFfnBuffers buffers = step.buffers.ffn();
+  const ops::PrefillFfnBuffers buffers = b.ffn();
   // The split takes whole chunks; read rows alone run on the GPU.
-  if (step.aneFfn && step.readRows.empty())
+  if (step.aneFfn && step.readRows.empty()) {
+    ops::Normalization::addRms(step.graph, residual, norm, b.normalized, geometry_.hiddenSize, rows);
     step.aneFfn->add(step.graph, index, buffers, std::move(residual), std::move(output), rows);
-  else
-    operators_.linear().addSwiGlu(step.graph, ffn, buffers, std::move(residual), std::move(output), rows,
-                                  step.rows);
+    return;
+  }
+  const ops::PreparedInput normalized =
+      ops::Normalization::addRms(step.graph, residual, norm, b.normalized, geometry_.hiddenSize, rows,
+                                 b.linearScratch, linear.swiGluInput(ffn, rows, step.rows));
+  linear.addSwiGlu(step.graph, ffn, buffers, std::move(residual), std::move(output), rows, step.rows, normalized);
 }
 
+// A decode step's lanes route their verify rows alone (ops::MoeBuffers::lanes).
 void QwenTarget::addPrefillMoeRouting(PrefillStep &step, const ops::NormWeights &norm,
                                       const ops::BlockMoeWeights &ffn, metal::MetalBuffer residual,
                                       metal::MetalBuffer output) const {
   const QwenTargetPrefillBuffers &b = step.buffers;
   ops::Normalization::addRms(step.graph, residual, norm, b.normalized, geometry_.hiddenSize, step.outputRows());
-  step.ffn = {b.normalized, std::move(residual), std::move(output), b.moe, {}, {}};
+  step.ffn = {.input = b.normalized, .residual = std::move(residual), .output = std::move(output), .scratch = b.moe};
+  if (const QwenTargetDecodeBuffers *d = step.decode) {
+    step.ffn.lanes = d->step.lanes;
+    step.ffn.laneRows = b.laneRows;
+    step.ffn.verifyRows = d->verifyRows;
+  }
   ops::MoE::addRouting(step.graph, step.ffn, ffn, *step.moe);
-}
-
-void QwenTarget::addVerifyDenseFfn(VerifyStep &step, const ops::NormWeights &norm, ops::SwiGluProjections ffn,
-                                   metal::MetalBuffer residual, metal::MetalBuffer output) const {
-  const QwenTargetVerifyBuffers &b = step.buffers;
-  const ops::Linear &linear = operators_.linear();
-  const ops::LinearPlan gateUpPlan = linear.plan(*ffn.up, step.rows, ops::LinearEpilogue::GateUp, ffn.gate);
-  const ops::PreparedInput normalized =
-      ops::Normalization::addRms(step.graph, residual, norm, b.normalized, geometry_.hiddenSize, step.rows,
-                                 b.linearScratch, gateUpPlan.input());
-  linear.add(step.graph,
-             {.input = b.normalized, .output = b.denseIntermediate, .gateScratch = b.denseGateScratch,
-              .scratch = b.linearScratch, .prepared = normalized},
-             *ffn.up, gateUpPlan, ffn.gate);
-  linear.add(step.graph,
-             {.input = b.denseIntermediate, .output = std::move(output), .residual = std::move(residual),
-              .scratch = b.linearScratch},
-             *ffn.down, linear.plan(*ffn.down, step.rows, ops::LinearEpilogue::Residual));
-}
-
-void QwenTarget::addVerifyMoe(VerifyStep &step, const ops::NormWeights &norm, const ops::BlockMoeWeights &ffn,
-                              metal::MetalBuffer residual, metal::MetalBuffer output) const {
-  const QwenTargetVerifyBuffers &b = step.buffers;
-  ops::Normalization::addRms(step.graph, residual, norm, b.normalized, geometry_.hiddenSize, step.rows);
-  ops::MoE::add(step.graph,
-                {b.normalized, std::move(residual), std::move(output), b.moe,
-                 std::span(step.verifyBlocks).first(step.lanes), b.verifyRows},
-                ffn, *step.moe);
 }
 
 void QwenTarget::addNormalizedHead(metal::CommandGraph &graph, const ops::NormWeights &finalNorm,
                                    metal::MetalBuffer hidden, metal::MetalBuffer finalHidden,
-                                   metal::MetalBuffer logits, uint32_t lanes, ops::LinearScratch scratch) const {
-  const ops::PreparedInput normalized =
-      ops::Normalization::addRms(graph, std::move(hidden), finalNorm, finalHidden, geometry_.hiddenSize,
-                                 lanes * kVerifyRows, scratch, decodeInput(vocabularyProjection(), lanes));
-  addDecodeProjection(graph, std::move(finalHidden), vocabularyProjection(), std::move(logits), lanes, scratch,
-                      normalized);
+                                   metal::MetalBuffer logits, uint32_t rows, ops::LinearScratch scratch) const {
+  const ops::Linear &linear = operators_.linear();
+  const ops::LinearPlan plan = linear.plan(vocabularyProjection(), rows);
+  const ops::PreparedInput normalized = ops::Normalization::addRms(
+      graph, std::move(hidden), finalNorm, finalHidden, geometry_.hiddenSize, rows, scratch, plan.input());
+  linear.add(graph,
+             {.input = std::move(finalHidden), .output = std::move(logits), .scratch = scratch,
+              .prepared = normalized},
+             vocabularyProjection(), plan);
 }
 
 void QwenTarget::addCapture(metal::CommandGraph &graph, uint32_t slot, metal::MetalBuffer output,
@@ -504,36 +434,9 @@ public:
     return addPrefillLayers(std::span(steps), *this, layers);
   }
 
-  void addVerify(metal::CommandGraph &graph, QwenTargetVerifyBuffers buffers, const kv::PageStorage &kv,
-                 SpilledKvReads &spilled, std::span<const kv::ChunkedPrefillParams> chunks,
-                 uint32_t lanes) const override {
-    VerifyStep step = verifyStep(graph, buffers, kv, spilled, chunks, lanes);
-    for (uint32_t index = 0; index < geometry_.layers; ++index) {
-      const Layer &layer = weights_.layers[index];
-      const metal::MetalBuffer input = buffers.hidden[index & 1];
-      const metal::MetalBuffer output = buffers.hidden[(index & 1) ^ 1];
-      const metal::MetalBuffer residual = std::visit(
-          [&](const auto &mixer) {
-            const ops::PreparedInput normalized = ops::Normalization::addRms(
-                step.graph, input, layer.inputNorm, buffers.normalized, geometry_.hiddenSize, step.rows,
-                buffers.linearScratch, decodeInput(mixer.inputProjection, step.lanes));
-            const BlockOutput block{mixerOutput(buffers, mixer), input};
-            addVerifyMixer(step, mixer, normalized, block);
-            return block.rows;
-          },
-          layer.mixer);
-      addVerifyFfn(step, layer, residual, output);
-      if (const auto slot = geometry_.captureSlot(index))
-        addCapture(step.graph, *slot, output, 0, buffers.capturedTargetHidden, 0, step.rows);
-    }
-    requireLayerPartition(step.gdnLayer, step.attentionLayer);
-    addHeadBatch(step.graph, buffers.hidden[geometry_.layers & 1], buffers.finalHidden, buffers.logits, step.lanes,
-                 buffers.linearScratch);
-  }
-
   void addHeadBatch(metal::CommandGraph &graph, metal::MetalBuffer hidden, metal::MetalBuffer finalHidden,
-                    metal::MetalBuffer logits, uint32_t lanes, ops::LinearScratch scratch) const override {
-    addNormalizedHead(graph, weights_.finalNorm, std::move(hidden), std::move(finalHidden), std::move(logits), lanes,
+                    metal::MetalBuffer logits, uint32_t rows, ops::LinearScratch scratch) const override {
+    addNormalizedHead(graph, weights_.finalNorm, std::move(hidden), std::move(finalHidden), std::move(logits), rows,
                       scratch);
   }
 
@@ -553,11 +456,13 @@ private:
     const QwenTargetPrefillBuffers &b = step.buffers;
     const metal::MetalBuffer input = b.hidden[index & 1];
     planOutputRows(step, index);
-    ops::Normalization::addRms(step.graph, input, layer.inputNorm, b.normalized, geometry_.hiddenSize, step.rows);
     const metal::MetalBuffer residual = std::visit(
         [&](const auto &mixer) {
+          const ops::PreparedInput normalized = ops::Normalization::addRms(
+              step.graph, input, layer.inputNorm, b.normalized, geometry_.hiddenSize, step.rows, b.linearScratch,
+              operators_.linear().plan(mixer.inputProjection, step.rows).input());
           const BlockOutput block{mixerOutput(b, mixer), input};
-          addPrefillMixer(step, mixer, block);
+          addPrefillMixer(step, mixer, normalized, block);
           return block.rows;
         },
         layer.mixer);
@@ -568,12 +473,23 @@ private:
     const QwenTargetPrefillBuffers &b = step.buffers;
     if (const ops::BlockMoeWeights *ffn = moe(index)) ops::MoE::addRouted(step.graph, step.ffn, *ffn, *step.moe);
     addReadRows(step, b.hidden[index & 1], b.hidden[(index & 1) ^ 1]);
+    // The draft reads a decode step's every row of the layers it captures.
+    if (step.decode) {
+      if (const auto slot = geometry_.captureSlot(index))
+        addCapture(step.graph, *slot, b.hidden[(index & 1) ^ 1], 0, step.decode->capturedTargetHidden, 0, step.rows);
+      return;
+    }
     forEachPrefillCapture(step, index, [&](uint32_t slot, uint32_t source, uint32_t destination, uint32_t rows) {
       addCapture(step.graph, slot, b.hidden[(index & 1) ^ 1], source, b.captured, destination, rows);
     });
   }
+  // A decode step's head reads every row's final norm.
   [[nodiscard]] metal::MetalBuffer addPrefillEnd(PrefillStep &step) const {
-    return step.buffers.hidden[geometry_.layers & 1];
+    const metal::MetalBuffer hidden = step.buffers.hidden[geometry_.layers & 1];
+    if (const QwenTargetDecodeBuffers *d = step.decode)
+      addNormalizedHead(step.graph, weights_.finalNorm, hidden, d->finalHidden, d->logits, step.rows,
+                        step.buffers.linearScratch);
+    return hidden;
   }
 
   // The FFN of layer `index` (QwenTarget::addPrefillDenseFfn and its kin): a
@@ -586,14 +502,6 @@ private:
       addPrefillMoeRouting(step, layer.postAttentionNorm, *qwenMoeBlock(layer), std::move(residual),
                            std::move(output));
   }
-  void addVerifyFfn(VerifyStep &step, const Layer &layer, metal::MetalBuffer residual,
-                    metal::MetalBuffer output) const {
-    if (const std::optional<ops::SwiGluProjections> dense = denseFfn(layer))
-      addVerifyDenseFfn(step, layer.postAttentionNorm, *dense, std::move(residual), std::move(output));
-    else
-      addVerifyMoe(step, layer.postAttentionNorm, *qwenMoeBlock(layer), std::move(residual), std::move(output));
-  }
-
   const QwenTargetWeights<Layout, Layer> &weights_;
 };
 

@@ -36,12 +36,9 @@ public:
   void addInsideCapture(metal::CommandGraph &graph, metal::MetalBuffer auxiliaryIn,
                         metal::MetalBuffer captured) const override;
   void prepareVerifyLane(uint32_t lane, uint64_t position, const QwenTargetRequest &request) override;
-  void addVerify(metal::CommandGraph &graph, QwenTargetVerifyBuffers buffers, const kv::PageStorage &kv,
-                 SpilledKvReads &spilled, std::span<const kv::ChunkedPrefillParams> chunks,
-                 uint32_t lanes) const override;
   // The hidden rows are the final mix, which the head reads as they are.
   void addHeadBatch(metal::CommandGraph &graph, metal::MetalBuffer hidden, metal::MetalBuffer finalHidden,
-                    metal::MetalBuffer logits, uint32_t lanes, ops::LinearScratch scratch) const override;
+                    metal::MetalBuffer logits, uint32_t rows, ops::LinearScratch scratch) const override;
   // The GPU hashes the verify rows' PLE rows, and when the table streams a
   // host step of the command stages them, between the hash and the verify
   // that gathers them.
@@ -49,7 +46,7 @@ public:
   // Each lane's PLE history and QSA pending keys after its retained rows,
   // from the convolution inputs and keys its verify wrote of its block.
   void addStateCommit(metal::CommandGraph &graph, QwenTargetCommitBuffers buffers,
-                      std::span<const ops::LaneRows> blocks) const override;
+                      const ops::StepRows &step) const override;
 
   // The PLE rows of a lane's rows of the last step, each row's heads' in
   // order.
@@ -59,12 +56,14 @@ private:
   // The shared prefill's layer loop runs the family's (QwenTarget::addPrefillLayers).
   friend class QwenTarget;
 
-  // A prefill chunk's step: the shared one, the chunk's scratch, the QSA
-  // blocks each sequence's rows complete and where each attention layer's
-  // QSA index sits in the extents the index tables reach.
+  // A step's family state: the shared one, its scratch, the QSA blocks each
+  // prompt sequence's rows complete or each decode lane's rows may complete,
+  // and where each attention layer's QSA index sits in the extents the index
+  // tables reach.
   struct PrefillStep : QwenTarget::PrefillStep {
     Qwen4Scratch scratch{};
     std::vector<Qwen4Blocks> blocks{};
+    Qwen4LaneBlocks laneBlocks{};
     std::span<const uint32_t> indexOffsets{};
   };
   // The family's prefill layers. The streams start as the embedding's rows;
@@ -82,22 +81,13 @@ private:
   void addPrefillExperts(PrefillStep &step, uint32_t index) const;
   [[nodiscard]] metal::MetalBuffer addPrefillEnd(PrefillStep &step) const;
 
-  // A verify step: the shared one, its scratch, the QSA blocks its lanes
-  // complete and where each attention layer's QSA index sits.
-  struct VerifyStep : QwenTarget::VerifyStep {
-    Qwen4Scratch scratch{};
-    Qwen4LaneBlocks blocks{};
-    std::span<const uint32_t> indexOffsets{};
-  };
-
-  // A prefill step's mix of the streams through `hyper` into `output` and,
-  // when it injects, the injection weights into the step's scratch.
-  void addPrefillMix(PrefillStep &step, const Qwen4HyperWeights &hyper, metal::MetalBuffer output) const;
-  // A verify step's mix into `output`; its projections read the tables its
-  // norm and low step write, and with `next`, the decode projection that
-  // reads `output` first takes the table the mix writes (the returned input).
-  ops::PreparedInput addVerifyMix(VerifyStep &step, const Qwen4HyperWeights &hyper, metal::MetalBuffer output,
-                                  const ops::Projection *next = nullptr) const;
+  // A step's mix of the streams through `hyper` into `output` and, when it
+  // injects, the injection weights into the step's scratch. Its projections
+  // read the tables its norm and low step write as their plans take them,
+  // and with `next`, the projection that reads `output` first takes the
+  // table the mix writes (the returned input).
+  ops::PreparedInput addMix(PrefillStep &step, const Qwen4HyperWeights &hyper, metal::MetalBuffer output,
+                            const ops::Projection *next = nullptr) const;
   // The QSA of the attention layer the step reaches next: the indexer's
   // projections of the step's rows and the QSA keys and block index of each
   // sequence or lane (writing its rows' and its completed blocks' entries);
@@ -106,7 +96,8 @@ private:
   // through (none for rows that keep every block).
   [[nodiscard]] std::vector<ops::AttentionBlocks> addPrefillQsa(PrefillStep &step,
                                                                 const Qwen4IndexerWeights &indexer) const;
-  [[nodiscard]] ops::AttentionBlocks addVerifyQsa(VerifyStep &step, const Qwen4IndexerWeights &indexer) const;
+  [[nodiscard]] std::vector<ops::AttentionBlocks> addDecodeQsa(PrefillStep &step,
+                                                               const Qwen4IndexerWeights &indexer) const;
   // The PLE layer's `count` rows into scratch.pleRows: from the table by
   // scratch.pleIndices, or, when the table streams, from the rows staged by
   // scratch.pleSlots, with the table's own gather.

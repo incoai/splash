@@ -17,9 +17,8 @@ namespace {
 
 constexpr uint32_t kLanes = ExecutionLimits::maximumBatchWidth;
 constexpr uint32_t kChunkRows = ExecutionLimits::prefillTokenBudget;
-constexpr uint32_t kVerifyRows = ExecutionLimits::decodeLaneRows;
-// A decode step's most rows: every lane's verify rows, packed.
-constexpr uint32_t kStepRows = kLanes * kVerifyRows;
+// A decode step's most rows: every lane's verify block, packed.
+constexpr uint32_t kStepRows = kLanes * ExecutionLimits::targetVerifyRows;
 // The QSA selection scores a prefill chunk's rows in batches, which bounds
 // its score scratch (a row scores every block of the context): of this many
 // rows at the native window (prefillScoreRows); a verify scores every lane's

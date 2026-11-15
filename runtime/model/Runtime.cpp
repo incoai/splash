@@ -65,24 +65,14 @@ using metal::MetalBuffer;
 constexpr ops::StepRows decodeStep(uint32_t lanes) noexcept {
   return {lanes, lanes * kDraftRows, ops::verifyLaneCap(lanes * kDraftRows, lanes)};
 }
-// Each lane's rows of a decode cycle, as decodeStep lays them out: the
-// draft's block, ExecutionLimits::decodeLaneRows rows from lane x
-// decodeLaneRows, which the target's verify kernels and its state commit take.
-constexpr std::array<ops::LaneRows, kLaneCount> kCycleBlocks = [] {
-  std::array<ops::LaneRows, kLaneCount> blocks{};
-  for (uint32_t lane = 0; lane < kLaneCount; ++lane)
-    blocks[lane] = {lane * ExecutionLimits::decodeLaneRows, ExecutionLimits::decodeLaneRows};
-  return blocks;
-}();
-static_assert(ExecutionLimits::decodeLaneRows == kDraftRows, "a decode cycle's lanes are their drafts' blocks");
-// The row a lane selects its first token after a prompt from, the first of
-// its cycle block: the target's LM head runs over a cycle's rows of the
-// command's lanes (decodeLaneRows a lane), not over the decode arena's
-// kDecodeRows a lane. The prompt's final row of the hidden goes there, and
-// the selection reads its logits and writes its token there.
+// The row a lane selects its first token after a prompt from, lane x
+// decodeLaneRows: the target's LM head runs over decodeLaneRows rows of each
+// of the command's lanes (encodeInitialSelections), not over the decode
+// arena's kDecodeRows a lane. The prompt's final row of the hidden goes
+// there, and the selection reads its logits and writes its token there.
 constexpr std::array<uint32_t, kLaneCount> kDecodeFirstRows = [] {
   std::array<uint32_t, kLaneCount> rows{};
-  for (uint32_t lane = 0; lane < kLaneCount; ++lane) rows[lane] = kCycleBlocks[lane].first;
+  for (uint32_t lane = 0; lane < kLaneCount; ++lane) rows[lane] = lane * ExecutionLimits::decodeLaneRows;
   return rows;
 }();
 
@@ -1538,7 +1528,7 @@ struct Runtime::Impl {
     };
     targetModel->addHeadBatch(graph, decodeArena->lanesRows(TargetTensor::Hidden0, storage),
                              d(DecodeTensor::FinalHidden),
-                             d(DecodeTensor::Logits), width,
+                             d(DecodeTensor::Logits), width * ExecutionLimits::decodeLaneRows,
                              decodeArena->linearScratch());
     if (std::ranges::none_of(lanes, &InitialSelection::select))
       return;
@@ -1883,15 +1873,14 @@ struct Runtime::Impl {
     if (!graph.dispatches().empty()) backend.preparePipelines(graph.dispatches());
   }
 
-  // Creates the pipelines of a verify of `entries`, each after the longest
-  // history the target serves, without running it (Runtime::warmupDecodeBatch).
-  // The lanes' inputs are prepared for that history; the next decode prepares
-  // its own.
+  // Creates the pipelines of a decode step of `entries`, each after the
+  // longest history the target serves before a lane's most rows, without
+  // running it (Runtime::warmupDecodeBatch). The lanes' inputs are prepared
+  // for that history; the next decode prepares its own.
   void prepareLongestVerify(std::span<Request *const> entries) {
-    const uint32_t history = geometry.target.contextTokens() - ExecutionLimits::decodeLaneRows;
+    const uint32_t history = geometry.target.contextTokens() - kDecodeRows;
     const std::vector<uint32_t> tokens(history);
-    const std::vector<uint32_t> pages((history + ExecutionLimits::decodeLaneRows + kv::kPageTokens - 1) /
-                                      kv::kPageTokens);
+    const std::vector<uint32_t> pages((history + kDecodeRows + kv::kPageTokens - 1) / kv::kPageTokens);
     std::vector<ModelBatchItem> items(entries.size());
     for (uint32_t lane = 0; lane < entries.size(); ++lane) {
       QwenTargetRequest request = targetRequest(*entries[lane]);
@@ -1901,7 +1890,7 @@ struct Runtime::Impl {
     }
     SpilledKvReads reads;
     CommandGraph graph;
-    encodeTargetVerifyBatchForward(graph, entries, items, reads);
+    encodeTargetDecodeForward(graph, entries, items, decodeStep(static_cast<uint32_t>(entries.size())), reads);
     backend.preparePipelines(graph.dispatches());
   }
 
@@ -2426,71 +2415,53 @@ struct Runtime::Impl {
     entry.lookupChain = chain;
   }
 
-  void encodeTargetVerifyBatchForward(CommandGraph &graph,
-                                      std::span<Request *const> entries,
-                                      std::span<const ModelBatchItem> items, SpilledKvReads &reads) {
-    if (entries.empty() || entries.size() > kLaneCount ||
-        entries.size() != items.size()) {
-      throw std::invalid_argument("invalid target verify batch");
-    }
-    const uint32_t lanes = static_cast<uint32_t>(entries.size());
-    const uint32_t storage = targetModel->decodeStorageLanes(lanes);
-    auto d = [&](DecodeTensor tensor) {
-      return decodeArena->batchSlice(tensor, storage);
-    };
-
-    // The target step tensors of the lanes' rows: a row tensor's rows of the
-    // storage lanes, the staging, workspaces and MoE scratch whole.
-    const auto rows = [&](TargetTensor tensor) { return decodeArena->lanesRows(tensor, storage); };
+  // A decode step's target forward: the prompt forward over the step's rows
+  // (QwenTarget::addPrefill with a decode chunk), each lane a sequence of the
+  // step's lane cap of rows at most, which the selector's layout places, its
+  // head over every row.
+  void encodeTargetDecodeForward(CommandGraph &graph, std::span<Request *const> entries,
+                                 std::span<const ModelBatchItem> items, const ops::StepRows &step,
+                                 SpilledKvReads &reads) {
+    if (entries.empty() || entries.size() > kLaneCount || entries.size() != items.size() ||
+        step.lanes != entries.size())
+      throw std::invalid_argument("invalid target decode step");
+    const uint32_t lanes = step.lanes;
     const TargetArena &target = decodeArena->target();
-    std::array<ChunkedPrefillParams, kLaneCount> chunks{};
-    QwenTargetVerifyBuffers buffers;
+    QwenTargetPrefillBuffers buffers = targetBuffers(target, 0);
     buffers.linearScratch = decodeArena->linearScratch();
-    buffers.hidden = {rows(TargetTensor::Hidden0), rows(TargetTensor::Hidden1)};
-    buffers.normalized = rows(TargetTensor::Normalized);
-    buffers.gdnHidden = rows(TargetTensor::GdnHidden);
-    buffers.gdnOutput = rows(TargetTensor::GdnOutput);
-    buffers.denseIntermediate = rows(TargetTensor::Intermediate);
-    buffers.fullPacked = rows(TargetTensor::FullPacked);
-    buffers.fullQueries = target.get(TargetTensor::FullQueries);
-    buffers.attentionPartials = target.get(TargetTensor::AttentionPartials);
-    buffers.attentionStatistics = target.get(TargetTensor::AttentionStatistics);
-    buffers.fullAttention = target.get(TargetTensor::FullAttention);
-    buffers.attentionHidden = rows(TargetTensor::AttentionHidden);
-    buffers.attentionOutput = rows(TargetTensor::AttentionOutput);
-    buffers.ropeCos = rows(TargetTensor::RopeCos);
-    buffers.ropeSin = rows(TargetTensor::RopeSin);
-    buffers.ropeInverseFrequencies = prefillArena->get(PrefillTensor::TargetInverseFrequencies);
-    buffers.capturedTargetHidden = d(DecodeTensor::CapturedTargetHidden);
-    buffers.finalHidden = d(DecodeTensor::FinalHidden);
-    buffers.logits = d(DecodeTensor::Logits);
     buffers.denseGateScratch = decodeArena->gateScratch();
-    buffers.gdnPacked = rows(TargetTensor::GdnPacked);
-    buffers.gdnTape = decodeArena->batchSlice(DecodeTensor::GdnTape, kLaneCount);
-    buffers.moe = target.moeScratch(0);
-    buffers.verifyRows = decodeArena->batchSlice(DecodeTensor::VerifyRows, lanes);
-    buffers.tree = decodeArena->batchSlice(DecodeTensor::TreeRows, lanes);
+    buffers.ropeInverseFrequencies = prefillArena->get(PrefillTensor::TargetInverseFrequencies);
     buffers.laneRows = decodeArena->batchSlice(DecodeTensor::LaneLayout, lanes);
-    for (uint32_t lane = 0; lane < lanes; ++lane)
-      chunks[lane] = chunkParams(items[lane].logicalPosition, kCycleBlocks[lane].rows, items[lane].pageTable);
+    QwenTargetDecodeBuffers decode;
+    decode.step = step;
+    decode.gdnTape = decodeArena->batchSlice(DecodeTensor::GdnTape, kLaneCount);
+    decode.verifyRows = decodeArena->batchSlice(DecodeTensor::VerifyRows, lanes);
+    decode.tree = decodeArena->batchSlice(DecodeTensor::TreeRows, lanes);
+    decode.capturedTargetHidden = decodeArena->batchSlice(DecodeTensor::CapturedTargetHidden, kLaneCount);
+    decode.finalHidden = decodeArena->batchSlice(DecodeTensor::FinalHidden, kLaneCount);
+    decode.logits = decodeArena->batchSlice(DecodeTensor::Logits, kLaneCount);
+    std::array<QwenTargetPrefillSequence, kLaneCount> sequences{};
     for (uint32_t lane = 0; lane < kLaneCount; ++lane) {
       Request &entry = laneEntry(entries, lane);
       const LaneTables tables = laneTables(entry.stateLane);
-      buffers.pageTables[lane] = tables.pages;
-      buffers.indexTables[lane] = tables.index;
-      buffers.currentGdnStates[lane] = states.current(entry.stateLane).stateBase;
-      buffers.nextGdnStates[lane] = states.next(entry.stateLane).stateBase;
-      buffers.auxiliary[lane] = states.current(entry.stateLane).auxiliary;
+      decode.currentGdnStates[lane] = states.current(entry.stateLane).stateBase;
+      decode.nextGdnStates[lane] = states.next(entry.stateLane).stateBase;
+      decode.auxiliary[lane] = states.current(entry.stateLane).auxiliary;
+      decode.indexTables[lane] = tables.index;
+      if (lane >= lanes) continue;
+      const QwenLaneMetadata &metadata = states.metadata(entry.stateLane);
+      decode.gdnTapeLanes[lane] = {decodeArena->gdnTapeSlot(entry.stateLane, metadata.activeParity),
+                                   decodeArena->gdnTapeSlot(entry.stateLane, metadata.activeParity ^ 1),
+                                   metadata.pendingPath};
+      sequences[lane] = {.lane = lane,
+                         .rows = step.laneCap,
+                         .chunk = chunkParams(items[lane].logicalPosition, step.laneCap, items[lane].pageTable),
+                         .pageTable = tables.pages,
+                         .indexTable = tables.index};
     }
-    for (uint32_t lane = 0; lane < lanes; ++lane) {
-      const uint32_t stateLane = entries[lane]->stateLane;
-      const QwenLaneMetadata &metadata = states.metadata(stateLane);
-      buffers.gdnTapeLanes[lane] = {decodeArena->gdnTapeSlot(stateLane, metadata.activeParity),
-                                    decodeArena->gdnTapeSlot(stateLane, metadata.activeParity ^ 1),
-                                    metadata.pendingPath};
-    }
-    targetModel->addVerify(graph, std::move(buffers), kvPages, reads,
-                          std::span(chunks).first(lanes), lanes);
+    const QwenTargetPrefillChunk chunk{buffers, std::span(sequences).first(lanes), step.rows, &decode};
+    static_cast<void>(
+        targetModel->addPrefill(graph, std::span(&chunk, 1), kvPages, reads, {0, geometry.target.layers}, nullptr));
   }
 
   void encodeTargetVerifyBatchPolicy(CommandGraph &graph,
@@ -2594,8 +2565,7 @@ struct Runtime::Impl {
   // The target's commit after acceptance (QwenTarget::addStateCommit): each
   // lane's auxiliary state after its retained rows. The GDN state folds the
   // retained rows into the lane's next step instead.
-  void encodeTargetStateCommit(CommandGraph &graph,
-                               std::span<Request *const> lanes) {
+  void encodeTargetStateCommit(CommandGraph &graph, std::span<Request *const> lanes, const ops::StepRows &step) {
     if (lanes.empty() || lanes.size() > kLaneCount)
       throw std::invalid_argument("invalid target state commit batch");
     const uint32_t width = static_cast<uint32_t>(lanes.size());
@@ -2610,7 +2580,7 @@ struct Runtime::Impl {
       buffers.auxiliaryOut[lane] = states.next(entry.stateLane).auxiliary;
       buffers.indexTables[lane] = laneTables(entry.stateLane).index;
     }
-    targetModel->addStateCommit(graph, std::move(buffers), std::span(kCycleBlocks).first(width));
+    targetModel->addStateCommit(graph, std::move(buffers), step);
   }
 
   // The state each lane's cycle captures (ModelBatchItem::stateCaptures), at
@@ -2670,7 +2640,7 @@ struct Runtime::Impl {
     encodeTargetVerifyBatchPolicy(graph, entries, step);
     encodeBatchAcceptance(graph, entries, maximumRetained, step);
     encodeKvPathCommit(graph, entries, items, step);
-    encodeTargetStateCommit(graph, entries);
+    encodeTargetStateCommit(graph, entries, step);
     encodeDraftStateCommitBatch(graph, entries, items, step);
     encodeDecodeCaptures(graph, entries, items, maximumRetained, step);
   }
@@ -2949,8 +2919,7 @@ struct Runtime::Impl {
                                      anchorPositions(std::span(entries).first(lanes_.size()), items_));
         impl_.encodeBatchEmbedding(target, DecodeTensor::InputTokens,
                                    impl_.decodeArena->lanesRows(TargetTensor::Hidden0, width), width, step_.rows);
-        impl_.encodeTargetVerifyBatchForward(
-            target, {entries.data(), lanes_.size()}, items_, *reads_);
+        impl_.encodeTargetDecodeForward(target, {entries.data(), lanes_.size()}, items_, step_, *reads_);
         submit(target);
         stage_ = Stage::TargetForward;
       }
@@ -3660,7 +3629,7 @@ Runtime::decodeAsync(const BatchPlan &plan,
   impl_->encodeBatchVerifyInput(commandGraph, step, Impl::anchorPositions(entries, items));
   impl_->encodeBatchEmbedding(commandGraph, DecodeTensor::InputTokens,
                               impl_->decodeArena->lanesRows(TargetTensor::Hidden0, width), width, step.rows);
-  impl_->encodeTargetVerifyBatchForward(commandGraph, entries, items, *reads);
+  impl_->encodeTargetDecodeForward(commandGraph, entries, items, step, *reads);
   impl_->encodeVerifyCommit(commandGraph, entries, items, {maximumRetained.data(), width}, step);
 
   std::vector<ModelBatchItem> copiedItems(items.begin(), items.end());
@@ -4056,9 +4025,9 @@ WarmupStepResult Runtime::warmupCompositeStateRestore() {
       throw std::runtime_error("prefix restore length mismatch");
     }
 
-    // Continue from committed KV history. This M8 command teacher-forces a
-    // new chunk, then the real speculative cycle overwrites its speculative
-    // page suffix and advances only the accepted commit length.
+    // Continue from committed KV history. This prefill teacher-forces the
+    // suffix's kDecodeRows tokens, then the real speculative cycle overwrites
+    // its speculative page suffix and advances only the accepted commit length.
     BatchPlan suffixPlan{.kind = WorkKind::Prefill,
                          .items = {{id, suffixTokens}},
                          .decodeStage = DecodeStage::Regular};

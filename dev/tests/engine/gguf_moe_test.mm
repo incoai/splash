@@ -1480,14 +1480,14 @@ int chunkedSlots(MetalBackend &backend) {
   return failures;
 }
 
-// A verify block of a step's rows: its first row, its rows, and the rows of
-// them it verifies (MoeBuffers::verifyBlocks and verifyRows).
+// A verify block of a step's rows, a decode lane's: its first row, its rows,
+// and the rows of them it verifies (MoeBuffers::laneRows and verifyRows).
 struct VerifiedBlock final {
   uint32_t firstRow, rows, verify;
 };
 
 // A step whose rows hold verify blocks routes each block's verify rows alone
-// and every row of no block, a prompt's (MoeBuffers::verifyBlocks). With each
+// and every row of no block, a prompt's (MoeBuffers::laneRows). With each
 // block's every row verified, its output and tile kinds are bitwise the
 // all-rows grouping's. With fewer, a routed route of a row past its block's
 // verify rows stays out of every tile with the route row ~0u, every other
@@ -1520,11 +1520,12 @@ int verifiedRows(MetalBackend &backend, const std::string &name, uint32_t rows,
   // Each row's block, or none for a prompt's row.
   constexpr uint32_t kNoBlock = UINT32_MAX;
   std::vector<uint32_t> blockOf(rows, kNoBlock);
-  std::vector<splash::ops::LaneRows> verifyBlocks;
+  std::vector<SplashLaneRows> laneRows;
   for (uint32_t block = 0; block < blocks.size(); ++block) {
-    verifyBlocks.push_back({blocks[block].firstRow, blocks[block].rows});
+    laneRows.push_back({blocks[block].firstRow, blocks[block].rows});
     std::fill_n(blockOf.begin() + blocks[block].firstRow, blocks[block].rows, block);
   }
+  const MetalBuffer layout = upload(backend, laneRows.data(), laneRows.size() * sizeof(SplashLaneRows), "lane-rows");
   const auto verified = [&](uint32_t row) {
     return blockOf[row] == kNoBlock || row - blocks[blockOf[row]].firstRow < blocks[blockOf[row]].verify;
   };
@@ -1562,8 +1563,8 @@ int verifiedRows(MetalBackend &backend, const std::string &name, uint32_t rows,
   const auto run = [&](const MetalBuffer &verifyRows) {
     allocate(backend, b, plan);
     std::memset(b.moe.output.contents(), 0, b.moe.output.sizeBytes());
-    b.moe.verifyBlocks = verifyRows ? std::span<const splash::ops::LaneRows>(verifyBlocks)
-                                    : std::span<const splash::ops::LaneRows>();
+    b.moe.lanes = verifyRows ? uint32_t(blocks.size()) : 0;
+    b.moe.laneRows = verifyRows ? layout : MetalBuffer{};
     b.moe.verifyRows = verifyRows;
     CommandGraph graph;
     MoE::add(graph, b.moe, m.weights, plan);

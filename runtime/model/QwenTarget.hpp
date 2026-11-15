@@ -281,12 +281,43 @@ struct QwenTargetPrefillBuffers final {
   }
 };
 
+// What a decode step's layers read and write beside a prompt chunk's
+// buffers, a decode cycle's target forward being the prompt forward over the
+// step's rows (QwenTargetPrefillChunk::decode): the step's lanes and rows
+// (ops::StepRows); the lanes' GDN states before and after the step and their
+// decode tapes (ops::GdnTapeLane); each lane's verify rows, the first of its
+// rows, which alone route a MoE layer (ops::MoeBuffers::verifyRows); the
+// step's rows' places in their lanes' trees (ops::TreeRow), which the GDN and
+// attention layers read; each lane's auxiliary state before the step and its
+// pages' block index, for a layout with one; and the rows the draft reads
+// (the captured layers' rows), the final norm's rows and the logits of every
+// row of the step.
+struct QwenTargetDecodeBuffers final {
+  ops::StepRows step{};
+  std::array<metal::MetalBuffer, ExecutionLimits::maximumBatchWidth> currentGdnStates;
+  std::array<metal::MetalBuffer, ExecutionLimits::maximumBatchWidth> nextGdnStates;
+  metal::MetalBuffer gdnTape;
+  std::array<ops::GdnTapeLane, ExecutionLimits::maximumBatchWidth> gdnTapeLanes{};
+  metal::MetalBuffer verifyRows;
+  metal::MetalBuffer tree;
+  std::array<metal::MetalBuffer, ExecutionLimits::maximumBatchWidth> auxiliary;
+  std::array<metal::MetalBuffer, ExecutionLimits::maximumBatchWidth> indexTables;
+  metal::MetalBuffer capturedTargetHidden;
+  metal::MetalBuffer finalHidden;
+  metal::MetalBuffer logits;
+};
+
 // A chunk of a prefill command: `rows` rows of its lanes' sequences, packed
-// in sequence order, in its own buffers.
+// in sequence order, in its own buffers; or a decode step (`decode`), whose
+// sequences are its lanes, each of the cycle's lane cap of rows at most
+// (ops::StepRows::laneCap), which the step's layout places
+// (QwenTargetPrefillBuffers::laneRows: the draft's selector writes it on the
+// device), its `rows` the step's.
 struct QwenTargetPrefillChunk final {
   QwenTargetPrefillBuffers buffers;
   std::span<const QwenTargetPrefillSequence> sequences;
   uint32_t rows = 0;
+  const QwenTargetDecodeBuffers *decode = nullptr;
 };
 
 // The layers [first, end) of a prefill command one of its passes runs
@@ -295,54 +326,6 @@ struct QwenTargetPrefillChunk final {
 struct QwenPrefillLayers final {
   uint32_t first = 0;
   uint32_t end = 0;
-};
-
-struct QwenTargetVerifyBuffers final {
-  ops::LinearScratch linearScratch{};
-  std::array<metal::MetalBuffer, 2> hidden;
-  metal::MetalBuffer normalized;
-  metal::MetalBuffer gdnHidden;
-  metal::MetalBuffer gdnOutput;
-  metal::MetalBuffer denseIntermediate;
-  metal::MetalBuffer fullPacked;
-  metal::MetalBuffer fullQueries;
-  metal::MetalBuffer attentionPartials;
-  metal::MetalBuffer attentionStatistics;
-  metal::MetalBuffer fullAttention;
-  metal::MetalBuffer attentionHidden;
-  metal::MetalBuffer attentionOutput;
-  metal::MetalBuffer ropeCos;
-  metal::MetalBuffer ropeSin;
-  metal::MetalBuffer ropeInverseFrequencies;
-  metal::MetalBuffer capturedTargetHidden;
-  metal::MetalBuffer finalHidden;
-  metal::MetalBuffer logits;
-  metal::MetalBuffer denseGateScratch;
-  metal::MetalBuffer gdnPacked;
-  // The lanes' decode tapes (ops::GdnTapeLane).
-  metal::MetalBuffer gdnTape;
-  std::array<ops::GdnTapeLane, ExecutionLimits::maximumBatchWidth> gdnTapeLanes{};
-  std::array<metal::MetalBuffer, ExecutionLimits::maximumBatchWidth>
-      currentGdnStates;
-  std::array<metal::MetalBuffer, ExecutionLimits::maximumBatchWidth>
-      nextGdnStates;
-  std::array<metal::MetalBuffer, ExecutionLimits::maximumBatchWidth>
-      pageTables;
-  // Each lane's pages' block index, for a layout with one
-  // (ops::BlockIndex::tables).
-  std::array<metal::MetalBuffer, ExecutionLimits::maximumBatchWidth> indexTables;
-  ops::MoeScratch moe;
-  // Each lane's verify rows (ops::DraftSelector::addVerifyRows), which a MoE
-  // target's steps route alone (ops::MoeBuffers::verifyRows).
-  metal::MetalBuffer verifyRows;
-  // The step's rows' places in their lanes' trees (ops::TreeRow), which the
-  // GDN and attention layers read, and each lane's block of the step's rows
-  // as the device holds it (SplashLaneRows), which the GDN layers read.
-  metal::MetalBuffer tree;
-  metal::MetalBuffer laneRows;
-  // Each lane's auxiliary state before the step; the commit writes the one
-  // after it (addStateCommit).
-  std::array<metal::MetalBuffer, ExecutionLimits::maximumBatchWidth> auxiliary;
 };
 
 // A decode step's verify input as its draft's selector lays it out on the
@@ -517,33 +500,26 @@ public:
   // verify rows, those from `position` on of `request`, before the cycle's
   // commands are encoded.
   virtual void prepareVerifyLane(uint32_t lane, uint64_t position, const QwenTargetRequest &request);
-  // A verify's layers and head over `lanes` lanes, whose blocks on Index
-  // pages it reads through `spilled` (the command's SpilledKvReads).
-  virtual void addVerify(
-      metal::CommandGraph &graph, QwenTargetVerifyBuffers buffers,
-      const kv::PageStorage &kv, SpilledKvReads &spilled,
-      std::span<const kv::ChunkedPrefillParams> chunks,
-      uint32_t lanes) const = 0;
-  // The head over `lanes` lanes of decodeLaneRows rows of the last layer's
-  // output, as verify ends: one sweep of the vocabulary projection for every
-  // lane.
+  // The head over `rows` rows of the last layer's output: one sweep of the
+  // vocabulary projection, as a decode step's forward ends (addPrefill with a
+  // decode chunk).
   virtual void addHeadBatch(metal::CommandGraph &graph, metal::MetalBuffer hidden,
                             metal::MetalBuffer finalHidden, metal::MetalBuffer logits,
-                            uint32_t lanes, ops::LinearScratch scratch) const = 0;
+                            uint32_t rows, ops::LinearScratch scratch) const = 0;
   // The inputs the target makes itself of a step's verify input, which the
   // draft's selector writes and addEmbedding gathers: none, but a family's
   // that reads them itself.
   virtual void addVerifyInput(metal::CommandGraph &graph, const QwenVerifyInput &input) const;
   void addEmbedding(metal::CommandGraph &graph, metal::MetalBuffer tokens,
                     metal::MetalBuffer hidden, uint32_t rows) const;
-  // The commit after acceptance of a verify of the lanes of `blocks`, each
-  // lane's verify block: in the verify's command after it (addVerify), or
-  // for constrained decoding in the next command, before any other decode
-  // step reuses the verify's scratch. Each lane's auxiliary state after its
-  // retained rows, from what the verify computed of its block's rows. None
-  // for a target without auxiliary state.
+  // The commit after acceptance of a decode step (`step`, whose lanes' rows
+  // the layout places, QwenTargetCommitBuffers::laneRows): in the step's
+  // command after its forward, or for constrained decoding in the next
+  // command, before any other decode step reuses the step's scratch. Each
+  // lane's auxiliary state after its retained rows, from what the forward
+  // computed of its rows. None for a target without auxiliary state.
   virtual void addStateCommit(metal::CommandGraph &graph, QwenTargetCommitBuffers buffers,
-                              std::span<const ops::LaneRows> blocks) const;
+                              const ops::StepRows &step) const;
   // After a verify's acceptance, the GDN state after its first `rows` rows of
   // one lane, which the lane's next step would hold had the lane retained
   // exactly those, in a cache cell, when the lane retained that many. None
@@ -593,31 +569,14 @@ protected:
     // not every row (planOutputRows): its state writes run on every row, its
     // output work on these alone, read row i as row i.
     std::vector<uint32_t> readRows{};
+    // A decode step's own buffers; none for a prompt chunk.
+    const QwenTargetDecodeBuffers *decode = nullptr;
     [[nodiscard]] uint32_t outputRows() const noexcept {
       return readRows.empty() ? rows : static_cast<uint32_t>(readRows.size());
     }
     [[nodiscard]] std::span<const kv::ChunkedPrefillParams> attentionSequences() const noexcept {
       return std::span(chunks).first(sequences.size());
     }
-  };
-
-  struct VerifyStep {
-    metal::CommandGraph &graph;
-    const QwenTargetVerifyBuffers &buffers;
-    std::span<const SplashKvLayer> kvLayers;
-    SpilledKvReads &spilled;
-    std::span<const kv::ChunkedPrefillParams> chunks;
-    uint32_t lanes;
-    uint32_t rows;
-    ops::AttentionPlan attention;
-    // With a sliding window, the plan of the sliding layers.
-    std::optional<ops::AttentionPlan> windowedAttention{};
-    std::optional<ops::MoePlan> moe{};
-    // Each lane's verify block, its 8 rows from row 8 l, which a MoE routes
-    // up to the lane's verify rows (ops::MoeBuffers::verifyBlocks).
-    std::array<ops::LaneRows, ExecutionLimits::maximumBatchWidth> verifyBlocks{};
-    uint32_t gdnLayer = 0;
-    uint32_t attentionLayer = 0;
   };
 
   // Where a mixer's output projection writes: `rows`, adding the projection
@@ -691,10 +650,6 @@ protected:
     }
     return outputs;
   }
-  // The checked step of a verify of `lanes` lanes, with its plans.
-  [[nodiscard]] VerifyStep verifyStep(metal::CommandGraph &graph, const QwenTargetVerifyBuffers &buffers,
-                                      const kv::PageStorage &kv, SpilledKvReads &spilled,
-                                      std::span<const kv::ChunkedPrefillParams> chunks, uint32_t lanes) const;
   // Throws unless a family's `layers` match the geometry's layers and its
   // attention layers.
   template <class Layer> void requireLayers(std::span<const Layer> layers) const {
@@ -709,44 +664,28 @@ protected:
   // output projection's `output`: a GDN, and an attention whose rows attend
   // as the layer's variant does (QwenTargetGeometry::attentionVariant), with
   // the layer's sinks where its geometry adds them, and, when given, only the
-  // blocks of their lists (`blocks`, a prefill's per sequence, a verify's for
-  // the step), through the step's reads of spilled K/V.
-  void addPrefillMixer(PrefillStep &step, const QwenGdnWeights &mixer, BlockOutput output) const;
-  void addPrefillMixer(PrefillStep &step, const QwenAttentionWeights &mixer, BlockOutput output,
-                       std::span<const ops::AttentionBlocks> blocks = {}) const;
-  // A verify's normalized rows are in the table `normalized` describes,
-  // which the mixer's input projection reads (decodeInput).
-  void addVerifyMixer(VerifyStep &step, const QwenGdnWeights &mixer, ops::PreparedInput normalized,
-                      BlockOutput output) const;
-  void addVerifyMixer(VerifyStep &step, const QwenAttentionWeights &mixer, ops::PreparedInput normalized,
-                      BlockOutput output, const ops::AttentionBlocks &blocks = {}) const;
-  // The input the decode plan of `projection` over `lanes` lanes reads, a
-  // table its producer writes or plain rows.
-  [[nodiscard]] ops::LinearInput decodeInput(const ops::Projection &projection, uint32_t lanes) const;
-  // A decode projection over `lanes` lanes through its own plan; `prepared`
-  // describes the table its producer wrote for the plan's input.
-  void addDecodeProjection(metal::CommandGraph &graph, metal::MetalBuffer input, const ops::Projection &projection,
-                           metal::MetalBuffer output, uint32_t lanes, ops::LinearScratch scratch,
-                           ops::PreparedInput prepared = {}) const;
+  // blocks of their lists (`blocks`, one per sequence), through the step's
+  // reads of spilled K/V. The normalized rows are as `normalized` describes,
+  // the input projection's plan's (a table its producer wrote, or plain).
+  void addPrefillMixer(PrefillStep &step, const QwenGdnWeights &mixer, ops::PreparedInput normalized,
+                       BlockOutput output) const;
+  void addPrefillMixer(PrefillStep &step, const QwenAttentionWeights &mixer, ops::PreparedInput normalized,
+                       BlockOutput output, std::span<const ops::AttentionBlocks> blocks = {}) const;
   // The FFNs of a layer whose residual is one row of hiddenSize values: each
   // reads the RMS norm `norm` of the mixer's `residual` rows and adds its
   // output to them into `output`. A dense SwiGLU, in a prefill on the
   // Neural Engine with the step's split of it (layer `index`'s, AneFfn); a
-  // MoE block's routing, whose routed work a prefill adds beside and after the
+  // MoE block's routing, whose routed work a step adds beside and after the
   // layer's load (addPrefillLayers, ops::MoE::addResident and addRouted with
-  // step.ffn), and a verify's whole block.
+  // step.ffn).
   void addPrefillDenseFfn(PrefillStep &step, uint32_t index, const ops::NormWeights &norm,
                           ops::SwiGluProjections ffn, metal::MetalBuffer residual, metal::MetalBuffer output) const;
   void addPrefillMoeRouting(PrefillStep &step, const ops::NormWeights &norm, const ops::BlockMoeWeights &ffn,
                             metal::MetalBuffer residual, metal::MetalBuffer output) const;
-  void addVerifyDenseFfn(VerifyStep &step, const ops::NormWeights &norm, ops::SwiGluProjections ffn,
-                         metal::MetalBuffer residual, metal::MetalBuffer output) const;
-  void addVerifyMoe(VerifyStep &step, const ops::NormWeights &norm, const ops::BlockMoeWeights &ffn,
-                    metal::MetalBuffer residual, metal::MetalBuffer output) const;
   // The head of a target whose last layer's rows read a final RMS norm,
   // `finalNorm`, into `finalHidden`, as addHeadBatch takes them.
   void addNormalizedHead(metal::CommandGraph &graph, const ops::NormWeights &finalNorm, metal::MetalBuffer hidden,
-                         metal::MetalBuffer finalHidden, metal::MetalBuffer logits, uint32_t lanes,
+                         metal::MetalBuffer finalHidden, metal::MetalBuffer logits, uint32_t rows,
                          ops::LinearScratch scratch) const;
   // Copies `rows` rows of a layer's output rows, from row `sourceRow` of
   // `output`, into capture slot `slot` of the captured hidden rows from row

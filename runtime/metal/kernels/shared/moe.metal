@@ -160,18 +160,18 @@ MOE_ROUTE_SELECT_UNGATED_ENTRY(moe_route_select_f32_sigmoid_s2, SPLASH_MOE_EXPER
 #undef MOE_ROUTE_SELECT_BODY
 
 // Whether a verified grouping leaves routed route `route` out: its row lies
-// in a verify block past the block's verify rows (MoeGroupParams).
+// in a lane's rows past the lane's verify rows (MoeGroupParams).
 template <uint Shared, bool Verified>
-inline bool moe_unverified_route(device const uint *verify_rows,
+inline bool moe_unverified_route(device const SplashLaneRows *lane_rows, device const uint *verify_rows,
                                  constant MoeGroupParams &params, uint route) {
   if (!Verified)
     return false;
   const uint row = route / (params.top_k + Shared);
-  for (uint block = 0; block < SPLASH_MAXIMUM_BATCH_WIDTH; ++block) {
-    // Wraps past the rows for a row before the block.
-    const uint offset = row - params.verify.first_row[block];
-    if (offset < params.verify.rows[block])
-      return offset >= verify_rows[block];
+  for (uint lane = 0; lane < params.lanes; ++lane) {
+    // Wraps past the rows for a row before the lane's.
+    const uint offset = row - lane_rows[lane].first;
+    if (offset < lane_rows[lane].rows)
+      return offset >= verify_rows[lane];
   }
   return false;
 }
@@ -186,13 +186,13 @@ inline bool moe_unverified_route(device const uint *verify_rows,
 // experts it marks MOE_SLOT_ABSENT. It writes the tile count with the expert
 // passes' grids (MoeTileCount) and a streamed block's slot table into
 // expert_slots (ops::MoeScratch::expertSlots). Slots threads, one per expert
-// slot. A Verified grouping routes its verify blocks' verify rows alone, and
-// every row of no block (MoeGroupParams).
+// slot. A Verified grouping routes its lanes' verify rows alone, and every
+// row of no lane (MoeGroupParams).
 template <uint Slots, uint Shared, bool Verified>
 inline void moe_group_routes_phase(
     device const uint *selected, device MoeTileDescriptor *tiles, device MoeTileCount *tile_count,
     device uint *grouped_routes, device uint *route_rows, device const uint *slots, device uint *expert_slots,
-    device const uint *verify_rows,
+    device const SplashLaneRows *lane_rows, device const uint *verify_rows,
     constant MoeGroupParams &params, uint thread_index, uint simd_lane, uint simd_group,
     threadgroup atomic_uint *counts, threadgroup atomic_uint *cursors, threadgroup uint *tile_offsets,
     threadgroup uint *simd_totals, threadgroup uint *simd_absent) {
@@ -212,7 +212,7 @@ inline void moe_group_routes_phase(
   threadgroup_barrier(mem_flags::mem_threadgroup);
   for (uint route = thread_index; route < routes; route += Slots) {
     if (moe_shared_slice(route % routes_per_row, params.top_k) >= Shared &&
-        !moe_unverified_route<Shared, Verified>(verify_rows, params, route)) {
+        !moe_unverified_route<Shared, Verified>(lane_rows, verify_rows, params, route)) {
       atomic_fetch_add_explicit(&counts[selected[route]], 1u,
                                 memory_order_relaxed);
     }
@@ -259,7 +259,7 @@ inline void moe_group_routes_phase(
   for (uint route = thread_index; route < routes; route += Slots) {
     if (moe_shared_slice(route % routes_per_row, params.top_k) < Shared)
       continue;
-    if (moe_unverified_route<Shared, Verified>(verify_rows, params, route)) {
+    if (moe_unverified_route<Shared, Verified>(lane_rows, verify_rows, params, route)) {
       route_rows[route] = ~0u;
       continue;
     }
@@ -306,7 +306,7 @@ inline void moe_group_routes_phase(
   }
 }
 
-#define MOE_GROUP_ROUTES_BODY(Slots, Shared, Verified, verify_rows)            \
+#define MOE_GROUP_ROUTES_BODY(Slots, Shared, Verified, lane_rows, verify_rows) \
     threadgroup atomic_uint counts[Slots];                                     \
     threadgroup atomic_uint cursors[Slots];                                    \
     threadgroup uint tile_offsets[Slots];                                      \
@@ -314,7 +314,7 @@ inline void moe_group_routes_phase(
     threadgroup uint simd_absent[Slots / 32];                                  \
     moe_group_routes_phase<Slots, Shared, Verified>(                           \
         selected, tiles, tile_count, grouped_routes, route_rows, slots,        \
-        expert_slots, verify_rows, params, thread_index, simd_lane,            \
+        expert_slots, lane_rows, verify_rows, params, thread_index, simd_lane, \
         simd_group, counts, cursors, tile_offsets, simd_totals, simd_absent);
 #define MOE_GROUP_ROUTES_ENTRY(Name, Slots, Shared)                            \
   kernel void Name(                                                            \
@@ -329,10 +329,11 @@ inline void moe_group_routes_phase(
       uint thread_index [[thread_index_in_threadgroup]],                       \
       uint simd_lane [[thread_index_in_simdgroup]],                            \
       uint simd_group [[simdgroup_index_in_threadgroup]]) {                    \
-    MOE_GROUP_ROUTES_BODY(Slots, Shared, false, nullptr)                       \
+    MOE_GROUP_ROUTES_BODY(Slots, Shared, false, nullptr, nullptr)              \
   }
-// A grouping of a step with verify blocks, which routes each block's verify
-// rows alone (MoeGroupParams), the uint per block the draft selector wrote.
+// A grouping of a decode step, which routes each lane's verify rows alone
+// (MoeGroupParams): the lanes' rows and a uint per lane the draft selector
+// wrote.
 #define MOE_GROUP_ROUTES_VERIFIED_ENTRY(Name, Slots, Shared)                   \
   kernel void Name(                                                            \
       device const uint *selected [[buffer(0)]],                               \
@@ -343,11 +344,12 @@ inline void moe_group_routes_phase(
       device const uint *slots [[buffer(5)]],                                  \
       device uint *expert_slots [[buffer(6)]],                                 \
       device const uint *verify_rows [[buffer(7)]],                            \
-      constant MoeGroupParams &params [[buffer(8)]],                           \
+      device const SplashLaneRows *lane_rows [[buffer(8)]],                    \
+      constant MoeGroupParams &params [[buffer(9)]],                           \
       uint thread_index [[thread_index_in_threadgroup]],                       \
       uint simd_lane [[thread_index_in_simdgroup]],                            \
       uint simd_group [[simdgroup_index_in_threadgroup]]) {                    \
-    MOE_GROUP_ROUTES_BODY(Slots, Shared, true, verify_rows)                    \
+    MOE_GROUP_ROUTES_BODY(Slots, Shared, true, lane_rows, verify_rows)         \
   }
 // Each for the shared slices of a compiled routing, under its slices suffix
 // (ops::kCompiledMoeRoutings), on the expert slots of its selection.

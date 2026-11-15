@@ -49,8 +49,6 @@ inline constexpr uint32_t kPrefillRows = ExecutionLimits::prefillTokenBudget;
 // once per 8192 rows and keep both bounded.
 inline constexpr uint32_t kPrefillGroupChunks = 4;
 inline constexpr uint32_t kTileRows = kv::kPageTokens;
-inline constexpr uint32_t kRaggedAttentionRows =
-    kPrefillRows + kLaneCount * (kTileRows - 1);
 inline constexpr uint32_t kDraftCacheStride = ExecutionLimits::draftContextTokens;
 inline constexpr uint32_t kMaximumPageTableEntries =
     (kv::kMaximumPhysicalTokens + kv::kPageTokens - 1) / kv::kPageTokens;
@@ -203,9 +201,9 @@ template <class T> constexpr uint64_t bytesFor(uint64_t elements) noexcept {
   return elements * sizeof(T);
 }
 
-// The tensors of a target step (QwenTargetPrefillBuffers,
-// QwenTargetVerifyBuffers) over the rows of its command's sequences, sized by
-// their rows: a prompt chunk's, or a decode step's lanes' (TargetArena).
+// The tensors of a target step (QwenTargetPrefillBuffers) over the rows of
+// its command's sequences, sized by their rows: a prompt chunk's, or a decode
+// step's lanes' (TargetArena).
 enum class TargetTensor : uint32_t {
   Hidden0,
   Hidden1,

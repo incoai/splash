@@ -54,7 +54,7 @@ constexpr uint64_t kLongChunkRoutes = 3;
 
 // What a load serves, which ExpertStoreStats::uses and Impl::stepTimes hold a
 // use for, at its value: a prompt's chunks, or a decode step, whose steps
-// route their lanes' verify blocks (ops::MoeBuffers::verifyBlocks).
+// route their lanes' verify rows (ops::MoeBuffers::lanes).
 enum class LoadUse : size_t { Prefill, Decode };
 
 // One projection of an expert of some size: rows x columns in format, its
@@ -255,18 +255,20 @@ struct ExpertStore::Impl {
   struct PartTiles final {
     metal::MetalBuffer descriptors, count;
   };
-  // The rows a predicting step routes (ops::MoeBuffers::verifyBlocks): every
-  // row but a verify block's past the block's verify rows, which the selector
-  // wrote before the step's GPU work ran up to its load.
+  // The rows a predicting step routes (ops::MoeBuffers::laneRows): every row
+  // but a lane's past its verify rows, which the selector wrote before the
+  // step's GPU work ran up to its load.
   struct RoutedRows final {
-    std::vector<ops::LaneRows> blocks;
+    uint32_t lanes = 0;
+    metal::MetalBuffer laneRows;
     metal::MetalBuffer verifyRows;
 
     [[nodiscard]] bool routes(uint32_t row) const noexcept {
+      const auto *layout = static_cast<const SplashLaneRows *>(laneRows.contents());
       const auto *verified = static_cast<const uint32_t *>(verifyRows.contents());
-      for (size_t block = 0; block < blocks.size(); ++block)
-        if (const uint32_t offset = row - blocks[block].first; offset < blocks[block].rows)
-          return offset < verified[block];
+      for (uint32_t lane = 0; lane < lanes; ++lane)
+        if (const uint32_t offset = row - layout[lane].first; offset < layout[lane].rows)
+          return offset < verified[lane];
       return true;
     }
   };
@@ -1261,13 +1263,13 @@ void ExpertStore::addLoad(metal::CommandGraph &graph, std::span<const ops::MoeLo
   const ops::MoeShape shape = impl.shape;
   if (parts.empty()) throw std::invalid_argument("an expert load serves no step");
   if (!impl.streams(block)) throw std::invalid_argument("a block of a size of one block does not load");
-  // A load serves a decode step when its steps route verify blocks.
+  // A load serves a decode step when its steps route lanes' verify rows.
   LoadUse use = LoadUse::Prefill;
   uint32_t rows = 0;
   std::vector<Impl::PartTiles> tiles;
   tiles.reserve(parts.size());
   for (const ops::MoeLoadPart &part : parts) {
-    if (!part.buffers->verifyBlocks.empty()) use = LoadUse::Decode;
+    if (part.buffers->lanes) use = LoadUse::Decode;
     rows += part.plan->rows();
     tiles.push_back({part.buffers->scratch.tileDescriptors, part.buffers->scratch.tileCount});
   }
@@ -1285,7 +1287,7 @@ void ExpertStore::addLoad(metal::CommandGraph &graph, std::span<const ops::MoeLo
     // holds, take more than one step.
     if (parts.size() != 1) throw std::invalid_argument("an expert load that predicts serves one step");
     const ops::MoeBuffers &step = *parts.front().buffers;
-    routed = {{step.verifyBlocks.begin(), step.verifyBlocks.end()}, step.verifyRows};
+    routed = {step.lanes, step.laneRows, step.verifyRows};
     const Impl::Block &next = impl.blocks[block + 1];
     ops::MoE::addRoutes(graph, step.input, next.router, next.scalarGate, impl.predictionScores,
                         impl.predictionRoutes, impl.predictionWeights, rows, shape,

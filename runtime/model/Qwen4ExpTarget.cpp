@@ -18,9 +18,6 @@
 namespace splash::model {
 namespace {
 
-// The rows a decode step verifies of each of its lanes.
-constexpr uint32_t kVerifyRows = ExecutionLimits::decodeLaneRows;
-
 ops::HyperShape hyperShape(const QwenTargetGeometry &g) { return {g.hiddenSize, g.hyperConnections, g.hyperRank}; }
 ops::NgramShape ngramShape(const QwenTargetGeometry &g) {
   return {g.hiddenSize, g.hyperConnections, g.pleConvolutionTaps, g.pleNgram};
@@ -100,27 +97,50 @@ std::vector<metal::MetalBuffer> Qwen4ExpTarget::addPrefill(metal::CommandGraph &
   const bool begins = !layers.first;
   for (uint32_t index = 0; index < steps.size(); ++index) {
     PrefillStep &step = steps[index];
-    step.scratch = steps_.prefillScratch(index);
-    step.blocks = begins ? steps_.preparePrefill(index, chunks[index]) : steps_.prefillBlocks(index, chunks[index]);
     step.indexOffsets = offsets;
-    step.ffn = {step.buffers.normalized, step.scratch.zeros, step.scratch.branch, step.buffers.moe, {}, {}};
+    if (const QwenTargetDecodeBuffers *d = step.decode) {
+      // A decode step's inputs are its lanes' (prepareVerifyLane,
+      // addVerifyInput): the QSA blocks a lane's rows may complete from its
+      // position.
+      step.scratch = steps_.verifyScratch(ExecutionLimits::maximumBatchWidth * ExecutionLimits::targetVerifyRows);
+      std::array<uint32_t, ExecutionLimits::maximumBatchWidth> positions{};
+      for (uint32_t lane = 0; lane < d->step.lanes; ++lane)
+        positions[lane] = static_cast<uint32_t>(step.chunks[lane].committed_tokens);
+      step.laneBlocks = steps_.verifyBlocks(std::span(positions).first(d->step.lanes));
+    } else {
+      step.scratch = steps_.prefillScratch(index);
+      step.blocks = begins ? steps_.preparePrefill(index, chunks[index]) : steps_.prefillBlocks(index, chunks[index]);
+    }
+    step.ffn = {.input = step.buffers.normalized,
+                .residual = step.scratch.zeros,
+                .output = step.scratch.branch,
+                .scratch = step.buffers.moe};
+    if (const QwenTargetDecodeBuffers *d = step.decode) {
+      step.ffn.lanes = d->step.lanes;
+      step.ffn.laneRows = step.buffers.laneRows;
+      step.ffn.verifyRows = d->verifyRows;
+    }
   }
-  if (begins) steps_.readAhead(chunks);
+  if (begins && !chunks.front().decode) steps_.readAhead(chunks);
   return addPrefillLayers(std::span(steps), *this, layers);
 }
 
-void Qwen4ExpTarget::addPrefillMix(PrefillStep &step, const Qwen4HyperWeights &hyper,
-                                   metal::MetalBuffer output) const {
-  const QwenTargetPrefillBuffers &b = step.buffers;
+ops::PreparedInput Qwen4ExpTarget::addMix(PrefillStep &step, const Qwen4HyperWeights &hyper,
+                                          metal::MetalBuffer output, const ops::Projection *next) const {
   const Qwen4Scratch &h = step.scratch;
+  const ops::LinearScratch scratch = step.buffers.linearScratch;
   const ops::Linear &linear = operators_.linear();
   const ops::HyperShape hs = hyperShape(geometry_);
   ops::HyperConnection::addNorm(step.graph, h.streams, hyper.norm, hyper.inject, h.normalized, h.weights, hs,
                                 step.rows);
-  linear.addProjection(step.graph, h.normalized, hyper.down, h.low, step.rows, b.linearScratch);
-  ops::HyperConnection::addLow(step.graph, h.low, hs, step.rows);
-  linear.addProjection(step.graph, h.low, hyper.up, h.gate, step.rows, b.linearScratch);
-  ops::HyperConnection::addMix(step.graph, h.normalized, h.gate, std::move(output), hs, step.rows);
+  linear.add(step.graph, {.input = h.normalized, .output = h.low, .scratch = scratch}, hyper.down,
+             linear.plan(hyper.down, step.rows));
+  const ops::LinearPlan upPlan = linear.plan(hyper.up, step.rows);
+  ops::PreparedInput prepared = ops::HyperConnection::addLow(step.graph, h.low, hs, step.rows, scratch, upPlan.input());
+  linear.add(step.graph, {.input = h.low, .output = h.gate, .scratch = scratch, .prepared = std::move(prepared)},
+             hyper.up, upPlan);
+  return ops::HyperConnection::addMix(step.graph, h.normalized, h.gate, std::move(output), hs, step.rows, scratch,
+                                      next ? linear.plan(*next, step.rows).input() : ops::LinearInput::Plain);
 }
 
 void Qwen4ExpTarget::addPrefillBegin(PrefillStep &step) const {
@@ -152,33 +172,44 @@ void Qwen4ExpTarget::addPrefillLayer(PrefillStep &step, uint32_t index) const {
     linear.addProjection(step.graph, h.pleRows, ple.value, h.pleValue, rows, b.linearScratch);
     ops::NgramEmbedding::addGate(step.graph, h.gate, h.pleValue, h.streams, ple.keyNorm, ple.queryNorm,
                                  ple.convolutionNorm, h.pleGated, h.pleConvolution, ps, rows);
-    // Every sequence's rows after its history in one dispatch, by the
-    // chunk's layout, and its history after them; a state captured inside
-    // the command holds the history after its row.
+    // Every sequence's rows after its history in one dispatch, by the step's
+    // layout: a prompt sequence's in order, writing its history after them
+    // (and a state captured inside the command the history after its row),
+    // a decode lane's each along its path of the lane's tree, whose commit
+    // writes the history after the path it accepts.
     std::vector<metal::MetalBuffer> historyIn, historyOut;
-    for (const QwenTargetPrefillSequence &sequence : step.sequences) {
-      historyIn.push_back(sequence.auxiliaryIn);
-      historyOut.push_back(sequence.auxiliaryOut);
+    ops::LayoutRows layoutRows;
+    metal::MetalBuffer tree;
+    if (const QwenTargetDecodeBuffers *d = step.decode) {
+      historyIn.assign(d->auxiliary.begin(), d->auxiliary.begin() + d->step.lanes);
+      layoutRows = {d->step.lanes, d->step.rows, d->step.laneCap};
+      tree = d->tree;
+    } else {
+      for (const QwenTargetPrefillSequence &sequence : step.sequences) {
+        historyIn.push_back(sequence.auxiliaryIn);
+        historyOut.push_back(sequence.auxiliaryOut);
+      }
+      layoutRows = promptRows(step.sequences, rows);
     }
     ops::NgramEmbedding::addConvolution(step.graph, u16Rows(h.pleConvolution, 0, rows, ps.width()), historyIn,
                                         historyOut, ple.convolution, f32Rows(h.pleGated, 0, rows, ps.width()),
-                                        f32Rows(h.streams, 0, rows, ps.width()), ps, b.laneRows,
-                                        promptRows(step.sequences, rows));
+                                        f32Rows(h.streams, 0, rows, ps.width()), ps, b.laneRows, layoutRows, tree);
     for (const QwenTargetPrefillSequence &sequence : step.sequences)
       for (const QwenTargetStateCapture &capture : sequence.stateCaptures)
         addCaptureHistory(step.graph, h, sequence.rowBegin, sequence.auxiliaryIn, capture);
   }
-  addPrefillMix(step, layer.mixerHyper, b.normalized);
   std::visit(
       [&](const auto &mixer) {
+        const ops::PreparedInput input = addMix(step, layer.mixerHyper, b.normalized, &mixer.inputProjection);
         if constexpr (std::is_same_v<std::remove_cvref_t<decltype(mixer)>, QwenGdnWeights>)
-          addPrefillMixer(step, mixer, {h.branch, {}});
+          addPrefillMixer(step, mixer, input, {h.branch, {}});
         else
-          addPrefillMixer(step, mixer, {h.branch, {}}, addPrefillQsa(step, *layer.indexer));
+          addPrefillMixer(step, mixer, input, {h.branch, {}},
+                          step.decode ? addDecodeQsa(step, *layer.indexer) : addPrefillQsa(step, *layer.indexer));
       },
       layer.mixer);
   ops::HyperConnection::addCombine(step.graph, h.streams, h.branch, h.weights, hyperShape(geometry_), rows);
-  addPrefillMix(step, layer.ffnHyper, b.normalized);
+  addMix(step, layer.ffnHyper, b.normalized);
   ops::MoE::addRouting(step.graph, step.ffn, layer.ffn, *step.moe);
 }
 
@@ -188,14 +219,31 @@ void Qwen4ExpTarget::addPrefillExperts(PrefillStep &step, uint32_t index) const 
   const Qwen4Scratch &h = step.scratch;
   ops::MoE::addRouted(step.graph, step.ffn, weights_.layers[index].ffn, *step.moe);
   ops::HyperConnection::addCombine(step.graph, h.streams, h.branch, h.weights, hyperShape(geometry_), step.rows);
+  // The draft reads a decode step's every row of the layers it captures.
+  if (step.decode) {
+    if (const auto slot = geometry_.captureSlot(index))
+      addStreamCapture(step.graph, geometry_, *slot, h.streams, step.decode->capturedTargetHidden, 0, step.rows);
+    return;
+  }
   forEachPrefillCapture(step, index, [&](uint32_t slot, uint32_t source, uint32_t destination, uint32_t rows) {
     addStreamCapture(step.graph, geometry_, slot, rowsOf<float>(h.streams, source, rows, geometry_.streamWidth()),
                      step.buffers.captured, destination, rows);
   });
 }
 
+// A decode step's head reads every row of the final mix, which takes the
+// table the head's plan reads.
 metal::MetalBuffer Qwen4ExpTarget::addPrefillEnd(PrefillStep &step) const {
-  addPrefillMix(step, weights_.finalHyper, step.buffers.hidden[1]);
+  if (const QwenTargetDecodeBuffers *d = step.decode) {
+    const ops::Linear &linear = operators_.linear();
+    const ops::Projection &head = weights_.logitsProjection;
+    linear.add(step.graph,
+               {.input = d->finalHidden, .output = d->logits, .scratch = step.buffers.linearScratch,
+                .prepared = addMix(step, weights_.finalHyper, d->finalHidden, &head)},
+               head, linear.plan(head, step.rows));
+    return d->finalHidden;
+  }
+  addMix(step, weights_.finalHyper, step.buffers.hidden[1]);
   return step.buffers.hidden[1];
 }
 
@@ -283,47 +331,34 @@ void Qwen4ExpTarget::addVerifyInput(metal::CommandGraph &graph, const QwenVerify
   steps_.addVerifyInput(graph, input);
 }
 
-ops::PreparedInput Qwen4ExpTarget::addVerifyMix(VerifyStep &step, const Qwen4HyperWeights &hyper,
-                                                metal::MetalBuffer output, const ops::Projection *next) const {
-  const Qwen4Scratch &h = step.scratch;
-  const ops::LinearScratch scratch = step.buffers.linearScratch;
-  const ops::HyperShape hs = hyperShape(geometry_);
-  ops::HyperConnection::addNorm(step.graph, h.streams, hyper.norm, hyper.inject, h.normalized, h.weights, hs,
-                                step.rows);
-  addDecodeProjection(step.graph, h.normalized, hyper.down, h.low, step.lanes, scratch);
-  ops::PreparedInput prepared =
-      ops::HyperConnection::addLow(step.graph, h.low, hs, step.rows, scratch, decodeInput(hyper.up, step.lanes));
-  addDecodeProjection(step.graph, h.low, hyper.up, h.gate, step.lanes, scratch, std::move(prepared));
-  return ops::HyperConnection::addMix(step.graph, h.normalized, h.gate, std::move(output), hs, step.rows, scratch,
-                                      next ? decodeInput(*next, step.lanes) : ops::LinearInput::Plain);
-}
-
 // Every lane's QSA in one dispatch of each kernel, over its rows as the
 // step lays them out on the device: a row that completes a block keeps the
 // block, pooled from its path, as its block key, and a lane's rows select
 // from the blocks complete before its anchor and their paths' block keys.
 // Once a lane's rows attend sparsely, every lane's attends through its
 // list: a lane's rows that keep every block select them all.
-ops::AttentionBlocks Qwen4ExpTarget::addVerifyQsa(VerifyStep &step, const Qwen4IndexerWeights &indexer) const {
-  const QwenTargetVerifyBuffers &b = step.buffers;
+std::vector<ops::AttentionBlocks> Qwen4ExpTarget::addDecodeQsa(PrefillStep &step,
+                                                               const Qwen4IndexerWeights &indexer) const {
+  const QwenTargetPrefillBuffers &b = step.buffers;
+  const QwenTargetDecodeBuffers &d = *step.decode;
   const Qwen4Scratch &h = step.scratch;
   const ops::Linear &linear = operators_.linear();
   const uint32_t layer = step.attentionLayer, topBlocks = weights_.layout.indexerTopBlocks;
   const uint32_t keyWidth = geometry_.indexerHeadDimension, queryWidth = geometry_.indexerHeads * keyWidth;
-  const uint32_t laneCap = ops::verifyLaneCap(step.rows, step.lanes);
+  const uint32_t lanes = d.step.lanes, laneCap = d.step.laneCap;
   addIndexerProjections(step.graph, linear, b.normalized, indexer, h.indexerQuery, h.indexerKey, step.rows);
   std::array<uint32_t, ExecutionLimits::maximumBatchWidth> firstPositions{};
   bool sparse = false;
-  for (uint32_t lane = 0; lane < step.lanes; ++lane) {
+  for (uint32_t lane = 0; lane < lanes; ++lane) {
     firstPositions[lane] = step.chunks[lane].committed_tokens;
     sparse = sparse || ops::BlockIndexer::sparse(firstPositions[lane], laneCap, topBlocks);
   }
   const ops::IndexerTreeRows tree{b.laneRows,
-                                  b.tree,
+                                  d.tree,
                                   step.rows,
                                   laneCap,
-                                  std::span(firstPositions).first(step.lanes),
-                                  {std::span(b.indexTables).first(step.lanes), step.indexOffsets[layer]},
+                                  std::span(firstPositions).first(lanes),
+                                  {std::span(d.indexTables).first(lanes), step.indexOffsets[layer]},
                                   topBlocks,
                                   h.maskWords,
                                   h.scoreStride};
@@ -333,104 +368,49 @@ ops::AttentionBlocks Qwen4ExpTarget::addVerifyQsa(VerifyStep &step, const Qwen4I
   const metal::MetalBuffer keys = rowsOf<uint16_t>(h.qsaKeys, layer * h.keyLayerRows, step.rows, keyWidth);
   const metal::MetalBuffer blockKeys = rowsOf<uint16_t>(h.qsaBlockKeys, layer * h.keyLayerRows, step.rows, keyWidth);
   std::array<metal::MetalBuffer, ExecutionLimits::maximumBatchWidth> pending;
-  for (uint32_t lane = 0; lane < step.lanes; ++lane) pending[lane] = steps_.qsaPending(b.auxiliary[lane], layer);
+  for (uint32_t lane = 0; lane < lanes; ++lane) pending[lane] = steps_.qsaPending(d.auxiliary[lane], layer);
   ops::BlockIndexer::addProject(step.graph, rowsOf<float>(h.indexerQuery, 0, step.rows, queryWidth),
                                 rowsOf<float>(h.indexerKey, 0, step.rows, keyWidth), indexer.queryNorm,
                                 rowsOf<float>(b.ropeCos, 0, step.rows, geometry_.rotaryPairs),
                                 rowsOf<float>(b.ropeSin, 0, step.rows, geometry_.rotaryPairs), queries, keys,
-                                b.laneRows, {step.lanes, step.rows, laneCap});
+                                b.laneRows, {lanes, step.rows, laneCap});
   ops::BlockIndexer::addTreePool(step.graph,
-                                 {step.blocks.records, std::span(step.blocks.counts).first(step.lanes),
-                                  step.blocks.laneRecords, keys, std::span(pending).first(step.lanes)},
+                                 {step.laneBlocks.records, std::span(step.laneBlocks.counts).first(lanes),
+                                  step.laneBlocks.laneRecords, keys, std::span(pending).first(lanes)},
                                  blockKeys, indexer.keyNorm, b.ropeInverseFrequencies,
                                  geometry_.ropeScaling.attentionFactor(), tree);
-  if (!sparse) return {h.qsaLists, h.qsaListCounts, 0, 0};
+  if (!sparse) return std::vector<ops::AttentionBlocks>(lanes, {h.qsaLists, h.qsaListCounts, 0, 0});
   const metal::MetalBuffer rowMasks = rowsOf<uint32_t>(h.qsaRowMasks, 0, step.rows, 1);
-  const ops::AttentionBlocks blocks{h.qsaLists, h.qsaListCounts, h.listStride, 0, {}, {}, rowMasks};
+  const ops::AttentionBlocks lists{h.qsaLists, h.qsaListCounts, h.listStride, 0, {}, {}, rowMasks};
   ops::BlockIndexer::addTreeSelect(step.graph, queries, blockKeys, h.qsaScores,
                                    rowsOf<uint32_t>(h.qsaMask, 0, step.rows, h.maskWords), rowMasks, tree);
   std::array<ops::BlockListRows, ExecutionLimits::maximumBatchWidth> laneLists{};
-  for (uint32_t lane = 0; lane < step.lanes; ++lane)
-    laneLists[lane] = {lane, kVerifyRows, firstPositions[lane], lane};
-  ops::PagedAttention::addBlockLists(step.graph, h.qsaMask, h.maskWords, std::span(laneLists).first(step.lanes),
-                                     {b.laneRows, step.rows}, blocks);
+  std::vector<ops::AttentionBlocks> blocks(lanes, lists);
+  for (uint32_t lane = 0; lane < lanes; ++lane) {
+    laneLists[lane] = {lane, laneCap, firstPositions[lane], lane};
+    blocks[lane].list = lane;
+  }
+  ops::PagedAttention::addBlockLists(step.graph, h.qsaMask, h.maskWords, std::span(laneLists).first(lanes),
+                                     {b.laneRows, step.rows}, lists);
   return blocks;
 }
 
-// The residual streams start as the embedding's rows, every block reads
-// their mix and adds its branch back to them, and the head reads the final
-// mix.
-void Qwen4ExpTarget::addVerify(metal::CommandGraph &graph, QwenTargetVerifyBuffers buffers,
-                               const kv::PageStorage &kv, SpilledKvReads &spilled,
-                               std::span<const kv::ChunkedPrefillParams> chunks, uint32_t lanes) const {
-  VerifyStep step{verifyStep(graph, buffers, kv, spilled, chunks, lanes)};
-  const std::vector<uint32_t> offsets = indexOffsets(kv, geometry_.kvLayout.attentionLayers);
-  step.scratch = steps_.verifyScratch(decodeStorageLanes(lanes) * kVerifyRows);
-  step.indexOffsets = offsets;
-  std::array<uint32_t, ExecutionLimits::maximumBatchWidth> positions{};
-  for (uint32_t lane = 0; lane < lanes; ++lane) positions[lane] = chunks[lane].committed_tokens;
-  step.blocks = steps_.verifyBlocks(std::span(positions).first(lanes));
-  const QwenTargetVerifyBuffers &b = step.buffers;
-  const Qwen4Scratch &h = step.scratch;
-  const ops::HyperShape hs = hyperShape(geometry_);
-  const uint32_t rows = step.rows;
-  ops::HyperConnection::addInit(step.graph, b.hidden[0], h.streams, hs, rows);
-  for (uint32_t index = 0; index < geometry_.layers; ++index) {
-    const Qwen4ExpLayerWeights &layer = weights_.layers[index];
-    if (layer.ple) {
-      const Qwen4PleWeights &ple = *layer.ple;
-      const ops::NgramShape ps = ngramShape(geometry_);
-      addPleGather(step.graph, h, rows * geometry_.pleHeads());
-      addDecodeProjection(step.graph, h.pleRows, ple.key, h.gate, lanes, b.linearScratch);
-      addDecodeProjection(step.graph, h.pleRows, ple.value, h.pleValue, lanes, b.linearScratch);
-      ops::NgramEmbedding::addGate(step.graph, h.gate, h.pleValue, h.streams, ple.keyNorm, ple.queryNorm,
-                                   ple.convolutionNorm, h.pleGated, h.pleConvolution, ps, rows);
-      // Every lane's rows after its history in one dispatch, by the step's
-      // layout, each along its path of the lane's tree; the commit writes
-      // the history after the path it accepts.
-      ops::NgramEmbedding::addConvolution(step.graph, rowsOf<uint16_t>(h.pleConvolution, 0, rows, ps.width()),
-                                          std::span(b.auxiliary).first(lanes), {}, ple.convolution,
-                                          rowsOf<float>(h.pleGated, 0, rows, ps.width()),
-                                          rowsOf<float>(h.streams, 0, rows, ps.width()), ps, b.laneRows,
-                                          {lanes, rows, ops::verifyLaneCap(rows, lanes)}, b.tree);
-    }
-    std::visit(
-        [&](const auto &mixer) {
-          const ops::PreparedInput input = addVerifyMix(step, layer.mixerHyper, b.normalized, &mixer.inputProjection);
-          if constexpr (std::is_same_v<std::remove_cvref_t<decltype(mixer)>, QwenGdnWeights>)
-            addVerifyMixer(step, mixer, input, {h.branch, {}});
-          else
-            addVerifyMixer(step, mixer, input, {h.branch, {}}, addVerifyQsa(step, *layer.indexer));
-        },
-        layer.mixer);
-    ops::HyperConnection::addCombine(step.graph, h.streams, h.branch, h.weights, hs, rows);
-    addVerifyMix(step, layer.ffnHyper, b.normalized);
-    ops::MoE::add(step.graph,
-                  {b.normalized, h.zeros, h.branch, b.moe, std::span(step.verifyBlocks).first(lanes), b.verifyRows},
-                  layer.ffn, *step.moe);
-    ops::HyperConnection::addCombine(step.graph, h.streams, h.branch, h.weights, hs, rows);
-    if (const auto slot = geometry_.captureSlot(index))
-      addStreamCapture(step.graph, geometry_, *slot, h.streams, b.capturedTargetHidden, 0, rows);
-  }
-  requireLayerPartition(step.gdnLayer, step.attentionLayer);
-  addDecodeProjection(step.graph, b.finalHidden, weights_.logitsProjection, b.logits, lanes, b.linearScratch,
-                      addVerifyMix(step, weights_.finalHyper, b.finalHidden, &weights_.logitsProjection));
-}
-
 void Qwen4ExpTarget::addHeadBatch(metal::CommandGraph &graph, metal::MetalBuffer hidden, metal::MetalBuffer,
-                                  metal::MetalBuffer logits, uint32_t lanes, ops::LinearScratch scratch) const {
-  addDecodeProjection(graph, std::move(hidden), vocabularyProjection(), std::move(logits), lanes, scratch);
+                                  metal::MetalBuffer logits, uint32_t rows, ops::LinearScratch scratch) const {
+  const ops::Linear &linear = operators_.linear();
+  linear.add(graph, {.input = std::move(hidden), .output = std::move(logits), .scratch = scratch},
+             vocabularyProjection(), linear.plan(vocabularyProjection(), rows));
 }
 
 void Qwen4ExpTarget::addStateCommit(metal::CommandGraph &graph, QwenTargetCommitBuffers buffers,
-                                    std::span<const ops::LaneRows> blocks) const {
-  QwenTarget::addStateCommit(graph, buffers, blocks);
-  const auto lanes = static_cast<uint32_t>(blocks.size());
+                                    const ops::StepRows &step) const {
+  QwenTarget::addStateCommit(graph, buffers, step);
+  const uint32_t lanes = step.lanes;
   // Every lane's PLE history after its accepted path in one dispatch, from
   // the convolution inputs its verify wrote of its rows, by the step's
   // layout.
   const ops::NgramShape shape = ngramShape(geometry_);
-  const ops::LayoutRows rows{lanes, static_cast<uint32_t>(ops::rowsEnd(blocks)), ops::mostRows(blocks)};
+  const ops::LayoutRows rows{lanes, step.rows, step.laneCap};
   const Qwen4Scratch scratch = steps_.verifyScratch(rows.rows);
   ops::NgramEmbedding::addCommit(graph, rowsOf<uint16_t>(scratch.pleConvolution, 0, rows.rows, shape.width()),
                                  std::span(buffers.auxiliaryIn).first(lanes),

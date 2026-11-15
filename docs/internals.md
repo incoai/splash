@@ -451,14 +451,29 @@ token after a prompt is selected from, and written at, the lane's one row,
 whose layout its selection writes first (`decode_sample_first_rows`), and
 Qwen3.8-Flash-Next's n-gram hash reads it too, hashing a row's n-grams along
 its path; so do the GDN decode, the target's attention (`ops::AttentionRows`),
-and Qwen3.8-Flash-Next's block indexer (its projection, pool, selection and
+Qwen3.8-Flash-Next's block indexer (its projection, pool, selection and
 commit) and PLE convolution and commit, one dispatch for every lane on grids
 up to the lane cap (`ops::LayoutRows`), a prompt chunk's projection and
-convolution by the layout its host writes. The target's other kernels
-address each lane's rows by the host's `ops::LaneRows` (the kernels'
-per-lane `first_row` and `rows`), so lanes of different row counts share one
-dispatch; a decode step holds eight rows a lane, which the selector lays out
-at lane x 8. A
+convolution by the layout its host writes, and a MoE step's verified routing
+(`ops::MoeBuffers::laneRows`). A decode step holds eight rows a lane, which
+the selector lays out at lane x 8.
+
+A decode step's target forward is the prompt forward (`QwenTarget::addPrefill`
+over a chunk whose `decode` names the step's own buffers,
+`QwenTargetDecodeBuffers`): its lanes are the chunk's sequences, each of the
+cycle's lane cap of rows at most, which the layout places, its rows the
+step's, through the same layer loop (`addPrefillLayers`), plans by its rows,
+attention, dense FFN and MoE load and passes (a decode step's load serves a
+group of one step). It differs where the work does: its GDN layers run the
+decode scan from each lane's state along its tree into its tape, where a
+prompt sequence scans its rows from its states into theirs; its attention
+over spilled K/V reads the lists those reads locate, where a prompt
+sequence's reads staging; its MoE routes each lane's verify rows alone; every
+row is read, so the forward's end runs the head over every row and the draft
+captures every row of the layers it reads; and the Neural Engine split takes
+prompt chunks alone. Norms and producers write each projection's input as its
+plan takes it, the register tile's table on the decode tiles, a prompt
+chunk's as a decode step's. A
 lane's verify block is a tree (`metal/abi/VerifyTree.h`, a row's parent,
 depth and ancestors' mask), which the draft's selector writes with
 each row's token, its verify input: a row's penalties count the draft tokens
@@ -479,7 +494,14 @@ A lane's verify block holds up to 16 rows (`SPLASH_TARGET_VERIFY_ROWS`): its
 anchor and the rows proposed after it, a chain or a tree, each row's place in
 it (its ancestors, parent and depth, `metal/abi/VerifyTree.h`) one entry per
 packed row; a decode cycle gives every lane the chain of its draft's eight
-(`ExecutionLimits::decodeLaneRows`) until a cycle chooses each lane's rows. The
+(`ExecutionLimits::decodeLaneRows`) until a cycle chooses each lane's rows. What
+a cycle may hold follows the block's 16 rows: the KV it writes past the context
+(`SPLASH_SPECULATIVE_SCRATCH_TOKENS`, 15), the KV the engine holds for a lane's
+cycle and its reply captures, a block-sparse target's verify rows
+(`SparseKvShape::verifyRows`), and the decode arena: a step's 64 packed rows,
+which `DecodeArena::rows` views by a lane's `ops::LaneRows`, and the MoE plan of
+every step of 1 to 64 rows (`ExecutionPlans::moeWorkspace`), past 32 rows on
+32-row expert tiles (the 35B's: 5.2 MiB). The
 GDN decode (`verify_gdn_fused`) reads each lane's block from the device
 (`SplashLaneRows`) and its rows' tree. A chain's rows run the sequential
 delta-rule scan; a tree's rows each read the state before the block along
@@ -1999,7 +2021,7 @@ count as memory on its way back. `/status` counts the releases that freed what
 they were for and their pages (`kv_spill.releases`, `released_pages`).
 
 **Hot block cache** (`HotBlocksPool`, `runtime/model/ModelPools.hpp`). The
-floor, 4,096 slots a layer for each decoding lane that holds one and 4,096 more,
+floor, 8,192 slots a layer for each decoding lane that holds one and 4,096 more,
 in whole extents, is taken all or none as a lane holding Index pages decodes
 (`KvBlockCache::reserveLane`). The cache grows toward `--sparse-kv-memory` only
 while a lane holds a floor, and is a rebuilt cache while no lane reads above the
