@@ -580,10 +580,6 @@ void requireTree(const Fixture &f, uint32_t lane, uint32_t anchor, const std::ve
 void chainCase(MetalBackend &backend, uint32_t vocabulary, uint32_t lanes, DraftVocabulary tokens = {}) {
   Random random(0x5e1ec7 + uint64_t{vocabulary} * 8 + lanes * 2 + uint64_t{tokens.leading} * 16);
   const uint32_t columns = tokens.columns(vocabulary);
-  // The token of a logits column.
-  const auto columnToken = [&](uint32_t column) {
-    return column < tokens.leading ? column : column - tokens.leading + tokens.trailing;
-  };
   const std::array patterns{Pattern::Peaked, Pattern::Uniform, Pattern::Ties, Pattern::Sparse};
   const Fixture f = makeFixture(backend, vocabulary, lanes, random, patterns, 0.1F, tokens);
   const DraftSelector selector(vocabulary);
@@ -606,7 +602,7 @@ void chainCase(MetalBackend &backend, uint32_t vocabulary, uint32_t lanes, Draft
         const uint32_t id = f.candidates(lane)[position * kCandidates + rank];
         const float value = f.unary(lane)[position * kCandidates + rank];
         if (rank < expected.size())
-          require(id == columnToken(expected[rank]) && value == row[expected[rank]],
+          require(id == tokens.token(expected[rank]) && value == row[expected[rank]],
                   "draft top-16 candidates differ from the exact sorted order of their tokens");
         else
           require(id == 0xFFFFFFFFU && value == -INFINITY, "draft top-16 padding lost the empty sentinel");

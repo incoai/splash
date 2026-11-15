@@ -3,22 +3,28 @@
 // kVocabularyWindow tokens, its anchor the last, lie in it, its trailing
 // tokens too; the whole vocabulary from a token outside it until that token
 // has left every lane's window; always the whole vocabulary for a family with
-// no subset.
+// no subset. The draft's head over a subset writes at each logits column the
+// head row of the token the selector reads there, in whole tiles of rows.
 #include "TestChecks.hpp"
+#include "metal/abi/QuantFormat.h"
 #include "model/DFlashDraft.hpp"
+#include "model/QwenHybridLayout.hpp"
 #include "ops/DraftSelector.hpp"
+#include "ops/Weights.hpp"
 
 #include <cstdint>
 #include <exception>
 #include <initializer_list>
 #include <iostream>
 #include <span>
+#include <string>
 #include <vector>
 
 namespace {
 
 using splash::model::DFlashDraft;
 using splash::ops::DraftVocabulary;
+using splash::ops::Projection;
 using splash::test::rejects;
 using splash::test::require;
 
@@ -56,11 +62,36 @@ void stepVocabulary() {
           "a step of more anchors than token histories was accepted");
 }
 
+// The head's rows of a subset (DraftVocabulary::rows, the view DFlashDraft
+// runs, Projection::rows) are, column by column, the tokens the selector
+// reads its logits columns as (DraftVocabulary::token), every column one row
+// of the subset's, and whole QUANT_TILE_ROWS tiles of them, which the view
+// takes: the Qwen families' subset and subsets with and without either part.
+void headRowsAreSelectorTokens() {
+  const auto check = [](DraftVocabulary subset, uint32_t vocabulary, const std::string &name) {
+    uint32_t column = 0;
+    for (const Projection::RowRange range : subset.rows(vocabulary)) {
+      require(range.first % QUANT_TILE_ROWS == 0 && range.count % QUANT_TILE_ROWS == 0,
+              name + "'s head rows are not whole tiles");
+      for (uint32_t row = range.first; row < range.first + range.count; ++row, ++column)
+        require(subset.holds(row) && subset.token(column) == row,
+                name + "'s logits column " + std::to_string(column) + " is head row " + std::to_string(row) +
+                    ", which the selector does not read it as");
+    }
+    require(column == subset.columns(vocabulary), name + "'s head rows are not its logits columns");
+  };
+  check(splash::model::kQwenDraftVocabulary, 248'320, "the Qwen families' subset");
+  check({512, 960}, 1024, "a subset of both parts");
+  check({512, 1024}, 1024, "a leading part alone");
+  check({0, 384}, 1024, "a trailing part alone");
+}
+
 } // namespace
 
 int main() {
   try {
     stepVocabulary();
+    headRowsAreSelectorTokens();
     std::cout << "draft vocabulary: PASS\n";
     return 0;
   } catch (const std::exception &error) {

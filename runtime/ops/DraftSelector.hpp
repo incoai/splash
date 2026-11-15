@@ -4,6 +4,7 @@
 #include "metal/MetalBackend.hpp"
 #include "metal/abi/Sampling.h"
 #include "ops/LaneRows.hpp"
+#include "ops/Weights.hpp"
 
 #include <array>
 #include <cstdint>
@@ -99,6 +100,16 @@ struct DraftVocabulary final {
     return leading + (vocabulary - trailing);
   }
   [[nodiscard]] constexpr bool holds(uint32_t token) const noexcept { return token < leading || token >= trailing; }
+  // The token of logits column `column`, as the selector reads it
+  // (draft_select_top16_sharded, SelectorBatchParams).
+  [[nodiscard]] constexpr uint32_t token(uint32_t column) const noexcept {
+    return column < leading ? column : column - leading + trailing;
+  }
+  // The rows of a vocabulary head of `vocabulary` rows that write its logits
+  // columns, in column order (Projection::rows): the head's view over it.
+  [[nodiscard]] constexpr std::array<Projection::RowRange, 2> rows(uint32_t vocabulary) const noexcept {
+    return {{{0, leading}, {trailing, vocabulary - trailing}}};
+  }
   bool operator==(const DraftVocabulary &) const = default;
 };
 

@@ -5,6 +5,7 @@
 #include "ops/Embedding.hpp"
 
 #include <algorithm>
+#include <array>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -39,12 +40,13 @@ std::vector<ops::Projection> contextKvRows(const metal::MetalBackend &backend,
   return result;
 }
 
-// The head's rows of the subset's tokens: its leading ones, then its trailing
-// ones; the head itself for the whole vocabulary.
+// The head's rows of the subset's tokens (ops::DraftVocabulary::rows); the
+// head itself for the whole vocabulary.
 ops::Projection subsetRows(const metal::MetalBackend &backend, const ops::Projection &head,
                            ops::DraftVocabulary subset) {
   if (subset == ops::DraftVocabulary{}) return head;
-  return head.rows(backend, {{0, subset.leading}, {subset.trailing, head.outputSize - subset.trailing}});
+  const std::array<ops::Projection::RowRange, 2> rows = subset.rows(head.outputSize);
+  return head.rows(backend, {rows[0], rows[1]});
 }
 
 } // namespace
