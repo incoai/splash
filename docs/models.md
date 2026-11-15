@@ -522,7 +522,13 @@ target verifies over its whole head, so a greedy request's output stays the
 target's and a sampled one keeps its exact distribution; only the proposals,
 and with them the tokens a cycle accepts, can change: 99.98% of the tokens
 Qwen3.8-27B and Qwen3.6-35B-A3B committed decoding agents, code and rewrites
-greedily lie in the subset. Flint's vocabulary mixes its scripts through all
+greedily lie in the subset. On 1.6.2, whose cycles held at most eight rows a
+lane, on an M5 Max the draft's head pass took 1.13 ms of a one-lane
+Qwen3.8-27B MLX 4-bit cycle instead of 1.72 ms (a dispatch of the leading rows
+and one of the last 320), and decode steps took less GPU time with the same
+acceptance (`backend_regression`, ABBA): 1.5% at one lane and 0.6% at four on
+that model, 1.5% and 1.0% on its UD-Q4_K_M GGUF, 2.3% and 1.7% on
+Qwen3.6-35B-A3B UD-Q4_K_M. Flint's vocabulary mixes its scripts through all
 its tokens (its first 98,304 hold 98.1% of English text's tokens and 88.5% of
 Russian text's), so its drafts propose from all of them.
 

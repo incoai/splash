@@ -22,9 +22,9 @@ enum class QwenFfnKind : uint8_t { Dense, SparseMoe };
 // 148,275), and its last 320, its chat, tool and thinking tokens (248,044 to
 // 248,076); 59.8% of the vocabulary head's rows, whole 64-row tiles. Of the
 // tokens Qwen3.8-27B and Qwen3.6-35B-A3B committed decoding agents, code and
-// rewrites greedily, 99.98% lie in it; without its last tiles, 1.0% do not,
-// the agents' tool calls and turn ends, which cost the 27B's agent cycles
-// 5.5% of their tokens.
+// rewrites greedily, 99.98% lie in it; without its last tiles 1.0% would not,
+// the agents' tool calls and turn ends, and a replay of the 27B's agent
+// cycles puts what they would lose at 5.5% of their tokens.
 inline constexpr ops::DraftVocabulary kQwenDraftVocabulary{148'288, 248'000};
 
 // The dimensions and tokens of a Qwen hybrid target: GDN layers, every
