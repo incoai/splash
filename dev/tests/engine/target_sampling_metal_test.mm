@@ -17,7 +17,11 @@
 // allowed either way, instead of passing by chance. A lane selects the same,
 // bit for bit, whatever lanes share its batch; a distribution of one token
 // selects the masked argmax; and a lane that ignores end-of-sequence never
-// selects a stop token.
+// selects a stop token. A sampled verify row that tests the children its
+// draft drew selects as the recursion does in double, row by row; the
+// recursion's selections, enumerated, are the target's distribution, and so
+// are those of a tree's anchor and verified children, Monte Carlo; and a row
+// whose target keeps only candidates selects one of them.
 // Extreme repetition penalties saturate to exact, finite outcomes, and rows
 // of non-finite logits select the sentinel 0xFFFFFFFF. The host
 // word helpers and the lifecycle that rebuilds a resumed request's words are
@@ -40,10 +44,12 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <functional>
 #include <iostream>
 #include <limits>
 #include <numeric>
 #include <optional>
+#include <random>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -62,9 +68,14 @@ using namespace splash::ops;
 // one more than a verify block's most rows.
 constexpr uint32_t kRows = splash::ops::kDecodeLaneRows;
 constexpr uint32_t kMaskRows = SPLASH_TARGET_VERIFY_ROWS + 1;
+// A lane's tree rows (the selector's draws and next probabilities of each),
+// and the uniforms before its child tests: a verify block's.
+constexpr uint32_t kBlock = SPLASH_TARGET_VERIFY_ROWS;
 constexpr uint32_t kPositions = SPLASH_DRAFT_PROPOSAL_TOKENS;
 constexpr uint32_t kLanes = SPLASH_MAXIMUM_BATCH_WIDTH;
 constexpr uint32_t kUniforms = SPLASH_SAMPLING_UNIFORMS;
+constexpr uint32_t kCandidates = SPLASH_DRAFT_CANDIDATES;
+constexpr uint32_t kChildren = SPLASH_TREE_CHILDREN;
 constexpr float kFloatMax = std::numeric_limits<float>::max();
 // Both stop tokens sit below every spike of fillRow; their other places are
 // SPLASH_NO_TOKEN.
@@ -102,6 +113,12 @@ MetalBuffer allocate(MetalBackend &backend, uint64_t bytes) {
   MetalBuffer buffer =
       backend.allocateBuffer(bytes, BufferStorage::Shared, "target sampling");
   std::memset(buffer.contents(), 0, bytes);
+  return buffer;
+}
+
+MetalBuffer filled(MetalBackend &backend, uint64_t bytes, uint8_t value) {
+  MetalBuffer buffer = allocate(backend, bytes);
+  std::memset(buffer.contents(), value, bytes);
   return buffer;
 }
 
@@ -211,7 +228,12 @@ Batch makeBatch(MetalBackend &backend, uint32_t vocabulary, uint32_t lanes) {
               allocate(backend, space.vocabularyRangesBytes),
               allocate(backend, space.vocabularyArrivalsBytes),
               allocate(backend, uint64_t{lanes} * sizeof(LaneRows)),
-              allocate(backend, uint64_t{lanes} * sizeof(uint32_t))},
+              allocate(backend, uint64_t{lanes} * sizeof(uint32_t)),
+              // No row tests children unless a test gives it some.
+              filled(backend, uint64_t{rows} * sizeof(uint32_t), 0xff),
+              allocate(backend, uint64_t{lanes} * kPositions * kCandidates * sizeof(uint32_t)),
+              filled(backend, uint64_t{lanes} * kBlock * kChildren, 0xff),
+              allocate(backend, uint64_t{lanes} * kBlock * kCandidates * sizeof(float))},
           vocabulary, rows};
 }
 
@@ -913,7 +935,9 @@ void bufferExtents(MetalBackend &backend) {
       sampling.addVerify(graph, policies, buffers, blockStep(lanes), kStopTokens, {words, tableRows});
     };
     // Every row of the step, each lane's up to a block's: its mask rows and
-    // uniforms, and its verify input and tree rows, which its penalties read.
+    // uniforms (a sampled lane's child tests' too), its verify input and tree
+    // rows, which its penalties read, and what its sampled rows test: their
+    // sources and the lanes' draft candidates, draws and next probabilities.
     const auto rows = workspace(3 * kRows);
     requireExtents(
         {{&SamplingBuffers::logits, 3 * kRows * logitsRow, 4, "sampling logits"},
@@ -925,11 +949,15 @@ void bufferExtents(MetalBackend &backend) {
          {&SamplingBuffers::vocabularyRows, rows[3], sizeof(TargetVocabularyRow), "sampling vocabulary row"},
          {&SamplingBuffers::vocabularyRanges, rows[4], sizeof(TargetVocabularyRange), "sampling vocabulary range"},
          {&SamplingBuffers::vocabularyArrivals, rows[5], 4, "sampling arrival"},
-         {&SamplingBuffers::uniforms, (kUniforms + kRows) * 4, 4, "sampling uniform"},
+         {&SamplingBuffers::uniforms, (kUniforms + kBlock + kRows * kChildren) * 4, 4, "sampling uniform"},
          {&SamplingBuffers::inputTokens, lanes * kRows * 4, 4, "verify input token"},
          {&SamplingBuffers::treeRows, lanes * kRows * sizeof(TreeRow), sizeof(TreeRow), "verify tree row"},
          {&SamplingBuffers::laneRows, lanes * sizeof(LaneRows), sizeof(LaneRows), "sampling lane rows"},
-         {&SamplingBuffers::verifyRows, lanes * 4, 4, "sampling verify rows"}},
+         {&SamplingBuffers::verifyRows, lanes * 4, 4, "sampling verify rows"},
+         {&SamplingBuffers::verifySources, lanes * kRows * 4, 4, "verify source"},
+         {&SamplingBuffers::candidates, lanes * kPositions * kCandidates * 4, 4, "draft candidate"},
+         {&SamplingBuffers::treeDraws, lanes * kBlock * kChildren, 1, "draft tree draw"},
+         {&SamplingBuffers::treeNext, lanes * kBlock * kCandidates * 4, 4, "draft tree next"}},
         [&](CommandGraph &graph, const SamplingBuffers &buffers) { encode(graph, buffers, table); });
     splash::test::requireExtent(backend, table, 2 * logitsRow, 4, "penalty table",
                                 [&](CommandGraph &graph, const MetalBuffer &words) {
@@ -2417,6 +2445,589 @@ void treeSelections(MetalBackend &backend) {
               "a row above the cut's depth or below a closed path took the end");
 }
 
+// A sampled verify row's draft children (metal/abi/Sampling.h): its next
+// position's candidates, the draft's probabilities of them, and the
+// candidate indices it drew, in order.
+struct Children final {
+  std::array<uint32_t, kCandidates> ids{};
+  std::array<double, kCandidates> q{};
+  std::vector<uint32_t> draws;
+};
+
+// The recursion after the children before: the target's probabilities of
+// the candidates and its mass outside them, and the draft's probabilities.
+struct Residual final {
+  std::array<double, kCandidates> p{};
+  double outside = 0.0;
+  std::array<double, kCandidates> q{};
+};
+
+Residual startOf(const std::vector<double> &p, const Children &children) {
+  Residual r;
+  double inside = 0.0;
+  for (uint32_t i = 0; i < kCandidates; ++i) {
+    r.p[i] = children.ids[i] < p.size() ? p[children.ids[i]] : 0.0;
+    inside += r.p[i];
+  }
+  r.outside = std::max(1.0 - inside, 0.0);
+  r.q = children.q;
+  return r;
+}
+
+// After child `index` is rejected: the target's residual max(p - q, 0),
+// renormalized, and the draft without the child, renormalized by the sum of
+// what is left of it. False where nothing is
+// left of the residual, which an exact recursion never reaches.
+bool reject(Residual &r, uint32_t index) {
+  double residual = r.outside;
+  for (uint32_t i = 0; i < kCandidates; ++i)
+    residual += std::max(r.p[i] - r.q[i], 0.0);
+  if (!(residual > 0.0))
+    return false;
+  for (uint32_t i = 0; i < kCandidates; ++i)
+    r.p[i] = std::max(r.p[i] - r.q[i], 0.0) / residual;
+  r.outside /= residual;
+  r.q[index] = 0.0;
+  const double rest = std::accumulate(r.q.begin(), r.q.end(), 0.0);
+  for (uint32_t i = 0; rest > 0.0 && i < kCandidates; ++i)
+    r.q[i] /= rest;
+  return true;
+}
+
+// The distribution a row with `children` draws selects from, by enumeration
+// of the draft's draws without replacement and of each test's outcome, the
+// last residual where every test rejects: the candidates' residual, and
+// past them the target's own probabilities outside them.
+std::vector<double> selectionDistribution(const std::vector<double> &p, const Children &children,
+                                          uint32_t draws) {
+  std::vector<double> out(p.size(), 0.0);
+  double outsideMass = 0.0;
+  std::vector<bool> candidate(p.size(), false);
+  for (const uint32_t id : children.ids)
+    if (id < p.size())
+      candidate[id] = true;
+  for (uint32_t token = 0; token < p.size(); ++token)
+    outsideMass += candidate[token] ? 0.0 : p[token];
+  std::function<void(const Residual &, uint32_t, double)> step = [&](const Residual &r, uint32_t left,
+                                                                     double weight) {
+    double draft = 0.0;
+    for (const double value : r.q)
+      draft += value;
+    if (!left || !(draft > 0.0)) {
+      for (uint32_t i = 0; i < kCandidates; ++i)
+        if (children.ids[i] < p.size())
+          out[children.ids[i]] += weight * r.p[i];
+      for (uint32_t token = 0; token < p.size() && outsideMass > 0.0; ++token)
+        if (!candidate[token])
+          out[token] += weight * r.outside * p[token] / outsideMass;
+      return;
+    }
+    for (uint32_t i = 0; i < kCandidates; ++i) {
+      if (!(r.q[i] > 0.0))
+        continue;
+      const double accept = std::min(1.0, r.p[i] / r.q[i]);
+      out[children.ids[i]] += weight * r.q[i] * accept;
+      Residual next = r;
+      if (accept < 1.0 && reject(next, i))
+        step(next, left - 1, weight * r.q[i] * (1.0 - accept));
+    }
+  };
+  step(startOf(p, children), draws, 1.0);
+  return out;
+}
+
+// The recursion selects from the target's distribution whatever the draft:
+// over 300 random targets and drafts, of one to four children, some
+// candidates outside the target's support and some of its mass outside the
+// candidates, the enumerated selection is the target's to 1e-12.
+void recursiveRejectionSampling() {
+  Random random(0x72727321);
+  const auto dirichlet = [&](std::span<double> out, uint32_t zeros) {
+    double total = 0.0;
+    for (double &value : out) {
+      value = -std::log(0.5 * (random.unit() + 1.0) + 1e-9);
+      total += value;
+    }
+    for (uint32_t i = 0; i < zeros; ++i)
+      out[random.next() % out.size()] = 0.0;
+    total = std::accumulate(out.begin(), out.end(), 0.0);
+    for (double &value : out)
+      value /= total;
+  };
+  double worst = 0.0;
+  for (uint32_t trial = 0; trial < 300; ++trial) {
+    std::vector<double> p(24);
+    dirichlet(p, trial % 5);
+    Children children;
+    std::vector<uint32_t> tokens(p.size());
+    std::iota(tokens.begin(), tokens.end(), 0U);
+    std::shuffle(tokens.begin(), tokens.end(), std::mt19937(trial));
+    std::copy_n(tokens.begin(), kCandidates, children.ids.begin());
+    dirichlet(children.q, trial % 7);
+    const std::vector<double> selected = selectionDistribution(p, children, 1 + trial % 4);
+    for (uint32_t token = 0; token < p.size(); ++token)
+      worst = std::max(worst, std::fabs(selected[token] - p[token]));
+  }
+  require(worst < 1e-12, "the recursion's selections are off the target's by " + std::to_string(worst));
+}
+
+// The selection of a row that tests `children` with uniforms `tests`, then
+// draws the last residual with `uniform`: a candidate by the residual's
+// weights in index order, or past them a token outside them by the target's
+// probabilities in token order; a row without children draws from its whole
+// distribution in token order. Close where a comparison lay within 1e-5 of
+// its threshold, which float sums may decide either way.
+struct Selection final {
+  uint32_t token = 0;
+  bool close = false;
+};
+
+Selection referenceSelection(const std::vector<double> &p, const Children &children, std::span<const float> tests,
+                             double uniform) {
+  Selection result;
+  // A row without children draws from its whole distribution in token order.
+  if (children.draws.empty()) {
+    double cumulative = 0.0;
+    for (uint32_t token = 0; token < p.size(); ++token) {
+      if (!(p[token] > 0.0))
+        continue;
+      result.close = result.close || std::fabs(uniform - cumulative) < 1e-5 ||
+                     std::fabs(uniform - cumulative - p[token]) < 1e-5;
+      cumulative += p[token];
+      result.token = token;
+      if (uniform < cumulative)
+        break;
+    }
+    return result;
+  }
+  Residual r = startOf(p, children);
+  for (uint32_t child = 0; child < children.draws.size(); ++child) {
+    const uint32_t index = children.draws[child];
+    const double left = tests[child] * r.q[index];
+    result.close = result.close || std::fabs(left - r.p[index]) < 1e-5;
+    if (left < r.p[index]) {
+      result.token = children.ids[index];
+      return result;
+    }
+    if (!reject(r, index))
+      break;
+  }
+  const double inside = std::accumulate(r.p.begin(), r.p.end(), 0.0);
+  const double point = uniform * (inside + r.outside);
+  double cumulative = 0.0;
+  for (uint32_t i = 0; i < kCandidates; ++i) {
+    if (!(r.p[i] > 0.0))
+      continue;
+    result.close = result.close || std::fabs(point - cumulative) < 1e-5 ||
+                   std::fabs(point - cumulative - r.p[i]) < 1e-5;
+    cumulative += r.p[i];
+    if (point < cumulative) {
+      result.token = children.ids[i];
+      return result;
+    }
+  }
+  std::vector<double> outside = p;
+  for (const uint32_t id : children.ids)
+    if (id < outside.size())
+      outside[id] = 0.0;
+  const double total = std::accumulate(outside.begin(), outside.end(), 0.0);
+  const double target = (point - inside) / r.outside * total;
+  cumulative = 0.0;
+  for (uint32_t token = 0; token < outside.size(); ++token) {
+    if (!(outside[token] > 0.0))
+      continue;
+    result.close = result.close || std::fabs(target - cumulative) < 1e-5 * total ||
+                   std::fabs(target - cumulative - outside[token]) < 1e-5 * total;
+    cumulative += outside[token];
+    if (target < cumulative || token + 1 == outside.size()) {
+      result.token = token;
+      return result;
+    }
+  }
+  return result;
+}
+
+// The draft's draws without replacement from q, Gumbel-top-k of its log q.
+std::vector<uint32_t> drawChildren(const std::array<double, kCandidates> &q, uint32_t count, std::mt19937_64 &rng) {
+  std::uniform_real_distribution<double> unit(0.0, 1.0);
+  std::vector<std::pair<double, uint32_t>> keys;
+  for (uint32_t i = 0; i < kCandidates; ++i)
+    if (q[i] > 0.0)
+      keys.emplace_back(std::log(q[i]) - std::log(-std::log(unit(rng) + 1e-300)), i);
+  std::sort(keys.begin(), keys.end(), [](const auto &a, const auto &b) { return a.first > b.first; });
+  std::vector<uint32_t> draws;
+  for (uint32_t i = 0; i < count && i < keys.size(); ++i)
+    draws.push_back(keys[i].second);
+  return draws;
+}
+
+// Writes a lane's tree row `row`'s children for its selection: its source
+// (the row itself), its draws and its next position's probabilities, and
+// the lane's candidates at the position after the row's depth.
+void setChildren(const Batch &batch, uint32_t lane, uint32_t row, uint32_t depth, const Children &children) {
+  static_cast<uint32_t *>(batch.buffers.verifySources.contents())[lane * kRows + row] = row;
+  std::copy(children.ids.begin(), children.ids.end(),
+            static_cast<uint32_t *>(batch.buffers.candidates.contents()) + (lane * kPositions + depth) * kCandidates);
+  auto *draws = static_cast<uint8_t *>(batch.buffers.treeDraws.contents()) + (lane * kBlock + row) * kChildren;
+  std::fill_n(draws, kChildren, uint8_t{0xff});
+  std::copy(children.draws.begin(), children.draws.end(), draws);
+  auto *next = static_cast<float *>(batch.buffers.treeNext.contents()) + (lane * kBlock + row) * kCandidates;
+  for (uint32_t i = 0; i < kCandidates; ++i)
+    next[i] = static_cast<float>(children.q[i]);
+}
+
+// A sampled verify row that tests the children its draft drew selects as the
+// recursion does with its uniforms: for each lane's chain of rows, with
+// production and other policies, of zero to four children each, their
+// candidates a row's likeliest tokens among others, one of a lane's first row
+// each round past the vocabulary (0xffffffff, as the draft's top 16 lists for
+// a row of fewer comparable logits, never drawn), row by row against the
+// reference, but where a comparison lies within float rounding of its
+// threshold or the policy's cut is ambiguous.
+void childTests(MetalBackend &backend) {
+  constexpr uint32_t vocabulary = 1003;
+  Sampling sampling(vocabulary);
+  const Batch batch = makeBatch(backend, vocabulary, kLanes);
+  const MetalBuffer table = penaltyTable(backend, vocabulary);
+  const std::array<uint32_t, kLanes> tableRows{};
+  const std::vector<SamplingPolicy> policies{SamplingPolicy{20, 1.0F, 0.95F}, SamplingPolicy{20, 0.7F, 0.8F},
+                                             SamplingPolicy{0, 1.0F, 1.0F}, SamplingPolicy{40, 1.3F, 0.9F}};
+  Random random(0x63686c64);
+  std::mt19937_64 rng(0x63686c64);
+  uint32_t checked = 0, drawn = 0;
+  for (uint32_t round = 0; round < 24; ++round) {
+    for (uint32_t row = 0; row < batch.rows; ++row)
+      fillRow(batch.row(row), vocabulary, random);
+    for (uint32_t uniform = 0; uniform < kLanes * kUniforms; ++uniform)
+      batch.uniforms()[uniform] = 0.5F * (random.unit() + 1.0F);
+    std::vector<std::vector<Children>> rows(kLanes, std::vector<Children>(kRows));
+    for (uint32_t lane = 0; lane < kLanes; ++lane)
+      for (uint32_t row = 0; row + 1 < kRows && row < kPositions; ++row) {
+        Children &children = rows[lane][row];
+        // The row's likeliest tokens and others, all distinct.
+        std::vector<uint32_t> ids = referenceBest(batch.row(lane * kRows + row), vocabulary, 6);
+        while (ids.size() < kCandidates) {
+          const uint32_t id = random.next() % vocabulary;
+          if (std::find(ids.begin(), ids.end(), id) == ids.end())
+            ids.push_back(id);
+        }
+        std::shuffle(ids.begin(), ids.end(), rng);
+        std::copy(ids.begin(), ids.end(), children.ids.begin());
+        const bool outside = row == 0 && lane == round % kLanes;
+        if (outside)
+          children.ids[kCandidates - 1] = 0xffffffffU;
+        double total = 0.0;
+        for (uint32_t i = 0; i < kCandidates; ++i) {
+          double &value = children.q[i];
+          value = random.next() % 4 && !(outside && i == kCandidates - 1) ? std::pow(0.5 * (random.unit() + 1.0), 3.0)
+                                                                          : 0.0;
+          total += value;
+        }
+        for (double &value : children.q)
+          value /= total;
+        children.draws = drawChildren(children.q, (round + row + lane) % (kChildren + 1), rng);
+        setChildren(batch, lane, row, row, children);
+      }
+    batch.poison();
+    CommandGraph graph;
+    sampling.addVerify(graph, policies, batch.buffers, layOut(batch.buffers, blocks(kLanes)), kStopTokens,
+                       {table, tableRows});
+    static_cast<void>(backend.submitCommandAsync(graph.dispatches()).wait());
+    for (uint32_t lane = 0; lane < kLanes; ++lane)
+      for (uint32_t row = 0; row + 1 < kRows && row < kPositions; ++row) {
+        const Distribution target = referenceDistribution(batch.row(lane * kRows + row), vocabulary, policies[lane]);
+        ++drawn;
+        if (target.ambiguousMass > 0.0)
+          continue;
+        const float *tests = batch.uniforms() + lane * kUniforms + kBlock + row * kChildren;
+        const Selection reference =
+            referenceSelection(target.probabilities, rows[lane][row], std::span(tests, kChildren),
+                               batch.uniforms()[lane * kUniforms + row]);
+        if (reference.close)
+          continue;
+        ++checked;
+        require(batch.outputTokens()[lane * kRows + row] == reference.token,
+                "round " + std::to_string(round) + " lane " + std::to_string(lane) + " row " + std::to_string(row) +
+                    ": selected " + std::to_string(batch.outputTokens()[lane * kRows + row]) + ", not " +
+                    std::to_string(reference.token));
+      }
+  }
+  require(checked * 10 >= drawn * 9, "most rows were too close to check");
+}
+
+// A sampled verify row whose draft holds all but 1.5e-8 of its q_T on its
+// first child, which fp32 holds as 1, tests its second child, once it rejects
+// the first, against the rest of the draft renormalized, a fifteenth of which
+// the second holds. The target holds 0.5 on the first child, 0.01 on the
+// second and 0.49 outside the candidates. Over random uniforms, row by row
+// against the recursion in double, but where a comparison lies within float
+// rounding of its threshold.
+void dominantChild(MetalBackend &backend) {
+  constexpr uint32_t vocabulary = 1003;
+  Sampling sampling(vocabulary);
+  const Batch batch = makeBatch(backend, vocabulary, kLanes);
+  const MetalBuffer table = penaltyTable(backend, vocabulary);
+  const std::array<uint32_t, kLanes> tableRows{};
+  const SamplingPolicy policy{0, 1.0F, 1.0F};
+  const std::vector<SamplingPolicy> policies(kLanes, policy);
+  std::vector<float> logits(vocabulary, -1.0e4F);
+  logits[500] = std::log(0.5F);
+  logits[503] = std::log(0.01F);
+  for (uint32_t i = 0; i < 49; ++i)
+    logits[600 + i] = std::log(0.01F);
+  const Distribution target = referenceDistribution(logits.data(), vocabulary, policy);
+  Children children;
+  for (uint32_t i = 0; i < kCandidates; ++i) {
+    children.ids[i] = i == 0 ? 500U : i == 1 ? 503U : 100U + 3U * i;
+    children.q[i] = i == 0 ? 1.0 : 1.0e-9;
+  }
+  children.draws = {0, 1};
+  Random random(0x646f6d69);
+  uint32_t checked = 0, seconds = 0;
+  for (uint32_t round = 0; round < 8; ++round) {
+    for (uint32_t uniform = 0; uniform < kLanes * kUniforms; ++uniform)
+      batch.uniforms()[uniform] = 0.5F * (random.unit() + 1.0F);
+    for (uint32_t lane = 0; lane < kLanes; ++lane)
+      for (uint32_t row = 0; row < kPositions; ++row) {
+        std::copy(logits.begin(), logits.end(), batch.row(lane * kRows + row));
+        setChildren(batch, lane, row, row, children);
+      }
+    batch.poison();
+    CommandGraph graph;
+    sampling.addVerify(graph, policies, batch.buffers, layOut(batch.buffers, blocks(kLanes)), kStopTokens,
+                       {table, tableRows});
+    static_cast<void>(backend.submitCommandAsync(graph.dispatches()).wait());
+    for (uint32_t lane = 0; lane < kLanes; ++lane)
+      for (uint32_t row = 0; row < kPositions; ++row) {
+        const float *tests = batch.uniforms() + lane * kUniforms + kBlock + row * kChildren;
+        const Selection reference = referenceSelection(target.probabilities, children, std::span(tests, kChildren),
+                                                       batch.uniforms()[lane * kUniforms + row]);
+        if (reference.close)
+          continue;
+        ++checked;
+        seconds += reference.token == 503 ? 1 : 0;
+        require(batch.outputTokens()[lane * kRows + row] == reference.token,
+                "round " + std::to_string(round) + " lane " + std::to_string(lane) + " row " + std::to_string(row) +
+                    ": selected " + std::to_string(batch.outputTokens()[lane * kRows + row]) + ", not " +
+                    std::to_string(reference.token));
+      }
+  }
+  require(checked >= 200 && seconds > 0, "too few rows checked the second child's test");
+}
+
+// A sampled verify row whose target keeps only candidates, all as likely,
+// rejects a drawn child the target does not keep, its draft weighing the kept
+// candidates as the target does. Nothing of the target lies outside the
+// candidates, so the row selects a kept one, whatever float rounding leaves
+// of one less their probabilities: a draw past them would find no token, the
+// vocabulary's first range holding none of them. For two to fifteen kept
+// candidates, one count a row.
+void keptCandidatesAlone(MetalBackend &backend) {
+  constexpr uint32_t vocabulary = 1003;
+  Sampling sampling(vocabulary);
+  const Batch batch = makeBatch(backend, vocabulary, kLanes);
+  const MetalBuffer table = penaltyTable(backend, vocabulary);
+  const std::array<uint32_t, kLanes> tableRows{};
+  const std::vector<SamplingPolicy> policies(kLanes, SamplingPolicy{0, 1.0F, 1.0F});
+  Random random(0x6b657074);
+  for (uint32_t uniform = 0; uniform < kLanes * kUniforms; ++uniform)
+    batch.uniforms()[uniform] = 0.5F * (random.unit() + 1.0F);
+  std::vector<uint32_t> counts(batch.rows, 0);
+  for (uint32_t lane = 0; lane < kLanes; ++lane)
+    for (uint32_t row = 0; row < kPositions; ++row) {
+      const uint32_t count = 2 + (lane * kPositions + row) % (kCandidates - 2);
+      counts[lane * kRows + row] = count;
+      float *logits = batch.row(lane * kRows + row);
+      std::fill(logits, logits + vocabulary, -1.0e4F);
+      Children children;
+      for (uint32_t i = 0; i < kCandidates; ++i) {
+        children.ids[i] = i < count ? 500 + 7 * i : 100 + 3 * i;
+        children.q[i] = i < count ? 1.0 / count : 1.0e-12;
+        if (i < count)
+          logits[children.ids[i]] = 0.0F;
+      }
+      children.draws = {kCandidates - 1};
+      setChildren(batch, lane, row, row, children);
+    }
+  batch.poison();
+  CommandGraph graph;
+  sampling.addVerify(graph, policies, batch.buffers, layOut(batch.buffers, blocks(kLanes)), kStopTokens,
+                     {table, tableRows});
+  static_cast<void>(backend.submitCommandAsync(graph.dispatches()).wait());
+  for (uint32_t lane = 0; lane < kLanes; ++lane)
+    for (uint32_t row = 0; row < kPositions; ++row) {
+      const uint32_t at = lane * kRows + row, token = batch.outputTokens()[at];
+      require(token >= 500 && token < 500 + 7 * counts[at] && (token - 500) % 7 == 0,
+              std::to_string(counts[at]) + " kept candidates: row " + std::to_string(at) + " selected " +
+                  std::to_string(token));
+    }
+}
+
+// The recursion over trees selects from the target, Monte Carlo: a lane's
+// anchor tests three children its draft drew without replacement, the first
+// two of them verify rows that test two each of their own. Over 6000 such
+// trees, their draws and uniforms fresh, the anchor's selection follows the
+// target's distribution at the anchor, and a verified child's selection,
+// where acceptance walked to it, the target's at that child: each a
+// chi-square over the outcomes expected 5 times or more (the others pooled)
+// within five standard deviations of its degrees of freedom, for at least
+// `walked` children walked 300 times or more. Under `policy`; the drafts
+// favor less likely tokens, or, `peaked`, hold all but 1.5e-8 of their mass
+// on one candidate, which fp32 holds as 1.
+void childTestsOnTrees(MetalBackend &backend, const SamplingPolicy &policy, bool peaked, uint32_t walked) {
+  constexpr uint32_t vocabulary = 1003, kRuns = 1500, kTreeRows = 7;
+  Sampling sampling(vocabulary);
+  const Batch batch = makeBatch(backend, vocabulary, kLanes);
+  const MetalBuffer table = penaltyTable(backend, vocabulary);
+  const std::array<uint32_t, kLanes> tableRows{};
+  const std::vector<SamplingPolicy> policies(kLanes, policy);
+  const std::string variant = "temperature " + std::to_string(policy.temperature) + (peaked ? ", peaked: " : ": ");
+  Random random(0x74726565);
+  std::mt19937_64 rng(0x74726565);
+  // The anchor's logits and each of its candidates' as a child; the rows
+  // below a child alike.
+  std::vector<float> anchor(vocabulary), leaf(vocabulary);
+  fillRow(anchor.data(), vocabulary, random);
+  fillRow(leaf.data(), vocabulary, random);
+  const Distribution root = referenceDistribution(anchor.data(), vocabulary, policy);
+  require(root.ambiguousMass == 0.0, "the test's anchor is ambiguous");
+  // The anchor's candidates: six of its likeliest tokens and ten others.
+  // Its draft favors the less likely of the six, so that a draw is often
+  // rejected and the row's later tests and residuals decide; or, peaked,
+  // holds nearly all on the second likeliest, the rest a fifteenth each once
+  // the target rejects it.
+  Children first;
+  std::vector<uint32_t> ids = referenceBest(anchor.data(), vocabulary, 6);
+  while (ids.size() < kCandidates) {
+    const uint32_t id = random.next() % vocabulary;
+    if (std::find(ids.begin(), ids.end(), id) == ids.end())
+      ids.push_back(id);
+  }
+  std::copy(ids.begin(), ids.end(), first.ids.begin());
+  for (uint32_t i = 0; i < kCandidates; ++i)
+    first.q[i] = peaked ? (i == 1 ? 1.0 - 1.5e-8 : 1.0e-9) : i < 6 ? 1.0 + i : 0.2;
+  const double firstTotal = std::accumulate(first.q.begin(), first.q.end(), 0.0);
+  for (double &value : first.q)
+    value /= firstTotal;
+  std::vector<std::vector<float>> childLogits(kCandidates, std::vector<float>(vocabulary));
+  std::vector<Distribution> childTargets;
+  for (uint32_t i = 0; i < kCandidates; ++i) {
+    fillRow(childLogits[i].data(), vocabulary, random);
+    childTargets.push_back(referenceDistribution(childLogits[i].data(), vocabulary, policy));
+    require(childTargets.back().ambiguousMass == 0.0, "the test's child is ambiguous");
+  }
+  // The next position's candidates, which every child shares, each child's
+  // draft weighing them otherwise.
+  std::vector<uint32_t> next = referenceBest(childLogits[0].data(), vocabulary, 5);
+  while (next.size() < kCandidates) {
+    const uint32_t id = random.next() % vocabulary;
+    if (std::find(next.begin(), next.end(), id) == next.end())
+      next.push_back(id);
+  }
+  std::vector<Children> second(kCandidates);
+  for (uint32_t i = 0; i < kCandidates; ++i) {
+    std::copy(next.begin(), next.end(), second[i].ids.begin());
+    double total = 0.0;
+    for (uint32_t j = 0; j < kCandidates; ++j)
+      total += second[i].q[j] = peaked ? (j == 1 ? 1.0 - 1.5e-8 : 1.0e-9) : j < 5 ? 1.0 + (j + i) % 5 : 0.2;
+    for (double &value : second[i].q)
+      value /= total;
+  }
+  std::vector<uint32_t> anchorCounts(vocabulary, 0);
+  std::vector<std::vector<uint32_t>> childCounts(kCandidates, std::vector<uint32_t>(vocabulary, 0));
+  // Each lane's block: its tree's rows, then rows past its verify rows.
+  const std::vector<LaneRows> laneRows = blocks(kLanes);
+  const std::array<uint32_t, kLanes> verifiedRows{kTreeRows, kTreeRows, kTreeRows, kTreeRows};
+  const std::array<uint32_t, kLanes> limits{kRows, kRows, kRows, kRows};
+  const AcceptanceBuffers acceptance = acceptanceBuffers(backend, batch, kLanes);
+  // Preorder: the anchor, the first child and its two, the second and its two.
+  constexpr std::array<uint32_t, kTreeRows> parents{0, 0, 1, 1, 0, 4, 4};
+  for (uint32_t run = 0; run < kRuns; ++run) {
+    std::vector<std::array<uint32_t, 2>> verified(kLanes);
+    for (uint32_t lane = 0; lane < kLanes; ++lane) {
+      Children top = first;
+      top.draws = drawChildren(first.q, 3, rng);
+      setChildren(batch, lane, 0, 0, top);
+      std::copy(anchor.begin(), anchor.end(), batch.row(lane * kRows));
+      auto *tree = static_cast<TreeRow *>(batch.buffers.treeRows.contents()) + lane * kRows;
+      uint32_t *inputs = batch.inputTokens() + lane * kRows;
+      std::array<uint32_t, kRows> ancestors{}, depths{};
+      for (uint32_t row = 0; row < kRows; ++row) {
+        const uint32_t parent = row < kTreeRows ? parents[row] : row - 1;
+        ancestors[row] = (row ? ancestors[parent] : 0U) | (1U << row);
+        depths[row] = row ? depths[parent] + 1 : 0;
+        tree[row] = {ancestors[row], static_cast<uint16_t>(row ? parent : SPLASH_TREE_ROOT),
+                     static_cast<uint16_t>(depths[row])};
+      }
+      inputs[0] = 1;
+      for (uint32_t branch = 0; branch < 2; ++branch) {
+        const uint32_t index = top.draws[branch], at = branch ? 4 : 1;
+        verified[lane][branch] = index;
+        inputs[at] = first.ids[index];
+        std::copy(childLogits[index].begin(), childLogits[index].end(), batch.row(lane * kRows + at));
+        Children grand = second[index];
+        grand.draws = drawChildren(grand.q, 2, rng);
+        setChildren(batch, lane, at, 1, grand);
+        for (uint32_t grandchild = 0; grandchild < 2; ++grandchild) {
+          inputs[at + 1 + grandchild] = grand.ids[grand.draws[grandchild]];
+          std::copy(leaf.begin(), leaf.end(), batch.row(lane * kRows + at + 1 + grandchild));
+        }
+      }
+    }
+    for (uint32_t uniform = 0; uniform < kLanes * kUniforms; ++uniform)
+      batch.uniforms()[uniform] = 0.5F * (random.unit() + 1.0F);
+    batch.poison();
+    CommandGraph graph;
+    const StepRows step = layOut(batch.buffers, laneRows, verifiedRows);
+    sampling.addVerify(graph, policies, batch.buffers, step, kStopTokens, {table, tableRows});
+    sampling.addAcceptance(graph, acceptance, step, limits, kStopTokens);
+    static_cast<void>(backend.submitCommandAsync(graph.dispatches()).wait());
+    const auto *retained = static_cast<const uint32_t *>(acceptance.retainedCounts.contents());
+    for (uint32_t lane = 0; lane < kLanes; ++lane) {
+      const uint32_t *kept = static_cast<const uint32_t *>(acceptance.outputTokens.contents()) + lane * kRows;
+      ++anchorCounts[kept[0]];
+      for (uint32_t branch = 0; branch < 2 && retained[lane] >= 2; ++branch)
+        if (kept[0] == first.ids[verified[lane][branch]])
+          ++childCounts[verified[lane][branch]][kept[1]];
+    }
+  }
+  const auto chiSquare = [](const std::vector<uint32_t> &counts, const std::vector<double> &probabilities,
+                            const std::string &label) {
+    const double total = std::accumulate(counts.begin(), counts.end(), 0.0);
+    double chi = 0.0, pooledSeen = 0.0, pooledExpected = 0.0;
+    uint32_t bins = 0;
+    for (uint32_t token = 0; token < counts.size(); ++token) {
+      const double want = probabilities[token] * total;
+      require(probabilities[token] > 0.0 || counts[token] == 0,
+              label + ": selected token " + std::to_string(token) + ", which the target never selects");
+      if (want < 5.0) {
+        pooledSeen += counts[token];
+        pooledExpected += want;
+        continue;
+      }
+      chi += (counts[token] - want) * (counts[token] - want) / want;
+      ++bins;
+    }
+    if (pooledExpected >= 5.0) {
+      chi += (pooledSeen - pooledExpected) * (pooledSeen - pooledExpected) / pooledExpected;
+      ++bins;
+    }
+    const double freedom = bins - 1.0;
+    require(bins >= 2 && chi < freedom + 5.0 * std::sqrt(2.0 * freedom),
+            label + ": chi-square " + std::to_string(chi) + " over " + std::to_string(freedom) +
+                " degrees of freedom");
+  };
+  chiSquare(anchorCounts, root.probabilities, variant + "the anchor's selections");
+  uint32_t children = 0;
+  for (uint32_t i = 0; i < kCandidates; ++i) {
+    if (std::accumulate(childCounts[i].begin(), childCounts[i].end(), 0U) < 300)
+      continue;
+    chiSquare(childCounts[i], childTargets[i].probabilities, variant + "child " + std::to_string(i) + "'s selections");
+    ++children;
+  }
+  require(children >= walked, variant + "too few children were walked to check their selections");
+}
+
 // The host words: prompt bits only when repetition reads them, counts of
 // every selected token (the generated history and the pending anchor), and
 // no token outside the vocabulary or history without a prompt.
@@ -2548,6 +3159,8 @@ int main(int argc, char **argv) {
     penaltyLifecycle();
     stage = "policies that keep one token";
     onlyTheMostLikelyIsGreedy();
+    stage = "recursive rejection sampling";
+    recursiveRejectionSampling();
     MetalBackend backend(argv[1]);
     stage = "invalid penalties";
     invalidPenalties(backend);
@@ -2576,6 +3189,16 @@ int main(int argc, char **argv) {
     packedLanes(backend);
     stage = "tree selections";
     treeSelections(backend);
+    stage = "child tests";
+    childTests(backend);
+    stage = "kept candidates alone";
+    keptCandidatesAlone(backend);
+    stage = "a dominant child";
+    dominantChild(backend);
+    stage = "child tests on trees";
+    childTestsOnTrees(backend, SamplingPolicy{20, 1.0F, 0.95F}, false, 2);
+    stage = "child tests on trees of peaked drafts at temperature 0.3";
+    childTestsOnTrees(backend, SamplingPolicy{20, 0.3F, 0.95F}, true, 1);
     for (const uint32_t vocabulary : {1003U, 248320U}) {
       uint32_t changedSelections = 0;
       for (uint32_t lanes = 1; lanes <= kLanes; ++lanes) {

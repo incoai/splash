@@ -257,11 +257,14 @@ decodeTensorBytes(const RuntimeGeometry &geometry,
   put(DecodeTensor::TopPartialIds, selectorWorkspace.partialIdsBytes);
   put(DecodeTensor::TopPartialValues, selectorWorkspace.partialValuesBytes);
   put(DecodeTensor::TreeRows, bytesFor<ops::TreeRow>(r));
+  put(DecodeTensor::VerifySources, bytesFor<uint32_t>(r));
   // A lane's tree takes a verify block's rows.
   const uint64_t v = ExecutionLimits::targetVerifyRows;
   put(DecodeTensor::DraftTreeTokens, bytesFor<uint32_t>(v));
   put(DecodeTensor::DraftTrees, bytesFor<ops::TreeRow>(v));
   put(DecodeTensor::DraftTreeScores, bytesFor<float>(2 * v));
+  put(DecodeTensor::DraftTreeDraws, bytesFor<uint8_t>(v * SPLASH_TREE_CHILDREN));
+  put(DecodeTensor::DraftTreeNext, bytesFor<float>(v * SPLASH_DRAFT_CANDIDATES));
   put(DecodeTensor::DraftTreeSizes, sizeof(uint32_t));
   put(DecodeTensor::ChainTokens, bytesFor<uint32_t>(SPLASH_TREE_CHAIN_TOKENS));
   put(DecodeTensor::ChainRates, bytesFor<float>(uint64_t{SPLASH_TREE_CHAIN_TOKENS} * SPLASH_TREE_AGREEMENTS));

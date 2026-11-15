@@ -199,8 +199,9 @@ void Sampling::addVerify(metal::CommandGraph &graph,
   requireStepRows(step);
   if (policies.size() != step.lanes)
     throw std::invalid_argument("invalid sampling batch width");
-  // Verify row r of a lane reads mask row r + 1.
-  const TargetRows selected{step.rows, step.laneCap, 1};
+  // Verify row r of a lane reads mask row r + 1, and a sampled one tests its
+  // draft's children.
+  const TargetRows selected{step.rows, step.laneCap, 1, true};
   const TargetSamplingParams params = selection(policies, buffers, selected, stopTokens);
   addPenalties(graph, buffers, penalties, penaltyParams(policies, buffers, penalties, selected));
   addSelection(graph, params, policies, buffers, selected);
@@ -217,6 +218,7 @@ TargetSamplingParams Sampling::selection(std::span<const SamplingPolicy> policie
   params.vocabulary = vocabulary_;
   params.mask_words = maskWords_;
   params.mask_row = rows.maskRow;
+  params.trees = rows.trees ? 1 : 0;
   std::ranges::copy(stopTokens.ids, params.stop_tokens);
   // The rows each policy's kernels reach, up to the last that reads each
   // buffer: the logits and output tokens of every lane, a workspace the
@@ -232,7 +234,10 @@ TargetSamplingParams Sampling::selection(std::span<const SamplingPolicy> policie
       params.top_p[lane] = policy.topP;
       params.min_p[lane] = policy.minP;
       params.sampling_mask |= uint32_t{1} << lane;
-      uniformEnd = uint64_t{lane} * SPLASH_SAMPLING_UNIFORMS + rows.laneCap;
+      // A verify row's child tests follow the lane's draw uniforms.
+      uniformEnd = uint64_t{lane} * SPLASH_SAMPLING_UNIFORMS +
+                   (rows.trees ? SPLASH_TARGET_VERIFY_ROWS + uint64_t{rows.laneCap} * SPLASH_TREE_CHILDREN
+                               : rows.laneCap);
     }
     if (policy.constrained) {
       params.constrained_mask |= uint32_t{1} << lane;
@@ -259,6 +264,16 @@ TargetSamplingParams Sampling::selection(std::span<const SamplingPolicy> policie
   requireBytes(buffers.vocabularyRanges, sampled.vocabularyRangesBytes, "sampling vocabulary range");
   requireBytes(buffers.vocabularyArrivals, sampled.vocabularyArrivalsBytes, "sampling arrival");
   requireBytes(buffers.uniforms, uniformEnd * sizeof(float), "sampling uniform");
+  if (params.trees && params.sampling_mask) {
+    const uint64_t treeRows = uint64_t{lanes} * SPLASH_TARGET_VERIFY_ROWS;
+    requireBytes(buffers.treeRows, end * sizeof(TreeRow), "verify tree row");
+    requireBytes(buffers.verifySources, end * sizeof(uint32_t), "verify source");
+    requireBytes(buffers.candidates,
+                 uint64_t{lanes} * SPLASH_DRAFT_PROPOSAL_TOKENS * SPLASH_DRAFT_CANDIDATES * sizeof(uint32_t),
+                 "draft candidate");
+    requireBytes(buffers.treeDraws, treeRows * SPLASH_TREE_CHILDREN, "draft tree draw");
+    requireBytes(buffers.treeNext, treeRows * SPLASH_DRAFT_CANDIDATES * sizeof(float), "draft tree next");
+  }
   return params;
 }
 
@@ -291,7 +306,8 @@ void Sampling::addSelection(metal::CommandGraph &graph, const TargetSamplingPara
     graph.add("decode_sample_vocabulary_draw",
               {buffers.logits, buffers.constraintMasks, buffers.vocabularyRows, buffers.uniforms,
                buffers.outputTokens, buffers.vocabularyRanges, buffers.vocabularyArrivals, buffers.laneRows,
-               buffers.verifyRows},
+               buffers.verifyRows, buffers.treeRows, buffers.verifySources, buffers.candidates, buffers.treeDraws,
+               buffers.treeNext},
               params, {most * kVocabularyGroups, lanes, 1}, {kVocabularyThreads, 1, 1});
   }
   // Only a selection that reaches a lane's thinking cutoff dispatches it.

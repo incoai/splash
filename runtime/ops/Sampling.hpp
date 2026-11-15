@@ -130,6 +130,15 @@ struct SamplingBuffers final {
   // a first token's.
   metal::MetalBuffer laneRows;
   metal::MetalBuffer verifyRows;
+  // What a decode step's sampled verify row tests (metal/abi/Sampling.h):
+  // each row's source, the row of its lane's tree it is, the lanes' draft
+  // candidates (uint32 [lanes][SPLASH_DRAFT_PROPOSAL_TOKENS]
+  // [SPLASH_DRAFT_CANDIDATES]), and each lane's tree's draws and next
+  // positions' probabilities (ops::DraftSelectorBuffers).
+  metal::MetalBuffer verifySources;
+  metal::MetalBuffer candidates;
+  metal::MetalBuffer treeDraws;
+  metal::MetalBuffer treeNext;
 };
 
 struct AcceptanceBuffers final {
@@ -184,7 +193,9 @@ public:
   // LM head's fresh output. Other lanes dispatch nothing new. A greedy lane
   // then takes each row's argmax and a sampled lane draws from each row's
   // distribution over the whole vocabulary, row i with the lane's uniform i,
-  // both among the tokens the lane admits: the first token after a prompt
+  // a decode step's verify row testing the children its draft drew with the
+  // uniforms after (metal/abi/Sampling.h), both among the tokens the lane
+  // admits: the first token after a prompt
   // from each lane's one row of the logits (`rows`), and the verify rows of
   // each lane of a decode step (`step`, as its proposer laid them out in the
   // buffers' lane rows and verify rows). Each selected row's token goes to the
@@ -210,11 +221,14 @@ public:
 private:
   // The rows a selection takes from each lane (metal/abi/Sampling.h
   // TargetSamplingParams): the logits rows its lanes' rows end before, the
-  // most rows of a lane, which its grids span, and the first's mask row.
+  // most rows of a lane, which its grids span, the first's mask row, and
+  // whether they are a decode step's verify rows, whose sampled rows test
+  // their draft's children.
   struct TargetRows final {
     uint64_t end = 0;
     uint32_t laneCap = 0;
     uint32_t maskRow = 0;
+    bool trees = false;
   };
 
   // The penalties of each penalized lane's selected rows, each also counting

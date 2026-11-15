@@ -11,12 +11,24 @@
 
 // The uniforms one lane draws a decode cycle with, in [0, 1): row r of a
 // lane's selection draws with its uniform r, the first token after a prompt
-// (a selection of one row) with uniform 0. A sampled verify row draws its
-// token from the target's whole distribution, and acceptance follows a row's
-// child only when the child's token is that draw, so every token a lane keeps
-// is a draw from the target and the rows of one path draw with uniforms of
-// their own. Lane l's uniforms start at l * SPLASH_SAMPLING_UNIFORMS.
-#define SPLASH_SAMPLING_UNIFORMS SPLASH_TARGET_VERIFY_ROWS
+// (a selection of one row) with uniform 0, and a sampled verify row tests the
+// children its draft drew (DraftTreeParams) with its uniforms
+// SPLASH_TARGET_VERIFY_ROWS + r * SPLASH_TREE_CHILDREN on. Such a row selects
+// by recursive rejection sampling without replacement: it tests its children
+// in the order drawn, selecting child i, of probability q_i under the draft
+// and p_i under the target, with probability min(1, p_i / q_i), where after
+// each rejection the target's distribution becomes its residual
+// max(p - q, 0), renormalized, and the draft's loses the rejected child,
+// renormalized; one that selects none draws from the last residual. Its
+// selection is so a draw from the target's distribution and a child it
+// rejected only at fp32 rounding, and acceptance follows a row's child only
+// when the child's token is that selection, so
+// every token a lane keeps is a draw from the target; the rows of one path
+// draw with uniforms of their own. A greedy row's argmax is the same rule at
+// temperature 0, where the draft's children are its most likely candidates
+// and every distribution falls on one token. Lane l's uniforms start at
+// l * SPLASH_SAMPLING_UNIFORMS.
+#define SPLASH_SAMPLING_UNIFORMS (SPLASH_TARGET_VERIFY_ROWS * (1u + SPLASH_TREE_CHILDREN))
 
 // The stop tokens a target's selections and acceptance compare
 // (ops::StopTokens): up to SPLASH_STOP_TOKENS ids, every place past them
@@ -49,10 +61,13 @@ struct TargetSamplingParams {
   // Lanes that ignore end-of-sequence: they never select a stop token.
   uint32_t exclude_stop_mask;
   uint32_t stop_tokens[SPLASH_STOP_TOKENS];
+  // Whether the rows are a decode step's verify rows, whose sampled rows test
+  // the children their draft drew (SPLASH_SAMPLING_UNIFORMS).
+  uint32_t trees;
 };
 
-static_assert(sizeof(TargetSamplingParams) == 104,
-              "Target sampling parameters are 104 bytes on both sides");
+static_assert(sizeof(TargetSamplingParams) == 108,
+              "Target sampling parameters are 108 bytes on both sides");
 
 // The selection of each lane's first token after its prompt from its one row
 // of the logits, row[l]: decode_sample_first_rows writes the lane rows and
@@ -178,7 +193,11 @@ static_assert(sizeof(SelectorBatchParams) == 24,
 // depth (model::LookupAgreement): the draft's most likely candidate there,
 // another of its candidates, none of them, or past the draft's positions.
 #define SPLASH_TREE_AGREEMENTS 4u
-// The most children a tree's draft row takes, its most likely candidates.
+// The most children a tree's draft row takes: a greedy lane's most likely
+// candidates, a sampled lane's draws (DraftTreeParams). On Qwen3.8-27B's
+// sampled cycles (temperature 1, top_k 20, top_p 0.95) a row kept 0.701 of
+// the proposals at each position with one child, 0.785 with two and 0.841
+// with four.
 #define SPLASH_TREE_CHILDREN 4u
 
 // The tree each lane grows (draft_select_tree), up to a verify block's rows
@@ -193,10 +212,16 @@ static_assert(sizeof(SelectorBatchParams) == 24,
 // (a greedy lane's or a sampled one's, model::VerifyBudget); a step to host
 // chain token d of the lane, chain[l] tokens from the anchor, at its rate for
 // its agreement with the draft at depth d. The tree grows best first by
-// estimate, a draft row taking its children[l] most likely candidates and a
-// chain token the next, one row for each token path (a step to a token its
-// parent already has a child of joins that child), until the lane's rows or
-// none past depth depth[l] are left.
+// estimate, a draft row taking children[l] candidates and a chain token the
+// next, one row for each token path (a step to a token its parent already has
+// a child of joins that child), until the lane's rows or none past depth
+// depth[l] are left. A greedy lane's row (temperature[l] 0) takes its most
+// likely candidates; a sampled lane's draws them without replacement from
+// q_T, the candidates' probabilities at the lane's temperature T, its
+// Gumbel-top-k: the largest log q_T + G, G a Gumbel of the row's key and the
+// candidate's token, a row's key a hash of its parent's and its token, the
+// anchor's the lane's noise[l] (a 64-bit seed, low word first), so that every
+// row draws with noise of its own. A sampled lane's q is q_T.
 struct DraftTreeParams {
   uint32_t anchor[SPLASH_MAXIMUM_BATCH_WIDTH];
   uint32_t depth[SPLASH_MAXIMUM_BATCH_WIDTH];
@@ -205,10 +230,12 @@ struct DraftTreeParams {
   uint32_t lanes;
   float slope[SPLASH_MAXIMUM_BATCH_WIDTH];
   float intercept[SPLASH_MAXIMUM_BATCH_WIDTH][SPLASH_DRAFT_PROPOSAL_TOKENS];
+  float temperature[SPLASH_MAXIMUM_BATCH_WIDTH];
+  uint32_t noise[SPLASH_MAXIMUM_BATCH_WIDTH][2];
 };
 
-static_assert(sizeof(DraftTreeParams) == 196,
-              "Draft tree parameters are 196 bytes on both sides");
+static_assert(sizeof(DraftTreeParams) == 244,
+              "Draft tree parameters are 244 bytes on both sides");
 
 // The rows of a decode cycle (draft_verify_rows): `rows` rows over its lanes,
 // 1 to lane_cap a lane, laid out from the lanes' trees (DraftTreeParams).
@@ -244,8 +271,9 @@ static_assert(sizeof(VerifyRowsParams) == 4 * (SPLASH_TARGET_VERIFY_ROWS * SPLAS
 // after a stop token; the mask of the rows it retains (bit j for row j of its
 // block); and the path's proposals among them, all of them where the cap or
 // a stop token cuts the path. A greedy row selects its argmax and a sampled
-// row draws from the target's whole distribution, so a lane retains the
-// target's own tokens under either policy.
+// row by rejection sampling over the children its draft drew there
+// (SPLASH_SAMPLING_UNIFORMS), a draw from the target's distribution, so a
+// lane retains the target's own tokens under either policy.
 struct AcceptBatchParams {
   uint32_t remaining[SPLASH_MAXIMUM_BATCH_WIDTH];
   uint32_t stop_tokens[SPLASH_STOP_TOKENS];

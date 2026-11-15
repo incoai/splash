@@ -7,7 +7,8 @@
 // intercepts[position] for its draft probability q at its proposal position,
 // and a row's chance its own times its parent's (DraftTreeParams): greedy
 // lanes fit theirs to the last kLabels labels of their trees' rows, sampled
-// lanes, whose acceptance follows the target's draws, apart. A cycle of R rows
+// lanes, whose drawn children their verify rows' rejection sampling accepts,
+// apart. A cycle of R rows
 // costs a + b * R ms, fit per lane count, constrained or not, to its latest
 // cycles.
 // A cycle counts at most twice the larger of its fitted price and the mean:

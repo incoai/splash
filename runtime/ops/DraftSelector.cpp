@@ -54,12 +54,17 @@ void DraftSelector::add(metal::CommandGraph &graph, const DraftSelectorBuffers &
     if (!std::isfinite(l.calibration.slope) ||
         !std::ranges::all_of(l.calibration.intercepts, [](float value) { return std::isfinite(value); }))
       throw std::invalid_argument("invalid draft tree calibration");
+    if (!(l.temperature >= 0.0F && std::isfinite(l.temperature)))
+      throw std::invalid_argument("invalid draft tree temperature");
     edges.anchor[lane] = tree.anchor[lane] = l.anchor;
     tree.depth[lane] = l.depth;
     tree.chain[lane] = l.chain;
     tree.children[lane] = l.children;
     tree.slope[lane] = l.calibration.slope;
     std::ranges::copy(l.calibration.intercepts, tree.intercept[lane]);
+    tree.temperature[lane] = l.temperature;
+    tree.noise[lane][0] = static_cast<uint32_t>(l.noise);
+    tree.noise[lane][1] = static_cast<uint32_t>(l.noise >> 32);
   }
   // A lane's proposal positions take rows 1-7 of its eight query rows of the
   // logits and the selector hidden rows; its tree takes a verify block's rows.
@@ -84,6 +89,8 @@ void DraftSelector::add(metal::CommandGraph &graph, const DraftSelectorBuffers &
   requireBytes(buffers.trees, treeRows * sizeof(TreeRow), "draft tree row");
   requireBytes(buffers.treeScores, treeRows * 2 * sizeof(float), "draft tree score");
   requireBytes(buffers.treeSizes, uint64_t{count} * sizeof(uint32_t), "draft tree size");
+  requireBytes(buffers.treeDraws, treeRows * SPLASH_TREE_CHILDREN, "draft tree draw");
+  requireBytes(buffers.treeNext, treeRows * SPLASH_DRAFT_CANDIDATES * sizeof(float), "draft tree next");
   graph.add("draft_select_top16_sharded",
             {buffers.logits, buffers.partialIds, buffers.partialValues},
             vocabulary_, {uint64_t{count} * kPositions * kShards, 1, 1});
@@ -97,7 +104,8 @@ void DraftSelector::add(metal::CommandGraph &graph, const DraftSelectorBuffers &
   // predecessor, before its first thread grows the tree.
   graph.add("draft_select_tree",
             {buffers.candidates, buffers.unary, buffers.partialValues, buffers.chainTokens, buffers.chainRates,
-             buffers.treeTokens, buffers.trees, buffers.treeScores, buffers.treeSizes},
+             buffers.treeTokens, buffers.trees, buffers.treeScores, buffers.treeSizes, buffers.treeDraws,
+             buffers.treeNext},
             tree, {count, 1, 1}, {kPositions * SPLASH_DRAFT_CANDIDATES, 1, 1});
 }
 
@@ -130,9 +138,10 @@ void DraftSelector::addVerifyRows(metal::CommandGraph &graph, const DraftSelecto
   requireBytes(buffers.treeRows, uint64_t{step.rows} * sizeof(TreeRow), "verify tree row");
   requireBytes(buffers.laneRows, uint64_t{step.lanes} * sizeof(LaneRows), "verify lane rows");
   requireBytes(buffers.verifyRows, uint64_t{step.lanes} * sizeof(uint32_t), "verify rows");
+  requireBytes(buffers.verifySources, uint64_t{step.rows} * sizeof(uint32_t), "verify source");
   graph.add("draft_verify_rows",
             {buffers.treeTokens, buffers.trees, buffers.treeScores, buffers.treeSizes, buffers.inputTokens,
-             buffers.treeRows, buffers.laneRows, buffers.verifyRows},
+             buffers.treeRows, buffers.laneRows, buffers.verifyRows, buffers.verifySources},
             params, {1, 1, 1}, {1, 1, 1});
 }
 

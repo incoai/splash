@@ -263,9 +263,14 @@ sum past it. All three apply to the whole vocabulary, exactly, for the first
 token and every verified draft position alike: the sampler sums each row's
 softmax denominator, finds where its distribution ends without sorting the
 vocabulary, and draws over every token the distribution keeps, each verify row
-with a uniform of its own; a decode cycle keeps a draft token only where the
-row before it drew that token, and then the draw of the last row it keeps, so
-every token it emits is a draw from the target. vLLM itself refuses a nonzero
+with uniforms of its own. A verify row tests the draft tokens its draft drew
+there, in the order drawn, keeping draft token i with probability
+min(1, p_i / q_i) of the target's and the draft's probabilities after the
+ones before it (the target's residual after each rejection), and draws from
+the last residual where it keeps none ([Drafts](models.md#drafts)); a decode
+cycle keeps a draft token only where the row before it selected that token,
+and then the selection of the last row it keeps, so every token it emits is a
+draw from the target. vLLM itself refuses a nonzero
 `min_p` with speculative decoding; here it is one more cut of the target
 distribution, which the draws read as they read the others, so sampling stays
 exact. A request

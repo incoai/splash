@@ -394,6 +394,9 @@ struct Runtime::Impl {
     // replays one input token and regenerates this value.
     std::vector<uint16_t> finalTargetHidden;
     std::array<float, kSamplingUniformCount> cycleUniforms{};
+    // A decode cycle's noise, with which a sampled lane's draft draws the
+    // children of its tree's rows (ops::DraftTreeLane).
+    uint64_t cycleNoise = 0;
     // Nonempty selects score-only mode: the final prefill chunk computes raw
     // logits at these token ids instead of selecting an anchor.
     std::vector<uint32_t> scoreTokens;
@@ -1081,20 +1084,23 @@ struct Runtime::Impl {
     }
   }
 
-  static float nextUniform(Request &entry) noexcept {
+  // The request's next 64 random bits: splitmix64 of its seed and counter.
+  static uint64_t nextBits(Request &entry) noexcept {
     uint64_t value =
         entry.sampling.seed + (++entry.rngCounter) * 0x9e3779b97f4a7c15ULL;
     value = (value ^ (value >> 30)) * 0xbf58476d1ce4e5b9ULL;
     value = (value ^ (value >> 27)) * 0x94d049bb133111ebULL;
-    value ^= value >> 31;
-    return float(value >> 40) * 0x1p-24F;
+    return value ^ (value >> 31);
   }
 
-  // A decode cycle's uniforms: one for each row of the lane's verify block
-  // (metal/abi/Sampling.h).
+  static float nextUniform(Request &entry) noexcept { return float(nextBits(entry) >> 40) * 0x1p-24F; }
+
+  // A decode cycle's uniforms, one for each row of the lane's verify block
+  // (metal/abi/Sampling.h), and its draft's noise.
   static void stageSamplingCycle(Request &entry) noexcept {
     for (float &uniform : entry.cycleUniforms)
       uniform = nextUniform(entry);
+    entry.cycleNoise = nextBits(entry);
   }
 
   [[nodiscard]] LaneTables laneTables(uint32_t stateLane) const {
@@ -1363,7 +1369,11 @@ struct Runtime::Impl {
             d(DecodeTensor::TargetVocabularyRanges),
             d(DecodeTensor::TargetVocabularyArrivals),
             d(DecodeTensor::LaneLayout),
-            d(DecodeTensor::VerifyRows)};
+            d(DecodeTensor::VerifyRows),
+            d(DecodeTensor::VerifySources),
+            d(DecodeTensor::Candidates),
+            d(DecodeTensor::DraftTreeDraws),
+            d(DecodeTensor::DraftTreeNext)};
   }
 
   // A completed cycle's lane's retained tokens, from its first row.
@@ -2307,11 +2317,17 @@ struct Runtime::Impl {
       const ops::SamplingPolicy policy = samplingPolicy(entry);
       const bool branches = targetModel->verifiesTrees() && !policy.constrained;
       tree.children = branches ? SPLASH_TREE_CHILDREN : 1;
-      // Its draft steps' estimates are its policy's acceptance model's: a
-      // sampled lane's follows the target's draws.
+      // Its draft steps' estimates are its policy's acceptance model's, a
+      // sampled lane's learned from its verify rows' rejection sampling. A
+      // sampled lane draws its rows' children from its draft at its
+      // temperature.
       const VerifyBudget::Acceptance &acceptance =
           verifyBudget ? verifyBudget->acceptance(policy.samples()) : VerifyBudget::kPrior;
       tree.calibration = {acceptance.slope, acceptance.intercepts};
+      if (policy.samples()) {
+        tree.temperature = policy.temperature;
+        tree.noise = entry.cycleNoise;
+      }
       entry.lookupChain = {};
       // A thinking end at the lane's first row is its proposals, a chain the
       // verify selects whatever its logits: no draft row beside it could be
@@ -2334,8 +2350,9 @@ struct Runtime::Impl {
         d(DecodeTensor::Candidates),      d(DecodeTensor::Unary),           d(DecodeTensor::SelectorHidden),
         d(DecodeTensor::ChainTokens),     d(DecodeTensor::ChainRates),      d(DecodeTensor::DraftTreeTokens),
         d(DecodeTensor::DraftTrees),      d(DecodeTensor::DraftTreeScores), d(DecodeTensor::DraftTreeSizes),
-        d(DecodeTensor::InputTokens),     d(DecodeTensor::TreeRows),        d(DecodeTensor::LaneLayout),
-        d(DecodeTensor::VerifyRows)};
+        d(DecodeTensor::DraftTreeDraws),  d(DecodeTensor::DraftTreeNext),   d(DecodeTensor::InputTokens),
+        d(DecodeTensor::TreeRows),        d(DecodeTensor::LaneLayout),      d(DecodeTensor::VerifyRows),
+        d(DecodeTensor::VerifySources)};
     draftModel.addSelection(graph, selection, std::span(trees).first(lanes));
     // Without the budget, or in a cycle that explores, the cycle verifies as
     // many of the trees' rows as it holds.

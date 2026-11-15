@@ -362,7 +362,7 @@ temperature 1 of its position's candidates' scores after its parent's) is
 estimated by an online model, logit(p) = slope * logit(q) +
 intercept[position], the probability that the target accepts it once it
 accepted its parent, one model for greedy lanes and one for sampled lanes,
-whose acceptance follows the target's draws. The engine refits each every 64
+whose drawn children their verify rows' rejection sampling accepts. The engine refits each every 64
 cycles on its last 4096 labels: each row of a lane's tree whose parent the
 cycle's walk accepted, labeled with whether the target selected the row's
 token there, a row past the lane's verify rows too (its parent's selection
@@ -386,10 +386,23 @@ tokens over the cycle's cost at that many rows in all. It numbers a lane's
 verify rows in preorder, its likeliest path on its first rows, packs the lanes'
 rows in lane order, the cycle's rows past the verify rows on the first lanes
 under the cap, and writes each lane's rows (`DecodeTensor::LaneLayout`), which
-the cycle's later kernels read on the GPU. Whatever its policy a lane proposes the same rows: a sampled lane's
-verify rows draw from the target, and its cycle keeps a proposal only where the
-row before it drew that token, so its acceptance stays exact, and its most
-likely proposals are those it keeps most often. The engine takes a cycle's cost at so many rows from the wall times of the
+the cycle's later kernels read on the GPU. A sampled lane's draft draws a
+row's children without replacement from its candidates at the lane's
+temperature (their Gumbel-top-k), which its tree takes in the order drawn, and
+each of its verify rows selects by recursive rejection sampling over them: it
+keeps child i, of probability p under the target and q under the draft after
+the children before it, with probability min(1, p / q), the target's
+distribution becoming its residual max(p - q, 0) and the draft's losing the
+child after each rejection, and draws from the last residual where it keeps
+none (`metal/abi/Sampling.h`). Its cycle keeps a proposal only where the row
+before it selected that token, so its acceptance stays exact; with one child
+a row this is the rejection sampling of a chain of draft draws, and every
+child more accepts more. A greedy lane's argmax is the same rule at
+temperature 0, its children its draft's most likely. On Qwen3.8-27B's own
+sampled cycles at temperature 1, top_k 20 and top_p 0.95, a row that selected
+by its draw alone, of its draft's most likely child, kept 0.671 of the
+proposals at each position, where this rule keeps 0.701, and 0.785 and 0.841
+of its proposals with two and four children. The engine takes a cycle's cost at so many rows from the wall times of the
 lane count's latest cycles, which for streamed experts include the store's reads
 of its misses: a least-squares line in the rows over about the last 30 cycles,
 its slope shrunk toward the shape the measured targets share, since what a row
