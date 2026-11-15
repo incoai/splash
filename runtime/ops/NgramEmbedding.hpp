@@ -48,14 +48,19 @@ struct NgramEmbedding final {
                       metal::MetalBuffer streams, const NormWeights &keyNorm, const NormWeights &queryNorm,
                       const NormWeights &convolutionNorm, metal::MetalBuffer gated,
                       metal::MetalBuffer convolutionInput, NgramShape shape, uint32_t rows);
-  // One sequence's rows; writes the history after them unless historyOut is
-  // empty. With `tree`, the rows' places (a SplashTreeRow a row) of a verify
-  // block of at most 32 rows, whose taps follow each row's path; the commit
-  // then writes its history (addCommit).
+  // The convolution of a command's sequences' rows (a prompt chunk's
+  // sequences, or a verify step's lanes) as its layout holds them (`layout`,
+  // a SplashLaneRows a sequence, of `rows`), in one dispatch whose grid spans
+  // the sequences' bound: sequence s's taps before its first row read
+  // historyIn[s], and with historyOut its history after its rows goes to
+  // historyOut[s]. With `tree`, the rows' places (a SplashTreeRow a row) of
+  // verify blocks of at most 32 rows, whose taps follow each row's path; the
+  // commit then writes their history (addCommit).
   static void addConvolution(metal::CommandGraph &graph, metal::MetalBuffer convolutionInput,
-                             metal::MetalBuffer historyIn, metal::MetalBuffer historyOut, metal::MetalBuffer taps,
-                             metal::MetalBuffer gated, metal::MetalBuffer streams, NgramShape shape, uint32_t rows,
-                             metal::MetalBuffer tree = {});
+                             std::span<const metal::MetalBuffer> historyIn,
+                             std::span<const metal::MetalBuffer> historyOut, metal::MetalBuffer taps,
+                             metal::MetalBuffer gated, metal::MetalBuffer streams, NgramShape shape,
+                             metal::MetalBuffer layout, const LayoutRows &rows, metal::MetalBuffer tree = {});
   // The history after the first `rows` rows of one sequence's prefill (a
   // state captured inside its command).
   static void addHistory(metal::CommandGraph &graph, metal::MetalBuffer convolutionInput,

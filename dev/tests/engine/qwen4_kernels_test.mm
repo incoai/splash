@@ -426,8 +426,10 @@ void pleTest(MetalBackend &backend) {
   check(okConvIn, "PLE gate: normalized convolution input");
 
   CommandGraph graph2;
-  ops::NgramEmbedding::addConvolution(graph2, conv, histIn, histOut, upload(backend, tapsW), gated, streamsBuffer,
-                                      shape, rows);
+  const std::array<ops::LaneRows, 1> sequence{{{0, rows}}};
+  ops::NgramEmbedding::addConvolution(graph2, conv, std::span(&histIn, 1), std::span(&histOut, 1),
+                                      upload(backend, tapsW), gated, streamsBuffer, shape,
+                                      laneRowsOf(backend, sequence), {1, rows, rows});
   run(backend, graph2);
   const auto gotX = download<float>(streamsBuffer, rows * width);
   const auto gotH = download<uint16_t>(histOut, history * width);
@@ -497,8 +499,10 @@ void pleTreeTest(MetalBackend &backend) {
                     tapsBuffer = upload(backend, tapsW), gatedBuffer = upload(backend, gated),
                     streamsBuffer = upload(backend, x);
   CommandGraph graph;
-  ops::NgramEmbedding::addConvolution(graph, convBuffer, histIn, {}, tapsBuffer, gatedBuffer, streamsBuffer, shape,
-                                      rows, upload(backend, tree));
+  const std::array<ops::LaneRows, 1> block{{{0, rows}}};
+  ops::NgramEmbedding::addConvolution(graph, convBuffer, std::span(&histIn, 1), {}, tapsBuffer, gatedBuffer,
+                                      streamsBuffer, shape, laneRowsOf(backend, block), {1, rows, rows},
+                                      upload(backend, tree));
   run(backend, graph);
   const auto gotX = download<float>(streamsBuffer, rows * width);
   // Input `depth` of row r's path, or before the anchor the history's.
@@ -1333,6 +1337,116 @@ void qsaProjectPackedLanes(MetalBackend &backend) {
   }
 }
 
+// The PLE convolution of a command's sequences in one dispatch, each
+// sequence's rows its entry of the layout on the device: a decode step's
+// lanes of 1 to 16 rows packed at a cycle's caps of 8 and 16, trees among
+// them whose rows' packed predecessors are not their parents, and a prompt
+// chunk's sequences, which write their histories after their rows. Each
+// sequence's streams and history are its own convolved alone from row 0 after
+// its own history, bit for bit, and the command's spare rows, past its rows
+// to its sequences' bound, keep their streams.
+void plePackedLanes(MetalBackend &backend) {
+  constexpr uint32_t hidden = 256, streams = 4, taps = 4, dilation = 3, width = hidden * streams;
+  constexpr uint16_t kFill = 0x7FC1;
+  const ops::NgramShape shape{hidden, streams, taps, dilation};
+  const uint32_t history = shape.history();
+  std::mt19937 rng(47);
+  const MetalBuffer tapsBuffer = upload(backend, randoms(rng, uint64_t{width} * taps, 0.4f));
+  struct Convolved final {
+    std::vector<uint32_t> streams;
+    std::vector<std::vector<uint16_t>> histories;
+  };
+  // The convolution of `lanes` at `bound` rows a sequence over `slots` rows
+  // of `conv`, `gated` and `x`, sequence s after histories[s]; with `tree` (a
+  // row a slot) along its rows' paths, else writing each sequence's history
+  // after its rows: the streams' bits and the histories written.
+  const auto convolve = [&](std::span<const ops::LaneRows> lanes, uint32_t bound, uint32_t slots,
+                            const std::vector<float> &conv, const std::vector<float> &gated,
+                            const std::vector<float> &x, std::span<const std::vector<float>> histories,
+                            std::span<const ops::TreeRow> tree) {
+    const bool inTree = !tree.empty();
+    const MetalBuffer streamsBuffer = upload(backend, x);
+    std::vector<MetalBuffer> in, out;
+    for (const std::vector<float> &values : histories) {
+      in.push_back(upload(backend, bf16s(values)));
+      if (!inTree) out.push_back(upload(backend, std::vector<uint16_t>(uint64_t{history} * width, kFill)));
+    }
+    CommandGraph graph;
+    ops::NgramEmbedding::addConvolution(
+        graph, upload(backend, bf16s(conv)), in, out, tapsBuffer, upload(backend, gated), streamsBuffer, shape,
+        laneRowsOf(backend, lanes),
+        {static_cast<uint32_t>(lanes.size()), static_cast<uint32_t>(ops::rowsEnd(lanes)), bound},
+        inTree ? upload(backend, std::vector<ops::TreeRow>(tree.begin(), tree.end())) : MetalBuffer{});
+    run(backend, graph);
+    Convolved result{download<uint32_t>(streamsBuffer, uint64_t{slots} * width), {}};
+    for (const MetalBuffer &buffer : out) result.histories.push_back(download<uint16_t>(buffer, uint64_t{history} * width));
+    return result;
+  };
+  // A verify step's lanes by their rows' parents (-1 the anchor's), or a
+  // prompt chunk's sequences, chains of their rows.
+  const auto chain = [](uint32_t rows) {
+    std::vector<int> parents(rows);
+    for (uint32_t row = 0; row < rows; ++row) parents[row] = int(row) - 1;
+    return parents;
+  };
+  struct Case final {
+    uint32_t bound;
+    bool tree;
+    std::vector<std::vector<int>> sequences;
+  };
+  const std::vector<Case> cases{
+      {8, true, {chain(3), {-1, 0, 1, 2, 3, 1, 5, 0}, chain(1), {-1, 0, 0, 1, 2, 3}}},
+      {16, true, {{-1, 0, 1, 2, 3, 4, 5, 6, 1, 8, 9, 0, 11, 12, 13, 14}, chain(1), {-1, 0, 1, 1, 3, 2, 5, 0, 7},
+                  chain(12)}},
+      {16, true, {{-1, 0, 0, 1, 2, 3, 4}, chain(16)}},
+      {40, false, {chain(5), chain(40), chain(1), chain(17)}}};
+  for (const Case &c : cases) {
+    std::vector<ops::LaneRows> lanes;
+    std::vector<ops::TreeRow> tree;
+    uint32_t rows = 0;
+    for (const std::vector<int> &parents : c.sequences) {
+      lanes.push_back({rows, static_cast<uint32_t>(parents.size())});
+      rows += static_cast<uint32_t>(parents.size());
+      if (!c.tree) continue;
+      const std::vector<ops::TreeRow> own = qsaTree(parents);
+      tree.insert(tree.end(), own.begin(), own.end());
+    }
+    const uint32_t slots = static_cast<uint32_t>(lanes.size()) * c.bound;
+    const auto conv = randoms(rng, uint64_t{slots} * width, 1.0f), gated = randoms(rng, uint64_t{slots} * width, 1.0f),
+               x = randoms(rng, uint64_t{slots} * width, 1.0f);
+    std::vector<std::vector<float>> histories;
+    for (size_t s = 0; s < lanes.size(); ++s) histories.push_back(randoms(rng, uint64_t{history} * width, 1.0f));
+    const Convolved packed = convolve(lanes, c.bound, slots, conv, gated, x, histories, tree);
+    bool same = true;
+    for (size_t s = 0; s < lanes.size(); ++s) {
+      const ops::LaneRows lane = lanes[s];
+      const auto rowsOfLane = [&](const std::vector<float> &values) {
+        return std::vector<float>(values.begin() + uint64_t{lane.first} * width,
+                                  values.begin() + (uint64_t{lane.first} + lane.rows) * width);
+      };
+      const std::array<ops::LaneRows, 1> own{{{0, lane.rows}}};
+      const Convolved alone =
+          convolve(own, c.bound, lane.rows, rowsOfLane(conv), rowsOfLane(gated), rowsOfLane(x),
+                   std::span(histories).subspan(s, 1),
+                   c.tree ? std::span<const ops::TreeRow>(tree).subspan(lane.first, lane.rows)
+                          : std::span<const ops::TreeRow>{});
+      same &= std::equal(alone.streams.begin(), alone.streams.end(),
+                         packed.streams.begin() + uint64_t{lane.first} * width);
+      if (!c.tree) same &= alone.histories[0] == packed.histories[s];
+    }
+    std::vector<uint32_t> xBits(x.size());
+    std::memcpy(xBits.data(), x.data(), x.size() * sizeof(float));
+    std::string sizes;
+    for (const ops::LaneRows &lane : lanes) sizes += (sizes.empty() ? "" : ", ") + std::to_string(lane.rows);
+    const std::string scope = std::string("PLE convolution of ") + (c.tree ? "tree lanes" : "prompt sequences") +
+                              " of " + sizes + " rows at a bound of " + std::to_string(c.bound);
+    check(same, scope + ": each one's streams" + (c.tree ? "" : " and history") + " as alone, bit for bit");
+    check(std::equal(packed.streams.begin() + uint64_t{rows} * width, packed.streams.end(),
+                     xBits.begin() + uint64_t{rows} * width),
+          scope + ": the spare rows keep their streams");
+  }
+}
+
 // Lanes of different row counts packed one after another (5, 8, 1 and 6
 // rows from rows 0, 5, 13 and 14) hash their rows as each lane does alone
 // from row 0, each from its own tokens before it, bit for bit.
@@ -1769,16 +1883,22 @@ void pleExtentsTest(MetalBackend &backend) {
                                  ops::NgramEmbedding::addGate(graph, b[0], b[1], b[2], {b[3], true}, {b[4], true},
                                                               {b[5], true}, b[6], b[7], shape, rows);
                                });
+  // A prompt chunk's two sequences, each its history before and after.
   splash::test::requireExtents(backend,
                                Extents{{0, inputBytes, 2, "n-gram embedding convolution input"},
                                        {1, history, 2, "n-gram embedding history"},
-                                       {2, history, 2, "n-gram embedding next history"},
-                                       {3, uint64_t{width} * taps * 4, 4, "n-gram embedding convolution taps"},
-                                       {4, floatBytes, 4, "n-gram embedding gated"},
-                                       {5, floatBytes, 4, "n-gram embedding streams"}},
+                                       {2, history, 2, "n-gram embedding history"},
+                                       {3, history, 2, "n-gram embedding next history"},
+                                       {4, history, 2, "n-gram embedding next history"},
+                                       {5, uint64_t{width} * taps * 4, 4, "n-gram embedding convolution taps"},
+                                       {6, floatBytes, 4, "n-gram embedding gated"},
+                                       {7, floatBytes, 4, "n-gram embedding streams"},
+                                       {8, 2 * sizeof(ops::LaneRows), sizeof(ops::LaneRows),
+                                        "n-gram embedding layout"}},
                                [&](CommandGraph &graph, const Buffers &b) {
-                                 ops::NgramEmbedding::addConvolution(graph, b[0], b[1], b[2], b[3], b[4], b[5], shape,
-                                                                     rows);
+                                 const std::array<MetalBuffer, 2> in{b[1], b[2]}, out{b[3], b[4]};
+                                 ops::NgramEmbedding::addConvolution(graph, b[0], in, out, b[5], b[6], b[7], shape,
+                                                                     b[8], {2, rows, rows});
                                });
   // A verify block's convolution, along its rows' paths.
   splash::test::requireExtents(backend,
@@ -1788,10 +1908,11 @@ void pleExtentsTest(MetalBackend &backend) {
                                        {3, floatBytes, 4, "n-gram embedding gated"},
                                        {4, floatBytes, 4, "n-gram embedding streams"},
                                        {5, uint64_t{rows} * sizeof(splash::ops::TreeRow), 8,
-                                        "n-gram embedding tree rows"}},
+                                        "n-gram embedding tree rows"},
+                                       {6, sizeof(ops::LaneRows), sizeof(ops::LaneRows), "n-gram embedding layout"}},
                                [&](CommandGraph &graph, const Buffers &b) {
-                                 ops::NgramEmbedding::addConvolution(graph, b[0], b[1], {}, b[2], b[3], b[4], shape,
-                                                                     rows, b[5]);
+                                 ops::NgramEmbedding::addConvolution(graph, b[0], std::span(&b[1], 1), {}, b[2], b[3],
+                                                                     b[4], shape, b[6], {1, rows, rows}, b[5]);
                                });
   splash::test::requireExtents(backend,
                                Extents{{0, inputBytes, 2, "n-gram embedding convolution input"},
@@ -1861,6 +1982,7 @@ int main(int argc, const char *argv[]) {
         hyperNormKernelsTest(backend, !std::getenv("MTL_SHADER_VALIDATION"));
         pleTest(backend);
         pleTreeTest(backend);
+        plePackedLanes(backend);
         qsaTest(backend, {150, 20, 16, 0, 1, 7});
         // A threshold inside a run of equal scores: fewer other blocks than
         // the budget.

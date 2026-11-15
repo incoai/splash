@@ -2,6 +2,7 @@
 #include "metal/abi/NgramEmbedding.h"
 #include "metal/kernels/common/activation.h"
 #include "metal/kernels/common/hyper_streams.h"
+#include "metal/kernels/common/lane_bindings.h"
 #include "metal/kernels/common/rms_inverse.h"
 #include "metal/kernels/common/verify_tree.h"
 
@@ -84,46 +85,63 @@ kernel void ngram_embedding_gate(device const bfloat *key [[buffer(0)]],
   }
 }
 
-// The depthwise convolution over one sequence's rows: tap k of channel
-// c (taps[c][k]) reads the input (taps - 1 - k) * dilation rows back, before
-// the first row from the history; silu of the sum and the gated values are
-// added to the streams. With write_history, the history after the rows. A
-// verify block's rows (p.tree, a row's place in `tree`) count back along
-// their paths; a prompt's bind another buffer for the tree, which they do
-// not read.
+// The depthwise convolution over each of a command's sequences' rows (a
+// prompt chunk's sequences, or a verify step's lanes), threadgroup (row,
+// channel group, sequence) of sequence s's rows its entry of the command's
+// layout: tap k of channel c (taps[c][k]) reads the input (taps - 1 - k) *
+// dilation rows back, before the sequence's first row from its history
+// (history_in s); silu of the sum and the gated values are added to the
+// streams. With write_history, the sequence's history after its rows
+// (history_out s). A verify block's rows (p.tree, a row's place in `tree`)
+// count back along their paths; a prompt's bind another buffer for the
+// tree, which they do not read. A row past its sequence's rows and history,
+// or a sequence whose rows run past the command's, writes nothing.
 kernel void ngram_embedding_conv(device const bfloat *input [[buffer(0)]],
-                                 device const bfloat *history_in [[buffer(1)]],
-                                 device bfloat *history_out [[buffer(2)]],
-                                 device const float *taps [[buffer(3)]],
-                                 device const float *gated [[buffer(4)]],
-                                 device float *streams [[buffer(5)]],
-                                 device const SplashTreeRow *tree [[buffer(6)]],
-                                 constant NgramEmbeddingParams &p [[buffer(7)]],
-                                 uint2 group [[threadgroup_position_in_grid]],
+                                 device const bfloat *history_in0 [[buffer(1)]],
+                                 device const bfloat *history_in1 [[buffer(2)]],
+                                 device const bfloat *history_in2 [[buffer(3)]],
+                                 device const bfloat *history_in3 [[buffer(4)]],
+                                 device bfloat *history_out0 [[buffer(5)]],
+                                 device bfloat *history_out1 [[buffer(6)]],
+                                 device bfloat *history_out2 [[buffer(7)]],
+                                 device bfloat *history_out3 [[buffer(8)]],
+                                 device const float *taps [[buffer(9)]],
+                                 device const float *gated [[buffer(10)]],
+                                 device float *streams [[buffer(11)]],
+                                 device const SplashLaneRows *layout [[buffer(12)]],
+                                 device const SplashTreeRow *tree [[buffer(13)]],
+                                 constant NgramEmbeddingParams &p [[buffer(14)]],
+                                 uint3 group [[threadgroup_position_in_grid]],
                                  uint tid [[thread_index_in_threadgroup]]) {
   const uint width = p.streams * p.hidden;
-  const uint c = group.y * kRowThreads + tid, row = group.x;
-  if (c >= width) return;
+  const uint c = group.y * kRowThreads + tid, row = group.x, s = group.z;
+  if (c >= width || s >= min(p.sequences, SPLASH_MAXIMUM_BATCH_WIDTH)) return;
+  const SplashLaneRows rows = layout[s];
+  if (ulong(rows.first) + rows.rows > p.rows) return;
+  device const bfloat *sequence = input + ulong(rows.first) * width;
+  device const bfloat *history_in = SPLASH_LANE_BINDING(s, history_in0, history_in1, history_in2, history_in3);
   const int history = int((p.taps - 1) * p.dilation);
   const auto at = [&](int t) -> float {
-    return t >= 0 ? float(input[ulong(t) * width + c]) : float(history_in[ulong(history + t) * width + c]);
+    return t >= 0 ? float(sequence[ulong(t) * width + c]) : float(history_in[ulong(history + t) * width + c]);
   };
-  if (row < p.rows) {
+  if (row < rows.rows) {
     // The row's path and depth: a prompt's rows are a chain.
-    const uint path = p.tree ? tree[row].ancestors : 0u;
-    const int depth = p.tree ? int(tree[row].depth) : int(row);
+    const uint packed = rows.first + row;
+    const uint path = p.tree ? tree[packed].ancestors : 0u;
+    const int depth = p.tree ? int(tree[packed].depth) : int(row);
     float sum = 0.0f;
     for (uint k = 0; k < p.taps; ++k) {
       const int back = depth - int((p.taps - 1 - k) * p.dilation);
       sum += taps[ulong(c) * p.taps + k] * at(back >= 0 && p.tree ? int(splash_path_row(path, uint(back))) : back);
     }
-    const ulong i = ulong(row) * width + c;
+    const ulong i = ulong(packed) * width + c;
     streams[i] += gated[i] + splash_silu(sum);
-  } else if (p.write_history && row - p.rows < uint(history)) {
-    // Rows past the sequence write the history: row p.rows + j holds row
+  } else if (p.write_history && row - rows.rows < uint(history)) {
+    // Rows past the sequence's write its history: row rows + j holds row
     // rows - history + j.
-    const int j = int(row - p.rows);
-    history_out[ulong(j) * width + c] = bfloat(at(int(p.rows) - history + j));
+    const int j = int(row - rows.rows);
+    device bfloat *history_out = SPLASH_LANE_BINDING(s, history_out0, history_out1, history_out2, history_out3);
+    history_out[ulong(j) * width + c] = bfloat(at(int(rows.rows) - history + j));
   }
 }
 

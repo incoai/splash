@@ -15,18 +15,21 @@
 #include "metal/abi/ExecutionGeometry.h"
 #include "metal/abi/HyperConnection.h"
 
-// The gate (ngram_embedding_gate) and dilated convolution
-// (ngram_embedding_conv) of `rows` rows of one sequence over `streams`
-// streams of `hidden` values: `taps` taps `dilation` rows apart, whose
-// history is the (taps - 1) * dilation rows before the first.
-// ngram_embedding_conv writes the history after its rows when write_history
-// is set; ngram_embedding_history writes the history after a sequence's first
-// `rows` rows, and ngram_embedding_commit the history after a lane's accepted
-// path of its verify block, a row mask the GPU wrote. With `tree` set the
-// convolution's rows are a verify block of at most 32 rows, a tree
-// (metal/abi/VerifyTree.h) whose row's taps follow its path: the input `back`
-// rows before a row is its path's row at its depth less back, or before the
-// block's anchor the history's.
+// The gate (ngram_embedding_gate) of `rows` rows over `streams` streams of
+// `hidden` values, and the dilated convolution (ngram_embedding_conv) of a
+// command's `sequences` sequences of its `rows` rows: `taps` taps `dilation`
+// rows apart, whose history is the (taps - 1) * dilation rows before a
+// sequence's first. Sequence s's rows are entry s of the command's layout
+// (SplashLaneRows, metal/abi/VerifyTree.h): a prompt chunk's sequences' as its
+// host writes them, a verify step's lanes' as its proposer does.
+// ngram_embedding_conv writes each sequence's history after its rows when
+// write_history is set; ngram_embedding_history writes the history after a
+// sequence's first `rows` rows, and ngram_embedding_commit the history after
+// a lane's accepted path of its verify block, a row mask the GPU wrote. With
+// `tree` set the convolution's sequences are verify blocks of at most 32
+// rows, trees (metal/abi/VerifyTree.h) whose row's taps follow its path: the
+// input `back` rows before a row is its path's row at its depth less back,
+// or before the block's anchor the history's.
 struct NgramEmbeddingParams {
   uint32_t rows;
   uint32_t hidden;
@@ -35,10 +38,11 @@ struct NgramEmbeddingParams {
   uint32_t dilation;
   uint32_t write_history;
   uint32_t tree;
+  uint32_t sequences;
 };
 
-static_assert(sizeof(NgramEmbeddingParams) == 28,
-              "n-gram embedding parameters are 28 bytes on both sides");
+static_assert(sizeof(NgramEmbeddingParams) == 32,
+              "n-gram embedding parameters are 32 bytes on both sides");
 
 // The table rows (the n-gram hash, model/Qwen4Steps.hpp qwen4PleRows) of each
 // of `lanes` lanes' rows of a verify step on the GPU (ngram_embedding_hash):

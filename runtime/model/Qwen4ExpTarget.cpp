@@ -152,16 +152,21 @@ void Qwen4ExpTarget::addPrefillLayer(PrefillStep &step, uint32_t index) const {
     linear.addProjection(step.graph, h.pleRows, ple.value, h.pleValue, rows, b.linearScratch);
     ops::NgramEmbedding::addGate(step.graph, h.gate, h.pleValue, h.streams, ple.keyNorm, ple.queryNorm,
                                  ple.convolutionNorm, h.pleGated, h.pleConvolution, ps, rows);
+    // Every sequence's rows after its history in one dispatch, by the
+    // chunk's layout, and its history after them; a state captured inside
+    // the command holds the history after its row.
+    std::vector<metal::MetalBuffer> historyIn, historyOut;
     for (const QwenTargetPrefillSequence &sequence : step.sequences) {
-      ops::NgramEmbedding::addConvolution(
-          step.graph, u16Rows(h.pleConvolution, sequence.rowBegin, sequence.rows, ps.width()),
-          sequence.auxiliaryIn, sequence.auxiliaryOut, ple.convolution,
-          f32Rows(h.pleGated, sequence.rowBegin, sequence.rows, ps.width()),
-          f32Rows(h.streams, sequence.rowBegin, sequence.rows, ps.width()), ps, sequence.rows);
-      // A state captured inside the command holds the history after its row.
+      historyIn.push_back(sequence.auxiliaryIn);
+      historyOut.push_back(sequence.auxiliaryOut);
+    }
+    ops::NgramEmbedding::addConvolution(step.graph, u16Rows(h.pleConvolution, 0, rows, ps.width()), historyIn,
+                                        historyOut, ple.convolution, f32Rows(h.pleGated, 0, rows, ps.width()),
+                                        f32Rows(h.streams, 0, rows, ps.width()), ps, b.laneRows,
+                                        promptRows(step.sequences, rows));
+    for (const QwenTargetPrefillSequence &sequence : step.sequences)
       for (const QwenTargetStateCapture &capture : sequence.stateCaptures)
         addCaptureHistory(step.graph, h, sequence.rowBegin, sequence.auxiliaryIn, capture);
-    }
   }
   addPrefillMix(step, layer.mixerHyper, b.normalized);
   std::visit(
@@ -380,16 +385,14 @@ void Qwen4ExpTarget::addVerify(metal::CommandGraph &graph, QwenTargetVerifyBuffe
       addDecodeProjection(step.graph, h.pleRows, ple.value, h.pleValue, lanes, b.linearScratch);
       ops::NgramEmbedding::addGate(step.graph, h.gate, h.pleValue, h.streams, ple.keyNorm, ple.queryNorm,
                                    ple.convolutionNorm, h.pleGated, h.pleConvolution, ps, rows);
-      // Each lane's rows after its history, each along its path of the
-      // lane's tree; the commit writes the history after the path it
-      // accepts.
-      for (uint32_t lane = 0; lane < lanes; ++lane)
-        ops::NgramEmbedding::addConvolution(
-            step.graph, rowsOf<uint16_t>(h.pleConvolution, lane * kVerifyRows, kVerifyRows, ps.width()),
-            b.auxiliary[lane], {}, ple.convolution,
-            rowsOf<float>(h.pleGated, lane * kVerifyRows, kVerifyRows, ps.width()),
-            rowsOf<float>(h.streams, lane * kVerifyRows, kVerifyRows, ps.width()), ps, kVerifyRows,
-            rowsOf<ops::TreeRow>(b.tree, lane * kVerifyRows, kVerifyRows, 1));
+      // Every lane's rows after its history in one dispatch, by the step's
+      // layout, each along its path of the lane's tree; the commit writes
+      // the history after the path it accepts.
+      ops::NgramEmbedding::addConvolution(step.graph, rowsOf<uint16_t>(h.pleConvolution, 0, rows, ps.width()),
+                                          std::span(b.auxiliary).first(lanes), {}, ple.convolution,
+                                          rowsOf<float>(h.pleGated, 0, rows, ps.width()),
+                                          rowsOf<float>(h.streams, 0, rows, ps.width()), ps, b.laneRows,
+                                          {lanes, rows, ops::verifyLaneCap(rows, lanes)}, b.tree);
     }
     std::visit(
         [&](const auto &mixer) {
