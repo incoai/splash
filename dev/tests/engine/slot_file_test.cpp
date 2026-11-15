@@ -1207,6 +1207,38 @@ static void testMetadataWriteAccounting() {
   next.seal();
 }
 
+static void testPayloadOriginEdges() {
+  using Kind = splash::model::PayloadWriteKind;
+  constexpr size_t size = kHostPageBytes;
+  double now = 0;
+  auto budget = std::make_shared<DiskBudget>(2 * size, [&] { return now; });
+  budget->setWriteBudget(16 * size);
+  SlotFile first(size, budget), second(size, budget);
+  auto a = first.acquire(), b = second.acquire();
+  const auto credit = budget->writeBudgetBytes();
+  require(first.write(a, {}, {}, Kind::Persist)->wait(), "empty payload failed");
+  require(budget->writtenBytes() == 0 && budget->writeBudgetBytes() == credit,
+          "empty payload changed counters or credit");
+  const std::vector<std::byte> bytes(size, std::byte{8});
+  auto one = first.write(a, {bytes}, {}, Kind::Persist);
+  auto two = second.write(b, {bytes}, {}, Kind::Reclaim);
+  require(one->wait() && two->wait(), "parallel slot files failed");
+  const auto counts = budget->ioSnapshot();
+  require(counts.payloadWrites[1] == size && counts.payloadWrites[2] == size &&
+              counts.writtenBytes == 2 * size && budget->writeBudgetBytes() == credit - static_cast<int64_t>(2 * size),
+          "parallel origins changed byte accounting or submission credit");
+  auto fresh = std::make_shared<DiskBudget>(size);
+  require(fresh->writtenBytes() == 0 && fresh->ioSnapshot().payloadWrites == splash::model::PayloadWrites{},
+          "new native resource retained old origin counters");
+  SlotFile closed(size, fresh);
+  auto slot = closed.acquire();
+  payloadFault.store(4);
+  require(!closed.write(slot, {bytes}, {}, Kind::Spill)->wait(), "zero write succeeded");
+  const auto before = fresh->ioSnapshot().payloadWrites;
+  require(!closed.write(slot, {bytes}, {}, Kind::Persist) && fresh->ioSnapshot().payloadWrites == before,
+          "refused write changed accepted-byte counters");
+}
+
 static void testPayloadWriteOrigins() {
   using Kind = splash::model::PayloadWriteKind;
   constexpr size_t page = kHostPageBytes;
@@ -1249,6 +1281,7 @@ static void testPayloadWriteOrigins() {
 
 int main() {
   try {
+    testPayloadOriginEdges();
     testPayloadWriteOrigins();
     testFailedMetadataHeaderAccounting();
     testAdoptionMetadataClearing();
