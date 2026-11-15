@@ -33,7 +33,7 @@ using splash::ops::RowCopy;
 using splash::ops::RowRegion;
 using splash::ops::StopTokens;
 
-constexpr uint32_t kRows = splash::model::ExecutionLimits::targetVerifyRows;
+constexpr uint32_t kRows = splash::model::ExecutionLimits::decodeLaneRows;
 constexpr uint32_t kProposals =
     splash::model::ExecutionLimits::draftProposalTokens;
 constexpr uint32_t kLanes =

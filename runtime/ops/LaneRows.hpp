@@ -75,6 +75,10 @@ inline void copyLaneRows(std::span<const LaneRows> lanes, uint32_t (&first)[SPLA
   }
 }
 
+// The rows a decode cycle verifies of each lane (SPLASH_DECODE_LANE_ROWS).
+inline constexpr uint32_t kDecodeLaneRows = SPLASH_DECODE_LANE_ROWS;
+static_assert(kDecodeLaneRows <= SPLASH_TARGET_VERIFY_ROWS);
+
 // The most rows of a lane's verify block in a decode step of `rows` rows over
 // `lanes` lanes, which the step's proposer chooses on the device within it:
 // eight while the step's rows give each lane no more, the rows the GDN
@@ -83,6 +87,12 @@ inline void copyLaneRows(std::span<const LaneRows> lanes, uint32_t (&first)[SPLA
 // block's most.
 [[nodiscard]] constexpr uint32_t verifyLaneCap(uint32_t rows, uint32_t lanes) noexcept {
   return rows <= uint64_t{8} * lanes ? 8 : SPLASH_TARGET_VERIFY_ROWS;
+}
+
+// The path of the first `rows` rows of a chain, a block's rows a row mask
+// names as a tree's accepted path does (metal/abi/VerifyTree.h).
+[[nodiscard]] constexpr uint32_t chainPath(uint32_t rows) noexcept {
+  return rows >= 32 ? ~uint32_t{0} : (uint32_t{1} << rows) - 1;
 }
 
 // Lane rows as a proposer writes them on the device for the kernels after it

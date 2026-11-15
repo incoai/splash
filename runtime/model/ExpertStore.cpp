@@ -39,10 +39,14 @@ constexpr uint32_t kNoSlot = UINT32_MAX;
 // what it takes on eighteen.
 constexpr uint64_t kAheadPieceBytes = 512 << 10;
 constexpr unsigned kAheadReaders = 4;
-// A decode cycle's most rows: every lane's verify rows. A load of at most
-// these rows (Impl::cycleLoad) stages its experts in one round, predicts the
-// next block's and keeps the GPU awake, as a decode step's load does.
-constexpr uint32_t kCycleRows = ExecutionLimits::maximumBatchWidth * ExecutionLimits::targetVerifyRows;
+// The rows a load stages its experts for in one round (Impl::cycleLoad),
+// predicting the next block's and keeping the GPU awake as a decode step's
+// load does: four lanes of a draft's block. On a 48 GB M5 Pro, staging for
+// 64 rows took 192 places of an expert from Qwen3.8-Flash-Next's expert
+// cache, and 2.4-3.8% more time a token at one and two lanes and 5-6% more
+// at three and four lanes' steps of 32 rows; a step of more rows loads in
+// two rounds, 29% more GPU a step at 48 rows and 19% more at 64.
+constexpr uint32_t kCycleRows = 32;
 // A load's rows are a long chunk when they route at least this many times as
 // many experts as a block has: routed evenly, that many routes leave about
 // e^-3, 5%, of the experts unrouted, so it routes nearly every expert.
@@ -152,8 +156,8 @@ Geometry geometryOf(const StreamedBlocks &streamed, ops::MoeShape shape) {
   return g;
 }
 
-// The staging: the experts of a block a decode cycle's rows may route, and
-// at least two places, of which a round of a load of more rows than a cycle's
+// The staging: the experts of a block kCycleRows rows may route, and at
+// least two places, of which a round of a load of more rows than those
 // stages one half.
 Places stagingOf(const Geometry &g, ops::MoeShape shape) {
   return {g.nativeBytes,
@@ -283,7 +287,7 @@ struct ExpertStore::Impl {
             uint32_t round, uint32_t rounds, const RoutedRows &routed);
   void route(uint32_t block, std::span<const std::span<const MoeTileDescriptor>> parts, uint32_t rows,
              ExpertStoreStats::Use &use);
-  // Whether a load of `rows` rows is at most a decode cycle's: the staging
+  // Whether a load of `rows` rows is at most kCycleRows: the staging
   // holds the experts they may route (stagingOf), the prediction's buffers
   // their rows, and the reads of so few experts end within about a
   // millisecond.

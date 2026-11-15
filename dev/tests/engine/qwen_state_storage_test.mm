@@ -1035,12 +1035,13 @@ void run(const std::string &metallib) {
     // its state, which neither a snapshot, a restore nor a prefill step reads.
     storage.updateLengths(0, {2'048, 0, 2'048, 2'048});
     const uint32_t parity = storage.metadata(0).activeParity;
-    for (const uint32_t retained : {0U, model::ExecutionLimits::targetVerifyRows + 1})
-      rejects([&] { storage.swapDecodeParity(0, retained); }, "a decode step retains one to all of its rows",
-              "a decode step retained no rows or more than its rows");
-    storage.swapDecodeParity(0, 3);
-    require(storage.metadata(0).pendingRows == 3 && storage.metadata(0).activeParity != parity,
-            "a decode step's swap lost its retained rows");
+    // A path holds its anchor's row and rows of a block.
+    for (const uint32_t path : {0U, 0b110U, ops::chainPath(model::ExecutionLimits::targetVerifyRows + 1)})
+      rejects([&] { storage.swapDecodeParity(0, path); }, "a decode step accepts a path of its rows from its anchor's",
+              "a decode step accepted no rows, a path without its anchor or rows past a block's");
+    storage.swapDecodeParity(0, 0b1011);
+    require(storage.metadata(0).pendingPath == 0b1011 && storage.metadata(0).activeParity != parity,
+            "a decode step's swap lost its accepted path");
     rejects([&] { static_cast<void>(storage.snapshot(0)); }, "Qwen lane state has decoded rows pending",
             "a snapshot read a cell without its retained rows");
     rejects([&] { static_cast<void>(storage.snapshotToDisk(0, {})); }, "Qwen lane state has decoded rows pending",
@@ -1049,10 +1050,10 @@ void run(const std::string &metallib) {
             "Qwen lane state has decoded rows pending", "a restore overwrote a cell with pending rows");
     rejects([&] { storage.swapParity(0); }, "Qwen lane state has decoded rows pending",
             "a prefill step followed a decode step's pending rows");
-    storage.swapDecodeParity(0, model::ExecutionLimits::targetVerifyRows);
-    require(storage.metadata(0).pendingRows == model::ExecutionLimits::targetVerifyRows &&
+    storage.swapDecodeParity(0, ops::chainPath(model::ExecutionLimits::targetVerifyRows));
+    require(storage.metadata(0).pendingPath == ops::chainPath(model::ExecutionLimits::targetVerifyRows) &&
                 storage.metadata(0).activeParity == parity,
-            "the next decode step's swap did not take its own retained rows");
+            "the next decode step's swap did not take its own accepted path");
     rejects([&] { storage.releaseLane(0, 404); }, "Qwen lane owner mismatch",
             "lane release accepted the wrong owner");
 
@@ -1066,7 +1067,7 @@ void run(const std::string &metallib) {
     require(storage.tryActivateLane(0, 303) &&
                 storage.metadata(0).assigned() &&
                 storage.metadata(0).lengths == QwenLogicalLengths{} &&
-                !storage.metadata(0).pendingRows,
+                !storage.metadata(0).pendingPath,
             "recomputation did not start from a fresh empty state");
 
     // Dropping a cached state returns its buffers to the storage's pool rather

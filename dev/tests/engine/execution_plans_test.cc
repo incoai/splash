@@ -1,5 +1,6 @@
 #include "TestChecks.hpp"
 #include "ops/ExecutionPlans.hpp"
+#include "ops/LaneRows.hpp"
 
 #include <algorithm>
 #include <array>
@@ -213,7 +214,7 @@ void draftPlans() {
                 "a draft's prefill chunk took the int8 prefill tile or left the target's bf16 plan");
       }
       for (uint32_t lanes = 1; lanes <= 4; ++lanes)
-        require(draft.plan(context, lanes * SPLASH_TARGET_VERIFY_ROWS).configuration() == target.plan(context, lanes * SPLASH_TARGET_VERIFY_ROWS).configuration(),
+        require(draft.plan(context, lanes * splash::ops::kDecodeLaneRows).configuration() == target.plan(context, lanes * splash::ops::kDecodeLaneRows).configuration(),
                 "a draft's decode plan departed from the target's");
     }
 }

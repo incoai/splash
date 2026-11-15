@@ -1580,7 +1580,7 @@ int main(int argc, char **argv) {
               << ",\"ane_ffn_minimum_rows\":" << ranAneFfnMinimumRows
               << ",\"geometry\":{\"prefill_rows\":"
               << model::ExecutionLimits::prefillTokenBudget
-              << ",\"verify_rows\":" << model::ExecutionLimits::targetVerifyRows
+              << ",\"verify_rows\":" << model::ExecutionLimits::decodeLaneRows
               << ",\"batch_width\":" << model::ExecutionLimits::maximumBatchWidth
               << ",\"kv_block_tokens\":"
               << kv::kPageTokens

@@ -51,7 +51,7 @@ model::RuntimeGeometry geometryOf(const model::QwenTargetDimensions &layout, kv:
   if (spills)
     geometry.spilledKv = model::SparseKvShape{.blockTokens = layout.indexerBlockTokens,
                                               .selectedBlocks = layout.indexerTopBlocks,
-                                              .verifyRows = model::ExecutionLimits::targetVerifyRows,
+                                              .verifyRows = model::ExecutionLimits::decodeLaneRows,
                                               .denseHistoryTokens = layout.indexerTokens()};
   geometry.prefillChunks = groups ? model::kPrefillGroupChunks : 1;
   return geometry;

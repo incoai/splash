@@ -45,8 +45,8 @@ static_assert(sizeof(GDNGatePrefillParams) == 4,
 // for SPLASH_TARGET_VERIFY_ROWS rows and, each field for every row of the
 // lane's block in turn, the rows' convolution inputs ([conv_dim] bf16), their
 // k then v rows ([key_width + value_width] bf16), decay ([value_heads] fp32)
-// and beta ([value_heads] bf16). The lane's next step folds the rows it
-// retained into the state before its own (GDN::addDecode).
+// and beta ([value_heads] bf16). The lane's next step folds the path of rows
+// it accepted into the state before its own (GDN::addDecode).
 inline constexpr uint64_t gdn_tape_kv_offset(uint32_t conv_dim) {
   return uint64_t(SPLASH_TARGET_VERIFY_ROWS) * conv_dim * 2;
 }
@@ -77,21 +77,16 @@ struct GDNDecodeBatchParams {
   uint64_t recurrent_layer_bytes;
   uint64_t convolution_state_bytes;
   // Per lane, byte offsets in the tape buffer of this layer's tape of the
-  // lane's previous step (the pending rows) and of this step, and how many
-  // rows of the previous step the lane retained and its state does not hold
-  // yet.
+  // lane's previous step (the pending rows) and of this step, and the path
+  // of rows of the previous step the lane accepted and its state does not
+  // hold yet: a row mask (metal/abi/VerifyTree.h), none after a prefill.
   uint64_t pending_tape[SPLASH_MAXIMUM_BATCH_WIDTH];
   uint64_t step_tape[SPLASH_MAXIMUM_BATCH_WIDTH];
-  uint32_t pending_rows[SPLASH_MAXIMUM_BATCH_WIDTH];
-  // Per lane, its block of the step's rows: its first row and its rows, 1 to
-  // SPLASH_TARGET_VERIFY_ROWS. They are its rows of the packed, hidden and
-  // table rows, and its tape's first rows.
-  uint32_t first_row[SPLASH_MAXIMUM_BATCH_WIDTH];
-  uint32_t rows[SPLASH_MAXIMUM_BATCH_WIDTH];
+  uint32_t pending_path[SPLASH_MAXIMUM_BATCH_WIDTH];
 };
 
-static_assert(sizeof(GDNDecodeBatchParams) == 144,
-              "GDN decode parameters are 144 bytes on both sides");
+static_assert(sizeof(GDNDecodeBatchParams) == 112,
+              "GDN decode parameters are 112 bytes on both sides");
 
 // A fold of the first `rows` rows of a lane's step alone (GDN::addFold): the
 // state cells' strides, as in GDNDecodeBatchParams, and the byte offset in

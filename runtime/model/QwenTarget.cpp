@@ -20,7 +20,7 @@ namespace splash::model {
 namespace {
 
 // The rows a decode step verifies of each of its lanes.
-constexpr uint32_t kVerifyRows = ExecutionLimits::targetVerifyRows;
+constexpr uint32_t kVerifyRows = ExecutionLimits::decodeLaneRows;
 
 // A prefill sequence binds every GDN layer's state cells, in and out, and so
 // does each state it captures; with auxiliary state, its cells too.
@@ -342,15 +342,11 @@ void QwenTarget::addVerifyMixer(VerifyStep &step, const QwenGdnWeights &mixer, o
                       std::move(normalized));
   const ops::LinearPlan outputPlan = linear.plan(
       mixer.outputProjection, step.rows, output.residual ? ops::LinearEpilogue::Residual : ops::LinearEpilogue::None);
-  // Lane l's block is its verify rows, rows [8 l, 8 l + 8) of the step.
-  std::array<ops::GdnDecodeBlock, ExecutionLimits::maximumBatchWidth> blocks{};
-  for (uint32_t lane = 0; lane < step.lanes; ++lane)
-    blocks[lane] = {{lane * kVerifyRows, kVerifyRows}, b.gdnTapeLanes[lane]};
   const ops::PreparedInput hidden = ops::GDN::addDecode(
       step.graph,
       {b.gdnPacked, mixer.convolutionWeights, b.currentGdnStates, b.nextGdnStates, b.gdnTape,
-       std::span(blocks).first(step.lanes), mixer.decay, mixer.timeBias, mixer.mixerNorm, b.gdnHidden,
-       b.verifyRows, b.linearScratch},
+       std::span(b.gdnTapeLanes).first(step.lanes), b.laneRows, step.rows, ops::verifyLaneCap(step.rows, step.lanes),
+       mixer.decay, mixer.timeBias, mixer.mixerNorm, b.gdnHidden, b.verifyRows, b.tree, b.linearScratch},
       geometry_.gdnShape(), layer, geometry_.stateLayout.strides(), mixer.outputHeadOrder, outputPlan.input());
   linear.add(step.graph,
              {.input = b.gdnHidden, .output = std::move(output.rows), .residual = std::move(output.residual),

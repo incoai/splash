@@ -27,6 +27,7 @@
 #include "TestChecks.hpp"
 #include "metal/MetalBackend.hpp"
 #include "ops/Embedding.hpp"
+#include "ops/LaneRows.hpp"
 #include "ops/Sampling.hpp"
 
 #import <Foundation/Foundation.h>
@@ -57,7 +58,10 @@ using splash::metal::MetalBackend;
 using splash::metal::MetalBuffer;
 using namespace splash::ops;
 
-constexpr uint32_t kRows = SPLASH_TARGET_VERIFY_ROWS;
+// A decode lane's rows, and its constraint-mask rows (metal/abi/Sampling.h),
+// one more than a verify block's most rows.
+constexpr uint32_t kRows = splash::ops::kDecodeLaneRows;
+constexpr uint32_t kMaskRows = SPLASH_TARGET_VERIFY_ROWS + 1;
 constexpr uint32_t kPositions = SPLASH_DRAFT_PROPOSAL_TOKENS;
 constexpr uint32_t kLanes = SPLASH_MAXIMUM_BATCH_WIDTH;
 constexpr uint32_t kUniforms = SPLASH_SAMPLING_UNIFORMS;
@@ -198,7 +202,7 @@ Batch makeBatch(MetalBackend &backend, uint32_t vocabulary, uint32_t lanes) {
               allocate(backend, space.vocabularyRowsBytes),
               allocate(backend, uint64_t{lanes} * kUniforms * sizeof(float)),
               allocate(backend,
-                       uint64_t{lanes} * (kRows + 1) * ((vocabulary + 31) / 32) * 4),
+                       uint64_t{lanes} * kMaskRows * ((vocabulary + 31) / 32) * 4),
               allocate(backend, uint64_t{rows} * sizeof(uint32_t)),
               allocate(backend, space.argmaxValuesBytes),
               allocate(backend, space.argmaxIndicesBytes),
@@ -514,7 +518,7 @@ void penalties(MetalBackend &backend, uint32_t vocabulary, uint32_t lanes,
     if (row % 2)
       batch.row(row)[kStopTokens.ids[0]] = 13.0F;
   }
-  for (uint32_t index = 0; index < lanes * (kRows + 1) * batch.maskWords();
+  for (uint32_t index = 0; index < lanes * kMaskRows * batch.maskWords();
        ++index)
     batch.masks()[index] = 0xB6DB6DB6U ^ index;
   for (uint32_t uniform = 0; uniform < lanes * kUniforms; ++uniform)
@@ -558,7 +562,7 @@ void penalties(MetalBackend &backend, uint32_t vocabulary, uint32_t lanes,
       const SamplingPolicy &policy = policies[lane];
       const Admission admits{
           policy.constrained
-              ? batch.masks() + (uint64_t{lane} * (kRows + 1) + row % kRows + 1) *
+              ? batch.masks() + (uint64_t{lane} * kMaskRows + row % kRows + 1) *
                                     batch.maskWords()
               : nullptr,
           policy.excludesStopTokens};
@@ -599,7 +603,7 @@ void penalties(MetalBackend &backend, uint32_t vocabulary, uint32_t lanes,
     const float *selected = batch.row(lane * kRows + kOffset);
     const Admission admits{
         policy.constrained
-            ? batch.masks() + uint64_t{lane} * (kRows + 1) * batch.maskWords()
+            ? batch.masks() + uint64_t{lane} * kMaskRows * batch.maskWords()
             : nullptr,
         policy.excludesStopTokens};
     if (policy.samples())
@@ -883,7 +887,7 @@ void bufferExtents(MetalBackend &backend) {
     // constrained lane's mask row and the sampled lane's uniform.
     const auto rows = workspace(2 * kRows + 3 + 1);
     requireExtents({{&SamplingBuffers::logits, (2 * kRows + 3 + 1) * logitsRow, 4, "sampling logits"},
-                    {&SamplingBuffers::constraintMasks, (kRows + 1 + 1) * maskRow, 4, "constraint mask"},
+                    {&SamplingBuffers::constraintMasks, (kMaskRows + 1) * maskRow, 4, "constraint mask"},
                     {&SamplingBuffers::outputTokens, (2 * kRows + 3 + 1) * 4, 4, "sampled token"},
                     {&SamplingBuffers::argmaxValues, rows[0], 4, "argmax value"},
                     {&SamplingBuffers::argmaxIndices, rows[1], 4, "argmax index"},
@@ -913,7 +917,7 @@ void bufferExtents(MetalBackend &backend) {
     const auto rows = workspace(3 * kRows);
     requireExtents(
         {{&SamplingBuffers::logits, 3 * kRows * logitsRow, 4, "sampling logits"},
-         {&SamplingBuffers::constraintMasks, (kRows + 1 + 1 + kRows) * maskRow, 4, "constraint mask"},
+         {&SamplingBuffers::constraintMasks, (kMaskRows + 1 + kRows) * maskRow, 4, "constraint mask"},
          {&SamplingBuffers::outputTokens, lanes * kRows * 4, 4, "sampled token"},
          {&SamplingBuffers::argmaxValues, rows[0], 4, "argmax value"},
          {&SamplingBuffers::argmaxIndices, rows[1], 4, "argmax index"},
@@ -1056,13 +1060,13 @@ void sampledRows(MetalBackend &backend, uint32_t vocabulary, uint32_t lanes,
                  std::vector{beyond, narrow, stoplessGreedy},
                  std::vector{wide, thousand, greedy, fifty}};
   const std::vector<SamplingPolicy> &policies = batches[lanes - 1];
-  for (uint32_t index = 0; index < lanes * (kRows + 1) * batch.maskWords();
+  for (uint32_t index = 0; index < lanes * kMaskRows * batch.maskWords();
        ++index)
     batch.masks()[index] = 0xB6DB6DB6U ^ index;
   const auto admission = [&](uint32_t lane, uint32_t row) {
     return Admission{policies[lane].constrained
                          ? batch.masks() +
-                               (uint64_t{lane} * (kRows + 1) + row + 1) *
+                               (uint64_t{lane} * kMaskRows + row + 1) *
                                    batch.maskWords()
                          : nullptr,
                      policies[lane].excludesStopTokens};
@@ -1252,7 +1256,7 @@ void packedLanes(MetalBackend &backend) {
   Run all = makeRun(lanes, packed);
   for (uint32_t row = 0; row < all.batch.rows; ++row)
     fillShaped(all.batch.row(row), vocabulary, row % 2 ? Shape::Ties : Shape::Peaked, random);
-  for (uint32_t index = 0; index < lanes * (kRows + 1) * all.batch.maskWords(); ++index)
+  for (uint32_t index = 0; index < lanes * kMaskRows * all.batch.maskWords(); ++index)
     all.batch.masks()[index] = 0xB6DB6DB6U ^ (index * 2654435761U);
   for (uint32_t uniform = 0; uniform < lanes * kUniforms; ++uniform)
     all.batch.uniforms()[uniform] = 0.5F * (random.unit() + 1.0F);
@@ -1280,8 +1284,8 @@ void packedLanes(MetalBackend &backend) {
     const Run alone = makeRun(1, own);
     std::copy_n(logits.begin() + uint64_t{block.first} * vocabulary, uint64_t{block.rows} * vocabulary,
                 alone.batch.logits());
-    std::copy_n(all.batch.masks() + uint64_t{lane} * (kRows + 1) * all.batch.maskWords(),
-                (kRows + 1) * all.batch.maskWords(), alone.batch.masks());
+    std::copy_n(all.batch.masks() + uint64_t{lane} * kMaskRows * all.batch.maskWords(),
+                kMaskRows * all.batch.maskWords(), alone.batch.masks());
     std::copy_n(all.batch.uniforms() + lane * kUniforms, kUniforms, alone.batch.uniforms());
     std::copy_n(inputs.begin() + block.first, block.rows, alone.batch.inputTokens());
     run(alone, std::span(policies).subspan(lane, 1), own, std::span(verifyRows).subspan(lane, 1),
@@ -1343,7 +1347,7 @@ void unconstrainedRowsIgnoreMasks(MetalBackend &backend) {
     }
     for (uint32_t uniform = 0; uniform < lanes * kUniforms; ++uniform)
       batch.uniforms()[uniform] = 0.5F * (random.unit() + 1.0F);
-    std::fill_n(batch.masks(), lanes * (kRows + 1) * batch.maskWords(),
+    std::fill_n(batch.masks(), lanes * kMaskRows * batch.maskWords(),
                 maskWord);
     CommandGraph verify;
     sampling.addVerify(verify, policies, batch.buffers, layOut(batch.buffers, blocks(policies.size())), stops, {});
@@ -1377,7 +1381,7 @@ void targetTop1(MetalBackend &backend, uint32_t vocabulary, uint32_t lanes) {
     for (uint32_t token = 0; token < vocabulary; ++token)
       batch.row(row)[token] = float(int((token * 7 + row * 13) % 23) - 11) +
                               float(token % 3) * 0x1p-12F;
-  for (uint32_t row = 0; row < lanes * (kRows + 1); ++row)
+  for (uint32_t row = 0; row < lanes * kMaskRows; ++row)
     for (uint32_t token = 0; token < vocabulary; ++token)
       if ((token + row) % 17 == 0)
         batch.masks()[uint64_t{row} * words + token / 32] |= 1U << (token % 32);
@@ -1424,7 +1428,7 @@ void targetTop1(MetalBackend &backend, uint32_t vocabulary, uint32_t lanes) {
   for (uint32_t row = 0; row < batch.rows; ++row) {
     if (row % kRows == kRows - 1)
       continue;
-    const uint32_t maskRow = row / kRows * (kRows + 1) + row % kRows + 1;
+    const uint32_t maskRow = row / kRows * kMaskRows + row % kRows + 1;
     const uint32_t id = expected(row, maskRow);
     batch.inputTokens()[row + 1] = row % 2 ? id : (id + 1) % vocabulary;
   }
@@ -1436,7 +1440,7 @@ void targetTop1(MetalBackend &backend, uint32_t vocabulary, uint32_t lanes) {
   sampling.addVerify(verify, policies, batch.buffers, layOut(batch.buffers, blocks(policies.size())), stops, {});
   static_cast<void>(backend.submitCommandAsync(verify.dispatches()).wait());
   for (uint32_t row = 0; row < batch.rows; ++row) {
-    const uint32_t maskRow = row / kRows * (kRows + 1) + row % kRows + 1;
+    const uint32_t maskRow = row / kRows * kMaskRows + row % kRows + 1;
     const uint32_t id = expected(row, maskRow);
     if (!policies[row / kRows].samples()) {
       require(tokens[row] == id,
@@ -1598,10 +1602,10 @@ void excludedStopTokens(MetalBackend &backend, uint32_t vocabulary) {
 void thinkingCutoffs(MetalBackend &backend, uint32_t vocabulary) {
   const auto stops = shardEdgeStopTokens(vocabulary);
   const uint32_t close = vocabulary - 3, alsoEnds = vocabulary - 5;
-  // Ends of one token, of fewer than a verify's rows and of more; their
-  // other tokens repeat five that no row prefers.
+  // Ends of one token, of fewer than a verify's rows and of more than a
+  // verify block's; their other tokens repeat five that no row prefers.
   std::vector<std::vector<uint32_t>> ends;
-  for (const uint32_t length : {1U, 3U, kRows + 3}) {
+  for (const uint32_t length : {1U, 3U, SPLASH_TARGET_VERIFY_ROWS + 3}) {
     std::vector<uint32_t> &end = ends.emplace_back();
     for (uint32_t index = 0; index + 1 < length; ++index)
       end.push_back(vocabulary - 6 - index % 5);
@@ -1650,7 +1654,7 @@ void thinkingCutoffs(MetalBackend &backend, uint32_t vocabulary) {
   const uint32_t words = batch.maskWords();
   // Lane l's mask row `row` refuses `token`.
   const auto refuse = [&](uint32_t lane, uint32_t row, uint32_t token) {
-    masks[(uint64_t{lane} * (kRows + 1) + row) * words + token / 32] &= ~(1U << token % 32);
+    masks[(uint64_t{lane} * kMaskRows + row) * words + token / 32] &= ~(1U << token % 32);
   };
   for (const std::vector<uint32_t> &end : ends) {
     for (const float temperature : {0.0F, 0.8F}) {
@@ -1776,7 +1780,7 @@ void thinkingCutoffs(MetalBackend &backend, uint32_t vocabulary) {
           std::vector<SamplingPolicy> policies;
           std::array<std::array<uint32_t, kRows>, kLanes> expected{};
           std::array<std::array<uint32_t, kPositions>, kLanes> drafts{};
-          std::fill_n(masks, uint64_t{kLanes} * (kRows + 1) * words, ~0U);
+          std::fill_n(masks, uint64_t{kLanes} * kMaskRows * words, ~0U);
           for (uint32_t lane = 0; lane < kLanes; ++lane) {
             SamplingPolicy policy{32, (samplingMask >> lane & 1U) ? 0.8F : 0.0F, 1.0F, true};
             policy.thinkingCutoff = ThinkingCutoff{cuts[lane], end, alsoEnds, true};

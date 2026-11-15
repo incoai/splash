@@ -131,7 +131,7 @@ public:
     const auto next = model::RuntimeInstrumentation::pendingToken(runtime_, result.requestId);
     require(next.has_value(), "penalty probe has no selected continuation");
     const size_t retained = result.outputTokens.size() - result.outputTokensWithoutKv;
-    require(retained > 0 && retained <= model::ExecutionLimits::targetVerifyRows,
+    require(retained > 0 && retained <= model::ExecutionLimits::decodeLaneRows,
             "penalty probe retention is outside the verified rows");
     for (size_t index = 0; index < retained; ++index) {
       const uint32_t selected = index + 1 < retained ? result.outputTokens[index + 1] : *next;
@@ -441,7 +441,7 @@ std::vector<uint8_t> bytesOf(const metal::MetalBuffer &buffer) {
 // positions they hold, each layer's keys then values.
 struct CommittedState final {
   model::QwenLogicalLengths lengths;
-  uint32_t pendingRows = 0;
+  uint32_t pendingPath = 0;
   std::vector<uint8_t> cell;
   std::vector<uint8_t> retained;
   std::vector<std::vector<uint16_t>> rings;
@@ -451,7 +451,7 @@ CommittedState committedState(const model::Runtime &executor, const model::QwenS
                               uint32_t lane) {
   const auto &metadata = states.metadata(lane);
   // A cell of no bytes (a target without GDN layers') holds nothing.
-  CommittedState state{metadata.lengths, metadata.pendingRows, bytesOf(states.current(lane).stateBase),
+  CommittedState state{metadata.lengths, metadata.pendingPath, bytesOf(states.current(lane).stateBase),
                        model::RuntimeInstrumentation::pendingGdnRows(executor, metadata.requestId), {}};
   // A ring's keys are [head][slot][dimension] and its values [head][dimension]
   // [slot]; position p is slot p % window.
@@ -482,7 +482,7 @@ CommittedState committedState(const model::Runtime &executor, const model::QwenS
 // (its cells hold nothing).
 void requireSameCommittedState(const CommittedState &left, const CommittedState &right,
                                const std::string &label) {
-  require(left.lengths == right.lengths && left.pendingRows && left.pendingRows == right.pendingRows,
+  require(left.lengths == right.lengths && left.pendingPath && left.pendingPath == right.pendingPath,
           label + ": the logical state differs");
   require(left.cell == right.cell, label + ": the GDN cell differs");
   require((!left.retained.empty() || left.cell.empty()) && left.retained == right.retained,
@@ -2291,7 +2291,7 @@ void requireThinkingBudgetClosesThinking(model::Runtime &executor) {
                       " did not end thinking with its end tokens, then go on");
           // A cycle that cuts past its row 0 may return the end's first
           // token alone; each cycle after it returns up to eight of them.
-          constexpr uint32_t rows = model::ExecutionLimits::targetVerifyRows;
+          constexpr uint32_t rows = model::ExecutionLimits::decodeLaneRows;
           const std::vector<uint32_t> &cycles = generated[lane].cycles;
           const uint32_t endCycles = cycles[first + length - 1] - cycles[first] + 1;
           require(endCycles <= 1 + (length - 1 + rows - 1) / rows,
@@ -2396,7 +2396,7 @@ void requireConstrainedThinkingEndWaitsForItsMask(model::Runtime &executor) {
   const std::array<std::vector<uint32_t>, 3> pageTables{
       pageRange(108, 4), pageRange(116, 4), pageRange(120, 4)};
   const std::array<uint64_t, 3> ids{311, 312, 313};
-  constexpr uint32_t rows = model::ExecutionLimits::targetVerifyRows;
+  constexpr uint32_t rows = model::ExecutionLimits::decodeLaneRows;
   constexpr uint32_t proposals = model::ExecutionLimits::draftProposalTokens;
   for (const std::vector<uint32_t> &end : targetTokens->thinkingEnds) {
     const uint32_t length = static_cast<uint32_t>(end.size());
@@ -2470,7 +2470,7 @@ void requireConstrainedThinkingEndWaitsForItsMask(model::Runtime &executor) {
 void requireThinkingEndVerifiesItsTokens(model::Runtime &executor, const model::LoadedModel &model) {
   const std::vector<uint32_t> &prompt = targetTokens->thinkingPrompt;
   const std::vector<uint32_t> &end = targetTokens->thinkingEnds[1];
-  constexpr uint32_t rows = model::ExecutionLimits::targetVerifyRows;
+  constexpr uint32_t rows = model::ExecutionLimits::decodeLaneRows;
   const uint32_t length = static_cast<uint32_t>(prompt.size());
   const std::vector<uint32_t> pages = pageRange(108, 4);
   EngineRequest request = makeRequest(321, prompt, 64);
@@ -3155,7 +3155,7 @@ void requireBatchedLanesMatchReordered(model::Runtime &executor, const model::Qw
 void requireConstrainedLaneSharesDecode(model::Runtime &executor, const model::QwenStateStorage &states,
                                         const model::ModelDescriptor &descriptor, std::span<const uint32_t> seed) {
   constexpr uint32_t kPromptTokens = 160;
-  constexpr uint32_t kRows = model::ExecutionLimits::targetVerifyRows;
+  constexpr uint32_t kRows = model::ExecutionLimits::decodeLaneRows;
   // Cycles whose masks admit every token, then the forced cycle and the one
   // after it.
   constexpr uint32_t kAdmitting = 3, kCycles = kAdmitting + 2;
@@ -3349,7 +3349,7 @@ void requireConstrainedLaneTakesTheMasksItAskedFor(model::Runtime &executor,
 // cycles the budget prices apart.
 void requireBudgetedCyclesAreWellFormed(model::Runtime &executor, const model::QwenStateStorage &states,
                                         std::span<const uint32_t> seed) {
-  constexpr uint32_t kRows = model::ExecutionLimits::targetVerifyRows;
+  constexpr uint32_t kRows = model::ExecutionLimits::decodeLaneRows;
   constexpr uint32_t kExplore = model::VerifyBudget::kExploreCycles;
   constexpr uint32_t kCycles = model::VerifyBudget::kRefitCycles + 1;
   struct Lane final {
@@ -3660,7 +3660,7 @@ public:
     std::vector<ModelBatchItem> items;
     bool indexed = false;
     for (SpillRequest *request : requests) {
-      ensure(*request, request->committed + model::ExecutionLimits::targetVerifyRows);
+      ensure(*request, request->committed + model::ExecutionLimits::decodeLaneRows);
       if (request->holdsIndexPages()) {
         const model::ModelMemoryAdmission floor =
             runtime_->reserveSpilledReads(request->id, {.kind = WorkKind::Decode});
@@ -3966,7 +3966,7 @@ void requireSpilledKvMatchesResident(metal::MetalBackend &backend, const model::
                                       const metal::AllocationAdmission &admission, const MemoryGovernor &governor,
                                       kv::Format format, ops::GdnStateFormat stateFormat, const SpillOptions &options) {
   constexpr uint32_t kCycles = 4;
-  constexpr uint32_t kDecodeTokens = (1 + 4 * kCycles) * model::ExecutionLimits::targetVerifyRows;
+  constexpr uint32_t kDecodeTokens = (1 + 4 * kCycles) * model::ExecutionLimits::decodeLaneRows;
   constexpr uint32_t kIntoPage = 13, kLastChunkRows = 10;
   static_assert(kIntoPage + kLastChunkRows < kv::kPageTokens);
   const uint32_t denseTokens = densePagesOf(*model.descriptor.capabilities.sparseKv) * kv::kPageTokens;

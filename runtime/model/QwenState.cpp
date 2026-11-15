@@ -430,13 +430,13 @@ void QwenStateStorage::swapParity(uint32_t index) {
   current.metadata.activeParity ^= 1;
 }
 
-void QwenStateStorage::swapDecodeParity(uint32_t index, uint32_t retainedRows) {
+void QwenStateStorage::swapDecodeParity(uint32_t index, uint32_t path) {
   Lane &current = lane(index);
   requireAssigned(current);
-  if (!retainedRows || retainedRows > ExecutionLimits::targetVerifyRows)
-    throw std::invalid_argument("a decode step retains one to all of its rows");
+  if (!(path & 1) || path >> ExecutionLimits::targetVerifyRows)
+    throw std::invalid_argument("a decode step accepts a path of its rows from its anchor's");
   current.metadata.activeParity ^= 1;
-  current.metadata.pendingRows = retainedRows;
+  current.metadata.pendingPath = path;
 }
 
 std::shared_ptr<const QwenCompositeState>
@@ -667,7 +667,7 @@ void QwenStateStorage::requireAssigned(const Lane &current) {
 
 void QwenStateStorage::requireCommitted(const Lane &current) {
   requireAssigned(current);
-  if (current.metadata.pendingRows)
+  if (current.metadata.pendingPath)
     throw std::logic_error("Qwen lane state has decoded rows pending");
 }
 

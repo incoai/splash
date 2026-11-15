@@ -7,6 +7,7 @@
 #include "ops/PagedAttention.hpp"
 #include "Q8PageFormatReference.hpp"
 #include "ops/KernelCalibration.hpp"
+#include "ops/LaneRows.hpp"
 
 #include <algorithm>
 #include <array>
@@ -30,7 +31,7 @@ namespace {
 constexpr uint32_t kStride = kPageTokens;
 constexpr uint32_t kQueryStride = kStride;
 constexpr uint32_t kRows = kAttentionTileRows;
-static_assert(kRows == SPLASH_TARGET_VERIFY_ROWS, "a decode lane's rows are one tile");
+static_assert(kRows == splash::ops::kDecodeLaneRows, "a decode lane's rows are one tile");
 
 // The production GQA geometries, every family's (TestFamilies.hpp). The
 // group size selects the kernel specialization, which the plans name

@@ -13,6 +13,7 @@
 #include "ops/PagedAttention.hpp"
 #include "ops/RoPE.hpp"
 #include "ops/KernelCalibration.hpp"
+#include "ops/LaneRows.hpp"
 
 #include <algorithm>
 #include <array>
@@ -50,7 +51,7 @@ constexpr test::AttentionGeometry kGeometry{kQueryHeads, kKvHeads, kHeadDimensio
 constexpr uint32_t kWindow = 512, kRotaryPairs = kHeadDimension / 2;
 constexpr uint32_t kPageTokens = kv::kPageTokens;
 // A decode lane's rows, one attention tile.
-constexpr uint32_t kLaneRows = SPLASH_TARGET_VERIFY_ROWS;
+constexpr uint32_t kLaneRows = ops::kDecodeLaneRows;
 // The attention layer under test is the second of a pool's two, so its region
 // starts past the first one's in every extent.
 constexpr uint32_t kLayer = 1;

@@ -59,6 +59,7 @@
 #include "metal/abi/RoPE.h"
 #include "ops/BlockIndexer.hpp"
 #include "ops/ExecutionPlans.hpp"
+#include "ops/LaneRows.hpp"
 #include "ops/PagedAttention.hpp"
 
 #include <algorithm>
@@ -94,7 +95,7 @@ using test::HostKvExtents;
 using test::moveBlock;
 
 constexpr uint32_t kMaximumLanes = SPLASH_MAXIMUM_BATCH_WIDTH;
-constexpr uint32_t kVerifyRows = SPLASH_TARGET_VERIFY_ROWS;
+constexpr uint32_t kVerifyRows = splash::ops::kDecodeLaneRows;
 constexpr uint32_t kPrefillRows = SPLASH_PREFILL_TOKEN_BUDGET;
 
 // The swept attention layer is the second of the extents' two.

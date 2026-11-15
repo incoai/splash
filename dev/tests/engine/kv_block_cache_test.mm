@@ -26,6 +26,7 @@
 #include "model/KvBlockCache.hpp"
 #include "model/ModelPools.hpp"
 #include "ops/KernelCalibration.hpp"
+#include "ops/LaneRows.hpp"
 #include "ops/PagedAttention.hpp"
 
 #import <Foundation/Foundation.h>
@@ -97,7 +98,7 @@ using Lanes = std::vector<std::shared_ptr<const KvPageSources>>;
 std::vector<std::vector<uint32_t>> resolve(MetalBackend &backend, KvBlockCache &cache, uint32_t layer,
                                            const Lanes &lanes, const std::vector<std::vector<uint32_t>> &blocks,
                                            const std::shared_ptr<KvReadStats> &stats) {
-  constexpr uint32_t kRows = SPLASH_TARGET_VERIFY_ROWS;
+  constexpr uint32_t kRows = splash::ops::kDecodeLaneRows;
   uint32_t history = 0;
   for (const std::vector<uint32_t> &list : blocks)
     if (!list.empty()) history = std::max(history, (list.back() + 1) * SPLASH_ATTENTION_BLOCK_TOKENS);
@@ -565,7 +566,7 @@ template <typename T> void overwrite(const test::AttentionFixture &fixture, uint
 
 template <typename T> void attendsThroughLocations(MetalBackend &backend, kv::Format format) {
   using Tensor = test::AttentionFixturePlan::Tensor;
-  constexpr uint32_t kQueryHeads = 24, kLayer = 1, kRows = SPLASH_TARGET_VERIFY_ROWS, kTokens = SPLASH_ATTENTION_BLOCK_TOKENS;
+  constexpr uint32_t kQueryHeads = 24, kLayer = 1, kRows = splash::ops::kDecodeLaneRows, kTokens = SPLASH_ATTENTION_BLOCK_TOKENS;
   const kv::Layout layout = layoutOf(format);
   const test::AttentionShape shape{kQueryHeads, layout.kvHeads, layout.headDimension, format, true};
   const test::AttentionFixturePlan::Histories histories{1503, 1219};

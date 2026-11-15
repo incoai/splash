@@ -216,7 +216,8 @@ void growToCap(ExpertStore &store) {
 // round, any other load half of them a round. A long chunk's load whose next
 // block streams (`nextStreams`) reads it ahead in one step more.
 uint32_t loadSteps(const MoeShape &shape, uint32_t rows, bool nextStreams) {
-  const uint32_t cycleRows = splash::model::ExecutionLimits::maximumBatchWidth * kLaneRows;
+  // The store's (ExpertStore.cpp's kCycleRows), fewer than four 16-row lanes'.
+  constexpr uint32_t cycleRows = 32;
   const uint64_t places =
       std::max<uint64_t>(2, std::min<uint64_t>(shape.experts, uint64_t{cycleRows} * shape.expertsPerToken));
   const uint64_t routable = std::min<uint64_t>(shape.experts, uint64_t{rows} * shape.expertsPerToken);

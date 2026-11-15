@@ -1,6 +1,7 @@
 #include "TestBuffers.hpp"
 #include "TestChecks.hpp"
 #include "ops/GDN.hpp"
+#include "ops/LaneRows.hpp"
 #include "ops/Linear.hpp"
 #include "ops/Normalization.hpp"
 #include "ops/PagedAttention.hpp"
@@ -1227,14 +1228,17 @@ void producerTableContract(metal::MetalBackend &backend) {
     buffers.convolutionWeights = allocate(backend, shape.convolutionDimension * 4 * 2);
     buffers.currentStates = states;
     buffers.nextStates = states;
-    const std::array<GdnDecodeBlock, kLanes> blocks{GdnDecodeBlock{{0, kRows}, {0, gdnTapeLayerBytes(shape), 0}}};
+    const std::array<GdnTapeLane, kLanes> tapes{GdnTapeLane{0, gdnTapeLayerBytes(shape), 0}};
     buffers.tape = allocate(backend, 2 * gdnTapeLayerBytes(shape));
-    buffers.blocks = blocks;
+    buffers.tapes = tapes;
+    buffers.laneRows = allocate(backend, kLanes * sizeof(SplashLaneRows));
+    buffers.rows = buffers.laneCap = kRows;
     buffers.decayWeights = allocate(backend, shape.valueHeads * 4);
     buffers.timeBias = allocate(backend, shape.valueHeads * 2);
     buffers.mixerNorm = {allocate(backend, shape.headDimension * 2)};
     buffers.hidden = allocate(backend, kRows * shape.valueHeads * shape.headDimension * 2);
     buffers.verifyRows = allocate(backend, kLanes * 4);
+    buffers.tree = allocate(backend, kRows * sizeof(SplashTreeRow));
     metal::CommandGraph graph;
     rejects(
         [&] {
@@ -1285,9 +1289,9 @@ void rotatedRegisterInput(metal::MetalBackend &backend) {
   const NormWeights norm{allocate(backend, 17408 * 2)};
   const metal::MetalBuffer rows = allocate(backend, uint64_t{32} * 17408 * 2);
   for (uint32_t lanes = 1; lanes <= 4; ++lanes) {
-    const LinearPlan plan = m3.plan(rotated, lanes * SPLASH_TARGET_VERIFY_ROWS);
+    const LinearPlan plan = m3.plan(rotated, lanes * splash::ops::kDecodeLaneRows);
     require(plan.configuration().tile == LinearTile::GgufRegister && plan.input() == LinearInput::Plain &&
-                m3.plan(plain, lanes * SPLASH_TARGET_VERIFY_ROWS).input() == LinearInput::Table16,
+                m3.plan(plain, lanes * splash::ops::kDecodeLaneRows).input() == LinearInput::Table16,
             "a rotated register plan's producer writes a table it discards");
     metal::CommandGraph graph;
     (void)Normalization::addRms(graph, rows, norm, rows, 17408, lanes * 8, scratch, plan.input());
@@ -1307,10 +1311,10 @@ void decodeInt8Setting(metal::MetalBackend &backend) {
   const Linear on = gpu(10, 16), off(simulatedDevice(10, 16), Int8Activations::Off);
   bool int8 = false;
   for (uint32_t lanes = 1; lanes <= SPLASH_MAXIMUM_BATCH_WIDTH; ++lanes) {
-    LinearConfig config = on.plan(rotated, lanes * SPLASH_TARGET_VERIFY_ROWS).configuration();
+    LinearConfig config = on.plan(rotated, lanes * splash::ops::kDecodeLaneRows).configuration();
     int8 |= config.decodeInt8;
     config.decodeInt8 = false;
-    require(off.plan(rotated, lanes * SPLASH_TARGET_VERIFY_ROWS).configuration() == config,
+    require(off.plan(rotated, lanes * splash::ops::kDecodeLaneRows).configuration() == config,
             "int8 activations off moved a rotated PQ2_0 decode plan other than off the int8 tiles");
   }
   require(int8, "no decode plan of a rotated PQ2_0 projection takes int8 activations with them on");
@@ -1573,7 +1577,7 @@ void registerTileExtents(metal::MetalBackend &backend) {
   constexpr uint32_t n = 512, k = 2048, lanes = 2;
   constexpr uint64_t rows = lanes * 8;
   const Projection block(n, k, BlockWeights{{segmentPlanes(backend, GGUF_FMT_Q4K, n, k)}});
-  const LinearPlan plan = m3.plan(block, lanes * SPLASH_TARGET_VERIFY_ROWS);
+  const LinearPlan plan = m3.plan(block, lanes * splash::ops::kDecodeLaneRows);
   const LinearScratchSize scratch = plan.scratchSize();
   require(plan.configuration().tile == LinearTile::GgufRegister && scratch.input && scratch.sums &&
               scratch.partials && scratch.counters,

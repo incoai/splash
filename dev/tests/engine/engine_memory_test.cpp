@@ -2769,7 +2769,7 @@ void testARefusedDecodeLeavesThePromptOutsideItsCommand() {
   // A long prompt's commands run between theirs.
   engine.submit(request(3, std::vector<uint32_t>(8 * model::ExecutionLimits::prefillTokenBudget, 3)));
   const auto needsPage = [&](uint64_t id) {
-    return promptTokens(id) + events.outputs[id].size() + model::ExecutionLimits::targetVerifyRows >
+    return promptTokens(id) + events.outputs[id].size() + model::ExecutionLimits::decodeLaneRows >
            uint64_t{resources.pageTable(id).pages.size()} * KvCache::pageTokens;
   };
   tickUntil(

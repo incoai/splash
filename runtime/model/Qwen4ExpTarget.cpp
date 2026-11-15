@@ -18,7 +18,7 @@ namespace splash::model {
 namespace {
 
 // The rows a decode step verifies of each of its lanes.
-constexpr uint32_t kVerifyRows = ExecutionLimits::targetVerifyRows;
+constexpr uint32_t kVerifyRows = ExecutionLimits::decodeLaneRows;
 
 ops::HyperShape hyperShape(const QwenTargetGeometry &g) { return {g.hiddenSize, g.hyperConnections, g.hyperRank}; }
 ops::NgramShape ngramShape(const QwenTargetGeometry &g) {

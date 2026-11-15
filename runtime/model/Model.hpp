@@ -1,6 +1,7 @@
 #pragma once
 
 #include "metal/abi/ExecutionGeometry.h"
+#include "ops/LaneRows.hpp"
 #include "ops/PagedKv.hpp"
 #include "ops/Vision.hpp"
 #include "model/CommandCost.hpp"
@@ -627,7 +628,10 @@ struct ExecutionLimits final {
       (prefillTokenBudget + kv::kPageTokens - 1) / kv::kPageTokens;
   static constexpr uint32_t draftQueryRows = SPLASH_DRAFT_QUERY_ROWS;
   static constexpr uint32_t draftProposalTokens = SPLASH_DRAFT_PROPOSAL_TOKENS;
+  // The most rows of a lane's verify block, which every target kernel takes.
   static constexpr uint32_t targetVerifyRows = SPLASH_TARGET_VERIFY_ROWS;
+  // The rows a decode cycle verifies of each lane (ops::kDecodeLaneRows).
+  static constexpr uint32_t decodeLaneRows = ops::kDecodeLaneRows;
   static constexpr uint32_t draftContextTokens = SPLASH_DRAFT_SLIDING_WINDOW;
   // The most target layers a DFlash2 draft reads (its target_layer_ids).
   static constexpr uint32_t maximumDraftTargetLayers = 8;
@@ -643,8 +647,8 @@ struct ExecutionLimits final {
 
 static_assert(ExecutionLimits::draftQueryRows ==
               ExecutionLimits::draftProposalTokens + 1);
-static_assert(ExecutionLimits::targetVerifyRows ==
-              ExecutionLimits::draftQueryRows);
+static_assert(ExecutionLimits::decodeLaneRows <= ExecutionLimits::targetVerifyRows &&
+              ExecutionLimits::draftQueryRows <= ExecutionLimits::targetVerifyRows);
 
 // The first rule a command breaks, or none: at most maximumBatchWidth
 // lanes; and for a prefill, pass `pass` of at most maximumPasses passes,

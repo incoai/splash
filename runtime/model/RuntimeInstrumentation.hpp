@@ -56,10 +56,11 @@ public:
     std::span<const SplashKvPage> index;
   };
   [[nodiscard]] static LaneTables laneTables(const Runtime &runtime, uint64_t requestId);
-  // The rows resident request `requestId`'s latest decode step retained,
+  // The rows resident request `requestId`'s latest decode step accepted,
   // which its GDN cell holds only once its next step folds them in
-  // (QwenLaneMetadata::pendingRows): every GDN layer's tape rows
-  // (metal/abi/GDN.h) up to that count, field by field, layer by layer.
+  // (QwenLaneMetadata::pendingPath): every GDN layer's tape rows
+  // (metal/abi/GDN.h) of that path in its order, field by field, layer by
+  // layer.
   [[nodiscard]] static std::vector<uint8_t> pendingGdnRows(const Runtime &runtime, uint64_t requestId);
   // The entries of the registry through which the placements of an image
   // share its rows: an entry for each image whose rows something holds, and

@@ -10,6 +10,7 @@
 #include "NormReference.hpp"
 #include "TestFamilies.hpp"
 #include "ops/KernelCalibration.hpp"
+#include "ops/LaneRows.hpp"
 
 #include <algorithm>
 #include <array>
@@ -58,7 +59,7 @@ using Geometry = splash::test::AttentionGeometry;
 const std::vector<Geometry> kGeometries = splash::test::familyAttentionGeometries();
 
 // A decode lane's rows, one tile.
-constexpr uint32_t kLaneRows = SPLASH_TARGET_VERIFY_ROWS;
+constexpr uint32_t kLaneRows = ops::kDecodeLaneRows;
 static_assert(kLaneRows == kv::kAttentionTileRows);
 
 // Whether a layout's attention reads the blocks its index selects (the

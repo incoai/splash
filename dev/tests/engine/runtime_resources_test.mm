@@ -1114,7 +1114,7 @@ void testALongRequestAfterTheWarmupsCreatesNothing(const char *metallibPath) {
   // not matter here.
   constexpr uint32_t chunk = model::ExecutionLimits::prefillTokenBudget, history = 4 * chunk;
   const std::vector<uint32_t> prompt(history, 7);
-  std::vector<uint32_t> pages((history + model::ExecutionLimits::targetVerifyRows + kv::kPageTokens - 1) /
+  std::vector<uint32_t> pages((history + model::ExecutionLimits::decodeLaneRows + kv::kPageTokens - 1) /
                               kv::kPageTokens);
   for (uint32_t page = 0; page < pages.size(); ++page) pages[page] = page % model::ExecutionLimits::warmupKvPages;
   auto &executor = dynamic_cast<model::Runtime &>(*runtime);

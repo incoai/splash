@@ -1,6 +1,7 @@
 #include "ops/ExecutionPlans.hpp"
 
 #include "metal/abi/Gguf.h"
+#include "ops/LaneRows.hpp"
 
 #include <algorithm>
 #include <utility>
@@ -9,7 +10,6 @@ namespace splash::ops {
 namespace {
 
 constexpr uint32_t kMaximumLanes = SPLASH_MAXIMUM_BATCH_WIDTH;
-constexpr uint32_t kDecodeRows = SPLASH_TARGET_VERIFY_ROWS;
 
 template <typename Workspace, size_t N>
 void include(Workspace &bound, const Workspace &required,
@@ -95,7 +95,7 @@ MoeWorkspace ExecutionPlans::moePrefillWorkspace(MoeShape shape, uint32_t router
 MoeWorkspace ExecutionPlans::moeDecodeWorkspacePerLane(MoeShape shape, uint32_t routerFormat) const {
   MoeWorkspace bound;
   for (uint32_t lanes = 1; lanes <= kMaximumLanes; ++lanes)
-    include(bound, moe(shape, routerFormat, lanes * kDecodeRows).workspace(), kMoeWorkspaceFields, lanes);
+    include(bound, moe(shape, routerFormat, lanes * kDecodeLaneRows).workspace(), kMoeWorkspaceFields, lanes);
   return bound;
 }
 

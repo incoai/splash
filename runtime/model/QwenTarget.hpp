@@ -337,6 +337,11 @@ struct QwenTargetVerifyBuffers final {
   // Each lane's verify rows (ops::DraftSelector::addVerifyRows), which a MoE
   // target's steps route alone (ops::MoeBuffers::verifyRows).
   metal::MetalBuffer verifyRows;
+  // The step's rows' places in their lanes' trees (ops::TreeRow), and each
+  // lane's block of the step's rows as the device holds it (SplashLaneRows),
+  // which the GDN layers read.
+  metal::MetalBuffer tree;
+  metal::MetalBuffer laneRows;
   // Each lane's auxiliary state before the step; the commit writes the one
   // after it (addStateCommit).
   std::array<metal::MetalBuffer, ExecutionLimits::maximumBatchWidth> auxiliary;
@@ -511,7 +516,7 @@ public:
       const kv::PageStorage &kv, SpilledKvReads &spilled,
       std::span<const kv::ChunkedPrefillParams> chunks,
       uint32_t lanes) const = 0;
-  // The head over `lanes` lanes of targetVerifyRows rows of the last layer's
+  // The head over `lanes` lanes of decodeLaneRows rows of the last layer's
   // output, as verify ends: one sweep of the vocabulary projection for every
   // lane.
   virtual void addHeadBatch(metal::CommandGraph &graph, metal::MetalBuffer hidden,

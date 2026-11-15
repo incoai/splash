@@ -34,6 +34,7 @@
 #include "metal/abi/KvExtent.h"
 #include "metal/abi/HyperConnection.h"
 #include "metal/abi/NgramEmbedding.h"
+#include "ops/LaneRows.hpp"
 
 #import <Foundation/Foundation.h>
 
@@ -379,7 +380,7 @@ void pleTest(MetalBackend &backend) {
   const auto knP = plus(kn), qnP = plus(qn), cnP = plus(cn);
   // The convolution input of a verify step's rows, which the commit reads.
   MetalBuffer gated = scratch(backend, rows * width * 4),
-              conv = scratch(backend, uint64_t{SPLASH_TARGET_VERIFY_ROWS} * width * 2);
+              conv = scratch(backend, uint64_t{splash::ops::kDecodeLaneRows} * width * 2);
   MetalBuffer streamsBuffer = upload(backend, x), histIn = upload(backend, bf16s(hist)),
               histOut = scratch(backend, history * width * 2);
   CommandGraph graph;
@@ -1105,9 +1106,9 @@ void streamMeanTest(MetalBackend &backend) {
 
 // The PLE hash on the GPU against the same hash on the CPU, as
 // model/Qwen4Steps.cpp's qwen4PleRows computes it, of three lanes of
-// SPLASH_TARGET_VERIFY_ROWS rows each.
+// splash::ops::kDecodeLaneRows rows each.
 void pleHashTest(MetalBackend &backend) {
-  const uint32_t lanes = 3, laneRows = SPLASH_TARGET_VERIFY_ROWS, ngram = 3, perNgram = 8, heads = 16, eos = 248044;
+  const uint32_t lanes = 3, laneRows = splash::ops::kDecodeLaneRows, ngram = 3, perNgram = 8, heads = 16, eos = 248044;
   NgramHashParams params{};
   params.ngram = ngram;
   params.heads_per_ngram = perNgram;
@@ -1350,21 +1351,21 @@ void pleExtentsTest(MetalBackend &backend) {
                                });
   splash::test::requireExtents(
       backend,
-      Extents{{0, uint64_t{SPLASH_TARGET_VERIFY_ROWS} * width * 2, 2, "n-gram embedding convolution input"},
+      Extents{{0, uint64_t{splash::ops::kDecodeLaneRows} * width * 2, 2, "n-gram embedding convolution input"},
               {1, history, 2, "n-gram embedding history"},
               {2, history, 2, "n-gram embedding next history"},
               {3, 4, 4, "n-gram embedding retained rows"}},
       [&](CommandGraph &graph, const Buffers &b) {
-        ops::NgramEmbedding::addCommit(graph, b[0], b[1], b[2], b[3], shape, SPLASH_TARGET_VERIFY_ROWS);
+        ops::NgramEmbedding::addCommit(graph, b[0], b[1], b[2], b[3], shape, splash::ops::kDecodeLaneRows);
       });
   NgramHashParams params{};
   params.ngram = 3;
   params.heads_per_ngram = 8;
   const uint32_t heads = 16;
-  const std::array<ops::LaneRows, 3> blocks{{{0, SPLASH_TARGET_VERIFY_ROWS},
-                                             {SPLASH_TARGET_VERIFY_ROWS, SPLASH_TARGET_VERIFY_ROWS},
-                                             {2 * SPLASH_TARGET_VERIFY_ROWS, 3}}};
-  const uint64_t hashRows = 2 * SPLASH_TARGET_VERIFY_ROWS + 3;
+  const std::array<ops::LaneRows, 3> blocks{{{0, splash::ops::kDecodeLaneRows},
+                                             {splash::ops::kDecodeLaneRows, splash::ops::kDecodeLaneRows},
+                                             {2 * splash::ops::kDecodeLaneRows, 3}}};
+  const uint64_t hashRows = 2 * splash::ops::kDecodeLaneRows + 3;
   splash::test::requireExtents(backend,
                                Extents{{0, hashRows * 4, 4, "n-gram hash token"},
                                        {1, hashRows * sizeof(ops::TreeRow), sizeof(ops::TreeRow),

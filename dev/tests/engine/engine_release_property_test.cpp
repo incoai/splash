@@ -478,7 +478,7 @@ public:
                chance(50) ? test::commandShape(4 * model::ExecutionLimits::prefillTokenBudget, 4, true)
                           : std::function<void(Executor &)>{}) {
     Spilling &spill = lanes_.spill;
-    spill.model.decodeTokens = model::ExecutionLimits::targetVerifyRows;
+    spill.model.decodeTokens = model::ExecutionLimits::decodeLaneRows;
     spill.host.governor.ledger().setDecisionLog([this](std::string_view line) {
       log_.emplace_back(line);
       if (verbose_)

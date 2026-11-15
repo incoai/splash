@@ -87,10 +87,11 @@ struct QwenLaneMetadata final {
   uint64_t requestId = 0;
   uint32_t activeParity = 0;
   QwenLogicalLengths lengths;
-  // The rows of the lane's last decode step it retained, which its current
-  // cell does not hold: they wait on the lane's tape for its next decode step
-  // (ops::GdnTapeLane). Zero after a prefill step or a restore.
-  uint32_t pendingRows = 0;
+  // The path of rows of the lane's last decode step it accepted, which its
+  // current cell does not hold: they wait on the lane's tape for its next
+  // decode step (ops::GdnTapeLane::pendingPath). Zero after a prefill step or
+  // a restore.
+  uint32_t pendingPath = 0;
 
   [[nodiscard]] bool assigned() const noexcept { return requestId != 0; }
 };
@@ -297,11 +298,12 @@ public:
   // Hot-path metadata operations; none performs a buffer copy. A step makes
   // next() current. swapParity: a prefill step's, which read the lane's
   // whole state (no pending rows) and holds its every row. swapDecodeParity:
-  // a decode step's, which folded the pending rows in and holds the state
-  // before its own rows, `retainedRows` (1 to 8) of which wait on the tape.
+  // a decode step's, which folded the pending path in and holds the state
+  // before its own rows, whose accepted `path` (a row mask of its block, its
+  // anchor's row first, metal/abi/VerifyTree.h) waits on the tape.
   void updateLengths(uint32_t lane, QwenLogicalLengths lengths);
   void swapParity(uint32_t lane);
-  void swapDecodeParity(uint32_t lane, uint32_t retainedRows);
+  void swapDecodeParity(uint32_t lane, uint32_t path);
 
   // Copies committed state into a pooled or newly admitted cache slot while
   // the lane retains its own cells; it throws for a lane with pending rows,

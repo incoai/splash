@@ -2,11 +2,13 @@
 
 #include "metal/abi/ExecutionGeometry.h"
 #include "metal/abi/GDN.h"
+#include "metal/abi/VerifyTree.h"
 #include "ops/BufferExtent.hpp"
 #include "ops/LaneBindings.hpp"
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <cstddef>
 #include <limits>
 #include <stdexcept>
@@ -24,6 +26,12 @@ uint32_t headFlags(GdnShape shape, GdnHeadOrder order) noexcept {
 }
 
 static_assert(offsetof(GDNDecodeBatchParams, conv_layer_bytes) == 8);
+
+// The rows of a lane's block and of its pending path the decode kernels hold
+// (kernels/decode/gdn.metal): those of the draft's chain, eight, and with
+// _r16 every row of a verify block.
+constexpr uint32_t kGdnDecodeChainRows = 8;
+static_assert(SPLASH_TARGET_VERIFY_ROWS == 16, "the _r16 kernels hold every row of a block");
 
 // The compiled GDN shapes (kernels/prefill/gdn.metal, kernels/decode/gdn.metal),
 // of either gate, and their kernels' name suffix. The scan reads no packed
@@ -196,8 +204,10 @@ void GDN::addPrefill(metal::CommandGraph &graph, const metal::MetalBackend &back
 PreparedInput GDN::addDecode(metal::CommandGraph &graph, GdnDecodeBuffers buffers,
                              GdnShape shape, uint32_t layer,
                              GdnStateStrides state, GdnHeadOrder order, LinearInput input) {
-  const uint32_t lanes = static_cast<uint32_t>(buffers.blocks.size());
-  if (!lanes || lanes > SPLASH_MAXIMUM_BATCH_WIDTH || !state.valid())
+  const uint32_t lanes = static_cast<uint32_t>(buffers.tapes.size());
+  // Each lane holds 1 to laneCap of the step's rows.
+  if (!lanes || lanes > SPLASH_MAXIMUM_BATCH_WIDTH || !state.valid() || !buffers.laneCap ||
+      buffers.laneCap > SPLASH_TARGET_VERIFY_ROWS || buffers.rows < lanes)
     throw std::invalid_argument("invalid GDN decode geometry");
   const CompiledGdn &kernel = compiledGdn(shape);
   GDNDecodeBatchParams params{headFlags(shape, order),
@@ -207,26 +217,14 @@ PreparedInput GDN::addDecode(metal::CommandGraph &graph, GdnDecodeBuffers buffer
                               state.convolutionStateBytes,
                               {},
                               {},
-                              {},
-                              {},
                               {}};
-  // A lane's rows of the packed and hidden rows are its block's, 1 to
-  // SPLASH_TARGET_VERIFY_ROWS of them (a simdgroup each), and the blocks
-  // ascend without overlapping: the step's rows end at the last block's.
-  uint32_t rows = 0;
-  for (uint32_t lane = 0; lane < lanes; ++lane) {
-    const GdnDecodeBlock &block = buffers.blocks[lane];
-    if (!block.rows || block.rows > SPLASH_TARGET_VERIFY_ROWS || block.first < rows ||
-        block.first > std::numeric_limits<uint32_t>::max() - block.rows)
-      throw std::invalid_argument("invalid GDN decode geometry");
-    params.first_row[lane] = block.first;
-    params.rows[lane] = block.rows;
-    rows = block.first + block.rows;
-  }
+  const uint32_t rows = buffers.rows;
   requireBytes(buffers.packed, packedBytes(shape, rows), "GDN packed");
   requireMixerWeights(shape, buffers.convolutionWeights, buffers.decayWeights, buffers.timeBias);
   requireBytes(buffers.hidden, uint64_t{rows} * valueWidth(shape) * 2, "GDN hidden");
   requireBytes(buffers.verifyRows, uint64_t{lanes} * sizeof(uint32_t), "GDN verify rows");
+  requireBytes(buffers.tree, uint64_t{rows} * sizeof(SplashTreeRow), "GDN tree rows");
+  requireBytes(buffers.laneRows, uint64_t{lanes} * sizeof(SplashLaneRows), "GDN lane rows");
   // Each lane reads its pending rows' tape of this layer and writes its
   // step's; no step's tape may overlap a tape another lane, or the step's own
   // lane, reads or writes.
@@ -237,15 +235,19 @@ PreparedInput GDN::addDecode(metal::CommandGraph &graph, GdnDecodeBuffers buffer
   const uint64_t layerOffset = uint64_t{layer} * tapeBytes;
   const uint64_t lastSlot = std::numeric_limits<uint64_t>::max() - layerOffset - tapeBytes;
   const auto overlaps = [&](uint64_t a, uint64_t b) { return a < b + tapeBytes && b < a + tapeBytes; };
+  // A kernel holds every row of a lane's block and of its pending path.
+  uint32_t most = buffers.laneCap;
   for (uint32_t lane = 0; lane < lanes; ++lane) {
-    const GdnTapeLane &tape = buffers.blocks[lane].tape;
+    const GdnTapeLane &tape = buffers.tapes[lane];
+    most = std::max(most, static_cast<uint32_t>(std::popcount(tape.pendingPath)));
     if (tape.pendingSlot > lastSlot || tape.stepSlot > lastSlot)
       throw std::invalid_argument("invalid GDN decode tape");
     params.pending_tape[lane] = tape.pendingSlot + layerOffset;
     params.step_tape[lane] = tape.stepSlot + layerOffset;
-    params.pending_rows[lane] = tape.pendingRows;
-    if (tape.pendingRows > SPLASH_TARGET_VERIFY_ROWS || params.pending_tape[lane] % 16 ||
-        params.step_tape[lane] % 16)
+    params.pending_path[lane] = tape.pendingPath;
+    // A pending path holds rows of a step, its anchor's first.
+    if ((tape.pendingPath && !(tape.pendingPath & 1)) || tape.pendingPath >> SPLASH_TARGET_VERIFY_ROWS ||
+        params.pending_tape[lane] % 16 || params.step_tape[lane] % 16)
       throw std::invalid_argument("invalid GDN decode tape");
     for (uint32_t other = 0; other <= lane; ++other)
       if (overlaps(params.step_tape[lane], params.pending_tape[other]) ||
@@ -259,16 +261,17 @@ PreparedInput GDN::addDecode(metal::CommandGraph &graph, GdnDecodeBuffers buffer
   const bool prepare = input != LinearInput::Plain;
   if (prepare)
     requireTableScratch(buffers.linearScratch, input, shape.valueHeads * shape.headDimension, rows);
-  bindings.reserve(prepare ? 18 : 16);
+  bindings.reserve(prepare ? 20 : 18);
   appendLaneBindings(bindings, buffers.currentStates, buffers.nextStates);
   requireStates(shape, state, layer, lanes, buffers.currentStates, buffers.nextStates);
   bindings.insert(bindings.end(),
                   {buffers.tape, buffers.decayWeights, buffers.timeBias, buffers.mixerNorm.buffer,
-                   buffers.hidden, buffers.verifyRows});
+                   buffers.hidden, buffers.verifyRows, buffers.tree, buffers.laneRows});
   if (prepare)
     bindings.insert(bindings.end(), {buffers.linearScratch.input, buffers.linearScratch.sums});
   const std::string name = std::string("verify_gdn_fused") + tableSuffix(input) + std::string(kernel.suffix);
-  graph.add(stateKernel(normKernel(name, buffers.mixerNorm, shape.headDimension), state.format),
+  graph.add(stateKernel(normKernel(name, buffers.mixerNorm, shape.headDimension), state.format) +
+                (most > kGdnDecodeChainRows ? "_r16" : ""),
             std::move(bindings), params, {shape.valueHeads, lanes, 1});
   if (!prepare) return {};
   return {buffers.hidden, input};

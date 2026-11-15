@@ -579,7 +579,7 @@ void testProtocolLimitsFollowTheModel() {
   capabilities.vocabularySize = 248320;
   const protocol::ProtocolLimits limits = protocolLimitsFor(capabilities, 4096);
   require(limits.maxMaskWords == 7760 * 9 && limits.maxSimulationTokens == 8 &&
-              limits.maxTokenBatch == 9 && limits.maxPromptTokens == 4096 &&
+              limits.maxTokenBatch == 17 && limits.maxPromptTokens == 4096 &&
               limits.maxLogicalOutputTokens == 4096,
           "the protocol limits do not follow the model and the served context");
 }

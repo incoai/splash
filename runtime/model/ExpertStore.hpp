@@ -34,8 +34,8 @@
 // a slot for each routed expert that is not resident (in the first round),
 // never one of an expert the same load routes, and reads the native rows of
 // some of them into places of the store's staging, then a repack
-// (moe_expert_load) of those places into their slots. A load of at most a
-// decode cycle's rows (a decode step's, or a prompt chunk's of so few rows)
+// (moe_expert_load) of those places into their slots. A load of at most 32
+// rows (a decode step's, or a prompt chunk's of so few rows)
 // is one round over every place; any other load stages half the places a
 // round, as many rounds as its rows may need, so that the other half is free
 // for the read-ahead below while the GPU repacks. A run of consecutive

@@ -130,16 +130,16 @@ uint64_t readPages(uint64_t visibleTokens, uint32_t windowTokens) {
 }
 
 // The history splits of each of a sequence's `tiles` query tiles, which read
-// `pages` pages. A sequence of one tile (a decode lane's) takes a split per
-// kTilePagesPerSplit pages, between kSharedSplits and
-// kAttentionMaximumSplits. A longer one takes a whole split per
-// pagesPerSplit pages (AttentionCalibration), at least kSharedSplits shared
-// out over its tiles (all a short history takes) and at most kSharedSplits,
-// nor over all its tiles more than kAttentionSequenceSplits: taking a tile's
-// splits ran a sequence of two to four tiles up to 9% slower (on an M6 at
-// 128K tokens). With a window, no more than the pages it reads (a split
-// each). It depends on the sequence alone, so batching never changes a
-// sequence's partition.
+// `pages` pages. A sequence of one tile (a decode lane's of up to 8 rows)
+// takes a split per kTilePagesPerSplit pages, between kSharedSplits and
+// kAttentionMaximumSplits. A longer one, a lane's of 9 to 16 rows too, takes
+// a whole split per pagesPerSplit pages (AttentionCalibration), at least
+// kSharedSplits shared out over its tiles (all a short history takes) and at
+// most kSharedSplits, nor over all its tiles more than
+// kAttentionSequenceSplits: taking a tile's splits ran a sequence of two to
+// four tiles up to 9% slower (on an M6 at 128K tokens). With a window, no
+// more than the pages it reads (a split each). It depends on the sequence
+// alone, so batching never changes a sequence's partition.
 constexpr uint32_t kSharedSplits = 32;
 constexpr uint32_t kTilePagesPerSplit = 16;
 uint32_t attentionSplits(uint32_t tiles, uint64_t pages, uint32_t windowTokens, uint32_t pagesPerSplit) {

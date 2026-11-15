@@ -464,6 +464,23 @@ commit takes the retained path's rows in order (the mask acceptance writes,
 and a lane's draft RoPE rows hold its verify block's positions, the first eight
 of which the draft's rows take and the context commit one a retained row.
 
+A lane's verify block holds up to 16 rows (`SPLASH_TARGET_VERIFY_ROWS`): its
+anchor and the rows proposed after it, a chain or a tree, each row's place in
+it (its ancestors, parent and depth, `metal/abi/VerifyTree.h`) one entry per
+packed row; a decode cycle gives every lane the chain of its draft's eight
+(`ExecutionLimits::decodeLaneRows`) until a cycle chooses each lane's rows. The
+GDN decode (`verify_gdn_fused`) reads each lane's block from the device
+(`SplashLaneRows`) and its rows' tree. A chain's rows run the sequential
+delta-rule scan; a tree's rows each read the state before the block along
+their own path, the row's query carried up the path to the anchor (output =
+S z + the sum of each path row's value times its coefficient), with no state
+per row, and every row's convolution reads its path's tokens. Every row goes
+to the lane's tape, and the lane's next step folds the path it accepted, a
+row mask, into the state. Its kernels hold eight rows of a lane's block and of
+its pending path, or sixteen (`_r16`) for a step whose lanes may hold more
+(`ops::verifyLaneCap`): over a layer's 8-row chains the 16-row kernels took
+13-19% longer (DRAM-cold, an M6), for their threadgroup memory.
+
 ### Kernel selection
 
 Three pieces choose every kernel configuration, and nothing else in the

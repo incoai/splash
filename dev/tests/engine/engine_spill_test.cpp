@@ -538,7 +538,7 @@ void testALongLaneConvertsItselfBesideAnother() {
   // A command in which the long lane needs a page and the short lane none.
   const auto needsPage = [&](uint64_t id, uint32_t promptPages) {
     const uint64_t tokens = promptPages * KvCache::pageTokens + 1 + spill.events.outputs[id].size() +
-                            model::ExecutionLimits::targetVerifyRows;
+                            model::ExecutionLimits::decodeLaneRows;
     return tokens > uint64_t{spill.cache.pageTable(id).pages.size()} * KvCache::pageTokens;
   };
   spill.runUntil(
@@ -577,7 +577,7 @@ void testASharedPrefixCountsForNoConversion() {
     spill.engine.submit(std::move(longLane));
     const auto needsPage = [&](uint64_t id, uint32_t promptPages) {
       const uint64_t tokens = promptPages * KvCache::pageTokens + 1 + spill.events.outputs[id].size() +
-                              model::ExecutionLimits::targetVerifyRows;
+                              model::ExecutionLimits::decodeLaneRows;
       return tokens > uint64_t{spill.cache.pageTable(id).pages.size()} * KvCache::pageTokens;
     };
     spill.runUntil(
@@ -677,7 +677,7 @@ void testALanesGrowthConvertsNoOtherLane() {
   // A command in which the short lane needs a page and the long lane none.
   const auto needsPage = [&](uint64_t id, uint32_t promptPages) {
     const uint64_t tokens = promptPages * KvCache::pageTokens + 1 + spill.events.outputs[id].size() +
-                            model::ExecutionLimits::targetVerifyRows;
+                            model::ExecutionLimits::decodeLaneRows;
     return tokens > uint64_t{spill.cache.pageTable(id).pages.size()} * KvCache::pageTokens;
   };
   spill.runUntil(
@@ -3780,7 +3780,7 @@ void testNoReleaseOfAPageALaneBetweenItsPassesHolds() {
   // Lane 2's prompt is lane 1's and 2,048 pages more: it holds lane 1's pages and prefills the rest in passes. Lane 1
   // then decodes eight tokens a step, its verify rows', so its growth meets the wall within four steps.
   lanes.startSpill(Spilling::prompt(2, 1, 4'094, 8));
-  spill.model.decodeTokens = model::ExecutionLimits::targetVerifyRows;
+  spill.model.decodeTokens = model::ExecutionLimits::decodeLaneRows;
   spill.runUntil([&] { return between() && !spill.engine.commandInFlight(); },
                  "lane 2's prompt did not come between a command's passes");
   require(!spill.cache.holdsIndexPages(1) && !spill.cache.holdsIndexPages(2),

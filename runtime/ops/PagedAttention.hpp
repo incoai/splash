@@ -245,7 +245,8 @@ public:
 
   // The workspace of `slots` tile splits of a geometry's tiles. The runtime
   // owns allocation: a prompt chunk's takes kAttentionSequenceSplits, a decode
-  // lane's kAttentionMaximumSplits (its one tile at the most splits).
+  // lane's kAttentionMaximumSplits (its one tile at the most splits, or each
+  // of its two, past 8 rows, at most 32).
   [[nodiscard]] static AttentionWorkspace workspace(uint32_t slots, uint32_t queryHeads, kv::Layout layout);
   // Whether the compiled geometry of `queryHeads` over a layout's KV heads
   // (kCompiledAttention) computes attention as a target's layout states it:

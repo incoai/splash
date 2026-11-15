@@ -103,26 +103,20 @@ struct GdnPrefillCapture final {
 
 // A lane's decode tape (metal/abi/GDN.h): each step leaves its rows'
 // convolution inputs, k, v and gates there, and the lane's next step folds
-// the rows it retained into the state before its own, so the state cell a
-// step writes holds the state before the step's rows. A slot holds one step
-// of every layer, gdnTapeLayerBytes(shape) apart; the offsets are in
-// GdnDecodeBuffers::tape.
+// the path of rows it accepted into the state before its own, so the state
+// cell a step writes holds the state before the step's rows. A slot holds
+// one step of every layer, gdnTapeLayerBytes(shape) apart; the offsets are
+// in GdnDecodeBuffers::tape.
 struct GdnTapeLane final {
   uint64_t pendingSlot = 0; // the lane's previous step's
   uint64_t stepSlot = 0;    // this step's
-  // The previous step's rows the lane retained, which the state does not
-  // hold yet: 0 after a prefill or a restore.
-  uint32_t pendingRows = 0;
+  // The path of the previous step's rows the lane accepted, which the state
+  // does not hold yet: a row mask (metal/abi/VerifyTree.h, its anchor's bit
+  // and the bits of its rows below it), 0 after a prefill or a restore.
+  uint32_t pendingPath = 0;
 };
 
 [[nodiscard]] uint64_t gdnTapeLayerBytes(const GdnShape &shape) noexcept;
-
-// A lane's block of a decode step's rows (its LaneRows: `rows` rows, 1 to
-// SPLASH_TARGET_VERIFY_ROWS, from row `first` of the step's packed, hidden
-// and table rows on), and the lane's tape, whose first rows they are.
-struct GdnDecodeBlock final : LaneRows {
-  GdnTapeLane tape;
-};
 
 struct GdnDecodeBuffers final {
   metal::MetalBuffer packed;
@@ -130,8 +124,15 @@ struct GdnDecodeBuffers final {
   std::span<const metal::MetalBuffer> currentStates;
   std::span<const metal::MetalBuffer> nextStates;
   metal::MetalBuffer tape;
-  // Each lane's block, ascending in the step's rows, which do not overlap.
-  std::span<const GdnDecodeBlock> blocks;
+  // Each lane's tape, whose first rows its block's rows are.
+  std::span<const GdnTapeLane> tapes;
+  // Each lane's block of the step's `rows` rows (SplashLaneRows: its first
+  // row and rows, ascending, not overlapping), which the step's proposer
+  // writes on the device: its rows of the packed, hidden, table and tree
+  // rows, 1 to `laneCap` of them (verifyLaneCap).
+  metal::MetalBuffer laneRows;
+  uint32_t rows = 0;
+  uint32_t laneCap = 0;
   metal::MetalBuffer decayWeights;
   metal::MetalBuffer timeBias;
   NormWeights mixerNorm;
@@ -139,6 +140,11 @@ struct GdnDecodeBuffers final {
   // Each lane's verify rows (ops::DraftSelector::addVerifyRows): its block's
   // rows past them get zero recurrent output.
   metal::MetalBuffer verifyRows;
+  // The step's rows' places in their blocks' trees (SplashTreeRow, a row of
+  // the step's rows each): a chain's rows run the sequential recurrence,
+  // another tree's rows each read the state before the block along their
+  // own path, and every row's convolution reads its path's tokens.
+  metal::MetalBuffer tree;
   LinearScratch linearScratch{};
 };
 
@@ -166,9 +172,9 @@ public:
                          GdnPrefillBuffers buffers, GdnShape shape, uint32_t tokens,
                          GdnStateFormat state, GdnHeadOrder order,
                          std::span<const GdnPrefillCapture> captures = {});
-  // The step of buffers.blocks' lanes, 1 to SPLASH_MAXIMUM_BATCH_WIDTH.
+  // The step of buffers.tapes' lanes, 1 to SPLASH_MAXIMUM_BATCH_WIDTH.
   // Also writes the out-projection's `input` table into
-  // buffers.linearScratch when it is not Plain, the table rows of the blocks'
+  // buffers.linearScratch when it is not Plain, the table rows of the step's
   // rows, and throws when the scratch cannot hold it.
   static PreparedInput addDecode(metal::CommandGraph &graph, GdnDecodeBuffers buffers,
                                  GdnShape shape, uint32_t layer,
