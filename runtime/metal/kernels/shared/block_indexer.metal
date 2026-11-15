@@ -409,6 +409,7 @@ kernel void block_indexer_score(device const bfloat *queries [[buffer(0)]],
 // complete before the lane's anchor from the index. A tile none of whose
 // rows can attend sparsely (its last row's position bounds theirs) scores
 // nothing.
+static_assert(SPLASH_TARGET_VERIFY_ROWS <= kScoreBlocks, "the last tile holds a key for each of a lane's rows");
 kernel void block_indexer_score_tree(device const bfloat *queries [[buffer(0)]],
                                      device const bfloat *block_keys [[buffer(1)]],
                                      device const SplashTreeRow *tree [[buffer(2)]],

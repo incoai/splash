@@ -2570,7 +2570,6 @@ struct Runtime::Impl {
       throw std::invalid_argument("invalid target state commit batch");
     const uint32_t width = static_cast<uint32_t>(lanes.size());
     QwenTargetCommitBuffers buffers;
-    buffers.retainedCounts = decodeArena->batchSlice(DecodeTensor::RetainedCount, width);
     buffers.retainedRows = decodeArena->batchSlice(DecodeTensor::RetainedRows, width);
     buffers.laneRows = decodeArena->batchSlice(DecodeTensor::LaneLayout, width);
     buffers.indexLayerBytes = kvPages.indexLayerBytes();

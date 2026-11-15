@@ -570,8 +570,10 @@ enum class DecodeTensor : uint32_t {
   // which a block-sparse attention selects through (ops::BlockIndex).
   IndexTable,
   // For a target whose K/V spills: where each entry of a verify's block
-  // lists reads its block (ops::AttentionBlocks::locations), a lane's list
-  // in its row of the batch.
+  // lists reads its block (ops::AttentionBlocks::locations), laid out as the
+  // lists are, a list's stride apart from the batch's first row: a lane's
+  // row holds two 8-row tiles' lists (SparseKvShape::verifyRows), and a
+  // lane's list of an 8-row block, list l, sits in row l / 2.
   Locations,
   // Indexed by state lane, like PageTable: a penalized request's penalty
   // words (ops::Sampling::rebuildPenaltyWords).

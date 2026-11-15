@@ -66,10 +66,16 @@ uint32_t prefillScoreRows(const QwenTargetGeometry &g) {
 }
 
 // The attention's tiles of rows, whose block masks become a block list each
-// (ops::PagedAttention::addBlockLists). A row attends to at most its top
-// blocks and the block of its tail, so a tile's list holds at most this many
-// entries.
+// (ops::PagedAttention::addBlockLists). A prompt row attends at most its top
+// blocks and the block of its tail; a verify row its top blocks before its
+// lane's anchor's block and, from it on, blocks of its lane's K/V slots,
+// which a verify block's rows span (kSlotBlocks, five at 16 rows): no more of
+// those than a tile has rows, so a tile's list holds at most this many
+// entries, though a tree row alone may list more than its top blocks and one
+// (512 and three slot blocks at depth 4 on Qwen3.8-Flash-Next).
 constexpr uint32_t kTileRows = SPLASH_ATTENTION_TILE_ROWS;
+constexpr uint32_t kSlotBlocks = (SPLASH_TARGET_VERIFY_ROWS + 2 * BLOCK_INDEXER_BLOCK - 2) / BLOCK_INDEXER_BLOCK;
+static_assert(kSlotBlocks <= kTileRows, "a tile's list holds its lane's slot blocks beside its rows' top blocks");
 uint32_t listStride(const QwenTargetGeometry &g) { return kTileRows * (g.indexerTopBlocks + 1); }
 
 // The tokens before a lane's verify rows that its rows' n-grams reach.

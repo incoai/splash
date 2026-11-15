@@ -345,7 +345,6 @@ struct QwenVerifyInput final {
 // For a layout with a block index, each lane's index table and a layer's
 // bytes of the index plane (kv::PageStorage::indexLayerBytes).
 struct QwenTargetCommitBuffers final {
-  metal::MetalBuffer retainedCounts;
   // Each lane's accepted path, a row mask of its block (metal/abi/
   // VerifyTree.h), as acceptance wrote it, and its rows of the step as the
   // device holds them (SplashLaneRows).

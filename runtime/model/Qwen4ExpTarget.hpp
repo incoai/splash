@@ -43,8 +43,10 @@ public:
   // host step of the command stages them, between the hash and the verify
   // that gathers them.
   void addVerifyInput(metal::CommandGraph &graph, const QwenVerifyInput &input) const override;
-  // Each lane's PLE history and QSA pending keys after its retained rows,
-  // from the convolution inputs and keys its verify wrote of its block.
+  // Each lane's PLE history and QSA pending keys after its accepted path, and
+  // in every attention layer the blocks the path completes into the lane's
+  // QSA index, from the convolution inputs, raw keys and block keys its
+  // verify wrote of its block.
   void addStateCommit(metal::CommandGraph &graph, QwenTargetCommitBuffers buffers,
                       const ops::StepRows &step) const override;
 
@@ -89,8 +91,10 @@ private:
   ops::PreparedInput addMix(PrefillStep &step, const Qwen4HyperWeights &hyper, metal::MetalBuffer output,
                             const ops::Projection *next = nullptr) const;
   // The QSA of the attention layer the step reaches next: the indexer's
-  // projections of the step's rows and the QSA keys and block index of each
-  // sequence or lane (writing its rows' and its completed blocks' entries);
+  // projections of the step's rows; a prompt sequence's blocks its rows
+  // complete into its index and its pending keys after them, or a verify
+  // lane's block key of each block a row's path completes, which the commit
+  // writes into the index once the lane accepts that path (addStateCommit);
   // a sequence or lane whose rows attend more blocks than they keep then
   // selects theirs, and returns the block lists its attention attends
   // through (none for rows that keep every block).

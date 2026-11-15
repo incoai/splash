@@ -126,7 +126,8 @@ public:
   // rows of the step, QwenTarget::decodeStorageLanes).
   [[nodiscard]] Qwen4Scratch verifyScratch(uint32_t rows) const;
   // Writes batch lane `lane`'s inputs of its verify rows from `position` on:
-  // the tokens before them and the QSA blocks they complete.
+  // the tokens before them and the records of the QSA blocks a path of a
+  // verify block's most rows from it may complete.
   void prepareVerifyLane(uint32_t lane, uint64_t position, const QwenTargetRequest &request);
   // The blocks prepareVerifyLane wrote for each lane of a step, whose rows
   // start at positions[lane].

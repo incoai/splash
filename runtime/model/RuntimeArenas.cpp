@@ -267,8 +267,11 @@ decodeTensorBytes(const RuntimeGeometry &geometry,
   put(DecodeTensor::PageTable, bytesFor<SplashKvPage>(kMaximumPageTableEntries));
   if (geometry.target.kvLayout.indexDimension)
     put(DecodeTensor::IndexTable, bytesFor<SplashKvPage>(kMaximumPageTableEntries));
-  // A verify lane's list holds each row's selected blocks and the block of
-  // the row's own tail.
+  // A verify lane's list of a tile of its rows holds each row's selected
+  // blocks before the anchor's block and, from it on, the blocks of the K/V
+  // slots of the path rows it attends, no more of those than the tile has
+  // rows: at most selectedBlocks + 1 entries a row of the tile
+  // (Qwen4Steps.cpp, listStride), though a tree row alone may hold more.
   if (const auto &shape = geometry.spilledKv)
     put(DecodeTensor::Locations, bytesFor<uint32_t>(uint64_t{shape->verifyRows} * (shape->selectedBlocks + 1)));
   put(DecodeTensor::PenaltyState,
