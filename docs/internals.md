@@ -2025,9 +2025,10 @@ restarting while the long request works (below).
 `/status` shows it: `admission.held_behind_refusal` counts the wanted starts
 held back untried (above), `memory_governor.growth_allowed` and
 `host_headroom_bytes` show whether
-and how far the host lets the engine grow, and `state.idle_gdn_cells`,
+and how far the host lets the engine grow, `state.idle_gdn_cells`,
 `idle_draft_rings` and `idle_context_windows` count the pooled lane buffers a
-start can take. A request's `timeout`, or `--request-timeout`, bounds the wait.
+start can take, and `idle_cached_cells` the pooled cells a captured state
+takes. A request's `timeout`, or `--request-timeout`, bounds the wait.
 
 After a suspension, suspended requests resume before new work of their priority
 or below, one at a time, higher priority first and then in the order they
@@ -2241,7 +2242,7 @@ decode (`Model::capturesInDecode`), and its decode writes the rings alone. A
 target without GDN layers keeps no GDN state: its cells have no bytes, every
 lane and state shares one empty cell that holds no memory, so a lane holds the
 draft's rings and window and a cached state the window alone, and
-`state.idle_gdn_cells` stays 0.
+`state.idle_gdn_cells` and `idle_cached_cells` stay 0.
 
 ### Prefill and decode scheduling
 

@@ -3832,6 +3832,7 @@ ModelTelemetry Runtime::telemetry() const noexcept {
   ModelTelemetry result = impl_->counters;
   result.stateAllocatedBytes = impl_->states.actualAllocatedBytes();
   result.idleGdnCells = impl_->states.idleCells();
+  result.idleCachedCells = impl_->states.idleCachedCells();
   result.idleDraftRings = impl_->states.idleRings();
   result.idleContextWindows = impl_->states.idleWindows();
   result.visionArenaBytes = impl_->vision ? impl_->vision->arenaBytes() : 0;

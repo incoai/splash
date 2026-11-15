@@ -717,9 +717,10 @@ struct ModelMemoryActual final {
 
 struct ModelTelemetry final {
   uint64_t stateAllocatedBytes = 0;
-  // Pooled state buffers no lane holds: GDN parity cells, draft rings and
-  // context windows.
+  // Pooled state buffers no lane holds: GDN parity cells, the cached cells
+  // states take, draft rings and context windows.
   uint32_t idleGdnCells = 0;
+  uint32_t idleCachedCells = 0;
   uint32_t idleDraftRings = 0;
   uint32_t idleContextWindows = 0;
   uint64_t targetPrefillRows = 0;

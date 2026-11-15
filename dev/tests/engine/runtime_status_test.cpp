@@ -315,6 +315,7 @@ StatusInputs representativeStatus() {
   model::ModelTelemetry executorTelemetry;
   executorTelemetry.stateAllocatedBytes = 350'224'384;
   executorTelemetry.idleGdnCells = 1;
+  executorTelemetry.idleCachedCells = 4;
   executorTelemetry.idleDraftRings = 2;
   executorTelemetry.idleContextWindows = 3;
   executorTelemetry.targetPrefillRows = 10000;
