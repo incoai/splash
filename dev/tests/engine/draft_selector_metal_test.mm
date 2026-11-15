@@ -1463,6 +1463,12 @@ void stepVocabulary() {
           "a lane whose window lies in the subset drafted over the whole vocabulary");
   require(step(subset, {&oldest}, {7}) == whole && step(subset, {&inside}, {600}) == whole,
           "a lane whose window holds a token outside the subset drafted over it");
+  // The subset's edges: its last leading token and its first trailing one lie
+  // in it, the tokens next to them between its parts do not.
+  require(step(subset, {&inside}, {511}) == subset && step(subset, {&inside}, {960}) == subset,
+          "a lane whose anchor is an edge token of the subset drafted over the whole vocabulary");
+  require(step(subset, {&inside}, {512}) == whole && step(subset, {&inside}, {959}) == whole,
+          "a lane whose anchor lies next to the subset's edge drafted over the subset");
   require(step(subset, {&inside, &oldest}, {7, 7}) == whole,
           "a step drafted over the subset while one of its lanes' windows leaves it");
   const std::vector<uint32_t> none;
