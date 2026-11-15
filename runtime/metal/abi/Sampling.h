@@ -76,22 +76,26 @@ static_assert(sizeof(TargetShardMass) == 12,
               "Target shard masses are 12 bytes on both sides");
 
 // A sampled row's selection over the whole vocabulary. The search records
-// the row's largest admitted logit and where its min-p/top-k/top-p
+// the row's largest admitted logit, where its min-p/top-k/top-p
 // distribution ends in the order of the logits (the key and id of its last
-// token, metal/kernels/decode/sampling.metal). The draw writes a drafted
-// row's target probability of its draft token; the token it draws goes to
-// the output tokens: for a verify row with a draft token, the correction
-// acceptance takes if it rejects that token (a draw from the residual
-// distribution); otherwise a draw from the row's distribution.
+// token, metal/kernels/decode/sampling.metal) and the kept mass, the sum of
+// the softmax weights of the tokens it keeps, which the relaxed
+// verification reads the kept tokens' probabilities with. The draw writes a
+// drafted row's target probability of its draft token (under RFlash, the
+// relaxed row's); the token it draws goes to the output tokens: for a verify
+// row with a draft token, the correction acceptance takes if it rejects that
+// token (a draw from the residual distribution); otherwise a draw from the
+// row's distribution.
 struct TargetVocabularyRow {
   float maximum;
   uint32_t end_key;
   uint32_t end_last;
   float draft_probability;
+  float kept_mass;
 };
 
-static_assert(sizeof(TargetVocabularyRow) == 16,
-              "Target vocabulary rows are 16 bytes on both sides");
+static_assert(sizeof(TargetVocabularyRow) == 20,
+              "Target vocabulary rows are 20 bytes on both sides");
 
 // One range of the vocabulary in such a row's draw, which one simdgroup of
 // the row's groups sums: the kept weight of its tokens other than the
@@ -215,3 +219,58 @@ struct AcceptBatchParams {
 
 static_assert(sizeof(AcceptBatchParams) == 36,
               "Batched acceptance parameters are 36 bytes on both sides");
+
+// RFlash (relaxed speculative decoding with a drift constraint): one
+// relaxation per verify of a sampled lane, between the search and the draw
+// of its rows (decode_relax_dflash). For every drafted row the solver reads
+// the target probabilities of the draft's candidates, as the draw would
+// (the kept weight over the kept mass of TargetVocabularyRow), and the
+// candidates' draft probabilities, and replaces the row by the relaxed
+// target that solves the lane's block program:
+//
+//   max   sum_j w_j a_j(p_hat_j) - lambda sum_j w_j KL(p_hat_j || p_j)
+//   s.t.  sum_j w_j [ <p_hat_j / p_j - 1, z_j>_{p_j} - alpha KL(p_hat_j || p_j) ] <= 0,
+//
+// a_j the acceptance probability at row j, w_j the probability of reaching
+// it, z_j = log((1 - eps) q_j + eps p_j) / p_j) the direction of drift
+// toward the draft. The rows of a lane are the drafted rows it verifies
+// (its verify rows less the anchor) before its thinking cutoff, whose rows
+// take the end of thinking whatever their distributions; every other token
+// of a row shares one ratio to the target, which the draw scales the rest
+// of the row by. The solution is written per candidate
+// (relaxed_probabilities, one per candidate slot of the position, as draft
+// probabilities are) and per row (relaxed_rest, the rest ratio, above 0); a
+// row left untouched, a greedy lane's, one past the lane's rows or one
+// whose search kept no finite mass, has rest 0. Status per lane: 0 the
+// constraint is slack at price 0, 1 a binding price was found, 2 no price up
+// to mu_max satisfies the constraint and the cap's solution is used with its
+// constraint residual accepted, 3 the lane does not sample.
+#define SPLASH_RELAX_STATUS_SLACK 0u
+#define SPLASH_RELAX_STATUS_BOUND 1u
+#define SPLASH_RELAX_STATUS_CAPPED 2u
+#define SPLASH_RELAX_STATUS_NONE 3u
+
+struct RelaxParams {
+  // The verify's selection: its rows, drafted rows and policies.
+  struct TargetSamplingParams selection;
+  // The price of divergence, > 0, and the drift allowance, >= 0.
+  float lambda;
+  float alpha;
+  // The draft's smoothing in z, and the rest mass at or below which a row's
+  // rest is left untouched (ratio 1).
+  float eps;
+  float tail_floor;
+  // The upper end of the price search (the lesser of 0.99 lambda / alpha
+  // and 16 lambda) and the first probe as a fraction of it.
+  float mu_max;
+  float probe0;
+  // Reach-weight passes and secant iterations per pass.
+  uint32_t passes;
+  uint32_t iterations;
+  // Each lane's thinking cutoff row (ThinkingCutoffParams::row): the rows
+  // its block stops before, the selection's rows where it has none.
+  uint32_t cutoff_row[SPLASH_MAXIMUM_BATCH_WIDTH];
+};
+
+static_assert(sizeof(RelaxParams) == 152 + 4 * SPLASH_MAXIMUM_BATCH_WIDTH,
+              "Relaxation parameters are 152 bytes and a row per lane on both sides");

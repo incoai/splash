@@ -45,6 +45,10 @@
 // Candidates the draft selector keeps per proposal position; acceptance and
 // the sampled draw read them.
 #define SPLASH_DRAFT_CANDIDATES 16u
+// Threads of the group that relaxes a sampled lane's drafted rows
+// (decode_relax_dflash): one simdgroup per proposal position, whose lanes
+// hold the position's candidates twice over.
+#define SPLASH_RELAX_THREADS (SPLASH_DRAFT_PROPOSAL_TOKENS * 32u)
 // The rank of the draft selector's codebooks.
 #define SPLASH_DRAFT_SELECTOR_RANK 256u
 // Rows of one value head's recurrent state a prefill GDN scan threadgroup

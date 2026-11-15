@@ -383,7 +383,9 @@ machine's timing and on what the server served before, and a MoE row's result
 depends on which rows share its expert tiles ([Kernels](internals.md#kernels)): under the
 budget the same greedy (temperature 0) or seeded request can give different text
 from run to run, even alone on an idle server ([Sampling](api.md#sampling)); sampled
-outputs keep their exact distribution. With every row verified (a dense target,
+outputs keep their exact distribution under lossless verification, while a
+block's relaxed target ([relaxed verification](#relaxed-verification)) is over
+the rows its cycle verifies and so varies with them. With every row verified (a dense target,
 or `--verify-rows all`), the rows a cycle verifies follow its lanes' output
 budgets alone. The speculation counts ([Output limits and
 streaming](api.md#output-limits-and-streaming)) count the proposals a cycle verified.
@@ -400,6 +402,53 @@ one for the rest, and `GgufPreparation` quantizes each projection into af4g64
 planes, 4 bits in groups of 64 as MLX's affine quantization rounds them, and
 copies every other tensor as stored. The draft runs on the block kernels its
 target's projections run on.
+
+## Relaxed verification
+
+`--rflash-lambda` and `--rflash-alpha` turn on RFlash, relaxed speculative
+decoding with a drift constraint, for sampled requests. Lossless
+verification accepts a drafted token `x` with probability `min(1, p(x) /
+q(x))` against the target's distribution `p`. Relaxed rules accept more by
+verifying against a modified target instead, which raises the acceptance
+length, but a rule that bounds only how far the modified target may move
+leans every row toward the draft, and over a long generation the output
+drifts into the draft's own habits and gets longer, so the gain in
+acceptance is lost. RFlash caps that drift: for every verify of a sampled
+lane, one program over the block's drafted rows chooses the relaxed target
+that maximizes the expected accepted length less `λ` times the KL divergence
+it spends, subject to the block's drift toward the draft being at most `α`
+times that divergence (`α` 0 allows none). The program weights each row by
+the probability of reaching it averaged over the draft's proposals, so the
+constraint holds for a block in that average and not along each sampled
+draft; for a single row it is exact. Recommended
+settings are `λ` 1.5 with `α` 0.5 for Qwen3.8-27B and `λ` 1.5 with `α` 2 for
+Qwen3.6-35B-A3B.
+
+The relaxation is one more step of a verify (`ops::Sampling`,
+`decode_relax_dflash` in `metal/kernels/decode/sampling.metal`), between the
+search that ends each row's min-p/top-k/top-p distribution and the draw. One
+group per lane reads, for each drafted row it verifies (its verify rows less
+the anchor, so under the verify budget only the rows the target computed),
+the kept probabilities of the draft's sixteen candidates and their draft
+probabilities, solves the block program in closed form per row with a secant
+search for the block's drift price, and writes the relaxed probability of
+each candidate and the ratio every other token of the row is scaled by. The
+draw and acceptance then run unchanged against the relaxed rows: the draft
+token's probability, the residual a rejection corrects from and the
+acceptance test are the relaxed row's; the bonus row after a fully accepted
+block, greedy lanes, the rows past a lane's verify rows, the rows from a
+lane's thinking cutoff on (which take the end of thinking whatever their
+distributions) and a row that keeps no finite mass keep lossless
+verification; a lane whose constraint no price up to the search's cap (the
+lesser of `0.99 λ / α` and `16 λ`) satisfies keeps the cap's solution and
+its constraint residual is accepted.
+The kernel is checked against a double-precision reference solver
+(`dev/tests/engine/RFlashReference.hpp`, `rflash_metal_test.mm`), which the
+Triton kernel RFlash uses in vLLM and SGLang (the algorithm this kernel
+ports) matches on rows of the test's shape and on 99.5% of real Qwen3.8-27B
+verify blocks; the rest sit at the price search's cap or hold several roots,
+where a secant search and a bisection legitimately stop at different
+feasible prices. `/status` reports the setting as `rflash`.
 
 ## Vision
 

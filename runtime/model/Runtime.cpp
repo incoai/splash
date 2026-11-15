@@ -593,11 +593,12 @@ struct Runtime::Impl {
         model(value.model),
         geometry(RuntimeGeometry::from(value.model, value.kvPages.layout().format,
                                        value.stateStorage.layout().target.format,
-                                       StreamedParts::loaded(value.model, value.blockCache != nullptr))),
+                                       StreamedParts::loaded(value.model, value.blockCache != nullptr),
+                                       value.relaxation.has_value())),
         operators(value.operators),
         kvPages(value.kvPages),
         states(value.stateStorage),
-        sampling(geometry.target.vocabularySize),
+        sampling(geometry.target.vocabularySize, value.relaxation),
         targetModel(std::visit(
                         [&](const auto &weights) {
                           return makeQwenTarget(weights, geometry.target, value.backend, operators,
@@ -1298,7 +1299,11 @@ struct Runtime::Impl {
             d(DecodeTensor::Candidates),
             d(DecodeTensor::ProposalProbs),
             d(DecodeTensor::TargetVocabularyRanges),
-            d(DecodeTensor::TargetVocabularyArrivals)};
+            d(DecodeTensor::TargetVocabularyArrivals),
+            d(DecodeTensor::VerifyRows),
+            d(DecodeTensor::RelaxedProbabilities),
+            d(DecodeTensor::RelaxedRest),
+            d(DecodeTensor::RelaxedStatus)};
   }
 
   std::span<uint32_t> penaltyWords(uint32_t stateLane) const {
@@ -3741,6 +3746,7 @@ ModelTelemetry Runtime::telemetry() const noexcept {
   result.visionArenaBytes = impl_->vision ? impl_->vision->arenaBytes() : 0;
   result.embeddingCacheBytes = impl_->embeddingCacheBytes;
   result.verifyBudget = impl_->verifyBudget.has_value();
+  result.relaxation = impl_->sampling.relaxation();
   result.stateHeldImageBytes = impl_->heldRowsBytes(false);
   for (const auto &[_, held] : impl_->imageRows) {
     if (const std::shared_ptr<const Impl::ImageRows> rows = held.lock())
@@ -3776,9 +3782,10 @@ void withPrefillArena(
 ModelMemoryPlan plannedRuntimeMemory(const LoadedModel &model,
                                      const ops::ExecutionPlans &operators,
                                      kv::Format kvFormat,
-                                     ops::GdnStateFormat stateFormat, StreamedParts parts) {
+                                     ops::GdnStateFormat stateFormat, StreamedParts parts,
+                                     bool relaxedVerify) {
   requireCompatibleModel(model);
-  const RuntimeGeometry geometry = RuntimeGeometry::from(model, kvFormat, stateFormat, parts);
+  const RuntimeGeometry geometry = RuntimeGeometry::from(model, kvFormat, stateFormat, parts, relaxedVerify);
   return {model.stateLayout(stateFormat).laneBytes(),
           plannedPrefillBytes(geometry, operators),
           plannedDecodeBytes(geometry, operators)};

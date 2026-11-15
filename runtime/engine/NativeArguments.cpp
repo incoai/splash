@@ -119,6 +119,9 @@ NativeArguments parseNativeArguments(int argc, const char *const *argv) {
   NativeArguments result;
   // Read once the model's own context is known.
   std::optional<std::string_view> relaunchContext;
+  // Checked together once both are read.
+  std::optional<double> relaxationLambda;
+  std::optional<double> relaxationAlpha;
   int next = 5;
   if (next < argc && !std::string_view(argv[next]).starts_with("--")) {
     const std::string_view quota(argv[next++]);
@@ -189,12 +192,28 @@ NativeArguments parseNativeArguments(int argc, const char *const *argv) {
       if (value != "auto" && value != "all")
         throw UsageError("--verify-rows requires auto or all");
       result.verifyRows = value == "all" ? model::VerifyRows::All : model::VerifyRows::Auto;
+    } else if (option == "--rflash-lambda") {
+      double lambda = 0.0;
+      if (!parseFinite(value, lambda) || !ops::RelaxationSetting::holds(lambda, true))
+        throw UsageError("--rflash-lambda requires a positive number (1e-6 to 1e6)");
+      relaxationLambda = lambda;
+    } else if (option == "--rflash-alpha") {
+      double alpha = 0.0;
+      if (!parseFinite(value, alpha) || !ops::RelaxationSetting::holds(alpha, false))
+        throw UsageError("--rflash-alpha requires a nonnegative number (at most 1e6)");
+      relaxationAlpha = alpha;
     } else if (option == "--relaunch-context") {
       relaunchContext = value;
     } else {
       throw UsageError("unexpected argument " + std::string(option));
     }
   }
+  if (relaxationLambda.has_value() != relaxationAlpha.has_value())
+    throw UsageError("--rflash-lambda and --rflash-alpha are set together");
+  // Each holds as a float (RelaxationSetting::holds), so the pair is valid.
+  if (relaxationLambda)
+    result.relaxation = ops::RelaxationSetting::validated(static_cast<float>(*relaxationLambda),
+                                                          static_cast<float>(*relaxationAlpha));
   if (result.persistentCache && !result.maxCacheDisk.automatic && !result.maxCacheDisk.bytes)
     throw UsageError("--persistent-cache requires an SSD cache, which MAX_CACHE_DISK_BYTES 0 turns off");
   if (result.maxCacheDiskWritesBytes && !result.maxCacheDisk.automatic && !result.maxCacheDisk.bytes)

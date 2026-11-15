@@ -2,6 +2,7 @@
 
 #include "metal/abi/ExecutionGeometry.h"
 #include "ops/PagedKv.hpp"
+#include "ops/Relaxation.hpp"
 #include "ops/Vision.hpp"
 #include "model/CommandCost.hpp"
 #include "model/ElasticPool.hpp"
@@ -744,6 +745,8 @@ struct ModelTelemetry final {
   // Whether decode cycles verify the rows the verify budget chooses
   // (budgetsVerifyRows) rather than every row.
   bool verifyBudget = false;
+  // The relaxation sampled lanes' verifies run under (RFlash), if any.
+  std::optional<ops::RelaxationSetting> relaxation;
   double lastConstrainedTargetForwardGpuSeconds = 0.0;
   double totalConstrainedTargetForwardGpuSeconds = 0.0;
   double lastConstrainedMaskWaitSeconds = 0.0;

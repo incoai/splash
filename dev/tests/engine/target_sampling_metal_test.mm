@@ -165,7 +165,9 @@ Batch makeBatch(MetalBackend &backend, uint32_t vocabulary, uint32_t lanes) {
               allocate(backend, proposals.candidatesBytes),
               allocate(backend, proposals.proposalProbabilitiesBytes),
               allocate(backend, space.vocabularyRangesBytes),
-              allocate(backend, space.vocabularyArrivalsBytes)},
+              allocate(backend, space.vocabularyArrivalsBytes),
+              // No relaxation: its buffers stay empty.
+              {}, {}, {}, {}},
           vocabulary, rows};
 }
 

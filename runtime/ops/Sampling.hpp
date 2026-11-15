@@ -4,6 +4,7 @@
 #include "metal/abi/ExecutionGeometry.h"
 #include "metal/abi/Sampling.h"
 #include "metal/MetalBackend.hpp"
+#include "ops/Relaxation.hpp"
 #include "ops/StopTokens.hpp"
 
 #include <algorithm>
@@ -126,6 +127,14 @@ struct SamplingBuffers final {
   // finished: a count every draw returns to zero, where it starts.
   metal::MetalBuffer vocabularyRanges;
   metal::MetalBuffer vocabularyArrivals;
+  // Under a relaxation (Sampling::relaxation), read by a verify alone: each
+  // lane's verify rows (ops::DraftSelector), which bound the rows it relaxes,
+  // and the relaxation's outputs (metal/abi/Sampling.h), which the draw
+  // reads. Empty without one.
+  metal::MetalBuffer verifyRows;
+  metal::MetalBuffer relaxedProbabilities;
+  metal::MetalBuffer relaxedRest;
+  metal::MetalBuffer relaxedStatus;
 };
 
 struct AcceptanceBuffers final {
@@ -145,10 +154,15 @@ struct AcceptanceBuffers final {
 // Target token policy (penalties, min-p/top-k/top-p, constrained selection,
 // stop-token exclusion, greedy argmax) and DFlash acceptance of the draft's
 // proposals; the model only supplies policy, buffers, penalty words and its
-// stop tokens. The draft's own selector is ops::DraftSelector.
+// stop tokens. The draft's own selector is ops::DraftSelector. With a
+// relaxation (RFlash), a verify of a sampled lane relaxes the drafted rows
+// it verifies toward the draft, under the drift constraint, before its
+// draw and acceptance, which run unchanged against the relaxed rows.
 class Sampling final {
 public:
-  explicit Sampling(uint32_t vocabulary);
+  explicit Sampling(uint32_t vocabulary, std::optional<RelaxationSetting> relaxation = std::nullopt);
+
+  [[nodiscard]] const std::optional<RelaxationSetting> &relaxation() const noexcept { return relaxation_; }
 
   // Exact scratch/output bytes for the fixed precompiled sampling ABI.
   // Counts may cover one lane or a batch of lanes; the operator owns sharding.
@@ -238,6 +252,7 @@ private:
 
   uint32_t vocabulary_ = 0;
   uint32_t maskWords_ = 0;
+  std::optional<RelaxationSetting> relaxation_;
 };
 
 } // namespace splash::ops

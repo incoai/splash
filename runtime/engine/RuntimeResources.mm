@@ -436,6 +436,15 @@ void reportVerifyRows(const model::LoadedModel &loaded, model::VerifyRows rows) 
             " is dense).");
 }
 
+// The relaxation sampled requests' verifies run under (--rflash-lambda,
+// --rflash-alpha), if any.
+void reportRelaxation(const std::optional<ops::RelaxationSetting> &relaxation) {
+  if (relaxation)
+    logLine("Sampled requests verify with RFlash (--rflash-lambda ", relaxation->lambda, " --rflash-alpha ",
+            relaxation->alpha, "): drafted tokens are accepted against the relaxed target; greedy requests verify "
+            "losslessly.");
+}
+
 // Why a target's long requests keep their KV in memory, empty when they
 // spill.
 std::string spillOffReason(const model::ModelDescriptor &model, const kv::Layout &layout,
@@ -618,7 +627,7 @@ RuntimeResources::RuntimeResources(
     std::unique_ptr<ops::AneFfn> aneFfn, AneFfnOutcome aneFfnOutcome,
     std::unique_ptr<model::KvBlockCache> blockCache,
     std::unique_ptr<model::KvHistoryStream> historyStream, bool spillAlways,
-    model::VerifyRows verifyRows)
+    model::VerifyRows verifyRows, std::optional<ops::RelaxationSetting> relaxation)
     : persistentCache_(std::move(persistentCache)),
       backend_(std::move(backend)), readers_(std::move(readers)), model_(std::move(model)),
       operators_(std::move(operators)),
@@ -631,7 +640,8 @@ RuntimeResources::RuntimeResources(
       cache_(std::move(cache)), aneFfn_(std::move(aneFfn)),
       blockCache_(std::move(blockCache)), historyStream_(std::move(historyStream)),
       releasableMemory_({model_.images.get(), model_.expertStore()}, idleSplit(aneFfn_.get())),
-      aneFfnOutcome_(std::move(aneFfnOutcome)), spillAlways_(spillAlways), verifyRows_(verifyRows) {}
+      aneFfnOutcome_(std::move(aneFfnOutcome)), spillAlways_(spillAlways), verifyRows_(verifyRows),
+      relaxation_(relaxation) {}
 
 std::unique_ptr<RuntimeResources>
 RuntimeResources::create(const RuntimeResourcesConfig &config,
@@ -921,14 +931,15 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
                                   error.what());
     }
     try {
+      const bool relaxed = config.relaxation.has_value();
       modelMemoryPlan = model::plannedRuntimeMemory(loaded, operators, config.kvFormat, config.stateFormat,
-                                                    model::StreamedParts::loaded(loaded));
+                                                    model::StreamedParts::loaded(loaded), relaxed);
       if (kvMaySpill)
         spillModelMemoryPlan = model::plannedRuntimeMemory(loaded, operators, config.kvFormat, config.stateFormat,
-                                                           model::StreamedParts::loaded(loaded, true));
+                                                           model::StreamedParts::loaded(loaded, true), relaxed);
       const auto arenas = [&](model::StreamedParts parts) {
         const model::ModelMemoryPlan streamed =
-            model::plannedRuntimeMemory(loaded, operators, config.kvFormat, config.stateFormat, parts);
+            model::plannedRuntimeMemory(loaded, operators, config.kvFormat, config.stateFormat, parts, relaxed);
         return streamed.sharedPrefillPlannedAllocatedBytes + streamed.sharedDecodePlannedAllocatedBytes;
       };
       for (const bool table : {false, true}) {
@@ -1036,6 +1047,7 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
   }
   ready();
   reportVerifyRows(loaded, config.verifyRows);
+  reportRelaxation(config.relaxation);
 
   // The automatic tier keeps its staging only where the plan holds the model
   // and the requested context beside it, the parts as they load, or where
@@ -1275,7 +1287,7 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
         std::move(memoryGovernor), startClaim, std::move(startScope), std::move(kvPages), std::move(stateStorage),
         std::move(kvTier), std::move(disk.space), std::move(kvPool), std::move(cache),
         std::move(aneFfn.split), std::move(aneFfn.outcome), std::move(blockCache),
-        std::move(historyStream), config.kvSpillAlways, config.verifyRows));
+        std::move(historyStream), config.kvSpillAlways, config.verifyRows, config.relaxation));
     result->adoptPersistentCache();
     return result;
   } catch (const RuntimeResourcesError &) {
@@ -1408,6 +1420,7 @@ model::RuntimeContext RuntimeResources::modelContext() noexcept {
       blockCache_.get(),
       historyStream_.get(),
       verifyRows_,
+      relaxation_,
   };
 }
 

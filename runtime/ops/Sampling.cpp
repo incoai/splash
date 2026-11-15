@@ -16,6 +16,7 @@ constexpr uint32_t kMaximumLanes = SPLASH_MAXIMUM_BATCH_WIDTH;
 constexpr uint32_t kTargetShards = SPLASH_TARGET_SAMPLING_SHARDS;
 constexpr uint32_t kVocabularyThreads = SPLASH_TARGET_VOCABULARY_THREADS;
 constexpr uint32_t kVocabularyGroups = SPLASH_TARGET_VOCABULARY_GROUPS;
+constexpr uint32_t kRelaxThreads = SPLASH_RELAX_THREADS;
 
 // A sampled lane keeps its topK most likely tokens, and every token for 0 or
 // a topK past the vocabulary (top-k disabled).
@@ -128,10 +129,12 @@ void Sampling::countPenaltyTokens(std::span<uint32_t> words,
     ++words[token];
 }
 
-Sampling::Sampling(uint32_t vocabulary)
-    : vocabulary_(vocabulary), maskWords_((vocabulary + 31) / 32) {
+Sampling::Sampling(uint32_t vocabulary, std::optional<RelaxationSetting> relaxation)
+    : vocabulary_(vocabulary), maskWords_((vocabulary + 31) / 32), relaxation_(relaxation) {
   if (!vocabulary)
     throw std::invalid_argument("invalid sampling geometry");
+  if (relaxation && !RelaxationSetting::validated(relaxation->lambda, relaxation->alpha))
+    throw std::invalid_argument("invalid relaxation setting");
 }
 
 void Sampling::addPenalties(metal::CommandGraph &graph,
@@ -276,6 +279,18 @@ TargetSamplingParams Sampling::selection(std::span<const SamplingPolicy> policie
       const uint64_t candidates = (last * SPLASH_DRAFT_PROPOSAL_TOKENS + drafted) * SPLASH_DRAFT_CANDIDATES;
       requireBytes(buffers.draftCandidates, candidates * sizeof(uint32_t), "draft candidate");
       requireBytes(buffers.draftProbabilities, candidates * sizeof(float), "draft probability");
+      // A relaxed verify is dispatched over every lane: each reads its
+      // verify rows and writes its status and the relaxed rows of its
+      // proposal positions (zeros for a lane that does not sample), which the
+      // draw then reads.
+      if (relaxation_) {
+        const uint64_t positions = lanes * SPLASH_DRAFT_PROPOSAL_TOKENS;
+        requireBytes(buffers.verifyRows, lanes * sizeof(uint32_t), "verify rows");
+        requireBytes(buffers.relaxedProbabilities, positions * SPLASH_DRAFT_CANDIDATES * sizeof(float),
+                     "relaxed probability");
+        requireBytes(buffers.relaxedRest, positions * sizeof(float), "relaxed rest");
+        requireBytes(buffers.relaxedStatus, lanes * sizeof(uint32_t), "relaxation status");
+      }
     }
   }
   return params;
@@ -287,6 +302,8 @@ void Sampling::addSelection(metal::CommandGraph &graph, const TargetSamplingPara
   // rows of every lane; the groups of the other kind's lanes return at once.
   const uint32_t lanes = static_cast<uint32_t>(policies.size());
   const uint64_t selected = uint64_t{lanes} * params.rows;
+  const ThinkingCutoffs cutoffs =
+      thinkingCutoffs(policies, vocabulary_, params.rows, params.drafted_rows, params.mask_row);
   if (params.sampling_mask != (uint32_t{1} << lanes) - 1) {
     graph.add("decode_sample_argmax_sharded",
               {buffers.logits, buffers.constraintMasks, buffers.argmaxValues,
@@ -305,18 +322,48 @@ void Sampling::addSelection(metal::CommandGraph &graph, const TargetSamplingPara
               {buffers.logits, buffers.constraintMasks, buffers.partialMasses,
                buffers.vocabularyRows},
               params, {selected, 1, 1}, {kVocabularyThreads, 1, 1});
-    graph.add("decode_sample_vocabulary_draw",
-              {buffers.logits, buffers.constraintMasks, buffers.vocabularyRows,
-               buffers.inputTokens, buffers.draftCandidates,
-               buffers.draftProbabilities, buffers.uniforms,
-               buffers.outputTokens, buffers.vocabularyRanges,
-               buffers.vocabularyArrivals},
-              params, {selected * kVocabularyGroups, 1, 1},
-              {kVocabularyThreads, 1, 1});
+    // A verify under a relaxation relaxes the drafted rows of every sampled
+    // lane between the search and the draw, which then draws from the
+    // relaxed rows (decode_relax_dflash, metal/abi/Sampling.h).
+    if (relaxation_ && params.drafted_rows) {
+      RelaxParams relax{};
+      relax.selection = params;
+      relax.lambda = relaxation_->lambda;
+      relax.alpha = relaxation_->alpha;
+      relax.eps = relaxation_->eps;
+      relax.tail_floor = relaxation_->tailFloor;
+      relax.mu_max = relaxation_->muMax();
+      relax.probe0 = relaxation_->firstProbe();
+      relax.passes = relaxation_->passes();
+      relax.iterations = relaxation_->iterations;
+      // A lane's block stops before its thinking cutoff, whose rows take the
+      // end of thinking whatever the relaxation would make of them. The end
+      // of a lane that waits for its mask starts at this row or later, so
+      // the rows before it are the block's either way.
+      std::copy_n(cutoffs.params.row, lanes, relax.cutoff_row);
+      graph.add("decode_relax_dflash",
+                {buffers.logits, buffers.constraintMasks, buffers.vocabularyRows, buffers.draftCandidates,
+                 buffers.draftProbabilities, buffers.verifyRows, buffers.relaxedProbabilities, buffers.relaxedRest,
+                 buffers.relaxedStatus},
+                relax, {lanes, 1, 1}, {kRelaxThreads, 1, 1});
+      graph.add("decode_sample_vocabulary_draw_relaxed",
+                {buffers.logits, buffers.constraintMasks, buffers.vocabularyRows, buffers.inputTokens,
+                 buffers.draftCandidates, buffers.draftProbabilities, buffers.uniforms, buffers.outputTokens,
+                 buffers.vocabularyRanges, buffers.vocabularyArrivals, buffers.relaxedProbabilities,
+                 buffers.relaxedRest},
+                params, {selected * kVocabularyGroups, 1, 1}, {kVocabularyThreads, 1, 1});
+    } else {
+      graph.add("decode_sample_vocabulary_draw",
+                {buffers.logits, buffers.constraintMasks, buffers.vocabularyRows,
+                 buffers.inputTokens, buffers.draftCandidates,
+                 buffers.draftProbabilities, buffers.uniforms,
+                 buffers.outputTokens, buffers.vocabularyRanges,
+                 buffers.vocabularyArrivals},
+                params, {selected * kVocabularyGroups, 1, 1},
+                {kVocabularyThreads, 1, 1});
+    }
   }
   // Only a selection that reaches a lane's thinking cutoff dispatches it.
-  const ThinkingCutoffs cutoffs =
-      thinkingCutoffs(policies, vocabulary_, params.rows, params.drafted_rows, params.mask_row);
   if (!cutoffs.cutLanes)
     return;
   // A cut lane reads its draft tokens up to its drafted rows' last; a lane

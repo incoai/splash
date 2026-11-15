@@ -168,6 +168,9 @@ struct RuntimeResourcesConfig {
   // where an int8-activation path takes them, or keep every activation bf16
   // (ops::Int8Activations), for the life of the engine (ops::ExecutionPlans).
   ops::Int8Activations int8Activations = ops::Int8Activations::On;
+  // --rflash-lambda and --rflash-alpha: the relaxation sampled lanes'
+  // verifies run under (ops::Sampling, RFlash); none verifies losslessly.
+  std::optional<ops::RelaxationSetting> relaxation;
   // The prefill FFN's Neural Engine split (startAneFfn): off with
   // --disable-ane, and a benchmark round runs the split of the first so that
   // rounds repeat one another.
@@ -370,7 +373,7 @@ private:
                    std::unique_ptr<ops::AneFfn> aneFfn, AneFfnOutcome aneFfnOutcome,
                    std::unique_ptr<model::KvBlockCache> blockCache,
                    std::unique_ptr<model::KvHistoryStream> historyStream, bool spillAlways,
-                   model::VerifyRows verifyRows);
+                   model::VerifyRows verifyRows, std::optional<ops::RelaxationSetting> relaxation);
   // Takes back the restore points the last process left in a persistent
   // tier (Cache::adopt) and opens its files for this one.
   void adoptPersistentCache();
@@ -408,6 +411,8 @@ private:
   bool spillAlways_ = false;
   // --verify-rows, which modelContext() passes on.
   model::VerifyRows verifyRows_ = model::VerifyRows::Auto;
+  // --rflash-lambda / --rflash-alpha, which modelContext() passes on.
+  std::optional<ops::RelaxationSetting> relaxation_;
   // Ends a probation once it has lasted, unless the process stops first.
   std::thread probation_;
   std::mutex probationMutex_;
