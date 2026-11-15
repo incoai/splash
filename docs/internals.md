@@ -427,8 +427,9 @@ A prefill command's last layer outputs only the rows something reads: one row
 per sequence, its last (the head's input and the finiteness check), unless the
 draft reads that layer. Every row still writes its KV. The tile that holds each
 read row attends on its sequence's split count and kernels
-(`PagedAttention::lastTiles`), and its gate, o-projection, norm and FFN run
-on the read rows compacted, on the chunk's projection configurations
+(`PagedAttention::lastTiles`), its reduce writes the read rows compacted
+(`AttentionOutput::Last`), and its o-projection, norm and FFN run on them,
+on the chunk's projection configurations
 (`Linear::plan` of a chunk's rows), so a dense target's read rows keep
 their bits where the GPU runs the layer. A MoE block runs the plan of the read
 rows, whose routes then see
@@ -1004,9 +1005,8 @@ format's segments (or, on the int8-activation tile, `gguf_prefill_int8_quantize`
 its segments' formats alone, and a `moe_expert_gguf_m<rows>` pipeline its pass's routed and
 shared formats alone, which specialize it as Metal function constants
 (`ComputeDispatch::constants`, a pipeline per name and values), so its first use compiles a
-loop for each of those formats rather than for all 44. The norm, GDN, attention-gate and
-attention-gather variants that also write the register kernels' input table carry `table16` in
-their names. The epilogue kinds of both GGUF families are in `kernels/common/gguf_tile.h`, the
+loop for each of those formats rather than for all 44. The norm, GDN and attention-reduce
+variants that also write the register kernels' input table carry `table16` in their names. The epilogue kinds of both GGUF families are in `kernels/common/gguf_tile.h`, the
 SiLU and sigmoid every kernel shares in `kernels/common/activation.h`, and the MMA helpers every
 register kernel uses, GGUF or fp32, in `kernels/common/sgmatrix.h`.
 
@@ -1079,17 +1079,17 @@ formats, each plane checked bytewise against the reference repack.
 
 Target attention runs once a layer for every sequence of a command, a decode step's lanes as a
 prompt chunk's sequences (`ops::PagedAttention`, `SplashAttentionSequence`): one q/k projection
-and one gate over all their rows, each sequence's queries staged after the one before it, and a
-split and a reduce for each run of sequences whose tiles' splits fit the workspace
-(`ops::AttentionPlan`), each sequence's split count its own bound's and history's. Every kernel
+over all their rows, each sequence's queries staged after the one before it, and a split and a
+reduce for each run of sequences whose tiles' splits fit the workspace (`ops::AttentionPlan`),
+each sequence's split count its own bound's and history's. Every kernel
 reads a sequence's rows from the command's layout (`ops::AttentionRows`, a `SplashLaneRows` a
 sequence): a prompt chunk's as its host writes them (`PrefillTensor::LaneLayout`), a decode step's
 as its selector writes them on the device (`DecodeTensor::LaneLayout`), each within its bound, its
 chunk's `chunk_tokens` (a prompt sequence's rows, a decode lane's cap), which sizes everything
 the host lays out for it: its staging, page table, tiles of 8 rows, partial slots and lists. The
-per-row kernels (q/k norm and RoPE, gate) take a grid of each sequence's rows up to the largest
-bound, a threadgroup reading its sequence's layout entry once, and a row or tile past its
-sequence's rows writes nothing. The projection's K-head threadgroups also store their row's key
+per-row kernel (q/k norm and RoPE) takes a grid of each sequence's rows up to the largest bound, a
+threadgroup reading its sequence's layout entry once, and a row or tile past its sequence's rows
+writes nothing. The projection's K-head threadgroups also store their row's key
 and value in its page slot through the sequence's page table (`splash_store_kv_slot`: INT8 at a
 scale per row and head of the largest magnitude over 127, or BF16 as it is), so the attention
 reads every row's K/V from the pages with no store of its own: the projection's kernels are
@@ -1108,8 +1108,12 @@ splits stop at the 18 pages such a window reads
 per row, by the int8-activation rule) and scores them against the INT8 keys (kernel selection,
 rule 5). A geometry
 with learned sinks (`reduce…_sinks`) binds the layer's, an F32 per query head, to the reduce,
-which adds each to its row's softmax after the splits, in their order, as a key with no value;
-one without an output gate (`gather`) gives the out-projection its attention rows as they are.
+which adds each to its row's softmax after the splits, in their order, as a key with no value.
+Each reduce writes its rows as the out-projection's input (`ops::AttentionOutputRows`,
+`splash_attention_output_row`): each row of a geometry with an output gate times the sigmoid of
+its query head's gate in its packed row, of one without as it is, at its packed row, or of a
+prefill's last layer each sequence's last row alone as row s; and where the out-projection reads
+a table (`…_table16`), the table and its sums too. No attention row is staged, and no gate runs.
 The RoPE tables are of the target geometry's pairs (`rope_build_tables`, or
 `rope_build_tables_p64` for 64; a decode cycle's `rope_build_tree_tables*`). `make test-engine-metal`
 runs `attention-variants`, every

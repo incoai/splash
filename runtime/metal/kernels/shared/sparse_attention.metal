@@ -1,3 +1,4 @@
+#include "metal/kernels/common/attention_gate.h"
 #include "metal/kernels/common/lane_bindings.h"
 #include "metal/kernels/common/sparse_attention_tile.h"
 
@@ -217,35 +218,56 @@ SPARSE_LOCATED_SPLIT(attention_bf16_sparse_located_kv2_g12, 2, 12, 256, bfloat)
 #undef SPARSE_SPLIT
 #undef SPARSE_SPLIT_BODY
 
-// Combines the splits that took entries of the tile's list.
-#define SPARSE_REDUCE(Name, Heads, Group, HeadDim)                             \
+// Combines the splits that took entries of the tile's list, and writes the
+// row as the out-projection's input (splash_attention_output_row, gated by
+// its query head's gate in its packed row), with Table into its Table16
+// input too. Bindings: the partials and statistics, the packed rows, the
+// out-projection's input rows, its table and the table's sums (other buffers
+// of the dispatch without a table), the command's layout, the lists' counts,
+// then the parameters.
+#define SPARSE_REDUCE_KERNEL(Name, Heads, Group, HeadDim, Table)                 \
   kernel void Name(                                                            \
       device const float *partials [[buffer(0)]],                              \
       device const float *statistics [[buffer(1)]],                            \
-      device bfloat *output [[buffer(2)]],                                     \
-      device const SplashLaneRows *layout [[buffer(3)]],                       \
-      device const uint *counts [[buffer(4)]],                                 \
-      constant SplashAttentionParams &params [[buffer(5)]],                    \
+      device const bfloat *packed_qkv [[buffer(2)]],                           \
+      device bfloat *hidden [[buffer(3)]],                                     \
+      device bfloat *table [[buffer(4)]],                                      \
+      device float *sums [[buffer(5)]],                                        \
+      device const SplashLaneRows *layout [[buffer(6)]],                       \
+      device const uint *counts [[buffer(7)]],                                 \
+      constant SplashAttentionParams &params [[buffer(8)]],                    \
       uint3 group [[threadgroup_position_in_grid]],                            \
       uint thread_index [[thread_index_in_threadgroup]]) {                     \
     constexpr uint Rows = SPLASH_ATTENTION_TILE_ROWS;                          \
     threadgroup float weights[SplashAttentionMaximumSplits];                   \
     threadgroup float group_values[HeadDim / 32];                              \
+    threadgroup bfloat pairs[HeadDim];                                         \
     const uint s = splash_attention_sequence_of_tile(params, group.z);         \
     constant SplashAttentionSequence &sequence = params.sequence[s];           \
     const uint fused_row = group.y, tile_index = group.z - sequence.first_tile; \
+    const SplashAttentionRows rows = splash_attention_rows(layout, params, s); \
     const SplashAttentionTile tile = splash_attention_tile<Heads, Group,       \
-        HeadDim>(params, sequence, splash_attention_rows(layout, params, s),   \
-                 group.x, tile_index);                                         \
+        HeadDim>(params, sequence, rows, group.x, tile_index);                 \
     if (!tile.active || fused_row >= Rows * Group || thread_index >= HeadDim)  \
       return;                                                                  \
     const uint count = splash_sparse_list_count(                               \
         counts, sequence.block_stride, sequence.block_list + tile_index,       \
         tile.first_position, tile.active_rows);                                \
-    splash_attention_combine_splits<Group, Rows, HeadDim>(                     \
-        partials, statistics, output + tile.offset, tile.active_rows,          \
+    const bfloat value = splash_attention_combine_splits<Group, Rows, HeadDim>( \
+        partials, statistics, tile.active_rows,                                \
         splash_sparse_written_splits(count, tile.splits), tile.first_slot,     \
         fused_row, thread_index, weights, group_values);                       \
+    const SplashAttentionOutput place = splash_attention_output(               \
+        params, s, rows,                                                       \
+        tile.first_position - sequence.committed_tokens + fused_row / Group);  \
+    splash_attention_output_row<Heads * Group, Heads, HeadDim, true, Table>(   \
+        value, packed_qkv, hidden, table, sums, place.packed, place.output,    \
+        group.x * Group + fused_row % Group, thread_index, place.writes,       \
+        pairs);                                                                \
   }
+#define SPARSE_REDUCE(Name, Heads, Group, HeadDim)                             \
+  SPARSE_REDUCE_KERNEL(Name, Heads, Group, HeadDim, false)                     \
+  SPARSE_REDUCE_KERNEL(Name##_table16, Heads, Group, HeadDim, true)
 SPARSE_REDUCE(attention_sparse_reduce_kv2_g12, 2, 12, 256)
 #undef SPARSE_REDUCE
+#undef SPARSE_REDUCE_KERNEL

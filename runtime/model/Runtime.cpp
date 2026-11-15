@@ -280,7 +280,6 @@ QwenTargetPrefillBuffers targetBuffers(const TargetArena &target, uint32_t chunk
   buffers.denseIntermediate = t(TargetTensor::Intermediate);
   buffers.fullPacked = t(TargetTensor::FullPacked);
   buffers.fullQueries = t(TargetTensor::FullQueries);
-  buffers.fullAttention = t(TargetTensor::FullAttention);
   buffers.attentionPartials = t(TargetTensor::AttentionPartials);
   buffers.attentionStatistics = t(TargetTensor::AttentionStatistics);
   buffers.attentionHidden = t(TargetTensor::AttentionHidden);

@@ -28,16 +28,16 @@ uint32_t tileParts(uint32_t queryHeads, kv::Layout layout) {
 }
 
 // The compiled attention geometries (kernels/shared/attention_qkv.metal,
-// paged_attention.metal, paged_attention_store.metal and
-// sparse_attention.metal): query heads over KV heads of a head dimension and
+// paged_attention.metal, sparse_attention.metal and
+// kv_path_commit.metal): query heads over KV heads of a head dimension and
 // how they read the pages, and their kernels' name suffix, the path commits'
 // by KV heads, head dimension and the value order of the reader. The sparse
 // kernels read selected blocks of token-major values (Qwen3.8-Flash-Next's);
 // the dense page loop reads every page of dimension-major ones. Each
 // geometry's kernels are compiled for:
 // - gated: projection rows that hold each query head's output gate after its
-//   queries, by whose sigmoid the output multiplies the attention rows
-//   (Qwen3.5's); without, the output gathers them as they are;
+//   queries, by whose sigmoid the reduce multiplies the attention rows it
+//   writes (Qwen3.5's); without, it writes them as they are;
 // - sinks: a learned sink per query head, which every reduce adds;
 // - rotaryPairs: the pairs its RoPE rotates, and unrotated: a projection
 //   without RoPE (NoPE) as well, for an AttentionVariant that is not rotated;
@@ -58,7 +58,7 @@ struct CompiledAttention final {
   bool unrotated;
   uint32_t windowTokens;
   std::string_view suffix;
-  std::string_view storeSuffix;
+  std::string_view commitSuffix;
 };
 constexpr std::array kCompiledAttention{
     CompiledAttention{24, 4, 256, kv::Reads::EveryPage, true, false, 32, false, 0, "", ""},
@@ -77,10 +77,10 @@ bool storesLayout(const CompiledAttention &compiled, kv::Layout layout) {
 
 // The KV path commit kernels' suffix of a layout's KV heads, head dimension
 // and value order, whose pages a compiled geometry stores.
-std::string_view storeSuffix(kv::Layout layout) {
+std::string_view commitSuffix(kv::Layout layout) {
   if (layout.valid())
     for (const CompiledAttention &compiled : kCompiledAttention)
-      if (storesLayout(compiled, layout)) return compiled.storeSuffix;
+      if (storesLayout(compiled, layout)) return compiled.commitSuffix;
   throw std::invalid_argument("no KV store kernel for layout");
 }
 
@@ -89,7 +89,7 @@ std::string_view storeSuffix(kv::Layout layout) {
 // compile a layer's variant.
 const CompiledAttention &compiledAttention(uint32_t queryHeads, kv::Layout layout,
                                            AttentionVariant variant = {}) {
-  static_cast<void>(storeSuffix(layout));
+  static_cast<void>(commitSuffix(layout));
   for (const CompiledAttention &compiled : kCompiledAttention) {
     if (compiled.queryHeads != queryHeads || compiled.reads != layout.reads || !storesLayout(compiled, layout))
       continue;
@@ -249,12 +249,11 @@ metal::DispatchSize rowGroups(uint64_t groups, const CommandRows &command, size_
   return {groups, command.mostRows, sequences};
 }
 
-// The staging of a command's rows its kernels reach, of `reach` rows of the
-// last sequence's: queries and attention rows hold a KV head's group of query
-// heads a row.
-void requireStaging(const AttentionStaging &staging, const CommandRows &rows, uint32_t group, kv::Layout layout,
+// The staged queries of a command's rows its kernels reach, of `reach` rows
+// of the last sequence's: a KV head's group of query heads a row.
+void requireQueries(const metal::MetalBuffer &queries, const CommandRows &rows, uint32_t group, kv::Layout layout,
                     uint32_t reach) {
-  requireBytes(staging.queries, rows.rowBytes(uint64_t{group} * layout.headDimension, reach), "attention query");
+  requireBytes(queries, rows.rowBytes(uint64_t{group} * layout.headDimension, reach), "attention query");
 }
 
 // A packed projection row: every query head's q and, gated, its gate, then
@@ -274,7 +273,7 @@ std::vector<metal::MetalBuffer> projectionBindings(const CompiledAttention &comp
                                                    uint64_t rows, metal::MetalBuffer packed,
                                                    const NormWeights &queryNorm, const NormWeights &keyNorm,
                                                    metal::MetalBuffer ropeCos, metal::MetalBuffer ropeSin,
-                                                   const AttentionStaging &staging,
+                                                   metal::MetalBuffer queries,
                                                    std::span<const metal::MetalBuffer> pageTables) {
   std::vector<metal::MetalBuffer> bindings{std::move(packed), queryNorm.buffer, keyNorm.buffer};
   if (variant.rotated) {
@@ -283,7 +282,7 @@ std::vector<metal::MetalBuffer> projectionBindings(const CompiledAttention &comp
     requireBytes(ropeSin, bytes, "attention RoPE sine");
     bindings.insert(bindings.end(), {std::move(ropeCos), std::move(ropeSin)});
   }
-  bindings.push_back(staging.queries);
+  bindings.push_back(std::move(queries));
   const auto tables = laneBindings(pageTables);
   bindings.insert(bindings.end(), tables.begin(), tables.end());
   return bindings;
@@ -442,7 +441,7 @@ kv::ChunkedPrefillParams PagedAttention::chunkParams(uint64_t logicalPosition, u
 void PagedAttention::addProjection(metal::CommandGraph &graph, metal::MetalBuffer packed,
                                    const NormWeights &queryNorm, const NormWeights &keyNorm,
                                    metal::MetalBuffer ropeCos, metal::MetalBuffer ropeSin,
-                                   const AttentionStaging &staging, SplashKvLayer layer,
+                                   metal::MetalBuffer queries, SplashKvLayer layer,
                                    std::span<const metal::MetalBuffer> pageTables,
                                    std::span<const kv::ChunkedPrefillParams> sequences, const AttentionRows &rows,
                                    uint32_t queryHeads, kv::Layout layout, AttentionVariant variant) {
@@ -452,11 +451,11 @@ void PagedAttention::addProjection(metal::CommandGraph &graph, metal::MetalBuffe
     throw std::invalid_argument("a q/k projection takes a page table per sequence");
   requireRows(rows, command, sequences.size());
   requireBytes(packed, uint64_t{rows.rows} * packedWidth(kernel) * 2, "attention q/k/v");
-  requireStaging(staging, command, queryHeads / layout.kvHeads, layout, command.last.chunk_tokens);
+  requireQueries(queries, command, queryHeads / layout.kvHeads, layout, command.last.chunk_tokens);
   for (size_t s = 0; s < sequences.size(); ++s) requirePageTable(pageTables[s], sequences[s]);
   std::vector<metal::MetalBuffer> bindings = projectionBindings(
       kernel, variant, rows.rows, std::move(packed), queryNorm, keyNorm, std::move(ropeCos), std::move(ropeSin),
-      staging, pageTables);
+      std::move(queries), pageTables);
   bindings.push_back(rows.layout);
   graph.add(qkNormKernel(kernelName(kernelFormat(layout) + "_qkv",
                                     std::string(kernel.suffix) + (variant.rotated ? "" : "_nope")),
@@ -465,12 +464,12 @@ void PagedAttention::addProjection(metal::CommandGraph &graph, metal::MetalBuffe
             rowGroups(queryHeads + layout.kvHeads, command, sequences.size()), {layout.headDimension, 1, 1});
 }
 
-void PagedAttention::addAttention(metal::CommandGraph &graph, const AttentionPlan &plan,
-                                  const AttentionStaging &staging, const metal::MetalBuffer &partials,
-                                  const metal::MetalBuffer &statistics,
-                                  std::span<const kv::ChunkedPrefillParams> sequences,
-                                  std::span<const AttentionHistory> histories, const AttentionRows &rows,
-                                  metal::MetalBuffer sinks) {
+PreparedInput PagedAttention::addAttention(metal::CommandGraph &graph, const AttentionPlan &plan,
+                                           metal::MetalBuffer queries, const metal::MetalBuffer &partials,
+                                           const metal::MetalBuffer &statistics,
+                                           std::span<const kv::ChunkedPrefillParams> sequences,
+                                           std::span<const AttentionHistory> histories, const AttentionRows &rows,
+                                           const AttentionOutputRows &output, metal::MetalBuffer sinks) {
   const CommandRows command = commandRows(sequences, plan.layout);
   const std::span<const AttentionPlan::Sequence> planned = plan.sequences();
   if (planned.size() != sequences.size() || histories.size() != sequences.size())
@@ -488,13 +487,31 @@ void PagedAttention::addAttention(metal::CommandGraph &graph, const AttentionPla
       requireBytes(histories[s].blocks.rowMasks, uint64_t{rows.rows} * sizeof(uint32_t), "attention row masks");
   }
   requireRows(rows, command, sequences.size());
-  // The tiles read the queries and write the attention rows in whole tiles
-  // of rows, which each sequence's stride holds.
+  // The tiles read the queries in whole tiles of rows, which each sequence's
+  // stride holds.
   const uint32_t group = plan.queryHeads / plan.layout.kvHeads;
   const uint32_t tileRows = kv::attentionTiles(command.last.chunk_tokens) * kv::kAttentionTileRows;
-  requireStaging(staging, command, group, plan.layout, tileRows);
-  requireBytes(staging.rows, command.rowBytes(uint64_t{group} * plan.layout.headDimension, tileRows),
-               "attention output");
+  requireQueries(queries, command, group, plan.layout, tileRows);
+  // The reduce writes every row as its packed row, or each sequence's last
+  // as row s of a plan of its last tiles, gating it by its packed row's gate
+  // where the geometry has one, and the out-projection's table of the rows
+  // where the input takes one; without, another buffer of the dispatch takes
+  // the packed rows', the table's and the sums' bindings, of which it reads
+  // nothing.
+  const bool last = output.output == AttentionOutput::Last, table = output.input != LinearInput::Plain;
+  for (const AttentionPlan::Sequence &sequence : planned)
+    if (last && sequence.firstTile + 1 != kv::attentionTiles(sequence.rows))
+      throw std::invalid_argument("an attention of each sequence's last row takes the plan of its last tiles");
+  const CompiledAttention &kernel = compiledAttention(plan.queryHeads, plan.layout);
+  const uint32_t width = plan.queryHeads * plan.layout.headDimension;
+  const uint32_t outputRows = last ? static_cast<uint32_t>(sequences.size()) : rows.rows;
+  if (kernel.gated) requireBytes(output.packed, gateBytes(rows.rows, kernel), "attention gate");
+  requireBytes(output.hidden, uint64_t{outputRows} * width * 2, "attention hidden");
+  if (table) requireTableScratch(output.scratch, output.input, width, outputRows);
+  const metal::MetalBuffer &gates = kernel.gated ? output.packed : output.hidden;
+  const metal::MetalBuffer &tableInput = table ? output.scratch.input : output.hidden;
+  const metal::MetalBuffer &tableSums = table ? output.scratch.sums : output.hidden;
+  const std::string reducePipeline = std::string(plan.reducePipeline()) + tableSuffix(output.input);
   const AttentionWorkspace workspace = plan.workspace();
   requireBytes(partials, workspace.partialsBytes, "attention partials");
   requireBytes(statistics, workspace.statisticsBytes, "attention statistics");
@@ -511,7 +528,7 @@ void PagedAttention::addAttention(metal::CommandGraph &graph, const AttentionPla
                                .rows = rows.rows,
                                .tiles = dispatch.tiles,
                                .trees = rows.tree ? 1U : 0U,
-                               .last_rows = 0,
+                               .last_rows = last ? 1U : 0U,
                                .kv = layer,
                                .sequence = {}};
     std::array<metal::MetalBuffer, kMaximumSequences> tables;
@@ -546,12 +563,13 @@ void PagedAttention::addAttention(metal::CommandGraph &graph, const AttentionPla
       tables[d] = history.pageTable;
     }
     const auto bound = laneBindings(std::span(tables).first(dispatch.sequences));
-    std::vector<metal::MetalBuffer> split{staging.queries, partials, statistics};
+    std::vector<metal::MetalBuffer> split{queries, partials, statistics};
     split.insert(split.end(), bound.begin(), bound.end());
     // Without tree rows a split binds another buffer of the dispatch for
     // them, of which it reads nothing.
     split.insert(split.end(), {rows.tree ? rows.tree : partials, rows.layout});
-    std::vector<metal::MetalBuffer> reduce{partials, statistics, staging.rows, rows.layout};
+    std::vector<metal::MetalBuffer> reduce{partials, statistics, gates, output.hidden, tableInput, tableSums,
+                                           rows.layout};
     if (plan.sparse) {
       // Without lists, or without tree rows for the row masks, a sparse
       // kernel binds another buffer of the dispatch for them, of which it
@@ -566,8 +584,7 @@ void PagedAttention::addAttention(metal::CommandGraph &graph, const AttentionPla
     if (plan.sinks) reduce.push_back(sinks);
     graph.add(std::string(plan.splitPipeline(static_cast<bool>(blocks.locations))), std::move(split), params,
               plan.splitGroups(dispatch));
-    graph.add(std::string(plan.reducePipeline()), std::move(reduce), params, plan.reduceGroups(dispatch),
-              reduceThreads(plan.layout));
+    graph.add(reducePipeline, std::move(reduce), params, plan.reduceGroups(dispatch), reduceThreads(plan.layout));
     return slot;
   };
   for (const AttentionPlan::Dispatch &dispatch : plan.dispatches()) {
@@ -586,57 +603,7 @@ void PagedAttention::addAttention(metal::CommandGraph &graph, const AttentionPla
       slot = encode(run, layer, slot);
     }
   }
-}
-
-PreparedInput PagedAttention::addGate(metal::CommandGraph &graph, metal::MetalBuffer packed,
-                                      const AttentionStaging &staging, metal::MetalBuffer hidden,
-                                      std::span<const kv::ChunkedPrefillParams> sequences, const AttentionRows &rows,
-                                      AttentionOutput output, uint32_t queryHeads, kv::Layout layout,
-                                      LinearScratch scratch, LinearInput input) {
-  const CompiledAttention &kernel = compiledAttention(queryHeads, layout);
-  const CommandRows command = commandRows(sequences, layout);
-  requireRows(rows, command, sequences.size());
-  kv::AttentionParams params = everyRow(sequences, command, rows);
-  // Each sequence's last row alone (a row of its bound, a prompt's rows), as
-  // output row s.
-  const bool last = output == AttentionOutput::Last;
-  if (last) {
-    params.last_rows = 1;
-    for (size_t s = 0; s < sequences.size(); ++s)
-      params.sequence[s] = sequenceRows(sequences[s], command, s, sequences[s].chunk_tokens - 1);
-  }
-  const uint32_t outputRows = last ? static_cast<uint32_t>(sequences.size()) : rows.rows;
-  const uint32_t width = queryHeads * layout.headDimension;
-  if (kernel.gated) requireBytes(packed, gateBytes(rows.rows, kernel), "attention gate");
-  requireBytes(staging.rows,
-               command.rowBytes(uint64_t{queryHeads / layout.kvHeads} * layout.headDimension,
-                                command.last.chunk_tokens),
-               "attention row");
-  requireBytes(hidden, uint64_t{outputRows} * width * 2, "attention hidden");
-  // An ungated geometry's gather reads no packed row.
-  const std::string name = kernel.gated ? "gate" : "gather";
-  std::vector<metal::MetalBuffer> bindings{staging.rows, hidden};
-  if (kernel.gated) bindings.insert(bindings.begin(), std::move(packed));
-  // A thread an element of a row, or for a table two, groups of
-  // SPLASH_ATTENTION_GATE_THREADS of each row of every sequence.
-  const uint32_t elements = input != LinearInput::Plain ? width / 2 : width;
-  if (elements % SPLASH_ATTENTION_GATE_THREADS)
-    throw std::logic_error("an attention gate's row takes whole threadgroups");
-  const metal::DispatchSize groups = last ? metal::DispatchSize{elements / SPLASH_ATTENTION_GATE_THREADS, 1,
-                                                                 sequences.size()}
-                                          : rowGroups(elements / SPLASH_ATTENTION_GATE_THREADS, command,
-                                                      sequences.size());
-  if (input != LinearInput::Plain) {
-    requireTableScratch(scratch, input, width, outputRows);
-    bindings.insert(bindings.end(), {scratch.input, scratch.sums, rows.layout});
-    graph.add(kernelName(name + tableSuffix(input), kernel.suffix), std::move(bindings), params, groups,
-              {SPLASH_ATTENTION_GATE_THREADS, 1, 1});
-    return {std::move(hidden), input};
-  }
-  bindings.push_back(rows.layout);
-  graph.add(kernelName(name, kernel.suffix), std::move(bindings), params, groups,
-            {SPLASH_ATTENTION_GATE_THREADS, 1, 1});
-  return {};
+  return table ? PreparedInput{output.hidden, output.input} : PreparedInput{};
 }
 
 void PagedAttention::addBlockLists(metal::CommandGraph &graph, const metal::MetalBuffer &mask, uint32_t maskWords,
@@ -695,7 +662,7 @@ void PagedAttention::addPathCommit(metal::CommandGraph &graph, kv::Layout layout
   const auto tables = laneBindings(pageTables);
   std::vector<metal::MetalBuffer> bindings(tables.begin(), tables.end());
   bindings.push_back(paths);
-  graph.add(kernelName(kernelFormat(layout) + "_commit", storeSuffix(layout)), std::move(bindings), params,
+  graph.add(kernelName(kernelFormat(layout) + "_commit", commitSuffix(layout)), std::move(bindings), params,
             {uint64_t{layout.attentionLayers} * layout.kvHeads, lanes, 1}, {layout.headDimension, 1, 1});
 }
 

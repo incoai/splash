@@ -32,8 +32,6 @@ std::array<uint64_t, targetTensorCount> targetTensorBytes(const QwenTargetGeomet
   put(TargetTensor::FullPacked, bytesFor<uint16_t>(rows * target.packedFullWidth));
   put(TargetTensor::FullQueries,
       bytesFor<uint16_t>(uint64_t{target.attentionQueryHeads} * stagedRows * target.attentionHeadDimension));
-  put(TargetTensor::FullAttention,
-      bytesFor<uint16_t>(uint64_t{target.attentionQueryHeads} * stagedRows * target.attentionHeadDimension));
   put(TargetTensor::AttentionPartials, shape.attention.partialsBytes);
   put(TargetTensor::AttentionStatistics, shape.attention.statisticsBytes);
   put(TargetTensor::AttentionHidden, bytesFor<uint16_t>(rows * target.attentionWidth));

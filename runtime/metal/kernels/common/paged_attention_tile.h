@@ -487,17 +487,17 @@ inline float splash_row_sink(uint fused_row, device const float *group_sinks) {
 // are shared by all output dimensions: their weights are computed once per
 // row, the splits' maxima by the threads at their split's index (written
 // never exceeds HeadDim), then each lane streams one dimension of the
-// partials. A row past the tile's active rows is written as zeros; a
-// threadgroup owns one fused row, so it returns uniformly.
+// partials; the row's value comes back to each thread, its dimension's, and a
+// row past the tile's active rows is zero. A threadgroup owns one fused row,
+// so it returns uniformly.
 // A layer's learned sinks come as group_sinks, a logit per query head of the
 // tile's KV head (its GQA group), and none without: the row's query head's
 // sink is one more key, with no value, of the softmax (the scores' scale
 // already applied), so it enters the maximum and, after the splits in their
 // order, the denominator.
 template <uint QueryHeadsPerKVHead, uint RowsPerTile, uint HeadDim, class... GroupSinks>
-inline void splash_attention_combine_splits(
-    device const float *partials, device const float *statistics,
-    device bfloat *tile_output, uint active_rows, uint written,
+inline bfloat splash_attention_combine_splits(
+    device const float *partials, device const float *statistics, uint active_rows, uint written,
     ulong head_slot, uint fused_row, uint thread_index,
     threadgroup float *weights, threadgroup float *group_values,
     GroupSinks... group_sinks) {
@@ -505,10 +505,8 @@ inline void splash_attention_combine_splits(
   constexpr uint M = RowsPerTile * QueryHeadsPerKVHead;
   constexpr uint D = HeadDim;
   static_assert(D >= SPLASH_ATTENTION_MAXIMUM_SPLITS, "a thread per split");
-  if (fused_row / QueryHeadsPerKVHead >= active_rows) {
-    tile_output[fused_row * D + thread_index] = bfloat(0.0f);
-    return;
-  }
+  if (fused_row / QueryHeadsPerKVHead >= active_rows)
+    return bfloat(0.0f);
   const uint lane = thread_index % 32, sg = thread_index / 32;
   const ulong stat = ((head_slot + thread_index) * M + fused_row) * 2;
   const float maximum = thread_index < written ? statistics[stat] : -INFINITY;
@@ -533,8 +531,7 @@ inline void splash_attention_combine_splits(
   }
   if constexpr (Sinks)
     denominator += fast::exp(sink - row_maximum);
-  tile_output[fused_row * D + thread_index] =
-      bfloat(denominator > 0.0f ? numerator / denominator : 0.0f);
+  return bfloat(denominator > 0.0f ? numerator / denominator : 0.0f);
 }
 
 // The sinks of KV head kv_head's query heads (its GQA group) among a
@@ -549,12 +546,11 @@ inline device const float *splash_group_sinks(uint kv_head, device const float *
 // those that own at least one page wrote their partials, and the partition
 // is recomputed here, of the same Window and, for a tree's tile, from the
 // same anchor. A part past the tile's active rows ran no split; its rows are
-// written as zeros.
+// zero.
 template <uint QueryHeadsPerKVHead, uint RowsPerTile, uint Parts, uint HeadDim,
           uint Window, class... GroupSinks>
-inline void splash_attention_reduce_row(
-    device const float *partials, device const float *statistics,
-    device bfloat *output, SplashAttentionTile whole, uint slot_stride,
+inline bfloat splash_attention_reduce_row(
+    device const float *partials, device const float *statistics, SplashAttentionTile whole, uint slot_stride,
     bool tree, uint anchor, uint fused_row, uint thread_index, threadgroup float *weights,
     threadgroup float *group_values, GroupSinks... group_sinks) {
   constexpr uint PartRows = RowsPerTile / Parts;
@@ -562,18 +558,14 @@ inline void splash_attention_reduce_row(
   const SplashAttentionTile tile =
       splash_attention_tile_part<QueryHeadsPerKVHead, RowsPerTile, Parts, HeadDim>(
           whole, fused_row / PartM, slot_stride);
-  if (!tile.active) {
-    output[whole.offset + ulong(fused_row) * HeadDim +
-           thread_index] = bfloat(0.0f);
-    return;
-  }
+  if (!tile.active)
+    return bfloat(0.0f);
   uint pages = splash_attention_pages(tile.first_position + tile.active_rows);
   if constexpr (Window != 0)
     pages -= splash_attention_first_page<Window>(splash_attention_window_position(tree, anchor, tile.first_position));
   const uint per_split = splash_attention_pages_per_split(pages, tile.splits);
   const uint written = (pages + per_split - 1) / per_split;
-  splash_attention_combine_splits<QueryHeadsPerKVHead, PartRows, HeadDim>(
-      partials, statistics, output + tile.offset, tile.active_rows, written,
-      tile.first_slot, fused_row % PartM, thread_index, weights, group_values,
-      group_sinks...);
+  return splash_attention_combine_splits<QueryHeadsPerKVHead, PartRows, HeadDim>(
+      partials, statistics, tile.active_rows, written, tile.first_slot, fused_row % PartM, thread_index, weights,
+      group_values, group_sinks...);
 }

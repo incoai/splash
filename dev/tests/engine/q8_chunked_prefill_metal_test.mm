@@ -49,6 +49,12 @@ uint64_t attentionIndex(uint32_t stride, uint32_t head, uint32_t row,
          dimension;
 }
 
+// The attention's output of a row, as the reduce writes the out-projection's
+// input rows: [row][query head][dimension].
+uint64_t outputIndex(uint32_t head, uint32_t row, uint32_t dimension) {
+  return (uint64_t{row} * kQueryHeads + head) * kHeadDimension + dimension;
+}
+
 using splash::test::require;
 
 id<MTLBuffer> makeBuffer(id<MTLDevice> device, uint64_t bytes) {
@@ -158,6 +164,10 @@ struct Case {
   id<MTLBuffer> chunkKeys;
   id<MTLBuffer> chunkValues;
   id<MTLBuffer> queries;
+  // The packed projection rows, from which the reduce reads each query
+  // head's gate: every gate +inf, whose sigmoid is 1, so that it writes each
+  // attention row as it is into the output rows (outputIndex).
+  id<MTLBuffer> packed;
   id<MTLBuffer> output;
   id<MTLBuffer> partials;
   id<MTLBuffer> statistics;
@@ -201,6 +211,13 @@ Case makeCase(id<MTLDevice> device, uint32_t committed, uint32_t chunk,
       makeBuffer(device, chunkElements * sizeof(BFloat16Bits));
   uint64_t queryElements = uint64_t{kQueryHeads} * stride * kHeadDimension;
   result.queries = makeBuffer(device, queryElements * sizeof(BFloat16Bits));
+  constexpr uint64_t kPackedWidth = uint64_t{2 * kQueryHeads + 2 * kKvHeads} * kHeadDimension;
+  result.packed = makeBuffer(device, stride * kPackedWidth * sizeof(BFloat16Bits));
+  for (uint64_t row = 0; row < stride; ++row)
+    for (uint32_t head = 0; head < kQueryHeads; ++head)
+      std::fill_n(static_cast<BFloat16Bits *>(result.packed.contents) + row * kPackedWidth +
+                      (uint64_t{head} * 2 + 1) * kHeadDimension,
+                  kHeadDimension, BFloat16Bits{0x7f80});
   result.output = makeBuffer(device, queryElements * sizeof(BFloat16Bits));
   const auto workspace = splash::ops::PagedAttention::workspace(splash::ops::kAttentionSequenceSplits, kQueryHeads,
                                                                {1, kKvHeads, kHeadDimension});
@@ -353,12 +370,16 @@ void encodeAttention(id<MTLComputeCommandEncoder> encoder,
   data.pool->use(encoder, MTLResourceUsageRead);
   [encoder dispatchThreadgroups:MTLSizeMake(split.x, split.y, split.z)
              threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+  // The plain reduce writes no table: the output rows take the table's and
+  // its sums' bindings.
   [encoder setComputePipelineState:pipelines.reduce];
   [encoder setBuffer:data.partials offset:0 atIndex:0];
   [encoder setBuffer:data.statistics offset:0 atIndex:1];
-  [encoder setBuffer:data.output offset:0 atIndex:2];
-  setLayout(encoder, data, 3);
-  [encoder setBytes:&params length:sizeof(params) atIndex:4];
+  [encoder setBuffer:data.packed offset:0 atIndex:2];
+  for (NSUInteger index = 3; index < 6; ++index)
+    [encoder setBuffer:data.output offset:0 atIndex:index];
+  setLayout(encoder, data, 6);
+  [encoder setBytes:&params length:sizeof(params) atIndex:7];
   [encoder dispatchThreadgroups:MTLSizeMake(reduce.x, reduce.y, reduce.z)
              threadsPerThreadgroup:MTLSizeMake(kHeadDimension, 1, 1)];
 }
@@ -455,10 +476,9 @@ void validateAttention(const Case &data,
   for (uint32_t head : heads) {
     for (uint32_t row : rows) {
       for (uint32_t dimension = 0; dimension < kHeadDimension; ++dimension) {
-        uint64_t index = attentionIndex(data.params.chunk_stride, head, row,
-                                        dimension);
-        float observed = bfloat16ToFloat(actual[index]);
-        float reference = bfloat16ToFloat(expected[index]);
+        float observed = bfloat16ToFloat(actual[outputIndex(head, row, dimension)]);
+        float reference = bfloat16ToFloat(
+            expected[attentionIndex(data.params.chunk_stride, head, row, dimension)]);
         if (!std::isfinite(observed)) {
           throw std::runtime_error(
               "non-finite attention output: head=" +
@@ -648,21 +668,16 @@ void testChunkReference(id<MTLDevice> device, id<MTLCommandQueue> queue,
       const auto *output = static_cast<const BFloat16Bits *>(data.output.contents);
       const std::vector<BFloat16Bits> first(
           output, output + data.output.length / sizeof(BFloat16Bits));
-      // The reduction writes every row of the chunk's query tiles, zeros
-      // past the chunk, and nothing beyond them.
-      const uint32_t tiledRows = attentionTiles(chunk) * kAttentionTileRows;
+      // The reduction writes the chunk's rows, and nothing past them.
       const auto validateCoverage = [&] {
         for (uint32_t head = 0; head < kQueryHeads; ++head)
           for (uint32_t row = 0; row < rows; ++row)
             for (uint32_t dimension = 0; dimension < kHeadDimension; ++dimension) {
-              const auto value = output[attentionIndex(rows, head, row, dimension)];
-              if (row < chunk) {
+              const auto value = output[outputIndex(head, row, dimension)];
+              if (row < chunk)
                 require(std::isfinite(bfloat16ToFloat(value)), "chunked output is nonfinite");
-              } else if (row < tiledRows) {
-                require(value == 0, "an inactive row of a query tile was not zeroed");
-              } else {
-                require(value == 0xffff, "prefill attention wrote past its query tiles");
-              }
+              else
+                require(value == 0xffff, "prefill attention wrote past its chunk's rows");
             }
       };
       validateCoverage();
@@ -680,7 +695,7 @@ void testChunkReference(id<MTLDevice> device, id<MTLCommandQueue> queue,
       for (uint32_t head = 0; head < kQueryHeads; ++head)
         for (uint32_t row = 0; row < chunk; ++row)
           for (uint32_t dimension = 0; dimension < kHeadDimension; ++dimension) {
-            const auto index = attentionIndex(rows, head, row, dimension);
+            const auto index = outputIndex(head, row, dimension);
             const float left = bfloat16ToFloat(first[index]);
             const float right = bfloat16ToFloat(output[index]);
             differences += first[index] != output[index];

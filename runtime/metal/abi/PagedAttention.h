@@ -158,12 +158,10 @@ static_assert(sizeof(SplashAttentionSequence) == 44,
 // depth, so it attends the history of that position's window and, of the
 // block's rows, its ancestors and itself; a tree's tiles read their pages
 // from the anchor's window. Without, rows attend causally.
-// With `last_rows` nonzero the gate writes one row a sequence, its first
-// (the sequence's last row: ops::AttentionOutput::Last), sequence s's as
-// output row s; without, every row as its packed row. A gate group of
-// SPLASH_ATTENTION_GATE_THREADS threads takes a thread's element (two, for
-// the out-projection's table) of one row.
-#define SPLASH_ATTENTION_GATE_THREADS 256u
+// The reduce writes each row as the out-projection's input row: with
+// `last_rows` nonzero one row a sequence, its last (ops::AttentionOutput::
+// Last), the command's sequence first_sequence + s's as output row
+// first_sequence + s; without, every row as its packed row.
 struct SplashAttentionParams {
   uint32_t sequences;
   uint32_t first_sequence;

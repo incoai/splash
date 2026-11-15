@@ -50,3 +50,22 @@ inline SplashAttentionRows splash_attention_rows(device const SplashLaneRows *la
     return {0, 0};
   return {entry.first + sequence.layout_row, rows};
 }
+
+// Where a reduce writes row `row` of dispatch sequence s (counted from its
+// rows' first, SplashAttentionRows): its packed row, the output row it
+// writes, its packed row or, with last_rows (SplashAttentionParams), its
+// sequence's place among the command's for the sequence's last row alone,
+// and whether it writes: a row the sequence holds, and with last_rows its
+// last.
+struct SplashAttentionOutput {
+  ulong packed;
+  ulong output;
+  bool writes;
+};
+
+inline SplashAttentionOutput splash_attention_output(constant SplashAttentionParams &params, uint s,
+                                                     SplashAttentionRows rows, uint row) {
+  const ulong packed = ulong(rows.first) + row;
+  return {packed, params.last_rows ? ulong(params.first_sequence) + s : packed,
+          row < rows.rows && (!params.last_rows || row + 1 == rows.rows)};
+}

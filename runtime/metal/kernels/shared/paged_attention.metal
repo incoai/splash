@@ -1,3 +1,4 @@
+#include "metal/kernels/common/attention_gate.h"
 #include "metal/kernels/common/lane_bindings.h"
 #include "metal/kernels/common/paged_attention_tile.h"
 
@@ -44,28 +45,36 @@ inline void splash_attention_split_phase(
 }
 
 // Reduce: a threadgroup of HeadDim threads per fused row of a tile, group.z
-// the dispatch's tile. A reduce that adds learned sinks passes the layer's,
-// one per query head, last.
-template <uint KVHeads, uint QueryHeadsPerKVHead, uint HeadDim, uint Window, class... Sinks>
+// the dispatch's tile, which writes the row as the out-projection's input
+// (splash_attention_output_row): Gated by its query head's gate in its
+// packed row, at its output row (splash_attention_output), and with Table
+// into the out-projection's table too. A reduce that adds learned sinks
+// passes the layer's, one per query head, last.
+template <uint KVHeads, uint QueryHeadsPerKVHead, uint HeadDim, uint Window, bool Gated, bool Table, class... Sinks>
 inline void splash_attention_reduce_phase(
-    device const float *partials, device const float *statistics,
-    device bfloat *output, device const SplashLaneRows *layout, constant SplashAttentionParams &params, uint3 group,
-    uint thread_index, threadgroup float *weights,
-    threadgroup float *group_values, Sinks... sinks) {
+    device const float *partials, device const float *statistics, device const bfloat *packed_qkv,
+    device bfloat *hidden, device bfloat *table, device float *sums, device const SplashLaneRows *layout,
+    constant SplashAttentionParams &params, uint3 group, uint thread_index, threadgroup float *weights,
+    threadgroup float *group_values, threadgroup bfloat *pairs, Sinks... sinks) {
   constexpr ushort M = SPLASH_ATTENTION_TILE_ROWS * QueryHeadsPerKVHead;
   constexpr ushort D = HeadDim;
   const uint fused_row = group.y;
   const uint s = splash_attention_sequence_of_tile(params, group.z);
   constant SplashAttentionSequence &sequence = params.sequence[s];
+  const SplashAttentionRows rows = splash_attention_rows(layout, params, s);
   const SplashAttentionTile tile = splash_attention_tile<KVHeads, QueryHeadsPerKVHead, HeadDim>(
-      params, sequence, splash_attention_rows(layout, params, s), group.x, group.z - sequence.first_tile);
+      params, sequence, rows, group.x, group.z - sequence.first_tile);
   if (!tile.active || fused_row >= M || thread_index >= D)
     return;
-  splash_attention_reduce_row<QueryHeadsPerKVHead, SPLASH_ATTENTION_TILE_ROWS,
-                              SPLASH_ATTENTION_TILE_PARTS(QueryHeadsPerKVHead), HeadDim, Window>(
-      partials, statistics, output, tile, sequence.split_count, params.trees != 0, sequence.committed_tokens,
-      fused_row, thread_index, weights, group_values,
-      splash_group_sinks<QueryHeadsPerKVHead>(group.x, sinks)...);
+  const bfloat value = splash_attention_reduce_row<QueryHeadsPerKVHead, SPLASH_ATTENTION_TILE_ROWS,
+                                                   SPLASH_ATTENTION_TILE_PARTS(QueryHeadsPerKVHead), HeadDim, Window>(
+      partials, statistics, tile, sequence.split_count, params.trees != 0, sequence.committed_tokens, fused_row,
+      thread_index, weights, group_values, splash_group_sinks<QueryHeadsPerKVHead>(group.x, sinks)...);
+  const SplashAttentionOutput place = splash_attention_output(
+      params, s, rows, tile.first_position - sequence.committed_tokens + fused_row / QueryHeadsPerKVHead);
+  splash_attention_output_row<KVHeads * QueryHeadsPerKVHead, KVHeads, HeadDim, Gated, Table>(
+      value, packed_qkv, hidden, table, sums, place.packed, place.output,
+      group.x * QueryHeadsPerKVHead + fused_row % QueryHeadsPerKVHead, thread_index, place.writes, pairs);
 }
 
 #define PAGED_ATTENTION_SPLIT(Name, Heads, Group, HeadDim, Window, CacheElement, Int8Queries)                   \
@@ -117,43 +126,65 @@ PAGED_ATTENTION_SPLIT(attention_bf16_split_kv4_g8_d128, 4, 8, 128, 0, bfloat, fa
 PAGED_ATTENTION_SPLIT(attention_bf16_split_kv4_g8_d128_w512, 4, 8, 128, 512, bfloat, false)
 #undef PAGED_ATTENTION_SPLIT
 
-#define PAGED_ATTENTION_REDUCE(Name, Heads, Group, HeadDim, Window)                                           \
+// Bindings: the partials and statistics, the projection's packed rows (a
+// gated geometry's gates, another buffer of the dispatch for an ungated one),
+// the out-projection's input rows, its table and the table's sums (other
+// buffers of the dispatch without a table), the command's layout, then the
+// parameters; a reduce that adds learned sinks binds the layer's, an F32 per
+// query head, before them. Each is compiled plain and, _table16, writing
+// the out-projection's Table16 input too.
+#define PAGED_ATTENTION_REDUCE_KERNEL(Name, Heads, Group, HeadDim, Window, Gated, Table)                       \
   kernel void Name(                                                                                           \
       device const float *partials [[buffer(0)]],                                                             \
       device const float *statistics [[buffer(1)]],                                                           \
-      device bfloat *output [[buffer(2)]],                                                                    \
-      device const SplashLaneRows *layout [[buffer(3)]],                                                      \
-      constant SplashAttentionParams &params [[buffer(4)]],                                                   \
+      device const bfloat *packed_qkv [[buffer(2)]],                                                          \
+      device bfloat *hidden [[buffer(3)]],                                                                    \
+      device bfloat *table [[buffer(4)]],                                                                     \
+      device float *sums [[buffer(5)]],                                                                       \
+      device const SplashLaneRows *layout [[buffer(6)]],                                                      \
+      constant SplashAttentionParams &params [[buffer(7)]],                                                   \
       uint3 group [[threadgroup_position_in_grid]],                                                           \
       uint thread_index [[thread_index_in_threadgroup]]) {                                                    \
     threadgroup float weights[SplashAttentionMaximumSplits];                                                  \
     threadgroup float group_values[HeadDim / 32];                                                             \
-    splash_attention_reduce_phase<Heads, Group, HeadDim, Window>(partials, statistics, output, layout, params, \
-                                                                 group, thread_index, weights, group_values); \
+    threadgroup bfloat pairs[HeadDim];                                                                        \
+    splash_attention_reduce_phase<Heads, Group, HeadDim, Window, Gated, Table>(                               \
+        partials, statistics, packed_qkv, hidden, table, sums, layout, params, group, thread_index, weights,   \
+        group_values, pairs);                                                                                 \
   }
-
-// A reduce with learned sinks binds the layer's, an F32 per query head,
-// after the layout.
-#define PAGED_ATTENTION_SINK_REDUCE(Name, Heads, Group, HeadDim, Window)                                      \
+#define PAGED_ATTENTION_SINK_REDUCE_KERNEL(Name, Heads, Group, HeadDim, Window, Gated, Table)                  \
   kernel void Name(                                                                                           \
       device const float *partials [[buffer(0)]],                                                             \
       device const float *statistics [[buffer(1)]],                                                           \
-      device bfloat *output [[buffer(2)]],                                                                    \
-      device const SplashLaneRows *layout [[buffer(3)]],                                                      \
-      device const float *sinks [[buffer(4)]],                                                                \
-      constant SplashAttentionParams &params [[buffer(5)]],                                                   \
+      device const bfloat *packed_qkv [[buffer(2)]],                                                          \
+      device bfloat *hidden [[buffer(3)]],                                                                    \
+      device bfloat *table [[buffer(4)]],                                                                     \
+      device float *sums [[buffer(5)]],                                                                       \
+      device const SplashLaneRows *layout [[buffer(6)]],                                                      \
+      device const float *sinks [[buffer(7)]],                                                                \
+      constant SplashAttentionParams &params [[buffer(8)]],                                                   \
       uint3 group [[threadgroup_position_in_grid]],                                                           \
       uint thread_index [[thread_index_in_threadgroup]]) {                                                    \
     threadgroup float weights[SplashAttentionMaximumSplits];                                                  \
     threadgroup float group_values[HeadDim / 32];                                                             \
-    splash_attention_reduce_phase<Heads, Group, HeadDim, Window>(partials, statistics, output, layout, params, \
-                                                                 group, thread_index, weights, group_values, \
-                                                                 sinks);                                      \
+    threadgroup bfloat pairs[HeadDim];                                                                        \
+    splash_attention_reduce_phase<Heads, Group, HeadDim, Window, Gated, Table>(                               \
+        partials, statistics, packed_qkv, hidden, table, sums, layout, params, group, thread_index, weights,   \
+        group_values, pairs, sinks);                                                                          \
   }
-PAGED_ATTENTION_REDUCE(attention_reduce, 4, 6, 256, 0)
-PAGED_ATTENTION_REDUCE(attention_reduce_kv2_g8, 2, 8, 256, 0)
-PAGED_ATTENTION_REDUCE(attention_reduce_kv2_g16, 2, 16, 256, 0)
-PAGED_ATTENTION_SINK_REDUCE(attention_reduce_kv4_g8_d128_sinks, 4, 8, 128, 0)
-PAGED_ATTENTION_SINK_REDUCE(attention_reduce_kv4_g8_d128_w512_sinks, 4, 8, 128, 512)
+#define PAGED_ATTENTION_REDUCE(Name, Heads, Group, HeadDim, Window, Gated)                                     \
+  PAGED_ATTENTION_REDUCE_KERNEL(Name, Heads, Group, HeadDim, Window, Gated, false)                             \
+  PAGED_ATTENTION_REDUCE_KERNEL(Name##_table16, Heads, Group, HeadDim, Window, Gated, true)
+#define PAGED_ATTENTION_SINK_REDUCE(Name, Heads, Group, HeadDim, Window, Gated)                                \
+  PAGED_ATTENTION_SINK_REDUCE_KERNEL(Name, Heads, Group, HeadDim, Window, Gated, false)                        \
+  PAGED_ATTENTION_SINK_REDUCE_KERNEL(Name##_table16, Heads, Group, HeadDim, Window, Gated, true)
+PAGED_ATTENTION_REDUCE(attention_reduce, 4, 6, 256, 0, true)
+PAGED_ATTENTION_REDUCE(attention_reduce_kv2_g8, 2, 8, 256, 0, true)
+PAGED_ATTENTION_REDUCE(attention_reduce_kv2_g16, 2, 16, 256, 0, true)
+// Flint's layers have no output gate.
+PAGED_ATTENTION_SINK_REDUCE(attention_reduce_kv4_g8_d128_sinks, 4, 8, 128, 0, false)
+PAGED_ATTENTION_SINK_REDUCE(attention_reduce_kv4_g8_d128_w512_sinks, 4, 8, 128, 512, false)
 #undef PAGED_ATTENTION_SINK_REDUCE
 #undef PAGED_ATTENTION_REDUCE
+#undef PAGED_ATTENTION_SINK_REDUCE_KERNEL
+#undef PAGED_ATTENTION_REDUCE_KERNEL

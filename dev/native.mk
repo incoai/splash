@@ -193,7 +193,7 @@ TEST_Q8_LIB := $(ENGINE_TEST_BUILD)/q8-paged-kv.metallib
 # path commit, beside the tests' store.
 TEST_Q8_KERNEL_SOURCES := \
 	runtime/metal/kernels/shared/paged_attention.metal \
-	runtime/metal/kernels/shared/paged_attention_store.metal \
+	runtime/metal/kernels/shared/kv_path_commit.metal \
 	runtime/metal/kernels/shared/sparse_attention.metal
 TEST_Q8_KERNEL_AIRS := $(patsubst runtime/metal/kernels/%.metal,$(ENGINE_TEST_BUILD)/kernels/%.air,$(TEST_Q8_KERNEL_SOURCES))
 # Every library a MetalBackend loads has the kernel that ends its residency;

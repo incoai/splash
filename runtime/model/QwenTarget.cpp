@@ -269,7 +269,6 @@ void QwenTarget::addPrefillMixer(PrefillStep &step, const QwenAttentionWeights &
   if (!step.readRows.empty() && !output.residual)
     throw std::logic_error("a Qwen prefill layer that outputs its read rows alone has no residual rows");
   const std::span<const kv::ChunkedPrefillParams> sequences = step.attentionSequences();
-  const ops::AttentionStaging staging{b.fullQueries, b.fullAttention};
   const ops::AttentionRows rows{b.laneRows, step.rows, step.decode ? step.decode->tree : metal::MetalBuffer{}};
   const std::span<const metal::MetalBuffer> pageTables = std::span(step.pageTables).first(sequences.size());
   linear.add(step.graph,
@@ -278,7 +277,7 @@ void QwenTarget::addPrefillMixer(PrefillStep &step, const QwenAttentionWeights &
              mixer.inputProjection, linear.plan(mixer.inputProjection, step.rows));
   // The q/k projection stores each row's key and value in its page slot.
   ops::PagedAttention::addProjection(step.graph, b.fullPacked, mixer.queryNorm, mixer.keyNorm, b.ropeCos, b.ropeSin,
-                                     staging, step.kvLayers[layer], pageTables, sequences, rows,
+                                     b.fullQueries, step.kvLayers[layer], pageTables, sequences, rows,
                                      geometry_.attentionQueryHeads, geometry_.kvLayout, variant);
   std::array<ops::AttentionHistory, ExecutionLimits::maximumBatchWidth> histories{};
   if (step.decode) {
@@ -313,20 +312,19 @@ void QwenTarget::addPrefillMixer(PrefillStep &step, const QwenAttentionWeights &
     }
   }
   // Only each sequence's last row is read (planOutputRows): the tile that
-  // holds it attends as in the chunk (lastTiles), and its gated row is read
-  // row `index`.
+  // holds it attends as in the chunk (lastTiles), and its gated row is
+  // written row `index`.
   const bool lastRows = !step.readRows.empty();
   const ops::AttentionPlan &plan = variant.windowTokens ? *step.windowedAttention : *step.attention;
-  ops::PagedAttention::addAttention(step.graph, lastRows ? ops::PagedAttention::lastTiles(plan) : plan, staging,
-                                    b.attentionPartials, b.attentionStatistics, sequences,
-                                    std::span(histories).first(sequences.size()), rows, mixer.sinks);
   const ops::LinearPlan outputPlan =
       linear.plan(mixer.outputProjection, step.outputRows(),
                   output.residual ? ops::LinearEpilogue::Residual : ops::LinearEpilogue::None, nullptr, step.rows);
-  const ops::PreparedInput hidden = ops::PagedAttention::addGate(
-      step.graph, b.fullPacked, staging, b.attentionHidden, sequences, rows,
-      lastRows ? ops::AttentionOutput::Last : ops::AttentionOutput::Every, geometry_.attentionQueryHeads,
-      geometry_.kvLayout, b.linearScratch, lastRows ? ops::LinearInput::Plain : outputPlan.input());
+  const ops::PreparedInput hidden = ops::PagedAttention::addAttention(
+      step.graph, lastRows ? ops::PagedAttention::lastTiles(plan) : plan, b.fullQueries, b.attentionPartials,
+      b.attentionStatistics, sequences, std::span(histories).first(sequences.size()), rows,
+      {b.fullPacked, b.attentionHidden, lastRows ? ops::AttentionOutput::Last : ops::AttentionOutput::Every,
+       b.linearScratch, lastRows ? ops::LinearInput::Plain : outputPlan.input()},
+      mixer.sinks);
   // The read rows' residual rows, gathered into the normalized rows the
   // input projection has read.
   metal::MetalBuffer residual = std::move(output.residual);

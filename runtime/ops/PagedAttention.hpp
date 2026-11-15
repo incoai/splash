@@ -135,21 +135,12 @@ struct AttentionHistory final {
   AttentionBlocks blocks{};
 };
 
-// A layer's staging of its command's sequences (SplashAttentionSequence),
-// each after the one before it, a KV head's rows its chunk_stride apart: the
-// queries and attention rows [KV head][row][query head in group][dimension].
-// The keys and values go to their pages directly (addProjection).
-struct AttentionStaging final {
-  metal::MetalBuffer queries;
-  metal::MetalBuffer rows;
-};
-
 // A command's rows as its sequences hold them: `rows` packed rows, sequence
 // s's first row and rows entry s of `layout` (SplashLaneRows,
 // metal/abi/VerifyTree.h: a prompt chunk's as its host writes them, a decode
 // step's as its selector writes them on the device), each at most its
-// chunk's chunk_tokens. The per-row kernels (q/k projection and store, gate)
-// take a grid of the sequences' rows up to the largest bound, and each
+// chunk's chunk_tokens. The per-row kernel (q/k projection and store) takes
+// a grid of the sequences' rows up to the largest bound, and each
 // sequence's attention tiles are its bound's, whose splits its history and
 // bound plan (PagedAttention::plan); a row or tile past the sequence's rows
 // writes nothing. With `tree`, a decode step's rows' places in their lanes'
@@ -164,6 +155,21 @@ struct AttentionRows final {
 // Which of its sequences' attention rows a layer outputs: every row, or each
 // sequence's last row alone, sequence s's as output row s.
 enum class AttentionOutput : uint8_t { Every, Last };
+
+// Where a layer's attention writes its rows (addAttention): as the
+// out-projection's input rows `hidden`, each multiplied by the sigmoid of its
+// query head's gate in its packed row of `packed` where the geometry is
+// gated, or for an ungated one gathered as they are, which reads no packed
+// row; the rows `output` names, every row as its packed row or each
+// sequence's last row as row s; and, when `input` is not Plain, the
+// out-projection's table of them in `scratch` too.
+struct AttentionOutputRows final {
+  metal::MetalBuffer packed;
+  metal::MetalBuffer hidden;
+  AttentionOutput output = AttentionOutput::Every;
+  LinearScratch scratch{};
+  LinearInput input = LinearInput::Plain;
+};
 
 // The attention of a command's sequences (at most a batch's) for one layer
 // variant, planned once a step: each sequence's history splits and the tiles
@@ -240,9 +246,9 @@ struct BlockListRows final {
 
 // Target attention over paged INT8 or BF16 history, one op for every
 // command: each layer stages its sequences' queries and stores their K/V in
-// their pages (addProjection), attends them (addAttention) and gates
-// the attention rows into the out-projection's input rows (addGate), each
-// once for all its sequences, whether a decode step's lanes or a prompt
+// their pages (addProjection), then attends them into the out-projection's
+// input rows (addAttention, whose reduce gates them), each once for all its
+// sequences, whether a decode step's lanes or a prompt
 // chunk's, each reading the sequences' rows from the command's layout
 // (AttentionRows). A tile reads its history one Page32 at a time, or,
 // sparse, the blocks of its list a few at a time; neither changes cache
@@ -287,43 +293,40 @@ public:
 
   // The q/k norms and, for a rotated variant, the RoPE of the sequences'
   // packed projection rows (every query head's queries, and a gated
-  // geometry's gates, then the K and V heads): their queries staged for the
-  // attention, and their keys and values written into the pages of `layer`,
+  // geometry's gates, then the K and V heads): their queries staged in
+  // `queries` for the attention, each sequence's after the one before it, a
+  // KV head's rows its chunk_stride apart ([KV head][row][query head in
+  // group][dimension]), and their keys and values written into the pages of
+  // `layer`,
   // each sequence's through its page table, in one dispatch before the
   // attention, which reads them there. A row rotates by its packed row's
   // rows of the RoPE tables (ops::RoPE). An unrotated variant reads no RoPE
   // tables; ropeCos and ropeSin may be empty.
   static void addProjection(metal::CommandGraph &graph, metal::MetalBuffer packed, const NormWeights &queryNorm,
                             const NormWeights &keyNorm, metal::MetalBuffer ropeCos, metal::MetalBuffer ropeSin,
-                            const AttentionStaging &staging, SplashKvLayer layer,
+                            metal::MetalBuffer queries, SplashKvLayer layer,
                             std::span<const metal::MetalBuffer> pageTables,
                             std::span<const kv::ChunkedPrefillParams> sequences, const AttentionRows &rows,
                             uint32_t queryHeads, kv::Layout layout, AttentionVariant variant = {});
-  // The plan's dispatches over the staged queries into the attention rows,
-  // which must not alias, each sequence reading its history where `histories`
-  // say. The plan owns the grids; partials and statistics hold its workspace.
-  // A dispatch whose sequences read their layer in two placements (`kv`)
-  // runs as a dispatch per run of them that reads one.
-  // `sinks` holds the layer's learned sinks, an F32 per query head, for a
-  // plan whose reduce adds them (its `sinks`). With rows' tree, each sequence
-  // is a decode lane's block of at most 32 rows whose rows attend their paths
-  // (SplashAttentionParams::trees).
-  static void addAttention(metal::CommandGraph &graph, const AttentionPlan &plan, const AttentionStaging &staging,
-                           const metal::MetalBuffer &partials, const metal::MetalBuffer &statistics,
-                           std::span<const kv::ChunkedPrefillParams> sequences,
-                           std::span<const AttentionHistory> histories, const AttentionRows &rows,
-                           metal::MetalBuffer sinks = {});
-  // The sequences' attention rows `output` names as the out-projection's input
-  // rows, every row as its packed row or each sequence's last row as row s:
-  // each multiplied by the sigmoid of its query head's gate in its packed row,
-  // or for an ungated geometry gathered as they are, reading no packed row.
-  // Also writes the out-projection's `input` table into `scratch` when it is
-  // not Plain, and throws when `scratch` cannot hold it.
-  static PreparedInput addGate(metal::CommandGraph &graph, metal::MetalBuffer packed,
-                               const AttentionStaging &staging, metal::MetalBuffer hidden,
-                               std::span<const kv::ChunkedPrefillParams> sequences, const AttentionRows &rows,
-                               AttentionOutput output, uint32_t queryHeads, kv::Layout layout,
-                               LinearScratch scratch = {}, LinearInput input = LinearInput::Plain);
+  // The plan's dispatches over the staged queries into the out-projection's
+  // input rows (`output`, AttentionOutputRows), which must not alias them,
+  // each sequence reading its history where `histories` say: each reduce
+  // gates its rows and writes them, and the out-projection's table where
+  // output.input is not Plain (it throws when output.scratch cannot hold
+  // it), which the returned input names. The plan owns the grids; partials
+  // and statistics hold its workspace. A dispatch whose sequences read their
+  // layer in two placements (`kv`) runs as a dispatch per run of them that
+  // reads one. `sinks` holds the layer's learned sinks, an F32 per query
+  // head, for a plan whose reduce adds them (its `sinks`). With rows' tree,
+  // each sequence is a decode lane's block of at most 32 rows whose rows
+  // attend their paths (SplashAttentionParams::trees). An output of each
+  // sequence's last row takes the plan of its last tiles (lastTiles).
+  static PreparedInput addAttention(metal::CommandGraph &graph, const AttentionPlan &plan,
+                                    metal::MetalBuffer queries, const metal::MetalBuffer &partials,
+                                    const metal::MetalBuffer &statistics,
+                                    std::span<const kv::ChunkedPrefillParams> sequences,
+                                    std::span<const AttentionHistory> histories, const AttentionRows &rows,
+                                    const AttentionOutputRows &output, metal::MetalBuffer sinks = {});
   // One dispatch of the block lists of up to a batch of sequences of a
   // command's rows (`rows`, whose tree it does not read), whose block masks
   // are rows of `mask`, one a packed row, `maskWords` words each

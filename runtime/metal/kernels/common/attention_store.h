@@ -13,7 +13,7 @@ using namespace metal;
 // sequence's committed tokens plus the row: a decode step
 // writes all its rows, a lane's at the slots of their rows of its block; its
 // commit moves the accepted path's rows to the slots of their depths
-// (splash_path_commit_phase, paged_attention_store.metal), and the rows past
+// (splash_path_commit_phase, kv_path_commit.metal), and the rows past
 // them stay unreachable until the next command starting at the same logical
 // position overwrites them. INT8 pages take a scale per row and head, the
 // largest magnitude of the head's values over 127, and codes of the values

@@ -22,10 +22,10 @@
 #include <vector>
 
 // The paged-attention fixture attention-sweep times: deterministic Page32
-// history of every lane in the extents of a pool, one sequence of rows per
-// lane with its queries, and the production store and attention graph over
-// them; and the move of a block from a page to a block cache that an
-// attention reads through its locations.
+// history and rows of every lane in the extents of a pool, one sequence of
+// rows per lane with its queries, and the production attention graph over
+// them, which writes the out-projection's rows; and the move of a block from
+// a page to a block cache that an attention reads through its locations.
 namespace splash::test {
 
 // The target attention layer a fixture holds: its query and KV heads and
@@ -71,7 +71,7 @@ struct AttentionFixturePlan final {
   // ops::AttentionRows). Table0 is lane 0's page table; every other lane's
   // follows it.
   enum class Tensor : uint32_t {
-    Queries, Output, Partials, Statistics, Sinks, Layout,
+    Queries, Packed, Output, Partials, Statistics, Sinks, Layout,
     Table0, Count = Table0 + kMaximumLanes
   };
   using Histories = std::array<uint32_t, kMaximumLanes>;
@@ -80,7 +80,7 @@ struct AttentionFixturePlan final {
   AttentionFixtureGeometry geometry;
   uint32_t lanes = 0;
   uint32_t rows = 0;
-  // A lane's rows of chunk keys and values, queries and output: whole pages.
+  // A lane's staged query rows: whole pages.
   uint32_t stride = 0;
   Histories histories{};
   // The pages of each lane's history and rows.
@@ -150,7 +150,13 @@ struct AttentionFixturePlan final {
     const uint64_t queries =
         uint64_t{lanes} * shape.queryHeads * plan.stride * shape.headDimension * sizeof(uint16_t);
     plan.size(Tensor::Queries, queries);
-    plan.size(Tensor::Output, queries);
+    // The rows' packed projection rows, from which the reduce reads their
+    // gates (zero here, whose sigmoid is a half): each query head's queries
+    // and gate, then the K and V heads; and the out-projection's input rows
+    // it writes.
+    plan.size(Tensor::Packed, uint64_t{lanes} * rows * (2 * shape.queryHeads + 2 * shape.kvHeads) *
+                                  shape.headDimension * sizeof(uint16_t));
+    plan.size(Tensor::Output, uint64_t{lanes} * rows * shape.queryHeads * shape.headDimension * sizeof(uint16_t));
     plan.size(Tensor::Partials, scratch.partialsBytes);
     plan.size(Tensor::Statistics, scratch.statisticsBytes);
     plan.size(Tensor::Sinks, uint64_t{shape.queryHeads} * sizeof(float));
@@ -312,15 +318,15 @@ public:
                 const ops::AttentionBlocks &blocks = {}) const {
     const auto chunks = sequences();
     const std::span<const kv::ChunkedPrefillParams> lanes = std::span(chunks).first(plan_.lanes);
-    const ops::AttentionStaging staging{buffer(Tensor::Queries), buffer(Tensor::Output)};
     std::array<ops::AttentionHistory, AttentionFixturePlan::kMaximumLanes> histories{};
     for (uint32_t lane = 0; lane < plan_.lanes; ++lane) {
       histories[lane] = {layer_, tables_[lane], blocks};
       if (blocks.stride) histories[lane].blocks.list += lane * kv::attentionTiles(plan_.rows);
     }
-    ops::PagedAttention::addAttention(graph, attention, staging, buffer(Tensor::Partials),
-                                      buffer(Tensor::Statistics), lanes, std::span(histories).first(plan_.lanes),
-                                      rows(), sinks(attention.sinks));
+    (void)ops::PagedAttention::addAttention(graph, attention, buffer(Tensor::Queries), buffer(Tensor::Partials),
+                                            buffer(Tensor::Statistics), lanes, std::span(histories).first(plan_.lanes),
+                                            rows(), {buffer(Tensor::Packed), buffer(Tensor::Output)},
+                                            sinks(attention.sinks));
   }
 
   [[nodiscard]] const AttentionFixturePlan &plan() const noexcept { return plan_; }

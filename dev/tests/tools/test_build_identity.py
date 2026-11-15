@@ -373,7 +373,7 @@ class CompileConfigurationTests(unittest.TestCase):
                 kernel_root / "shared" / name
                 for name in (
                     "paged_attention.metal",
-                    "paged_attention_store.metal",
+                    "kv_path_commit.metal",
                     "sparse_attention.metal",
                 )
             ]

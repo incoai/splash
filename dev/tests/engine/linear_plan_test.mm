@@ -1252,29 +1252,32 @@ void producerTableContract(metal::MetalBackend &backend) {
             "the GDN decode's table contract");
   }
   {
-    // The 27B's attention: 24 query heads over 4 KV heads of 256, and the
-    // staging of a lane's 8 rows in 32 per KV head.
+    // The 27B's attention: 24 query heads over 4 KV heads of 256, a lane's
+    // 8 rows staged in 32 per KV head; its reduce writes the out-projection's
+    // rows.
     const kv::Layout layout{1, 4, 256};
     const metal::MetalBuffer packed = allocate(backend, kRows * (24 * 2 + 4 * 2) * 256 * 2);
-    const ops::AttentionStaging staging{.rows = allocate(backend, 4 * 32 * 6 * 256 * 2)};
+    const metal::MetalBuffer queries = allocate(backend, 4 * 32 * 6 * 256 * 2);
     const metal::MetalBuffer hidden = allocate(backend, kRows * 24 * 256 * 2);
     const std::array lane{PagedAttention::chunkParams(0, kRows, 32, 1)};
     const metal::MetalBuffer laneRows = allocate(backend, sizeof(SplashLaneRows));
     *static_cast<SplashLaneRows *>(laneRows.contents()) = {0, kRows};
     const AttentionRows rows{laneRows, kRows};
+    const AttentionPlan plan = PagedAttention::plan(lane, 24, layout, kApple10Attention, Int8Activations::Off,
+                                                    PagedAttention::workspace(kv::kAttentionMaximumSplits, 24, layout));
+    const metal::MetalBuffer partials = allocate(backend, plan.workspace().partialsBytes),
+                             statistics = allocate(backend, plan.workspace().statisticsBytes);
+    const std::array histories{AttentionHistory{{1, 0}, allocate(backend, sizeof(SplashKvPage))}};
+    const auto attend = [&](metal::CommandGraph &graph, LinearInput input) {
+      return PagedAttention::addAttention(graph, plan, queries, partials, statistics, lane, histories, rows,
+                                          {packed, hidden, AttentionOutput::Every, {}, input});
+    };
     metal::CommandGraph graph;
-    rejects(
-        [&] {
-          (void)PagedAttention::addGate(graph, packed, staging, hidden, lane, rows, AttentionOutput::Every, 24, layout,
-                                        {}, LinearInput::Table16);
-        },
-        "linear table buffer holds", "the attention gate wrote a table without scratch");
-    require(graph.empty() &&
-                PagedAttention::addGate(graph, packed, staging, hidden, lane, rows, AttentionOutput::Every, 24, layout,
-                                        {}, LinearInput::Plain)
-                        .layout == LinearInput::Plain &&
-                plainKernel(graph, "attention_gate"),
-            "the attention gate's table contract");
+    rejects([&] { (void)attend(graph, LinearInput::Table16); }, "linear table buffer holds",
+            "the attention reduce wrote a table without scratch");
+    require(graph.empty() && attend(graph, LinearInput::Plain).layout == LinearInput::Plain &&
+                graph.dispatches().size() == 2 && graph.dispatches()[1].pipelineName == "attention_reduce",
+            "the attention reduce's table contract");
   }
 }
 

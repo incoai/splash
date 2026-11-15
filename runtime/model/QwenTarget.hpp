@@ -261,7 +261,6 @@ struct QwenTargetPrefillBuffers final {
   metal::MetalBuffer denseIntermediate;
   metal::MetalBuffer fullPacked;
   metal::MetalBuffer fullQueries;
-  metal::MetalBuffer fullAttention;
   metal::MetalBuffer attentionPartials;
   metal::MetalBuffer attentionStatistics;
   metal::MetalBuffer attentionHidden;

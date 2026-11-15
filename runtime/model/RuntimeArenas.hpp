@@ -220,7 +220,6 @@ enum class TargetTensor : uint32_t {
   Intermediate,
   FullPacked,
   FullQueries,
-  FullAttention,
   AttentionPartials,
   AttentionStatistics,
   AttentionHidden,

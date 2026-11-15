@@ -19,6 +19,7 @@
 #include <iostream>
 #include <limits>
 #include <memory>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -121,6 +122,21 @@ id<MTLBuffer> makeBuffer(id<MTLDevice> device, uint64_t bytes) {
     throw std::runtime_error("Metal buffer allocation failed");
   std::memset(result.contents, 0, result.length);
   return result;
+}
+
+// The packed projection rows of `rows` rows of a shape, from which its
+// reduce reads each query head's gate (every geometry of the head dimension
+// is gated): every gate +inf, whose sigmoid is 1, so that the reduce writes
+// each attention row as it is.
+id<MTLBuffer> identityGates(id<MTLDevice> device, Shape shape, uint64_t rows) {
+  const uint64_t width = (uint64_t{shape.queryHeads()} * 2 + uint64_t{shape.kvHeads} * 2) * kHeadDimension;
+  id<MTLBuffer> packed = makeBuffer(device, rows * width * sizeof(uint16_t));
+  auto *elements = static_cast<uint16_t *>(packed.contents);
+  for (uint64_t row = 0; row < rows; ++row)
+    for (uint32_t head = 0; head < shape.queryHeads(); ++head)
+      std::fill_n(elements + row * width + (uint64_t{head} * 2 + 1) * kHeadDimension, kHeadDimension,
+                  uint16_t{0x7f80});
+  return packed;
 }
 
 id<MTLComputePipelineState>
@@ -232,6 +248,12 @@ struct Case {
     return tree.empty() || token < params.committed_tokens || ((visible >> (token - params.committed_tokens)) & 1u);
   }
 
+  // The attention's output of lane `lane`'s row of a dispatch of the case's
+  // rows a lane, as its reduce writes the out-projection's input rows:
+  // [lane][row][query head][dimension].
+  uint64_t outputIndex(uint32_t lane, uint32_t head, uint32_t row, uint32_t dimension) const {
+    return ((uint64_t{lane} * params.row_bound + row) * shape.queryHeads() + head) * kHeadDimension + dimension;
+  }
   uint64_t queryIndex(uint32_t head, uint32_t row, uint32_t dimension) const {
     const uint32_t kvHead = head / shape.queryHeadsPerKvHead;
     const uint32_t localHead = head % shape.queryHeadsPerKvHead;
@@ -547,22 +569,46 @@ std::vector<uint8_t> copyOf(id<MTLBuffer> buffer) {
   return {bytes, bytes + buffer.length};
 }
 
-// A dispatch of `width` lanes, each the case's rows after its history: lane
-// l's rows the dispatch's from l x 8 on, its tile the dispatch's tile l and
-// its staging the KV heads after the lanes before it.
+// A lane of a dispatch: its rows, up to its case's row bound, and their
+// places as a tree (Case::tree), none for rows that attend causally.
+struct DispatchLane {
+  uint32_t rows;
+  std::vector<SplashTreeRow> tree;
+};
+
+// A dispatch of lanes `lanes`, each of the case's pages and queries after its
+// history, as a decode step packs its lanes: lane l's rows the dispatch's from
+// the lanes' before it on, its tiles (of the bound's rows) the dispatch's
+// after theirs, and its staging the KV heads after theirs. Every tree row of
+// no lane's row holds 0xFF, whose ancestors read as a chain's. The reduce
+// writes the lanes' rows as the out-projection's input rows, gated by gates
+// of +inf (identityGates). Through QSA masks each lane is the case's rows, of
+// one tile, with a copy of its list and row masks.
 Dispatch dispatch(id<MTLDevice> device, id<MTLCommandQueue> queue,
                   id<MTLComputePipelineState> split,
                   id<MTLComputePipelineState> reduce, const Case &data,
-                  uint32_t width) {
+                  std::span<const DispatchLane> lanes) {
   const Shape shape = data.shape;
-  const uint32_t splits = data.params.split_count;
+  const auto width = uint32_t(lanes.size());
+  const uint32_t splits = data.params.split_count, bound = data.params.row_bound;
+  const uint32_t laneTiles = (bound + kRows - 1) / kRows;
+  std::vector<uint32_t> first;
+  uint64_t rows = 0;
+  for (const DispatchLane &lane : lanes) {
+    require(lane.rows <= bound, "a dispatch's lane holds more rows than its bound");
+    require(!data.maskWords || (laneTiles == 1 && lane.rows == bound),
+            "a dispatch's QSA lanes are its case's rows, a tile each");
+    first.push_back(uint32_t(rows));
+    rows += lane.rows;
+  }
   const uint64_t laneBytes = data.queries.length;
   id<MTLBuffer> queries = makeBuffer(device, width * laneBytes);
-  id<MTLBuffer> output = makeBuffer(device, width * laneBytes);
-  // The workspace production allocates for `width` lanes, which holds every
-  // split count's slots.
-  const splash::ops::AttentionWorkspace workspace =
-      splash::ops::PagedAttention::workspace(width * kAttentionMaximumSplits, shape.queryHeads(), shape.layout());
+  id<MTLBuffer> packed = identityGates(device, shape, rows);
+  id<MTLBuffer> output = makeBuffer(device, rows * shape.queryHeads() * kHeadDimension * sizeof(BFloat16Bits));
+  // The workspace production allocates for the lanes' tiles, which holds
+  // every split count's slots.
+  const splash::ops::AttentionWorkspace workspace = splash::ops::PagedAttention::workspace(
+      width * laneTiles * kAttentionMaximumSplits, shape.queryHeads(), shape.layout());
   id<MTLBuffer> partials = makeBuffer(device, workspace.partialsBytes);
   id<MTLBuffer> statistics = makeBuffer(device, workspace.statisticsBytes);
   for (uint32_t lane = 0; lane < width; ++lane) {
@@ -572,32 +618,36 @@ Dispatch dispatch(id<MTLDevice> device, id<MTLCommandQueue> queue,
   // With QSA masks every lane attends through a copy of the case's list,
   // lane l's list kQsaJunkLists + l.
   const BlockLists blocks = data.maskWords ? qsaBlockLists(device, data, width) : BlockLists{partials, partials, 0};
-  // Each lane's copy of the case's tree and, through QSA masks, its row
-  // masks, at its rows.
+  // Each lane's tree and, through QSA masks, a copy of the case's row masks,
+  // at its rows, in buffers of a bound's rows a lane.
   id<MTLBuffer> tree = partials, rowMasks = partials;
-  if (!data.tree.empty()) {
-    tree = makeBuffer(device, uint64_t{width} * data.params.row_bound * sizeof(SplashTreeRow));
-    for (uint32_t lane = 0; lane < width; ++lane)
-      std::copy(data.tree.begin(), data.tree.end(), static_cast<SplashTreeRow *>(tree.contents) + lane * data.params.row_bound);
+  const bool trees = !lanes.empty() && !lanes[0].tree.empty();
+  if (trees) {
+    tree = makeBuffer(device, uint64_t{width} * bound * sizeof(SplashTreeRow));
+    std::memset(tree.contents, 0xFF, tree.length);
+    for (uint32_t lane = 0; lane < width; ++lane) {
+      require(lanes[lane].tree.size() == lanes[lane].rows, "a lane's tree is not its rows'");
+      std::copy(lanes[lane].tree.begin(), lanes[lane].tree.end(),
+                static_cast<SplashTreeRow *>(tree.contents) + first[lane]);
+    }
   }
   if (!data.rowMasks.empty()) {
-    rowMasks = makeBuffer(device, uint64_t{width} * data.params.row_bound * sizeof(uint32_t));
+    rowMasks = makeBuffer(device, uint64_t{width} * bound * sizeof(uint32_t));
     for (uint32_t lane = 0; lane < width; ++lane)
-      std::copy(data.rowMasks.begin(), data.rowMasks.end(),
-                static_cast<uint32_t *>(rowMasks.contents) + lane * data.params.row_bound);
+      std::copy(data.rowMasks.begin(), data.rowMasks.end(), static_cast<uint32_t *>(rowMasks.contents) + first[lane]);
   }
-  SplashAttentionParams params{.sequences = width, .first_sequence = 0, .rows = width * data.params.row_bound,
-                               .tiles = width, .trees = data.tree.empty() ? 0U : 1U, .last_rows = 0,
+  SplashAttentionParams params{.sequences = width, .first_sequence = 0, .rows = uint32_t(rows),
+                               .tiles = width * laneTiles, .trees = trees ? 1U : 0U, .last_rows = 0,
                                .kv = data.pool->layer(kLayer), .sequence = {}};
   // Each lane's rows of the command, after the lanes before it.
   id<MTLBuffer> layout = makeBuffer(device, width * sizeof(SplashLaneRows));
   for (uint32_t lane = 0; lane < width; ++lane) {
-    static_cast<SplashLaneRows *>(layout.contents)[lane] = {lane * data.params.row_bound, data.params.row_bound};
+    static_cast<SplashLaneRows *>(layout.contents)[lane] = {first[lane], lanes[lane].rows};
     SplashAttentionSequence &sequence = params.sequence[lane];
     sequence = data.params;
     sequence.stage_row = lane * shape.kvHeads * kStride;
-    sequence.first_tile = lane;
-    sequence.first_slot = lane * shape.kvHeads * splits;
+    sequence.first_tile = lane * laneTiles;
+    sequence.first_slot = lane * laneTiles * shape.kvHeads * splits;
     sequence.block_stride = blocks.stride;
     sequence.block_list = blocks.stride ? kQsaJunkLists + lane : 0;
   }
@@ -626,23 +676,34 @@ Dispatch dispatch(id<MTLDevice> device, id<MTLCommandQueue> queue,
   for (id<MTLBuffer> extent : data.extents)
     [encoder useResource:extent usage:MTLResourceUsageRead];
   // The sparse split's grid is one-dimensional (AttentionPlan::splitGroups).
-  [encoder dispatchThreadgroups:shape.sparse() ? MTLSizeMake(shape.kvHeads * splits, width, 1)
-                                               : MTLSizeMake(shape.kvHeads * shape.parts(), width, splits)
+  [encoder dispatchThreadgroups:shape.sparse() ? MTLSizeMake(shape.kvHeads * splits, width * laneTiles, 1)
+                                               : MTLSizeMake(shape.kvHeads * shape.parts(), width * laneTiles, splits)
           threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+  // The plain reduce writes no table: the output rows take the table's and
+  // its sums' bindings.
   [encoder setComputePipelineState:reduce];
   [encoder setBuffer:partials offset:0 atIndex:0];
   [encoder setBuffer:statistics offset:0 atIndex:1];
-  [encoder setBuffer:output offset:0 atIndex:2];
-  [encoder setBuffer:layout offset:0 atIndex:3];
-  paramsIndex = 4;
+  [encoder setBuffer:packed offset:0 atIndex:2];
+  for (NSUInteger index = 3; index < 6; ++index)
+    [encoder setBuffer:output offset:0 atIndex:index];
+  [encoder setBuffer:layout offset:0 atIndex:6];
+  paramsIndex = 7;
   if (shape.sparse())
     [encoder setBuffer:blocks.counts offset:0 atIndex:paramsIndex++];
   [encoder setBytes:&params length:sizeof(params) atIndex:paramsIndex];
-  [encoder dispatchThreadgroups:MTLSizeMake(shape.kvHeads, shape.fusedRows(), width)
+  [encoder dispatchThreadgroups:MTLSizeMake(shape.kvHeads, shape.fusedRows(), width * laneTiles)
           threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
   [encoder endEncoding];
   finish(command);
   return {copyOf(output), copyOf(partials), copyOf(statistics)};
+}
+
+// A dispatch of `width` lanes, each the case's rows and tree.
+Dispatch dispatch(id<MTLDevice> device, id<MTLCommandQueue> queue, id<MTLComputePipelineState> split,
+                  id<MTLComputePipelineState> reduce, const Case &data, uint32_t width) {
+  const std::vector<DispatchLane> lanes(width, DispatchLane{data.params.row_bound, data.tree});
+  return dispatch(device, queue, split, reduce, data, lanes);
 }
 
 // The BF16 quality gate measures Q8 quantization fidelity on the synthetic
@@ -657,8 +718,8 @@ void checkOutput(const Case &data, uint32_t width,
   const uint32_t activeRows = data.params.row_bound;
   const auto *actual =
       reinterpret_cast<const BFloat16Bits *>(outputBytes.data());
-  const uint64_t laneElements = expectedQ8.size();
-  require(outputBytes.size() == width * laneElements * sizeof(BFloat16Bits),
+  require(outputBytes.size() ==
+              uint64_t{width} * activeRows * shape.queryHeads() * kHeadDimension * sizeof(BFloat16Bits),
           "attention output size departed from its lanes");
   double dot = 0.0;
   double actualSquared = 0.0;
@@ -682,7 +743,7 @@ void checkOutput(const Case &data, uint32_t width,
         float bf16TopValue = -std::numeric_limits<float>::infinity();
         for (uint32_t dimension = 0; dimension < kHeadDimension; ++dimension) {
           const uint64_t local = data.queryIndex(head, row, dimension);
-          const uint64_t index = uint64_t{lane} * laneElements + local;
+          const uint64_t index = data.outputIndex(lane, head, row, dimension);
           const float observed = bfloat16ToFloat(actual[index]);
           const float q8Reference = bfloat16ToFloat(expectedQ8[local]);
           const float bf16Reference = bfloat16ToFloat(expectedBf16[local]);
@@ -884,8 +945,8 @@ void treeAgainstChains(id<MTLDevice> device, id<MTLCommandQueue> queue, const Pi
       for (uint32_t row = 0; row < rows; ++row) {
         float largest = 0.0f, difference = 0.0f;
         for (uint32_t dimension = 0; dimension < kHeadDimension; ++dimension) {
-          const float a = bfloat16ToFloat(treeOut[whole.queryIndex(head, path[row], dimension)]);
-          const float b = bfloat16ToFloat(chainOut[chain.queryIndex(head, row, dimension)]);
+          const float a = bfloat16ToFloat(treeOut[whole.outputIndex(0, head, path[row], dimension)]);
+          const float b = bfloat16ToFloat(chainOut[chain.outputIndex(0, head, row, dimension)]);
           largest = std::max({largest, std::abs(a), std::abs(b)});
           difference = std::max(difference, std::abs(a - b));
           differing += a != b;
@@ -897,6 +958,52 @@ void treeAgainstChains(id<MTLDevice> device, id<MTLCommandQueue> queue, const Pi
   std::cout << name << " committed=" << committed << " values=" << compared << " differing=" << differing
             << " worst_in_bf16_steps_of_the_row=" << worst << '\n';
   require(worst <= 1.0f, "a tree row's attention departs from its path's chain by more than its rounding");
+}
+
+// Lanes of 16, 5, 9 and 12 rows of a verify block's bound, two tiles a lane,
+// packed by their first rows (0, 16, 21 and 30) after the same history, each
+// a tree that branches: each lane's rows are a dispatch of it alone, bit for
+// bit, whose rows match the reference of the lane's tree. The tree rows of no
+// lane's row hold 0xFF, whose ancestors read as a chain's (dispatch), so that
+// a lane that took its tree rows at another row than its first (lanes 2 and 3
+// at lane x 16) attends another lane's tree or a chain.
+void raggedTrees(id<MTLDevice> device, id<MTLCommandQueue> queue, const Pipelines &pipelines, Shape shape,
+                 uint32_t committed, uint32_t splits, bool qualityGate) {
+  constexpr uint32_t kBound = SPLASH_TARGET_VERIFY_ROWS;
+  // A chain with a branch off row 2 at row 8, two children a row, a chain
+  // with branches off rows 1 and 4, and two children a row again.
+  const std::array<std::vector<int>, 4> kParents{
+      std::vector<int>{-1, 0, 1, 2, 3, 4, 5, 6, 2, 8, 9, 10, 11, 12, 13, 14}, std::vector<int>{-1, 0, 0, 1, 1},
+      std::vector<int>{-1, 0, 1, 2, 1, 4, 5, 4, 7}, std::vector<int>{-1, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5}};
+  std::array<DispatchLane, 4> lanes;
+  for (uint32_t lane = 0; lane < lanes.size(); ++lane) {
+    std::vector<SplashTreeRow> &tree = lanes[lane].tree;
+    for (uint32_t row = 0; row < kParents[lane].size(); ++row) {
+      const int parent = kParents[lane][row];
+      tree.push_back(parent < 0 ? SplashTreeRow{1u, SPLASH_TREE_ROOT, 0}
+                                : SplashTreeRow{tree[parent].ancestors | 1u << row, static_cast<uint16_t>(parent),
+                                                static_cast<uint16_t>(tree[parent].depth + 1)});
+    }
+    lanes[lane].rows = uint32_t(tree.size());
+  }
+  Case data = makeCase(device, shape, committed, kBound, splits);
+  fill(data);
+  const std::string name = pipelines.splitName + "_ragged_trees";
+  const Dispatch packed = dispatch(device, queue, pipelines.split, pipelines.reduce, data, lanes);
+  const uint64_t rowBytes = uint64_t{shape.queryHeads()} * kHeadDimension * sizeof(BFloat16Bits);
+  uint64_t first = 0;
+  for (uint32_t lane = 0; lane < lanes.size(); ++lane) {
+    const Dispatch alone =
+        dispatch(device, queue, pipelines.split, pipelines.reduce, data, std::span(lanes).subspan(lane, 1));
+    Case reference = makeCase(device, shape, committed, lanes[lane].rows, splits);
+    reference.tree = lanes[lane].tree;
+    fill(reference);
+    checkOutput(reference, 1, cpuReference(reference, true), cpuReference(reference, false), alone.output,
+                qualityGate, name + "_lane" + std::to_string(lane));
+    require(!std::memcmp(packed.output.data() + first * rowBytes, alone.output.data(), lanes[lane].rows * rowBytes),
+            name + ": lane " + std::to_string(lane) + " of a packed step attends otherwise than alone");
+    first += lanes[lane].rows;
+  }
 }
 
 
@@ -945,7 +1052,7 @@ void runCase(id<MTLDevice> device, id<MTLCommandQueue> queue,
 
 // Isolate the merge from QK/PV: large differences in maxima, cancellation,
 // ragged split counts and inactive rows exercise the reduction of a tile of
-// eight active rows or fewer.
+// eight active rows or fewer, which writes the active rows alone.
 void checkReduce(id<MTLDevice> device, id<MTLCommandQueue> queue,
                  id<MTLLibrary> library, Shape shape, uint32_t splits,
                  uint32_t activeRows) {
@@ -966,23 +1073,25 @@ void checkReduce(id<MTLDevice> device, id<MTLCommandQueue> queue,
         for (uint32_t dim = 0; dim < d; ++dim)
           p[index * d + dim] = float(int((split * 71 + dim * 37 + row * 13) % 257) - 128) * 0.125f;
       }
-  // The merge of the partials into a poisoned output; a sparse reduce without
-  // lists binds another buffer of the dispatch for their counts, of which it
-  // reads nothing.
+  // The merge of the partials into a poisoned output of a tile's rows, gated
+  // by gates of +inf; a sparse reduce without lists binds another buffer of
+  // the dispatch for their counts, of which it reads nothing.
   id<MTLBuffer> layout = makeBuffer(device, sizeof(SplashLaneRows));
   *static_cast<SplashLaneRows *>(layout.contents) = {0, activeRows};
+  id<MTLBuffer> packed = identityGates(device, shape, kRows);
   const auto reduce = [&](const SplashAttentionParams &params) {
-    id<MTLBuffer> output = makeBuffer(device, uint64_t{shape.kvHeads} * kStride *
-                                                 shape.queryHeadsPerKvHead * d * 2);
+    id<MTLBuffer> output = makeBuffer(device, uint64_t{kRows} * shape.queryHeads() * d * 2);
     std::memset(output.contents, 0xa5, output.length);
     id<MTLCommandBuffer> command = [queue commandBuffer];
     id<MTLComputeCommandEncoder> encoder = [command computeCommandEncoder];
     [encoder setComputePipelineState:makePipeline(device, library, shape.reduce())];
     [encoder setBuffer:partials offset:0 atIndex:0];
     [encoder setBuffer:stats offset:0 atIndex:1];
-    [encoder setBuffer:output offset:0 atIndex:2];
-    [encoder setBuffer:layout offset:0 atIndex:3];
-    NSUInteger paramsIndex = 4;
+    [encoder setBuffer:packed offset:0 atIndex:2];
+    for (NSUInteger index = 3; index < 6; ++index)
+      [encoder setBuffer:output offset:0 atIndex:index];
+    [encoder setBuffer:layout offset:0 atIndex:6];
+    NSUInteger paramsIndex = 7;
     if (shape.sparse())
       [encoder setBuffer:partials offset:0 atIndex:paramsIndex++];
     [encoder setBytes:&params length:sizeof(params) atIndex:paramsIndex];
@@ -992,17 +1101,20 @@ void checkReduce(id<MTLDevice> device, id<MTLCommandQueue> queue,
     finish(command);
     return output;
   };
-  // The fp64 merge of each active row, the inactive rows' zeros and the
-  // poison kept past the eight-row view.
+  // The fp64 merge of each active row, and the poison kept in the inactive
+  // rows: fused row `row` of KV head `head` is query head head x group +
+  // row % group of output row row / group.
   const auto check = [&](id<MTLBuffer> output) {
     const auto *out = static_cast<const BFloat16Bits *>(output.contents);
     for (uint32_t head = 0; head < shape.kvHeads; ++head)
       for (uint32_t row = 0; row < m; ++row) {
-        const uint64_t offset = (uint64_t{head} * kStride * shape.queryHeadsPerKvHead + row) * d;
+        const uint64_t offset = (uint64_t{row / shape.queryHeadsPerKvHead} * shape.queryHeads() +
+                                 head * shape.queryHeadsPerKvHead + row % shape.queryHeadsPerKvHead) *
+                                d;
         const bool active = row / shape.queryHeadsPerKvHead < activeRows;
         if (!active) {
           for (uint32_t dim = 0; dim < d; ++dim)
-            require(out[offset + dim] == 0, "inactive attention row was not exactly zero");
+            require(out[offset + dim] == 0xa5a5, "attention merge wrote an inactive row");
           continue;
         }
         double maximum = -INFINITY;
@@ -1025,12 +1137,6 @@ void checkReduce(id<MTLDevice> device, id<MTLCommandQueue> queue,
                   "attention merge differs from fp64 reference");
         }
       }
-    for (uint32_t head = 0; head < shape.kvHeads; ++head)
-      for (uint32_t row = m; row < kStride * shape.queryHeadsPerKvHead; ++row)
-        for (uint32_t dim = 0; dim < d; ++dim)
-          require(out[(uint64_t{head} * kStride * shape.queryHeadsPerKvHead + row) * d + dim] ==
-                      0xa5a5,
-                  "attention merge wrote beyond its eight-row view");
   };
   // A history every split takes a share of: a page each of the page loop's,
   // and of a sparse reduce without lists the least blocks a split takes.
@@ -1101,6 +1207,10 @@ void run(const char *libraryPath) {
     runCase(device, queue, pipelines, shape, 0, 8, 1, true, 32, false, true);
     runCase(device, queue, pipelines, shape, 127, 8, 4, true, 32, false, true);
     runCase(device, queue, pipelines, shape, 4'093, 7, 2, false, 65, false, true);
+    // Tree rows of lanes of 16, 5, 9 and 12 rows packed by their first rows,
+    // over no history and one past a page.
+    raggedTrees(device, queue, pipelines, shape, 0, 32, true);
+    raggedTrees(device, queue, pipelines, shape, 127, 32, true);
     if (shape.queryHeadsPerKvHead == 12) {
       // Tree rows through QSA lists and row masks, causal and sparse, and
       // against their paths as chains.
