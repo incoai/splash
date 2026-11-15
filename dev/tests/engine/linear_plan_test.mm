@@ -131,7 +131,8 @@ void apple9StagesPastTheRegisterTile() {
       const bool staged = rows > kMaximumRegisterRows && rows <= kMaximumDecodeTileRows;
       const LinearTile tile =
           rows <= kMaximumRegisterRows ? LinearTile::GgufRegister : staged ? LinearTile::GgufStaged : LinearTile::GgufPrefill;
-      if (plan.configuration().tile != tile || plan.storageRows() != (rows <= 32 ? 32U : staged ? 64U : 128U))
+      if (plan.configuration().tile != tile ||
+          plan.storageRows() != (rows <= 32 ? 32U : staged ? stagedTileRows(rows) : 128U))
         broke("Apple9 chunk tile", 9, cores, plan.workload());
     }
 }
@@ -357,8 +358,8 @@ void ggufPlans() {
               three.scratchSize().partials == splitPartialsBytes(three),
           "GGUF staged three-lane plans run the 32-row tile");
   for (const auto [rows, storage] :
-       {std::pair{1U, 8U}, {8U, 8U}, {9U, 16U}, {17U, 32U}, {25U, 32U}, {32U, 32U}, {33U, 64U}, {48U, 64U},
-        {64U, 64U}, {65U, 128U}, {100U, 128U}, {129U, 256U}, {2048U, 2048U}}) {
+       {std::pair{1U, 8U}, {8U, 8U}, {9U, 16U}, {17U, 32U}, {25U, 32U}, {32U, 32U}, {33U, 48U}, {48U, 48U},
+        {49U, 64U}, {64U, 64U}, {65U, 128U}, {100U, 128U}, {129U, 256U}, {2048U, 2048U}}) {
     const LinearPlan prefill = linear.plan({{5120, 17408}, rows, LinearEpilogue::UpWithGate},
                                            blockProjection(5120, 17408, 1));
     // Plans of up to 64 rows take the decode tiles, here the staged tile and

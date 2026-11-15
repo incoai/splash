@@ -17,7 +17,7 @@
 // Decode tile of the staged kernels, which runs plans of up to 64 rows, a
 // decode step's or a prompt chunk's alike: two simdgroups, each staging its
 // own GGUF_STAGED_COLUMNS columns GGUF_STAGED_STEP inputs at a time over 8,
-// 16, 32 or 64 rows.
+// 16, 32, 48 or 64 rows.
 #define GGUF_STAGED_COLUMNS 32u
 #define GGUF_STAGED_STEP 32u
 #define GGUF_STAGED_THREADS (GGUF_TILE_COLUMNS / GGUF_STAGED_COLUMNS * 32u)

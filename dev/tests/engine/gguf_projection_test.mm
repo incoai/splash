@@ -790,7 +790,7 @@ void oneGateUpPass(MetalBackend &backend, const Linear &linear, bool spread) {
 // 168- and 136-row chunks on the 128-row tiles: the second tile holds 40 or 8 rows, so its last two or three 32-row
 // simdgroups skip their matmuls, though not the barriers of the stage they share, and leave the rows from 192 or 160
 // unwritten. Chunks of up to 32 rows run the decode tiles, whose rows equal the 128-row tiles' bitwise without K
-// splits and lie within fp64 with them; chunks of 33-64 rows run the 64-row decode tile, alike, and also at eight
+// splits and lie within fp64 with them; chunks of 33-64 rows run the 48- and 64-row tiles, alike, and also at eight
 // partitions, which the split law takes for some shapes, where K takes them. Every chunk's last 1 and 4 rows, on its
 // tile and splits at their own height, equal its rows bitwise. Each of `formats` ([1024, K]) at each epilogue, and a
 // fused projection at its segments' column offsets.

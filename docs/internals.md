@@ -520,7 +520,7 @@ The rules:
    is below its `RegisterBoundary`: 4 x column tiles x table tiles <
    belowQuarters x cores, a one-pass-eligible gate/up pair's column tiles
    counting both tensors'. It splits by `registerSplits`. Otherwise the staged
-   tile runs at the fewest of 8, 16, 32 or 64 rows that hold the plan's, split by
+   tile runs at the fewest of 8, 16, 32, 48 or 64 rows that hold the plan's, split by
    `stagedSplits` (the Apple10 wave law also picks one or two passes for a
    pair of one format from `onePassFromCores`), its walks spread from
    `spreadFromCores`, and a plan of one table tile unsplit on the 16-row tile
@@ -590,9 +590,9 @@ every projection
 
 - a prefill of the most rows, 2048, and one of each class of chunk whose
   projections run kernels of their own, of its fewest rows
-  (`ExecutionPlans::prefillRowClasses`): each staged tile height a chunk takes,
-  from 1, 9, 17 and 33 rows, and the prefill tile, from 65 rows. These need no
-  memory the first
+  (`ExecutionPlans::prefillRowClasses`): each decode tile and height a chunk
+  takes, from 1 (the column tile), 3, 9, 17, 25, 33 and 49 rows, and the
+  prefill tile, from 65 rows. These need no memory the first
   did not, and are required as it is. Every other kernel choice a chunk's
   rows make today has one threshold (the float tiles, the MoE expert and
   router tiles, the staged norm, the hyper-connection norm's quarters, and the

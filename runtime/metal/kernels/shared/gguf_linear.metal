@@ -101,11 +101,11 @@ constant constexpr uint kPrefillStages = 2 * GGUF_TILE_COLUMNS * GGUF_PREFILL_ST
 
 // ---------------- decode dispatches over (64-column tiles, K partitions): two simdgroups of 32 columns per
 // threadgroup, every row of the plan in its tile, `splits` partitions of K (grid.y; kernels/common/split_reduce.h).
-// MPP computes 16-row fragments, so a tile holds 8, 16, 32 or 64 rows, the fewest that hold the plan's (these
-// kernels and the fused ones): 24 rows run the 32-row tile, 33 to 64 the 64-row tile, and a plan of at most 8 may run
-// the 16-row tile (LinearPlan::storageRows); the padding rows are computed and discarded. Rows are independent, so
-// every active row is the bits of any other tile height (gguf-projection checks it); the 32-row tile at 24 rows costs
-// what it costs at 32, 3-15% less than a 16-row plus an 8-row matmul per stage.
+// MPP computes 16-row fragments, so a tile holds 8, 16, 32, 48 or 64 rows, the fewest that hold the plan's (these
+// kernels and the fused ones): 24 rows run the 32-row tile, 33 to 48 the 48-row tile, 49 to 64 the 64-row tile, and a
+// plan of at most 8 may run the 16-row tile (LinearPlan::storageRows); the padding rows are computed and discarded.
+// Rows are independent, so every active row is the bits of any other tile height (gguf-projection checks it); the
+// 32-row tile at 24 rows costs what it costs at 32, 3-15% less than a 16-row plus an 8-row matmul per stage.
 // Gate/up runs as a gate pass (a) into the gate scratch and an up pass (g) whose epilogue applies silu(gate) to the bf16
 // up value, as the Apple9 register kernels do. The destination's type Out is bf16, or fp32 for the plain epilogue's
 // logits (a_f32, ops::Projection::destination). Each column tile walks its partition from the step staged_first_step
@@ -151,7 +151,7 @@ using GgufDecodeKernel = void(device bfloat *, device uchar *, device uchar *, d
   template [[host_name("gguf_decode_" #f "_m" #R "_" #ep)]] kernel GgufDecodeKernel<Out> gguf_decode<F, R, Ep, Out>;
 #define GGUF_DECODE_ROWS(F, f, ep, Ep, Out)                                                                     \
   GGUF_DECODE(F, f, 8, ep, Ep, Out) GGUF_DECODE(F, f, 16, ep, Ep, Out) GGUF_DECODE(F, f, 32, ep, Ep, Out)       \
-  GGUF_DECODE(F, f, 64, ep, Ep, Out)
+  GGUF_DECODE(F, f, 48, ep, Ep, Out) GGUF_DECODE(F, f, 64, ep, Ep, Out)
 #define GGUF_DECODE_FORMAT(F, f)                                                                                  \
   GGUF_DECODE_ROWS(F, f, a, EpNone, bfloat) GGUF_DECODE_ROWS(F, f, a_f32, EpNone, float)                          \
   GGUF_DECODE_ROWS(F, f, r, EpResidual, bfloat) GGUF_DECODE_ROWS(F, f, g, EpUpWithGate, bfloat)
@@ -258,7 +258,7 @@ struct fused_formats {
                        p.out_stride, column0, simd_group * 32 + simd_lane, &arrival,                              \
                        [&](uint row, uint column, float v) { output[ulong(row) * p.out_stride + column0 + column] = bfloat(v); }); \
   }
-GGUF_DECODE_FUSED(8) GGUF_DECODE_FUSED(16) GGUF_DECODE_FUSED(32) GGUF_DECODE_FUSED(64)
+GGUF_DECODE_FUSED(8) GGUF_DECODE_FUSED(16) GGUF_DECODE_FUSED(32) GGUF_DECODE_FUSED(48) GGUF_DECODE_FUSED(64)
 #undef GGUF_DECODE_FUSED
 
 // The prefill kernels: grid (GGUF_PREFILL_ROWS-row tiles of the chunk, column tiles), four simdgroups; the residual

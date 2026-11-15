@@ -75,7 +75,7 @@ enum class LinearEpilogue : uint8_t { None, Residual, GateUp, UpWithGate };
 // (LinearConfig::oneGateUpPass) runs 32 columns of both tensors per
 // threadgroup of one simdgroup. The staged tiles, GgufStaged and GgufPrefill,
 // dequantize the weights into threadgroup memory for matmul2d.
-// GgufStaged: the two-simdgroup staged tile of 8, 16, 32 or 64 rows, each
+// GgufStaged: the two-simdgroup staged tile of 8, 16, 32, 48 or 64 rows, each
 // simdgroup staging its own columns, with optional K splits. GgufPrefill: the
 // 128-row shared-stage prefill tile.
 // GgufRegister: the exact register tile on bf16 8x8 matrix operations
@@ -111,11 +111,11 @@ inline constexpr uint32_t kMaximumPairRows = 32;
 // (kernels/shared/gguf_linear.metal).
 inline constexpr uint32_t kMaximumInt8Rows = 32;
 // The staged tile that holds `rows` rows: MPP computes 16-row fragments, so
-// the tile holds 8, 16, 32 or 64 rows, the fewest that hold the plan's (24
-// rows run the 32-row tile; a plan of at most 8 may run the 16-row tile,
-// LinearConfig::sixteenRows).
+// the tile holds 8, 16, 32, 48 or 64 rows, the fewest that hold the plan's (24
+// rows run the 32-row tile, 40 the 48-row tile; a plan of at most 8 may run
+// the 16-row tile, LinearConfig::sixteenRows).
 [[nodiscard]] constexpr uint32_t stagedTileRows(uint32_t rows) noexcept {
-  return rows <= 8 ? 8 : rows <= 16 ? 16 : rows <= 32 ? 32 : 64;
+  return rows <= 8 ? 8 : rows <= 16 ? 16 : rows <= 32 ? 32 : rows <= 48 ? 48 : 64;
 }
 // The rows a staged plan of `rows` rows stores: its tile's, or 16 for a plan
 // on the 16-row tile (LinearConfig::sixteenRows) or on the int8 tiles, whose
