@@ -15,10 +15,12 @@
 // pipeline and GPU microseconds. A lane whose answer ends begins it again
 // between cycles, untimed. --prompt FILE[,FILE...] takes each lane's prompt
 // from a file of token ids, lane i the (i mod n)th of n files, as a served
-// width's lanes read different text. --step-rows has every decode step take T
+// width's lanes read different text; --widths N profiles B1 through BN.
+// --step-rows has every decode step take T
 // rows (at most 16 and at least one a lane: RuntimeInstrumentation::
 // forceStepRows), for the cost of a step by its rows; --attribute off times
-// the fused cycles alone.
+// the fused cycles alone and the prompt's fused prefill. --answer-tokens
+// sizes each lane's pages too.
 // With --images it profiles the vision encoder instead, loading only the
 // model's vision role: K encodes of a synthetic image per patch grid (height
 // x width in patches), fused and then attributed.
@@ -365,7 +367,7 @@ int main(int argc, char **argv) {
         std::cerr << "usage: decode-profile METALLIB MODEL_ROOT "
                      "[--prompt-tokens N] [--cycles K] [--kv-format int8|bf16] "
                      "[--state-format fp32|bf16] [--expert-memory SIZE] [--ple-memory SIZE] "
-                     "[--dispatch-list FILE] [--verify-rows auto|all] [--step-rows T] [--attribute on|off] "
+                     "[--dispatch-list FILE] [--verify-rows auto|all] [--step-rows T] [--attribute on|off] [--widths N] "
                      "[--warmups on|off] [--prompt chat|counting|FILE[,FILE...]] [--step-log on|off] "
                      "[--temperature T [--seed S]] [--thinking-budget TOKENS] [--answer-tokens N]\n"
                      "       decode-profile METALLIB MODEL_ROOT "
@@ -374,6 +376,8 @@ int main(int argc, char **argv) {
       }
       uint32_t promptTokens = 512;
       uint32_t cycles = 4;
+      // The widest width profiled, B1 through it.
+      uint32_t widths = 4;
       kv::Format format = kv::Format::Int8;
       ops::GdnStateFormat stateFormat = ops::GdnStateFormat::Float32;
       std::vector<ops::ImageGrid> grids;
@@ -404,6 +408,12 @@ int main(int argc, char **argv) {
           textOptions = true;
         } else if (option == "--cycles")
           cycles = parseCount(argv[index + 1], "--cycles");
+        else if (option == "--widths") {
+          widths = parseCount(argv[index + 1], "--widths");
+          if (widths > 4)
+            throw std::invalid_argument("--widths takes 1 to 4");
+          textOptions = true;
+        }
         else if (option == "--kv-format") {
           const std::string_view value(argv[index + 1]);
           if (value != "int8" && value != "bf16")
@@ -493,7 +503,7 @@ int main(int argc, char **argv) {
 
       // Enough Page32 pages for four lanes of prompt plus generated rows.
       const uint32_t pagesPerLane =
-          (promptTokens + 256 + model::ExecutionLimits::targetVerifyRows) /
+          (promptTokens + std::max(answer.tokens, kAnswerTokens) + model::ExecutionLimits::targetVerifyRows) /
               kv::kPageTokens +
           2;
       // Whole extents of the largest size the pool rule picks, as a large
@@ -556,8 +566,8 @@ int main(int argc, char **argv) {
             ids.push_back(id);
           if (ids.empty() || !input.eof())
             throw std::invalid_argument("--prompt reads files of token ids");
-          if (ids.size() + answer.tokens > promptTokens + kAnswerTokens)
-            throw std::invalid_argument("--prompt-tokens holds no lane's prompt and answer of " + file.string());
+          if (ids.size() > promptTokens)
+            throw std::invalid_argument("--prompt-tokens holds no lane's prompt of " + file.string());
         }
       }
       // Lane `index`'s prompt.
@@ -585,15 +595,19 @@ int main(int argc, char **argv) {
       prefill(executor, lanes[0], prompt, answer);
       const double prefillFused =
           executor.telemetry().totalPrefillGpuSeconds - prefillBefore;
-      executor.end(lanes[0].id);
-      BackendInstrumentation::setDispatchProfiling(backend, true);
-      prefill(executor, lanes[0], prompt, answer);
-      BackendInstrumentation::setDispatchProfiling(backend, false);
-      Table prefillTable;
-      accumulate(prefillTable,
-                 BackendInstrumentation::takeDispatchProfile(backend));
-      print("prefill " + std::to_string(promptTokens) + " rows", prefillTable,
-            1.0, prefillFused);
+      if (attribute) {
+        executor.end(lanes[0].id);
+        BackendInstrumentation::setDispatchProfiling(backend, true);
+        prefill(executor, lanes[0], prompt, answer);
+        BackendInstrumentation::setDispatchProfiling(backend, false);
+        Table prefillTable;
+        accumulate(prefillTable,
+                   BackendInstrumentation::takeDispatchProfile(backend));
+        print("prefill " + std::to_string(prompt.size()) + " rows", prefillTable,
+              1.0, prefillFused);
+      } else {
+        std::printf("== prefill %zu rows: %.2f ms fused ==\n", prompt.size(), prefillFused * 1e3);
+      }
 
       // A cycle of the active lanes, then, untimed, the prompt again of each
       // lane whose answer it ended.
@@ -667,14 +681,14 @@ int main(int argc, char **argv) {
       };
       profileWidth("B1 decode cycle", std::span<Lane>(&lanes[0], 1));
       // Add one lane at a time so M16 and M24 paths are measured too.
-      for (uint32_t index = 1; index < lanes.size(); ++index) {
+      for (uint32_t index = 1; index < widths; ++index) {
         prefill(executor, lanes[index], promptOf(index), answer);
         const std::string title = "B" + std::to_string(index + 1) + " decode cycle";
         profileWidth(title.c_str(), std::span<Lane>(lanes.data(), index + 1));
       }
 
-      for (Lane &lane : lanes)
-        executor.end(lane.id);
+      for (uint32_t index = 0; index < widths; ++index)
+        executor.end(lanes[index].id);
       return 0;
     } catch (const std::exception &error) {
       std::cerr << "decode-profile: " << error.what() << '\n';
