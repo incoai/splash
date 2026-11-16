@@ -1,5 +1,5 @@
 {
-  "created_at": "2026-11-16T13:40:21.573429+00:00",
+  "created_at": "2026-11-16T14:06:08.048757+00:00",
   "upstream_base": "d8af1054aab0f97de21d043e01aa98af3754f10e",
   "source_sha256": {
     "runtime/model/QwenState.hpp": "ae4a020d3592b18ab4b5f42fb1975bfc73b831b314f56827b2938789050de7f3",
@@ -8,12 +8,12 @@
     "runtime/model/Runtime.cpp": "e2a63cd5d54750c2312252992628ce70f645c945cbdf8346401fc0b965ed71e3",
     "dev/tests/engine/SyntheticModels.hpp": "5f0a679ad49587c5de36be108ee0e168efc5b74165ebc8eacc4df486479e417b",
     "dev/tests/engine/qwen_state_storage_test.mm": "81b074cf82580f936b6ff4f96928fd79331fed9b8461392d45575d8d4343a5d5",
-    "dev/tests/engine/ram_continuation_test.mm": "4efbe14959f69c31d821d3aca0ae7beb29454206214c90084e2ab615dae8eaf7"
+    "dev/tests/engine/ram_continuation_test.mm": "455025464e91fa5ab806ca18e82bf042a22356938796a174669908a7a76c4433"
   },
   "binary_sha256": {
     "build/engine-tests/engine": "81d1f19611ca9ae3c7b5f4a7b1e3cd105ae0395aade45fd1f2f6d2df953587e4",
     "build/engine-tests/qwen-state-storage": "1e44481d0ea07a94752dfaf1cfa74812285d52678f605523325ecf4545e8e846",
-    "build/engine-tests/ram-continuation": "b279bc1a6b232c18f87847f18de3842430d667f2acb8a859198d5da8cbff7445"
+    "build/engine-tests/ram-continuation": "e1dfa22e8dcda34b2b2d142ee64d6e4b666a5d4dd8005e7a71a087ef6216eacd"
   },
   "engine_tests": {
     "passed": 458,
@@ -38,5 +38,21 @@
   "Runtime_cpp_identical_to_ASAN_tested_deployed_stack": true,
   "deployed": false,
   "production_model_benchmarks": false,
-  "rotation_policy_implemented": false
+  "rotation_policy_implemented": false,
+  "full_draft_acceptance_controls": {
+    "passed": 4,
+    "accepted_draft_tokens_per_cycle": 7,
+    "families": [
+      "dense",
+      "flash-next"
+    ],
+    "formats": [
+      "fp32",
+      "bf16"
+    ],
+    "normal_upstream_build_passed": true,
+    "uniform_ASAN_UBSAN_build_passed": true,
+    "ASAN_library_base": "9753a803a8d7acc4caf6e164292ca279ea69d830",
+    "ASAN_driver_source_sha256": "455025464e91fa5ab806ca18e82bf042a22356938796a174669908a7a76c4433"
+  }
 }
