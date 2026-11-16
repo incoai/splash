@@ -269,8 +269,9 @@ struct Lane final {
   std::vector<uint32_t> pages;
   // The pages never change, so the page table keeps its first revision.
   uint64_t pageTableRevision = 1;
-  // The tokens of its answer so far, and its output budget.
+  // The tokens of its answer so far, its cycles, and its output budget.
   uint32_t answered = 0;
+  uint32_t answerCycles = 0;
   uint32_t budget = kAnswerTokens;
   // Its answer ended in the last cycle, at a stop token or its output
   // budget: it begins again before the next.
@@ -295,6 +296,7 @@ void prefill(model::Runtime &executor, Lane &lane,
   request.sampling = answer.sampling;
   request.thinkingBudget = answer.thinking;
   lane.answered = 0;
+  lane.answerCycles = 0;
   executor.beginColdRequest(request.modelView(), lane.stateLane);
   uint32_t offset = 0;
   while (offset < prompt.size()) {
@@ -325,6 +327,14 @@ struct CycleTiming final {
   uint64_t tokens = 0;
 };
 
+// Each answer's first two cycles, a lane's: its place among the active lanes,
+// the cycle of its answer, the rows it verified and the tokens it retained
+// (decode-profile --step-log on), until profileWidth prints them.
+struct AnswerCycle final {
+  uint32_t lane = 0, cycle = 0, rows = 0, tokens = 0;
+};
+std::vector<AnswerCycle> answerCycles;
+
 CycleTiming decodeCycle(metal::MetalBackend &backend,
                         model::Runtime &executor,
                         std::span<Lane> lanes) {
@@ -348,6 +358,10 @@ CycleTiming decodeCycle(metal::MetalBackend &backend,
     if (!results[index].failure.empty())
       throw std::runtime_error(results[index].failure);
     lanes[index].answered += static_cast<uint32_t>(results[index].outputTokens.size());
+    if (++lanes[index].answerCycles <= 2)
+      answerCycles.push_back({static_cast<uint32_t>(index), lanes[index].answerCycles,
+                              results[index].draftedTokens + 1,
+                              static_cast<uint32_t>(results[index].outputTokens.size())});
     lanes[index].finished = results[index].finished || lanes[index].answered == lanes[index].budget;
     lanes[index].position += results[index].outputTokens.size() -
                              results[index].outputTokensWithoutKv;
@@ -624,8 +638,13 @@ int main(int argc, char **argv) {
       auto profileWidth = [&](const char *title, std::span<Lane> active) {
         std::vector<CycleTiming> fused;
         static_cast<void>(model::RuntimeInstrumentation::takeStepChoices(executor));
+        answerCycles.clear();
         for (uint32_t cycle = 0; cycle < cycles; ++cycle)
           fused.push_back(cycleOf(active));
+        if (stepLog)
+          for (const AnswerCycle &answer : answerCycles)
+            std::printf("%s answer cycle: lane %u, cycle %u, rows %u, tokens %u\n", title, answer.lane, answer.cycle,
+                        answer.rows, answer.tokens);
         if (stepLog)
           for (const auto &choice : model::RuntimeInstrumentation::takeStepChoices(executor)) {
             std::printf("%s step: %u rows at lane cap %u (expected %.3f, cost %.2f ms), verified %u, "
