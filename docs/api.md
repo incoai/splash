@@ -232,6 +232,11 @@ the output so far, and presence and frequency lower the logit of every output
 token by `presence_penalty` plus `frequency_penalty` times its count.
 Speculative decoding stays exact: each verified draft position counts the draft
 tokens before it, so a penalized request samples as it would without a draft.
+Exact, here and wherever this page says it of sampling, is under lossless
+verification, the default: a server started with `--rflash-lambda` and
+`--rflash-alpha` verifies sampled requests against a relaxed target instead
+([relaxed verification](models.md#relaxed-verification)), and their outputs
+follow that target, not the distribution the request's parameters describe.
 Splash does not implement `logit_bias`: a non-empty one returns 400; `null` and
 `{}` are accepted. Like vLLM and HF, repetition counts every prompt token: with
 the Qwen templates that includes the tool-call syntax every tool-enabled system
@@ -684,6 +689,7 @@ fields; additional fields may be added:
 | `ane_ffn.state`, `share`, `minimum_rows`, `reason` | The prefill FFN's [Neural Engine split](internals.md#neural-engine-prefill): `split` while it serves, at `share` of the FFN's channels over chunks of `minimum_rows` rows or more; `off` when the start left the GPU alone (`share` and `minimum_rows` 0); `stopped` once it stopped while serving, until the engine restarts. `reason` is the start's outcome, or why the split stopped |
 | `ane_ffn.split_commands`, `evaluations`, `ane_ms`, `reruns` | Prefill commands the split ran since engine start, the Neural Engine's evaluations in them and its milliseconds over them (each evaluation's from the GPU's signal to start it to its report); and the chunks the GPU ran again alone after the split's work for them failed |
 | `verify_rows` | The rows of a draft block decode cycles verify ([drafts](models.md#drafts), `--verify-rows`): `auto` where the verify budget chooses them (a MoE target under the default), `all` where they verify every row the output limit leaves (a dense target, or `--verify-rows all`) |
+| `rflash` | The relaxation sampled requests' verifies run under ([relaxed verification](models.md#relaxed-verification)): its `lambda` and `alpha`; absent where verification is lossless |
 | `model_timing.prefill.last_gpu_ms`, `total_gpu_ms` | GPU time of the last prefill command, and of all since engine start, warmup included: each from its first Metal command buffer's start to its last one's end, so with the Neural Engine split it spans the GPU's waits on the Neural Engine; a chunk's image encodes, a command of their own ahead of it, add theirs, as a chunk run again adds the rerun's |
 | `metrics.decode_tokens_per_second` | Aggregate native decode throughput, not a request's end-to-end rate |
 | `metrics.decode_wall_ms` | Total wall time of the decode commands on the GPU, from submission to completion |

@@ -258,6 +258,14 @@ decodeTensorBytes(const RuntimeGeometry &geometry,
       samplingWorkspace.vocabularyRangesBytes);
   put(DecodeTensor::TargetVocabularyArrivals,
       samplingWorkspace.vocabularyArrivalsBytes);
+  // A lane's relaxation as the kernels lay it out: its proposal positions'
+  // candidates and rest ratios, and its status. Lossless verification has
+  // none, and its arena is the one it had.
+  if (geometry.relaxedVerify) {
+    put(DecodeTensor::RelaxedProbabilities, bytesFor<float>(kDraftProposalTokens * SPLASH_DRAFT_CANDIDATES));
+    put(DecodeTensor::RelaxedRest, bytesFor<float>(kDraftProposalTokens));
+    put(DecodeTensor::RelaxedStatus, bytesFor<uint32_t>(1));
+  }
   put(DecodeTensor::SamplingUniforms, bytesFor<float>(kSamplingUniformCount));
   put(DecodeTensor::ConstraintMasks,
       bytesFor<uint32_t>(uint64_t{ExecutionLimits::maximumStepTokens} *

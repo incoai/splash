@@ -91,6 +91,10 @@ struct NativeArguments final {
   // an int8-activation path takes them
   // (RuntimeResourcesConfig::int8Activations).
   ops::Int8Activations int8Activations = ops::Int8Activations::On;
+  // --rflash-lambda LAMBDA --rflash-alpha ALPHA, both or neither: the
+  // relaxation sampled requests' verifies run under
+  // (RuntimeResourcesConfig::relaxation); none verifies losslessly.
+  std::optional<ops::RelaxationSetting> relaxation;
 };
 
 // Reads `serve-native MODEL_DIRECTORY MAX_CONTEXT|auto MAX_MEMORY_BYTES|auto

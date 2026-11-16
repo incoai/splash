@@ -133,6 +133,17 @@ inline void shard_mass(TargetRow row, uint shard,
     partial = merge_masses(group_masses, 8, row.temperature);
 }
 
+
+// Candidate slot k of a drafted position as the draw and the relaxation read
+// it: a candidate the draft lists twice counts once, as lookups find its
+// first entry; a slot of an undrafted row is empty.
+inline uint unique_candidate(device const uint *ids, uint k, bool drafted) {
+  uint id = drafted ? ids[k] : 0xffffffffu;
+  for (uint earlier = 0; drafted && earlier < k; ++earlier)
+    id = ids[earlier] == id ? 0xffffffffu : id;
+  return id;
+}
+
 // One shard of each selected row of the sampled lanes.
 kernel void decode_sample_mass_sharded(
     device const float *logits [[buffer(0)]],
@@ -285,6 +296,9 @@ struct DrawScratch {
   float draft_draw_weights[kDraftCandidates];
   uint draft_ranges[kDraftCandidates];
   float kept_mass;
+  // What the kept weight of every token other than the candidates is
+  // scaled by: the relaxed row's rest ratio under RFlash, else 1.
+  float rest_scale;
   uint drawn_range;
   float drawn_target;
   uint drawn_token;
@@ -588,15 +602,18 @@ inline Selection select_last(TargetRow row, OrderBoundary floor,
 // before it keep. A top-k selection the scratch holds ranked is walked for
 // the nucleus in that order, with the sums it was selected with; otherwise
 // the nucleus is searched for. A row that keeps every admitted token ends at
-// {kNoKey, 0}.
+// {kNoKey, 0}. kept_mass receives the mass of the tokens the distribution
+// keeps, summed as the search measured it.
 inline OrderBoundary distribution_end(TargetRow row, float min_p, uint top_k,
                                       float top_p, float mass, uint admitted,
                                       threadgroup VocabularyScratch &scratch,
                                       uint thread_index, uint lane,
-                                      uint simd_group) {
+                                      uint simd_group,
+                                      thread float &kept_mass) {
   OrderBoundary end{kNoKey, 0};
   Bracket bracket{kLowestKey, logit_key(row.maximum) + 1, admitted, 0, mass,
                   0.0f};
+  kept_mass = mass;
   if (min_p > 0.0f) {
     // A token weighs min_p of the heaviest, which weighs 1, at the logit
     // -temperature * log(min_p) below the maximum. The tokens at or above
@@ -610,6 +627,7 @@ inline OrderBoundary distribution_end(TargetRow row, float min_p, uint top_k,
       bracket.lo = lowest;
       bracket.lo_count = kept.count;
       bracket.lo_mass = kept.mass;
+      kept_mass = kept.mass;
     }
   }
   if (top_k < bracket.lo_count) {
@@ -619,6 +637,7 @@ inline OrderBoundary distribution_end(TargetRow row, float min_p, uint top_k,
                                       CountTarget{top_k - 1}, scratch,
                                       thread_index, lane, simd_group);
     end = top.last;
+    kept_mass = top.mass;
     if (top.ranked && top_p < 1.0f) {
       // Every thread reads the selection before the walk rewrites it.
       threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -626,26 +645,33 @@ inline OrderBoundary distribution_end(TargetRow row, float min_p, uint top_k,
         // Rounding may leave the nucleus unreached: keep the whole top-k.
         const float nucleus = top_p * top.mass;
         float walked = 0.0f;
+        float kept = top.mass;
         for (uint index = 0; index < top.count; ++index) {
           walked += row.weight(key_logit(scratch.keys[index]));
           if (walked > nucleus) {
             end = {scratch.keys[index], scratch.ids[index]};
+            kept = walked;
             break;
           }
         }
         scratch.selection.last = end;
+        scratch.selection.mass = kept;
       }
       threadgroup_barrier(mem_flags::mem_threadgroup);
+      kept_mass = scratch.selection.mass;
       return scratch.selection.last;
     }
     bracket.lo = end.key;
     bracket.lo_count = top.count;
     bracket.lo_mass = top.mass;
   }
-  if (top_p < 1.0f)
-    end = select_last(row, end, bracket, MassTarget{top_p * bracket.lo_mass},
-                      scratch, thread_index, lane, simd_group)
-              .last;
+  if (top_p < 1.0f) {
+    const Selection nucleus =
+        select_last(row, end, bracket, MassTarget{top_p * bracket.lo_mass},
+                    scratch, thread_index, lane, simd_group);
+    end = nucleus.last;
+    kept_mass = nucleus.mass;
+  }
   return end;
 }
 
@@ -667,9 +693,10 @@ inline uint range_candidates(uint range, threadgroup DrawScratch &scratch) {
 }
 
 // One range's weight in the draw: the kept weight of its tokens other than
-// the draft's candidates, plus its candidates' draw weights.
+// the draft's candidates, scaled by the rest scale, plus its candidates'
+// draw weights.
 inline float range_weight(uint range, threadgroup DrawScratch &scratch) {
-  float weight = scratch.range_rest[range];
+  float weight = scratch.range_rest[range] * scratch.rest_scale;
   for (uint held = range_candidates(range, scratch); held; held &= held - 1)
     weight += scratch.draft_draw_weights[ctz(held)];
   return weight;
@@ -698,21 +725,24 @@ inline uint range_last(uint range, threadgroup DrawScratch &scratch) {
 // weights once, adds the ranges in order and walks the one that holds the
 // draw with prefix sums. A range's weight and its walk add the same token
 // weights, so the range the draw picks always has a token to draw.
+// A relaxed row (RFlash, decode_relax_dflash) draws from the relaxed target
+// instead: each candidate weighs its relaxed probability times the kept
+// mass, and every other kept token its weight times rest_scale, the row's
+// rest ratio; the draft token's probability is the relaxed row's.
 inline bool vocabulary_draw(
     TargetRow row, OrderBoundary end, bool drafted, uint draft_token,
     device const uint *draft_ids, device const float *draft_probabilities,
+    bool relaxed, device const float *relaxed_probabilities, float rest_scale,
     float uniform, device coherent(device) TargetVocabularyRange *ranges,
     device atomic_uint *arrivals, uint slice, threadgroup DrawScratch &scratch,
     uint thread_index, uint lane, uint simd_group, thread uint &drawn,
     thread float &draft_probability) {
   const uint range_tokens = (row.vocabulary + kVocabularyRanges * 32 - 1) /
                             (kVocabularyRanges * 32) * 32;
+  if (thread_index == 0)
+    scratch.rest_scale = relaxed ? rest_scale : 1.0f;
   if (thread_index < kDraftCandidates) {
-    // A candidate the draft lists twice counts once, as lookups find its
-    // first entry.
-    uint id = drafted ? draft_ids[thread_index] : 0xffffffffu;
-    for (uint earlier = 0; drafted && earlier < thread_index; ++earlier)
-      id = draft_ids[earlier] == id ? 0xffffffffu : id;
+    const uint id = unique_candidate(draft_ids, thread_index, drafted);
     scratch.draft_ids[thread_index] = id;
     scratch.draft_ranges[thread_index] =
         id < row.vocabulary ? id / range_tokens : kVocabularyRanges;
@@ -757,9 +787,20 @@ inline bool vocabulary_draw(
       kept_mass += scratch.range_rest[range];
     for (uint index = 0; index < kDraftCandidates; ++index)
       kept_mass += scratch.draft_weights[index];
+    // The relaxed row's candidate weights, in the units of the kept mass
+    // of the row itself, which the rest tokens' scaled weights share.
+    for (uint index = 0; relaxed && index < kDraftCandidates; ++index) {
+      scratch.draft_weights[index] =
+          scratch.draft_ids[index] < row.vocabulary
+              ? relaxed_probabilities[index] * kept_mass
+              : 0.0f;
+    }
+    // The rest's weights as the draw sums them: a relaxed row's are scaled
+    // by its rest ratio, which may leave none.
     bool residual = false;
     for (uint range = 0; drafted && range < kVocabularyRanges; ++range)
-      residual = residual || scratch.range_rest[range] > 0.0f;
+      residual = residual ||
+                 scratch.range_rest[range] * scratch.rest_scale > 0.0f;
     for (uint index = 0; drafted && index < kDraftCandidates; ++index) {
       const float left = max(scratch.draft_weights[index] -
                                  scratch.draft_probabilities[index] * kept_mass,
@@ -808,9 +849,11 @@ inline bool vocabulary_draw(
     const uint walk_held = range_candidates(walked, scratch);
     const float target = scratch.drawn_target;
     float cumulative = 0.0f;
+    const float scale = scratch.rest_scale;
     for (uint first = walk_begin; first < walk_finish; first += 32) {
       const uint token = first + lane;
-      float weight = token < walk_finish ? kept_weight(row, end, token) : 0.0f;
+      float weight =
+          token < walk_finish ? kept_weight(row, end, token) * scale : 0.0f;
       for (uint bits = walk_held; bits; bits &= bits - 1) {
         const uint index = ctz(bits);
         if (scratch.draft_ids[index] == token)
@@ -829,8 +872,21 @@ inline bool vocabulary_draw(
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
   drawn = scratch.drawn_token;
-  draft_probability =
-      drafted ? kept_weight(row, end, draft_token) / scratch.kept_mass : 0.0f;
+  if (drafted) {
+    float weight = kept_weight(row, end, draft_token);
+    if (relaxed) {
+      // Off the candidates the relaxed row is the row scaled by its rest
+      // ratio; a candidate's weight is its relaxed one.
+      weight *= scratch.rest_scale;
+      for (uint index = 0; index < kDraftCandidates; ++index) {
+        if (scratch.draft_ids[index] == draft_token)
+          weight = scratch.draft_weights[index];
+      }
+    }
+    draft_probability = weight / scratch.kept_mass;
+  } else {
+    draft_probability = 0.0f;
+  }
   split_release(arrivals, thread_index);
   return true;
 }
@@ -847,11 +903,12 @@ inline void search_row(TargetRow row, device const TargetShardMass *masses,
   const TargetShardMass merged =
       merge_masses(masses, SPLASH_TARGET_SAMPLING_SHARDS, row.temperature);
   row.maximum = merged.maximum;
+  float kept_mass;
   const OrderBoundary end =
       distribution_end(row, min_p, top_k, top_p, merged.sum, merged.admitted,
-                       scratch, thread_index, lane, simd_group);
+                       scratch, thread_index, lane, simd_group, kept_mass);
   if (thread_index == 0)
-    record = {merged.maximum, end.key, end.last, 0.0f};
+    record = {merged.maximum, end.key, end.last, 0.0f, kept_mass};
 }
 
 // Where the distribution of each selected row of the sampled lanes ends, one
@@ -876,10 +933,58 @@ kernel void decode_sample_vocabulary_search(
              vocabulary_rows[s], scratch, thread_index, lane, simd_group);
 }
 
+// The draw of one selected row of the sampled lanes, one of its
+// kVocabularyGroups groups: the first token after a prompt, a verify row's
+// draft token's probability and the correction a rejection takes or, for the
+// last verify row, which follows the whole draft, its bonus token. With
+// relax, a drafted row whose relaxed rest ratio is above 0 draws from its
+// relaxed target (decode_relax_dflash); an untouched row (rest 0) draws as
+// without.
+inline void draw_selected_row(
+    device const float *logits, device const uint *token_mask,
+    device TargetVocabularyRow *vocabulary_rows,
+    device const uint *input_tokens, device const uint *draft_ids,
+    device const float *draft_probabilities, device const float *uniforms,
+    device uint *tokens, device coherent(device) TargetVocabularyRange *ranges,
+    device atomic_uint *arrivals, constant TargetSamplingParams &params,
+    bool relax, device const float *relaxed_probabilities,
+    device const float *relaxed_rest, threadgroup DrawScratch &scratch,
+    uint group, uint thread_index, uint lane, uint simd_group) {
+  const uint s = group / kVocabularyGroups;
+  if (!lane_samples(params, s))
+    return;
+  const uint batch = selected_lane(params, s);
+  const uint index = s % params.rows;
+  device TargetVocabularyRow &record = vocabulary_rows[s];
+  TargetRow row = selected_row(logits, token_mask, params, s);
+  row.maximum = record.maximum;
+  // A drafted row follows its draft token, the next verify input row.
+  const bool drafted = index < params.drafted_rows;
+  const ulong position =
+      ulong(batch) * SPLASH_DRAFT_PROPOSAL_TOKENS + (drafted ? index : 0);
+  const float rest_scale = relax && drafted ? relaxed_rest[position] : 0.0f;
+  const bool relaxed = rest_scale > 0.0f;
+  uint token;
+  float draft_probability;
+  if (vocabulary_draw(
+          row, {record.end_key, record.end_last}, drafted,
+          drafted ? input_tokens[s + 1] : 0u,
+          draft_ids + position * kDraftCandidates,
+          draft_probabilities + position * kDraftCandidates, relaxed,
+          relaxed_probabilities + position * kDraftCandidates, rest_scale,
+          uniforms[ulong(batch) * SPLASH_SAMPLING_UNIFORMS + params.uniform],
+          ranges + ulong(s) * kVocabularyRanges, arrivals + s,
+          group % kVocabularyGroups, scratch, thread_index, lane, simd_group,
+          token, draft_probability) &&
+      thread_index == 0) {
+    tokens[s] = token;
+    if (drafted)
+      record.draft_probability = draft_probability;
+  }
+}
+
 // The draw of each selected row of the sampled lanes, kVocabularyGroups
-// groups per row: the first token after a prompt, a verify row's draft
-// token's probability and the correction a rejection takes or, for the last
-// verify row, which follows the whole draft, its bonus token.
+// groups per row.
 kernel void decode_sample_vocabulary_draw(
     device const float *logits [[buffer(0)]],
     device const uint *token_mask [[buffer(1)]],
@@ -897,34 +1002,41 @@ kernel void decode_sample_vocabulary_draw(
     uint lane [[thread_index_in_simdgroup]],
     uint simd_group [[simdgroup_index_in_threadgroup]]) {
   threadgroup DrawScratch scratch;
-  const uint s = group / kVocabularyGroups;
-  if (!lane_samples(params, s))
-    return;
-  const uint batch = selected_lane(params, s);
-  const uint index = s % params.rows;
-  device TargetVocabularyRow &record = vocabulary_rows[s];
-  TargetRow row = selected_row(logits, token_mask, params, s);
-  row.maximum = record.maximum;
-  // A drafted row follows its draft token, the next verify input row.
-  const bool drafted = index < params.drafted_rows;
-  const ulong position =
-      ulong(batch) * SPLASH_DRAFT_PROPOSAL_TOKENS + (drafted ? index : 0);
-  uint token;
-  float draft_probability;
-  if (vocabulary_draw(
-          row, {record.end_key, record.end_last}, drafted,
-          drafted ? input_tokens[s + 1] : 0u,
-          draft_ids + position * kDraftCandidates,
-          draft_probabilities + position * kDraftCandidates,
-          uniforms[ulong(batch) * SPLASH_SAMPLING_UNIFORMS + params.uniform],
-          ranges + ulong(s) * kVocabularyRanges, arrivals + s,
-          group % kVocabularyGroups, scratch, thread_index, lane, simd_group,
-          token, draft_probability) &&
-      thread_index == 0) {
-    tokens[s] = token;
-    if (drafted)
-      record.draft_probability = draft_probability;
-  }
+  // No row is relaxed: the relaxed buffers are never read.
+  draw_selected_row(logits, token_mask, vocabulary_rows, input_tokens,
+                    draft_ids, draft_probabilities, uniforms, tokens, ranges,
+                    arrivals, params, false, draft_probabilities,
+                    draft_probabilities, scratch, group, thread_index, lane,
+                    simd_group);
+}
+
+// The same draw of a verify whose drafted rows RFlash relaxed
+// (decode_relax_dflash): relaxed_probabilities and relaxed_rest are its
+// outputs.
+kernel void decode_sample_vocabulary_draw_relaxed(
+    device const float *logits [[buffer(0)]],
+    device const uint *token_mask [[buffer(1)]],
+    device TargetVocabularyRow *vocabulary_rows [[buffer(2)]],
+    device const uint *input_tokens [[buffer(3)]],
+    device const uint *draft_ids [[buffer(4)]],
+    device const float *draft_probabilities [[buffer(5)]],
+    device const float *uniforms [[buffer(6)]],
+    device uint *tokens [[buffer(7)]],
+    device coherent(device) TargetVocabularyRange *ranges [[buffer(8)]],
+    device atomic_uint *arrivals [[buffer(9)]],
+    device const float *relaxed_probabilities [[buffer(10)]],
+    device const float *relaxed_rest [[buffer(11)]],
+    constant TargetSamplingParams &params [[buffer(12)]],
+    uint group [[threadgroup_position_in_grid]],
+    uint thread_index [[thread_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]]) {
+  threadgroup DrawScratch scratch;
+  draw_selected_row(logits, token_mask, vocabulary_rows, input_tokens,
+                    draft_ids, draft_probabilities, uniforms, tokens, ranges,
+                    arrivals, params, true, relaxed_probabilities,
+                    relaxed_rest, scratch, group, thread_index, lane,
+                    simd_group);
 }
 
 // Whether no token can be selected for a logit: NaN has no order and -inf
@@ -1706,4 +1818,432 @@ kernel void decode_accept_dflash(
     accept_greedy_lane(lane_draft, lane_target, retained[batch],
                        accepted_count[batch], lane_params);
   }
+}
+
+// RFlash: the relaxation of a sampled lane's drafted verify rows
+// (metal/abi/Sampling.h RelaxParams), between the search and the draw of a
+// verify. One group of SPLASH_RELAX_THREADS threads per lane, one simdgroup
+// per drafted row: lane k of a row's simdgroup holds candidate k of the
+// row's draft position, and lane k + 16 holds it again for the second kink
+// of the row's closed form. The block's price search runs in thread 0,
+// which publishes each solve's price and the search's decisions through
+// the scratch, so every thread takes the same branches.
+//
+// A row's closed form: r = p_hat / p =
+// min(max(q / p, A x), A x e^{1 / Lam}), A = exp(-mu_j z / Lam_j), Lam_j =
+// lam_j - alpha mu_j, lam_j = lam / R_j, mu_j = mu / R_j, with the
+// normaliser x fixed by sum p r = 1 over the candidates and the rest
+// bucket, which has q = 0 and z = log eps. In y = log x the normaliser's
+// sum is piecewise linear between the kinks lk - a and lk - b of the
+// candidates (a = log A - 1, b = a + 1 / Lam), so the kinks bracket y and
+// one closed-form step inside the bracket solves it, as the kernel of the
+// reference implementation does.
+constant constexpr uint kRelaxRows = SPLASH_DRAFT_PROPOSAL_TOKENS;
+constant constexpr float kRelaxNone = -1.0e30f;
+static_assert(SPLASH_RELAX_THREADS == kRelaxRows * 32 && kRelaxRows <= 32,
+              "one simdgroup per drafted row, which the scratch holds");
+
+struct RelaxCandidate {
+  float p;
+  float q;
+  float z;
+  float lk;
+  float lp;
+  bool live;
+  bool kink;
+};
+
+struct RelaxRow {
+  float prest;
+  float zr;
+  float lpr;
+  float ltot;
+  float total;
+};
+
+struct RelaxScratch {
+  float accept[kRelaxRows];
+  float slack[kRelaxRows];
+  float reach[kRelaxRows];
+  float run[kRelaxRows];
+  // Thread 0's decisions, read by every thread after a barrier: the price
+  // the next solve takes, whether it runs, whether the cap is solved after
+  // a probe, whether the rows keep a solve's solution as the feasible end,
+  // and the violation. Each is written only between a barrier every thread
+  // has passed since its last read and the barrier before its next one. The
+  // cap's decision has a field of its own for that: the search that follows
+  // it writes `solve` again with no barrier between.
+  float price;
+  uint solve;
+  uint cap;
+  uint take;
+  float violation;
+};
+
+// Reach weights w_j = prod_{i<j} a_i and remaining runs R_j = 1 + a_{j+1}
+// R_{j+1} (R of the last row 1) of the rows below M from their acceptance
+// probabilities; rows from M on have reach 0 and run 1.
+inline void relax_weights(threadgroup RelaxScratch &scratch, uint M) {
+  float reach = 1.0f;
+  for (uint j = 0; j < kRelaxRows; ++j) {
+    scratch.reach[j] = j < M ? reach : 0.0f;
+    reach *= scratch.accept[j];
+  }
+  float run = 1.0f;
+  for (uint j = kRelaxRows; j-- > 0;) {
+    run = j + 1 < M ? 1.0f + scratch.accept[j + 1] * run : 1.0f;
+    scratch.run[j] = run;
+  }
+}
+
+// The block constraint's violation: minus the reach-weighted sum of the
+// rows' slacks, positive when the constraint is violated.
+inline float relax_violation(threadgroup RelaxScratch &scratch, uint M) {
+  float f = 0.0f;
+  for (uint j = 0; j < M; ++j)
+    f -= scratch.reach[j] * scratch.slack[j];
+  return f;
+}
+
+// One row's closed form at the row's prices lam_r and mu_r, every lane of
+// its simdgroup taking part: writes the lane's candidate's relaxed
+// probability and the row's rest ratio, and returns the row's slack n_j =
+// alpha KL(p_hat || p) - drift, the same in every lane.
+inline float relax_row_solve(RelaxCandidate c, RelaxRow r, float lam_r,
+                             float mu_r, float alpha, uint lane,
+                             thread float &ph, thread float &rr) {
+  const bool first = lane < kDraftCandidates;
+  const float Lam = lam_r - alpha * mu_r;
+  const float a = -mu_r * c.z / Lam - 1.0f;
+  const float b = a + 1.0f / Lam;
+  const float ar = -mu_r * r.zr / Lam - 1.0f;
+  // Bracket y between consecutive kinks: lane k owns the kink where
+  // candidate k's lower clamp crosses q / p, lane k + 16 the one where its
+  // upper clamp does. Only the sign of the normaliser's sum less the total
+  // matters, so terms are clamped at e^60.
+  const float bp = first ? c.lk - a : c.lk - b;
+  float ssum = 0.0f;
+  for (uint i = 0; i < kDraftCandidates; ++i) {
+    const float ai = simd_shuffle(a, i);
+    const float bi = simd_shuffle(b, i);
+    const float lki = simd_shuffle(c.lk, i);
+    const float lpi = simd_shuffle(c.lp, i);
+    const float lr = min(max(lki, ai + bp), bi + bp);
+    ssum += lpi > kRelaxNone ? exp(min(lpi + lr, 60.0f)) : 0.0f;
+  }
+  ssum += r.lpr > kRelaxNone ? exp(min(r.lpr + ar + bp, 60.0f)) : 0.0f;
+  const float lF = log(ssum) - r.ltot;
+  const float y_lo = simd_max(c.kink && lF < 0.0f ? bp : kRelaxNone);
+  const float y_hi = simd_min(c.kink && lF >= 0.0f ? bp : -kRelaxNone);
+  const bool has_lo = y_lo > 0.5f * kRelaxNone;
+  const bool has_hi = y_hi < -0.5f * kRelaxNone;
+  const float ym = has_lo && has_hi ? 0.5f * (y_lo + y_hi)
+                   : has_lo         ? y_lo + 1.0f
+                   : has_hi         ? y_hi - 1.0f
+                                    : 0.0f;
+  // Inside the bracket each candidate sits on its lower clamp, its upper
+  // clamp or its kink, and the sum is C + x D.
+  const float la = a + ym;
+  const float lb = b + ym;
+  const bool on_lo = c.live && la > c.lk;
+  const bool on_hi = c.live && lb < c.lk && c.kink;
+  const bool at_k = c.live && c.kink && la <= c.lk && lb >= c.lk;
+  const float C = simd_sum(first && at_k ? c.q : 0.0f);
+  const float tD = first && on_lo   ? c.lp + a
+                   : first && on_hi ? c.lp + b
+                                    : kRelaxNone;
+  const float mD =
+      max(simd_max(tD), r.lpr > kRelaxNone ? r.lpr + ar : kRelaxNone);
+  const float sD = simd_sum(first ? exp(tD - mD) : 0.0f) +
+                   (r.lpr > kRelaxNone ? exp(r.lpr + ar - mD) : 0.0f);
+  const float lD = mD + log(max(sD, 1e-30f));
+  float y = log(max(r.total - C, 1e-30f)) - lD;
+  y = lD > -80.0f ? y : ym;
+  y = has_lo ? max(y, y_lo) : y;
+  y = has_hi ? min(y, y_hi) : y;
+  const float lr = min(min(max(c.lk, a + y), b + y), 80.0f);
+  const float lrr = min(ar + y, 80.0f);
+  ph = c.live ? c.p * exp(lr) : 0.0f;
+  rr = exp(lrr);
+  const float phr = r.prest * rr;
+  return simd_sum(first && c.live ? alpha * ph * lr - (ph - c.p) * c.z
+                                  : 0.0f) +
+         (r.prest > 0.0f ? alpha * phr * lrr : 0.0f) - (phr - r.prest) * r.zr;
+}
+
+// Whether a mass is a positive finite number. A bit test, which Metal's
+// fast math keeps (unselectable_logit).
+inline bool positive_finite(float value) {
+  return as_type<uint>(value) - 1u < 0x7f7fffffu;
+}
+
+// Publishes the rows' slacks and returns the violation at the price just
+// solved, the same in every thread.
+inline float relax_publish(threadgroup RelaxScratch &scratch, float slack,
+                           uint M, uint thread_index, uint lane,
+                           uint simd_group) {
+  if (lane == 0)
+    scratch.slack[simd_group] = slack;
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (thread_index == 0)
+    scratch.violation = relax_violation(scratch, M);
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  return scratch.violation;
+}
+
+kernel void decode_relax_dflash(
+    device const float *logits [[buffer(0)]],
+    device const uint *token_mask [[buffer(1)]],
+    device const TargetVocabularyRow *vocabulary_rows [[buffer(2)]],
+    device const uint *draft_ids [[buffer(3)]],
+    device const float *draft_probabilities [[buffer(4)]],
+    device const uint *verify_rows [[buffer(5)]],
+    device float *relaxed_probabilities [[buffer(6)]],
+    device float *relaxed_rest [[buffer(7)]],
+    device uint *relaxed_status [[buffer(8)]],
+    constant RelaxParams &params [[buffer(9)]],
+    uint batch [[threadgroup_position_in_grid]],
+    uint thread_index [[thread_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]]) {
+  threadgroup RelaxScratch scratch;
+  constant TargetSamplingParams &selection = params.selection;
+  const uint j = simd_group;
+  const uint k = lane & (kDraftCandidates - 1);
+  const bool first = lane < kDraftCandidates;
+  const ulong position = ulong(batch) * kRelaxRows + j;
+  // The rows the lane relaxes: the drafted rows among its verify rows,
+  // which the anchor's row leads.
+  const uint verified = min(verify_rows[batch], SPLASH_TARGET_VERIFY_ROWS);
+  // A row from the lane's thinking cutoff on takes the end of thinking
+  // whatever its distribution (decode_sample_thinking_cutoff), so the block
+  // ends before it: those rows keep lossless verification and add nothing
+  // to the runs of the rows before them.
+  const uint M =
+      min(min(verified > 0 ? verified - 1 : 0u, selection.drafted_rows),
+          params.cutoff_row[batch]);
+  const bool samples = (selection.sampling_mask & (1u << batch)) != 0;
+  if (!samples || M == 0) {
+    if (first)
+      relaxed_probabilities[position * kDraftCandidates + k] = 0.0f;
+    if (lane == 0)
+      relaxed_rest[position] = 0.0f;
+    if (thread_index == 0)
+      relaxed_status[batch] =
+          samples ? SPLASH_RELAX_STATUS_SLACK : SPLASH_RELAX_STATUS_NONE;
+    return;
+  }
+  const uint s = batch * selection.rows + j;
+  const TargetVocabularyRow record = vocabulary_rows[s];
+  // A row among the block's whose search found no finite kept mass (every
+  // admitted logit -inf, or a NaN) has no distribution to relax. It stays
+  // untouched, as a row past the block does, and its acceptance of 0 ends
+  // the runs of the rows before it, so its weights reach no other row.
+  const bool valid = j < M && positive_finite(record.kept_mass);
+  TargetRow row = selected_row(logits, token_mask, selection, s);
+  row.maximum = record.maximum;
+  const OrderBoundary end{record.end_key, record.end_last};
+  // The candidates as the draw reads them.
+  const uint id = unique_candidate(draft_ids + position * kDraftCandidates, k, valid);
+  RelaxCandidate c;
+  c.q = valid && id < row.vocabulary
+            ? draft_probabilities[position * kDraftCandidates + k]
+            : 0.0f;
+  c.p = valid && id < row.vocabulary
+            ? kept_weight(row, end, id) / record.kept_mass
+            : 0.0f;
+  c.live = c.p > 0.0f;
+  c.kink = c.live && c.q > 0.0f;
+  const float psum = simd_sum(first ? c.p : 0.0f);
+  const float prest_raw = valid ? max(1.0f - psum, 0.0f) : 0.0f;
+  RelaxRow r;
+  // A tiny tail is left untouched (ratio 1); a row outside the block has
+  // no candidates and a rest of 1, so that its solve stays finite at slack
+  // 0 (its outputs are never read).
+  const float prest = prest_raw > params.tail_floor ? prest_raw : 0.0f;
+  r.prest = valid ? prest : 1.0f;
+  r.total = valid ? psum + prest : 1.0f;
+  c.z = clamp(log(((1.0f - params.eps) * c.q + params.eps * c.p) /
+                  max(c.p, 1e-30f)),
+              -20.0f, 20.0f);
+  r.zr = clamp(log(params.eps), -20.0f, 20.0f);
+  c.lk = c.kink ? log(max(c.q, 1e-30f) / max(c.p, 1e-30f)) : kRelaxNone;
+  c.lp = c.live ? log(max(c.p, 1e-30f)) : kRelaxNone;
+  r.lpr = r.prest > 0.0f ? log(max(r.prest, 1e-30f)) : kRelaxNone;
+  r.ltot = log(max(r.total, 1e-30f));
+  // The lossless acceptances start the reach weights.
+  const float a0 = simd_sum(first ? min(c.p, c.q) : 0.0f);
+  if (lane == 0)
+    scratch.accept[j] = valid ? a0 : 0.0f;
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (thread_index == 0)
+    relax_weights(scratch, M);
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+
+  // The search's state, thread 0's.
+  float t_prev = params.probe0;
+  float t_lo = 0.0f;
+  float t_hi = 0.0f;
+  float f_lo = 0.0f;
+  float f_hi = 0.0f;
+  float g_hi = 0.0f;
+  float side = 0.0f;
+  bool noroot = false;
+  uint status = SPLASH_RELAX_STATUS_SLACK;
+  // The rows' carried solution and the feasible end of the search.
+  float ph_cur = c.p;
+  float rr_cur = 1.0f;
+  float ph_hi = c.p;
+  float rr_hi = 1.0f;
+  for (uint pass = 0; pass < params.passes; ++pass) {
+    const float run = scratch.run[j];
+    const float lam_r = params.lambda / run;
+    float ph0;
+    float rr0;
+    const float n0 =
+        relax_row_solve(c, r, lam_r, 0.0f, params.alpha, lane, ph0, rr0);
+    const float f0 =
+        relax_publish(scratch, n0, M, thread_index, lane, simd_group);
+    ph_cur = ph0;
+    rr_cur = rr0;
+    if (thread_index == 0) {
+      // The constraint is slack at price 0 unless violated: then the price
+      // is searched in [0, mu_max]. A later pass first tries the previous
+      // pass's price, as the reach weights moved little: if it is feasible
+      // the root lies below it and the cap is not needed.
+      // Slack within the reference's tolerance (a zero-drift block's f0 is
+      // rounding noise of either sign).
+      const bool violated = f0 > 1e-7f;
+      t_prev = violated ? t_prev : params.probe0;
+      const bool warm = t_prev > 0.0f && t_prev < 1.0f;
+      const float t_probe = warm ? t_prev : 1.0f;
+      scratch.solve = violated ? 1u : 0u;
+      scratch.price = t_probe * params.mu_max;
+      t_lo = 0.0f;
+      t_hi = t_probe;
+      f_lo = f0;
+      status = SPLASH_RELAX_STATUS_SLACK;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (scratch.solve != 0) {
+      float ph1;
+      float rr1;
+      const float n1 = relax_row_solve(c, r, lam_r, scratch.price / run,
+                                       params.alpha, lane, ph1, rr1);
+      const float f1 =
+          relax_publish(scratch, n1, M, thread_index, lane, simd_group);
+      ph_hi = ph1;
+      rr_hi = rr1;
+      if (thread_index == 0) {
+        f_hi = f1;
+        // A warm probe that is violated too: the root lies above it, up to
+        // the cap.
+        scratch.cap = t_hi < 1.0f && f1 > 0.0f ? 1u : 0u;
+      }
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      if (scratch.cap != 0) {
+        float ph2;
+        float rr2;
+        const float n2 = relax_row_solve(c, r, lam_r, params.mu_max / run,
+                                         params.alpha, lane, ph2, rr2);
+        const float f2 =
+            relax_publish(scratch, n2, M, thread_index, lane, simd_group);
+        ph_hi = ph2;
+        rr_hi = rr2;
+        if (thread_index == 0) {
+          t_lo = t_hi;
+          f_lo = f_hi;
+          t_hi = 1.0f;
+          f_hi = f2;
+        }
+      }
+      if (thread_index == 0) {
+        noroot = f_hi > 0.0f;
+        side = 0.0f;
+        g_hi = f_hi;
+      }
+      // Anderson-Bjorck secant steps on the fraction t of mu_max; the search
+      // stops on the feasible end, the one returned, with the reference
+      // implementation's tolerances (1e-4 in t, 1e-6 in the constraint,
+      // tested on the true value at t_hi, not the rescaled one).
+      for (uint it = 0; it < params.iterations; ++it) {
+        if (thread_index == 0) {
+          const bool active = (t_hi - t_lo) > 1e-4f && abs(g_hi) > 1e-6f &&
+                              f_lo > 0.0f && f_hi <= 0.0f;
+          const float den = f_lo - f_hi;
+          float tt =
+              t_lo + f_lo * (t_hi - t_lo) / (den > 1e-12f ? den : 1e-12f);
+          tt = tt > t_lo && tt < t_hi ? tt : 0.5f * (t_lo + t_hi);
+          scratch.solve = active ? 1u : 0u;
+          scratch.price = tt * params.mu_max;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (scratch.solve == 0)
+          break;
+        const float tt = scratch.price / params.mu_max;
+        float pt;
+        float rt;
+        const float nt = relax_row_solve(c, r, lam_r, scratch.price / run,
+                                         params.alpha, lane, pt, rt);
+        const float ft =
+            relax_publish(scratch, nt, M, thread_index, lane, simd_group);
+        if (thread_index == 0) {
+          const bool pos = ft > 0.0f;
+          // An end kept twice in a row has its f scaled by 1 - f_new /
+          // f_replaced.
+          const float m_a = 1.0f - ft / (f_lo > 0.0f ? f_lo : 1.0f);
+          const float m_b = 1.0f - ft / (f_hi < 0.0f ? f_hi : -1.0f);
+          if (pos && side > 0.0f)
+            f_hi *= m_a > 0.0f ? m_a : 0.5f;
+          if (!pos && side < 0.0f)
+            f_lo *= m_b > 0.0f ? m_b : 0.5f;
+          if (pos) {
+            t_lo = tt;
+            f_lo = ft;
+          } else {
+            t_hi = tt;
+            f_hi = ft;
+            g_hi = ft;
+          }
+          side = pos ? 1.0f : -1.0f;
+          scratch.take = pos ? 0u : 1u;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (scratch.take != 0) {
+          ph_hi = pt;
+          rr_hi = rt;
+        }
+      }
+      // The solution at t_hi, the feasible end (the cap itself when no price
+      // satisfies the constraint: the next pass reweights from it, and a
+      // lane still without a root at the end keeps the cap's solution, its
+      // constraint residual accepted).
+      ph_cur = ph_hi;
+      rr_cur = rr_hi;
+      if (thread_index == 0) {
+        status = noroot ? SPLASH_RELAX_STATUS_CAPPED
+                        : SPLASH_RELAX_STATUS_BOUND;
+        t_prev = noroot ? params.probe0 : t_hi;
+      }
+    }
+    // The reach weights of the next pass from the solution's acceptances.
+    const float a_new = simd_sum(first ? min(ph_cur, c.q) : 0.0f);
+    if (lane == 0)
+      scratch.accept[j] = valid ? a_new : 0.0f;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (thread_index == 0)
+      relax_weights(scratch, M);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+  }
+  if (first)
+    relaxed_probabilities[position * kDraftCandidates + k] =
+        valid ? ph_cur : 0.0f;
+  // A rest of 0 marks an untouched row for the draw, so a relaxed row's
+  // ratio, which may underflow where the candidates take all of the row's
+  // mass, stays above it.
+  if (lane == 0)
+    relaxed_rest[position] =
+        valid ? (prest > 0.0f ? max(rr_cur, FLT_MIN) : 1.0f) : 0.0f;
+  if (thread_index == 0)
+    relaxed_status[batch] = status;
 }

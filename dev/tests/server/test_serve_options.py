@@ -91,6 +91,39 @@ OPTIONS = {
         {"auto": "auto", "all": "all"},
         ("", "budget", "every", "ALL"),
     ),
+    # Each needs the other (check_serve_arguments); the pair is checked
+    # through the native command lines.
+    "--rflash-lambda": (
+        [
+            (["--rflash-lambda=1.5", "--rflash-alpha=0.5"], 1.5),
+            (["--rflash-lambda=0.2", "--rflash-alpha=0"], 0.2),
+        ],
+        [
+            ["--rflash-lambda=0", "--rflash-alpha=0.5"],
+            ["--rflash-lambda=-1", "--rflash-alpha=0.5"],
+            ["--rflash-lambda=nan", "--rflash-alpha=0.5"],
+            ["--rflash-lambda=cheap", "--rflash-alpha=0.5"],
+            ["--rflash-lambda=1e-7", "--rflash-alpha=0.5"],
+            ["--rflash-lambda=1.000001e6", "--rflash-alpha=0.5"],
+            ["--rflash-lambda=1e39", "--rflash-alpha=0.5"],
+            ["--rflash-lambda=1.5"],
+        ],
+    ),
+    "--rflash-alpha": (
+        [
+            (["--rflash-lambda=1.5", "--rflash-alpha=0.5"], 0.5),
+            (["--rflash-lambda=1.5", "--rflash-alpha=0"], 0.0),
+        ],
+        [
+            ["--rflash-lambda=1.5", "--rflash-alpha=-0.5"],
+            ["--rflash-lambda=1.5", "--rflash-alpha=inf"],
+            ["--rflash-lambda=1.5", "--rflash-alpha=none"],
+            ["--rflash-lambda=1.5", "--rflash-alpha=1e-50"],
+            ["--rflash-lambda=1.5", "--rflash-alpha=1.000001e6"],
+            ["--rflash-lambda=1.5", "--rflash-alpha=1e39"],
+            ["--rflash-alpha=0.5"],
+        ],
+    ),
     "--ple-memory": values(
         "--ple-memory",
         {

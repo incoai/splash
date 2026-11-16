@@ -595,9 +595,10 @@ class LauncherTests(unittest.TestCase):
 
     def test_the_apps_launch_options_are_the_serve_options(self):
         # The desktop app offers every option of splash serve but those of one
-        # model and those it sets itself, from one table (LaunchOption.all,
-        # docs/package.md): a flag it keeps that serve no longer takes would
-        # fail every start, and a new option would never show.
+        # model (RFlash's pair among them: its values are a model's) and those
+        # it sets itself, from one table (LaunchOption.all, docs/package.md):
+        # a flag it keeps that serve no longer takes would fail every start,
+        # and a new option would never show.
         with (
             mock.patch("sys.stdout", io.StringIO()) as output,
             self.assertRaises(SystemExit),
@@ -611,6 +612,8 @@ class LauncherTests(unittest.TestCase):
             "--revision",
             "--draft-model",
             "--mmproj",
+            "--rflash-lambda",
+            "--rflash-alpha",
         }
         self.assertIn("--max-memory", flags)
         table = Path(launcher.__file__).resolve().parents[1] / (

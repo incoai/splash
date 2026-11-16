@@ -915,6 +915,8 @@ def main_args(**overrides):
             "disable_ane": False,
             "activations": "auto",
             "verify_rows": "auto",
+            "rflash_lambda": None,
+            "rflash_alpha": None,
             "max_image_pixels": images.MAX_PIXELS,
             "request_timeout": None,
             "queue_size": 1,

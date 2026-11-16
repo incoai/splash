@@ -426,8 +426,9 @@ void testCleanRuntimeStatus(const char *goldenPath) {
 
 // Whole documents for the branches the representative one leaves out. A
 // spilling target: the plan's kv_spill, readers not yet built, a Spill
-// request, the Neural Engine split serving, SSD writes closed and two warmup
-// steps memory-limited. A resident target with windows: the plan's kv_window,
+// request, the Neural Engine split serving, SSD writes closed, a relaxation
+// of sampled requests' verifies and two warmup steps memory-limited. A
+// resident target with windows: the plan's kv_window,
 // no kv_spill or kv.window, no host telemetry, the idle release off, the
 // split off, the streamed stores absent, SSD writes open, Metal failed with a
 // reason that needs escaping after it created two pipelines while serving,
@@ -460,6 +461,8 @@ std::vector<std::pair<const char *, StatusInputs>> statusVariants() {
   spilling.sample.aneFfn = {AneFfnSnapshot::State::Split, "at share 0.41 for chunks of 640 rows or more", 0.41, 640, 3,
                      192, 1234.5};
   spilling.sample.engine.resources.kvTier.writesGated = engine::DiskWritesGate::Closed;
+  // Sampled requests verify under a relaxation, which the status names.
+  spilling.sample.telemetry.relaxation = ops::RelaxationSetting::validated(1.5F, 0.5F);
   spilling.warmup.decodeBatches[2] = WarmupStepStatus::MemoryLimited;
   spilling.warmup.decodeBatches[3] = WarmupStepStatus::MemoryLimited;
 

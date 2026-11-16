@@ -162,6 +162,9 @@ void testServerCommandLines(const char *path) {
       {"kv_format_default", [](NativeArguments &read) { read.kvFormat = kv::Format::Int8; }},
       {"state_format_default",
        [](NativeArguments &read) { read.stateFormat = ops::GdnStateFormat::Float32; }},
+      {"rflash", [](NativeArguments &read) { read.relaxation = ops::RelaxationSetting::validated(1.5F, 0.5F); }},
+      {"rflash_no_drift",
+       [](NativeArguments &read) { read.relaxation = ops::RelaxationSetting::validated(0.2F, 0.0F); }},
       // A relaunch asks for the first engine's context beside that engine's
       // MAX_CONTEXT: it is planned as that engine was, and serves what its
       // plan holds of the context.
@@ -211,7 +214,8 @@ void testServerCommandLines(const char *path) {
            read.neuralEngine == meant.neuralEngine && read.pleMemory == meant.pleMemory &&
            read.expertMemory == meant.expertMemory && read.sparseKvMemory == meant.sparseKvMemory &&
            read.kvSpillAlways == meant.kvSpillAlways && read.kvWindowTrim == meant.kvWindowTrim &&
-           read.verifyRows == meant.verifyRows && read.int8Activations == meant.int8Activations;
+           read.verifyRows == meant.verifyRows && read.int8Activations == meant.int8Activations &&
+           read.relaxation == meant.relaxation;
   };
   const auto golden = readGolden(path);
   require(golden.size() == changes.size(),
@@ -310,6 +314,17 @@ void testRefusals() {
     refuses({"auto", "auto", "--activations", value}, "--activations requires auto or bf16");
   for (const char *rows : {"budget", "every", "ALL", ""})
     refuses({"auto", "auto", "--verify-rows", rows}, "--verify-rows requires auto or all");
+  // RFlash takes both hyperparameters, a price and a nonnegative allowance
+  // in the settings' range (ops::RelaxationSetting), the allowance not one
+  // a float holds as zero unless it is 0.
+  for (const char *price : {"0", "-1.5", "nan", "inf", "cheap", "", "1e-7", "1.000001e6", "1e39"})
+    refuses({"auto", "auto", "--rflash-lambda", price, "--rflash-alpha", "0.5"},
+            "--rflash-lambda requires a positive number");
+  for (const char *allowance : {"-0.5", "nan", "inf", "none", "", "1e-50", "1.000001e6", "1e39"})
+    refuses({"auto", "auto", "--rflash-lambda", "1.5", "--rflash-alpha", allowance},
+            "--rflash-alpha requires a nonnegative number");
+  refuses({"auto", "auto", "--rflash-lambda", "1.5"}, "--rflash-lambda and --rflash-alpha are set together");
+  refuses({"auto", "auto", "--rflash-alpha", "0.5"}, "--rflash-lambda and --rflash-alpha are set together");
   // The server passes bytes, auto or off.
   for (const char *size : {"0", "2G", "OFF", ""})
     refuses({"auto", "auto", "--ple-memory", size}, "--ple-memory requires a positive byte count, auto or off");

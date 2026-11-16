@@ -194,10 +194,12 @@ void sampling() {
                         std::numeric_limits<uint32_t>::max()}) {
     const auto workspace = Sampling::workspace(rows);
     const uint64_t count = rows;
+    // A vocabulary row is 20 bytes: it records the kept mass the relaxed
+    // draw scales by.
     require(workspace.argmaxValuesBytes == count * 16 * 4 &&
                 workspace.argmaxIndicesBytes == count * 16 * 4 &&
                 workspace.partialMassesBytes == count * 16 * 12 &&
-                workspace.vocabularyRowsBytes == count * 16 &&
+                workspace.vocabularyRowsBytes == count * 20 &&
                 workspace.vocabularyRangesBytes == count * 256 * 8 &&
                 workspace.vocabularyArrivalsBytes == count * 4,
             "target sampling workspace changed from the shipped 16-shard ABI");

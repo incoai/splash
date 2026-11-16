@@ -798,6 +798,12 @@ std::string runtimeStatusJson(const StatusStart &start, const StatusSample &samp
     // budget chooses them, all where they are every row up to each lane's
     // retention limit.
     w.field("verify_rows", executorTelemetry.verifyBudget ? "auto" : "all");
+    // The relaxation sampled requests' verifies run under (--rflash-lambda,
+    // --rflash-alpha); a server that verifies losslessly reports none.
+    if (const auto &relaxation = executorTelemetry.relaxation)
+      w.object("rflash", [&] {
+        w.field("lambda", relaxation->shown(relaxation->lambda)).field("alpha", relaxation->shown(relaxation->alpha));
+      });
     w.key("model_timing");
     writeModelTiming(w, executorTelemetry);
     w.object("constraint_masks", [&] {

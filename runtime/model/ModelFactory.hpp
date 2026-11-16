@@ -9,11 +9,13 @@
 #include "QwenVision.hpp"
 #include "ops/PageStorage.hpp"
 #include "ops/ExecutionPlans.hpp"
+#include "ops/Relaxation.hpp"
 
 #include <array>
 #include <filesystem>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <string>
 #include <variant>
 #include <vector>
@@ -135,6 +137,9 @@ struct RuntimeContext final {
   KvBlockCache *blockCache = nullptr;
   KvHistoryStream *historyStream = nullptr;
   VerifyRows verifyRows = VerifyRows::Auto;
+  // RFlash (--rflash-lambda, --rflash-alpha): the relaxation of sampled
+  // lanes' verifies (ops::Sampling); none verifies losslessly.
+  std::optional<ops::RelaxationSetting> relaxation = std::nullopt;
 };
 
 // Validates only the interface between independently defined target and draft
@@ -190,11 +195,14 @@ struct StreamedParts final {
 };
 // The lane state and arenas of `model`'s geometry with `parts` streaming,
 // whatever streams of it as it loaded: one load plans them for every part
-// that may stream (engine::planStreamedMemory).
+// that may stream (engine::planStreamedMemory). `relaxedVerify`: the runtime
+// has a relaxation (RuntimeContext::relaxation), whose outputs its decode
+// arena holds.
 [[nodiscard]] ModelMemoryPlan
 plannedRuntimeMemory(const LoadedModel &model,
                      const ops::ExecutionPlans &operators,
-                     kv::Format kvFormat, ops::GdnStateFormat stateFormat, StreamedParts parts);
+                     kv::Format kvFormat, ops::GdnStateFormat stateFormat, StreamedParts parts,
+                     bool relaxedVerify = false);
 [[nodiscard]] std::unique_ptr<RuntimeModel>
 createRuntime(RuntimeContext context);
 

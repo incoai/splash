@@ -124,6 +124,7 @@ window. To set your own limits or cache options, add these to `splash serve`:
 | `--disable-ane` | Prefill on the GPU alone. Default: the 27B also uses the Neural Engine. |
 | `--max-cache-disk 16G` | Cap the SSD cache (default: auto, up to 32 GiB; `0` turns it off). |
 | `--persistent-cache` | Keep the SSD cache across restarts. Off by default. |
+| `--rflash-lambda 1.5 --rflash-alpha 0.5` | Verify sampled requests with [RFlash](docs/models.md#relaxed-verification), relaxed speculative decoding with a drift constraint: more drafted tokens accepted at the lossless output length and accuracy. Off by default. |
 
 Use `--max-memory` to leave room for other applications.
 The server listens on localhost without authentication by default. For LAN

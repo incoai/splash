@@ -62,6 +62,10 @@ struct RuntimeGeometry final {
   bool streamedExperts = false;
   // The step scratch the target keeps itself beside the arenas.
   QwenTargetScratchBytes targetScratch{};
+  // Whether sampled lanes' verifies run under a relaxation (RFlash), whose
+  // outputs the decode arena then holds; without one it holds none, and the
+  // arenas are those of lossless verification.
+  bool relaxedVerify = false;
 
   // The geometry of `model` as it loaded, or with `parts` streaming
   // whatever streams of it as it loaded (plannedRuntimeMemory). Only a
@@ -73,8 +77,10 @@ struct RuntimeGeometry final {
     return from(model, kvFormat, stateFormat, StreamedParts::loaded(model));
   }
   [[nodiscard]] static RuntimeGeometry from(const LoadedModel &model, kv::Format kvFormat,
-                                            ops::GdnStateFormat stateFormat, StreamedParts parts) {
+                                            ops::GdnStateFormat stateFormat, StreamedParts parts,
+                                            bool relaxedVerify = false) {
     RuntimeGeometry result;
+    result.relaxedVerify = relaxedVerify;
     result.draft = model.draft.layout;
     result.target = std::visit(
         [&](const auto &weights) { return qwenTargetGeometry(weights, result.draft.targetLayerIds()); },
@@ -413,6 +419,12 @@ enum class DecodeTensor : uint32_t {
   AcceptedCount,
   VerifyRows,
   VerifyConfidence,
+  // RFlash's relaxation of a verify's drafted rows (ops::Sampling,
+  // metal/abi/Sampling.h RelaxParams): the relaxed probabilities of each
+  // position's candidates, each row's rest ratio and each lane's status.
+  RelaxedProbabilities,
+  RelaxedRest,
+  RelaxedStatus,
   DraftInputTokens,
   DraftHidden0,
   DraftHidden1,

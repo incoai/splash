@@ -10,6 +10,7 @@ import copy
 import math
 import os
 import re
+import struct
 from collections.abc import Callable
 from dataclasses import dataclass
 from decimal import Decimal
@@ -259,14 +260,51 @@ def parse_queue_size(value):
     return size
 
 
-def parse_decode_share(value):
+def _parse_finite(value, *, positive, example):
+    """A finite number, positive or nonnegative, for an argparse type."""
     try:
-        share = float(value)
+        number = float(value)
     except ValueError:
-        share = math.nan
-    if not math.isfinite(share) or share < 0:
-        raise argparse.ArgumentTypeError("must be a nonnegative number such as 0.5")
-    return share
+        number = math.nan
+    if not math.isfinite(number) or (number <= 0 if positive else number < 0):
+        kind = "positive" if positive else "nonnegative"
+        raise argparse.ArgumentTypeError(f"must be a {kind} number such as {example}")
+    return number
+
+
+def parse_decode_share(value):
+    return _parse_finite(value, positive=False, example="0.5")
+
+
+# RFlash's settings' range (ops::RelaxationSetting::least and most): the
+# price from the least to the most, the allowance 0 or up to the most.
+RFLASH_LEAST = 1e-6
+RFLASH_MOST = 1e6
+
+
+def _parse_rflash(value, *, positive, example):
+    """A setting of RFlash in its range, which the engine holds as a float:
+    one out of range, or an allowance a float holds as zero though it is
+    not, is refused here as the engine would refuse it at its start
+    (RelaxationSetting::holds)."""
+    number = _parse_finite(value, positive=positive, example=example)
+    low = RFLASH_LEAST if positive else 0.0
+    if not low <= number <= RFLASH_MOST or (
+        number > 0 and struct.unpack("f", struct.pack("f", number))[0] == 0
+    ):
+        least = "1e-6" if positive else "0"
+        raise argparse.ArgumentTypeError(
+            f"must be a number from {least} to 1e6, such as {example}"
+        )
+    return number
+
+
+def parse_rflash_lambda(value):
+    return _parse_rflash(value, positive=True, example="1.5")
+
+
+def parse_rflash_alpha(value):
+    return _parse_rflash(value, positive=False, example="0.5")
 
 
 def parse_max_image_pixels(value):
@@ -795,6 +833,34 @@ SERVE_OPTIONS = (
         needs="experts",
     ),
     ServeOption(
+        "--rflash-lambda",
+        "requests",
+        dict(
+            type=parse_rflash_lambda,
+            default=None,
+            metavar="LAMBDA",
+            help="RFlash, relaxed speculative decoding with a drift constraint, "
+            "for sampled requests: the price of the divergence a verified "
+            "block may spend, such as 1.5 (a larger price stays closer to "
+            "lossless verification); set with --rflash-alpha (default: "
+            "lossless verification)",
+        ),
+        engine=EngineArgument("--rflash-lambda"),
+    ),
+    ServeOption(
+        "--rflash-alpha",
+        "requests",
+        dict(
+            type=parse_rflash_alpha,
+            default=None,
+            metavar="ALPHA",
+            help="RFlash's drift allowance: the drift toward the draft a "
+            "verified block may add per nat of divergence, such as 0.5 (0 "
+            "allows none); set with --rflash-lambda",
+        ),
+        engine=EngineArgument("--rflash-alpha"),
+    ),
+    ServeOption(
         "--allow-idle-sleep",
         "requests",
         dict(
@@ -842,6 +908,8 @@ def check_serve_arguments(parser, args):
         )
     if args.cache_dir is not None and not args.persistent_cache:
         parser.error("--cache-dir needs --persistent-cache")
+    if (args.rflash_lambda is None) != (args.rflash_alpha is None):
+        parser.error("--rflash-lambda and --rflash-alpha are set together")
 
 
 def serve_argv(args):
