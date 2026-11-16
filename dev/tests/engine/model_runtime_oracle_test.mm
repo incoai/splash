@@ -6591,10 +6591,19 @@ int main(int argc, char **argv) {
             "constrained verify mask offset is incorrect");
     executor.end(40);
 
-    // Accept two proposals of a path of the three a budget of four tokens
-    // lets the cycle verify and reject the third. The cycle's tree holds
-    // such a path, and its mask request simulates the tree after its anchor;
-    // the verified rows are counted only after target verification.
+    // Accept the proposals down a path of the tree the cycle grew and reject
+    // the others. A budget of four tokens lets the cycle verify three
+    // proposals, none deeper than three, the draft's largest estimates after
+    // an anchor the target did not choose, so the tree's shape is the
+    // machine's: a row two deep is among them only where its path's estimate
+    // exceeds that of the anchor's third child (Qwen3.8-Flash-Next's three on
+    // an M5 Max are the anchor's children). Where the tree holds a row two
+    // deep the path is the first one's: the cycle accepts its two proposals,
+    // its masks reject the third, and the successor they select, the budget's
+    // last token, is emitted at once without a KV row. Else it is the
+    // anchor's first child's, whose successor the next cycle would emit. The
+    // mask request simulates the tree after its anchor; the verified rows are
+    // counted only after target verification.
     EngineRequest perfectConstraint = makeRequest(44, prompt129, 4);
     perfectConstraint.constraint = ConstraintMode::TokenMask;
     beginCold(executor, perfectConstraint, 0);
@@ -6615,26 +6624,38 @@ int main(int argc, char **argv) {
             "perfect constraint did not overlap its mask request");
     const ModelMaskRequest &perfectAsked = perfectPending.maskRequests[0];
     const std::vector<uint32_t> perfectDepths = maskDepths(perfectAsked);
-    // The tree's first row two deep, and the row before it on its path.
-    const auto perfectSecond = static_cast<uint32_t>(std::ranges::find(perfectDepths, 2U) - perfectDepths.begin());
-    require(perfectAsked.simulationTokens.front() == perfectAnchor && std::ranges::max(perfectDepths) <= 3 &&
-                perfectSecond < perfectDepths.size(),
-            "perfect constraint's tree is deeper than its budget leaves or holds no path of two proposals");
-    const std::array perfectPath{perfectAnchor, perfectAsked.simulationTokens[perfectAsked.parents[perfectSecond]],
-                                 perfectAsked.simulationTokens[perfectSecond]};
     const size_t perfectSimulated = perfectAsked.simulationTokens.size();
+    require(perfectAsked.simulationTokens.front() == perfectAnchor && perfectSimulated >= 2 &&
+                std::ranges::max(perfectDepths) <= 3,
+            "perfect constraint's tree holds no proposal or is deeper than its budget leaves");
+    // The tree's first row two deep, or without one its first proposal, and
+    // the tokens down to it from the anchor's.
+    const auto perfectLast = static_cast<uint32_t>(
+        std::ranges::find(perfectDepths, std::min(std::ranges::max(perfectDepths), 2U)) - perfectDepths.begin());
+    std::vector<uint32_t> perfectPath{perfectAsked.simulationTokens[perfectLast]};
+    for (uint32_t row = perfectLast; row;) {
+      row = perfectAsked.parents[row];
+      perfectPath.insert(perfectPath.begin(), perfectAsked.simulationTokens[row]);
+    }
     provideMask(executor, 44,
-                pathMasks(perfectAsked, perfectPath, unlikeChildren(perfectAsked, perfectSecond, 121), 123));
+                pathMasks(perfectAsked, perfectPath,
+                          unlikeChildren(perfectAsked, pathRows(perfectAsked, perfectPath).back(), 121), 123));
     auto perfectResults = finishMaskedDecode(std::move(perfectPending));
     require(perfectResults.size() == 1,
             "perfect constrained overlap returned the wrong width");
     ModelStepResult perfectResult = std::move(perfectResults[0]);
+    // The cycle commits its path, and after two proposals the successor too.
+    const size_t perfectAccepted = perfectPath.size() - 1;
+    const size_t perfectEmitted = perfectAccepted == 2 ? 1 : 0;
     require(perfectResult.nextDecodeStage == DecodeStage::Regular &&
-                perfectResult.outputTokens.size() == 4 &&
-                perfectResult.outputTokensWithoutKv == 1 &&
+                perfectResult.outputTokens.size() == perfectPath.size() + perfectEmitted &&
+                std::equal(perfectPath.begin(), perfectPath.end(), perfectResult.outputTokens.begin()) &&
+                perfectResult.outputTokensWithoutKv == perfectEmitted &&
                 perfectResult.draftedTokens == perfectSimulated - 1 &&
-                perfectResult.acceptedDraftTokens == 2,
-            "constrained acceptance did not report two of its rows");
+                perfectResult.acceptedDraftTokens == perfectAccepted,
+            "constrained acceptance did not report its path's " + std::to_string(perfectAccepted) + " of the " +
+                std::to_string(perfectSimulated - 1) + " proposals it verified");
+    std::cout << "constrained_path proposals=" << perfectSimulated - 1 << " accepted=" << perfectAccepted << '\n';
     executor.end(44);
 
     EngineRequest alternateConstraint = makeRequest(41, prompt129, 1);
