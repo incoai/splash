@@ -648,14 +648,15 @@ private:
   // pages up to its projection beyond those it holds; a Spill lane's floor
   // up to its projection beyond its floor now, in prefill beyond its floor
   // at its next command's end, whose pages beyond those it holds count Full
-  // (nextCommandPages); none for a lane that ended.
+  // (nextCommandPages); none for a lane that ended. With `starting`, that
+  // request's start too: its state, and its chain's pages in memory as held.
   struct LaneDemand final {
     uint32_t fullPages = 0;  // the Resident lanes' pages and the Spill lanes' next prefill commands'
     uint64_t bytes = 0;      // the Spill lanes' floors and the readers' hot block floors
   };
-  [[nodiscard]] LaneDemand laneDemand() const;
+  [[nodiscard]] LaneDemand laneDemand(uint64_t starting = 0) const;
   // laneDemand in bytes, the Full pages at a Full page's bytes.
-  [[nodiscard]] uint64_t laneDemandBytes() const;
+  [[nodiscard]] uint64_t laneDemandBytes(uint64_t starting = 0) const;
   // The highest priority among the lanes in service, none without one.
   [[nodiscard]] std::optional<RequestPriority> highestLanePriority() const;
   // The request's projection fits in memory alone, as it would without the

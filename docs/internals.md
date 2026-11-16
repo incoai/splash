@@ -1779,7 +1779,15 @@ pressure too, and grows past both, short of critical pressure, once nothing in
 place meets its refusal: the governor exempts that allocation's retries from
 the margin and the pressure test (`MemoryGovernor::free`), since waiting would
 stall work in service; so does the KV a prefill command takes past its first state
-boundary, which the lane's next command would take anyway. A `Floor` claim
+boundary, which the lane's next command would take anyway. A start beside lanes
+in service is exempted the same way, for the margin alone: at normal pressure,
+in the band too, it passes while the headroom holds its whole start (its state
+and the pages it restores and is projected to grow into) beside what the lanes
+in service are projected to grow into, never the spare reserve, so sessions
+arriving together decode together rather than take turns, while a start whose
+prompt or chain the headroom does not hold takes nothing and waits; what a
+start takes counts against the headroom until the host's counters show it, as
+a pool's growth does, so starts in a row add up. A `Floor` claim
 passes short of critical pressure, and critical pressure refuses every claim,
 except an allocation covered by what the same allocation released, which
 passes the engine's limit too: its net change raises neither the charge nor

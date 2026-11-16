@@ -987,7 +987,7 @@ bool Engine::admit(Request &active, double now) {
   // (anotherResident): the host exempts it once nothing in place meets it,
   // and it takes up to what is in use. Beside a resident lane it is a start,
   // which takes only the cache nothing in use holds, the model's caches it
-  // rebuilds on use among them, and waits for that lane.
+  // rebuilds on use among them, and the host's margin, or waits for that lane.
   ClaimSpec spec = claimFor(active, anotherResident(active.request.id) ? ClaimClass::Start : ClaimClass::InService);
   spec.supersedes = supersedes;
   bool commits = false;

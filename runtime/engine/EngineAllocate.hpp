@@ -94,7 +94,7 @@ auto Engine::allocate(Attempt &&attempt, const ClaimSpec &spec, Refusal refusal)
     claim.governor = &governor;
     claim.id = ledger.open(claimed);
   }
-  ledger.setLanes(laneDemandBytes(), highestLanePriority());
+  ledger.setLanes(laneDemandBytes(spec.cls == ClaimClass::Start ? spec.requestId : 0), highestLanePriority());
   // The allocation runs in the claim's one scope, so what an attempt's work
   // released pays for the later attempts' allocations too (fund); each
   // attempt starts from a need the scope's refusal records afresh, and what

@@ -260,7 +260,7 @@ public:
   // refused is met in place first, from the pages and state buffers already
   // allocated; failing that, the retries of an InService claim, or
   // of an Optional one its lane needs (ClaimSpec::laneNeeds), pass the host,
-  // and another claim falls short.
+  // those of a Start its margin (HostRule), and another claim falls short.
   [[nodiscard]] FreeResult free(ClaimId claim, const Need &need);
   // What free() would find for such a claim, up to `enough`, taking nothing
   // and leaving the chains `kept` (VictimQuery::kept).
@@ -309,18 +309,18 @@ private:
   };
 
   // The host's one rule at its latest sample. Headroom h is the spare memory
-  // above the spare reserve, less what is being allocated and pool growth
-  // the host's counters do not show yet. The band begins when h falls below
-  // the margin M (kHostMarginBytes) or cannot be measured, and ends once h
-  // clears M by the largest pool growth unit (or by what host-refused claims
-  // wait for, if less: the band never holds them once h has room for them),
-  // or once a host pass finds nothing to take. Floor work passes. In-service
-  // work passes while h keeps M beyond it at normal pressure, and as an
-  // exempt claim once nothing in place meets it. A pool's growth the growth
-  // pass admitted on its net change (growthHost) passes. Anything else needs
-  // h to keep M beyond it outside the band and macOS's warning. macOS's
-  // critical pressure refuses everything. What a scope's work paid for
-  // never asks the rule (fund).
+  // above the spare reserve, less what is being allocated and pool growth the
+  // host's counters do not show yet. The band begins when h falls below the
+  // margin M (kHostMarginBytes) or cannot be measured, and ends once h clears M
+  // by the largest pool growth unit (or by what host-refused claims wait for, if
+  // less: the band never holds them once h has room for them), or once a host
+  // pass finds nothing to take. Floor work passes. In-service work passes while h
+  // keeps M beyond it at normal pressure, and as an exempt claim once nothing in
+  // place meets it; so does a start, at normal pressure, while h holds its whole
+  // start (hostBytes). A pool's growth the growth pass admitted on its net change
+  // (growthHost) passes. Anything else needs h to keep M beyond it outside the
+  // band and macOS's warning. macOS's critical pressure refuses everything. What
+  // a scope's work paid for never asks the rule (fund).
   class HostRule final {
   public:
     void sample(const std::optional<HostMemory> &host, uint64_t spareReserve, uint64_t inFlight,
@@ -350,8 +350,8 @@ private:
   // growth leaves the host, besides the margin, what the lanes in service are
   // projected to grow into (MemoryLedger::laneDemandBytes), as it leaves them
   // that room under the limit; it never runs while a request's claim waits
-  // (MemoryLedger::grow).
-  [[nodiscard]] uint64_t hostBytes(ClaimClass cls, uint64_t bytes) const noexcept;
+  // (MemoryLedger::grow); an exempt start at that growth, its own in it.
+  [[nodiscard]] uint64_t hostBytes(ClaimClass cls, uint64_t bytes, bool hostExempt = false) const noexcept;
   [[nodiscard]] GrowthHost growthHost(bool paced);
   // The admission's reservation for the scope's claim, or nothing with the
   // cause of the refusal in failure.
@@ -362,10 +362,10 @@ private:
   [[nodiscard]] std::optional<HostMemory> sampleHost() const noexcept;
   [[nodiscard]] uint64_t hostHeadroomBytes(const std::optional<HostMemory> &host,
                                            uint64_t reservedBytes) const noexcept;
-  // Of what pools grew within kHostSettleMilliseconds, what the host's
-  // reading `host` does not show yet: what the headroom has fallen since the
-  // growth does not cover (a store chunk's pages count only once experts load
-  // into it).
+  // Of what pools grew and starts took within kHostSettleMilliseconds, what
+  // the host's reading `host` does not show yet: what the headroom has fallen
+  // since does not cover (a store chunk counts once experts load into it, a
+  // state once a command writes it).
   [[nodiscard]] uint64_t unseenGrowthBytes(const std::optional<HostMemory> &host) const noexcept;
   [[nodiscard]] MemoryGovernorSnapshot
   snapshot(const std::optional<HostMemory> &hostMemory, const HostRule &rule) const noexcept;
@@ -398,8 +398,8 @@ private:
   bool bandWaived_ = false;
   // The latest control pass's clock, or the start growth's.
   double clockMilliseconds_ = 0.0;
-  // Pools' growth the host's counters may not show yet (unseenGrowthBytes):
-  // its bytes, the host's raw headroom before it, and when it lapses.
+  // Pools' growth and starts the host's counters may not show yet
+  // (unseenGrowthBytes): bytes, raw headroom before them, when they lapse.
   uint64_t unseenGrowthBytes_ = 0;
   uint64_t unseenGrowthHeadroom_ = 0;
   double unseenGrowthUntilMilliseconds_ = 0.0;

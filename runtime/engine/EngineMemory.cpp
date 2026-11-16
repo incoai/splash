@@ -124,12 +124,12 @@ Engine::ResidentRoom Engine::residentRoom(const Request &active, const ClaimSpec
   return {.needed = need.bytes, .available = available, .heldTokens = heldPages * KvCache::pageTokens};
 }
 
-uint64_t Engine::laneDemandBytes() const {
-  const LaneDemand lanes = laneDemand();
+uint64_t Engine::laneDemandBytes(uint64_t starting) const {
+  const LaneDemand lanes = laneDemand(starting);
   return uint64_t{lanes.fullPages} * cache_.bytesPerPage(kv::PageForm::Full) + lanes.bytes;
 }
 
-Engine::LaneDemand Engine::laneDemand() const {
+Engine::LaneDemand Engine::laneDemand(uint64_t starting) const {
   const SpillGeometry &geometry = config_.spill.geometry;
   const auto pages = [](uint64_t tokens) { return (tokens + KvCache::pageTokens - 1) / KvCache::pageTokens; };
   LaneDemand demand;
@@ -140,16 +140,19 @@ Engine::LaneDemand Engine::laneDemand() const {
   // A Spill lane with none reads nothing spilled.
   std::vector<uint64_t> readers;
   for (const auto &[id, peer] : requests_) {
-    if (!peer.lane || peer.pendingEnd)
+    if ((!peer.lane && id != starting) || peer.pendingEnd)
       continue;
+    demand.bytes += peer.lane ? 0 : model_.startStateBytes();
     const bool prefill = scheduler_.phase(id) == Phase::Prefill;
-    if (cache_.holdsIndexPages(id)) {
+    if (peer.lane && cache_.holdsIndexPages(id)) {
       readers.push_back(id);
       if (prefill)
         demand.bytes += model_.stagingShortfall(id, nextCommandPages(peer));
     }
     const uint64_t projection = projectedTokens(peer);
-    const uint64_t held = kvCapacity(id);
+    uint64_t held = peer.lane ? kvCapacity(id) : 0;
+    if (!held && peer.admissionProbe && !peer.skipCache)
+      held = uint64_t{cache_.residentChainPages(peer.admissionProbe->restoredChain())} * KvCache::pageTokens;
     if (peer.kvMode == KvMode::Spill) {
       // Its floor grows, up to its projection. But a prefill command writes
       // its rows to Full pages, which no release returns until their copies
