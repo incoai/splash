@@ -467,6 +467,20 @@ int main(int argc, char **argv) {
     const std::vector<uint32_t> tokens{0, 5, 17, 200};
     const Reference reference{Gguf(root / "target" / "ripple.gguf")};
     const auto expected = reference.logits(tokens);
+    {
+      const auto raw = backend.allocateBuffer(uint64_t{kRows} * kHidden * 2,
+                                              BufferStorage::Shared, "draft embeddings");
+      CommandGraph graph;
+      target->addDraftEmbedding(graph, upload(backend, tokens, "draft tokens"), raw, kRows);
+      static_cast<void>(backend.submitCommandAsync(graph.dispatches()).wait());
+      const auto table = reference.gguf.values("token_embd.weight");
+      const auto *got = static_cast<const uint16_t *>(raw.contents());
+      for (uint32_t row = 0; row < kRows; ++row)
+        for (uint32_t column = 0; column < kHidden; ++column)
+          require(got[row * kHidden + column] == splash::test::floatToBf16(
+                      static_cast<float>(table[uint64_t{tokens[row]} * kHidden + column])),
+                  "draft input inherited the target's embedding scale");
+    }
 
     MetalBuffer logits;
     const model::PrefillArena prefillArena(backend, geometry, operators);

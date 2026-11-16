@@ -108,6 +108,11 @@ void QwenTarget::addEmbedding(metal::CommandGraph &graph,
                       rows, geometry_.embeddingScale);
 }
 
+void QwenTarget::addDraftEmbedding(metal::CommandGraph &graph, metal::MetalBuffer tokens,
+                                  metal::MetalBuffer hidden, uint32_t rows) const {
+  ops::Embedding::add(graph, std::move(tokens), weightsBase_.tokenEmbedding, std::move(hidden), rows);
+}
+
 void QwenTarget::addStateCommit(metal::CommandGraph &, QwenTargetCommitBuffers buffers, uint32_t lanes) const {
   if (!lanes || lanes > ExecutionLimits::maximumBatchWidth)
     throw std::invalid_argument("invalid Qwen state commit batch");

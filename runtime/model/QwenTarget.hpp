@@ -527,6 +527,9 @@ public:
                               uint32_t rows) const;
   virtual void addEmbedding(metal::CommandGraph &graph, metal::MetalBuffer tokens,
                             metal::MetalBuffer hidden, uint32_t rows) const;
+  // The draft borrows token-table rows before the target's embedding scale.
+  void addDraftEmbedding(metal::CommandGraph &graph, metal::MetalBuffer tokens,
+                         metal::MetalBuffer hidden, uint32_t rows) const;
   // The commit after acceptance of a verify of `lanes` lanes: in the
   // verify's command after it (addVerify), or for constrained decoding in
   // the next command, before any other decode step reuses the verify's

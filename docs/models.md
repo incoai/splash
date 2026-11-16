@@ -328,8 +328,10 @@ retain 4096 RoPE positions, and its full layer retains 16384 positions without
 RoPE. The context window and KV rings follow each layer's attention shape.
 `readDraftLayout` in `ModelDescriptor.mm` validates the checkpoint against its
 variant; the kernels take any hidden width of whole 16-channel convolution
-groups. A draft's rows after its anchor read the
-target's token table row of the mask token, unless its release ships that
+groups. Draft inputs borrow the target's token-table rows before any
+target-specific embedding scale. Ripple scales its own inputs by the square
+root of its hidden size; the draft reads the raw rows (`QwenTarget::addDraftEmbedding`).
+A draft's rows after its anchor read the target's token table row of the mask token, unless its release ships that
 token's BF16 embedding, which they read instead (`DFlashDraft::addMaskRows`):
 `mask_embedding.safetensors`, one tensor `mask_embedding` of the hidden size.
 A quantized table can lose the row: Qwen3.5-122B-A10B's is of order 1e-6,

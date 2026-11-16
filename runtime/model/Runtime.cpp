@@ -2451,14 +2451,14 @@ struct Runtime::Impl {
     encodeDraftStateCommitBatch(graph, entries, items);
   }
 
-  void encodeBatchEmbedding(CommandGraph &graph, DecodeTensor tokens,
+  void encodeDraftEmbedding(CommandGraph &graph, DecodeTensor tokens,
                             DecodeTensor output, uint32_t lanes, uint32_t rows = 0) {
     if (!lanes || lanes > kLaneCount)
       throw std::invalid_argument("invalid embedding batch width");
     if (!rows)
       rows = lanes * kDecodeRows;
-    targetModel->addEmbedding(graph, decodeArena->batchSlice(tokens, lanes),
-                             decodeArena->batchSlice(output, lanes), rows);
+    targetModel->addDraftEmbedding(graph, decodeArena->batchSlice(tokens, lanes),
+                                  decodeArena->batchSlice(output, lanes), rows);
   }
 
   void encodeBatchVerifyInput(CommandGraph &graph, uint32_t lanes) {
@@ -3363,7 +3363,7 @@ Runtime::decodeAsync(const BatchPlan &plan,
       impl_->decodeArena->batchSlice(DecodeTensor::DraftRopeSin, width));
   // The draft encodes its whole block: every row's embedding, not the
   // ABI's 8-row sub-pass the target's verify gathers use.
-  impl_->encodeBatchEmbedding(commandGraph, DecodeTensor::DraftInputTokens,
+  impl_->encodeDraftEmbedding(commandGraph, DecodeTensor::DraftInputTokens,
                               DecodeTensor::DraftHidden0, width,
                               width * impl_->states.layout().draft.rows);
   impl_->draftModel.addMaskRows(commandGraph, impl_->decodeArena->batchSlice(DecodeTensor::DraftHidden0, width),
@@ -3896,7 +3896,7 @@ std::vector<uint32_t> RuntimeInstrumentation::lastTableRows(const Runtime &runti
 std::span<const float> RuntimeInstrumentation::lastLogits(const Runtime &runtime, uint32_t lane) {
   const Runtime::Impl &impl = *runtime.impl_;
   return {contents<float>(impl.decodeArena->get(lane, DecodeTensor::Logits), "logits"),
-          uint64_t{ExecutionLimits::targetVerifyRows} * impl.geometry.target.vocabularySize};
+          uint64_t{impl.geometry.target.verifyRows} * impl.geometry.target.vocabularySize};
 }
 
 std::span<const uint16_t> RuntimeInstrumentation::lastCapturedRows(const Runtime &runtime, uint32_t chunk) {
