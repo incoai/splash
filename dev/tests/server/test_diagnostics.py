@@ -245,6 +245,7 @@ class DiagnosticsTests(HarnessTestCase):
                             "sent_effort": None,
                             "effort": None,
                             "enable_thinking": None,
+                            "template_effort": None,
                             "thinking": True,
                             **reasoning,
                         },
@@ -274,6 +275,24 @@ class DiagnosticsTests(HarnessTestCase):
             line(sent_effort="high", effort="none", thinking=False),
             " · effort high → none · thinking off\n",
         )
+        # The effort chat_template_kwargs set is the one the template renders,
+        # over the one sent and the server's default (#777).
+        self.assertEqual(
+            line(template_effort="low", enable_thinking=True),
+            " · effort low (chat_template_kwargs) · enable_thinking true · thinking on\n",
+        )
+        self.assertEqual(
+            line(effort="high", template_effort="low"),
+            " · effort low (chat_template_kwargs) · thinking on\n",
+        )
+        self.assertEqual(
+            line(sent_effort="medium", effort="medium", template_effort="low"),
+            " · effort medium → low (chat_template_kwargs) · thinking on\n",
+        )
+        self.assertEqual(
+            line(sent_effort="low", effort="low", template_effort="low"),
+            " · effort low (chat_template_kwargs) · thinking on\n",
+        )
 
     def test_started_records_carry_chat_reasoning_options(self):
         records = []
@@ -286,6 +305,8 @@ class DiagnosticsTests(HarnessTestCase):
             chat_body(),
             chat_body(reasoning_effort="none"),
             chat_body(chat_template_kwargs={"enable_thinking": False}),
+            chat_body(chat_template_kwargs={"reasoning_effort": "medium"}),
+            chat_body(chat_template_kwargs={"reasoning_effort": "unheard-of"}),
         ):
             status, _, payload = harness.request("POST", "/v1/chat/completions", body)
             self.assertEqual(status, 200, payload)
@@ -301,19 +322,36 @@ class DiagnosticsTests(HarnessTestCase):
                     "sent_effort": None,
                     "effort": "low",
                     "enable_thinking": None,
+                    "template_effort": None,
                     "thinking": True,
                 },
                 {
                     "sent_effort": "none",
                     "effort": "none",
                     "enable_thinking": None,
+                    "template_effort": None,
                     "thinking": False,
                 },
                 {
                     "sent_effort": None,
                     "effort": "low",
                     "enable_thinking": False,
+                    "template_effort": None,
                     "thinking": False,
+                },
+                {
+                    "sent_effort": None,
+                    "effort": "low",
+                    "enable_thinking": None,
+                    "template_effort": "medium",
+                    "thinking": True,
+                },
+                {
+                    "sent_effort": None,
+                    "effort": "low",
+                    "enable_thinking": None,
+                    "template_effort": None,
+                    "thinking": True,
                 },
                 None,
             ],

@@ -79,13 +79,16 @@ class ReasoningRequest:
     """How a chat request asked to reason: the reasoning effort it sent, None
     when absent; the effort its template rendered with, the server's own
     where it sets every request's, else the server's default for an absent
-    one and None for the template's own; and its chat_template_kwargs
+    one and None for the template's own; its chat_template_kwargs
     enable_thinking, None when unset or when the server's effort replaced
-    it."""
+    it; and the effort its chat_template_kwargs set, which the template
+    renders over the others, None when unset or when the server's effort
+    replaced it."""
 
     sent: str | None
     effort: str | None
     enable_thinking: bool | None
+    template: str | None = None
 
 
 @dataclass
@@ -1015,6 +1018,7 @@ class NativeBackend:
                     "sent_effort": job.reasoning.sent,
                     "effort": job.reasoning.effort,
                     "enable_thinking": job.reasoning.enable_thinking,
+                    "template_effort": job.reasoning.template,
                     "thinking": job.thinking,
                 }
             self._log(record)

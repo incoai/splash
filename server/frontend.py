@@ -132,6 +132,9 @@ class Prompt:
     template_kwargs: dict = field(default_factory=dict)
     # The reasoning effort the request sent; None where it sent none.
     sent_effort: str | None = None
+    # The reasoning effort its chat_template_kwargs set, which the template
+    # renders over the others; None where they set none Splash names.
+    template_effort: str | None = None
 
 
 @dataclass
@@ -653,6 +656,7 @@ class Frontend:
             # malformed field is refused as without it.
             reasoning_effort, enable_thinking = self.reasoning_effort, None
             template_kwargs.pop("reasoning_effort", None)
+        template_effort = template_kwargs.get("reasoning_effort")
         messages = normalize_messages(body.get("messages"), vision=self.vision)
         tools, tool_policy = normalize_tools(
             body.get("tools"),
@@ -679,6 +683,7 @@ class Frontend:
             enable_thinking,
             template_kwargs,
             body.get("reasoning_effort"),
+            template_effort if template_effort in REASONING_EFFORTS else None,
         )
 
     def _tokenize(self, text, **options):
@@ -887,7 +892,10 @@ class Frontend:
             flags,
             thinking=thinking,
             reasoning=ReasoningRequest(
-                prompt.sent_effort, prompt.reasoning_effort, prompt.enable_thinking
+                prompt.sent_effort,
+                prompt.reasoning_effort,
+                prompt.enable_thinking,
+                prompt.template_effort,
             ),
             chat_format=self.chat_format,
             thinking_token_budget=(

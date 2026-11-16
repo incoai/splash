@@ -406,6 +406,7 @@ class ServerReasoningEffortTests(unittest.TestCase):
                 "sent_effort": "high",
                 "effort": "none",
                 "enable_thinking": None,
+                "template_effort": None,
                 "thinking": False,
             },
         )

@@ -1244,9 +1244,11 @@ The console's Started line names the request the engine took, by the id its
 Done, Cancelled or Error line names too, and shows how each chat request
 reasons: the effort it sent, or `absent`; after an arrow, the effort it
 rendered with where the server gave it another, the default or the one
-`--reasoning-effort` sets; its `enable_thinking` when it set one that counted;
-and whether it thinks, as in
-`Started · request 12 · input 2,473 · cached 0 · effort absent → low · thinking on`
+`--reasoning-effort` sets; the effort its `chat_template_kwargs` set, which
+the template renders over the others, followed by `(chat_template_kwargs)`;
+its `enable_thinking` when it set one that counted; and whether it thinks, as in
+`Started · request 12 · input 2,473 · cached 0 · effort absent → low · thinking on`,
+`effort low (chat_template_kwargs) · thinking on`
 or, under `--reasoning-effort none`, `effort high → none · thinking off`.
 
 A Chat or Messages request's `chat_template_kwargs` are passed to the template
