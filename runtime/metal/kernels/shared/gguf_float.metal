@@ -144,7 +144,10 @@ inline void project(device const bfloat *input, FloatProjection<T> projection, c
     const uint run = step * 8 + l.fn;
 #pragma unroll
     for (uint f = 0; f < kFragments; ++f) {
-      if (f * 8 >= live) break;
+      // Independent guards keep the four fragment indices unrolled. The
+      // early-exit form corrupts native-row MMA results under M5 shader
+      // validation once all 32 rows are active.
+      if (f * 8 >= live) continue;
       const uint row = f * 8 + l.fm;
       device const uchar *x = reinterpret_cast<device const uchar *>(input + ulong(row0 + row) * K);
       const Eight<bfloat> a0 = Eight<bfloat>::load(x, run * 8, row < live && run < runs);
