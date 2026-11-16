@@ -3,7 +3,7 @@ its answers, a message or its server-sent events, and its error shape."""
 
 from functools import partial
 
-from .. import json_codec, request_fields
+from .. import json_codec, request_fields, safeguards
 from ..chat_messages import field_value, image_part, media_content
 from ..documents import document_parts
 from ..errors import APIError, ContextLengthError, ErrorDialect
@@ -16,6 +16,9 @@ def post_messages(exchange, body, deadline):
     app = exchange.app
     streamed, flags = request_fields.generation(body)
     chat, omitted = to_chat_body(body, thinking_resolver=app.thinking_codec.decode)
+    # With --no-safeguards the field is ignored, as an unknown field is, and
+    # Claude Code makes its own classifier requests.
+    review = safeguards.messages_request(body) if exchange.safeguards else None
     job = app.prepare(
         chat,
         deadline=deadline,
@@ -24,7 +27,7 @@ def post_messages(exchange, body, deadline):
         stop_field="stop_sequences",
     )
     respond = stream if streamed else complete
-    return job, partial(respond, exchange, omitted=omitted)
+    return job, partial(respond, exchange, omitted=omitted, review=review)
 
 
 def post_count_tokens(exchange, body, deadline):
@@ -524,7 +527,7 @@ def _tool_choice(choice):
     return {"parallel_tool_calls": not disable_parallel, "tool_choice": tool_choice}
 
 
-def complete(exchange, job, *, omitted):
+def complete(exchange, job, *, omitted, review=None):
     app = exchange.app
     sequencer = BlockSequencer()
     collected = exchange.collect(
@@ -542,21 +545,23 @@ def complete(exchange, job, *, omitted):
         if collected.reasoning and omitted
         else ""
     )
-    exchange.send_json(
-        200,
-        message_response(
-            app.response_model,
-            job,
-            blocks,
-            result,
-            collected.called,
-            omitted,
-            signature,
-        ),
+    response = message_response(
+        app.response_model,
+        job,
+        blocks,
+        result,
+        collected.called,
+        omitted,
+        signature,
     )
+    if review is not None:
+        response["safeguard_results"] = safeguards.review_tool_calls(
+            exchange, job, review, blocks
+        )
+    exchange.send_json(200, response)
 
 
-def stream(exchange, job, *, omitted):
+def stream(exchange, job, *, omitted, review=None):
     app = exchange.app
 
     def send(event, payload):
@@ -635,18 +640,25 @@ def stream(exchange, job, *, omitted):
             on_progress=lambda progress: send("ping", {"prompt_progress": progress}),
         )
         result = collected.result
-        sequencer.finish(collected.cut, collected.reasoning_open)
+        blocks = sequencer.finish(collected.cut, collected.reasoning_open)
+        delta = {
+            "stop_reason": stop_reason(
+                result,
+                collected.called,
+                job.output_clamped_to_context,
+            ),
+            "stop_sequence": result.stop_sequence,
+        }
+        # Claude Code reads the results on the final message_delta. The
+        # reviews run after the output, the stream kept alive meanwhile.
+        if review is not None:
+            delta["safeguard_results"] = safeguards.review_tool_calls(
+                exchange, job, review, blocks, keepalive
+            )
         send(
             "message_delta",
             {
-                "delta": {
-                    "stop_reason": stop_reason(
-                        result,
-                        collected.called,
-                        job.output_clamped_to_context,
-                    ),
-                    "stop_sequence": result.stop_sequence,
-                },
+                "delta": delta,
                 "usage": {
                     "output_tokens": result.completion_tokens,
                     "output_tokens_details": {"thinking_tokens": job.reasoning_tokens},

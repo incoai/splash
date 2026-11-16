@@ -49,6 +49,7 @@ SERVER_FILES = (
     "output.py",
     "frontend.py",
     "chat_templates.py",
+    "safeguards.py",
     "diagnostics.py",
     "chat_messages.py",
     "chat_format.py",

@@ -21,7 +21,9 @@ handlers, how its requests convert to Chat, its complete and streamed
 answers, its error shape and its state (`openai.py` for Chat and text
 completions, `anthropic.py` for Messages, `responses.py` for Responses and
 the responses it stores, `scoring.py` for /v1/judgments and /v1/systemone
-and their finite-choice prompts). `request_fields.py` reads the fields every
+and their finite-choice prompts). `safeguards.py`, outside `dialects/`,
+holds the action-review policy that /v1/safeguards and Messages' safeguard
+results share, built on `scoring.py`'s judgments. `request_fields.py` reads the fields every
 API reads alike, `chat_messages.py` normalizes the Chat messages every API's
 request reaches, and `frontend.py` prepares a Chat body or a text completion
 as a job. `connections.py` holds the HTTP ingress bounds and `errors.py` the

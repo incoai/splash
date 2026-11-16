@@ -29,7 +29,7 @@ from transformers import AutoTokenizer
 from install import assembly
 from install.models import ModelError
 
-from . import dialects, json_codec, serve_options, serve_record
+from . import dialects, json_codec, safeguards, serve_options, serve_record
 from . import runtime as engine_runtime
 from .backend import (
     NativeBackend,
@@ -335,6 +335,12 @@ class FrontendHandler(BaseHTTPRequestHandler):
         return self.server.app
 
     @property
+    def safeguards(self):
+        """Whether a Messages request asking for safeguard_results gets them
+        (serve --no-safeguards turns it off)."""
+        return self.server.safeguards
+
+    @property
     def route(self):
         """The request's path as routing, authentication and error dialects
         all read it; empty before a request line parses."""
@@ -398,6 +404,10 @@ class FrontendHandler(BaseHTTPRequestHandler):
         print_status(
             f"Error · {request}{code} · {self.command} {path[:256]}", error=True
         )
+
+    def log_api_error(self, code):
+        """Print an error's console line for a failure the request survives."""
+        self._log_api_error(code)
 
     def safe_error(self, error, *, log=True):
         """Answer with `error` as its path's API answers it, unless the
@@ -986,6 +996,7 @@ ROUTES = {
         FrontendHandler._post_apply_template, prompt_only=True
     ),
     ("POST", "/v1/judgments"): Route(dialects.scoring.post_judgments),
+    ("POST", "/v1/safeguards"): Route(safeguards.post_review),
     ("POST", "/v1/systemone"): Route(
         dialects.scoring.post_systemone,
         dialects.scoring.ERRORS,
@@ -1056,6 +1067,7 @@ class FrontendServer(HTTPServer):
         webui=True,
         max_request_bytes=serve_options.DEFAULT_MAX_REQUEST_BYTES,
         allowed_origins=(),
+        safeguards=False,
     ):
         if (
             isinstance(max_request_bytes, bool)
@@ -1069,6 +1081,8 @@ class FrontendServer(HTTPServer):
         )
         self.api_key = api_key
         self.webui = webui
+        # Whether Messages requests asking for safeguard_results get them.
+        self.safeguards = safeguards
         self.allowed_hosts = {
             host.lower().rstrip(".")
             for host in (*allowed_hosts, address[0], "localhost", "127.0.0.1", "::1")
@@ -1307,6 +1321,7 @@ def main():
             webui=not args.no_webui,
             max_request_bytes=args.max_request_size,
             allowed_origins=args.allowed_origin,
+            safeguards=not args.no_safeguards,
         )
         try:
             server.server_bind()
