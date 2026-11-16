@@ -223,20 +223,26 @@ void checkPrefillInt8Scratch() {
 // One decode arena serves every lane count, and a staged plan's partials
 // grow with its rows. The arena must hold every lane's plan of every target
 // projection and the draft's context projections, over a lane's most rows,
-// and of the draft's own, over its block's, at the measured core counts.
+// and of the draft's own and of its head over its subset of the vocabulary
+// (DFlashDraft), over its block's, at the measured core counts and an M3
+// Ultra's 80: there the register tile splits K for the subset head's 2,322
+// column tiles and not for the whole head's 3,880, whose plan takes no
+// partials.
 void checkLaneScratch(const model::LoadedModel &loaded) {
   const auto geometry = model::RuntimeGeometry::from(loaded, kv::Format::Int8, ops::GdnStateFormat::Float32);
   const auto &d = geometry.draft;
+  const auto &target = geometry.target;
   // Each matrix with the rows a lane gives it.
   std::vector<std::pair<ops::LinearMatrix, uint32_t>> matrices{
       {{d.dynamicSize, d.hiddenSize}, model::kDraftRows},       {{d.qkvSize, d.hiddenSize}, model::kDraftRows},
       {{d.hiddenSize, d.attentionSize}, model::kDraftRows},     {{d.intermediateSize, d.hiddenSize}, model::kDraftRows},
       {{d.hiddenSize, d.intermediateSize}, model::kDraftRows},  {{d.selectorRank, d.hiddenSize}, model::kDraftRows},
-      {{d.contextKvSize(), d.hiddenSize}, model::kDecodeRows}, {{d.hiddenSize, d.targetHiddenSize()}, model::kDecodeRows}};
-  for (const auto &p : geometry.target.decodeProjections)
+      {{d.contextKvSize(), d.hiddenSize}, model::kDecodeRows}, {{d.hiddenSize, d.targetHiddenSize()}, model::kDecodeRows},
+      {{target.draftVocabulary.columns(target.vocabularySize), target.hiddenSize}, model::kDraftRows}};
+  for (const auto &p : target.decodeProjections)
     matrices.push_back({{p.outputSize, p.inputSize}, model::kDecodeRows});
   for (uint32_t family : {9U, 10U, 11U})
-    for (uint32_t cores : {12U, 20U, 40U}) {
+    for (uint32_t cores : {12U, 20U, 40U, 80U}) {
       DeviceCapabilities device;
       device.appleGpuFamily = family;
       device.gpuCoreCount = cores;
