@@ -176,8 +176,8 @@ StepCosts::Choice StepCosts::choose(std::span<const std::span<const float>> chan
   const std::vector<Point> &points = table(lanes);
   const uint32_t narrow = lanes * kNarrowCap;
   if (!measured(lanes)) {
-    // A draft's block a lane at the narrow cap, 1.6.2's step, as far as the
-    // lanes' chances fill it.
+    // A draft's block a lane at the narrow cap, --verify-rows all's step, as
+    // far as the lanes' chances fill it.
     const Pool block = poolOf(chances, kNarrowCap);
     const uint32_t rows = std::min(lanes - 1 + uint32_t(block.expected.size()), points.back().last);
     return {{lanes, rows, kNarrowCap}, block.expected[rows - lanes], 0.0};

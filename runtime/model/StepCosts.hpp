@@ -106,7 +106,8 @@ public:
   // first (VerifyBudget::laneChances): of the steps that fill a class as far
   // as the lanes' chances go, the one with the most expected accepted tokens
   // per cost, and among equals the fewest rows; before its lane count is
-  // measured, a draft's block a lane at the narrow cap, 1.6.2's step.
+  // measured, a draft's block a lane at the narrow cap, --verify-rows all's
+  // step, as far as the lanes' chances fill it.
   [[nodiscard]] Choice choose(std::span<const std::span<const float>> chances) const;
   // A cycle's step under --verify-rows all: a draft's block a lane, no more
   // than each lane holds (`holds`, its anchor and the rows past it it may

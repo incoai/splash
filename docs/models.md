@@ -354,11 +354,13 @@ starts of the same build, models and formats on the Mac read it back from
 beside the Neural Engine's calibrations instead, and no cycle changes it. A
 lane count whose lanes' state a start cannot hold beside the rest of its
 memory (under `--max-memory`, or where the warmup's allocation fails) is not
-measured: its cycles take a draft's block a lane, 1.6.2's step, until a start
-that holds them measures it. A lane holds up to eight rows unless the step's
-rows give one lane more of the lanes' chances, sixteen then, at what the
-16-row lane cap's GDN kernels and attention tiles add to a step of eight rows
-a lane, which the start also measures. Every target verifies every row of its
+measured: its cycles take a draft's block a lane, `--verify-rows all`'s step,
+as far as the lanes' chances fill it,
+until a start that holds them measures it. A lane holds up to eight rows
+unless the step's rows give one lane more of the lanes' chances, sixteen
+then, at what the 16-row lane cap's GDN kernels and attention tiles add to a
+step of eight rows a lane, which the start also measures. Every target
+verifies every row of its
 step that its lanes' trees fill: a dense target's projections read their weights once for
 all of a step's rows, so a row costs it little, and a MoE target's step,
 whose rows each route their own experts, which a rejected row reads for
