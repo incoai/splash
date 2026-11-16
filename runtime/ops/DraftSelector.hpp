@@ -115,9 +115,10 @@ public:
            std::span<const DraftTreeLane> lanes) const;
   // After add: the rows of a decode step of `step.lanes` lanes
   // (VerifyRowsParams), the trees' best rows that the step's rows and its
-  // lane cap hold, each lane's numbered in preorder, and the step's rows past
-  // them of no lane.
-  static void addVerifyRows(metal::CommandGraph &graph, const DraftSelectorBuffers &buffers, const StepRows &step);
+  // lane cap hold, none past an anchor estimated below `floor`, each lane's
+  // numbered in preorder, and the step's rows past them of no lane.
+  static void addVerifyRows(metal::CommandGraph &graph, const DraftSelectorBuffers &buffers, const StepRows &step,
+                            float floor = 0.0F);
 
 private:
   uint32_t vocabulary_ = 0;

@@ -254,30 +254,44 @@ static_assert(sizeof(DraftTreeParams) == 244,
 // Every lane holds its anchor; the plan's other rows go to the largest
 // estimates of the trees' rows, a lane's in the order its tree took them
 // (each at most its parent's, which comes before it), the earlier lane first
-// among equal ones, none past a lane's cap. A row is so taken by its rank
-// among all rows: every row ranked above it is another lane's, or its own
-// tree's that its draws did not make, and its own descendants rank below it,
-// so no row is verified for its own draws, which would leave its selection
-// no draw from the target. A lane's rows are its anchor and the rows it
-// took, numbered in preorder, its likeliest path on its first rows, and
-// lanes' rows are packed in lane order (SplashLaneRows). Where the trees
-// hold fewer rows than the plan (a sampled lane drew fewer children than its
-// chances promised, or a lane's tree is shallower than its share of the
-// step), the plan's rows past the lanes' belong to no lane: no kernel
-// selects, retains, attends or routes through the MoE experts a row of no
-// lane, and the projections compute it unread, as they compute a tile's
-// spare rows. Each carries lane 0's anchor, as the embedding gathers by
-// token. The rows and the cap come from the host before this cycle's draws,
-// so they admit no row by its own draws: the step costs' choice from the
-// last cycle's chances (model::StepCosts::choose), a draft's block a
-// lane under --verify-rows all, or a step a test forces.
+// among equal ones, none past a lane's cap and none estimated below `floor`
+// (at 0, every row the plan and the caps hold). A row is so taken by its own
+// estimate and its rank among all rows: its estimate reads its ancestors'
+// draws, which made it and the siblings drawn before it, and never its own;
+// every row ranked above it is another lane's, or its own tree's that its
+// draws did not make, and its own descendants rank below it. So no row is
+// verified for its own draws, which would leave its selection no draw from
+// the target: a rule may weigh a row by its own estimate and the rows ranked
+// above it, as the rank and the floor do, and never by the rows ranked after
+// it, its own descendants among them. A tree's estimates are finite (no row
+// is made of a candidate whose probability is not above 0), so they sort. A
+// sampled row tests every child its draft drew, whether or not the layout
+// holds the child's row (decode_sample_vocabulary_draw), and acceptance
+// follows its selection only to a row its lane holds (AcceptBatchParams): a
+// child the plan, the cap or the floor left out ends the lane's path, its
+// token the next cycle's anchor. A lane's rows are its anchor and the rows
+// it took, numbered in preorder, its likeliest path on its first rows, and
+// lanes' rows are packed in lane order (SplashLaneRows). Where the lanes
+// take fewer rows than the plan (rows under the floor, a sampled lane that
+// drew fewer children than its chances promised, or a tree shallower than
+// its lane's share of the step), the plan's rows past the lanes' belong to
+// no lane: no kernel selects, retains, attends or routes through the MoE
+// experts a row of no lane, and the projections compute it unread, as they
+// compute a tile's spare rows. Each carries lane 0's anchor, as the
+// embedding gathers by token. The rows, the cap and the floor come from the
+// host before this cycle's draws, so they admit no row by its own draws: the
+// step costs' choice from the last cycle's chances
+// (model::StepCosts::choose), a draft's block a lane under --verify-rows
+// all, a step within that block at its cost line's floor for a target whose
+// experts stream (model::CostLine::choose), or a step a test forces.
 struct VerifyRowsParams {
   uint32_t lanes;
   uint32_t rows;
   uint32_t lane_cap;
+  float floor;
 };
 
-static_assert(sizeof(VerifyRowsParams) == 12, "Verify rows parameters are 12 bytes on both sides");
+static_assert(sizeof(VerifyRowsParams) == 16, "Verify rows parameters are 16 bytes on both sides");
 
 // Acceptance of each lane's rows (SplashLaneRows) of the command's packed
 // rows, as a tree (metal/abi/VerifyTree.h): from its anchor's row the lane

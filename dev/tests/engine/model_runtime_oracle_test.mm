@@ -4249,10 +4249,18 @@ void requireMixedStepMatchesLanesAlone(model::Runtime &executor, std::span<const
 // a forced step of 8 rows a lane. Each lane holds the rows its tree grew, as
 // a step of exactly the lanes' rows lays them out from the same states,
 // commits a well formed cycle, and its rows' logits are within `bound`
-// (cosine) of that step's, whose projections' tiles hold other rows.
+// (cosine) of that step's, whose projections' tiles hold other rows. So does
+// a step at a floor (VerifyRowsParams), whose lanes hold their trees' rows
+// estimated at least the floor and leave the others to no lane: of greedy
+// lanes with output budgets of 12 tokens, whose trees fill a draft's block
+// with rows of four children each (children's estimates sum to at most
+// their parent's, so no floor passes a whole tree), at floors of 0.1, 0.25,
+// 0.5 and 0.75, one at least of which leaves out some of the trees' rows
+// past their anchors and not all; and at a floor over every estimate, which
+// leaves each lane its anchor alone.
 void requireRowsOfNoLane(model::Runtime &executor, std::span<const uint32_t> seed, uint32_t vocabulary,
                          double bound) {
-  constexpr uint32_t kLanes = 3, kOutput = 6, kStepRows = 8 * kLanes;
+  constexpr uint32_t kLanes = 3, kOutput = 6, kGreedyOutput = 12, kStepRows = 8 * kLanes;
   struct Lane final {
     EngineRequest request;
     std::vector<uint32_t> pages;
@@ -4267,24 +4275,28 @@ void requireRowsOfNoLane(model::Runtime &executor, std::span<const uint32_t> see
     lane.request.sampling = {.temperature = 0.05F, .topP = 1.0F, .topK = 0, .seed = 5303 + index};
     lane.pages = pageRange(100 + 4 * index, 4);
   }
-  // The lanes in one forced step of `rows` rows, each request an id of its
-  // own from `firstId`: each lane's rows and their raw logits.
+  // The lanes in one forced step of `rows` rows at `floor`, each request an
+  // id of its own from `firstId`, sampled as above or `greedy` with the
+  // longer budget: each lane's rows and their raw logits.
   struct Step final {
     std::array<uint32_t, kLanes> rows{};
     std::vector<std::vector<float>> logits;
   };
-  const auto decode = [&](uint64_t firstId, uint32_t rows) {
+  const auto decode = [&](uint64_t firstId, uint32_t rows, float floor = 0.0F, bool greedy = false) {
     BatchPlan plan{.kind = WorkKind::Decode, .decodeStage = DecodeStage::Regular};
     std::vector<ModelBatchItem> items;
+    const uint32_t budget = greedy ? kGreedyOutput : kOutput;
     for (uint32_t index = 0; index < kLanes; ++index) {
       Lane &lane = lanes[index];
       lane.request.id = firstId + index;
+      lane.request.maxNewTokens = budget;
+      lane.request.sampling.temperature = greedy ? 0.0F : 0.05F;
       beginCold(executor, lane.request, index);
       requireOpen(prefillChunk(executor, lane.request.id, 0, lane.request.prompt, lane.pages), "rows of no lane");
       plan.items.push_back({lane.request.id, 0});
       items.push_back(withRevision({lane.request.id, lane.request.prompt.size(), 0, lane.pages}));
     }
-    model::RuntimeInstrumentation::forceStepRows(executor, rows);
+    model::RuntimeInstrumentation::forceStepRows(executor, rows, floor);
     model::RuntimeInstrumentation::captureTargetLogits(executor, true);
     static_cast<void>(model::RuntimeInstrumentation::takeTargetLogits(executor));
     const std::vector<ModelStepResult> results = executor.decode(plan, items);
@@ -4295,8 +4307,8 @@ void requireRowsOfNoLane(model::Runtime &executor, std::span<const uint32_t> see
     for (uint32_t index = 0; index < kLanes; ++index) {
       const ModelStepResult &result = results[index];
       step.rows[index] = model::RuntimeInstrumentation::lastVerifyRows(executor, index);
-      require(result.failure.empty() && !result.outputTokens.empty() && result.outputTokens.size() <= kOutput &&
-                  step.rows[index] <= kOutput,
+      require(result.failure.empty() && !result.outputTokens.empty() && result.outputTokens.size() <= budget &&
+                  step.rows[index] <= budget,
               "rows of no lane: lane " + std::to_string(index) + " of a step of " + std::to_string(rows) +
                   " rows held " + std::to_string(step.rows[index]) + " and committed " +
                   std::to_string(result.outputTokens.size()) + " tokens");
@@ -4306,22 +4318,49 @@ void requireRowsOfNoLane(model::Runtime &executor, std::span<const uint32_t> see
     require(step.logits.size() == kLanes, "rows of no lane: a step copied no logits");
     return step;
   };
+  // The least cosine of the rows `step`'s lanes hold to those of `exact`, a
+  // step of exactly their rows.
+  const auto leastCosine = [&](const Step &step, const Step &exact) {
+    double least = 1.0;
+    for (uint32_t index = 0; index < kLanes; ++index) {
+      require(exact.rows[index] == step.rows[index], "rows of no lane: a lane held other rows in a step of its rows");
+      for (uint32_t row = 0; row < step.rows[index]; ++row) {
+        SimilarityAccumulator accumulator;
+        for (uint64_t at = uint64_t{row} * vocabulary; at < uint64_t{row + 1} * vocabulary; ++at)
+          accumulator.add(step.logits[index][at], exact.logits[index][at]);
+        least = std::min(least, accumulator.result().cosine);
+      }
+    }
+    return least;
+  };
   const Step wide = decode(1200, kStepRows);
   const uint32_t held = std::accumulate(wide.rows.begin(), wide.rows.end(), 0U);
-  const Step exact = decode(1210, held);
-  double least = 1.0;
-  for (uint32_t index = 0; index < kLanes; ++index) {
-    require(exact.rows[index] == wide.rows[index], "rows of no lane: a lane held other rows in a step of its rows");
-    for (uint32_t row = 0; row < wide.rows[index]; ++row) {
-      SimilarityAccumulator accumulator;
-      for (uint64_t at = uint64_t{row} * vocabulary; at < uint64_t{row + 1} * vocabulary; ++at)
-        accumulator.add(wide.logits[index][at], exact.logits[index][at]);
-      least = std::min(least, accumulator.result().cosine);
-    }
-  }
+  double least = leastCosine(wide, decode(1210, held));
   std::cout << "rows_of_no_lane held=" << held << " of " << kStepRows << " least_cosine=" << least << '\n';
   require(least > bound, "rows of no lane: a lane's logits are at cosine " + std::to_string(least) +
                              " of a step of exactly the lanes' rows");
+  const Step full = decode(1220, kStepRows, 0.0F, true);
+  const uint32_t filled = std::accumulate(full.rows.begin(), full.rows.end(), 0U);
+  std::string floors;
+  bool some = false;
+  uint64_t firstId = 1230;
+  for (const float floor : {0.1F, 0.25F, 0.5F, 0.75F, 1.5F}) {
+    const Step floored = decode(firstId, kStepRows, floor, true);
+    const uint32_t taken = std::accumulate(floored.rows.begin(), floored.rows.end(), 0U);
+    for (uint32_t index = 0; index < kLanes; ++index)
+      require(floored.rows[index] <= full.rows[index], "rows of no lane: a floor gave a lane rows");
+    least = leastCosine(floored, decode(firstId + 10, taken, 0.0F, true));
+    require(least > bound, "rows of no lane: at a floor of " + std::to_string(floor) + " a lane's logits are at cosine " +
+                               std::to_string(least) + " of a step of exactly the lanes' rows");
+    floors += (floors.empty() ? "" : ",") + std::to_string(taken);
+    some = some || (taken > kLanes && taken < filled);
+    require(floor < 1.0F || taken == kLanes, "rows of no lane: a floor over every estimate left the lanes " +
+                                                 std::to_string(taken) + " rows, not their anchors alone");
+    firstId += 20;
+  }
+  std::cout << "rows_of_no_lane floors=0.1,0.25,0.5,0.75,1.5 held=" << floors << " of " << filled << '\n';
+  require(some, "rows of no lane: no floor of 0.1 to 0.75 left out some of the trees' " + std::to_string(filled) +
+                    " rows past their anchors and not all (the lanes held " + floors + ")");
   std::cout << "rows_of_no_lane=PASS\n";
 }
 
@@ -4343,8 +4382,11 @@ void requireRowsOfNoLane(model::Runtime &executor, std::span<const uint32_t> see
 // end's (none the draft's), a lane's next step has chances to size it by
 // (its tree grows past its step's rows, and a tree of no draft row leaves its
 // chances as they were), whatever step its measured costs then choose;
-// then constrained lanes, which take the same costs, or where the target's
-// experts stream a cost line of their own (model::CostLine).
+// then constrained lanes, which take the same costs. A target whose experts
+// stream takes each cycle's rows at its cost line's floor instead, the floor
+// of a line of the cycles that ran before it, its constrained cycles a line
+// of their own (model::CostLine), and some cycle's lanes take fewer rows than
+// its step.
 void requireBudgetedCyclesAreWellFormed(model::Runtime &executor, const model::QwenStateStorage &states,
                                         std::span<const uint32_t> seed, bool streamed) {
   constexpr uint32_t kRows = model::ExecutionLimits::targetVerifyRows;
@@ -4452,28 +4494,58 @@ void requireBudgetedCyclesAreWellFormed(model::Runtime &executor, const model::Q
     firstPage += static_cast<uint32_t>(lane.pages.size());
     begin(lane);
   }
-  static_cast<void>(model::RuntimeInstrumentation::takeStepChoices(executor));
+  // The choices of the cycles since the last take, `constrained` or not. A
+  // target whose experts stream measures no table: each of its cycles' steps
+  // lies within a draft's block a lane at the narrow cap, weighs no cost, and
+  // takes its rows at the floor of a cost line fed, as `line` is here, every
+  // cycle before it that committed: the rows its lanes verified, the tokens
+  // they retained and the time the runtime's line took it at, constrained
+  // cycles a line of their own (model::CostLine). Another target's cycles
+  // have no floor.
+  const std::array<uint32_t, 1> anyClasses{1};
+  model::CostLine line(anyClasses);
+  uint32_t floored = 0, short_ = 0;
+  const auto choicesOf = [&](bool constrained) {
+    std::vector<model::RuntimeInstrumentation::StepChoice> choices =
+        model::RuntimeInstrumentation::takeStepChoices(executor);
+    for (const model::RuntimeInstrumentation::StepChoice &choice : choices) {
+      if (!streamed) {
+        require(choice.floor == 0.0 && choice.sampleMilliseconds == 0.0,
+                "a target whose experts do not stream took a cycle's rows at a floor");
+        continue;
+      }
+      require(choice.laneCap == model::StepCosts::kNarrowCap && choice.rows >= choice.lanes &&
+                  choice.rows <= choice.lanes * model::StepCosts::kNarrowCap && choice.cost == 0.0 &&
+                  choice.verified <= choice.rows,
+              "a streamed-expert target's step left a draft's block a lane at the narrow cap, or weighed a cost");
+      require(choice.floor == static_cast<float>(line.floor(choice.lanes, constrained)),
+              "a streamed-expert target's cycle took its rows at a floor of " + std::to_string(choice.floor) +
+                  ", not the " + std::to_string(line.floor(choice.lanes, constrained)) +
+                  " of a line of the cycles that ran before it");
+      floored += choice.floor > 0.0;
+      short_ += choice.verified < choice.rows;
+      if (choice.sampleMilliseconds > 0.0)
+        line.observe(choice.lanes, constrained, choice.verified, choice.retained, choice.sampleMilliseconds);
+    }
+    return choices;
+  };
+  static_cast<void>(choicesOf(false));
   decode(lanes, 1);
-  const std::vector<model::RuntimeInstrumentation::StepChoice> firstCycle =
-      model::RuntimeInstrumentation::takeStepChoices(executor);
-  // A target whose experts stream measures no table: its cost line has no
-  // sample before its first cycle, which its seed's shape sizes within a
-  // draft's block a lane at no cost, and prices the cycles after its samples
-  // (model::CostLine).
+  const std::vector<model::RuntimeInstrumentation::StepChoice> firstCycle = choicesOf(false);
+  // A streamed-expert target's line has no sample before its first cycle,
+  // which takes its rows at the seed's floor (the decode warmups teach it
+  // nothing) within the step of the lanes' first chances, every row's 1: a
+  // draft's block a lane.
   require(firstCycle.size() == 1 && firstCycle[0].lanes == 4 &&
-              (streamed ? firstCycle[0].cost == 0.0 && firstCycle[0].laneCap == model::StepCosts::kNarrowCap &&
-                              firstCycle[0].rows <= 4 * model::StepCosts::kNarrowCap
+              (streamed ? firstCycle[0].floor > 0.0 && firstCycle[0].sampleMilliseconds > 0.0 &&
+                              firstCycle[0].rows == 4 * model::StepCosts::kNarrowCap
                         : firstCycle[0].cost > 0.0),
-          streamed ? "a streamed-expert target's first cycle, before its line's samples, was priced or took more "
-                     "than a draft's block a lane"
+          streamed ? "a streamed-expert target's first cycle, before its line's samples, had no floor, was not "
+                     "planned a draft's block a lane, or gave its line no sample"
                    : "the first budgeted cycle after the decode warmups weighed no measured cost: the warmups "
                      "measured no step of four lanes");
   decode(lanes, kCycles - 1);
-  const std::vector<model::RuntimeInstrumentation::StepChoice> later =
-      model::RuntimeInstrumentation::takeStepChoices(executor);
-  require(!streamed || (!later.empty() && later.back().cost > 0.0 &&
-                        later.back().rows <= later.back().lanes * model::StepCosts::kNarrowCap),
-          "a streamed-expert target's cost line priced no cycle, or took more than a draft's block a lane");
+  static_cast<void>(choicesOf(false));
   require(lanes[3].tokens.size() == 12, "the budgeted lanes did not reach the cycles the check needs");
   for (const Lane &lane : lanes)
     executor.end(lane.request.id);
@@ -4492,10 +4564,9 @@ void requireBudgetedCyclesAreWellFormed(model::Runtime &executor, const model::Q
   // A lane's free cycle after its `dip`, the step it sizes.
   const auto afterDip = [&](std::vector<Lane> &dipping, const auto &dip, const std::string &what) {
     dip();
-    static_cast<void>(model::RuntimeInstrumentation::takeStepChoices(executor));
+    static_cast<void>(choicesOf(false));
     decode(dipping, 1);
-    const std::vector<model::RuntimeInstrumentation::StepChoice> next =
-        model::RuntimeInstrumentation::takeStepChoices(executor);
+    const std::vector<model::RuntimeInstrumentation::StepChoice> next = choicesOf(false);
     require(next.size() == 1 && next[0].chances > 0,
             "after " + what + " a lane's next step had no chances to size it by");
   };
@@ -4528,9 +4599,8 @@ void requireBudgetedCyclesAreWellFormed(model::Runtime &executor, const model::Q
       [&] {
         decode(thinking, 1);
         std::string step;
-        for (const model::RuntimeInstrumentation::StepChoice &choice :
-             model::RuntimeInstrumentation::takeStepChoices(executor)) {
-          step += " step of " + std::to_string(choice.rows) + " rows, expected " + std::to_string(choice.expected) +
+        for (const model::RuntimeInstrumentation::StepChoice &choice : choicesOf(false)) {
+          step += " step of " + std::to_string(choice.rows) + " rows at a floor of " + std::to_string(choice.floor) +
                   ", verified " + std::to_string(choice.verified);
         }
         require(thinker.tokens == thinker.end, "a thinking end's cycle retained " +
@@ -4566,14 +4636,21 @@ void requireBudgetedCyclesAreWellFormed(model::Runtime &executor, const model::Q
     require(result.failure.empty() && result.outputTokens.empty(),
             "a budgeted constrained lane's first token failed or was emitted");
   decode(constrained, 24);
+  static_cast<void>(choicesOf(true));
   for (const Lane &lane : constrained) {
     require(lane.finished || lane.tokens.size() == lane.request.maxNewTokens,
             "a budgeted constrained lane did not finish");
     executor.end(lane.request.id);
   }
+  // A streamed-expert target's cycles took their rows at floors, and the
+  // lanes of some took fewer rows than their step: rows of no lane, through
+  // the routes, the attention, the selection and the commit of serving.
+  require(!streamed || (floored > 0 && short_ > 0),
+          "a streamed-expert target's cycles had a floor in " + std::to_string(floored) +
+              " cycles and fewer rows than their step in " + std::to_string(short_));
   std::cout << "budgeted_cycles=PASS decode_warmups_seconds=" << warmupSeconds << " lane_cycles=" << laneCycles
             << " mean_verify_rows=" << double(verifiedRows) / double(laneCycles) << " wide_lanes=" << wideLanes
-            << '\n';
+            << " floored_cycles=" << floored << " short_cycles=" << short_ << '\n';
 }
 
 // The cost of passes over history (model::StepCosts' k) follows the cycles a

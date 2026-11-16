@@ -25,10 +25,12 @@
 // chain's child leaves its drawn siblings what its rate leaves of 1.
 // draft_verify_rows
 // must lay out the rows of every lane whose expected tokens are the best of
-// every assignment the step's rows and the lanes' cap allow, each lane
-// exactly the rows it took, packed in lane order, and the step's rows past
-// them of no lane, each lane 0's anchor and no source; and number a lane's
-// rows in preorder, the earlier-taken child first.
+// every assignment the step's rows, the lanes' cap and its floor allow (no
+// row past an anchor estimated below the floor: one at it is taken, one just
+// under it is not, and an anchor whatever its estimate), each lane exactly
+// the rows it took, packed in lane order, and the step's rows past them of
+// no lane, each lane 0's anchor and no source; and number a lane's rows in
+// preorder, the earlier-taken child first.
 #include "ChainRows.hpp"
 #include "LinearNumerics.hpp"
 #include "TestBuffers.hpp"
@@ -1056,10 +1058,11 @@ DrawnTree drawTree(Random &random, uint32_t rows, uint32_t anchor) {
 }
 
 // The best assignment of rows to lanes by brute force: each lane a prefix of
-// its tree's rows, its anchor to at most `cap` of them, the lanes' together
-// at most `rows`, of the most expected tokens. Expected tokens count a lane's
-// anchor 1 and each other row its estimate, in double.
-double bestAssignment(const std::vector<DrawnTree> &trees, uint32_t rows, uint32_t cap) {
+// its tree's rows, its anchor to at most `cap` of them, none past its anchor
+// estimated below `floor`, the lanes' together at most `rows`, of the most
+// expected tokens. Expected tokens count a lane's anchor 1 and each other row
+// its estimate, in double.
+double bestAssignment(const std::vector<DrawnTree> &trees, uint32_t rows, uint32_t cap, float floor) {
   const uint32_t lanes = static_cast<uint32_t>(trees.size());
   std::vector<uint32_t> kept(lanes, 1);
   double best = 0.0;
@@ -1075,7 +1078,8 @@ double bestAssignment(const std::vector<DrawnTree> &trees, uint32_t rows, uint32
       best = std::max(best, expected);
     more = false;
     for (uint32_t lane = 0; lane < lanes && !more; ++lane) {
-      if (kept[lane] < std::min<uint32_t>(cap, static_cast<uint32_t>(trees[lane].tokens.size()))) {
+      if (kept[lane] < std::min<uint32_t>(cap, static_cast<uint32_t>(trees[lane].tokens.size())) &&
+          trees[lane].estimates[kept[lane]] >= floor) {
         ++kept[lane];
         more = true;
       } else {
@@ -1088,8 +1092,9 @@ double bestAssignment(const std::vector<DrawnTree> &trees, uint32_t rows, uint32
 
 // The rows draft_verify_rows takes of each lane: every lane's rows past its
 // anchor by estimate (the earlier lane's, then its earlier row, first among
-// equal ones), each the step's rows and the lane's cap leave room for.
-std::vector<uint32_t> ruleAssignment(const std::vector<DrawnTree> &trees, uint32_t rows, uint32_t cap) {
+// equal ones), each the step's rows and the lane's cap leave room for, to the
+// first estimated below `floor`.
+std::vector<uint32_t> ruleAssignment(const std::vector<DrawnTree> &trees, uint32_t rows, uint32_t cap, float floor) {
   const uint32_t lanes = static_cast<uint32_t>(trees.size());
   std::vector<std::pair<float, uint32_t>> order;
   for (uint32_t lane = 0; lane < lanes; ++lane)
@@ -1099,7 +1104,7 @@ std::vector<uint32_t> ruleAssignment(const std::vector<DrawnTree> &trees, uint32
   std::vector<uint32_t> taken(lanes, 1U);
   uint32_t total = lanes;
   for (const auto &entry : order) {
-    if (total == rows)
+    if (total == rows || entry.first < floor)
       break;
     if (taken[entry.second] == cap)
       continue;
@@ -1111,17 +1116,20 @@ std::vector<uint32_t> ruleAssignment(const std::vector<DrawnTree> &trees, uint32
 
 // draft_verify_rows against its rule and every assignment of rows: for
 // random trees (estimates with exact 0 and repeats, of 1 to kBlock rows),
-// steps of 1 to 4 lanes and every count of rows and cap they allow, each lane
-// holds exactly the rows the rule takes, the first rows its tree took, no
-// lane more than the cap and the lanes no more than the step's rows, and
-// their expected tokens are the best of every assignment. The lanes' rows are
-// the step's first, in lane order, and its rows past them, where the trees
-// hold fewer, are of no lane: each holds lane 0's anchor and no source. A
-// lane's rows are numbered in preorder, the earlier-taken child first, with
-// their tokens, depths, ancestors and sources.
+// steps of 1 to 4 lanes, every count of rows and cap they allow and floors
+// of none, at a row's estimate, just over one, anywhere and over them all,
+// each lane holds exactly the rows the rule takes, the first rows its tree
+// took, no lane more than the cap and the lanes no more than the step's
+// rows, and their expected tokens are the best of every assignment that
+// takes no row below the floor. An anchor's estimate, 0 here, is not read.
+// The lanes' rows are the step's first, in lane order, and its rows past
+// them, where the trees hold fewer or the floor left rows out, are of no
+// lane: each holds lane 0's anchor and no source. A lane's rows are numbered
+// in preorder, the earlier-taken child first, with their tokens, depths,
+// ancestors and sources.
 void verifyRowsLayout(MetalBackend &backend) {
   Random random(0xb0d9e7);
-  uint32_t short_ = 0;
+  uint32_t short_ = 0, floored = 0;
   for (uint32_t trial = 0; trial < 600; ++trial) {
     const uint32_t lanes = 1 + trial % kLanes;
     const uint32_t cap = 1 + random.next() % kBlock;
@@ -1151,21 +1159,34 @@ void verifyRowsLayout(MetalBackend &backend) {
         static_cast<TreeRow *>(b.trees.contents())[at] = {ancestors[row], static_cast<uint16_t>(parent),
                                                          static_cast<uint16_t>(depth[row])};
         static_cast<float *>(b.treeScores.contents())[2 * at] = float(row) * 0.01F;
-        static_cast<float *>(b.treeScores.contents())[2 * at + 1] = trees[lane].estimates[row];
+        static_cast<float *>(b.treeScores.contents())[2 * at + 1] = row ? trees[lane].estimates[row] : 0.0F;
       }
     }
+    // The floor: none, a row's estimate, the next float over one (over the
+    // least normal float where the estimate is 0: a GPU flushes a smaller
+    // floor to none, and a host's floor, its line's slope times a rate, is no
+    // such float), any, or one over every estimate.
+    const DrawnTree &some = trees[random.next() % lanes];
+    const float estimate = some.estimates[random.next() % some.estimates.size()];
+    const uint32_t kind = random.next() % 6;
+    const float floor = kind < 2    ? 0.0F
+                        : kind == 2 ? estimate
+                        : kind == 3 ? std::nextafter(std::max(estimate, std::numeric_limits<float>::min()), 2.0F)
+                        : kind == 4 ? 0.5F * (random.unit() + 1.0F)
+                                    : 1.5F;
     // A row holds 0xBAD, no tree's token nor source, until the layout writes
     // it.
     std::fill_n(static_cast<uint32_t *>(b.inputTokens.contents()), rows, 0xBADu);
     std::fill_n(static_cast<uint32_t *>(b.verifySources.contents()), rows, 0xBADu);
     CommandGraph graph;
-    DraftSelector::addVerifyRows(graph, b, {lanes, rows, cap});
+    DraftSelector::addVerifyRows(graph, b, {lanes, rows, cap}, floor);
     static_cast<void>(backend.submitCommandAsync(graph.dispatches()).wait());
     const auto *laneRows = static_cast<const LaneRows *>(b.laneRows.contents());
-    const std::string label = "verify rows trial " + std::to_string(trial);
+    const std::string label = "verify rows trial " + std::to_string(trial) + ", floor " + std::to_string(floor);
 
     // The choice: each lane exactly the rule's rows, the best assignment.
-    const std::vector<uint32_t> rule = ruleAssignment(trees, rows, cap);
+    const std::vector<uint32_t> rule = ruleAssignment(trees, rows, cap, floor);
+    floored += rule != ruleAssignment(trees, rows, cap, 0.0F);
     double expected = 0.0;
     uint32_t first = 0;
     for (uint32_t lane = 0; lane < lanes; ++lane) {
@@ -1180,7 +1201,7 @@ void verifyRowsLayout(MetalBackend &backend) {
       first += laneRows[lane].rows;
     }
     require(first <= rows, label + ": the lanes hold more rows than the step");
-    const double best = bestAssignment(trees, rows, cap);
+    const double best = bestAssignment(trees, rows, cap, floor);
     require(expected >= best * (1.0 - 1e-6), label + ": draft_verify_rows chose " + std::to_string(expected) +
                                                  " expected tokens where " + std::to_string(best) + " were possible");
     // The step's rows past the lanes' are of no lane.
@@ -1220,8 +1241,74 @@ void verifyRowsLayout(MetalBackend &backend) {
       }
     }
   }
-  // A quarter of the trials' trees hold fewer rows than their steps.
+  // A quarter of the trials' trees hold fewer rows than their steps, and the
+  // floor left rows out of a sixth of them.
   require(short_ >= 100, "only " + std::to_string(short_) + " of 600 trials left rows of no lane");
+  require(floored >= 100, "the floor left rows out of only " + std::to_string(floored) + " of 600 trials");
+}
+
+// The floor on a row's own estimate: of two lanes' chains estimated 0.9, 0.5,
+// 0.5, 0.25 and 0.1, and 0.5, 0.3 and 0, past their anchors, in a step of a
+// draft's block a lane, a floor of none takes every row; one of 0.5 the rows
+// at it and above, 4 and 2 with the anchors; the next float over 0.5 those
+// above it, 2 and 1; and one over every estimate the anchors alone, whose
+// own estimates, 0 here, the layout does not read. The lanes' rows are
+// packed in lane order, and the step's other rows are of no lane.
+void verifyRowsFloor(MetalBackend &backend) {
+  constexpr uint32_t lanes = 2, cap = 8, rows = lanes * cap;
+  const std::array<std::vector<float>, lanes> estimates{
+      {{0.0F, 0.9F, 0.5F, 0.5F, 0.25F, 0.1F}, {0.0F, 0.5F, 0.3F, 0.0F}}};
+  DraftSelectorBuffers b{};
+  b.treeTokens = allocate(backend, uint64_t{lanes} * kBlock * 4);
+  b.trees = allocate(backend, uint64_t{lanes} * kBlock * sizeof(TreeRow));
+  b.treeScores = allocate(backend, uint64_t{lanes} * kBlock * 8);
+  b.treeSizes = allocate(backend, uint64_t{lanes} * 4);
+  b.inputTokens = allocate(backend, uint64_t{rows} * 4);
+  b.treeRows = allocate(backend, uint64_t{rows} * sizeof(TreeRow));
+  b.laneRows = allocate(backend, uint64_t{lanes} * sizeof(LaneRows));
+  b.verifySources = allocate(backend, uint64_t{rows} * 4);
+  for (uint32_t lane = 0; lane < lanes; ++lane) {
+    static_cast<uint32_t *>(b.treeSizes.contents())[lane] = static_cast<uint32_t>(estimates[lane].size());
+    for (uint32_t row = 0; row < estimates[lane].size(); ++row) {
+      const uint32_t at = lane * kBlock + row;
+      static_cast<uint32_t *>(b.treeTokens.contents())[at] = 100 * (lane + 1) + row;
+      static_cast<TreeRow *>(b.trees.contents())[at] = chainRow(row);
+      static_cast<float *>(b.treeScores.contents())[2 * at + 1] = estimates[lane][row];
+    }
+  }
+  struct Case final {
+    float floor;
+    std::array<uint32_t, lanes> held;
+  };
+  for (const Case &c : {Case{0.0F, {6, 4}}, Case{0.5F, {4, 2}}, Case{std::nextafter(0.5F, 1.0F), {2, 1}},
+                        Case{1.5F, {1, 1}}}) {
+    std::fill_n(static_cast<uint32_t *>(b.inputTokens.contents()), rows, 0xBADu);
+    std::fill_n(static_cast<uint32_t *>(b.verifySources.contents()), rows, 0xBADu);
+    CommandGraph graph;
+    DraftSelector::addVerifyRows(graph, b, {lanes, rows, cap}, c.floor);
+    static_cast<void>(backend.submitCommandAsync(graph.dispatches()).wait());
+    const auto *laneRows = static_cast<const LaneRows *>(b.laneRows.contents());
+    const auto *tokens = static_cast<const uint32_t *>(b.inputTokens.contents());
+    const auto *sources = static_cast<const uint32_t *>(b.verifySources.contents());
+    const std::string label = "verify rows at a floor of " + std::to_string(c.floor) + ": ";
+    uint32_t first = 0;
+    for (uint32_t lane = 0; lane < lanes; ++lane) {
+      const uint32_t held = laneRows[lane].rows;
+      require(held >= 1 && laneRows[lane].first == first && tokens[first] == 100 * (lane + 1) && sources[first] == 0,
+              label + "lane " + std::to_string(lane) + " does not hold its anchor after the lanes before it");
+      require(held == c.held[lane],
+              label + "lane " + std::to_string(lane) + " took " + std::to_string(held) + " rows, not " +
+                  std::to_string(c.held[lane]) +
+                  (held > c.held[lane] ? ": rows under the floor" : ": it left out rows at the floor or above it"));
+      for (uint32_t row = 0; row < held; ++row)
+        require(tokens[first + row] == 100 * (lane + 1) + row && sources[first + row] == row,
+                label + "a lane's rows are not the first of its chain");
+      first += held;
+    }
+    for (uint32_t slot = first; slot < rows; ++slot)
+      require(tokens[slot] == 100 && sources[slot] == SPLASH_NO_TOKEN,
+              label + "row " + std::to_string(slot) + " of no lane is not lane 0's anchor without a source");
+  }
 }
 
 // A step's rows go to the likeliest rows of every lane's tree, whichever
@@ -1362,8 +1449,13 @@ void invalidRequests(MetalBackend &backend) {
     rejects([&] { DraftSelector::addVerifyRows(graph, f.buffers, bad); }, "invalid decode step rows",
             "impossible step rows were encoded");
   require(graph.empty(), "an invalid draft selector request encoded a graph");
+  // A floor that is not a number, below none, or without end.
+  for (const float bad : {NAN, -0.25F, INFINITY})
+    rejects([&] { DraftSelector::addVerifyRows(graph, f.buffers, StepRows{2, 2 * kBlock, kBlock}, bad); },
+            "invalid verify rows floor", "an impossible floor was encoded");
+  require(graph.empty(), "an invalid floor encoded a graph");
   CommandGraph encoded;
-  DraftSelector::addVerifyRows(encoded, f.buffers, StepRows{2, 2 * kBlock, kBlock});
+  DraftSelector::addVerifyRows(encoded, f.buffers, StepRows{2, 2 * kBlock, kBlock}, 0.25F);
   require(!encoded.empty(), "valid verify rows were not encoded");
 }
 
@@ -1388,6 +1480,7 @@ int main(int argc, char **argv) {
     siblingsShareTheirParent(backend);
     chainCountsAgainstItsSiblings(backend);
     verifyRowsLayout(backend);
+    verifyRowsFloor(backend);
     verifyRowsAcrossLanes(backend);
     std::cout << "draft_selector_metal_test: PASS\n";
     return 0;

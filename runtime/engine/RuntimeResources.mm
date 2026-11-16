@@ -421,14 +421,15 @@ void reportStreamedStores(const model::LoadedModel &loaded, const model::Streama
   }
 }
 
-// The rows the target's decode cycles verify (--verify-rows), and why: by
-// its cycles' cost line where its experts stream (model::CostLine).
+// The rows the target's decode cycles verify (--verify-rows), and why: those
+// its cycles' cost line's floor passes where its experts stream
+// (model::CostLine).
 void reportVerifyRows(model::VerifyRows rows, bool streamed) {
   if (rows == model::VerifyRows::All)
     logLine("Decode cycles verify every row of the draft's block (--verify-rows all).");
   else
-    logLine("Decode cycles verify the rows of the step ",
-            streamed ? "their cost line chooses" : "their measured costs choose",
+    logLine("Decode cycles verify the rows ",
+            streamed ? "their cost line's floor passes" : "of the step their measured costs choose",
             " (--verify-rows auto): greedy and seeded outputs can differ from run to run.");
 }
 

@@ -344,9 +344,8 @@ leaving them as they were; and its host chain's, or without one those of its
 last chain's path that its draft joined), and a table of what a step costs
 by its class: the steps whose kernels are the same (`ops::ExecutionPlans::
 decodeRowClasses`: a projection's tile and staged height, a float tile, a MoE
-target's expert tile), priced by a step of the class's last rows, up to the
-rows the target runs in one pass (a streamed-expert store's round of 32, else
-sixteen a lane). The start measures the table on the Mac before it serves
+target's expert tile), priced by a step of the class's last rows, up to
+sixteen rows a lane. The start measures the table on the Mac before it serves
 (in the decode warmups, three passes over a step of each class at each lane
 count, each step's median wall time: a first start's decode warmups of
 Qwen3.8-27B on a 48 GB M5 Pro take 11.1 s, a later start's 1.0 s), later
@@ -367,24 +366,33 @@ lane count whose lanes' state a start cannot hold beside the rest of its
 memory (under `--max-memory`, or where the warmup's allocation fails) is not
 measured: its cycles take a draft's block a lane, `--verify-rows all`'s step,
 as far as the lanes' chances fill it,
-until a start that holds them measures it. A target whose experts stream
-([Streamed experts](server.md#streamed-experts)) measures no table, as its
-steps' costs follow its store's state, which only serving sees: its cycles
-fit 1.6.2's online cost line, a + b R ms for R rows at each lane count
-(`model::CostLine`), and take up to a draft's block a lane, the rows of the
-most expected tokens per cost by it, a draft's block a lane before its
-first sample and every 32nd cycle. A lane holds up to eight rows
+until a start that holds them measures it. A lane holds up to eight rows
 unless the step's rows give one lane more of the lanes' chances, sixteen
 then, at what the 16-row lane cap's GDN kernels and attention tiles add to a
-step of eight rows a lane, which the start also measures. Every target
-verifies every row of its
-step that its lanes' trees fill: a dense target's projections read their weights once for
-all of a step's rows, so a row costs it little, and a MoE target's step,
-whose rows each route their own experts, which a rejected row reads for
-nothing (a Qwen3.8-Flash-Next cycle of one lane routes about 43 experts a
-layer with all eight rows and 17 with two), from the SSD where they stream
-([Streamed experts](server.md#streamed-experts)), is priced by the same
-costs of its steps' rows. `--verify-rows all` has every cycle's step verify
+step of eight rows a lane, which the start also measures. Such a target
+verifies every row of its step that its lanes' trees fill: a dense target's
+projections read their weights once for all of a step's rows, so a row costs
+it little, and a MoE target's step, whose rows each route their own experts,
+which a rejected row reads for nothing (a Qwen3.8-Flash-Next cycle of one
+lane routes about 43 experts a layer with all eight rows and 17 with two),
+is priced by the same costs of its steps' rows. A target whose experts stream
+from the SSD ([Streamed experts](server.md#streamed-experts)) measures no
+table, as what its rows cost follows its store's state, which only serving
+sees: its cycles fit 1.6.2's online cost line, a + b R ms for the R rows a
+cycle's lanes verify at each lane count (`model::CostLine`), and verify a
+row exactly when the estimate that the target accepts it is at least the
+line's floor, b times the tokens per ms of the lane count's latest cycles:
+the price at which a row's chance of a token is worth its time. A cycle
+applies the floor twice. Before it runs, the host applies it to the lanes'
+chances, which pick only the kernels that run: the step is the last rows of
+the kernel class that holds the rows the floor passes, no fewer than a
+draft's block in all and at most one a lane. After its draft, the device
+applies it to the trees' own
+estimates, which pick the rows: the lanes verify the step's rows at or above
+the floor, and the others belong to no lane and route no expert
+(`VerifyRowsParams`). Before the line's first sample the floor is its seed's,
+and every 32nd cycle of a lane count verifies a draft's block a lane, which
+keeps the line's rows spread. `--verify-rows all` has every cycle's step verify
 every row of a draft's block a lane, so that greedy and seeded outputs
 repeat. The startup log says which rows the cycles
 verify and why, and `/status` reports it as `verify_rows`. The selector grows

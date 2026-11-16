@@ -1829,12 +1829,15 @@ kernel void draft_verify_rows(device const uint *tree_tokens [[buffer(0)]],
       owners[at] = lane;
     }
   }
-  // The best of them that the cycle's rows and the lanes' cap hold.
+  // The best of them that the cycle's rows and the lanes' cap hold, none
+  // below the floor: they fall, so the first below it ends them.
   uint rows[Lanes];
   for (uint lane = 0; lane < params.lanes; ++lane)
     rows[lane] = 1;
   uint taken = params.lanes;
   for (uint i = 0; i < count && taken < params.rows; ++i) {
+    if (estimates[i] < params.floor)
+      break;
     if (rows[owners[i]] == params.lane_cap)
       continue;
     ++rows[owners[i]];

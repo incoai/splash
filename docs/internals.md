@@ -946,9 +946,10 @@ products in different orders: a route's output depends on how many rows the step
 expert, so decode results of GGUF MoE targets, the 35B's included, are not invariant to the
 batch (`kernels/common/moe_expert_slab.h`). Under the default `--verify-rows auto`, a decode
 step's rows also follow the step costs the start measured on the Mac, the cost of passes over
-history its cycles fit (`model::StepCosts::observeContext`) and the acceptance the
-verify budget learns from earlier requests ([Drafts](models.md#drafts)), so decode results can
-differ between runs of one request.
+history its cycles fit (`model::StepCosts::observeContext`; a streamed-expert target's, the
+cost line its cycles fit, `model::CostLine`) and the acceptance the verify budget learns from
+earlier requests ([Drafts](models.md#drafts)), so decode results can differ between runs of
+one request.
 The float router, QSA indexer and alpha/beta projections run in `kernels/shared/gguf_float.metal`,
 which runs two projections of one input in one dispatch where they take the same tile (the
 indexer's query and key, each on the tile of its own width), and the token rows are gathered by

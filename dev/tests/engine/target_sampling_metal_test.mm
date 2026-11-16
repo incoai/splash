@@ -20,7 +20,9 @@
 // selects a stop token. A sampled verify row that tests the children its
 // draft drew selects as the recursion does in double, row by row; the
 // recursion's selections, enumerated, are the target's distribution, and so
-// are those of a tree's anchor and verified children, Monte Carlo; and a row
+// are those of a tree's anchor and verified children, Monte Carlo, also
+// where a floor on the rows' estimates leaves children unverified (a floor
+// on estimates that read a row's own draws must fail that check); and a row
 // whose target keeps only candidates selects one of them.
 // Extreme repetition penalties saturate to exact, finite outcomes, and rows
 // of non-finite logits select the sentinel 0xFFFFFFFF. The host
@@ -31,6 +33,7 @@
 #include "TestBuffers.hpp"
 #include "TestChecks.hpp"
 #include "metal/MetalBackend.hpp"
+#include "ops/DraftSelector.hpp"
 #include "ops/Embedding.hpp"
 #include "ops/LaneRows.hpp"
 #include "ops/Sampling.hpp"
@@ -2947,6 +2950,98 @@ void keptCandidatesAlone(MetalBackend &backend) {
     }
 }
 
+// The targets and drafts of the trees the Monte Carlo checks draw: an
+// anchor's logits and its distribution under a policy, and those of each of
+// its candidates as a child; the rows below a child, alike. The anchor's
+// candidates are six of its likeliest tokens and ten others. Its draft favors
+// the less likely of the six, so that a draw is often rejected and the row's
+// later tests and residuals decide; or, peaked, holds nearly all on the
+// second likeliest, the rest a fifteenth each once the target rejects it. The
+// next position's candidates, which every child shares, each child's draft
+// weighs otherwise.
+struct TreeTargets final {
+  std::vector<float> anchor, leaf;
+  Distribution root;
+  Children first;
+  std::vector<std::vector<float>> childLogits;
+  std::vector<Distribution> childTargets;
+  std::vector<Children> second;
+};
+
+TreeTargets treeTargets(uint32_t vocabulary, const SamplingPolicy &policy, bool peaked, Random &random) {
+  TreeTargets t;
+  t.anchor.resize(vocabulary);
+  t.leaf.resize(vocabulary);
+  fillRow(t.anchor.data(), vocabulary, random);
+  fillRow(t.leaf.data(), vocabulary, random);
+  t.root = referenceDistribution(t.anchor.data(), vocabulary, policy);
+  require(t.root.ambiguousMass == 0.0, "the test's anchor is ambiguous");
+  std::vector<uint32_t> ids = referenceBest(t.anchor.data(), vocabulary, 6);
+  while (ids.size() < kCandidates) {
+    const uint32_t id = random.next() % vocabulary;
+    if (std::find(ids.begin(), ids.end(), id) == ids.end())
+      ids.push_back(id);
+  }
+  std::copy(ids.begin(), ids.end(), t.first.ids.begin());
+  for (uint32_t i = 0; i < kCandidates; ++i)
+    t.first.q[i] = peaked ? (i == 1 ? 1.0 - 1.5e-8 : 1.0e-9) : i < 6 ? 1.0 + i : 0.2;
+  const double firstTotal = std::accumulate(t.first.q.begin(), t.first.q.end(), 0.0);
+  for (double &value : t.first.q)
+    value /= firstTotal;
+  t.childLogits.assign(kCandidates, std::vector<float>(vocabulary));
+  for (uint32_t i = 0; i < kCandidates; ++i) {
+    fillRow(t.childLogits[i].data(), vocabulary, random);
+    t.childTargets.push_back(referenceDistribution(t.childLogits[i].data(), vocabulary, policy));
+    require(t.childTargets.back().ambiguousMass == 0.0, "the test's child is ambiguous");
+  }
+  std::vector<uint32_t> next = referenceBest(t.childLogits[0].data(), vocabulary, 5);
+  while (next.size() < kCandidates) {
+    const uint32_t id = random.next() % vocabulary;
+    if (std::find(next.begin(), next.end(), id) == next.end())
+      next.push_back(id);
+  }
+  t.second.resize(kCandidates);
+  for (uint32_t i = 0; i < kCandidates; ++i) {
+    std::copy(next.begin(), next.end(), t.second[i].ids.begin());
+    double total = 0.0;
+    for (uint32_t j = 0; j < kCandidates; ++j)
+      total += t.second[i].q[j] = peaked ? (j == 1 ? 1.0 - 1.5e-8 : 1.0e-9) : j < 5 ? 1.0 + (j + i) % 5 : 0.2;
+    for (double &value : t.second[i].q)
+      value /= total;
+  }
+  return t;
+}
+
+// Whether `counts` follow `probabilities`: their chi-square over the outcomes
+// expected 5 times or more (the others pooled) lies within five standard
+// deviations of its degrees of freedom, which `text` gives. No outcome the
+// distribution never gives may be counted.
+bool followsDistribution(const std::vector<uint32_t> &counts, const std::vector<double> &probabilities,
+                         const std::string &label, std::string &text) {
+  const double total = std::accumulate(counts.begin(), counts.end(), 0.0);
+  double chi = 0.0, pooledSeen = 0.0, pooledExpected = 0.0;
+  uint32_t bins = 0;
+  for (uint32_t token = 0; token < counts.size(); ++token) {
+    const double want = probabilities[token] * total;
+    require(probabilities[token] > 0.0 || counts[token] == 0,
+            label + ": selected token " + std::to_string(token) + ", which the target never selects");
+    if (want < 5.0) {
+      pooledSeen += counts[token];
+      pooledExpected += want;
+      continue;
+    }
+    chi += (counts[token] - want) * (counts[token] - want) / want;
+    ++bins;
+  }
+  if (pooledExpected >= 5.0) {
+    chi += (pooledSeen - pooledExpected) * (pooledSeen - pooledExpected) / pooledExpected;
+    ++bins;
+  }
+  const double freedom = bins - 1.0;
+  text = "chi-square " + std::to_string(chi) + " over " + std::to_string(freedom) + " degrees of freedom";
+  return bins >= 2 && chi < freedom + 5.0 * std::sqrt(2.0 * freedom);
+}
+
 // The recursion over trees selects from the target, Monte Carlo: a lane's
 // anchor tests three children its draft drew without replacement, the first
 // two of them verify rows that test two each of their own. Over 6000 such
@@ -2968,55 +3063,13 @@ void childTestsOnTrees(MetalBackend &backend, const SamplingPolicy &policy, bool
   const std::string variant = "temperature " + std::to_string(policy.temperature) + (peaked ? ", peaked: " : ": ");
   Random random(0x74726565);
   std::mt19937_64 rng(0x74726565);
-  // The anchor's logits and each of its candidates' as a child; the rows
-  // below a child alike.
-  std::vector<float> anchor(vocabulary), leaf(vocabulary);
-  fillRow(anchor.data(), vocabulary, random);
-  fillRow(leaf.data(), vocabulary, random);
-  const Distribution root = referenceDistribution(anchor.data(), vocabulary, policy);
-  require(root.ambiguousMass == 0.0, "the test's anchor is ambiguous");
-  // The anchor's candidates: six of its likeliest tokens and ten others.
-  // Its draft favors the less likely of the six, so that a draw is often
-  // rejected and the row's later tests and residuals decide; or, peaked,
-  // holds nearly all on the second likeliest, the rest a fifteenth each once
-  // the target rejects it.
-  Children first;
-  std::vector<uint32_t> ids = referenceBest(anchor.data(), vocabulary, 6);
-  while (ids.size() < kCandidates) {
-    const uint32_t id = random.next() % vocabulary;
-    if (std::find(ids.begin(), ids.end(), id) == ids.end())
-      ids.push_back(id);
-  }
-  std::copy(ids.begin(), ids.end(), first.ids.begin());
-  for (uint32_t i = 0; i < kCandidates; ++i)
-    first.q[i] = peaked ? (i == 1 ? 1.0 - 1.5e-8 : 1.0e-9) : i < 6 ? 1.0 + i : 0.2;
-  const double firstTotal = std::accumulate(first.q.begin(), first.q.end(), 0.0);
-  for (double &value : first.q)
-    value /= firstTotal;
-  std::vector<std::vector<float>> childLogits(kCandidates, std::vector<float>(vocabulary));
-  std::vector<Distribution> childTargets;
-  for (uint32_t i = 0; i < kCandidates; ++i) {
-    fillRow(childLogits[i].data(), vocabulary, random);
-    childTargets.push_back(referenceDistribution(childLogits[i].data(), vocabulary, policy));
-    require(childTargets.back().ambiguousMass == 0.0, "the test's child is ambiguous");
-  }
-  // The next position's candidates, which every child shares, each child's
-  // draft weighing them otherwise.
-  std::vector<uint32_t> next = referenceBest(childLogits[0].data(), vocabulary, 5);
-  while (next.size() < kCandidates) {
-    const uint32_t id = random.next() % vocabulary;
-    if (std::find(next.begin(), next.end(), id) == next.end())
-      next.push_back(id);
-  }
-  std::vector<Children> second(kCandidates);
-  for (uint32_t i = 0; i < kCandidates; ++i) {
-    std::copy(next.begin(), next.end(), second[i].ids.begin());
-    double total = 0.0;
-    for (uint32_t j = 0; j < kCandidates; ++j)
-      total += second[i].q[j] = peaked ? (j == 1 ? 1.0 - 1.5e-8 : 1.0e-9) : j < 5 ? 1.0 + (j + i) % 5 : 0.2;
-    for (double &value : second[i].q)
-      value /= total;
-  }
+  const TreeTargets t = treeTargets(vocabulary, policy, peaked, random);
+  const std::vector<float> &anchor = t.anchor, &leaf = t.leaf;
+  const Distribution &root = t.root;
+  const Children &first = t.first;
+  const std::vector<std::vector<float>> &childLogits = t.childLogits;
+  const std::vector<Distribution> &childTargets = t.childTargets;
+  const std::vector<Children> &second = t.second;
   std::vector<uint32_t> anchorCounts(vocabulary, 0);
   std::vector<std::vector<uint32_t>> childCounts(kCandidates, std::vector<uint32_t>(vocabulary, 0));
   // Each lane's rows: its tree's, from its block's first row, whose rows past
@@ -3078,29 +3131,8 @@ void childTestsOnTrees(MetalBackend &backend, const SamplingPolicy &policy, bool
   }
   const auto chiSquare = [](const std::vector<uint32_t> &counts, const std::vector<double> &probabilities,
                             const std::string &label) {
-    const double total = std::accumulate(counts.begin(), counts.end(), 0.0);
-    double chi = 0.0, pooledSeen = 0.0, pooledExpected = 0.0;
-    uint32_t bins = 0;
-    for (uint32_t token = 0; token < counts.size(); ++token) {
-      const double want = probabilities[token] * total;
-      require(probabilities[token] > 0.0 || counts[token] == 0,
-              label + ": selected token " + std::to_string(token) + ", which the target never selects");
-      if (want < 5.0) {
-        pooledSeen += counts[token];
-        pooledExpected += want;
-        continue;
-      }
-      chi += (counts[token] - want) * (counts[token] - want) / want;
-      ++bins;
-    }
-    if (pooledExpected >= 5.0) {
-      chi += (pooledSeen - pooledExpected) * (pooledSeen - pooledExpected) / pooledExpected;
-      ++bins;
-    }
-    const double freedom = bins - 1.0;
-    require(bins >= 2 && chi < freedom + 5.0 * std::sqrt(2.0 * freedom),
-            label + ": chi-square " + std::to_string(chi) + " over " + std::to_string(freedom) +
-                " degrees of freedom");
+    std::string text;
+    require(followsDistribution(counts, probabilities, label, text), label + ": " + text);
   };
   chiSquare(anchorCounts, root.probabilities, variant + "the anchor's selections");
   uint32_t children = 0;
@@ -3111,6 +3143,134 @@ void childTestsOnTrees(MetalBackend &backend, const SamplingPolicy &policy, bool
     ++children;
   }
   require(children >= walked, variant + "too few children were walked to check their selections");
+}
+
+// Selections under a floor on the verify rows (VerifyRowsParams) are the
+// target's, Monte Carlo. A lane's anchor draws three children, the first two
+// of them rows of its tree, each of which draws two of its own that have no
+// row, and draft_verify_rows lays each tree out in a step of three rows a
+// lane at a floor between the children's estimates: a child is verified in
+// some trees and in others left out, its token the lane's last. With each
+// child estimated as the selector estimates it, by the draft's probability
+// of the draw that made it and no more than the child drawn before it, the
+// anchor's selections follow the target's distribution at the anchor and a
+// verified child's, where acceptance walked to it, the target's at that
+// child (chi-squares as childTestsOnTrees', for two children or more walked
+// 300 times). With each child estimated by the probability of its own first
+// draw instead (`ownDraws`), which no selector does, the same floor verifies
+// a row for its own draws, and the children's selections must not follow
+// their targets: the check tells such a rule. The anchor's draft here favors
+// the likelier of its six likeliest candidates, so that the children over
+// the floor are those the target selects most.
+void childTestsUnderAFloor(MetalBackend &backend, const SamplingPolicy &policy, bool ownDraws) {
+  constexpr uint32_t vocabulary = 1003, kRuns = 1500, kTreeRows = 3;
+  constexpr float kFloor = 0.15F;
+  Sampling sampling(vocabulary);
+  const Batch batch = makeBatch(backend, vocabulary, kLanes);
+  const MetalBuffer table = penaltyTable(backend, vocabulary);
+  const std::array<uint32_t, kLanes> tableRows{};
+  const std::vector<SamplingPolicy> policies(kLanes, policy);
+  const std::string variant = ownDraws ? "a floor on estimates of a row's own draws: " : "a floor: ";
+  Random random(0x666c6f72);
+  std::mt19937_64 rng(0x666c6f72);
+  TreeTargets t = treeTargets(vocabulary, policy, false, random);
+  std::reverse(t.first.q.begin(), t.first.q.begin() + 6);
+  // The lanes' trees, which draft_verify_rows lays out as the batch's rows.
+  DraftSelectorBuffers trees{};
+  trees.treeTokens = allocate(backend, uint64_t{kLanes} * kBlock * sizeof(uint32_t));
+  trees.trees = allocate(backend, uint64_t{kLanes} * kBlock * sizeof(TreeRow));
+  trees.treeScores = allocate(backend, uint64_t{kLanes} * kBlock * 2 * sizeof(float));
+  trees.treeSizes = allocate(backend, uint64_t{kLanes} * sizeof(uint32_t));
+  trees.inputTokens = batch.buffers.inputTokens;
+  trees.treeRows = batch.buffers.treeRows;
+  trees.laneRows = batch.buffers.laneRows;
+  trees.verifySources = batch.buffers.verifySources;
+  auto *tokens = static_cast<uint32_t *>(trees.treeTokens.contents());
+  auto *rows = static_cast<TreeRow *>(trees.trees.contents());
+  auto *scores = static_cast<float *>(trees.treeScores.contents());
+  const StepRows step{kLanes, kLanes * kTreeRows, kNarrowLaneRows};
+  std::array<uint32_t, kLanes> limits{};
+  limits.fill(step.laneCap);
+  const AcceptanceBuffers acceptance = acceptanceBuffers(backend, batch, kLanes);
+  const auto *laneRows = static_cast<const LaneRows *>(batch.buffers.laneRows.contents());
+  const auto *sources = static_cast<const uint32_t *>(batch.buffers.verifySources.contents());
+  std::vector<uint32_t> anchorCounts(vocabulary, 0);
+  std::vector<std::vector<uint32_t>> childCounts(kCandidates, std::vector<uint32_t>(vocabulary, 0));
+  uint32_t verified = 0;
+  for (uint32_t run = 0; run < kRuns; ++run) {
+    std::vector<std::array<uint32_t, 2>> drawn(kLanes);
+    for (uint32_t lane = 0; lane < kLanes; ++lane) {
+      Children top = t.first;
+      top.draws = drawChildren(t.first.q, 3, rng);
+      setChildren(batch, lane, 0, 0, top);
+      static_cast<uint32_t *>(trees.treeSizes.contents())[lane] = kTreeRows;
+      tokens[lane * kBlock] = 1;
+      rows[lane * kBlock] = {1, SPLASH_TREE_ROOT, 0};
+      float estimate = 1.0F;
+      for (uint32_t branch = 0; branch < 2; ++branch) {
+        const uint32_t index = top.draws[branch], row = 1 + branch;
+        drawn[lane][branch] = index;
+        Children grand = t.second[index];
+        grand.draws = drawChildren(grand.q, 2, rng);
+        setChildren(batch, lane, row, 1, grand);
+        tokens[lane * kBlock + row] = t.first.ids[index];
+        rows[lane * kBlock + row] = {1U | 1U << row, 0, 1};
+        estimate = std::min(estimate, static_cast<float>(ownDraws ? grand.q[grand.draws[0]] : t.first.q[index]));
+        scores[2 * (lane * kBlock + row) + 1] = estimate;
+      }
+    }
+    CommandGraph layout;
+    DraftSelector::addVerifyRows(layout, trees, step, kFloor);
+    static_cast<void>(backend.submitCommandAsync(layout.dispatches()).wait());
+    // Each row's logits: its tree row's, the anchor's or a drawn child's.
+    for (uint32_t lane = 0; lane < kLanes; ++lane) {
+      verified += laneRows[lane].rows - 1;
+      for (uint32_t at = 0; at < laneRows[lane].rows; ++at) {
+        const uint32_t source = sources[laneRows[lane].first + at];
+        const std::vector<float> &logits = source ? t.childLogits[drawn[lane][source - 1]] : t.anchor;
+        std::copy(logits.begin(), logits.end(), batch.row(laneRows[lane].first + at));
+      }
+    }
+    for (uint32_t uniform = 0; uniform < kLanes * kUniforms; ++uniform)
+      batch.uniforms()[uniform] = 0.5F * (random.unit() + 1.0F);
+    batch.poison();
+    CommandGraph graph;
+    sampling.addVerify(graph, policies, batch.buffers, step, kStopTokens, {table, tableRows});
+    sampling.addAcceptance(graph, acceptance, step, limits, kStopTokens);
+    static_cast<void>(backend.submitCommandAsync(graph.dispatches()).wait());
+    const auto *retained = static_cast<const uint32_t *>(acceptance.retainedCounts.contents());
+    for (uint32_t lane = 0; lane < kLanes; ++lane) {
+      const uint32_t *kept = static_cast<const uint32_t *>(acceptance.outputTokens.contents()) + laneRows[lane].first;
+      ++anchorCounts[kept[0]];
+      for (uint32_t branch = 0; branch + 1 < laneRows[lane].rows && retained[lane] >= 2; ++branch)
+        if (kept[0] == t.first.ids[drawn[lane][branch]])
+          ++childCounts[drawn[lane][branch]][kept[1]];
+    }
+  }
+  // The floor left a child out of some trees and verified it in others.
+  const uint32_t drawnChildren = 2 * kRuns * kLanes;
+  require(verified > drawnChildren / 5 && verified < drawnChildren * 4 / 5,
+          variant + std::to_string(verified) + " of " + std::to_string(drawnChildren) +
+              " children were verified, too many or too few for the floor to matter");
+  std::string text;
+  require(followsDistribution(anchorCounts, t.root.probabilities, variant + "the anchor's selections", text),
+          variant + "the anchor's selections: " + text);
+  uint32_t children = 0;
+  std::string failed;
+  for (uint32_t i = 0; i < kCandidates; ++i) {
+    if (std::accumulate(childCounts[i].begin(), childCounts[i].end(), 0U) < 300)
+      continue;
+    ++children;
+    if (!followsDistribution(childCounts[i], t.childTargets[i].probabilities, variant + "child " + std::to_string(i),
+                             text))
+      failed += " child " + std::to_string(i) + "'s selections: " + text + ";";
+  }
+  require(children >= 2, variant + "too few children were walked to check their selections");
+  if (ownDraws)
+    require(!failed.empty(), variant + "every child's selections followed its target, so the check cannot tell "
+                                       "a floor that verifies a row for its own draws");
+  else
+    require(failed.empty(), variant + failed);
 }
 
 // The host words: prompt bits only when repetition reads them, counts of
@@ -3284,6 +3444,10 @@ int main(int argc, char **argv) {
     childTestsOnTrees(backend, SamplingPolicy{20, 1.0F, 0.95F}, false, 2);
     stage = "child tests on trees of peaked drafts at temperature 0.3";
     childTestsOnTrees(backend, SamplingPolicy{20, 0.3F, 0.95F}, true, 1);
+    stage = "child tests under a floor";
+    childTestsUnderAFloor(backend, SamplingPolicy{20, 1.0F, 0.95F}, false);
+    stage = "child tests under a floor on estimates of a row's own draws";
+    childTestsUnderAFloor(backend, SamplingPolicy{20, 1.0F, 0.95F}, true);
     for (const uint32_t vocabulary : {1003U, 248320U}) {
       uint32_t changedSelections = 0;
       for (uint32_t lanes = 1; lanes <= kLanes; ++lanes) {

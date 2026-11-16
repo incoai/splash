@@ -20,7 +20,10 @@
 // rows (at most 16 and at least one a lane: RuntimeInstrumentation::
 // forceStepRows), for the cost of a step by its rows; --attribute off times
 // the fused cycles alone and the prompt's fused prefill. --answer-tokens
-// sizes each lane's pages too.
+// sizes each lane's pages too. --block-plans on has a streamed-expert
+// target's cycles plan a draft's block a lane at their floor
+// (RuntimeInstrumentation::planBlocks), for what the larger class's kernels
+// cost a cycle.
 // With --images it profiles the vision encoder instead, loading only the
 // model's vision role: K encodes of a synthetic image per patch grid (height
 // x width in patches), fused and then attributed.
@@ -383,6 +386,7 @@ int main(int argc, char **argv) {
                      "[--state-format fp32|bf16] [--expert-memory SIZE] [--ple-memory SIZE] "
                      "[--dispatch-list FILE] [--verify-rows auto|all] [--step-rows T] [--attribute on|off] [--widths N] "
                      "[--warmups on|off] [--prompt chat|counting|FILE[,FILE...]] [--step-log on|off] "
+                     "[--block-plans on|off] "
                      "[--temperature T [--seed S]] [--thinking-budget TOKENS] [--answer-tokens N]\n"
                      "       decode-profile METALLIB MODEL_ROOT "
                      "--images HxW[,HxW...] [--cycles K]\n";
@@ -405,7 +409,7 @@ int main(int argc, char **argv) {
       // The start's decode warmups, which measure the step costs (StepCosts);
       // the counting prompt, or a file's token ids; and each cycle's choice
       // of its rows.
-      bool warmups = false, counting = false, stepLog = false;
+      bool warmups = false, counting = false, stepLog = false, blockPlans = false;
       // A file of token ids a lane, lane i the (i mod n)th of n.
       std::vector<std::filesystem::path> promptFiles;
       // Sampled answers at Qwen's recommended top-k 20 and top-p 0.95, and a
@@ -448,11 +452,11 @@ int main(int argc, char **argv) {
             throw std::invalid_argument("--verify-rows takes auto or all");
           verifyRows = value == "all" ? model::VerifyRows::All : model::VerifyRows::Auto;
           textOptions = true;
-        } else if (option == "--warmups" || option == "--step-log") {
+        } else if (option == "--warmups" || option == "--step-log" || option == "--block-plans") {
           const std::string_view value(argv[index + 1]);
           if (value != "on" && value != "off")
             throw std::invalid_argument(std::string(option) + " takes on or off");
-          (option == "--warmups" ? warmups : stepLog) = value == "on";
+          (option == "--warmups" ? warmups : option == "--step-log" ? stepLog : blockPlans) = value == "on";
           textOptions = true;
         } else if (option == "--prompt") {
           const std::string_view value(argv[index + 1]);
@@ -559,6 +563,7 @@ int main(int argc, char **argv) {
         static_cast<void>(model::RuntimeInstrumentation::takeStepChoices(executor));
       }
       model::RuntimeInstrumentation::forceStepRows(executor, stepRows);
+      model::RuntimeInstrumentation::planBlocks(executor, blockPlans);
 
       std::printf("device %s, %u prompt tokens, %u cycles per width, %s state\n",
                   backend.capabilities().deviceName.c_str(), promptTokens,
@@ -648,9 +653,10 @@ int main(int argc, char **argv) {
         if (stepLog)
           for (const auto &choice : model::RuntimeInstrumentation::takeStepChoices(executor)) {
             std::printf("%s step: %u rows at lane cap %u (expected %.3f, cost %.2f ms), verified %u, "
-                        "retained %u, wall %.2f ms, gpu %.2f ms, k %.4f\n",
+                        "retained %u, wall %.2f ms, gpu %.2f ms, k %.4f, floor %.4f\n",
                         title, choice.rows, choice.laneCap, choice.expected, choice.cost, choice.verified,
-                        choice.retained, choice.wallMilliseconds, choice.gpuMilliseconds, choice.contextCost);
+                        choice.retained, choice.wallMilliseconds, choice.gpuMilliseconds, choice.contextCost,
+                        choice.floor);
           }
         // The cycles in the order they ran, and their mean: a greedy prompt
         // runs the same cycle sequence every time, so two builds compare

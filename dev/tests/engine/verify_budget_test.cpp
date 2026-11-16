@@ -788,18 +788,19 @@ void laneChancesBound() {
 }
 
 // 1.6.2's fit of a lane count's samples, from the samples alone: the decayed
-// sums of their rows and times, and the least-squares line through them, its
-// slope shrunk toward the seed's as much as five cycles spread a row a lane
-// would pull it.
+// sums of their rows, times and tokens, the least-squares line through them,
+// its slope shrunk toward the seed's as much as five cycles spread a row a
+// lane would pull it, and the floor, the slope times their tokens per ms.
 struct LineSamples final {
-  double w = 0.0, r = 0.0, rr = 0.0, t = 0.0, rt = 0.0;
+  double w = 0.0, r = 0.0, rr = 0.0, t = 0.0, rt = 0.0, k = 0.0;
 
-  void add(uint32_t rows, double milliseconds) {
+  void add(uint32_t rows, uint32_t tokens, double milliseconds) {
     w = 0.97 * w + 1.0;
     r = 0.97 * r + rows;
     rr = 0.97 * rr + double(rows) * rows;
     t = 0.97 * t + milliseconds;
     rt = 0.97 * rt + rows * milliseconds;
+    k = 0.97 * k + tokens;
   }
   [[nodiscard]] double mean() const { return t / w; }
   // The line's intercept and slope.
@@ -814,6 +815,7 @@ struct LineSamples final {
         std::max((w * covariance + 5.0 * lanes * lanes * prior) / (w * spread + 5.0 * lanes * lanes), 0.0);
     return {meanTime - slope * meanRows, slope};
   }
+  [[nodiscard]] double floor(uint32_t lanes) const { return std::min(line(lanes).second, t / r) * k / t; }
   // Whether a cost line's fit is this one.
   [[nodiscard]] bool fits(uint32_t lanes, const std::optional<std::pair<double, double>> &fit) const {
     const auto [intercept, slope] = line(lanes);
@@ -822,59 +824,115 @@ struct LineSamples final {
   }
 };
 
+// The classes of Qwen3.8-Flash-Next's steps of up to its store's round of 32
+// rows (ExecutionPlans::decodeRowClasses on an Apple10 GPU): steps of 1, 2,
+// 3, 4 to 8, 9 to 15, 16, 17 to 24 and 25 to 32 rows.
+constexpr uint32_t kStreamedClasses[] = {1, 2, 3, 4, 9, 16, 17, 25};
+
 // 1.6.2's cost line, as a streamed-expert target's cycles fit it: a lane
-// count's decayed sums of its samples' rows and times, the least-squares line
-// through them with its slope shrunk toward the seed's (kPriorCycles cycles
-// spread a row a lane), recomputed here from the samples alone; its cost of a
-// step at least a twentieth of the mean; the seed's shape (1.6.2's table).
-// Constrained cycles keep a line of their own, and a cycle whose rows did not
-// fill its step counts toward the explorations alone.
+// count's decayed sums of the rows its cycles' lanes verified and of their
+// times, the least-squares line through them with its slope shrunk toward
+// the seed's (kPriorCycles cycles spread a row a lane), recomputed here from
+// the samples alone; the seed's shape (1.6.2's table). Its floor is the
+// line's slope times the tokens per ms of the same cycles, their decayed
+// tokens over their decayed times, which follows the latest cycles (the
+// first here retain every row, the later ones their anchors alone); before
+// a sample it is the seed's, the seed's slope times the tokens per cost of
+// a cycle of the anchors alone by the seed; and none where the next cycle
+// is a lane count's every 32nd, which explores. The slope it takes is at
+// most the cycles' time a row, so the floor at most their tokens a row.
+// Constrained cycles keep a line of their own.
 void costLineFitsTheSamples() {
   require(CostLine::seed(1, 8) == 1.0 && CostLine::seed(2, 2) == 0.5 &&
               std::fabs(CostLine::seed(2, 6) - 0.66) < 1e-12 &&
               std::fabs(CostLine::seed(4, 12) - 0.57) < 1e-12,
           "the cost line's seed is not 1.6.2's");
   for (uint32_t lanes = 1; lanes <= CostLine::kLanes; ++lanes) {
-    CostLine costs;
-    require(!costs.line(lanes, false), "a cost line had a fit before a sample");
+    CostLine costs(kStreamedClasses);
+    // The seed's floor: 0.4 / 4.2, 0.5 / 3.5, 0.55 / 3.15 and 0.6 / 2.8 at
+    // one to four lanes.
+    const double seedSlope = (1.0 - CostLine::seed(lanes, lanes)) / (7.0 * lanes);
+    const double seedFloor = seedSlope * lanes / CostLine::seed(lanes, lanes);
+    require(!costs.line(lanes, false) && std::fabs(costs.floor(lanes, false) - seedFloor) <= 1e-12 &&
+                std::fabs(seedFloor - std::array{0.4 / 4.2, 0.5 / 3.5, 0.55 / 3.15, 0.6 / 2.8}[lanes - 1]) <= 1e-12,
+            std::to_string(lanes) + " lanes: before a sample the cost line had a fit, or its floor is not the seed's");
     std::mt19937_64 random(0xc057 + lanes);
     std::uniform_int_distribution<uint32_t> rowsOf(lanes, lanes * CostLine::kBlockRows);
     std::uniform_real_distribution<double> noise(-1.0, 1.0);
     LineSamples samples;
     for (uint32_t cycle = 0; cycle < 90; ++cycle) {
-      const uint32_t rows = rowsOf(random);
+      const uint32_t rows = rowsOf(random), tokens = cycle < 45 ? rows : lanes;
       const double milliseconds = 12.0 + 0.6 * rows + 0.5 * noise(random);
-      costs.observe({lanes, rows, CostLine::kBlockRows}, false, milliseconds);
-      samples.add(rows, milliseconds);
-      const auto fit = costs.line(lanes, false);
-      require(samples.fits(lanes, fit),
+      costs.observe(lanes, false, rows, tokens, milliseconds);
+      samples.add(rows, tokens, milliseconds);
+      require(samples.fits(lanes, costs.line(lanes, false)),
               std::to_string(lanes) + " lanes: the cost line is not 1.6.2's fit of its samples after cycle " +
                   std::to_string(cycle));
-      for (uint32_t rows2 = lanes; rows2 <= lanes * CostLine::kBlockRows; ++rows2)
-        require(costs.cost(lanes, false, rows2) ==
-                    std::max(fit->first + fit->second * rows2, 0.05 * samples.mean()),
-                "a step's cost is not its line's, at least a twentieth of the mean");
+      const double floor = costs.floor(lanes, false);
+      if ((cycle + 1) % CostLine::kExploreCycles == CostLine::kExploreCycles - 1)
+        require(floor == 0.0, std::to_string(lanes) + " lanes: the 32nd cycle of a lane count had a floor");
+      else
+        require(floor > 0.0 && std::fabs(floor - samples.floor(lanes)) <= 1e-9 * samples.floor(lanes),
+                std::to_string(lanes) + " lanes: the floor after cycle " + std::to_string(cycle) +
+                    " is not the line's slope times its latest cycles' tokens per ms");
     }
-    require(!costs.line(lanes, true), "an unconstrained cycle taught the constrained line");
-    // A cycle whose rows did not fill its step teaches no line.
-    const auto before = costs.line(lanes, false);
-    costs.observe({lanes, lanes, CostLine::kBlockRows}, false, std::nullopt);
-    require(costs.line(lanes, false) == before, "a cycle of no sample moved the line");
+    require(!costs.line(lanes, true) && std::fabs(costs.floor(lanes, true) - seedFloor) <= 1e-12,
+            "an unconstrained cycle taught the constrained line");
+    // A cold start: a cycle of every row at twenty times the time of the
+    // cycles of the anchors alone after it, each retaining every row. The
+    // line's slope puts its intercept below nothing, and the floor is the
+    // cycles' tokens a row, 1, which a row the target is certain to accept
+    // passes.
+    CostLine cold(kStreamedClasses);
+    LineSamples start;
+    for (uint32_t cycle = 0; cycle < 6; ++cycle) {
+      const uint32_t rows = cycle ? lanes : lanes * CostLine::kBlockRows;
+      const double milliseconds = cycle ? 20.0 : 400.0;
+      cold.observe(lanes, false, rows, rows, milliseconds);
+      start.add(rows, rows, milliseconds);
+    }
+    require(start.line(lanes).first < 0.0 && start.line(lanes).second * start.k / start.t > 1.0,
+            std::to_string(lanes) + " lanes: the cold start's line does not price a row over the cycles' time a row");
+    require(std::fabs(cold.floor(lanes, false) - 1.0) <= 1e-12,
+            std::to_string(lanes) + " lanes: a slope over the cycles' time a row put the floor at " +
+                std::to_string(cold.floor(lanes, false)) + ", not at their tokens a row");
   }
 }
 
-// A streamed-expert target's step, at the narrow cap within a draft's block a
-// lane: before its line has a sample, by 1.6.2's seed shape (no cost in the
-// choice), which takes certain chances' every row and chances of 0.05 the
-// anchors alone; every 32nd cycle of a lane count, constrained or not apart,
-// a draft's block a lane, no more than each lane holds; else, of the steps
-// the lanes' chances fill, the most expected tokens per cost by its line, the
-// fewest rows among equals, never past a draft's block a lane however cheap
-// its rows. A cycle counts at most twice the larger of its line's price and
-// the mean: a stall moves the line as a cycle of that time does.
+// A streamed-expert target's step and floor. On every 32nd cycle of a lane
+// count, constrained or not apart, the floor is none and the step a draft's
+// block a lane, no more than each lane holds, at the narrow cap, whatever
+// the lanes' chances. Else the floor is its line's, the seed's before a
+// sample, and the step's rows the last of the class that holds the lanes'
+// anchors and their chances at least the floor (a chance at the floor
+// passes, one under it does not), no more of a lane's than a draft's block
+// nor than it holds, or a draft's block of rows in all where they are fewer
+// (one lane's step is a draft's block whatever its chances), and the step no
+// more than a draft's block a lane. The
+// choice weighs no expected tokens and no cost. A cycle counts at most twice
+// the larger of its line's price and the mean: a stall moves the line as a
+// cycle of that time does.
 void costLineChoosesItsSteps() {
   constexpr uint32_t kNarrow = CostLine::kBlockRows;
+  // The last rows of the class of a step of `rows` rows.
+  const auto classEnd = [](uint32_t rows) {
+    const auto next = std::upper_bound(std::begin(kStreamedClasses), std::end(kStreamedClasses), rows);
+    return next == std::end(kStreamedClasses) ? CostLine::kLanes * kNarrow : *next - 1;
+  };
+  // The step of `chances` at `floor`, for lanes holding `holds`.
+  const auto stepOf = [&](const std::vector<std::vector<float>> &chances, const std::vector<uint32_t> &holds,
+                          float floor) {
+    uint32_t passed = 0;
+    for (size_t lane = 0; lane < chances.size(); ++lane) {
+      uint32_t rows = 1;
+      for (const float chance : chances[lane])
+        rows += chance >= floor;
+      passed += std::min({rows, holds[lane], kNarrow});
+    }
+    return std::min(classEnd(std::max(passed, kNarrow)), StepCosts::block(holds).rows);
+  };
   for (uint32_t lanes = 1; lanes <= CostLine::kLanes; ++lanes) {
+    const std::string label = std::to_string(lanes) + " lanes: ";
     std::vector<uint32_t> holds(lanes, StepCosts::kWideCap);
     holds.back() = lanes > 1 ? 3 : StepCosts::kWideCap;
     // Each lane's chances no more than it holds past its anchor.
@@ -885,41 +943,96 @@ void costLineChoosesItsSteps() {
       return made;
     };
     const splash::ops::StepRows block = StepCosts::block(holds);
-    CostLine costs;
-    const StepCosts::Choice sure = costs.choose(spansOf(curves(1.0F)), holds, false);
-    require(sure.step.rows == block.rows && sure.step.laneCap == kNarrow && sure.milliseconds == 0.0,
-            std::to_string(lanes) + " lanes: the seed's shape did not take certain chances' every row");
-    const StepCosts::Choice faint = costs.choose(spansOf(curves(0.05F)), holds, false);
-    require(faint.step.rows == lanes && faint.milliseconds == 0.0,
-            std::to_string(lanes) + " lanes: the seed's shape took " + std::to_string(faint.step.rows) +
-                " rows of chances 0.05, not the anchors alone");
-    // A line whose rows cost next to nothing: certain chances take every
-    // row the narrow cap holds, a draft's block a lane. `samples` keeps what
-    // the line saw, for the stall's bound below.
+    const std::vector<std::vector<float>> none(lanes);
+    CostLine costs(kStreamedClasses);
+    // Before a sample, at the seed's floor: certain chances take a draft's
+    // block a lane, and chances of 0.05 or none a draft's block of rows.
+    const auto seedFloor = static_cast<float>(costs.floor(lanes, false));
+    for (const auto &[chances, rows] :
+         {std::pair{curves(1.0F), block.rows}, std::pair{curves(0.05F), kNarrow}, std::pair{none, kNarrow}}) {
+      const StepCosts::Choice first = costs.choose(spansOf(chances), holds, false);
+      require(first.step.lanes == lanes && first.step.rows == rows && first.step.laneCap == kNarrow &&
+                  first.floor == seedFloor && seedFloor > 0.05F && first.expected == 0.0 && first.milliseconds == 0.0,
+              label + "before a sample the step is " + std::to_string(first.step.rows) + " rows at a floor of " +
+                  std::to_string(first.floor) + ", not the " + std::to_string(rows) + " its seed's floor passes");
+    }
+    // A line whose rows cost next to nothing, over cycles that retain their
+    // anchors alone. `samples` keeps what the line saw.
     LineSamples samples;
     const auto cycleOf = [&](uint32_t rows) {
-      costs.observe({lanes, rows, kNarrow}, false, 20.0);
-      samples.add(rows, 20.0);
+      costs.observe(lanes, false, rows, lanes, 20.0);
+      samples.add(rows, lanes, 20.0);
     };
     for (uint32_t cycle = 0; cycle < 30; ++cycle)
       cycleOf(lanes + cycle % (lanes * (kNarrow - 1) + 1));
+    const float floor = costs.choose(spansOf(none), holds, false).floor;
+    require(floor > 0.0F && floor < 0.05F && std::fabs(floor - samples.floor(lanes)) <= 1e-6 * samples.floor(lanes),
+            label + "the step's floor is not its line's");
+    // A draft's block of rows where no chance reaches the floor. Past it,
+    // among lanes that hold a verify block's rows, a chance at the floor
+    // passes into the next class and one under it does not: a lane's certain
+    // chances that with the anchors make a draft's block of rows, and one
+    // more in another lane.
+    const float under = std::nextafter(floor, 0.0F);
+    require(costs.choose(spansOf(none), holds, false).step.rows == kNarrow &&
+                costs.choose(spansOf(curves(under)), holds, false).step.rows == kNarrow,
+            label + "chances under the floor did not leave the step a draft's block of rows in all");
+    if (lanes > 1) {
+      const std::vector<uint32_t> full(lanes, StepCosts::kWideCap);
+      std::vector<std::vector<float>> edge(lanes);
+      edge.front().assign(kNarrow - lanes, 1.0F);
+      edge.back() = {under};
+      const StepCosts::Choice below = costs.choose(spansOf(edge), full, false);
+      edge.back() = {floor, under};
+      const StepCosts::Choice atFloor = costs.choose(spansOf(edge), full, false);
+      require(below.step.rows == kNarrow && atFloor.step.rows == classEnd(kNarrow + 1) &&
+                  atFloor.step.laneCap == kNarrow && atFloor.floor == floor && atFloor.expected == 0.0 &&
+                  atFloor.milliseconds == 0.0,
+              label + "a chance under the floor and one at it gave " + std::to_string(below.step.rows) + " and " +
+                  std::to_string(atFloor.step.rows) + " rows, not a draft's block and the last of the class past it");
+    }
+    // Certain chances past a verify block's rows: a draft's block a lane, no
+    // more than each lane holds.
     const std::vector<std::vector<float>> wide(lanes, std::vector<float>(StepCosts::kWideCap - 1, 1.0F));
-    const StepCosts::Choice cheap =
-        costs.choose(spansOf(wide), std::vector<uint32_t>(lanes, StepCosts::kWideCap), false);
-    require(cheap.step.rows == lanes * kNarrow && cheap.step.laneCap == kNarrow && cheap.milliseconds > 0.0,
-            std::to_string(lanes) + " lanes: a cheap line took " + std::to_string(cheap.step.rows) +
-                " rows, not a draft's block a lane at the narrow cap");
+    require(costs.choose(spansOf(wide), holds, false).step.rows == block.rows,
+            label + "certain chances did not take a draft's block a lane, no more than each lane holds");
+    // Every step the chances fill, drawn at random among lanes that hold 1
+    // to a verify block's rows.
+    std::mt19937_64 random(0xf100 + lanes);
+    for (uint32_t trial = 0; trial < 300; ++trial) {
+      std::vector<uint32_t> held(lanes);
+      std::vector<std::vector<float>> chances(lanes);
+      for (uint32_t lane = 0; lane < lanes; ++lane) {
+        held[lane] = 1 + random() % StepCosts::kWideCap;
+        chances[lane].resize(random() % held[lane]);
+        for (float &chance : chances[lane]) {
+          const uint64_t kind = random() % 4;
+          chance = kind == 0 ? floor : kind == 1 ? under : kind == 2 ? 1.0F : 0.0F;
+        }
+        std::ranges::sort(chances[lane], std::greater<>());
+      }
+      const StepCosts::Choice got = costs.choose(spansOf(chances), held, false);
+      require(got.step.lanes == lanes && got.step.rows == stepOf(chances, held, floor) &&
+                  got.step.laneCap == kNarrow && got.floor == floor,
+              label + "trial " + std::to_string(trial) + ": the step is " + std::to_string(got.step.rows) +
+                  " rows, not the " + std::to_string(stepOf(chances, held, floor)) +
+                  " that end the class of the rows its floor passes, within a draft's block a lane");
+    }
     // Every 32nd cycle explores: the 31st observed cycle's next step is the
-    // block, whatever the line; the constrained cycles count their own.
+    // block at no floor, whatever the chances; the constrained cycles count
+    // their own.
     cycleOf(lanes);
-    const std::vector<std::vector<float>> none(lanes);
-    require(costs.choose(spansOf(none), holds, false).step.rows == block.rows,
-            std::to_string(lanes) + " lanes: the 32nd cycle did not explore a draft's block a lane");
-    require(costs.choose(spansOf(none), holds, true).step.rows == lanes,
-            "the constrained cycles, of no sample, explored or took rows of no chance");
+    const StepCosts::Choice explored = costs.choose(spansOf(none), holds, false);
+    require(explored.step.rows == block.rows && explored.floor == 0.0F,
+            label + "the 32nd cycle did not explore a draft's block a lane at no floor");
+    for (uint32_t cycle = 0; cycle < 5; ++cycle)
+      costs.observe(lanes, true, lanes + cycle, lanes, 30.0);
+    require(costs.choose(spansOf(none), holds, true).floor > 0.0F &&
+                costs.choose(spansOf(none), holds, false).floor == 0.0F,
+            label + "the constrained cycles explored at the unconstrained cycles' count, or moved it");
     cycleOf(block.rows);
-    require(costs.choose(spansOf(none), holds, false).step.rows == lanes,
-            std::to_string(lanes) + " lanes: a cycle after an exploration explored again or took rows of no chance");
+    require(costs.choose(spansOf(none), holds, false).floor > 0.0F,
+            label + "the cycle after an exploration explored again");
     // A stall counts as a cycle of twice the larger of its line's price and
     // the mean, by 1.6.2's fit of the samples with that cycle among them.
     // Every cycle so far took 20 ms, and the prior's slope leaves the line's
@@ -929,41 +1042,16 @@ void costLineChoosesItsSteps() {
     for (const uint32_t rows : {lanes, lanes * kNarrow}) {
       const double price = intercept + slope * rows;
       require(rows == lanes ? price < samples.mean() : price > samples.mean(),
-              std::to_string(lanes) + " lanes: the line's price at " + std::to_string(rows) +
-                  " rows is not on its side of the mean");
+              label + "the line's price at " + std::to_string(rows) + " rows is not on its side of the mean");
       CostLine stalled = costs;
-      stalled.observe({lanes, rows, kNarrow}, false, 5.0 * samples.mean());
+      stalled.observe(lanes, false, rows, lanes, 5.0 * samples.mean());
       LineSamples bounded = samples;
-      bounded.add(rows, 2.0 * std::max(price, samples.mean()));
+      bounded.add(rows, lanes, 2.0 * std::max(price, samples.mean()));
       require(stalled.line(lanes, false) != costs.line(lanes, false), "a stall of five times the mean did not count");
       require(bounded.fits(lanes, stalled.line(lanes, false)),
               "a stall of five times the mean did not count at twice the larger of its line's price and the mean");
     }
   }
-  // One lane whose rows cost 10 + 2 R ms over chances 0.9, 0.8, ..., 0.3: of
-  // E(T) / cost(T), T from 1 to 8, the best is the brute force's.
-  CostLine line;
-  for (uint32_t cycle = 0; cycle < 60; ++cycle) {
-    const uint32_t rows = 1 + cycle % 8;
-    line.observe({1, rows, kNarrow}, false, 10.0 + 2.0 * rows);
-  }
-  const std::vector<std::vector<float>> falling{{0.9F, 0.8F, 0.7F, 0.6F, 0.5F, 0.4F, 0.3F}};
-  const std::vector<uint32_t> one{StepCosts::kWideCap};
-  double best = 0.0;
-  uint32_t bestRows = 0;
-  for (uint32_t rows = 1; rows <= kNarrow; ++rows) {
-    double expected = 1.0;
-    for (uint32_t at = 0; at + 1 < rows; ++at)
-      expected += falling[0][at];
-    const double perCost = expected / line.cost(1, false, rows);
-    if (perCost > best) {
-      best = perCost;
-      bestRows = rows;
-    }
-  }
-  const StepCosts::Choice got = line.choose(spansOf(falling), one, false);
-  require(got.step.rows == bestRows, "a line chose " + std::to_string(got.step.rows) + " rows where " +
-                                         std::to_string(bestRows) + " give the most tokens per cost");
 }
 
 // The steps no costs choose: under --verify-rows all, a draft's block a lane,
@@ -1016,6 +1104,29 @@ void invalidSteps() {
             "an impossible lane count's line was recalled");
     rejects([&] { static_cast<void>(costs.choose(spansOf(std::vector<std::vector<float>>(lanes)))); },
             "invalid step lane count", "a step of an impossible lane count was chosen");
+  }
+  // A cost line over such classes; a cycle of fewer rows than its lanes or
+  // more than a draft's block a lane, of fewer tokens than its lanes or more
+  // than its rows, or of no time; lanes that hold no rows of their own; and
+  // lane counts outside a batch.
+  for (const std::vector<uint32_t> &classes :
+       {std::vector<uint32_t>{}, std::vector<uint32_t>{3, 9}, std::vector<uint32_t>{1, 9, 3}})
+    rejects([&] { CostLine line(classes); }, "invalid step classes", "impossible classes made a cost line");
+  CostLine line(kStreamedClasses);
+  for (const auto &[rows, tokens, milliseconds] :
+       {std::tuple{1U, 2U, 10.0}, std::tuple{17U, 2U, 10.0}, std::tuple{4U, 1U, 10.0}, std::tuple{4U, 5U, 10.0},
+        std::tuple{4U, 2U, 0.0}, std::tuple{4U, 2U, double(NAN)}})
+    rejects([&] { line.observe(2, false, rows, tokens, milliseconds); }, "invalid cost line cycle",
+            "an impossible cycle was a sample");
+  require(!line.line(2, false), "a refused cycle was a sample");
+  const std::vector<std::vector<float>> two(2);
+  rejects([&] { static_cast<void>(line.choose(spansOf(two), std::vector<uint32_t>{8}, false)); },
+          "a step's lanes hold no rows of their own", "lanes that hold no rows of their own took a step");
+  for (const uint32_t lanes : {0U, 5U}) {
+    rejects([&] { static_cast<void>(line.floor(lanes, false)); }, "invalid cost line lane count",
+            "an impossible lane count had a floor");
+    rejects([&] { line.observe(lanes, false, 4, 4, 10.0); }, "invalid cost line lane count",
+            "an impossible lane count's cycle was a sample");
   }
 }
 

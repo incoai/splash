@@ -111,9 +111,11 @@ void DraftSelector::add(metal::CommandGraph &graph, const DraftSelectorBuffers &
 }
 
 void DraftSelector::addVerifyRows(metal::CommandGraph &graph, const DraftSelectorBuffers &buffers,
-                                  const StepRows &step) {
+                                  const StepRows &step, float floor) {
   requireStepRows(step);
-  const VerifyRowsParams params{step.lanes, step.rows, step.laneCap};
+  if (!(floor >= 0.0F && std::isfinite(floor)))
+    throw std::invalid_argument("invalid verify rows floor");
+  const VerifyRowsParams params{.lanes = step.lanes, .rows = step.rows, .lane_cap = step.laneCap, .floor = floor};
   // It reads each lane's tree and writes the step's rows.
   const uint64_t treeRows = uint64_t{step.lanes} * SPLASH_TARGET_VERIFY_ROWS;
   requireBytes(buffers.treeTokens, treeRows * sizeof(uint32_t), "draft tree token");

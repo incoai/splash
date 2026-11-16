@@ -42,17 +42,24 @@ public:
   // of r rows is its first r bits; until the next command that selects.
   [[nodiscard]] static uint32_t lastRetainedRows(const Runtime &runtime, uint32_t lane);
   // Every later decode step of a runtime takes `rows` rows, at most a verify
-  // block's a lane and at least a row a lane, each of them verified, in place
-  // of its cycles' choice (StepCosts::choose), which such steps do not
-  // teach; none gives the choice back. For measuring steps' costs by their
-  // rows.
-  static void forceStepRows(Runtime &runtime, std::optional<uint32_t> rows);
+  // block's a lane and at least a row a lane, each of them verified but
+  // those past an anchor estimated below `floor` (VerifyRowsParams), in
+  // place of its cycles' choice (StepCosts::choose), which such steps do
+  // not teach; none gives the choice back. For measuring steps' costs by
+  // their rows, and for steps whose lanes take fewer rows than they hold.
+  static void forceStepRows(Runtime &runtime, std::optional<uint32_t> rows, float floor = 0.0F);
+  // Whether a streamed-expert target's later cycles each plan a draft's
+  // block a lane, at their floor, whatever class their floor passes the
+  // lanes' last chances into (CostLine::choose): for measuring what the
+  // larger class's kernels cost a cycle.
+  static void planBlocks(Runtime &runtime, bool enabled);
   // A decode cycle's choice of its step (StepCosts::choose) and what it
   // weighed: its rows and lane cap, the chances its lanes' curves held
   // (VerifyBudget::laneChances), the expected accepted tokens and its cost
-  // (none before its lane count is measured); and once it completed,
-  // the rows its lanes verified (fewer than the step's where its trees held
-  // fewer), the tokens they retained and the cycle's wall and GPU times.
+  // (none before its lane count is measured, nor where a floor sizes the
+  // cycle); and once it completed, the rows its lanes verified (fewer than
+  // the step's where its trees held fewer or its floor left rows out), the
+  // tokens they retained and the cycle's wall and GPU times.
   struct StepChoice final {
     uint32_t lanes = 0;
     uint32_t rows = 0;
@@ -67,6 +74,11 @@ public:
     // The cost of a pass over a thousand tokens of history it weighed
     // (StepCosts::contextCost).
     double contextCost = 0.0;
+    // The floor its lanes took their rows at (StepCosts::Choice), and the
+    // time a streamed-expert target's line took the cycle at
+    // (CostLine::observe; none where no line did).
+    double floor = 0.0;
+    double sampleMilliseconds = 0.0;
   };
   // The choices of the decode cycles the step costs sized since the last
   // take, which it clears.

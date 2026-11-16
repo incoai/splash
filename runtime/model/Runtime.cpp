@@ -548,10 +548,11 @@ struct Runtime::Impl {
   DFlashDraft draftModel;
   // The acceptance model and costs a decode cycle's rows follow
   // (--verify-rows auto): its step's rows, by the costs the start measures
-  // (StepCosts), or a target whose experts stream by its cycles' online cost
-  // line (CostLine), each of which a lane holds it verifies. None under
-  // --verify-rows all: a cycle's step then verifies a draft's block a lane,
-  // no more than each lane holds, so that its outputs repeat.
+  // (StepCosts), each of which a lane holds it verifies, or for a target
+  // whose experts stream those at least the floor of its cycles' online cost
+  // line (CostLine). None under --verify-rows all: a cycle's step then
+  // verifies a draft's block a lane, no more than each lane holds, so that
+  // its outputs repeat.
   std::optional<VerifyBudget> verifyBudget;
   std::optional<StepCosts> stepCosts;
   std::optional<CostLine> costLine;
@@ -684,13 +685,17 @@ struct Runtime::Impl {
   // warmups' and measured steps' (Runtime::warmupDecodeBatch), or those a
   // test forces (RuntimeInstrumentation::forceStepRows). Its rows, at least
   // a row and at most a verify block a lane, at `laneCap` where given, else
-  // at the cap its rows need.
+  // at the cap its rows need, and the floor a test gives it.
   struct ForcedStep final {
     uint32_t rows = 0;
     std::optional<uint32_t> laneCap;
+    float floor = 0.0F;
   };
   std::optional<ForcedStep> forcedStep;
 #ifdef SPLASH_RUNTIME_INSTRUMENTATION
+  // Whether a streamed-expert target's cycles plan a draft's block a lane
+  // (RuntimeInstrumentation::planBlocks).
+  bool blockPlans = false;
   // Whether commands copy the target's logits before their policy
   // (RuntimeInstrumentation::captureTargetLogits), and the copies, one per
   // batch lane of the last command that made them.
@@ -734,7 +739,7 @@ struct Runtime::Impl {
     // --verify-rows auto the start measures them (Runtime::warmupDecodeBatch)
     // unless an earlier start of this model and build on this Mac did; a
     // target whose experts stream measures none, its cycles' cost line
-    // pricing its steps (CostLine).
+    // pricing its rows (CostLine), whose steps end at the classes' last rows.
     std::optional<std::pair<ops::MoeShape, uint32_t>> moe;
     if (geometry.target.ffnKind == QwenFfnKind::SparseMoe)
       moe.emplace(geometry.target.moeBlockShape(), geometry.target.moeRouterFormat);
@@ -744,7 +749,7 @@ struct Runtime::Impl {
     if (value.verifyRows == VerifyRows::Auto) {
       verifyBudget.emplace();
       if (model.expertStore()) {
-        costLine.emplace();
+        costLine.emplace(stepClasses);
       } else {
         stepCosts.emplace(stepClasses, mostStepRows, geometry.target.ffnKind == QwenFfnKind::SparseMoe);
         for (uint32_t lanes = 1; value.recallStepCosts && lanes <= kLaneCount; ++lanes)
@@ -2345,13 +2350,13 @@ struct Runtime::Impl {
   // The cycle's step (`step`): each lane's tree of the draft's proposals and
   // its host chain (`proposals`), no deeper than depths[lane], and the rows
   // of the trees it verifies, the best by the acceptance model's estimates
-  // that the step holds.
+  // that the step holds, none past an anchor estimated below `floor`.
   void encodeDraftBatchGraph(CommandGraph &graph,
                              std::span<Request *const> entries,
                              std::span<const uint64_t> logicalPositions,
                              std::span<const uint32_t> depths,
                              std::span<const LaneProposals> proposals,
-                             const ops::StepRows &step) {
+                             const ops::StepRows &step, float floor) {
     if (entries.empty() || entries.size() > kLaneCount ||
         entries.size() != logicalPositions.size() ||
         entries.size() != depths.size() || entries.size() != proposals.size()) {
@@ -2429,7 +2434,7 @@ struct Runtime::Impl {
         d(DecodeTensor::InputTokens),     d(DecodeTensor::TreeRows),        d(DecodeTensor::LaneLayout),
         d(DecodeTensor::VerifySources)};
     draftModel.addSelection(graph, selection, std::span(trees).first(lanes));
-    ops::DraftSelector::addVerifyRows(graph, selection, step);
+    ops::DraftSelector::addVerifyRows(graph, selection, step, floor);
   }
 
   // A lane's proposals of a cycle beside its draft's: its host chain of at
@@ -2572,20 +2577,26 @@ struct Runtime::Impl {
   // block a lane, no more than each lane holds, so that a cycle's shape and
   // outputs repeat (StepCosts::block); else the step its lane count's
   // measured costs choose (StepCosts::choose), or a streamed-expert target's
-  // cost line, constrained cycles' apart (CostLine::choose).
+  // step and floor by its cost line, constrained cycles' apart
+  // (CostLine::choose).
   StepCosts::Choice chooseStep(std::span<const std::vector<float>> curves, std::span<const uint32_t> holds,
                                std::span<const uint64_t> contexts, bool constrained) const {
     const auto lanes = static_cast<uint32_t>(curves.size());
     if (forcedStep)
-      return {StepCosts::forced(lanes, forcedStep->rows, forcedStep->laneCap)};
+      return {.step = StepCosts::forced(lanes, forcedStep->rows, forcedStep->laneCap), .floor = forcedStep->floor};
     if (!stepCosts && !costLine)
-      return {StepCosts::block(holds)};
+      return {.step = StepCosts::block(holds)};
     std::array<std::span<const float>, kLaneCount> chances{};
     for (uint32_t lane = 0; lane < lanes; ++lane)
       chances[lane] = curves[lane];
-    if (costLine)
-      return costLine->choose(std::span(chances).first(lanes), holds, constrained);
-    return stepCosts->choose(std::span(chances).first(lanes), contexts);
+    if (!costLine)
+      return stepCosts->choose(std::span(chances).first(lanes), contexts);
+    StepCosts::Choice choice = costLine->choose(std::span(chances).first(lanes), holds, constrained);
+#ifdef SPLASH_RUNTIME_INSTRUMENTATION
+    if (blockPlans)
+      choice.step = StepCosts::block(holds);
+#endif
+    return choice;
   }
 
   // A decode step's target forward: the prompt forward over the step's rows
@@ -2855,9 +2866,9 @@ struct Runtime::Impl {
   // took, which the start's forced steps skip, with its lanes'
   // rows and histories, if every lane committed and its lanes' rows filled
   // the step (StepCosts::observeContext). A streamed-expert target's cycle
-  // its line chose, constrained or not, counts toward the line's
-  // explorations once every lane committed, and is a sample of it, at that
-  // time, where its lanes' rows filled the step (CostLine::observe).
+  // its line sized, constrained or not, is a sample of the line once every
+  // lane committed: the rows its lanes verified and the tokens they
+  // retained, at that time (CostLine::observe).
   std::vector<ModelStepResult> finalizeDecode(
       std::span<DecodeLaneResult> lanes, std::span<const ModelBatchItem> items,
       CommandTiming timing, SpilledKvReads &reads, const ops::StepRows &step,
@@ -3030,14 +3041,20 @@ struct Runtime::Impl {
     }
 #endif
     counters.totalDecodeWallSeconds += timing.wallSeconds;
-    uint32_t laid = 0;
-    for (const DecodeLaneResult &lane : lanes.first(items.size()))
+    uint32_t laid = 0, retained = 0;
+    for (const DecodeLaneResult &lane : lanes.first(items.size())) {
       laid += lane.rows.rows;
+      retained += lane.retained;
+    }
     const auto sampled = [&] {
       return std::chrono::duration<double, std::milli>(AwakeClock::now() - *planned - learned).count();
     };
     if (costLine && planned && commits) {
-      costLine->observe(step, constrained, laid == step.rows ? std::optional(sampled()) : std::nullopt);
+      const double sample = sampled();
+      costLine->observe(step.lanes, constrained, laid, retained, sample);
+#ifdef SPLASH_RUNTIME_INSTRUMENTATION
+      stepChoices.back().sampleMilliseconds = sample;
+#endif
     } else if (stepCosts && planned && commits && laid == step.rows) {
       std::array<uint32_t, kLaneCount> laneRows{};
       std::array<uint64_t, kLaneCount> contexts{};
@@ -3828,7 +3845,8 @@ Runtime::decodeAsync(const BatchPlan &plan,
                                   .chances = chances,
                                   .expected = choice.expected,
                                   .cost = choice.milliseconds,
-                                  .contextCost = impl_->stepCosts ? impl_->stepCosts->contextCost() : 0.0});
+                                  .contextCost = impl_->stepCosts ? impl_->stepCosts->contextCost() : 0.0,
+                                  .floor = choice.floor});
   }
 #endif
   for (uint32_t lane = 0; lane < width; ++lane) {
@@ -3865,12 +3883,12 @@ Runtime::decodeAsync(const BatchPlan &plan,
   impl_->draftModel.addMaskRows(commandGraph, impl_->decodeArena->batchSlice(DecodeTensor::DraftHidden0, width),
                                 width);
   impl_->encodeDraftBatchGraph(commandGraph, entries, {logicalPositions.data(), width}, {depths.data(), width},
-                               std::span(proposals).first(width), step);
+                               std::span(proposals).first(width), step, choice.floor);
   std::shared_ptr<SpilledKvReads> reads = impl_->decodeReads(items);
   // The weights it reads on demand and the spilled K/V its reads bring.
   WorkCount count({}, impl_->model.expertStore(), reads);
   if (constrained) {
-    // A constrained cycle a streamed-expert target's line chose gives its
+    // A constrained cycle a streamed-expert target's line sized gives its
     // constrained line a sample (finalizeDecode).
     return std::make_unique<Impl::ConstrainedDecodeTicket>(
         *impl_, std::move(lanes), items, std::move(reads), commandGraph, step, std::move(count),
@@ -3886,7 +3904,7 @@ Runtime::decodeAsync(const BatchPlan &plan,
   Impl *impl = impl_.get();
   // A cycle the costs chose, with no constrained lane, gives the cost of
   // passes over history a sample, and one a streamed-expert target's line
-  // chose its line, constrained or not (finalizeDecode).
+  // sized its line, constrained or not (finalizeDecode).
   const bool samples = !impl_->forcedStep && (impl_->costLine || (impl_->stepCosts && !constrained));
   auto finish = [impl, lanes = std::move(lanes), reads, items = std::move(copiedItems), step,
                  planned = samples ? std::optional(planned) : std::nullopt,
@@ -4526,11 +4544,13 @@ uint32_t RuntimeInstrumentation::lastRetainedRows(const Runtime &runtime, uint32
   return *contents<uint32_t>(runtime.impl_->decodeArena->get(lane, DecodeTensor::RetainedRows), "retained rows");
 }
 
-void RuntimeInstrumentation::forceStepRows(Runtime &runtime, std::optional<uint32_t> rows) {
+void RuntimeInstrumentation::forceStepRows(Runtime &runtime, std::optional<uint32_t> rows, float floor) {
   runtime.impl_->forcedStep.reset();
   if (rows)
-    runtime.impl_->forcedStep = Runtime::Impl::ForcedStep{*rows, std::nullopt};
+    runtime.impl_->forcedStep = Runtime::Impl::ForcedStep{.rows = *rows, .laneCap = std::nullopt, .floor = floor};
 }
+
+void RuntimeInstrumentation::planBlocks(Runtime &runtime, bool enabled) { runtime.impl_->blockPlans = enabled; }
 
 std::vector<RuntimeInstrumentation::StepChoice> RuntimeInstrumentation::takeStepChoices(Runtime &runtime) {
   return std::exchange(runtime.impl_->stepChoices, {});

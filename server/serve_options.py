@@ -833,8 +833,9 @@ SERVE_OPTIONS = (
             "(default: auto, where each cycle takes the step of the most "
             "expected accepted tokens per cost, by the costs the Mac measured "
             "at a start and the cost of a long history and the acceptance "
-            "learned from earlier cycles, on every model, which is faster but "
-            "lets those outputs differ from run to run)",
+            "learned from earlier cycles, or, on a model whose experts "
+            "stream, the rows worth their time by its cycles' cost line, "
+            "which is faster but lets those outputs differ from run to run)",
         ),
         engine=EngineArgument("--verify-rows"),
     ),

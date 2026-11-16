@@ -244,7 +244,7 @@ StepCosts::Choice StepCosts::choose(std::span<const std::span<const float>> chan
     // far as the lanes' chances fill it.
     const Pool block = poolOf(chances, kNarrowCap);
     const uint32_t rows = std::min(lanes - 1 + uint32_t(block.expected.size()), points.back().last);
-    return {{lanes, rows, kNarrowCap}, block.expected[rows - lanes], 0.0};
+    return {.step = {lanes, rows, kNarrowCap}, .expected = block.expected[rows - lanes]};
   }
   const Pool pool = poolOf(chances, kWideCap, contexts);
   // The most rows the lanes' chances fill.
@@ -253,12 +253,14 @@ StepCosts::Choice StepCosts::choose(std::span<const std::span<const float>> chan
   // than a draft's block.
   const auto capOf = [&](uint32_t rows) { return pool.widest[rows - lanes] > kNarrowCap ? kWideCap : kNarrowCap; };
   // Every step the chances fill, at its price and its passes over history.
-  Choice best{{lanes, lanes, kNarrowCap}, double(lanes), price(lanes, lanes, kNarrowCap) + perPass_ * pool.passes[0]};
+  Choice best{.step = {lanes, lanes, kNarrowCap},
+              .expected = double(lanes),
+              .milliseconds = price(lanes, lanes, kNarrowCap) + perPass_ * pool.passes[0]};
   for (uint32_t rows = lanes + 1; rows <= std::min(bound, points.back().last); ++rows) {
     const uint32_t cap = capOf(rows);
     const double milliseconds = price(lanes, rows, cap) + perPass_ * pool.passes[rows - lanes];
     if (pool.expected[rows - lanes] / milliseconds > best.expected / best.milliseconds)
-      best = {{lanes, rows, cap}, pool.expected[rows - lanes], milliseconds};
+      best = {.step = {lanes, rows, cap}, .expected = pool.expected[rows - lanes], .milliseconds = milliseconds};
   }
   return best;
 }
@@ -278,6 +280,11 @@ constexpr std::array<std::array<double, 4>, CostLine::kLanes> kSeed{{
 
 } // namespace
 
+CostLine::CostLine(std::span<const uint32_t> classes) : classes_(classes.begin(), classes.end()) {
+  if (classes_.empty() || classes_.front() != 1 || !std::ranges::is_sorted(classes_))
+    throw std::invalid_argument("invalid step classes");
+}
+
 double CostLine::seed(uint32_t lanes, uint32_t rows) {
   if (!lanes || lanes > kLanes || rows < lanes || rows > lanes * kBlockRows)
     throw std::invalid_argument("invalid cost line rows");
@@ -291,6 +298,11 @@ double CostLine::seed(uint32_t lanes, uint32_t rows) {
   return shape[upper - 1] + t * (shape[upper] - shape[upper - 1]);
 }
 
+double CostLine::seedSlope(uint32_t lanes) {
+  const uint32_t first = lanes, last = lanes * kBlockRows;
+  return (seed(lanes, last) - seed(lanes, first)) / double(last - first);
+}
+
 const CostLine::Cost &CostLine::table(uint32_t lanes, bool constrained) const {
   if (!lanes || lanes > kLanes)
     throw std::invalid_argument("invalid cost line lane count");
@@ -301,14 +313,13 @@ std::optional<std::pair<double, double>> CostLine::line(uint32_t lanes, bool con
   const Cost &cost = table(lanes, constrained);
   if (cost.weight <= 0.0)
     return std::nullopt;
-  const uint32_t first = lanes, last = lanes * kBlockRows;
   const double meanRows = cost.rows / cost.weight, meanTime = cost.time / cost.weight;
   const double spread = std::max(cost.rowsSquared / cost.weight - meanRows * meanRows, 0.0);
   const double covariance = cost.rowsTime / cost.weight - meanRows * meanTime;
   // The seed's slope at the cycles' level, worth kPriorCycles cycles whose
   // rows spread by a row a lane.
-  const double seedSlope = (seed(lanes, last) - seed(lanes, first)) / double(last - first);
-  const double priorSlope = seedSlope * meanTime / seed(lanes, static_cast<uint32_t>(std::lround(meanRows)));
+  const double priorSlope =
+      seedSlope(lanes) * meanTime / seed(lanes, static_cast<uint32_t>(std::lround(meanRows)));
   const double priorSpread = double(lanes) * lanes;
   const double slope = std::max(
       (cost.weight * covariance + kPriorCycles * priorSpread * priorSlope) /
@@ -317,71 +328,70 @@ std::optional<std::pair<double, double>> CostLine::line(uint32_t lanes, bool con
   return std::pair{meanTime - slope * meanRows, slope};
 }
 
-double CostLine::cost(uint32_t lanes, bool constrained, uint32_t rows) const {
+double CostLine::floor(uint32_t lanes, bool constrained) const {
+  const Cost &cost = table(lanes, constrained);
+  if (cycles_[constrained ? 1 : 0][lanes - 1] % kExploreCycles == kExploreCycles - 1)
+    return 0.0;
+  // Before a sample, the seed's slope at the rate of the one cycle whose
+  // tokens need none: the anchors alone, a token a lane at the seed's cost of
+  // a row a lane.
   const auto fit = line(lanes, constrained);
   if (!fit)
-    return 0.0;
-  const Cost &cost = table(lanes, constrained);
-  return std::max(fit->first + fit->second * rows, 0.05 * cost.time / cost.weight);
-}
-
-bool CostLine::explores(uint32_t lanes, bool constrained) const {
-  static_cast<void>(table(lanes, constrained));
-  return cycles_[constrained ? 1 : 0][lanes - 1] % kExploreCycles == kExploreCycles - 1;
+    return seedSlope(lanes) * lanes / seed(lanes, lanes);
+  // A cycle of no rows costs no less than nothing, so a row costs at most the
+  // cycles' time a row. A slope past that (after a stall, or a cold start at
+  // many rows) would put the floor over the cycles' tokens a row, and over 1
+  // where they retained every row, which leaves out a forced chain's rows,
+  // estimated 1, that the target is certain to accept.
+  return std::min(fit->second, cost.time / cost.rows) * cost.tokens / cost.time;
 }
 
 StepCosts::Choice CostLine::choose(std::span<const std::span<const float>> chances, std::span<const uint32_t> holds,
                                    bool constrained) const {
   const auto lanes = static_cast<uint32_t>(chances.size());
-  static_cast<void>(table(lanes, constrained));
+  const auto floor = static_cast<float>(this->floor(lanes, constrained));
   if (holds.size() != chances.size())
     throw std::invalid_argument("a step's lanes hold no rows of their own");
-  const Pool pool = poolOf(chances, kBlockRows);
-  const auto expected = [&](uint32_t rows) {
-    return pool.expected[std::min<size_t>(rows - lanes, pool.expected.size() - 1)];
-  };
-  // Every kExploreCycles-th cycle, a draft's block a lane.
-  if (explores(lanes, constrained)) {
-    const ops::StepRows step = StepCosts::block(holds);
-    return {step, expected(step.rows), cost(lanes, constrained, step.rows)};
+  // Without a floor, a draft's block a lane.
+  StepCosts::Choice choice{.step = StepCosts::block(holds), .floor = floor};
+  if (!(floor > 0.0F))
+    return choice;
+  // The lanes' anchors and their chances the floor passes, no more of a lane
+  // than the block gives it, or a draft's block of rows in all where they
+  // are fewer, and the last rows of the class that holds them.
+  uint32_t passed = 0;
+  for (uint32_t lane = 0; lane < lanes; ++lane) {
+    const auto above = std::ranges::count_if(chances[lane], [&](float chance) { return chance >= floor; });
+    passed += std::min({1 + static_cast<uint32_t>(above), holds[lane], kBlockRows});
   }
-  // Its line's costs, or before its line has a sample, the seed's shape,
-  // whose rows' ratios the choice takes alone (a cost of none in the choice).
-  const bool fitted = line(lanes, constrained).has_value();
-  const auto price = [&](uint32_t rows) { return fitted ? cost(lanes, constrained, rows) : seed(lanes, rows); };
-  StepCosts::Choice best{{lanes, lanes, kBlockRows}, double(lanes), price(lanes)};
-  const uint32_t most = std::min(lanes - 1 + static_cast<uint32_t>(pool.expected.size()), lanes * kBlockRows);
-  for (uint32_t rows = lanes + 1; rows <= most; ++rows)
-    if (expected(rows) / price(rows) > best.expected / best.milliseconds)
-      best = {{lanes, rows, kBlockRows}, expected(rows), price(rows)};
-  if (!fitted)
-    best.milliseconds = 0.0;
-  return best;
+  passed = std::max(passed, kBlockRows);
+  if (const auto next = std::ranges::upper_bound(classes_, passed); next != classes_.end())
+    choice.step.rows = std::min(choice.step.rows, *next - 1);
+  return choice;
 }
 
-void CostLine::observe(const ops::StepRows &step, bool constrained, std::optional<double> milliseconds) {
-  static_cast<void>(table(step.lanes, constrained));
-  if (step.rows < step.lanes || step.rows > step.lanes * kBlockRows)
+void CostLine::observe(uint32_t lanes, bool constrained, uint32_t rows, uint32_t tokens, double milliseconds) {
+  static_cast<void>(table(lanes, constrained));
+  if (rows < lanes || rows > lanes * kBlockRows || tokens < lanes || tokens > rows || !std::isfinite(milliseconds) ||
+      milliseconds <= 0.0)
     throw std::invalid_argument("invalid cost line cycle");
   const size_t policy = constrained ? 1 : 0;
-  ++cycles_[policy][step.lanes - 1];
-  if (!milliseconds || !std::isfinite(*milliseconds) || *milliseconds <= 0.0)
-    return;
-  Cost &cost = tables_[policy][step.lanes - 1];
-  const double rows = step.rows;
+  ++cycles_[policy][lanes - 1];
+  Cost &cost = tables_[policy][lanes - 1];
   // A cycle counts at most twice the larger of its line's price and the
   // mean: the mean keeps the bound up where a stall tilted the line to next
   // to nothing, since a bound at the line alone would hold it there, and a
   // cycle the bound cuts still counts, so that costs that step up and stay
   // up move the line.
-  double counted = *milliseconds;
-  if (const auto fit = line(step.lanes, constrained))
+  double counted = milliseconds;
+  if (const auto fit = line(lanes, constrained))
     counted = std::min(counted, 2.0 * std::max(fit->first + fit->second * rows, cost.time / cost.weight));
   cost.weight = kDecay * cost.weight + 1.0;
   cost.rows = kDecay * cost.rows + rows;
-  cost.rowsSquared = kDecay * cost.rowsSquared + rows * rows;
+  cost.rowsSquared = kDecay * cost.rowsSquared + double(rows) * rows;
   cost.time = kDecay * cost.time + counted;
   cost.rowsTime = kDecay * cost.rowsTime + rows * counted;
+  cost.tokens = kDecay * cost.tokens + tokens;
 }
 
 } // namespace splash::model
