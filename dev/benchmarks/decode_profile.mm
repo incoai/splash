@@ -501,7 +501,7 @@ int main(int argc, char **argv) {
           model::loadModel(backend, root, model::inspectModelRoot(root), loadOptions);
       ops::ExecutionPlans operators(backend.capabilities(), ops::Int8Activations::On);
 
-      // Enough Page32 pages for four lanes of prompt plus generated rows.
+      // Enough Page32 pages for each width's lanes of prompt plus generated rows.
       const uint32_t pagesPerLane =
           (promptTokens + std::max(answer.tokens, kAnswerTokens) + model::ExecutionLimits::targetVerifyRows) /
               kv::kPageTokens +
@@ -511,7 +511,7 @@ int main(int argc, char **argv) {
       const kv::Layout kvLayout = model.targetKvLayout(format);
       const uint32_t extentPages = kvLayout.maximumExtentPages();
       const uint32_t pageCount =
-          (pagesPerLane * 4 + extentPages - 1) / extentPages * extentPages;
+          (pagesPerLane * widths + extentPages - 1) / extentPages * extentPages;
       MemoryGovernor governor(
           backend, backend.capabilities().recommendedMaxWorkingSetBytes, 1, 1,
           queryHostMemory, 0);
