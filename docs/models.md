@@ -367,7 +367,13 @@ lane count whose lanes' state a start cannot hold beside the rest of its
 memory (under `--max-memory`, or where the warmup's allocation fails) is not
 measured: its cycles take a draft's block a lane, `--verify-rows all`'s step,
 as far as the lanes' chances fill it,
-until a start that holds them measures it. A lane holds up to eight rows
+until a start that holds them measures it. A target whose experts stream
+([Streamed experts](server.md#streamed-experts)) measures no table, as its
+steps' costs follow its store's state, which only serving sees: its cycles
+fit 1.6.2's online cost line, a + b R ms for R rows at each lane count
+(`model::CostLine`), and take up to a draft's block a lane, the rows of the
+most expected tokens per cost by it, a draft's block a lane before its
+first sample and every 32nd cycle. A lane holds up to eight rows
 unless the step's rows give one lane more of the lanes' chances, sixteen
 then, at what the 16-row lane cap's GDN kernels and attention tiles add to a
 step of eight rows a lane, which the start also measures. Every target

@@ -4343,9 +4343,10 @@ void requireRowsOfNoLane(model::Runtime &executor, std::span<const uint32_t> see
 // end's (none the draft's), a lane's next step has chances to size it by
 // (its tree grows past its step's rows, and a tree of no draft row leaves its
 // chances as they were), whatever step its measured costs then choose;
-// then constrained lanes, which take the same costs.
+// then constrained lanes, which take the same costs, or where the target's
+// experts stream a cost line of their own (model::CostLine).
 void requireBudgetedCyclesAreWellFormed(model::Runtime &executor, const model::QwenStateStorage &states,
-                                        std::span<const uint32_t> seed) {
+                                        std::span<const uint32_t> seed, bool streamed) {
   constexpr uint32_t kRows = model::ExecutionLimits::targetVerifyRows;
   constexpr uint32_t kCycles = model::VerifyBudget::kRefitCycles + 1;
   const auto warmupsStarted = std::chrono::steady_clock::now();
@@ -4455,10 +4456,24 @@ void requireBudgetedCyclesAreWellFormed(model::Runtime &executor, const model::Q
   decode(lanes, 1);
   const std::vector<model::RuntimeInstrumentation::StepChoice> firstCycle =
       model::RuntimeInstrumentation::takeStepChoices(executor);
-  require(firstCycle.size() == 1 && firstCycle[0].lanes == 4 && firstCycle[0].cost > 0.0,
-          "the first budgeted cycle after the decode warmups weighed no measured cost: the warmups measured no "
-          "step of four lanes");
+  // A target whose experts stream measures no table: its cost line has no
+  // sample before its first cycle, which its seed's shape sizes within a
+  // draft's block a lane at no cost, and prices the cycles after its samples
+  // (model::CostLine).
+  require(firstCycle.size() == 1 && firstCycle[0].lanes == 4 &&
+              (streamed ? firstCycle[0].cost == 0.0 && firstCycle[0].laneCap == model::StepCosts::kNarrowCap &&
+                              firstCycle[0].rows <= 4 * model::StepCosts::kNarrowCap
+                        : firstCycle[0].cost > 0.0),
+          streamed ? "a streamed-expert target's first cycle, before its line's samples, was priced or took more "
+                     "than a draft's block a lane"
+                   : "the first budgeted cycle after the decode warmups weighed no measured cost: the warmups "
+                     "measured no step of four lanes");
   decode(lanes, kCycles - 1);
+  const std::vector<model::RuntimeInstrumentation::StepChoice> later =
+      model::RuntimeInstrumentation::takeStepChoices(executor);
+  require(!streamed || (!later.empty() && later.back().cost > 0.0 &&
+                        later.back().rows <= later.back().lanes * model::StepCosts::kNarrowCap),
+          "a streamed-expert target's cost line priced no cycle, or took more than a draft's block a lane");
   require(lanes[3].tokens.size() == 12, "the budgeted lanes did not reach the cycles the check needs");
   for (const Lane &lane : lanes)
     executor.end(lane.request.id);
@@ -7969,37 +7984,49 @@ int main(int argc, char **argv) {
       require(static_cast<bool>(budgetArenas), "the budgeted runtime's arenas exceed the oracle Metal budget");
     };
     budgeted();
-    requireBudgetedCyclesAreWellFormed(*runtime, states, samplingSeedTokens);
+    const bool streamed = model.expertStore() != nullptr;
+    requireBudgetedCyclesAreWellFormed(*runtime, states, samplingSeedTokens, streamed);
     requireRowsOfNoLane(*runtime, samplingSeedTokens, model.descriptor.capabilities.vocabularySize, bound);
-    require(remembers == model::ExecutionLimits::maximumBatchWidth &&
-                remembered.size() == model::ExecutionLimits::maximumBatchWidth,
+    // A target whose experts stream measures no table: its cycles' cost line
+    // prices its steps (model::CostLine).
+    if (streamed) {
+      require(remembers == 0 && model::RuntimeInstrumentation::stepPoints(*runtime, 1).empty(),
+              "a target whose experts stream measured a step table");
+      std::cout << "streamed_cost_line=PASS\n";
+    }
+    require(streamed || (remembers == model::ExecutionLimits::maximumBatchWidth &&
+                         remembered.size() == model::ExecutionLimits::maximumBatchWidth),
             "the decode warmups did not remember each lane count's measured step costs");
-    const std::unordered_map<uint32_t, std::string> first = remembered;
-    budgeted();
-    const auto recalledStarted = std::chrono::steady_clock::now();
-    for (uint32_t width = 1; width <= model::ExecutionLimits::maximumBatchWidth; ++width)
-      static_cast<void>(runtime->warmupDecodeBatch(width));
-    const double recalledSeconds =
-        std::chrono::duration<double>(std::chrono::steady_clock::now() - recalledStarted).count();
-    require(remembers == model::ExecutionLimits::maximumBatchWidth && remembered == first,
-            "a start that recalled its step costs measured them again");
-    // That start's runtime has served no cycle: its cost of history is none.
-    requireServedCyclesTeachHistoryCost(*runtime, samplingSeedTokens);
-    // A remembered line of a point at no cost, or of points another build's
-    // classes made: a start measures the lane count again and keeps its line.
-    for (const std::string_view stale : {std::string_view("2:8:-1"), std::string_view("8:8:20 16:16:30")}) {
-      remembered[1] = stale;
+    // A start that recalls its table measures nothing (none to recall where
+    // its experts stream).
+    if (!streamed) {
+      const std::unordered_map<uint32_t, std::string> first = remembered;
       budgeted();
+      const auto recalledStarted = std::chrono::steady_clock::now();
       for (uint32_t width = 1; width <= model::ExecutionLimits::maximumBatchWidth; ++width)
         static_cast<void>(runtime->warmupDecodeBatch(width));
-      const std::vector<model::StepCosts::Point> points = model::RuntimeInstrumentation::stepPoints(*runtime, 1);
-      require(remembered[1] != stale && !points.empty() &&
-                  std::ranges::all_of(points, [](const model::StepCosts::Point &p) { return p.milliseconds > 0.0; }),
-              "a start that recalled a line of no step's cost did not measure it again");
+      const double recalledSeconds =
+          std::chrono::duration<double>(std::chrono::steady_clock::now() - recalledStarted).count();
+      require(remembers == model::ExecutionLimits::maximumBatchWidth && remembered == first,
+              "a start that recalled its step costs measured them again");
+      // That start's runtime has served no cycle: its cost of history is none.
+      requireServedCyclesTeachHistoryCost(*runtime, samplingSeedTokens);
+      // A remembered line of a point at no cost, or of points another build's
+      // classes made: a start measures the lane count again and keeps its line.
+      for (const std::string_view stale : {std::string_view("2:8:-1"), std::string_view("8:8:20 16:16:30")}) {
+        remembered[1] = stale;
+        budgeted();
+        for (uint32_t width = 1; width <= model::ExecutionLimits::maximumBatchWidth; ++width)
+          static_cast<void>(runtime->warmupDecodeBatch(width));
+        const std::vector<model::StepCosts::Point> points = model::RuntimeInstrumentation::stepPoints(*runtime, 1);
+        require(remembered[1] != stale && !points.empty() &&
+                    std::ranges::all_of(points, [](const model::StepCosts::Point &p) { return p.milliseconds > 0.0; }),
+                "a start that recalled a line of no step's cost did not measure it again");
+      }
+      require(remembers == model::ExecutionLimits::maximumBatchWidth + 2,
+              "the starts that recalled lines of no step's cost did not remember what they measured");
+      std::cout << "recalled_step_costs=PASS decode_warmups_seconds=" << recalledSeconds << '\n';
     }
-    require(remembers == model::ExecutionLimits::maximumBatchWidth + 2,
-            "the starts that recalled lines of no step's cost did not remember what they measured");
-    std::cout << "recalled_step_costs=PASS decode_warmups_seconds=" << recalledSeconds << '\n';
     std::cout << "model_runtime_oracle_test: PASS\n";
     return 0;
   } catch (const std::exception &error) {

@@ -40,6 +40,7 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 namespace splash::model {
@@ -177,6 +178,78 @@ private:
   double passesTimesExcess_ = 0.0;
   double passesSquared_ = 0.0;
   double perPass_ = 0.0;
+};
+
+// The steps of a target whose experts stream from a store (ExpertStore),
+// which no table measured at the start prices: its points, on the start's
+// lanes over a cold store, read Qwen3.8-Flash-Next's 1-row step at 25.4 ms,
+// below serving's, its 16-row step 41% over serving's, and did not rise with
+// their rows, while what a step costs follows the store's state as serving
+// moves it. Its cycles take 1.6.2's online cost line (rc5's VerifyBudget):
+// a cycle of R rows over L lanes costs a + b R ms, a line a lane count fits
+// to its latest cycles, constrained cycles (a lane under a token mask, whose
+// mask round trips its time holds) apart. A step takes up to a draft's block
+// a lane (1.6.2's rows; Qwen3.8-Flash-Next's best fixed steps all were
+// within it), at the narrow cap: of the steps the lanes' chances fill, the
+// one with the most expected accepted tokens per cost, the fewest rows among
+// equals, by the seed's shape before its line has a sample, as 1.6.2's.
+// Every kExploreCycles-th cycle of a lane count, as 1.6.2's, takes a draft's
+// block a lane (StepCosts::block). The cost of passes over history
+// (StepCosts' k) does not apply: the line's intercept holds the lanes'
+// history as it moves.
+class CostLine final {
+public:
+  static constexpr uint32_t kLanes = SPLASH_MAXIMUM_BATCH_WIDTH;
+  static constexpr uint32_t kBlockRows = StepCosts::kNarrowCap;
+  // Every kExploreCycles-th cycle of a lane count verifies every row, which
+  // keeps the rows of the cost fit spread.
+  static constexpr uint32_t kExploreCycles = 32;
+  // Each cycle weighs kDecay times the next (about the last 33 cycles), as
+  // what a row costs follows the requests served.
+  static constexpr double kDecay = 0.97;
+  // The slope shrinks toward the seed's as much as kPriorCycles spread
+  // cycles would pull it.
+  static constexpr double kPriorCycles = 5.0;
+
+  // The shape of a cycle's cost by its rows (a cycle of every row costs 1),
+  // whose slope the line's shrinks toward.
+  [[nodiscard]] static double seed(uint32_t lanes, uint32_t rows);
+  // The line of a lane count's cycles, constrained or not: its intercept and
+  // slope, none before a sample.
+  [[nodiscard]] std::optional<std::pair<double, double>> line(uint32_t lanes, bool constrained) const;
+  // A cycle's cost of `rows` rows by its line, nondecreasing and positive: a
+  // negative intercept leaves the fewest rows a twentieth of the mean.
+  [[nodiscard]] double cost(uint32_t lanes, bool constrained, uint32_t rows) const;
+  // Whether the next cycle of `lanes` lanes, constrained or not, verifies
+  // every row.
+  [[nodiscard]] bool explores(uint32_t lanes, bool constrained) const;
+  // The step of a cycle of `chances.size()` lanes, each lane's chances best
+  // first, each holding `holds` rows (its anchor and the rows past it it may
+  // verify), constrained or not, at its expected accepted tokens and its
+  // cost (none before its line has a sample, when the seed's shape chooses).
+  [[nodiscard]] StepCosts::Choice choose(std::span<const std::span<const float>> chances,
+                                         std::span<const uint32_t> holds, bool constrained) const;
+  // A cycle of `step`, constrained or not, that committed: it counts toward
+  // its lane count's explorations, and, with `milliseconds` (its time from
+  // its plan to its results, less its learning, where its lanes' rows filled
+  // the step), it is a sample of its line, at most twice the larger of its
+  // line's price and the mean (a stall's bound).
+  void observe(const ops::StepRows &step, bool constrained, std::optional<double> milliseconds);
+
+private:
+  // The weighted sums of the latest cycles' rows R and times t.
+  struct Cost final {
+    double weight = 0.0;
+    double rows = 0.0;
+    double rowsSquared = 0.0;
+    double time = 0.0;
+    double rowsTime = 0.0;
+  };
+
+  [[nodiscard]] const Cost &table(uint32_t lanes, bool constrained) const;
+
+  std::array<std::array<Cost, kLanes>, 2> tables_{};
+  std::array<std::array<uint64_t, kLanes>, 2> cycles_{};
 };
 
 } // namespace splash::model

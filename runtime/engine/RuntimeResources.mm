@@ -421,13 +421,15 @@ void reportStreamedStores(const model::LoadedModel &loaded, const model::Streama
   }
 }
 
-// The rows the target's decode cycles verify (--verify-rows), and why.
-void reportVerifyRows(model::VerifyRows rows) {
+// The rows the target's decode cycles verify (--verify-rows), and why: by
+// its cycles' cost line where its experts stream (model::CostLine).
+void reportVerifyRows(model::VerifyRows rows, bool streamed) {
   if (rows == model::VerifyRows::All)
     logLine("Decode cycles verify every row of the draft's block (--verify-rows all).");
   else
-    logLine("Decode cycles verify the rows of the step their measured costs choose (--verify-rows auto): greedy "
-            "and seeded outputs can differ from run to run.");
+    logLine("Decode cycles verify the rows of the step ",
+            streamed ? "their cost line chooses" : "their measured costs choose",
+            " (--verify-rows auto): greedy and seeded outputs can differ from run to run.");
 }
 
 // Why a target's long requests keep their KV in memory, empty when they
@@ -1035,7 +1037,7 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
   };
 
   ready();
-  reportVerifyRows(config.verifyRows);
+  reportVerifyRows(config.verifyRows, loaded.expertStore() != nullptr);
 
   // The automatic tier keeps its staging only where the plan holds the model
   // and the requested context beside it, the parts as they load, or where

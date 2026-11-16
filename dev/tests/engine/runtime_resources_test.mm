@@ -393,11 +393,12 @@ void testAutomaticExpertMemory(RuntimeResourcesConfig config) {
   }
 }
 
-// --verify-rows: by default every target's decode cycles verify the rows of
-// the step their measured costs choose, a MoE target's whether its routed
-// experts load with their layers or stream from the SSD; `all` verifies every
-// row of a draft's block. The start says which in one line a mode, and the
-// runtime built on what it assembled runs it.
+// --verify-rows: by default a target's decode cycles verify the rows of the
+// step their measured costs choose, a MoE target's whose routed experts load
+// with their layers too, and those of a target whose experts stream from the
+// SSD the step their cost line chooses (model::CostLine); `all` verifies
+// every row of a draft's block. The start says which in one line a mode, and
+// the runtime built on what it assembled runs it.
 void testVerifyRows(const char *metallibPath, RuntimeResourcesConfig moe) {
   struct Started final {
     std::string log;
@@ -428,7 +429,10 @@ void testVerifyRows(const char *metallibPath, RuntimeResourcesConfig moe) {
   // A budget a byte short of the whole model's minimum, below the one that
   // holds every expert and the KV allowance, streams them.
   moe.maximumMemoryBytes = startStreamed(moe).minimumRequired - 1;
-  requireStart(moe, budgeted, true, "a MoE target whose experts stream did not budget its rows");
+  requireStart(moe,
+               "Decode cycles verify the rows of the step their cost line chooses (--verify-rows auto): greedy "
+               "and seeded outputs can differ from run to run.",
+               true, "a MoE target whose experts stream did not follow its cost line");
   moe.verifyRows = model::VerifyRows::All;
   requireStart(moe, "Decode cycles verify every row of the draft's block (--verify-rows all).", false,
                "--verify-rows all did not verify every row of a MoE target");
