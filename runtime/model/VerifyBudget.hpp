@@ -7,10 +7,11 @@
 // A draft row's own chance, that the target selects its token where it
 // accepted the row's parent, is logit(p) = slope * logit(q) +
 // intercepts[position] for its draft probability q at its proposal position,
-// at most its cap, what its parent's earlier draws left of 1, and a row's
-// chance its own times its parent's (DraftTreeParams): greedy lanes fit
-// theirs to the last kLabels labels of their trees' rows, sampled lanes,
-// whose drawn children their verify rows' rejection sampling accepts, apart.
+// at most its cap, what its parent's host chain child and earlier draws left
+// of 1, and a row's chance its own times its parent's (DraftTreeParams):
+// greedy lanes fit theirs to the last kLabels labels of their trees' rows,
+// sampled lanes, whose drawn children their verify rows' rejection sampling
+// accepts, apart.
 #include "metal/abi/ExecutionGeometry.h"
 #include "ops/LaneRows.hpp"
 

@@ -395,12 +395,16 @@ keys only the schema names). A step to a candidate of probability q (the softmax
 temperature 1 of its position's candidates' scores after its parent's) is
 estimated by an online model, logit(p) = slope * logit(q) +
 intercept[position], the probability that the target accepts it once it
-accepted its parent, at most what the candidates its parent drew before it
-left of 1 (its cap), since the target selects one token after the parent: the
-estimates of the children a row drew sum to at most its own (a host chain's
-child beside them is estimated by its own rate). There is one model for
-greedy lanes and one for sampled lanes, whose drawn children their verify
-rows' rejection sampling accepts. The engine refits each every 64
+accepted its parent, at most what the parent's host chain child (at its
+chain's rate) and the candidates the parent drew before it left of 1 (its
+cap), since the target selects one token after the parent: the estimates of a
+row's children sum to at most its own. Before the chain's child counted, on
+Qwen3.6-35B-A3B's 31K-token code prompts, a chain's first rows of rate 0.9 or
+more were retained 0.95-0.99 of the time and the draft rows beside them
+estimated 0.19-0.20 and retained 0.02-0.09, the anchor's children summing to
+1.14-1.16. There is one model for greedy lanes and one for sampled lanes,
+whose drawn children their verify rows' rejection sampling accepts. The
+engine refits each every 64
 cycles on its last 4096 labels: each row of a lane's tree whose parent the
 cycle's walk accepted, labeled with whether the target selected the row's
 token there and carrying the row's cap (a label its cap bounds tells the fit

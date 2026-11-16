@@ -11,16 +11,19 @@
 // brute-force reference's, row for row: every path that takes one of a
 // row's `children` likeliest candidates a step and every prefix of the lane's
 // host chain, scored by the product of its steps' estimates (a draft step's
-// by its lane's own calibration; a sampled lane's row takes its candidates of
-// the largest log q_T + G, G the Gumbel of the row's key), ranked, one row for each token path, as
-// many as a verify block holds and its depth plus one (the tokens a walk of
-// it may retain), and none deeper than its depth: its tokens,
-// parents, depths, ancestors, draft probabilities (a host chain's row takes
-// that of a draft step that joins it, none otherwise)
-// and estimates. A tree of one child a row and no chain is the chain the
-// selector walked before it built trees, token for token, from the same
-// scores. A host chain whose tokens the target selects whatever its logits,
-// with no draft children, takes the first rows. draft_verify_rows
+// by its lane's own calibration, at most what its parent's chain child and
+// earlier draws left of 1; a sampled lane's row takes its candidates of the
+// largest log q_T + G, G the Gumbel of the row's key), ranked, one row for
+// each token path, as many as a verify block holds and its depth plus one
+// (the tokens a walk of it may retain), and none deeper than its depth: its
+// tokens, parents, depths, ancestors, draft probabilities (a host chain's row
+// takes that of a draft step that joins it, none otherwise), estimates and
+// caps, a row's children within its estimate. A tree of one child a row and
+// no chain is the chain the selector walked before it built trees, token for
+// token, from the same scores. A host chain whose tokens the target selects
+// whatever its logits, with no draft children, takes the first rows, and a
+// chain's child leaves its drawn siblings what its rate leaves of 1.
+// draft_verify_rows
 // must lay out the rows of every lane whose expected tokens are the best of
 // every assignment the step's rows and the lanes' cap allow, each lane
 // exactly the rows it took, packed in lane order, and the step's rows past
@@ -353,8 +356,8 @@ struct Node final {
   // for a row the selector did not expand.
   std::vector<uint32_t> draws;
   std::vector<double> next;
-  // The cap of the draft step to it: what its parent's earlier draws left of
-  // 1; 1 for a row of no draft probability.
+  // The cap of the draft step to it: what its parent's host chain child and
+  // earlier draws left of 1; 1 for a row of no draft probability.
   double cap = 1.0;
 };
 
@@ -398,20 +401,28 @@ std::optional<std::vector<Node>> referenceTree(const Lattice &l, const DraftTree
         auto &[draws, next] = expansions[path];
         for (uint32_t i = 0; i < kCandidates; ++i)
           next.push_back(draftProbability(q, lane, i));
-        // A child's own estimate is at most what the children drawn before
-        // it left of 1, and the child is estimated at most as the one drawn
-        // before it.
-        double bound = score, left = 1.0;
+        // A child's own estimate is at most what the row's host chain child
+        // and the children drawn before it left of 1, and the child is
+        // estimated at most as the one drawn before it. A row on the chain's
+        // path has the chain's next token for a child, whose rate counts
+        // first; a drawn child of that token is it, capped by what the others
+        // left, and takes the more of its own estimate and the rate.
+        const bool chained = position < lane.chain && std::equal(path.begin(), path.end(), chain.tokens.begin());
+        const double rate = chained ? chain.rates[position][agreement(l, chain.tokens[position], position)] : 0.0;
+        double bound = score, left = 1.0 - rate, reserved = rate;
         for (const uint32_t index : taken) {
           if (!(q[index] > 0.0))
             break;
           draws.push_back(index);
           const uint32_t token = l.ids[position][index];
+          const bool joinsChain = chained && token == chain.tokens[position];
+          const double cap = joinsChain ? left + reserved : left;
           path.push_back(token);
-          const double own = std::min(estimate(lane.calibration, draftProbability(q, lane, index), position), left);
+          const double own = std::min(estimate(lane.calibration, draftProbability(q, lane, index), position), cap);
           bound = std::min(bound, score * own);
-          entries.push_back({path, bound, false, left});
-          left -= own;
+          entries.push_back({path, bound, false, cap});
+          left = joinsChain ? cap - std::max(own, reserved) : left - own;
+          reserved = joinsChain ? 0.0 : reserved;
           if (position + 1 < lane.depth && position + 1 < kPositions)
             expand(path, treeKey(key, token), position + 1, index, bound);
           path.pop_back();
@@ -438,14 +449,16 @@ std::optional<std::vector<Node>> referenceTree(const Lattice &l, const DraftTree
   std::map<std::vector<uint32_t>, uint32_t> made{{{}, 0}};
   for (size_t index = 0; index < entries.size() && rows.size() < std::min(kBlock, lane.depth + 1); ++index) {
     const Entry &entry = entries[index];
-    // Float sums decide between paths within this of each other, but for a
-    // row's children of one estimate, the bound of the one drawn before,
-    // which the order drawn ranks.
+    // Float sums decide between paths within this of each other, and the
+    // selector's heap orders paths of one estimate (0 among them, as a chain
+    // child's siblings may be) as it pushed them, but for a row's children
+    // of one estimate, the bound of the one drawn before, which the order
+    // drawn ranks.
     if (index + 1 < entries.size()) {
       const Entry &after = entries[index + 1];
       const bool siblings = after.path.size() == entry.path.size() &&
                             std::equal(entry.path.begin(), entry.path.end() - 1, after.path.begin());
-      if (after.path != entry.path && after.score > entry.score * (1.0 - 1e-4) &&
+      if (after.path != entry.path && after.score >= entry.score * (1.0 - 1e-4) &&
           !(siblings && after.score == entry.score))
         return std::nullopt;
     }
@@ -492,8 +505,25 @@ std::optional<std::vector<Node>> referenceTree(const Lattice &l, const DraftTree
   return rows;
 }
 
+// The target selects one token after a row, so that the estimates of a
+// lane's rows' children, its host chain's and its draft's, sum to at most
+// their parent's.
+void requireChildrenWithinParents(const Fixture &f, uint32_t lane, const std::string &label) {
+  const uint32_t first = lane * kBlock, rows = f.rowCount(lane);
+  std::vector<double> children(rows, 0.0);
+  for (uint32_t row = 1; row < rows; ++row)
+    children[f.tree()[first + row].parent] += f.scores()[2 * (first + row) + 1];
+  for (uint32_t row = 0; row < rows; ++row) {
+    const double own = f.scores()[2 * (first + row) + 1];
+    require(children[row] <= own * (1.0 + 1e-5),
+            label + ": row " + std::to_string(row) + "'s children are estimated " + std::to_string(children[row]) +
+                " together, past its " + std::to_string(own));
+  }
+}
+
 // A lane's tree from the selector as `rows`, in its order: tokens, parents,
-// depths, ancestors, draft probabilities and estimates, and its size.
+// depths, ancestors, draft probabilities and estimates, and its size; its
+// rows' children within their parents.
 void requireTree(const Fixture &f, uint32_t lane, uint32_t anchor, const std::vector<Node> &rows,
                  const std::string &label) {
   const uint32_t first = lane * kBlock;
@@ -529,6 +559,7 @@ void requireTree(const Fixture &f, uint32_t lane, uint32_t anchor, const std::ve
               label + ": row " + std::to_string(row) + "'s next probability " + std::to_string(i) + " differs");
     }
   }
+  requireChildrenWithinParents(f, lane, label);
 }
 
 // The selector's top-16 candidates and their edge table over production-like
@@ -939,6 +970,66 @@ void siblingsShareTheirParent(MetalBackend &backend) {
   }
 }
 
+// A row's host chain child counts against the caps of the children its draft
+// drew: of an anchor whose candidates a calibration estimates alike (slope
+// 0) at 0.3, beside a one-token chain at rate 0.97, lane 0's the draft's
+// likeliest token and lane 1's a token none of its candidates hold, the
+// first draft row beside the chain's row is capped at and estimated what the
+// chain left of 1, 0.03, and the draft's others at 0, so that the anchor's
+// children sum to at most its 1; lane 0's likeliest step, which joins the
+// chain's row, is that child, capped at 1. A step deeper the draft estimates
+// its rows at 0.01, so that a tree of its depth's rows and one, 4, holds the
+// chain's row and the first draft row beside it.
+void chainCountsAgainstItsSiblings(MetalBackend &backend) {
+  constexpr uint32_t vocabulary = 1003;
+  constexpr float kRate = 0.97F;
+  Random random(0x63686169);
+  const std::array patterns{Pattern::Uniform};
+  const Fixture f = makeFixture(backend, vocabulary, 2, random, patterns, 0.1F);
+  const DraftSelector selector(vocabulary);
+  DraftCalibration flat;
+  flat.slope = 0.0F;
+  flat.intercepts.fill(std::log(0.01F / 0.99F));
+  flat.intercepts[0] = std::log(0.3F / 0.7F);
+  const std::array trees{DraftTreeLane{7, 3, 1, kChildren, flat}, DraftTreeLane{9, 3, 1, kChildren, flat}};
+  run(backend, selector, f, trees);
+  std::array<uint32_t, 2> chain{};
+  std::array<uint32_t, 2> beside{};
+  for (uint32_t lane = 0; lane < 2; ++lane) {
+    const Lattice l = latticeOf(f, lane);
+    const auto &ranked = l.ranked[0][0];
+    if (lane == 0) {
+      chain[lane] = l.ids[0][ranked[0]];
+      beside[lane] = l.ids[0][ranked[1]];
+    } else {
+      while (std::ranges::find(l.ids[0], chain[lane]) != l.ids[0].end())
+        ++chain[lane];
+      beside[lane] = l.ids[0][ranked[0]];
+    }
+    *f.chainTokens(lane) = chain[lane];
+    std::fill_n(f.chainRates(lane), kAgreements, kRate);
+  }
+  run(backend, selector, f, trees);
+  const double left = 1.0 - double(kRate);
+  for (uint32_t lane = 0; lane < 2; ++lane) {
+    const std::string label = "chain beside drawn siblings, lane " + std::to_string(lane);
+    const uint32_t first = lane * kBlock;
+    const auto estimate = [&](uint32_t row) { return double(f.scores()[2 * (first + row) + 1]); };
+    require(f.rowCount(lane) == 4, label + ": the tree holds " + std::to_string(f.rowCount(lane)) + " rows, not 4");
+    require(f.tokens()[first + 1] == chain[lane] && std::fabs(estimate(1) - kRate) <= 1e-6 &&
+                f.caps()[first + 1] == 1.0F,
+            label + ": the chain's row is not row 1 at its rate, capped at 1");
+    require(lane == 0 ? f.scores()[2 * (first + 1)] >= 0.0F : f.scores()[2 * (first + 1)] == -1.0F,
+            label + ": the chain's row is joined by the draft's likeliest step only where it is that token");
+    require(f.tokens()[first + 2] == beside[lane] && f.tree()[first + 2].parent == 0 &&
+                std::fabs(estimate(2) - left) <= 1e-6 && std::fabs(f.caps()[first + 2] - left) <= 1e-6,
+            label + ": the draft row beside the chain is estimated " + std::to_string(estimate(2)) + " of cap " +
+                std::to_string(f.caps()[first + 2]) + ", not what the chain left, " + std::to_string(left));
+    require(f.tree()[first + 3].parent != 0, label + ": a third child of the anchor outranked the draft's next step");
+    requireChildrenWithinParents(f, lane, label);
+  }
+}
+
 // A lane's rows as a tree in the selector's order and their scores, drawn at
 // random: each row's parent an earlier row, its estimate at most its parent's.
 struct DrawnTree final {
@@ -1295,6 +1386,7 @@ int main(int argc, char **argv) {
     forcedChain(backend);
     chainRowsTheDraftJoins(backend);
     siblingsShareTheirParent(backend);
+    chainCountsAgainstItsSiblings(backend);
     verifyRowsLayout(backend);
     verifyRowsAcrossLanes(backend);
     std::cout << "draft_selector_metal_test: PASS\n";

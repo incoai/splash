@@ -2502,11 +2502,11 @@ struct Runtime::Impl {
   // lookup chain's one joined: the estimates of the rows draft steps made or
   // joined past its anchor, best first, those on its lookup chain's path
   // apart, which the next cycle's chain estimates anew where it proposes
-  // one. The children a row's draft step drew have estimates that sum to at
-  // most its own (DraftTreeParams); a host chain's child beside them is
-  // estimated by the chain. A tree of no such child (a host chain's that
-  // outranked each of the draft's), and a forced chain's, which grows none,
-  // leave the chances as they were.
+  // one. A row's children have estimates that sum to at most its own, a host
+  // chain's child at its rate beside those its draft drew (DraftTreeParams).
+  // A tree of no such child (a host chain's that outranked each of the
+  // draft's), and a forced chain's, which grows none, leave the chances as
+  // they were.
   void keepChances(Request &entry, uint32_t lane, bool forced) const {
     if (forced)
       return;
