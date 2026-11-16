@@ -2436,6 +2436,19 @@ cached state the window alone, and `state.idle_gdn_cells` and
 
 ### Prefill and decode scheduling
 
+A decode cycle is one command in two parts
+(`MetalBackend::submitCommandPartsAsync`): the draft's part goes to the GPU as
+soon as it is encoded, and the target's forward and the verify's commit are
+built, validated and encoded behind it while the GPU runs the draft, which
+takes longer than that host work (2.35 ms of GPU against 0.29 ms on
+Qwen3.6-35B-A3B at one lane, M5 Max; built whole, the cycle took 0.28 ms
+longer, 1.7%). It is one command to the backend's gate and watchdog, and its
+ticket's GPU time runs from the draft's start. The runtime writes every input
+the CPU makes before the draft's part goes: the second part's builder runs
+while the GPU may read, so it writes no buffer (`Runtime::decodeAsync`). A
+second part that cannot be built leaves the command its first part, and the
+backend as healthy as a refused command leaves it.
+
 Greedy, sampled and constrained requests share decode batches; each lane keeps
 its own sampling policy and RNG, and a greedy lane takes the argmax path in any
 batch. A batch with a constrained lane runs its cycle as three commands around

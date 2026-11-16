@@ -4314,9 +4314,12 @@ void requireBranchedPathsMatchChains(model::Runtime &executor, const model::Mode
 // (a cosine of 1 within 1e-6: the same rows, routed alike); alone, within
 // `aloneBound` (cosine), which takes the rounding of a step of other rows:
 // of its projections' tiles, and of a MoE target's expert tiles, which a
-// lane alone fills with its rows alone.
-void requireMixedStepMatchesLanesAlone(model::Runtime &executor, std::span<const uint32_t> seed, uint32_t vocabulary,
-                                       double aloneBound) {
+// lane alone fills with its rows alone. The step is one command in two
+// parts, its draft's and its target's (Runtime::decodeAsync), which gives
+// every row the bits the command built whole and then submitted gives, in
+// one command buffer more.
+void requireMixedStepMatchesLanesAlone(model::Runtime &executor, metal::MetalBackend &backend,
+                                       std::span<const uint32_t> seed, uint32_t vocabulary, double aloneBound) {
   constexpr std::array<uint32_t, 4> kRows{16, 5, 9, 12}, kFirstForced{0, 3, 5, 1};
   constexpr uint32_t kStepRows = 16 + 5 + 9 + 12;
   // The thinking end's words, before the token that closes thinking.
@@ -4340,7 +4343,9 @@ void requireMixedStepMatchesLanesAlone(model::Runtime &executor, std::span<const
     lane.pages = pageRange(100 + 4 * index, 4);
   }
   // `order`'s lanes in one step of `rows` rows, each request an id of its
-  // own from `firstId`: their raw logits by lane, each its rows' in order.
+  // own from `firstId`: their raw logits by lane, each its rows' in order,
+  // and the command buffers the step's command took.
+  uint64_t commandBuffers = 0;
   const auto decode = [&](std::span<const uint32_t> order, uint64_t firstId, uint32_t rows) {
     BatchPlan plan{.kind = WorkKind::Decode, .decodeStage = DecodeStage::Regular};
     std::vector<ModelBatchItem> items;
@@ -4356,6 +4361,7 @@ void requireMixedStepMatchesLanesAlone(model::Runtime &executor, std::span<const
     model::RuntimeInstrumentation::captureTargetLogits(executor, true);
     static_cast<void>(model::RuntimeInstrumentation::takeTargetLogits(executor));
     const std::vector<ModelStepResult> results = executor.decode(plan, items);
+    commandBuffers = BackendInstrumentation::lastCommandBuffers(backend);
     model::RuntimeInstrumentation::captureTargetLogits(executor, false);
     model::RuntimeInstrumentation::forceStepRows(executor, std::nullopt);
     require(results.size() == order.size(), "mixed step: a step lost a lane");
@@ -4393,6 +4399,14 @@ void requireMixedStepMatchesLanesAlone(model::Runtime &executor, std::span<const
   };
   constexpr std::array<uint32_t, 4> kInOrder{0, 1, 2, 3}, kReversed{3, 2, 1, 0};
   const std::vector<std::vector<float>> mixed = decode(kInOrder, 1100, kStepRows);
+  const uint64_t partsBuffers = commandBuffers;
+  BackendInstrumentation::submitPartsWhole(backend, true);
+  const std::vector<std::vector<float>> whole = decode(kInOrder, 1130, kStepRows);
+  BackendInstrumentation::submitPartsWhole(backend, false);
+  require(whole == mixed && partsBuffers == commandBuffers + 1,
+          "mixed step: the step in two parts, of " + std::to_string(partsBuffers) +
+              " command buffers, does not give the bits of its command submitted whole, of " +
+              std::to_string(commandBuffers));
   const std::vector<std::vector<float>> reversed = decode(kReversed, 1110, kStepRows);
   double reversedLeast = 1.0, aloneLeast = 1.0;
   std::string byLane;
@@ -4403,8 +4417,8 @@ void requireMixedStepMatchesLanesAlone(model::Runtime &executor, std::span<const
     aloneLeast = std::min(aloneLeast, least);
     byLane += (index ? "," : "") + std::to_string(least);
   }
-  std::cout << "mixed_step rows=16,5,9,12 reversed_least_cosine=" << reversedLeast << " alone_least_cosine=" << byLane
-            << '\n';
+  std::cout << "mixed_step rows=16,5,9,12 command_buffers=" << partsBuffers << " reversed_least_cosine="
+            << reversedLeast << " alone_least_cosine=" << byLane << '\n';
   require(reversedLeast > 1.0 - 1e-6,
           "mixed step: a lane's logits are at cosine " + std::to_string(reversedLeast) +
               " of its in the step of its lanes reversed");
@@ -6393,8 +6407,8 @@ int main(int argc, char **argv) {
     // A lane alone in a MoE target's step routes its rows to expert tiles of
     // its own rows, which sum in another order: Qwen3.8-Flash-Next's lanes
     // alone keep a cosine of 0.988 to their rows in the step of 42 rows.
-    requireMixedStepMatchesLanesAlone(executor, samplingSeedTokens, model.descriptor.capabilities.vocabularySize,
-                                      sparseMoe ? 0.98 : bound);
+    requireMixedStepMatchesLanesAlone(executor, backend, samplingSeedTokens,
+                                      model.descriptor.capabilities.vocabularySize, sparseMoe ? 0.98 : bound);
     requireRowsOfNoLane(executor, samplingSeedTokens, model.descriptor.capabilities.vocabularySize, bound);
 
     // A reusable composite state contains no final hidden. A fresh

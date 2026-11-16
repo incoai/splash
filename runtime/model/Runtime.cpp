@@ -3894,18 +3894,17 @@ Runtime::decodeAsync(const BatchPlan &plan,
   }
 
   const std::span<Impl::Request *const> entries(requests.data(), width);
-  CommandGraph commandGraph;
+  CommandGraph draft;
   // The draft's RoPE rows alone: the target's follow the layout the cycle's
   // selector writes (encodeBatchVerifyInput).
-  impl_->addRopeTables(commandGraph, {}, 0, impl_->decodeArena->batchSlice(DecodeTensor::DraftPositions, width),
+  impl_->addRopeTables(draft, {}, 0, impl_->decodeArena->batchSlice(DecodeTensor::DraftPositions, width),
                        width * kDecodeRows, {}, {}, impl_->decodeArena->batchSlice(DecodeTensor::DraftRopeCos, width),
                        impl_->decodeArena->batchSlice(DecodeTensor::DraftRopeSin, width));
-  impl_->encodeBatchEmbedding(commandGraph, DecodeTensor::DraftInputTokens,
+  impl_->encodeBatchEmbedding(draft, DecodeTensor::DraftInputTokens,
                               impl_->decodeArena->batchSlice(DecodeTensor::DraftHidden0, width), width,
                               width * kDraftRows);
-  impl_->draftModel.addMaskRows(commandGraph, impl_->decodeArena->batchSlice(DecodeTensor::DraftHidden0, width),
-                                width);
-  impl_->encodeDraftBatchGraph(commandGraph, entries, {logicalPositions.data(), width}, {depths.data(), width},
+  impl_->draftModel.addMaskRows(draft, impl_->decodeArena->batchSlice(DecodeTensor::DraftHidden0, width), width);
+  impl_->encodeDraftBatchGraph(draft, entries, {logicalPositions.data(), width}, {depths.data(), width},
                                std::span(proposals).first(width), step, choice.floor);
   std::shared_ptr<SpilledKvReads> reads = impl_->decodeReads(items);
   // The weights it reads on demand and the spilled K/V its reads bring.
@@ -3914,14 +3913,30 @@ Runtime::decodeAsync(const BatchPlan &plan,
     // A constrained cycle a streamed-expert target's line sized gives its
     // constrained line a sample (finalizeDecode).
     return std::make_unique<Impl::ConstrainedDecodeTicket>(
-        *impl_, std::move(lanes), items, std::move(reads), commandGraph, step, std::move(count),
+        *impl_, std::move(lanes), items, std::move(reads), draft, step, std::move(count),
         impl_->costLine && !impl_->forcedStep ? std::optional(planned) : std::nullopt, std::move(completion));
   }
-  impl_->encodeBatchVerifyInput(commandGraph, step, Impl::anchorPositions(entries, items));
-  impl_->encodeBatchEmbedding(commandGraph, DecodeTensor::InputTokens,
-                              impl_->decodeArena->lanesRows(TargetTensor::Hidden0, width), width, step.rows);
-  impl_->encodeTargetDecodeForward(commandGraph, entries, items, step, *reads);
-  impl_->encodeVerifyCommit(commandGraph, entries, items, {maximumRetained.data(), width}, step);
+  // The cycle is one command in two parts (MetalBackend::submitCommandPartsAsync):
+  // the draft's goes to the GPU as it is, and the target's, its forward and
+  // the verify's commit, is built, validated and encoded while the GPU runs
+  // the draft: Qwen3.6-35B-A3B's one-lane draft takes 2.35 ms of GPU and its
+  // target's part 0.29 ms of host (its graph 0.12, its preparation 0.03, its
+  // encoding 0.14; M5 Max, 2K), which a command built whole spent before the
+  // GPU started: 0.28 ms a cycle, 1.7% of a one-lane cycle and 0.9% of a
+  // four-lane one, and 1.0% to 0.4% of Qwen3.8-27B's. The target's part
+  // writes no buffer as it is built: every input the CPU makes is written
+  // above (prepareDecodeLane), before the draft's part goes. Where it cannot
+  // be built the draft's part has run alone, which wrote the cycle's own
+  // rows of the decode arena and nothing a lane keeps.
+  CommandGraph target;
+  const auto targetPart = [&] {
+    impl_->encodeBatchVerifyInput(target, step, Impl::anchorPositions(entries, items));
+    impl_->encodeBatchEmbedding(target, DecodeTensor::InputTokens,
+                                impl_->decodeArena->lanesRows(TargetTensor::Hidden0, width), width, step.rows);
+    impl_->encodeTargetDecodeForward(target, entries, items, step, *reads);
+    impl_->encodeVerifyCommit(target, entries, items, {maximumRetained.data(), width}, step);
+    return target.command();
+  };
 
   std::vector<ModelBatchItem> copiedItems(items.begin(), items.end());
   Impl *impl = impl_.get();
@@ -3934,8 +3949,7 @@ Runtime::decodeAsync(const BatchPlan &plan,
                  constrained](CommandTiming timing) mutable {
     return impl->finalizeDecode(lanes, items, timing, *reads, step, planned, constrained);
   };
-  CommandTicket command = impl_->backend.submitCommandAsync(
-      commandGraph.command(), std::move(completion));
+  CommandTicket command = impl_->backend.submitCommandPartsAsync(draft.command(), targetPart, std::move(completion));
   return std::make_unique<DeferredMetalTicket>(std::move(command), std::move(finish), std::move(count));
 }
 
