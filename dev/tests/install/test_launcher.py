@@ -1215,6 +1215,49 @@ class LauncherTests(unittest.TestCase):
             served = api.parse_args(server_arguments(execute.call_args.args[1]))
             self.assertEqual(served.model_root, str(selection))
 
+    def test_install_installs_as_serve_does_and_starts_nothing(self):
+        model = "MiniMaxAI/MiniMax-H3:my-finetune"
+        spec = Path(self.enterContext(tempfile.TemporaryDirectory())) / "spec.json"
+        spec.write_text("{}")
+        for extra, forwarded in (
+            ([], None),
+            (["--spec", str(spec)], str(spec.resolve())),
+        ):
+            with (
+                self.subTest(extra=extra),
+                mock.patch.object(launcher, "_check_port") as probe,
+                mock.patch.object(launcher, "_ensure_installed") as install,
+                mock.patch.object(launcher.os, "execve") as execute,
+            ):
+                self.assertEqual(launcher.main(["install", model, *extra]), 0)
+            probe.assert_not_called()
+            execute.assert_not_called()
+            want = launcher.model_artifacts.Selection.of(launcher.paths.MODELS, model)
+            install.assert_called_once_with(want, forwarded)
+        with mock.patch("sys.stderr", io.StringIO()), self.assertRaises(SystemExit):
+            launcher.parse_args(["install"])
+
+    def test_arguments_after_the_separator_are_refused_after_each_commands_own(self):
+        # serve refuses them last, after SPLASH_PORT and its own options;
+        # install, which reads no port, at once.
+        for environment, arguments, message in (
+            ({"SPLASH_PORT": "bad"}, ["serve", "--model", MODEL_ID], "SPLASH_PORT: "),
+            ({}, ["serve", "--model", MODEL_ID, "--mmproj", "x"],
+             "--mmproj requires --model-dir"),
+            ({}, ["serve", "--model", MODEL_ID], "only supported for coding clients"),
+            ({"SPLASH_PORT": "bad"}, ["install", MODEL_ID],
+             "only supported for coding clients"),
+        ):  # fmt: skip
+            with (
+                self.subTest(arguments=arguments, environment=environment),
+                mock.patch.dict(os.environ, environment),
+                mock.patch("sys.stderr", io.StringIO()) as error,
+                self.assertRaises(SystemExit) as failed,
+            ):
+                launcher.parse_args([*arguments, "--", "z"])
+            self.assertEqual(failed.exception.code, 2)
+            self.assertIn(message, error.getvalue())
+
     def test_serve_takes_the_stop_signals_and_holds_them_across_the_exec(self):
         # A non-interactive shell starts background jobs with SIGINT ignored.
         signal.signal(signal.SIGINT, signal.SIG_IGN)

@@ -254,6 +254,12 @@ a status document of another schema. An added field keeps the version, as
 `weights` did in 1.2.1 and `ane_ffn` in 1.3.0. Builds between releases share a
 version while its layout changes.
 
+The video engine's stream has its own pair, `kVideoProtocolVersion` in
+`runtime/video/protocol/VideoProtocol.hpp` and `VIDEO_PROTOCOL_VERSION` in
+`server/video_protocol.py`: bump them together when any byte of that stream
+changes, a Cancel, Error or StartFailed payload of the engine protocol's
+included (`dev/tests/engine/video_protocol_golden.txt` pins them).
+
 ## Local benchmarks
 
 From a source checkout with the model installed, use the native benchmark for
