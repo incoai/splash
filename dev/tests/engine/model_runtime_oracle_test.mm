@@ -2155,11 +2155,15 @@ void requireDecodeCaptureMatchesTheLane(model::Runtime &executor, model::QwenSta
   };
   // Request `id` on lane 0 from `length` prompt tokens to its first cycle,
   // which captures the page at `boundary` when given one; the rows it
-  // retained.
+  // retained. It never selects a stop token: a first cycle that keeps a
+  // short reply and its end ends its request (the 35B's from 95 of these
+  // tokens keeps three and a stop token), and the check runs a cycle after.
   const auto firstCycle = [&](uint64_t id, uint32_t length, std::optional<uint32_t> boundary,
                               std::vector<std::shared_ptr<const CompositeState>> &captured) {
     const std::vector<uint32_t> tokens = promptOf(length);
-    beginCold(executor, makeRequest(id, tokens, 64), 0);
+    EngineRequest request = makeRequest(id, tokens, 64);
+    request.flags = RequestIgnoreEndOfSequence;
+    beginCold(executor, request, 0);
     executor.setDraftContextPlan(id, planDraftContext(0, length, {}));
     const ModelStepResult prefilled = prefillChunk(executor, id, 0, tokens, decodePages);
     require(prefilled.failure.empty() && prefilled.outputTokens.empty(),
@@ -2180,8 +2184,13 @@ void requireDecodeCaptureMatchesTheLane(model::Runtime &executor, model::QwenSta
   };
   // A prompt whose first cycle retains exactly the rows before a page, the
   // most of them found, so that the fold takes several rows where it can.
+  // The cycles take a forced step of a draft's block, the 8 rows the search
+  // spans before each page: a forced step teaches neither the step's choice
+  // nor the lookup's rates, so the capturing cycle repeats the one the
+  // search found.
   uint32_t prompt = 0, boundary = 0;
   std::vector<std::shared_ptr<const CompositeState>> none;
+  model::RuntimeInstrumentation::forceStepRows(executor, model::ExecutionLimits::draftQueryRows);
   for (const uint32_t page : {96U, 128U})
     for (uint32_t length = page - 8; length < page; ++length) {
       const uint32_t retained = firstCycle(440 + length, length, std::nullopt, none).first;
@@ -2199,6 +2208,7 @@ void requireDecodeCaptureMatchesTheLane(model::Runtime &executor, model::QwenSta
   // The lane's next cycle folds those rows: its cell is then the state at
   // the page.
   const ModelStepResult next = decodeOne(executor, 430, boundary, decodePages);
+  model::RuntimeInstrumentation::forceStepRows(executor, std::nullopt);
   require(next.failure.empty(), "the cycle after a decode capture failed");
   const model::GdnStateLayout layout = states.layout().target;
   const std::vector<uint8_t> lane = bytesOf(states.current(0).stateBase);
