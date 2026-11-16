@@ -20,22 +20,24 @@ inline void state_quantize_thread(device const State *state, device char *codes,
     return;
   device const State *values = reinterpret_cast<device const State *>(
       reinterpret_cast<device const char *>(state) + ulong(layer) * p.state_layer_bytes) + ulong(index) * kValues;
-  float x[kValues];
+  // The block's scale from one pass over the values and their codes from a
+  // second: Apple11's compiler (macOS 27.0) crashed in register allocation
+  // when the thread held its values in an array across the shuffle.
   float amax = 0.0f;
   for (uint i = 0; i < kValues; i += 4) {
-    const float4 four = float4(*reinterpret_cast<device const vec<State, 4> *>(values + i));
-    for (uint j = 0; j < 4; ++j) {
-      x[i + j] = four[j];
-      amax = max(amax, abs(four[j]));
-    }
+    const float4 four = abs(float4(*reinterpret_cast<device const vec<State, 4> *>(values + i)));
+    amax = max(amax, max(max(four.x, four.y), max(four.z, four.w)));
   }
   amax = max(amax, simd_shuffle_xor(amax, 1));
   const bfloat scale = state_codec_scale(amax);
+  const float wide = float(scale);
   device char *layerCodes = codes + ulong(layer) * p.codes_layer_bytes;
   device char4 *out = reinterpret_cast<device char4 *>(layerCodes + ulong(index) * kValues);
-  for (uint i = 0; i < kValues; i += 4)
-    out[i / 4] = char4(state_code(x[i], float(scale)), state_code(x[i + 1], float(scale)),
-                       state_code(x[i + 2], float(scale)), state_code(x[i + 3], float(scale)));
+  for (uint i = 0; i < kValues; i += 4) {
+    const float4 four = float4(*reinterpret_cast<device const vec<State, 4> *>(values + i));
+    out[i / 4] = char4(state_code(four.x, wide), state_code(four.y, wide), state_code(four.z, wide),
+                       state_code(four.w, wide));
+  }
   if ((index & 1) == 0)
     reinterpret_cast<device bfloat *>(layerCodes + p.scales_offset)[index / 2] = scale;
 }
