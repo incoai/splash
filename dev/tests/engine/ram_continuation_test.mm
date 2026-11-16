@@ -75,9 +75,9 @@ ModelStepResult step(model::Runtime &runtime, uint64_t id, uint64_t position,
 void run(const char *metallib) {
   const test::TemporaryDirectory root("splash-ram-continuation");
   for (const bool flashNext : {false, true}) {
-    auto config = flashNext ? test::flashNextConfig(metallib, root.path() / "flash-next",
-                                                    gguf_fixtures::kPleTableRows, 2560, 8)
-                            : test::loadableConfig(metallib, root.path() / "dense", "ram-continuation-unit");
+    auto config = flashNext
+        ? test::flashNextConfig(metallib, root.path() / "flash-next", gguf_fixtures::kPleTableRows, 2560, 8)
+        : test::loadableConfig(metallib, root.path() / "dense", "ram-continuation-unit");
     config.aneFfn.enabled = false;
     config.verifyRows = model::VerifyRows::All;
     if (flashNext) {
@@ -208,7 +208,8 @@ void run(const char *metallib) {
         require(!storage.metadata(lane).assigned(), "continuation test retained an active lane");
       for (const auto *pages : {&baselinePages, &parkedPages, &intruderPages})
         for (const uint32_t page : *pages) pool.releasePage(page, false);
-      std::cout << "ram_continuation=PASS family=" << (flashNext ? "flash-next" : "dense") << " state=" << (format == ops::GdnStateFormat::Float32 ? "fp32" : "bf16")
+      std::cout << "ram_continuation=PASS family=" << (flashNext ? "flash-next" : "dense")
+                << " state=" << (format == ops::GdnStateFormat::Float32 ? "fp32" : "bf16")
                 << " rotations=2 sampled_tokens=" << output.size() << '\n';
     }
   }
@@ -217,7 +218,12 @@ void run(const char *metallib) {
 int main(int argc, const char **argv) {
   if (argc != 2) return EXIT_FAILURE;
   @autoreleasepool {
-    try { run(argv[1]); return EXIT_SUCCESS; }
-    catch (const std::exception &error) { std::cerr << error.what() << '\n'; return EXIT_FAILURE; }
+    try {
+      run(argv[1]);
+      return EXIT_SUCCESS;
+    } catch (const std::exception &error) {
+      std::cerr << error.what() << '\n';
+      return EXIT_FAILURE;
+    }
   }
 }

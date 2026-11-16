@@ -60,8 +60,9 @@ read/reclaim failure across parking.
 
 ## Activation gates
 
-A scheduling policy is intentionally absent. Native Engine source currently
-uses 30102 production lines of its 30105-line architecture budget. Adding a
+A scheduling policy is intentionally absent. The deployed-stack comparison
+uses 30102 Engine production lines of its 30105-line architecture budget;
+the refreshed upstream-main review base uses all 30105 lines. Adding a
 second suspension/admission mechanism without simplifying existing ownership
 would both exceed that gate and risk bypassing resource, cache and cancellation
 contracts. Do not raise the budget or add an exception for this experiment.
@@ -98,3 +99,14 @@ instance/identity unchanged, zero transport restarts, Samsung slots open on the
 verified external volume, Flash-Next at 96 GiB RAM/512 GiB cache, eight queue
 workers and admission/M4 disabled. Fusion and deployment were unchanged.
 See `ram-continuation-tests-20261116.json` for sanitized evidence.
+
+## Focused upstream review branch
+
+The patch was transplanted onto refreshed upstream main `d8af105` without the
+earlier cache/counter patches. Its full fake-model Engine binary passes 458/458;
+storage cases and all four synthetic numerical cases also pass on the M5. The
+architecture checker passes at 30105/30105 Engine production lines.
+`Runtime.cpp` is byte-identical to the uniformly ASan/UBSan-tested deployed-stack
+variant. ASan/UBSan were not repeated on this separate upstream base; the
+base-specific receipts keep those validations distinct. See
+`ram-continuation-upstream-tests-20261116.json`.
