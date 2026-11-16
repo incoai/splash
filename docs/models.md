@@ -330,22 +330,20 @@ without the embedding, 4.7 with it. Every family loads and runs its draft
 alike: a decode cycle drafts eight rows, the anchor and seven proposal
 positions, and the target verifies a tree of the draft's candidates at those
 positions and of its host chain (below), as many of its rows among a draft's
-block's eight as the cycle chose for the lane (its verify rows,
-`ops::DraftSelector::addVerifyRows`), no more of them, and none deeper, than
+block's eight as the cycle's step gives the lane
+(`ops::DraftSelector::addVerifyRows`), no more of them, and none deeper, than
 the lane may still retain: the tokens its output budget leaves, to which its
-tree grows, at most sixteen rows. A dense target verifies every row up to that limit: its
-projections read their weights once for all of a cycle's rows, so a row costs it
-little. Each row a MoE target verifies routes its own experts, which a rejected
-row reads for nothing (a Qwen3.8-Flash-Next cycle of one lane routes about 43
-experts a layer with all eight rows and 17 with two), from the SSD where they
-stream ([Streamed experts](server.md#streamed-experts)), so by default (`--verify-rows
-auto`) a MoE target's cycles choose their rows by expected accepted tokens per
-unit of cost (the verify budget, `model::VerifyBudget`), whether its experts
-stream or not: on an M5 Max serving Qwen3.6-35B-A3B with its experts all loaded,
-one, two and four concurrent agentic requests of 1000 tokens decoded 8.7%, 8.5%
-and 2.1% faster under the budget than with every row verified in GGUF UD-Q4_K_M,
-and 2.1%, 0.9% and 6.0% faster in MLX 4-bit. `--verify-rows all` has every
-target's cycles verify every row. The startup log says which rows the cycles
+tree grows, at most sixteen rows. Every target verifies every row of its step
+that its lanes' trees fill: a dense target's projections read their weights
+once for all of a step's rows, so a row costs it little, and each row a MoE
+target verifies routes its own experts, which a rejected row reads for
+nothing (a Qwen3.8-Flash-Next cycle of one lane routes about 43 experts a
+layer with all eight rows and 17 with two), from the SSD where they stream
+([Streamed experts](server.md#streamed-experts)). By default (`--verify-rows
+auto`) the trees' estimates follow an acceptance model the engine learns
+from its cycles (the verify budget, `model::VerifyBudget`, below);
+`--verify-rows all` learns nothing, so that greedy and seeded outputs
+repeat. The startup log says which rows the cycles
 verify and why, and `/status` reports it as `verify_rows`. The selector grows
 each lane's verify rows into a tree over its candidates (`draft_select_tree`):
 from the anchor, best first by the estimate that the target accepts a row's
@@ -384,7 +382,7 @@ rows' rejection sampling accepts. The engine refits each every 64
 cycles on its last 4096 labels: each row of a lane's tree whose parent the
 cycle's walk accepted, labeled with whether the target selected the row's
 token there and carrying the row's cap (a label its cap bounds tells the fit
-nothing), a row past the lane's verify rows too (its parent's selection
+nothing), a row its lane did not verify too (its parent's selection
 says whether the target would have accepted it), but none whose probability
 is not one (a lookup chain's row that no draft step joined, a row of a chain
 the target selects whatever its logits, or a draft row that is not finite) and
@@ -397,21 +395,23 @@ cycles of Qwen3.8-27B, each workload under the fit of the others', trees of
 within 0.012 of the rate the target accepted them at (the mean over tenths of
 the estimate), against 0.021 with the fit of their chains' labels, under
 which rows estimated at 0.15 to 0.45 were accepted at 0.10 to 0.38. A row's
-estimate is what verifying it adds to its lane's expected tokens; one GPU step after the
-selector (`draft_verify_rows`) lays out the cycle's rows, a draft block's a
-lane: every lane verifies its anchor and the rows of the largest estimates over
-the batch, a lane's in the order its tree took them and none past a lane's cap,
-as many as the cycle's rows hold or, under the budget, those in order while
-each raises the expected tokens over the cycle's cost at that many rows in all,
-the first that does not ending them: a row's admission then reads only the rows
-before it, not its own descendants, whose estimates follow its draws, which
-keeps a sampled lane's selections draws from the target whatever the cost's
-shape (for a cost convex in the rows it is the most tokens per cost of any
-count). It numbers a lane's
-verify rows in preorder, its likeliest path on its first rows, packs the lanes'
-rows in lane order, the cycle's rows past the verify rows on the first lanes
-under the cap, and writes each lane's rows (`DecodeTensor::LaneLayout`), which
-the cycle's later kernels read on the GPU. A sampled lane's draft draws a
+estimate is what verifying it adds to its lane's expected tokens; one GPU
+step after the selector (`draft_verify_rows`) lays out the step's rows: every
+lane its anchor and the rows of the largest estimates over the batch, a
+lane's in the order its tree took them and none past a lane's cap, as many as
+the cycle's rows hold, every one of which its lane verifies. A row's
+admission so reads only the rows ranked above it, never its own descendants,
+whose estimates follow its draws, which keeps a sampled lane's selections
+draws from the target. It numbers a lane's rows in preorder, its likeliest
+path on its first rows, packs the lanes' rows in lane order, and writes each
+lane's rows (`DecodeTensor::LaneLayout`), which the cycle's later kernels
+read on the GPU. Where the trees hold fewer rows than the step (a lane's
+tree holds no more rows than a walk of it may retain, so a lane near its
+output limit or its thinking budget's end holds fewer than its share), the
+step's rows past the lanes' belong to no lane: the target's projections
+compute them unread, as a tile's spare rows, each holding lane 0's anchor,
+but no attention, GDN recurrence, MoE routing
+(`moe_group_routes_verified`), selection, penalty or acceptance reads them. A sampled lane's draft draws a
 row's children without replacement from its candidates at the lane's
 temperature (their Gumbel-top-k), which its tree takes in the order drawn, and
 each of its verify rows selects by recursive rejection sampling over them: it
@@ -427,28 +427,11 @@ temperature 0, its children its draft's most likely. On Qwen3.8-27B's own
 sampled cycles at temperature 1, top_k 20 and top_p 0.95, a row that selected
 by its draw alone, of its draft's most likely child, kept 0.671 of the
 proposals at each position, where this rule keeps 0.701, and 0.785 and 0.841
-of its proposals with two and four children. The engine takes a cycle's cost at so many rows from the wall times of the
-lane count's latest cycles, which for streamed experts include the store's reads
-of its misses: a least-squares line in the rows over about the last 30 cycles,
-its slope shrunk toward the shape the measured targets share, since what a row
-costs follows the requests served (a Qwen3.6-35B-A3B cycle with 4 GB of experts
-adds about 3 ms a row on prose and 8 ms on reasoning); constrained cycles are fit
-apart, and every 32nd cycle of a lane count verifies every row, which keeps the
-rows of the fit spread. A cycle counts in the fit at most twice the larger of the
-line's cost at its rows and the mean cycle time: one stalled cycle, such as one
-behind a slow SSD read, would otherwise tilt the line so that the next cycles
-verify their anchors alone, and the mean keeps the cap up where the line has
-fallen. The log notes, at most once a minute, the cycles counted at under half
-their time (`Verify budget: a cycle of`). A fixed shorter block would do worse:
-in agentic use about one cycle in six accepts all seven proposals and one in
-five accepts none. Rows past a lane's verify rows still run the target's
-layers, whose kernels take up to sixteen rows a lane, but their MoE steps route no
-expert (`moe_group_routes_verified`), their GDN recurrence is skipped and its
-output left zero (`verify_gdn_fused`), and no selection, penalty or acceptance
-reads them.
-The budget's acceptance model fits every request's labels, a dense target's
-too, and its costs follow wall time, so the rows a cycle verifies depend on
-what the server served before and on the machine's timing, and a MoE row's result
+of its proposals with two and four children. A fixed shorter block would do
+worse: in agentic use about one cycle in six accepts all seven proposals and
+one in five accepts none.
+The budget's acceptance model follows every request's labels, so the rows a
+cycle verifies depend on what the server served before, and a MoE row's result
 depends on which rows share its expert tiles ([Kernels](internals.md#kernels)): under the
 budget the same greedy (temperature 0) or seeded request can give different text
 from run to run, even alone on an idle server ([Sampling](api.md#sampling)); sampled

@@ -22,9 +22,8 @@ public:
   [[nodiscard]] static std::vector<uint32_t> lastTableRows(const Runtime &runtime, uint32_t lane);
   // The fp32 logits the last command that selected left in batch lane
   // `lane`'s rows, each the target's vocabulary wide, until the next command:
-  // a decode step's rows as its selector laid them out (its verify rows
-  // first), or the row of the final position of the prefill chunk that ended
-  // a prompt.
+  // a decode step's rows as its selector laid them out, or the row of the
+  // final position of the prefill chunk that ended a prompt.
   [[nodiscard]] static std::span<const float> lastLogits(const Runtime &runtime, uint32_t lane);
   // The target rows the last prefill command captured for the draft in its
   // chunk `chunk`'s buffer, until the next prefill: bf16 rows of the output
@@ -32,9 +31,9 @@ public:
   // values each, in their order), the captured rows in the order the draft's
   // context plan captured them (a cold prompt's first command: its rows).
   [[nodiscard]] static std::span<const uint16_t> lastCapturedRows(const Runtime &runtime, uint32_t chunk);
-  // The rows batch lane `lane` of the last decode step verified
-  // (ops::DraftSelector::addVerifyRows), until the next command that
-  // selects.
+  // The rows batch lane `lane` of the last decode step verified, its rows of
+  // the step as its selector laid them out (ops::DraftSelector::
+  // addVerifyRows), until the next command that selects.
   [[nodiscard]] static uint32_t lastVerifyRows(const Runtime &runtime, uint32_t lane);
   // The path of the rows batch lane `lane` of the last decode step retained,
   // a bit a row of its rows from its first (metal/abi/VerifyTree.h): a chain
@@ -48,8 +47,8 @@ public:
   // While capturing, each command that selects first tokens or verifies
   // copies the rows lastLogits returns, as the target's forward wrote them
   // before the policy rewrites them in place: for each of its batch lanes,
-  // row 0 for a selection or the lane's verified rows (lastVerifyRows) for a
-  // verify. Only a capturing command adds the host step that copies them.
+  // row 0 for a selection or the lane's rows (lastVerifyRows) for a verify.
+  // Only a capturing command adds the host step that copies them.
   // takeTargetLogits() reads and clears the copies, one per batch lane of the
   // last such command since the last take; none if none ran.
   static void captureTargetLogits(Runtime &runtime, bool enabled);

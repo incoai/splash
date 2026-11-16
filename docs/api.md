@@ -302,11 +302,11 @@ output can differ from that run's, which computed the whole prompt; repeats
 meant to match each take a `cache_salt` of their own (below). By default the
 verify budget ([Drafts](models.md#drafts)) sets the rows a decode cycle
 verifies: every target's trees follow the estimates it fits to the requests
-served before, and a MoE target's rows the machine's timing too, where a row's
-MoE result depends on which rows share its expert tiles: there the same greedy
-(temperature 0) or seeded request can give different text from run to run even
-alone on an idle server, as on other engines that batch requests, while sampled
-outputs keep their exact distribution. A request that restores nothing can
+served before, and a MoE row's result depends on which rows share its expert
+tiles: there the same greedy (temperature 0) or seeded request can give
+different text from run to run even alone on an idle server, as on other
+engines that batch requests, while sampled outputs keep their exact
+distribution. A request that restores nothing can
 still read cached KV: once a command completes, each block it filled whose
 prefix, tokens and identity (images and cache salt) match a cached block is
 swapped for that block's page,
@@ -747,7 +747,7 @@ fields; additional fields may be added:
 | `memory_plan.budget.host_held_back_bytes` | The expert store's chunks above its floor, which it started without and the memory ledger grows into as the host allows ([memory and context](server.md#memory-and-context)): no memory at the start, but among the fixed bytes, so that the context and the KV the plan holds are the limit's |
 | `ane_ffn.state`, `share`, `minimum_rows`, `reason` | The prefill FFN's [Neural Engine split](internals.md#neural-engine-prefill): `split` while it serves, at `share` of the FFN's channels over chunks of `minimum_rows` rows or more; `off` when the start left the GPU alone (`share` and `minimum_rows` 0); `stopped` once it stopped while serving, until the engine restarts. `reason` is the start's outcome, or why the split stopped |
 | `ane_ffn.split_commands`, `evaluations`, `ane_ms`, `reruns` | Prefill commands the split ran since engine start, the Neural Engine's evaluations in them and its milliseconds over them (each evaluation's from the GPU's signal to start it to its report); and the chunks the GPU ran again alone after the split's work for them failed |
-| `verify_rows` | The rows of a draft block decode cycles verify ([drafts](models.md#drafts), `--verify-rows`): `auto` where the verify budget learns the trees' estimates and chooses a MoE target's rows (the default), `all` where they verify every row the output limit leaves and nothing learns (`--verify-rows all`) |
+| `verify_rows` | The rows decode cycles verify ([drafts](models.md#drafts), `--verify-rows`): `auto` where the verify budget's estimates, learned from the requests served, choose them from the lanes' trees, every row of a draft's block a lane they fill verified (the default), `all` where each verifies every row of a draft's block a lane the output limit leaves, nothing learning (`--verify-rows all`) |
 | `model_timing.prefill.last_gpu_ms`, `total_gpu_ms` | GPU time of the last prefill command, and of all since engine start, warmup included: each from its first Metal command buffer's start to its last one's end, so with the Neural Engine split it spans the GPU's waits on the Neural Engine; a chunk's image encodes, a command of their own ahead of it, add theirs, as a chunk run again adds the rerun's |
 | `metrics.decode_tokens_per_second` | Aggregate native decode throughput, not a request's end-to-end rate |
 | `metrics.decode_wall_ms` | Total wall time of the decode commands on the GPU, from submission to completion |

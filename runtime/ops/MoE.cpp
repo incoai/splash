@@ -221,15 +221,11 @@ void MoE::addRouting(metal::CommandGraph &graph, const MoeBuffers &buffers, cons
   const MoeScratch &scratch = buffers.scratch;
   for (const MoeScratchField &field : kMoeScratchFields)
     requireBytes(scratch.*field.buffer, required.*field.bytes, field.name);
-  // A decode step's lanes' rows and verify rows, which the selector writes
-  // on the device.
+  // A decode step's lanes' rows, which the selector writes on the device.
   MoeGroupParams group = groupParams(plan, weights);
   const uint32_t lanes = buffers.lanes;
   if (lanes > SPLASH_MAXIMUM_BATCH_WIDTH) throw std::invalid_argument("a MoE step has more lanes than a batch");
-  if (lanes) {
-    requireBytes(buffers.laneRows, uint64_t{lanes} * sizeof(SplashLaneRows), "MoE lane rows");
-    requireBytes(buffers.verifyRows, uint64_t{lanes} * sizeof(uint32_t), "MoE verify rows");
-  }
+  if (lanes) requireBytes(buffers.laneRows, uint64_t{lanes} * sizeof(SplashLaneRows), "MoE lane rows");
   group.lanes = lanes;
   MoE::addRoutes(graph, buffers.input, weights.router, weights.sharedScalarGate, scratch.groupedInput,
                  scratch.selectedExperts, scratch.routingWeights, rows, shape, plan.configuration().ggufRouterTile);
@@ -242,7 +238,7 @@ void MoE::addRouting(metal::CommandGraph &graph, const MoeBuffers &buffers, cons
   std::vector<metal::MetalBuffer> grouping{scratch.selectedExperts, scratch.tileDescriptors, scratch.tileCount,
                                            scratch.groupedRoutes, scratch.routeRows, weights.slotTable,
                                            scratch.expertSlots};
-  if (lanes) grouping.insert(grouping.end(), {buffers.verifyRows, buffers.laneRows});
+  if (lanes) grouping.push_back(buffers.laneRows);
   graph.add(routingKernel(lanes ? "moe_group_routes_verified" : "moe_group_routes", shape,
                           &CompiledMoeRouting::slicesSuffix),
             std::move(grouping), group, {1, 1, 1}, {shape.routerWidth(), 1, 1});

@@ -39,10 +39,10 @@
 #define SPLASH_NO_TOKEN 0xFFFFFFFFu
 
 // One target-policy dispatch over the selected rows of its lanes, a grid of a
-// lane's rows by lanes: lane l selects its verify rows, the first
-// verify_rows[l] of its lane rows (SplashLaneRows, metal/abi/VerifyTree.h),
-// which a decode cycle's selector writes (VerifyRowsParams), at most
-// SPLASH_TARGET_VERIFY_ROWS. Its row i, the logits row s = first + i, reads
+// lane's rows by lanes: lane l selects every one of its lane rows
+// (SplashLaneRows, metal/abi/VerifyTree.h), which a decode cycle's selector
+// writes (VerifyRowsParams), at most SPLASH_TARGET_VERIFY_ROWS, and no row
+// of no lane. Its row i, the logits row s = first + i, reads
 // mask row l * (SPLASH_TARGET_VERIFY_ROWS + 1) + mask_row + i of the lane's
 // SPLASH_TARGET_VERIFY_ROWS + 1 constraint-mask rows and draws with uniform
 // l * SPLASH_SAMPLING_UNIFORMS + i; workspaces, vocabulary rows and output
@@ -70,9 +70,9 @@ static_assert(sizeof(TargetSamplingParams) == 108,
               "Target sampling parameters are 108 bytes on both sides");
 
 // The selection of each lane's first token after its prompt from its one row
-// of the logits, row[l]: decode_sample_first_rows writes the lane rows, verify
-// rows (TargetSamplingParams) and that row's tree row, a tree's root, that
-// the selection's kernels read.
+// of the logits, row[l]: decode_sample_first_rows writes the lane rows
+// (TargetSamplingParams) and that row's tree row, a tree's root, that the
+// selection's kernels read.
 struct SampleFirstRowsParams {
   uint32_t row[SPLASH_MAXIMUM_BATCH_WIDTH];
 };
@@ -229,14 +229,11 @@ static_assert(sizeof(SelectorBatchParams) == 24,
 // anchor's the lane's noise[l] (a 64-bit seed, low word first), so that every
 // row draws with noise of its own. A sampled lane's q is q_T. A row's draft
 // probability is the q of the draft step that made it, or joined it where a
-// host chain made it first; a row of a chain whose tokens the target selects
-// whatever its logits (forced[l]: a thinking end, a grammar's forced tokens)
-// has none (-1), as has a chain row no draft step joined.
+// host chain made it first; a chain row no draft step joined has none (-1).
 struct DraftTreeParams {
   uint32_t anchor[SPLASH_MAXIMUM_BATCH_WIDTH];
   uint32_t depth[SPLASH_MAXIMUM_BATCH_WIDTH];
   uint32_t chain[SPLASH_MAXIMUM_BATCH_WIDTH];
-  uint32_t forced[SPLASH_MAXIMUM_BATCH_WIDTH];
   uint32_t children[SPLASH_MAXIMUM_BATCH_WIDTH];
   uint32_t lanes;
   float slope[SPLASH_MAXIMUM_BATCH_WIDTH];
@@ -245,56 +242,51 @@ struct DraftTreeParams {
   uint32_t noise[SPLASH_MAXIMUM_BATCH_WIDTH][2];
 };
 
-static_assert(sizeof(DraftTreeParams) == 260,
-              "Draft tree parameters are 260 bytes on both sides");
+static_assert(sizeof(DraftTreeParams) == 244,
+              "Draft tree parameters are 244 bytes on both sides");
 
-// The rows of a decode cycle (draft_verify_rows): `rows` rows over its lanes,
-// 1 to lane_cap a lane, laid out from the lanes' trees (DraftTreeParams).
-// Every lane verifies its anchor; the cycle's other rows go to the largest
+// The rows of a decode cycle (draft_verify_rows): the `rows` rows of its
+// step's plan (ops::StepRows), laid out over its lanes' trees
+// (DraftTreeParams), 1 to lane_cap a lane, every row a lane holds verified.
+// Every lane holds its anchor; the plan's other rows go to the largest
 // estimates of the trees' rows, a lane's in the order its tree took them
 // (each at most its parent's, which comes before it), the earlier lane first
-// among equal ones, none past a lane's cap. With every_row the cycle verifies as many as its rows hold;
-// otherwise those of them, in order, while each raises the expected tokens,
-// its lanes plus the estimates it took, over cost[the rows it verifies in
-// all]: the first that does not ends them. A row's estimates follow the
-// draws of the rows above it, so a row admitted by the rows after it, its
-// own descendants among them, would be verified for its own draws, and its
-// selection would no longer be a draw from the target; the first that does
-// not improve is the most tokens per cost of any count where the cost is
-// convex in the rows, and keeps the admission to the rows before it for any
-// cost. A lane's
-// verify rows are its anchor and the rows it took, numbered in preorder, its
-// likeliest path on its first rows. Lanes' rows are packed in lane order
-// (SplashLaneRows), and the cycle's rows past every lane's verify rows go to
-// lanes under the cap, the first lane first, each a row of its anchor's token
-// that extends the path of the row before it: no kernel selects, retains or
-// routes through the MoE experts a row past its lane's verify rows.
-// The rows and the cap come from the host before this cycle's draws, so they
-// admit no row by its own draws: a draft's block a lane, or a step a test
-// forces; the costs are those of the rows verified.
+// among equal ones, none past a lane's cap. A row is so taken by its rank
+// among all rows: every row ranked above it is another lane's, or its own
+// tree's that its draws did not make, and its own descendants rank below it,
+// so no row is verified for its own draws, which would leave its selection
+// no draw from the target. A lane's rows are its anchor and the rows it
+// took, numbered in preorder, its likeliest path on its first rows, and
+// lanes' rows are packed in lane order (SplashLaneRows). Where the trees
+// hold fewer rows than the plan (a lane's tree holds no more rows than a
+// walk of it may retain, so a lane near its output limit or its thinking
+// budget's end holds fewer than its share of the step), the plan's rows past
+// the lanes' belong to no lane: no kernel selects, retains, attends or routes
+// through the MoE experts a row of no lane, and the projections compute it
+// unread, as they compute a tile's spare rows. Each carries lane 0's anchor,
+// as the embedding gathers by token. The rows and the cap come from the host
+// before this cycle's draws, so they admit no row by its own draws: a
+// draft's block a lane, or a step a test forces.
 struct VerifyRowsParams {
-  float cost[SPLASH_TARGET_VERIFY_ROWS * SPLASH_MAXIMUM_BATCH_WIDTH + 1];
   uint32_t lanes;
   uint32_t rows;
   uint32_t lane_cap;
-  uint32_t every_row;
 };
 
-static_assert(sizeof(VerifyRowsParams) == 4 * (SPLASH_TARGET_VERIFY_ROWS * SPLASH_MAXIMUM_BATCH_WIDTH + 5),
-              "Verify rows parameters are the same size on both sides");
+static_assert(sizeof(VerifyRowsParams) == 12, "Verify rows parameters are 12 bytes on both sides");
 
-// Acceptance of each lane's verify rows, the first verify_rows[l] of its lane
-// rows (SplashLaneRows) of the command's packed rows, as a tree
-// (metal/abi/VerifyTree.h): from its anchor's row the lane follows the child
-// whose token (its verify input row) is the current row's selection, until no
-// child is. It retains the selections of that path's rows in order, the last
-// the target's token after the path, at most remaining[l] of them and none
-// after a stop token; the mask of the rows it retains (bit j for row j of its
-// block); and the path's proposals among them, all of them where the cap or
-// a stop token cuts the path. A greedy row selects its argmax and a sampled
-// row by rejection sampling over the children its draft drew there
-// (SPLASH_SAMPLING_UNIFORMS), a draw from the target's distribution, so a
-// lane retains the target's own tokens under either policy.
+// Acceptance of each lane's rows (SplashLaneRows) of the command's packed
+// rows, as a tree (metal/abi/VerifyTree.h): from its anchor's row the lane
+// follows the child whose token (its verify input row) is the current row's
+// selection, until no child is. It retains the selections of that path's
+// rows in order, the last the target's token after the path, at most
+// remaining[l] of them and none after a stop token; the mask of the rows it
+// retains (bit j for row j of its block); and the path's proposals among
+// them, all of them where the cap or a stop token cuts the path. A greedy
+// row selects its argmax and a sampled row by rejection sampling over the
+// children its draft drew there (SPLASH_SAMPLING_UNIFORMS), a draw from the
+// target's distribution, so a lane retains the target's own tokens under
+// either policy.
 struct AcceptBatchParams {
   uint32_t remaining[SPLASH_MAXIMUM_BATCH_WIDTH];
   uint32_t stop_tokens[SPLASH_STOP_TOKENS];

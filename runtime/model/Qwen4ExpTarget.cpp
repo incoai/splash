@@ -118,7 +118,6 @@ std::vector<metal::MetalBuffer> Qwen4ExpTarget::addPrefill(metal::CommandGraph &
     if (const QwenTargetDecodeBuffers *d = step.decode) {
       step.ffn.lanes = d->step.lanes;
       step.ffn.laneRows = step.buffers.laneRows;
-      step.ffn.verifyRows = d->verifyRows;
     }
   }
   if (begins && !chunks.front().decode) steps_.readAhead(chunks);

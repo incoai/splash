@@ -210,7 +210,10 @@ kernel void ngram_embedding_commit(device const bfloat *input [[buffer(0)]],
 // qwen4PleRows on the CPU): heads of the 2- to ngram-gram hashes of the row's
 // token and those before it on its path, cut at EOS or the sequence's start.
 // A thread per row of the step: its lane is the last whose first row is at
-// most it, and a row past that lane's rows hashes nothing.
+// most it. A row of no lane, past that lane's rows (VerifyRowsParams), takes
+// the table rows of lane 0's anchor, whose token it carries: rows of the
+// table, which the step's PLE gathers by them, and the same rows, which a
+// streamed table stages once.
 kernel void ngram_embedding_hash(device const uint *tokens [[buffer(0)]],
                                  device const SplashTreeRow *tree [[buffer(1)]],
                                  device const SplashLaneRows *lane_rows [[buffer(2)]],
@@ -221,14 +224,19 @@ kernel void ngram_embedding_hash(device const uint *tokens [[buffer(0)]],
   uint lane = 0;
   for (uint l = 1; l < min(p.lanes, uint(SPLASH_MAXIMUM_BATCH_WIDTH)); ++l)
     lane = index >= lane_rows[l].first ? l : lane;
+  // The row hashed; the difference wraps for a row before lane 0's.
+  uint at = index;
+  if (index - lane_rows[lane].first >= lane_rows[lane].rows) {
+    lane = 0;
+    at = lane_rows[0].first;
+  }
   const uint first = lane_rows[lane].first;
-  if (index < first || index - first >= lane_rows[lane].rows) return;
   // The row's token, then the ngram - 1 tokens before it: its parents' up to
   // the anchor, then those before the lane's first row; EOS from a cut on.
-  ulong context[NGRAM_EMBEDDING_MAXIMUM_NGRAM] = {tokens[index]};
+  ulong context[NGRAM_EMBEDDING_MAXIMUM_NGRAM] = {tokens[at]};
   bool cut = false;
-  uint row = index - first;
-  const uint depth = tree[index].depth;
+  uint row = at - first;
+  const uint depth = tree[at].depth;
   for (uint back = 1; back < p.ngram; ++back) {
     uint previous;
     if (back <= depth) {

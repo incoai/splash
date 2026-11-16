@@ -11,14 +11,10 @@
 // from the online warm start and from the prior alike, and recover the model
 // the labels were drawn from; a refit from the model a fit reached keeps it,
 // and a model whose lanes labeled nothing stays as it was; a label its cap
-// bounds tells the fit nothing, one under its cap moves it. The
-// costs are the seed's shape before any cycle, then the affine fit of the
-// latest cycles of each lane count and kind, positive and nondecreasing, the
-// seed's slope where their rows do not spread; every kExploreCycles-th cycle
-// of a lane count explores; a stall over rows that cluster leaves the cycles
-// after it their tokens per millisecond. A cycle's rows (stepRows) are the
-// most expected tokens per cost of every assignment of rows to its lanes'
-// chances that its rows and their caps allow, the fewest among equal ones.
+// bounds tells the fit nothing, one under its cap moves it. A cycle's rows
+// (stepRows) are the most expected tokens per cost of every assignment of
+// rows to its lanes' chances that its rows and their caps allow, the fewest
+// among equal ones.
 #include "TestChecks.hpp"
 #include "model/VerifyBudget.hpp"
 
@@ -120,8 +116,7 @@ void refitKeeps(const std::vector<VerifyBudget::Label> &labels, const VerifyBudg
   require(moved < 1e-6, "a refit from the model a fit reached moved it by " + std::to_string(moved));
 }
 
-// Greedy lanes drawn from a known model: every row verified in three lanes
-// of four and 1 to 8 rows in the others, each with six labels at positions
+// Greedy lanes drawn from a known model, each with six labels at positions
 // drawn alike, their draft probabilities spread over (0, 1), accepted with
 // the model's probabilities.
 struct Generator final {
@@ -131,7 +126,6 @@ struct Generator final {
     std::normal_distribution<double> feature(1.5, 2.0);
     std::uniform_real_distribution<double> unit(0.0, 1.0);
     VerifyBudget::Lane lane;
-    lane.verifyRows = random() % 4 ? 8 : 1 + static_cast<uint32_t>(random() % 8);
     for (uint32_t label = 0; label < 6; ++label) {
       const uint32_t position = static_cast<uint32_t>(random() % kPositions);
       const float logit = static_cast<float>(logitOf(1.0 / (1.0 + std::exp(-feature(random)))));
@@ -142,29 +136,10 @@ struct Generator final {
   }
 };
 
-void priorAndExploration() {
-  VerifyBudget budget;
+void startsAtThePrior() {
+  const VerifyBudget budget;
   require(budget.acceptance(false) == VerifyBudget::kPrior && budget.acceptance(true) == VerifyBudget::kPrior,
           "a new budget is not the prior");
-  for (uint32_t lanes = 1; lanes <= VerifyBudget::kLanes; ++lanes) {
-    const auto costs = budget.costs(lanes, false);
-    for (uint32_t rows = 0; rows <= VerifyBudget::kBlockRows * VerifyBudget::kLanes; ++rows) {
-      const bool inside = rows >= lanes && rows <= lanes * VerifyBudget::kBlockRows;
-      require(inside ? std::fabs(costs[rows] - VerifyBudget::seed(lanes, rows)) < 1e-6 : costs[rows] == 0.0F,
-              "a new budget's costs are not the seed's shape");
-      require(!inside || rows == lanes || costs[rows] >= costs[rows - 1], "the seed's costs decrease");
-    }
-    require(std::fabs(costs[lanes * VerifyBudget::kBlockRows] - 1.0F) < 1e-6, "every row does not cost 1");
-  }
-  VerifyBudget::Lane lane;
-  lane.verifyRows = 8;
-  for (uint32_t cycle = 0; cycle < 3 * VerifyBudget::kExploreCycles; ++cycle) {
-    require(budget.explores(2, false) == (cycle % VerifyBudget::kExploreCycles == VerifyBudget::kExploreCycles - 1),
-            "two-lane cycles explore at another cadence");
-    require(!budget.explores(1, false) && !budget.explores(2, true), "other cycles' kinds explored");
-    const std::array lanes{lane, lane};
-    budget.observe(lanes, false, 10.0);
-  }
 }
 
 // A tree in its selector's order, after a walk that selected 11 at the
@@ -204,16 +179,14 @@ void treeLabelsOfAWalk() {
           "a walk of one selection labeled rows below its anchor's children");
   require(VerifyBudget::treeLabels(tokens, rows, scores, caps, {}).empty(), "a walk of no selection labeled rows");
 
-  // A cycle keeps a greedy lane's labels and a sampled lane's apart, and
-  // without a valid time still labels, leaving the costs alone.
+  // A cycle keeps a greedy lane's labels and a sampled lane's apart.
   VerifyBudget budget;
-  const VerifyBudget::Lane greedy{8, false, labels}, sampled{3, true, {expected[1], expected[3]}};
-  budget.observe(std::array{greedy, sampled, greedy}, false, 0.0);
+  const VerifyBudget::Lane greedy{false, labels}, sampled{true, {expected[1], expected[3]}};
+  budget.observe(std::array{greedy, sampled, greedy});
   std::vector<VerifyBudget::Label> both = labels;
   both.insert(both.end(), labels.begin(), labels.end());
   require(budget.labels(false) == both && budget.labels(true) == sampled.labels,
           "a cycle did not keep its greedy and sampled lanes' labels apart");
-  require(budget.costs(4, false) == VerifyBudget().costs(4, false), "a cycle without a time changed the costs");
 }
 
 // Greedy lanes whose rows the target always accepts and sampled lanes whose
@@ -221,13 +194,13 @@ void treeLabelsOfAWalk() {
 // one whose lanes labeled nothing keeps its model.
 void policiesFitApart() {
   VerifyBudget budget;
-  VerifyBudget::Lane greedy{8, false, {}}, sampled{8, true, {}};
+  VerifyBudget::Lane greedy{false, {}}, sampled{true, {}};
   for (uint32_t position = 0; position < kPositions; ++position) {
     greedy.labels.push_back({position, 0.5F, true});
     sampled.labels.push_back({position, 0.5F, false});
   }
   for (uint32_t cycle = 0; cycle < VerifyBudget::kRefitCycles; ++cycle)
-    budget.observe(std::array{greedy, sampled}, false, 10.0);
+    budget.observe(std::array{greedy, sampled});
   const VerifyBudget::Acceptance up = budget.acceptance(false), down = budget.acceptance(true);
   require(up == VerifyBudget::fit(budget.labels(false), VerifyBudget::kPrior) &&
               down == VerifyBudget::fit(budget.labels(true), VerifyBudget::kPrior),
@@ -238,7 +211,7 @@ void policiesFitApart() {
             "a policy's refit did not follow its own lanes at position " + std::to_string(position));
   // Greedy lanes alone: the sampled model stays.
   for (uint32_t cycle = 0; cycle < VerifyBudget::kRefitCycles; ++cycle)
-    budget.observe(std::array{greedy}, false, 10.0);
+    budget.observe(std::array{greedy});
   require(budget.acceptance(true) == down && budget.acceptance(false) != up,
           "a refit of the greedy lanes' labels moved the sampled lanes' model");
 }
@@ -252,7 +225,7 @@ void fitsTheLabels() {
     std::vector<VerifyBudget::Lane> lanes(1 + cycle % VerifyBudget::kLanes);
     for (auto &lane : lanes)
       lane = generator.lane();
-    budget.observe(lanes, cycle % 3 == 0, 50.0);
+    budget.observe(lanes);
   }
   const auto labels = budget.labels(false);
   require(labels.size() == VerifyBudget::kLabels && budget.labels(true).empty(),
@@ -302,138 +275,16 @@ void fitsTheLabels() {
               " against " + std::to_string(cold.intercepts[0]) + ")");
 }
 
-void learnsTheCosts() {
-  VerifyBudget budget;
-  VerifyBudget::Lane lane;
-  const auto cycle = [&](uint32_t lanes, uint32_t rows, bool constrained, double milliseconds) {
-    std::vector<VerifyBudget::Lane> batch(lanes, lane);
-    for (uint32_t i = 0; i < lanes; ++i)
-      batch[i].verifyRows = rows / lanes + (i < rows % lanes ? 1 : 0);
-    budget.observe(batch, constrained, milliseconds);
-  };
-  const auto affine = [](double a, double b) { return [=](uint32_t rows) { return a + b * rows; }; };
-  const auto follows = [&](uint32_t lanes, bool constrained, const auto &time, const char *what) {
-    const auto costs = budget.costs(lanes, constrained);
-    for (uint32_t rows = lanes; rows <= lanes * VerifyBudget::kBlockRows; ++rows)
-      require(std::fabs(costs[rows] - time(rows)) < 0.02 * time(rows),
-              std::string(what) + " at " + std::to_string(rows) + " rows: " + std::to_string(costs[rows]) +
-                  " against " + std::to_string(time(rows)));
-  };
-  // Cycles over spread rows give back their affine time.
-  const auto shallow = affine(20.0, 2.5);
-  for (int repeat = 0; repeat < 40; ++repeat)
-    for (const uint32_t rows : {3U, 6U, 9U, 12U, 16U})
-      cycle(2, rows, false, shallow(rows));
-  follows(2, false, shallow, "the costs missed an affine time");
-  // The latest requests price a row: a steeper time takes over.
-  const auto steep = affine(30.0, 8.0);
-  for (int repeat = 0; repeat < 40; ++repeat)
-    for (const uint32_t rows : {3U, 6U, 9U, 12U, 16U})
-      cycle(2, rows, false, steep(rows));
-  follows(2, false, steep, "the costs kept an older request's price");
-  require(budget.costs(2, true) == VerifyBudget().costs(2, true) &&
-              budget.costs(3, false) == VerifyBudget().costs(3, false),
-          "measured cycles changed another lane count's or kind's costs");
-  // Without a spread of rows, the slope is the seed's at the cycles' level.
-  for (int repeat = 0; repeat < 100; ++repeat)
-    cycle(1, 8, false, 50.0);
-  const auto flat = budget.costs(1, false);
-  for (uint32_t rows = 1; rows <= VerifyBudget::kBlockRows; ++rows) {
-    const double expected = 50.0 * (VerifyBudget::seed(1, 1) + (rows - 1) * (1.0 - VerifyBudget::seed(1, 1)) / 7.0);
-    require(std::fabs(flat[rows] - expected) < 1e-3 * expected, "the costs of unspread rows left the seed's slope");
-  }
-  // A stall counts as at most twice the larger of its fitted price and the
-  // cycles' mean.
-  const auto before = budget.costs(2, false);
-  cycle(2, 9, false, 50.0 * steep(9));
-  const auto after = budget.costs(2, false);
-  require(after[9] < before[9] * 1.04F, "a stall moved the costs by more than its bounded share");
-  // A time that falls with the rows prices every total alike; a negative
-  // intercept leaves the fewest rows positive.
-  for (int repeat = 0; repeat < 60; ++repeat) {
-    cycle(4, 10, true, 50.0);
-    cycle(4, 12, true, 40.0);
-  }
-  const auto falling = budget.costs(4, true);
-  for (uint32_t rows = 4; rows < 32; ++rows)
-    require(falling[rows + 1] == falling[rows] && falling[rows] > 0.0F, "a falling time gave unequal costs");
-  for (int repeat = 0; repeat < 60; ++repeat)
-    for (const uint32_t rows : {16U, 24U, 32U})
-      cycle(4, rows, false, -100.0 + 10.0 * rows);
-  const auto negative = budget.costs(4, false);
-  for (uint32_t rows = 4; rows <= 32; ++rows)
-    require(negative[rows] > 0.0F && (rows == 4 || negative[rows] >= negative[rows - 1]),
-            "a negative intercept gave a cost that is not positive or decreases");
-}
-
-// Two lanes whose proposals each survive 0.75 of the time, over cycles of the
-// seed's shape, verify the total of the most expected tokens per cost, which
-// draft_verify_rows takes: 10 rows in all, so the fit's rows cluster. A stall
-// that doubles the second exploring cycle tilts the fit's line below zero at
-// the anchors; the 64 cycles after it keep at least 0.9 of the tokens per
-// millisecond the cycles of a run without the stall give.
-void stallOverClusteredRows() {
-  constexpr uint32_t kLanes = 2, kEvery = kLanes * VerifyBudget::kBlockRows, kAfter = 64;
-  constexpr double kSurvival = 0.75;
-  const auto time = [](uint32_t rows) { return 50.0 * VerifyBudget::seed(kLanes, rows); };
-  // The anchors, then each lane's next proposal in turn.
-  const auto expected = [&](uint32_t rows) {
-    double tokens = kLanes;
-    for (uint32_t row = kLanes; row < rows; ++row)
-      tokens += std::pow(kSurvival, 1 + (row - kLanes) / kLanes);
-    return tokens;
-  };
-  const auto choice = [&](const auto &cost) {
-    uint32_t best = kLanes;
-    for (uint32_t rows = kLanes + 1; rows <= kEvery; ++rows)
-      if (expected(rows) / cost(rows) > expected(best) / cost(best))
-        best = rows;
-    return best;
-  };
-  require(choice(time) == 10, "the cycles' times did not make 10 rows the best total");
-  const auto tokensPerMillisecond = [&](bool stall) {
-    VerifyBudget budget;
-    VerifyBudget::Lane lane;
-    double tokens = 0.0, milliseconds = 0.0;
-    for (uint32_t explored = 0, after = 0; after < kAfter;) {
-      const auto costs = budget.costs(kLanes, false);
-      const bool explores = budget.explores(kLanes, false);
-      const uint32_t rows = explores ? kEvery : choice([&](uint32_t total) { return double(costs[total]); });
-      const bool second = explores && ++explored == 2;
-      if (explored >= 2 && !second) {
-        ++after;
-        tokens += expected(rows);
-        milliseconds += time(rows);
-      }
-      std::array batch{lane, lane};
-      batch[0].verifyRows = rows - rows / 2;
-      batch[1].verifyRows = rows / 2;
-      budget.observe(batch, false, (stall && second ? 2.0 : 1.0) * time(rows));
-    }
-    return tokens / milliseconds;
-  };
-  const double ratio = tokensPerMillisecond(true) / tokensPerMillisecond(false);
-  require(ratio >= 0.9, "the cycles after a stall gave " + std::to_string(ratio) +
-                            " of the tokens per millisecond of a run without it");
-}
-
 void invalidInputs() {
   VerifyBudget budget;
-  VerifyBudget::Lane lane;
-  lane.verifyRows = 8;
-  rejects([&] { budget.observe({}, false, 1.0); }, "invalid verify budget cycle", "an empty cycle was observed");
+  const VerifyBudget::Lane lane;
+  rejects([&] { budget.observe({}); }, "invalid verify budget cycle", "an empty cycle was observed");
   const std::vector<VerifyBudget::Lane> five(5, lane);
-  rejects([&] { budget.observe(five, false, 1.0); }, "invalid verify budget cycle", "five lanes were observed");
-  for (const uint32_t rows : {0U, 9U}) {
-    VerifyBudget::Lane bad = lane;
-    bad.verifyRows = rows;
-    rejects([&] { budget.observe(std::array{bad}, false, 1.0); }, "invalid verify budget lane",
-            "an impossible lane was observed");
-  }
+  rejects([&] { budget.observe(five); }, "invalid verify budget cycle", "five lanes were observed");
   for (const VerifyBudget::Label &label : {VerifyBudget::Label{kPositions, 0.0F, true}, {0, NAN, true}}) {
     VerifyBudget::Lane bad = lane;
     bad.labels = {label};
-    rejects([&] { budget.observe(std::array{bad}, false, 1.0); }, "invalid verify budget label",
+    rejects([&] { budget.observe(std::array{bad}); }, "invalid verify budget label",
             "an impossible label was observed");
   }
   require(budget.labels(false).empty(), "a refused cycle kept labels");
@@ -450,15 +301,6 @@ void invalidInputs() {
         Tree{two, tokens, scores, std::span(caps).first(1)}, Tree{backwards, tokens, scores, caps}})
     rejects([&] { static_cast<void>(VerifyBudget::treeLabels(ids, rows, pairs, rowCaps, tokens)); },
             "invalid verify budget tree", "an impossible tree was labeled");
-  for (const uint32_t lanes : {0U, 5U}) {
-    rejects([&] { static_cast<void>(budget.costs(lanes, false)); }, "invalid verify budget lane count",
-            "costs of an impossible lane count were given");
-    rejects([&] { static_cast<void>(budget.explores(lanes, false)); }, "invalid verify budget lane count",
-            "exploration of an impossible lane count was given");
-  }
-  for (const auto &[lanes, rows] : {std::pair{2U, 1U}, std::pair{2U, 17U}, std::pair{0U, 0U}})
-    rejects([&] { static_cast<void>(VerifyBudget::seed(lanes, rows)); }, "invalid verify budget rows",
-            "a seed outside a batch's rows was given");
   const std::vector<VerifyBudget::Label> past{{kPositions, 0.0F, true}};
   rejects([&] { static_cast<void>(VerifyBudget::fit(past, VerifyBudget::kPrior)); }, "invalid verify budget label",
           "a label past the proposals was fit");
@@ -598,12 +440,10 @@ void cycleRowsChoice() {
 
 int main() {
   try {
-    priorAndExploration();
+    startsAtThePrior();
     treeLabelsOfAWalk();
     policiesFitApart();
     fitsTheLabels();
-    learnsTheCosts();
-    stallOverClusteredRows();
     invalidInputs();
     cycleRowsChoice();
   } catch (const std::exception &error) {

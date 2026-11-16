@@ -65,14 +65,15 @@ inline bool moe_column_tile(Tiles tiles, uint32_t t) {
 
 // The column tiles of the gate/up and down passes, whose grids the grouping
 // writes (MoeTileCount). A verified grouping (moe_group_routes_verified*) of a
-// decode step of `lanes` lanes routes only the first verify_rows[l] rows of
-// each lane l's rows of the step, lane_rows[l] as the draft selector laid them
-// out on the device (ops::DraftSelector::addVerifyRows), and every row of no
-// lane: the routed routes of a lane's row past them stay out of every tile
-// with the route row ~0u, which the combine skips. The other groupings route
-// every row. Only a streamed grouping, of a step whose passes run around its
-// load, reads the MoE block's slot table (MoeTileCount) and copies it for the
-// passes beside the load.
+// decode step of `lanes` lanes routes only its lanes' rows, lane_rows[l] as
+// the draft selector laid them out on the device
+// (ops::DraftSelector::addVerifyRows), which its lanes verify: the routed
+// routes of a row of no lane stay out of every tile with the route row ~0u,
+// which the combine skips, so that its hidden state, which nothing reads,
+// costs no expert's work, nor on a streamed store an expert's load. The other
+// groupings route every row. Only a streamed grouping, of a step whose passes
+// run around its load, reads the MoE block's slot table (MoeTileCount) and
+// copies it for the passes beside the load.
 struct MoeGroupParams {
   uint32_t rows;
   uint32_t top_k;

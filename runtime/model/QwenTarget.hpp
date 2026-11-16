@@ -286,10 +286,9 @@ struct QwenTargetPrefillBuffers final {
 // buffers, a decode cycle's target forward being the prompt forward over the
 // step's rows (QwenTargetPrefillChunk::decode): the step's lanes and rows
 // (ops::StepRows); the lanes' GDN states before and after the step and their
-// decode tapes (ops::GdnTapeLane); each lane's verify rows, the first of its
-// rows, which alone route a MoE layer (ops::MoeBuffers::verifyRows); the
-// step's rows' places in their lanes' trees (ops::TreeRow), which the GDN and
-// attention layers read; and the rows the draft reads (the captured layers'
+// decode tapes (ops::GdnTapeLane); the step's rows' places in their lanes'
+// trees (ops::TreeRow), which the GDN and attention layers read; and the
+// rows the draft reads (the captured layers'
 // rows), the final norm's rows and the logits of every row of the step. A
 // lane's auxiliary state before the step and its pages' block index are its
 // sequence's (QwenTargetPrefillSequence::auxiliaryIn, indexTable).
@@ -299,7 +298,6 @@ struct QwenTargetDecodeBuffers final {
   std::array<metal::MetalBuffer, ExecutionLimits::maximumBatchWidth> nextGdnStates;
   metal::MetalBuffer gdnTape;
   std::array<ops::GdnTapeLane, ExecutionLimits::maximumBatchWidth> gdnTapeLanes{};
-  metal::MetalBuffer verifyRows;
   metal::MetalBuffer tree;
   metal::MetalBuffer capturedTargetHidden;
   metal::MetalBuffer finalHidden;

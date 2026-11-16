@@ -219,7 +219,6 @@ decodeTensorBytes(const RuntimeGeometry &geometry,
   put(DecodeTensor::RetainedCount, sizeof(uint32_t));
   put(DecodeTensor::RetainedRows, sizeof(uint32_t));
   put(DecodeTensor::AcceptedCount, sizeof(uint32_t));
-  put(DecodeTensor::VerifyRows, sizeof(uint32_t));
   put(DecodeTensor::LaneLayout, sizeof(ops::LaneRows));
   // The draft's own rows: its block's, kDraftRows a lane.
   const uint64_t d = kDraftRows;

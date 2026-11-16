@@ -124,12 +124,10 @@ struct SamplingBuffers final {
   // finished: a count every draw returns to zero, where it starts.
   metal::MetalBuffer vocabularyRanges;
   metal::MetalBuffer vocabularyArrivals;
-  // Each lane's rows of the logits (SplashLaneRows) and how many of them,
-  // from the first, it selects (uint32, its verify rows): a decode step's
-  // proposer writes them (ops::DraftSelector::addVerifyRows), and addInitial
-  // a first token's.
+  // Each lane's rows of the logits (SplashLaneRows), every one of which it
+  // selects: a decode step's proposer writes them
+  // (ops::DraftSelector::addVerifyRows), and addInitial a first token's.
   metal::MetalBuffer laneRows;
-  metal::MetalBuffer verifyRows;
   // What a decode step's sampled verify row tests (metal/abi/Sampling.h):
   // each row's source, the row of its lane's tree it is, the lanes' draft
   // candidates (uint32 [lanes][SPLASH_DRAFT_PROPOSAL_TOKENS]
@@ -153,10 +151,9 @@ struct AcceptanceBuffers final {
   metal::MetalBuffer acceptedCounts;
   // Each lane's retained rows, a mask of its block's (AcceptBatchParams).
   metal::MetalBuffer retainedRows;
-  // Each lane's rows of the step (SplashLaneRows) and its verify rows, the
-  // first of them (ops::DraftSelector::addVerifyRows), which it walks.
+  // Each lane's rows of the step (SplashLaneRows,
+  // ops::DraftSelector::addVerifyRows), which it walks.
   metal::MetalBuffer laneRows;
-  metal::MetalBuffer verifyRows;
 };
 
 // Target token policy (penalties, min-p/top-k/top-p, constrained selection,
@@ -196,9 +193,9 @@ public:
   // a decode step's verify row testing the children its draft drew with the
   // uniforms after (metal/abi/Sampling.h), both among the tokens the lane
   // admits: the first token after a prompt
-  // from each lane's one row of the logits (`rows`), and the verify rows of
-  // each lane of a decode step (`step`, as its proposer laid them out in the
-  // buffers' lane rows and verify rows). Each selected row's token goes to the
+  // from each lane's one row of the logits (`rows`), and the rows of each
+  // lane of a decode step (`step`, as its proposer laid them out in the
+  // buffers' lane rows). Each selected row's token goes to the
   // output tokens at its logits row. A lane's rows from its thinking cutoff on
   // then take the end of thinking. Both run the same kernels (addSelection).
   void addInitial(metal::CommandGraph &graph,
@@ -211,8 +208,8 @@ public:
                  SamplingBuffers buffers, const StepRows &step,
                  const StopTokens &stopTokens,
                  const PenaltyTable &penalties) const;
-  // Each lane's acceptance of its verify rows of a decode step (addVerify's)
-  // as a tree: the path its rows' selections follow from its anchor, of which
+  // Each lane's acceptance of its rows of a decode step (addVerify's) as a
+  // tree: the path its rows' selections follow from its anchor, of which
   // it retains at most maximumRetained[lane] rows (metal/abi/Sampling.h
   // AcceptBatchParams).
   void addAcceptance(metal::CommandGraph &graph, AcceptanceBuffers buffers, const StepRows &step,

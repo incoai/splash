@@ -49,8 +49,9 @@ static_assert(sizeof(NgramEmbeddingParams) == 32,
 // lane l's rows as the step's proposer lays them out (SplashLaneRows,
 // metal/abi/VerifyTree.h), each row's from its token and the ngram - 1 tokens
 // before it on its path, its tree row's parents' and then the tokens before
-// the lane's first row, nearest first (NGRAM_EMBEDDING_NONE for none). The
-// hash mixes the n-grams of 2 to `ngram` tokens, at most
+// the lane's first row, nearest first (NGRAM_EMBEDDING_NONE for none), and a
+// row of no lane's lane 0's anchor's (metal/abi/Sampling.h
+// VerifyRowsParams). The hash mixes the n-grams of 2 to `ngram` tokens, at most
 // NGRAM_EMBEDDING_MAXIMUM_NGRAM, with a multiplier per n-gram position; each
 // n-gram's heads_per_ngram heads take its hash modulo their row counts
 // (`vocabularies`) past their `offsets`.

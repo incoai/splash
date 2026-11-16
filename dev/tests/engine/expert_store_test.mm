@@ -5,7 +5,8 @@
 // do, their slots holding the reference repack's planes, in as many rounds as
 // the staging needs, and read ahead the next round's experts or the next
 // block's a long chunk routes or a load of a decode cycle's rows at most
-// predicts, a decode step's from its lanes' verify blocks; a decode step's
+// predicts, a decode step's from its lanes' rows, also where they hold fewer
+// rows than the step; a decode step's
 // experts outlive long chunks of other blocks; the union of a block's steps
 // loads at once, the steps sharing their expert passes' scratch as a prefill
 // group's chunks do; a size of one block holds every expert, through a release
@@ -118,20 +119,28 @@ constexpr uint64_t kSpareBytes = 4096;
 constexpr uint32_t kLaneRows = splash::model::ExecutionLimits::targetVerifyRows;
 
 // A step a block runs: the plan of its rows and, of a decode step, its
-// lanes, whose rows, every row verified (ops::MoeBuffers::lanes), make its
+// lanes, whose rows (ops::MoeBuffers::lanes), which alone route, make its
 // loads a decode step's; a prefill chunk has none.
 struct StepPlan final {
   MoePlan plan;
   uint32_t lanes = 0;
-  // Each lane's rows of the step, from row lane x laneRows.
+  // Each lane's rows of the step.
   std::array<SplashLaneRows, splash::model::ExecutionLimits::maximumBatchWidth> blocks{};
-  uint32_t laneRows = 0;
 };
 
 // A decode step of `lanes` lanes of `laneRows` rows each, on 8-row tiles.
 StepPlan decodeStep(const MoeShape &shape, uint32_t lanes, uint32_t laneRows = kLaneRows) {
-  StepPlan step{MoE::plan(shape, lanes * laneRows, MoeConfig{}), lanes, {}, laneRows};
+  StepPlan step{MoE::plan(shape, lanes * laneRows, MoeConfig{}), lanes, {}};
   for (uint32_t lane = 0; lane < lanes; ++lane) step.blocks[lane] = {lane * laneRows, laneRows};
+  return step;
+}
+
+// A decode step of 16 rows whose two lanes hold 5 and 3 of them, its other 8
+// rows of no lane (VerifyRowsParams), which route no expert.
+StepPlan shortLanesStep(const MoeShape &shape) {
+  StepPlan step{MoE::plan(shape, 16, MoeConfig{}), 2, {}};
+  step.blocks[0] = {0, 5};
+  step.blocks[1] = {5, 3};
   return step;
 }
 
@@ -210,6 +219,12 @@ void growToCap(ExpertStore &store) {
     require(static_cast<bool>(store.growTowardCap(splash::test::admitAll)), "a store's growth to its cap was refused");
 }
 
+// Whether a load of `rows` rows is a long chunk's (ExpertStore.cpp's
+// kLongChunkRoutes), which reads every expert of its next block ahead.
+bool longChunk(const MoeShape &shape, uint32_t rows) {
+  return uint64_t{rows} * shape.expertsPerToken >= 3ULL * shape.experts;
+}
+
 // The host steps of a load of `rows` rows, a round each: the staging places
 // the experts of a block a decode cycle's rows may route, and at least two; a
 // load of at most a cycle's rows, which they hold, stages them all in one
@@ -222,8 +237,7 @@ uint32_t loadSteps(const MoeShape &shape, uint32_t rows, bool nextStreams) {
       std::max<uint64_t>(2, std::min<uint64_t>(shape.experts, uint64_t{cycleRows} * shape.expertsPerToken));
   const uint64_t routable = std::min<uint64_t>(shape.experts, uint64_t{rows} * shape.expertsPerToken);
   const uint64_t perRound = rows <= cycleRows ? places : places / 2;
-  const bool longChunk = uint64_t{rows} * shape.expertsPerToken >= 3ULL * shape.experts;
-  return static_cast<uint32_t>((routable + perRound - 1) / perRound) + (longChunk && nextStreams);
+  return static_cast<uint32_t>((routable + perRound - 1) / perRound) + (longChunk(shape, rows) && nextStreams);
 }
 
 // A step's rows of input and residual and its output, fresh.
@@ -235,16 +249,12 @@ void freshRows(MetalBackend &backend, Buffers &b, const MoeShape &shape) {
   b.moe.output = zeros(backend, uint64_t{kMaximumRows} * shape.hiddenSize * 2, "moe-output");
 }
 
-// A step's buffers routing its decode lanes' rows, every row of each, or
-// none.
+// A step's buffers routing its decode lanes' rows, or none.
 void verifyLanes(MetalBackend &backend, Buffers &b, const StepPlan &step) {
-  const std::vector<uint32_t> verify(step.blocks.size(), step.laneRows);
   b.moe.lanes = step.lanes;
   b.moe.laneRows =
       step.lanes ? upload(backend, step.blocks.data(), step.blocks.size() * sizeof(SplashLaneRows), "lane-rows")
                  : MetalBuffer{};
-  b.moe.verifyRows =
-      step.lanes ? upload(backend, verify.data(), verify.size() * sizeof(uint32_t), "verify-rows") : MetalBuffer{};
 }
 
 // The output rows of one MoE dispatch of `weights` over the first rows of a
@@ -272,15 +282,24 @@ std::pair<uint32_t, uint32_t> chunkOf(const splash::ops::ExpertChunks &chunks, u
 }
 
 // Every expert the last dispatch routed holds its slot's planes, in the
-// slot's chunk, as the reference repacked them.
+// slot's chunk, as the reference repacked them: those of every row of a
+// prompt chunk, and of a decode step's lanes' rows (b.moe.laneRows), a row
+// of no lane routing none.
 bool slotsHoldTheirExperts(const Model &m, const BlockMoeWeights &streamed, const Buffers &b, const MoePlan &plan) {
   const auto *selected = static_cast<const uint32_t *>(b.moe.scratch.selectedExperts.contents());
   const auto *table = static_cast<const uint32_t *>(streamed.slotTable.contents());
   const std::vector<MetalBuffer> &chunks = *streamed.chunks.planes();
   const BlockExpertProjection *resident[] = {&m.weights.gate, &m.weights.up, &m.weights.down};
+  const auto *lanes = b.moe.lanes ? static_cast<const SplashLaneRows *>(b.moe.laneRows.contents()) : nullptr;
+  const auto routed = [&](uint64_t row) {
+    bool laid = !lanes;
+    for (uint32_t lane = 0; lane < b.moe.lanes; ++lane)
+      laid = laid || (row >= lanes[lane].first && row < uint64_t{lanes[lane].first} + lanes[lane].rows);
+    return laid;
+  };
   for (uint64_t route = 0; route < uint64_t{plan.rows()} * m.shape.routesPerToken(); ++route) {
     const uint32_t expert = selected[route];
-    if (expert >= m.shape.experts) continue;
+    if (expert >= m.shape.experts || !routed(route / m.shape.routesPerToken())) continue;
     const auto [chunk, local] = chunkOf(streamed.chunks, table[expert]);
     for (size_t p = 0; p < 3; ++p) {
       const QuantizedSegment &experts = resident[p]->routed;
@@ -317,16 +336,17 @@ int streamedExperts(MetalBackend &backend, const MoeShape &shape, const std::fil
     for (uint32_t block = 0; block < 2; ++block) store.bind(block, streamed[block]);
     Buffers b;
     const int before = failures;
-    // Decode steps of one to four lanes and prefill chunks of fresh rows, the
-    // two blocks taking turns, so each block's load evicts the other's
-    // experts; the long chunks' first blocks read the second's ahead, and the
-    // first blocks of steps of at most a cycle's rows (9 and 27) predict it. A
-    // decode step's blocks read the same rows, so the first block (the first
-    // layer) predicts the second's routes exactly (both have the same router)
-    // and reads them ahead.
+    // Decode steps of one to four lanes, and of lanes that hold fewer rows
+    // than their step, and prefill chunks of fresh rows, the two blocks
+    // taking turns, so each block's load evicts the other's experts; the long
+    // chunks' first blocks read the second's ahead, and the first blocks of
+    // steps of at most a cycle's rows (9 and 27) predict it. A decode step's
+    // blocks read the same rows, so the first block (the first layer)
+    // predicts the second's routes exactly (both have the same router) and
+    // reads them ahead.
     const StepPlan plans[] = {decodeStep(shape, 1), decodeStep(shape, 4), prefillStep(shape, 27),
                               prefillStep(shape, kMaximumRows), decodeStep(shape, 3), prefillStep(shape, 9),
-                              decodeStep(shape, 2), prefillStep(shape, 64)};
+                              shortLanesStep(shape), decodeStep(shape, 2), prefillStep(shape, 64)};
     uint32_t index = 0;
     std::array<uint64_t, 2> rounds{};
     for (const StepPlan &step : plans)
@@ -356,9 +376,15 @@ int streamedExperts(MetalBackend &backend, const MoeShape &shape, const std::fil
     }
     const ExpertStoreStats::Use &prefill = stats.uses[0], &decode = stats.uses[1];
     decodePrefetched += decode.prefetched;
+    // A decode step's prediction names exactly the experts its next block's
+    // load routes, a row of no lane's none (a prompt chunk's next block reads
+    // fresh rows): where no decode step is a long chunk's, every expert a
+    // decode step read ahead whole, that load found read ahead.
+    const bool predictsAlone = !longChunk(shape, 4 * kLaneRows);
     if (loads != index || read <= stats.slots || stats.resident > stats.slots || routed < read || !prefill.loads ||
         !decode.loads || !prefill.prefetched || prefill.prefetched > prefill.read || decode.prefetched > decode.read ||
-        prefill.readAhead < prefill.prefetched || decode.readAhead < decode.prefetched || !stats.failure.empty()) {
+        prefill.readAhead < prefill.prefetched || decode.readAhead < decode.prefetched ||
+        (predictsAlone && decode.readAhead != decode.prefetched) || !stats.failure.empty()) {
       printf("  %s: %llu loads routed %llu experts and read %llu (ahead: prefill %llu of %llu, decode %llu of %llu) "
              "into %llu slots%s%s FAIL\n",
              formats.c_str(), (unsigned long long)loads, (unsigned long long)routed, (unsigned long long)read,

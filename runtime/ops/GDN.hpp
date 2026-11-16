@@ -129,7 +129,8 @@ struct GdnDecodeBuffers final {
   // Each lane's block of the step's `rows` rows (SplashLaneRows: its first
   // row and rows, ascending, not overlapping), which the step's proposer
   // writes on the device: its rows of the packed, hidden, table and tree
-  // rows, 1 to `laneCap` of them (verifyLaneCap).
+  // rows, 1 to `laneCap` of them (verifyLaneCap). A row of no lane
+  // (VerifyRowsParams) it leaves alone.
   metal::MetalBuffer laneRows;
   uint32_t rows = 0;
   uint32_t laneCap = 0;
@@ -137,9 +138,6 @@ struct GdnDecodeBuffers final {
   metal::MetalBuffer timeBias;
   NormWeights mixerNorm;
   metal::MetalBuffer hidden;
-  // Each lane's verify rows (ops::DraftSelector::addVerifyRows): its block's
-  // rows past them get zero recurrent output.
-  metal::MetalBuffer verifyRows;
   // The step's rows' places in their blocks' trees (SplashTreeRow, a row of
   // the step's rows each): a chain's rows run the sequential recurrence,
   // another tree's rows each read the state before the block along their

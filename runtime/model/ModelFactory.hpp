@@ -112,13 +112,6 @@ enum class VerifyRows : uint8_t {
   All,
 };
 
-// Whether the decode cycles of `model` verify the rows the verify budget
-// chooses (model::VerifyBudget, ops::DraftSelector::addVerifyRows) under
-// `rows`. Each row a MoE target verifies routes its own experts, which a
-// rejected row reads for nothing; a dense target reads its weights once for
-// all of a cycle's rows.
-[[nodiscard]] bool budgetsVerifyRows(const LoadedModel &model, VerifyRows rows) noexcept;
-
 // Model execution resources, which the engine assembles. What a request's
 // start allocates is admitted through the state storage.
 struct RuntimeContext final {

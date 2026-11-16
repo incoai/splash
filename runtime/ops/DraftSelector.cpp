@@ -59,7 +59,6 @@ void DraftSelector::add(metal::CommandGraph &graph, const DraftSelectorBuffers &
     edges.anchor[lane] = tree.anchor[lane] = l.anchor;
     tree.depth[lane] = l.depth;
     tree.chain[lane] = l.chain;
-    tree.forced[lane] = l.forced;
     tree.children[lane] = l.children;
     tree.slope[lane] = l.calibration.slope;
     std::ranges::copy(l.calibration.intercepts, tree.intercept[lane]);
@@ -112,24 +111,9 @@ void DraftSelector::add(metal::CommandGraph &graph, const DraftSelectorBuffers &
 }
 
 void DraftSelector::addVerifyRows(metal::CommandGraph &graph, const DraftSelectorBuffers &buffers,
-                                  const StepRows &step, std::span<const float> costs) {
+                                  const StepRows &step) {
   requireStepRows(step);
-  VerifyRowsParams params{};
-  params.lanes = step.lanes;
-  params.rows = step.rows;
-  params.lane_cap = step.laneCap;
-  params.every_row = costs.empty() ? 1 : 0;
-  // The costs of every total the lanes may verify, from their anchors to the
-  // step's rows.
-  if (!costs.empty()) {
-    if (costs.size() <= step.rows)
-      throw std::invalid_argument("invalid draft verify rows cost");
-    for (uint32_t total = step.lanes; total <= step.rows; ++total) {
-      if (!(std::isfinite(costs[total]) && costs[total] > 0.0F))
-        throw std::invalid_argument("invalid draft verify rows cost");
-      params.cost[total] = costs[total];
-    }
-  }
+  const VerifyRowsParams params{step.lanes, step.rows, step.laneCap};
   // It reads each lane's tree and writes the step's rows.
   const uint64_t treeRows = uint64_t{step.lanes} * SPLASH_TARGET_VERIFY_ROWS;
   requireBytes(buffers.treeTokens, treeRows * sizeof(uint32_t), "draft tree token");
@@ -139,11 +123,10 @@ void DraftSelector::addVerifyRows(metal::CommandGraph &graph, const DraftSelecto
   requireBytes(buffers.inputTokens, uint64_t{step.rows} * sizeof(uint32_t), "verify input token");
   requireBytes(buffers.treeRows, uint64_t{step.rows} * sizeof(TreeRow), "verify tree row");
   requireBytes(buffers.laneRows, uint64_t{step.lanes} * sizeof(LaneRows), "verify lane rows");
-  requireBytes(buffers.verifyRows, uint64_t{step.lanes} * sizeof(uint32_t), "verify rows");
   requireBytes(buffers.verifySources, uint64_t{step.rows} * sizeof(uint32_t), "verify source");
   graph.add("draft_verify_rows",
             {buffers.treeTokens, buffers.trees, buffers.treeScores, buffers.treeSizes, buffers.inputTokens,
-             buffers.treeRows, buffers.laneRows, buffers.verifyRows, buffers.verifySources},
+             buffers.treeRows, buffers.laneRows, buffers.verifySources},
             params, {1, 1, 1}, {1, 1, 1});
 }
 

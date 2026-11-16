@@ -780,8 +780,8 @@ struct ModelTelemetry final {
   // work for them failed (Runtime::prefillAsync).
   uint64_t aneFfnReruns = 0;
   // Whether a verify budget learns the estimates by which decode cycles take
-  // their trees' rows, and on a MoE target cuts them (--verify-rows auto),
-  // rather than none learning (--verify-rows all).
+  // their trees' rows (--verify-rows auto), rather than none learning
+  // (--verify-rows all).
   bool verifyBudget = false;
   double lastConstrainedTargetForwardGpuSeconds = 0.0;
   double totalConstrainedTargetForwardGpuSeconds = 0.0;

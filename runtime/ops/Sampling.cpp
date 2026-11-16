@@ -165,7 +165,7 @@ void Sampling::addPenalties(metal::CommandGraph &graph, const SamplingBuffers &b
   if (!params.entries)
     return;
   graph.add("decode_sample_penalize",
-            {buffers.logits, table.words, buffers.inputTokens, buffers.treeRows, buffers.laneRows, buffers.verifyRows},
+            {buffers.logits, table.words, buffers.inputTokens, buffers.treeRows, buffers.laneRows},
             params, {(vocabulary_ + kPenaltyThreads - 1) / kPenaltyThreads, params.entries, 1},
             {kPenaltyThreads, 1, 1});
 }
@@ -190,8 +190,7 @@ void Sampling::addInitial(metal::CommandGraph &graph,
   const SamplingPenaltyParams penalized = penaltyParams(policies, buffers, penalties, selected);
   // Each lane's one row is its tree's root.
   requireBytes(buffers.treeRows, end * sizeof(TreeRow), "verify tree row");
-  graph.add("decode_sample_first_rows", {buffers.laneRows, buffers.verifyRows, buffers.treeRows}, first,
-            {lanes, 1, 1}, {1, 1, 1});
+  graph.add("decode_sample_first_rows", {buffers.laneRows, buffers.treeRows}, first, {lanes, 1, 1}, {1, 1, 1});
   addPenalties(graph, buffers, penalties, penalized);
   addSelection(graph, params, policies, buffers, selected);
 }
@@ -261,7 +260,6 @@ TargetSamplingParams Sampling::selection(std::span<const SamplingPolicy> policie
   requireBytes(buffers.constraintMasks, maskEnd * sizeof(uint32_t), "constraint mask");
   requireBytes(buffers.outputTokens, end * sizeof(uint32_t), "sampled token");
   requireBytes(buffers.laneRows, uint64_t{lanes} * sizeof(LaneRows), "sampling lane rows");
-  requireBytes(buffers.verifyRows, uint64_t{lanes} * sizeof(uint32_t), "sampling verify rows");
   requireBytes(buffers.argmaxValues, greedy.argmaxValuesBytes, "argmax value");
   requireBytes(buffers.argmaxIndices, greedy.argmaxIndicesBytes, "argmax index");
   requireBytes(buffers.partialMasses, sampled.partialMassesBytes, "sampling mass");
@@ -287,32 +285,30 @@ void Sampling::addSelection(metal::CommandGraph &graph, const TargetSamplingPara
                             const TargetRows &rows) const {
   // Greedy and sampled lanes run their own kernels, each over a grid of a
   // lane's rows by lanes; the groups of the other kind's lanes, and those
-  // past a lane's verify rows, return at once.
+  // past a lane's rows, return at once.
   const uint32_t lanes = static_cast<uint32_t>(policies.size());
   const uint32_t most = rows.laneCap;
   if (params.sampling_mask != (uint32_t{1} << lanes) - 1) {
     graph.add("decode_sample_argmax_sharded",
               {buffers.logits, buffers.constraintMasks, buffers.argmaxValues, buffers.argmaxIndices,
-               buffers.laneRows, buffers.verifyRows},
+               buffers.laneRows},
               params, {most * kTargetShards, lanes, 1});
     graph.add("decode_sample_argmax_reduce",
-              {buffers.argmaxValues, buffers.argmaxIndices, buffers.outputTokens, buffers.laneRows,
-               buffers.verifyRows},
-              params, {most, lanes, 1}, {32, 1, 1});
+              {buffers.argmaxValues, buffers.argmaxIndices, buffers.outputTokens, buffers.laneRows}, params,
+              {most, lanes, 1}, {32, 1, 1});
   }
   if (params.sampling_mask) {
     graph.add("decode_sample_mass_sharded",
-              {buffers.logits, buffers.constraintMasks, buffers.partialMasses, buffers.laneRows, buffers.verifyRows},
-              params, {most * kTargetShards, lanes, 1});
+              {buffers.logits, buffers.constraintMasks, buffers.partialMasses, buffers.laneRows}, params,
+              {most * kTargetShards, lanes, 1});
     graph.add("decode_sample_vocabulary_search",
               {buffers.logits, buffers.constraintMasks, buffers.partialMasses, buffers.vocabularyRows,
-               buffers.laneRows, buffers.verifyRows},
+               buffers.laneRows},
               params, {most, lanes, 1}, {kVocabularyThreads, 1, 1});
     graph.add("decode_sample_vocabulary_draw",
               {buffers.logits, buffers.constraintMasks, buffers.vocabularyRows, buffers.uniforms,
                buffers.outputTokens, buffers.vocabularyRanges, buffers.vocabularyArrivals, buffers.laneRows,
-               buffers.verifyRows, buffers.treeRows, buffers.verifySources, buffers.candidates, buffers.treeDraws,
-               buffers.treeNext},
+               buffers.treeRows, buffers.verifySources, buffers.candidates, buffers.treeDraws, buffers.treeNext},
               params, {most * kVocabularyGroups, lanes, 1}, {kVocabularyThreads, 1, 1});
   }
   // Only a selection that reaches a lane's thinking cutoff dispatches it.
@@ -327,8 +323,7 @@ void Sampling::addSelection(metal::CommandGraph &graph, const TargetSamplingPara
     requireBytes(buffers.treeRows, rows.end * sizeof(TreeRow), "verify tree row");
   }
   graph.add("decode_sample_thinking_cutoff",
-            {buffers.inputTokens, buffers.constraintMasks, buffers.treeRows, buffers.outputTokens, buffers.laneRows,
-             buffers.verifyRows},
+            {buffers.inputTokens, buffers.constraintMasks, buffers.treeRows, buffers.outputTokens, buffers.laneRows},
             cutoffs.params, {lanes, 1, 1}, {1, 1, 1});
 }
 
@@ -340,7 +335,7 @@ void Sampling::addAcceptance(metal::CommandGraph &graph, AcceptanceBuffers buffe
   const uint32_t lanes = step.lanes;
   AcceptBatchParams params{};
   std::ranges::copy(stopTokens.ids, params.stop_tokens);
-  // A lane retains at most its verify rows.
+  // A lane retains at most its rows.
   for (uint32_t lane = 0; lane < lanes; ++lane) {
     if (!maximumRetained[lane] || maximumRetained[lane] > step.laneCap)
       throw std::invalid_argument("invalid DFlash retention limit");
@@ -355,10 +350,9 @@ void Sampling::addAcceptance(metal::CommandGraph &graph, AcceptanceBuffers buffe
   requireBytes(buffers.acceptedCounts, lanes * sizeof(uint32_t), "accepted count");
   requireBytes(buffers.retainedRows, lanes * sizeof(uint32_t), "retained rows");
   requireBytes(buffers.laneRows, lanes * sizeof(LaneRows), "lane rows");
-  requireBytes(buffers.verifyRows, lanes * sizeof(uint32_t), "verify rows");
   graph.add("decode_accept_tree",
             {buffers.inputTokens, buffers.treeRows, buffers.outputTokens, buffers.retainedCounts,
-             buffers.acceptedCounts, buffers.retainedRows, buffers.laneRows, buffers.verifyRows},
+             buffers.acceptedCounts, buffers.retainedRows, buffers.laneRows},
             params, {lanes, 1, 1}, {1, 1, 1});
 }
 

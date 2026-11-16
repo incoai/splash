@@ -4242,22 +4242,102 @@ void requireMixedStepMatchesLanesAlone(model::Runtime &executor, std::span<const
   std::cout << "mixed_step_matches_lanes_alone=PASS\n";
 }
 
-// Under --verify-rows auto a MoE target's decode cycles verify the rows its
-// verify budget chooses, which follow the wall times and acceptance of the
-// cycles before them, so that runs need not repeat one another. Each cycle of
-// lanes decoded together must be well formed all the same: no lane fails;
-// each verifies its anchor and at most the rows its output budget leaves,
-// every one of them in the cycles the budget explores (each
-// kExploreCycles-th of a lane count and kind); drafts the proposals past its
-// anchor that it verified, accepts no more of them, and commits the rows it
-// retained, no more than it verified. Greedy and sampled lanes decode for
-// more cycles than the budget's refit period, one of them ending at its
-// output budget within its first cycles, then constrained lanes, whose
-// cycles the budget prices apart.
+// A step whose lanes' trees hold fewer rows than it leaves its rows past
+// theirs to no lane, which no kernel reads: three sampled lanes at a low
+// temperature, whose draft rows each draw one child (the others' weights
+// underflow), and output budgets of 6 tokens, which hold a tree to 6 rows, in
+// a forced step of 8 rows a lane. Each lane holds the rows its tree grew, as
+// a step of exactly the lanes' rows lays them out from the same states,
+// commits a well formed cycle, and its rows' logits are within `bound`
+// (cosine) of that step's, whose projections' tiles hold other rows.
+void requireRowsOfNoLane(model::Runtime &executor, std::span<const uint32_t> seed, uint32_t vocabulary,
+                         double bound) {
+  constexpr uint32_t kLanes = 3, kOutput = 6, kStepRows = 8 * kLanes;
+  struct Lane final {
+    EngineRequest request;
+    std::vector<uint32_t> pages;
+  };
+  std::array<Lane, kLanes> lanes;
+  for (uint32_t index = 0; index < kLanes; ++index) {
+    Lane &lane = lanes[index];
+    std::vector<uint32_t> prompt(36 + 11 * index);
+    for (uint32_t at = 0; at < prompt.size(); ++at) prompt[at] = seed[(at + 5 * index) % seed.size()];
+    lane.request = makeRequest(0, std::move(prompt), kOutput);
+    lane.request.flags = RequestIgnoreEndOfSequence;
+    lane.request.sampling = {.temperature = 0.05F, .topP = 1.0F, .topK = 0, .seed = 5303 + index};
+    lane.pages = pageRange(100 + 4 * index, 4);
+  }
+  // The lanes in one forced step of `rows` rows, each request an id of its
+  // own from `firstId`: each lane's rows and their raw logits.
+  struct Step final {
+    std::array<uint32_t, kLanes> rows{};
+    std::vector<std::vector<float>> logits;
+  };
+  const auto decode = [&](uint64_t firstId, uint32_t rows) {
+    BatchPlan plan{.kind = WorkKind::Decode, .decodeStage = DecodeStage::Regular};
+    std::vector<ModelBatchItem> items;
+    for (uint32_t index = 0; index < kLanes; ++index) {
+      Lane &lane = lanes[index];
+      lane.request.id = firstId + index;
+      beginCold(executor, lane.request, index);
+      requireOpen(prefillChunk(executor, lane.request.id, 0, lane.request.prompt, lane.pages), "rows of no lane");
+      plan.items.push_back({lane.request.id, 0});
+      items.push_back(withRevision({lane.request.id, lane.request.prompt.size(), 0, lane.pages}));
+    }
+    model::RuntimeInstrumentation::forceStepRows(executor, rows);
+    model::RuntimeInstrumentation::captureTargetLogits(executor, true);
+    static_cast<void>(model::RuntimeInstrumentation::takeTargetLogits(executor));
+    const std::vector<ModelStepResult> results = executor.decode(plan, items);
+    model::RuntimeInstrumentation::captureTargetLogits(executor, false);
+    model::RuntimeInstrumentation::forceStepRows(executor, std::nullopt);
+    require(results.size() == kLanes, "rows of no lane: a step lost a lane");
+    Step step;
+    for (uint32_t index = 0; index < kLanes; ++index) {
+      const ModelStepResult &result = results[index];
+      step.rows[index] = model::RuntimeInstrumentation::lastVerifyRows(executor, index);
+      require(result.failure.empty() && !result.outputTokens.empty() && result.outputTokens.size() <= kOutput &&
+                  step.rows[index] <= kOutput,
+              "rows of no lane: lane " + std::to_string(index) + " of a step of " + std::to_string(rows) +
+                  " rows held " + std::to_string(step.rows[index]) + " and committed " +
+                  std::to_string(result.outputTokens.size()) + " tokens");
+      executor.end(lanes[index].request.id);
+    }
+    step.logits = model::RuntimeInstrumentation::takeTargetLogits(executor);
+    require(step.logits.size() == kLanes, "rows of no lane: a step copied no logits");
+    return step;
+  };
+  const Step wide = decode(1200, kStepRows);
+  const uint32_t held = std::accumulate(wide.rows.begin(), wide.rows.end(), 0U);
+  const Step exact = decode(1210, held);
+  double least = 1.0;
+  for (uint32_t index = 0; index < kLanes; ++index) {
+    require(exact.rows[index] == wide.rows[index], "rows of no lane: a lane held other rows in a step of its rows");
+    for (uint32_t row = 0; row < wide.rows[index]; ++row) {
+      SimilarityAccumulator accumulator;
+      for (uint64_t at = uint64_t{row} * vocabulary; at < uint64_t{row + 1} * vocabulary; ++at)
+        accumulator.add(wide.logits[index][at], exact.logits[index][at]);
+      least = std::min(least, accumulator.result().cosine);
+    }
+  }
+  std::cout << "rows_of_no_lane held=" << held << " of " << kStepRows << " least_cosine=" << least << '\n';
+  require(least > bound, "rows of no lane: a lane's logits are at cosine " + std::to_string(least) +
+                             " of a step of exactly the lanes' rows");
+  std::cout << "rows_of_no_lane=PASS\n";
+}
+
+// Under --verify-rows auto every target's decode cycles take their trees'
+// rows by the estimates the verify budget learns from the cycles before them,
+// so that runs need not repeat one another. Each cycle of lanes decoded
+// together must be well formed all the same: no lane fails; each verifies its
+// anchor and the rows of a draft's block its output budget leaves, every row
+// its tree fills; drafts the proposals past its anchor that it verified,
+// accepts no more of them, and commits the rows it retained, no more than it
+// verified. Greedy and sampled lanes decode for more cycles than the
+// budget's refit period, one of them ending at its output budget within its
+// first cycles, then constrained lanes.
 void requireBudgetedCyclesAreWellFormed(model::Runtime &executor, const model::QwenStateStorage &states,
                                         std::span<const uint32_t> seed) {
   constexpr uint32_t kRows = model::ExecutionLimits::draftQueryRows;
-  constexpr uint32_t kExplore = model::VerifyBudget::kExploreCycles;
   constexpr uint32_t kCycles = model::VerifyBudget::kRefitCycles + 1;
   struct Lane final {
     EngineRequest request;
@@ -4266,8 +4346,6 @@ void requireBudgetedCyclesAreWellFormed(model::Runtime &executor, const model::Q
     std::vector<uint32_t> tokens;
     bool finished = false;
   };
-  // Each lane count's cycles of each kind so far, as the budget counts them.
-  std::array<std::array<uint32_t, model::ExecutionLimits::maximumBatchWidth>, 2> counted{};
   uint64_t laneCycles = 0, verifiedRows = 0;
   const auto decode = [&](std::vector<Lane> &lanes, uint32_t cycles) {
     for (uint32_t cycle = 0; cycle < cycles; ++cycle) {
@@ -4297,7 +4375,6 @@ void requireBudgetedCyclesAreWellFormed(model::Runtime &executor, const model::Q
         results = executor.decode(plan, items);
       }
       require(results.size() == active.size(), "a budgeted cycle lost a lane");
-      const bool explores = counted[constrained][active.size() - 1]++ % kExplore == kExplore - 1;
       for (uint32_t index = 0; index < active.size(); ++index) {
         Lane &lane = *active[index];
         const ModelStepResult &result = results[index];
@@ -4306,8 +4383,8 @@ void requireBudgetedCyclesAreWellFormed(model::Runtime &executor, const model::Q
         const uint32_t rows = model::RuntimeInstrumentation::lastVerifyRows(executor, index);
         const size_t retained = result.outputTokens.size() - result.outputTokensWithoutKv;
         require(result.failure.empty(), "a budgeted cycle failed a lane: " + result.failure);
-        require(rows >= 1 && rows <= room && (rows == room || !explores),
-                "a budgeted cycle verified rows its lane's output budget does not leave");
+        require(rows == room, "a budgeted cycle verified " + std::to_string(rows) + " rows of a lane whose tree " +
+                                  "fills " + std::to_string(room));
         require(result.draftedTokens == rows - 1 && result.acceptedDraftTokens <= result.draftedTokens &&
                     retained >= 1 && retained <= rows && result.outputTokens.size() <= remaining &&
                     states.metadata(lane.stateLane).lengths.targetTokens == items[index].logicalPosition + retained,
@@ -4346,8 +4423,7 @@ void requireBudgetedCyclesAreWellFormed(model::Runtime &executor, const model::Q
     begin(lane);
   }
   decode(lanes, kCycles);
-  require(lanes[3].tokens.size() == 12 && counted[0][2] >= kExplore,
-          "the budgeted lanes did not reach the cycles the check needs");
+  require(lanes[3].tokens.size() == 12, "the budgeted lanes did not reach the cycles the check needs");
   for (const Lane &lane : lanes)
     executor.end(lane.request.id);
 
@@ -5840,6 +5916,7 @@ int main(int argc, char **argv) {
     // alone keep a cosine of 0.988 to their rows in the step of 42 rows.
     requireMixedStepMatchesLanesAlone(executor, samplingSeedTokens, model.descriptor.capabilities.vocabularySize,
                                       sparseMoe ? 0.98 : bound);
+    requireRowsOfNoLane(executor, samplingSeedTokens, model.descriptor.capabilities.vocabularySize, bound);
 
     // A reusable composite state contains no final hidden. A fresh
     // consumer must replay at least one complete input token; that replay
@@ -7652,19 +7729,15 @@ int main(int argc, char **argv) {
               << (aneFfn && aneFfn->retired() ? " ane_ffn_stopped=" + aneFfn->reason() : std::string()) << '\n';
     require(!aneFfnFault || (aneFfn && aneFfn->retired() && historicalTelemetry.aneFfnReruns == 1),
             "an armed fault did not stop the split once");
-    // The verify budget's cut, on a MoE target's runtime of its own
-    // (--verify-rows auto) admitted in the main one's place. A dense
-    // target's budget cuts no rows (budgetsVerifyRows).
-    if (sparseMoe) {
-      runtime.reset();
-      context.verifyRows = model::VerifyRows::Auto;
-      const metal::AllocationResult budgetArenas =
-          governedFor(governor, "the budgeted runtime's arenas")(arenaBytes, [&] { runtime.emplace(context); });
-      require(static_cast<bool>(budgetArenas), "the budgeted runtime's arenas exceed the oracle Metal budget");
-      requireBudgetedCyclesAreWellFormed(*runtime, states, samplingSeedTokens);
-    } else {
-      std::cout << "budgeted_cycles=SKIP (a dense target verifies every row; its verify budget cuts none)\n";
-    }
+    // The verify budget's cycles, on a runtime of their own (--verify-rows
+    // auto) admitted in the main one's place.
+    runtime.reset();
+    context.verifyRows = model::VerifyRows::Auto;
+    const metal::AllocationResult budgetArenas =
+        governedFor(governor, "the budgeted runtime's arenas")(arenaBytes, [&] { runtime.emplace(context); });
+    require(static_cast<bool>(budgetArenas), "the budgeted runtime's arenas exceed the oracle Metal budget");
+    requireBudgetedCyclesAreWellFormed(*runtime, states, samplingSeedTokens);
+    requireRowsOfNoLane(*runtime, samplingSeedTokens, model.descriptor.capabilities.vocabularySize, bound);
     std::cout << "model_runtime_oracle_test: PASS\n";
     return 0;
   } catch (const std::exception &error) {

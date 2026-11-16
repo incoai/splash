@@ -146,19 +146,19 @@ StepRows blockStep(size_t lanes) {
 }
 
 // Lanes' rows `rows` of a step, as its proposer lays them out on the device
-// in `buffers` (their lane rows and verify rows), each lane verifying its
-// rows or the first verified[lane] of them; the step of them.
-StepRows layOut(const SamplingBuffers &buffers, std::span<const LaneRows> rows,
-                std::span<const uint32_t> verified = {}) {
+// in `buffers` (their lane rows), each lane verifying every one of its rows;
+// the step of them: its rows to the last lane's end, those in no lane's of no
+// lane, at the lane cap a step of so many rows takes (verifyLaneCap), or a
+// verify block's where a lane holds more rows than a draft's block.
+StepRows layOut(const SamplingBuffers &buffers, std::span<const LaneRows> rows) {
   auto *laneRows = static_cast<LaneRows *>(buffers.laneRows.contents());
-  auto *verifyRows = static_cast<uint32_t *>(buffers.verifyRows.contents());
-  uint32_t cap = 0;
+  uint32_t most = 0;
   for (uint32_t lane = 0; lane < rows.size(); ++lane) {
     laneRows[lane] = rows[lane];
-    verifyRows[lane] = verified.empty() ? rows[lane].rows : verified[lane];
-    cap = std::max(cap, rows[lane].rows);
+    most = std::max(most, rows[lane].rows);
   }
-  return {static_cast<uint32_t>(rows.size()), static_cast<uint32_t>(rowsEnd(rows)), cap};
+  const auto lanes = static_cast<uint32_t>(rows.size()), end = static_cast<uint32_t>(rowsEnd(rows));
+  return {lanes, end, most > kNarrowLaneRows ? SPLASH_TARGET_VERIFY_ROWS : verifyLaneCap(end, lanes)};
 }
 
 // The row each of `lanes` lanes' first token after a prompt is selected
@@ -243,7 +243,6 @@ Batch makeBatch(MetalBackend &backend, uint32_t vocabulary, uint32_t lanes) {
               allocate(backend, space.vocabularyRangesBytes),
               allocate(backend, space.vocabularyArrivalsBytes),
               allocate(backend, uint64_t{lanes} * sizeof(LaneRows)),
-              allocate(backend, uint64_t{lanes} * sizeof(uint32_t)),
               // No row tests children unless a test gives it some.
               filled(backend, uint64_t{rows} * sizeof(uint32_t), 0xff),
               allocate(backend, uint64_t{lanes} * kPositions * kCandidates * sizeof(uint32_t)),
@@ -661,7 +660,7 @@ void penalties(MetalBackend &backend, uint32_t vocabulary, uint32_t lanes,
 AcceptanceBuffers acceptanceBuffers(MetalBackend &backend, const Batch &batch, uint32_t lanes) {
   return {batch.buffers.inputTokens, batch.buffers.treeRows, batch.buffers.outputTokens,
           allocate(backend, lanes * sizeof(uint32_t)), allocate(backend, lanes * sizeof(uint32_t)),
-          allocate(backend, lanes * sizeof(uint32_t)), batch.buffers.laneRows, batch.buffers.verifyRows};
+          allocate(backend, lanes * sizeof(uint32_t)), batch.buffers.laneRows};
 }
 
 // The token a uniform draws from weights in token order, failing on data
@@ -938,7 +937,6 @@ void bufferExtents(MetalBackend &backend) {
                     {&SamplingBuffers::vocabularyArrivals, rows[5], 4, "sampling arrival"},
                     {&SamplingBuffers::uniforms, 4, 4, "sampling uniform"},
                     {&SamplingBuffers::laneRows, lanes * sizeof(LaneRows), sizeof(LaneRows), "sampling lane rows"},
-                    {&SamplingBuffers::verifyRows, lanes * 4, 4, "sampling verify rows"},
                     {&SamplingBuffers::treeRows, (2 * kRows + 3 + 1) * sizeof(TreeRow), sizeof(TreeRow),
                      "verify tree row"}},
                    [&](CommandGraph &graph, const SamplingBuffers &buffers) { encode(graph, buffers, table); });
@@ -972,7 +970,6 @@ void bufferExtents(MetalBackend &backend) {
          {&SamplingBuffers::inputTokens, lanes * kRows * 4, 4, "verify input token"},
          {&SamplingBuffers::treeRows, lanes * kRows * sizeof(TreeRow), sizeof(TreeRow), "verify tree row"},
          {&SamplingBuffers::laneRows, lanes * sizeof(LaneRows), sizeof(LaneRows), "sampling lane rows"},
-         {&SamplingBuffers::verifyRows, lanes * 4, 4, "sampling verify rows"},
          {&SamplingBuffers::verifySources, lanes * kRows * 4, 4, "verify source"},
          {&SamplingBuffers::candidates, lanes * kPositions * kCandidates * 4, 4, "draft candidate"},
          {&SamplingBuffers::treeDraws, lanes * kBlock * kChildren, 1, "draft tree draw"},
@@ -994,8 +991,7 @@ void bufferExtents(MetalBackend &backend) {
            {&AcceptanceBuffers::retainedCounts, lanes * 4, 4, "retained count"},
            {&AcceptanceBuffers::acceptedCounts, lanes * 4, 4, "accepted count"},
            {&AcceptanceBuffers::retainedRows, lanes * 4, 4, "retained rows"},
-           {&AcceptanceBuffers::laneRows, lanes * sizeof(LaneRows), sizeof(LaneRows), "lane rows"},
-           {&AcceptanceBuffers::verifyRows, lanes * 4, 4, "verify rows"}})
+           {&AcceptanceBuffers::laneRows, lanes * sizeof(LaneRows), sizeof(LaneRows), "lane rows"}})
     splash::test::requireExtent(backend, acceptance.*member, bytes, element, what,
                                 [&](CommandGraph &graph, const MetalBuffer &buffer) {
                                   AcceptanceBuffers changed = acceptance;
@@ -1251,19 +1247,20 @@ void mixedVerify(MetalBackend &backend, uint32_t lanes, uint32_t samplingMask) {
   }
 }
 
-// Lanes whose verify blocks hold different row counts, packed one after
-// another (5, 8, 1 and 6 rows from rows 0, 5, 13 and 14), select and accept
-// as each lane does alone in a block from row 0, bit for bit: its penalized
-// logits, tokens and sampled records, and its retained and accepted counts
-// and rows. A lane whose thinking cutoff is at its first row proposes its end
-// there, as its selector's host chain does. The lanes mix greedy and sampled policies, penalties, a
-// mask, stop exclusion, retention and verify-row limits below a block's rows,
-// and thinking cutoffs at a block's first row and inside one; a block of one
-// row checks no proposal.
+// Lanes of different row counts, packed one after another (5, 6, 1 and 6
+// rows from rows 0, 5, 13 and 14, rows 11 and 12 of no lane), select and
+// accept as each lane does alone in a block from row 0, bit for bit: its
+// penalized logits, tokens and sampled records, and its retained and
+// accepted counts and rows. A lane whose thinking cutoff is at its first row
+// proposes its end there, as its selector's host chain does. The lanes mix
+// greedy and sampled policies, penalties, a mask, stop exclusion, a
+// retention limit below a lane's rows, and thinking cutoffs at a lane's first
+// row and inside one; a lane of one row checks no proposal. No kernel
+// selects, penalizes or accepts a row of no lane.
 void packedLanes(MetalBackend &backend) {
   constexpr uint32_t vocabulary = 1003, lanes = kLanes;
-  const std::array<LaneRows, lanes> packed{{{0, 5}, {5, 8}, {13, 1}, {14, 6}}};
-  const std::array<uint32_t, lanes> tableRows{2, 0, 3, 1}, retainedLimits{5, 8, 1, 4}, verifyRows{5, 6, 1, 6};
+  const std::array<LaneRows, lanes> packed{{{0, 5}, {5, 6}, {13, 1}, {14, 6}}};
+  const std::array<uint32_t, lanes> tableRows{2, 0, 3, 1}, retainedLimits{5, 8, 1, 4};
   const std::array<uint32_t, 3> end{vocabulary - 6, vocabulary - 7, vocabulary - 3};
   std::array<SamplingPolicy, lanes> policies{
       SamplingPolicy{}, SamplingPolicy{32, 0.8F, 0.95F, true, false, {1.3F, 0.5F, 0.25F}},
@@ -1290,10 +1287,9 @@ void packedLanes(MetalBackend &backend) {
   };
   const auto words = [](const MetalBuffer &buffer) { return static_cast<uint32_t *>(buffer.contents()); };
   const auto run = [&](const Run &r, std::span<const SamplingPolicy> lanePolicies, std::span<const LaneRows> rows,
-                       std::span<const uint32_t> verified, std::span<const uint32_t> laneTableRows,
-                       std::span<const uint32_t> limits) {
+                       std::span<const uint32_t> laneTableRows, std::span<const uint32_t> limits) {
     r.batch.poison();
-    const StepRows step = layOut(r.batch.buffers, rows, verified);
+    const StepRows step = layOut(r.batch.buffers, rows);
     CommandGraph graph;
     sampling.addVerify(graph, lanePolicies, r.batch.buffers, step, stops, {table, laneTableRows});
     sampling.addAcceptance(graph, r.acceptance, step, limits, stops);
@@ -1323,7 +1319,7 @@ void packedLanes(MetalBackend &backend) {
   }
   const std::vector<float> logits(all.batch.logits(), all.batch.logits() + uint64_t{all.batch.rows} * vocabulary);
   const std::vector<uint32_t> inputs(all.batch.inputTokens(), all.batch.inputTokens() + all.batch.rows);
-  run(all, policies, packed, verifyRows, tableRows, retainedLimits);
+  run(all, policies, packed, tableRows, retainedLimits);
 
   for (uint32_t lane = 0; lane < lanes; ++lane) {
     const LaneRows block = packed[lane];
@@ -1335,8 +1331,8 @@ void packedLanes(MetalBackend &backend) {
                 kMaskRows * all.batch.maskWords(), alone.batch.masks());
     std::copy_n(all.batch.uniforms() + lane * kUniforms, kUniforms, alone.batch.uniforms());
     std::copy_n(inputs.begin() + block.first, block.rows, alone.batch.inputTokens());
-    run(alone, std::span(policies).subspan(lane, 1), own, std::span(verifyRows).subspan(lane, 1),
-        std::span(tableRows).subspan(lane, 1), std::span(retainedLimits).subspan(lane, 1));
+    run(alone, std::span(policies).subspan(lane, 1), own, std::span(tableRows).subspan(lane, 1),
+        std::span(retainedLimits).subspan(lane, 1));
 
     const std::string label = "packed lane " + std::to_string(lane);
     const auto same = [](const auto *packedValues, const auto *aloneValues, uint64_t count) {
@@ -1360,16 +1356,13 @@ void packedLanes(MetalBackend &backend) {
   require(words(all.acceptance.acceptedCounts)[0] == 4 && words(all.acceptance.acceptedCounts)[2] == 0 &&
               words(all.acceptance.retainedCounts)[2] == 1 && all.batch.outputTokens()[13] == end[0],
           "packed lanes accepted other than their drafts and ends");
-  // No kernel selects a lane's rows past its verify rows (lane 1's last two,
-  // penalized and sampled): they keep their logits and their tokens' poison.
-  for (uint32_t lane = 0; lane < lanes; ++lane)
-    for (uint32_t row = verifyRows[lane]; row < packed[lane].rows; ++row) {
-      const uint32_t at = packed[lane].first + row;
-      require(all.batch.outputTokens()[at] == 0xA5A5A5A5U &&
-                  std::memcmp(all.batch.row(at), logits.data() + uint64_t{at} * vocabulary, vocabulary * 4) == 0,
-              "packed lane " + std::to_string(lane) + " selected its row " + std::to_string(row) +
-                  " past its verify rows");
-    }
+  // No kernel selects a row of no lane (rows 11 and 12, after lane 1's
+  // penalized and sampled rows): they keep their logits and their tokens'
+  // poison.
+  for (const uint32_t at : {11U, 12U})
+    require(all.batch.outputTokens()[at] == 0xA5A5A5A5U &&
+                std::memcmp(all.batch.row(at), logits.data() + uint64_t{at} * vocabulary, vocabulary * 4) == 0,
+            "row " + std::to_string(at) + " of no lane was selected or penalized");
 }
 
 // The runtime uploads masks for constrained lanes alone, so an unconstrained
@@ -2486,12 +2479,11 @@ void treeSelections(MetalBackend &backend) {
     masks[(uint64_t{lane} * kMaskRows + 2) * words + end[0] / 32] &= ~(1U << end[0] % 32);
     batch.inputTokens()[lane * kRows + 2] = 11;
   }
-  const std::array<uint32_t, 2> eightRows{8, 8};
   const auto select = [&] {
     std::copy(original.begin(), original.end(), batch.logits());
     batch.poison();
     CommandGraph graph;
-    sampling.addVerify(graph, policies, batch.buffers, layOut(batch.buffers, blocks(2), eightRows), kStopTokens,
+    sampling.addVerify(graph, policies, batch.buffers, layOut(batch.buffers, blocks(2)), kStopTokens,
                        {table, tableRows});
     static_cast<void>(backend.submitCommandAsync(graph.dispatches()).wait());
     return std::vector<uint32_t>(batch.outputTokens(), batch.outputTokens() + batch.rows);
@@ -3027,9 +3019,10 @@ void childTestsOnTrees(MetalBackend &backend, const SamplingPolicy &policy, bool
   }
   std::vector<uint32_t> anchorCounts(vocabulary, 0);
   std::vector<std::vector<uint32_t>> childCounts(kCandidates, std::vector<uint32_t>(vocabulary, 0));
-  // Each lane's block: its tree's rows, then rows past its verify rows.
-  const std::vector<LaneRows> laneRows = blocks(kLanes);
-  const std::array<uint32_t, kLanes> verifiedRows{kTreeRows, kTreeRows, kTreeRows, kTreeRows};
+  // Each lane's rows: its tree's, from its block's first row, whose rows past
+  // them are of no lane.
+  std::vector<LaneRows> laneRows = blocks(kLanes);
+  for (LaneRows &rows : laneRows) rows.rows = kTreeRows;
   const std::array<uint32_t, kLanes> limits{kRows, kRows, kRows, kRows};
   const AcceptanceBuffers acceptance = acceptanceBuffers(backend, batch, kLanes);
   // Preorder: the anchor, the first child and its two, the second and its two.
@@ -3070,7 +3063,7 @@ void childTestsOnTrees(MetalBackend &backend, const SamplingPolicy &policy, bool
       batch.uniforms()[uniform] = 0.5F * (random.unit() + 1.0F);
     batch.poison();
     CommandGraph graph;
-    const StepRows step = layOut(batch.buffers, laneRows, verifiedRows);
+    const StepRows step = layOut(batch.buffers, laneRows);
     sampling.addVerify(graph, policies, batch.buffers, step, kStopTokens, {table, tableRows});
     sampling.addAcceptance(graph, acceptance, step, limits, kStopTokens);
     static_cast<void>(backend.submitCommandAsync(graph.dispatches()).wait());

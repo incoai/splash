@@ -443,15 +443,21 @@ GPU, so in a chunk it takes their last FFN rounds as the GPU's alone. On a
 A decode step's rows are laid out on the GPU by its draft's selector
 (`ops::DraftSelector::addVerifyRows`): each lane's first row among the step's
 packed rows and its row count (`SplashLaneRows`, `DecodeTensor::LaneLayout`),
-and its verify rows, the first of them (`DecodeTensor::VerifyRows`). The
-host fixes only the step's rows and a lane's most (`ops::StepRows`,
-`ops::verifyLaneCap`), which the grids span. The step's token selection and
-its penalties and thinking cutoffs, acceptance and the draft's context commit
-read the layout on the GPU and take a lane's verify rows alone; the first
-token after a prompt is selected from, and written at, the lane's one row,
-whose layout its selection writes first (`decode_sample_first_rows`), and
+the best rows of the lanes' trees that the step holds, every one of which the
+lane verifies. The host fixes only the step's rows and a lane's most
+(`ops::StepRows`, `ops::verifyLaneCap`), which the grids span; where the
+trees hold fewer rows than the step, its rows past the lanes' belong to no
+lane, which no kernel selects, attends, retains or routes through the MoE
+experts, and which carry lane 0's anchor, as the embedding gathers by token
+(the projections compute them unread, as a tile's spare rows). The step's
+token selection and its penalties and thinking cutoffs, acceptance and the
+draft's context commit read the layout on the GPU and take a lane's rows; the
+first token after a prompt is selected from, and written at, the lane's one
+row, whose layout its selection writes first (`decode_sample_first_rows`), and
 Qwen3.8-Flash-Next's n-gram hash reads it too, hashing a row's n-grams along
-its path; so do the GDN decode, the target's attention (`ops::AttentionRows`),
+its path and a row of no lane's as lane 0's anchor's, so that the PLE gathers
+valid table rows for it, which a streamed table stages already; so do the GDN
+decode, the target's attention (`ops::AttentionRows`),
 Qwen3.8-Flash-Next's block indexer (its projection, pool, selection and
 commit) and PLE convolution and commit, one dispatch for every lane on grids
 up to the lane cap (`ops::LayoutRows`), a prompt chunk's projection and
@@ -469,7 +475,7 @@ group of one step). It differs where the work does: its GDN layers run the
 decode scan from each lane's state along its tree into its tape, where a
 prompt sequence scans its rows from its states into theirs; its attention
 over spilled K/V reads the lists those reads locate, where a prompt
-sequence's reads staging; its MoE routes each lane's verify rows alone; every
+sequence's reads staging; its MoE routes its lanes' rows alone; every
 row is read, so the forward's end runs the head over every row and the draft
 captures every row of the layers it reads; and the Neural Engine split takes
 prompt chunks alone. Norms and producers write each projection's input as its
@@ -930,10 +936,9 @@ An expert's only tile of at most `GGUF_COLUMN_ROWS` live rows runs on the column
 (`kernels/common/gguf_column_tile.h`) rather than the staged one, and the two sum a row's
 products in different orders: a route's output depends on how many rows the step routes to its
 expert, so decode results of GGUF MoE targets, the 35B's included, are not invariant to the
-batch (`kernels/common/moe_expert_slab.h`). Under the default `--verify-rows auto`, which rows a
-decode step routes also follows the verify budget ([Drafts](models.md#drafts)), which learns
-from timing and earlier requests, so a MoE target's decode results can differ between runs of
-one request.
+batch (`kernels/common/moe_expert_slab.h`). Under the default `--verify-rows auto`, a decode
+step's rows also follow the acceptance the verify budget learns from earlier requests
+([Drafts](models.md#drafts)), so decode results can differ between runs of one request.
 The float router, QSA indexer and alpha/beta projections run in `kernels/shared/gguf_float.metal`,
 which runs two projections of one input in one dispatch where they take the same tile (the
 indexer's query and key, each on the tile of its own width), and the token rows are gathered by
@@ -1048,8 +1053,8 @@ finite, and a plan of one or two rows on the column tile in every format and in 
 triples within the bound, the rows past its own unread and unwritten; and
 `gguf-moe`: the float projections on both float tiles and the MoE layer on every GGUF
 plan, the staged 8- and 32-row tiles, in every format as each routed and shared expert tensor,
-against fp64, bitwise against the full grids and two gate/up passes, verify blocks among prompt
-rows routing their verify rows alone, and with the experts in
+against fp64, bitwise against the full grids and two gate/up passes, a decode step routing its
+lanes' rows alone, no row of no lane, and with the experts in
 permuted slots across a floor chunk and elastic chunks of other, few slots, the last of fewer,
 bitwise as in one chunk, and refuses floor and elastic chunks one unit short, a malformed chunk list
 or chunks made for another block; `gguf-moe-e512` runs all of it at Qwen3.8-Flash-Next's 512 experts
@@ -2338,7 +2343,7 @@ step's arithmetic, which it matches bit for bit), and the state's window is a
 copy of the lane's plus those rows' context; the completion seals the state only
 where the lane retained those rows. Both writes are one function of the runtime
 (`encodeDecodeCaptures`), which names the rows a lane retained: the path of its
-verify rows its acceptance wrote, whose first rows before the page both take. Each such state is a rolling
+rows its acceptance wrote, whose first rows before the page both take. Each such state is a rolling
 checkpoint of the reply that retires the one before it, which a preempted lane
 resumes from once its KV holds a token past it, and the last, once the request
 ends, is the reply's state: the point a next request whose prompt renders the
@@ -2390,7 +2395,7 @@ its own sampling policy and RNG, and a greedy lane takes the argmax path in any
 batch. A batch with a constrained lane runs its cycle as three commands around
 the host mask exchange: the draft, the target forward while the server computes
 each constrained lane's masks, and the selection, in which only the constrained
-lanes read masks. A lane's mask request carries its verify rows as their tree,
+lanes read masks. A lane's mask request carries its rows as their tree,
 each row's token and its parent row, and the server's grammar walks it depth
 first in one matcher, consuming a row's token over its parent's state and
 rolling it back after the row's subtree, so each row's mask follows its own

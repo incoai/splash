@@ -160,9 +160,9 @@ struct RuntimeResourcesConfig {
   // --kv-window-trim off: a windowed target's pages keep every layer's K/V,
   // for validation that trimming changes no output (CacheWindowPolicy::trim).
   bool kvWindowTrim = true;
-  // --verify-rows: the rows of the draft's block a decode cycle verifies
-  // (model::budgetsVerifyRows); a benchmark round verifies every row so that
-  // rounds repeat one another.
+  // --verify-rows: the rows a decode cycle verifies (reportVerifyRows); a
+  // benchmark round verifies every row of a draft's block a lane (all) so
+  // that rounds repeat one another.
   model::VerifyRows verifyRows = model::VerifyRows::Auto;
   // --activations: whether the plans may round activations to int8
   // where an int8-activation path takes them, or keep every activation bf16

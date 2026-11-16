@@ -422,15 +422,12 @@ void reportStreamedStores(const model::LoadedModel &loaded, const model::Streama
 }
 
 // The rows the target's decode cycles verify (--verify-rows), and why.
-void reportVerifyRows(const model::LoadedModel &loaded, model::VerifyRows rows) {
-  if (model::budgetsVerifyRows(loaded, rows))
-    logLine("Decode cycles verify the rows the verify budget chooses (--verify-rows auto, as ", loaded.name(),
-            " is a MoE target): greedy and seeded outputs can differ from run to run.");
-  else if (rows == model::VerifyRows::All)
+void reportVerifyRows(model::VerifyRows rows) {
+  if (rows == model::VerifyRows::All)
     logLine("Decode cycles verify every row of the draft's block (--verify-rows all).");
   else
-    logLine("Decode cycles verify every row of the draft's block by the verify budget's estimates (--verify-rows "
-            "auto, as ", loaded.name(), " is dense): greedy and seeded outputs can differ from run to run.");
+    logLine("Decode cycles verify the rows the verify budget chooses for each step (--verify-rows auto): greedy "
+            "and seeded outputs can differ from run to run.");
 }
 
 // Why a target's long requests keep their KV in memory, empty when they
@@ -1038,7 +1035,7 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
   };
 
   ready();
-  reportVerifyRows(loaded, config.verifyRows);
+  reportVerifyRows(config.verifyRows);
 
   // The automatic tier keeps its staging only where the plan holds the model
   // and the requested context beside it, the parts as they load, or where

@@ -255,21 +255,21 @@ struct ExpertStore::Impl {
   struct PartTiles final {
     metal::MetalBuffer descriptors, count;
   };
-  // The rows a predicting step routes (ops::MoeBuffers::laneRows): every row
-  // but a lane's past its verify rows, which the selector wrote before the
-  // step's GPU work ran up to its load.
+  // The rows a predicting step routes (ops::MoeBuffers::laneRows): a decode
+  // step's lanes' rows, which the selector wrote before the step's GPU work
+  // ran up to its load, and no row of no lane; a prompt chunk's every row.
   struct RoutedRows final {
     uint32_t lanes = 0;
     metal::MetalBuffer laneRows;
-    metal::MetalBuffer verifyRows;
 
     [[nodiscard]] bool routes(uint32_t row) const noexcept {
+      if (!lanes)
+        return true;
       const auto *layout = static_cast<const SplashLaneRows *>(laneRows.contents());
-      const auto *verified = static_cast<const uint32_t *>(verifyRows.contents());
       for (uint32_t lane = 0; lane < lanes; ++lane)
-        if (const uint32_t offset = row - layout[lane].first; offset < layout[lane].rows)
-          return offset < verified[lane];
-      return true;
+        if (row - layout[lane].first < layout[lane].rows)
+          return true;
+      return false;
     }
   };
 
@@ -1287,7 +1287,7 @@ void ExpertStore::addLoad(metal::CommandGraph &graph, std::span<const ops::MoeLo
     // holds, take more than one step.
     if (parts.size() != 1) throw std::invalid_argument("an expert load that predicts serves one step");
     const ops::MoeBuffers &step = *parts.front().buffers;
-    routed = {step.lanes, step.laneRows, step.verifyRows};
+    routed = {step.lanes, step.laneRows};
     const Impl::Block &next = impl.blocks[block + 1];
     ops::MoE::addRoutes(graph, step.input, next.router, next.scalarGate, impl.predictionScores,
                         impl.predictionRoutes, impl.predictionWeights, rows, shape,

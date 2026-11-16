@@ -213,7 +213,7 @@ void QwenTarget::addPrefillMixer(PrefillStep &step, const QwenGdnWeights &mixer,
         step.graph,
         {b.gdnPacked, mixer.convolutionWeights, d->currentGdnStates, d->nextGdnStates, d->gdnTape,
          std::span(d->gdnTapeLanes).first(d->step.lanes), b.laneRows, step.rows, d->step.laneCap, mixer.decay,
-         mixer.timeBias, mixer.mixerNorm, b.gdnHidden, d->verifyRows, d->tree, b.linearScratch},
+         mixer.timeBias, mixer.mixerNorm, b.gdnHidden, d->tree, b.linearScratch},
         geometry_.gdnShape(), layer, geometry_.stateLayout.strides(), mixer.outputHeadOrder, outputPlan.input());
   } else {
     for (const QwenTargetPrefillSequence &sequence : step.sequences) {
@@ -357,7 +357,7 @@ void QwenTarget::addPrefillDenseFfn(PrefillStep &step, uint32_t index, const ops
   linear.addSwiGlu(step.graph, ffn, buffers, std::move(residual), std::move(output), rows, step.rows, normalized);
 }
 
-// A decode step's lanes route their verify rows alone (ops::MoeBuffers::lanes).
+// A decode step's lanes route their rows alone (ops::MoeBuffers::lanes).
 void QwenTarget::addPrefillMoeRouting(PrefillStep &step, const ops::NormWeights &norm,
                                       const ops::BlockMoeWeights &ffn, metal::MetalBuffer residual,
                                       metal::MetalBuffer output) const {
@@ -367,7 +367,6 @@ void QwenTarget::addPrefillMoeRouting(PrefillStep &step, const ops::NormWeights 
   if (const QwenTargetDecodeBuffers *d = step.decode) {
     step.ffn.lanes = d->step.lanes;
     step.ffn.laneRows = b.laneRows;
-    step.ffn.verifyRows = d->verifyRows;
   }
   ops::MoE::addRouting(step.graph, step.ffn, ffn, *step.moe);
 }

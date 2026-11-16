@@ -1,28 +1,21 @@
 #pragma once
 
-// The verify rows a MoE target's decode cycles choose
-// (ops::DraftSelector::addVerifyRows): the most expected accepted tokens per
-// cost, learned online. A draft row's own chance, that the target selects its
-// token where it accepted the row's parent, is logit(p) = slope * logit(q) +
+// The online estimates a decode cycle's rows take: each lane's chances that
+// the target accepts its tree's rows, which its GPU's layout of the step's
+// best rows reads (ops::DraftSelector::addVerifyRows).
+// A draft row's own chance, that the target selects its token where it
+// accepted the row's parent, is logit(p) = slope * logit(q) +
 // intercepts[position] for its draft probability q at its proposal position,
 // at most its cap, what its parent's earlier draws left of 1, and a row's
-// chance its own times its parent's (DraftTreeParams): greedy
-// lanes fit theirs to the last kLabels labels of their trees' rows, sampled
-// lanes, whose drawn children their verify rows' rejection sampling accepts,
-// apart. A cycle of R rows
-// costs a + b * R ms, fit per lane count, constrained or not, to its latest
-// cycles.
-// A cycle counts at most twice the larger of its fitted price and the mean:
-// capped at the price alone, one 2x stall over clustered rows had 45 of the
-// next 64 cycles verify their anchors alone.
+// chance its own times its parent's (DraftTreeParams): greedy lanes fit
+// theirs to the last kLabels labels of their trees' rows, sampled lanes,
+// whose drawn children their verify rows' rejection sampling accepts, apart.
 #include "metal/abi/ExecutionGeometry.h"
 #include "ops/LaneRows.hpp"
 
 #include <array>
 #include <cstdint>
-#include <optional>
 #include <span>
-#include <utility>
 #include <vector>
 
 namespace splash::model {
@@ -34,15 +27,6 @@ public:
   static constexpr uint32_t kLanes = SPLASH_MAXIMUM_BATCH_WIDTH;
   static constexpr uint32_t kRefitCycles = 64;
   static constexpr uint32_t kLabels = 4096;
-  // Every kExploreCycles-th cycle of a lane count verifies every row, which
-  // keeps the rows of the cost fit spread.
-  static constexpr uint32_t kExploreCycles = 32;
-  // Each cycle weighs kDecay times the next (about the last 33 cycles), as
-  // what a row costs follows the requests served.
-  static constexpr double kDecay = 0.97;
-  // The slope shrinks toward the seed's as much as kPriorCycles spread
-  // cycles would pull it.
-  static constexpr double kPriorCycles = 5.0;
   // The prior's precision on the slope and on each intercept: about twenty
   // labels' worth each (a label tells the slope about its logit squared, some
   // 2.5, times what it tells its intercept).
@@ -78,10 +62,9 @@ public:
     bool operator==(const Label &) const = default;
   };
 
-  // A lane of a completed cycle: the rows it verified, whether it samples,
-  // and its tree's labels (treeLabels).
+  // A lane of a completed cycle: whether it samples, and its tree's labels
+  // (treeLabels).
   struct Lane final {
-    uint32_t verifyRows = 0;
     bool samples = false;
     std::vector<Label> labels;
   };
@@ -102,13 +85,8 @@ public:
 
   // The acceptance model of the lanes that sample, or of the greedy ones.
   [[nodiscard]] const Acceptance &acceptance(bool samples) const noexcept { return acceptance_[samples]; }
-  // costs[R] for `lanes` lanes that verify R rows in all, R from `lanes` to
-  // eight rows a lane, nondecreasing in R; zero elsewhere.
-  [[nodiscard]] std::array<float, kBlockRows * kLanes + 1> costs(uint32_t lanes, bool constrained) const;
-  // Whether the next cycle of `lanes` lanes verifies every row.
-  [[nodiscard]] bool explores(uint32_t lanes, bool constrained) const;
-  // A completed cycle and its commands' wall time.
-  void observe(std::span<const Lane> lanes, bool constrained, double milliseconds);
+  // A completed cycle's lanes, whose labels it keeps.
+  void observe(std::span<const Lane> lanes);
 
   // The labels kept of the lanes that sample, or of the greedy ones, oldest
   // first.
@@ -116,8 +94,6 @@ public:
   // The maximum a posteriori model of `labels` under the prior, by damped
   // Newton steps from `start`.
   [[nodiscard]] static Acceptance fit(std::span<const Label> labels, const Acceptance &start);
-  // The shape of a cycle's cost by its rows (a cycle of every row costs 1).
-  [[nodiscard]] static double seed(uint32_t lanes, uint32_t rows);
 
   // A lane's chances for a cycle's choice of rows (stepRows): the estimates
   // that the target accepts each row its tree would add past its anchor,
@@ -138,30 +114,11 @@ public:
                                               std::span<const float> costs);
 
 private:
-  // The weighted sums of the latest cycles' rows R and times t.
-  struct Cost final {
-    double weight = 0.0;
-    double rows = 0.0;
-    double rowsSquared = 0.0;
-    double time = 0.0;
-    double rowsTime = 0.0;
-  };
-
-  [[nodiscard]] const Cost &table(uint32_t lanes, bool constrained) const;
-  // The fit's intercept and slope; none before any cycle.
-  [[nodiscard]] std::optional<std::pair<double, double>> line(uint32_t lanes, bool constrained) const;
-
   // The greedy lanes', then the sampled ones'.
   std::array<Acceptance, 2> acceptance_{kPrior, kPrior};
   std::array<std::vector<Label>, 2> labels_;
   std::array<size_t, 2> next_{};
   uint64_t cycles_ = 0;
-  std::array<std::array<Cost, kLanes>, 2> tables_{};
-  std::array<std::array<uint64_t, kLanes>, 2> tableCycles_{};
-  // The cycles counted at under half their time since the last notice of
-  // them, and the awake time (ms) before which no other notice is given.
-  uint64_t cuts_ = 0;
-  double nextNotice_ = 0.0;
 };
 
 } // namespace splash::model

@@ -53,13 +53,12 @@ struct DraftSelectorBuffers final {
   metal::MetalBuffer treeCaps;
   // A decode step's rows (ops::StepRows) as addVerifyRows lays them out from
   // the trees: each row's token, its verify input, its tree row, and its
-  // source, the row of its lane's tree it is (uint32, SPLASH_NO_TOKEN past a
-  // lane's verify rows), packed in lane order; each lane's rows
-  // (SplashLaneRows) and its verify rows (uint32), the first of them.
+  // source, the row of its lane's tree it is (uint32, SPLASH_NO_TOKEN for a
+  // row of no lane), packed in lane order; and each lane's rows
+  // (SplashLaneRows).
   metal::MetalBuffer inputTokens;
   metal::MetalBuffer treeRows;
   metal::MetalBuffer laneRows;
-  metal::MetalBuffer verifyRows;
   metal::MetalBuffer verifySources;
 };
 
@@ -77,9 +76,7 @@ struct DraftCalibration final {
 // `children` children a draft row (none: its rows are its host chain's), its
 // draft steps estimated by `calibration`. A greedy lane (temperature 0) takes
 // a row's most likely candidates; a sampled lane draws them without
-// replacement at its temperature, with the cycle's `noise`. A `forced` chain
-// is one whose tokens the target selects whatever its logits, whose rows no
-// draft step joining them gives a draft probability.
+// replacement at its temperature, with the cycle's `noise`.
 struct DraftTreeLane final {
   uint32_t anchor = 0;
   uint32_t depth = 0;
@@ -88,7 +85,6 @@ struct DraftTreeLane final {
   DraftCalibration calibration{};
   float temperature = 0.0F;
   uint64_t noise = 0;
-  bool forced = false;
 };
 
 // The draft's selector codebooks, which score the edge from a proposal
@@ -118,13 +114,10 @@ public:
   void add(metal::CommandGraph &graph, const DraftSelectorBuffers &buffers, const DraftCodebooks &codebooks,
            std::span<const DraftTreeLane> lanes) const;
   // After add: the rows of a decode step of `step.lanes` lanes
-  // (VerifyRowsParams), each lane's verify rows numbered in preorder: the
-  // trees' best rows that the step's rows hold without costs, or of them, in
-  // order, those while each raises the expected accepted tokens per cost,
-  // where costs[R] is the cost of a step that verifies R rows in all, for R
-  // from the lane count to the step's rows, in any unit.
-  static void addVerifyRows(metal::CommandGraph &graph, const DraftSelectorBuffers &buffers, const StepRows &step,
-                            std::span<const float> costs);
+  // (VerifyRowsParams), the trees' best rows that the step's rows and its
+  // lane cap hold, each lane's numbered in preorder, and the step's rows past
+  // them of no lane.
+  static void addVerifyRows(metal::CommandGraph &graph, const DraftSelectorBuffers &buffers, const StepRows &step);
 
 private:
   uint32_t vocabulary_ = 0;

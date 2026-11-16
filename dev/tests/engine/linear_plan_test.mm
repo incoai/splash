@@ -1237,7 +1237,6 @@ void producerTableContract(metal::MetalBackend &backend) {
     buffers.timeBias = allocate(backend, shape.valueHeads * 2);
     buffers.mixerNorm = {allocate(backend, shape.headDimension * 2)};
     buffers.hidden = allocate(backend, kRows * shape.valueHeads * shape.headDimension * 2);
-    buffers.verifyRows = allocate(backend, kLanes * 4);
     buffers.tree = allocate(backend, kRows * sizeof(SplashTreeRow));
     metal::CommandGraph graph;
     rejects(

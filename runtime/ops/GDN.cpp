@@ -222,7 +222,6 @@ PreparedInput GDN::addDecode(metal::CommandGraph &graph, GdnDecodeBuffers buffer
   requireBytes(buffers.packed, packedBytes(shape, rows), "GDN packed");
   requireMixerWeights(shape, buffers.convolutionWeights, buffers.decayWeights, buffers.timeBias);
   requireBytes(buffers.hidden, uint64_t{rows} * valueWidth(shape) * 2, "GDN hidden");
-  requireBytes(buffers.verifyRows, uint64_t{lanes} * sizeof(uint32_t), "GDN verify rows");
   requireBytes(buffers.tree, uint64_t{rows} * sizeof(SplashTreeRow), "GDN tree rows");
   requireBytes(buffers.laneRows, uint64_t{lanes} * sizeof(SplashLaneRows), "GDN lane rows");
   // Each lane reads its pending rows' tape of this layer and writes its
@@ -261,12 +260,11 @@ PreparedInput GDN::addDecode(metal::CommandGraph &graph, GdnDecodeBuffers buffer
   const bool prepare = input != LinearInput::Plain;
   if (prepare)
     requireTableScratch(buffers.linearScratch, input, shape.valueHeads * shape.headDimension, rows);
-  bindings.reserve(prepare ? 20 : 18);
+  bindings.reserve(prepare ? 19 : 17);
   appendLaneBindings(bindings, buffers.currentStates, buffers.nextStates);
   requireStates(shape, state, layer, lanes, buffers.currentStates, buffers.nextStates);
-  bindings.insert(bindings.end(),
-                  {buffers.tape, buffers.decayWeights, buffers.timeBias, buffers.mixerNorm.buffer,
-                   buffers.hidden, buffers.verifyRows, buffers.tree, buffers.laneRows});
+  bindings.insert(bindings.end(), {buffers.tape, buffers.decayWeights, buffers.timeBias, buffers.mixerNorm.buffer,
+                                   buffers.hidden, buffers.tree, buffers.laneRows});
   if (prepare)
     bindings.insert(bindings.end(), {buffers.linearScratch.input, buffers.linearScratch.sums});
   const std::string name = std::string("verify_gdn_fused") + tableSuffix(input) + std::string(kernel.suffix);

@@ -437,8 +437,8 @@ struct Runtime::Impl {
   };
 
   // A lane's proposals of a cycle beside its draft's (proposeChain): its
-  // host chain's tokens, and whether they are forced
-  // (ops::DraftTreeLane::forced), which grows no tree of its draft's beside
+  // host chain's tokens, and whether they are forced, tokens the target
+  // selects whatever its logits, which grows no tree of its draft's beside
   // them.
   struct LaneProposals final {
     uint32_t chain = 0;
@@ -451,11 +451,10 @@ struct Runtime::Impl {
     uint32_t accepted = 0;
     uint32_t currentAnchor = 0;
     uint32_t maximumRetained = 0;
-    // The lane's rows of the cycle as its selector laid them out, the first
-    // of them it verified (budgetsVerifyRows) and the mask of those it
-    // retained (acceptance's, metal/abi/VerifyTree.h).
+    // The lane's rows of the cycle as its selector laid them out, each of
+    // which it verified, and the mask of those it retained (acceptance's,
+    // metal/abi/VerifyTree.h).
     ops::LaneRows rows{};
-    uint32_t verifyRows = 0;
     uint32_t retainedRows = 0;
     // The draft proposals the lane's thinking end replaced, which its
     // speculation counts leave out.
@@ -535,13 +534,10 @@ struct Runtime::Impl {
   ops::Sampling sampling;
   std::unique_ptr<QwenTarget> targetModel;
   DFlashDraft draftModel;
-  // The acceptance model every lane's tree estimates follow and the costs
-  // by which a MoE target's GPU budget cuts the rows of a cycle
-  // (budgetsVerifyRows), under --verify-rows auto. None under --verify-rows
-  // all: a cycle then verifies every row of a draft's block a lane and
-  // nothing learns, so that its outputs repeat.
+  // The acceptance model every lane's tree estimates follow, under
+  // --verify-rows auto. None under --verify-rows all: nothing learns, so that
+  // a cycle's outputs repeat.
   std::optional<VerifyBudget> verifyBudget;
-  bool cutsVerifyRows = false;
   // The lookup chains' acceptance, which every unconstrained request's
   // cycles teach under --verify-rows auto, greedy and sampled lanes apart.
   LookupAcceptance lookupAcceptance;
@@ -700,7 +696,6 @@ struct Runtime::Impl {
         decodeArena->batchSlice(DecodeTensor::PenaltyState, kLaneCount);
     if (value.verifyRows == VerifyRows::Auto)
       verifyBudget.emplace();
-    cutsVerifyRows = budgetsVerifyRows(model, value.verifyRows);
     if (ExpertStore *store = model.expertStore())
       pools.push_back(&expertPool.emplace(*store));
     if (blockCache) {
@@ -1381,7 +1376,6 @@ struct Runtime::Impl {
             d(DecodeTensor::TargetVocabularyRanges),
             d(DecodeTensor::TargetVocabularyArrivals),
             d(DecodeTensor::LaneLayout),
-            d(DecodeTensor::VerifyRows),
             d(DecodeTensor::VerifySources),
             d(DecodeTensor::Candidates),
             d(DecodeTensor::DraftTreeDraws),
@@ -1528,8 +1522,8 @@ struct Runtime::Impl {
 #ifdef SPLASH_RUNTIME_INSTRUMENTATION
   // While capturing, a host step before the policy that copies the logits
   // the target's forward left in each of the command's `lanes` batch lanes:
-  // its first token's row for a selection, its verify rows as the step's
-  // selector laid them out for a verify.
+  // its first token's row for a selection, its rows as the step's selector
+  // laid them out for a verify.
   void encodeTargetLogitsCapture(CommandGraph &graph, uint32_t lanes, bool verify) {
     if (!capturingTargetLogits)
       return;
@@ -1539,12 +1533,8 @@ struct Runtime::Impl {
       capturedTargetLogits.resize(lanes);
       for (uint32_t lane = 0; lane < lanes; ++lane) {
         const ops::LaneRows rows = verify ? laneRows(lane) : ops::LaneRows{lane, 1};
-        const uint32_t copied =
-            verify ? *contents<uint32_t>(decodeArena->get(lane, DecodeTensor::VerifyRows), "verify rows") : 1;
-        if (!copied || copied > rows.rows)
-          throw std::logic_error("captured verify rows are out of range");
         const float *first = logits + rows.first * vocabulary;
-        capturedTargetLogits[lane].assign(first, first + copied * vocabulary);
+        capturedTargetLogits[lane].assign(first, first + rows.rows * vocabulary);
       }
     });
   }
@@ -2287,14 +2277,14 @@ struct Runtime::Impl {
 
   // The cycle's step (`step`): each lane's tree of the draft's proposals and
   // its host chain (`proposals`), no deeper than depths[lane], and the rows
-  // of the trees it verifies, by the acceptance model and, where the budget
-  // cuts them, the costs of `constrained` cycles of its lane count.
+  // of the trees it verifies, the best by the acceptance model's estimates
+  // that the step holds.
   void encodeDraftBatchGraph(CommandGraph &graph,
                              std::span<Request *const> entries,
                              std::span<const uint64_t> logicalPositions,
                              std::span<const uint32_t> depths,
                              std::span<const LaneProposals> proposals,
-                             bool constrained, const ops::StepRows &step) {
+                             const ops::StepRows &step) {
     if (entries.empty() || entries.size() > kLaneCount ||
         entries.size() != logicalPositions.size() ||
         entries.size() != depths.size() || entries.size() != proposals.size()) {
@@ -2349,7 +2339,6 @@ struct Runtime::Impl {
       // (ConstrainedDecodeTicket).
       tree.children = proposals[lane].forced ? 0 : SPLASH_TREE_CHILDREN;
       tree.chain = std::min(proposals[lane].chain, tree.depth);
-      tree.forced = proposals[lane].forced;
       entry.lookupChain.resize(std::min<size_t>(entry.lookupChain.size(), tree.chain));
       // Its draft steps' estimates are its policy's acceptance model's, a
       // sampled lane's learned from its verify rows' rejection sampling. A
@@ -2371,17 +2360,9 @@ struct Runtime::Impl {
         d(DecodeTensor::DraftTrees),      d(DecodeTensor::DraftTreeScores), d(DecodeTensor::DraftTreeSizes),
         d(DecodeTensor::DraftTreeDraws),  d(DecodeTensor::DraftTreeNext),   d(DecodeTensor::DraftTreeCaps),
         d(DecodeTensor::InputTokens),     d(DecodeTensor::TreeRows),        d(DecodeTensor::LaneLayout),
-        d(DecodeTensor::VerifyRows),      d(DecodeTensor::VerifySources)};
+        d(DecodeTensor::VerifySources)};
     draftModel.addSelection(graph, selection, std::span(trees).first(lanes));
-    // Where the budget does not cut the rows, in a cycle that explores, or
-    // in a forced step, the cycle verifies as many of the trees' rows as its
-    // step holds.
-    std::array<float, VerifyBudget::kBlockRows * VerifyBudget::kLanes + 1> costs{};
-    const bool cuts = cutsVerifyRows && !forcedStepRows && !verifyBudget->explores(lanes, constrained);
-    if (cuts)
-      costs = verifyBudget->costs(lanes, constrained);
-    ops::DraftSelector::addVerifyRows(graph, selection, step,
-                                      cuts ? std::span<const float>(costs) : std::span<const float>{});
+    ops::DraftSelector::addVerifyRows(graph, selection, step);
   }
 
   // A lane's proposals of a cycle beside its draft's: its host chain of at
@@ -2478,7 +2459,6 @@ struct Runtime::Impl {
     QwenTargetDecodeBuffers decode;
     decode.step = step;
     decode.gdnTape = decodeArena->batchSlice(DecodeTensor::GdnTape, kLaneCount);
-    decode.verifyRows = decodeArena->batchSlice(DecodeTensor::VerifyRows, lanes);
     decode.tree = decodeArena->batchSlice(DecodeTensor::TreeRows, lanes);
     decode.capturedTargetHidden = decodeArena->batchSlice(DecodeTensor::CapturedTargetHidden, kLaneCount);
     decode.finalHidden = decodeArena->batchSlice(DecodeTensor::FinalHidden, kLaneCount);
@@ -2577,8 +2557,7 @@ struct Runtime::Impl {
          decodeArena->batchSlice(DecodeTensor::RetainedCount, width),
          decodeArena->batchSlice(DecodeTensor::AcceptedCount, width),
          decodeArena->batchSlice(DecodeTensor::RetainedRows, width),
-         decodeArena->batchSlice(DecodeTensor::LaneLayout, width),
-         decodeArena->batchSlice(DecodeTensor::VerifyRows, width)},
+         decodeArena->batchSlice(DecodeTensor::LaneLayout, width)},
         step, maximumRetained, geometry.target.stopTokens);
   }
 
@@ -2623,7 +2602,7 @@ struct Runtime::Impl {
   // the page boundary its retained rows reach: the lane's state after the
   // rows it retained this cycle before the boundary, which its next cycle
   // would hold had it retained exactly those. The rows a lane retains are
-  // the path of its verify rows its acceptance wrote (DecodeTensor::
+  // the path of its rows its acceptance wrote (DecodeTensor::
   // RetainedRows): the capture folds the path's first `rows` rows of the
   // verify's tape into the state the verify wrote (QwenTarget::addStateFold)
   // and stores their context rows, which the draft's commit normalized, in
@@ -2720,11 +2699,10 @@ struct Runtime::Impl {
   }
 
   // A cycle's results once its command completed, which ends the command's
-  // reads of spilled K/V; `constrained` for a cycle that waited for host
-  // masks, whose costs the verify budget fits apart.
+  // reads of spilled K/V; `step` the rows it laid out.
   std::vector<ModelStepResult> finalizeDecode(
       std::span<DecodeLaneResult> lanes, std::span<const ModelBatchItem> items,
-      CommandTiming timing, SpilledKvReads &reads, bool constrained) {
+      CommandTiming timing, SpilledKvReads &reads, const ops::StepRows &step) {
     reads.end();
     std::array<std::vector<uint64_t>, kLaneCount> unreadable = unreadableBlocks(reads);
     for (uint32_t lane = 0; lane < items.size(); ++lane) {
@@ -2736,17 +2714,18 @@ struct Runtime::Impl {
                                                 "GPU retained token count");
       laneResult.accepted = *contents<uint32_t>(d(DecodeTensor::AcceptedCount),
                                                 "GPU accepted draft count");
-      laneResult.verifyRows = *contents<uint32_t>(d(DecodeTensor::VerifyRows),
-                                                  "GPU verify rows");
       laneResult.retainedRows = *contents<uint32_t>(d(DecodeTensor::RetainedRows), "GPU retained rows");
       laneResult.rows = laneRows(lane);
-      if (!laneResult.verifyRows || laneResult.verifyRows > laneResult.rows.rows)
-        throw std::runtime_error("draft selector produced invalid verify rows");
-      if (!laneResult.retained || laneResult.retained > std::min(laneResult.verifyRows, laneResult.maximumRetained) ||
+      // The step's rows hold its lanes', at most its cap each; the rows past
+      // them are of no lane.
+      const uint32_t rows = laneResult.rows.rows;
+      if (rows > step.laneCap || uint64_t{laneResult.rows.first} + rows > step.rows)
+        throw std::runtime_error("draft selector produced invalid lane rows");
+      if (!laneResult.retained || laneResult.retained > std::min(rows, laneResult.maximumRetained) ||
           std::popcount(laneResult.retainedRows) != static_cast<int>(laneResult.retained) ||
-          !(laneResult.retainedRows & 1) || laneResult.retainedRows >> (laneResult.verifyRows - 1) > 1)
+          !(laneResult.retainedRows & 1) || laneResult.retainedRows >> (rows - 1) > 1)
         throw std::runtime_error("target policy produced invalid retention");
-      if (laneResult.accepted >= laneResult.verifyRows || laneResult.accepted > laneResult.retained)
+      if (laneResult.accepted >= rows || laneResult.accepted > laneResult.retained)
         throw std::runtime_error(
             "target accepted more than the draft proposed");
       // The retained target tokens, from the lane's first row, end with the
@@ -2780,7 +2759,7 @@ struct Runtime::Impl {
           contents<uint32_t>(decodeArena->get(lane, DecodeTensor::Candidates), "draft candidates"),
           uint64_t{kDraftProposalTokens} * SPLASH_DRAFT_CANDIDATES);
       const LookupOutcome outcome =
-          lookupOutcome(entry.lookupChain, treeTokens, tree, std::min(laneResult.verifyRows, size),
+          lookupOutcome(entry.lookupChain, treeTokens, tree, std::min(laneResult.rows.rows, size),
                         {retainedTokens(laneResult), laneResult.retained}, candidates);
       if (!outcome.verified.empty())
         lookupAcceptance.observe(samplingEnabled(entry), entry.lookupLength, outcome.verified, outcome.accepted);
@@ -2794,7 +2773,6 @@ struct Runtime::Impl {
             ExecutionLimits::targetVerifyRows);
         // The lane's retained tokens are its target's selections along its
         // path, which label each row of its tree under one of them.
-        observed[lane].verifyRows = laneResult.verifyRows;
         observed[lane].samples = samplingEnabled(*laneResult.request);
         observed[lane].labels = VerifyBudget::treeLabels(
             {contents<uint32_t>(decodeArena->get(lane, DecodeTensor::DraftTreeTokens), "draft tree tokens"), size},
@@ -2803,8 +2781,7 @@ struct Runtime::Impl {
             {contents<float>(decodeArena->get(lane, DecodeTensor::DraftTreeCaps), "draft tree caps"), size},
             {retainedTokens(laneResult), std::min(laneResult.retained, laneResult.ownSelections)});
       }
-      verifyBudget->observe(std::span(observed).first(items.size()), constrained,
-                            timing.wallSeconds * 1000.0);
+      verifyBudget->observe(std::span(observed).first(items.size()));
     }
 
     std::vector<ModelStepResult> results;
@@ -2870,7 +2847,7 @@ struct Runtime::Impl {
       // only where the output limit or a stop token cut the path).
       const uint32_t accepted =
           std::min(laneResult.accepted, laneResult.retained - 1);
-      const uint32_t verified = laneResult.verifyRows - 1;
+      const uint32_t verified = laneResult.rows.rows - 1;
       results.push_back({entry.id,
                          0,
                          std::move(output),
@@ -2926,14 +2903,10 @@ struct Runtime::Impl {
           entries[lane] = &entry;
           if (!constrained(lane))
             continue;
-          // A constrained lane's grammar finds its verify rows' masks along
-          // each row's path: the rows' tokens from its first row, its
-          // anchor's first, each with its parent row.
+          // A constrained lane's grammar finds its rows' masks along each
+          // row's path: the rows' tokens from its first row, its anchor's
+          // first, each with its parent row.
           const ops::LaneRows block = impl_.laneRows(lane);
-          const uint32_t verified =
-              *contents<uint32_t>(impl_.decodeArena->get(lane, DecodeTensor::VerifyRows), "verify rows");
-          if (!verified || verified > block.rows)
-            throw std::runtime_error("draft selector produced invalid verify rows");
           const uint32_t *rows =
               contents<uint32_t>(impl_.decodeArena->batchSlice(DecodeTensor::InputTokens, kLaneCount),
                                  "constrained verify rows") +
@@ -2943,11 +2916,11 @@ struct Runtime::Impl {
                                      "constrained verify tree") +
               block.first;
           entry.maskWords.clear();
-          entry.verifyMaskRows = verified + 1;
+          entry.verifyMaskRows = block.rows + 1;
 
           if (!abandoned_[lane]) {
-            ModelMaskRequest request{entry.id, {rows, rows + verified}, {}};
-            for (uint32_t row = 0; row < verified; ++row)
+            ModelMaskRequest request{entry.id, {rows, rows + block.rows}, {}};
+            for (uint32_t row = 0; row < block.rows; ++row)
               request.parents.push_back(row ? tree[row].parent : kNoMaskParent);
             requests_.push_back(std::move(request));
           }
@@ -3049,7 +3022,7 @@ struct Runtime::Impl {
           targetForwardGpuSeconds_;
       counters.lastConstrainedMaskWaitSeconds = maskWaitSeconds_;
       counters.totalConstrainedMaskWaitSeconds += maskWaitSeconds_;
-      std::vector<ModelStepResult> results = impl_.finalizeDecode(lanes_, items_, timing_, *reads_, true);
+      std::vector<ModelStepResult> results = impl_.finalizeDecode(lanes_, items_, timing_, *reads_, step_);
       // The page sources of the items and the reads go with the command,
       // before the engine applies its results (DeferredMetalTicket::wait).
       items_.clear();
@@ -3682,7 +3655,7 @@ Runtime::decodeAsync(const BatchPlan &plan,
   impl_->draftModel.addMaskRows(commandGraph, impl_->decodeArena->batchSlice(DecodeTensor::DraftHidden0, width),
                                 width);
   impl_->encodeDraftBatchGraph(commandGraph, entries, {logicalPositions.data(), width}, {depths.data(), width},
-                               std::span(proposals).first(width), constrained, step);
+                               std::span(proposals).first(width), step);
   std::shared_ptr<SpilledKvReads> reads = impl_->decodeReads(items);
   // The weights it reads on demand and the spilled K/V its reads bring.
   WorkCount count({}, impl_->model.expertStore(), reads);
@@ -3699,9 +3672,9 @@ Runtime::decodeAsync(const BatchPlan &plan,
 
   std::vector<ModelBatchItem> copiedItems(items.begin(), items.end());
   Impl *impl = impl_.get();
-  auto finish = [impl, lanes = std::move(lanes), reads,
-                 items = std::move(copiedItems)](CommandTiming timing) mutable {
-    return impl->finalizeDecode(lanes, items, timing, *reads, false);
+  auto finish = [impl, lanes = std::move(lanes), reads, items = std::move(copiedItems),
+                 step](CommandTiming timing) mutable {
+    return impl->finalizeDecode(lanes, items, timing, *reads, step);
   };
   CommandTicket command = impl_->backend.submitCommandAsync(
       commandGraph.command(), std::move(completion));
@@ -4217,12 +4190,6 @@ ModelMemoryPlan plannedRuntimeMemory(const ModelDescriptor &descriptor, const Qw
       RuntimeGeometry::from(descriptor, descriptor.draft, target, kvFormat, stateFormat, parts), operators);
 }
 
-bool budgetsVerifyRows(const LoadedModel &model, VerifyRows rows) noexcept {
-  const bool moe =
-      std::visit([](const auto &layout) { return layout.ffnKind == QwenFfnKind::SparseMoe; }, model.descriptor.target);
-  return moe && rows == VerifyRows::Auto;
-}
-
 std::unique_ptr<RuntimeModel> createRuntime(RuntimeContext context) {
   return std::make_unique<Runtime>(std::move(context));
 }
@@ -4247,7 +4214,7 @@ std::span<const uint16_t> RuntimeInstrumentation::lastCapturedRows(const Runtime
 }
 
 uint32_t RuntimeInstrumentation::lastVerifyRows(const Runtime &runtime, uint32_t lane) {
-  return *contents<uint32_t>(runtime.impl_->decodeArena->get(lane, DecodeTensor::VerifyRows), "verify rows");
+  return runtime.impl_->laneRows(lane).rows;
 }
 
 uint32_t RuntimeInstrumentation::lastRetainedRows(const Runtime &runtime, uint32_t lane) {

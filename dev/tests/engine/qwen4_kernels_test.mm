@@ -1631,7 +1631,10 @@ void plePackedCommit(MetalBackend &backend) {
 
 // Lanes of different row counts packed one after another (5, 8, 1 and 6
 // rows from rows 0, 5, 13 and 14) hash their rows as each lane does alone
-// from row 0, each from its own tokens before it, bit for bit.
+// from row 0, each from its own tokens before it, bit for bit; the step's
+// three rows of no lane after them, each holding lane 0's anchor
+// (VerifyRowsParams) and a tree row no kernel may read, take lane 0's anchor
+// row's table rows.
 void pleHashPackedLanes(MetalBackend &backend) {
   const uint32_t heads = 16, eos = 248044;
   NgramHashParams params{};
@@ -1646,17 +1649,28 @@ void pleHashPackedLanes(MetalBackend &backend) {
     params.offsets[h] = h * 20000000;
   }
   const std::array<ops::LaneRows, 4> packed{{{0, 5}, {5, 8}, {13, 1}, {14, 6}}};
+  constexpr uint32_t kNoLane = 3;
   const std::vector<uint32_t> tokens = {5, 6, eos, 7, 8, 9, 10, 11, 1, 2, 3, 4, 5, 248319,
-                                        0, 12, eos, 13, 14, 15};
+                                        0, 12, eos, 13, 14, 15, 5, 5, 5};
   const std::vector<uint32_t> before = {40, 41, NGRAM_EMBEDDING_NONE, NGRAM_EMBEDDING_NONE, eos, 77, 3, eos};
   MetalBuffer indices = scratch(backend, uint64_t{tokens.size()} * heads * 4);
+  std::memset(indices.contents(), 0xff, indices.sizeBytes());
+  ops::StepRows step = stepOf(packed);
+  step.rows += kNoLane;
+  std::vector<ops::TreeRow> tree(step.rows, ops::TreeRow{~0U, 0xffff, 0xffff});
+  for (const ops::LaneRows &lane : packed)
+    for (uint32_t row = 0; row < lane.rows; ++row) tree[lane.first + row] = splash::test::chainRow(row);
   CommandGraph graph;
   ops::NgramEmbedding::addHash(graph,
-                               {upload(backend, tokens), chainsOf(backend, packed), laneRowsOf(backend, packed),
+                               {upload(backend, tokens), upload(backend, tree), laneRowsOf(backend, packed),
                                 upload(backend, before), indices},
-                               params, stepOf(packed), heads);
+                               params, step, heads);
   run(backend, graph);
   const auto got = download<uint32_t>(indices, tokens.size() * heads);
+  bool noLane = true;
+  for (uint32_t row = step.rows - kNoLane; row < step.rows; ++row)
+    noLane &= std::equal(got.begin(), got.begin() + heads, got.begin() + uint64_t{row} * heads);
+  check(noLane, "PLE hash of the rows of no lane: lane 0's anchor row's");
   bool ok = true;
   for (uint32_t lane = 0; lane < packed.size(); ++lane) {
     const ops::LaneRows block = packed[lane];

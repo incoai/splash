@@ -376,15 +376,13 @@ struct MoeBuffers final {
   metal::MetalBuffer output;
   MoeScratch scratch;
   // A decode step's `lanes` lanes: each lane's rows of the step, a
-  // SplashLaneRows a lane, and its verify rows, the first of them, a uint32 a
-  // lane, as the draft selector lays them out on the device
-  // (ops::DraftSelector::addVerifyRows). Its routing routes each lane's verify
-  // rows alone and every row of no lane (moe_group_routes_verified*), and a
-  // streamed load predicts the next MoE block's experts from the rows it
-  // routes. A prompt chunk has no lanes: every row routes.
+  // SplashLaneRows a lane, as the draft selector lays them out on the device
+  // (ops::DraftSelector::addVerifyRows). Its routing routes its lanes' rows
+  // alone, no row of no lane (moe_group_routes_verified*), and a streamed
+  // load predicts the next MoE block's experts from the rows it routes. A
+  // prompt chunk has no lanes: every row routes.
   uint32_t lanes = 0;
   metal::MetalBuffer laneRows;
-  metal::MetalBuffer verifyRows;
 };
 
 // Routes and executes grouped experts from immutable weight views.

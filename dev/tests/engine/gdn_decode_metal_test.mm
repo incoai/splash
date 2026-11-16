@@ -12,12 +12,12 @@
 // gate's hidden rows are also checked bit for bit against the prefill gate's
 // from the same recurrent rows. Changing multi-step batches are compared
 // bit for bit with independent lanes, with rejected tape rows poisoned. The
-// decode over a bf16 state is checked against the fp32 decode. A lane's step
-// rows past its verify rows change only those rows' outputs, which are zero.
-// A fold of a step's first rows alone stores the state the lane's next step
-// holds when it retained those or more, bit for bit.
-// Lanes whose blocks of a step's rows hold fewer rows than a lane's eight, at
-// any first row, leave what each block run alone leaves.
+// decode over a bf16 state is checked against the fp32 decode. A fold of a
+// step's first rows alone stores the state the lane's next step holds when it
+// retained those or more, bit for bit. Lanes whose blocks of a step's rows
+// hold fewer rows than a lane's eight, at any first row, the step's other
+// rows of no lane, leave what each block run alone leaves, and the rows of no
+// lane as they were.
 #include "ChainRows.hpp"
 #include "TestBuffers.hpp"
 #include "TestChecks.hpp"
@@ -188,8 +188,6 @@ struct Fixture final {
   uint64_t packedStride, tapeBytes, kvWidth;
   Random random;
   MetalBuffer packed, convWeights, decayWeights, timeBias, hidden, tape;
-  // Each lane's verify rows: every row.
-  MetalBuffer verifyRows;
   // The step's rows' places in their blocks' trees: each block a chain.
   MetalBuffer tree;
   // Its blocks as its steps take them (decodeBuffers).
@@ -224,8 +222,6 @@ struct Fixture final {
                    "gdn hidden");
     tape = alloc(2 * kMaxLanes * kLayers * tapeBytes, "gdn tape");
     std::memset(tape.contents(), 0, tape.sizeBytes());
-    verifyRows = alloc(kMaxLanes * sizeof(uint32_t), "gdn verify rows");
-    std::fill_n(static_cast<uint32_t *>(verifyRows.contents()), kMaxLanes, kRows);
     tree = alloc(uint64_t{kMaxLanes} * kRows * sizeof(TreeRow), "gdn tree rows");
     steps.emplace(backend, std::span(blocks).first(0));
     mixerNorm = makeNormWeights(backend, kHeadDim, float32,
@@ -289,7 +285,7 @@ struct Fixture final {
   GdnDecodeBuffers decodeBuffers(uint32_t layer) const {
     steps->write(std::span(blocks).first(lanes));
     return steps->into({packedLayer[layer], convWeights, current, next, tape, {}, {}, 0, 0, decayWeights, timeBias,
-                        mixerNorm, hidden, verifyRows, tree});
+                        mixerNorm, hidden, tree});
   }
 
   // Row `token` of lane `lane` in layer `layer` of the packed projection.
@@ -718,6 +714,12 @@ struct PreparedTables final {
     addReferencePreparation(graph, layout, hidden, referenceTable, referenceSums, width,
                             lanes * kRows / GGUF_TABLE16_ROWS);
   }
+  // The decode's table and sums as the preparation of `hidden` writes them,
+  // before a decode that leaves rows of no lane, whose hidden rows stay as
+  // they were, writes its own.
+  void addInitial(CommandGraph &graph, const MetalBuffer &hidden) const {
+    addReferencePreparation(graph, layout, hidden, table, sums, width, lanes * kRows / GGUF_TABLE16_ROWS);
+  }
   // The decode reported the table it wrote, and wrote the reference's bytes.
   void requireWritten(const PreparedInput &reported, const MetalBuffer &hidden,
                       const std::string &what) const {
@@ -968,7 +970,6 @@ void bufferExtents(MetalBackend &backend, const GdnShape &shape, LinearInput lay
            {&GdnDecodeBuffers::timeBias, uint64_t{shape.valueHeads} * 2, 2, "GDN time bias"},
            {&GdnDecodeBuffers::tape, fixture.slot(lanes - 1, 1) + kLayers * fixture.tapeBytes, 2, "GDN tape"},
            {&GdnDecodeBuffers::hidden, rows * width * 2, 2, "GDN hidden"},
-           {&GdnDecodeBuffers::verifyRows, uint64_t{lanes} * 4, 4, "GDN verify rows"},
            {&GdnDecodeBuffers::tree, rows * sizeof(TreeRow), sizeof(TreeRow), "GDN tree rows"},
            {&GdnDecodeBuffers::laneRows, uint64_t{lanes} * sizeof(SplashLaneRows), 4, "GDN lane rows"}})
     requireExtent(backend, decode.*member, bytes, element, what, [&](CommandGraph &graph, const MetalBuffer &buffer) {
@@ -1129,129 +1130,19 @@ void gateMatchesPrefill(MetalBackend &backend, const GdnShape &shape, bool float
   }
 }
 
-// Two steps of every layer over cells of `format`, the second folding
-// retained[l] rows of the first, with lane l verifying verify[l] rows of each
-// step: what they leave in the hidden rows, the tape and the next cells. Where
-// `layout` is a table, each step's out-projection table and sums must be the
-// reference preparation of its hidden rows.
-struct StepsRun final {
-  std::vector<uint8_t> hidden, tape;
-  std::vector<std::vector<uint8_t>> cells;
-};
-StepsRun runSteps(MetalBackend &backend, const GdnShape &shape, uint32_t lanes, LinearInput layout, bool float32,
-                  GdnHeadOrder order, GdnStateFormat format, const std::array<uint32_t, kMaxLanes> &verify,
-                  const std::array<uint32_t, kMaxLanes> &retained, const std::string &what) {
-  const auto bytesOf = [](const MetalBuffer &buffer) {
-    const auto *bytes = static_cast<const uint8_t *>(buffer.contents());
-    return std::vector<uint8_t>(bytes, bytes + buffer.sizeBytes());
-  };
-  Fixture fixture(backend, shape, lanes, float32);
-  const Cell cell(shape, format);
-  const bool narrow = format == GdnStateFormat::BFloat16;
-  std::array<MetalBuffer, kMaxLanes> current = fixture.current, next = fixture.next;
-  if (narrow) {
-    // The fixture's fp32 cells rounded to bf16, as bfloatState takes them.
-    const uint64_t elements = uint64_t{shape.valueHeads} * shape.headDimension * shape.headDimension;
-    for (uint32_t lane = 0; lane < kMaxLanes; ++lane) {
-      current[lane] = sharedBuffer(backend, cell.bytes);
-      next[lane] = sharedBuffer(backend, cell.bytes);
-      std::memset(next[lane].contents(), 0, cell.bytes);
-      std::memcpy(current[lane].contents(), fixture.current[lane].contents(), cell.convBytes);
-      for (uint32_t layer = 0; layer < kLayers; ++layer) {
-        const float *values = fixture.cell.recurrent(fixture.cellBytes(fixture.current[lane]), layer);
-        auto *rounded = reinterpret_cast<uint16_t *>(static_cast<uint8_t *>(current[lane].contents()) +
-                                                     cell.convBytes + layer * cell.recurrentLayerBytes);
-        for (uint64_t index = 0; index < elements; ++index) rounded[index] = floatToBf16(values[index]);
-      }
-    }
-  }
-  std::optional<PreparedTables> tables;
-  if (layout != LinearInput::Plain)
-    tables.emplace(backend, layout, shape.valueHeads * shape.headDimension, lanes);
-  std::memcpy(fixture.verifyRows.contents(), verify.data(), sizeof(verify));
-  for (uint32_t step = 0; step < 2; ++step) {
-    if (step) {
-      fixture.advance(retained);
-      if (narrow) {
-        std::swap(current, next);
-        for (const MetalBuffer &buffer : next) std::memset(buffer.contents(), 0, cell.bytes);
-      } else {
-        current = fixture.current;
-        next = fixture.next;
-      }
-      fixture.fillPacked();
-      fixture.clear();
-    }
-    CommandGraph graph;
-    PreparedInput prepared;
-    for (uint32_t layer = 0; layer < kLayers; ++layer) {
-      GdnDecodeBuffers buffers = fixture.decodeBuffers(layer);
-      buffers.currentStates = current;
-      buffers.nextStates = next;
-      if (tables) buffers.linearScratch = tables->scratch();
-      prepared = GDN::addDecode(graph, buffers, shape, layer, cell.strides(), order, layout);
-    }
-    if (tables) tables->addReference(graph, fixture.hidden);
-    (void)backend.submitCommandAsync(graph.dispatches()).wait();
-    if (tables)
-      tables->requireWritten(prepared, fixture.hidden, what + " step " + std::to_string(step));
-    else
-      require(prepared.layout == LinearInput::Plain, what + ": plain GDN claimed a table");
-  }
-  StepsRun run{bytesOf(fixture.hidden), bytesOf(fixture.tape), {}};
-  for (uint32_t lane = 0; lane < kMaxLanes; ++lane) run.cells.push_back(bytesOf(next[lane]));
-  return run;
-}
-
-// A lane verifying fewer rows leaves the state, the tape and its verified
-// rows' outputs as every row does, and zero in its other rows; its next step
-// retains at most the rows it verified.
-void partialVerifyRows(MetalBackend &backend, const GdnShape &shape, uint32_t lanes, LinearInput layout,
-                       bool float32, GdnHeadOrder order, GdnStateFormat format) {
-  const std::string what = caseName("partial verify rows", shape, lanes, layout) +
-                           (order == GdnHeadOrder::Tiled ? " tiled" : " grouped") + " " +
-                           std::string(formatName(format));
-  std::array<uint32_t, kMaxLanes> every{}, verify{}, retained{};
-  every.fill(kRows);
-  // Lane l verifies 1 + (5 l + 3) % 8 rows (4, 1, 6, 3) and retains
-  // 1 + (3 l + 2) % those (3, 1, 3, 3).
-  for (uint32_t lane = 0; lane < kMaxLanes; ++lane) {
-    verify[lane] = 1 + (5 * lane + 3) % kRows;
-    retained[lane] = 1 + (3 * lane + 2) % verify[lane];
-  }
-  const StepsRun reference =
-      runSteps(backend, shape, lanes, layout, float32, order, format, every, retained, what + " every row");
-  const StepsRun run = runSteps(backend, shape, lanes, layout, float32, order, format, verify, retained, what);
-  require(run.tape == reference.tape, what + ": tape differs from every row's");
-  require(run.cells == reference.cells, what + ": state cells differ from every row's");
-  const uint64_t rowValues = uint64_t{shape.valueHeads} * shape.headDimension;
-  const auto *got = reinterpret_cast<const uint16_t *>(run.hidden.data());
-  const auto *expected = reinterpret_cast<const uint16_t *>(reference.hidden.data());
-  for (uint32_t lane = 0; lane < lanes; ++lane)
-    for (uint32_t token = 0; token < kRows; ++token) {
-      const uint64_t row = (uint64_t{lane} * kRows + token) * rowValues;
-      if (token < verify[lane])
-        require(!std::memcmp(got + row, expected + row, rowValues * 2),
-                what + ": a verified row differs from every row's");
-      else
-        require(std::all_of(got + row, got + row + rowValues, [](uint16_t v) { return (v & 0x7FFF) == 0; }),
-                what + ": an unverified row is not zero");
-    }
-}
-
-// Lanes 0, 1 and 2 take blocks of 8, 5 and 3 rows at rows 0, 8 and 13 of a
-// step's 16 rows, the last two in one table tile; they verify 7, 5 and 2 of
-// them, and their next steps fold 5, 3 and 2. Over two steps of every layer
-// from the same inputs, the packed step leaves each lane's state cells, tape
-// and hidden rows as its block run alone does (a one-lane step of its rows
-// from row 0, in buffers of its own), byte for byte, and the out-projection
-// table the reference preparation of those hidden rows; a lane's tape rows
-// past its block's rows, poisoned, and the hidden rows past the last block's
-// stay as they were.
+// Lanes 0, 1 and 2 take blocks of 7, 5 and 2 rows at rows 0, 8 and 13 of a
+// step's 16 rows, the last two in one table tile, rows 7 and 15 of no lane,
+// and their next steps fold 5, 3 and 2. Over two steps of every layer from
+// the same inputs, the packed step leaves each lane's state cells, tape and
+// hidden rows as its block run alone does (a one-lane step of exactly its
+// rows from row 0, in buffers of its own), byte for byte, and the
+// out-projection table the reference preparation of those hidden rows; a
+// lane's tape rows past its block's rows, poisoned, and the hidden rows of no
+// lane stay as they were.
 void raggedBlocks(MetalBackend &backend, const GdnShape &shape, bool float32, GdnHeadOrder order, LinearInput layout,
                   GdnStateFormat format) {
   constexpr uint32_t kBlocks = 3, kStepRows = 16;
-  constexpr std::array<uint32_t, kBlocks> kFirst{0, 8, 13}, kBlockRows{8, 5, 3}, kVerify{7, 5, 2};
+  constexpr std::array<uint32_t, kBlocks> kFirst{0, 8, 13}, kBlockRows{7, 5, 2};
   constexpr std::array<uint32_t, kMaxLanes> kRetained{5, 3, 2, 0};
   const std::string what = caseName("ragged blocks", shape, kBlocks, layout) + (float32 ? " f32 norm" : " bf16 norm") +
                            (order == GdnHeadOrder::Tiled ? " tiled" : " grouped") + " " +
@@ -1275,7 +1166,6 @@ void raggedBlocks(MetalBackend &backend, const GdnShape &shape, bool float32, Gd
       }
     }
     std::memset(fixture->tape.contents(), 0xFF, fixture->tape.sizeBytes());
-    std::memcpy(fixture->verifyRows.contents(), kVerify.data(), sizeof(kVerify));
   }
   for (uint32_t lane = 0; lane < kBlocks; ++lane) {
     packed.blocks[lane].firstRow = kFirst[lane];
@@ -1305,6 +1195,7 @@ void raggedBlocks(MetalBackend &backend, const GdnShape &shape, bool float32, Gd
       for (uint32_t lane = 0; lane < kBlocks; ++lane) laneTables.emplace_back(backend, layout, width, 1);
     }
     CommandGraph packedGraph, aloneGraph;
+    if (tables) tables->addInitial(packedGraph, packed.hidden);
     PreparedInput prepared;
     std::vector<StepBlocks> singleBlocks;
     for (uint32_t lane = 0; lane < kBlocks; ++lane)
@@ -1322,7 +1213,6 @@ void raggedBlocks(MetalBackend &backend, const GdnShape &shape, bool float32, Gd
         single.currentStates = current;
         single.nextStates = next;
         single.hidden = view(alone.hidden, lane * kRows * hiddenRowBytes, kRows * hiddenRowBytes);
-        single.verifyRows = view(alone.verifyRows, lane * sizeof(uint32_t), sizeof(uint32_t));
         if (tables) single.linearScratch = laneTables[lane].scratch();
         (void)GDN::addDecode(aloneGraph, single, shape, layer, cell.strides(), order, layout);
       }
@@ -1359,10 +1249,16 @@ void raggedBlocks(MetalBackend &backend, const GdnShape &shape, bool float32, Gd
     }
     require(!std::memcmp(packed.tape.contents(), alone.tape.contents(), packed.tape.sizeBytes()),
             where + ": tapes differ from the blocks' alone");
-    const auto *rest = static_cast<const uint8_t *>(packed.hidden.contents()) + kStepRows * hiddenRowBytes;
-    require(std::all_of(rest, rest + (kMaxLanes * kRows - kStepRows) * hiddenRowBytes,
-                        [](uint8_t byte) { return byte == 0; }),
-            where + ": a hidden row past the last block's was written");
+    // The hidden rows of no lane, those of the step's (7 and 15) and those
+    // past it, stay as they were.
+    for (uint32_t row = 0; row < kMaxLanes * kRows; ++row) {
+      bool laid = false;
+      for (uint32_t lane = 0; lane < kBlocks; ++lane)
+        laid = laid || (row >= kFirst[lane] && row < kFirst[lane] + kBlockRows[lane]);
+      const auto *hidden = static_cast<const uint8_t *>(packed.hidden.contents()) + row * hiddenRowBytes;
+      require(laid || std::all_of(hidden, hidden + hiddenRowBytes, [](uint8_t byte) { return byte == 0; }),
+              where + ": hidden row " + std::to_string(row) + " of no lane was written");
+    }
   }
 }
 
@@ -1568,15 +1464,15 @@ void raggedTrees(MetalBackend &backend, const GdnShape &shape, bool float32, Gdn
 }
 
 // The rows of a tree block each compute what the chain of their path
-// computes: four lanes of random trees of `blockRows` rows (the last
-// verifying only its first rows) from the same states, each a step of every
-// layer, on the kernels of eight rows or of sixteen.
+// computes: four lanes of random trees of `blockRows` rows (the last holding
+// only its first rows, the rest of no lane) from the same states, each a step
+// of every layer, on the kernels of eight rows or of sixteen.
 // Each row's tape row is the last tape row of its path run as a chain (a
 // lane of its own from the same state, its packed rows the path's), bit for
 // bit, and its hidden row that chain's last within their sums' rounding: the
 // chain advances the state row by row, the tree reads the state before the
-// block through its query carried up the path (gdn_decode_transform). An
-// unverified row's hidden row is zero. The next step, folding each lane's
+// block through its query carried up the path (gdn_decode_transform). A row
+// of no lane's hidden row stays as it was. The next step, folding each lane's
 // deepest path, leaves the cells, tape and hidden rows that folding the
 // chain of that path leaves, bit for bit.
 void treeRows(MetalBackend &backend, const GdnShape &shape, bool float32, GdnStateFormat format,
@@ -1590,15 +1486,14 @@ void treeRows(MetalBackend &backend, const GdnShape &shape, bool float32, GdnSta
   Fixture tree(backend, shape, kMaxLanes, float32);
   if (narrow) narrowCells(tree, cell);
   // Narrow and wide trees, and a chain whose last row is its second last's
-  // sibling; the last lane verifies only its first rows.
+  // sibling; the last lane holds only its first rows.
   std::array<BlockTree, kMaxLanes> trees{randomTree(random, blockRows, 3), randomTree(random, blockRows, blockRows),
                                          randomTree(random, blockRows, 1), randomTree(random, blockRows, 4)};
   trees[2].parent.back() = blockRows - 3;
-  const std::array<uint32_t, kMaxLanes> verified{blockRows, blockRows, blockRows, blockRows - 3};
-  std::memcpy(tree.verifyRows.contents(), verified.data(), sizeof(verified));
+  const std::array<uint32_t, kMaxLanes> held{blockRows, blockRows, blockRows, blockRows - 3};
   auto *rows = static_cast<TreeRow *>(tree.tree.contents());
   for (uint32_t lane = 0; lane < kMaxLanes; ++lane) {
-    tree.blocks[lane].rows = blockRows;
+    tree.blocks[lane].rows = held[lane];
     for (uint32_t row = 0; row < blockRows; ++row) rows[lane * kRows + row] = trees[lane].node(row);
   }
   decodeStep(backend, tree, cell, tree.blocks);
@@ -1615,7 +1510,6 @@ void treeRows(MetalBackend &backend, const GdnShape &shape, bool float32, GdnSta
       for (uint32_t row = 0; row < path.size(); ++row)
         std::memcpy(const_cast<uint16_t *>(chain.packedRow(layer, laneOfChain, row)),
                     tree.packedRow(layer, lane, path[row]), packedRowBytes);
-    static_cast<uint32_t *>(chain.verifyRows.contents())[laneOfChain] = blockRows;
   };
   const auto comparePath = [&](const Fixture &chain, uint32_t lane, uint32_t laneOfChain, uint32_t leaf) {
     const std::vector<uint32_t> path = trees[lane].path(leaf);
@@ -1647,7 +1541,7 @@ void treeRows(MetalBackend &backend, const GdnShape &shape, bool float32, GdnSta
   std::array<uint32_t, kMaxLanes> deepest{};
   std::vector<std::pair<uint32_t, uint32_t>> others;
   for (uint32_t lane = 0; lane < kMaxLanes; ++lane) {
-    const std::vector<uint32_t> leaves = trees[lane].leaves(verified[lane]);
+    const std::vector<uint32_t> leaves = trees[lane].leaves(held[lane]);
     deepest[lane] = *std::max_element(leaves.begin(), leaves.end(), [&](uint32_t a, uint32_t b) {
       return trees[lane].path(a).size() < trees[lane].path(b).size();
     });
@@ -1669,11 +1563,11 @@ void treeRows(MetalBackend &backend, const GdnShape &shape, bool float32, GdnSta
     for (uint32_t index = 0; index < count; ++index)
       comparePath(leaves, others[first + index].first, index, others[first + index].second);
   }
-  // Rows past a lane's verified rows output zero.
-  for (uint32_t row = verified.back(); row < blockRows; ++row) {
+  // The rows past the last lane's, of no lane, stay as they were.
+  for (uint32_t row = held.back(); row < blockRows; ++row) {
     const uint16_t *hidden = tree.hiddenRow(kMaxLanes - 1, row, 0);
-    require(std::all_of(hidden, hidden + hiddenRowBytes / 2, [](uint16_t value) { return (value & 0x7FFF) == 0; }),
-            what + ": an unverified tree row is not zero");
+    require(std::all_of(hidden, hidden + hiddenRowBytes / 2, [](uint16_t value) { return value == 0; }),
+            what + ": a tree row of no lane was written");
   }
   require(inexact * 50 <= compared, what + ": more than 2% of tree rows' hidden values differ from their paths'");
 
@@ -1692,7 +1586,6 @@ void treeRows(MetalBackend &backend, const GdnShape &shape, bool float32, GdnSta
       tape = {tape.stepSlot, tape.pendingSlot, paths[lane]};
       fixture->blocks[lane].rows = blockRows;
     }
-    std::fill_n(static_cast<uint32_t *>(fixture->verifyRows.contents()), kMaxLanes, blockRows);
     fixture->chains();
     fixture->clear();
   }
@@ -1743,7 +1636,6 @@ void narrowKernelsFoldPathsPastTheirRows(MetalBackend &backend, const GdnShape &
       if (trees[lane].path(row).size() <= kNarrowRows) accepted[lane] = row;
     require(accepted[lane], what + ": a lane's tree has no path of at most eight rows past row 7");
   }
-  std::fill_n(static_cast<uint32_t *>(tree.verifyRows.contents()), kMaxLanes, kRows);
   decodeStep(backend, tree, cell, tree.blocks);
   // Each accepted path run as a chain from the tree lane's state.
   const uint64_t packedRowBytes = uint64_t{shape.packedWidth} * 2;
@@ -1770,7 +1662,6 @@ void narrowKernelsFoldPathsPastTheirRows(MetalBackend &backend, const GdnShape &
       tape = {tape.stepSlot, tape.pendingSlot, path};
       fixture->blocks[lane].rows = kNarrowRows;
     }
-    std::fill_n(static_cast<uint32_t *>(fixture->verifyRows.contents()), kMaxLanes, kNarrowRows);
     fixture->chains();
     fixture->clear();
   }
@@ -1829,7 +1720,6 @@ void chainHalves(MetalBackend &backend, const GdnShape &shape, bool float32) {
   // Each lane's first eight rows, then its next eight as the next step's
   // first.
   for (uint32_t lane = 0; lane < kMaxLanes; ++lane) halves.blocks[lane].rows = kHalf;
-  std::fill_n(static_cast<uint32_t *>(halves.verifyRows.contents()), kMaxLanes, kHalf);
   decodeStep(backend, halves, cell, halves.blocks);
   std::vector<uint8_t> firstHidden(static_cast<const uint8_t *>(halves.hidden.contents()),
                                    static_cast<const uint8_t *>(halves.hidden.contents()) + halves.hidden.sizeBytes());
@@ -1867,7 +1757,6 @@ void chainHalves(MetalBackend &backend, const GdnShape &shape, bool float32) {
   halves.advance(pending);
   for (Fixture *fixture : {&whole, &halves}) {
     for (uint32_t lane = 0; lane < kMaxLanes; ++lane) fixture->blocks[lane].rows = kHalf;
-    std::fill_n(static_cast<uint32_t *>(fixture->verifyRows.contents()), kMaxLanes, kHalf);
     fixture->clear();
   }
   whole.fillPacked();
@@ -2264,13 +2153,6 @@ int main(int argc, char **argv) {
         for (bool float32 : familyNorms(shape))
           for (LinearInput layout : {LinearInput::Plain, LinearInput::Table16})
             bfloatState(backend, shape, lanes, float32, layout);
-    for (const GdnShape &shape : kShapes)
-      for (uint32_t lanes = 1; lanes <= kMaxLanes; ++lanes)
-        for (bool float32 : familyNorms(shape))
-          for (LinearInput layout : {LinearInput::Plain, LinearInput::Table16})
-            for (GdnStateFormat format : {GdnStateFormat::Float32, GdnStateFormat::BFloat16})
-              partialVerifyRows(backend, shape, lanes, layout, float32,
-                                float32 ? GdnHeadOrder::Tiled : GdnHeadOrder::Grouped, format);
     for (const GdnShape &shape : kShapes)
       for (const GdnStateFormat format : {GdnStateFormat::Float32, GdnStateFormat::BFloat16})
         foldMatchesTheNextStep(backend, shape, format);

@@ -521,7 +521,6 @@ enum class DecodeTensor : uint32_t {
   // Sampling.h AcceptBatchParams) and the K/V path commit reads.
   RetainedRows,
   AcceptedCount,
-  VerifyRows,
   // Each lane's rows of a step (SplashLaneRows), which the step's selector
   // writes (ops::DraftSelector::addVerifyRows), or a first token's selection.
   LaneLayout,
