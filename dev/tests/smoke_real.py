@@ -719,11 +719,13 @@ def run_text_only(port: int, model: str, nonce: str) -> None:
     print("text-only media refusal: PASS", flush=True)
 
 
-# A tool whose only valid call is {"value": "ok"}.
+# A tool whose only valid call is {"value": "ok"}. Strict, so that its
+# arguments are generated to its schema.
 PROBE_TOOL = {
     "type": "function",
     "function": {
         "name": "record_probe",
+        "strict": True,
         "description": "Record the fixed smoke-test value.",
         "parameters": {
             "type": "object",
@@ -802,7 +804,7 @@ def run(port: int, model: str) -> None:
     require(calls[0].get("function", {}).get("name") == "record_probe", "wrong tool")
     require(
         json.loads(calls[0]["function"]["arguments"]) == {"value": "ok"},
-        "wrong tool arguments",
+        f"wrong strict tool arguments: {calls!r}",
     )
     print("tool protocol: PASS", flush=True)
 
