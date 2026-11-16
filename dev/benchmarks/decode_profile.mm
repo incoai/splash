@@ -13,7 +13,9 @@
 // cycle pays in dispatch boundaries rather than kernel work. --dispatch-list
 // writes the attributed B1 cycles' dispatches in order, one line each: index,
 // pipeline and GPU microseconds. A lane whose answer ends begins it again
-// between cycles, untimed. --step-rows has every decode step take T
+// between cycles, untimed. --prompt FILE[,FILE...] takes each lane's prompt
+// from a file of token ids, lane i the (i mod n)th of n files, as a served
+// width's lanes read different text. --step-rows has every decode step take T
 // rows (at most 16 and at least one a lane: RuntimeInstrumentation::
 // forceStepRows), for the cost of a step by its rows; --attribute off times
 // the fused cycles alone.
@@ -364,7 +366,7 @@ int main(int argc, char **argv) {
                      "[--prompt-tokens N] [--cycles K] [--kv-format int8|bf16] "
                      "[--state-format fp32|bf16] [--expert-memory SIZE] [--ple-memory SIZE] "
                      "[--dispatch-list FILE] [--verify-rows auto|all] [--step-rows T] [--attribute on|off] "
-                     "[--warmups on|off] [--prompt chat|counting|FILE] [--step-log on|off] "
+                     "[--warmups on|off] [--prompt chat|counting|FILE[,FILE...]] [--step-log on|off] "
                      "[--temperature T [--seed S]] [--thinking-budget TOKENS] [--answer-tokens N]\n"
                      "       decode-profile METALLIB MODEL_ROOT "
                      "--images HxW[,HxW...] [--cycles K]\n";
@@ -386,7 +388,8 @@ int main(int argc, char **argv) {
       // the counting prompt, or a file's token ids; and each cycle's choice
       // of its rows.
       bool warmups = false, counting = false, stepLog = false;
-      std::optional<std::filesystem::path> promptFile;
+      // A file of token ids a lane, lane i the (i mod n)th of n.
+      std::vector<std::filesystem::path> promptFiles;
       // Sampled answers at Qwen's recommended top-k 20 and top-p 0.95, and a
       // thinking budget the answers think under from an open thinking block.
       Answer answer;
@@ -431,7 +434,11 @@ int main(int argc, char **argv) {
           const std::string_view value(argv[index + 1]);
           counting = value == "counting";
           if (value != "chat" && !counting)
-            promptFile = std::filesystem::path(value);
+            for (size_t start = 0; start <= value.size();) {
+              const size_t comma = std::min(value.find(',', start), value.size());
+              promptFiles.emplace_back(std::string(value.substr(start, comma - start)));
+              start = comma + 1;
+            }
           textOptions = true;
         } else if (option == "--temperature") {
           answer.sampling.temperature = std::stof(argv[index + 1]);
@@ -461,6 +468,7 @@ int main(int argc, char **argv) {
         } else if (option == "--dispatch-list") {
           dispatchList = argv[index + 1];
           textOptions = true;
+
         } else if (option == "--images")
           grids = parseGrids(argv[index + 1]);
         else
@@ -537,16 +545,24 @@ int main(int argc, char **argv) {
         lanes[index] = {index + 1, index, 0,
                         pageRange(index * pagesPerLane, pagesPerLane)};
       }
-      std::vector<uint32_t> prompt =
-          counting ? countingPrompt(model.descriptor) : chatPrompt(model.descriptor, promptTokens);
-      if (promptFile) {
-        std::ifstream input(*promptFile);
-        prompt.clear();
-        for (uint32_t id = 0; input >> id;)
-          prompt.push_back(id);
-        if (prompt.empty() || !input.eof())
-          throw std::invalid_argument("--prompt reads a file of token ids");
+      std::vector<std::vector<uint32_t>> prompts{
+          counting ? countingPrompt(model.descriptor) : chatPrompt(model.descriptor, promptTokens)};
+      if (!promptFiles.empty()) {
+        prompts.clear();
+        for (const std::filesystem::path &file : promptFiles) {
+          std::ifstream input(file);
+          std::vector<uint32_t> &ids = prompts.emplace_back();
+          for (uint32_t id = 0; input >> id;)
+            ids.push_back(id);
+          if (ids.empty() || !input.eof())
+            throw std::invalid_argument("--prompt reads files of token ids");
+          if (ids.size() + answer.tokens > promptTokens + kAnswerTokens)
+            throw std::invalid_argument("--prompt-tokens holds no lane's prompt and answer of " + file.string());
+        }
       }
+      // Lane `index`'s prompt.
+      const auto promptOf = [&](uint32_t index) -> std::vector<uint32_t> & { return prompts[index % prompts.size()]; };
+      std::vector<uint32_t> &prompt = prompts.front();
       // Under a thinking budget a Qwen answer thinks: a prompt's empty
       // thinking block stays open, and the budget's end is "\n\n</think>".
       if (thinkingTokens) {
@@ -586,7 +602,7 @@ int main(int argc, char **argv) {
         for (Lane &lane : active)
           if (lane.finished) {
             executor.end(lane.id);
-            prefill(executor, lane, prompt, answer);
+            prefill(executor, lane, promptOf(lane.stateLane), answer);
             lane.finished = false;
           }
         return timing;
@@ -652,7 +668,7 @@ int main(int argc, char **argv) {
       profileWidth("B1 decode cycle", std::span<Lane>(&lanes[0], 1));
       // Add one lane at a time so M16 and M24 paths are measured too.
       for (uint32_t index = 1; index < lanes.size(); ++index) {
-        prefill(executor, lanes[index], prompt, answer);
+        prefill(executor, lanes[index], promptOf(index), answer);
         const std::string title = "B" + std::to_string(index + 1) + " decode cycle";
         profileWidth(title.c_str(), std::span<Lane>(lanes.data(), index + 1));
       }
