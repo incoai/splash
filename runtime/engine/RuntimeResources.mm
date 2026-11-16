@@ -426,7 +426,7 @@ void reportVerifyRows(model::VerifyRows rows) {
   if (rows == model::VerifyRows::All)
     logLine("Decode cycles verify every row of the draft's block (--verify-rows all).");
   else
-    logLine("Decode cycles verify the rows the verify budget chooses for each step (--verify-rows auto): greedy "
+    logLine("Decode cycles verify the rows of the step their measured costs choose (--verify-rows auto): greedy "
             "and seeded outputs can differ from run to run.");
 }
 
@@ -1396,18 +1396,13 @@ bool RuntimeResources::closePersistentCache() {
   return true;
 }
 
-model::RuntimeContext RuntimeResources::modelContext() noexcept {
-  return {
-      *backend_,
-      model_,
-      *kvPages_,
-      *stateStorage_,
-      operators_,
-      aneFfn_.get(),
-      blockCache_.get(),
-      historyStream_.get(),
-      verifyRows_,
-  };
+model::RuntimeContext RuntimeResources::modelContext() {
+  // A start's measured step costs stay beside the split's calibrations.
+  const std::string key =
+      model::stepCostsKey(model_, *kvPages_, *stateStorage_, operators_, *backend_, cacheIdentity_.buildId);
+  return {*backend_, model_, *kvPages_, *stateStorage_, operators_, aneFfn_.get(), blockCache_.get(),
+          historyStream_.get(), verifyRows_, [key](uint32_t lanes) { return ane::recall(key + std::to_string(lanes)); },
+          [key](uint32_t lanes, std::string_view line) { ane::remember(key + std::to_string(lanes), line); }};
 }
 
 EngineSpillConfig RuntimeResources::spillConfig() const noexcept {

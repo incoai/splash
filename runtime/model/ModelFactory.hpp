@@ -14,7 +14,9 @@
 #include <filesystem>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <string>
+#include <string_view>
 #include <variant>
 #include <vector>
 
@@ -102,13 +104,15 @@ struct LoadedModel final {
   }
 };
 
-// How a decode cycle chooses the rows of the draft's block the target
-// verifies for each lane (--verify-rows), never past the lane's retention
-// limit: the tokens its output budget leaves, at most the block's rows.
+// How a decode cycle chooses its rows (--verify-rows), never past a lane's
+// retention limit: the tokens its output budget leaves, at most a verify
+// block's rows.
 enum class VerifyRows : uint8_t {
-  // The verify budget's rows on a MoE target, every row on a dense one.
+  // The step costs': a step's rows by the costs the start measures
+  // (StepCosts::choose), every row of which a lane holds verified.
   Auto,
-  // Every row, so that a greedy or seeded request repeats its output.
+  // Every row of a draft's block a lane, so that a greedy or seeded request
+  // repeats its output.
   All,
 };
 
@@ -128,7 +132,22 @@ struct RuntimeContext final {
   KvBlockCache *blockCache = nullptr;
   KvHistoryStream *historyStream = nullptr;
   VerifyRows verifyRows = VerifyRows::Auto;
+  // What a start keeps of the step costs its decode warmups measure on this
+  // Mac (Runtime::warmupDecodeBatch, StepCosts::text): the line a lane
+  // count's were remembered as, if any, which the runtime reads when it is
+  // made, and remembering one; neither where every start measures them.
+  std::function<std::optional<std::string>(uint32_t lanes)> recallStepCosts{};
+  std::function<void(uint32_t lanes, std::string_view line)> rememberStepCosts{};
 };
+
+// What the step costs a start's decode warmups measure follow
+// (RuntimeContext::recallStepCosts), a key to keep them under but for their
+// lane count: the Mac and its macOS, the build `buildId`, the models'
+// manifests, the KV and state formats, the activations, the expert store's
+// cap and floor, and the bytes of a streamed table's row cache.
+[[nodiscard]] std::string stepCostsKey(const LoadedModel &model, const kv::PageStorage &kvPages,
+                                       const QwenStateStorage &stateStorage, const ops::ExecutionPlans &operators,
+                                       const metal::MetalBackend &backend, std::string_view buildId);
 
 // Validates only the interface between independently defined target and draft
 // architectures. Each architecture validates its own tensor and state layout.

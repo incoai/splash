@@ -13,6 +13,7 @@
 #include "model/QwenTarget.hpp"
 #include "model/RuntimeArenas.hpp"
 #include "model/SpilledKvReads.hpp"
+#include "model/StepCosts.hpp"
 #include "model/VerifyBudget.hpp"
 #include "model/WorkFormulas.hpp"
 
@@ -59,8 +60,8 @@ using metal::MetalBuffer;
 
 // A decode step of `rows` rows over `lanes` lanes (ops::StepRows), whose
 // selector lays them out over the lanes' trees (ops::DraftSelector::
-// addVerifyRows), at the lane cap its rows need: a cycle's are a draft's
-// block a lane, or the rows a test forces (Runtime::Impl::chooseStep).
+// addVerifyRows): a forced step's or --verify-rows all's, its cap the one
+// its rows need.
 constexpr ops::StepRows stepOf(uint32_t lanes, uint32_t rows) noexcept {
   return {lanes, rows, ops::verifyLaneCap(rows, lanes)};
 }
@@ -430,19 +431,27 @@ struct Runtime::Impl {
     // the match's length and the chain's tokens, none without.
     uint32_t lookupLength = 0;
     std::vector<uint32_t> lookupChain;
-    // The estimates of the rows its draft's tree took in its last cycle past
-    // its anchor, best first (DecodeTensor::DraftTreeScores), for the choice
-    // of a cycle's rows (VerifyBudget::stepRows); none before its first.
-    std::vector<float> chances;
+    // The estimates of the rows draft steps made or joined past its anchor
+    // of its latest tree in which the draft made a child of the anchor, best
+    // first (keepChances), for the choice of a cycle's rows (laneCurve):
+    // those off its lookup chain's path, and apart those on it, which a
+    // cycle that proposes no host chain takes in its chain's place; none
+    // before its first.
+    struct Chances final {
+      std::vector<float> draft;
+      std::vector<float> joined;
+    };
+    std::optional<Chances> chances;
   };
 
   // A lane's proposals of a cycle beside its draft's (proposeChain): its
-  // host chain's tokens, and whether they are forced, tokens the target
-  // selects whatever its logits, which grows no tree of its draft's beside
-  // them.
+  // host chain's tokens, whether they are forced, tokens the target selects
+  // whatever its logits, which grows no tree of its draft's beside them, and
+  // their chances (VerifyBudget::laneChances).
   struct LaneProposals final {
     uint32_t chain = 0;
     bool forced = false;
+    std::vector<float> chances;
   };
 
   struct DecodeLaneResult final {
@@ -459,6 +468,9 @@ struct Runtime::Impl {
     // The draft proposals the lane's thinking end replaced, which its
     // speculation counts leave out.
     uint32_t endDrafts = 0;
+    // Whether its host chain was forced (LaneProposals::forced): the draft's
+    // rows beside the chain's tokens are dead, as no other is selected there.
+    bool forcedChain = false;
     // The rows of its path, from its anchor's, whose selections are its
     // target's own: every one, or those before a thinking cutoff's row, from
     // which the cutoff selects the end of thinking.
@@ -534,10 +546,20 @@ struct Runtime::Impl {
   ops::Sampling sampling;
   std::unique_ptr<QwenTarget> targetModel;
   DFlashDraft draftModel;
-  // The acceptance model every lane's tree estimates follow, under
-  // --verify-rows auto. None under --verify-rows all: nothing learns, so that
-  // a cycle's outputs repeat.
+  // The acceptance model and costs a decode cycle's rows follow
+  // (--verify-rows auto): its step's rows, by the costs the start measures
+  // (StepCosts), each of which a lane holds it verifies. None under
+  // --verify-rows all: a cycle's step then verifies a draft's block a lane,
+  // no more than each lane holds, so that its outputs repeat.
   std::optional<VerifyBudget> verifyBudget;
+  std::optional<StepCosts> stepCosts;
+  // Keeping the step costs this start measures on this Mac, beside those
+  // earlier starts did (RuntimeContext::recallStepCosts).
+  std::function<void(uint32_t lanes, std::string_view line)> rememberStepCosts;
+  // The fewest rows of each class of a decode step's kernels, up to the most
+  // rows a step runs in one pass (ops::ExecutionPlans::decodeRowClasses).
+  std::vector<uint32_t> stepClasses;
+  uint32_t mostStepRows = kDecodeStepRows;
   // The lookup chains' acceptance, which every unconstrained request's
   // cycles teach under --verify-rows auto, greedy and sampled lanes apart.
   LookupAcceptance lookupAcceptance;
@@ -655,16 +677,26 @@ struct Runtime::Impl {
   VisionArenaPool visionPool{*this};
   EmbeddingsPool embeddingsPool{*this};
   std::vector<ElasticPool *> pools;
-  // The rows every decode step takes in place of a draft's block a lane,
-  // each of them verified, which such steps do not teach, as a test forces
-  // them (RuntimeInstrumentation::forceStepRows).
-  std::optional<uint32_t> forcedStepRows;
+  // The step every decode cycle takes in place of the cycles' choice, each
+  // of its rows verified, which such cycles do not teach: the start's decode
+  // warmups' and measured steps' (Runtime::warmupDecodeBatch), or those a
+  // test forces (RuntimeInstrumentation::forceStepRows). Its rows, at least
+  // a row and at most a verify block a lane, at `laneCap` where given, else
+  // at the cap its rows need.
+  struct ForcedStep final {
+    uint32_t rows = 0;
+    std::optional<uint32_t> laneCap;
+  };
+  std::optional<ForcedStep> forcedStep;
 #ifdef SPLASH_RUNTIME_INSTRUMENTATION
   // Whether commands copy the target's logits before their policy
   // (RuntimeInstrumentation::captureTargetLogits), and the copies, one per
   // batch lane of the last command that made them.
   bool capturingTargetLogits = false;
   std::vector<std::vector<float>> capturedTargetLogits;
+  // The choices of the cycles the budget sized (RuntimeInstrumentation::
+  // takeStepChoices).
+  std::vector<RuntimeInstrumentation::StepChoice> stepChoices;
 #endif
   explicit Impl(RuntimeContext value)
       : backend(value.backend),
@@ -694,8 +726,25 @@ struct Runtime::Impl {
     decodeArena = std::make_unique<DecodeArena>(backend, geometry, operators);
     penaltyTable =
         decodeArena->batchSlice(DecodeTensor::PenaltyState, kLaneCount);
-    if (value.verifyRows == VerifyRows::Auto)
+    // A decode step's classes, up to the rows a step runs in one pass: a
+    // streamed expert store's round (a 48-row step on a 32-row store takes a
+    // second round, +30% a step), else a verify block a lane. Under
+    // --verify-rows auto the start measures them (Runtime::warmupDecodeBatch)
+    // unless an earlier start of this model and build on this Mac did.
+    std::optional<std::pair<ops::MoeShape, uint32_t>> moe;
+    if (geometry.target.ffnKind == QwenFfnKind::SparseMoe)
+      moe.emplace(geometry.target.moeBlockShape(), geometry.target.moeRouterFormat);
+    if (model.expertStore())
+      mostStepRows = std::min(kDecodeStepRows, ExpertStore::cycleRows());
+    stepClasses = operators.decodeRowClasses(mostStepRows, moe);
+    if (value.verifyRows == VerifyRows::Auto) {
       verifyBudget.emplace();
+      stepCosts.emplace(stepClasses, mostStepRows, geometry.target.ffnKind == QwenFfnKind::SparseMoe);
+      for (uint32_t lanes = 1; value.recallStepCosts && lanes <= kLaneCount; ++lanes)
+        if (const std::optional<std::string> line = value.recallStepCosts(lanes))
+          stepCosts->recall(lanes, *line);
+    }
+    rememberStepCosts = std::move(value.rememberStepCosts);
     if (ExpertStore *store = model.expertStore())
       pools.push_back(&expertPool.emplace(*store));
     if (blockCache) {
@@ -1896,8 +1945,8 @@ struct Runtime::Impl {
     if (!graph.dispatches().empty()) backend.preparePipelines(graph.dispatches());
   }
 
-  // Creates the pipelines of the decode steps of `entries` of each lane
-  // cap's most rows, each lane after the longest history the target serves
+  // Creates the pipelines of the decode steps of `entries` of every class
+  // and lane cap, each lane after the longest history the target serves
   // before a lane's most rows, without running them
   // (Runtime::warmupDecodeBatch). The lanes' inputs are prepared for that
   // history; the next decode prepares its own.
@@ -1912,12 +1961,22 @@ struct Runtime::Impl {
       targetModel->prepareVerifyLane(lane, history, request);
       items[lane] = {.requestId = entries[lane]->id, .logicalPosition = history, .pageTable = pages};
     }
-    // The largest step of each lane cap.
+    // A step of each class's last rows (ops::ExecutionPlans::
+    // decodeRowClasses, and a draft's block a lane) at each lane cap that
+    // holds them: every kernel a step of any rows and cap runs, so that no
+    // cycle creates one while serving.
     const auto lanes = static_cast<uint32_t>(entries.size());
-    for (const uint32_t rows : {lanes * kDraftRows, lanes * kDecodeRows}) {
+    const uint32_t most = std::min(mostStepRows, lanes * kDecodeRows);
+    std::vector<ops::StepRows> steps;
+    for (uint32_t rows = lanes; rows <= most; ++rows)
+      if (rows == most || rows == lanes * kDraftRows || std::ranges::binary_search(stepClasses, rows + 1))
+        for (const uint32_t cap : {kDraftRows, kDecodeRows})
+          if (rows <= lanes * cap)
+            steps.push_back({lanes, rows, cap});
+    for (const ops::StepRows &step : steps) {
       SpilledKvReads reads;
       CommandGraph graph;
-      encodeTargetDecodeForward(graph, entries, items, stepOf(lanes, rows), reads);
+      encodeTargetDecodeForward(graph, entries, items, step, reads);
       backend.preparePipelines(graph.dispatches());
     }
   }
@@ -2367,7 +2426,7 @@ struct Runtime::Impl {
 
   // A lane's proposals of a cycle beside its draft's: its host chain of at
   // most `depth` tokens in the lane's chain rows (DecodeTensor::ChainTokens
-  // and ChainRates). A thinking
+  // and ChainRates) and its chances (VerifyBudget::laneChances). A thinking
   // end at the lane's first row is its proposals, a chain the verify selects
   // whatever its logits. Its host chain is otherwise the tokens its grammar
   // forces after its anchor, where it forces any, or its lookup chain.
@@ -2384,14 +2443,15 @@ struct Runtime::Impl {
   // a thinking end, which its cutoff selects, and the tokens a grammar
   // forces, which its masks admit alone (at each of the 847 forced positions
   // of 15 traced structured outputs of Qwen3.8-27B). Beside its tokens the
-  // draft's rows are dead, so its lane grows no tree.
+  // draft's rows are dead, so its lane grows no tree and its chances are its
+  // tokens' alone (laneCurve).
   LaneProposals proposeForcedChain(uint32_t lane, std::span<const uint32_t> tokens, uint32_t depth) {
     const auto chain = static_cast<uint32_t>(std::min<size_t>({tokens.size(), depth, SPLASH_TREE_CHAIN_TOKENS}));
     std::copy_n(tokens.begin(), chain,
                 contents<uint32_t>(decodeArena->get(lane, DecodeTensor::ChainTokens), "chain tokens"));
     std::fill_n(contents<float>(decodeArena->get(lane, DecodeTensor::ChainRates), "chain rates"),
                 chain * SPLASH_TREE_AGREEMENTS, 1.0F);
-    return {chain, true};
+    return {chain, true, std::vector<float>(chain, 1.0F)};
   }
 
   // The tokens its grammar forced after mask row `row`'s path, which a
@@ -2408,7 +2468,8 @@ struct Runtime::Impl {
   // the latest earlier occurrence of its latest tokens (LookupIndex), at most
   // `depth`, each estimated at its depth and the match's length for each
   // agreement with the draft, by its policy's counts (LookupAcceptance), of
-  // which the selector takes its own.
+  // which the selector takes its own; its chances the host's, which knows no
+  // agreement.
   LaneProposals proposeLookup(Request &entry, uint32_t lane, uint32_t depth) {
     const LookupIndex &index = entry.lookup;
     if (index.tokens().size() != entry.tokens.size() + 1 || index.tokens().back() != *entry.pendingToken)
@@ -2420,23 +2481,99 @@ struct Runtime::Impl {
     const bool samples = samplingEnabled(entry);
     auto *tokens = contents<uint32_t>(decodeArena->get(lane, DecodeTensor::ChainTokens), "chain tokens");
     auto *rates = contents<float>(decodeArena->get(lane, DecodeTensor::ChainRates), "chain rates");
+    LaneProposals proposals{static_cast<uint32_t>(chain.size()), false, {}};
+    float chance = 1.0F;
     for (uint32_t at = 0; at < chain.size(); ++at) {
       tokens[at] = chain[at];
       for (uint32_t agreement = 0; agreement < SPLASH_TREE_AGREEMENTS; ++agreement)
         rates[at * SPLASH_TREE_AGREEMENTS + agreement] =
             lookupAcceptance.rate(samples, length, at, static_cast<LookupAgreement>(agreement));
+      chance *= lookupAcceptance.rate(samples, length, at, LookupAgreement::Unknown);
+      proposals.chances.push_back(chance);
     }
     entry.lookupLength = length;
     // A copy: its index grows when the cycle's selections commit.
     entry.lookupChain.assign(chain.begin(), chain.end());
-    return {static_cast<uint32_t>(chain.size()), false};
+    return proposals;
   }
 
-  // A cycle's step over `lanes` lanes: a draft's block a lane, or the rows a
-  // test forces, from a row a lane to a verify block's.
-  ops::StepRows chooseStep(uint32_t lanes) const {
-    return stepOf(lanes, forcedStepRows ? std::clamp(*forcedStepRows, lanes, lanes * kDecodeRows)
-                                        : lanes * kDraftRows);
+  // A lane's chances for its next cycle's rows (laneCurve), from a tree in
+  // which its draft made a child of its anchor, a draft step's row or a
+  // lookup chain's one joined: the estimates of the rows draft steps made or
+  // joined past its anchor, best first, those on its lookup chain's path
+  // apart, which the next cycle's chain estimates anew where it proposes
+  // one. The children a row's draft step drew have estimates that sum to at
+  // most its own (DraftTreeParams); a host chain's child beside them is
+  // estimated by the chain. A tree of no such child (a host chain's that
+  // outranked each of the draft's), and a forced chain's, which grows none,
+  // leave the chances as they were.
+  void keepChances(Request &entry, uint32_t lane, bool forced) const {
+    if (forced)
+      return;
+    const uint32_t size =
+        std::min(*contents<uint32_t>(decodeArena->get(lane, DecodeTensor::DraftTreeSizes), "draft tree size"),
+                 ExecutionLimits::targetVerifyRows);
+    const uint32_t *tokens =
+        contents<uint32_t>(decodeArena->get(lane, DecodeTensor::DraftTreeTokens), "draft tree tokens");
+    const ops::TreeRow *tree = contents<ops::TreeRow>(decodeArena->get(lane, DecodeTensor::DraftTrees), "draft trees");
+    const float *scores = contents<float>(decodeArena->get(lane, DecodeTensor::DraftTreeScores), "draft tree scores");
+    const auto drafted = [&](uint32_t row) { return scores[2 * row] >= 0.0F && scores[2 * row] <= 1.0F; };
+    bool anchorDrafted = false;
+    for (uint32_t row = 1; row < size; ++row)
+      anchorDrafted = anchorDrafted || (tree[row].parent == 0 && drafted(row));
+    if (!anchorDrafted)
+      return;
+    // A chain token's row is its predecessor's child of its token.
+    uint32_t chained = 0;
+    for (uint32_t depth = 0, parent = 0; depth < entry.lookupChain.size(); ++depth) {
+      uint32_t row = parent + 1;
+      while (row < size && !(tree[row].parent == parent && tokens[row] == entry.lookupChain[depth]))
+        ++row;
+      if (row == size)
+        break;
+      chained |= 1U << row;
+      parent = row;
+    }
+    Request::Chances &kept = entry.chances.emplace();
+    for (uint32_t row = 1; row < size; ++row)
+      if (drafted(row))
+        (chained >> row & 1U ? kept.joined : kept.draft).push_back(scores[2 * row + 1]);
+    std::ranges::sort(kept.draft, std::greater<>());
+    std::ranges::sort(kept.joined, std::greater<>());
+  }
+
+  // A lane's chances of a cycle's rows (VerifyBudget::laneChances), at most
+  // its tree's depth: a forced chain's tokens' alone; else its draft's from
+  // its last tree (keepChances), before its first every row's 1 of a draft's
+  // block, and its host chain's, or where it proposes none, those of its last
+  // chain's path that draft steps joined, which its draft proposes again.
+  std::vector<float> laneCurve(const Request &entry, const LaneProposals &proposals, uint32_t depth) const {
+    static const std::vector<float> unknown(kDraftRows - 1, 1.0F);
+    std::span<const float> draft, chain = proposals.chances;
+    if (!proposals.forced) {
+      draft = entry.chances ? std::span<const float>(entry.chances->draft) : std::span<const float>(unknown);
+      if (!proposals.chain && entry.chances)
+        chain = entry.chances->joined;
+    }
+    return VerifyBudget::laneChances(draft, chain, depth);
+  }
+
+  // A cycle's step over curves.size() lanes, each holding at most `holds`
+  // rows (its output left, or a forced chain): a forced step
+  // (StepCosts::forced); without step costs (--verify-rows all), a draft's
+  // block a lane, no more than each lane holds, so that a cycle's shape and
+  // outputs repeat (StepCosts::block); else the step its lane count's
+  // measured costs choose (StepCosts::choose).
+  StepCosts::Choice chooseStep(std::span<const std::vector<float>> curves, std::span<const uint32_t> holds) const {
+    const auto lanes = static_cast<uint32_t>(curves.size());
+    if (forcedStep)
+      return {StepCosts::forced(lanes, forcedStep->rows, forcedStep->laneCap)};
+    if (!stepCosts)
+      return {StepCosts::block(holds)};
+    std::array<std::span<const float>, kLaneCount> chances{};
+    for (uint32_t lane = 0; lane < lanes; ++lane)
+      chances[lane] = curves[lane];
+    return stepCosts->choose(std::span(chances).first(lanes));
   }
 
   // A decode step's target forward: the prompt forward over the step's rows
@@ -2743,7 +2880,7 @@ struct Runtime::Impl {
     bool commits = true;
     for (uint32_t lane = 0; lane < items.size(); ++lane)
       commits = commits && lanes[lane].failure.empty() && unreadable[lane].empty();
-    for (uint32_t lane = 0; lane < items.size() && commits && verifyBudget && !forcedStepRows; ++lane) {
+    for (uint32_t lane = 0; lane < items.size() && commits && verifyBudget && !forcedStep; ++lane) {
       const DecodeLaneResult &laneResult = lanes[lane];
       Request &entry = *laneResult.request;
       if (entry.lookupChain.empty() || entry.constraint == ConstraintMode::TokenMask)
@@ -2764,7 +2901,7 @@ struct Runtime::Impl {
       if (!outcome.verified.empty())
         lookupAcceptance.observe(samplingEnabled(entry), entry.lookupLength, outcome.verified, outcome.accepted);
     }
-    if (verifyBudget && commits && !forcedStepRows) {
+    if (verifyBudget && commits && !forcedStep) {
       std::array<VerifyBudget::Lane, kLaneCount> observed{};
       for (uint32_t lane = 0; lane < items.size(); ++lane) {
         const DecodeLaneResult &laneResult = lanes[lane];
@@ -2831,15 +2968,7 @@ struct Runtime::Impl {
                        targetTokens[laneResult.retained - 1]);
       entry.maskWords.clear();
       entry.verifyMaskRows = 0;
-      // Its tree's estimates past its anchor, best first, for its next
-      // cycle's choice of rows.
-      const uint32_t size =
-          std::min(*contents<uint32_t>(decodeArena->get(lane, DecodeTensor::DraftTreeSizes), "draft tree size"),
-                   ExecutionLimits::targetVerifyRows);
-      const float *scores = contents<float>(decodeArena->get(lane, DecodeTensor::DraftTreeScores), "draft tree scores");
-      entry.chances.resize(size ? size - 1 : 0);
-      for (uint32_t row = 1; row < size; ++row)
-        entry.chances[row - 1] = scores[2 * row + 1];
+      keepChances(entry, lane, laneResult.forcedChain);
       // The end replaced the first proposals, which acceptance keeps as far
       // as the lane retains them; the draft proposed the others, and the
       // speculation counts the ones the lane verified and the accepted ones
@@ -2865,6 +2994,17 @@ struct Runtime::Impl {
     counters.lastDecodeGpuSeconds = timing.gpuSeconds;
     counters.totalDecodeGpuSeconds += timing.gpuSeconds;
     counters.lastDecodeWallSeconds = timing.wallSeconds;
+#ifdef SPLASH_RUNTIME_INSTRUMENTATION
+    if (!stepChoices.empty() && !stepChoices.back().wallMilliseconds) {
+      RuntimeInstrumentation::StepChoice &choice = stepChoices.back();
+      choice.wallMilliseconds = timing.wallSeconds * 1000.0;
+      choice.gpuMilliseconds = timing.gpuSeconds * 1000.0;
+      for (const DecodeLaneResult &lane : lanes.first(items.size())) {
+        choice.verified += lane.rows.rows;
+        choice.retained += lane.retained;
+      }
+    }
+#endif
     counters.totalDecodeWallSeconds += timing.wallSeconds;
     return results;
   }
@@ -3576,8 +3716,9 @@ Runtime::decodeAsync(const BatchPlan &plan,
   std::vector<Impl::DecodeLaneResult> lanes(width);
   std::array<Impl::Request *, kLaneCount> requests{};
   std::array<uint64_t, kLaneCount> logicalPositions{};
-  std::array<uint32_t, kLaneCount> maximumRetained{}, depths{};
+  std::array<uint32_t, kLaneCount> maximumRetained{}, depths{}, holds{};
   std::array<Impl::LaneProposals, kLaneCount> proposals{};
+  std::vector<std::vector<float>> curves(width);
   // A cycle with a constrained lane waits for the host's masks between its
   // commands (ConstrainedDecodeTicket).
   bool constrained = false;
@@ -3607,9 +3748,10 @@ Runtime::decodeAsync(const BatchPlan &plan,
     }
     // Its tree and host chain, as deep as the rows past its anchor it could
     // retain whatever the step's rows (its output left, at most a verify
-    // block), and no more of its rows than that depth past its anchor: under
-    // --verify-rows all a lane verifies every row of a draft's block its
-    // output limit leaves.
+    // block), so that the tree's estimates size the next cycle's
+    // (keepChances), and no more of its rows, nor of its chances of the
+    // cycle's rows, than that depth past its anchor: under --verify-rows all
+    // a lane verifies every row of a draft's block its output limit leaves.
     // Under a thinking budget whose end is not due, no deeper than the
     // thinking it has left: the cutoff's row selects the end whatever its
     // rows below propose.
@@ -3617,11 +3759,29 @@ Runtime::decodeAsync(const BatchPlan &plan,
     const std::optional<ops::ThinkingCutoff> &cutoff = policy.thinkingCutoff;
     depths[lane] = std::min({remaining, kDecodeRows, cutoff && cutoff->row ? cutoff->row + 1 : kDecodeRows}) - 1;
     proposals[lane] = impl_->proposeChain(entry, lane, policy, depths[lane]);
+    curves[lane] = impl_->laneCurve(entry, proposals[lane], depths[lane]);
+    // The rows the lane holds: its anchor and its tree to its depth, or, for
+    // a forced chain, which grows no tree beside it, the chain.
+    holds[lane] = 1 + (proposals[lane].forced ? std::min(proposals[lane].chain, depths[lane]) : depths[lane]);
     requests[lane] = &entry;
     logicalPositions[lane] = item.logicalPosition;
   }
   // The cycle's rows, which every one of its commands lays out alike.
-  const ops::StepRows step = impl_->chooseStep(width);
+  const StepCosts::Choice choice = impl_->chooseStep(curves, std::span(holds).first(width));
+  const ops::StepRows step = choice.step;
+#ifdef SPLASH_RUNTIME_INSTRUMENTATION
+  if (impl_->stepCosts && !impl_->forcedStep) {
+    uint32_t chances = 0;
+    for (const std::vector<float> &curve : curves)
+      chances += static_cast<uint32_t>(curve.size());
+    impl_->stepChoices.push_back({.lanes = width,
+                                  .rows = step.rows,
+                                  .laneCap = step.laneCap,
+                                  .chances = chances,
+                                  .expected = choice.expected,
+                                  .cost = choice.milliseconds});
+  }
+#endif
   for (uint32_t lane = 0; lane < width; ++lane) {
     const ModelBatchItem &item = items[lane];
     Impl::Request &entry = *requests[lane];
@@ -3632,6 +3792,7 @@ Runtime::decodeAsync(const BatchPlan &plan,
     // At most the rows the step may give the lane: its cap, and the step's
     // rows past a row of each other lane.
     laneResult.maximumRetained = std::min({remaining, step.laneCap, step.rows - (width - 1)});
+    laneResult.forcedChain = proposals[lane].forced;
     if (const auto cutoff = Impl::samplingPolicy(entry).thinkingCutoff) {
       laneResult.endDrafts = cutoff->replacedProposals();
       laneResult.ownSelections = std::min(cutoff->row, ExecutionLimits::targetVerifyRows);
@@ -3943,6 +4104,78 @@ WarmupStepResult Runtime::warmupPrefill(uint32_t rows) {
           wallSeconds, std::move(lanes)};
 }
 
+// Lanes of their own, which ignore the stop tokens and hold an answer of a
+// verify block's rows a step, decode cycles of each of the step costs'
+// points (StepCosts::steps), their rows forced and each verified, each timed
+// from its plan to its results: a serving cycle's next waits for its tokens,
+// so a cycle costs its host's work, its graph's and its results', and its
+// GPU's. Each point's cost is the median of kReplays passes over every point,
+// each from the lanes' prompts anew and so over the same tokens and the
+// experts they route, and each starting its points a pass's share further
+// along, so that no point always runs first after the prompts: the first
+// pass's first touch of a buffer or an expert's pages, and a cycle slowed by
+// other work on the GPU (an app's rendering), move no point.
+void Runtime::measureDecodeSteps(uint32_t width) {
+  constexpr uint64_t firstId = std::numeric_limits<uint64_t>::max() - 120;
+  const std::vector<ops::StepRows> steps = impl_->stepCosts->steps(width);
+  const auto answer = static_cast<uint32_t>(steps.size()) * ExecutionLimits::targetVerifyRows;
+  const uint32_t lanePages = (1 + answer + ExecutionLimits::targetVerifyRows + kv::kPageTokens - 1) / kv::kPageTokens;
+  const auto stateLane = [](uint32_t lane) { return ExecutionLimits::maximumBatchWidth - 1 - lane; };
+  const std::optional<Impl::ForcedStep> forced = impl_->forcedStep;
+  std::array<std::vector<uint32_t>, ExecutionLimits::maximumBatchWidth> pages;
+  for (uint32_t lane = 0; lane < width; ++lane) {
+    for (uint32_t page = 0; page < lanePages; ++page) pages[lane].push_back(5 + lane * lanePages + page);
+    requireRunwayPages(impl_->kvPages, pages[lane]);
+  }
+  std::vector<std::vector<double>> replays(StepCosts::kReplays, std::vector<double>(steps.size()));
+  const auto ending = [&] {
+    for (uint32_t lane = 0; lane < width; ++lane)
+      if (impl_->requests.contains(firstId + lane))
+        end(firstId + lane);
+  };
+  try {
+    for (size_t pass = 0; pass < replays.size(); ++pass) {
+      std::array<uint64_t, ExecutionLimits::maximumBatchWidth> positions{};
+      for (uint32_t lane = 0; lane < width; ++lane) {
+        const std::array<uint32_t, 1> prompt{lane};
+        ModelRequest request{.id = firstId + lane, .prompt = prompt, .maxNewTokens = answer};
+        request.flags = RequestIgnoreEndOfSequence;
+        beginColdRequest(request, stateLane(lane));
+        BatchPlan prefillPlan{
+            .kind = WorkKind::Prefill, .items = {{request.id, 1}}, .decodeStage = DecodeStage::Regular};
+        ModelBatchItem item = warmupItem(request.id, 0, 1, pages[lane]);
+        item.inputTokens = prompt;
+        requireLanesSucceeded(prefill(prefillPlan, std::span<const ModelBatchItem>(&item, 1)));
+        prepareWarmupDecode(request.id, lane);
+        positions[lane] = 1;
+      }
+      for (size_t index = 0; index < steps.size(); ++index) {
+        const size_t step = (index + pass * steps.size() / replays.size()) % steps.size();
+        BatchPlan plan{.kind = WorkKind::Decode};
+        std::vector<ModelBatchItem> items;
+        for (uint32_t lane = 0; lane < width; ++lane) {
+          plan.items.push_back({firstId + lane, 0});
+          items.push_back(warmupItem(firstId + lane, positions[lane], 0, pages[lane]));
+        }
+        impl_->forcedStep = Impl::ForcedStep{steps[step].rows, steps[step].laneCap};
+        const auto started = AwakeClock::now();
+        const std::vector<ModelStepResult> decoded = decode(plan, items);
+        replays[pass][step] = std::chrono::duration<double, std::milli>(AwakeClock::now() - started).count();
+        requireLanesSucceeded(decoded);
+        for (uint32_t lane = 0; lane < width; ++lane)
+          positions[lane] += decoded[lane].outputTokens.size() - decoded[lane].outputTokensWithoutKv;
+      }
+      ending();
+    }
+  } catch (...) {
+    impl_->forcedStep = forced;
+    ending();
+    throw;
+  }
+  impl_->forcedStep = forced;
+  impl_->stepCosts->measure(width, replays);
+}
+
 WarmupStepResult Runtime::warmupDecodeBatch(uint32_t width) {
   if (!width || width > ExecutionLimits::maximumBatchWidth) {
     throw std::invalid_argument("invalid decode warmup width");
@@ -3982,6 +4215,15 @@ WarmupStepResult Runtime::warmupDecodeBatch(uint32_t width) {
       plan.items.push_back({firstId + lane, 0});
       items.push_back(warmupItem(firstId + lane, 1, 0, pages[lane]));
     }
+    // A forced step of a draft's block a lane: the cycle that creates the
+    // decode's kernels is the run's coldest (a first cycle five times the
+    // next one tilted the costs' lines below zero), and a forced step
+    // teaches nothing.
+    struct Forcing final {
+      std::optional<Impl::ForcedStep> &step;
+      std::optional<Impl::ForcedStep> before;
+      ~Forcing() { step = before; }
+    } forcing{impl_->forcedStep, std::exchange(impl_->forcedStep, Impl::ForcedStep{width * kDraftRows, std::nullopt})};
     const auto phaseStart = AwakeClock::now();
     auto decoded = decode(plan, items);
     wallSeconds = std::chrono::duration<double>(AwakeClock::now() - phaseStart).count();
@@ -4024,6 +4266,13 @@ WarmupStepResult Runtime::warmupDecodeBatch(uint32_t width) {
     for (uint32_t lane = 0; lane < width; ++lane)
       end(firstId + lane);
     throw;
+  }
+  // The steps' costs, which no earlier start of this model and build on this
+  // Mac measured and remembered, for later starts.
+  if (impl_->stepCosts && !impl_->stepCosts->measured(width)) {
+    measureDecodeSteps(width);
+    if (impl_->rememberStepCosts)
+      impl_->rememberStepCosts(width, impl_->stepCosts->text(width));
   }
   return {"real B" + std::to_string(width) + " draft/verify/commit decode",
           wallSeconds, std::move(lanes)};
@@ -4222,7 +4471,20 @@ uint32_t RuntimeInstrumentation::lastRetainedRows(const Runtime &runtime, uint32
 }
 
 void RuntimeInstrumentation::forceStepRows(Runtime &runtime, std::optional<uint32_t> rows) {
-  runtime.impl_->forcedStepRows = rows;
+  runtime.impl_->forcedStep.reset();
+  if (rows)
+    runtime.impl_->forcedStep = Runtime::Impl::ForcedStep{*rows, std::nullopt};
+}
+
+std::vector<RuntimeInstrumentation::StepChoice> RuntimeInstrumentation::takeStepChoices(Runtime &runtime) {
+  return std::exchange(runtime.impl_->stepChoices, {});
+}
+
+std::vector<StepCosts::Point> RuntimeInstrumentation::stepPoints(const Runtime &runtime, uint32_t lanes) {
+  if (!runtime.impl_->stepCosts)
+    return {};
+  const std::span<const StepCosts::Point> points = runtime.impl_->stepCosts->points(lanes);
+  return {points.begin(), points.end()};
 }
 
 void RuntimeInstrumentation::captureTargetLogits(Runtime &runtime, bool enabled) {

@@ -1232,6 +1232,8 @@ ExpertStore::ExpertStore(metal::MetalBackend &backend, StreamedBlocks streamed, 
 
 ExpertStore::~ExpertStore() = default;
 
+uint32_t ExpertStore::cycleRows() noexcept { return kCycleRows; }
+
 void ExpertStore::bind(uint32_t block, ops::BlockMoeWeights &weights) {
   Impl &impl = *impl_;
   Impl::Block &streamed = impl.blocks.at(block);

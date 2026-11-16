@@ -358,7 +358,8 @@ $(ENGINE_TEST_BUILD) $(ENGINE_SANITIZER_BUILD):
 # library or a framework. Those that also run under the sanitizers list their
 # sources with the sanitizer builds.
 $(TEST_WEIGHT_SOURCE): dev/tests/engine/weight_source_test.cpp runtime/model/WeightSource.cpp
-$(TEST_VERIFY_BUDGET): dev/tests/engine/verify_budget_test.cpp runtime/model/VerifyBudget.cpp
+$(TEST_VERIFY_BUDGET): dev/tests/engine/verify_budget_test.cpp runtime/model/VerifyBudget.cpp \
+		runtime/model/StepCosts.cpp
 $(TEST_LOOKUP_PROPOSALS): dev/tests/engine/lookup_proposals_test.cpp runtime/model/LookupProposals.cpp
 $(TEST_EXPERT_CHUNK_LAYOUT): dev/tests/engine/expert_chunk_layout_test.cpp
 $(TEST_GGUF_FILE): dev/tests/engine/gguf_file_test.cpp runtime/model/GgufFile.cpp \
@@ -516,7 +517,7 @@ $(TEST_MODEL_RUNTIME_ORACLE): dev/tests/engine/model_runtime_oracle_test.mm \
 $(TEST_MODEL_RUNTIME_ORACLE): ENGINE_TEST_CXXFLAGS += -include $(BUILD_ID_HEADER)
 $(TEST_DECODE_PROFILE): dev/benchmarks/decode_profile.mm \
 		dev/tools/LoadOptions.hpp \
-		$(ENGINE_INSTRUMENTED_METAL_OBJECT) $(ENGINE_LIBRARY) $(LIB)
+		$(ENGINE_INSTRUMENTED_METAL_OBJECT) $(ENGINE_INSTRUMENTED_RUNTIME_OBJECT) $(ENGINE_LIBRARY) $(LIB)
 $(TEST_TEACHER_LOGITS): dev/benchmarks/teacher_logits.mm \
 		dev/tools/LoadOptions.hpp \
 		$(ENGINE_INSTRUMENTED_RUNTIME_OBJECT) $(ENGINE_LIBRARY) $(LIB)

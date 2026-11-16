@@ -5,7 +5,6 @@
 #include <cmath>
 #include <functional>
 #include <stdexcept>
-#include <utility>
 
 namespace splash::model {
 namespace {
@@ -204,57 +203,12 @@ VerifyBudget::Acceptance VerifyBudget::fit(std::span<const Label> labels, const 
   return result;
 }
 
-std::vector<float> VerifyBudget::laneChances(std::span<const float> tree, std::span<const float> lookup) {
-  std::vector<float> chances(tree.size() + lookup.size());
-  std::merge(tree.begin(), tree.end(), lookup.begin(), lookup.end(), chances.begin(), std::greater<>());
-  chances.resize(std::min<size_t>(chances.size(), SPLASH_TARGET_VERIFY_ROWS - 1));
+std::vector<float> VerifyBudget::laneChances(std::span<const float> tree, std::span<const float> chain,
+                                             uint32_t depth) {
+  std::vector<float> chances(tree.size() + chain.size());
+  std::merge(tree.begin(), tree.end(), chain.begin(), chain.end(), chances.begin(), std::greater<>());
+  chances.resize(std::min<size_t>({chances.size(), depth, kBlockRows - 1}));
   return chances;
-}
-
-ops::StepRows VerifyBudget::stepRows(std::span<const std::vector<float>> curves, std::span<const float> costs) {
-  const auto lanes = static_cast<uint32_t>(curves.size());
-  if (!lanes || lanes > kLanes)
-    throw std::invalid_argument("invalid cycle rows lanes");
-  if (costs.size() <= lanes)
-    throw std::invalid_argument("invalid cycle rows cost");
-  const uint64_t most = std::min<uint64_t>(uint64_t{lanes} * SPLASH_TARGET_VERIFY_ROWS, costs.size() - 1);
-  for (uint64_t rows = lanes; rows <= most; ++rows)
-    if (!(std::isfinite(costs[rows]) && costs[rows] > 0.0F))
-      throw std::invalid_argument("invalid cycle rows cost");
-  // Each cap's chances over the lanes, largest first, and their sums: every
-  // lane's first cap - 1, which its tree took in order.
-  struct Sums final {
-    uint32_t cap = 0;
-    std::vector<double> prefix;
-  };
-  // At most two caps (ops::verifyLaneCap), whose sums stay in place.
-  std::vector<Sums> sums;
-  sums.reserve(2);
-  const auto prefixOf = [&](uint32_t cap) -> const std::vector<double> & {
-    for (const Sums &each : sums)
-      if (each.cap == cap)
-        return each.prefix;
-    std::vector<float> chances;
-    for (const std::vector<float> &curve : curves)
-      chances.insert(chances.end(), curve.begin(), curve.begin() + std::min<size_t>(curve.size(), cap - 1));
-    std::ranges::sort(chances, std::greater<>());
-    std::vector<double> prefix{0.0};
-    for (const float chance : chances)
-      prefix.push_back(prefix.back() + std::clamp(double(chance), 0.0, 1.0));
-    return sums.emplace_back(Sums{cap, std::move(prefix)}).prefix;
-  };
-  uint32_t chosen = lanes;
-  double best = 0.0;
-  for (uint32_t rows = lanes; rows <= most; ++rows) {
-    const std::vector<double> &prefix = prefixOf(ops::verifyLaneCap(rows, lanes));
-    const double expected = lanes + prefix[std::min<size_t>(rows - lanes, prefix.size() - 1)];
-    const double value = expected / costs[rows];
-    if (value > best) {
-      best = value;
-      chosen = rows;
-    }
-  }
-  return {lanes, chosen, ops::verifyLaneCap(chosen, lanes)};
 }
 
 } // namespace splash::model

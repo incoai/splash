@@ -7,7 +7,8 @@
 // every plan line to diff them. With int8 activations off every plan must be
 // its golden plan in bf16 activations (int8ActivationsOff). It also checks
 // that startup warmup's prefill chunks select every plan a prefill chunk
-// selects, with int8 activations on and off (warmupCovers).
+// selects, with int8 activations on and off (warmupCovers), and that a
+// decode step of any rows selects its class's plans (decodeClassesHold).
 //
 //   kernel-selection <golden>            compare against the golden
 //   kernel-selection --write <golden>    write it
@@ -808,6 +809,72 @@ void warmupCovers(const std::string &name, const ExecutionPlans &plans, std::vec
   });
 }
 
+// ---- Decode classes ---------------------------------------------------------
+
+// The choice of a cycle's rows prices a class of decode steps by a step of its
+// last rows, and the start creates that step's kernels alone
+// (ExecutionPlans::decodeRowClasses, model::StepCosts): so a step of any rows,
+// up to a verify block a lane, selects what a step of its class's last rows
+// does, of every kernel a step's rows pick: its projections' tile and staged
+// height in each set of formats the plans tell apart, its float tiles, and a
+// MoE target's expert and router tiles. Adds each class that holds a change
+// to `misses`.
+void decodeClassesHold(const std::string &name, const ExecutionPlans &plans, std::vector<std::string> &misses) {
+  constexpr uint32_t most = SPLASH_MAXIMUM_BATCH_WIDTH * SPLASH_TARGET_VERIFY_ROWS;
+  const auto check = [&](const std::string &what, std::span<const uint32_t> classes, const auto &select) {
+    for (size_t i = 0; i < classes.size(); ++i) {
+      const uint32_t last = i + 1 < classes.size() ? classes[i + 1] - 1 : most;
+      for (uint32_t rows = classes[i]; rows < last; ++rows)
+        if (select(rows) != select(last)) {
+          misses.push_back(name + " " + what + ": a step of " + std::to_string(rows) +
+                           " rows selects another plan than its class's last, " + std::to_string(last));
+          return;
+        }
+    }
+  };
+  const std::vector<uint32_t> dense = plans.decodeRowClasses(most, std::nullopt);
+  const Linear &linear = plans.linear();
+  const auto tile = [](const LinearPlan &plan) {
+    const LinearTile t = plan.configuration().tile;
+    return uint32_t(t) << 8 | (t == LinearTile::GgufStaged || t == LinearTile::GgufRegister ? plan.storageRows() : 0);
+  };
+  std::vector<UnitFormats> units;
+  for (const FormatSet &set : formatSets()) {
+    std::optional<Projection> p;
+    try {
+      p.emplace(projection(projectionCases().front(), set));
+    } catch (const std::exception &) {
+      continue;
+    }
+    const Projection *unit = &*p;
+    const UnitFormats formats = unitFormats(std::span(&unit, 1));
+    if (std::ranges::find(units, formats) != units.end()) continue;
+    units.push_back(formats);
+    for (const auto epilogue : {LinearEpilogue::None, LinearEpilogue::Residual, LinearEpilogue::UpWithGate})
+      check("projection " + set.name + " e" + std::to_string(unsigned(epilogue)), dense,
+            [&](uint32_t rows) { return tile(linear.plan(*p, rows, epilogue)); });
+  }
+  for (const uint32_t format : kFloatFormats)
+    for (const uint32_t columns : kFloatColumns)
+      check("float tile " + formatName(format) + " columns " + std::to_string(columns), dense,
+            [&](uint32_t rows) { return linear.ggufFloatTile(rows, columns, format); });
+  model::forEachFamily([&](const auto &family) {
+    if (family.ffnKind != model::QwenFfnKind::SparseMoe) return;
+    const std::string f(family.family);
+    const MoeShape shape = family.moeBlockShape();
+    std::vector<uint32_t> seen;
+    for (const MoeFormatSet &set : moeFormatSets()) {
+      const uint32_t routerFormat = routerFormatOf(moeBlocks(shape, set));
+      if (std::ranges::find(seen, routerFormat) != seen.end()) continue;
+      seen.push_back(routerFormat);
+      const std::vector<uint32_t> classes = plans.decodeRowClasses(most, std::pair{shape, routerFormat});
+      const auto config = [&](uint32_t rows) { return selectMoe(plans.calibration(), shape, routerFormat, rows); };
+      check("moe experts " + f + " " + set.name, classes, [&](uint32_t rows) { return config(rows).expertTile; });
+      check("moe router " + f + " " + set.name, classes, [&](uint32_t rows) { return config(rows).ggufRouterTile; });
+    }
+  });
+}
+
 // ---- Golden file ----------------------------------------------------------
 
 Golden selections(bool dump) {
@@ -907,6 +974,17 @@ int main(int argc, char **argv) {
     }
     std::cout << "PASS kernel selection: warmup's prefill chunks select every plan of " << std::size(kDevices)
               << " devices, int8 activations on and off\n";
+    for (const auto [family, cores] : kDevices)
+      for (const Int8Activations int8 : {Int8Activations::On, Int8Activations::Off})
+        decodeClassesHold(std::to_string(family) + "," + std::to_string(cores) +
+                              (int8 == Int8Activations::On ? " int8" : " bf16"),
+                          ExecutionPlans(device(family, cores), int8), misses);
+    if (!misses.empty()) {
+      for (size_t i = 0; i < misses.size() && i < 40; ++i) std::cerr << misses[i] << '\n';
+      throw std::runtime_error(std::to_string(misses.size()) + " decode step classes hold a kernel change");
+    }
+    std::cout << "PASS kernel selection: every decode step selects its class's last step's plans on "
+              << std::size(kDevices) << " devices, int8 activations on and off\n";
     return 0;
   } catch (const std::exception &error) {
     std::cerr << "FAIL kernel selection: " << error.what() << '\n';

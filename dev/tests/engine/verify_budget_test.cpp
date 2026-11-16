@@ -1,21 +1,26 @@
-// The verify budget's online estimates (model::VerifyBudget). Its acceptance
+// The verify budget's online estimates (model::VerifyBudget) and the step
+// costs a cycle's rows follow (model::StepCosts). The budget's acceptance
 // models, the greedy lanes' and the sampled lanes', are the prior before any
 // label. A lane's tree labels each row whose parent its walk reached and
 // selected at, with whether that selection is the row's token, a row past
 // the verify rows too, but no row whose draft probability is not one (a row
 // a host chain made, a draft row that is not finite) and none under a row
-// past the selections, each carrying its row's cap; a cycle keeps the last
-// kLabels of each policy apart.
+// past the selections; a cycle keeps the last kLabels of each policy apart.
 // Every kRefitCycles-th cycle refits each model, which must equal an
 // independent undamped Newton solution of the same posterior over its labels,
 // from the online warm start and from the prior alike, and recover the model
 // the labels were drawn from; a refit from the model a fit reached keeps it,
 // and a model whose lanes labeled nothing stays as it was; a label its cap
-// bounds tells the fit nothing, one under its cap moves it. A cycle's rows
-// (stepRows) are the most expected tokens per cost of every assignment of
-// rows to its lanes' chances that its rows and their caps allow, the fewest
-// among equal ones.
+// bounds tells the fit nothing, one under its cap moves it. A step table's
+// point costs the median of its replays; a
+// cycle's step is, of every step the lanes' chances fill, the most expected
+// tokens per cost by its class's point and the wide lane cap's price where
+// its allocation gives a lane more than a draft's block, the fewest rows
+// among equals, against a brute force; before its lane count is measured it
+// is a draft's block a lane; a table's line recalls its costs, and a line of
+// another table's points none.
 #include "TestChecks.hpp"
+#include "model/StepCosts.hpp"
 #include "model/VerifyBudget.hpp"
 
 #include <algorithm>
@@ -24,11 +29,16 @@
 #include <cstdint>
 #include <functional>
 #include <iostream>
+#include <map>
+#include <optional>
 #include <random>
 #include <stdexcept>
 #include <string>
+#include <string_view>
+#include <tuple>
 #include <vector>
 
+using splash::model::StepCosts;
 using splash::model::VerifyBudget;
 using splash::test::rejects;
 using splash::test::require;
@@ -345,95 +355,370 @@ std::vector<double> bestAssignments(const std::vector<std::vector<float>> &curve
   return best;
 }
 
-void cycleRowsChoice() {
-  constexpr uint32_t kBlock = SPLASH_TARGET_VERIFY_ROWS;
+// Spans of each lane's chances.
+std::vector<std::span<const float>> spansOf(const std::vector<std::vector<float>> &curves) {
+  return {curves.begin(), curves.end()};
+}
+
+// A table measured at every lane count, its classes rising where `rising`,
+// each point at `cost(lanes, point)` milliseconds in each of its replays.
+template <class Cost>
+StepCosts measuredTable(std::span<const uint32_t> classes, uint32_t mostRows, bool rising, const Cost &cost) {
+  StepCosts costs(classes, mostRows, rising);
+  for (uint32_t lanes = 1; lanes <= StepCosts::kLanes; ++lanes) {
+    std::vector<double> replay;
+    for (const StepCosts::Point &point : costs.points(lanes))
+      replay.push_back(cost(lanes, point));
+    const std::vector<std::vector<double>> replays(StepCosts::kReplays, replay);
+    costs.measure(lanes, replays);
+  }
+  return costs;
+}
+
+// The classes of the projection tiles and heights of Qwen3.8-27B's plans
+// (ExecutionPlans::decodeRowClasses on an Apple9 GPU).
+constexpr uint32_t kClasses[] = {1, 3, 9, 17, 25, 33, 49};
+
+// A rising table measures each class of more than one row at its first rows
+// and its last, the rows past the first rising from it; a dense table at its
+// last rows alone.
+void risingPoints() {
+  struct Expected final {
+    uint32_t first, last, cap;
+    bool rises;
+  };
+  const std::vector<Expected> rising{{3, 3, 8, false},   {4, 8, 8, true},   {9, 9, 8, false},  {10, 16, 8, true},
+                                     {16, 16, 16, false}, {17, 17, 16, false}, {18, 24, 16, true}, {25, 25, 16, false},
+                                     {26, 32, 16, true}},
+      dense{{3, 8, 8, false}, {9, 16, 8, false}, {16, 16, 16, false}, {17, 24, 16, false}, {25, 32, 16, false}};
+  for (const auto &[rises, expected] : {std::pair{true, rising}, std::pair{false, dense}}) {
+    const StepCosts costs(kClasses, 64, rises);
+    const std::span<const StepCosts::Point> points = costs.points(2);
+    bool same = points.size() == expected.size();
+    for (size_t i = 0; same && i < points.size(); ++i)
+      same = points[i].first == expected[i].first && points[i].last == expected[i].last &&
+             points[i].cap == expected[i].cap && points[i].rises == expected[i].rises;
+    require(same, std::string(rises ? "a rising" : "a dense") + " table of two lanes holds other points");
+  }
+}
+
+// A point's cost is the median of its replays: a replay five times as slow
+// moves no point, an even count's is the mean of its middle two, and a lane
+// count is measured once every point has a cost.
+void replaysMedian() {
+  StepCosts costs(kClasses, 64, false);
+  for (uint32_t lanes = 1; lanes <= StepCosts::kLanes; ++lanes) {
+    require(!costs.measured(lanes), "a table measured nothing and was measured");
+    const size_t points = costs.points(lanes).size();
+    std::vector<std::vector<double>> replays(StepCosts::kReplays, std::vector<double>(points));
+    for (size_t point = 0; point < points; ++point)
+      for (uint32_t replay = 0; replay < StepCosts::kReplays; ++replay)
+        replays[replay][point] = (10.0 + double(point)) * (replay == point % StepCosts::kReplays ? 5.0 : 1.0);
+    costs.measure(lanes, replays);
+    require(costs.measured(lanes), "a measured lane count was not measured");
+    for (size_t point = 0; point < points; ++point)
+      require(costs.points(lanes)[point].milliseconds == 10.0 + double(point),
+              "a slow replay moved the cost of a point of " + std::to_string(lanes) + " lanes");
+    costs.measure(lanes,
+                  std::vector<std::vector<double>>{std::vector<double>(points, 4.0), std::vector<double>(points, 6.0)});
+    require(costs.points(lanes).front().milliseconds == 5.0, "two replays' median is not their mean");
+  }
+}
+
+// The step of a measured table, by brute force over every T the lanes'
+// chances fill: T's expected tokens are the best assignment of T - lanes
+// rows to the lanes' chances (each lane a prefix, at most a verify block's
+// rows), its lane cap the wide one where that assignment gives a lane more
+// than a draft's block of rows, and its cost its class's point (no class of
+// the anchors alone), with what the wide cap adds at a draft's block a lane
+// where a narrow class's step takes it, none where a noisy measurement put
+// the wide cap below the narrow one. The choice is the step of the most
+// expected tokens per cost, the fewest rows among equals. Random distinct
+// chances, a lane in three copying, over random rising costs, every other
+// trial with a step that may make a larger class the cheaper, the wide cap
+// within 0.2 ms of the narrow one either way.
+void choiceOverTheTable() {
+  constexpr uint32_t kBlock = StepCosts::kWideCap, kNarrow = StepCosts::kNarrowCap;
   std::mt19937_64 random(0x57e9a1);
   std::uniform_real_distribution<double> unit(0.0, 1.0);
-  for (uint32_t trial = 0; trial < 240; ++trial) {
-    const uint32_t lanes = 1 + trial % VerifyBudget::kLanes;
-    // Curves of 0 to a block's rows past the anchor, largest first, an exact
-    // 1 or 0 now and then.
+  for (uint32_t trial = 0; trial < 400; ++trial) {
+    const uint32_t lanes = 1 + trial % StepCosts::kLanes, mostRows = trial % 5 == 4 ? 32 : 64;
+    // Every third trial's classes rise with their rows, as a MoE target's.
+    const bool rising = trial % 3 == 1;
     std::vector<std::vector<float>> curves(lanes);
     for (std::vector<float> &curve : curves) {
+      const bool copying = random() % 3 == 0;
       curve.resize(random() % kBlock);
-      for (float &chance : curve) {
-        const uint64_t kind = random() % 8;
-        chance = kind == 0 ? 1.0F : kind == 1 ? 0.0F : static_cast<float>(unit(random));
-      }
+      for (float &chance : curve)
+        chance = static_cast<float>(copying ? 0.9 + 0.1 * unit(random) : unit(random));
       std::ranges::sort(curve, std::greater<>());
     }
-    // Flat, linear and step-shaped costs over 16-row and 32-row tiles, and
-    // random nondecreasing ones; now and then a table that ends early.
-    const uint32_t ends = trial % 7 == 6 ? lanes + static_cast<uint32_t>(random() % (lanes * (kBlock - 1) + 1))
-                                          : lanes * kBlock;
-    std::vector<float> costs(ends + 1, 0.0F);
-    float level = 1.0F;
-    for (uint32_t rows = lanes; rows <= ends; ++rows) {
-      switch (trial % 4) {
-      case 0: costs[rows] = 1.0F; break;
-      case 1: costs[rows] = 10.0F + 0.4F * float(rows); break;
-      case 2: costs[rows] = rows <= 16 ? 1.0F : rows <= 32 ? 1.1F : 1.6F; break;
-      default: level += static_cast<float>(unit(random)) * 0.1F; costs[rows] = level; break;
-      }
-    }
-    const splash::ops::StepRows got = VerifyBudget::stepRows(curves, costs);
+    std::map<std::pair<uint32_t, uint32_t>, std::pair<double, double>> table;
+    const auto cost = [&](uint32_t laneCount, uint32_t last, uint32_t cap) {
+      auto [at, fresh] = table.try_emplace({laneCount, last});
+      if (fresh)
+        at->second = {10.0 + 0.2 * last + (trial % 2 ? 6.0 * unit(random) : 0.0), 0.4 * unit(random) - 0.2};
+      return at->second.first + (cap == kBlock ? at->second.second : 0.0);
+    };
+    const StepCosts costs = measuredTable(kClasses, mostRows, rising, [&](uint32_t laneCount, const StepCosts::Point &p) {
+      return cost(laneCount, p.last, p.cap);
+    });
+    const StepCosts::Choice got = costs.choose(spansOf(curves));
+    const uint32_t most = std::min(lanes * kBlock, mostRows), narrow = lanes * kNarrow;
+    std::vector<uint32_t> starts(std::begin(kClasses), std::end(kClasses));
+    starts.push_back(narrow + 1);
+    std::ranges::sort(starts);
+    // The last rows of the class of a step of `rows` rows, and its first.
+    const auto lastOf = [&](uint32_t rows) {
+      uint32_t last = most;
+      for (const uint32_t start : starts)
+        if (start > rows) {
+          last = std::min(last, start - 1);
+          break;
+        }
+      return last;
+    };
+    const auto firstOf = [&](uint32_t rows) {
+      uint32_t first = lanes;
+      for (const uint32_t start : starts)
+        if (start <= rows)
+          first = std::max(first, start);
+      return first;
+    };
+    // A step's cost in its class at `cap`: its last rows' point, or in a
+    // rising class the line from its first rows' point to its last's.
+    const auto classCost = [&](uint32_t rows, uint32_t cap) {
+      const uint32_t first = firstOf(rows), last = lastOf(rows);
+      if (!rising || first == last)
+        return cost(lanes, last, cap);
+      return cost(lanes, first, cap) +
+             (cost(lanes, last, cap) - cost(lanes, first, cap)) * (rows - first) / double(last - first);
+    };
+    // The pooled chances, largest first, and the lanes' rows of each T.
+    std::vector<std::pair<float, uint32_t>> pooled;
+    for (uint32_t lane = 0; lane < lanes; ++lane)
+      for (const float chance : curves[lane]) pooled.push_back({chance, lane});
+    std::ranges::sort(pooled, std::greater<>());
+    const std::vector<double> assigned = bestAssignments(curves, kBlock);
+    const double wider = std::max(cost(lanes, narrow, kBlock) - cost(lanes, narrow, kNarrow), 0.0);
     double best = 0.0;
-    uint32_t chosen = lanes;
-    std::vector<double> values(ends + 1, 0.0);
-    const std::vector<double> narrow = bestAssignments(curves, splash::ops::verifyLaneCap(lanes, lanes)),
-                              wide = bestAssignments(curves, splash::ops::verifyLaneCap(lanes * kBlock, lanes));
-    for (uint32_t rows = lanes; rows <= ends; ++rows) {
-      const uint32_t cap = splash::ops::verifyLaneCap(rows, lanes);
-      const std::vector<double> &assigned = cap == splash::ops::verifyLaneCap(lanes, lanes) ? narrow : wide;
-      values[rows] = (lanes + assigned[std::min<size_t>(rows - lanes, assigned.size() - 1)]) / costs[rows];
-      if (values[rows] > best * (1.0 + 1e-9)) {
-        best = values[rows];
-        chosen = rows;
-      }
+    std::vector<uint32_t> held(lanes, 1);
+    std::map<uint32_t, std::pair<uint32_t, double>> steps;
+    for (uint32_t rows = lanes; rows <= std::min<size_t>(most, lanes + pooled.size()); ++rows) {
+      if (rows > lanes)
+        ++held[pooled[rows - lanes - 1].second];
+      const uint32_t last = lastOf(rows);
+      if (last == lanes)
+        continue;
+      const uint32_t cap = *std::ranges::max_element(held) > kNarrow ? kBlock : kNarrow;
+      const double milliseconds =
+          classCost(rows, last > narrow ? kBlock : kNarrow) + (last <= narrow && cap == kBlock ? wider : 0.0);
+      steps[rows] = {cap, milliseconds};
+      best = std::max(best, (lanes + assigned[rows - lanes]) / milliseconds);
     }
-    const std::string label = "cycle rows trial " + std::to_string(trial);
-    require(got.lanes == lanes && got.laneCap == splash::ops::verifyLaneCap(got.rows, lanes),
-            label + ": the step's lanes or cap are not its rows'");
-    require(got.rows >= lanes && got.rows <= ends && std::fabs(values[got.rows] - best) <= 1e-9 * best &&
-                got.rows <= chosen,
-            label + ": chose " + std::to_string(got.rows) + " rows where " + std::to_string(chosen) + " give " +
-                std::to_string(best) + " tokens per cost");
+    const std::string label = "step choice trial " + std::to_string(trial);
+    if (steps.empty()) {
+      require(got.step.rows == lanes, label + ": lanes of no chance took more than their anchors");
+      continue;
+    }
+    const auto at = steps.find(got.step.rows);
+    const double value = got.expected / got.milliseconds;
+    require(got.step.lanes == lanes && at != steps.end() && got.step.laneCap == at->second.first &&
+                std::fabs(got.milliseconds - at->second.second) < 1e-9 * at->second.second &&
+                std::fabs(got.expected - (lanes + assigned[got.step.rows - lanes])) < 1e-6,
+            label + ": chose " + std::to_string(got.step.rows) + " rows at cap " + std::to_string(got.step.laneCap) +
+                " weighing another cap, cost or expected tokens than the step's");
+    require(std::fabs(value - best) <= 1e-9 * best,
+            label + ": chose " + std::to_string(got.step.rows) + " rows for " + std::to_string(value) +
+                " tokens per millisecond where the best gives " + std::to_string(best));
+    for (const auto &[rows, step] : steps)
+      require(rows >= got.step.rows || (lanes + assigned[rows - lanes]) / step.second < best * (1.0 - 1e-9),
+              label + ": chose " + std::to_string(got.step.rows) + " rows where " + std::to_string(rows) +
+                  " give as many tokens per millisecond");
   }
-  // One lane whose tree would take a block's rows, all certain, at a flat
-  // cost: every row of a block.
-  const std::vector<std::vector<float>> certain{std::vector<float>(kBlock - 1, 1.0F)};
-  require(VerifyBudget::stepRows(certain, std::vector<float>(kBlock + 1, 1.0F)).rows == kBlock,
-          "a lane of certain rows at a flat cost did not take a block's rows");
-  // Four lanes of 0.9 a step, whose rows past 32 cost 60% more than those
-  // up to it: 32 rows, eight a lane.
-  std::vector<std::vector<float>> steady(4);
-  for (std::vector<float> &curve : steady)
-    for (uint32_t row = 1; row < kBlock; ++row)
-      curve.push_back(static_cast<float>(std::pow(0.9, row)));
-  std::vector<float> stepped(4 * kBlock + 1);
-  for (uint32_t rows = 4; rows <= 4 * kBlock; ++rows)
-    stepped[rows] = rows <= 32 ? 1.0F : 1.6F;
-  const splash::ops::StepRows steps = VerifyBudget::stepRows(steady, stepped);
-  require(steps.rows == 32 && steps.laneCap == 8, "a cost step past 32 rows did not stop the rows at 32");
-  // A lane's chances: its tree's and its lookup chain's, largest first, at
-  // most a block's rows past its anchor.
-  require(VerifyBudget::laneChances(std::vector<float>{0.9F, 0.5F, 0.2F}, std::vector<float>{0.8F, 0.6F}) ==
-              std::vector<float>{0.9F, 0.8F, 0.6F, 0.5F, 0.2F},
+  // Two lanes, one copying (15 certain chances) beside one of none, where
+  // 9-16 rows cost what 3-8 do and the wide cap adds 1%: the wide cap's 16
+  // rows take its copy, which a cap of eight rows a lane would stop at 9.
+  const std::vector<std::vector<float>> copying{std::vector<float>(kBlock - 1, 1.0F), {}};
+  const StepCosts flat = measuredTable(kClasses, 64, false, [](uint32_t, const StepCosts::Point &p) {
+    return (p.last <= 16 ? 10.0 : 20.0) * (p.cap == kBlock && p.last == 16 ? 1.01 : 1.0);
+  });
+  const StepCosts::Choice wide = flat.choose(spansOf(copying));
+  require(wide.step.rows == 16 && wide.step.laneCap == kBlock && wide.expected == 16.0 &&
+              std::fabs(wide.milliseconds - 10.1) < 1e-9,
+          "a copying lane beside an empty one did not take 16 rows at the wide cap and its cost");
+  // Two lanes of seven certain chances each: 16 rows at the narrow cap, at
+  // its class's cost alone.
+  const std::vector<std::vector<float>> even(2, std::vector<float>(kNarrow - 1, 1.0F));
+  const StepCosts::Choice block = flat.choose(spansOf(even));
+  require(block.step.rows == 16 && block.step.laneCap == kNarrow && block.milliseconds == 10.0,
+          "two lanes of a draft's block each did not take it at the narrow cap");
+  // A lane whose chances past two are none: its class's cost alike, the
+  // fewest rows of the most tokens, three.
+  const std::vector<std::vector<float>> two{{1.0F, 1.0F, 0.0F, 0.0F, 0.0F}};
+  require(flat.choose(spansOf(two)).step.rows == 3, "rows of no chance were taken at no gain");
+  // One lane whose thinking end forces five tokens, four certain rows past
+  // its anchor, over classes 1-2, 3-8 and 9-16 that cost 9, 10, 12, 30, 33
+  // and 45 ms at 1, 2, 3, 8, 9 and 16 rows: where the classes rise, a step of
+  // five rows costs the line from 3 rows to 8, 19.2 ms, and takes the end
+  // whole; at a class's last rows alone it would cost 30 ms and lose to two
+  // rows. A dense table prices it at its class's end.
+  const auto end = [](uint32_t lanes, const StepCosts::Point &p) {
+    return lanes > 1 ? 10.0 + p.last
+                     : std::map<uint32_t, double>{{1, 9.0}, {2, 10.0}, {3, 12.0}, {8, 30.0}, {9, 33.0}, {16, 45.0}}.at(
+                           p.last);
+  };
+  const std::vector<std::vector<float>> forcedEnd{std::vector<float>(4, 1.0F)};
+  const StepCosts::Choice rose = measuredTable(kClasses, 64, true, end).choose(spansOf(forcedEnd));
+  require(rose.step.rows == 5 && std::fabs(rose.milliseconds - 19.2) < 1e-9,
+          "a thinking end's four certain rows over rising classes took " + std::to_string(rose.step.rows) +
+              " rows at " + std::to_string(rose.milliseconds) + " ms");
+  const StepCosts::Choice flatEnd = measuredTable(kClasses, 64, false, [](uint32_t lanes, const StepCosts::Point &p) {
+    return lanes > 1 ? 10.0 + p.last : std::map<uint32_t, double>{{2, 10.0}, {8, 30.0}, {16, 45.0}}.at(p.last);
+  }).choose(spansOf(forcedEnd));
+  require(flatEnd.step.rows == 2 && flatEnd.milliseconds == 10.0,
+          "a dense class did not price a step inside it at its end");
+  // A forced chain's 15 certain rows beside a first cycle's 7, in either lane
+  // order: their equal chances split eight rows a lane, so 16 rows keep the
+  // narrow cap at its class's cost, where piling the chain's rows on its lane
+  // first takes the wide cap, and then its 24 rows.
+  const StepCosts stepped = measuredTable(kClasses, 64, false, [](uint32_t, const StepCosts::Point &p) {
+    return p.last <= 8 ? 40.0 : p.last <= 16 ? (p.cap == kBlock ? 55.0 : 50.0) : p.last <= 24 ? 80.0 : 85.0;
+  });
+  const std::vector<float> forced(kBlock - 1, 1.0F), first(kNarrow - 1, 1.0F);
+  for (const std::vector<std::vector<float>> &order : {std::vector{forced, first}, std::vector{first, forced}}) {
+    const StepCosts::Choice even = stepped.choose(spansOf(order));
+    require(even.step.rows == 16 && even.step.laneCap == kNarrow && even.milliseconds == 50.0,
+            "equal chances piled on one lane took " + std::to_string(even.step.rows) + " rows at cap " +
+                std::to_string(even.step.laneCap));
+  }
+}
+
+// A measured lane count's line gives its costs back to another table of the
+// same classes; a line of other rows or caps, of a cost that is not above
+// none, of a point short or one more, gives none and changes nothing; an
+// unmeasured lane count has no line.
+void recallsTheTable() {
+  const StepCosts measured = measuredTable(kClasses, 64, false, [](uint32_t lanes, const StepCosts::Point &p) {
+    return 10.0 + lanes + 0.25 * p.last + (p.cap == StepCosts::kWideCap ? 0.125 : 0.0);
+  });
+  StepCosts recalled(kClasses, 64, false);
+  for (uint32_t lanes = 1; lanes <= StepCosts::kLanes; ++lanes) {
+    recalled.recall(lanes, measured.text(lanes));
+    require(recalled.measured(lanes), "a measured line did not recall its costs");
+    for (size_t point = 0; point < measured.points(lanes).size(); ++point)
+      require(recalled.points(lanes)[point].milliseconds == measured.points(lanes)[point].milliseconds,
+              "a recalled line gave other costs than its measurement's");
+  }
+  StepCosts other(kClasses, 64, false);
+  const std::string line = measured.text(2);
+  const std::string shifted = "2:8:5" + line.substr(line.find(' '));
+  for (const std::string &bad : {std::string(), std::string("8:8:x"), shifted, line + " 64:16:9",
+                                 line.substr(0, line.rfind(' ')), line.substr(0, line.rfind(':')) + ":-1",
+                                 line.substr(0, line.rfind(':')) + ":nan"}) {
+    other.recall(2, bad);
+    require(!other.measured(2), "a line of no table's costs was recalled: " + bad);
+  }
+  rejects([&] { static_cast<void>(other.text(2)); }, "an unmeasured lane count has no costs to keep",
+          "an unmeasured lane count gave a line");
+}
+
+// Before its lane count is measured, a cycle takes a draft's block a lane at
+// the narrow cap, no more than the lanes' chances fill nor the table's rows;
+// lanes without a chance past their anchors take their anchors, measured or
+// not; a table holds no step of more rows than it runs in one pass.
+void unmeasuredAndBounds() {
+  const StepCosts unmeasured(kClasses, 32, false);
+  for (uint32_t lanes = 1; lanes <= StepCosts::kLanes; ++lanes) {
+    const std::vector<std::vector<float>> sure(lanes, std::vector<float>(StepCosts::kWideCap - 1, 1.0F)),
+        three(lanes, std::vector<float>(3, 0.5F)), none(lanes);
+    const StepCosts::Choice block = unmeasured.choose(spansOf(sure));
+    require(block.step.rows == std::min(8 * lanes, 32U) && block.step.laneCap == StepCosts::kNarrowCap &&
+                block.milliseconds == 0.0,
+            "an unmeasured table did not take a draft's block a lane at " + std::to_string(lanes) + " lanes");
+    require(unmeasured.choose(spansOf(three)).step.rows == 4 * lanes,
+            "an unmeasured table took rows the lanes' chances do not fill");
+    require(unmeasured.choose(spansOf(none)).step.rows == lanes, "lanes of no chance took more than their anchors");
+    for (const StepCosts::Point &point : unmeasured.points(lanes))
+      require(point.last <= 32 && point.first >= lanes, "a point lies outside its lanes' rows in one pass");
+  }
+  const StepCosts measured = measuredTable(kClasses, 64, false, [](uint32_t, const StepCosts::Point &p) {
+    return 10.0 + p.last;
+  });
+  for (uint32_t lanes = 1; lanes <= StepCosts::kLanes; ++lanes)
+    require(measured.choose(spansOf(std::vector<std::vector<float>>(lanes))).step.rows == lanes,
+            "measured lanes of no chance took more than their anchors");
+}
+
+// A lane's chances: its tree's and its lookup chain's, largest first, at
+// most a block's rows past its anchor and its tree's depth. A lane of two
+// tokens left, one past its anchor, expects at most two whatever the rows.
+void laneChancesBound() {
+  constexpr uint32_t kBlock = SPLASH_TARGET_VERIFY_ROWS;
+  require(VerifyBudget::laneChances(std::vector<float>{0.9F, 0.5F, 0.2F}, std::vector<float>{0.8F, 0.6F},
+                                    kBlock - 1) == std::vector<float>{0.9F, 0.8F, 0.6F, 0.5F, 0.2F},
           "a lane's chances did not merge its tree's and its lookup's");
-  require(VerifyBudget::laneChances(std::vector<float>(kBlock, 0.5F), std::vector<float>(kBlock, 0.7F)).size() ==
-              kBlock - 1,
+  require(VerifyBudget::laneChances(std::vector<float>(kBlock, 0.5F), std::vector<float>(kBlock, 0.7F), kBlock)
+                  .size() == kBlock - 1,
           "a lane's chances ran past a block's rows");
-  const std::vector<std::vector<float>> none, five(5);
-  rejects([&] { static_cast<void>(VerifyBudget::stepRows(none, stepped)); }, "invalid cycle rows lanes",
-          "a cycle of no lanes chose rows");
-  rejects([&] { static_cast<void>(VerifyBudget::stepRows(five, stepped)); }, "invalid cycle rows lanes",
-          "a cycle of five lanes chose rows");
-  rejects([&] { static_cast<void>(VerifyBudget::stepRows(steady, std::vector<float>(4, 1.0F))); },
-          "invalid cycle rows cost", "costs that end before the lanes' anchors were taken");
-  std::vector<float> holed = stepped;
-  holed[20] = 0.0F;
-  rejects([&] { static_cast<void>(VerifyBudget::stepRows(steady, holed)); }, "invalid cycle rows cost",
-          "a cost that is not positive was taken");
+  const std::vector<std::vector<float>> last{
+      VerifyBudget::laneChances(std::vector<float>(kBlock - 1, 0.9F), std::vector<float>{}, 1)};
+  const StepCosts flat = measuredTable(kClasses, 64, false, [](uint32_t, const StepCosts::Point &) { return 1.0; });
+  require(last[0] == std::vector<float>{0.9F} && flat.choose(spansOf(last)).expected <= 2.0,
+          "a lane's chances ran past its tree's depth");
+}
+
+// The steps no costs choose: under --verify-rows all, a draft's block a lane,
+// no more than each lane holds, at the narrow cap; and a forced step, a row a
+// lane to a verify block's, at the cap it names, else at the one its rows
+// need.
+void stepsOfNoCost() {
+  const std::vector<uint32_t> holds{3, 16, 1, 9};
+  const splash::ops::StepRows all = StepCosts::block(holds);
+  require(all.lanes == 4 && all.rows == 3 + 8 + 1 + 8 && all.laneCap == StepCosts::kNarrowCap,
+          "a step of --verify-rows all took " + std::to_string(all.rows) + " rows, not a draft's block a lane held");
+  for (const auto &[lanes, rows, cap, expected] :
+       {std::tuple{2U, 16U, std::optional<uint32_t>(StepCosts::kWideCap), splash::ops::StepRows{2, 16, 16}},
+        std::tuple{2U, 16U, std::optional<uint32_t>(), splash::ops::StepRows{2, 16, 8}},
+        std::tuple{2U, 40U, std::optional<uint32_t>(), splash::ops::StepRows{2, 32, 16}},
+        std::tuple{3U, 1U, std::optional<uint32_t>(), splash::ops::StepRows{3, 3, 8}},
+        std::tuple{4U, 40U, std::optional<uint32_t>(StepCosts::kNarrowCap), splash::ops::StepRows{4, 32, 8}}}) {
+    const splash::ops::StepRows got = StepCosts::forced(lanes, rows, cap);
+    require(got.lanes == expected.lanes && got.rows == expected.rows && got.laneCap == expected.laneCap,
+            "a forced step of " + std::to_string(rows) + " rows over " + std::to_string(lanes) + " lanes took " +
+                std::to_string(got.rows) + " at cap " + std::to_string(got.laneCap));
+  }
+}
+
+// Tables of no classes, of classes not from one row or not rising, or of no
+// rows; replays of no point, of a point short, of a time that is not
+// positive; and lane counts outside a batch.
+void invalidSteps() {
+  for (const std::vector<uint32_t> &classes :
+       {std::vector<uint32_t>{}, std::vector<uint32_t>{3, 9}, std::vector<uint32_t>{1, 9, 3}})
+    rejects([&] { StepCosts costs(classes, 64, false); }, "invalid step classes", "impossible classes made a table");
+  rejects([&] { StepCosts costs(kClasses, 0, false); }, "invalid step classes", "a table of no rows was made");
+  // Four lanes of four rows hold their anchors alone.
+  rejects([&] { StepCosts costs(kClasses, StepCosts::kLanes, false); }, "hold nothing past its lanes' anchors",
+          "a table of the anchors alone was made");
+  StepCosts costs(kClasses, 64, false);
+  const size_t points = costs.points(2).size();
+  for (const std::vector<std::vector<double>> &replays :
+       {std::vector<std::vector<double>>{}, {std::vector<double>(points - 1, 1.0)},
+        {std::vector<double>(points, 1.0), std::vector<double>(points, 0.0)},
+        {std::vector<double>(points, NAN)}})
+    rejects([&] { costs.measure(2, replays); }, "invalid step replays", "impossible replays were measured");
+  require(!costs.measured(2), "refused replays measured a lane count");
+  for (const uint32_t lanes : {0U, 5U}) {
+    rejects([&] { static_cast<void>(costs.points(lanes)); }, "invalid step lane count",
+            "points of an impossible lane count were given");
+    rejects([&] { costs.measure(lanes, std::vector<std::vector<double>>{std::vector<double>(points, 1.0)}); },
+            "invalid step lane count", "an impossible lane count was measured");
+    rejects([&] { costs.recall(lanes, ""); }, "invalid step lane count",
+            "an impossible lane count's line was recalled");
+    rejects([&] { static_cast<void>(costs.choose(spansOf(std::vector<std::vector<float>>(lanes)))); },
+            "invalid step lane count", "a step of an impossible lane count was chosen");
+  }
 }
 
 } // namespace
@@ -445,7 +730,14 @@ int main() {
     policiesFitApart();
     fitsTheLabels();
     invalidInputs();
-    cycleRowsChoice();
+    replaysMedian();
+    risingPoints();
+    choiceOverTheTable();
+    unmeasuredAndBounds();
+    laneChancesBound();
+    recallsTheTable();
+    stepsOfNoCost();
+    invalidSteps();
   } catch (const std::exception &error) {
     std::cerr << "verify_budget_test: FAIL: " << error.what() << '\n';
     return 1;

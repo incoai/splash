@@ -7,7 +7,9 @@
 #include "ops/PagedAttention.hpp"
 
 #include <cstdint>
+#include <optional>
 #include <span>
+#include <utility>
 #include <vector>
 
 namespace splash::ops {
@@ -34,6 +36,19 @@ public:
   // projection, float and MoE tile a chunk of any rows selects, and its
   // prefill attention after each history it plans.
   [[nodiscard]] std::vector<uint32_t> prefillRowClasses() const;
+  // The fewest rows of each class of decode step of up to `mostRows` rows,
+  // at most a verify block a lane, whose kernels it picks by its rows: its
+  // projections' tile and staged height, as prefillRowClasses walks them, a
+  // float projection's tile (selectFloatTile), and a MoE target's expert
+  // tile (selectMoe) where `moe` names its blocks' shape and router format.
+  // A decode step's attention and GDN kernels follow its lane cap, not its
+  // rows; its norms and heads follow its projections' plans. The choice of a
+  // cycle's rows prices a class by a step of its last rows
+  // (model::StepCosts), and the start creates that step's kernels alone, so
+  // a class holds no kernel change; kernel-selection checks the tiles and
+  // heights that would.
+  [[nodiscard]] std::vector<uint32_t> decodeRowClasses(uint32_t mostRows,
+                                                       std::optional<std::pair<MoeShape, uint32_t>> moe) const;
 
   // The attention of a command's sequences (PagedAttention::plan) whose
   // dispatches fit `capacity`, the workspace bound to it.

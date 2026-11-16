@@ -3,6 +3,8 @@
 #include "metal/abi/Gguf.h"
 
 #include <algorithm>
+#include <stdexcept>
+#include <tuple>
 #include <utility>
 
 namespace splash::ops {
@@ -28,6 +30,33 @@ std::vector<uint32_t> ExecutionPlans::prefillRowClasses() const {
     // Only the staged and register tiles' kernels are named by their height.
     const bool named = tile == LinearTile::GgufStaged || tile == LinearTile::GgufRegister;
     const std::pair key{tile, named ? plan.storageRows() : 0};
+    if (first.empty() || key != last) first.push_back(rows);
+    last = key;
+  }
+  return first;
+}
+
+// A step's rows pick its projections' tile and height as a chunk's do
+// (prefillRowClasses); a float projection's tile, which a step's rows move
+// only at the accelerator tile's fewest rows, as they fill one 64-row tile
+// (selectFloatTile); and a MoE target's expert tile (32-row tiles once its
+// rows' routes outnumber its experts). Its router's tile changes with them
+// on no device.
+std::vector<uint32_t> ExecutionPlans::decodeRowClasses(uint32_t mostRows,
+                                                       std::optional<std::pair<MoeShape, uint32_t>> moe) const {
+  if (mostRows > SPLASH_MAXIMUM_BATCH_WIDTH * SPLASH_TARGET_VERIFY_ROWS)
+    throw std::invalid_argument("a decode step holds at most a verify block a lane");
+  const FloatTileCalibration &floats = calibration().floatTile;
+  std::vector<uint32_t> first;
+  std::tuple<LinearTile, uint32_t, bool, uint32_t> last{};
+  for (uint32_t rows = 1; rows <= mostRows; ++rows) {
+    const LinearPlan plan = linear_.plan({{GGUF_TILE_COLUMNS, GGUF_TILE_COLUMNS}, rows});
+    const LinearTile tile = plan.configuration().tile;
+    const bool named = tile == LinearTile::GgufStaged || tile == LinearTile::GgufRegister;
+    MoeConfig config{};
+    if (moe) config = selectMoe(calibration(), moe->first, moe->second, rows);
+    const std::tuple key{tile, named ? plan.storageRows() : 0, floats.neuralAccelerator && rows >= floats.minimumRows,
+                         uint32_t(config.expertTile)};
     if (first.empty() || key != last) first.push_back(rows);
     last = key;
   }

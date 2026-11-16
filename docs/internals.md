@@ -53,9 +53,9 @@ production code. Before release,
 compare full-model greedy outputs at the same prompts, cached prefixes and
 batch schedule against the base. Repeat seeded sampled requests within each
 build, and explicitly check base-versus-candidate seeded output when preserving
-a drafting policy. Run a MoE target with `--verify-rows all` for these
-comparisons: the verify budget its cycles otherwise follow makes greedy and
-seeded outputs vary from run to run ([Drafts](models.md#drafts)). These are measured
+a drafting policy. Run with `--verify-rows all` for these comparisons: the
+measured costs and learned acceptance a cycle's rows otherwise follow make
+greedy and seeded outputs vary from run to run ([Drafts](models.md#drafts)). These are measured
 gates, not a guarantee across arbitrary compiler versions or GPUs.
 
 The values the native runtime holds constant (the Metal command timeout, the
@@ -462,8 +462,14 @@ Qwen3.8-Flash-Next's block indexer (its projection, pool, selection and
 commit) and PLE convolution and commit, one dispatch for every lane on grids
 up to the lane cap (`ops::LayoutRows`), a prompt chunk's projection and
 convolution by the layout its host writes, and a MoE step's verified routing
-(`ops::MoeBuffers::laneRows`). A decode step holds eight rows a lane, which
-the selector lays out at lane x 8.
+(`ops::MoeBuffers::laneRows`). A decode step holds the rows the host chose
+for its cycle before encoding it (`model::StepCosts::choose`): the T, from
+a row a lane to sixteen, with the most expected accepted tokens over the cost
+of a step of T rows, from each lane's chances (its draft's rows' estimates in
+its last cycle and its host chain's) and the cost the start measured for the
+class of steps T falls in (`ops::ExecutionPlans::decodeRowClasses`); a lane
+holds at most eight of them unless the lanes' chances give one lane more, and
+sixteen then, which the selector packs in lane order.
 
 A decode step's target forward is the prompt forward (`QwenTarget::addPrefill`
 over a chunk whose `decode` names the step's own buffers,
@@ -500,8 +506,7 @@ the draft's rows alone.
 A lane's verify block holds up to 16 rows (`SPLASH_TARGET_VERIFY_ROWS`): its
 anchor and the rows proposed after it, a tree, each row's place in it (its
 ancestors, parent and depth, `metal/abi/VerifyTree.h`) one entry per packed
-row; a decode cycle gives every lane a draft's block of them
-(`ExecutionLimits::draftQueryRows`), and a step a test forces up to sixteen. What
+row, as many as the cycle's step gives the lane (above). What
 a cycle may hold follows the block's 16 rows: the KV it writes past the context
 (`SPLASH_SPECULATIVE_SCRATCH_TOKENS`, 15), the KV the engine holds for a lane's
 cycle and its reply captures, a block-sparse target's verify rows
@@ -937,8 +942,9 @@ An expert's only tile of at most `GGUF_COLUMN_ROWS` live rows runs on the column
 products in different orders: a route's output depends on how many rows the step routes to its
 expert, so decode results of GGUF MoE targets, the 35B's included, are not invariant to the
 batch (`kernels/common/moe_expert_slab.h`). Under the default `--verify-rows auto`, a decode
-step's rows also follow the acceptance the verify budget learns from earlier requests
-([Drafts](models.md#drafts)), so decode results can differ between runs of one request.
+step's rows also follow the step costs the start measured on the Mac and the acceptance the
+verify budget learns from earlier requests ([Drafts](models.md#drafts)), so decode results can
+differ between runs of one request.
 The float router, QSA indexer and alpha/beta projections run in `kernels/shared/gguf_float.metal`,
 which runs two projections of one input in one dispatch where they take the same tile (the
 indexer's query and key, each on the tile of its own width), and the token rows are gathered by

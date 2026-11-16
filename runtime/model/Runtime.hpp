@@ -1,6 +1,7 @@
 #pragma once
 
 #include "model/ModelFactory.hpp"
+#include "model/VerifyBudget.hpp"
 
 #include <cstdint>
 #include <memory>
@@ -82,6 +83,9 @@ private:
   [[nodiscard]] uint32_t residentLane(uint64_t requestId) const;
   void finishRestore(uint64_t requestId, uint32_t boundary, bool restoreDraft);
   void prepareWarmupDecode(uint64_t requestId, uint32_t anchor);
+  // The step costs of `width` lanes on this machine (StepCosts::measure),
+  // from passes of a cycle of each of their points.
+  void measureDecodeSteps(uint32_t width);
   [[nodiscard]] StateAdmission beginAt(const ModelRequest &request,
                                        uint32_t stateLane);
   [[nodiscard]] std::unique_ptr<ModelBatchTicket>

@@ -1,8 +1,9 @@
 #pragma once
 
 // The online estimates a decode cycle's rows take: each lane's chances that
-// the target accepts its tree's rows, which its GPU's layout of the step's
-// best rows reads (ops::DraftSelector::addVerifyRows).
+// the target accepts its tree's rows, which a cycle's choice of its step's
+// rows weighs (StepCosts) and its GPU's layout of the step's best rows reads
+// (ops::DraftSelector::addVerifyRows).
 // A draft row's own chance, that the target selects its token where it
 // accepted the row's parent, is logit(p) = slope * logit(q) +
 // intercepts[position] for its draft probability q at its proposal position,
@@ -23,7 +24,8 @@ namespace splash::model {
 class VerifyBudget final {
 public:
   static constexpr uint32_t kPositions = SPLASH_DRAFT_PROPOSAL_TOKENS;
-  static constexpr uint32_t kBlockRows = SPLASH_DRAFT_QUERY_ROWS;
+  // A lane's most rows, a verify block's (ops::verifyLaneCap).
+  static constexpr uint32_t kBlockRows = SPLASH_TARGET_VERIFY_ROWS;
   static constexpr uint32_t kLanes = SPLASH_MAXIMUM_BATCH_WIDTH;
   static constexpr uint32_t kRefitCycles = 64;
   static constexpr uint32_t kLabels = 4096;
@@ -94,24 +96,21 @@ public:
   // The maximum a posteriori model of `labels` under the prior, by damped
   // Newton steps from `start`.
   [[nodiscard]] static Acceptance fit(std::span<const Label> labels, const Acceptance &start);
-
-  // A lane's chances for a cycle's choice of rows (stepRows): the estimates
+  // A lane's chances for a cycle's choice of rows (StepCosts): the estimates
   // that the target accepts each row its tree would add past its anchor,
-  // best first, at most a verify block's rows past it. They are those its
-  // last cycle's tree took (ops::DraftSelectorBuffers::treeScores), every
-  // row's 1 for a lane without one, merged with this cycle's lookup chain's,
-  // each the product of its tokens' rates to its depth (LookupAcceptance,
-  // whose agreement with the draft the host does not know).
-  [[nodiscard]] static std::vector<float> laneChances(std::span<const float> tree, std::span<const float> lookup);
-  // The rows of a cycle of curves.size() lanes (ops::StepRows): the T, from
-  // the lane count to a verify block's rows a lane and to the costs' end,
-  // with the most expected accepted tokens per costs[T], the fewest rows
-  // among equal ones. A cycle of T rows verifies every lane's anchor and the
-  // T - lanes largest chances over its lanes' curves, none past a lane's
-  // ops::verifyLaneCap(T, lanes) rows, as the GPU's choice of its rows does
-  // (ops::DraftSelector::addVerifyRows) with this cycle's chances.
-  [[nodiscard]] static ops::StepRows stepRows(std::span<const std::vector<float>> curves,
-                                              std::span<const float> costs);
+  // best first, no more of them than its tree's `depth` (its output left
+  // past its anchor) nor than a verify block's rows past it. They are the
+  // `tree`'s, the draft's rows of the latest tree in which its draft made a
+  // child of its anchor (ops::DraftSelectorBuffers::treeScores, a row's
+  // drawn children's summing to at most its own), less its lookup chain's
+  // path (a lane before its first cycle takes every row's 1 of a draft's
+  // block), merged with the `chain`'s: this cycle's host chain's, a lookup
+  // chain's each the product of its tokens' rates to its depth
+  // (LookupAcceptance, whose agreement with the draft the host does not
+  // know), a chain the grammar or the thinking end forces every token's 1;
+  // without one, the last chain's path's rows that draft steps joined.
+  [[nodiscard]] static std::vector<float> laneChances(std::span<const float> tree, std::span<const float> chain,
+                                                      uint32_t depth);
 
 private:
   // The greedy lanes', then the sampled ones'.

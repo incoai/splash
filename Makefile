@@ -317,6 +317,7 @@ ENGINE_CPP_SOURCES := \
 	runtime/model/GgufPreparation.cpp \
 	runtime/model/SlotRecycler.cpp \
 	runtime/model/ExpertStore.cpp \
+	runtime/model/StepCosts.cpp \
 	runtime/model/VerifyBudget.cpp \
 	runtime/model/LookupProposals.cpp \
 	runtime/model/Qwen3_6Moe.cpp \

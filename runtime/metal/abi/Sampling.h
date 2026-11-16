@@ -258,15 +258,16 @@ static_assert(sizeof(DraftTreeParams) == 244,
 // no draw from the target. A lane's rows are its anchor and the rows it
 // took, numbered in preorder, its likeliest path on its first rows, and
 // lanes' rows are packed in lane order (SplashLaneRows). Where the trees
-// hold fewer rows than the plan (a lane's tree holds no more rows than a
-// walk of it may retain, so a lane near its output limit or its thinking
-// budget's end holds fewer than its share of the step), the plan's rows past
-// the lanes' belong to no lane: no kernel selects, retains, attends or routes
-// through the MoE experts a row of no lane, and the projections compute it
-// unread, as they compute a tile's spare rows. Each carries lane 0's anchor,
-// as the embedding gathers by token. The rows and the cap come from the host
-// before this cycle's draws, so they admit no row by its own draws: a
-// draft's block a lane, or a step a test forces.
+// hold fewer rows than the plan (a sampled lane drew fewer children than its
+// chances promised, or a lane's tree is shallower than its share of the
+// step), the plan's rows past the lanes' belong to no lane: no kernel
+// selects, retains, attends or routes through the MoE experts a row of no
+// lane, and the projections compute it unread, as they compute a tile's
+// spare rows. Each carries lane 0's anchor, as the embedding gathers by
+// token. The rows and the cap come from the host before this cycle's draws,
+// so they admit no row by its own draws: the step costs' choice from the
+// last cycle's chances (model::StepCosts::choose), a draft's block a
+// lane under --verify-rows all, or a step a test forces.
 struct VerifyRowsParams {
   uint32_t lanes;
   uint32_t rows;

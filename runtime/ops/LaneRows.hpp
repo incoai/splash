@@ -31,12 +31,13 @@ inline constexpr uint32_t kNarrowLaneRows = SPLASH_GDN_NARROW_ROWS;
 static_assert(kNarrowLaneRows == SPLASH_DRAFT_QUERY_ROWS && kNarrowLaneRows <= SPLASH_TARGET_VERIFY_ROWS,
               "a draft's block runs on the narrow GDN kernels");
 
-// The most rows of a lane's verify block in a decode step of `rows` rows over
-// `lanes` lanes, which the step's proposer chooses on the device within it:
-// those of the narrow GDN decode kernels (SPLASH_GDN_NARROW_ROWS) while
-// the step's rows give each lane no more, which took 13-19% less time than
+// The least lane cap a decode step of `rows` rows over `lanes` lanes needs:
+// that of the narrow GDN decode kernels (SPLASH_GDN_NARROW_ROWS) while the
+// step's rows give each lane no more, which took 13-19% less time than
 // those of sixteen over a layer's 8-row chains (DRAM-cold, an M6); else a
-// verify block's most.
+// verify block's most. A forced step's cap, and --verify-rows all's; a
+// cycle's own step takes the wide cap below it too where its allocation gives
+// a lane more than the narrow cap (model::StepCosts::choose).
 [[nodiscard]] constexpr uint32_t verifyLaneCap(uint32_t rows, uint32_t lanes) noexcept {
   return rows <= uint64_t{kNarrowLaneRows} * lanes ? kNarrowLaneRows : SPLASH_TARGET_VERIFY_ROWS;
 }
@@ -48,8 +49,8 @@ static_assert(sizeof(LaneRows) == sizeof(SplashLaneRows));
 // A decode step's rows, which its proposer lays out on the device for the
 // kernels after it (SplashLaneRows, ops::DraftSelector::addVerifyRows):
 // `rows` rows over `lanes` lanes, packed in lane order, each lane's 1 to
-// `laneCap` of them (verifyLaneCap). A kernel's grid of a lane's rows spans
-// the cap.
+// `laneCap` of them, at least the cap its rows need (verifyLaneCap). A
+// kernel's grid of a lane's rows spans the cap.
 struct StepRows final {
   uint32_t lanes = 0;
   uint32_t rows = 0;

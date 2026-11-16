@@ -2,7 +2,9 @@
 
 #include "metal/abi/KvExtent.h"
 #include "model/Runtime.hpp"
+#include "model/StepCosts.hpp"
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <optional>
@@ -41,9 +43,34 @@ public:
   [[nodiscard]] static uint32_t lastRetainedRows(const Runtime &runtime, uint32_t lane);
   // Every later decode step of a runtime takes `rows` rows, at most a verify
   // block's a lane and at least a row a lane, each of them verified, in place
-  // of a draft's block a lane, and teaches the verify budget nothing; none
-  // gives the draft's block back.
+  // of its cycles' choice (StepCosts::choose), which such steps do not
+  // teach; none gives the choice back. For measuring steps' costs by their
+  // rows.
   static void forceStepRows(Runtime &runtime, std::optional<uint32_t> rows);
+  // A decode cycle's choice of its step (StepCosts::choose) and what it
+  // weighed: its rows and lane cap, the chances its lanes' curves held
+  // (VerifyBudget::laneChances), the expected accepted tokens and its cost
+  // (none before its lane count is measured); and once it completed,
+  // the rows its lanes verified (fewer than the step's where its trees held
+  // fewer), the tokens they retained and the cycle's wall and GPU times.
+  struct StepChoice final {
+    uint32_t lanes = 0;
+    uint32_t rows = 0;
+    uint32_t laneCap = 0;
+    uint32_t chances = 0;
+    double expected = 0.0;
+    double cost = 0.0;
+    uint32_t verified = 0;
+    uint32_t retained = 0;
+    double wallMilliseconds = 0.0;
+    double gpuMilliseconds = 0.0;
+  };
+  // The choices of the decode cycles the step costs sized since the last
+  // take, which it clears.
+  [[nodiscard]] static std::vector<StepChoice> takeStepChoices(Runtime &runtime);
+  // The classes of `lanes` lanes' steps and their measured costs
+  // (StepCosts::points); none without --verify-rows auto.
+  [[nodiscard]] static std::vector<StepCosts::Point> stepPoints(const Runtime &runtime, uint32_t lanes);
   // While capturing, each command that selects first tokens or verifies
   // copies the rows lastLogits returns, as the target's forward wrote them
   // before the policy rewrites them in place: for each of its batch lanes,

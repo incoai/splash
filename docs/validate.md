@@ -301,8 +301,9 @@ A change of the weight images' layout (`EXPECT_IMAGE_CHANGE=1`) makes
 `backend_regression` report the images it changed instead of failing on them.
 `decode-profile --dispatch-list FILE` writes the profiled B1 cycles'
 dispatches in order with their GPU time. Its `--verify-rows all` verifies
-every row of a MoE target's cycles, as `backend-benchmark` does, so two
-builds' runs route the same experts; each width also reports its tokens per
+every row of a draft's block a lane, as `backend-benchmark` does, so two
+builds' runs take the same steps and route the same experts, and its
+`--step-rows T` has every step take T rows, for a step's cost by its rows; each width also reports its tokens per
 cycle and wall ms per token, and prints its fused cycles in the order they
 ran and their mean: a greedy prompt runs the same cycles every time, so two
 builds compare cycle by cycle.

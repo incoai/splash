@@ -393,8 +393,8 @@ void testAutomaticExpertMemory(RuntimeResourcesConfig config) {
   }
 }
 
-// --verify-rows: by default every target's decode cycles verify the rows the
-// verify budget chooses for each step, a MoE target's whether its routed
+// --verify-rows: by default every target's decode cycles verify the rows of
+// the step their measured costs choose, a MoE target's whether its routed
 // experts load with their layers or stream from the SSD; `all` verifies every
 // row of a draft's block. The start says which in one line a mode, and the
 // runtime built on what it assembled runs it.
@@ -422,7 +422,7 @@ void testVerifyRows(const char *metallibPath, RuntimeResourcesConfig moe) {
     const Started started = start(config);
     require(started.log.find(line) != std::string::npos && started.budget == budget, message);
   };
-  const std::string_view budgeted = "Decode cycles verify the rows the verify budget chooses for each step "
+  const std::string_view budgeted = "Decode cycles verify the rows of the step their measured costs choose "
                                     "(--verify-rows auto): greedy and seeded outputs can differ from run to run.";
   requireStart(moe, budgeted, true, "a MoE target with resident experts did not budget its rows");
   // A budget a byte short of the whole model's minimum, below the one that
@@ -1087,9 +1087,13 @@ void testARestoreAfterTheOtherWarmupsCreatesNothing(const char *metallibPath) {
 
 // A verify's kernels follow its lanes' history, which the decode warmups'
 // is short of: past 7.2K tokens Apple10's INT8 attention scores INT8 queries
-// (attention_q8q_split; no Apple9 GPU does). After the start's
-// warmups, a request of 8K tokens creates no pipeline: each decode warmup
-// created its verify's after the longest history.
+// (attention_q8q_split; no Apple9 GPU does). They follow its step's lane cap
+// too: a lane of more than eight rows takes the 16-row GDN kernels. After
+// the start's warmups, a request of 8K tokens creates no pipeline in its
+// first cycle, which a thinking budget of no tokens fills with its end's 16
+// tokens, each certain, so that the cycle takes a verify block's rows: each
+// decode warmup created the steps' of each lane cap after the longest
+// history.
 void testALongRequestAfterTheWarmupsCreatesNothing(const char *metallibPath) {
   const test::TemporaryDirectory root("splash-long-request-pipelines");
   RuntimeResourcesConfig config = loadableConfig(metallibPath, root.path(), "long-request-pipelines-test");
@@ -1117,8 +1121,11 @@ void testALongRequestAfterTheWarmupsCreatesNothing(const char *metallibPath) {
   for (uint32_t page = 0; page < pages.size(); ++page) pages[page] = page % model::ExecutionLimits::warmupKvPages;
   auto &executor = dynamic_cast<model::Runtime &>(*runtime);
   constexpr uint64_t id = 736;
+  ThinkingBudget thinking{0, {}, 0};
+  for (uint32_t token = 100; token <= 116; ++token) thinking.end.push_back(token);
+  thinking.alsoEnds = thinking.end.back();
   const std::string log = test::capturedStderr([&] {
-    executor.beginColdRequest({.id = id, .prompt = prompt, .maxNewTokens = 16}, 0);
+    executor.beginColdRequest({.id = id, .prompt = prompt, .maxNewTokens = 32, .thinkingBudget = &thinking}, 0);
     for (uint32_t position = 0; position < history; position += chunk) {
       ModelBatchItem item{
           .requestId = id, .logicalPosition = position, .tokenCount = chunk, .pageTable = pages, .pageTableRevision = 1};
@@ -1134,6 +1141,8 @@ void testALongRequestAfterTheWarmupsCreatesNothing(const char *metallibPath) {
                                          std::span<const ModelBatchItem>(&item, 1));
     require(decoded.size() == 1 && decoded[0].failure.empty() && !decoded[0].outputTokens.empty(),
             "the long request's decode failed");
+    require(decoded[0].outputTokens.size() > model::ExecutionLimits::draftQueryRows,
+            "the long request's first cycle verified no more than eight rows");
     executor.end(id);
   });
   require(backend.pipelinesCreatedWhileServing() == 0,

@@ -169,6 +169,10 @@ public:
   ExpertStore(const ExpertStore &) = delete;
   ExpertStore &operator=(const ExpertStore &) = delete;
 
+  // The most rows a decode step routes in one round of loads: a step of more
+  // rows stages its experts in a second round.
+  [[nodiscard]] static uint32_t cycleRows() noexcept;
+
   // Block `block`'s routed segments (the format and size of its size's
   // slots), chunks and slot table, which `weights` reads them through, and,
   // when its experts stream, the store, which loads them; the store keeps the

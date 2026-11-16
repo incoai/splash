@@ -1,10 +1,16 @@
 #include "ModelFactory.hpp"
 #include "model/DraftCheckpoint.hpp"
+#include "model/ExpertStore.hpp"
 #include "model/GgufTarget.hpp"
+#include "model/QwenState.hpp"
 #include "model/QwenTargetLoader.hpp"
 #include "model/SafetensorsTarget.hpp"
+#include "model/SparseRowStore.hpp"
 #include "model/VisionLoader.hpp"
 
+#include <sys/sysctl.h>
+
+#include <array>
 #include <functional>
 #include <stdexcept>
 #include <string_view>
@@ -149,6 +155,27 @@ LoadedModel loadModel(metal::MetalBackend &backend,
   result.manifestFingerprintSha256 = weightManifestFingerprint(records);
   requireCompatibleModel(result);
   return result;
+}
+
+std::string stepCostsKey(const LoadedModel &model, const kv::PageStorage &kvPages,
+                         const QwenStateStorage &stateStorage, const ops::ExecutionPlans &operators,
+                         const metal::MetalBackend &backend, std::string_view buildId) {
+  // The macOS version and build, as the kernel names them.
+  const auto kernel = [](const char *name) {
+    std::array<char, 64> value{};
+    size_t size = value.size();
+    return sysctlbyname(name, value.data(), &size, nullptr, 0) ? std::string() : std::string(value.data());
+  };
+  const ExpertStoreStats experts = model.expertStore() ? model.expertStore()->stats() : ExpertStoreStats{};
+  const SparseRowStore *table = model.streamedTable();
+  return "verify budget step costs models " + model.manifestFingerprintSha256 + " kv " +
+         std::string(kv::formatName(kvPages.layout().format)) + " state " +
+         std::string(ops::formatName(stateStorage.layout().target.format)) + " int8 activations " +
+         std::to_string(operators.linear().int8Activations() == ops::Int8Activations::On) + " experts " +
+         std::to_string(experts.capBytes) + " floor " + std::to_string(experts.floorBytes) + " table " +
+         std::to_string(table ? table->committedBytes() : 0) + " device " + backend.capabilities().deviceName +
+         " macos " + kernel("kern.osproductversion") + " " + kernel("kern.osversion") + " build " +
+         std::string(buildId) + " lanes ";
 }
 
 } // namespace splash::model

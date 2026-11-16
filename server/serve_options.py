@@ -828,11 +828,13 @@ SERVE_OPTIONS = (
         dict(
             choices=("auto", "all"),
             default="auto",
-            help="rows of each draft block decode verifies: all verifies every "
-            "row and learns nothing, so greedy and seeded outputs repeat "
-            "(default: auto, where a verify budget learned from earlier cycles "
-            "sets every model's tree estimates and chooses a MoE model's rows, "
-            "which is faster but lets those outputs differ from run to run)",
+            help="rows each decode cycle verifies: all verifies every row of "
+            "a draft's block a lane, so greedy and seeded outputs repeat "
+            "(default: auto, where each cycle takes the step of the most "
+            "expected accepted tokens per cost, by the costs the Mac measured "
+            "at a start and the acceptance learned from earlier cycles, on "
+            "every model, which is faster but lets those outputs differ from "
+            "run to run)",
         ),
         engine=EngineArgument("--verify-rows"),
     ),

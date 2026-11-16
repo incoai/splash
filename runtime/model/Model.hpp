@@ -779,9 +779,9 @@ struct ModelTelemetry final {
   // Prefill chunks the GPU ran again alone once the Neural Engine split's
   // work for them failed (Runtime::prefillAsync).
   uint64_t aneFfnReruns = 0;
-  // Whether a verify budget learns the estimates by which decode cycles take
-  // their trees' rows (--verify-rows auto), rather than none learning
-  // (--verify-rows all).
+  // Whether decode cycles' rows follow the step costs and the verify
+  // budget's acceptance (--verify-rows auto): the rows of the steps they
+  // choose, rather than every row of a draft's block a lane.
   bool verifyBudget = false;
   double lastConstrainedTargetForwardGpuSeconds = 0.0;
   double totalConstrainedTargetForwardGpuSeconds = 0.0;

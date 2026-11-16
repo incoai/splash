@@ -344,7 +344,7 @@ public:
   [[nodiscard]] std::optional<model::KvBlockCacheStats> kvBlockCacheStats() const;
   [[nodiscard]] std::optional<model::KvHistoryStreamStats> kvHistoryStreamStats() const;
 
-  [[nodiscard]] model::RuntimeContext modelContext() noexcept;
+  [[nodiscard]] model::RuntimeContext modelContext();
   // What the engine gives back while idle (NativeLoopConfig::weights): the
   // weight images, and the Neural Engine split's program if it runs one.
   [[nodiscard]] ReleasableMemory &releasableMemory() noexcept { return releasableMemory_; }
