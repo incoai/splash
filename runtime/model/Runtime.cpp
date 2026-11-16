@@ -1822,6 +1822,20 @@ struct Runtime::Impl {
     backend.preparePipelines(graph.dispatches());
   }
 
+  // Creates the pipelines of a decode cycle's state capture
+  // (encodeDecodeCaptures) on decode lane `lane` and state lane `stateLane`,
+  // without running them (Runtime::warmupDecodeBatch): the fold of the
+  // verify's tape into the captured state and the store of its window rows,
+  // which only a cycle whose retained rows reach the page a reply's state is
+  // kept at runs.
+  void prepareCapturePipelines(uint32_t lane, uint32_t stateLane) const {
+    if (!capturesInDecode())
+      return;
+    CommandGraph graph;
+    encodeCapture(graph, lane, stateLane, states.current(stateLane).stateBase, states.window(stateLane), 1, 0);
+    backend.preparePipelines(graph.dispatches());
+  }
+
   // The draft's context of chunk `index` of a command's chunks: the rows its
   // parts capture go into their lanes' rings and windows. A state captured
   // inside the command takes into its window the rows its lane's parts
@@ -2416,22 +2430,28 @@ struct Runtime::Impl {
   void encodeDecodeCaptures(CommandGraph &graph, std::span<Request *const> entries,
                             std::span<const ModelBatchItem> items) {
     for (uint32_t lane = 0; lane < entries.size(); ++lane) {
-      const uint32_t stateLane = entries[lane]->stateLane;
       for (const StateCapture &capture : items[lane].stateCaptures) {
-        const uint32_t rows = static_cast<uint32_t>(capture.tokens - items[lane].logicalPosition);
         const QwenCachedBuffers &state = static_cast<QwenStateReservation &>(*capture.reservation).buffers();
-        targetModel->addStateFold(graph,
-                                  {decodeArena->get(lane, DecodeTensor::RetainedCount), states.next(stateLane).stateBase,
-                                   decodeArena->batchSlice(DecodeTensor::GdnTape, kLaneCount),
-                                   decodeArena->gdnTapeSlot(stateLane, states.metadata(stateLane).activeParity ^ 1),
-                                   state.gdn->buffers().stateBase},
-                                  rows);
-        ops::DraftAttention::addWindowStore(graph, decodeArena->get(lane, DecodeTensor::ContextHidden),
-                                            state.window->buffer(), rows,
-                                            static_cast<uint32_t>(items[lane].logicalPosition),
-                                            geometry.draft.hiddenSize);
+        encodeCapture(graph, lane, entries[lane]->stateLane, state.gdn->buffers().stateBase, state.window->buffer(),
+                      static_cast<uint32_t>(capture.tokens - items[lane].logicalPosition),
+                      static_cast<uint32_t>(items[lane].logicalPosition));
       }
     }
+  }
+
+  // A capture's commands on decode lane `lane` of state lane `stateLane`
+  // (encodeDecodeCaptures): the fold of the first `rows` of the verify's
+  // tape into the GDN state `fold` and the store of their context rows, from
+  // `position`, in the state's `window`.
+  void encodeCapture(CommandGraph &graph, uint32_t lane, uint32_t stateLane, const MetalBuffer &fold,
+                     const MetalBuffer &window, uint32_t rows, uint32_t position) const {
+    targetModel->addStateFold(graph,
+                              {decodeArena->get(lane, DecodeTensor::RetainedCount), states.next(stateLane).stateBase,
+                               decodeArena->batchSlice(DecodeTensor::GdnTape, kLaneCount),
+                               decodeArena->gdnTapeSlot(stateLane, states.metadata(stateLane).activeParity ^ 1), fold},
+                              rows);
+    ops::DraftAttention::addWindowStore(graph, decodeArena->get(lane, DecodeTensor::ContextHidden), window, rows,
+                                        position, geometry.draft.hiddenSize);
   }
 
   // A verify's selection, acceptance and commits, which end its cycle's last
@@ -3700,6 +3720,9 @@ WarmupStepResult Runtime::warmupDecodeBatch(uint32_t width) {
     std::array<Impl::Request *, ExecutionLimits::maximumBatchWidth> entries{};
     for (uint32_t lane = 0; lane < width; ++lane) entries[lane] = &impl_->request(firstId + lane);
     impl_->prepareLongestVerify(std::span(entries).first(width));
+    // A reply's state is captured in decode at the page its retained rows
+    // reach, by a fold no prompt or warmup cycle runs.
+    impl_->prepareCapturePipelines(0, stateLane(0));
     for (uint32_t lane = 0; lane < width; ++lane) {
       lanes.push_back({std::move(decoded[lane]),
                        impl_->request(firstId + lane).pendingToken,

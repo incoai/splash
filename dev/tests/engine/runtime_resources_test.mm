@@ -1142,6 +1142,63 @@ void testALongRequestAfterTheWarmupsCreatesNothing(const char *metallibPath) {
           "a request of 8K tokens after the start's warmups created pipelines: " + log);
 }
 
+// A reply's state is captured in decode, at the page its cycle's retained
+// rows reach (Model::capturesInDecode), by a fold of the verify's tape that no
+// prompt runs. After the start's warmups, a cycle that captures a state at
+// its page creates no pipeline: each decode warmup created the capture's.
+void testAReplyCaptureAfterTheWarmupsCreatesNothing(const char *metallibPath) {
+  const test::TemporaryDirectory root("splash-reply-capture-pipelines");
+  RuntimeResourcesConfig config = loadableConfig(metallibPath, root.path(), "reply-capture-pipelines-test");
+  std::unique_ptr<RuntimeResources> resources;
+  static_cast<void>(test::capturedStderr([&] { resources = RuntimeResources::create(config, 0); }));
+  const EngineMemoryBreakdown &budget = resources->memoryPlan().breakdown();
+  std::unique_ptr<model::RuntimeModel> runtime;
+  require(static_cast<bool>(resources->memoryGovernor().allocationAdmission()(
+              budget.sharedPrefillBytes + budget.sharedDecodeBytes,
+              [&] { runtime = model::createRuntime(resources->modelContext()); })),
+          "the runtime's arenas were refused");
+  require(runtime->capturesInDecode(), "the reply capture's model captures no state in decode");
+  const KvPool::RunwayHold runway(resources->kvPool());
+  static_cast<void>(runtime->warmupPrefill(model::ExecutionLimits::prefillTokenBudget));
+  for (const uint32_t rows : resources->modelContext().operators.prefillRowClasses())
+    static_cast<void>(runtime->warmupPrefill(rows));
+  static_cast<void>(runtime->warmupDecodeBatch(1));
+  metal::MetalBackend &backend = resources->backend();
+  backend.beginServing();
+  // A prompt a row short of a page, whose first cycle's first retained row
+  // reaches the page, on the runway's pages.
+  constexpr uint32_t tokens = kv::kPageTokens - 1;
+  const std::vector<uint32_t> prompt(tokens, 7);
+  const std::vector<uint32_t> pages{0, 1};
+  auto &executor = dynamic_cast<model::Runtime &>(*runtime);
+  constexpr uint64_t id = 737;
+  bool captured = false;
+  const std::string log = test::capturedStderr([&] {
+    executor.beginColdRequest({.id = id, .prompt = prompt, .maxNewTokens = 16}, 0);
+    ModelBatchItem chunk{.requestId = id, .tokenCount = tokens, .pageTable = pages, .pageTableRevision = 1};
+    chunk.inputTokens = prompt;
+    const auto prefilled = executor.prefill({.kind = WorkKind::Prefill, .items = {{id, tokens}}},
+                                            std::span<const ModelBatchItem>(&chunk, 1));
+    require(prefilled.size() == 1 && prefilled[0].failure.empty() && prefilled[0].outputTokens.empty(),
+            "the reply's prompt failed or ended it");
+    ModelBatchItem item{.requestId = id, .logicalPosition = tokens, .pageTable = pages, .pageTableRevision = 1};
+    metal::AllocationFailure refusal;
+    item.stateCaptures.push_back({kv::kPageTokens, executor.reserveState(id, kv::kPageTokens, refusal)});
+    require(item.stateCaptures.back().reservation != nullptr, "the buffers of the reply's state were refused");
+    auto decoded = executor.decode({.kind = WorkKind::Decode, .items = {{id, 0}}},
+                                   std::span<const ModelBatchItem>(&item, 1));
+    require(decoded.size() == 1 && decoded[0].failure.empty() && !decoded[0].outputTokens.empty(),
+            "the reply's cycle failed");
+    captured = decoded[0].capturedStates.size() == 1;
+    decoded.clear();
+    item = {};
+    executor.end(id);
+  });
+  require(captured, "the reply's cycle captured no state at its page: " + log);
+  require(backend.pipelinesCreatedWhileServing() == 0,
+          "a cycle that captured a reply's state after the start's warmups created pipelines: " + log);
+}
+
 // The SSD cache holds no write back unless a write budget is set; one that
 // is set starts with a quarter of a day's.
 void testWriteBudgetOnlyWhenSet(const char *metallibPath) {
@@ -2089,6 +2146,7 @@ int main(int argc, char **argv) {
       testYarnRuntime(argv[1]);
       testARestoreAfterTheOtherWarmupsCreatesNothing(argv[1]);
       testALongRequestAfterTheWarmupsCreatesNothing(argv[1]);
+      testAReplyCaptureAfterTheWarmupsCreatesNothing(argv[1]);
       testWriteBudgetOnlyWhenSet(argv[1]);
       testStaleCachesGoAtEveryStart(argv[1]);
       testMadeCacheRootStaysOutOfBackups(argv[1]);
