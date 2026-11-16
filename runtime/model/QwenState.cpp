@@ -341,6 +341,84 @@ void QwenStateStorage::releaseLane(uint32_t index, uint64_t requestId) {
   current.metadata = {};
 }
 
+struct QwenStateStorage::ParkedLane::Impl final {
+  std::shared_ptr<QwenBufferPool> pool;
+  std::shared_ptr<StateAllocationTracker> allocations;
+  Lane lane;
+  MetalBuffer scratch;
+  uint64_t scratchAllocatedBytes = 0;
+  ~Impl() {
+    // Discard releases ownership directly. Cancellation must not allocate
+    // vector capacity to return a parked lane to a pool under memory pressure.
+    allocations->bytes.fetch_sub(scratchAllocatedBytes, std::memory_order_relaxed);
+  }
+};
+
+QwenStateStorage::ParkedLane::ParkedLane(std::unique_ptr<Impl> impl)
+    : impl_(std::move(impl)) {}
+QwenStateStorage::ParkedLane::~ParkedLane() = default;
+const QwenLaneMetadata &QwenStateStorage::ParkedLane::metadata() const noexcept {
+  return impl_->lane.metadata;
+}
+const MetalBuffer &QwenStateStorage::ParkedLane::scratch() const noexcept {
+  return impl_->scratch;
+}
+
+std::unique_ptr<QwenStateStorage::ParkedLane> QwenStateStorage::parkLane(
+    uint32_t index, uint64_t requestId, uint64_t scratchBytes,
+    const std::function<void(const MetalBuffer &)> &saveScratch,
+    metal::AllocationFailure &refusal) {
+  Lane &source = lane(index);
+  if (backend_.commandInFlight())
+    throw std::logic_error("cannot park a lane with a command in flight");
+  requireAssigned(source);
+  if (!requestId || source.metadata.requestId != requestId)
+    throw std::logic_error("Qwen lane owner mismatch");
+  if (scratchBytes > std::numeric_limits<uint64_t>::max() - (kHostPageBytes - 1))
+    throw std::invalid_argument("parked scratch size overflows alignment");
+  if (scratchBytes && !saveScratch)
+    throw std::invalid_argument("parked scratch needs a save operation");
+  auto held = std::make_unique<ParkedLane::Impl>();
+  held->pool = pool_;
+  held->allocations = allocations_;
+  refusal = metal::AllocationFailure::None;
+  if (scratchBytes) {
+    const auto admitted = admitAllocation_(alignUp(scratchBytes), [&] {
+      held->scratch = backend_.allocateBuffer(alignUp(scratchBytes), metal::BufferStorage::Shared,
+                                               "qwen-parked-lane-scratch");
+      held->scratchAllocatedBytes = held->scratch.allocatedBytes();
+      allocations_->bytes.fetch_add(held->scratchAllocatedBytes, std::memory_order_relaxed);
+    });
+    if (!admitted) {
+      refusal = admitted.failure;
+      return {};
+    }
+  }
+  // Allocate the wrapper before detaching too: host allocation can fail.
+  auto parked = std::unique_ptr<ParkedLane>(new ParkedLane(std::move(held)));
+  if (saveScratch)
+    saveScratch(parked->scratch());
+  parked->impl_->lane = std::move(source);
+  source = {};
+  return parked;
+}
+
+void QwenStateStorage::restoreParkedLane(uint32_t index, uint64_t requestId,
+                                        std::unique_ptr<ParkedLane> &parked) {
+  Lane &destination = lane(index);
+  if (backend_.commandInFlight())
+    throw std::logic_error("cannot restore a parked lane with a command in flight");
+  if (!parked || parked->impl_->pool != pool_)
+    throw std::invalid_argument("parked lane belongs to another storage");
+  if (!requestId || parked->metadata().requestId != requestId)
+    throw std::logic_error("Qwen lane owner mismatch");
+  if (destination.metadata.assigned())
+    throw std::logic_error("parked destination lane is assigned");
+  destination = std::move(parked->impl_->lane);
+  parked->impl_->lane = {};
+  parked.reset();
+}
+
 void QwenStateStorage::clearForColdStart(uint32_t index) {
   const Lane &target = lane(index);
   requireAssigned(target);

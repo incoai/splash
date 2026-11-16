@@ -34,6 +34,12 @@ public:
   [[nodiscard]] StateAdmission
   begin(const ModelRequest &request) override;
   void suspend(uint64_t requestId) override;
+  // Experimental RAM-only decode continuation. Not used by Engine admission.
+  // The caller must finish every outstanding command ticket before either
+  // operation, retain the request's KV pages, and end() on cancellation.
+  // Unsupported decode stages or memory refusal leave the request resident.
+  [[nodiscard]] ModelMemoryAdmission parkDecodedRequest(uint64_t requestId);
+  [[nodiscard]] StateAdmission restoreParkedRequest(uint64_t requestId);
   [[nodiscard]] StateAdmission
   resume(const ModelRequest &request) override;
   [[nodiscard]] std::unique_ptr<StateRestore> beginRestore(

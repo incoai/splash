@@ -139,17 +139,18 @@ inline engine::RuntimeResourcesConfig moeConfig(const char *metallibPath, const 
 // a PLE table of `pleRows` rows, and a draft of one layer that reads four of
 // them; no vision tower.
 inline engine::RuntimeResourcesConfig flashNextConfig(const char *metallibPath, const std::filesystem::path &root,
-                                                      uint64_t pleRows = gguf_fixtures::kPleTableRows) {
+                                                      uint64_t pleRows = gguf_fixtures::kPleTableRows,
+                                                      uint32_t targetHiddenSize = 256, uint32_t experts = 4) {
   model::Qwen4ExpLayout target;
   target.layers = 8;
-  target.hiddenSize = 256;
+  target.hiddenSize = targetHiddenSize;
   target.vocabularySize = 256;
   target.fullAttentionPeriod = 2;
   target.maskToken = 252;
   target.stopTokens = {250, 251};
   target.pleEosToken = 250;
   target.pleImageToken = 253;
-  target.experts = 4;
+  target.experts = experts;
   target.expertsPerToken = 2;
   target.expertIntermediateSize = 256;
   target.pleLayer = 0;

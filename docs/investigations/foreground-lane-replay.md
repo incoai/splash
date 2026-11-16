@@ -2,7 +2,7 @@
 
 Source base: downstream production commit
 `9753a803a8d7acc4caf6e164292ca279ea69d830`.
-This investigation adds fake-model engine tests only. It changes no scheduler,
+The initial characterization commit adds fake-model engine tests only. It changes no scheduler,
 model runtime, service configuration, memory limit or cache policy. No native
 fairness experiment is enabled or deployed.
 
@@ -93,3 +93,7 @@ pass: **458 passed, 0 failed**. Built with the repository target and its
 `-Wall -Wextra -Werror` flags. See `foreground-lane-replay-tests.json` for hashes,
 commands and read-only production verification. No Metal numerical tests or
 real-model benchmarks were run, and nothing was deployed.
+
+The subsequent RAM-only Runtime prototype and its targeted qualification are
+documented in [ram-continuation-prototype.md](ram-continuation-prototype.md).
+Engine rotation and production activation remain absent.
