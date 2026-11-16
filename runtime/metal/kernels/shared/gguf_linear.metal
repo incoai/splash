@@ -308,33 +308,40 @@ GGUF_DECODE_FUSED(8) GGUF_DECODE_FUSED(16) GGUF_DECODE_FUSED(32) GGUF_DECODE_FUS
   threadgroup half stage[kPrefillStages]
 // The plain kernel takes up to three segments of its format (GgufPrefillSegmentsParams), so the segments of a fused
 // projection that share a format run as one dispatch, grid.y over their column tiles in segment order.
-#define GGUF_PREFILL(F, f)                                                                                         \
+#define GGUF_PREFILL(F, f, R)                                                                                         \
   kernel void gguf_prefill_##f##_a(device bfloat *input [[buffer(0)]], GGUF_SEGMENTS,                            \
                                    device bfloat *output [[buffer(10)]],                                          \
                                    constant GgufPrefillSegmentsParams &p [[buffer(11)]], GGUF_PREFILL_THREAD) {    \
     GGUF_PREFILL_TABLES(F);                                                                                        \
     GGUF_SEGMENT_OF(group.y, p.cols);                                                                              \
-    const uint first = group.x * GGUF_PREFILL_ROWS, rows = p.rows > first ? p.rows - first : 0;                    \
-    gguf_prefill_tile<F, GGUF_PREFILL_SIMDGROUP_ROWS, GGUF_PREFILL_SIMDGROUPS, GGUF_TILE_COLUMNS, GGUF_PREFILL_STEP>(input + ulong(first) * p.input_size, w0, w1, meta,                        \
+    const uint first = group.x * (R * GGUF_PREFILL_SIMDGROUPS), rows = p.rows > first ? p.rows - first : 0;                    \
+    gguf_prefill_tile<F, R, GGUF_PREFILL_SIMDGROUPS, GGUF_TILE_COLUMNS, GGUF_PREFILL_STEP>(input + ulong(first) * p.input_size, w0, w1, meta,                        \
                                          output + ulong(first) * p.out_stride, p.input_size,                       \
                                          local * GGUF_TILE_COLUMNS, rows, stage, tl, simd_lane, simd_group,        \
                                          p.out_stride, p.offset[s]);                                               \
   }
-#define GGUF_PREFILL_EPILOGUE(F, f, ep, Ep)                                                                        \
+#define GGUF_PREFILL_EPILOGUE(F, f, R, ep, Ep)                                                                        \
   kernel void gguf_prefill_##f##_##ep(GGUF_PREFILL_BUFFERS, device bfloat *aux [[buffer(5)]],                    \
                                       constant GgufPrefillParams &p [[buffer(6)]], GGUF_PREFILL_THREAD) {          \
     GGUF_PREFILL_TABLES(F);                                                                                        \
-    const uint first = group.x * GGUF_PREFILL_ROWS, rows = p.rows > first ? p.rows - first : 0;                    \
-    gguf_prefill_tile<F, GGUF_PREFILL_SIMDGROUP_ROWS, GGUF_PREFILL_SIMDGROUPS, GGUF_TILE_COLUMNS, GGUF_PREFILL_STEP, Ep>(input + ulong(first) * p.input_size, w0, w1, meta,                    \
+    const uint first = group.x * (R * GGUF_PREFILL_SIMDGROUPS), rows = p.rows > first ? p.rows - first : 0;                    \
+    gguf_prefill_tile<F, R, GGUF_PREFILL_SIMDGROUPS, GGUF_TILE_COLUMNS, GGUF_PREFILL_STEP, Ep>(input + ulong(first) * p.input_size, w0, w1, meta,                    \
                                              output + ulong(first) * p.out_stride, p.input_size,                   \
                                              group.y * GGUF_TILE_COLUMNS, rows, stage, tl, simd_lane, simd_group,  \
                                              p.out_stride, p.out_offset, aux + ulong(first) * p.out_stride,        \
                                              p.clamp);                                                             \
   }
-#define GGUF_PREFILL_FORMAT(F, f) \
-  GGUF_PREFILL(F, f) GGUF_PREFILL_EPILOGUE(F, f, r, EpResidual) GGUF_PREFILL_EPILOGUE(F, f, g, EpUpWithGate)  \
-  GGUF_PREFILL_EPILOGUE(F, f, c, EpClampedUpWithGate)
+#define GGUF_PREFILL_SIZED_FORMAT(F, f, R) \
+  GGUF_PREFILL(F, f, R) GGUF_PREFILL_EPILOGUE(F, f, R, r, EpResidual) \
+  GGUF_PREFILL_EPILOGUE(F, f, R, g, EpUpWithGate) \
+  GGUF_PREFILL_EPILOGUE(F, f, R, c, EpClampedUpWithGate)
+#define GGUF_PREFILL_FORMAT(F, f) GGUF_PREFILL_SIZED_FORMAT(F, f, GGUF_PREFILL_SIMDGROUP_ROWS)
 QUANT_FORMATS(GGUF_PREFILL_FORMAT)
+// Low-occupancy Q4_K/Q5_K chunks: the same stage and four simdgroups,
+// each holding half as many rows. Selection keeps longer chunks on 128 rows.
+GGUF_PREFILL_SIZED_FORMAT(FmtQ4K, q4k_m64, 16)
+GGUF_PREFILL_SIZED_FORMAT(FmtQ5K, q5k_m64, 16)
+#undef GGUF_PREFILL_SIZED_FORMAT
 #undef GGUF_PREFILL_FORMAT
 
 // The residual kernels over a view of the leading inputs of wider weight rows, for the Neural Engine FFN split's down

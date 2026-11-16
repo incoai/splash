@@ -612,7 +612,8 @@ int main(int argc, char **argv) {
     auto verifyTarget = std::visit([&](const auto &weights) {
       return makeQwenTarget(weights, verifyGeometry.target, backend, operators, 1);
     }, model.target);
-    for (uint32_t lanes = 1; lanes <= 4; ++lanes) {
+    for (const auto [lanes, blockRows] : {std::pair{1u, 1u}, std::pair{1u, 16u}, std::pair{2u, 16u},
+                                         std::pair{3u, 16u}, std::pair{4u, 16u}}) {
       CommandGraph graph;
       const uint32_t storage = verifyTarget->decodeStorageLanes(lanes);
       auto d = [&](model::DecodeTensor tensor) { return verifyArena.batchSlice(tensor, storage); };
@@ -646,7 +647,7 @@ int main(int argc, char **argv) {
       std::vector<std::vector<std::vector<double>>> expectedLanes;
       for (uint32_t lane = 0; lane < lanes; ++lane) {
         std::vector<uint32_t> ids;
-        for (uint32_t row = 0; row < 16; ++row) {
+        for (uint32_t row = 0; row < blockRows; ++row) {
           ids.push_back((row * 13 + lane * 7) % kVocab);
           positions.insert(positions.end(), {row, row, row});
         }
@@ -655,7 +656,7 @@ int main(int argc, char **argv) {
         b.pageTables[lane] = verifyArena.get(lane, model::DecodeTensor::PageTable);
         const std::vector<uint32_t> page{lane * extent};
         pages.writeEntries(page, 0, b.pageTables[lane]);
-        chunks[lane] = ops::PagedAttention::prefillParams(0, 16, kv::kVerifyChunkStride, 1);
+        chunks[lane] = ops::PagedAttention::prefillParams(0, blockRows, kv::kVerifyChunkStride, 1);
       }
       std::vector<float> inv(kPairs);
       for (uint32_t pair = 0; pair < kPairs; ++pair) inv[pair] = std::pow(kTheta, -float(pair) / kPairs);
@@ -663,24 +664,24 @@ int main(int argc, char **argv) {
       ops::RoPE::addTables(graph, upload(backend, positions, "verify positions"), none,
                            uploadFloats(backend, inv, "inverse frequencies"), none,
                            b.ropeCos, b.ropeSin, none, none,
-                           {.target_rows = lanes * 16, .draft_rows = 0, .target_scale = 1.0F}, lanes * 16, kPairs);
-      verifyTarget->addEmbedding(graph, upload(backend, input, "verify tokens"), b.hidden[0], lanes * 16);
+                           {.target_rows = lanes * blockRows, .draft_rows = 0, .target_scale = 1.0F}, lanes * blockRows, kPairs);
+      verifyTarget->addEmbedding(graph, upload(backend, input, "verify tokens"), b.hidden[0], lanes * blockRows);
       SpilledKvReads spilled;
-      verifyTarget->addVerify(graph, b, pages, spilled, chunks, lanes, 16);
+      verifyTarget->addVerify(graph, b, pages, spilled, chunks, lanes, blockRows);
       static_cast<void>(backend.submitCommandAsync(graph.dispatches()).wait());
       const auto *actual = static_cast<const float *>(b.logits.contents());
       for (uint32_t lane = 0; lane < lanes; ++lane)
-        for (uint32_t row = 0; row < 16; ++row) {
+        for (uint32_t row = 0; row < blockRows; ++row) {
           double scale = 0;
           for (double value : expectedLanes[lane][row]) scale += value * value;
           scale = std::sqrt(scale / kVocab);
           for (uint32_t token = 0; token < kVocab; ++token) {
             const double want = expectedLanes[lane][row][token];
-            const float got = actual[(lane * 16 + row) * kVocab + token];
+            const float got = actual[(lane * blockRows + row) * kVocab + token];
             if (!std::isfinite(got) || std::fabs(got - want) > 0.015 * scale + 0.025) {
               std::cerr << "verify lanes " << lanes << " lane " << lane << " row " << row
                         << " token " << token << ": " << got << " vs " << want << '\n';
-              throw std::runtime_error("sixteen-row target verify diverged from the reference");
+              throw std::runtime_error("target verify diverged from the reference");
             }
           }
         }

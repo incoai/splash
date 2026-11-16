@@ -132,6 +132,8 @@ void LinearPlan::requireConfiguration() const {
   const uint32_t k = workload_.matrix.inputSize;
   const LinearConfig &c = config_;
   const bool decode = workload_.phase == LinearPhase::Decode;
+  if (c.prefill64Rows && (decode || c.tile != LinearTile::GgufPrefill))
+    throw std::invalid_argument("only a bf16 block prefill uses the 64-row prefill tile");
   if (c.spread && c.tile != LinearTile::GgufStaged)
     throw std::invalid_argument("only the staged block tile spreads its walks");
   if (c.oneGateUpPass && (c.tile != LinearTile::GgufStaged || !decode || (workload_.epilogue != LinearEpilogue::GateUp && workload_.epilogue != LinearEpilogue::ClampedGateUp)))
@@ -368,7 +370,8 @@ void Linear::addGgufStaged(metal::CommandGraph &graph, const LinearBuffers &b,
 }
 
 // The prefill tile, which runs prefill chunks of more than
-// ProjectionCalibration::stagedPrefillRows rows over 128-row tiles: a plain projection in one
+// ProjectionCalibration::stagedPrefillRows rows over 128-row tiles, or 64
+// where the measured low-occupancy policy selects them: a plain projection in one
 // dispatch per format, over the column tiles of its segments of that format
 // (a fused projection's segments otherwise run as small grids of their own),
 // a projection with an epilogue in one dispatch per segment. Rows past the
@@ -379,7 +382,13 @@ void Linear::addGgufPrefill(metal::CommandGraph &graph, const LinearBuffers &b,
   const LinearWorkload w = plan.workload();
   const auto [n, k] = w.matrix;
   const char epilogue = epilogueSuffix(w.epilogue);
-  const uint32_t rowTiles = plan.storageRows() / GGUF_PREFILL_ROWS;
+  const bool small = plan.configuration().prefill64Rows;
+  if (small && !unitFormats(std::array{&p}).prefill64Takes)
+    throw std::invalid_argument("the 64-row prefill tile takes Q4_K/Q5_K without leading-input views");
+  const uint32_t rowTiles = plan.storageRows() / (small ? GGUF_PREFILL_ROWS / 2 : GGUF_PREFILL_ROWS);
+  const auto kernel = [&](const char *format) {
+    return prefillKernel((std::string(format) + (small ? "_m64" : "")).c_str(), epilogue);
+  };
   if (w.epilogue == LinearEpilogue::None && !p.planeInputs()) {
     const std::vector<QuantizedSegment> &segments = p.blocks().segments;
     std::vector<uint32_t> formats;
@@ -404,7 +413,7 @@ void Linear::addGgufPrefill(metal::CommandGraph &graph, const LinearBuffers &b,
         bindings.insert(bindings.end(), {s.plane0, s.plane1Slot(), s.meta});
       }
       bindings.push_back(b.output);
-      graph.add(prefillKernel(group.front()->name(), epilogue), std::move(bindings), params,
+      graph.add(kernel(group.front()->name()), std::move(bindings), params,
                 {rowTiles, columns / GGUF_TILE_COLUMNS, 1}, {GGUF_PREFILL_THREADS, 1, 1});
     }
     return;
@@ -415,10 +424,10 @@ void Linear::addGgufPrefill(metal::CommandGraph &graph, const LinearBuffers &b,
     const GgufPrefillParams params{k, w.rows, n, s.columnOffset, b.clamp};
     const metal::DispatchSize groups{rowTiles, s.outputSize / GGUF_TILE_COLUMNS, 1};
     if (p.planeInputs())
-      graph.add(leadingInputsInstance(prefillKernel(s.name(), epilogue)), std::move(bindings),
+      graph.add(leadingInputsInstance(kernel(s.name())), std::move(bindings),
                 GgufPrefillLeadingParams{params, p.planeInputs()}, groups, {GGUF_PREFILL_THREADS, 1, 1});
     else
-      graph.add(prefillKernel(s.name(), epilogue), std::move(bindings), params, groups, {GGUF_PREFILL_THREADS, 1, 1});
+      graph.add(kernel(s.name()), std::move(bindings), params, groups, {GGUF_PREFILL_THREADS, 1, 1});
   }
 }
 

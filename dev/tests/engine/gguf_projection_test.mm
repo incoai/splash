@@ -1708,6 +1708,36 @@ void gatherExtents(MetalBackend &backend) {
           "extent and refused one element short");
 }
 
+// Both row heights must write identical live rows and leave row/column
+// padding intact, including partial final simdgroups and fused format groups.
+void prefill64(MetalBackend &backend, const Linear &linear) {
+  constexpr uint32_t K = 512;
+  const Tensor q4 = tensor(backend, Q4K, 512, K), q5 = tensor(backend, Q5K, 512, K);
+  for (const std::vector<const Tensor *> &parts : {std::vector<const Tensor *>{&q4},
+                                                 std::vector<const Tensor *>{&q5},
+                                                 std::vector<const Tensor *>{&q4, &q5, &q4}}) {
+    const uint32_t covered = segmentColumns(parts), columns = covered + 64;
+    const Projection p = projection(parts, columns);
+    for (const uint32_t rows : {1u, 65u, 92u, 126u, 128u, 129u})
+      for (const auto ep : {LinearEpilogue::None, LinearEpilogue::Residual,
+                            LinearEpilogue::UpWithGate, LinearEpilogue::ClampedUpWithGate}) {
+        const LinearWorkload w{{columns, K}, rows, LinearPhase::Prefill, ep};
+        const auto standard = Linear::plan(w, {.tile = LinearTile::GgufPrefill}, FloatOutput::BFloat16);
+        const auto small = Linear::plan(w, {.tile = LinearTile::GgufPrefill, .prefill64Rows = true},
+                                        FloatOutput::BFloat16);
+        const auto x = storageRows(activations(Inputs::Dense, rows, K), K, rows, standard.storageRows());
+        const auto aux = storageRows(residuals(rows, columns), columns, rows, standard.storageRows());
+        const std::string label = "64-row prefill " + std::to_string(rows) + " " + epilogueName(ep);
+        const auto a = run(backend, linear, standard, p, nullptr, x, aux, kPoisonNaN, covered, label);
+        const auto b = run(backend, linear, small, p, nullptr, x, aux, kPoisonNaN, covered, label);
+        if (!sameRows(a.output, 0, b.output, 0, rows, columns)) fail(label + ": differs from 128-row tile");
+        for (uint64_t i = uint64_t{(rows + 15) / 16 * 16} * columns; i < b.output.size(); ++i)
+          if (b.output[i] != kUnwritten) { fail(label + ": writes row padding"); break; }
+      }
+  }
+  section("64-row prefill: Q4_K/Q5_K, fused formats, all epilogues and partial tiles match 128 rows bitwise");
+}
+
 int main(int argc, char **argv) {
   @autoreleasepool {
     if (argc != 2) {
@@ -1730,6 +1760,7 @@ int main(int argc, char **argv) {
         oneGateUpPass(backend, linear, spread, 16, LinearEpilogue::ClampedGateUp);
       }
       prefill(backend, linear, 1024, tileFormats(LinearTile::GgufStaged));
+      prefill64(backend, linear);
       decodeInt8(backend, linear);
       decodeInt8(backend, linear, 16);
       prefillInt8(backend, linear);

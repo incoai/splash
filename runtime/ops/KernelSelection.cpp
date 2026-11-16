@@ -124,7 +124,7 @@ bool registers(const RegisterBoundary &boundary, FormatClass formatClass, uint32
   // The calibration speaks for one to four 8-row groups (the boundary law
   // was measured there); a whole 16-row block's wider groups run staged,
   // whose weight read amortizes over them.
-  if (lanes > 4)
+  if (!lanes || lanes > 4)
     return false;
   return 4 * columnTiles * lanes < uint64_t{boundary.belowQuarters[size_t(formatClass)][lanes - 1]} * cores;
 }
@@ -167,7 +167,10 @@ LinearConfig bf16Projection(const KernelCalibration &calibration, LinearWorkload
   const uint32_t cores = calibration.cores;
   if (w.phase == LinearPhase::Prefill) {
     if (w.rows <= p.stagedPrefillRows) return staged(p, n, k, w.rows, unit.weightBits16, cores, Passes::Two);
-    return {.tile = LinearTile::GgufPrefill};
+    return {.tile = LinearTile::GgufPrefill,
+            .prefill64Rows = unit.prefill64Takes && w.rows <= GGUF_PREFILL_ROWS &&
+                             cores >= p.smallPrefillFromCores &&
+                             n / GGUF_TILE_COLUMNS < uint64_t{p.smallPrefillColumnTilesPerCore} * cores};
   }
   const uint32_t lanes = w.rows / SPLASH_TARGET_VERIFY_ROWS;
   const bool gateUp = w.epilogue == LinearEpilogue::GateUp ||
@@ -202,11 +205,13 @@ UnitFormats unitFormats(std::span<const Projection *const> projections) noexcept
   UnitFormats unit;
   FormatClassifier classes;
   uint32_t bits = 0, count = 0;
-  bool decodeInt8 = true, prefillInt8 = true, quantized = false;
+  bool decodeInt8 = true, prefillInt8 = true, prefill64 = true, quantized = false;
   for (const Projection *p : projections) {
     if (!p) continue;
+    prefill64 &= !p->planeInputs();
     bits += p->shape().weightBits16, ++count;
     for (const QuantizedSegment &s : p->blocks().segments) {
+      prefill64 &= s.formatId == GGUF_FMT_Q4K || s.formatId == GGUF_FMT_Q5K;
       if (s.isFloat()) continue;
       unit.registerTakes &= quant_register_tensor(s.formatId, s.inputSize);
       classes.add(s.formatId);
@@ -217,6 +222,7 @@ UnitFormats unitFormats(std::span<const Projection *const> projections) noexcept
   }
   unit.decodeInt8Takes = quantized && decodeInt8;
   unit.prefillInt8Takes = quantized && prefillInt8;
+  unit.prefill64Takes = quantized && prefill64;
   unit.formatClass = classes.formatClass();
   unit.weightBits16 = count ? bits / count : 0;
   if (projections.size() == 2 && projections[0] && projections[1]) {

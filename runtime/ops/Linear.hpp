@@ -88,7 +88,7 @@ enum class LinearEpilogue : uint8_t {
 // prefill chunks of up to 32 rows, or the 64-row tile up to
 // ProjectionCalibration::stagedPrefillRows), each simdgroup staging its own
 // columns, with optional K splits. GgufPrefill: the 128-row shared-stage
-// prefill tile.
+// prefill tile (64 rows under LinearConfig::prefill64Rows).
 // GgufRegister: the exact register tile on bf16 8x8 matrix operations
 // (Apple9), over an activation table, every request lane in one threadgroup,
 // optional K splits.
@@ -149,6 +149,9 @@ struct LinearConfig final {
   // (gguf_rotate_int8), into the int8 tiles (gguf_decode_int8_pq20_m<rows>_*)
   // at the plan's storage rows, splits, spread and passes.
   bool decodeInt8 = false;
+  // GgufPrefill: four 16-row simdgroups instead of four 32-row ones.
+  // Storage keeps its 128-row extent; twice as many 64-row tiles run.
+  bool prefill64Rows = false;
   [[nodiscard]] constexpr bool validSplits() const noexcept {
     return splits && splits <= kMaximumSplits && !(splits & (splits - 1));
   }

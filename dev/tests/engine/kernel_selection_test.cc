@@ -217,6 +217,7 @@ std::string describe(const LinearPlan &plan) {
        << c.oneGateUpPass << " sixteen " << c.sixteenRows << " storage " << plan.storageRows() << " input "
        << unsigned(plan.input()) << " scratch " << s.input << "/" << s.sums << "/" << s.partials << "/"
        << s.counters << "/" << s.rotated << " gate " << plan.gateScratchBytes();
+  if (c.prefill64Rows) line << " prefill64";
   return line.str();
 }
 
@@ -830,8 +831,44 @@ void dumpLines(const Golden &golden, const std::string &directory) {
 
 } // namespace
 
+// Sub-block decode rows must bypass the register calibration, which is
+// indexed by complete eight-row groups. In particular a one-token target
+// decode must not read the entry before its boundary table.
+void subBlockDecodeRows() {
+  for (const auto [family, cores] : kDevices) {
+    const auto calibration = KernelCalibration::of(device(family, cores));
+    for (uint32_t rows = 1; rows < SPLASH_TARGET_VERIFY_ROWS; ++rows)
+      for (const auto epilogue : {LinearEpilogue::None, LinearEpilogue::GateUp,
+                                 LinearEpilogue::ClampedGateUp}) {
+        const auto config = selectProjection(calibration, Int8Activations::Off,
+                                             {{1024, 5120}, rows, LinearPhase::Decode, epilogue},
+                                             {.registerTakes = true, .weightBits16 = 64, .oneFormat = true});
+        test::require(config.tile == LinearTile::GgufStaged,
+                      "sub-block decode indexed the register boundary");
+      }
+  }
+}
+
+void smallPrefillBoundary() {
+  const UnitFormats formats{.prefill64Takes = true};
+  const auto picks = [&](uint32_t family, uint32_t cores, uint32_t rows, uint32_t columns,
+                         const UnitFormats &unit) {
+    return selectProjection(KernelCalibration::of(device(family, cores)), Int8Activations::On,
+                            {{columns, 5120}, rows, LinearPhase::Prefill}, unit).prefill64Rows;
+  };
+  test::require(picks(10, 40, 65, 119 * 64, formats) && picks(10, 40, 128, 119 * 64, formats),
+                "low-occupancy Q4/Q5 prefill missed the small tile");
+  test::require(!picks(10, 40, 64, 5120, formats) && !picks(10, 40, 129, 5120, formats) &&
+                    !picks(10, 40, 128, 120 * 64, formats) && !picks(10, 20, 128, 512, formats) &&
+                    !picks(9, 40, 128, 512, formats) && !picks(11, 40, 128, 512, formats) &&
+                    !picks(10, 40, 128, 5120, {}),
+                "small prefill tile escaped its measured device, format or occupancy boundary");
+}
+
 int main(int argc, char **argv) {
   try {
+    subBlockDecodeRows();
+    smallPrefillBoundary();
     std::optional<std::string> dump, golden, write;
     for (int i = 1; i < argc; ++i) {
       const std::string arg = argv[i];
