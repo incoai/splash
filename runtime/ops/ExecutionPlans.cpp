@@ -1,4 +1,5 @@
 #include "ops/ExecutionPlans.hpp"
+#include "ops/KernelSelection.hpp"
 
 #include "metal/abi/Gguf.h"
 
@@ -28,9 +29,9 @@ void include(Workspace &bound, const Workspace &required,
 ExecutionPlans::ExecutionPlans(const DeviceCapabilities &device, Int8Activations int8Activations)
     : linear_(device, int8Activations), draftLinear_(device, Int8Activations::Off) {}
 
-// A chunk's rows pick its projections' tile, and a staged tile's height names
-// its kernels (gguf_decode_<format>_m<rows>_*), so each height a chunk takes
-// is a class, and the prefill tile one more. Every other kernel a chunk's
+// A chunk's projection tile and row height name its kernels, so each height
+// a chunk takes is a class, including both shared prefill row tiles.
+// Every other kernel a chunk's
 // rows pick today changes once along them (selectFloatTile, selectMoe, the
 // staged norm, the hyper-connection norm's quarters, and the Neural Engine
 // split, which takes no class's first chunk: AneFfn::kMinimumRows), so a
@@ -39,13 +40,23 @@ ExecutionPlans::ExecutionPlans(const DeviceCapabilities &device, Int8Activations
 // 17-row chunk on a 16-core Apple9 plan.
 std::vector<uint32_t> ExecutionPlans::prefillRowClasses() const {
   std::vector<uint32_t> first;
-  std::pair<LinearTile, uint32_t> last{};
+  // Include both format capabilities: a low-grid prefill may use the small
+  // row tile, then return to the full tile before ANE splitting begins.
+  const std::array<UnitFormats, 2> units{{{}, {.prefill64Takes = true}}};
+  std::array<std::pair<LinearTile, uint32_t>, units.size()> last{};
   for (uint32_t rows = 1; rows <= SPLASH_PREFILL_TOKEN_BUDGET; ++rows) {
-    const LinearPlan plan = linear_.plan({{GGUF_TILE_COLUMNS, GGUF_TILE_COLUMNS}, rows, LinearPhase::Prefill});
-    const LinearTile tile = plan.configuration().tile;
-    const std::pair key{tile, tile == LinearTile::GgufStaged ? plan.storageRows() : 0};
-    if (first.empty() || key != last) first.push_back(rows);
-    last = key;
+    const LinearWorkload workload{{GGUF_TILE_COLUMNS, GGUF_TILE_COLUMNS}, rows, LinearPhase::Prefill};
+    bool changed = first.empty();
+    for (size_t index = 0; index < units.size(); ++index) {
+      const auto config = selectProjection(calibration(), linear_.int8Activations(), workload, units[index]);
+      const LinearPlan plan = Linear::plan(workload, config, FloatOutput::BFloat16);
+      const uint32_t height = config.tile == LinearTile::GgufStaged ? plan.storageRows()
+                              : config.prefill64Rows ? GGUF_PREFILL_ROWS / 2 : GGUF_PREFILL_ROWS;
+      const std::pair key{config.tile, height};
+      changed |= key != last[index];
+      last[index] = key;
+    }
+    if (changed) first.push_back(rows);
   }
   return first;
 }

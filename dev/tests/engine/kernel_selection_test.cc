@@ -711,13 +711,15 @@ void warmupCovers(const std::string &name, const ExecutionPlans &plans, std::vec
                        " rows after " + std::to_string(chunk->second) + " tokens");
   };
   const Linear &linear = plans.linear();
-  // A projection plan's tile, and a staged tile's height, which names its kernels.
+  // The tile and row height that name its kernels, including both prefill variants.
   const auto tile = [](const LinearPlan &plan) {
-    const LinearTile t = plan.configuration().tile;
-    return uint32_t(t) << 8 | (t == LinearTile::GgufStaged ? plan.storageRows() : 0);
+    const LinearConfig c = plan.configuration();
+    const uint32_t rows = c.tile == LinearTile::GgufStaged ? plan.storageRows()
+                          : c.tile == LinearTile::GgufPrefill ? (c.prefill64Rows ? 64u : 128u) : 0u;
+    return uint32_t(c.tile) << 8 | rows;
   };
-  // Of one matrix, whose shape the tile a chunk's rows pick does not follow,
-  // in each set of formats the plans tell apart.
+  // A low-column-count matrix exercises both prefill row heights where the
+  // device selects them, in every set of formats the plans tell apart.
   std::vector<UnitFormats> units;
   for (const FormatSet &set : formatSets()) {
     std::optional<Projection> p;
