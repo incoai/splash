@@ -578,7 +578,7 @@ def await_done(exchange, job):
     return event[1]
 
 
-def _preparation_checkpoint(deadline, disconnected):
+def preparation_checkpoint(deadline, disconnected):
     """A check that a request's preparation may go on: its deadline has not
     passed, and its client has not left."""
 
@@ -590,7 +590,7 @@ def _preparation_checkpoint(deadline, disconnected):
     return checkpoint
 
 
-def _encode_score_prompt(app, messages, labels, admit, checkpoint, what):
+def encode_score_prompt(app, messages, labels, admit, checkpoint, what):
     """The tokens, answer-slot token ids and text of a scoring prompt. The
     request's input drives the render, so a failure is its error."""
     try:
@@ -636,7 +636,7 @@ def prepare_judgment(app, body, *, deadline, disconnected):
         raise APIError(400, str(error)) from error
     priority = request_fields.priority(body)
     cache_salt = request_fields.cache_salt(body)
-    checkpoint = _preparation_checkpoint(deadline, disconnected)
+    checkpoint = preparation_checkpoint(deadline, disconnected)
     with app.preparation(deadline):
 
         def admit(prompt_tokens):
@@ -644,7 +644,7 @@ def prepare_judgment(app, body, *, deadline, disconnected):
             if prompt_tokens > app.max_context:
                 raise ContextLengthError(prompt_tokens, app.max_context)
 
-        tokens, slots, prompt = _encode_score_prompt(
+        tokens, slots, prompt = encode_score_prompt(
             app,
             judgment_messages(body),
             LETTERS[: len(body["options"])],
@@ -682,7 +682,7 @@ def prepare_systemone(app, body, *, deadline, disconnected):
         raise RequestValidationError(details)
     jobs = []
     total_tokens = 0
-    checkpoint = _preparation_checkpoint(deadline, disconnected)
+    checkpoint = preparation_checkpoint(deadline, disconnected)
     with app.preparation(deadline):
         for qid, spec in specs:
             if spec.deterministic:
@@ -717,7 +717,7 @@ def prepare_systemone(app, body, *, deadline, disconnected):
                         ]
                     )
 
-            tokens, slot_ids, _ = _encode_score_prompt(
+            tokens, slot_ids, _ = encode_score_prompt(
                 app,
                 systemone_messages(state, spec, labels),
                 labels,

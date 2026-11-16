@@ -151,6 +151,7 @@ paths for `--model-dir`, `--draft-model` and `--mmproj`.
 | `--cache-dir` | `~/Library/Caches/Splash/prefix-cache` | Where `--persistent-cache` keeps its files; needs `--persistent-cache`. |
 | `--served-model-name` | None | Additional model name the API accepts; repeatable. See [API model aliases](#api-model-aliases). |
 | `--announce-served-name` | Off | Report the first `--served-model-name` in responses; needs `--served-model-name`. |
+| `--no-safeguards` | Off | Ignore the Messages `safeguards` field instead of reviewing each tool call of a response that asks for it and returning `safeguard_results`, Claude Code auto mode's server-side classifier. See [action review](api.md#action-review). |
 | `--default-reasoning-effort` | `SPLASH_DEFAULT_REASONING_EFFORT` or the template's | Effort of Chat and Responses requests that set none. See [default reasoning effort](#default-reasoning-effort). |
 | `--thinking-token-budget` | `SPLASH_THINKING_TOKEN_BUDGET` or none | Thinking tokens of a request that sets no budget. See [thinking token budget](#thinking-token-budget). |
 | `--thinking-end-text` | `SPLASH_THINKING_END_TEXT` or the template's close | Text that ends thinking where a budget runs out, `</think>` its last token; unset, the close the chat template writes after a reasoning. See [thinking token budget](#thinking-token-budget). |
@@ -1190,6 +1191,12 @@ proxy (`http_proxy`, `https_proxy` or `all_proxy`, in either case), it adds
 keeping the hosts already there and leaving `*` as it is, so no proxy receives
 the server's key. A proxy set only in macOS system settings is left to that
 setting's own exceptions.
+
+`splash claude` starts Claude Code in auto mode (`--permission-mode auto`,
+which a `--permission-mode` argument overrides). Splash reviews each tool
+call itself ([action review](api.md#action-review)); with `splash serve
+--no-safeguards`, Claude Code's own classifier requests reach Splash as
+ordinary Messages requests instead.
 
 `splash pi` adds a `splash` provider to Pi's `models.json` (`splash-<port>` for
 a server on another port), preserving other providers, settings and sessions.

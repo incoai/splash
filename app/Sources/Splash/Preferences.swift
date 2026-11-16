@@ -471,6 +471,10 @@ extension LaunchOption {
             help: "Replies and the model list give the first served model name rather than the model’s own.",
             section: .api, kind: .toggle(on: true),
             requires: [Requirement("Needs a served model name.") { $0["--served-model-name"] != nil }]),
+        LaunchOption(
+            flag: "--no-safeguards", title: "Review agent tool calls",
+            help: "Claude Code’s auto mode asks Splash whether each tool call is safe to run. Off, Claude Code asks the model itself.",
+            section: .api, kind: .toggle(on: false)),
     ]
 
     private static let requests: [LaunchOption] = [
