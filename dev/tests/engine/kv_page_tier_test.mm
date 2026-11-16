@@ -655,9 +655,11 @@ void namespaceNamesTheSlotFormat() {
   require(KvPageTier::slotFormatToken(dense).empty() &&
               KvPageTier::slotFormatToken(flashNext) == " slots block-records-v1",
           "the slot format's token changed");
-  // What the stack's builds named these caches.
-  require(name(dense) == "6365d687c8be103a3bbcc6d2a83b1543",
-          "a dense layout's cache namespace changed: its caches would be emptied");
+  // What the stack's builds named these caches since cached GDN states took
+  // int8 codes (0d770e276), which renamed every GDN model's caches once.
+  const std::string denseName = name(dense);
+  require(denseName == "88a6a28cadb13dc02b99998aa48baa72",
+          "a dense layout's cache namespace changed to " + denseName + ": its caches would be emptied");
   require(name(flashNext) != "06d3cbb9e548c52d3d582ff9e5d16453" &&
               name(flashNextBf16) != "80a5feae1f55cd1b06749217aedfdae3",
           "a spillable layout's namespace did not change with its slots' format");
