@@ -64,6 +64,9 @@ public:
     uint32_t retained = 0;
     double wallMilliseconds = 0.0;
     double gpuMilliseconds = 0.0;
+    // The cost of a pass over a thousand tokens of history it weighed
+    // (StepCosts::contextCost).
+    double contextCost = 0.0;
   };
   // The choices of the decode cycles the step costs sized since the last
   // take, which it clears.

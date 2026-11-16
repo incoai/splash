@@ -832,9 +832,9 @@ SERVE_OPTIONS = (
             "a draft's block a lane, so greedy and seeded outputs repeat "
             "(default: auto, where each cycle takes the step of the most "
             "expected accepted tokens per cost, by the costs the Mac measured "
-            "at a start and the acceptance learned from earlier cycles, on "
-            "every model, which is faster but lets those outputs differ from "
-            "run to run)",
+            "at a start and the cost of a long history and the acceptance "
+            "learned from earlier cycles, on every model, which is faster but "
+            "lets those outputs differ from run to run)",
         ),
         engine=EngineArgument("--verify-rows"),
     ),

@@ -4561,6 +4561,121 @@ void requireBudgetedCyclesAreWellFormed(model::Runtime &executor, const model::Q
             << '\n';
 }
 
+// The cost of passes over history (model::StepCosts' k) follows the cycles a
+// runtime serves, on a runtime whose step costs are measured and whose k is
+// none. Two lanes, at histories of half the seed's tokens and of all of
+// them, take their first cycle, whose results are taken late: by the
+// runtime's clock, a cycle's plan to its results, a stall, which counts at
+// twice its price, so that where the lanes' rows filled the step k is that
+// price over the lanes' passes over their own histories, and where they did
+// not the cycle is no sample. A forced cycle of the lanes and a constrained
+// lane's cycle, which that k prices too, leave it as it was: the lanes' next
+// cycle weighs it still.
+void requireServedCyclesTeachHistoryCost(model::Runtime &executor, std::span<const uint32_t> seed) {
+  constexpr uint32_t kRows = model::ExecutionLimits::targetVerifyRows;
+  struct Lane final {
+    EngineRequest request;
+    std::vector<uint32_t> pages;
+    uint64_t position = 0;
+  };
+  // The two lanes, which ignore the stop tokens, and the constrained one,
+  // whose output budgets outlast their cycles; a lane's pages are those of
+  // its prompt and budget and of a verify block's rows past them.
+  constexpr uint32_t kBudget = 4 * kRows;
+  std::vector<Lane> lanes(3);
+  for (uint32_t index = 0, firstPage = 0; index < lanes.size(); ++index) {
+    Lane &lane = lanes[index];
+    const std::span<const uint32_t> prompt = seed.first(index ? seed.size() : seed.size() / 2);
+    lane.request = makeRequest(820 + index, std::vector<uint32_t>(prompt.begin(), prompt.end()), kBudget);
+    if (index == 2)
+      lane.request.constraint = ConstraintMode::TokenMask;
+    else
+      lane.request.flags = RequestIgnoreEndOfSequence;
+    lane.position = prompt.size();
+    lane.pages = pageRange(firstPage, static_cast<uint32_t>((prompt.size() + kBudget + kRows + kv::kPageTokens - 1) /
+                                                           kv::kPageTokens));
+    firstPage += static_cast<uint32_t>(lane.pages.size());
+    beginCold(executor, lane.request, index);
+    const ModelStepResult prefilled = prefillChunk(executor, lane.request.id, 0, lane.request.prompt, lane.pages);
+    require(prefilled.outputTokens.empty() &&
+                prefilled.nextDecodeStage == (index == 2 ? DecodeStage::ApplyInitialMask : DecodeStage::Regular),
+            "a history-cost lane's prompt did not leave it a first cycle");
+  }
+  // The constrained lane's first token, one its mask names, which is no stop
+  // token.
+  Lane &masked = lanes[2];
+  provideMask(executor, masked.request.id, singletonMasks(std::array<uint32_t, 1>{100}));
+  const ModelStepResult selected =
+      decodeOne(executor, masked.request.id, masked.position, masked.pages, DecodeStage::ApplyInitialMask);
+  require(selected.failure.empty() && selected.outputTokens.empty(),
+          "a history-cost constrained lane's first token failed or was emitted");
+  // A cycle of the two lanes, its results taken `late` after its submission.
+  const auto cycle = [&](std::chrono::duration<double, std::milli> late) {
+    BatchPlan plan{.kind = WorkKind::Decode, .decodeStage = DecodeStage::Regular};
+    std::vector<ModelBatchItem> items;
+    for (const Lane &lane : std::span(lanes).first(2)) {
+      plan.items.push_back({lane.request.id, 0});
+      items.push_back(withRevision(
+          {.requestId = lane.request.id, .logicalPosition = lane.position, .pageTable = lane.pages}));
+    }
+    const std::unique_ptr<ModelBatchTicket> ticket = executor.submit(plan, items, [] {});
+    std::this_thread::sleep_for(late);
+    const std::vector<ModelStepResult> results = ticket->wait();
+    require(results.size() == 2 && results[0].failure.empty() && results[1].failure.empty(),
+            "a history-cost cycle lost or failed a lane");
+    for (uint32_t index = 0; index < 2; ++index)
+      lanes[index].position += results[index].outputTokens.size() - results[index].outputTokensWithoutKv;
+  };
+  // Later than twice any step of two lanes costs: a step's price is at most
+  // its class's point and what the wide cap adds, each at most the dearest.
+  double dearest = 0.0;
+  for (const model::StepCosts::Point &point : model::RuntimeInstrumentation::stepPoints(executor, 2))
+    dearest = std::max(dearest, point.milliseconds);
+  const std::chrono::duration<double, std::milli> stall(5.0 * dearest);
+  const std::array<uint64_t, 2> histories{lanes[0].position, lanes[1].position};
+  static_cast<void>(model::RuntimeInstrumentation::takeStepChoices(executor));
+  cycle(stall);
+  const std::vector<model::RuntimeInstrumentation::StepChoice> first =
+      model::RuntimeInstrumentation::takeStepChoices(executor);
+  require(first.size() == 1 && first[0].lanes == 2 && first[0].cost > 0.0 && first[0].contextCost == 0.0 &&
+              stall.count() > 2.0 * first[0].cost,
+          "a runtime's first served cycle weighed no measured cost, weighed a cost of history no cycle taught, or "
+          "was no stall");
+  double passes = 0.0;
+  for (uint32_t index = 0; index < 2; ++index)
+    passes += (model::RuntimeInstrumentation::lastVerifyRows(executor, index) + model::StepCosts::kNarrowCap - 1) /
+              model::StepCosts::kNarrowCap * (double(histories[index]) / 1000.0);
+  const double k = first[0].verified == first[0].rows ? first[0].cost / passes : 0.0;
+  model::RuntimeInstrumentation::forceStepRows(executor, 2);
+  cycle({});
+  model::RuntimeInstrumentation::forceStepRows(executor, std::nullopt);
+  PendingMaskedDecode pending = beginMaskedDecodeOne(executor, masked.request.id, masked.position, masked.pages);
+  for (const ModelMaskRequest &request : pending.maskRequests)
+    provideMask(executor, request.requestId,
+                std::vector<uint32_t>((request.simulationTokens.size() + 1) * targetTokens->maskWords(), ~0U));
+  const std::vector<ModelStepResult> maskedResults = finishMaskedDecode(std::move(pending));
+  require(maskedResults.size() == 1 && maskedResults[0].failure.empty(), "a history-cost constrained cycle failed");
+  cycle({});
+  // The constrained cycle's choice and the lanes' next one: the forced cycle
+  // made none.
+  const std::vector<model::RuntimeInstrumentation::StepChoice> later =
+      model::RuntimeInstrumentation::takeStepChoices(executor);
+  const auto weighed = [&](size_t choice) {
+    return choice < later.size() && std::fabs(later[choice].contextCost - k) <= 1e-9 * k;
+  };
+  require(later.size() == 2 && weighed(0) && weighed(1),
+          "a stalled cycle of " + std::to_string(first[0].verified) + " of its step's " +
+              std::to_string(first[0].rows) + " rows, priced " + std::to_string(first[0].cost) + " ms over " +
+              std::to_string(passes) + " passes over history, should leave a cost of history of " +
+              std::to_string(k) + "; after a forced cycle a constrained cycle weighed " +
+              (later.empty() ? std::string("nothing") : std::to_string(later.front().contextCost)) + " and the lanes' next " +
+              (later.size() < 2 ? std::string("nothing") : std::to_string(later[1].contextCost)));
+  for (const Lane &lane : lanes)
+    executor.end(lane.request.id);
+  std::cout << "history_cost=PASS k=" << k << " passes=" << passes << " step_rows=" << first[0].rows
+            << " verified=" << first[0].verified << '\n';
+}
+
 // The K/V of a block-sparse target whose committed pages hold only their
 // index (kv::PageForm::Index), their K/V in SSD cache tier copies, reaches
 // the attention through the command's reads of spilled K/V
@@ -7868,6 +7983,8 @@ int main(int argc, char **argv) {
         std::chrono::duration<double>(std::chrono::steady_clock::now() - recalledStarted).count();
     require(remembers == model::ExecutionLimits::maximumBatchWidth && remembered == first,
             "a start that recalled its step costs measured them again");
+    // That start's runtime has served no cycle: its cost of history is none.
+    requireServedCyclesTeachHistoryCost(*runtime, samplingSeedTokens);
     // A remembered line of a point at no cost, or of points another build's
     // classes made: a start measures the lane count again and keeps its line.
     for (const std::string_view stale : {std::string_view("2:8:-1"), std::string_view("8:8:20 16:16:30")}) {

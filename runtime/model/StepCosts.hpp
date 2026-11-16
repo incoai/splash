@@ -56,6 +56,37 @@ public:
   // by a median of 2-6% and a p90 of 5-10%, as routing varies; Qwen3.8-27B's
   // by 0.5% and 1.1%.
   static constexpr uint32_t kReplays = 3;
+  // A step costs its price plus k times its passes over history: the sum
+  // over its lanes of each lane's history, in thousands of tokens, times the
+  // attention passes its rows take, a pass a draft's block of rows. The start
+  // measures its points at a few tokens of history, and each pass reads a
+  // lane's whole history: Qwen3.6-35B-A3B on a 48 GB M5 Pro, a forced step's
+  // wall at 32K less its wall at 2K is 2.2-3.6 ms a pass at every lane count
+  // and step (two lanes: +5.7 ms at 2 passes, +10.9 at 4), where one level a
+  // lane count would price 4 passes as 2. k, one for the model, from none at
+  // the start and kept in the process alone, is the least-squares slope
+  // through the origin of eligible cycles' wall less their price on their
+  // passes over history, each cycle's weight decaying by a 64th a cycle, the
+  // acceptance fit's refit period (VerifyBudget::kRefitCycles), a half-life of
+  // 44 cycles, a second or two of decode; a cycle of more than twice its
+  // predicted cost, a stall, counts at twice it, so that k grows to a cost
+  // of passes the table lacks however far it is from none. At short
+  // histories k is no pass's cost but what serving's cycles cost over the
+  // start's table, over a small regressor (Qwen3.6-35B-A3B at 512-token
+  // prompts: 0.49-1.43 on a 24 GB M6 and 0.56-5.16 on a 16 GB M4, against the
+  // 0.07-0.12 of a pass over 30K above), which does little harm: there a
+  // step of one pass a lane is priced within 0.3 ms of its wall and a lane's
+  // second pass 3-6% over, and one sample at a long history brings k back.
+  // The 64th is a choice, not a measured optimum: replayed through fits of a
+  // 32nd, a 64th and a 128th, Qwen3.6-35B-A3B's logged cycles are priced
+  // 1.21, 1.22 and 1.24 ms off their walls at a steady 31K on an M5 Max (4%
+  // of a cycle), 1.8-2.6, 2.1-3.1 and 2.4-3.7 ms off over the 16 cycles after
+  // a jump from 512 tokens to 16K on an M6 and 0.7-0.8, 0.7-1.0 and 0.8-1.3
+  // over the 400 back at 512, where k is the table's level error again, and
+  // the cycle after one slowed five times is overpriced 1.2, 0.6 and 0.4 ms:
+  // a faster fit follows a history that jumps sooner, a slower one averages
+  // a stall away, and neither differs from the 64th by a millisecond a cycle.
+  static constexpr double kContextDecay = 1.0 - 1.0 / 64.0;
 
   // A lane count's steps over `classes`, the fewest rows of each class of a
   // decode step's kernels (ops::ExecutionPlans::decodeRowClasses), of up to
@@ -107,8 +138,20 @@ public:
   // as the lanes' chances go, the one with the most expected accepted tokens
   // per cost, and among equals the fewest rows; before its lane count is
   // measured, a draft's block a lane at the narrow cap, --verify-rows all's
-  // step, as far as the lanes' chances fill it.
-  [[nodiscard]] Choice choose(std::span<const std::span<const float>> chances) const;
+  // step, as far as the lanes' chances fill it. `contexts`, each lane's
+  // history in tokens, where given, adds each step's passes over history at
+  // k (contextCost).
+  [[nodiscard]] Choice choose(std::span<const std::span<const float>> chances,
+                              std::span<const uint64_t> contexts = {}) const;
+  // A cycle of `step` that could give a sample, in `milliseconds` from its
+  // plan to its results, its lanes' rows `laneRows` and histories `contexts`:
+  // where its lane count is measured, its wall, at most twice its predicted
+  // cost, less the table's price on its passes over history teaches k.
+  void observeContext(const ops::StepRows &step, std::span<const uint32_t> laneRows,
+                      std::span<const uint64_t> contexts, double milliseconds);
+  // k: milliseconds a pass over a thousand tokens of history (none before a
+  // cycle observed one).
+  [[nodiscard]] double contextCost() const noexcept { return perPass_; }
   // A cycle's step under --verify-rows all: a draft's block a lane, no more
   // than each lane holds (`holds`, its anchor and the rows past it it may
   // verify), at the narrow cap, so that its outputs repeat.
@@ -124,6 +167,16 @@ private:
   [[nodiscard]] const std::vector<Point> &table(uint32_t lanes) const;
 
   std::array<std::vector<Point>, kLanes> tables_;
+  // The table's price of a step of `rows` rows at `cap` over `lanes` lanes,
+  // as choose weighs it: its class's point, or a rising class's line, plus
+  // what the wide cap adds at a draft's block a lane where a narrow class's
+  // step takes it.
+  [[nodiscard]] double price(uint32_t lanes, uint32_t rows, uint32_t cap) const;
+  // The decayed sums of passes over history times wall less price, and of
+  // its square, and their slope k.
+  double passesTimesExcess_ = 0.0;
+  double passesSquared_ = 0.0;
+  double perPass_ = 0.0;
 };
 
 } // namespace splash::model

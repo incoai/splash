@@ -623,6 +623,124 @@ void recallsTheTable() {
           "an unmeasured lane count gave a line");
 }
 
+// The cost of passes over history: k, the least-squares slope through the
+// origin of cycles' wall less their price on their passes over history (a
+// lane's history in thousands of tokens times the passes its own rows take,
+// a pass a draft's block), each cycle's weight decaying by a 64th a cycle,
+// none below none, one for the model, a stall counted at twice its predicted
+// cost; a step costs its price plus k times its own passes over history, the
+// anchors alone too, each lane's passes over its own history, so at a long
+// history a lane's second pass can make fewer rows the better step where one
+// level would not, and beside a lane of a long history a lane of a short one
+// still takes it. Impossible samples are refused; an unmeasured lane count's
+// cycle teaches nothing.
+void contextPerPass() {
+  const auto table = [] {
+    return measuredTable(kClasses, 64, false, [](uint32_t, const StepCosts::Point &p) {
+      return p.last <= 8 ? 10.0 : 12.0;
+    });
+  };
+  StepCosts costs = table();
+  // One lane whose rows past 8 expect 2.2 tokens more: 10.2 tokens in 12 ms
+  // beat 8 in 10 at no history.
+  std::vector<float> curve(StepCosts::kWideCap - 1, 0.0F);
+  for (size_t row = 0; row < curve.size(); ++row)
+    curve[row] = row < 7 ? 1.0F : 0.275F;
+  const std::vector<std::vector<float>> lane{curve};
+  const std::vector<uint64_t> history{30000};
+  require(costs.contextCost() == 0.0 && costs.choose(spansOf(lane), history).step.rows == 16,
+          "with no cost of passes over history the table's choice moved");
+  const std::vector<uint32_t> sixteen{16}, eight{8};
+  // 16 rows, two passes over 30K: 60; 8 rows, one: 30.
+  costs.observeContext({1, 16, StepCosts::kWideCap}, sixteen, history, 12.0 + 6.0);
+  costs.observeContext({1, 8, StepCosts::kNarrowCap}, eight, history, 10.0 + 3.0);
+  require(std::fabs(costs.contextCost() - 0.1) < 1e-9, "k is not the slope of wall less price on passes over history: " +
+                                                           std::to_string(costs.contextCost()));
+  // At 30K, 8 rows cost 10 + 3 and 16 cost 12 + 6: 8 in 13 beat 10.2 in 18
+  // (one level of 3 for both would have kept 16: 10.2 in 15).
+  const StepCosts::Choice choice = costs.choose(spansOf(lane), history);
+  require(choice.step.rows == 8 && std::fabs(choice.milliseconds - 13.0) < 1e-9,
+          "a lane's second pass over 30K did not move the choice to 8 rows");
+  require(costs.choose(spansOf(lane), std::vector<uint64_t>{0}).step.rows == 16,
+          "a lane of no history paid for passes over history");
+  // The anchors alone pay their pass too: a lane whose one row past its
+  // anchor has a chance of 0.2 takes it, 1.2 tokens in 13 ms against 1 in 13
+  // (the anchors at their table's 10 ms would have kept it out: 1 in 10).
+  const StepCosts::Choice faint = costs.choose(spansOf(std::vector<std::vector<float>>{{0.2F}}), history);
+  require(faint.step.rows == 2 && std::fabs(faint.milliseconds - 13.0) < 1e-9,
+          "the anchors alone did not pay their pass over history");
+  // Each lane's passes are over its own history. The lane above beside one
+  // of a draft's block of certain rows, one of them at 2K and the other at
+  // 30K, in either order: 16 rows cost 12 + 3.2. Where the lane past its
+  // block is the one at 2K, its second pass costs 0.2, and 18.2 tokens in
+  // 15.4 ms beat 16 in 15.2 (a pass more for every lane would cost 3.2: 18.2
+  // in 18.4); where it is the one at 30K, 3, and 16 in 15.2 beat 18.2 in 18.2.
+  const std::vector<float> block(StepCosts::kNarrowCap - 1, 1.0F);
+  for (const bool pastFirst : {true, false})
+    for (const bool pastLong : {false, true}) {
+      const uint64_t past = pastLong ? 30000 : 2000, beside = pastLong ? 2000 : 30000;
+      const std::vector<std::vector<float>> lanes = pastFirst ? std::vector{curve, block} : std::vector{block, curve};
+      const std::vector<uint64_t> histories = pastFirst ? std::vector{past, beside} : std::vector{beside, past};
+      const StepCosts::Choice both = costs.choose(spansOf(lanes), histories);
+      require(pastLong ? both.step.rows == 16 && both.step.laneCap == StepCosts::kNarrowCap &&
+                             std::fabs(both.milliseconds - 15.2) < 1e-9
+                       : both.step.rows == 24 && both.step.laneCap == StepCosts::kWideCap &&
+                             std::fabs(both.milliseconds - 15.4) < 1e-9,
+              std::string("a lane's second pass was not priced over its own history: beside a lane at ") +
+                  (pastLong ? "2K, a lane at 30K" : "30K, a lane at 2K") + " took " + std::to_string(both.step.rows) +
+                  " rows at " + std::to_string(both.milliseconds) + " ms");
+    }
+  // A cycle's passes are its lanes' own rows' over their own histories: two
+  // lanes of 4 and 16 rows at 30K and 2K pass over 30 + 2 * 2, 34 (their 20
+  // rows split evenly would pass over 64, their histories exchanged over 62).
+  StepCosts uneven = table();
+  uneven.observeContext({2, 20, StepCosts::kWideCap}, std::vector<uint32_t>{4, 16}, std::vector<uint64_t>{30000, 2000},
+                        12.0 + 0.1 * 34.0);
+  require(std::fabs(uneven.contextCost() - 0.1) < 1e-9,
+          "a cycle's passes over history are not its lanes' own rows' over their own histories: " +
+              std::to_string(uneven.contextCost()));
+  // At a slope of 0.2 for 64 cycles, then of 0.05 (two lanes) for 300: the
+  // decayed fit follows the latest.
+  for (uint32_t cycle = 0; cycle < 64; ++cycle)
+    costs.observeContext({1, 8, StepCosts::kNarrowCap}, eight, history, 10.0 + 6.0);
+  require(std::fabs(costs.contextCost() - 0.2) < 0.02, "k did not follow a slope of 0.2");
+  for (uint32_t cycle = 0; cycle < 300; ++cycle)
+    costs.observeContext({2, 16, StepCosts::kNarrowCap}, std::vector<uint32_t>{8, 8},
+                         std::vector<uint64_t>{20000, 40000}, 12.0 + 0.05 * 60.0);
+  require(std::fabs(costs.contextCost() - 0.05) < 0.003,
+          "k is not one decayed fit for the model across lane counts: " + std::to_string(costs.contextCost()));
+  // Over a long run each cycle is a 64th of the fit, one in the acceptance
+  // fit's refit period: after 2048 cycles at a slope of 0.2, one at 0.05
+  // moves k a 64th of the way.
+  StepCosts steady = table();
+  for (uint32_t cycle = 0; cycle < 2048; ++cycle)
+    steady.observeContext({1, 8, StepCosts::kNarrowCap}, eight, history, 10.0 + 0.2 * 30.0);
+  steady.observeContext({1, 8, StepCosts::kNarrowCap}, eight, history, 10.0 + 0.05 * 30.0);
+  require(std::fabs(steady.contextCost() - (0.2 - 0.15 / VerifyBudget::kRefitCycles)) < 1e-9,
+          "a cycle is not a 64th of a long run's fit: " + std::to_string(steady.contextCost()));
+  // A stall counts at twice its predicted cost: from a k of none, a cycle of
+  // 100 ms whose price is 10 and passes 30 counts at 20, so k is a third, and
+  // the next at 40, so k grows to the cost the table lacks (k of 2: 70 ms).
+  StepCosts stalls = table();
+  stalls.observeContext({1, 8, StepCosts::kNarrowCap}, eight, history, 100.0);
+  require(std::fabs(stalls.contextCost() - 10.0 / 30.0) < 1e-9,
+          "a stall did not count at twice its predicted cost: " + std::to_string(stalls.contextCost()));
+  for (uint32_t cycle = 0; cycle < 200; ++cycle)
+    stalls.observeContext({1, 8, StepCosts::kNarrowCap}, eight, history, 10.0 + 2.0 * 30.0);
+  require(std::fabs(stalls.contextCost() - 2.0) < 0.05,
+          "k did not grow to a cost of passes far from none: " + std::to_string(stalls.contextCost()));
+  for (uint32_t cycle = 0; cycle < 300; ++cycle)
+    costs.observeContext({1, 8, StepCosts::kNarrowCap}, eight, history, 9.0);
+  require(costs.contextCost() == 0.0, "a slope below none was taken");
+  StepCosts unmeasured(kClasses, 64, false);
+  unmeasured.observeContext({1, 8, StepCosts::kNarrowCap}, eight, history, 40.0);
+  require(unmeasured.contextCost() == 0.0, "an unmeasured lane count's cycle taught k");
+  rejects([&] { costs.observeContext({1, 8, StepCosts::kNarrowCap}, eight, history, -1.0); }, "invalid step sample",
+          "an impossible sample was taken");
+  rejects([&] { costs.observeContext({2, 8, StepCosts::kNarrowCap}, eight, history, 10.0); }, "invalid step sample",
+          "a sample of other lanes than its step's was taken");
+}
+
 // Before its lane count is measured, a cycle takes a draft's block a lane at
 // the narrow cap, no more than the lanes' chances fill nor the table's rows;
 // lanes without a chance past their anchors take their anchors, measured or
@@ -736,6 +854,7 @@ int main() {
     unmeasuredAndBounds();
     laneChancesBound();
     recallsTheTable();
+    contextPerPass();
     stepsOfNoCost();
     invalidSteps();
   } catch (const std::exception &error) {

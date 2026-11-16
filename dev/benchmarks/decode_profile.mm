@@ -599,9 +599,9 @@ int main(int argc, char **argv) {
         if (stepLog)
           for (const auto &choice : model::RuntimeInstrumentation::takeStepChoices(executor)) {
             std::printf("%s step: %u rows at lane cap %u (expected %.3f, cost %.2f ms), verified %u, "
-                        "retained %u, wall %.2f ms, gpu %.2f ms\n",
+                        "retained %u, wall %.2f ms, gpu %.2f ms, k %.4f\n",
                         title, choice.rows, choice.laneCap, choice.expected, choice.cost, choice.verified,
-                        choice.retained, choice.wallMilliseconds, choice.gpuMilliseconds);
+                        choice.retained, choice.wallMilliseconds, choice.gpuMilliseconds, choice.contextCost);
           }
         // The cycles in the order they ran, and their mean: a greedy prompt
         // runs the same cycle sequence every time, so two builds compare

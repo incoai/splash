@@ -20,10 +20,20 @@ namespace {
 struct Pool final {
   std::vector<double> expected;
   std::vector<uint32_t> widest;
+  // Its passes over history, the sum over lanes of a lane's history in
+  // thousands of tokens times the passes its rows take (`contexts` given).
+  std::vector<double> passes;
 };
 
-Pool poolOf(std::span<const std::span<const float>> chances, uint32_t cap) {
-  Pool pool{{double(chances.size())}, {1}};
+// The passes a lane of `rows` rows takes, a pass a draft's block of rows.
+uint32_t passesOf(uint32_t rows) { return (rows + StepCosts::kNarrowCap - 1) / StepCosts::kNarrowCap; }
+
+Pool poolOf(std::span<const std::span<const float>> chances, uint32_t cap, std::span<const uint64_t> contexts = {}) {
+  const auto history = [&](size_t lane) { return lane < contexts.size() ? double(contexts[lane]) / 1000.0 : 0.0; };
+  double anchors = 0.0;
+  for (size_t lane = 0; lane < chances.size(); ++lane)
+    anchors += history(lane);
+  Pool pool{{double(chances.size())}, {1}, {anchors}};
   std::vector<uint32_t> held(chances.size(), 1);
   const auto next = [&](size_t lane) { return chances[lane][held[lane] - 1]; };
   for (;;) {
@@ -40,6 +50,8 @@ Pool poolOf(std::span<const std::span<const float>> chances, uint32_t cap) {
     pool.expected.push_back(pool.expected.back() + std::clamp(double(next(*taker)), 0.0, 1.0));
     ++held[*taker];
     pool.widest.push_back(std::max(pool.widest.back(), held[*taker]));
+    pool.passes.push_back(pool.passes.back() +
+                          (passesOf(held[*taker]) - passesOf(held[*taker] - 1)) * history(*taker));
   }
 }
 
@@ -171,10 +183,62 @@ bool StepCosts::measured(uint32_t lanes) const {
   return !points.empty() && std::ranges::all_of(points, [](const Point &point) { return point.milliseconds > 0.0; });
 }
 
-StepCosts::Choice StepCosts::choose(std::span<const std::span<const float>> chances) const {
-  const auto lanes = static_cast<uint32_t>(chances.size());
+double StepCosts::price(uint32_t lanes, uint32_t rows, uint32_t cap) const {
   const std::vector<Point> &points = table(lanes);
   const uint32_t narrow = lanes * kNarrowCap;
+  // What the wide cap adds at a draft's block a lane, which a narrow class's
+  // step at the wide cap adds to its point (none at one lane, whose narrow
+  // steps hold no lane past the narrow cap). The wide cap runs the narrow
+  // cap's kernels over more rows a lane, so it adds no less than none: a
+  // measurement below that is noise (Qwen3.6-35B-A3B's three lanes, -0.4%).
+  const auto atNarrow = [&](uint32_t c) {
+    return std::ranges::find_if(points, [&](const Point &p) { return p.last == narrow && p.cap == c; });
+  };
+  const double wider = atNarrow(kWideCap) == points.end()
+                           ? 0.0
+                           : std::max(atNarrow(kWideCap)->milliseconds - atNarrow(kNarrowCap)->milliseconds, 0.0);
+  // The anchors alone, a class no table measures, cost at most the lowest
+  // point.
+  if (rows <= lanes)
+    return points.front().milliseconds;
+  auto point = points.begin();
+  while (point != points.end() && point->last < rows)
+    ++point;
+  if (point == points.end())
+    throw std::invalid_argument("a step of more rows than its lane count's table");
+  // A rising class's step costs the line from its first rows' point.
+  const double atRows = point->rises && point != points.begin()
+                            ? std::prev(point)->milliseconds +
+                                  (point->milliseconds - std::prev(point)->milliseconds) *
+                                      (double(rows) - std::prev(point)->last) / (point->last - std::prev(point)->last)
+                            : point->milliseconds;
+  return atRows + (cap > point->cap ? wider : 0.0);
+}
+
+void StepCosts::observeContext(const ops::StepRows &step, std::span<const uint32_t> laneRows,
+                               std::span<const uint64_t> contexts, double milliseconds) {
+  if (!std::isfinite(milliseconds) || milliseconds <= 0.0 || laneRows.size() != step.lanes ||
+      contexts.size() != step.lanes)
+    throw std::invalid_argument("invalid step sample");
+  if (!measured(step.lanes))
+    return;
+  double passes = 0.0;
+  for (size_t lane = 0; lane < step.lanes; ++lane)
+    passes += passesOf(std::max(laneRows[lane], 1U)) * double(contexts[lane]) / 1000.0;
+  // A stall counts at twice the cycle's predicted cost, as 1.6.2's line
+  // counted one: dropped, every cycle at a history whose passes the table
+  // lacks would read as a stall from a k of none, which would never learn.
+  const double table = price(step.lanes, step.rows, step.laneCap);
+  const double wall = std::min(milliseconds, 2.0 * (table + perPass_ * passes));
+  passesTimesExcess_ = kContextDecay * passesTimesExcess_ + passes * (wall - table);
+  passesSquared_ = kContextDecay * passesSquared_ + passes * passes;
+  perPass_ = passesSquared_ > 0.0 ? std::max(passesTimesExcess_ / passesSquared_, 0.0) : 0.0;
+}
+
+StepCosts::Choice StepCosts::choose(std::span<const std::span<const float>> chances,
+                                    std::span<const uint64_t> contexts) const {
+  const auto lanes = static_cast<uint32_t>(chances.size());
+  const std::vector<Point> &points = table(lanes);
   if (!measured(lanes)) {
     // A draft's block a lane at the narrow cap, --verify-rows all's step, as
     // far as the lanes' chances fill it.
@@ -182,39 +246,17 @@ StepCosts::Choice StepCosts::choose(std::span<const std::span<const float>> chan
     const uint32_t rows = std::min(lanes - 1 + uint32_t(block.expected.size()), points.back().last);
     return {{lanes, rows, kNarrowCap}, block.expected[rows - lanes], 0.0};
   }
-  const Pool pool = poolOf(chances, kWideCap);
+  const Pool pool = poolOf(chances, kWideCap, contexts);
   // The most rows the lanes' chances fill.
   const auto bound = static_cast<uint32_t>(lanes - 1 + pool.expected.size());
   // A step of `rows` rows takes the wide cap where a lane of it holds more
   // than a draft's block.
   const auto capOf = [&](uint32_t rows) { return pool.widest[rows - lanes] > kNarrowCap ? kWideCap : kNarrowCap; };
-  // What the wide cap adds at a draft's block a lane, which a narrow class's
-  // step at the wide cap adds to its point (none at one lane, whose narrow
-  // steps hold no lane past the narrow cap). The wide cap runs the narrow
-  // cap's kernels over more rows a lane, so it adds no less than none: a
-  // measurement below that is noise (Qwen3.6-35B-A3B's three lanes, -0.4%).
-  const auto atNarrow = [&](uint32_t cap) {
-    return std::ranges::find_if(points, [&](const Point &p) { return p.last == narrow && p.cap == cap; });
-  };
-  const double wider = atNarrow(kWideCap) == points.end()
-                           ? 0.0
-                           : std::max(atNarrow(kWideCap)->milliseconds - atNarrow(kNarrowCap)->milliseconds, 0.0);
-  // Every step the chances fill, at its class's cost and what the wide cap
-  // adds where a narrow class's step takes it. The anchors alone, a class no
-  // table measures, cost at most the lowest point.
-  Choice best{{lanes, lanes, kNarrowCap}, double(lanes), points.front().milliseconds};
-  auto point = points.begin();
+  // Every step the chances fill, at its price and its passes over history.
+  Choice best{{lanes, lanes, kNarrowCap}, double(lanes), price(lanes, lanes, kNarrowCap) + perPass_ * pool.passes[0]};
   for (uint32_t rows = lanes + 1; rows <= std::min(bound, points.back().last); ++rows) {
-    while (point->last < rows)
-      ++point;
     const uint32_t cap = capOf(rows);
-    // A rising class's step costs the line from its first rows' point.
-    const double atRows =
-        point->rises ? std::prev(point)->milliseconds + (point->milliseconds - std::prev(point)->milliseconds) *
-                                                            (rows - std::prev(point)->last) /
-                                                            (point->last - std::prev(point)->last)
-                     : point->milliseconds;
-    const double milliseconds = atRows + (cap > point->cap ? wider : 0.0);
+    const double milliseconds = price(lanes, rows, cap) + perPass_ * pool.passes[rows - lanes];
     if (pool.expected[rows - lanes] / milliseconds > best.expected / best.milliseconds)
       best = {{lanes, rows, cap}, pool.expected[rows - lanes], milliseconds};
   }

@@ -351,7 +351,18 @@ sixteen a lane). The start measures the table on the Mac before it serves
 count, each step's median wall time: a first start's decode warmups of
 Qwen3.8-27B on a 48 GB M5 Pro take 11.1 s, a later start's 1.0 s), later
 starts of the same build, models and formats on the Mac read it back from
-beside the Neural Engine's calibrations instead, and no cycle changes it. A
+beside the Neural Engine's calibrations instead, and no cycle changes it. The
+table's steps ran at a few tokens of history, and each attention pass, one
+for a lane's first eight rows and one more for its rows past them, reads the
+lane's whole history (on Qwen3.6-35B-A3B on a 48 GB M5 Pro a step at 32K
+takes 2.2 to 3.6 ms a pass more than at 2K), so a step costs its table's
+price plus k times its passes
+over history: over its lanes, a lane's history in thousands of tokens times
+the passes its rows take. k is one number for the model, none at each start,
+which serving fits: the slope of its cycles' time less their table's price on
+their passes over history, the latest cycles weighing most, from the cycles
+the costs chose that held no constrained lane
+(`model::StepCosts::observeContext`). A
 lane count whose lanes' state a start cannot hold beside the rest of its
 memory (under `--max-memory`, or where the warmup's allocation fails) is not
 measured: its cycles take a draft's block a lane, `--verify-rows all`'s step,
@@ -457,7 +468,8 @@ proposals at each position, where this rule keeps 0.701, and 0.785 and 0.841
 of its proposals with two and four children. A fixed shorter block would do
 worse: in agentic use about one cycle in six accepts all seven proposals and
 one in five accepts none.
-The step costs are those the Mac measured at a start and its acceptance
+The step costs are those the Mac measured at a start, the cost of history
+they add follows the cycles served, and its acceptance
 model follows every request's labels, so the rows a cycle verifies depend on
 the machine and on what the server served before, and a MoE row's result
 depends on which rows share its expert tiles ([Kernels](internals.md#kernels)): under

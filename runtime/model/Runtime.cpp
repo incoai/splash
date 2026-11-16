@@ -2564,7 +2564,8 @@ struct Runtime::Impl {
   // block a lane, no more than each lane holds, so that a cycle's shape and
   // outputs repeat (StepCosts::block); else the step its lane count's
   // measured costs choose (StepCosts::choose).
-  StepCosts::Choice chooseStep(std::span<const std::vector<float>> curves, std::span<const uint32_t> holds) const {
+  StepCosts::Choice chooseStep(std::span<const std::vector<float>> curves, std::span<const uint32_t> holds,
+                               std::span<const uint64_t> contexts) const {
     const auto lanes = static_cast<uint32_t>(curves.size());
     if (forcedStep)
       return {StepCosts::forced(lanes, forcedStep->rows, forcedStep->laneCap)};
@@ -2573,7 +2574,7 @@ struct Runtime::Impl {
     std::array<std::span<const float>, kLaneCount> chances{};
     for (uint32_t lane = 0; lane < lanes; ++lane)
       chances[lane] = curves[lane];
-    return stepCosts->choose(std::span(chances).first(lanes));
+    return stepCosts->choose(std::span(chances).first(lanes), contexts);
   }
 
   // A decode step's target forward: the prompt forward over the step's rows
@@ -2836,10 +2837,17 @@ struct Runtime::Impl {
   }
 
   // A cycle's results once its command completed, which ends the command's
-  // reads of spilled K/V; `step` the rows it laid out.
+  // reads of spilled K/V; `step` the rows it laid out. Where it can
+  // give a sample (no constrained lane, its step chosen by the
+  // costs), from `planned`, its plan's start, the cost of passes over
+  // history takes its time to its results, less what its learning
+  // took, which the start's forced steps skip, with its lanes'
+  // rows and histories, if every lane committed and its lanes' rows filled
+  // the step (StepCosts::observeContext).
   std::vector<ModelStepResult> finalizeDecode(
       std::span<DecodeLaneResult> lanes, std::span<const ModelBatchItem> items,
-      CommandTiming timing, SpilledKvReads &reads, const ops::StepRows &step) {
+      CommandTiming timing, SpilledKvReads &reads, const ops::StepRows &step,
+      std::optional<AwakeClock::time_point> planned) {
     reads.end();
     std::array<std::vector<uint64_t>, kLaneCount> unreadable = unreadableBlocks(reads);
     for (uint32_t lane = 0; lane < items.size(); ++lane) {
@@ -2880,6 +2888,7 @@ struct Runtime::Impl {
     bool commits = true;
     for (uint32_t lane = 0; lane < items.size(); ++lane)
       commits = commits && lanes[lane].failure.empty() && unreadable[lane].empty();
+    const auto learning = AwakeClock::now();
     for (uint32_t lane = 0; lane < items.size() && commits && verifyBudget && !forcedStep; ++lane) {
       const DecodeLaneResult &laneResult = lanes[lane];
       Request &entry = *laneResult.request;
@@ -2920,6 +2929,7 @@ struct Runtime::Impl {
       }
       verifyBudget->observe(std::span(observed).first(items.size()));
     }
+    const AwakeClock::duration learned = AwakeClock::now() - learning;
 
     std::vector<ModelStepResult> results;
     results.reserve(items.size());
@@ -3006,6 +3016,20 @@ struct Runtime::Impl {
     }
 #endif
     counters.totalDecodeWallSeconds += timing.wallSeconds;
+    uint32_t laid = 0;
+    for (const DecodeLaneResult &lane : lanes.first(items.size()))
+      laid += lane.rows.rows;
+    if (planned && commits && laid == step.rows) {
+      std::array<uint32_t, kLaneCount> laneRows{};
+      std::array<uint64_t, kLaneCount> contexts{};
+      for (uint32_t lane = 0; lane < items.size(); ++lane) {
+        laneRows[lane] = lanes[lane].rows.rows;
+        contexts[lane] = items[lane].logicalPosition;
+      }
+      stepCosts->observeContext(
+          step, std::span(laneRows).first(items.size()), std::span(contexts).first(items.size()),
+          std::chrono::duration<double, std::milli>(AwakeClock::now() - *planned - learned).count());
+    }
     return results;
   }
 
@@ -3162,7 +3186,8 @@ struct Runtime::Impl {
           targetForwardGpuSeconds_;
       counters.lastConstrainedMaskWaitSeconds = maskWaitSeconds_;
       counters.totalConstrainedMaskWaitSeconds += maskWaitSeconds_;
-      std::vector<ModelStepResult> results = impl_.finalizeDecode(lanes_, items_, timing_, *reads_, step_);
+      std::vector<ModelStepResult> results =
+          impl_.finalizeDecode(lanes_, items_, timing_, *reads_, step_, std::nullopt);
       // The page sources of the items and the reads go with the command,
       // before the engine applies its results (DeferredMetalTicket::wait).
       items_.clear();
@@ -3707,6 +3732,7 @@ std::unique_ptr<ModelBatchTicket>
 Runtime::decodeAsync(const BatchPlan &plan,
                      std::span<const ModelBatchItem> items,
                      std::function<void()> completion) {
+  const auto planned = AwakeClock::now();
   impl_->requireCommand(plan, items);
   validatePlan(plan, items, WorkKind::Decode);
   if (plan.decodeStage != DecodeStage::Regular)
@@ -3767,7 +3793,8 @@ Runtime::decodeAsync(const BatchPlan &plan,
     logicalPositions[lane] = item.logicalPosition;
   }
   // The cycle's rows, which every one of its commands lays out alike.
-  const StepCosts::Choice choice = impl_->chooseStep(curves, std::span(holds).first(width));
+  const StepCosts::Choice choice =
+      impl_->chooseStep(curves, std::span(holds).first(width), std::span(logicalPositions).first(width));
   const ops::StepRows step = choice.step;
 #ifdef SPLASH_RUNTIME_INSTRUMENTATION
   if (impl_->stepCosts && !impl_->forcedStep) {
@@ -3779,7 +3806,8 @@ Runtime::decodeAsync(const BatchPlan &plan,
                                   .laneCap = step.laneCap,
                                   .chances = chances,
                                   .expected = choice.expected,
-                                  .cost = choice.milliseconds});
+                                  .cost = choice.milliseconds,
+                                  .contextCost = impl_->stepCosts->contextCost()});
   }
 #endif
   for (uint32_t lane = 0; lane < width; ++lane) {
@@ -3833,9 +3861,12 @@ Runtime::decodeAsync(const BatchPlan &plan,
 
   std::vector<ModelBatchItem> copiedItems(items.begin(), items.end());
   Impl *impl = impl_.get();
-  auto finish = [impl, lanes = std::move(lanes), reads, items = std::move(copiedItems),
-                 step](CommandTiming timing) mutable {
-    return impl->finalizeDecode(lanes, items, timing, *reads, step);
+  // A cycle the costs chose, with no constrained lane, gives the cost of
+  // passes over history a sample (finalizeDecode).
+  const bool samples = impl_->stepCosts && !impl_->forcedStep && !constrained;
+  auto finish = [impl, lanes = std::move(lanes), reads, items = std::move(copiedItems), step,
+                 planned = samples ? std::optional(planned) : std::nullopt](CommandTiming timing) mutable {
+    return impl->finalizeDecode(lanes, items, timing, *reads, step, planned);
   };
   CommandTicket command = impl_->backend.submitCommandAsync(
       commandGraph.command(), std::move(completion));

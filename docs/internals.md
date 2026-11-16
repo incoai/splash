@@ -54,7 +54,8 @@ compare full-model greedy outputs at the same prompts, cached prefixes and
 batch schedule against the base. Repeat seeded sampled requests within each
 build, and explicitly check base-versus-candidate seeded output when preserving
 a drafting policy. Run with `--verify-rows all` for these comparisons: the
-measured costs and learned acceptance a cycle's rows otherwise follow make
+measured costs, and the cost of history and the acceptance learned while
+serving, which a cycle's rows otherwise follow, make
 greedy and seeded outputs vary from run to run ([Drafts](models.md#drafts)). These are measured
 gates, not a guarantee across arbitrary compiler versions or GPUs.
 
@@ -467,7 +468,9 @@ for its cycle before encoding it (`model::StepCosts::choose`): the T, from
 a row a lane to sixteen, with the most expected accepted tokens over the cost
 of a step of T rows, from each lane's chances (its draft's rows' estimates in
 its last cycle and its host chain's) and the cost the start measured for the
-class of steps T falls in (`ops::ExecutionPlans::decodeRowClasses`); a lane
+class of steps T falls in (`ops::ExecutionPlans::decodeRowClasses`) plus, for
+each of the step's passes over a thousand tokens of a lane's history, the
+cost k its cycles fit (`model::StepCosts::observeContext`); a lane
 holds at most eight of them unless the lanes' chances give one lane more, and
 sixteen then, which the selector packs in lane order.
 
@@ -942,7 +945,8 @@ An expert's only tile of at most `GGUF_COLUMN_ROWS` live rows runs on the column
 products in different orders: a route's output depends on how many rows the step routes to its
 expert, so decode results of GGUF MoE targets, the 35B's included, are not invariant to the
 batch (`kernels/common/moe_expert_slab.h`). Under the default `--verify-rows auto`, a decode
-step's rows also follow the step costs the start measured on the Mac and the acceptance the
+step's rows also follow the step costs the start measured on the Mac, the cost of passes over
+history its cycles fit (`model::StepCosts::observeContext`) and the acceptance the
 verify budget learns from earlier requests ([Drafts](models.md#drafts)), so decode results can
 differ between runs of one request.
 The float router, QSA indexer and alpha/beta projections run in `kernels/shared/gguf_float.metal`,
