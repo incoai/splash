@@ -12,6 +12,7 @@
 #include "metal/abi/PagedAttention.h"
 #include "metal/abi/RoPE.h"
 #include "metal/abi/RowCopy.h"
+#include "metal/abi/StateCodec.h"
 #include "metal/abi/Sampling.h"
 #include "metal/abi/VerifyTree.h"
 #include "metal/abi/Vision.h"

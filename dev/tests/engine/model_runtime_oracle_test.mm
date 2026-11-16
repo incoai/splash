@@ -2,6 +2,7 @@
 #include "ChainRows.hpp"
 #include "LinearNumerics.hpp"
 #include "PenaltyReference.hpp"
+#include "StateCodecReference.hpp"
 #include "TestChecks.hpp"
 #include "TestKvTier.hpp"
 #include "ane/ProgramInstrumentation.hpp"
@@ -575,6 +576,19 @@ void restoreActivePrefix(model::Runtime &executor, uint64_t requestId,
   require(!executor.beginRestore(requestId, boundary, state, true, {}),
           "resident restore returned a read");
   executor.setDraftContextPlan(requestId, planDraftContext(boundary, promptTokens, {}));
+}
+
+// Passes a lane's GDN state through the codes a cached state stores it as
+// (ops::StateCodec): what a lane that restores a state captured there holds.
+// The lane keeps its draft rings, window and lengths, and the runtime is not
+// told: a teacher that goes on from here computes what a restored lane does.
+void decodeLane(model::QwenStateStorage &states, uint32_t lane) {
+  metal::AllocationFailure refusal;
+  const std::shared_ptr<model::QwenStateReservation> reservation = states.reserve(refusal);
+  require(reservation != nullptr, "the buffers of a lane's cached form were refused");
+  states.storeState(lane, *reservation);
+  const auto state = states.seal(*reservation, states.metadata(lane).lengths);
+  require(!states.beginRestore(lane, *state, true, {}, [] {}), "a resident restore returned a read");
 }
 
 // Whether a chunk encodes an image, counted on the backend that runs it.
@@ -1245,6 +1259,8 @@ void requireRepeatedImagePlacements(model::Runtime &executor,
                std::span<const uint32_t>(prompt).first(64), pages, ImageEncodes{backend, true});
   auto checkpoint = executor.snapshot(request.id);
   require(checkpoint != nullptr, "image prefix checkpoint allocation failed");
+  // The teacher goes on from the state the checkpoint holds.
+  decodeLane(states, lane);
   prefillChunk(executor, request.id, 64,
                std::span<const uint32_t>(prompt).subspan(64), pages, ImageEncodes{backend, false});
   require(executor.telemetry().imageEncodes == encodes + 1,
@@ -1279,10 +1295,10 @@ void requireRepeatedImagePlacements(model::Runtime &executor,
 // so the rings computed again from the window must come before them: a later
 // rebuild would overwrite the chunk's captured rings, which match bit for bit.
 // The restored lane matches the cold teacher-forced lane that made the
-// checkpoint.
+// checkpoint and went on from the state it holds.
 void requireFullWindowRestore(model::Runtime &executor,
                               const metal::MetalBackend &backend,
-                              const model::QwenStateStorage &states) {
+                              model::QwenStateStorage &states) {
   constexpr uint32_t window = model::ExecutionLimits::draftContextTokens;
   constexpr uint32_t boundary = window + 64;
   std::vector<uint32_t> prompt(boundary + 64);
@@ -1298,6 +1314,7 @@ void requireFullWindowRestore(model::Runtime &executor,
   prefillChunk(executor, request.id, window, tokens.subspan(window, boundary - window), pages);
   auto checkpoint = executor.snapshot(request.id);
   require(checkpoint != nullptr, "full-window checkpoint allocation failed");
+  decodeLane(states, 0);
   prefillChunk(executor, request.id, boundary, tokens.subspan(boundary), pages);
   const auto expected = sampleCommittedState(backend, states, 0, boundary);
   executor.end(request.id);
@@ -1403,7 +1420,7 @@ uint64_t requireCapturedWindow(const std::vector<uint8_t> &captured, const std::
 // such as a GGUF float projection's tile, leaves them only as close as any
 // two partitions.
 void requireStatesCapturedInsideCommands(model::Runtime &executor, const metal::MetalBackend &backend,
-                                     const kv::PageStorage &pages, const model::QwenStateStorage &states,
+                                     const kv::PageStorage &pages, model::QwenStateStorage &states,
                                      const ops::AneFfn *aneFfn, std::span<const uint32_t> chat) {
   constexpr uint32_t split = 480, firstCaptured = 1024, secondCaptured = 2080, end = 2112, longer = 2144;
   require(pages.pageCount() > 120, "the KV pool cannot hold the captured-state fixture");
@@ -1485,6 +1502,8 @@ void requireStatesCapturedInsideCommands(model::Runtime &executor, const metal::
           "captured windows took the wrong positions from the lane's window before the command");
   require(std::memcmp(before.data(), after.data(), uint64_t{64} * width / 2) != 0,
           "the command left the slots it overwrote as they were");
+  // The lane's state as its codes hold it.
+  decodeLane(states, 1);
   require(capturedBytes[2].cell == bytesOf(states.current(1).stateBase) && capturedBytes[2].window == after,
           "the state captured at the command's end is not the lane's");
 
@@ -2058,9 +2077,10 @@ void requireCapturesOutliveTheirItems(model::Runtime &executor,
   std::vector<uint32_t> prompt(tokens);
   for (uint32_t index = 0; index < tokens; ++index)
     prompt[index] = chat[index % chat.size()];
-  const auto idle = [&] { return std::pair{states.idleCells(), states.idleWindows()}; };
-  // A state's cell goes back to the idle pool beside its window, but a cell
-  // of no bytes (a target without GDN layers'), which the pool does not count.
+  const auto idle = [&] { return std::pair{states.idleCachedCells(), states.idleWindows()}; };
+  // A state's cached cell goes back to the idle pool beside its window, but a
+  // cell of no bytes (a target without GDN layers'), which the pool does not
+  // count.
   const uint32_t cells = states.layout().target.cellBytes() ? 2 : 0;
   // The prompt's one command for request `id` over `pages`, which captures
   // its states at the boundaries; its items go before it is waited for.
@@ -2108,6 +2128,147 @@ void requireCapturesOutliveTheirItems(model::Runtime &executor,
   while (executor.releaseIdleBuffer(false)) {
   }
   std::cout << "captures_outlive_their_items=PASS\n";
+}
+
+// A decode cycle's captured state (Runtime::encodeDecodeCaptures, whose fold
+// stores the state's codes) holds the codes the codec makes of the state the
+// lane itself holds at that page, bit for bit: a cycle that retains exactly
+// the rows before its page captures it, and the lane's next cycle, which
+// folds those rows as the capture did, leaves the lane's cell at that state.
+// Restored, the capture gives that cell's convolution rows and its
+// recurrent state through the codes (StateCodecReference.hpp). Beside it, a
+// prefill of the same tokens captured at the same page: its own arithmetic
+// for the rows past the prompt leaves a state a little off the decode's, so
+// its codes are compared for the record only.
+void requireDecodeCaptureMatchesTheLane(model::Runtime &executor, model::QwenStateStorage &states,
+                                        std::span<const uint32_t> chat) {
+  if (!executor.capturesInDecode()) {
+    std::cout << "decode_capture=SKIP (the target writes auxiliary state with its retained rows)\n";
+    return;
+  }
+  const std::vector<uint32_t> decodePages = pageRange(100, 5), prefillPages = pageRange(105, 5);
+  const auto promptOf = [&](uint32_t length) {
+    std::vector<uint32_t> tokens(length);
+    for (uint32_t index = 0; index < length; ++index)
+      tokens[index] = chat[index % chat.size()];
+    return tokens;
+  };
+  // Request `id` on lane 0 from `length` prompt tokens to its first cycle,
+  // which captures the page at `boundary` when given one; the rows it
+  // retained.
+  const auto firstCycle = [&](uint64_t id, uint32_t length, std::optional<uint32_t> boundary,
+                              std::vector<std::shared_ptr<const CompositeState>> &captured) {
+    const std::vector<uint32_t> tokens = promptOf(length);
+    beginCold(executor, makeRequest(id, tokens, 64), 0);
+    executor.setDraftContextPlan(id, planDraftContext(0, length, {}));
+    const ModelStepResult prefilled = prefillChunk(executor, id, 0, tokens, decodePages);
+    require(prefilled.failure.empty() && prefilled.outputTokens.empty(),
+            "a decode capture's prompt ended right after prefill");
+    const BatchPlan plan{.kind = WorkKind::Decode, .items = {{id, 0}}, .decodeStage = DecodeStage::Regular};
+    ModelBatchItem item = withRevision({id, length, 0, decodePages});
+    if (boundary) {
+      metal::AllocationFailure refusal;
+      item.stateCaptures.push_back({*boundary, executor.reserveState(id, *boundary, refusal)});
+      require(item.stateCaptures.back().reservation != nullptr, "the buffers of a decode capture were refused");
+    }
+    std::vector<ModelStepResult> results = executor.decode(plan, std::span<const ModelBatchItem>(&item, 1));
+    require(results.size() == 1 && results[0].failure.empty() && !results[0].finished,
+            "a decode capture's cycle failed or ended its request");
+    captured = std::move(results[0].capturedStates);
+    return std::pair{static_cast<uint32_t>(states.metadata(0).lengths.targetTokens - length),
+                     std::move(results[0].outputTokens)};
+  };
+  // A prompt whose first cycle retains exactly the rows before a page, the
+  // most of them found, so that the fold takes several rows where it can.
+  uint32_t prompt = 0, boundary = 0;
+  std::vector<std::shared_ptr<const CompositeState>> none;
+  for (const uint32_t page : {96U, 128U})
+    for (uint32_t length = page - 8; length < page; ++length) {
+      const uint32_t retained = firstCycle(440 + length, length, std::nullopt, none).first;
+      executor.end(440 + length);
+      if (length + retained == page && (!prompt || page - length > boundary - prompt)) {
+        prompt = length;
+        boundary = page;
+      }
+    }
+  require(prompt != 0, "no prompt of 88 to 127 tokens had a first cycle that ended at a page");
+  std::vector<std::shared_ptr<const CompositeState>> captured;
+  const auto [retained, generated] = firstCycle(430, prompt, boundary, captured);
+  require(prompt + retained == boundary && captured.size() == 1 && generated.size() >= retained,
+          "the capturing cycle did not retain exactly the rows before its page, as the same cycle did before");
+  // The lane's next cycle folds those rows: its cell is then the state at
+  // the page.
+  const ModelStepResult next = decodeOne(executor, 430, boundary, decodePages);
+  require(next.failure.empty(), "the cycle after a decode capture failed");
+  const model::GdnStateLayout layout = states.layout().target;
+  const std::vector<uint8_t> lane = bytesOf(states.current(0).stateBase);
+  executor.end(430);
+  std::vector<uint32_t> through = promptOf(prompt);
+  through.insert(through.end(), generated.begin(), generated.begin() + retained);
+  // A restore leaves its request a token to prefill.
+  std::vector<uint32_t> probe = through;
+  probe.push_back(chat[boundary % chat.size()]);
+  const StateBytes fromDecode = restoredBytes(executor, states, 432, 2, probe, boundary, captured.front());
+
+  const bool bfloat = layout.format == ops::GdnStateFormat::BFloat16;
+  const uint32_t rows = layout.recurrentGroups * layout.recurrentRows, columns = layout.recurrentColumns;
+  const uint64_t carried = uint64_t{layout.convolutionHistory} * layout.convolutionChannels * 2;
+  const auto values = [&](const std::vector<uint8_t> &cell, uint32_t layer) {
+    const uint8_t *at = cell.data() + layout.convolutionBytes() + uint64_t{layer} * layout.recurrentLayerBytes();
+    std::vector<float> result(uint64_t{rows} * columns);
+    for (uint64_t index = 0; index < result.size(); ++index) {
+      if (bfloat) {
+        uint16_t narrow = 0;
+        std::memcpy(&narrow, at + index * 2, 2);
+        result[index] = test::bf16ToFloat(narrow);
+      } else {
+        std::memcpy(&result[index], at + index * 4, 4);
+      }
+    }
+    return result;
+  };
+  uint64_t differing = 0;
+  for (uint32_t layer = 0; layer < layout.layers; ++layer) {
+    const uint64_t rowsAt = uint64_t{layer} * layout.convolutionLayerBytes();
+    require(std::memcmp(fromDecode.cell.data() + rowsAt, lane.data() + rowsAt, carried) == 0,
+            "a decode capture's convolution rows are not the lane's at its page");
+    // The lane's state through the codec, as a restore of its codes gives it.
+    const std::vector<float> state = values(lane, layer), restored = values(fromDecode.cell, layer);
+    const std::vector<uint8_t> codes = test::stateCodesReference(state.data(), rows, columns);
+    for (uint64_t index = 0; index < state.size(); ++index) {
+      uint16_t scale = 0;
+      std::memcpy(&scale, codes.data() + state_codec_scales_offset(rows, columns) +
+                              index / SPLASH_STATE_CODEC_BLOCK * 2, 2);
+      float expected = static_cast<float>(static_cast<int8_t>(codes[index])) * test::bf16ToFloat(scale);
+      if (bfloat)
+        expected = test::bf16ToFloat(test::floatToBf16(expected));
+      differing += expected != restored[index];
+    }
+  }
+  require(differing == 0, "a decode capture restores " + std::to_string(differing) +
+                              " recurrent values other than the codes of the lane's state at its page");
+
+  // For the record: a prefill of the same tokens captured at the same page.
+  beginCold(executor, makeRequest(431, through, 1), 1);
+  executor.setDraftContextPlan(431, planDraftContext(0, boundary, {}));
+  requireOpen(prefillChunk(executor, 431, 0, std::span(through).first(prompt), prefillPages), "decode capture");
+  const std::array<uint32_t, 1> end{boundary};
+  ModelStepResult rest =
+      prefillChunk(executor, 431, prompt, std::span(through).subspan(prompt), prefillPages, {}, end);
+  require(rest.failure.empty() && rest.capturedStates.size() == 1, "the prefill capture at the page failed");
+  executor.end(431);
+  const StateBytes fromPrefill = restoredBytes(executor, states, 433, 2, probe, boundary, rest.capturedStates.front());
+  SimilarityAccumulator recurrent;
+  for (uint32_t layer = 0; layer < layout.layers; ++layer) {
+    const std::vector<float> left = values(fromDecode.cell, layer), right = values(fromPrefill.cell, layer);
+    for (uint64_t index = 0; index < left.size(); ++index)
+      recurrent.add(left[index], right[index]);
+  }
+  const std::streamsize precision = std::cout.precision(9);
+  std::cout << "decode_capture prompt=" << prompt << " rows=" << retained << " lane_codes_equal=1"
+            << " prefill_recurrent_cos=" << recurrent.result().cosine << '\n';
+  std::cout.precision(precision);
+  std::cout << "decode_capture=PASS\n";
 }
 
 // Fills every byte of a lane's GDN recurrent state, the half of the cell its
@@ -5625,7 +5786,7 @@ void warmupEos(model::RuntimeContext context, model::LoadedModel &model) {
     weights.layout = std::get<Layout>(originalTarget);
   }, model.target);
   model.descriptor.target = originalTarget;
-  const model::QwenStateStorage &states = context.stateStorage;
+  model::QwenStateStorage &states = context.stateStorage;
   for (uint32_t lane = 0; lane < 4; ++lane)
     require(!states.metadata(lane).assigned(),
             "EOS warmup left an active state lane");
@@ -6126,6 +6287,7 @@ int main(int argc, char **argv) {
     requireThinkingEndVerifiesItsTokens(executor, model);
     requireStatesCapturedInsideCommands(executor, backend, pages, states, aneFfn.get(), samplingSeedTokens);
     requireCapturesOutliveTheirItems(executor, states, samplingSeedTokens);
+    requireDecodeCaptureMatchesTheLane(executor, states, samplingSeedTokens);
     requirePrefillGroupMatchesItsChunks(executor, pages, states, samplingSeedTokens,
                                         model.descriptor.hasVision());
     requirePrefillPassesMatchWhole(executor, pages, states, samplingSeedTokens, model.descriptor.hasVision());
@@ -6250,13 +6412,13 @@ int main(int argc, char **argv) {
     require(partitionedSamplingSnapshot != nullptr,
             "partitioned sampling snapshot allocation failed");
     executor.end(54);
-    // The restore copies the target state exactly, so after the replayed
-    // token the restored lane and a cold lane hold the same GDN cell and
-    // select the same anchor. Their draft rings differ: a cached state keeps
-    // the 4-bit context window, from which the restore computes them again,
-    // and a sampled cycle draws a rejected proposal's correction from the
-    // target's distribution less the draft's, so the cycle's later tokens
-    // may differ.
+    // A restore decodes the target state's codes, so after the replayed
+    // token the restored lane and a cold lane whose state passed through the
+    // same codes hold the same GDN cell and select the same anchor. Their
+    // draft rings differ: a cached state keeps the 4-bit context window, from
+    // which the restore computes them again, and a sampled cycle draws a
+    // rejected proposal's correction from the target's distribution less the
+    // draft's, so the cycle's later tokens may differ.
     EngineRequest restoredMicroSampling =
         makeRequest(55, policyReplayPrompt, 2);
     restoredMicroSampling.sampling = partitionedSampling.sampling;
@@ -6277,6 +6439,7 @@ int main(int argc, char **argv) {
     prefillChunk(executor, 57, 120,
                  std::span<const uint32_t>(policyReplayPrompt).subspan(120, 8),
                  coldPolicyPages);
+    decodeLane(states, 1);
     ModelStepResult coldReplay = prefillChunk(
         executor, 57, 128,
         std::span<const uint32_t>(policyReplayPrompt).subspan(128, 1),
@@ -6473,7 +6636,8 @@ int main(int argc, char **argv) {
     }
 
     // A Page32 composite state followed by one replayed token must equal a cold
-    // run with the same 128+1 command partition.
+    // run with the same 128+1 command partition, whose state passes through
+    // the codes the composite state holds.
     EngineRequest extended = makeRequest(20, prompt129, 2);
     beginCold(executor, extended, 0);
     restoreActivePrefix(executor, 20, prompt129.size(), 128, promptSnapshot);
@@ -6496,6 +6660,7 @@ int main(int argc, char **argv) {
     prefillChunk(executor, 21, 0,
                  std::span<const uint32_t>(prompt129).first(128),
                  coldReplayPages);
+    decodeLane(states, 0);
     ModelStepResult coldExtendedResult = firstStep(
         executor,
         prefillChunk(executor, 21, 128,
@@ -6508,7 +6673,8 @@ int main(int argc, char **argv) {
 
     // Recurrent cache entries are policy-neutral. The consumer replays one
     // teacher-forced token, then selects from the regenerated final hidden
-    // with its own sampling stream: its anchor is a cold run's. The tokens
+    // with its own sampling stream: its anchor is a cold run's whose state
+    // passed through the entry's codes. The tokens
     // after the anchor come from draft rings the restore computed again from
     // the context window (compareCommittedSamples), so they are compared with
     // those of a second consumer, of a second producer's snapshot under
@@ -6563,6 +6729,7 @@ int main(int argc, char **argv) {
     prefillChunk(executor, 32, 120,
                  std::span<const uint32_t>(samplingPrompt).subspan(120, 8),
                  coldSamplingPages);
+    decodeLane(states, 0);
     ModelStepResult coldSample = firstStep(
         executor,
         prefillChunk(executor, 32, 128,

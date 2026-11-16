@@ -749,9 +749,10 @@ struct ModelMemoryActual final {
 
 struct ModelTelemetry final {
   uint64_t stateAllocatedBytes = 0;
-  // Pooled state buffers no lane holds: GDN parity cells, draft rings and
-  // context windows.
+  // Pooled state buffers no lane holds: GDN parity cells, the cached cells
+  // states take, draft rings and context windows.
   uint32_t idleGdnCells = 0;
+  uint32_t idleCachedCells = 0;
   uint32_t idleDraftRings = 0;
   uint32_t idleContextWindows = 0;
   uint64_t targetPrefillRows = 0;
@@ -908,8 +909,9 @@ public:
   [[nodiscard]] virtual std::optional<uint32_t> statesToActivate() const noexcept { return 0; }
   // The bytes releaseIdleBuffer(keepLane), called until it gives none,
   // releases once the cache has let go of `evictedStates` more cached states,
-  // whose buffers return to the pool: the pooled buffers, beyond those one
-  // lane starts from with keepLane, at the sizes their layout declares,
+  // whose buffers return to the pool: the pooled buffers, beyond those the
+  // next lane starts from with keepLane (none beside a lane in service, whose
+  // own it takes once that ends), at the sizes their layout declares,
   // which no allocation falls short of. With `afterStart`, of the pool a
   // lane's start leaves (startStateBytes): the evicted states refill the
   // buffers it took from it before any of theirs frees memory. Zero where
@@ -943,8 +945,8 @@ public:
     work.layerAttentionPairs = work.attentionPairs;
     return work;
   }
-  // Releases one pooled state buffer no lane holds (keepLane keeps those one
-  // lane starts from) and returns its bytes; zero when none is idle. One
+  // Releases one pooled state buffer no lane holds (keepLane keeps those the
+  // next lane starts from) and returns its bytes; zero when none is idle. One
   // buffer a call, so a denied allocation that retries between calls frees
   // only what it needs. The model's other idle memory goes through pools().
   [[nodiscard]] virtual uint64_t releaseIdleBuffer(bool keepLane) noexcept = 0;

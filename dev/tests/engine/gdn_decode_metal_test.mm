@@ -32,6 +32,7 @@
 #include "LinearInputReference.hpp"
 #include "LinearNumerics.hpp"
 #include "NormReference.hpp"
+#include "StateCodecReference.hpp"
 
 #import <Foundation/Foundation.h>
 
@@ -1852,27 +1853,34 @@ void rejectsInvalid(MetalBackend &backend) {
       },
       "norm weight buffer holds", "bf16 norm weights were read as F32");
   // A fold takes one to all of a step's rows of every layer, from an aligned
-  // tape slot whose layers the tape holds, into a cell as large as the
-  // state's.
+  // tape slot whose layers the tape holds, into a cached cell as large as
+  // the state's, whose layers each hold a layer's codes.
   const MetalBuffer retainedRows = sharedBuffer(backend, 4);
   const GdnFoldBuffers fold{fixture.next[0], fixture.tape, fixture.slot(0, 1), retainedRows, fixture.current[0]};
+  const uint64_t codes = fixture.cell.layout.cachedRecurrentLayerBytes();
   for (const uint32_t rows : {0U, kRows + 1})
-    rejects([&] { GDN::addFold(graph, fold, shape, kLayers, rows, fixture.cell.strides()); },
+    rejects([&] { GDN::addFold(graph, fold, shape, kLayers, rows, fixture.cell.strides(), codes); },
             "invalid GDN fold geometry", "a fold of no rows or more than a step's was accepted");
   rejects(
       [&] {
         GdnFoldBuffers misaligned = fold;
         misaligned.stepSlot += 8;
-        GDN::addFold(graph, misaligned, shape, kLayers, 1, fixture.cell.strides());
+        GDN::addFold(graph, misaligned, shape, kLayers, 1, fixture.cell.strides(), codes);
       },
       "invalid GDN fold geometry", "a fold of a misaligned tape slot was accepted");
-  rejects([&] { GDN::addFold(graph, fold, shape, 2 * kMaxLanes * kLayers, 1, fixture.cell.strides()); },
+  rejects(
+      [&] {
+        const uint64_t layer = state_codec_layer_bytes(shape.valueHeads * kHeadDim, kHeadDim);
+        GDN::addFold(graph, fold, shape, kLayers, 1, fixture.cell.strides(), layer - 1);
+      },
+      "invalid GDN fold geometry", "a fold into layers shorter than their codes was accepted");
+  rejects([&] { GDN::addFold(graph, fold, shape, 2 * kMaxLanes * kLayers, 1, fixture.cell.strides(), codes); },
           "GDN tape buffer holds", "a fold read past the tape");
   rejects(
       [&] {
         GdnFoldBuffers small = fold;
-        small.fold = sharedBuffer(backend, fixture.cell.bytes / 2);
-        GDN::addFold(graph, small, shape, kLayers, 1, fixture.cell.strides());
+        small.fold = sharedBuffer(backend, fixture.cell.layout.cachedCellBytes() / 2);
+        GDN::addFold(graph, small, shape, kLayers, 1, fixture.cell.strides(), codes);
       },
       "GDN folded state buffer holds", "a fold wrote past its cell");
   require(graph.empty(), "invalid GDN request partially encoded a graph");
@@ -1880,12 +1888,14 @@ void rejectsInvalid(MetalBackend &backend) {
 
 // A fold of the first rows of a step's retained path alone (GDN::addFold)
 // stores the state the lane's next step holds when the lane retained those
-// rows, bit for bit, in every layer: the recurrent state and the convolution
-// rows, over either state format, for each count of a chain's rows and of a
-// tree's path that skips rows, as a capture on a branch takes it. The step
-// folds rows of the one before it, so a fold from the state it started from,
-// or from the earlier step's tape slot, stores another state. A lane whose
-// path holds fewer rows leaves the fold's cell as it was.
+// rows as a cached state stores it, bit for bit, in every layer: the
+// convolution rows, and the codes the codec makes of the recurrent state as
+// the lane's cell holds it (StateCodecReference.hpp), over either state
+// format, for each count of a chain's rows and of a tree's path that skips
+// rows, as a capture on a branch takes it. The step folds rows of the one
+// before it, so a fold from the state it started from, or from the earlier
+// step's tape slot, stores another state. A lane whose path holds fewer rows
+// leaves the fold's cell as it was.
 void foldMatchesTheNextStep(MetalBackend &backend, const GdnShape &shape, GdnStateFormat format) {
   const std::string what =
       "fold vh" + std::to_string(shape.valueHeads) + " " + std::string(formatName(format));
@@ -1939,7 +1949,8 @@ void foldMatchesTheNextStep(MetalBackend &backend, const GdnShape &shape, GdnSta
   (void)backend.submitCommandAsync(step.dispatches()).wait();
   const uint64_t stepSlot = fixture.blocks[0].tape.stepSlot, pendingSlot = fixture.blocks[0].tape.pendingSlot;
 
-  const MetalBuffer retainedRows = sharedBuffer(backend, 4), fold = sharedBuffer(backend, cell.bytes);
+  const uint64_t cached = cell.layout.cachedCellBytes();
+  const MetalBuffer retainedRows = sharedBuffer(backend, 4), fold = sharedBuffer(backend, cached);
   std::array<MetalBuffer, kMaxLanes> current, next;
   current.fill(sharedBuffer(backend, cell.bytes));
   next.fill(sharedBuffer(backend, cell.bytes));
@@ -1951,27 +1962,36 @@ void foldMatchesTheNextStep(MetalBackend &backend, const GdnShape &shape, GdnSta
   // leaves its own rows in a slot of another lane's, so that the earlier
   // step's rows stay for the step to run again.
   const auto check = [&](uint32_t rows, uint32_t retained, uint32_t first, const std::string &where) {
-    std::memset(fold.contents(), 0xA5, cell.bytes);
+    std::memset(fold.contents(), 0xA5, cached);
     *static_cast<uint32_t *>(retainedRows.contents()) = retained;
     std::memcpy(current[0].contents(), fixture.next[0].contents(), cell.bytes);
     std::memset(next[0].contents(), 0, cell.bytes);
     CommandGraph graph;
     GDN::addFold(graph, {fixture.next[0], fixture.tape, stepSlot, retainedRows, fold}, shape, kLayers, rows,
-                 cell.strides());
+                 cell.strides(), cell.layout.cachedRecurrentLayerBytes());
     addStep(graph, current, next, {stepSlot, fixture.slot(2, 0), first});
     (void)backend.submitCommandAsync(graph.dispatches()).wait();
     if (std::popcount(retained) < static_cast<int>(rows)) {
-      require(std::all_of(bytes(fold, 0), bytes(fold, cell.bytes), [](uint8_t byte) { return byte == 0xA5; }),
+      require(std::all_of(bytes(fold, 0), bytes(fold, cached), [](uint8_t byte) { return byte == 0xA5; }),
               where + ": a fold of rows the lane did not retain wrote its cell");
       return;
     }
+    const uint32_t valueRows = shape.valueHeads * kHeadDim;
     for (uint32_t layer = 0; layer < kLayers; ++layer) {
       const uint64_t rowsAt = layer * cell.convLayerBytes;
-      const uint64_t stateAt = cell.convBytes + layer * cell.recurrentLayerBytes;
       require(!std::memcmp(bytes(fold, rowsAt), bytes(next[0], rowsAt), carried),
               where + ": the fold's convolution rows are not the next step's");
-      require(!std::memcmp(bytes(fold, stateAt), bytes(next[0], stateAt), recurrent),
-              where + ": the fold's state is not the next step's");
+      // The next step's recurrent state, widened where the cell holds bf16.
+      const uint8_t *stateAt = bytes(next[0], cell.convBytes + layer * cell.recurrentLayerBytes);
+      std::vector<float> values(uint64_t{valueRows} * kHeadDim);
+      for (uint64_t index = 0; index < values.size(); ++index)
+        values[index] = format == GdnStateFormat::BFloat16
+                            ? splash::test::codecWiden(reinterpret_cast<const uint16_t *>(stateAt)[index])
+                            : reinterpret_cast<const float *>(stateAt)[index];
+      const std::vector<uint8_t> expected = splash::test::stateCodesReference(values.data(), valueRows, kHeadDim);
+      require(!std::memcmp(bytes(fold, cell.convBytes + layer * cell.layout.cachedRecurrentLayerBytes()),
+                           expected.data(), expected.size()),
+              where + ": the fold's codes are not the codec's of the next step's state");
     }
   };
   for (uint32_t rows = 1; rows <= kRows; ++rows)
@@ -1997,7 +2017,8 @@ void foldMatchesTheNextStep(MetalBackend &backend, const GdnShape &shape, GdnSta
             what + " of " + std::to_string(rows) + " rows of a branched path, " +
                 std::to_string(std::popcount(retained)) + " retained");
   }
-  std::cout << what << ": each count of a chain's rows and of a branched path's folds to the next step's state\n";
+  std::cout << what
+            << ": each count of a chain's rows and of a branched path's folds to the codes of the next step's state\n";
 }
 
 } // namespace

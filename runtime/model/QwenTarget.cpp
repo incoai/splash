@@ -31,7 +31,8 @@ void requirePrefillStates(const QwenTargetGeometry &geometry, const QwenTargetPr
       (auxiliary && (!sequence.auxiliaryIn || !sequence.auxiliaryOut)) ||
       !std::ranges::all_of(sequence.stateCaptures, [&](const QwenTargetStateCapture &capture) {
         return everyLayer(capture.convolution) && everyLayer(capture.recurrent) && (capture.auxiliary || !auxiliary);
-      }))
+      }) ||
+      (!sequence.endCodes.empty() && !everyLayer(sequence.endCodes)))
     throw std::invalid_argument("Qwen prefill state layer mismatch");
 }
 
@@ -116,7 +117,8 @@ void QwenTarget::addStateFold(metal::CommandGraph &graph, QwenTargetFoldBuffers 
   ops::GDN::addFold(graph,
                     {std::move(buffers.state), std::move(buffers.gdnTape), buffers.stepSlot,
                      std::move(buffers.retainedRows), std::move(buffers.fold)},
-                    geometry_.gdnShape(), geometry_.stateLayout.layers, rows, geometry_.stateLayout.strides());
+                    geometry_.gdnShape(), geometry_.stateLayout.layers, rows, geometry_.stateLayout.strides(),
+                    geometry_.stateLayout.cachedRecurrentLayerBytes());
 }
 
 void QwenTarget::requireLayers(size_t layers, size_t attentionLayers) const {
@@ -224,9 +226,11 @@ void QwenTarget::addPrefillMixer(PrefillStep &step, const QwenGdnWeights &mixer,
         return rowsOf<float>(buffer, sequence.rowBegin, sequence.rows, width);
       };
       std::vector<ops::GdnPrefillCapture> captures;
-      captures.reserve(sequence.stateCaptures.size());
+      captures.reserve(sequence.stateCaptures.size() + 1);
       for (const QwenTargetStateCapture &capture : sequence.stateCaptures)
         captures.push_back({capture.row, capture.convolution[layer], capture.recurrent[layer]});
+      if (!sequence.endCodes.empty())
+        captures.push_back({sequence.rows, {}, sequence.endCodes[layer]});
       ops::GDN::addPrefill(
           step.graph, backend_,
           {u16(b.gdnPacked, geometry_.packedGdnWidth), mixer.convolutionWeights, sequence.convolutionIn[layer],

@@ -1801,7 +1801,12 @@ Every claim walks one order. A unit the claim's rights (`TakeRights`) do not
 take is skipped, not a stop:
 
 1. Idle state buffers beyond those the next lane starts from, and those
-   too under macOS's critical pressure.
+   too under macOS's critical pressure. Qwen's pool keeps a lane's buffers
+   for the next start only while no lane is in service: beside one that is,
+   whose own the next start takes once it ends, it keeps none, since a lane's
+   cells serve no cached state (after two concurrent chats at a 22 GB limit
+   another lane's kept beside one in service left 22 cached 4K-token chats
+   where 24 fit).
 2. Cached units that free memory now (copied, dead or needing no write, a
    reply's opportunistic state among them), in the cache's one order
    (`Cache::walkFor`).
@@ -2209,9 +2214,10 @@ restarting while the long request works (below).
 `/status` shows it: `admission.held_behind_refusal` counts the wanted starts
 held back untried (above), `memory_governor.growth_allowed` and
 `host_headroom_bytes` show whether
-and how far the host lets the engine grow, and `state.idle_gdn_cells`,
+and how far the host lets the engine grow, `state.idle_gdn_cells`,
 `idle_draft_rings` and `idle_context_windows` count the pooled lane buffers a
-start can take. A request's `timeout`, or `--request-timeout`, bounds the wait.
+start can take, and `idle_cached_cells` the pooled cells a captured state
+takes. A request's `timeout`, or `--request-timeout`, bounds the wait.
 
 After a suspension, suspended requests resume before new work of their priority
 or below, one at a time, higher priority first and then in the order they
@@ -2322,35 +2328,63 @@ system prompt, resumes there instead of from the start. It stays only if the
 replay state fits beside it; refused memory, the replay state takes its buffers
 rather than another lane's checkpoint. With the SSD cache it costs a write as
 well: reclaim takes checkpoints first and writes the states it evicts to the
-SSD, this one too (153 MiB for 27B), and one published straight to the SSD,
+SSD, this one too (47 MiB for 27B), and one published straight to the SSD,
 when no RAM slot took it, stays there. These writes draw on the SSD cache's
 write budget when one is set, which drops them while it is spent, a suspended
 request's own too, and a full quota makes room for one by dropping the oldest
 copy, perhaps an older conversation's restore point.
 
-A cached state holds the target's GDN cell and the draft's context window, not
-the draft's rings: the context row of each of the 2048 positions the rings
-cover, from which every draft layer computes its keys and values, in 4-bit
-codes over groups of 64 values with each group's fp16 scale and minimum
+A cached state holds a cached cell of the target's GDN state and the draft's
+context window, not the draft's rings. The cached cell
+(`GdnStateLayout::cachedCellBytes`) keeps every layer's convolution rows and
+the auxiliary state as a lane's cell does, and each layer's recurrent state as
+int8 codes, each block of 32 values of a value row with a bf16 scale, the
+block's largest magnitude over 127 (`ops::StateCodec`): 38 MiB of the 27B's 47
+MiB state, where the FP32 state takes 144 MiB. The codes are made once as a
+state is captured and decoded once as it is restored, so the running state
+keeps its format; the relative error of a decoded state is 0.8 to 0.9% on the
+27B, 35B and Qwen3.8-Flash-Next alike. A row's scale fits GDN, whose decay is per
+head: a scale per key column, across rows of very different size, had 2.4
+times the error and 6 to 10 times the effect on the next-token distributions.
+Lanes and cached states pool their cells apart (`QwenBufferPool`): a cached
+state's eviction returns a cached cell and a window, never a lane's cell, so
+`statesToActivate` counts states only for windows, and `idleBufferBytes` a
+cached cell's bytes for each.
+
+The window is the context row of each of the 2048 positions the rings cover,
+from which every draft layer computes its keys and values, in 4-bit codes over
+groups of 64 values with each group's fp16 scale and minimum
 (`DraftStateLayout::windowBytes`: 5.6 MiB for 27B and 2.25 MiB for 35B, where
 the rings take 40 and 48 MiB). Prefill keeps a lane's window beside its rings;
 a restore that continues the rings computes them from the window again at the
 start of the request's first prefill chunk (`DFlashDraft::addContextRebuild`).
-A prefill chunk writes each state it captures inside its rows
+A prefill chunk captures each state at a row of its rows
 (`ModelBatchItem::stateCaptures`) into buffers reserved before it runs: every
-GDN layer's dispatches stop there to store the state and go on from it, and
-the state's window is a copy of the lane's as the chunk finds it plus the
-chunk's rows before the boundary, since the chunk's later rows take the slots
-of the state's oldest rows in the lane's window. A state at the chunk's end is
-copied from the lane after it.
+GDN layer's dispatches stop at a state inside the rows, store its convolution
+rows in the state's cell and go on from them, while the recurrent state goes
+on in the lane's cell in place, and a dispatch of the codec stores the codes
+of the state the layer reached there; the state's window is a copy of the
+lane's as the chunk finds it plus the chunk's rows before the boundary, since
+the chunk's later rows take the slots of the state's oldest rows in the lane's
+window. A state at the end of a lane's rows in the chunk takes its codes the
+same way; the rest of a state at the command's end is copied from the lane
+after it (`QwenStateStorage::copyBeside`). `snapshot` and a state written
+straight from a lane to the SSD run one command of the codec, and a restore
+one of its decode, between commands: a restore from RAM decodes the cached
+cell into the lane's, and one from the SSD reads the slot into the lane's other
+cell, which the lane's next transition writes before it reads it, and decodes
+it from there, its promoted RAM copy taking the codes as they came.
 
 Decode keeps each lane's window current with its rings too, and a cycle whose
 retained rows may reach the next whole page reserves that page's state, in one
 attempt that frees nothing for it (`Engine::reserveReplyCapture`); refused, the
 cycle captures none. A decode step leaves the rows it retains on the lane's tape
 for the lane's next step to fold into the GDN state, so the cycle folds the rows
-before the page alone into the state's cell (`ops::GDN::addFold`, the next
-step's arithmetic, which it matches bit for bit), and the state's window is a
+before the page alone and stores the result's codes in the state's cell
+(`ops::GDN::addFold`: the next step's arithmetic, then the codec's, so the
+codes are bit for bit those the codec makes of the state the next step holds;
+it reads the 27B's 144 MiB state and writes 38 MiB, where a fold into a lane's
+cell and the codec after it would move 470 MiB), and the state's window is a
 copy of the lane's plus those rows' context; the completion seals the state only
 where the lane retained those rows. Both writes are one function of the runtime
 (`encodeDecodeCaptures`), which names the rows a lane retained: the path of its
@@ -2388,16 +2422,17 @@ to save 2.4% of their prefill. A suspended lane's checkpoints
 stay opportunistic: once they went, the lane replays its reply from its prompt's
 replay point, as one that captured none. A decoding lane's latest state retires
 only once the next is published, beside which its cycle holds that next state's
-reservation, so the pool's idle cells keep one more for each lane that captured
-than for one that captured none once the lanes end (`state.idle_gdn_cells`: 11
-after four lanes' 300-token replies, where 1.6.2 leaves 8), which a claim takes
-first (step 1 above). A target whose state commit writes
-auxiliary state after its retained rows (Qwen3.8-Flash-Next) captures none in
-decode (`Model::capturesInDecode`), and its decode writes the rings alone. A
-target without GDN layers keeps no GDN state: its cells have no bytes, every
-lane and state shares one empty cell that holds no memory, so a lane holds the
-draft's rings and window and a cached state the window alone, and
-`state.idle_gdn_cells` stays 0.
+reservation, so once the lanes end the pool holds those reservations' cached
+cells beside the lanes' cells (`state.idle_cached_cells` 2 beside
+`idle_gdn_cells` 8 after four lanes' 300-token replies at a 22 GB limit, where
+1.6.2 leaves 8 cells), which a claim takes first (step 1 above). A target
+whose state commit writes auxiliary state after its retained rows
+(Qwen3.8-Flash-Next) captures none in decode (`Model::capturesInDecode`), and
+its decode writes the rings alone. A target without GDN layers keeps no GDN
+state: its cells have no bytes, every lane and state shares one empty cell
+that holds no memory, so a lane holds the draft's rings and window and a
+cached state the window alone, and `state.idle_gdn_cells` and
+`idle_cached_cells` stay 0.
 
 ### Prefill and decode scheduling
 
@@ -2885,7 +2920,8 @@ were 14.5 MiB past the KV file's end and 768 KiB past the state file's, from
 1.1 to 15.8 MiB past the KV file's after each of the ten prompts that filled
 it, and gone within six minutes of the engine's exit; a second run's stayed
 five minutes after it. A file that a few large writes grow keeps more for its
-size: with the 27B's states of 153 MiB, `state.slots` held 8.4 MiB past its end
+size: with states of 153 MiB, the 27B's before cached states took int8 codes,
+`state.slots` held 8.4 MiB past its end
 with one state (5.5% of its length), in a cache 1.6.1 wrote and in a fresh one
 alike, and 15.8 MiB with two (5.2%), beside 1.9 MiB past a `kv.slots` of 142
 MiB (1.3%); in another run the two files, 451.5 MiB long together, held 29.6

@@ -275,6 +275,7 @@ ENGINE_CPP_SOURCES := \
 	runtime/ops/RoPE.cpp \
 	runtime/ops/RowCopy.cpp \
 	runtime/ops/Sampling.cpp \
+	runtime/ops/StateCodec.cpp \
 	runtime/ops/Vision.cpp \
 	runtime/metal/DeviceCapabilities.cpp \
 	runtime/engine/MemoryPlan.cpp \

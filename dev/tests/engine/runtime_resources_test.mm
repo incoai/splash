@@ -505,16 +505,15 @@ void testPersistentCacheNamespace() {
                   name &&
               persistentCacheNamespace(identity('a', "build", kv::Format::BFloat16),
                                        model.stateLayout) != name &&
-              persistentCacheNamespace(identity('a', "build", kv::Format::Int8), states) != name &&
-              persistentCacheNamespace(identity('a', "build", kv::Format::Int8), bfloatStates) != name,
-          "other models, layouts or state formats shared a cache namespace");
-  // A dense layout's namespace is the one main (be3b083c) names, with FP32
-  // and BF16 states: a change of its lines would leave every 27B's and 35B's
+              persistentCacheNamespace(identity('a', "build", kv::Format::Int8), states) != name,
+          "other models or layouts shared a cache namespace");
+  // A cached state holds the codes of its recurrent layers (ops::StateCodec)
+  // whatever the lanes' state format, so both formats read one namespace:
+  // the dense layout's, whose change would leave every 27B's and 35B's
   // persistent cache cold.
-  require(name == "6365d687c8be103a3bbcc6d2a83b1543" &&
-              persistentCacheNamespace(identity('a', "build", kv::Format::Int8), bfloatStates) ==
-                  "172879058b5e2bcc713e129a2b62393a",
-          "a dense layout's cache namespace is not the one main names");
+  require(name == "88a6a28cadb13dc02b99998aa48baa72" &&
+              persistentCacheNamespace(identity('a', "build", kv::Format::Int8), bfloatStates) == name,
+          "a dense layout's cache namespace is not the one its codes name");
   // A QSA layout's pages hold token-major values and the index's pooled
   // keys, and its states the PLE history and the index's pending keys.
   RuntimeCacheIdentity tokenMajor = identity('a', "build", kv::Format::Int8), indexed = tokenMajor;

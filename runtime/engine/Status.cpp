@@ -482,6 +482,7 @@ void writeState(json::Writer &w, const CacheSnapshot &resources, const model::Mo
         .field("allocated_bytes", telemetry.stateAllocatedBytes)
         .field("active_lanes", resources.activeRequests)
         .field("idle_gdn_cells", telemetry.idleGdnCells)
+        .field("idle_cached_cells", telemetry.idleCachedCells)
         .field("idle_draft_rings", telemetry.idleDraftRings)
         .field("idle_context_windows", telemetry.idleContextWindows)
         .field("publications", state.publications)
