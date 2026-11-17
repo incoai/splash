@@ -56,8 +56,11 @@ struct AneFfnModel final {
   uint32_t units = 0;
   // The split's Metal memory with the ANE taking `aneUnits` of them.
   std::function<uint64_t(uint32_t aneUnits)> plannedBytes;
-  // Calibration's timings (ops::ane_ffn::Measurement::time).
+  // Calibration's timings (ops::ane_ffn::Measurement::time), and the same of
+  // the split with the ANE taking `aneUnits`, on the layers they timed, less
+  // their GPU alone's `gpuAlone`.
   std::function<ops::ane_ffn::Timings()> time;
+  std::function<ops::ane_ffn::Timing(uint32_t aneUnits, double gpuAlone)> timeAt;
   // The split that serves with the ANE taking `aneUnits`, verified, with its
   // chunks timed (ops::ane_ffn::Measurement::chunks) when `timeChunks`. A
   // model a test plays prepares no split.
@@ -131,8 +134,8 @@ struct AneFfnStart final {
 // until the plan holds a split; then it logs that it sets the split up. The
 // split takes this Mac's calibration of the model within the units the plan
 // holds, once remembered; else it is calibrated: timed, its share chosen
-// (ops::ane_ffn::choose) and again once its split's chunks are timed
-// (ops::ane_ffn::refit), taken where its split is prepared and takes no chunk
+// (ops::ane_ffn::choose) and again once its split is timed there as the
+// fit's were (ops::ane_ffn::refit), taken where its split is prepared and takes no chunk
 // longer (ops::ane_ffn::slowerNowhere), the least chunk found (minimumRows), and the
 // outcome remembered, a split or none. The split then judges itself against the GPU
 // alone as calibrated (ops::ane_ffn::Breaker), which forgets the calibration

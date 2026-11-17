@@ -109,24 +109,29 @@ double Measurement::gpuPart(std::span<const SwiGluProjections> layers, AneFfn &s
   return usable((command(count) - command(1)) / (count - 1));
 }
 
+std::vector<SwiGluProjections> Measurement::sampled() const {
+  // A model of fewer layers times some twice.
+  std::vector<SwiGluProjections> layers;
+  for (uint32_t index = 0; index < kSampledLayers; ++index)
+    layers.push_back(layers_[index * (layers_.size() - 1) / (kSampledLayers - 1)]);
+  return layers;
+}
+
 Timings Measurement::time() {
   const uint32_t units = AneFfn::units(layers_);
-  // A model of fewer layers times some twice.
-  std::vector<SwiGluProjections> sampled;
-  for (uint32_t index = 0; index < kSampledLayers; ++index)
-    sampled.push_back(layers_[index * (layers_.size() - 1) / (kSampledLayers - 1)]);
-  constexpr uint32_t kRows = AneFfn::kMaximumRows, kCount = kSampledLayers - 1;
   Timings timings;
-  timings.gpuAlone = layer(sampled, kCount, kRows);
-  const auto measure = [&](double share) {
-    const uint32_t aneUnits = nearestUnits(share, units);
-    AneFfn split(backend_, linear_, sampled, aneUnits, interrupted_, std::array{kRows});
-    return Timing{static_cast<double>(aneUnits) / units, gpuPart(sampled, split),
-                  layer(sampled, kCount, kRows, &split, timings.gpuAlone)};
-  };
-  timings.low = measure(kTimedShares[0]);
-  timings.high = measure(kTimedShares[1]);
+  timings.gpuAlone = layer(sampled(), kSampledLayers - 1, AneFfn::kMaximumRows);
+  timings.low = time(nearestUnits(kTimedShares[0], units), timings.gpuAlone);
+  timings.high = time(nearestUnits(kTimedShares[1], units), timings.gpuAlone);
   return timings;
+}
+
+Timing Measurement::time(uint32_t aneUnits, double gpuAlone) {
+  const std::vector<SwiGluProjections> layers = sampled();
+  constexpr uint32_t kRows = AneFfn::kMaximumRows;
+  AneFfn split(backend_, linear_, layers, aneUnits, interrupted_, std::array{kRows});
+  return Timing{static_cast<double>(aneUnits) / AneFfn::units(layers_), gpuPart(layers, split),
+                layer(layers, kSampledLayers - 1, kRows, &split, gpuAlone)};
 }
 
 ChunkTimings Measurement::chunks(AneFfn &split) {

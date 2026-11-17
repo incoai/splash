@@ -1519,6 +1519,13 @@ AneFfnModel aneFfnModel(metal::MetalBackend &backend, const model::LoadedModel &
     });
     return timings;
   };
+  model.timeAt = [&backend, &linear, layers, cancelled, onArena](uint32_t aneUnits, double gpuAlone) {
+    ops::ane_ffn::Timing timing;
+    onArena([&](const ops::PrefillFfnBuffers &ffn, const std::array<metal::MetalBuffer, 2> &hidden) {
+      timing = ops::ane_ffn::Measurement(backend, linear, *layers, ffn, hidden, cancelled).time(aneUnits, gpuAlone);
+    });
+    return timing;
+  };
   model.prepare = [&backend, &linear, layers, cancelled, onArena](uint32_t aneUnits, bool timeChunks) {
     AneFfnPrepared prepared;
     onArena([&](const ops::PrefillFfnBuffers &ffn, const std::array<metal::MetalBuffer, 2> &hidden) {

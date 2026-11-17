@@ -30,6 +30,7 @@ using namespace splash::engine;
 using Kind = AneFfnOutcome::Kind;
 using splash::ops::ane_ffn::Calibration;
 using splash::ops::ane_ffn::ChunkTimings;
+using splash::ops::ane_ffn::Timing;
 using splash::ops::ane_ffn::Timings;
 using splash::test::rejects;
 using splash::test::require;
@@ -94,6 +95,9 @@ struct Fake {
   std::optional<std::string> unavailable;
   uint64_t unitBytes = 256 * kMiB;
   std::function<Timings()> time = measured;
+  // The split's full chunk at the units calibration first chooses, timed on the layers time() timed: by default as
+  // the first layers' chunks below time it.
+  std::function<double(uint32_t)> timeAt = [](uint32_t) { return 15.5; };
   std::function<AneFfnPrepared(uint32_t, bool)> prepare = [](uint32_t, bool timed) {
     AneFfnPrepared prepared;
     if (timed) prepared.chunks = timedChunks(15.5);
@@ -105,9 +109,10 @@ struct Fake {
   std::optional<Calibration> stored, remembered;
   std::optional<uint32_t> recalled, rememberedMost;
   bool healthy = true;
-  // The calls the start made: of unavailable() and time(), and of prepare() with its arguments, the last and the units
-  // of each.
+  // The calls the start made: of unavailable() and time(), the units of timeAt()'s, and of prepare() with its
+  // arguments, the last and the units of each.
   uint32_t asked = 0, timings = 0;
+  std::vector<uint32_t> timedUnits;
   std::optional<std::pair<uint32_t, bool>> prepared;
   std::vector<uint32_t> preparedUnits;
 
@@ -133,6 +138,11 @@ struct Fake {
     result.time = [this] {
       ++timings;
       return time();
+    };
+    result.timeAt = [this](uint32_t aneUnits, double gpuAlone) {
+      if (gpuAlone != time().gpuAlone) throw std::logic_error("a split was timed against another GPU alone");
+      timedUnits.push_back(aneUnits);
+      return Timing{aneUnits / 34.0, 0.0, timeAt(aneUnits)};
     };
     result.prepare = [this](uint32_t aneUnits, bool timeChunks) {
       prepared = {aneUnits, timeChunks};
@@ -601,13 +611,16 @@ void testNoGain() {
           "a split of no chunk that gains split: " + started.log);
 }
 
-// The chosen split's chunks time its full chunk nearest T's least, which fits the bandwidth's term where the low share
-// could not: the M5 Max's timings choose 6 units, whose split layer of 13.84 ms chooses 7 (ane_ffn_calibration_test),
-// whose split is prepared, timed, served and remembered instead where it takes no chunk longer, and otherwise the
-// split of 6 serves, prepared again. One whose refitted model keeps its units is prepared once.
+// The chosen units' full chunk, timed nearest T's least as the fit's timings were and on their layers, fits the
+// bandwidth's term where the low share could not: the M5 Max's timings choose 6 units, whose split layer of 13.84 ms
+// chooses 7 (ane_ffn_calibration_test), whose split is prepared, timed, served and remembered instead where it takes
+// no chunk longer, and otherwise the split of 6 serves, prepared again. One whose refitted model keeps its units is
+// prepared once. The first layers' chunks do not refit: a model whose first layers' formats are slower, as mixed
+// quantizations' can be, would bias it.
 void testRefitMovesTheChoice() {
   Fake fake;
   fake.time = [] { return Timings{{14.0 / 34, 9.9673, 23.929}, {27.0 / 34, 4.7526, 46.034}, 15.834}; };
+  fake.timeAt = [](uint32_t) { return 13.84; };
   fake.prepare = [](uint32_t aneUnits, bool timed) {
     AneFfnPrepared prepared;
     if (timed) prepared.chunks = timedChunks(aneUnits == 6 ? 13.84 : 13.55);
@@ -615,7 +628,7 @@ void testRefitMovesTheChoice() {
     return prepared;
   };
   Started started = start(fake);
-  require(started.start.outcome.kind == Kind::Split && fake.timings == 1 &&
+  require(started.start.outcome.kind == Kind::Split && fake.timings == 1 && fake.timedUnits == std::vector{6u} &&
               fake.preparedUnits == std::vector{6u, 7u} && fake.prepared == std::pair(7u, true) &&
               fake.remembered && fake.remembered->aneUnits == 7 && fake.remembered->minimumRows == 553 &&
               started.start.plan && started.start.plan->breakdown().aneFfnBytes == fake.bytes(7) &&
@@ -626,6 +639,7 @@ void testRefitMovesTheChoice() {
   // split of six serves, prepared again.
   fake = {};
   fake.time = [] { return Timings{{14.0 / 34, 9.9673, 23.929}, {27.0 / 34, 4.7526, 46.034}, 15.834}; };
+  fake.timeAt = [](uint32_t) { return 13.84; };
   fake.prepare = [](uint32_t aneUnits, bool timed) {
     AneFfnPrepared prepared;
     if (timed) {
@@ -645,10 +659,45 @@ void testRefitMovesTheChoice() {
   fake.preparedUnits.clear();
   fake.stored.reset();
   fake.time = measured;
+  fake.timeAt = [](uint32_t) { return 15.5; };
   started = start(fake);
   require(started.start.outcome.kind == Kind::Split && fake.preparedUnits == std::vector{8u} &&
               fake.remembered && fake.remembered->aneUnits == 8,
           "a choice its refitted model keeps was prepared again");
+  // Six units' full chunk takes 13.84 ms over the first layers, which would choose 7, but 13.19 over the fit's, which
+  // keeps 6; and the other way about, 7, whose full chunk takes 13.0 ms.
+  for (const bool fitLayersMove : {false, true}) {
+    fake = {};
+    fake.time = [] { return Timings{{14.0 / 34, 9.9673, 23.929}, {27.0 / 34, 4.7526, 46.034}, 15.834}; };
+    fake.timeAt = [=](uint32_t) { return fitLayersMove ? 13.84 : 13.19; };
+    fake.prepare = [=](uint32_t aneUnits, bool timed) {
+      AneFfnPrepared prepared;
+      if (timed) prepared.chunks = timedChunks(aneUnits == 6 ? (fitLayersMove ? 13.19 : 13.84) : 13.0);
+      prepared.error = 0.025;
+      return prepared;
+    };
+    started = start(fake);
+    require(started.start.outcome.kind == Kind::Split &&
+                fake.preparedUnits == (fitLayersMove ? std::vector{6u, 7u} : std::vector{6u}) && fake.remembered &&
+                fake.remembered->aneUnits == (fitLayersMove ? 7u : 6u),
+            "the first layers' chunks, not the split timed on the fit's layers, refitted the choice: " + started.log);
+  }
+  // A refit whose split cannot be timed leaves the first units, whose split is prepared, served and remembered.
+  fake = {};
+  fake.time = [] { return Timings{{14.0 / 34, 9.9673, 23.929}, {27.0 / 34, 4.7526, 46.034}, 15.834}; };
+  fake.timeAt = [](uint32_t) -> double { throw std::runtime_error("the Neural Engine refused the program"); };
+  fake.prepare = [](uint32_t, bool timed) {
+    AneFfnPrepared prepared;
+    if (timed) prepared.chunks = timedChunks(13.84);
+    prepared.error = 0.025;
+    return prepared;
+  };
+  started = start(fake);
+  require(started.start.outcome.kind == Kind::Split && fake.preparedUnits == std::vector{6u} && fake.remembered &&
+              fake.remembered->aneUnits == 6 &&
+              has(started.log, "refitted share was not found (the Neural Engine refused the program); its first "
+                               "share serves"),
+          "a refit whose split could not be timed did not leave the first units to serve: " + started.log);
 }
 
 // A refitted split that cannot be prepared leaves the first, which was: the M5 Max's timings choose 6 units and then
@@ -660,6 +709,7 @@ void testARefittedSplitThatFailsKeepsTheFirst() {
   const auto timings = [] { return Timings{{14.0 / 34, 9.9673, 23.929}, {27.0 / 34, 4.7526, 46.034}, 15.834}; };
   Fake fake;
   fake.time = timings;
+  fake.timeAt = [](uint32_t) { return 13.84; };
   fake.prepare = [](uint32_t aneUnits, bool timed) {
     if (aneUnits == 7) throw std::runtime_error("the Neural Engine refused the program of 7 units");
     AneFfnPrepared prepared;
@@ -679,6 +729,7 @@ void testARefittedSplitThatFailsKeepsTheFirst() {
           "a refitted split that failed to prepare did not leave the first to serve: " + started.log);
   fake = {};
   fake.time = timings;
+  fake.timeAt = [](uint32_t) { return 13.84; };
   fake.prepare = [&](uint32_t aneUnits, bool timed) {
     if (aneUnits == 7) {
       fake.healthy = false;
@@ -692,6 +743,7 @@ void testARefittedSplitThatFailsKeepsTheFirst() {
           "a start went on past a refitted split's failure on a backend that stopped");
   fake = {};
   fake.time = timings;
+  fake.timeAt = [](uint32_t) { return 13.84; };
   bool cancelled = false;
   fake.prepare = [&](uint32_t aneUnits, bool timed) {
     if (aneUnits == 7) {
