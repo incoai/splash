@@ -1886,13 +1886,20 @@ again, on Qwen3.8-Flash-Next a pass of the routed experts, which stream, and 14
 cuts made a 237K-token prompt past the memory wall 8% slower to its first token.
 
 The resume point is the newest ordinary state in RAM (`StateCache::resumePoint`),
-the one a conversation's next turn most likely resumes from. A claim of no
-certain reuse passes over it; one with it takes it in its recency order, and
-so does the host's pass under critical pressure. Every state a reclaim takes
-from RAM, but a reply's opportunistic state (below), is written to the SSD cache
-first while the tier takes the write, so a resume point that goes keeps its SSD
-copy: its next turn starts with a
-restore read rather than a prefill.
+the one a conversation's next turn most likely resumes from; the chains queued
+requests will restore are of certain reuse too. Only the KV of the lanes in
+service is never taken: every other claim takes certain reuse in its recency
+order, starts and the host's pass among them, but a pool's growth, which takes
+none, and optional work, which takes the resume point alone. That is vLLM's
+rule, whose cached blocks no running request references stay in its free queue
+and go in LRU order as blocks are allocated, and SGLang's, whose radix cache
+locks only running requests' paths and evicts unlocked leaves; kept from starts
+and the host's pass, queued chains made sessions arriving together take turns
+(#758). Every state a reclaim takes from RAM, but a reply's opportunistic state
+(below), is written to the SSD cache first while the tier takes the write, with
+the KV it restores through, so a resume point or a queued chain that goes keeps
+its SSD copy: its turn starts with a restore read rather than a prefill. With
+no SSD cache it is dropped and prefilled again, as in vLLM.
 
 The engine's own optional work (the Index runway's refill with no Spill lane in
 service, trims with no lane in service) takes no unit at all: its rights are the

@@ -1267,8 +1267,9 @@ void testAWaitingClaimDemotesAWholeChainRunAtOnce() {
   cache.checkInvariants();
 }
 
-// Certain reuse per claim class: Start and Optional take the resume point but never a
-// queued chain; Growth takes neither; InService takes them oldest first.
+// Certain reuse per claim class: Optional takes the resume point but never a queued chain;
+// Growth takes neither; Start and InService take them oldest first, as vLLM and SGLang
+// evict any block no running request holds.
 void testCertainReuseByClass() {
   struct Case final {
     ClaimSpec spec;
@@ -1276,7 +1277,7 @@ void testCertainReuseByClass() {
     bool keepsQueued;
     bool keepsResumePoint;
   };
-  for (const Case each : {Case{{.cls = ClaimClass::Start}, true, true, false},
+  for (const Case each : {Case{{.cls = ClaimClass::Start}, true, false, true},
                           Case{{.cls = ClaimClass::Optional, .requestId = 1, .timing = NeedTiming::Immediate}, true, true, false},
                           Case{{.cls = ClaimClass::Growth, .timing = NeedTiming::Immediate}, false, true, true},
                           Case{{.cls = ClaimClass::InService}, true, false, true}}) {
@@ -5753,8 +5754,8 @@ void testPeekHasNoSideEffects() {
   require(units && observe() == before, "the walk changed the cache");
 }
 
-// The resume point and wanted chains come in their place to in-service work, the resume point alone
-// to a start; Growth and a host below Critical are never offered them.
+// The resume point and wanted chains come in their place to in-service work, a start and the host,
+// as vLLM and SGLang evict any block no running request holds; Growth is never offered them.
 void testResumePointAndWantedChainsAreCertainReuse() {
   test::TestKvStorage storage{16, 100, 1};
   KvPool pool{storage, 16};
@@ -5786,16 +5787,16 @@ void testResumePointAndWantedChainsAreCertainReuse() {
     return units;
   };
   // Prompt 1's state (wanted), prompt 2's and prompt 3's (the resume point).
-  require(offered(ClaimClass::InService, {.stateBuffers = 1}).first == 3,
-          "in-service work was not offered the resume point and the wanted chain's state");
-  require(offered(ClaimClass::Start, {.stateBuffers = 1}).first == 2,
-          "a start was not offered the resume point alone of certain reuse");
-  // Growth and a host pass short of critical pressure leave them: a page
-  // need's units free prompt 2's pages alone, its state and then its
-  // leaves, and a device need's units every extent but theirs.
-  for (const ClaimClass cls : {ClaimClass::Host, ClaimClass::Growth})
-    require(offered(cls, {.stateBuffers = 1}).first == 1 && offered(cls, {.pages = 1}).second == 2,
-            "a claim that may take nothing of certain reuse was offered some, or not the rest");
+  for (const ClaimClass cls : {ClaimClass::InService, ClaimClass::Start, ClaimClass::Host})
+    require(offered(cls, {.stateBuffers = 1}).first == 3,
+            "a claim of class " + std::to_string(static_cast<int>(cls)) +
+                " was not offered the resume point and the wanted chain's state");
+  // Growth leaves them: a page need's units free prompt 2's pages alone,
+  // its state and then its leaves, and a device need's units every extent
+  // but theirs.
+  require(offered(ClaimClass::Growth, {.stateBuffers = 1}).first == 1 &&
+              offered(ClaimClass::Growth, {.pages = 1}).second == 2,
+          "growth was offered certain reuse, or not the rest");
   const ClaimSpec growth{.cls = ClaimClass::Growth, .timing = NeedTiming::Immediate};
   require(test::freeFromCache(cache, growth, {.pages = 2}).outcome == FreeOutcome::Met,
           "growth did not take what is not of certain reuse");

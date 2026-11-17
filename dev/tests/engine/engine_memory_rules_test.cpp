@@ -435,6 +435,82 @@ void testAHostRefusedStartIsFreedForByThePass() {
               std::to_string(harness.governor->ledger().hostRefusedWaitingBytes()));
 }
 
+// A start the pool's limit leaves no page beside a lane in service takes a queued request's chain, as vLLM and
+// SGLang evict any block no running request holds: written to the SSD cache first, from which that request later
+// restores it without its prefill, or, with no tier, dropped and prefilled again. The lane in service keeps its KV.
+void testAStartTakesAQueuedChainItsRequestRestoresLater() {
+  for (const bool tiered : {true, false}) {
+    test::TestKvStorage storage(64, 4096, 4);
+    KvPool pool(storage, 0);
+    test::TestKvTier tier;
+    tier.capacity = 256;
+    tier.transferLimit = 8;
+    engine::Cache cache(pool, tiered ? &tier : nullptr, tiered ? test::ampleDiskBudget() : nullptr);
+    Executor executor;
+    if (tiered) {
+      executor.keptTier = std::make_shared<test::OffloadControl>();
+      executor.keptTier->ready = true;
+    }
+    Events events;
+    engine::Engine engine(test::engineConfig(), cache, executor, events);
+    guardReleases(storage, engine);
+    double now = 1;
+    // Ticks, with the control pass's landings between commands: they mark the chains queued requests restore
+    // (Cache::setWantedChains).
+    const auto step = [&] {
+      if (!engine.commandInFlight())
+        engine.collectLandings(now);
+      static_cast<void>(engine.tick(now++));
+      tier.complete();
+      if (executor.restoreControl)
+        executor.restoreControl->ready = true;
+    };
+    const auto run = [&](const std::function<bool()> &done, const char *what) {
+      for (int each = 0; each < 20'000 && !done(); ++each)
+        step();
+      require(done(), what);
+    };
+    // The chain the queued request restores: 32 pages, its replay point at 512.
+    const std::vector<uint32_t> chain(513, 5);
+    engine.submit(request(10, chain));
+    run([&] { return idle(engine); }, "the chain's request did not finish");
+    // The lane in service, resident while it waits for its mask; then the pool's limit at what it holds.
+    engine.submit(maskedForeground(1, std::vector<uint32_t>(64, 1)));
+    run([&] { return events.maskRequests.size() == 1; }, "the lane did not wait for its mask");
+    // A newer resume point, a page, which a start took before: the chain is the queued request's alone.
+    engine.submit(request(11, std::vector<uint32_t>(17, 7)));
+    run([&] { return events.usage.contains(11); }, "the newer resume point's request did not finish");
+    storage.budgetPages = static_cast<uint32_t>(storage.allocatedBytes() / 4096);
+    // A start the limit holds only without the chain, and the request whose chain it is, queued below the
+    // Foreground lanes.
+    EngineRequest start = request(3, std::vector<uint32_t>(129, 3));
+    start.priority = RequestPriority::Foreground;
+    start.deadlineMilliseconds = 1e9;
+    engine.submit(std::move(start));
+    std::vector<uint32_t> next = chain;
+    next.push_back(6);
+    EngineRequest queued = request(2, next);
+    queued.priority = RequestPriority::Background;
+    queued.deadlineMilliseconds = 1e9;
+    engine.submit(std::move(queued));
+    for (int each = 0; each < 5'000 && !events.outputs.contains(3); ++each)
+      step();
+    require(events.outputs.contains(3) && !events.usage.contains(1) && executor.suspensions == 0,
+            std::string(tiered ? "with" : "without") +
+                " the SSD cache, a start beside a lane in service did not take a queued chain, or took the lane's KV");
+    require(!tiered || !tier.writes.empty(), "the chain was not written to the SSD cache before it went");
+    // The lane ends and the limit lifts: the queued request starts.
+    storage.budgetPages = std::numeric_limits<uint32_t>::max();
+    engine.cancel(1);
+    run([&] { return idle(engine); }, "the requests did not finish");
+    const auto at = std::ranges::find(events.startIds, 2);
+    require(at != events.startIds.end() &&
+                events.starts[static_cast<size_t>(at - events.startIds.begin())] == (tiered ? 512u : 0u),
+            std::string("the queued request ") +
+                (tiered ? "did not restore its chain from the SSD cache" : "did not prefill its dropped chain again"));
+  }
+}
+
 // A request that has not started ranks by the work its start restores: a cold start neither outranks a lane in
 // prefill of its priority nor holds room that lane waits for.
 void testAStartRanksByTheWorkItHolds() {
@@ -1313,6 +1389,7 @@ std::span<const test::TestCase> rulesTests() {
       {"testACancelBetweenPassesBesideItsOwnPrioritysDecodeKeepsThePasses",
        testACancelBetweenPassesBesideItsOwnPrioritysDecodeKeepsThePasses},
       {"testAHostRefusedStartIsFreedForByThePass", testAHostRefusedStartIsFreedForByThePass},
+      {"testAStartTakesAQueuedChainItsRequestRestoresLater", testAStartTakesAQueuedChainItsRequestRestoresLater},
       {"testAStartRanksByTheWorkItHolds", testAStartRanksByTheWorkItHolds},
       {"testCopiesAheadForRegrowthStayWithinAUnit", testCopiesAheadForRegrowthStayWithinAUnit},
       {"testALaneAPlanLeavesOutWaitsForItsCommandNotOnItsClaim",

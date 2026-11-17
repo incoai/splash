@@ -5373,8 +5373,9 @@ void testResumedLaneKeepsThePromptReplayPoint() {
   require(resources.snapshot().stateCache.checkpointEntries == 0 &&
               resources.probe(history, {}).cachedTokens() == 32,
           "the history's point outlasted the prompt's");
-  // A shrink that keeps the resume point keeps the prompt's point.
-  while (test::takeStep(resources, {.cls = ClaimClass::Host}, {.bytes = 1}).gave()) {
+  // A shrink that keeps the resume point, a pool's growth's, keeps the
+  // prompt's point.
+  while (test::takeStep(resources, {.cls = ClaimClass::Growth}, {.bytes = 1}).gave()) {
   }
   // The next turn keeps the text before the generation prompt.
   std::vector<uint32_t> next(35, static_cast<uint32_t>(id));
