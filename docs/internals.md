@@ -1413,7 +1413,9 @@ layers, whose formats a mixed quantization can make other than the rest's,
 which would bias u); where that fit chooses other units, their split is prepared
 and timed in turn, and serves if it splits every chunk the first splits, none
 of them more than 2% longer, the first otherwise, as where the refit's split
-cannot be timed or the other split prepared: the refit took Qwen3.8-27B
+cannot be timed or the other split prepared (a first split that does not
+prepare again leaves that start the GPU alone and the calibration of the first
+units remembered for the next): the refit took Qwen3.8-27B
 UD-Q4_K_M from 9 of its 34 units to 10
 on an M5 Max, whose full chunk prefilled 1.5-2.0% faster but which split
 chunks from 780 rows against 575, so that chunks of 640 and 672 rows ran 12%

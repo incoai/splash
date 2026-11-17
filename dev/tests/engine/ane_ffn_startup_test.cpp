@@ -758,6 +758,39 @@ void testARefittedSplitThatFailsKeepsTheFirst() {
           "a cancelled start went on past a refitted split's failure");
 }
 
+// A first split that does not prepare again after the refitted one lost leaves the GPU alone to this start, its
+// context the calibration's, and the calibration of the first units remembered, which the next start sets up: the
+// M5 Max's timings choose 6 units and then 7, whose 640-row function takes 6.0 ms (testRefitMovesTheChoice), and the
+// Neural Engine refuses the program of 6 the second time. It ended the start with the GPU alone and nothing
+// remembered, so that every later start calibrated again.
+void testAFirstSplitThatDoesNotPrepareAgainIsRemembered() {
+  Fake fake;
+  fake.time = [] { return Timings{{14.0 / 34, 9.9673, 23.929}, {27.0 / 34, 4.7526, 46.034}, 15.834}; };
+  fake.timeAt = [](uint32_t) { return 13.84; };
+  uint32_t preparedSix = 0;
+  fake.prepare = [&](uint32_t aneUnits, bool timed) {
+    if (aneUnits == 6 && ++preparedSix == 2) throw std::runtime_error("the Neural Engine refused the program of 6 units");
+    AneFfnPrepared prepared;
+    if (timed) {
+      prepared.chunks = timedChunks(aneUnits == 6 ? 13.84 : 13.55);
+      if (aneUnits == 7) prepared.chunks.functions[11].split = 6.0;
+    }
+    prepared.error = 0.025;
+    return prepared;
+  };
+  Started started = start(fake);
+  require(started.start.outcome.kind == Kind::Unavailable && !started.start.split && !started.start.plan &&
+              fake.preparedUnits == std::vector{6u, 7u, 6u} && fake.remembered && fake.remembered->aneUnits == 6 &&
+              fake.remembered->minimumRows == 553 && started.start.outcome.context == contextWith(fake.bytes(6)) &&
+              has(started.log, "its calibrated share's split was not prepared again: the Neural Engine refused the "
+                               "program of 6 units; the next start sets it up as calibrated"),
+          "a first split that did not prepare again left nothing remembered: " + started.log);
+  started = start(fake);
+  require(started.start.outcome.kind == Kind::Split && fake.timings == 1 && fake.prepared == std::pair(6u, false) &&
+              has(started.log, "set up as calibrated before"),
+          "the next start did not set up the remembered first units: " + started.log);
+}
+
 // A start takes this Mac's calibration once remembered: it neither times nor remembers, prepares the remembered units
 // untimed with the remembered least chunk, and says so; a remembered calibration of no split leaves the GPU alone at
 // once. One of more units than the plan holds, or of least rows no function holds, is calibrated again.
@@ -839,6 +872,7 @@ int main() {
     testNoGain();
     testRefitMovesTheChoice();
     testARefittedSplitThatFailsKeepsTheFirst();
+    testAFirstSplitThatDoesNotPrepareAgainIsRemembered();
     testRemembered();
     testGivenShare();
     std::cout << "ane ffn startup tests passed\n";
