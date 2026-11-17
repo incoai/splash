@@ -252,9 +252,12 @@ struct ChatContextFlowTests {
     }
 
     /// Stop while the server holds a new chat's first message gives the message back to edit: the
-    /// composer holds it as it did, with nothing to say, and no chat was kept. Another chat opened
-    /// while the server holds the message stays open as the server takes it, the composer empty
-    /// then, the message being the new chat's.
+    /// composer holds it as it did, with nothing to say, and no chat was kept. The composer holds
+    /// it under another chat opened meanwhile too, Stop in Send's place there, which brings the
+    /// message back to the new chat, open again. Another chat opened while the server holds the
+    /// message stays open as the server takes it, the composer empty then, the message being the
+    /// new chat's. Under the other chat, the composer held the message under a Send that did
+    /// nothing, and Escape did nothing either: Stop was the new chat's alone.
     @Test func aFirstMessageHeldIsStoppedOrTakenWhereverTheWindowIs() async throws {
         try await withServer { fixture in
             let state = fixture.state
@@ -274,7 +277,15 @@ struct ChatContextFlowTests {
             state.sendDraft()
             try await waitFor(state.chats.streaming != nil, "the message sent again")
             state.chats.selection = fixture.history.id
-            #expect(Composed(state.draft) == before && !state.chats.answering && !state.canSendDraft)
+            #expect(Composed(state.draft) == before && state.chats.answering && !state.canSendDraft)
+            state.chats.stop()
+            try await waitFor(state.chats.streaming == nil, "the stop under the other chat")
+            #expect(state.chats.selection == nil && Composed(state.draft) == before && state.canSendDraft)
+            #expect(try fixture.written() == [fixture.history.id])
+
+            state.sendDraft()
+            try await waitFor(state.chats.streaming != nil, "the message sent once more")
+            state.chats.selection = fixture.history.id
             try fixture.release()
             try await waitFor(state.chats.streaming == nil, "the reply")
             #expect(state.draft.isEmpty && state.chats.selection == fixture.history.id)

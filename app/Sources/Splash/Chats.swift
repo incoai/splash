@@ -157,15 +157,17 @@ final class ChatStore {
     /// which is none of those kept until the server takes its first message.
     var streaming: UUID? { reply?.conversation }
 
-    /// Whether the request under way is the open chat's, which Stop then stops: its reply streams
-    /// in the open conversation, or the server has yet to take the first message of the new chat.
+    /// Whether the composer's Stop stops the request under way: its reply streams in the open
+    /// conversation, or the server has yet to take a new chat's first message, which the composer
+    /// holds whichever chat is open (`sendingFirstMessage`). Stopped under another chat, the
+    /// message comes back to the new chat, which opens (`stream`).
     var answering: Bool {
         guard let reply else { return false }
-        return pending?.ask == .first ? selection == nil : reply.conversation == selection
+        return pending?.ask == .first || reply.conversation == selection
     }
 
     /// Whether the server has yet to take a new chat's first message: the composer holds the
-    /// message meanwhile, as it was sent.
+    /// message meanwhile, as it was sent, whichever chat is open, Stop in Send's place.
     var sendingFirstMessage: Bool { pending?.ask == .first }
 
     private let folder: URL

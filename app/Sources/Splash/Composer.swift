@@ -293,7 +293,7 @@ struct Composer: View {
         let notice: Draft.Notice?
     }
 
-    /// Whether the open chat's request is under way, which Stop stops.
+    /// Whether a request is under way that Stop stops here (`ChatStore.answering`).
     private var streaming: Bool { state.chats.answering }
 
     private var help: String {
