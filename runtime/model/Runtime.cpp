@@ -1980,6 +1980,39 @@ struct Runtime::Impl {
     if (!graph.dispatches().empty()) backend.preparePipelines(graph.dispatches());
   }
 
+  // Creates the pipelines of a prompt chunk of `rows` rows of `entry` after
+  // the longest history the target serves before them, without running it
+  // (Runtime::warmupPrefill), its FFN on the GPU, as every chunk's once the
+  // Neural Engine's split stopped. The chunk's inputs are written for that
+  // history; the next prompt writes its own.
+  void prepareLongestPrefill(const Request &entry, uint32_t rows) {
+    const uint32_t context = geometry.target.contextTokens(), history = context - rows;
+    const std::vector<uint32_t> tokens(context);
+    const std::vector<uint32_t> pages((context + kv::kPageTokens - 1) / kv::kPageTokens);
+    const LaneTables tables = laneTables(entry.stateLane);
+    const GdnParityBuffers &in = states.current(entry.stateLane), &out = states.next(entry.stateLane);
+    QwenTargetRequest request = targetRequest(entry);
+    request.tokens = tokens;
+    const QwenTargetPrefillSequence sequence{.rows = rows,
+                                             .tokens = std::span(tokens).subspan(history),
+                                             .request = std::move(request),
+                                             .chunk = chunkParams(history, rows, pages),
+                                             .pageTable = tables.pages,
+                                             .indexTable = tables.index,
+                                             .convolutionIn = in.convolutionLayers,
+                                             .convolutionOut = out.convolutionLayers,
+                                             .recurrentIn = in.recurrentLayers,
+                                             .recurrentOut = out.recurrentLayers,
+                                             .auxiliaryIn = in.auxiliary,
+                                             .auxiliaryOut = out.auxiliary};
+    const QwenTargetPrefillChunk chunk{prefillBuffers(*prefillArena, 0), std::span(&sequence, 1), rows, nullptr};
+    CommandGraph graph;
+    SpilledKvReads reads;
+    static_cast<void>(targetModel->addPrefill(graph, std::span(&chunk, 1), kvPages, reads,
+                                              {0, geometry.target.layers}, nullptr));
+    backend.preparePipelines(graph.dispatches());
+  }
+
   // Creates the pipelines of the decode steps of `entries` of every class
   // and lane cap, each lane after the longest history the target serves
   // before a lane's most rows, without running them
@@ -4229,6 +4262,14 @@ WarmupStepResult Runtime::warmupPrefill(uint32_t rows) {
     // warmup also creates, without running them, what such a capture runs
     // on its lane and the codec.
     impl_->prepareInsideCapture(0);
+    // A chunk's kernels follow its history, as a verify's do, and this one's
+    // has none: past 2,048 tokens Flash-Next's indexer selects a prompt's
+    // blocks by kernels a verify does not run (its rows select by their
+    // paths'), and its first longer prompt created block_indexer_score and
+    // block_indexer_select while serving (0.14 ms each on the 64 GB M5 Pro).
+    // So each prefill warmup also creates the pipelines of its chunk after the
+    // longest history.
+    impl_->prepareLongestPrefill(impl_->request(id), rows);
     end(id);
   } catch (...) {
     end(id);

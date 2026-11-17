@@ -16,6 +16,7 @@
 #include "TestChecks.hpp"
 #include "model/ModelDescriptor.hpp"
 #include "ops/AneFfn.hpp"
+#include "ops/BlockIndexer.hpp"
 #include "ops/ExecutionPlans.hpp"
 #include "ops/KernelSelection.hpp"
 #include "ops/LaneRows.hpp"
@@ -704,12 +705,17 @@ void int8ActivationsOff() {
 
 // The rows and history of the first prefill chunk, of 1 to 2048 rows after
 // each of `histories`, whose `select(rows, history)` no warmup chunk's is (a
-// chunk of each of `warm` rows, from no history); nothing when there is none.
+// chunk of each of `warm` rows, from no history and, of a target that serves
+// `context` tokens, after the longest history before it); nothing when there
+// is none.
 template <class Select>
-std::optional<std::pair<uint32_t, uint32_t>> unwarmed(std::span<const uint32_t> warm,
+std::optional<std::pair<uint32_t, uint32_t>> unwarmed(std::span<const uint32_t> warm, uint32_t context,
                                                       std::span<const uint32_t> histories, const Select &select) {
   std::set<decltype(select(1U, 0U))> warmed;
-  for (const uint32_t rows : warm) warmed.insert(select(rows, 0U));
+  for (const uint32_t rows : warm) {
+    warmed.insert(select(rows, 0U));
+    if (context >= rows) warmed.insert(select(rows, context - rows));
+  }
   for (uint32_t rows = 1; rows <= SPLASH_PREFILL_TOKEN_BUDGET; ++rows)
     for (const uint32_t history : histories)
       if (!warmed.contains(select(rows, history))) return std::pair{rows, history};
@@ -718,24 +724,29 @@ std::optional<std::pair<uint32_t, uint32_t>> unwarmed(std::span<const uint32_t> 
 
 // Startup warmup runs a prefill chunk of the fewest rows of each class
 // (ExecutionPlans::prefillRowClasses) and one of the most, from no history,
-// and a chunk whose plans none of them selects creates its kernels while its
-// request waits: 19 s for the 27B's cold 17-row chunk on a 16-core Apple9
-// plan. So every plan a chunk of 1 to 2048 rows selects is a warmup chunk's:
-// its projections' tile and staged height, whole and of its one read row
-// (Linear::plan), with the Neural Engine split from any of its least
-// rows or without it; its float tiles; its MoE blocks' expert and router
-// tiles; and after each of kAttentionHistories, its attention's kernels. Adds each
-// that is not to `misses`. It checks one matrix shape and the columns of
-// kFloatColumns; the other kernels a chunk's rows pick, the staged norm and
-// the hyper-connection norm's quarters (single thresholds today, whose sides
-// the chunks of one row and of the most take) and those of GDN, the draft and
-// vision, only the backend's count of pipelines created while serving checks.
+// and creates the kernels of each after the longest history the target
+// serves before it (Runtime::warmupPrefill); a chunk whose plans none of them
+// selects creates its kernels while its request waits: 19 s for the 27B's
+// cold 17-row chunk on a 16-core Apple9 plan. So every plan a chunk of 1 to
+// 2048 rows selects is a warmup chunk's: its projections' tile and staged
+// height, whole and of its one read row (Linear::plan), with the Neural
+// Engine split from any of its least rows or without it; its float tiles; its
+// MoE blocks' expert and router tiles; and after each of kAttentionHistories,
+// its attention's kernels and whether its block indexer selects its rows'
+// blocks (BlockIndexer::sparse: Flash-Next's prompt past 2,048 tokens, whose
+// kernels a verify does not run). Adds each that is not to `misses`. It
+// checks one matrix shape and the columns of kFloatColumns; the other kernels
+// a chunk's rows pick, the staged norm and the hyper-connection norm's
+// quarters (single thresholds today, whose sides the chunks of one row and of
+// the most take) and those of GDN, the draft and vision, only the backend's
+// count of pipelines created while serving checks.
 void warmupCovers(const std::string &name, const ExecutionPlans &plans, std::vector<std::string> &misses) {
   std::vector<uint32_t> warm = plans.prefillRowClasses();
   warm.push_back(SPLASH_PREFILL_TOKEN_BUDGET);
   constexpr uint32_t noHistory[] = {0};
-  const auto check = [&](const std::string &what, std::span<const uint32_t> histories, const auto &select) {
-    if (const auto chunk = unwarmed(warm, histories, select))
+  const auto check = [&](const std::string &what, std::span<const uint32_t> histories, const auto &select,
+                         uint32_t context = 0) {
+    if (const auto chunk = unwarmed(warm, context, histories, select))
       misses.push_back(name + " " + what + ": no warmup chunk selects the plan of " + std::to_string(chunk->first) +
                        " rows after " + std::to_string(chunk->second) + " tokens");
   };
@@ -806,6 +817,10 @@ void warmupCovers(const std::string &name, const ExecutionPlans &plans, std::vec
                 return plan.splitPipeline() + " " + plan.reducePipeline();
               });
     }
+    if (const uint32_t top = family.indexerTopBlocks)
+      check("block indexer " + f, kAttentionHistories,
+            [&](uint32_t rows, uint32_t history) { return BlockIndexer::sparse(history, rows, top); },
+            family.nativeContextTokens);
   });
 }
 
