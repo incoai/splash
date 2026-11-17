@@ -23,7 +23,7 @@ from dev.tests.server_fixtures import (
     Plan,
     chat_body,
 )
-from server import connections, document_worker, serve_options
+from server import connections, document_worker, serve_options, unix_socket
 from server import server as api
 
 
@@ -1072,6 +1072,65 @@ class UnixSocketTests(HarnessTestCase):
         )
         self.assertFalse(os.path.lexists(target))
         self.assertFalse(os.path.lexists(self.path))
+
+    def test_a_symbolic_link_put_at_the_path_before_the_bind_is_refused(self):
+        """bind follows a symbolic link put at the path after the start
+        looked there, as one can be in a directory others write to: the
+        start is refused after the bind, naming it, and its close leaves the
+        link (the server served at the socket bind left where the link
+        pointed, which its close, removing the link, left behind)."""
+        target, linked = self.path + ".elsewhere", self.path
+
+        class LinkedBeforeTheBind(socket.socket):
+            def bind(self, address):
+                os.symlink(target, linked)
+                super().bind(address)
+
+        claim = unix_socket.Claim(self.path)
+        with (
+            LinkedBeforeTheBind(socket.AF_UNIX) as listener,
+            self.assertRaises(OSError) as refused,
+        ):
+            claim.bind(listener)
+        claim.close()
+        self.assertEqual(
+            str(refused.exception),
+            f"[Errno 62] the socket's path is a symbolic link: {self.path!r}",
+        )
+        self.assertEqual(os.readlink(self.path), target)
+        # Where the link points, what bind made stays: a socket nothing serves.
+        self.assertTrue(stat.S_ISSOCK(os.lstat(target).st_mode))
+
+    def test_a_file_of_another_kind_is_not_asked_whose_it_is(self):
+        """A file at the path that is no socket stays, and the start is
+        refused as at an address in use, whatever a connection to it would
+        meet: one a sandbox refused before it read the file's kind, as
+        macOS's refuses a socket (EPERM), would have been removed as a
+        socket the sandbox keeps the server from asking. macOS's says no
+        socket (ENOTSOCK) to these, so a stand-in refuses here."""
+
+        class NotPermitted(socket.socket):
+            def connect_ex(self, address):
+                return errno.EPERM
+
+        for kind, make in (
+            ("regular", lambda: Path(self.path).write_text("kept")),
+            ("fifo", lambda: os.mkfifo(self.path)),
+        ):
+            make()
+            kept = os.lstat(self.path)
+            claim = unix_socket.Claim(self.path)
+            with (
+                self.subTest(kind=kind),
+                socket.socket(socket.AF_UNIX) as listener,
+                mock.patch.object(unix_socket.socket, "socket", NotPermitted),
+                self.assertRaises(OSError) as refused,
+            ):
+                claim.bind(listener)
+            claim.close()
+            self.assertEqual(refused.exception.errno, errno.EADDRINUSE)
+            self.assertEqual(os.lstat(self.path).st_ino, kept.st_ino)
+            os.unlink(self.path)
 
     @unittest.skipIf(os.geteuid() == 0, "root connects whatever a socket's mode says")
     def test_a_socket_this_user_may_not_connect_to_stays(self):

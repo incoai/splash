@@ -18,6 +18,7 @@ import errno
 import fcntl
 import os
 import socket
+import stat
 
 # How --host names a socket: unix:PATH.
 PREFIX = "unix:"
@@ -28,6 +29,11 @@ def path(host):
     if host.startswith(PREFIX):
         return host[len(PREFIX) :]
     return None
+
+
+def _symbolic_link(path):
+    """The refusal of a symbolic link at a socket's path."""
+    return OSError(errno.ELOOP, "the socket's path is a symbolic link", path)
 
 
 class Claim:
@@ -64,18 +70,26 @@ class Claim:
         stays, and the bind fails as on an address in use: a socket that
         accepts the connection is another program's listener, one whose
         permissions refuse this user (EACCES) is not this user's to remove,
-        and a file of another kind (ENOTSOCK) is no socket. A symbolic link
-        at the path is refused before any of it, by name: bind would follow
-        it and leave the socket where it points, which close, removing the
-        link, would not remove."""
-        if os.path.islink(self.path):
-            raise OSError(
-                errno.ELOOP, "the socket's path is a symbolic link", self.path
-            )
-        with socket.socket(socket.AF_UNIX) as probe:
-            if probe.connect_ex(self.path) in (errno.ECONNREFUSED, errno.EPERM):
-                os.unlink(self.path)
+        and a file of another kind is no socket, and is not asked, so that
+        no answer a sandbox gives removes it. A symbolic link at the path is
+        refused before any of it, by name: bind would follow it and leave
+        the socket where it points, which close, removing the link, would
+        not remove. bind follows one put at the path after that look too,
+        in a directory others write to: the start is then refused after the
+        bind, the socket left where the link points and served nowhere."""
+        try:
+            mode = os.lstat(self.path).st_mode
+        except FileNotFoundError:
+            mode = 0
+        if stat.S_ISLNK(mode):
+            raise _symbolic_link(self.path)
+        if stat.S_ISSOCK(mode):
+            with socket.socket(socket.AF_UNIX) as probe:
+                if probe.connect_ex(self.path) in (errno.ECONNREFUSED, errno.EPERM):
+                    os.unlink(self.path)
         listener.bind(self.path)
+        if os.path.islink(self.path):
+            raise _symbolic_link(self.path)
         self._bound = True
 
     def close(self):
