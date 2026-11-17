@@ -2766,14 +2766,17 @@ void requireConstrainedThinkingEndWaitsForItsMask(model::Runtime &executor) {
   std::cout << "constrained_thinking_budget=PASS\n";
 }
 
-// Under --verify-rows all a cycle verifies every row of a draft's block a
-// lane that its output limit leaves: a lane of 2 to 7 tokens left verifies
-// that many rows, drafting one fewer, as its tree holds no more rows than a
-// walk of it may retain (siblings at its depth filled a block of 8).
+// Under --verify-rows all a cycle's rows do not follow its output left, as
+// 1.6.2's did not: a lane of 2 to 7 tokens left verifies the draft's block a
+// lane of 64 left does, drafting 7, and emits the start of what that lane
+// emits, no more than it has left, so that an answer under a lower output
+// limit starts one under a higher.
 void requireCyclesVerifyTheirOutputLeft(model::Runtime &executor) {
   const std::vector<uint32_t> &prompt = targetTokens->thinkingPrompt;
   const std::vector<uint32_t> pages = pageRange(108, 4);
-  for (const uint32_t left : {2U, 3U, 5U, 7U}) {
+  constexpr uint32_t block = model::StepCosts::kNarrowCap;
+  std::vector<uint32_t> longer;
+  for (const uint32_t left : {64U, 2U, 3U, 5U, 7U}) {
     EngineRequest request = makeRequest(340 + left, prompt, left);
     request.flags = RequestIgnoreEndOfSequence;
     beginCold(executor, request, 0);
@@ -2781,9 +2784,16 @@ void requireCyclesVerifyTheirOutputLeft(model::Runtime &executor) {
     const ModelStepResult cycle = decodeOne(executor, request.id, prompt.size(), pages);
     const uint32_t rows = model::RuntimeInstrumentation::lastVerifyRows(executor, 0);
     executor.end(request.id);
-    require(rows == left && cycle.draftedTokens == left - 1,
+    if (longer.empty())
+      longer = cycle.outputTokens;
+    const size_t emitted = cycle.outputTokens.size();
+    require(rows == block && cycle.draftedTokens == block - 1,
             "a cycle of " + std::to_string(left) + " tokens left verified " + std::to_string(rows) +
                 " rows and drafted " + std::to_string(cycle.draftedTokens));
+    require(emitted && emitted <= std::min<size_t>(left, longer.size()) &&
+                std::ranges::equal(cycle.outputTokens, std::span(longer).first(emitted)),
+            "a cycle of " + std::to_string(left) + " tokens left emitted " + std::to_string(emitted) +
+                " tokens, not the start of a cycle's with more left");
   }
   std::cout << "output_left_rows=PASS\n";
 }
@@ -3867,12 +3877,13 @@ void requireConstrainedLaneSharesDecode(model::Runtime &executor, const model::Q
   std::cout << "constrained_lane_shares_decode=PASS\n";
 }
 
-// A constrained lane whose output budget leaves it fewer tokens than a draft
-// block's rows verifies a tree no deeper than they, and its mask request
-// simulates its rows' tokens alone: the runtime takes the masks the server
-// answers it with, one at its anchor and one after each simulated token, and
-// the lane decodes to its budget. Its masks admit every token but the stop
-// tokens.
+// A constrained lane's mask request simulates its rows' tokens alone, fewer
+// than a verify block's: the runtime takes the masks the server answers it
+// with, one at its anchor and one after each simulated token, and the lane
+// decodes to its budget. Under --verify-rows all its rows do not follow its
+// output left (requireCyclesVerifyTheirOutputLeft): a lane whose output
+// budget leaves it fewer tokens than a draft block's rows still verifies a
+// draft's block. Its masks admit every token but the stop tokens.
 void requireConstrainedLaneTakesTheMasksItAskedFor(model::Runtime &executor,
                                                    const model::ModelDescriptor &descriptor,
                                                    std::span<const uint32_t> seed) {
@@ -3904,13 +3915,12 @@ void requireConstrainedLaneTakesTheMasksItAskedFor(model::Runtime &executor,
   for (bool finished = false; !finished && tokens.size() < kBudget;) {
     PendingMaskedDecode pending = beginMaskedDecodeOne(executor, request.id, kPromptTokens + tokens.size(), pages);
     require(pending.maskRequests.size() == 1, "a constrained cycle did not ask for its lane's mask");
-    // Its tree's rows are no deeper than its output budget leaves.
+    // Its rows, its anchor's among them, are a draft's block, whatever its
+    // output budget leaves.
     const ModelMaskRequest &asked = pending.maskRequests[0];
     const size_t simulated = asked.simulationTokens.size();
-    std::vector<uint32_t> depths(simulated, 0);
-    for (size_t row = 1; row < simulated; ++row) depths[row] = depths.at(asked.parents[row]) + 1;
-    require(simulated >= 1 && *std::ranges::max_element(depths) < kBudget - tokens.size(),
-            "a constrained cycle simulated rows its lane's output budget does not leave");
+    require(simulated == model::StepCosts::kNarrowCap,
+            "a constrained cycle simulated " + std::to_string(simulated) + " rows, not a draft's block");
     fewest = std::min(fewest, static_cast<uint32_t>(simulated));
     provideMask(executor, request.id, admitting(simulated + 1));
     const std::vector<ModelStepResult> results = finishMaskedDecode(std::move(pending));
@@ -4306,12 +4316,12 @@ void requireBranchedPathsMatchChains(model::Runtime &executor, const model::Mode
 // lane's rows as the same step of its lanes in the reverse order does, and
 // as a step of that lane alone does. Four greedy lanes of their own prompts
 // are teacher-forced: a thinking budget of no tokens whose end is the lane's
-// continuation, words of the model's thinking end, makes each row select the
-// next forced token and replaces the draft's proposals with them, so a
-// lane's rows are its forced chain, as deep as its output budget leaves, and
-// it retains every one. With budgets of 16, 5, 9 and 12 tokens a step of
-// their 42 rows, at the cap of 16, gives each lane its budget's rows; then
-// the lanes run again in the reverse order, each at another place among the
+// continuation, as many words of the model's thinking end as its output
+// budget, makes each row select the next forced token and replaces the
+// draft's proposals with them, so a lane's rows are its forced chain, and it
+// retains every one. With budgets of 16, 5, 9 and 12 tokens a step of their
+// 42 rows, at the cap of 16, gives each lane its budget's rows; then the
+// lanes run again in the reverse order, each at another place among the
 // step's rows and in another state lane, and each alone in a step of its
 // rows. Each row's raw logits in the reversed step are the step's in order
 // (a cosine of 1 within 1e-6: the same rows, routed alike); alone, within
@@ -4323,9 +4333,12 @@ void requireBranchedPathsMatchChains(model::Runtime &executor, const model::Mode
 // one command buffer more.
 void requireMixedStepMatchesLanesAlone(model::Runtime &executor, metal::MetalBackend &backend,
                                        std::span<const uint32_t> seed, uint32_t vocabulary, double aloneBound) {
-  constexpr std::array<uint32_t, 4> kRows{16, 5, 9, 12}, kFirstForced{0, 3, 5, 1};
+  constexpr std::array<uint32_t, 4> kRows{16, 5, 9, 12}, kFirstForced{0, 3, 4, 1};
   constexpr uint32_t kStepRows = 16 + 5 + 9 + 12;
-  // The thinking end's words, before the token that closes thinking.
+  // The thinking end's words, before the token that closes thinking. A
+  // lane's own end is the words of its rows, the last of which ends its
+  // thinking and so appears in it once: the third lane's words start at the
+  // fifth, as from the sixth its ninth word would repeat its fifth.
   const std::vector<uint32_t> &words = targetTokens->thinkingEnds[1];
   struct Lane final {
     EngineRequest request;
@@ -4340,9 +4353,8 @@ void requireMixedStepMatchesLanesAlone(model::Runtime &executor, metal::MetalBac
     require(kFirstForced[index] + kRows[index] < words.size(), "mixed step: the thinking end is too short");
     lane.forced.assign(words.begin() + kFirstForced[index], words.begin() + kFirstForced[index] + kRows[index]);
     lane.request = makeRequest(0, std::move(prompt), kRows[index]);
-    std::vector<uint32_t> end = lane.forced;
-    end.push_back(targetTokens->thinkEnd);
-    lane.request.thinkingBudget = ThinkingBudget{0, std::move(end), targetTokens->thinkEnd};
+    lane.request.thinkingBudget = ThinkingBudget{0, lane.forced, targetTokens->thinkEnd};
+    require(!lane.request.thinkingBudget->unusable(), "mixed step: a lane's thinking end ends it before its last word");
     lane.pages = pageRange(100 + 4 * index, 4);
   }
   // `order`'s lanes in one step of `rows` rows, each request an id of its
@@ -4433,11 +4445,13 @@ void requireMixedStepMatchesLanesAlone(model::Runtime &executor, metal::MetalBac
 // A step whose lanes' trees hold fewer rows than it leaves its rows past
 // theirs to no lane, which no kernel reads: three sampled lanes at a low
 // temperature, whose draft rows each draw one child (the others' weights
-// underflow), and output budgets of 6 tokens, which hold a tree to 6 rows, in
-// a forced step of 8 rows a lane. Each lane holds the rows its tree grew, as
-// a step of exactly the lanes' rows lays them out from the same states,
-// commits a well formed cycle, and its rows' logits are within `bound`
-// (cosine) of that step's, whose projections' tiles hold other rows. So does
+// underflow), and output budgets of 6 tokens, which hold a tree to 6 rows
+// under --verify-rows auto (under all a tree is a draft's block whatever the
+// output left), in a forced step of 8 rows a lane. Each lane holds the rows
+// its tree grew, as a step of exactly the lanes' rows lays them out from the
+// same states, commits a well formed cycle, and its rows' logits are within
+// `bound` (cosine) of that step's, whose projections' tiles hold other rows.
+// So does
 // a step at a floor (VerifyRowsParams), whose lanes hold their trees' rows
 // estimated at least the floor and leave the others to no lane: of greedy
 // lanes with output budgets of 12 tokens, whose trees fill a draft's block
@@ -4491,12 +4505,15 @@ void requireRowsOfNoLane(model::Runtime &executor, std::span<const uint32_t> see
     model::RuntimeInstrumentation::captureTargetLogits(executor, false);
     model::RuntimeInstrumentation::forceStepRows(executor, std::nullopt);
     require(results.size() == kLanes, "rows of no lane: a step lost a lane");
+    // The most rows a lane's tree holds: its output budget's where that
+    // sizes it, else a draft's block.
+    const uint32_t most = executor.telemetry().verifyBudget ? budget : model::StepCosts::kNarrowCap;
     Step step;
     for (uint32_t index = 0; index < kLanes; ++index) {
       const ModelStepResult &result = results[index];
       step.rows[index] = model::RuntimeInstrumentation::lastVerifyRows(executor, index);
       require(result.failure.empty() && !result.outputTokens.empty() && result.outputTokens.size() <= budget &&
-                  step.rows[index] <= budget,
+                  step.rows[index] <= most,
               "rows of no lane: lane " + std::to_string(index) + " of a step of " + std::to_string(rows) +
                   " rows held " + std::to_string(step.rows[index]) + " and committed " +
                   std::to_string(result.outputTokens.size()) + " tokens");
@@ -6508,9 +6525,9 @@ int main(int argc, char **argv) {
             "constrained short prefill final hidden is unusable");
     executor.end(56);
 
-    // Every decode runs a draft block's eight rows a lane and verifies those
-    // its output budget leaves: its anchor and the rows of its tree, none
-    // deeper than the lane may retain. Compare each budgeted commit with a
+    // Every decode runs and verifies a draft block's eight rows a lane, its
+    // anchor and the rows of its tree, and retains no more than its output
+    // budget leaves. Compare each budgeted commit with a
     // constrained cycle that retains the same prefix, its masks walking its
     // tree down the committed path and rejecting every child of the path's
     // last row. The constrained request has the same budget, so it verifies
@@ -6565,13 +6582,12 @@ int main(int argc, char **argv) {
       auto pending =
           beginMaskedDecodeOne(executor, replayId, 129, replayPages);
       // Its mask request simulates the rows the replay verifies, the
-      // budgeted cycle's: its anchor and its tree's rows, none deeper than
-      // the proposals its budget leaves room for.
+      // budgeted cycle's: its anchor and its tree's rows, a draft's block.
       require(pending.maskRequests.size() == 1, "replay proposals were not exposed");
       const ModelMaskRequest &asked = pending.maskRequests[0];
       require(asked.simulationTokens.size() == result.draftedTokens + 1 &&
-                  std::ranges::max(maskDepths(asked)) < outputLimit,
-              "the cycle verified other rows than its budget leaves");
+                  asked.simulationTokens.size() == model::StepCosts::kNarrowCap,
+              "the cycle verified other rows than a draft's block");
       const std::span<const uint32_t> path = std::span(result.outputTokens).first(stored);
       provideMask(executor, replayId,
                   pathMasks(asked, path, unlikeChildren(asked, pathRows(asked, path).back(), 101), 100));
@@ -6801,9 +6817,9 @@ int main(int argc, char **argv) {
     const auto beforeConstrained = executor.telemetry();
 
     // The constraint handshake exposes the rows the cycle verifies: the
-    // pending anchor and its tree's rows, none deeper than the one proposal
-    // its budget of two tokens leaves room for. The next mask therefore has
-    // a row before the anchor and one after each of them.
+    // pending anchor and its tree's rows, a draft's block, whatever its
+    // budget of two tokens leaves. The next mask therefore has a row before
+    // the anchor and one after each of them.
     EngineRequest constrained = makeRequest(40, prompt129, 2);
     constrained.constraint = ConstraintMode::TokenMask;
     beginCold(executor, constrained, 0);
@@ -6833,9 +6849,8 @@ int main(int argc, char **argv) {
         beginMaskedDecodeOne(executor, 40, 129, pageTable);
     require(verify.maskRequests.size() == 1 &&
                 verify.maskRequests[0].requestId == 40 &&
-                verify.maskRequests[0].simulationTokens.size() >= 2 &&
+                verify.maskRequests[0].simulationTokens.size() == model::StepCosts::kNarrowCap &&
                 verify.maskRequests[0].simulationTokens.front() == anchorA &&
-                std::ranges::max(maskDepths(verify.maskRequests[0])) == 1 &&
                 verify.ticket->ownsMaskWait(40),
             "constraint proposals were not exposed during target forward");
     const size_t verifySimulated = verify.maskRequests[0].simulationTokens.size();
@@ -6863,18 +6878,16 @@ int main(int argc, char **argv) {
     executor.end(40);
 
     // Accept the proposals down a path of the tree the cycle grew and reject
-    // the others. A budget of four tokens lets the cycle verify three
-    // proposals, none deeper than three, the draft's largest estimates after
-    // an anchor the target did not choose, so the tree's shape is the
-    // machine's: a row two deep is among them only where its path's estimate
-    // exceeds that of the anchor's third child (Qwen3.8-Flash-Next's three on
-    // an M5 Max are the anchor's children). Where the tree holds a row two
-    // deep the path is the first one's: the cycle accepts its two proposals,
-    // its masks reject the third, and the successor they select, the budget's
-    // last token, is emitted at once without a KV row. Else it is the
-    // anchor's first child's, whose successor the next cycle would emit. The
-    // mask request simulates the tree after its anchor; the verified rows are
-    // counted only after target verification.
+    // the others. Whatever its budget of four tokens leaves, the cycle
+    // verifies a draft's block, seven proposals, the draft's largest
+    // estimates after an anchor the target did not choose, so the tree's
+    // shape is the machine's. Where the tree holds a row two deep the path is
+    // the first one's: the cycle accepts its two proposals, its masks reject
+    // the third, and the successor they select, the budget's last token, is
+    // emitted at once without a KV row. Else it is the anchor's first
+    // child's, whose successor the next cycle would emit. The mask request
+    // simulates the tree after its anchor; the verified rows are counted only
+    // after target verification.
     EngineRequest perfectConstraint = makeRequest(44, prompt129, 4);
     perfectConstraint.constraint = ConstraintMode::TokenMask;
     beginCold(executor, perfectConstraint, 0);
@@ -6896,9 +6909,9 @@ int main(int argc, char **argv) {
     const ModelMaskRequest &perfectAsked = perfectPending.maskRequests[0];
     const std::vector<uint32_t> perfectDepths = maskDepths(perfectAsked);
     const size_t perfectSimulated = perfectAsked.simulationTokens.size();
-    require(perfectAsked.simulationTokens.front() == perfectAnchor && perfectSimulated >= 2 &&
-                std::ranges::max(perfectDepths) <= 3,
-            "perfect constraint's tree holds no proposal or is deeper than its budget leaves");
+    require(perfectAsked.simulationTokens.front() == perfectAnchor &&
+                perfectSimulated == model::StepCosts::kNarrowCap,
+            "perfect constraint's cycle verifies other rows than a draft's block");
     // The tree's first row two deep, or without one its first proposal, and
     // the tokens down to it from the anchor's.
     const auto perfectLast = static_cast<uint32_t>(
@@ -7013,13 +7026,12 @@ int main(int argc, char **argv) {
       const uint64_t id = 42 + lane;
       PendingMaskedDecode initial = beginMaskedDecodeOne(
           executor, id, 129, lane ? crossPages1 : crossPages0);
-      // Its budget of three tokens leaves its anchor and its tree's rows,
-      // none deeper than two proposals.
+      // Its anchor and its tree's rows, a draft's block, whatever its budget
+      // of three tokens leaves.
       require(initial.maskRequests.size() == 1 &&
-                  initial.maskRequests[0].simulationTokens.size() >= 2 &&
+                  initial.maskRequests[0].simulationTokens.size() == model::StepCosts::kNarrowCap &&
                   initial.maskRequests[0].simulationTokens.front() ==
-                      crossAnchors[lane] &&
-                  std::ranges::max(maskDepths(initial.maskRequests[0])) <= 2,
+                      crossAnchors[lane],
               "B1 initial constrained cycle did not draft from its anchor");
       crossNext[lane] = unlikeChildren(initial.maskRequests[0], 0, 112);
       provideMask(executor, id,
@@ -7043,15 +7055,15 @@ int main(int argc, char **argv) {
                 crossPending.ticket->ownsMaskWait(42) &&
                 crossPending.ticket->ownsMaskWait(43),
             "B2 target forward did not own both constraint masks");
-    // Each lane's budget leaves the B2 cycle its anchor and its tree's rows,
-    // none deeper than one proposal; a successor rejects them all.
+    // Each lane's B2 cycle verifies its anchor and its tree's rows, a
+    // draft's block whatever its budget leaves; a successor rejects them all.
     std::array<uint32_t, 2> crossRejected{};
     std::array<size_t, 2> crossSimulated{};
     for (uint32_t lane = 0; lane < 2; ++lane) {
       const ModelMaskRequest &asked = crossPending.maskRequests[lane];
       crossSimulated[lane] = asked.simulationTokens.size();
-      require(crossSimulated[lane] >= 2 && std::ranges::max(maskDepths(asked)) == 1,
-              "a B2 constrained lane simulated rows its budget does not leave");
+      require(crossSimulated[lane] == model::StepCosts::kNarrowCap,
+              "a B2 constrained lane simulated other rows than a draft's block");
       crossRejected[lane] = unlikeChildren(asked, 0, 121);
       provideMask(executor, asked.requestId,
                   pathMasks(asked, std::array{crossNext[lane]}, crossRejected[lane], 123));

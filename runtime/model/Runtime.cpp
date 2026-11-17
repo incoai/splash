@@ -2620,12 +2620,12 @@ struct Runtime::Impl {
   }
 
   // A cycle's step over curves.size() lanes, each holding at most `holds`
-  // rows (its output left, or a forced chain): a forced step
-  // (StepCosts::forced); without step costs (--verify-rows all), a draft's
-  // block a lane, no more than each lane holds, so that a cycle's shape and
-  // outputs repeat (StepCosts::block); else the step its lane count's
-  // measured costs choose (StepCosts::choose), or a streamed-expert target's
-  // step and floor by its cost line, constrained cycles' apart
+  // rows (its output left under --verify-rows auto, or a forced chain): a
+  // forced step (StepCosts::forced); without step costs (--verify-rows all),
+  // a draft's block a lane, no more than each lane holds, so that a cycle's
+  // shape and outputs repeat (StepCosts::block); else the step its lane
+  // count's measured costs choose (StepCosts::choose), or a streamed-expert
+  // target's step and floor by its cost line, constrained cycles' apart
   // (CostLine::choose).
   StepCosts::Choice chooseStep(std::span<const std::vector<float>> curves, std::span<const uint32_t> holds,
                                std::span<const uint64_t> contexts, bool constrained) const {
@@ -3862,14 +3862,17 @@ Runtime::decodeAsync(const BatchPlan &plan,
     // retain whatever the step's rows (its output left, at most a verify
     // block), so that the tree's estimates size the next cycle's
     // (keepChances), and no more of its rows, nor of its chances of the
-    // cycle's rows, than that depth past its anchor: under --verify-rows all
-    // a lane verifies every row of a draft's block its output limit leaves.
-    // Under a thinking budget whose end is not due, no deeper than the
+    // cycle's rows, than that depth past its anchor. Under --verify-rows all
+    // its output left sizes nothing, as in 1.6.2: a cycle runs as it would
+    // with more output left and retains no more than is left, so that an
+    // answer under a lower output limit starts one under a higher, bit for
+    // bit. Under a thinking budget whose end is not due, no deeper than the
     // thinking it has left: the cutoff's row selects the end whatever its
     // rows below propose.
     const ops::SamplingPolicy policy = Impl::samplingPolicy(entry);
     const std::optional<ops::ThinkingCutoff> &cutoff = policy.thinkingCutoff;
-    depths[lane] = std::min({remaining, kDecodeRows, cutoff && cutoff->row ? cutoff->row + 1 : kDecodeRows}) - 1;
+    const uint32_t left = impl_->verifyBudget ? remaining : kDecodeRows;
+    depths[lane] = std::min({left, kDecodeRows, cutoff && cutoff->row ? cutoff->row + 1 : kDecodeRows}) - 1;
     proposals[lane] = impl_->proposeChain(entry, lane, policy, depths[lane]);
     curves[lane] = impl_->laneCurve(entry, proposals[lane], depths[lane]);
     // The rows the lane holds: its anchor and its tree to its depth, or, for

@@ -489,8 +489,9 @@ the machine and on what the server served before, and a MoE row's result
 depends on which rows share its expert tiles ([Kernels](internals.md#kernels)): under
 `--verify-rows auto` the same greedy (temperature 0) or seeded request can give
 different text from run to run, even alone on an idle server
-([Sampling](api.md#sampling)); sampled outputs keep their exact distribution. Under `--verify-rows all`, the rows a
-cycle verifies follow its lanes' output budgets alone. The speculation counts ([Output limits and
+([Sampling](api.md#sampling)); sampled outputs keep their exact distribution. Under `--verify-rows all`, every
+cycle verifies a draft's block a lane whatever output its lanes have left, which caps only what they
+retain, so that an answer under a lower output limit starts the one under a higher. The speculation counts ([Output limits and
 streaming](api.md#output-limits-and-streaming)) count the proposals a cycle verified.
 The target writes the outputs of the layers the draft reads for each row it
 reads; Qwen3.8-Flash-Next's, whose layers carry four hyper-connection streams,
