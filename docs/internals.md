@@ -2867,8 +2867,11 @@ not and in use too, so that a start after a crash takes it back, gives up the
 oldest point for it (below), and refuses one larger than its limit, counting
 each of its copies at what its slot takes, those still to write by what their
 pages hold (`Cache::pointFits`). A clean stop writes a persistent tier's
-waiting points, the newest first; a temporary tier's copies go with the
-process.
+waiting points, the newest first, then gives up the KV copies no state needs
+(`Cache::closePersistentTier`), which the next start would leave behind: the
+blocks a Spill request wrote through past its point, and what is left of the
+chain of a point the full quota gave up, whose copies go only as later writes
+need room. A temporary tier's copies go with the process.
 
 Otherwise writes happen when RAM reclamation selects a victim without a copy.
 States copy through one staging buffer, freeing their RAM immediately. KV

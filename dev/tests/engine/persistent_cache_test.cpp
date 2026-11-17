@@ -663,6 +663,12 @@ void testOldestPointInRamGoesWithItsChain() {
   require(adoption.states == 2 && adoption.blocks == 5 && adoption.dropped == 1,
           "the next process did not take the two newer points back whole");
   next.cache.checkInvariants();
+  // The copy left of the oldest point's chain stays behind after a crash; a clean stop gives it up.
+  process.cache.closePersistentTier();
+  Process after(true);
+  require(!copiesOf(oldest) && after.adopt(process.kvLabels(), process.stateLabels()).dropped == 0,
+          "a clean stop left the copy of a chain no state needs behind");
+  process.cache.checkInvariants();
 }
 
 // Room for a point's state never takes its own chain: the deeper point's copies go, then the
@@ -799,7 +805,7 @@ void testCleanStopRecordsRecency() {
   again.push_back(7);
   require(process.cache.lookup(again, {}).state.has_value(), "the first point was not found");
   require(labelled()[first] < labelled()[second], "a use relabelled a copy before the stop");
-  process.cache.relabelStates();
+  process.cache.closePersistentTier();
   require(labelled()[first] > labelled()[second], "the clean stop did not record the newest use");
 }
 
@@ -1539,6 +1545,38 @@ void testWriteThroughCopiesAreRestorePoints() {
           "the next process did not take the written-through point back whole");
 }
 
+// A Spill request writes through every block it publishes, past its restore point too, as a reply
+// completes a block past the prompt's: no state needs that copy, which stays behind after a crash,
+// and a clean stop gives it up.
+void testCleanStopGivesUpCopiesPastAPoint() {
+  const std::vector<uint32_t> prompt = promptOf(1000, 4);
+  const auto budget = std::make_shared<model::DiskBudget>(1600);
+  Process earlier(true, budget, CacheSpillPolicy{1, 1, true});
+  earlier.tier.budget = budget;
+  // Room for an Index extent beside the eight Full pages.
+  earlier.storage.budgetPages = 9;
+  earlier.cache.beginRequest(1, KvMode::Spill);
+  require(earlier.cache.commitSpill(1, 4) && admitTokens(earlier.cache, 1, prompt.size()).granted(),
+          "the Spill request was not admitted");
+  earlier.cache.publishCommittedBlocks(1, prompt, static_cast<uint32_t>(prompt.size()), {});
+  const uint64_t point = earlier.cache.blockAt(1, 3 * KvCache::pageTokens);
+  static_cast<void>(test::spillRound(earlier.cache, earlier.tier));
+  earlier.publish(point);
+  earlier.cache.endRequest(1);
+  require(earlier.persist(point) == PersistStatus::Durable && earlier.kvLabels().size() == 4,
+          "the point did not become durable beside the copy past it");
+  const auto adopted = [&] {
+    Process next(true);
+    return next.adopt(earlier.kvLabels(), earlier.stateLabels());
+  };
+  require(adopted().dropped == 1, "the copy past the point did not stay behind after a crash");
+  earlier.cache.closePersistentTier();
+  const CacheAdoption adoption = adopted();
+  require(adoption.blocks == 3 && adoption.states == 1 && adoption.dropped == 0 && earlier.kvLabels().size() == 3,
+          "a clean stop left the copy past the point behind");
+  earlier.cache.checkInvariants();
+}
+
 // Recomputing a point's chain leaves its copies to the point, which stays whole, and they count as
 // no KV of the request.
 void testRecomputedChainsStayWhole() {
@@ -1724,6 +1762,7 @@ int main() {
     testCopiesFollowDemandNotAWindow();
     testCopyDemandCountsOnlyWhatGoesAtOnce();
     testWriteThroughCopiesAreRestorePoints();
+    testCleanStopGivesUpCopiesPastAPoint();
     testRecomputedChainsStayWhole();
     testCommittedPagesTakeTheSpilledChainOfAStateInRam();
     testAPrefixWithoutOwnCopiesHoldsBackNoSpill();

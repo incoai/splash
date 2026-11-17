@@ -302,9 +302,9 @@ public:
   // finds a persistent tier emptied (CacheDirectory::engineFailed).
   void engineFailed() noexcept;
   // At a clean stop, after the engine's flush (Engine::flushRestorePoints):
-  // each state copy's label takes its state's current recency, both files
-  // reach the drive and the directory records a clean end. False when they
-  // did not; true at once without a persistent tier.
+  // the cache closes its tier (Cache::closePersistentTier), both files reach
+  // the drive and the directory records a clean end. False when they did
+  // not; true at once without a persistent tier.
   [[nodiscard]] bool closePersistentCache();
 
   [[nodiscard]] metal::MetalBackend &backend() noexcept { return *backend_; }

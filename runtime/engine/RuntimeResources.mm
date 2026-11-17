@@ -1383,9 +1383,9 @@ bool RuntimeResources::closePersistentCache() {
   if (!persistentCache_.directory)
     return true;
   stopProbation();
-  cache_->relabelStates();
-  // Each file runs its operations in order: the writes and labels submitted
-  // before land first.
+  cache_->closePersistentTier();
+  // Each file runs its operations in order, and a freed slot's punch, which
+  // clears its record, before any later one: what came before lands first.
   const auto kv = persistentCache_.kv->synchronize({});
   const auto states = persistentCache_.states->synchronize({});
   const bool kvSynchronized = kv->wait();

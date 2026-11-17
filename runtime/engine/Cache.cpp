@@ -3065,8 +3065,6 @@ bool Cache::newestPoint(uint64_t block) const {
   return kv_.contains(block) && states_.ordinary(block) && !superseded(block);
 }
 
-void Cache::relabelStates() const { states_.relabel(); }
-
 bool Cache::superseded(uint64_t block) const {
   if (!kv_.stateBelow(block))
     return false;

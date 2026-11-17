@@ -433,12 +433,15 @@ public:
   // once after they land: the bytes of the pages they copy and of the RAM
   // copy of the state they write.
   [[nodiscard]] uint64_t copyingAheadBytes() const noexcept;
-  // At a clean stop: the label of each state copy a persistent tier keeps
-  // takes its state's current recency, which the next process orders them
-  // by; a copy takes its state's class as soon as a checkpoint becomes
-  // ordinary, which a crash keeps too. KV copies keep the labels of their
-  // writes: a chain goes with the states that need it (freeDiskSpace).
-  void relabelStates() const;
+  // At a clean stop: the KV copies no state needs go, as a full quota gives
+  // them up first (freeDiskSpace), since the next process takes back only
+  // restore points (adopt); each state copy's label takes its state's
+  // current recency, which the next process orders them by.
+  void closePersistentTier() {
+    while (kv_.unneededCopy())
+      static_cast<void>(freeDiskSpace(false, false));
+    states_.relabel();
+  }
   // Measures the volume the disk tier lives on and sets the budget's limit
   // (DiskSpace::measure), for keepDiskLimit(); none without such a tier.
   void setDiskMeasure(std::function<void()> measure) { diskMeasure_ = std::move(measure); }
