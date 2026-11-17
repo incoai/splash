@@ -4569,6 +4569,87 @@ void requireRowsOfNoLane(model::Runtime &executor, std::span<const uint32_t> see
   std::cout << "rows_of_no_lane=PASS\n";
 }
 
+// What requireArgmaxChain compared: the tokens, those the target ranked
+// first, and the largest gap below the target's best of one it did not.
+struct ArgmaxChain final {
+  uint32_t tokens = 0;
+  uint32_t first = 0;
+  float gap = 0.0F;
+};
+
+// A greedy lane's `tokens`, which it emitted after `request`'s prompt, are
+// the target's argmax chain. The request again, in state lane `stateLane` on
+// `pages`, decodes one row a cycle (a forced step of one row: the target's
+// own decode, which verifies its anchor alone and so takes none of the
+// draft's trees, the step costs' rows and lane caps, the layout's packing or
+// the acceptance's walk), teacher-forced along the tokens by a thinking
+// budget of no tokens whose end they are (an end's rows select it whatever
+// their logits), and each token must be the largest of the raw logits of the
+// row that selected it (RuntimeInstrumentation::captureTargetLogits) among
+// the tokens a lane that ignores end-of-sequence admits, or within
+// kNearTie of it. A step of other rows rounds a row's logits otherwise (a
+// lane's logits alone and in a step of other rows keep cosines of 0.9996 to
+// 0.9999, requireMixedStepMatchesLanesAlone), which may order two nearly
+// equal tokens either way (the largest gaps of such ties this check found
+// were 0.11 on Qwen3.6-35B-A3B and 0.0015 on Qwen3.8-27B, of about 500
+// tokens each); a token the target ranks a logit or more below its best is
+// no rounding but a wrong token, or one computed from a wrong history (a
+// token emitted out of its path's order, or an auto step's K/V committed
+// along another path, lay 10.8 and 11.0 below on the 35B). Forcing the
+// lane's own tokens keeps every later token checked
+// past such a tie. The end closes with a token the lane did not emit, the
+// only one that ends its thinking (ThinkingBudget::unusable), so that the
+// tokens may hold </think> anywhere; the check ends before the close.
+ArgmaxChain requireArgmaxChain(model::Runtime &executor, const ops::StopTokens &stops, EngineRequest request,
+                               uint32_t stateLane, const std::vector<uint32_t> &pages,
+                               std::span<const uint32_t> checked) {
+  constexpr float kNearTie = 1.0F;
+  require(!checked.empty(), "a greedy lane emitted no token to check");
+  uint32_t close = 0;
+  while (std::ranges::find(checked, close) != checked.end() || stops.contains(close)) ++close;
+  std::vector<uint32_t> end(checked.begin(), checked.end());
+  end.push_back(close);
+  request.thinkingBudget = ThinkingBudget{0, end, close};
+  ArgmaxChain chain;
+  // Row `at`'s logits, which selected checked[at].
+  const auto check = [&](uint32_t at, std::optional<uint32_t> selected) {
+    std::vector<std::vector<float>> rows = model::RuntimeInstrumentation::takeTargetLogits(executor);
+    require(rows.size() == 1 && !rows.front().empty() && selected == checked[at],
+            "the target's direct decode did not select the greedy lane's token " + std::to_string(at) +
+                " as its thinking end forced it");
+    const std::vector<float> &logits = rows.front();
+    const uint32_t token = checked[at];
+    float best = -std::numeric_limits<float>::infinity();
+    for (uint32_t id = 0; id < logits.size(); ++id)
+      if (!stops.contains(id) && !test::unselectableLogit(logits[id])) best = std::max(best, logits[id]);
+    const float gap = best - logits.at(token);
+    require(!stops.contains(token) && !test::unselectableLogit(logits[token]) && gap <= kNearTie,
+            "a greedy lane's token " + std::to_string(at) + " (" + std::to_string(token) + ") lies " +
+                std::to_string(gap) + " below the target's best logit, past a near tie's " +
+                std::to_string(kNearTie));
+    ++chain.tokens;
+    chain.first += gap <= 0.0F;
+    chain.gap = std::max(chain.gap, gap);
+  };
+  model::RuntimeInstrumentation::captureTargetLogits(executor, true);
+  model::RuntimeInstrumentation::forceStepRows(executor, 1);
+  beginCold(executor, request, stateLane);
+  const ModelStepResult prefilled = prefillChunk(executor, request.id, 0, request.prompt, pages);
+  require(prefilled.failure.empty() && prefilled.outputTokens.empty(),
+          "the target's direct decode of a greedy lane's prompt failed or emitted its first token");
+  check(0, prefilled.firstToken);
+  for (uint32_t at = 1; at < checked.size(); ++at) {
+    const ModelStepResult decoded = decodeOne(executor, request.id, request.prompt.size() + at - 1, pages);
+    require(decoded.failure.empty() && decoded.outputTokens == std::vector<uint32_t>{checked[at - 1]},
+            "the target's direct decode did not emit the greedy lane's token " + std::to_string(at - 1));
+    check(at, model::RuntimeInstrumentation::pendingToken(executor, request.id));
+  }
+  model::RuntimeInstrumentation::forceStepRows(executor, std::nullopt);
+  model::RuntimeInstrumentation::captureTargetLogits(executor, false);
+  executor.end(request.id);
+  return chain;
+}
+
 // Under --verify-rows auto a decode cycle's rows follow the step costs the
 // start measured on this machine and the acceptance the verify budget
 // learns from the cycles before them, so that runs need not repeat one
@@ -4581,7 +4662,8 @@ void requireRowsOfNoLane(model::Runtime &executor, std::span<const uint32_t> see
 // this machine (Runtime::warmupDecodeBatch: the first cycle of four lanes
 // weighs a measured cost), greedy and sampled lanes decode for more cycles
 // than the budget's refit period, one of them ending at its output budget
-// within its first cycles; one lane takes steps of every row count to a
+// within its first cycles, the greedy ones' first 256 tokens the target's
+// argmax chain (requireArgmaxChain); one lane takes steps of every row count to a
 // verify block's, forced, past eight rows a lane too; a dip does not stick:
 // after a step of one row, and after a cycle whose rows were a thinking
 // end's (none the draft's), a lane's next step has chances to size it by
@@ -4593,7 +4675,8 @@ void requireRowsOfNoLane(model::Runtime &executor, std::span<const uint32_t> see
 // of their own (model::CostLine), and some cycle's lanes take fewer rows than
 // its step.
 void requireBudgetedCyclesAreWellFormed(model::Runtime &executor, const model::QwenStateStorage &states,
-                                        std::span<const uint32_t> seed, bool streamed) {
+                                        const model::ModelDescriptor &descriptor, std::span<const uint32_t> seed,
+                                        bool streamed) {
   constexpr uint32_t kRows = model::ExecutionLimits::targetVerifyRows;
   constexpr uint32_t kCycles = model::VerifyBudget::kRefitCycles + 1;
   const auto warmupsStarted = std::chrono::steady_clock::now();
@@ -4754,6 +4837,23 @@ void requireBudgetedCyclesAreWellFormed(model::Runtime &executor, const model::Q
   require(lanes[3].tokens.size() == 12, "the budgeted lanes did not reach the cycles the check needs");
   for (const Lane &lane : lanes)
     executor.end(lane.request.id);
+  // The greedy lanes' first 256 tokens, over their wide and narrow cycles,
+  // are the target's argmax chain.
+  const ops::StopTokens stops = std::visit([](const auto &layout) { return layout.stopTokens; }, descriptor.target);
+  ArgmaxChain chains;
+  for (const uint32_t index : {0U, 2U}) {
+    const Lane &lane = lanes[index];
+    EngineRequest direct = lane.request;
+    direct.id = 820 + index;
+    const ArgmaxChain chain =
+        requireArgmaxChain(executor, stops, direct, lane.stateLane, lane.pages,
+                           std::span(lane.tokens).first(std::min<size_t>(lane.tokens.size(), 256)));
+    chains.tokens += chain.tokens;
+    chains.first += chain.first;
+    chains.gap = std::max(chains.gap, chain.gap);
+  }
+  std::cout << "budgeted_greedy_chain=PASS tokens=" << chains.tokens << " target_first=" << chains.first
+            << " largest_gap=" << chains.gap << '\n';
 
   // One lane's steps of every row count from 1 to a verify block's, those
   // of 9 to 15 rows at the cap of 16.
@@ -8289,7 +8389,7 @@ int main(int argc, char **argv) {
     };
     budgeted();
     const bool streamed = model.expertStore() != nullptr;
-    requireBudgetedCyclesAreWellFormed(*runtime, states, samplingSeedTokens, streamed);
+    requireBudgetedCyclesAreWellFormed(*runtime, states, model.descriptor, samplingSeedTokens, streamed);
     requireRowsOfNoLane(*runtime, samplingSeedTokens, model.descriptor.capabilities.vocabularySize, bound);
     // A target whose experts stream measures no table: its cycles' cost line
     // prices its steps (model::CostLine).
