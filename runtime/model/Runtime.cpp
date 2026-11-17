@@ -1531,8 +1531,12 @@ struct Runtime::Impl {
   // lookup index takes the request's tokens through it, those of a state it
   // restored before its first chunk included, and once the chunk ends the
   // prompt, the anchor a replayed request kept (Request::lookup). A chunk
-  // run again, or another pass of it, adds nothing.
+  // run again, or another pass of it, adds nothing. A request no decode
+  // cycle reads it of, one that scores or whose prompt selects its one
+  // token, indexes no prompt: 84-89 bytes a token, 23 MB at 262K tokens.
   static void followPrompt(Request &entry, uint64_t end) {
+    if (!entry.scoreTokens.empty() || entry.maxNewTokens < 2)
+      return;
     LookupIndex &index = entry.lookup;
     const size_t held = index.tokens().size();
     if (held < end)

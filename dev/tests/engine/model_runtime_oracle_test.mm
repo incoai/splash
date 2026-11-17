@@ -1466,6 +1466,9 @@ void requireStatesCapturedInsideCommands(model::Runtime &executor, const metal::
   executor.setDraftContextPlan(401, planDraftContext(0, end, boundaries));
   prefill(401, 0, shorter.first(split), plainPages);
   const auto [plain, plainSplit] = prefill(401, split, shorter.subspan(split), plainPages);
+  // A score request, which no decode cycle reads a lookup index of, has
+  // none.
+  requireLookupIndex(executor, 401, {}, "a score request's prompt");
   beginCold(executor, scoring(402, shorter), 1);
   executor.setDraftContextPlan(402, planDraftContext(0, end, boundaries));
   prefill(402, 0, shorter.first(split), capturingPages);
