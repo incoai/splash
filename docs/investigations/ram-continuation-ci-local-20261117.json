@@ -1,0 +1,33 @@
+{
+  "created_at_utc": "2026-11-17T14:30:57.735803+00:00",
+  "head": "5efd09b27f9542850e38f5d531807eb387603409",
+  "ci_run": 44096592312,
+  "ci_result": {
+    "native_sanitizers": "success",
+    "python_3_12": "success",
+    "python_3_13": "success",
+    "python_3_14": "success",
+    "production_and_CPU": "success",
+    "all_native_tools_build": "success",
+    "desktop_app": "failure",
+    "manual_release_gate": "skipped"
+  },
+  "failure": {
+    "test": "whatTheComposerHeldGoesAtOnceAsItsChatOpens",
+    "source": "app/Tests/SplashTests/ChatScreenTests.swift:610",
+    "reason": "timed out waiting for ready",
+    "job": 134085213402
+  },
+  "local_reproduction": {
+    "isolated_test": "passed, 1 test, 8.646 seconds",
+    "full_suite": "passed, 250 tests, 27 suites, 182.206 seconds, 1 pre-existing known issue",
+    "app_source_diff_from_PR_head": false,
+    "product_or_test_timeout_changed": false,
+    "log_sha256": "dff8fad8e541fd8630a469626719c5a29277b1438c35ce4a559c74c476e6479f",
+    "isolated_log_sha256": "64d28580bfe6b3540e3c253aa513d1086a93991bc0a2581555c13253f46c44db"
+  },
+  "rerun_attempt": "GitHub connector returned 403; existing gh CLI reported job cannot be rerun",
+  "status": "keep draft; local success does not replace clean CI",
+  "production_deployed": false,
+  "model_benchmark": false
+}
