@@ -511,6 +511,92 @@ void testAStartTakesAQueuedChainItsRequestRestoresLater() {
   }
 }
 
+// #758's start: beside a lane in service, the host at its margin refuses it, and nothing in memory gives the host
+// room but a queued request's chain. The host's passes take that chain, written to the SSD cache first, from which
+// its request later restores it without its prefill, or, with no tier, dropped and prefilled again; the start
+// begins while the lane is in service. Under 1.7.0's rows the passes kept queued chains short of critical pressure,
+// and the start waited for the lane to end.
+void testAHostRefusedStartBesideALaneTakesAQueuedChain() {
+  for (const bool tiered : {true, false}) {
+    HarnessOptions options{.pages = 256, .memory = test::FakeMemory::Config{}};
+    if (tiered)
+      options.tier = test::TierOptions{.capacity = 256, .transferLimit = 8};
+    test::EngineHarness harness(std::move(options));
+    harness.model.laneFootprintBytes = 64 * 1024;
+    if (tiered) {
+      harness.model.keptTier = std::make_shared<test::OffloadControl>();
+      harness.model.keptTier->ready = true;
+    }
+    // Ticks, with the control pass's landings between commands, which mark the chains queued requests restore
+    // (Cache::setWantedChains), and its host pass every 500 ms.
+    double pass = harness.now();
+    const auto step = [&] {
+      if (!harness.engine.commandInFlight())
+        harness.engine.collectLandings(harness.now());
+      if (harness.now() >= pass) {
+        static_cast<void>(harness.governor->controlPass(harness.now()));
+        pass = harness.now() + 500.0;
+      }
+      if (!harness.tick())
+        harness.advanceTo(harness.now() + 1.0);
+      if (harness.tier)
+        harness.tier->complete();
+      harness.model.restoreControl->ready = true;
+    };
+    // The chain the queued request restores, its replay point at 1,024, and the lane in service, resident while it
+    // waits for its mask.
+    const std::vector<uint32_t> chain(1025, 5);
+    harness.engine.submit(harness.request(10, chain));
+    harness.runUntilIdle();
+    harness.engine.submit(maskedForeground(1, std::vector<uint32_t>(64, 1)));
+    harness.runUntil([&] { return harness.events.maskRequests.size() == 1; }, "the lane did not wait for its mask");
+    // The host's other memory leaves it 48 KiB short of its margin: the start it refuses, and the request whose
+    // chain it is, queued below it.
+    test::FakeMemory &memory = *harness.memory;
+    const uint64_t other = memory.hostBytes() - memory.total() - test::GovernorLimits{}.hostSpareReserveBytes;
+    memory.setHost(other - kHostMarginBytes - 48 * 1024, MemoryPressure::Normal);
+    EngineRequest start = harness.request(3, std::vector<uint32_t>(129, 3));
+    start.priority = RequestPriority::Foreground;
+    start.deadlineMilliseconds = 1e9;
+    harness.engine.submit(std::move(start));
+    std::vector<uint32_t> next = chain;
+    next.push_back(6);
+    EngineRequest queued = harness.request(2, next);
+    queued.priority = RequestPriority::Background;
+    queued.deadlineMilliseconds = 1e9;
+    harness.engine.submit(std::move(queued));
+    bool refused = false;
+    for (const double end = harness.now() + 3000.0; harness.now() < end && !harness.events.outputs.contains(3);) {
+      step();
+      refused = refused || harness.governor->ledger().hostRefusedWaitingBytes() != 0;
+    }
+    require(refused, "the host did not refuse the start");
+    const MemoryGovernorSnapshot governor = harness.governor->snapshot();
+    require(harness.events.outputs.contains(3) && !harness.events.usage.contains(1) && harness.model.suspensions == 0,
+            std::string(tiered ? "with" : "without") +
+                " the SSD cache, a start the host refused beside a lane in service was not met by its passes taking a "
+                "queued chain: host headroom " +
+                std::to_string(governor.hostHeadroomBytes) + ", waiting claims " +
+                std::to_string(governor.claims.waiting) + ", kv " + std::to_string(memory.held("kv")) +
+                ", host refused " + std::to_string(harness.governor->ledger().hostRefusedWaitingBytes()));
+    require(!tiered || !harness.tier->writes.empty(), "the chain was not written to the SSD cache before it went");
+    const uint32_t restores = harness.tier ? harness.tier->restores : 0;
+    // The lane ends and the host's other memory leaves: the queued request starts.
+    memory.setHost(other - 4 * kHostMarginBytes, MemoryPressure::Normal);
+    harness.engine.cancel(1);
+    for (int each = 0; each < 20'000 && !idle(harness.engine); ++each)
+      step();
+    require(idle(harness.engine), "the requests did not finish");
+    const auto at = std::ranges::find(harness.events.startIds, 2);
+    require(at != harness.events.startIds.end() &&
+                harness.events.starts[static_cast<size_t>(at - harness.events.startIds.begin())] ==
+                    (tiered ? 1024u : 0u) &&
+                (!tiered || harness.tier->restores > restores),
+            std::string("the queued request ") +
+                (tiered ? "did not restore its chain from the SSD cache" : "did not prefill its dropped chain again"));
+  }
+}
+
 // A request that has not started ranks by the work its start restores: a cold start neither outranks a lane in
 // prefill of its priority nor holds room that lane waits for.
 void testAStartRanksByTheWorkItHolds() {
@@ -1390,6 +1476,7 @@ std::span<const test::TestCase> rulesTests() {
        testACancelBetweenPassesBesideItsOwnPrioritysDecodeKeepsThePasses},
       {"testAHostRefusedStartIsFreedForByThePass", testAHostRefusedStartIsFreedForByThePass},
       {"testAStartTakesAQueuedChainItsRequestRestoresLater", testAStartTakesAQueuedChainItsRequestRestoresLater},
+      {"testAHostRefusedStartBesideALaneTakesAQueuedChain", testAHostRefusedStartBesideALaneTakesAQueuedChain},
       {"testAStartRanksByTheWorkItHolds", testAStartRanksByTheWorkItHolds},
       {"testCopiesAheadForRegrowthStayWithinAUnit", testCopiesAheadForRegrowthStayWithinAUnit},
       {"testALaneAPlanLeavesOutWaitsForItsCommandNotOnItsClaim",
