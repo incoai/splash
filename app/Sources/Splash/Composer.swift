@@ -261,7 +261,7 @@ struct Composer: View {
             if !draft.attachments.isEmpty {
                 Attachments(draft: draft, held: held)
             }
-            ComposerField(text: $draft.text, focusRequests: draft.focusRequests,
+            ComposerField(text: $draft.text, chat: state.chats.selection, focusRequests: draft.focusRequests,
                           yields: state.terminalShows, held: held,
                           placeholder: "Message Splash", submit: state.sendDraft, cancel: stop, acceptsImages: images && !held,
                           attach: { draft.attach($0, unreadable: $1) }, attachPDFs: { draft.attach(pdfs: $0) })
@@ -614,6 +614,8 @@ extension Attachments {
 /// the text scrolls.
 private struct ComposerField: NSViewRepresentable {
     @Binding var text: String
+    /// The chat whose draft `text` is, nil for a new chat.
+    let chat: UUID?
     let focusRequests: Int
     /// Whether a terminal of the drawer shows, which keeps the keyboard as the field shows
     /// (`AppState.terminalShows`).
@@ -679,11 +681,13 @@ private struct ComposerField: NSViewRepresentable {
     func updateNSView(_ scroll: NSScrollView, context: Context) {
         context.coordinator.field = self
         guard let view = scroll.documentView as? MessageTextView else { return }
-        // Only a change made elsewhere, as sending the message clears it, goes to the view: the
-        // view's own edits are in `text` already, and what the input method composes is in the
-        // view alone until it is committed.
-        if text != context.coordinator.published {
+        // Only a change made elsewhere, as sending the message clears it, or another chat's
+        // draft goes to the view: the view's own edits are in `text` already, and what the input
+        // method composes is in the view alone until it is committed. Another chat's draft goes
+        // even where its text is the same, so that no edit made in one chat is undone in another.
+        if text != context.coordinator.published || chat != context.coordinator.chat {
             context.coordinator.published = text
+            context.coordinator.chat = chat
             // A change made here is no edit to undo.
             view.string = text
             context.coordinator.undo.removeAllActions()
@@ -706,9 +710,10 @@ private struct ComposerField: NSViewRepresentable {
         var focusRequests = 0
         /// Whether the field has shown, past its first update.
         var shown = false
-        /// The text the view and the draft last agreed on.
+        /// The text the view and the draft last agreed on, and the chat whose draft it is.
         var published = ""
-        /// The field's own edits, which a message sent clears.
+        var chat: UUID?
+        /// The field's own edits, which a message sent or another chat opened clears.
         let undo = UndoManager()
 
         init(_ field: ComposerField) {
