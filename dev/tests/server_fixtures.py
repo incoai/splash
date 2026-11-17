@@ -927,6 +927,7 @@ def main_args(**overrides):
             "sparse_kv_memory": None,
             "kv_format": "int8",
             "state_format": "fp32",
+            "cached_states": "int8",
             "serve_record": None,
             **overrides,
         }
