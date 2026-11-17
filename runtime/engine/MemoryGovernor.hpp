@@ -204,9 +204,10 @@ public:
   void setPressure(MemoryPressure pressure) noexcept;
   void holdUnseen(bool held) noexcept { unseenHeld_ = held; }  // a lane holds memory no command of it wrote
   [[nodiscard]] bool unseenHeld() const noexcept { return unseenHeld_; }
-  // What the governor makes of a fresh sample of the host. Reading it changes
-  // nothing: the host's band moves only with the samples a reservation or the
-  // control pass takes, so /status does not move admission.
+  // What the governor makes of a fresh sample of the host. Reading it
+  // changes nothing: the host's band moves only with the samples a
+  // reservation or the control pass takes, so /status does not move
+  // admission.
   [[nodiscard]] MemoryGovernorSnapshot snapshot() const noexcept;
   // snapshot(), with the host's band moved to its sample, as a
   // reservation's and the control pass's move it.

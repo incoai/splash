@@ -41,8 +41,9 @@ inline constexpr double kResourceWaitTimeoutMilliseconds = 30000.0;
 // later, without spinning the loop on attempts.
 inline constexpr double kResourceRetryBackoffMilliseconds = 100.0;
 // The output a request's KV is projected to hold at admission, at most: the
-// tokens it may still generate, clipped to this many. A request that outgrows
-// it converts to Spill when memory refuses its growth (EngineSpillConfig).
+// tokens it may still generate, clipped to this many. A request that
+// outgrows it converts to Spill when memory refuses its growth
+// (EngineSpillConfig).
 inline constexpr uint32_t kProjectedOutputTokens = 4096;
 
 // The engine's constructor refuses a config without its context window, its
@@ -265,15 +266,16 @@ public:
 
   // While the weights are released or being restored (weightsHeld), a tick
   // runs its timed checks, collects transfers and runs write-behind, then
-  // takes back one part of the weights while a request waits, inside a Floor
-  // claim's scope, which the host's margins do not refuse. A part that comes
-  // back ends their waits for memory; a refused one makes them wait for
-  // memory (resourceWaitSnapshot), retried at every tick, which the loop runs
-  // for their retries and limits; each fails once the attempt at or past its
-  // own limit is refused. Once no request waits, the restore goes on inside a
-  // Start claim's scope, as the host's margins admit it, and a refused part
-  // ends it: the weights give back what came back. No request runs until they
-  // are back. While a part is written on its thread (weightsWriting), a tick
+  // takes back one part of the weights while a request waits, inside a
+  // Floor claim's scope, which the host's margins do not refuse. A part that
+  // comes back ends their waits for memory; a refused one makes them wait
+  // for memory (resourceWaitSnapshot), retried at every tick, which the loop
+  // runs for their retries and limits; each fails once the attempt at or
+  // past its own limit is refused. Once no request waits, the restore goes
+  // on inside a Start claim's scope, as the host's margins admit it, and a
+  // refused part ends it:
+  // the weights give back what came back. No request runs until they are
+  // back. While a part is written on its thread (weightsWriting), a tick
   // only ends the requests whose deadlines passed: the write's end wakes the
   // loop (the completion notifier).
   [[nodiscard]] bool tick(double nowMilliseconds);
@@ -833,8 +835,9 @@ private:
   // Publishes the state of a boundary the lane reached, or reuses the one
   // cached there: `state`, captured, or without one taken from the lane
   // (fromLane) or written from it to the disk tier; `recycled` when its
-  // buffers took room reclaimed from cache. The lane's recovery point retires
-  // as the boundary's kind has it. False when the state was refused.
+  // buffers took room reclaimed from cache. The lane's recovery point
+  // retires as the boundary's kind has it. False when the state was
+  // refused.
   bool publishStateBoundary(Request &request, Request::StateBoundary objective,
                             std::shared_ptr<const CompositeState> state, bool recycled,
                             bool fromLane, double nowMilliseconds);
@@ -895,24 +898,25 @@ private:
   // only as the claim's take rights allow: the model's idle state buffers,
   // which cost nothing and are taken as they go (Model::releaseIdleBuffer),
   // of at least Model::idleBufferBytes of no evicted states, keeping one
-  // lane's start unless the rights take it first (TakeRights::laneStart); the
-  // command between its passes (TakeRights::passCommand), at no cost; with no
-  // command in flight, the releases of the Spill lanes the claim's rights
-  // reach (TakeRights::lanes), neither restoring, ended nor between passes,
-  // the lowest-ranked lane's first: each lane's pages whose copies landed
-  // (Cache::releasablePages) whose every holder is such a lane, off the chain
-  // a Resident start restores, then for a claim that waits for writes those
-  // whose copies land, which it releases once they have (releases); the
-  // lane's conversion to Spill (TakeRights::convertLane) while it is
-  // Resident, decoding or prefilling, not ended and not between passes, on a
-  // target that can spill with the tier open and its quota holding the lane's
-  // pages, and only where the pages it would spill free, net of the first
-  // lane's hot block floor its decode reads, cover what the claim lacks; its
-  // take releases at once its pages whose copies landed, as a release does,
-  // and its claim's retries the rest as their copies land. The command
-  // between its passes gives back the buffers of the states it would capture,
-  // which the model's pool releases at once; its lanes that ended are left to
-  // settleEndedBetweenPasses. Last, for in-service KV
+  // lane's start unless the rights take it first (TakeRights::laneStart);
+  // the command between its passes (TakeRights::passCommand), at no cost;
+  // with no command in flight, the releases of the Spill lanes the claim's
+  // rights reach (TakeRights::lanes), neither restoring, ended nor between
+  // passes, the lowest-ranked lane's first: each lane's pages whose copies
+  // landed (Cache::releasablePages) whose every holder is such a lane, off
+  // the chain a Resident start restores, then for a claim that waits for
+  // writes those whose copies land, which it releases once they have
+  // (releases); the lane's conversion to Spill (TakeRights::convertLane)
+  // while it is Resident, decoding or prefilling, not ended and not between
+  // passes, on a target that can spill with the tier open and its quota
+  // holding the lane's pages, and only where the pages it would spill free,
+  // net of the first lane's hot block floor its decode reads, cover what the
+  // claim lacks; its take releases at once its pages whose copies landed,
+  // as a release does, and its claim's retries the rest as their copies
+  // land.
+  // The command between its passes gives back the buffers of the states it
+  // would capture, which the model's pool releases at once; its lanes that
+  // ended are left to settleEndedBetweenPasses. Last, for in-service KV
   // (TakeRights::LaneStart::Last), the pooled buffers one lane starts from,
   // all the pool keeps released.
   class EngineVictims final : public VictimSource {
@@ -931,23 +935,24 @@ private:
     // rights reach (VictimQuery::reaches), neither restoring, ended nor
     // between their command's passes, off the chain a Resident start restores.
     [[nodiscard]] ReleaseRule releaseRule(const VictimQuery &query) const;
-    // Each lane's units: for a need of Full pages, the claim's pages moved in
-    // place, with the bytes of the extent more that keeps the Index runway
+    // Each lane's units: for a need of Full pages, the claim's pages moved
+    // in place, with the bytes of the extent more that keeps the Index runway
     // (Cache::inPlaceMoves), offered where the reads of the lanes they give
     // Index pages lack nothing, since what it frees is not sized for them;
     // then for a need of bytes the host did not refuse, whole extents of
     // pages and one more the free Full pages beside complete
     // (Cache::releaseBeside), as many as compaction can empty
     // (Cache::releaseMoves), each page freeing its Full bytes less its Index
-    // page's, less what those reads take (readsShortfall), offered where they
-    // free some; last, after every lane's, outside --kv-spill always, for a
-    // claim that waits for writes, those whose copies land, which leave it
-    // Pending (later). The units for bytes count what their takes in turn
-    // free as the copies stand, each page, each lane's first reads and each
-    // extent once (ReleaseCount): copies that land before the takes can lower
-    // the count, by 102 MB for two lanes on one conversation, as a lane's
-    // landed pages then join, in its whole extents, shared pages a later
-    // lane's unit counted. A key is the lane's request.
+    // page's, less what those reads take (readsShortfall), offered where
+    // they free some; last, after every lane's, outside --kv-spill always,
+    // for a claim that waits for writes, those whose copies land, which
+    // leave it Pending (later).
+    // The units for bytes count what their takes in turn free as the copies
+    // stand, each page, each lane's first reads and each extent once
+    // (ReleaseCount): copies that land before the takes can lower the
+    // count, by 102 MB for two lanes on one conversation, as a lane's landed
+    // pages then join, in its whole extents, shared pages a later lane's
+    // unit counted. A key is the lane's request.
     [[nodiscard]] std::vector<Victim> releases(const VictimQuery &query) const;
     [[nodiscard]] std::vector<Victim> conversions(const VictimQuery &query) const;
     Engine &engine_;
@@ -1109,12 +1114,13 @@ private:
   // the lane refused.
   [[nodiscard]] Prepared refuse(std::span<const Denied> denied, const PlanContext &plan);
   // What a scheduled lane's growth reclaims up to. A scheduled lane is
-  // resident: it grows as a request in service. The lane that yields first if
-  // growth fails takes nothing in use, since its own suspension, not another
-  // conversation's replay point, pays for it. While other lanes fit, it waits
-  // for them instead, resident and denied each step, as a start a resident
-  // lane holds back waits. Which lane that is is asked where it matters: an
-  // allocation may give up the command between its passes (EngineVictims).
+  // resident: it grows as a request in service. The lane that yields first
+  // if growth fails takes nothing in use, since its own suspension, not
+  // another conversation's replay point, pays for it. While other lanes
+  // fit, it waits for them instead, resident and denied each step, as a
+  // start a resident lane holds back waits. Which lane that is is asked
+  // where it matters: an allocation may give up the command between its
+  // passes (EngineVictims).
   [[nodiscard]] ReclaimClass growthClass(const Request &active) const;
   // The KV a lane's command takes before it runs. A prefill command's KV
   // reaches its first state boundary first; what lies past it follows once
@@ -1140,14 +1146,15 @@ private:
   [[nodiscard]] uint64_t kvCapacity(uint64_t requestId) const;
   // For a request of this priority that cannot start: suspends the lane that
   // yields first (laneToYield) if its priority is strictly lower, without a
-  // drain, or abandons the command between its passes that holds it if a lane
-  // of that command ended, which that frees (yieldsEndedLanes). A lane of
-  // that command, of a lower priority than the start, gives the command up
-  // with its suspension, as the start's prompt would (Scheduler::yieldsTo).
-  // The lane waits as for a free one, and resumes once admission reaches it
-  // again, a Resident one with its current KV capacity. True when one was
-  // suspended or freed. Memory on its way back makes no lane yield, as in
-  // prepare(): a request refused while it is pending waits for it instead.
+  // drain, or abandons the command between its passes that holds it if a
+  // lane of that command ended, which that frees (yieldsEndedLanes). A lane
+  // of that command, of a lower priority than the start, gives the command
+  // up with its suspension, as the start's prompt would
+  // (Scheduler::yieldsTo). The lane waits as
+  // for a free one, and resumes once admission reaches it again, a Resident
+  // one with its current KV capacity. True when one was suspended or freed.
+  // Memory on its way back makes no lane yield, as in prepare(): a request
+  // refused while it is pending waits for it instead.
   [[nodiscard]] bool preemptBelow(RequestPriority priority, double nowMilliseconds);
   [[nodiscard]] bool resourceRetryReady(const Request &request,
                                         double nowMilliseconds) const noexcept;
