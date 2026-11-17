@@ -27,6 +27,7 @@
 #include "../../../runtime/ops/BlockIndexer.hpp"
 #include "../../../runtime/ops/HyperConnection.hpp"
 #include "../../../runtime/ops/NgramEmbedding.hpp"
+#include "../../../runtime/ops/PagedAttention.hpp"
 #include "../../../runtime/ops/RoPE.hpp"
 #include "../../../runtime/ops/Sampling.hpp"
 #include "LinearInputReference.hpp"
@@ -1697,8 +1698,13 @@ void pleHashPackedLanes(MetalBackend &backend) {
 // serves at most and at a window YaRN stretches to 300,020 tokens, where an
 // 8-row tile's slack left a 16-row lane's bitmap a block short, by their
 // ratio to the native window (model::servedFor), whose prefill scores keep
-// the native window's scratch; the native window's scratch refuses rows at
-// the end of YaRN's.
+// the native window's scratch: the selection's bitmaps and scores
+// (BlockIndexer), and the block lists of the same rows' tiles
+// (PagedAttention::addBlockLists), each lane's after the lanes' before it
+// as Qwen4ExpTarget lays them out, whose bitmaps must reach the rows' last
+// block and whose lists and counts the scratch must hold, a 16-row lane's
+// two tiles' each; the native window's scratch refuses rows at the end of
+// YaRN's, to both.
 void qsaScratchCoversWindow(MetalBackend &backend) {
   constexpr uint32_t kChunk = 2048, kVerify = 8, kBlock = SPLASH_TARGET_VERIFY_ROWS, kLanes = 4;
   const model::Qwen4ExpWeights weights;
@@ -1730,6 +1736,25 @@ void qsaScratchCoversWindow(MetalBackend &backend) {
     }
     return !graph.empty();
   };
+  // The block lists of the same rows' tiles.
+  const auto lists = [&](const model::Qwen4Scratch &s, uint32_t rows, std::vector<uint32_t> firsts) {
+    std::vector<ops::LaneRows> blocks;
+    std::vector<ops::BlockListRows> sequences;
+    for (uint32_t lane = 0, list = 0; lane < firsts.size(); ++lane) {
+      blocks.push_back({lane * rows, rows});
+      sequences.push_back({lane, rows, firsts[lane], list});
+      list += splash::kv::attentionTiles(rows);
+    }
+    CommandGraph graph;
+    try {
+      ops::PagedAttention::addBlockLists(graph, s.qsaMask, s.maskWords, sequences,
+                                         {upload(backend, blocks), static_cast<uint32_t>(blocks.size()) * rows},
+                                         {s.qsaLists, s.qsaListCounts, s.listStride, 0});
+    } catch (const std::invalid_argument &) {
+      return false;
+    }
+    return !graph.empty();
+  };
   uint64_t nativeScores = 0;
   for (const auto &[geometry, window] :
        {std::pair{&native, 262'144U}, std::pair{&yarn, 1'010'000U}, std::pair{&stretched, 300'020U}}) {
@@ -1741,9 +1766,14 @@ void qsaScratchCoversWindow(MetalBackend &backend) {
               selects(verify, kVerify, std::vector<uint32_t>(kLanes, window - kVerify)) &&
               selects(verify, kBlock, std::vector<uint32_t>(kLanes, window - 2)) && scores <= nativeScores,
           "QSA scratch of a " + std::to_string(window) + "-token window: its last rows, within the native scores");
+    check(lists(prefill, kChunk, {window - kChunk}) &&
+              lists(verify, kVerify, std::vector<uint32_t>(kLanes, window - kVerify)) &&
+              lists(verify, kBlock, std::vector<uint32_t>(kLanes, window - 2)),
+          "QSA block lists of a " + std::to_string(window) + "-token window: its last rows' tiles");
   }
   const model::Qwen4Steps steps(weights, native, backend, 1);
-  check(!selects(steps.prefillScratch(0), kChunk, {1'010'000 - kChunk}),
+  check(!selects(steps.prefillScratch(0), kChunk, {1'010'000 - kChunk}) &&
+            !lists(steps.prefillScratch(0), kChunk, {1'010'000 - kChunk}),
         "QSA scratch of the native window refuses the rows of YaRN's");
 }
 
