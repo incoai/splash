@@ -806,14 +806,13 @@ ClaimSpec Engine::stateClaim(const Request &active, StateClass kind, bool supers
 }
 
 Engine::Reservation Engine::reserveStateBuffers(Request &active, uint32_t tokens, const ClaimSpec &spec, Refusal refusal) {
-  Reservation result;
+  std::shared_ptr<StateReservation> buffers;
   const auto taken = allocate([&] {
     metal::AllocationFailure failure = metal::AllocationFailure::None;
-    result.buffers = model_.reserveState(active.request.id, tokens, failure);
-    return StateBuffers{.ok = result.buffers != nullptr, .allocationFailure = failure};
+    buffers = model_.reserveState(active.request.id, tokens, failure);
+    return StateBuffers{.ok = buffers != nullptr, .allocationFailure = failure};
   }, spec, refusal);
-  result.recycled = result.buffers && taken.freed;
-  return result;
+  return {buffers, buffers && taken.freed};
 }
 
 Engine::Reservation Engine::reserveCapture(Request &active, StateClass kind, uint32_t tokens,

@@ -3501,7 +3501,16 @@ ModelMemoryAdmission Runtime::suspend(uint64_t id, SuspensionKind kind, uint64_t
   }
 }
 
-StateAdmission Runtime::resumeExact(uint64_t id, uint64_t resident) {
+StateAdmission Runtime::resumeExact(uint64_t id, uint64_t resident, bool allowFreeLane) {
+  if (resident && allowFreeLane) {
+    const auto &entry = impl_->request(id);
+    const auto &peer = impl_->request(resident);
+    if (!entry.parked || !entry.parkedPacketCapacity || !peer.resident || peer.stateLane != entry.stateLane)
+      throw std::logic_error("independent return needs a prepared parked owner and its resident peer");
+    if (const auto free = impl_->availableLane()) {
+      return restoreParkedInto(id, *free);
+    }
+  }
   return resident ? exchangeDecodedRequests(id, resident) : restoreParkedRequest(id);
 }
 
@@ -3552,37 +3561,33 @@ ModelMemoryAdmission Runtime::parkDecodedRequest(uint64_t requestId, bool exchan
 }
 
 StateAdmission Runtime::restoreParkedRequest(uint64_t requestId) {
-  Impl::Request &entry = impl_->request(requestId);
-  if (entry.resident || !entry.parked)
-    throw std::logic_error("Qwen request is not parked");
-  if (impl_->backend.commandInFlight())
+  const auto &entry = impl_->request(requestId);
+  if (entry.resident || !entry.parked) throw std::logic_error("Qwen request is not parked");
+  // An orphan bank keeps its original floor. A paired return into a distinct
+  // free slot is explicit in resumeExact and reserves that new floor first.
+  const auto lane = entry.parkedPacketCapacity ? std::optional(entry.stateLane) : impl_->availableLane();
+  return lane ? restoreParkedInto(requestId, *lane) : StateAdmission{{}, StateFailure::ConcurrencyLimit};
+}
+
+StateAdmission Runtime::restoreParkedInto(uint64_t requestId, uint32_t lane) {
+  auto &entry = impl_->request(requestId);
+  if (entry.resident || !entry.parked) throw std::logic_error("Qwen request is not parked");
+  if (impl_->backend.commandInFlight() || impl_->states.metadata(lane).assigned())
     return {{}, StateFailure::ConcurrencyLimit};
-  const auto restore = [&](uint32_t lane) -> StateAdmission {
-    if (impl_->blockCache) {
-      const ModelMemoryAdmission hot = impl_->blockCache->reserveLane(lane);
-      if (!hot.granted())
-        return {{}, StateFailure::MemoryPressure, hot.allocationFailure};
-    }
-    const auto metadata = entry.parked->metadata();
-    auto *source = static_cast<uint8_t *>(entry.parked->scratch().contents());
-    impl_->copyDecodeScratch(lane, metadata, source + entry.parkedPacketOffset, true);
-    impl_->states.restoreParkedLane(lane, requestId, entry.parked);
-    entry.stateLane = lane;
-    entry.resident = true;
-    if (entry.parkedPacketCapacity) --impl_->exchangeBanks;
-    entry.parkedPacketCapacity = entry.parkedPacketOffset = entry.reservedBorrower = 0;
-    impl_->pageTableBindings[lane] = {};
-    return {lane, StateFailure::None};
-  };
-  // An exchange bank retains its original physical floor. Restoring into a
-  // different free lane would orphan that reservation or borrow another bank's.
-  if (entry.parkedPacketCapacity) {
-    if (impl_->states.metadata(entry.stateLane).assigned())
-      return {{}, StateFailure::ConcurrencyLimit};
-    return restore(entry.stateLane);
+  if (impl_->blockCache) {
+    const auto hot = impl_->blockCache->reserveLane(lane);
+    if (!hot.granted()) return {{}, StateFailure::MemoryPressure, hot.allocationFailure};
   }
-  const auto lane = impl_->availableLane();
-  return lane ? restore(*lane) : StateAdmission{{}, StateFailure::ConcurrencyLimit};
+  const auto metadata = entry.parked->metadata();
+  auto *source = static_cast<uint8_t *>(entry.parked->scratch().contents());
+  impl_->copyDecodeScratch(lane, metadata, source + entry.parkedPacketOffset, true);
+  impl_->states.restoreParkedLane(lane, requestId, entry.parked);
+  entry.stateLane = lane;
+  entry.resident = true;
+  if (entry.parkedPacketCapacity) --impl_->exchangeBanks;
+  entry.parkedPacketCapacity = entry.parkedPacketOffset = entry.reservedBorrower = 0;
+  impl_->pageTableBindings[lane] = {};
+  return {lane, StateFailure::None};
 }
 
 StateAdmission Runtime::exchangeDecodedRequests(uint64_t parkedId, uint64_t residentId) {

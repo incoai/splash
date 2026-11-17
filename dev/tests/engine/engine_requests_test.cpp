@@ -2059,6 +2059,39 @@ void testExactForegroundTurnsSustainEightStreams() {
   }
 }
 
+void testExactForegroundTurnsUseFreedPhysicalSlots() {
+  for (const bool refuse : {false, true}) {
+    test::EngineHarness h({.pages = 1024, .engine = {.foregroundTurnTokens = 8}});
+    h.model.exactContinuations = true; h.model.denyExactExpansion = refuse; h.model.firstTokens = true;
+    h.model.decodeFinishes = false; h.model.decodeTokens = 1;
+    for (uint64_t id = 1; id <= 8; ++id) {
+      auto input = request(id, std::vector<uint32_t>(40, static_cast<uint32_t>(id)));
+      input.priority = RequestPriority::Foreground; input.maxNewTokens = 256;
+      h.engine.submit(std::move(input));
+    }
+    h.runUntil([&] { return h.engine.snapshot().scheduler.parked == 4; }, "four pairs did not form");
+    std::vector<uint64_t> finishedPair;
+    for (const auto &[id, active] : h.model.requests)
+      if (active.lane == 0) finishedPair.push_back(id);
+    require(finishedPair.size() == 2, "the completed pair did not share its physical slot");
+    for (auto id : finishedPair) h.engine.cancel(id);
+    h.runUntil([&] { return h.engine.snapshot().scheduler.decoding == 4 || h.engine.snapshot().completed > 0; },
+               "parked owners did not refill the available physical slots");
+    const auto snapshot = h.engine.snapshot();
+    if (refuse)
+      require(h.model.exactExpansions == 0 && snapshot.completed > 0 && h.events.failedCount == 0,
+              "refused independent return did not retain productive paired progress");
+    else
+      require(snapshot.scheduler.decoding == 4 && snapshot.scheduler.parked == 2 && h.model.exactExpansions > 0 &&
+                  snapshot.completed == 0 && h.events.failedCount == 0,
+              "a free physical slot remained idle beside a parked foreground owner");
+    h.runUntilIdle();
+    require(h.engine.snapshot().completed == 6 && h.engine.snapshot().cancelled == 2 &&
+                h.model.requests.empty() && h.engine.snapshot().resourceReplayTokens == 0,
+            "expanding a pair lost ownership or replayed output");
+  }
+}
+
 void testExactForegroundTurnsCancelAndExpireParkedOwners() {
   for (const bool parked : {false, true}) {
     test::EngineHarness h({.pages = 1024, .engine = {.foregroundTurnTokens = 4}});
@@ -2768,6 +2801,7 @@ void testStopInFlightFinishesAfterTheCommand() {
 
 std::span<const test::TestCase> requestsTests() {
   static constexpr test::TestCase kTests[] = {
+      {"testExactForegroundTurnsUseFreedPhysicalSlots", testExactForegroundTurnsUseFreedPhysicalSlots},
       {"testCancelledStreamingContinuationDoesNotResumeOrEmitAgain", testCancelledStreamingContinuationDoesNotResumeOrEmitAgain},
       {"testForegroundLaneCapacityDoesNotRotateStreamingPeers", testForegroundLaneCapacityDoesNotRotateStreamingPeers},
       {"testExactForegroundTurnsSustainEightStreams", testExactForegroundTurnsSustainEightStreams},

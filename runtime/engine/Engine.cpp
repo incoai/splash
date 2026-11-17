@@ -629,15 +629,21 @@ EngineSnapshot Engine::snapshot() const {
 bool Engine::rotateDecodedTurns() {
   if (!config_.foregroundTurnTokens) return false;
   bool progressed = false;
+  auto occupied = std::ranges::count_if(requests_, [](const auto &item) { return item.second.lane.has_value(); });
   for (auto &[id, parked] : requests_) {
     if (parked.finalized || scheduler_.phase(id) != Phase::Parked) continue;
     Request *peer = parked.exchangePeer ? &request(*parked.exchangePeer) : nullptr;
     if (peer && (!peer->lane || peer->restore || peer->pendingEnd || peer->resourceWait.pending ||
                  scheduler_.phase(peer->request.id) != Phase::Decode ||
                  generatedTokens(*peer) - peer->turnStartedTokens < config_.foregroundTurnTokens)) continue;
-    const auto returned = model_.resumeExact(id, peer ? peer->request.id : 0);
+    const bool expand = peer && occupied < model::ExecutionLimits::maximumBatchWidth;
+    auto returned = expand ? allocate([&] { return model_.resumeExact(id, peer->request.id, true); },
+        {.cls = ClaimClass::Optional, .requestId = id, .rank = rankOf(parked), .timing = NeedTiming::Immediate,
+         .priority = parked.request.priority}, Refusal::Settled).admission : StateAdmission{};
+    if (!returned.granted()) returned = model_.resumeExact(id, peer ? peer->request.id : 0);
     if (!returned.granted()) continue;
-    if (peer) { peer->lane.reset(); scheduler_.parkDecode(peer->request.id); }
+    if (peer && returned.lane == peer->lane) { peer->lane.reset(); scheduler_.parkDecode(peer->request.id); }
+    else if (peer) { peer->exchangePeer.reset(); parked.exchangePeer.reset(); ++occupied; }
     parked.lane = *returned.lane;
     parked.turnStartedTokens = generatedTokens(parked);
     scheduler_.returnDecode(id);

@@ -301,12 +301,22 @@ public:
     pageTables.erase(id);
     return {.ok = true};
   }
-  StateAdmission resumeExact(uint64_t id, uint64_t resident = 0) override {
+  StateAdmission resumeExact(uint64_t id, uint64_t resident = 0, bool allowFreeLane = false) override {
     auto &entry = requests.at(id);
     if (!entry.parked) throw std::logic_error("exact return without a parked owner");
     if (resident) {
       auto &out = requests.at(resident);
       if (!out.resident || out.lane != entry.lane) throw std::logic_error("wrong exact peer");
+      if (allowFreeLane && denyExactExpansion) return {{}, StateFailure::MemoryPressure, metal::AllocationFailure::HostPressure};
+      if (allowFreeLane) {
+        for (uint32_t lane = 0; lane < maximumLanes; ++lane) {
+          if (std::ranges::any_of(requests, [lane](const auto &item) { return (item.second.resident || item.second.parked) && item.second.lane == lane; })) continue;
+          entry.lane = lane; entry.resident = true; entry.parked = false; entry.reservedBorrower = 0;
+          giveBackStates(entry.exactScratchBytes); entry.exactScratchBytes = 0;
+          pageTables.erase(id); ++exactExpansions;
+          return {lane, StateFailure::None};
+        }
+      }
       if (out.awaitingMask || out.constrained || out.generated + 1 >= outputLimits.at(resident))
         return {{}, StateFailure::ConcurrencyLimit};
       out.reservedBorrower = 0;
@@ -919,8 +929,8 @@ public:
   // Begins the budget refuses, and resumes the host refuses.
   uint32_t deniedBegins = 0;
   uint64_t exactBankBytes = 4096;
-  bool exactContinuations = false, denyExactPark = false;
-  uint32_t exactParks = 0, exactExchanges = 0, exactReturns = 0;
+  bool exactContinuations = false, denyExactPark = false, denyExactExpansion = false;
+  uint32_t exactParks = 0, exactExchanges = 0, exactReturns = 0, exactExpansions = 0;
   uint32_t suspensions = 0;
   // The request of each suspension, in order.
   std::vector<uint64_t> suspendedIds;

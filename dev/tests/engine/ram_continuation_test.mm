@@ -594,6 +594,75 @@ void reservedSlotCases(RuntimeResources &resources, model::Runtime &runtime) {
   std::cout << "reserved_slot=PASS preferred_slot=3 unrelated_admission_blocked=1 stale_lease_blocked=1 exact_return=1\n";
 }
 
+void freeSlotExpansionCases(RuntimeResources &resources, model::Runtime &runtime) {
+  auto context = resources.modelContext(); auto &pool = resources.kvPool();
+  std::array<std::vector<uint32_t>, 5> pages;
+  const std::vector<uint32_t> prompt(40, 11);
+  std::array<uint64_t, 5> position{};
+  const auto id = [](uint32_t index) { return uint64_t{1601} + index; };
+  const auto input = [&](uint32_t index) {
+    EngineRequest r; r.id = id(index); r.prompt = prompt; r.maxNewTokens = 4096;
+    r.flags = RequestIgnoreEndOfSequence;
+    r.sampling = {.temperature = 0.7F, .presencePenalty = 0.2F, .frequencyPenalty = 0.1F, .seed = 47};
+    return r;
+  };
+  for (auto &table : pages) {
+    auto acquired = pool.acquirePages(16); require(acquired.granted(), "expansion KV refused");
+    table = std::move(acquired.pages); for (auto page : table) pool.clearPage(page);
+  }
+  const auto begin = [&](uint32_t index, uint32_t lane) {
+    runtime.beginColdRequest(input(index).modelView(), lane);
+    // Cross-owner full-buffer controls also initialize unused ring rows;
+    // ordinary cold starts need only the logical rows the next step reads.
+    context.stateStorage.clearDraftRings(lane);
+    static_cast<void>(step(runtime, id(index), 0, pages[index], prompt));
+    position[index] = prompt.size();
+  };
+  const auto decode = [&](uint32_t index) {
+    auto result = step(runtime, id(index), position[index], pages[index]);
+    position[index] += result.outputTokens.size() - result.outputTokensWithoutKv;
+    return result;
+  };
+  for (uint32_t index = 0; index < 4; ++index) { begin(index, index); static_cast<void>(decode(index)); }
+  const auto compare = [&](std::string_view label, const State &a, const State &b) {
+    try { equal(a, b); }
+    catch (const std::exception &) {
+      throw std::runtime_error(std::string(label) + ": current=" + std::to_string(a.current == b.current) +
+          " next=" + std::to_string(a.next == b.next) + " window=" + std::to_string(a.window == b.window) +
+          " pending=" + std::to_string(a.pending == b.pending) + " penalties=" + std::to_string(a.penalties == b.penalties) +
+          " rings=" + std::to_string(a.rings == b.rings));
+    }
+  };
+  const auto saved = state(runtime, context.stateStorage, 1);
+  model::Model &model = runtime;
+  require(model.suspend(id(1), model::SuspensionKind::Exact, id(4)).granted(), "expansion bank refused");
+  const auto borrowed = model.begin(input(4).modelView());
+  require(borrowed.granted() && *borrowed.lane == 1, "expansion borrower lost its slot");
+  runtime.setDraftContextPlan(id(4), planDraftContext(0, static_cast<uint32_t>(prompt.size()), {}));
+  static_cast<void>(step(runtime, id(4), 0, pages[4], prompt)); position[4] = prompt.size();
+  static_cast<void>(decode(4));
+  const auto peer = state(runtime, context.stateStorage, 1);
+  runtime.end(id(3));
+  const auto split = model.resumeExact(id(1), id(4), true);
+  require(split.granted() && *split.lane == 3 && context.stateStorage.metadata(1).requestId == id(4),
+          "parked owner did not use the newly free physical slot independently");
+  compare("returned snapshot", saved, state(runtime, context.stateStorage, 3));
+  compare("untouched peer", peer, state(runtime, context.stateStorage, 1));
+  const auto expected = decode(0), actual = decode(1);
+  require(actual.outputTokens == expected.outputTokens && actual.draftedTokens == expected.draftedTokens &&
+              actual.acceptedDraftTokens == expected.acceptedDraftTokens,
+          "independent return changed sampling or speculative continuation");
+  auto control = state(runtime, context.stateStorage, 0); control.metadata.requestId = id(1);
+  compare("control after decode", control, state(runtime, context.stateStorage, 3));
+  for (uint32_t index : {0u, 1u, 2u, 4u}) runtime.end(id(index));
+  for (auto &table : pages) for (auto page : table) pool.releasePage(page, false);
+  for (uint32_t lane = 0; lane < 4; ++lane)
+    require(!context.stateStorage.metadata(lane).assigned() &&
+                (!context.blockCache || !context.blockCache->holdsLane(lane)),
+            "independent return retained a lane or its original peer's hot floor");
+  std::cout << "free_slot_expansion=PASS free_slot_used=1 peer_unchanged=1 state_sampling_parity=1 floors_released=1\n";
+}
+
 void run(const char *metallib) {
   const test::TemporaryDirectory root("splash-ram-continuation");
   for (const bool flashNext : {false, true}) {
@@ -1006,6 +1075,7 @@ void run(const char *metallib) {
       exchangeCases(*resources, *runtime);
       eightOwnerExchangeCases(*resources, *runtime);
       reservedSlotCases(*resources, *runtime);
+      freeSlotExpansionCases(*resources, *runtime);
       for (uint32_t lane = 0; lane < model::ExecutionLimits::maximumBatchWidth; ++lane)
         require(!storage.metadata(lane).assigned(), "continuation test retained an active lane");
       for (const auto *pages : {&baselinePages, &parkedPages, &intruderPages})

@@ -36,7 +36,7 @@ public:
   begin(const ModelRequest &request) override;
   void suspend(uint64_t requestId) override;
   [[nodiscard]] ModelMemoryAdmission suspend(uint64_t requestId, SuspensionKind kind, uint64_t borrower = 0) override;
-  [[nodiscard]] StateAdmission resumeExact(uint64_t requestId, uint64_t residentId = 0) override;
+  [[nodiscard]] StateAdmission resumeExact(uint64_t requestId, uint64_t residentId = 0, bool allowFreeLane = false) override;
   // Experimental RAM-only decode continuation. Not used by Engine admission.
   // The caller must finish every outstanding command ticket before either
   // operation, retain the request's KV pages, and end() on cancellation.
@@ -92,6 +92,7 @@ public:
   telemetry() const noexcept override;
 
 private:
+  [[nodiscard]] StateAdmission restoreParkedInto(uint64_t requestId, uint32_t lane);
   // The state lane of a resident request; the storage checks that its
   // committed state can be cached.
   [[nodiscard]] uint32_t residentLane(uint64_t requestId) const;

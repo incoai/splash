@@ -869,8 +869,9 @@ public:
     return {.ok = true};
   }
   // Return an exact owner into its original free slot, or exchange it with
-  // that slot's resident. Neither successful return needs a new allocation.
-  [[nodiscard]] virtual StateAdmission resumeExact(uint64_t, uint64_t = 0) {
+  // that slot's resident. Default returns allocate nothing. allowFreeLane permits an optional hot-floor
+  // reservation to split a pair into two independent physical lanes.
+  [[nodiscard]] virtual StateAdmission resumeExact(uint64_t, uint64_t = 0, bool = false) {
     return {{}, StateFailure::ConcurrencyLimit};
   }
   [[nodiscard]] virtual StateAdmission resume(const ModelRequest &request) = 0;
