@@ -324,7 +324,7 @@ StreamedMemoryResult planStreamedMemory(const StreamedMemoryInputs &in) {
   bool expertsStream = experts->streams, tableStreams = table->streams;
   for (;;) {
     StreamedMemoryResult result = planParts(in, *experts, *table, in.arenaBytes[expertsStream][tableStreams],
-                                            in.spillArenaBytes[tableStreams]);
+                                            in.spillArenaBytes[expertsStream][tableStreams]);
     if (!result.plan || ((expertsStream || !result.plan->expertBytes) && (tableStreams || !result.plan->tableBytes)))
       return result;
     expertsStream = expertsStream || result.plan->expertBytes;

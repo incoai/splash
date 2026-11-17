@@ -745,8 +745,7 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
   // whose K/V spills, which only a block-sparse target with a spillable
   // layout may have.
   const bool kvMaySpill = config.model.capabilities.sparseKv && kvLayout.spillable();
-  std::array<std::array<uint64_t, 2>, 2> arenaBytes{};
-  std::array<uint64_t, 2> spillArenaBytes{};
+  std::array<std::array<uint64_t, 2>, 2> arenaBytes{}, spillArenaBytes{};
   // The room for active KV, which only a target whose KV may spill plans
   // with: until the tier's files open, what the volume they will take
   // leaves now, a persistent tier's root, whose caches nobody holds count as
@@ -842,11 +841,12 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
       };
       for (const bool table : {false, true}) {
         const uint64_t tableRowBytes = table ? streamable.tableRowBytes : 0;
-        for (const bool experts : {false, true})
-          arenaBytes[experts][table] =
-              arenas({.experts = experts && streamable.expertBytes, .tableRowBytes = tableRowBytes});
-        if (kvMaySpill)
-          spillArenaBytes[table] = arenas({.tableRowBytes = tableRowBytes, .kv = true});
+        for (const bool experts : {false, true}) {
+          model::StreamedParts parts{.experts = experts && streamable.expertBytes, .tableRowBytes = tableRowBytes};
+          arenaBytes[experts][table] = arenas(parts);
+          parts.kv = true;
+          if (kvMaySpill) spillArenaBytes[experts][table] = arenas(parts);
+        }
       }
     } catch (const std::exception &error) {
       throw RuntimeResourcesError(
@@ -961,11 +961,11 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
                                         std::to_string(planned) + " bytes, are not those of the model as it loaded, " +
                                         std::to_string(loadedBytes) + " bytes");
     };
-    const bool tableStreams = loaded.streamedTable() != nullptr;
-    requirePlanned(arenaBytes[loaded.expertStore() != nullptr][tableStreams], modelMemoryPlan,
-                   "a runtime whose K/V is in memory");
+    const bool expertsStream = loaded.expertStore() != nullptr, tableStreams = loaded.streamedTable() != nullptr;
+    requirePlanned(arenaBytes[expertsStream][tableStreams], modelMemoryPlan, "a runtime whose K/V is in memory");
     if (kvMaySpill)
-      requirePlanned(spillArenaBytes[tableStreams], spillModelMemoryPlan, "a runtime whose K/V spills");
+      requirePlanned(spillArenaBytes[expertsStream][tableStreams], spillModelMemoryPlan,
+                     "a runtime whose K/V spills");
   };
   load(false);
 

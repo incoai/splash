@@ -892,30 +892,37 @@ void testSpillNeedsATierAndRoom() {
 }
 
 // A plan that spills holds the arenas of a runtime whose K/V spills, which
-// runs prefill groups and holds where its verifies' blocks are: beside
-// streamed experts what they add comes out of the experts' store, and where
-// the floors hold an empty Spill request only beside the arenas of a runtime
-// whose K/V stays in memory, the plan does not spill.
+// runs prefill groups and holds where its verifies' blocks are, those of
+// what the plan streams: beside streamed experts what they add comes out of
+// the experts' store, and where the floors hold an empty Spill request only
+// beside the arenas of a runtime whose K/V stays in memory, the plan does
+// not spill.
 void testSpillHoldsTheArenasOfASpillingRuntime() {
   constexpr uint64_t kExtra = 256 * kMiB;
   StreamedMemoryInputs inputs = kFlashNext.inputs(kStudio);
   const StreamedMemoryPlan resident = requirePlan(inputs);
   const uint64_t group = arenaBytes(kFlashNext.group);
-  inputs.spillArenaBytes = {group + kExtra, group + kExtra};
+  // The arenas of a spilling runtime whose experts stream, which Flash-Next's
+  // plan streams on the Studio, hold more; those of one whose experts load
+  // whole do not count.
+  inputs.spillArenaBytes = {{{group, group}, {group + kExtra, group + kExtra}}};
   const StreamedMemoryPlan spilling = requirePlan(inputs);
   require(resident.spill.enabled && spilling.spill.enabled && resident.expertBytes - spilling.expertBytes == kExtra,
-          "a plan that spills did not hold the arenas of a runtime whose K/V spills");
+          "a plan that spills did not hold the arenas of a runtime whose K/V spills and whose experts stream");
+  inputs.spillArenaBytes = {{{group + kExtra, group + kExtra}, {group, group}}};
+  require(requirePlan(inputs).expertBytes == resident.expertBytes,
+          "a plan whose experts stream held the arenas of a spilling runtime whose experts load whole");
 
   inputs = kFlashNext.inputs(kM6);
   inputs.experts.setting = inputs.table.setting = {StreamedSetting::Mode::Off, 0};
   const uint64_t chunk = arenaBytes(kFlashNext.chunk);
-  inputs.spillArenaBytes = {chunk, chunk};
+  inputs.spillArenaBytes.fill({chunk, chunk});
   const uint64_t base = inputs.fixedBytes + chunk + inputs.laneStateBytes +
                         256 * test::sparseKvLayout().bytesPerModelPage() + kFlashNext.experts.allBytes +
                         kFlashNext.table.allBytes;
   for (inputs.hardBudgetBytes = base; !requirePlan(inputs).spill.enabled; inputs.hardBudgetBytes += 16 * kMiB)
     require(inputs.hardBudgetBytes < base + 4 * kGiB, "no budget let the target spill");
-  inputs.spillArenaBytes = {chunk + kExtra, chunk + kExtra};
+  inputs.spillArenaBytes.fill({chunk + kExtra, chunk + kExtra});
   require(!requirePlan(inputs).spill.enabled, "spilling was planned beside arenas its runtime does not run");
   inputs.hardBudgetBytes += kExtra;
   require(requirePlan(inputs).spill.enabled, "the spilling runtime's arenas took more than they add");
