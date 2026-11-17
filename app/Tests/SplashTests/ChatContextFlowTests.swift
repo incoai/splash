@@ -584,7 +584,7 @@ extension Chats {
 }
 
 @MainActor
-private final class ContextFixture {
+final class ContextFixture {
     let history = Conversation(title: "Saved chat", messages: [ChatMessage(role: .user, text: String(repeating: "h", count: 800)),
                                                               ChatMessage(role: .assistant, text: "Saved answer")])
     let root: URL
