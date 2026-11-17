@@ -136,9 +136,13 @@ final class ChatStore {
     /// stop would have to take back: the chat stays as it was, and a new one was never listed,
     /// opened or written.
     private struct Pending {
+        /// What a request asks for: a new chat's first message, which has no conversation to show
+        /// in, and which the composer holds meanwhile; a later message, which its chat shows, the
+        /// composer having given it up; or an answer asked again.
+        enum Ask { case first, later, again }
+
         let conversation: Conversation
-        /// Whether its chat is a new one, which has no conversation to show a message in.
-        let new: Bool
+        let ask: Ask
         /// Tells that the message shows in its conversation, for the composer to give it up.
         let shown: () -> Void
     }
@@ -157,12 +161,12 @@ final class ChatStore {
     /// in the open conversation, or the server has yet to take the first message of the new chat.
     var answering: Bool {
         guard let reply else { return false }
-        return pending?.new == true ? selection == nil : reply.conversation == selection
+        return pending?.ask == .first ? selection == nil : reply.conversation == selection
     }
 
     /// Whether the server has yet to take a new chat's first message: the composer holds the
     /// message meanwhile, as it was sent.
-    var sendingFirstMessage: Bool { pending?.new == true }
+    var sendingFirstMessage: Bool { pending?.ask == .first }
 
     private let folder: URL
     /// Where the conversations' attachments are kept, a file each (`Attachment.file`).
@@ -367,6 +371,16 @@ final class ChatStore {
         replying?.cancel()
     }
 
+    /// Stops the request under way as the app quits. A later message the server has yet to take
+    /// is its chat's first, as though the server had taken it: its chat shows it, and the
+    /// composer, which gave it up, goes with the app, as would the attachments no chat names
+    /// (`adoptFiles`). A new chat's first message, which the composer still holds, goes with the
+    /// composer, as any draft does, and an answer asked again leaves the earlier one.
+    func quit() {
+        if pending?.ask == .later { keep() }
+        stop()
+    }
+
     /// Streams the reply to `conversation`'s last message, asked again `instead` of an earlier
     /// answer where one is given. The open conversation shows the request at once, which `shown`
     /// tells; a `new` chat, which has no conversation, shows nothing of it. What the request
@@ -384,7 +398,7 @@ final class ChatStore {
         let history = conversation.messages
         var answer = ChatMessage(role: .assistant, text: "", model: server.model)
         conversation.messages.append(answer)
-        pending = Pending(conversation: conversation, new: new, shown: shown)
+        pending = Pending(conversation: conversation, ask: new ? .first : previous == nil ? .later : .again, shown: shown)
         if !new { shown() }
         let reply = Reply(answer, in: conversation.id)
         self.reply = reply
@@ -465,13 +479,13 @@ final class ChatStore {
     private func keep() {
         guard let pending else { return }
         self.pending = nil
-        guard var conversation = pending.new ? pending.conversation
+        guard var conversation = pending.ask == .first ? pending.conversation
             : conversations.first(where: { $0.id == pending.conversation.id }) else { return }
         conversation.messages = pending.conversation.messages
         if conversation.title.isEmpty { conversation.title = pending.conversation.title }
         conversation.updated = .now
         put(conversation)
-        guard pending.new else { return }
+        guard pending.ask == .first else { return }
         if selection == nil { selection = conversation.id }
         pending.shown()
     }

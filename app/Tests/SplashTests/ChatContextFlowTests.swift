@@ -304,6 +304,39 @@ struct ChatContextFlowTests {
         }
     }
 
+    /// A quit while the server holds a later message keeps the message in its chat, which shows
+    /// it, with its attachments and its answer stopped, and the next launch reads it there and
+    /// keeps the attachments' files, which the chat names. Given back to the composer, which goes
+    /// with the app, the message was lost, and the next launch took its attachments for those of
+    /// a draft and removed them.
+    @Test func aQuitWhileTheServerHoldsALaterMessageKeepsItInItsChat() async throws {
+        try await withServer { fixture in
+            let state = fixture.state
+            state.draft.text = "Short?"
+            state.draft.attach([try #require(NSImage(data: Showcase.picture))])
+            try await waitFor(!state.draft.attachments.isEmpty, "the picture")
+            let attachments = state.draft.attachments
+            try fixture.hold()
+            state.sendDraft()
+            try await fixture.held()
+            #expect(state.draft.isEmpty && state.quitCost.requests == 1)
+            state.quit()
+            AppDelegate(state: state).applicationWillTerminate(Notification(name: NSApplication.willTerminateNotification))
+            try await waitFor(state.chats.streaming == nil, "the stop")
+            #expect(state.draft.isEmpty)
+            let kept = try #require(state.chats.conversations.first)
+            #expect(kept.id == fixture.history.id && kept.messages.map(\.text) == fixture.history.messages.map(\.text) + ["Short?", ""])
+            #expect(kept.messages.dropLast().last?.attachments == attachments && kept.messages.last?.stopped == true)
+            state.chats.flush()
+            let next = ChatStore(folder: fixture.root.appending(path: "chats"))
+            #expect(next.conversations == [kept])
+            next.adoptFiles()
+            next.flush()
+            #expect(attachments.allSatisfy { FileManager.default.fileExists(atPath: next.attachments.appending(path: $0.file).path) })
+            try fixture.release()
+        }
+    }
+
     /// A later message stopped while the server holds it goes back to the composer, with nothing
     /// to say, and its chat is as it was, in the list and on disk.
     @Test func aLaterMessageStoppedBeforeTheServerTakesItGoesBack() async throws {

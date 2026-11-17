@@ -418,7 +418,7 @@ final class AppState {
     /// models gets SIGINT, as Ctrl+C sends, and SIGKILL 5 s later.
     func quit() {
         quitting = true
-        chats.stop()
+        chats.quit()
         drawer.endAll()
         // A deletion cut short would leave files no one uses: the quit waits for it.
         if installer.work != .removal { installer.cancel() }
