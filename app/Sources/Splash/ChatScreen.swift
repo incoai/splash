@@ -52,7 +52,7 @@ struct ChatScreen: View {
             get: { deletion != nil }, set: { if !$0 { deletion = nil } }
         ), presenting: deletion) { deletion in
             Button("Delete", role: .destructive) {
-                state.chats.delete(deletion.ids)
+                state.delete(deletion.ids)
                 // Those picked, deleted, end the picking; another chat deleted leaves the rest.
                 if picked == deletion.ids { picked = nil } else { picked?.subtract(deletion.ids) }
             }

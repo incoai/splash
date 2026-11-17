@@ -182,6 +182,13 @@ final class Draft {
         drafts[nil] = draft
     }
 
+    /// Forgets the drafts of `chats`, deleted (`AppState.delete`). An attachment of theirs still
+    /// being encoded joins no draft once kept (`update`), and its file goes as the next launch
+    /// finds no chat naming it (`ChatStore.adoptFiles`).
+    func forget(_ chats: Set<UUID>) {
+        for chat in chats { drafts[chat] = nil }
+    }
+
     /// Takes back `refused`, what a request that came to nothing gives back, in its chat's draft:
     /// the text the draft gave up before what was typed there since, a blank line apart, its
     /// attachments before those attached since, and why, where there is a why.

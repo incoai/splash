@@ -515,6 +515,12 @@ final class AppState {
         if carried { draft.carry(from: open) }
     }
 
+    /// Deletes the conversations of `ids` (`ChatStore.delete`), and their drafts.
+    func delete(_ ids: Set<UUID>) {
+        chats.delete(ids)
+        draft.forget(ids)
+    }
+
     /// Sends the draft to the running model. The composer gives the message up as it shows in its
     /// conversation (`ChatStore.send`): at once in an open one, and in a new chat, which has none,
     /// once the server has taken it and the chat opens. Until then the composer holds a new chat's

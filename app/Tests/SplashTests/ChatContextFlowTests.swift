@@ -106,6 +106,27 @@ struct ChatContextFlowTests {
         }
     }
 
+    /// Deleting a chat forgets its draft, and an image still being encoded for it joins no draft
+    /// once kept. Kept, the deleted chat's draft held its text until the app quit, and the late
+    /// image made it a draft again.
+    @Test func deletingAChatForgetsItsDraft() async throws {
+        try await withServer { fixture in
+            let state = fixture.state
+            let id = fixture.history.id
+            state.draft.text = "Not sent"
+            state.draft.attach([try #require(NSImage(data: Showcase.picture))])
+            state.delete([id])
+            #expect(state.chats.conversations.isEmpty && state.chats.selection == nil && state.draft.isEmpty)
+            // Attachments join in the order they were attached: once a later one is kept, the
+            // deleted chat's has gone where it goes.
+            state.draft.attach([try #require(NSImage(data: Showcase.picture))])
+            try await waitFor(state.draft.attachments.count == 1, "the later image")
+            // The deleted chat's id, which nothing lists, as its draft was kept under it.
+            state.chats.selection = id
+            #expect(state.draft.isEmpty && state.draft.attaching == 0 && state.draft.notice == nil)
+        }
+    }
+
     @Test func aPromptInsideTheReplyAllowanceStillGoes() async throws {
         try await withServer { fixture in
             let state = fixture.state
