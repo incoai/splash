@@ -29,7 +29,8 @@ inline float codecWiden(uint16_t value) {
 // (metal/abi/StateCodec.h). A block's scale is its largest magnitude over 127
 // rounded to nearest even bf16; a value's code the value over the scale
 // rounded to nearest even (nearbyint's default), within [-127, 127], or zero
-// in a block of zeros.
+// in a block of zeros. A block that holds NaN or an infinity has a NaN scale
+// (common/state_codec.h) and, here, zero codes.
 inline std::vector<uint8_t> stateCodesReference(const float *values, uint32_t rows, uint32_t columns) {
   constexpr uint32_t block = SPLASH_STATE_CODEC_BLOCK;
   std::vector<uint8_t> image(state_codec_layer_bytes(rows, columns));
@@ -38,12 +39,13 @@ inline std::vector<uint8_t> stateCodesReference(const float *values, uint32_t ro
     const float *blockValues = values + b * block;
     float amax = 0.0F;
     for (uint32_t i = 0; i < block; ++i)
-      amax = std::max(amax, std::fabs(blockValues[i]));
-    const uint16_t scale = codecBf16(amax * (1.0F / 127.0F));
+      amax = std::isfinite(blockValues[i]) ? std::max(amax, std::fabs(blockValues[i])) : INFINITY;
+    const uint16_t scale = std::isfinite(amax) ? codecBf16(amax * (1.0F / 127.0F)) : uint16_t{0x7FC0};
     const float wide = codecWiden(scale);
     for (uint32_t i = 0; i < block; ++i) {
       const auto code = static_cast<int8_t>(
-          wide > 0.0F ? std::clamp(std::nearbyint(blockValues[i] / wide), -127.0F, 127.0F) : 0.0F);
+          wide > 0.0F && std::isfinite(wide) ? std::clamp(std::nearbyint(blockValues[i] / wide), -127.0F, 127.0F)
+                                             : 0.0F);
       std::memcpy(image.data() + b * block + i, &code, 1);
     }
     std::memcpy(image.data() + state_codec_scales_offset(rows, columns) + b * 2, &scale, 2);

@@ -2359,7 +2359,9 @@ block's largest magnitude over 127 (`ops::StateCodec`): 38 MiB of the 27B's 47
 MiB state, where the FP32 state takes 144 MiB. The codes are made once as a
 state is captured and decoded once as it is restored, so the running state
 keeps its format; the relative error of a decoded state is 0.8 to 0.9% on the
-27B, 35B and Qwen3.8-Flash-Next alike. A row's scale fits GDN, whose decay is per
+27B, 35B and Qwen3.8-Flash-Next alike. A block that holds NaN or an infinity
+gets a NaN scale and restores as NaN, every value of it, so a state that was
+not finite never comes back as one that is. A row's scale fits GDN, whose decay is per
 head: a scale per key column, across rows of very different size, had 2.4
 times the error and 6 to 10 times the effect on the next-token distributions.
 Lanes and cached states pool their cells apart (`QwenBufferPool`): a cached

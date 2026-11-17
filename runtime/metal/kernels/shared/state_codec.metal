@@ -23,10 +23,11 @@ inline void state_quantize_thread(device const State *state, device char *codes,
   // The block's scale from one pass over the values and their codes from a
   // second: Apple11's compiler (macOS 27.0) crashed in register allocation
   // when the thread held its values in an array across the shuffle.
-  float amax = 0.0f;
+  uint amax = 0;
   for (uint i = 0; i < kValues; i += 4) {
-    const float4 four = abs(float4(*reinterpret_cast<device const vec<State, 4> *>(values + i)));
-    amax = max(amax, max(max(four.x, four.y), max(four.z, four.w)));
+    const float4 four = float4(*reinterpret_cast<device const vec<State, 4> *>(values + i));
+    amax = max(amax, max(max(state_codec_magnitude(four.x), state_codec_magnitude(four.y)),
+                         max(state_codec_magnitude(four.z), state_codec_magnitude(four.w))));
   }
   amax = max(amax, simd_shuffle_xor(amax, 1));
   const bfloat scale = state_codec_scale(amax);

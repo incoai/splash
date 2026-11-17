@@ -1,11 +1,15 @@
 // The cached form of GDN recurrent layers (ops::StateCodec) against a CPU
 // reference, byte for byte: the codes and bf16 scales of every block, and the
 // values decoded from them, over fp32 and bf16 running states of every
-// family's GDN rows, layers apart by their own strides. A block is two
-// threads' halves, so blocks whose largest magnitude lies in either half, in
-// both, or nowhere (zeros) check the halves' shared scale. Every decoded
-// value is within half its block's step of the value coded, and each case's
-// state within the bound measured on the models: a relative error of 1%.
+// family's GDN rows, layers apart by their own strides, and of rows whose
+// threads leave most of their threadgroup idle, which write nothing past
+// their layer. A block is two threads' halves, so blocks whose largest
+// magnitude lies in either half, in both, or nowhere (zeros) check the
+// halves' shared scale. Every decoded value is within half its block's step
+// of the value coded, and each case's state within the bound measured on the
+// models: a relative error of 1%. A block that holds NaN or an infinity in
+// either half restores as NaN, every value of it, and the blocks around it
+// as the reference codes them.
 #include "metal/CommandGraph.hpp"
 #include "metal/MetalBackend.hpp"
 #include "model/Bfloat16.hpp"
@@ -95,6 +99,10 @@ void runCase(MetalBackend &backend, uint32_t rows, uint32_t layers, GdnStateForm
   MetalBuffer state = splash::test::sharedBuffer(backend, uint64_t{layers} * shape.stateLayerBytes);
   MetalBuffer codes = splash::test::sharedBuffer(backend, uint64_t{layers} * shape.codesLayerBytes);
   MetalBuffer decoded = splash::test::sharedBuffer(backend, uint64_t{layers} * shape.stateLayerBytes);
+  // What the codec leaves alone: the bytes between layers.
+  constexpr uint8_t kUntouched = 0x5A;
+  std::memset(codes.contents(), kUntouched, codes.sizeBytes());
+  std::memset(decoded.contents(), kUntouched, decoded.sizeBytes());
   const uint64_t layerValues = uint64_t{rows} * columns;
   for (uint32_t layer = 0; layer < layers; ++layer)
     for (uint64_t i = 0; i < layerValues; ++i) {
@@ -145,9 +153,91 @@ void runCase(MetalBackend &backend, uint32_t rows, uint32_t layers, GdnStateForm
       squaredNorm += double(value) * value;
     }
   }
+  const auto untouched = [&](const MetalBuffer &buffer, uint64_t layerStride, uint64_t layerBytes) {
+    for (uint32_t layer = 0; layer < layers; ++layer)
+      for (uint64_t at = layer * layerStride + layerBytes; at < (layer + 1) * layerStride; ++at)
+        if (data<uint8_t>(buffer)[at] != kUntouched)
+          return false;
+    return true;
+  };
+  require(untouched(codes, shape.codesLayerBytes, shape.codesBytes()) &&
+              untouched(decoded, shape.stateLayerBytes, shape.stateBytes()),
+          label + "the codec wrote past a layer");
   const double relative = std::sqrt(squaredError / squaredNorm);
   require(relative < 0.01, label + "the state's relative error exceeds 1%");
   std::cout << label << "codes, scales and decoded values are the reference's, relative error " << relative << '\n';
+}
+
+// A state that is not finite stays so: a block holding NaN, +inf or -inf in
+// either thread's half restores as NaN, every value of it, where its largest
+// finite magnitude, or zero, would make one a finite value the state never
+// held; the blocks around it code as the reference codes them.
+void nonFiniteBlocks(MetalBackend &backend, GdnStateFormat format) {
+  const std::string label = std::string(splash::ops::formatName(format)) + " state with values not finite: ";
+  constexpr uint32_t rows = 8, columns = 128, blocksPerRow = columns / kBlock;
+  StateCodecShape shape{1, rows, columns, 0, 0, format};
+  shape.stateLayerBytes = shape.stateBytes();
+  shape.codesLayerBytes = shape.codesBytes();
+  std::vector<float> values = stateValues(shape, 5);
+  // Block by block: NaN, +inf and -inf, each in the first half and in the
+  // second, alone, beside finite values or in a block otherwise of zeros.
+  const float kinds[] = {NAN, INFINITY, -INFINITY};
+  std::vector<bool> finite(rows * blocksPerRow, true);
+  for (uint32_t kind = 0; kind < 6; ++kind) {
+    const uint32_t block = 3 * kind + 1;
+    float *at = values.data() + block * kBlock;
+    if (kind >= 3) std::fill(at, at + kBlock, 0.0F);
+    at[kind % 2 ? kBlock - 3 : 2] = kinds[kind % 3];
+    finite[block] = false;
+  }
+  if (format == GdnStateFormat::BFloat16)
+    for (float &value : values) value = codecWiden(codecBf16(value));
+  const uint64_t element = splash::ops::elementBytes(format);
+  MetalBuffer state = splash::test::sharedBuffer(backend, shape.stateBytes());
+  MetalBuffer codes = splash::test::sharedBuffer(backend, shape.codesBytes());
+  MetalBuffer decoded = splash::test::sharedBuffer(backend, shape.stateBytes());
+  for (uint64_t i = 0; i < values.size(); ++i) {
+    if (format == GdnStateFormat::Float32)
+      std::memcpy(data<std::byte>(state) + i * element, &values[i], 4);
+    else {
+      const uint16_t narrow = codecBf16(values[i]);
+      std::memcpy(data<std::byte>(state) + i * element, &narrow, 2);
+    }
+  }
+  CommandGraph graph;
+  StateCodec::addQuantize(graph, state, codes, shape);
+  StateCodec::addDequantize(graph, codes, decoded, shape);
+  submit(backend, graph);
+  // The reference of the finite blocks, the others zeros.
+  std::vector<float> finiteValues = values;
+  for (uint32_t block = 0; block < finite.size(); ++block)
+    if (!finite[block]) std::fill_n(finiteValues.begin() + block * kBlock, kBlock, 0.0F);
+  const std::vector<uint8_t> reference = splash::test::stateCodesReference(finiteValues.data(), rows, columns);
+  const auto *scales = reinterpret_cast<const uint16_t *>(data<uint8_t>(codes) + state_codec_scales_offset(rows, columns));
+  const auto *referenceScales =
+      reinterpret_cast<const uint16_t *>(reference.data() + state_codec_scales_offset(rows, columns));
+  for (uint32_t block = 0; block < finite.size(); ++block) {
+    const std::string where = label + "block " + std::to_string(block) + " ";
+    for (uint32_t i = 0; i < kBlock; ++i) {
+      const uint64_t index = uint64_t{block} * kBlock + i;
+      float got = 0.0F;
+      if (format == GdnStateFormat::Float32)
+        std::memcpy(&got, data<std::byte>(decoded) + index * 4, 4);
+      else {
+        uint16_t narrow = 0;
+        std::memcpy(&narrow, data<std::byte>(decoded) + index * 2, 2);
+        got = codecWiden(narrow);
+      }
+      if (!finite[block])
+        require(std::isnan(got), where + "restored a value as " + std::to_string(got) + ", not NaN");
+      else
+        require(data<uint8_t>(codes)[index] == reference[index] && std::isfinite(got),
+                where + "of finite values did not code as the reference beside one that is not finite");
+    }
+    if (finite[block])
+      require(scales[block] == referenceScales[block], where + "has another scale than the reference's");
+  }
+  std::cout << label << "its blocks that are not restore as NaN\n";
 }
 
 // Each buffer at the extent the codec reaches and one element short: the
@@ -180,6 +270,11 @@ void run(const std::string &metallib) {
       runCase(backend, rows, 1, format, 0);
       runCase(backend, rows, 3, format, 16384);
     }
+    // Rows whose threads leave a threadgroup of 256 mostly idle: 24 threads
+    // in one, and 296 over two.
+    runCase(backend, 3, 3, format, 4096);
+    runCase(backend, 37, 3, format, 4096);
+    nonFiniteBlocks(backend, format);
   }
   std::cout << "state_codec_metal_test passed\n";
 }
