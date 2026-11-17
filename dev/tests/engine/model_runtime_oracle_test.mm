@@ -2768,9 +2768,10 @@ void requireConstrainedThinkingEndWaitsForItsMask(model::Runtime &executor) {
 
 // Under --verify-rows all a cycle's rows do not follow its output left, as
 // 1.6.2's did not: a lane of 2 to 7 tokens left verifies the draft's block a
-// lane of 64 left does, drafting 7, and emits the start of what that lane
-// emits, no more than it has left, so that an answer under a lower output
-// limit starts one under a higher.
+// lane of 64 left does, and emits the start of what that lane emits, no more
+// than it has left, so that an answer under a lower output limit starts one
+// under a higher; it counts as drafted, as 1.6.2 did, the proposals it could
+// retain, one fewer than its tokens left.
 void requireCyclesVerifyTheirOutputLeft(model::Runtime &executor) {
   const std::vector<uint32_t> &prompt = targetTokens->thinkingPrompt;
   const std::vector<uint32_t> pages = pageRange(108, 4);
@@ -2787,7 +2788,7 @@ void requireCyclesVerifyTheirOutputLeft(model::Runtime &executor) {
     if (longer.empty())
       longer = cycle.outputTokens;
     const size_t emitted = cycle.outputTokens.size();
-    require(rows == block && cycle.draftedTokens == block - 1,
+    require(rows == block && cycle.draftedTokens == std::min(block, left) - 1,
             "a cycle of " + std::to_string(left) + " tokens left verified " + std::to_string(rows) +
                 " rows and drafted " + std::to_string(cycle.draftedTokens));
     require(emitted && emitted <= std::min<size_t>(left, longer.size()) &&
@@ -6685,8 +6686,8 @@ int main(int argc, char **argv) {
       // budgeted cycle's: its anchor and its tree's rows, a draft's block.
       require(pending.maskRequests.size() == 1, "replay proposals were not exposed");
       const ModelMaskRequest &asked = pending.maskRequests[0];
-      require(asked.simulationTokens.size() == result.draftedTokens + 1 &&
-                  asked.simulationTokens.size() == model::StepCosts::kNarrowCap,
+      require(asked.simulationTokens.size() == model::StepCosts::kNarrowCap &&
+                  result.draftedTokens + 1 == std::min<size_t>(asked.simulationTokens.size(), outputLimit),
               "the cycle verified other rows than a draft's block");
       const std::span<const uint32_t> path = std::span(result.outputTokens).first(stored);
       provideMask(executor, replayId,
@@ -6972,7 +6973,7 @@ int main(int argc, char **argv) {
                     std::vector<uint32_t>{anchorA, nextB} &&
                 constrainedFirst.outputTokensWithoutKv == 1 &&
                 !constrainedFirst.finished &&
-                constrainedFirst.draftedTokens == verifySimulated - 1 &&
+                constrainedFirst.draftedTokens == std::min<size_t>(verifySimulated, 2) - 1 &&
                 constrainedFirst.acceptedDraftTokens == 0,
             "constrained verify mask offset is incorrect");
     executor.end(40);
@@ -7035,7 +7036,7 @@ int main(int argc, char **argv) {
                 perfectResult.outputTokens.size() == perfectPath.size() + perfectEmitted &&
                 std::equal(perfectPath.begin(), perfectPath.end(), perfectResult.outputTokens.begin()) &&
                 perfectResult.outputTokensWithoutKv == perfectEmitted &&
-                perfectResult.draftedTokens == perfectSimulated - 1 &&
+                perfectResult.draftedTokens == std::min<size_t>(perfectSimulated, 4) - 1 &&
                 perfectResult.acceptedDraftTokens == perfectAccepted,
             "constrained acceptance did not report its path's " + std::to_string(perfectAccepted) + " of the " +
                 std::to_string(perfectSimulated - 1) + " proposals it verified");
@@ -7177,8 +7178,8 @@ int main(int argc, char **argv) {
                     std::vector<uint32_t>{crossNext[1], crossRejected[1]} &&
                 crossResults[0].outputTokensWithoutKv == 1 &&
                 crossResults[1].outputTokensWithoutKv == 1 &&
-                crossResults[0].draftedTokens == crossSimulated[0] - 1 &&
-                crossResults[1].draftedTokens == crossSimulated[1] - 1 &&
+                crossResults[0].draftedTokens == std::min<size_t>(crossSimulated[0], 2) - 1 &&
+                crossResults[1].draftedTokens == std::min<size_t>(crossSimulated[1], 2) - 1 &&
                 crossResults[0].acceptedDraftTokens == 0 &&
                 crossResults[1].acceptedDraftTokens == 0,
             "B2 constrained overlap corrupted a lane");

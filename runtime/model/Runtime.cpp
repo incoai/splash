@@ -3054,12 +3054,15 @@ struct Runtime::Impl {
       keepChances(entry, lane, laneResult.forcedChain);
       // The end replaced the first proposals, which acceptance keeps as far
       // as the lane retains them; the draft proposed the others, and the
-      // speculation counts the ones the lane verified and the accepted ones
-      // before its last retained token, the next anchor (an accepted proposal
-      // only where the output limit or a stop token cut the path).
+      // speculation counts the ones the lane verified that it could retain,
+      // as 1.6.2's did (its rows past its output left, which --verify-rows
+      // all runs as a lane with more left would, are no proposal it could
+      // take), and the accepted ones before its last retained token, the
+      // next anchor (an accepted proposal only where the output limit or a
+      // stop token cut the path).
       const uint32_t accepted =
           std::min(laneResult.accepted, laneResult.retained - 1);
-      const uint32_t verified = laneResult.rows.rows - 1;
+      const uint32_t verified = std::min(laneResult.rows.rows, laneResult.maximumRetained) - 1;
       results.push_back({entry.id,
                          0,
                          std::move(output),
