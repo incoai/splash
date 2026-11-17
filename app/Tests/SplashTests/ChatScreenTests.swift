@@ -210,7 +210,7 @@ extension ChatScreenTests {
             refused.append((Self.unlike(drawn, before, in: sidebar, window), Self.unlike(drawn, before, in: toolbar, window),
                             try Self.field(in: window).minY - field.minY, since > 0 ? mark : nil))
         }
-        #expect(state.draft.notice?.text == "This message is longer than the model’s context." && state.draft.text == FirstMessagePictures.draft)
+        #expect(state.draft.notice == "This message is longer than the model’s context." && state.draft.text == FirstMessagePictures.draft)
         #expect(!state.chats.answering && state.canSendDraft)
         // The message is the user's to edit again.
         text.insertText(" And more.", replacementRange: NSRange(location: NSNotFound, length: 0))

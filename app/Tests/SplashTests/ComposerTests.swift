@@ -194,7 +194,7 @@ struct ComposerTests {
         draft.remove(at: 0)
         try await waitFor(!FileManager.default.fileExists(atPath: files.appending(path: first.file).path))
         let message = draft.message
-        draft.take()
+        draft.take(from: nil)
         #expect(message.attachments.count == 1 && draft.attachments.isEmpty && draft.thumbnails.isEmpty)
         #expect(FileManager.default.fileExists(atPath: files.appending(path: message.attachments[0].file).path))
     }

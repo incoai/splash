@@ -317,7 +317,7 @@ private struct ChatList<Actions: View>: View {
         VStack(spacing: 0) {
             // A new chat, at the top of the chats it joins, its icon in line with the search's.
             Button {
-                chats.newChat()
+                state.newChat()
                 state.draft.focus()
             } label: {
                 Label("New Chat", systemImage: "plus")

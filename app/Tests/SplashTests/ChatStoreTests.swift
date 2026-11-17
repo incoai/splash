@@ -49,7 +49,7 @@ struct ChatStoreTests {
         draft.text = "and then this"
         draft.restore(refused)
         #expect(draft.text == "Summarize this\n\nand then this")
-        #expect(draft.notice == Draft.Notice(text: "Too large", conversation: nil))
+        #expect(draft.notice == "Too large")
         draft.text = " \n"
         draft.restore(refused)
         #expect(draft.text == "Summarize this")
