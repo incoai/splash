@@ -139,8 +139,14 @@ CacheDirectory::open(const std::filesystem::path &root, std::string_view cacheNa
                      std::chrono::milliseconds lockWait, const std::function<bool()> &cancelled) {
   if (!namespaceName(cacheNamespace))
     throw std::invalid_argument("a cache namespace is 32 lowercase hex digits");
-  if (root.has_parent_path())
-    std::filesystem::create_directories(root.parent_path());
+  // A signal can interrupt the mkdir of a parent as it can the root's.
+  std::error_code made;
+  if (root.has_parent_path() && retryInterrupted([&] {
+        std::filesystem::create_directories(root.parent_path(), made);
+        errno = made.value();
+        return made ? -1 : 0;
+      }) < 0)
+    throw std::filesystem::filesystem_error("create_directories", root.parent_path(), made);
   if (!openDirectory(root, "open cache root"))
     throw std::system_error(ENOENT, std::generic_category(), "open cache root");
   const std::filesystem::path path = root / cacheNamespace;
@@ -155,9 +161,9 @@ CacheDirectory::open(const std::filesystem::path &root, std::string_view cacheNa
     // can take its directory away before this one opens it or makes its
     // lock there: the next turn makes it again, empty.
     std::optional<Descriptor> directory = openDirectory(path, "open cache directory");
-    Descriptor lock(directory ? ::openat(directory->get(), kLock,
-                                         O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW, 0600)
-                              : -1);
+    Descriptor lock(directory ? retryInterrupted([&] {
+      return ::openat(directory->get(), kLock, O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW, 0600);
+    }) : -1);
     if (lock.get() < 0) {
       if (directory && errno != ENOENT)
         fail("open cache directory lock");
