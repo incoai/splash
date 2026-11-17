@@ -195,7 +195,10 @@
     "targeted_startup_launcher_Python_upstream": 128,
     "targeted_startup_launcher_Python_production": 115,
     "Swift_typed_launch_values": "passed",
-    "architecture_budget_increased": false
+    "architecture_budget_increased": false,
+    "full_local_Python_tests_run": 1721,
+    "full_local_Python_skipped": 8,
+    "full_local_Python_failures_errors": 0
   },
   "coding_restoration": {
     "restored": true,
@@ -281,5 +284,16 @@
       "max_s": 1.8022392919519916
     },
     "definition": "Client time to the SSE chunk containing the end of the 32nd token in the final visible answer, using installed tokenizer offsets. SSE chunk timing, not GPU token-event timing."
+  },
+  "temperature_measurement": {
+    "coding_warm_periodic_SMART_max_C": {
+      "old": 48.85,
+      "new": 49.85
+    },
+    "coding_warm_end_of_wave_max_C": {
+      "old": 47.85,
+      "new": 49.85
+    },
+    "summary_field_scope": "temperature_max_c in coding_metrics is the maximum of the end-of-wave SMART readings; the periodic warm samples captured a higher old-build reading."
   }
 }
