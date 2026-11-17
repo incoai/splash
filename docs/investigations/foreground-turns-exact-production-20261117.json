@@ -1,0 +1,118 @@
+{
+  "date": "2026-11-17",
+  "comparison": "exact deployed signed 9753a80 vs initial foreground-turns backport at 32 tokens",
+  "candidate_source": "cfc730e",
+  "ordering": [
+    "old",
+    "new",
+    "new",
+    "old"
+  ],
+  "warm_rounds_per_build": 3,
+  "concurrent_requests": 8,
+  "model": "ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF:Q2_0",
+  "RAM_GiB": 96,
+  "cache_GiB": 512,
+  "context_tokens": 262144,
+  "max_completion_tokens": 8192,
+  "metrics": {
+    "off": {
+      "warm_waves": 3,
+      "requests": 24,
+      "complete": 23,
+      "trusted_pass": 17,
+      "generated_tests_pass": 8,
+      "strict_pass": 7,
+      "ttft_p50_s": 5.1911766870180145,
+      "ttft_p95_s": 17.37353083305061,
+      "wall_p50_s": 20.346653354004957,
+      "wall_p95_s": 26.53805208299309,
+      "aggregate_tokens_s": 380.24077037546976,
+      "completion_tokens": 36486,
+      "generation_wall_s": 95.95499179104809,
+      "wave_tps": [
+        385.4227242214042,
+        386.52374558866023,
+        364.7906342080927
+      ],
+      "SSE_content_chunk_gap_p95_s": 0.048113416065461934,
+      "SSE_content_chunk_gap_max_s": 0.1743296249769628,
+      "cold_waves": 2,
+      "cold_ttft_p95_s": 26.830923582892865,
+      "warm_host_writes_bytes": 1242624000,
+      "warm_payload_bytes": 938311680,
+      "temperature_max_c": 46.85000000000002,
+      "parked_peak": 0,
+      "sampled_active_peak": 8
+    },
+    "on": {
+      "warm_waves": 3,
+      "requests": 24,
+      "complete": 24,
+      "trusted_pass": 18,
+      "generated_tests_pass": 12,
+      "strict_pass": 12,
+      "ttft_p50_s": 0.5315181874902919,
+      "ttft_p95_s": 1.2350523329805583,
+      "wall_p50_s": 21.552960916480515,
+      "wall_p95_s": 26.401774500031024,
+      "aggregate_tokens_s": 371.98199634030306,
+      "completion_tokens": 29523,
+      "generation_wall_s": 79.36674433294684,
+      "wave_tps": [
+        372.0396913514606,
+        373.64133845258834,
+        370.2023892366975
+      ],
+      "SSE_content_chunk_gap_p95_s": 0.049261166946962476,
+      "SSE_content_chunk_gap_max_s": 0.9210906670195982,
+      "cold_waves": 2,
+      "cold_ttft_p95_s": 4.296934915939346,
+      "warm_host_writes_bytes": 1020928000,
+      "warm_payload_bytes": 938311680,
+      "temperature_max_c": 49.85000000000002,
+      "parked_peak": 4,
+      "sampled_active_peak": 8
+    },
+    "change_percent": {
+      "ttft_p50_s": -89.76112316077584,
+      "ttft_p95_s": -92.89118403824368,
+      "wall_p50_s": 5.928776302851357,
+      "wall_p95_s": -0.5135176558395571,
+      "aggregate_tokens_s": -2.1719854046717724,
+      "warm_host_writes_bytes": -17.84095591264936
+    }
+  },
+  "production_restored": {
+    "restored": true,
+    "health": {
+      "11500/health": 200,
+      "11500/ready": 200,
+      "11501/health": 200,
+      "11501/ready": 200,
+      "11502/health": 200,
+      "11502/ready": 200,
+      "11503/health": 200,
+      "11503/ready": 200,
+      "11504/health": 200,
+      "11504/ready": 200
+    },
+    "database_preserved": true,
+    "production_files_unchanged": true,
+    "persistent_cache": true,
+    "taken_back": {
+      "states": 4835,
+      "kv_blocks": 350566,
+      "bytes": 449725005824,
+      "left_behind": 0
+    },
+    "missing_history": 0
+  },
+  "activated": false,
+  "decision": "Do not activate this candidate: throughput fell 2.17 percent. Qualify the free-slot expansion correction separately.",
+  "limitations": [
+    "Small coding sample and adaptive verify rows permit output differences; correctness counts are not a proven accuracy improvement.",
+    "Engine payload bytes are identical: host-write differences are not attributable SSD savings.",
+    "SSE content-chunk gaps are not individual-token latency."
+  ]
+}

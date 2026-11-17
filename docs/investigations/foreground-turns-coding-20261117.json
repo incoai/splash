@@ -1,0 +1,131 @@
+{
+  "date": "2026-11-17",
+  "comparison": "same production-derived candidate binary, foreground turns disabled vs 32 tokens",
+  "candidate_source": "cfc730e",
+  "candidate_build_id": "src-c8c5379bd520abfa9f209e5b159ce97dd33fbec0e67c08af49e0eebdb2268050",
+  "ordering": [
+    "off",
+    "on",
+    "on",
+    "off"
+  ],
+  "model": "ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF:Q2_0",
+  "RAM_GiB": 96,
+  "cache_GiB": 512,
+  "context_tokens": 262144,
+  "queue_workers": 8,
+  "max_completion_tokens": 8192,
+  "state_and_activations": "bf16",
+  "verify_rows": "auto",
+  "admission_fusion_M4_enabled": false,
+  "cold_rounds_per_arm": 1,
+  "warm_rounds_per_arm": 3,
+  "metrics": {
+    "off": {
+      "warm_waves": 6,
+      "requests": 48,
+      "complete": 47,
+      "trusted_pass": 34,
+      "generated_tests_pass": 17,
+      "strict_pass": 17,
+      "ttft_p50_s": 4.891000813047867,
+      "ttft_p95_s": 20.82255233300384,
+      "wall_p50_s": 20.465721458022017,
+      "wall_p95_s": 33.92351824999787,
+      "aggregate_tokens_s": 379.14018880261,
+      "completion_tokens": 70035,
+      "generation_wall_s": 184.7205916660605,
+      "wave_tps": [
+        385.75158007839434,
+        374.1401574542242,
+        371.64065042666164,
+        375.08549320864,
+        386.0455527512566,
+        379.9311957938285
+      ],
+      "SSE_content_chunk_gap_p95_s": 0.048683458007872105,
+      "SSE_content_chunk_gap_max_s": 0.27439691696781665,
+      "cold_waves": 2,
+      "cold_ttft_p95_s": 18.650945874978788,
+      "warm_host_writes_bytes": 2198016000,
+      "warm_payload_bytes": 1876623360,
+      "temperature_max_c": 46.85000000000002,
+      "parked_peak": 0,
+      "sampled_active_peak": 8
+    },
+    "on": {
+      "warm_waves": 6,
+      "requests": 48,
+      "complete": 46,
+      "trusted_pass": 34,
+      "generated_tests_pass": 20,
+      "strict_pass": 19,
+      "ttft_p50_s": 0.5082679165061563,
+      "ttft_p95_s": 1.2426240000640973,
+      "wall_p50_s": 22.048130083072465,
+      "wall_p95_s": 27.666349875042215,
+      "aggregate_tokens_s": 380.3327910267841,
+      "completion_tokens": 73264,
+      "generation_wall_s": 192.63130008382723,
+      "wave_tps": [
+        382.9220065424412,
+        383.95255260744295,
+        380.45075861650173,
+        392.9017031802179,
+        384.4703144841431,
+        366.78253781350963
+      ],
+      "SSE_content_chunk_gap_p95_s": 0.04870116605889052,
+      "SSE_content_chunk_gap_max_s": 0.8991128329653293,
+      "cold_waves": 2,
+      "cold_ttft_p95_s": 4.164867458981462,
+      "warm_host_writes_bytes": 1889280000,
+      "warm_payload_bytes": 1876623360,
+      "temperature_max_c": 45.85000000000002,
+      "parked_peak": 4,
+      "sampled_active_peak": 8
+    },
+    "change_percent": {
+      "ttft_p50_s": -89.60809993835545,
+      "ttft_p95_s": -94.03231659504809,
+      "wall_p50_s": 7.731995318592522,
+      "wall_p95_s": -18.44492758340609,
+      "aggregate_tokens_s": 0.3145544206064166,
+      "warm_host_writes_bytes": -14.046121593291405
+    }
+  },
+  "production_restored": {
+    "restored": true,
+    "health": {
+      "11500/health": 200,
+      "11500/ready": 200,
+      "11501/health": 200,
+      "11501/ready": 200,
+      "11502/health": 200,
+      "11502/ready": 200,
+      "11503/health": 200,
+      "11503/ready": 200,
+      "11504/health": 200,
+      "11504/ready": 200
+    },
+    "database_preserved": true,
+    "production_files_unchanged": true,
+    "persistent_cache": true,
+    "taken_back": {
+      "states": 4835,
+      "kv_blocks": 350566,
+      "bytes": 449725005824,
+      "left_behind": 0
+    },
+    "missing_history": 0
+  },
+  "limitations": [
+    "This isolates the scheduler on the same candidate; exact signed production-build control is a separate final gate.",
+    "Adaptive verify-row selection permits output differences; coding counts do not establish accuracy improvement.",
+    "Length-limited replies count as incomplete and failed, rather than successful coding answers.",
+    "Streaming gaps describe SSE content chunks, not tokenizer-level token latency.",
+    "Identical engine payload bytes were written; the host-write difference is not attributable SSD savings.",
+    "Median completion rose 7.7 percent and the longest content-chunk gap increased; report these tradeoffs alongside lower p95 TTFT."
+  ],
+  "activated": false
+}
