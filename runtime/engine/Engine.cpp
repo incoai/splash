@@ -1890,6 +1890,7 @@ void Engine::apply(const Pending &command, std::span<const ModelStepResult> resu
       continue;
     }
     active.unprovenState.reset();
+    active.ran = true;
     if (active.pendingEnd) {
       // An in-flight Metal command cannot be revoked safely. Its provisional
       // writes remain invisible, but a cancelled, deadline-expired or
@@ -2222,6 +2223,7 @@ void Engine::vacateLane(Request &active, bool keepContinuation) {
     model_.end(id);
   cache_.endRequest(id);
   active.lane.reset();
+  active.ran = false;
 }
 
 void Engine::release(Request &active) {

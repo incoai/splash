@@ -202,6 +202,8 @@ public:
   // does. A refusal records what the claim lacks (need).
   [[nodiscard]] metal::AllocationAdmission allocationAdmission() noexcept;
   void setPressure(MemoryPressure pressure) noexcept;
+  void holdUnseen(bool held) noexcept { unseenHeld_ = held; }  // a lane holds memory no command of it wrote
+  [[nodiscard]] bool unseenHeld() const noexcept { return unseenHeld_; }
   // What the governor makes of a fresh sample of the host. Reading it changes
   // nothing: the host's band moves only with the samples a reservation or the
   // control pass takes, so /status does not move admission.
@@ -361,10 +363,10 @@ private:
   [[nodiscard]] std::optional<HostMemory> sampleHost() const noexcept;
   [[nodiscard]] uint64_t hostHeadroomBytes(const std::optional<HostMemory> &host,
                                            uint64_t reservedBytes) const noexcept;
-  // Of what pools grew and starts took within kHostSettleMilliseconds, what
-  // the host's reading `host` does not show yet: what the headroom has fallen
-  // since does not cover (a store chunk counts once experts load into it, a
-  // state once a command writes it).
+  // Of what pools grew and starts took within kHostSettleMilliseconds, or
+  // since while a lane holds memory no command wrote (holdUnseen), what the
+  // host's reading `host` does not show: what the headroom has fallen since
+  // does not cover (a store chunk shows as experts load into it).
   [[nodiscard]] uint64_t unseenGrowthBytes(const std::optional<HostMemory> &host) const noexcept;
   [[nodiscard]] MemoryGovernorSnapshot
   snapshot(const std::optional<HostMemory> &hostMemory, const HostRule &rule) const noexcept;
@@ -398,10 +400,11 @@ private:
   // The latest control pass's clock, or the start growth's.
   double clockMilliseconds_ = 0.0;
   // Pools' growth and starts the host's counters may not show yet
-  // (unseenGrowthBytes): bytes, raw headroom before them, when they lapse.
+  // (unseenGrowthBytes): bytes, raw headroom before them, lapse, hold.
   uint64_t unseenGrowthBytes_ = 0;
   uint64_t unseenGrowthHeadroom_ = 0;
   double unseenGrowthUntilMilliseconds_ = 0.0;
+  bool unseenHeld_ = false;
 };
 
 // Connects an engine to the governor that admits its memory and whose ledger

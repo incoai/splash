@@ -401,6 +401,7 @@ private:
     // refused, restart its wait's limit.
     uint64_t admission = 0;
     std::optional<uint32_t> lane;
+    bool ran = false;  // a command of its lane has ended: what its start took is written
     uint32_t promptTokens = 0;
     uint32_t reportedPromptTokens = 0;
     uint32_t replayTokens = 0;

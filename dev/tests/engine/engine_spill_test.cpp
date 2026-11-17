@@ -1060,6 +1060,27 @@ std::pair<bool, int64_t> spillStartBesideALane(uint64_t headroomMiB) {
   return {beside, least};
 }
 
+// A lane holds what its start took counted on the host (MemoryGovernor::
+// holdUnseen) until a command of it has ended, which writes it, and no
+// longer: the host's counters show it then.
+void testALaneHoldsWhatItTookCountedUntilACommandOfItEnds() {
+  Spilling spill{16'384, true, 0, 200'000, Spilling::Extent{256}, {}, {}, true, FlashNextLanes::kPages};
+  spill.model.laneFootprintBytes = 42ULL << 20;
+  spill.engine.submit(Spilling::prompt(1, 1, 1'000, 40));
+  bool heldBeforeOutput = false, heldWhileDecoding = false;
+  for (int tick = 0; tick < 20'000 && spill.events.completedCount < 1 && spill.events.failures.empty(); ++tick) {
+    static_cast<void>(spill.engine.tick(spill.now++));
+    spill.tier.complete();
+    const bool held = spill.host.governor.unseenHeld();
+    const size_t output = spill.events.outputs[1].size();
+    heldBeforeOutput = heldBeforeOutput || (held && output == 0);
+    heldWhileDecoding = heldWhileDecoding || (held && output > 1 && output < 40);
+  }
+  require(spill.events.completedCount == 1 && heldBeforeOutput && !heldWhileDecoding,
+          std::string("a lane's start ") + (heldBeforeOutput ? "" : "was never held counted") +
+              (heldWhileDecoding ? "was held counted after a command of it ended" : "") + failureDetail(spill.events));
+}
+
 // A Spill start beside a lane in service is weighed whole, as placement
 // prices it: its state, its prompt's staging, its first command's pages, its
 // floor of the hot block cache and its floor's growth. Short of that, it
@@ -4721,6 +4742,7 @@ std::span<const test::TestCase> spillTests() {
       {"testAStartWaitingForALaneOfItsPriorityLeavesLowerLanesRunning",
        testAStartWaitingForALaneOfItsPriorityLeavesLowerLanesRunning},
       {"testASpillStartBesideALaneIsWeighedWhole", testASpillStartBesideALaneIsWeighedWhole},
+      {"testALaneHoldsWhatItTookCountedUntilACommandOfItEnds", testALaneHoldsWhatItTookCountedUntilACommandOfItEnds},
       {"testLaneDemandCountsTheHotFloorALaneWaitsFor", testLaneDemandCountsTheHotFloorALaneWaitsFor},
       {"testAStartRefusedMemoryCountsNoConversion", testAStartRefusedMemoryCountsNoConversion},
       {"testShortQuotaBoundsWaitsOrRefusesASpillStart", testShortQuotaBoundsWaitsOrRefusesASpillStart},

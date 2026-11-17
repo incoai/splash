@@ -1422,6 +1422,24 @@ void testStartsInARowTakeNoMoreThanTheHeadroom() {
   require(started == 2, std::to_string(started) + " starts of 200 MiB began in 512 MiB of headroom");
 }
 
+// Starts 1.5 s apart, past the host's settling, its readings 5 s behind: while a lane holds memory no command of
+// it has written (holdUnseen), what the starts took stays counted, and two of 200 MiB start in 512 MiB.
+void testWhatNoCommandWroteStaysCounted() {
+  FakeMemory::Config config = host(512 * kMiB);
+  config.readingLagMilliseconds = 5000.0;
+  Fixture fixture(std::move(config));
+  fixture.governor->holdUnseen(true);
+  uint32_t started = 0;
+  double t = 0.0;
+  for (uint64_t id = 2; id <= 5; ++id) {
+    const ClaimId start = fixture.ledger().open(request(id, RequestPriority::Normal, ClaimClass::Start));
+    started += static_cast<bool>(fixture.allocateFreeing(start, 200 * kMiB));
+    t += 1.5;
+    static_cast<void>(fixture.pass(t));
+  }
+  require(started == 2, std::to_string(started) + " starts of 200 MiB began 1.5 s apart in 512 MiB of headroom");
+}
+
 // An exempt start is weighed at the lanes' projected growth, its own counted in it: in 512 MiB of headroom a start
 // projected at 500 MiB takes its two 200 MiB allocations, each out of that projection, and one projected at 600 MiB
 // takes nothing.
@@ -1434,6 +1452,8 @@ void testAStartIsWeighedWhole() {
     const bool second = first && static_cast<bool>(fixture.allocate(start, 200 * kMiB));
     require(first == (projected == 500 * kMiB) && second == first,
             first ? "a start was refused what it was projected to take" : "a start took part of more than the headroom");
+    // Not exempted, its claim logs it short, not met past the host.
+    require(first || !fixture.ledger().claim(start).hostExempt, "a start its whole start did not fit was exempted");
   }
 }
 
@@ -2668,6 +2688,7 @@ std::span<const test::TestCase> ledgerTests() {
       {"testDeficitCountsHostRefusedClaimsNotAnIdleMargin", testDeficitCountsHostRefusedClaimsNotAnIdleMargin},
       {"testAHostRefusedStartIsAdmittedWithinTwoPasses", testAHostRefusedStartIsAdmittedWithinTwoPasses},
       {"testStartsInARowTakeNoMoreThanTheHeadroom", testStartsInARowTakeNoMoreThanTheHeadroom},
+      {"testWhatNoCommandWroteStaysCounted", testWhatNoCommandWroteStaysCounted},
       {"testAStartIsWeighedWhole", testAStartIsWeighedWhole},
       {"testGrowthLeavesTheHostWhatAStartItRefusedWaitsFor", testGrowthLeavesTheHostWhatAStartItRefusedWaitsFor},
       {"testSourceOrderIsKeptWithinASource", testSourceOrderIsKeptWithinASource},

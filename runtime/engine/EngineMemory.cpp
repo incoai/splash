@@ -134,19 +134,19 @@ Engine::LaneDemand Engine::laneDemand(uint64_t starting) const {
   const auto pages = [](uint64_t tokens) { return (tokens + KvCache::pageTokens - 1) / KvCache::pageTokens; };
   LaneDemand demand;
   // The lanes that read spilled KV, those holding Index pages, and a start
-  // placed Spill (placement): those without their floor of the hot block
-  // cache yet lack it once for them all, in whole extents: floorExtents(2)
-  // for two, not 2 x floorExtents(1); and one in prefill the staging of its
-  // history through its next command, a start's through its prompt.
+  // placed Spill (placement), as a lane is until a command of it ends: those
+  // without their floor of the hot block cache lack it once for them all, in
+  // whole extents (floorExtents(2) for two, not 2 x floorExtents(1)); one in
+  // prefill the staging through its next command, a start's through its prompt.
   std::vector<uint64_t> readers;
   for (const auto &[id, peer] : requests_) {
     if ((!peer.lane && id != starting) || peer.pendingEnd)
       continue;
     demand.bytes += peer.lane ? 0 : model_.startStateBytes();
-    const bool prefill = !peer.lane || scheduler_.phase(id) == Phase::Prefill;
-    if (peer.lane ? cache_.holdsIndexPages(id) : peer.kvMode == KvMode::Spill) {
+    const bool prefill = !peer.ran || scheduler_.phase(id) == Phase::Prefill;
+    if (peer.ran ? cache_.holdsIndexPages(id) : peer.kvMode == KvMode::Spill) {
       readers.push_back(id);
-      const uint64_t staged = peer.lane ? nextCommandPages(peer) : pages(peer.promptTokens);
+      const uint64_t staged = peer.ran ? nextCommandPages(peer) : pages(peer.promptTokens);
       demand.bytes += prefill ? model_.stagingShortfall(id, static_cast<uint32_t>(staged)) : 0;
     }
     const uint64_t projection = projectedTokens(peer);
@@ -216,6 +216,7 @@ void Engine::syncClaims(double now) {
     active.gapSince.claimWaited =
         active.gapSince.claimWaited || ((waiting || hostRefused) && active.lastTokenMilliseconds);
   }
+  governor().holdUnseen(std::ranges::any_of(requests_, [](const auto &e) { return e.second.lane && !e.second.ran; }));
 }
 
 void Engine::passOver(const BatchPlan &plan, std::span<const uint64_t> excluded) {

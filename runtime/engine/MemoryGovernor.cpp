@@ -201,7 +201,7 @@ uint64_t MemoryGovernor::hostHeadroomBytes(const std::optional<HostMemory> &host
 }
 
 uint64_t MemoryGovernor::unseenGrowthBytes(const std::optional<HostMemory> &host) const noexcept {
-  if (!host || clockMilliseconds_ >= unseenGrowthUntilMilliseconds_)
+  if (!host || (clockMilliseconds_ >= unseenGrowthUntilMilliseconds_ && !unseenHeld_))
     return 0;
   const uint64_t fallen = saturatingSubtract(unseenGrowthHeadroom_, hostHeadroomBytes(host, 0));
   return saturatingSubtract(unseenGrowthBytes_, fallen);
@@ -413,8 +413,10 @@ FreeResult MemoryGovernor::free(ClaimId claim, const Need &need) {
   // release's refill of the Index runway, says nothing of it.
   const Need refusal = ledger_.claim(claim).refusal;
   const ClaimSpec &spec = ledger_.claim(claim).spec;
+  const bool start = spec.cls == ClaimClass::Start &&
+                     hostRule_.admits(spec.cls, hostBytes(spec.cls, need.bytes, true), true);
   const FreeResult result = ledger_.free(claim, need, roomBytes(), hostRule_.level(),
-                                         hostClass(spec) == ClaimClass::InService || spec.cls == ClaimClass::Start);
+                                         hostClass(spec) == ClaimClass::InService || start);
   ledger_.refused(claim, refusal);
   return result;
 }
