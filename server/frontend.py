@@ -133,7 +133,8 @@ class Prompt:
     # The reasoning effort the request sent; None where it sent none.
     sent_effort: str | None = None
     # The reasoning effort its chat_template_kwargs set, which the template
-    # renders over the others; None where they set none Splash names.
+    # renders over the others; None where they set none Splash names, or the
+    # template reads none (ChatTemplate.reads_effort).
     template_effort: str | None = None
 
 
@@ -683,7 +684,10 @@ class Frontend:
             enable_thinking,
             template_kwargs,
             body.get("reasoning_effort"),
-            template_effort if template_effort in REASONING_EFFORTS else None,
+            template_effort
+            if template_effort in REASONING_EFFORTS
+            and self.chat_templates.select(tools).reads_effort
+            else None,
         )
 
     def _tokenize(self, text, **options):

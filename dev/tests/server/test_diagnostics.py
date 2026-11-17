@@ -15,9 +15,11 @@ from dev.tests.server_fixtures import (
     FakeRuntime,
     HarnessTestCase,
     StalledConsole,
+    TemplateTokenizer,
     chat_body,
     console_written,
     full_pipe,
+    reasoning_template,
 )
 from server import diagnostics
 from server import server as api
@@ -339,11 +341,13 @@ class DiagnosticsTests(HarnessTestCase):
                     "template_effort": None,
                     "thinking": False,
                 },
+                # The template reads only enable_thinking: the effort the
+                # kwargs set is none it rendered with.
                 {
                     "sent_effort": None,
                     "effort": "low",
                     "enable_thinking": None,
-                    "template_effort": "medium",
+                    "template_effort": None,
                     "thinking": True,
                 },
                 {
@@ -356,6 +360,49 @@ class DiagnosticsTests(HarnessTestCase):
                 None,
             ],
         )
+
+    def test_the_started_line_names_the_kwargs_effort_where_the_template_reads_it(
+        self,
+    ):
+        """The reasoning_effort a request's chat_template_kwargs set is the
+        effort the Started line names where the template reads it, and the
+        server's default where it reads only enable_thinking, which renders
+        by that default alone (the line named the kwargs' effort there too,
+        `effort medium (chat_template_kwargs)`)."""
+        body = chat_body(chat_template_kwargs={"reasoning_effort": "medium"})
+        for template, said in (
+            (None, "effort absent → low · thinking on"),
+            (
+                reasoning_template(efforts=["none", "low", "medium"]),
+                "effort medium (chat_template_kwargs) · thinking on",
+            ),
+        ):
+            records = []
+            harness = self.harness(
+                FakeRuntime(),
+                request_logger=records.append,
+                default_reasoning_effort="low",
+                **(
+                    {}
+                    if template is None
+                    else {"tokenizer": TemplateTokenizer(template)}
+                ),
+            )
+            status, _, payload = harness.request("POST", "/v1/chat/completions", body)
+            self.assertEqual(status, 200, payload)
+            (started,) = (
+                record for record in records if record["outcome"] == "started"
+            )
+            with (
+                self.subTest(said=said),
+                mock.patch.object(api.time, "strftime", return_value="19:03:32"),
+                mock.patch("sys.stdout", new_callable=io.StringIO) as output,
+            ):
+                printed(started)
+                self.assertEqual(
+                    "effort " + output.getvalue().partition(" · effort ")[2],
+                    f"{said}\n",
+                )
 
     def test_console_shows_the_tool_block_signature(self):
         record = {

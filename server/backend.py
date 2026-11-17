@@ -82,8 +82,8 @@ class ReasoningRequest:
     one and None for the template's own; its chat_template_kwargs
     enable_thinking, None when unset or when the server's effort replaced
     it; and the effort its chat_template_kwargs set, which the template
-    renders over the others, None when unset or when the server's effort
-    replaced it."""
+    renders over the others, None when unset, when the server's effort
+    replaced it or when the template does not read it."""
 
     sent: str | None
     effort: str | None
