@@ -2,6 +2,8 @@
 #include "SyntheticModels.hpp"
 #include "ClaimScope.hpp"
 #include "TestChecks.hpp"
+#include "TestKvTier.hpp"
+#include "ops/KvSlotFormat.hpp"
 #include "model/Runtime.hpp"
 #include "model/RuntimeInstrumentation.hpp"
 #include "model/QwenState.hpp"
@@ -72,7 +74,9 @@ ModelStepResult step(model::Runtime &runtime, uint64_t id, uint64_t position,
   if (probeRestore)
     require(!runtime.restoreParkedRequest(202).granted(), "a live command permitted restoration");
   const auto results = ticket->wait();
-  require(results.size() == 1 && results.front().failure.empty(), "synthetic continuation command failed");
+  require(results.size() == 1, "synthetic continuation lost its result");
+  require(results.front().failure.empty(), "synthetic continuation command failed for " +
+          std::to_string(id) + " at " + std::to_string(position) + ": " + results.front().failure);
   return results.front();
 }
 std::vector<uint32_t> singletonMasks(std::span<const uint32_t> tokens, uint32_t vocabulary) {
@@ -149,6 +153,136 @@ ModelStepResult partialStep(model::Runtime &runtime, metal::MetalBackend &backen
   require(result.acceptedDraftTokens == accepted && result.outputTokens.size() == accepted + 1,
           "mask did not force the requested intermediate acceptance length");
   return result;
+}
+
+// Follow the real-model spill oracle's SlotFormat -> Index-page transition,
+// but use its in-memory copy to inject read faults without touching any SSD.
+void spilledContinuation(RuntimeResources &resources, model::Runtime &runtime) {
+  auto context = resources.modelContext();
+  auto &pool = resources.kvPool();
+  auto &cache = *context.blockCache;
+  const auto shape = *context.model.descriptor.capabilities.sparseKv;
+  const uint32_t densePages = (shape.denseHistoryTokens + kv::kPageTokens - 1) / kv::kPageTokens;
+  const uint32_t count = (densePages + 5) * kv::kPageTokens;
+  const uint32_t pageCount = count / kv::kPageTokens + 4;
+  const kv::SlotFormat format(context.kvPages.layout());
+  require(format.version() == 1, "continuation fixture has no spillable slot format");
+  std::vector<uint32_t> prompt(count);
+  for (uint32_t i = 0; i < count; ++i) prompt[i] = 10 + i % 100;
+  uint64_t block = 10'000;
+  // A successful cold read, a failed cold read, then a fresh successful
+  // request: failed commands are ended, as Engine requires, never retried
+  // in-place with recurrent/draft scratch that the failed GPU command wrote.
+  for (const bool fail : {false, true, false}) {
+    const auto acquire = [&] {
+      auto result = pool.acquirePages(pageCount);
+      require(result.granted() && result.pages.size() == pageCount, "spill fixture pages refused");
+      for (const auto page : result.pages) pool.clearPage(page);
+      return result.pages;
+    };
+    auto resident = acquire(), spilled = acquire(), intruderPages = acquire();
+    EngineRequest a, b;
+    a.id = 1001; a.prompt = prompt; a.maxNewTokens = 4096;
+    a.flags = RequestIgnoreEndOfSequence; a.sampling.temperature = 0.7F; a.sampling.seed = 47;
+    b = a; b.id = 1002;
+    runtime.beginColdRequest(a.modelView(), 0);
+    runtime.beginColdRequest(b.modelView(), 1);
+    for (uint32_t at = 0; at < count;) {
+      const uint32_t rows = std::min(count - at, runtime.commandLimits().commandRows);
+      const auto input = std::span(prompt).subspan(at, rows);
+      static_cast<void>(step(runtime, a.id, at, resident, input));
+      static_cast<void>(step(runtime, b.id, at, spilled, input));
+      at += rows;
+    }
+    const auto initialA = step(runtime, a.id, count, resident);
+    const auto initialB = step(runtime, b.id, count, spilled);
+    require(!initialA.outputTokens.empty() && initialA.outputTokens == initialB.outputTokens &&
+                initialA.outputTokensWithoutKv == initialB.outputTokensWithoutKv,
+            "spill controls differed before moving pages");
+    const uint64_t position = count + initialA.outputTokens.size() - initialA.outputTokensWithoutKv;
+    auto chunk = std::make_shared<model::KvPageSources::Chunk>();
+    require(pageCount <= model::KvPageSources::kChunkPages, "spill fixture needs another source chunk");
+    std::vector<std::shared_ptr<test::TestKvCopy>> copies;
+    // Keep dense history and a complete trailing window page resident.
+    for (uint32_t page = densePages; page + 1 < count / kv::kPageTokens; ++page) {
+      std::vector<std::byte> payload;
+      for (const auto span : format.transferSpans(context.kvPages, spilled[page]))
+        payload.insert(payload.end(), span.begin(), span.end());
+      auto copy = std::make_shared<test::TestKvCopy>(std::move(payload));
+      const std::array old{spilled[page]};
+      const auto moved = pool.movePages(old, kv::PageForm::Index);
+      require(moved.granted(), "continuation page could not move to Index form");
+      for (uint32_t layer = 0; layer < context.kvPages.layout().attentionLayers; ++layer)
+        for (auto tensor : context.kvPages.layerSpans(old[0], layer))
+          std::ranges::fill(tensor, std::byte{0x7f});
+      spilled[page] = moved.moves.follow(old[0]);
+      chunk->pages[page] = {++block, copy};
+      ++chunk->indexPages;
+      copies.push_back(std::move(copy));
+    }
+    const auto sources = std::make_shared<const model::KvPageSources>(
+        std::vector<std::shared_ptr<const model::KvPageSources::Chunk>>{chunk}, pageCount);
+    require(!copies.empty(), "continuation fixture did not spill any history");
+    require(runtime.reserveSpilledReads(b.id, {.kind = WorkKind::Decode}).granted(),
+            "spilled continuation hot floor refused");
+    require(cache.holdsLane(1), "spilled request did not hold its hot floor");
+    const auto saved = state(runtime, context.stateStorage, 1);
+    require(saved.metadata.pendingRows > 0, "spilled continuation retained no speculative GDN rows");
+    require(runtime.parkDecodedRequest(b.id).granted(), "spilled continuation could not park");
+    require(!cache.holdsLane(1), "parked request retained its hot floor");
+    while (cache.releaseAboveFloor()) {}
+    // Overwrite the old decoder lane with a different request.
+    EngineRequest intruder = a; intruder.id = 1003; intruder.prompt = {11, 12, 13};
+    runtime.beginColdRequest(intruder.modelView(), 1);
+    static_cast<void>(step(runtime, intruder.id, 0, intruderPages, intruder.prompt));
+    const auto restored = runtime.restoreParkedRequest(b.id);
+    require(restored.granted() && *restored.lane == 2, "spilled continuation did not rebind");
+    equal(saved, state(runtime, context.stateStorage, 2));
+    for (auto &copy : copies) copy->failAll = fail;
+    const auto expected = step(runtime, a.id, position, resident);
+    const uint32_t vocabulary = context.model.descriptor.capabilities.vocabularySize;
+    const auto expectedSpan = model::RuntimeInstrumentation::lastLogits(runtime, 0).first(vocabulary);
+    const std::vector<float> expectedLogits(expectedSpan.begin(), expectedSpan.end());
+    require(std::any_of(expectedLogits.begin(), expectedLogits.end(),
+                        [&](float value) { return value != expectedLogits.front(); }),
+            "spilled continuation has only tied target logits");
+    require(runtime.reserveSpilledReads(b.id, {.kind = WorkKind::Decode}).granted() && cache.holdsLane(2),
+            "restored request could not reacquire its hot floor");
+    BatchPlan plan{.kind = WorkKind::Decode, .items = {{b.id, 0}}, .decodeStage = DecodeStage::Regular};
+    ModelBatchItem item{b.id, position, 0, spilled};
+    item.pageTableRevision = 2;
+    item.pageSources = sources;
+    auto ticket = runtime.submit(plan, {&item, 1}, {});
+    const auto results = ticket->wait();
+    require(results.size() == 1 && results[0].requestId == b.id, "spilled continuation lost its result");
+    const auto &actual = results[0];
+    uint64_t reads = 0;
+    for (const auto &copy : copies) reads += copy->reads();
+    require(reads > 0, "continuation never read its spilled copies");
+    if (fail) {
+      require(actual.failure.empty() && !actual.unreadableKvBlocks.empty() && actual.outputTokens.empty(),
+              "failed spilled reads silently committed continuation tokens");
+      for (const auto unreadable : actual.unreadableKvBlocks)
+        require(std::any_of(chunk->pages.begin(), chunk->pages.end(),
+                            [&](const auto &source) { return source.block == unreadable; }),
+                "failed continuation reported another request's spilled block");
+    } else {
+      require(actual.failure.empty() && actual.unreadableKvBlocks.empty() &&
+                  !actual.outputTokens.empty() && actual.outputTokens == expected.outputTokens &&
+                  actual.draftedTokens == expected.draftedTokens &&
+                  actual.acceptedDraftTokens == expected.acceptedDraftTokens &&
+                  actual.outputTokensWithoutKv == expected.outputTokensWithoutKv,
+              "spilled continuation differed from resident control");
+      const auto actualLogits = model::RuntimeInstrumentation::lastLogits(runtime, 0).first(vocabulary);
+      require(std::equal(expectedLogits.begin(), expectedLogits.end(), actualLogits.begin()),
+              "spilled continuation logits differed from resident control");
+    }
+    runtime.end(a.id); runtime.end(b.id); runtime.end(intruder.id);
+    for (auto page : resident) pool.releasePage(page, false);
+    for (auto page : spilled) pool.releasePage(page, false);
+    for (auto page : intruderPages) pool.releasePage(page, false);
+    std::cout << "spilled_continuation=PASS fault=" << fail << " reads=" << reads << '\n';
+  }
 }
 
 void run(const char *metallib) {
@@ -519,12 +653,39 @@ void run(const char *metallib) {
     }
   }
 }
+void runSpilled(const char *metallib) {
+  const test::TemporaryDirectory root("splash-spilled-continuation");
+  auto config = test::flashNextConfig(metallib, root.path() / "model",
+                                     gguf_fixtures::kPleTableRows, 2560, 8, true);
+  config.aneFfn.enabled = false;
+  config.verifyRows = model::VerifyRows::All;
+  config.cacheDisk = {.bytes = 2 * kGiB};
+  config.cacheRoot = root.path() / "unit-cache";
+  config.diskVolume = test::reading(test::localVolume(500 * kGiB));
+  config.kvSpillAlways = true;
+  for (const auto format : {ops::GdnStateFormat::Float32, ops::GdnStateFormat::BFloat16}) {
+    config.stateFormat = format;
+    auto resources = RuntimeResources::create(config, 4096);
+    const test::ClaimScope claim(resources->memoryGovernor(), ClaimClass::Floor);
+    const auto &budget = resources->memoryPlan().breakdown();
+    std::unique_ptr<model::Runtime> runtime;
+    require(static_cast<bool>(resources->memoryGovernor().allocationAdmission()(
+        budget.sharedPrefillBytes + budget.sharedDecodeBytes,
+        [&] { runtime = std::make_unique<model::Runtime>(resources->modelContext()); })),
+        "spilled continuation arenas refused");
+    spilledContinuation(*resources, *runtime);
+    std::cout << "spilled_format=PASS state="
+              << (format == ops::GdnStateFormat::Float32 ? "fp32" : "bf16") << '\n';
+  }
+}
+
 } // namespace
 int main(int argc, const char **argv) {
   if (argc != 2) return EXIT_FAILURE;
   @autoreleasepool {
     try {
       run(argv[1]);
+      runSpilled(argv[1]);
       return EXIT_SUCCESS;
     } catch (const std::exception &error) {
       std::cerr << error.what() << '\n';

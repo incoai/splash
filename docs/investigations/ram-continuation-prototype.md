@@ -177,3 +177,50 @@ Samsung cache files stayed open on the verified external volume. Flash-Next,
 96 GiB RAM, 512 GiB cache and the disabled flags were unchanged. No deployment
 or real-model performance benchmark occurred. Source/binary hashes and sanitized
 acceptance are recorded in `ram-continuation-cycle3-20261116.json`.
+
+## Fourth correctness cycle: spilled reads
+
+The new opt-in synthetic attention fixture uses deterministic bounded nonzero
+weights for attention, embedding/output and the indexer, with unit norms. GDN,
+FFN and PLE projection weights remain zero; this is not a trained-model test.
+The existing default fixtures and production code are unchanged. Zero target
+weights were rejected for this test because they selected only tied resident
+keys and made no copy reads; generic quantization-fixture weights were also
+rejected because their extreme scales produced non-finite long-prefill rows.
+
+For each FP32/BF16 state format, the driver runs a successful cold-copy read,
+an injected failed cold-copy read, and a fresh successful request after ending
+the failure. It prefills 2208 tokens, decodes once to leave speculative GDN rows,
+serializes four committed history pages with SlotFormat, then moves those pages
+to Index form. Dense-prefix and the trailing full page stay resident. Old Full
+page K/V is poisoned only after the move, following the existing spill oracle.
+
+Parking releases the request's hot-cache floor; reclaimable cache extents are
+released. Another request overwrites the vacated decoder lane before restore
+into a different lane. Exact retained state matches, the restored request
+reacquires its hot floor, and its new page-table revision identifies Index pages
+with retained TestKvCopy ownership. Successful results match a resident control's
+non-tied logits bit for bit, tokens and speculative counts. Each successful case
+makes 16 copy reads; each failed case makes 32 attempted reads. Failures identify
+only that request's source blocks and return no output tokens. Failed requests
+are ended, as Engine requires; no unsafe in-place retry is attempted.
+
+The six scenarios pass normally and with the uniformly instrumented ASan/UBSan
+library described above, including the non-tied-logit guard. All prior driver
+cases pass again. Architecture remains 30105/30105. The read-failure injection
+uses in-memory copies through the actual spilled-KV reader; physical Samsung IO,
+corruption/crash recovery and latency are not qualified by these tests.
+
+The last commit's CI sanitizers and Python 3.12/3.13/3.14 passed. Its primary job
+failed before compilation while downloading Apple's Metal toolchain catalog
+(exit 70). This account cannot rerun the upstream job; this test commit triggers
+fresh CI. Keep the PR draft pending clean CI and lifecycle/design review. Engine
+scheduling, fairness, real-model verification variation and matched performance
+qualification remain open gates; no TTFT or throughput improvement is claimed.
+
+See `ram-continuation-cycle4-20261117.json` for hashes, test counts and production
+acceptance. All ten production health/readiness checks passed again, with the
+same native identity/instance, zero transport restarts and Samsung slot files
+open on the verified external volume. Flash-Next, 96 GiB RAM, 512 GiB cache and
+the disabled flags stayed unchanged. No runtime code or production settings
+changed in this cycle.
