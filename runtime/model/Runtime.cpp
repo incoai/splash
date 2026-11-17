@@ -754,9 +754,16 @@ struct Runtime::Impl {
         costLine.emplace(stepClasses);
       } else {
         stepCosts.emplace(stepClasses, mostStepRows, geometry.target.ffnKind == QwenFfnKind::SparseMoe);
-        for (uint32_t lanes = 1; value.recallStepCosts && lanes <= kLaneCount; ++lanes)
-          if (const std::optional<std::string> line = value.recallStepCosts(lanes))
+        for (uint32_t lanes = 1; lanes <= kLaneCount; ++lanes) {
+          // Each lane count's measurement fits the startup runway from its
+          // page 5 (Runtime::measureDecodeSteps): the most points today, a
+          // MoE target's 14 at four lanes, take 37 of its 64 pages.
+          if (5 + lanes * measuredLanePages(stepCosts->points(lanes).size()) > ExecutionLimits::warmupKvPages)
+            throw std::logic_error("a lane count's step costs take more pages than the startup runway");
+          const std::optional<std::string> line = value.recallStepCosts ? value.recallStepCosts(lanes) : std::nullopt;
+          if (line)
             stepCosts->recall(lanes, *line);
+        }
       }
     }
     rememberStepCosts = std::move(value.rememberStepCosts);
@@ -2594,6 +2601,14 @@ struct Runtime::Impl {
     return VerifyBudget::laneChances(draft, chain, depth);
   }
 
+  // The KV pages of a lane of a measurement of `points` step costs' points
+  // (Runtime::measureDecodeSteps): its prompt's token, a verify block a
+  // point and one more.
+  static uint32_t measuredLanePages(size_t points) {
+    return static_cast<uint32_t>((1 + (points + 1) * ExecutionLimits::targetVerifyRows + kv::kPageTokens - 1) /
+                                 kv::kPageTokens);
+  }
+
   // A cycle's step over curves.size() lanes, each holding at most `holds`
   // rows (its output left, or a forced chain): a forced step
   // (StepCosts::forced); without step costs (--verify-rows all), a draft's
@@ -4232,7 +4247,7 @@ void Runtime::measureDecodeSteps(uint32_t width) {
   constexpr uint64_t firstId = std::numeric_limits<uint64_t>::max() - 120;
   const std::vector<ops::StepRows> steps = impl_->stepCosts->steps(width);
   const auto answer = static_cast<uint32_t>(steps.size()) * ExecutionLimits::targetVerifyRows;
-  const uint32_t lanePages = (1 + answer + ExecutionLimits::targetVerifyRows + kv::kPageTokens - 1) / kv::kPageTokens;
+  const uint32_t lanePages = Impl::measuredLanePages(steps.size());
   const auto stateLane = [](uint32_t lane) { return ExecutionLimits::maximumBatchWidth - 1 - lane; };
   const std::optional<Impl::ForcedStep> forced = impl_->forcedStep;
   std::array<std::vector<uint32_t>, ExecutionLimits::maximumBatchWidth> pages;
