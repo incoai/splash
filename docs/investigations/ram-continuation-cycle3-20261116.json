@@ -1,0 +1,121 @@
+{
+  "created_at_utc": "2026-11-17T03:45:59.884219+00:00",
+  "parent_commit": "d5d73043f91726c6eb31763e750dfe4693fabb5e",
+  "scope": "synthetic combined constraint and thinking continuation correctness; no serving activation",
+  "driver_sha256": "ed649c6db0a01f529a434812e77819d563226abde7d1ce9b22a4ed87bc782fbe",
+  "normal_binary_sha256": "d7c2fb2c9e673ab7d5ab614439f56eeb33c5d09b0af2fc8a36ea5a32b00a93d7",
+  "sanitizer_binary_sha256": "7470fdfb04eac92f41b32b522a7358e748758a3cd2c3ad9f7a3f59b06d08e993",
+  "fault_control_binary_sha256": "f75ba22ab586c8a1227197a072131812c4f2adcbc3be8c995096894bacf9696f",
+  "combined_cases": {
+    "families": [
+      "dense",
+      "flash-next"
+    ],
+    "state_formats": [
+      "fp32",
+      "bf16"
+    ],
+    "temperatures": [
+      0.0,
+      0.7
+    ],
+    "thinking_budgets": [
+      0,
+      1,
+      5,
+      12
+    ],
+    "cases": 32,
+    "normal_passed": 32,
+    "ASAN_UBSAN_passed": 32,
+    "park_points": [
+      "inside grammar-delayed thinking end",
+      "first thinking-end token selected but not committed"
+    ],
+    "grammar_tokens": [
+      5,
+      6,
+      7
+    ],
+    "thinking_end_tokens": [
+      2,
+      3
+    ],
+    "end_sequence_once_in_order": true,
+    "exact_state_and_next_masked_tokens_match": true,
+    "vacated_lane_overwritten_by_other_request": true
+  },
+  "existing_controls_rerun": {
+    "partial_acceptance_cases": 24,
+    "thinking_cases": 16,
+    "sampled_two_parity_rotation": true,
+    "full_draft_acceptance": 7,
+    "terminal_anchor_refusal": true,
+    "cancellation": true,
+    "KV_table_rebinding": true
+  },
+  "fault_control": {
+    "scope": "temporary Runtime clone only; not committed or deployed",
+    "injected_fault": "reset thinking continuation when parking combined-case request 902",
+    "positive_exit": 0,
+    "fault_control_exit": 1,
+    "expected_failure": "combined grammar/thinking continuation changed its next output",
+    "expected_thinking_state_loss_detected": true
+  },
+  "sanitizer_scope": {
+    "uniform_native_library": true,
+    "library_substrate_base": "9753a803a8d7acc4caf6e164292ca279ea69d830",
+    "matched_substrate_headers": true,
+    "Runtime_cpp_byte_identical_to_upstream_candidate": true,
+    "parked_storage_implementation_byte_identical": true,
+    "container_checks_enabled": true,
+    "leak_detection": false
+  },
+  "architecture": {
+    "passed": true,
+    "engine_lines": 30105,
+    "budget": 30105
+  },
+  "production_model_weights_loaded": false,
+  "runtime_code_changed": false,
+  "deployed": false,
+  "performance_benchmark": false,
+  "limitations": [
+    "Fixed verification rows and synthetic weights only",
+    "Actual spilled-KV reads/failures, Engine fairness and scheduling integration remain unqualified",
+    "No TTFT, throughput or real coding accuracy improvement claimed"
+  ],
+  "production_verification": {
+    "native_instance_unchanged": true,
+    "native_identity_unchanged": true,
+    "native_restarts": 0,
+    "native_ready": true,
+    "persistent_Samsung_files_open": true,
+    "Samsung_external_volume_UUID_verified": true,
+    "model": "ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF:Q2_0",
+    "context_tokens": 262144,
+    "RAM_GiB": 96,
+    "cache_GiB": 512,
+    "admission_enabled": false,
+    "M4_enabled": false,
+    "fusion_unchanged": true,
+    "worker_limit": 8,
+    "capacity": 128,
+    "queue_running": 3,
+    "queue_waiting": 0,
+    "health": {
+      "11500/health": 200,
+      "11500/ready": 200,
+      "11501/health": 200,
+      "11501/ready": 200,
+      "11502/health": 200,
+      "11502/ready": 200,
+      "11503/health": 200,
+      "11503/ready": 200,
+      "11504/health": 200,
+      "11504/ready": 200
+    },
+    "deployed": false,
+    "model_benchmarks": false
+  }
+}

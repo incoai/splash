@@ -144,3 +144,36 @@ synthetic weights in observed production-idle windows. They are not real coding
 benchmarks; combined constrained/thinking behavior, actual spilled-KV failure
 paths and scheduler integration remain activation gates. See
 `ram-continuation-cycle2-20261116.json` for hashes and counts.
+
+## Third correctness cycle
+
+Added 32 combined grammar/thinking cases: greedy and sampled decoding, thinking
+budgets 0, 1, 5 and 12, dense/Flash-Next and FP32/BF16. Each parks twice: inside
+a grammar-delayed thinking-end sequence, then with the first end token selected
+but not committed. Another request overwrites the vacated lane before restore.
+Exact state, subsequent tokens and speculative counts match the uninterrupted
+control; the two-token end sequence appears exactly once and in order.
+
+All 32 pass normally on the upstream candidate and under the same uniformly
+instrumented ASan/UBSan library described above. The previous 40 partial/thinking
+cases and existing controls also pass again. A temporary, test-only Runtime clone
+that deliberately drops request 902's thinking continuation fails at the expected
+next-output parity assertion (exit 1), while the positive driver exits 0. This
+checks test sensitivity; it is not a discovered production bug or runtime fix.
+Container checks remain enabled; architecture remains 30105/30105.
+
+These tests close the synthetic combined grammar/thinking gap from cycle two.
+They do not close the spilled-KV boundary: the active hot-reader fixture retains
+Full resident pages. Existing oracle helpers serialize pages before moving them
+to Index form and retain dense-prefix/window pages; a future continuation fixture
+must preserve those ownership rules and exercise read failures explicitly rather
+than merely attach a hot cache. Physical SSD failure behavior remains separate.
+Engine scheduling, fairness and real-model verification variation also remain
+unqualified, so a RAM-continuation TTFT benchmark would be premature.
+
+Production verification after the runs passed all ten health/readiness checks.
+Native identity and instance remained unchanged, with zero transport restarts;
+Samsung cache files stayed open on the verified external volume. Flash-Next,
+96 GiB RAM, 512 GiB cache and the disabled flags were unchanged. No deployment
+or real-model performance benchmark occurred. Source/binary hashes and sanitized
+acceptance are recorded in `ram-continuation-cycle3-20261116.json`.

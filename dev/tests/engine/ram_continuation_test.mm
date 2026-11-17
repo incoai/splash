@@ -12,6 +12,7 @@
 #include <chrono>
 #include <thread>
 #include <iostream>
+#include <functional>
 #include <memory>
 #include <set>
 #include <vector>
@@ -84,9 +85,11 @@ std::vector<uint32_t> singletonMasks(std::span<const uint32_t> tokens, uint32_t 
   return words;
 }
 void initialMask(model::Runtime &runtime, uint64_t id, uint64_t position,
-                 const std::vector<uint32_t> &pages, uint32_t vocabulary) {
+                 const std::vector<uint32_t> &pages, uint32_t vocabulary,
+                 const std::vector<uint32_t> &given = {}) {
   const std::array<uint32_t, 1> token{0};
-  require(!runtime.provideMask(id, singletonMasks(token, vocabulary)), "initial mask was refused");
+  require(!runtime.provideMask(id, given.empty() ? singletonMasks(token, vocabulary) : given),
+          "initial mask was refused");
   BatchPlan plan{.kind = WorkKind::Decode, .items = {{id, 0}},
                  .decodeStage = DecodeStage::ApplyInitialMask};
   ModelBatchItem item{id, position, 0, pages};
@@ -96,9 +99,9 @@ void initialMask(model::Runtime &runtime, uint64_t id, uint64_t position,
   require(results.size() == 1 && results.front().failure.empty() && results.front().outputTokens.empty(),
           "initial mask selection failed or committed an output row");
 }
-ModelStepResult partialStep(model::Runtime &runtime, metal::MetalBackend &backend,
+ModelStepResult maskedStep(model::Runtime &runtime, metal::MetalBackend &backend,
                             uint64_t id, uint64_t position, const std::vector<uint32_t> &pages,
-                            uint32_t vocabulary, uint32_t accepted) {
+                            const std::function<std::vector<uint32_t>(std::span<const uint32_t>)> &maskFor) {
   require(runtime.reserveSpilledReads(id, {.kind = WorkKind::Decode}).granted(),
           "partial-acceptance hot floor was refused");
   BatchPlan plan{.kind = WorkKind::Decode, .items = {{id, 0}}, .decodeStage = DecodeStage::Regular};
@@ -120,23 +123,32 @@ ModelStepResult partialStep(model::Runtime &runtime, metal::MetalBackend &backen
   require(requests.size() == 1 && requests.front().requestId == id,
           "partial-acceptance simulation belongs to another request");
   const auto &simulation = requests.front().simulationTokens;
-  require(accepted > 0 && accepted + 1 < simulation.size(), "fixture is not partial acceptance");
   // Drain target forward without supplying the mask. A host-only mask wait
   // must not be mistaken for a safe point merely because the GPU is idle.
   while (backend.commandInFlight()) advance();
   require(!runtime.parkDecodedRequest(id).granted(), "mask-waiting request was parked with an idle GPU");
-  std::vector<uint32_t> selected(simulation.size() + 1, 0);
-  selected[0] = simulation.front();
-  for (uint32_t row = 1; row <= accepted; ++row) selected[row] = simulation[row];
-  selected[accepted + 1] = simulation[accepted + 1] == 0 ? 1 : 0;
-  require(!runtime.provideMask(id, singletonMasks(selected, vocabulary)), "verify masks were refused");
+  require(!runtime.provideMask(id, maskFor(simulation)), "verify masks were refused");
   while (!ticket->ready()) advance();
   const auto results = ticket->wait();
   require(results.size() == 1 && results.front().failure.empty() &&
-              results.front().acceptedDraftTokens == accepted &&
-              results.front().outputTokens.size() == accepted + 1,
-          "mask did not force the requested intermediate acceptance length");
+              results.front().acceptedDraftTokens <= results.front().draftedTokens,
+          "masked continuation command failed");
   return results.front();
+}
+ModelStepResult partialStep(model::Runtime &runtime, metal::MetalBackend &backend,
+                            uint64_t id, uint64_t position, const std::vector<uint32_t> &pages,
+                            uint32_t vocabulary, uint32_t accepted) {
+  const auto result = maskedStep(runtime, backend, id, position, pages, [&](auto simulation) {
+    require(accepted > 0 && accepted + 1 < simulation.size(), "fixture is not partial acceptance");
+    std::vector<uint32_t> selected(simulation.size() + 1, 0);
+    selected[0] = simulation.front();
+    for (uint32_t row = 1; row <= accepted; ++row) selected[row] = simulation[row];
+    selected[accepted + 1] = simulation[accepted + 1] == 0 ? 1 : 0;
+    return singletonMasks(selected, vocabulary);
+  });
+  require(result.acceptedDraftTokens == accepted && result.outputTokens.size() == accepted + 1,
+          "mask did not force the requested intermediate acceptance length");
+  return result;
 }
 
 void run(const char *metallib) {
@@ -388,6 +400,103 @@ void run(const char *metallib) {
         runtime->end(303);
         ++thinkingCases;
       }
+      uint32_t combinedCases = 0;
+      for (const float temperature : {0.0F, 0.7F}) {
+        for (const uint32_t thinkingTokens : {0u, 1u, 5u, 12u}) {
+          for (const auto *pages : {&baselinePages, &parkedPages, &intruderPages})
+            for (const uint32_t page : *pages) pool.clearPage(page);
+          auto aRequest = input(901), bRequest = input(902);
+          aRequest.flags = bRequest.flags = 0;
+          aRequest.constraint = bRequest.constraint = ConstraintMode::TokenMask;
+          aRequest.sampling = bRequest.sampling = {};
+          aRequest.sampling.temperature = bRequest.sampling.temperature = temperature;
+          aRequest.sampling.seed = bRequest.sampling.seed = 47;
+          aRequest.thinkingBudget = bRequest.thinkingBudget = ThinkingBudget{thinkingTokens, {2, 3}, 4};
+          const uint32_t character = thinkingTokens ? thinkingTokens - 1 : 0;
+          const uint32_t endAt = character + 3;
+          const auto maskAt = [&](uint64_t position) {
+            if (position >= character && position < endAt) {
+              const std::array<uint32_t, 1> token{static_cast<uint32_t>(5 + position - character)};
+              return singletonMasks(token, vocabulary);
+            }
+            std::vector<uint32_t> words((vocabulary + 31) / 32, ~0u);
+            // Admit the desired thinking-end token without forcing it: a
+            // lost thinking continuation would choose an ordinary token.
+            for (const uint32_t token : {2u, 3u, 4u, 5u, 6u, 7u})
+              if (!((position == endAt && token == 2) || (position == endAt + 1 && token == 3)))
+                words[token / 32] &= ~(1u << (token % 32));
+            return words;
+          };
+          runtime->beginColdRequest(aRequest.modelView(), 0);
+          runtime->beginColdRequest(bRequest.modelView(), 1);
+          require(step(*runtime, 901, 0, baselinePages, prompt).nextDecodeStage == DecodeStage::ApplyInitialMask &&
+                      step(*runtime, 902, 0, parkedPages, prompt).nextDecodeStage == DecodeStage::ApplyInitialMask,
+                  "combined fixture skipped its initial masks");
+          initialMask(*runtime, 901, prompt.size(), baselinePages, vocabulary, maskAt(0));
+          initialMask(*runtime, 902, prompt.size(), parkedPages, vocabulary, maskAt(0));
+          std::vector<uint32_t> generated;
+          const auto compareMasked = [&] {
+            const uint64_t position = generated.size();
+            const auto masks = [&](auto simulation) {
+              std::vector<uint32_t> words;
+              for (uint32_t row = 0; row <= simulation.size(); ++row) {
+                const auto next = maskAt(position + row);
+                words.insert(words.end(), next.begin(), next.end());
+              }
+              return words;
+            };
+            const auto a = maskedStep(*runtime, resources->backend(), 901, prompt.size() + position,
+                                      baselinePages, masks);
+            const auto b = maskedStep(*runtime, resources->backend(), 902, prompt.size() + position,
+                                      parkedPages, masks);
+            require(!a.finished && !b.finished && !a.outputTokens.empty() &&
+                        a.outputTokens == b.outputTokens && a.acceptedDraftTokens == b.acceptedDraftTokens &&
+                        a.outputTokensWithoutKv == b.outputTokensWithoutKv,
+                    "combined grammar/thinking continuation changed its next output");
+            generated.insert(generated.end(), a.outputTokens.begin(), a.outputTokens.end());
+          };
+          uint32_t cycles = 0;
+          while (model::RuntimeInstrumentation::pendingToken(*runtime, 902) != 6 && cycles++ < 20)
+            compareMasked();
+          require(model::RuntimeInstrumentation::pendingToken(*runtime, 902) == 6 &&
+                      generated.size() == character + 1,
+                  "fixture did not pause inside a grammar-delayed thinking end");
+          const auto saved = state(*runtime, storage, 1);
+          require(runtime->parkDecodedRequest(902).granted(), "combined continuation could not park");
+          runtime->beginColdRequest(intruder.modelView(), 1);
+          static_cast<void>(step(*runtime, 303, 0, intruderPages, prompt));
+          static_cast<void>(step(*runtime, 303, prompt.size(), intruderPages));
+          const auto restored = runtime->restoreParkedRequest(902);
+          require(restored.granted() && *restored.lane == 2, "combined continuation did not rebind");
+          equal(saved, state(*runtime, storage, 2));
+          while (model::RuntimeInstrumentation::pendingToken(*runtime, 902) != 2 && cycles++ < 30)
+            compareMasked();
+          require(model::RuntimeInstrumentation::pendingToken(*runtime, 902) == 2 && generated.size() == endAt,
+                  "fixture did not reach the first selected thinking-end token");
+          runtime->end(303);
+          const auto ending = state(*runtime, storage, 2);
+          require(runtime->parkDecodedRequest(902).granted(), "partly selected thinking end could not park");
+          runtime->beginColdRequest(intruder.modelView(), 2);
+          static_cast<void>(step(*runtime, 303, 0, intruderPages, prompt));
+          static_cast<void>(step(*runtime, 303, prompt.size(), intruderPages));
+          const auto endingRestored = runtime->restoreParkedRequest(902);
+          require(endingRestored.granted() && *endingRestored.lane == 1,
+                  "partly selected thinking end did not rebind");
+          equal(ending, state(*runtime, storage, 1));
+          while (generated.size() < endAt + 5 && cycles++ < 40) compareMasked();
+          const std::array<uint32_t, 3> characterTokens{5, 6, 7};
+          require(generated.size() >= endAt + 5 &&
+                      std::equal(characterTokens.begin(), characterTokens.end(), generated.begin() + character) &&
+                      generated[endAt] == 2 && generated[endAt + 1] == 3 &&
+                      std::count(generated.begin(), generated.end(), 2) == 1 &&
+                      std::count(generated.begin(), generated.end(), 3) == 1,
+                  "combined continuation ended thinking early, twice or out of order");
+          runtime->end(901);
+          runtime->end(902);
+          runtime->end(303);
+          ++combinedCases;
+        }
+      }
       auto terminal = input(505);
       terminal.maxNewTokens = 1;
       for (const uint32_t page : intruderPages) pool.clearPage(page);
@@ -405,7 +514,8 @@ void run(const char *metallib) {
                 << " rotations=2 sampled_tokens=" << output.size()
                 << " full_draft_accepted=" << fullBase.acceptedDraftTokens
                 << " partial_cases=" << partialCases
-                << " thinking_cases=" << thinkingCases << '\n';
+                << " thinking_cases=" << thinkingCases
+                << " combined_cases=" << combinedCases << '\n';
     }
   }
 }
