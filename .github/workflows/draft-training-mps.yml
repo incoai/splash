@@ -1,0 +1,48 @@
+name: Experimental DFlash2 MPS smoke
+
+on:
+  workflow_dispatch:
+    inputs:
+      runner_label:
+        description: Label of a trusted self-hosted Apple Silicon runner with MPS
+        type: string
+        required: true
+        default: splash-mps-training
+
+permissions:
+  contents: read
+
+jobs:
+  mps-smoke:
+    runs-on: [self-hosted, macOS, ARM64, "${{ inputs.runner_label }}"]
+    timeout-minutes: 30
+    env:
+      DFLASH_REQUIRE_MPS: "1"
+      PYTORCH_ENABLE_MPS_FALLBACK: "0"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+      - name: Install optional training dependencies
+        run: python -m pip install -r training/requirements.txt
+      - name: Record Apple GPU and library versions
+        run: |
+          python - <<'PY'
+          import json
+          import platform
+          import torch
+          import transformers
+          from draft_training.__main__ import execution_context, require_torch
+          require_torch("mps")
+          print(json.dumps({
+              "execution": execution_context(torch, "mps"),
+              "python": platform.python_version(),
+              "torch": torch.__version__,
+              "transformers": transformers.__version__,
+          }, indent=2))
+          PY
+      - name: Run actual MPS capture, training, resume, export, and evaluation
+        run: python -m unittest dev.tests.training.test_mps -v
