@@ -165,8 +165,7 @@ private:
   void promptProgress(uint64_t requestId, uint32_t processedTokens) override;
   void firstTokenParts(uint64_t requestId, const TtftParts &parts) override;
   void tokens(uint64_t requestId, std::span<const uint32_t> values) override;
-  void maskRequested(uint64_t requestId,
-                     std::span<const uint32_t> simulationTokens) override;
+  void maskRequested(const ModelMaskRequest &request) override;
   void completed(uint64_t requestId, EngineFinishReason reason, bool bounded,
                  uint32_t promptTokens, uint32_t completionTokens,
                  uint32_t deduplicatedTokens,

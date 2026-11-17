@@ -1,6 +1,7 @@
 #include "TestChecks.hpp"
 #include "engine/CacheDirectory.hpp"
 
+#include <dlfcn.h>
 #include <fcntl.h>
 #include <sys/file.h>
 #include <sys/stat.h>
@@ -10,6 +11,7 @@
 #include <algorithm>
 #include <cerrno>
 #include <chrono>
+#include <cstdarg>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -26,6 +28,104 @@ using splash::engine::CacheDirectory;
 using splash::test::rejects;
 using splash::test::require;
 using namespace std::chrono_literals;
+
+namespace cache_syscall_test {
+
+enum class Operation { mkdir, open, openat, fsync };
+
+// Only this thread's exact temporary path is armed. Unarmed calls use libc;
+// no production injection interface or modified copy of CacheDirectory is used.
+struct Fault final {
+  Operation operation;
+  std::string path;
+  std::vector<int> errors;
+  size_t calls = 0;
+  int flags = 0;
+  mode_t mode = 0;
+};
+thread_local Fault *active = nullptr;
+
+bool inject(Operation operation, const char *path, int flags, mode_t mode) {
+  Fault *fault = active;
+  if (!fault || fault->operation != operation || fault->path != path)
+    return false;
+  fault->flags = flags;
+  fault->mode = mode;
+  const size_t call = fault->calls++;
+  if (call >= fault->errors.size())
+    return false;
+  errno = fault->errors[call];
+  return true;
+}
+
+class Armed final {
+public:
+  explicit Armed(Fault &fault) { active = &fault; }
+  ~Armed() { active = nullptr; }
+  Armed(const Armed &) = delete;
+  Armed &operator=(const Armed &) = delete;
+};
+
+} // namespace cache_syscall_test
+
+// Resolve libc's actual syscall wrappers rather than recursively calling the
+// executable's interposed symbol. This also observes the original mode/flags.
+extern "C" int mkdir(const char *path, mode_t mode) {
+  using Function = int (*)(const char *, mode_t);
+  static const auto real = reinterpret_cast<Function>(::dlsym(RTLD_NEXT, "mkdir"));
+  if (!real)
+    std::abort();
+  if (cache_syscall_test::inject(cache_syscall_test::Operation::mkdir, path, 0, mode))
+    return -1;
+  return real(path, mode);
+}
+
+extern "C" int open(const char *path, int flags, ...) {
+  using Function = int (*)(const char *, int, ...);
+  static const auto real = reinterpret_cast<Function>(::dlsym(RTLD_NEXT, "open"));
+  if (!real)
+    std::abort();
+  mode_t mode = 0;
+  if (flags & O_CREAT) {
+    va_list arguments;
+    va_start(arguments, flags);
+    mode = static_cast<mode_t>(va_arg(arguments, int));
+    va_end(arguments);
+  }
+  if (cache_syscall_test::inject(cache_syscall_test::Operation::open, path, flags, mode))
+    return -1;
+  return real(path, flags, mode);
+}
+
+// A namespace's lock opens relative to its directory, so its fault names the
+// lock's file name.
+extern "C" int openat(int directory, const char *path, int flags, ...) {
+  using Function = int (*)(int, const char *, int, ...);
+  static const auto real = reinterpret_cast<Function>(::dlsym(RTLD_NEXT, "openat"));
+  if (!real)
+    std::abort();
+  mode_t mode = 0;
+  if (flags & O_CREAT) {
+    va_list arguments;
+    va_start(arguments, flags);
+    mode = static_cast<mode_t>(va_arg(arguments, int));
+    va_end(arguments);
+  }
+  if (cache_syscall_test::inject(cache_syscall_test::Operation::openat, path, flags, mode))
+    return -1;
+  return real(directory, path, flags, mode);
+}
+
+// An fsync names no path: its fault names none either.
+extern "C" int fsync(int descriptor) {
+  using Function = int (*)(int);
+  static const auto real = reinterpret_cast<Function>(::dlsym(RTLD_NEXT, "fsync"));
+  if (!real)
+    std::abort();
+  if (cache_syscall_test::inject(cache_syscall_test::Operation::fsync, "", 0, 0))
+    return -1;
+  return real(descriptor);
+}
 
 namespace {
 
@@ -91,6 +191,224 @@ void testOneProcessAtATime() {
     rejects([&] { static_cast<void>(root.open(name)); },
             "a cache namespace is 32 lowercase hex digits",
             "a namespace that is not 32 lowercase hex digits was accepted");
+}
+
+// A signal can interrupt mkdir/open before the cache root is available.
+// Retry only that syscall; never reopen/empty the whole cache.
+void testInterruptedDirectorySyscalls() {
+  using cache_syscall_test::Armed;
+  using cache_syscall_test::Fault;
+  using cache_syscall_test::Operation;
+  for (const bool namespacePath : {false, true}) {
+    for (const Operation operation : {Operation::mkdir, Operation::open}) {
+      for (const bool existing : {false, true}) {
+        Root root;
+        if (existing) {
+          auto first = root.open();
+          touch(first->kvSlots());
+        }
+        Fault fault{operation, (namespacePath ? root.path() / kNamespace : root.path()).string(),
+                    {EINTR, EINTR}};
+        Armed armed(fault);
+        auto directory = root.open();
+        require(directory && fault.calls == 3, "interrupted directory syscall was not retried");
+        if (operation == Operation::mkdir)
+          require(fault.mode == 0700, "mkdir retry changed private directory mode");
+        else
+          require(fault.flags == (O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW),
+                  "open retry changed directory security flags");
+        struct stat status {};
+        require(::stat(fault.path.c_str(), &status) == 0 && (status.st_mode & 0777) == 0700,
+                "interrupted directory creation changed final permissions");
+        if (existing)
+          require(std::filesystem::exists(directory->kvSlots()), "retry discarded existing cache files");
+      }
+    }
+  }
+}
+
+// A permanent error must escape once, including after an interruption. It
+// must not be mistaken for a removed directory or restart the cache operation.
+void testDirectoryErrorsKeepTheirErrno() {
+  using cache_syscall_test::Armed;
+  using cache_syscall_test::Fault;
+  using cache_syscall_test::Operation;
+  for (const bool namespacePath : {false, true}) {
+    for (const Operation operation : {Operation::mkdir, Operation::open}) {
+      for (const std::vector<int> &errors : {std::vector<int>{EACCES},
+                                            std::vector<int>{EINTR, EIO}}) {
+        Root root;
+        Fault fault{operation, (namespacePath ? root.path() / kNamespace : root.path()).string(),
+                    errors};
+        Armed armed(fault);
+        bool failed = false;
+        try {
+          static_cast<void>(root.open());
+        } catch (const std::system_error &error) {
+          failed = true;
+          require(error.code() == std::error_code(errors.back(), std::generic_category()),
+                  "directory failure lost its final errno");
+        }
+        require(failed && fault.calls == errors.size(), "non-EINTR directory error was retried");
+      }
+    }
+  }
+}
+
+// A signal storm cannot spin startup forever. ENOENT retains its original
+// root-error/namespace-race behavior, and interrupted opens still reject links.
+void testDirectoryRetryBoundAndSecurity() {
+  using cache_syscall_test::Armed;
+  using cache_syscall_test::Fault;
+  using cache_syscall_test::Operation;
+  for (const bool namespacePath : {false, true}) {
+    for (const Operation operation : {Operation::mkdir, Operation::open}) {
+      Root root;
+      Fault fault{operation, (namespacePath ? root.path() / kNamespace : root.path()).string(),
+                  std::vector<int>(16, EINTR)};
+      Armed armed(fault);
+      bool failed = false;
+      try {
+        static_cast<void>(root.open());
+      } catch (const std::system_error &error) {
+        failed = error.code() == std::error_code(EINTR, std::generic_category());
+      }
+      require(failed && fault.calls == 8, "repeated interruptions exceeded the startup bound");
+    }
+    {
+      Root root;
+      Fault fault{Operation::open,
+                  (namespacePath ? root.path() / kNamespace : root.path()).string(), {ENOENT}};
+      Armed armed(fault);
+      if (namespacePath)
+        require(!root.open(), "removed namespace did not retain its expired-race result");
+      else {
+        bool failed = false;
+        try {
+          static_cast<void>(root.open());
+        } catch (const std::system_error &error) {
+          failed = error.code() == std::error_code(ENOENT, std::generic_category());
+        }
+        require(failed, "removed cache root did not retain ENOENT");
+      }
+      require(fault.calls == 1, "ENOENT was retried as EINTR");
+    }
+    {
+      Root root;
+      const auto target = root.path().parent_path() / "outside";
+      std::filesystem::create_directory(target);
+      const auto link = namespacePath ? root.path() / kNamespace : root.path();
+      if (namespacePath)
+        std::filesystem::create_directory(root.path());
+      std::filesystem::create_directory_symlink(target, link);
+      Fault fault{Operation::open, link.string(), {EINTR, EINTR}};
+      Armed armed(fault);
+      bool failed = false;
+      try {
+        static_cast<void>(root.open());
+      } catch (const std::system_error &error) {
+        failed = error.code().value() == ELOOP || error.code().value() == ENOTDIR;
+      }
+      require(failed && fault.calls == 3, "interrupted directory open followed a symlink");
+      require(std::filesystem::is_empty(target), "symlink target acquired cache files");
+    }
+  }
+}
+
+// A signal can interrupt the open of a namespace's lock as it can its
+// directory's: that open is retried alike, with its flags and mode, within the
+// same bound, and another error escapes at once.
+void testInterruptedLockOpen() {
+  using cache_syscall_test::Armed;
+  using cache_syscall_test::Fault;
+  using cache_syscall_test::Operation;
+  {
+    Root root;
+    Fault fault{Operation::openat, "lock", {EINTR, EINTR}};
+    Armed armed(fault);
+    require(root.open() && fault.calls == 3 && fault.flags == (O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW) &&
+                fault.mode == 0600,
+            "an interrupted open of the lock was not retried as it was made");
+  }
+  for (const std::vector<int> &errors : {std::vector<int>(16, EINTR), std::vector<int>{EINTR, EIO}}) {
+    Root root;
+    Fault fault{Operation::openat, "lock", errors};
+    Armed armed(fault);
+    int failed = 0;
+    try {
+      static_cast<void>(root.open());
+    } catch (const std::system_error &error) {
+      failed = error.code().value();
+    }
+    require(failed == (errors.size() > 8 ? EINTR : EIO) && fault.calls == std::min<size_t>(errors.size(), 8),
+            "an open of the lock retried past its bound or another error than EINTR");
+  }
+}
+
+// A signal can interrupt the open of a mark and the fsyncs that make marks
+// durable, which every start and close makes: each is retried alike, with the
+// mark's flags and mode, within the same bound.
+void testInterruptedMarks() {
+  using cache_syscall_test::Armed;
+  using cache_syscall_test::Fault;
+  using cache_syscall_test::Operation;
+  {
+    Root root;
+    auto directory = root.open();
+    Fault fault{Operation::openat, "serving", {EINTR, EINTR}};
+    Armed armed(fault);
+    directory->beginServing();
+    require(fault.calls == 3 && fault.flags == (O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC | O_NOFOLLOW) &&
+                fault.mode == 0600 && std::filesystem::exists(directory->path() / "serving"),
+            "an interrupted open of a mark was not retried as it was made");
+  }
+  // beginServing() makes two marks, each with an fsync of its file and one of
+  // the directory; close() removes three, the failed probation's too, with an
+  // fsync of the directory each.
+  for (const bool closing : {false, true}) {
+    Root root;
+    auto directory = root.open();
+    if (closing)
+      directory->beginServing();
+    Fault fault{Operation::fsync, "", {EINTR, EINTR}};
+    Armed armed(fault);
+    if (closing)
+      directory->close();
+    else
+      directory->beginServing();
+    require(fault.calls == (closing ? 5u : 6u) &&
+                std::filesystem::exists(directory->path() / "serving") == !closing,
+            "an interrupted fsync of a mark was not retried");
+  }
+  Root root;
+  auto directory = root.open();
+  Fault fault{Operation::fsync, "", std::vector<int>(16, EINTR)};
+  Armed armed(fault);
+  int failed = 0;
+  try {
+    directory->beginServing();
+  } catch (const std::system_error &error) {
+    failed = error.code().value();
+  }
+  require(failed == EINTR && fault.calls == 8, "an fsync of a mark retried past its bound");
+}
+
+// A root whose parents are missing, as a first start's ~/Library/Caches/Splash
+// is, has them made; a parent that cannot be made fails the open, naming it.
+void testRootParentsAreMade() {
+  Root root;
+  const auto nested = root.path() / "a" / "b" / "prefix-cache";
+  require(CacheDirectory::open(nested, kNamespace, 0ms) && std::filesystem::is_directory(nested / kNamespace),
+          "a root's missing parents were not made");
+  touch(root.path() / "file");
+  const auto under = root.path() / "file" / "c";
+  bool failed = false;
+  try {
+    static_cast<void>(CacheDirectory::open(under / "prefix-cache", kNamespace, 0ms));
+  } catch (const std::filesystem::filesystem_error &error) {
+    failed = error.code() == std::errc::not_a_directory && error.path1() == under;
+  }
+  require(failed, "a parent under a file did not fail the open with its path");
 }
 
 // The marks say how the last processes ended: serving without closing is an
@@ -335,6 +653,12 @@ void testForeignDirectoriesAreRefused() {
 
 int main() {
   try {
+    testInterruptedDirectorySyscalls();
+    testDirectoryErrorsKeepTheirErrno();
+    testDirectoryRetryBoundAndSecurity();
+    testInterruptedLockOpen();
+    testRootParentsAreMade();
+    testInterruptedMarks();
     testOneProcessAtATime();
     testMarksFollowTheLastEnd();
     testStaleNamespacesGo();

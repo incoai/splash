@@ -54,10 +54,11 @@ public:
   // Some lane of the command holds an Index page.
   [[nodiscard]] bool active() const noexcept;
   // After a layer's block lists, before its attention: the lists with the
-  // locations of their entries' blocks (KvBlockCache::addResolve), for the
-  // located split. Only an active one, for lists.
+  // locations of their entries' blocks (KvBlockCache::addResolve), each
+  // lane's `laneLists` lists of its tiles, for the located split. Only an
+  // active one, for lists.
   [[nodiscard]] ops::AttentionBlocks verify(metal::CommandGraph &graph, uint32_t layer,
-                                            const ops::AttentionBlocks &blocks);
+                                            const ops::AttentionBlocks &blocks, uint32_t laneLists);
   // After a prefill chunk's store: the K/V its attention reads, staged when
   // the history of `sequence` holds Index pages (KvHistoryStream), else
   // `pool`. The chunk's pages are [chunkFirstPage, chunkFirstPage +

@@ -16,7 +16,7 @@ namespace splash::test {
 inline void spendWriteBudget(const std::shared_ptr<model::DiskBudget> &budget) {
   model::SlotFile file(kHostPageBytes, budget);
   const std::vector<std::byte> payload(kHostPageBytes, std::byte{1});
-  require(file.write(file.acquire(), {payload}, {})->wait(), "the budget's write failed");
+  require(file.write(file.acquire(payload.size()), {payload}, {})->wait(), "the budget's write failed");
 }
 
 // A disk budget whose write budget refills on a clock the test moves: two

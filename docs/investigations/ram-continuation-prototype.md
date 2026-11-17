@@ -5,6 +5,31 @@ history. This prototype adds a separate native Runtime capability to retain a
 decoder in RAM and resume without replay. Engine admission does not call it;
 there is no protocol, CLI or production activation path. Nothing is deployed.
 
+## Current baseline
+
+The newest reconciliation targets upstream main `61f6d51` (1.7.0 source,
+including 1.6.2), not a production upgrade. Earlier receipts below remain
+historical evidence on their named 1.6.1 bases. The tree decoder uses a
+`pendingPath` mask and at most 16 retained rows; parking copies precisely those
+physical tape rows while retaining the running FP32/BF16 cells exactly, without
+the cached-state codec. Grammar masks follow tree depth. Request-local lookup,
+grammar, RNG and thinking continuation remain with the request.
+
+Upstream decode-time checkpoints are enabled only without auxiliary state.
+Flash-Next's PLE/QSA state excludes it: the concrete Runtime capability check
+asserts this in both state formats. A controlled CPU characterization finds
+8/52/140 replay rows without decode captures and 8/20/12 with captures at reply
+thresholds 1/41/129. Those are fake-model work counts for the two capabilities,
+not Flash-Next timings or a measured improvement of production. Captures may
+also be refused under pressure. Equal-priority foreground streams still do not
+rotate; the eight-request characterization remains unchanged.
+
+The shared lifecycle, KV ownership and deterministic fairness acceptance matrix
+are in [ram-continuation-scheduler-qualification.md](ram-continuation-scheduler-qualification.md).
+It is a review specification, with no Engine scheduling implementation or
+activation. Upstream's architecture budget is 30594/30594; this patch adds no
+Engine production lines and does not raise that budget.
+
 ## Retained state and accounting
 
 `QwenStateStorage::ParkedLane` owns both recurrent-state parity cells, including
@@ -224,3 +249,39 @@ same native identity/instance, zero transport restarts and Samsung slot files
 open on the verified external volume. Flash-Next, 96 GiB RAM, 512 GiB cache and
 the disabled flags stayed unchanged. No runtime code or production settings
 changed in this cycle.
+
+## 1.7 tree-contract qualification
+
+The current base passes 480/480 CPU Engine tests. Normal M5 and fresh full-library
+ASan/UBSan runs pass dense/Flash-Next in FP32/BF16, including 15 accepted proposals
+and all 16 retained rows, 24 partial-acceptance cases (one nonconsecutive path per
+configuration), 16 thinking and 32 combined grammar/thinking cases, and six
+spilled-read scenarios. Masks follow parent depth; exact grammar park points use
+one-row steps before restoring ordinary tree choice, and thinking tests run to a
+bounded token goal rather than assume three cycles finish the budget.
+
+Four additional byte-ownership cases put canaries in a sparse pending tape path
+(rows 0/3/15), overwrite the old lane/slot and verify exact restore elsewhere.
+These requests end without numerically decoding the invalid canary bytes.
+Storage tests use codec-aligned dimensions and preserve the same sparse metadata
+path, with refusal, throwing-save rollback, cancellation and late-handle cleanup.
+
+A uniformly instrumented temporary clone that incorrectly copies a consecutive
+prefix of popcount rows instead of the selected physical rows exits 1 at the
+expected state/tape parity check. The correct driver exits 0. No fault code is
+committed; this is a test-sensitivity control, not a serving defect. The entire
+native library and instrumentation were rebuilt on the current upstream base
+with matching headers, container checks enabled and macOS leak detection off.
+
+Matching 1.7 shaders were built with the locally downloaded Apple Metal compiler
+component. The normal correctness run lacked the optional sibling host-step
+keepawake shader and reported its latency warning; the sanitizer run included
+that matching shader. No timing result is inferred from either. Physical SSD
+faults, trained-model variation and Engine scheduling remain unqualified.
+
+All ten production health/readiness checks pass after the runs. Native identity
+and instance remain unchanged with zero transport restarts; Samsung cache files
+remain open on the verified external volume. Flash-Next, 96 GiB RAM/512 GiB cache,
+eight workers and the disabled flags are unchanged. No deployment, queue pause,
+production restart or real-model benchmark occurred. Hashes and sanitized
+acceptance are in `ram-continuation-upstream170-20261117.json`.

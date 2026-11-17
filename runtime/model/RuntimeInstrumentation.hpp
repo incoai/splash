@@ -2,7 +2,9 @@
 
 #include "metal/abi/KvExtent.h"
 #include "model/Runtime.hpp"
+#include "model/StepCosts.hpp"
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <optional>
@@ -16,14 +18,14 @@ namespace splash::model {
 // these; production binaries never link it.
 class RuntimeInstrumentation final {
 public:
-  // The PLE rows the last decode step gathered for batch lane `lane`'s
-  // verify rows, each row's heads' in order (Qwen3.8-Flash-Next), until the
+  // The PLE rows the last decode step gathered for batch lane `lane`'s rows
+  // of the step, each row's heads' in order (Qwen3.8-Flash-Next), until the
   // next decode step; none for a target without them.
   [[nodiscard]] static std::vector<uint32_t> lastTableRows(const Runtime &runtime, uint32_t lane);
-  // The fp32 logits the last command left in batch lane `lane`'s rows, each
-  // the target's vocabulary wide, until the next command: a decode step's
-  // verify rows, or in row 0 the final position of the prefill chunk that
-  // ended a prompt.
+  // The fp32 logits the last command that selected left in batch lane
+  // `lane`'s rows, each the target's vocabulary wide, until the next command:
+  // a decode step's rows as its selector laid them out, or the row of the
+  // final position of the prefill chunk that ended a prompt.
   [[nodiscard]] static std::span<const float> lastLogits(const Runtime &runtime, uint32_t lane);
   // The target rows the last prefill command captured for the draft in its
   // chunk `chunk`'s buffer, until the next prefill: bf16 rows of the output
@@ -31,14 +33,64 @@ public:
   // values each, in their order), the captured rows in the order the draft's
   // context plan captured them (a cold prompt's first command: its rows).
   [[nodiscard]] static std::span<const uint16_t> lastCapturedRows(const Runtime &runtime, uint32_t chunk);
-  // The rows of its block batch lane `lane` of the last decode step verified
-  // (ops::DraftSelector::addVerifyRows), until the next decode step.
+  // The rows batch lane `lane` of the last decode step verified, its rows of
+  // the step as its selector laid them out (ops::DraftSelector::
+  // addVerifyRows), until the next command that selects.
   [[nodiscard]] static uint32_t lastVerifyRows(const Runtime &runtime, uint32_t lane);
+  // The path of the rows batch lane `lane` of the last decode step retained,
+  // a bit a row of its rows from its first (metal/abi/VerifyTree.h): a chain
+  // of r rows is its first r bits; until the next command that selects.
+  [[nodiscard]] static uint32_t lastRetainedRows(const Runtime &runtime, uint32_t lane);
+  // Every later decode step of a runtime takes `rows` rows, at most a verify
+  // block's a lane and at least a row a lane, each of them verified but
+  // those past an anchor estimated below `floor` (VerifyRowsParams), in
+  // place of its cycles' choice (StepCosts::choose), which such steps do
+  // not teach; none gives the choice back. For measuring steps' costs by
+  // their rows, and for steps whose lanes take fewer rows than they hold.
+  static void forceStepRows(Runtime &runtime, std::optional<uint32_t> rows, float floor = 0.0F);
+  // Whether a streamed-expert target's later cycles each plan a draft's
+  // block a lane, at their floor, whatever class their floor passes the
+  // lanes' last chances into (CostLine::choose): for measuring what the
+  // larger class's kernels cost a cycle.
+  static void planBlocks(Runtime &runtime, bool enabled);
+  // A decode cycle's choice of its step (StepCosts::choose) and what it
+  // weighed: its rows and lane cap, the chances its lanes' curves held
+  // (VerifyBudget::laneChances), the expected accepted tokens and its cost
+  // (none before its lane count is measured, nor where a floor sizes the
+  // cycle); and once it completed, the rows its lanes verified (fewer than
+  // the step's where its trees held fewer or its floor left rows out), the
+  // tokens they retained and the cycle's wall and GPU times.
+  struct StepChoice final {
+    uint32_t lanes = 0;
+    uint32_t rows = 0;
+    uint32_t laneCap = 0;
+    uint32_t chances = 0;
+    double expected = 0.0;
+    double cost = 0.0;
+    uint32_t verified = 0;
+    uint32_t retained = 0;
+    double wallMilliseconds = 0.0;
+    double gpuMilliseconds = 0.0;
+    // The cost of a pass over a thousand tokens of history it weighed
+    // (StepCosts::contextCost).
+    double contextCost = 0.0;
+    // The floor its lanes took their rows at (StepCosts::Choice), and the
+    // time a streamed-expert target's line took the cycle at
+    // (CostLine::observe; none where no line did).
+    double floor = 0.0;
+    double sampleMilliseconds = 0.0;
+  };
+  // The choices of the decode cycles the step costs sized since the last
+  // take, which it clears.
+  [[nodiscard]] static std::vector<StepChoice> takeStepChoices(Runtime &runtime);
+  // The classes of `lanes` lanes' steps and their measured costs
+  // (StepCosts::points); none without --verify-rows auto.
+  [[nodiscard]] static std::vector<StepCosts::Point> stepPoints(const Runtime &runtime, uint32_t lanes);
   // While capturing, each command that selects first tokens or verifies
   // copies the rows lastLogits returns, as the target's forward wrote them
   // before the policy rewrites them in place: for each of its batch lanes,
-  // row 0 for a selection or the lane's verified rows (lastVerifyRows) for a
-  // verify. Only a capturing command adds the host step that copies them.
+  // row 0 for a selection or the lane's rows (lastVerifyRows) for a verify.
+  // Only a capturing command adds the host step that copies them.
   // takeTargetLogits() reads and clears the copies, one per batch lane of the
   // last such command since the last take; none if none ran.
   static void captureTargetLogits(Runtime &runtime, bool enabled);
@@ -46,6 +98,12 @@ public:
   // The anchor request `requestId`'s last selection left pending, which its
   // next decode step emits first; none until its first token is selected.
   [[nodiscard]] static std::optional<uint32_t> pendingToken(const Runtime &runtime, uint64_t requestId);
+  // The tokens request `requestId`'s lookup index holds (model::LookupIndex),
+  // until its next command or suspension.
+  [[nodiscard]] static std::span<const uint32_t> lookupTokens(const Runtime &runtime, uint64_t requestId);
+  // The lookup chain request `requestId`'s latest decode cycle proposed beside
+  // its draft's tree, until its next; none where it proposed none.
+  [[nodiscard]] static std::span<const uint32_t> lookupChain(const Runtime &runtime, uint64_t requestId);
   // The GPU tables of resident request `requestId`'s lane as its last
   // command left them, every entry the lane holds: its page table and, for
   // a layout with a block index, its index table (none without).
@@ -54,10 +112,15 @@ public:
     std::span<const SplashKvPage> index;
   };
   [[nodiscard]] static LaneTables laneTables(const Runtime &runtime, uint64_t requestId);
-  // The rows resident request `requestId`'s latest decode step retained,
+  // Fill a resident lane's active tape with deterministic byte canaries.
+  // Only a drained roundtrip test may use it, ending the request before any
+  // further numerical decode: the canaries are not valid recurrent inputs.
+  static void fillPendingTape(Runtime &runtime, uint64_t requestId, uint32_t seed);
+  // The rows resident request `requestId`'s latest decode step accepted,
   // which its GDN cell holds only once its next step folds them in
-  // (QwenLaneMetadata::pendingRows): every GDN layer's tape rows
-  // (metal/abi/GDN.h) up to that count, field by field, layer by layer.
+  // (QwenLaneMetadata::pendingPath): every GDN layer's tape rows
+  // (metal/abi/GDN.h) of that path in its order, field by field, layer by
+  // layer.
   [[nodiscard]] static std::vector<uint8_t> pendingGdnRows(const Runtime &runtime, uint64_t requestId);
   // The entries of the registry through which the placements of an image
   // share its rows: an entry for each image whose rows something holds, and

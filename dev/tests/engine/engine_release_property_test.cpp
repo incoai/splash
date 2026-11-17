@@ -39,9 +39,9 @@ using splash::test::require;
 constexpr uint64_t kFullPageBytes = 423'936, kIndexPageBytes = 24'576;
 
 // Spill lanes under the governor's 40 GiB limit at Qwen3.8-Flash-Next's page bytes and history staging, in extents
-// of `extentPages` pages, its 390 MiB hot block floor scaled to them, with `pageIds` page ids: with ids for every
-// extent the lanes reach, the governor limits the pool and never the id range, as production's ids hold every
-// extent the limit could hold of Index pages (RuntimeResources).
+// of `extentPages` pages, its 8-row lanes' 390 MiB hot block floor scaled to them, with `pageIds` page ids: with
+// ids for every extent the lanes reach, the governor limits the pool and never the id range, as production's ids
+// hold every extent the limit could hold of Index pages (RuntimeResources).
 struct Wall final {
   explicit Wall(uint32_t extentPages, uint32_t pageIds, const std::function<void(Executor &)> &shape = {})
       : spill{65'536, false, 0, 200'000, Spilling::Extent{extentPages}, shape, {}, true,

@@ -10,9 +10,12 @@
 
 #include "metal/CommandGraph.hpp"
 #include "metal/abi/NgramEmbedding.h"
+#include "metal/abi/VerifyTree.h"
+#include "ops/LaneRows.hpp"
 #include "ops/Normalization.hpp"
 
 #include <cstdint>
+#include <span>
 
 namespace splash::ops {
 
@@ -27,27 +30,56 @@ struct NgramShape final {
   [[nodiscard]] constexpr uint32_t history() const noexcept { return (taps - 1) * dilation; }
 };
 
+// The buffers of a verify step's n-gram hash: each of the step's rows' token
+// and tree row (metal/abi/VerifyTree.h), each lane's rows of the step
+// (SplashLaneRows), which the step's proposer writes, the ngram - 1 tokens
+// before each lane's first row (NgramHashParams), and the table rows it
+// writes for each of the step's rows.
+struct NgramHashBuffers final {
+  metal::MetalBuffer tokens;
+  metal::MetalBuffer tree;
+  metal::MetalBuffer laneRows;
+  metal::MetalBuffer before;
+  metal::MetalBuffer indices;
+};
+
 struct NgramEmbedding final {
   static void addGate(metal::CommandGraph &graph, metal::MetalBuffer key, metal::MetalBuffer value,
                       metal::MetalBuffer streams, const NormWeights &keyNorm, const NormWeights &queryNorm,
                       const NormWeights &convolutionNorm, metal::MetalBuffer gated,
                       metal::MetalBuffer convolutionInput, NgramShape shape, uint32_t rows);
-  // One sequence's rows; writes the history after them unless historyOut is empty.
+  // The convolution of a command's sequences' rows (a prompt chunk's
+  // sequences, or a verify step's lanes) as its layout holds them (`layout`,
+  // a SplashLaneRows a sequence, of `rows`), in one dispatch whose grid spans
+  // the sequences' bound: sequence s's taps before its first row read
+  // historyIn[s], and with historyOut its history after its rows goes to
+  // historyOut[s]. With `tree`, the rows' places (a SplashTreeRow a row) of
+  // verify blocks of at most 32 rows, whose taps follow each row's path; the
+  // commit then writes their history (addCommit).
   static void addConvolution(metal::CommandGraph &graph, metal::MetalBuffer convolutionInput,
-                             metal::MetalBuffer historyIn, metal::MetalBuffer historyOut, metal::MetalBuffer taps,
-                             metal::MetalBuffer gated, metal::MetalBuffer streams, NgramShape shape, uint32_t rows);
+                             std::span<const metal::MetalBuffer> historyIn,
+                             std::span<const metal::MetalBuffer> historyOut, metal::MetalBuffer taps,
+                             metal::MetalBuffer gated, metal::MetalBuffer streams, NgramShape shape,
+                             metal::MetalBuffer layout, const LayoutRows &rows, metal::MetalBuffer tree = {});
   // The history after the first `rows` rows of one sequence's prefill (a
   // state captured inside its command).
   static void addHistory(metal::CommandGraph &graph, metal::MetalBuffer convolutionInput,
                          metal::MetalBuffer historyIn, metal::MetalBuffer historyOut, NgramShape shape,
                          uint32_t rows);
-  // The history after a lane's `retained` (a GPU count) rows of its verify
-  // step's SPLASH_TARGET_VERIFY_ROWS in convolutionInput.
+  // The history after each lane's accepted path (`paths`, a row mask the GPU
+  // wrote a lane, metal/abi/VerifyTree.h) of its verify block's rows in
+  // convolutionInput, as the step's layout holds them (`layout`, a
+  // SplashLaneRows a lane, of `rows`, at most 32 rows a lane), in one
+  // dispatch: lane l's history before it historyIn[l], after it
+  // historyOut[l].
   static void addCommit(metal::CommandGraph &graph, metal::MetalBuffer convolutionInput,
-                        metal::MetalBuffer historyIn, metal::MetalBuffer historyOut, metal::MetalBuffer retained,
-                        NgramShape shape);
-  static void addHash(metal::CommandGraph &graph, metal::MetalBuffer tokens, metal::MetalBuffer before,
-                      metal::MetalBuffer indices, const NgramHashParams &params, uint32_t heads);
+                        std::span<const metal::MetalBuffer> historyIn, std::span<const metal::MetalBuffer> historyOut,
+                        metal::MetalBuffer paths, NgramShape shape, metal::MetalBuffer layout,
+                        const LayoutRows &rows);
+  // The table rows of each lane's rows of a verify step (`step`) by the hash
+  // `params` describes, whose lane count it sets.
+  static void addHash(metal::CommandGraph &graph, NgramHashBuffers buffers, NgramHashParams params,
+                      const StepRows &step, uint32_t heads);
 };
 
 } // namespace splash::ops

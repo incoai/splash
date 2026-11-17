@@ -36,3 +36,18 @@ struct RopeRangeParams {
 
 static_assert(sizeof(RopeRangeParams) == 8,
               "RoPE range parameters are 8 bytes on both sides");
+
+// The target rows of a decode step's `rows` packed rows over `lanes` lanes
+// (ops::RoPE::addTreeTables), which its selector lays out on the device: lane
+// l's rows (its SplashLaneRows) each at the RoPE position anchors[l], its
+// anchor's, plus the row's depth in the lane's tree (its SplashTreeRow), the
+// table scaled by target_scale as RopeTableParams' is.
+struct RopeTreeParams {
+  uint32_t lanes;
+  uint32_t rows;
+  float target_scale;
+  uint32_t anchors[SPLASH_MAXIMUM_BATCH_WIDTH];
+};
+
+static_assert(sizeof(RopeTreeParams) == 12 + 4 * SPLASH_MAXIMUM_BATCH_WIDTH,
+              "RoPE tree parameters are the same size on both sides");

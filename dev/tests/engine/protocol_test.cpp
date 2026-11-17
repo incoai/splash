@@ -27,6 +27,7 @@ namespace {
 using namespace splash::protocol;
 using splash::ConstraintMode;
 using splash::ImageSpan;
+using splash::kNoMaskParent;
 using splash::RequestIgnoreEndOfSequence;
 using splash::SamplingParameters;
 using splash::ThinkingBudget;
@@ -226,8 +227,9 @@ const std::vector<std::pair<std::string, ClientMessage>> &clientMessages() {
       {"request_ignore_eos", exampleIgnoreEosRequest()},
       {"request_progress", exampleProgressRequest()},
       {"cancel", CancelFrame{91}},
+      // Mask row 1 forces two tokens after its path, row 2 one.
       {"mask_response",
-       MaskResponseFrame{91, 7, {0xffffffffU, 0, 0xa5a5a5a5U}}},
+       MaskResponseFrame{91, 7, {0xffffffffU, 0, 0xa5a5a5a5U}, {1, 40, 1, 41, 2, 50}}},
       {"status_request", StatusRequestFrame{808}},
       {"release_request", ReleaseRequestFrame{808}},
       {"stop", StopFrame{91}},
@@ -264,8 +266,9 @@ const std::vector<std::pair<std::string, EngineEvent>> &engineEvents() {
       {"start", StartEvent{91, 2, 4096}},
       {"prompt_progress", PromptProgressEvent{91, 2048, 123456}},
       {"tokens", TokensEvent{91, 17, {10, 11, 12}}},
-      {"mask_request_initial", MaskRequestEvent{91, 6, 4, {}}},
-      {"mask_request_verify", MaskRequestEvent{91, 7, 4, {101, 102, 103}}},
+      {"mask_request_initial", MaskRequestEvent{91, 6, 4, {}, {}}},
+      // A verify block's tree: the anchor, and two rows that follow it.
+      {"mask_request_verify", MaskRequestEvent{91, 7, 4, {101, 102, 103}, {kNoMaskParent, 0, 0}}},
       {"done", DoneEvent{91, EngineFinishReason::Stop, 4096, 512, 1000, 2000,
                          3500, {}, 64, {350, 280, 50}}},
       {"done_scored", DoneEvent{91, EngineFinishReason::Stop, 4096, 0, 1000, 0,
@@ -1091,6 +1094,12 @@ void testFailureTaxonomy() {
   expectEventIssue(test,
                    TokensEvent{8, std::numeric_limits<uint32_t>::max(), {1}},
                    IssueCode::IntegerOverflow);
+  // A mask request's tokens are a tree: a parent each, the first the root,
+  // and every other one's before it.
+  expectEventIssue(test, MaskRequestEvent{8, 1, 4, {101, 102}, {kNoMaskParent}}, IssueCode::InvalidCount);
+  expectEventIssue(test, MaskRequestEvent{8, 1, 4, {101, 102}, {0, 0}}, IssueCode::InvalidConstraint);
+  expectEventIssue(test, MaskRequestEvent{8, 1, 4, {101, 102, 103}, {kNoMaskParent, 0, 2}},
+                   IssueCode::InvalidConstraint);
   expectEventIssue(test,
                    ErrorEvent{FailureClass::RequestError, 0, false, "bad", ""},
                    IssueCode::InvalidErrorClassification);
@@ -1126,10 +1135,20 @@ void testUnnamedRequestFailuresAreFatal() {
          FailureClass::ProtocolFatal);
   expect(StopFrame{0}, IssueCode::InvalidRequestId,
          FailureClass::ProtocolFatal);
-  expect(MaskResponseFrame{0, 7, {1}}, IssueCode::InvalidRequestId,
+  expect(MaskResponseFrame{0, 7, {1}, {}}, IssueCode::InvalidRequestId,
          FailureClass::ProtocolFatal);
-  expect(MaskResponseFrame{91, 0, {1}}, IssueCode::InvalidRequestId,
+  expect(MaskResponseFrame{91, 0, {1}, {}}, IssueCode::InvalidRequestId,
          FailureClass::RequestError);
+  // A mask response's forced tokens hold at most a row and a token for each
+  // token of the largest request, after each of its rows: four words where a
+  // request simulates one token.
+  ProtocolLimits oneToken;
+  oneToken.maxSimulationTokens = 1;
+  expect(MaskResponseFrame{91, 7, {1}, {0, 5, 1, 6, 1, 7}}, IssueCode::LimitExceeded,
+         FailureClass::RequestError, oneToken);
+  const auto fits = decodeClient(peer::serialize(MaskResponseFrame{91, 7, {1}, {0, 5, 1, 6}}), oneToken);
+  const std::vector<uint32_t> forced{0, 5, 1, 6};
+  CHECK(test, fits && std::get<MaskResponseFrame>(*fits.value).forcedTokens == forced);
 }
 
 void testInvalidLimitsAndOuterTruncation() {

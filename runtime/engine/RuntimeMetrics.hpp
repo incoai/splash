@@ -18,7 +18,7 @@ namespace splash::engine {
 
 // What held requests before their first tokens, by TtftPart.
 inline constexpr std::string_view kTtftPartNames[] = {"own_prefill", "claim_wait", "decode", "other_prefill",
-                                                      "rest"};
+                                                      "unit_wait", "rest"};
 static_assert(std::size(kTtftPartNames) == kTtftParts);
 
 // Most recently completed real batch of one work kind. Status queries during
@@ -48,8 +48,8 @@ struct RuntimeMetricsSnapshot {
   // trip). Lifetime; quantiles within a factor of two, maximum exact.
   model::LatencyStats decodeGap;
   // Each request's time to its first token by what held it (TtftPart
-  // order: own prefill, claim wait, decode, other prefill, rest), which sum
-  // to its TTFT. Lifetime; quantiles within a factor of two, maximum exact.
+  // order, as kTtftPartNames names them), which sum to its TTFT. Lifetime;
+  // quantiles within a factor of two, maximum exact.
   std::array<model::LatencyStats, engine::kTtftParts> ttftParts{};
   double prefillTokensPerSecond = 0.0;
   double decodeTokensPerSecond = 0.0;

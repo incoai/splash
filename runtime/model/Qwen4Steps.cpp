@@ -17,9 +17,8 @@ namespace {
 
 constexpr uint32_t kLanes = ExecutionLimits::maximumBatchWidth;
 constexpr uint32_t kChunkRows = ExecutionLimits::prefillTokenBudget;
-constexpr uint32_t kVerifyRows = ExecutionLimits::targetVerifyRows;
-// A decode step's most rows: every lane's verify rows, packed.
-constexpr uint32_t kStepRows = kLanes * kVerifyRows;
+// A decode step's most rows: every lane's verify block, packed.
+constexpr uint32_t kStepRows = kLanes * ExecutionLimits::targetVerifyRows;
 // The QSA selection scores a prefill chunk's rows in batches, which bounds
 // its score scratch (a row scores every block of the context): of this many
 // rows at the native window (prefillScoreRows); a verify scores every lane's
@@ -35,17 +34,26 @@ constexpr uint32_t blockCount(uint64_t position, uint32_t rows) noexcept {
 }
 // A prefill chunk's blocks, each sequence's after the one before it: a
 // sequence completes at most one block more than its rows hold whole, and a
-// chunk holds at most a sequence per lane. A verify lane's.
+// chunk holds at most a sequence per lane. A verify lane's: those a path of
+// a verify block's most rows may complete.
 constexpr uint64_t kChunkBlockBytes = (kChunkRows / BLOCK_INDEXER_BLOCK + kLanes) * sizeof(BlockIndexerBlock);
+constexpr uint32_t kBlockRows = ExecutionLimits::targetVerifyRows;
 constexpr uint64_t kLaneBlockBytes =
-    (kVerifyRows + BLOCK_INDEXER_BLOCK - 1) / BLOCK_INDEXER_BLOCK * sizeof(BlockIndexerBlock);
+    (kBlockRows + BLOCK_INDEXER_BLOCK - 1) / BLOCK_INDEXER_BLOCK * sizeof(BlockIndexerBlock);
 
 // The words of a row's QSA bitmap in a window of `contextTokens`: a bit per
-// block of the context and the blocks past it that a tile's lists read, as
-// far as the select writes (BLOCK_INDEXER_TILE_SLACK). A row's scores: one
-// per block its bitmap covers. Both follow the window the target serves.
+// block a lane's rows may reach, its anchor at the window's last position
+// and a verify block's rows from it into the KV slots past the context
+// (SPLASH_SPECULATIVE_SCRATCH_TOKENS), whatever the step's lane cap, and
+// the blocks past them that a tile's lists read, as far as the select writes
+// (BLOCK_INDEXER_TILE_SLACK): with the context's blocks and the slack alone,
+// an 8-row tile's, a 16-row lane at the end of a window of 300,020 tokens
+// found its bitmap a block short. A row's scores: one per block its bitmap
+// covers. Both follow the window the target serves.
 constexpr uint32_t maskWords(uint32_t contextTokens) {
-  return (contextTokens / BLOCK_INDEXER_BLOCK + BLOCK_INDEXER_TILE_SLACK + 31) / 32;
+  return ((contextTokens + SPLASH_SPECULATIVE_SCRATCH_TOKENS) / BLOCK_INDEXER_BLOCK + 1 + BLOCK_INDEXER_TILE_SLACK +
+          31) /
+         32;
 }
 uint32_t maskWords(const QwenTargetGeometry &g) { return maskWords(g.contextTokens()); }
 uint32_t scoreStride(const QwenTargetGeometry &g) { return maskWords(g) * 32; }
@@ -58,11 +66,16 @@ uint32_t prefillScoreRows(const QwenTargetGeometry &g) {
 }
 
 // The attention's tiles of rows, whose block masks become a block list each
-// (ops::PagedAttention::addBlockLists): a verify lane's rows, or a prefill
-// tile's. A row attends to at most its top blocks and the block of its tail,
-// so a tile's list holds at most this many entries.
-constexpr uint32_t kTileRows = SPLASH_TARGET_VERIFY_ROWS;
-static_assert(kTileRows == SPLASH_PREFILL_ATTENTION_TILE_ROWS, "verify and prefill tiles hold as many rows");
+// (ops::PagedAttention::addBlockLists). A prompt row attends at most its top
+// blocks and the block of its tail; a verify row its top blocks before its
+// lane's anchor's block and, from it on, blocks of its lane's K/V slots,
+// which a verify block's rows span (kSlotBlocks, five at 16 rows): no more of
+// those than a tile has rows, so a tile's list holds at most this many
+// entries, though a tree row alone may list more than its top blocks and one
+// (512 and three slot blocks at depth 4 on Qwen3.8-Flash-Next).
+constexpr uint32_t kTileRows = SPLASH_ATTENTION_TILE_ROWS;
+constexpr uint32_t kSlotBlocks = (SPLASH_TARGET_VERIFY_ROWS + 2 * BLOCK_INDEXER_BLOCK - 2) / BLOCK_INDEXER_BLOCK;
+static_assert(kSlotBlocks <= kTileRows, "a tile's list holds its lane's slot blocks beside its rows' top blocks");
 uint32_t listStride(const QwenTargetGeometry &g) { return kTileRows * (g.indexerTopBlocks + 1); }
 
 // The tokens before a lane's verify rows that its rows' n-grams reach.
@@ -82,7 +95,8 @@ struct Tensor final {
 
 // A step's QSA raw keys: a prefill chunk's of the layer it runs, which its
 // pool reads; a decode step's of every attention layer, which its commit
-// reads after the last.
+// reads after the last, as it does a decode step's block keys
+// (ops::BlockIndexer::addTreePool).
 uint64_t keyRowBytes(bool decode) { return decode ? 0 : bytesFor<uint16_t>(BLOCK_INDEXER_DIMENSION); }
 uint64_t keyFixedBytes(const QwenTargetGeometry &g, bool decode) {
   return decode ? bytesFor<uint16_t>(uint64_t{g.attentionLayerCount()} * kStepRows * BLOCK_INDEXER_DIMENSION) : 0;
@@ -118,6 +132,12 @@ std::vector<Tensor> tensors(const QwenTargetGeometry &g, uint64_t pleRowBytes, b
        bytesFor<uint32_t>(uint64_t{kLanes} * listStride(g)), false},
       {&Qwen4Scratch::qsaListCounts, bytesFor<uint32_t>(1), bytesFor<uint32_t>(kLanes), false},
   };
+  // A decode step's block keys of every attention layer and each row's mask
+  // of its lane's rows it attends (ops::BlockIndexer::addTreeSelect).
+  if (decode) {
+    result.push_back({&Qwen4Scratch::qsaBlockKeys, 0, keyFixedBytes(g, true), false});
+    result.push_back({&Qwen4Scratch::qsaRowMasks, bytesFor<uint32_t>(1), 0, false});
+  }
   // A streamed table's step stages up to every row id's row, each distinct
   // one once, and each id's slot.
   if (pleRowBytes) {
@@ -311,8 +331,8 @@ void Qwen4Steps::prepareVerifyLane(uint32_t lane, uint64_t position, const QwenT
   for (uint32_t back = 1; back <= prior; ++back)
     before[back - 1] = position >= back ? request.tokens[position - back] : NGRAM_EMBEDDING_NONE;
   preparedPositions_[lane] = position;
-  if (blockCount(position, kVerifyRows))
-    writeBlocks(position, kVerifyRows, request,
+  if (blockCount(position, kBlockRows))
+    writeBlocks(position, kBlockRows, request,
                 contents<BlockIndexerBlock>(backend_.view(decode_, decodeBlocksOffset_ + lane * kLaneBlockBytes,
                                                           kLaneBlockBytes)));
 }
@@ -325,7 +345,7 @@ Qwen4LaneBlocks Qwen4Steps::verifyBlocks(std::span<const uint32_t> positions) co
   for (uint32_t lane = 0; lane < positions.size(); ++lane) {
     if (preparedPositions_[lane] != positions[lane])
       throw std::logic_error("a Qwen3.8-Flash-Next verify lane's inputs were prepared for another position");
-    blocks.counts[lane] = blockCount(positions[lane], kVerifyRows);
+    blocks.counts[lane] = blockCount(positions[lane], kBlockRows);
   }
   return blocks;
 }
@@ -348,8 +368,7 @@ metal::MetalBuffer Qwen4Steps::priorTokens() const {
   return backend_.view(decode_, decodePriorOffset_, bytesFor<uint32_t>(kLanes * priorCount(geometry_)));
 }
 
-void Qwen4Steps::addVerifyInput(metal::CommandGraph &graph, metal::MetalBuffer tokens, uint32_t lanes) const {
-  if (!lanes || lanes > kLanes) throw std::invalid_argument("invalid PLE hash");
+void Qwen4Steps::addVerifyInput(metal::CommandGraph &graph, const QwenVerifyInput &input) const {
   const Qwen4ExpLayout &layout = weights_.layout;
   const Qwen4PleHash &hash = weights_.pleHash;
   const uint32_t heads = layout.pleHeads();
@@ -357,29 +376,30 @@ void Qwen4Steps::addVerifyInput(metal::CommandGraph &graph, metal::MetalBuffer t
       hash.headOffsets.size() != heads)
     throw std::logic_error("PLE hash geometry mismatch");
   NgramHashParams params{};
-  params.rows = lanes * kVerifyRows;
   params.ngram = layout.pleNgram;
   params.heads_per_ngram = layout.pleHeadsPerNgram;
   params.eos = layout.pleEosToken;
   std::copy(hash.multipliers.begin(), hash.multipliers.end(), params.multipliers);
   std::copy(hash.headVocabularies.begin(), hash.headVocabularies.end(), params.vocabularies);
   std::copy(hash.headOffsets.begin(), hash.headOffsets.end(), params.offsets);
-  const Qwen4Scratch scratch = verifyScratch(params.rows);
-  ops::NgramEmbedding::addHash(graph, std::move(tokens), priorTokens(), scratch.pleIndices, params, heads);
+  const uint32_t rows = input.step.rows;
+  const Qwen4Scratch scratch = verifyScratch(rows);
+  ops::NgramEmbedding::addHash(graph, {input.tokens, input.treeRows, input.laneRows, priorTokens(), scratch.pleIndices},
+                               params, input.step, heads);
   // A verify step stages a few rows per lane, most of them already in the
   // cache, so its host step is short and keeps the GPU awake
   // (metal::HostStepGpu::Awake).
   if (weights_.streamedTable)
     graph.host([store = weights_.streamedTable, rowBytes = pleRowBytes_, scratch,
-                count = params.rows * heads] { stage(*store, rowBytes, scratch, count, false); },
+                count = rows * heads] { stage(*store, rowBytes, scratch, count, false); },
                {}, metal::HostStepGpu::Awake);
 }
 
-std::vector<uint32_t> Qwen4Steps::verifyPleRows(uint32_t lane) const {
-  if (lane >= kLanes) throw std::out_of_range("Qwen3.8-Flash-Next verify lane");
+std::vector<uint32_t> Qwen4Steps::verifyPleRows(const ops::LaneRows &rows) const {
+  if (uint64_t{rows.first} + rows.rows > kStepRows) throw std::out_of_range("Qwen3.8-Flash-Next verify rows");
   const uint32_t heads = geometry_.pleHeads();
   const auto *indices = contents<const uint32_t>(verifyScratch(kStepRows).pleIndices);
-  return {indices + uint64_t{lane} * kVerifyRows * heads, indices + uint64_t{lane + 1} * kVerifyRows * heads};
+  return {indices + uint64_t{rows.first} * heads, indices + (uint64_t{rows.first} + rows.rows) * heads};
 }
 
 // The products stay below 2^63 (readPleHash bounds each multiplier by

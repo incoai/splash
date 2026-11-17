@@ -254,8 +254,9 @@ struct Runtime: Sendable {
         return (try? JSONDecoder().decode(Owner.self, from: data))?.pid
     }
 
-    /// What the launcher serving `port`, or the server it runs as, last wrote of its start or its
-    /// stop (`server/serve_record.py`), beside the port's lock; nil before one has.
+    /// What the launcher serving `port`, or the server it runs as, last wrote of its start, its
+    /// engine's relaunch or its stop (`server/serve_record.py`), beside the port's lock; nil before
+    /// one has.
     func serveRecord(port: Int) -> ServeRecord? {
         guard let data = try? Data(contentsOf: locks.appending(path: "serve-\(port).json")) else { return nil }
         return try? JSONDecoder().decode(ServeRecord.self, from: data)
@@ -319,14 +320,25 @@ private final class PipeOutput: @unchecked Sendable {
 }
 
 /// What a launcher writes of its start, as itself or as the server it runs as: the process, the
-/// phase of its start, while warming how far the warm-up is, and, for a server that ended on a
+/// phase it is at, while warming how far the warm-up is, and, for a server that ended on a
 /// failure, at its start or once ready, why: the class of the failure, with what it needed against
 /// what it had for a shortfall, and its message.
 struct ServeRecord: Decodable, Equatable {
-    /// Starting; loading the model's weights; running the model once (warming); answering; or
-    /// failed.
+    /// Starting; loading the model's weights; running the model once (warming); answering; once
+    /// it answered, starting a failed engine again (recovering), then answering again; or failed.
     enum Phase: String, Decodable {
-        case starting, loading, warming, ready, failed
+        case starting, loading, warming, ready, recovering, failed
+        /// A phase this app has no name for, as a later server may write: no news of the server,
+        /// in a record whose process and failure still read.
+        case unknown
+
+        init(from decoder: Decoder) throws {
+            self = Phase(rawValue: try decoder.singleValueContainer().decode(String.self)) ?? .unknown
+        }
+
+        /// Whether the server's start has ended with it answering: its engine serves, or failed
+        /// since and is being started again, which its status goes on to tell.
+        var started: Bool { self == .ready || self == .recovering }
     }
 
     /// The steps of the engine's warm-up done, of all, as it begins and as each step ends: a step

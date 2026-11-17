@@ -118,8 +118,9 @@ struct LoopFixture {
         storage(shape.pages, shape.pageBytes, shape.extentPages, shape.indexPageBytes),
         pool(memory ? storage.through(*memory, governor->allocationAdmission()) : storage, shape.runwayPages),
         tier(kvTier(options)),
-        budget(tier ? std::make_shared<model::DiskBudget>(uint64_t{options->tier->capacity} * tier->slotBytes(),
-                                                          [this] { return monotonic; })
+        budget(tier ? std::make_shared<model::DiskBudget>(
+                          uint64_t{options->tier->capacity} * tier->slotBytes(kv::PageForm::Full),
+                          [this] { return monotonic; })
                     : nullptr),
         cache(pool, tier ? &*tier : nullptr, budget, options ? options->cacheSpill : std::nullopt),
         loop(

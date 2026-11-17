@@ -1,4 +1,5 @@
 import io
+import json
 import os
 import tempfile
 import unittest
@@ -231,3 +232,214 @@ class DefaultReasoningTests(unittest.TestCase):
                         ),
                         explicit is not None,
                     )
+
+
+class ServerReasoningEffortTests(unittest.TestCase):
+    """--reasoning-effort: the effort of every request, whatever it asks."""
+
+    # What a request may say of reasoning, by route.
+    CHAT = (
+        {},
+        {"reasoning_effort": "none"},
+        {"reasoning_effort": "max"},
+        {"chat_template_kwargs": {"enable_thinking": True}},
+        {"chat_template_kwargs": {"enable_thinking": False}},
+        {
+            "reasoning_effort": "low",
+            "chat_template_kwargs": {
+                "enable_thinking": True,
+                "reasoning_effort": "max",
+            },
+        },
+    )
+    RESPONSES = (
+        {},
+        {"reasoning": {"effort": "none"}},
+        {"reasoning": {"effort": "xhigh"}},
+        {"chat_template_kwargs": {"enable_thinking": True}},
+    )
+    MESSAGES = (
+        {},
+        {"thinking": {"type": "disabled"}},
+        {"thinking": {"type": "adaptive"}},
+        {"thinking": {"type": "adaptive"}, "output_config": {"effort": "max"}},
+        {"thinking": {"type": "enabled", "budget_tokens": 1024}},
+        {"chat_template_kwargs": {"enable_thinking": True}},
+    )
+    ROUTES = (
+        ("/v1/chat/completions", fixtures.chat_body, CHAT),
+        ("/apply-template", fixtures.chat_body, CHAT),
+        ("/v1/responses", fixtures.responses_body, RESPONSES),
+        ("/v1/messages", fixtures.anthropic_body, MESSAGES),
+        ("/v1/messages/count_tokens", fixtures.anthropic_body, MESSAGES),
+    )
+    # Fields of reasoning a route refuses, with or without the option.
+    MALFORMED = (
+        ("/v1/chat/completions", fixtures.chat_body, {"reasoning_effort": "turbo"}),
+        ("/v1/chat/completions", fixtures.chat_body, {"reasoning_effort": 1}),
+        (
+            "/v1/chat/completions",
+            fixtures.chat_body,
+            {"chat_template_kwargs": {"enable_thinking": "yes"}},
+        ),
+        ("/v1/responses", fixtures.responses_body, {"reasoning": "high"}),
+        ("/v1/responses", fixtures.responses_body, {"reasoning": {"effort": "on"}}),
+        ("/v1/messages", fixtures.anthropic_body, {"thinking": {"type": "on"}}),
+        (
+            "/v1/messages",
+            fixtures.anthropic_body,
+            {"thinking": {"type": "enabled", "budget_tokens": 10}},
+        ),
+        (
+            "/v1/messages",
+            fixtures.anthropic_body,
+            {"thinking": {"type": "disabled", "display": "omitted"}},
+        ),
+        ("/v1/messages", fixtures.anthropic_body, {"output_config": {"effort": "on"}}),
+    )
+
+    def harness(self, effort=None, **kwargs):
+        harness = fixtures.Harness(
+            fixtures.FakeRuntime(), reasoning_effort=effort, **kwargs
+        )
+        self.addCleanup(harness.close)
+        return harness
+
+    def test_every_route_renders_every_request_with_the_servers_effort(self):
+        for effort in ("none", "low", "max"):
+            harness = self.harness(effort)
+            for path, make, asks in self.ROUTES:
+                for ask in asks:
+                    with self.subTest(effort=effort, path=path, ask=ask):
+                        status, _, payload = harness.request(
+                            "POST", path, make(max_tokens=1100, **ask)
+                        )
+                        self.assertEqual(status, 200, payload)
+                        template = harness.tokenizer.templates[-1][1]
+                        self.assertEqual(template["enable_thinking"], effort != "none")
+                        self.assertEqual(template["reasoning_effort"], effort)
+            harness.close()
+
+    def test_the_servers_effort_decides_whether_a_request_thinks(self):
+        asks_to_think = fixtures.chat_body(
+            reasoning_effort="max", chat_template_kwargs={"enable_thinking": True}
+        )
+        asks_not_to = fixtures.chat_body(
+            reasoning_effort="none", chat_template_kwargs={"enable_thinking": False}
+        )
+        for effort, thinks in (("none", False), ("high", True)):
+            # A template that thinks unless told not to, and one that does
+            # not unless told to.
+            for default in (True, False):
+                harness = self.harness(
+                    effort,
+                    tokenizer=fixtures.TemplateTokenizer(
+                        fixtures.reasoning_template(default=default)
+                    ),
+                )
+                for body in (fixtures.chat_body(), asks_to_think, asks_not_to):
+                    with self.subTest(effort=effort, default=default, body=body):
+                        job = harness.app.prepare(body, deadline=fixtures.FOREVER)
+                        self.assertIs(job.thinking, thinks)
+
+    def test_a_malformed_reasoning_field_is_refused_as_without_it(self):
+        plain, forced = self.harness(), self.harness("none")
+        for path, make, ask in self.MALFORMED:
+            with self.subTest(path=path, ask=ask):
+                body = make(max_tokens=1100, **ask)
+                expected = plain.request("POST", path, body)
+                self.assertEqual(expected[0], 400, expected[2])
+                self.assertEqual(forced.request("POST", path, body), expected)
+        self.assertEqual(forced.backend.runtime.requests, [])
+
+    def test_models_and_status_report_the_effort_in_force(self):
+        # A request's effort decides nothing, so /v1/models lists none for a
+        # client to offer, as for a model that decides itself; /status names
+        # the effort every request gets.
+        for effort in (None, "none", "high"):
+            with self.subTest(effort=effort):
+                harness = self.harness(effort)
+                _, _, payload = harness.request("GET", "/status")
+                status = json.loads(payload)
+                self.assertEqual(status["reasoning_effort"], effort)
+                self.assertIs(status["reasoning_switch"], effort is None)
+                _, _, payload = harness.request("GET", "/v1/models")
+                reasoning = json.loads(payload)["data"][0]["reasoning"]
+                self.assertEqual(
+                    reasoning == {"thinks": None, "efforts": [], "default": None},
+                    effort is not None,
+                )
+
+    def test_a_thinking_budget_still_caps_the_thinking_it_sets(self):
+        # The effort says whether a request thinks, and a budget, the
+        # server's or the request's own, how long.
+        harness = self.harness(
+            "high",
+            default_thinking_token_budget=64,
+            tokenizer=fixtures.TemplateTokenizer(fixtures.reasoning_template()),
+        )
+        for ask, budget in (({}, 64), ({"thinking_token_budget": 32}, 32)):
+            with self.subTest(ask=ask):
+                job = harness.app.prepare(
+                    fixtures.chat_body(reasoning_effort="none", max_tokens=100, **ask),
+                    deadline=fixtures.FOREVER,
+                )
+                self.assertEqual(
+                    (job.thinking, job.thinking_token_budget), (True, budget)
+                )
+
+    def test_started_records_show_what_was_sent_and_what_rendered(self):
+        records = []
+        harness = self.harness("none", request_logger=records.append)
+        status, _, payload = harness.request(
+            "POST",
+            "/v1/chat/completions",
+            fixtures.chat_body(
+                reasoning_effort="high", chat_template_kwargs={"enable_thinking": True}
+            ),
+        )
+        self.assertEqual(status, 200, payload)
+        (started,) = (record for record in records if record["outcome"] == "started")
+        self.assertEqual(
+            started["reasoning"],
+            {
+                "sent_effort": "high",
+                "effort": "none",
+                "enable_thinking": None,
+                "template_effort": None,
+                "thinking": False,
+            },
+        )
+
+    def test_it_is_refused_with_a_default_effort_and_taken_with_a_budget(self):
+        names = ("SPLASH_REASONING_EFFORT", "SPLASH_DEFAULT_REASONING_EFFORT")
+        for parse, args in (
+            (api.parse_args, SERVER_ARGS),
+            (launcher.parse_args, ["serve", "--model", "owner/repo"]),
+        ):
+            for environment, options in (
+                ({}, ["--reasoning-effort=none", "--default-reasoning-effort=low"]),
+                ({names[1]: "low"}, ["--reasoning-effort=none"]),
+                ({names[0]: "none"}, ["--default-reasoning-effort=low"]),
+            ):
+                with (
+                    self.subTest(parse=parse.__module__, options=options),
+                    mock.patch.dict(os.environ),
+                    mock.patch("sys.stderr", io.StringIO()) as stderr,
+                ):
+                    for name in names:
+                        os.environ.pop(name, None)
+                    os.environ.update(environment)
+                    with self.assertRaises(SystemExit):
+                        parse([*args, *options])
+                    self.assertIn("--default-reasoning-effort", stderr.getvalue())
+                    self.assertIn("--reasoning-effort", stderr.getvalue())
+            with mock.patch.dict(os.environ):
+                for name in names:
+                    os.environ.pop(name, None)
+                parsed = parse(
+                    [*args, "--reasoning-effort=none", "--thinking-token-budget=64"]
+                )
+            self.assertEqual(
+                (parsed.reasoning_effort, parsed.thinking_token_budget), ("none", 64)
+            )

@@ -203,11 +203,12 @@ NSUInteger addedBuffers(const EventStep &step) noexcept {
 }
 
 // The command buffers a command of `dispatches` dispatches and these event
-// steps takes: one, and those its steps add. Refuses the steps when its
-// submission cannot encode them.
-NSUInteger checkEvents(std::span<const EventStep> events, size_t dispatches) {
+// steps takes: one, and those its steps add, after the `earlier` buffers of
+// its first part (MetalBackend::submitCommandPartsAsync). Refuses the steps when
+// its submission cannot encode them.
+NSUInteger checkEvents(std::span<const EventStep> events, size_t dispatches, NSUInteger earlier = 0) {
     size_t before = 0, joined = 0;
-    NSUInteger buffers = 1;
+    NSUInteger buffers = earlier + 1;
     for (const EventStep &step : events) {
         if (step.kind == EventStep::Kind::Host ? !step.work : !step.event || !step.value)
             throw MetalBackendError(step.kind == EventStep::Kind::Host
@@ -500,7 +501,7 @@ struct BackendAsyncState {
         healthy.store(false, std::memory_order_release);
     }
 
-    uint64_t beginSubmission(size_t dispatchCount) {
+    uint64_t beginSubmission() {
         ensureHealthy();
         std::lock_guard lock(gateMutex);
         if (stopping)
@@ -510,18 +511,19 @@ struct BackendAsyncState {
                 "Metal backend already has an in-flight command");
         }
         activeSequence = ++nextSequence;
-        activeDispatchCount = dispatchCount;
         return activeSequence;
     }
 
     // Commits a command's last buffer through `commit`, which holds it after
     // the command's host steps (Impl::commit), the buffers before it handed
-    // on as their encoding ended.
+    // on as their encoding ended; the command has `dispatchCount` dispatches,
+    // which a timeout names.
     template <class Commit>
-    void commitSubmission(uint64_t sequence, id<MTLCommandBuffer> command,
+    void commitSubmission(uint64_t sequence, id<MTLCommandBuffer> command, size_t dispatchCount,
                           std::function<void(id<MTLCommandBuffer>)> completion, Commit &&commit) {
         std::lock_guard lock(gateMutex);
         activeCommand = command;
+        activeDispatchCount = dispatchCount;
         activeCompletion = std::move(completion);
         commandWatchdog.start(sequence, awakeSeconds());
         commit(command);
@@ -1245,6 +1247,8 @@ struct MetalBackend::Impl {
     bool dispatchProfiling = false;
     std::vector<DispatchTiming> dispatchProfile;
     uint64_t lastCommandBuffers = 0;
+    // BackendInstrumentation::submitPartsWhole.
+    bool wholeParts = false;
 #endif
     __strong id<MTLDevice> device = nil;
     __strong id<MTLCommandQueue> queue = nil;
@@ -1817,30 +1821,55 @@ struct MetalBackend::Impl {
         return spin;
     }
 
+    // Whether a command in two parts sends its first part ahead of its
+    // second's building (MetalBackend::submitCommandPartsAsync): always, but
+    // under BackendInstrumentation::submitPartsWhole, where the second part is
+    // encoded behind the first in the same buffer, so that nothing goes before
+    // the whole command is encoded.
+    bool firstPartAhead() const noexcept {
+#ifdef SPLASH_BACKEND_INSTRUMENTATION
+        return !wholeParts;
+#else
+        return true;
+#endif
+    }
+
+    // What a command's event steps need before any of them is encoded: the
+    // check of the GPU's spin with the first awake step, and the runner with
+    // the first host step.
+    void prepareSteps(std::span<const EventStep> events) {
+        if (!hostStepSpin && AwakeClock::now() >= nextSpinCheck &&
+            std::ranges::any_of(events, [](const EventStep &step) { return step.gpu == HostStepGpu::Awake; }))
+            checkHostStepSpin();
+        if (!hostStepRunner &&
+            std::ranges::any_of(events, [](const EventStep &step) { return step.kind == EventStep::Kind::Host; }))
+            hostStepRunner = std::make_unique<HostStepRunner>();
+    }
+
     // Encodes and commits prepared dispatches, which index `tables`, and the
     // event steps between them; the ticket retains `retained` until it is
-    // consumed.
+    // consumed. With `rest` they are a command's first part, in one buffer
+    // (MetalBackend::submitCommandPartsAsync): committed as its encoding ends, and
+    // the part `rest` then gives is prepared and encoded after it, into the
+    // same ticket.
     CommandTicket commit(std::span<const PreparedDispatch> dispatches,
                          std::span<const PreparedTable> tables,
                          std::span<const EventStep> events,
                          std::vector<std::shared_ptr<MetalAllocation>> retained,
-                         CommandCompletion completion) {
-        if (!hostStepSpin && AwakeClock::now() >= nextSpinCheck &&
-            std::ranges::any_of(events, [](const EventStep &step) { return step.gpu == HostStepGpu::Awake; }))
-            checkHostStepSpin();
-        // The runner starts with the first command that has a host step,
-        // before the submission: one that cannot start leaves nothing held.
-        if (!hostStepRunner &&
-            std::ranges::any_of(events, [](const EventStep &step) { return step.kind == EventStep::Kind::Host; }))
-            hostStepRunner = std::make_unique<HostStepRunner>();
+                         CommandCompletion completion,
+                         const std::function<Command()> &rest = {}) {
+        // Before the submission: a runner that cannot start leaves nothing
+        // held.
+        prepareSteps(events);
         auto ticketState = std::make_shared<CommandTicket::State>();
         ticketState->backend = asyncState;
         ticketState->completion = std::move(completion);
         ticketState->retainedAllocations = std::move(retained);
-        ticketState->sequence =
-            asyncState->beginSubmission(dispatches.size());
+        ticketState->sequence = asyncState->beginSubmission();
 
         auto failEncoding = [](std::string message) { throw MetalBackendError(std::move(message)); };
+        // Why a second part was not built (below), if it was not.
+        std::exception_ptr unbuilt;
 
         auto wallStart = AwakeClock::now();
         // The buffers before the last commit as their encoding ends, or once
@@ -1853,7 +1882,7 @@ struct MetalBackend::Impl {
         // needs.
         @autoreleasepool {
             // The buffers before `command` handed on to be committed, each
-            // ended by an event signal or a host step.
+            // ended by an event signal or a host step, or a first part's.
             std::vector<id<MTLCommandBuffer>> leading;
             // Any failure while encoding, such as Metal creating no buffer or
             // encoder, marks the backend unhealthy. The buffers already
@@ -1867,13 +1896,6 @@ struct MetalBackend::Impl {
                     failEncoding("unable to create Metal command buffer");
                 }
                 ticketState->wallStart = wallStart;
-                id<MTLComputeCommandEncoder> encoder = nil;
-                // Encodes the event steps that follow the first `encoded`
-                // dispatches, after the join of a host step whose beside
-                // dispatches end there.
-                auto step = events.begin();
-                size_t joinAt = 0;
-                HostStepJoin join;
                 // Commits a buffer whose encoding ended, once every host step
                 // before it returned (HostSteps).
                 const auto commitEncoded = [&](id<MTLCommandBuffer> buffer) {
@@ -1882,113 +1904,173 @@ struct MetalBackend::Impl {
                     else
                         [buffer commit];
                 };
-                const auto encodeSteps = [&](size_t encoded) {
-                    if (joinAt && joinAt == encoded) {
-                        if (encoder) {
-                            [encoder endEncoding];
-                            encoder = nil;
+                // Encodes a part's dispatches, which index `tables`, and the
+                // event steps between them into `command` and the buffers the
+                // steps add, of which it leaves the last, its encoding ended.
+                const auto encode = [&](std::span<const PreparedDispatch> dispatches,
+                                        std::span<const PreparedTable> tables,
+                                        std::span<const EventStep> events) {
+                    id<MTLComputeCommandEncoder> encoder = nil;
+                    // Encodes the event steps that follow the first `encoded`
+                    // dispatches, after the join of a host step whose beside
+                    // dispatches end there.
+                    auto step = events.begin();
+                    size_t joinAt = 0;
+                    HostStepJoin join;
+                    const auto encodeSteps = [&](size_t encoded) {
+                        if (joinAt && joinAt == encoded) {
+                            if (encoder) {
+                                [encoder endEncoding];
+                                encoder = nil;
+                            }
+                            command = joinHostStep(join, leading, *ticketState->hostSteps);
+                            joinAt = 0;
                         }
-                        command = joinHostStep(join, leading, *ticketState->hostSteps);
-                        joinAt = 0;
+                        for (; step != events.end() && step->before == encoded; ++step) {
+                            if (encoder) {
+                                [encoder endEncoding];
+                                encoder = nil;
+                            }
+                            if (step->kind == EventStep::Kind::Host) {
+                                command = encodeHostStep(command, leading, ticketState->hostSteps,
+                                                         ticketState->sequence, *step, join, failEncoding);
+                                if (step->beside) joinAt = encoded + step->beside;
+                                continue;
+                            }
+                            id<MTLSharedEvent> event =
+                                (__bridge id<MTLSharedEvent>)step->event.nativeHandle();
+                            if (step->kind == EventStep::Kind::Wait) {
+                                [command encodeWaitForEvent:event value:step->value];
+                                continue;
+                            }
+                            [command encodeSignalEvent:event value:step->value];
+                            // A buffer that fails may end without its signal; the
+                            // work after it, waiting on an agent that waits on the
+                            // signal, would then stall until a timeout ends it. The
+                            // CPU delivers the signal instead, so the command ends
+                            // with the failure at once.
+                            const SharedEvent signaled = step->event;
+                            const uint64_t value = step->value;
+                            [command addCompletedHandler:^(id<MTLCommandBuffer> ended) {
+                                if (ended.status == MTLCommandBufferStatusError)
+                                    signaled.signal(value);
+                            }];
+                            leading.push_back(command);
+                            commitEncoded(command);
+                            command = [queue commandBuffer];
+                            if (!command) {
+                                failEncoding("unable to create Metal command buffer");
+                            }
+                        }
+                    };
+                    // Indexed by argument table entry. The ticket and the dispatches
+                    // keep the buffers alive.
+                    __unsafe_unretained id<MTLBuffer> buffers[kBufferArgumentEntries];
+                    NSUInteger offsets[kBufferArgumentEntries];
+                    EncoderResidency encoderResidency(encoderStamps, tables);
+                    for (size_t index = 0; index < dispatches.size(); ++index) {
+                        encodeSteps(index);
+                        const PreparedDispatch &item = dispatches[index];
+                        const ComputeDispatch &dispatch = *item.source;
+                        if (!encoder) {
+                            encoder = [command computeCommandEncoder];
+                            if (!encoder) {
+                                failEncoding("unable to create Metal compute encoder");
+                            }
+                            encoderResidency.begin(encoder);
+                        }
+                        [encoder setComputePipelineState:item.pipeline];
+                        for (const BufferBinding &binding : dispatch.buffers) {
+                            const MetalBuffer::Impl &buffer = *binding.buffer.impl_;
+                            buffers[binding.index] = buffer.allocation->buffer;
+                            offsets[binding.index] = buffer.offsetBytes;
+                            encoderResidency.reach(*buffer.allocation, buffer.offsetBytes, buffer.lengthBytes);
+                        }
+                        // One call per run of consecutive entries: a command graph's
+                        // dispatch binds a single run.
+                        for (uint32_t unbound = item.bufferIndices; unbound;) {
+                            const uint32_t first = std::countr_zero(unbound);
+                            const uint32_t count = std::countr_one(unbound >> first);
+                            [encoder setBuffers:buffers + first
+                                        offsets:offsets + first
+                                      withRange:NSMakeRange(first, count)];
+                            unbound &= ~(((uint32_t{1} << count) - 1) << first);
+                        }
+                        for (const BytesBinding &binding : dispatch.bytes) {
+                            [encoder setBytes:binding.data
+                                       length:binding.sizeBytes
+                                      atIndex:binding.index];
+                        }
+                        if (item.table != PreparedDispatch::kNoTable) {
+                            encoderResidency.listed(item.table, dispatch.addresses.writes);
+                            const PreparedTable &table = tables[item.table];
+                            [encoder setBytes:table.addresses.data()
+                                       length:table.addresses.size() * sizeof(uint64_t)
+                                      atIndex:dispatch.addresses.index];
+                        }
+                        const IndirectGrid &grid = dispatch.indirectThreadgroups;
+                        if (grid.buffer) {
+                            const MetalBuffer::Impl &arguments = *grid.buffer.impl_;
+                            [encoder
+                                dispatchThreadgroupsWithIndirectBuffer:
+                                    arguments.allocation->buffer
+                                                  indirectBufferOffset:
+                                    arguments.offsetBytes + grid.offsetBytes
+                                                 threadsPerThreadgroup:item.threads];
+                        } else {
+                            [encoder dispatchThreadgroups:item.groups
+                                     threadsPerThreadgroup:item.threads];
+                        }
                     }
-                    for (; step != events.end() && step->before == encoded; ++step) {
-                        if (encoder) {
-                            [encoder endEncoding];
-                            encoder = nil;
-                        }
-                        if (step->kind == EventStep::Kind::Host) {
-                            command = encodeHostStep(command, leading, ticketState->hostSteps,
-                                                     ticketState->sequence, *step, join, failEncoding);
-                            if (step->beside) joinAt = encoded + step->beside;
-                            continue;
-                        }
-                        id<MTLSharedEvent> event =
-                            (__bridge id<MTLSharedEvent>)step->event.nativeHandle();
-                        if (step->kind == EventStep::Kind::Wait) {
-                            [command encodeWaitForEvent:event value:step->value];
-                            continue;
-                        }
-                        [command encodeSignalEvent:event value:step->value];
-                        // A buffer that fails may end without its signal; the
-                        // work after it, waiting on an agent that waits on the
-                        // signal, would then stall until a timeout ends it. The
-                        // CPU delivers the signal instead, so the command ends
-                        // with the failure at once.
-                        const SharedEvent signaled = step->event;
-                        const uint64_t value = step->value;
-                        [command addCompletedHandler:^(id<MTLCommandBuffer> ended) {
-                            if (ended.status == MTLCommandBufferStatusError)
-                                signaled.signal(value);
-                        }];
+                    encodeSteps(dispatches.size());
+                    if (encoder) [encoder endEncoding];
+                };
+                encode(dispatches, tables, events);
+                size_t dispatchCount = dispatches.size();
+                if (rest) {
+                    // The first part goes: the GPU runs it while the second
+                    // is built, prepared and encoded. Its failure is the
+                    // command's, as that of any buffer handed on.
+                    const bool ahead = firstPartAhead();
+                    if (ahead) {
                         leading.push_back(command);
                         commitEncoded(command);
+                    }
+                    // A second part that cannot be built, or that is refused
+                    // as a command is before any of it is encoded, leaves the
+                    // command its first part: an empty buffer ends it, and
+                    // the submission throws the reason once that part ended
+                    // (below), in place of the completion's notice.
+                    Command second;
+                    std::optional<PreparedCommand> prepared;
+                    try {
+                        second = rest();
+                        [[maybe_unused]] const NSUInteger buffers =
+                            checkEvents(second.events, second.dispatches.size(), ahead ? 1 : 0);
+#ifdef SPLASH_BACKEND_INSTRUMENTATION
+                        lastCommandBuffers = buffers;
+#endif
+                        prepareSteps(second.events);
+                        prepared = prepare(second.dispatches, second.events);
+                    } catch (...) {
+                        unbuilt = std::current_exception();
+                        ticketState->completion = {};
+                    }
+                    if (ahead) {
                         command = [queue commandBuffer];
                         if (!command) {
                             failEncoding("unable to create Metal command buffer");
                         }
                     }
-                };
-                // Indexed by argument table entry. The ticket and the dispatches
-                // keep the buffers alive.
-                __unsafe_unretained id<MTLBuffer> buffers[kBufferArgumentEntries];
-                NSUInteger offsets[kBufferArgumentEntries];
-                EncoderResidency encoderResidency(encoderStamps, tables);
-                for (size_t index = 0; index < dispatches.size(); ++index) {
-                    encodeSteps(index);
-                    const PreparedDispatch &item = dispatches[index];
-                    const ComputeDispatch &dispatch = *item.source;
-                    if (!encoder) {
-                        encoder = [command computeCommandEncoder];
-                        if (!encoder) {
-                            failEncoding("unable to create Metal compute encoder");
-                        }
-                        encoderResidency.begin(encoder);
-                    }
-                    [encoder setComputePipelineState:item.pipeline];
-                    for (const BufferBinding &binding : dispatch.buffers) {
-                        const MetalBuffer::Impl &buffer = *binding.buffer.impl_;
-                        buffers[binding.index] = buffer.allocation->buffer;
-                        offsets[binding.index] = buffer.offsetBytes;
-                        encoderResidency.reach(*buffer.allocation, buffer.offsetBytes, buffer.lengthBytes);
-                    }
-                    // One call per run of consecutive entries: a command graph's
-                    // dispatch binds a single run.
-                    for (uint32_t unbound = item.bufferIndices; unbound;) {
-                        const uint32_t first = std::countr_zero(unbound);
-                        const uint32_t count = std::countr_one(unbound >> first);
-                        [encoder setBuffers:buffers + first
-                                    offsets:offsets + first
-                                  withRange:NSMakeRange(first, count)];
-                        unbound &= ~(((uint32_t{1} << count) - 1) << first);
-                    }
-                    for (const BytesBinding &binding : dispatch.bytes) {
-                        [encoder setBytes:binding.data
-                                   length:binding.sizeBytes
-                                  atIndex:binding.index];
-                    }
-                    if (item.table != PreparedDispatch::kNoTable) {
-                        encoderResidency.listed(item.table, dispatch.addresses.writes);
-                        const PreparedTable &table = tables[item.table];
-                        [encoder setBytes:table.addresses.data()
-                                   length:table.addresses.size() * sizeof(uint64_t)
-                                  atIndex:dispatch.addresses.index];
-                    }
-                    const IndirectGrid &grid = dispatch.indirectThreadgroups;
-                    if (grid.buffer) {
-                        const MetalBuffer::Impl &arguments = *grid.buffer.impl_;
-                        [encoder
-                            dispatchThreadgroupsWithIndirectBuffer:
-                                arguments.allocation->buffer
-                                              indirectBufferOffset:
-                                arguments.offsetBytes + grid.offsetBytes
-                                             threadsPerThreadgroup:item.threads];
-                    } else {
-                        [encoder dispatchThreadgroups:item.groups
-                                 threadsPerThreadgroup:item.threads];
+                    if (prepared) {
+                        ticketState->retainedAllocations.insert(
+                            ticketState->retainedAllocations.end(),
+                            std::make_move_iterator(prepared->retainedAllocations.begin()),
+                            std::make_move_iterator(prepared->retainedAllocations.end()));
+                        encode(prepared->dispatches, prepared->tables, second.events);
+                        dispatchCount += second.dispatches.size();
                     }
                 }
-                encodeSteps(dispatches.size());
-                if (encoder) [encoder endEncoding];
                 ticketState->leadingCommands = leading;
 
                 // Driver callbacks only complete the ticket. Device-wide memory
@@ -1999,7 +2081,7 @@ struct MetalBackend::Impl {
                 [command addCompletedHandler:^(id<MTLCommandBuffer> completed) {
                     ticketState->finishCommand(completed);
                 }];
-                asyncState->commitSubmission(ticketState->sequence, command,
+                asyncState->commitSubmission(ticketState->sequence, command, dispatchCount,
                     [weakTicket = std::weak_ptr(ticketState)](
                         id<MTLCommandBuffer> completed) {
                         if (auto ticket = weakTicket.lock())
@@ -2025,7 +2107,11 @@ struct MetalBackend::Impl {
                 throw;
             }
         }
-        return CommandTicket(std::move(ticketState));
+        CommandTicket ticket(std::move(ticketState));
+        // The first part runs alone: the ticket, let go, waits for it, and
+        // the submission throws why the second was not built.
+        if (unbuilt) std::rethrow_exception(unbuilt);
+        return ticket;
     }
 
 #ifdef SPLASH_BACKEND_INSTRUMENTATION
@@ -2062,8 +2148,7 @@ struct MetalBackend::Impl {
         runSteps(command.dispatches.size());
         auto ticketState = std::make_shared<CommandTicket::State>();
         ticketState->backend = asyncState;
-        ticketState->sequence =
-            asyncState->beginSubmission(command.dispatches.size());
+        ticketState->sequence = asyncState->beginSubmission();
         ticketState->timing = total;
         ticketState->completed = true;
         if (completion) completion();
@@ -2491,6 +2576,28 @@ CommandTicket MetalBackend::submitCommandAsync(const Command &command,
                          std::move(completion));
 }
 
+CommandTicket MetalBackend::submitCommandPartsAsync(const Command &first, const std::function<Command()> &rest,
+                                                    CommandCompletion completion) {
+    checkOperation();
+    if (!rest) throw MetalBackendError("a command in two parts needs its second");
+    if (!first.events.empty()) throw MetalBackendError("a command's first part has no event steps");
+#ifdef SPLASH_BACKEND_INSTRUMENTATION
+    // Profiled, the parts are one command: the first part's dispatches, then
+    // the second's.
+    if (impl_->dispatchProfiling) {
+        const Command second = rest();
+        std::vector<ComputeDispatch> dispatches(first.dispatches.begin(), first.dispatches.end());
+        dispatches.insert(dispatches.end(), second.dispatches.begin(), second.dispatches.end());
+        std::vector<EventStep> events(second.events.begin(), second.events.end());
+        for (EventStep &step : events) step.before += first.dispatches.size();
+        return submitCommandAsync(Command{dispatches, events}, std::move(completion));
+    }
+#endif
+    Impl::PreparedCommand prepared = impl_->prepare(first.dispatches);
+    return impl_->commit(prepared.dispatches, prepared.tables, {}, std::move(prepared.retainedAllocations),
+                         std::move(completion), rest);
+}
+
 void MetalBackend::preparePipelines(
     std::span<const ComputeDispatch> dispatches) {
     checkOperation();
@@ -2573,6 +2680,10 @@ void BackendInstrumentation::setDispatchProfiling(MetalBackend &backend,
 std::vector<DispatchTiming>
 BackendInstrumentation::takeDispatchProfile(MetalBackend &backend) {
     return std::exchange(backend.impl_->dispatchProfile, {});
+}
+
+void BackendInstrumentation::submitPartsWhole(MetalBackend &backend, bool enabled) {
+    backend.impl_->wholeParts = enabled;
 }
 
 std::optional<bool> BackendInstrumentation::awakeHostStepsSpin(MetalBackend &backend) {

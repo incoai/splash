@@ -1409,3 +1409,516 @@ class RunTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+MIB = 1 << 20
+
+
+def reasoning_event(text):
+    return {"choices": [{"index": 0, "delta": {"reasoning_content": text}}]}
+
+
+def call_events(call_id, name, arguments):
+    """A tool call as server.py streams it: a delta that names it, then its
+    arguments' JSON text in two pieces."""
+
+    def delta(call):
+        return {
+            "choices": [{"index": 0, "delta": {"tool_calls": [{"index": 0, **call}]}}]
+        }
+
+    half = len(arguments) // 2
+    return [
+        delta({"id": call_id, "type": "function", "function": {"name": name}}),
+        delta({"function": {"arguments": arguments[:half]}}),
+        delta({"function": {"arguments": arguments[half:]}}),
+    ]
+
+
+def usage_event(prompt, cached, deduplicated=0):
+    return {
+        "choices": [],
+        "usage": {
+            "prompt_tokens": prompt,
+            "completion_tokens": 20,
+            "prompt_tokens_details": {"cached_tokens": cached},
+            "completion_tokens_details": {"reasoning_tokens": 5},
+        },
+        "metrics": {
+            "cache": {"status": "hit", "deduplicated_tokens": deduplicated},
+            "prefill": {"tokens": prompt - cached},
+        },
+    }
+
+
+class FakeCachingServer:
+    """What a conversation scenario's fake server answers and reports. Each
+    request is answered with a reasoning, a sentence and, unless `calls` is
+    false, one read_file call, and counts a prompt of 1,000 tokens per
+    message it holds past its first, all but the last 1,000 cached. /status
+    counts, per request answered, 10 MiB written, of them two KV pages of
+    1 MiB copied ahead and the rest one state, and after `requests`
+    requests 1 MiB more at each of its next reads past the first, up to
+    `late`. With `slim_page_bytes` its plan is a target's whose windows leave
+    Slim pages of that size."""
+
+    def __init__(self, requests=0, late=0, calls=True, slim_page_bytes=None):
+        self.lock = threading.Lock()
+        self.bodies: list[dict] = []
+        self.requests, self.late, self.calls = requests, late, calls
+        self.slim_page_bytes = slim_page_bytes
+        self.reads_after = 0
+
+    def answer(self, text):
+        body = json.loads(text)
+        with self.lock:
+            self.bodies.append(body)
+            number = len(self.bodies)
+        prompt = 1000 * (len(body["messages"]) - 1)
+        call = call_events(f"call_{number}", "read_file", '{"part": %d}' % number)
+        return [
+            reasoning_event(f"Thought {number}."),
+            content_event(f"Reply {number}."),
+            *(call if self.calls else []),
+            usage_event(prompt, prompt - 1000, deduplicated=32),
+        ]
+
+    def status(self):
+        with self.lock:
+            answered = len(self.bodies)
+            if self.requests and answered == self.requests:
+                self.reads_after += 1
+            late = min(self.late, max(0, self.reads_after - 1))
+        window = {"kv_window": {"slim_page_bytes": self.slim_page_bytes}}
+        return {
+            "requests": {"submitted": answered, "completed": answered},
+            "memory_plan": {
+                "model": {"kv_page_bytes": MIB},
+                "budget": window if self.slim_page_bytes else {},
+            },
+            "disk": {
+                "written_bytes": (10 * answered + late) * MIB,
+                "kv_copies": 2 * answered,
+                "write_behind": {"waiting": 0, "durable": answered, "unneeded": 0},
+            },
+            "state": {"offloads": answered + late, "disk_hits": answered // 2},
+            "cache": {"lost_state_misses": 0},
+        }
+
+    def of(self, conversation, marker="Task"):
+        """The messages of each request of one conversation, in order."""
+        return [
+            body["messages"]
+            for body in self.bodies
+            if any(
+                f"{marker} {conversation}" in message["content"][:40]
+                for message in body["messages"]
+                if message["role"] == "user"
+            )
+        ]
+
+
+class ConversationScenarioTests(unittest.TestCase):
+    """The agent and edit scenarios: what their turns send, and what they
+    record of the cache's writes."""
+
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.directory = temporary.name
+        # The tail ends once the cache has written nothing for 0.2 s.
+        for name, seconds in (
+            ("TAIL_QUIET_SECONDS", 0.2),
+            ("TAIL_LIMIT_SECONDS", 5.0),
+            ("TAIL_POLL_SECONDS", 0.02),
+        ):
+            patch = mock.patch.object(clients, name, seconds)
+            patch.start()
+            self.addCleanup(patch.stop)
+
+    def events(self, label, kind):
+        path = Path(self.directory) / f"{label}.events.jsonl"
+        return [
+            event
+            for event in map(json.loads, path.read_text().splitlines())
+            if event["kind"] == kind
+        ]
+
+    def run_scenario(self, scenario, fake, label, **options):
+        with StreamingServer(fake.answer, fake.status) as server:
+            return scenario(
+                server.port,
+                self.directory,
+                label,
+                turn_tokens=200,
+                gap=0,
+                text=synthetic_corpus(),
+                **options,
+            )
+
+    def test_a_stream_keeps_the_reply_as_a_client_sends_it_back(self):
+        # A reply of a reasoning and a tool call alone began with its
+        # reasoning, though it has no content chunk.
+        events = [
+            reasoning_event("Read "),
+            reasoning_event("it."),
+            *call_events("call_7", "read_file", '{"part": 3}'),
+        ]
+        with StreamingServer(lambda body: events) as fake:
+            stream = clients.Stream(fake.port, "{}")
+        self.assertEqual(
+            stream.message(),
+            {
+                "role": "assistant",
+                "content": "",
+                "reasoning_content": "Read it.",
+                "tool_calls": [
+                    {
+                        "id": "call_7",
+                        "type": "function",
+                        "function": {"name": "read_file", "arguments": '{"part": 3}'},
+                    }
+                ],
+            },
+        )
+        self.assertEqual(stream.chunks, [])
+        self.assertTrue(stream.sent <= stream.began <= stream.ended)
+        with StreamingServer(lambda body: [content_event("OK")]) as fake:
+            plain = clients.Stream(fake.port, "{}")
+        self.assertEqual(plain.message(), {"role": "assistant", "content": "OK"})
+        self.assertEqual(plain.began, plain.first)
+
+    def test_an_agent_turn_sends_the_reply_and_the_tools_result_after_it(self):
+        fake = FakeCachingServer()
+        self.run_scenario(clients.run_agent, fake, "a", conversations=2, turns=3)
+        self.assertEqual(len(fake.bodies), 6)
+        self.assertTrue(all(body["tools"] for body in fake.bodies))
+        first, second = fake.of(0), fake.of(1)
+        self.assertEqual((len(first), len(second)), (3, 3))
+        # The conversations share their system prompt and differ from their
+        # tasks on.
+        self.assertEqual(first[0][0], second[0][0])
+        self.assertEqual(first[0][0]["role"], "system")
+        self.assertNotEqual(first[0][1], second[0][1])
+        for conversation, requests in enumerate((first, second)):
+            for turn, (before, after) in enumerate(zip(requests, requests[1:])):
+                # Each turn only adds to the conversation: the reply as the
+                # server streamed it, then the result of its call.
+                self.assertEqual(after[: len(before)], before)
+                reply, result = after[len(before) :]
+                number = fake.bodies.index(
+                    next(b for b in fake.bodies if b["messages"] == before)
+                )
+                self.assertEqual(
+                    reply,
+                    {
+                        "role": "assistant",
+                        "content": f"Reply {number + 1}.",
+                        "reasoning_content": f"Thought {number + 1}.",
+                        "tool_calls": [
+                            {
+                                "id": f"call_{number + 1}",
+                                "type": "function",
+                                "function": {
+                                    "name": "read_file",
+                                    "arguments": '{"part": %d}' % (number + 1),
+                                },
+                            }
+                        ],
+                    },
+                )
+                self.assertEqual(
+                    (result["role"], result["tool_call_id"]),
+                    ("tool", f"call_{number + 1}"),
+                )
+                head = f"# module {conversation}, part {turn}\n"
+                self.assertTrue(result["content"].startswith(head))
+                # About 200 tokens of the corpus, whole lines of it.
+                size = len(result["content"]) - len(head)
+                self.assertTrue(600 <= size <= 200 * 4.08, size)
+        results = [request[-1]["content"] for request in first[1:] + second[1:]]
+        self.assertEqual(len(set(results)), 4)
+        requests = self.events("a", "request")
+        self.assertEqual(
+            [(r["turn"], r["turn_kind"], r["conv"]) for r in requests],
+            [(0, "first", 0), (0, "first", 1), (1, "loop", 0), (1, "loop", 1)]
+            + [(2, "loop", 0), (2, "loop", 1)],
+        )
+        self.assertTrue(all(r["calls"] == 1 and r["reasoning"] == 5 for r in requests))
+        self.assertTrue(all(r["deduplicated"] == 32 for r in requests))
+
+    def test_a_reply_without_a_call_gets_its_part_as_the_users_message(self):
+        fake = FakeCachingServer(calls=False)
+        self.run_scenario(clients.run_agent, fake, "a", conversations=1, turns=2)
+        before, after = fake.of(0)
+        reply, part = after[len(before) :]
+        self.assertEqual(
+            reply,
+            {
+                "role": "assistant",
+                "content": "Reply 1.",
+                "reasoning_content": "Thought 1.",
+            },
+        )
+        self.assertEqual(part["role"], "user")
+        self.assertTrue(part["content"].startswith("# module 0, part 0\n"))
+        self.assertEqual(self.events("a", "request")[0]["calls"], 0)
+
+    def test_each_turn_reports_what_the_cache_wrote_and_the_summary_sums_it(self):
+        # Two conversations of three turns: each request writes 10 MiB, two
+        # KV pages of them copied ahead, and after the last turn the cache
+        # writes two more states of 1 MiB.
+        fake = FakeCachingServer(requests=6, late=2)
+        summary = self.run_scenario(
+            clients.run_agent, fake, "a", conversations=2, turns=3
+        )
+        turns = self.events("a", "turn")
+        self.assertEqual([t["requests"] for t in turns], [2, 2, 2])
+        self.assertEqual(
+            [t["disk.written_bytes"] for t in turns], [20 * MIB, 20 * MIB, 20 * MIB]
+        )
+        self.assertEqual([t["disk.kv_copies"] for t in turns], [4, 4, 4])
+        self.assertEqual([t["state.offloads"] for t in turns], [2, 2, 2])
+        # Prompts of 1,000, 3,000 and 5,000 tokens, all but 1,000 cached.
+        self.assertEqual([t["prompt"] for t in turns], [2000, 6000, 10000])
+        self.assertEqual([t["cached"] for t in turns], [0, 4000, 8000])
+        (tail,) = self.events("a", "tail")
+        self.assertEqual(
+            (tail["disk.written_bytes"], tail["state.offloads"]), (2 * MIB, 2)
+        )
+        self.assertEqual(self.events("a", "summary")[0]["requests"], 6)
+        self.assertEqual(
+            {
+                key: summary[key]
+                for key in (
+                    "turns",
+                    "requests",
+                    "prompt_tokens",
+                    "cached_tokens",
+                    "deduplicated_tokens",
+                    "reuse_rate",
+                    "written_bytes",
+                    "written_bytes_per_request",
+                    "written_bytes_per_1k_prompt_tokens",
+                    "written_by_cause",
+                    "tail_written_bytes",
+                    "tail_written_by_cause",
+                )
+            },
+            {
+                "turns": 3,
+                "requests": 6,
+                "prompt_tokens": 18000,
+                "cached_tokens": 12000,
+                "deduplicated_tokens": 192,
+                "reuse_rate": 0.6667,
+                "written_bytes": 60 * MIB,
+                "written_bytes_per_request": 10 * MIB,
+                "written_bytes_per_1k_prompt_tokens": round(60 * MIB / 18),
+                "written_by_cause": {
+                    "states": 48 * MIB,
+                    "kv_demotions": 0,
+                    "kv_copies": 12 * MIB,
+                    "kv_spill": 0,
+                },
+                "tail_written_bytes": 2 * MIB,
+                "tail_written_by_cause": {
+                    "states": 2 * MIB,
+                    "kv_demotions": 0,
+                    "kv_copies": 0,
+                    "kv_spill": 0,
+                },
+            },
+        )
+        self.assertEqual(summary["counters"]["disk.write_behind.durable"], 6)
+        self.assertEqual(
+            {kind: times["n"] for kind, times in summary["ttft_ms"].items()},
+            {"first": 2, "loop": 4},
+        )
+        # The /status at each turn's start, and the one after the tail.
+        samples = (Path(self.directory) / "a.status.jsonl").read_text().splitlines()
+        self.assertEqual(
+            [json.loads(line).get("turn") for line in samples], [0, 1, 2, 3, None]
+        )
+
+    def test_the_check_says_that_slim_pages_count_whole(self):
+        # No counter tells a Slim page's write from a whole page's, so the
+        # KV by cause is overstated for a target that writes them.
+        fake = FakeCachingServer(requests=2, slim_page_bytes=MIB // 4)
+        summary = self.run_scenario(
+            clients.run_agent, fake, "s", conversations=1, turns=2
+        )
+        self.assertEqual(
+            (summary["kv_page_bytes"], summary["slim_page_bytes"]), (MIB, MIB // 4)
+        )
+        directory = Path(self.directory)
+        (directory / "s.out").write_text("DONE\n")
+        (directory / "s.meta.json").write_text(
+            json.dumps({"scenario": "agent", "build_id": "b1"})
+        )
+        self.assertIn(
+            "KV by cause counts every page at 1.0 MiB: this target's Slim pages "
+            "store 0.2 MiB, so its KV is overstated and its states understated",
+            check.check_run(check.Run(directory, "s"))["notes"],
+        )
+
+    def test_an_edit_run_branches_from_the_middle_and_returns(self):
+        fake = FakeCachingServer()
+        self.run_scenario(clients.run_edit, fake, "e", conversations=2, turns=4)
+        kinds = [r["turn_kind"] for r in self.events("e", "request")]
+        after_build = ["regenerate", "edit", "follow", "return"]
+        self.assertEqual(
+            kinds,
+            ["build"] * 8 + [kind for kind in after_build for _ in range(2)] * 3,
+        )
+        # One request at a time, each a turn of its own.
+        self.assertEqual(
+            [t["requests"] for t in self.events("e", "turn")], [1] * len(kinds)
+        )
+        self.assertTrue(all("tools" not in body for body in fake.bodies))
+        for conversation in (0, 1):
+            requests = fake.of(conversation, marker="Chat")
+            build, later = requests[:4], requests[4:]
+            for before, after in zip(build, build[1:]):
+                self.assertEqual(after[: len(before)], before)
+                self.assertEqual(
+                    [m["role"] for m in after[len(before) :]], ["assistant", "user"]
+                )
+            whole = build[-1]
+            # At the turns a quarter, half and three quarters in.
+            for depth, (again, edit, follow, back) in zip(
+                (1, 2, 3), zip(*[iter(later)] * 4)
+            ):
+                self.assertEqual(again, build[depth])
+                self.assertEqual(edit[:-1], build[depth][:-1])
+                self.assertNotEqual(edit[-1], build[depth][-1])
+                self.assertIn(f"part {depth}, revised", edit[-1]["content"])
+                self.assertEqual(follow[: len(edit)], edit)
+                self.assertEqual(
+                    [m["role"] for m in follow[len(edit) :]], ["assistant", "user"]
+                )
+                # The original conversation, whole, goes on by one turn.
+                self.assertEqual(back[: len(whole)], whole)
+                self.assertEqual(
+                    [m["role"] for m in back[len(whole) :]], ["assistant", "user"]
+                )
+                whole = back
+            # No message of the user's is sent in two places.
+            asked = {m["content"] for r in requests for m in r if m["role"] == "user"}
+            self.assertEqual(len(asked), 4 + 3 * 3)
+        with self.assertRaisesRegex(ValueError, "2 turns"):
+            self.run_scenario(clients.run_edit, fake, "short", turns=1)
+
+    def test_a_request_the_server_fails_ends_the_scenario(self):
+        fake = FakeCachingServer()
+
+        def answer(body):
+            events = fake.answer(body)
+            return [FAILED_EVENT] if len(fake.bodies) == 4 else events
+
+        with StreamingServer(answer, fake.status) as server:
+            with self.assertRaisesRegex(
+                clients.RequestFailed,
+                "loop turn 1, conversation [01]: 200 .*internal_server_error",
+            ):
+                clients.run_agent(
+                    server.port,
+                    self.directory,
+                    "f",
+                    conversations=2,
+                    turns=3,
+                    turn_tokens=200,
+                    gap=0,
+                    text=synthetic_corpus(),
+                )
+        self.assertEqual(len(self.events("f", "turn")), 1)
+
+    def test_the_check_notes_what_a_run_measured(self):
+        fake = FakeCachingServer(requests=6, late=2)
+        self.run_scenario(clients.run_agent, fake, "a", conversations=2, turns=3)
+        directory = Path(self.directory)
+        (directory / "a.out").write_text("DONE\n")
+        (directory / "a.meta.json").write_text(
+            json.dumps({"scenario": "agent", "build_id": "b1"})
+        )
+        ran = check.Run(directory, "a")
+        result = check.check_run(ran)
+        self.assertEqual((result["invalid"], result["failures"]), ([], []))
+        notes = result["notes"]
+        self.assertIn(
+            "written: 60.0 MiB over 6 requests, 10.0 MiB a request, 3.3 MiB per "
+            "1,000 prompt tokens: states 48.0 MiB in 6 writes, KV copied ahead "
+            "12.0 MiB, KV demoted 0.0 MiB, KV spilled 0.0 MiB",
+            notes,
+        )
+        self.assertIn(
+            "written after the last turn: 2.0 MiB: states 2.0 MiB in 2 writes, "
+            "KV copied ahead 0.0 MiB, KV demoted 0.0 MiB, KV spilled 0.0 MiB",
+            notes,
+        )
+        self.assertIn(
+            "reuse: 66.7% of 18000 prompt tokens cached, 192 more read from "
+            "cached KV; 3 states and 0 KV pages from the SSD (0.0 MiB read), "
+            "0 lookups past a lost state",
+            notes,
+        )
+        self.assertEqual(
+            sum(note.startswith("first token, ") for note in notes), 2, notes
+        )
+        self.assertFalse(any("Slim" in note for note in notes), notes)
+        samples = check.metrics(ran)
+        self.assertEqual(
+            {name: len(values) for name, values in samples.items()},
+            {"agent_first_ttft_ms": 2, "agent_loop_ttft_ms": 4},
+        )
+
+    def test_a_run_passes_the_scenarios_options(self):
+        class FakeServer:
+            def __init__(self, tree, root, model, port, server_args, log):
+                self.process = mock.Mock(pid=4242, **{"poll.return_value": None})
+
+            def wait_ready(self):
+                return 1.0
+
+            def engine_pids(self):
+                return {4242}
+
+            def stop(self):
+                return {"signals": ["SIGINT"], "exit": 0, "left_running": []}
+
+        def ran(scenario, *options):
+            tree = Path(self.directory) / scenario
+            (tree / "build").mkdir(parents=True)
+            (tree / "build" / "splash").write_bytes(b"splash")
+            with (
+                mock.patch.multiple(
+                    run,
+                    Server=FakeServer,
+                    ps_snapshot=lambda ours: {"at": 0.0, "rows": [], "therm": ""},
+                    port_answers=lambda port: False,
+                    tree_build_id=lambda tree: "src-1",
+                    host_memory=lambda: {},
+                    check_identity=lambda port, server, build_id: {"pid": 4242},
+                ),
+                mock.patch.object(
+                    run.clients, f"run_{scenario}", return_value={"requests": 6}
+                ) as client,
+            ):
+                code = run.main(
+                    ["--tree", str(tree), "--machine", "studio", "--model", "m"]
+                    + ["--model-root", str(tree), "--scenario", scenario]
+                    + ["--label", "s", "--out", str(tree / "out"), *options]
+                )
+            self.assertEqual(code, 0)
+            self.assertIn('s summary {"requests": 6}', (tree / "out/s.out").read_text())
+            return client.call_args.kwargs
+
+        # An option left out is the scenario's own default.
+        self.assertEqual(
+            ran("agent", "--conversations", "3", "--turns", "5"),
+            {"timeout": clients.REQUEST_SECONDS, "conversations": 3, "turns": 5},
+        )
+        self.assertEqual(
+            ran("edit", "--turn-tokens", "500", "--gap", "0.5"),
+            {"timeout": clients.REQUEST_SECONDS, "turn_tokens": 500, "gap": 0.5},
+        )

@@ -5,11 +5,12 @@
 #include <metal_stdlib>
 using namespace metal;
 
-// The column tile of kernels/shared/moe_gguf.metal: a GEMV of few rows in registers. Lane l of a simdgroup owns
-// output column `column`, decodes its column's groups of 32 into registers (dequant32_chunks) and multiplies each
-// weight into the fp32 sums of its rows: no stage, no barrier, Rows FMAs per weight. The staged tile runs a
-// dequantize, barrier and matmul chain per 32-input step on padded 8-row MPP tiles, which bounds it at few rows, not
-// DRAM, so the column tile runs the MoE expert tiles of one or two live rows (moe_column_tile). Includers set
+// The column tile of kernels/shared/moe_gguf.metal and kernels/decode/linear_gguf_column.metal: a GEMV of few rows
+// in registers. Lane l of a simdgroup owns output column `column`, decodes its column's groups of 32 into registers
+// (dequant32_chunks) and multiplies each weight into the fp32 sums of its rows: no stage, no barrier, Rows FMAs per
+// weight. The staged tile runs a dequantize, barrier and matmul chain per 32-input step on padded 8-row MPP tiles,
+// which bounds it at few rows, not DRAM, so the column tile runs the MoE expert tiles and the decode projections of at
+// most GGUF_COLUMN_ROWS live rows (moe_column_tile, ops::LinearTile::GgufColumn). Includers set
 // `#pragma clang fp reassociate(off)` first.
 
 // Each row's sum over groups [g_begin, g_end) of K, of its first `rows` rows (at most Rows): per group one fp32 chain
