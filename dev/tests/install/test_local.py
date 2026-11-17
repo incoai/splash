@@ -11,6 +11,7 @@ from unittest import mock
 from dev.tests.installer_fixtures import (
     DENSE,
     DRAFT_COMMIT,
+    FLASH_NEXT,
     GGML,
     MOE,
     PROCESSOR,
@@ -312,6 +313,21 @@ class LocalModelTest(unittest.TestCase):
             "projector; an MLX target keeps its vision tower in its checkpoint",
         ):
             self.prepare(target, draft, mmproj=mmproj)
+
+    def test_flash_next_mlx_keeps_its_external_ple_table(self):
+        target = mlx_target(self.root / "flash-next", FLASH_NEXT)
+        (target / "ngram_table.bin").write_bytes(b"external PLE table")
+        draft = draft_dir(self.root / "draft", FLASH_NEXT)
+        prepared = self.prepare(target, draft, language_only=True)
+        record = assembly.verify(prepared, full=True)
+        self.assertEqual(record["family"], FLASH_NEXT.name)
+        self.assertIn("target/ngram_table.bin", record["files"])
+        self.assertEqual(
+            (prepared / "target/ngram_table.bin").read_bytes(), b"external PLE table"
+        )
+        (target / "ngram_table.bin").write_bytes(b"changed table")
+        with self.assertRaises(models.ModelError):
+            assembly.verify(prepared)
 
     def test_a_split_gguf_is_named_by_any_part_or_its_directory(self):
         directory = self.root / "UD-Q4_K_M"

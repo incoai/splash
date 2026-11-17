@@ -62,7 +62,8 @@ release-app: install-environment all
 
 # The app's own tests; the Python ones cover what packages it.
 check-app:
-	swift test --package-path app
+	# AppKit tests share NSApplication and window focus across suites.
+	swift test --package-path app --no-parallel
 
 # Uploads the built RELEASE_VERSION archive, its checksum, the tester installer
 # and the `latest` pointer to the private Hugging Face repo testers install

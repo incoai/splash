@@ -94,7 +94,10 @@ TargetWeights loadTarget(metal::MetalBackend &backend, WeightImages &images, con
         const std::filesystem::path directory = root / "target";
         switch (descriptor.targetSource) {
         case TargetSource::Safetensors: {
-          SafetensorsTargetLoader loader(backend, images, directory, layout, experts);
+          SparseRowStoreOptions table = streamedTableRows(layout);
+          table.cacheBytes = options.streamedTableBytes;
+          table.readers = options.readers;
+          SafetensorsTargetLoader loader(backend, images, directory, layout, experts, table);
           return readTarget(backend, layout, std::ref(loader));
         }
         case TargetSource::Gguf: {

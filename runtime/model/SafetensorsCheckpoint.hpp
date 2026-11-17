@@ -13,6 +13,8 @@ namespace splash::model {
 // runtime or allocating tensors. It reads no configuration: inspection checks
 // the model's config.json, the target's quantization included
 // (inspectModelRoot).
+// An optional mlx-serve ngram_table.bin uses the same wire format; its short
+// names are indexed under ngram_table. beside the checkpoint's module names.
 class SafetensorsCheckpoint final {
 public:
   explicit SafetensorsCheckpoint(const std::filesystem::path &directory);
