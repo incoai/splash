@@ -66,9 +66,9 @@ struct AneFfnModel final {
   // model a test plays prepares no split.
   std::function<AneFfnPrepared(uint32_t aneUnits, bool timeChunks)> prepare;
   // This Mac's calibration of the split within `maxAneUnits` units, if one
-  // is remembered; remembering one; and forgetting it.
+  // is remembered; remembering one, true once kept; and forgetting it.
   std::function<std::optional<ops::ane_ffn::Calibration>(uint32_t maxAneUnits)> recall;
-  std::function<void(uint32_t maxAneUnits, const ops::ane_ffn::Calibration &calibration)> remember;
+  std::function<bool(uint32_t maxAneUnits, const ops::ane_ffn::Calibration &calibration)> remember;
   std::function<void(uint32_t maxAneUnits)> forget;
   // Whether the Metal backend still serves.
   std::function<bool()> healthy;
@@ -139,8 +139,8 @@ struct AneFfnStart final {
 // longer (ops::ane_ffn::slowerNowhere), the least chunk found (minimumRows), and the
 // outcome remembered, a split or none. The split then judges itself against the GPU
 // alone as calibrated (ops::ane_ffn::Breaker), which forgets the calibration
-// when it trips, so that the next start calibrates again; a given split
-// takes the given least chunk, no breaker, and nothing remembered. Logs the
+// when it trips; the Neural Engine's refusals count (ops::ane_ffn::Calibration). A
+// given split takes the given least chunk, no breaker, and nothing remembered. Logs the
 // outcome, a split a relaunch's context refuses in a plain line: the server,
 // not the user, asked for that context. A failure leaves the GPU alone,
 // unless `cancelled` returns true, the wait for the ANE was interrupted or

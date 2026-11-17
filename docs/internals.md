@@ -1364,9 +1364,10 @@ then makes of it: a split that failed leaves the GPU alone at the same context,
 and the memory the split would hold stays with the KV cache. Every start of a
 model on a Mac that takes one calibration so serves the same context; one
 calibrated anew may serve another, after the split lost to the GPU alone, which
-forgets the calibration (below), after a start whose remembered split did not
-prepare, which forgets it too, after a start whose calibration failed and
-left none, or once macOS cleared the directory that keeps it. The server's
+forgets the calibration (below), after the Neural Engine refused a remembered
+split, which leaves the next start to calibrate again (below), after a start
+whose calibration failed and left none, or once macOS cleared the directory
+that keeps it. The server's
 relaunch of the engine after a failure keeps the first engine's context
 whatever it calibrates: the server passes that context
 (`serve-native --relaunch-context`) beside the first engine's `MAX_CONTEXT`,
@@ -1436,6 +1437,14 @@ what it found (`remembered-*` in the cache directory below): the units, the
 least chunk and the GPU alone's layer at 512 and 2048 rows, or that no split
 gains enough. Later starts take it untimed: they build the split, check it as
 below and serve, in 0.6 s on an M5 Max, 0.9 s on an M5 Pro and 1.4 s on an M6.
+Beside it the start keeps how often the Neural Engine refused a split
+(`ane::Refused`: its service did not compile, load or run the program, or the
+check below failed): the first refusal of a remembered split leaves the next
+start to calibrate again, and the second, of a split calibrated, remembered or
+calibrated again, leaves the GPU alone, uncalibrated, until the key changes.
+Any other failure to build the split, as Metal refusing memory, keeps the
+calibration: that start runs the GPU alone, and the log says what the next
+start does.
 Across many starts over hours of prefill on those three Macs the timings chose
 the same units within their noise, while timing every start cost 3-8 s, and a
 start whose timings strayed could change the share, each share compiling a

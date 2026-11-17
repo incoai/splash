@@ -1553,7 +1553,7 @@ AneFfnModel aneFfnModel(metal::MetalBackend &backend, const model::LoadedModel &
     return line ? ops::ane_ffn::Calibration::parse(*line) : std::nullopt;
   };
   model.remember = [key](uint32_t maxAneUnits, const ops::ane_ffn::Calibration &calibration) {
-    ane::remember(key + std::to_string(maxAneUnits), calibration.text());
+    return ane::remember(key + std::to_string(maxAneUnits), calibration.text());
   };
   model.forget = [key](uint32_t maxAneUnits) { ane::forget(key + std::to_string(maxAneUnits)); };
   model.healthy = [&backend] { return backend.healthy(); };

@@ -23,7 +23,7 @@ constexpr double kMinimumGain = 0.05;
 constexpr double kChunkNoise = 0.02;
 // The first word of a Calibration's text, which a change to its fields
 // renumbers.
-constexpr std::string_view kCalibrationTag = "ane-ffn-calibration-1";
+constexpr std::string_view kCalibrationTag = "ane-ffn-calibration-2";
 
 // The GPU alone's milliseconds of a chunk's FFN layer by its rows: the line
 // through its timings, which the GPU follows within 1% between them.
@@ -155,26 +155,48 @@ bool slowerNowhere(const ChunkTimings &candidate, const ChunkTimings &incumbent)
   return true;
 }
 
+Calibration refused(const std::optional<Calibration> &recalled, Calibration kept) {
+  kept.refusals = (recalled ? recalled->refusals : 0) + 1;
+  return kept.refusals < Calibration::kRefusals ? kept : Calibration{.refusals = Calibration::kRefusals};
+}
+
+std::string Calibration::nextStart(const std::optional<Calibration> &record) {
+  if (record && record->aneUnits) return "the next start sets it up as calibrated";
+  if (record && record->refusals == kRefusals)
+    return "starts leave the GPU alone until Splash, macOS or the model changes";
+  return "the next start calibrates again";
+}
+
+std::string Calibration::withoutSplit() const {
+  return refusals ? "the Neural Engine refused its split twice; " + nextStart(*this)
+                  : "no Neural Engine split beat it by enough when this Mac calibrated it";
+}
+
 std::string Calibration::text() const {
   std::ostringstream text;
   text << std::setprecision(9) << kCalibrationTag << ' ' << aneUnits << ' ' << minimumRows;
   for (const ChunkTimings::Gpu &point : gpu) text << ' ' << point.rows << ' ' << point.milliseconds;
+  text << ' ' << refusals;
   return text.str();
 }
 
 // A record of units holds least rows and the GPU alone at ascending rows of
-// usable milliseconds; one of none holds neither.
+// usable milliseconds, and fewer than kRefusals refusals; one of none holds
+// neither, and at most kRefusals.
 std::optional<Calibration> Calibration::parse(std::string_view text) {
   std::istringstream in{std::string(text)};
   std::string tag;
   Calibration calibration;
   in >> tag >> calibration.aneUnits >> calibration.minimumRows;
   for (ChunkTimings::Gpu &point : calibration.gpu) in >> point.rows >> point.milliseconds;
+  in >> calibration.refusals;
   std::string rest;
-  if (!in || tag != kCalibrationTag || (in >> rest)) return std::nullopt;
+  if (!in || tag != kCalibrationTag || (in >> rest) || calibration.refusals > kRefusals) return std::nullopt;
   const auto &[low, high] = calibration.gpu;
   const auto usableMilliseconds = [](double value) { return value > 0.0 && std::isfinite(value); };
-  if (!calibration.aneUnits) return calibration.minimumRows ? std::nullopt : std::optional(Calibration{});
+  if (!calibration.aneUnits)
+    return calibration.minimumRows ? std::nullopt : std::optional(Calibration{.refusals = calibration.refusals});
+  if (calibration.refusals == kRefusals) return std::nullopt;
   if (!calibration.minimumRows || !(low.rows < high.rows) || !usableMilliseconds(low.milliseconds) ||
       !usableMilliseconds(high.milliseconds))
     return std::nullopt;

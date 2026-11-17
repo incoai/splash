@@ -108,6 +108,8 @@ struct Fake {
   // for, and the calibration it remembered and under which most units.
   std::optional<Calibration> stored, remembered;
   std::optional<uint32_t> recalled, rememberedMost;
+  // Whether remember() keeps what it is given, as a cache directory that takes writes does.
+  bool keeps = true;
   bool healthy = true;
   // The calls the start made: of unavailable() and time(), the units of timeAt()'s, and of prepare() with its
   // arguments, the last and the units of each.
@@ -154,8 +156,10 @@ struct Fake {
       return stored;
     };
     result.remember = [this](uint32_t maxAneUnits, const Calibration &calibration) {
+      if (!keeps) return false;
       rememberedMost = maxAneUnits;
       stored = remembered = calibration;
+      return true;
     };
     result.forget = [this](uint32_t) { stored.reset(); };
     result.healthy = [this] { return healthy; };
@@ -762,8 +766,7 @@ void testARefittedSplitThatFailsKeepsTheFirst() {
 // context the calibration's, and the calibration of the first units remembered, which the next start sets up: the
 // M5 Max's timings choose 6 units and then 7, whose 640-row function takes 6.0 ms (testRefitMovesTheChoice), and the
 // Neural Engine refuses the program of 6 the second time. It ended the start with the GPU alone and nothing
-// remembered, so that every later start calibrated again. A start whose remembered split does not prepare forgets
-// it, so that the next calibrates again rather than every start fail on the same split.
+// remembered, so that every later start calibrated again.
 void testAFirstSplitThatDoesNotPrepareAgainIsRemembered() {
   Fake fake;
   fake.time = [] { return Timings{{14.0 / 34, 9.9673, 23.929}, {27.0 / 34, 4.7526, 46.034}, 15.834}; };
@@ -790,15 +793,107 @@ void testAFirstSplitThatDoesNotPrepareAgainIsRemembered() {
   require(started.start.outcome.kind == Kind::Split && fake.timings == 1 && fake.prepared == std::pair(6u, false) &&
               has(started.log, "set up as calibrated before"),
           "the next start did not set up the remembered first units: " + started.log);
-  preparedSix = 1;
+}
+
+// A split the Neural Engine refuses (ane::Refused) counts beside the calibration, and the second refusal leaves the
+// GPU alone, uncalibrated, until the calibration's key changes: it was forgotten at each refusal, so that a split the
+// Neural Engine refused each time was calibrated every other start. A calibration whose first split does not prepare
+// again is kept with the refusal and refused again by the next start (testAFirstSplitThatDoesNotPrepareAgainIsRemembered's
+// timings); a remembered split refused once is calibrated again, and that split refused; a split refused while it is
+// calibrated is calibrated once more. The log says what the next start does, as what stayed remembered says.
+void testARefusedSplitIsNotCalibratedInALoop() {
+  const auto refusedUntimed = [](uint32_t aneUnits, bool timed) {
+    if (!timed) throw ane::Refused("ANE load failed: the Neural Engine refused the program of " +
+                                   std::to_string(aneUnits) + " units");
+    AneFfnPrepared prepared;
+    prepared.chunks = timedChunks(aneUnits == 6 ? 13.84 : 13.55);
+    if (aneUnits == 7) prepared.chunks.functions[11].split = 6.0;
+    return prepared;
+  };
+  constexpr std::string_view kLeft = "starts leave the GPU alone until Splash, macOS or the model changes";
+  Fake fake;
+  fake.time = [] { return Timings{{14.0 / 34, 9.9673, 23.929}, {27.0 / 34, 4.7526, 46.034}, 15.834}; };
+  fake.timeAt = [](uint32_t) { return 13.84; };
+  fake.prepare = refusedUntimed;
+  Started started = start(fake);
+  require(started.start.outcome.kind == Kind::Unavailable && fake.stored && fake.stored->aneUnits == 6 &&
+              fake.stored->refusals == 1 &&
+              has(started.log, "refused the program of 6 units; the next start sets it up as calibrated"),
+          "a calibration whose first split was refused again was not kept with the refusal: " + started.log);
   started = start(fake);
-  require(started.start.outcome.kind == Kind::Unavailable && !started.start.split && !fake.stored &&
-              has(started.log, "its remembered share's split was not prepared: the Neural Engine refused the program "
-                               "of 6 units; the next start calibrates again"),
-          "a remembered split that did not prepare was not forgotten: " + started.log);
+  require(started.start.outcome.kind == Kind::Unavailable && fake.stored && !fake.stored->aneUnits &&
+              fake.stored->refusals == 2 && has(started.log, std::string("refused the program of 6 units; ") + kLeft.data()),
+          "a split refused twice did not leave the GPU alone: " + started.log);
+  for (int later = 0; later < 2; ++later) {
+    fake.preparedUnits.clear();
+    started = start(fake);
+    require(started.start.outcome.kind == Kind::Unavailable && fake.timings == 1 && fake.preparedUnits.empty() &&
+                started.start.outcome.context == contextWith(0) &&
+                has(started.log, std::string("the Neural Engine refused its split twice; ") + kLeft.data()),
+            "a start after a split refused twice calibrated or set a split up: " + started.log);
+  }
+
+  const std::array<ChunkTimings::Gpu, 2> gpu{{{512, 5.0}, {2048, 20.0}}};
+  fake = {};
+  fake.stored = Calibration{9, 700, gpu};
+  fake.prepare = [](uint32_t aneUnits, bool timed) -> AneFfnPrepared {
+    if (aneUnits == 9) throw ane::Refused("ANE compilation failed");
+    return Fake{}.prepare(aneUnits, timed);
+  };
+  fake.keeps = false;
   started = start(fake);
-  require(started.start.outcome.kind == Kind::Split && fake.timings == 2,
-          "the start after a remembered split that did not prepare did not calibrate again: " + started.log);
+  require(started.start.outcome.kind == Kind::Unavailable && fake.stored && fake.stored->aneUnits == 9 &&
+              has(started.log, "ANE compilation failed; the next start sets it up as calibrated"),
+          "a refusal that could not be remembered said the next start would not set the split up: " + started.log);
+  fake.keeps = true;
+  started = start(fake);
+  require(started.start.outcome.kind == Kind::Unavailable && fake.stored && !fake.stored->aneUnits &&
+              fake.stored->refusals == 1 &&
+              has(started.log, "ANE compilation failed; the next start calibrates again"),
+          "a remembered split refused once was not left to calibrate again: " + started.log);
+  started = start(fake);
+  require(started.start.outcome.kind == Kind::Split && fake.timings == 1 && fake.stored &&
+              fake.stored->aneUnits == 8 && fake.stored->refusals == 1,
+          "the start after a refusal did not calibrate again, keeping the refusal: " + started.log);
+  fake.prepare = [](uint32_t, bool) -> AneFfnPrepared { throw ane::Refused("ANE load failed"); };
+  started = start(fake);
+  require(started.start.outcome.kind == Kind::Unavailable && fake.stored && fake.stored->refusals == 2 &&
+              has(started.log, std::string("ANE load failed; ") + kLeft.data()),
+          "a split calibrated again after a refusal and refused did not leave the GPU alone: " + started.log);
+
+  fake = {};
+  fake.prepare = [](uint32_t, bool) -> AneFfnPrepared { throw ane::Refused("ANE load failed"); };
+  started = start(fake);
+  require(started.start.outcome.kind == Kind::Unavailable && fake.stored && fake.stored->refusals == 1 &&
+              has(started.log, "ANE load failed; the next start calibrates again"),
+          "a split refused while it was calibrated was not counted: " + started.log);
+  started = start(fake);
+  started = start(fake);
+  require(fake.timings == 2 && fake.stored && fake.stored->refusals == 2 &&
+              has(started.log, std::string("the Neural Engine refused its split twice; ") + kLeft.data()),
+          "a split refused each time it was calibrated was calibrated more than twice: " + started.log);
+}
+
+// A remembered split that fails to prepare for another reason than the Neural Engine's refusal, as Metal refusing an
+// arena under memory pressure, keeps its calibration: that start runs the GPU alone and the next sets the split up.
+// It was forgotten, and the next start calibrated again.
+void testAFailureThatIsNotARefusalKeepsTheCalibration() {
+  const std::array<ChunkTimings::Gpu, 2> gpu{{{512, 5.0}, {2048, 20.0}}};
+  Fake fake;
+  fake.stored = Calibration{9, 700, gpu};
+  fake.prepare = [](uint32_t, bool) -> AneFfnPrepared {
+    throw metal::MetalAllocationError("the prefill arena was not allocated", metal::AllocationFailure::DriverRejected);
+  };
+  Started started = start(fake);
+  require(started.start.outcome.kind == Kind::Unavailable && !started.start.split && fake.stored &&
+              fake.stored->aneUnits == 9 && fake.stored->minimumRows == 700 && !fake.stored->refusals &&
+              has(started.log, "its remembered share's split was not prepared: the prefill arena was not allocated; "
+                               "the next start sets it up as calibrated"),
+          "a remembered split that failed for another reason than a refusal lost its calibration: " + started.log);
+  fake.prepare = Fake{}.prepare;
+  started = start(fake);
+  require(started.start.outcome.kind == Kind::Split && !fake.timings && fake.prepared == std::pair(9u, false),
+          "the start after a failure that was not a refusal did not set the calibration up: " + started.log);
 }
 
 // A start takes this Mac's calibration once remembered: it neither times nor remembers, prepares the remembered units
@@ -883,6 +978,8 @@ int main() {
     testRefitMovesTheChoice();
     testARefittedSplitThatFailsKeepsTheFirst();
     testAFirstSplitThatDoesNotPrepareAgainIsRemembered();
+    testARefusedSplitIsNotCalibratedInALoop();
+    testAFailureThatIsNotARefusalKeepsTheCalibration();
     testRemembered();
     testGivenShare();
     std::cout << "ane ffn startup tests passed\n";

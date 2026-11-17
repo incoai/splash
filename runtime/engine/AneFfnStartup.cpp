@@ -16,6 +16,7 @@ namespace splash::engine {
 namespace {
 
 namespace ane_ffn = ops::ane_ffn;
+using Calibration = ane_ffn::Calibration;
 using Kind = AneFfnOutcome::Kind;
 
 // `tokens` with its thousands grouped, as the server prints a context.
@@ -179,6 +180,11 @@ AneFfnStart decide(const AneFfnModel &model, const AneFfnSetting &setting, Reque
     return AneFfnStart{std::move(prepared.split), std::move(plan.plan),
                        {Kind::Split, reason.str(), automaticWith(aneUnits), without}};
   };
+  // This Mac's calibration as recalled; what the next start does once this one tried to remember `record`.
+  std::optional<Calibration> calibration;
+  const auto keep = [&](const Calibration &record) {
+    return Calibration::nextStart(model.remember(maxAneUnits, record) ? record : calibration);
+  };
   try {
     if (given) {
       AneFfnPrepared prepared = model.prepare(*given, false);
@@ -203,7 +209,8 @@ AneFfnStart decide(const AneFfnModel &model, const AneFfnSetting &setting, Reque
     };
 
     // Why `step` failed on a backend that serves and in a start that goes on,
-    // or none.
+    // or none, and whether the Neural Engine refused the split.
+    bool refusal = false;
     const auto failure = [&](const auto &step) -> std::optional<std::string> {
       try {
         step();
@@ -212,26 +219,24 @@ AneFfnStart decide(const AneFfnModel &model, const AneFfnSetting &setting, Reque
         throw;
       } catch (const std::exception &error) {
         if ((cancelled && cancelled()) || !model.healthy()) throw;
+        refusal = dynamic_cast<const ane::Refused *>(&error);
         return error.what();
       }
     };
-    std::optional<ane_ffn::Calibration> calibration = model.recall(maxAneUnits);
+    calibration = model.recall(maxAneUnits);
     if (calibration && calibration->aneUnits &&
         (calibration->aneUnits > maxAneUnits || calibration->minimumRows < ops::AneFfn::kMinimumRows ||
          calibration->minimumRows > ops::AneFfn::kMaximumRows))
       calibration.reset();
-    if (calibration) {
+    if (calibration && (calibration->aneUnits || calibration->refusals != 1)) {
       assumed = calibration->aneUnits;
       if (!calibration->aneUnits)
-        return gpuAloneServing(Kind::NoGain, "no Neural Engine split beat it by enough when this Mac calibrated it");
-      // A remembered split that does not prepare is forgotten, so that the
-      // next start calibrates again rather than every start fail on it.
+        return gpuAloneServing(calibration->refusals ? Kind::Unavailable : Kind::NoGain, calibration->withoutSplit());
+      // The Neural Engine's refusal counts in the split's place; another failure keeps it.
       AneFfnPrepared prepared;
-      if (const auto reason = failure([&] { prepared = model.prepare(calibration->aneUnits, false); })) {
-        model.forget(maxAneUnits);
-        return gpuAloneServing(Kind::Unavailable, "its remembered share's split was not prepared: " + *reason +
-                                                      "; the next start calibrates again");
-      }
+      if (const auto reason = failure([&] { prepared = model.prepare(calibration->aneUnits, false); }))
+        return gpuAloneServing(Kind::Unavailable, "its remembered share's split was not prepared: " + *reason + "; " +
+                                                      keep(refusal ? ane_ffn::refused(calibration) : *calibration));
       take(prepared, *calibration);
       return serve(std::move(prepared), calibration->aneUnits, calibration->minimumRows, "",
                    "set up as calibrated before");
@@ -296,12 +301,11 @@ AneFfnStart decide(const AneFfnModel &model, const AneFfnSetting &setting, Reque
     if (!minimumRows)
       return noGain("no chunk of the Neural Engine split beats it by enough, " + timed + " (calibrated in " +
                     seconds() + ")");
-    const ane_ffn::Calibration made{chosen, *minimumRows, chunks.gpu};
+    const Calibration made{chosen, *minimumRows, chunks.gpu, calibration ? calibration->refusals : 0};
     if (unprepared) {
-      model.remember(maxAneUnits, made);
       assumed = chosen;
       return gpuAloneServing(Kind::Unavailable, "its calibrated share's split was not prepared again: " + *unprepared +
-                                                    "; the next start sets it up as calibrated");
+                                                    "; " + keep(refusal ? ane_ffn::refused(calibration, made) : made));
     }
     take(prepared, made);
     AneFfnStart start = serve(std::move(prepared), chosen, *minimumRows, ": " + timed + " on the GPU alone",
@@ -312,7 +316,8 @@ AneFfnStart decide(const AneFfnModel &model, const AneFfnSetting &setting, Reque
     throw;
   } catch (const std::exception &error) {
     if ((cancelled && cancelled()) || !model.healthy()) throw;
-    return gpuAloneServing(Kind::Unavailable, error.what());
+    if (given || !dynamic_cast<const ane::Refused *>(&error)) return gpuAloneServing(Kind::Unavailable, error.what());
+    return gpuAloneServing(Kind::Unavailable, error.what() + ("; " + keep(ane_ffn::refused(calibration))));
   }
 }
 
