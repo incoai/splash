@@ -59,6 +59,16 @@ public:
   // by a median of 2-6% and a p90 of 5-10%, as routing varies; Qwen3.8-27B's
   // by 0.5% and 1.1%.
   static constexpr uint32_t kReplays = 3;
+  // Two replays that other work slowed can: then a point's median is past its
+  // fastest replay by what slowed them. A lane count's costs whose every
+  // median is at most kSteadySpread past its point's fastest replay are kept
+  // for later starts (Runtime::warmupDecodeBatch); others are measured again
+  // at the next start. A fifth is twice the 35B's p90 above: routing alone
+  // puts a median past its fastest replay by no more than its cycles differ.
+  // On a 36 GB M5 Max with nothing else on its GPU, the runtime oracle's
+  // tables were within 6.7-10.4% on Qwen3.6-35B-A3B and 1.2-6.3% on
+  // Qwen3.8-27B.
+  static constexpr double kSteadySpread = 0.2;
   // A step costs its price plus k times its passes over history: the sum
   // over its lanes of each lane's history, in thousands of tokens, times the
   // attention passes its rows take, a pass a draft's block of rows. The start
@@ -117,8 +127,9 @@ public:
   // The steps that measure a lane count's points, in the points' order.
   [[nodiscard]] std::vector<ops::StepRows> steps(uint32_t lanes) const;
   // A lane count's points' costs from its steps' replays: `replays[r][p]`
-  // the wall milliseconds of replay r of point p's step.
-  void measure(uint32_t lanes, std::span<const std::vector<double>> replays);
+  // the wall milliseconds of replay r of point p's step. Returns its spread:
+  // the most a point's median is past its fastest replay, a fraction of it.
+  double measure(uint32_t lanes, std::span<const std::vector<double>> replays);
   // Whether a lane count's points are measured.
   [[nodiscard]] bool measured(uint32_t lanes) const;
   // A measured lane count's points as a line of text, each point's last

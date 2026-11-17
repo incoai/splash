@@ -116,13 +116,14 @@ std::vector<ops::StepRows> StepCosts::steps(uint32_t lanes) const {
   return steps;
 }
 
-void StepCosts::measure(uint32_t lanes, std::span<const std::vector<double>> replays) {
+double StepCosts::measure(uint32_t lanes, std::span<const std::vector<double>> replays) {
   std::vector<Point> &points = table(lanes);
   if (replays.empty() || std::ranges::any_of(replays, [&](const std::vector<double> &replay) {
         return replay.size() != points.size() ||
                std::ranges::any_of(replay, [](double ms) { return !std::isfinite(ms) || ms <= 0.0; });
       }))
     throw std::invalid_argument("invalid step replays");
+  double spread = 0.0;
   for (size_t point = 0; point < points.size(); ++point) {
     std::vector<double> times;
     for (const std::vector<double> &replay : replays)
@@ -130,7 +131,9 @@ void StepCosts::measure(uint32_t lanes, std::span<const std::vector<double>> rep
     std::ranges::sort(times);
     const size_t half = times.size() / 2;
     points[point].milliseconds = times.size() % 2 ? times[half] : 0.5 * (times[half - 1] + times[half]);
+    spread = std::max(spread, points[point].milliseconds / times.front() - 1.0);
   }
+  return spread;
 }
 
 std::string StepCosts::text(uint32_t lanes) const {

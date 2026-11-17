@@ -404,8 +404,11 @@ void risingPoints() {
 }
 
 // A point's cost is the median of its replays: a replay five times as slow
-// moves no point, an even count's is the mean of its middle two, and a lane
-// count is measured once every point has a cost.
+// moves no point and leaves the measurement's spread none; two replays of a
+// point a tenth past its third, as a MoE target's routing moves them, leave
+// it steady (StepCosts::kSteadySpread), and two 30% past it, as other work
+// slows them, do not; an even count's is the mean of its middle two; and a
+// lane count is measured once every point has a cost.
 void replaysMedian() {
   StepCosts costs(kClasses, 64, false);
   for (uint32_t lanes = 1; lanes <= StepCosts::kLanes; ++lanes) {
@@ -415,11 +418,20 @@ void replaysMedian() {
     for (size_t point = 0; point < points; ++point)
       for (uint32_t replay = 0; replay < StepCosts::kReplays; ++replay)
         replays[replay][point] = (10.0 + double(point)) * (replay == point % StepCosts::kReplays ? 5.0 : 1.0);
-    costs.measure(lanes, replays);
+    const double spread = costs.measure(lanes, replays);
     require(costs.measured(lanes), "a measured lane count was not measured");
     for (size_t point = 0; point < points; ++point)
       require(costs.points(lanes)[point].milliseconds == 10.0 + double(point),
               "a slow replay moved the cost of a point of " + std::to_string(lanes) + " lanes");
+    require(spread == 0.0, "a slow replay spread a measurement of " + std::to_string(lanes) + " lanes");
+    for (const double slower : {1.1, 1.3}) {
+      std::vector<std::vector<double>> slowed(StepCosts::kReplays, std::vector<double>(points, 10.0));
+      slowed[1].back() = slowed[2].back() = 10.0 * slower;
+      const double apart = costs.measure(lanes, slowed);
+      require(std::abs(apart - (slower - 1.0)) < 1e-9 && (apart <= StepCosts::kSteadySpread) == (slower < 1.2),
+              "two replays " + std::to_string(slower) + " times their third's spread a measurement " +
+                  std::to_string(apart));
+    }
     costs.measure(lanes,
                   std::vector<std::vector<double>>{std::vector<double>(points, 4.0), std::vector<double>(points, 6.0)});
     require(costs.points(lanes).front().milliseconds == 5.0, "two replays' median is not their mean");

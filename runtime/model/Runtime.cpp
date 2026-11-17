@@ -4,6 +4,7 @@
 #include "model/RuntimeInstrumentation.hpp"
 #endif
 #include "AwakeClock.hpp"
+#include "StderrLine.hpp"
 #include "model/ExpertStore.hpp"
 #include "model/KvBlockCache.hpp"
 #include "model/KvHistoryStream.hpp"
@@ -36,6 +37,7 @@
 #include <cstdint>
 #include <cstring>
 #include <deque>
+#include <iomanip>
 #include <iterator>
 #include <limits>
 #include <list>
@@ -761,8 +763,12 @@ struct Runtime::Impl {
           if (5 + lanes * measuredLanePages(stepCosts->points(lanes).size()) > ExecutionLimits::warmupKvPages)
             throw std::logic_error("a lane count's step costs take more pages than the startup runway");
           const std::optional<std::string> line = value.recallStepCosts ? value.recallStepCosts(lanes) : std::nullopt;
-          if (line)
-            stepCosts->recall(lanes, *line);
+          if (!line)
+            continue;
+          stepCosts->recall(lanes, *line);
+          if (stepCosts->measured(lanes))
+            logLine("Decode step costs of ", lanes, lanes == 1 ? " lane" : " lanes",
+                    " as an earlier start measured them: ", *line);
         }
       }
     }
@@ -4247,7 +4253,7 @@ WarmupStepResult Runtime::warmupPrefill(uint32_t rows) {
 // along, so that no point always runs first after the prompts: the first
 // pass's first touch of a buffer or an expert's pages, and a cycle slowed by
 // other work on the GPU (an app's rendering), move no point.
-void Runtime::measureDecodeSteps(uint32_t width) {
+double Runtime::measureDecodeSteps(uint32_t width) {
   constexpr uint64_t firstId = std::numeric_limits<uint64_t>::max() - 120;
   const std::vector<ops::StepRows> steps = impl_->stepCosts->steps(width);
   const auto answer = static_cast<uint32_t>(steps.size()) * ExecutionLimits::targetVerifyRows;
@@ -4305,7 +4311,7 @@ void Runtime::measureDecodeSteps(uint32_t width) {
     throw;
   }
   impl_->forcedStep = forced;
-  impl_->stepCosts->measure(width, replays);
+  return impl_->stepCosts->measure(width, replays);
 }
 
 WarmupStepResult Runtime::warmupDecodeBatch(uint32_t width) {
@@ -4400,10 +4406,15 @@ WarmupStepResult Runtime::warmupDecodeBatch(uint32_t width) {
     throw;
   }
   // The steps' costs, which no earlier start of this model and build on this
-  // Mac measured and remembered, for later starts.
+  // Mac measured and remembered, for later starts where steady
+  // (StepCosts::kSteadySpread).
   if (impl_->stepCosts && !impl_->stepCosts->measured(width)) {
-    measureDecodeSteps(width);
-    if (impl_->rememberStepCosts)
+    const double spread = measureDecodeSteps(width);
+    const bool steady = spread <= StepCosts::kSteadySpread;
+    logLine("Decode step costs of ", width, width == 1 ? " lane" : " lanes", " measured, medians within ", std::fixed,
+            std::setprecision(1), 100.0 * spread, "% of their fastest replays",
+            steady ? "" : ", too far apart to keep for later starts", ": ", impl_->stepCosts->text(width));
+    if (steady && impl_->rememberStepCosts)
       impl_->rememberStepCosts(width, impl_->stepCosts->text(width));
   }
   return {"real B" + std::to_string(width) + " draft/verify/commit decode",
