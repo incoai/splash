@@ -288,15 +288,19 @@ void CacheDirectory::close() {
   unmark(kServing);
 }
 
+// A signal can interrupt the open and each fsync as it can the directories'.
 void CacheDirectory::mark(const char *name) {
-  Descriptor file(::openat(directory_, name, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC | O_NOFOLLOW,
-                           0600));
-  if (file.get() < 0 || ::fsync(file.get()) < 0 || ::fsync(directory_) < 0)
+  Descriptor file(retryInterrupted([&] {
+    return ::openat(directory_, name, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC | O_NOFOLLOW, 0600);
+  }));
+  if (file.get() < 0 || retryInterrupted([&] { return ::fsync(file.get()); }) < 0 ||
+      retryInterrupted([&] { return ::fsync(directory_); }) < 0)
     fail("mark cache directory");
 }
 
 void CacheDirectory::unmark(const char *name) {
-  if ((::unlinkat(directory_, name, 0) < 0 && errno != ENOENT) || ::fsync(directory_) < 0)
+  if ((::unlinkat(directory_, name, 0) < 0 && errno != ENOENT) ||
+      retryInterrupted([&] { return ::fsync(directory_); }) < 0)
     fail("unmark cache directory");
 }
 

@@ -31,7 +31,7 @@ using namespace std::chrono_literals;
 
 namespace cache_syscall_test {
 
-enum class Operation { mkdir, open, openat };
+enum class Operation { mkdir, open, openat, fsync };
 
 // Only this thread's exact temporary path is armed. Unarmed calls use libc;
 // no production injection interface or modified copy of CacheDirectory is used.
@@ -114,6 +114,17 @@ extern "C" int openat(int directory, const char *path, int flags, ...) {
   if (cache_syscall_test::inject(cache_syscall_test::Operation::openat, path, flags, mode))
     return -1;
   return real(directory, path, flags, mode);
+}
+
+// An fsync names no path: its fault names none either.
+extern "C" int fsync(int descriptor) {
+  using Function = int (*)(int);
+  static const auto real = reinterpret_cast<Function>(::dlsym(RTLD_NEXT, "fsync"));
+  if (!real)
+    std::abort();
+  if (cache_syscall_test::inject(cache_syscall_test::Operation::fsync, "", 0, 0))
+    return -1;
+  return real(descriptor);
 }
 
 namespace {
@@ -332,6 +343,54 @@ void testInterruptedLockOpen() {
     require(failed == (errors.size() > 8 ? EINTR : EIO) && fault.calls == std::min<size_t>(errors.size(), 8),
             "an open of the lock retried past its bound or another error than EINTR");
   }
+}
+
+// A signal can interrupt the open of a mark and the fsyncs that make marks
+// durable, which every start and close makes: each is retried alike, with the
+// mark's flags and mode, within the same bound.
+void testInterruptedMarks() {
+  using cache_syscall_test::Armed;
+  using cache_syscall_test::Fault;
+  using cache_syscall_test::Operation;
+  {
+    Root root;
+    auto directory = root.open();
+    Fault fault{Operation::openat, "serving", {EINTR, EINTR}};
+    Armed armed(fault);
+    directory->beginServing();
+    require(fault.calls == 3 && fault.flags == (O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC | O_NOFOLLOW) &&
+                fault.mode == 0600 && std::filesystem::exists(directory->path() / "serving"),
+            "an interrupted open of a mark was not retried as it was made");
+  }
+  // beginServing() makes two marks, each with an fsync of its file and one of
+  // the directory; close() removes three, the failed probation's too, with an
+  // fsync of the directory each.
+  for (const bool closing : {false, true}) {
+    Root root;
+    auto directory = root.open();
+    if (closing)
+      directory->beginServing();
+    Fault fault{Operation::fsync, "", {EINTR, EINTR}};
+    Armed armed(fault);
+    if (closing)
+      directory->close();
+    else
+      directory->beginServing();
+    require(fault.calls == (closing ? 5u : 6u) &&
+                std::filesystem::exists(directory->path() / "serving") == !closing,
+            "an interrupted fsync of a mark was not retried");
+  }
+  Root root;
+  auto directory = root.open();
+  Fault fault{Operation::fsync, "", std::vector<int>(16, EINTR)};
+  Armed armed(fault);
+  int failed = 0;
+  try {
+    directory->beginServing();
+  } catch (const std::system_error &error) {
+    failed = error.code().value();
+  }
+  require(failed == EINTR && fault.calls == 8, "an fsync of a mark retried past its bound");
 }
 
 // A root whose parents are missing, as a first start's ~/Library/Caches/Splash
@@ -599,6 +658,7 @@ int main() {
     testDirectoryRetryBoundAndSecurity();
     testInterruptedLockOpen();
     testRootParentsAreMade();
+    testInterruptedMarks();
     testOneProcessAtATime();
     testMarksFollowTheLastEnd();
     testStaleNamespacesGo();
