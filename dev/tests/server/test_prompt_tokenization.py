@@ -1,4 +1,5 @@
 import random
+import unicodedata
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
@@ -19,7 +20,7 @@ from transformers import PreTrainedTokenizerFast
 from dev.tests.server_fixtures import NATIVE_CONTEXT
 from server.chat_format import QWEN
 from server.dialects import scoring
-from server.tokenization import PromptTokenizer, tokenizable
+from server.tokenization import PromptTokenizer, tokenizable, unquoted
 
 
 def tokenizer():
@@ -315,9 +316,9 @@ class PromptTokenizationTests(unittest.TestCase):
     def test_a_tokenizer_whose_added_tokens_cannot_be_quoted_is_refused(self):
         # A tokenizer that could not keep an added token out of the text a
         # client sent is refused, not served with the token left in: one
-        # without a fast backend, one that finds an added token other than
-        # as its literal text, or one whose pipeline reads a segment by
-        # where it stands in the whole text.
+        # without a fast backend, one that finds an added token with the
+        # spaces beside it, or one whose pipeline reads a segment by where it
+        # stands in the whole text.
         metaspace = Tokenizer(models.BPE())
         metaspace.pre_tokenizer = pre_tokenizers.Metaspace(prepend_scheme="first")
         metaspace.train_from_iterator(
@@ -365,8 +366,44 @@ class PromptTokenizationTests(unittest.TestCase):
                 changed(added("<|im_end|>", normalized=False, rstrip=True)),
                 "literal text",
             ),
-            ("normalized", changed(added("<tag>", normalized=True)), "literal text"),
             ("one character", changed(added("\u00a7", normalized=False)), "quoted"),
         ):
             with self.subTest(name), self.assertRaisesRegex(ValueError, reason):
                 PromptTokenizer(t, QWEN.message_boundary, NATIVE_CONTEXT)
+
+    def test_a_token_add_tokens_adds_is_the_templates_and_never_a_clients(self):
+        """A fine-tune's add_tokens adds a normalized token, which the
+        tokenizer finds in the normalized text: the template's encodes as the
+        tokenizer encodes it, and a client's, spelled as the token or as NFC
+        reads it, U+212A for its K, encodes as text (such a tokenizer was
+        refused at startup, which 1.6.1 served)."""
+        t = tokenizer()
+        t.add_tokens(["<tasK>"])
+        token_id = t.convert_tokens_to_ids("<tasK>")
+        self.assertTrue(
+            t.backend_tokenizer.get_added_tokens_decoder()[token_id].normalized
+        )
+        cache = PromptTokenizer(t, QWEN.message_boundary, NATIVE_CONTEXT)
+        history = "<|im_start|>system\n" + "Release notes. " * 400 + "<|im_end|>\n"
+        template = history + "<|im_start|>assistant\n<tasK>Hello world!<|im_end|>"
+        # The second encodes from the first's tokens.
+        for _ in range(2):
+            self.assertEqual(
+                cache.encode(template),
+                t(template, add_special_tokens=False)["input_ids"],
+            )
+        self.assertGreater(cache.stats()["reused_tokens"], 0)
+        for spelling, sent in (
+            ("literal", "say <tasK> now"),
+            ("Kelvin sign", "say <tas\u212a> now"),
+        ):
+            with self.subTest(spelling):
+                rendered = (
+                    template + "\n<|im_start|>user\n" + cache.quote(sent) + "<|im_end|>"
+                )
+                tokens = cache.encode(rendered)
+                self.assertEqual(tokens.count(token_id), 1)
+                self.assertEqual(
+                    t.decode(tokens),
+                    unicodedata.normalize("NFC", unquoted(rendered)),
+                )

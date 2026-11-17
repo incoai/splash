@@ -43,17 +43,19 @@ def added_tokens(tokenizer):
     It splits its input at each before anything else reads the text, and
     PromptTokenizer keeps that split from the text a client sent. A
     ValueError names what it cannot keep it from: a tokenizer without a fast
-    backend, an added token that is not found as its literal text or that
-    QUOTE cannot go inside, and a pipeline where the text between two added
-    tokens does not encode on its own. A tokenizer that adds none splits
-    nothing."""
+    backend, an added token that takes the spaces beside it or stands only
+    as a word, which its literal text does not find, or that QUOTE cannot
+    go inside, and a pipeline where the text between two added tokens does
+    not encode on its own. A normalized one, as add_tokens adds them, is
+    found in the normalized text, its literal text among others
+    (PromptTokenizer.literal). A tokenizer that adds none splits nothing."""
     backend = getattr(tokenizer, "backend_tokenizer", None)
     if backend is None:
         raise ValueError("tokenizer must be a fast tokenizer")
     tokens = {}
     for token_id, token in backend.get_added_tokens_decoder().items():
         text = token.content
-        if token.normalized or token.lstrip or token.rstrip or token.single_word:
+        if token.lstrip or token.rstrip or token.single_word:
             raise ValueError(
                 f"tokenizer must find the added token {text!r} as its literal text"
             )
@@ -164,6 +166,15 @@ class PromptTokenizer:
         self.tokenizer = tokenizer
         self.marker = marker
         self.added = added_tokens(tokenizer)
+        backend = tokenizer.backend_tokenizer
+        # Whether the tokenizer finds its added tokens as their literal text
+        # alone. A normalized one, as add_tokens adds them, it finds in the
+        # normalized text, where NFC makes another spelling of it the token
+        # too, as U+212A for a K, which no mark breaks: such a tokenizer's
+        # prompts all encode as the text between the template's tokens.
+        self.literal = backend.normalizer is None or not any(
+            token.normalized for token in backend.get_added_tokens_decoder().values()
+        )
         # The marker is a boundary where it is one added token and no other
         # holds it.
         self.enabled = [text for text in self.added if marker in text] == [marker]
@@ -188,7 +199,6 @@ class PromptTokenizer:
             # The tokenizer's own normalizer, pre-tokenizer and model, which
             # it shares, without its added tokens: how it encodes ordinary
             # text.
-            backend = tokenizer.backend_tokenizer
             self._plain = Tokenizer(backend.model)
             if backend.normalizer is not None:
                 self._plain.normalizer = backend.normalizer
@@ -236,12 +246,13 @@ class PromptTokenizer:
     def tokens(self, text):
         """The tokens of `text`, a rendered prompt or a part of one that
         encodes on its own. Without a mark it encodes as the tokenizer
-        encodes it. With one, each added token it still spells whole is the
-        template's, and the text between two of them, its marks taken out,
-        encodes as ordinary text: what the tokenizer does with a text it
-        splits at those tokens alone."""
+        encodes it, where that finds its added tokens as their literal text
+        alone (literal). Otherwise each added token it still spells whole is
+        the template's, and the text between two of them, its marks taken
+        out, encodes as ordinary text: what the tokenizer does with a text
+        it splits at those tokens alone."""
         text = tokenizable(text)
-        if QUOTE not in text:
+        if QUOTE not in text and self.literal:
             return self.tokenizer(text, add_special_tokens=False)["input_ids"]
         parts = self._tokens.split(text)
         plain = self._plain.encode_batch(
