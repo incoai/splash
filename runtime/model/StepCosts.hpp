@@ -126,6 +126,13 @@ public:
   [[nodiscard]] std::span<const Point> points(uint32_t lanes) const;
   // The steps that measure a lane count's points, in the points' order.
   [[nodiscard]] std::vector<ops::StepRows> steps(uint32_t lanes) const;
+  // The KV pages of a lane of a measurement of `points` points
+  // (Runtime::measureDecodeSteps): its prompt's token, a verify block a
+  // point and one more.
+  static uint32_t lanePages(size_t points);
+  // Throws where a lane count's measurement, its lanes laid from page
+  // `first`, runs past the `runway` pages it is measured on.
+  void requireRunway(uint32_t first, uint32_t runway) const;
   // A lane count's points' costs from its steps' replays: `replays[r][p]`
   // the wall milliseconds of replay r of point p's step. Returns its spread:
   // the most a point's median is past its fastest replay, a fraction of it.

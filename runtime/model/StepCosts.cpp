@@ -116,6 +116,17 @@ std::vector<ops::StepRows> StepCosts::steps(uint32_t lanes) const {
   return steps;
 }
 
+uint32_t StepCosts::lanePages(size_t points) {
+  return static_cast<uint32_t>((1 + (points + 1) * kWideCap + SPLASH_TARGET_KV_BLOCK_TOKENS - 1) /
+                               SPLASH_TARGET_KV_BLOCK_TOKENS);
+}
+
+void StepCosts::requireRunway(uint32_t first, uint32_t runway) const {
+  for (uint32_t lanes = 1; lanes <= kLanes; ++lanes)
+    if (first + lanes * lanePages(table(lanes).size()) > runway)
+      throw std::logic_error("a lane count's step costs take more pages than the startup runway");
+}
+
 double StepCosts::measure(uint32_t lanes, std::span<const std::vector<double>> replays) {
   std::vector<Point> &points = table(lanes);
   if (replays.empty() || std::ranges::any_of(replays, [&](const std::vector<double> &replay) {

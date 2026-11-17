@@ -1089,8 +1089,9 @@ void stepsOfNoCost() {
 }
 
 // Tables of no classes, of classes not from one row or not rising, or of no
-// rows; replays of no point, of a point short, of a time that is not
-// positive; and lane counts outside a batch.
+// rows; a table whose measurement runs past the startup runway; replays of
+// no point, of a point short, of a time that is not positive; and lane
+// counts outside a batch.
 void invalidSteps() {
   for (const std::vector<uint32_t> &classes :
        {std::vector<uint32_t>{}, std::vector<uint32_t>{3, 9}, std::vector<uint32_t>{1, 9, 3}})
@@ -1099,6 +1100,16 @@ void invalidSteps() {
   // Four lanes of four rows hold their anchors alone.
   rejects([&] { StepCosts costs(kClasses, StepCosts::kLanes, false); }, "hold nothing past its lanes' anchors",
           "a table of the anchors alone was made");
+  // The startup runway's 64 pages from page 5 hold four lanes of 26 points,
+  // not of 27; a class every row makes 61 at four lanes, while a MoE
+  // target's table of kClasses fits.
+  require(5 + 4 * StepCosts::lanePages(26) <= 64 && 5 + 4 * StepCosts::lanePages(27) > 64,
+          "the runway holds other lanes than a measurement lays");
+  std::vector<uint32_t> everyRow;
+  for (uint32_t row = 1; row <= 64; ++row) everyRow.push_back(row);
+  rejects([&] { StepCosts(everyRow, 64, false).requireRunway(5, 64); }, "more pages than the startup runway",
+          "a table whose measurement runs past the startup runway was taken");
+  StepCosts(kClasses, 64, true).requireRunway(5, 64);
   StepCosts costs(kClasses, 64, false);
   const size_t points = costs.points(2).size();
   for (const std::vector<std::vector<double>> &replays :
