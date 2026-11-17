@@ -18,7 +18,7 @@
 // pins the bytes both sides agree on.
 namespace splash::protocol {
 
-inline constexpr uint16_t kProtocolVersion = 13;
+inline constexpr uint16_t kProtocolVersion = 14;
 // A frame is its header, the magic "SPLH", the u16 protocol version, the
 // u16 FrameType and the u64 payload length, then the payload.
 inline constexpr size_t kFrameHeaderBytes = 16;
@@ -344,6 +344,13 @@ struct DoneEvent {
   // engine's own: the SSD cache's quota, or memory a lone lane could not
   // grow past (engine::EngineEventSink::completed).
   bool bounded = false;
+  // With optionLogits only: log(sum(exp(logit))) over the whole vocabulary at
+  // that position, and its highest logits (at most
+  // ExecutionLimits::scoreTopTokens, descending), so a client can read
+  // full-vocabulary log probabilities and its options' probability mass.
+  double logNormalizer = 0.0;
+  std::vector<uint32_t> topTokenIds{};
+  std::vector<float> topLogits{};
 
   bool operator==(const DoneEvent &) const = default;
 };

@@ -186,11 +186,14 @@ LinearPlan Linear::decodePlan(const Projection &p, uint32_t lanes, LinearEpilogu
   return plan(decode({p.outputSize, p.inputSize}, lanes, epilogue), p, gate);
 }
 LinearPlan Linear::prefillPlan(const Projection &p, uint32_t rows, LinearEpilogue epilogue,
-                               uint32_t chunkRows) const {
-  const LinearWorkload w{{p.outputSize, p.inputSize}, rows, LinearPhase::Prefill, epilogue};
+                               uint32_t chunkRows, bool splitFree) const {
+  LinearWorkload w{{p.outputSize, p.inputSize}, rows, LinearPhase::Prefill, epilogue};
+  w.splitFree = splitFree;
   if (!chunkRows || chunkRows == rows) return plan(w, p);
   if (rows > chunkRows) throw std::invalid_argument("a prefill plan takes rows of its chunk");
-  const LinearPlan chunk = plan({w.matrix, chunkRows, LinearPhase::Prefill, epilogue}, p);
+  LinearWorkload whole{w.matrix, chunkRows, LinearPhase::Prefill, epilogue};
+  whole.splitFree = splitFree;
+  const LinearPlan chunk = plan(whole, p);
   LinearPlan part(w, chunk.configuration(), chunk.destination());
   part.rotated_ = chunk.rotated_;
   return part;
@@ -266,26 +269,28 @@ PreparedInput Linear::add(metal::CommandGraph &graph, LinearBuffers b,
 }
 
 void Linear::addPrefill(metal::CommandGraph &graph, metal::MetalBuffer input, const Projection &p,
-                        metal::MetalBuffer output, uint32_t rows, LinearScratch scratch, uint32_t chunkRows) const {
+                        metal::MetalBuffer output, uint32_t rows, LinearScratch scratch, uint32_t chunkRows,
+                        bool splitFree) const {
   add(graph, {.input = input, .output = output, .scratch = scratch}, p,
-      prefillPlan(p, rows, LinearEpilogue::None, chunkRows));
+      prefillPlan(p, rows, LinearEpilogue::None, chunkRows, splitFree));
 }
 void Linear::addPrefillResidual(metal::CommandGraph &graph, metal::MetalBuffer input, const Projection &p,
                                 metal::MetalBuffer residual, metal::MetalBuffer output, uint32_t rows,
-                                LinearScratch scratch, uint32_t chunkRows) const {
+                                LinearScratch scratch, uint32_t chunkRows, bool splitFree) const {
   add(graph, {.input = input, .output = output, .residual = residual, .scratch = scratch}, p,
-      prefillPlan(p, rows, LinearEpilogue::Residual, chunkRows));
+      prefillPlan(p, rows, LinearEpilogue::Residual, chunkRows, splitFree));
 }
 void Linear::addPrefillSwiGlu(metal::CommandGraph &graph, const SwiGluProjections &ffn,
                               const PrefillFfnBuffers &b, metal::MetalBuffer residual, metal::MetalBuffer output,
-                              uint32_t rows, uint32_t chunkRows) const {
-  const PreparedInput normalized = add(graph, {.input = b.normalized, .output = b.gateScratch, .scratch = b.scratch},
-                                       *ffn.gate, prefillPlan(*ffn.gate, rows, LinearEpilogue::None, chunkRows));
+                              uint32_t rows, uint32_t chunkRows, bool splitFree) const {
+  const PreparedInput normalized =
+      add(graph, {.input = b.normalized, .output = b.gateScratch, .scratch = b.scratch}, *ffn.gate,
+          prefillPlan(*ffn.gate, rows, LinearEpilogue::None, chunkRows, splitFree));
   add(graph,
       {.input = b.normalized, .output = b.intermediate, .gateScratch = b.gateScratch, .scratch = b.scratch,
        .prepared = normalized},
-      *ffn.up, prefillPlan(*ffn.up, rows, LinearEpilogue::UpWithGate, chunkRows));
-  addPrefillResidual(graph, b.intermediate, *ffn.down, residual, output, rows, b.scratch, chunkRows);
+      *ffn.up, prefillPlan(*ffn.up, rows, LinearEpilogue::UpWithGate, chunkRows, splitFree));
+  addPrefillResidual(graph, b.intermediate, *ffn.down, residual, output, rows, b.scratch, chunkRows, splitFree);
 }
 
 } // namespace splash::ops
