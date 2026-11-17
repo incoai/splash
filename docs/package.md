@@ -147,7 +147,8 @@ written and opened only once the server has taken its first message, which
 stays in the composer meanwhile as it was sent, Stop in Send's place. A message
 the server refuses, that never reaches it or that is stopped before it is taken
 changes no chat, and is in the composer again, or still, with why unless it was
-stopped, its chat open again where another was opened meanwhile. One that fails
+stopped, its chat open again where another was opened meanwhile. A quit keeps
+a later message in its chat, its answer stopped. One that fails
 after stays in its chat, its answer saying why. A chat
 takes the title the model sums its first exchange up
 in, asked in the background without thinking. The list puts the pinned chats

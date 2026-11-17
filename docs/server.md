@@ -247,7 +247,9 @@ connection, as the socket a killed server left behind does, and one its
 sandbox does not let it connect to. A socket that accepts a connection stays,
 as do one whose permissions refuse the server's user and a file of another
 kind, and the start is refused. So is a start that finds a symbolic link at
-`PATH` or at `PATH.lock`: the server follows neither. A sandbox's profile must
+`PATH` or at `PATH.lock`: the server follows neither. A link put at `PATH`
+while the server starts is followed by the bind, and the start is then
+refused: keep the socket in a directory only you write to. A sandbox's profile must
 let the server bind `PATH` and accept there, and write `PATH`, which it
 creates and removes, and `PATH.lock`; it may refuse the server a connection
 to `PATH`.
