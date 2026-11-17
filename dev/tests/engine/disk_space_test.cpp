@@ -301,9 +301,13 @@ void testFilesHoldWhatTheirSlotsCount() {
   }
   require(file->synchronize({})->wait(), "the tier's file did not synchronize");
   space.measure();
-  // The records are a header's block and a block of 32 records.
-  require(slots.size() == 32 && budget->usedBytes() == quota && space.heldBytes() >= quota &&
-              space.heldBytes() <= quota + kHostPageBytes,
+  // The files hold what the slots count, and the records a header's block and a block of 32
+  // records; their blocks, which the tier counts, hold at least that, and for a while APFS's can
+  // hold more (test::dataBytes).
+  const uint64_t data =
+      test::dataBytes(directory.path() / "kv.slots") + test::dataBytes(directory.path() / "kv.records");
+  require(slots.size() == 32 && budget->usedBytes() == quota && data >= quota && data <= quota + kHostPageBytes &&
+              space.heldBytes() >= data,
           "the tier's files hold other than what its slots count on the volume");
   file->seal();
 }

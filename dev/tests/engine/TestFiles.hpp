@@ -1,8 +1,10 @@
 #pragma once
 
 // Files of the weight preparation tests: a private temporary directory and
-// whole-file writes and reads that fail with the path they could not use.
+// whole-file writes and reads that fail with the path they could not use;
+// and of the SSD cache's tests, what a file holds on its volume.
 
+#include <fcntl.h>
 #include <unistd.h>
 
 #include <cerrno>
@@ -56,6 +58,31 @@ inline std::vector<uint8_t> readFile(const std::filesystem::path &path) {
   std::ifstream file(path, std::ios::binary);
   if (!file) throw std::runtime_error("cannot read " + path.string());
   return {std::istreambuf_iterator<char>(file), {}};
+}
+
+// What a file holds on its volume: the bytes of its data, the ranges up to
+// its end that are not holes. Not its blocks (st_blocks), which APFS lets
+// run past the data of a file written to for over a second until the file
+// closes: 16 MiB past it after 2.5 s of writes past a file's end, each
+// punching the hole before it, on the Studio (M5 Max).
+inline uint64_t dataBytes(const std::filesystem::path &path) {
+  const int descriptor = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+  if (descriptor < 0) throw std::system_error(errno, std::generic_category(), "cannot open " + path.string());
+  const off_t end = ::lseek(descriptor, 0, SEEK_END);
+  uint64_t bytes = 0;
+  for (off_t at = 0; at < end;) {
+    // ENXIO: no data from `at` to the end.
+    const off_t data = ::lseek(descriptor, at, SEEK_DATA);
+    if (data < 0) break;
+    at = ::lseek(descriptor, data, SEEK_HOLE);
+    if (at <= data) {
+      ::close(descriptor);
+      throw std::runtime_error("cannot measure the data of " + path.string());
+    }
+    bytes += static_cast<uint64_t>(at - data);
+  }
+  ::close(descriptor);
+  return bytes;
 }
 
 } // namespace splash::test
