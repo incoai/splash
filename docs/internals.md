@@ -1895,7 +1895,11 @@ rule, whose cached blocks no running request references stay in its free queue
 and go in LRU order as blocks are allocated, and SGLang's, whose radix cache
 locks only running requests' paths and evicts unlocked leaves; kept from starts
 and the host's pass, queued chains made sessions arriving together take turns
-(#758). Every state a reclaim takes from RAM, but a reply's opportunistic state
+(#758). The host's own pass takes certain reuse only while a start it refused
+waits, or at critical pressure: a pass for its margin alone, which other
+applications' growth asks for, keeps it with the SSD cache or without, so an
+idle conversation's next turn finds it in RAM. Every state a reclaim takes
+from RAM, but a reply's opportunistic state
 (below), is written to the SSD cache first while the tier takes the write, with
 the KV it restores through, so a resume point or a queued chain that goes keeps
 its SSD copy: its turn starts with a restore read rather than a prefill. With

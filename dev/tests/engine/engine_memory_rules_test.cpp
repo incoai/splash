@@ -550,8 +550,8 @@ void testAHostRefusedStartBesideALaneTakesAQueuedChain() {
     harness.runUntilIdle();
     harness.engine.submit(maskedForeground(1, std::vector<uint32_t>(64, 1)));
     harness.runUntil([&] { return harness.events.maskRequests.size() == 1; }, "the lane did not wait for its mask");
-    // The host's other memory leaves it 48 KiB short of its margin: the start it refuses, and the request whose
-    // chain it is, queued below it.
+    // The host's other memory leaves it 48 KiB past its margin, less than the start needs: the start it refuses, and
+    // the request whose chain it is, queued below it.
     test::FakeMemory &memory = *harness.memory;
     const uint64_t other = memory.hostBytes() - memory.total() - test::GovernorLimits{}.hostSpareReserveBytes;
     memory.setHost(other - kHostMarginBytes - 48 * 1024, MemoryPressure::Normal);
@@ -594,6 +594,73 @@ void testAHostRefusedStartBesideALaneTakesAQueuedChain() {
                 (!tiered || harness.tier->restores > restores),
             std::string("the queued request ") +
                 (tiered ? "did not restore its chain from the SSD cache" : "did not prefill its dropped chain again"));
+  }
+}
+
+// The host's pass for its margin alone, as other applications grow, with no start it refused waiting, keeps certain
+// reuse, here a queued request's chain, with the SSD cache or without: the queued request finds it in RAM. Only a
+// waiting start the host refused, or critical pressure, lets the pass take it.
+void testAHostPassForItsMarginAloneKeepsCertainReuse() {
+  for (const bool tiered : {true, false}) {
+    HarnessOptions options{.pages = 256, .memory = test::FakeMemory::Config{},
+                           .shape = [](Executor &shape) { shape.maximumLanes = 1; }};
+    if (tiered)
+      options.tier = test::TierOptions{.capacity = 256, .transferLimit = 8};
+    test::EngineHarness harness(std::move(options));
+    harness.model.laneFootprintBytes = 64 * 1024;
+    if (tiered) {
+      harness.model.keptTier = std::make_shared<test::OffloadControl>();
+      harness.model.keptTier->ready = true;
+    }
+    double pass = harness.now();
+    bool refused = false;
+    const auto step = [&] {
+      if (!harness.engine.commandInFlight())
+        harness.engine.collectLandings(harness.now());
+      if (harness.now() >= pass) {
+        static_cast<void>(harness.governor->controlPass(harness.now()));
+        pass = harness.now() + 500.0;
+      }
+      if (!harness.tick())
+        harness.advanceTo(harness.now() + 1.0);
+      if (harness.tier)
+        harness.tier->complete();
+      harness.model.restoreControl->ready = true;
+      refused = refused || harness.governor->ledger().hostRefusedWaitingBytes() != 0;
+    };
+    // The chain a queued request restores, its replay point at 1,024; the lane in service holds the model's one
+    // lane, which the queued request waits for, not memory.
+    const std::vector<uint32_t> chain(1025, 5);
+    harness.engine.submit(harness.request(10, chain));
+    harness.runUntilIdle();
+    harness.engine.submit(maskedForeground(1, std::vector<uint32_t>(64, 1)));
+    harness.runUntil([&] { return harness.events.maskRequests.size() == 1; }, "the lane did not wait for its mask");
+    std::vector<uint32_t> next = chain;
+    next.push_back(6);
+    EngineRequest queued = harness.request(2, next);
+    queued.deadlineMilliseconds = 1e9;
+    harness.engine.submit(std::move(queued));
+    // Other applications leave the host 1 MiB short of its margin.
+    test::FakeMemory &memory = *harness.memory;
+    const uint64_t other = memory.hostBytes() - memory.total() - test::GovernorLimits{}.hostSpareReserveBytes;
+    memory.setHost(other - kHostMarginBytes + (1ULL << 20), MemoryPressure::Normal);
+    for (const double end = harness.now() + 3000.0; harness.now() < end;)
+      step();
+    require(!refused, "the host refused a start");
+    // The lane ends and the host's other memory leaves: the queued request starts.
+    memory.setHost(other - 4 * kHostMarginBytes, MemoryPressure::Normal);
+    harness.engine.cancel(1);
+    for (int each = 0; each < 20'000 && !idle(harness.engine); ++each)
+      step();
+    require(idle(harness.engine), "the requests did not finish");
+    const auto at = std::ranges::find(harness.events.startIds, 2);
+    const uint32_t start =
+        at == harness.events.startIds.end() ? 0 : harness.events.starts[static_cast<size_t>(at - harness.events.startIds.begin())];
+    require(start == 1024 && (!tiered || (harness.tier->writes.empty() && harness.tier->restores == 0)),
+            std::string(tiered ? "with" : "without") +
+                " the SSD cache, the host's pass for its margin alone took a queued chain: its request started at " +
+                std::to_string(start) + ", writes " + std::to_string(harness.tier ? harness.tier->writes.size() : 0) +
+                ", restores " + std::to_string(harness.tier ? harness.tier->restores : 0));
   }
 }
 
@@ -1477,6 +1544,7 @@ std::span<const test::TestCase> rulesTests() {
       {"testAHostRefusedStartIsFreedForByThePass", testAHostRefusedStartIsFreedForByThePass},
       {"testAStartTakesAQueuedChainItsRequestRestoresLater", testAStartTakesAQueuedChainItsRequestRestoresLater},
       {"testAHostRefusedStartBesideALaneTakesAQueuedChain", testAHostRefusedStartBesideALaneTakesAQueuedChain},
+      {"testAHostPassForItsMarginAloneKeepsCertainReuse", testAHostPassForItsMarginAloneKeepsCertainReuse},
       {"testAStartRanksByTheWorkItHolds", testAStartRanksByTheWorkItHolds},
       {"testCopiesAheadForRegrowthStayWithinAUnit", testCopiesAheadForRegrowthStayWithinAUnit},
       {"testALaneAPlanLeavesOutWaitsForItsCommandNotOnItsClaim",

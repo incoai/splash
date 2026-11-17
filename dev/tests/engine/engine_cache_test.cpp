@@ -1280,7 +1280,9 @@ void testCertainReuseByClass() {
   for (const Case each : {Case{{.cls = ClaimClass::Start}, true, false, true},
                           Case{{.cls = ClaimClass::Optional, .requestId = 1, .timing = NeedTiming::Immediate}, true, true, false},
                           Case{{.cls = ClaimClass::Growth, .timing = NeedTiming::Immediate}, false, true, true},
-                          Case{{.cls = ClaimClass::InService}, true, false, true}}) {
+                          Case{{.cls = ClaimClass::InService}, true, false, true},
+                          Case{{.cls = ClaimClass::Host}, false, true, true},
+                          Case{{.cls = ClaimClass::Host, .forRefusedStart = true}, true, false, true}}) {
     Prefixes prefixes;
     for (const uint64_t block : prefixes.blocks)
       prefixes.cache.publishCompositeState(block, std::make_shared<TestState>(100), false);
@@ -5754,8 +5756,9 @@ void testPeekHasNoSideEffects() {
   require(units && observe() == before, "the walk changed the cache");
 }
 
-// The resume point and wanted chains come in their place to in-service work, a start and the host,
-// as vLLM and SGLang evict any block no running request holds; Growth is never offered them.
+// The resume point and wanted chains come in their place to in-service work, a start and the host's pass
+// for a start it refused, as vLLM and SGLang evict any block no running request holds; Growth and the
+// host's pass for its margin alone are never offered them.
 void testResumePointAndWantedChainsAreCertainReuse() {
   test::TestKvStorage storage{16, 100, 1};
   KvPool pool{storage, 16};
@@ -5776,8 +5779,8 @@ void testResumePointAndWantedChainsAreCertainReuse() {
   CacheProbe probe = cache.probe(wanted, {});
   cache.setWantedChains({probe.restoredChain()});
   // The units and pages a claim of the class is offered.
-  const auto offered = [&](ClaimClass cls, const Need &need) {
-    const VictimQuery query = test::query({.cls = cls}, need);
+  const auto offered = [&](const ClaimSpec &spec, const Need &need) {
+    const VictimQuery query = test::query(spec, need);
     std::pair<uint32_t, uint32_t> units;
     for (std::optional<engine::Victim> victim = cache.peek(query, nullptr); victim;
          victim = cache.peek(query, &*victim)) {
@@ -5787,15 +5790,18 @@ void testResumePointAndWantedChainsAreCertainReuse() {
     return units;
   };
   // Prompt 1's state (wanted), prompt 2's and prompt 3's (the resume point).
-  for (const ClaimClass cls : {ClaimClass::InService, ClaimClass::Start, ClaimClass::Host})
-    require(offered(cls, {.stateBuffers = 1}).first == 3,
-            "a claim of class " + std::to_string(static_cast<int>(cls)) +
+  for (const ClaimSpec spec : {ClaimSpec{.cls = ClaimClass::InService}, ClaimSpec{.cls = ClaimClass::Start},
+                               ClaimSpec{.cls = ClaimClass::Host, .forRefusedStart = true}})
+    require(offered(spec, {.stateBuffers = 1}).first == 3,
+            "a claim of class " + std::to_string(static_cast<int>(spec.cls)) +
                 " was not offered the resume point and the wanted chain's state");
+  require(offered({.cls = ClaimClass::Host}, {.stateBuffers = 1}).first == 1,
+          "the host's pass for its margin alone was offered certain reuse");
   // Growth leaves them: a page need's units free prompt 2's pages alone,
   // its state and then its leaves, and a device need's units every extent
   // but theirs.
-  require(offered(ClaimClass::Growth, {.stateBuffers = 1}).first == 1 &&
-              offered(ClaimClass::Growth, {.pages = 1}).second == 2,
+  require(offered({.cls = ClaimClass::Growth}, {.stateBuffers = 1}).first == 1 &&
+              offered({.cls = ClaimClass::Growth}, {.pages = 1}).second == 2,
           "growth was offered certain reuse, or not the rest");
   const ClaimSpec growth{.cls = ClaimClass::Growth, .timing = NeedTiming::Immediate};
   require(test::freeFromCache(cache, growth, {.pages = 2}).outcome == FreeOutcome::Met,
@@ -5807,7 +5813,7 @@ void testResumePointAndWantedChainsAreCertainReuse() {
               !cache.probe(other, {}).cachedTokens(),
           "growth's memory reclaims took the wanted chain or the resume point");
   cache.setWantedChains({});
-  require(offered(ClaimClass::Growth, {.stateBuffers = 1}).first == 1,
+  require(offered({.cls = ClaimClass::Growth}, {.stateBuffers = 1}).first == 1,
           "a chain no request waits for any more stayed of certain reuse");
 }
 
