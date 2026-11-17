@@ -1029,6 +1029,55 @@ void testAStartWaitingForALaneOfItsPriorityLeavesLowerLanesRunning() {
               failureDetail(spill.events));
 }
 
+// A Spill start beside a decoding Spill lane, the host's headroom above the
+// spare reserve at H, in the Flash-Next proportions: lane state 42 MiB, hot
+// block floor 390 MiB. Whether request 2 started beside lane 1, and the
+// least headroom above the reserve while both ran.
+std::pair<bool, int64_t> spillStartBesideALane(uint64_t headroomMiB) {
+  Spilling spill{16'384, true, 0, 200'000, Spilling::Extent{256}, {}, {}, true, FlashNextLanes::kPages};
+  spill.model.spilledReadFloorBytes = 390ULL << 20;
+  spill.model.stagingPageBytes = 36'864;
+  spill.model.laneFootprintBytes = 42ULL << 20;
+  spill.engine.submit(Spilling::prompt(1, 1, 2'000, 400));
+  spill.runUntil([&] { return spill.events.outputs[1].size() >= 4 && !spill.engine.commandInFlight(); },
+                 "lane 1 did not decode");
+  test::FakeMemory &memory = spill.host.memory;
+  const uint64_t reserve = test::GovernorLimits{}.hostSpareReserveBytes;
+  memory.setHost(memory.hostBytes() - memory.total() - reserve - (headroomMiB << 20), MemoryPressure::Normal);
+  static_cast<void>(spill.host.governor.evaluate());
+  spill.engine.submit(Spilling::prompt(2, 2, 1'000, 8));
+  int64_t least = std::numeric_limits<int64_t>::max();
+  bool beside = false;
+  for (int tick = 0; tick < 20'000 && spill.events.completedCount < 2 && spill.events.failures.empty(); ++tick) {
+    static_cast<void>(spill.engine.tick(spill.now++));
+    spill.tier.complete();
+    least = std::min(least, static_cast<int64_t>(memory.hostBytes() - memory.otherBytes() - memory.total()) -
+                                static_cast<int64_t>(reserve));
+    beside = beside || (std::ranges::count(spill.events.startIds, 2) != 0 && spill.events.outputs[1].size() < 400);
+  }
+  require(spill.events.completedCount == 2 && spill.events.failures.empty(),
+          "the Spill requests did not complete" + failureDetail(spill.events));
+  return {beside, least};
+}
+
+// A Spill start beside a lane in service is weighed whole, as placement
+// prices it: its state, its prompt's staging, its first command's pages, its
+// floor of the hot block cache and its floor's growth. Short of that, it
+// takes nothing and waits for the lane; with room for it, it starts beside
+// it. Either way the spare reserve stays whole. Weighed at its state and
+// floor alone, it started on 128 to 400 MiB, and its lane, in service, then
+// took up to 363 MiB of the reserve; with its first command's staging alone,
+// on 486 MiB, and took 5.
+void testASpillStartBesideALaneIsWeighedWhole() {
+  for (const auto &[headroomMiB, starts] : {std::pair{256u, false}, {500u, false}, {540u, true}, {1000u, true}}) {
+    const auto [beside, least] = spillStartBesideALane(headroomMiB);
+    require(beside == starts && least >= (starts ? 0 : int64_t{headroomMiB} << 20),
+            std::to_string(headroomMiB) + " MiB above the spare reserve: a Spill start " +
+                (beside ? "started" : "waited") + " beside a lane in service, the reserve then " +
+                std::to_string(least / (1 << 20)) + " MiB away");
+  }
+}
+
 // Lane demand counts the hot block floor a prefilling Spill lane waits for, and none once it holds
 // it.
 void testLaneDemandCountsTheHotFloorALaneWaitsFor() {
@@ -4671,6 +4720,7 @@ std::span<const test::TestCase> spillTests() {
       {"testALanesGrowthConvertsNoOtherLane", testALanesGrowthConvertsNoOtherLane},
       {"testAStartWaitingForALaneOfItsPriorityLeavesLowerLanesRunning",
        testAStartWaitingForALaneOfItsPriorityLeavesLowerLanesRunning},
+      {"testASpillStartBesideALaneIsWeighedWhole", testASpillStartBesideALaneIsWeighedWhole},
       {"testLaneDemandCountsTheHotFloorALaneWaitsFor", testLaneDemandCountsTheHotFloorALaneWaitsFor},
       {"testAStartRefusedMemoryCountsNoConversion", testAStartRefusedMemoryCountsNoConversion},
       {"testShortQuotaBoundsWaitsOrRefusesASpillStart", testShortQuotaBoundsWaitsOrRefusesASpillStart},

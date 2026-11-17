@@ -1056,9 +1056,13 @@ void testFirstRequestStartsThroughTheHostPause() {
     std::optional<uint64_t> headroom;  // none: the pause's
     uint32_t promptTokens = 0;
     bool starts = false;
+    uint32_t chainTokens = 0;  // the first request's prompt it begins with, in memory
   };
+  // A start takes its chain's pages in place: 24 KiB holds 200 tokens past
+  // 64 of the first's, not 200 of its own.
   for (const Case scenario : {Case{std::nullopt, 65, true}, Case{0, 65, false}, Case{64 * 1024, 65, true},
-                              Case{64 * 1024, 1000, false}}) {
+                              Case{64 * 1024, 1000, false}, Case{24 * 1024, 200, true, 64},
+                              Case{24 * 1024, 200, false}}) {
     const bool marginLeft = scenario.starts;
     test::TestKvStorage storage(64, 4096, 4);
     KvPool pool(storage, 0);
@@ -1091,7 +1095,9 @@ void testFirstRequestStartsThroughTheHostPause() {
       static_cast<void>(host.governor().evaluate());
     }
 
-    auto second = request(2, std::vector<uint32_t>(scenario.promptTokens, 2));
+    std::vector<uint32_t> prompt(scenario.chainTokens, 1);
+    prompt.resize(scenario.promptTokens, 2);
+    auto second = request(2, prompt);
     second.deadlineMilliseconds = 1'000'000;
     engine.submit(std::move(second));
     const CacheSnapshot before = resources.snapshot();

@@ -133,21 +133,21 @@ Engine::LaneDemand Engine::laneDemand(uint64_t starting) const {
   const SpillGeometry &geometry = config_.spill.geometry;
   const auto pages = [](uint64_t tokens) { return (tokens + KvCache::pageTokens - 1) / KvCache::pageTokens; };
   LaneDemand demand;
-  // The lanes that read spilled KV, those holding Index pages: those
-  // without their floor of the hot block cache yet lack it once for them
-  // all, in whole extents: floorExtents(2) for two, not 2 x floorExtents(1);
-  // and one in prefill the staging of its history through its next command.
-  // A Spill lane with none reads nothing spilled.
+  // The lanes that read spilled KV, those holding Index pages, and a start
+  // placed Spill (placement): those without their floor of the hot block
+  // cache yet lack it once for them all, in whole extents: floorExtents(2)
+  // for two, not 2 x floorExtents(1); and one in prefill the staging of its
+  // history through its next command, a start's through its prompt.
   std::vector<uint64_t> readers;
   for (const auto &[id, peer] : requests_) {
     if ((!peer.lane && id != starting) || peer.pendingEnd)
       continue;
     demand.bytes += peer.lane ? 0 : model_.startStateBytes();
-    const bool prefill = scheduler_.phase(id) == Phase::Prefill;
-    if (peer.lane && cache_.holdsIndexPages(id)) {
+    const bool prefill = !peer.lane || scheduler_.phase(id) == Phase::Prefill;
+    if (peer.lane ? cache_.holdsIndexPages(id) : peer.kvMode == KvMode::Spill) {
       readers.push_back(id);
-      if (prefill)
-        demand.bytes += model_.stagingShortfall(id, nextCommandPages(peer));
+      const uint64_t staged = peer.lane ? nextCommandPages(peer) : pages(peer.promptTokens);
+      demand.bytes += prefill ? model_.stagingShortfall(id, static_cast<uint32_t>(staged)) : 0;
     }
     const uint64_t projection = projectedTokens(peer);
     uint64_t held = peer.lane ? kvCapacity(id) : 0;
@@ -262,10 +262,12 @@ uint64_t Engine::copyDemandBytes() const {
 }
 
 uint32_t Engine::nextCommandPages(const Request &active) const {
-  const uint64_t id = active.request.id;
+  const bool restores = !active.lane && active.admissionProbe && !active.skipCache;
+  const uint64_t from = restores ? active.admissionProbe->restoredChain().size() * KvCache::pageTokens
+                                 : scheduler_.promptProcessed(active.request.id);
   const uint64_t end =
-      scheduler_.phase(id) == Phase::Prefill
-          ? std::min<uint64_t>(scheduler_.promptProcessed(id) + model_.commandLimits().commandRows, active.promptTokens)
+      !active.lane || scheduler_.phase(active.request.id) == Phase::Prefill
+          ? std::min<uint64_t>(from + model_.commandLimits().commandRows, active.promptTokens)
           : active.exactTokens.size() + model::ExecutionLimits::targetVerifyRows;
   return static_cast<uint32_t>((end + KvCache::pageTokens - 1) / KvCache::pageTokens);
 }

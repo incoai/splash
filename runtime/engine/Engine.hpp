@@ -648,8 +648,7 @@ private:
   // pages up to its projection beyond those it holds; a Spill lane's floor
   // up to its projection beyond its floor now, in prefill beyond its floor
   // at its next command's end, whose pages beyond those it holds count Full
-  // (nextCommandPages); none for a lane that ended. With `starting`, that
-  // request's start too: its state, and its chain's pages in memory as held.
+  // (nextCommandPages); none for a lane that ended; with `starting`, its start.
   struct LaneDemand final {
     uint32_t fullPages = 0;  // the Resident lanes' pages and the Spill lanes' next prefill commands'
     uint64_t bytes = 0;      // the Spill lanes' floors and the readers' hot block floors
@@ -1220,9 +1219,9 @@ private:
   // lanes' next commands add and what a pool's last growth lacked, one
   // growth unit at most (MemoryLedger::growthLackBytes).
   [[nodiscard]] uint64_t copyDemandBytes() const;
-  // The pages of KV through what a lane's next command reaches: in prefill
-  // as many rows as one command holds, within its prompt; in decode its
-  // verify rows.
+  // The pages of KV through what a lane's next command reaches: in prefill,
+  // as a start's first past the chain it restores, as many rows as one
+  // command holds, within its prompt; in decode its verify rows.
   [[nodiscard]] uint32_t nextCommandPages(const Request &request) const;
   // What the model's memory for the reads of spilled KV lacks once the lanes
   // hold Index pages: none for one that holds some already; else in prefill
