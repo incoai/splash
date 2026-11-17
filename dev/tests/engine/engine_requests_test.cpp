@@ -2033,6 +2033,178 @@ void testForegroundLaneCapacityDoesNotRotateStreamingPeers() {
             "a waiting foreground stream did not finish its full output");
 }
 
+void testExactForegroundTurnsSustainEightStreams() {
+  for (const bool refuse : {false, true}) {
+    test::EngineHarness h({.pages = 1024, .engine = {.foregroundTurnTokens = 32}});
+    h.model.exactContinuations = true; h.model.denyExactPark = refuse;
+    h.model.firstTokens = true; h.model.decodeFinishes = false; h.model.decodeTokens = 1;
+    for (uint64_t id = 1; id <= 8; ++id) {
+      auto input = request(id, std::vector<uint32_t>(40, static_cast<uint32_t>(id)));
+      input.priority = RequestPriority::Foreground; input.maxNewTokens = 192;
+      h.engine.submit(std::move(input));
+    }
+    h.runUntil([&] {
+      return h.events.outputs.size() == 8 && std::all_of(h.events.outputs.begin(), h.events.outputs.end(),
+          [](const auto &entry) { return entry.second.size() >= 32; });
+    }, "eight foreground owners did not receive sustained service");
+    require(refuse || h.events.completedCount == 0, "first four streams finished before waiters got sustained service");
+    h.runUntilIdle();
+    require(h.events.failedCount == 0 && h.events.completedCount == 8 && h.model.requests.empty(),
+            "foreground turns leaked requests or failed completion");
+    require(h.model.suspensions == 0 && h.engine.snapshot().resourceReplayTokens == 0 &&
+                h.model.exactParks == (refuse ? 0u : 4u) && (refuse || h.model.exactExchanges >= 8),
+            "foreground turns replayed output, nested banks or ignored refusal");
+    for (uint64_t id = 1; id <= 8; ++id)
+      require(h.events.outputs.at(id).size() == 192, "foreground turns lost or repeated tokens");
+  }
+}
+
+void testExactForegroundTurnsCancelAndExpireParkedOwners() {
+  for (const bool parked : {false, true}) {
+    test::EngineHarness h({.pages = 1024, .engine = {.foregroundTurnTokens = 4}});
+    h.model.exactContinuations = true; h.model.firstTokens = true;
+    h.model.decodeFinishes = false; h.model.decodeTokens = 1;
+    for (uint64_t id = 1; id <= 8; ++id) {
+      auto input = request(id, std::vector<uint32_t>(40, static_cast<uint32_t>(id)));
+      input.priority = RequestPriority::Foreground; input.maxNewTokens = 96;
+      h.engine.submit(std::move(input));
+    }
+    h.runUntil([&] { return h.engine.snapshot().scheduler.parked == 4; }, "four pairs did not form");
+    std::vector<uint64_t> cancel;
+    for (const auto &active : h.engine.snapshot().activeRequests)
+      if ((active.phase == Phase::Parked) == parked) cancel.push_back(active.id);
+    require(cancel.size() == 4, "paired cancellation did not select four owners");
+    for (auto id : cancel) h.engine.cancel(id);
+    h.runUntilIdle();
+    require(h.engine.snapshot().cancelled == 4 && h.events.failedCount == 0 && h.model.requests.empty() &&
+                h.engine.snapshot().scheduler.parked == 0, "paired terminal cleanup retained an owner");
+    for (const auto &[id, tokens] : h.events.outputs)
+      if (std::find(cancel.begin(), cancel.end(), id) == cancel.end())
+        require(tokens.size() == 96, "survivor did not finish its output");
+  }
+}
+
+void testExactForegroundTurnsDeadlineAndPressureRecovery() {
+  for (const bool expiry : {false, true}) {
+    test::EngineHarness h({.pages = 32, .engine = {.foregroundTurnTokens = 4}});
+    h.model.exactContinuations = true; h.model.firstTokens = true;
+    h.model.decodeFinishes = false; h.model.decodeTokens = 1;
+    h.model.kvGrowthBlocked = &h.storage.growthBlocked;
+    for (uint64_t id = 1; id <= 8; ++id) {
+      auto input = request(id, std::vector<uint32_t>(40, static_cast<uint32_t>(id)));
+      input.priority = RequestPriority::Foreground; input.maxNewTokens = 96;
+      h.engine.submit(std::move(input));
+    }
+    h.runUntil([&] { return h.engine.snapshot().scheduler.parked == 4; }, "recovery pairs did not form");
+    const auto before = h.events.outputs;
+    if (expiry) h.advanceTo(10001);
+    else h.storage.growthBlocked = true;
+    h.runUntilIdle();
+    require(h.model.requests.empty() && h.cache.snapshot().activeRequests == 0 && h.engine.snapshot().scheduler.parked == 0,
+            "deadline or replay recovery retained exact owners or KV references");
+    if (expiry) {
+      require(h.events.failedCount == 8 && h.events.outputs == before, "expired exact owners emitted again or survived");
+    } else {
+      require(h.events.failedCount == 0 && h.model.suspensions >= 2 && h.engine.snapshot().resourceReplayTokens > 0,
+              "pressure recovery: failed=" + std::to_string(h.events.failedCount) + " suspensions=" + std::to_string(h.model.suspensions) + " replay=" + std::to_string(h.engine.snapshot().resourceReplayTokens));
+      for (uint64_t id = 1; id <= 8; ++id)
+        require(h.events.outputs.at(id).size() == 96, "pressure recovery duplicated or shortened generation");
+    }
+  }
+}
+
+void testExactForegroundTurnsRespectPriorityAndColdBound() {
+  for (const bool cold : {false, true}) {
+    test::EngineHarness h({.pages = 2048, .engine = {.foregroundTurnTokens = 4}});
+    h.model.exactContinuations = true; h.model.firstTokens = true;
+    h.model.decodeFinishes = false; h.model.decodeTokens = 1;
+    for (uint64_t id = 1; id <= 8; ++id) {
+      auto input = request(id, std::vector<uint32_t>(id <= 4 || !cold ? 40 : 600, static_cast<uint32_t>(id)));
+      input.priority = id <= 4 || cold ? RequestPriority::Foreground : RequestPriority::Normal;
+      input.maxNewTokens = 64; h.engine.submit(std::move(input));
+    }
+    h.runUntil([&] { return h.events.outputs.contains(5); }, "bounded/priority admission never advanced");
+    require(h.events.completedCount >= 4 && h.model.exactParks == 0,
+            "a cold long prompt or lower-priority request borrowed a foreground slot");
+    h.runUntilIdle();
+    require(h.events.failedCount == 0 && h.events.completedCount == 8 && h.model.requests.empty(),
+            "ordinary fallback did not finish cleanly");
+  }
+}
+
+void testExactForegroundTurnsGovernorChargesAndPressureRecovery() {
+  for (const auto quantum : {0u, 4u}) for (const bool pressure : {false, true}) {
+    test::EngineHarness h({.pages = 256, .engine = {.foregroundTurnTokens = quantum},
+        .memory = test::FakeMemory::Config{}, .limits = {.limitBytes = 8 * 1024 * 1024},
+        .shape = [](Executor &model) {
+          model.exactContinuations = true; model.laneFootprintBytes = 65536; model.exactBankBytes = 65536;
+        }});
+    h.model.firstTokens = true; h.model.decodeFinishes = false; h.model.decodeTokens = 1;
+    for (uint64_t id = 1; id <= 4; ++id) {
+      auto input = request(id, std::vector<uint32_t>(40, static_cast<uint32_t>(id)));
+      input.priority = RequestPriority::Foreground; input.maxNewTokens = 128;
+      h.engine.submit(std::move(input));
+    }
+    h.runUntil([&] { return h.events.outputs.size() == 4 && h.events.outputs.at(4).size() >= 8; }, "governed streams did not start");
+    if (pressure) h.governor->setPressure(MemoryPressure::Critical);
+    for (uint64_t id = 5; id <= 8; ++id) {
+      auto input = request(id, std::vector<uint32_t>(40, static_cast<uint32_t>(id)));
+      input.priority = RequestPriority::Foreground; input.maxNewTokens = 128;
+      h.engine.submit(std::move(input));
+    }
+    if (pressure) {
+      for (uint32_t step = 0; step < 20; ++step) static_cast<void>(h.tick());
+      // The existing governor may suspend resident work under critical
+      // pressure too. Bound recovery and check ownership, not zero replay.
+      require(h.model.suspensions <= 8 && h.engine.snapshot().scheduler.parked <= 4,
+              "critical pressure caused unbounded replay or retained-bank population");
+      h.governor->setPressure(MemoryPressure::Normal);
+    }
+    if (quantum && !pressure)
+      h.runUntil([&] { return h.engine.snapshot().scheduler.parked == 4; }, "governed banks did not become available");
+    h.runUntilIdle();
+    require(h.events.failedCount == 0 && h.model.requests.empty() && h.cache.snapshot().activeRequests == 0,
+            "governed banks leaked state/KV or did not finish");
+    for (uint64_t id = 1; id <= 8; ++id)
+      require(h.events.outputs.at(id).size() == 128, "governed pressure changed completed output");
+  }
+}
+
+void testExactForegroundTurnsReserveBorrowerSlotAcrossCancellation() {
+  test::EngineHarness h({.pages = 1024, .engine = {.foregroundTurnTokens = 4}});
+  h.model.exactContinuations = true; h.model.firstTokens = true;
+  h.model.decodeFinishes = false; h.model.decodeTokens = 1;
+  uint64_t cancelled = 0, orphan = 0; uint32_t reserved = 0;
+  h.model.beginObserver = [&] {
+    if (h.model.lastBeginId != 7 || cancelled) return;
+    for (const auto &[_, owner] : h.model.requests)
+      if (owner.parked && owner.reservedBorrower == 7) reserved = owner.lane;
+    for (const auto &[id, owner] : h.model.requests) if (owner.resident && owner.lane < reserved) {
+      for (const auto &[other, peer] : h.model.requests) if (peer.parked && peer.lane == owner.lane) {
+        cancelled = id; orphan = other; break;
+      }
+      if (cancelled) break;
+    }
+    require(cancelled != 0, "slot-race fixture found no paired resident to cancel");
+    h.engine.cancel(cancelled);
+  };
+  for (uint64_t id = 1; id <= 8; ++id) {
+    auto input = request(id, std::vector<uint32_t>(40, static_cast<uint32_t>(id)));
+    input.priority = RequestPriority::Foreground; input.maxNewTokens = 256;
+    h.engine.submit(std::move(input));
+  }
+  h.runUntil([&] { return cancelled && h.model.requests.contains(7); }, "slot-race cancellation did not run");
+  require(h.model.requests.at(7).lane == reserved, "borrower stole the newly orphaned return slot");
+  h.runUntil([&] { return h.model.requests.contains(orphan) && h.model.requests.at(orphan).resident; },
+             "orphaned peer did not return after the unrelated cancellation");
+  require(!h.events.outputs.contains(7) || h.events.outputs.at(7).size() < 256, "orphan waited for an unrelated borrower to finish");
+  const auto stopped = h.events.outputs.contains(cancelled) ? h.events.outputs.at(cancelled) : std::vector<uint32_t>{};
+  h.runUntilIdle();
+  require(h.events.failedCount == 0 && h.engine.snapshot().cancelled == 1 && h.model.requests.empty() &&
+              (h.events.outputs.contains(cancelled) ? h.events.outputs.at(cancelled) : std::vector<uint32_t>{}) == stopped && h.cache.snapshot().activeRequests == 0,
+          "slot-race cleanup leaked an owner or emitted after cancellation");
+}
+
 // Decode checkpoints bound replay to a page's tail when available. Targets
 // without them still replay generation from prefill; a fairness policy must
 // distinguish the two rather than assume history always grows its resume cost.
@@ -2598,6 +2770,12 @@ std::span<const test::TestCase> requestsTests() {
   static constexpr test::TestCase kTests[] = {
       {"testCancelledStreamingContinuationDoesNotResumeOrEmitAgain", testCancelledStreamingContinuationDoesNotResumeOrEmitAgain},
       {"testForegroundLaneCapacityDoesNotRotateStreamingPeers", testForegroundLaneCapacityDoesNotRotateStreamingPeers},
+      {"testExactForegroundTurnsSustainEightStreams", testExactForegroundTurnsSustainEightStreams},
+      {"testExactForegroundTurnsCancelAndExpireParkedOwners", testExactForegroundTurnsCancelAndExpireParkedOwners},
+      {"testExactForegroundTurnsDeadlineAndPressureRecovery", testExactForegroundTurnsDeadlineAndPressureRecovery},
+      {"testExactForegroundTurnsRespectPriorityAndColdBound", testExactForegroundTurnsRespectPriorityAndColdBound},
+      {"testExactForegroundTurnsGovernorChargesAndPressureRecovery", testExactForegroundTurnsGovernorChargesAndPressureRecovery},
+      {"testExactForegroundTurnsReserveBorrowerSlotAcrossCancellation", testExactForegroundTurnsReserveBorrowerSlotAcrossCancellation},
       {"testStreamingSuspensionReplayCostTracksDecodeCheckpoints", testStreamingSuspensionReplayCostTracksDecodeCheckpoints},
       {"testSpeculativeCountsStayWithEachConcurrentRequest", testSpeculativeCountsStayWithEachConcurrentRequest},
       {"testImpossibleSpeculativeCountsFailOnlyTheirOwnLane", testImpossibleSpeculativeCountsFailOnlyTheirOwnLane},

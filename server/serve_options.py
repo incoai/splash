@@ -265,6 +265,16 @@ def parse_queue_size(value):
     return size
 
 
+def parse_foreground_turn_tokens(value):
+    try:
+        tokens = int(value)
+        if 0 <= tokens <= 4096:
+            return tokens
+    except ValueError:
+        pass
+    raise argparse.ArgumentTypeError("must be an integer in [0, 4096]")
+
+
 def parse_decode_share(value):
     try:
         share = float(value)
@@ -797,6 +807,17 @@ SERVE_OPTIONS = (
             help="requests admitted at once, running or waiting; more get 503 "
             f"(default: {DEFAULT_QUEUE_SIZE})",
         ),
+    ),
+    ServeOption(
+        "--foreground-turn-tokens",
+        "requests",
+        dict(
+            type=parse_foreground_turn_tokens,
+            default=None,
+            metavar="TOKENS",
+            help="foreground decode tokens per shared-lane turn; 0 disables (default: 0)",
+        ),
+        engine=EngineArgument("--foreground-turn-tokens"),
     ),
     ServeOption(
         "--decode-share",

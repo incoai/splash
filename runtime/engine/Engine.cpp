@@ -88,39 +88,8 @@ Engine::Engine(EngineConfig config, Cache &cache, model::Model &model,
 Engine::~Engine() { config_.governor->ledger().removeSource(victims_); }
 
 void Engine::submit(EngineRequest value) {
-  const auto outOfVocabulary = [&](uint32_t token) {
-    return token >= config_.vocabularySize;
-  };
-  if (value.prompt.size() + value.maxNewTokens > config_.maxContext) {
-    throw std::invalid_argument("request exceeds the context window");
-  }
-  if (std::any_of(value.prompt.begin(), value.prompt.end(), outOfVocabulary)) {
-    throw std::invalid_argument("prompt token is out of vocabulary");
-  }
-  if (std::any_of(value.scoreTokens.begin(), value.scoreTokens.end(),
-                  outOfVocabulary)) {
-    throw std::invalid_argument("score token is out of vocabulary");
-  }
-  if (value.thinkingBudget) {
-    if (const char *reason = value.thinkingBudget->unusable())
-      throw std::invalid_argument(reason);
-    if (std::any_of(value.thinkingBudget->end.begin(),
-                    value.thinkingBudget->end.end(), outOfVocabulary) ||
-        outOfVocabulary(value.thinkingBudget->alsoEnds))
-      throw std::invalid_argument("thinking end token is out of vocabulary");
-  }
-  if (!value.images.empty() && !config_.maxImagePatches) {
-    throw std::invalid_argument("this model is serving without vision");
-  }
-  // The protocol bounds an image by the most patches the vision encoder
-  // takes; the server's pixel cap may allow fewer.
-  if (std::any_of(value.images.begin(), value.images.end(),
-                  [&](const ImageSpan &image) {
-                    return image.grid().patches() > config_.maxImagePatches;
-                  })) {
-    throw std::invalid_argument(
-        "image has more patches than the server's pixel cap allows");
-  }
+  if (const auto error = value.modelView().validationError(config_.vocabularySize, config_.maxContext, config_.maxImagePatches))
+    throw std::invalid_argument(std::string(*error));
   const uint64_t id = value.id;
   // A request the protocol saw end may still be here, finalized, until the
   // next sweepTerminal; its id is free again.
@@ -358,6 +327,7 @@ bool Engine::tick(double now) {
   // The tick's host time runs from here, its first planning call, to the
   // submission of the command it plans (tickHostMilliseconds).
   const AwakeClock::time_point planning = AwakeClock::now();
+  progressed = rotateDecodedTurns() || progressed;
   progressed = admitQueued(now) || progressed;
   sweepTerminal(now);
   // Lanes that wait for memory on its way back cannot run before it lands;
@@ -629,6 +599,7 @@ std::optional<double> Engine::nextWakeupMilliseconds() const {
 
 EngineSnapshot Engine::snapshot() const {
   EngineSnapshot result = counters_;
+  result.foregroundTurnTokens = config_.foregroundTurnTokens;
   result.maximumContextTokens = config_.maxContext;
   result.scheduler = scheduler_.snapshot();
   result.resources = cache_.snapshot();
@@ -651,6 +622,60 @@ EngineSnapshot Engine::snapshot() const {
   }
   std::ranges::sort(result.activeRequests, {}, &ActiveRequestSnapshot::id);
   return result;
+}
+
+// A slot has at most one displaced owner. Independent pairs all return before
+// admission can lend another slot; a completed peer leaves a free-slot return.
+bool Engine::rotateDecodedTurns() {
+  if (!config_.foregroundTurnTokens) return false;
+  bool progressed = false;
+  for (auto &[id, parked] : requests_) {
+    if (parked.finalized || scheduler_.phase(id) != Phase::Parked) continue;
+    Request *peer = parked.exchangePeer ? &request(*parked.exchangePeer) : nullptr;
+    if (peer && (!peer->lane || peer->restore || peer->pendingEnd || peer->resourceWait.pending ||
+                 scheduler_.phase(peer->request.id) != Phase::Decode ||
+                 generatedTokens(*peer) - peer->turnStartedTokens < config_.foregroundTurnTokens)) continue;
+    const auto returned = model_.resumeExact(id, peer ? peer->request.id : 0);
+    if (!returned.granted()) continue;
+    if (peer) { peer->lane.reset(); scheduler_.parkDecode(peer->request.id); }
+    parked.lane = *returned.lane;
+    parked.turnStartedTokens = generatedTokens(parked);
+    scheduler_.returnDecode(id);
+    signalResourceProgress();
+    progressed = true;
+  }
+  return progressed;
+}
+
+bool Engine::lendForeground(Request &start, double now) {
+  if (!config_.foregroundTurnTokens || start.exchangePeer || start.request.priority != RequestPriority::Foreground ||
+      scheduler_.suspended(start.request.id) || start.request.constraint != ConstraintMode::None ||
+      !start.request.images.empty() || passCommand_.active() || drainingForRecovery()) return false;
+  const auto lookup = cache_.lookup(start.exactTokens, promptIdentity(start.request), start.admissionProbe ? &*start.admissionProbe : nullptr);
+  // Bound initial prefill work too: long cold prompts keep ordinary admission.
+  if (start.promptTokens - lookup.resumeBoundary() > 512) return false;
+  Request *victim = nullptr;
+  for (auto &[id, candidate] : requests_)
+    if (candidate.lane && !candidate.exchangePeer && !candidate.restore && !candidate.pendingEnd &&
+        !candidate.resourceWait.pending && scheduler_.phase(id) == Phase::Decode &&
+        candidate.request.priority == start.request.priority && candidate.request.constraint == ConstraintMode::None &&
+        candidate.request.images.empty() && generatedTokens(candidate) - candidate.turnStartedTokens >= config_.foregroundTurnTokens &&
+        (!victim || scheduler_.submissionOrder(id) < scheduler_.submissionOrder(victim->request.id))) victim = &candidate;
+  if (!victim) return false;
+  const auto physicalLane = *victim->lane;
+  const auto parked = allocate([&] { return model::ModelMemoryAdmission{.ok = vacateLane(*victim, true, true, start.request.id)}; },
+                               {.cls = ClaimClass::Optional, .requestId = start.request.id, .rank = rankOf(start),
+                                .timing = NeedTiming::Immediate, .priority = start.request.priority}, Refusal::Settled);
+  if (!parked.admission.granted()) return false;
+  // Model ownership moved; the active cache request and its KV pins stay live.
+  victim->exchangePeer = start.request.id;
+  start.exchangePeer = victim->request.id;
+  start.turnStartedTokens = generatedTokens(start);
+  if (!admit(start, now) || !start.lane || *start.lane != physicalLane) {
+    start.exchangePeer.reset(); victim->exchangePeer.reset();
+    static_cast<void>(rotateDecodedTurns());
+  }
+  return true;
 }
 
 bool Engine::admitQueued(double now) {
@@ -799,14 +824,11 @@ bool Engine::admitQueued(double now) {
     bool quota = active.resourceWait.diskQuota;
     if (resourceRetryReady(active, now)) {
       if (lanesFull) {
-        if (!laneSought) {
-          laneSought = true;
-          if (preemptBelow(active.request.priority, now)) {
-            // The suspension is this pass's progress, whatever the next admits.
-            static_cast<void>(admitQueued(now));
-            return true;
-          }
+        if (!std::exchange(laneSought, true) && preemptBelow(active.request.priority, now)) {
+          static_cast<void>(admitQueued(now));
+          return true;
         }
+        if (lendForeground(active, now)) { progressed = true; continue; }
         waitForLane(id, active);
       } else if (admit(active, now)) {
         // Recovery admits one request at a time.
@@ -1816,6 +1838,7 @@ uint64_t Engine::completedTokens(const Request &active) const {
   case Phase::Prefill:
     return scheduler_.promptProcessed(id);
   case Phase::Decode:
+  case Phase::Parked:
   case Phase::WaitingMask:
     return active.exactTokens.size();
   default:
@@ -2198,8 +2221,9 @@ void Engine::finishFailure(Request &active, LaneEnd end) {
   release(active);
 }
 
-void Engine::vacateLane(Request &active, bool keepContinuation) {
+bool Engine::vacateLane(Request &active, bool keepContinuation, bool exact, uint64_t borrower) {
   const uint64_t id = active.request.id;
+  if (exact && !model_.suspend(id, model::SuspensionKind::Exact, borrower).granted()) return false;
   // An ended request whose prompt rendered an earlier reply back keeps its
   // own reply's last state (Cache::keepReply), which a reclaim then writes
   // as any checkpoint: its conversation renders replies back, as agent
@@ -2216,12 +2240,12 @@ void Engine::vacateLane(Request &active, bool keepContinuation) {
   if (passCommand_.holds(id))
     settleEnded(passCommand_.yield());
   discardPendingStateBoundaries(active);
-  if (keepContinuation)
-    model_.suspend(id);
-  else
-    model_.end(id);
-  cache_.endRequest(id);
+  if (keepContinuation && !exact) model_.suspend(id);
+  else if (!keepContinuation) model_.end(id);
+  if (!exact) cache_.endRequest(id);
   active.lane.reset();
+  if (exact) scheduler_.parkDecode(id);
+  return true;
 }
 
 void Engine::release(Request &active) {
@@ -2229,7 +2253,11 @@ void Engine::release(Request &active) {
   // An ended request holds no claim.
   active.claim.reset();
   active.maskRequestedMilliseconds.reset();
-  if (active.lane || scheduler_.suspended(active.request.id)) {
+  if (active.exchangePeer) {
+    request(*active.exchangePeer).exchangePeer.reset();
+    active.exchangePeer.reset();
+  }
+  if (active.lane || scheduler_.suspended(active.request.id) || scheduler_.parked(active.request.id)) {
     // A resident lane gives its memory back: what failed for want of it may
     // fit now, so the recovery drain ends and the next attempt finds out.
     if (active.lane)

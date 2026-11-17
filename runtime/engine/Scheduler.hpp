@@ -22,6 +22,7 @@ enum class Phase : uint8_t {
   Prefill,
   Decode,
   WaitingMask,
+  Parked,
   Completed,
   Cancelled,
   Failed,
@@ -98,6 +99,7 @@ struct SchedulerSnapshot final {
   uint32_t prefilling = 0;
   uint32_t decoding = 0;
   uint32_t waitingMask = 0;
+  uint32_t parked = 0;
   uint32_t terminal = 0;
   uint64_t prefillBatches = 0;
   // The prefill commands' rows, a command's with its first pass (the
@@ -160,6 +162,8 @@ public:
   void suspendForResources(uint64_t requestId);
   void resumeFromResources(uint64_t requestId, uint32_t alreadyProcessed,
                            uint32_t replayTokens);
+  void parkDecode(uint64_t requestId);
+  void returnDecode(uint64_t requestId);
   void maskReady(uint64_t requestId);
   void cancel(uint64_t requestId);
   // Ends a request outside a command's completion, as at its length.
@@ -239,19 +243,22 @@ public:
   // phase keeps it until remove(), so the engine can end the request's
   // continuation.
   [[nodiscard]] bool suspended(uint64_t requestId) const;
+  [[nodiscard]] bool parked(uint64_t requestId) const;
   // The request's place in submission order.
   [[nodiscard]] uint64_t submissionOrder(uint64_t requestId) const;
   [[nodiscard]] uint32_t promptProcessed(uint64_t requestId) const;
   [[nodiscard]] SchedulerSnapshot snapshot() const noexcept;
 
 private:
+  void setAdmissionPhase(uint64_t id, Phase phase);
+  void terminate(uint64_t id, Phase phase);
   struct Request final {
     RequestSpec spec;
     Phase phase = Phase::Queued;
     uint32_t promptProcessed = 0;
     // Set by suspendForResources: the request comes back through
     // resumeFromResources, never through resourcesReady.
-    bool suspended = false;
+    std::optional<model::SuspensionKind> suspension;
     DecodeStage decodeStage = DecodeStage::Regular;
     uint64_t order = 0;
     uint64_t lastDecodeDispatch = 0;

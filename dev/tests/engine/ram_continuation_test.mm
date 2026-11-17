@@ -362,7 +362,7 @@ void exchangeCases(RuntimeResources &resources, model::Runtime &runtime) {
   require(!refused.granted() && runtime.actualRuntimeMemory().stateActualAllocatedBytes == charged,
           "refused exchange bank detached or allocated the resident state");
   equal(savedVictim, state(runtime, context.stateStorage, 0));
-  require(runtime.prepareDecodedExchange(id(0)).granted(), "exchange scratch bank refused");
+  require(static_cast<model::Model &>(runtime).suspend(id(0), model::SuspensionKind::Exact).granted(), "exchange scratch bank refused");
   require(context.stateStorage.metadata(0).requestId == 0, "prepared exchange retained its lane");
   begin(4, 0);
   static_cast<void>(decode(4));
@@ -389,7 +389,7 @@ void exchangeCases(RuntimeResources &resources, model::Runtime &runtime) {
   governor.setPressure(MemoryPressure::Critical);
   StateAdmission restored;
   allocationFailureAfter = 0;
-  try { restored = runtime.exchangeDecodedRequests(id(0), id(4)); }
+  try { restored = static_cast<model::Model &>(runtime).resumeExact(id(0), id(4)); }
   catch (...) { allocationFailureAfter = -1; throw; }
   const bool noHostAllocation = allocationFailureAfter == 0;
   allocationFailureAfter = -1;
@@ -561,6 +561,37 @@ void eightOwnerExchangeCases(RuntimeResources &resources, model::Runtime &runtim
     require(!context.stateStorage.metadata(lane).assigned() && (!context.blockCache || !context.blockCache->holdsLane(lane)),
             "eight-owner cancellation retained running state or floors");
   std::cout << "eight_owner_exchange=PASS banks=4 owners=8 switches=8 sampled_control_parity=1 allocation_free=1 cancellation=1\n";
+}
+
+void reservedSlotCases(RuntimeResources &resources, model::Runtime &runtime) {
+  auto context = resources.modelContext(); auto &pool = resources.kvPool();
+  std::vector<uint32_t> prompt(40, 11);
+  auto acquired = pool.acquirePages(16); require(acquired.granted(), "reservation KV refused");
+  auto pages = std::move(acquired.pages); for (auto p : pages) pool.clearPage(p);
+  const auto request = [&](uint64_t id) {
+    EngineRequest r; r.id = id; r.prompt = prompt; r.maxNewTokens = 4096;
+    r.flags = RequestIgnoreEndOfSequence; r.sampling = {.temperature = 0.7F, .seed = 47}; return r;
+  };
+  runtime.beginColdRequest(request(1501).modelView(), 3);
+  static_cast<void>(step(runtime, 1501, 0, pages, prompt));
+  static_cast<void>(step(runtime, 1501, prompt.size(), pages));
+  const auto saved = state(runtime, context.stateStorage, 3);
+  model::Model &model = runtime;
+  require(model.suspend(1501, model::SuspensionKind::Exact, 1503).granted(), "reserved bank refused");
+  const auto borrowed = model.begin(request(1503).modelView());
+  require(borrowed.granted() && *borrowed.lane == 3, "borrower took a lower free slot outside its bank");
+  runtime.end(1503);
+  for (uint64_t id = 1504; id <= 1506; ++id) {
+    const auto admission = model.begin(request(id).modelView());
+    require(admission.granted() && *admission.lane == id - 1504, "ordinary admission stole a bank slot");
+  }
+  require(!model.begin(request(1503).modelView()).granted(), "consumed borrower id retained a stale reservation");
+  const auto restored = model.resumeExact(1501);
+  require(restored.granted() && *restored.lane == 3, "orphaned bank could not return beside unrelated admissions");
+  equal(saved, state(runtime, context.stateStorage, 3));
+  for (uint64_t id : {1501, 1504, 1505, 1506}) runtime.end(id);
+  for (auto p : pages) pool.releasePage(p, false);
+  std::cout << "reserved_slot=PASS preferred_slot=3 unrelated_admission_blocked=1 stale_lease_blocked=1 exact_return=1\n";
 }
 
 void run(const char *metallib) {
@@ -974,6 +1005,7 @@ void run(const char *metallib) {
       runtime->end(505);
       exchangeCases(*resources, *runtime);
       eightOwnerExchangeCases(*resources, *runtime);
+      reservedSlotCases(*resources, *runtime);
       for (uint32_t lane = 0; lane < model::ExecutionLimits::maximumBatchWidth; ++lane)
         require(!storage.metadata(lane).assigned(), "continuation test retained an active lane");
       for (const auto *pages : {&baselinePages, &parkedPages, &intruderPages})

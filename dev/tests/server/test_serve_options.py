@@ -89,6 +89,11 @@ OPTIONS = {
         {effort: effort for effort in REASONING_EFFORTS},
         ("", "turbo", "XHIGH"),
     ),
+    "--foreground-turn-tokens": values(
+        "--foreground-turn-tokens",
+        {"0": 0, "32": 32, "4096": 4096},
+        ("", "-1", "4097", "1.5", "nan"),
+    ),
     "--thinking-token-budget": values(
         "--thinking-token-budget", {"0": 0, "4096": 4096}, ("-1", "1.5", "many")
     ),

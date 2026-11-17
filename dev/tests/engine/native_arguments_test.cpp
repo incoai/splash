@@ -412,6 +412,18 @@ void testARelaunchKeepsItsFirstEnginesMaxContext() {
           "a relaunch of a --max-context within the native window lost it, or was served with YaRN");
 }
 
+void testForegroundTurns() {
+  const ModelDirectory model;
+  for (const auto tokens : {0u, 32u, 4096u})
+    require(parse(model, {"auto", "auto", "--foreground-turn-tokens", std::to_string(tokens)}).foregroundTurnTokens == tokens,
+            "foreground turn quantum was not preserved");
+  require(parse(model, {"auto", "auto", "--foreground-turn-tokens", "32", "--foreground-turn-tokens", "0"}).foregroundTurnTokens == 0,
+          "a repeated zero did not disable foreground turns");
+  for (const auto value : {"", "-1", "4097", "1.5", "nan"})
+    rejects([&] { static_cast<void>(parse(model, {"auto", "auto", "--foreground-turn-tokens", value})); },
+            "foreground-turn-tokens", "invalid foreground turn quantum accepted");
+}
+
 int main(int argc, char **argv) {
   if (argc != 3) {
     std::cerr << "usage: " << argv[0] << " native_command_golden.txt MODEL_CONFIGS\n";
@@ -420,6 +432,7 @@ int main(int argc, char **argv) {
   modelConfigs = argv[2];
   try {
     testServerCommandLines(argv[1]);
+    testForegroundTurns();
     testNeuralEngine();
     testInt8Activations();
     testVerifyRows();

@@ -12,40 +12,29 @@ namespace splash::engine {
 namespace {
 
 template <typename T>
-bool parsePositive(std::string_view value, T &result) {
+bool parseInteger(std::string_view value, T &result, bool allowZero = false) {
   const char *end = value.data() + value.size();
   auto parsed = std::from_chars(value.data(), end, result);
-  return parsed.ec == std::errc{} && parsed.ptr == end && result != 0;
+  return parsed.ec == std::errc{} && parsed.ptr == end && (allowZero || result != 0);
 }
 
-uint64_t parseMaxMemory(std::string_view value) {
-  if (value == "auto")
-    return 0;
-  uint64_t result = 0;
-  if (!parsePositive(value, result))
-    throw UsageError("MAX_MEMORY_BYTES must be auto or a positive integer");
+template <typename T>
+T parseAutoPositive(std::string_view value, const char *error) {
+  if (value == "auto") return 0;
+  T result = 0;
+  if (!parseInteger(value, result)) throw UsageError(error);
   return result;
 }
 
-// Whether `value` is a context of 1 to `most` tokens, which `result` then
-// holds.
-bool parseContext(std::string_view value, uint32_t most, uint32_t &result) {
-  return parsePositive(value, result) && result <= most;
-}
-
-// MAX_CONTEXT, zero for auto; the model bounds it (model::servedFor).
-uint32_t parseMaxContext(std::string_view value) {
-  if (value == "auto")
-    return 0;
-  uint32_t result = 0;
-  if (!parsePositive(value, result))
-    throw UsageError("MAX_CONTEXT must be auto or a positive integer");
-  return result;
+bool parseChoice(std::string_view option, std::string_view value, std::string_view yes, std::string_view no) {
+  if (value == yes) return true;
+  if (value == no) return false;
+  throw UsageError(std::string(option) + " requires " + std::string(yes) + " or " + std::string(no));
 }
 
 uint32_t parseMaxImagePatches(std::string_view value) {
   uint32_t result = 0;
-  if (!parsePositive(value, result) || result % 4 ||
+  if (!parseInteger(value, result) || result % 4 ||
       result > ops::kMaximumImagePatches)
     throw UsageError("--max-image-patches requires a positive multiple of 4 "
                      "up to " + std::to_string(ops::kMaximumImagePatches));
@@ -82,7 +71,7 @@ StreamedSetting parseStreamedSetting(std::string_view option, std::string_view v
   if (value == "off")
     return {StreamedSetting::Mode::Off, 0};
   StreamedSetting result{StreamedSetting::Mode::Size, 0};
-  if (!parsePositive(value, result.bytes))
+  if (!parseInteger(value, result.bytes))
     throw UsageError(std::string(option) + " requires a positive byte count, auto or off");
   return result;
 }
@@ -123,7 +112,7 @@ NativeArguments parseNativeArguments(int argc, const char *const *argv) {
   if (next < argc && !std::string_view(argv[next]).starts_with("--")) {
     const std::string_view quota(argv[next++]);
     result.maxCacheDisk = {};
-    if (quota != "0" && !parsePositive(quota, result.maxCacheDisk.bytes))
+    if (quota != "0" && !parseInteger(quota, result.maxCacheDisk.bytes))
       throw UsageError("MAX_CACHE_DISK_BYTES must be a nonnegative integer");
   }
   // Options follow as --name value pairs; a missing value fails its check.
@@ -131,28 +120,22 @@ NativeArguments parseNativeArguments(int argc, const char *const *argv) {
     const std::string_view option(argv[next]);
     const std::string_view value(next + 1 < argc ? argv[next + 1] : "");
     if (option == "--kv-format") {
-      if (value != "int8" && value != "bf16")
-        throw UsageError("--kv-format requires int8 or bf16");
-      result.kvFormat = value == "int8" ? kv::Format::Int8 : kv::Format::BFloat16;
+      result.kvFormat = parseChoice(option, value, "int8", "bf16") ? kv::Format::Int8 : kv::Format::BFloat16;
     } else if (option == "--state-format") {
-      if (value != "fp32" && value != "bf16")
-        throw UsageError("--state-format requires fp32 or bf16");
-      result.stateFormat =
-          value == "fp32" ? ops::GdnStateFormat::Float32 : ops::GdnStateFormat::BFloat16;
+      result.stateFormat = parseChoice(option, value, "fp32", "bf16") ? ops::GdnStateFormat::Float32 : ops::GdnStateFormat::BFloat16;
     } else if (option == "--cached-states") {
-      if (value != "int8" && value != "exact")
-        throw UsageError("--cached-states requires int8 or exact");
-      result.exactCachedStates = value == "exact";
+      result.exactCachedStates = !parseChoice(option, value, "int8", "exact");
+    } else if (option == "--foreground-turn-tokens") {
+      if (!parseInteger(value, result.foregroundTurnTokens, true) || result.foregroundTurnTokens > 4096)
+        throw UsageError("--foreground-turn-tokens requires an integer in [0, 4096]");
     } else if (option == "--decode-share") {
       result.decodeShare = parseDecodeShare(value);
     } else if (option == "--max-image-patches") {
       result.maxImagePatches = parseMaxImagePatches(value);
     } else if (option == "--persistent-cache") {
-      if (value != "on" && value != "off")
-        throw UsageError("--persistent-cache requires on or off");
-      result.persistentCache = value == "on";
+      result.persistentCache = parseChoice(option, value, "on", "off");
     } else if (option == "--max-cache-disk-writes") {
-      if (value != "0" && !parsePositive(value, result.maxCacheDiskWritesBytes))
+      if (value != "0" && !parseInteger(value, result.maxCacheDiskWritesBytes))
         throw UsageError("--max-cache-disk-writes requires a nonnegative integer byte count");
     } else if (option == "--cache-dir") {
       if (value.empty())
@@ -161,16 +144,14 @@ NativeArguments parseNativeArguments(int argc, const char *const *argv) {
     } else if (option == "--idle-release") {
       result.idleReleaseSeconds = parseIdleRelease(value);
     } else if (option == "--idle-sleep") {
-      if (value != "prevent" && value != "allow")
-        throw UsageError("--idle-sleep requires prevent or allow");
-      result.preventIdleSleep = value == "prevent";
+      result.preventIdleSleep = parseChoice(option, value, "prevent", "allow");
     } else if (option == "--ple-memory") {
       result.pleMemory = parseStreamedSetting(option, value);
     } else if (option == "--expert-memory") {
       result.expertMemory = parseStreamedSetting(option, value);
     } else if (option == "--sparse-kv-memory") {
       uint64_t bytes = 0;
-      if (value != "auto" && !parsePositive(value, bytes))
+      if (value != "auto" && !parseInteger(value, bytes))
         throw UsageError("--sparse-kv-memory requires a positive byte count or auto");
       result.sparseKvMemory = bytes ? std::optional<uint64_t>(bytes) : std::nullopt;
     } else if (option == "--kv-spill") {
@@ -178,21 +159,13 @@ NativeArguments parseNativeArguments(int argc, const char *const *argv) {
         throw UsageError("--kv-spill requires always");
       result.kvSpillAlways = true;
     } else if (option == "--kv-window-trim") {
-      if (value != "on" && value != "off")
-        throw UsageError("--kv-window-trim requires on or off");
-      result.kvWindowTrim = value == "on";
+      result.kvWindowTrim = parseChoice(option, value, "on", "off");
     } else if (option == "--ane") {
-      if (value != "on" && value != "off")
-        throw UsageError("--ane requires on or off");
-      result.neuralEngine = value == "on";
+      result.neuralEngine = parseChoice(option, value, "on", "off");
     } else if (option == "--activations") {
-      if (value != "auto" && value != "bf16")
-        throw UsageError("--activations requires auto or bf16");
-      result.int8Activations = value == "auto" ? ops::Int8Activations::On : ops::Int8Activations::Off;
+      result.int8Activations = parseChoice(option, value, "auto", "bf16") ? ops::Int8Activations::On : ops::Int8Activations::Off;
     } else if (option == "--verify-rows") {
-      if (value != "auto" && value != "all")
-        throw UsageError("--verify-rows requires auto or all");
-      result.verifyRows = value == "all" ? model::VerifyRows::All : model::VerifyRows::Auto;
+      result.verifyRows = parseChoice(option, value, "auto", "all") ? model::VerifyRows::Auto : model::VerifyRows::All;
     } else if (option == "--relaunch-context") {
       relaunchContext = value;
     } else {
@@ -207,7 +180,7 @@ NativeArguments parseNativeArguments(int argc, const char *const *argv) {
     throw UsageError("--cache-dir requires --persistent-cache on");
   result.modelRoot = requireModelRoot(argv[2]);
   model::ModelDescriptor inspected = inspectModel(result.modelRoot);
-  result.maxContext = parseMaxContext(argv[3]);
+  result.maxContext = parseAutoPositive<uint32_t>(argv[3], "MAX_CONTEXT must be auto or a positive integer");
   try {
     result.model = model::servedFor(std::move(inspected), result.maxContext);
   } catch (const std::invalid_argument &error) {
@@ -218,10 +191,10 @@ NativeArguments parseNativeArguments(int argc, const char *const *argv) {
   if (relaunchContext) {
     const uint32_t most =
         result.maxContext ? result.maxContext : result.model.capabilities.maximumContextTokens;
-    if (!parseContext(*relaunchContext, most, result.relaunchContext))
+    if ((!parseInteger(*relaunchContext, result.relaunchContext) || result.relaunchContext > most))
       throw UsageError("--relaunch-context requires an integer in [1, " + std::to_string(most) + "]");
   }
-  result.maxMemoryBytes = parseMaxMemory(argv[4]);
+  result.maxMemoryBytes = parseAutoPositive<uint64_t>(argv[4], "MAX_MEMORY_BYTES must be auto or a positive integer");
   return result;
 }
 

@@ -88,7 +88,7 @@ void Scheduler::resourcesReady(uint64_t id, uint32_t processed) {
   if (processed > request.spec.prefillTokens) {
     throw std::invalid_argument("processed prompt exceeds request");
   }
-  if (request.suspended) {
+  if (request.suspension) {
     throw std::logic_error("suspended request requires resumeFromResources");
   }
   request.promptProcessed = processed;
@@ -100,12 +100,29 @@ void Scheduler::resourcesReady(uint64_t id, uint32_t processed) {
     promptCompleted(request);
 }
 
+void Scheduler::parkDecode(uint64_t id) {
+  auto &request = get(id);
+  if (active_ || request.phase != Phase::Decode || waitsForMask(request.decodeStage))
+    throw std::logic_error("only a drained regular decoder can park");
+  request.phase = Phase::Parked;
+  request.suspension = model::SuspensionKind::Exact;
+  dropStaleDecodeDebt();
+}
+
+void Scheduler::returnDecode(uint64_t id) {
+  auto &request = get(id);
+  if (active_ || request.phase != Phase::Parked)
+    throw std::logic_error("only a drained parked decoder can return");
+  request.phase = Phase::Decode;
+  request.suspension.reset();
+}
+
 void Scheduler::suspendForResources(uint64_t id) {
   Request &request = get(id);
   if (request.phase != Phase::Prefill && request.phase != Phase::Decode) {
     throw std::logic_error("only runnable resident work can be suspended");
   }
-  request.suspended = true;
+  request.suspension = model::SuspensionKind::Replay;
   request.phase = Phase::WaitingResources;
   dropStaleDecodeDebt();
 }
@@ -113,7 +130,7 @@ void Scheduler::suspendForResources(uint64_t id) {
 void Scheduler::resumeFromResources(uint64_t id, uint32_t processed,
                                     uint32_t replayTokens) {
   Request &request = get(id);
-  if (request.phase != Phase::WaitingResources || !request.suspended) {
+  if (request.phase != Phase::WaitingResources || request.suspension != model::SuspensionKind::Replay) {
     throw std::logic_error("request is not suspended for resources");
   }
   if (processed >= replayTokens)
@@ -127,39 +144,20 @@ void Scheduler::resumeFromResources(uint64_t id, uint32_t processed,
   request.promptProcessed = processed;
   request.spec.prefillTokens = replayTokens;
   request.phase = Phase::Prefill;
-  request.suspended = false;
+  request.suspension.reset();
 }
 
-void Scheduler::deferAdmission(uint64_t id) {
-  Request &request = get(id);
-  if (request.suspended ||
-      (request.phase != Phase::Queued &&
-       request.phase != Phase::WaitingResources &&
-       request.phase != Phase::WaitingPrefix))
-    throw std::logic_error("only unstarted work can wait for scheduling");
-  request.phase = Phase::Queued;
+void Scheduler::setAdmissionPhase(uint64_t id, Phase phase) {
+  auto &request = get(id);
+  if ((request.suspension && phase != Phase::WaitingResources) ||
+      (request.phase != Phase::Queued && request.phase != Phase::WaitingResources && request.phase != Phase::WaitingPrefix))
+    throw std::logic_error("only unstarted work can wait for admission");
+  request.phase = phase;
 }
 
-void Scheduler::waitForResources(uint64_t id) {
-  Request &request = get(id);
-  if (request.phase != Phase::Queued &&
-      request.phase != Phase::WaitingResources &&
-      request.phase != Phase::WaitingPrefix) {
-    throw std::logic_error("resident request cannot wait before admission");
-  }
-  request.phase = Phase::WaitingResources;
-}
-
-void Scheduler::waitForPrefix(uint64_t id) {
-  Request &request = get(id);
-  if (request.suspended ||
-      (request.phase != Phase::Queued &&
-       request.phase != Phase::WaitingResources &&
-       request.phase != Phase::WaitingPrefix)) {
-    throw std::logic_error("only unstarted requests can wait for a prefix");
-  }
-  request.phase = Phase::WaitingPrefix;
-}
+void Scheduler::deferAdmission(uint64_t id) { setAdmissionPhase(id, Phase::Queued); }
+void Scheduler::waitForResources(uint64_t id) { setAdmissionPhase(id, Phase::WaitingResources); }
+void Scheduler::waitForPrefix(uint64_t id) { setAdmissionPhase(id, Phase::WaitingPrefix); }
 
 void Scheduler::maskReady(uint64_t id) {
   Request &request = get(id);
@@ -170,27 +168,16 @@ void Scheduler::maskReady(uint64_t id) {
   request.phase = Phase::Decode;
 }
 
-void Scheduler::cancel(uint64_t id) {
-  Request &request = get(id);
-  if (!terminal(request.phase))
-    request.phase = Phase::Cancelled;
+void Scheduler::terminate(uint64_t id, Phase phase) {
+  auto &request = get(id);
+  if (terminal(request.phase)) return;
+  request.phase = phase;
   dropStaleDecodeDebt();
 }
 
-void Scheduler::finish(uint64_t id) {
-  Request &request = get(id);
-  if (!terminal(request.phase))
-    request.phase = Phase::Completed;
-  dropStaleDecodeDebt();
-}
-
-void Scheduler::fail(uint64_t id) {
-  Request &request = get(id);
-  if (terminal(request.phase))
-    return;
-  request.phase = Phase::Failed;
-  dropStaleDecodeDebt();
-}
+void Scheduler::cancel(uint64_t id) { terminate(id, Phase::Cancelled); }
+void Scheduler::finish(uint64_t id) { terminate(id, Phase::Completed); }
+void Scheduler::fail(uint64_t id) { terminate(id, Phase::Failed); }
 
 void Scheduler::remove(uint64_t id) {
   if (active_ && holds(active_->items, id))
@@ -203,21 +190,13 @@ void Scheduler::remove(uint64_t id) {
 }
 
 std::vector<uint64_t> Scheduler::admissionOrder() const {
-  std::vector<const Request *> ready;
+  std::vector<uint64_t> ready;
   ready.reserve(requests_.size());
-  for (const auto &[_, request] : requests_) {
-    if (request.phase == Phase::Queued ||
-        request.phase == Phase::WaitingResources ||
-        request.phase == Phase::WaitingPrefix) {
-      ready.push_back(&request);
-    }
-  }
-  std::sort(ready.begin(), ready.end(), byPriorityThenOrder);
-  std::vector<uint64_t> result;
-  result.reserve(ready.size());
-  for (const Request *request : ready)
-    result.push_back(request->spec.id);
-  return result;
+  for (const auto &[id, request] : requests_)
+    if (request.phase == Phase::Queued || request.phase == Phase::WaitingResources || request.phase == Phase::WaitingPrefix)
+      ready.push_back(id);
+  std::ranges::sort(ready, [&](uint64_t a, uint64_t b) { return byPriorityThenOrder(&get(a), &get(b)); });
+  return ready;
 }
 
 std::vector<uint64_t> Scheduler::prefillAdmissionOrder(std::span<const PrefillAdmission> candidates,
@@ -225,7 +204,7 @@ std::vector<uint64_t> Scheduler::prefillAdmissionOrder(std::span<const PrefillAd
   // A request admission has not started, from the tokens it starts at.
   const auto unstarted = [&](const PrefillAdmission &entry) {
     const Request &value = get(entry.requestId);
-    if (value.suspended ||
+    if (value.suspension ||
         (value.phase != Phase::Queued && value.phase != Phase::WaitingResources &&
          value.phase != Phase::WaitingPrefix) ||
         entry.cachedTokens >= value.spec.prefillTokens)
@@ -670,7 +649,7 @@ void Scheduler::commit(const BatchPlan &plan, const PlanInputs &in) {
     for (const BatchItem &item : plan.items)
       youngestServed = std::max(youngestServed, get(item.requestId).order);
     for (auto &[id, request] : requests_) {
-      if (request.spec.priority != priority || request.suspended || listed(in.excluded, id) ||
+      if (request.spec.priority != priority || request.suspension || listed(in.excluded, id) ||
           (request.phase != Phase::Queued && request.phase != Phase::WaitingResources &&
            request.phase != Phase::WaitingPrefix && request.phase != Phase::Prefill))
         continue;
@@ -828,7 +807,8 @@ Phase Scheduler::phase(uint64_t id) const { return get(id).phase; }
 
 DecodeStage Scheduler::decodeStage(uint64_t id) const { return get(id).decodeStage; }
 
-bool Scheduler::suspended(uint64_t id) const { return get(id).suspended; }
+bool Scheduler::suspended(uint64_t id) const { return get(id).suspension == model::SuspensionKind::Replay; }
+bool Scheduler::parked(uint64_t id) const { return get(id).suspension == model::SuspensionKind::Exact; }
 
 uint64_t Scheduler::submissionOrder(uint64_t id) const { return get(id).order; }
 
@@ -858,6 +838,9 @@ SchedulerSnapshot Scheduler::snapshot() const noexcept {
       break;
     case Phase::WaitingMask:
       ++result.waitingMask;
+      break;
+    case Phase::Parked:
+      ++result.parked;
       break;
     case Phase::Completed:
     case Phase::Cancelled:

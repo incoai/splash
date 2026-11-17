@@ -233,18 +233,6 @@ StateAdmission laneAdmission(uint32_t lane, const metal::AllocationResult &resul
   return {{}, StateFailure::MemoryPressure, result.failure};
 }
 
-// Any unassigned lane works: its buffers come from the storage's pool, and
-// the governor is asked only for what the pool lacks.
-template <class Activate>
-StateAdmission admitIdleLane(const QwenStateStorage &states,
-                             Activate activate) {
-  for (uint32_t lane = 0; lane < kLaneCount; ++lane) {
-    if (!states.metadata(lane).assigned())
-      return activate(lane);
-  }
-  return {{}, StateFailure::ConcurrencyLimit};
-}
-
 // A prefill arena's linear scratch. Prefill plans read plain bf16 rows; the
 // int8 prefill tile quantizes them into the table and sums.
 ops::LinearScratch prefillScratch(const PrefillArena &arena) {
@@ -351,7 +339,7 @@ struct Runtime::Impl {
     uint32_t stateLane = 0;
     bool resident = false;
     std::unique_ptr<QwenStateStorage::ParkedLane> parked;
-    uint64_t parkedPacketCapacity = 0, parkedPacketOffset = 0;
+    uint64_t parkedPacketCapacity = 0, parkedPacketOffset = 0, reservedBorrower = 0;
     bool promptComplete = false;
     // Rebuild state from already-emitted tokens without sampling an initial
     // anchor, consuming RNG, or replaying output to the caller.
@@ -998,13 +986,28 @@ struct Runtime::Impl {
            uint64_t{entry.generatedTokens} + 1 < entry.maxNewTokens &&
            !isStopToken(geometry, *entry.pendingToken);
   }
-  bool exchangeHoldsFloor(uint32_t lane) const {
+  bool exchangeOwnsSlot(uint32_t lane) const {
     if (!exchangeBanks) return false;
     return std::ranges::any_of(requests, [&](const auto &item) {
       const auto &entry = item.second;
       return entry.parked && entry.parkedPacketCapacity && entry.stateLane == lane;
     });
   }
+  std::optional<uint32_t> availableLane(uint64_t id = 0) const {
+    if (exchangeBanks && id)
+      for (const auto &[_, entry] : requests)
+        if (entry.parkedPacketCapacity && entry.reservedBorrower == id)
+          return states.metadata(entry.stateLane).assigned() ? std::nullopt : std::optional(entry.stateLane);
+    for (uint32_t lane = 0; lane < kLaneCount; ++lane)
+      if (!states.metadata(lane).assigned() && !exchangeOwnsSlot(lane)) return lane;
+    return {};
+  }
+  void consumeExactReservation(uint64_t id) {
+    if (exchangeBanks)
+      for (auto &[_, entry] : requests)
+        if (entry.reservedBorrower == id) entry.reservedBorrower = 0;
+  }
+
   void copyDecodeScratch(uint32_t lane, const QwenLaneMetadata &metadata, uint8_t *packet, bool restoring) const {
     const uint64_t tapeBytes = pendingGdnBytes(metadata);
     copyPendingGdn(lane, metadata, packet, restoring);
@@ -1022,7 +1025,7 @@ struct Runtime::Impl {
       states.clearDraftRings(entry.stateLane);
     states.releaseLane(entry.stateLane, entry.id);
     pageTableBindings[entry.stateLane] = {};
-    if (blockCache && !exchangeHoldsFloor(entry.stateLane))
+    if (blockCache && !exchangeOwnsSlot(entry.stateLane))
       blockCache->releaseLane(entry.stateLane);
   }
 
@@ -3451,8 +3454,9 @@ void Runtime::beginColdRequest(const ModelRequest &request,
 
 StateAdmission Runtime::begin(const ModelRequest &request) {
   Impl::VisionRollback rollback{*impl_, impl_->vision};
-  StateAdmission admission = admitIdleLane(
-      impl_->states, [&](uint32_t lane) { return beginAt(request, lane); });
+  const auto lane = impl_->availableLane(request.id);
+  StateAdmission admission = lane ? beginAt(request, *lane) : StateAdmission{{}, StateFailure::ConcurrencyLimit};
+  if (admission.granted()) impl_->consumeExactReservation(request.id);
   rollback.committed = admission.granted();
   return admission;
 }
@@ -3476,6 +3480,31 @@ void Runtime::suspend(uint64_t requestId) {
   impl_->releaseLeftStaging();
 }
 
+ModelMemoryAdmission Runtime::suspend(uint64_t id, SuspensionKind kind, uint64_t borrower) {
+  if (kind == SuspensionKind::Replay) { suspend(id); return {.ok = true}; }
+  auto &entry = impl_->request(id);
+  if (!entry.resident || !impl_->canPark(entry) || impl_->exchangeOwnsSlot(entry.stateLane)) return {};
+  if (borrower && (borrower == id || impl_->requests.contains(borrower) ||
+      std::ranges::any_of(impl_->requests, [&](const auto &item) { return item.second.reservedBorrower == borrower; }))) return {};
+  const auto lane = entry.stateLane;
+  const bool held = impl_->blockCache && impl_->blockCache->holdsLane(lane);
+  const auto floor = reserveSpilledReads(id, {.kind = WorkKind::Decode});
+  if (!floor.granted()) return floor;
+  try {
+    const auto result = prepareDecodedExchange(id);
+    if (result.granted()) entry.reservedBorrower = borrower;
+    if (!result.granted() && impl_->blockCache && !held) impl_->blockCache->releaseLane(lane);
+    return result;
+  } catch (...) {
+    if (impl_->blockCache && !held) impl_->blockCache->releaseLane(lane);
+    throw;
+  }
+}
+
+StateAdmission Runtime::resumeExact(uint64_t id, uint64_t resident) {
+  return resident ? exchangeDecodedRequests(id, resident) : restoreParkedRequest(id);
+}
+
 ModelMemoryAdmission Runtime::parkDecodedRequest(uint64_t requestId) {
   return parkDecodedRequest(requestId, false);
 }
@@ -3490,7 +3519,7 @@ ModelMemoryAdmission Runtime::parkDecodedRequest(uint64_t requestId, bool exchan
     throw std::logic_error("Qwen request is not resident for parking");
   if (!impl_->canPark(entry)) return {};
   const uint32_t lane = entry.stateLane;
-  if (impl_->exchangeHoldsFloor(lane)) return {};
+  if (impl_->exchangeOwnsSlot(lane)) return {};
   const auto metadata = impl_->states.metadata(lane);
   const uint64_t tapeBytes = impl_->pendingGdnBytes(metadata);
   const MetalBuffer penalties = impl_->decodeArena->get(lane, DecodeTensor::PenaltyState);
@@ -3541,7 +3570,7 @@ StateAdmission Runtime::restoreParkedRequest(uint64_t requestId) {
     entry.stateLane = lane;
     entry.resident = true;
     if (entry.parkedPacketCapacity) --impl_->exchangeBanks;
-    entry.parkedPacketCapacity = entry.parkedPacketOffset = 0;
+    entry.parkedPacketCapacity = entry.parkedPacketOffset = entry.reservedBorrower = 0;
     impl_->pageTableBindings[lane] = {};
     return {lane, StateFailure::None};
   };
@@ -3552,7 +3581,8 @@ StateAdmission Runtime::restoreParkedRequest(uint64_t requestId) {
       return {{}, StateFailure::ConcurrencyLimit};
     return restore(entry.stateLane);
   }
-  return admitIdleLane(impl_->states, restore);
+  const auto lane = impl_->availableLane();
+  return lane ? restore(*lane) : StateAdmission{{}, StateFailure::ConcurrencyLimit};
 }
 
 StateAdmission Runtime::exchangeDecodedRequests(uint64_t parkedId, uint64_t residentId) {
@@ -3582,6 +3612,7 @@ StateAdmission Runtime::exchangeDecodedRequests(uint64_t parkedId, uint64_t resi
     throw;
   }
   outgoing.parked = std::move(incoming.parked);
+  outgoing.reservedBorrower = incoming.reservedBorrower = 0;
   outgoing.parkedPacketCapacity = capacity;
   outgoing.parkedPacketOffset = nextOffset;
   outgoing.resident = false;
@@ -3605,9 +3636,8 @@ StateAdmission Runtime::resume(const ModelRequest &request) {
   }
   Impl::VisionRollback rollback{*impl_, impl_->vision};
   std::vector<Impl::ImageState> images;
-  StateAdmission admission = admitIdleLane(impl_->states, [&](uint32_t lane) {
-    return impl_->activate(request, lane, images);
-  });
+  const auto lane = impl_->availableLane();
+  StateAdmission admission = lane ? impl_->activate(request, *lane, images) : StateAdmission{{}, StateFailure::ConcurrencyLimit};
   if (admission.granted()) {
     entry.stateLane = *admission.lane;
     entry.resident = true;

@@ -140,7 +140,7 @@ Engine::LaneDemand Engine::laneDemand() const {
   // A Spill lane with none reads nothing spilled.
   std::vector<uint64_t> readers;
   for (const auto &[id, peer] : requests_) {
-    if (!peer.lane || peer.pendingEnd)
+    if ((!peer.lane && scheduler_.phase(id) != Phase::Parked) || peer.pendingEnd)
       continue;
     const bool prefill = scheduler_.phase(id) == Phase::Prefill;
     if (cache_.holdsIndexPages(id)) {
@@ -281,10 +281,6 @@ uint64_t Engine::readsShortfall(std::span<const uint64_t> lanes) const {
   return bytes + model_.hotFloorShortfall(decoding);
 }
 
-bool Engine::fitsResidentAlone(const Request &active) const {
-  return projectedTokens(active) <= config_.spill.geometry.residentTokens;
-}
-
 uint64_t Engine::chainEnd(const CacheLookup &lookup) noexcept {
   return lookup.state ? lookup.state->kvBlock() : 0;
 }
@@ -304,7 +300,7 @@ uint32_t Engine::spillPages(const Request &active, uint32_t copied) const {
 }
 
 Engine::InMemory Engine::inMemory(const Request &active, const ClaimSpec &spec) const {
-  if (!fitsResidentAlone(active))
+  if (projectedTokens(active) > config_.spill.geometry.residentTokens)
     return {};
   const ResidentRoom room = residentRoom(active, spec, projectedTokens(active));
   if (room.holds())
@@ -506,7 +502,8 @@ void Engine::endAtLength(Request &active) {
 
 bool Engine::resourceRetryReady(const Request &active,
                                 double now) const noexcept {
-  return active.resourceWait.retryMilliseconds <= 0.0 ||
+  return (config_.foregroundTurnTokens && active.resourceWait.reason == StateFailure::ConcurrencyLimit) ||
+         active.resourceWait.retryMilliseconds <= 0.0 ||
          active.resourceWait.epoch != resourceEpoch_ ||
          now >= active.resourceWait.retryMilliseconds;
 }
@@ -711,14 +708,7 @@ uint32_t Engine::reserveCaptures(Request &active, const BatchItem &item,
       // beside buffers of its own, in its claim. Refused the pool and the
       // admission, it takes that checkpoint's buffers, as it takes its
       // lane's after a command: nothing is freed for it.
-      std::shared_ptr<StateReservation> buffers;
-      static_cast<void>(allocate(
-          [&] {
-            metal::AllocationFailure refusal = metal::AllocationFailure::None;
-            buffers = model_.reserveState(active.request.id, tokens, refusal);
-            return StateBuffers{.ok = buffers != nullptr, .allocationFailure = refusal};
-          },
-          stateClaim(active, kind, supersedes), Refusal::SettledOnce));
+      auto buffers = reserveStateBuffers(active, tokens, stateClaim(active, kind, supersedes), Refusal::SettledOnce).buffers;
       if (buffers) {
         states.push_back({tokens, std::move(buffers)});
         captures.push_back({tokens});
@@ -798,14 +788,7 @@ void Engine::reserveReplyCapture(Request &active, std::vector<StateCapture> &sta
   const uint32_t output = active.outputLimit - (held - active.promptTokens);
   if (page - held > std::min(model::ExecutionLimits::targetVerifyRows, output))
     return;
-  std::shared_ptr<StateReservation> buffers;
-  static_cast<void>(allocate(
-      [&] {
-        metal::AllocationFailure refusal = metal::AllocationFailure::None;
-        buffers = model_.reserveState(active.request.id, page, refusal);
-        return StateBuffers{.ok = buffers != nullptr, .allocationFailure = refusal};
-      },
-      stateClaim(active, StateClass::Checkpoint, supersedes), Refusal::SettledOnce));
+  auto buffers = reserveStateBuffers(active, page, stateClaim(active, StateClass::Checkpoint, supersedes), Refusal::SettledOnce).buffers;
   if (buffers) {
     states.push_back({page, std::move(buffers)});
     captures.push_back({page});
@@ -815,24 +798,26 @@ void Engine::reserveReplyCapture(Request &active, std::vector<StateCapture> &sta
 ClaimSpec Engine::stateClaim(const Request &active, StateClass kind, bool supersedes) const {
   ClaimSpec spec = claimFor(active, kind == StateClass::InUse ? ClaimClass::InService : ClaimClass::Optional);
   spec.supersedes = supersedes;
-  switch (kind) {
-  case StateClass::InUse:
-    // The point its next turn resumes from may wait for memory on its way
-    // back, and takes what is in use last.
-    spec.reach = ReclaimClass::InUse;
-    break;
-  case StateClass::Checkpoint:
-  case StateClass::Ordinary:
-    // Its work goes on without it: it takes what frees memory at once.
-    spec.timing = NeedTiming::Immediate;
-    break;
-  }
+  // Recovery may wait and take in-use memory; optional captures take only
+  // what frees immediately, so they never delay a lane's command.
+  if (kind == StateClass::InUse) spec.reach = ReclaimClass::InUse;
+  else spec.timing = NeedTiming::Immediate;
   return spec;
+}
+
+Engine::Reservation Engine::reserveStateBuffers(Request &active, uint32_t tokens, const ClaimSpec &spec, Refusal refusal) {
+  Reservation result;
+  const auto taken = allocate([&] {
+    metal::AllocationFailure failure = metal::AllocationFailure::None;
+    result.buffers = model_.reserveState(active.request.id, tokens, failure);
+    return StateBuffers{.ok = result.buffers != nullptr, .allocationFailure = failure};
+  }, spec, refusal);
+  result.recycled = result.buffers && taken.freed;
+  return result;
 }
 
 Engine::Reservation Engine::reserveCapture(Request &active, StateClass kind, uint32_t tokens,
                                            bool followsCheckpoint, bool supersedes) {
-  const uint64_t id = active.request.id;
   // The lane's checkpoint is its recovery point until a state that retires
   // it is published after a completed command (a cancelled, expired or
   // failed one leaves it to a retry). So no state takes its buffers before
@@ -848,16 +833,9 @@ Engine::Reservation Engine::reserveCapture(Request &active, StateClass kind, uin
   const bool predecessorPinned =
       kind == StateClass::Checkpoint && followsCheckpoint && checkpointPinned(active);
   const bool fromLane = predecessorPinned || checkpointReclaimable(active);
-  Reservation result;
-  const auto attempt = [&] {
-    metal::AllocationFailure refusal = metal::AllocationFailure::None;
-    result.buffers = model_.reserveState(id, tokens, refusal);
-    return StateBuffers{.ok = result.buffers != nullptr, .allocationFailure = refusal};
-  };
-  const ClaimSpec spec = stateClaim(active, kind, supersedes);
-  const auto taken = allocate(attempt, spec, fromLane ? Refusal::SettledOnce : Refusal::Settled);
+  auto result = reserveStateBuffers(active, tokens, stateClaim(active, kind, supersedes),
+                                    fromLane ? Refusal::SettledOnce : Refusal::Settled);
   result.fromLane = !result.buffers && fromLane;
-  result.recycled = result.buffers && taken.freed;
   return result;
 }
 
@@ -938,7 +916,7 @@ bool Engine::preemptBelow(RequestPriority priority, double now) {
 
 bool Engine::anotherResident(uint64_t requestId) const {
   return std::any_of(requests_.begin(), requests_.end(), [&](const auto &entry) {
-    return entry.first != requestId && entry.second.lane;
+    return entry.first != requestId && (entry.second.lane || scheduler_.phase(entry.first) == Phase::Parked);
   });
 }
 
@@ -1265,6 +1243,8 @@ void Engine::suspendLane(Request &active, uint64_t workEnd, metal::AllocationFai
   if (!active.lane || scheduler_.suspended(active.request.id)) {
     throw std::logic_error("request cannot be suspended");
   }
+  const auto paired = std::exchange(active.exchangePeer, std::nullopt);
+  if (paired) request(*paired).exchangePeer.reset();
   // A decoding lane holds an anchor unless its first mask has yet to select
   // one; a lane in prefill holds what it held when its replay began.
   if (scheduler_.phase(active.request.id) == Phase::Decode)
@@ -1275,6 +1255,14 @@ void Engine::suspendLane(Request &active, uint64_t workEnd, metal::AllocationFai
   active.replayTokens = static_cast<uint32_t>(active.exactTokens.size());
   scheduler_.suspendForResources(active.request.id);
   deferResourceRetry(active, now, {.allocationFailure = failure}, reason);
+  if (paired) {
+    auto &peer = request(*paired);
+    const auto returned = model_.resumeExact(*paired);
+    if (!returned.granted()) throw std::logic_error("paired recovery lost its reserved return");
+    peer.lane = *returned.lane;
+    scheduler_.returnDecode(*paired);
+    suspendLane(peer, kvCapacity(*paired), failure, reason, now);
+  }
 }
 
 void Engine::suspendForGrowth(Request &active, uint64_t workEnd,
