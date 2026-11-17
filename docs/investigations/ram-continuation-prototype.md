@@ -69,8 +69,8 @@ contracts. Do not raise the budget or add an exception for this experiment.
 
 Before integration, agree on a shared lifecycle for replay suspension and RAM
 parking, including KV ownership, deadlines, claim accounting and page movement.
-Then test bounded eight-user rotation and starvation, intermediate speculative
-acceptance, constrained/thinking continuation, resource denial and actual
+Then test bounded eight-user rotation and starvation, real-model speculative
+variation, combined constrained/thinking continuation, resource denial and actual
 spilled-KV failure paths. Keep that policy disabled until matched coding tests
 show lower p95 TTFT and time to 32 tokens without unacceptable inter-token gaps,
 completion/correctness regression, extra SSD writes or throughput loss.
@@ -117,3 +117,30 @@ sequence. These controls pass for both architectures and state formats in the
 normal upstream build and with the uniformly instrumented deployed-stack native
 library. Intermediate speculative-acceptance patterns and real-model variation
 remain separate activation gates.
+
+## Second correctness cycle
+
+The expanded driver passes 24 partial-acceptance scenarios: one through six
+accepted drafts (two through seven pending GDN rows), for dense/Flash-Next in
+FP32/BF16. Each forces acceptance through actual grammar masks, parks and rebinds
+the request after a different request overwrites its old lane, checks exact
+state bytes and verifies the next masked output. It also verifies that an
+initial-mask waiter and a verify-mask waiter with an idle GPU cannot park.
+
+Another 16 scenarios use thinking budgets 0, 1, 5 and 12. They pause immediately
+after prefill with no pending GDN rows, preserve the anchor/budget continuation,
+and emit the two-token thinking-end sequence exactly once and in order. Along
+with the sampled and full-acceptance controls, the driver now exercises pending
+GDN counts zero through eight.
+
+Both normal upstream binaries and the uniformly ASan/UBSan-instrumented library
+pass all new scenarios. The latter uses matching deployed-stack substrate
+headers, with byte-identical Runtime and parked-storage implementations; this
+is not a claim that the full upstream library was rebuilt under sanitizers.
+The architecture checker remains green at 30105/30105 Engine lines.
+
+No runtime patch was necessary: only tests and evidence changed. These runs used
+synthetic weights in observed production-idle windows. They are not real coding
+benchmarks; combined constrained/thinking behavior, actual spilled-KV failure
+paths and scheduler integration remain activation gates. See
+`ram-continuation-cycle2-20261116.json` for hashes and counts.

@@ -9,6 +9,8 @@
 #include <algorithm>
 #include <array>
 #include <cstring>
+#include <chrono>
+#include <thread>
 #include <iostream>
 #include <memory>
 #include <set>
@@ -72,6 +74,71 @@ ModelStepResult step(model::Runtime &runtime, uint64_t id, uint64_t position,
   require(results.size() == 1 && results.front().failure.empty(), "synthetic continuation command failed");
   return results.front();
 }
+std::vector<uint32_t> singletonMasks(std::span<const uint32_t> tokens, uint32_t vocabulary) {
+  const uint32_t stride = (vocabulary + 31) / 32;
+  std::vector<uint32_t> words(tokens.size() * stride, 0);
+  for (size_t row = 0; row < tokens.size(); ++row) {
+    require(tokens[row] < vocabulary, "partial-acceptance mask token is outside vocabulary");
+    words[row * stride + tokens[row] / 32] |= 1u << (tokens[row] % 32);
+  }
+  return words;
+}
+void initialMask(model::Runtime &runtime, uint64_t id, uint64_t position,
+                 const std::vector<uint32_t> &pages, uint32_t vocabulary) {
+  const std::array<uint32_t, 1> token{0};
+  require(!runtime.provideMask(id, singletonMasks(token, vocabulary)), "initial mask was refused");
+  BatchPlan plan{.kind = WorkKind::Decode, .items = {{id, 0}},
+                 .decodeStage = DecodeStage::ApplyInitialMask};
+  ModelBatchItem item{id, position, 0, pages};
+  item.pageTableRevision = 1;
+  auto ticket = runtime.submit(plan, {&item, 1}, {});
+  const auto results = ticket->wait();
+  require(results.size() == 1 && results.front().failure.empty() && results.front().outputTokens.empty(),
+          "initial mask selection failed or committed an output row");
+}
+ModelStepResult partialStep(model::Runtime &runtime, metal::MetalBackend &backend,
+                            uint64_t id, uint64_t position, const std::vector<uint32_t> &pages,
+                            uint32_t vocabulary, uint32_t accepted) {
+  require(runtime.reserveSpilledReads(id, {.kind = WorkKind::Decode}).granted(),
+          "partial-acceptance hot floor was refused");
+  BatchPlan plan{.kind = WorkKind::Decode, .items = {{id, 0}}, .decodeStage = DecodeStage::Regular};
+  ModelBatchItem item{id, position, 0, pages};
+  item.pageTableRevision = 1;
+  auto ticket = runtime.submit(plan, {&item, 1}, {});
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(20);
+  const auto advance = [&] {
+    require(std::chrono::steady_clock::now() < deadline, "partial-acceptance ticket timed out");
+    ticket->advance();
+    std::this_thread::yield();
+  };
+  std::vector<ModelMaskRequest> requests;
+  while (requests.empty()) {
+    advance();
+    requests = ticket->takeMaskRequests();
+    require(!ticket->ready(), "masked decode finished without its verify masks");
+  }
+  require(requests.size() == 1 && requests.front().requestId == id,
+          "partial-acceptance simulation belongs to another request");
+  const auto &simulation = requests.front().simulationTokens;
+  require(accepted > 0 && accepted + 1 < simulation.size(), "fixture is not partial acceptance");
+  // Drain target forward without supplying the mask. A host-only mask wait
+  // must not be mistaken for a safe point merely because the GPU is idle.
+  while (backend.commandInFlight()) advance();
+  require(!runtime.parkDecodedRequest(id).granted(), "mask-waiting request was parked with an idle GPU");
+  std::vector<uint32_t> selected(simulation.size() + 1, 0);
+  selected[0] = simulation.front();
+  for (uint32_t row = 1; row <= accepted; ++row) selected[row] = simulation[row];
+  selected[accepted + 1] = simulation[accepted + 1] == 0 ? 1 : 0;
+  require(!runtime.provideMask(id, singletonMasks(selected, vocabulary)), "verify masks were refused");
+  while (!ticket->ready()) advance();
+  const auto results = ticket->wait();
+  require(results.size() == 1 && results.front().failure.empty() &&
+              results.front().acceptedDraftTokens == accepted &&
+              results.front().outputTokens.size() == accepted + 1,
+          "mask did not force the requested intermediate acceptance length");
+  return results.front();
+}
+
 void run(const char *metallib) {
   const test::TemporaryDirectory root("splash-ram-continuation");
   for (const bool flashNext : {false, true}) {
@@ -232,6 +299,95 @@ void run(const char *metallib) {
       runtime->end(601);
       runtime->end(602);
       runtime->end(303);
+      const uint32_t vocabulary = std::visit([](const auto &layout) { return layout.vocabularySize; },
+                                               config.model.target);
+      uint32_t partialCases = 0;
+      for (uint32_t accepted = 1; accepted < model::ExecutionLimits::draftProposalTokens; ++accepted) {
+        for (const auto *pages : {&baselinePages, &parkedPages, &intruderPages})
+          for (const uint32_t page : *pages) pool.clearPage(page);
+        auto maskedBase = input(701), maskedParked = input(702);
+        maskedBase.flags = maskedParked.flags = 0;
+        maskedBase.sampling = maskedParked.sampling = {};
+        maskedBase.constraint = maskedParked.constraint = ConstraintMode::TokenMask;
+        runtime->beginColdRequest(maskedBase.modelView(), 0);
+        runtime->beginColdRequest(maskedParked.modelView(), 1);
+        require(step(*runtime, 701, 0, baselinePages, prompt).nextDecodeStage == DecodeStage::ApplyInitialMask &&
+                    step(*runtime, 702, 0, parkedPages, prompt).nextDecodeStage == DecodeStage::ApplyInitialMask,
+                "masked fixture skipped its initial selection stage");
+        require(!runtime->parkDecodedRequest(702).granted(), "initial-mask waiter was parked");
+        initialMask(*runtime, 701, prompt.size(), baselinePages, vocabulary);
+        initialMask(*runtime, 702, prompt.size(), parkedPages, vocabulary);
+        const auto a = partialStep(*runtime, resources->backend(), 701, prompt.size(), baselinePages,
+                                   vocabulary, accepted);
+        const auto b = partialStep(*runtime, resources->backend(), 702, prompt.size(), parkedPages,
+                                   vocabulary, accepted);
+        require(a.outputTokens == b.outputTokens, "partial-acceptance controls diverged before parking");
+        const auto saved = state(*runtime, storage, 1);
+        require(saved.metadata.pendingRows == accepted + 1 && runtime->parkDecodedRequest(702).granted(),
+                "intermediate pending state was not parked exactly");
+        runtime->beginColdRequest(intruder.modelView(), 1);
+        static_cast<void>(step(*runtime, 303, 0, intruderPages, prompt));
+        static_cast<void>(step(*runtime, 303, prompt.size(), intruderPages));
+        const auto restored = runtime->restoreParkedRequest(702);
+        require(restored.granted() && *restored.lane == 2, "masked continuation did not rebind");
+        equal(saved, state(*runtime, storage, 2));
+        const uint64_t next = prompt.size() + a.outputTokens.size();
+        const auto afterA = partialStep(*runtime, resources->backend(), 701, next, baselinePages,
+                                        vocabulary, accepted);
+        const auto afterB = partialStep(*runtime, resources->backend(), 702, next, parkedPages,
+                                        vocabulary, accepted);
+        require(afterA.outputTokens == afterB.outputTokens &&
+                    afterA.acceptedDraftTokens == afterB.acceptedDraftTokens,
+                "partial-acceptance stream changed after parking");
+        runtime->end(701);
+        runtime->end(702);
+        runtime->end(303);
+        ++partialCases;
+      }
+      uint32_t thinkingCases = 0;
+      for (const uint32_t thinkingTokens : {0u, 1u, 5u, 12u}) {
+        for (const auto *pages : {&baselinePages, &parkedPages, &intruderPages})
+          for (const uint32_t page : *pages) pool.clearPage(page);
+        auto thinkingBase = input(801), thinkingParked = input(802);
+        thinkingBase.sampling = thinkingParked.sampling = {};
+        thinkingBase.thinkingBudget = thinkingParked.thinkingBudget = ThinkingBudget{thinkingTokens, {2, 3}, 4};
+        runtime->beginColdRequest(thinkingBase.modelView(), 0);
+        runtime->beginColdRequest(thinkingParked.modelView(), 1);
+        static_cast<void>(step(*runtime, 801, 0, baselinePages, prompt));
+        static_cast<void>(step(*runtime, 802, 0, parkedPages, prompt));
+        const auto saved = state(*runtime, storage, 1);
+        require(saved.metadata.pendingRows == 0 && runtime->parkDecodedRequest(802).granted(),
+                "post-prefill thinking state did not park without a pending tape");
+        const auto anchor = model::RuntimeInstrumentation::pendingToken(*runtime, 802);
+        runtime->beginColdRequest(intruder.modelView(), 1);
+        static_cast<void>(step(*runtime, 303, 0, intruderPages, prompt));
+        static_cast<void>(step(*runtime, 303, prompt.size(), intruderPages));
+        const auto restored = runtime->restoreParkedRequest(802);
+        require(restored.granted() && *restored.lane == 2 &&
+                    model::RuntimeInstrumentation::pendingToken(*runtime, 802) == anchor,
+                "thinking state lost its pending anchor when rebound");
+        equal(saved, state(*runtime, storage, 2));
+        uint64_t next = prompt.size();
+        std::vector<uint32_t> tokens;
+        for (uint32_t cycle = 0; cycle < 3; ++cycle) {
+          const auto a = step(*runtime, 801, next, baselinePages);
+          const auto b = step(*runtime, 802, next, parkedPages);
+          require(a.outputTokens == b.outputTokens && a.acceptedDraftTokens == b.acceptedDraftTokens &&
+                      a.outputTokensWithoutKv == b.outputTokensWithoutKv,
+                  "thinking budget or end sequence changed after parking");
+          next += a.outputTokens.size() - a.outputTokensWithoutKv;
+          tokens.insert(tokens.end(), a.outputTokens.begin(), a.outputTokens.end());
+        }
+        const std::array<uint32_t, 2> end{2, 3};
+        require(std::search(tokens.begin(), tokens.end(), end.begin(), end.end()) != tokens.end() &&
+                    std::count(tokens.begin(), tokens.end(), 2) == 1 &&
+                    std::count(tokens.begin(), tokens.end(), 3) == 1,
+                "thinking fixture lost, duplicated or reordered its end sequence");
+        runtime->end(801);
+        runtime->end(802);
+        runtime->end(303);
+        ++thinkingCases;
+      }
       auto terminal = input(505);
       terminal.maxNewTokens = 1;
       for (const uint32_t page : intruderPages) pool.clearPage(page);
@@ -247,7 +403,9 @@ void run(const char *metallib) {
       std::cout << "ram_continuation=PASS family=" << (flashNext ? "flash-next" : "dense")
                 << " state=" << (format == ops::GdnStateFormat::Float32 ? "fp32" : "bf16")
                 << " rotations=2 sampled_tokens=" << output.size()
-                << " full_draft_accepted=" << fullBase.acceptedDraftTokens << '\n';
+                << " full_draft_accepted=" << fullBase.acceptedDraftTokens
+                << " partial_cases=" << partialCases
+                << " thinking_cases=" << thinkingCases << '\n';
     }
   }
 }

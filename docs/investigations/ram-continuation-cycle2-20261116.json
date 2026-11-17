@@ -1,0 +1,120 @@
+{
+  "created_at_utc": "2026-11-17T03:15:58.282819+00:00",
+  "parent_commit": "d4fa13b43ebc2a3084de9369aa18ea2f2c13ef9e",
+  "scope": "synthetic numerical correctness; no serving activation",
+  "driver_sha256": "9c564868d7c0b82cbe2f2c9a6ca51574547ee97ca7d44419fbfa7bb74f23aae6",
+  "normal_binary_sha256": "da11613e7433854df7de9aa29081f7a3562cd26d8f5c87eca1c0a251cb964c56",
+  "sanitizer_binary_sha256": "9db1d015371c1405ecd831510eec69d211efbf48d766f771b5c3dfa6539aaafb",
+  "families": [
+    "dense",
+    "flash-next"
+  ],
+  "state_formats": [
+    "fp32",
+    "bf16"
+  ],
+  "partial_acceptance": {
+    "accepted_drafts": [
+      1,
+      2,
+      3,
+      4,
+      5,
+      6
+    ],
+    "pending_GDN_rows": [
+      2,
+      3,
+      4,
+      5,
+      6,
+      7
+    ],
+    "cases": 24,
+    "normal_passed": 24,
+    "ASAN_UBSAN_passed": 24,
+    "idle_GPU_mask_wait_parking_refused": true,
+    "initial_mask_wait_parking_refused": true,
+    "exact_state_and_next_masked_tokens_match": true
+  },
+  "thinking_continuation": {
+    "budgets": [
+      0,
+      1,
+      5,
+      12
+    ],
+    "end_tokens": [
+      2,
+      3
+    ],
+    "cases": 16,
+    "normal_passed": 16,
+    "ASAN_UBSAN_passed": 16,
+    "pending_GDN_rows_at_park": 0,
+    "end_sequence_once_in_order": true
+  },
+  "existing_controls_rerun": {
+    "sampled_two_parity_rotation": true,
+    "full_draft_acceptance": 7,
+    "terminal_anchor_refusal": true,
+    "cancellation": true,
+    "KV_table_rebinding": true
+  },
+  "sanitizer_scope": {
+    "uniform_native_library": true,
+    "library_substrate_base": "9753a803a8d7acc4caf6e164292ca279ea69d830",
+    "matched_substrate_headers": true,
+    "Runtime_cpp_byte_identical_to_upstream_candidate": true,
+    "parked_storage_implementation_byte_identical": true,
+    "container_checks_enabled": true,
+    "leak_detection": false
+  },
+  "architecture": {
+    "passed": true,
+    "engine_lines": 30105,
+    "budget": 30105
+  },
+  "production_model_weights_loaded": false,
+  "runtime_code_changed": false,
+  "deployed": false,
+  "performance_benchmark": false,
+  "limitations": [
+    "Fixed verification rows and synthetic weights only",
+    "Combined constrained thinking, actual spilled-KV failure paths and Engine fairness remain unqualified",
+    "No TTFT, throughput or real coding accuracy improvement claimed"
+  ],
+  "production_verification": {
+    "native_instance_unchanged": true,
+    "native_identity_unchanged": true,
+    "native_restarts": 0,
+    "native_ready": true,
+    "persistent_Samsung_files_open": true,
+    "Samsung_external_volume_UUID_verified": true,
+    "model": "ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF:Q2_0",
+    "context_tokens": 262144,
+    "RAM_GiB": 96,
+    "cache_GiB": 512,
+    "admission_enabled": false,
+    "M4_enabled": false,
+    "fusion_unchanged": true,
+    "worker_limit": 8,
+    "capacity": 128,
+    "queue_running": 1,
+    "queue_waiting": 0,
+    "health": {
+      "11500/health": 200,
+      "11500/ready": 200,
+      "11501/health": 200,
+      "11501/ready": 200,
+      "11502/health": 200,
+      "11502/ready": 200,
+      "11503/health": 200,
+      "11503/ready": 200,
+      "11504/health": 200,
+      "11504/ready": 200
+    },
+    "deployed": false,
+    "model_benchmarks": false
+  }
+}
