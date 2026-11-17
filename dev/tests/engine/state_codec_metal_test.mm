@@ -9,7 +9,9 @@
 // of the value coded, and each case's state within the bound measured on the
 // models: a relative error of 1%. A block that holds NaN or an infinity in
 // either half restores as NaN, every value of it, and the blocks around it
-// as the reference codes them.
+// as the reference codes them, whether the codec coded it or the decode fold
+// that stores a reply state's codes (state_code_quad, through
+// state_codec_test.metal's kernel).
 #include "metal/CommandGraph.hpp"
 #include "metal/MetalBackend.hpp"
 #include "model/Bfloat16.hpp"
@@ -171,9 +173,12 @@ void runCase(MetalBackend &backend, uint32_t rows, uint32_t layers, GdnStateForm
 // A state that is not finite stays so: a block holding NaN, +inf or -inf in
 // either thread's half restores as NaN, every value of it, where its largest
 // finite magnitude, or zero, would make one a finite value the state never
-// held; the blocks around it code as the reference codes them.
-void nonFiniteBlocks(MetalBackend &backend, GdnStateFormat format) {
-  const std::string label = std::string(splash::ops::formatName(format)) + " state with values not finite: ";
+// held; the blocks around it code as the reference codes them. With `fold`
+// the decode fold codes the state, its lanes four values each, eight a block,
+// so that the values not finite lie in a block's first lane and its last.
+void nonFiniteBlocks(MetalBackend &backend, GdnStateFormat format, bool fold) {
+  const std::string label = std::string(splash::ops::formatName(format)) +
+                            (fold ? " state the decode fold codes" : " state") + " with values not finite: ";
   constexpr uint32_t rows = 8, columns = 128, blocksPerRow = columns / kBlock;
   StateCodecShape shape{1, rows, columns, 0, 0, format};
   shape.stateLayerBytes = shape.stateBytes();
@@ -205,7 +210,16 @@ void nonFiniteBlocks(MetalBackend &backend, GdnStateFormat format) {
     }
   }
   CommandGraph graph;
-  StateCodec::addQuantize(graph, state, codes, shape);
+  if (fold) {
+    MetalBuffer wide = splash::test::sharedBuffer(backend, values.size() * sizeof(float));
+    std::memcpy(wide.contents(), values.data(), values.size() * sizeof(float));
+    const auto lanes = static_cast<uint32_t>(values.size() / 4);
+    graph.add(format == GdnStateFormat::Float32 ? "test_state_code_quad_f32" : "test_state_code_quad_bf16",
+              {wide, codes}, static_cast<uint32_t>(state_codec_scales_offset(rows, columns)), {lanes / 32, 1, 1},
+              {32, 1, 1});
+  } else {
+    StateCodec::addQuantize(graph, state, codes, shape);
+  }
   StateCodec::addDequantize(graph, codes, decoded, shape);
   submit(backend, graph);
   // The reference of the finite blocks, the others zeros.
@@ -274,7 +288,8 @@ void run(const std::string &metallib) {
     // in one, and 296 over two.
     runCase(backend, 3, 3, format, 4096);
     runCase(backend, 37, 3, format, 4096);
-    nonFiniteBlocks(backend, format);
+    nonFiniteBlocks(backend, format, false);
+    nonFiniteBlocks(backend, format, true);
   }
   std::cout << "state_codec_metal_test passed\n";
 }

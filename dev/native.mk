@@ -191,6 +191,10 @@ TEST_Q8_AIR := $(ENGINE_TEST_BUILD)/q8-paged-kv.air
 # production store routine (the q/k projection's): in the Q8 tests' library
 # and the production-and-test one.
 TEST_ATTENTION_STORE_AIR := $(ENGINE_TEST_BUILD)/attention-store-test.air
+# The codes the decode fold stores of a state (state_code_quad), which the
+# state codec's test checks beside the codec's own: in the production-and-test
+# library.
+TEST_STATE_CODEC_AIR := $(ENGINE_TEST_BUILD)/state-codec-test.air
 TEST_Q8_LIB := $(ENGINE_TEST_BUILD)/q8-paged-kv.metallib
 # Both Q8 tests share the attention kernels, the sparse ones included, and the
 # path commit, beside the tests' store.
@@ -317,7 +321,7 @@ TEST_CONFIG_TARGETS := $(filter-out $(LIB) $(HOST_STEP_LIB),$(sort $(TEST_CPU_TA
 	$(TEST_DECODE_PROFILE) $(TEST_TEACHER_LOGITS) $(TEST_ATTENTION_SWEEP) \
 	$(TEST_GGUF_PROJECTION_BENCHMARK) $(TEST_GGUF_MOE_BENCHMARK) \
 	$(TEST_Q8_AIR) $(TEST_Q8_KERNEL_AIRS) $(TEST_RESIDENCY_AIR) $(TEST_HOST_STEP_AIR) $(TEST_METAL_BACKEND_AIR) \
-	$(TEST_GGUF_DEQUANT_AIR) $(TEST_GGUF_MOE_AIR) $(TEST_ATTENTION_STORE_AIR)
+	$(TEST_GGUF_DEQUANT_AIR) $(TEST_GGUF_MOE_AIR) $(TEST_ATTENTION_STORE_AIR) $(TEST_STATE_CODEC_AIR)
 # Benchmarks and tools that build with the production flags.
 PRODUCTION_FLAG_TOOLS := $(TEST_BACKEND_BENCHMARK) $(WEIGHT_DIGESTS)
 SANITIZER_CONFIG_TARGETS := $(TEST_SLOT_FILE_ASAN) $(TEST_SLOT_FILE_TSAN) \
@@ -482,7 +486,7 @@ $(TEST_QWEN4_KERNELS): dev/tests/engine/qwen4_kernels_test.mm \
 $(TEST_GDN_METAL_TEST): dev/tests/engine/gdn_metal_test.mm \
 		$(ENGINE_LIBRARY) $(LIB)
 $(TEST_STATE_CODEC_TEST): dev/tests/engine/state_codec_metal_test.mm \
-		$(ENGINE_LIBRARY) $(LIB)
+		$(ENGINE_LIBRARY) $(TEST_PRODUCTION_LIB)
 $(TEST_ATTENTION_PLAN): dev/tests/engine/paged_attention_plan_test.mm \
 		$(ENGINE_LIBRARY) $(TEST_PRODUCTION_LIB)
 $(TEST_ATTENTION_VARIANTS): dev/tests/engine/attention_variants_metal_test.mm \
@@ -592,10 +596,13 @@ $(ENGINE_TEST_BUILD)/kernels/%.air: runtime/metal/kernels/%.metal \
 # dequantizer bitwise, and gguf-moe the production gate/up pass against the
 # production down pass's expert tile, so they compile as production does
 # (gguf-dequant's AIR does not depend on -O3 with metal 32023, but that of
-# some kernels, moe_gguf's among them, does).
+# some kernels, moe_gguf's among them, does). The state codec's test kernel
+# stores codes as the decode kernels do, under the fast math that may drop a
+# NaN.
 $(TEST_GGUF_DEQUANT_AIR): dev/tests/engine/gguf_dequant_test.metal
 $(TEST_GGUF_MOE_AIR): dev/tests/engine/gguf_moe_test.metal
-$(TEST_GGUF_DEQUANT_AIR) $(TEST_GGUF_MOE_AIR): $(KERNEL_HEADERS) | $(ENGINE_TEST_BUILD)
+$(TEST_STATE_CODEC_AIR): dev/tests/engine/state_codec_test.metal
+$(TEST_GGUF_DEQUANT_AIR) $(TEST_GGUF_MOE_AIR) $(TEST_STATE_CODEC_AIR): $(KERNEL_HEADERS) | $(ENGINE_TEST_BUILD)
 	$(RUN_CONFIGURED) $(METAL) $(PROD_METALFLAGS) -c $(filter %.metal,$^) -o $@
 
 # Test libraries, each linked from the AIRs it lists.
@@ -606,9 +613,11 @@ $(TEST_METAL_BACKEND_LIB): $(TEST_METAL_BACKEND_AIR) $(TEST_RESIDENCY_AIR)
 $(TEST_HOST_STEP_LIB): $(TEST_HOST_STEP_AIR)
 # The production kernels and test kernels in one library, for the kernel
 # tests that run test kernels between production dispatches:
-# metal_backend_test.metal's copies, and gguf_moe_test.metal's gate and up
-# passes apart. It relinks whenever the production library does.
+# metal_backend_test.metal's copies, gguf_moe_test.metal's gate and up
+# passes apart, and state_codec_test.metal's decode fold codes. It relinks
+# whenever the production library does.
 $(TEST_PRODUCTION_LIB): $(PRODUCTION_AIRS) $(TEST_METAL_BACKEND_AIR) $(TEST_GGUF_MOE_AIR) $(TEST_ATTENTION_STORE_AIR) \
+		$(TEST_STATE_CODEC_AIR) \
 		$(LIB)
 
 $(TEST_GGUF_DEQUANT_LIB) $(TEST_Q8_LIB) $(TEST_Q8_ATTENTION_LIB) $(TEST_METAL_BACKEND_LIB) \
@@ -727,7 +736,7 @@ test-engine-metal: $(TEST_METAL_TARGETS)
 	$(METAL_TEST_ENV) $(TEST_Q8_ATTENTION_TEST) $(TEST_Q8_ATTENTION_LIB)
 	$(METAL_TEST_ENV) $(TEST_Q8_PREFILL_TEST) $(TEST_Q8_ATTENTION_LIB)
 	$(METAL_TEST_ENV) $(TEST_GDN_METAL_TEST) $(LIB)
-	$(METAL_TEST_ENV) $(TEST_STATE_CODEC_TEST) $(LIB)
+	$(METAL_TEST_ENV) $(TEST_STATE_CODEC_TEST) $(TEST_PRODUCTION_LIB)
 	$(METAL_TEST_ENV) $(TEST_DFLASH_BATCH_CONTROL_TEST) $(LIB)
 	$(METAL_TEST_ENV) $(TEST_DRAFT_ATTENTION_TEST) $(LIB)
 	$(METAL_TEST_ENV) $(TEST_GDN_DECODE_TEST) $(LIB)
