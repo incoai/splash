@@ -540,7 +540,7 @@ TtftPart Engine::holderOf(const Request &active) const {
   }
   if (pending_)
     return pending_->plan.kind == WorkKind::Decode ? TtftPart::Decode : TtftPart::OtherPrefill;
-  return TtftPart::Rest;
+  return unitWait_ ? TtftPart::UnitWait : TtftPart::Rest;
 }
 
 void Engine::firstTokens(Request &active) {

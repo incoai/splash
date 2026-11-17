@@ -443,7 +443,7 @@ void NativeRuntime::tokens(uint64_t requestId,
     parts[static_cast<size_t>(TtftPart::Rest)] = std::max(0.0, ttft - counted);
     metrics_.ttftParts(parts);
     logLine("TTFT of request ", requestId, ": ", ttft, " ms: own prefill ", parts[0], ", claim wait ", parts[1],
-            ", decode ", parts[2], ", other prefill ", parts[3], ", rest ", parts[4]);
+            ", decode ", parts[2], ", other prefill ", parts[3], ", unit wait ", parts[4], ", rest ", parts[5]);
   }
   uint32_t offset = telemetry.emittedTokens;
   telemetry.emittedTokens += static_cast<uint32_t>(values.size());

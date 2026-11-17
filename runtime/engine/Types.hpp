@@ -167,11 +167,12 @@ inline constexpr std::string_view kDeadlineExceededMessage =
 // What held a request before its first token, in
 // milliseconds, each interval counted once by precedence: a command in
 // flight that carries its prompt's rows, its memory claim waiting, a decode
-// command, another request's prefill command, and the rest (the host,
-// admission, idle). The engine measures the first four between its ticks;
-// the rest is the time to the first token less them.
-enum class TtftPart : uint8_t { OwnPrefill, ClaimWait, Decode, OtherPrefill, Rest };
-inline constexpr size_t kTtftParts = 5;
+// command, another request's prefill command, the next prefill unit waiting
+// for a decoder whose memory lands (Scheduler::waitsUntil), and the rest
+// (the host, admission, idle). The engine measures the first five between
+// its ticks; the rest is the time to the first token less them.
+enum class TtftPart : uint8_t { OwnPrefill, ClaimWait, Decode, OtherPrefill, UnitWait, Rest };
+inline constexpr size_t kTtftParts = 6;
 using TtftParts = std::array<double, kTtftParts>;
 
 class EngineEventSink {

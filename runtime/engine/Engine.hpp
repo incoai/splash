@@ -979,7 +979,8 @@ private:
   // holds(now) counts the time since the last tick
   // to what held each then; holderOf names what holds one as the engine is
   // now, by precedence: a prefill command in flight with its rows, its claim
-  // waiting, a decode command, another prefill command, the rest. Before a
+  // waiting, a decode command, another prefill command, the next prefill
+  // unit's wait for a decoder (unitWait_), the rest. Before a
   // request's first tokens, firstTokens sends what held it.
   void holds(double nowMilliseconds) noexcept;
   [[nodiscard]] TtftPart holderOf(const Request &request) const;

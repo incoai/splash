@@ -311,6 +311,25 @@ void testAUnitsWaitRunsOutWithoutACommand() {
   spill.runUntilIdle();
 }
 
+// The prompt's TTFT shows its unit's wait for the decoder whose memory lands (TtftPart::UnitWait), all of it, which
+// it counted as the rest's idle time.
+void testAUnitsWaitCountsInItsPromptsTtft() {
+  Spilling spill(400, false, 1'000'000, 0, {4}, {}, {}, false, {.count = 2048});
+  const double converted = convertBesideAPrompt(spill);
+  const double waitEnd = *spill.engine.nextWakeupMilliseconds();
+  for (; spill.now <= waitEnd; spill.now += 1.0)
+    static_cast<void>(spill.engine.tick(spill.now));
+  spill.storage.budgetPages = 4'096;
+  spill.runUntil([&] { return !spill.events.outputs[2].empty(); }, "the prompt did not answer once the wall went");
+  const double counted = spill.events.ttftParts.at(2)[static_cast<size_t>(TtftPart::UnitWait)];
+  require(counted >= waitEnd - converted,
+          "the prompt's TTFT counted " + std::to_string(counted) + " ms of its unit's " +
+              std::to_string(waitEnd - converted) + " ms wait for the decoder");
+  spill.engine.cancel(1);
+  spill.engine.cancel(2);
+  spill.runUntilIdle();
+}
+
 // A converted lane preempted and resumed stays Spill under its output limit when the quota holds its
 // projection; a quota short of it bounds the resume, and the bound and the end at it count as the
 // converted lane's.
@@ -4647,6 +4666,7 @@ std::span<const test::TestCase> spillTests() {
        testAConversionWithCopiesRunsInTheCommandItConvertsFor},
       {"testAUnitsWaitEndsWithItsLanes", testAUnitsWaitEndsWithItsLanes},
       {"testAUnitsWaitRunsOutWithoutACommand", testAUnitsWaitRunsOutWithoutACommand},
+      {"testAUnitsWaitCountsInItsPromptsTtft", testAUnitsWaitCountsInItsPromptsTtft},
       {"testAConvertedLaneResumesUnderTheSpillRules", testAConvertedLaneResumesUnderTheSpillRules},
       {"testAConvertedLanesMovesReleaseTheExtentsTheyEmpty", testAConvertedLanesMovesReleaseTheExtentsTheyEmpty},
       {"testALongDecodingLaneConvertsItselfAtTheWall", testALongDecodingLaneConvertsItselfAtTheWall},
