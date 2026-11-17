@@ -3273,6 +3273,150 @@ void childTestsUnderAFloor(MetalBackend &backend, const SamplingPolicy &policy, 
     require(failed.empty(), variant + failed);
 }
 
+// The selector's own trees select from the target, Monte Carlo, end to end
+// on the device, where childTestsOnTrees' and childTestsUnderAFloor's draws
+// are the host's: each run, draft_select_tree grows every lane's tree from
+// the draft's candidates with fresh noise (DraftTreeLane::noise) and records
+// of each row the children it drew, in the order drawn, and the q_T its keys
+// drew them from (draws, next), draft_verify_rows lays the trees out, the
+// verify rows test those records and acceptance walks the rows. A lane's
+// anchor draws three children at the policy's temperature from the
+// candidates of treeTargets' anchor, its draft favoring the less likely of
+// its six likeliest; each child row it takes draws three of its own a
+// position deeper, over edges of its own predecessor; and the tree takes
+// three rows (depth 2): the first child drawn, then the second or a
+// grandchild. A selector that records its draws in another order than it
+// drew them, or keeps in `next` another q than its keys drew from, moves the
+// anchor's selections off the target's distribution. Over 1500 runs of four
+// lanes (6000 trees), the anchor's selections follow the target's
+// distribution at the anchor, and a child's, where acceptance walked to it
+// 300 times or more (two children at least), the target's at that child, by
+// followsDistribution's chi-square: the policy's top 20 at temperature 0.7
+// and top_p 0.95 leave each check here 8 degrees of freedom (the anchor and
+// four children walked 443 to 902 times), at which a correct sampler fails
+// one with probability 4.7e-4 (the chi-square tail past nu + 5 sqrt(2 nu)),
+// all five below 2.4e-3; the seeds are fixed, so a passing run repeats.
+void childTestsOfTheSelectorsDraws(MetalBackend &backend, const SamplingPolicy &policy) {
+  constexpr uint32_t vocabulary = 1003, kRuns = 1500, kTreeRows = 3, kDraftRows = SPLASH_DRAFT_QUERY_ROWS;
+  constexpr uint32_t kRank = SPLASH_DRAFT_SELECTOR_RANK;
+  Sampling sampling(vocabulary);
+  const DraftSelector selector(vocabulary);
+  const Batch batch = makeBatch(backend, vocabulary, kLanes);
+  const MetalBuffer table = penaltyTable(backend, vocabulary);
+  const std::array<uint32_t, kLanes> tableRows{};
+  const std::vector<SamplingPolicy> policies(kLanes, policy);
+  Random random(0x73656c64);
+  const TreeTargets t = treeTargets(vocabulary, policy, false, random);
+  // The draft's rows: at position 0 the anchor's candidates at their draft
+  // probabilities, at position 1 the children's shared ones at the first
+  // child's, every other token far below. bf16 edge factors of 0.1 at most,
+  // so that a child's next probabilities follow its own predecessor.
+  const auto workspace = DraftSelector::workspace(kLanes * kPositions);
+  const auto bfloat = [&](uint64_t count) {
+    MetalBuffer buffer = allocate(backend, count * sizeof(uint16_t));
+    auto *values = static_cast<uint16_t *>(buffer.contents());
+    for (uint64_t i = 0; i < count; ++i) {
+      const float value = 0.1F * random.unit();
+      uint32_t bits = 0;
+      std::memcpy(&bits, &value, sizeof(bits));
+      values[i] = static_cast<uint16_t>(bits >> 16);
+    }
+    return buffer;
+  };
+  DraftSelectorBuffers trees{};
+  trees.logits = allocate(backend, uint64_t{kLanes} * kDraftRows * vocabulary * sizeof(float));
+  trees.partialIds = allocate(backend, workspace.partialIdsBytes);
+  trees.partialValues = allocate(backend, workspace.partialValuesBytes);
+  trees.candidates = batch.buffers.candidates;
+  trees.unary = allocate(backend, workspace.unaryBytes);
+  trees.selectorHidden = bfloat(uint64_t{kLanes} * kDraftRows * kRank);
+  trees.chainTokens = allocate(backend, uint64_t{kLanes} * SPLASH_TREE_CHAIN_TOKENS * sizeof(uint32_t));
+  trees.chainRates =
+      allocate(backend, uint64_t{kLanes} * SPLASH_TREE_CHAIN_TOKENS * SPLASH_TREE_AGREEMENTS * sizeof(float));
+  trees.treeTokens = allocate(backend, uint64_t{kLanes} * kBlock * sizeof(uint32_t));
+  trees.trees = allocate(backend, uint64_t{kLanes} * kBlock * sizeof(TreeRow));
+  trees.treeScores = allocate(backend, uint64_t{kLanes} * kBlock * 2 * sizeof(float));
+  trees.treeSizes = allocate(backend, uint64_t{kLanes} * sizeof(uint32_t));
+  trees.treeDraws = batch.buffers.treeDraws;
+  trees.treeNext = batch.buffers.treeNext;
+  trees.treeCaps = allocate(backend, uint64_t{kLanes} * kBlock * sizeof(float));
+  trees.inputTokens = batch.buffers.inputTokens;
+  trees.treeRows = batch.buffers.treeRows;
+  trees.laneRows = batch.buffers.laneRows;
+  trees.verifySources = batch.buffers.verifySources;
+  const DraftCodebooks codebooks{bfloat(uint64_t{vocabulary} * kRank), bfloat(uint64_t{vocabulary} * kRank)};
+  auto *draft = static_cast<float *>(trees.logits.contents());
+  std::fill_n(draft, uint64_t{kLanes} * kDraftRows * vocabulary, -30.0F);
+  for (uint32_t lane = 0; lane < kLanes; ++lane)
+    for (uint32_t i = 0; i < kCandidates; ++i) {
+      draft[(uint64_t{lane} * kDraftRows + 1) * vocabulary + t.first.ids[i]] = std::log(float(t.first.q[i]));
+      draft[(uint64_t{lane} * kDraftRows + 2) * vocabulary + t.second[0].ids[i]] = std::log(float(t.second[0].q[i]));
+    }
+  const StepRows step{kLanes, kLanes * kTreeRows, kNarrowLaneRows};
+  std::array<uint32_t, kLanes> limits{};
+  limits.fill(step.laneCap);
+  const AcceptanceBuffers acceptance = acceptanceBuffers(backend, batch, kLanes);
+  const auto *laneRows = static_cast<const LaneRows *>(batch.buffers.laneRows.contents());
+  const auto *sources = static_cast<const uint32_t *>(batch.buffers.verifySources.contents());
+  const auto *tokens = static_cast<const uint32_t *>(trees.treeTokens.contents());
+  const auto *rows = static_cast<const TreeRow *>(trees.trees.contents());
+  // A candidate's index in treeTargets' order, whose child targets it takes.
+  const auto indexOf = [&](uint32_t token) {
+    return static_cast<uint32_t>(std::find(t.first.ids.begin(), t.first.ids.end(), token) - t.first.ids.begin());
+  };
+  std::vector<uint32_t> anchorCounts(vocabulary, 0);
+  std::vector<std::vector<uint32_t>> childCounts(kCandidates, std::vector<uint32_t>(vocabulary, 0));
+  for (uint32_t run = 0; run < kRuns; ++run) {
+    std::vector<DraftTreeLane> lanes;
+    for (uint32_t lane = 0; lane < kLanes; ++lane)
+      lanes.push_back({7, 2, 0, 3, DraftCalibration{}, policy.temperature,
+                       uint64_t{random.next()} << 32 | random.next()});
+    CommandGraph layout;
+    selector.add(layout, trees, codebooks, DraftVocabulary{}, lanes);
+    DraftSelector::addVerifyRows(layout, trees, step);
+    static_cast<void>(backend.submitCommandAsync(layout.dispatches()).wait());
+    // Each row's logits: its tree row's, the anchor's, a child's or a
+    // grandchild's.
+    for (uint32_t lane = 0; lane < kLanes; ++lane) {
+      require(laneRows[lane].rows == kTreeRows, "a lane's tree did not take three rows");
+      for (uint32_t at = 0; at < laneRows[lane].rows; ++at) {
+        const uint32_t row = lane * kBlock + sources[laneRows[lane].first + at];
+        const std::vector<float> &logits = rows[row].depth == 0   ? t.anchor
+                                           : rows[row].depth == 1 ? t.childLogits[indexOf(tokens[row])]
+                                                                  : t.leaf;
+        std::copy(logits.begin(), logits.end(), batch.row(laneRows[lane].first + at));
+      }
+    }
+    for (uint32_t uniform = 0; uniform < kLanes * kUniforms; ++uniform)
+      batch.uniforms()[uniform] = 0.5F * (random.unit() + 1.0F);
+    batch.poison();
+    CommandGraph graph;
+    sampling.addVerify(graph, policies, batch.buffers, step, kStopTokens, {table, tableRows});
+    sampling.addAcceptance(graph, acceptance, step, limits, kStopTokens);
+    static_cast<void>(backend.submitCommandAsync(graph.dispatches()).wait());
+    const auto *retained = static_cast<const uint32_t *>(acceptance.retainedCounts.contents());
+    for (uint32_t lane = 0; lane < kLanes; ++lane) {
+      const uint32_t *kept = static_cast<const uint32_t *>(acceptance.outputTokens.contents()) + laneRows[lane].first;
+      ++anchorCounts[kept[0]];
+      if (retained[lane] >= 2)
+        ++childCounts[indexOf(kept[0])][kept[1]];
+    }
+  }
+  const std::string variant = "the selector's draws at temperature " + std::to_string(policy.temperature) + ": ";
+  std::string text;
+  require(followsDistribution(anchorCounts, t.root.probabilities, variant + "the anchor's selections", text),
+          variant + "the anchor's selections: " + text);
+  uint32_t children = 0;
+  for (uint32_t i = 0; i < kCandidates; ++i) {
+    if (std::accumulate(childCounts[i].begin(), childCounts[i].end(), 0U) < 300)
+      continue;
+    const std::string label = variant + "child " + std::to_string(i) + "'s selections";
+    require(followsDistribution(childCounts[i], t.childTargets[i].probabilities, label, text), label + ": " + text);
+    ++children;
+  }
+  require(children >= 2, variant + "too few children were walked to check their selections");
+}
+
 // The host words: prompt bits only when repetition reads them, counts of
 // every selected token (the generated history and the pending anchor), and
 // no token outside the vocabulary or history without a prompt.
@@ -3448,6 +3592,8 @@ int main(int argc, char **argv) {
     childTestsUnderAFloor(backend, SamplingPolicy{20, 1.0F, 0.95F}, false);
     stage = "child tests under a floor on estimates of a row's own draws";
     childTestsUnderAFloor(backend, SamplingPolicy{20, 1.0F, 0.95F}, true);
+    stage = "child tests of the selector's own draws";
+    childTestsOfTheSelectorsDraws(backend, SamplingPolicy{20, 0.7F, 0.95F});
     for (const uint32_t vocabulary : {1003U, 248320U}) {
       uint32_t changedSelections = 0;
       for (uint32_t lanes = 1; lanes <= kLanes; ++lanes) {
