@@ -1208,9 +1208,14 @@ void run(const char *libraryPath) {
     runCase(device, queue, pipelines, shape, 127, 8, 4, true, 32, false, true);
     runCase(device, queue, pipelines, shape, 4'093, 7, 2, false, 65, false, true);
     // Tree rows of lanes of 16, 5, 9 and 12 rows packed by their first rows,
-    // over no history and one past a page.
+    // over no history, one past a page, and a long one over 65 splits of two
+    // pages each, at which a 16-row lane's second tile reads a page more
+    // than its first (129 and 128), so that the split and the reduce of each
+    // tile partition its own pages (Flint's geometry alone had 16-row trees
+    // over long histories, attention_variants_metal_test).
     raggedTrees(device, queue, pipelines, shape, 0, 32, true);
     raggedTrees(device, queue, pipelines, shape, 127, 32, true);
+    raggedTrees(device, queue, pipelines, shape, 4'083, 65, false);
     if (shape.queryHeadsPerKvHead == 12) {
       // Tree rows through QSA lists and row masks, causal and sparse, and
       // against their paths as chains.
