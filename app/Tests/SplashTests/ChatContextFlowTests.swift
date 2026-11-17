@@ -81,6 +81,31 @@ struct ChatContextFlowTests {
         }
     }
 
+    /// A draft the context cannot hold goes with a new chat while an image of it is still being
+    /// encoded, and the image joins it there once kept: the new chat's draft holds the text and
+    /// the image and can go, and the chat it left can send again. Joining the chat it was attached
+    /// in, the image made a draft of its own there, which counted an image too few, and the new
+    /// chat's draft waited for it for good: neither chat could send.
+    @Test func aDraftGoesWithANewChatWithAnImageStillBeingEncoded() async throws {
+        try await withServer { fixture in
+            let state = fixture.state
+            let long = String(repeating: "x", count: 300)
+            state.draft.text = long
+            let full = try await count(state)
+            #expect(full.level == .full && state.overflow == full)
+            state.draft.attach([try #require(NSImage(data: Showcase.picture))])
+            #expect(state.draft.attaching == 1 && state.overflow == full)
+            state.newChat()
+            #expect(state.draft.text == long && state.draft.attaching == 1)
+            try await waitFor(state.draft.attaching == 0, "the image")
+            #expect(state.draft.text == long && state.draft.attachments.count == 1 && state.canSendDraft)
+            state.chats.selection = fixture.history.id
+            #expect(state.draft.isEmpty && state.draft.attaching == 0)
+            state.draft.text = "Short?"
+            #expect(state.canSendDraft)
+        }
+    }
+
     @Test func aPromptInsideTheReplyAllowanceStillGoes() async throws {
         try await withServer { fixture in
             let state = fixture.state

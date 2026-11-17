@@ -12,6 +12,9 @@ import UniformTypeIdentifiers
 final class Draft {
     /// What a chat's draft holds.
     private struct Kept {
+        /// Which draft it is, for what is attached to it to join it wherever it has gone by the
+        /// time it is kept (`carry`).
+        let id = UUID()
         var text = ""
         var attachments: [Attachment] = []
         var thumbnails: [UUID: NSImage] = [:]
@@ -68,15 +71,13 @@ final class Draft {
     /// They are encoded away from the main thread, which a photo would hold for a tenth of a second
     /// or more, and join the draft in the order they were attached.
     func attach(_ images: [NSImage], unreadable: Int = 0) {
-        // In the chat they were attached in, whichever is open once they are kept.
-        let chat = chat()
         let sources = images.compactMap { $0.cgImage(forProposedRect: nil, context: nil, hints: nil) }
         let missed = images.count - sources.count + unreadable
         guard !sources.isEmpty else {
-            if missed > 0 { noticeUnattached(missed, in: chat) }
+            if missed > 0 { drafts[chat(), default: Kept()].notice = Self.unattached(missed) }
             return
         }
-        drafts[chat, default: Kept()].attaching += sources.count
+        let draft = startAttaching(sources.count)
         let files = files
         let encoding = Task.detached(priority: .userInitiated) {
             sources.compactMap { source in Self.encoded(source).flatMap { Self.kept($0, in: files) } }
@@ -85,18 +86,20 @@ final class Draft {
         lastAttachment = Task {
             await previous?.value
             let encoded = await encoding.value
-            for (attachment, data) in encoded {
-                drafts[chat, default: Kept()].attachments.append(attachment)
-                drafts[chat, default: Kept()].thumbnails[attachment.id] = NSImage(data: data)
+            update(draft) { draft in
+                for (attachment, data) in encoded {
+                    draft.attachments.append(attachment)
+                    draft.thumbnails[attachment.id] = NSImage(data: data)
+                }
+                draft.attaching -= sources.count
+                let failed = missed + sources.count - encoded.count
+                if failed > 0 { draft.notice = Self.unattached(failed) }
             }
-            drafts[chat, default: Kept()].attaching -= sources.count
-            let failed = missed + sources.count - encoded.count
-            if failed > 0 { noticeUnattached(failed, in: chat) }
         }
     }
 
-    private func noticeUnattached(_ failed: Int, in chat: UUID?) {
-        drafts[chat, default: Kept()].notice = failed == 1 ? "An image couldn’t be attached" : "\(failed) images couldn’t be attached"
+    private static func unattached(_ failed: Int) -> String {
+        failed == 1 ? "An image couldn’t be attached" : "\(failed) images couldn’t be attached"
     }
 
     /// Attaches the PDFs at `urls` as they are, with their names and pages, read and kept away from
@@ -104,21 +107,38 @@ final class Draft {
     /// the server to say why.
     func attach(pdfs urls: [URL]) {
         guard !urls.isEmpty else { return }
-        let chat = chat()
-        drafts[chat, default: Kept()].attaching += urls.count
+        let draft = startAttaching(urls.count)
         let files = files
         let reading = Task.detached(priority: .userInitiated) { urls.map { ($0, Self.keptPDF($0, in: files)) } }
         let previous = lastAttachment
         lastAttachment = Task {
             await previous?.value
             let read = await reading.value
-            drafts[chat, default: Kept()].attachments += read.compactMap(\.1)
-            drafts[chat, default: Kept()].attaching -= urls.count
-            let failed = read.filter { $0.1 == nil }.map { $0.0.lastPathComponent }
-            if let first = failed.first {
-                drafts[chat, default: Kept()].notice = failed.count == 1 ? "“\(first)” couldn’t be read" : "\(failed.count) PDFs couldn’t be read"
+            update(draft) { draft in
+                draft.attachments += read.compactMap(\.1)
+                draft.attaching -= urls.count
+                let failed = read.filter { $0.1 == nil }.map { $0.0.lastPathComponent }
+                if let first = failed.first {
+                    draft.notice = failed.count == 1 ? "“\(first)” couldn’t be read" : "\(failed.count) PDFs couldn’t be read"
+                }
             }
         }
+    }
+
+    /// Counts `count` attachments under way in the open chat's draft, and names the draft, which
+    /// they join once kept, in whichever chat it is by then (`update`).
+    private func startAttaching(_ count: Int) -> UUID {
+        var draft = drafts[chat()] ?? Kept()
+        draft.attaching += count
+        drafts[chat()] = draft
+        return draft.id
+    }
+
+    /// Changes draft `id` in whichever chat it is now, a new chat it went with (`carry`) or its
+    /// own; nothing where it is gone, with its chat deleted (`forget`).
+    private func update(_ id: UUID, _ change: (inout Kept) -> Void) {
+        guard let found = drafts.first(where: { $0.value.id == id }) else { return }
+        change(&drafts[found.key]!)
     }
 
     /// The record of the PDF at `url`, kept as a file in `files`; nil where it can't be read or
