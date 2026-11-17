@@ -508,6 +508,13 @@ extension LaunchOption {
             kind: .choice(standard: "0.5", choices: [], custom: Value(prompt: "1", message: "A number, 0 or more.",
                                                                      parse: { Double($0).flatMap { $0 >= 0 ? String($0) : nil } }))),
         LaunchOption(
+            flag: "--foreground-turn-tokens", title: "Foreground sharing",
+            help: "Experimental: share short answering turns among urgent text requests so they can start sooner. Off keeps standard scheduling; 0 turns sharing off.",
+            section: .requests,
+            kind: .choice(standard: "Off", choices: [("32", "32 tokens"), ("64", "64 tokens")],
+                          custom: Value(prompt: "32", message: "Tokens per turn, 0 to 4,096.",
+                                        parse: { Int($0).flatMap { (0...4096).contains($0) ? String($0) : nil } }))),
+        LaunchOption(
             flag: "--verify-rows", title: "Repeatable answers",
             help: "Greedy and seeded answers repeat when a request runs alone with the same prompts cached, at some cost in speed. A prompt sent again reads from the cache, so its answer can differ.",
             section: .requests, kind: .choice(standard: "Off", choices: [("all", "On")], custom: nil)),
