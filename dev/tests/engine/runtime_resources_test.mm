@@ -130,10 +130,11 @@ StreamedStart startStreamed(const RuntimeResourcesConfig &config, uint32_t reque
 // before a streamable part loads whole: the first 64K tokens (the window
 // where that is less) and their speculative rows, in the fewest pages whose
 // extents hold them as one request's KV capacity rounds them
-// (kvCapacityPagesFor), less the runway among the floors. A part loads whole
-// only where the budget holds its floors, all of it and this allowance. It is
-// not the allowance a store's growth above its smallest is priced with, which
-// in a windowed layout also keeps a streamed command's pages Full.
+// (kvCapacityPagesFor), with their tokens' lookup index, less the runway
+// among the floors. A part loads whole only where the budget holds its
+// floors, all of it and this allowance. It is not the allowance a store's
+// growth above its smallest is priced with, which in a windowed layout also
+// keeps a streamed command's pages Full.
 uint64_t residentAllowanceBytes(const RuntimeResourcesConfig &config) {
   kv::Layout layout = config.model.targetKvLayout;
   layout.format = config.kvFormat;
@@ -142,8 +143,9 @@ uint64_t residentAllowanceBytes(const RuntimeResourcesConfig &config) {
   const uint64_t pages = (tokens + kv::kPageTokens - 1) / kv::kPageTokens;
   uint64_t budget = pages;
   while (kvCapacityPagesFor(layout, budget) < pages) ++budget;
-  return kvPagesBytes(layout, budget, kvWindowFloorPages(layout, 0), layout.extentPagesFor(budget)) -
-         kvRunwayPages(layout.minimumExtentPages()) * layout.bytesPerModelPage();
+  const uint64_t index = kv::kPageTokens * model::kLookupIndexTokenBytes;
+  return kvPagesBytes(layout, budget, kvWindowFloorPages(layout, 0), layout.extentPagesFor(budget)) + budget * index -
+         kvRunwayPages(layout.minimumExtentPages()) * (layout.bytesPerModelPage() + index);
 }
 
 // The runtime memory a start plans of a model of `config` before its weights

@@ -37,9 +37,11 @@ ModelMemoryProfile model() {
   return test::modelMemoryProfile(2 * kGiB, 1 * kGiB, 1 * kGiB);
 }
 
-// The pages the budget holds for one request's KV beside one lane's state.
+// The pages the budget holds for one request's KV beside one lane's state,
+// each with its tokens' lookup index on the host.
 uint64_t budgetPages(const EngineMemoryBreakdown &budget) {
-  return (budget.dynamicBudgetBytes - budget.laneStateBytes) / budget.kvPageBytes;
+  return (budget.dynamicBudgetBytes - budget.laneStateBytes) /
+         (budget.kvPageBytes + 32 * model::kLookupIndexTokenBytes);
 }
 
 void testUnifiedElasticBudget() {
@@ -54,7 +56,7 @@ void testUnifiedElasticBudget() {
               budget.hardBudgetBytes - budget.fixedRuntimeBytes,
           "state and KV do not share one dynamic budget");
   require(budget.minimumDynamicBytes ==
-                  budget.laneStateBytes + budget.kvExtentBytes &&
+                  budget.laneStateBytes + budget.kvExtentBytes + 128 * 32 * model::kLookupIndexTokenBytes &&
               budget.minimumRequiredBytes ==
                   budget.fixedRuntimeBytes + budget.minimumDynamicBytes,
           "minimum B1 plus the KV runway is incorrect");
@@ -129,7 +131,7 @@ void testMinimumHoldsTheWarmupRunway() {
   const EngineMemoryPlan plan = test::requireMemoryPlan(device(), profile);
   const auto &budget = plan.breakdown();
   require(budget.minimumDynamicBytes ==
-              budget.laneStateBytes + 64 * budget.kvPageBytes,
+              budget.laneStateBytes + 64 * (budget.kvPageBytes + 32 * model::kLookupIndexTokenBytes),
           "the minimum does not hold the warmup runway");
   const auto refused =
       evaluateEngineMemoryPlan(device(), profile, budget.minimumRequiredBytes - 1);
@@ -342,9 +344,11 @@ void testWindowedKvCostsSlimPages() {
   const auto extents = [&](uint64_t pages) { return (pages + extent - 1) / extent; };
   const uint64_t taken =
       extents(81) * extent * fullBytes + extents(budget.kvCapacityPages - 81) * extent * slimBytes;
+  // With each page's tokens' lookup index on the host.
+  const uint64_t index = 32 * model::kLookupIndexTokenBytes, held = taken + budget.kvCapacityPages * index;
   require(budget.kvPageBytes == fullBytes && budget.kvSlimPageBytes == slimBytes && budget.kvWindowFloorPages == 81 &&
               budget.kvExtentPages == extent && (budget.kvCapacityPages - 81) % extent == 0 &&
-              taken <= available && available - taken < extent * slimBytes && budget.kvCapacityBytes == taken &&
+              held <= available && available - held < extent * (slimBytes + index) && budget.kvCapacityBytes == taken &&
               budget.kvCapacityPages > 3 * full.kvCapacityPages,
           "a windowed layout's KV capacity is not its lane's Full pages and the Slim extents beside them");
   require(full.kvSlimPageBytes == 0 && full.kvWindowFloorPages == 0 &&
@@ -371,7 +375,7 @@ void testExtentSizeFollowsThePool() {
     return evaluateEngineMemoryPlan(
         device(), compact,
         reference.fixedRuntimeBytes + reference.laneStateBytes +
-            pages * reference.kvPageBytes);
+            pages * (reference.kvPageBytes + 32 * model::kLookupIndexTokenBytes));
   };
   for (const auto [pages, extent] :
        std::array<std::array<uint64_t, 2>, 4>{{{10'240, 512}, {10'496, 256},
@@ -385,7 +389,7 @@ void testExtentSizeFollowsThePool() {
   const auto tooSmall = planFor(255);
   require(!tooSmall.plan && tooSmall.status.code == BudgetErrorCode::KvPoolDoesNotFit &&
               tooSmall.status.breakdown.minimumDynamicBytes ==
-                  reference.laneStateBytes + 256 * 332'800,
+                  reference.laneStateBytes + 256 * (332'800 + 32 * model::kLookupIndexTokenBytes),
           "a budget below the smallest extent was accepted");
 }
 
@@ -563,13 +567,14 @@ void testFlashNextOnTheThreeMacs() {
     require(spill.enabled && plan.tableBytes == kFlashNextTableShare,
             std::string("Flash-Next's table on the ") + mac.name + " does not stream through its share");
     // The floors, the arenas, the stores and the KV of the first 64K tokens
-    // and their speculative rows (2,049 pages), in the fewest pages whose
+    // and their speculative rows (2,049 pages) with their lookup index, in the fewest pages whose
     // extents hold them as one request's capacity, the runway among them,
     // fill the budget, or leave the KV more where the experts load whole.
     const uint64_t charged = inputs.fixedBytes + inputs.arenaBytes[plan.expertBytes != 0][1] + inputs.laneStateBytes +
                              spill.floorBytes +
                              (plan.expertBytes ? plan.expertBytes : kFlashNext.experts.allBytes) + plan.tableBytes +
-                             budgetPagesHolding(test::sparseKvLayout(), 2'049) * page;
+                             budgetPagesHolding(test::sparseKvLayout(), 2'049) *
+                                 (page + 32 * model::kLookupIndexTokenBytes);
     if (mac.workingSet == kM5Pro.workingSet)
       require(!plan.expertBytes && charged < hardBudget(mac), "the M5 Pro does not load Flash-Next's experts whole");
     else
@@ -628,7 +633,8 @@ void testSpillAllowanceFollowsASmallerRequestedContext() {
   const StreamedMemoryPlan plan = requirePlan(inputs);
   const uint64_t charged = inputs.fixedBytes + inputs.arenaBytes[plan.expertBytes != 0][1] + inputs.laneStateBytes +
                            plan.spill.floorBytes + plan.expertBytes + plan.tableBytes +
-                           budgetPagesHolding(test::sparseKvLayout(), 513) * page;
+                           budgetPagesHolding(test::sparseKvLayout(), 513) *
+                               (page + 32 * model::kLookupIndexTokenBytes);
   require(plan.spill.enabled && plan.expertBytes && charged == hardBudget(kM6),
           "Flash-Next with a 16K context kept more than 16K tokens resident beside its experts");
 }
@@ -638,7 +644,7 @@ void testSpillAllowanceFollowsASmallerRequestedContext() {
 // beside the whole Q2_K_XL, the others the 256K window of UD-Q4_K_M.
 void testDense35BKeepsMainsPlan() {
   const std::tuple<Mac, Target, uint32_t, uint64_t> pinned[] = {
-      {kM6, k35BQ2, 229'361, 229'376}, {kStudio, k35BQ4, 262'144, 352'256}, {kM5Pro, k35BQ4, 262'144, 2'801'664}};
+      {kM6, k35BQ2, 229'361, 229'376}, {kStudio, k35BQ4, 262'144, 344'064}, {kM5Pro, k35BQ4, 262'144, 2'777'088}};
   for (const auto &[mac, target, context, capacityTokens] : pinned) {
     const StreamedMemoryPlan plan = requirePlan(target.inputs(mac));
     require(!plan.expertBytes && !plan.tableBytes && !plan.spill.enabled,
@@ -918,8 +924,8 @@ void testSpillHoldsTheArenasOfASpillingRuntime() {
   const uint64_t chunk = arenaBytes(kFlashNext.chunk);
   inputs.spillArenaBytes.fill({chunk, chunk});
   const uint64_t base = inputs.fixedBytes + chunk + inputs.laneStateBytes +
-                        256 * test::sparseKvLayout().bytesPerModelPage() + kFlashNext.experts.allBytes +
-                        kFlashNext.table.allBytes;
+                        256 * (test::sparseKvLayout().bytesPerModelPage() + 32 * model::kLookupIndexTokenBytes) +
+                        kFlashNext.experts.allBytes + kFlashNext.table.allBytes;
   for (inputs.hardBudgetBytes = base; !requirePlan(inputs).spill.enabled; inputs.hardBudgetBytes += 16 * kMiB)
     require(inputs.hardBudgetBytes < base + 4 * kGiB, "no budget let the target spill");
   inputs.spillArenaBytes.fill({chunk + kExtra, chunk + kExtra});
@@ -1114,7 +1120,8 @@ void testResidentContextIsWhatALoneStartTakes() {
     const KvSpillPlan &spill = streamed.spill;
     const uint64_t held = spill.heldBytes();
     const ModelMemoryProfile profile = kFlashNext.profile(streamed.expertBytes, streamed.tableBytes, spill);
-    const uint64_t extent = 256 * layout.bytesPerModelPage();
+    // An extent's pages with their tokens' lookup index.
+    const uint64_t extent = 256 * (layout.bytesPerModelPage() + 32 * model::kLookupIndexTokenBytes);
     const uint64_t eight = profile.fixedRuntimeBytes() + kFlashNext.chunk.laneStatePlannedAllocatedBytes + 8 * extent;
     for (const uint64_t room : {uint64_t{0}, held - 1, held, extent / 2, extent - 1}) {
       const EngineMemoryBreakdown budget =

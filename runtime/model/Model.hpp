@@ -737,6 +737,10 @@ struct ModelMemoryPlan final {
 // overhead. Startup counts them before a model loads.
 inline constexpr uint64_t kPipelineReserveBytes = 256ULL << 20;
 inline constexpr uint64_t kRuntimeOverheadReserveBytes = 512ULL << 20;
+// What a resident request's lookup index (LookupIndex) holds on the host a
+// token: 84 bytes on a traced 128K-token prompt, 89 on a 100K one. The plan
+// counts it with the tokens of the KV pages it prices.
+inline constexpr uint64_t kLookupIndexTokenBytes = 89;
 
 struct ModelMemoryActual final {
   uint64_t stateActualAllocatedBytes = 0;

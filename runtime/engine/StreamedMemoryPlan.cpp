@@ -97,8 +97,9 @@ struct SpillFloors final {
     return buffers * extentsBytes(in.kvLayout, pagesOf(kvTokens(tokens)), in.kvLayout.bytesPerLayerPage());
   }
   [[nodiscard]] uint64_t bytes(uint64_t tokens, uint32_t buffers) const {
-    return geometry.spillFloorBytes(kvTokens(tokens)) + indexRunwayBytes +
-           readerTableBytes(in, hotFloorBytes, buffers) + std::max(stagingBytes(tokens, buffers), hotFloorBytes);
+    return geometry.spillFloorBytes(kvTokens(tokens)) + kvTokens(tokens) * model::kLookupIndexTokenBytes +
+           indexRunwayBytes + readerTableBytes(in, hotFloorBytes, buffers) +
+           std::max(stagingBytes(tokens, buffers), hotFloorBytes);
   }
 };
 
@@ -264,8 +265,9 @@ StreamedMemoryResult planParts(const StreamedMemoryInputs &in, const Part &exper
     // A windowed layout's KV beyond its lane's Full pages is Slim, in
     // extents of its own.
     const uint32_t floorPages = kvWindowFloorPages(layout, streaming ? in.groupPages : 0);
-    return static_cast<int64_t>(
-        saturatingSubtract(kvPagesBytes(layout, budget, floorPages, layout.extentPagesFor(budget)), runwayBytes));
+    const uint64_t index = budget * kv::kPageTokens * model::kLookupIndexTokenBytes;
+    return static_cast<int64_t>(saturatingSubtract(
+        kvPagesBytes(layout, budget, floorPages, layout.extentPagesFor(budget)) + index, runwayBytes));
   };
   const int64_t tableShare =
       table.automatic
