@@ -379,10 +379,10 @@ struct ClaimState final {
   bool hostRefusedWaiting = false;
   // The host refused it after in-place units could not meet it: the
   // allocation's retries pass the host with each of their reservations (an
-  // InService claim, or an Optional one its lane needs; a Start's, its margin)
-  // until the allocation ends (Engine::allocate), since nothing left in place
-  // would meet it and waiting would stall the work in service. A growth pass
-  // also sets it on a unit it admitted on its net change, so that allocation
+  // InService claim, or an Optional one its lane needs) until the
+  // allocation ends (Engine::allocate), since nothing left in place would
+  // meet it and waiting would stall the work in service. A growth pass also
+  // sets it on a unit it admitted on its net change, so that allocation
   // passes the host (MemoryGovernor::growthHost).
   bool hostExempt = false;
   // The decisions its lines logged since its last grant, by what the need
@@ -449,9 +449,8 @@ public:
   // The control clock the ledger dates waits, copy demand and regrowth by.
   void setNow(double nowSeconds) noexcept;
   // The lanes in service: their projected growth, which pools' growth leaves
-  // free, and the highest priority among them; a start's own comes out of it.
+  // free, and the highest priority among them.
   void setLanes(uint64_t demandBytes, std::optional<RequestPriority> highest) noexcept;
-  void tookDemand(uint64_t bytes) noexcept { laneDemandBytes_ -= bytes < laneDemandBytes_ ? bytes : laneDemandBytes_; }
   [[nodiscard]] uint64_t laneDemandBytes() const noexcept { return laneDemandBytes_; }
   // Where the ledger writes the decisions it logs, with the claimant, what
   // it took, the bytes and the outcome (free), the grants that end a logged

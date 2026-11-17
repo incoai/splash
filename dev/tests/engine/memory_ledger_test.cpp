@@ -531,14 +531,6 @@ void testOneHostRule() {
     require(!admits(2560 * kMiB, normal, cls, 1792 * kMiB), "elective work inside the margin was admitted");
     require(!admits(8 * kGiB, warning, cls, kGiB), "macOS's warning admitted elective work");
   }
-  // An exempt start takes the margin, in the band too, at normal pressure, and never the spare reserve.
-  require(admits(512 * kMiB, normal, ClaimClass::Start, 256 * kMiB, true), "an exempt start was refused the margin");
-  require(admits(512 * kMiB, normal, ClaimClass::Start, 512 * kMiB, true), "an exempt start was refused all the margin");
-  require(admits(512 * kMiB, normal, ClaimClass::Start, 768 * kMiB, true).failure ==
-              metal::AllocationFailure::HostPressure,
-          "an exempt start took the spare reserve");
-  require(!admits(8 * kGiB, warning, ClaimClass::Start, kGiB, true), "macOS's warning admitted an exempt start");
-  require(!admits(8 * kGiB, critical, ClaimClass::Start, kGiB, true), "critical pressure admitted an exempt start");
   // The query the engine asks of growth, with no bytes and no credit: the
   // margin, the band and macOS's warning hold it as they hold growth.
   const auto growthAllowed = [](uint64_t headroom, MemoryPressure pressure) {
@@ -1395,66 +1387,11 @@ void testHostRefusedNeedIsMetInPlaceFirst() {
   require(fixture.allocate(lane, 512 * kMiB) && fixture.ledger().claim(lane).hostExempt,
           "the exempt retry was refused, or its grant ended the exemption before the allocation did");
   fixture.ledger().setHostExempt(lane, false);
-  fixture.memory.release("kv", 512 * kMiB);
-  // A start nothing in place meets is exempted too, for the margin alone: once the lane gives back its 512 MiB, the
-  // 176 MiB of headroom beside the cache hold one of the start's 128 MiB reservations and not a second.
   const ClaimId start = fixture.ledger().open(request(2, RequestPriority::Normal, ClaimClass::Start));
-  require(!fixture.allocate(start, 128 * kMiB), "the host admitted the start");
-  require(fixture.governor->free(start, fixture.governor->need(start)).outcome == FreeOutcome::Met &&
-              fixture.ledger().claim(start).hostExempt,
-          "a start nothing in place meets was not exempted");
-  require(fixture.allocate(start, 128 * kMiB), "an exempt start was refused the margin");
-  require(fixture.allocate(start, 128 * kMiB).failure == metal::AllocationFailure::HostPressure,
-          "an exempt start took the spare reserve");
-}
-
-// Starts in a row take no more of the headroom together than each may alone, though the host's readings do not
-// show yet what they took: two of 200 MiB start in 512 MiB, a third waits.
-void testStartsInARowTakeNoMoreThanTheHeadroom() {
-  FakeMemory::Config config = host(512 * kMiB);
-  config.readingLagMilliseconds = 1000.0;
-  Fixture fixture(std::move(config));
-  uint32_t started = 0;
-  for (uint64_t id = 2; id <= 4; ++id) {
-    const ClaimId start = fixture.ledger().open(request(id, RequestPriority::Normal, ClaimClass::Start));
-    started += static_cast<bool>(fixture.allocateFreeing(start, 200 * kMiB));
-  }
-  require(started == 2, std::to_string(started) + " starts of 200 MiB began in 512 MiB of headroom");
-}
-
-// Starts 1.5 s apart, past the host's settling, its readings 5 s behind: while a lane holds memory no command of
-// it has written (holdUnseen), what the starts took stays counted, and two of 200 MiB start in 512 MiB.
-void testWhatNoCommandWroteStaysCounted() {
-  FakeMemory::Config config = host(512 * kMiB);
-  config.readingLagMilliseconds = 5000.0;
-  Fixture fixture(std::move(config));
-  fixture.governor->holdUnseen(true);
-  uint32_t started = 0;
-  double t = 0.0;
-  for (uint64_t id = 2; id <= 5; ++id) {
-    const ClaimId start = fixture.ledger().open(request(id, RequestPriority::Normal, ClaimClass::Start));
-    started += static_cast<bool>(fixture.allocateFreeing(start, 200 * kMiB));
-    t += 1.5;
-    static_cast<void>(fixture.pass(t));
-  }
-  require(started == 2, std::to_string(started) + " starts of 200 MiB began 1.5 s apart in 512 MiB of headroom");
-}
-
-// An exempt start is weighed at the lanes' projected growth, its own counted in it: in 512 MiB of headroom a start
-// projected at 500 MiB takes its two 200 MiB allocations, each out of that projection, and one projected at 600 MiB
-// takes nothing.
-void testAStartIsWeighedWhole() {
-  for (const uint64_t projected : {500 * kMiB, 600 * kMiB}) {
-    Fixture fixture(host(512 * kMiB));
-    fixture.ledger().setLanes(projected, RequestPriority::Normal);
-    const ClaimId start = fixture.ledger().open(request(2, RequestPriority::Normal, ClaimClass::Start));
-    const bool first = static_cast<bool>(fixture.allocateFreeing(start, 200 * kMiB));
-    const bool second = first && static_cast<bool>(fixture.allocate(start, 200 * kMiB));
-    require(first == (projected == 500 * kMiB) && second == first,
-            first ? "a start was refused what it was projected to take" : "a start took part of more than the headroom");
-    // Not exempted, its claim logs it short, not met past the host.
-    require(first || !fixture.ledger().claim(start).hostExempt, "a start its whole start did not fit was exempted");
-  }
+  require(!fixture.allocate(start, 512 * kMiB), "the host admitted the start");
+  require(fixture.governor->free(start, fixture.governor->need(start)).outcome == FreeOutcome::Short &&
+              !fixture.ledger().claim(start).hostExempt,
+          "a start was exempted from the host");
 }
 
 // What a lane needs (ClaimSpec::laneNeeds), refused by the host, is met in place by any unit its class may take
@@ -2687,9 +2624,6 @@ std::span<const test::TestCase> ledgerTests() {
        testACriticalPassThatFindsNothingIsShortWhileMemoryLands},
       {"testDeficitCountsHostRefusedClaimsNotAnIdleMargin", testDeficitCountsHostRefusedClaimsNotAnIdleMargin},
       {"testAHostRefusedStartIsAdmittedWithinTwoPasses", testAHostRefusedStartIsAdmittedWithinTwoPasses},
-      {"testStartsInARowTakeNoMoreThanTheHeadroom", testStartsInARowTakeNoMoreThanTheHeadroom},
-      {"testWhatNoCommandWroteStaysCounted", testWhatNoCommandWroteStaysCounted},
-      {"testAStartIsWeighedWhole", testAStartIsWeighedWhole},
       {"testGrowthLeavesTheHostWhatAStartItRefusedWaitsFor", testGrowthLeavesTheHostWhatAStartItRefusedWaitsFor},
       {"testSourceOrderIsKeptWithinASource", testSourceOrderIsKeptWithinASource},
       {"testUnitsKeyedByTheirPlaceAreTakenAsChosen", testUnitsKeyedByTheirPlaceAreTakenAsChosen},

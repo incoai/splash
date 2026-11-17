@@ -1790,23 +1790,7 @@ pressure too, and grows past both, short of critical pressure, once nothing in
 place meets its refusal: the governor exempts that allocation's retries from
 the margin and the pressure test (`MemoryGovernor::free`), since waiting would
 stall work in service; so does the KV a prefill command takes past its first state
-boundary, which the lane's next command would take anyway. A start beside lanes
-in service is exempted too, for the margin alone, where at normal pressure, in
-the band too, the headroom holds its whole start beside what the lanes in
-service are projected to grow into: its state, the pages it restores and is
-projected to grow into, and placed Spill, the staging and hot block floor it
-reads its history through, as placement prices it; a lane no command of which
-has ended counts as a start for what it reads, and every lane's output is
-projected at most 4,096 tokens on (`kProjectedOutputTokens`), past which it
-grows in service. Exempted, it takes the margin and never the spare reserve, so
-sessions arriving together decode together rather than take turns; a start the
-headroom does not hold whole is not exempted, its claim logs it short, and it
-waits as before. Its first try is the margin's rule: outside the band, with the
-headroom past the margin by its first allocation, that allocation passes
-unexempted, and a later one the host refuses is weighed whole. What starts and
-pools' growth take counts against the headroom until the host's counters show
-it, past the host's settling while a lane holds memory no command of it has
-written (`MemoryGovernor::holdUnseen`), so starts in a row add up. A `Floor` claim
+boundary, which the lane's next command would take anyway. A `Floor` claim
 passes short of critical pressure, and critical pressure refuses every claim,
 except an allocation covered by what the same allocation released, which
 passes the engine's limit too: its net change raises neither the charge nor

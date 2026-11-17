@@ -124,35 +124,32 @@ Engine::ResidentRoom Engine::residentRoom(const Request &active, const ClaimSpec
   return {.needed = need.bytes, .available = available, .heldTokens = heldPages * KvCache::pageTokens};
 }
 
-uint64_t Engine::laneDemandBytes(uint64_t starting) const {
-  const LaneDemand lanes = laneDemand(starting);
+uint64_t Engine::laneDemandBytes() const {
+  const LaneDemand lanes = laneDemand();
   return uint64_t{lanes.fullPages} * cache_.bytesPerPage(kv::PageForm::Full) + lanes.bytes;
 }
 
-Engine::LaneDemand Engine::laneDemand(uint64_t starting) const {
+Engine::LaneDemand Engine::laneDemand() const {
   const SpillGeometry &geometry = config_.spill.geometry;
   const auto pages = [](uint64_t tokens) { return (tokens + KvCache::pageTokens - 1) / KvCache::pageTokens; };
   LaneDemand demand;
-  // The lanes that read spilled KV, those holding Index pages, and a start
-  // placed Spill (placement), as a lane is until a command of it ends: those
-  // without their floor of the hot block cache lack it once for them all, in
-  // whole extents (floorExtents(2) for two, not 2 x floorExtents(1)); one in
-  // prefill the staging through its next command, a start's through its prompt.
+  // The lanes that read spilled KV, those holding Index pages: those
+  // without their floor of the hot block cache yet lack it once for them
+  // all, in whole extents: floorExtents(2) for two, not 2 x floorExtents(1);
+  // and one in prefill the staging of its history through its next command.
+  // A Spill lane with none reads nothing spilled.
   std::vector<uint64_t> readers;
   for (const auto &[id, peer] : requests_) {
-    if ((!peer.lane && id != starting) || peer.pendingEnd)
+    if (!peer.lane || peer.pendingEnd)
       continue;
-    demand.bytes += peer.lane ? 0 : model_.startStateBytes();
-    const bool prefill = !peer.ran || scheduler_.phase(id) == Phase::Prefill;
-    if (peer.ran ? cache_.holdsIndexPages(id) : peer.kvMode == KvMode::Spill) {
+    const bool prefill = scheduler_.phase(id) == Phase::Prefill;
+    if (cache_.holdsIndexPages(id)) {
       readers.push_back(id);
-      const uint64_t staged = peer.ran ? nextCommandPages(peer) : pages(peer.promptTokens);
-      demand.bytes += prefill ? model_.stagingShortfall(id, static_cast<uint32_t>(staged)) : 0;
+      if (prefill)
+        demand.bytes += model_.stagingShortfall(id, nextCommandPages(peer));
     }
     const uint64_t projection = projectedTokens(peer);
-    uint64_t held = peer.lane ? kvCapacity(id) : 0;
-    if (!held && peer.admissionProbe && !peer.skipCache)
-      held = uint64_t{cache_.residentChainPages(peer.admissionProbe->restoredChain())} * KvCache::pageTokens;
+    const uint64_t held = kvCapacity(id);
     if (peer.kvMode == KvMode::Spill) {
       // Its floor grows, up to its projection. But a prefill command writes
       // its rows to Full pages, which no release returns until their copies
@@ -216,7 +213,6 @@ void Engine::syncClaims(double now) {
     active.gapSince.claimWaited =
         active.gapSince.claimWaited || ((waiting || hostRefused) && active.lastTokenMilliseconds);
   }
-  governor().holdUnseen(std::ranges::any_of(requests_, [](const auto &e) { return e.second.lane && !e.second.ran; }));
 }
 
 void Engine::passOver(const BatchPlan &plan, std::span<const uint64_t> excluded) {
@@ -263,12 +259,10 @@ uint64_t Engine::copyDemandBytes() const {
 }
 
 uint32_t Engine::nextCommandPages(const Request &active) const {
-  const bool restores = !active.lane && active.admissionProbe && !active.skipCache;
-  const uint64_t from = restores ? active.admissionProbe->restoredChain().size() * KvCache::pageTokens
-                                 : scheduler_.promptProcessed(active.request.id);
+  const uint64_t id = active.request.id;
   const uint64_t end =
-      !active.lane || scheduler_.phase(active.request.id) == Phase::Prefill
-          ? std::min<uint64_t>(from + model_.commandLimits().commandRows, active.promptTokens)
+      scheduler_.phase(id) == Phase::Prefill
+          ? std::min<uint64_t>(scheduler_.promptProcessed(id) + model_.commandLimits().commandRows, active.promptTokens)
           : active.exactTokens.size() + model::ExecutionLimits::targetVerifyRows;
   return static_cast<uint32_t>((end + KvCache::pageTokens - 1) / KvCache::pageTokens);
 }

@@ -398,8 +398,8 @@ void testACancelBetweenPassesBesideItsOwnPrioritysDecodeKeepsThePasses() {
               ", the other lane ran passes " + passesOf(1) + " (expected " + expected + ")");
 }
 
-// A start the host refused beside a resident lane, with less headroom than it needs, is freed for by the host's
-// passes, from a rebuild-only pool and never the expert store, and then runs.
+// A start the host refused beside a resident lane is freed for by the host's passes, from a rebuild-only pool and
+// never the expert store, and then runs.
 void testAHostRefusedStartIsFreedForByThePass() {
   test::EngineHarness harness({.pages = 64, .memory = test::FakeMemory::Config{}});
   test::FakeElasticPool pool("vision_arena", *harness.memory, 64 * 1024, 1, 3, 4, 3);
@@ -412,7 +412,8 @@ void testAHostRefusedStartIsFreedForByThePass() {
   harness.runUntil([&] { return harness.events.maskRequests.size() == 1; },
                    "the Foreground lane did not wait for its mask");
   test::FakeMemory &memory = *harness.memory;
-  memory.setHost(memory.hostBytes() - memory.total() - test::GovernorLimits{}.hostSpareReserveBytes - 48 * 1024,
+  memory.setHost(memory.hostBytes() - memory.total() - test::GovernorLimits{}.hostSpareReserveBytes -
+                     kHostMarginBytes - 48 * 1024,
                  MemoryPressure::Normal);
   harness.engine.submit(harness.request(3, std::vector<uint32_t>(64, 3)));
   double pass = harness.now();
@@ -1036,15 +1037,14 @@ void testAHostRefusedStartWaitsOnItsClaim() {
   harness.engine.submit(std::move(decoder));
   harness.runUntil([&] { return harness.events.outputs.contains(1); }, "the decoder did not decode");
   const test::GovernorLimits limits;
-  // Other applications leave the host its spare reserve alone: a start has no margin to take.
   const uint64_t other = harness.memory->hostBytes() - limits.hostSpareReserveBytes - harness.memory->total();
-  harness.memory->setHost(other, MemoryPressure::Normal);
+  harness.memory->setHost(other - kHostMarginBytes + (1ULL << 20), MemoryPressure::Normal);
   const double arrived = harness.now();
   EngineRequest prompt = harness.request(2, std::vector<uint32_t>(300, 2));
   prompt.deadlineMilliseconds = 1e9;
   harness.engine.submit(std::move(prompt));
   harness.runUntil([&] { return harness.now() >= arrived + 2000.0; }, "the clock did not move");
-  require(!harness.events.tokenTimes.contains(2), "the host admitted a start into its spare reserve");
+  require(!harness.events.tokenTimes.contains(2), "the host admitted a start short of its margin");
   harness.memory->setHost(other - 4 * kHostMarginBytes, MemoryPressure::Normal);
   const double released = harness.now();
   harness.runUntil([&] { return harness.events.tokenTimes.contains(2); }, "the prompt did not answer");

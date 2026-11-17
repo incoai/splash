@@ -1047,75 +1047,50 @@ void testAHostRefusedGrowthTakesOnlyWhatFreesNow() {
           "a growth the host refused took the leaf on its way to the SSD cache, or wrote it");
 }
 
-// With nothing in service the first request starts through the host pause. One beside it takes the margin for its
-// whole start and starts at once; where the headroom above the spare reserve does not hold its state and pages
-// (none at all, or 64 KiB beside a 1000-token prompt) it waits, evicting and taking nothing, and starts once the first
-// is done.
+// With nothing in service the first request starts through the host pause; one beside it waits without evicting and
+// starts once the first is done.
 void testFirstRequestStartsThroughTheHostPause() {
-  struct Case final {
-    std::optional<uint64_t> headroom;  // none: the pause's
-    uint32_t promptTokens = 0;
-    bool starts = false;
-    uint32_t chainTokens = 0;  // the first request's prompt it begins with, in memory
-  };
-  // A start takes its chain's pages in place: 24 KiB holds 200 tokens past
-  // 64 of the first's, not 200 of its own.
-  for (const Case scenario : {Case{std::nullopt, 65, true}, Case{0, 65, false}, Case{64 * 1024, 65, true},
-                              Case{64 * 1024, 1000, false}, Case{24 * 1024, 200, true, 64},
-                              Case{24 * 1024, 200, false}}) {
-    const bool marginLeft = scenario.starts;
-    test::TestKvStorage storage(64, 4096, 4);
-    KvPool pool(storage, 0);
-    engine::Cache resources(pool, nullptr, nullptr);
-    Executor executor;
-    executor.decodeFinishes = false;
-    Events events;
-    HostPause host;
-    host.pause();
-    EngineConfig config = test::engineConfig();
-    host.attach(config, storage, pool);
-    host.attach(executor);
-    engine::Engine engine(config, resources, executor, events);
-    guardReleases(storage, engine);
-    auto first = request(1, std::vector<uint32_t>(65, 1));
-    first.maxNewTokens = 40;
-    first.deadlineMilliseconds = 1'000'000;
-    engine.submit(std::move(first));
-    double now = 1;
-    while (now < 100 && events.outputs[1].empty())
-      static_cast<void>(engine.tick(now++));
-    require(!events.outputs[1].empty() && executor.beginAttempts == 2 &&
-                pool.snapshot().pagesAllocated >= 4,
-            "the first request did not start through the host pause");
-    if (scenario.headroom) {
-      test::FakeMemory &memory = host.host.memory;
-      memory.setHost(memory.hostBytes() - memory.total() - test::GovernorLimits{}.hostSpareReserveBytes -
-                         *scenario.headroom,
-                     MemoryPressure::Normal);
-      static_cast<void>(host.governor().evaluate());
-    }
+  test::TestKvStorage storage(64, 4096, 4);
+  KvPool pool(storage, 0);
+  engine::Cache resources(pool, nullptr, nullptr);
+  Executor executor;
+  executor.decodeFinishes = false;
+  Events events;
+  HostPause host;
+  host.pause();
+  EngineConfig config = test::engineConfig();
+  host.attach(config, storage, pool);
+  host.attach(executor);
+  engine::Engine engine(config, resources, executor, events);
+  guardReleases(storage, engine);
+  auto first = request(1, std::vector<uint32_t>(65, 1));
+  first.maxNewTokens = 40;
+  first.deadlineMilliseconds = 1'000'000;
+  engine.submit(std::move(first));
+  double now = 1;
+  while (now < 100 && events.outputs[1].empty())
+    static_cast<void>(engine.tick(now++));
+  require(!events.outputs[1].empty() && executor.beginAttempts == 2 &&
+              pool.snapshot().pagesAllocated >= 4,
+          "the first request did not start through the host pause");
 
-    std::vector<uint32_t> prompt(scenario.chainTokens, 1);
-    prompt.resize(scenario.promptTokens, 2);
-    auto second = request(2, prompt);
-    second.deadlineMilliseconds = 1'000'000;
-    engine.submit(std::move(second));
-    const CacheSnapshot before = resources.snapshot();
+  auto second = request(2, std::vector<uint32_t>(65, 2));
+  second.deadlineMilliseconds = 1'000'000;
+  engine.submit(std::move(second));
+  const CacheSnapshot before = resources.snapshot();
+  static_cast<void>(engine.tick(now++));
+  static_cast<void>(engine.tick(now++));
+  require(!executor.requests.contains(2) && events.startIds.size() == 1 &&
+              engine.resourceWaitSnapshot(now).memory == 1 &&
+              resources.snapshot().pool.pagesPrefix >= before.pool.pagesPrefix &&
+              resources.snapshot().stateCache.evictions == before.stateCache.evictions,
+          "a second request grew, or evicted for the host, beside one in service");
+  while (now < 1000 && events.completedCount < 2)
     static_cast<void>(engine.tick(now++));
-    static_cast<void>(engine.tick(now++));
-    require(executor.requests.contains(2) == marginLeft && events.startIds.size() == (marginLeft ? 2u : 1u) &&
-                engine.resourceWaitSnapshot(now).memory == (marginLeft ? 0u : 1u) &&
-                resources.snapshot().pool.pagesPrefix >= before.pool.pagesPrefix &&
-                resources.snapshot().stateCache.evictions == before.stateCache.evictions,
-            marginLeft ? "a second request beside one in service did not take the host's margin, or evicted for it"
-                       : "a second request grew into the spare reserve, or evicted for the host, beside one in service");
-    while (now < 1000 && events.completedCount < 2)
-      static_cast<void>(engine.tick(now++));
-    require(events.completedCount == 2 && events.failedCount == 0 &&
-                events.startIds == std::vector<uint64_t>({1, 2}) &&
-                executor.suspensions == 0,
-            "the second request did not complete beside or after the first");
-  }
+  require(events.completedCount == 2 && events.failedCount == 0 &&
+              events.startIds == std::vector<uint64_t>({1, 2}) &&
+              executor.suspensions == 0,
+          "the waiting request did not start once nothing was in service");
 }
 
 // A request whose start needs no new memory still starts beside one in

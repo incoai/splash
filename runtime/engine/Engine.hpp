@@ -403,7 +403,6 @@ private:
     // refused, restart its wait's limit.
     uint64_t admission = 0;
     std::optional<uint32_t> lane;
-    bool ran = false;  // a command of its lane has ended: what its start took is written
     uint32_t promptTokens = 0;
     uint32_t reportedPromptTokens = 0;
     uint32_t replayTokens = 0;
@@ -649,14 +648,14 @@ private:
   // pages up to its projection beyond those it holds; a Spill lane's floor
   // up to its projection beyond its floor now, in prefill beyond its floor
   // at its next command's end, whose pages beyond those it holds count Full
-  // (nextCommandPages); none for a lane that ended; with `starting`, its start.
+  // (nextCommandPages); none for a lane that ended.
   struct LaneDemand final {
     uint32_t fullPages = 0;  // the Resident lanes' pages and the Spill lanes' next prefill commands'
     uint64_t bytes = 0;      // the Spill lanes' floors and the readers' hot block floors
   };
-  [[nodiscard]] LaneDemand laneDemand(uint64_t starting = 0) const;
+  [[nodiscard]] LaneDemand laneDemand() const;
   // laneDemand in bytes, the Full pages at a Full page's bytes.
-  [[nodiscard]] uint64_t laneDemandBytes(uint64_t starting = 0) const;
+  [[nodiscard]] uint64_t laneDemandBytes() const;
   // The highest priority among the lanes in service, none without one.
   [[nodiscard]] std::optional<RequestPriority> highestLanePriority() const;
   // The request's projection fits in memory alone, as it would without the
@@ -1220,9 +1219,9 @@ private:
   // lanes' next commands add and what a pool's last growth lacked, one
   // growth unit at most (MemoryLedger::growthLackBytes).
   [[nodiscard]] uint64_t copyDemandBytes() const;
-  // The pages of KV through what a lane's next command reaches: in prefill,
-  // as a start's first past the chain it restores, as many rows as one
-  // command holds, within its prompt; in decode its verify rows.
+  // The pages of KV through what a lane's next command reaches: in prefill
+  // as many rows as one command holds, within its prompt; in decode its
+  // verify rows.
   [[nodiscard]] uint32_t nextCommandPages(const Request &request) const;
   // What the model's memory for the reads of spilled KV lacks once the lanes
   // hold Index pages: none for one that holds some already; else in prefill

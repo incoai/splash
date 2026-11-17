@@ -201,7 +201,7 @@ uint64_t MemoryGovernor::hostHeadroomBytes(const std::optional<HostMemory> &host
 }
 
 uint64_t MemoryGovernor::unseenGrowthBytes(const std::optional<HostMemory> &host) const noexcept {
-  if (!host || (clockMilliseconds_ >= unseenGrowthUntilMilliseconds_ && !unseenHeld_))
+  if (!host || clockMilliseconds_ >= unseenGrowthUntilMilliseconds_)
     return 0;
   const uint64_t fallen = saturatingSubtract(unseenGrowthHeadroom_, hostHeadroomBytes(host, 0));
   return saturatingSubtract(unseenGrowthBytes_, fallen);
@@ -225,7 +225,7 @@ MemoryGovernor::tryReserve(uint64_t bytes, metal::AllocationFailure &failure) {
   const ClaimState &claim = ledger_.claim(scope_);
   const bool fits = engineFits && ledger_.heldBytes(scope_) <= limitBytes_ - observed - requested;
   const ClaimClass cls = hostClass(claim.spec);
-  const bool hostAdmits = hostRule_.admits(cls, hostBytes(cls, bytes, claim.hostExempt), claim.hostExempt);
+  const bool hostAdmits = hostRule_.admits(cls, hostBytes(cls, bytes), claim.hostExempt);
   // What the scope's work released and its allocations have not taken back
   // pays for one of no more than that past both, under critical pressure
   // too: the scope's net change never raises the charge, so it takes no room
@@ -241,14 +241,14 @@ MemoryGovernor::tryReserve(uint64_t bytes, metal::AllocationFailure &failure) {
     ledger_.allocationRefused();
     return std::nullopt;
   }
-  // Pools' growth and starts show on the host only as they fill: until then,
-  // or the host settles, its rule counts them, so starts in a row add up.
-  if ((claim.spec.cls == ClaimClass::Growth || claim.spec.cls == ClaimClass::Start) && host) {
+  // A pool's growth reaches the host's counters only as it fills: until
+  // they show it, or the host has settled, the host's rule counts what it
+  // admitted on its margin.
+  if (claim.spec.cls == ClaimClass::Growth && host) {
     unseenGrowthBytes_ = unseenGrowthBytes(host) + bytes;
     unseenGrowthHeadroom_ = hostHeadroomBytes(host, 0);
     unseenGrowthUntilMilliseconds_ = clockMilliseconds_ + kHostSettleMilliseconds;
   }
-  if (claim.spec.cls == ClaimClass::Start) ledger_.tookDemand(bytes);
   reservedBytes_ = requested;
   return Reservation(this, bytes);
 }
@@ -364,9 +364,10 @@ bool MemoryGovernor::HostRule::admits(ClaimClass cls, uint64_t bytes, bool hostE
     return false;
   if (cls == ClaimClass::Floor || ((cls == ClaimClass::InService || cls == ClaimClass::Growth) && hostExempt))
     return true;
-  const bool exemptStart = cls == ClaimClass::Start && hostExempt;  // takes the margin, never the reserve
-  const bool fits = measured_ && headroom_ >= bytes && headroom_ - bytes >= (exemptStart ? 0 : kHostMarginBytes);
-  return fits && system_ == MemoryPressure::Normal && (cls == ClaimClass::InService || exemptStart || !constrained_);
+  const bool keepsMargin = measured_ && headroom_ >= bytes && headroom_ - bytes >= kHostMarginBytes;
+  if (cls == ClaimClass::InService)
+    return keepsMargin && system_ == MemoryPressure::Normal;
+  return keepsMargin && system_ == MemoryPressure::Normal && !constrained_;
 }
 
 uint64_t MemoryGovernor::HostRule::deficitBytes(uint64_t refusedWaitingBytes, uint64_t returningBytes) const noexcept {
@@ -412,11 +413,8 @@ FreeResult MemoryGovernor::free(ClaimId claim, const Need &need) {
   // What the claim lacks stands: a refusal of what its takes allocate, as a
   // release's refill of the Index runway, says nothing of it.
   const Need refusal = ledger_.claim(claim).refusal;
-  const ClaimSpec &spec = ledger_.claim(claim).spec;
-  const bool start = spec.cls == ClaimClass::Start &&
-                     hostRule_.admits(spec.cls, hostBytes(spec.cls, need.bytes, true), true);
   const FreeResult result = ledger_.free(claim, need, roomBytes(), hostRule_.level(),
-                                         hostClass(spec) == ClaimClass::InService || start);
+                                         hostClass(ledger_.claim(claim).spec) == ClaimClass::InService);
   ledger_.refused(claim, refusal);
   return result;
 }
@@ -459,10 +457,10 @@ FreeResult MemoryGovernor::hostPass(uint64_t target) {
   return result;
 }
 
-uint64_t MemoryGovernor::hostBytes(ClaimClass cls, uint64_t bytes, bool hostExempt) const noexcept {
-  if (cls == ClaimClass::Growth)
-    return saturatingAdd(bytes, ledger_.laneDemandBytes());
-  return cls == ClaimClass::Start && hostExempt ? std::max(bytes, ledger_.laneDemandBytes()) : bytes;
+uint64_t MemoryGovernor::hostBytes(ClaimClass cls, uint64_t bytes) const noexcept {
+  if (cls != ClaimClass::Growth)
+    return bytes;
+  return saturatingAdd(bytes, ledger_.laneDemandBytes());
 }
 
 GrowthHost MemoryGovernor::growthHost(bool paced) {
