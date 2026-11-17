@@ -1882,9 +1882,10 @@ kernel void draft_verify_rows(device const uint *tree_tokens [[buffer(0)]],
     first += rows[lane];
   }
   // The rows of no lane (VerifyRowsParams), which the embedding gathers by
-  // their token.
+  // their token, on no path and of no parent: none of an earlier cycle's.
   for (uint row = first; row < params.rows; ++row) {
     tokens[row] = tree_tokens[0];
+    tree[row] = {0u, ushort(SPLASH_TREE_ROOT), ushort(0)};
     sources[row] = SPLASH_NO_TOKEN;
   }
 }

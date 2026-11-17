@@ -1261,7 +1261,8 @@ void verifyRowsLayout(MetalBackend &backend) {
 // at it and above, 4 and 2 with the anchors; the next float over 0.5 those
 // above it, 2 and 1; and one over every estimate the anchors alone, whose
 // own estimates, 0 here, the layout does not read. The lanes' rows are
-// packed in lane order, and the step's other rows are of no lane.
+// packed in lane order, and the step's other rows are of no lane, on no path
+// and of no parent whatever their tree rows held before.
 void verifyRowsFloor(MetalBackend &backend) {
   constexpr uint32_t lanes = 2, cap = 8, rows = lanes * cap;
   const std::array<std::vector<float>, lanes> estimates{
@@ -1292,10 +1293,12 @@ void verifyRowsFloor(MetalBackend &backend) {
                         Case{1.5F, {1, 1}}}) {
     std::fill_n(static_cast<uint32_t *>(b.inputTokens.contents()), rows, 0xBADu);
     std::fill_n(static_cast<uint32_t *>(b.verifySources.contents()), rows, 0xBADu);
+    std::fill_n(static_cast<TreeRow *>(b.treeRows.contents()), rows, chainRow(5));
     CommandGraph graph;
     DraftSelector::addVerifyRows(graph, b, {lanes, rows, cap}, c.floor);
     static_cast<void>(backend.submitCommandAsync(graph.dispatches()).wait());
     const auto *laneRows = static_cast<const LaneRows *>(b.laneRows.contents());
+    const auto *tree = static_cast<const TreeRow *>(b.treeRows.contents());
     const auto *tokens = static_cast<const uint32_t *>(b.inputTokens.contents());
     const auto *sources = static_cast<const uint32_t *>(b.verifySources.contents());
     const std::string label = "verify rows at a floor of " + std::to_string(c.floor) + ": ";
@@ -1314,8 +1317,10 @@ void verifyRowsFloor(MetalBackend &backend) {
       first += held;
     }
     for (uint32_t slot = first; slot < rows; ++slot)
-      require(tokens[slot] == 100 && sources[slot] == SPLASH_NO_TOKEN,
-              label + "row " + std::to_string(slot) + " of no lane is not lane 0's anchor without a source");
+      require(tokens[slot] == 100 && sources[slot] == SPLASH_NO_TOKEN && !tree[slot].ancestors &&
+                  tree[slot].parent == SPLASH_TREE_ROOT && !tree[slot].depth,
+              label + "row " + std::to_string(slot) +
+                  " of no lane is not lane 0's anchor without a source, a path or a parent");
   }
 }
 
