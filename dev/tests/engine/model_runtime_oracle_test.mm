@@ -4591,12 +4591,13 @@ struct ArgmaxChain final {
 // kNearTie of it. A step of other rows rounds a row's logits otherwise (a
 // lane's logits alone and in a step of other rows keep cosines of 0.9996 to
 // 0.9999, requireMixedStepMatchesLanesAlone), which may order two nearly
-// equal tokens either way (the largest gaps of such ties this check found
-// were 0.11 on Qwen3.6-35B-A3B and 0.0015 on Qwen3.8-27B, of about 500
-// tokens each); a token the target ranks a logit or more below its best is
-// no rounding but a wrong token, or one computed from a wrong history (a
-// token emitted out of its path's order, or an auto step's K/V committed
-// along another path, lay 10.8 and 11.0 below on the 35B). Forcing the
+// equal tokens either way (the largest gaps of such ties this check found,
+// of about 500 tokens a run, were 0.08, 0.11 and 0.24 on Qwen3.6-35B-A3B
+// and 0.0015 on Qwen3.8-27B); a token the target ranks half a logit or more
+// below its best, twice the largest of them, is no rounding but a wrong
+// token, or one computed from a wrong history (a token emitted out of its
+// path's order, or an auto step's K/V committed along another path, lay
+// 10.8 and 11.0 below on the 35B). Forcing the
 // lane's own tokens keeps every later token checked
 // past such a tie. The end closes with a token the lane did not emit, the
 // only one that ends its thinking (ThinkingBudget::unusable), so that the
@@ -4604,7 +4605,7 @@ struct ArgmaxChain final {
 ArgmaxChain requireArgmaxChain(model::Runtime &executor, const ops::StopTokens &stops, EngineRequest request,
                                uint32_t stateLane, const std::vector<uint32_t> &pages,
                                std::span<const uint32_t> checked) {
-  constexpr float kNearTie = 1.0F;
+  constexpr float kNearTie = 0.5F;
   require(!checked.empty(), "a greedy lane emitted no token to check");
   uint32_t close = 0;
   while (std::ranges::find(checked, close) != checked.end() || stops.contains(close)) ++close;
