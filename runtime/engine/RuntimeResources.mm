@@ -568,9 +568,12 @@ std::string persistentCacheNamespace(const RuntimeCacheIdentity &identity,
             << gdn.convolutionChannels << ' ' << gdn.recurrentGroups << ' ' << gdn.recurrentRows
             << ' ' << gdn.recurrentColumns
             // A cached state stores its recurrent layers as the codes of
-            // ops::StateCodec, whatever the running format; without GDN
-            // layers there are none.
-            << (gdn.layers ? " codes int8 block " + std::to_string(SPLASH_STATE_CODEC_BLOCK) + " bf16" : "");
+            // ops::StateCodec, whatever the running format, or as that
+            // format holds them (--cached-states exact), named apart from
+            // 1.6.x's line for it; without GDN layers there are none.
+            << (!gdn.layers        ? ""
+                : gdn.cachedCodes ? " codes int8 block " + std::to_string(SPLASH_STATE_CODEC_BLOCK) + " bf16"
+                                  : " exact " + std::string(ops::formatName(gdn.format)));
   // A family's state after the GDN layers' (Qwen3.8-Flash-Next's PLE history
   // and QSA pending keys, model::QwenHybridLayout::gdnStateLayout).
   if (gdn.auxiliaryBytes) canonical << " auxiliary " << gdn.auxiliaryBytes;
@@ -703,6 +706,7 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
   // weights load and again once the files open.
   model::CompositeStateLayout stateLayout = config.model.stateLayout;
   stateLayout.target.format = config.stateFormat;
+  stateLayout.target.cachedCodes = !config.exactCachedStates;
   const uint64_t stateBytes = stateLayout.cachedBytes();
   const bool automaticDisk = config.cacheDisk.automatic;
   const uint64_t cacheDiskBytes = automaticDisk ? kAutomaticCacheDiskBytes : config.cacheDisk.bytes;
@@ -1121,7 +1125,7 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
     // them whatever room the volume has, as the first engine's context it
     // keeps may rest on them.
     const std::string cacheNamespace =
-        persistentCacheNamespace(cacheIdentity, loaded.stateLayout(config.stateFormat));
+        persistentCacheNamespace(cacheIdentity, loaded.stateLayout(config.stateFormat, !config.exactCachedStates));
     // The KV file's slots hold a page as the tier lays it out, checksummed by
     // segment when persistent, and the writes of both files hold back while
     // a step waits for reads.
@@ -1211,8 +1215,8 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
         static_cast<uint32_t>(poolExtents * budget.kvExtentPages), budget.kvExtentPages);
     auto kvPool = std::make_unique<KvPool>(*kvPages, model::ExecutionLimits::warmupKvPages);
     auto stateStorage = std::make_unique<model::QwenStateStorage>(
-        *backend, memoryGovernor->allocationAdmission(), loaded.stateLayout(config.stateFormat),
-        disk.states);
+        *backend, memoryGovernor->allocationAdmission(),
+        loaded.stateLayout(config.stateFormat, !config.exactCachedStates), disk.states);
     std::unique_ptr<KvPageTier> kvTier;
     if (disk.kv)
       kvTier = std::make_unique<KvPageTier>(*kvPages, kvFormat, disk.kv, readers);

@@ -717,6 +717,13 @@ agent transcripts changed 27B's next-token distributions by a mean KL of
 differs from a restore of its own state, and the error does not build up over
 a conversation's successive hits.
 
+`--cached-states exact` keeps a cached state in the running state's format
+instead, as 1.6 did: a restore is the state it cached, bit for bit, and a
+cached state takes as much memory and SSD as a lane's state (153 MiB for 27B in
+FP32, 81 MiB in BF16). The default, `--cached-states int8`, stores the codes.
+The two keep their caches apart on the SSD, so switching starts the persistent
+cache cold. Restart to switch.
+
 Select the running state's storage when starting the server:
 
 ```bash
@@ -730,7 +737,8 @@ state a chunk captures inside it (a replay point, junction or checkpoint), and
 at the end of each decode step. So where a prompt's chunks end and its states
 are captured also changes its state in the last bits
 ([sampling](api.md#sampling)). Cached states take the same codes in either
-format, and the SSD cache keeps them for both. Restart to switch formats. Omit
+format, and the SSD cache keeps them for both, unless `--cached-states exact`
+keeps them in the running format. Restart to switch formats. Omit
 `--state-format` or use `--state-format fp32` for the default, the precision
 the models' configurations ask for.
 

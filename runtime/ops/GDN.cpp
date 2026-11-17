@@ -132,7 +132,7 @@ void requireStates(const GdnShape &shape, GdnStateStrides strides, uint32_t laye
 void GDN::addPrefill(metal::CommandGraph &graph, const metal::MetalBackend &backend,
                      GdnPrefillBuffers buffers, GdnShape shape, uint32_t tokens,
                      GdnStateFormat state, GdnHeadOrder order,
-                     std::span<const GdnPrefillCapture> captures) {
+                     std::span<const GdnPrefillCapture> captures, bool codes) {
   if (!tokens || !validFormat(state))
     throw std::invalid_argument("invalid GDN prefill geometry");
   const CompiledGdn &kernel = compiledGdn(shape);
@@ -153,12 +153,14 @@ void GDN::addPrefill(metal::CommandGraph &graph, const metal::MetalBackend &back
   requireBytes(buffers.recurrentOut, recurrentBytes(shape, state), "GDN next recurrent state");
   requireBytes(buffers.recurrentRows, valueRows, "GDN recurrent row");
   requireBytes(buffers.hidden, valueRows, "GDN hidden");
-  // One layer's codes (ops::StateCodec).
+  // One layer's codes (ops::StateCodec), or its state as it is.
   const StateCodecShape codec{1,
                               shape.valueHeads * shape.headDimension,
                               shape.headDimension,
                               recurrentBytes(shape, state),
-                              state_codec_layer_bytes(shape.valueHeads * shape.headDimension, shape.headDimension),
+                              codes ? state_codec_layer_bytes(shape.valueHeads * shape.headDimension,
+                                                              shape.headDimension)
+                                    : recurrentBytes(shape, state),
                               state};
   uint32_t previous = 0;
   for (const GdnPrefillCapture &capture : captures) {
@@ -167,7 +169,7 @@ void GDN::addPrefill(metal::CommandGraph &graph, const metal::MetalBackend &back
     previous = capture.tokens;
     if (capture.tokens < tokens)
       requireBytes(capture.convolution, carriedBytes(shape), "GDN captured convolution state");
-    requireBytes(capture.recurrent, codec.codesBytes(), "GDN captured recurrent codes");
+    requireBytes(capture.recurrent, codec.codesLayerBytes, "GDN captured recurrent codes");
   }
   const bool endCapture = !captures.empty() && captures.back().tokens == tokens;
   const size_t runs = captures.size() - (endCapture ? 1 : 0) + 1;
@@ -205,8 +207,12 @@ void GDN::addPrefill(metal::CommandGraph &graph, const metal::MetalBackend &back
                rows(buffers.recurrentRows, valueWidth(shape), valueWidth(shape), 2)},
               params, {uint64_t{shape.valueHeads} * shape.headDimension / SPLASH_GDN_SCAN_STATE_ROWS, 1, 1},
               {SPLASH_GDN_SCAN_THREADS, 1, 1});
-    if (index < captures.size() && captures[index].tokens == end)
-      StateCodec::addQuantize(graph, recurrentOut, captures[index].recurrent, codec);
+    if (index < captures.size() && captures[index].tokens == end) {
+      if (codes)
+        StateCodec::addQuantize(graph, recurrentOut, captures[index].recurrent, codec);
+      else
+        StateCodec::addCopy(graph, recurrentOut, captures[index].recurrent, codec);
+    }
     convolution = convolutionOut;
     recurrent = recurrentOut;
     begin = end;
@@ -291,8 +297,11 @@ PreparedInput GDN::addDecode(metal::CommandGraph &graph, GdnDecodeBuffers buffer
 }
 
 void GDN::addFold(metal::CommandGraph &graph, GdnFoldBuffers buffers, GdnShape shape,
-                  uint32_t layers, uint32_t rows, GdnStateStrides state, uint64_t codesLayerBytes) {
-  const uint64_t codes = state_codec_layer_bytes(shape.valueHeads * shape.headDimension, shape.headDimension);
+                  uint32_t layers, uint32_t rows, GdnStateStrides state, uint64_t codesLayerBytes,
+                  bool codesFolded) {
+  const uint64_t codes = codesFolded
+                             ? state_codec_layer_bytes(shape.valueHeads * shape.headDimension, shape.headDimension)
+                             : state.recurrentLayerBytes;
   if (!layers || !rows || rows > SPLASH_TARGET_VERIFY_ROWS || !state.valid() || buffers.stepSlot % 16 ||
       codesLayerBytes < codes)
     throw std::invalid_argument("invalid GDN fold geometry");
@@ -310,7 +319,9 @@ void GDN::addFold(metal::CommandGraph &graph, GdnFoldBuffers buffers, GdnShape s
                "GDN folded state");
   const GDNFoldParams params{state.convolutionLayerBytes, state.recurrentLayerBytes,
                              state.convolutionStateBytes, codesLayerBytes, buffers.stepSlot, rows, 0};
-  graph.add(stateKernel(std::string("verify_gdn_fold") + std::string(kernel.scanSuffix), state.format),
+  graph.add(stateKernel(std::string(codesFolded ? "verify_gdn_fold" : "verify_gdn_fold_exact") +
+                            std::string(kernel.scanSuffix),
+                        state.format),
             {std::move(buffers.state), std::move(buffers.fold), std::move(buffers.tape),
              std::move(buffers.retainedRows)},
             params, {shape.valueHeads, layers, 1});

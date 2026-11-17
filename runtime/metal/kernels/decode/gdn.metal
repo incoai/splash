@@ -624,10 +624,11 @@ inline void gdn_decode_batch_phase(
 // `fold`, a cached state's cell: the rows at the lane cell's offsets, the
 // recurrent state as the codes ops::StateCodec makes of it as the lane's
 // cell would store it (the codec's arithmetic, common/state_codec.h, on the
-// values the scan's lanes hold). Nothing when the path holds fewer rows.
+// values the scan's lanes hold), or as the lane's cell would hold it with
+// Exact (--cached-states exact). Nothing when the path holds fewer rows.
 // Grid {value heads, layers}.
 template <uint KeyHeads, uint ValueHeads, uint HeadDim, uint ConvDim,
-          uint RowsInFlight, class State>
+          uint RowsInFlight, class State, bool Exact = false>
 inline void gdn_fold_phase(device const uchar *state, device uchar *fold,
                            device uchar *tape, device const uint *retained_rows,
                            constant GDNFoldParams &params, uint2 group,
@@ -687,8 +688,12 @@ inline void gdn_fold_phase(device const uchar *state, device uchar *fold,
     }
     gdn_fold_rows<HeadDim, SPLASH_TARGET_VERIFY_ROWS, RowsInFlight>(values, pending, rows, value_dim, lane);
     for (uint r = 0; r < RowsInFlight; ++r)
-      state_code_quad<State>(values[r], codes + base(value_dim[r]),
-                             scales + base(value_dim[r]) / SPLASH_STATE_CODEC_BLOCK, lane);
+      if (Exact)
+        *reinterpret_cast<device vec<State, 4> *>(reinterpret_cast<device State *>(codes) + base(value_dim[r])) =
+            vec<State, 4>(float4(values[r][0], values[r][1], values[r][2], values[r][3]));
+      else
+        state_code_quad<State>(values[r], codes + base(value_dim[r]),
+                               scales + base(value_dim[r]) / SPLASH_STATE_CODEC_BLOCK, lane);
   }
 }
 
@@ -773,21 +778,25 @@ GDN_DECODE_TABLE_ENTRY(verify_gdn_fused_table16_p16512_f32, 16, 48, 128, 10240, 
 // The fold of a step's rows alone (GDN::addFold), over an fp32 state and, as
 // Name_bf16_state, a bf16 one. It reads no packed rows, so shapes of one head
 // layout share it.
-#define GDN_FOLD_KERNEL(Name, KeyHeads, ValueHeads, HeadDim, ConvDim, State) \
+#define GDN_FOLD_KERNEL(Name, KeyHeads, ValueHeads, HeadDim, ConvDim, State, Exact) \
   kernel void Name(device const uchar *state [[buffer(0)]], device uchar *fold [[buffer(1)]], \
       device uchar *tape [[buffer(2)]], device const uint *retained_rows [[buffer(3)]], \
       constant GDNFoldParams &params [[buffer(4)]], GDN_DECODE_THREADS) { \
     threadgroup GdnPendingShared<HeadDim, SPLASH_TARGET_VERIFY_ROWS> pending; \
-    gdn_fold_phase<KeyHeads, ValueHeads, HeadDim, ConvDim, 2, State>( \
+    gdn_fold_phase<KeyHeads, ValueHeads, HeadDim, ConvDim, 2, State, Exact>( \
         state, fold, tape, retained_rows, params, group, lane, simd_group, pending); \
   }
-#define GDN_FOLD_ENTRY(Name, KeyHeads, ValueHeads, HeadDim, ConvDim) \
-  GDN_FOLD_KERNEL(Name, KeyHeads, ValueHeads, HeadDim, ConvDim, float) \
-  GDN_FOLD_KERNEL(Name##_bf16_state, KeyHeads, ValueHeads, HeadDim, ConvDim, bfloat)
+#define GDN_FOLD_ENTRY(Name, KeyHeads, ValueHeads, HeadDim, ConvDim, Exact) \
+  GDN_FOLD_KERNEL(Name, KeyHeads, ValueHeads, HeadDim, ConvDim, float, Exact) \
+  GDN_FOLD_KERNEL(Name##_bf16_state, KeyHeads, ValueHeads, HeadDim, ConvDim, bfloat, Exact)
 
-GDN_FOLD_ENTRY(verify_gdn_fold, 16, 48, 128, 10240)
-GDN_FOLD_ENTRY(verify_gdn_fold_vh32, 16, 32, 128, 8192)
-GDN_FOLD_ENTRY(verify_gdn_fold_vh64, 16, 64, 128, 12288)
+GDN_FOLD_ENTRY(verify_gdn_fold, 16, 48, 128, 10240, false)
+GDN_FOLD_ENTRY(verify_gdn_fold_vh32, 16, 32, 128, 8192, false)
+GDN_FOLD_ENTRY(verify_gdn_fold_vh64, 16, 64, 128, 12288, false)
+// A cached state in the running format (--cached-states exact).
+GDN_FOLD_ENTRY(verify_gdn_fold_exact, 16, 48, 128, 10240, true)
+GDN_FOLD_ENTRY(verify_gdn_fold_exact_vh32, 16, 32, 128, 8192, true)
+GDN_FOLD_ENTRY(verify_gdn_fold_exact_vh64, 16, 64, 128, 12288, true)
 #undef GDN_FOLD_ENTRY
 #undef GDN_FOLD_KERNEL
 #undef GDN_DECODE_ENTRY

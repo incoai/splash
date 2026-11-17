@@ -58,6 +58,17 @@ inline void state_dequantize_thread(device const char *codes, device State *stat
     *reinterpret_cast<device vec<State, 4> *>(values + i) = vec<State, 4>(float4(in[i / 4]) * scale);
 }
 
+// A cached state that keeps the running format (ops::StateCodec::addCopy):
+// each layer's state bytes as they are, 16 a thread.
+kernel void state_copy(device const uchar *from [[buffer(0)]], device uchar *to [[buffer(1)]],
+                       constant StateCodecParams &p [[buffer(2)]], uint2 position [[thread_position_in_grid]]) {
+  if (position.x >= p.threads_per_layer)
+    return;
+  const ulong offset = ulong(position.x) * 16;
+  *reinterpret_cast<device uint4 *>(to + ulong(position.y) * p.codes_layer_bytes + offset) =
+      *reinterpret_cast<device const uint4 *>(from + ulong(position.y) * p.state_layer_bytes + offset);
+}
+
 #define STATE_CODEC_KERNELS(Suffix, State)                                                           \
   kernel void state_quantize##Suffix(device const State *state [[buffer(0)]],                        \
                                      device char *codes [[buffer(1)]],                               \

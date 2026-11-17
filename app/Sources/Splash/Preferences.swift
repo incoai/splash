@@ -362,7 +362,7 @@ extension LaunchOption {
             section: .memory, kind: .choice(standard: "8-bit", choices: [("bf16", "16-bit")], custom: nil)),
         LaunchOption(
             flag: "--state-format", title: "Recurrent state",
-            help: "How a hybrid model such as Qwen3.6 keeps the state of the requests it is running. 16-bit takes half the memory. Cached conversations take the same compact form either way.",
+            help: "How a hybrid model such as Qwen3.6 keeps the state of the requests it is running. 16-bit takes half the memory. Cached conversations take the same compact form either way, unless the server runs with --cached-states exact.",
             section: .memory, kind: .choice(standard: "32-bit", choices: [("bf16", "16-bit")], custom: nil)),
         LaunchOption(
             flag: "--expert-memory", title: "Expert cache",

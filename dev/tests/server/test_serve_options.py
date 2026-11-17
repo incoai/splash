@@ -109,6 +109,9 @@ OPTIONS = {
     "--state-format": values(
         "--state-format", {"fp32": "fp32", "bf16": "bf16"}, ("fp16", "int8")
     ),
+    "--cached-states": values(
+        "--cached-states", {"int8": "int8", "exact": "exact"}, ("", "fp32", "Exact")
+    ),
     "--disable-ane": ([(["--disable-ane"], True)], []),
     "--activations": values(
         "--activations", {"auto": "auto", "bf16": "bf16"}, ("", "on", "off", "BF16")

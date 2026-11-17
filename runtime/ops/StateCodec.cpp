@@ -48,4 +48,18 @@ void StateCodec::addDequantize(metal::CommandGraph &graph, metal::MetalBuffer co
   add(graph, "state_dequantize", std::move(codes), std::move(state), shape);
 }
 
+// 16 bytes a thread: a layer's state is whole blocks of values, each of 64
+// bytes or more.
+void StateCodec::addCopy(metal::CommandGraph &graph, metal::MetalBuffer from, metal::MetalBuffer to,
+                         StateCodecShape shape) {
+  if (!shape.valid() || shape.codesLayerBytes < shape.stateBytes())
+    throw std::invalid_argument("invalid state copy shape");
+  requireBytes(from, uint64_t{shape.layers - 1} * shape.stateLayerBytes + shape.stateBytes(), "state copy source");
+  requireBytes(to, uint64_t{shape.layers - 1} * shape.codesLayerBytes + shape.stateBytes(), "state copy destination");
+  const StateCodecParams p{shape.stateLayerBytes, shape.codesLayerBytes, 0,
+                           static_cast<uint32_t>(shape.stateBytes() / 16), 0};
+  graph.add("state_copy", {std::move(from), std::move(to)}, p,
+            {(p.threads_per_layer + kThreads - 1) / kThreads, shape.layers, 1}, {kThreads, 1, 1});
+}
+
 } // namespace splash::ops

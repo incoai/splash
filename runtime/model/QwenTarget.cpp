@@ -123,7 +123,7 @@ void QwenTarget::addStateFold(metal::CommandGraph &graph, QwenTargetFoldBuffers 
                     {std::move(buffers.state), std::move(buffers.gdnTape), buffers.stepSlot,
                      std::move(buffers.retainedRows), std::move(buffers.fold)},
                     geometry_.gdnShape(), geometry_.stateLayout.layers, rows, geometry_.stateLayout.strides(),
-                    geometry_.stateLayout.cachedRecurrentLayerBytes());
+                    geometry_.stateLayout.cachedRecurrentLayerBytes(), geometry_.stateLayout.cachedCodes);
 }
 
 void QwenTarget::requireLayers(size_t layers, size_t attentionLayers) const {
@@ -244,7 +244,8 @@ void QwenTarget::addPrefillMixer(PrefillStep &step, const QwenGdnWeights &mixer,
            mixer.timeBias, f32(b.gdnDecay, geometry_.gdnValueHeads), u16(b.gdnBeta, geometry_.gdnValueHeads),
            sequence.recurrentIn[layer], sequence.recurrentOut[layer], u16(b.recurrent, geometry_.attentionWidth),
            mixer.mixerNorm, u16(b.gdnHidden, geometry_.attentionWidth)},
-          geometry_.gdnShape(), sequence.rows, geometry_.stateLayout.format, mixer.outputHeadOrder, captures);
+          geometry_.gdnShape(), sequence.rows, geometry_.stateLayout.format, mixer.outputHeadOrder, captures,
+          geometry_.stateLayout.cachedCodes);
     }
   }
   linear.add(step.graph,

@@ -172,10 +172,11 @@ public:
   // every capture inside them, follows the last run. The scan is sequential,
   // so with an fp32 state the runs compute what one run does, and a bf16
   // state is rounded at each capture as a prefill ending there rounds it.
+  // Without `codes` a capture holds the state as it is.
   static void addPrefill(metal::CommandGraph &graph, const metal::MetalBackend &backend,
                          GdnPrefillBuffers buffers, GdnShape shape, uint32_t tokens,
                          GdnStateFormat state, GdnHeadOrder order,
-                         std::span<const GdnPrefillCapture> captures = {});
+                         std::span<const GdnPrefillCapture> captures = {}, bool codes = true);
   // The step of buffers.tapes' lanes, 1 to SPLASH_MAXIMUM_BATCH_WIDTH.
   // Also writes the out-projection's `input` table into
   // buffers.linearScratch when it is not Plain, the table rows of the step's
@@ -192,9 +193,11 @@ public:
   // codes, each layer's codesLayerBytes after the last; bit for bit the rows
   // and the codes ops::StateCodec makes of the state the lane's next step
   // holds when the lane retained exactly those rows. A lane whose path holds
-  // fewer leaves the fold as it was.
+  // fewer leaves the fold as it was. Without `codes` the fold holds the
+  // recurrent state as the lane's cell would, in its format.
   static void addFold(metal::CommandGraph &graph, GdnFoldBuffers buffers, GdnShape shape,
-                      uint32_t layers, uint32_t rows, GdnStateStrides state, uint64_t codesLayerBytes);
+                      uint32_t layers, uint32_t rows, GdnStateStrides state, uint64_t codesLayerBytes,
+                      bool codes = true);
 };
 
 } // namespace splash::ops

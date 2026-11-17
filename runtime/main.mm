@@ -148,7 +148,7 @@ void printUsage(std::string_view executable) {
       "usage: " + command +
       " serve-native MODEL_DIRECTORY"
       " MAX_CONTEXT|auto MAX_MEMORY_BYTES|auto [MAX_CACHE_DISK_BYTES]"
-      " [--kv-format int8|bf16] [--state-format fp32|bf16] [--decode-share SHARE]"
+      " [--kv-format int8|bf16] [--state-format fp32|bf16] [--cached-states int8|exact] [--decode-share SHARE]"
       " [--max-image-patches PATCHES] [--persistent-cache on|off] [--cache-dir DIRECTORY]"
       " [--max-cache-disk-writes BYTES]"
       " [--idle-release SECONDS|off] [--idle-sleep prevent|allow] [--ane on|off]"
@@ -227,6 +227,7 @@ bootstrapConfig(const engine::NativeArguments &arguments) {
     config.resources.cacheRoot = caches / "prefix-cache";
   config.resources.kvFormat = arguments.kvFormat;
   config.resources.stateFormat = arguments.stateFormat;
+  config.resources.exactCachedStates = arguments.exactCachedStates;
   config.resources.maximumImagePatches = arguments.maxImagePatches;
   config.resources.idleReleaseSeconds = arguments.idleReleaseSeconds;
   config.resources.aneFfn.enabled = arguments.neuralEngine;

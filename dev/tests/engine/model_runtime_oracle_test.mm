@@ -67,6 +67,9 @@ using metal::BackendInstrumentation;
 
 namespace {
 
+// --cached-states exact: cached states keep the running format, not codes.
+bool exactCachedStates = false;
+
 [[noreturn]] void fail(const std::string &message) {
   throw std::runtime_error(message);
 }
@@ -2245,6 +2248,14 @@ void requireDecodeCaptureMatchesTheLane(model::Runtime &executor, model::QwenSta
     const uint64_t rowsAt = uint64_t{layer} * layout.convolutionLayerBytes();
     require(std::memcmp(fromDecode.cell.data() + rowsAt, lane.data() + rowsAt, carried) == 0,
             "a decode capture's convolution rows are not the lane's at its page");
+    // A cached state in the running format (--cached-states exact) restores
+    // the lane's state bit for bit.
+    if (!layout.cachedCodes) {
+      const uint64_t stateAt = layout.convolutionBytes() + uint64_t{layer} * layout.recurrentLayerBytes();
+      differing += std::memcmp(fromDecode.cell.data() + stateAt, lane.data() + stateAt,
+                               uint64_t{rows} * columns * (bfloat ? 2 : 4)) != 0;
+      continue;
+    }
     // The lane's state through the codec, as a restore of its codes gives it.
     const std::vector<float> state = values(lane, layer), restored = values(fromDecode.cell, layer);
     const std::vector<uint8_t> codes = test::stateCodesReference(state.data(), rows, columns);
@@ -5152,7 +5163,7 @@ public:
         windowPages_(options.windowPages), densePages_(densePagesOf(shape_)),
         extentPages_(layout_.minimumExtentPages()),
         kv_(backend, admission, layout_, poolPages(lanePages, extentPages_), extentPages_), pool_(kv_, extentPages_),
-        states_(backend, admission, model.stateLayout(stateFormat), nullptr),
+        states_(backend, admission, model.stateLayout(stateFormat, !exactCachedStates), nullptr),
         readers_(std::make_shared<model::SsdReaders>(model::kSsdReaders)),
         cache_(backend, admission, layout_, extentPages_,
                {.shape = shape_, .targetBytes = 0, .readers = readers_,
@@ -5972,6 +5983,7 @@ int main(int argc, char **argv) {
     model::ModelLoadOptions loadOptions;
     if (argc < 3)
       fail("usage: model-runtime-oracle METALLIB MODEL_ROOT [--kv-format int8|bf16] [--state-format fp32|bf16] "
+           "[--cached-states int8|exact] "
            "[--ane-ffn-share SHARE] [--ane-ffn-fault EVALUATION] [--ple-memory SIZE] "
            "[--expert-memory SIZE] [--max-context TOKENS] [--spill-tokens N] [--spill-window PAGES] "
            "[--spill-buffers 1|2] [--images-only | --warmup-eos-only | --prefill-groups-only | --spill-only]");
@@ -6001,6 +6013,10 @@ int main(int argc, char **argv) {
         const std::string_view value(argv[++i]);
         if (value != "fp32" && value != "bf16") fail("invalid state format");
         stateFormat = value == "fp32" ? ops::GdnStateFormat::Float32 : ops::GdnStateFormat::BFloat16;
+      } else if (option == "--cached-states" && i + 1 < argc) {
+        const std::string_view value(argv[++i]);
+        if (value != "int8" && value != "exact") fail("invalid cached states");
+        exactCachedStates = value == "exact";
       } else if (option == "--ane-ffn-share" && i + 1 < argc) {
         const char *value = argv[++i];
         char *end = nullptr;
@@ -6133,7 +6149,7 @@ int main(int argc, char **argv) {
     // cached states at most. A plan holds these bytes where it holds the
     // context of one request whose lane's state and KV take them.
     constexpr uint64_t kMostCachedStates = 6;
-    const model::CompositeStateLayout stateLayout = model.stateLayout(stateFormat);
+    const model::CompositeStateLayout stateLayout = model.stateLayout(stateFormat, !exactCachedStates);
     const uint64_t pageBytes = kvLayout.bytesPerModelPage();
     const uint64_t checksBytes = model::ExecutionLimits::maximumBatchWidth * stateLayout.laneBytes() +
                                  kMostCachedStates * stateLayout.cachedBytes() + uint64_t{pageCount} * pageBytes;
@@ -6225,7 +6241,7 @@ int main(int argc, char **argv) {
               "oracle KV extent is unavailable");
     model::QwenStateStorage states(backend,
                                     admission,
-                                    model.stateLayout(stateFormat), nullptr);
+                                    model.stateLayout(stateFormat, !exactCachedStates), nullptr);
     model::RuntimeContext context{backend, model, pages, states, operators, aneFfn.get()};
     // The checks compare runs of one schedule bit for bit, which a draft's
     // block a lane (--verify-rows all) keeps comparable on a MoE target: the

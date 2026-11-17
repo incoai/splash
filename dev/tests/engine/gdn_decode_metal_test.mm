@@ -1951,6 +1951,8 @@ void foldMatchesTheNextStep(MetalBackend &backend, const GdnShape &shape, GdnSta
 
   const uint64_t cached = cell.layout.cachedCellBytes();
   const MetalBuffer retainedRows = sharedBuffer(backend, 4), fold = sharedBuffer(backend, cached);
+  // A cached state in the running format (--cached-states exact): a lane's cell.
+  const MetalBuffer exactFold = sharedBuffer(backend, cell.bytes);
   std::array<MetalBuffer, kMaxLanes> current, next;
   current.fill(sharedBuffer(backend, cell.bytes));
   next.fill(sharedBuffer(backend, cell.bytes));
@@ -1963,16 +1965,21 @@ void foldMatchesTheNextStep(MetalBackend &backend, const GdnShape &shape, GdnSta
   // step's rows stay for the step to run again.
   const auto check = [&](uint32_t rows, uint32_t retained, uint32_t first, const std::string &where) {
     std::memset(fold.contents(), 0xA5, cached);
+    std::memset(exactFold.contents(), 0xA5, cell.bytes);
     *static_cast<uint32_t *>(retainedRows.contents()) = retained;
     std::memcpy(current[0].contents(), fixture.next[0].contents(), cell.bytes);
     std::memset(next[0].contents(), 0, cell.bytes);
     CommandGraph graph;
     GDN::addFold(graph, {fixture.next[0], fixture.tape, stepSlot, retainedRows, fold}, shape, kLayers, rows,
                  cell.strides(), cell.layout.cachedRecurrentLayerBytes());
+    GDN::addFold(graph, {fixture.next[0], fixture.tape, stepSlot, retainedRows, exactFold}, shape, kLayers, rows,
+                 cell.strides(), cell.recurrentLayerBytes, false);
     addStep(graph, current, next, {stepSlot, fixture.slot(2, 0), first});
     (void)backend.submitCommandAsync(graph.dispatches()).wait();
     if (std::popcount(retained) < static_cast<int>(rows)) {
-      require(std::all_of(bytes(fold, 0), bytes(fold, cached), [](uint8_t byte) { return byte == 0xA5; }),
+      require(std::all_of(bytes(fold, 0), bytes(fold, cached), [](uint8_t byte) { return byte == 0xA5; }) &&
+                  std::all_of(bytes(exactFold, 0), bytes(exactFold, cell.bytes),
+                              [](uint8_t byte) { return byte == 0xA5; }),
               where + ": a fold of rows the lane did not retain wrote its cell");
       return;
     }
@@ -1992,6 +1999,11 @@ void foldMatchesTheNextStep(MetalBackend &backend, const GdnShape &shape, GdnSta
       require(!std::memcmp(bytes(fold, cell.convBytes + layer * cell.layout.cachedRecurrentLayerBytes()),
                            expected.data(), expected.size()),
               where + ": the fold's codes are not the codec's of the next step's state");
+      const uint64_t stateAtExact = cell.convBytes + layer * cell.recurrentLayerBytes;
+      require(!std::memcmp(bytes(exactFold, rowsAt), bytes(next[0], rowsAt), carried) &&
+                  !std::memcmp(bytes(exactFold, stateAtExact), stateAt,
+                               values.size() * (format == GdnStateFormat::BFloat16 ? 2 : 4)),
+              where + ": an exact fold is not the next step's state bit for bit");
     }
   };
   for (uint32_t rows = 1; rows <= kRows; ++rows)

@@ -70,9 +70,10 @@ struct LoadedModel final {
     layout.format = format;
     return layout;
   }
-  [[nodiscard]] CompositeStateLayout stateLayout(ops::GdnStateFormat format) const noexcept {
+  [[nodiscard]] CompositeStateLayout stateLayout(ops::GdnStateFormat format, bool cachedCodes = true) const noexcept {
     auto layout = descriptor.stateLayout;
     layout.target.format = format;
+    layout.target.cachedCodes = cachedCodes;
     return layout;
   }
   [[nodiscard]] uint32_t maximumContextTokens() const noexcept {

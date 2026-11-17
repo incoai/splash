@@ -388,6 +388,52 @@ void testDiskRestore(metal::MetalBackend &backend) {
   storage.releaseLane(0, 123);
 }
 
+// With --cached-states exact a cached state keeps the running format: its
+// cell is a lane's, and a restore from its RAM copy or from the disk
+// reproduces every byte of the lane's state, NaN patterns and all, in fp32
+// and in bf16, where codes reproduce the values to half a step.
+void testExactCachedStatesRestoreEveryByte(metal::MetalBackend &backend) {
+  MemoryGovernor governor(backend, backend.capabilities().recommendedMaxWorkingSetBytes, 1, 1,
+                          queryHostMemory, 0);
+  const test::ClaimScope start(governor, ClaimClass::Floor);
+  for (const ops::GdnStateFormat format : {ops::GdnStateFormat::Float32, ops::GdnStateFormat::BFloat16}) {
+    const std::string label = std::string(ops::formatName(format)) + " exact cached state: ";
+    model::CompositeStateLayout layout = kStateLayout;
+    layout.target.format = format;
+    layout.target.cachedCodes = false;
+    require(layout.target.cachedCellBytes() == layout.target.cellBytes() &&
+                layout.cachedBytes() == layout.target.cellBytes() + kDraftState.windowBytes(),
+            label + "it is not a lane's cell and window");
+    const uint64_t slotBytes = model::SlotFile::slotBytesFor(layout.cachedBytes());
+    model::QwenStateStorage storage(
+        backend, governor.allocationAdmission(), layout,
+        std::make_shared<model::SlotFile>(slotBytes, std::make_shared<model::DiskBudget>(slotBytes)));
+    require(static_cast<bool>(storage.tryActivateLane(0, 7)), label + "lane activation failed");
+    fill(storage.current(0).stateBase, 11);
+    fill(storage.window(0), 12);
+    const auto image = stateImage(storage, 0);
+    storage.updateLengths(0, published(4096));
+    auto resident = storage.snapshot(0);
+    require(resident && resident->residentBytes() == layout.cachedBytes(), label + "the RAM copy is not its size");
+    fill(storage.current(0).stateBase, 13);
+    require(!storage.beginRestore(0, *resident, true, {}, [] {}) && stateImage(storage, 0) == image,
+            label + "a restore from RAM did not reproduce every byte");
+    auto write = resident->offload({});
+    require(write != nullptr, label + "the disk copy was refused");
+    auto disk = write->state();
+    resident.reset();
+    require(finishWhenReady(*write), label + "the disk write failed");
+    write.reset();
+    fill(storage.current(0).stateBase, 14);
+    auto read = storage.beginRestore(0, *disk, true, {}, [] {});
+    require(read && finishWhenReady(*read) && stateImage(storage, 0) == image,
+            label + "a restore from the disk did not reproduce every byte");
+    read.reset();
+    disk.reset();
+    storage.releaseLane(0, 7);
+  }
+}
+
 // A lane whose state no cache slot can hold writes it from its own cells: no
 // cache buffer is taken, the disk copy restores every byte of the active
 // parity, and a full quota refuses until a disk copy is dropped.
@@ -1040,6 +1086,7 @@ void run(const std::string &metallib) {
   metal::MetalBackend backend(metallib);
   testOffloadAllocationFailure(backend);
   testDiskRestore(backend);
+  testExactCachedStatesRestoreEveryByte(backend);
   testDirectDiskSnapshot(backend);
   testStateWritesDrawOnTheWriteBudget(backend);
   testStateSmallerThanSlot(backend);

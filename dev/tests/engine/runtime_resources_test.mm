@@ -1422,6 +1422,19 @@ void testAutomaticContextIgnoresTheVolume(const char *metallibPath) {
   require(!off.tier && room.tier && room.staging == config.model.stateLayout.cachedBytes() &&
               room.context == room.planContext && room.context < off.context,
           "the automatic tier did not start beside its staging, or the staging cost no context");
+  // A cached state in the running format (--cached-states exact) stages and
+  // counts as a lane's cell and window, more than its codes.
+  model::CompositeStateLayout running = config.model.stateLayout;
+  running.target.format = config.stateFormat;
+  running.target.cachedCodes = false;
+  config.exactCachedStates = true;
+  config.maximumMemoryBytes += running.cachedBytes();
+  const Started exact = start();
+  require(exact.tier && exact.staging == running.cachedBytes() &&
+              running.cachedBytes() > config.model.stateLayout.cachedBytes(),
+          "an exact cached state did not stage as the running state holds it");
+  config.exactCachedStates = false;
+  config.maximumMemoryBytes -= running.cachedBytes();
   const std::array<std::pair<std::optional<DiskVolume>, std::string>, 3> refusals{{
       {localVolume(11 * kGiB), "11.0 GiB available on /Volumes/Test is too little beyond the 10.0 GiB"},
       {std::nullopt, "its volume cannot be measured"},

@@ -103,6 +103,8 @@ struct CacheDiskQuota final {
 struct RuntimeResourcesConfig {
   kv::Format kvFormat = kv::Format::Int8;
   ops::GdnStateFormat stateFormat = ops::GdnStateFormat::Float32;
+  // Cached states keep stateFormat rather than codes (--cached-states exact).
+  bool exactCachedStates = false;
   std::filesystem::path metallibPath;
   std::filesystem::path modelRoot;
   model::ModelDescriptor model;

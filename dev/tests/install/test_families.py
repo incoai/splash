@@ -22,6 +22,7 @@ UNUSABLE = {
     "Flint": {
         "--language-only",
         "--state-format",
+        "--cached-states",
         "--ple-memory",
         "--sparse-kv-memory",
         "--disable-ane",

@@ -711,8 +711,7 @@ struct Runtime::Impl {
   explicit Impl(RuntimeContext value)
       : backend(value.backend),
         model(value.model),
-        geometry(RuntimeGeometry::from(value.model, value.kvPages.layout().format,
-                                       value.stateStorage.layout().target.format,
+        geometry(RuntimeGeometry::from(value.model, value.kvPages.layout().format, value.stateStorage.layout().target,
                                        StreamedParts::loaded(value.model, value.blockCache != nullptr))),
         operators(value.operators),
         kvPages(value.kvPages),
@@ -728,7 +727,7 @@ struct Runtime::Impl {
                    geometry.target.draftVocabulary),
         aneFfn(value.aneFfn), blockCache(value.blockCache), historyStream(value.historyStream),
         limits(splash::model::commandLimits(geometry, aneFfn ? aneFfn->minimumRows() : 0)) {
-    if (states.layout() != model.stateLayout(states.layout().target.format) ||
+    if (states.layout() != model.stateLayout(states.layout().target.format, states.layout().target.cachedCodes) ||
         kvPages.layout() != model.targetKvLayout(kvPages.layout().format) || !blockCache != !historyStream) {
       throw std::invalid_argument(
           "model runtime resources do not match the loaded model");

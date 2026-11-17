@@ -20,7 +20,8 @@ inline constexpr uint32_t kGdnConvolutionTaps = SPLASH_GDN_CONVOLUTION_TAPS;
 // Physical state geometry is supplied by the paired target and draft models,
 // and the running recurrent state's format by the runtime (--state-format).
 // A cached state's cell holds the recurrent layers as int8 codes and bf16
-// scales instead (ops::StateCodec, cachedCellBytes). The engine sees only
+// scales instead (ops::StateCodec, cachedCellBytes), or with
+// --cached-states exact as the running state does. The engine sees only
 // opaque CompositeState handles and byte accounting. A target without GDN
 // layers keeps only its auxiliary state in a cell, if it has one: its cells
 // may hold nothing.
@@ -37,6 +38,9 @@ struct GdnStateLayout final {
   // State a family keeps beside its GDN layers' (Qwen3.8-Flash-Next's PLE
   // convolution history), after them in the cell.
   uint64_t auxiliaryBytes = 0;
+  // Whether a cached state holds the recurrent layers as codes; false keeps
+  // them in `format` (--cached-states exact).
+  bool cachedCodes = true;
 
   // Every GDN dimension is set with GDN layers and zero without.
   [[nodiscard]] constexpr bool valid() const noexcept {
@@ -65,9 +69,10 @@ struct GdnStateLayout final {
     return convolutionBytes() + recurrentBytes() + alignUp(auxiliaryBytes);
   }
   // A cached state's recurrent layer: the codes and scales of every value
-  // head's rows (ops::StateCodec).
+  // head's rows (ops::StateCodec), or a lane's layer.
   [[nodiscard]] constexpr uint64_t cachedRecurrentLayerBytes() const noexcept {
-    return alignUp(state_codec_layer_bytes(recurrentGroups * recurrentRows, recurrentColumns));
+    return cachedCodes ? alignUp(state_codec_layer_bytes(recurrentGroups * recurrentRows, recurrentColumns))
+                       : recurrentLayerBytes();
   }
   [[nodiscard]] constexpr uint64_t cachedRecurrentBytes() const noexcept {
     return uint64_t{layers} * cachedRecurrentLayerBytes();
@@ -76,7 +81,8 @@ struct GdnStateLayout final {
   [[nodiscard]] constexpr uint64_t cachedCellBytes() const noexcept {
     return convolutionBytes() + cachedRecurrentBytes() + alignUp(auxiliaryBytes);
   }
-  // The codec between a lane's recurrent layers and a cached state's.
+  // The codec, or the copy, between a lane's recurrent layers and a cached
+  // state's.
   [[nodiscard]] constexpr ops::StateCodecShape codecShape() const noexcept {
     return {layers,
             recurrentGroups * recurrentRows,

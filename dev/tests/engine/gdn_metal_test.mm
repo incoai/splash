@@ -677,6 +677,28 @@ void runCapturedStatesCase(MetalBackend &backend, const GdnShape &shape, GdnStat
       require(std::memcmp(captured.captures[lane][index].recurrent.contents(), codes.data(), codes.size()) == 0,
               label + "cached codes differ from the CPU's of the split's state" + where);
     }
+  // A cached state in the running format (--cached-states exact) captures
+  // the split's state as it is, byte for byte.
+  RaggedRun exact = run();
+  exact.captures.resize(lanes.size());
+  CommandGraph exactCapturing;
+  for (size_t lane = 0; lane < lanes.size(); ++lane) {
+    for (uint32_t row : lanes[lane].captures)
+      exact.captures[lane].push_back(
+          {row, shared(backend, carriedBytes, "exact conv"), shared(backend, stateBytes, "exact state")});
+    GDN::addPrefill(exactCapturing, backend,
+                    rows(exact, lanes[lane].rowBegin, lanes[lane].tokens, source.convolutionIn, source.recurrentIn,
+                         exact.convolution[lane], exact.recurrent[lane]),
+                    shape, lanes[lane].tokens, format, GdnHeadOrder::Grouped, exact.captures[lane], false);
+  }
+  submit(exactCapturing);
+  for (size_t lane = 0; lane < lanes.size(); ++lane)
+    for (size_t index = 0; index < lanes[lane].captures.size(); ++index) {
+      const bool end = lanes[lane].captures[index] == lanes[lane].tokens;
+      same(exact.captures[lane][index].recurrent, end ? split.recurrent[lane] : split.captures[lane][index].recurrent,
+           "an exact cached state differs from the split's state of lane " + std::to_string(lane) + " at row " +
+               std::to_string(lanes[lane].captures[index]));
+    }
   sameRows(captured, split, "the split");
   if (format == GdnStateFormat::Float32)
     sameRows(captured, single, "the single pass");

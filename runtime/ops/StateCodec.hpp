@@ -34,13 +34,18 @@ struct StateCodecShape final {
 
 // Quantizes a running state's layers into a cached state's and dequantizes
 // them back, one dispatch over every layer of `shape`; `state` and `codes`
-// start at the first layer.
+// start at the first layer. A cached state that keeps the running format
+// (--cached-states exact) is copied instead, byte for byte (addCopy).
 class StateCodec final {
 public:
   static void addQuantize(metal::CommandGraph &graph, metal::MetalBuffer state, metal::MetalBuffer codes,
                           StateCodecShape shape);
   static void addDequantize(metal::CommandGraph &graph, metal::MetalBuffer codes, metal::MetalBuffer state,
                             StateCodecShape shape);
+  // Each layer's state bytes of `shape` from `from`, its layers
+  // stateLayerBytes apart, to `to`, codesLayerBytes apart, as they are.
+  static void addCopy(metal::CommandGraph &graph, metal::MetalBuffer from, metal::MetalBuffer to,
+                      StateCodecShape shape);
 };
 
 } // namespace splash::ops

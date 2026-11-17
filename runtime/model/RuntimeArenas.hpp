@@ -85,6 +85,14 @@ struct RuntimeGeometry final {
                            model.target),
                 kvFormat, stateFormat, parts);
   }
+  // The same with a cached state's form as `states`, a runtime's state
+  // storage's, holds it (GdnStateLayout::cachedCodes).
+  [[nodiscard]] static RuntimeGeometry from(const LoadedModel &model, kv::Format kvFormat,
+                                            const GdnStateLayout &states, StreamedParts parts) {
+    RuntimeGeometry result = from(model, kvFormat, states.format, parts);
+    result.target.stateLayout.cachedCodes = states.cachedCodes;
+    return result;
+  }
   // The geometry of a model of `descriptor` whose draft is of `draft` and
   // whose target's weights give `target` (qwenTargetGeometry, as they loaded
   // or as their files plan them, plannedTargetGeometry), with `parts`

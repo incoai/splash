@@ -532,7 +532,11 @@ void QwenStateStorage::addCode(metal::CommandGraph &graph, bool quantize, const 
   const GdnStateLayout &gdn = layout_.target;
   const MetalBuffer running = backend_.view(cell.stateBase, gdn.convolutionBytes(), gdn.recurrentBytes());
   const MetalBuffer codes = backend_.view(cached.stateBase, gdn.convolutionBytes(), gdn.cachedRecurrentBytes());
-  if (quantize)
+  // A cached state in the running format is the lane's bytes; its layers
+  // are as far apart as a lane's either way.
+  if (!gdn.cachedCodes)
+    ops::StateCodec::addCopy(graph, quantize ? running : codes, quantize ? codes : running, gdn.codecShape());
+  else if (quantize)
     ops::StateCodec::addQuantize(graph, running, codes, gdn.codecShape());
   else
     ops::StateCodec::addDequantize(graph, codes, running, gdn.codecShape());
