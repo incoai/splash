@@ -1408,9 +1408,9 @@ and an M5 Pro the ANE's is the longer (1.7 ms a unit of the full-chunk layer
 against 0.6 and 1.1 ms), on an M6 the GPU's (1.9 against 1.2 ms), all with
 `--activations bf16`. It fits u at 0.4, then again at the units it chose,
 nearest T's least, from their split's full-chunk layer timed as the fit's were,
-on the same four layers (the chunks' timings below take the model's first
-layers, whose formats a mixed quantization can make other than the rest's,
-which would bias u); where that fit chooses other units, their split is prepared
+on the same four layers (a mixed quantization can give the model's first
+layers other formats than the rest's, which would bias u); where that fit
+chooses other units, their split is prepared
 and timed in turn, and serves if it splits every chunk the first splits, none
 of them more than 2% longer, the first otherwise, as where the refit's split
 cannot be timed or the other split prepared (a first split that does not
@@ -1447,10 +1447,17 @@ ANE's output filled with NaN first so that rows it leaves unwritten show,
 against the leading rows of a full chunk on the GPU alone, which computes every
 row alike whatever the chunk's rows. The outputs must be finite and differ from
 the GPU's by at most 10% of what the ANE adds over the GPU's part; int8 leaves
-2.5-2.8% on Qwen3.8-27B. A start that calibrates then times the GPU's FFN layer
-alone at 512 and 2048 rows and the split layer of every function as above, and
-splits the chunks from the least rows from which every larger chunk's split
-layer takes at most 2% longer than the GPU's at the chunk's rows. Every row
+2.5-2.8% on Qwen3.8-27B. A start that calibrates first times the GPU's FFN
+layer alone at 512 and 2048 rows and the split layer of every function, on a
+split of its own over the four layers the fit timed, as many to a command, so
+that the splits it compares are timed where it fitted them; and it splits the
+chunks from the least rows from which every larger chunk's split layer takes at
+most 2% longer than the GPU's at the chunk's rows. Six calibrations of
+Qwen3.8-27B MLX 4-bit on the Studio (M5 Max) timed each function's split layer
+within a range of 3.2% of its mean for the median function, 6.1% at most,
+where over the model's first layers, about 4,096 rows of layers to a command,
+it was 3.6% and 10.9%; both chose 7 units, from 822-1,028 rows against
+816-1,313. Every row
 count is checked, since a batch's chunk sums its lanes' rows: an evaluation
 costs the ANE its function's rows, which a chunk pads up to, and the functions
 do not cost it in proportion to their rows (on an M5 Max 640 rows take 93% of

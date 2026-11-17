@@ -14,12 +14,12 @@ namespace {
 
 // The shares calibration times the split at.
 constexpr std::array<double, 2> kTimedShares{0.4, 0.8};
-// The layers time() spreads over the model; each of its commands takes all
-// but the last, which gives the last one's next weights to stage.
+// The layers time() and chunks() spread over the model; each of their
+// commands takes all but the last, which gives the last one's next weights
+// to stage.
 constexpr uint32_t kSampledLayers = 5;
-// The rows of layers of each command chunks() times, and the runs of each
-// command.
-constexpr uint32_t kCommandRows = 2 * AneFfn::kMaximumRows, kRuns = 3;
+// The runs of each command.
+constexpr uint32_t kRuns = 3;
 
 // The median of kRuns of `run`'s milliseconds, which passes over a first run
 // that wires a function.
@@ -134,20 +134,26 @@ Timing Measurement::time(uint32_t aneUnits, double gpuAlone) {
                 layer(layers, kSampledLayers - 1, kRows, &split, gpuAlone)};
 }
 
-ChunkTimings Measurement::chunks(AneFfn &split) {
+// On the layers time() timed, as many to a command, so that the splits
+// calibration compares (slowerNowhere) are timed where it fitted them. Six
+// calibrations of Qwen3.8-27B MLX 4-bit on an M5 Max timed each function's
+// split layer within a range of 6.1% of its mean (3.2% the median function)
+// this way, against 10.9% (3.6%) over the model's first layers at about
+// 4,096 rows of layers to a command, and chose the same 7 units from about
+// the same least rows (842 the median against 833).
+ChunkTimings Measurement::chunks(uint32_t aneUnits) {
+  const std::vector<SwiGluProjections> layers = sampled();
+  AneFfn split(backend_, linear_, layers, aneUnits, interrupted_);
   std::vector<uint32_t> rows;
   for (const AneFfn::Evaluation &evaluation : split.evaluations_) rows.push_back(evaluation.rows);
-  // About kCommandRows rows of layers to a command, more layers of fewer rows.
-  const auto count = [&](uint32_t chunk) {
-    return static_cast<uint32_t>(std::clamp<size_t>(kCommandRows / chunk, 1, layers_.size() - 1));
-  };
-  const auto gpu = [&](uint32_t chunk) { return ChunkTimings::Gpu{chunk, layer(layers_, count(chunk), chunk)}; };
+  constexpr uint32_t kCount = kSampledLayers - 1;
+  const auto gpu = [&](uint32_t chunk) { return ChunkTimings::Gpu{chunk, layer(layers, kCount, chunk)}; };
   ChunkTimings timings{{gpu(rows.front()), gpu(rows.back())}, {}};
   const auto &[low, high] = timings.gpu;
   const double slope = (high.milliseconds - low.milliseconds) / (high.rows - low.rows);
   for (size_t function = rows.size(); function-- > 0;)
     timings.functions.push_back({function ? rows[function - 1] + 1 : rows.front(), rows[function],
-                                 layer(layers_, count(rows[function]), rows[function], &split,
+                                 layer(layers, kCount, rows[function], &split,
                                        low.milliseconds + slope * (rows[function] - low.rows))});
   return timings;
 }

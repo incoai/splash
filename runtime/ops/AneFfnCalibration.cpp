@@ -16,9 +16,10 @@ namespace {
 constexpr double kMinimumGain = 0.05;
 // How much longer than the GPU's alone a chunk's split layer may take and
 // the chunk still split: six timings of each function's split layer of
-// Qwen3.8-27B on an M5 Max spread over ±3%, and the FFN takes about half of
-// a prefill, so a chunk that splits within this prefills at most about 1%
-// slower.
+// Qwen3.8-27B on an M5 Max spread over ±3%, and on the layers calibration
+// fits (Measurement::chunks) over ±1.6% for the median function and ±3% at
+// most, and the FFN takes about half of a prefill, so a chunk that splits
+// within this prefills at most about 1% slower.
 constexpr double kChunkNoise = 0.02;
 // The first word of a Calibration's text, which a change to its fields
 // renumbers.

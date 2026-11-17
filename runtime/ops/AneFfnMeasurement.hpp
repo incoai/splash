@@ -35,10 +35,11 @@ public:
   // alone that time() timed: what calibration fits again at the units it
   // first chooses (ane_ffn::refit), on the layers it fitted.
   [[nodiscard]] Timing time(uint32_t aneUnits, double gpuAlone);
-  // The GPU alone over the least and the most rows of `split`'s functions,
-  // and `split` over a chunk of the rows of each of its functions, on the
-  // first layers.
-  [[nodiscard]] ChunkTimings chunks(AneFfn &split);
+  // The GPU alone over the least and the most rows of the split's
+  // functions, and the split with the ANE taking `aneUnits` over a chunk of
+  // the rows of each of its functions, on the layers time() times: a
+  // program of every function, as the split that serves compiles.
+  [[nodiscard]] ChunkTimings chunks(uint32_t aneUnits);
 
 private:
   // The per-layer milliseconds of `count` `rows`-row FFN layers of `layers`

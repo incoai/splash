@@ -1529,11 +1529,12 @@ AneFfnModel aneFfnModel(metal::MetalBackend &backend, const model::LoadedModel &
   model.prepare = [&backend, &linear, layers, cancelled, onArena](uint32_t aneUnits, bool timeChunks) {
     AneFfnPrepared prepared;
     onArena([&](const ops::PrefillFfnBuffers &ffn, const std::array<metal::MetalBuffer, 2> &hidden) {
+      // The chunks are timed on a split of their own, before this one is
+      // made, so that no two splits are held at once.
+      if (timeChunks)
+        prepared.chunks = ops::ane_ffn::Measurement(backend, linear, *layers, ffn, hidden, cancelled).chunks(aneUnits);
       prepared.split = std::make_unique<ops::AneFfn>(backend, linear, *layers, aneUnits, cancelled);
       prepared.error = prepared.split->verify(*layers, ffn, hidden);
-      if (timeChunks)
-        prepared.chunks =
-            ops::ane_ffn::Measurement(backend, linear, *layers, ffn, hidden, cancelled).chunks(*prepared.split);
     });
     return prepared;
   };
