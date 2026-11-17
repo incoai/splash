@@ -1,6 +1,7 @@
 // Synthetic-weight numerical unit test; never loads the production model.
 #include "SyntheticModels.hpp"
 #include "ClaimScope.hpp"
+#include "AllocationFailure.hpp"
 #include "TestChecks.hpp"
 #include "TestKvTier.hpp"
 #include "ops/KvSlotFormat.hpp"
@@ -34,13 +35,14 @@ std::vector<uint8_t> bytes(const metal::MetalBuffer &buffer) {
 }
 struct State final {
   model::QwenLaneMetadata metadata;
-  std::vector<uint8_t> current, next, window, pending;
+  std::vector<uint8_t> current, next, window, pending, penalties;
   std::vector<std::vector<uint8_t>> rings;
 };
 State state(const model::Runtime &runtime, const model::QwenStateStorage &storage, uint32_t lane) {
   State result{storage.metadata(lane), bytes(storage.current(lane).stateBase),
                bytes(storage.next(lane).stateBase), bytes(storage.window(lane)),
-               model::RuntimeInstrumentation::pendingGdnRows(runtime, storage.metadata(lane).requestId), {}};
+               model::RuntimeInstrumentation::pendingGdnRows(runtime, storage.metadata(lane).requestId),
+               model::RuntimeInstrumentation::penaltyState(runtime, storage.metadata(lane).requestId), {}};
   for (const auto &ring : storage.draft(lane)) {
     result.rings.push_back(bytes(ring.keys));
     result.rings.push_back(bytes(ring.values));
@@ -53,12 +55,13 @@ void equal(const State &a, const State &b) {
               a.metadata.lengths == b.metadata.lengths &&
               a.metadata.pendingPath == b.metadata.pendingPath &&
               a.current == b.current && a.next == b.next && a.window == b.window &&
-              a.pending == b.pending && a.rings == b.rings,
+              a.pending == b.pending && a.penalties == b.penalties && a.rings == b.rings,
           "park/rebind changed recurrent state, tape, draft context or metadata");
 }
 ModelStepResult step(model::Runtime &runtime, uint64_t id, uint64_t position,
                      const std::vector<uint32_t> &pages, std::span<const uint32_t> prompt = {},
-                     bool probePark = false, bool probeRestore = false) {
+                     bool probePark = false, bool probeRestore = false,
+                     const std::function<void()> &during = {}) {
   const bool prefill = !prompt.empty();
   const uint32_t count = static_cast<uint32_t>(prompt.size());
   BatchPlan plan{.kind = prefill ? WorkKind::Prefill : WorkKind::Decode,
@@ -70,6 +73,7 @@ ModelStepResult step(model::Runtime &runtime, uint64_t id, uint64_t position,
     require(runtime.reserveSpilledReads(id, {.kind = WorkKind::Decode}).granted(),
             "continuation decode hot floor was refused");
   auto ticket = runtime.submit(plan, {&item, 1}, {});
+  if (during) during();
   if (probePark)
     require(!runtime.parkDecodedRequest(202).granted(), "a live command permitted parking");
   if (probeRestore)
@@ -308,6 +312,157 @@ void spilledContinuation(RuntimeResources &resources, model::Runtime &runtime) {
     for (auto page : intruderPages) pool.releasePage(page, false);
     std::cout << "spilled_continuation=PASS fault=" << fail << " reads=" << reads << '\n';
   }
+}
+
+void exchangeCases(RuntimeResources &resources, model::Runtime &runtime) {
+  auto context = resources.modelContext();
+  auto &governor = resources.memoryGovernor();
+  auto &pool = resources.kvPool();
+  std::array<std::vector<uint32_t>, 5> pages;
+  std::array<uint64_t, 5> positions;
+  positions.fill(40);
+  std::vector<uint32_t> prompt(40);
+  for (uint32_t row = 0; row < prompt.size(); ++row) prompt[row] = 10 + row;
+  const auto id = [](uint32_t index) { return uint64_t{1201} + index; };
+  const auto begin = [&](uint32_t index, uint32_t lane) {
+    positions[index] = prompt.size();
+    auto acquired = pool.acquirePages(16);
+    require(acquired.granted(), "exchange fixture KV refused");
+    pages[index] = std::move(acquired.pages);
+    for (auto page : pages[index]) pool.clearPage(page);
+    EngineRequest request;
+    request.id = id(index); request.prompt = prompt; request.maxNewTokens = 4096;
+    request.flags = RequestIgnoreEndOfSequence;
+    request.sampling.temperature = 0.8F;
+    request.sampling.presencePenalty = 0.2F; request.sampling.frequencyPenalty = 0.1F;
+    request.sampling.seed = 47;
+    runtime.beginColdRequest(request.modelView(), lane);
+    static_cast<void>(step(runtime, id(index), 0, pages[index], prompt));
+  };
+  const auto decode = [&](uint32_t index, const std::function<void()> &during = {}) {
+    auto result = step(runtime, id(index), positions[index], pages[index], {}, false, false, during);
+    positions[index] += result.outputTokens.size() - result.outputTokensWithoutKv;
+    return result;
+  };
+  for (uint32_t index = 0; index < 4; ++index) {
+    begin(index, index);
+    if (!index && context.blockCache) {
+      const auto before = state(runtime, context.stateStorage, 0);
+      require(!runtime.prepareDecodedExchange(id(0)).granted(), "exchange prepared without a reserved hot floor");
+      equal(before, state(runtime, context.stateStorage, 0));
+    }
+    static_cast<void>(decode(index));
+  }
+  static_cast<void>(decode(2));
+  const auto savedVictim = state(runtime, context.stateStorage, 0);
+  const auto charged = runtime.actualRuntimeMemory().stateActualAllocatedBytes;
+  governor.setPressure(MemoryPressure::Critical);
+  const auto refused = runtime.prepareDecodedExchange(id(0));
+  governor.setPressure(MemoryPressure::Normal);
+  require(!refused.granted() && runtime.actualRuntimeMemory().stateActualAllocatedBytes == charged,
+          "refused exchange bank detached or allocated the resident state");
+  equal(savedVictim, state(runtime, context.stateStorage, 0));
+  require(runtime.prepareDecodedExchange(id(0)).granted(), "exchange scratch bank refused");
+  require(context.stateStorage.metadata(0).requestId == 0, "prepared exchange retained its lane");
+  begin(4, 0);
+  static_cast<void>(decode(4));
+  static_cast<void>(decode(4, [&] {
+    require(!runtime.exchangeDecodedRequests(id(0), id(4)).granted(), "live command permitted exchange");
+  }));
+  const auto savedBorrower = state(runtime, context.stateStorage, 0);
+  require(!runtime.prepareDecodedExchange(id(4)).granted() && !runtime.parkDecodedRequest(id(4)).granted(),
+          "a second bank or compact park took the same physical slot");
+  equal(savedBorrower, state(runtime, context.stateStorage, 0));
+  if (context.blockCache) {
+    context.blockCache->releaseLane(0);
+    require(!runtime.exchangeDecodedRequests(id(0), id(4)).granted(), "exchange returned without a reserved hot floor");
+    equal(savedBorrower, state(runtime, context.stateStorage, 0));
+    require(runtime.reserveSpilledReads(id(4), {.kind = WorkKind::Decode}).granted(), "test floor reacquisition refused");
+  }
+  const auto unrelated = state(runtime, context.stateStorage, 1);
+  require(!runtime.exchangeDecodedRequests(id(0), id(1)).granted(), "exchange migrated a bank to another physical lane");
+  equal(unrelated, state(runtime, context.stateStorage, 1));
+  equal(savedBorrower, state(runtime, context.stateStorage, 0));
+  require(!runtime.restoreParkedRequest(id(0)).granted(), "full-lane fixture unexpectedly restored without exchange");
+  const auto allocated = resources.backend().memoryStats().allocatedBytes;
+  const auto denied = governor.snapshot().deniedReservations;
+  governor.setPressure(MemoryPressure::Critical);
+  StateAdmission restored;
+  allocationFailureAfter = 0;
+  try { restored = runtime.exchangeDecodedRequests(id(0), id(4)); }
+  catch (...) { allocationFailureAfter = -1; throw; }
+  const bool noHostAllocation = allocationFailureAfter == 0;
+  allocationFailureAfter = -1;
+  governor.setPressure(MemoryPressure::Normal);
+  require(noHostAllocation && restored.granted() && *restored.lane == 0 &&
+              resources.backend().memoryStats().allocatedBytes == allocated &&
+              governor.snapshot().deniedReservations == denied,
+          "full-lane return failed or allocated under critical pressure");
+  equal(savedVictim, state(runtime, context.stateStorage, 0));
+  const auto expectedVictim = decode(1), actualVictim = decode(0);
+  require(expectedVictim.outputTokens == actualVictim.outputTokens &&
+              expectedVictim.acceptedDraftTokens == actualVictim.acceptedDraftTokens,
+          "exchange changed the returned stream or penalty/RNG continuation");
+  require(runtime.exchangeDecodedRequests(id(4), id(0)).granted(), "reverse exchange failed");
+  equal(savedBorrower, state(runtime, context.stateStorage, 0));
+  const auto expectedBorrower = decode(2), actualBorrower = decode(4);
+  require(expectedBorrower.outputTokens == actualBorrower.outputTokens &&
+              expectedBorrower.acceptedDraftTokens == actualBorrower.acceptedDraftTokens,
+          "reverse exchange changed the borrower continuation");
+  const auto borrowerAfter = state(runtime, context.stateStorage, 0);
+  const auto beforeCycles = resources.backend().memoryStats().allocatedBytes;
+  governor.setPressure(MemoryPressure::Critical);
+  for (uint32_t cycle = 0; cycle < 16; ++cycle) {
+    require(runtime.exchangeDecodedRequests(id(0), id(4)).granted() &&
+                runtime.exchangeDecodedRequests(id(4), id(0)).granted(),
+            "repeated in-place exchange failed under critical pressure");
+  }
+  governor.setPressure(MemoryPressure::Normal);
+  require(resources.backend().memoryStats().allocatedBytes == beforeCycles,
+          "repeated exchanges changed Metal allocation");
+  equal(borrowerAfter, state(runtime, context.stateStorage, 0));
+  runtime.end(id(0));
+  if (context.blockCache) require(context.blockCache->holdsLane(0), "cancelled parked peer stole the resident floor");
+  for (uint32_t index = 1; index < 5; ++index) runtime.end(id(index));
+  const auto releasePages = [&] {
+    for (auto &list : pages) {
+      for (auto page : list) pool.releasePage(page, false);
+      list.clear();
+    }
+  };
+  releasePages();
+  // If the resident ends first, the bank retains its physical floor until
+  // the parked owner is restored. No new floor allocation is needed then.
+  begin(0, 0); static_cast<void>(decode(0));
+  const auto beforeResidentEnd = state(runtime, context.stateStorage, 0);
+  require(runtime.prepareDecodedExchange(id(0)).granted(), "resident-first cancellation bank refused");
+  begin(4, 0); static_cast<void>(decode(4));
+  runtime.end(id(4));
+  if (context.blockCache) require(context.blockCache->holdsLane(0), "resident end lost the bank's floor");
+  require(runtime.restoreParkedRequest(id(0)).granted(), "return after resident cancellation failed");
+  equal(beforeResidentEnd, state(runtime, context.stateStorage, 0));
+  runtime.end(id(0)); releasePages();
+  // A lower-numbered lane becoming free must not steal this bank's floor.
+  begin(0, 3); static_cast<void>(decode(0));
+  const auto highLane = state(runtime, context.stateStorage, 3);
+  require(runtime.prepareDecodedExchange(id(0)).granted(), "high-lane exchange bank refused");
+  begin(4, 3); static_cast<void>(decode(4));
+  require(!runtime.restoreParkedRequest(id(0)).granted(), "bank used an unrelated free physical lane");
+  runtime.end(id(4));
+  const auto highRestore = runtime.restoreParkedRequest(id(0));
+  require(highRestore.granted() && *highRestore.lane == 3, "bank restored outside its reserved physical lane");
+  equal(highLane, state(runtime, context.stateStorage, 3));
+  runtime.end(id(0)); releasePages();
+  // A prepared bank cancelled before another owner starts releases its
+  // otherwise orphaned floor, and repeated cancellation is harmless.
+  begin(0, 0); static_cast<void>(decode(0));
+  require(runtime.prepareDecodedExchange(id(0)).granted(), "unborrowed cancellation bank refused");
+  runtime.end(id(0)); runtime.end(id(0)); releasePages();
+  for (uint32_t lane = 0; lane < 4; ++lane)
+    require(!context.stateStorage.metadata(lane).assigned() &&
+                (!context.blockCache || !context.blockCache->holdsLane(lane)),
+            "exchange cancellation retained a lane or hot floor");
+  std::cout << "full_lane_exchange=PASS switches=34 allocation_free=1 host_allocation_free=1 critical_pressure=1 refusal=1 cancellation=1\n";
 }
 
 void run(const char *metallib) {
@@ -719,6 +874,7 @@ void run(const char *metallib) {
       require(ended.outputTokens.size() == 1 && !runtime->parkDecodedRequest(505).granted(),
               "an already emitted terminal anchor was parked for another decode");
       runtime->end(505);
+      exchangeCases(*resources, *runtime);
       for (uint32_t lane = 0; lane < model::ExecutionLimits::maximumBatchWidth; ++lane)
         require(!storage.metadata(lane).assigned(), "continuation test retained an active lane");
       for (const auto *pages : {&baselinePages, &parkedPages, &intruderPages})

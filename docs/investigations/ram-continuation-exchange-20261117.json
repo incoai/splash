@@ -1,0 +1,132 @@
+{
+  "created_at_utc": "2026-11-17T14:31:31.303945+00:00",
+  "source_base": "5efd09b27f9542850e38f5d531807eb387603409",
+  "scope": "concrete Runtime full-lane exchange; no Engine activation or end-to-end benchmark",
+  "trained_weight_cases": [
+    {
+      "temperature": 0,
+      "rows": 8,
+      "rotations": 2,
+      "output_tokens": 35,
+      "scratch_peak_bytes": 44793856,
+      "mean_park_us": 671.688,
+      "mean_restore_us": 726.208,
+      "micro_timings_only": 1
+    },
+    {
+      "temperature": 0,
+      "rows": 16,
+      "rotations": 2,
+      "output_tokens": 36,
+      "scratch_peak_bytes": 44793856,
+      "mean_park_us": 718.646,
+      "mean_restore_us": 476.938,
+      "micro_timings_only": 1
+    },
+    {
+      "temperature": 0.7,
+      "rows": 8,
+      "rotations": 2,
+      "output_tokens": 32,
+      "scratch_peak_bytes": 44793856,
+      "mean_park_us": 525.292,
+      "mean_restore_us": 349.417,
+      "micro_timings_only": 1
+    },
+    {
+      "temperature": 0.7,
+      "rows": 16,
+      "rotations": 2,
+      "output_tokens": 38,
+      "scratch_peak_bytes": 44793856,
+      "mean_park_us": 703.792,
+      "mean_restore_us": 383.521,
+      "micro_timings_only": 1
+    }
+  ],
+  "matched_candidate_output_tokens": 141,
+  "prompt_tokens": 7379,
+  "prompt_tokens_sha256": "6f64a6b35ec14550b18f6571731a142f04c6382abe45faa59eab9f85c406f93a",
+  "native_driver": {
+    "normal_passed": true,
+    "uniform_native_library_ASAN_UBSAN_passed": true,
+    "family_format_configurations": 4,
+    "switches_each": 34,
+    "caller_thread_operator_new_fault_guard_passed": true,
+    "critical_governor_pressure_returns_passed": true,
+    "busy_command_refusal": true,
+    "missing_hot_floor_refusal": true,
+    "cross_lane_refusal": true,
+    "ordinary_restore_uses_original_reserved_lane": true,
+    "cancel_parked_first_resident_first_and_before_borrow": true,
+    "penalty_state_bytes_and_sampled_tokens_preserved": true,
+    "prior_compact_grammar_thinking_spilled_read_cases_passed": true,
+    "container_checks_enabled": true,
+    "leak_detection": false
+  },
+  "cpu_engine_tests": {
+    "passed": 480,
+    "failed": 0
+  },
+  "local_app_suite": {
+    "passed": 250,
+    "known_issues": 1,
+    "isolated_CI_readiness_test_passed": true
+  },
+  "architecture": {
+    "passed": true,
+    "engine_lines": 30594,
+    "budget": 30594,
+    "budget_increased": false
+  },
+  "sha256": {
+    "normal_binary": "478de0f6a11f337a29c211424876aec450c3b8554d5155217ce2394194180df6",
+    "ASAN_UBSAN_binary": "c010218acb2c07668996dfc5c684ed93fbc80dde0627f49978934955123b48bd",
+    "normal_log": "0289df68d2fed0e90068fd2907f1ab2874d4e3f7470f5fc5c8b390654e20e7fb",
+    "ASAN_UBSAN_log": "5842d2e707d6df915f45148fa9a5e3fadcd5debfca81ae787da44c22954fd5df",
+    "oracle_binary": "6b43542b503ad6c6d96ad77d9e45ba928a9f8d133cbf314eb85b2fb7e489f853",
+    "oracle_source": "c5335e8f2dc4ccf030b4fda8ea22ed30c4a9a31784a7ebd88d1ef9a590fa46de",
+    "oracle_log": "7b2bc11edc7e2cd1a6cbbf365c63d2189bfeae04e45cd0e393c548423a03f951",
+    "runtime_source": "e287e85eac564b9226abc594835876e9ab8f4c8e215053d775854d923da7e716",
+    "state_storage_source": "29a578040d68c7943de563364dc2957b17ee7dccac7dd1d7776e8b8c9d49546b",
+    "driver_source": "c2783a9110350998a5ec019716ce02e263493940fe03b990d47fdc2ac8b7060c",
+    "metallib": "66c214f15852ae12377f5ae1fe6b975b7d857d7cd68418972d3e403d404c94db"
+  },
+  "production_acceptance": {
+    "native_ready": true,
+    "same_production_identity": true,
+    "same_model": true,
+    "RAM_GiB": 96,
+    "cache_GiB": 512,
+    "context_tokens": 262144,
+    "Samsung_persistent_files_open": true,
+    "Samsung_volume_UUID_verified": true,
+    "queue_DB_inode_and_history_preserved": true,
+    "worker_limit": 8,
+    "capacity": 128,
+    "admission_enabled": false,
+    "M4_enabled": false,
+    "fusion_unchanged": true,
+    "production_configuration_hashes_unchanged": true,
+    "health": {
+      "11500/health": 200,
+      "11500/ready": 200,
+      "11501/health": 200,
+      "11501/ready": 200,
+      "11502/health": 200,
+      "11502/ready": 200,
+      "11503/health": 200,
+      "11503/ready": 200,
+      "11504/health": 200,
+      "11504/ready": 200
+    },
+    "deployed": false
+  },
+  "limitations": [
+    "No Model-interface/Engine scheduling integration; no TTFT/TPS or sustained eight-user benefit proven",
+    "Fixed rows, one public coding context, no full answer/generated-test grading",
+    "Resident private test KV; no physical Samsung fault qualification",
+    "Micro timings are two returns per case; not latency percentiles",
+    "Latest upstream CI for base draft still has desktop-app readiness timeout; local 250-test suite passed; keep draft"
+  ]
+}

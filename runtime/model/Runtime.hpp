@@ -41,6 +41,12 @@ public:
   // Unsupported decode stages or memory refusal leave the request resident.
   [[nodiscard]] ModelMemoryAdmission parkDecodedRequest(uint64_t requestId);
   [[nodiscard]] StateAdmission restoreParkedRequest(uint64_t requestId);
+  // Reserve two maximum-sized scratch packets before detaching. Spill-capable
+  // callers first reserveSpilledReads(Decode); the physical lane keeps that
+  // floor. Subsequent exchanges need no allocation or free state lane;
+  // both owners must use that physical lane, including an ordinary return.
+  [[nodiscard]] ModelMemoryAdmission prepareDecodedExchange(uint64_t requestId);
+  [[nodiscard]] StateAdmission exchangeDecodedRequests(uint64_t parkedId, uint64_t residentId);
   [[nodiscard]] StateAdmission
   resume(const ModelRequest &request) override;
   [[nodiscard]] std::unique_ptr<StateRestore> beginRestore(
@@ -87,6 +93,7 @@ private:
   // The state lane of a resident request; the storage checks that its
   // committed state can be cached.
   [[nodiscard]] uint32_t residentLane(uint64_t requestId) const;
+  [[nodiscard]] ModelMemoryAdmission parkDecodedRequest(uint64_t requestId, bool exchange);
   void finishRestore(uint64_t requestId, uint32_t boundary, bool restoreDraft);
   void prepareWarmupDecode(uint64_t requestId, uint32_t anchor);
   // The step costs of `width` lanes on this machine (StepCosts::measure),

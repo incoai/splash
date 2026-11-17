@@ -5553,7 +5553,7 @@ std::vector<uint32_t> continuationPrompt(const std::filesystem::path &path, uint
 void requireRamContinuation(metal::MetalBackend &backend, const model::LoadedModel &model,
                             const ops::ExecutionPlans &operators, const metal::AllocationAdmission &admission,
                             const MemoryGovernor &governor, kv::Format format, ops::GdnStateFormat stateFormat,
-                            const std::vector<uint32_t> &prompt) {
+                            const std::vector<uint32_t> &prompt, bool exchange) {
   require(model.descriptor.capabilities.sparseKv.has_value(), "continuation-only currently requires block-sparse KV");
   const uint32_t lanePages = (static_cast<uint32_t>(prompt.size()) + 512) / kv::kPageTokens + 2;
   SpillOptions options;
@@ -5563,7 +5563,8 @@ void requireRamContinuation(metal::MetalBackend &backend, const model::LoadedMod
           "continuation fixture exceeds remaining governor headroom");
   uint64_t nextId = 9000;
   for (const float temperature : {0.0F, 0.7F}) for (const uint32_t rows : {8u, 16u}) {
-    const SamplingParameters sampling{.temperature = temperature, .seed = 47};
+    const SamplingParameters sampling{.temperature = temperature, .presencePenalty = 0.2F,
+                                      .frequencyPenalty = 0.1F, .seed = 47};
     SpillRequest baseline{.id = ++nextId, .stateLane = 0, .prompt = prompt};
     SpillRequest candidate{.id = ++nextId, .stateLane = 1, .prompt = prompt};
     fixture.begin(baseline, sampling);
@@ -5591,6 +5592,27 @@ void requireRamContinuation(metal::MetalBackend &backend, const model::LoadedMod
       outputTokens += a.outputTokens.size();
     };
     for (uint32_t step = 0; step < 3; ++step) compare();
+    const std::vector<uint32_t> shortPrompt(prompt.begin(), prompt.begin() + std::min<size_t>(128, prompt.size()));
+    SpillRequest peerControl{.id = ++nextId, .stateLane = 2, .prompt = shortPrompt};
+    SpillRequest filler{.id = ++nextId, .stateLane = 3, .prompt = shortPrompt};
+    SpillRequest borrower{.id = ++nextId, .stateLane = 1, .prompt = shortPrompt};
+    if (exchange) {
+      fixture.begin(peerControl, sampling); prefill(peerControl);
+      fixture.begin(filler, sampling); prefill(filler);
+      require(runtime.reserveSpilledReads(candidate.id, {.kind = WorkKind::Decode}).granted(),
+              "exchange floor refused");
+    }
+    const auto overwrite = [&](SpillRequest &intruder) {
+      const auto actual = fixture.decode(std::array{&intruder}).front();
+      const auto counts = fixture.lastResults().front();
+      if (exchange) {
+        const auto expected = fixture.decode(std::array{&peerControl}).front();
+        const auto control = fixture.lastResults().front();
+        require(actual == expected && counts.draftedTokens == control.draftedTokens &&
+                    counts.acceptedDraftTokens == control.acceptedDraftTokens,
+                "exchange changed borrower's trained-weight continuation");
+      }
+    };
     std::set<uint32_t> parities;
     double parkMicroseconds = 0, restoreMicroseconds = 0;
     uint64_t scratchPeak = 0;
@@ -5604,25 +5626,36 @@ void requireRamContinuation(metal::MetalBackend &backend, const model::LoadedMod
       const auto anchor = model::RuntimeInstrumentation::pendingToken(runtime, candidate.id);
       const auto before = runtime.actualRuntimeMemory().stateActualAllocatedBytes;
       auto start = AwakeClock::now();
-      require(runtime.parkDecodedRequest(candidate.id).granted(), "real-weight continuation park refused");
+      if (exchange && rotation)
+        require(runtime.exchangeDecodedRequests(borrower.id, candidate.id).granted(), "trained reverse exchange refused");
+      else
+        require((exchange ? runtime.prepareDecodedExchange(candidate.id) : runtime.parkDecodedRequest(candidate.id)).granted(),
+                "real-weight continuation park refused");
       parkMicroseconds += std::chrono::duration<double, std::micro>(AwakeClock::now() - start).count();
       scratchPeak = std::max(scratchPeak, runtime.actualRuntimeMemory().stateActualAllocatedBytes - before);
-      SpillRequest intruder{.id = ++nextId, .stateLane = oldLane,
-                            .prompt = std::vector(prompt.begin(), prompt.begin() + std::min<size_t>(128, prompt.size()))};
-      fixture.begin(intruder, sampling); prefill(intruder);
+      SpillRequest temporary{.id = ++nextId, .stateLane = oldLane, .prompt = shortPrompt};
+      auto &intruder = exchange ? borrower : temporary;
+      if (!exchange || !rotation) { fixture.begin(intruder, sampling); prefill(intruder); }
       // Prefill flips parity per command, so the intruder's shorter prompt
       // need not finish in the victim's prefill parity. Always overwrite at
       // least one tape, then another only to reach the saved parity.
-      static_cast<void>(fixture.decode(std::array{&intruder}));
-      if (fixture.states().metadata(oldLane).activeParity != metadata.activeParity)
-        static_cast<void>(fixture.decode(std::array{&intruder}));
+      overwrite(intruder);
+      if (fixture.states().metadata(oldLane).activeParity != metadata.activeParity) overwrite(intruder);
       require(fixture.states().metadata(oldLane).activeParity == metadata.activeParity,
               "continuation intruder did not overwrite the vacated tape parity");
       start = AwakeClock::now();
-      const auto restored = runtime.restoreParkedRequest(candidate.id);
+      if (exchange) for (uint32_t lane = 0; lane < 4; ++lane)
+        require(fixture.states().metadata(lane).assigned(), "trained exchange did not occupy every physical lane");
+      const auto beforeReturn = backend.memoryStats().allocatedBytes;
+      const auto denied = governor.snapshot().deniedReservations;
+      const auto restored = exchange ? runtime.exchangeDecodedRequests(candidate.id, intruder.id)
+                                     : runtime.restoreParkedRequest(candidate.id);
       restoreMicroseconds += std::chrono::duration<double, std::micro>(AwakeClock::now() - start).count();
-      require(restored.granted() && *restored.lane != oldLane,
-              "real-weight continuation did not rebind into a different lane");
+      require(restored.granted() && (exchange ? *restored.lane == oldLane : *restored.lane != oldLane),
+              "real-weight continuation returned into the wrong physical lane");
+      if (exchange) require(backend.memoryStats().allocatedBytes == beforeReturn &&
+                                governor.snapshot().deniedReservations == denied,
+                            "trained exchange allocated on return");
       candidate.stateLane = *restored.lane;
       requireSameCommittedState(saved, committedState(runtime, fixture.states(), candidate.stateLane),
                                 "real-weight RAM park/restore");
@@ -5630,12 +5663,13 @@ void requireRamContinuation(metal::MetalBackend &backend, const model::LoadedMod
                   savedWindow == bytesOf(fixture.states().window(candidate.stateLane)) &&
                   anchor == model::RuntimeInstrumentation::pendingToken(runtime, candidate.id),
               "RAM restore changed the other parity, window or pending anchor");
-      fixture.end(intruder);
+      if (!exchange) fixture.end(intruder);
       for (uint32_t step = 0; step < (rotation ? 4u : 3u); ++step) compare();
     }
     require(parities.size() == 2, "real-weight continuation did not exercise both tape parities");
     fixture.end(baseline); fixture.end(candidate);
-    std::cout << "ram_continuation_real=PASS temperature=" << temperature << " rows=" << rows
+    if (exchange) { fixture.end(borrower); fixture.end(peerControl); fixture.end(filler); }
+    std::cout << (exchange ? "ram_exchange_real=PASS temperature=" : "ram_continuation_real=PASS temperature=") << temperature << " rows=" << rows
               << " rotations=2 output_tokens=" << outputTokens << " scratch_peak_bytes=" << scratchPeak
               << " mean_park_us=" << parkMicroseconds / 2 << " mean_restore_us=" << restoreMicroseconds / 2
               << " micro_timings_only=1\n" << std::flush;
@@ -6074,7 +6108,7 @@ void warmupEos(model::RuntimeContext context, model::LoadedModel &model) {
 int main(int argc, char **argv) {
   try {
     bool imagesOnly = false, warmupEosOnly = false, prefillGroupsOnly = false, spillOnly = false;
-    bool continuationOnly = false;
+    bool continuationOnly = false, continuationExchange = false;
     std::filesystem::path continuationFile;
     uint64_t maximumMemoryBytes = 0;
     SpillOptions spill;
@@ -6107,10 +6141,11 @@ int main(int argc, char **argv) {
            "[--cached-states int8|exact] [--max-memory SIZE] "
            "[--ane-ffn-share SHARE] [--ane-ffn-fault EVALUATION] [--ple-memory SIZE] "
            "[--expert-memory SIZE] [--max-context TOKENS] [--spill-tokens N] [--spill-window PAGES] "
-           "[--spill-buffers 1|2] [--continuation-prompt TOKEN_FILE] [--continuation-only | --images-only | --warmup-eos-only | --prefill-groups-only | --spill-only]");
+           "[--spill-buffers 1|2] [--continuation-exchange] [--continuation-prompt TOKEN_FILE] [--continuation-only | --images-only | --warmup-eos-only | --prefill-groups-only | --spill-only]");
     for (int i = 3; i < argc; ++i) {
       const std::string_view option(argv[i]);
       if (option == "--continuation-only") continuationOnly = true;
+      else if (option == "--continuation-exchange") continuationExchange = true;
       else if (option == "--continuation-prompt" && i + 1 < argc) continuationFile = argv[++i];
       else if (option == "--max-memory" && i + 1 < argc) {
         maximumMemoryBytes = tools::parseBytes(argv[++i]);
@@ -6166,6 +6201,7 @@ int main(int argc, char **argv) {
         maxContext = static_cast<uint32_t>(parsed);
       } else fail("unknown model-runtime-oracle option");
     }
+    if (continuationExchange && !continuationOnly) fail("continuation-exchange requires continuation-only");
     if (continuationOnly && (imagesOnly || warmupEosOnly || prefillGroupsOnly || spillOnly))
       fail("continuation-only cannot be combined with another oracle scope");
     if (!continuationFile.empty() && !continuationOnly)
@@ -6254,7 +6290,7 @@ int main(int argc, char **argv) {
     const MemoryGovernor::Scope oracleScope(governor, oracleClaim);
     const metal::AllocationAdmission governed = governedFor(governor, "an allocation");
     if (continuationOnly) {
-      requireRamContinuation(backend, model, operators, governed, governor, format, stateFormat, ramPrompt);
+      requireRamContinuation(backend, model, operators, governed, governor, format, stateFormat, ramPrompt, continuationExchange);
       std::cout << "PASS model-runtime-oracle scope=continuation-only model=" << model.name()
                 << " governor_limit_bytes=" << governor.snapshot().limitBytes << "\n";
       return 0;

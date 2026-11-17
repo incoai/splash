@@ -112,6 +112,8 @@ public:
     std::span<const SplashKvPage> index;
   };
   [[nodiscard]] static LaneTables laneTables(const Runtime &runtime, uint64_t requestId);
+  // The resident request's lane-indexed sampling counts, as raw bytes.
+  [[nodiscard]] static std::vector<uint8_t> penaltyState(const Runtime &runtime, uint64_t requestId);
   // Fill a resident lane's active tape with deterministic byte canaries.
   // Only a drained roundtrip test may use it, ending the request before any
   // further numerical decode: the canaries are not valid recurrent inputs.

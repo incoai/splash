@@ -301,6 +301,10 @@ public:
   // the handle; wrong owner/storage or an occupied destination consumes nothing.
   void restoreParkedLane(uint32_t lane, uint64_t requestId,
                          std::unique_ptr<ParkedLane> &parked);
+  // Swaps an assigned lane with a parked owner's buffers, without allocation.
+  // The caller has already exchanged lane-indexed scratch. Neither handle is
+  // consumed; the parked handle now owns the outgoing resident's state.
+  void exchangeParkedLane(uint32_t lane, uint64_t residentId, uint64_t parkedId, ParkedLane &parked);
   // A lane that starts at length zero without a restore reads zero recurrent
   // state; its first transition overwrites the other parity.
   void clearForColdStart(uint32_t lane);

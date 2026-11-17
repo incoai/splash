@@ -351,6 +351,7 @@ struct Runtime::Impl {
     uint32_t stateLane = 0;
     bool resident = false;
     std::unique_ptr<QwenStateStorage::ParkedLane> parked;
+    uint64_t parkedPacketCapacity = 0, parkedPacketOffset = 0;
     bool promptComplete = false;
     // Rebuild state from already-emitted tokens without sampling an initial
     // anchor, consuming RNG, or replaying output to the caller.
@@ -518,6 +519,7 @@ struct Runtime::Impl {
   // of its request's state lane, which need not be its own.
   MetalBuffer penaltyTable;
   std::unordered_map<uint64_t, Request> requests;
+  uint32_t exchangeBanks = 0;
   // Allocated for images that need an encode, sized for the largest one the
   // start that built it staged, and reclaimable once no image waits for one
   // and no refused start holds it. Injecting already encoded rows needs no
@@ -975,8 +977,8 @@ struct Runtime::Impl {
                       uint8_t *packed, bool restoring) const {
     if (!metadata.pendingPath || !geometry.target.stateLayout.layers) return;
     const ops::GdnShape shape = geometry.target.gdnShape();
-    auto *slot = contents<uint8_t>(decodeArena->batchSlice(DecodeTensor::GdnTape, kLaneCount), "GDN tape") +
-        decodeArena->gdnTapeSlot(lane, metadata.activeParity);
+    auto *slot = contents<uint8_t>(decodeArena->get(lane, DecodeTensor::GdnTape), "GDN tape") +
+        metadata.activeParity * gdnTapeSlotBytes(geometry);
     for (uint32_t layer = 0; layer < geometry.target.stateLayout.layers; ++layer) {
       auto *tape = slot + layer * ops::gdnTapeLayerBytes(shape);
       for (const auto &[offset, rowBytes] : pendingGdnFields()) {
@@ -990,6 +992,29 @@ struct Runtime::Impl {
     }
   }
 
+  bool canPark(const Request &entry) const {
+    return !backend.commandInFlight() && entry.promptComplete && !entry.verifyMaskRows && !entry.resultInvalid &&
+           entry.decodeStage == DecodeStage::Regular && entry.pendingToken &&
+           uint64_t{entry.generatedTokens} + 1 < entry.maxNewTokens &&
+           !isStopToken(geometry, *entry.pendingToken);
+  }
+  bool exchangeHoldsFloor(uint32_t lane) const {
+    if (!exchangeBanks) return false;
+    return std::ranges::any_of(requests, [&](const auto &item) {
+      const auto &entry = item.second;
+      return entry.parked && entry.parkedPacketCapacity && entry.stateLane == lane;
+    });
+  }
+  void copyDecodeScratch(uint32_t lane, const QwenLaneMetadata &metadata, uint8_t *packet, bool restoring) const {
+    const uint64_t tapeBytes = pendingGdnBytes(metadata);
+    copyPendingGdn(lane, metadata, packet, restoring);
+    const MetalBuffer penalties = decodeArena->get(lane, DecodeTensor::PenaltyState);
+    if (penalties.sizeBytes()) {
+      if (restoring) std::memcpy(penalties.contents(), packet + tapeBytes, penalties.sizeBytes());
+      else std::memcpy(packet + tapeBytes, penalties.contents(), penalties.sizeBytes());
+    }
+  }
+
   // A resident request returns its lane's buffers to the pool, and its
   // floor of the hot block cache.
   void releaseLane(Request &entry) {
@@ -997,7 +1022,7 @@ struct Runtime::Impl {
       states.clearDraftRings(entry.stateLane);
     states.releaseLane(entry.stateLane, entry.id);
     pageTableBindings[entry.stateLane] = {};
-    if (blockCache)
+    if (blockCache && !exchangeHoldsFloor(entry.stateLane))
       blockCache->releaseLane(entry.stateLane);
   }
 
@@ -3452,34 +3477,47 @@ void Runtime::suspend(uint64_t requestId) {
 }
 
 ModelMemoryAdmission Runtime::parkDecodedRequest(uint64_t requestId) {
+  return parkDecodedRequest(requestId, false);
+}
+
+ModelMemoryAdmission Runtime::prepareDecodedExchange(uint64_t requestId) {
+  return parkDecodedRequest(requestId, true);
+}
+
+ModelMemoryAdmission Runtime::parkDecodedRequest(uint64_t requestId, bool exchange) {
   Impl::Request &entry = impl_->request(requestId);
   if (!entry.resident || entry.parked)
     throw std::logic_error("Qwen request is not resident for parking");
-  if (impl_->backend.commandInFlight() || !entry.promptComplete || entry.verifyMaskRows || entry.resultInvalid ||
-      entry.decodeStage != DecodeStage::Regular || !entry.pendingToken)
-    return {};
-  if (uint64_t{entry.generatedTokens} + 1 >= entry.maxNewTokens ||
-      isStopToken(impl_->geometry, *entry.pendingToken))
-    return {};
+  if (!impl_->canPark(entry)) return {};
   const uint32_t lane = entry.stateLane;
+  if (impl_->exchangeHoldsFloor(lane)) return {};
   const auto metadata = impl_->states.metadata(lane);
   const uint64_t tapeBytes = impl_->pendingGdnBytes(metadata);
   const MetalBuffer penalties = impl_->decodeArena->get(lane, DecodeTensor::PenaltyState);
-  const uint64_t scratchBytes = checkedAdd(tapeBytes, penalties.sizeBytes(), "parked decode scratch");
+  uint64_t packetCapacity = 0;
+  uint64_t scratchBytes = checkedAdd(tapeBytes, penalties.sizeBytes(), "parked decode scratch");
+  if (exchange) {
+    if (impl_->blockCache && !impl_->blockCache->holdsLane(lane)) return {};
+    auto maximum = metadata;
+    maximum.pendingPath = ~uint32_t{0} >> (32 - model::ExecutionLimits::targetVerifyRows);
+    packetCapacity = alignUp(checkedAdd(impl_->pendingGdnBytes(maximum), penalties.sizeBytes(), "exchange packet"));
+    scratchBytes = checkedMultiply(packetCapacity, 2, "exchange scratch bank");
+  }
   metal::AllocationFailure refusal;
   auto held = impl_->states.parkLane(lane, requestId, scratchBytes,
       [&](const MetalBuffer &scratch) {
         auto *destination = static_cast<uint8_t *>(scratch.contents());
-        impl_->copyPendingGdn(lane, metadata, destination, false);
-        if (penalties.sizeBytes())
-          std::memcpy(destination + tapeBytes, penalties.contents(), penalties.sizeBytes());
+        impl_->copyDecodeScratch(lane, metadata, destination, false);
       }, refusal);
   if (!held)
     return {.allocationFailure = refusal};
   entry.parked = std::move(held);
+  entry.parkedPacketCapacity = packetCapacity;
+  entry.parkedPacketOffset = 0;
+  if (packetCapacity) ++impl_->exchangeBanks;
   entry.resident = false;
   impl_->pageTableBindings[lane] = {};
-  if (impl_->blockCache)
+  if (impl_->blockCache && !exchange)
     impl_->blockCache->releaseLane(lane);
   return {.ok = true};
 }
@@ -3490,25 +3528,68 @@ StateAdmission Runtime::restoreParkedRequest(uint64_t requestId) {
     throw std::logic_error("Qwen request is not parked");
   if (impl_->backend.commandInFlight())
     return {{}, StateFailure::ConcurrencyLimit};
-  return admitIdleLane(impl_->states, [&](uint32_t lane) -> StateAdmission {
+  const auto restore = [&](uint32_t lane) -> StateAdmission {
     if (impl_->blockCache) {
       const ModelMemoryAdmission hot = impl_->blockCache->reserveLane(lane);
       if (!hot.granted())
         return {{}, StateFailure::MemoryPressure, hot.allocationFailure};
     }
     const auto metadata = entry.parked->metadata();
-    const uint64_t tapeBytes = impl_->pendingGdnBytes(metadata);
     auto *source = static_cast<uint8_t *>(entry.parked->scratch().contents());
-    impl_->copyPendingGdn(lane, metadata, source, true);
-    const MetalBuffer penalties = impl_->decodeArena->get(lane, DecodeTensor::PenaltyState);
-    if (penalties.sizeBytes())
-      std::memcpy(penalties.contents(), source + tapeBytes, penalties.sizeBytes());
+    impl_->copyDecodeScratch(lane, metadata, source + entry.parkedPacketOffset, true);
     impl_->states.restoreParkedLane(lane, requestId, entry.parked);
     entry.stateLane = lane;
     entry.resident = true;
+    if (entry.parkedPacketCapacity) --impl_->exchangeBanks;
+    entry.parkedPacketCapacity = entry.parkedPacketOffset = 0;
     impl_->pageTableBindings[lane] = {};
     return {lane, StateFailure::None};
-  });
+  };
+  // An exchange bank retains its original physical floor. Restoring into a
+  // different free lane would orphan that reservation or borrow another bank's.
+  if (entry.parkedPacketCapacity) {
+    if (impl_->states.metadata(entry.stateLane).assigned())
+      return {{}, StateFailure::ConcurrencyLimit};
+    return restore(entry.stateLane);
+  }
+  return admitIdleLane(impl_->states, restore);
+}
+
+StateAdmission Runtime::exchangeDecodedRequests(uint64_t parkedId, uint64_t residentId) {
+  auto &incoming = impl_->request(parkedId);
+  auto &outgoing = impl_->request(residentId);
+  if (incoming.resident || !incoming.parked || !incoming.parkedPacketCapacity ||
+      !outgoing.resident || outgoing.parked)
+    throw std::logic_error("decoded exchange needs a prepared parked owner and a resident");
+  if (!impl_->canPark(outgoing)) return {{}, StateFailure::ConcurrencyLimit};
+  const uint32_t lane = outgoing.stateLane;
+  if (lane != incoming.stateLane) return {{}, StateFailure::ConcurrencyLimit};
+  if (impl_->blockCache && !impl_->blockCache->holdsLane(lane))
+    return {{}, StateFailure::MemoryPressure};
+  const auto inMetadata = incoming.parked->metadata();
+  const auto outMetadata = impl_->states.metadata(lane);
+  const uint64_t capacity = incoming.parkedPacketCapacity;
+  const uint64_t nextOffset = incoming.parkedPacketOffset ? 0 : capacity;
+  auto *bank = static_cast<uint8_t *>(incoming.parked->scratch().contents());
+  // Save the entire outgoing packet before either tape or penalty words are
+  // overwritten. Both maximum packets were admitted before the first park.
+  impl_->copyDecodeScratch(lane, outMetadata, bank + nextOffset, false);
+  impl_->copyDecodeScratch(lane, inMetadata, bank + incoming.parkedPacketOffset, true);
+  try {
+    impl_->states.exchangeParkedLane(lane, residentId, parkedId, *incoming.parked);
+  } catch (...) {
+    impl_->copyDecodeScratch(lane, outMetadata, bank + nextOffset, true);
+    throw;
+  }
+  outgoing.parked = std::move(incoming.parked);
+  outgoing.parkedPacketCapacity = capacity;
+  outgoing.parkedPacketOffset = nextOffset;
+  outgoing.resident = false;
+  incoming.resident = true;
+  incoming.stateLane = lane;
+  incoming.parkedPacketCapacity = incoming.parkedPacketOffset = 0;
+  impl_->pageTableBindings[lane] = {};
+  return {lane, StateFailure::None};
 }
 
 StateAdmission Runtime::resume(const ModelRequest &request) {
@@ -4258,8 +4339,12 @@ void Runtime::end(uint64_t requestId) {
   if (found == impl_->requests.end())
     return;
   impl_->releaseImages(found->second);
+  if (found->second.parkedPacketCapacity && impl_->blockCache &&
+      !impl_->states.metadata(found->second.stateLane).assigned())
+    impl_->blockCache->releaseLane(found->second.stateLane);
   if (found->second.resident)
     impl_->releaseLane(found->second);
+  if (found->second.parkedPacketCapacity) --impl_->exchangeBanks;
   impl_->requests.erase(found);
   impl_->releaseLeftStaging();
 }
@@ -4800,6 +4885,16 @@ RuntimeInstrumentation::LaneTables RuntimeInstrumentation::laneTables(const Runt
                  : std::span<const SplashKvPage>();
   };
   return {entries(tables.pages), entries(tables.index)};
+}
+
+std::vector<uint8_t> RuntimeInstrumentation::penaltyState(const Runtime &runtime, uint64_t requestId) {
+  const auto &impl = *runtime.impl_;
+  const auto &entry = impl.requests.at(requestId);
+  if (!entry.resident) throw std::logic_error("request is not resident");
+  const auto buffer = impl.decodeArena->get(entry.stateLane, DecodeTensor::PenaltyState);
+  const auto *begin = static_cast<const uint8_t *>(buffer.contents());
+  if (!buffer.sizeBytes()) return {};
+  return {begin, begin + buffer.sizeBytes()};
 }
 
 void RuntimeInstrumentation::fillPendingTape(Runtime &runtime, uint64_t requestId, uint32_t seed) {
