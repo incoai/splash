@@ -285,3 +285,35 @@ remain open on the verified external volume. Flash-Next, 96 GiB RAM/512 GiB cach
 eight workers and the disabled flags are unchanged. No deployment, queue pause,
 production restart or real-model benchmark occurred. Hashes and sanitized
 acceptance are in `ram-continuation-upstream170-20261117.json`.
+
+## Real-weight continuation qualification
+
+A new development-only oracle scope passes on the installed Q2_0 Flash-Next
+weights with a 7379-token context containing actual continuation source and a
+coding-review request. Greedy/sampled decoding at fixed 8/16-row budgets passes
+all four cases, eight park/rebind rotations across both tape parities, with 141
+matched output tokens per control and exact retained state, logits and
+speculative counts. Another request overwrites the old lane and its matching
+tape parity before each restore. The first attempt stopped at a fixture parity
+assumption; observation-driven intruder parity fixed the fixture, with no
+serving-runtime fix. Both attempts automatically restored production and queue.
+
+The oracle now accepts `--continuation-only --continuation-prompt TOKEN_FILE`
+and a `--max-memory` bound. Invalid scope/size arguments and invalid token files
+are rejected before weight loading. The real run used BF16 state, int8 KV,
+exact cached-state layout, a 4 GiB PLE cache, 96 GiB governor and 256K served
+context. Test KV lives in a separate resident pool; it does not write the
+persistent Samsung cache. No Engine activation or serving flag was added.
+
+Mean park times for the four two-rotation cases were 0.438/0.463/0.409/0.583 ms;
+mean restores were 6.118/0.184/0.147/0.207 ms. These are operation micro timings,
+not TTFT or latency percentiles. Scratch peaks ranged from 3.5 to 13.7 MiB.
+There is no queue, throughput or full coding-answer benefit claim from this
+correctness run. Adaptive scheduling and complete coding/test scoring remain.
+
+The current serving build and all configuration hashes were restored, with all
+ten health/readiness checks green and the queue DB inode/history preserved.
+Samsung took back 3215 states and 263590 KV blocks (290.6 GiB), with none left
+behind; files remain open and transport restarts are zero. Flash-Next, 96 GiB
+RAM/512 GiB cache, eight workers and admission/fusion/M4 settings are unchanged.
+See `ram-continuation-real-20261117.json` for exact case values and hashes.

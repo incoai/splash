@@ -1,0 +1,147 @@
+{
+  "created_at_utc": "2026-11-17T13:49:20.526913+00:00",
+  "base_commit": "26820f93114e4f9aad0f917e48d5cfbff9e77c4b",
+  "scope": "trained Flash-Next exact RAM continuation, not scheduler TTFT or coding-answer quality",
+  "model": "ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF:Q2_0",
+  "state_format": "bf16",
+  "KV_format": "int8",
+  "PLE_memory_GiB": 4,
+  "governor_limit_GiB": 96,
+  "served_context_tokens": 262144,
+  "cases": [
+    {
+      "temperature": 0,
+      "rows": 8,
+      "rotations": 2,
+      "output_tokens": 35,
+      "scratch_peak_bytes": 6356992,
+      "mean_park_us": 437.855,
+      "mean_restore_us": 6117.92,
+      "micro_timings_only": 1
+    },
+    {
+      "temperature": 0,
+      "rows": 16,
+      "rotations": 2,
+      "output_tokens": 36,
+      "scratch_peak_bytes": 6356992,
+      "mean_park_us": 463.271,
+      "mean_restore_us": 184.291,
+      "micro_timings_only": 1
+    },
+    {
+      "temperature": 0.7,
+      "rows": 8,
+      "rotations": 2,
+      "output_tokens": 32,
+      "scratch_peak_bytes": 3670016,
+      "mean_park_us": 408.708,
+      "mean_restore_us": 147.145,
+      "micro_timings_only": 1
+    },
+    {
+      "temperature": 0.7,
+      "rows": 16,
+      "rotations": 2,
+      "output_tokens": 38,
+      "scratch_peak_bytes": 14368768,
+      "mean_park_us": 582.917,
+      "mean_restore_us": 207.438,
+      "micro_timings_only": 1
+    }
+  ],
+  "passed": 4,
+  "rotations": 8,
+  "matched_output_tokens_per_control": 141,
+  "prompt": {
+    "prompt_tokens": 7379,
+    "tokens_sha256": "6f64a6b35ec14550b18f6571731a142f04c6382abe45faa59eab9f85c406f93a",
+    "vocabulary": 248320,
+    "first_token_is_chat_start": true,
+    "last_token_is_newline": true
+  },
+  "parity_checks": [
+    "both pending-tape parities",
+    "exact committed/current state and pending tape",
+    "other GDN parity cell",
+    "draft window and rings",
+    "pending anchor",
+    "output tokens",
+    "target-logit digests",
+    "drafted/accepted counts"
+  ],
+  "negative_cli_scope_checks": 4,
+  "negative_token_file_checks_without_weight_loading": 4,
+  "recovery_guard_tests": 3,
+  "first_attempt": {
+    "passed": false,
+    "cause": "fixture assumed intruder prefill left a fixed tape parity; corrected to observe parity after prefill",
+    "production_and_queue_restored": true,
+    "serving_runtime_fix_required": false
+  },
+  "sha256": {
+    "oracle_source": "5334fa207e091f6ff134c1690dfce6c2903489ff4785ef741f15044bacdc8af0",
+    "oracle_binary": "59a6d42657264682fa9493504f56e7de8d1a27a99657084fedda54036f5d2441",
+    "shader_library": "66c214f15852ae12377f5ae1fe6b975b7d857d7cd68418972d3e403d404c94db",
+    "log": "62a9ca78269beb348f60197e7f468a23655c26b82008ce609eb29c4e48ea9482"
+  },
+  "CI_before_oracle_extension": {
+    "head": "26820f93114e4f9aad0f917e48d5cfbff9e77c4b",
+    "all_automatic_checks_passed": true,
+    "manual_release_gate_not_run": true
+  },
+  "limitations": [
+    "One 7379-token real coding-context fixture; no full coding-answer/generated-test scoring",
+    "Fixed 8/16-row choices, not adaptive production step-policy qualification",
+    "Two rotations per case; operation means are micro timings, not latency percentiles",
+    "No Engine scheduler invokes parking, so no TTFT/TPS/concurrency benefit is claimed",
+    "Test KV stayed resident; no physical SSD fault injection",
+    "Production was briefly paused in guarded idle windows and restored to identical configuration; no new build deployed"
+  ],
+  "production_restoration": {
+    "native_ready": true,
+    "same_production_identity": true,
+    "same_model": true,
+    "RAM_GiB": 96,
+    "cache_GiB": 512,
+    "context_tokens": 262144,
+    "Samsung_persistent_files_open": true,
+    "Samsung_volume_UUID_verified": true,
+    "queue_DB_inode_and_history_preserved": true,
+    "worker_limit": 8,
+    "capacity": 128,
+    "admission_enabled": false,
+    "M4_enabled": false,
+    "fusion_unchanged": true,
+    "production_configuration_hashes_unchanged": true,
+    "health": {
+      "11500/health": 200,
+      "11500/ready": 200,
+      "11501/health": 200,
+      "11501/ready": 200,
+      "11502/health": 200,
+      "11502/ready": 200,
+      "11503/health": 200,
+      "11503/ready": 200,
+      "11504/health": 200,
+      "11504/ready": 200
+    },
+    "deployed": false
+  },
+  "cache_readback": {
+    "ready": true,
+    "persistent": true,
+    "taken_back": {
+      "states": 3215,
+      "kv_blocks": 263590,
+      "bytes": 312027054080,
+      "left_behind": 0
+    },
+    "cache_used_GiB": 290.7790222167969,
+    "transport_restarts": 0,
+    "queue_running": 4,
+    "queue_queued": 0
+  },
+  "deployed": false,
+  "model_performance_benchmark": false
+}

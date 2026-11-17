@@ -469,3 +469,37 @@ leaves `dev/tests` and `dev/benchmarks` out (`.gitattributes`), and a copy
 that keeps the files' old times leaves make running stale binaries. For a
 gate, delete the test binary before building it and record the commit, an
 empty `git status --porcelain`, the binary's SHA-256 and its test count.
+
+### Exact RAM-continuation qualification
+
+The development runtime oracle can check the dormant RAM continuation against
+an uninterrupted real-weight control without enabling an Engine policy:
+
+```sh
+build/engine-tests/model-runtime-oracle METALLIB MODEL_ROOT \
+  --continuation-only --continuation-prompt PROMPT_TOKEN_FILE \
+  --max-memory 96G --max-context 262144 --state-format bf16 \
+  --kv-format int8 --cached-states exact --ple-memory 4G
+```
+
+`PROMPT_TOKEN_FILE` contains whitespace-separated unsigned vocabulary token IDs
+prepared by that installation's tokenizer, including its rendered chat prompt.
+The oracle validates every ID and leaves a 512-token runway before loading
+weights. `--max-memory` bounds the oracle's memory plan; without it the existing
+automatic plan applies. A continuation scope cannot be combined with another
+`*-only` scope, and requires a prompt file. It currently requires block-sparse
+KV and uses its own resident KV pool, without persistent-cache writes.
+
+The check runs greedy and sampled controls with fixed 8- and 16-row budgets,
+parks twice across both tape parities, lets another request overwrite each old
+lane, restores elsewhere and compares exact retained state, tokens, logits and
+speculative counts. Its park/restore micro timings exclude model loading and
+state-observation copies. Two rotations are correctness observations, not an
+end-to-end TTFT, throughput, coding-quality or scheduler-fairness benchmark.
+Adaptive step choices and a serving-policy comparison remain separate gates.
+
+Use a guarded idle-window test with guaranteed restoration when the installed
+model cannot safely fit beside production. Keep the configured model, RAM/cache
+limits and disabled flags on restoration, and verify the persistent cache and
+request queue afterward. The development oracle does not stop or restart any
+service itself.
