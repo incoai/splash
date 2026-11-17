@@ -163,6 +163,21 @@ loadModel(metal::MetalBackend &backend,
                  const std::filesystem::path &root,
                  const ModelDescriptor &descriptor,
                  const ModelLoadOptions &options = {});
+// The geometry of the target in `root` (qwenTargetGeometry) as its files'
+// headers give it, before any weight loads: the target's loader reads its
+// images reserved, of no memory and unwritten (WeightImages loaded while
+// released), so every projection has its formats and sizes as a load gives
+// them. Its routed experts read with their layers' images, which make no
+// store and stay far below the largest buffer, which a reservation is held
+// to too (Flash-Next Q2_0's largest, 743 MiB, of an M5 Max's 21 GiB); with
+// `streamedTableBytes`, its table streams through a row cache of that many
+// bytes on `readers`, as its whole image may exceed that buffer (Flash-Next's
+// 27,466 MiB).
+[[nodiscard]] QwenTargetGeometry plannedTargetGeometry(metal::MetalBackend &backend,
+                                                       const std::filesystem::path &root,
+                                                       const ModelDescriptor &descriptor,
+                                                       uint64_t streamedTableBytes,
+                                                       std::shared_ptr<SsdReaders> readers);
 
 // The FFN layers of a target whose every layer's FFN is dense (denseFfn),
 // which the prefill FFN's Neural Engine split (ops::AneFfn) may take; none
@@ -189,12 +204,18 @@ struct StreamedParts final {
   [[nodiscard]] static StreamedParts loaded(const LoadedModel &model, bool kv = false) noexcept;
 };
 // The lane state and arenas of `model`'s geometry with `parts` streaming,
-// whatever streams of it as it loaded: one load plans them for every part
-// that may stream (engine::planStreamedMemory).
+// whatever streams of it as it loaded.
 [[nodiscard]] ModelMemoryPlan
 plannedRuntimeMemory(const LoadedModel &model,
                      const ops::ExecutionPlans &operators,
                      kv::Format kvFormat, ops::GdnStateFormat stateFormat, StreamedParts parts);
+// Those of a model of `descriptor` whose target's files give `target`
+// (plannedTargetGeometry) with `parts` streaming, before it loads: they plan
+// the stores of every part that may stream (engine::planStreamedMemory).
+[[nodiscard]] ModelMemoryPlan plannedRuntimeMemory(const ModelDescriptor &descriptor,
+                                                   const QwenTargetGeometry &target,
+                                                   const ops::ExecutionPlans &operators, kv::Format kvFormat,
+                                                   ops::GdnStateFormat stateFormat, StreamedParts parts);
 [[nodiscard]] std::unique_ptr<RuntimeModel>
 createRuntime(RuntimeContext context);
 

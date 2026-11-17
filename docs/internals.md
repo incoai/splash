@@ -244,6 +244,22 @@ instead of mixing two versions. A start logs `Weights loaded in N s.`; loading
 reads the sources at about the speed of the disk that holds them
 ([upstream loading](../dev/benchmarks/upstream-loading.md#loading-time)).
 
+A start plans its memory before the weights load, and its arenas rest on
+the target's formats ([memory and context](server.md#memory-and-context)), so it
+first reads the target from its images unwritten: `WeightImages` loaded while
+released reserves each image, a buffer of no memory whose views are handles
+of their sizes, and the image's file reads the bytes its readers parse, its
+header and descriptors, from the image's plan (`gguf::Image::fills`). The
+target's loader and readers run as for a load and give every projection its
+formats and sizes (`model::plannedTargetGeometry`): the routed experts read
+with their layers' reserved images, which make no store, and a table that
+may stream streams through its smallest row cache, as its whole image may
+exceed the largest buffer, which a reservation is held to as well. The read
+writes nothing and holds no memory once done; while it runs, only the tables
+its readers fill on the host, the resident experts' slot table and a rotated
+GGUF's signs, a page each. A restore writes an image loaded while released
+as one released after it loaded.
+
 At load time the engine validates the GGUF metadata, including the data
 alignment (`general.alignment`, a power of two of 8 or more, as the GGUF spec
 requires: the repack reads blocks as words) and the rotary embedding and norm
@@ -709,7 +725,11 @@ least `following`'s, since it starts as the one before drains. Each threadgroup 
 columns of a K step of the projection's bits per weight (`ProjectionShape::weightBits16`, the
 most a format stores where the formats are unknown, which bounds the scratch), and a split
 grid's threadgroups each also store their fp32 partials of the tile's rows, which the last
-partition reads back. The constants come from sweeps of 2 to 40 threadgroups per core on the
+partition to arrive at the tile's counter reads back (`kernels/common/split_reduce.h`, which
+the register tile's splits and the sampled draw's vocabulary ranges share): every thread
+fences its stores at device scope before its threadgroup arrives, and every thread of the
+last one fences again before it reads, since a barrier orders memory for its own threadgroup
+alone. The constants come from sweeps of 2 to 40 threadgroups per core on the
 32-core M5 Max, the 20-core M5 Pro and the 12-core M6 (`gguf-projection-benchmark`, which times
 a gate/up pair in both pass modes; MLX 4-bit and six GGUF formats at 2048 and 5120 inputs,
 gate/up pairs in MLX 4-bit): time per byte steps up past 10 and 16 threadgroups per core at one
@@ -1195,18 +1215,32 @@ staged. It fits `T(s) = max(A(s), G(s) + u·A(s))`
 timings; A, the ANE's part, proportional to its channels through the split
 layer at 0.8, where the ANE's part takes the longer on every Mac measured; and
 u the bandwidth the ANE's part takes from the GPU's beside it, the split
-layer's excess over G at 0.4 where G takes the longer there (on the M6 the
-GPU's part runs a tenth to a third longer beside the ANE's). It takes the units
+layer's excess over G where G takes the longer (on the M6 the GPU's part runs
+a tenth to a third longer beside the ANE's at 0.4). It takes the units
 whose T, or T a unit either way, is least at its longest, since the timings can
 put T's least a unit off: a unit past where the ANE's part takes the longer
 costs the ANE's time per unit, a unit short of it the GPU's, and on an M5 Max
 and an M5 Pro the ANE's is the longer (1.7 ms a unit of the full-chunk layer
 against 0.6 and 1.1 ms), on an M6 the GPU's (1.9 against 1.2 ms), all with
-`--activations bf16`. On Qwen3.8-27B that takes 8 of the 34 units on an M5
-Max, 14-15 on an M5 Pro and 25-26 on an M6 with `--activations bf16`, the best
-each Mac's sweeps measured. By default the int8-activation tile makes the
-GPU's part faster, so the split takes fewer: 10 on a 20-core M5 Pro (the M5
-Max and M6 unmeasured). The split runs if T there gains 5% on the GPU alone. A
+`--activations bf16`. It fits u at 0.4, then again at the units it chose,
+nearest T's least, from their split's full-chunk layer as the chunks' timings
+below take it; where that fit chooses other units, their split is prepared
+and timed in turn, and serves if it splits every chunk the first splits, none
+of them more than 2% longer, the first otherwise, as where the other split
+cannot be prepared or timed: the refit took Qwen3.8-27B
+UD-Q4_K_M from 9 of its 34 units to 10
+on an M5 Max, whose full chunk prefilled 1.5-2.0% faster but which split
+chunks from 780 rows against 575, so that chunks of 640 and 672 rows ran 12%
+slower, and 9 serve. Where the ANE's part takes the longer already
+at 0.4, as on a 32-core M5 Max by default, 0.4 leaves u at none and T short of
+its least comes out too short: half the calibrations of Qwen3.8-27B took 6
+units, which prefill chunks of 1,024 to 2,016 rows 1.4-1.5% slower than 7,
+while the split layer of 6 units (13.8 ms against G's 13.2: u = 0.06) chooses
+7. On Qwen3.8-27B the calibration takes 8 of the 34 units on an M5 Max, 14-15
+on an M5 Pro and 25-26 on an M6 with `--activations bf16`, the best each Mac's
+sweeps measured. By default the int8-activation tile makes the GPU's part
+faster, so the split takes fewer: 10 on a 20-core M5 Pro and 7 on a 32-core M5
+Max (the M6 unmeasured). The split runs if T there gains 5% on the GPU alone. A
 start calibrates the split once for a Mac, a model, a macOS version, an engine
 build, `--activations` and the most units its memory plan holds, and remembers
 what it found (`remembered-*` in the cache directory below): the units, the
@@ -1289,7 +1323,8 @@ on Qwen3.8-27B); `splash serve --disable-ane` keeps the FFN on the GPU, and
 `ane-ffn-calibration`, the fit, the choice, the least chunk, a calibration's
 line of text and the breaker on timings it is given, also under the sanitizers,
 and `ane-ffn-startup`, each outcome of a start on a model it plays, a
-remembered calibration among them, the automatic context, the same in each
+remembered calibration and one whose fit at the units it chose moves them among
+them, the automatic context, the same in each
 where the split may run, and a relaunch's, which holds the first engine's
 context where a calibration made anew would serve another.
 `make test-engine-metal` runs `ane-ffn`: its kernels
@@ -1686,7 +1721,7 @@ target with an SSD cache that takes writes), else 0.85 of its slots;
 `--expert-memory` sets it exactly. The stores are sized before the start
 knows whether the run spills; a store above its smallest size laid out for a
 spill the final plan does not make loads again at 0.85, while one at its
-smallest size is all its floor at either share (`holdsStores` in
+smallest size is all its floor at either share (`keepsFloor` in
 `runtime/engine/RuntimeResources.mm`). No claim takes the store below its
 floor.
 After the host's pass a pool grows one unit, an elastic store chunk of about
@@ -1755,10 +1790,20 @@ less an Index page, less the first lane's hot block floor
 (`Model::hotFloorBytes`), cover the missing bytes: about 46K tokens on
 Qwen3.8-Flash-Next. It needs the SSD cache's quota for its pages and a free
 page in the Index runway, an extent kept while spilling is possible
-(`Engine::spillLanded`). Its claim then waits for its copies and releases its
-pages as they land (below), and it follows the Spill rules ([KV on the
-SSD](server.md#kv-on-the-ssd)): a prefill goes on as a Spill lane's, its
-later commands planned in that shape. No other claim converts a lane.
+(`Engine::spillLanded`). The conversion's take then releases its pages as a
+Spill lane's (below, `Engine::EngineVictims::take`): at once those whose copies
+landed, a chain it restored or the copies written ahead, so the lane runs in
+the command it converts for; its claim waits only for the copies its
+conversion starts, and releases those pages as they land, which a decoding
+lane's next prefill unit waits for up to the time of a unit ([prefill and
+decode scheduling](#prefill-and-decode-scheduling)). Waiting for the
+claim's retry instead, a decoding lane beside a prefill in passes lost the
+decode command after a pass and its gap held two passes, 1,066 ms against the
+838 ms of one pass and a decode command in engine-sim's Studio churn, where
+the cache had copied every page of its history. It then follows the Spill
+rules ([KV on the SSD](server.md#kv-on-the-ssd)): a prefill goes on as a
+Spill lane's, its later commands planned in that shape. No other claim
+converts a lane.
 
 **Releases** (`Engine::EngineVictims::releases`, `Cache::releasePages`). A Spill
 lane writes each committed page to the SSD cache and keeps it Full, so it
@@ -1990,7 +2035,12 @@ refused, or waits for scheduling, no suspended request resumes. When every
 lane is taken, or a new request's start is refused memory that no copy being
 written to disk is about to free, the resident of the lowest priority below it
 is suspended for it (`cache.priority_suspensions` in `/status`) and resumes
-once a lane and its memory are free. A new request below the priority of a running lane neither
+once a lane and its memory are free. A request that takes a lane starts in it
+at once: the next command is its prompt's, before any more work of the lanes
+that remain, and a command between its passes that the suspension gave up runs
+again only after it (on a 32-core M5 Max a Foreground prompt under four
+Background decodes starts 63 ms sooner at the 27B's command times, 25 ms at
+the 35B's). A new request below the priority of a running lane neither
 starts nor takes a lane until no lane of that priority runs, since it could not
 run before.
 
@@ -2206,8 +2256,29 @@ last pass, which commits nothing of it, and a command all of whose requests
 have ended stops at once.
 While requests of the same or a higher priority
 decode (a lane waiting for its token mask is owed nothing), each prefill unit owes them
-decode time, `--decode-share` times its own, before the next one runs. These
-policies do not extend client deadlines.
+decode time, `--decode-share` times its own, before the next one runs. A decoding lane
+whose memory is on its way back, as its own copies are after its conversion to Spill,
+is owed it too: while the prefill owes decode time, the next unit waits for that
+memory where the lane has not decoded since the last unit began, whose gap the unit
+would hold a second unit of, and the wait works the debt off as the lane's decode
+would (`Scheduler::waitsUntil`). It ends at the latest once the last unit has ended
+for as long as it took, or for G where it took longer, as the whole command that ends
+a decoder's own prompt does: a time set as that unit ends, so the wait lasts once for
+a unit, whatever commands run meanwhile, and ends with the lanes it is for (the engine
+asks for its wakeup only while a unit waits). Memory that
+lands during a unit makes the lane wait for the unit's end, so a wait as long as the
+unit moves the lane's next decode by a whole unit, which memory landing that late would
+have cost it anyway, where a shorter wait the memory outlasts adds itself to the lane's
+gap. Nothing the engine measures tells beforehand how long the
+memory takes: the SSD cache keeps no write rate, and a claim's wait does not follow
+what it lacks. In engine-sim's Studio churn a lane whose conversion started 2,321
+copies waited 94 ms for those its release needed, a decode gap of 686 ms where the
+next 471 ms pass made it 1,063 ms, and the waits of five such conversions took 92 to
+94 ms whether their claims lacked 1 MB or 105 MB. With the SSD cache writing at a
+tenth of its rate, the longest gap was 1,543 ms, as with no wait, where waits of the
+235 ms that pass owes made it 1,780 ms: the copies of five of the eight conversions
+outlasted the wait, the GPU idle for the 471 to 474 ms of a pass, and those of three
+landed within it, past the debt. These policies do not extend client deadlines.
 
 ### Resource waits
 
@@ -2299,9 +2370,10 @@ closer than a window share the pages of their tails. The cache keeps it so
   persistent restore point only with Full copies of its tail.
 - Each cut of a request's page table checks that every page from the window
   before its published blocks on is Full, always (`Cache::cutPageTable`).
-- A KV slot holds what its page holds when it is written, and its record
-  names the form (`KvSlotLabel`); a restore allocates that form. A restore
-  point persists its tail Full, as RAM holds it.
+- A KV slot holds what its page holds when it is written, takes that much
+  of the SSD cache's quota ([disk tier](#disk-tier)), and its record names
+  the form (`KvSlotLabel`); a restore allocates that form. A restore point
+  persists its tail Full, as RAM holds it.
 
 So no byte a kernel reads changes: a run with trimming off
 (`--kv-window-trim off`, the native argument validation passes) emits the
@@ -2377,13 +2449,14 @@ settle at (available - floor) / (tiers + 3) of what was available before them,
 and blocks a local snapshot keeps when such a tier frees them cost it at most a
 third more than it freed. Tiers with sizes on one volume take its room in turn,
 down to the floor, with no margin above it: while a local snapshot keeps the
-blocks such a tier frees, each copy it writes in place of another takes a slot
-of free space, and the copies a measure then has it give up free nothing, so
-free space can fall below the floor, as far as a full volume, before the tier
+blocks such a tier frees, each copy it writes in place of another takes what it
+stores of free space, and the copies a measure then has it give up free nothing,
+so free space can fall below the floor, as far as a full volume, before the tier
 has given up every copy it holds or the snapshot goes. A limit below what the
 tier holds is met at the next control pass by giving copies up in the order a
 full quota replaces them, never a copy in transfer or the only copy of a state
-in use, and a limit below one slot makes no room at all. Off a local volume, or
+in use, and a limit below what a copy takes makes no room for it at all. Off a
+local volume, or
 one that cannot be measured, the quota is the limit. A persistent tier's limit
 bounds its whole root, and the tier may use all of it: the other caches nobody
 holds, looked at once at start, count among what it holds, and while the root
@@ -2477,9 +2550,11 @@ refused, and once the quota is full a reclaim writes what it takes, as for any
 victim without a copy, giving up redundant copies, those made ahead among them,
 first. A persistent tier copies every point, whether memory has run short or
 not and in use too, so that a start after a crash takes it back, gives up the
-oldest point for it (below), and refuses one larger than its limit. A clean
-stop writes a persistent tier's waiting points, the newest first; a temporary
-tier's copies go with the process.
+oldest point for it (below), and refuses one larger than its limit, counting
+each of its copies at what its slot takes, those still to write by what their
+pages hold (`Cache::pointFits`). A clean stop writes a persistent tier's
+waiting points, the newest first; a temporary tier's copies go with the
+process.
 
 Otherwise writes happen when RAM reclamation selects a victim without a copy.
 States copy through one staging buffer, freeing their RAM immediately. KV
@@ -2529,8 +2604,49 @@ With `--persistent-cache` they are `kv.slots` and `state.slots` in the cache's
 directory, each beside a file of its slots' records, and stay for the next
 start. Otherwise, or when another process holds that directory or it cannot be
 used, they are temporary (`$TMPDIR/splash-cache-*`), unlinked as they are
-created and gone when the engine exits. A full quota of temporary files
-replaces the oldest redundant copy first, then the oldest sole copy, across both
+created and gone when the engine exits. A file's slots are all the size of its
+largest payload, a state or a Full page, each at its index times that size, and
+a slot is acquired for the payload it will hold and counts what it keeps on the
+volume (`SlotFile::quotaBytesFor`): the payload's host pages, which are what
+its write stores and what the write budget charges, so a Slim page's slot
+counts 464 KiB of Flint's 1.59 MiB and the quota holds 3.5 times the Slim
+pages it holds Full ones. The rest of the slot stays a hole, so a file's
+length can pass the quota while its blocks stay within it. The volume does
+not leave it one by itself: APFS allocates the gap before a write that lands
+past what the file held (gaps of 1 to 16 MiB were filled, one of 32 MiB was
+not: 256 payloads of 462 KiB in such slots took 407 MiB, and 116 MiB only once
+each slot had been freed and written again), so a write past the end of what
+the file's slots hold returns the hole before it
+(`SlotFile::Backing::stored`, one `F_PUNCHHOLE`, 14 to 43 us). Nor does it
+keep a hole at the file's end: a write into one has all of it allocated up to
+the write, so when the last slot that holds blocks is freed the file ends with
+the one below that does (`SlotFile::Backing::released`). With both, each
+slot's extents on the volume are its payload's host pages, slot by slot: in a
+3 GiB cache of 6,417 Flint pages, `SEEK_DATA` and `F_LOG2PHYS_EXT` map
+3,202,039,808 bytes of the KV file in 8,175 extents, as many as its slots
+count. The file's `st_blocks` ran 0.5% above that, and all of the difference
+lay past the file's end, where the cache writes nothing. APFS allocates ahead
+of a file that grows by writes spread over time: Slim pages written into new
+slots 60 ms apart, each past the end, kept up to 11.3 MiB beyond it, and
+appends of 1 MiB 100 ms apart 768 KiB. It keeps those blocks after the file
+closes until it drops them on its own; a truncation to the file's own length
+or an `fsync` leaves them, cloning the file drops them. In that cache they
+were 14.5 MiB past the KV file's end and 768 KiB past the state file's, from
+1.1 to 15.8 MiB past the KV file's after each of the ten prompts that filled
+it, and gone within six minutes of the engine's exit; a second run's stayed
+five minutes after it. A file that a few large writes grow keeps more for its
+size: with the 27B's states of 153 MiB, `state.slots` held 8.4 MiB past its end
+with one state (5.5% of its length), in a cache 1.6.1 wrote and in a fresh one
+alike, and 15.8 MiB with two (5.2%), beside 1.9 MiB past a `kv.slots` of 142
+MiB (1.3%); in another run the two files, 451.5 MiB long together, held 29.6
+MiB more than that (6.5%). These are measurements, not a bound: what APFS keeps
+follows how the file grew. No slot holds them, so the quota does not count them
+and the cache cannot give them back; the limit's rule, which reads the files'
+blocks (`DiskSpace::measure`), counts them as the tier's, as it counts the
+records files (1.2 MiB beside the Flint cache's 3 GiB), which hold no slot
+either. A full
+quota of temporary files replaces the oldest
+redundant copy first, then the oldest sole copy, across both
 KV and states; sole copies of states in use, and the KV they restore through,
 make room only for a copy that is itself in use, and last. A persistent tier
 keeps restore points whole instead, since its redundant copies are what the next
@@ -2551,9 +2667,10 @@ no SSD cache (above). Before reclaim takes a state in RAM, only a spilling
 request's page takes the spilled KV under it, the state first, once nothing else
 is left. A freed slot returns its quota at once and its blocks to the volume
 (`F_PUNCHHOLE`) once its file's IO worker finishes the transfer it is in, so the
-two files together occupy about the live slots instead of each keeping its
-high-water mark; `/status` reports that as `disk.file_bytes` beside
-`disk.used_bytes`. Until the punch the other file can take that quota, so
+two files together occupy about what the live slots count instead of each
+keeping its high-water mark; `/status` reports that as `disk.file_bytes`, what
+the slots whose blocks the files hold count, beside `disk.used_bytes`. Until
+the punch the other file can take that quota, so
 allocated blocks can briefly exceed the limit by the slots freed but not yet
 punched, bounded by the transfer each file's worker is in: about 2% of a 10G
 tier in a 25-minute churn run on an M5 Max. A write that finds the volume full
@@ -2562,8 +2679,18 @@ once and shrinks to the new limit. If the volume still shows room above the
 floor, the write met a limit the measure cannot see, such as a volume quota or a
 disk image whose host is full, or the volume filled and freed again; after a
 second such write the tier keeps within what it holds, with one log line, while
-serving continues. On a volume that cannot punch holes the files keep the blocks
-of freed slots, which the runtime reports once; the limit counts them.
+serving continues. A volume that returns no blocks (`F_PUNCHHOLE` fails, as on
+HFS+ and exFAT, which keep no holes at all) keeps in each slot whatever an
+earlier payload or its own allocation put there, so there every slot counts
+whole: each file asks its volume once as it opens, with a punch past its end,
+a punch that fails later counts the slots acquired after it whole too, and the
+runtime reports it once. The slot whose punch failed keeps its blocks, which
+`disk.file_bytes` goes on counting: what is written there next counts with
+them, the larger of the two, until a punch returns the range
+(`SlotFile::Backing::back`). A quota of 16 Full slots then holds 16 Slim pages
+on 24.4 MiB of blocks, where on APFS it holds 56 on 25.4 MiB. The files keep
+the blocks of freed slots there, each up to its high-water mark, and the
+limit's rule counts them as the tier's.
 
 Transfers use `pread`/`pwrite` with `F_NOCACHE`, every one an aligned range.
 Those of the files' IO workers, every write and a state's reads, move whole
@@ -2585,13 +2712,23 @@ back checks the segments it covers: a whole or index restore that fails is a
 miss, and a block or history read that fails is `kv_unreadable` for the
 requests that read it. A KV record of a layout with a sliding window also names
 the form of the page its slot holds (`KvSlotLabel`), and a start takes back
-only the forms it restores.
+only the forms it restores. A slot it takes back counts what one acquired for
+the record's payload does, and as adoption ends every block between one adopted
+payload's host pages and the next one's slot goes back to the volume
+(`SlotFile::finishAdoption`): the slots it leaves behind, and what a file
+whose writer returned no holes holds around its shorter payloads, so such a
+cache, each slot whole on the volume, is taken back as it is and shrinks to its
+payloads' pages at that start (96 slots, two in three Slim: 153 MiB before,
+80 MiB after, every payload matching its record).
 
 `/status` reports the shared quota, its limit, the write budget and KV
 transfers under `disk`. Its cumulative `read_bytes` and `written_bytes` count
 bytes transferred by file IO across KV and state files, including partial or
 cancelled transfers. They exclude
-filesystem metadata and physical SSD write amplification. State transfers appear
+filesystem metadata and physical SSD write amplification. Its write rate,
+`written_last_hour_bytes` and `written_last_day_bytes`, is what the write
+budget counts, the host pages of each write submitted, in the last 60 and
+1,440 minutes of the awake clock (`model::DiskBudget::writeRate`). State transfers appear
 under `state` (`disk_bytes`, `offloads`, `disk_hits`, `disk_promotions`). Cache
 counters include:
 
@@ -2647,7 +2784,9 @@ warm-up done of all, and again as each step ends
 ([Warmup and pipelines](#warmup-and-pipelines)), then its Ready event when the
 warm-up is done; the server prints the first engine's Warming and writes it to
 its serve record, where the app shows it as the start's Warming up step and
-its progress.
+its progress. A relaunched engine's Warming goes no further: its warm-up is
+part of the recovery, which the record names as one phase from the failure
+on ([serve record](server.md#serve-record)).
 Ready says what the start serves: its lanes, the context it resolved (a
 relaunch may serve less than the first engine did), whether it admits
 images, and the target's vocabulary, stop

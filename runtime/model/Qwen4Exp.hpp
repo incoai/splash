@@ -182,16 +182,16 @@ struct Qwen4ExpWeights final : QwenTargetWeightsBase {
                                                   const QwenTargetFiles &files);
 
 // The family's target (model/Qwen4ExpTarget.hpp), whose prefill commands run
-// up to `prefillChunks` chunks; the step scratch it keeps itself, with the
-// rows of a streamed PLE table of `tableRowBytes` each (zero: the table
-// loads); and the projections its hyper-connection mixes, QSA indexers and
-// PLE layer dispatch (qwenTargetGeometry).
+// up to `prefillChunks` chunks; the step scratch a target of its layout keeps
+// itself, with the rows of a streamed PLE table of `tableRowBytes` each
+// (zero: the table loads); and the projections its hyper-connection mixes,
+// QSA indexers and PLE layer dispatch (qwenTargetGeometry).
 [[nodiscard]] std::unique_ptr<QwenTarget> makeQwenTarget(const Qwen4ExpWeights &weights,
                                                          const QwenTargetGeometry &geometry,
                                                          metal::MetalBackend &backend,
                                                          const ops::ExecutionPlans &operators,
                                                          uint32_t prefillChunks);
-[[nodiscard]] QwenTargetScratchBytes qwenTargetScratchBytes(const Qwen4ExpWeights &weights,
+[[nodiscard]] QwenTargetScratchBytes qwenTargetScratchBytes(const Qwen4ExpLayout &layout,
                                                             const QwenTargetGeometry &geometry,
                                                             uint32_t prefillChunks, uint64_t tableRowBytes);
 void includeFamilyProjections(QwenTargetGeometry &geometry, const Qwen4ExpWeights &weights);

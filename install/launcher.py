@@ -26,7 +26,7 @@ if __name__ == "__main__" and not __package__:
 # The options, the record and the console serve shares with the server, in
 # modules of the standard library alone: the launcher runs before .venv
 # exists.
-from server import diagnostics, serve_options, serve_record
+from server import diagnostics, serve_options, serve_record, unix_socket
 
 from . import clients, paths
 from . import models as model_artifacts
@@ -118,6 +118,11 @@ def _flush_console():
 
 def _base_url(port):
     return f"http://127.0.0.1:{port}"
+
+
+# The --host values under which a server listens at _base_url's address: the
+# default, its name, and every IPv4 address.
+_LOOPBACK_HOSTS = ("127.0.0.1", "localhost", "0.0.0.0")
 
 
 # The server is on this Mac's loopback: requests to it connect directly, so
@@ -260,26 +265,68 @@ def _prepare_local_model(args):
     return prepared
 
 
+def _printable(value):
+    """Whether `value` is a string a line can show as it is."""
+    return isinstance(value, str) and value != "" and value.isprintable()
+
+
 def _serve_lock_owner(lock):
+    """The process holding a port's lock, by the names a refusal words
+    (_words): its PID, model and port, as serve wrote them in the lock, with
+    its --host where the lock names one and the phase its serve record says
+    where the record is that PID's; none for a lock without the first
+    three."""
     try:
         lock.seek(0)
         owner = json.load(lock)
     except (OSError, UnicodeError, ValueError):
-        return ""
+        return {}
     if not isinstance(owner, dict):
-        return ""
+        return {}
     pid, model, port = owner.get("pid"), owner.get("model"), owner.get("port")
     if (
         type(pid) is not int
         or pid <= 0
-        or not isinstance(model, str)
-        or not model
-        or not model.isprintable()
+        or not _printable(model)
         or type(port) is not int
         or not 1 <= port <= 65535
     ):
+        return {}
+    names = {"PID": pid, "model": model, "port": port}
+    if _printable(host := owner.get("host")):
+        names["host"] = host
+    try:
+        record = json.loads(_serve_record(port).read_bytes())
+    except (OSError, ValueError):
+        record = None
+    if isinstance(record, dict) and record.get("pid") == pid:
+        if _printable(phase := record.get("phase")):
+            names["phase"] = phase
+    return names
+
+
+def _words(owner):
+    """A lock's owner (_serve_lock_owner) in a refusal's words, after
+    "serving"; nothing for a lock that names none."""
+    if not owner:
         return ""
-    return f" (PID {pid}, model {model}, port {port})"
+    return f" ({', '.join(f'{name} {value}' for name, value in owner.items())})"
+
+
+def _port_holder(port):
+    """The process holding `port`'s lock, as _serve_lock_owner names it, or
+    None while none holds it: the lock taken shared without waiting, which
+    only a holder refuses, as the app probes it."""
+    try:
+        lock = _serve_lock(port).open()
+    except OSError:
+        return None
+    with lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return _serve_lock_owner(lock)
+    return None
 
 
 def _check_port(host, port):
@@ -290,7 +337,15 @@ def _check_port(host, port):
     process's listener at a wider or narrower address of the port (0.0.0.0
     or a dual-stack :: beside 127.0.0.1, or the reverse), and the two would
     then split the address's connections, so a listener that accepts one
-    there owns the port too."""
+    there owns the port too. A UNIX socket's path is claimed and bound as the
+    HTTP listener claims and binds it, and given up again."""
+    if (path := unix_socket.path(host)) is not None:
+        with (
+            contextlib.closing(unix_socket.Claim(path)) as claim,
+            socket.socket(socket.AF_UNIX) as probe,
+        ):
+            claim.bind(probe)
+        return
     with socket.socket() as probe:
         probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         probe.bind((host, port))
@@ -313,8 +368,14 @@ def _prepare_start(args):
     try:
         _check_port(args.host, args.port)
     except OSError as error:
+        # A UNIX socket has no port: --host names all of where it listens.
+        address = (
+            args.host
+            if unix_socket.path(args.host) is not None
+            else f"{args.host}:{args.port}"
+        )
         raise LauncherError(
-            f"cannot bind {args.host}:{args.port}: {error}", serve_record.PORT
+            f"cannot bind {address}: {error}", serve_record.PORT
         ) from None
     if args.model_dir is not None:
         return _prepare_local_model(args)
@@ -414,13 +475,25 @@ def serve(args):
         try:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
+            # The port names the lock whatever --host listens on, a UNIX
+            # socket too: a second server takes another.
             raise LauncherError(
-                f"Splash is already serving{_serve_lock_owner(lock)}; "
-                "stop it with Ctrl+C first"
+                f"Splash is already serving{_words(_serve_lock_owner(lock))}; "
+                "stop it with Ctrl+C first, or serve on another --port"
             ) from None
         lock.seek(0)
         lock.truncate()
-        json.dump({"pid": os.getpid(), "model": args.model, "port": args.port}, lock)
+        # With where it listens, which an agent command that finds no server
+        # at 127.0.0.1:PORT names (coding_client).
+        json.dump(
+            {
+                "pid": os.getpid(),
+                "model": args.model,
+                "port": args.port,
+                "host": args.host,
+            },
+            lock,
+        )
         lock.flush()
         # The record is the lock holder's: from here on a start that fails
         # says why in it, as the server, which keeps this pid, does too. A
@@ -469,10 +542,30 @@ def coding_client(args):
     path = clients.find_executable(args.command)
     listing = _request_json("/v1/models", port=args.port)
     if listing is None:
-        message = (
-            f"No ready Splash server at {_base_url(args.port)}. "
-            "Run 'splash serve --model <HF_REPO_ID>' in another terminal first."
-        )
+        holder = _port_holder(args.port)
+        if holder is None:
+            message = (
+                f"No ready Splash server at {_base_url(args.port)}. "
+                "Run 'splash serve --model <HF_REPO_ID>' in another terminal first."
+            )
+        elif holder.get("host") in _LOOPBACK_HOSTS and holder.get("phase") == "ready":
+            # It listens where the agent commands ask and its record says
+            # ready, so only that it did not answer is known: a server that
+            # stops closes its listener first and holds the port, its record
+            # still ready, until its engine has stopped.
+            message = (
+                f"Splash is serving{_words(holder)} but does not answer at "
+                f"{_base_url(args.port)}: it may be stopping."
+            )
+        else:
+            # The server holding the port listens elsewhere, on another
+            # address or a UNIX socket, or is not ready yet; a second one
+            # would be refused the port.
+            message = (
+                f"No ready Splash server at {_base_url(args.port)}, but Splash "
+                f"is serving{_words(holder)}. Agent commands connect over TCP "
+                "on loopback to a server that is ready."
+            )
         # OpenCode and Hermes have a --port of their own, which goes after --.
         if args.explicit_port:
             message += (

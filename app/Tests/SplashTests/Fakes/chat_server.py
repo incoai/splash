@@ -1,7 +1,10 @@
-# A launcher that serves as a ready `splash serve` of a model that sees images and thinks: it reads
-# a prompt for 0.3 s, then streams a reply in parts over 0.7 s, and titles a chat after 0.4 s
-# (ChatScreenTests). While a file `hold` is in the runtime's folder, a reply waits to start, so
-# that a test can draw what sending changes before the reply changes the window again.
+# A launcher that serves as a ready `splash serve` of a model that sees images and thinks: it
+# takes a message, reads its prompt for 0.3 s, then streams a reply in parts over 0.7 s, and
+# titles a chat after 0.4 s (ChatScreenTests). Files in the runtime's folder stop it at each step,
+# so that a test can draw what one changes before the next changes the window again: while `hold`
+# is there, it holds a message before it takes or refuses it; while `refuse` is there, it refuses
+# the message, as one longer than the model's context; and while `wait` is there, the reply to a
+# message it has taken waits to start.
 import json
 import os
 import runpy
@@ -52,9 +55,21 @@ class Handler(BaseHTTPRequestHandler):
             return self.reply(title)
         while (root / "hold").exists():
             time.sleep(0.01)
+        if (root / "refuse").exists():
+            error = {
+                "message": "prompt exceeds the context window",
+                "code": "context_length_exceeded",
+            }
+            return self.reply({"error": error}, 400)
+        # As the server takes a message: its response starts, with a chunk that says nothing.
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
         self.end_headers()
+        start = {"choices": [{"delta": {"role": "assistant", "content": ""}}]}
+        self.wfile.write(f"data: {json.dumps(start)}\n\n".encode())
+        self.wfile.flush()
+        while (root / "wait").exists():
+            time.sleep(0.01)
         for processed in range(1, 4):
             progress = {"choices": [], "prompt_progress": {"total": 3, "processed": processed}}
             self.wfile.write(f"data: {json.dumps(progress)}\n\n".encode())

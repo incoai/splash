@@ -14,6 +14,7 @@
 #include <optional>
 #include <set>
 #include <span>
+#include <stdexcept>
 #include <vector>
 
 namespace splash::test {
@@ -62,8 +63,10 @@ private:
   mutable std::atomic<uint64_t> reads_{0};
 };
 
-// A KV disk tier without a disk: slots count against a quota (or a DiskBudget), transfers finish
-// when the test says so, and each slot is its own TestKvCopy that readers may outlive.
+// A KV disk tier without a disk: slots count against a quota of slots (or, in bytes, a DiskBudget:
+// 100 for a Full page's slot and 30 for a Slim page's, as SlotFile counts what a slot stores),
+// transfers finish when the test says so, and each slot is its own TestKvCopy that readers may
+// outlive.
 class TestKvTier final : public engine::KvTier {
 public:
   struct Transfer final {
@@ -80,7 +83,7 @@ public:
   TestKvTier() = default;
   explicit TestKvTier(bool persistent) : persistentTier(persistent) {}
 
-  uint64_t slotBytes() const noexcept override { return 100; }
+  uint64_t slotBytes(kv::PageForm form) const override { return form == kv::PageForm::Slim ? 30 : 100; }
   bool writable() const noexcept override { return writableFile; }
   bool persistent() const noexcept override { return persistentTier; }
   void label(const std::shared_ptr<engine::KvDiskSlot> &slot, std::vector<std::byte> label) override {
@@ -91,10 +94,10 @@ public:
     return writableFile && inFlight() < transferLimit && writesInFlight_[kind] < writeLimits[kind];
   }
   bool canRestore() const noexcept override { return inFlight() < transferLimit; }
-  std::shared_ptr<engine::KvDiskSlot> acquireSlot(model::DiskBudget::Draw draw) override {
+  std::shared_ptr<engine::KvDiskSlot> acquireSlot(kv::PageForm form, model::DiskBudget::Draw draw) override {
     draws.push_back(draw);
-    if (budget ? !budget->reserve(slotBytes(), draw) : slots >= capacity) return {};
-    return std::make_shared<Slot>(*this);
+    if (budget ? !budget->reserve(slotBytes(form), draw) : slots >= capacity) return {};
+    return std::make_shared<Slot>(*this, slotBytes(form));
   }
   std::unique_ptr<engine::KvTransfer>
   demote(uint32_t page, std::shared_ptr<engine::KvDiskSlot>, engine::WriteClass write,
@@ -162,14 +165,19 @@ public:
   }
   [[nodiscard]] uint32_t inFlight() const noexcept { return inFlight_; }
   // The labels of the slots a persistent tier holds, as the next process
-  // finds them, and a slot that process takes back.
+  // finds them, and a slot that process takes back, of a page of the form
+  // its label names, within the tier's budget if it has one.
   [[nodiscard]] std::vector<std::vector<std::byte>> labels() const {
     std::vector<std::vector<std::byte>> result;
     for (const Slot *slot : live_)
       if (!slot->label.empty()) result.push_back(slot->label);
     return result;
   }
-  [[nodiscard]] std::shared_ptr<engine::KvDiskSlot> adopt() { return std::make_shared<Slot>(*this); }
+  [[nodiscard]] std::shared_ptr<engine::KvDiskSlot> adopt(kv::PageForm form = kv::PageForm::Full) {
+    if (budget && !budget->reserve(slotBytes(form)))
+      throw std::logic_error("a test tier takes back only what its budget holds");
+    return std::make_shared<Slot>(*this, slotBytes(form));
+  }
 
   uint32_t slots = 0;
   uint32_t capacity = 4;
@@ -201,18 +209,22 @@ public:
 
 private:
   struct Slot final : engine::KvDiskSlot, TestKvCopy {
-    explicit Slot(TestKvTier &owner) : tier(owner), budget(owner.budget) {
+    Slot(TestKvTier &owner, uint64_t taken) : tier(owner), budget(owner.budget), taken_(taken) {
       ++tier.slots;
       tier.live_.insert(this);
     }
     ~Slot() override {
       --tier.slots;
       tier.live_.erase(this);
-      if (budget) budget->release(tier.slotBytes());
+      if (budget) budget->release(taken_);
     }
+    uint64_t bytes() const noexcept override { return taken_; }
     TestKvTier &tier;
     std::shared_ptr<model::DiskBudget> budget;
     std::vector<std::byte> label;
+
+  private:
+    uint64_t taken_;
   };
   class Ticket final : public engine::KvTransfer {
   public:
@@ -240,7 +252,7 @@ private:
     auto transfer = std::make_shared<Transfer>();
     transfer->write = write;
     if (bytesPerMillisecond)
-      transfer->dueMilliseconds = clock() + double(slotBytes()) / *bytesPerMillisecond;
+      transfer->dueMilliseconds = clock() + double(slotBytes(kv::PageForm::Full)) / *bytesPerMillisecond;
     transfers.push_back(transfer);
     ++inFlight_;
     if (write) ++writesInFlight_[static_cast<size_t>(*write)];

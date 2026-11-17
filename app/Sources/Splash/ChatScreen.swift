@@ -107,9 +107,15 @@ private struct ChatTitle<Actions: View>: View {
         // kept the item at the width it first had, the title's alone, and the room added once its place was known
         // drew past the item's edge, where clicks don't reach.
         .fixedSize()
-        // Fading in once it has its place, as the toolbar sizes the item to it.
-        .opacity(place == nil ? 0 : 1)
+        // Once it has its place, its room and its width take it within `settle`, as the toolbar sizes the item to
+        // them, and it fades in after, as what comes into a page does once what makes room for it has moved
+        // (`Motion.comingAndGoing`). Fading in on one animation with them, it came some points from its place, cut to
+        // the least window's width, and slid and widened as it showed: of the frames drawn 55, 78 and 101 ms after a
+        // new chat's first message was taken, each had some 100 pixels of it where the title, once still, has none.
+        // Its room and width changed at once instead, the toolbar left the item at its first width, the title over
+        // the switch before it, in one window of two.
         .animation(Motion.settle, value: place == nil)
+        .animation(Motion.settle?.delay(Motion.settleSeconds)) { $0.opacity(place == nil ? 0 : 1) }
         .background(ToolbarProbe { place = $0 })
         // Along with the sidebar as it slides.
         .animation(Motion.settle, value: state.showsSidebar)
@@ -493,7 +499,7 @@ private struct ConversationView: View {
 
     var body: some View {
         let shown = state.chats.current.flatMap { $0.messages.isEmpty ? nil : $0 }
-        VStack(spacing: 0) {
+        ChatColumn(newChat: shown == nil) {
             // What the composer leaves goes at once, and what it makes room for fades in once it
             // has moved (`Motion.comingAndGoing`): the transcript faded out under the composer
             // moving over it as a new chat opened, and in under the composer moving away as a
@@ -506,8 +512,7 @@ private struct ConversationView: View {
                 // A new chat: the mark, showing what the Server does, over the composer, and while a
                 // start warms up why it can take long, in the room under the mark, so that the
                 // composer stays in its place.
-                Spacer()
-                Group {
+                VStack(spacing: 0) {
                     StatusMark(look: state.serverStatus.look, since: state.server.since, size: 44)
                     Text(state.serverStatus.note ?? "")
                         .font(.callout)
@@ -521,10 +526,6 @@ private struct ConversationView: View {
             // One composer either way, so that its text view, and what the input method composes
             // in it, stays when a chat gets its first message or a new chat opens.
             footer
-            if shown == nil {
-                Spacer()
-                Spacer()
-            }
         }
         // The composer moves, whole, between a new chat's middle and a conversation's foot.
         .animation(Motion.settle, value: shown == nil)
@@ -532,11 +533,25 @@ private struct ConversationView: View {
         .background(.background)
     }
 
+    /// The composer, standing on its foot, the line under it, which the column places: from there
+    /// it reaches up as far as what it holds, and tells the column how far by its guides.
     private var footer: some View {
         Composer(draft: state.draft)
             .frame(maxWidth: column)
             .padding(.horizontal, 32)
             .padding(.bottom, 24)
+            .fixedSize(horizontal: false, vertical: true)
+            // As wide as the column, the composer in its middle, so that its foot starts on a
+            // whole point: a column of an odd width put the foot half a point in, and Stop's glyph,
+            // placed from there, drew a pixel to the right of its place once it had travelled.
+            .frame(maxWidth: .infinity)
+            .frame(height: 0, alignment: .bottom)
+            // As it travels, its foot moves and it stands on it, as tall as what it holds then
+            // (`Composer`), its controls where they were as what was over them goes. Its parts
+            // each moving from where they were to where they go, the card drew empty and as tall
+            // as before, 237 points, for the first 100 ms after the server took a new chat's
+            // first message, its text and what was over it gone; then shrank to 77 as it went.
+            .geometryGroup()
     }
 
     /// `conversation` as the page shows it, Ask Again as the Server allows.
@@ -545,6 +560,73 @@ private struct ConversationView: View {
         let askAgain = TranscriptPage.AskAgain(enabled: server.answers && state.chats.streaming == nil,
                                                help: "Ask \(server.model.map(state.displayName(of:)) ?? "the model") Again")
         return TranscriptPage(conversation, askAgain: askAgain, name: state.displayName(of:))
+    }
+}
+
+/// The open chat, laid out down the window: a conversation's transcript over the composer at the
+/// foot, or a new chat's mark over the composer in the middle, where the room over the mark and
+/// under the composer is a third and two thirds of what the window leaves them. That room is
+/// measured as if the composer held nothing over its text, so that what comes over its text, the
+/// line that says why and what is attached, grows it up, the mark with it, and moves neither its
+/// text nor what is under it: split with it, the line that says why moved the text 17 points down
+/// and the mark 8 up. The composer stands on its foot (`ConversationView.footer`), which the column
+/// places, and tells how far it reaches over it by its guides. It reaches past the column's top
+/// where it holds more than the column is tall, as a draft taller than the window holds does, or
+/// one of some lines in the 240 points the drawer leaves the Chat at the least (`WithDrawer`): it
+/// stands on its foot still, and a conversation's transcript has no height left.
+private struct ChatColumn: Layout {
+    /// Whether it lays a new chat out.
+    let newChat: Bool
+
+    func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
+        proposal.replacingUnspecifiedDimensions()
+    }
+
+    func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) {
+        guard let composer = subviews.last else { return }
+        let pages = subviews.dropLast()
+        let width = ProposedViewSize(width: bounds.width, height: nil)
+        let reach = composer.dimensions(in: width)
+        // How far the composer reaches over its foot, and how far it would with nothing over its text.
+        let height = -reach[.composerTop], plain = -reach[.composerPlain]
+        var foot = bounds.maxY
+        if newChat {
+            let mark = pages.map { $0.sizeThatFits(width).height }.max() ?? 0
+            let room = max(0, bounds.height - mark - plain)
+            foot = min(bounds.maxY, max(bounds.minY + mark + height, bounds.minY + room / 3 + mark + plain))
+        }
+        composer.place(at: CGPoint(x: bounds.midX, y: foot), anchor: .top, proposal: width)
+        for page in pages {
+            if newChat {
+                page.place(at: CGPoint(x: bounds.midX, y: foot - height), anchor: .bottom, proposal: width)
+            } else {
+                // None, not less, where the composer reaches past the column's top.
+                let left = max(0, foot - height - bounds.minY)
+                page.place(at: bounds.origin, proposal: ProposedViewSize(width: bounds.width, height: left))
+            }
+        }
+    }
+
+    // No alignment guides of its own, which would otherwise be looked for in the transcript.
+    func explicitAlignment(of guide: HorizontalAlignment, in bounds: CGRect, proposal: ProposedViewSize,
+                           subviews: Subviews, cache: inout ()) -> CGFloat? { nil }
+
+    func explicitAlignment(of guide: VerticalAlignment, in bounds: CGRect, proposal: ProposedViewSize,
+                           subviews: Subviews, cache: inout ()) -> CGFloat? { nil }
+}
+
+extension VerticalAlignment {
+    /// The composer's top (`Composer`), which the column it stands in places (`ChatColumn`).
+    static let composerTop = VerticalAlignment(ComposerTop.self)
+    /// Where the composer's top would be with nothing over its text (`Composer`).
+    static let composerPlain = VerticalAlignment(ComposerPlain.self)
+
+    private enum ComposerTop: AlignmentID {
+        static func defaultValue(in context: ViewDimensions) -> CGFloat { context[.top] }
+    }
+
+    private enum ComposerPlain: AlignmentID {
+        static func defaultValue(in context: ViewDimensions) -> CGFloat { context[.top] }
     }
 }
 

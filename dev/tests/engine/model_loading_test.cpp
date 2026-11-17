@@ -2,6 +2,7 @@
 #include "TestBuffers.hpp"
 #include "TestChecks.hpp"
 #include "TestCheckpoint.hpp"
+#include "model/GgufImage.hpp"
 #include "model/GgufImageLayout.hpp"
 #include "model/ModelFactory.hpp"
 #include "model/ModelSizing.hpp"
@@ -257,6 +258,63 @@ void testWeightImages(MetalBackend &backend, const std::filesystem::path &root) 
             "unable to truncate synthetic file");
     rejects([&] { (void)load(unalignedPath, "TEST0001", 1, 2); }, "weight image size is not 16 KiB-aligned",
             "unaligned file size was accepted");
+}
+
+// Weights loaded while released are reserved: an image's buffer holds no
+// memory and its sections are views of none, of their sizes, while its file
+// reads the header and the descriptors its plan writes (ImagePlan::planned),
+// so that what a reader parses of the weights costs no memory; an image whose
+// plan holds none of them cannot be read so. The next restore writes the
+// image, under the views read before, and no image loads while a restore is
+// under way.
+void testReservedImages(MetalBackend &backend, const std::filesystem::path &root) {
+    constexpr uint32_t elementCount = kWeightFileAlignment / sizeof(uint32_t);
+    std::array<uint32_t, elementCount> expected{};
+    for (uint32_t i = 0; i < elementCount; ++i) expected[i] = i * 13 + 5;
+    constexpr uint64_t kDescriptorBytes = splash::model::GgufTensorDescriptor::kBytes;
+    const std::array<uint64_t, 2> sections{kDescriptorBytes, sizeof(expected)};
+    const auto path = root / "reserved.bin";
+    const uint64_t fileBytes = writeWeightFile(path, "TEST0001", 3, 4, sections);
+    std::vector<uint8_t> described(kDescriptorBytes);
+    for (size_t i = 0; i < described.size(); ++i) described[i] = static_cast<uint8_t>(i * 7 + 1);
+    const int descriptor = open(path.c_str(), O_WRONLY | O_CLOEXEC);
+    require(descriptor >= 0 &&
+                pwrite(descriptor, described.data(), described.size(), kWeightFileAlignment) ==
+                    static_cast<ssize_t>(described.size()) &&
+                pwrite(descriptor, expected.data(), sizeof(expected), 2 * kWeightFileAlignment) ==
+                    static_cast<ssize_t>(sizeof(expected)),
+            "unable to write the reserved image's sections");
+    close(descriptor);
+    const std::array<uint8_t, 16> header = splash::model::weightFileHeader("TEST0001", 3, 4);
+    const auto planned = std::make_shared<const std::vector<splash::model::gguf::Fill>>(
+        std::vector<splash::model::gguf::Fill>{{0, {header.begin(), header.end()}},
+                                               {kWeightFileAlignment, described}});
+    const auto image = [&] {
+        splash::model::ImagePlan plan = fileImage(path, "test/reserved.bin", "TEST0001", 3, 4);
+        plan.planned = planned;
+        return plan;
+    };
+    const uint64_t baseline = backend.memoryStats().allocatedBytes;
+    splash::model::WeightImages images(backend, "fixture");
+    images.release();
+    WeightFile file = images.load(image());
+    const std::span<const uint8_t> read = file.read(kDescriptorBytes, "descriptor");
+    const MetalBuffer payload = file.section(sizeof(expected), "payload");
+    file.finish();
+    require(std::equal(read.begin(), read.end(), described.begin(), described.end()) && payload &&
+                payload.sizeBytes() == sizeof(expected) && !payload.contents() &&
+                backend.memoryStats().allocatedBytes == baseline && images.released(),
+            "an image loaded while released was not reserved, or its file did not read its plan's bytes");
+    rejects([&] { (void)images.load(fileImage(path, "test/unplanned.bin", "TEST0001", 3, 4)); },
+            "weight image is not host visible", "an image without the bytes its readers parse was read without memory");
+    require(!images.restore(splash::test::admitAll) && images.released(), "the restore did not start");
+    rejects([&] { (void)images.load(image()); }, "while a restore is under way",
+            "an image loaded while a restore was under way");
+    splash::test::restoreWeights(images);
+    require(!images.released() && backend.memoryStats().allocatedBytes >= baseline + fileBytes &&
+                payload.contents() &&
+                std::memcmp(payload.contents(), expected.data(), sizeof(expected)) == 0,
+            "the restore did not write the reserved image under the views read before");
 }
 
 // A restore admits each image's memory. An image admission refuses, and one
@@ -1036,6 +1094,7 @@ int main(int argc, const char *argv[]) {
         MetalBackend backend(argv[1]);
         TempDirectory temporary;
         testWeightImages(backend, temporary.path());
+        testReservedImages(backend, temporary.path());
         testRestoreAdmission(backend, temporary.path());
         testRestoreWritesEachImageOnItsThread(backend, temporary.path());
         testGgufImageLayout(backend, temporary.path());

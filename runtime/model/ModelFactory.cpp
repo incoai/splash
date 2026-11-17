@@ -72,29 +72,21 @@ StreamedParts StreamedParts::loaded(const LoadedModel &model, bool kv) noexcept 
   return {.experts = model.expertStore() != nullptr, .tableRowBytes = table ? table->table().rowBytes : 0, .kv = kv};
 }
 
-LoadedModel loadModel(metal::MetalBackend &backend,
-                              const std::filesystem::path &root,
-                              const ModelDescriptor &descriptor,
-                              const ModelLoadOptions &options) {
-  LoadedModel result;
-  result.descriptor = descriptor;
-  if (!result.descriptor.valid())
-    throw std::invalid_argument("model descriptor is invalid");
-  result.images = std::make_shared<WeightImages>(backend, result.descriptor.sourceIdentity);
-  WeightImages &images = *result.images;
-  // Every source's metadata is checked before the first image is written:
-  // the vision tower's and the draft's here, the target's by its loader.
-  const auto vision = planVisionLoader(root, result.descriptor);
-  DraftCheckpointLoader draft(backend, images, root / "draft", result.descriptor.draft);
+namespace {
+
+// The target of `descriptor` in `root`, its images loaded into `images` as
+// `options` says.
+TargetWeights loadTarget(metal::MetalBackend &backend, WeightImages &images, const std::filesystem::path &root,
+                         const ModelDescriptor &descriptor, const ModelLoadOptions &options) {
   // The weights that stream from their files read on the engine's readers.
   const ExpertStoreOptions experts{.memoryBytes = options.expertMemoryBytes,
                                    .floorBytes = options.expertFloorBytes,
                                    .floorShare = options.expertFloorShare,
                                    .readers = options.readers};
-  result.target = std::visit(
+  return std::visit(
       [&](const auto &layout) -> TargetWeights {
         const std::filesystem::path directory = root / "target";
-        switch (result.descriptor.targetSource) {
+        switch (descriptor.targetSource) {
         case TargetSource::Safetensors: {
           SafetensorsTargetLoader loader(backend, images, directory, layout, experts);
           return readTarget(backend, layout, std::ref(loader));
@@ -112,7 +104,39 @@ LoadedModel loadModel(metal::MetalBackend &backend,
         }
         throw std::invalid_argument("unknown target source");
       },
-      result.descriptor.target);
+      descriptor.target);
+}
+
+} // namespace
+
+QwenTargetGeometry plannedTargetGeometry(metal::MetalBackend &backend, const std::filesystem::path &root,
+                                         const ModelDescriptor &descriptor, uint64_t streamedTableBytes,
+                                         std::shared_ptr<SsdReaders> readers) {
+  if (!descriptor.valid()) throw std::invalid_argument("model descriptor is invalid");
+  // Released before the first image, the images load reserved.
+  WeightImages images(backend, descriptor.sourceIdentity);
+  images.release();
+  const TargetWeights target = loadTarget(backend, images, root, descriptor,
+                                          {.streamedTableBytes = streamedTableBytes, .readers = std::move(readers)});
+  return std::visit(
+      [&](const auto &weights) { return qwenTargetGeometry(weights, descriptor.draft.targetLayerIds()); }, target);
+}
+
+LoadedModel loadModel(metal::MetalBackend &backend,
+                              const std::filesystem::path &root,
+                              const ModelDescriptor &descriptor,
+                              const ModelLoadOptions &options) {
+  LoadedModel result;
+  result.descriptor = descriptor;
+  if (!result.descriptor.valid())
+    throw std::invalid_argument("model descriptor is invalid");
+  result.images = std::make_shared<WeightImages>(backend, result.descriptor.sourceIdentity);
+  WeightImages &images = *result.images;
+  // Every source's metadata is checked before the first image is written:
+  // the vision tower's and the draft's here, the target's by its loader.
+  const auto vision = planVisionLoader(root, result.descriptor);
+  DraftCheckpointLoader draft(backend, images, root / "draft", result.descriptor.draft);
+  result.target = loadTarget(backend, images, root, result.descriptor, options);
   result.draft = loadDFlashDraftWeights(backend, draft, result.descriptor.draft);
   result.vision = loadVisionWeights(backend, images, vision.get());
 

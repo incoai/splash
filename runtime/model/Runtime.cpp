@@ -3773,15 +3773,34 @@ void withPrefillArena(
   use(buffers.ffn(), buffers.hidden);
 }
 
+namespace {
+
+// The lane state of a model of `descriptor` in `stateFormat` and the arenas
+// of `geometry`.
+ModelMemoryPlan memoryPlanOf(const ModelDescriptor &descriptor, ops::GdnStateFormat stateFormat,
+                             const RuntimeGeometry &geometry, const ops::ExecutionPlans &operators) {
+  CompositeStateLayout states = descriptor.stateLayout;
+  states.target.format = stateFormat;
+  return {states.laneBytes(), plannedPrefillBytes(geometry, operators), plannedDecodeBytes(geometry, operators)};
+}
+
+} // namespace
+
 ModelMemoryPlan plannedRuntimeMemory(const LoadedModel &model,
                                      const ops::ExecutionPlans &operators,
                                      kv::Format kvFormat,
                                      ops::GdnStateFormat stateFormat, StreamedParts parts) {
   requireCompatibleModel(model);
-  const RuntimeGeometry geometry = RuntimeGeometry::from(model, kvFormat, stateFormat, parts);
-  return {model.stateLayout(stateFormat).laneBytes(),
-          plannedPrefillBytes(geometry, operators),
-          plannedDecodeBytes(geometry, operators)};
+  return memoryPlanOf(model.descriptor, stateFormat, RuntimeGeometry::from(model, kvFormat, stateFormat, parts),
+                      operators);
+}
+
+ModelMemoryPlan plannedRuntimeMemory(const ModelDescriptor &descriptor, const QwenTargetGeometry &target,
+                                     const ops::ExecutionPlans &operators, kv::Format kvFormat,
+                                     ops::GdnStateFormat stateFormat, StreamedParts parts) {
+  return memoryPlanOf(
+      descriptor, stateFormat,
+      RuntimeGeometry::from(descriptor, descriptor.draft, target, kvFormat, stateFormat, parts), operators);
 }
 
 bool budgetsVerifyRows(const LoadedModel &model, VerifyRows rows) noexcept {

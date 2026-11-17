@@ -78,12 +78,17 @@ struct PassProgress final {
 // them back this tick), the shapes of the resident prefill lanes and, for
 // admission, of the candidates, the command between its passes, if any,
 // and, for admission, the admitted requests that restore their prefix from
-// the SSD cache before they run, each from the boundary it restores to.
+// the SSD cache before they run, each from the boundary it restores to;
+// then which of the lanes left out wait for memory on its way back, and the
+// time now, by which a prefill unit waits for decoders among them
+// (waitsUntil).
 struct PlanInputs final {
   std::span<const uint64_t> excluded;
   std::span<const LaneShape> shapes;
   const PassProgress *passes = nullptr;
   std::span<const PrefillAdmission> restoring;
+  std::span<const uint64_t> landing;
+  double now = 0.0;
 };
 
 struct SchedulerSnapshot final {
@@ -180,8 +185,24 @@ public:
   // The next command, planned without the excluded lanes. While a command is
   // between its passes (in.passes), that is its next pass or decode, as its
   // priority and the decode share order them, or a prefill plan of a higher
-  // priority.
+  // priority. None while the next prefill unit waits for a decoder whose
+  // memory lands (waitsUntil).
   [[nodiscard]] std::optional<BatchPlan> next(const PlanInputs &in) const;
+  // When the wait ends for which next() plans nothing: the next prefill
+  // unit's for a decoder of its priority or a higher one, among in.landing,
+  // that has not decoded since the last prefill unit began, whose gap the
+  // unit would hold a second unit of. It waits only while the prefill owes
+  // decode time, and at most until the last unit has ended for as long as it
+  // took, or for the decode gap target where it took longer (complete). None
+  // where no unit waits: no lane left to wait or to wait for, a decoder that
+  // can run, or that time past.
+  [[nodiscard]] std::optional<double> waitsUntil(const PlanInputs &in) const;
+  // The next prefill unit waited `milliseconds` for such a decoder
+  // (waitsUntil), a wait now over: it works the prefill's debt off, as that
+  // decoder's decode would have. Told once the wait has ended, the debt
+  // stands through it: the unit waits its time out, past the debt too, and
+  // the decoder whose memory lands in it runs first.
+  void waited(double milliseconds) noexcept;
   // Whether `plan` is a prefill plan other than the next pass of the command
   // between its passes, which is abandoned before it commits.
   [[nodiscard]] bool abandonsPasses(const BatchPlan &plan, const PlanInputs &in) const;
@@ -196,9 +217,11 @@ public:
   void commit(const BatchPlan &plan, const PlanInputs &in);
   // A pass before the command's last consumes no rows and ends no lane. A
   // timed command's last pass leaves its rows' time over its passes, image
-  // encodes left out, for the next commands to be sized from.
+  // encodes left out, for the next commands to be sized from. A prefill
+  // unit, ended at `now`, bounds the next unit's wait for decoders whose
+  // memory lands (waitsUntil).
   void complete(const BatchPlan &plan, std::span<const StepResult> results,
-                const model::CommandSample &sample);
+                const model::CommandSample &sample, double now);
   // The pass after `plan`, a completed pass before its command's last: it
   // runs from the layer `plan` ended at. Once a pass of the command ran its
   // heaviest attention layer, the layers left are split again into the
@@ -311,6 +334,9 @@ private:
   [[nodiscard]] std::optional<Planned> planPrefill(std::vector<Lane> ready) const;
   [[nodiscard]] std::optional<BatchPlan> nextPrefill(const PlanInputs &in) const;
   [[nodiscard]] std::optional<BatchPlan> nextDecode(std::span<const uint64_t> excluded) const;
+  // When `prefill`, which runs as no decode can, stops waiting for decoders
+  // whose memory lands; none where it does not wait (waitsUntil).
+  [[nodiscard]] std::optional<double> waitsForDecoders(const BatchPlan &prefill, const PlanInputs &in) const;
   // Debt is owed only to requests that decode or wait for a mask: once the
   // last one leaves, a later decoder starts without it.
   void dropStaleDecodeDebt() noexcept;
@@ -334,8 +360,17 @@ private:
   double decodeShare_;
   // Decode time that prefill still owes the lanes that decoded beside it
   // (not those waiting for a mask): equal-priority decode runs until its
-  // commands' wall time has worked it off.
+  // commands' wall time, and the time the next prefill unit waited for
+  // decoders whose memory lands (waited), have worked it off.
   double decodeDebtMilliseconds_ = 0.0;
+  // When the next prefill unit's wait for decoders whose memory lands ends at
+  // the latest: the end of the last prefill unit and the time it took, at
+  // most the decode gap target (complete). A time, set as that unit ends, so
+  // the wait ends by itself, and once for a unit.
+  double waitEndMilliseconds_ = 0.0;
+  // The decode dispatch order when the last prefill unit committed: a lane
+  // whose last decode dispatch is no later has not decoded since.
+  uint64_t prefillDispatchOrder_ = 0;
   std::optional<WorkKind> lastCommittedKind_;
   // A prefill command as it ran: its rows, the attention pairs of its
   // heaviest layer, its rows' time over its passes and in its heaviest, and

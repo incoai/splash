@@ -74,20 +74,33 @@ struct RuntimeGeometry final {
   }
   [[nodiscard]] static RuntimeGeometry from(const LoadedModel &model, kv::Format kvFormat,
                                             ops::GdnStateFormat stateFormat, StreamedParts parts) {
+    const DFlashDraftLayout &draft = model.draft.layout;
+    return from(model.descriptor, draft,
+                std::visit([&](const auto &weights) { return qwenTargetGeometry(weights, draft.targetLayerIds()); },
+                           model.target),
+                kvFormat, stateFormat, parts);
+  }
+  // The geometry of a model of `descriptor` whose draft is of `draft` and
+  // whose target's weights give `target` (qwenTargetGeometry, as they loaded
+  // or as their files plan them, plannedTargetGeometry), with `parts`
+  // streaming.
+  [[nodiscard]] static RuntimeGeometry from(const ModelDescriptor &descriptor, const DFlashDraftLayout &draft,
+                                            QwenTargetGeometry target, kv::Format kvFormat,
+                                            ops::GdnStateFormat stateFormat, StreamedParts parts) {
     RuntimeGeometry result;
-    result.draft = model.draft.layout;
-    result.target = std::visit(
-        [&](const auto &weights) { return qwenTargetGeometry(weights, result.draft.targetLayerIds()); },
-        model.target);
-    result.target.kvLayout = model.targetKvLayout(kvFormat);
-    result.target.stateLayout = model.stateLayout(stateFormat).target;
-    result.target.ropeScaling = model.descriptor.ropeScaling;
-    if (parts.kv) result.spilledKv = model.descriptor.capabilities.sparseKv;
+    result.draft = draft;
+    result.target = std::move(target);
+    result.target.kvLayout = descriptor.targetKvLayout;
+    result.target.kvLayout.format = kvFormat;
+    result.target.stateLayout = descriptor.stateLayout.target;
+    result.target.stateLayout.format = stateFormat;
+    result.target.ropeScaling = descriptor.ropeScaling;
+    if (parts.kv) result.spilledKv = descriptor.capabilities.sparseKv;
     result.streamedExperts = parts.experts;
     if (parts.experts || parts.kv) result.prefillChunks = kPrefillGroupChunks;
     if (!result.target.valid() || !result.draft.stateLayout().valid() ||
         (parts.kv && !result.target.kvLayout.spillable()) ||
-        result.target.contextTokens() != model.descriptor.capabilities.maximumContextTokens ||
+        result.target.contextTokens() != descriptor.capabilities.maximumContextTokens ||
         result.target.hiddenSize != result.draft.hiddenSize ||
         result.target.vocabularySize != result.draft.vocabularySize ||
         result.target.capturedHiddenSize() != result.draft.targetHiddenSize()) {
@@ -95,10 +108,10 @@ struct RuntimeGeometry final {
     }
     // Sized from the geometry, once it is valid.
     result.targetScratch = std::visit(
-        [&](const auto &weights) {
-          return qwenTargetScratchBytes(weights, result.target, result.prefillChunks, parts.tableRowBytes);
+        [&](const auto &layout) {
+          return qwenTargetScratchBytes(layout, result.target, result.prefillChunks, parts.tableRowBytes);
         },
-        model.target);
+        descriptor.target);
     return result;
   }
 

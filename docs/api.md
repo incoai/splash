@@ -81,7 +81,15 @@ in `reasoning_content`, beside `content`, in the message and in each stream
 delta, and an assistant message sent back may carry its `reasoning_content`
 (or `reasoning` text). Message content may hold Responses' `input_text`,
 `output_text` and `input_image` parts too, and a `refusal` part, an assistant's
-refusal, is text. A history tool call whose `arguments` are not a JSON object,
+refusal, is text. What a request sends is text to the model, never one of its
+control tokens: a `<tool_call>`, `<think>` or `<|im_end|>` that a message, a
+tool result, a call or a tool definition spells reaches the model as those
+characters, in every API, and so does one that a text only begins, such as a
+call's name ending in `<|im_end|` before the `>` the template writes after it
+([tokenizer and chat templates](models.md#tokenizer-and-chat-templates)). A
+U+0000 in any of them reaches the model as U+FFFD, as a lone surrogate does: a
+template may delete the character, and with it what kept a tag apart. A
+history tool call whose `arguments` are not a JSON object,
 such as one the output limit cut, is kept as text, so the conversation
 continues. `n` other than 1 and `logprobs: true` return 400.
 
@@ -123,10 +131,11 @@ found; a system message's `tool_addition` and `tool_removal` blocks change
 them in order: a `tool_definition` adds a tool or replaces the one of its name,
 and a removed tool is left out until a later block adds it again),
 `tool_choice` (`auto`, `any`, `tool` or `none`, with
-`disable_parallel_tool_use`), `stop_sequences`, `temperature`, `top_p`, `top_k`,
-`thinking`, `output_config` and Chat's `chat_template_kwargs`, whose
-`enable_thinking` outranks `thinking`. Otherwise a request reasons only when
-`thinking` sets it: `{"type": "enabled", "budget_tokens": N}` and
+`disable_parallel_tool_use`), `stop_sequences`, the [sampling](#sampling)
+fields, of which Anthropic defines `temperature`, `top_p` and `top_k`, Chat's
+`ignore_eos`, `thinking`, `output_config` and Chat's `chat_template_kwargs`,
+whose `enable_thinking` outranks `thinking`. Otherwise a request reasons only
+when `thinking` sets it: `{"type": "enabled", "budget_tokens": N}` and
 `{"type": "adaptive"}` reason at `output_config.effort`, one of `low`, `medium`,
 `high` (the default), `xhigh` and `max`, while `{"type": "disabled"}` and an
 omitted `thinking` do not. Enabled thinking requires `budget_tokens`, an integer
@@ -149,6 +158,9 @@ Splash makes no other edit, so the model reads the conversation as sent.
 and returns `{"prompt":"..."}` using the same template as generation.
 `add_generation_prompt` defaults to true. Image prompts retain textual placeholders;
 raw tokenization does not account for image embeddings (use `count_tokens` for that).
+Nor does it tell a tag a message quotes, which the prompt encodes as text, from
+the template's own: `/tokenize` reads both as the token, so the tokens of a
+returned prompt are the request's only where it quotes none.
 Both endpoints run without inference and share bounded preparation capacity with
 `count_tokens`; they can inspect prompts larger than the serving context limit.
 
@@ -217,14 +229,15 @@ the connections it holds cannot exhaust it.
 
 ## Sampling
 
-Chat, text completions and Responses sample with `temperature` (default 1.0, in
-[0, 2]), `top_p` (0.95), `top_k` (20, a positive integer, 0 or -1), `min_p` (0,
-in [0, 1]), `presence_penalty` and `frequency_penalty` (0, in [-2, 2]) and
-`repetition_penalty` (1, positive). The defaults of `temperature`, `top_p` and
-`top_k` are the ones the served model's family publishes (Qwen's, and the same
-numbers in Flint's GGUF release); the publishers set no penalties, so Qwen's
-recommended `presence_penalty` of 1.5 for non-thinking use must be sent
-explicitly. Each field that is out of range returns 400 naming it. As in vLLM, a
+Chat, text completions, Responses and Messages sample with `temperature`
+(default 1.0, in [0, 2]), `top_p` (0.95), `top_k` (20, a positive integer, 0 or
+-1), `min_p` (0, in [0, 1]), `presence_penalty` and `frequency_penalty` (0, in
+[-2, 2]) and `repetition_penalty` (1, positive). The defaults of `temperature`,
+`top_p` and `top_k` are the ones the served model's family publishes (Qwen's,
+and the same numbers in Flint's GGUF release); the publishers set no
+penalties, so Qwen's recommended `presence_penalty` of 1.5 for non-thinking use
+must be sent explicitly. Each field that is out of range returns 400 naming it,
+on every route. As in vLLM, a
 nonzero temperature below 0.01 samples at 0.01, and the penalties rewrite the
 raw logits before temperature, for greedy requests too: repetition divides a
 positive logit and multiplies a negative one for every token of the prompt or of
@@ -238,7 +251,9 @@ the Qwen templates that includes the tool-call syntax every tool-enabled system
 prompt carries, earlier tool calls and reasoning, and the `<think>` markers of
 the generation prompt, so a `repetition_penalty` above 1 can delay tool calls
 and the end of reasoning and change names copied from the context. Anthropic
-Messages defines no penalties and no `min_p`.
+defines no penalties and no `min_p` for Messages; Splash's Messages takes
+them and `logit_bias` as Chat does, with the same 400 for a bad value, so that
+a client whose requests go only to Messages can set them too.
 
 In vLLM's order, after temperature `min_p` first drops every token less
 likely than `min_p` times the most likely one, `top_k` then keeps the most
@@ -323,10 +338,11 @@ of a long request's KV ([KV on the SSD](server.md#kv-on-the-ssd)). An
 invalid value returns 400 naming the field the request sent. Messages refuses
 a final assistant message (prefill) with 400; `count_tokens` still counts it.
 
-Chat and text completions accept `"ignore_eos":true` (default false), as vLLM
-and llama.cpp do: the model never selects its own stop tokens, and a draft
-proposal of one is rejected, so generation runs to its output budget and
-finishes with `length` unless a `stop` string ends it first. Benchmarks use it
+Chat, text completions, Responses and Messages accept `"ignore_eos":true`
+(default false), as vLLM and llama.cpp do: the model never selects its own
+stop tokens, and a draft proposal of one is rejected, so generation runs to its
+output budget and finishes with `length` (Messages' `max_tokens`) unless a stop
+string ends it first. Benchmarks use it
 to generate a fixed number of tokens. Constrained tool calls, output under
 `tool_choice: "none"` and structured output generate under a grammar, which
 decides where the output ends, so combining them with `ignore_eos` returns 400.
@@ -521,6 +537,14 @@ reference a remote document, and cannot combine `unevaluatedProperties` with
 final output; it does not inject formatting instructions into the prompt.
 Clients should describe their output requirements in their own messages.
 
+The JSON is the answer's first token where no reasoning comes before it, so a
+small output limit is spent on the value; after reasoning, up to 64 whitespace
+characters may set it apart, as the template's blank line after `</think>`
+does. Between the value's own tokens the model may write up to 64 whitespace
+characters, which takes pretty printing 15 levels deep at four spaces;
+whitespace inside strings is content and unbounded. A required or named tool
+call starts the same way.
+
 ## Images and PDFs
 
 Images arrive inline as base64 `data:` URLs: Chat `image_url` parts, Responses
@@ -624,8 +648,9 @@ an empty think block, `<think></think>`, and the answer slots are read after it,
 where its answer starts. Besides the row it takes `model`, `timeout`,
 `priority` and `cache_salt` as the generation APIs do ([request
 fields](#request-fields)); other generation controls return errors rather than
-silently changing the scoring protocol. SemIf-derived code retains its MIT
-notice in `server/dialects/scoring.py`.
+silently changing the scoring protocol. A row's text is text to the model, as a
+message's is: evidence that spells `<|im_end|>` ends no turn. SemIf-derived code
+retains its MIT notice in `server/dialects/scoring.py`.
 
 `POST /v1/systemone` requires the served `model`, a string/object/array `state`,
 and a nonempty `questions` map, and takes `cache_salt` as the generation APIs
@@ -676,6 +701,7 @@ fields; additional fields may be added:
 | `streamed_table` | While the PLE table streams, the [streamed PLE table](server.md#ple-table-streaming)'s cache, stages, reads and prefetches; `null` otherwise |
 | `streamed_experts` | While routed experts stream, the [streamed experts](server.md#streamed-experts)' store: its bytes at its cap and floor, its live chunks and those at the cap, the chunks it gave back and took back, its live chunks' bytes and slots and its resident experts, per use its loads, reads, read-ahead and host-step round trips, and its failure; `null` otherwise |
 | `kv_spill` | While a block-sparse target's KV can go to the SSD, its [KV on the SSD](server.md#kv-on-the-ssd): the requests that started in each mode, converted to `spill`, had their output bounded (once per request, at its start or a resume) or ended at that bound (and of those, the converted ones: `converted_bounded`, `converted_length_ends`), and were refused for the quota, the write budget or a closed tier, and the starts waiting for the quota (`requests`); the pages that hold only their index and those whose KV is on the SSD; the write-through of spilling requests' pages; page moves (`spill_moves`), and of those the releases that gave a spilling request's pages' memory back for a claim and their pages (`releases`, `released_pages`); rewrites and restores; the quota of KV in service; the hot block cache's memory, hits, reads and host steps (`block_cache`; `read` over `resolves` is the blocks a layer's step missed on average) and the history streams' reads, how long each layer's took (`read_ms`, whose total gives with `bytes` the streams' bandwidth) and staging (`history_stream`); absent for a target whose KV stays in memory, whose plan's `memory_plan.budget.kv_spill` is `null` |
+| `disk.written_last_hour_bytes`, `written_last_day_bytes` | The [SSD cache](server.md#ssd-cache)'s write rate: the bytes its writes took over the last hour and the last day the Mac was awake, in the host pages each write stores, as `--max-cache-disk-writes` counts them, with a write budget or without. Each window ends now and is exact to a minute; an engine that started less than an hour or a day ago has written all of its count |
 | `disk.write_behind.waiting`, `durable`, `unneeded`, `refused` | The restore points the [SSD cache](server.md#ssd-cache) copies ahead: those queued for their copies, the one being copied among them (`waiting`), and since engine start those copied (`durable`), gone on from first (`unneeded`) and not copied for want of room or a file that takes writes (`refused`). An idle engine can report points waiting. Without `--persistent-cache` a point is copied only while a reclaim has reached cached KV or a state with no copy on the SSD within the last minute, 10 s after its publication once its request has ended; otherwise it waits for memory to run short, which may never happen, and is not work the engine owes. With it each point is written once it falls due, 10 s after its publication at the earliest, and at a clean stop (up to 6 s), so there `waiting` is SSD work still to come and drains by itself |
 | `kv.window` | For a target with sliding-window layers, its [windows](internals.md#sliding-windows): the `window_pages` a row's window and a state's tail keep Full, whether pages past every window give up their windowed layers' K/V (`trim`, off with the native `--kv-window-trim off`), the pool's `full_pages` and `slim_pages` in use and the Slim extents' `slim_bytes`, the `pinned_blocks` states' tails hold, the `trimmed_pages` since engine start, the `upgrades` of blocks that took the page of a writer that computed them again, and the `refused_states` whose tail was not Full; absent for other targets |
 | `memory_plan.budget.kv_window` | For a target whose pages give up a window's layers, a Slim page's `slim_page_bytes` and the `floor_pages` a lane keeps Full, by which one request's KV capacity is counted; absent for other targets |
@@ -704,7 +730,8 @@ fields; additional fields may be added:
 | `maximum_context_tokens` | Declared context limit; available memory may limit admission |
 | `thermal_state` | The Mac's thermal state as macOS reports it: `nominal`, `fair`, `serious` or `critical`. As the Mac heats, its CPU and GPU clocks drop and prefill and decode slow down, on some Macs already at `fair`; readiness ignores it. The engine samples it twice a second and logs each change (`Thermal state: fair → serious`) |
 | `vision`, `input_modalities` | Whether image and PDF input is accepted; `false` and `["text"]` for a model serving without vision |
-| `reasoning_switch` | Whether a request's reasoning effort or `enable_thinking` turns the model's reasoning on and off ([default reasoning effort](server.md#default-reasoning-effort)): `true` for the Qwen families, `false` for Flint, whose model decides each turn |
+| `reasoning_switch` | Whether a request's reasoning effort or `enable_thinking` turns the model's reasoning on and off ([default reasoning effort](server.md#default-reasoning-effort)): `true` for the Qwen families, `false` for Flint, whose model decides each turn, and under `--reasoning-effort`, where the server sets every request's effort |
+| `reasoning_effort` | The effort `--reasoning-effort` gives every request, whatever it asks; `null` without the option |
 | `chat_template.later_system` | `native`, `patched` or `unsupported`: how system messages after the first render (per name for named templates) |
 | `transport.recovering`, `transport.stopped`, `transport.error` | The engine is restarting, or Splash stopped restarting it after a failure a restart would meet again, or after 6 failures in a row, and the server is exiting ([engine restarts](server.md#engine-restarts-and-sleep)); `error` names its failure, the last failed restart, or why restarts stopped |
 | `capabilities.max_context_tokens` | The context the server serves now: the latest engine's, which a restart whose plan holds less may lower until a later one regains it |
@@ -721,7 +748,8 @@ until the pressure lifts.
 `GET /metrics` exports in Prometheus text format the `requests`,
 `memory_actual` and `metrics` fields above, the status's scheduler, KV, cache,
 admission and image counts, the SSD cache's quota, limit, use, volume space,
-write budget, what holds its writes back and the bytes it read and wrote, and
+write budget, what holds its writes back, the bytes it read and wrote and those
+it wrote over the last hour and day, and
 readiness, memory pressure and thermal state. It also exports the decode gaps,
 the scheduler's gap target, contended prefill units, bound cuts, index page
 conflicts and replans, the memory ledger's owed and claimed bytes and per account
@@ -761,11 +789,12 @@ cannot avoid model prefill.
 
 Exact-prefix caching reuses model work while the server runs, and across
 restarts with `--persistent-cache` ([persistent cache](server.md#persistent-cache)).
-Text requests also reuse tokenized history at literal message-end boundaries
-when the tokenizer supports independent encoding there. This process-local cache
-retains the newest prefix of up to sixteen conversations, in storage sized for
-four prompts of the served context however Python stores their text (24 bytes a
-token); it falls back to full encoding for other tokenizer pipelines.
+Chat requests also reuse tokenized history at literal message-end boundaries,
+with images and with tags a message quotes as without, where the family's
+boundary is one added token of the tokenizer and no other holds it. This
+process-local cache retains the newest prefix of up to sixteen conversations,
+in storage sized for four prompts of the served context however Python stores
+their text (24 bytes a token).
 `/status.tokenizer_cache` reports its usage: `hits` and `misses` count the
 prompts long enough to look up (4,096 characters through their last message
 end) that found a cached prefix and that did not, and `evictions` the prefixes

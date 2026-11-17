@@ -5,7 +5,7 @@ import UniformTypeIdentifiers
 
 /// The message being written: its text and what is attached to it, kept as files in the store's
 /// attachments folder as it attaches (`ChatStore.attachments`), which become the message's once it
-/// is sent; one taken off goes.
+/// is taken; one taken off goes.
 @MainActor @Observable
 final class Draft {
     var text = "" {
@@ -22,8 +22,10 @@ final class Draft {
     /// Asks the text field for the keyboard; counts the requests.
     private(set) var focusRequests = 0
     /// What the composer says over the message, in the chat it is about, until the draft changes
-    /// or is sent: why the server refused what the draft holds again or a reply asked again
-    /// (`restore`), or a file that couldn't be attached.
+    /// or its message is taken: why the server refused what the draft holds or a reply asked
+    /// again (`restore`), or a file that couldn't be attached. A message sent again says it until
+    /// the server answers, rather than taking it away for the frames a refusal takes to say it
+    /// again.
     private(set) var notice: Notice?
 
     struct Notice: Equatable {
@@ -120,27 +122,32 @@ final class Draft {
         Task.detached { try? FileManager.default.removeItem(at: file) }
     }
 
-    /// Takes the message, leaving the draft empty; its attachments' files are the message's.
-    func take() -> (text: String, attachments: [Attachment]) {
-        defer {
-            text = ""
-            attachments = []
-            thumbnails = [:]
-            notice = nil
-        }
-        return (text.trimmingCharacters(in: .whitespacesAndNewlines), attachments)
+    /// The message as it is sent: the text without the space around it, and what is attached.
+    var message: (text: String, attachments: [Attachment]) {
+        (text.trimmingCharacters(in: .whitespacesAndNewlines), attachments)
     }
 
-    /// Takes back `refused`, what the server didn't take, with why, in its chat: its text before
-    /// what was typed since, a blank line apart, and its attachments before those attached since.
+    /// Takes the message out, leaving the draft empty: it is its conversation's from then on
+    /// (`AppState.sendDraft`), and its attachments' files with it.
+    func take() {
+        text = ""
+        attachments = []
+        thumbnails = [:]
+        notice = nil
+    }
+
+    /// Takes back `refused`, what a request that came to nothing gives back, in its chat: the
+    /// text the draft gave up before what was typed since, a blank line apart, its attachments
+    /// before those attached since, and why, where there is a why.
     func restore(_ refused: ChatStore.Refused) {
-        let typed = text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "" : text
-        text = [refused.text, typed].filter { !$0.isEmpty }.joined(separator: "\n\n")
+        if !refused.text.isEmpty {
+            text = text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? refused.text : "\(refused.text)\n\n\(text)"
+        }
         attachments.insert(contentsOf: refused.attachments, at: 0)
         for attachment in refused.attachments where attachment.kind == .image {
             thumbnails[attachment.id] = NSImage(contentsOf: files.appending(path: attachment.file))
         }
-        notice = Notice(text: refused.reason, conversation: refused.conversation)
+        notice = refused.reason.map { Notice(text: $0, conversation: refused.conversation) }
         focus()
     }
 
@@ -170,7 +177,13 @@ final class Draft {
 
 /// Where a message is written: the text and the images attached; under them what the Server runs,
 /// how much of the model's context the next prompt takes, how much the model thinks, and Send, or
-/// Stop while a reply streams.
+/// Stop while the open chat's request is under way. While the server has yet to take a new chat's
+/// first message (`AppState.sendDraft`), the composer holds the message as it was sent: its text
+/// and attachments stay and take no change, by typing, pasting, dropping or their buttons, so that
+/// what the chat opens with, or a refusal leaves, is what was sent, and an attachment's file is
+/// there for the request to read; Stop gives the message back to edit. The composer looks as it
+/// did, but for Stop: dimmed meanwhile, its controls would blink at each message the server takes
+/// or refuses at once.
 struct Composer: View {
     @Environment(AppState.self) private var state
     @Environment(\.colorScheme) private var colorScheme
@@ -179,8 +192,11 @@ struct Composer: View {
 
     var body: some View {
         let images = state.server.acceptsImages
+        let held = state.chats.sendingFirstMessage
+        // The line that says why, in the chat it is about.
+        let notice = draft.notice.flatMap { $0.conversation == state.chats.selection ? $0 : nil }
         VStack(alignment: .leading, spacing: 10) {
-            if let notice = draft.notice, notice.conversation == state.chats.selection {
+            if let notice {
                 // As a reply says why it stopped short.
                 Label {
                     Text(notice.text).foregroundStyle(.secondary)
@@ -190,19 +206,20 @@ struct Composer: View {
                 .font(.system(size: 12))
             }
             if !draft.attachments.isEmpty {
-                Attachments(draft: draft)
+                Attachments(draft: draft, held: held)
             }
             ComposerField(text: $draft.text, focusRequests: draft.focusRequests,
-                          yields: state.terminalShows,
-                          placeholder: "Message Splash", submit: state.sendDraft, cancel: stop, acceptsImages: images,
+                          yields: state.terminalShows, held: held,
+                          placeholder: "Message Splash", submit: state.sendDraft, cancel: stop, acceptsImages: images && !held,
                           attach: { draft.attach($0, unreadable: $1) }, attachPDFs: { draft.attach(pdfs: $0) })
+                .alignmentGuide(.composerPlain) { $0[.top] - Self.inset }
             // As the server's stage changes them (`MainView`), a control that goes goes at once, and
             // one that comes fades in once those beside it have moved, as a row of a page does: as
             // a switch began, the model's words slid over Attach Images fading out.
             HStack(spacing: 6) {
                 // Only for a model that sees images and reads PDFs.
                 if images {
-                    Button { picking = true } label: { Image(systemName: "plus") }
+                    Button { if !held { picking = true } } label: { Image(systemName: "plus") }
                         .foregroundStyle(.secondary)
                         .help("Attach Images or PDFs")
                         .accessibilityLabel("Attach Images or PDFs")
@@ -235,11 +252,19 @@ struct Composer: View {
             .animation(Motion.settle, value: state.showsContext)
         }
         .padding(.horizontal, 16)
-        .padding(.vertical, 12)
+        .padding(.vertical, Self.inset)
         .background(colorScheme == .dark ? AnyShapeStyle(.fill.tertiary) : AnyShapeStyle(.background),
                     in: .rect(cornerRadius: 22))
         .overlay { RoundedRectangle(cornerRadius: 22).strokeBorder(.separator) }
         .shadow(color: .black.opacity(0.06), radius: 14, y: 4)
+        .alignmentGuide(.composerTop) { $0[.top] }
+        // What it holds comes and goes at once, and its height with it, whatever else moves: as it
+        // travels between a new chat and a conversation, it is as tall as what it holds then, and
+        // what it holds travels with it. Coming once it had moved, the line that says why left an
+        // empty row as the composer travelled to a new chat opened again, 25 points over its text.
+        .transaction(value: Contents(text: draft.text, attachments: draft.attachments.map(\.id), notice: notice)) {
+            $0.animation = nil
+        }
         .fileImporter(isPresented: $picking, allowedContentTypes: [.image, .pdf], allowsMultipleSelection: true) { result in
             let urls = (try? result.get()) ?? []
             let pdfs = urls.filter { UTType(filenameExtension: $0.pathExtension)?.conforms(to: .pdf) == true }
@@ -256,10 +281,20 @@ struct Composer: View {
         .onChange(of: state.chats.selection, initial: true) { _, open in draft.conversation = open }
     }
 
-    /// Whether the open conversation's reply streams.
-    private var streaming: Bool {
-        state.chats.streaming != nil && state.chats.streaming == state.chats.current?.id
+    /// The room the composer leaves over what it holds and under its controls: over its text
+    /// where nothing is over it (`VerticalAlignment.composerPlain`). No actor's: the guide reads
+    /// it as SwiftUI computes it, which need not be on the main actor.
+    private nonisolated static let inset: CGFloat = 12
+
+    /// What the composer holds, which it takes at once.
+    private struct Contents: Equatable {
+        let text: String
+        let attachments: [UUID]
+        let notice: Draft.Notice?
     }
+
+    /// Whether the open chat's request is under way, which Stop stops.
+    private var streaming: Bool { state.chats.answering }
 
     private var help: String {
         if !state.server.answers { return "Available once a model is running" }
@@ -273,7 +308,7 @@ struct Composer: View {
         return "Send"
     }
 
-    /// Stops the open conversation's reply, the way Escape cancels; false when none streams.
+    /// Stops the open chat's request, the way Escape cancels; false when none is under way.
     private func stop() -> Bool {
         guard streaming else { return false }
         state.chats.stop()
@@ -459,13 +494,14 @@ private struct EffortMenu: View {
     }
 }
 
-/// What is attached to a draft, each with a button that takes it off: an image as itself, a PDF as
-/// its name and pages, in red where the model's limits leave it out. Each has a hairline, so that
-/// a white one keeps its edge on the composer, and its button a solid disc, which stands out over
-/// any image in either appearance.
+/// What is attached to a draft, each with a button that takes it off, unless the message is held
+/// as it was sent (`Composer`): an image as itself, a PDF as its name and pages, in red where the
+/// model's limits leave it out. Each has a hairline, so that a white one keeps its edge on the
+/// composer, and its button a solid disc, which stands out over any image in either appearance.
 private struct Attachments: View {
     @Environment(AppState.self) private var state
     let draft: Draft
+    let held: Bool
 
     var body: some View {
         ScrollView(.horizontal, showsIndicators: false) {
@@ -484,7 +520,7 @@ private struct Attachments: View {
                         }
                         .clipShape(.rect(cornerRadius: 10))
                         .overlay { RoundedRectangle(cornerRadius: 10).strokeBorder(.separator) }
-                        Button { draft.remove(at: index) } label: {
+                        Button { if !held { draft.remove(at: index) } } label: {
                             Image(systemName: "xmark.circle.fill")
                                 .symbolRenderingMode(.palette)
                                 .foregroundStyle(.white, .black.opacity(0.6))
@@ -531,10 +567,13 @@ private struct ComposerField: NSViewRepresentable {
     /// Whether a terminal of the drawer shows, which keeps the keyboard as the field shows
     /// (`AppState.terminalShows`).
     let yields: Bool
+    /// Whether the text is held as it was sent (`Composer`): it takes no edit, and keeps the
+    /// keyboard, so that Escape stops the request.
+    let held: Bool
     let placeholder: String
     let submit: () -> Void
     let cancel: () -> Bool
-    /// Whether the model takes images and PDFs.
+    /// Whether images and PDFs attach: the model takes them, and the message is not held.
     let acceptsImages: Bool
     /// Takes images, and how many of those chosen could not be read.
     let attach: ([NSImage], Int) -> Void
@@ -631,6 +670,10 @@ private struct ComposerField: NSViewRepresentable {
             guard let view = notification.object as? NSTextView else { return }
             published = view.string
             field.text = view.string
+        }
+
+        func textView(_ view: NSTextView, shouldChangeTextIn range: NSRange, replacementString: String?) -> Bool {
+            !field.held
         }
 
         func textView(_ view: NSTextView, doCommandBy selector: Selector) -> Bool {

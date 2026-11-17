@@ -14,6 +14,7 @@ from llguidance.numpy import (
 from .chat_format import THINK_END, THINK_START, TOOL_CALL_OPEN
 from .errors import APIError, ConstraintError
 from .lru import LRUCache
+from .tokenization import added_tokens
 
 
 class TokenConstraint:
@@ -113,7 +114,14 @@ def validate_tokenizer(tokenizer, chat_format):
     the close of thinking, the model's own opening of it where the model
     opens it, and a call's opening must each be the format's token, and
     each stop text one token (check_capabilities checks which stop tokens,
-    once the engine names them)."""
+    once the engine names them). Refuse too one whose added tokens the
+    server could not keep out of the text a client sent
+    (tokenization.added_tokens), which would serve a prompt that quotes a tag
+    with the tag as its control token."""
+    try:
+        added_tokens(tokenizer)
+    except ValueError as error:
+        raise TokenizerContractError(str(error)) from None
     vocabulary = tokenizer.get_vocab()
     expected = {
         THINK_END: chat_format.think_end_id,

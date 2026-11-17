@@ -192,7 +192,7 @@ std::unique_ptr<StateOffload> QwenCompositeState::write(
     const std::shared_ptr<SlotFile> &file, const std::shared_ptr<StateStaging> &staging,
     const std::vector<std::span<std::byte>> &spans, CompositeStateLayout layout,
     QwenLogicalLengths lengths, std::function<void()> completion) {
-  auto disk = file->acquire();
+  auto disk = file->acquire(layout.cachedBytes());
   if (!disk) return {};
   auto result = std::shared_ptr<const QwenCompositeState>(
       new QwenCompositeState(layout, lengths, file, disk));
@@ -222,7 +222,7 @@ QwenCompositeState::persist(std::function<void()> completion) const {
   // As for offload().
   if (!canOffload(true))
     return {};
-  auto disk = file_->acquire();
+  auto disk = file_->acquire(layout_.cachedBytes());
   if (!disk)
     return {};
   auto copy = std::shared_ptr<const CompositeState>(

@@ -151,11 +151,11 @@ public:
   void holdPage(uint32_t page);
   void unholdPage(uint32_t page);
   [[nodiscard]] bool held(uint64_t blockId) const;
-  // Held blocks whose K/V has a copy (kvCopied): the copies of active KV
-  // (model::DiskBudget::commit), each once however many requests hold its
-  // block. A copy of another command's K/V beside a held page is a cached
-  // copy.
-  [[nodiscard]] uint32_t heldCopies() const noexcept { return heldCopies_; }
+  // What the copies of held blocks' K/V (kvCopied) take of the quota
+  // (KvDiskSlot::bytes): the copies of active KV (model::DiskBudget::commit),
+  // each once however many requests hold its block. A copy of another
+  // command's K/V beside a held page is a cached copy.
+  [[nodiscard]] uint64_t heldCopyBytes() const noexcept { return heldCopyBytes_; }
   // Called as a block gains or loses a copy of its own K/V (kvCopied), with
   // the block's depth and page, so that each request holding it on that
   // page counts it (Cache::holdsActiveKvQuota). Erasing a block calls none:
@@ -404,6 +404,8 @@ public:
   // Blocks with a disk copy, resident or not; the pool counts the resident
   // blocks (KvPoolSnapshot::pagesPrefix).
   [[nodiscard]] uint32_t diskBlocks() const noexcept { return diskBlocks_; }
+  // What their copies take of the quota (KvDiskSlot::bytes).
+  [[nodiscard]] uint64_t diskBytes() const noexcept { return diskBytes_; }
   // Blocks whose page holds only their index: spilled blocks.
   [[nodiscard]] uint32_t indexBlocks() const noexcept { return indexBlocks_; }
   // Copies given to a block that had one before: writes of content that
@@ -615,8 +617,9 @@ private:
   RecencyOrder unneeded_;
   RecencyOrder trimmable_;
   uint32_t diskBlocks_ = 0;
+  uint64_t diskBytes_ = 0;
   uint32_t indexBlocks_ = 0;
-  uint32_t heldCopies_ = 0;
+  uint64_t heldCopyBytes_ = 0;
   CopyChanged copyChanged_;
   uint64_t rewrites_ = 0;
   uint64_t upgrades_ = 0;

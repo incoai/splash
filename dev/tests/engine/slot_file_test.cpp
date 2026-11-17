@@ -10,6 +10,7 @@
 #include <cmath>
 #include <future>
 #include <csignal>
+#include <cstdarg>
 #include <dlfcn.h>
 #include <fcntl.h>
 #include <sys/resource.h>
@@ -45,6 +46,25 @@ extern "C" ssize_t pwrite(int descriptor, const void *data, size_t bytes, off_t 
   return next(descriptor, data, bytes, offset);
 }
 
+// While set, this test's files find a volume that returns no blocks, as HFS+
+// and exFAT refuse a punch: the slot file's fcntl is this one in the test
+// binary, which otherwise passes the call and its argument on.
+static std::atomic<bool> refusingPunches{false};
+
+extern "C" int fcntl(int descriptor, int command, ...) {
+  if (command == F_PUNCHHOLE && refusingPunches.load()) {
+    errno = ENOTTY;
+    return -1;
+  }
+  va_list arguments;
+  va_start(arguments, command);
+  void *const argument = va_arg(arguments, void *);
+  va_end(arguments);
+  using Control = int (*)(int, int, ...);
+  static const auto next = reinterpret_cast<Control>(::dlsym(RTLD_NEXT, "fcntl"));
+  return next(descriptor, command, argument);
+}
+
 using splash::kHostPageBytes;
 using splash::model::DiskBudget;
 using splash::model::SlotFile;
@@ -71,8 +91,8 @@ static void testFailedWriteStopsWriting() {
       signal(SIGXFSZ, SIG_DFL);
       auto budget = std::make_shared<DiskBudget>(2 * size);
       SlotFile file(size, budget);
-      auto complete = file.acquire();
-      auto partial = file.acquire();
+      auto complete = file.acquire(size);
+      auto partial = file.acquire(size);
       std::vector<std::byte> source(size, std::byte{1}), output(size);
       require(file.write(complete, {source}, {})->wait(), "initial write failed");
       struct rlimit original;
@@ -116,7 +136,7 @@ static void testScatteredSpans() {
   constexpr size_t size = (2 << 20) + 3 * kHostPageBytes;
   auto budget = std::make_shared<DiskBudget>(size);
   SlotFile file(size, budget);
-  auto slot = file.acquire();
+  auto slot = file.acquire(size);
   std::vector<std::byte> source(size);
   for (size_t index = 0; index < source.size(); ++index)
     source[index] = static_cast<std::byte>(index * 131 + 7);
@@ -187,7 +207,7 @@ static void testAlignedRunsMoveDirectly() {
   constexpr size_t size = 3 * chunk;
   auto budget = std::make_shared<DiskBudget>(size);
   SlotFile file(size, budget);
-  auto slot = file.acquire();
+  auto slot = file.acquire(size);
   const std::vector<Shape> shapes{
       // Two chunks straight, and the run's last half chunk through the buffer.
       {{5 * chunk / 2, true}},
@@ -236,7 +256,7 @@ static void testAlignedRunsMoveDirectly() {
 static void testCancelledDirectWrite() {
   constexpr size_t size = 3 << 20;
   SlotFile file(size, std::make_shared<DiskBudget>(size));
-  auto slot = file.acquire();
+  auto slot = file.acquire(size);
   std::vector<std::byte> memory;
   const auto source = placeSpans(memory, {{size, true}}).front();
   require(file.write(slot, {source}, {})->wait(), "the first write of aligned runs failed");
@@ -263,7 +283,7 @@ static void testFreedSlotsReturnTheirBlocks() {
   const auto fill = [&](SlotFile &file) {
     std::vector<std::shared_ptr<SlotFile::Slot>> slots;
     for (int index = 0; index < 4; ++index) {
-      slots.push_back(file.acquire());
+      slots.push_back(file.acquire(size));
       require(slots.back() && file.write(slots.back(), {source}, {})->wait(),
               "a slot of the quota could not be written");
     }
@@ -273,7 +293,7 @@ static void testFreedSlotsReturnTheirBlocks() {
   require(budget->fileBytes() == 4 * size, "written slots were not counted on disk");
   slots.clear();
   // A read of an unwritten slot completes behind the punches queued before it.
-  require(!first.read(first.acquire(), {output}, {})->wait() && budget->fileBytes() == 0,
+  require(!first.read(first.acquire(size), {output}, {})->wait() && budget->fileBytes() == 0,
           "freed slots kept their blocks");
   slots = fill(second);
   require(budget->fileBytes() == 4 * size,
@@ -286,9 +306,9 @@ static void testPunchedSlotIsReusable() {
   auto budget = std::make_shared<DiskBudget>(size);
   SlotFile file(size, budget);
   std::vector<std::byte> first(size, std::byte{1}), second(size / 2, std::byte{2});
-  require(file.write(file.acquire(), {first}, {})->wait(), "the first write failed");
+  require(file.write(file.acquire(size), {first}, {})->wait(), "the first write failed");
   // The quota holds one slot, so this is the same one.
-  auto slot = file.acquire();
+  auto slot = file.acquire(size);
   std::vector<std::byte> output(second.size());
   require(slot && file.write(slot, {second}, {})->wait() &&
               file.read(slot, {output}, {})->wait() && output == second &&
@@ -357,8 +377,8 @@ static void testPersistentSlotsComeBack() {
     SlotFile file(size, budget, directory.persistence());
     require(file.persistent() && file.records().empty(), "a new persistent file listed records");
     file.finishAdoption();
-    auto first = file.acquire(), second = file.acquire(), third = file.acquire(),
-         unlabelled = file.acquire();
+    auto first = file.acquire(size), second = file.acquire(size), third = file.acquire(size),
+         unlabelled = file.acquire(size);
     require(file.write(first, {one}, {})->wait() && file.write(second, {two}, {})->wait() &&
                 file.write(third, {three}, {})->wait() &&
                 file.write(unlabelled, {three}, {})->wait(),
@@ -409,7 +429,7 @@ static void testShortPayloadEndsTheFile() {
     auto budget = std::make_shared<DiskBudget>(size);
     SlotFile file(size, budget, directory.persistence());
     file.finishAdoption();
-    auto slot = file.acquire();
+    auto slot = file.acquire(size);
     require(file.write(slot, {payload}, {})->wait() && budget->writtenBytes() == kHostPageBytes &&
                 sizeOf(directory.slots()) == kHostPageBytes,
             "a short payload's write stored more than its page");
@@ -438,7 +458,7 @@ static void testAdoptedSlotsCheckTheirFirstRead() {
         {&four, 4}, {&five, 5}, {&five, 6}};
     std::vector<std::shared_ptr<SlotFile::Slot>> kept;
     for (const auto &[payload, label] : payloads) {
-      kept.push_back(file.acquire());
+      kept.push_back(file.acquire(size));
       require(file.write(kept.back(), {*payload}, {})->wait(), "persistent write failed");
       file.label(kept.back(), labelOf(label));
     }
@@ -460,7 +480,7 @@ static void testAdoptedSlotsCheckTheirFirstRead() {
   std::vector<std::byte> half(size / 2);
   require(!file.read(partial, {half}, {})->wait(),
           "an adopted slot passed a read that did not cover its payload");
-  auto fresh = file.acquire();
+  auto fresh = file.acquire(size);
   require(file.write(fresh, {four}, {})->wait() && file.read(fresh, {half}, {})->wait(),
           "a slot this process wrote was checked against a record");
 }
@@ -476,7 +496,7 @@ static void testForeignFilesAndDamagedRecordsAreDropped() {
     file.finishAdoption();
     std::vector<std::shared_ptr<SlotFile::Slot>> kept;
     for (int index = 0; index < slots; ++index) {
-      kept.push_back(file.acquire());
+      kept.push_back(file.acquire(size));
       require(file.write(kept.back(), {payload}, {})->wait(), "persistent write failed");
       file.label(kept.back(), labelOf(static_cast<uint64_t>(index)));
     }
@@ -507,7 +527,7 @@ static void testAdoptionCountsPastTheQuota() {
     file.finishAdoption();
     std::vector<std::shared_ptr<SlotFile::Slot>> kept;
     for (int index = 0; index < 3; ++index) {
-      kept.push_back(file.acquire());
+      kept.push_back(file.acquire(size));
       require(file.write(kept.back(), {payload}, {})->wait(), "persistent write failed");
       file.label(kept.back(), labelOf(static_cast<uint64_t>(index)));
     }
@@ -516,7 +536,7 @@ static void testAdoptionCountsPastTheQuota() {
   }
   auto budget = std::make_shared<DiskBudget>(size);
   SlotFile file(size, budget, directory.persistence());
-  rejects([&] { static_cast<void>(file.acquire()); },
+  rejects([&] { static_cast<void>(file.acquire(size)); },
           "a persistent slot file acquires slots only after adoption",
           "a persistent file acquired a slot before adoption finished");
   rejects([&] { static_cast<void>(file.synchronize({})); },
@@ -526,13 +546,315 @@ static void testAdoptionCountsPastTheQuota() {
   for (const SlotRecord &record : file.records())
     adopted.push_back(file.adopt(record));
   file.finishAdoption();
-  require(budget->usedBytes() == 3 * size && !file.acquire(),
+  require(budget->usedBytes() == 3 * size && !file.acquire(size),
           "adoption did not count past the quota, or a slot was granted beyond it");
   adopted.pop_back();
   adopted.pop_back();
-  require(budget->usedBytes() == size && !file.acquire(), "a full quota granted a slot");
+  require(budget->usedBytes() == size && !file.acquire(size), "a full quota granted a slot");
   adopted.pop_back();
-  require(file.acquire() != nullptr, "the quota did not return once adoption gave it up");
+  require(file.acquire(size) != nullptr, "the quota did not return once adoption gave it up");
+}
+
+// Bytes that differ from one place and seed to the next.
+static std::vector<std::byte> patterned(size_t size, uint32_t seed) {
+  std::vector<std::byte> bytes(size);
+  uint32_t state = seed;
+  for (std::byte &value : bytes) {
+    state = state * 1664525u + 1013904223u;
+    value = static_cast<std::byte>(state >> 24);
+  }
+  return bytes;
+}
+
+// The blocks a file takes on its volume.
+static uint64_t blocksOf(const std::filesystem::path &path) {
+  struct stat status {};
+  require(::stat(path.c_str(), &status) == 0, "file could not be measured");
+  return static_cast<uint64_t>(status.st_blocks) * 512;
+}
+
+// A slot counts the host pages of the payload it was acquired for: a quota holds as many shorter
+// payloads as its bytes allow beside whole ones, through release and reuse by a payload of
+// another size, and the file keeps no more on the volume than the quota counts.
+static void testSlotsCountTheirPayloads() {
+  constexpr size_t page = kHostPageBytes, size = 4 * page;
+  Directory directory;
+  auto budget = std::make_shared<DiskBudget>(4 * size);
+  SlotFile file(size, budget, directory.persistence());
+  file.finishAdoption();
+  require(file.quotaBytesFor(1) == page && file.quotaBytesFor(page + 1) == 2 * page &&
+              file.quotaBytesFor(size) == size,
+          "a slot does not count its payload's host pages");
+  std::vector<std::pair<std::shared_ptr<SlotFile::Slot>, std::vector<std::byte>>> held;
+  uint32_t seed = 0;
+  const auto store = [&](size_t bytes) {
+    auto slot = file.acquire(bytes);
+    if (!slot)
+      return false;
+    held.emplace_back(std::move(slot), patterned(bytes, ++seed));
+    require(file.write(held.back().first, {held.back().second}, {})->wait(), "a slot write failed");
+    return true;
+  };
+  const auto intact = [&] {
+    for (const auto &[slot, payload] : held) {
+      std::vector<std::byte> output(payload.size());
+      if (!file.read(slot, {output}, {})->wait() || output != payload)
+        return false;
+    }
+    return true;
+  };
+  // Two whole payloads and eight of a page fill the sixteen pages of the
+  // quota, where four slots counted whole would.
+  require(store(size) && store(size), "a whole payload was refused");
+  for (int index = 0; index < 8; ++index)
+    require(store(page - 5), "a quota with room for a page refused a payload of one");
+  require(budget->usedBytes() == 4 * size && budget->fileBytes() == 4 * size && !store(1) && intact(),
+          "the quota did not hold the payloads its bytes allow, or held more");
+  require(file.synchronize({})->wait() && blocksOf(directory.slots()) <= budget->usedBytes(),
+          "the file kept more on its volume than the quota counts");
+  rejects([&] { static_cast<void>(file.write(held.back().first, {held.front().second}, {})); },
+          "slot write does not match this file's slots", "a slot took a payload of more pages than it counts");
+  // A payload of a page gives its room to another of one, not to a whole
+  // one; a whole one gives its room to four of a page, the first in its slot.
+  held.pop_back();
+  require(budget->usedBytes() == 4 * size - page && !store(size) && store(page) && !store(1),
+          "a released payload's pages did not return, or more than they did");
+  held.erase(held.begin());
+  for (int index = 0; index < 4; ++index)
+    require(store(page), "a released whole slot's pages did not hold payloads of a page");
+  require(budget->usedBytes() == 4 * size && !store(1) && intact(), "payloads in a reused slot lost their bytes");
+  // Four payloads of a page give their room to a whole one, in a slot that
+  // last held one page.
+  held.erase(held.end() - 4, held.end());
+  require(store(size) && budget->usedBytes() == 4 * size && budget->fileBytes() == 4 * size && intact(),
+          "a slot reused for a larger payload did not hold it");
+  require(file.synchronize({})->wait() && blocksOf(directory.slots()) <= budget->usedBytes(),
+          "reused slots kept more on the volume than the quota counts");
+  held.clear();
+  require(file.synchronize({})->wait() && budget->usedBytes() == 0 && budget->fileBytes() == 0 &&
+              blocksOf(directory.slots()) == 0,
+          "released slots kept quota or blocks");
+  file.seal();
+}
+
+// The file ends where the highest slot that holds blocks does: slots freed at its end leave no
+// hole there, which the volume would fill whole under a shorter payload written into it.
+static void testTheFileEndsWithItsLastSlot() {
+  constexpr size_t page = kHostPageBytes, size = 4 * page;
+  Directory directory;
+  auto budget = std::make_shared<DiskBudget>(8 * size);
+  SlotFile file(size, budget, directory.persistence());
+  file.finishAdoption();
+  const std::vector<std::byte> whole = patterned(size, 1), small = patterned(page, 2);
+  std::vector<std::byte> output(size);
+  std::vector<std::shared_ptr<SlotFile::Slot>> slots;
+  for (int index = 0; index < 3; ++index) {
+    slots.push_back(file.acquire(size));
+    require(file.write(slots.back(), {whole}, {})->wait(), "a slot write failed");
+  }
+  require(file.synchronize({})->wait() && sizeOf(directory.slots()) == 3 * size,
+          "three whole payloads did not make a file of three slots");
+  slots.pop_back();
+  slots.pop_back();
+  // A synchronization completes behind the punches queued before it.
+  require(file.synchronize({})->wait() && sizeOf(directory.slots()) == size && blocksOf(directory.slots()) == size,
+          "the file did not end with the last slot that holds blocks");
+  // The slots come back with a page each, the lower one first.
+  for (int index = 1; index < 3; ++index) {
+    slots.push_back(file.acquire(page));
+    require(file.write(slots.back(), {small}, {})->wait() && file.synchronize({})->wait() &&
+                sizeOf(directory.slots()) == index * size + page &&
+                blocksOf(directory.slots()) == budget->usedBytes(),
+            "a shorter payload in a slot freed at the file's end kept more than its pages");
+  }
+  require(file.read(slots.front(), {output}, {})->wait() && output == whole, "the slot below lost its payload");
+  file.seal();
+}
+
+// On a volume that returns no blocks a slot keeps whatever was stored in it, so it counts whole:
+// the quota bounds the file as it bounds the slots. A punch that fails later counts the slots
+// after it whole too.
+static void testVolumeWithoutHolesCountsWholeSlots() {
+  constexpr size_t page = kHostPageBytes, size = 4 * page;
+  const std::vector<std::byte> payload = patterned(page, 3);
+  std::vector<std::byte> output(page);
+  {
+    Directory directory;
+    refusingPunches = true;
+    auto budget = std::make_shared<DiskBudget>(4 * size);
+    SlotFile file(size, budget, directory.persistence());
+    file.finishAdoption();
+    require(file.quotaBytesFor(page) == size, "a slot on a volume without holes did not count whole");
+    std::vector<std::shared_ptr<SlotFile::Slot>> slots;
+    for (int round = 0; round < 3; ++round) {
+      for (int index = 0; index < 4; ++index) {
+        slots.push_back(file.acquire(page));
+        require(slots.back() && file.write(slots.back(), {payload}, {})->wait(), "a slot write failed");
+      }
+      require(budget->usedBytes() == 4 * size && !file.acquire(page) && sizeOf(directory.slots()) <= 4 * size,
+              "the quota did not bound a file whose volume keeps whole slots");
+      slots.clear();
+    }
+    // The freed slots keep their blocks, which the budget goes on counting.
+    require(!file.read(file.acquire(page), {output}, {})->wait() && budget->fileBytes() == 4 * size,
+            "slots a volume keeps the blocks of stopped counting on disk");
+    refusingPunches = false;
+    file.seal();
+  }
+  auto budget = std::make_shared<DiskBudget>(4 * size);
+  SlotFile file(size, budget);
+  auto first = file.acquire(page), second = file.acquire(page);
+  require(first && second && budget->usedBytes() == 2 * page && file.write(first, {payload}, {})->wait(),
+          "slots on a volume that returns blocks did not count their pages");
+  refusingPunches = true;
+  first.reset();
+  // A read completes behind the punch queued before it.
+  require(!file.read(second, {output}, {})->wait() && file.quotaBytesFor(page) == size,
+          "a file whose punch failed went on counting pages");
+  auto third = file.acquire(page);
+  require(third && budget->usedBytes() == page + size && budget->fileBytes() == page,
+          "a slot acquired after a punch failed did not count whole, or the kept blocks stopped counting");
+  refusingPunches = false;
+}
+
+// A punch that fails leaves its slot's blocks in the file, which goes on counting them, and what
+// is written there next counts with them, the larger of the two: a larger payload stays whole
+// when the file ends below it and when the file grows again, a smaller one leaves the blocks
+// under it counted, and the punch that succeeds returns all of them.
+static void testAFailedPunchLeavesItsBlocksCounted() {
+  constexpr size_t page = kHostPageBytes, size = 4 * page;
+  const std::vector<std::byte> small = patterned(page, 1), whole = patterned(size, 2), other = patterned(size, 3);
+  std::vector<std::byte> output(size), piece(page);
+  {
+    // A page in the lower slot, whose punch fails, then a whole payload there.
+    Directory directory;
+    auto budget = std::make_shared<DiskBudget>(4 * size);
+    SlotFile file(size, budget, directory.persistence());
+    file.finishAdoption();
+    auto lower = file.acquire(page), upper = file.acquire(size);
+    require(file.write(lower, {small}, {})->wait() && file.write(upper, {whole}, {})->wait(), "a slot write failed");
+    refusingPunches = true;
+    lower.reset();
+    // A synchronization completes behind the punch queued before it.
+    const bool refused = file.synchronize({})->wait();
+    refusingPunches = false;
+    require(refused && budget->fileBytes() == page + size, "a slot whose punch failed stopped counting on disk");
+    lower = file.acquire(size);
+    require(lower && file.write(lower, {other}, {})->wait() && budget->fileBytes() == 2 * size &&
+                blocksOf(directory.slots()) == 2 * size,
+            "a payload over what a failed punch left did not count what it holds");
+    // The slot above goes, and the file ends with the whole payload below it.
+    upper.reset();
+    require(file.synchronize({})->wait() && sizeOf(directory.slots()) == size && budget->fileBytes() == size &&
+                file.read(lower, {output}, {})->wait() && output == other,
+            "the file ended short of a payload written over what a failed punch left");
+    // A write past the file's end returns the hole before it, and no more.
+    upper = file.acquire(size);
+    require(upper && file.write(upper, {whole}, {})->wait() && file.read(lower, {output}, {})->wait() &&
+                output == other,
+            "a write past the file's end returned blocks of a payload written over what a failed punch left");
+    file.seal();
+  }
+  // A whole payload in the lower slot, whose punch fails once a page is on its way there: the
+  // page's slot was acquired while the volume returned blocks, so it takes a page of the quota,
+  // and the file goes on counting the whole payload's blocks, which it holds.
+  Directory directory;
+  auto budget = std::make_shared<DiskBudget>(4 * size);
+  SlotFile file(size, budget, directory.persistence());
+  file.finishAdoption();
+  auto lower = file.acquire(size), upper = file.acquire(page);
+  require(file.write(lower, {whole}, {})->wait() && file.write(upper, {small}, {})->wait(), "a slot write failed");
+  // Park the worker in a completion, so the punch runs once the page's write is queued behind it.
+  std::promise<void> reached, release;
+  auto released = release.get_future().share();
+  auto parked = file.synchronize([&] { reached.set_value(); released.wait(); });
+  reached.get_future().wait();
+  lower.reset();
+  lower = file.acquire(page);
+  auto written = file.write(lower, {small}, {});
+  refusingPunches = true;
+  release.set_value();
+  const bool landed = written->wait();
+  refusingPunches = false;
+  require(parked->wait() && landed && budget->usedBytes() == 2 * page && budget->fileBytes() == size + page &&
+              blocksOf(directory.slots()) == size + page && file.read(lower, {piece}, {})->wait() && piece == small,
+          "a smaller payload over what a failed punch left did not read back, or the blocks under it stopped counting");
+  // The punch that succeeds returns the page and what the failed one left under it.
+  lower.reset();
+  require(file.synchronize({})->wait() && budget->fileBytes() == page && blocksOf(directory.slots()) == page &&
+              file.read(upper, {piece}, {})->wait() && piece == small,
+          "a punch after one that failed left blocks counted or on the volume");
+  file.seal();
+}
+
+// A file whose earlier process kept every slot whole on the volume, as one that returned no hole
+// around a shorter payload left it: its records and payloads are what this process writes, so the
+// next one takes them back as they are, counts each by its payload's pages, and returns the rest.
+static void testAdoptionReturnsTheHolesAnEarlierProcessKept() {
+  constexpr size_t page = kHostPageBytes, size = 4 * page;
+  Directory directory;
+  // Slot by slot: the payloads, of which the fourth is not taken back.
+  const std::vector<std::vector<std::byte>> payloads{patterned(page - 3, 1), patterned(size, 2), patterned(2 * page, 3),
+                                                     patterned(page, 4), patterned(page + 1, 5)};
+  {
+    SlotFile file(size, std::make_shared<DiskBudget>(8 * size), directory.persistence());
+    file.finishAdoption();
+    std::vector<std::shared_ptr<SlotFile::Slot>> kept;
+    for (uint64_t index = 0; index < payloads.size(); ++index) {
+      kept.push_back(file.acquire(payloads[index].size()));
+      require(file.write(kept.back(), {payloads[index]}, {})->wait(), "persistent write failed");
+      file.label(kept.back(), labelOf(index));
+    }
+    require(file.synchronize({})->wait(), "a persistent file did not synchronize");
+    file.seal();
+  }
+  // That process's volume filled every slot to its end: zeros past each
+  // payload's pages, which no record covers.
+  {
+    const int descriptor = ::open(directory.slots().c_str(), O_WRONLY);
+    require(descriptor >= 0, "slot file could not be opened");
+    const std::vector<std::byte> zeros(size);
+    for (uint64_t index = 0; index < payloads.size(); ++index) {
+      const uint64_t stored = SlotFile::slotBytesFor(payloads[index].size());
+      require(stored == size || ::pwrite(descriptor, zeros.data(), size - stored,
+                                         static_cast<off_t>(index * size + stored)) ==
+                                    static_cast<ssize_t>(size - stored),
+              "a slot could not be filled");
+    }
+    require(::fsync(descriptor) == 0, "slot file did not synchronize");
+    ::close(descriptor);
+  }
+  require(blocksOf(directory.slots()) == payloads.size() * size,
+          "the earlier process's file does not hold whole slots");
+  auto budget = std::make_shared<DiskBudget>(8 * size);
+  SlotFile file(size, budget, directory.persistence());
+  const std::vector<SlotRecord> records = file.records();
+  require(records.size() == payloads.size(), "the earlier process's records did not come back");
+  std::vector<std::shared_ptr<SlotFile::Slot>> adopted;
+  for (const SlotRecord &record : records)
+    if (record.index != 3)
+      adopted.push_back(file.adopt(record));
+  file.finishAdoption();
+  // One page, four, two and two.
+  require(budget->usedBytes() == 9 * page && budget->fileBytes() == 9 * page &&
+              adopted[0]->bytes() == page && adopted[1]->bytes() == size && adopted[3]->bytes() == 2 * page,
+          "adopted slots did not count their payloads' pages");
+  require(file.synchronize({})->wait() && sizeOf(directory.slots()) == 4 * size + 2 * page &&
+              blocksOf(directory.slots()) <= budget->usedBytes(),
+          "adoption left the holes an earlier process kept on the volume");
+  for (size_t index = 0; index < adopted.size(); ++index) {
+    const std::vector<std::byte> &payload = payloads[index < 3 ? index : index + 1];
+    std::vector<std::byte> output(payload.size());
+    require(file.read(adopted[index], {output}, {})->wait() && output == payload,
+            "an adopted payload did not read back after its holes went");
+  }
+  // The slot not taken back is free, for a payload of any size.
+  auto fresh = file.acquire(size);
+  std::vector<std::byte> output(size);
+  require(fresh && file.write(fresh, {payloads[1]}, {})->wait() && file.read(fresh, {output}, {})->wait() &&
+              output == payloads[1] && budget->usedBytes() == 13 * page,
+          "the slot adoption freed did not take a whole payload");
+  file.seal();
 }
 
 // The limit bounds live slots below the quota; a limit below a slot takes no write at all.
@@ -543,17 +865,17 @@ static void testTheLimitBoundsLiveSlots() {
   budget->setLimitBytes(8 * size);
   require(budget->limitBytes() == 4 * size, "the limit passed the quota");
   budget->setLimitBytes(2 * size);
-  auto first = file.acquire(), second = file.acquire();
-  require(first && second && !file.acquire(), "the limit did not bound live slots");
+  auto first = file.acquire(size), second = file.acquire(size);
+  require(first && second && !file.acquire(size), "the limit did not bound live slots");
   budget->setLimitBytes(size - 1);
   require(!file.takesWrite(false) && !file.takesWrite(true),
           "a file took a write under a limit that holds no slot");
   budget->setLimitBytes(size);
   require(file.takesWrite(true), "a file took no write under a limit that holds a slot");
   first.reset();
-  require(!file.acquire(), "a slot was granted while more than the limit was live");
+  require(!file.acquire(size), "a slot was granted while more than the limit was live");
   second.reset();
-  first = file.acquire();
+  first = file.acquire(size);
   require(first != nullptr, "the limit granted nothing once enough was freed");
   const std::vector<std::byte> payload(size, std::byte{3});
   require(file.write(first, {payload}, {})->wait() && file.allocatedBytes() >= size,
@@ -577,7 +899,7 @@ static void testWritesDrawOnTheWriteBudget() {
   const std::vector<std::byte> half(size / 2, std::byte{1});
   std::vector<std::shared_ptr<SlotFile::Slot>> slots;
   const auto write = [&] {
-    slots.push_back(file.acquire());
+    slots.push_back(file.acquire(size));
     require(file.write(slots.back(), {half}, {})->wait(), "a slot write failed");
   };
   write();
@@ -603,6 +925,47 @@ static void testWritesDrawOnTheWriteBudget() {
   require(file.takesWrite(false) && !budget->admitsAgainAt(), "a lifted budget held a write back");
 }
 
+// The write rate counts what every write took, with a write budget or without, over the last hour
+// and the last day of the budget's clock.
+static void testWritesCountOverTheLastHourAndDay() {
+  constexpr size_t size = kHostPageBytes;
+  constexpr double kMinute = 60'000.0, kHour = 60 * kMinute, kDay = 24 * kHour;
+  // A clock that has run for days, as the awake clock has when an engine starts.
+  double now = 3 * kDay + 17 * kMinute;
+  auto budget = std::make_shared<DiskBudget>(64 * size, [&now] { return now; });
+  SlotFile file(size, budget);
+  const std::vector<std::byte> half(size / 2, std::byte{1});
+  const auto rate = [&] { return budget->writeRate(); };
+  const auto write = [&] { require(file.write(file.acquire(half.size()), {half}, {})->wait(), "a slot write failed"); };
+  require(!rate().hourBytes && !rate().dayBytes, "a tier that wrote nothing had a write rate");
+  write();
+  require(rate().hourBytes == size && rate().dayBytes == size,
+          "half a page's payload did not count as the page its write stores");
+  now += 30 * kMinute;
+  write();
+  write();
+  require(rate().hourBytes == 3 * size && rate().dayBytes == 3 * size, "the last hour lost a write");
+  now += 45 * kMinute;
+  require(rate().hourBytes == 2 * size && rate().dayBytes == 3 * size,
+          "a write 75 minutes old still counted in the last hour, or left the last day");
+  now += 30 * kMinute;
+  require(!rate().hourBytes && rate().dayBytes == 3 * size, "an idle hour had a write rate");
+  // A day and a minute after the first write, while the day still holds the others.
+  now += kDay - 105 * kMinute + kMinute;
+  require(rate().dayBytes == 2 * size, "a write more than a day old still counted in the last day");
+  write();
+  require(rate().hourBytes == size && rate().dayBytes == 3 * size,
+          "a write a day after the first did not count beside those the day still holds");
+  now += 5 * kDay;
+  require(!rate().hourBytes && !rate().dayBytes, "writes days old still counted");
+  write();
+  require(rate().hourBytes == size && rate().dayBytes == size,
+          "a write after idle days counted those of the days before");
+  budget->setWriteBudget(4 * size);
+  write();
+  require(rate().hourBytes == 2 * size, "a write budget changed what the write rate counts");
+}
+
 // A write that hits a full volume (ENOSPC, EDQUOT) only reports it; the file keeps taking writes.
 static void testFullVolumeIsReported() {
   constexpr size_t size = kHostPageBytes;
@@ -611,7 +974,7 @@ static void testFullVolumeIsReported() {
   const std::vector<std::byte> payload(size, std::byte{5});
   std::vector<std::byte> output(size);
   for (const int error : {ENOSPC, EDQUOT}) {
-    auto slot = file.acquire();
+    auto slot = file.acquire(size);
     failingWrites = error;
     const bool written = file.write(slot, {payload}, {})->wait();
     failingWrites = 0;
@@ -622,17 +985,6 @@ static void testFullVolumeIsReported() {
                 output == payload && !budget->fullReported(),
             "the file took no write after its volume was full");
   }
-}
-
-// Bytes that differ from one place and seed to the next.
-static std::vector<std::byte> patterned(size_t size, uint32_t seed) {
-  std::vector<std::byte> bytes(size);
-  uint32_t state = seed;
-  for (std::byte &value : bytes) {
-    state = state * 1664525u + 1013904223u;
-    value = static_cast<std::byte>(state >> 24);
-  }
-  return bytes;
 }
 
 // Memory aligned for reads beside the worker (SlotFile::readAt).
@@ -677,7 +1029,7 @@ static void testReadAtReadsAlignedUnits() {
   constexpr uint64_t unit = splash::kSlotReadAlignmentBytes;
   auto budget = std::make_shared<DiskBudget>(4 * size);
   SlotFile file(size, budget), other(size, budget);
-  auto slot = file.acquire(), unwritten = file.acquire(), foreign = other.acquire();
+  auto slot = file.acquire(size), unwritten = file.acquire(size), foreign = other.acquire(size);
   const std::vector<std::byte> payload = patterned(size - 1000, 3);
   require(file.write(slot, {payload}, {})->wait() && other.write(foreign, {payload}, {})->wait(),
           "slot writes failed");
@@ -708,7 +1060,7 @@ static void testReadAtBesideTheWorker() {
   SlotFile file(size, budget);
   const AlignedBytes buffer(size);
   const std::vector<std::byte> first = patterned(size, 1), second = patterned(size, 2);
-  auto written = file.acquire();
+  auto written = file.acquire(size);
   require(file.write(written, {first}, {})->wait(), "slot write failed");
   std::promise<void> reached, release;
   auto released = release.get_future().share();
@@ -718,7 +1070,7 @@ static void testReadAtBesideTheWorker() {
     released.wait();
   });
   reached.get_future().wait();
-  auto queued = file.acquire();
+  auto queued = file.acquire(size);
   auto write = file.write(queued, {second}, {});
   require(!file.readAt(*queued, 0, size, buffer.span()), "a slot read back before its write landed");
   release.set_value();
@@ -741,7 +1093,7 @@ static void testReadAtBesideTheWorker() {
   }
   for (uint32_t round = 0; round < 64; ++round) {
     const std::vector<std::byte> payload = patterned(size, round);
-    auto other = file.acquire();
+    auto other = file.acquire(size);
     require(other && file.write(other, {payload}, {})->wait(), "a write beside reads failed");
   }
   stop = true;
@@ -758,7 +1110,7 @@ static void testOneSegmentKeepsVersionOneRecords() {
     {
       SlotFile file(size, std::make_shared<DiskBudget>(2 * size), directory.persistence("tag"), options);
       file.finishAdoption();
-      auto slot = file.acquire();
+      auto slot = file.acquire(size);
       require(file.write(slot, {payload}, {})->wait(), "persistent write failed");
       file.label(slot, labelOf(9));
       require(file.synchronize({})->wait(), "a persistent file did not synchronize");
@@ -792,7 +1144,7 @@ static void testSegmentedRecords() {
   const auto fill = [&](const SlotFile::Options &with, size_t bytes) {
     SlotFile file(size, std::make_shared<DiskBudget>(2 * size), directory.persistence("tag"), with);
     file.finishAdoption();
-    auto slot = file.acquire();
+    auto slot = file.acquire(size);
     require(file.write(slot, {std::span(payload).first(bytes)}, {})->wait(), "persistent write failed");
     file.label(slot, labelOf(4));
     require(file.synchronize({})->wait(), "a persistent file did not synchronize");
@@ -832,7 +1184,7 @@ static void testSegmentedRecords() {
     rejects([&] { static_cast<void>(file.adopt({0, payload.size(), {checksums.front()}, labelOf(4)})); },
             "adopted slot is not one of this file's records", "a record of other segments was adopted");
     file.finishAdoption();
-    auto slot = file.acquire();
+    auto slot = file.acquire(size);
     rejects([&] { static_cast<void>(file.write(slot, {std::span(payload).first(100)}, {})); },
             "slot write does not match this file's slots", "a payload of other than the segments was written");
     file.seal();
@@ -865,7 +1217,7 @@ static void testAdoptedReadsCheckTheirSegments() {
     file.finishAdoption();
     std::vector<std::shared_ptr<SlotFile::Slot>> kept;
     for (uint64_t label = 0; label < 3; ++label) {
-      kept.push_back(file.acquire());
+      kept.push_back(file.acquire(size));
       require(file.write(kept.back(), {payload}, {})->wait(), "persistent write failed");
       file.label(kept.back(), labelOf(label));
     }
@@ -902,7 +1254,7 @@ static void testAdoptedReadsCheckTheirSegments() {
   before = budget->readBytes();
   require(reads(*whole, 8192 + 100, 50) && budget->readBytes() - before == unit,
           "an adopted slot a read beside the worker checked whole was not trusted");
-  auto fresh = file.acquire();
+  auto fresh = file.acquire(size);
   require(file.write(fresh, {payload}, {})->wait() && reads(*fresh, 8192 + 4160 + 5, 1),
           "a slot this process wrote was checked against a record");
 }
@@ -922,24 +1274,24 @@ static void testCommitmentsDrawWithinTheActiveLimit() {
               budget->commit(size, 3 * size) && budget->committedBytes() == 5 * size,
           "a commitment passed the active limit beside what is held and committed");
   budget->uncommit(size);
-  std::vector<std::shared_ptr<SlotFile::Slot>> slots{file.acquire(), file.acquire()};
-  require(slots[0] && slots[1] && !file.acquire(), "cached copies passed the limit");
+  std::vector<std::shared_ptr<SlotFile::Slot>> slots{file.acquire(size), file.acquire(size)};
+  require(slots[0] && slots[1] && !file.acquire(size), "cached copies passed the limit");
   for (int page = 0; page < 4; ++page) {
-    slots.push_back(file.acquire(DiskBudget::Draw::Commitment));
+    slots.push_back(file.acquire(size, DiskBudget::Draw::Commitment));
     require(slots.back() && budget->committedBytes() == (3 - page) * size,
             "a committed page did not draw its slot from the commitment within the active limit");
   }
-  require(!file.acquire(DiskBudget::Draw::Commitment) && budget->usedBytes() == 6 * size,
+  require(!file.acquire(size, DiskBudget::Draw::Commitment) && budget->usedBytes() == 6 * size,
           "a draw took more than was committed");
   require(budget->commit(3 * size, 0), "a commitment beside nothing held was refused");
   for (int page = 0; page < 2; ++page) {
-    slots.push_back(file.acquire(DiskBudget::Draw::Commitment));
+    slots.push_back(file.acquire(size, DiskBudget::Draw::Commitment));
     require(slots.back() != nullptr, "a committed page did not draw its slot within the active limit");
   }
-  require(!file.acquire(DiskBudget::Draw::Commitment) && budget->committedBytes() == size,
+  require(!file.acquire(size, DiskBudget::Draw::Commitment) && budget->committedBytes() == size,
           "a committed draw passed what the files hold under the active limit");
   slots.pop_back();
-  require(file.acquire(DiskBudget::Draw::Commitment) && !budget->committedBytes(),
+  require(file.acquire(size, DiskBudget::Draw::Commitment) && !budget->committedBytes(),
           "a freed slot's room did not take the committed draw");
 }
 
@@ -955,7 +1307,7 @@ static void testSpillsWithinTheWriteBudget() {
   require(budget->admitsSpill(size) && !budget->admitsSpill(size + 1),
           "a write budget did not cover exactly its balance of committed writes");
   SlotFile file(size, budget);
-  auto slot = file.acquire();
+  auto slot = file.acquire(size);
   const std::vector<std::byte> payload(size, std::byte{2});
   require(file.write(slot, {payload}, {})->wait(), "slot write failed");
   require(budget->admitsSpill(0) && !budget->admitsSpill(1), "a spent write budget covered a committed write");
@@ -982,7 +1334,7 @@ static void testWritesDeferToReads() {
                                  ++asked;
                                  return reading.load();
                                }});
-  auto slot = file.acquire();
+  auto slot = file.acquire(size);
   const std::vector<std::byte> payload = patterned(size, 11);
   require(file.write(slot, {payload}, {})->wait(), "a deferred write failed");
   const uint64_t deferred = budget->writesDeferredMicroseconds();
@@ -1027,7 +1379,7 @@ static void testSlotsKeepNoReaders() {
   std::promise<void> began, release;
   auto batch = readers->start(
       1,
-      [slot = file->acquire(), &began, released = release.get_future().share()](size_t) {
+      [slot = file->acquire(size), &began, released = release.get_future().share()](size_t) {
         began.set_value();
         released.wait();
       },
@@ -1057,8 +1409,14 @@ int main() {
     testAdoptedSlotsCheckTheirFirstRead();
     testForeignFilesAndDamagedRecordsAreDropped();
     testAdoptionCountsPastTheQuota();
+    testSlotsCountTheirPayloads();
+    testTheFileEndsWithItsLastSlot();
+    testVolumeWithoutHolesCountsWholeSlots();
+    testAFailedPunchLeavesItsBlocksCounted();
+    testAdoptionReturnsTheHolesAnEarlierProcessKept();
     testTheLimitBoundsLiveSlots();
     testWritesDrawOnTheWriteBudget();
+    testWritesCountOverTheLastHourAndDay();
     testFullVolumeIsReported();
     testReadAtReadsAlignedUnits();
     testReadAtBesideTheWorker();
@@ -1074,9 +1432,9 @@ int main() {
     SlotFile file(size, budget);
     require(file.slotBytes() == size && budget->usedBytes() == 0,
             "file did not report its slot size or took quota");
-    auto first = file.acquire();
-    auto second = file.acquire();
-    require(first && second && budget->usedBytes() == size * 2 && !file.acquire(),
+    auto first = file.acquire(size);
+    auto second = file.acquire(size);
+    require(first && second && budget->usedBytes() == size * 2 && !file.acquire(size),
             "a partial slot of the quota was granted");
     std::vector<std::byte> source(size, std::byte{0xa5}), restored(size);
     auto write = file.write(first, {std::span(source).first(128), std::span(source).subspan(128)}, {});
@@ -1124,9 +1482,9 @@ int main() {
             "the worker did not survive a throwing completion");
     first.reset();
     second.reset();
-    auto reused = file.acquire();
-    second = file.acquire();
-    require(reused && second && !file.acquire(), "released quota was not reusable");
+    auto reused = file.acquire(size);
+    second = file.acquire(size);
+    require(reused && second && !file.acquire(size), "released quota was not reusable");
     rejects([&] { SlotFile(size, std::make_shared<DiskBudget>(size - 1)); },
             "slot file quota holds no slot", "quota below one slot was accepted");
     rejects([&] { SlotFile(size + 1, std::make_shared<DiskBudget>(4 * size)); },
@@ -1147,20 +1505,20 @@ int main() {
       auto shared = std::make_shared<DiskBudget>(4 * size);
       SlotFile small(size, shared);
       SlotFile large(2 * size, shared);
-      auto one = large.acquire();
-      auto two = small.acquire();
-      require(one && two && shared->usedBytes() == 3 * size && !large.acquire(),
+      auto one = large.acquire(2 * size);
+      auto two = small.acquire(size);
+      require(one && two && shared->usedBytes() == 3 * size && !large.acquire(2 * size),
               "the shared budget did not bound the second file");
       std::vector<std::byte> largePayload(2 * size, std::byte{3});
       require(large.write(one, {largePayload}, {})->wait() &&
                   small.write(two, {source}, {})->wait(), "shared IO writes failed");
       require(shared->writtenBytes() == 3 * size,
               "shared IO counters did not include both slot files");
-      auto three = small.acquire();
-      require(three && !small.acquire() && shared->usedBytes() == 4 * size,
+      auto three = small.acquire(size);
+      require(three && !small.acquire(size) && shared->usedBytes() == 4 * size,
               "the last slot of the budget was not granted exactly once");
       one.reset();
-      require(shared->usedBytes() == 2 * size && large.acquire() && !small.acquire(),
+      require(shared->usedBytes() == 2 * size && large.acquire(2 * size) && !small.acquire(size),
               "a released slot did not return its bytes to the budget");
       rejects([&] { SlotFile(8 * size, shared); }, "slot file quota holds no slot",
               "a file whose slot exceeds the shared budget was accepted");

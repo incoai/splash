@@ -149,6 +149,7 @@ StatusInputs representativeStatus() {
   engine.resources.kvTier.restores = 3;
   engine.resources.kvTier.readBytes = 12345;
   engine.resources.kvTier.writtenBytes = 67890;
+  engine.resources.kvTier.writeRate = {.hourBytes = 16384, .dayBytes = 65536};
   engine.resources.kvTier.fileBytes = 24680;
   engine.resources.kvTier.capacityBytes = 34359738368;
   engine.resources.kvTier.limitBytes = 8589934592;

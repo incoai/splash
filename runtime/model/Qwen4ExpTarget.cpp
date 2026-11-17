@@ -458,7 +458,7 @@ std::unique_ptr<QwenTarget> makeQwenTarget(const Qwen4ExpWeights &weights, const
   return std::make_unique<Qwen4ExpTarget>(weights, geometry, backend, operators, prefillChunks);
 }
 
-QwenTargetScratchBytes qwenTargetScratchBytes(const Qwen4ExpWeights &, const QwenTargetGeometry &geometry,
+QwenTargetScratchBytes qwenTargetScratchBytes(const Qwen4ExpLayout &, const QwenTargetGeometry &geometry,
                                               uint32_t prefillChunks, uint64_t tableRowBytes) {
   return Qwen4Steps::scratchBytes(geometry, tableRowBytes, prefillChunks);
 }
