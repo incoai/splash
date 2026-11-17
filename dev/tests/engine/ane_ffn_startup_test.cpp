@@ -762,7 +762,8 @@ void testARefittedSplitThatFailsKeepsTheFirst() {
 // context the calibration's, and the calibration of the first units remembered, which the next start sets up: the
 // M5 Max's timings choose 6 units and then 7, whose 640-row function takes 6.0 ms (testRefitMovesTheChoice), and the
 // Neural Engine refuses the program of 6 the second time. It ended the start with the GPU alone and nothing
-// remembered, so that every later start calibrated again.
+// remembered, so that every later start calibrated again. A start whose remembered split does not prepare forgets
+// it, so that the next calibrates again rather than every start fail on the same split.
 void testAFirstSplitThatDoesNotPrepareAgainIsRemembered() {
   Fake fake;
   fake.time = [] { return Timings{{14.0 / 34, 9.9673, 23.929}, {27.0 / 34, 4.7526, 46.034}, 15.834}; };
@@ -789,6 +790,15 @@ void testAFirstSplitThatDoesNotPrepareAgainIsRemembered() {
   require(started.start.outcome.kind == Kind::Split && fake.timings == 1 && fake.prepared == std::pair(6u, false) &&
               has(started.log, "set up as calibrated before"),
           "the next start did not set up the remembered first units: " + started.log);
+  preparedSix = 1;
+  started = start(fake);
+  require(started.start.outcome.kind == Kind::Unavailable && !started.start.split && !fake.stored &&
+              has(started.log, "its remembered share's split was not prepared: the Neural Engine refused the program "
+                               "of 6 units; the next start calibrates again"),
+          "a remembered split that did not prepare was not forgotten: " + started.log);
+  started = start(fake);
+  require(started.start.outcome.kind == Kind::Split && fake.timings == 2,
+          "the start after a remembered split that did not prepare did not calibrate again: " + started.log);
 }
 
 // A start takes this Mac's calibration once remembered: it neither times nor remembers, prepares the remembered units

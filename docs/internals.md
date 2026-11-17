@@ -1364,7 +1364,8 @@ then makes of it: a split that failed leaves the GPU alone at the same context,
 and the memory the split would hold stays with the KV cache. Every start of a
 model on a Mac that takes one calibration so serves the same context; one
 calibrated anew may serve another, after the split lost to the GPU alone, which
-forgets the calibration (below), after a start whose calibration failed and
+forgets the calibration (below), after a start whose remembered split did not
+prepare, which forgets it too, after a start whose calibration failed and
 left none, or once macOS cleared the directory that keeps it. The server's
 relaunch of the engine after a failure keeps the first engine's context
 whatever it calibrates: the server passes that context

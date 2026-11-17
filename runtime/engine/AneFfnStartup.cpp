@@ -202,6 +202,19 @@ AneFfnStart decide(const AneFfnModel &model, const AneFfnSetting &setting, Reque
       return gpuAloneServing(Kind::NoGain, std::move(reason));
     };
 
+    // Why `step` failed on a backend that serves and in a start that goes on,
+    // or none.
+    const auto failure = [&](const auto &step) -> std::optional<std::string> {
+      try {
+        step();
+        return std::nullopt;
+      } catch (const ane::Interrupted &) {
+        throw;
+      } catch (const std::exception &error) {
+        if ((cancelled && cancelled()) || !model.healthy()) throw;
+        return error.what();
+      }
+    };
     std::optional<ane_ffn::Calibration> calibration = model.recall(maxAneUnits);
     if (calibration && calibration->aneUnits &&
         (calibration->aneUnits > maxAneUnits || calibration->minimumRows < ops::AneFfn::kMinimumRows ||
@@ -211,7 +224,14 @@ AneFfnStart decide(const AneFfnModel &model, const AneFfnSetting &setting, Reque
       assumed = calibration->aneUnits;
       if (!calibration->aneUnits)
         return gpuAloneServing(Kind::NoGain, "no Neural Engine split beat it by enough when this Mac calibrated it");
-      AneFfnPrepared prepared = model.prepare(calibration->aneUnits, false);
+      // A remembered split that does not prepare is forgotten, so that the
+      // next start calibrates again rather than every start fail on it.
+      AneFfnPrepared prepared;
+      if (const auto reason = failure([&] { prepared = model.prepare(calibration->aneUnits, false); })) {
+        model.forget(maxAneUnits);
+        return gpuAloneServing(Kind::Unavailable, "its remembered share's split was not prepared: " + *reason +
+                                                      "; the next start calibrates again");
+      }
       take(prepared, *calibration);
       return serve(std::move(prepared), calibration->aneUnits, calibration->minimumRows, "",
                    "set up as calibrated before");
@@ -241,18 +261,7 @@ AneFfnStart decide(const AneFfnModel &model, const AneFfnSetting &setting, Reque
     // them, and a first split that does not prepare again leaves this start
     // the GPU alone and the next its calibration. Either ended the start with
     // the GPU alone, nothing remembered, so that every start calibrated again
-    // and ended so. Why `step` failed on such a backend and start, or none.
-    const auto failure = [&](const auto &step) -> std::optional<std::string> {
-      try {
-        step();
-        return std::nullopt;
-      } catch (const ane::Interrupted &) {
-        throw;
-      } catch (const std::exception &error) {
-        if ((cancelled && cancelled()) || !model.healthy()) throw;
-        return error.what();
-      }
-    };
+    // and ended so.
     const auto refitting = [&](const char *failed, const auto &step) {
       if (const std::optional<std::string> reason = failure(step))
         logLine("The Neural Engine FFN split's refitted share was not ", failed, " (", *reason,
