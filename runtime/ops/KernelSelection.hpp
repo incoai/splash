@@ -81,9 +81,8 @@ struct SplitChoice final {
 // every block (QwenTarget.cpp), at the format of most routers' rows, F32 for
 // none.
 [[nodiscard]] uint32_t moeRouterFormat(std::span<const BlockMoeWeights *const> blocks) noexcept;
-// A MoE plan's configuration of `rows` rows in `phase`, its routers in
-// `routerFormat`.
+// A MoE plan's configuration of `rows` rows, its routers in `routerFormat`.
 [[nodiscard]] MoeConfig selectMoe(const KernelCalibration &calibration, const MoeShape &shape,
-                                  uint32_t routerFormat, uint32_t rows, MoePhase phase) noexcept;
+                                  uint32_t routerFormat, uint32_t rows) noexcept;
 
 } // namespace splash::ops

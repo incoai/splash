@@ -260,12 +260,20 @@ likely than `min_p` times the most likely one, `top_k` then keeps the most
 likely of the rest, every one when it is 0 or -1 or past the vocabulary, and
 `top_p` then the fewest of those whose probabilities, renormalized over them,
 sum past it. All three apply to the whole vocabulary, exactly, for the first
-token, the verified draft positions and their corrections alike: the sampler
-sums each row's softmax denominator, finds where its distribution ends
-without sorting the vocabulary, and draws over every token the distribution
-keeps. vLLM itself refuses a nonzero `min_p` with speculative decoding; here
-it is one more cut of the target distribution, which acceptance and
-correction read as they read the others, so sampling stays exact. A request
+token and every verified draft position alike: the sampler sums each row's
+softmax denominator, finds where its distribution ends without sorting the
+vocabulary, and draws over every token the distribution keeps, each verify row
+with uniforms of its own. A verify row tests the draft tokens its draft drew
+there, in the order drawn, keeping draft token i with probability
+min(1, p_i / q_i) of the target's and the draft's probabilities after the
+ones before it (the target's residual after each rejection), and draws from
+the last residual where it keeps none ([Drafts](models.md#drafts)); a decode
+cycle keeps a draft token only where the row before it selected that token,
+and then the selection of the last row it keeps, so every token it emits is a
+draw from the target. vLLM itself refuses a nonzero
+`min_p` with speculative decoding; here it is one more cut of the target
+distribution, which the draws read as they read the others, so sampling stays
+exact. A request
 that keeps only its most likely token, at a `min_p` of 1 or a `top_k` of 1,
 decodes greedily, its draft's proposals too: it selects what sampling would
 but for equally likely tokens, of which it takes the lowest id.
@@ -285,20 +293,21 @@ change the batch and the chunking, and chunk boundaries also come from the
 cached boundary a request resumes from, from a boundary another request waits to
 resume from, and from one whose state, or the KV past it, memory could not hold.
 With `--state-format bf16` the state is also rounded at each state a chunk
-captures (a replay point, junction or checkpoint). So on a dense target, or a
-MoE target under `--verify-rows all`, a greedy or seeded request repeats its
-output when it runs alone with the same cached prefixes; alongside other
+captures (a replay point, junction or checkpoint). So under `--verify-rows
+all` a greedy or seeded request repeats its output when it runs alone with the
+same cached prefixes; alongside other
 requests, or with other prefixes cached, it can differ. A request's own repeat
 is such a case: served from the prefix cache, it computes only the rows past the
 state its first run cached, so its output can differ from that run's, which
 computed the whole prompt; repeats meant to match each take a `cache_salt` of
-their own (below). By default a MoE target's decode cycles verify the rows the
-verify budget chooses ([Drafts](models.md#drafts)), which follow the machine's
-timing and the requests served before, and a row's MoE result depends on which
-rows share its expert tiles: there the same greedy (temperature 0) or seeded
-request can give different text from run to run even alone on an idle server, as
-on other engines that batch requests, while sampled outputs keep their exact
-distribution. A request that restores nothing can still read cached KV: once a
+their own (below). By default a decode cycle's rows follow the step costs the
+Mac measured, and the cost of a long history and the acceptance learned from
+the requests served before
+([Drafts](models.md#drafts)), and a row's result depends on the rows its step holds
+(on a MoE target, on which rows share its expert tiles too): the same greedy
+(temperature 0) or seeded request can give different text from run to run even
+alone on an idle server, as on other engines that batch requests, while sampled
+outputs keep their exact distribution. A request that restores nothing can still read cached KV: once a
 command completes, each block it filled whose prefix, tokens and identity
 (images and cache salt) match a cached block is swapped for that block's page,
 which another command computed, and its later commands read it. A request
@@ -366,6 +375,35 @@ Responses `cache_write_tokens` is 0: clients price cache writes apart from the
 rest of the uncached input, and the prefix cache keeps a prompt as prefill
 computes it, at no cost of its own. So uncached input is `input_tokens` less
 `cached_tokens`, as in Messages, which reports no `cache_creation_input_tokens`.
+
+Every API keeps a response's state where its generation ended: at the last
+32-token page boundary, counted from the start of the prompt, that the prompt
+and its generated tokens reach, beside the state before its generation prompt.
+A next request whose prompt renders that reply back token for token resumes
+there and prefills only what follows that boundary: a Chat client that sends the
+assistant message back as it came, a Responses client that continues with
+`previous_response_id` or sends the output items back, a Messages client that
+sends the assistant turn back. The template decides what it renders: Qwen3.8's
+renders an earlier turn's reasoning by default, Qwen3.6's only after the last
+user message (an agent's tool loop) or with `preserve_thinking`, so a reply
+that reasoned resumes there only when its reasoning is sent back and rendered.
+A next prompt that renders the reply otherwise, as one that leaves out its
+reasoning or a text the model generated as tokens the text does not encode to
+(`Any` `where` for `Anywhere`), resumes from the state before the generation
+prompt. A response cancelled, failed or ended by a `stop` sequence keeps the
+state at the last boundary its generation crossed, which a next prompt that
+renders back the text up to it resumes from. Qwen3.8-Flash-Next keeps no such
+state ([internals](internals.md#replay-points-and-checkpoints)).
+
+Such a state is opportunistic: memory that runs short drops it first, and the
+SSD cache never writes it, so a client that never sends a reply back as it came
+costs the cache nothing. A request whose prompt renders an earlier reply back,
+as far as a page that reply's state was kept at, whether memory still holds that
+state or not, shows that its conversation renders replies back: its own reply's
+state is kept when the reply holds at least 2048 tokens past its prompt's state
+(fewer prefill again faster than their state writes), and memory that runs short
+writes it to the SSD cache as any checkpoint, so the next turn resumes after the
+reply under memory pressure too, and so is the state of each later such turn.
 
 Chat and text completions include a llama-server-style `timings` object, both in
 non-streaming responses and in the final finish-reason chunk of a stream,
@@ -709,14 +747,14 @@ fields; additional fields may be added:
 | `memory_plan.budget.host_held_back_bytes` | The expert store's chunks above its floor, which it started without and the memory ledger grows into as the host allows ([memory and context](server.md#memory-and-context)): no memory at the start, but among the fixed bytes, so that the context and the KV the plan holds are the limit's |
 | `ane_ffn.state`, `share`, `minimum_rows`, `reason` | The prefill FFN's [Neural Engine split](internals.md#neural-engine-prefill): `split` while it serves, at `share` of the FFN's channels over chunks of `minimum_rows` rows or more; `off` when the start left the GPU alone (`share` and `minimum_rows` 0); `stopped` once it stopped while serving, until the engine restarts. `reason` is the start's outcome, or why the split stopped |
 | `ane_ffn.split_commands`, `evaluations`, `ane_ms`, `reruns` | Prefill commands the split ran since engine start, the Neural Engine's evaluations in them and its milliseconds over them (each evaluation's from the GPU's signal to start it to its report); and the chunks the GPU ran again alone after the split's work for them failed |
-| `verify_rows` | The rows of a draft block decode cycles verify ([drafts](models.md#drafts), `--verify-rows`): `auto` where the verify budget chooses them (a MoE target under the default), `all` where they verify every row the output limit leaves (a dense target, or `--verify-rows all`) |
+| `verify_rows` | The rows decode cycles verify ([drafts](models.md#drafts), `--verify-rows`): `auto` where each cycle's step is the one of the most expected accepted tokens per measured cost, with what its cycles show a long history adds to it, every row of which its lanes' trees fill is verified, or, where the target's experts stream, each cycle verifies the rows whose chance of a token is worth their time by its cycles' cost line (the default), `all` where each verifies every row of a draft's block a lane, whatever output the lane has left (`--verify-rows all`) |
 | `model_timing.prefill.last_gpu_ms`, `total_gpu_ms` | GPU time of the last prefill command, and of all since engine start, warmup included: each from its first Metal command buffer's start to its last one's end, so with the Neural Engine split it spans the GPU's waits on the Neural Engine; a chunk's image encodes, a command of their own ahead of it, add theirs, as a chunk run again adds the rerun's |
 | `metrics.decode_tokens_per_second` | Aggregate native decode throughput, not a request's end-to-end rate |
 | `metrics.decode_wall_ms` | Total wall time of the decode commands on the GPU, from submission to completion |
 | `metrics.decode_cycle_ms` | Total engine time of the decode commands, each from the previous command's completion (or its plan after idleness) to its own: the GPU command plus the host work between commands |
 | `metrics.decode_gap_ms` | Every interval a request saw between two of its token events after its first, since engine start, undivided by the tokens an event carries (`itl_ms` divides it): what a streaming client waits between chunks, whatever the engine ran meanwhile. `p50`, `p95` and `p99` within a factor of two, `max` exact, `total` and `samples` |
 | `metrics.decode_gap_causes` | The decode gaps since engine start longer than the bound the scheduler sizes contended prefill work by (`scheduler.decode_gap_target_ms`), each counted once under the first cause that held in it: `prefill_unit` (a prefill command or pass ran), `claim_wait` (the lane's memory claim waited for memory on its way back, or to retry what the host refused), `ssd_read` (the decode command that ended it read from the SSD: experts the store missed, or spilled K/V), `pool_release` (a pool gave a unit back), `replan` (a plan was made again) or `other`, each with its `gaps` and their `ms`; and of the gaps a prefill unit caused, the time those units took (`prefill_ms`) |
-| `metrics.ttft_parts_ms` | Each request's time to its first token since engine start, split by what held it, each interval counted once by precedence, the parts of a request summing to its native TTFT: `own_prefill` (a prefill command in flight carried its prompt's rows), `claim_wait` (its memory claim waited for memory on its way back, or to retry what the host refused), `decode` (a decode command ran), `other_prefill` (another request's prefill command ran) and `rest` (the host, admission, idle), each in the shape of `metrics.decode_gap_ms`. The native log has one line per request at its first token with the same five parts |
+| `metrics.ttft_parts_ms` | Each request's time to its first token since engine start, split by what held it, each interval counted once by precedence, the parts of a request summing to its native TTFT: `own_prefill` (a prefill command in flight carried its prompt's rows), `claim_wait` (its memory claim waited for memory on its way back, or to retry what the host refused), `decode` (a decode command ran), `other_prefill` (another request's prefill command ran), `unit_wait` (the next prefill unit waited, with nothing running, for a decoder whose memory was on its way back, at most as long as the last unit took) and `rest` (the host, admission, idle), each in the shape of `metrics.decode_gap_ms`. The native log has one line per request at its first token with the same six parts |
 | `scheduler.decode_gap_target_ms`, `contended_prefill_ms` | The decode gap the scheduler sizes contended prefill work by, and the wall time of each prefill unit (a command, or one pass of it) that ran while a request of its priority or a higher one decoded, in the shape of `metrics.decode_gap_ms`, its `p50`, `p95` and `p99` within a millisecond and never above `max` |
 | `scheduler.prefill_units`, `pass_commands`, `abandoned_pass_commands`, `bound_cuts`, `index_page_conflicts`, `replans` | Since engine start: the prefill units run; the commands that ran in passes over the model's layers, and those a superseding plan abandoned between passes; the contended plans whose leader was cut to fewer rows than it would run alone; the plans that left out a request that could have joined them because the command already held the most requests whose history may have pages only on the SSD that the model reads in one command; and the plans prepared again because a request's memory was refused or held back, a state capture cut its rows, or its KV converted to `spill` |
 | `memory_governor.host_telemetry` | The host's memory as macOS counts it, beside the governor's estimate, which no rule acts on: the engine process's `phys_footprint_bytes` and the part of them macOS holds `compressed_bytes`, the host's `file_backed_bytes` (its file cache, active and inactive alike) and `inactive_bytes` (its inactive and speculative pages, file-backed and anonymous alike: macOS splits neither queue), and the file cache macOS keeps however short memory is (`filecache_min_bytes`, `vm.vm_page_filecache_min`); `null` where macOS does not report it |

@@ -1,5 +1,6 @@
 #include "metal/abi/KernelABI.h"
 #include "metal/kernels/common/draft_context_kv.h"
+#include "metal/kernels/common/draft_context_window.h"
 #include "metal/kernels/common/lane_bindings.h"
 #include "metal/kernels/common/rms_inverse.h"
 
@@ -115,29 +116,63 @@ kernel void draft_context_kv_commit(
     device bfloat *values1 [[buffer(9)]],
     device bfloat *values2 [[buffer(10)]],
     device bfloat *values3 [[buffer(11)]],
-    device const uint *retained [[buffer(12)]],
-    constant DraftContextBatchParams &params [[buffer(13)]],
-    uint group [[threadgroup_position_in_grid]],
+    device const uint *retained_rows [[buffer(12)]],
+    device const SplashLaneRows *lane_rows [[buffer(13)]],
+    constant DraftContextBatchParams &params [[buffer(14)]],
+    uint2 group [[threadgroup_position_in_grid]],
     uint thread_index [[thread_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]],
     uint simd_group [[simdgroup_index_in_threadgroup]]) {
-  constexpr uint Rows = SPLASH_TARGET_VERIFY_ROWS;
   constexpr uint KVHeads = SPLASH_DRAFT_KV_HEADS;
   // A context row's keys and values (draft_context_kv_phase).
   constexpr uint RowWidth = 2 * KVHeads * SPLASH_DRAFT_HEAD_DIMENSION;
-  constexpr uint RopeLaneStride = Rows * SPLASH_DRAFT_ROPE_PAIRS;
-  uint batch = group / (Rows * KVHeads);
-  uint task = group % (Rows * KVHeads);
+  constexpr uint RopeLaneStride =
+      SPLASH_TARGET_VERIFY_ROWS * SPLASH_DRAFT_ROPE_PAIRS;
+  // A grid of (path row, KV head) tasks of a lane's block by lanes: path row
+  // i is the i-th row the lane retained, its i-th set bit.
+  const uint batch = group.y, row = group.x / KVHeads;
+  uint path = retained_rows[batch];
+  if (row >= min(uint(popcount(path)), lane_rows[batch].rows))
+    return;
+  for (uint earlier = 0; earlier < row; ++earlier)
+    path &= path - 1;
   device bfloat *keys = SPLASH_LANE_BINDING(batch, keys0, keys1, keys2, keys3);
   device bfloat *values = SPLASH_LANE_BINDING(batch, values0, values1, values2, values3);
+  const ulong rope = ulong(batch) * RopeLaneStride + row * SPLASH_DRAFT_ROPE_PAIRS;
   threadgroup float reductions[8];
   threadgroup bfloat normalized[SPLASH_DRAFT_HEAD_DIMENSION];
   draft_context_kv_phase(
-      context_kv + ulong(batch) * Rows * RowWidth, k_norm,
-      rope_cos + ulong(batch) * RopeLaneStride,
-      rope_sin + ulong(batch) * RopeLaneStride, keys, values,
-      params.start_position[batch], min(retained[batch], Rows), task,
-      thread_index, lane, simd_group, reductions, normalized);
+      context_kv + (ulong(lane_rows[batch].first) + ctz(path)) * RowWidth,
+      k_norm, rope_cos + rope, rope_sin + rope, keys, values,
+      params.start_position[batch] + row, group.x % KVHeads, thread_index,
+      lane, simd_group, reductions, normalized);
+}
+
+// The rows a lane retained of its rows of a decode step (`retained_rows`, its
+// acceptance's mask, among its rows `lane_rows`), in path order, to the slots
+// of their positions in its context window, which stays current with its
+// rings: the path's i-th, its i-th set bit, at the lane's start position plus
+// i.
+kernel void draft_context_window_commit(
+    device const bfloat *context [[buffer(0)]], device uchar *window [[buffer(1)]],
+    device const uint *retained_rows [[buffer(2)]],
+    device const SplashLaneRows *lane_rows [[buffer(3)]],
+    constant DraftContextWindowParams &params [[buffer(4)]],
+    uint threadgroup_index [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]]) {
+  DraftContextGroup at;
+  if (!draft_context_group(params, threadgroup_index, simd_group, at))
+    return;
+  uint path = retained_rows[0];
+  if (at.row >= min(uint(popcount(path)), lane_rows[0].rows))
+    return;
+  for (uint earlier = 0; earlier < at.row; ++earlier)
+    path &= path - 1;
+  // The store reads row at.row of its rows: here the lane's path row, at or
+  // past it.
+  draft_context_store(context + (ulong(lane_rows[0].first) + ctz(path) - at.row) * params.width, window, params,
+                      at, lane);
 }
 
 // One split of the attention of one KV head over the 32 query rows of one
@@ -474,7 +509,9 @@ kernel void draft_attention_qkv(
   constexpr ulong Attention = SPLASH_DRAFT_ATTENTION_WIDTH;
   constexpr ulong KVHeads = SPLASH_DRAFT_KV_HEADS;
   constexpr ulong HeadDim = SPLASH_DRAFT_HEAD_DIMENSION;
-  constexpr ulong RopeStride = Rows * SPLASH_DRAFT_ROPE_PAIRS;
+  // A lane's RoPE rows hold its verify block's positions, the first Rows of
+  // which its draft's rows take.
+  constexpr ulong RopeStride = SPLASH_TARGET_VERIFY_ROWS * SPLASH_DRAFT_ROPE_PAIRS;
   uint batch = group.y;
   threadgroup float reductions[8];
   threadgroup bfloat head[SPLASH_DRAFT_HEAD_DIMENSION];

@@ -76,6 +76,7 @@ struct Qwen4ExpLayout final : QwenHybridLayout {
                           .fullAttentionPeriod = 4,
                           .maskToken = 248077,
                           .stopTokens = {248044, 248046},
+                          .draftVocabulary = kQwenDraftVocabulary,
                           .ffnKind = QwenFfnKind::SparseMoe,
                           .experts = 512,
                           .expertsPerToken = 10,

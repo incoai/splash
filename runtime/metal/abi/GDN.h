@@ -41,11 +41,12 @@ struct GDNGatePrefillParams {
 static_assert(sizeof(GDNGatePrefillParams) == 4,
               "GDN prefill gate parameters are 4 bytes on both sides");
 
-// A decode step leaves its rows on the lane's tape: one layer's holds, each
-// field for every row in turn, the rows' convolution inputs ([conv_dim]
-// bf16), their k then v rows ([key_width + value_width] bf16), decay
-// ([value_heads] fp32) and beta ([value_heads] bf16). The lane's next step
-// folds the rows it retained into the state before its own (GDN::addDecode).
+// A decode step leaves its rows on the lane's tape: one layer's holds room
+// for SPLASH_TARGET_VERIFY_ROWS rows and, each field for every row of the
+// lane's block in turn, the rows' convolution inputs ([conv_dim] bf16), their
+// k then v rows ([key_width + value_width] bf16), decay ([value_heads] fp32)
+// and beta ([value_heads] bf16). The lane's next step folds the path of rows
+// it accepted into the state before its own (GDN::addDecode).
 inline constexpr uint64_t gdn_tape_kv_offset(uint32_t conv_dim) {
   return uint64_t(SPLASH_TARGET_VERIFY_ROWS) * conv_dim * 2;
 }
@@ -76,13 +77,32 @@ struct GDNDecodeBatchParams {
   uint64_t recurrent_layer_bytes;
   uint64_t convolution_state_bytes;
   // Per lane, byte offsets in the tape buffer of this layer's tape of the
-  // lane's previous step (the pending rows) and of this step, and how many
-  // rows of the previous step the lane retained and its state does not hold
-  // yet.
+  // lane's previous step (the pending rows) and of this step, and the path
+  // of rows of the previous step the lane accepted and its state does not
+  // hold yet: a row mask (metal/abi/VerifyTree.h), none after a prefill.
   uint64_t pending_tape[SPLASH_MAXIMUM_BATCH_WIDTH];
   uint64_t step_tape[SPLASH_MAXIMUM_BATCH_WIDTH];
-  uint32_t pending_rows[SPLASH_MAXIMUM_BATCH_WIDTH];
+  uint32_t pending_path[SPLASH_MAXIMUM_BATCH_WIDTH];
 };
 
 static_assert(sizeof(GDNDecodeBatchParams) == 112,
               "GDN decode parameters are 112 bytes on both sides");
+
+// A fold of the first `rows` rows of a lane's accepted path of its step alone
+// (GDN::addFold): the state cells' strides, as in GDNDecodeBatchParams; the
+// cached cell's recurrent layers' (codes_layer_bytes apart from its
+// convolution_state_bytes, as ops::StateCodec stores them); and the byte
+// offset in the tape buffer of the step's first layer's tape, which the next
+// layers' follow gdn_tape_layer_bytes apart.
+struct GDNFoldParams {
+  uint64_t conv_layer_bytes;
+  uint64_t recurrent_layer_bytes;
+  uint64_t convolution_state_bytes;
+  uint64_t codes_layer_bytes;
+  uint64_t step_tape;
+  uint32_t rows;
+  uint32_t padding;
+};
+
+static_assert(sizeof(GDNFoldParams) == 48,
+              "GDN fold parameters are 48 bytes on both sides");

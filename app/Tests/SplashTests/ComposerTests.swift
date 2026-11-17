@@ -47,6 +47,27 @@ struct ComposerTests {
         try await waitFor(window.firstResponder === composer)
     }
 
+    /// Another chat opened takes the text view's edits to undo away, even where its draft's text
+    /// is the same: Undo there never brings back an edit made in the other chat. Kept while the
+    /// texts matched, the edits let Undo put one chat's typing into the other's draft.
+    @Test func anotherChatTakesTheEditsToUndoAway() async throws {
+        let (state, window, folder) = try chat()
+        defer { window.orderOut(nil); try? FileManager.default.removeItem(at: folder) }
+        let composer = try await focusedComposer(in: window)
+        let conversation = try #require(state.chats.selection)
+        state.chats.newChat()
+        state.draft.text = "Same"
+        Self.update(window)
+        state.chats.selection = conversation
+        Self.update(window)
+        composer.insertText("Same", replacementRange: NSRange(location: NSNotFound, length: 0))
+        Self.update(window)
+        #expect(state.draft.text == "Same" && composer.undoManager?.canUndo == true)
+        state.chats.newChat()
+        Self.update(window)
+        #expect(state.draft.text == "Same" && composer.undoManager?.canUndo == false)
+    }
+
     /// A new chat, and a chat's first message, keep the composer's text view, and the keyboard in it.
     @Test func aNewChatKeepsTheComposer() async throws {
         let (state, window, folder) = try chat()
@@ -194,7 +215,7 @@ struct ComposerTests {
         draft.remove(at: 0)
         try await waitFor(!FileManager.default.fileExists(atPath: files.appending(path: first.file).path))
         let message = draft.message
-        draft.take()
+        draft.take(from: nil)
         #expect(message.attachments.count == 1 && draft.attachments.isEmpty && draft.thumbnails.isEmpty)
         #expect(FileManager.default.fileExists(atPath: files.appending(path: message.attachments[0].file).path))
     }

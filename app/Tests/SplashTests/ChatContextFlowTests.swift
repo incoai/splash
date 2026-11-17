@@ -32,8 +32,10 @@ struct ChatContextFlowTests {
             #expect(try fixture.sent().isEmpty)
             await picture("chat-context-full", state: state)
 
-            // A new chat keeps the draft and leaves the long one saved.
-            state.chats.newChat()
+            // A new chat, as the note says, takes the draft along and leaves the long one saved,
+            // with no draft: the draft went, not a copy of it.
+            state.newChat()
+            #expect(state.draft.text == text && state.draft.attachments == attachments)
             #expect(state.overflow == nil)
             #expect(try await count(state).level == .normal)
             #expect(state.canSendDraft)
@@ -49,6 +51,79 @@ struct ChatContextFlowTests {
             // Sending doesn't count the prompt again.
             #expect(try fixture.counts() == counts)
             #expect(state.chats.conversations.first { $0.id == fixture.history.id } == fixture.history)
+            state.chats.selection = fixture.history.id
+            #expect(state.draft.isEmpty)
+        }
+    }
+
+    /// A draft its chat's context can hold stays in its chat as a new chat opens, which shows its
+    /// own draft. A new chat that holds a draft of its own keeps it as a draft the context cannot
+    /// hold asks for a new chat: that draft stays in its chat, and neither is lost or joined.
+    @Test func aDraftItsChatCanHoldStaysAsANewChatOpens() async throws {
+        try await withServer { fixture in
+            let state = fixture.state
+            state.draft.text = "Short?"
+            let short = try await count(state)
+            #expect(short.fits)
+            state.newChat()
+            #expect(state.draft.isEmpty)
+            state.draft.text = "Typed in the new chat"
+            state.chats.selection = fixture.history.id
+            #expect(state.draft.text == "Short?")
+            let long = String(repeating: "x", count: 300)
+            state.draft.text = long
+            let full = try await count(state)
+            #expect(full.level == .full && state.overflow == full)
+            state.newChat()
+            #expect(state.draft.text == "Typed in the new chat")
+            state.chats.selection = fixture.history.id
+            #expect(state.draft.text == long)
+        }
+    }
+
+    /// A draft the context cannot hold goes with a new chat while an image of it is still being
+    /// encoded, and the image joins it there once kept: the new chat's draft holds the text and
+    /// the image and can go, and the chat it left can send again. Joining the chat it was attached
+    /// in, the image made a draft of its own there, which counted an image too few, and the new
+    /// chat's draft waited for it for good: neither chat could send.
+    @Test func aDraftGoesWithANewChatWithAnImageStillBeingEncoded() async throws {
+        try await withServer { fixture in
+            let state = fixture.state
+            let long = String(repeating: "x", count: 300)
+            state.draft.text = long
+            let full = try await count(state)
+            #expect(full.level == .full && state.overflow == full)
+            state.draft.attach([try #require(NSImage(data: Showcase.picture))])
+            #expect(state.draft.attaching == 1 && state.overflow == full)
+            state.newChat()
+            #expect(state.draft.text == long && state.draft.attaching == 1)
+            try await waitFor(state.draft.attaching == 0, "the image")
+            #expect(state.draft.text == long && state.draft.attachments.count == 1 && state.canSendDraft)
+            state.chats.selection = fixture.history.id
+            #expect(state.draft.isEmpty && state.draft.attaching == 0)
+            state.draft.text = "Short?"
+            #expect(state.canSendDraft)
+        }
+    }
+
+    /// Deleting a chat forgets its draft, and an image still being encoded for it joins no draft
+    /// once kept. Kept, the deleted chat's draft held its text until the app quit, and the late
+    /// image made it a draft again.
+    @Test func deletingAChatForgetsItsDraft() async throws {
+        try await withServer { fixture in
+            let state = fixture.state
+            let id = fixture.history.id
+            state.draft.text = "Not sent"
+            state.draft.attach([try #require(NSImage(data: Showcase.picture))])
+            state.delete([id])
+            #expect(state.chats.conversations.isEmpty && state.chats.selection == nil && state.draft.isEmpty)
+            // Attachments join in the order they were attached: once a later one is kept, the
+            // deleted chat's has gone where it goes.
+            state.draft.attach([try #require(NSImage(data: Showcase.picture))])
+            try await waitFor(state.draft.attachments.count == 1, "the later image")
+            // The deleted chat's id, which nothing lists, as its draft was kept under it.
+            state.chats.selection = id
+            #expect(state.draft.isEmpty && state.draft.attaching == 0 && state.draft.notice == nil)
         }
     }
 
@@ -172,18 +247,23 @@ struct ChatContextFlowTests {
             try await waitFor(state.chats.streaming == nil && state.draft.notice != nil)
             #expect(state.draft.text == "refuse this" && state.draft.attachments == attachments)
             #expect(state.draft.thumbnails[attachments[0].id] != nil)
-            // About that chat, where alone the composer says it.
-            #expect(state.draft.notice == Draft.Notice(text: "Request body too large", conversation: chat.id))
+            #expect(state.draft.notice == "Request body too large")
             #expect(state.chats.current == chat)
             #expect(attachments.allSatisfy { FileManager.default.fileExists(atPath: state.chats.attachments.appending(path: $0.file).path) })
-            // In a new chat, which stays new: nothing kept of it, in the list or on disk.
+            // In a new chat, which stays new: nothing kept of it, in the list or on disk. Its draft
+            // is its own: the other chat's message and why stay in that chat.
             state.chats.newChat()
+            #expect(state.draft.isEmpty && state.draft.notice == nil)
+            state.draft.text = "refuse this"
+            state.draft.attach([try #require(NSImage(data: Showcase.picture))])
+            try await waitFor(!state.draft.attachments.isEmpty)
+            let attached = state.draft.attachments
             let count = state.chats.conversations.count
             state.sendDraft()
             try await waitFor(state.chats.streaming == nil && state.draft.notice != nil)
-            #expect(state.draft.notice?.conversation == nil)
+            #expect(state.draft.notice == "Request body too large")
             #expect(state.chats.conversations.count == count && state.chats.selection == nil)
-            #expect(state.draft.attachments == attachments)
+            #expect(state.draft.attachments == attached)
             state.chats.flush()
             let written = try FileManager.default.contentsOfDirectory(at: fixture.root.appending(path: "chats"), includingPropertiesForKeys: nil)
             #expect(written.filter { $0.pathExtension == "json" }.count == count)
@@ -192,7 +272,10 @@ struct ChatContextFlowTests {
             state.sendDraft()
             #expect(state.draft.notice == nil)
             try await waitFor(state.chats.streaming == nil && state.chats.current?.messages.count == 2)
-            #expect(state.chats.current?.messages.first?.attachments == attachments)
+            #expect(state.chats.current?.messages.first?.attachments == attached)
+            state.chats.selection = chat.id
+            #expect(state.draft.text == "refuse this" && state.draft.attachments == attachments)
+            #expect(state.draft.notice == "Request body too large")
         }
     }
 
@@ -225,7 +308,7 @@ struct ChatContextFlowTests {
             try fixture.release()
             try await waitFor(state.chats.streaming == nil, "the refusal")
             var refused = before
-            refused.notice = Draft.Notice(text: "Request body too large", conversation: nil)
+            refused.notice = "Request body too large"
             #expect(composed.values == [before, refused] && chats.values == [listed], "through the refusal")
             #expect(!state.chats.sendingFirstMessage && !state.chats.answering && state.canSendDraft)
             #expect(try fixture.written() == [fixture.history.id])
@@ -253,8 +336,11 @@ struct ChatContextFlowTests {
 
     /// Stop while the server holds a new chat's first message gives the message back to edit: the
     /// composer holds it as it did, with nothing to say, and no chat was kept. Another chat opened
-    /// while the server holds the message stays open as the server takes it, the composer empty
-    /// then, the message being the new chat's.
+    /// while the server holds the message shows its own draft, to write in while Send waits for
+    /// the reply, and the new chat opened again holds the message, Stop in Send's place. Another
+    /// chat open as the server takes the message stays open, its draft as it was written, the
+    /// message being the new chat's. With one draft for every chat, the other chat's composer held
+    /// the new chat's message, which took no edit, under a Send that did nothing, with no Stop.
     @Test func aFirstMessageHeldIsStoppedOrTakenWhereverTheWindowIs() async throws {
         try await withServer { fixture in
             let state = fixture.state
@@ -274,13 +360,19 @@ struct ChatContextFlowTests {
             state.sendDraft()
             try await waitFor(state.chats.streaming != nil, "the message sent again")
             state.chats.selection = fixture.history.id
-            #expect(Composed(state.draft) == before && !state.chats.answering && !state.canSendDraft)
+            #expect(state.draft.isEmpty && !state.chats.sendingFirstMessage && !state.chats.answering && !state.canSendDraft)
+            state.draft.text = "Typed in the saved chat"
+            state.chats.newChat()
+            #expect(Composed(state.draft) == before && state.chats.sendingFirstMessage && state.chats.answering)
+            state.chats.selection = fixture.history.id
             try fixture.release()
             try await waitFor(state.chats.streaming == nil, "the reply")
-            #expect(state.draft.isEmpty && state.chats.selection == fixture.history.id)
+            #expect(state.draft.text == "Typed in the saved chat" && state.chats.selection == fixture.history.id)
             let new = try #require(state.chats.conversations.first)
             #expect(new.id != fixture.history.id && new.messages.map(\.text) == ["Plan a trip to Kyoto in spring", "Answer"])
             #expect(state.chats.conversations.count == 2)
+            state.chats.newChat()
+            #expect(state.draft.isEmpty)
         }
     }
 
@@ -304,6 +396,39 @@ struct ChatContextFlowTests {
         }
     }
 
+    /// A quit while the server holds a later message keeps the message in its chat, which shows
+    /// it, with its attachments and its answer stopped, and the next launch reads it there and
+    /// keeps the attachments' files, which the chat names. Given back to the composer, which goes
+    /// with the app, the message was lost, and the next launch took its attachments for those of
+    /// a draft and removed them.
+    @Test func aQuitWhileTheServerHoldsALaterMessageKeepsItInItsChat() async throws {
+        try await withServer { fixture in
+            let state = fixture.state
+            state.draft.text = "Short?"
+            state.draft.attach([try #require(NSImage(data: Showcase.picture))])
+            try await waitFor(!state.draft.attachments.isEmpty, "the picture")
+            let attachments = state.draft.attachments
+            try fixture.hold()
+            state.sendDraft()
+            try await fixture.held()
+            #expect(state.draft.isEmpty && state.quitCost.requests == 1)
+            state.quit()
+            AppDelegate(state: state).applicationWillTerminate(Notification(name: NSApplication.willTerminateNotification))
+            try await waitFor(state.chats.streaming == nil, "the stop")
+            #expect(state.draft.isEmpty)
+            let kept = try #require(state.chats.conversations.first)
+            #expect(kept.id == fixture.history.id && kept.messages.map(\.text) == fixture.history.messages.map(\.text) + ["Short?", ""])
+            #expect(kept.messages.dropLast().last?.attachments == attachments && kept.messages.last?.stopped == true)
+            state.chats.flush()
+            let next = ChatStore(folder: fixture.root.appending(path: "chats"))
+            #expect(next.conversations == [kept])
+            next.adoptFiles()
+            next.flush()
+            #expect(attachments.allSatisfy { FileManager.default.fileExists(atPath: next.attachments.appending(path: $0.file).path) })
+            try fixture.release()
+        }
+    }
+
     /// A later message stopped while the server holds it goes back to the composer, with nothing
     /// to say, and its chat is as it was, in the list and on disk.
     @Test func aLaterMessageStoppedBeforeTheServerTakesItGoesBack() async throws {
@@ -323,13 +448,15 @@ struct ChatContextFlowTests {
         }
     }
 
-    /// A message that comes back once another chat is open comes back to its chat, which opens
-    /// again, where the composer holds it, says why and Send sends it: a later message the server
-    /// refuses, back in the composer before what was typed in the other chat meanwhile, which
-    /// stays; a new chat's first message it refuses, which the composer still holds; and a later
-    /// message stopped from elsewhere, as a switch of models stops it, back with nothing to say.
-    /// Left under the chat opened meanwhile, the composer said nothing of why there, its reason
-    /// being about another chat, and Send sent the message there.
+    /// A message that comes back once another chat is open comes back to its chat's draft, and
+    /// its chat opens again, where the composer holds it, says why and Send sends it: a later
+    /// message the server refuses, alone, what was typed in the other chat meanwhile staying in
+    /// that chat's draft; a new chat's first message it refuses, which the new chat's composer
+    /// still holds; and a later message stopped from elsewhere, as a switch of models stops it,
+    /// back with nothing to say. Left under the chat opened meanwhile, the composer said nothing
+    /// of why there, its reason being about another chat, and Send sent the message there; put
+    /// back before what was typed in the other chat, a blank line apart, Send sent both to its
+    /// chat.
     @Test func aMessageThatComesBackOnceAnotherChatIsOpenOpensItsChat() async throws {
         try await withServer { fixture in
             let state = fixture.state
@@ -342,10 +469,10 @@ struct ChatContextFlowTests {
             try fixture.release()
             try await waitFor(state.chats.streaming == nil, "the refusal")
             #expect(state.chats.selection == fixture.history.id && state.chats.current == fixture.history)
-            #expect(state.draft.text == "refuse this\n\nTyped in the new chat")
-            #expect(state.draft.notice == Draft.Notice(text: "Request body too large", conversation: fixture.history.id))
-
+            #expect(state.draft.text == "refuse this" && state.draft.notice == "Request body too large")
             state.chats.newChat()
+            #expect(state.draft.text == "Typed in the new chat" && state.draft.notice == nil)
+
             state.draft.text = "refuse this"
             try fixture.hold()
             state.sendDraft()
@@ -355,7 +482,7 @@ struct ChatContextFlowTests {
             try await waitFor(state.chats.streaming == nil, "the refusal")
             #expect(state.chats.selection == nil && state.chats.conversations == [fixture.history])
             #expect(state.draft.text == "refuse this")
-            #expect(state.draft.notice == Draft.Notice(text: "Request body too large", conversation: nil))
+            #expect(state.draft.notice == "Request body too large")
 
             state.chats.selection = fixture.history.id
             state.draft.text = "Short?"
@@ -435,7 +562,7 @@ private struct Composed: Equatable {
     var text = ""
     var attachments: [Splash.Attachment] = []
     var pictured: Set<UUID> = []
-    var notice: Draft.Notice?
+    var notice: String?
 }
 
 extension Composed {

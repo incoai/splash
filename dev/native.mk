@@ -158,19 +158,23 @@ TEST_Q8_STORAGE_TEST := $(ENGINE_TEST_BUILD)/q8-page-storage
 TEST_Q8_ATTENTION_TEST := $(ENGINE_TEST_BUILD)/q8-flash-attention
 TEST_Q8_PREFILL_TEST := $(ENGINE_TEST_BUILD)/q8-chunked-prefill
 TEST_GDN_METAL_TEST := $(ENGINE_TEST_BUILD)/gdn-metal
+TEST_STATE_CODEC_TEST := $(ENGINE_TEST_BUILD)/state-codec-metal
 TEST_OPERATOR_WORKSPACE := $(ENGINE_TEST_BUILD)/operator-workspace
 TEST_EXECUTION_PLANS := $(ENGINE_TEST_BUILD)/execution-plans
 TEST_KERNEL_SELECTION := $(ENGINE_TEST_BUILD)/kernel-selection
 TEST_MODEL_EXECUTION_PLANS := $(ENGINE_TEST_BUILD)/model-execution-plans
+TEST_DRAFT_VOCABULARY := $(ENGINE_TEST_BUILD)/draft-vocabulary
 TEST_COMMAND_LIMITS := $(ENGINE_TEST_BUILD)/command-limits
 TEST_ATTENTION_PLAN := $(ENGINE_TEST_BUILD)/paged-attention-plan
 TEST_ATTENTION_VARIANTS := $(ENGINE_TEST_BUILD)/attention-variants
+TEST_ROPE_TABLES := $(ENGINE_TEST_BUILD)/rope-tables
 TEST_LINEAR_PLAN := $(ENGINE_TEST_BUILD)/linear-plan
 TEST_DFLASH_BATCH_CONTROL_TEST := $(ENGINE_TEST_BUILD)/dflash-batch-control
 TEST_DRAFT_ATTENTION_TEST := $(ENGINE_TEST_BUILD)/draft-attention
 TEST_GDN_DECODE_TEST := $(ENGINE_TEST_BUILD)/gdn-decode
 TEST_DRAFT_SELECTOR_TEST := $(ENGINE_TEST_BUILD)/draft-selector
 TEST_TARGET_SAMPLING_TEST := $(ENGINE_TEST_BUILD)/target-sampling
+TEST_TARGET_SAMPLING_WIDE_TEST := $(ENGINE_TEST_BUILD)/target-sampling-16
 TEST_VISION_METAL_TEST := $(ENGINE_TEST_BUILD)/vision-metal
 TEST_VISION_ATTENTION_TEST := $(ENGINE_TEST_BUILD)/vision-attention
 TEST_BACKEND_BENCHMARK := $(ENGINE_TEST_BUILD)/backend-benchmark
@@ -183,14 +187,20 @@ TEST_MODEL_RUNTIME_ORACLE := $(ENGINE_TEST_BUILD)/model-runtime-oracle
 WEIGHT_DIGESTS := $(ENGINE_TEST_BUILD)/weight-digests
 TEST_VISION_ENCODER_TEST := $(ENGINE_TEST_BUILD)/vision-encoder
 TEST_Q8_AIR := $(ENGINE_TEST_BUILD)/q8-paged-kv.air
+# The attention tests' store of K/V they stage themselves, over the
+# production store routine (the q/k projection's): in the Q8 tests' library
+# and the production-and-test one.
+TEST_ATTENTION_STORE_AIR := $(ENGINE_TEST_BUILD)/attention-store-test.air
+# The codes the decode fold stores of a state (state_code_quad), which the
+# state codec's test checks beside the codec's own: in the production-and-test
+# library.
+TEST_STATE_CODEC_AIR := $(ENGINE_TEST_BUILD)/state-codec-test.air
 TEST_Q8_LIB := $(ENGINE_TEST_BUILD)/q8-paged-kv.metallib
-# Both Q8 tests share the attention and store kernels of both phases, the
-# sparse ones included.
+# Both Q8 tests share the attention kernels, the sparse ones included, and the
+# path commit, beside the tests' store.
 TEST_Q8_KERNEL_SOURCES := \
-	runtime/metal/kernels/prefill/paged_attention.metal \
-	runtime/metal/kernels/decode/paged_attention.metal \
-	runtime/metal/kernels/prefill/paged_attention_store.metal \
-	runtime/metal/kernels/decode/paged_attention_store.metal \
+	runtime/metal/kernels/shared/paged_attention.metal \
+	runtime/metal/kernels/shared/kv_path_commit.metal \
 	runtime/metal/kernels/shared/sparse_attention.metal
 TEST_Q8_KERNEL_AIRS := $(patsubst runtime/metal/kernels/%.metal,$(ENGINE_TEST_BUILD)/kernels/%.air,$(TEST_Q8_KERNEL_SOURCES))
 # Every library a MetalBackend loads has the kernel that ends its residency;
@@ -215,12 +225,13 @@ TEST_SSD_READERS := $(ENGINE_TEST_BUILD)/ssd-readers
 TEST_SLOT_RECYCLER := $(ENGINE_TEST_BUILD)/slot-recycler
 TEST_EXPERT_CHUNK_LAYOUT := $(ENGINE_TEST_BUILD)/expert-chunk-layout
 TEST_VERIFY_BUDGET := $(ENGINE_TEST_BUILD)/verify-budget
+TEST_LOOKUP_PROPOSALS := $(ENGINE_TEST_BUILD)/lookup-proposals
 TEST_CACHE_DIRECTORY := $(ENGINE_TEST_BUILD)/cache-directory
 TEST_DISK_SPACE := $(ENGINE_TEST_BUILD)/disk-space
 TEST_PERSISTENT_CACHE := $(ENGINE_TEST_BUILD)/persistent-cache
 
 TEST_CPU_TARGETS := $(TEST_SLOT_FILE) $(TEST_SPARSE_ROW_STORE) $(TEST_SSD_READERS) $(TEST_SLOT_RECYCLER) \
-	$(TEST_EXPERT_CHUNK_LAYOUT) $(TEST_VERIFY_BUDGET) \
+	$(TEST_EXPERT_CHUNK_LAYOUT) $(TEST_VERIFY_BUDGET) $(TEST_LOOKUP_PROPOSALS) \
 	$(TEST_CACHE_DIRECTORY) $(TEST_DISK_SPACE) $(TEST_LEGACY_WEIGHT_CACHE) $(TEST_VISION_PREPARATION) $(TEST_SAFETENSORS_CHECKPOINT) $(TEST_WEIGHT_SOURCE) $(TEST_OPERATOR_WORKSPACE) \
 	$(TEST_MODEL_CONFIGURATION) $(TEST_FAMILY_VALUES) \
 	$(TEST_KV_SLOT_FORMAT) $(TEST_KV_PAGE_TIER_HOST) \
@@ -232,6 +243,7 @@ TEST_CPU_TARGETS := $(TEST_SLOT_FILE) $(TEST_SPARSE_ROW_STORE) $(TEST_SSD_READER
 	$(TEST_EXECUTION_PLANS) \
 	$(TEST_KERNEL_SELECTION) \
 	$(TEST_MODEL_EXECUTION_PLANS) \
+	$(TEST_DRAFT_VOCABULARY) \
 	$(TEST_COMMAND_LIMITS) \
 	$(TEST_MEMORY_TEST) \
 	$(TEST_KV_PAGE_CACHE_TEST) \
@@ -276,6 +288,7 @@ TEST_METAL_TARGETS := $(TEST_DRAFT_PREPARATION) \
 	$(TEST_GGUF_PREPARATION) \
 	$(TEST_ATTENTION_PLAN) \
 	$(TEST_ATTENTION_VARIANTS) \
+	$(TEST_ROPE_TABLES) \
 	$(TEST_LINEAR_PLAN) \
 	$(TEST_RESOURCES_TEST) \
 	$(TEST_KV_PAGE_TIER_TEST) \
@@ -286,11 +299,13 @@ TEST_METAL_TARGETS := $(TEST_DRAFT_PREPARATION) \
 	$(TEST_Q8_ATTENTION_TEST) \
 	$(TEST_Q8_PREFILL_TEST) \
 	$(TEST_GDN_METAL_TEST) \
+	$(TEST_STATE_CODEC_TEST) \
 	$(TEST_DFLASH_BATCH_CONTROL_TEST) \
 	$(TEST_DRAFT_ATTENTION_TEST) \
 	$(TEST_GDN_DECODE_TEST) \
 	$(TEST_DRAFT_SELECTOR_TEST) \
 	$(TEST_TARGET_SAMPLING_TEST) \
+	$(TEST_TARGET_SAMPLING_WIDE_TEST) \
 	$(TEST_VISION_METAL_TEST) \
 	$(TEST_VISION_ATTENTION_TEST) \
 	$(TEST_METAL_BACKEND_TEST) \
@@ -306,7 +321,7 @@ TEST_CONFIG_TARGETS := $(filter-out $(LIB) $(HOST_STEP_LIB),$(sort $(TEST_CPU_TA
 	$(TEST_DECODE_PROFILE) $(TEST_TEACHER_LOGITS) $(TEST_ATTENTION_SWEEP) \
 	$(TEST_GGUF_PROJECTION_BENCHMARK) $(TEST_GGUF_MOE_BENCHMARK) \
 	$(TEST_Q8_AIR) $(TEST_Q8_KERNEL_AIRS) $(TEST_RESIDENCY_AIR) $(TEST_HOST_STEP_AIR) $(TEST_METAL_BACKEND_AIR) \
-	$(TEST_GGUF_DEQUANT_AIR) $(TEST_GGUF_MOE_AIR)
+	$(TEST_GGUF_DEQUANT_AIR) $(TEST_GGUF_MOE_AIR) $(TEST_ATTENTION_STORE_AIR) $(TEST_STATE_CODEC_AIR)
 # Benchmarks and tools that build with the production flags.
 PRODUCTION_FLAG_TOOLS := $(TEST_BACKEND_BENCHMARK) $(WEIGHT_DIGESTS)
 SANITIZER_CONFIG_TARGETS := $(TEST_SLOT_FILE_ASAN) $(TEST_SLOT_FILE_TSAN) \
@@ -351,7 +366,9 @@ $(ENGINE_TEST_BUILD) $(ENGINE_SANITIZER_BUILD):
 # library or a framework. Those that also run under the sanitizers list their
 # sources with the sanitizer builds.
 $(TEST_WEIGHT_SOURCE): dev/tests/engine/weight_source_test.cpp runtime/model/WeightSource.cpp
-$(TEST_VERIFY_BUDGET): dev/tests/engine/verify_budget_test.cpp runtime/model/VerifyBudget.cpp
+$(TEST_VERIFY_BUDGET): dev/tests/engine/verify_budget_test.cpp runtime/model/VerifyBudget.cpp \
+		runtime/model/StepCosts.cpp
+$(TEST_LOOKUP_PROPOSALS): dev/tests/engine/lookup_proposals_test.cpp runtime/model/LookupProposals.cpp
 $(TEST_EXPERT_CHUNK_LAYOUT): dev/tests/engine/expert_chunk_layout_test.cpp
 $(TEST_GGUF_FILE): dev/tests/engine/gguf_file_test.cpp runtime/model/GgufFile.cpp \
 		runtime/model/WeightSource.cpp
@@ -381,7 +398,7 @@ $(TEST_WEIGHT_SOURCE) $(TEST_GGUF_FILE) $(TEST_MEMORY_TEST) $(TEST_KV_PAGE_CACHE
 		$(TEST_MEMORY_AUDIT_TEST) $(TEST_MEMORY_GOVERNOR_TEST) $(TEST_MEMORY_LEDGER) $(TEST_STATUS_TEST) \
 		$(TEST_JSON_WRITER) \
 		$(TEST_Q8_CPU_TEST) $(TEST_SLOT_FILE) $(TEST_SPARSE_ROW_STORE) $(TEST_SSD_READERS) $(TEST_SLOT_RECYCLER) \
-		$(TEST_EXPERT_CHUNK_LAYOUT) $(TEST_VERIFY_BUDGET) \
+		$(TEST_EXPERT_CHUNK_LAYOUT) $(TEST_VERIFY_BUDGET) $(TEST_LOOKUP_PROPOSALS) \
 		$(TEST_CACHE_DIRECTORY) $(TEST_DISK_SPACE) $(TEST_KV_SLOT_FORMAT) $(TEST_KV_PAGE_TIER_HOST) \
 		$(TEST_LEGACY_WEIGHT_CACHE) $(TEST_PERSISTENT_CACHE) $(TEST_ENGINE_CACHE_TEST) $(TEST_CACHE_PROPERTY) \
 		$(TEST_PROTOCOL_TEST) \
@@ -406,12 +423,14 @@ $(TEST_KERNEL_SELECTION): dev/tests/engine/kernel_selection_test.cc \
 		$(ENGINE_LIBRARY)
 $(TEST_MODEL_EXECUTION_PLANS): dev/tests/engine/model_execution_plan_test.cpp \
 		$(ENGINE_LIBRARY)
+$(TEST_DRAFT_VOCABULARY): dev/tests/engine/draft_vocabulary_test.cpp $(ENGINE_LIBRARY)
 $(TEST_VISION_METAL_TEST): dev/tests/engine/vision_metal_test.cpp \
 		$(ENGINE_LIBRARY) $(LIB)
 
 $(TEST_SAFETENSORS_CHECKPOINT) $(TEST_FAMILY_VALUES) $(TEST_VISION_PREPARATION) \
 		$(TEST_NATIVE_ARGUMENTS_TEST) $(TEST_ANE_FFN_STARTUP) $(TEST_MODEL_LOADING_TEST) $(TEST_OPERATOR_WORKSPACE) \
-		$(TEST_EXECUTION_PLANS) $(TEST_KERNEL_SELECTION) $(TEST_MODEL_EXECUTION_PLANS) $(TEST_VISION_METAL_TEST): | $(ENGINE_TEST_BUILD)
+		$(TEST_EXECUTION_PLANS) $(TEST_KERNEL_SELECTION) $(TEST_MODEL_EXECUTION_PLANS) $(TEST_DRAFT_VOCABULARY) \
+		$(TEST_VISION_METAL_TEST): | $(ENGINE_TEST_BUILD)
 	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) $(TEST_INPUTS) \
 		$(ENGINE_LINKFLAGS) -o $@
 $(TEST_COMMAND_LIMITS): dev/tests/engine/command_limits_test.cpp $(ENGINE_LIBRARY) | $(ENGINE_TEST_BUILD)
@@ -466,9 +485,13 @@ $(TEST_QWEN4_KERNELS): dev/tests/engine/qwen4_kernels_test.mm \
 		$(ENGINE_LIBRARY) $(LIB)
 $(TEST_GDN_METAL_TEST): dev/tests/engine/gdn_metal_test.mm \
 		$(ENGINE_LIBRARY) $(LIB)
+$(TEST_STATE_CODEC_TEST): dev/tests/engine/state_codec_metal_test.mm \
+		$(ENGINE_LIBRARY) $(TEST_PRODUCTION_LIB)
 $(TEST_ATTENTION_PLAN): dev/tests/engine/paged_attention_plan_test.mm \
-		$(ENGINE_LIBRARY) $(LIB)
+		$(ENGINE_LIBRARY) $(TEST_PRODUCTION_LIB)
 $(TEST_ATTENTION_VARIANTS): dev/tests/engine/attention_variants_metal_test.mm \
+		$(ENGINE_LIBRARY) $(TEST_PRODUCTION_LIB)
+$(TEST_ROPE_TABLES): dev/tests/engine/rope_tables_metal_test.mm \
 		$(ENGINE_LIBRARY) $(LIB)
 $(TEST_LINEAR_PLAN): dev/tests/engine/linear_plan_test.mm \
 		$(ENGINE_LIBRARY) $(LIB)
@@ -482,6 +505,10 @@ $(TEST_DRAFT_SELECTOR_TEST): dev/tests/engine/draft_selector_metal_test.mm \
 		$(ENGINE_LIBRARY) $(LIB)
 $(TEST_TARGET_SAMPLING_TEST): dev/tests/engine/target_sampling_metal_test.mm \
 		$(ENGINE_LIBRARY) $(LIB)
+# The same test over lanes of a verify block's 16 rows.
+$(TEST_TARGET_SAMPLING_WIDE_TEST): dev/tests/engine/target_sampling_metal_test.mm \
+		$(ENGINE_LIBRARY) $(LIB)
+$(TEST_TARGET_SAMPLING_WIDE_TEST): ENGINE_TEST_CXXFLAGS += -DTARGET_SAMPLING_LANE_ROWS=16
 $(TEST_VISION_ATTENTION_TEST): dev/tests/engine/vision_attention_metal_test.mm \
 		$(ENGINE_LIBRARY) $(LIB)
 $(TEST_Q8_METAL_TEST): dev/tests/engine/q8_paged_kv_metal_test.mm
@@ -502,7 +529,7 @@ $(TEST_MODEL_RUNTIME_ORACLE): dev/tests/engine/model_runtime_oracle_test.mm \
 $(TEST_MODEL_RUNTIME_ORACLE): ENGINE_TEST_CXXFLAGS += -include $(BUILD_ID_HEADER)
 $(TEST_DECODE_PROFILE): dev/benchmarks/decode_profile.mm \
 		dev/tools/LoadOptions.hpp \
-		$(ENGINE_INSTRUMENTED_METAL_OBJECT) $(ENGINE_LIBRARY) $(LIB)
+		$(ENGINE_INSTRUMENTED_METAL_OBJECT) $(ENGINE_INSTRUMENTED_RUNTIME_OBJECT) $(ENGINE_LIBRARY) $(LIB)
 $(TEST_TEACHER_LOGITS): dev/benchmarks/teacher_logits.mm \
 		dev/tools/LoadOptions.hpp \
 		$(ENGINE_INSTRUMENTED_RUNTIME_OBJECT) $(ENGINE_LIBRARY) $(LIB)
@@ -522,11 +549,11 @@ $(TEST_MODEL_CONFIGURATION) $(TEST_DRAFT_PREPARATION) $(TEST_GGUF_PROJECTION) $(
 		$(TEST_KV_PAGE_TIER_TEST) $(TEST_QWEN_STATE_TEST) $(TEST_Q8_ATTENTION_TEST) \
 		$(TEST_Q8_PREFILL_TEST) $(TEST_GGUF_MOE) $(TEST_GGUF_MOE_E512) $(TEST_GGUF_MOE_SIGMOID) \
 		$(TEST_EXPERT_STORE) $(TEST_KV_BLOCK_CACHE) $(TEST_KV_HISTORY_STREAM) $(TEST_QWEN4_KERNELS) \
-		$(TEST_GDN_METAL_TEST) $(TEST_ATTENTION_PLAN) $(TEST_LINEAR_PLAN) \
+		$(TEST_GDN_METAL_TEST) $(TEST_STATE_CODEC_TEST) $(TEST_ATTENTION_PLAN) $(TEST_LINEAR_PLAN) \
 		$(TEST_DFLASH_BATCH_CONTROL_TEST) $(TEST_DRAFT_ATTENTION_TEST) \
 		$(TEST_GDN_DECODE_TEST) $(TEST_DRAFT_SELECTOR_TEST) \
-		$(TEST_TARGET_SAMPLING_TEST) $(TEST_VISION_ATTENTION_TEST) \
-		$(TEST_Q8_METAL_TEST) $(TEST_Q8_STORAGE_TEST) $(TEST_ATTENTION_VARIANTS) \
+		$(TEST_TARGET_SAMPLING_TEST) $(TEST_TARGET_SAMPLING_WIDE_TEST) $(TEST_VISION_ATTENTION_TEST) \
+		$(TEST_Q8_METAL_TEST) $(TEST_Q8_STORAGE_TEST) $(TEST_ATTENTION_VARIANTS) $(TEST_ROPE_TABLES) \
 		$(TEST_METAL_BACKEND_TEST) $(TEST_HANDOFF_TEST) $(TEST_PRESSURE_SERVING) $(TEST_VISION_ENCODER_TEST) \
 		$(TEST_MODEL_RUNTIME_ORACLE) \
 		$(TEST_DECODE_PROFILE) $(TEST_TEACHER_LOGITS) $(TEST_ATTENTION_SWEEP) \
@@ -554,8 +581,9 @@ $(TEST_BACKEND_BENCHMARK): dev/benchmarks/backend_benchmark.mm \
 # Test kernels, each compiled from its Metal source with the test flags.
 $(TEST_Q8_AIR): dev/tests/engine/q8_page_format_oracle.metal runtime/metal/abi/ExecutionGeometry.h
 $(TEST_METAL_BACKEND_AIR): dev/tests/engine/metal_backend_test.metal
+$(TEST_ATTENTION_STORE_AIR): dev/tests/engine/attention_store_test.metal $(KERNEL_HEADERS)
 
-$(TEST_Q8_AIR) $(TEST_METAL_BACKEND_AIR): | $(ENGINE_TEST_BUILD)
+$(TEST_Q8_AIR) $(TEST_METAL_BACKEND_AIR) $(TEST_ATTENTION_STORE_AIR): | $(ENGINE_TEST_BUILD)
 	$(RUN_CONFIGURED) $(METAL) $(TEST_METALFLAGS) -c $(filter %.metal,$^) -o $@
 
 $(ENGINE_TEST_BUILD)/kernels/%.air: runtime/metal/kernels/%.metal \
@@ -568,23 +596,29 @@ $(ENGINE_TEST_BUILD)/kernels/%.air: runtime/metal/kernels/%.metal \
 # dequantizer bitwise, and gguf-moe the production gate/up pass against the
 # production down pass's expert tile, so they compile as production does
 # (gguf-dequant's AIR does not depend on -O3 with metal 32023, but that of
-# some kernels, moe_gguf's among them, does).
+# some kernels, moe_gguf's among them, does). The state codec's test kernel
+# stores codes as the decode kernels do, under the fast math that may drop a
+# NaN.
 $(TEST_GGUF_DEQUANT_AIR): dev/tests/engine/gguf_dequant_test.metal
 $(TEST_GGUF_MOE_AIR): dev/tests/engine/gguf_moe_test.metal
-$(TEST_GGUF_DEQUANT_AIR) $(TEST_GGUF_MOE_AIR): $(KERNEL_HEADERS) | $(ENGINE_TEST_BUILD)
+$(TEST_STATE_CODEC_AIR): dev/tests/engine/state_codec_test.metal
+$(TEST_GGUF_DEQUANT_AIR) $(TEST_GGUF_MOE_AIR) $(TEST_STATE_CODEC_AIR): $(KERNEL_HEADERS) | $(ENGINE_TEST_BUILD)
 	$(RUN_CONFIGURED) $(METAL) $(PROD_METALFLAGS) -c $(filter %.metal,$^) -o $@
 
 # Test libraries, each linked from the AIRs it lists.
 $(TEST_GGUF_DEQUANT_LIB): $(TEST_GGUF_DEQUANT_AIR) $(TEST_RESIDENCY_AIR)
 $(TEST_Q8_LIB): $(TEST_Q8_AIR) $(TEST_RESIDENCY_AIR)
-$(TEST_Q8_ATTENTION_LIB): $(TEST_Q8_KERNEL_AIRS)
+$(TEST_Q8_ATTENTION_LIB): $(TEST_Q8_KERNEL_AIRS) $(TEST_ATTENTION_STORE_AIR)
 $(TEST_METAL_BACKEND_LIB): $(TEST_METAL_BACKEND_AIR) $(TEST_RESIDENCY_AIR)
 $(TEST_HOST_STEP_LIB): $(TEST_HOST_STEP_AIR)
 # The production kernels and test kernels in one library, for the kernel
 # tests that run test kernels between production dispatches:
-# metal_backend_test.metal's copies, and gguf_moe_test.metal's gate and up
-# passes apart. It relinks whenever the production library does.
-$(TEST_PRODUCTION_LIB): $(PRODUCTION_AIRS) $(TEST_METAL_BACKEND_AIR) $(TEST_GGUF_MOE_AIR) $(LIB)
+# metal_backend_test.metal's copies, gguf_moe_test.metal's gate and up
+# passes apart, and state_codec_test.metal's decode fold codes. It relinks
+# whenever the production library does.
+$(TEST_PRODUCTION_LIB): $(PRODUCTION_AIRS) $(TEST_METAL_BACKEND_AIR) $(TEST_GGUF_MOE_AIR) $(TEST_ATTENTION_STORE_AIR) \
+		$(TEST_STATE_CODEC_AIR) \
+		$(LIB)
 
 $(TEST_GGUF_DEQUANT_LIB) $(TEST_Q8_LIB) $(TEST_Q8_ATTENTION_LIB) $(TEST_METAL_BACKEND_LIB) \
 		$(TEST_PRODUCTION_LIB) $(TEST_HOST_STEP_LIB):
@@ -618,6 +652,7 @@ test-engine-cpu: $(TEST_CPU_TARGETS) $(TEST_ATTENTION_SWEEP) $(TEST_BACKEND_BENC
 	$(ENGINE_CPU_STEP) $(TEST_SLOT_RECYCLER)
 	$(ENGINE_CPU_STEP) $(TEST_EXPERT_CHUNK_LAYOUT)
 	$(ENGINE_CPU_STEP) $(TEST_VERIFY_BUDGET)
+	$(ENGINE_CPU_STEP) $(TEST_LOOKUP_PROPOSALS) dev/tests/engine/lookup_replay_fixture.txt
 	$(ENGINE_CPU_STEP) $(TEST_CACHE_DIRECTORY)
 	$(ENGINE_CPU_STEP) $(TEST_DISK_SPACE)
 	$(ENGINE_CPU_STEP) $(TEST_LEGACY_WEIGHT_CACHE)
@@ -638,6 +673,7 @@ test-engine-cpu: $(TEST_CPU_TARGETS) $(TEST_ATTENTION_SWEEP) $(TEST_BACKEND_BENC
 	$(ENGINE_CPU_STEP) $(TEST_EXECUTION_PLANS)
 	$(ENGINE_CPU_STEP) $(TEST_KERNEL_SELECTION) dev/tests/engine/kernel_selection_golden.txt
 	$(ENGINE_CPU_STEP) $(TEST_MODEL_EXECUTION_PLANS)
+	$(ENGINE_CPU_STEP) $(TEST_DRAFT_VOCABULARY)
 	$(ENGINE_CPU_STEP) $(TEST_COMMAND_LIMITS)
 	$(ENGINE_CPU_STEP) $(TEST_MEMORY_TEST)
 	$(ENGINE_CPU_STEP) $(TEST_KV_PAGE_CACHE_TEST)
@@ -687,23 +723,26 @@ test-engine-metal: $(TEST_METAL_TARGETS)
 	$(METAL_TEST_ENV) $(TEST_KV_HISTORY_STREAM) $(LIB)
 	$(METAL_TEST_ENV) $(TEST_QWEN4_KERNELS) $(LIB)
 	$(TEST_QWEN4_KERNELS) $(LIB) bitwise
-	$(METAL_TEST_ENV) $(TEST_ATTENTION_PLAN) $(LIB)
-	$(METAL_TEST_ENV) $(TEST_ATTENTION_VARIANTS) $(LIB)
+	$(METAL_TEST_ENV) $(TEST_ATTENTION_PLAN) $(TEST_PRODUCTION_LIB)
+	$(METAL_TEST_ENV) $(TEST_ATTENTION_VARIANTS) $(TEST_PRODUCTION_LIB)
+	$(METAL_TEST_ENV) $(TEST_ROPE_TABLES) $(LIB)
 	$(METAL_TEST_ENV) $(TEST_LINEAR_PLAN) $(LIB)
 	$(METAL_TEST_ENV) $(TEST_RESOURCES_TEST) $(LIB)
 	$(METAL_TEST_ENV) $(TEST_KV_PAGE_TIER_TEST) $(TEST_METAL_BACKEND_LIB)
 	$(METAL_TEST_ENV) $(TEST_MODEL_LOADING_TEST) $(TEST_METAL_BACKEND_LIB) $(LIB)
-	$(METAL_TEST_ENV) $(TEST_QWEN_STATE_TEST) $(TEST_Q8_LIB)
+	$(METAL_TEST_ENV) $(TEST_QWEN_STATE_TEST) $(LIB)
 	$(METAL_TEST_ENV) $(TEST_Q8_METAL_TEST) $(TEST_Q8_LIB)
 	$(METAL_TEST_ENV) $(TEST_Q8_STORAGE_TEST) $(TEST_METAL_BACKEND_LIB)
 	$(METAL_TEST_ENV) $(TEST_Q8_ATTENTION_TEST) $(TEST_Q8_ATTENTION_LIB)
 	$(METAL_TEST_ENV) $(TEST_Q8_PREFILL_TEST) $(TEST_Q8_ATTENTION_LIB)
 	$(METAL_TEST_ENV) $(TEST_GDN_METAL_TEST) $(LIB)
+	$(METAL_TEST_ENV) $(TEST_STATE_CODEC_TEST) $(TEST_PRODUCTION_LIB)
 	$(METAL_TEST_ENV) $(TEST_DFLASH_BATCH_CONTROL_TEST) $(LIB)
 	$(METAL_TEST_ENV) $(TEST_DRAFT_ATTENTION_TEST) $(LIB)
 	$(METAL_TEST_ENV) $(TEST_GDN_DECODE_TEST) $(LIB)
 	$(METAL_TEST_ENV) $(TEST_DRAFT_SELECTOR_TEST) $(LIB)
 	$(METAL_TEST_ENV) $(TEST_TARGET_SAMPLING_TEST) $(LIB)
+	$(METAL_TEST_ENV) $(TEST_TARGET_SAMPLING_WIDE_TEST) $(LIB)
 	$(METAL_TEST_ENV) $(TEST_VISION_METAL_TEST) $(LIB)
 	$(METAL_TEST_ENV) $(TEST_VISION_ATTENTION_TEST) $(LIB)
 	$(METAL_TEST_ENV) $(TEST_METAL_BACKEND_TEST) $(TEST_METAL_BACKEND_LIB)

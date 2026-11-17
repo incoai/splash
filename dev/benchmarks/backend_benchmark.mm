@@ -56,6 +56,7 @@ struct Observation final {
   std::string failure;
   // A score-only request's logits at its score tokens.
   std::vector<float> optionLogits;
+  SpeculativeCounts speculation;
 };
 
 struct BatchObservation final {
@@ -93,15 +94,16 @@ public:
                               values.end());
   }
 
-  void maskRequested(uint64_t, std::span<const uint32_t>) override {
+  void maskRequested(const ModelMaskRequest &) override {
     throw std::logic_error("unconstrained benchmark requested a token mask");
   }
 
   void completed(uint64_t requestId, EngineFinishReason, bool, uint32_t,
                  uint32_t, uint32_t, std::span<const float> optionLogits,
-                 const SpeculativeCounts &) override {
+                 const SpeculativeCounts &counts) override {
     Observation &value = observations_[requestId];
     value.completed = true;
+    value.speculation = counts;
     value.optionLogits.assign(optionLogits.begin(), optionLogits.end());
   }
 
@@ -159,6 +161,7 @@ struct Measurement final {
   uint64_t junctionMaterializations = 0;
   std::vector<uint32_t> outputTokens;
   std::optional<bool> coldOutputMatch;
+  SpeculativeCounts speculation;
 };
 
 struct DecodeThroughputMeasurement final {
@@ -467,6 +470,7 @@ Measurement runRequest(engine::Engine &engine, Driver &driver,
   result.junctionMaterializations = engineAfter.junctionMaterializations -
                                     engineBefore.junctionMaterializations;
   result.outputTokens = observed.outputTokens;
+  result.speculation = observed.speculation;
   if (progress) {
     progress->complete(
         "request", result.scenario, result.sample, result.promptTokens, 0,
@@ -511,12 +515,16 @@ void evictAllCompositeState(engine::Cache &resources) {
   }
 }
 
+// `width` lanes of one prompt decoded together: under --verify-rows all
+// their outputs agree, every lane verifying every row of a draft's block;
+// under auto the step their measured costs choose may give them other rows,
+// whose rounding may part them.
 DecodeThroughputMeasurement
 runDecodeThroughput(engine::Engine &engine, Driver &driver,
                     model::RuntimeModel &executor, Events &events,
                     ProgressJournal *progress, uint64_t &requestId,
                     uint32_t width, uint32_t sample,
-                    std::span<const uint32_t> tokens) {
+                    std::span<const uint32_t> tokens, model::VerifyRows verifyRows) {
   if (!width || width > model::ExecutionLimits::maximumBatchWidth) {
     throw std::invalid_argument("invalid decode throughput width");
   }
@@ -593,7 +601,7 @@ runDecodeThroughput(engine::Engine &engine, Driver &driver,
       throw std::runtime_error(
           "decode throughput request did not produce exactly 64 tokens");
     }
-    if (reference && reference->outputTokens != observed.outputTokens) {
+    if (verifyRows == model::VerifyRows::All && reference && reference->outputTokens != observed.outputTokens) {
       throw std::runtime_error("decode throughput lanes diverged");
     }
     reference = &observed;
@@ -656,10 +664,11 @@ runDecodeThroughput(engine::Engine &engine, Driver &driver,
       decodeOutputTokens > completedTokens) {
     throw std::runtime_error("decode throughput work accounting is invalid");
   }
-  // A cycle counts the proposals each lane verified: seven, or fewer once the
-  // lane's output budget leaves less than its block to retain.
+  // A cycle counts the proposals each lane verified: at most a verify
+  // block's rows past its anchor, fewer once the lane's output budget leaves
+  // less than its block to retain.
   if (draftedTokens > uint64_t{width} * decodeBatches *
-                          model::ExecutionLimits::draftProposalTokens ||
+                          (model::ExecutionLimits::targetVerifyRows - 1) ||
       acceptedDraftTokens > draftedTokens) {
     throw std::runtime_error("decode throughput DFlash accounting is invalid");
   }
@@ -704,7 +713,11 @@ void emitMeasurement(const Measurement &value, bool first) {
             << ",\"draft_state_restore_skipped\":"
             << value.draftStateRestoreSkipped
             << ",\"junction_materializations\":"
-            << value.junctionMaterializations << ",\"output_tokens\":[";
+            << value.junctionMaterializations
+            << ",\"drafted_tokens\":" << value.speculation.draftedTokens
+            << ",\"accepted_draft_tokens\":" << value.speculation.acceptedDraftTokens
+            << ",\"speculative_cycles\":" << value.speculation.cycles
+            << ",\"output_tokens\":[";
   for (size_t index = 0; index < value.outputTokens.size(); ++index) {
     if (index)
       std::cout << ',';
@@ -902,7 +915,7 @@ int main(int argc, char **argv) {
                    "[--samples COUNT] [--progress PATH] "
                    "[--scenario NAME[,NAME...]] [--ane-ffn-share SHARE "
                    "[--ane-ffn-minimum-rows ROWS]] [--max-context TOKENS] "
-                   "[--activations auto|bf16] "
+                   "[--activations auto|bf16] [--verify-rows all|auto] "
                    "[--logits DIR [--logits-from DIR] [--logits-width LANES]]\n"
                    "  NAME: decode, partial, short, transcripts, context, exact, logits or resume "
                    "(default: decode,partial,context)\n"
@@ -914,6 +927,9 @@ int main(int argc, char **argv) {
                    "--max-context, with YaRN past the model's native window "
                    "(default: what memory holds)\n"
                    "  --activations: as serve's (default: auto)\n"
+                   "  --verify-rows: as serve's (default: all, so that the times measure the "
+                   "backend and outputs repeat, where the verify budget's rows follow the "
+                   "cycles before them)\n"
                    "  DIR: the logits scenario's dump, and the earlier dump whose "
                    "prefixes it scores (default: its own greedy transcripts')\n"
                    "  LANES: the score requests the logits scenario runs at once "
@@ -927,6 +943,7 @@ int main(int argc, char **argv) {
     std::optional<uint32_t> aneFfnMinimumRows;
     uint32_t maxContext = 0;
     ops::Int8Activations int8Activations = ops::Int8Activations::On;
+    model::VerifyRows verifyRows = model::VerifyRows::All;
     std::optional<std::filesystem::path> logitsDirectory, logitsFrom;
     uint32_t logitsWidth = 1;
     bool logitsOptions = false;
@@ -948,6 +965,11 @@ int main(int argc, char **argv) {
         maxContext = parseMaxContext(argv[index + 1]);
       } else if (option == "--activations") {
         int8Activations = parseInt8Activations(argv[index + 1]);
+      } else if (option == "--verify-rows") {
+        const std::string_view value(argv[index + 1]);
+        if (value != "all" && value != "auto")
+          throw std::invalid_argument("--verify-rows takes all or auto");
+        verifyRows = value == "all" ? model::VerifyRows::All : model::VerifyRows::Auto;
       } else if (option == "--logits") {
         logitsDirectory = std::filesystem::path(argv[index + 1]);
       } else if (option == "--logits-from") {
@@ -977,11 +999,7 @@ int main(int argc, char **argv) {
     config.buildId = SPLASH_BUILD_ID;
     config.aneFfn = engine::AneFfnSetting::fromGiven(aneFfnShare, aneFfnMinimumRows);
     config.int8Activations = int8Activations;
-    // The verify budget's rows follow the wall times and acceptance of the
-    // cycles before them, so a MoE target's outputs would not repeat from
-    // round to round: every cycle verifies every row (--verify-rows all), and
-    // the times measure the backend, not the budget.
-    config.verifyRows = model::VerifyRows::All;
+    config.verifyRows = verifyRows;
     bootstrapConfig.nativeLoop.engine.maxContext = maxContext;
     const std::string modelRoot = config.modelRoot.string();
     const auto &capabilities = config.model.capabilities;
@@ -1114,7 +1132,7 @@ int main(int argc, char **argv) {
           evictAllCache(resources->cache());
           decodeThroughput.push_back(runDecodeThroughput(
               engine, driver, *executor, events, progress.get(), requestId,
-              width, sample, decodeThroughputPrompt));
+              width, sample, decodeThroughputPrompt, config.verifyRows));
         }
       }
       // A wider batch must not lose aggregate throughput. A dense model can
@@ -1580,7 +1598,7 @@ int main(int argc, char **argv) {
               << ",\"ane_ffn_minimum_rows\":" << ranAneFfnMinimumRows
               << ",\"geometry\":{\"prefill_rows\":"
               << model::ExecutionLimits::prefillTokenBudget
-              << ",\"verify_rows\":" << model::ExecutionLimits::targetVerifyRows
+              << ",\"verify_rows\":" << model::ExecutionLimits::draftQueryRows
               << ",\"batch_width\":" << model::ExecutionLimits::maximumBatchWidth
               << ",\"kv_block_tokens\":"
               << kv::kPageTokens

@@ -52,7 +52,7 @@ struct ChatScreen: View {
             get: { deletion != nil }, set: { if !$0 { deletion = nil } }
         ), presenting: deletion) { deletion in
             Button("Delete", role: .destructive) {
-                state.chats.delete(deletion.ids)
+                state.delete(deletion.ids)
                 // Those picked, deleted, end the picking; another chat deleted leaves the rest.
                 if picked == deletion.ids { picked = nil } else { picked?.subtract(deletion.ids) }
             }
@@ -317,7 +317,7 @@ private struct ChatList<Actions: View>: View {
         VStack(spacing: 0) {
             // A new chat, at the top of the chats it joins, its icon in line with the search's.
             Button {
-                chats.newChat()
+                state.newChat()
                 state.draft.focus()
             } label: {
                 Label("New Chat", systemImage: "plus")

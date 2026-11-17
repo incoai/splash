@@ -45,6 +45,8 @@ inline PlannedModel plannedModel() {
   target.hiddenSize = 2048;
   target.vocabularySize = 1024;
   target.stopTokens = {1022, 1023};
+  // Not the Qwen tokenizer's 248,320 tokens: its draft proposes from all of them.
+  target.draftVocabulary = {};
   target.intermediateSize = 1024;
   constexpr std::array<uint32_t, 2> draftReads{1, 3};
   result.draft = model::draftLayout(target.hiddenSize, target.vocabularySize, 2, 1024, 10'000'000.0F, draftReads);
@@ -116,6 +118,7 @@ inline engine::RuntimeResourcesConfig moeConfig(const char *metallibPath, const 
   target.layers = kMoeLayers;
   target.vocabularySize = planned.target.vocabularySize;
   target.stopTokens = planned.target.stopTokens;
+  target.draftVocabulary = planned.target.draftVocabulary;
   target.experts = kMoeExperts;
   static_cast<void>(test::writeSyntheticModel(root, target, planned.draft, planned.vision));
   engine::RuntimeResourcesConfig config;
@@ -147,6 +150,8 @@ inline engine::RuntimeResourcesConfig flashNextConfig(const char *metallibPath, 
   target.fullAttentionPeriod = 2;
   target.maskToken = 252;
   target.stopTokens = {250, 251};
+  // Not the Qwen tokenizer's 248,320 tokens: its draft proposes from all of them.
+  target.draftVocabulary = {};
   target.pleEosToken = 250;
   target.pleImageToken = 253;
   target.experts = 4;

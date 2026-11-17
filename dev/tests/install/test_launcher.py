@@ -1041,6 +1041,62 @@ class LauncherTests(unittest.TestCase):
                     )
         agent.assert_not_called()
 
+    def test_an_agent_command_says_what_is_known_of_a_ready_161_server(self):
+        """A 1.6.1 server's lock names no --host. Of one whose record says
+        ready and that does not answer at 127.0.0.1:PORT, an agent command
+        says that it does not answer, which it may not as it stops or where
+        it listens on another address (it said there was no ready server and
+        that agent commands need a ready one, beside `phase ready`)."""
+        with socket.socket() as unused:
+            unused.bind(("127.0.0.1", 0))
+            port = unused.getsockname()[1]
+        os.environ["SPLASH_PORT"] = str(port)
+        lock = launcher.RUNTIME_DIR / f"serve-{port}.lock"
+        lock.write_text(json.dumps({"pid": 4242, "model": MODEL_ID, "port": port}))
+        (launcher.RUNTIME_DIR / f"serve-{port}.json").write_text(
+            json.dumps({"pid": 4242, "phase": "ready"})
+        )
+        with (
+            mock.patch.object(
+                launcher.clients, "find_executable", return_value="/bin/echo"
+            ),
+            mock.patch.object(launcher.os, "execvpe") as agent,
+            lock.open() as holder,
+            mock.patch("sys.stderr", io.StringIO()) as error,
+        ):
+            fcntl.flock(holder, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            self.assertEqual(launcher.main(["codex"]), 1)
+            console_written()
+        self.assertEqual(
+            error.getvalue(),
+            f"error: Splash is serving (PID 4242, model {MODEL_ID}, port {port}, "
+            f"phase ready) but does not answer at http://127.0.0.1:{port}: it may "
+            "be stopping, or listen on another address.\n",
+        )
+        agent.assert_not_called()
+
+    def test_an_ipv6_host_is_refused_before_model_work(self):
+        """The server listens on IPv4 alone: a start with --host :: or ::1 is
+        refused as it checks the address, so a server that holds the port
+        under either is never ready, as an agent command that finds one
+        says it is not (a ready one on ::1 would be on loopback, where the
+        command does not reach it)."""
+        for host in ("::", "::1"):
+            with (
+                self.subTest(host=host),
+                tempfile.TemporaryDirectory() as temporary,
+                mock.patch.object(launcher, "RUNTIME_DIR", Path(temporary)),
+                mock.patch.object(launcher, "_ensure_installed") as install,
+                mock.patch.object(launcher.os, "execve") as execute,
+                mock.patch("sys.stderr", io.StringIO()) as error,
+            ):
+                result = launcher.main(["serve", "--model", MODEL_ID, "--host", host])
+                console_written()
+                self.assertEqual(result, 1)
+                self.assertIn(f"cannot bind {host}:", error.getvalue())
+                install.assert_not_called()
+                execute.assert_not_called()
+
     def test_client_setup_works_while_status_is_unavailable(self):
         class Handler(BaseHTTPRequestHandler):
             def do_GET(self):

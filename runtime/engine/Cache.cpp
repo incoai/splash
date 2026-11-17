@@ -323,6 +323,7 @@ CacheLookup Cache::lookup(std::span<const uint32_t> prompt,
     if (result.kvBoundary > result.resumeBoundary() && kv_.stateBelow(blocks.back()))
       result.junctionBoundary = result.kvBoundary;
   }
+  result.rendersReply = std::ranges::any_of(blocks, [&](uint64_t block) { return kv_.heldReply(block); });
   const uint64_t stateBlock = result.state ? result.state->kvBlock() : 0;
   for (auto block = blocks.rbegin(); block != blocks.rend(); ++block) {
     if (*block == stateBlock) break;
@@ -3063,8 +3064,6 @@ PersistStatus Cache::persist(uint64_t block) {
 bool Cache::newestPoint(uint64_t block) const {
   return kv_.contains(block) && states_.ordinary(block) && !superseded(block);
 }
-
-void Cache::relabelStates() const { states_.relabel(); }
 
 bool Cache::superseded(uint64_t block) const {
   if (!kv_.stateBelow(block))

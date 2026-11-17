@@ -224,24 +224,31 @@ void testSlowerNowhere() {
           "a split that took chunks longer was taken");
 }
 
-// A calibration as a line of text comes back as it was, and one of no split as none; a line of another tag or
-// version, with more or fewer fields, units without least rows or the GPU alone out of order or unusable is not one.
+// A calibration as a line of text comes back as it was, its refusals too, and one of no split as none with its
+// refusals; a line of another tag or version, with more or fewer fields, units without least rows, the GPU alone out
+// of order or unusable, more refusals than kRefusals or a split beside kRefusals is not one.
 void testCalibrationText() {
-  const Calibration made{8, 655, {{{512, 5.25}, {2048, 19.375}}}};
+  const Calibration made{8, 655, {{{512, 5.25}, {2048, 19.375}}}, 1};
   const std::optional<Calibration> back = Calibration::parse(made.text());
   require(back && back->aneUnits == 8 && back->minimumRows == 655 && back->gpu[0].rows == 512 &&
-              back->gpu[0].milliseconds == 5.25 && back->gpu[1].rows == 2048 && back->gpu[1].milliseconds == 19.375,
+              back->gpu[0].milliseconds == 5.25 && back->gpu[1].rows == 2048 &&
+              back->gpu[1].milliseconds == 19.375 && back->refusals == 1,
           "a calibration did not come back as it was: " + made.text());
-  const std::optional<Calibration> none = Calibration::parse(Calibration{}.text());
-  require(none && !none->aneUnits && !none->minimumRows, "a calibration of no split did not come back");
-  for (const std::string_view line : {"", "ane-ffn-calibration-0 8 655 512 5.25 2048 19.375",
-                                      "ane-ffn-calibration-1 8 655 512 5.25 2048",
-                                      "ane-ffn-calibration-1 8 655 512 5.25 2048 19.375 1",
-                                      "ane-ffn-calibration-1 8 0 512 5.25 2048 19.375",
-                                      "ane-ffn-calibration-1 0 655 0 0 0 0",
-                                      "ane-ffn-calibration-1 8 655 2048 19.375 512 5.25",
-                                      "ane-ffn-calibration-1 8 655 512 0 2048 19.375",
-                                      "ane-ffn-calibration-1 8 655 512 nan 2048 19.375"})
+  const std::optional<Calibration> none = Calibration::parse(Calibration{}.text()),
+                                   refused = Calibration::parse(Calibration{.refusals = 2}.text());
+  require(none && !none->aneUnits && !none->minimumRows && !none->refusals && refused && !refused->aneUnits &&
+              refused->refusals == 2,
+          "a calibration of no split did not come back");
+  for (const std::string_view line : {"", "ane-ffn-calibration-1 8 655 512 5.25 2048 19.375",
+                                      "ane-ffn-calibration-2 8 655 512 5.25 2048 19.375",
+                                      "ane-ffn-calibration-2 8 655 512 5.25 2048 19.375 0 1",
+                                      "ane-ffn-calibration-2 8 0 512 5.25 2048 19.375 0",
+                                      "ane-ffn-calibration-2 0 655 0 0 0 0 0",
+                                      "ane-ffn-calibration-2 8 655 2048 19.375 512 5.25 0",
+                                      "ane-ffn-calibration-2 8 655 512 0 2048 19.375 0",
+                                      "ane-ffn-calibration-2 8 655 512 nan 2048 19.375 0",
+                                      "ane-ffn-calibration-2 0 0 0 0 0 0 3",
+                                      "ane-ffn-calibration-2 8 655 512 5.25 2048 19.375 2"})
     require(!Calibration::parse(line), "\"" + std::string(line) + "\" was taken for a calibration");
 }
 

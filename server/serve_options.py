@@ -574,10 +574,25 @@ SERVE_OPTIONS = (
         dict(
             choices=("fp32", "bf16"),
             default="fp32",
-            help="recurrent state storage (default: fp32); bf16 halves each "
-            "state, so memory and the SSD cache hold about twice as many",
+            help="recurrent state storage of running requests (default: fp32); "
+            "bf16 halves each one's state, and cached states store int8 codes "
+            "in either format unless --cached-states exact",
         ),
         engine=EngineArgument("--state-format"),
+        needs="recurrent_state",
+    ),
+    ServeOption(
+        "--cached-states",
+        "memory",
+        dict(
+            choices=("int8", "exact"),
+            default="int8",
+            help="recurrent state storage of cached states (default: int8): int8 "
+            "codes take about a quarter of an fp32 state, and a restored state "
+            "can differ at near ties; exact keeps --state-format's, so a "
+            "restore is exact",
+        ),
+        engine=EngineArgument("--cached-states"),
         needs="recurrent_state",
     ),
     ServeOption(
@@ -828,14 +843,16 @@ SERVE_OPTIONS = (
         dict(
             choices=("auto", "all"),
             default="auto",
-            help="rows of each draft block decode verifies: all verifies every "
-            "row, so a MoE model's greedy and seeded outputs repeat as a dense "
-            "model's do (default: auto, where a verify budget learned from "
-            "earlier cycles chooses a MoE model's rows, which is faster but "
-            "lets those outputs differ from run to run)",
+            help="rows each decode cycle verifies: all verifies every row of "
+            "a draft's block a lane, so greedy and seeded outputs repeat "
+            "(default: auto, where each cycle takes the step of the most "
+            "expected accepted tokens per cost, by the costs the Mac measured "
+            "at a start and the cost of a long history and the acceptance "
+            "learned from earlier cycles, or, on a model whose experts "
+            "stream, the rows worth their time by its cycles' cost line, "
+            "which is faster but lets those outputs differ from run to run)",
         ),
         engine=EngineArgument("--verify-rows"),
-        needs="experts",
     ),
     ServeOption(
         "--allow-idle-sleep",

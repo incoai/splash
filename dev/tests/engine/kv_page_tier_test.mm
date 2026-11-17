@@ -644,10 +644,9 @@ void namespaceNamesTheSlotFormat() {
   const model::ModelDescriptor model = model::makeModelDescriptor(
       "namespace-test", model::Qwen3_8Layout{}, test::qwen3_8Draft(), test::qwen3_8Vision(),
       model::TargetSource::Safetensors, model::VisionSource::Safetensors);
-  const auto name = [&](kv::Layout layout) {
+  const auto name = [&](kv::Layout layout, model::CompositeStateLayout states) {
     return engine::persistentCacheNamespace(
-        engine::makeRuntimeCacheIdentity(std::string(64, 'a'), std::string(64, 'b'), "build", layout, {}),
-        model.stateLayout);
+        engine::makeRuntimeCacheIdentity(std::string(64, 'a'), std::string(64, 'b'), "build", layout, {}), states);
   };
   const kv::Layout dense{16, 4, 256, kv::Format::Int8};
   const kv::Layout flashNext{12, 2, 256, kv::Format::Int8, 128, true, 0, 0, kv::Reads::SelectedBlocks};
@@ -655,12 +654,23 @@ void namespaceNamesTheSlotFormat() {
   require(KvPageTier::slotFormatToken(dense).empty() &&
               KvPageTier::slotFormatToken(flashNext) == " slots block-records-v1",
           "the slot format's token changed");
-  // What the stack's builds named these caches.
-  require(name(dense) == "6365d687c8be103a3bbcc6d2a83b1543",
-          "a dense layout's cache namespace changed: its caches would be emptied");
-  require(name(flashNext) != "06d3cbb9e548c52d3d582ff9e5d16453" &&
-              name(flashNextBf16) != "80a5feae1f55cd1b06749217aedfdae3",
+  // What the stack's builds named these caches since cached GDN states took
+  // int8 codes (0d770e276), which renamed every GDN model's caches once.
+  const std::string denseName = name(dense, model.stateLayout);
+  require(denseName == "88a6a28cadb13dc02b99998aa48baa72",
+          "a dense layout's cache namespace changed to " + denseName + ": its caches would be emptied");
+  require(name(flashNext, model.stateLayout) != "06d3cbb9e548c52d3d582ff9e5d16453" &&
+              name(flashNextBf16, model.stateLayout) != "80a5feae1f55cd1b06749217aedfdae3",
           "a spillable layout's namespace did not change with its slots' format");
+  // A cached state in the running format (--cached-states exact) names its
+  // caches apart from the codes' and by its format, so neither mode reads the
+  // other's states; the codes' name is the same whatever the running format.
+  model::CompositeStateLayout exact = model.stateLayout, exactBf16 = model.stateLayout, codesBf16 = model.stateLayout;
+  exact.target.cachedCodes = exactBf16.target.cachedCodes = false;
+  exactBf16.target.format = codesBf16.target.format = ops::GdnStateFormat::BFloat16;
+  require(name(dense, exact) != denseName && name(dense, exactBf16) != denseName &&
+              name(dense, exact) != name(dense, exactBf16) && name(dense, codesBf16) == denseName,
+          "a cached state's form or format did not name its caches apart");
 }
 
 void run(const std::string &metallib) {

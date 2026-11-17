@@ -103,6 +103,8 @@ struct CacheDiskQuota final {
 struct RuntimeResourcesConfig {
   kv::Format kvFormat = kv::Format::Int8;
   ops::GdnStateFormat stateFormat = ops::GdnStateFormat::Float32;
+  // Cached states keep stateFormat rather than codes (--cached-states exact).
+  bool exactCachedStates = false;
   std::filesystem::path metallibPath;
   std::filesystem::path modelRoot;
   model::ModelDescriptor model;
@@ -160,9 +162,9 @@ struct RuntimeResourcesConfig {
   // --kv-window-trim off: a windowed target's pages keep every layer's K/V,
   // for validation that trimming changes no output (CacheWindowPolicy::trim).
   bool kvWindowTrim = true;
-  // --verify-rows: the rows of the draft's block a decode cycle verifies
-  // (model::budgetsVerifyRows); a benchmark round verifies every row so that
-  // rounds repeat one another.
+  // --verify-rows: the rows a decode cycle verifies (reportVerifyRows); a
+  // benchmark round verifies every row of a draft's block a lane (all) so
+  // that rounds repeat one another.
   model::VerifyRows verifyRows = model::VerifyRows::Auto;
   // --activations: whether the plans may round activations to int8
   // where an int8-activation path takes them, or keep every activation bf16
@@ -302,9 +304,9 @@ public:
   // finds a persistent tier emptied (CacheDirectory::engineFailed).
   void engineFailed() noexcept;
   // At a clean stop, after the engine's flush (Engine::flushRestorePoints):
-  // each state copy's label takes its state's current recency, both files
-  // reach the drive and the directory records a clean end. False when they
-  // did not; true at once without a persistent tier.
+  // the cache closes its tier (Cache::closePersistentTier), both files reach
+  // the drive and the directory records a clean end. False when they did
+  // not; true at once without a persistent tier.
   [[nodiscard]] bool closePersistentCache();
 
   [[nodiscard]] metal::MetalBackend &backend() noexcept { return *backend_; }
@@ -344,7 +346,7 @@ public:
   [[nodiscard]] std::optional<model::KvBlockCacheStats> kvBlockCacheStats() const;
   [[nodiscard]] std::optional<model::KvHistoryStreamStats> kvHistoryStreamStats() const;
 
-  [[nodiscard]] model::RuntimeContext modelContext() noexcept;
+  [[nodiscard]] model::RuntimeContext modelContext();
   // What the engine gives back while idle (NativeLoopConfig::weights): the
   // weight images, and the Neural Engine split's program if it runs one.
   [[nodiscard]] ReleasableMemory &releasableMemory() noexcept { return releasableMemory_; }

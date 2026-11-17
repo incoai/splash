@@ -38,7 +38,7 @@ final class AppState {
     let chats: ChatStore
     /// The count of the next prompt, which the composer's ring shows.
     let chatContext = ChatContext()
-    /// The message being written, kept while the window shows something else.
+    /// The message being written in each chat, kept while the window shows something else.
     let draft: Draft
     /// The open conversation's page, kept while the window shows something else, so that the Chat
     /// shows again at once.
@@ -114,7 +114,7 @@ final class AppState {
         modelFiles = Self.keptModelFiles(defaults)
         drawer = Drawer(shell: shell)
         chats = ChatStore(folder: folders.chats)
-        draft = Draft(files: chats.attachments)
+        draft = Draft(files: chats.attachments) { [chats] in chats.selection }
         server = Server(runtime: runtime, log: folders.logs.appending(path: "server.log"), defaults: defaults)
         installer = Installer(runtime: runtime, log: folders.logs.appending(path: "install.log"), defaults: defaults)
         catalog = Catalog(contentsOf: runtime.suggestedModels)
@@ -418,7 +418,7 @@ final class AppState {
     /// models gets SIGINT, as Ctrl+C sends, and SIGKILL 5 s later.
     func quit() {
         quitting = true
-        chats.stop()
+        chats.quit()
         drawer.endAll()
         // A deletion cut short would leave files no one uses: the quit waits for it.
         if installer.work != .removal { installer.cancel() }
@@ -506,21 +506,36 @@ final class AppState {
         contextRequest.flatMap(chatContext.usage(for:)).flatMap { $0.fits ? nil : $0 }
     }
 
+    /// Opens a new chat. A draft the open chat's context cannot hold goes with it, as the
+    /// composer's note says to start a new chat for it (`overflow`); every other draft stays in its
+    /// chat (`Draft.carry`).
+    func newChat() {
+        let open = chats.selection, carried = overflow != nil
+        chats.newChat()
+        if carried { draft.carry(from: open) }
+    }
+
+    /// Deletes the conversations of `ids` (`ChatStore.delete`), and their drafts.
+    func delete(_ ids: Set<UUID>) {
+        chats.delete(ids)
+        draft.forget(ids)
+    }
+
     /// Sends the draft to the running model. The composer gives the message up as it shows in its
     /// conversation (`ChatStore.send`): at once in an open one, and in a new chat, which has none,
     /// once the server has taken it and the chat opens. Until then the composer holds a new chat's
     /// first message as it was sent, so that a refusal leaves the window as it was, the composer
     /// saying why: with the chat opened and listed at Send, a refusal took the composer to the
     /// conversation's foot and back, and a row into the list and out. A message that comes back
-    /// comes back to its chat, which the store opens again where another was opened meanwhile
-    /// (`ChatStore.stream`).
+    /// comes back to its chat's draft, and its chat, which the store opens again where another was
+    /// opened meanwhile (`ChatStore.stream`).
     func sendDraft() {
         guard canSendDraft, let target else { return }
-        let message = draft.message
+        let message = draft.message, chat = chats.selection
         chats.send(message.text, attachments: message.attachments, to: target) { [weak self] refused in
             self?.draft.restore(refused)
         } shown: { [weak self] in
-            self?.draft.take()
+            self?.draft.take(from: chat)
         }
     }
 

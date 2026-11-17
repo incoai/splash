@@ -10,6 +10,7 @@
 #endif
 
 #include "metal/abi/PagedAttention.h"
+#include "metal/abi/VerifyTree.h"
 
 // The block indexer of a full-attention layer: BLOCK_INDEXER_HEADS query
 // heads and one key head of BLOCK_INDEXER_DIMENSION values, the shape the
@@ -26,6 +27,19 @@
 // its open block (bf16 [slot][dimension] of BLOCK_INDEXER_PENDING slots, the
 // token at position b * BLOCK_INDEXER_BLOCK + slot of the block b that is not
 // complete), which its state keeps.
+//
+// A prompt's rows are committed as they run: the blocks they complete go into
+// the index, from which every row scores them. A verify step's lane is a
+// block of rows from its anchor, a tree (metal/abi/VerifyTree.h) whose rows'
+// lanes and places the step's proposer writes on the device (SplashLaneRows,
+// SplashTreeRow): a row's position is the anchor's plus its depth, so
+// siblings share positions, and a block one of its rows completes holds that
+// row's path's tokens. Such a row keeps the block's pooled key as its own,
+// its block key (bf16 [row][dimension], block_indexer_pool_tree); a row
+// scores the blocks complete before the anchor from the index and those its
+// path completes from its path's block keys; and once the verify accepted a
+// path, the commit writes the block keys of the path's rows into the index
+// (block_indexer_commit).
 #define BLOCK_INDEXER_DIMENSION 128u
 #define BLOCK_INDEXER_HEADS 4u
 #define BLOCK_INDEXER_BLOCK SPLASH_ATTENTION_BLOCK_TOKENS
@@ -45,22 +59,32 @@
 // writes a row's bitmap that far.
 #define BLOCK_INDEXER_TILE_SLACK \
   ((SPLASH_ATTENTION_BLOCK_ROW_BITS - 1u + BLOCK_INDEXER_BLOCK - 1u) / BLOCK_INDEXER_BLOCK)
-// An indexer dispatch serves `lanes` lanes, each through its own index table:
-// a verify step's lanes, or a prefill sequence as one. Lane l's `rows` rows
-// follow the rows of the lanes before it in the queries, the keys, the scores
-// and the bitmaps, the first at logical position first_position[l] +
-// row_offset. A dispatch of one lane selects a long sequence's rows in
-// batches of the score scratch's rows: the batch from row `row_offset` of its
-// queries and bitmaps, scored into the scratch's first rows. The pool pools
-// lane l's counts[l] blocks, its records lane_records records apart, and
-// rotates their keys by the target's RoPE scaled by rope_scale, as the
-// queries' tables are (RopeTableParams::target_scale).
-struct BlockIndexerParams {
-  uint32_t lanes;
+// The projection of a command's `sequences` sequences' rows of its `rows`
+// rows (block_indexer_project): sequence s's rows are entry s of the
+// command's layout (SplashLaneRows), a prompt chunk's sequences' as its host
+// writes them or a verify step's lanes' as its proposer does.
+struct BlockIndexerProjectParams {
+  uint32_t sequences;
   uint32_t rows;
-  uint32_t first_position[SPLASH_MAXIMUM_BATCH_WIDTH];
-  uint32_t counts[SPLASH_MAXIMUM_BATCH_WIDTH];
-  uint32_t lane_records;
+};
+
+static_assert(sizeof(BlockIndexerProjectParams) == 8,
+              "block indexer projection parameters are the same size on both sides");
+
+// A prompt sequence's dispatch (block_indexer_pool, block_indexer_score,
+// block_indexer_select), its rows committed as they run: `rows` rows of the
+// queries, keys and bitmaps from their first, the first at logical position
+// first_position + row_offset, through the sequence's index table. The pool
+// pools its `blocks` blocks into the index, rotating their keys by the
+// target's RoPE scaled by rope_scale, as the queries' tables are
+// (RopeTableParams::target_scale). The selection scores a long sequence's
+// rows in batches of the score scratch's rows: the batch from row
+// `row_offset` of its queries and bitmaps, scored into the scratch's first
+// rows.
+struct BlockIndexerSequenceParams {
+  uint32_t first_position;
+  uint32_t rows;
+  uint32_t blocks;
   uint32_t row_offset;
   uint32_t top_blocks;
   uint32_t mask_words;   // 32-bit words of a row's block bitmap
@@ -69,26 +93,59 @@ struct BlockIndexerParams {
   float rope_scale;
 };
 
-static_assert(sizeof(BlockIndexerParams) == 36 + 8 * SPLASH_MAXIMUM_BATCH_WIDTH,
-              "block indexer parameters are the same size on both sides");
+static_assert(sizeof(BlockIndexerSequenceParams) == 36,
+              "block indexer sequence parameters are the same size on both sides");
 
-// The pending keys of each of `lanes` lanes after the first retained[l] of
-// its `rows` rows of a step from first_position[l], in `layers` layers: the
-// keys of the rows' last block that they do not complete, from the step's
-// keys (`layer_rows` rows between two layers') and, before the lane's first
-// row, its pending keys before the step. block_indexer_pending takes the
-// retained rows from these parameters (a prefill sequence's, or those before
-// a state it captures), block_indexer_commit from the counts a verify wrote.
-struct BlockIndexerPendingParams {
+// A verify step's dispatch (block_indexer_pool_tree, block_indexer_score_tree,
+// block_indexer_select_tree) over `lanes` lanes, each through its own index
+// table, whose rows the step's proposer writes on the device, of the step's
+// rows from row 0 (scores and bitmaps alike): lane l's anchor at
+// first_position[l]; its pool's counts[l] records, lane_records records after
+// the lane's before it, of the blocks from the anchor's on, one a block a path
+// of the lane's most rows may complete; and as a sequence's, its budget,
+// bitmap and score widths, index and RoPE scale.
+struct BlockIndexerTreeParams {
   uint32_t lanes;
-  uint32_t rows;
-  uint32_t layer_rows;
   uint32_t first_position[SPLASH_MAXIMUM_BATCH_WIDTH];
-  uint32_t retained[SPLASH_MAXIMUM_BATCH_WIDTH];
+  uint32_t counts[SPLASH_MAXIMUM_BATCH_WIDTH];
+  uint32_t lane_records;
+  uint32_t top_blocks;
+  uint32_t mask_words;
+  uint32_t score_stride;
+  uint32_t index_offset;
+  float rope_scale;
 };
 
-static_assert(sizeof(BlockIndexerPendingParams) == 12 + 8 * SPLASH_MAXIMUM_BATCH_WIDTH,
+static_assert(sizeof(BlockIndexerTreeParams) == 28 + 8 * SPLASH_MAXIMUM_BATCH_WIDTH,
+              "block indexer tree parameters are the same size on both sides");
+
+// A sequence's pending keys after its first `retained` rows from
+// first_position (block_indexer_pending): the keys of the rows' last block
+// that they do not complete, from the rows' keys and, before the first row,
+// its pending keys before them.
+struct BlockIndexerPendingParams {
+  uint32_t first_position;
+  uint32_t retained;
+};
+
+static_assert(sizeof(BlockIndexerPendingParams) == 8,
               "block indexer pending parameters are the same size on both sides");
+
+// The commit after a verify accepted a path of each of `lanes` lanes' rows
+// (block_indexer_commit), in every attention layer: lane l's anchor at
+// first_position[l]; a layer's keys and block keys `layer_rows` rows after
+// the layer's before it, from the step's row 0; attention layer a's index
+// a * index_layer_bytes bytes into every index entry's plane
+// (kv::PageStorage::indexLayerBytes).
+struct BlockIndexerCommitParams {
+  uint32_t lanes;
+  uint32_t layer_rows;
+  uint32_t index_layer_bytes;
+  uint32_t first_position[SPLASH_MAXIMUM_BATCH_WIDTH];
+};
+
+static_assert(sizeof(BlockIndexerCommitParams) == 12 + 4 * SPLASH_MAXIMUM_BATCH_WIDTH,
+              "block indexer commit parameters are the same size on both sides");
 
 // One block to pool: its first token's logical position and RoPE position
 // (t, h, w; text repeats one), to which its pooled key is rotated.

@@ -64,9 +64,10 @@ private:
 };
 
 // A KV disk tier without a disk: slots count against a quota of slots (or, in bytes, a DiskBudget:
-// 100 for a Full page's slot and 30 for a Slim page's, as SlotFile counts what a slot stores),
-// transfers finish when the test says so, and each slot is its own TestKvCopy that readers may
-// outlive.
+// 100 for a Full page's slot and 30 for a Slim page's, standing in for what SlotFile counts of a
+// page of each form, which kv-page-tier-host holds a real tier to), transfers finish when the test
+// says so, and each slot is its own TestKvCopy that readers may outlive. Tests on it check the
+// cache's count of its slots, not the slot file's.
 class TestKvTier final : public engine::KvTier {
 public:
   struct Transfer final {

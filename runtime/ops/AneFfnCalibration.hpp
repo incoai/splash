@@ -96,15 +96,32 @@ struct ChunkTimings final {
 // take again (engine::startAneFfn): the ANE's units and the least rows of a
 // chunk the split takes, none of either when no split gained enough; and the
 // GPU alone's layer at the least and the most rows of the split's functions,
-// which the breaker judges the split against.
+// which the breaker judges the split against. Beside it, how often the
+// Neural Engine refused a split of the model (ane::Refused) since the start
+// that first calibrated it: a record of no split and one refusal calibrates
+// again, and the next refusal leaves no split and kRefusals, the GPU alone,
+// so that a split the Neural Engine refuses each time costs two calibrations
+// at most, not one every other start.
 struct Calibration final {
+  static constexpr uint32_t kRefusals = 2;
   uint32_t aneUnits = 0, minimumRows = 0;
   std::array<ChunkTimings::Gpu, 2> gpu{};
+  uint32_t refusals = 0;
 
+  // What the next start does with `record`, as remembered, in a log's words:
+  // sets its split up, calibrates again or leaves the GPU alone.
+  [[nodiscard]] static std::string nextStart(const std::optional<Calibration> &record);
+  // Why a start that takes this record, of no split, leaves the GPU alone, in
+  // a log's words: no split gained enough, or the Neural Engine refused one.
+  [[nodiscard]] std::string withoutSplit() const;
   // As one line of text, and back: none for text that is not such a line.
   [[nodiscard]] std::string text() const;
   [[nodiscard]] static std::optional<Calibration> parse(std::string_view text);
 };
+// The record `recalled` once the Neural Engine refused the split a start
+// prepared: `kept`, the calibration the next start sets up, or none, with the
+// refusal counted, and none at Calibration::kRefusals.
+[[nodiscard]] Calibration refused(const std::optional<Calibration> &recalled, Calibration kept = {});
 
 // When a split that serves loses to the GPU alone (AneFfnCalibration.cpp):
 // over each kWindow commands it finishes, the Neural Engine's milliseconds

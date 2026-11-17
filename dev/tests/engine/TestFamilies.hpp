@@ -59,6 +59,26 @@ struct AttentionGeometry final {
   return row;
 }
 
+// The history splits of each tile of a sequence of `rows` rows after
+// `history` tokens (ops::PagedAttention's rule, written out): one tile, a
+// split per 16 pages it reads, between 32 and 128; more tiles, a whole split
+// per `pagesPerSplit` pages they read, at least 32 shared out over them and
+// at most 32, nor 256 over them; with a window, the pages a window reads at
+// most, a split each. A sparse sequence of more than one tile reads its
+// lists, the shared splits alone.
+[[nodiscard]] constexpr uint32_t attentionSplits(uint32_t rows, uint32_t history, bool sparse,
+                                                 uint32_t windowTokens = 0, uint32_t pagesPerSplit = 32) noexcept {
+  const uint32_t tiles = (rows + 7) / 8;
+  const uint32_t windowPages = (windowTokens + 7 + 31) / 32 + 1;
+  uint64_t pages = sparse && tiles > 1 ? 0 : (uint64_t{history} + rows + 31) / 32;
+  if (windowTokens) pages = std::min<uint64_t>(pages, windowPages);
+  const uint32_t fewest = std::clamp(32U / tiles, 1U, 32U);
+  const uint32_t most = std::clamp(256U / tiles, fewest, 32U);
+  const auto splits = static_cast<uint32_t>(tiles == 1 ? std::clamp<uint64_t>((pages + 15) / 16, 32, 128)
+                                                       : std::clamp<uint64_t>(pages / pagesPerSplit, fewest, most));
+  return windowTokens ? std::min(splits, windowPages) : splits;
+}
+
 // A family's attention geometry.
 template <class Family> [[nodiscard]] AttentionGeometry attentionGeometry(const Family &family) {
   const kv::Layout layout = family.kvLayout();

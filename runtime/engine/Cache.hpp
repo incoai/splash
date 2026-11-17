@@ -46,6 +46,9 @@ struct CacheLookup final {
   // A matched block deeper than the state once held a reusable state that
   // is gone from both tiers.
   bool lostState = false;
+  // A matched block held a reply's state (KvCache::noteReply): the prompt
+  // renders an earlier reply back, as far as that block at least.
+  bool rendersReply = false;
 
   [[nodiscard]] uint32_t resumeBoundary() const noexcept {
     return state ? state->boundary() : 0;
@@ -430,12 +433,16 @@ public:
   // once after they land: the bytes of the pages they copy and of the RAM
   // copy of the state they write.
   [[nodiscard]] uint64_t copyingAheadBytes() const noexcept;
-  // At a clean stop: the label of each state copy a persistent tier keeps
-  // takes its state's current recency, which the next process orders them
-  // by; a copy takes its state's class as soon as a checkpoint becomes
-  // ordinary, which a crash keeps too. KV copies keep the labels of their
-  // writes: a chain goes with the states that need it (freeDiskSpace).
-  void relabelStates() const;
+  // At a clean stop: the KV copies no state needs go, as a full quota gives
+  // them up first (freeDiskSpace), since the next process takes back only
+  // restore points (adopt), each at once, its punch queued, and none past
+  // `end`; each state copy's label takes its state's current recency, which
+  // the next process orders them by.
+  void closePersistentTier(AwakeClock::time_point end = AwakeClock::time_point::max()) {
+    while (AwakeClock::now() < end && kv_.unneededCopy())
+      static_cast<void>(freeDiskSpace(false, false));
+    states_.relabel();
+  }
   // Measures the volume the disk tier lives on and sets the budget's limit
   // (DiskSpace::measure), for keepDiskLimit(); none without such a tier.
   void setDiskMeasure(std::function<void()> measure) { diskMeasure_ = std::move(measure); }
@@ -559,8 +566,8 @@ public:
   // alone gives a claim that keeps no Full runway. None under --kv-spill
   // always, whose landings count them. Counted in whole extents of its own
   // pages, a lane on a finished lane's prefix gave one extent of its 511
-  // releasable pages beside 3 free ones, and its 390 MiB hot block floor
-  // failed it at a limit where it completes alone, on Qwen3.8-Flash-Next at
+  // releasable pages beside 3 free ones, and its hot block floor failed it
+  // at a limit where it completes alone, on Qwen3.8-Flash-Next at
   // 9.38G and 9.43G.
   [[nodiscard]] uint32_t releaseBeside(const VictimQuery &query) const;
   // A Spill request's pages a release moves to the index form, oldest
@@ -795,6 +802,9 @@ public:
   [[nodiscard]] bool stateResident(uint64_t kvBlock) const noexcept;
   // False only while this exact disposable publication is pinned.
   bool retireCheckpointState(StateCheckpoint checkpoint) noexcept;
+  // A reply's state, opportunistic or kept (StateCache::markReply).
+  void markReply(StateCheckpoint checkpoint) noexcept { states_.markReply(checkpoint); }
+  void keepReply(StateCheckpoint checkpoint) noexcept { states_.keepReply(checkpoint); }
   // This exact disposable publication is pinned: retireCheckpointState
   // refuses it.
   [[nodiscard]] bool checkpointPinned(StateCheckpoint checkpoint) const noexcept {

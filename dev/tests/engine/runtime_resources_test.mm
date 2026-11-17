@@ -130,10 +130,11 @@ StreamedStart startStreamed(const RuntimeResourcesConfig &config, uint32_t reque
 // before a streamable part loads whole: the first 64K tokens (the window
 // where that is less) and their speculative rows, in the fewest pages whose
 // extents hold them as one request's KV capacity rounds them
-// (kvCapacityPagesFor), less the runway among the floors. A part loads whole
-// only where the budget holds its floors, all of it and this allowance. It is
-// not the allowance a store's growth above its smallest is priced with, which
-// in a windowed layout also keeps a streamed command's pages Full.
+// (kvCapacityPagesFor), with their tokens' lookup index, less the runway
+// among the floors. A part loads whole only where the budget holds its
+// floors, all of it and this allowance. It is not the allowance a store's
+// growth above its smallest is priced with, which in a windowed layout also
+// keeps a streamed command's pages Full.
 uint64_t residentAllowanceBytes(const RuntimeResourcesConfig &config) {
   kv::Layout layout = config.model.targetKvLayout;
   layout.format = config.kvFormat;
@@ -142,8 +143,9 @@ uint64_t residentAllowanceBytes(const RuntimeResourcesConfig &config) {
   const uint64_t pages = (tokens + kv::kPageTokens - 1) / kv::kPageTokens;
   uint64_t budget = pages;
   while (kvCapacityPagesFor(layout, budget) < pages) ++budget;
-  return kvPagesBytes(layout, budget, kvWindowFloorPages(layout, 0), layout.extentPagesFor(budget)) -
-         kvRunwayPages(layout.minimumExtentPages()) * layout.bytesPerModelPage();
+  const uint64_t index = kv::kPageTokens * model::kLookupIndexTokenBytes;
+  return kvPagesBytes(layout, budget, kvWindowFloorPages(layout, 0), layout.extentPagesFor(budget)) + budget * index -
+         kvRunwayPages(layout.minimumExtentPages()) * (layout.bytesPerModelPage() + index);
 }
 
 // The runtime memory a start plans of a model of `config` before its weights
@@ -393,11 +395,12 @@ void testAutomaticExpertMemory(RuntimeResourcesConfig config) {
   }
 }
 
-// --verify-rows: by default a MoE target's decode cycles verify the rows the
-// verify budget chooses, whether its routed experts load with their layers or
-// stream from the SSD, and a dense target's every row; `all` verifies every
-// row. The start says which, and the runtime built on what it assembled runs
-// it.
+// --verify-rows: by default a target's decode cycles verify the rows of the
+// step their measured costs choose, a MoE target's whose routed experts load
+// with their layers too, and those of a target whose experts stream from the
+// SSD the rows their cost line's floor passes (model::CostLine); `all`
+// verifies every row of a draft's block. The start says which in one line a
+// mode, and the runtime built on what it assembled runs it.
 void testVerifyRows(const char *metallibPath, RuntimeResourcesConfig moe) {
   struct Started final {
     std::string log;
@@ -422,21 +425,22 @@ void testVerifyRows(const char *metallibPath, RuntimeResourcesConfig moe) {
     const Started started = start(config);
     require(started.log.find(line) != std::string::npos && started.budget == budget, message);
   };
-  const std::string_view budgeted = "Decode cycles verify the rows the verify budget chooses (--verify-rows auto, as "
-                                    "moe-test is a MoE target): greedy and seeded outputs can differ from run to run.";
+  const std::string_view budgeted = "Decode cycles verify the rows of the step their measured costs choose "
+                                    "(--verify-rows auto): greedy and seeded outputs can differ from run to run.";
   requireStart(moe, budgeted, true, "a MoE target with resident experts did not budget its rows");
   // A budget a byte short of the whole model's minimum, below the one that
   // holds every expert and the KV allowance, streams them.
   moe.maximumMemoryBytes = startStreamed(moe).minimumRequired - 1;
-  requireStart(moe, budgeted, true, "a MoE target whose experts stream did not budget its rows");
+  requireStart(moe,
+               "Decode cycles verify the rows their cost line's floor passes (--verify-rows auto): greedy and "
+               "seeded outputs can differ from run to run.",
+               true, "a MoE target whose experts stream did not follow its cost line's floor");
   moe.verifyRows = model::VerifyRows::All;
   requireStart(moe, "Decode cycles verify every row of the draft's block (--verify-rows all).", false,
                "--verify-rows all did not verify every row of a MoE target");
   const test::TemporaryDirectory root("splash-verify-rows");
-  requireStart(loadableConfig(metallibPath, root.path(), "verify-rows-test"),
-               "Decode cycles verify every row of the draft's block (--verify-rows auto, as verify-rows-test is "
-               "dense).",
-               false, "a dense target did not verify every row");
+  requireStart(loadableConfig(metallibPath, root.path(), "verify-rows-test"), budgeted, true,
+               "a dense target's steps did not follow the verify budget");
 }
 
 // Startup fails at the loader, whose vision weight files are deliberately
@@ -503,16 +507,15 @@ void testPersistentCacheNamespace() {
                   name &&
               persistentCacheNamespace(identity('a', "build", kv::Format::BFloat16),
                                        model.stateLayout) != name &&
-              persistentCacheNamespace(identity('a', "build", kv::Format::Int8), states) != name &&
-              persistentCacheNamespace(identity('a', "build", kv::Format::Int8), bfloatStates) != name,
-          "other models, layouts or state formats shared a cache namespace");
-  // A dense layout's namespace is the one main (be3b083c) names, with FP32
-  // and BF16 states: a change of its lines would leave every 27B's and 35B's
+              persistentCacheNamespace(identity('a', "build", kv::Format::Int8), states) != name,
+          "other models or layouts shared a cache namespace");
+  // A cached state holds the codes of its recurrent layers (ops::StateCodec)
+  // whatever the lanes' state format, so both formats read one namespace:
+  // the dense layout's, whose change would leave every 27B's and 35B's
   // persistent cache cold.
-  require(name == "6365d687c8be103a3bbcc6d2a83b1543" &&
-              persistentCacheNamespace(identity('a', "build", kv::Format::Int8), bfloatStates) ==
-                  "172879058b5e2bcc713e129a2b62393a",
-          "a dense layout's cache namespace is not the one main names");
+  require(name == "88a6a28cadb13dc02b99998aa48baa72" &&
+              persistentCacheNamespace(identity('a', "build", kv::Format::Int8), bfloatStates) == name,
+          "a dense layout's cache namespace is not the one its codes name");
   // A QSA layout's pages hold token-major values and the index's pooled
   // keys, and its states the PLE history and the index's pending keys.
   RuntimeCacheIdentity tokenMajor = identity('a', "build", kv::Format::Int8), indexed = tokenMajor;
@@ -1089,9 +1092,13 @@ void testARestoreAfterTheOtherWarmupsCreatesNothing(const char *metallibPath) {
 
 // A verify's kernels follow its lanes' history, which the decode warmups'
 // is short of: past 7.2K tokens Apple10's INT8 attention scores INT8 queries
-// (verify_attention_q8q_split; no Apple9 GPU does). After the start's
-// warmups, a request of 8K tokens creates no pipeline: each decode warmup
-// created its verify's after the longest history.
+// (attention_q8q_split; no Apple9 GPU does). They follow its step's lane cap
+// too: a lane of more than eight rows takes the 16-row GDN kernels. After
+// the start's warmups, a request of 8K tokens creates no pipeline in its
+// first cycle, which a thinking budget of no tokens fills with its end's 16
+// tokens, each certain, so that the cycle takes a verify block's rows: each
+// decode warmup created the steps' of each lane cap after the longest
+// history.
 void testALongRequestAfterTheWarmupsCreatesNothing(const char *metallibPath) {
   const test::TemporaryDirectory root("splash-long-request-pipelines");
   RuntimeResourcesConfig config = loadableConfig(metallibPath, root.path(), "long-request-pipelines-test");
@@ -1119,8 +1126,11 @@ void testALongRequestAfterTheWarmupsCreatesNothing(const char *metallibPath) {
   for (uint32_t page = 0; page < pages.size(); ++page) pages[page] = page % model::ExecutionLimits::warmupKvPages;
   auto &executor = dynamic_cast<model::Runtime &>(*runtime);
   constexpr uint64_t id = 736;
+  ThinkingBudget thinking{0, {}, 0};
+  for (uint32_t token = 100; token <= 116; ++token) thinking.end.push_back(token);
+  thinking.alsoEnds = thinking.end.back();
   const std::string log = test::capturedStderr([&] {
-    executor.beginColdRequest({.id = id, .prompt = prompt, .maxNewTokens = 16}, 0);
+    executor.beginColdRequest({.id = id, .prompt = prompt, .maxNewTokens = 32, .thinkingBudget = &thinking}, 0);
     for (uint32_t position = 0; position < history; position += chunk) {
       ModelBatchItem item{
           .requestId = id, .logicalPosition = position, .tokenCount = chunk, .pageTable = pages, .pageTableRevision = 1};
@@ -1136,10 +1146,124 @@ void testALongRequestAfterTheWarmupsCreatesNothing(const char *metallibPath) {
                                          std::span<const ModelBatchItem>(&item, 1));
     require(decoded.size() == 1 && decoded[0].failure.empty() && !decoded[0].outputTokens.empty(),
             "the long request's decode failed");
+    require(decoded[0].outputTokens.size() > model::ExecutionLimits::draftQueryRows,
+            "the long request's first cycle verified no more than eight rows");
     executor.end(id);
   });
   require(backend.pipelinesCreatedWhileServing() == 0,
           "a request of 8K tokens after the start's warmups created pipelines: " + log);
+}
+
+// A reply's state is captured in decode, at the page its cycle's retained
+// rows reach (Model::capturesInDecode), by a fold of the verify's tape that no
+// prompt runs. After the start's warmups, a cycle that captures a state at
+// its page creates no pipeline: each decode warmup created the capture's.
+void testAReplyCaptureAfterTheWarmupsCreatesNothing(const char *metallibPath) {
+  const test::TemporaryDirectory root("splash-reply-capture-pipelines");
+  RuntimeResourcesConfig config = loadableConfig(metallibPath, root.path(), "reply-capture-pipelines-test");
+  std::unique_ptr<RuntimeResources> resources;
+  static_cast<void>(test::capturedStderr([&] { resources = RuntimeResources::create(config, 0); }));
+  const EngineMemoryBreakdown &budget = resources->memoryPlan().breakdown();
+  std::unique_ptr<model::RuntimeModel> runtime;
+  require(static_cast<bool>(resources->memoryGovernor().allocationAdmission()(
+              budget.sharedPrefillBytes + budget.sharedDecodeBytes,
+              [&] { runtime = model::createRuntime(resources->modelContext()); })),
+          "the runtime's arenas were refused");
+  require(runtime->capturesInDecode(), "the reply capture's model captures no state in decode");
+  const KvPool::RunwayHold runway(resources->kvPool());
+  static_cast<void>(runtime->warmupPrefill(model::ExecutionLimits::prefillTokenBudget));
+  for (const uint32_t rows : resources->modelContext().operators.prefillRowClasses())
+    static_cast<void>(runtime->warmupPrefill(rows));
+  static_cast<void>(runtime->warmupDecodeBatch(1));
+  metal::MetalBackend &backend = resources->backend();
+  backend.beginServing();
+  // A prompt a row short of a page, whose first cycle's first retained row
+  // reaches the page, on the runway's pages.
+  constexpr uint32_t tokens = kv::kPageTokens - 1;
+  const std::vector<uint32_t> prompt(tokens, 7);
+  const std::vector<uint32_t> pages{0, 1};
+  auto &executor = dynamic_cast<model::Runtime &>(*runtime);
+  constexpr uint64_t id = 737;
+  bool captured = false;
+  const std::string log = test::capturedStderr([&] {
+    executor.beginColdRequest({.id = id, .prompt = prompt, .maxNewTokens = 16}, 0);
+    ModelBatchItem chunk{.requestId = id, .tokenCount = tokens, .pageTable = pages, .pageTableRevision = 1};
+    chunk.inputTokens = prompt;
+    const auto prefilled = executor.prefill({.kind = WorkKind::Prefill, .items = {{id, tokens}}},
+                                            std::span<const ModelBatchItem>(&chunk, 1));
+    require(prefilled.size() == 1 && prefilled[0].failure.empty() && prefilled[0].outputTokens.empty(),
+            "the reply's prompt failed or ended it");
+    ModelBatchItem item{.requestId = id, .logicalPosition = tokens, .pageTable = pages, .pageTableRevision = 1};
+    metal::AllocationFailure refusal;
+    item.stateCaptures.push_back({kv::kPageTokens, executor.reserveState(id, kv::kPageTokens, refusal)});
+    require(item.stateCaptures.back().reservation != nullptr, "the buffers of the reply's state were refused");
+    auto decoded = executor.decode({.kind = WorkKind::Decode, .items = {{id, 0}}},
+                                   std::span<const ModelBatchItem>(&item, 1));
+    require(decoded.size() == 1 && decoded[0].failure.empty() && !decoded[0].outputTokens.empty(),
+            "the reply's cycle failed");
+    captured = decoded[0].capturedStates.size() == 1;
+    decoded.clear();
+    item = {};
+    executor.end(id);
+  });
+  require(captured, "the reply's cycle captured no state at its page: " + log);
+  require(backend.pipelinesCreatedWhileServing() == 0,
+          "a cycle that captured a reply's state after the start's warmups created pipelines: " + log);
+}
+
+// The engine reserves a state to capture in decode at a page up to a verify
+// block's rows ahead (Engine::reserveReplyCapture), not knowing the rows the
+// runtime gives the lane in a cycle. A cycle of 8 rows a lane given a page 12
+// rows ahead captures nothing and fails nothing, as one whose acceptance
+// falls short does; the cycle whose retained rows reach the page seals the
+// state.
+void testADecodeCapturePastItsCycleWaits(const char *metallibPath) {
+  const test::TemporaryDirectory root("splash-decode-capture");
+  RuntimeResourcesConfig config = loadableConfig(metallibPath, root.path(), "decode-capture-test");
+  std::unique_ptr<RuntimeResources> resources;
+  static_cast<void>(test::capturedStderr([&] { resources = RuntimeResources::create(config, 0); }));
+  const EngineMemoryBreakdown &budget = resources->memoryPlan().breakdown();
+  std::unique_ptr<model::RuntimeModel> runtime;
+  require(static_cast<bool>(resources->memoryGovernor().allocationAdmission()(
+              budget.sharedPrefillBytes + budget.sharedDecodeBytes,
+              [&] { runtime = model::createRuntime(resources->modelContext()); })),
+          "the runtime's arenas were refused");
+  const KvPool::RunwayHold runway(resources->kvPool());
+  auto &executor = dynamic_cast<model::Runtime &>(*runtime);
+  require(executor.capturesInDecode(), "the planned model captures no state in decode");
+  // The prompt ends 12 rows before the page; its pages repeat the runway's.
+  constexpr uint32_t page = kv::kPageTokens, promptTokens = page - 12;
+  static_assert(page - promptTokens > model::ExecutionLimits::draftQueryRows &&
+                    page - promptTokens <= model::ExecutionLimits::targetVerifyRows,
+                "the page lies past a cycle's lane rows and within a verify block's");
+  const std::vector<uint32_t> prompt(promptTokens, 7);
+  std::vector<uint32_t> pages(3);
+  for (uint32_t index = 0; index < pages.size(); ++index) pages[index] = index % model::ExecutionLimits::warmupKvPages;
+  constexpr uint64_t id = 738;
+  const test::ClaimScope claim(resources->memoryGovernor(), ClaimClass::Optional);
+  executor.beginColdRequest({.id = id, .prompt = prompt, .maxNewTokens = 64}, 0);
+  ModelBatchItem chunk{.requestId = id, .tokenCount = promptTokens, .pageTable = pages, .pageTableRevision = 1};
+  chunk.inputTokens = prompt;
+  const auto prefilled = executor.prefill({.kind = WorkKind::Prefill, .items = {{id, promptTokens}}},
+                                          std::span<const ModelBatchItem>(&chunk, 1));
+  require(prefilled.size() == 1 && prefilled[0].failure.empty() && prefilled[0].outputTokens.empty(),
+          "the prompt failed or ended the request");
+  uint64_t position = promptTokens;
+  for (uint32_t cycle = 0; position < page; ++cycle) {
+    require(cycle < page - promptTokens, "the lane's cycles never reached its page");
+    ModelBatchItem item{.requestId = id, .logicalPosition = position, .pageTable = pages, .pageTableRevision = 1};
+    metal::AllocationFailure refusal = metal::AllocationFailure::None;
+    item.stateCaptures.push_back({page, executor.reserveState(id, page, refusal)});
+    require(item.stateCaptures.back().reservation != nullptr, "the state to capture was refused");
+    const auto decoded =
+        executor.decode({.kind = WorkKind::Decode, .items = {{id, 0}}}, std::span<const ModelBatchItem>(&item, 1));
+    require(decoded.size() == 1 && decoded[0].failure.empty(), "a cycle given a page to capture failed");
+    position += decoded[0].outputTokens.size() - decoded[0].outputTokensWithoutKv;
+    require(decoded[0].capturedStates.size() == (position >= page ? 1U : 0U),
+            position >= page ? "the cycle that reached its page sealed no state"
+                             : "a cycle that fell short of its page sealed a state");
+  }
+  executor.end(id);
 }
 
 // The SSD cache holds no write back unless a write budget is set; one that
@@ -1298,6 +1422,19 @@ void testAutomaticContextIgnoresTheVolume(const char *metallibPath) {
   require(!off.tier && room.tier && room.staging == config.model.stateLayout.cachedBytes() &&
               room.context == room.planContext && room.context < off.context,
           "the automatic tier did not start beside its staging, or the staging cost no context");
+  // A cached state in the running format (--cached-states exact) stages and
+  // counts as a lane's cell and window, more than its codes.
+  model::CompositeStateLayout running = config.model.stateLayout;
+  running.target.format = config.stateFormat;
+  running.target.cachedCodes = false;
+  config.exactCachedStates = true;
+  config.maximumMemoryBytes += running.cachedBytes();
+  const Started exact = start();
+  require(exact.tier && exact.staging == running.cachedBytes() &&
+              running.cachedBytes() > config.model.stateLayout.cachedBytes(),
+          "an exact cached state did not stage as the running state holds it");
+  config.exactCachedStates = false;
+  config.maximumMemoryBytes -= running.cachedBytes();
   const std::array<std::pair<std::optional<DiskVolume>, std::string>, 3> refusals{{
       {localVolume(11 * kGiB), "11.0 GiB available on /Volumes/Test is too little beyond the 10.0 GiB"},
       {std::nullopt, "its volume cannot be measured"},
@@ -1649,6 +1786,50 @@ void testThePlanCountsEveryBuffer(const char *metallibPath) {
   require(audit.valid && !audit.backendUnclassifiedBytes,
           "the backend holds " + std::to_string(audit.backendUnclassifiedBytes) +
               " bytes of buffers the memory plan does not count");
+}
+
+// The decode arena holds a step of four lanes of a verify block's 16 rows,
+// packed: a lane's rows of a row tensor, the step's own or its target's, are
+// those from its first row on, by the tensor's row (fp32 logits of the
+// vocabulary, a token, three rotary positions, a tree row, a hidden row), and
+// every row of a step fits; rows past the step's and a lane's own tensor are
+// refused.
+void testDecodeArenaHoldsAStepsPackedRows(const char *metallibPath) {
+  const test::TemporaryDirectory root("splash-decode-rows");
+  const RuntimeResourcesConfig config = loadableConfig(metallibPath, root.path(), "decode-rows");
+  metal::MetalBackend backend(metallibPath);
+  const model::LoadedModel loaded = model::loadModel(backend, config.modelRoot, config.model);
+  const auto geometry = model::RuntimeGeometry::from(loaded, kv::Format::Int8, ops::GdnStateFormat::Float32);
+  const ops::ExecutionPlans operators(backend.capabilities(), ops::Int8Activations::On);
+  const model::DecodeArena arena(backend, geometry, operators);
+  constexpr uint32_t kStepRows = model::kLaneCount * model::ExecutionLimits::targetVerifyRows;
+  const auto at = [](const metal::MetalBuffer &buffer) { return static_cast<const std::byte *>(buffer.contents()); };
+  // A lane's rows after lanes of 16 and 5.
+  constexpr ops::LaneRows lane{21, 11};
+  const uint64_t hiddenRow = uint64_t{geometry.target.hiddenSize} * sizeof(uint16_t);
+  const std::pair<model::DecodeTensor, uint64_t> rowTensors[] = {
+      {model::DecodeTensor::Logits, uint64_t{geometry.target.vocabularySize} * sizeof(float)},
+      {model::DecodeTensor::InputTokens, sizeof(uint32_t)},
+      {model::DecodeTensor::OutputTokens, sizeof(uint32_t)},
+      {model::DecodeTensor::TreeRows, sizeof(ops::TreeRow)},
+      {model::DecodeTensor::FinalHidden, hiddenRow},
+      {model::DecodeTensor::CapturedTargetHidden, uint64_t{geometry.target.capturedHiddenSize()} * sizeof(uint16_t)}};
+  for (const auto &[tensor, row] : rowTensors) {
+    const metal::MetalBuffer step = arena.batchSlice(tensor, model::kLaneCount);
+    const metal::MetalBuffer rows = arena.rows(tensor, lane);
+    require(step.sizeBytes() == kStepRows * row && arena.rows(tensor, {0, kStepRows}).sizeBytes() == step.sizeBytes() &&
+                at(rows) == at(step) + lane.first * row && rows.sizeBytes() == lane.rows * row,
+            "a lane's rows of a decode row tensor are not its packed rows");
+  }
+  const metal::MetalBuffer hidden = arena.target().get(model::TargetTensor::Hidden0);
+  const metal::MetalBuffer hiddenRows = arena.rows(model::TargetTensor::Hidden0, lane);
+  require(hidden.sizeBytes() == kStepRows * hiddenRow && at(hiddenRows) == at(hidden) + lane.first * hiddenRow &&
+              hiddenRows.sizeBytes() == lane.rows * hiddenRow,
+          "a lane's rows of a target row tensor are not its packed rows");
+  rejects([&] { static_cast<void>(arena.rows(model::DecodeTensor::Logits, {kStepRows - 1, 2})); },
+          "invalid decode step rows", "rows past a decode step's were viewed");
+  rejects([&] { static_cast<void>(arena.rows(model::DecodeTensor::SamplingUniforms, {0, 1})); },
+          "holds no step rows", "a lane's own decode tensor was viewed as a step's rows");
 }
 
 // The ledger's accounts sum to what the governor charges: at Ready a start of
@@ -2089,6 +2270,8 @@ int main(int argc, char **argv) {
       testYarnRuntime(argv[1]);
       testARestoreAfterTheOtherWarmupsCreatesNothing(argv[1]);
       testALongRequestAfterTheWarmupsCreatesNothing(argv[1]);
+      testAReplyCaptureAfterTheWarmupsCreatesNothing(argv[1]);
+      testADecodeCapturePastItsCycleWaits(argv[1]);
       testWriteBudgetOnlyWhenSet(argv[1]);
       testStaleCachesGoAtEveryStart(argv[1]);
       testMadeCacheRootStaysOutOfBackups(argv[1]);
@@ -2102,6 +2285,7 @@ int main(int argc, char **argv) {
       testTheTableIgnoresTheHostsSpareMemory(argv[1]);
       testEngineFollowsTheGovernor(argv[1]);
       testThePlanCountsEveryBuffer(argv[1]);
+      testDecodeArenaHoldsAStepsPackedRows(argv[1]);
       testDenseRuntimeBoundary(argv[1]);
       testSpilledRuntimeBoundary(argv[1]);
       testThePlanCountsTheSpilledKvReadersTables(argv[1]);

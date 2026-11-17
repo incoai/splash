@@ -100,8 +100,8 @@ constexpr unsigned kQos = QOS_CLASS_DEFAULT;
 constexpr auto kWaitSlice = std::chrono::milliseconds(50);
 
 [[noreturn]] void fail(const char *what, NSError *error) {
-  throw std::runtime_error(std::string("ANE ") + what + " failed" +
-                           (error ? std::string(": ") + error.description.UTF8String : std::string()));
+  throw Refused(std::string("ANE ") + what + " failed" +
+                (error ? std::string(": ") + error.description.UTF8String : std::string()));
 }
 
 // Runs `body`, which messages the private interface, and throws an
@@ -839,12 +839,13 @@ std::optional<std::string> recall(std::string_view key) noexcept {
   return std::nullopt;
 }
 
-void remember(std::string_view key, std::string_view line) noexcept {
+bool remember(std::string_view key, std::string_view line) noexcept {
   try {
     std::filesystem::create_directories(cacheDirectory());
     writeWhole(rememberedFile(key), bytesOf(line));
+    return true;
   } catch (const std::exception &) {
-    // The next start calibrates again.
+    return false;
   }
 }
 

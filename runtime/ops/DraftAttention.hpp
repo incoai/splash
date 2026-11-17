@@ -2,6 +2,7 @@
 
 #include "metal/CommandGraph.hpp"
 #include "metal/abi/ExecutionGeometry.h"
+#include "ops/LaneRows.hpp"
 
 #include <cstdint>
 #include <span>
@@ -105,14 +106,21 @@ public:
       metal::MetalBuffer ropeSin, metal::MetalBuffer keys,
       metal::MetalBuffer values, uint32_t tokens, uint32_t startPosition,
       DraftAttentionShape shape);
+  // Each lane's retained rows of a decode step (a GPU mask of its rows, which
+  // acceptance writes) among its rows of the step (laneRows, SplashLaneRows,
+  // which the step's proposer writes): the path's context rows among the
+  // lane's of contextKv, its i-th at the lane's start position plus i,
+  // rotated by the lane's RoPE row i (a lane's RoPE rows hold its verify
+  // block's positions, SPLASH_TARGET_VERIFY_ROWS a lane).
   static void addContextCommit(
       metal::CommandGraph &graph, metal::MetalBuffer contextKv,
       metal::MetalBuffer keyNorm, metal::MetalBuffer ropeCos,
       metal::MetalBuffer ropeSin,
       std::span<const metal::MetalBuffer> persistentKeys,
       std::span<const metal::MetalBuffer> persistentValues,
-      metal::MetalBuffer retainedCounts,
-      std::span<const uint32_t> startPositions, DraftAttentionShape shape);
+      metal::MetalBuffer retainedRows, metal::MetalBuffer laneRows,
+      std::span<const uint32_t> startPositions, const StepRows &step,
+      DraftAttentionShape shape);
 
   // A context window: for each slot of a ring, the bf16 context row of
   // `width` values the slot's keys and values are computed from, in 4-bit
@@ -124,6 +132,18 @@ public:
                              metal::MetalBuffer context,
                              metal::MetalBuffer window, uint32_t rows,
                              uint32_t startPosition, uint32_t width);
+  // Stores the first `rows` (at most a verify block's) of the context rows a
+  // lane retained of its rows of a decode step of `contextRows` context rows
+  // (`retained`, its acceptance's mask of them, metal/abi/VerifyTree.h, among
+  // its rows `laneRows`, SplashLaneRows), the path's i-th at position
+  // startPosition + i, as addWindowStore does.
+  static void addWindowCommit(metal::CommandGraph &graph,
+                              metal::MetalBuffer context,
+                              metal::MetalBuffer window,
+                              metal::MetalBuffer retained,
+                              metal::MetalBuffer laneRows,
+                              uint32_t contextRows, uint32_t rows,
+                              uint32_t startPosition, uint32_t width);
   // Loads the rows of positions startPosition on back into `rows` rows.
   static void addWindowLoad(metal::CommandGraph &graph,
                             metal::MetalBuffer window,

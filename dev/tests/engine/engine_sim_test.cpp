@@ -380,7 +380,7 @@ struct Churn final {
 // One decode command of `decoders` lanes at the experts' `share`,
 // `spillLanes` of them reading spilled K/V.
 double decodeCommand(const test::TimingProfile &profile, uint32_t decoders, double share, uint32_t spillLanes) {
-  return test::decodeTimes(profile, decoders, decoders * model::ExecutionLimits::targetVerifyRows, share, spillLanes)
+  return test::decodeTimes(profile, decoders, decoders * model::ExecutionLimits::draftQueryRows, share, spillLanes)
       .wallMilliseconds;
 }
 

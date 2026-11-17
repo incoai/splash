@@ -362,8 +362,12 @@ extension LaunchOption {
             section: .memory, kind: .choice(standard: "8-bit", choices: [("bf16", "16-bit")], custom: nil)),
         LaunchOption(
             flag: "--state-format", title: "Recurrent state",
-            help: "How a hybrid model such as Qwen3.6 keeps its state. 16-bit takes half the memory, so twice as many fit.",
+            help: "How a hybrid model such as Qwen3.6 keeps the state of the requests it is running. 16-bit takes half the memory. Cached conversations keep the form Cached state sets.",
             section: .memory, kind: .choice(standard: "32-bit", choices: [("bf16", "16-bit")], custom: nil)),
+        LaunchOption(
+            flag: "--cached-states", title: "Cached state",
+            help: "How a hybrid model such as Qwen3.6 keeps the state of each conversation it has cached, in memory and on the SSD. 8-bit takes the least room. Exact keeps the state as Recurrent state runs it, so a conversation goes on exactly where it left off, in up to 3.25 times the room.",
+            section: .memory, kind: .choice(standard: "8-bit", choices: [("exact", "Exact")], custom: nil)),
         LaunchOption(
             flag: "--expert-memory", title: "Expert cache",
             help: "MoE expert weights kept in memory; the others are read from the SSD as needed. Auto gives them what the context leaves. All keeps every expert in memory.",
@@ -505,7 +509,7 @@ extension LaunchOption {
                                                                      parse: { Double($0).flatMap { $0 >= 0 ? String($0) : nil } }))),
         LaunchOption(
             flag: "--verify-rows", title: "Repeatable answers",
-            help: "A MoE model’s greedy and seeded answers repeat when a request runs alone with the same prompts cached, at some cost in speed. A prompt sent again reads from the cache, so its answer can differ.",
+            help: "Greedy and seeded answers repeat when a request runs alone with the same prompts cached, at some cost in speed. A prompt sent again reads from the cache, so its answer can differ.",
             section: .requests, kind: .choice(standard: "Off", choices: [("all", "On")], custom: nil)),
         LaunchOption(
             flag: "--disable-ane", title: "Neural Engine for long prompts",

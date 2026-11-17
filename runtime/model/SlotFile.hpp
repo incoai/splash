@@ -238,7 +238,8 @@ public:
   // Bytes the budget's files hold on disk: for each slot's range, what the
   // slot written there since its blocks last went back counts
   // (SlotFile::quotaBytesFor), the most of them where a punch failed between
-  // two.
+  // two, and the whole range where it lies in a hole a write past the
+  // file's end left whose punch failed.
   [[nodiscard]] uint64_t fileBytes() const noexcept {
     return file_.load(std::memory_order_relaxed);
   }
@@ -526,8 +527,11 @@ public:
   // Flushes the slots and records written so far to the drive.
   [[nodiscard]] std::shared_ptr<Operation> synchronize(std::function<void()> completion);
   // The process is ending: a slot dropped from now on keeps its blocks and
-  // its record for the next one.
-  void seal() noexcept;
+  // its record for the next one, which frees them (finishAdoption), and so
+  // does one whose punch has not started by `punchesEnd`, the earliest any
+  // seal gave: the worker starts no punch past it, so that an operation
+  // after the punches waits past it for one punch at most.
+  void seal(AwakeClock::time_point punchesEnd = AwakeClock::time_point::max()) noexcept;
   // The spans total at most one slot, a write's no more host pages than its
   // slot was acquired for and exactly the segments in a file of several, and
   // stay valid until the operation is ready. A write stores them in order

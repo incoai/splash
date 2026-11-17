@@ -48,7 +48,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
-from jinja2 import Environment, TemplateError, TemplateSyntaxError, nodes
+from jinja2 import Environment, TemplateError, TemplateSyntaxError, meta, nodes
 from jinja2.ext import Extension
 from jinja2.lexer import Token
 
@@ -200,6 +200,10 @@ class ChatTemplate:
     # What the template writes from a reasoning's end through its close, such
     # as Qwen's line break and </think>; None where the probe found none.
     thinking_end: str | None
+    # Whether it reads reasoning_effort, which a request's chat_template_kwargs
+    # can set over Splash's own: one that reads only enable_thinking, as
+    # Qwen3.6's does, renders without it.
+    reads_effort: bool
 
     def accepts(self, messages):
         """Whether requests with these normalized messages are served: a
@@ -372,7 +376,19 @@ def _prepare(render, encode, source):
         probe,
         *_reasoning(render, source),
         _thinking_end(render, source),
+        _reads_effort(source),
     )
+
+
+def _reads_effort(source):
+    """Whether the template reads reasoning_effort; not one that Jinja cannot
+    compile, which renders no request."""
+    try:
+        return "reasoning_effort" in meta.find_undeclared_variables(
+            _ENVIRONMENT.parse(source)
+        )
+    except TemplateError:
+        return False
 
 
 def _thinking_end(render, source):

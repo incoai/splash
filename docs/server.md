@@ -175,6 +175,7 @@ paths for `--model-dir`, `--draft-model` and `--mmproj`.
 | `--max-context` | Auto | Set the context limit, e.g. `100K` or `1M` (K = 1024 tokens, M = 1,000,000), up to the model's limit; past the 256K native window a model with YaRN turns it on. See [memory and context](#memory-and-context). |
 | `--kv-format` | `int8` | Target KV storage: `int8` or `bf16`. See [KV cache precision](#kv-cache-precision). |
 | `--state-format` | `fp32` | Recurrent state storage: `fp32` or `bf16`. See [state precision](#state-precision). |
+| `--cached-states` | `int8` | Cached recurrent state storage: `int8` codes, or `exact`, in `--state-format`'s precision. See [state precision](#state-precision). |
 | `--ple-memory` | Auto | Qwen3.8-Flash-Next: read the PLE n-gram table from the SSD through a host row cache of this size, e.g. `2G`; `off` loads the whole table. Auto streams it through a cache of at most the rows of a 128K-token prompt, less where memory is short. See [PLE table streaming](#ple-table-streaming). |
 | `--expert-memory` | Auto | MoE targets: the memory routed experts keep, e.g. `16G`; they stream through a store of exactly this size, which neither grows nor gives memory back, and read the other experts from the SSD when a step routes them; a size that holds every expert, or `off`, loads them all. Auto loads them all where memory holds them, else gives them what the context leaves, given back down to their floor while requests need it. See [streamed experts](#streamed-experts). |
 | `--sparse-kv-memory` | Auto | Qwen3.8-Flash-Next: memory for the KV blocks read back from the SSD for requests whose KV is there, e.g. `1200M`; never below its floor, which auto keeps. See [KV on the SSD](#kv-on-the-ssd). |
@@ -197,7 +198,7 @@ paths for `--model-dir`, `--draft-model` and `--mmproj`.
 | `--decode-share` | `0.5` | Decode time owed per unit of prefill time while other requests generate. A request waiting for memory on its way back is owed it too, and the prompt's next unit waits for that memory until its last unit has ended for as long as it took, at most 500 ms. Higher keeps their output faster during a long prompt and slows that prompt; `0` alternates one command each. |
 | `--disable-ane` | Off | Prefill on the GPU alone. By default a dense model's long prompts also use the Neural Engine when that is faster. See [Neural Engine prefill](internals.md#neural-engine-prefill). |
 | `--activations` | `auto` | On M5 and later Macs, whose GPUs multiply int8 at twice their bf16 rate, `auto` rounds activations to int8 where that is faster and leaves the others bf16: prefill chunks of more than 64 rows through a target's MLX 4- and 5-bit weights in groups of 64 (not a MoE model's routed experts), rounded per row and 64 inputs, about a quarter less time to the first token on Qwen3.8-27B MLX 4-bit; a Ternary-Bonsai (rotated PQ2_0) model's decode, 13-16% less time a cycle on a 20-core M5 Pro; and attention over the INT8 KV cache where a split reads 8 pages or more, 4-7% sooner first tokens at 32K-64K (see [KV cache precision](#kv-cache-precision)). `bf16` is a precision opt-out for evaluations and bf16 parity: every activation stays bf16, though a [persistent cache](#persistent-cache) keeps what an `auto` run prefilled, so a parity run starts in a fresh `--cache-dir`. What `auto` costs, as next-token KL against bf16: about 2.2e-3 for Qwen3.8-27B MLX 4-bit's prefill on the GPU alone, 2.8e-4 for Bonsai's decode, and with INT8 queries 1.37x the KL the INT8 KV cache alone gives Qwen3.8-27B. The Neural Engine split, which multiplies its part in int8 whatever this option, has its own switch, `--disable-ane`. See [kernel selection](internals.md#kernel-selection). |
-| `--verify-rows` | `auto` | The rows of each draft block decode cycles verify: `auto` lets the verify budget choose a MoE target's rows, which is faster but makes its greedy and seeded outputs vary from run to run, and verifies every row of a dense target; `all` verifies every row the output limit leaves on every target, so those outputs repeat when a request runs alone with the same cached prefixes. See [drafts](models.md#drafts) and [sampling](api.md#sampling). |
+| `--verify-rows` | `auto` | The rows decode cycles verify: `auto` gives each cycle the step of the most expected accepted tokens per cost, by the costs the Mac measured at a start and what its cycles show a long history adds to them (on a target whose experts stream, the rows whose chance of a token is worth their time by its cycles' cost line), which is faster but makes greedy and seeded outputs vary from run to run; `all` verifies every row of a draft's block a lane the output limit leaves, so those outputs repeat when a request runs alone with the same cached prefixes. See [drafts](models.md#drafts) and [sampling](api.md#sampling). |
 | `--allow-idle-sleep` | Off | Let the Mac sleep automatically while requests run; by default it stays awake until they finish (the display may still sleep). |
 
 Sizes (`--max-memory`, `--max-cache-disk`, `--max-cache-disk-writes`,
@@ -247,7 +248,9 @@ connection, as the socket a killed server left behind does, and one its
 sandbox does not let it connect to. A socket that accepts a connection stays,
 as do one whose permissions refuse the server's user and a file of another
 kind, and the start is refused. So is a start that finds a symbolic link at
-`PATH` or at `PATH.lock`: the server follows neither. A sandbox's profile must
+`PATH` or at `PATH.lock`: the server follows neither. A link put at `PATH`
+while the server starts is followed by the bind, and the start is then
+refused: keep the socket in a directory only you write to. A sandbox's profile must
 let the server bind `PATH` and accept there, and write `PATH`, which it
 creates and removes, and `PATH.lock`; it may refuse the server a connection
 to `PATH`.
@@ -551,33 +554,36 @@ off` loads every expert, as a SIZE that holds them all does.
   experts go first), and reads them from their
   files into a staging of a decode cycle's experts on the engine's SSD
   readers, and a repack kernel writes them into their slots before the expert
-  passes over them run. A decode step's load is one such round; a prefill
-  command's loads take as many rounds as its rows may route experts, each
-  staging half of the staging while the other half is read ahead. The kernels
-  find every routed expert through a table of its slot and the chunks that
-  hold its slots, so resident experts, one chunk of every expert, and streamed
-  experts run the same kernels.
+  passes over them run. A load of at most 32 rows (a decode step's of so
+  few, four lanes of 8, or a prompt chunk's) is one such round; a longer
+  command's loads take as many rounds as its rows may route experts,
+  each staging half of the staging while the other half is read ahead. The
+  kernels find every routed expert through a table of its slot and the
+  chunks that hold its slots, so resident experts, one chunk of every expert,
+  and streamed experts run the same kernels.
 - The grouping puts the tiles of the experts already resident first and those
-  a load brings last (their slot-table entry is marked absent). A decode
-  step's expert passes over the resident ones and the shared expert run while
-  its load's host step reads from the SSD, on the grouping's copy of the slot
-  table; the passes over the experts it brought and the combine run after the
-  repack, through a second table of the slots the load routed, which the host
-  step writes and the GPU reads no earlier. Outputs are bitwise the same: each
-  expert's tiles, their kinds and the combine order do not change.
+  a load brings last (their slot-table entry is marked absent). Every
+  command's expert passes over the resident ones and the shared expert, each
+  of its chunks', run while its load's first host step reads from the SSD, on
+  the grouping's copy of the slot table; the passes over the experts it
+  brought and the combine run after the repack, through a second table of the
+  slots the load routed, which the host step writes and the GPU reads no
+  earlier. Outputs are bitwise the same: each expert's tiles, their kinds and
+  the combine order do not change.
 - An expert's rows a GGUF stores as they are are read straight into the
   staging (`F_NOCACHE`, widened to whole 16 KiB pages, which the kernel reads
   without the buffer cache: an M5 Pro reads 460 KiB pieces from four threads
   at 9.3 GB/s instead of 8.1, with less than half the CPU).
 - While the GPU repacks a round or runs a layer, the next round's experts or
   the next block's likely experts are read ahead: those the next block's
-  router picks from this block's input in a decode step; after a long prefill
-  chunk's last repack, one more host step reads nearly all of the next
-  block's into the whole staging. A load takes the read-ahead over without
+  router picks from this block's input in a load of a cycle's rows; after a
+  long prefill chunk's last repack, one more host step reads nearly all of the
+  next block's into the whole staging. A load takes the read-ahead over without
   waiting for its reads of experts it does not route, and a read ahead of an
   expert no load routes may fail without failing anything. A decode step
-  loads and predicts only the experts its lanes' verify rows route
-  ([Drafts](models.md#drafts)); the selector writes those rows before the step's load.
+  loads and predicts only the experts its lanes' rows route, none of a row of
+  no lane ([Drafts](models.md#drafts)); the selector writes those rows before
+  the step's load.
 - Experts of one format share their slots, held in chunks, each a buffer of
   its own of at most the device's largest buffer (`maxBufferLength`). One
   chunk holds each format's floor: under auto every slot when KV can spill
@@ -601,7 +607,7 @@ off` loads every expert, as a SIZE that holds them all does.
   cap has as many of the cap's chunks as the slots above its lower floor take,
   at most 7 in a store under 6.7 GiB. A size of one block (layers in formats
   of their own) is one chunk of every expert.
-- A decode step's loads keep the GPU awake through their host steps
+- A load of a cycle's rows keeps the GPU awake through its host step
   ([Host steps](internals.md#host-steps)), so the work after a load starts at once and at
   full clocks rather than after the GPU's wake-up.
 - A prefill command runs a group of up to four chunks of 2048 rows layer by
@@ -701,23 +707,41 @@ KV format.
 
 The linear-attention (GDN) layers of the targets carry a recurrent state,
 which every lane holds and every cached state keeps, in memory and on the SSD.
-Select its storage when starting the server:
+A cached state stores it as int8 codes, each block of 32 values of a row with
+a bf16 scale, whatever format the lanes run in: 47 MiB a state for 27B instead
+of 153 MiB in FP32, 20 MiB for 35B instead of 64 MiB, so memory and the
+[SSD cache](#ssd-cache) hold 3.25 times as many cached states. A restore
+decodes the codes into the lane's state, so a cache hit continues from a state
+a little off the one it cached: restoring 40 cached prompts of code, chat and
+agent transcripts changed 27B's next-token distributions by a mean KL of
+1.1e-4, below the 1.5e-4 by which a cold run of the same prompts already
+differs from a restore of its own state, and the error does not build up over
+a conversation's successive hits.
+
+`--cached-states exact` keeps a cached state in the running state's format
+instead, as 1.6 did: a restore is the state it cached, bit for bit, and a
+cached state takes as much memory and SSD as a lane's state (153 MiB for 27B in
+FP32, 81 MiB in BF16). The default, `--cached-states int8`, stores the codes.
+The two keep their caches apart on the SSD, so switching starts the persistent
+cache cold. Restart to switch.
+
+Select the running state's storage when starting the server:
 
 ```bash
 splash serve --model mlx-community/Qwen3.8-27B-4bit --state-format bf16
 ```
 
-BF16 halves the recurrent state, most of a cached state's bytes, so memory and
-the [SSD cache](#ssd-cache) hold nearly twice as many cached states, and a
-decode step reads and writes half the state. The kernels compute in FP32
-either way and round the state to BF16 where they store it: at the end of each
-prefill chunk, at each state a chunk captures inside it (a replay point,
-junction or checkpoint), and at the end of each decode step. So where a
-prompt's chunks end and its states are captured also changes its state in the
-last bits ([sampling](api.md#sampling)). Restart to switch
-formats; the SSD cache keeps each format's states apart. Omit `--state-format`
-or use `--state-format fp32` for the default, the precision the models'
-configurations ask for.
+BF16 halves the recurrent state each lane holds, and a decode step reads and
+writes half the state. The kernels compute in FP32 either way and round the
+state to BF16 where they store it: at the end of each prefill chunk, at each
+state a chunk captures inside it (a replay point, junction or checkpoint), and
+at the end of each decode step. So where a prompt's chunks end and its states
+are captured also changes its state in the last bits
+([sampling](api.md#sampling)). Cached states take the same codes in either
+format, and the SSD cache keeps them for both, unless `--cached-states exact`
+keeps them in the running format. Restart to switch formats. Omit
+`--state-format` or use `--state-format fp32` for the default, the precision
+the models' configurations ask for.
 
 ### SSD cache
 
@@ -742,8 +766,10 @@ that conversation leaves memory at once instead of waiting for its writes.
 Without memory pressure the cache writes nothing ahead, so a Mac whose memory
 never runs short spends no SSD writes on it. Nothing else is copied ahead: not
 the KV a reply adds past the point, which no state resumes from, a shorter
-prompt, which is quicker to compute again, or a progress checkpoint. These
-copies take only the room the cache has free beside its other copies and the
+prompt, which is quicker to compute again, or a progress checkpoint, the state
+where a response's generation ended among them
+([API](api.md#output-limits-and-streaming)). These copies take only the room
+the cache has free beside its other copies and the
 room spilling requests hold for their KV: they give up no copy, a point that
 room cannot hold is not copied, and a full cache gives up the copies of what
 memory still holds first. They wait while the cache reads a prompt back, writes
@@ -781,17 +807,18 @@ part a copy does not fill unallocated, so its length (`ls -l`) can pass the
 quota while the space it takes (`du`) stays within it, beside what APFS
 allocates past the files' ends as they grow and keeps until it drops it on its
 own: about 16 MiB past a file that grows by many small writes, and a few
-percent of one that grows by a few large ones (15.8 MiB past two of the 27B's
-153 MiB states; 29.6 MiB past both files, 451.5 MiB long together, in another
-run). That needs a volume
+percent of one that grows by a few large ones (15.8 MiB past two 153 MiB
+states, the 27B's before cached states took int8 codes; 29.6 MiB past both
+files, 451.5 MiB long together, in another run). That needs a volume
 that gives the unused part of a file back, as APFS does; on one that does not,
 such as HFS+ or exFAT, every copy counts a whole page's or state's room, and
 the log says so once.
 
-State writes stage through a buffer of one state (64 MiB for 35B, 153 MiB for
+State writes stage through a buffer of one state (20 MiB for 35B, 47 MiB for
 27B) that the memory plan sets aside within `--max-memory`; on a 24 GB Mac
-serving 27B that costs 4,096 tokens of context. A size sets it aside whatever
-it costs, as before, and a quota too small for one state leaves the cache off.
+serving 27B that costs about 1,500 tokens of context, the KV of 46 pages.
+A size sets it aside whatever it costs, as before, and a quota too small for
+one state leaves the cache off.
 `auto` sets it aside only where the memory plan holds the model and the
 requested context beside it, and gives it up to the
 [Neural Engine split](internals.md#neural-engine-prefill) where the plan holds the split
@@ -912,13 +939,16 @@ its copies, not as the request's KV. One whose KV spills writes its own over
 them before its pages spill.
 
 A start takes back every recorded point whose chain is whole. A clean stop
-writes the waiting points (newest first, up to 6 s, whatever the write budget)
-and syncs the files. After a crash the next start takes back what reached the
-disk, each state with the class it had last: a checkpoint a request went on to
-reuse as an ordinary state comes back as one. Every start serves its first
-minute on probation: after two starts in a row fail within it, or one whose
-engine reports its own failure, the next start begins empty. `/status` reports
-all this under `disk` (`persistent`, `taken_back`).
+writes the waiting points (newest first, up to 6 s, whatever the write budget),
+gives up the copies no point needs (up to 2 s), such as those of the blocks a
+long request wrote past its point, and syncs the files, so that the next start
+leaves nothing behind. After a crash the next start takes back what reached
+the disk, each state with the class it had last: a checkpoint a request went on
+to reuse as an ordinary state comes back as one; the copies no point needs
+stay behind, and that start frees them. Every start serves its first minute on
+probation: after two starts in a row fail within it, or one whose engine
+reports its own failure, the next start begins empty. `/status` reports all
+this under `disk` (`persistent`, `taken_back`).
 
 ### KV on the SSD
 
@@ -961,7 +991,7 @@ what memory holds, as a dense target's is.
   from then on rather than yield its lane or fail, where that covers what it
   lacks: what spilling the pages only it holds frees, past its first 2,048
   tokens and its last 64 pages, less the hot block cache's floor its
-  decode's reads need (390 MiB), which takes a request of about 46K tokens
+  decode's reads need (585 MiB), which takes a request of about 62K tokens
   or more. Its pages whose copies have landed, as a prefix restored from the
   SSD cache or copied ahead has them, give back the memory it lacks at once,
   as below, so it misses no step; it waits only while the copies it starts
@@ -1008,14 +1038,15 @@ what memory holds, as a dense target's is.
   selected blocks not in memory into one hot block cache that all requests
   share, a page's in one read from its first missed block to its last on the
   32 SSD readers, and attends them there.
-  The cache holds at least, for n decoding requests, n + 1 times the blocks a
-  request's 8 rows select, 8,192 blocks a layer (390 MiB) for one, taken
+  The cache holds at least, for n decoding requests, the blocks each
+  request's 16 rows select and 8 rows' more, 12,288 blocks a layer (585 MiB)
+  for one, taken
   whole as a request some of whose pages gave their memory back starts decoding,
   by the same release as its first pages give memory back, whichever request's
   claim it was for; `--sparse-kv-memory` raises its target, toward which it
   grows only while a request holds a floor. A decoding request's floor goes only
   with the request. While no request reads above the floor, the cache's memory,
-  up to 975 MiB after the last spilling request ends, is among the first to go
+  up to 1,755 MiB after the last spilling request ends, is among the first to go
   when memory is short, as a cache the model rebuilds. It shares the readers'
   memory with the history staging below, which the plan sets aside the larger
   of, so a target within the staging takes nothing from the expert store.
@@ -1227,9 +1258,11 @@ The console's Started line names the request the engine took, by the id its
 Done, Cancelled or Error line names too, and shows how each chat request
 reasons: the effort it sent, or `absent`; after an arrow, the effort it
 rendered with where the server gave it another, the default or the one
-`--reasoning-effort` sets; its `enable_thinking` when it set one that counted;
-and whether it thinks, as in
-`Started · request 12 · input 2,473 · cached 0 · effort absent → low · thinking on`
+`--reasoning-effort` sets; the effort its `chat_template_kwargs` set, which
+the template renders over the others, followed by `(chat_template_kwargs)`;
+its `enable_thinking` when it set one that counted; and whether it thinks, as in
+`Started · request 12 · input 2,473 · cached 0 · effort absent → low · thinking on`,
+`effort low (chat_template_kwargs) · thinking on`
 or, under `--reasoning-effort none`, `effort high → none · thinking off`.
 
 A Chat or Messages request's `chat_template_kwargs` are passed to the template

@@ -79,13 +79,16 @@ class ReasoningRequest:
     """How a chat request asked to reason: the reasoning effort it sent, None
     when absent; the effort its template rendered with, the server's own
     where it sets every request's, else the server's default for an absent
-    one and None for the template's own; and its chat_template_kwargs
+    one and None for the template's own; its chat_template_kwargs
     enable_thinking, None when unset or when the server's effort replaced
-    it."""
+    it; and the effort its chat_template_kwargs set, which the template
+    renders over the others, None when unset, when the server's effort
+    replaced it or when the template does not read it."""
 
     sent: str | None
     effort: str | None
     enable_thinking: bool | None
+    template: str | None = None
 
 
 @dataclass
@@ -793,11 +796,12 @@ class NativeBackend:
             return None
 
         def provide(event):
-            # runtime sends the simulated context sequence, not merely draft
-            # proposals: [] for the initial mask, then [pending anchor,
-            # draft...] for verification. TokenConstraint returns the mask
-            # before the first simulated token and after each token.
-            return job.constraint.masks(event.simulation_tokens)
+            # runtime sends the simulated context, not merely draft
+            # proposals: nothing for the initial mask, then a verify block's
+            # tree, the pending anchor its root. TokenConstraint returns the
+            # mask before the first simulated token and after each token's
+            # path, and the tokens the grammar forces after each.
+            return job.constraint.masks(event.simulation_tokens, event.parents)
 
         return provide
 
@@ -1014,6 +1018,7 @@ class NativeBackend:
                     "sent_effort": job.reasoning.sent,
                     "effort": job.reasoning.effort,
                     "enable_thinking": job.reasoning.enable_thinking,
+                    "template_effort": job.reasoning.template,
                     "thinking": job.thinking,
                 }
             self._log(record)

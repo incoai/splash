@@ -104,7 +104,7 @@ const char *writesGatedName(DiskWritesGate gate) noexcept {
 }
 
 // What the streamed stores count by, in the order of their uses
-// (model::SparseRowUse, and ops::MoePhase for model::ExpertStoreStats::uses).
+// (model::SparseRowUse, and model::ExpertStoreStats::uses).
 constexpr std::string_view kStreamedUses[] = {"prefill", "decode"};
 static_assert(std::size(kStreamedUses) == model::kSparseRowUses);
 // The causes of decode gaps past the bound, by GapCause.
@@ -482,6 +482,7 @@ void writeState(json::Writer &w, const CacheSnapshot &resources, const model::Mo
         .field("allocated_bytes", telemetry.stateAllocatedBytes)
         .field("active_lanes", resources.activeRequests)
         .field("idle_gdn_cells", telemetry.idleGdnCells)
+        .field("idle_cached_cells", telemetry.idleCachedCells)
         .field("idle_draft_rings", telemetry.idleDraftRings)
         .field("idle_context_windows", telemetry.idleContextWindows)
         .field("publications", state.publications)
@@ -797,8 +798,8 @@ std::string runtimeStatusJson(const StatusStart &start, const StatusSample &samp
           .field("resets", executorTelemetry.draftStateResets);
     });
     // The rows decode cycles verify (--verify-rows): auto where the verify
-    // budget chooses them, all where they are every row up to each lane's
-    // retention limit.
+    // budget chooses them, all where they are every row of a draft's block a
+    // lane up to each lane's retention limit.
     w.field("verify_rows", executorTelemetry.verifyBudget ? "auto" : "all");
     w.key("model_timing");
     writeModelTiming(w, executorTelemetry);

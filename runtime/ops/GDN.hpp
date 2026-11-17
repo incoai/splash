@@ -1,6 +1,7 @@
 #pragma once
 
 #include "metal/CommandGraph.hpp"
+#include "ops/LaneRows.hpp"
 #include "ops/Linear.hpp"
 #include "ops/Normalization.hpp"
 
@@ -91,9 +92,11 @@ struct GdnPrefillBuffers final {
   metal::MetalBuffer hidden;
 };
 
-// A state a prefill captures inside its rows: the convolution carry and the
-// recurrent state after its first `tokens` rows, which it stores in these
-// buffers as a prefill ending there would.
+// A state a prefill caches after its first `tokens` rows: the codes of its
+// recurrent state (ops::StateCodec) in `recurrent` and, for a state inside
+// the rows, the convolution carry in `convolution`, which the prefill stores
+// there as a prefill ending there would and continues from. A state at the
+// rows' end takes its carry from the prefill's convolutionOut.
 struct GdnPrefillCapture final {
   uint32_t tokens = 0;
   metal::MetalBuffer convolution;
@@ -102,16 +105,17 @@ struct GdnPrefillCapture final {
 
 // A lane's decode tape (metal/abi/GDN.h): each step leaves its rows'
 // convolution inputs, k, v and gates there, and the lane's next step folds
-// the rows it retained into the state before its own, so the state cell a
-// step writes holds the state before the step's rows. A slot holds one step
-// of every layer, gdnTapeLayerBytes(shape) apart; the offsets are in
-// GdnDecodeBuffers::tape.
+// the path of rows it accepted into the state before its own, so the state
+// cell a step writes holds the state before the step's rows. A slot holds
+// one step of every layer, gdnTapeLayerBytes(shape) apart; the offsets are
+// in GdnDecodeBuffers::tape.
 struct GdnTapeLane final {
   uint64_t pendingSlot = 0; // the lane's previous step's
   uint64_t stepSlot = 0;    // this step's
-  // The previous step's rows the lane retained, which the state does not
-  // hold yet: 0 after a prefill or a restore.
-  uint32_t pendingRows = 0;
+  // The path of the previous step's rows the lane accepted, which the state
+  // does not hold yet: a row mask (metal/abi/VerifyTree.h, its anchor's bit
+  // and the bits of its rows below it), 0 after a prefill or a restore.
+  uint32_t pendingPath = 0;
 };
 
 [[nodiscard]] uint64_t gdnTapeLayerBytes(const GdnShape &shape) noexcept;
@@ -122,36 +126,78 @@ struct GdnDecodeBuffers final {
   std::span<const metal::MetalBuffer> currentStates;
   std::span<const metal::MetalBuffer> nextStates;
   metal::MetalBuffer tape;
-  std::span<const GdnTapeLane> tapeLanes;
+  // Each lane's tape, whose first rows its block's rows are.
+  std::span<const GdnTapeLane> tapes;
+  // Each lane's block of the step's `rows` rows (SplashLaneRows: its first
+  // row and rows, ascending, not overlapping), which the step's proposer
+  // writes on the device: its rows of the packed, hidden, table and tree
+  // rows, 1 to `laneCap` of them (verifyLaneCap). A row of no lane
+  // (VerifyRowsParams) it leaves alone.
+  metal::MetalBuffer laneRows;
+  uint32_t rows = 0;
+  uint32_t laneCap = 0;
   metal::MetalBuffer decayWeights;
   metal::MetalBuffer timeBias;
   NormWeights mixerNorm;
   metal::MetalBuffer hidden;
-  // Each lane's verify rows (ops::DraftSelector::addVerifyRows): the step's
-  // rows past them get zero recurrent output.
-  metal::MetalBuffer verifyRows;
+  // The step's rows' places in their blocks' trees (SplashTreeRow, a row of
+  // the step's rows each): a chain's rows run the sequential recurrence,
+  // another tree's rows each read the state before the block along their
+  // own path, and every row's convolution reads its path's tokens.
+  metal::MetalBuffer tree;
   LinearScratch linearScratch{};
+};
+
+// A lane's decode step to fold rows of alone (GDN::addFold): the cell the
+// step wrote, which holds the state before its rows, the tape its rows are
+// on (every layer's, from stepSlot), the path of them the lane retained, the
+// row mask the step's acceptance wrote (metal/abi/VerifyTree.h), and the
+// cached state's cell the fold writes: the convolution rows at the lane
+// cell's offsets, then each layer's codes (ops::StateCodec).
+struct GdnFoldBuffers final {
+  metal::MetalBuffer state;
+  metal::MetalBuffer tape;
+  uint64_t stepSlot = 0;
+  metal::MetalBuffer retainedRows;
+  metal::MetalBuffer fold;
 };
 
 class GDN final {
 public:
-  // Each capture, ascending inside the rows, ends one run of the prepare and
-  // scan dispatches, and the next run starts from the state it stored; the
-  // gate then runs once over every row. The scan is sequential, so with an
-  // fp32 state the runs compute what one run does, and a bf16 state is
-  // rounded at each capture as a prefill ending there rounds it.
+  // Each capture inside the rows, ascending, ends one run of the prepare and
+  // scan dispatches; every run stores its state in recurrentOut, which the
+  // next continues from in place, and the convolution carry of a capture in
+  // its buffer; the gate then runs once over every row. A capture's codes
+  // follow the run that ends at it, and a capture at the rows' end, after
+  // every capture inside them, follows the last run. The scan is sequential,
+  // so with an fp32 state the runs compute what one run does, and a bf16
+  // state is rounded at each capture as a prefill ending there rounds it.
+  // Without `codes` a capture holds the state as it is.
   static void addPrefill(metal::CommandGraph &graph, const metal::MetalBackend &backend,
                          GdnPrefillBuffers buffers, GdnShape shape, uint32_t tokens,
                          GdnStateFormat state, GdnHeadOrder order,
-                         std::span<const GdnPrefillCapture> captures = {});
+                         std::span<const GdnPrefillCapture> captures = {}, bool codes = true);
+  // The step of buffers.tapes' lanes, 1 to SPLASH_MAXIMUM_BATCH_WIDTH.
   // Also writes the out-projection's `input` table into
-  // buffers.linearScratch when it is not Plain, and throws when the scratch
-  // cannot hold it.
+  // buffers.linearScratch when it is not Plain, the table rows of the step's
+  // rows, and throws when the scratch cannot hold it.
   static PreparedInput addDecode(metal::CommandGraph &graph, GdnDecodeBuffers buffers,
-                                 GdnShape shape, uint32_t lanes, uint32_t layer,
+                                 GdnShape shape, uint32_t layer,
                                  GdnStateStrides state,
                                  GdnHeadOrder order,
                                  LinearInput input);
+  // The state after the first `rows` rows of the path a lane retained of a
+  // decode step's rows, in each of `layers` layers, as a cached state stores
+  // it in buffers.fold: those rows folded into the state before them, the
+  // convolution rows they leave as they are and the recurrent state as its
+  // codes, each layer's codesLayerBytes after the last; bit for bit the rows
+  // and the codes ops::StateCodec makes of the state the lane's next step
+  // holds when the lane retained exactly those rows. A lane whose path holds
+  // fewer leaves the fold as it was. Without `codes` the fold holds the
+  // recurrent state as the lane's cell would, in its format.
+  static void addFold(metal::CommandGraph &graph, GdnFoldBuffers buffers, GdnShape shape,
+                      uint32_t layers, uint32_t rows, GdnStateStrides state, uint64_t codesLayerBytes,
+                      bool codes = true);
 };
 
 } // namespace splash::ops

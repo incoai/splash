@@ -119,8 +119,13 @@ void formsCountWhatTheyStore(const std::shared_ptr<model::SsdReaders> &readers, 
   constexpr uint32_t kPages = 16;
   test::HostKvPages pages(layout, 2 * kPages);
   const kv::SlotFormat format(layout);
-  const uint64_t full = SlotFile::slotBytesFor(format.payloadBytes(kv::PageForm::Full));
-  const uint64_t slim = SlotFile::slotBytesFor(format.payloadBytes(kv::PageForm::Slim));
+  // A slot takes its page's bytes in its form (kv::Layout), in whole host pages: what the tier
+  // counts, worked out apart from how it counts them (SlotFormat::payloadBytes,
+  // SlotFile::quotaBytesFor).
+  const auto hostPages = [&](kv::PageForm form) {
+    return (layout.bytesPerModelPage(form) + kHostPageBytes - 1) / kHostPageBytes * kHostPageBytes;
+  };
+  const uint64_t full = hostPages(kv::PageForm::Full), slim = hostPages(kv::PageForm::Slim);
   auto budget = std::make_shared<DiskBudget>(4 * full);
   Tier tier(pages, format, std::make_shared<SlotFile>(full, budget), readers);
   require(slim < full && tier.slotBytes(kv::PageForm::Full) == full && tier.slotBytes(kv::PageForm::Slim) == slim,

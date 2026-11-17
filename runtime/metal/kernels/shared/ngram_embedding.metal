@@ -2,7 +2,9 @@
 #include "metal/abi/NgramEmbedding.h"
 #include "metal/kernels/common/activation.h"
 #include "metal/kernels/common/hyper_streams.h"
+#include "metal/kernels/common/lane_bindings.h"
 #include "metal/kernels/common/rms_inverse.h"
+#include "metal/kernels/common/verify_tree.h"
 
 #include <metal_stdlib>
 
@@ -83,53 +85,84 @@ kernel void ngram_embedding_gate(device const bfloat *key [[buffer(0)]],
   }
 }
 
-// The depthwise convolution over one sequence's rows: tap k of channel
-// c (taps[c][k]) reads the input (taps - 1 - k) * dilation rows back, before
-// the first row from the history; silu of the sum and the gated values are
-// added to the streams. With write_history, the history after the rows.
+// The depthwise convolution over each of a command's sequences' rows (a
+// prompt chunk's sequences, or a verify step's lanes), threadgroup (row,
+// channel group, sequence) of sequence s's rows its entry of the command's
+// layout: tap k of channel c (taps[c][k]) reads the input (taps - 1 - k) *
+// dilation rows back, before the sequence's first row from its history
+// (history_in s); silu of the sum and the gated values are added to the
+// streams. With write_history, the sequence's history after its rows
+// (history_out s). A verify block's rows (p.tree, a row's place in `tree`)
+// count back along their paths; a prompt's bind another buffer for the
+// tree, which they do not read. A row past its sequence's rows and history,
+// or a sequence whose rows run past the command's, writes nothing.
 kernel void ngram_embedding_conv(device const bfloat *input [[buffer(0)]],
-                                 device const bfloat *history_in [[buffer(1)]],
-                                 device bfloat *history_out [[buffer(2)]],
-                                 device const float *taps [[buffer(3)]],
-                                 device const float *gated [[buffer(4)]],
-                                 device float *streams [[buffer(5)]],
-                                 constant NgramEmbeddingParams &p [[buffer(6)]],
-                                 uint2 group [[threadgroup_position_in_grid]],
+                                 device const bfloat *history_in0 [[buffer(1)]],
+                                 device const bfloat *history_in1 [[buffer(2)]],
+                                 device const bfloat *history_in2 [[buffer(3)]],
+                                 device const bfloat *history_in3 [[buffer(4)]],
+                                 device bfloat *history_out0 [[buffer(5)]],
+                                 device bfloat *history_out1 [[buffer(6)]],
+                                 device bfloat *history_out2 [[buffer(7)]],
+                                 device bfloat *history_out3 [[buffer(8)]],
+                                 device const float *taps [[buffer(9)]],
+                                 device const float *gated [[buffer(10)]],
+                                 device float *streams [[buffer(11)]],
+                                 device const SplashLaneRows *layout [[buffer(12)]],
+                                 device const SplashTreeRow *tree [[buffer(13)]],
+                                 constant NgramEmbeddingParams &p [[buffer(14)]],
+                                 uint3 group [[threadgroup_position_in_grid]],
                                  uint tid [[thread_index_in_threadgroup]]) {
   const uint width = p.streams * p.hidden;
-  const uint c = group.y * kRowThreads + tid, row = group.x;
-  if (c >= width) return;
+  const uint c = group.y * kRowThreads + tid, row = group.x, s = group.z;
+  if (c >= width || s >= min(p.sequences, SPLASH_MAXIMUM_BATCH_WIDTH)) return;
+  const SplashLaneRows rows = layout[s];
+  if (ulong(rows.first) + rows.rows > p.rows) return;
+  device const bfloat *sequence = input + ulong(rows.first) * width;
+  device const bfloat *history_in = SPLASH_LANE_BINDING(s, history_in0, history_in1, history_in2, history_in3);
   const int history = int((p.taps - 1) * p.dilation);
   const auto at = [&](int t) -> float {
-    return t >= 0 ? float(input[ulong(t) * width + c]) : float(history_in[ulong(history + t) * width + c]);
+    return t >= 0 ? float(sequence[ulong(t) * width + c]) : float(history_in[ulong(history + t) * width + c]);
   };
-  if (row < p.rows) {
+  if (row < rows.rows) {
+    // The row's path and depth: a prompt's rows are a chain.
+    const uint packed = rows.first + row;
+    const uint path = p.tree ? tree[packed].ancestors : 0u;
+    const int depth = p.tree ? int(tree[packed].depth) : int(row);
     float sum = 0.0f;
-    for (uint k = 0; k < p.taps; ++k)
-      sum += taps[ulong(c) * p.taps + k] * at(int(row) - int((p.taps - 1 - k) * p.dilation));
-    const ulong i = ulong(row) * width + c;
+    for (uint k = 0; k < p.taps; ++k) {
+      const int back = depth - int((p.taps - 1 - k) * p.dilation);
+      sum += taps[ulong(c) * p.taps + k] * at(back >= 0 && p.tree ? int(splash_path_row(path, uint(back))) : back);
+    }
+    const ulong i = ulong(packed) * width + c;
     streams[i] += gated[i] + splash_silu(sum);
-  } else if (p.write_history && row - p.rows < uint(history)) {
-    // Rows past the sequence write the history: row p.rows + j holds row
+  } else if (p.write_history && row - rows.rows < uint(history)) {
+    // Rows past the sequence's write its history: row rows + j holds row
     // rows - history + j.
-    const int j = int(row - p.rows);
-    history_out[ulong(j) * width + c] = bfloat(at(int(p.rows) - history + j));
+    const int j = int(row - rows.rows);
+    device bfloat *history_out = SPLASH_LANE_BINDING(s, history_out0, history_out1, history_out2, history_out3);
+    history_out[ulong(j) * width + c] = bfloat(at(int(rows.rows) - history + j));
   }
 }
 
-// The history after a sequence's first `rows` rows: its history before,
-// then the convolution inputs; threadgroup (j, y) writes row j's channels
-// from y x kRowThreads on.
+// The history after a sequence's first `rows` rows, or the rows of a
+// verify block's `path` (a row mask, its `rows` rows in order): its history
+// before, then the convolution inputs; threadgroup (j, y) writes row j's
+// channels from y x kRowThreads on.
 inline void ngram_history_rows(device const bfloat *input, device const bfloat *history_in,
                                device bfloat *history_out, constant NgramEmbeddingParams &p, uint rows,
-                               uint2 group, uint tid) {
+                               uint path, uint2 group, uint tid) {
   const uint width = p.streams * p.hidden;
   const uint history = (p.taps - 1) * p.dilation;
   const uint c = group.y * kRowThreads + tid, j = group.x;
   if (c >= width || j >= history) return;
   const int source = int(rows) - int(history) + int(j);
-  history_out[ulong(j) * width + c] = source >= 0 ? input[ulong(source) * width + c]
-                                                  : history_in[ulong(int(history) + source) * width + c];
+  if (source < 0) {
+    history_out[ulong(j) * width + c] = history_in[ulong(int(history) + source) * width + c];
+    return;
+  }
+  const uint row = path ? splash_path_row(path, uint(source)) : uint(source);
+  history_out[ulong(j) * width + c] = input[ulong(row) * width + c];
 }
 
 // The history after a prefill sequence's first p.rows rows (a state captured
@@ -140,36 +173,78 @@ kernel void ngram_embedding_history(device const bfloat *input [[buffer(0)]],
                                     constant NgramEmbeddingParams &p [[buffer(3)]],
                                     uint2 group [[threadgroup_position_in_grid]],
                                     uint tid [[thread_index_in_threadgroup]]) {
-  ngram_history_rows(input, history_in, history_out, p, p.rows, group, tid);
+  ngram_history_rows(input, history_in, history_out, p, p.rows, 0, group, tid);
 }
 
-// The history after a lane's retained rows of a verify step, a count the GPU
-// wrote.
+// The history after each lane's accepted path of its verify block, a row
+// mask the GPU wrote (acceptance's retained rows, paths[l]) of the lane's
+// rows its entry of the step's layout holds: threadgroup (j, y, lane), from
+// the lane's history before (history_in l) to its history after
+// (history_out l). A lane whose rows run past the step's writes nothing.
 kernel void ngram_embedding_commit(device const bfloat *input [[buffer(0)]],
-                                   device const bfloat *history_in [[buffer(1)]],
-                                   device bfloat *history_out [[buffer(2)]],
-                                   device const uint *retained [[buffer(3)]],
-                                   constant NgramEmbeddingParams &p [[buffer(4)]],
-                                   uint2 group [[threadgroup_position_in_grid]],
+                                   device const bfloat *history_in0 [[buffer(1)]],
+                                   device const bfloat *history_in1 [[buffer(2)]],
+                                   device const bfloat *history_in2 [[buffer(3)]],
+                                   device const bfloat *history_in3 [[buffer(4)]],
+                                   device bfloat *history_out0 [[buffer(5)]],
+                                   device bfloat *history_out1 [[buffer(6)]],
+                                   device bfloat *history_out2 [[buffer(7)]],
+                                   device bfloat *history_out3 [[buffer(8)]],
+                                   device const uint *paths [[buffer(9)]],
+                                   device const SplashLaneRows *layout [[buffer(10)]],
+                                   constant NgramEmbeddingParams &p [[buffer(11)]],
+                                   uint3 group [[threadgroup_position_in_grid]],
                                    uint tid [[thread_index_in_threadgroup]]) {
-  ngram_history_rows(input, history_in, history_out, p, retained[0], group, tid);
+  const uint lane = group.z;
+  if (lane >= min(p.sequences, SPLASH_MAXIMUM_BATCH_WIDTH)) return;
+  const SplashLaneRows rows = layout[lane];
+  if (ulong(rows.first) + rows.rows > p.rows) return;
+  const uint path = paths[lane];
+  ngram_history_rows(input + ulong(rows.first) * p.streams * p.hidden,
+                     SPLASH_LANE_BINDING(lane, history_in0, history_in1, history_in2, history_in3),
+                     SPLASH_LANE_BINDING(lane, history_out0, history_out1, history_out2, history_out3), p,
+                     popcount(path), path, group.xy, tid);
 }
 
-// The table rows of each lane's verify rows (model/Qwen4Steps.cpp qwen4PleRows
-// on the CPU): heads of the 2- to ngram-gram hashes of the row's token and
-// those before it, cut at EOS or the sequence's start.
+// The table rows of each lane's rows of a verify step (model/Qwen4Steps.cpp
+// qwen4PleRows on the CPU): heads of the 2- to ngram-gram hashes of the row's
+// token and those before it on its path, cut at EOS or the sequence's start.
+// A thread per row of the step: its lane is the last whose first row is at
+// most it. A row of no lane, past that lane's rows (VerifyRowsParams), takes
+// the table rows of lane 0's anchor, whose token it carries: rows of the
+// table, which the step's PLE gathers by them, and the same rows, which a
+// streamed table stages once.
 kernel void ngram_embedding_hash(device const uint *tokens [[buffer(0)]],
-                                 device const uint *before [[buffer(1)]],
-                                 device uint *indices [[buffer(2)]],
-                                 constant NgramHashParams &p [[buffer(3)]],
+                                 device const SplashTreeRow *tree [[buffer(1)]],
+                                 device const SplashLaneRows *lane_rows [[buffer(2)]],
+                                 device const uint *before [[buffer(3)]],
+                                 device uint *indices [[buffer(4)]],
+                                 constant NgramHashParams &p [[buffer(5)]],
                                  uint index [[thread_position_in_grid]]) {
-  if (index >= p.rows) return;
-  const uint lane = index / SPLASH_TARGET_VERIFY_ROWS, r = index % SPLASH_TARGET_VERIFY_ROWS;
-  // The row's token, then the ngram - 1 tokens before it, EOS from a cut on.
-  ulong context[NGRAM_EMBEDDING_MAXIMUM_NGRAM] = {tokens[index]};
+  uint lane = 0;
+  for (uint l = 1; l < min(p.lanes, uint(SPLASH_MAXIMUM_BATCH_WIDTH)); ++l)
+    lane = index >= lane_rows[l].first ? l : lane;
+  // The row hashed; the difference wraps for a row before lane 0's.
+  uint at = index;
+  if (index - lane_rows[lane].first >= lane_rows[lane].rows) {
+    lane = 0;
+    at = lane_rows[0].first;
+  }
+  const uint first = lane_rows[lane].first;
+  // The row's token, then the ngram - 1 tokens before it: its parents' up to
+  // the anchor, then those before the lane's first row; EOS from a cut on.
+  ulong context[NGRAM_EMBEDDING_MAXIMUM_NGRAM] = {tokens[at]};
   bool cut = false;
+  uint row = at - first;
+  const uint depth = tree[at].depth;
   for (uint back = 1; back < p.ngram; ++back) {
-    const uint previous = back <= r ? tokens[index - back] : before[lane * (p.ngram - 1) + (back - r - 1)];
+    uint previous;
+    if (back <= depth) {
+      row = tree[first + row].parent;
+      previous = tokens[first + row];
+    } else {
+      previous = before[lane * (p.ngram - 1) + (back - depth - 1)];
+    }
     cut = cut || previous == NGRAM_EMBEDDING_NONE || previous == p.eos;
     context[back] = cut ? p.eos : previous;
   }

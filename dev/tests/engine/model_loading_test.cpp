@@ -118,7 +118,7 @@ void testStartupCapabilities() {
                 ExecutionLimits::prefillTokenBudget == 2048 &&
                 ExecutionLimits::draftQueryRows == 8 &&
                 ExecutionLimits::draftProposalTokens == 7 &&
-                ExecutionLimits::targetVerifyRows == 8 &&
+                ExecutionLimits::targetVerifyRows == 16 && splash::ops::kNarrowLaneRows == 8 &&
                 ExecutionLimits::draftContextTokens == 2048,
             "DFlash execution contract changed");
 }
@@ -618,6 +618,8 @@ template <class Layout = Qwen3_8Layout> Layout syntheticTarget() {
     target.layers = 4;
     target.hiddenSize = 256;
     target.vocabularySize = 256;
+    // Not the Qwen tokenizer's 248,320 tokens: its draft proposes from all of them.
+    target.draftVocabulary = {};
     target.convolutionDimension = 512;
     target.gdnKeyHeads = 2;
     target.gdnValueHeads = 4;

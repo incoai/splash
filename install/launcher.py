@@ -548,14 +548,18 @@ def coding_client(args):
                 f"No ready Splash server at {_base_url(args.port)}. "
                 "Run 'splash serve --model <HF_REPO_ID>' in another terminal first."
             )
-        elif holder.get("host") in _LOOPBACK_HOSTS and holder.get("phase") == "ready":
-            # It listens where the agent commands ask and its record says
-            # ready, so only that it did not answer is known: a server that
-            # stops closes its listener first and holds the port, its record
-            # still ready, until its engine has stopped.
+        elif holder.get("phase") == "ready" and (
+            "host" not in holder or holder["host"] in _LOOPBACK_HOSTS
+        ):
+            # Its record says ready, and it listens where the agent commands
+            # ask, or may: a lock that names no address, as 1.6.1's do not,
+            # says nothing of where. So only that it did not answer is known:
+            # a server that stops closes its listener first and holds the
+            # port, its record still ready, until its engine has stopped.
             message = (
                 f"Splash is serving{_words(holder)} but does not answer at "
-                f"{_base_url(args.port)}: it may be stopping."
+                f"{_base_url(args.port)}: it may be stopping"
+                + ("." if "host" in holder else ", or listen on another address.")
             )
         else:
             # The server holding the port listens elsewhere, on another

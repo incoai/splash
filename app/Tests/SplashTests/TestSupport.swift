@@ -11,8 +11,13 @@ func waitFor(_ condition: @autoclosure () async -> Bool, _ what: @autoclosure ()
              seconds: Double = 10, sourceLocation: SourceLocation = #_sourceLocation) async throws {
     let deadline = ContinuousClock.now + .seconds(seconds)
     while !(await condition()) {
-        try #require(ContinuousClock.now < deadline, "timed out waiting for \(what())", sourceLocation: sourceLocation)
+        // Let queued main-actor callbacks run before the final deadline check. Snapshot work
+        // can hold the actor past the deadline with a completion waiting behind the last poll.
         try await Task.sleep(for: .milliseconds(20))
+        if ContinuousClock.now >= deadline {
+            try #require(await condition(), "timed out waiting for \(what())", sourceLocation: sourceLocation)
+            return
+        }
     }
 }
 

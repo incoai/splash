@@ -196,7 +196,7 @@ class CrashTraceTest(unittest.TestCase):
                 ring.start_generation(1, 50)
                 small = wire.serialize_message(wire.StatusRequestFrame(1))
                 large = wire.serialize_message(
-                    wire.MaskResponseFrame(2, 3, bytes(4 * 64))
+                    wire.MaskResponseFrame(2, 3, bytes(4 * 64), ())
                 )
                 ring.record_bytes(1, "client_to_engine", small)
                 ring.record_bytes(1, "client_to_engine", large)
