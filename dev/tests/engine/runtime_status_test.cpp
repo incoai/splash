@@ -495,6 +495,16 @@ std::vector<std::pair<const char *, StatusInputs>> statusVariants() {
   return {{"spilling", std::move(spilling)}, {"resident", std::move(resident)}};
 }
 
+void testExactForegroundStatus() {
+  auto input = representativeStatus();
+  input.sample.engine.foregroundTurnTokens = 32;
+  input.sample.engine.scheduler.parked = 4;
+  const auto json = input.json();
+  require(json.find("\"parked\":4") != std::string::npos &&
+              json.find("\"foreground_turn_tokens\":32") != std::string::npos,
+          "status hid active foreground turns or parked owners");
+}
+
 void testStatusVariants(const char *goldenPath) {
   std::string documents;
   for (const auto &[name, inputs] : statusVariants())
@@ -1087,6 +1097,7 @@ int main(int argc, char **argv) {
   try {
     testCleanRuntimeStatus(argv[1]);
     testStatusVariants(argv[2]);
+    testExactForegroundStatus();
     testCurrentReadinessAndSimultaneousPeak();
     testWarmupStepsReportMeasurementTruth();
     testMemoryPressureTelemetry();

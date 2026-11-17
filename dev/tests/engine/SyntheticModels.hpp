@@ -142,10 +142,12 @@ inline engine::RuntimeResourcesConfig moeConfig(const char *metallibPath, const 
 // a PLE table of `pleRows` rows, and a draft of one layer that reads four of
 // them; no vision tower.
 inline engine::RuntimeResourcesConfig flashNextConfig(const char *metallibPath, const std::filesystem::path &root,
-                                                      uint64_t pleRows = gguf_fixtures::kPleTableRows) {
+                                                      uint64_t pleRows = gguf_fixtures::kPleTableRows,
+                                                      uint32_t targetHiddenSize = 256, uint32_t experts = 4,
+                                                      bool nonzeroAttention = false) {
   model::Qwen4ExpLayout target;
   target.layers = 8;
-  target.hiddenSize = 256;
+  target.hiddenSize = targetHiddenSize;
   target.vocabularySize = 256;
   target.fullAttentionPeriod = 2;
   target.maskToken = 252;
@@ -154,7 +156,7 @@ inline engine::RuntimeResourcesConfig flashNextConfig(const char *metallibPath, 
   target.draftVocabulary = {};
   target.pleEosToken = 250;
   target.pleImageToken = 253;
-  target.experts = 4;
+  target.experts = experts;
   target.expertsPerToken = 2;
   target.expertIntermediateSize = 256;
   target.pleLayer = 0;
@@ -176,8 +178,38 @@ inline engine::RuntimeResourcesConfig flashNextConfig(const char *metallibPath, 
   keys.push_back(test::gguf::int32ArrayKey(ple + "head_vocab_sizes", rows));
   keys.push_back(test::gguf::uint32Key(ple + "eos_token_id", target.pleEosToken));
   std::filesystem::create_directories(root / "target");
-  test::writeFile(root / "target" / "model.gguf",
-                  test::gguf::file(keys, gguf_fixtures::targetTensors(target, types, pleRows)));
+  auto tensors = gguf_fixtures::targetTensors(target, types, pleRows);
+  if (nonzeroAttention) {
+    // Bounded inference weights, unlike the quantization fixtures' extreme
+    // block scales. Keep GDN/FFN branches zero; vary attention and its indexer
+    // so spilled-copy tests cannot pass by selecting only tied resident keys.
+    uint32_t seed = 1700;
+    const auto next = [&] { seed = seed * 1664525u + 1013904223u; return seed; };
+    for (auto &tensor : tensors) {
+      if (gguf_fixtures::isNorm(tensor.name)) {
+        const float one = 1.0F;
+        for (size_t at = 0; at < tensor.data.size(); at += sizeof(one))
+          std::memcpy(tensor.data.data() + at, &one, sizeof(one));
+      } else if (tensor.name.ends_with("indexer.q_proj.weight") ||
+                 tensor.name.ends_with("indexer.k_proj.weight")) {
+        for (size_t at = 0; at < tensor.data.size(); at += sizeof(float)) {
+          const float value = (int32_t(next() >> 24) - 128) / 32768.0F;
+          std::memcpy(tensor.data.data() + at, &value, sizeof(value));
+        }
+      } else if (tensor.name == "token_embd.weight" || tensor.name == "output.weight" ||
+                 tensor.name.ends_with("attn_q.weight") || tensor.name.ends_with("attn_k.weight") ||
+                 tensor.name.ends_with("attn_v.weight") || tensor.name.ends_with("attn_output.weight")) {
+        if (tensor.type != gguf_fixtures::kQ8_0)
+          throw std::logic_error("nonzero attention fixture requires Q8_0 projections");
+        for (size_t at = 0; at < tensor.data.size(); at += 34) {
+          tensor.data[at] = 0; tensor.data[at + 1] = 0x14; // fp16 2^-10
+          for (size_t code = 2; code < 34; ++code)
+            tensor.data[at + code] = uint8_t(int8_t(int32_t(next() >> 24) % 9 - 4));
+        }
+      }
+    }
+  }
+  test::writeFile(root / "target" / "model.gguf", test::gguf::file(keys, tensors));
   constexpr std::array<uint32_t, 4> draftReads{1, 3, 5, 7};
   const model::DFlashDraftLayout draft =
       model::draftLayout(target.hiddenSize, target.vocabularySize, 1, 512, 1'000'000.0F, draftReads);

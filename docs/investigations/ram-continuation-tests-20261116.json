@@ -1,0 +1,106 @@
+{
+  "created_at": "2026-11-16T13:33:33.992392+00:00",
+  "base_commit": "9753a803a8d7acc4caf6e164292ca279ea69d830",
+  "runtime_policy_enabled": false,
+  "engine_admission_calls_parking": false,
+  "deployed": false,
+  "production_model_benchmarks": false,
+  "source_sha256": {
+    "runtime/model/QwenState.hpp": "077539bf829dc3b1b87629ce7559f301a3d106b76d3cebcdf32af7cd0d130d28",
+    "runtime/model/QwenState.cpp": "dce5b3f8b49485ad52476c23b37c65f5b64b6a088d9a85b480a95fb392e1c7e3",
+    "runtime/model/Runtime.hpp": "32704393ae3ae54a6924983764ffcfc6bb4d54e6635a3b540f3a0c80aedd89e1",
+    "runtime/model/Runtime.cpp": "e2a63cd5d54750c2312252992628ce70f645c945cbdf8346401fc0b965ed71e3",
+    "dev/tests/engine/SyntheticModels.hpp": "5f0a679ad49587c5de36be108ee0e168efc5b74165ebc8eacc4df486479e417b",
+    "dev/tests/engine/qwen_state_storage_test.mm": "c508b71cae19fa3b51f63970e4b7e580e0f5d4805191f69c9435d9f7462795f2",
+    "dev/tests/engine/ram_continuation_test.mm": "fa1b7ad65c4b1bee0461aa19f596185c778b2040b2a402ccb5699183c888cdb6"
+  },
+  "engine_tests": {
+    "passed": 458,
+    "failed": 0
+  },
+  "storage_unit_tests": {
+    "passed": true,
+    "formats": [
+      "fp32",
+      "bf16"
+    ],
+    "auxiliary_state": true,
+    "late_handle_cleanup": true
+  },
+  "numerical_unit_tests": {
+    "passed": true,
+    "families": [
+      "dense",
+      "flash-next"
+    ],
+    "formats": [
+      "fp32",
+      "bf16"
+    ],
+    "cases": 4,
+    "rotations_per_case": 2,
+    "state_parities_per_case": 2,
+    "sampled_tokens_per_case": 6,
+    "KV_table_rebinding": true,
+    "real_model_weights": false,
+    "fixed_verify_rows": true,
+    "actual_spilled_KV_pages": false
+  },
+  "sanitizers": {
+    "address": true,
+    "undefined_behavior": true,
+    "full_native_library_instrumented": true,
+    "construction_control_passed": true,
+    "storage_passed": true,
+    "numerical_cases_passed": 4,
+    "container_checks_enabled": true,
+    "initial_mixed_instrumentation_failed": true,
+    "construction_only_mixed_control_reproduced": true,
+    "detection_suppressed": false
+  },
+  "architecture": {
+    "passed": true,
+    "engine_production_lines": 30102,
+    "engine_line_budget": 30105
+  },
+  "production_verification": {
+    "native_instance_unchanged": true,
+    "native_identity_unchanged": true,
+    "native_restarts": 0,
+    "native_ready": true,
+    "persistent_Samsung_files_open": true,
+    "Samsung_external_volume_UUID_verified": true,
+    "model": "ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF:Q2_0",
+    "context_tokens": 262144,
+    "RAM_GiB": 96,
+    "cache_GiB": 512,
+    "admission_enabled": false,
+    "M4_enabled": false,
+    "fusion_unchanged": true,
+    "worker_limit": 8,
+    "capacity": 128,
+    "queue_running": 0,
+    "queue_waiting": 0,
+    "health": {
+      "11500/health": 200,
+      "11500/ready": 200,
+      "11501/health": 200,
+      "11501/ready": 200,
+      "11502/health": 200,
+      "11502/ready": 200,
+      "11503/health": 200,
+      "11503/ready": 200,
+      "11504/health": 200,
+      "11504/ready": 200
+    },
+    "deployed": false,
+    "model_benchmarks": false
+  },
+  "limitations": [
+    "No Engine rotation policy or activation path",
+    "No real-model TTFT, throughput or coding-quality measurement",
+    "No actual spilled-KV read/reclaim-failure qualification",
+    "No qualification of all constrained, thinking or draft-acceptance outcomes",
+    "Full make check and CI not run in this worktree"
+  ]
+}

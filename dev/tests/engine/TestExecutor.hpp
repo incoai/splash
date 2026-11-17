@@ -239,7 +239,13 @@ public:
       --deniedBegins;
       return {{}, StateFailure::MemoryPressure, metal::AllocationFailure::EngineBudget};
     }
+    std::optional<uint32_t> reserved;
+    for (const auto &[_, candidate] : requests)
+      if (candidate.parked && candidate.reservedBorrower == request.id) reserved = candidate.lane;
     for (uint32_t lane = 0; lane < maximumLanes; ++lane) {
+      if ((reserved && lane != *reserved) || std::ranges::any_of(requests, [&](const auto &item) {
+            return item.second.parked && item.second.lane == lane && item.second.reservedBorrower != request.id;
+          })) continue;
       const bool used = std::any_of(
           requests.begin(), requests.end(), [lane](const auto &entry) {
             return entry.second.resident && entry.second.lane == lane;
@@ -256,6 +262,7 @@ public:
                     .scoreTokens = {request.scoreTokens.begin(),
                                     request.scoreTokens.end()}});
         prompts[request.id].assign(request.prompt.begin(), request.prompt.end());
+        for (auto &[_, owner] : requests) if (owner.reservedBorrower == request.id) owner.reservedBorrower = 0;
         return {lane, StateFailure::None};
       }
     }
@@ -278,6 +285,54 @@ public:
     if (kvGrowthBlocked && unblockGrowthOnSuspend)
       *kvGrowthBlocked = false;
   }
+  model::ModelMemoryAdmission suspend(uint64_t id, model::SuspensionKind kind, uint64_t borrower = 0) override {
+    if (kind == model::SuspensionKind::Replay) { suspend(id); return {.ok = true}; }
+    auto &entry = requests.at(id);
+    if (!exactContinuations || denyExactPark || !entry.resident || entry.constrained || entry.awaitingMask ||
+        entry.generated + 1 >= outputLimits.at(id)) return {};
+    if (borrower && (borrower == id || requests.contains(borrower))) return {};
+    if (memory && exactBankBytes) {
+      const auto result = memory->allocate(admission, "states", exactBankBytes);
+      if (!result) return {.allocationFailure = result.failure};
+      heldStateBytes += exactBankBytes; entry.exactScratchBytes = exactBankBytes;
+    }
+    entry.reservedBorrower = borrower;
+    entry.resident = false; entry.parked = true; ++exactParks;
+    pageTables.erase(id);
+    return {.ok = true};
+  }
+  StateAdmission resumeExact(uint64_t id, uint64_t resident = 0, bool allowFreeLane = false) override {
+    auto &entry = requests.at(id);
+    if (!entry.parked) throw std::logic_error("exact return without a parked owner");
+    if (resident) {
+      auto &out = requests.at(resident);
+      if (!out.resident || out.lane != entry.lane) throw std::logic_error("wrong exact peer");
+      if (allowFreeLane && denyExactExpansion) return {{}, StateFailure::MemoryPressure, metal::AllocationFailure::HostPressure};
+      if (allowFreeLane) {
+        for (uint32_t lane = 0; lane < maximumLanes; ++lane) {
+          if (std::ranges::any_of(requests, [lane](const auto &item) { return (item.second.resident || item.second.parked) && item.second.lane == lane; })) continue;
+          entry.lane = lane; entry.resident = true; entry.parked = false; entry.reservedBorrower = 0;
+          giveBackStates(entry.exactScratchBytes); entry.exactScratchBytes = 0;
+          pageTables.erase(id); ++exactExpansions;
+          return {lane, StateFailure::None};
+        }
+      }
+      if (out.awaitingMask || out.constrained || out.generated + 1 >= outputLimits.at(resident))
+        return {{}, StateFailure::ConcurrencyLimit};
+      out.reservedBorrower = 0;
+      out.exactScratchBytes = std::exchange(entry.exactScratchBytes, 0);
+      out.resident = false; out.parked = true; pageTables.erase(resident); ++exactExchanges;
+    } else {
+      for (const auto &[other, candidate] : requests)
+        if (other != id && candidate.resident && candidate.lane == entry.lane)
+          return {{}, StateFailure::ConcurrencyLimit};
+      if (entry.exactScratchBytes) { giveBackStates(entry.exactScratchBytes); entry.exactScratchBytes = 0; }
+      ++exactReturns;
+    }
+    entry.resident = true; entry.parked = false; entry.reservedBorrower = 0; pageTables.erase(id);
+    return {entry.lane, StateFailure::None};
+  }
+
   StateAdmission resume(const ModelRequest &request) override {
     ++resumeAttempts;
     lastRestoredTokens = request.restoredTokens;
@@ -287,6 +342,7 @@ public:
     const uint64_t id = request.id;
     Request &entry = requests.at(id);
     for (uint32_t lane = 0; lane < maximumLanes; ++lane) {
+      if (std::ranges::any_of(requests, [lane](const auto &item) { return item.second.parked && item.second.lane == lane; })) continue;
       const bool used = std::any_of(
           requests.begin(), requests.end(), [&](const auto &candidate) {
             return candidate.first != id && candidate.second.resident &&
@@ -748,11 +804,13 @@ public:
   }
   void end(uint64_t id) override {
     ++ends;
-    if (const auto found = requests.find(id); found != requests.end() && found->second.resident) {
+    if (const auto found = requests.find(id); found != requests.end() && (found->second.resident || found->second.parked)) {
       releaseLane(id);
       if (laneReleased)
         laneReleased();
     }
+    if (const auto found = requests.find(id); found != requests.end())
+      giveBackStates(found->second.exactScratchBytes);
     requests.erase(id);
     pageTables.erase(id);
     spilledReadFloors.erase(id);
@@ -802,6 +860,8 @@ public:
     uint32_t lane = 0;
     uint32_t position = 0;
     bool resident = false;
+    bool parked = false;
+    uint64_t exactScratchBytes = 0, reservedBorrower = 0;
     bool replaying = false;
     bool constrained = false;
     std::vector<uint32_t> scoreTokens;
@@ -868,6 +928,9 @@ public:
   uint32_t lastRestoredTokens = 0;
   // Begins the budget refuses, and resumes the host refuses.
   uint32_t deniedBegins = 0;
+  uint64_t exactBankBytes = 4096;
+  bool exactContinuations = false, denyExactPark = false, denyExactExpansion = false;
+  uint32_t exactParks = 0, exactExchanges = 0, exactReturns = 0, exactExpansions = 0;
   uint32_t suspensions = 0;
   // The request of each suspension, in order.
   std::vector<uint64_t> suspendedIds;

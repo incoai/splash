@@ -274,6 +274,37 @@ public:
   tryActivateLane(uint32_t lane, uint64_t requestId, uint64_t extraBytes = 0,
                   const std::function<void()> &allocateExtra = {});
   void releaseLane(uint32_t lane, uint64_t requestId);
+  // A RAM-only continuation, not a prefix-cache snapshot. The caller drains
+  // commands first and stores every lane-indexed scratch value in scratch().
+  // Holding it retains both parities, draft rings/window and pending-row
+  // metadata under the same allocation ledger. No buffers enter the idle pool.
+  class ParkedLane final {
+  public:
+    ~ParkedLane();
+    ParkedLane(const ParkedLane &) = delete;
+    ParkedLane &operator=(const ParkedLane &) = delete;
+    [[nodiscard]] const QwenLaneMetadata &metadata() const noexcept;
+    [[nodiscard]] const metal::MetalBuffer &scratch() const noexcept;
+  private:
+    struct Impl;
+    explicit ParkedLane(std::unique_ptr<Impl> impl);
+    std::unique_ptr<Impl> impl_;
+    friend class QwenStateStorage;
+  };
+  // All allocation and saveScratch complete before the source is detached.
+  // Refusal (null) or a throwing save leaves the assigned lane unchanged.
+  [[nodiscard]] std::unique_ptr<ParkedLane> parkLane(
+      uint32_t lane, uint64_t requestId, uint64_t scratchBytes,
+      const std::function<void(const metal::MetalBuffer &)> &saveScratch,
+      metal::AllocationFailure &refusal);
+  // Caller restores scratch into the free destination first. Success consumes
+  // the handle; wrong owner/storage or an occupied destination consumes nothing.
+  void restoreParkedLane(uint32_t lane, uint64_t requestId,
+                         std::unique_ptr<ParkedLane> &parked);
+  // Swaps an assigned lane with a parked owner's buffers, without allocation.
+  // The caller has already exchanged lane-indexed scratch. Neither handle is
+  // consumed; the parked handle now owns the outgoing resident's state.
+  void exchangeParkedLane(uint32_t lane, uint64_t residentId, uint64_t parkedId, ParkedLane &parked);
   // A lane that starts at length zero without a restore reads zero recurrent
   // state; its first transition overwrites the other parity.
   void clearForColdStart(uint32_t lane);

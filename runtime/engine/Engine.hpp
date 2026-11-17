@@ -65,6 +65,8 @@ struct EngineConfig final {
   // only where one layer of a group, or a cut at its floor rows, does
   // (Scheduler). Finite and positive.
   double decodeGapMilliseconds = 500.0;
+  // Zero keeps resident-only admission; a positive quantum permits exact foreground turns.
+  uint32_t foregroundTurnTokens = 0;
   // The prefill checkpoint interval and the resource wait limit.
   uint32_t prefillCheckpointTokens = kPrefillCheckpointTokens;
   double resourceWaitTimeoutMilliseconds = kResourceWaitTimeoutMilliseconds;
@@ -178,6 +180,7 @@ struct DecodeGapCausesSnapshot final {
 };
 
 struct EngineSnapshot final {
+  uint32_t foregroundTurnTokens = 0;
   SchedulerSnapshot scheduler;
   // Requests not yet finalized, in submission (id) order.
   std::vector<ActiveRequestSnapshot> activeRequests;
@@ -403,6 +406,8 @@ private:
     // refused, restart its wait's limit.
     uint64_t admission = 0;
     std::optional<uint32_t> lane;
+    std::optional<uint64_t> exchangePeer;
+    uint32_t turnStartedTokens = 0;
     uint32_t promptTokens = 0;
     uint32_t reportedPromptTokens = 0;
     uint32_t replayTokens = 0;
@@ -658,9 +663,6 @@ private:
   [[nodiscard]] uint64_t laneDemandBytes() const;
   // The highest priority among the lanes in service, none without one.
   [[nodiscard]] std::optional<RequestPriority> highestLanePriority() const;
-  // The request's projection fits in memory alone, as it would without the
-  // SSD cache (SpillGeometry::residentTokens).
-  [[nodiscard]] bool fitsResidentAlone(const Request &request) const;
   // The last block of a chain of KV a request holds: the one a lookup
   // matched, which it restores, or the one it holds published as its lane
   // runs, its prompt's progress while it prefills (a replay publishes its
@@ -701,7 +703,7 @@ private:
   [[nodiscard]] SpillAdmission admitSpill(Request &request, bool resuming, uint64_t chainEnd, const ClaimSpec &spec,
                                           double nowMilliseconds);
   // What memory does for a start the SSD cache cannot take whose projection
-  // fits in memory alone (fitsResidentAlone): it starts Resident where the
+  // fits the resident context bound: it starts Resident where the
   // claim its admission makes holds its Resident KV now beside the lanes'
   // projected growth (residentRoom), since a lane started where memory does
   // not hold it fails at a wall the engine already sees. Beside other lanes
@@ -878,6 +880,16 @@ private:
   // predecessor a reader pins takes only the pool or the admission too:
   // refused, its command ends at it, and apply publishes it from the lane
   // only if the pin has gone by then. Null buffers when refused.
+  // What a refused allocation leaves (allocate). Waits: the work it is for
+  // waits for the memory (a lane's start, its KV, its reads), so a refusal
+  // no memory on its way back ends is a failure the recovery drain waits
+  // out (allocationFailed_). Settled: the caller goes on without it, which
+  // records none: a command ends sooner, a state goes without RAM buffers,
+  // landed Spill pages stay Full or the Index runway short. SettledOnce: as
+  // Settled, in one attempt the ledger frees nothing for, the caller taking
+  // buffers it holds instead (its lane's, a checkpoint's).
+  enum class Refusal : uint8_t { Waits, Settled, SettledOnce };
+  [[nodiscard]] Reservation reserveStateBuffers(Request &request, uint32_t tokens, const ClaimSpec &spec, Refusal refusal);
   [[nodiscard]] Reservation reserveCapture(Request &request, StateClass kind, uint32_t tokens,
                                            bool followsCheckpoint, bool supersedes);
   // Reserves the buffers of the state a decoding lane captures in its next
@@ -1013,15 +1025,6 @@ private:
     // The ledger took memory for it (FreeOutcome::Met) before an attempt.
     bool freed = false;
   };
-  // What a refused allocation leaves (allocate). Waits: the work it is for
-  // waits for the memory (a lane's start, its KV, its reads), so a refusal
-  // no memory on its way back ends is a failure the recovery drain waits
-  // out (allocationFailed_). Settled: the caller goes on without it, which
-  // records none: a command ends sooner, a state goes without RAM buffers,
-  // landed Spill pages stay Full or the Index runway short. SettledOnce: as
-  // Settled, in one attempt the ledger frees nothing for, the caller taking
-  // buffers it holds instead (its lane's, a checkpoint's).
-  enum class Refusal : uint8_t { Waits, Settled, SettledOnce };
   // Converts a Resident lane to Spill on a target whose KV can live on the
   // SSD cache (Cache::convertToSpill), committing its projection's pages
   // without a copy, the chain it holds or, at admission, the one it restores
@@ -1287,7 +1290,9 @@ private:
   // a signal would count as progress in deferResourceRetry and move the
   // refused request's own wait limit out on every retry. Nor does a growth
   // suspension (suspendForGrowth), which starts the recovery drain instead.
-  void vacateLane(Request &request, bool keepContinuation);
+  bool vacateLane(Request &request, bool keepContinuation, bool exact = false, uint64_t borrower = 0);
+  bool rotateDecodedTurns();
+  bool lendForeground(Request &start, double now);
   void release(Request &request);
   // Removes the finalized requests; the idle period begins once none is left.
   void sweepTerminal(double nowMilliseconds);

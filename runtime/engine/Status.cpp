@@ -77,6 +77,7 @@ const char *phaseName(engine::Phase phase) noexcept {
   case engine::Phase::Prefill: return "prefill";
   case engine::Phase::Decode: return "decode";
   case engine::Phase::WaitingMask: return "waiting_mask";
+  case engine::Phase::Parked: return "parked";
   case engine::Phase::Completed: return "completed";
   case engine::Phase::Cancelled: return "cancelled";
   case engine::Phase::Failed: return "failed";
@@ -605,6 +606,8 @@ void writeScheduler(json::Writer &w, const engine::EngineSnapshot &core) {
         .field("prefilling", scheduler.prefilling)
         .field("decoding", scheduler.decoding)
         .field("waiting_mask", scheduler.waitingMask)
+        .field("parked", scheduler.parked)
+        .field("foreground_turn_tokens", core.foregroundTurnTokens)
         .field("terminal", scheduler.terminal)
         .field("prefill_batches", scheduler.prefillBatches)
         .field("prefill_rows", scheduler.prefillRows)

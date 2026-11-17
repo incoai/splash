@@ -158,6 +158,7 @@ struct ModelRequest final {
   // before it are neither staged nor encoded; their spans still place
   // rotary positions.
   uint32_t restoredTokens = 0;
+  [[nodiscard]] std::optional<std::string_view> validationError(uint32_t vocabulary, uint32_t context, uint32_t imagePatches) const;
 };
 
 // One image in the prompt: the run of placeholder tokens it occupies (one per
@@ -182,6 +183,23 @@ struct ImageSpan final {
   }
   bool operator==(const ImageSpan &) const = default;
 };
+
+inline std::optional<std::string_view> ModelRequest::validationError(uint32_t vocabulary, uint32_t context,
+                                                                    uint32_t imagePatches) const {
+  if (prompt.size() > context || maxNewTokens > context - prompt.size()) return "request exceeds the context window";
+  const auto outside = [vocabulary](uint32_t token) { return token >= vocabulary; };
+  if (std::ranges::any_of(prompt, outside)) return "prompt token is out of vocabulary";
+  if (std::ranges::any_of(scoreTokens, outside)) return "score token is out of vocabulary";
+  if (thinkingBudget) {
+    if (const auto reason = thinkingBudget->unusable()) return reason;
+    if (std::ranges::any_of(thinkingBudget->end, outside) || outside(thinkingBudget->alsoEnds))
+      return "thinking end token is out of vocabulary";
+  }
+  if (!images.empty() && !imagePatches) return "this model is serving without vision";
+  if (std::ranges::any_of(images, [imagePatches](const auto &image) { return image.grid().patches() > imagePatches; }))
+    return "image has more patches than the server's pixel cap allows";
+  return {};
+}
 
 // The first rule a request's image spans break, or none: each covers a valid
 // grid within the patch limit with one token per merged patch group, the
@@ -824,6 +842,8 @@ struct WarmupStepResult final {
   std::vector<WarmupLaneResult> lanes;
 };
 
+enum class SuspensionKind : uint8_t { Replay, Exact };
+
 class Model : public PrefillWorkSource {
 public:
   virtual ~Model() = default;
@@ -839,6 +859,21 @@ public:
   // last budgeted anchor as it selects it, and decodes no lane left only
   // that anchor.
   virtual void suspend(uint64_t requestId) = 0;
+  // Exact suspension is optional. It retains live KV and admits a bank before
+  // detaching; refusal leaves the resident untouched. A nonzero third id
+  // reserves the physical slot for that not-yet-started borrower. Other
+  // admissions cannot take parked slots. end() disposes either owner.
+  [[nodiscard]] virtual ModelMemoryAdmission suspend(uint64_t id, SuspensionKind kind, uint64_t = 0) {
+    if (kind == SuspensionKind::Exact) return {};
+    suspend(id);
+    return {.ok = true};
+  }
+  // Return an exact owner into its original free slot, or exchange it with
+  // that slot's resident. Default returns allocate nothing. allowFreeLane permits an optional hot-floor
+  // reservation to split a pair into two independent physical lanes.
+  [[nodiscard]] virtual StateAdmission resumeExact(uint64_t, uint64_t = 0, bool = false) {
+    return {{}, StateFailure::ConcurrencyLimit};
+  }
   [[nodiscard]] virtual StateAdmission resume(const ModelRequest &request) = 0;
   // Restores a cached state into the request's lane at `boundary`. A RAM
   // state is copied now and the call returns null; a disk state returns the

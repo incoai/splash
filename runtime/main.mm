@@ -241,6 +241,7 @@ bootstrapConfig(const engine::NativeArguments &arguments) {
   config.resources.int8Activations = arguments.int8Activations;
   config.nativeLoop.engine.maxContext = arguments.maxContext;
   config.nativeLoop.engine.decodeShare = arguments.decodeShare;
+  config.nativeLoop.engine.foregroundTurnTokens = arguments.foregroundTurnTokens;
   return config;
 }
 

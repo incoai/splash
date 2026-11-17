@@ -38,7 +38,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: Homebrew/actions/setup-homebrew@d482da0e602890d3160aade42e72c8556103bf04
       - name: Install the Metal toolchain
-        run: xcodebuild -downloadComponent MetalToolchain
+        run: bash .github/scripts/install-metal-toolchain.sh
       - name: Install Python 3.13
         run: HOMEBREW_NO_AUTO_UPDATE=1 brew install python@3.13
       - name: Build production and run CPU runtime checks
@@ -73,7 +73,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: Homebrew/actions/setup-homebrew@d482da0e602890d3160aade42e72c8556103bf04
       - name: Install the Metal toolchain
-        run: xcodebuild -downloadComponent MetalToolchain
+        run: bash .github/scripts/install-metal-toolchain.sh
       - name: Install Python and fish for the completion tests
         run: HOMEBREW_NO_AUTO_UPDATE=1 brew install python@${{ matrix.python-version }} fish
       - name: Run the Python tests and source checks

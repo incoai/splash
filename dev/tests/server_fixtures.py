@@ -907,6 +907,7 @@ def main_args(**overrides):
             "persistent_cache": False,
             "cache_dir": None,
             "decode_share": None,
+            "foreground_turn_tokens": None,
             "disable_ane": False,
             "activations": "auto",
             "verify_rows": "auto",

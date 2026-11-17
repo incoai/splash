@@ -35,6 +35,20 @@ public:
   [[nodiscard]] StateAdmission
   begin(const ModelRequest &request) override;
   void suspend(uint64_t requestId) override;
+  [[nodiscard]] ModelMemoryAdmission suspend(uint64_t requestId, SuspensionKind kind, uint64_t borrower = 0) override;
+  [[nodiscard]] StateAdmission resumeExact(uint64_t requestId, uint64_t residentId = 0, bool allowFreeLane = false) override;
+  // Experimental RAM-only decode continuation. Not used by Engine admission.
+  // The caller must finish every outstanding command ticket before either
+  // operation, retain the request's KV pages, and end() on cancellation.
+  // Unsupported decode stages or memory refusal leave the request resident.
+  [[nodiscard]] ModelMemoryAdmission parkDecodedRequest(uint64_t requestId);
+  [[nodiscard]] StateAdmission restoreParkedRequest(uint64_t requestId);
+  // Reserve two maximum-sized scratch packets before detaching. Spill-capable
+  // callers first reserveSpilledReads(Decode); the physical lane keeps that
+  // floor. Subsequent exchanges need no allocation or free state lane;
+  // both owners must use that physical lane, including an ordinary return.
+  [[nodiscard]] ModelMemoryAdmission prepareDecodedExchange(uint64_t requestId);
+  [[nodiscard]] StateAdmission exchangeDecodedRequests(uint64_t parkedId, uint64_t residentId);
   [[nodiscard]] StateAdmission
   resume(const ModelRequest &request) override;
   [[nodiscard]] std::unique_ptr<StateRestore> beginRestore(
@@ -78,9 +92,11 @@ public:
   telemetry() const noexcept override;
 
 private:
+  [[nodiscard]] StateAdmission restoreParkedInto(uint64_t requestId, uint32_t lane);
   // The state lane of a resident request; the storage checks that its
   // committed state can be cached.
   [[nodiscard]] uint32_t residentLane(uint64_t requestId) const;
+  [[nodiscard]] ModelMemoryAdmission parkDecodedRequest(uint64_t requestId, bool exchange);
   void finishRestore(uint64_t requestId, uint32_t boundary, bool restoreDraft);
   void prepareWarmupDecode(uint64_t requestId, uint32_t anchor);
   // The step costs of `width` lanes on this machine (StepCosts::measure),

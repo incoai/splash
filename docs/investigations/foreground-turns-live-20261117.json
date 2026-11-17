@@ -1,0 +1,82 @@
+{
+  "active": true,
+  "source_commit": "76ae6320486b24b7ff613d866bb88aa06dad4a8d",
+  "build_id": "src-ec91c93e87fb8813bdb6005d1f024e4ee8c4d2323132a5efd7834e5414429f9b",
+  "native_sha256": "b5b003433dc630be1d4af7c3b6b03be51bdca39f8af823aca26658b86822c07a",
+  "foreground_turn_tokens": 32,
+  "model": "ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF:Q2_0",
+  "RAM_GiB": 96,
+  "cache_GiB": 512,
+  "context_tokens": 262144,
+  "persistent_Samsung_slots_open": true,
+  "same_signed_service_requirement": true,
+  "restart_without_permission_prompt_verified": true,
+  "taken_back": {
+    "states": 4534,
+    "kv_blocks": 328719,
+    "bytes": 421717966848,
+    "left_behind": 0
+  },
+  "persistent_cache_read_bytes": 158400512,
+  "worker_limit": 8,
+  "capacity": 128,
+  "admission_fusion_M4_enabled": false,
+  "database_preserved": true,
+  "missing_history": 0,
+  "health": {
+    "11500/health": 200,
+    "11500/ready": 200,
+    "11501/health": 200,
+    "11501/ready": 200,
+    "11502/health": 200,
+    "11502/ready": 200,
+    "11503/health": 200,
+    "11503/ready": 200,
+    "11504/health": 200,
+    "11504/ready": 200
+  },
+  "foreground_client_acceptance": {
+    "requests": 8,
+    "HTTP_200": 8,
+    "body_priority_omitted": true,
+    "interactive_header_forwarded": true,
+    "parked_peak": 4
+  },
+  "cache_seed_reuse": {
+    "prompt_tokens": 7268,
+    "cached_after_restart": 7232,
+    "seed_cached_tokens": 0
+  },
+  "release_guard_correction": "First attempt rolled back safely after the checker compared newly signed service executable bytes with the old signature. Verified unsigned executable code and designated requirement match; pinned all new signed service hashes before successful retry.",
+  "normal_traffic_observation": {
+    "healthy": true,
+    "observed_seconds": 60.765214920043945,
+    "normal_requests_completed_during_window": 8,
+    "failed_requests": 0,
+    "same_engine_instance": true,
+    "pressure": [
+      "normal",
+      "normal",
+      "normal",
+      "normal"
+    ],
+    "cache_writes_gated": [
+      "no",
+      "no",
+      "no",
+      "no"
+    ],
+    "health": {
+      "11500/health": 200,
+      "11500/ready": 200,
+      "11501/health": 200,
+      "11501/ready": 200,
+      "11502/health": 200,
+      "11502/ready": 200,
+      "11503/health": 200,
+      "11503/ready": 200,
+      "11504/health": 200,
+      "11504/ready": 200
+    }
+  }
+}

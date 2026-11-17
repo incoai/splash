@@ -941,6 +941,120 @@ void testStartBytes(metal::MetalBackend &backend) {
   }
 }
 
+void testParkedLane(metal::MetalBackend &backend) {
+  const uint64_t backendBefore = backend.memoryStats().allocatedBytes;
+  for (const auto format : {ops::GdnStateFormat::Float32, ops::GdnStateFormat::BFloat16}) {
+    const model::CompositeStateLayout layout{{2, 3, 16, 1, 8, SPLASH_STATE_CODEC_BLOCK, format, 37}, {1, 1, 8, 128}};
+    MemoryGovernor governor(backend, backend.capabilities().recommendedMaxWorkingSetBytes, 1, 1,
+                            queryHostMemory, 0);
+    const test::ClaimScope start(governor, ClaimClass::Floor);
+    bool allowed = true;
+    auto admission = [&](uint64_t bytes, const std::function<void()> &allocate) -> metal::AllocationResult {
+      return allowed ? governor.allocationAdmission()(bytes, allocate)
+                     : metal::AllocationResult{metal::AllocationFailure::EngineBudget};
+    };
+    model::QwenStateStorage storage(backend, admission, layout, nullptr);
+    require(static_cast<bool>(storage.tryActivateLane(0, 101)), "park fixture activation failed");
+    fill(storage.current(0).stateBase, 19);
+    fill(storage.next(0).stateBase, 23);
+    fill(storage.window(0), 29);
+    for (const auto &ring : storage.draft(0)) {
+      fill(ring.keys, 31);
+      fill(ring.values, 37);
+    }
+    storage.updateLengths(0, {37, 0, 37, 32});
+    constexpr uint32_t pendingPath = 1u | (1u << 3) | (1u << 15);
+    storage.swapDecodeParity(0, pendingPath);
+    const auto metadata = storage.metadata(0);
+    const auto current = bytesOf(storage.current(0).stateBase);
+    const auto next = bytesOf(storage.next(0).stateBase);
+    const auto window = bytesOf(storage.window(0));
+    const auto keys = bytesOf(storage.draft(0).front().keys);
+    const auto values = bytesOf(storage.draft(0).front().values);
+    const uint64_t before = storage.actualAllocatedBytes();
+    metal::AllocationFailure refusal;
+    bool saved = false;
+    const auto save = [&](const metal::MetalBuffer &scratch) { saved = true; fill(scratch, 41); };
+    allowed = false;
+    auto parked = storage.parkLane(0, 101, 19, save, refusal);
+    require(!parked && !saved && refusal == metal::AllocationFailure::EngineBudget &&
+                storage.metadata(0).requestId == 101 && storage.actualAllocatedBytes() == before,
+            "refused parking detached a lane, copied scratch or changed its charge");
+    allowed = true;
+    rejects([&] {
+      static_cast<void>(storage.parkLane(0, 101, 19, [](const auto &) {
+        throw std::runtime_error("save refused");
+      }, refusal));
+    }, "save refused", "throwing scratch save was swallowed");
+    require(storage.metadata(0).requestId == 101 && storage.actualAllocatedBytes() == before,
+            "throwing scratch save lost lane ownership or leaked its charge");
+    rejects([&] { static_cast<void>(storage.parkLane(0, 202, 0, {}, refusal)); },
+            "owner mismatch", "another request parked the lane");
+    rejects([&] {
+      static_cast<void>(storage.parkLane(0, 101, std::numeric_limits<uint64_t>::max(), save, refusal));
+    }, "overflows", "overflowing parked scratch was accepted");
+    parked = storage.parkLane(0, 101, 19, save, refusal);
+    require(parked && saved && refusal == metal::AllocationFailure::None &&
+                !storage.metadata(0).assigned() && parked->metadata().pendingPath == pendingPath &&
+                parked->metadata().activeParity == metadata.activeParity &&
+                parked->metadata().lengths == metadata.lengths &&
+                storage.actualAllocatedBytes() == before + parked->scratch().allocatedBytes() &&
+                storage.idleCells() == 0 && storage.idleRings() == 0 && storage.idleWindows() == 0,
+            "parking changed pending state, undercharged memory or pooled held buffers");
+    const auto scratch = bytesOf(parked->scratch());
+    require(static_cast<bool>(storage.tryActivateLane(0, 202)), "intruder activation failed");
+    fill(storage.current(0).stateBase, 43);
+    fill(storage.window(0), 47);
+    for (const auto &ring : storage.draft(0)) fill(ring.keys, 53);
+    rejects([&] { storage.restoreParkedLane(0, 101, parked); }, "destination lane is assigned",
+            "restore overwrote an occupied destination");
+    model::QwenStateStorage other(backend, admission, layout, nullptr);
+    rejects([&] { other.restoreParkedLane(1, 101, parked); }, "another storage",
+            "restore accepted a continuation from another storage");
+    rejects([&] { storage.restoreParkedLane(1, 202, parked); }, "owner mismatch",
+            "restore accepted another request's continuation");
+    require(parked && sameBytes(parked->scratch(), scratch), "rejected restore consumed scratch");
+    const uint64_t withScratch = storage.actualAllocatedBytes();
+    const uint64_t scratchCharge = parked->scratch().allocatedBytes();
+    storage.restoreParkedLane(1, 101, parked);
+    require(!parked && storage.metadata(1).requestId == 101 &&
+                storage.metadata(1).activeParity == metadata.activeParity &&
+                storage.metadata(1).pendingPath == metadata.pendingPath &&
+                storage.metadata(1).lengths == metadata.lengths &&
+                sameBytes(storage.current(1).stateBase, current) &&
+                sameBytes(storage.next(1).stateBase, next) && sameBytes(storage.window(1), window) &&
+                sameBytes(storage.draft(1).front().keys, keys) &&
+                sameBytes(storage.draft(1).front().values, values) &&
+                storage.actualAllocatedBytes() == withScratch - scratchCharge,
+            "rebinding changed bytes, metadata, parity or the scratch allocation charge");
+    rejects([&] { storage.restoreParkedLane(2, 101, parked); }, "another storage",
+            "a consumed continuation was restored twice");
+    parked = storage.parkLane(1, 101, 0, {}, refusal);
+    require(parked && !parked->scratch(), "scratch-free parking allocated scratch");
+    parked.reset();
+    require(storage.idleCells() == 0 && storage.idleRings() == 0 && storage.idleWindows() == 0 &&
+                storage.actualAllocatedBytes() == before,
+            "discarding a parked lane retained its state or allocation charge");
+    storage.releaseLane(0, 202);
+  }
+  std::unique_ptr<model::QwenStateStorage::ParkedLane> late;
+  {
+    const model::CompositeStateLayout layout{{1, 3, 16, 1, 8, SPLASH_STATE_CODEC_BLOCK}, {1, 1, 8, 128}};
+    MemoryGovernor governor(backend, backend.capabilities().recommendedMaxWorkingSetBytes, 1, 1,
+                            queryHostMemory, 0);
+    const test::ClaimScope start(governor, ClaimClass::Floor);
+    model::QwenStateStorage storage(backend, governor.allocationAdmission(), layout, nullptr);
+    require(static_cast<bool>(storage.tryActivateLane(0, 909)), "late discard fixture failed");
+    metal::AllocationFailure refusal;
+    late = storage.parkLane(0, 909, 0, {}, refusal);
+  }
+  require(late && backend.memoryStats().allocatedBytes > backendBefore,
+          "storage destruction lost a parked lane's owned buffers");
+  late.reset();
+  require(backend.memoryStats().allocatedBytes == backendBefore, "parked lane tests leaked Metal buffers");
+  std::cout << "parked_lane=PASS formats=fp32,bf16 pending_rows=3 rebind=1 refusal=1 rollback=1\n";
+}
+
 // The pool keeps the buffers the next lane starts from only while no lane
 // holds its own: beside a lane in service, a released lane's cells, rings and
 // window are idle bytes that keepLane releases, since the lane in service
@@ -1075,6 +1189,7 @@ void testAccountingAcrossCapturesAndRestores(metal::MetalBackend &backend) {
     }
     require(backend.memoryStats().allocatedBytes == backendBefore, "the storage left Metal allocations behind");
   }
+
 }
 
 void run(const std::string &metallib) {
@@ -1084,6 +1199,7 @@ void run(const std::string &metallib) {
 
   testLayoutFormulas();
   metal::MetalBackend backend(metallib);
+  testParkedLane(backend);
   testOffloadAllocationFailure(backend);
   testDiskRestore(backend);
   testExactCachedStatesRestoreEveryByte(backend);
@@ -1546,13 +1662,18 @@ void run(const std::string &metallib) {
 } // namespace
 
 int main(int argc, const char **argv) {
-  if (argc != 2) {
-    std::cerr << "usage: qwen_state_storage_test METALLIB\n";
+  if (argc != 2 && !(argc == 3 && std::string_view(argv[2]) == "--park-only")) {
+    std::cerr << "usage: qwen_state_storage_test METALLIB [--park-only]\n";
     return EXIT_FAILURE;
   }
   @autoreleasepool {
     try {
-      run(argv[1]);
+      if (argc == 3) {
+        metal::MetalBackend backend(argv[1]);
+        testParkedLane(backend);
+      } else {
+        run(argv[1]);
+      }
       return EXIT_SUCCESS;
     } catch (const std::exception &error) {
       std::cerr << "qwen state storage test failed: " << error.what() << '\n';

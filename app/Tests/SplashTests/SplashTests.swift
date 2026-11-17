@@ -375,6 +375,10 @@ struct ServeSettingsTests {
         #expect(try custom("--expert-memory").parse("lots") == nil)
         #expect(try custom("--idle-release").parse("45M") == "45m")
         #expect(try custom("--port").parse("0") == nil)
+        #expect(try custom("--foreground-turn-tokens").parse("0") == "0")
+        #expect(try custom("--foreground-turn-tokens").parse("4096") == "4096")
+        #expect(try custom("--foreground-turn-tokens").parse("-1") == nil)
+        #expect(try custom("--foreground-turn-tokens").parse("4097") == nil)
         #expect(try custom("--served-model-name").parse("gpt-4o,  o3 ") == "gpt-4o, o3")
         // A value typed in is one the option takes, as kept and read back: every example, and the
         // menu's choices.
