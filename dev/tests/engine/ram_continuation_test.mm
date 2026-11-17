@@ -465,6 +465,104 @@ void exchangeCases(RuntimeResources &resources, model::Runtime &runtime) {
   std::cout << "full_lane_exchange=PASS switches=34 allocation_free=1 host_allocation_free=1 critical_pressure=1 refusal=1 cancellation=1\n";
 }
 
+// Four independent banks: returning one pair must not consume another's
+// reserved floor or scratch. Controls run each owner's next command alone.
+void eightOwnerExchangeCases(RuntimeResources &resources, model::Runtime &runtime) {
+  auto context = resources.modelContext();
+  auto &pool = resources.kvPool();
+  std::array<std::vector<uint32_t>, 8> pages;
+  std::array<uint64_t, 8> positions{};
+  std::array<State, 8> saved;
+  std::array<ModelStepResult, 8> expected;
+  const auto id = [](uint32_t i) { return uint64_t{1401} + i; };
+  const auto begin = [&](uint32_t i, uint32_t lane) {
+    std::vector<uint32_t> prompt(40 + i);
+    for (uint32_t row = 0; row < prompt.size(); ++row) prompt[row] = 10 + row + i;
+    auto acquired = pool.acquirePages(16);
+    require(acquired.granted(), "eight-owner KV refused");
+    pages[i] = std::move(acquired.pages);
+    for (auto page : pages[i]) pool.clearPage(page);
+    EngineRequest request;
+    request.id = id(i); request.prompt = prompt; request.maxNewTokens = 4096;
+    request.flags = RequestIgnoreEndOfSequence;
+    request.sampling = {.temperature = 0.7F, .presencePenalty = 0.2F, .frequencyPenalty = 0.1F, .seed = 47};
+    runtime.beginColdRequest(request.modelView(), lane);
+    static_cast<void>(step(runtime, id(i), 0, pages[i], prompt));
+    positions[i] = prompt.size();
+  };
+  const auto decode = [&](uint32_t i) {
+    auto result = step(runtime, id(i), positions[i], pages[i]);
+    positions[i] += result.outputTokens.size() - result.outputTokensWithoutKv;
+    return result;
+  };
+  const auto freePages = [&](uint32_t i) {
+    for (auto page : pages[i]) pool.releasePage(page, false);
+    pages[i].clear();
+  };
+  for (uint32_t i = 0; i < 8; ++i) {
+    begin(i, 0); static_cast<void>(decode(i)); expected[i] = decode(i);
+    runtime.end(id(i)); freePages(i);
+  }
+  for (uint32_t lane = 0; lane < 4; ++lane) {
+    begin(lane, lane); static_cast<void>(decode(lane));
+    saved[lane] = state(runtime, context.stateStorage, lane);
+    require(runtime.prepareDecodedExchange(id(lane)).granted(), "four-bank preparation refused");
+  }
+  for (uint32_t lane = 0; lane < 4; ++lane) {
+    begin(lane + 4, lane); static_cast<void>(decode(lane + 4));
+    saved[lane + 4] = state(runtime, context.stateStorage, lane);
+  }
+  const auto swapAll = [&](bool returnOriginal) {
+    const auto allocated = resources.backend().memoryStats().allocatedBytes;
+    const auto denials = resources.memoryGovernor().snapshot().deniedReservations;
+    resources.memoryGovernor().setPressure(MemoryPressure::Critical);
+    for (uint32_t lane = 0; lane < 4; ++lane) {
+      const uint32_t incoming = lane + (returnOriginal ? 0 : 4), outgoing = lane + (returnOriginal ? 4 : 0);
+      StateAdmission result;
+      allocationFailureAfter = 0;
+      try { result = runtime.exchangeDecodedRequests(id(incoming), id(outgoing)); }
+      catch (...) { allocationFailureAfter = -1; throw; }
+      const bool noAllocation = allocationFailureAfter == 0;
+      allocationFailureAfter = -1;
+      require(noAllocation && result.granted() && *result.lane == lane, "four-bank return refused or allocated");
+      equal(saved[incoming], state(runtime, context.stateStorage, lane));
+    }
+    resources.memoryGovernor().setPressure(MemoryPressure::Normal);
+    require(resources.backend().memoryStats().allocatedBytes == allocated &&
+                resources.memoryGovernor().snapshot().deniedReservations == denials,
+            "four-bank exchange changed Metal allocation or reservation count");
+  };
+  swapAll(true);
+  for (uint32_t i = 0; i < 4; ++i) {
+    const auto actual = decode(i);
+    require(actual.outputTokens == expected[i].outputTokens && actual.draftedTokens == expected[i].draftedTokens &&
+                actual.acceptedDraftTokens == expected[i].acceptedDraftTokens, "four-bank original lost continuation parity");
+  }
+  swapAll(false);
+  for (uint32_t i = 4; i < 8; ++i) {
+    const auto actual = decode(i);
+    require(actual.outputTokens == expected[i].outputTokens && actual.draftedTokens == expected[i].draftedTokens &&
+                actual.acceptedDraftTokens == expected[i].acceptedDraftTokens, "four-bank borrower lost continuation parity");
+  }
+  for (uint32_t lane = 0; lane < 4; ++lane) {
+    if (lane % 2) {
+      runtime.end(id(lane + 4));
+      const auto restored = runtime.restoreParkedRequest(id(lane));
+      require(restored.granted() && *restored.lane == lane, "four-bank cancellation stole another physical floor");
+      runtime.end(id(lane));
+    } else {
+      runtime.end(id(lane)); runtime.end(id(lane + 4));
+    }
+    for (uint32_t peer = lane + 1; peer < 4; ++peer)
+      require(!context.blockCache || context.blockCache->holdsLane(peer), "pair cancellation released another bank's floor");
+  }
+  for (uint32_t i = 0; i < 8; ++i) freePages(i);
+  for (uint32_t lane = 0; lane < 4; ++lane)
+    require(!context.stateStorage.metadata(lane).assigned() && (!context.blockCache || !context.blockCache->holdsLane(lane)),
+            "eight-owner cancellation retained running state or floors");
+  std::cout << "eight_owner_exchange=PASS banks=4 owners=8 switches=8 sampled_control_parity=1 allocation_free=1 cancellation=1\n";
+}
+
 void run(const char *metallib) {
   const test::TemporaryDirectory root("splash-ram-continuation");
   for (const bool flashNext : {false, true}) {
@@ -875,6 +973,7 @@ void run(const char *metallib) {
               "an already emitted terminal anchor was parked for another decode");
       runtime->end(505);
       exchangeCases(*resources, *runtime);
+      eightOwnerExchangeCases(*resources, *runtime);
       for (uint32_t lane = 0; lane < model::ExecutionLimits::maximumBatchWidth; ++lane)
         require(!storage.metadata(lane).assigned(), "continuation test retained an active lane");
       for (const auto *pages : {&baselinePages, &parkedPages, &intruderPages})

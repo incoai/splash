@@ -102,3 +102,42 @@ Architecture remains at the unchanged 30594/30594 Engine line budget. Scheduler
 integration requires a genuine shared-lifecycle simplification; no raised budget,
 new exception or cosmetic line removal is justified. Issue #779 remains the
 upstream lifecycle discussion, with no agreement or merge readiness implied.
+
+## Admission and return rule to qualify next
+
+Start with fixed 32-visible-token turns for equal-priority foreground pairs,
+at most one bank per physical slot. This is a candidate policy, not an enabled
+setting or a measured optimum. Select the oldest unpaid return before lending
+the slot again; new arrivals cannot displace an outstanding owner. A bank must
+be admitted without reclaiming an in-service stream. Failure keeps existing
+scheduling intact.
+
+The first loan includes the borrower's prefix restore and remaining prefill,
+which can take longer than its token turn. Do not assume the quick return
+primitive bounds that startup. Initial qualification should bound/limit the
+admissible warm-prefill work using existing scheduling measurements and test
+an explicit startup timeout. If the borrower cannot enter safe regular decode,
+resolve its unfinished prefill/restore through the shared replay lifecycle,
+drain commands/pass ownership, and return the parked stream. Verify that this
+does not repeatedly discard prefill work or starve the borrower. Long cold
+prompts need their own acceptance cases before widening eligibility.
+
+Pair members keep their own deadlines and KV references. A terminal event
+collapses the pair exactly once, retaining the survivor's physical floor only
+until its ordinary lifecycle resumes. Pressure recovery resolves a pair before
+replaying either owner; a retained floor cannot silently become unreclaimable.
+The governor's lane-demand and host-pressure accounting must include retained
+owners even while the scheduler excludes them from runnable work. Tests must
+measure time to 32 tokens and completion alongside first-token latency.
+
+## Eight-owner follow-up
+
+Normal and uniform ASan/UBSan runs also pass four simultaneous banks/eight
+request owners in all four family/format configurations. Eight distinct
+prompts match their uninterrupted sampled next-step controls after all pairs
+return and reverse. Each switch runs under critical pressure and a host
+allocation fault guard; Metal allocation and denial counts remain unchanged.
+Mixed cancellation orders preserve other banks' floors and finally release
+all owners' KV/state/floors. These are synthetic Runtime tests, not eight-user
+Engine fairness or trained eight-user throughput qualification. Receipt:
+`ram-continuation-eight-owner-20261117.json`.

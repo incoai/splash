@@ -1,0 +1,61 @@
+{
+  "created_at_utc": "2026-11-17T14:40:47.047277+00:00",
+  "source_base": "9df2ae9",
+  "scope": "four-bank/eight-owner concrete Runtime tests; not integrated Engine scheduling or workload benchmarking",
+  "normal_exit": 0,
+  "ASAN_UBSAN_exit": 0,
+  "configurations": [
+    "dense/fp32",
+    "dense/bf16",
+    "Flash-Next/fp32",
+    "Flash-Next/bf16"
+  ],
+  "banks_per_configuration": 4,
+  "owners_per_configuration": 8,
+  "exchanges_per_configuration": 8,
+  "behavior": [
+    "separate uninterrupted controls for eight distinct prompts",
+    "exact state/penalties/window/rings/metadata on each return",
+    "sampled output tokens and speculative counts match every control",
+    "next-allocation host fault guard and critical memory pressure on all eight exchanges",
+    "Metal bytes and governor denial counters unchanged across exchanges",
+    "mixed parked-first and resident-first cancellation preserves other banks floors",
+    "all eight owners release KV and final floors/state"
+  ],
+  "unchanged_prior_driver_cases_passed": true,
+  "sha256": {
+    "driver_source": "97b26fbb8465c1e19bca3ffc90dfcd346923d784e1e97b3817214561f3204039",
+    "normal_binary": "34b1664d88185eb6163d30a87a37adb152fb77744f6dff8307db7abc13cc0415",
+    "ASAN_UBSAN_binary": "66194bad97311e9c671c96875c737fb3818cbae11dd2f426990495d102375a32",
+    "normal_log": "9407ddbd596f267491ce008a824b9b6fed75406ceaf5608be5c6da30164a96da",
+    "ASAN_UBSAN_log": "6c250a288f36b0244607f60b29055d630ad6a4bb2c03ac44bd01c994919a308f"
+  },
+  "post_test_production_health": {
+    "native_ready": true,
+    "health": {
+      "11500/health": 200,
+      "11500/ready": 200,
+      "11501/health": 200,
+      "11501/ready": 200,
+      "11502/health": 200,
+      "11502/ready": 200,
+      "11503/health": 200,
+      "11503/ready": 200,
+      "11504/health": 200,
+      "11504/ready": 200
+    },
+    "running": 1,
+    "queued": 0,
+    "RAM_GiB": 96,
+    "cache_GiB": 512,
+    "cache_persistent": true,
+    "worker_limit": 8,
+    "admission_enabled": false,
+    "M4_enabled": false
+  },
+  "limitations": [
+    "Synthetic fixed-row tests, not eight-user Engine fairness or latency",
+    "Trained-weight four-lane qualification is separately recorded; this four-bank extension is synthetic only",
+    "No deployment or flag activation; no new TTFT/TPS/write-savings claim"
+  ]
+}
