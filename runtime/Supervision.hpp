@@ -50,7 +50,8 @@ inline constexpr milliseconds kMaskWait{5'000};
 // reach the disk (main.mm).
 inline constexpr milliseconds kFlush{6'000};
 // What a clean stop then gives a persistent cache's KV copies no state needs
-// to go, a round of them landing at a time (RuntimeResources::
+// to go: none goes, and no punch of one starts, past it, so the stop waits
+// past it for one punch and the files' syncs at most (RuntimeResources::
 // closePersistentCache); the next start frees those left, as after a crash.
 // A copy's punch and its record's clear took 0.10-0.16 ms on an M5 Max's
 // SSD, so 2 s gives up some 12,000, past the 8,192 blocks of a 262,144-token

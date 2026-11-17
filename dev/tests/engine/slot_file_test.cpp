@@ -51,12 +51,16 @@ extern "C" ssize_t pwrite(int descriptor, const void *data, size_t bytes, off_t 
 // and exFAT refuse a punch: the slot file's fcntl is this one in the test
 // binary, which otherwise passes the call and its argument on.
 static std::atomic<bool> refusingPunches{false};
+// While set, each punch takes this long first, as on slow storage.
+static std::atomic<int> punchMilliseconds{0};
 
 extern "C" int fcntl(int descriptor, int command, ...) {
   if (command == F_PUNCHHOLE && refusingPunches.load()) {
     errno = ENOTTY;
     return -1;
   }
+  if (command == F_PUNCHHOLE)
+    std::this_thread::sleep_for(std::chrono::milliseconds(punchMilliseconds.load()));
   va_list arguments;
   va_start(arguments, command);
   void *const argument = va_arg(arguments, void *);
@@ -66,6 +70,7 @@ extern "C" int fcntl(int descriptor, int command, ...) {
   return next(descriptor, command, argument);
 }
 
+using splash::AwakeClock;
 using splash::kHostPageBytes;
 using splash::model::DiskBudget;
 using splash::model::SlotFile;
@@ -629,6 +634,58 @@ static void testSlotsCountTheirPayloads() {
   require(file.synchronize({})->wait() && budget->usedBytes() == 0 && budget->fileBytes() == 0 &&
               dataBytes(directory.slots()) == 0,
           "released slots kept quota or blocks");
+  file.seal();
+}
+
+// A clean stop seals the KV file with an end to its punches (RuntimeResources::closePersistentCache,
+// supervision::kDrain): on storage that takes 10 ms a punch, the punches of 200 freed slots take 2 s,
+// and the sync after them waits past an end 0.1 s away for one punch and itself; the slots whose punch
+// had not started keep their records, which the next process frees. Punches that start by the end
+// land.
+static void testSealedPunchesStopAtTheirEnd() {
+  using namespace std::chrono_literals;
+  constexpr size_t size = kHostPageBytes;
+  constexpr uint32_t count = 200;
+  Directory directory;
+  const std::vector<std::byte> payload = patterned(size, 4);
+  // A file of `slots` labelled slots, freed and sealed with punches until `end` from then, each
+  // punch taking `punch`: how long the sync after them took.
+  const auto close = [&](uint32_t slots, std::chrono::milliseconds punch, AwakeClock::duration end) {
+    auto budget = std::make_shared<DiskBudget>(count * size);
+    SlotFile file(size, budget, directory.persistence());
+    file.finishAdoption();
+    std::vector<std::shared_ptr<SlotFile::Slot>> held;
+    for (uint32_t index = 0; index < slots; ++index) {
+      held.push_back(file.acquire(size));
+      require(file.write(held.back(), {payload}, {})->wait(), "a slot write failed");
+      file.label(held.back(), labelOf(index));
+    }
+    require(file.synchronize({})->wait(), "the slots did not reach the drive");
+    punchMilliseconds = static_cast<int>(punch.count());
+    const AwakeClock::time_point start = AwakeClock::now();
+    held.clear();
+    file.seal(start + end);
+    require(file.synchronize({})->wait(), "the sync after the punches failed");
+    punchMilliseconds = 0;
+    return AwakeClock::now() - start;
+  };
+  const auto took = close(count, 10ms, 100ms);
+  require(took < 1s, "the sync after a sealed file's punches waited " +
+                         std::to_string(std::chrono::duration<double>(took).count()) + " s, past their end");
+  {
+    auto budget = std::make_shared<DiskBudget>(count * size);
+    SlotFile file(size, budget, directory.persistence());
+    require(!file.records().empty(), "the slots whose punch had not started by the end lost their records");
+    file.finishAdoption();
+    require(file.synchronize({})->wait() && budget->usedBytes() == 0 && dataBytes(directory.slots()) == 0,
+            "the next process did not free the slots the punches left");
+    file.seal();
+  }
+  static_cast<void>(close(20, 10ms, 60s));
+  auto budget = std::make_shared<DiskBudget>(count * size);
+  SlotFile file(size, budget, directory.persistence());
+  require(file.records().empty(), "a punch that started before the end did not land");
+  file.finishAdoption();
   file.seal();
 }
 
@@ -1430,6 +1487,7 @@ int main() {
     testAdoptionCountsPastTheQuota();
     testSlotsCountTheirPayloads();
     testTheFileEndsWithItsLastSlot();
+    testSealedPunchesStopAtTheirEnd();
     testVolumeWithoutHolesCountsWholeSlots();
     testAFailedPunchLeavesItsBlocksCounted();
     testAFailedPunchOfAHoleLeavesItsBlocksCounted();

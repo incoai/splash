@@ -2878,8 +2878,9 @@ each of its copies at what its slot takes, those still to write by what their
 pages hold (`Cache::pointFits`). A clean stop writes a persistent tier's
 waiting points, the newest first, then gives up the KV copies no state needs
 (`Cache::closePersistentTier`), which the next start would leave behind, for
-up to 2 s (`supervision::kDrain`, a round of 1,024 landing at a time; the next
-start frees those left): the blocks a Spill request wrote through past its
+up to 2 s (`supervision::kDrain`: none goes and no punch starts past it, which
+`SlotFile::seal` holds the file's worker to; the next start frees those
+left): the blocks a Spill request wrote through past its
 point, and what is left of the chain of a point the full quota gave up, whose
 copies go only as later writes need room. A temporary tier's copies go with
 the process.

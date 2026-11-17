@@ -80,10 +80,6 @@ constexpr uint32_t kPersistentCacheFormat = 2;
 // then (supervision::kStop).
 constexpr std::chrono::seconds kCacheLockWait{20};
 static_assert(kCacheLockWait > supervision::kStop);
-// The KV copies no state needs a clean stop gives up between two checks of
-// its time for them (supervision::kDrain), which they land first: 1,024
-// punches take 0.10-0.16 s on an M5 Max's SSD, a synchronize 10 ms more.
-constexpr uint32_t kDrainRound = 1024;
 // A cache nobody opened or wrote for this long is removed at the next start,
 // whether or not that start keeps a cache itself.
 constexpr std::chrono::hours kStaleCache{24 * 14};
@@ -1391,13 +1387,11 @@ bool RuntimeResources::closePersistentCache() {
   if (!persistentCache_.directory)
     return true;
   stopProbation();
-  // Each file runs its operations in order, and a freed slot's punch, which
-  // clears its record, before any later one: what came before lands first.
+  // Each file runs its operations in order, a freed slot's punch, which clears
+  // its record, first; no copy goes, and no punch starts, past kDrain.
   const auto drainEnd = AwakeClock::now() + supervision::kDrain;
-  cache_->closePersistentTier([&, given = 0U]() mutable {
-    return ++given % kDrainRound != 0 ||
-           (persistentCache_.kv->synchronize({})->wait() && AwakeClock::now() < drainEnd);
-  });
+  cache_->closePersistentTier(drainEnd);
+  persistentCache_.kv->seal(drainEnd);
   const auto kv = persistentCache_.kv->synchronize({});
   const auto states = persistentCache_.states->synchronize({});
   const bool kvSynchronized = kv->wait();

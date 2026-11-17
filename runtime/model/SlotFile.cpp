@@ -58,8 +58,10 @@ struct SlotFile::Backing {
   // A persistent file between opening and finishAdoption(): the worker
   // waits, and the slots are adoption's alone.
   bool adopting = false;
-  // The process is ending: freed slots keep their blocks and records.
+  // The process is ending: freed slots keep their blocks and records, and
+  // those still to punch at punchesEnd too (seal).
   bool sealed = false;
+  AwakeClock::time_point punchesEnd = AwakeClock::time_point::max();
   // Until a punch fails: the volume returns the blocks of a punched range,
   // so a slot keeps only its payload's host pages (quotaBytesFor).
   std::atomic<bool> volumeReturnsBlocks{true};
@@ -849,9 +851,10 @@ std::shared_ptr<SlotFile::Operation> SlotFile::synchronize(std::function<void()>
       std::move(completion));
 }
 
-void SlotFile::seal() noexcept {
+void SlotFile::seal(AwakeClock::time_point punchesEnd) noexcept {
   std::lock_guard lock(backing_->mutex);
   backing_->sealed = true;
+  backing_->punchesEnd = std::min(backing_->punchesEnd, punchesEnd);
 }
 
 std::shared_ptr<SlotFile::Operation> SlotFile::submit(Run run, std::function<void()> completion,
@@ -884,6 +887,10 @@ void SlotFile::run() {
                (!backing.punches.empty() && !backing.adopting);
       });
       if (!backing.stopping && !backing.adopting && !backing.punches.empty()) {
+        if (AwakeClock::now() >= backing.punchesEnd) {
+          backing.punches.clear();
+          continue;
+        }
         const uint32_t index = backing.punches.back();
         backing.punches.pop_back();
         lock.unlock();

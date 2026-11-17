@@ -527,8 +527,11 @@ public:
   // Flushes the slots and records written so far to the drive.
   [[nodiscard]] std::shared_ptr<Operation> synchronize(std::function<void()> completion);
   // The process is ending: a slot dropped from now on keeps its blocks and
-  // its record for the next one.
-  void seal() noexcept;
+  // its record for the next one, which frees them (finishAdoption), and so
+  // does one whose punch has not started by `punchesEnd`, the earliest any
+  // seal gave: the worker starts no punch past it, so that an operation
+  // after the punches waits past it for one punch at most.
+  void seal(AwakeClock::time_point punchesEnd = AwakeClock::time_point::max()) noexcept;
   // The spans total at most one slot, a write's no more host pages than its
   // slot was acquired for and exactly the segments in a file of several, and
   // stay valid until the operation is ready. A write stores them in order
