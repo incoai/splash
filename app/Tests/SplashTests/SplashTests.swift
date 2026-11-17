@@ -76,14 +76,15 @@ struct ServeSettingsTests {
     @Test func passesTheOptionsSetInTheTablesOrder() {
         let settings = ServeSettings(values: [
             "--port": "8100", "--max-context": "131072", "--max-memory": "48G", "--idle-release": "off",
-            "--language-only": "true", "--kv-format": "bf16", "--max-cache-disk": "16G", "--persistent-cache": "true",
+            "--language-only": "true", "--kv-format": "bf16", "--cached-states": "exact", "--max-cache-disk": "16G",
+            "--persistent-cache": "true",
             "--host": "0.0.0.0", "--allowed-origin": "a.example, b.example", "--no-webui": "true",
             "--thinking-end-text": "Now the answer. </think>", "--disable-ane": "true",
         ], apiKey: "secret")
         #expect(settings.serveArguments(model: "a/b", localName: nil)
             == ["serve", "--model", "a/b", "--port", "8100", "--offline", "--max-context", "131072",
                 "--max-memory", "48G", "--idle-release", "off", "--language-only", "--kv-format", "bf16",
-                "--max-cache-disk", "16G", "--persistent-cache", "--host", "0.0.0.0",
+                "--cached-states", "exact", "--max-cache-disk", "16G", "--persistent-cache", "--host", "0.0.0.0",
                 "--allowed-origin", "a.example", "--allowed-origin", "b.example", "--no-webui",
                 "--thinking-end-text", "Now the answer. </think>", "--disable-ane"])
         // The key reaches the server in its environment, never its command line.
@@ -162,7 +163,7 @@ struct ServeSettingsTests {
 
     /// Flint's options, as the runtime reports its family: no vision, recurrent state, PLE table,
     /// sparse KV, Neural Engine or thinking switch.
-    static let flint = ModelFamily(unusable: ["--language-only", "--state-format", "--ple-memory", "--sparse-kv-memory",
+    static let flint = ModelFamily(unusable: ["--language-only", "--state-format", "--cached-states", "--ple-memory", "--sparse-kv-memory",
                                               "--disable-ane", "--max-image-pixels", "--default-reasoning-effort",
                                               "--thinking-token-budget", "--thinking-end-text"],
                                    contextTokens: 262_144, maxContextTokens: 262_144)
@@ -188,7 +189,7 @@ struct ServeSettingsTests {
         // The card leaves them out, and the bands of parts left empty.
         #expect(LaunchOptions.options(.memory, for: Self.flint).map(\.flag)
             == ["--kv-format", "--expert-memory"])
-        #expect(LaunchOptions.options(.memory, for: .unknown).count == 5)
+        #expect(LaunchOptions.options(.memory, for: .unknown).count == 6)
     }
 
     /// A context length longer than the model picked serves stays kept for a model that serves it,

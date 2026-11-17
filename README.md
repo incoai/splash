@@ -119,8 +119,8 @@ window. To set your own limits or cache options, add these to `splash serve`:
 | `--max-context 100K` | Set the context limit. Up to `1M` tokens. |
 | `--language-only` | Skip vision; serve text only. |
 | `--kv-format bf16` | Use BF16 KV cache. Default: 8-bit (INT8). |
-| `--state-format bf16` | Run BF16 recurrent states, half the size. Default: FP32. Cached states store int8 codes either way. |
-| `--cached-states exact` | Keep cached recurrent states in `--state-format`'s precision, so a restore is exact; 3.25 times the memory and SSD a state in FP32. Default: `int8` codes. |
+| `--state-format bf16` | Run BF16 recurrent states, half the size. Default: FP32. |
+| `--cached-states exact` | Keep cached recurrent states in `--state-format`'s precision, so a restore is exact; an FP32 state takes 3.25 times the memory and SSD. Default: INT8 codes. |
 | `--activations bf16` | Use BF16 activations. Default: auto. |
 | `--disable-ane` | Prefill on the GPU alone. Default: the 27B also uses the Neural Engine. |
 | `--max-cache-disk 16G` | Cap the SSD cache (default: auto, up to 32 GiB; `0` turns it off). |
