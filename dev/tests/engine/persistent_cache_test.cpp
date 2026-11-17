@@ -1547,7 +1547,8 @@ void testWriteThroughCopiesAreRestorePoints() {
 
 // A Spill request writes through every block it publishes, past its restore point too, as a reply
 // completes a block past the prompt's: no state needs that copy, which stays behind after a crash,
-// and a clean stop gives it up.
+// and a clean stop gives it up, but for one whose time for such copies has run out
+// (RuntimeResources::closePersistentCache, supervision::kDrain).
 void testCleanStopGivesUpCopiesPastAPoint() {
   const std::vector<uint32_t> prompt = promptOf(1000, 4);
   const auto budget = std::make_shared<model::DiskBudget>(1600);
@@ -1570,6 +1571,8 @@ void testCleanStopGivesUpCopiesPastAPoint() {
     return next.adopt(earlier.kvLabels(), earlier.stateLabels());
   };
   require(adopted().dropped == 1, "the copy past the point did not stay behind after a crash");
+  earlier.cache.closePersistentTier([] { return false; });
+  require(adopted().dropped == 1, "a clean stop gave up a copy past the point once its time for them had run out");
   earlier.cache.closePersistentTier();
   const CacheAdoption adoption = adopted();
   require(adoption.blocks == 3 && adoption.states == 1 && adoption.dropped == 0 && earlier.kvLabels().size() == 3,

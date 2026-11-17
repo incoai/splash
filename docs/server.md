@@ -931,15 +931,15 @@ them before its pages spill.
 
 A start takes back every recorded point whose chain is whole. A clean stop
 writes the waiting points (newest first, up to 6 s, whatever the write budget),
-gives up the copies no point needs, such as those of the blocks a long request
-wrote past its point, and syncs the files, so that the next start leaves
-nothing behind. After a crash the next start takes back what reached the disk,
-each state with the class it had last: a checkpoint a request went on to reuse
-as an ordinary state comes back as one; the copies no point needs stay behind,
-and that start frees them. Every start serves its first minute on probation:
-after two starts in a row fail within it, or one whose engine reports its own
-failure, the next start begins empty. `/status` reports all this under `disk`
-(`persistent`, `taken_back`).
+gives up the copies no point needs (up to 2 s), such as those of the blocks a
+long request wrote past its point, and syncs the files, so that the next start
+leaves nothing behind. After a crash the next start takes back what reached
+the disk, each state with the class it had last: a checkpoint a request went on
+to reuse as an ordinary state comes back as one; the copies no point needs
+stay behind, and that start frees them. Every start serves its first minute on
+probation: after two starts in a row fail within it, or one whose engine
+reports its own failure, the next start begins empty. `/status` reports all
+this under `disk` (`persistent`, `taken_back`).
 
 ### KV on the SSD
 

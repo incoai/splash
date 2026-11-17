@@ -12,7 +12,8 @@
 // Stopping, from the outside in:
 // 1. The engine, on SIGTERM or the end of its input, stops taking work,
 //    gives the newest restore points of a persistent cache up to kFlush to
-//    reach the disk, and exits.
+//    reach the disk and the copies no state needs up to kDrain to go, and
+//    exits.
 // 2. The server stops its engine with SIGTERM, sends SIGKILL to one still
 //    running after kStop, then waits up to kStop more for it to exit.
 // 3. The server, on SIGTERM or a first SIGINT, stops as in 2; later SIGTERMs
@@ -48,6 +49,13 @@ inline constexpr milliseconds kMaskWait{5'000};
 // What a clean stop gives the newest restore points of a persistent cache to
 // reach the disk (main.mm).
 inline constexpr milliseconds kFlush{6'000};
+// What a clean stop then gives a persistent cache's KV copies no state needs
+// to go, a round of them landing at a time (RuntimeResources::
+// closePersistentCache); the next start frees those left, as after a crash.
+// A copy's punch and its record's clear took 0.10-0.16 ms on an M5 Max's
+// SSD, so 2 s gives up some 12,000, past the 8,192 blocks of a 262,144-token
+// chain; the 48 GB M5 Pro's long tests left 1, 37 and 628.
+inline constexpr milliseconds kDrain{2'000};
 // From a stop signal to the engine's exit, its flush included; the server
 // kills an engine still running after it.
 inline constexpr milliseconds kStop{15'000};
@@ -62,7 +70,7 @@ inline constexpr milliseconds kProbation{60'000};
 inline constexpr milliseconds kStartRetryWindow{30'000};
 
 static_assert(kGpuWaitLimit < kCommandTimeout);
-static_assert(kFlush < kStop);
+static_assert(kFlush + kDrain < kStop);
 static_assert(kLoopStall < kProbation);
 static_assert(kStartRetryWindow < kProbation);
 

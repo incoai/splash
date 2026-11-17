@@ -435,10 +435,11 @@ public:
   [[nodiscard]] uint64_t copyingAheadBytes() const noexcept;
   // At a clean stop: the KV copies no state needs go, as a full quota gives
   // them up first (freeDiskSpace), since the next process takes back only
-  // restore points (adopt); each state copy's label takes its state's
-  // current recency, which the next process orders them by.
-  void closePersistentTier() {
-    while (kv_.unneededCopy())
+  // restore points (adopt), each while `more` says so; each state copy's
+  // label takes its state's current recency, which the next process orders
+  // them by.
+  void closePersistentTier(const std::function<bool()> &more = [] { return true; }) {
+    while (kv_.unneededCopy() && more())
       static_cast<void>(freeDiskSpace(false, false));
     states_.relabel();
   }
