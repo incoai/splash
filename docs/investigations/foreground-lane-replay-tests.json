@@ -1,0 +1,40 @@
+{
+  "created_at": "2026-11-16T12:33:27.394405+00:00",
+  "base_commit": "9753a803a8d7acc4caf6e164292ca279ea69d830",
+  "scope": "fake-model native lane capacity and suspension replay characterization",
+  "targeted": {
+    "passed": 3,
+    "failed": 0,
+    "command": "build/engine-tests/engine --filter ForegroundLaneCapacity,StreamingSuspensionReplay,CancelledStreamingContinuation"
+  },
+  "engine_suite": {
+    "passed": 458,
+    "failed": 0,
+    "command": "build/engine-tests/engine"
+  },
+  "test_source_sha256": "327496e590d30e35243cf266499bf0ce41418cedd5b56d7d22b9c8af65770b8c",
+  "binary_sha256": "8fc7c0fdbaaef46052c359623685c1649a8a2a876b57e66870e0c1b73b132f85",
+  "runtime_source_changed": false,
+  "deployed": false,
+  "model_benchmarks": false,
+  "production_read_only_verification": {
+    "splash_health_http": 200,
+    "queue_health_http": 200,
+    "queue_ready_http": 200,
+    "native_ready": true,
+    "persistent_cache": true,
+    "RAM_GiB": 96,
+    "cache_GiB": 512,
+    "context_tokens": 262144,
+    "admission_enabled": false,
+    "M4_enabled": false,
+    "workers": 8,
+    "queue_running": 0,
+    "queue_waiting": 0
+  },
+  "limitations": [
+    "Fake model uses constant token 42; no numerical Flash-Next parity or coding quality claim",
+    "No measured production TTFT or throughput improvement",
+    "No equal-priority preemption or RAM checkpoint API implemented"
+  ]
+}

@@ -44,6 +44,8 @@
 #include <cstring>
 #include <filesystem>
 #include <functional>
+#include <fstream>
+#include <charconv>
 #include <iostream>
 #include <iterator>
 #include <limits>
@@ -51,6 +53,7 @@
 #include <numeric>
 #include <optional>
 #include <random>
+#include <set>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -5210,9 +5213,10 @@ public:
            (shape_.requiredSlots(2) + extentSlots - 1) / extentSlots * cache_.extentBytes();
   }
 
-  void begin(SpillRequest &request) {
+  void begin(SpillRequest &request, SamplingParameters sampling = {}) {
     EngineRequest engineRequest = makeRequest(request.id, request.prompt, 4096);
     engineRequest.flags = RequestIgnoreEndOfSequence;
+    engineRequest.sampling = sampling;
     beginCold(*runtime_, engineRequest, request.stateLane);
   }
 
@@ -5523,6 +5527,120 @@ private:
   uint64_t blocks_ = 0;
   uint64_t unspilledPages_ = 0;
 };
+
+// Token IDs prepared by the serving tokenizer, not text interpreted by this
+// executable. Validate the whole input before loading model weights.
+std::vector<uint32_t> continuationPrompt(const std::filesystem::path &path, uint32_t vocabulary,
+                                        uint32_t context) {
+  std::ifstream input(path);
+  require(input.good(), "cannot open continuation prompt token file");
+  std::vector<uint32_t> tokens;
+  for (std::string word; input >> word;) {
+    uint32_t token = 0;
+    const auto [end, error] = std::from_chars(word.data(), word.data() + word.size(), token);
+    require(error == std::errc{} && end == word.data() + word.size() && token < vocabulary,
+            "continuation prompt contains an invalid vocabulary token");
+    require(tokens.size() + 512 < context, "continuation prompt leaves no bounded decode runway");
+    tokens.push_back(token);
+  }
+  require(input.eof() && !tokens.empty(), "continuation prompt is empty or unreadable");
+  return tokens;
+}
+
+// A real-weight check of exact RAM parking, separate from Engine scheduling.
+// Both controls execute single-lane commands of the same forced row budget;
+// no activation or end-to-end TTFT benefit follows from these micro timings.
+void requireRamContinuation(metal::MetalBackend &backend, const model::LoadedModel &model,
+                            const ops::ExecutionPlans &operators, const metal::AllocationAdmission &admission,
+                            const MemoryGovernor &governor, kv::Format format, ops::GdnStateFormat stateFormat,
+                            const std::vector<uint32_t> &prompt) {
+  require(model.descriptor.capabilities.sparseKv.has_value(), "continuation-only currently requires block-sparse KV");
+  const uint32_t lanePages = (static_cast<uint32_t>(prompt.size()) + 512) / kv::kPageTokens + 2;
+  SpillOptions options;
+  SpillRuntime fixture(backend, model, operators, admission, format, stateFormat, options, lanePages);
+  auto &runtime = fixture.runtime();
+  require(fixture.peakBytes(static_cast<uint32_t>(prompt.size()), 512) <= governor.snapshot().headroomBytes,
+          "continuation fixture exceeds remaining governor headroom");
+  uint64_t nextId = 9000;
+  for (const float temperature : {0.0F, 0.7F}) for (const uint32_t rows : {8u, 16u}) {
+    const SamplingParameters sampling{.temperature = temperature, .seed = 47};
+    SpillRequest baseline{.id = ++nextId, .stateLane = 0, .prompt = prompt};
+    SpillRequest candidate{.id = ++nextId, .stateLane = 1, .prompt = prompt};
+    fixture.begin(baseline, sampling);
+    fixture.begin(candidate, sampling);
+    const auto prefill = [&](SpillRequest &request) {
+      while (request.committed < request.prompt.size())
+        static_cast<void>(fixture.prefill(request, std::min<uint32_t>(request.prompt.size(),
+                    request.committed + runtime.commandLimits().commandRows)));
+    };
+    prefill(baseline); prefill(candidate);
+    require(model::RuntimeInstrumentation::pendingToken(runtime, baseline.id) ==
+                model::RuntimeInstrumentation::pendingToken(runtime, candidate.id),
+            "continuation controls selected different initial anchors");
+    model::RuntimeInstrumentation::forceStepRows(runtime, rows);
+    uint64_t outputTokens = 0;
+    const auto compare = [&] {
+      const auto a = fixture.decode(std::array{&baseline}).front();
+      const auto counts = fixture.lastResults().front();
+      const auto b = fixture.decode(std::array{&candidate}).front();
+      const auto other = fixture.lastResults().front();
+      require(a == b && counts.draftedTokens == other.draftedTokens &&
+                  counts.acceptedDraftTokens == other.acceptedDraftTokens &&
+                  counts.outputTokensWithoutKv == other.outputTokensWithoutKv,
+              "RAM continuation changed real-weight tokens, logits or speculative counts");
+      outputTokens += a.outputTokens.size();
+    };
+    for (uint32_t step = 0; step < 3; ++step) compare();
+    std::set<uint32_t> parities;
+    double parkMicroseconds = 0, restoreMicroseconds = 0;
+    uint64_t scratchPeak = 0;
+    for (uint32_t rotation = 0; rotation < 2; ++rotation) {
+      const uint32_t oldLane = candidate.stateLane;
+      const auto metadata = fixture.states().metadata(oldLane);
+      parities.insert(metadata.activeParity);
+      const auto saved = committedState(runtime, fixture.states(), oldLane);
+      const auto savedNext = bytesOf(fixture.states().next(oldLane).stateBase);
+      const auto savedWindow = bytesOf(fixture.states().window(oldLane));
+      const auto anchor = model::RuntimeInstrumentation::pendingToken(runtime, candidate.id);
+      const auto before = runtime.actualRuntimeMemory().stateActualAllocatedBytes;
+      auto start = AwakeClock::now();
+      require(runtime.parkDecodedRequest(candidate.id).granted(), "real-weight continuation park refused");
+      parkMicroseconds += std::chrono::duration<double, std::micro>(AwakeClock::now() - start).count();
+      scratchPeak = std::max(scratchPeak, runtime.actualRuntimeMemory().stateActualAllocatedBytes - before);
+      SpillRequest intruder{.id = ++nextId, .stateLane = oldLane,
+                            .prompt = std::vector(prompt.begin(), prompt.begin() + std::min<size_t>(128, prompt.size()))};
+      fixture.begin(intruder, sampling); prefill(intruder);
+      // Prefill flips parity per command, so the intruder's shorter prompt
+      // need not finish in the victim's prefill parity. Always overwrite at
+      // least one tape, then another only to reach the saved parity.
+      static_cast<void>(fixture.decode(std::array{&intruder}));
+      if (fixture.states().metadata(oldLane).activeParity != metadata.activeParity)
+        static_cast<void>(fixture.decode(std::array{&intruder}));
+      require(fixture.states().metadata(oldLane).activeParity == metadata.activeParity,
+              "continuation intruder did not overwrite the vacated tape parity");
+      start = AwakeClock::now();
+      const auto restored = runtime.restoreParkedRequest(candidate.id);
+      restoreMicroseconds += std::chrono::duration<double, std::micro>(AwakeClock::now() - start).count();
+      require(restored.granted() && *restored.lane != oldLane,
+              "real-weight continuation did not rebind into a different lane");
+      candidate.stateLane = *restored.lane;
+      requireSameCommittedState(saved, committedState(runtime, fixture.states(), candidate.stateLane),
+                                "real-weight RAM park/restore");
+      require(savedNext == bytesOf(fixture.states().next(candidate.stateLane).stateBase) &&
+                  savedWindow == bytesOf(fixture.states().window(candidate.stateLane)) &&
+                  anchor == model::RuntimeInstrumentation::pendingToken(runtime, candidate.id),
+              "RAM restore changed the other parity, window or pending anchor");
+      fixture.end(intruder);
+      for (uint32_t step = 0; step < (rotation ? 4u : 3u); ++step) compare();
+    }
+    require(parities.size() == 2, "real-weight continuation did not exercise both tape parities");
+    fixture.end(baseline); fixture.end(candidate);
+    std::cout << "ram_continuation_real=PASS temperature=" << temperature << " rows=" << rows
+              << " rotations=2 output_tokens=" << outputTokens << " scratch_peak_bytes=" << scratchPeak
+              << " mean_park_us=" << parkMicroseconds / 2 << " mean_restore_us=" << restoreMicroseconds / 2
+              << " micro_timings_only=1\n" << std::flush;
+  }
+}
 
 // What a spill run's requests gave, each command's step per request, in
 // the order the run issued them, and the command buffers each command took
@@ -5956,6 +6074,9 @@ void warmupEos(model::RuntimeContext context, model::LoadedModel &model) {
 int main(int argc, char **argv) {
   try {
     bool imagesOnly = false, warmupEosOnly = false, prefillGroupsOnly = false, spillOnly = false;
+    bool continuationOnly = false;
+    std::filesystem::path continuationFile;
+    uint64_t maximumMemoryBytes = 0;
     SpillOptions spill;
     kv::Format format = kv::Format::Int8;
     ops::GdnStateFormat stateFormat = ops::GdnStateFormat::Float32;
@@ -5983,13 +6104,19 @@ int main(int argc, char **argv) {
     model::ModelLoadOptions loadOptions;
     if (argc < 3)
       fail("usage: model-runtime-oracle METALLIB MODEL_ROOT [--kv-format int8|bf16] [--state-format fp32|bf16] "
-           "[--cached-states int8|exact] "
+           "[--cached-states int8|exact] [--max-memory SIZE] "
            "[--ane-ffn-share SHARE] [--ane-ffn-fault EVALUATION] [--ple-memory SIZE] "
            "[--expert-memory SIZE] [--max-context TOKENS] [--spill-tokens N] [--spill-window PAGES] "
-           "[--spill-buffers 1|2] [--images-only | --warmup-eos-only | --prefill-groups-only | --spill-only]");
+           "[--spill-buffers 1|2] [--continuation-prompt TOKEN_FILE] [--continuation-only | --images-only | --warmup-eos-only | --prefill-groups-only | --spill-only]");
     for (int i = 3; i < argc; ++i) {
       const std::string_view option(argv[i]);
-      if (option == "--images-only") imagesOnly = true;
+      if (option == "--continuation-only") continuationOnly = true;
+      else if (option == "--continuation-prompt" && i + 1 < argc) continuationFile = argv[++i];
+      else if (option == "--max-memory" && i + 1 < argc) {
+        maximumMemoryBytes = tools::parseBytes(argv[++i]);
+        if (!maximumMemoryBytes) fail("--max-memory takes a positive size such as 96G");
+      }
+      else if (option == "--images-only") imagesOnly = true;
       else if (option == "--warmup-eos-only") warmupEosOnly = true;
       else if (option == "--prefill-groups-only") prefillGroupsOnly = true;
       else if (option == "--spill-only") spillOnly = true;
@@ -6039,6 +6166,11 @@ int main(int argc, char **argv) {
         maxContext = static_cast<uint32_t>(parsed);
       } else fail("unknown model-runtime-oracle option");
     }
+    if (continuationOnly && (imagesOnly || warmupEosOnly || prefillGroupsOnly || spillOnly))
+      fail("continuation-only cannot be combined with another oracle scope");
+    if (!continuationFile.empty() && !continuationOnly)
+      fail("continuation-prompt requires continuation-only");
+    if (continuationOnly && continuationFile.empty()) fail("continuation-only requires continuation-prompt");
     metal::MetalBackend backend(argv[1]);
     const auto &device = backend.capabilities();
     if (const auto error = device.validationError())
@@ -6048,6 +6180,9 @@ int main(int argc, char **argv) {
     const std::filesystem::path modelRoot(argv[2]);
     const auto descriptor = model::servedFor(model::inspectModelRoot(modelRoot), maxContext);
     targetTokens = &oracleTokens(descriptor);
+    const auto ramPrompt = continuationOnly
+        ? continuationPrompt(continuationFile, descriptor.capabilities.vocabularySize, descriptor.capabilities.maximumContextTokens)
+        : std::vector<uint32_t>{};
     // Production's weight byte count with a different bound. Production checks
     // it only against the Metal hard budget, then guards host headroom at every
     // Metal operation while loading. This oracle has no such guard, so the
@@ -6059,6 +6194,8 @@ int main(int argc, char **argv) {
     // that has just exited a moment later, so a run that starts as a server
     // stops can find it still held.
     const uint64_t weightBytes = tools::weightBytes(modelRoot, descriptor, loadOptions);
+    require(!maximumMemoryBytes || weightBytes <= maximumMemoryBytes,
+            "the model weights exceed --max-memory before runtime allocation");
     const auto memoryDeadline = AwakeClock::now() + supervision::kStartRetryWindow;
     bool reportedMemoryWait = false;
     while (true) {
@@ -6097,7 +6234,7 @@ int main(int argc, char **argv) {
       ModelMemoryProfile profile{
           model.name(), model.maximumContextTokens(),
           model.targetKvLayout(format), footprint, stateFormat};
-      return evaluateEngineMemoryPlan(backend.capabilities(), profile, 0);
+      return evaluateEngineMemoryPlan(backend.capabilities(), profile, maximumMemoryBytes);
     };
 
     // The plan's governor, as a start builds it before it sets up the split,
@@ -6116,6 +6253,12 @@ int main(int argc, char **argv) {
     const ClaimId oracleClaim = governor.ledger().open({.cls = ClaimClass::Floor});
     const MemoryGovernor::Scope oracleScope(governor, oracleClaim);
     const metal::AllocationAdmission governed = governedFor(governor, "an allocation");
+    if (continuationOnly) {
+      requireRamContinuation(backend, model, operators, governed, governor, format, stateFormat, ramPrompt);
+      std::cout << "PASS model-runtime-oracle scope=continuation-only model=" << model.name()
+                << " governor_limit_bytes=" << governor.snapshot().limitBytes << "\n";
+      return 0;
+    }
     // A block-sparse target's spill check runs before the split is set up, on
     // a pool and a runtime of its own that the context the oracle asks the
     // split to leave does not count.

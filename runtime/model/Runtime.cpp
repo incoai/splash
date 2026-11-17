@@ -1,6 +1,6 @@
 #include "model/Runtime.hpp"
-#ifdef SPLASH_RUNTIME_INSTRUMENTATION
 #include "metal/abi/GDN.h"
+#ifdef SPLASH_RUNTIME_INSTRUMENTATION
 #include "model/RuntimeInstrumentation.hpp"
 #endif
 #include "AwakeClock.hpp"
@@ -350,6 +350,7 @@ struct Runtime::Impl {
     uint64_t id = 0;
     uint32_t stateLane = 0;
     bool resident = false;
+    std::unique_ptr<QwenStateStorage::ParkedLane> parked;
     bool promptComplete = false;
     // Rebuild state from already-emitted tokens without sampling an initial
     // anchor, consuming RNG, or replaying output to the caller.
@@ -946,6 +947,47 @@ struct Runtime::Impl {
     embeddingCacheBytes -= bytes;
     ++counters.imageEmbeddingEvictions;
     return bytes;
+  }
+
+  auto pendingGdnFields() const {
+    const ops::GdnShape shape = geometry.target.gdnShape();
+    const uint32_t kvWidth = (shape.keyHeads + shape.valueHeads) * shape.headDimension;
+    return std::array<std::pair<uint64_t, uint64_t>, 4>{{
+        {0, uint64_t{shape.convolutionDimension} * 2},
+        {gdn_tape_kv_offset(shape.convolutionDimension), uint64_t{kvWidth} * 2},
+        {gdn_tape_decay_offset(shape.convolutionDimension, kvWidth), uint64_t{shape.valueHeads} * 4},
+        {gdn_tape_beta_offset(shape.convolutionDimension, kvWidth, shape.valueHeads),
+         uint64_t{shape.valueHeads} * 2},
+    }};
+  }
+  uint64_t pendingGdnBytes(const QwenLaneMetadata &metadata) const {
+    uint64_t rowBytes = 0;
+    for (const auto &[offset, bytes] : pendingGdnFields()) {
+      static_cast<void>(offset);
+      rowBytes = checkedAdd(rowBytes, bytes, "pending GDN row");
+    }
+    return checkedMultiply(checkedMultiply(rowBytes, std::popcount(metadata.pendingPath), "pending GDN rows"),
+                           geometry.target.stateLayout.layers, "pending GDN layers");
+  }
+  // Only the rows the next step reads, not an entire speculative tape slot.
+  // No GPU command is in flight while the host saves or restores these rows.
+  void copyPendingGdn(uint32_t lane, const QwenLaneMetadata &metadata,
+                      uint8_t *packed, bool restoring) const {
+    if (!metadata.pendingPath || !geometry.target.stateLayout.layers) return;
+    const ops::GdnShape shape = geometry.target.gdnShape();
+    auto *slot = contents<uint8_t>(decodeArena->batchSlice(DecodeTensor::GdnTape, kLaneCount), "GDN tape") +
+        decodeArena->gdnTapeSlot(lane, metadata.activeParity);
+    for (uint32_t layer = 0; layer < geometry.target.stateLayout.layers; ++layer) {
+      auto *tape = slot + layer * ops::gdnTapeLayerBytes(shape);
+      for (const auto &[offset, rowBytes] : pendingGdnFields()) {
+        for (uint32_t path = metadata.pendingPath; path; path &= path - 1) {
+          auto *row = tape + offset + std::countr_zero(path) * rowBytes;
+          if (restoring) std::memcpy(row, packed, rowBytes);
+          else std::memcpy(packed, row, rowBytes);
+          packed += rowBytes;
+        }
+      }
+    }
   }
 
   // A resident request returns its lane's buffers to the pool, and its
@@ -3409,9 +3451,69 @@ void Runtime::suspend(uint64_t requestId) {
   impl_->releaseLeftStaging();
 }
 
+ModelMemoryAdmission Runtime::parkDecodedRequest(uint64_t requestId) {
+  Impl::Request &entry = impl_->request(requestId);
+  if (!entry.resident || entry.parked)
+    throw std::logic_error("Qwen request is not resident for parking");
+  if (impl_->backend.commandInFlight() || !entry.promptComplete || entry.verifyMaskRows || entry.resultInvalid ||
+      entry.decodeStage != DecodeStage::Regular || !entry.pendingToken)
+    return {};
+  if (uint64_t{entry.generatedTokens} + 1 >= entry.maxNewTokens ||
+      isStopToken(impl_->geometry, *entry.pendingToken))
+    return {};
+  const uint32_t lane = entry.stateLane;
+  const auto metadata = impl_->states.metadata(lane);
+  const uint64_t tapeBytes = impl_->pendingGdnBytes(metadata);
+  const MetalBuffer penalties = impl_->decodeArena->get(lane, DecodeTensor::PenaltyState);
+  const uint64_t scratchBytes = checkedAdd(tapeBytes, penalties.sizeBytes(), "parked decode scratch");
+  metal::AllocationFailure refusal;
+  auto held = impl_->states.parkLane(lane, requestId, scratchBytes,
+      [&](const MetalBuffer &scratch) {
+        auto *destination = static_cast<uint8_t *>(scratch.contents());
+        impl_->copyPendingGdn(lane, metadata, destination, false);
+        if (penalties.sizeBytes())
+          std::memcpy(destination + tapeBytes, penalties.contents(), penalties.sizeBytes());
+      }, refusal);
+  if (!held)
+    return {.allocationFailure = refusal};
+  entry.parked = std::move(held);
+  entry.resident = false;
+  impl_->pageTableBindings[lane] = {};
+  if (impl_->blockCache)
+    impl_->blockCache->releaseLane(lane);
+  return {.ok = true};
+}
+
+StateAdmission Runtime::restoreParkedRequest(uint64_t requestId) {
+  Impl::Request &entry = impl_->request(requestId);
+  if (entry.resident || !entry.parked)
+    throw std::logic_error("Qwen request is not parked");
+  if (impl_->backend.commandInFlight())
+    return {{}, StateFailure::ConcurrencyLimit};
+  return admitIdleLane(impl_->states, [&](uint32_t lane) -> StateAdmission {
+    if (impl_->blockCache) {
+      const ModelMemoryAdmission hot = impl_->blockCache->reserveLane(lane);
+      if (!hot.granted())
+        return {{}, StateFailure::MemoryPressure, hot.allocationFailure};
+    }
+    const auto metadata = entry.parked->metadata();
+    const uint64_t tapeBytes = impl_->pendingGdnBytes(metadata);
+    auto *source = static_cast<uint8_t *>(entry.parked->scratch().contents());
+    impl_->copyPendingGdn(lane, metadata, source, true);
+    const MetalBuffer penalties = impl_->decodeArena->get(lane, DecodeTensor::PenaltyState);
+    if (penalties.sizeBytes())
+      std::memcpy(penalties.contents(), source + tapeBytes, penalties.sizeBytes());
+    impl_->states.restoreParkedLane(lane, requestId, entry.parked);
+    entry.stateLane = lane;
+    entry.resident = true;
+    impl_->pageTableBindings[lane] = {};
+    return {lane, StateFailure::None};
+  });
+}
+
 StateAdmission Runtime::resume(const ModelRequest &request) {
   Impl::Request &entry = impl_->request(request.id);
-  if (entry.resident) {
+  if (entry.resident || entry.parked) {
     throw std::logic_error("Qwen request is not suspended");
   }
   if (request.prompt.size() < entry.promptTokens) {
@@ -4698,6 +4800,21 @@ RuntimeInstrumentation::LaneTables RuntimeInstrumentation::laneTables(const Runt
                  : std::span<const SplashKvPage>();
   };
   return {entries(tables.pages), entries(tables.index)};
+}
+
+void RuntimeInstrumentation::fillPendingTape(Runtime &runtime, uint64_t requestId, uint32_t seed) {
+  Runtime::Impl &impl = *runtime.impl_;
+  const auto &entry = impl.requests.at(requestId);
+  if (!entry.resident || impl.backend.commandInFlight())
+    throw std::logic_error("pending tape canaries require a drained resident lane");
+  const auto &metadata = impl.states.metadata(entry.stateLane);
+  auto *slot = contents<uint8_t>(impl.decodeArena->batchSlice(DecodeTensor::GdnTape, kLaneCount), "GDN tape") +
+      impl.decodeArena->gdnTapeSlot(entry.stateLane, metadata.activeParity);
+  uint32_t value = seed | 1;
+  for (uint64_t at = 0; at < gdnTapeSlotBytes(impl.geometry); ++at) {
+    value ^= value << 13; value ^= value >> 17; value ^= value << 5;
+    slot[at] = static_cast<uint8_t>(value);
+  }
 }
 
 std::vector<uint8_t> RuntimeInstrumentation::pendingGdnRows(const Runtime &runtime, uint64_t requestId) {

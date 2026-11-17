@@ -112,6 +112,10 @@ public:
     std::span<const SplashKvPage> index;
   };
   [[nodiscard]] static LaneTables laneTables(const Runtime &runtime, uint64_t requestId);
+  // Fill a resident lane's active tape with deterministic byte canaries.
+  // Only a drained roundtrip test may use it, ending the request before any
+  // further numerical decode: the canaries are not valid recurrent inputs.
+  static void fillPendingTape(Runtime &runtime, uint64_t requestId, uint32_t seed);
   // The rows resident request `requestId`'s latest decode step accepted,
   // which its GDN cell holds only once its next step folds them in
   // (QwenLaneMetadata::pendingPath): every GDN layer's tape rows

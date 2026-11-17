@@ -1,0 +1,140 @@
+{
+  "created_at_utc": "2026-11-17T12:27:55.813381+00:00",
+  "parent_commit": "0284a7effa8276a996be82606ec6a4dbe2f472aa",
+  "scope": "synthetic spilled-KV decoder continuation correctness; no serving activation",
+  "sha256": {
+    "driver": "d2944603263174e1d12cc3abfa21349414d10639b162986a25623f8ace71594b",
+    "synthetic_model_helper": "3215db1517b5a7af3e5d2890bbaaddb970f394ca9ae9103d5bb62b97ffc1cf0c",
+    "normal_binary": "3392561e72d1a4fd7855e0bcb36234d1dcefbeb6d42e43f38e00026724ce5d31",
+    "sanitizer_binary": "d3084f01341ae073459b697af3976441080cc2dbd121b67a26afb0d6a55061f2",
+    "normal_log": "344535b1464dcd40bee1a517bcc767fc0e453252d90a4e25712d2c711286727c",
+    "sanitizer_log": "6a1f8b5cd8ce9158bd2b73b01f3c8879501044a42a915c270016ffa02b4c7268"
+  },
+  "spilled_cases": {
+    "family": "flash-next",
+    "state_formats": [
+      "fp32",
+      "bf16"
+    ],
+    "sequence_per_format": [
+      "successful cold-copy read",
+      "injected failed cold-copy read",
+      "fresh successful request after ending failed request"
+    ],
+    "cases": 6,
+    "normal_passed": 6,
+    "ASAN_UBSAN_passed": 6,
+    "prompt_tokens": 2208,
+    "dense_prefix_pages_retained": 64,
+    "serialized_Index_pages": 4,
+    "trailing_full_page_retained": true,
+    "decode_before_park": true,
+    "pending_GDN_rows_present": true,
+    "old_Full_page_KV_poisoned_after_move": true,
+    "copy_reads_in_case_order": [
+      16,
+      32,
+      16,
+      16,
+      32,
+      16
+    ],
+    "exact_state_after_rebind": true,
+    "hot_floor_released_on_park_and_reacquired_after_restore": true,
+    "reclaim_above_existing_floors": true,
+    "non_tied_target_logits_required": true,
+    "positive_tokens_speculative_counts_and_logits_exact": true,
+    "failure_blocks_owned_by_request": true,
+    "failed_reads_return_no_tokens": true,
+    "failed_request_ended_without_in_place_retry": true
+  },
+  "synthetic_target": {
+    "bounded_nonzero_attention_embedding_output_and_indexer": true,
+    "unit_norms": true,
+    "deterministic_seed": 1700,
+    "GDN_FFN_PLE_projection_weights_zero": true,
+    "default_fixtures_unchanged": true
+  },
+  "existing_controls_rerun": {
+    "partial_acceptance_cases": 24,
+    "thinking_cases": 16,
+    "combined_grammar_thinking_cases": 32,
+    "sampled_two_parity_rotation": true,
+    "full_draft_acceptance": 7,
+    "terminal_anchor_refusal": true,
+    "cancellation": true,
+    "KV_table_rebinding": true
+  },
+  "sanitizer_scope": {
+    "uniform_native_library": true,
+    "library_substrate_base": "9753a803a8d7acc4caf6e164292ca279ea69d830",
+    "matched_substrate_headers": true,
+    "Runtime_cpp_byte_identical_to_upstream_candidate": true,
+    "parked_storage_implementation_byte_identical": true,
+    "container_checks_enabled": true,
+    "leak_detection": false
+  },
+  "architecture": {
+    "passed": true,
+    "engine_lines": 30105,
+    "budget": 30105
+  },
+  "previous_head_CI": {
+    "run": 44012563798,
+    "native_sanitizers": "passed",
+    "python_versions_passed": [
+      "3.12",
+      "3.13",
+      "3.14"
+    ],
+    "primary_job": "failed before compilation during Apple Metal catalog download; exit 70",
+    "rerun": "denied by GitHub: requires repository admin; next commit triggers new CI"
+  },
+  "rejected_fixture_controls": [
+    "zero target weights made no spilled-copy reads; no pass claimed",
+    "generic quantization fixture extreme scales produced non-finite prefill; replaced with bounded attention weights"
+  ],
+  "limitations": [
+    "TestKvCopy uses memory through actual spilled-KV reader; no physical SSD fault or latency qualification",
+    "Synthetic fixed-verification weights, including zero GDN/FFN/PLE branches; no trained-model quality claim",
+    "Engine scheduling/fairness, real-model verification variation and persistent-cache recovery remain unqualified",
+    "No TTFT, throughput or SSD-write savings claimed"
+  ],
+  "production_model_weights_loaded": false,
+  "runtime_code_changed": false,
+  "deployed": false,
+  "performance_benchmark": false,
+  "production_verification": {
+    "M4_enabled": false,
+    "RAM_GiB": 96,
+    "Samsung_external_volume_UUID_verified": true,
+    "admission_enabled": false,
+    "cache_GiB": 512,
+    "capacity": 128,
+    "context_tokens": 262144,
+    "deployed": false,
+    "fusion_unchanged": true,
+    "health": {
+      "11500/health": 200,
+      "11500/ready": 200,
+      "11501/health": 200,
+      "11501/ready": 200,
+      "11502/health": 200,
+      "11502/ready": 200,
+      "11503/health": 200,
+      "11503/ready": 200,
+      "11504/health": 200,
+      "11504/ready": 200
+    },
+    "model": "ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF:Q2_0",
+    "model_benchmarks": false,
+    "native_identity_unchanged": true,
+    "native_instance_unchanged": true,
+    "native_ready": true,
+    "native_restarts": 0,
+    "persistent_Samsung_files_open": true,
+    "queue_running": 1,
+    "queue_waiting": 0,
+    "worker_limit": 8
+  }
+}

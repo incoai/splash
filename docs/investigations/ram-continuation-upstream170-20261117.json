@@ -1,0 +1,162 @@
+{
+  "created_at_utc": "2026-11-17T13:02:24.274919+00:00",
+  "previous_feature_commit": "87c2c173a0715ec4b3df08444803d7290b61f434",
+  "upstream_base": "61f6d51643a2cf8b3ed868dcb4bcda176ae578ec",
+  "scope": "1.7.0 tree-contract reconciliation, synthetic correctness and scheduler qualification specification; no activation",
+  "sha256": {
+    "runtime/model/Runtime.cpp": "2933c94923d20140649b6b1f7e311bb3c4245eacbf1070c4039e9083f68f8c23",
+    "runtime/model/QwenState.cpp": "eb18f8e42586a4191561861584be77f59a6c0153c6d11a0041a4bd0762a6a39d",
+    "runtime/model/RuntimeInstrumentation.hpp": "8a34d0d0b305746abaf7cbfed31d571b29c4772858de700ffa286958c75eebed",
+    "dev/tests/engine/ram_continuation_test.mm": "ec1d45842bd8429e4ccee172c3378a8bfd5eb3ea7742402ec410bf2580eabeb7",
+    "dev/tests/engine/qwen_state_storage_test.mm": "54813d0beb91f1e3d9a93709a9235e0c0e3e51f6a3029755fa5436e95b2128b5",
+    "dev/tests/engine/engine_requests_test.cpp": "e3b669740e735b549be57a84201697b22ed7e7dabf7edcb52fb737ee0d92ac12",
+    "normal_binary": "bad342108dc61c5192b750f33dcca25f2a0c8282d5c7a331d6165287905717f9",
+    "ASAN_UBSAN_binary": "1bd5e3b2eec8f9e0b24a8660213015bf2e8a7be14a992173bcf4ee2626eef0a6",
+    "metallib": "66c214f15852ae12377f5ae1fe6b975b7d857d7cd68418972d3e403d404c94db",
+    "host_step_metallib": "9f94af73a1a7ab440d381268281989cb80698b3921ebec95772e2b889fc54ffb",
+    "fault_control_binary": "f413207ae4fa64976c62b4017dba5ad24c10fba6831f1c4a43baff6eae1390a7",
+    "fault_control_source": "5a2643de50c58c5f95143082caa801c022150132496fb364a2efcc3ffa43e06a",
+    "fault_control_driver": "ec1d45842bd8429e4ccee172c3378a8bfd5eb3ea7742402ec410bf2580eabeb7",
+    "normal.log": "d25ac4e324c02e6222dc1789bf7abf494e01ac899582cd591273519b1b02366d",
+    "storage.log": "eba33950a18d129aa9461ed723ebb020665c0775d56e5b39794d4c201f87be14",
+    "asan.log": "44ce0f27c10accc2a0b915c50d23192da7941609e1a4bc6f156a954ca5534e6e",
+    "storage-asan.log": "eba33950a18d129aa9461ed723ebb020665c0775d56e5b39794d4c201f87be14",
+    "fault.log": "e7a737a8bdc5d2f39dd27694b44979bd8cb80bbd00e14123dea7cfd874991cc5"
+  },
+  "engine_tests": {
+    "passed": 480,
+    "failed": 0,
+    "current_eight_request_no_equal_priority_rotation_characterization": true
+  },
+  "replay_characterization": {
+    "reply_thresholds": [
+      1,
+      41,
+      129
+    ],
+    "without_decode_captures_replay_rows": [
+      8,
+      52,
+      140
+    ],
+    "with_decode_captures_replay_rows": [
+      8,
+      20,
+      12
+    ],
+    "fake_model_work_counts_not_timings": true,
+    "concrete_Runtime_dense_captures_enabled": true,
+    "concrete_Runtime_FlashNext_auxiliary_state_captures_disabled": true,
+    "FlashNext_speedup_claimed": false
+  },
+  "normal_and_ASAN_UBSAN": {
+    "family_format_configurations": 4,
+    "families": [
+      "dense",
+      "flash-next"
+    ],
+    "state_formats": [
+      "fp32",
+      "bf16"
+    ],
+    "full_accepted_proposals_per_configuration": 15,
+    "full_retained_rows": 16,
+    "partial_cases": 24,
+    "observed_nonconsecutive_partial_paths_per_configuration": 1,
+    "thinking_cases": 16,
+    "combined_grammar_thinking_cases": 32,
+    "sparse_byte_canary_cases": 4,
+    "byte_canary_path_rows": [
+      0,
+      3,
+      15
+    ],
+    "canaries_never_numerically_decoded": true,
+    "storage_cases_passed": true,
+    "spilled_read_cases": 6,
+    "spilled_copy_reads_in_case_order": [
+      16,
+      32,
+      16,
+      16,
+      32,
+      16
+    ],
+    "grammar_masks_follow_tree_depth": true,
+    "grammar_park_safe_points_force_one_row_before_restoring_normal_tree_choice": true,
+    "thinking_completion_bounded_by_token_goal_not_fixed_cycles": true
+  },
+  "fault_control": {
+    "storage_ASAN_UBSAN_exit": 0,
+    "driver_ASAN_UBSAN_exit": 0,
+    "fault_control_exit": 1,
+    "incorrect_consecutive_prefix_copy_detected": true,
+    "fault": "copy consecutive prefix of popcount rows rather than selected physical rows",
+    "expected_failure": "park/rebind changed recurrent state, tape, draft context or metadata",
+    "scope": "temporary clone, not committed or deployed"
+  },
+  "sanitizer_scope": {
+    "entire_native_library_rebuilt_on_current_upstream_base": true,
+    "matching_current_headers": true,
+    "address_and_undefined": true,
+    "container_checks_enabled": true,
+    "leak_detection": false
+  },
+  "architecture": {
+    "passed": true,
+    "engine_lines": 30594,
+    "budget": 30594,
+    "Engine_production_code_changed_from_upstream": false,
+    "budget_raised_by_this_patch": false
+  },
+  "artifacts": {
+    "new_matching_1_7_metallib_built": true,
+    "local_Apple_Metal_toolchain": "27B47",
+    "normal_run_missing_optional_host_keepawake_shader": true,
+    "sanitizer_run_includes_matching_host_step_shader": true,
+    "no_latency_claim_from_either_run": true
+  },
+  "limitations": [
+    "Synthetic weights and controlled verification; no trained-model correctness or TTFT/TPS claim",
+    "Nonzero attention spill target retains zero GDN/FFN/PLE projections",
+    "Byte canaries test ownership only; requests end before further numerical decode",
+    "Spilled failure injection uses in-memory copies, not physical Samsung faults",
+    "No Engine scheduling integration; Model-interface and shared ownership design still open",
+    "Latest packaged GitHub release at verification was 1.6.1; 1.7.0 source is on main"
+  ],
+  "deployed": false,
+  "model_benchmarks": false,
+  "production_verification": {
+    "M4_enabled": false,
+    "RAM_GiB": 96,
+    "Samsung_external_volume_UUID_verified": true,
+    "admission_enabled": false,
+    "cache_GiB": 512,
+    "capacity": 128,
+    "context_tokens": 262144,
+    "deployed": false,
+    "fusion_unchanged": true,
+    "health": {
+      "11500/health": 200,
+      "11500/ready": 200,
+      "11501/health": 200,
+      "11501/ready": 200,
+      "11502/health": 200,
+      "11502/ready": 200,
+      "11503/health": 200,
+      "11503/ready": 200,
+      "11504/health": 200,
+      "11504/ready": 200
+    },
+    "model": "ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF:Q2_0",
+    "model_benchmarks": false,
+    "native_identity_unchanged": true,
+    "native_instance_unchanged": true,
+    "native_ready": true,
+    "native_restarts": 0,
+    "persistent_Samsung_files_open": true,
+    "queue_running": 4,
+    "queue_waiting": 0,
+    "worker_limit": 8
+  }
+}
