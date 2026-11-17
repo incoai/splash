@@ -68,8 +68,9 @@ struct SlotFile::Backing {
   // takes of the quota (Slot::bytes), from its write's first chunk until a
   // punch returns the range, and the most of them when a punch failed
   // between two, which leaves the earlier one's blocks under what the later
-  // one stores. The budget's file bytes count it, and the file ends with the
-  // last slot's (released).
+  // one stores; the whole slot where the hole before a write past the
+  // file's end stayed (stored). The budget's file bytes count it, and the
+  // file ends with the last slot's (released).
   std::vector<uint64_t> backed;
   // Worker-only: where what the file's slots hold ends, which is where the
   // file ends (stored, released).
@@ -115,10 +116,14 @@ struct SlotFile::Backing {
   bool returnBlocks(uint64_t offset, uint64_t bytes) noexcept;
   // On the worker, after a write stored `bytes` at `offset`: a write past
   // where the file's writes ended returns the hole before it, which the
-  // volume allocates with the write.
+  // volume allocates with the write. A hole whose punch failed stays, and
+  // each slot's range it lies in counts whole, as a slot's own does. The
+  // write counted its slot's range (back) before its first chunk, so none
+  // of these grows `backed`.
   void stored(uint64_t offset, uint64_t bytes) noexcept {
-    if (offset > end)
-      static_cast<void>(returnBlocks(end, offset - end));
+    if (offset > end && !returnBlocks(end, offset - end))
+      for (uint64_t index = end / slotBytes; index < offset / slotBytes; ++index)
+        back(static_cast<uint32_t>(index), slotBytes);
     end = std::max(end, offset + bytes);
   }
   // On the worker, after a punch returned the blocks of slot `index`: when

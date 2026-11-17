@@ -787,6 +787,30 @@ static void testAFailedPunchLeavesItsBlocksCounted() {
   file.seal();
 }
 
+// A write past the file's end whose hole's punch fails leaves the hole's blocks in the file, which
+// counts each slot's range the hole lies in whole until a punch of that slot returns it.
+static void testAFailedPunchOfAHoleLeavesItsBlocksCounted() {
+  constexpr size_t page = kHostPageBytes, size = 4 * page;
+  const std::vector<std::byte> whole = patterned(size, 1), small = patterned(page, 2);
+  auto budget = std::make_shared<DiskBudget>(4 * size);
+  SlotFile file(size, budget);
+  // A page in the lowest slot; the next one's range is the hole before a whole payload above it.
+  auto lowest = file.acquire(page), middle = file.acquire(page), upper = file.acquire(size);
+  require(file.write(lowest, {small}, {})->wait(), "a slot write failed");
+  refusingPunches = true;
+  const bool landed = file.write(upper, {whole}, {})->wait();
+  refusingPunches = false;
+  require(landed && budget->fileBytes() == 3 * size,
+          "the hole a failed punch left before a write past the file's end was not counted");
+  // A page written in the middle slot adds nothing; its punch returns the hole's blocks with it.
+  require(file.write(middle, {small}, {})->wait() && budget->fileBytes() == 3 * size,
+          "a payload over a hole a failed punch left counted again");
+  middle.reset();
+  std::vector<std::byte> output(page);
+  require(file.read(lowest, {output}, {})->wait() && output == small && budget->fileBytes() == 2 * size,
+          "a punch of a slot a hole a failed punch left lay in did not return it");
+}
+
 // A file whose earlier process kept every slot whole on the volume, as one that returned no hole
 // around a shorter payload left it: its records and payloads are what this process writes, so the
 // next one takes them back as they are, counts each by its payload's pages, and returns the rest.
@@ -1413,6 +1437,7 @@ int main() {
     testTheFileEndsWithItsLastSlot();
     testVolumeWithoutHolesCountsWholeSlots();
     testAFailedPunchLeavesItsBlocksCounted();
+    testAFailedPunchOfAHoleLeavesItsBlocksCounted();
     testAdoptionReturnsTheHolesAnEarlierProcessKept();
     testTheLimitBoundsLiveSlots();
     testWritesDrawOnTheWriteBudget();

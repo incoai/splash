@@ -238,7 +238,8 @@ public:
   // Bytes the budget's files hold on disk: for each slot's range, what the
   // slot written there since its blocks last went back counts
   // (SlotFile::quotaBytesFor), the most of them where a punch failed between
-  // two.
+  // two, and the whole range where it lies in a hole a write past the
+  // file's end left whose punch failed.
   [[nodiscard]] uint64_t fileBytes() const noexcept {
     return file_.load(std::memory_order_relaxed);
   }

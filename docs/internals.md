@@ -3005,7 +3005,9 @@ a punch that fails later counts the slots acquired after it whole too, and the
 runtime reports it once. The slot whose punch failed keeps its blocks, which
 `disk.file_bytes` goes on counting: what is written there next counts with
 them, the larger of the two, until a punch returns the range
-(`SlotFile::Backing::back`). A quota of 16 Full slots then holds 16 Slim pages
+(`SlotFile::Backing::back`). A hole before a write past the file's end whose
+punch failed counts so too, each slot's range it lies in whole
+(`SlotFile::Backing::stored`). A quota of 16 Full slots then holds 16 Slim pages
 on 24.4 MiB of blocks, where on APFS it holds 56 on 25.4 MiB. The files keep
 the blocks of freed slots there, each up to its high-water mark, and the
 limit's rule counts them as the tier's.
