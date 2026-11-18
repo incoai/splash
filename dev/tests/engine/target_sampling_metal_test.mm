@@ -148,11 +148,12 @@ struct Batch final {
   }
 };
 
-Batch makeBatch(MetalBackend &backend, uint32_t vocabulary, uint32_t lanes, uint32_t blockRows = kRows) {
+Batch makeBatch(MetalBackend &backend, uint32_t vocabulary, uint32_t lanes, uint32_t blockRows = kRows,
+                uint32_t candidates = kDraftCandidates) {
   const uint32_t rows = lanes * blockRows;
   const auto space = Sampling::workspace(rows);
   const auto proposals =
-      DraftSelector::workspace(lanes * (blockRows - 1), SPLASH_DRAFT_CANDIDATES);
+      DraftSelector::workspace(lanes * (blockRows - 1), candidates);
   return {SamplingBuffers{
               allocate(backend, uint64_t{rows} * vocabulary * sizeof(float)),
               allocate(backend, space.partialMassesBytes),
@@ -427,6 +428,38 @@ void requireInitialDraw(const Batch &batch, uint32_t lane,
   requireDraw(batch.outputTokens()[lane], target.probabilities,
               batch.uniforms()[lane * kUniforms + SPLASH_UNIFORM_INITIAL],
               target.ambiguousMass, label);
+}
+
+// Initial selection reads one row of each family's block. Give every row a
+// disjoint distribution so a compacted lane stride cannot select another's.
+void initialBlockLanes(MetalBackend &backend) {
+  constexpr uint32_t vocabulary = 1003;
+  constexpr std::array<float, kLanes> uniforms{0.1F, 0.75F, 0.98F, 0.45F};
+  for (const uint32_t blockRows : {8U, 16U}) {
+    const uint32_t candidates = blockRows == 16 ? 32 : kDraftCandidates;
+    Sampling sampling(vocabulary, candidates, blockRows);
+    for (uint32_t lanes = 1; lanes <= kLanes; ++lanes) {
+      const Batch batch = makeBatch(backend, vocabulary, lanes, blockRows, candidates);
+      std::fill_n(batch.logits(), uint64_t{batch.rows} * vocabulary, -std::numeric_limits<float>::infinity());
+      std::vector<SamplingPolicy> policies(lanes, {.topK = 3, .temperature = 1.0F, .topP = 1.0F});
+      for (uint32_t row = 0; row < batch.rows; ++row)
+        for (uint32_t choice = 0; choice < 3; ++choice)
+          batch.row(row)[3 + 3 * row + choice] = 2.0F - choice;
+      for (uint32_t lane = 0; lane < lanes; ++lane)
+        batch.uniforms()[lane * kUniforms + SPLASH_UNIFORM_INITIAL] = uniforms[lane];
+      for (const uint32_t offset : {0U, 3U, blockRows - 1}) {
+        batch.poison();
+        CommandGraph graph;
+        sampling.addInitial(graph, policies, batch.buffers, offset, kStopTokens, {});
+        static_cast<void>(backend.submitCommandAsync(graph.dispatches()).wait());
+        for (uint32_t lane = 0; lane < lanes; ++lane)
+          requireInitialDraw(batch, lane,
+              referenceDistribution(batch.row(lane * blockRows + offset), vocabulary, policies[lane]),
+              "initial block " + std::to_string(blockRows) + " B" + std::to_string(lanes) +
+                  " lane " + std::to_string(lane));
+      }
+    }
+  }
 }
 
 std::span<uint32_t> tableRow(const MetalBuffer &table, uint32_t vocabulary,
@@ -2679,6 +2712,8 @@ int main(int argc, char **argv) {
     stage = "policies that keep one token";
     onlyTheMostLikelyIsGreedy();
     MetalBackend backend(argv[1]);
+    stage = "initial block lanes";
+    initialBlockLanes(backend);
     stage = "invalid penalties";
     invalidPenalties(backend);
     stage = "buffer extents";

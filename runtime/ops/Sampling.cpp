@@ -208,7 +208,7 @@ void Sampling::addInitial(metal::CommandGraph &graph,
     throw std::invalid_argument("invalid initial sampling row");
   const TargetSamplingParams params =
       selection(policies, buffers,
-                {1, rowOffset, 0, SPLASH_UNIFORM_INITIAL, 0, SPLASH_TARGET_VERIFY_ROWS}, stopTokens);
+                {1, rowOffset, 0, SPLASH_UNIFORM_INITIAL, 0, verifyRows_}, stopTokens);
   addPenalties(graph, policies, buffers, penalties, rowOffset, false);
   addSelection(graph, params, policies, buffers);
 }
