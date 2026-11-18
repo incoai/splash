@@ -286,7 +286,7 @@ void NemotronHTarget::addHeadBatch(metal::CommandGraph &graph, metal::MetalBuffe
                     scratch);
 }
 
-QwenTargetScratchBytes qwenTargetScratchBytes(const NemotronHWeights &, const QwenTargetGeometry &geometry, uint32_t,
+QwenTargetScratchBytes qwenTargetScratchBytes(const NemotronHLayout &, const QwenTargetGeometry &geometry, uint32_t,
                                               uint64_t) {
   return NemotronHTarget::scratchBytes(geometry);
 }

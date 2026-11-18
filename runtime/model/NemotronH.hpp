@@ -261,7 +261,7 @@ struct SparseRowStoreOptions;
 [[nodiscard]] SparseRowStoreOptions streamedTableRows(const NemotronHLayout &layout);
 // The decode scratch its blocks need beyond the runtime's arena
 // (NemotronHTarget) and its prefill scratch.
-[[nodiscard]] QwenTargetScratchBytes qwenTargetScratchBytes(const NemotronHWeights &weights,
+[[nodiscard]] QwenTargetScratchBytes qwenTargetScratchBytes(const NemotronHLayout &layout,
                                                             const QwenTargetGeometry &geometry,
                                                             uint32_t prefillChunks, uint64_t tableRowBytes);
 
