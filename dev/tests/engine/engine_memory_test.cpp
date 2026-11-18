@@ -294,9 +294,10 @@ void testCancellationInFlightAtBoundaryPublishesNoState() {
   require(engine.commandInFlight() && executor.requests.size() == 1,
           "in-flight cancellation released resources owned by the command");
   runUntilIdle(engine);
-  // The command captured the replay state; it goes back to the pool.
+  // The command captured the tail checkpoint at 3840 and the replay state;
+  // they go back to the pool.
   const auto snapshot = engine.snapshot();
-  require(executor.captures.size() == 1 && *executor.evictedStateBytes == 64 &&
+  require(executor.captures.size() == 2 && *executor.evictedStateBytes == 128 &&
               snapshot.resources.stateCache.entries == 0 &&
               snapshot.resources.stateCache.publications == 0 &&
               snapshot.replayStatePublications == 0 &&
@@ -521,18 +522,21 @@ void testBoundaryStatesAreCapturedInsideCommands() {
   runUntilIdle(engine);
   require(capturedStates(executor, 1) == std::vector<std::pair<uint32_t, uint64_t>>{{1056, 1057}},
           "a prompt's one command did not capture its replay point");
-  // Its commands end at 3104, 5152, 7200 and 8001.
+  // Its commands end at 3104, 5152, 7200 and 8001; its tail checkpoint at
+  // 7744 keeps the one at 4096 beside it.
   engine.submit(request(2, prompt));
   runUntilIdle(engine);
   require(events.starts.back() == 1056 && executor.prefillChunks.at(2) == 4 &&
               capturedStates(executor, 2) ==
-                  std::vector<std::pair<uint32_t, uint64_t>>{{4096, 5152}, {8000, 8001}},
+                  std::vector<std::pair<uint32_t, uint64_t>>{{4096, 5152}, {7744, 8001}, {8000, 8001}},
           "a checkpoint or a replay point inside a command was not captured there");
   auto counters = engine.snapshot();
-  require(counters.checkpointPublications == 1 && counters.replayStatePublications == 2 &&
-              counters.stateCaptures == 3 && counters.captureCuts == 0 &&
+  require(counters.checkpointPublications == 2 && counters.replayStatePublications == 2 &&
+              counters.stateCaptures == 4 && counters.captureCuts == 0 &&
               resources.lookup(std::vector<uint32_t>(prompt.begin(), prompt.begin() + 4097), {})
                       .resumeBoundary() == 4096 &&
+              resources.lookup(std::vector<uint32_t>(prompt.begin(), prompt.begin() + 7745), {})
+                      .resumeBoundary() == 7744 &&
               resources.lookup(prompt, {}).resumeBoundary() == 8000,
           "the captured states were not published");
 
@@ -546,7 +550,7 @@ void testBoundaryStatesAreCapturedInsideCommands() {
           "a junction and a replay point in one command were not both captured");
   counters = engine.snapshot();
   require(counters.junctionMaterializations == 1 && counters.replayStatePublications == 4 &&
-              counters.stateCaptures == 6 && counters.captureCuts == 0,
+              counters.stateCaptures == 7 && counters.captureCuts == 0,
           "the branch's states were not published");
   engine.submit(request(5, branchingConversation(30'000)));
   runUntilIdle(engine);
@@ -638,13 +642,14 @@ void testPassedCheckpointLeavesTheJunctionItsOwnClass() {
     }
     return !memoryFull;
   };
-  // Another conversation leaves the prompt at 3584 for a replay point of its
-  // own at 3680, so the request plans a junction there, past its checkpoint
-  // at 3072: both lie in its command [2048, 4096).
+  // Another conversation leaves the prompt at 3584 for a tail checkpoint
+  // and a replay point of its own at 3728 and 3984, so the request plans a
+  // junction there, past its checkpoint at 3072: both lie in its command
+  // [2048, 4096).
   std::vector<uint32_t> prompt(6001);
   std::iota(prompt.begin(), prompt.end(), 1);
   std::vector<uint32_t> other(prompt.begin(), prompt.begin() + 3584);
-  other.resize(3685, 0);
+  other.resize(3985, 0);
   engine.submit(request(1, other));
   runUntilIdle(engine);
   engine.submit(request(3, std::vector<uint32_t>(200, 7)));
@@ -664,7 +669,7 @@ void testPassedCheckpointLeavesTheJunctionItsOwnClass() {
   const auto counters = engine.snapshot();
   require(capturedStates(executor, 2) == std::vector<std::pair<uint32_t, uint64_t>>{{3584, 4096}} &&
               counters.captureCuts == 0 && counters.junctionMaterializations == 1 &&
-              counters.recycledStatePublications == 1 && counters.checkpointPublications == 0 &&
+              counters.recycledStatePublications == 1 && counters.checkpointPublications == 1 &&
               executor.diskSnapshots == 0,
           "a passed checkpoint's refusal ended the command, or it was written to the SSD");
   host.pause(false);
@@ -742,8 +747,9 @@ void testNonFiniteCommandDropsItsCaptures() {
           "a non-finite command published its state or kept its buffers");
 }
 
-// Two lanes computing the same prompt both capture its replay state; the
-// later one finds it cached and drops its own, whose buffers go back.
+// Two lanes computing the same prompt both capture its tail checkpoint and
+// replay state; the later one finds them cached and drops its own, whose
+// buffers go back.
 void testDuplicateCaptureIsDropped() {
   test::TestKvStorage storage(512, 4096, 4);
   KvPool pool(storage, 0);
@@ -763,11 +769,11 @@ void testDuplicateCaptureIsDropped() {
   engine.submit(std::move(duplicate));
   runUntilIdle(engine);
   const auto counters = engine.snapshot();
-  require(executor.prefillRows == 2 * prompt.size() && executor.captures.size() == 2 &&
-              counters.stateCaptures == 2 && counters.replayStatePublications == 1 &&
-              counters.deduplicatedStatePublications == 1 &&
-              counters.resources.stateCache.entries == 1 &&
-              *executor.evictedStateBytes == 64,
+  require(executor.prefillRows == 2 * prompt.size() && executor.captures.size() == 4 &&
+              counters.stateCaptures == 4 && counters.replayStatePublications == 1 &&
+              counters.checkpointPublications == 1 && counters.deduplicatedStatePublications == 2 &&
+              counters.resources.stateCache.entries == 2 &&
+              *executor.evictedStateBytes == 128,
           "a duplicate capture was published or kept its buffers");
 }
 
@@ -6119,7 +6125,9 @@ void testCaptureKvPastTheMarginCutsNoCommand() {
     uint64_t cuts;
   };
   std::string failures;
-  // 18,000 tokens end at a replay point whose own buffers the margin refuses while the lane holds a checkpoint.
+  // Both plan a tail checkpoint that the margin refuses beside the lane's checkpoint, which the ledger may not take
+  // mid-command, and with no SSD to take it the tail is dropped without a cut. 18,000 tokens end at a replay point
+  // whose own buffers the margin refuses while the lane holds a checkpoint: one cut.
   for (const Case &expected : {Case{12'000, 0}, Case{18'000, 1}}) {
     test::EngineHarness harness({.pages = 4 * extentPages,
                                  .pageBytes = pageBytes,

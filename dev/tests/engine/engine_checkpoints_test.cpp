@@ -74,16 +74,17 @@ void testConcurrentProgressRetainsAtMostOnePointPerLane() {
         std::max(maximumEntries, resources.snapshot().stateCache.entries);
   }
   // 24576 lies within one prefill chunk of the replay boundary at 24992; the
-  // last checkpoint, at 20480, stays beside the replay state.
-  const uint32_t checkpoints = 5;
+  // last checkpoint, at 20480, and the tail's, at 24736, stay beside the
+  // replay state.
+  const uint32_t checkpoints = 6;
   require(idle(engine) && events.completedCount == 2 &&
               engine.snapshot().checkpointPublications >= checkpoints &&
               engine.snapshot().checkpointPublications <= 2 * checkpoints &&
               engine.snapshot().cacheHits == 1 &&
               executor.prefillRows == prompt.size() * 2 - 24992 &&
-              maximumEntries <= 2 &&
-              resources.snapshot().stateCache.entries == 2 &&
-              resources.snapshot().stateCache.checkpointEntries == 1,
+              maximumEntries <= 3 &&
+              resources.snapshot().stateCache.entries == 3 &&
+              resources.snapshot().stateCache.checkpointEntries == 2,
           "concurrent prompts accumulated progress states beyond their active lanes");
 }
 
@@ -130,12 +131,14 @@ void testRepeatedRetriesRollTheRestoredCheckpoint() {
   }
   engine.submit(request(503, prompt));
   h.runUntilIdle();
-  // Of its checkpoints only the last, at 36864, stays beside its replay state.
+  // Of its checkpoints only the last, at 36864, and the tail's, at 39744,
+  // stay beside its replay state.
   require(events.starts.back() == 3 * kPrefillCheckpointTokens &&
               executor.prefillRows == prompt.size() &&
-              resources.snapshot().stateCache.entries == 2 &&
-              resources.snapshot().stateCache.checkpointEntries == 1 &&
-              resources.lookup(std::vector<uint32_t>(36865, 31), {}).resumeBoundary() == 36864,
+              resources.snapshot().stateCache.entries == 3 &&
+              resources.snapshot().stateCache.checkpointEntries == 2 &&
+              resources.lookup(std::vector<uint32_t>(36865, 31), {}).resumeBoundary() == 36864 &&
+              resources.lookup(std::vector<uint32_t>(39745, 31), {}).resumeBoundary() == 39744,
           "successful retry recomputed or retained superseded recovery states");
 }
 
@@ -247,10 +250,10 @@ void testRetryRetiresCheckpointAtDeeperJunction() {
               resources.snapshot().stateCache.checkpointEntries == 0,
           "retry kept an earlier recovery point after publishing its junction");
   // Past the junction it checkpoints at 24576, the last before its replay
-  // boundary, which stays.
+  // boundary, which stays beside its tail checkpoint at 29744.
   h.runUntilIdle();
-  require(resources.snapshot().stateCache.entries == 4 &&
-              resources.snapshot().stateCache.checkpointEntries == 1,
+  require(resources.snapshot().stateCache.entries == 5 &&
+              resources.snapshot().stateCache.checkpointEntries == 2,
           "retry did not retain its junction, its replay state and its last checkpoint");
 }
 
@@ -267,18 +270,19 @@ void testPinnedCheckpointSkipsReplacementButNotOrdinaryState() {
           "fixture did not pin its checkpoint");
   h.runUntilIdle();
   // The checkpoints at 8192 and 12288 cannot retire the pinned one: their
-  // commands capture them in pooled buffers, which go back unpublished.
-  // 16384 lies within one prefill chunk of the replay boundary at 17984.
-  require(engine.snapshot().checkpointPublications == 1 &&
+  // commands capture them in pooled buffers, which go back unpublished. The
+  // tail's at 17728 retires none, so it is published. 16384 lies within one
+  // prefill chunk of the replay boundary at 17984.
+  require(engine.snapshot().checkpointPublications == 2 &&
               engine.snapshot().checkpointPublicationFailures == 2 &&
-              executor.reservationAttempts == 4 && executor.captures.size() == 4 &&
-              resources.snapshot().stateCache.entries == 2 &&
-              resources.snapshot().stateCache.checkpointEntries == 1 &&
+              executor.reservationAttempts == 5 && executor.captures.size() == 5 &&
+              resources.snapshot().stateCache.entries == 3 &&
+              resources.snapshot().stateCache.checkpointEntries == 2 &&
               resources.lookup(prompt, {}).resumeBoundary() == 17984,
           "pinned recovery point was overwritten or blocked ordinary publication");
   pinned = {};
   require(test::stateStep(resources).gave() &&
-              resources.snapshot().stateCache.checkpointEntries == 0 &&
+              resources.snapshot().stateCache.checkpointEntries == 1 &&
               resources.lookup(prompt, {}).resumeBoundary() == 17984,
           "released recovery pin did not rejoin the lower-priority queue");
 }
@@ -397,11 +401,12 @@ void testFailedReplacementContinuesWithoutRecoveryPoint() {
               resources.snapshot().stateCache.entries == 0 &&
               events.failedCount == 0,
           "denied replacement kept the retired checkpoint or failed inference");
-  // The checkpoints from 12288 on land; the last, at 20480, stays.
+  // The checkpoints from 12288 on land; the last, at 20480, stays beside
+  // the tail's at 24736.
   h.runUntilIdle();
   require(events.completedCount == 1 && executor.prefillRows == prompt.size() &&
-              resources.snapshot().stateCache.entries == 2 &&
-              resources.snapshot().stateCache.checkpointEntries == 1,
+              resources.snapshot().stateCache.entries == 3 &&
+              resources.snapshot().stateCache.checkpointEntries == 2,
           "inference did not recover from a skipped checkpoint publication");
 }
 
@@ -420,9 +425,10 @@ void testRollingHandleCannotRetirePromotedState() {
   h.runUntilIdle();
   const std::vector<uint32_t> prefix(
       prompt.begin(), prompt.begin() + kPrefillCheckpointTokens + 1);
-  // Beside the promoted state: the replay state and the last checkpoint.
-  require(resources.snapshot().stateCache.entries == 3 &&
-              resources.snapshot().stateCache.checkpointEntries == 1 &&
+  // Beside the promoted state: the replay state, the last checkpoint and the
+  // tail's.
+  require(resources.snapshot().stateCache.entries == 4 &&
+              resources.snapshot().stateCache.checkpointEntries == 2 &&
               resources.lookup(prefix, {}).resumeBoundary() ==
                   kPrefillCheckpointTokens,
           "old rolling handle deleted a state promoted by another request");
@@ -559,11 +565,12 @@ void testRefusedStateTakesTheCheckpointAfterItsCommand() {
       h.runUntilIdle();
       // Resuming at 64, the prompt's commands end at 2112, 4160, 6208 and
       // 8256: the checkpoint at 4096 lies in the second, and the junction at
-      // 6016, the checkpoint at 8192 or the replay point at 6976 in the next.
+      // 6016, the checkpoint at 8192 or the replay point at 6272 in the next.
+      // That replay point lies too near 4096 for a tail checkpoint before it.
       const uint32_t length =
-          kind == Kind::Junction ? 8001 : kind == Kind::Checkpoint ? 12001 : 7001;
+          kind == Kind::Junction ? 8001 : kind == Kind::Checkpoint ? 12001 : 6273;
       const uint32_t boundary =
-          kind == Kind::Junction ? 6016 : kind == Kind::Checkpoint ? 8192 : 6976;
+          kind == Kind::Junction ? 6016 : kind == Kind::Checkpoint ? 8192 : 6272;
       const uint32_t start = kind == Kind::Junction ? 4160 : 6208;
       std::vector<uint32_t> prompt(length);
       std::iota(prompt.begin(), prompt.end(), 1);
@@ -688,13 +695,14 @@ void testSecondConversationResumesFromTheLastCheckpoint() {
   Executor &executor = h.model;
   Events &events = h.events;
   engine::Engine &engine = h.engine;
-  // A 12000-token system prompt, then 201 tokens of the conversation's own:
-  // checkpoints at 4096 and 8192, the replay state at 12192.
-  std::vector<uint32_t> system(12000);
+  // A 10240-token system prompt, then 161 tokens of the conversation's own:
+  // checkpoints at 4096 and 8192, the replay state at 10400, too near 8192
+  // for a tail checkpoint before it.
+  std::vector<uint32_t> system(10240);
   std::iota(system.begin(), system.end(), 1);
   const auto conversation = [&](uint32_t first) {
     std::vector<uint32_t> prompt = system;
-    prompt.resize(system.size() + 201);
+    prompt.resize(system.size() + 161);
     std::iota(prompt.begin() + system.size(), prompt.end(), first);
     return prompt;
   };
@@ -719,7 +727,7 @@ void testSecondConversationResumesFromTheLastCheckpoint() {
   h.runUntilIdle();
   counters = engine.snapshot();
   require(events.starts.back() == 8192 && executor.restored == 8192 &&
-              executor.prefillRows - computed == 12201 - 8192 &&
+              executor.prefillRows - computed == 10401 - 8192 &&
               counters.junctionMaterializations == 1,
           "the second conversation did not resume from the kept checkpoint");
   require(counters.resources.stateCache.checkpointEntries == 0 &&
@@ -730,31 +738,31 @@ void testSecondConversationResumesFromTheLastCheckpoint() {
   const uint32_t restored = executor.restored;
   engine.submit(request(3, conversation(300'000)));
   h.runUntilIdle();
-  require(events.starts.back() == 12000 && executor.restored == restored + 12000 &&
+  require(events.starts.back() == 10240 && executor.restored == restored + 10240 &&
               events.completedCount == 3 && events.failedCount == 0,
           "the third conversation did not resume from the junction");
 }
 
 // A prompt that shares less than one checkpoint interval with a cached one
 // finds no checkpoint below where they part, and one shorter than an
-// interval plans none: such a request starts from the start and keeps no
-// checkpoint.
+// interval and a tail plans none: such a request starts from the start and
+// keeps no checkpoint.
 void testShortSharedPrefixFindsAndKeepsNoCheckpoint() {
   test::EngineHarness h({.pages = 1024, .shape = [](Executor &shape) { shape.maximumLanes = 1; }});
   Events &events = h.events;
   engine::Engine &engine = h.engine;
-  // Checkpoints at 4096 and 8192; the one at 8192 stays.
+  // Checkpoints at 4096 and 8192 and the tail's at 11936; the last two stay.
   std::vector<uint32_t> cached(12201);
   std::iota(cached.begin(), cached.end(), 1);
   engine.submit(request(1, cached));
   h.runUntilIdle();
   std::vector<uint32_t> shorter(cached.begin(), cached.begin() + 3000);
-  shorter.resize(4001, 7);
+  shorter.resize(2201, 7);
   engine.submit(request(2, shorter));
   h.runUntilIdle();
   const auto counters = engine.snapshot();
-  require(events.starts.back() == 0 && counters.checkpointPublications == 2 &&
-              counters.resources.stateCache.checkpointEntries == 1 &&
+  require(events.starts.back() == 0 && counters.checkpointPublications == 3 &&
+              counters.resources.stateCache.checkpointEntries == 2 &&
               events.completedCount == 2 && events.failedCount == 0,
           "a short prompt resumed from or kept a checkpoint");
 }
@@ -773,9 +781,10 @@ void testKeptCheckpointGoesFirstUnderPressure() {
   const std::vector<uint32_t> hot(65, 27);
   engine.submit(request(1, hot));
   h.runUntilIdle();
-  // Each keeps its checkpoint at 8192 beside its replay state at 12192.
+  // Each keeps its checkpoint at 8192 beside its replay state at 10400, too
+  // near it for a tail checkpoint.
   const auto keep = [&](uint64_t id, uint32_t token) {
-    const std::vector<uint32_t> prompt(12201, token);
+    const std::vector<uint32_t> prompt(10401, token);
     engine.submit(request(id, prompt));
     h.runUntilIdle();
     require(resources.snapshot().stateCache.checkpointEntries == 1,
@@ -787,7 +796,7 @@ void testKeptCheckpointGoesFirstUnderPressure() {
               resources.snapshot().stateCache.checkpointEvictions == 1 &&
               resources.snapshot().stateCache.entries == 2 &&
               resources.lookup(hot, {}).resumeBoundary() == 64 &&
-              resources.lookup(first, {}).resumeBoundary() == 12192,
+              resources.lookup(first, {}).resumeBoundary() == 10400,
           "reclaim took an ordinary state before the kept checkpoint");
 
   const std::vector<uint32_t> second = keep(3, 29);
@@ -805,8 +814,8 @@ void testKeptCheckpointGoesFirstUnderPressure() {
               counters.resources.stateCache.checkpointEntries == 0 &&
               counters.resources.stateCache.entries == 4 &&
               resources.lookup(hot, {}).resumeBoundary() == 64 &&
-              resources.lookup(first, {}).resumeBoundary() == 12192 &&
-              resources.lookup(second, {}).resumeBoundary() == 12192 &&
+              resources.lookup(first, {}).resumeBoundary() == 10400 &&
+              resources.lookup(second, {}).resumeBoundary() == 10400 &&
               resources.lookup(next, {}).resumeBoundary() == 64,
           "a publication without room took an ordinary state before the kept checkpoint");
 }
@@ -822,8 +831,12 @@ void testSharedCheckpointSurvivesPeerReplayPoint() {
     Events &events = h.events;
     engine::Engine &engine = h.engine;
     executor.decodeFinishes = false;
-    // Checkpoints at 4096 and 8192, the replay state at 12192.
-    std::vector<uint32_t> first(12201);
+    // Its decode captures no state (Model::capturesInDecode): the second
+    // lane's reply checkpoints would count among the first's.
+    executor.decodeStateCaptures = false;
+    // Checkpoints at 4096 and 8192, the replay state at 10400, too near 8192
+    // for a tail checkpoint.
+    std::vector<uint32_t> first(10401);
     std::iota(first.begin(), first.end(), 1);
     engine.submit(request(1, first));
     runUntilCheckpoint(h, 1);
@@ -875,7 +888,7 @@ void testSharedCheckpointSurvivesPeerReplayPoint() {
                 counters.resources.stateCache.inUse == 0 &&
                 counters.resources.stateCache.entries == 3 &&
                 counters.resources.stateCache.checkpointEntries == (refused ? 2U : 1U) &&
-                resources.probe(first, {}).cachedTokens() == 12192,
+                resources.probe(first, {}).cachedTokens() == 10400,
             "the lanes did not both finish, or left something behind");
   }
 }
@@ -899,9 +912,10 @@ void testReplayPointWithoutRoomTakesItsOwnCheckpoint() {
       }
       return !memoryFull;
     };
-    // Checkpoints at 4096 and 8192, the replay state at 12192; the other
-    // prompt checkpoints every 4096 tokens until it ends.
-    std::vector<uint32_t> prompt(12201);
+    // Checkpoints at 4096 and 8192, the replay state at 10400, too near 8192
+    // for a tail checkpoint before it; the other prompt checkpoints every
+    // 4096 tokens until it ends.
+    std::vector<uint32_t> prompt(10401);
     std::iota(prompt.begin(), prompt.end(), 1'000'000);
     std::vector<uint32_t> other(40001);
     std::iota(other.begin(), other.end(), 1);
@@ -934,7 +948,7 @@ void testReplayPointWithoutRoomTakesItsOwnCheckpoint() {
               "the lane did not reach its replay point");
     require(engine.snapshot().replayStatePublications == 1 &&
                 resources.snapshot().stateCache.checkpointEvictions == 0 &&
-                resources.probe(prompt, {}).cachedTokens() == 12192 &&
+                resources.probe(prompt, {}).cachedTokens() == 10400 &&
                 resources.probe(other, {}).cachedTokens() == 4096,
             "the replay point took the other lane's recovery point");
     require(resources.probe(branch, {}).cachedTokens() == (full ? 0U : 8192U),
@@ -989,29 +1003,30 @@ void testStatePastTheReplayPointKeepsTheCheckpoint() {
   Executor &executor = h.model;
   engine::Engine &engine = h.engine;
   executor.decodeFinishes = false;
-  // Checkpoints at 4096 and 8192, the replay point at 12192. A history of 64
-  // tokens ends at 12256: the lane resumes from 8192, and its command
-  // [10240, 12265) captures both.
+  // Checkpoints at 4096 and 8192 and the tail's at 11936, the replay point
+  // at 12192. A history of 64 tokens ends at 12256: the lane resumes from
+  // 11936, and its command [11936, 12265) captures both.
   std::vector<uint32_t> prompt(12201);
   std::iota(prompt.begin(), prompt.end(), 1);
   double now = 1;
   suspendWithoutTheReplayPoint(h, now, prompt, 64);
   tickUntil(h, now,
-            [&] { return executor.prefillChunks.at(1) == 8 && !engine.commandInFlight(); },
+            [&] { return executor.prefillChunks.at(1) == 7 && !engine.commandInFlight(); },
             "the resumed lane did not reach its history's end");
-  std::vector<uint32_t> branch(prompt.begin(), prompt.begin() + 9000);
-  branch.resize(9100, 0);
-  require(executor.restored == 8192 &&
+  std::vector<uint32_t> branch(prompt.begin(), prompt.begin() + 12000);
+  branch.resize(12100, 0);
+  require(executor.restored == 11936 &&
               capturedStates(executor, 1) == std::vector<std::pair<uint32_t, uint64_t>>{
                                                  {4096, 4096},
                                                  {8192, 8192},
+                                                 {11936, 12201},
                                                  {12192, 12201},
                                                  {12192, 12265},
                                                  {12256, 12265}} &&
-              engine.snapshot().checkpointPublications == 3,
+              engine.snapshot().checkpointPublications == 4,
           "the resumed lane did not capture its replay point and its history's end");
-  require(resources.probe(branch, {}).cachedTokens() == 8192 &&
-              resources.snapshot().stateCache.checkpointEntries == 2,
+  require(resources.probe(branch, {}).cachedTokens() == 11936 &&
+              resources.snapshot().stateCache.checkpointEntries == 3,
           "a state past the replay point retired the checkpoint the replay point keeps");
   executor.decodeFinishes = true;
   tickUntil(h, now, [&] { return idle(engine); }, "the lane did not finish");
@@ -1039,13 +1054,18 @@ void testReplayPointWithoutRoomTakesTheCheckpointItsCommandCaptures() {
     }
     return !memoryFull;
   };
-  // A checkpoint at 3072, the replay point at 6656. A history of 1600 tokens
-  // ends at 8256: the lane resumes from 3072, and its command [5120, 7168)
-  // captures its checkpoint at 6144 and the replay point.
+  // The prompt resumes from another conversation's replay point at 3072
+  // (its tail checkpoint at 2816), so it plans no checkpoint but the tail's at
+  // 6400 before its replay point at 6656. A history of 1600 tokens ends at 8256: with the tail lost too, the
+  // lane resumes from 3072, and its command [5120, 7168) captures its
+  // checkpoint at 6144 and the replay point.
   std::vector<uint32_t> prompt(6657);
   std::iota(prompt.begin(), prompt.end(), 1);
+  engine.submit(request(3, std::vector<uint32_t>(prompt.begin(), prompt.begin() + 3073)));
+  h.runUntilIdle();
   double now = 1;
   suspendWithoutTheReplayPoint(h, now, prompt, 1600);
+  dropDeepestState(h.cache, prompt);
   tickUntil(h, now, [&] { return events.usage.contains(2); },
             "the Normal request did not finish");
   // Memory fills: a state's buffers come only from a state the cache lets
@@ -1056,12 +1076,12 @@ void testReplayPointWithoutRoomTakesTheCheckpointItsCommandCaptures() {
   *executor.evictedStateBytes = 64;
   const uint64_t evictions = resources.snapshot().stateCache.evictions;
   tickUntil(h, now,
-            [&] { return executor.prefillChunks.at(1) == 6 && !engine.commandInFlight(); },
+            [&] { return executor.prefillChunks.at(1) == 4 && !engine.commandInFlight(); },
             "the resumed lane did not reach its replay point");
   const auto counters = engine.snapshot();
-  require(executor.restored == 3072 &&
+  require(executor.restored == 2 * 3072 &&
               capturedStates(executor, 1).back() == std::pair<uint32_t, uint64_t>{6656, 7168} &&
-              counters.replayStatePublications == 3 && counters.checkpointPublications == 1 &&
+              counters.replayStatePublications == 4 && counters.checkpointPublications == 2 &&
               counters.resources.stateCache.evictions == evictions &&
               resources.probe(std::vector<uint32_t>(65, 2), {}).cachedTokens() == 64 &&
               resources.probe(prompt, {}).cachedTokens() == 6656,
@@ -1070,7 +1090,7 @@ void testReplayPointWithoutRoomTakesTheCheckpointItsCommandCaptures() {
   memoryFull = false;
   executor.decodeFinishes = true;
   tickUntil(h, now, [&] { return idle(engine); }, "the lane did not finish");
-  require(events.completedCount == 2 && events.failedCount == 0, "a request failed");
+  require(events.completedCount == 3 && events.failedCount == 0, "a request failed");
 }
 
 void testShortSuffixContinuesCheckpointDraftState() {
@@ -1180,8 +1200,9 @@ void testCheckpointsSkipNearResumeAndReplayBoundaries() {
   prompt.resize(4201, 500);
   engine.submit(request(2, prompt));
   h.runUntilIdle();
+  // Only the first request's tail checkpoint, at 2720, is published.
   require(events.starts.back() == 2976 &&
-              !checkpointPlanned(2) && engine.snapshot().checkpointPublications == 0 &&
+              !checkpointPlanned(2) && engine.snapshot().checkpointPublications == 1 &&
               executor.reservations == reservations + 1,
           "a follow-up checkpointed within a chunk of its resume point or replay boundary");
 
@@ -1192,9 +1213,208 @@ void testCheckpointsSkipNearResumeAndReplayBoundaries() {
   resumed.resize(8193, 600);
   engine.submit(request(4, resumed));
   h.runUntilIdle();
+  // Only the tail checkpoints, at 3808 and 7936, are published.
   require(events.starts.back() == 4064 &&
-              !checkpointPlanned(4) && engine.snapshot().checkpointPublications == 0,
+              !checkpointPlanned(4) && engine.snapshot().checkpointPublications == 3,
           "a request checkpointed within a chunk of the state it resumed from");
+}
+
+// An agent's next turn rewrites the tail of this prompt's last message and
+// diverges just before its replay point. It restores from the checkpoint
+// kTrimmedTailTokens before that point, which the request keeps beside its
+// checkpoint at 4096 and its replay point.
+void testTrimmedTailRestoresNearItsDivergence() {
+  test::EngineHarness h({.pages = 1024, .shape = [](Executor &shape) { shape.maximumLanes = 1; }});
+  Executor &executor = h.model;
+  Events &events = h.events;
+  engine::Engine &engine = h.engine;
+  // Its replay point lands at 8992, its tail checkpoint at 8736.
+  std::vector<uint32_t> prompt(9000);
+  std::iota(prompt.begin(), prompt.end(), 1);
+  engine.submit(request(1, prompt));
+  h.runUntilIdle();
+  const auto counters = engine.snapshot();
+  require(counters.checkpointPublications == 2 &&
+              counters.resources.stateCache.checkpointRetirements == 0 &&
+              counters.resources.stateCache.checkpointEntries == 2 &&
+              counters.resources.stateCache.entries == 3,
+          "the tail checkpoint retired the request's last checkpoint");
+
+  const uint32_t computed = executor.prefillRows;
+  prompt.resize(8960);
+  prompt.resize(10'000, 7);
+  engine.submit(request(2, prompt));
+  h.runUntilIdle();
+  require(events.starts.back() == 8736 && executor.restored == 8736 &&
+              executor.prefillRows - computed == 10'000 - 8736 &&
+              events.completedCount == 2 && events.failedCount == 0,
+          "a turn that rewrote the tail did not restore near its divergence");
+}
+
+// Turn B rewrites the tail of turn A's last message and restores from A's
+// tail checkpoint, 192 tokens below where they part, too near for a junction:
+// the restored checkpoint is kept as one, so B's own checkpoints do not retire
+// it, and turn C, parting from B where B parted from A, restores from it.
+void testRestoredBranchPointIsKept() {
+  test::EngineHarness h({.pages = 2048, .shape = [](Executor &shape) { shape.maximumLanes = 1; }});
+  engine::Cache &resources = h.cache;
+  Events &events = h.events;
+  engine::Engine &engine = h.engine;
+  // A's checkpoint at 4096, its tail's at 8736, its replay point at 8992.
+  std::vector<uint32_t> a(9000);
+  std::iota(a.begin(), a.end(), 1);
+  engine.submit(request(1, a));
+  h.runUntilIdle();
+  const auto turn = [&](uint64_t id, uint32_t first, uint32_t length) {
+    std::vector<uint32_t> prompt(a.begin(), a.begin() + 8932);
+    prompt.resize(length);
+    std::iota(prompt.begin() + 8932, prompt.end(), first);
+    engine.submit(request(id, prompt));
+    h.runUntilIdle();
+  };
+  // B checkpoints at 12288 and at its tail, 14720, past the point it resumes
+  // from.
+  turn(2, 1'000'000, 15'000);
+  const std::vector<uint32_t> restored(a.begin(), a.begin() + 8737);
+  require(events.starts.back() == 8736 && engine.snapshot().checkpointPublications == 4 &&
+              !resources.checkpointState(resources.lookup(restored, {}).state->kvBlock()),
+          "the second turn did not restore from the first's tail checkpoint and keep it ordinary");
+  turn(3, 2'000'000, 10'000);
+  require(events.starts.back() == 8736 && events.completedCount == 3 && events.failedCount == 0,
+          "the third turn did not restore from the branch point the second kept");
+}
+
+// An agent conversation whose every turn rewrites the tail of the turn before
+// keeps one branch point at a time: each turn restores the previous turn's
+// tail, keeps it as its branch point, and retires the one the turn before
+// kept. At rest it holds each turn's replay point and one branch point.
+void testBranchPointsStayBoundedAlongAConversation() {
+  test::EngineHarness h({.pages = 4096, .shape = [](Executor &shape) { shape.maximumLanes = 1; }});
+  engine::Cache &resources = h.cache;
+  Events &events = h.events;
+  engine::Engine &engine = h.engine;
+  const auto replayOf = [](size_t length) {
+    return static_cast<uint32_t>((length - 1) / KvCache::pageTokens * KvCache::pageTokens);
+  };
+  std::vector<uint32_t> prompt(9000);
+  std::iota(prompt.begin(), prompt.end(), 1);
+  engine.submit(request(1, prompt));
+  h.runUntilIdle();
+  for (uint32_t turn = 2; turn <= 6; ++turn) {
+    // The turn trims 60 tokens of the last message and adds 3000 of its own.
+    const uint32_t tail = replayOf(prompt.size()) - kTrimmedTailTokens;
+    prompt.resize(replayOf(prompt.size()) - 60);
+    const size_t kept = prompt.size();
+    prompt.resize(kept + 3000);
+    std::iota(prompt.begin() + static_cast<std::ptrdiff_t>(kept), prompt.end(), turn * 1'000'000);
+    engine.submit(request(turn, prompt));
+    h.runUntilIdle();
+    const std::vector<uint32_t> restored(prompt.begin(), prompt.begin() + tail + 1);
+    const auto states = resources.snapshot().stateCache;
+    require(events.starts.back() == tail &&
+                !resources.checkpointState(resources.lookup(restored, {}).state->kvBlock()) &&
+                states.entries - states.checkpointEntries == turn + 1,
+            "a turn did not keep the tail it restored as the conversation's one branch point");
+  }
+  require(events.completedCount == 6 && events.failedCount == 0, "a turn failed");
+}
+
+// A lane that takes a kept rolling checkpoint as its recovery point makes it
+// a checkpoint like any, which a reclaim writes before it lets it go; so does
+// a request that ends before its replay point queues it.
+void testRecoveryPointIsNoSecondaryCheckpoint() {
+  for (const bool cancelled : {false, true}) {
+    test::EngineHarness h({.pages = 2048, .shape = [](Executor &shape) { shape.maximumLanes = 1; }});
+    engine::Cache &resources = h.cache;
+    Executor &executor = h.model;
+    Events &events = h.events;
+    engine::Engine &engine = h.engine;
+    // Checkpoints at 4096 and 8192, the tail's at 12160 in the command
+    // [10240, 12288), the replay point at 12416.
+    std::vector<uint32_t> prompt(12417);
+    std::iota(prompt.begin(), prompt.end(), 1);
+    engine.submit(request(1, prompt));
+    double now = 1;
+    tickUntil(h, now,
+              [&] {
+                return executor.requests.contains(1) && executor.requests.at(1).position == 12288 &&
+                       !engine.commandInFlight();
+              },
+              "the prompt did not publish its tail checkpoint");
+    const std::vector<uint32_t> rolling(prompt.begin(), prompt.begin() + 8193);
+    const uint64_t block = resources.lookup(rolling, {}).state->kvBlock();
+    require(resources.secondaryCheckpoint(block), "the tail did not keep its rolling checkpoint secondary");
+    if (cancelled) {
+      engine.cancel(1);
+      tickUntil(h, now, [&] { return idle(engine); }, "the request did not end");
+      require(!resources.secondaryCheckpoint(block) &&
+                  resources.probe(rolling, {}).cachedTokens() == 8192,
+              "a request that ended before its replay point left its kept checkpoint secondary");
+      continue;
+    }
+    tickUntil(h, now, [&] { return idle(engine); }, "the request did not finish");
+    // The next conversation leaves the prompt 2048 tokens or more past 8192:
+    // it resumes there and takes it as its recovery point.
+    std::vector<uint32_t> branch(prompt.begin(), prompt.begin() + 10'300);
+    branch.resize(10'400, 0);
+    engine.submit(request(2, branch));
+    tickUntil(h, now, [&] { return events.starts.size() == 2; }, "the branch did not start");
+    require(events.starts.back() == 8192 && !resources.secondaryCheckpoint(block),
+            "a lane's recovery point stayed a secondary checkpoint");
+    tickUntil(h, now, [&] { return idle(engine); }, "the branch did not finish");
+  }
+}
+
+// The lane's command refused buffers for its tail checkpoint, with no SSD,
+// goes on past it without it. The ledger may not take the lane's recovery
+// checkpoint at 8192 for the tail mid-command, so a cancelled command leaves
+// it for the retry.
+void testDroppedTailKeepsTheRecoveryPoint() {
+  test::EngineHarness h({.pages = 2048, .shape = [](Executor &shape) { shape.maximumLanes = 1; }});
+  engine::Cache &resources = h.cache;
+  Executor &executor = h.model;
+  Events &events = h.events;
+  engine::Engine &engine = h.engine;
+  bool memoryFull = false;
+  executor.reservationRoom = [&] {
+    if (*executor.evictedStateBytes >= 64) {
+      *executor.evictedStateBytes -= 64;
+      return true;
+    }
+    return !memoryFull;
+  };
+  // Checkpoints at 4096 and 8192, the tail's at 12160 in the command
+  // [10240, 12288), the replay point at 12416.
+  std::vector<uint32_t> prompt(12417);
+  std::iota(prompt.begin(), prompt.end(), 1);
+  engine.submit(request(1, prompt));
+  double now = 1;
+  tickUntil(h, now,
+            [&] {
+              return executor.requests.contains(1) && executor.requests.at(1).position == 10240 &&
+                     !engine.commandInFlight();
+            },
+            "the prompt did not reach the command of its tail");
+  const std::vector<uint32_t> recovery(prompt.begin(), prompt.begin() + 8193);
+  require(resources.probe(recovery, {}).cachedTokens() == 8192,
+          "fixture did not leave the lane its recovery checkpoint");
+  memoryFull = true;
+  *executor.evictedStateBytes = 0;
+  executor.holdPrefillUntil = std::make_shared<std::atomic<bool>>(false);
+  static_cast<void>(tickAt(h, now++));
+  require(engine.commandInFlight() && executor.requests.at(1).position == 12288 &&
+              engine.snapshot().captureCuts == 0 &&
+              resources.snapshot().stateCache.evictions == 0 &&
+              resources.probe(recovery, {}).cachedTokens() == 8192,
+          "the dropped tail ended its command or took the lane's recovery checkpoint");
+  engine.cancel(1);
+  *executor.holdPrefillUntil = true;
+  memoryFull = false;
+  tickUntil(h, now, [&] { return idle(engine); }, "the cancelled request did not end");
+  engine.submit(request(2, prompt));
+  h.runUntilIdle();
+  require(events.starts.back() == 8192 && events.failedCount == 0,
+          "the retry did not resume from the recovery checkpoint");
 }
 
 } // namespace
@@ -1228,6 +1448,11 @@ std::span<const test::TestCase> checkpointsTests() {
       {"testShortSuffixContinuesCheckpointDraftState", testShortSuffixContinuesCheckpointDraftState},
       {"testDefaultCheckpointRestoresLatestCommittedPrefix", testDefaultCheckpointRestoresLatestCommittedPrefix},
       {"testCheckpointsSkipNearResumeAndReplayBoundaries", testCheckpointsSkipNearResumeAndReplayBoundaries},
+      {"testTrimmedTailRestoresNearItsDivergence", testTrimmedTailRestoresNearItsDivergence},
+      {"testRestoredBranchPointIsKept", testRestoredBranchPointIsKept},
+      {"testBranchPointsStayBoundedAlongAConversation", testBranchPointsStayBoundedAlongAConversation},
+      {"testRecoveryPointIsNoSecondaryCheckpoint", testRecoveryPointIsNoSecondaryCheckpoint},
+      {"testDroppedTailKeepsTheRecoveryPoint", testDroppedTailKeepsTheRecoveryPoint},
   };
   return kTests;
 }

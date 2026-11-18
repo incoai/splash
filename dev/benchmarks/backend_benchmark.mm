@@ -1294,10 +1294,13 @@ int main(int argc, char **argv) {
         }
         continuationResult.coldOutputMatch =
             continuationResult.outputTokens == continuationCold.outputTokens;
-        if (coldResult.draftContextRows != expectedDraftContextRows(
-                length, engine::kPrefillCheckpointTokens)) {
+        const uint64_t expectedColdRows =
+            expectedDraftContextRows(length, engine::kPrefillCheckpointTokens);
+        if (coldResult.draftContextRows != expectedColdRows) {
           throw std::runtime_error(
-              "cold prefill performed unnecessary draft-context work");
+              "cold prefill draft-context work differs from its plan: rows=" +
+              std::to_string(coldResult.draftContextRows) +
+              " expected=" + std::to_string(expectedColdRows));
         }
         if (exactResult.ttftMilliseconds * 2.0 >=
             coldResult.ttftMilliseconds) {

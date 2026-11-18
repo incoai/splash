@@ -203,6 +203,25 @@ public:
   [[nodiscard]] bool contains(uint64_t kvBlock) const noexcept;
   // An ordinary state, in either tier.
   [[nodiscard]] bool ordinary(uint64_t kvBlock) const noexcept;
+  // Marks the checkpoint at this block secondary: a request's last rolling
+  // checkpoint kept beside its tail checkpoint and replay point, which cover
+  // its conversation's next turn. A reclaim lets its RAM copy go without a
+  // write, at once, before an ordinary state; write-behind may copy it to
+  // disk ahead of need (WriteBehind). It is a checkpoint again, no longer
+  // secondary, once made ordinary.
+  void markSecondary(uint64_t kvBlock) noexcept;
+  void clearSecondary(uint64_t kvBlock) noexcept;
+  [[nodiscard]] bool secondary(uint64_t kvBlock) const noexcept;
+  // A restored checkpoint kept as a conversation's branch point (made
+  // ordinary first): the states published past it record it
+  // (recordBranchPoint), and the next branch point of their conversation
+  // retires it (retireBranchPoint), so a conversation keeps one.
+  void markBranchPoint(uint64_t kvBlock) noexcept;
+  void recordBranchPoint(uint64_t kvBlock, uint64_t branchPoint) noexcept;
+  // The block's own branch point, or the one it recorded; 0 for none.
+  [[nodiscard]] uint64_t branchPointOf(uint64_t kvBlock) const noexcept;
+  // Retires the branch point at this block unless a request pins or uses it.
+  void retireBranchPoint(uint64_t kvBlock) noexcept;
   // The size of the state at this block; zero without one.
   [[nodiscard]] uint64_t bytes(uint64_t kvBlock) const noexcept;
   // A RAM copy exists.
@@ -339,6 +358,13 @@ private:
     uint64_t lastUsed = 0;
     bool checkpoint = false;
     Reply reply = Reply::None;
+    // A kept rolling checkpoint (markSecondary): a reclaim takes its RAM
+    // copy without a write.
+    bool secondary = false;
+    // A conversation's kept branch point (markBranchPoint), or the one below
+    // this state that its conversation keeps.
+    bool branchPoint = false;
+    uint64_t branchParent = 0;
     bool invalid = false;
     uint64_t publication = 0;
     RecencyOrder::Node ramNode;
@@ -359,9 +385,11 @@ private:
   [[nodiscard]] static std::optional<CacheEvictionCandidate>
   oldestOf(const RecencyOrder &order, const std::optional<CacheEvictionCandidate> &after) noexcept;
   // A RAM copy that leaves through a write while the tier takes one: a
-  // writable one without a disk copy, but an opportunistic reply's.
+  // writable one without a disk copy, but an opportunistic reply's or a kept
+  // rolling checkpoint's.
   [[nodiscard]] static bool writer(const Entry &entry) noexcept {
-    return entry.ram && !entry.disk && entry.ram->writable() && entry.reply != Reply::Opportunistic;
+    return entry.ram && !entry.disk && !entry.secondary && entry.ram->writable() &&
+           entry.reply != Reply::Opportunistic;
   }
   [[nodiscard]] static const std::shared_ptr<const CompositeState> &
   copy(const Entry &entry) noexcept {
