@@ -222,11 +222,10 @@ inline void gdn_prepare_prefill_phase(
   const uint value_channel =
       2 * KeyWidth + key_head * HeadsPerKey * HeadDim + thread_index;
 
-  const GdnConvHistory history{conv_state_in, packed, ConvDim, PackedWidth, 0};
-  const float query = float(gdn_conv_silu(packed, history, conv_weights,
-                                          PackedWidth, token, query_channel));
-  const float key = float(gdn_conv_silu(packed, history, conv_weights,
-                                        PackedWidth, token, key_channel));
+  const GdnConvTaps taps = gdn_conv_taps(
+      packed, PackedWidth, gdn_conv_history(conv_state_in, packed, ConvDim, PackedWidth, 0), token);
+  const float query = float(gdn_conv_silu(taps, conv_weights, query_channel));
+  const float key = float(gdn_conv_silu(taps, conv_weights, key_channel));
   const float query_sum = simd_sum(query * query);
   const float key_sum = simd_sum(key * key);
   if (lane == 0) {
@@ -253,8 +252,7 @@ inline void gdn_prepare_prefill_phase(
   for (uint head = 0; head < HeadsPerKey; ++head) {
     const uint channel = value_channel + head * HeadDim;
     v[ulong(token) * ValueWidth + channel - 2 * KeyWidth] =
-        gdn_conv_silu(packed, history, conv_weights, PackedWidth, token,
-                      channel);
+        gdn_conv_silu(taps, conv_weights, channel);
   }
   if (thread_index < HeadsPerKey) {
     const uint head = key_head * HeadsPerKey + thread_index;
@@ -265,8 +263,8 @@ inline void gdn_prepare_prefill_phase(
     decay[gate] = gates.decay;
   }
   if (token == 0) {
-    const GdnConvHistory carry{conv_state_in, packed, ConvDim, PackedWidth,
-                               params.tokens};
+    const GdnConvHistory carry =
+        gdn_conv_history(conv_state_in, packed, ConvDim, PackedWidth, params.tokens);
     for (uint row = 0; row < SPLASH_GDN_CONVOLUTION_TAPS - 1; ++row) {
       for (uint head = 0; head < HeadsPerKey + 2; ++head) {
         const uint channel = head == 0   ? query_channel

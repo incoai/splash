@@ -117,8 +117,9 @@ def client_messages():
         "request_ignore_eos": example_ignore_eos_request(),
         "request_progress": example_progress_request(),
         "cancel": p.CancelFrame(91),
+        # Mask row 1 forces two tokens after its path, row 2 one.
         "mask_response": p.MaskResponseFrame(
-            91, 7, struct.pack("<3I", 0xFFFFFFFF, 0, 0xA5A5A5A5)
+            91, 7, struct.pack("<3I", 0xFFFFFFFF, 0, 0xA5A5A5A5), (1, 40, 1, 41, 2, 50)
         ),
         "status_request": p.StatusRequestFrame(808),
         "release_request": p.ReleaseRequestFrame(808),
@@ -170,8 +171,11 @@ def engine_events():
         "start": p.StartEvent(91, 2, 4096),
         "prompt_progress": p.PromptProgressEvent(91, 2048, 123456),
         "tokens": p.TokensEvent(91, 17, (10, 11, 12)),
-        "mask_request_initial": p.MaskRequestEvent(91, 6, 4, ()),
-        "mask_request_verify": p.MaskRequestEvent(91, 7, 4, (101, 102, 103)),
+        "mask_request_initial": p.MaskRequestEvent(91, 6, 4, (), ()),
+        # A verify block's tree: the anchor, and two rows that follow it.
+        "mask_request_verify": p.MaskRequestEvent(
+            91, 7, 4, (101, 102, 103), (p.NO_PARENT, 0, 0)
+        ),
         "done": p.DoneEvent(
             91, p.FinishReason.STOP, 4096, 512, 1000, 2000, 3500, (), 64, 350, 280, 50
         ),
@@ -1137,6 +1141,18 @@ class ProtocolPythonTests(unittest.TestCase):
         self.assert_fatal_event(
             p.IssueCode.INVALID_ENUM_VALUE, p.ReadyEvent(4, 4096, 2, 64, 9, (1,))
         )
+        # A mask request's tokens are a tree: a parent each, the first the
+        # root, and every other one's before it.
+        for parents in ((0, 0), (p.NO_PARENT, 1), (p.NO_PARENT, p.NO_PARENT)):
+            with self.subTest(parents=parents):
+                self.assert_fatal_event(
+                    p.IssueCode.INVALID_CONSTRAINT,
+                    p.MaskRequestEvent(8, 1, 4, (101, 102), parents),
+                )
+        self.assert_fatal_event(
+            p.IssueCode.INVALID_PAYLOAD_LENGTH,
+            p.MaskRequestEvent(8, 1, 4, (101, 102), (p.NO_PARENT,)),
+        )
 
     def test_unnamed_request_failures_are_fatal(self):
         """A client frame's failure is its request's error only when the
@@ -1164,12 +1180,12 @@ class ProtocolPythonTests(unittest.TestCase):
                 p.FailureClass.PROTOCOL_FATAL,
             ),
             (
-                p.MaskResponseFrame(0, 7, bytes(4)),
+                p.MaskResponseFrame(0, 7, bytes(4), ()),
                 p.IssueCode.INVALID_REQUEST_ID,
                 p.FailureClass.PROTOCOL_FATAL,
             ),
             (
-                p.MaskResponseFrame(91, 0, bytes(4)),
+                p.MaskResponseFrame(91, 0, bytes(4), ()),
                 p.IssueCode.INVALID_REQUEST_ID,
                 p.FailureClass.REQUEST_ERROR,
             ),

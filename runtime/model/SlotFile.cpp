@@ -58,11 +58,25 @@ struct SlotFile::Backing {
   // A persistent file between opening and finishAdoption(): the worker
   // waits, and the slots are adoption's alone.
   bool adopting = false;
-  // The process is ending: freed slots keep their blocks and records.
+  // The process is ending: freed slots keep their blocks and records, and
+  // those still to punch at punchesEnd too (seal).
   bool sealed = false;
-  // Worker-only: the slots whose blocks the file holds, from a write's first
-  // chunk until a punch returns them.
-  std::vector<bool> backed;
+  AwakeClock::time_point punchesEnd = AwakeClock::time_point::max();
+  // Until a punch fails: the volume returns the blocks of a punched range,
+  // so a slot keeps only its payload's host pages (quotaBytesFor).
+  std::atomic<bool> volumeReturnsBlocks{true};
+  // Worker-only: how far from its start each slot's range may hold blocks of
+  // the file, zero for a slot that holds none: what a slot written there
+  // takes of the quota (Slot::bytes), from its write's first chunk until a
+  // punch returns the range, and the most of them when a punch failed
+  // between two, which leaves the earlier one's blocks under what the later
+  // one stores; the whole slot where the hole before a write past the
+  // file's end stayed (stored). The budget's file bytes count it, and the
+  // file ends with the last slot's (released).
+  std::vector<uint64_t> backed;
+  // Worker-only: where what the file's slots hold ends, which is where the
+  // file ends (stored, released).
+  uint64_t end = 0;
   ~Backing() {
     if (descriptor >= 0) ::close(descriptor);
     if (records >= 0) ::close(records);
@@ -86,14 +100,50 @@ struct SlotFile::Backing {
   bool load(std::span<std::byte> chunk, off_t offset) const noexcept;
   bool store(std::span<const std::byte> chunk, off_t offset) const noexcept;
 
-  // Marks a slot's blocks held; true when they were not.
-  bool back(uint32_t index) {
+  // Counts the blocks slot `index`'s range holds up to `bytes`, what a slot
+  // written there takes of the quota. A range that holds blocks already, an
+  // earlier holder's that a failed punch left, counts what `bytes` adds.
+  void back(uint32_t index, uint64_t bytes) {
     if (backed.size() <= index)
       backed.resize(index + 1);
-    if (backed[index])
-      return false;
-    backed[index] = true;
-    return true;
+    if (backed[index] >= bytes)
+      return;
+    budget->file_.fetch_add(bytes - backed[index], std::memory_order_relaxed);
+    backed[index] = bytes;
+  }
+  // Returns the blocks of a range that holds no payload to the volume
+  // (F_PUNCHHOLE); offsets and sizes of slots and of what writes store are
+  // whole host pages, so whole blocks. False, reported once, on a volume
+  // that returns none: the file's slots count whole from then on.
+  bool returnBlocks(uint64_t offset, uint64_t bytes) noexcept;
+  // On the worker, after a write stored `bytes` at `offset`: a write past
+  // where the file's writes ended returns the hole before it, which the
+  // volume allocates with the write. A hole whose punch failed stays, and
+  // each slot's range it lies in counts whole, as a slot's own does. The
+  // write counted its slot's range (back) before its first chunk, so none
+  // of these grows `backed`.
+  void stored(uint64_t offset, uint64_t bytes) noexcept {
+    if (offset > end && !returnBlocks(end, offset - end))
+      for (uint64_t index = end / slotBytes; index < offset / slotBytes; ++index)
+        back(static_cast<uint32_t>(index), slotBytes);
+    end = std::max(end, offset + bytes);
+  }
+  // On the worker, after a punch returned the blocks of slot `index`: when
+  // it was the last slot that held any, the file ends with the one below
+  // that does. A hole left at the file's end is not kept one: the volume
+  // allocates all of it under a write into it (a 464 KiB payload in a slot
+  // freed there after one of 1.59 MiB kept the whole slot), where a write
+  // past the file's end has only the hole before it allocated, which
+  // stored() returns.
+  void released(uint32_t index) noexcept {
+    const uint64_t start = uint64_t{index} * slotBytes;
+    if (end <= start || end > start + slotBytes)
+      return;
+    uint32_t above = index;
+    while (above && !backed[above - 1])
+      --above;
+    end = above ? uint64_t{above - 1} * slotBytes + backed[above - 1] : 0;
+    static_cast<void>(::ftruncate(descriptor, static_cast<off_t>(end)));
   }
 };
 
@@ -120,7 +170,7 @@ SlotFile::Slot::~Slot() {
   // transfer it is in and punched them. A write to another file of the
   // budget can take the quota meanwhile, so the files' blocks exceed the
   // budget by this slot until the punch.
-  backing_->budget->release(backing_->slotBytes);
+  backing_->budget->release(bytes_);
   if (punch)
     backing_->wake.notify_one();
 }
@@ -152,10 +202,9 @@ struct ErrnoMessage final {
   }
 };
 
-// Once per process: the volume keeps the blocks of freed slots.
-// The slots a persistent file does not take back keep their records until
-// they are reused: their payloads are punched, so a later read of one fails
-// its check, and the next start looks at them again.
+// Once per process. The slots a persistent file does not take back keep
+// their records until they are reused: their payloads are punched, so a
+// later read of one fails its check, and the next start looks at them again.
 void reportRecordFailure(int error) noexcept {
   static std::atomic<bool> reported{false};
   if (!reported.exchange(true, std::memory_order_relaxed))
@@ -163,11 +212,13 @@ void reportRecordFailure(int error) noexcept {
             ErrnoMessage{error}, "); they stay until reused.");
 }
 
+// Once per process: the volume keeps the blocks of freed slots and of the
+// holes around shorter payloads.
 void reportPunchFailure(int error) noexcept {
   static std::atomic<bool> reported{false};
   if (!reported.exchange(true, std::memory_order_relaxed))
-    logLine("Freed cache slots cannot return their blocks on this volume (",
-            ErrnoMessage{error}, "); disk use may exceed the SSD cache's limit.");
+    logLine("The SSD cache's volume returns no blocks of its files (", ErrnoMessage{error},
+            "): each copy counts a whole slot, and disk use may exceed the cache's limit.");
 }
 
 // Once per file: the write that stopped it.
@@ -471,6 +522,16 @@ bool SlotFile::Backing::store(std::span<const std::byte> chunk, off_t offset) co
   });
 }
 
+bool SlotFile::Backing::returnBlocks(uint64_t offset, uint64_t bytes) noexcept {
+  fpunchhole_t hole{0, 0, static_cast<off_t>(offset), static_cast<off_t>(bytes)};
+  if (::fcntl(descriptor, F_PUNCHHOLE, &hole) == 0)
+    return true;
+  const int error = errno;
+  volumeReturnsBlocks.store(false, std::memory_order_relaxed);
+  reportPunchFailure(error);
+  return false;
+}
+
 SlotFile::SlotFile(uint64_t slotBytes, std::shared_ptr<DiskBudget> budget, const Options &options)
     : backing_(std::make_shared<Backing>()) {
   prepare(slotBytes, std::move(budget), options);
@@ -484,6 +545,7 @@ SlotFile::SlotFile(uint64_t slotBytes, std::shared_ptr<DiskBudget> budget, const
   if (::fcntl(backing_->descriptor, F_SETFD, FD_CLOEXEC) < 0)
     throw std::system_error(errno, std::generic_category(), "close-on-exec slot file");
   uncache();
+  askVolume();
   worker_ = std::thread([this] { run(); });
 }
 
@@ -499,9 +561,10 @@ void SlotFile::prepare(uint64_t slotBytes, std::shared_ptr<DiskBudget> budget, c
   if (!budget)
     throw std::invalid_argument("slot file needs a disk budget");
   const uint64_t capacityBytes = budget->capacityBytes();
-  if (!slotBytes || capacityBytes > uint64_t{std::numeric_limits<off_t>::max()} ||
-      capacityBytes / slotBytes > std::numeric_limits<uint32_t>::max())
-    throw std::invalid_argument("invalid slot file capacity");
+  // Slots are indexed in 32 bits (acquire), and each starts at an offset an
+  // off_t holds.
+  if (!slotBytes || slotBytes > uint64_t{std::numeric_limits<off_t>::max()} >> 32)
+    throw std::invalid_argument("invalid slot size");
   if (capacityBytes < slotBytes)
     throw std::invalid_argument("slot file quota holds no slot");
   if (slotBytes % kHostPageBytes)
@@ -538,6 +601,13 @@ void SlotFile::uncache() {
     throw std::system_error(errno, std::generic_category(), "uncached slot file");
 }
 
+void SlotFile::askVolume() {
+  // Past the file's end nothing is stored, so a punch there changes nothing
+  // and only says whether the volume takes one.
+  static_cast<void>(backing_->returnBlocks(alignUp(fileBytes(backing_->descriptor, "stat slot file")),
+                                           kHostPageBytes));
+}
+
 void SlotFile::open(const Persistence &persistence) {
   Backing &backing = *backing_;
   if (!persistence.labelBytes)
@@ -550,6 +620,7 @@ void SlotFile::open(const Persistence &persistence) {
       recordsHeader(backing.slotBytes, backing.labelBytes, persistence.tag, backing.segmentEnds);
   backing.descriptor = openPersistent(persistence.slots, "open slot file");
   uncache();
+  askVolume();
   backing.records = openPersistent(persistence.records, "open slot record file");
   backing.adopting = true;
   const uint64_t recordFileBytes = fileBytes(backing.records, "stat slot record file");
@@ -570,7 +641,7 @@ void SlotFile::open(const Persistence &persistence) {
   const uint64_t recorded = (recordFileBytes - kRecordsHeaderBytes) / backing.recordBytes;
   if (std::max(slots, recorded) > std::numeric_limits<uint32_t>::max())
     throw std::runtime_error("slot file holds more slots than it can index");
-  adopted_.assign(std::max(slots, recorded), false);
+  adopted_.assign(std::max(slots, recorded), 0);
   std::vector<std::byte> records(std::min(slots, recorded) * backing.recordBytes);
   if (!readAll(backing.records, records, kRecordsHeaderBytes))
     throw std::system_error(errno, std::generic_category(), "read slot records");
@@ -595,11 +666,21 @@ SlotFile::~SlotFile() {
   worker_.join();
 }
 
-std::shared_ptr<SlotFile::Slot> SlotFile::acquire(DiskBudget::Draw draw) {
+uint64_t SlotFile::quotaBytesFor(uint64_t payloadBytes) const noexcept {
+  return backing_->volumeReturnsBlocks.load(std::memory_order_relaxed) ? slotBytesFor(payloadBytes)
+                                                                       : backing_->slotBytes;
+}
+
+std::shared_ptr<SlotFile::Slot> SlotFile::acquire(uint64_t payloadBytes, DiskBudget::Draw draw) {
+  if (!payloadBytes || payloadBytes > backing_->slotBytes)
+    throw std::invalid_argument("slot payload does not fit this file's slots");
   auto slot = std::shared_ptr<Slot>(new Slot({}, 0));
   std::lock_guard lock(backing_->mutex);
   if (backing_->adopting)
     throw std::logic_error("a persistent slot file acquires slots only after adoption");
+  // Every index is taken: the file holds no more slots, as at its limit.
+  if (backing_->free.empty() && backing_->allocated == std::numeric_limits<uint32_t>::max())
+    return {};
   // A new index needs room in the free and punch lists, made before bytes
   // are reserved so allocation failure cannot strand quota, and returning a
   // slot never needs to allocate. An index waits for at most one punch:
@@ -612,7 +693,8 @@ std::shared_ptr<SlotFile::Slot> SlotFile::acquire(DiskBudget::Draw draw) {
         list->reserve(std::max<size_t>(1, 2 * list->capacity()));
     }
   }
-  if (!backing_->budget->reserve(backing_->slotBytes, draw)) return {};
+  const uint64_t bytes = quotaBytesFor(payloadBytes);
+  if (!backing_->budget->reserve(bytes, draw)) return {};
   uint32_t index;
   if (!backing_->free.empty()) {
     index = backing_->free.back();
@@ -622,6 +704,7 @@ std::shared_ptr<SlotFile::Slot> SlotFile::acquire(DiskBudget::Draw draw) {
   }
   slot->backing_ = backing_;
   slot->index_ = index;
+  slot->bytes_ = bytes;
   return slot;
 }
 
@@ -671,13 +754,14 @@ std::shared_ptr<SlotFile::Slot> SlotFile::adopt(const SlotRecord &record) {
   const uint32_t allocated = std::max(backing.allocated, record.index + 1);
   for (std::vector<uint32_t> *list : {&backing.free, &backing.punches})
     list->reserve(allocated);
-  adopted_[record.index] = true;
+  const uint64_t bytes = quotaBytesFor(record.payloadBytes);
+  adopted_[record.index] = slotBytesFor(record.payloadBytes);
   backing.allocated = allocated;
-  backing.budget->used_.fetch_add(backing.slotBytes, std::memory_order_relaxed);
-  if (backing.back(record.index))
-    backing.budget->file_.fetch_add(backing.slotBytes, std::memory_order_relaxed);
+  backing.budget->used_.fetch_add(bytes, std::memory_order_relaxed);
+  backing.back(record.index, bytes);
   slot->backing_ = backing_;
   slot->index_ = record.index;
+  slot->bytes_ = bytes;
   slot->payloadBytes_ = record.payloadBytes;
   slot->checksums_ = record.checksums;
   slot->verify_.store(true, std::memory_order_relaxed);
@@ -692,17 +776,21 @@ void SlotFile::finishAdoption() {
     std::lock_guard lock(backing.mutex);
     if (!backing.adopting)
       throw std::logic_error("slot file adoption already finished");
-    // Past the last slot adopted, the files end; below it, each run of
-    // slots not adopted is free, its records cleared and its blocks
-    // returned. None of it is needed for serving: a failure leaves records
-    // behind, and the file goes on.
-    if (::ftruncate(backing.descriptor,
-                    static_cast<off_t>(uint64_t{backing.allocated} * backing.slotBytes)) < 0 ||
-        ::ftruncate(backing.records, recordOffset(backing.allocated, backing.recordBytes)) < 0)
-      reportRecordFailure(errno);
+    // Each run of slots not adopted is free and its records cleared, and the
+    // blocks between one adopted payload's host pages and the next one's
+    // slot go back: the slots not adopted, and what the volume kept around a
+    // shorter payload (a file whose process returned no such hole holds
+    // every slot whole; a punch of a hole already there took 3 us). Past the
+    // last adopted payload the files end. None of it is needed for serving:
+    // a failure leaves records and blocks behind, and the file goes on.
     const std::vector<std::byte> cleared(kChunkBytes);
+    uint64_t kept = 0;
     for (uint32_t begin = 0; begin < backing.allocated;) {
       if (adopted_[begin]) {
+        const uint64_t start = uint64_t{begin} * backing.slotBytes;
+        if (start > kept)
+          static_cast<void>(backing.returnBlocks(kept, start - kept));
+        kept = start + adopted_[begin];
         ++begin;
         continue;
       }
@@ -719,12 +807,12 @@ void SlotFile::finishAdoption() {
         }
         offset += bytes;
       }
-      fpunchhole_t hole{0, 0, slotOffset(begin, backing.slotBytes),
-                        static_cast<off_t>(uint64_t{end - begin} * backing.slotBytes)};
-      if (::fcntl(backing.descriptor, F_PUNCHHOLE, &hole) < 0)
-        reportPunchFailure(errno);
       begin = end;
     }
+    if (::ftruncate(backing.descriptor, static_cast<off_t>(kept)) < 0 ||
+        ::ftruncate(backing.records, recordOffset(backing.allocated, backing.recordBytes)) < 0)
+      reportRecordFailure(errno);
+    backing.end = kept;
     backing.adopting = false;
   }
   adopted_ = {};
@@ -763,9 +851,10 @@ std::shared_ptr<SlotFile::Operation> SlotFile::synchronize(std::function<void()>
       std::move(completion));
 }
 
-void SlotFile::seal() noexcept {
+void SlotFile::seal(AwakeClock::time_point punchesEnd) noexcept {
   std::lock_guard lock(backing_->mutex);
   backing_->sealed = true;
+  backing_->punchesEnd = std::min(backing_->punchesEnd, punchesEnd);
 }
 
 std::shared_ptr<SlotFile::Operation> SlotFile::submit(Run run, std::function<void()> completion,
@@ -798,6 +887,10 @@ void SlotFile::run() {
                (!backing.punches.empty() && !backing.adopting);
       });
       if (!backing.stopping && !backing.adopting && !backing.punches.empty()) {
+        if (AwakeClock::now() >= backing.punchesEnd) {
+          backing.punches.clear();
+          continue;
+        }
         const uint32_t index = backing.punches.back();
         backing.punches.pop_back();
         lock.unlock();
@@ -842,31 +935,28 @@ void SlotFile::punchHole(uint32_t index) noexcept {
   if (backing.persistent)
     static_cast<void>(writeAll(backing.records, backing.clearedRecord,
                                recordOffset(index, backing.recordBytes)));
-  // Slot offsets and sizes are whole alignment units, so whole blocks.
-  fpunchhole_t hole{0, 0, slotOffset(index, backing.slotBytes),
-                    static_cast<off_t>(backing.slotBytes)};
-  if (::fcntl(backing.descriptor, F_PUNCHHOLE, &hole) < 0) {
-    reportPunchFailure(errno);
+  if (!backing.returnBlocks(uint64_t{index} * backing.slotBytes, backing.slotBytes))
     return;
-  }
-  backing.backed[index] = false;
-  backing.budget->file_.fetch_sub(backing.slotBytes, std::memory_order_relaxed);
+  backing.budget->file_.fetch_sub(std::exchange(backing.backed[index], 0), std::memory_order_relaxed);
+  backing.released(index);
 }
 
 // A write gathers its spans into the worker's buffer one chunk at a time and
 // zeros the rest of their last host page, and no more: a shorter payload
 // (a trimmed KV page, a third of a full one) leaves the slot past it
-// unwritten, which nothing reads; a read moves the chunks its spans reach and
-// scatters each into them, ignoring the slot past them. A chunk of a span
-// the file can move straight skips the buffer. Every pwrite and pread is an
-// aligned range of the slot, and cancellation is noticed before each chunk.
-// In a persistent file a write checksums each segment of its spans as they
-// go, and the first read of an adopted slot checks them.
+// unwritten, which nothing reads, and a hole (Backing::stored); a read moves
+// the chunks its spans reach and scatters each into them, ignoring the slot
+// past them. A chunk of a span the file can move straight skips the buffer.
+// Every pwrite and pread is an aligned range of the slot, and cancellation is
+// noticed before each chunk. In a persistent file a write checksums each
+// segment of its spans as they go, and the first read of an adopted slot
+// checks them.
 std::shared_ptr<SlotFile::Operation> SlotFile::write(
     std::shared_ptr<Slot> slot, std::vector<std::span<const std::byte>> source,
     std::function<void()> completion) {
   const uint64_t payloadBytes = totalBytes(source);
-  if (!slot || slot->backing_ != backing_ || payloadBytes > backing_->slotBytes ||
+  // A slot counts at least its payload's host pages, at most the slot.
+  if (!slot || slot->backing_ != backing_ || payloadBytes > slot->bytes_ ||
       (!backing_->segmentEnds.empty() && payloadBytes != backing_->segmentEnds.back()))
     throw std::invalid_argument("slot write does not match this file's slots");
   if (!writable())
@@ -899,8 +989,8 @@ std::shared_ptr<SlotFile::Operation> SlotFile::write(
     Pieces pieces(source);
     for (uint64_t done = 0, end = slotBytesFor(payloadBytes); done < end;) {
       if (cancelled.load(std::memory_order_relaxed)) return false;
-      if (!done && backing.back(slot->index_))
-        backing.budget->file_.fetch_add(backing.slotBytes, std::memory_order_relaxed);
+      if (!done)
+        backing.back(slot->index_, slot->bytes_);
       std::span<const std::byte> chunk = pieces.directRun();
       if (!chunk.empty()) {
         chunk = chunk.first(kChunkBytes);
@@ -932,6 +1022,7 @@ std::shared_ptr<SlotFile::Operation> SlotFile::write(
           reportWriteFailure(error);
         return false;
       }
+      backing.stored(static_cast<uint64_t>(start) + done, chunk.size());
       done += chunk.size();
     }
     slot->payloadBytes_ = payloadBytes;

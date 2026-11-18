@@ -23,8 +23,8 @@ namespace gguf_sg {
 // (kernels/decode/linear_gguf_sgmatrix.metal).
 constant constexpr uint kZeroPointOffset = 160;
 
-// The rows of a table: one lane's verify rows.
-constant constexpr uint kRows = 8;
+// The rows of a table tile.
+constant constexpr uint kRows = GGUF_TABLE16_ROWS;
 static_assert(GGUF_TABLE16_SPAN_VALUES == GGUF_TABLE16_SPAN_INPUTS * kRows, "a span holds every row's inputs");
 
 // A span's values laid out as quads, so the lane (fm, fn) reads fragments

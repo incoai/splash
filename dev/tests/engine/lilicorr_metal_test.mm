@@ -18,6 +18,7 @@
 #include "metal/abi/LiLiCorr.h"
 #include "metal/abi/QuantFormat.h"
 #include "metal/abi/Sampling.h"
+#include "metal/abi/VerifyTree.h"
 #include "ops/LiLiCorr.hpp"
 
 #import <Foundation/Foundation.h>
@@ -58,6 +59,7 @@ constexpr uint32_t kPositions = SPLASH_DRAFT_PROPOSAL_TOKENS;
 constexpr uint32_t kCandidates = SPLASH_DRAFT_CANDIDATES;
 constexpr uint32_t kShards = SPLASH_DRAFT_SAMPLING_SHARDS;
 constexpr uint32_t kLanes = SPLASH_MAXIMUM_BATCH_WIDTH;
+constexpr uint32_t kBlock = SPLASH_TARGET_VERIFY_ROWS;
 constexpr uint32_t kHidden = 512;
 constexpr uint32_t kVocabulary = 1003;
 constexpr double kRmsEpsilon = 1e-6;
@@ -381,22 +383,31 @@ struct Fixture final {
                zeroed(backend, workspace.candidatesBytes),
                zeroed(backend, workspace.unaryBytes),
                {},
-               zeroed(backend, uint64_t{lanes} * SPLASH_SAMPLING_UNIFORMS * sizeof(float)),
-               zeroed(backend, uint64_t{positions} * sizeof(uint32_t)),
-               zeroed(backend, workspace.proposalProbabilitiesBytes),
-               zeroed(backend, uint64_t{positions} * sizeof(float))};
+               zeroed(backend, uint64_t{lanes} * SPLASH_TREE_CHAIN_TOKENS * sizeof(uint32_t)),
+               zeroed(backend, uint64_t{lanes} * SPLASH_TREE_CHAIN_TOKENS * SPLASH_TREE_AGREEMENTS * sizeof(float)),
+               zeroed(backend, uint64_t{lanes} * kBlock * sizeof(uint32_t)),
+               zeroed(backend, uint64_t{lanes} * kBlock * sizeof(SplashTreeRow)),
+               zeroed(backend, uint64_t{lanes} * kBlock * 2 * sizeof(float)),
+               zeroed(backend, uint64_t{lanes} * sizeof(uint32_t)),
+               zeroed(backend, uint64_t{lanes} * kBlock * SPLASH_TREE_CHILDREN),
+               zeroed(backend, uint64_t{lanes} * kBlock * kCandidates * sizeof(float)),
+               zeroed(backend, uint64_t{lanes} * kBlock * sizeof(float)),
+               zeroed(backend, uint64_t{lanes} * kBlock * sizeof(uint32_t)),
+               zeroed(backend, uint64_t{lanes} * kBlock * sizeof(SplashTreeRow)),
+               zeroed(backend, uint64_t{lanes} * sizeof(SplashLaneRows)),
+               zeroed(backend, uint64_t{lanes} * kBlock * sizeof(uint32_t))};
     // The draft's final hidden rows, whole prefill tiles of them.
     const uint64_t hiddenRows = (rows + GGUF_PREFILL_ROWS - 1) / GGUF_PREFILL_ROWS * GGUF_PREFILL_ROWS;
     finalHidden = weights.table(hiddenRows * kHidden, 1.0F);
     for (uint32_t lane = 0; lane < lanes; ++lane) {
       anchorRows.push_back(weights.table(kHidden, 1.0F));
-      anchors.push_back(random.next() % kVocabulary);
-      policies.push_back(SamplingPolicy{16, 0.0F, 1.0F, false});
+      // A greedy chain: a row's likeliest candidate a position.
+      trees.push_back({random.next() % kVocabulary, kBlock - 1, 0, 1});
     }
     std::vector<MetalBuffer> views;
     for (const uint64_t bytes : LiLiCorr::scratchBytes(kHidden)) views.push_back(zeroed(backend, bytes));
     LinearScratchSize size;
-    for (const Projection *p : w.projections()) size.include(linear.prefillScratchSize(p->shape()));
+    for (const Projection *p : w.projections()) size.include(linear.scratchSize(p->shape(), LiLiCorr::maximumRows()));
     const auto optional = [&](uint64_t bytes) { return bytes ? zeroed(backend, bytes) : MetalBuffer{}; };
     scratch = LiLiCorrScratch{views[0],  views[1],  views[2],  views[3],  views[4],  views[5],  views[6],
                               views[7],  views[8],  views[9],  views[10], views[11], views[12], views[13],
@@ -406,8 +417,8 @@ struct Fixture final {
   }
 
   void add(CommandGraph &graph, uint32_t hidden = kHidden) const {
-    LiLiCorr::add(graph, linear, selector, buffers, w, scratch, {finalHidden, embedding, anchorRows}, anchors,
-                  policies, hidden, kVocabulary);
+    LiLiCorr::add(graph, linear, selector, buffers, w, scratch, {finalHidden, embedding, anchorRows}, {}, trees,
+                  hidden);
   }
 
   uint32_t lanes;
@@ -419,8 +430,7 @@ struct Fixture final {
   DraftSelectorBuffers buffers;
   MetalBuffer finalHidden;
   std::vector<MetalBuffer> anchorRows;
-  std::vector<uint32_t> anchors;
-  std::vector<SamplingPolicy> policies;
+  std::vector<DraftTreeLane> trees;
   LiLiCorrScratch scratch;
 };
 
@@ -433,7 +443,7 @@ void runCase(MetalBackend &backend, uint32_t lanes) {
   for (const char *kernel :
        {"draft_select_top16_sharded", "lilicorr_lse", "lilicorr_candidates", "lilicorr_embed_sum",
         "lilicorr_store_anchor", "lilicorr_anchor", "lilicorr_rms", "lilicorr_attention", "lilicorr_residual",
-        "lilicorr_bias_silu", "lilicorr_factor_input", "lilicorr_scores", "draft_select_dflash"})
+        "lilicorr_bias_silu", "lilicorr_factor_input", "lilicorr_scores", "draft_select_tree"})
     require(ran.count(kernel), std::string("the selection did not run ") + kernel);
   static_cast<void>(backend.submitCommandAsync(graph.dispatches()).wait());
 
@@ -441,7 +451,8 @@ void runCase(MetalBackend &backend, uint32_t lanes) {
   const auto *candidates = static_cast<const uint32_t *>(f.buffers.candidates.contents());
   const auto *unary = static_cast<const float *>(f.buffers.unary.contents());
   const auto *ids = static_cast<const uint32_t *>(f.scratch.ids.contents());
-  const auto *tokens = static_cast<const uint32_t *>(f.buffers.proposedTokens.contents());
+  // A chain's tree: the anchor, then position p's token at row p + 1.
+  const auto *tokens = static_cast<const uint32_t *>(f.buffers.treeTokens.contents());
   const auto *partials = static_cast<const float *>(f.buffers.partialValues.contents());
   double worst = 0.0;
   uint32_t decided = 0;
@@ -483,7 +494,7 @@ void runCase(MetalBackend &backend, uint32_t lanes) {
         if (edges[c] > edges[best]) best = c;
         if (reference[c] > reference[referenceBest]) referenceBest = c;
       }
-      require(tokens[row] == top[best], "the walk did not take its table row's best candidate");
+      require(tokens[lane * kBlock + position + 1] == top[best], "the walk did not take its table row's best candidate");
       const double margin = reference[referenceBest] - reference[best];
       require(best == referenceBest || margin < 2 * kTableTolerance,
               "the walk's choice is not the reference's best beyond the noise");
@@ -511,7 +522,7 @@ void invalidRequests(MetalBackend &backend) {
           "anchor rows for other than every lane were accepted");
   refused([](Fixture &c) { c.w.layers.pop_back(); }, "invalid LiLiCorr selector batch",
           "a selector of one layer was accepted");
-  refused([](Fixture &c) { c.anchors.clear(), c.policies.clear(), c.anchorRows.clear(); },
+  refused([](Fixture &c) { c.trees.clear(), c.anchorRows.clear(); },
           "invalid LiLiCorr selector batch", "an empty batch was accepted");
   refused([&](Fixture &c) { c.scratch.x = backend.view(f.scratch.x, 0, f.scratch.x.sizeBytes() - 4); },
           "LiLiCorr scratch", "a residual scratch one element short was accepted");

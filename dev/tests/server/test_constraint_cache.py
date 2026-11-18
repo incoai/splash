@@ -27,11 +27,10 @@ class ConstraintCacheTests(unittest.TestCase):
             def deep_copy(self):
                 return self.grammar
 
-        constraint = mock.Mock(side_effect=lambda matcher, _executor, _format: matcher)
+        constraint = mock.Mock(side_effect=lambda matcher, _format: matcher)
         for target, replacement in (
             ("guidance_tokenizer", lambda *args, **kwargs: None),
             ("LLMatcher", Matcher),
-            ("LLExecutor", lambda: None),
             ("TokenConstraint", constraint),
         ):
             self.enterContext(mock.patch.object(constraints, target, replacement))
@@ -251,10 +250,9 @@ class ConstraintCacheTests(unittest.TestCase):
                 return_value="guidance-tokenizer",
             ),
             mock.patch("server.constraints.LLMatcher", Matcher),
-            mock.patch("server.constraints.LLExecutor", return_value="executor"),
             mock.patch(
                 "server.constraints.TokenConstraint",
-                side_effect=lambda matcher, executor, _format: (matcher, executor),
+                side_effect=lambda matcher, _format: (matcher,),
             ),
         ):
             factory = constraints.ConstraintFactory(object(), READY)
@@ -301,10 +299,9 @@ class ConstraintCacheTests(unittest.TestCase):
         with (
             mock.patch("server.constraints.guidance_tokenizer", return_value=object()),
             mock.patch("server.constraints.LLMatcher", Matcher),
-            mock.patch("server.constraints.LLExecutor", return_value=object()),
             mock.patch(
                 "server.constraints.TokenConstraint",
-                side_effect=lambda matcher, _executor, _format: matcher,
+                side_effect=lambda matcher, _format: matcher,
             ),
         ):
             factory = constraints.ConstraintFactory(object(), READY)
@@ -342,10 +339,9 @@ class ConstraintCacheTests(unittest.TestCase):
         with (
             mock.patch("server.constraints.guidance_tokenizer", return_value=object()),
             mock.patch("server.constraints.LLMatcher", Matcher),
-            mock.patch("server.constraints.LLExecutor", return_value=object()),
             mock.patch(
                 "server.constraints.TokenConstraint",
-                side_effect=lambda matcher, _executor, _format: matcher,
+                side_effect=lambda matcher, _format: matcher,
             ),
         ):
             factory = constraints.ConstraintFactory(object(), READY)

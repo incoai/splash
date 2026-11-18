@@ -42,6 +42,7 @@ struct Qwen3_8Layout final : QwenHybridLayout {
                           .fullAttentionPeriod = 4,
                           .maskToken = 248070,
                           .stopTokens = {248044, 248046},
+                          .draftVocabulary = kQwenDraftVocabulary,
                           .ffnKind = QwenFfnKind::Dense,
                           .intermediateSize = 17408},
                          "Qwen3.8-27B"} {}

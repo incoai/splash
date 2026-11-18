@@ -15,22 +15,19 @@ ROOT = Path(__file__).resolve().parents[3]
 # The options of `splash serve` the models of each family cannot use, as the
 # engine's facts of its layout and the family's release give them.
 UNUSABLE = {
-    "Qwen3.8-27B": {
-        "--expert-memory",
-        "--ple-memory",
-        "--sparse-kv-memory",
-        "--verify-rows",
-    },
+    "Qwen3.8-27B": {"--expert-memory", "--ple-memory", "--sparse-kv-memory"},
     "Qwen3.6-35B-A3B": {"--ple-memory", "--sparse-kv-memory", "--disable-ane"},
     "Qwen3.5-122B-A10B": {"--ple-memory", "--sparse-kv-memory", "--disable-ane"},
     "Qwen3.8-Flash-Next": {"--disable-ane"},
     "Flint": {
         "--language-only",
         "--state-format",
+        "--cached-states",
         "--ple-memory",
         "--sparse-kv-memory",
         "--disable-ane",
         "--max-image-pixels",
+        "--reasoning-effort",
         "--default-reasoning-effort",
         "--thinking-token-budget",
         "--thinking-end-text",

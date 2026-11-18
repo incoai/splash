@@ -66,6 +66,8 @@ class StatusContractTests(unittest.TestCase):
         self.assertIn('splash_disk_writes_gated{state="no"} 0', lines)
         self.assertIn("splash_disk_read_bytes_total 12345", lines)
         self.assertIn("splash_disk_written_bytes_total 67890", lines)
+        self.assertIn("splash_disk_written_last_hour_bytes 16384", lines)
+        self.assertIn("splash_disk_written_last_day_bytes 65536", lines)
 
     def test_required_leaves_are_exported(self):
         status = json.loads(GOLDEN.read_text())

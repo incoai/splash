@@ -1,5 +1,6 @@
 #include "metal/abi/KernelABI.h"
 #include "metal/abi/LiLiCorr.h"
+#include "metal/abi/VerifyTree.h"
 
 // The LiLiCorr selector of Bolt's draft (metal/abi/LiLiCorr.h,
 // ops/LiLiCorr.cpp): everything around its projections, which ops::Linear
@@ -255,9 +256,15 @@ kernel void lilicorr_scores(device const bfloat *out_head [[buffer(0)]], device 
 // Copies params.x bf16 values of row params.y, or with counts row
 // counts[0] - 1, of `source` to row params.z of `destination`: a lane's
 // anchor context row.
-kernel void lilicorr_store_anchor(device const bfloat *source [[buffer(0)]], device const uint *counts [[buffer(1)]],
-                                  device bfloat *destination [[buffer(2)]], constant uint3 &params [[buffer(3)]],
+// params: hidden width, the source row (0xffffffff: lane params.w's deepest
+// accepted row, the highest bit of its path mask, from its first row of the
+// step), the destination row, the lane.
+kernel void lilicorr_store_anchor(device const bfloat *source [[buffer(0)]], device const uint *paths [[buffer(1)]],
+                                  device bfloat *destination [[buffer(2)]],
+                                  device const SplashLaneRows *lanes [[buffer(3)]],
+                                  constant uint4 &params [[buffer(4)]],
                                   uint d [[thread_position_in_grid]]) {
-  const uint row = params.y == 0xffffffffu ? counts[0] - 1 : params.y;
+  const uint row =
+      params.y == 0xffffffffu ? lanes[params.w].first + (31u - clz(paths[params.w])) : params.y;
   destination[ulong(params.z) * params.x + d] = source[ulong(row) * params.x + d];
 }

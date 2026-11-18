@@ -34,7 +34,8 @@
 // a slot for each routed expert that is not resident (in the first round),
 // never one of an expert the same load routes, and reads the native rows of
 // some of them into places of the store's staging, then a repack
-// (moe_expert_load) of those places into their slots. A decode step's load
+// (moe_expert_load) of those places into their slots. A load of at most 32
+// rows (a decode step's, or a prompt chunk's of so few rows)
 // is one round over every place; any other load stages half the places a
 // round, as many rounds as its rows may need, so that the other half is free
 // for the read-ahead below while the GPU repacks. A run of consecutive
@@ -47,10 +48,10 @@
 // Once a round has staged its experts, the next experts are read ahead while
 // the GPU runs, into the places the round left free, an expert at a time in
 // pieces of at most kAheadPieceBytes, most likely first: the load's experts
-// of its next round, or after a decode step's round the next block's experts
+// of its next round, or after a cycle's load's round the next block's experts
 // that are likely routed and not resident, those the next block's router
-// picks from this block's input (the rows change little from block to
-// block), by their summed routing weights. A long prefill chunk (rows * topK
+// picks from the rows this block's input routes (the rows change little from
+// block to block), by their summed routing weights. A long chunk (rows * topK
 // >= 3 * experts) routes nearly every expert of the next block: one more host
 // step after its last repack reads them ahead into the whole staging, while
 // the GPU runs this block's experts and the next block's mixing. The next
@@ -171,6 +172,10 @@ public:
   ExpertStore(const ExpertStore &) = delete;
   ExpertStore &operator=(const ExpertStore &) = delete;
 
+  // The most rows a decode step routes in one round of loads: a step of more
+  // rows stages its experts in a second round.
+  [[nodiscard]] static uint32_t cycleRows() noexcept;
+
   // Block `block`'s routed segments (the format and size of its size's
   // slots), chunks and slot table, which `weights` reads them through, and,
   // when its experts stream, the store, which loads them; the store keeps the
@@ -218,7 +223,7 @@ public:
   // it takes back logs a line.
   [[nodiscard]] metal::AllocationResult growTowardCap(const metal::AllocationAdmission &admit);
   // The bytes a store of these blocks allocates besides its chunks: its
-  // staging, slot tables, jobs and the decode prediction's buffers.
+  // staging, slot tables, jobs and a cycle's load's prediction buffers.
   [[nodiscard]] static uint64_t fixedBytes(const StreamedBlocks &blocks, ops::MoeShape shape);
   // The smallest store of these blocks (ExpertStoreOptions::memoryBytes and
   // floorBytes), which the constructor refuses a byte less than: its fixed

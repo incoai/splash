@@ -138,6 +138,8 @@ public:
   // beside completed, those beside transfers in flight, and those that freed less than their count where the runway
   // held less than an extent before, or where the runway's refill was refused and moved fewer pages.
   uint64_t extentReleases = 0, besideReleases = 0, inFlightReleases = 0, shortRunwayReleases = 0, refusedReleases = 0;
+  // Drains that found the tier holding copies of Slim pages.
+  uint64_t slimCopies = 0;
 
   // Every request ends, every transfer lands, and nothing leaks: the pool's
   // pages and the tier's slots belong to the cache's blocks alone.
@@ -149,6 +151,13 @@ public:
     const KvPoolSnapshot pool = pool_.snapshot();
     require(pool.pagesActive == 0 && budget_->committedBytes() == 0 && cache_.spillSnapshot().heldBytes == 0,
             "a finished run left pages held, quota committed or copies held");
+    // The quota counts what the cache's copies hold and no more: each KV
+    // copy what a slot of the page it was written from takes, a Slim page's
+    // less than a Full one's, and each state.
+    const CacheSnapshot held = cache_.snapshot();
+    require(budget_->usedBytes() == held.kvTier.diskBytes + held.stateCache.diskBytes,
+            "the quota counts other than what the cache's copies hold");
+    slimCopies += held.kvTier.diskBytes < uint64_t{held.kvTier.diskBlocks} * tier_.slotBytes(kv::PageForm::Full);
   }
 
   // Every request ends; the transfers in flight stay so.
@@ -459,8 +468,17 @@ private:
     // As the engine does, a state at a block another request published one
     // at is reused, and one is published only with a tail it restores from.
     if (const uint64_t block = cache_.blockAt(id, pages * KvCache::pageTokens);
-        chance(30) && !cache_.reuseStoredState(block) && cache_.stateTailFull(block))
-      cache_.publishCompositeState(block, std::make_shared<ShelvedState>(shelf_, false), peeks_ && chance(30));
+        chance(30) && !cache_.reuseStoredState(block) && cache_.stateTailFull(block)) {
+      const bool checkpoint = peeks_ && chance(30);
+      cache_.publishCompositeState(block, std::make_shared<ShelvedState>(shelf_, false), checkpoint);
+      // Half the checkpoints are replies' states, which a reply's decode
+      // captures, half of those kept, as its request's end keeps one.
+      if (checkpoint && chance(50)) {
+        cache_.markReply(cache_.checkpointState(block));
+        if (chance(50))
+          cache_.keepReply(cache_.checkpointState(block));
+      }
+    }
   }
 
   // The tier's transfers land, a few of them failing.
@@ -727,7 +745,7 @@ private:
 // Seeds 1..plainSeeds plain and 1..windowedSeeds windowed, plus windowed seed 9454 (a poisoned
 // block's write lands after its subtree left).
 void testRandomRuns(uint32_t plainSeeds, uint32_t windowedSeeds) {
-  uint64_t releases = 0, beside = 0, inFlight = 0, shortRunway = 0, refused = 0;
+  uint64_t releases = 0, beside = 0, inFlight = 0, shortRunway = 0, refused = 0, slimCopies = 0;
   const auto check = [&](uint32_t seed, bool windowed) {
     Run run(seed, windowed);
     try {
@@ -745,6 +763,7 @@ void testRandomRuns(uint32_t plainSeeds, uint32_t windowedSeeds) {
     inFlight += run.inFlightReleases;
     shortRunway += run.shortRunwayReleases;
     refused += run.refusedReleases;
+    slimCopies += run.slimCopies;
   };
   for (const bool windowed : {false, true})
     for (uint32_t seed = 1; seed <= (windowed ? windowedSeeds : plainSeeds); ++seed)
@@ -754,7 +773,8 @@ void testRandomRuns(uint32_t plainSeeds, uint32_t windowedSeeds) {
             << " windowed and windowed seed 9454; " << releases << " releases of whole extents, " << beside
             << " of them completed by free pages beside, " << inFlight << " beside transfers in flight; of all, "
             << shortRunway << " freed less than counted with the runway short of an extent and " << refused
-            << " with its refill refused\n";
+            << " with its refill refused; the quota counted what the copies held at every run's end, " << slimCopies
+            << " of them with copies of Slim pages\n";
 }
 
 // The same runs with random claims counted and taken (checkTake), again with requests using the states they resume

@@ -5,6 +5,7 @@
 #include "metal/abi/Sampling.h"
 #include "ops/BufferExtent.hpp"
 
+#include <algorithm>
 #include <stdexcept>
 
 namespace splash::ops {
@@ -36,6 +37,10 @@ std::vector<const Projection *> LiLiCorrWeights::projections() const {
   return result;
 }
 
+uint32_t LiLiCorr::maximumRows() noexcept {
+  return std::max<uint32_t>(kLanes * kNodes, kLanes * SPLASH_DRAFT_QUERY_ROWS);
+}
+
 std::vector<uint64_t> LiLiCorr::scratchBytes(uint32_t hidden) {
   const uint64_t nodes = storageRows(kLanes * kNodes), lanes = storageRows(kLanes);
   return {kLanes * kPositions * sizeof(float),
@@ -61,25 +66,33 @@ std::vector<uint64_t> LiLiCorr::scratchBytes(uint32_t hidden) {
 }
 
 void LiLiCorr::addStoreAnchor(metal::CommandGraph &graph, const metal::MetalBuffer &rows, uint32_t row,
-                              const metal::MetalBuffer &counts, const metal::MetalBuffer &anchor, uint32_t hidden,
-                              uint32_t anchorRow) {
+                              const metal::MetalBuffer &anchor, uint32_t hidden, uint32_t anchorRow) {
   if (!hidden || hidden % 256) throw std::invalid_argument("invalid LiLiCorr anchor width");
   requireBytes(anchor, (uint64_t{anchorRow} + 1) * hidden * kBf16, "LiLiCorr anchor");
-  if (!counts) requireBytes(rows, (uint64_t{row} + 1) * hidden * kBf16, "LiLiCorr anchor source");
-  const uint32_t params[3] = {hidden, counts ? 0xffffffffu : row, anchorRow};
-  graph.add("lilicorr_store_anchor", {rows, counts ? counts : rows, anchor}, params, {hidden / 256, 1, 1});
+  requireBytes(rows, (uint64_t{row} + 1) * hidden * kBf16, "LiLiCorr anchor source");
+  const uint32_t params[4] = {hidden, row, anchorRow, 0};
+  graph.add("lilicorr_store_anchor", {rows, rows, anchor, rows}, params, {hidden / 256, 1, 1});
+}
+
+void LiLiCorr::addStoreAcceptedAnchor(metal::CommandGraph &graph, const metal::MetalBuffer &rows,
+                                      const metal::MetalBuffer &paths, const metal::MetalBuffer &laneRows,
+                                      uint32_t lane, const metal::MetalBuffer &anchor, uint32_t hidden) {
+  if (!hidden || hidden % 256) throw std::invalid_argument("invalid LiLiCorr anchor width");
+  requireBytes(anchor, uint64_t{hidden} * kBf16, "LiLiCorr anchor");
+  const uint32_t params[4] = {hidden, 0xffffffffu, 0, lane};
+  graph.add("lilicorr_store_anchor", {rows, paths, anchor, laneRows}, params, {hidden / 256, 1, 1});
 }
 
 void LiLiCorr::add(metal::CommandGraph &graph, const Linear &linear, const DraftSelector &selector,
                    const DraftSelectorBuffers &buffers, const LiLiCorrWeights &w, const LiLiCorrScratch &s,
-                   const LiLiCorrInputs &inputs, std::span<const uint32_t> anchors,
-                   std::span<const SamplingPolicy> policies, uint32_t hidden, uint32_t vocabulary) {
-  const uint32_t lanes = static_cast<uint32_t>(anchors.size());
+                   const LiLiCorrInputs &inputs, DraftVocabulary vocabulary,
+                   std::span<const DraftTreeLane> treeLanes, uint32_t hidden) {
+  const uint32_t lanes = static_cast<uint32_t>(treeLanes.size());
   if (!lanes || lanes > kLanes || inputs.anchorRows.size() != lanes || !inputs.finalHidden ||
       w.layers.size() != SPLASH_LILICORR_LAYERS || !hidden || hidden % 256)
     throw std::invalid_argument("invalid LiLiCorr selector batch");
   const uint32_t positions = lanes * kPositions, nodes = lanes * kNodes;
-  selector.requireBuffers(buffers, anchors, policies);
+  const DraftSelectorBatch batch = selector.requireBuffers(buffers, vocabulary, treeLanes);
   // Every scratch buffer holds a full batch's rows (scratchBytes).
   const std::vector<uint64_t> bytes = scratchBytes(hidden);
   const metal::MetalBuffer *scratch[] = {&s.lse,        &s.ids,        &s.features,       &s.featureDown, &s.embedded,
@@ -90,12 +103,14 @@ void LiLiCorr::add(metal::CommandGraph &graph, const Linear &linear, const Draft
   for (const metal::MetalBuffer &row : inputs.anchorRows)
     requireBytes(row, uint64_t{hidden} * kBf16, "LiLiCorr anchor source");
   const auto project = [&](const metal::MetalBuffer &input, const Projection &p, const metal::MetalBuffer &output,
-                           uint32_t rows) { linear.addPrefill(graph, input, p, output, rows, s.linear); };
+                           uint32_t rows) {
+    linear.add(graph, {.input = input, .output = output, .scratch = s.linear}, p, linear.plan(p, rows));
+  };
 
   // Each position's sixteen best draft tokens, the first eight of them nodes
   // with their features.
-  selector.addTopCandidates(graph, buffers, lanes);
-  graph.add("lilicorr_lse", {buffers.logits, s.lse}, vocabulary, {positions, 1, 1}, {1024, 1, 1});
+  selector.addTopCandidates(graph, buffers, batch);
+  graph.add("lilicorr_lse", {buffers.logits, s.lse}, batch.params.columns, {positions, 1, 1}, {1024, 1, 1});
   graph.add("lilicorr_candidates",
             {buffers.partialIds, buffers.partialValues, buffers.candidates, buffers.unary, s.lse, s.ids,
              w.featureNormWeight, w.featureNormBias, w.featureUp, w.featureUpBias, s.features},
@@ -113,7 +128,7 @@ void LiLiCorr::add(metal::CommandGraph &graph, const Linear &linear, const Draft
 
   // The lanes' anchor states.
   for (uint32_t lane = 0; lane < lanes; ++lane)
-    addStoreAnchor(graph, inputs.anchorRows[lane], 0, {}, s.anchorInput, hidden, lane);
+    addStoreAnchor(graph, inputs.anchorRows[lane], 0, s.anchorInput, hidden, lane);
   project(s.anchorInput, w.contextProjection, s.anchorProjected, lanes);
   graph.add("lilicorr_anchor", {s.anchorProjected, w.contextBias, w.anchorNorm.buffer, s.anchorState, s.anchorRows},
             {lanes, 1, 1});
@@ -145,7 +160,7 @@ void LiLiCorr::add(metal::CommandGraph &graph, const Linear &linear, const Draft
              buffers.partialValues},
             lanes, {kPositions, lanes, 1});
 
-  selector.addWalk(graph, buffers, anchors, policies);
+  selector.addTree(graph, buffers, batch);
 }
 
 } // namespace splash::ops

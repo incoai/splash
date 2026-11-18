@@ -13,9 +13,10 @@ import SwiftUI
 ///   pose as a model becomes ready.
 ///
 /// What appears fades in within `settle`, a section or a row of a page once what makes room for it
-/// has moved, and what goes from a page goes at once (`comingAndGoing`); a row's words change in
-/// place, and one check shows at a time. Nothing slides in but the switch's pill, the sidebar and
-/// the drawer. While a reply streams, the page lets its text out over the frames that follow it
+/// has moved, and what goes from a page goes at once (`comingAndGoing`); what the composer holds
+/// comes and goes at once, and travels with it (`Composer`); a row's words change in place, and
+/// one check shows at a time. Nothing slides in but the switch's pill, the sidebar and the drawer.
+/// While a reply streams, the page lets its text out over the frames that follow it
 /// and eases toward the bottom after it, so that its lines slide in (page.js, `paced` and
 /// `follower`); nothing else loops then, as drawing shares the GPU with the model: the reply's
 /// counters change once a second without rolling, and the engine's figures, every 2 s, change in

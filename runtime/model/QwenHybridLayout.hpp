@@ -2,6 +2,7 @@
 
 #include "model/RopeScaling.hpp"
 #include "model/StateLayout.hpp"
+#include "ops/DraftSelector.hpp"
 #include "ops/MoE.hpp"
 #include "ops/PagedKv.hpp"
 #include "ops/StopTokens.hpp"
@@ -16,6 +17,17 @@
 namespace splash::model {
 
 enum class QwenFfnKind : uint8_t { Dense, SparseMoe };
+
+// The tokens a DFlash2 draft of the Qwen families' vocabulary of 248,320
+// proposes from while a step's text stays in them: its first 148,288 tokens,
+// those of English, code and Chinese (the rest of its scripts begin at
+// 148,275), and its last 320, its chat, tool and thinking tokens (248,044 to
+// 248,076); 59.8% of the vocabulary head's rows, whole 64-row tiles. Of the
+// tokens Qwen3.8-27B and Qwen3.6-35B-A3B committed decoding agents, code and
+// rewrites greedily, 99.98% lie in it; without its last tiles 1.0% would not,
+// the agents' tool calls and turn ends, and a replay of the 27B's agent
+// cycles puts what they would lose at 5.5% of their tokens.
+inline constexpr ops::DraftVocabulary kQwenDraftVocabulary{148'288, 248'000};
 
 // The dimensions and tokens of a Qwen hybrid target: GDN layers, every
 // fullAttentionPeriod-th layer an attention layer instead (every layer with
@@ -79,6 +91,12 @@ struct QwenTargetDimensions {
   uint32_t firstDraftMaskToken = 0;
   uint32_t lastDraftMaskToken = 0;
   ops::StopTokens stopTokens{};
+  // The tokens its DFlash2 drafts propose from while a step's text stays in
+  // them (DFlashDraft::vocabulary): the Qwen families' kQwenDraftVocabulary;
+  // the whole vocabulary for a family whose vocabulary keeps no such block
+  // (Flint's mixes its scripts through all its tokens: its first 98,304 hold
+  // 98.1% of English text's tokens and 88.5% of Russian text's).
+  ops::DraftVocabulary draftVocabulary{};
   QwenFfnKind ffnKind = QwenFfnKind::Dense;
   // The dense FFN's width.
   uint32_t intermediateSize = 0;

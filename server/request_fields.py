@@ -8,6 +8,23 @@ from .errors import APIError
 # The priority a request names, by its lowercase wire name.
 _PRIORITIES = {priority.name.lower(): priority for priority in wire.RequestPriority}
 
+# The fields every generation API takes under Chat's names, as Chat takes
+# them: how a request samples (the frame's sampling fields, logit_bias, which
+# Splash does not implement and refuses unless empty, ignore_eos and seed),
+# and how it is scheduled and shares cache. A dialect hands Chat each one a
+# request sends, whether its own API defines it or not, so that Chat's
+# validation refuses a bad value with the same 400 on every route and no
+# route drops one: Anthropic defines 3 of the 7 sampling fields, and Messages
+# dropped the other 4, penalties some clients can set nowhere else.
+CHAT_GENERATION_FIELDS = (
+    *wire.SAMPLING_FIELDS,
+    "logit_bias",
+    "ignore_eos",
+    "seed",
+    "priority",
+    "cache_salt",
+)
+
 
 def generation(body):
     """Whether a generation request streams its answer, and the request flags

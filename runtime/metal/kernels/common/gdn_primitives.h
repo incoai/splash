@@ -3,40 +3,70 @@
 #include "metal/abi/KernelABI.h"
 #include "metal/kernels/common/activation.h"
 #include "metal/kernels/common/rms_inverse.h"
+#include "metal/kernels/common/verify_tree.h"
 
 // The convolution inputs before a command's first row: the rows a state
 // cell carries, or after `consumed` rows (in `rows`) the last of those rows
-// and the carried ones: at(r, c) is row r of the carried state the rows
-// leave.
+// and the carried ones: row r of the carried state the rows leave, at(r, c)
+// its channel c. The consumed rows are the first of `rows`, or, given a path
+// (a decode step's pending path, a row mask of its previous step's tape),
+// the rows the path holds in its order.
 struct GdnConvHistory {
-  device const bfloat *carried;
-  device const bfloat *rows;
-  uint conv_dim;
-  uint rows_width;
-  uint consumed;
+  device const bfloat *row_of[SPLASH_GDN_CONVOLUTION_TAPS - 1];
 
-  bfloat at(uint row, uint channel) const {
-    constexpr uint Carried = SPLASH_GDN_CONVOLUTION_TAPS - 1;
-    const uint source = consumed + row;
-    return source < Carried ? carried[source * conv_dim + channel]
-                            : rows[(source - Carried) * rows_width + channel];
-  }
+  bfloat at(uint row, uint channel) const { return row_of[row][channel]; }
 };
 
-// Causal convolution of one channel at one token of the command, reading the
-// preceding tokens from the history, rounded to bf16 and gated by SiLU.
-inline bfloat gdn_conv_silu(device const bfloat *packed, GdnConvHistory history,
-                            device const bfloat *conv_weights,
-                            uint packed_width, uint token, uint channel) {
-  constexpr uint Taps = SPLASH_GDN_CONVOLUTION_TAPS, Carried = Taps - 1;
-  float value = 0.0f;
-  for (uint tap = 0; tap < Taps; ++tap) {
-    uint position = token + tap;
-    bfloat input = position < Carried
-                       ? history.at(position, channel)
-                       : packed[(position - Carried) * packed_width + channel];
-    value += float(input) * float(conv_weights[channel * Taps + tap]);
+inline GdnConvHistory gdn_conv_history(device const bfloat *carried, device const bfloat *rows, uint conv_dim,
+                                       uint rows_width, uint consumed, uint path = 0) {
+  constexpr uint Carried = SPLASH_GDN_CONVOLUTION_TAPS - 1;
+  GdnConvHistory history;
+  for (uint row = 0; row < Carried; ++row) {
+    const uint source = consumed + row;
+    const uint index = source - Carried;
+    history.row_of[row] = source < Carried ? carried + source * conv_dim
+                                           : rows + (path ? splash_path_row(path, index) : index) * rows_width;
   }
+  return history;
+}
+
+// The rows of a token's convolution inputs, at its taps' positions: the
+// token at `depth` of a path, its own row and its predecessors' of the
+// command at rows path_rows[tap] (tap position depth + tap, the token's own
+// the last), the path's tokens before the command's rows from the history.
+struct GdnConvTaps {
+  device const bfloat *row_of[SPLASH_GDN_CONVOLUTION_TAPS];
+};
+
+inline GdnConvTaps gdn_conv_taps(device const bfloat *packed, uint packed_width, GdnConvHistory history, uint depth,
+                                 thread const uint (&path_rows)[SPLASH_GDN_CONVOLUTION_TAPS]) {
+  constexpr uint Taps = SPLASH_GDN_CONVOLUTION_TAPS, Carried = Taps - 1;
+  GdnConvTaps taps;
+  for (uint tap = 0; tap < Taps; ++tap) {
+    const uint position = depth + tap;
+    taps.row_of[tap] = position < Carried ? history.row_of[position] : packed + path_rows[tap] * packed_width;
+  }
+  return taps;
+}
+
+// The same for a token of the command's rows in order, the path of a
+// prompt's rows.
+inline GdnConvTaps gdn_conv_taps(device const bfloat *packed, uint packed_width, GdnConvHistory history,
+                                 uint token) {
+  constexpr uint Taps = SPLASH_GDN_CONVOLUTION_TAPS, Carried = Taps - 1;
+  uint rows[Taps];
+  for (uint tap = 0; tap < Taps; ++tap)
+    rows[tap] = token + tap - Carried;
+  return gdn_conv_taps(packed, packed_width, history, token, rows);
+}
+
+// Causal convolution of one channel over a token's taps, rounded to bf16 and
+// gated by SiLU.
+inline bfloat gdn_conv_silu(GdnConvTaps taps, device const bfloat *conv_weights, uint channel) {
+  constexpr uint Taps = SPLASH_GDN_CONVOLUTION_TAPS;
+  float value = 0.0f;
+  for (uint tap = 0; tap < Taps; ++tap)
+    value += float(taps.row_of[tap][channel]) * float(conv_weights[channel * Taps + tap]);
   value = float(bfloat(value));
   return bfloat(splash_silu(value));
 }

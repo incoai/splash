@@ -100,13 +100,12 @@ inline void gguf_prefill_tile(device bfloat *input, device uchar *w0, device uch
 constant constexpr uint kPrefillStages = 2 * GGUF_TILE_COLUMNS * GGUF_PREFILL_STEP;
 
 // ---------------- decode dispatches over (64-column tiles, K partitions): two simdgroups of 32 columns per
-// threadgroup, every request lane in its tile, `splits` partitions of K (grid.y; kernels/common/split_reduce.h).
-// MPP computes 16-row fragments, so a tile holds 8, 16 or 32 rows, or 64 for a prefill chunk of 33 to 64 rows on
-// Apple10 and on Apple9 GPUs of 10 cores or fewer (these kernels and the fused ones): a 3-lane step
-// runs the 32-row tile over the storage of four lanes, and a 1-lane step may run the 16-row tile over two
-// (LinearPlan::storageRows); the padding lane's rows are computed and discarded. Rows are independent, so every active
-// row is the bits of any other tile height (gguf-projection checks it); the 32-row tile at three lanes costs what it
-// costs at four, 3-15% less than a 16-row plus an 8-row matmul per stage.
+// threadgroup, every row of the plan in its tile, `splits` partitions of K (grid.y; kernels/common/split_reduce.h).
+// MPP computes 16-row fragments, so a tile holds 8, 16, 32, 48 or 64 rows, the fewest that hold the plan's (these
+// kernels and the fused ones): 24 rows run the 32-row tile, 33 to 48 the 48-row tile, 49 to 64 the 64-row tile, and a
+// plan of at most 8 may run the 16-row tile (LinearPlan::storageRows); the padding rows are computed and discarded.
+// Rows are independent, so every active row is the bits of any other tile height (gguf-projection checks it); the
+// 32-row tile at 24 rows costs what it costs at 32, 3-15% less than a 16-row plus an 8-row matmul per stage.
 // Gate/up runs as a gate pass (a) into the gate scratch and an up pass (g) whose epilogue applies silu(gate) to the bf16
 // up value, as the Apple9 register kernels do. The destination's type Out is bf16, or fp32 for the plain epilogue's
 // logits (a_f32, ops::Projection::destination). Each column tile walks its partition from the step staged_first_step
@@ -150,22 +149,21 @@ using GgufDecodeKernel = void(device bfloat *, device uchar *, device uchar *, d
                               constant GgufDecodeParams &, uint2, uint, uint);
 #define GGUF_DECODE(F, f, R, ep, Ep, Out) \
   template [[host_name("gguf_decode_" #f "_m" #R "_" #ep)]] kernel GgufDecodeKernel<Out> gguf_decode<F, R, Ep, Out>;
-#define GGUF_DECODE_ROWS(F, f, ep, Ep, Out) \
-  GGUF_DECODE(F, f, 8, ep, Ep, Out) GGUF_DECODE(F, f, 16, ep, Ep, Out) GGUF_DECODE(F, f, 32, ep, Ep, Out)
-// Prefill chunks of 33 to 64 rows run the 64-row tile (ops::Linear), whose bf16 epilogues prefill takes.
-#define GGUF_DECODE_ROWS64(F, f, ep, Ep) GGUF_DECODE_ROWS(F, f, ep, Ep, bfloat) GGUF_DECODE(F, f, 64, ep, Ep, bfloat)
+#define GGUF_DECODE_ROWS(F, f, ep, Ep, Out)                                                                     \
+  GGUF_DECODE(F, f, 8, ep, Ep, Out) GGUF_DECODE(F, f, 16, ep, Ep, Out) GGUF_DECODE(F, f, 32, ep, Ep, Out)       \
+  GGUF_DECODE(F, f, 48, ep, Ep, Out) GGUF_DECODE(F, f, 64, ep, Ep, Out)
 #define GGUF_DECODE_FORMAT(F, f)                                                                                  \
-  GGUF_DECODE_ROWS64(F, f, a, EpNone) GGUF_DECODE_ROWS(F, f, a_f32, EpNone, float)                                \
-  GGUF_DECODE_ROWS64(F, f, r, EpResidual) GGUF_DECODE_ROWS64(F, f, g, EpUpWithGate)
+  GGUF_DECODE_ROWS(F, f, a, EpNone, bfloat) GGUF_DECODE_ROWS(F, f, a_f32, EpNone, float)                          \
+  GGUF_DECODE_ROWS(F, f, r, EpResidual, bfloat) GGUF_DECODE_ROWS(F, f, g, EpUpWithGate, bfloat)
 QUANT_FORMATS(GGUF_DECODE_FORMAT)
 #undef GGUF_DECODE_FORMAT
-#undef GGUF_DECODE_ROWS64
 #undef GGUF_DECODE_ROWS
 #undef GGUF_DECODE
 
 // Gate/up in one dispatch, where gate and up share their format (ops::Linear, LinearConfig::oneGateUpPass): grid
 // (32-column tiles, K partitions), threadgroups of one simdgroup that stages the gate's and the up's same 32 columns
-// (gguf_staged_pair_steps), so the per-step latency of a tile's chain serves both tensors. Each walks from the step its
+// (gguf_staged_pair_steps), so the per-step latency of a tile's chain serves both tensors. Its simdgroup holds both
+// tensors' sums of every row, so the pair holds up to 32 rows (kMaximumPairRows); 64 run two passes. Each walks from the step its
 // 64-column tile walks from in the two passes, so at the same K split gate and up are the bits of the gate pass's and
 // of the up pass's sums, and the output is bf16(up) * silu(bf16(gate)) as the up pass writes it (gguf_store_gate_up).
 template <class F, ushort Rows>
@@ -260,8 +258,7 @@ struct fused_formats {
                        p.out_stride, column0, simd_group * 32 + simd_lane, &arrival,                              \
                        [&](uint row, uint column, float v) { output[ulong(row) * p.out_stride + column0 + column] = bfloat(v); }); \
   }
-// The 64-row instance runs fused prefill chunks of 33 to 64 rows (ops::Linear).
-GGUF_DECODE_FUSED(8) GGUF_DECODE_FUSED(16) GGUF_DECODE_FUSED(32) GGUF_DECODE_FUSED(64)
+GGUF_DECODE_FUSED(8) GGUF_DECODE_FUSED(16) GGUF_DECODE_FUSED(32) GGUF_DECODE_FUSED(48) GGUF_DECODE_FUSED(64)
 #undef GGUF_DECODE_FUSED
 
 // The prefill kernels: grid (GGUF_PREFILL_ROWS-row tiles of the chunk, column tiles), four simdgroups; the residual
@@ -342,8 +339,9 @@ QUANT_FORMATS(GGUF_PREFILL_LEADING_INPUTS)
 // column's 32 two-bit codes q as int8 q - 1 in {-1, 0, 1, 2} in the order of the int8 rows
 // (gguf_decode_int8_position), and one int8 matmul2d accumulates in int32 over a block's steps (|acc| <= 2 * 128 * 127
 // for PQ2_0's 128 inputs, exact); the block's last step folds it into the fp32 sums as acc * d * s, so a tile walks
-// from its block's first step. The tiles hold 16 or 32 rows (one lane on the 16-row tile), the 8-row int8 matmul
-// taking longer than the 16-row one.
+// from its block's first step. The tiles hold 16 or 32 rows (a plan of at most 8 on the 16-row tile), the 8-row int8
+// matmul taking longer than the 16-row one. At 64 rows a simdgroup's int32 and fp32 sums of every row spill: Bonsai's
+// GDN input took 1.12 ms on such a tile against 0.60 on the bf16 64-row tile and 0.21 on the int8 32-row tile (M6).
 
 // Stages `step` of `column` as int8: its 32 codes q as q - 1 ((q + 0x7F) ^ 0x80 a byte: bytes 0x7F..0x82 before the
 // xor, no carries) at the lane's 32 bytes of `stage`, and at a block's last step the block's d at d[lane], before the

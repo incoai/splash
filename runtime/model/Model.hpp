@@ -1,6 +1,7 @@
 #pragma once
 
 #include "metal/abi/ExecutionGeometry.h"
+#include "ops/LaneRows.hpp"
 #include "ops/PagedKv.hpp"
 #include "ops/Vision.hpp"
 #include "model/CommandCost.hpp"
@@ -409,9 +410,9 @@ struct StateAdmission final {
   [[nodiscard]] bool granted() const noexcept { return lane.has_value(); }
 };
 
-// The buffers of one cached state, taken for a state boundary that a prefill
-// command reaches (Model::reserveState). The command's completion seals them
-// into the state of that boundary; whatever it still holds goes back to the
+// The buffers of one cached state, taken for a state boundary that a command
+// reaches (Model::reserveState). The command's completion seals them into
+// the state of that boundary; whatever it still holds goes back to the
 // model's pool when the last handle goes, which the command's ticket keeps
 // until the GPU is done with them.
 class StateReservation {
@@ -419,10 +420,13 @@ public:
   virtual ~StateReservation() = default;
 };
 
-// A state a prefill command captures: the request's composite state after
-// `tokens` prompt tokens, in `reservation`'s buffers. The command writes the
-// state of a boundary inside it as a command ending there would store it, and
-// its completion copies the state of a boundary at its end.
+// A state a command captures: the request's composite state after `tokens`
+// tokens, in `reservation`'s buffers. A prefill command writes the state of
+// a boundary inside it as a command ending there would store it, and its
+// completion copies the state of a boundary at its end. A decode cycle
+// folds the rows it retained before the boundary into the state before
+// them, as the lane's next cycle would, and its completion seals the state
+// only if the lane retained them.
 struct StateCapture final {
   uint32_t tokens = 0;
   std::shared_ptr<StateReservation> reservation;
@@ -445,7 +449,9 @@ struct ModelBatchItem final {
   std::span<const uint32_t> inputTokens{};
   // A prefill chunk's states to capture, ascending: page-aligned boundaries in
   // (logicalPosition, logicalPosition + tokenCount], each one where the
-  // request's draft context plan leaves a whole draft window.
+  // request's draft context plan leaves a whole draft window. A decode
+  // cycle's: at most one, the page boundary past logicalPosition that the
+  // rows the lane may retain reach (Model::capturesInDecode).
   std::vector<StateCapture> stateCaptures{};
 };
 
@@ -469,7 +475,8 @@ struct ModelStepResult final {
   // requested order. Empty for generation and for cancelled/failed scoring.
   std::vector<float> scoreLogits{};
   // The states of the chunk's stateCaptures, in order, when the chunk
-  // commits; empty when it does not.
+  // commits; empty when it does not. A decode cycle's, only when the lane
+  // retained the rows before its boundary.
   std::vector<std::shared_ptr<const CompositeState>> capturedStates{};
   // Set when the model computed an unusable result for this lane alone: a
   // prefill chunk whose last row is not finite, a non-finite score logit or
@@ -497,9 +504,18 @@ struct ModelStepResult final {
   bool operator==(const ModelStepResult &) const = default;
 };
 
+// The parent of a mask request's first simulation token, its tree's root.
+inline constexpr uint32_t kNoMaskParent = UINT32_MAX;
+
+// The tokens whose grammar masks a request needs: none for its first token,
+// whose one mask is its grammar's state; for a decode cycle, its verify rows
+// as a tree, each token with its parent's index (kNoMaskParent for the
+// anchor), whose masks are the one before the anchor and one after each
+// token's path.
 struct ModelMaskRequest final {
   uint64_t requestId = 0;
   std::vector<uint32_t> simulationTokens;
+  std::vector<uint32_t> parents;
 };
 
 class ModelBatchTicket {
@@ -540,14 +556,20 @@ struct SparseKvShape final {
   uint32_t verifyRows = 0;
   uint32_t denseHistoryTokens = 0;
 
-  // The hot block cache of spilled K/V (KvBlockCache) in slots a layer: one
-  // decoding lane's rows select at most laneSlots(), and while `lanes` lanes
-  // decode over Index pages it holds requiredSlots(lanes), one lane's more
-  // than they select, so that two lanes' selections do not thrash it; for
-  // one lane, the size past which more slots save few reads.
+  // The hot block cache of spilled K/V (KvBlockCache) in slots a layer. One
+  // decoding lane's rows select at most laneSlots() blocks, each of which a
+  // resolve must place (KvBlockCache::addResolve throws past the free
+  // slots), so while `lanes` lanes decode over Index pages it holds
+  // requiredSlots(lanes): every lane's laneSlots(), and kSpareRows rows'
+  // blocks more, which keep the lanes' selections from evicting each
+  // other's. Eight rows' 4,096 slots on Qwen3.8-Flash-Next hold a whole
+  // step's: over prompts of 16K to 64K tokens, every lane, attention layer
+  // and cycle, a lane's selections took at most 2,631 slots at 8 rows and
+  // 3,794 at 16, of the 8,192 its 16 rows may select.
+  static constexpr uint32_t kSpareRows = 8;
   [[nodiscard]] constexpr uint64_t laneSlots() const noexcept { return uint64_t{verifyRows} * selectedBlocks; }
   [[nodiscard]] constexpr uint64_t requiredSlots(uint32_t lanes) const noexcept {
-    return lanes ? (uint64_t{lanes} + 1) * laneSlots() : 0;
+    return lanes ? uint64_t{lanes} * laneSlots() + uint64_t{kSpareRows} * selectedBlocks : 0;
   }
   bool operator==(const SparseKvShape &) const = default;
 };
@@ -647,6 +669,22 @@ maskWordsPerToken(uint32_t vocabularySize) noexcept {
   return static_cast<uint32_t>((uint64_t{vocabularySize} + 31) / 32);
 }
 
+// The tokens a mask's grammar forces after mask row `row`'s path, from the
+// pairs of a row and a token that came with it (Model::provideMask), past
+// `selection`, which begins them; none where the row forces nothing or the
+// selection is another token.
+[[nodiscard]] inline std::vector<uint32_t> forcedAfter(std::span<const uint32_t> forced, uint32_t row,
+                                                       uint32_t selection) {
+  std::vector<uint32_t> tokens;
+  for (size_t at = 0; at + 1 < forced.size(); at += 2)
+    if (forced[at] == row)
+      tokens.push_back(forced[at + 1]);
+  if (tokens.empty() || tokens.front() != selection)
+    return {};
+  tokens.erase(tokens.begin());
+  return tokens;
+}
+
 // Compile-time ceiling of the one native DFlash execution contract: the
 // kernels' ABI values (metal/abi/ExecutionGeometry.h) under the runtime's
 // names, and limits of the runtime's own. A draft must have been trained for
@@ -671,6 +709,7 @@ struct ExecutionLimits final {
       (prefillTokenBudget + kv::kPageTokens - 1) / kv::kPageTokens;
   static constexpr uint32_t draftQueryRows = SPLASH_DRAFT_QUERY_ROWS;
   static constexpr uint32_t draftProposalTokens = SPLASH_DRAFT_PROPOSAL_TOKENS;
+  // The most rows of a lane's verify block, which every target kernel takes.
   static constexpr uint32_t targetVerifyRows = SPLASH_TARGET_VERIFY_ROWS;
   static constexpr uint32_t draftContextTokens = SPLASH_DRAFT_SLIDING_WINDOW;
   // The most target layers a DFlash2 draft reads (its target_layer_ids).
@@ -687,8 +726,7 @@ struct ExecutionLimits final {
 
 static_assert(ExecutionLimits::draftQueryRows ==
               ExecutionLimits::draftProposalTokens + 1);
-static_assert(ExecutionLimits::targetVerifyRows ==
-              ExecutionLimits::draftQueryRows);
+static_assert(ExecutionLimits::draftQueryRows <= ExecutionLimits::targetVerifyRows);
 
 // The first rule a command breaks, or none: at most maximumBatchWidth
 // lanes; and for a prefill, pass `pass` of at most maximumPasses passes,
@@ -749,6 +787,10 @@ struct ModelMemoryPlan final {
 // overhead. Startup counts them before a model loads.
 inline constexpr uint64_t kPipelineReserveBytes = 256ULL << 20;
 inline constexpr uint64_t kRuntimeOverheadReserveBytes = 512ULL << 20;
+// What a resident request's lookup index (LookupIndex) holds on the host a
+// token: 84 bytes on a traced 128K-token prompt, 89 on a 100K one. The plan
+// counts it with the tokens of the KV pages it prices.
+inline constexpr uint64_t kLookupIndexTokenBytes = 89;
 
 struct ModelMemoryActual final {
   uint64_t stateActualAllocatedBytes = 0;
@@ -761,9 +803,10 @@ struct ModelMemoryActual final {
 
 struct ModelTelemetry final {
   uint64_t stateAllocatedBytes = 0;
-  // Pooled state buffers no lane holds: GDN parity cells, draft rings and
-  // context windows.
+  // Pooled state buffers no lane holds: GDN parity cells, the cached cells
+  // states take, draft rings and context windows.
   uint32_t idleGdnCells = 0;
+  uint32_t idleCachedCells = 0;
   uint32_t idleDraftRings = 0;
   uint32_t idleContextWindows = 0;
   uint64_t targetPrefillRows = 0;
@@ -791,8 +834,9 @@ struct ModelTelemetry final {
   // Prefill chunks the GPU ran again alone once the Neural Engine split's
   // work for them failed (Runtime::prefillAsync).
   uint64_t aneFfnReruns = 0;
-  // Whether decode cycles verify the rows the verify budget chooses
-  // (budgetsVerifyRows) rather than every row.
+  // Whether decode cycles' rows follow the step costs and the verify
+  // budget's acceptance (--verify-rows auto): the rows of the steps they
+  // choose, rather than every row of a draft's block a lane.
   bool verifyBudget = false;
   double lastConstrainedTargetForwardGpuSeconds = 0.0;
   double totalConstrainedTargetForwardGpuSeconds = 0.0;
@@ -860,12 +904,16 @@ public:
   submit(const BatchPlan &plan, std::span<const ModelBatchItem> items,
          std::function<void()> completion) = 0;
   // Takes the buffers of one cached state for the request's state boundary
-  // at `tokens`, which the prefill command reaching it fills
+  // at `tokens`, which the command reaching it fills
   // (ModelBatchItem::stateCaptures): from the pool, or one admission for
   // what the pool lacks. Null when the governor refuses, which sets
   // `refusal` to the cause; the caller may release a cached state and retry.
   [[nodiscard]] virtual std::shared_ptr<StateReservation>
   reserveState(uint64_t requestId, uint32_t tokens, metal::AllocationFailure &refusal) = 0;
+  // Whether a decode cycle captures the state of the page its retained rows
+  // reach (ModelBatchItem::stateCaptures), which keeps its lanes' draft
+  // context windows current for those states to take.
+  [[nodiscard]] virtual bool capturesInDecode() const noexcept { return false; }
   // Copies the request's committed state at its current page-aligned
   // boundary into the buffers of a cached state, taken as reserveState()
   // takes them: the state of a boundary its prefill command ended at without
@@ -915,8 +963,9 @@ public:
   [[nodiscard]] virtual std::optional<uint32_t> statesToActivate() const noexcept { return 0; }
   // The bytes releaseIdleBuffer(keepLane), called until it gives none,
   // releases once the cache has let go of `evictedStates` more cached states,
-  // whose buffers return to the pool: the pooled buffers, beyond those one
-  // lane starts from with keepLane, at the sizes their layout declares,
+  // whose buffers return to the pool: the pooled buffers, beyond those the
+  // next lane starts from with keepLane (none beside a lane in service, whose
+  // own it takes once that ends), at the sizes their layout declares,
   // which no allocation falls short of. With `afterStart`, of the pool a
   // lane's start leaves (startStateBytes): the evicted states refill the
   // buffers it took from it before any of theirs frees memory. Zero where
@@ -950,16 +999,18 @@ public:
     work.layerAttentionPairs = work.attentionPairs;
     return work;
   }
-  // Releases one pooled state buffer no lane holds (keepLane keeps those one
-  // lane starts from) and returns its bytes; zero when none is idle. One
+  // Releases one pooled state buffer no lane holds (keepLane keeps those the
+  // next lane starts from) and returns its bytes; zero when none is idle. One
   // buffer a call, so a denied allocation that retries between calls frees
   // only what it needs. The model's other idle memory goes through pools().
   [[nodiscard]] virtual uint64_t releaseIdleBuffer(bool keepLane) noexcept = 0;
   // The model's elastic memories, stable for its lifetime; none by default.
   [[nodiscard]] virtual std::span<ElasticPool *const> pools() noexcept { return {}; }
-  // Why this request's mask is unusable, or nothing when the model took it.
+  // Why this request's mask is unusable, or nothing when the model took it:
+  // its rows' words, and pairs of a mask row and a token its grammar forces
+  // after the row's path, the rows ascending and each row's tokens in order.
   [[nodiscard]] virtual std::optional<std::string>
-  provideMask(uint64_t requestId, std::span<const uint32_t> words) = 0;
+  provideMask(uint64_t requestId, std::span<const uint32_t> words, std::span<const uint32_t> forced) = 0;
   virtual void end(uint64_t requestId) = 0;
 };
 

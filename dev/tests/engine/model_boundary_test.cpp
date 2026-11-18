@@ -1,6 +1,7 @@
 // The rules every command keeps (model::commandViolation), the attention
-// pairs a command's rows compute (model::attentionPairs) and the work a model
-// reports by default (Model::prefillWork).
+// pairs a command's rows compute (model::attentionPairs), the work a model
+// reports by default (Model::prefillWork) and the tokens a mask's grammar
+// forces after a row (model::forcedAfter).
 
 #include "TestChecks.hpp"
 #include "model/Model.hpp"
@@ -249,7 +250,9 @@ public:
   }
   std::shared_ptr<const CompositeState> snapshot(uint64_t) override { return {}; }
   uint64_t releaseIdleBuffer(bool) noexcept override { return 0; }
-  std::optional<std::string> provideMask(uint64_t, std::span<const uint32_t>) override { return {}; }
+  std::optional<std::string> provideMask(uint64_t, std::span<const uint32_t>, std::span<const uint32_t>) override {
+    return {};
+  }
   void end(uint64_t) override {}
 };
 
@@ -272,6 +275,20 @@ void testTheDefaultLayerPairsIgnoreThePass() {
   }
 }
 
+// The tokens a mask's grammar forces after a row's path are its pairs'
+// tokens in order, past the selection that begins them: none where another
+// token was selected, where the row forces nothing, or where it forces the
+// selection alone.
+void testForcedTokensFollowTheSelectionThatBeginsThem() {
+  const std::vector<uint32_t> forced{0, 7, 2, 40, 2, 41, 2, 42, 3, 50};
+  require(model::forcedAfter(forced, 2, 40) == std::vector<uint32_t>{41, 42},
+          "a row's forced tokens past its selection are not its pairs' in order");
+  require(model::forcedAfter(forced, 2, 41).empty(), "a selection the row's tokens do not begin with kept them");
+  require(model::forcedAfter(forced, 1, 40).empty(), "a row that forces nothing kept another row's tokens");
+  require(model::forcedAfter(forced, 0, 7).empty(), "a row that forces its selection alone kept a token");
+  require(model::forcedAfter({}, 0, 7).empty(), "a mask without forced tokens kept a token");
+}
+
 } // namespace
 
 int main() {
@@ -290,6 +307,7 @@ int main() {
     testAWindowedLayerSaturatesAtItsWindow();
     testABlockSparseLayerSaturatesAtTheSelectionAndTail();
     testTheDefaultLayerPairsIgnoreThePass();
+    testForcedTokensFollowTheSelectionThatBeginsThem();
     std::cout << "model boundary tests passed\n";
     return EXIT_SUCCESS;
   } catch (const std::exception &error) {

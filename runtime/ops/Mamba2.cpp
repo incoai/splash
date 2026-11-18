@@ -56,31 +56,35 @@ uint64_t mamba2TapeLayerBytes(const Mamba2Shape &shape) {
 void Mamba2::addDecode(metal::CommandGraph &graph, metal::MetalBuffer packed, const Mamba2Weights &weights,
                        std::span<const metal::MetalBuffer> currentStates,
                        std::span<const metal::MetalBuffer> nextStates, metal::MetalBuffer tape,
-                       std::span<const GdnTapeLane> tapeLanes, metal::MetalBuffer y, Mamba2Shape shape,
-                       uint32_t layer, GdnStateStrides state) {
+                       std::span<const GdnTapeLane> tapeLanes, metal::MetalBuffer laneRows, uint32_t rows,
+                       metal::MetalBuffer y, Mamba2Shape shape, uint32_t layer, GdnStateStrides state) {
   const std::string_view suffix = suffixOf(shape);
   const auto lanes = uint32_t(tapeLanes.size());
   if (!lanes || lanes > SPLASH_MAXIMUM_BATCH_WIDTH) throw std::invalid_argument("invalid Mamba-2 decode batch width");
   if (!state.valid() || state.format != GdnStateFormat::Float32)
     throw std::invalid_argument("Mamba-2 keeps its state in fp32");
   requireWeights(weights, shape);
-  const uint64_t rows = uint64_t{lanes} * kRows;
-  requireBytes(packed, rows * shape.packedWidth() * 2, "Mamba-2 packed rows");
-  requireBytes(y, rows * shape.innerSize() * 4, "Mamba-2 gated rows");
+  if (rows < lanes || rows > uint64_t{lanes} * kRows) throw std::invalid_argument("invalid Mamba-2 decode rows");
+  requireBytes(packed, uint64_t{rows} * shape.packedWidth() * 2, "Mamba-2 packed rows");
+  requireBytes(y, uint64_t{rows} * shape.innerSize() * 4, "Mamba-2 gated rows");
+  requireBytes(laneRows, uint64_t{lanes} * sizeof(SplashLaneRows), "Mamba-2 lane rows");
   const uint64_t tapeBytes = mamba2TapeLayerBytes(shape);
   GDNDecodeBatchParams params{0, layer, state.convolutionLayerBytes, state.recurrentLayerBytes,
                               state.convolutionStateBytes, {}, {}, {}};
   for (uint32_t lane = 0; lane < lanes; ++lane) {
     const GdnTapeLane &t = tapeLanes[lane];
-    if (t.pendingRows > kRows) throw std::invalid_argument("invalid Mamba-2 decode tape");
+    // The scan folds a chain's rows: a path of the previous step's first rows.
+    if (t.pendingPath & (t.pendingPath + 1) || t.pendingPath >> kRows)
+      throw std::invalid_argument("Mamba-2 folds a chain's rows alone");
     params.pending_tape[lane] = t.pendingSlot + layer * tapeBytes;
     params.step_tape[lane] = t.stepSlot + layer * tapeBytes;
-    params.pending_rows[lane] = t.pendingRows;
+    params.pending_path[lane] = t.pendingPath;
     requireBytes(tape, std::max(params.pending_tape[lane], params.step_tape[lane]) + tapeBytes, "Mamba-2 tape");
   }
   std::vector<metal::MetalBuffer> bindings{std::move(packed), weights.convolution, weights.convolutionBias};
   appendLaneBindings(bindings, currentStates, nextStates);
-  bindings.insert(bindings.end(), {std::move(tape), weights.a, weights.dtBias, weights.d, std::move(y)});
+  bindings.insert(bindings.end(),
+                  {std::move(tape), weights.a, weights.dtBias, weights.d, std::move(y), std::move(laneRows)});
   graph.add("verify_mamba2" + std::string(suffix), std::move(bindings), params, {shape.heads, lanes, 1});
 }
 
@@ -103,7 +107,7 @@ void Mamba2::addPrefillStep(metal::CommandGraph &graph, metal::MetalBuffer packe
   GDNDecodeBatchParams params{};
   params.pending_tape[0] = pendingTape;
   params.step_tape[0] = stepTape;
-  params.pending_rows[0] = pendingRows;
+  params.pending_path[0] = (1u << pendingRows) - 1u;
   graph.add("prefill_mamba2" + std::string(suffix),
             {std::move(packed), weights.convolution, weights.convolutionBias, states.convolutionIn,
              states.recurrentIn, states.convolutionOut, states.recurrentOut, std::move(tape), weights.a,

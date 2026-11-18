@@ -73,16 +73,19 @@ MoeWorkspace workspaceFor(MoeShape shape, uint32_t rows, uint32_t tileRows) {
     throw std::invalid_argument("invalid MoE workspace shape");
   const uint64_t routes = uint64_t{rows} * shape.routesPerToken();
   const uint32_t tiles = moeMaximumTiles(rows, shape, tileRows);
-  const uint64_t groupedRows = uint64_t{tiles} * tileRows;
+  // A grouped row per route; the grouped input and the intermediate, which
+  // the passes' matmuls read, hold tileRows - 1 rows more, which a last
+  // tile's matmul may read past its live rows (moe_matmul_rows).
+  const uint64_t matmulRows = routes + tileRows - 1;
   // The router's fp32 scores, a row of routerWidth() expert slots per row,
   // live in the grouped input until the gather overwrites them.
   const uint64_t scoreBytes = uint64_t{rows} * shape.routerWidth() * sizeof(float);
   return {routes * sizeof(uint32_t), routes * sizeof(float),
           uint64_t{tiles} * sizeof(MoeTileDescriptor), sizeof(MoeTileCount),
-          groupedRows * sizeof(uint32_t), routes * sizeof(uint32_t), uint64_t{shape.experts} * sizeof(uint32_t),
-          std::max(tableBytes(shape.hiddenSize, groupedRows), scoreBytes),
-          groupedRows * shape.expertIntermediateSize * sizeof(uint16_t),
-          groupedRows * shape.hiddenSize * sizeof(uint16_t)};
+          routes * sizeof(uint32_t), routes * sizeof(uint32_t), uint64_t{shape.experts} * sizeof(uint32_t),
+          std::max(tableBytes(shape.hiddenSize, matmulRows), scoreBytes),
+          matmulRows * shape.expertIntermediateSize * sizeof(uint16_t),
+          routes * shape.hiddenSize * sizeof(uint16_t)};
 }
 
 // The shape's compiled routing (MoeShape::compiledRouting).
@@ -180,7 +183,10 @@ void addExperts(metal::CommandGraph &graph, const MoeScratch &scratch, const Blo
               {group.gate_up_columns, tiles, 1}, gateUpGrid, {GGUF_STAGED_THREADS, 1, 1});
     graph.specialize(passFormats<2>({up.routed.formatId, shared.formatId}));
     graph.addresses(weights.chunks.planes());
-    MoE::addReluSquared(graph, scratch.expertIntermediate, uint64_t{tiles} * plan.tileRows() * intermediate);
+    // The routes' rows, grouped one per route (workspaceFor), in whole
+    // 256-value groups: within the tileRows - 1 rows past them.
+    const uint64_t routes = uint64_t{plan.rows()} * shape.routesPerToken();
+    MoE::addReluSquared(graph, scratch.expertIntermediate, (routes * intermediate + 255) / 256 * 256);
   }
   // Down, projection 2 of the routed experts, which it reaches in the chunks.
   const SharedSlots downShared = sharedSlots(weights, down, 2, shape);
@@ -196,12 +202,8 @@ void addExperts(metal::CommandGraph &graph, const MoeScratch &scratch, const Blo
 
 } // namespace
 
-// Plans run 8-row tiles in decode and 8- or 32-row tiles in prefill.
-MoePlan::MoePlan(MoeShape shape, uint32_t rows, MoeConfig config,
-                 MoePhase phase)
-    : shape_(shape), rows_(rows), phase_(phase), config_(config) {
-  if (phase == MoePhase::Decode && config.expertTile != MoeExpertTile::M8)
-    throw std::invalid_argument("invalid MoE expert tile configuration");
+MoePlan::MoePlan(MoeShape shape, uint32_t rows, MoeConfig config)
+    : shape_(shape), rows_(rows), config_(config) {
   workspace_ = workspaceFor(shape, rows, tileRows());
   maximumTiles_ = moeMaximumTiles(rows, shape, tileRows());
 }
@@ -209,59 +211,20 @@ MoePlan::MoePlan(MoeShape shape, uint32_t rows, MoeConfig config,
 namespace {
 
 // A step's grouping into tiles, which its expert passes read: the gate/up
-// pass's column tiles are its staged columns. A `streamed` grouping is that
-// of a step whose passes run around its load (MoE::add).
-MoeGroupParams groupParams(const MoePlan &plan, bool streamed) {
+// pass's column tiles are its staged columns. A streamed block's grouping is
+// that of a step whose passes run around its load (MoE::add).
+MoeGroupParams groupParams(const MoePlan &plan, const BlockMoeWeights &weights) {
   const MoeShape shape = plan.shape();
-  return {plan.rows(), shape.expertsPerToken, plan.tileRows(), shape.experts,
+  return {plan.rows(),
+          shape.expertsPerToken,
+          plan.tileRows(),
+          shape.experts,
           // A ReluSquared up pass alone runs the down pass's tile of GGUF_TILE_COLUMNS.
           shape.expertIntermediateSize /
               (shape.activation == MoeActivation::SwiGlu ? GGUF_STAGED_COLUMNS : GGUF_TILE_COLUMNS),
           shape.hiddenSize / GGUF_TILE_COLUMNS,
-          SPLASH_TARGET_VERIFY_ROWS, streamed};
-}
-
-// MoE::addRouting, its grouping `streamed` (groupParams).
-void addStepRouting(metal::CommandGraph &graph, const MoeBuffers &buffers, const BlockMoeWeights &weights,
-                    const MoePlan &plan, bool streamed) {
-  const MoeShape shape = plan.shape();
-  const uint32_t rows = plan.rows();
-  validate(weights, shape);
-  const MoeWorkspace &required = plan.workspace();
-  const uint64_t hiddenRows = uint64_t{rows} * shape.hiddenSize * sizeof(uint16_t);
-  requireBytes(buffers.input, hiddenRows, "MoE input");
-  if (buffers.residual) requireBytes(buffers.residual, hiddenRows, "MoE residual");
-  requireBytes(buffers.output, hiddenRows, "MoE output");
-  if (shape.routerInputSize && !buffers.routerInput)
-    throw std::invalid_argument("the MoE router reads rows of its own width, which the step lacks");
-  const metal::MetalBuffer &routerInput = buffers.routerInput ? buffers.routerInput : buffers.input;
-  requireBytes(routerInput, uint64_t{rows} * shape.routerInput() * sizeof(uint16_t), "MoE router input");
-  const MoeScratch &scratch = buffers.scratch;
-  for (const MoeScratchField &field : kMoeScratchFields)
-    requireBytes(scratch.*field.buffer, required.*field.bytes, field.name);
-  MoE::addRoutes(graph, routerInput, weights.router, weights.sharedScalarGate, scratch.groupedInput,
-                 scratch.selectedExperts, scratch.routingWeights, rows, shape, plan.configuration().ggufRouterTile,
-                 weights.selectionBias);
-  // The expert passes launch the live tiles alone, on grids the grouping
-  // writes with the tile count: a one-lane 35B decode step fills a median of
-  // 30 of the 65 tiles it could, and the idle ones' threadgroups, returning at
-  // once, still cost up to 4.8% of a decode cycle (40-core M3 Max). A
-  // streamed grouping puts the tiles of experts the slot table marks absent
-  // last (MoeTileCount) and copies the table into expertSlots.
-  std::vector<metal::MetalBuffer> grouping{scratch.selectedExperts, scratch.tileDescriptors, scratch.tileCount,
-                                           scratch.groupedRoutes, scratch.routeRows, weights.slotTable,
-                                           scratch.expertSlots};
-  if (buffers.verifyRows) {
-    // A verify step's rows are its lanes' blocks.
-    if (plan.phase() != MoePhase::Decode)
-      throw std::invalid_argument("only a verify step's MoE routes its verify rows");
-    requireBytes(buffers.verifyRows, uint64_t{rows / SPLASH_TARGET_VERIFY_ROWS} * sizeof(uint32_t),
-                 "MoE verify rows");
-    grouping.push_back(buffers.verifyRows);
-  }
-  graph.add(routingKernel(buffers.verifyRows ? "moe_group_routes_verified" : "moe_group_routes", shape,
-                          &CompiledMoeRouting::slicesSuffix),
-            std::move(grouping), groupParams(plan, streamed), {1, 1, 1}, {shape.routerWidth(), 1, 1});
+          weights.stream != nullptr,
+          0};
 }
 
 void addGather(metal::CommandGraph &graph, const MoeBuffers &buffers, const MoePlan &plan) {
@@ -270,7 +233,7 @@ void addGather(metal::CommandGraph &graph, const MoeBuffers &buffers, const MoeP
   graph.add("moe_gather_rows",
             {buffers.input, scratch.groupedRoutes, scratch.tileDescriptors,
              scratch.tileCount, scratch.groupedInput},
-            MoeGatherParams{plan.tileRows(), shape.hiddenSize, shape.routesPerToken()},
+            MoeGatherParams{shape.hiddenSize, shape.routesPerToken()},
             {plan.maximumTiles(), shape.hiddenSize / 256, 1});
 }
 
@@ -290,36 +253,69 @@ void addCombine(metal::CommandGraph &graph, const MoeBuffers &buffers, const Moe
 
 } // namespace
 
-void MoE::add(metal::CommandGraph &graph, const MoeBuffers &buffers,
-              const BlockMoeWeights &weights, const MoePlan &plan) {
-  if (!weights.stream) {
-    addRouting(graph, buffers, weights, plan);
-    return addRouted(graph, buffers, weights, plan);
-  }
-  // The gather and the passes over the experts resident before the load run
-  // beside it, on the grouping's copy of their slots; those over the experts
-  // it brings, after it, on the load slot table.
-  addStepRouting(graph, buffers, weights, plan, true);
-  const MoeLoadPart part{&buffers, &plan};
-  const MoeGroupParams group = groupParams(plan, true);
-  weights.stream->addLoad(graph, {&part, 1}, weights.streamBlock, [&] {
-    addGather(graph, buffers, plan);
-    addExperts(graph, buffers.scratch, weights, buffers.scratch.expertSlots, plan, group, MOE_TILES_RESIDENT);
-  });
-  addExperts(graph, buffers.scratch, weights, weights.loadSlotTable, plan, group, MOE_TILES_LOADED);
-  addCombine(graph, buffers, plan);
+void MoE::addRouting(metal::CommandGraph &graph, const MoeBuffers &buffers, const BlockMoeWeights &weights,
+                     const MoePlan &plan) {
+  const MoeShape shape = plan.shape();
+  const uint32_t rows = plan.rows();
+  validate(weights, shape);
+  const MoeWorkspace &required = plan.workspace();
+  const uint64_t hiddenRows = uint64_t{rows} * shape.hiddenSize * sizeof(uint16_t);
+  requireBytes(buffers.input, hiddenRows, "MoE input");
+  if (buffers.residual) requireBytes(buffers.residual, hiddenRows, "MoE residual");
+  requireBytes(buffers.output, hiddenRows, "MoE output");
+  if (shape.routerInputSize && !buffers.routerInput)
+    throw std::invalid_argument("the MoE router reads rows of its own width, which the step lacks");
+  const metal::MetalBuffer &routerInput = buffers.routerInput ? buffers.routerInput : buffers.input;
+  requireBytes(routerInput, uint64_t{rows} * shape.routerInput() * sizeof(uint16_t), "MoE router input");
+  const MoeScratch &scratch = buffers.scratch;
+  for (const MoeScratchField &field : kMoeScratchFields)
+    requireBytes(scratch.*field.buffer, required.*field.bytes, field.name);
+  // A decode step's lanes' rows, which the selector writes on the device.
+  MoeGroupParams group = groupParams(plan, weights);
+  const uint32_t lanes = buffers.lanes;
+  if (lanes > SPLASH_MAXIMUM_BATCH_WIDTH) throw std::invalid_argument("a MoE step has more lanes than a batch");
+  if (lanes) requireBytes(buffers.laneRows, uint64_t{lanes} * sizeof(SplashLaneRows), "MoE lane rows");
+  group.lanes = lanes;
+  MoE::addRoutes(graph, routerInput, weights.router, weights.sharedScalarGate, scratch.groupedInput,
+                 scratch.selectedExperts, scratch.routingWeights, rows, shape, plan.configuration().ggufRouterTile,
+                 weights.selectionBias);
+  // The expert passes launch the live tiles alone, on grids the grouping
+  // writes with the tile count: a one-lane 35B decode step fills a median of
+  // 30 of the 65 tiles it could, and the idle ones' threadgroups, returning at
+  // once, still cost up to 4.8% of a decode cycle (40-core M3 Max). A
+  // streamed grouping puts the tiles of experts the slot table marks absent
+  // last (MoeTileCount) and copies the table into expertSlots.
+  std::vector<metal::MetalBuffer> grouping{scratch.selectedExperts, scratch.tileDescriptors, scratch.tileCount,
+                                           scratch.groupedRoutes, scratch.routeRows, weights.slotTable,
+                                           scratch.expertSlots};
+  if (lanes) grouping.push_back(buffers.laneRows);
+  graph.add(routingKernel(lanes ? "moe_group_routes_verified" : "moe_group_routes", shape,
+                          &CompiledMoeRouting::slicesSuffix),
+            std::move(grouping), group, {1, 1, 1}, {shape.routerWidth(), 1, 1});
 }
 
-void MoE::addRouting(metal::CommandGraph &graph, const MoeBuffers &buffers,
-                     const BlockMoeWeights &weights, const MoePlan &plan) {
-  addStepRouting(graph, buffers, weights, plan, false);
+// A streamed block's gather and passes over the experts resident before its
+// load, on the grouping's copy of their slots.
+void MoE::addResident(metal::CommandGraph &graph, const MoeBuffers &buffers,
+                      const BlockMoeWeights &weights, const MoePlan &plan) {
+  if (!weights.stream) throw std::invalid_argument("a resident MoE block's experts run after its routing alone");
+  addGather(graph, buffers, plan);
+  addExperts(graph, buffers.scratch, weights, buffers.scratch.expertSlots, plan, groupParams(plan, weights),
+             MOE_TILES_RESIDENT);
 }
 
+// A streamed block's passes over the experts its load brought, on the load
+// slot table, after addResident's beside the load; a resident block's gather
+// and passes over every expert. Then the combine.
 void MoE::addRouted(metal::CommandGraph &graph, const MoeBuffers &buffers,
                     const BlockMoeWeights &weights, const MoePlan &plan) {
-  addGather(graph, buffers, plan);
-  addExperts(graph, buffers.scratch, weights, weights.stream ? weights.loadSlotTable : weights.slotTable, plan,
-             groupParams(plan, false), MOE_TILES_ALL);
+  const MoeGroupParams group = groupParams(plan, weights);
+  if (weights.stream) {
+    addExperts(graph, buffers.scratch, weights, weights.loadSlotTable, plan, group, MOE_TILES_LOADED);
+  } else {
+    addGather(graph, buffers, plan);
+    addExperts(graph, buffers.scratch, weights, weights.slotTable, plan, group, MOE_TILES_ALL);
+  }
   addCombine(graph, buffers, plan);
 }
 
@@ -468,16 +464,10 @@ ExpertChunks residentExpertChunks(const BlockMoeWeights &weights) {
                           weights.up.routed, weights.down.routed);
 }
 
-MoePlan MoE::prefillPlan(MoeShape shape, uint32_t rows, MoeConfig config) {
+MoePlan MoE::plan(MoeShape shape, uint32_t rows, MoeConfig config) {
   if (!rows || rows > SPLASH_PREFILL_TOKEN_BUDGET)
-    throw std::invalid_argument("invalid MoE prefill rows");
-  return MoePlan(shape, rows, config, MoePhase::Prefill);
-}
-
-MoePlan MoE::decodePlan(MoeShape shape, uint32_t lanes, MoeConfig config) {
-  if (!lanes || lanes > SPLASH_MAXIMUM_BATCH_WIDTH)
-    throw std::invalid_argument("invalid MoE decode batch width");
-  return MoePlan(shape, lanes * SPLASH_TARGET_VERIFY_ROWS, config, MoePhase::Decode);
+    throw std::invalid_argument("invalid MoE rows");
+  return MoePlan(shape, rows, config);
 }
 
 } // namespace splash::ops

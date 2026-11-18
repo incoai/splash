@@ -3,39 +3,63 @@ import PDFKit
 import SwiftUI
 import UniformTypeIdentifiers
 
-/// The message being written: its text and what is attached to it, kept as files in the store's
-/// attachments folder as it attaches (`ChatStore.attachments`), which become the message's once it
-/// is sent; one taken off goes.
+/// The message being written in each chat, the open one's in the composer: its text and what is
+/// attached to it, kept as files in the store's attachments folder as it attaches
+/// (`ChatStore.attachments`), which become the message's once it is taken; one taken off goes.
+/// Each chat has its own, so that what one holds, a message the server holds or one that comes
+/// back, never shows in another's composer, to be sent there or mixed with what is written there.
 @MainActor @Observable
 final class Draft {
-    var text = "" {
-        didSet { if text != oldValue { notice = nil } }
+    /// What a chat's draft holds.
+    private struct Kept {
+        /// Which draft it is, for what is attached to it to join it wherever it has gone by the
+        /// time it is kept (`carry`).
+        let id = UUID()
+        var text = ""
+        var attachments: [Attachment] = []
+        var thumbnails: [UUID: NSImage] = [:]
+        var attaching = 0
+        var notice: String?
+
+        /// Whether it holds no message, nor one being attached.
+        var isEmpty: Bool { text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && attachments.isEmpty && attaching == 0 }
     }
-    private(set) var attachments: [Attachment] = []
+
+    /// The drafts, by their chat's conversation, nil for a new chat.
+    private var drafts: [UUID?: Kept] = [:]
+    /// The open chat, whose draft the composer shows.
+    private let chat: @MainActor () -> UUID?
+
+    var text: String {
+        get { drafts[chat()]?.text ?? "" }
+        set {
+            guard newValue != text else { return }
+            drafts[chat(), default: Kept()].text = newValue
+            drafts[chat()]?.notice = nil
+        }
+    }
+    var attachments: [Attachment] { drafts[chat()]?.attachments ?? [] }
     /// The images attached, as the composer shows them, by attachment.
-    private(set) var thumbnails: [UUID: NSImage] = [:]
+    var thumbnails: [UUID: NSImage] { drafts[chat()]?.thumbnails ?? [:] }
     /// How many attached images are still being encoded and kept, which join `attachments` once
     /// they are.
-    private(set) var attaching = 0
-    /// The attachment that joins `attachments` last, which the next one waits for.
+    var attaching: Int { drafts[chat()]?.attaching ?? 0 }
+    /// The attachment that joins its draft last, which the next one waits for.
     private var lastAttachment: Task<Void, Never>?
     /// Asks the text field for the keyboard; counts the requests.
     private(set) var focusRequests = 0
-    /// What the composer says over the message, in the chat it is about, until the draft changes
-    /// or is sent: why the server refused what the draft holds again or a reply asked again
-    /// (`restore`), or a file that couldn't be attached.
-    private(set) var notice: Notice?
-
-    struct Notice: Equatable {
-        let text: String
-        /// The conversation it is about; nil for a new one.
-        let conversation: UUID?
-    }
+    /// What the composer says over the message until the draft changes or its message is taken:
+    /// why the server refused what the draft holds or a reply asked again (`restore`), or a file
+    /// that couldn't be attached. A message sent again says it until the server answers, rather
+    /// than taking it away for the frames a refusal takes to say it again.
+    var notice: String? { drafts[chat()]?.notice }
     /// Where attachments are kept.
     let files: URL
 
-    init(files: URL) {
+    /// `chat` tells the open chat, nil for a new one.
+    init(files: URL, chat: @escaping @MainActor () -> UUID? = { nil }) {
         self.files = files
+        self.chat = chat
     }
 
     var isEmpty: Bool { text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && attachments.isEmpty }
@@ -50,10 +74,10 @@ final class Draft {
         let sources = images.compactMap { $0.cgImage(forProposedRect: nil, context: nil, hints: nil) }
         let missed = images.count - sources.count + unreadable
         guard !sources.isEmpty else {
-            if missed > 0 { noticeUnattached(missed) }
+            if missed > 0 { drafts[chat(), default: Kept()].notice = Self.unattached(missed) }
             return
         }
-        attaching += sources.count
+        let draft = startAttaching(sources.count)
         let files = files
         let encoding = Task.detached(priority: .userInitiated) {
             sources.compactMap { source in Self.encoded(source).flatMap { Self.kept($0, in: files) } }
@@ -61,20 +85,21 @@ final class Draft {
         let previous = lastAttachment
         lastAttachment = Task {
             await previous?.value
-            let kept = await encoding.value
-            for (attachment, data) in kept {
-                attachments.append(attachment)
-                thumbnails[attachment.id] = NSImage(data: data)
+            let encoded = await encoding.value
+            update(draft) { draft in
+                for (attachment, data) in encoded {
+                    draft.attachments.append(attachment)
+                    draft.thumbnails[attachment.id] = NSImage(data: data)
+                }
+                draft.attaching -= sources.count
+                let failed = missed + sources.count - encoded.count
+                if failed > 0 { draft.notice = Self.unattached(failed) }
             }
-            attaching -= sources.count
-            let failed = missed + sources.count - kept.count
-            if failed > 0 { noticeUnattached(failed) }
         }
     }
 
-    private func noticeUnattached(_ failed: Int) {
-        notice = Notice(text: failed == 1 ? "An image couldn’t be attached" : "\(failed) images couldn’t be attached",
-                        conversation: conversation)
+    private static func unattached(_ failed: Int) -> String {
+        failed == 1 ? "An image couldn’t be attached" : "\(failed) images couldn’t be attached"
     }
 
     /// Attaches the PDFs at `urls` as they are, with their names and pages, read and kept away from
@@ -82,25 +107,39 @@ final class Draft {
     /// the server to say why.
     func attach(pdfs urls: [URL]) {
         guard !urls.isEmpty else { return }
-        attaching += urls.count
+        let draft = startAttaching(urls.count)
         let files = files
         let reading = Task.detached(priority: .userInitiated) { urls.map { ($0, Self.keptPDF($0, in: files)) } }
         let previous = lastAttachment
         lastAttachment = Task {
             await previous?.value
             let read = await reading.value
-            attachments += read.compactMap(\.1)
-            attaching -= urls.count
-            let failed = read.filter { $0.1 == nil }.map { $0.0.lastPathComponent }
-            if let first = failed.first {
-                notice = Notice(text: failed.count == 1 ? "“\(first)” couldn’t be read" : "\(failed.count) PDFs couldn’t be read",
-                                conversation: conversation)
+            update(draft) { draft in
+                draft.attachments += read.compactMap(\.1)
+                draft.attaching -= urls.count
+                let failed = read.filter { $0.1 == nil }.map { $0.0.lastPathComponent }
+                if let first = failed.first {
+                    draft.notice = failed.count == 1 ? "“\(first)” couldn’t be read" : "\(failed.count) PDFs couldn’t be read"
+                }
             }
         }
     }
 
-    /// The conversation the composer writes in, for a notice about it (`ComposerField` sets it).
-    @ObservationIgnored var conversation: UUID?
+    /// Counts `count` attachments under way in the open chat's draft, and names the draft, which
+    /// they join once kept, in whichever chat it is by then (`update`).
+    private func startAttaching(_ count: Int) -> UUID {
+        var draft = drafts[chat()] ?? Kept()
+        draft.attaching += count
+        drafts[chat()] = draft
+        return draft.id
+    }
+
+    /// Changes draft `id` in whichever chat it is now, a new chat it went with (`carry`) or its
+    /// own; nothing where it is gone, with its chat deleted (`forget`).
+    private func update(_ id: UUID, _ change: (inout Kept) -> Void) {
+        guard let found = drafts.first(where: { $0.value.id == id }) else { return }
+        change(&drafts[found.key]!)
+    }
 
     /// The record of the PDF at `url`, kept as a file in `files`; nil where it can't be read or
     /// kept.
@@ -113,34 +152,57 @@ final class Draft {
 
     /// Takes attachment `index` off, and its file.
     func remove(at index: Int) {
-        notice = nil
-        let attachment = attachments.remove(at: index)
-        thumbnails[attachment.id] = nil
+        let chat = chat()
+        guard let attachment = drafts[chat]?.attachments.remove(at: index) else { return }
+        drafts[chat]?.thumbnails[attachment.id] = nil
+        drafts[chat]?.notice = nil
         let file = files.appending(path: attachment.file)
         Task.detached { try? FileManager.default.removeItem(at: file) }
     }
 
-    /// Takes the message, leaving the draft empty; its attachments' files are the message's.
-    func take() -> (text: String, attachments: [Attachment]) {
-        defer {
-            text = ""
-            attachments = []
-            thumbnails = [:]
-            notice = nil
-        }
-        return (text.trimmingCharacters(in: .whitespacesAndNewlines), attachments)
+    /// The message as it is sent: the text without the space around it, and what is attached.
+    var message: (text: String, attachments: [Attachment]) {
+        (text.trimmingCharacters(in: .whitespacesAndNewlines), attachments)
     }
 
-    /// Takes back `refused`, what the server didn't take, with why, in its chat: its text before
-    /// what was typed since, a blank line apart, and its attachments before those attached since.
+    /// Takes the message out of `chat`'s draft, the chat it was sent in, leaving the draft empty:
+    /// it is its conversation's from then on (`AppState.sendDraft`), and its attachments' files
+    /// with it.
+    func take(from chat: UUID?) {
+        drafts[chat] = nil
+    }
+
+    /// Takes `chat`'s draft into the new chat, without what the composer said of it there, as a
+    /// draft its chat's context cannot hold goes with a new chat (`AppState.newChat`). A new chat
+    /// that holds a draft of its own keeps it, and `chat` its own: neither is lost or joined.
+    func carry(from chat: UUID?) {
+        guard let chat, var draft = drafts[chat], drafts[nil].map(\.isEmpty) ?? true else { return }
+        draft.notice = nil
+        drafts[chat] = nil
+        drafts[nil] = draft
+    }
+
+    /// Forgets the drafts of `chats`, deleted (`AppState.delete`). An attachment of theirs still
+    /// being encoded joins no draft once kept (`update`), and its file goes as the next launch
+    /// finds no chat naming it (`ChatStore.adoptFiles`).
+    func forget(_ chats: Set<UUID>) {
+        for chat in chats { drafts[chat] = nil }
+    }
+
+    /// Takes back `refused`, what a request that came to nothing gives back, in its chat's draft:
+    /// the text the draft gave up before what was typed there since, a blank line apart, its
+    /// attachments before those attached since, and why, where there is a why.
     func restore(_ refused: ChatStore.Refused) {
-        let typed = text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "" : text
-        text = [refused.text, typed].filter { !$0.isEmpty }.joined(separator: "\n\n")
-        attachments.insert(contentsOf: refused.attachments, at: 0)
-        for attachment in refused.attachments where attachment.kind == .image {
-            thumbnails[attachment.id] = NSImage(contentsOf: files.appending(path: attachment.file))
+        var draft = drafts[refused.conversation] ?? Kept()
+        if !refused.text.isEmpty {
+            draft.text = draft.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? refused.text : "\(refused.text)\n\n\(draft.text)"
         }
-        notice = Notice(text: refused.reason, conversation: refused.conversation)
+        draft.attachments.insert(contentsOf: refused.attachments, at: 0)
+        for attachment in refused.attachments where attachment.kind == .image {
+            draft.thumbnails[attachment.id] = NSImage(contentsOf: files.appending(path: attachment.file))
+        }
+        draft.notice = refused.reason
+        drafts[refused.conversation] = draft
         focus()
     }
 
@@ -168,9 +230,15 @@ final class Draft {
     }
 }
 
-/// Where a message is written: the text and the images attached; under them what the Server runs,
-/// how much of the model's context the next prompt takes, how much the model thinks, and Send, or
-/// Stop while a reply streams.
+/// Where a message is written, the open chat's draft: the text and the images attached; under them
+/// what the Server runs, how much of the model's context the next prompt takes, how much the model
+/// thinks, and Send, or Stop while the open chat's request is under way. While the server has yet
+/// to take a new chat's first message (`AppState.sendDraft`), the new chat's composer holds the
+/// message as it was sent: its text and attachments stay and take no change, by typing, pasting,
+/// dropping or their buttons, so that what the chat opens with, or a refusal leaves, is what was
+/// sent, and an attachment's file is there for the request to read; Stop gives the message back to
+/// edit. The composer looks as it did, but for Stop: dimmed meanwhile, its controls would blink at
+/// each message the server takes or refuses at once.
 struct Composer: View {
     @Environment(AppState.self) private var state
     @Environment(\.colorScheme) private var colorScheme
@@ -179,30 +247,32 @@ struct Composer: View {
 
     var body: some View {
         let images = state.server.acceptsImages
+        let held = state.chats.sendingFirstMessage
         VStack(alignment: .leading, spacing: 10) {
-            if let notice = draft.notice, notice.conversation == state.chats.selection {
+            if let notice = draft.notice {
                 // As a reply says why it stopped short.
                 Label {
-                    Text(notice.text).foregroundStyle(.secondary)
+                    Text(notice).foregroundStyle(.secondary)
                 } icon: {
                     Image(systemName: "exclamationmark.triangle.fill").symbolRenderingMode(.multicolor)
                 }
                 .font(.system(size: 12))
             }
             if !draft.attachments.isEmpty {
-                Attachments(draft: draft)
+                Attachments(draft: draft, held: held)
             }
-            ComposerField(text: $draft.text, focusRequests: draft.focusRequests,
-                          yields: state.terminalShows,
-                          placeholder: "Message Splash", submit: state.sendDraft, cancel: stop, acceptsImages: images,
+            ComposerField(text: $draft.text, chat: state.chats.selection, focusRequests: draft.focusRequests,
+                          yields: state.terminalShows, held: held,
+                          placeholder: "Message Splash", submit: state.sendDraft, cancel: stop, acceptsImages: images && !held,
                           attach: { draft.attach($0, unreadable: $1) }, attachPDFs: { draft.attach(pdfs: $0) })
+                .alignmentGuide(.composerPlain) { $0[.top] - Self.inset }
             // As the server's stage changes them (`MainView`), a control that goes goes at once, and
             // one that comes fades in once those beside it have moved, as a row of a page does: as
             // a switch began, the model's words slid over Attach Images fading out.
             HStack(spacing: 6) {
                 // Only for a model that sees images and reads PDFs.
                 if images {
-                    Button { picking = true } label: { Image(systemName: "plus") }
+                    Button { if !held { picking = true } } label: { Image(systemName: "plus") }
                         .foregroundStyle(.secondary)
                         .help("Attach Images or PDFs")
                         .accessibilityLabel("Attach Images or PDFs")
@@ -235,11 +305,19 @@ struct Composer: View {
             .animation(Motion.settle, value: state.showsContext)
         }
         .padding(.horizontal, 16)
-        .padding(.vertical, 12)
+        .padding(.vertical, Self.inset)
         .background(colorScheme == .dark ? AnyShapeStyle(.fill.tertiary) : AnyShapeStyle(.background),
                     in: .rect(cornerRadius: 22))
         .overlay { RoundedRectangle(cornerRadius: 22).strokeBorder(.separator) }
         .shadow(color: .black.opacity(0.06), radius: 14, y: 4)
+        .alignmentGuide(.composerTop) { $0[.top] }
+        // What it holds comes and goes at once, and its height with it, whatever else moves: as it
+        // travels between a new chat and a conversation, it is as tall as what it holds then, and
+        // what it holds travels with it. Coming once it had moved, the line that says why left an
+        // empty row as the composer travelled to a new chat opened again, 25 points over its text.
+        .transaction(value: Contents(text: draft.text, attachments: draft.attachments.map(\.id), notice: draft.notice)) {
+            $0.animation = nil
+        }
         .fileImporter(isPresented: $picking, allowedContentTypes: [.image, .pdf], allowsMultipleSelection: true) { result in
             let urls = (try? result.get()) ?? []
             let pdfs = urls.filter { UTType(filenameExtension: $0.pathExtension)?.conforms(to: .pdf) == true }
@@ -252,14 +330,22 @@ struct Composer: View {
         .onChange(of: state.contextRequest, initial: true) { _, request in
             state.chatContext.refresh(request)
         }
-        // A file that can't be attached is told in the chat it was attached in.
-        .onChange(of: state.chats.selection, initial: true) { _, open in draft.conversation = open }
     }
 
-    /// Whether the open conversation's reply streams.
-    private var streaming: Bool {
-        state.chats.streaming != nil && state.chats.streaming == state.chats.current?.id
+    /// The room the composer leaves over what it holds and under its controls: over its text
+    /// where nothing is over it (`VerticalAlignment.composerPlain`). No actor's: the guide reads
+    /// it as SwiftUI computes it, which need not be on the main actor.
+    private nonisolated static let inset: CGFloat = 12
+
+    /// What the composer holds, which it takes at once.
+    private struct Contents: Equatable {
+        let text: String
+        let attachments: [UUID]
+        let notice: String?
     }
+
+    /// Whether a request is under way that Stop stops here (`ChatStore.answering`).
+    private var streaming: Bool { state.chats.answering }
 
     private var help: String {
         if !state.server.answers { return "Available once a model is running" }
@@ -273,7 +359,7 @@ struct Composer: View {
         return "Send"
     }
 
-    /// Stops the open conversation's reply, the way Escape cancels; false when none streams.
+    /// Stops the open chat's request, the way Escape cancels; false when none is under way.
     private func stop() -> Bool {
         guard streaming else { return false }
         state.chats.stop()
@@ -459,13 +545,14 @@ private struct EffortMenu: View {
     }
 }
 
-/// What is attached to a draft, each with a button that takes it off: an image as itself, a PDF as
-/// its name and pages, in red where the model's limits leave it out. Each has a hairline, so that
-/// a white one keeps its edge on the composer, and its button a solid disc, which stands out over
-/// any image in either appearance.
+/// What is attached to a draft, each with a button that takes it off, unless the message is held
+/// as it was sent (`Composer`): an image as itself, a PDF as its name and pages, in red where the
+/// model's limits leave it out. Each has a hairline, so that a white one keeps its edge on the
+/// composer, and its button a solid disc, which stands out over any image in either appearance.
 private struct Attachments: View {
     @Environment(AppState.self) private var state
     let draft: Draft
+    let held: Bool
 
     var body: some View {
         ScrollView(.horizontal, showsIndicators: false) {
@@ -484,7 +571,7 @@ private struct Attachments: View {
                         }
                         .clipShape(.rect(cornerRadius: 10))
                         .overlay { RoundedRectangle(cornerRadius: 10).strokeBorder(.separator) }
-                        Button { draft.remove(at: index) } label: {
+                        Button { if !held { draft.remove(at: index) } } label: {
                             Image(systemName: "xmark.circle.fill")
                                 .symbolRenderingMode(.palette)
                                 .foregroundStyle(.white, .black.opacity(0.6))
@@ -527,14 +614,19 @@ extension Attachments {
 /// the text scrolls.
 private struct ComposerField: NSViewRepresentable {
     @Binding var text: String
+    /// The chat whose draft `text` is, nil for a new chat.
+    let chat: UUID?
     let focusRequests: Int
     /// Whether a terminal of the drawer shows, which keeps the keyboard as the field shows
     /// (`AppState.terminalShows`).
     let yields: Bool
+    /// Whether the text is held as it was sent (`Composer`): it takes no edit, and keeps the
+    /// keyboard, so that Escape stops the request.
+    let held: Bool
     let placeholder: String
     let submit: () -> Void
     let cancel: () -> Bool
-    /// Whether the model takes images and PDFs.
+    /// Whether images and PDFs attach: the model takes them, and the message is not held.
     let acceptsImages: Bool
     /// Takes images, and how many of those chosen could not be read.
     let attach: ([NSImage], Int) -> Void
@@ -589,11 +681,13 @@ private struct ComposerField: NSViewRepresentable {
     func updateNSView(_ scroll: NSScrollView, context: Context) {
         context.coordinator.field = self
         guard let view = scroll.documentView as? MessageTextView else { return }
-        // Only a change made elsewhere, as sending the message clears it, goes to the view: the
-        // view's own edits are in `text` already, and what the input method composes is in the
-        // view alone until it is committed.
-        if text != context.coordinator.published {
+        // Only a change made elsewhere, as sending the message clears it, or another chat's
+        // draft goes to the view: the view's own edits are in `text` already, and what the input
+        // method composes is in the view alone until it is committed. Another chat's draft goes
+        // even where its text is the same, so that no edit made in one chat is undone in another.
+        if text != context.coordinator.published || chat != context.coordinator.chat {
             context.coordinator.published = text
+            context.coordinator.chat = chat
             // A change made here is no edit to undo.
             view.string = text
             context.coordinator.undo.removeAllActions()
@@ -616,9 +710,10 @@ private struct ComposerField: NSViewRepresentable {
         var focusRequests = 0
         /// Whether the field has shown, past its first update.
         var shown = false
-        /// The text the view and the draft last agreed on.
+        /// The text the view and the draft last agreed on, and the chat whose draft it is.
         var published = ""
-        /// The field's own edits, which a message sent clears.
+        var chat: UUID?
+        /// The field's own edits, which a message sent or another chat opened clears.
         let undo = UndoManager()
 
         init(_ field: ComposerField) {
@@ -631,6 +726,10 @@ private struct ComposerField: NSViewRepresentable {
             guard let view = notification.object as? NSTextView else { return }
             published = view.string
             field.text = view.string
+        }
+
+        func textView(_ view: NSTextView, shouldChangeTextIn range: NSRange, replacementString: String?) -> Bool {
+            !field.held
         }
 
         func textView(_ view: NSTextView, doCommandBy selector: Selector) -> Bool {

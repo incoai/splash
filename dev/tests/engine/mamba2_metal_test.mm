@@ -205,23 +205,35 @@ struct Fixture {
     return reinterpret_cast<float *>(static_cast<uint8_t *>(cell.contents()) + kConvBytes +
                                      kLayer * kRecurrentLayerBytes);
   }
-  uint16_t *packedRows(uint32_t lane) const { return static_cast<uint16_t *>(packed.contents()) + lane * kRows * kPacked; }
+  uint16_t *packedRows(uint32_t lane) const {
+    return static_cast<uint16_t *>(packed.contents()) + uint64_t{laneRows[lane].first} * kPacked;
+  }
   uint8_t *tapeAt(uint64_t offset) const { return static_cast<uint8_t *>(tape.contents()) + offset; }
   // Slot s of the tape, which holds a step of both layers.
   static uint64_t slot(uint32_t s) { return uint64_t{s} * kLayers * kTapeBytes; }
   static uint64_t layerTape(uint32_t s) { return slot(s) + kLayer * kTapeBytes; }
   ops::Mamba2Weights mamba2Weights() const { return {convW, convB, a, dtBias, d, norm}; }
 
+  // Lane l's rows of the step, packed from row first (default: a verify
+  // block's rows at l x kRows).
+  std::array<SplashLaneRows, kLanes> laneRows{{{0, kRows}, {kRows, kRows}}};
+
   void run(const uint32_t pendingSlots[], const uint32_t stepSlots[], const uint32_t pendingRows[]) {
     std::array<ops::GdnTapeLane, kLanes> tapes{};
-    for (uint32_t l = 0; l < kLanes; ++l) tapes[l] = {slot(pendingSlots[l]), slot(stepSlots[l]), pendingRows[l]};
+    // A chain's path: the previous step's first pendingRows rows.
+    for (uint32_t l = 0; l < kLanes; ++l)
+      tapes[l] = {slot(pendingSlots[l]), slot(stepSlots[l]), (1u << pendingRows[l]) - 1u};
+    const MetalBuffer laneRows = test::sharedBuffer(backend, kLanes * sizeof(SplashLaneRows));
+    std::memcpy(laneRows.contents(), this->laneRows.data(), sizeof(this->laneRows));
     const auto lanes = [](const std::vector<MetalBuffer> &v) {
       return std::vector<MetalBuffer>{v[0], v[1], v[0], v[0]};
     };
     const std::vector<MetalBuffer> currentLanes = lanes(current), nextLanes = lanes(next);
     CommandGraph graph;
-    ops::Mamba2::addDecode(graph, packed, mamba2Weights(), currentLanes, nextLanes, tape, tapes, y, kShape, kLayer,
-                           kStrides);
+    uint32_t rows = 0;
+    for (const SplashLaneRows &lane : this->laneRows) rows = std::max(rows, lane.first + lane.rows);
+    ops::Mamba2::addDecode(graph, packed, mamba2Weights(), currentLanes, nextLanes, tape, tapes, laneRows,
+                           std::max(rows, kLanes), y, kShape, kLayer, kStrides);
     ops::Mamba2::addGroupNorm(graph, y, norm, hidden, kEpsilon, kShape, kLanes * kRows);
     (void)backend.submitCommandAsync(graph.dispatches()).wait();
   }
@@ -244,18 +256,19 @@ void fillPacked(Fixture &f, Random &random) {
 void checkStep(Fixture &f, uint32_t lane, const LaneReference &committed, const StepReference &step,
                uint32_t stepSlot, const std::string &name) {
   const uint64_t stepTape = Fixture::layerTape(stepSlot);
-  const float *y = static_cast<const float *>(f.y.contents()) + lane * kRows * kXWidth;
-  const uint16_t *hidden = static_cast<const uint16_t *>(f.hidden.contents()) + lane * kRows * kXWidth;
+  const uint32_t first = f.laneRows[lane].first, rows = f.laneRows[lane].rows;
+  const float *y = static_cast<const float *>(f.y.contents()) + uint64_t{first} * kXWidth;
+  const uint16_t *hidden = static_cast<const uint16_t *>(f.hidden.contents()) + uint64_t{first} * kXWidth;
   double worst = 0.0;
   uint32_t skipAgrees = 0, normFirstAgrees = 0;
-  for (uint32_t i = 0; i < kRows * kXWidth; ++i) {
+  for (uint32_t i = 0; i < rows * kXWidth; ++i) {
     worst = std::max(worst, std::fabs(y[i] - step.y[i]) / (1.0 + std::fabs(step.y[i])));
     check(close(y[i], step.y[i], 2e-4), name + " y[" + std::to_string(i) + "] " + std::to_string(y[i]) + " vs " +
                                             std::to_string(step.y[i]));
     skipAgrees += close(y[i], step.yNoSkip[i], 2e-4) && !close(step.y[i], step.yNoSkip[i], 2e-4);
   }
   // The grouped norm of the kernel's own y, and of y with the norm before the gate.
-  for (uint32_t t = 0; t < kRows; ++t)
+  for (uint32_t t = 0; t < rows; ++t)
     for (uint32_t g = 0; g < kGroups; ++g) {
       const uint32_t base = t * kXWidth + g * 1024;
       double squares = 0.0, ungatedSquares = 0.0;
@@ -279,8 +292,8 @@ void checkStep(Fixture &f, uint32_t lane, const LaneReference &committed, const 
         normFirstAgrees += std::fabs(got - normFirst) <= std::ldexp(std::fabs(normFirst), -8);
       }
     }
-  check(skipAgrees < kRows * kXWidth / 100, name + " the kernel's y also matches the reference without the D skip");
-  check(normFirstAgrees < kRows * kXWidth / 2, name + " the norm also matches with the norm before the gate");
+  check(skipAgrees < rows * kXWidth / 100, name + " the kernel's y also matches the reference without the D skip");
+  check(normFirstAgrees < rows * kXWidth / 2, name + " the norm also matches with the norm before the gate");
   // The committed state and carry.
   const float *state = f.state(f.next[lane]);
   for (size_t i = 0; i < committed.state.size(); ++i)
@@ -295,7 +308,7 @@ void checkStep(Fixture &f, uint32_t lane, const LaneReference &committed, const 
   const float *bx = reinterpret_cast<const float *>(f.tapeAt(stepTape + mamba2_tape_bx_offset(kConv)));
   const float *decay = reinterpret_cast<const float *>(f.tapeAt(stepTape + mamba2_tape_decay_offset(kConv, kBxWidth)));
   const float *dt = reinterpret_cast<const float *>(f.tapeAt(stepTape + mamba2_tape_dt_offset(kConv, kBxWidth, kHeads)));
-  for (uint32_t t = 0; t < kRows; ++t) {
+  for (uint32_t t = 0; t < rows; ++t) {
     for (uint32_t ch = 0; ch < kConv; ++ch)
       check(inputs[t * kConv + ch] == f.packedRows(lane)[t * kPacked + kXbc + ch], name + " tape input");
     for (uint32_t i = 0; i < kGroups * kN; ++i)
@@ -346,7 +359,12 @@ void checkRefusals(MetalBackend &backend) {
   check(graph.empty(), "a refused Mamba-2 dispatch was encoded");
 }
 
-void runCase(MetalBackend &backend, const Weights &weights, uint32_t retained, uint64_t seed) {
+// Two steps of both lanes from random states: the first with no pending
+// rows, the second folding `retained` rows (lane 1 one fewer) of the first's;
+// `shortLanes` packs the second step's lanes as a decode step of few draft
+// rows does: 5 rows from row 0 and 3 from row 5.
+void runCase(MetalBackend &backend, const Weights &weights, uint32_t retained, uint64_t seed,
+             bool shortLanes = false) {
   Fixture f(backend, weights);
   Random random(seed);
   std::vector<LaneReference> lanes(kLanes);
@@ -380,6 +398,7 @@ void runCase(MetalBackend &backend, const Weights &weights, uint32_t retained, u
   // Second step: the first's next cells are current; fold `retained` rows
   // (lane 1 one fewer, so lanes differ) from the first's tape.
   std::swap(f.current, f.next);
+  if (shortLanes) f.laneRows = {{{0, 5}, {5, 3}}};
   const uint32_t pending[kLanes] = {retained, retained ? retained - 1 : 0};
   for (uint32_t l = 0; l < kLanes; ++l) advance(weights, lanes[l], firstPacked[l].data(), firstSteps[l], pending[l]);
   fillPacked(f, random);
@@ -389,7 +408,8 @@ void runCase(MetalBackend &backend, const Weights &weights, uint32_t retained, u
   f.run(first, second, pending);
   for (uint32_t l = 0; l < kLanes; ++l)
     checkStep(f, l, lanes[l], secondSteps[l], second[l],
-              "second step, " + std::to_string(pending[l]) + " pending rows");
+              std::string(shortLanes ? "short lanes, " : "") + "second step, " + std::to_string(pending[l]) +
+                  " pending rows");
 }
 
 } // namespace
@@ -401,7 +421,8 @@ int main(int argc, char **argv) {
     const Weights weights = randomWeights(random);
     MetalBackend backend(argv[1]);
     checkRefusals(backend);
-    for (const uint32_t retained : {0U, 3U, 8U}) runCase(backend, weights, retained, 1000 + retained);
+    for (const uint32_t retained : {0U, 3U, 8U, kRows}) runCase(backend, weights, retained, 1000 + retained);
+    runCase(backend, weights, 3, 2003, true);
   } catch (const std::exception &error) {
     std::fprintf(stderr, "error: %s\n", error.what());
     return 1;

@@ -29,10 +29,6 @@ template <uint P, uint N> struct Mamba2DecodeShared {
   float x[SPLASH_TARGET_VERIFY_ROWS * P];
   float decay[SPLASH_TARGET_VERIFY_ROWS];
   float dt[SPLASH_TARGET_VERIFY_ROWS];
-  float pending_b[SPLASH_TARGET_VERIFY_ROWS * N];
-  float pending_x[SPLASH_TARGET_VERIFY_ROWS * P];
-  float pending_decay[SPLASH_TARGET_VERIFY_ROWS];
-  float pending_dt[SPLASH_TARGET_VERIFY_ROWS];
 };
 
 // One layer's tape of one lane's step (metal/abi/Mamba2.h).
@@ -83,33 +79,33 @@ template <uint Groups, uint Heads, uint P, uint N, uint ConvDim, uint PackedWidt
           uint DtOffset>
 inline void mamba2_decode_prologue(device const bfloat *packed, device const float *conv_weights,
                                    device const float *conv_bias, GdnConvHistory history,
-                                   device bfloat *conv_state_out, Mamba2Tape pending_tape, uint pending,
-                                   Mamba2Tape step_tape, device const float *a, device const float *dt_bias,
+                                   device bfloat *conv_state_out, uint rows, Mamba2Tape step_tape,
+                                   device const float *a, device const float *dt_bias,
                                    threadgroup Mamba2DecodeShared<P, N> &shared, uint head, uint lane,
                                    uint simd_group) {
   constexpr uint HeadsPerGroup = Heads / Groups;
   constexpr uint XWidth = Heads * P, BxWidth = Groups * N + XWidth;
   constexpr uint XGroups = P / 32, NGroups = N / 32;
-  static_assert(SPLASH_TARGET_VERIFY_ROWS == kMamba2Simdgroups && P % 32 == 0 && N == 128,
-                "one simdgroup per verify row, four state columns per lane");
+  static_assert(P % 32 == 0 && N == 128, "whole simdgroups of x, four state columns per lane");
   static_assert(ConvDim == XWidth + 2 * Groups * N, "x | B | C");
   const uint group = head / HeadsPerGroup;
   const bool shared_writer = head % HeadsPerGroup == 0;
-  const bool carrier = simd_group < SPLASH_GDN_CONVOLUTION_TAPS - 1;
-  const uint token = simd_group;
-
-  if (token < pending) {
-    for (uint g = 0; g < NGroups; ++g)
-      shared.pending_b[token * N + 32 * g + lane] = pending_tape.bx[token * BxWidth + group * N + 32 * g + lane];
-    for (uint g = 0; g < XGroups; ++g)
-      shared.pending_x[token * P + 32 * g + lane] =
-          pending_tape.bx[token * BxWidth + Groups * N + head * P + 32 * g + lane];
-    if (lane == 0) {
-      shared.pending_decay[token] = pending_tape.decay[token * Heads + head];
-      shared.pending_dt[token] = pending_tape.dt[token * Heads + head];
+  // The carried convolution rows the pending rows leave, simdgroups 0-2 a
+  // row each.
+  if (simd_group < SPLASH_GDN_CONVOLUTION_TAPS - 1) {
+    for (uint g = 0; g < XGroups; ++g) {
+      const uint channel = head * P + 32 * g + lane;
+      conv_state_out[simd_group * ConvDim + channel] = history.at(simd_group, channel);
     }
+    if (shared_writer)
+      for (uint g = 0; g < NGroups; ++g) {
+        const uint b_channel = XWidth + group * N + 32 * g + lane, c_channel = b_channel + Groups * N;
+        conv_state_out[simd_group * ConvDim + b_channel] = history.at(simd_group, b_channel);
+        conv_state_out[simd_group * ConvDim + c_channel] = history.at(simd_group, c_channel);
+      }
   }
-
+  // The step's rows, a simdgroup's every eighth.
+  for (uint token = simd_group; token < rows; token += kMamba2Simdgroups) {
   device const bfloat *row = packed + token * PackedWidth;
   for (uint g = 0; g < XGroups; ++g) {
     const uint channel = head * P + 32 * g + lane;
@@ -118,7 +114,6 @@ inline void mamba2_decode_prologue(device const bfloat *packed, device const flo
     shared.x[token * P + 32 * g + lane] = x;
     step_tape.bx[token * BxWidth + Groups * N + head * P + 32 * g + lane] = x;
     step_tape.inputs[token * ConvDim + channel] = row[XbcOffset + channel];
-    if (carrier) conv_state_out[simd_group * ConvDim + channel] = history.at(simd_group, channel);
   }
   for (uint g = 0; g < NGroups; ++g) {
     const uint b_channel = XWidth + group * N + 32 * g + lane;
@@ -133,10 +128,6 @@ inline void mamba2_decode_prologue(device const bfloat *packed, device const flo
       step_tape.bx[token * BxWidth + group * N + 32 * g + lane] = b;
       step_tape.inputs[token * ConvDim + b_channel] = row[XbcOffset + b_channel];
       step_tape.inputs[token * ConvDim + c_channel] = row[XbcOffset + c_channel];
-      if (carrier) {
-        conv_state_out[simd_group * ConvDim + b_channel] = history.at(simd_group, b_channel);
-        conv_state_out[simd_group * ConvDim + c_channel] = history.at(simd_group, c_channel);
-      }
     }
   }
   if (lane == 0) {
@@ -149,6 +140,7 @@ inline void mamba2_decode_prologue(device const bfloat *packed, device const flo
     step_tape.dt[token * Heads + head] = dt;
     step_tape.decay[token * Heads + head] = decay;
   }
+  }
 }
 
 // The scan over the head's P state rows, four fp32 columns a lane,
@@ -156,12 +148,14 @@ inline void mamba2_decode_prologue(device const bfloat *packed, device const flo
 // the committed one, which goes to state_out; the step's rows then advance it
 // for their outputs, y = s . C + D x gated by silu(z), which go to `y` in
 // fp32. The next rows' state is loaded before these rows' is stored.
-template <uint Heads, uint P, uint N, uint PackedWidth, uint ZOffset, uint RowsInFlight>
+template <uint Groups, uint Heads, uint P, uint N, uint PackedWidth, uint ZOffset, uint RowsInFlight>
 inline void mamba2_decode_scan(device const float *state_in, device float *state_out,
-                               threadgroup Mamba2DecodeShared<P, N> &shared, uint pending,
-                               device const bfloat *packed, device const float *d, device float *y,
-                               uint head, uint lane, uint simd_group) {
-  constexpr uint Tokens = SPLASH_TARGET_VERIFY_ROWS;
+                               threadgroup Mamba2DecodeShared<P, N> &shared, Mamba2Tape pending_tape,
+                               uint pending, uint rows, device const bfloat *packed, device const float *d,
+                               device float *y, uint head, uint lane, uint simd_group) {
+  constexpr uint BxWidth = Groups * N + Heads * P, HeadsPerGroup = Heads / Groups;
+  device const float *pending_b = pending_tape.bx + (head / HeadsPerGroup) * N + lane * 4;
+  device const float *pending_x = pending_tape.bx + Groups * N + head * P;
   constexpr uint Batches = P / kMamba2Simdgroups;
   static_assert(Batches % RowsInFlight == 0, "rows in flight tile the head");
   const auto base = [&](uint batch, uint r) {
@@ -175,11 +169,13 @@ inline void mamba2_decode_scan(device const float *state_in, device float *state
   for (uint batch = 0; batch < Batches; batch += RowsInFlight) {
     uint state_row[RowsInFlight];
     for (uint r = 0; r < RowsInFlight; ++r) state_row[r] = (batch + r) * kMamba2Simdgroups + simd_group;
+    // The pending rows, from their tape, where the step that left them put
+    // their fp32 x, B, decay and dt.
     for (uint token = 0; token < pending; ++token) {
-      const float decay = shared.pending_decay[token], dt = shared.pending_dt[token];
-      threadgroup const float *b = shared.pending_b + token * N + lane * 4;
+      const float decay = pending_tape.decay[token * Heads + head], dt = pending_tape.dt[token * Heads + head];
+      device const float *b = pending_b + token * BxWidth;
       for (uint r = 0; r < RowsInFlight; ++r) {
-        const float x_dt = shared.pending_x[token * P + state_row[r]] * dt;
+        const float x_dt = pending_x[token * BxWidth + state_row[r]] * dt;
         for (uint i = 0; i < 4; ++i) state[r][i] = state[r][i] * decay + b[i] * x_dt;
       }
     }
@@ -190,7 +186,7 @@ inline void mamba2_decode_scan(device const float *state_in, device float *state
     }
     for (uint r = 0; r < RowsInFlight; ++r)
       for (uint i = 0; i < 4; ++i) state_out[base(batch, r) + i] = state[r][i];
-    for (uint token = 0; token < Tokens; ++token) {
+    for (uint token = 0; token < rows; ++token) {
       const float decay = shared.decay[token], dt = shared.dt[token];
       threadgroup const float *b = shared.b + token * N + lane * 4;
       threadgroup const float *c = shared.c + token * N + lane * 4;
@@ -227,19 +223,20 @@ inline void mamba2_decode_step(device const bfloat *packed, device const float *
                                device const float *conv_bias, device const bfloat *conv_state_in,
                                device bfloat *conv_state_out, device const float *state_in, device float *state_out,
                                device uchar *tape, ulong pending_offset, ulong step_offset, uint pending,
-                               device const float *a, device const float *dt_bias, device const float *d,
+                               uint rows, device const float *a, device const float *dt_bias, device const float *d,
                                device float *y, uint head, uint lane, uint simd_group,
                                threadgroup Mamba2DecodeShared<P, N> &shared) {
   const Mamba2Tape pending_tape = mamba2_tape<Groups, Heads, P, N, ConvDim>(tape, pending_offset);
   const Mamba2Tape step_tape = mamba2_tape<Groups, Heads, P, N, ConvDim>(tape, step_offset);
-  const GdnConvHistory history{conv_state_in, pending_tape.inputs, ConvDim, ConvDim, pending};
+  const GdnConvHistory history = gdn_conv_history(conv_state_in, pending_tape.inputs, ConvDim, ConvDim, pending);
 
   mamba2_decode_prologue<Groups, Heads, P, N, ConvDim, PackedWidth, XbcOffset, DtOffset>(
-      packed, conv_weights, conv_bias, history, conv_state_out, pending_tape, pending, step_tape, a, dt_bias,
-      shared, head, lane, simd_group);
+      packed, conv_weights, conv_bias, history, conv_state_out, rows, step_tape, a, dt_bias, shared, head, lane,
+      simd_group);
   threadgroup_barrier(mem_flags::mem_threadgroup);
-  mamba2_decode_scan<Heads, P, N, PackedWidth, ZOffset, 2>(state_in, state_out, shared, pending, packed, d, y, head,
-                                                           lane, simd_group);
+  mamba2_decode_scan<Groups, Heads, P, N, PackedWidth, ZOffset, 2>(state_in, state_out, shared, pending_tape,
+                                                                   pending, rows, packed, d, y, head, lane,
+                                                                   simd_group);
 }
 
 // Grid {heads, lanes}.
@@ -250,22 +247,24 @@ inline void mamba2_decode_batch_phase(
     device const uchar *current0, device const uchar *current1, device const uchar *current2,
     device const uchar *current3, device uchar *next0, device uchar *next1, device uchar *next2,
     device uchar *next3, device uchar *tape, device const float *a, device const float *dt_bias,
-    device const float *d, device float *y, constant GDNDecodeBatchParams &params, uint2 group, uint lane,
-    uint simd_group, threadgroup Mamba2DecodeShared<P, N> &shared) {
-  constexpr uint Rows = SPLASH_TARGET_VERIFY_ROWS;
+    device const float *d, device float *y, device const SplashLaneRows *lane_rows,
+    constant GDNDecodeBatchParams &params, uint2 group, uint lane, uint simd_group,
+    threadgroup Mamba2DecodeShared<P, N> &shared) {
   const uint batch = group.y;
+  const SplashLaneRows rows = lane_rows[batch];
   device const uchar *current = SPLASH_LANE_BINDING(batch, current0, current1, current2, current3);
   device uchar *next = SPLASH_LANE_BINDING(batch, next0, next1, next2, next3);
   mamba2_decode_step<Groups, Heads, P, N, ConvDim, PackedWidth, ZOffset, XbcOffset, DtOffset>(
-      packed + ulong(batch) * Rows * PackedWidth, conv_weights, conv_bias,
+      packed + ulong(rows.first) * PackedWidth, conv_weights, conv_bias,
       reinterpret_cast<device const bfloat *>(current + ulong(params.layer) * params.conv_layer_bytes),
       reinterpret_cast<device bfloat *>(next + ulong(params.layer) * params.conv_layer_bytes),
       reinterpret_cast<device const float *>(current + params.convolution_state_bytes +
                                              ulong(params.layer) * params.recurrent_layer_bytes),
       reinterpret_cast<device float *>(next + params.convolution_state_bytes +
                                        ulong(params.layer) * params.recurrent_layer_bytes),
-      tape, params.pending_tape[batch], params.step_tape[batch], params.pending_rows[batch], a, dt_bias, d,
-      y + ulong(batch) * Rows * Heads * P, group.x, lane, simd_group, shared);
+      tape, params.pending_tape[batch], params.step_tape[batch], uint(popcount(params.pending_path[batch])),
+      min(rows.rows, uint(SPLASH_TARGET_VERIFY_ROWS)), a, dt_bias, d, y + ulong(rows.first) * Heads * P, group.x,
+      lane, simd_group, shared);
 }
 
 #define MAMBA2_DECODE_KERNEL(Name, Groups, Heads, P, N, ConvDim, PackedWidth, ZOffset, XbcOffset, DtOffset)   \
@@ -277,13 +276,14 @@ inline void mamba2_decode_batch_phase(
                    device uchar *next3 [[buffer(10)]], device uchar *tape [[buffer(11)]],                      \
                    device const float *a [[buffer(12)]], device const float *dt_bias [[buffer(13)]],           \
                    device const float *d [[buffer(14)]], device float *y [[buffer(15)]],                       \
-                   constant GDNDecodeBatchParams &params [[buffer(16)]],                                       \
+                   device const SplashLaneRows *lane_rows [[buffer(16)]],                                      \
+                   constant GDNDecodeBatchParams &params [[buffer(17)]],                                       \
                    uint2 group [[threadgroup_position_in_grid]], uint lane [[thread_index_in_simdgroup]],      \
                    uint simd_group [[simdgroup_index_in_threadgroup]]) {                                       \
     threadgroup Mamba2DecodeShared<P, N> shared;                                                               \
     mamba2_decode_batch_phase<Groups, Heads, P, N, ConvDim, PackedWidth, ZOffset, XbcOffset, DtOffset>(        \
         packed, conv_weights, conv_bias, current0, current1, current2, current3, next0, next1, next2, next3,   \
-        tape, a, dt_bias, d, y, params, group, lane, simd_group, shared);                                      \
+        tape, a, dt_bias, d, y, lane_rows, params, group, lane, simd_group, shared);                                      \
   }
 
 // The compiled geometries (ops/Mamba2.cpp, kCompiledMamba2), named for their
@@ -308,8 +308,8 @@ MAMBA2_DECODE_KERNEL(verify_mamba2_g8_h128, 8, 128, 64, 128, 10240, 18560, 0, 81
     threadgroup Mamba2DecodeShared<P, N> shared;                                                               \
     mamba2_decode_step<Groups, Heads, P, N, ConvDim, PackedWidth, ZOffset, XbcOffset, DtOffset>(               \
         packed, conv_weights, conv_bias, conv_state_in, conv_state_out, state_in, state_out, tape,             \
-        params.pending_tape[0], params.step_tape[0], params.pending_rows[0], a, dt_bias, d, y, group.x, lane,  \
-        simd_group, shared);                                                                                   \
+        params.pending_tape[0], params.step_tape[0], uint(popcount(params.pending_path[0])),                   \
+        SPLASH_TARGET_VERIFY_ROWS, a, dt_bias, d, y, group.x, lane, simd_group, shared);                                                                                   \
   }
 MAMBA2_PREFILL_KERNEL(prefill_mamba2_g8_h128, 8, 128, 64, 128, 10240, 18560, 0, 8192, 18432)
 #undef MAMBA2_PREFILL_KERNEL

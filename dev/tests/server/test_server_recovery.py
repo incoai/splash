@@ -413,6 +413,91 @@ class ServerRecoveryTests(HarnessTestCase):
         )
         self.assertIn("native engine executable is missing", reason)
 
+    def test_the_follower_is_told_as_the_engine_fails_and_as_its_relaunch_serves(self):
+        """What follows the engine is told that it recovers as an engine that
+        served fails, and that it serves again once the engine relaunched in
+        its place does: once each, though a relaunch the host refuses memory
+        fails and is tried again in between."""
+        runtime = RecoveringRuntime()
+        host = wire.StartFailedEvent(
+            wire.StartFailureKind.HOST_MEMORY,
+            wire.ShortfallBound.DEVICE_MEMORY,
+            0,
+            0,
+            0,
+            b"the host has too little free memory to start",
+        )
+        backend = self.backend(runtime)
+        told = []
+        backend.follow(told.append)
+        self.assertEqual(told, [])
+        with (
+            mock.patch.object(supervision, "BACKOFF_BASE_SECONDS", 0.01),
+            mock.patch.object(backend_api, "print_status"),
+        ):
+            runtime.fail(backend)
+            self.assertEqual(told, [True])
+            runtime.outcomes.put(engine_runtime.EngineStartFailed(host))
+            self.wait_until(lambda: runtime.startup_calls == 2)
+            self.assertEqual(told, [True])
+            self.relaunched(runtime, backend)
+            self.assertEqual(told, [True, False])
+            runtime.fail(backend)
+            self.relaunched(runtime, backend)
+        self.assertEqual(told, [True, False, True, False])
+
+    def test_a_relaunch_that_fails_as_it_is_ready_is_not_told_as_serving(self):
+        """An engine that fails between its Ready and the relaunch's return
+        owes the next relaunch already: the follower, told of the failure on
+        the engine's thread and of the relaunch on the worker's, hears of no
+        serving engine until the next one serves."""
+        runtime = RecoveringRuntime()
+        backend = self.backend(runtime)
+        told = []
+        backend.follow(told.append)
+        relaunch = runtime.wait_ready
+
+        def ready_then_failed(timeout=None):
+            relaunch(timeout)
+            runtime.fail(backend)
+            return False
+
+        steps = iter((ready_then_failed, relaunch))
+        with (
+            mock.patch.object(supervision, "BACKOFF_BASE_SECONDS", 0.01),
+            mock.patch.object(backend_api, "print_status"),
+            mock.patch.object(
+                runtime,
+                "wait_ready",
+                side_effect=lambda timeout=None: next(steps)(timeout),
+            ),
+        ):
+            runtime.fail(backend)
+            runtime.outcomes.put(None)
+            self.wait_until(lambda: runtime.startup_calls == 2)
+            self.assertEqual(told, [True])
+            self.relaunched(runtime, backend)
+        self.assertEqual(told, [True, False])
+
+    def test_a_follower_hears_of_a_failure_before_it_followed_and_of_no_stop(self):
+        """A follower that begins while a relaunch is owed is told so at
+        once; once the backend stops relaunching it is told nothing more,
+        the server's end being the server's to say."""
+        runtime = RecoveringRuntime()
+        backend = self.backend(runtime)
+        backend.on_stopped = stopped = mock.Mock()
+        told = []
+        with mock.patch.object(backend_api, "print_status"):
+            runtime.fail(backend)
+            backend.follow(told.append)
+            self.assertEqual(told, [True])
+            runtime.outcomes.put(
+                engine_runtime.EngineLaunchFailed("native engine executable is missing")
+            )
+            self.wait_until(lambda: stopped.called)
+        backend.close()
+        self.assertEqual(told, [True])
+
     def test_relaunch_serving_less_context_is_adopted(self):
         """A relaunch whose plan holds less context serves that: the context
         /v1/models and /status report and requests are checked against

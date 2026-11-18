@@ -2387,6 +2387,123 @@ void earlyBuffersRunWhileTheRestEncodes(const std::string &metallibPath) {
     std::cout << "PASS a command's early buffers run while the rest encodes\n";
 }
 
+// A command in two parts is one command whose first part the GPU runs while
+// the caller builds the second: the first part's work shows before the
+// second is built, the second's dispatches and host steps follow it in order,
+// and one submission and one ticket hold both, the ticket's GPU time from the
+// first part's start and its wall time with the building of the second.
+void commandInTwoParts(const std::string &metallibPath) {
+    constexpr auto kBuilding = std::chrono::milliseconds(20);
+    MetalBackend backend(metallibPath);
+    MetalBuffer buffer = sharedBuffer(backend, sizeof(uint32_t));
+    auto *value = static_cast<volatile uint32_t *>(buffer.contents());
+    *value = 0;
+    const uint32_t count = 1, one = 1;
+    const std::vector<ComputeDispatch> first(1, addition(buffer, count, one)), second(3, addition(buffer, count, one));
+    // After the second part's first dispatch, the command's second.
+    std::atomic<uint32_t> atStep{0};
+    const std::vector<EventStep> steps{{1, {}, 0, EventStep::Kind::Host, [&] { atStep = *value; }}};
+    bool ranAhead = false, inFlight = false;
+    std::atomic<unsigned> notified{0};
+    const uint64_t submitted = BackendInstrumentation::submittedCommands(backend);
+    CommandTicket ticket = backend.submitCommandPartsAsync(
+        Command{first, {}},
+        [&] {
+            ranAhead = waitFor([&] { return *value == 1; }, std::chrono::seconds(5));
+            inFlight = backend.commandInFlight();
+            std::this_thread::sleep_for(kBuilding);
+            return Command{second, steps};
+        },
+        [&] { ++notified; });
+    const CommandTiming timing = ticket.wait();
+    require(ranAhead, "a command's first part did not run before its second was built");
+    require(inFlight && atStep == 2 && *value == 4,
+            "a command's second part did not follow its first in order, in the same command");
+    const double building = std::chrono::duration<double>(kBuilding).count();
+    require(timing.gpuSeconds >= building && timing.wallSeconds >= timing.gpuSeconds,
+            "a command in two parts does not time from its first part's start");
+    require(BackendInstrumentation::submittedCommands(backend) == submitted + 1 &&
+                BackendInstrumentation::lastCommandBuffers(backend) == 3 &&
+                waitFor([&] { return notified == 1; }, std::chrono::seconds(5)) && !backend.commandInFlight(),
+            "a command in two parts was not one submission of its parts' buffers, notified once");
+    // Refused before anything of it is committed: a first part with event
+    // steps, and a command without a second.
+    rejects([&] { (void)backend.submitCommandPartsAsync(Command{second, steps}, [&] { return Command{first, {}}; }); },
+            "a command's first part has no event steps", "a first part with event steps was submitted");
+    rejects([&] { (void)backend.submitCommandPartsAsync(Command{first, {}}, {}); },
+            "a command in two parts needs its second", "a command in two parts was submitted without its second");
+    require(backend.healthy() && !backend.commandInFlight() && *value == 4,
+            "a refused command in two parts ran or held the backend");
+    // Profiled, its dispatches are the first part's and then the second's,
+    // its host step between the second's.
+    BackendInstrumentation::setDispatchProfiling(backend, true);
+    atStep = 0;
+    CommandTicket profiled =
+        backend.submitCommandPartsAsync(Command{first, {}}, [&] { return Command{second, steps}; });
+    require(profiled.ready() && BackendInstrumentation::takeDispatchProfile(backend).size() == 4 && atStep == 6 &&
+                *value == 8,
+            "a profiled command in two parts was not its first part's dispatches and then its second's");
+    (void)profiled.wait();
+    BackendInstrumentation::setDispatchProfiling(backend, false);
+    // Submitted whole (BackendInstrumentation::submitPartsWhole), nothing of
+    // it runs before its second part is built, and it takes a buffer less:
+    // its second part follows its first in the same buffer.
+    BackendInstrumentation::submitPartsWhole(backend, true);
+    const uint32_t whole = *value;
+    uint32_t whileBuilding = 0;
+    (void)backend
+        .submitCommandPartsAsync(Command{first, {}},
+                                 [&] {
+                                     std::this_thread::sleep_for(kBuilding);
+                                     whileBuilding = *value;
+                                     return Command{second, steps};
+                                 })
+        .wait();
+    BackendInstrumentation::submitPartsWhole(backend, false);
+    require(whileBuilding == whole && atStep == whole + 2 && *value == whole + 4 &&
+                BackendInstrumentation::lastCommandBuffers(backend) == 2,
+            "a command in two parts submitted whole ran before its second part was built, or not as one command "
+            "of a buffer less");
+    std::cout << "PASS a command in two parts runs its first while its second is built\n";
+}
+
+// A second part that throws while it is built, or that the backend refuses
+// before it encodes any of it, leaves the command its first part alone: the
+// submission waits for that part, then throws the reason, with no completion
+// notified, nothing in flight and the backend healthy, as a command built
+// whole that is refused leaves it; the next command runs.
+void unbuiltSecondPartLeavesTheFirstAlone(const std::string &metallibPath) {
+    for (const bool refused : {false, true}) {
+        MetalBackend backend(metallibPath);
+        MetalBuffer buffer = sharedBuffer(backend, sizeof(uint32_t));
+        auto *value = static_cast<volatile uint32_t *>(buffer.contents());
+        *value = 0;
+        const uint32_t count = 1, one = 1;
+        const std::vector<ComputeDispatch> first(1, addition(buffer, count, one));
+        const char *reason = refused ? "Metal command must contain a dispatch" : "the second part was not built";
+        std::atomic<unsigned> notified{0};
+        rejects(
+            [&] {
+                (void)backend.submitCommandPartsAsync(
+                    Command{first, {}},
+                    [&]() -> Command {
+                        if (!refused) throw std::runtime_error(reason);
+                        return {};
+                    },
+                    [&] { ++notified; });
+            },
+            reason, "a command whose second part was not built was submitted");
+        require(*value == 1, "the first part of a command whose second was not built had not run when its submission "
+                             "threw");
+        require(backend.healthy() && !backend.commandInFlight() && notified == 0,
+                "an unbuilt second part left the backend unhealthy, its command in flight or a completion notified: " +
+                    backend.unhealthyReason());
+        (void)backend.submitCommandAsync(first).wait();
+        require(*value == 2, "the command after one whose second part was not built did not run");
+    }
+    std::cout << "PASS an unbuilt second part leaves the command its first part alone\n";
+}
+
 std::atomic<unsigned> encodersLeft{0};
 IMP originalEncoderAfterCommit = nullptr;
 // Hands out encoders until encodersLeft runs out, then none.
@@ -2412,7 +2529,9 @@ id limitedCommandBuffer(id queue, SEL selector) {
 // owners read as a command in flight before they free memory that buffer may
 // reach; the committed buffer still runs, and so does the host step after it.
 // One that fails before any commit (Metal creates no buffer for the command,
-// or none for the work after its host step) releases the submission.
+// or none for the work after its host step) releases the submission. A
+// command in two parts fails after a commit once its first part went: Metal
+// creates no buffer for its second.
 void encodingFailureAfterACommit(const std::string &metallibPath) {
     {
         MetalBackend backend(metallibPath);
@@ -2457,6 +2576,23 @@ void encodingFailureAfterACommit(const std::string &metallibPath) {
         commandBuffersLeft = -1;
         require(!backend.healthy() && !backend.commandInFlight(),
                 "a command that failed before any commit kept the submission or the backend healthy");
+    }
+    {
+        MetalBackend backend(metallibPath);
+        MetalBuffer buffer = sharedBuffer(backend, sizeof(uint32_t));
+        auto *value = static_cast<volatile uint32_t *>(buffer.contents());
+        *value = 0;
+        const uint32_t count = 1, one = 1;
+        const std::vector<ComputeDispatch> part(1, addition(buffer, count, one));
+        commandBuffersLeft = 1;
+        rejects([&] { (void)backend.submitCommandPartsAsync(Command{part, {}}, [&] { return Command{part, {}}; }); },
+                "unable to create Metal command buffer", "a command in two parts encoded without its second buffer");
+        commandBuffersLeft = -1;
+        require(!backend.healthy() && backend.commandInFlight() &&
+                    waitFor([&] { return *value == 1; }, std::chrono::seconds(5)),
+                "a command in two parts that failed after its first part's commit released the submission, left the "
+                "backend healthy or did not run that part: " +
+                    backend.unhealthyReason());
     }
     std::cout << "PASS an encoding failure keeps the submission only after a commit\n";
 }
@@ -3375,6 +3511,8 @@ std::span<const splash::test::TestCase> behaviourTests() {
         {"pipelinesCreatedWhileServingAreCounted", [] { pipelinesCreatedWhileServingAreCounted(metallib); }},
         {"hostStepCheckSpinsOutlastTheirRelease", [] { hostStepCheckSpinsOutlastTheirRelease(metallib); }},
         {"earlyBuffersRunWhileTheRestEncodes", [] { earlyBuffersRunWhileTheRestEncodes(metallib); }},
+        {"commandInTwoParts", [] { commandInTwoParts(metallib); }},
+        {"unbuiltSecondPartLeavesTheFirstAlone", [] { unbuiltSecondPartLeavesTheFirstAlone(metallib); }},
         {"encodingFailureAfterACommit", [] { encodingFailureAfterACommit(metallib); }},
         {"throwingHostStepFailsItsCommand", [] { throwingHostStepFailsItsCommand(metallib); }},
         {"failedCommandRunsNoLaterHostStep", [] { failedCommandRunsNoLaterHostStep(metallib); }},

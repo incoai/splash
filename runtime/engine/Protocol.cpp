@@ -26,7 +26,7 @@ std::string_view failureClassName(FailureClass failureClass);
 constexpr std::array<uint8_t, 4> kMagic{'S', 'P', 'L', 'H'};
 // Cancel and Stop: one u64 request id.
 constexpr uint64_t kRequestEndFixedBytes = 8;
-constexpr uint64_t kMaskResponseFixedBytes = 20;
+constexpr uint64_t kMaskResponseFixedBytes = 24;
 constexpr uint64_t kStatusRequestFixedBytes = 8;
 constexpr uint64_t kReleaseRequestFixedBytes = 8;
 constexpr uint64_t kReadyFixedBytes = 21;
@@ -38,6 +38,11 @@ constexpr uint64_t kDoneFixedBytes = 62;
 constexpr uint64_t kErrorFixedBytes = 22;
 constexpr uint64_t kStatusJsonFixedBytes = 8;
 constexpr uint64_t kStartFailedFixedBytes = 26;
+// The most words of a mask response's forced tokens: a row and a token for
+// as many tokens as a request simulates, after each of its rows.
+uint64_t forcedWords(const ProtocolLimits &limits) {
+  return 2 * (uint64_t{limits.maxSimulationTokens} + 1) * limits.maxSimulationTokens;
+}
 constexpr uint64_t kWarmingFixedBytes = 8;
 
 struct PayloadBounds {
@@ -85,7 +90,7 @@ std::optional<PayloadBounds> payloadBounds(FrameType type,
   case FrameType::Stop:
     return bounded(kRequestEndFixedBytes, kRequestEndFixedBytes);
   case FrameType::MaskResponse:
-    if (!checkedMultiply(limits.maxMaskWords, sizeof(uint32_t), variable) ||
+    if (!checkedMultiply(limits.maxMaskWords + forcedWords(limits), sizeof(uint32_t), variable) ||
         !checkedAdd(kMaskResponseFixedBytes, variable, maximum)) {
       return std::nullopt;
     }
@@ -483,12 +488,19 @@ std::optional<ProtocolIssue> validateMaskRequest(const MaskRequestEvent &event,
   }
   // An empty simulation sequence is the initial-anchor request and
   // deliberately produces one mask row. During speculative verification
-  // the sequence is [pending_anchor, draft...], so len+1 rows represent
-  // before-anchor and after each simulated token.
+  // the sequence is the verify block's tree, the pending anchor first, so
+  // len+1 rows represent before-anchor and after each token's path.
   if (!event.wordsPerMask ||
-      event.simulationTokens.size() > limits.maxSimulationTokens) {
+      event.simulationTokens.size() > limits.maxSimulationTokens ||
+      event.parents.size() != event.simulationTokens.size()) {
     return invalidEvent(IssueCode::InvalidCount, event.requestId,
                         "mask request dimensions are invalid");
+  }
+  // The first token is the tree's root, and every other follows one before it.
+  for (size_t row = 0; row < event.parents.size(); ++row) {
+    if (row ? event.parents[row] >= row : event.parents[row] != kNoMaskParent)
+      return invalidEvent(IssueCode::InvalidConstraint, event.requestId,
+                          "mask request tokens are not a tree whose parents come first");
   }
   uint64_t maskRows = 0;
   uint64_t totalWords = 0;
@@ -674,13 +686,15 @@ EncodedEvent encodeMaskRequest(const MaskRequestEvent &event,
   Writer writer =
       frameWriter(FrameType::MaskRequest,
                   kMaskRequestFixedBytes +
-                      event.simulationTokens.size() * sizeof(uint32_t));
+                      event.simulationTokens.size() * 2 * sizeof(uint32_t));
   writer.u64(event.requestId);
   writer.u64(event.maskRequestId);
   writer.u32(event.wordsPerMask);
   writer.u32(static_cast<uint32_t>(event.simulationTokens.size()));
   for (uint32_t token : event.simulationTokens)
     writer.u32(token);
+  for (uint32_t parent : event.parents)
+    writer.u32(parent);
   return success(writer.take());
 }
 
@@ -881,22 +895,22 @@ ProtocolResult<ClientMessage> decodeMaskResponse(const Frame &frame,
                                                  const ProtocolLimits &limits) {
   Reader reader(frame.payload);
   MaskResponseFrame response;
-  uint32_t wordCount = 0;
+  uint32_t wordCount = 0, forcedCount = 0;
   if (!reader.u64(response.requestId) || !reader.u64(response.maskRequestId) ||
-      !reader.u32(wordCount)) {
+      !reader.u32(wordCount) || !reader.u32(forcedCount)) {
     return failure<ClientMessage>(
         makeIssue(FailureClass::ProtocolFatal, IssueCode::InvalidPayloadLength,
                   0, "mask response fixed payload is truncated"));
   }
-  if (wordCount > limits.maxMaskWords) {
+  if (wordCount > limits.maxMaskWords || forcedCount > forcedWords(limits)) {
     return failure<ClientMessage>(
         requestIssue(IssueCode::LimitExceeded, response.requestId,
                      "mask response word count exceeds its limit"));
   }
   uint64_t expectedBytes = 0;
-  if (!checkedMultiply(wordCount, sizeof(uint32_t), expectedBytes) ||
+  if (!checkedMultiply(uint64_t{wordCount} + forcedCount, sizeof(uint32_t), expectedBytes) ||
       reader.remaining() != expectedBytes ||
-      !reader.words(wordCount, response.maskWords)) {
+      !reader.words(wordCount, response.maskWords) || !reader.words(forcedCount, response.forcedTokens)) {
     return failure<ClientMessage>(
         requestIssue(IssueCode::InvalidPayloadLength, response.requestId,
                      "mask word count does not match the binary payload"));

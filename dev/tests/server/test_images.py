@@ -24,7 +24,6 @@ from dev.tests.server_fixtures import (
     anthropic_body,
     chat_body,
     document_block,
-    engine_ready,
     no_signed_thinking,
     pdf_bytes,
     png_data_url,
@@ -393,134 +392,81 @@ class ImageRequestTest(HarnessTestCase):
         self.assertEqual(harness.app.images.stats()["entries"], 1)
         self.assertEqual(runtime.requests[1].frame.image_spans, request.image_spans)
 
-    def test_image_positions_ignore_quoted_vision_tokens(self):
-        from tokenizers import pre_tokenizers
+    @staticmethod
+    def nemotron_tokenizer():
+        """Byte-level BPE, as PromptTokenizer requires, with Nemotron's turn
+        and image tokens added."""
+        from tokenizers import AddedToken, decoders, pre_tokenizers, trainers
         from transformers import PreTrainedTokenizerFast
 
-        backend = Tokenizer(models.WordLevel({"[UNK]": 0}, unk_token="[UNK]"))
-        backend.pre_tokenizer = pre_tokenizers.WhitespaceSplit()
-        tokenizer = PreTrainedTokenizerFast(
-            tokenizer_object=backend,
-            additional_special_tokens=[
-                QWEN.image_pad,
-                "<|vision_start|>",
-                "<|vision_end|>",
-            ],
+        backend = Tokenizer(models.BPE())
+        backend.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=False)
+        backend.decoder = decoders.ByteLevel()
+        backend.train_from_iterator(
+            ["user assistant system Compare And? Done"],
+            trainers.BpeTrainer(
+                vocab_size=300,
+                initial_alphabet=pre_tokenizers.ByteLevel.alphabet(),
+                show_progress=False,
+            ),
         )
-        tokenizer.chat_template = (
-            "{% for message in messages %}{{ message.role }}: "
-            "{% if message.content is string %}{{ message.content }}"
-            "{% else %}{% for part in message.content %}"
-            "{% if part.type == 'image_url' %}"
-            "{{ '<|vision_start|><|image_pad|><|vision_end|>' }}"
-            "{% else %}{{ part.text }}{% endif %}{% endfor %}{% endif %}"
-            "{{ '\\n' }}{% endfor %}"
+        backend.add_special_tokens(
+            [
+                AddedToken(text, normalized=False, lstrip=False, rstrip=False)
+                for text in (
+                    "<|im_start|>",
+                    "<|im_end|>",
+                    NEMOTRON.image_pad,
+                    NEMOTRON.image_open,
+                    NEMOTRON.image_close,
+                )
+            ]
         )
-        app = object.__new__(request_frontend.Frontend)
-        app.tokenizer = tokenizer
-        app.chat_format = QWEN
+        return PreTrainedTokenizerFast(tokenizer_object=backend)
+
+    @staticmethod
+    def nemotron_app(tokenizer, max_context):
+        """A frontend of just what rendering a Nemotron prompt reads."""
         from server.latency import LatencyMetrics
+        from server.tokenization import PromptTokenizer
 
-        app.latencies = LatencyMetrics()
-        app.backend = SimpleNamespace(
-            runtime=SimpleNamespace(capabilities=engine_ready(1024))
-        )
-        quoted = "中文 📷 <|vision_start|><|image_pad|><|vision_end|>"
-        messages = [
-            {"role": "system", "content": "Document: " + QWEN.image_pad},
-            {
-                "role": "user",
-                "content": [
-                    {"type": "image_url", "image_url": {"url": "unused"}},
-                    {"type": "text", "text": quoted},
-                ],
-            },
-            {
-                "role": "tool",
-                "content": [
-                    {"type": "image_url", "image_url": {"url": "unused"}},
-                    {"type": "text", "text": quoted},
-                ],
-            },
-        ]
-        template = {
-            "tokenize": True,
-            "return_dict": False,
-            "chat_template": tokenizer.chat_template,
-        }
-        baseline = tokenizer.apply_chat_template(messages, **template)
-        pad_id = tokenizer.convert_tokens_to_ids(QWEN.image_pad)
-        all_pads = [i for i, token in enumerate(baseline) if token == pad_id]
-        self.assertEqual(len(all_pads), 5)
-        tokens, positions, rendered = app._render_image_tokens(messages, template)
-        self.assertEqual(tokens, baseline)
-        self.assertEqual(
-            rendered, tokenizer.apply_chat_template(messages, tokenize=False)
-        )
-        self.assertEqual(positions, [all_pads[1], all_pads[3]])
-        # Render markers must not change prompt/cache identity on a repeat.
-        self.assertEqual(
-            app._render_image_tokens(messages, template), (tokens, positions, rendered)
-        )
-        prepared = [
-            SimpleNamespace(
-                tokens=4,
-                grid_height=4,
-                grid_width=4,
-                digest_lo=i,
-                digest_hi=0,
-                pixels=bytes([i]),
-                frames=1,
-            )
-            for i in (1, 2)
-        ]
-        expanded, spans, pixels = app._expand_image_pads(tokens, prepared, positions)
-        expected = list(baseline)
-        for position in reversed(positions):
-            expected[position : position + 1] = [pad_id] * 4
-        self.assertEqual(expanded, expected)
-        self.assertEqual(
-            [span.offset for span in spans], [positions[0], positions[1] + 3]
-        )
-        self.assertEqual(pixels, b"\x01\x02")
-        app._check_image_placeholders(tokens, prepared, positions)
-        for wrong in (prepared[:1], [*prepared, prepared[0]]):
-            with self.assertRaisesRegex(api.APIError, "image count"):
-                app._check_image_placeholders(tokens, wrong, positions)
-
-    def test_nemotron_images_mark_template_sites_and_wrap_pads(self):
-        from tokenizers import pre_tokenizers
-        from transformers import PreTrainedTokenizerFast
-
-        backend = Tokenizer(models.WordLevel({"[UNK]": 0}, unk_token="[UNK]"))
-        backend.pre_tokenizer = pre_tokenizers.WhitespaceSplit()
-        tokenizer = PreTrainedTokenizerFast(
-            tokenizer_object=backend,
-            additional_special_tokens=[
-                "<|im_start|>",
-                "<|im_end|>",
-                NEMOTRON.image_pad,
-                NEMOTRON.image_open,
-                NEMOTRON.image_close,
-            ],
-        )
-        fixtures_dir = Path(__file__).resolve().parents[1] / "fixtures"
-        template = {
-            "tokenize": True,
-            "return_dict": False,
-            "chat_template": (fixtures_dir / "chat_templates/bolt.jinja").read_text(),
-        }
         app = object.__new__(request_frontend.Frontend)
         app.tokenizer = tokenizer
         app.chat_format = NEMOTRON
-        from server.latency import LatencyMetrics
-
         app.latencies = LatencyMetrics()
+        app.prompt_tokenizer = PromptTokenizer(
+            tokenizer, NEMOTRON.message_boundary, max_context
+        )
         app.backend = SimpleNamespace(
             runtime=SimpleNamespace(
-                capabilities=SimpleNamespace(max_context_tokens=1024)
+                capabilities=SimpleNamespace(max_context_tokens=max_context)
             )
         )
+        return app
+
+    @staticmethod
+    def render(app, messages, source, videos=(), count=None):
+        """As _render_prompt renders: the prompt's tokens, its text, and
+        each image's pad among the tokens."""
+        from server.tokenization import unquoted
+
+        if videos:
+            source = app._video_source(source)
+        rendered = app._apply_chat_template(messages, source, {})
+        if videos:
+            rendered = app._expand_videos(rendered, videos)
+        tokens = app.prompt_tokenizer.encode(rendered)
+        pad_id = app.tokenizer.convert_tokens_to_ids(NEMOTRON.image_pad)
+        if count is None:
+            count = tokens.count(pad_id)
+        return tokens, app._image_positions(tokens, count), unquoted(rendered)
+
+    def test_nemotron_images_mark_template_sites_and_wrap_pads(self):
+        tokenizer = self.nemotron_tokenizer()
+        fixtures_dir = Path(__file__).resolve().parents[1] / "fixtures"
+        source = (fixtures_dir / "chat_templates/bolt.jinja").read_text()
+        template = {"tokenize": True, "return_dict": False, "chat_template": source}
+        app = self.nemotron_app(tokenizer, 1024)
         image = {"type": "image_url", "image_url": {"url": "unused"}}
         messages = [
             # Text quoting the placeholder is not an image.
@@ -537,12 +483,12 @@ class ImageRequestTest(HarnessTestCase):
         pad, image_open, image_close = tokenizer.convert_tokens_to_ids(
             [NEMOTRON.image_pad, NEMOTRON.image_open, NEMOTRON.image_close]
         )
-        all_pads = [i for i, token in enumerate(baseline) if token == pad]
-        self.assertEqual(len(all_pads), 4)
-        tokens, positions, rendered = app._render_image_tokens(messages, template)
-        self.assertEqual(tokens, baseline)
+        # The tokenizer alone reads the system message's <image> as a pad too.
+        self.assertEqual(baseline.count(pad), 4)
+        tokens, positions, rendered = self.render(app, messages, source, count=3)
+        self.assertEqual(tokenizer.decode(tokens), rendered)
         self.assertIn("<image 1><image><image 2><image>Compare", rendered)
-        self.assertEqual(positions, all_pads[1:])
+        self.assertEqual(positions, [i for i, t in enumerate(tokens) if t == pad])
         prepared = [
             SimpleNamespace(
                 tokens=4,
@@ -556,7 +502,7 @@ class ImageRequestTest(HarnessTestCase):
             for i in (1, 2, 3)
         ]
         expanded, spans, _ = app._expand_image_pads(tokens, prepared, positions)
-        expected = list(baseline)
+        expected = list(tokens)
         for position in reversed(positions):
             expected[position : position + 1] = [image_open, *[pad] * 4, image_close]
         self.assertEqual(expanded, expected)
@@ -566,14 +512,16 @@ class ImageRequestTest(HarnessTestCase):
             [span.offset for span in spans],
             [position + 1 + 5 * i for i, position in enumerate(positions)],
         )
-        # The template drops a message's images where its text quotes the
-        # placeholder, so the images no longer match it.
+        # Text that quotes the placeholder reaches the template quoted, so the
+        # template still writes the message's image, and the quote stays text.
         quoting = [
             {"role": "user", "content": [image, {"type": "text", "text": "<image>"}]}
         ]
-        tokens, positions, _ = app._render_image_tokens(quoting, template)
+        tokens, positions, rendered = self.render(app, quoting, source, count=1)
+        self.assertEqual(rendered.count("<image>"), 2)
+        self.assertEqual(tokens.count(pad), 1)
         with self.assertRaisesRegex(api.APIError, "image count"):
-            app._check_image_placeholders(tokens, prepared[:1], positions)
+            self.render(app, quoting, source, count=2)
 
     def test_images_resize_as_their_familys_processor_does(self):
         image = SimpleNamespace(tokens=4, pixels=b"\x00")
@@ -601,38 +549,10 @@ class ImageRequestTest(HarnessTestCase):
     def test_nemotron_videos_widen_to_labeled_tubelets(self):
         """As Nemotron Omni's processor widens <video>: each tubelet's label,
         then its run, the runs a line apart; spans carry both frames."""
-        from tokenizers import pre_tokenizers
-        from transformers import PreTrainedTokenizerFast
-
-        backend = Tokenizer(models.WordLevel({"[UNK]": 0}, unk_token="[UNK]"))
-        backend.pre_tokenizer = pre_tokenizers.WhitespaceSplit()
-        tokenizer = PreTrainedTokenizerFast(
-            tokenizer_object=backend,
-            additional_special_tokens=[
-                "<|im_start|>",
-                "<|im_end|>",
-                NEMOTRON.image_pad,
-                NEMOTRON.image_open,
-                NEMOTRON.image_close,
-            ],
-        )
+        tokenizer = self.nemotron_tokenizer()
         fixtures_dir = Path(__file__).resolve().parents[1] / "fixtures"
-        template = {
-            "tokenize": False,
-            "return_dict": False,
-            "chat_template": (fixtures_dir / "chat_templates/bolt.jinja").read_text(),
-        }
-        app = object.__new__(request_frontend.Frontend)
-        app.tokenizer = tokenizer
-        app.chat_format = NEMOTRON
-        from server.latency import LatencyMetrics
-
-        app.latencies = LatencyMetrics()
-        app.backend = SimpleNamespace(
-            runtime=SimpleNamespace(
-                capabilities=SimpleNamespace(max_context_tokens=4096)
-            )
-        )
+        source = (fixtures_dir / "chat_templates/bolt.jinja").read_text()
+        app = self.nemotron_app(tokenizer, 4096)
         video = {"type": "video_url", "video_url": {"url": "unused"}}
         image = {"type": "image_url", "image_url": {"url": "unused"}}
         messages = [
@@ -649,8 +569,8 @@ class ImageRequestTest(HarnessTestCase):
                 "Frame 3 sampled at 1.98 seconds: ",
             ),
         )
-        tokens, positions, rendered = app._render_image_tokens(
-            messages, template, [labels]
+        tokens, positions, rendered = self.render(
+            app, messages, source, [labels], count=3
         )
         self.assertIn(
             f"{labels[0]}<image>\n{labels[1]}<image><image>What changed?", rendered
@@ -679,7 +599,9 @@ class ImageRequestTest(HarnessTestCase):
         self.assertEqual([span.frames for span in spans], [2, 2, 1])
         self.assertEqual(tokenizer.decode(expanded).count(f"{NEMOTRON.image_open}"), 3)
         with self.assertRaisesRegex(api.APIError, "video count"):
-            app._render_image_tokens(messages, template, [])
+            app._expand_videos(
+                app._apply_chat_template(messages, app._video_source(source), {}), []
+            )
 
     def test_pruned_video_folds_into_one_span(self):
         """EVS folds a video's tubelets into one span: the text between them,
@@ -784,19 +706,6 @@ class ImageRequestTest(HarnessTestCase):
                 images.video_resize(height, width),
                 (patches[0] * 16, patches[1] * 16),
             )
-
-    def test_image_render_marker_is_stable_across_requests(self):
-        app = self.harness(FakeRuntime(), tokenizer=ImagePadTokenizer()).app
-        template = {
-            "tokenize": False,
-            "return_dict": False,
-            "chat_template": app.tokenizer.chat_template,
-        }
-        app._render_image_tokens([image_message()], template)
-        app._render_image_tokens([image_message()], template)
-        first_source = app.tokenizer.templates[-2][1]["chat_template"]
-        second_source = app.tokenizer.templates[-1][1]["chat_template"]
-        self.assertEqual(first_source, second_source)
 
     def test_image_size_is_checked_before_pixel_concatenation(self):
         app = self.harness(FakeRuntime(), tokenizer=ImagePadTokenizer()).app

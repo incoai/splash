@@ -75,7 +75,7 @@ class BuildIdentityTests(unittest.TestCase):
         self.assertIn("runtime/metal/abi/ExecutionGeometry.h", inputs)
         self.assertIn("runtime/model/Runtime.cpp", inputs)
         self.assertIn("runtime/metal/kernels/decode/linear_gguf_sgmatrix.metal", inputs)
-        self.assertIn("runtime/metal/kernels/prefill/paged_attention.metal", inputs)
+        self.assertIn("runtime/metal/kernels/shared/paged_attention.metal", inputs)
         self.assertIn("runtime/metal/abi/KernelABI.h", inputs)
         self.assertIn("runtime/metal/kernels/common/paged_attention_tile.h", inputs)
         self.assertIn("dev/tools/build_identity.py", inputs)
@@ -367,24 +367,29 @@ class CompileConfigurationTests(unittest.TestCase):
             root = Path(directory)
             self.build_files(root)
             kernel_root = Path("runtime/metal/kernels")
-            # The Q8 tests' kernels: both phases' attention and store, and the
-            # sparse ones.
+            # The Q8 tests' kernels: the attention, the path commit and the
+            # sparse ones, beside the tests' own K/V store.
             q8_sources = [
-                kernel_root / phase / name
-                for phase in ("prefill", "decode")
-                for name in ("paged_attention.metal", "paged_attention_store.metal")
-            ] + [kernel_root / "shared/sparse_attention.metal"]
+                kernel_root / "shared" / name
+                for name in (
+                    "paged_attention.metal",
+                    "kv_path_commit.metal",
+                    "sparse_attention.metal",
+                )
+            ]
             # Every test library a MetalBackend loads links the kernel that
             # ends residency; q8-attention.metallib is loaded by raw MTLDevice
             # tests.
             residency_source = kernel_root / "shared/residency.metal"
             removed_source = kernel_root / "shared/removed.metal"
             removed_header = kernel_root / "common/removed.h"
+            store_source = Path("dev/tests/engine/attention_store_test.metal")
             for relative in (
                 *q8_sources,
                 residency_source,
                 removed_source,
                 removed_header,
+                store_source,
                 Path("runtime/engine/Status.cpp"),
                 Path("dev/tests/engine/metal_backend_test.metal"),
             ):
@@ -411,6 +416,7 @@ class CompileConfigurationTests(unittest.TestCase):
                 )
                 for source in (*q8_sources, residency_source, removed_source)
             }
+            # The tests' store includes the kernel headers too.
             test_airs = {
                 str(
                     build
@@ -418,7 +424,7 @@ class CompileConfigurationTests(unittest.TestCase):
                     / source.relative_to(kernel_root).with_suffix(".air")
                 )
                 for source in q8_sources
-            }
+            } | {str(build / "engine-tests/attention-store-test.air")}
             residency_air = str(build / "engine-tests/kernels/shared/residency.air")
 
             def rebuild(*selected):

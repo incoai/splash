@@ -439,8 +439,8 @@ bool MemoryGovernor::claimWaiting() const noexcept { return ledger_.claimWaiting
 // idle state buffers) first either way. A pass that freed nothing now or
 // later waits (Pending) while memory lands if its rights wait for writes,
 // else is Short: it found nothing to take.
-FreeResult MemoryGovernor::hostPass(uint64_t target) {
-  const ClaimSpec spec{.cls = ClaimClass::Host};
+FreeResult MemoryGovernor::hostPass(uint64_t target, bool forRefusedStart) {
+  const ClaimSpec spec{.cls = ClaimClass::Host, .forRefusedStart = forRefusedStart};
   const Need need{.bytes = target};
   const MemoryPressure pressure = hostRule_.level();
   const uint64_t found = ledger_.available(spec, need, 0, pressure);
@@ -500,10 +500,10 @@ bool MemoryGovernor::controlPass(double nowMilliseconds) {
       // One sized claim per settled second, resampled while critical
       // pressure lasts: the margin and what the host refused, in the one
       // order, the store down to its floor at most.
-      pass = hostPass(kHostMarginBytes + refused);
+      pass = hostPass(kHostMarginBytes + refused, refused != 0);
       nextHostPassMilliseconds_ = nowMilliseconds + kHostSettleMilliseconds;
     } else if (const uint64_t deficit = hostRule_.deficitBytes(refused, ledger_.returning().landingBytes)) {
-      pass = hostPass(std::min(kHostMarginBytes, deficit));
+      pass = hostPass(std::min(kHostMarginBytes, deficit), refused != 0);
     }
   }
   // After the host's claim: growth goes only where the host admits it, so

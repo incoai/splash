@@ -162,6 +162,8 @@ void testServerCommandLines(const char *path) {
       {"kv_format_default", [](NativeArguments &read) { read.kvFormat = kv::Format::Int8; }},
       {"state_format_default",
        [](NativeArguments &read) { read.stateFormat = ops::GdnStateFormat::Float32; }},
+      {"cached_states_exact", [](NativeArguments &read) { read.exactCachedStates = true; }},
+      {"cached_states_default", [](NativeArguments &read) { read.exactCachedStates = false; }},
       // A relaunch asks for the first engine's context beside that engine's
       // MAX_CONTEXT: it is planned as that engine was, and serves what its
       // plan holds of the context.
@@ -204,6 +206,7 @@ void testServerCommandLines(const char *path) {
            read.maxCacheDiskWritesBytes == meant.maxCacheDiskWritesBytes &&
            read.persistentCache == meant.persistentCache && read.cacheRoot == meant.cacheRoot &&
            read.kvFormat == meant.kvFormat && read.stateFormat == meant.stateFormat &&
+           read.exactCachedStates == meant.exactCachedStates &&
            read.decodeShare == meant.decodeShare &&
            read.maxImagePatches == meant.maxImagePatches &&
            read.idleReleaseSeconds == meant.idleReleaseSeconds &&
@@ -293,6 +296,7 @@ void testRefusals() {
   refuses({"auto", "auto", "--state-format", "fp16"},
           "--state-format requires fp32 or bf16");
   refuses({"auto", "auto", "--state-format"}, "--state-format requires fp32 or bf16");
+  refuses({"auto", "auto", "--cached-states", "fp32"}, "--cached-states requires int8 or exact");
   for (const char *share : {"-1", "nan", "inf", "half"})
     refuses({"auto", "auto", "--decode-share", share},
             "--decode-share requires a nonnegative number");

@@ -12,8 +12,9 @@
 // vocabulary, and the one that finishes last (split_arrive_last) draws.
 // Every reduction runs in a fixed order, so a row selects the same token on
 // every run. The same kernels select the first token after a prompt and the
-// verify rows (TargetSamplingParams): each dispatch covers the selected rows
-// of every lane, and the groups of the other policy's lanes return at once.
+// verify rows (TargetSamplingParams): each dispatch is a grid of a lane's rows
+// by lanes, and the groups of the other policy's lanes, and those past a
+// lane's rows, return at once.
 
 // Whether `token` is one of a target's stop tokens (metal/abi/Sampling.h).
 // SPLASH_NO_TOKEN, which pads them, is none, also where acceptance retains
@@ -49,22 +50,28 @@ struct TargetRow {
   }
 };
 
-// The lane of selected row s, and whether it samples.
-inline uint selected_lane(constant TargetSamplingParams &params, uint s) {
-  return s / params.rows;
+// Row `index` of lane `lane` of a dispatch (TargetSamplingParams): whether
+// the lane selects it, one of its rows, and takes the policy the kernel runs
+// (sampled or greedy), and its logits row s, which indexes the workspaces
+// and outputs.
+inline bool selects(constant TargetSamplingParams &params,
+                    device const SplashLaneRows *lane_rows, uint lane, uint index,
+                    bool sampled) {
+  return index < lane_rows[lane].rows &&
+         ((params.sampling_mask & (1u << lane)) != 0) == sampled;
 }
-inline bool lane_samples(constant TargetSamplingParams &params, uint s) {
-  return (params.sampling_mask & (1u << selected_lane(params, s))) != 0;
+inline uint selected_logits_row(device const SplashLaneRows *lane_rows,
+                                uint lane, uint index) {
+  return lane_rows[lane].first + index;
 }
 
-// Selected row s of a dispatch (TargetSamplingParams).
+// Row `index` of lane `lane` of a dispatch (TargetSamplingParams).
 inline TargetRow selected_row(device const float *logits,
                               device const uint *token_mask,
-                              constant TargetSamplingParams &params, uint s) {
-  const uint lane = selected_lane(params, s);
-  const uint index = s % params.rows;
-  return {logits + (ulong(lane) * SPLASH_TARGET_VERIFY_ROWS +
-                    params.logits_row + index) *
+                              constant TargetSamplingParams &params,
+                              device const SplashLaneRows *lane_rows, uint lane,
+                              uint index) {
+  return {logits + ulong(selected_logits_row(lane_rows, lane, index)) *
                        params.vocabulary,
           token_mask + (ulong(lane) * (SPLASH_TARGET_VERIFY_ROWS + 1) +
                         params.mask_row + index) *
@@ -75,6 +82,19 @@ inline TargetRow selected_row(device const float *logits,
           params.vocabulary,
           params.temperature[lane],
           0.0f};
+}
+
+// Each lane's lane rows and tree row for the selection of its first token
+// after its prompt (SampleFirstRowsParams), one group a lane: its one row of
+// the logits, a tree's root, which the selection's kernels read as a decode
+// cycle's.
+kernel void decode_sample_first_rows(
+    device SplashLaneRows *lane_rows [[buffer(0)]],
+    device SplashTreeRow *tree [[buffer(1)]],
+    constant SampleFirstRowsParams &params [[buffer(2)]],
+    uint lane [[threadgroup_position_in_grid]]) {
+  lane_rows[lane] = {params.row[lane], 1};
+  tree[params.row[lane]] = {1u, SPLASH_TREE_ROOT, 0};
 }
 
 // Shares of a row's softmax denominator combined in order: their largest
@@ -139,17 +159,21 @@ kernel void decode_sample_mass_sharded(
     device const float *logits [[buffer(0)]],
     device const uint *token_mask [[buffer(1)]],
     device TargetShardMass *partial_masses [[buffer(2)]],
-    constant TargetSamplingParams &params [[buffer(3)]],
-    uint group [[threadgroup_position_in_grid]],
+    device const SplashLaneRows *lane_rows [[buffer(3)]],
+    constant TargetSamplingParams &params [[buffer(4)]],
+    uint2 group [[threadgroup_position_in_grid]],
     uint thread_index [[thread_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]],
     uint simd_group [[simdgroup_index_in_threadgroup]]) {
   threadgroup TargetShardMass group_masses[8];
-  const uint s = group / SPLASH_TARGET_SAMPLING_SHARDS;
-  if (!lane_samples(params, s))
+  const uint batch = group.y, index = group.x / SPLASH_TARGET_SAMPLING_SHARDS;
+  if (!selects(params, lane_rows, batch, index, true))
     return;
-  shard_mass(selected_row(logits, token_mask, params, s),
-             group % SPLASH_TARGET_SAMPLING_SHARDS, partial_masses[group],
+  const uint shard = group.x % SPLASH_TARGET_SAMPLING_SHARDS;
+  shard_mass(selected_row(logits, token_mask, params, lane_rows, batch, index), shard,
+             partial_masses[ulong(selected_logits_row(lane_rows, batch, index)) *
+                                SPLASH_TARGET_SAMPLING_SHARDS +
+                            shard],
              group_masses, thread_index, lane, simd_group);
 }
 
@@ -167,7 +191,6 @@ static_assert(kVocabularyRanges <= kVocabularyThreads,
 // scale (place_pivots).
 constant constexpr uint kPivots = 15;
 constant constexpr uint kKeyPivots = 4;
-constant constexpr uint kDraftCandidates = SPLASH_DRAFT_CANDIDATES;
 
 // The order of the logits as an unsigned key: a larger logit has a larger
 // key, and -0 and +0, which compare equal, share one. Every logit's key is
@@ -272,23 +295,18 @@ struct VocabularyScratch {
 
 struct DrawScratch {
   uint arrival;
-  // Per range of the draw: the kept weight of its tokens other than the
-  // draft's candidates, one past the last of those with weight, and its
-  // weight in the draw.
-  float range_rest[kVocabularyRanges];
-  uint range_last[kVocabularyRanges];
+  // Per range of the draw: the kept weight of its tokens and one past the
+  // last of them with weight.
   float range_weights[kVocabularyRanges];
-  // The draft's candidates, each listed once: its draft probability, kept
-  // weight, weight in the draw and range.
-  uint draft_ids[kDraftCandidates];
-  float draft_probabilities[kDraftCandidates];
-  float draft_weights[kDraftCandidates];
-  float draft_draw_weights[kDraftCandidates];
-  uint draft_ranges[kDraftCandidates];
-  float kept_mass;
+  uint range_last[kVocabularyRanges];
   uint drawn_range;
   float drawn_target;
   uint drawn_token;
+  // Whether the row selected a candidate, and whether its draw excludes its
+  // candidates, which it then holds (vocabulary_draw).
+  bool selected;
+  bool excluding;
+  uint excluded[SPLASH_DRAFT_CANDIDATES];
 };
 
 // Pivots inside [lo, hi) that split the bracket. The tie order splits its
@@ -659,179 +677,210 @@ inline float kept_weight(TargetRow row, OrderBoundary end, uint token) {
   return at_or_before(logit_key(value), token, end) ? row.weight(value) : 0.0f;
 }
 
-// The draft's candidates in one range of the draw, one bit per staged entry.
-inline uint range_candidates(uint range, threadgroup DrawScratch &scratch) {
-  uint held = 0;
-  for (uint index = 0; index < kDraftCandidates; ++index)
-    held |= scratch.draft_ranges[index] == range ? 1u << index : 0u;
-  return held;
-}
+// A sampled verify row's draft children (TargetSamplingParams): the
+// candidates of its next position (ids, kDrawCandidates of them), the draft's
+// probabilities of them there (q), the candidate indices of the children its
+// draft drew, in the order drawn (kNoDraw past them), and a uniform for each
+// child's test. A row without children draws from its whole distribution.
+constant constexpr uint kDrawCandidates = SPLASH_DRAFT_CANDIDATES;
+constant constexpr uchar kNoDraw = 0xff;
+struct DrawChildren {
+  device const uint *ids;
+  device const float *q;
+  device const uchar *draws;
+  device const float *uniforms;
+};
 
-// One range's weight in the draw: the kept weight of its tokens other than
-// the draft's candidates, plus its candidates' draw weights.
-inline float range_weight(uint range, threadgroup DrawScratch &scratch) {
-  float weight = scratch.range_rest[range];
-  for (uint held = range_candidates(range, scratch); held; held &= held - 1)
-    weight += scratch.draft_draw_weights[ctz(held)];
-  return weight;
-}
-
-// The last token of a range with weight in the draw, which the draw takes
-// when rounding leaves its target unreached.
-inline uint range_last(uint range, threadgroup DrawScratch &scratch) {
-  uint after = scratch.range_last[range];
-  for (uint held = range_candidates(range, scratch); held; held &= held - 1) {
-    const uint index = ctz(held);
-    if (scratch.draft_draw_weights[index] > 0.0f)
-      after = max(after, scratch.draft_ids[index] + 1);
-  }
-  return after - 1;
-}
-
-// Draws the row's token, shared by its groups; returns true in the group that
-// finishes last, with the drawn token and the draft token's probability. Each
-// kept token weighs its softmax weight; with a draft, each of the draft's
-// candidates weighs its weight less its draft probability times the kept
-// mass, never below zero, so the draw follows the residual distribution
-// acceptance corrects a rejected draft token from (the whole distribution
-// when nothing remains). Each simdgroup of the row's groups sums one range of
-// the vocabulary without the candidates; the last group computes their
-// weights once, adds the ranges in order and walks the one that holds the
-// draw with prefix sums. A range's weight and its walk add the same token
-// weights, so the range the draw picks always has a token to draw.
+// The row's selection, shared by its groups; returns true in the group that
+// finishes last, with the selected token. Each kept token weighs its softmax
+// weight. Each simdgroup of the row's groups sums one range of the
+// vocabulary; the last group adds the ranges in order, then tests the row's
+// children in the order drawn, recursive rejection sampling without
+// replacement: child i, of probability p_i under the target and q_i under the
+// draft, is selected with probability min(1, p_i / q_i), where after each
+// rejection the target's distribution becomes its residual max(p - q, 0),
+// renormalized, and the draft's loses the rejected child, renormalized. A
+// row that selects none draws from the last residual: from its candidates'
+// residual weights, or past them from the target's own weights of the tokens
+// outside its candidates, whose range it walks with prefix sums. So the
+// selection is a draw from the target's distribution whatever the children,
+// and a child the row rejected only at fp32 rounding: where its residual
+// rounds to nothing, which leaves the draw the target before the child's
+// test, or where the candidates hold all the target keeps and their ranges a
+// remainder of rounding, which a draw past them lands on. A range's weight
+// and its walk add the same token weights, so the range the draw picks always
+// has a token to draw; a row that keeps no token draws past the vocabulary's
+// end, the sentinel of a row with no selectable logit.
 inline bool vocabulary_draw(
-    TargetRow row, OrderBoundary end, bool drafted, uint draft_token,
-    device const uint *draft_ids, device const float *draft_probabilities,
-    float uniform, device coherent(device) TargetVocabularyRange *ranges,
+    TargetRow row, OrderBoundary end, float uniform, DrawChildren children,
+    device coherent(device) TargetVocabularyRange *ranges,
     device atomic_uint *arrivals, uint slice, threadgroup DrawScratch &scratch,
-    uint thread_index, uint lane, uint simd_group, thread uint &drawn,
-    thread float &draft_probability) {
+    uint thread_index, uint lane, uint simd_group, thread uint &drawn) {
   const uint range_tokens = (row.vocabulary + kVocabularyRanges * 32 - 1) /
                             (kVocabularyRanges * 32) * 32;
-  if (thread_index < kDraftCandidates) {
-    // A candidate the draft lists twice counts once, as lookups find its
-    // first entry.
-    uint id = drafted ? draft_ids[thread_index] : 0xffffffffu;
-    for (uint earlier = 0; drafted && earlier < thread_index; ++earlier)
-      id = draft_ids[earlier] == id ? 0xffffffffu : id;
-    scratch.draft_ids[thread_index] = id;
-    scratch.draft_ranges[thread_index] =
-        id < row.vocabulary ? id / range_tokens : kVocabularyRanges;
-  }
-  threadgroup_barrier(mem_flags::mem_threadgroup);
   const uint own = slice * kVocabularySimdgroups + simd_group;
   const uint begin = min(own * range_tokens, row.vocabulary);
   const uint finish = min(begin + range_tokens, row.vocabulary);
-  const uint held = range_candidates(own, scratch);
-  float rest = 0.0f;
+  float kept = 0.0f;
   uint after = 0;
   for (uint first = begin; first < finish; first += 32) {
     const uint token = first + lane;
-    float weight = token < finish ? kept_weight(row, end, token) : 0.0f;
-    for (uint bits = held; bits; bits &= bits - 1)
-      weight = scratch.draft_ids[ctz(bits)] == token ? 0.0f : weight;
-    rest += weight;
+    const float weight = token < finish ? kept_weight(row, end, token) : 0.0f;
+    kept += weight;
     after = weight > 0.0f ? token + 1 : after;
   }
-  rest = simd_sum(rest);
+  kept = simd_sum(kept);
   after = simd_max(after);
   if (lane == 0)
-    ranges[own] = {rest, after};
+    ranges[own] = {kept, after};
   if (!split_arrive_last(arrivals, kVocabularyGroups, thread_index,
                          &scratch.arrival))
     return false;
   if (thread_index < kVocabularyRanges) {
     const TargetVocabularyRange measured = ranges[thread_index];
-    scratch.range_rest[thread_index] = measured.rest;
+    scratch.range_weights[thread_index] = measured.weight;
     scratch.range_last[thread_index] = measured.after;
   }
-  if (thread_index < kDraftCandidates) {
-    scratch.draft_probabilities[thread_index] =
-        drafted ? draft_probabilities[thread_index] : 0.0f;
-    scratch.draft_weights[thread_index] =
-        kept_weight(row, end, scratch.draft_ids[thread_index]);
-  }
-  threadgroup_barrier(mem_flags::mem_threadgroup);
-  if (thread_index == 0) {
-    float kept_mass = 0.0f;
-    for (uint range = 0; range < kVocabularyRanges; ++range)
-      kept_mass += scratch.range_rest[range];
-    for (uint index = 0; index < kDraftCandidates; ++index)
-      kept_mass += scratch.draft_weights[index];
-    bool residual = false;
-    for (uint range = 0; drafted && range < kVocabularyRanges; ++range)
-      residual = residual || scratch.range_rest[range] > 0.0f;
-    for (uint index = 0; drafted && index < kDraftCandidates; ++index) {
-      const float left = max(scratch.draft_weights[index] -
-                                 scratch.draft_probabilities[index] * kept_mass,
-                             0.0f);
-      scratch.draft_draw_weights[index] = left;
-      residual = residual || left > 0.0f;
-    }
-    // Without a draft, or with nothing left of its residual, the draw
-    // follows the distribution itself.
-    for (uint index = 0; !residual && index < kDraftCandidates; ++index)
-      scratch.draft_draw_weights[index] = scratch.draft_weights[index];
-    scratch.kept_mass = kept_mass;
-  }
-  threadgroup_barrier(mem_flags::mem_threadgroup);
-  if (thread_index < kVocabularyRanges)
-    scratch.range_weights[thread_index] = range_weight(thread_index, scratch);
   threadgroup_barrier(mem_flags::mem_threadgroup);
   if (thread_index == 0) {
     float total = 0.0f;
     for (uint range = 0; range < kVocabularyRanges; ++range)
       total += scratch.range_weights[range];
-    const float target = uniform * total;
-    float cumulative = 0.0f;
-    uint range_drawn = 0;
-    float range_target = 0.0f;
-    for (uint range = 0; range < kVocabularyRanges; ++range) {
-      const float weight = scratch.range_weights[range];
-      if (!(weight > 0.0f))
-        continue;
-      // Rounding may leave the target unreached: the last range with weight.
-      range_drawn = range;
-      range_target = target - cumulative;
-      cumulative += weight;
-      if (cumulative > target)
-        break;
+    scratch.excluding = false;
+    scratch.selected = false;
+    float target = uniform * total;
+    if (children.ids && children.draws[0] != kNoDraw && total > 0.0f) {
+      // The target's and the draft's probabilities of the candidates, and
+      // the target's mass outside them: what the ranges weigh once the
+      // candidates' weights leave them.
+      float p[kDrawCandidates], q[kDrawCandidates];
+      for (uint i = 0; i < kDrawCandidates; ++i) {
+        const uint id = children.ids[i];
+        const float weight = kept_weight(row, end, id);
+        // A candidate past the vocabulary, as the draft's top 16 lists one
+        // (0xffffffff) for a row of fewer comparable logits, weighs nothing
+        // and lies in no range.
+        if (id < row.vocabulary) {
+          const uint range = id / range_tokens;
+          scratch.range_weights[range] = max(scratch.range_weights[range] - weight, 0.0f);
+        }
+        scratch.excluded[i] = id;
+        p[i] = weight / total;
+        q[i] = children.q[i];
+      }
+      float outside_weight = 0.0f;
+      for (uint range = 0; range < kVocabularyRanges; ++range)
+        outside_weight += scratch.range_weights[range];
+      float outside = outside_weight / total;
+      for (uint child = 0; child < SPLASH_TREE_CHILDREN && !scratch.selected; ++child) {
+        const uint drawn_child = children.draws[child];
+        if (drawn_child == kNoDraw)
+          break;
+        if (children.uniforms[child] * q[drawn_child] < p[drawn_child]) {
+          scratch.selected = true;
+          scratch.drawn_token = children.ids[drawn_child];
+          break;
+        }
+        // The target's residual, and the draft without the rejected child.
+        float residual = outside;
+        for (uint i = 0; i < kDrawCandidates; ++i)
+          residual += max(p[i] - q[i], 0.0f);
+        if (!(residual > 0.0f))
+          break;
+        for (uint i = 0; i < kDrawCandidates; ++i)
+          p[i] = max(p[i] - q[i], 0.0f) / residual;
+        outside /= residual;
+        // The draft's rest, summed: one less a child that holds nearly all of
+        // q_T would cancel to nothing in fp32.
+        q[drawn_child] = 0.0f;
+        float rest = 0.0f;
+        for (uint i = 0; i < kDrawCandidates; ++i)
+          rest += q[i];
+        for (uint i = 0; rest > 0.0f && i < kDrawCandidates; ++i)
+          q[i] /= rest;
+      }
+      if (!scratch.selected) {
+        // The last residual's draw: a candidate, or past them a token of the
+        // target's own weights outside them. Rounding may leave the point
+        // unreached: the last candidate with weight, where none lies outside.
+        float inside = 0.0f;
+        for (uint i = 0; i < kDrawCandidates; ++i)
+          inside += p[i];
+        const float point = uniform * (inside + outside);
+        float cumulative = 0.0f;
+        uint last = kDrawCandidates;
+        for (uint i = 0; i < kDrawCandidates && !(point < cumulative); ++i) {
+          if (p[i] > 0.0f) {
+            last = i;
+            cumulative += p[i];
+          }
+        }
+        if (last < kDrawCandidates && (point < cumulative || !(outside > 0.0f))) {
+          scratch.selected = true;
+          scratch.drawn_token = children.ids[last];
+        } else {
+          scratch.excluding = true;
+          target = (point - inside) / outside * outside_weight;
+        }
+      }
     }
-    scratch.drawn_range = range_drawn;
-    scratch.drawn_target = range_target;
-    scratch.drawn_token = range_last(range_drawn, scratch);
+    if (!scratch.selected) {
+      float cumulative = 0.0f;
+      uint range_drawn = 0;
+      float range_target = 0.0f;
+      for (uint range = 0; range < kVocabularyRanges; ++range) {
+        const float weight = scratch.range_weights[range];
+        if (!(weight > 0.0f))
+          continue;
+        // Rounding may leave the target unreached: the last range with
+        // weight.
+        range_drawn = range;
+        range_target = target - cumulative;
+        cumulative += weight;
+        if (cumulative > target)
+          break;
+      }
+      scratch.drawn_range = range_drawn;
+      scratch.drawn_target = range_target;
+      // Rounding may leave the target unreached in the range too: its last
+      // token with weight, which the walk finds.
+      scratch.drawn_token = scratch.range_last[range_drawn] - 1;
+    }
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
-  if (simd_group == 0) {
+  if (simd_group == 0 && !scratch.selected) {
     const uint walked = scratch.drawn_range;
     const uint walk_begin = min(walked * range_tokens, row.vocabulary);
     const uint walk_finish = min(walk_begin + range_tokens, row.vocabulary);
-    const uint walk_held = range_candidates(walked, scratch);
     const float target = scratch.drawn_target;
     float cumulative = 0.0f;
-    for (uint first = walk_begin; first < walk_finish; first += 32) {
+    uint last = 0;
+    bool hit_found = false;
+    for (uint first = walk_begin; first < walk_finish && !hit_found; first += 32) {
       const uint token = first + lane;
-      float weight = token < walk_finish ? kept_weight(row, end, token) : 0.0f;
-      for (uint bits = walk_held; bits; bits &= bits - 1) {
-        const uint index = ctz(bits);
-        if (scratch.draft_ids[index] == token)
-          weight = scratch.draft_draw_weights[index];
-      }
+      bool excluded = false;
+      for (uint i = 0; scratch.excluding && i < kDrawCandidates; ++i)
+        excluded = excluded || scratch.excluded[i] == token;
+      const float weight =
+          token < walk_finish && !excluded ? kept_weight(row, end, token) : 0.0f;
+      last = max(last, simd_max(weight > 0.0f ? token + 1 : 0u));
       const float prefix = simd_prefix_inclusive_sum(weight);
       const uint hit =
           simd_min(weight > 0.0f && cumulative + prefix > target ? lane : 32u);
       if (hit < 32) {
         if (lane == 0)
           scratch.drawn_token = first + hit;
-        break;
+        hit_found = true;
       }
       cumulative += simd_broadcast(prefix, 31);
     }
+    // Excluding candidates, the range's last token with weight may be one of
+    // them: the last the walk weighed.
+    if (!hit_found && scratch.excluding && lane == 0 && last)
+      scratch.drawn_token = last - 1;
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
   drawn = scratch.drawn_token;
-  draft_probability =
-      drafted ? kept_weight(row, end, draft_token) / scratch.kept_mass : 0.0f;
   split_release(arrivals, thread_index);
   return true;
 }
@@ -852,7 +901,7 @@ inline void search_row(TargetRow row, device const TargetShardMass *masses,
       distribution_end(row, min_p, top_k, top_p, merged.sum, merged.admitted,
                        scratch, thread_index, lane, simd_group);
   if (thread_index == 0)
-    record = {merged.maximum, end.key, end.last, 0.0f};
+    record = {merged.maximum, end.key, end.last};
 }
 
 // Where the distribution of each selected row of the sampled lanes ends, one
@@ -862,70 +911,75 @@ kernel void decode_sample_vocabulary_search(
     device const uint *token_mask [[buffer(1)]],
     device const TargetShardMass *partial_masses [[buffer(2)]],
     device TargetVocabularyRow *vocabulary_rows [[buffer(3)]],
-    constant TargetSamplingParams &params [[buffer(4)]],
-    uint s [[threadgroup_position_in_grid]],
+    device const SplashLaneRows *lane_rows [[buffer(4)]],
+    constant TargetSamplingParams &params [[buffer(5)]],
+    uint2 group [[threadgroup_position_in_grid]],
     uint thread_index [[thread_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]],
     uint simd_group [[simdgroup_index_in_threadgroup]]) {
   threadgroup VocabularyScratch scratch;
-  if (!lane_samples(params, s))
+  const uint batch = group.y, index = group.x;
+  if (!selects(params, lane_rows, batch, index, true))
     return;
-  const uint batch = selected_lane(params, s);
-  search_row(selected_row(logits, token_mask, params, s),
+  const uint s = selected_logits_row(lane_rows, batch, index);
+  search_row(selected_row(logits, token_mask, params, lane_rows, batch, index),
              partial_masses + ulong(s) * SPLASH_TARGET_SAMPLING_SHARDS,
              params.min_p[batch], params.top_k[batch], params.top_p[batch],
              vocabulary_rows[s], scratch, thread_index, lane, simd_group);
 }
 
-// The draw of each selected row of the sampled lanes, kVocabularyGroups
-// groups per row: the first token after a prompt, a verify row's draft
-// token's probability and the correction a rejection takes or, for the last
-// verify row, which follows the whole draft, its bonus token.
+// The selection of each selected row of the sampled lanes, kVocabularyGroups
+// groups per row: row i of a lane draws with the lane's uniform i, and a
+// decode step's verify row (params.trees) tests the children its lane's
+// draft drew there (sources, its row of the lane's tree, whose draws and next
+// position's probabilities the selector wrote, and that position's
+// candidates) with the lane's uniforms SPLASH_TARGET_VERIFY_ROWS +
+// i * SPLASH_TREE_CHILDREN on.
 kernel void decode_sample_vocabulary_draw(
     device const float *logits [[buffer(0)]],
     device const uint *token_mask [[buffer(1)]],
-    device TargetVocabularyRow *vocabulary_rows [[buffer(2)]],
-    device const uint *input_tokens [[buffer(3)]],
-    device const uint *draft_ids [[buffer(4)]],
-    device const float *draft_probabilities [[buffer(5)]],
-    device const float *uniforms [[buffer(6)]],
-    device uint *tokens [[buffer(7)]],
-    device coherent(device) TargetVocabularyRange *ranges [[buffer(8)]],
-    device atomic_uint *arrivals [[buffer(9)]],
-    constant TargetSamplingParams &params [[buffer(10)]],
-    uint group [[threadgroup_position_in_grid]],
+    device const TargetVocabularyRow *vocabulary_rows [[buffer(2)]],
+    device const float *uniforms [[buffer(3)]],
+    device uint *tokens [[buffer(4)]],
+    device coherent(device) TargetVocabularyRange *ranges [[buffer(5)]],
+    device atomic_uint *arrivals [[buffer(6)]],
+    device const SplashLaneRows *lane_rows [[buffer(7)]],
+    device const SplashTreeRow *tree [[buffer(8)]],
+    device const uint *sources [[buffer(9)]],
+    device const uint *candidates [[buffer(10)]],
+    device const uchar *draws [[buffer(11)]],
+    device const float *next [[buffer(12)]],
+    constant TargetSamplingParams &params [[buffer(13)]],
+    uint2 group [[threadgroup_position_in_grid]],
     uint thread_index [[thread_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]],
     uint simd_group [[simdgroup_index_in_threadgroup]]) {
   threadgroup DrawScratch scratch;
-  const uint s = group / kVocabularyGroups;
-  if (!lane_samples(params, s))
+  const uint batch = group.y, index = group.x / kVocabularyGroups;
+  if (!selects(params, lane_rows, batch, index, true))
     return;
-  const uint batch = selected_lane(params, s);
-  const uint index = s % params.rows;
-  device TargetVocabularyRow &record = vocabulary_rows[s];
-  TargetRow row = selected_row(logits, token_mask, params, s);
+  const uint s = selected_logits_row(lane_rows, batch, index);
+  const TargetVocabularyRow record = vocabulary_rows[s];
+  TargetRow row = selected_row(logits, token_mask, params, lane_rows, batch, index);
   row.maximum = record.maximum;
-  // A drafted row follows its draft token, the next verify input row.
-  const bool drafted = index < params.drafted_rows;
-  const ulong position =
-      ulong(batch) * SPLASH_DRAFT_PROPOSAL_TOKENS + (drafted ? index : 0);
-  uint token;
-  float draft_probability;
-  if (vocabulary_draw(
-          row, {record.end_key, record.end_last}, drafted,
-          drafted ? input_tokens[s + 1] : 0u,
-          draft_ids + position * kDraftCandidates,
-          draft_probabilities + position * kDraftCandidates,
-          uniforms[ulong(batch) * SPLASH_SAMPLING_UNIFORMS + params.uniform],
-          ranges + ulong(s) * kVocabularyRanges, arrivals + s,
-          group % kVocabularyGroups, scratch, thread_index, lane, simd_group,
-          token, draft_probability) &&
-      thread_index == 0) {
-    tokens[s] = token;
-    if (drafted)
-      record.draft_probability = draft_probability;
+  device const float *lane_uniforms = uniforms + ulong(batch) * SPLASH_SAMPLING_UNIFORMS;
+  DrawChildren children{nullptr, nullptr, nullptr, nullptr};
+  if (params.trees) {
+    const uint source = sources[s], depth = tree[s].depth;
+    if (source != SPLASH_NO_TOKEN && depth < SPLASH_DRAFT_PROPOSAL_TOKENS) {
+      const ulong at = ulong(batch) * SPLASH_TARGET_VERIFY_ROWS + source;
+      children = {candidates + (ulong(batch) * SPLASH_DRAFT_PROPOSAL_TOKENS + depth) * kDrawCandidates,
+                  next + at * kDrawCandidates, draws + at * SPLASH_TREE_CHILDREN,
+                  lane_uniforms + SPLASH_TARGET_VERIFY_ROWS + index * SPLASH_TREE_CHILDREN};
+    }
   }
+  uint token;
+  if (vocabulary_draw(row, {record.end_key, record.end_last}, lane_uniforms[index], children,
+                      ranges + ulong(s) * kVocabularyRanges, arrivals + s,
+                      group.x % kVocabularyGroups, scratch, thread_index, lane,
+                      simd_group, token) &&
+      thread_index == 0)
+    tokens[s] = token;
 }
 
 // Whether no token can be selected for a logit: NaN has no order and -inf
@@ -952,25 +1006,39 @@ inline float penalize_logit(float value, uint count, float repetition,
   return clamp(value, -FLT_MAX, FLT_MAX);
 }
 
-// Rewrites one token's logit in each penalized row of one entry, in place.
-// Bit r of drafted is set when the lane's verify input row r holds the
-// token: those are the draft tokens that verify row r's context adds to the
-// output, so row r counts bits 1..r on top of the table's count.
-inline void penalize_token(device float *logits, device const uint *words,
-                           uint token, uint entry, uint drafted,
-                           constant SamplingPenaltyParams &params) {
+// The selected rows of each penalized entry, one thread per vocabulary token
+// and entry, rewritten in place. Their contexts add the entry's draft tokens
+// along their paths: bit r of drafted is set when the entry's verify input
+// row r (from its first row) holds the token, a draft token that the rows
+// below row r in its block's tree add to the output, so a row counts the bits
+// of its ancestors but its anchor (metal/abi/VerifyTree.h) on top of the
+// table's count. A selection of one row (the first token after a prompt) adds
+// none.
+kernel void decode_sample_penalize(
+    device float *logits [[buffer(0)]], device const uint *words [[buffer(1)]],
+    device const uint *input_tokens [[buffer(2)]],
+    device const SplashTreeRow *tree [[buffer(3)]],
+    device const SplashLaneRows *lane_rows [[buffer(4)]],
+    constant SamplingPenaltyParams &params [[buffer(5)]],
+    uint2 position [[thread_position_in_grid]]) {
+  const uint token = position.x;
+  const uint entry = position.y;
+  if (token >= params.vocabulary || entry >= params.entries)
+    return;
+  const SplashLaneRows lane = lane_rows[params.lane[entry]];
+  const uint rows = lane.rows;
+  device const uint *inputs = input_tokens + lane.first;
+  uint drafted = 0;
+  for (uint row = 1; row < rows; ++row)
+    drafted |= uint(inputs[row] == token) << row;
   const uint word =
       words[ulong(params.table_row[entry]) * params.vocabulary + token];
   if (!word && !drafted)
     return;
-  device float *column =
-      logits +
-      (ulong(params.logits_lane[entry]) * SPLASH_TARGET_VERIFY_ROWS +
-       params.row_offset) * params.vocabulary +
-      token;
-  for (uint row = 0; row < params.rows; ++row) {
-    const uint count = (word & SPLASH_PENALTY_COUNT_MASK) +
-                       popcount(drafted & ((2u << row) - 2u));
+  device float *column = logits + ulong(lane.first) * params.vocabulary + token;
+  for (uint row = 0; row < rows; ++row) {
+    const uint path = tree[lane.first + row].ancestors;
+    const uint count = (word & SPLASH_PENALTY_COUNT_MASK) + popcount(drafted & path & ~1u);
     if (!count && !(word & SPLASH_PENALTY_PROMPT_BIT))
       continue;
     device float &logit = column[ulong(row) * params.vocabulary];
@@ -978,36 +1046,6 @@ inline void penalize_token(device float *logits, device const uint *words,
                            params.repetition_inverse[entry],
                            params.presence[entry], params.frequency[entry]);
   }
-}
-
-// One thread per vocabulary token and penalized entry, over the rows the
-// first token after a prompt is selected from.
-kernel void decode_sample_penalize(device float *logits [[buffer(0)]],
-                                   device const uint *words [[buffer(1)]],
-                                   constant SamplingPenaltyParams &params
-                                   [[buffer(2)]],
-                                   uint2 position [[thread_position_in_grid]]) {
-  if (position.x < params.vocabulary && position.y < params.entries)
-    penalize_token(logits, words, position.x, position.y, 0, params);
-}
-
-// The verify rows of each penalized lane, whose contexts add the lane's
-// draft tokens (verify input rows 1..7) one row at a time.
-kernel void decode_sample_penalize_verify(
-    device float *logits [[buffer(0)]], device const uint *words [[buffer(1)]],
-    device const uint *input_tokens [[buffer(2)]],
-    constant SamplingPenaltyParams &params [[buffer(3)]],
-    uint2 position [[thread_position_in_grid]]) {
-  const uint token = position.x;
-  const uint entry = position.y;
-  if (token >= params.vocabulary || entry >= params.entries)
-    return;
-  device const uint *inputs =
-      input_tokens + ulong(params.logits_lane[entry]) * SPLASH_TARGET_VERIFY_ROWS;
-  uint drafted = 0;
-  for (uint row = 1; row < SPLASH_TARGET_VERIFY_ROWS; ++row)
-    drafted |= uint(inputs[row] == token) << row;
-  penalize_token(logits, words, token, entry, drafted, params);
 }
 
 inline bool top_beats(float value, uint token, float other, uint other_token) {
@@ -1056,12 +1094,14 @@ inline void simd_best_head(float value, uint token, thread float &best,
 // so nothing below it can be in the row's top-16 and the exact sorted insert
 // only runs for the few survivors. The group then pops its best sixteen in
 // rank order. The (value desc, id asc) order is total, so the partial is the
-// same set in the same order whatever the thread partition.
+// same set in the same order whatever the thread partition; it ranks the
+// row's columns and writes their tokens (SelectorBatchParams), whose order
+// is theirs.
 kernel void draft_select_top16_sharded(
     device const float *logits [[buffer(0)]],
     device uint *partial_ids [[buffer(1)]],
     device float *partial_values [[buffer(2)]],
-    constant uint &vocabulary [[buffer(3)]],
+    constant SelectorBatchParams &params [[buffer(3)]],
     uint group [[threadgroup_position_in_grid]],
     uint thread_index [[thread_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]],
@@ -1071,6 +1111,7 @@ kernel void draft_select_top16_sharded(
   constexpr uint Shards = SPLASH_DRAFT_SAMPLING_SHARDS;
   constexpr uint K = SPLASH_DRAFT_CANDIDATES;
   constexpr uint VectorTokens = 4, ChunkVectors = 16;
+  const uint vocabulary = params.columns;
   uint batch = group / (Positions * Shards);
   uint local = group % (Positions * Shards);
   uint position = local / Shards;
@@ -1180,7 +1221,10 @@ kernel void draft_select_top16_sharded(
       }
     }
     if (thread_index == rank) {
-      partial_ids[group * K + rank] = best_id;
+      // The empty sentinel stays one.
+      partial_ids[group * K + rank] = best_id < params.leading || best_id == 0xffffffffu
+                                          ? best_id
+                                          : best_id - params.leading + params.trailing;
       partial_values[group * K + rank] = best;
     }
     if (head_value == best && head_id == best_id)
@@ -1313,7 +1357,7 @@ kernel void draft_select_edges(
 
 // The LiLiCorr selector's candidates (metal/abi/LiLiCorr.h): one group of
 // 1024 threads per proposal row merges its shard partials as
-// draft_select_edges does, keeps the sixteen candidates for the walk, of
+// draft_select_edges does, keeps the sixteen candidates for draft_select_tree, of
 // which the first eight have unary 0 and the rest -inf (lilicorr_scores
 // writes their edges), writes those eight's ids, and their features' layer
 // norm and MLP up projection with SiLU, a bf16 row of SPLASH_LILICORR_HIDDEN
@@ -1374,203 +1418,540 @@ kernel void lilicorr_candidates(
   }
 }
 
-// One thread per lane walks the seven positions: the score of a candidate is
-// its unary score plus the edge from the previously chosen candidate, read
-// from the table draft_select_edges left in the partial-values scratch. It
-// writes the lane's confidence at each position (VerifyRowsParams) as it
-// walks.
-kernel void draft_select_dflash(
+// The best-first tree of draft_select_tree (DraftTreeParams). An entry is a
+// step the tree may take, from its parent row to a token one deeper, which
+// grows the tree in the order of its score, the estimate of the path it ends,
+// the earlier entry first among equal ones.
+constant constexpr uint kTreeChildren = SPLASH_TREE_CHILDREN;
+// A lane's rows, a verify block's at most, each a bit of its descendants'
+// ancestors masks (SplashTreeRow).
+constant constexpr uint kTreeRows = SPLASH_TARGET_VERIFY_ROWS;
+static_assert(kTreeRows <= 32, "a lane's rows fit its ancestors' masks");
+// An entry's info word: whether its token is a host chain's, its parent row,
+// its proposal position (its depth less one) and its candidate's index.
+constant constexpr uint kTreeChain = 1u << 31;
+// A row, the anchor among them, pushes its draft children once, as a draft
+// step makes it or joins it where a chain token made it, and one chain
+// entry, so no more entries than these are ever pushed.
+constant constexpr uint kTreeEntries = kTreeRows * (kTreeChildren + 1);
+constant constexpr uchar kNoCandidate = 0xff;
+// The token of a row's host chain child where it has none.
+constant constexpr uint kNoChainToken = 0xffffffffu;
+
+// A lane's draft candidates at each proposal position, the probability of
+// each after each predecessor candidate (the anchor for position 0) and the
+// predecessor's kTreeChildren most likely.
+struct TreeLattice {
+  uint ids[SPLASH_DRAFT_PROPOSAL_TOKENS][SPLASH_DRAFT_CANDIDATES];
+  float probability[SPLASH_DRAFT_PROPOSAL_TOKENS][SPLASH_DRAFT_CANDIDATES]
+                   [SPLASH_DRAFT_CANDIDATES];
+  uchar likeliest[SPLASH_DRAFT_PROPOSAL_TOKENS][SPLASH_DRAFT_CANDIDATES]
+                 [kTreeChildren];
+};
+
+struct TreeHeap {
+  float score[kTreeEntries];
+  uint order[kTreeEntries];
+  uint info[kTreeEntries];
+  uint size;
+  uint pushed;
+};
+
+// A lane's tree as it grows: its rows' tokens, ancestors' masks, parents,
+// depths, whether each lies on its host chain's path (its tokens from the
+// anchor are the chain's first ones), draft probabilities, estimates, caps
+// and keys, and of each row the children its draft drew (their candidate
+// indices, in order; kNoCandidate past them) with each one's cap, and its
+// next position's probabilities (DraftTreeParams).
+struct TreeRows {
+  uint token[kTreeRows];
+  uint ancestors[kTreeRows];
+  ushort parent[kTreeRows];
+  ushort depth[kTreeRows];
+  bool on_chain[kTreeRows];
+  float q[kTreeRows];
+  float estimate[kTreeRows];
+  float cap[kTreeRows];
+  ulong key[kTreeRows];
+  uchar draw[kTreeRows][kTreeChildren];
+  float left[kTreeRows][kTreeChildren];
+  float next[kTreeRows][SPLASH_DRAFT_CANDIDATES];
+  uint made;
+};
+
+// A new row's record of its children: none yet.
+inline void tree_row_clear(threadgroup TreeRows &rows, uint row) {
+  for (uint child = 0; child < kTreeChildren; ++child)
+    rows.draw[row][child] = kNoCandidate;
+  for (uint i = 0; i < SPLASH_DRAFT_CANDIDATES; ++i)
+    rows.next[row][i] = 0.0f;
+}
+
+inline bool tree_entry_before(threadgroup TreeHeap &heap, uint a, uint b) {
+  return heap.score[a] > heap.score[b] ||
+         (heap.score[a] == heap.score[b] && heap.order[a] < heap.order[b]);
+}
+
+inline void tree_entry_swap(threadgroup TreeHeap &heap, uint a, uint b) {
+  const float score = heap.score[a];
+  const uint order = heap.order[a], info = heap.info[a];
+  heap.score[a] = heap.score[b];
+  heap.order[a] = heap.order[b];
+  heap.info[a] = heap.info[b];
+  heap.score[b] = score;
+  heap.order[b] = order;
+  heap.info[b] = info;
+}
+
+inline void tree_push(threadgroup TreeHeap &heap, float score, uint info) {
+  uint at = heap.size++;
+  heap.score[at] = score;
+  heap.order[at] = heap.pushed++;
+  heap.info[at] = info;
+  while (at > 0 && tree_entry_before(heap, at, (at - 1) / 2)) {
+    tree_entry_swap(heap, at, (at - 1) / 2);
+    at = (at - 1) / 2;
+  }
+}
+
+// Removes the first entry, which the caller has read.
+inline void tree_pop(threadgroup TreeHeap &heap) {
+  tree_entry_swap(heap, 0, --heap.size);
+  for (uint at = 0;;) {
+    uint first = at;
+    for (uint child = 2 * at + 1; child <= 2 * at + 2; ++child)
+      if (child < heap.size && tree_entry_before(heap, child, first))
+        first = child;
+    if (first == at)
+      break;
+    tree_entry_swap(heap, at, first);
+    at = first;
+  }
+}
+
+inline uint tree_info(bool chain, uint parent, uint position, uint index) {
+  return (chain ? kTreeChain : 0u) | parent << 16 | position << 8 | index;
+}
+
+// The estimate of lane l's draft step of probability q at proposal position
+// p (DraftTreeParams), q kept off 0 and 1 for its logit.
+inline float tree_draft_estimate(constant DraftTreeParams &params, uint lane,
+                                 float q, uint position) {
+  q = clamp(q, 1.0e-6f, 1.0f - 1.0e-6f);
+  const float z = params.slope[lane] * log(q / (1.0f - q)) +
+                  params.intercept[lane][position];
+  return 1.0f / (1.0f + exp(-z));
+}
+
+// A host chain token's agreement with the draft at its depth (0-based):
+// the draft's most likely candidate there, another of its candidates, none,
+// or past its positions.
+inline uint tree_agreement(threadgroup TreeLattice &lattice, uint token,
+                           uint depth) {
+  if (depth >= SPLASH_DRAFT_PROPOSAL_TOKENS)
+    return 3;
+  if (token == lattice.ids[depth][0])
+    return 0;
+  for (uint i = 1; i < SPLASH_DRAFT_CANDIDATES; ++i)
+    if (token == lattice.ids[depth][i])
+      return 1;
+  return 2;
+}
+
+// The rate of a lane's host chain token at depth `depth` (0-based), by its
+// agreement with the draft there.
+inline float tree_chain_rate(threadgroup TreeLattice &lattice,
+                             device const uint *chain,
+                             device const float *rates, uint depth) {
+  return rates[depth * SPLASH_TREE_AGREEMENTS +
+               tree_agreement(lattice, chain[depth], depth)];
+}
+
+// The splitmix64 finalizer.
+inline ulong tree_hash(ulong value) {
+  value = (value ^ (value >> 30)) * 0xbf58476d1ce4e5b9ul;
+  value = (value ^ (value >> 27)) * 0x94d049bb133111ebul;
+  return value ^ (value >> 31);
+}
+
+// A row's key from its parent's and its token (DraftTreeParams).
+inline ulong tree_key(ulong parent, uint token) {
+  return tree_hash(parent + 0x9e3779b97f4a7c15ul * (ulong(token) + 1));
+}
+
+// The standard Gumbel of candidate token `token` under a row of key `key`:
+// of a uniform from the top 23 bits k of a hash of the two, (k + 0.5) / 2^23,
+// which fp32 holds exactly, inside (0, 1): with 24 bits the largest rounds to
+// 1, a Gumbel of infinity.
+inline float tree_gumbel(ulong key, uint token) {
+  const ulong value = tree_hash(key ^ 0xd1b54a32d192ed03ul * (ulong(token) + 1));
+  const float uniform = (float(value >> 41) + 0.5f) * 0x1p-23f;
+  return -log(-log(uniform));
+}
+
+// A draft row's entries for its children at the next position, and its
+// record of them (TreeRows): a greedy lane's most likely candidates, q at
+// temperature 1; a sampled lane's draws without replacement from q_T,
+// proportional to q^(1/T), its Gumbel-top-k with the row's key. q_T weighs
+// each candidate against the most likely, exp((log q - log q_max) / T), so
+// that its mass is at least 1 at any temperature, and the draws take its
+// stored values, which the target's tests read: a candidate whose weight
+// underflows is never drawn. The target selects one token after the row, so
+// its children's estimates sum to at most its own: each child's own estimate
+// is at most its cap, what the row's host chain child (`chain_token` at
+// `chain_rate`; none at a rate of 0) and the children drawn before it left of
+// 1 (DraftTreeParams), and the child is estimated at most as the one before
+// it, so that the tree takes a row's children in the order drawn and a cycle
+// verifies a first few of them. A drawn child of the chain's token is the
+// chain's child: its cap is what the others left, and it takes the more of
+// its own estimate and the chain's rate. The rate is the host's, from before
+// any draw, so no row is admitted by its own draws. Before the chain's child
+// counted, on Qwen3.6-35B-A3B's 31K-token code prompts at one and two lanes,
+// a chain's first rows of rate 0.9 or more were estimated 0.983 and 0.984 and
+// retained 0.954 and 0.985 of the time (108 and 328 rows), and the draft rows
+// beside them were estimated 0.202 and 0.193 and retained 0.088 and 0.018 (34
+// and 56 rows): the anchor's children summed to 1.14 to 1.16.
+inline void tree_expand(threadgroup TreeLattice &lattice,
+                        threadgroup TreeHeap &heap, threadgroup TreeRows &rows,
+                        constant DraftTreeParams &params, uint lane,
+                        uint children, uint row, uint position,
+                        uint predecessor, float score, uint chain_token,
+                        float chain_rate) {
+  threadgroup const float *q = lattice.probability[position][predecessor];
+  const float temperature = params.temperature[lane];
+  float top = 0.0f;
+  for (uint i = 0; i < SPLASH_DRAFT_CANDIDATES; ++i)
+    top = max(top, q[i]);
+  float mass = 0.0f;
+  for (uint i = 0; i < SPLASH_DRAFT_CANDIDATES; ++i) {
+    const float weight = temperature == 0.0f || !(q[i] > 0.0f)
+                             ? q[i]
+                             : exp((log(q[i]) - log(top)) / temperature);
+    rows.next[row][i] = weight;
+    mass += weight;
+  }
+  for (uint i = 0; i < SPLASH_DRAFT_CANDIDATES; ++i)
+    rows.next[row][i] /= mass;
+  float keys[SPLASH_DRAFT_CANDIDATES];
+  for (uint i = 0; temperature > 0.0f && i < SPLASH_DRAFT_CANDIDATES; ++i)
+    keys[i] = rows.next[row][i] > 0.0f
+                  ? log(rows.next[row][i]) + tree_gumbel(rows.key[row], lattice.ids[position][i])
+                  : -INFINITY;
+  uint taken = 0;
+  float bound = score, left = 1.0f - chain_rate, reserved = chain_rate;
+  for (uint child = 0; child < children; ++child) {
+    uint drawn = SPLASH_DRAFT_CANDIDATES;
+    if (temperature == 0.0f) {
+      const uint likeliest = lattice.likeliest[position][predecessor][child];
+      drawn = q[likeliest] > 0.0f ? likeliest : drawn;
+    } else {
+      for (uint i = 0; i < SPLASH_DRAFT_CANDIDATES; ++i)
+        if (!(taken & (1u << i)) && keys[i] > -INFINITY &&
+            (drawn == SPLASH_DRAFT_CANDIDATES || keys[i] > keys[drawn]))
+          drawn = i;
+    }
+    if (drawn == SPLASH_DRAFT_CANDIDATES)
+      return;
+    taken |= 1u << drawn;
+    const bool joins_chain = lattice.ids[position][drawn] == chain_token;
+    const float cap = joins_chain ? left + reserved : left;
+    rows.draw[row][child] = uchar(drawn);
+    rows.left[row][child] = cap;
+    const float own = min(tree_draft_estimate(params, lane, rows.next[row][drawn], position), cap);
+    left = joins_chain ? cap - max(own, reserved) : left - own;
+    reserved = joins_chain ? 0.0f : reserved;
+    bound = min(bound, score * own);
+    tree_push(heap, bound, tree_info(false, row, position, drawn));
+  }
+}
+
+// The cap of the step row `parent` drew to its candidate `index`
+// (tree_expand).
+inline float tree_cap(threadgroup TreeRows &rows, uint parent, uint index) {
+  for (uint child = 0; child < kTreeChildren; ++child)
+    if (rows.draw[parent][child] == index)
+      return rows.left[parent][child];
+  return 1.0f;
+}
+
+// One group per lane builds its tree (DraftTreeParams). Its threads first
+// take, for every proposal position and predecessor candidate (the anchor
+// for position 0), the probabilities of the position's candidates (the
+// softmax at temperature 1 of their unary scores plus the edges from the
+// predecessor, the table draft_select_edges left in the partial-values
+// scratch) and the predecessor's most likely, the lowest index first among
+// equal scores, as the chain walk chose; thread 0 then grows the tree. Rows
+// are written in the order the tree takes them, lane l's from row l *
+// SPLASH_TARGET_VERIFY_ROWS, so a row's parent comes before it and its
+// estimate is at most its parent's; sizes holds each lane's rows. A row's
+// draft probability (scores' x) is that of the draft step that made it, or
+// joined it where a lookup chain's token made it, its token's among the
+// candidates after its parent's; -1 for a chain row no draft step joined;
+// its estimate is scores' y, and the cap of that draft step its caps entry
+// (1 for a row it has no draft probability of). Of each row it also writes the candidate indices of the
+// children it drew, in order (draws, kNoCandidate past them), and its next
+// position's probabilities (next), which a sampled verify row's selection
+// tests (decode_sample_vocabulary_draw).
+kernel void draft_select_tree(
     device const uint *candidates [[buffer(0)]],
     device const float *unary [[buffer(1)]],
     device const float *partial_values [[buffer(2)]],
-    device const float *uniforms [[buffer(3)]],
-    device uint *tokens [[buffer(4)]], device float *q_probs [[buffer(5)]],
-    device float *confidence [[buffer(6)]],
-    constant SelectorBatchParams &params [[buffer(7)]],
-    uint batch [[thread_position_in_grid]]) {
-  constexpr ulong Positions = SPLASH_DRAFT_PROPOSAL_TOKENS;
-  constexpr ulong Shards = SPLASH_DRAFT_SAMPLING_SHARDS;
-  constexpr ulong Candidates = SPLASH_DRAFT_CANDIDATES;
-  candidates += batch * Positions * Candidates;
-  unary += batch * Positions * Candidates;
-  device const float *tables = partial_values +
-                               params.lanes * Positions * Shards * Candidates +
-                               batch * Positions * Candidates * Candidates;
-  uniforms += batch * SPLASH_SAMPLING_UNIFORMS;
-  tokens += batch * Positions;
-  q_probs += batch * Positions * Candidates;
-  confidence += batch * Positions;
+    device const uint *chain_tokens [[buffer(3)]],
+    device const float *chain_rates [[buffer(4)]],
+    device uint *tokens [[buffer(5)]],
+    device SplashTreeRow *tree [[buffer(6)]],
+    device float2 *scores [[buffer(7)]],
+    device uint *sizes [[buffer(8)]],
+    device uchar *draws [[buffer(9)]],
+    device float *next [[buffer(10)]],
+    device float *caps [[buffer(11)]],
+    constant DraftTreeParams &params [[buffer(12)]],
+    uint lane [[threadgroup_position_in_grid]],
+    uint thread_index [[thread_index_in_threadgroup]]) {
+  constexpr uint Positions = SPLASH_DRAFT_PROPOSAL_TOKENS;
+  constexpr uint Shards = SPLASH_DRAFT_SAMPLING_SHARDS;
+  constexpr uint Candidates = SPLASH_DRAFT_CANDIDATES;
+  threadgroup TreeLattice lattice;
+  threadgroup TreeHeap heap;
+  threadgroup TreeRows rows;
 
-  const bool sampling = (params.sampling_mask & (1u << batch)) != 0;
-  uint predecessor_index = 0;
-  for (uint position = 0; position < Positions; ++position) {
-    device const float *edges =
-        tables + (position * Candidates + predecessor_index) * Candidates;
-    float scores[Candidates];
-    for (uint i = 0; i < Candidates; ++i)
-      scores[i] = unary[position * Candidates + i] + edges[i];
-    // The largest of the position's candidate probabilities at temperature
-    // 1, before the lane chooses among them.
-    float best = scores[0];
-    for (uint i = 1; i < Candidates; ++i)
-      best = max(best, scores[i]);
-    float mass = 0.0f;
-    for (uint i = 0; i < Candidates; ++i)
-      mass += exp(scores[i] - best);
-    confidence[position] = 1.0f / mass;
-    uint selected = 0;
-    if (sampling) {
-      float maximum = scores[0];
+  const ulong origin = ulong(lane) * Positions * Candidates;
+  if (thread_index < Positions * Candidates) {
+    const uint position = thread_index / Candidates;
+    const uint predecessor = thread_index % Candidates;
+    lattice.ids[position][predecessor] = candidates[origin + thread_index];
+    // Position 0 follows the anchor alone.
+    if (position > 0 || predecessor == 0) {
+      device const float *edges =
+          partial_values +
+          ulong(params.lanes) * Positions * Shards * Candidates +
+          ((ulong(lane) * Positions + position) * Candidates + predecessor) *
+              Candidates;
+      float score[Candidates];
+      for (uint i = 0; i < Candidates; ++i)
+        score[i] = unary[origin + position * Candidates + i] + edges[i];
+      float best = score[0];
       for (uint i = 1; i < Candidates; ++i)
-        maximum = max(maximum, scores[i]);
-      float sum = 0.0f;
+        best = max(best, score[i]);
+      float weight[Candidates];
+      float mass = 0.0f;
       for (uint i = 0; i < Candidates; ++i) {
-        float probability =
-            exp((scores[i] - maximum) / params.temperature[batch]);
-        q_probs[position * Candidates + i] = probability;
-        sum += probability;
+        weight[i] = exp(score[i] - best);
+        mass += weight[i];
       }
-      float cumulative = 0.0f;
-      selected = Candidates - 1;
-      for (uint i = 0; i < Candidates; ++i) {
-        float probability = q_probs[position * Candidates + i] / sum;
-        q_probs[position * Candidates + i] = probability;
-        cumulative += probability;
-        if (selected == Candidates - 1 &&
-            cumulative > uniforms[SPLASH_UNIFORM_PROPOSALS + position]) {
-          selected = i;
-        }
-      }
-    } else {
-      for (uint i = 1; i < Candidates; ++i) {
-        if (scores[i] > scores[selected])
-          selected = i;
+      for (uint i = 0; i < Candidates; ++i)
+        lattice.probability[position][predecessor][i] = weight[i] / mass;
+      uint taken = 0;
+      for (uint child = 0; child < kTreeChildren; ++child) {
+        uint selected = Candidates;
+        for (uint i = 0; i < Candidates; ++i)
+          if (!(taken & (1u << i)) &&
+              (selected == Candidates || score[i] > score[selected]))
+            selected = i;
+        taken |= 1u << selected;
+        lattice.likeliest[position][predecessor][child] = uchar(selected);
       }
     }
-    predecessor_index = selected;
-    tokens[position] = candidates[position * Candidates + selected];
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+
+  constexpr uint Rows = SPLASH_TARGET_VERIFY_ROWS;
+  if (thread_index == 0) {
+    device const uint *chain =
+        chain_tokens + ulong(lane) * SPLASH_TREE_CHAIN_TOKENS;
+    device const float *rates = chain_rates + ulong(lane) *
+                                                  SPLASH_TREE_CHAIN_TOKENS *
+                                                  SPLASH_TREE_AGREEMENTS;
+    const uint children = params.children[lane];
+    const uint deepest = params.depth[lane], chained = params.chain[lane];
+    heap.size = 0;
+    heap.pushed = 0;
+    rows.made = 1;
+    rows.token[0] = params.anchor[lane];
+    rows.ancestors[0] = 1;
+    rows.parent[0] = SPLASH_TREE_ROOT;
+    rows.depth[0] = 0;
+    rows.on_chain[0] = true;
+    rows.q[0] = 1.0f;
+    rows.estimate[0] = 1.0f;
+    rows.cap[0] = 1.0f;
+    rows.key[0] = ulong(params.noise[lane][1]) << 32 | params.noise[lane][0];
+    tree_row_clear(rows, 0);
+    if (deepest > 0) {
+      const float rate =
+          chained ? tree_chain_rate(lattice, chain, rates, 0) : 0.0f;
+      tree_expand(lattice, heap, rows, params, lane, children, 0, 0, 0, 1.0f,
+                  chained ? chain[0] : kNoChainToken, rate);
+      if (chained)
+        tree_push(heap, rate, tree_info(true, 0, 0, 0));
+    }
+    // No more rows than the tokens a walk of the tree may retain.
+    const uint most = min(Rows, deepest + 1);
+    while (heap.size && rows.made < most) {
+      const float score = heap.score[0];
+      const uint info = heap.info[0];
+      tree_pop(heap);
+      const bool from_chain = (info & kTreeChain) != 0;
+      const uint parent = (info >> 16) & 0x7fffu;
+      const uint position = (info >> 8) & 0xffu, index = info & 0xffu;
+      const uint token =
+          from_chain ? chain[position] : lattice.ids[position][index];
+      // A token path the tree holds already gains no row.
+      uint row = 0;
+      for (uint other = 1; other < rows.made && !row; ++other)
+        row = rows.parent[other] == parent && rows.token[other] == token
+                  ? other
+                  : 0;
+      if (!row) {
+        row = rows.made++;
+        rows.token[row] = token;
+        rows.ancestors[row] = rows.ancestors[parent] | (1u << row);
+        rows.parent[row] = ushort(parent);
+        rows.depth[row] = ushort(position + 1);
+        rows.on_chain[row] = rows.on_chain[parent] && position < chained &&
+                             token == chain[position];
+        // A row a host chain token made is no draft step: its estimate is
+        // the chain's, and it has no draft probability.
+        rows.q[row] = from_chain ? -1.0f : rows.next[parent][index];
+        rows.estimate[row] = score;
+        rows.cap[row] = from_chain ? 1.0f : tree_cap(rows, parent, index);
+        rows.key[row] = tree_key(rows.key[parent], token);
+        tree_row_clear(rows, row);
+      } else if (!from_chain && rows.q[row] < 0.0f) {
+        // A draft step that joins a lookup chain's row labels the draft's
+        // calibration like any draft row: such rows, which the draft's top
+        // candidate often is, the target accepted 97-100% of the time in
+        // decode traces (model::LookupAcceptance::kPrior), and the fit
+        // without them learns from the draft's other rows alone.
+        rows.q[row] = rows.next[parent][index];
+        rows.cap[row] = tree_cap(rows, parent, index);
+      }
+      // The row's children lie a step deeper.
+      if (position + 1 >= deepest)
+        continue;
+      // A row on the chain's path has the chain's next token for a child.
+      const bool chain_child = rows.on_chain[row] && position + 1 < chained;
+      if (!from_chain && position + 1 < Positions)
+        tree_expand(lattice, heap, rows, params, lane, children, row,
+                    position + 1, index, score,
+                    chain_child ? chain[position + 1] : kNoChainToken,
+                    chain_child ? tree_chain_rate(lattice, chain, rates,
+                                                  position + 1)
+                                : 0.0f);
+      else if (from_chain && position + 1 < chained)
+        tree_push(heap,
+                  score * tree_chain_rate(lattice, chain, rates, position + 1),
+                  tree_info(true, row, position + 1, 0));
+    }
+    sizes[lane] = rows.made;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (thread_index < rows.made) {
+    const ulong at = ulong(lane) * Rows + thread_index;
+    tokens[at] = rows.token[thread_index];
+    tree[at] = {rows.ancestors[thread_index], rows.parent[thread_index],
+                rows.depth[thread_index]};
+    scores[at] = float2(rows.q[thread_index], rows.estimate[thread_index]);
+    caps[at] = rows.cap[thread_index];
+    for (uint child = 0; child < kTreeChildren; ++child)
+      draws[at * kTreeChildren + child] = rows.draw[thread_index][child];
+    for (uint i = 0; i < Candidates; ++i)
+      next[at * Candidates + i] = rows.next[thread_index][i];
   }
 }
 
-// One thread chooses every lane's verify rows (VerifyRowsParams): it ranks
-// the survivals of the lanes' proposal positions, largest first, the earlier
-// position first among equal ones, so that a lane's chosen rows are always the
-// first of its block, and takes as many as maximize the expected tokens over
-// the cost of the rows verified in all.
-kernel void draft_verify_rows(device const float *confidence [[buffer(0)]],
-                              device uint *verify_rows [[buffer(1)]],
-                              constant VerifyRowsParams &params [[buffer(2)]],
+// One thread lays out a decode cycle's rows (VerifyRowsParams) from the
+// trees the selector grew, lane l's sizes[l] rows from row l *
+// SPLASH_TARGET_VERIFY_ROWS of tree_tokens, trees and scores: each lane's
+// rows, and its rows' tokens, tree rows and sources (the row of its lane's
+// tree each is), packed in lane order, and after them the rows of no lane,
+// each lane 0's anchor and no source (SPLASH_NO_TOKEN). A lane's rows are
+// numbered in preorder, the earlier-taken (likelier) child first, so that
+// the likeliest path of its tree lies on its first rows.
+kernel void draft_verify_rows(device const uint *tree_tokens [[buffer(0)]],
+                              device const SplashTreeRow *trees [[buffer(1)]],
+                              device const float2 *scores [[buffer(2)]],
+                              device const uint *sizes [[buffer(3)]],
+                              device uint *tokens [[buffer(4)]],
+                              device SplashTreeRow *tree [[buffer(5)]],
+                              device SplashLaneRows *lane_rows [[buffer(6)]],
+                              device uint *sources [[buffer(7)]],
+                              constant VerifyRowsParams &params [[buffer(8)]],
                               uint index [[thread_position_in_grid]]) {
-  constexpr uint Positions = SPLASH_DRAFT_PROPOSAL_TOKENS;
   constexpr uint Lanes = SPLASH_MAXIMUM_BATCH_WIDTH;
+  constexpr uint Rows = SPLASH_TARGET_VERIFY_ROWS;
   if (index != 0)
     return;
-  uint rows[Lanes];
-  uint total = 0;
+  // Every lane's rows past its anchor by estimate, a lane's earlier row first
+  // among equal ones.
+  float estimates[Lanes * Rows];
+  uint owners[Lanes * Rows];
+  uint count = 0;
   for (uint lane = 0; lane < params.lanes; ++lane) {
-    rows[lane] = params.every_row != 0 ? params.maximum[lane] : 1;
-    total += rows[lane];
-  }
-  if (params.every_row == 0) {
-    float survivals[Lanes * Positions];
-    uint owners[Lanes * Positions];
-    uint count = 0;
-    for (uint lane = 0; lane < params.lanes; ++lane) {
-      float survival = 1.0f;
-      // Row position + 2 verifies the proposal at `position`.
-      for (uint position = 0; position + 1 < params.maximum[lane]; ++position) {
-        const float q = clamp(confidence[lane * Positions + position], 1.0e-6f,
-                              1.0f - 1.0e-6f);
-        const float z = params.slope * log(q / (1.0f - q)) +
-                        params.intercept[position];
-        survival *= 1.0f / (1.0f + exp(-z));
-        uint at = count++;
-        for (; at > 0 && survivals[at - 1] < survival; --at) {
-          survivals[at] = survivals[at - 1];
-          owners[at] = owners[at - 1];
-        }
-        survivals[at] = survival;
-        owners[at] = lane;
+    for (uint row = 1; row < sizes[lane]; ++row) {
+      const float estimate = scores[lane * Rows + row].y;
+      uint at = count++;
+      for (; at > 0 && estimates[at - 1] < estimate; --at) {
+        estimates[at] = estimates[at - 1];
+        owners[at] = owners[at - 1];
       }
+      estimates[at] = estimate;
+      owners[at] = lane;
     }
-    float expected = float(params.lanes);
-    float best = expected / params.cost[total];
-    uint taken = 0;
-    for (uint i = 0; i < count; ++i) {
-      expected += survivals[i];
-      const float value = expected / params.cost[total + i + 1];
-      if (value > best) {
-        best = value;
-        taken = i + 1;
-      }
-    }
-    for (uint i = 0; i < taken; ++i)
-      ++rows[owners[i]];
   }
+  // The best of them that the cycle's rows and the lanes' cap hold, none
+  // below the floor: they fall, so the first below it ends them.
+  uint rows[Lanes];
   for (uint lane = 0; lane < params.lanes; ++lane)
-    verify_rows[lane] = rows[lane];
-}
-
-inline float sparse_lookup(device const uint *ids,
-                           device const float *probabilities, uint count,
-                           uint token) {
-  for (uint i = 0; i < count; ++i) {
-    if (ids[i] == token)
-      return probabilities[i];
-  }
-  return 0.0f;
-}
-
-// One lane's view of AcceptBatchParams, built by decode_accept_dflash.
-struct AcceptParams {
-  uint remaining;
-  constant uint *stop_tokens;
-};
-
-// Keeps at most params.remaining of the accepted tokens plus the correction,
-// cut after the first stop token, and records the retained and accepted
-// counts.
-inline void finish_acceptance(device const uint *tokens, uint accepted,
-                              AcceptParams params, device uint &retained,
-                              device uint &accepted_count) {
-  accepted_count = accepted;
-  retained = min(accepted + 1, params.remaining);
-  for (uint i = 0; i < retained; ++i) {
-    if (stop_token(params.stop_tokens, tokens[i])) {
-      retained = i + 1;
+    rows[lane] = 1;
+  uint taken = params.lanes;
+  for (uint i = 0; i < count && taken < params.rows; ++i) {
+    if (estimates[i] < params.floor)
       break;
+    if (rows[owners[i]] == params.lane_cap)
+      continue;
+    ++rows[owners[i]];
+    ++taken;
+  }
+  uint first = 0;
+  for (uint lane = 0; lane < params.lanes; ++lane) {
+    device const uint *token = tree_tokens + lane * Rows;
+    uint parent[Rows];
+    for (uint row = 0; row < rows[lane]; ++row)
+      parent[row] = trees[lane * Rows + row].parent;
+    // Preorder: a row's children follow it, each with its subtree, in the
+    // order the tree took them.
+    uint order[Rows], placed[Rows], stack[Rows];
+    uint size = 0, next = 0;
+    stack[size++] = 0;
+    while (size) {
+      const uint row = stack[--size];
+      placed[row] = next;
+      order[next++] = row;
+      for (uint child = rows[lane]; child-- > row + 1;)
+        if (parent[child] == row)
+          stack[size++] = child;
     }
+    uint ancestors[Rows], depths[Rows];
+    for (uint at = 0; at < rows[lane]; ++at) {
+      const uint row = order[at];
+      const uint up = at ? placed[parent[row]] : uint(SPLASH_TREE_ROOT);
+      ancestors[at] = (at ? ancestors[up] : 0u) | (1u << at);
+      depths[at] = at ? depths[up] + 1 : 0u;
+      tokens[first + at] = token[row];
+      tree[first + at] = {ancestors[at], ushort(up), ushort(depths[at])};
+      sources[first + at] = row;
+    }
+    lane_rows[lane] = {first, rows[lane]};
+    first += rows[lane];
   }
-}
-
-// A sampled lane's verify rows carry their draft tokens' target
-// probabilities (TargetVocabularyRow), and its output tokens their draws:
-// the correction a rejection takes or, for the last row, the bonus token.
-// Acceptance overwrites the accepted rows with the draft tokens, so row
-// accepted keeps its draw.
-inline void accept_sampled_lane(device const uint *draft_tokens,
-                                device const uint *draft_ids,
-                                device const float *draft_probs,
-                                device const TargetVocabularyRow *target_rows,
-                                device const float *uniforms,
-                                device uint *output_tokens,
-                                device uint &retained,
-                                device uint &accepted_count,
-                                AcceptParams params) {
-  uint accepted = 0;
-  while (accepted < SPLASH_DRAFT_PROPOSAL_TOKENS) {
-    uint token = draft_tokens[accepted];
-    float q = sparse_lookup(draft_ids + accepted * kDraftCandidates,
-                            draft_probs + accepted * kDraftCandidates,
-                            kDraftCandidates, token);
-    float p = target_rows[accepted].draft_probability;
-    if (!(uniforms[SPLASH_UNIFORM_ACCEPTANCE + accepted] * q < p))
-      break;
-    output_tokens[accepted] = token;
-    ++accepted;
+  // The rows of no lane (VerifyRowsParams), which the embedding gathers by
+  // their token, on no path and of no parent: none of an earlier cycle's.
+  for (uint row = first; row < params.rows; ++row) {
+    tokens[row] = tree_tokens[0];
+    tree[row] = {0u, ushort(SPLASH_TREE_ROOT), ushort(0)};
+    sources[row] = SPLASH_NO_TOKEN;
   }
-  finish_acceptance(output_tokens, accepted, params, retained,
-                    accepted_count);
 }
 
 // One shard of a greedy row: its admitted token with the largest selectable
@@ -1623,18 +2004,23 @@ kernel void decode_sample_argmax_sharded(
     device const uint *token_mask [[buffer(1)]],
     device float *partial_values [[buffer(2)]],
     device uint *partial_indices [[buffer(3)]],
-    constant TargetSamplingParams &params [[buffer(4)]],
-    uint group [[threadgroup_position_in_grid]],
+    device const SplashLaneRows *lane_rows [[buffer(4)]],
+    constant TargetSamplingParams &params [[buffer(5)]],
+    uint2 group [[threadgroup_position_in_grid]],
     uint thread_index [[thread_index_in_threadgroup]]) {
   threadgroup float group_values[8];
   threadgroup uint group_indices[8];
-  const uint s = group / SPLASH_TARGET_SAMPLING_SHARDS;
-  if (lane_samples(params, s))
+  const uint batch = group.y, index = group.x / SPLASH_TARGET_SAMPLING_SHARDS;
+  if (!selects(params, lane_rows, batch, index, false))
     return;
-  argmax_shard(selected_row(logits, token_mask, params, s),
-               group % SPLASH_TARGET_SAMPLING_SHARDS, partial_values[group],
-               partial_indices[group], group_values, group_indices,
-               thread_index);
+  const uint shard = group.x % SPLASH_TARGET_SAMPLING_SHARDS;
+  const ulong partial =
+      ulong(selected_logits_row(lane_rows, batch, index)) *
+          SPLASH_TARGET_SAMPLING_SHARDS +
+      shard;
+  argmax_shard(selected_row(logits, token_mask, params, lane_rows, batch, index), shard,
+               partial_values[partial], partial_indices[partial],
+               group_values, group_indices, thread_index);
 }
 
 // A greedy row's token from its shards' partials.
@@ -1655,119 +2041,107 @@ kernel void decode_sample_argmax_reduce(
     device const float *partial_values [[buffer(0)]],
     device const uint *partial_indices [[buffer(1)]],
     device uint *tokens [[buffer(2)]],
-    constant TargetSamplingParams &params [[buffer(3)]],
-    uint s [[threadgroup_position_in_grid]],
+    device const SplashLaneRows *lane_rows [[buffer(3)]],
+    constant TargetSamplingParams &params [[buffer(4)]],
+    uint2 group [[threadgroup_position_in_grid]],
     uint lane [[thread_index_in_simdgroup]]) {
-  if (lane_samples(params, s))
+  const uint batch = group.y, index = group.x;
+  if (!selects(params, lane_rows, batch, index, false))
     return;
+  const uint s = selected_logits_row(lane_rows, batch, index);
   const uint token = argmax_reduce(partial_values, partial_indices, s, lane);
   if (lane == 0)
     tokens[s] = token;
 }
 
 // After the selection, the thinking cutoff of each lane that has one
-// (ThinkingCutoffParams): its rows from its row on select its end tokens, or
-// where its end waits for its mask, its rows from the first of those whose
-// mask admits the end's first token. Draft token r is verify input row r + 1.
+// (ThinkingCutoffParams): each row whose path reaches the path's cut, its row
+// at the depth of the lane's row or, where the lane's end waits for its mask,
+// the first from there whose mask admits the end's first token, selects the
+// end token of its depth past the cut. A row's path up to its cut, its anchor
+// excepted, holds the draft tokens before the cut.
 kernel void decode_sample_thinking_cutoff(
     device const uint *input_tokens [[buffer(0)]],
     device const uint *token_mask [[buffer(1)]],
-    device uint *tokens [[buffer(2)]],
-    device TargetVocabularyRow *vocabulary_rows [[buffer(3)]],
-    constant ThinkingCutoffParams &params [[buffer(4)]],
+    device const SplashTreeRow *tree [[buffer(2)]],
+    device uint *tokens [[buffer(3)]],
+    device const SplashLaneRows *lane_rows [[buffer(4)]],
+    constant ThinkingCutoffParams &params [[buffer(5)]],
     uint lane [[threadgroup_position_in_grid]]) {
-  uint row = params.row[lane];
-  if (params.waiting_mask & (1u << lane)) {
-    // The lane's mask rows, as selected_row reads them.
-    device const uint *masks =
-        token_mask + (ulong(lane) * (SPLASH_TARGET_VERIFY_ROWS + 1) +
-                      params.mask_row) *
-                         params.mask_words;
-    const uint start = params.tokens[lane][0];
-    for (; row < params.rows; ++row) {
-      if (masks[row * params.mask_words + start / 32] & (1u << (start % 32)))
+  const uint rows = lane_rows[lane].rows, first = lane_rows[lane].first;
+  const bool waits = (params.waiting_mask & (1u << lane)) != 0;
+  // The lane's mask rows, as selected_row reads them.
+  device const uint *masks =
+      token_mask + (ulong(lane) * (SPLASH_TARGET_VERIFY_ROWS + 1) +
+                    params.mask_row) *
+                       params.mask_words;
+  const uint start = params.tokens[lane][0];
+  for (uint at = 0; at < rows; ++at) {
+    const uint path = tree[first + at].ancestors;
+    const uint depth = tree[first + at].depth;
+    // The path's rows ascend from its anchor, one a depth; one past the
+    // row's depth where the path holds no cut.
+    uint cut = 0;
+    for (uint walk = path; walk; walk &= walk - 1, ++cut)
+      if (cut >= params.row[lane] &&
+          (!waits || (masks[ctz(walk) * params.mask_words + start / 32] &
+                      (1u << (start % 32)))))
         break;
-    }
-  }
-  if (row >= params.rows)
-    return;
-  const uint first = lane * params.rows;
-  for (uint r = 0; r < min(row, params.drafted_rows); ++r) {
-    const uint draft = input_tokens[first + r + 1];
-    if (draft == params.close[lane] || draft == params.also_ends[lane])
-      return;
-  }
-  for (uint i = 0; i < min(params.count[lane], params.rows - row); ++i) {
-    // A row with no selectable logit keeps its sentinel, so the lane fails.
-    if (tokens[first + row + i] >= params.vocabulary)
+    if (cut > depth || depth - cut >= params.count[lane])
       continue;
-    const uint end = params.tokens[lane][i];
-    tokens[first + row + i] = end;
-    if ((params.sampling_mask & (1u << lane)) && row + i < params.drafted_rows)
-      vocabulary_rows[first + row + i].draft_probability =
-          input_tokens[first + row + i + 1] == end ? 1.0f : 0.0f;
+    bool ended = false;
+    for (uint walk = path & ~1u; walk; walk &= walk - 1) {
+      const uint before = ctz(walk);
+      const uint draft = input_tokens[first + before];
+      ended = ended || (tree[first + before].depth <= cut &&
+                        (draft == params.close[lane] || draft == params.also_ends[lane]));
+    }
+    // A row with no selectable logit keeps its sentinel, so the lane fails.
+    if (!ended && tokens[first + at] < params.vocabulary)
+      tokens[first + at] = params.tokens[lane][depth - cut];
   }
 }
 
-// Before the verify, each lane whose thinking cutoff is at row 0
-// (ThinkingCutoffParams) and whose end does not wait for its mask, which
-// only the verify reads, drafts the end tokens its verify rows will select:
-// its draft token r is its row r's.
-kernel void decode_draft_thinking_cutoff(
-    device uint *proposed_tokens [[buffer(0)]],
-    constant ThinkingCutoffParams &params [[buffer(1)]],
-    uint lane [[threadgroup_position_in_grid]]) {
-  if (params.row[lane] != 0 || (params.waiting_mask & (1u << lane)))
-    return;
-  for (uint r = 0; r < min(params.count[lane], params.drafted_rows); ++r)
-    proposed_tokens[lane * SPLASH_DRAFT_PROPOSAL_TOKENS + r] =
-        params.tokens[lane][r];
-}
-
-inline void accept_greedy_lane(device const uint *draft_tokens,
-                               device uint *target_tokens,
-                               device uint &retained,
-                               device uint &accepted_count,
-                               AcceptParams params) {
-  uint accepted = 0;
-  while (accepted < SPLASH_DRAFT_PROPOSAL_TOKENS &&
-         draft_tokens[accepted] == target_tokens[accepted]) {
-    ++accepted;
-  }
-  finish_acceptance(target_tokens, accepted, params, retained,
-                    accepted_count);
-}
-
-kernel void decode_accept_dflash(
-    device const uint *draft_tokens [[buffer(0)]],
-    device const uint *draft_ids [[buffer(1)]],
-    device const float *draft_probs [[buffer(2)]],
-    device const TargetVocabularyRow *target_rows [[buffer(3)]],
-    device const float *uniforms [[buffer(4)]],
-    device uint *target_tokens [[buffer(5)]],
-    device uint *retained [[buffer(6)]],
-    device uint *accepted_count [[buffer(7)]],
-    device const uint *verify_rows [[buffer(8)]],
-    constant AcceptBatchParams &params [[buffer(9)]],
+// Each lane's acceptance (AcceptBatchParams), one thread a lane. Its retained
+// tokens, the selections of the path's rows, go to the output tokens from its
+// first row, each read before an earlier path row's is written there.
+kernel void decode_accept_tree(
+    device const uint *input_tokens [[buffer(0)]],
+    device const SplashTreeRow *tree [[buffer(1)]],
+    device uint *tokens [[buffer(2)]],
+    device uint *retained [[buffer(3)]],
+    device uint *accepted_count [[buffer(4)]],
+    device uint *retained_rows [[buffer(5)]],
+    device const SplashLaneRows *lane_rows [[buffer(6)]],
+    constant AcceptBatchParams &params [[buffer(7)]],
     uint batch [[threadgroup_position_in_grid]]) {
-  // A lane retains at most the rows its verify verified (the selector's
-  // verify rows, SelectorBatchParams).
-  uint remaining = min(params.remaining[batch], verify_rows[batch]);
-  AcceptParams lane_params{remaining, params.stop_tokens};
-  device const uint *lane_draft =
-      draft_tokens + batch * SPLASH_DRAFT_PROPOSAL_TOKENS;
-  device uint *lane_target =
-      target_tokens + batch * SPLASH_TARGET_VERIFY_ROWS;
-  if (params.sampling_mask & (1u << batch)) {
-    accept_sampled_lane(
-        lane_draft,
-        draft_ids + batch * SPLASH_DRAFT_PROPOSAL_TOKENS * kDraftCandidates,
-        draft_probs + batch * SPLASH_DRAFT_PROPOSAL_TOKENS * kDraftCandidates,
-        target_rows + batch * SPLASH_TARGET_VERIFY_ROWS,
-        uniforms + batch * SPLASH_SAMPLING_UNIFORMS, lane_target,
-        retained[batch], accepted_count[batch], lane_params);
-  } else {
-    accept_greedy_lane(lane_draft, lane_target, retained[batch],
-                       accepted_count[batch], lane_params);
+  const uint first = lane_rows[batch].first, rows = lane_rows[batch].rows;
+  device const uint *inputs = input_tokens + first;
+  device const SplashTreeRow *nodes = tree + first;
+  device uint *selected = tokens + first;
+  uint path[SPLASH_TARGET_VERIFY_ROWS];
+  path[0] = 0;
+  uint accepted = 0;
+  for (uint row = 0;;) {
+    const uint token = selected[row];
+    uint next = 0;
+    for (uint child = row + 1; child < rows && !next; ++child)
+      next = nodes[child].parent == row && inputs[child] == token ? child : 0;
+    if (!next)
+      break;
+    path[++accepted] = next;
+    row = next;
   }
+  uint kept = min(accepted + 1, params.remaining[batch]);
+  for (uint i = 0; i < kept; ++i) {
+    const uint token = selected[path[i]];
+    selected[i] = token;
+    if (stop_token(params.stop_tokens, token))
+      kept = i + 1;
+  }
+  // Where the lane's cap or a stop token cuts its path, every token it
+  // retains is a proposal it accepted.
+  accepted_count[batch] = min(accepted, kept);
+  retained[batch] = kept;
+  retained_rows[batch] = nodes[path[kept - 1]].ancestors;
 }

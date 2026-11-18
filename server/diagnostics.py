@@ -307,15 +307,24 @@ def print_status(message, *, error=False):
 
 
 def _reasoning_parts(reasoning):
-    """A chat request's reasoning: the effort it sent, or absent and the
-    server's default where that applied, its enable_thinking where it set
-    one, and whether it thinks."""
-    if reasoning["sent_effort"] is not None:
-        parts = [f"effort {reasoning['sent_effort']}"]
-    elif reasoning["effort"] is not None:
-        parts = [f"effort absent → {reasoning['effort']}"]
+    """A chat request's reasoning: the effort it sent, or absent, then the
+    effort it rendered with where that is another: its chat_template_kwargs
+    effort, which the template renders over the others, named as such, or
+    the server's (its default for an absent one, or the one it sets for
+    every request); its enable_thinking where it set one that counted, and
+    whether it thinks."""
+    sent, effort = reasoning["sent_effort"], reasoning["effort"]
+    if (template := reasoning.get("template_effort")) is not None:
+        rendered = f"{template} (chat_template_kwargs)"
+        parts = [
+            f"effort {rendered}"
+            if sent in (None, template)
+            else f"effort {sent} → {rendered}"
+        ]
     else:
-        parts = ["effort absent"]
+        parts = [f"effort {'absent' if sent is None else sent}"]
+        if effort not in (None, sent):
+            parts[0] += f" → {effort}"
     if reasoning["enable_thinking"] is not None:
         parts.append(f"enable_thinking {str(reasoning['enable_thinking']).lower()}")
     parts.append("thinking on" if reasoning["thinking"] else "thinking off")

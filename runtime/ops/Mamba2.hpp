@@ -59,16 +59,18 @@ struct Mamba2StepStates final {
 
 class Mamba2 final {
 public:
-  // Each lane's eight verify rows of `packed` from its state cell's layer
-  // `layer` to the next cell's, folding the rows its tape lane retained
-  // first, as GDN's decode does: the state written is the one before the
-  // step's rows, which the step leaves on its tape. Writes the gated rows y
-  // (fp32, inner size a row). The state is fp32.
+  // Each lane's rows of the step's `rows` rows of `packed` (its block in
+  // `laneRows`, SplashLaneRows, a chain of up to a verify block's rows) from
+  // its state cell's layer `layer` to the next cell's, folding the path its
+  // tape lane retained first (a chain's, its first rows), as GDN's decode
+  // does: the state written is the one before the step's rows, which the
+  // step leaves on its tape. Writes the gated rows y (fp32, inner size a
+  // row) of the lanes' rows. The state is fp32.
   static void addDecode(metal::CommandGraph &graph, metal::MetalBuffer packed, const Mamba2Weights &weights,
                         std::span<const metal::MetalBuffer> currentStates,
                         std::span<const metal::MetalBuffer> nextStates, metal::MetalBuffer tape,
-                        std::span<const GdnTapeLane> tapeLanes, metal::MetalBuffer y, Mamba2Shape shape,
-                        uint32_t layer, GdnStateStrides state);
+                        std::span<const GdnTapeLane> tapeLanes, metal::MetalBuffer laneRows, uint32_t rows,
+                        metal::MetalBuffer y, Mamba2Shape shape, uint32_t layer, GdnStateStrides state);
   // One prefill step of eight rows of `packed` from `states`' inputs to
   // their outputs, folding the `pendingRows` rows of the previous step's
   // tape at `pendingTape` first and leaving its rows' at `stepTape`; rows

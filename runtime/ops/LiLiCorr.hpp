@@ -92,20 +92,28 @@ public:
   // The bytes of each of LiLiCorrScratch's buffers but linear, in order, for
   // a draft of `hidden` width.
   [[nodiscard]] static std::vector<uint64_t> scratchBytes(uint32_t hidden);
+  // The most rows a selector's projection runs: a full batch's nodes or
+  // pass rows.
+  [[nodiscard]] static uint32_t maximumRows() noexcept;
 
   // Each lane's proposals: DraftSelector's candidates, the selector's edge
   // tables in their place in buffers.partialValues, then DraftSelector's
-  // walk over them.
+  // trees over them.
   static void add(metal::CommandGraph &graph, const Linear &linear, const DraftSelector &selector,
                   const DraftSelectorBuffers &buffers, const LiLiCorrWeights &weights,
-                  const LiLiCorrScratch &scratch, const LiLiCorrInputs &inputs, std::span<const uint32_t> anchors,
-                  std::span<const SamplingPolicy> policies, uint32_t hidden, uint32_t vocabulary);
+                  const LiLiCorrScratch &scratch, const LiLiCorrInputs &inputs, DraftVocabulary vocabulary,
+                  std::span<const DraftTreeLane> lanes, uint32_t hidden);
   // Copies row `row` of `rows` (or with `counts`, row counts[0] - 1) of
   // `hidden` bf16 values into row `anchorRow` of `anchor`: a lane's anchor
   // context row.
   static void addStoreAnchor(metal::CommandGraph &graph, const metal::MetalBuffer &rows, uint32_t row,
-                             const metal::MetalBuffer &counts, const metal::MetalBuffer &anchor, uint32_t hidden,
-                             uint32_t anchorRow = 0);
+                             const metal::MetalBuffer &anchor, uint32_t hidden, uint32_t anchorRow = 0);
+  // A decode step's lane `lane`'s anchor: its deepest accepted row of `rows`
+  // (the highest bit of its path mask in `paths`, from its first row in
+  // `laneRows`, SplashLaneRows).
+  static void addStoreAcceptedAnchor(metal::CommandGraph &graph, const metal::MetalBuffer &rows,
+                                     const metal::MetalBuffer &paths, const metal::MetalBuffer &laneRows,
+                                     uint32_t lane, const metal::MetalBuffer &anchor, uint32_t hidden);
 };
 
 } // namespace splash::ops

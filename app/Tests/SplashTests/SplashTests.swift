@@ -76,14 +76,15 @@ struct ServeSettingsTests {
     @Test func passesTheOptionsSetInTheTablesOrder() {
         let settings = ServeSettings(values: [
             "--port": "8100", "--max-context": "131072", "--max-memory": "48G", "--idle-release": "off",
-            "--language-only": "true", "--kv-format": "bf16", "--max-cache-disk": "16G", "--persistent-cache": "true",
+            "--language-only": "true", "--kv-format": "bf16", "--cached-states": "exact", "--max-cache-disk": "16G",
+            "--persistent-cache": "true",
             "--host": "0.0.0.0", "--allowed-origin": "a.example, b.example", "--no-webui": "true",
             "--thinking-end-text": "Now the answer. </think>", "--disable-ane": "true",
         ], apiKey: "secret")
         #expect(settings.serveArguments(model: "a/b", localName: nil)
             == ["serve", "--model", "a/b", "--port", "8100", "--offline", "--max-context", "131072",
                 "--max-memory", "48G", "--idle-release", "off", "--language-only", "--kv-format", "bf16",
-                "--max-cache-disk", "16G", "--persistent-cache", "--host", "0.0.0.0",
+                "--cached-states", "exact", "--max-cache-disk", "16G", "--persistent-cache", "--host", "0.0.0.0",
                 "--allowed-origin", "a.example", "--allowed-origin", "b.example", "--no-webui",
                 "--thinking-end-text", "Now the answer. </think>", "--disable-ane"])
         // The key reaches the server in its environment, never its command line.
@@ -162,7 +163,7 @@ struct ServeSettingsTests {
 
     /// Flint's options, as the runtime reports its family: no vision, recurrent state, PLE table,
     /// sparse KV, Neural Engine or thinking switch.
-    static let flint = ModelFamily(unusable: ["--language-only", "--state-format", "--ple-memory", "--sparse-kv-memory",
+    static let flint = ModelFamily(unusable: ["--language-only", "--state-format", "--cached-states", "--ple-memory", "--sparse-kv-memory",
                                               "--disable-ane", "--max-image-pixels", "--default-reasoning-effort",
                                               "--thinking-token-budget", "--thinking-end-text"],
                                    contextTokens: 262_144, maxContextTokens: 262_144)
@@ -188,7 +189,7 @@ struct ServeSettingsTests {
         // The card leaves them out, and the bands of parts left empty.
         #expect(LaunchOptions.options(.memory, for: Self.flint).map(\.flag)
             == ["--kv-format", "--expert-memory"])
-        #expect(LaunchOptions.options(.memory, for: .unknown).count == 5)
+        #expect(LaunchOptions.options(.memory, for: .unknown).count == 6)
     }
 
     /// A context length longer than the model picked serves stays kept for a model that serves it,
@@ -853,6 +854,24 @@ struct ServerTests {
         let warming = try JSONDecoder().decode(ServeRecord.self, from: Data(contentsOf: Self.goldens.appending(
             path: "server/serve_record_warming_golden.json")))
         #expect(warming.phase == .warming && warming.warmup == ServeRecord.Warmup(steps_done: 3, steps: 9))
+        // A ready server that starts a failed engine again: it has started, and is at no step of
+        // a start.
+        let recovering = try JSONDecoder().decode(ServeRecord.self, from: Data(contentsOf: Self.goldens.appending(
+            path: "server/serve_record_recovering_golden.json")))
+        #expect(recovering.pid == 4242 && recovering.phase == .recovering)
+        #expect(recovering.phase.started && Server.Step(recovering.phase) == nil)
+        #expect(ServeRecord.Phase.ready.started && !ServeRecord.Phase.warming.started && !ServeRecord.Phase.failed.started)
+    }
+
+    /// A phase a later server writes is no news of the server, and its record still reads: the
+    /// process that wrote it and the failure it names (the whole record read as none, so that the
+    /// exit it explained was worded as a crash).
+    @Test func keepsARecordWhosePhaseItDoesNotKnow() throws {
+        let record = try JSONDecoder().decode(ServeRecord.self, from: Data(
+            #"{"pid":4242,"phase":"draining","failure":{"kind":"stopped","message":"why it stopped"}}"#.utf8))
+        #expect(record.pid == 4242 && record.phase == .unknown)
+        #expect(!record.phase.started && Server.Step(record.phase) == nil)
+        #expect(Server.exitProblem(record: record, pid: 4242, port: 8000, holder: nil) == "why it stopped")
     }
 
     @Test func wordsAnExitByItsOwnRecord() throws {
@@ -872,8 +891,9 @@ struct ServerTests {
         let unknown = "It stopped unexpectedly. The log has the details."
         #expect(problem(record, pid: 4243) == unknown)
         #expect(problem(nil, pid: 4242) == unknown)
-        // A start, or a ready server, that crashed or was killed.
-        for phase in ["starting", "ready"] {
+        // A start, or a ready server, its engine serving or being started again, that crashed or
+        // was killed.
+        for phase in ["starting", "ready", "recovering"] {
             let unsaid = try JSONDecoder().decode(ServeRecord.self, from: Data(#"{"pid":4242,"phase":"\#(phase)"}"#.utf8))
             #expect(problem(unsaid, pid: 4242) == unknown)
         }
@@ -960,6 +980,37 @@ struct ServerTests {
         try await waitFor(!server.running, "the end")
         let lines = try String(contentsOf: log, encoding: .utf8).split(separator: "\n")
         #expect(lines.count == 2 && lines[0].hasPrefix("── Starting a/b, ") && lines[1] == "SPLASH_APP_PID=\(getpid())")
+    }
+
+    /// A server whose engine failed as its start ended has started: its record says recovering,
+    /// and the app shows it ready and recovering at once, before any status says so (it read no
+    /// record in a phase it did not know, and showed the start's last step until the relaunch
+    /// served).
+    @MainActor @Test func aServerRecoveringAsItsStartEndsHasStarted() async throws {
+        // A checkout whose Python writes the record of a server that recovers, and runs on.
+        let root = FileManager.default.temporaryDirectory.appending(path: "splash-recovering-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let runtime = Runtime(root: root)
+        for folder in [runtime.python.deletingLastPathComponent(), runtime.locks] {
+            try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        }
+        let record = runtime.locks.appending(path: "serve-0.json").path(percentEncoded: false)
+        try """
+        #!/bin/sh
+        echo "{\\"pid\\":$$,\\"phase\\":\\"recovering\\"}" > '\(record)'
+        while :; do sleep 0.1; done
+
+        """.write(to: runtime.python, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: runtime.python.path)
+        let server = Server(runtime: runtime, log: root.appending(path: "server.log"), defaults: .kept(in: root),
+                            killAfter: .seconds(1))
+        // Its interrupt ends the script, where a wait below fails too.
+        defer { server.stop() }
+        server.start("a/b", settings: ServeSettings(values: ["--port": "0"]))
+        try await waitFor(server.phase == .ready, "the start's end")
+        #expect(server.serving == .recovering && !server.answers)
+        server.stop()
+        try await waitFor(!server.running, "the stop", seconds: 11)
     }
 }
 
@@ -1642,16 +1693,24 @@ struct ChatTests {
     @MainActor @Test func keepsConversationsInTheirFolder() async throws {
         let folder = FileManager.default.temporaryDirectory.appending(path: "splash-chat-tests-\(UUID().uuidString)")
         defer { try? FileManager.default.removeItem(at: folder) }
+        let server = Process()
+        server.executableURL = URL(filePath: "/usr/bin/python3")
+        server.arguments = [try #require(Bundle.module.path(forResource: "streaming_server", ofType: "py", inDirectory: "Fakes"))]
+        let output = Pipe()
+        server.standardOutput = output
+        try server.run()
+        defer { server.terminate() }
+        let port = try #require(String(data: output.fileHandleForReading.availableData, encoding: .utf8)
+            .flatMap { Int($0.trimmingCharacters(in: .whitespacesAndNewlines)) })
         let store = ChatStore(folder: folder)
         #expect(store.conversations.isEmpty)
-        // Sending to no server fails, and the conversation keeps the question and why.
-        let nowhere = ChatTarget(url: URL(string: "http://127.0.0.1:9")!, model: "a/b", acceptsImages: false, effort: "")
-        store.send("Hello\nthere", attachments: [], to: nowhere)
-        #expect(store.current?.title == "Hello")
+        // A message the server takes makes a conversation, which keeps the question and the answer.
+        store.send("Hello\nthere", attachments: [], to: ChatTarget(url: URL(string: "http://127.0.0.1:\(port)")!, model: "a/b", acceptsImages: false, effort: ""))
         #expect(store.streaming != nil)
-        while store.streaming != nil { try await Task.sleep(for: .milliseconds(20)) }
+        try await waitFor(store.streaming == nil, "the reply to end")
+        #expect(store.current?.title == "Hello")
         let answer = try #require(store.current?.messages.last)
-        #expect(answer.role == .assistant && answer.model == "a/b" && answer.error != nil)
+        #expect(answer.role == .assistant && answer.model == "a/b" && answer.text == "One two three")
         store.rename(store.conversations[0].id, to: "Greeting")
         // Written off the main thread, on disk once flushed, as the app does as it quits.
         store.flush()
@@ -1767,6 +1826,7 @@ struct ChatTests {
             .flatMap { Int($0.trimmingCharacters(in: .whitespacesAndNewlines)) })
         let store = ChatStore(folder: folder)
         store.send("Hello\nthere", attachments: [], to: ChatTarget(url: URL(string: "http://127.0.0.1:\(port)")!, model: "a/b", acceptsImages: false, effort: ""))
+        try await waitFor(store.current != nil, "the server to take the message")
         #expect(store.current?.title == "Hello")
         try await waitFor(store.current?.title == "Greeting the user", "the model's title")
         store.flush()
@@ -1789,6 +1849,7 @@ struct ChatTests {
             .flatMap { Int($0.trimmingCharacters(in: .whitespacesAndNewlines)) })
         let store = ChatStore(folder: folder)
         store.send("Hello", attachments: [], to: ChatTarget(url: URL(string: "http://127.0.0.1:\(port)")!, model: "a/b", acceptsImages: false, effort: ""))
+        try await waitFor(store.current != nil, "the server to take the message")
         let id = try #require(store.current?.id)
         store.rename(id, to: "Mine")
         try await waitFor(store.streaming == nil, "the reply to end")
@@ -1830,6 +1891,7 @@ struct ChatTests {
             .flatMap { Int($0.trimmingCharacters(in: .whitespacesAndNewlines)) })
         let store = ChatStore(folder: folder)
         store.send("Hi", attachments: [], to: ChatTarget(url: URL(string: "http://127.0.0.1:\(port)")!, model: "a/b", acceptsImages: false, effort: ""))
+        try await waitFor(store.selection != nil, "the server to take the message")
         let streaming = try #require(store.streaming)
         #expect(store.selection == streaming)
         store.delete([streaming, gone.id, unread])

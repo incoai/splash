@@ -692,7 +692,7 @@ WeightFile loadImage(metal::MetalBackend &backend, WeightImages &images, std::st
                     writeGgufImage(backend, buffer, *plan);
                     checkUnchanged();
                   },
-                  plan->residentBytes};
+                  plan->residentBytes, std::shared_ptr<const std::vector<gguf::Fill>>(plan, &plan->fills)};
   return images.load(std::move(image));
 }
 

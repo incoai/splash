@@ -75,6 +75,14 @@ struct NemotronHLayout final : QwenHybridLayout {
   static constexpr std::string_view ggufArchitecture = "nemotron_h_moe";
   static constexpr bool loadsSafetensors = false;
 
+  // Its Mamba-2 state, whose cached states hold it as it runs: StateCodec's
+  // codes are GDN layers'.
+  [[nodiscard]] constexpr GdnStateLayout gdnStateLayout() const noexcept {
+    GdnStateLayout layout = QwenHybridLayout::gdnStateLayout();
+    layout.cachedCodes = false;
+    return layout;
+  }
+
   // Mamba-2: the in projection's rows (z | x B C | dt) and the inner width.
   uint32_t mambaInnerSize = 8192;
   uint32_t mambaInProjectionRows = 18560;

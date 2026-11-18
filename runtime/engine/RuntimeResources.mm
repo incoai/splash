@@ -324,7 +324,7 @@ RuntimeResourcesError planRefusal(const StreamedMemoryResult &result, uint64_t c
                                   const model::ModelDescriptor &model) {
   if (!result.requiredBytes)
     return RuntimeResourcesError(RuntimeResourceStage::Configuration, result.error);
-  std::string floors = "model weights with the runtime reserves, one lane's state, the KV runway";
+  std::string floors = "model weights and their arenas with the runtime reserves, one lane's state, the KV runway";
   if (streamable.expertBytes || streamable.tableBytes)
     floors += ", the streamed stores at their smallest or at the size --expert-memory or --ple-memory sets";
   if (model.capabilities.sparseKv)
@@ -362,17 +362,14 @@ std::string_view streamedOnlyIn(const StreamedMemoryPlan &plan, const StreamedMe
   return {};
 }
 
-// Whether a model loaded with `loaded` holds the stores `next` gives: each
-// part's, and the routed experts' store's floor. A store no size sets keeps
-// a share of its slots as its floor (model::ExpertStoreOptions::floorShare),
-// which matters only above its smallest size (`expertMinimumBytes`): at that
-// size every slot is its floor at any share.
-bool holdsStores(const model::ModelLoadOptions &loaded, const model::ModelLoadOptions &next,
-                 const model::StreamableWeights &streamable) {
-  const bool floorByShare = !loaded.expertFloorBytes && loaded.expertMemoryBytes > streamable.expertMinimumBytes;
-  return loaded.expertMemoryBytes == next.expertMemoryBytes && loaded.expertFloorBytes == next.expertFloorBytes &&
-         loaded.streamedTableBytes == next.streamedTableBytes &&
-         (!floorByShare || loaded.expertFloorShare == next.expertFloorShare);
+// Whether the routed experts' store of a model loaded with `loaded` keeps the
+// floor a share of `share` of its slots gives: a store no size sets keeps a
+// share of its slots as its floor (model::ExpertStoreOptions::floorShare),
+// which matters only above its smallest size (`expertMinimumBytes`), where
+// every slot is its floor at any share; a model without one keeps any.
+bool keepsFloor(const model::ModelLoadOptions &loaded, double share, const model::StreamableWeights &streamable) {
+  return loaded.expertFloorBytes || loaded.expertMemoryBytes <= streamable.expertMinimumBytes ||
+         loaded.expertFloorShare == share;
 }
 
 // What streams of the loaded model, and how an automatic part's store was
@@ -424,16 +421,16 @@ void reportStreamedStores(const model::LoadedModel &loaded, const model::Streama
   }
 }
 
-// The rows the target's decode cycles verify (--verify-rows), and why.
-void reportVerifyRows(const model::LoadedModel &loaded, model::VerifyRows rows) {
-  if (model::budgetsVerifyRows(loaded, rows))
-    logLine("Decode cycles verify the rows the verify budget chooses (--verify-rows auto, as ", loaded.name(),
-            " is a MoE target): greedy and seeded outputs can differ from run to run.");
-  else if (rows == model::VerifyRows::All)
+// The rows the target's decode cycles verify (--verify-rows), and why: those
+// its cycles' cost line's floor passes where its experts stream
+// (model::CostLine).
+void reportVerifyRows(model::VerifyRows rows, bool streamed) {
+  if (rows == model::VerifyRows::All)
     logLine("Decode cycles verify every row of the draft's block (--verify-rows all).");
   else
-    logLine("Decode cycles verify every row of the draft's block (--verify-rows auto, as ", loaded.name(),
-            " is dense).");
+    logLine("Decode cycles verify the rows ",
+            streamed ? "their cost line's floor passes" : "of the step their measured costs choose",
+            " (--verify-rows auto): greedy and seeded outputs can differ from run to run.");
 }
 
 // Why a target's long requests keep their KV in memory, empty when they
@@ -566,10 +563,13 @@ std::string persistentCacheNamespace(const RuntimeCacheIdentity &identity,
             << "gdn " << gdn.layers << ' ' << gdn.convolutionHistory << ' '
             << gdn.convolutionChannels << ' ' << gdn.recurrentGroups << ' ' << gdn.recurrentRows
             << ' ' << gdn.recurrentColumns
-            // fp32 states keep the line they had before states had a format,
-            // so the caches they wrote stay valid; without GDN layers the
-            // format stores nothing.
-            << (gdn.layers && gdn.format == ops::GdnStateFormat::BFloat16 ? " bf16" : "");
+            // A cached state stores its recurrent layers as the codes of
+            // ops::StateCodec, whatever the running format, or as that
+            // format holds them (--cached-states exact), named apart from
+            // 1.6.x's line for it; without GDN layers there are none.
+            << (!gdn.layers        ? ""
+                : gdn.cachedCodes ? " codes int8 block " + std::to_string(SPLASH_STATE_CODEC_BLOCK) + " bf16"
+                                  : " exact " + std::string(ops::formatName(gdn.format)));
   // A family's state after the GDN layers' (Qwen3.8-Flash-Next's PLE history
   // and QSA pending keys, model::QwenHybridLayout::gdnStateLayout).
   if (gdn.auxiliaryBytes) canonical << " auxiliary " << gdn.auxiliaryBytes;
@@ -702,6 +702,7 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
   // weights load and again once the files open.
   model::CompositeStateLayout stateLayout = config.model.stateLayout;
   stateLayout.target.format = config.stateFormat;
+  stateLayout.target.cachedCodes = stateLayout.target.cachedCodes && !config.exactCachedStates;
   const uint64_t stateBytes = stateLayout.cachedBytes();
   const bool automaticDisk = config.cacheDisk.automatic;
   const uint64_t cacheDiskBytes = automaticDisk ? kAutomaticCacheDiskBytes : config.cacheDisk.bytes;
@@ -727,11 +728,12 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
   // One plan (planStreamedMemory) sizes the parts of the weights that may
   // stream from the SSD, a MoE target's routed experts and a GGUF's PLE
   // table: a part set to a size or off loads as set, and the plan sizes an
-  // automatic one. It rests on the weights' sizes, which their files give
-  // before they load; on the arenas, which only a loaded model gives, as they
-  // rest on its weights' formats, but which one load gives for whatever
-  // streams of it (model::StreamedParts); and on the SSD cache's room for
-  // active KV and whether its KV file opened.
+  // automatic one. It rests on the weights' sizes and on the arenas, which
+  // rest on the weights' formats and grow with what streams
+  // (model::StreamedParts): their files give both before they load
+  // (model::plannedTargetGeometry), so the weights load once, with the
+  // stores the plan gives. It rests too on the SSD cache's room for active KV
+  // and whether its KV file opened.
   kv::Layout kvLayout = config.model.targetKvLayout;
   kvLayout.format = config.kvFormat;
   // How the KV tier lays a page out in its slot, and so the slots' size.
@@ -743,12 +745,11 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
     logLine("--max-memory ignored: its ", gibibytes(config.maximumMemoryBytes), " exceed this Mac's Metal budget of ",
             gibibytes(hardBudgetBytes), ", which it can only lower.");
   model::StreamableWeights streamable;
-  // The arenas of the loaded model by what streams of it, and those of a
-  // runtime whose K/V spills, which only a block-sparse target with a
-  // spillable layout may have; none before it loads.
+  // The arenas of the model by what streams of it, and those of a runtime
+  // whose K/V spills, which only a block-sparse target with a spillable
+  // layout may have.
   const bool kvMaySpill = config.model.capabilities.sparseKv && kvLayout.spillable();
-  std::array<std::array<uint64_t, 2>, 2> arenaBytes{};
-  std::array<uint64_t, 2> spillArenaBytes{};
+  std::array<std::array<uint64_t, 2>, 2> arenaBytes{}, spillArenaBytes{};
   // The room for active KV, which only a target whose KV may spill plans
   // with: until the tier's files open, what the volume they will take
   // leaves now, a persistent tier's root, whose caches nobody holds count as
@@ -806,12 +807,11 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
     return streamedPlan(config.expertMemory, config.pleMemory, stagingBytes, 0);
   };
   // The sizing plan with the staging the tier keeps. The automatic tier gives
-  // it up where the plan cannot hold the model beside it, and, once the
-  // model `loaded` gave the arenas, unless the plan spills, which the tier
-  // makes possible, where the staging would stream a part that loads whole
-  // without it: a tier that only caches costs the weights nothing, as it
-  // costs the context nothing (below).
-  const auto storesPlan = [&](bool loaded) {
+  // it up where the plan cannot hold the model beside it, and, unless the
+  // plan spills, which the tier makes possible, where the staging would
+  // stream a part that loads whole without it: a tier that only caches costs
+  // the weights nothing, as it costs the context nothing (below).
+  const auto storesPlan = [&] {
     StreamedMemoryResult planned = sizingPlan(stateStagingBytes);
     if (!stateStagingBytes || !automaticDisk || (planned.plan && planned.plan->spill.enabled))
       return planned;
@@ -822,7 +822,7 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
     if (!planned.plan && planned.requiredBytes)
       reason = "the memory budget has no room for its " + std::to_string(mebibytes(stateBytes)) +
                " MiB of state staging beside the model";
-    else if (planned.plan && loaded)
+    else if (planned.plan)
       if (const std::string_view part = streamedOnlyIn(*planned.plan, *without.plan); !part.empty())
         reason = "its " + std::to_string(mebibytes(stateBytes)) + " MiB of state staging would stream the " +
                  std::string(part);
@@ -831,15 +831,38 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
     diskOff(reason);
     return without;
   };
-  // The stores the plan gives the parts, the expert store at its floor,
-  // except that routed experts the plan streams load through a store of the
-  // least the floors charge them while `floors`, their smallest store or the
-  // store --expert-memory sizes: until the loaded model gives the arenas,
-  // which take from all that automatic experts stream through.
-  const auto storesOf = [&](const StreamedMemoryPlan &plan, bool floors) {
-    const uint64_t least = plan.expertFloorBytes ? plan.expertFloorBytes : streamable.expertMinimumBytes;
+  // One plan owner is used both before allocation and during encoding. The
+  // engine lends it to model execution without inspecting its plans.
+  ops::ExecutionPlans operators(device, config.int8Activations);
+  // The arenas by what streams of the model, from the geometry its target's
+  // files give: whatever streams, its projections are those of its formats.
+  const auto planArenas = [&](const model::QwenTargetGeometry &target) {
+    try {
+      const auto arenas = [&](model::StreamedParts parts) {
+        const model::ModelMemoryPlan streamed = model::plannedRuntimeMemory(
+            config.model, target, operators, config.kvFormat, config.stateFormat, parts);
+        return streamed.sharedPrefillPlannedAllocatedBytes + streamed.sharedDecodePlannedAllocatedBytes;
+      };
+      for (const bool table : {false, true}) {
+        const uint64_t tableRowBytes = table ? streamable.tableRowBytes : 0;
+        for (const bool experts : {false, true}) {
+          model::StreamedParts parts{.experts = experts && streamable.expertBytes, .tableRowBytes = tableRowBytes};
+          arenaBytes[experts][table] = arenas(parts);
+          parts.kv = true;
+          if (kvMaySpill) spillArenaBytes[experts][table] = arenas(parts);
+        }
+      }
+    } catch (const std::exception &error) {
+      throw RuntimeResourcesError(
+          RuntimeResourceStage::MemoryPlanning,
+          std::string("model allocated-size plan is invalid: ") + error.what());
+    }
+  };
+  // The stores the plan gives the parts: the routed experts' store at its
+  // cap, which starts at its floor.
+  const auto storesOf = [&](const StreamedMemoryPlan &plan) {
     return model::ModelLoadOptions{.streamedTableBytes = plan.tableBytes,
-                                   .expertMemoryBytes = floors && plan.expertBytes ? least : plan.expertBytes,
+                                   .expertMemoryBytes = plan.expertBytes,
                                    .expertFloorBytes = plan.expertFloorBytes,
                                    .expertFloorShare = plan.expertFloorShare,
                                    .readers = readers};
@@ -861,16 +884,19 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
                          "loads with the weights");
     reportIgnoredSetting("--expert-memory", config.expertMemory, streamable.expertBytes, config.model.name,
                          "routed experts", "load with their layers");
+    // A table that may stream streams through its smallest row cache while
+    // the target's files give its geometry.
+    planArenas(model::plannedTargetGeometry(*backend, config.modelRoot, config.model,
+                                            streamable.tableBytes ? streamable.tableMinimumBytes : 0, readers));
     // Refuse a model that cannot fit before loading its weights: beside them
-    // the plan needs at least the runtime reserves, one lane's state, the
-    // KV runway, the streamed stores at their smallest or at the size
-    // --expert-memory or --ple-memory sets, the floors of KV on the SSD
-    // cache and any SSD cache state staging; the plan after the load adds
-    // the arenas.
-    const StreamedMemoryResult planned = storesPlan(false);
+    // the plan needs at least their arenas, the runtime reserves, one lane's
+    // state, the KV runway, the streamed stores at their smallest or at the
+    // size --expert-memory or --ple-memory sets, the floors of KV on the SSD
+    // cache and any SSD cache state staging.
+    const StreamedMemoryResult planned = storesPlan();
     if (!planned.plan)
       throw planRefusal(planned, config.maximumMemoryBytes, hardBudgetBytes, streamable, config.model);
-    loadOptions = storesOf(*planned.plan, true);
+    loadOptions = storesOf(*planned.plan);
     // Fail before loading the model when the machine has no headroom at
     // all; the guard installed above keeps checking as residency grows.
     admitMetalOperation();
@@ -885,23 +911,18 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
                                 error.what());
   }
 
-  // One plan owner is used both before allocation and during encoding. The
-  // engine lends it to model execution without inspecting its plans.
-  ops::ExecutionPlans operators(device, config.int8Activations);
   model::LoadedModel loaded;
   // The runtime's lane state and arenas as the model loaded, with its K/V in
   // memory and where it spills.
   model::ModelMemoryPlan modelMemoryPlan, spillModelMemoryPlan;
-  // Loads the model as loadOptions says, `again` once it loaded, and plans
-  // its arenas: as it loaded, and for whatever streams of it.
+  // Loads the model as loadOptions says, `again` where a store the plan sized
+  // is laid out again (below), and plans its runtime memory as it loaded.
   const auto load = [&](bool again) {
     try {
       const auto started = AwakeClock::now();
       // The images of the last load go before the next allocates its own,
       // and the backend's peaks start again: the memory audit holds the load
-      // that serves to its plan, not one the plan with the arenas replaced,
-      // which may have held a PLE table whole that now streams through a
-      // row cache the audit's budget for Metal leaves out.
+      // that serves to its plan.
       loaded = {};
       backend->restartPeaks();
       loaded = model::loadModel(*backend, config.modelRoot, config.model, loadOptions);
@@ -926,24 +947,29 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
       if (kvMaySpill)
         spillModelMemoryPlan = model::plannedRuntimeMemory(loaded, operators, config.kvFormat, config.stateFormat,
                                                            model::StreamedParts::loaded(loaded, true));
-      const auto arenas = [&](model::StreamedParts parts) {
-        const model::ModelMemoryPlan streamed =
-            model::plannedRuntimeMemory(loaded, operators, config.kvFormat, config.stateFormat, parts);
-        return streamed.sharedPrefillPlannedAllocatedBytes + streamed.sharedDecodePlannedAllocatedBytes;
-      };
-      for (const bool table : {false, true}) {
-        const uint64_t tableRowBytes = table ? streamable.tableRowBytes : 0;
-        for (const bool experts : {false, true})
-          arenaBytes[experts][table] =
-              arenas({.experts = experts && streamable.expertBytes, .tableRowBytes = tableRowBytes});
-        if (kvMaySpill)
-          spillArenaBytes[table] = arenas({.tableRowBytes = tableRowBytes, .kv = true});
-      }
     } catch (const std::exception &error) {
       throw RuntimeResourcesError(
           RuntimeResourceStage::MemoryPlanning,
           std::string("model allocated-size plan is invalid: ") + error.what());
     }
+    // The stores were sized beside the arenas the model's files planned
+    // (planArenas), and the engine's plan holds those of the model as it
+    // loaded: one quantity from two sources, which a start requires equal,
+    // for the K/V in memory and where it spills, rather than serve stores
+    // sized for another model's arenas.
+    const auto requirePlanned = [&](uint64_t planned, const model::ModelMemoryPlan &as, const char *runtime) {
+      const uint64_t loadedBytes = as.sharedPrefillPlannedAllocatedBytes + as.sharedDecodePlannedAllocatedBytes;
+      if (planned != loadedBytes)
+        throw RuntimeResourcesError(RuntimeResourceStage::MemoryPlanning,
+                                    std::string("the arenas of ") + runtime + " that the model's files planned, " +
+                                        std::to_string(planned) + " bytes, are not those of the model as it loaded, " +
+                                        std::to_string(loadedBytes) + " bytes");
+    };
+    const bool expertsStream = loaded.expertStore() != nullptr, tableStreams = loaded.streamedTable() != nullptr;
+    requirePlanned(arenaBytes[expertsStream][tableStreams], modelMemoryPlan, "a runtime whose K/V is in memory");
+    if (kvMaySpill)
+      requirePlanned(spillArenaBytes[expertsStream][tableStreams], spillModelMemoryPlan,
+                     "a runtime whose K/V spills");
   };
   load(false);
 
@@ -1015,27 +1041,8 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
     splitModel = aneFfnModel(*backend, loaded, operators, config.kvFormat, config.buildId, config.cancelled);
   };
 
-  // The plan with the loaded model's arenas sizes the stores, and the start
-  // loads again where it gives other stores than those loaded (holdsStores):
-  // it loads once where the plan without the arenas already loads each part
-  // so, as for a model with no part to stream or routed experts whose store
-  // --expert-memory sizes, and twice otherwise, as where automatic routed
-  // experts stream. Floors that the arenas take beyond the budget stop the
-  // start with the engine plan's breakdown (requirePlan, below). Nothing
-  // here samples the host: the store starts at its floor, and the ledger
-  // grows it by the host's rule before Ready (MemoryGovernor::growToTargets).
-  const StreamedMemoryResult planned = storesPlan(true);
-  if (!planned.plan && !planned.requiredBytes)
-    throw planRefusal(planned, config.maximumMemoryBytes, hardBudgetBytes, streamable, config.model);
-  if (planned.plan) {
-    const model::ModelLoadOptions next = storesOf(*planned.plan, false);
-    if (!holdsStores(loadOptions, next, streamable)) {
-      loadOptions = next;
-      load(true);
-    }
-  }
   ready();
-  reportVerifyRows(loaded, config.verifyRows);
+  reportVerifyRows(config.verifyRows, loaded.expertStore() != nullptr);
 
   // The automatic tier keeps its staging only where the plan holds the model
   // and the requested context beside it, the parts as they load, or where
@@ -1114,7 +1121,7 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
     // them whatever room the volume has, as the first engine's context it
     // keeps may rest on them.
     const std::string cacheNamespace =
-        persistentCacheNamespace(cacheIdentity, loaded.stateLayout(config.stateFormat));
+        persistentCacheNamespace(cacheIdentity, loaded.stateLayout(config.stateFormat, !config.exactCachedStates));
     // The KV file's slots hold a page as the tier lays it out, checksummed by
     // segment when persistent, and the writes of both files hold back while
     // a step waits for reads.
@@ -1134,13 +1141,12 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
     // automatic expert store laid out beside a spill the plan no longer
     // makes (the tier turned off or its KV file did not open) loads again
     // with the floor the plan's spill gives (expertFloorShare) where that
-    // floor is another (holdsStores). The plan holds the store at its cap
+    // floor is another (keepsFloor). The plan holds the store at its cap
     // whatever its floor, and is made again with it. The stores are final
     // now, and the start reports them.
-    model::ModelLoadOptions served = loadOptions;
-    served.expertFloorShare = expertFloorShare(memoryPlan.breakdown().kvSpill.enabled);
-    if (!holdsStores(loadOptions, served, streamable)) {
-      loadOptions = served;
+    const double servedShare = expertFloorShare(memoryPlan.breakdown().kvSpill.enabled);
+    if (!keepsFloor(loadOptions, servedShare, streamable)) {
+      loadOptions.expertFloorShare = servedShare;
       load(true);
       ready();
       memoryPlan = requirePlan();
@@ -1205,8 +1211,8 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
         static_cast<uint32_t>(poolExtents * budget.kvExtentPages), budget.kvExtentPages);
     auto kvPool = std::make_unique<KvPool>(*kvPages, model::ExecutionLimits::warmupKvPages);
     auto stateStorage = std::make_unique<model::QwenStateStorage>(
-        *backend, memoryGovernor->allocationAdmission(), loaded.stateLayout(config.stateFormat),
-        disk.states);
+        *backend, memoryGovernor->allocationAdmission(),
+        loaded.stateLayout(config.stateFormat, !config.exactCachedStates), disk.states);
     std::unique_ptr<KvPageTier> kvTier;
     if (disk.kv)
       kvTier = std::make_unique<KvPageTier>(*kvPages, kvFormat, disk.kv, readers);
@@ -1245,7 +1251,7 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
     if (spill.enabled) {
       blockCache = std::make_unique<model::KvBlockCache>(
           *backend, memoryGovernor->allocationAdmission(), kvLayout, budget.kvExtentPages,
-          model::KvBlockCacheOptions{.laneSlots = static_cast<uint32_t>(spill.laneSlots),
+          model::KvBlockCacheOptions{.shape = *config.model.capabilities.sparseKv,
                                      .targetBytes = spill.hotTargetBytes,
                                      .readers = readers,
                                      .format = kvFormat});
@@ -1381,9 +1387,11 @@ bool RuntimeResources::closePersistentCache() {
   if (!persistentCache_.directory)
     return true;
   stopProbation();
-  cache_->relabelStates();
-  // Each file runs its operations in order: the writes and labels submitted
-  // before land first.
+  // Each file runs its operations in order, a freed slot's punch, which clears
+  // its record, first; no copy goes, and no punch starts, past kDrain.
+  const auto drainEnd = AwakeClock::now() + supervision::kDrain;
+  cache_->closePersistentTier(drainEnd);
+  persistentCache_.kv->seal(drainEnd);
   const auto kv = persistentCache_.kv->synchronize({});
   const auto states = persistentCache_.states->synchronize({});
   const bool kvSynchronized = kv->wait();
@@ -1397,18 +1405,13 @@ bool RuntimeResources::closePersistentCache() {
   return true;
 }
 
-model::RuntimeContext RuntimeResources::modelContext() noexcept {
-  return {
-      *backend_,
-      model_,
-      *kvPages_,
-      *stateStorage_,
-      operators_,
-      aneFfn_.get(),
-      blockCache_.get(),
-      historyStream_.get(),
-      verifyRows_,
-  };
+model::RuntimeContext RuntimeResources::modelContext() {
+  // A start's measured step costs stay beside the split's calibrations.
+  const std::string key =
+      model::stepCostsKey(model_, *kvPages_, *stateStorage_, operators_, *backend_, cacheIdentity_.buildId);
+  return {*backend_, model_, *kvPages_, *stateStorage_, operators_, aneFfn_.get(), blockCache_.get(),
+          historyStream_.get(), verifyRows_, [key](uint32_t lanes) { return ane::recall(key + std::to_string(lanes)); },
+          [key](uint32_t lanes, std::string_view line) { ane::remember(key + std::to_string(lanes), line); }};
 }
 
 EngineSpillConfig RuntimeResources::spillConfig() const noexcept {
@@ -1522,14 +1525,22 @@ AneFfnModel aneFfnModel(metal::MetalBackend &backend, const model::LoadedModel &
     });
     return timings;
   };
+  model.timeAt = [&backend, &linear, layers, cancelled, onArena](uint32_t aneUnits, double gpuAlone) {
+    ops::ane_ffn::Timing timing;
+    onArena([&](const ops::PrefillFfnBuffers &ffn, const std::array<metal::MetalBuffer, 2> &hidden) {
+      timing = ops::ane_ffn::Measurement(backend, linear, *layers, ffn, hidden, cancelled).time(aneUnits, gpuAlone);
+    });
+    return timing;
+  };
   model.prepare = [&backend, &linear, layers, cancelled, onArena](uint32_t aneUnits, bool timeChunks) {
     AneFfnPrepared prepared;
     onArena([&](const ops::PrefillFfnBuffers &ffn, const std::array<metal::MetalBuffer, 2> &hidden) {
+      // The chunks are timed on a split of their own, before this one is
+      // made, so that no two splits are held at once.
+      if (timeChunks)
+        prepared.chunks = ops::ane_ffn::Measurement(backend, linear, *layers, ffn, hidden, cancelled).chunks(aneUnits);
       prepared.split = std::make_unique<ops::AneFfn>(backend, linear, *layers, aneUnits, cancelled);
       prepared.error = prepared.split->verify(*layers, ffn, hidden);
-      if (timeChunks)
-        prepared.chunks =
-            ops::ane_ffn::Measurement(backend, linear, *layers, ffn, hidden, cancelled).chunks(*prepared.split);
     });
     return prepared;
   };
@@ -1542,7 +1553,7 @@ AneFfnModel aneFfnModel(metal::MetalBackend &backend, const model::LoadedModel &
     return line ? ops::ane_ffn::Calibration::parse(*line) : std::nullopt;
   };
   model.remember = [key](uint32_t maxAneUnits, const ops::ane_ffn::Calibration &calibration) {
-    ane::remember(key + std::to_string(maxAneUnits), calibration.text());
+    return ane::remember(key + std::to_string(maxAneUnits), calibration.text());
   };
   model.forget = [key](uint32_t maxAneUnits) { ane::forget(key + std::to_string(maxAneUnits)); };
   model.healthy = [&backend] { return backend.healthy(); };

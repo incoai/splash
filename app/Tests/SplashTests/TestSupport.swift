@@ -11,8 +11,54 @@ func waitFor(_ condition: @autoclosure () async -> Bool, _ what: @autoclosure ()
              seconds: Double = 10, sourceLocation: SourceLocation = #_sourceLocation) async throws {
     let deadline = ContinuousClock.now + .seconds(seconds)
     while !(await condition()) {
-        try #require(ContinuousClock.now < deadline, "timed out waiting for \(what())", sourceLocation: sourceLocation)
+        // Let queued main-actor callbacks run before the final deadline check. Snapshot work
+        // can hold the actor past the deadline with a completion waiting behind the last poll.
         try await Task.sleep(for: .milliseconds(20))
+        if ContinuousClock.now >= deadline {
+            try #require(await condition(), "timed out waiting for \(what())", sourceLocation: sourceLocation)
+            return
+        }
+    }
+}
+
+/// What `read` gives of the app's state, from now on: its value now, then at each change of it, as
+/// the turn of the main actor that changed it left it, which is what a window could draw. A test
+/// then says every state a flow went through, not only those it stopped to look at.
+@MainActor
+final class Seen<Value: Equatable> {
+    private var seen: [Value] = []
+    private let read: () -> Value
+
+    init(_ read: @escaping () -> Value) {
+        self.read = read
+        look()
+    }
+
+    /// The values so far, each unlike the one before it, the one the state has now last: a change
+    /// just made is there, and stays, though the turn that looks at it has yet to run and may
+    /// find the next one.
+    var values: [Value] {
+        note(read())
+        return seen
+    }
+
+    /// What `part` of the values was, each unlike the one before it: the order a part went
+    /// through its states in, whatever else changed between them.
+    func each<Part: Equatable>(_ part: (Value) -> Part) -> [Part] {
+        values.map(part).reduce(into: []) { parts, next in
+            if parts.last != next { parts.append(next) }
+        }
+    }
+
+    private func look() {
+        // Told before the change is made: the next turn reads what it left.
+        note(withObservationTracking(read) { [weak self] in
+            Task { @MainActor in self?.look() }
+        })
+    }
+
+    private func note(_ value: Value) {
+        if seen.last != value { seen.append(value) }
     }
 }
 
@@ -33,6 +79,14 @@ func freePort() -> Int {
 }
 
 extension NSView {
+    /// The first text view in this view that is no field editor: the composer's, in the Chat.
+    var firstTextView: NSTextView? {
+        func textViews(in view: NSView) -> [NSTextView] {
+            view.subviews.flatMap { ($0 as? NSTextView).map { [$0] } ?? textViews(in: $0) }
+        }
+        return textViews(in: self).first { !$0.isFieldEditor }
+    }
+
     /// The scroll view of the page this view shows (`AppKitScroll`): of those in it, the one whose
     /// content is the tallest.
     var pageScroll: NSScrollView? {
