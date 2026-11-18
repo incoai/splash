@@ -40,7 +40,7 @@ inline double normWeight(const ops::NormWeights &norm, uint32_t index) {
       : bf16ToFloat(static_cast<const uint16_t *>(norm.buffer.contents())[index]);
 }
 
-// The fp64 RMS norm of a bf16 row with the kernels' epsilon, scaled by the
+// The fp64 RMS norm of a bf16 row with the norm's epsilon, scaled by the
 // weights.
 inline std::vector<double> rmsNorm(const uint16_t *row, const ops::NormWeights &norm,
                                    uint32_t size) {
@@ -49,7 +49,7 @@ inline std::vector<double> rmsNorm(const uint16_t *row, const ops::NormWeights &
     const double value = bf16ToFloat(row[index]);
     squares += value * value;
   }
-  const double inverse = 1 / std::sqrt(squares / size + SPLASH_RMS_EPSILON);
+  const double inverse = 1 / std::sqrt(squares / size + norm.epsilon);
   std::vector<double> normalized(size);
   for (uint32_t index = 0; index < size; ++index)
     normalized[index] = bf16ToFloat(row[index]) * inverse * normWeight(norm, index);

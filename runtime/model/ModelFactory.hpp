@@ -32,7 +32,7 @@ class QwenStateStorage;
 class SsdReaders;
 class VisionLoader;
 
-using TargetWeights = std::variant<Qwen3_8Weights, Qwen3_6MoeWeights, Qwen4ExpWeights, FlintWeights>;
+using TargetWeights = std::variant<Qwen3_8Weights, Qwen3_6MoeWeights, Qwen4ExpWeights, NemotronHWeights, FlintWeights>;
 
 // How a model loads beside its descriptor: with streamedTableBytes, the rows
 // of a table the target's GGUF holds (model/ModelSizing.hpp) stream from its
@@ -73,7 +73,7 @@ struct LoadedModel final {
   [[nodiscard]] CompositeStateLayout stateLayout(ops::GdnStateFormat format, bool cachedCodes = true) const noexcept {
     auto layout = descriptor.stateLayout;
     layout.target.format = format;
-    layout.target.cachedCodes = cachedCodes;
+    layout.target.cachedCodes = layout.target.cachedCodes && cachedCodes;
     return layout;
   }
   [[nodiscard]] uint32_t maximumContextTokens() const noexcept {
@@ -191,6 +191,13 @@ loadModel(metal::MetalBackend &backend,
                                                        const ModelDescriptor &descriptor,
                                                        uint64_t streamedTableBytes,
                                                        std::shared_ptr<SsdReaders> readers);
+
+// The scratch of the LiLiCorr selector of `descriptor`'s draft, from its
+// files before the model loads (DFlashDraft::liLiCorrBytes); zero without
+// one. The stores are planned beside it, as the loaded model's plan holds it.
+[[nodiscard]] uint64_t plannedSelectorBytes(metal::MetalBackend &backend, const std::filesystem::path &root,
+                                            const ModelDescriptor &descriptor,
+                                            const ops::ExecutionPlans &operators);
 
 // The FFN layers of a target whose every layer's FFN is dense (denseFfn),
 // which the prefill FFN's Neural Engine split (ops::AneFfn) may take; none

@@ -22,11 +22,12 @@ template <class Family> [[nodiscard]] ops::GdnShape gdnShape(const Family &famil
           family.convolutionDimension, family.packedGdnWidth, family.gdnSigmoidGate};
 }
 
-// Each family's GDN shape, of the families with GDN layers.
+// Each family's GDN shape, of the families with GDN layers; Nemotron-H's
+// recurrent layers are Mamba-2's, of kernels of their own.
 [[nodiscard]] inline std::vector<ops::GdnShape> familyGdnShapes() {
   std::vector<ops::GdnShape> shapes;
   model::forEachFamily([&](const auto &family) {
-    if (!family.gdnLayerCount()) return;
+    if (family.singleBlockLayers() || !family.gdnLayerCount()) return;
     const ops::GdnShape shape = gdnShape(family);
     if (std::find(shapes.begin(), shapes.end(), shape) == shapes.end()) shapes.push_back(shape);
   });
@@ -112,7 +113,9 @@ template <class Runs> [[nodiscard]] std::vector<bool> normsOfFamilies(Runs runs)
 }
 // The norms the families of a GDN shape store.
 [[nodiscard]] inline std::vector<bool> familyNorms(const ops::GdnShape &shape) {
-  return normsOfFamilies([&](const auto &family) { return family.gdnLayerCount() && gdnShape(family) == shape; });
+  return normsOfFamilies([&](const auto &family) {
+    return !family.singleBlockLayers() && family.gdnLayerCount() && gdnShape(family) == shape;
+  });
 }
 // The norms the families of an attention geometry store.
 [[nodiscard]] inline std::vector<bool> familyNorms(const AttentionGeometry &geometry) {

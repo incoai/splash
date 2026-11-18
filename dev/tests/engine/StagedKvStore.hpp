@@ -29,7 +29,7 @@ inline void addStagedStore(metal::CommandGraph &graph, SplashKvLayer layer, cons
   // The kernel's suffix of the layout's KV heads, head dimension and value
   // order, as the path commit's (ops::PagedAttention).
   const std::string suffix = layout.valuesTokenMajor        ? "_kv2_vt"
-                             : layout.headDimension == 128 ? "_kv4_d128"
+                             : layout.headDimension == 128 ? (layout.kvHeads == 2 ? "_kv2_d128" : "_kv4_d128")
                              : layout.kvHeads == 2         ? "_kv2_g8"
                                                            : "";
   kv::AttentionParams params{.sequences = static_cast<uint32_t>(sequences.size()),

@@ -53,8 +53,9 @@ void requireRange(uint64_t offset, uint64_t bytes, uint64_t available) {
 // rows, which it builds from a quantized safetensors tensor's tensors, from
 // a GGUF's NVFP4 rows, or by quantizing a BF16 weight (into af4g64) or a
 // GGUF tensor of BF16 or F16 values (into Q8_0).
-enum class RowReader : uint8_t { Stored, Safetensors, GgufNvfp4, QuantizedBfloat16, QuantizedGgufFloat };
+enum class RowReader : uint8_t { Stored, Safetensors, GgufNvfp4, QuantizedBfloat16, QuantizedGgufFloat, ScaledQ8_0 };
 RowReader rowReader(const gguf::TensorRows &rows) {
+  if (rows.ggufScaledQ8_0) return RowReader::ScaledQ8_0;
   if (rows.safetensors.codes) return RowReader::Safetensors;
   if (rows.ggufNvfp4RowBytes) return RowReader::GgufNvfp4;
   if (rows.safetensors.bfloat16) return RowReader::QuantizedBfloat16;
@@ -272,16 +273,18 @@ void quantizeQ8_0Rows(const gguf::TensorRows &rows, uint64_t start, uint64_t cou
   }
 }
 
-// Native NVFP4 bytes [column, column + span) of `count` rows of llama.cpp's
-// NVFP4 from source row `start` on, back to back: per 256 elements the 16
-// UE4M3 scales of four block_nvfp4 as the E4M3 scales they are (llama.cpp
-// reads 0x7F as 0 and ignores bit 7), the row's tensor scale, and the codes with
+// Native NVFP4 or NVFP4G64 bytes [column, column + span) of `count` rows of
+// llama.cpp's NVFP4 from source row `start` on, back to back: per 256 (64)
+// elements the UE4M3 scales of four (one) block_nvfp4 as the E4M3 scales they
+// are (llama.cpp reads 0x7F as 0 and ignores bit 7), the row's tensor scale,
+// and the codes with
 // element e in the low nibble of byte e / 2 when e is even, else in its high
 // one (metal/abi/QuantFormat.h), where a block_nvfp4 holds element j of each
 // 16 in the low nibble of byte j and element j + 8 in its high one.
 void readGgufNvfp4Rows(const gguf::TensorRows &rows, uint64_t start, uint64_t count, uint64_t column, uint64_t span,
                        uint8_t *to) {
-  const QuantFormat &format = kQuantFormats[GGUF_FMT_NVFP4];
+  const QuantFormat &format = nativeFormat(rows);
+  const uint64_t gAt = quant_nvfp4_g(format.block_elements), codesAt = gAt + 4;
   const GgmlTypeTraits &blocks = *ggmlTypeTraits(ggml::kNVFP4);
   const uint64_t perNative = format.block_elements / blocks.blockElements, nativeBlocks = span / format.block_bytes,
                  sourceSpan = nativeBlocks * perNative * blocks.blockBytes;
@@ -301,14 +304,34 @@ void readGgufNvfp4Rows(const gguf::TensorRows &rows, uint64_t start, uint64_t co
           const uint8_t *codes = in + 4 + 8 * s;
           out[4 * q + s] = in[s] == 0x7F ? 0 : in[s] & 0x7F;
           // Elements 2 i and 2 i + 1: the low nibbles of bytes 2 i and 2 i + 1 for i < 4, else their high ones.
-          uint8_t *pairs = out + QUANT_NVFP4_CODES + 32 * q + 8 * s;
+          uint8_t *pairs = out + codesAt + 32 * q + 8 * s;
           for (uint64_t i = 0; i < 4; ++i) {
             pairs[i] = uint8_t((codes[2 * i] & 15) | (codes[2 * i + 1] & 15) << 4);
             pairs[4 + i] = uint8_t(codes[2 * i] >> 4 | (codes[2 * i + 1] & 0xF0));
           }
         }
       }
-      std::memcpy(out + QUANT_NVFP4_G, &g[row + b / nativeBlocks], 4);
+      std::memcpy(out + gAt, &g[row + b / nativeBlocks], 4);
+    }
+  }
+}
+
+// Q8_0 rows as stored, each block's half d times the row's tensor scale and
+// rounded back to half (a Nemotron-H Mamba-2 projection's .scale): the
+// products llama.cpp scales after the matmul, up to that rounding.
+void readScaledQ8_0Rows(const gguf::TensorRows &rows, uint64_t start, uint64_t count, uint64_t column, uint64_t span,
+                        uint8_t *to) {
+  constexpr uint64_t kBlockBytes = 34;
+  if (column % kBlockBytes || span % kBlockBytes) throw GgufError("scaled Q8_0 rows must be read whole blocks");
+  const std::vector<float> g = tensorScales(rows, start, count);
+  for (uint64_t row = 0; row < count; ++row) {
+    uint8_t *out = to + row * span;
+    rows.file->readData(rows.offset + (start + row) * rows.rowBytes + column, {out, span});
+    for (uint64_t b = 0; b < span; b += kBlockBytes) {
+      _Float16 d;
+      std::memcpy(&d, out + b, 2);
+      d = static_cast<_Float16>(static_cast<float>(d) * g[row]);
+      std::memcpy(out + b, &d, 2);
     }
   }
 }
@@ -334,6 +357,7 @@ void readRows(const gguf::TensorRows &rows, uint64_t first, uint64_t count, uint
     case RowReader::GgufNvfp4: readGgufNvfp4Rows(rows, start, run, column, span, out); break;
     case RowReader::QuantizedBfloat16: quantizeRows(rows, start, run, column, span, out); break;
     case RowReader::QuantizedGgufFloat: quantizeQ8_0Rows(rows, start, run, column, span, out); break;
+    case RowReader::ScaledQ8_0: readScaledQ8_0Rows(rows, start, run, column, span, out); break;
     }
     row += run;
   }

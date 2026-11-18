@@ -581,7 +581,11 @@ enum ContextLength {
         guard let window = family.contextTokens, let most = family.maxContextTokens else {
             return "\(units), such as 100K or 1M. \(yarn(nil))"
         }
-        guard most > window else { return "\(units), such as 100K; at most \(figure(window)), the model’s own window." }
+        guard most > window else {
+            // Past the most Splash serves (Nemotron 3.5 Super's 1M window), the model's window is not the bound.
+            return most < window ? "\(units), such as 100K or 1M; at most \(figure(most))."
+                : "\(units), such as 100K; at most \(figure(window)), the model’s own window."
+        }
         return "\(units), such as 100K or 1M; at most \(figure(most)). \(yarn(window))"
     }
 

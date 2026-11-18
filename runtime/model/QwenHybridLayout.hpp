@@ -7,7 +7,9 @@
 #include "ops/PagedKv.hpp"
 #include "ops/StopTokens.hpp"
 
+#include <algorithm>
 #include <array>
+#include <bit>
 #include <cmath>
 #include <cstdint>
 #include <string_view>
@@ -33,6 +35,11 @@ inline constexpr ops::DraftVocabulary kQwenDraftVocabulary{148'288, 248'000};
 // sparse MoE. A family's layout (QwenHybridLayout) sets them, and every view
 // of a target reads them from there: the target loaders, the GGUF planner
 // and the runtime's QwenTargetGeometry.
+// The most context Splash serves, as `splash serve --max-context` takes it
+// (serve_options.MAX_YARN_CONTEXT_TOKENS): a native window past it, as
+// Nemotron 3.5 Super's 1,048,576, is served to it.
+inline constexpr uint32_t kMaximumServedContextTokens = 1'010'000;
+
 struct QwenTargetDimensions {
   // The native window, the context max_position_embeddings states, and the
   // most context YaRN stretches it to (servedFor), as the family's model
@@ -128,15 +135,42 @@ struct QwenTargetDimensions {
   uint32_t pleHeadsPerNgram = 0;
   uint32_t pleHeadDimension = 0;
   uint32_t pleConvolutionTaps = 0;
+  // A target of single-block layers (Nemotron-H, model/NemotronH.hpp) names
+  // its attention and recurrent layers by bit, layer i bit i % 64 of word
+  // i / 64, in place of fullAttentionPeriod; its other layers are FFNs alone.
+  // Its recurrent heads (Mamba-2's) hold recurrentHeadDimension rows of
+  // gdnHeadDimension state columns. Zero for the hybrid's.
+  std::array<uint64_t, 2> attentionMask{};
+  std::array<uint64_t, 2> recurrentMask{};
+  uint32_t recurrentHeadDimension = 0;
 
+  [[nodiscard]] constexpr bool singleBlockLayers() const noexcept {
+    return (attentionMask[0] | attentionMask[1] | recurrentMask[0] | recurrentMask[1]) != 0;
+  }
+  [[nodiscard]] static constexpr bool maskHas(const std::array<uint64_t, 2> &mask, uint32_t layer) noexcept {
+    return layer < 128 && (mask[layer / 64] >> (layer % 64) & 1U);
+  }
   [[nodiscard]] constexpr bool
   isFullAttentionLayer(uint32_t layer) const noexcept {
+    if (singleBlockLayers()) return maskHas(attentionMask, layer);
     return fullAttentionPeriod && (layer + 1) % fullAttentionPeriod == 0;
   }
+  [[nodiscard]] constexpr bool isRecurrentLayer(uint32_t layer) const noexcept {
+    if (singleBlockLayers()) return maskHas(recurrentMask, layer);
+    return layer < layers && !isFullAttentionLayer(layer);
+  }
   [[nodiscard]] constexpr uint32_t attentionLayerCount() const noexcept {
+    if (singleBlockLayers()) return std::popcount(attentionMask[0]) + std::popcount(attentionMask[1]);
     return fullAttentionPeriod ? layers / fullAttentionPeriod : 0;
   }
-  [[nodiscard]] constexpr uint32_t gdnLayerCount() const noexcept { return layers - attentionLayerCount(); }
+  // The layers whose state is a GDN cell: a Qwen hybrid's non-attention
+  // layers, Nemotron-H's Mamba-2 layers (recurrentMask; its FFN-only layers
+  // hold none).
+  [[nodiscard]] constexpr uint32_t gdnLayerCount() const noexcept {
+    if (singleBlockLayers()) return std::popcount(recurrentMask[0]) + std::popcount(recurrentMask[1]);
+    return layers - attentionLayerCount();
+  }
+  [[nodiscard]] constexpr uint32_t recurrentLayerCount() const noexcept { return gdnLayerCount(); }
   // Whether its drafts choose their mask token (firstDraftMaskToken).
   [[nodiscard]] constexpr bool draftChoosesMaskToken() const noexcept { return lastDraftMaskToken != 0; }
   // Whether layer `layer`'s FFN is a MoE block, and the block's index among
@@ -162,13 +196,14 @@ struct QwenTargetDimensions {
   // context.
   [[nodiscard]] uint32_t servedContextTokens(const RopeScaling &scaling) const noexcept {
     if (!scaling.yarn())
-      return nativeContextTokens;
+      return std::min(nativeContextTokens, kMaximumServedContextTokens);
     return static_cast<uint32_t>(std::lround(nativeContextTokens * scaling.factor));
   }
   // The most context the target serves: YaRN's window, or the native one
-  // for a family YaRN does not stretch (yarnContextTokens 0).
+  // for a family YaRN does not stretch (yarnContextTokens 0), at most
+  // kMaximumServedContextTokens.
   [[nodiscard]] constexpr uint32_t maximumContextTokens() const noexcept {
-    return nativeContextTokens > yarnContextTokens ? nativeContextTokens : yarnContextTokens;
+    return std::min(std::max(nativeContextTokens, yarnContextTokens), kMaximumServedContextTokens);
   }
   // Whether the residual is hyperConnections streams, which a mix joins
   // before each mixer, each FFN and the logits in place of a norm.
@@ -239,7 +274,7 @@ struct QwenHybridLayout : QwenTargetDimensions {
             .convolutionHistory = gdnLayerCount() ? kGdnConvolutionTaps - 1 : 0,
             .convolutionChannels = convolutionDimension,
             .recurrentGroups = gdnValueHeads,
-            .recurrentRows = gdnHeadDimension,
+            .recurrentRows = recurrentHeadDimension ? recurrentHeadDimension : gdnHeadDimension,
             .recurrentColumns = gdnHeadDimension,
             .auxiliaryBytes = pleHistoryBytes() + indexerPendingBytes()};
   }

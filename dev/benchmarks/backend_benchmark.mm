@@ -914,7 +914,7 @@ int main(int argc, char **argv) {
       std::cerr << "usage: backend-benchmark METALLIB MODEL_ROOT "
                    "[--samples COUNT] [--progress PATH] "
                    "[--scenario NAME[,NAME...]] [--ane-ffn-share SHARE "
-                   "[--ane-ffn-minimum-rows ROWS]] [--max-context TOKENS] "
+                   "[--ane-ffn-minimum-rows ROWS]] [--max-context TOKENS] [--max-memory BYTES] "
                    "[--activations auto|bf16] [--verify-rows all|auto] "
                    "[--logits DIR [--logits-from DIR] [--logits-width LANES]]\n"
                    "  NAME: decode, partial, short, transcripts, context, exact, logits or resume "
@@ -927,6 +927,8 @@ int main(int argc, char **argv) {
                    "--max-context, with YaRN past the model's native window "
                    "(default: what memory holds)\n"
                    "  --activations: as serve's (default: auto)\n"
+                   "  BYTES: the engine's memory budget, as serve's --max-memory "
+                   "(default: what this Mac allows)\n"
                    "  --verify-rows: as serve's (default: all, so that the times measure the "
                    "backend and outputs repeat, where the verify budget's rows follow the "
                    "cycles before them)\n"
@@ -943,6 +945,7 @@ int main(int argc, char **argv) {
     std::optional<uint32_t> aneFfnMinimumRows;
     uint32_t maxContext = 0;
     ops::Int8Activations int8Activations = ops::Int8Activations::On;
+    uint64_t maxMemoryBytes = 0;
     model::VerifyRows verifyRows = model::VerifyRows::All;
     std::optional<std::filesystem::path> logitsDirectory, logitsFrom;
     uint32_t logitsWidth = 1;
@@ -965,6 +968,8 @@ int main(int argc, char **argv) {
         maxContext = parseMaxContext(argv[index + 1]);
       } else if (option == "--activations") {
         int8Activations = parseInt8Activations(argv[index + 1]);
+      } else if (option == "--max-memory") {
+        maxMemoryBytes = std::stoull(argv[index + 1]);
       } else if (option == "--verify-rows") {
         const std::string_view value(argv[index + 1]);
         if (value != "all" && value != "auto")
@@ -995,6 +1000,7 @@ int main(int argc, char **argv) {
     auto &config = bootstrapConfig.resources;
     config.metallibPath = std::filesystem::path(argv[1]);
     config.modelRoot = std::filesystem::path(argv[2]);
+    config.maximumMemoryBytes = maxMemoryBytes;
     config.model = model::servedFor(model::inspectModelRoot(config.modelRoot), maxContext);
     config.buildId = SPLASH_BUILD_ID;
     config.aneFfn = engine::AneFfnSetting::fromGiven(aneFfnShare, aneFfnMinimumRows);
@@ -1085,7 +1091,13 @@ int main(int argc, char **argv) {
     std::array<double, model::ExecutionLimits::maximumBatchWidth>
         decodeWarmupGpu{};
     std::vector<std::string> performanceFailures;
+    // Only the widths startup warmed: a width it found no memory for
+    // (MemoryLimited) would fail its lane here, and serving admits it only
+    // when memory allows. Its times stay zero.
+    const auto &startupDecode = bootstrap->report().warmup.decodeBatches;
     for (uint32_t width = 1; width <= decodeWarmupWall.size(); ++width) {
+      if (startupDecode[width - 1] != engine::WarmupStepStatus::Complete)
+        continue;
       decodeWarmupWall[width - 1] =
           executor->warmupDecodeBatch(width).wallSeconds * 1000.0;
       decodeWarmupGpu[width - 1] =

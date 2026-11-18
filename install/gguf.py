@@ -173,12 +173,24 @@ FLINT_PATTERNS = (
     r"(?i:'s|'t|'re|'ve|'m|'ll|'d)?"
     r"| ?[\p{P}\p{S}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+",
 )
+# Tekken (Mistral's, and Nemotron-H's): no normalizer, and BPE that takes a
+# word already in the vocabulary whole (ignore_merges), as the model's
+# tokenizer.json states. Its GGUFs name it pixtral or tekken (llama.cpp
+# #30894: Nemotron GGUFs converted before it say pixtral).
+TEKKEN_PATTERN = (
+    r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+"
+    r"|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*"
+    r"|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+"
+)
 # Each GGUF tokenizer profile (tokenizer.ggml.pre) Splash derives a tokenizer
 # for: the patterns that split text, each isolating its matches, in order,
-# and whether text is NFC-normalized before them.
+# whether text is NFC-normalized before them, and whether its BPE takes
+# vocabulary words whole (ignore_merges).
 TOKENIZER_PROFILES = {
-    "qwen35": ((QWEN35_PATTERN,), True),
-    "flint": (FLINT_PATTERNS, False),
+    "qwen35": ((QWEN35_PATTERN,), True, False),
+    "flint": (FLINT_PATTERNS, False, False),
+    "tekken": ((TEKKEN_PATTERN,), False, True),
+    "pixtral": ((TEKKEN_PATTERN,), False, True),
 }
 # The GGUF token types (llama_token_type) a byte-level BPE vocabulary uses:
 # control tokens are special added tokens, user-defined ones added tokens
@@ -193,7 +205,9 @@ def derived_files(target, vision=None):
     """DERIVED_FILES' contents, derived from a target GGUF's metadata and its
     vision projector's (local paths)."""
     metadata = Metadata(target)
-    config = model_config(metadata, None if vision is None else Metadata(vision))
+    # A RADIO projector's position grid is its table's extents.
+    vision = None if vision is None else Metadata(vision, tensors=True)
+    config = model_config(metadata, vision)
     return {"config.json": models.json_bytes(config), **tokenizer_files(metadata)}
 
 
@@ -222,7 +236,7 @@ def tokenizer_files(metadata):
             "unsupported GGUF tokenizer profile; expected gpt2/"
             + " or gpt2/".join(TOKENIZER_PROFILES)
         )
-    patterns, nfc = profile
+    patterns, nfc, ignore_merges = profile
     tokens = metadata.require("tokenizer.ggml.tokens", list)
     types = metadata.require("tokenizer.ggml.token_type", list)
     merges = metadata.require("tokenizer.ggml.merges", list)
@@ -250,7 +264,9 @@ def tokenizer_files(metadata):
             raise ModelError("GGUF automatic BOS/EOS insertion is unsupported: " + key)
     try:
         backend = Tokenizer(
-            token_models.BPE({t: i for i, t in enumerate(tokens)}, pairs)
+            token_models.BPE(
+                {t: i for i, t in enumerate(tokens)}, pairs, ignore_merges=ignore_merges
+            )
         )
     except Exception as error:
         raise ModelError("invalid GGUF BPE vocabulary or merges") from error
@@ -344,6 +360,10 @@ def model_config(metadata, vision=None):
         "num_key_value_heads": "attention.head_count_kv",
         "head_dim": "attention.key_length",
     }
+    if architecture.single_blocks:
+        # Per-layer arrays: the engine reads them from the GGUF; the config
+        # states each layer's block and the attention layers' KV heads.
+        del fields["num_key_value_heads"]
     if architecture.moe:
         # The routed experts, which a pruned release keeps fewer of than its
         # family; the engine plans, sizes and loads them by this count.
@@ -484,12 +504,17 @@ def flint_text_config(metadata, arch):
 
 
 def vision_config(vision):
+    """The vision_config of a clip mmproj: Qwen3.5's tower (qwen3vl_merger),
+    or Nemotron 3.5 Bolt's RADIO (nemotron_omni, radio_vision_config)."""
+    projector = vision.require("clip.projector_type", str)
     if (
         vision.require("general.architecture", str) != "clip"
-        or vision.require("clip.projector_type", str) != "qwen3vl_merger"
+        or projector not in ("qwen3vl_merger", "nemotron_omni")
         or vision.require("clip.use_gelu", bool) is not True
     ):
         raise ModelError("unsupported GGUF vision architecture")
+    if projector == "nemotron_omni":
+        return radio_vision_config(vision)
     fields = {
         "depth": "block_count",
         "hidden_size": "embedding_length",
@@ -514,6 +539,42 @@ def vision_config(vision):
         in_channels=3,
         num_position_embeddings=(image_size // result["patch_size"]) ** 2,
         hidden_act="gelu_pytorch_tanh",
+        deepstack_visual_indexes=[],
+    )
+    return result
+
+
+def radio_vision_config(vision):
+    """RADIO's vision_config, the keys of Qwen3.5's (the engine checks both,
+    ModelDescriptor.mm): one-frame RGB patches, erf GELU, the 2x2 merge its
+    projector states as scale_factor, and the position grid of its table,
+    v.position_embd.weight [hidden, cells], which its image_size (the
+    preprocessing's) does not give. The header must be read with tensors."""
+    fields = {
+        "depth": "block_count",
+        "hidden_size": "embedding_length",
+        "num_heads": "attention.head_count",
+        "intermediate_size": "feed_forward_length",
+        "out_hidden_size": "projection_dim",
+        "patch_size": "patch_size",
+        "spatial_merge_size": "projector.scale_factor",
+    }
+    result = {
+        name: vision.positive("clip.vision." + key) for name, key in fields.items()
+    }
+    extents = vision.extents.get("v.position_embd.weight") or ()
+    if extents[2:] == (1,):  # Super's mmproj states a third extent of 1
+        extents = extents[:2]
+    if len(extents) != 2 or extents[0] != result["hidden_size"]:
+        raise ModelError("invalid GGUF vision position grid")
+    # Super's tower ends in a LayerNorm (v.post_ln), Bolt's does not.
+    if "v.post_ln.weight" in vision.extents:
+        result["final_norm"] = True
+    result.update(
+        temporal_patch_size=1,
+        in_channels=3,
+        num_position_embeddings=extents[1],
+        hidden_act="gelu",
         deepstack_visual_indexes=[],
     )
     return result
@@ -594,6 +655,9 @@ class Architecture:
     model_type: str
     # Whether its FFN is a sparse MoE, else dense.
     moe: bool
+    # Whether each layer is a single block, Mamba-2, attention or MoE
+    # (nemotron_blocks), whose KV heads are a per-layer array.
+    single_blocks: bool = False
     # Whether a MoE target's leading_dense_block_count leading layers have a
     # dense FFN (dense_layers).
     leading_dense: bool = False
@@ -605,11 +669,59 @@ class Architecture:
     flat: bool = False
 
 
+def nemotron_blocks(metadata):
+    """Each layer's block of a Nemotron-H target (nemotron_h_moe, Nemotron
+    3.5 Bolt and Super), Mamba-2, NoPE attention or a latent MoE, as
+    llama.cpp tells them apart (src/models/nemotron-h.cpp): a MoE where
+    feed_forward_length is nonzero, attention where head_count_kv is
+    instead, else Mamba-2. The arrays must cover every layer, and the expert
+    count each MoE takes must be nonzero exactly there."""
+    arch = text_architecture(metadata)
+    layers = loaded_layers(metadata, arch)
+    arrays = {}
+    for key in ("feed_forward_length", "attention.head_count_kv", "expert_used_count"):
+        value = metadata.values.get(f"{arch}.{key}")
+        # Super's GGUFs state the experts each MoE takes as one scalar.
+        if key == "expert_used_count" and type(value) is int:
+            value = [value if ffn else 0 for ffn in arrays["feed_forward_length"]]
+        if (
+            type(value) is not list
+            or len(value) < layers
+            or not all(type(v) is int and v >= 0 for v in value)
+        ):
+            raise ModelError("missing or invalid GGUF metadata array: " + key)
+        arrays[key] = value[:layers]
+    kinds = []
+    for ffn, kv, used in zip(
+        arrays["feed_forward_length"],
+        arrays["attention.head_count_kv"],
+        arrays["expert_used_count"],
+    ):
+        if (ffn and kv) or bool(ffn) != bool(used):
+            raise ModelError("GGUF layer arrays name no single block")
+        kinds.append("moe" if ffn else "attention" if kv else "mamba")
+    return kinds
+
+
+def nemotron_text_config(metadata, arch):
+    """What Nemotron-H's configuration states beyond the sizes every
+    architecture's does: each layer's block, and the attention layers' KV
+    heads, which its header states per layer."""
+    kv = [n for n in metadata.values[arch + ".attention.head_count_kv"] if n]
+    return {"layer_types": nemotron_blocks(metadata), "num_key_value_heads": max(kv)}
+
+
 # The GGUF text architectures Splash serves, by general.architecture.
 ARCHITECTURES = {
     "qwen35": Architecture("qwen3_5_text", moe=False),
     "qwen35moe": Architecture("qwen3_5_moe_text", moe=True),
     "qwen4exp": Architecture("qwen4_exp_text", moe=True),
+    "nemotron_h_moe": Architecture(
+        "nemotron_h_moe_text",
+        moe=True,
+        text_config=nemotron_text_config,
+        single_blocks=True,
+    ),
     "flint": Architecture(
         "flint",
         moe=True,

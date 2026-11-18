@@ -3,6 +3,7 @@
 #include "metal/abi/ExecutionGeometry.h"
 #include "metal/abi/QuantFormat.h"
 #include "model/GgufImageLayout.hpp"
+#include "model/NemotronH.hpp"
 #include "model/StateLayout.hpp"
 #include "model/WeightLayout.hpp"
 
@@ -35,10 +36,14 @@ static_assert([] {
   return true;
 }(), "a meta unit is one native block");
 
-// The format whose native rows hold a GGUF tensor of `type`: the table's, or
-// NVFP4's for llama.cpp's NVFP4, whose block_nvfp4 rows the writer builds
-// NVFP4's native rows from (TensorRows::ggufNvfp4RowBytes).
-uint32_t imageFormat(uint32_t type) { return type == ggml::kNVFP4 ? GGUF_FMT_NVFP4 : gguf_format_of(type); }
+// The format whose native rows hold a GGUF tensor of `type` whose planes are
+// `columns` wide: the table's, or for llama.cpp's NVFP4, whose block_nvfp4
+// rows the writer builds native rows from (TensorRows::ggufNvfp4RowBytes),
+// NVFP4's, or NVFP4G64's where the rows are not whole 256s.
+uint32_t imageFormat(uint32_t type, uint64_t columns = 0) {
+  if (type == ggml::kNVFP4) return columns % 256 ? GGUF_FMT_NVFP4G64 : GGUF_FMT_NVFP4;
+  return gguf_format_of(type);
+}
 
 // A type of a format, BF16 and F16 among them: repacked into the planes
 // projections multiply, or rows as stored (storedRowBytes), which the
@@ -65,7 +70,7 @@ bool floatProjectionType(uint32_t type) { return floatType(type) || type == ggml
 // for llama.cpp's NVFP4 (Builder::tensorRows); 0 for a width that holds none.
 uint64_t storedRowBytes(const GgufTensor &tensor) {
   return floatType(tensor.type) ? tensor.columns() * sizeof(float)
-                                : quant_stored_row_bytes(imageFormat(tensor.type), tensor.columns());
+                                : quant_stored_row_bytes(imageFormat(tensor.type, tensor.columns()), tensor.columns());
 }
 
 // A MoE router, which the float projection runs in fp32 as stored (router):
@@ -179,10 +184,11 @@ public:
     if (!tensor) return;
     if (tensor->rows() != rows || tensor->columns() != windows * columns)
       throw GgufError("unexpected shape for " + name);
-    const uint32_t format = imageFormat(tensor->type);
+    const uint32_t format = imageFormat(tensor->type, columns);
     Repack repack = image_.planes(format, windows * rows, columns, name);
     for (uint32_t window = 0; window < windows; ++window) {
-      TensorRows source = tensorRows(*tensor, rows, ggufRowBytes(kQuantFormats[format], windows * columns), order);
+      TensorRows source =
+          tensorRows(*tensor, rows, ggufRowBytes(kQuantFormats[format], windows * columns), order, format);
       source.windows = windows;
       source.window = window;
       repack.sources.push_back(std::move(source));
@@ -208,12 +214,13 @@ public:
     image_.repack(std::move(repack));
   }
 
+  void ungatedExperts() noexcept { image_.ungatedExperts(); }
   // One routed experts' tensor [experts * N, K] (routedExperts).
   void expertTensor(const std::string &name, uint64_t rows, uint64_t columns) {
     const GgufTensor *tensor = find(name, quantizedType);
     if (!tensor) return;
     if (tensor->rows() != rows || tensor->columns() != columns) throw GgufError("unexpected shape for " + name);
-    const uint32_t format = imageFormat(tensor->type);
+    const uint32_t format = imageFormat(tensor->type, columns);
     Repack repack = image_.expertPlanes(format, rows, columns, name);
     repack.sources.push_back(tensorRows(*tensor, rows, ggufRowBytes(kQuantFormats[format], columns)));
     image_.expertRepack(std::move(repack));
@@ -232,7 +239,7 @@ public:
     } else if (const GgufTensor *fused = find(fusedName, quantizedType)) {
       if (fused->rows() != 2 * experts * width || fused->columns() != hidden)
         throw GgufError("unexpected shape for " + fusedName);
-      const uint32_t format = imageFormat(fused->type);
+      const uint32_t format = imageFormat(fused->type, hidden);
       const TensorRows rows = tensorRows(*fused, 2 * experts * width, ggufRowBytes(kQuantFormats[format], hidden));
       // Expert e's gate rows are rows 2e width.. of the fused tensor, its up rows the next width.
       for (const uint64_t up : {0, 1}) {
@@ -293,7 +300,7 @@ public:
       }
       return;
     }
-    const uint32_t format = imageFormat(beta->type);
+    const uint32_t format = imageFormat(beta->type, hidden);
     const uint64_t rowBytes = ggufRowBytes(kQuantFormats[format], hidden);
     Repack repack = image_.planes(format, tiledRows(2ull * heads), hidden, alphaName);
     for (const GgufTensor *t : {beta, alpha}) repack.sources.push_back(tensorRows(*t, heads, rowBytes, grouped(0, 1)));
@@ -393,6 +400,11 @@ public:
 
   Image finish() { return image_.finish(); }
 
+  // Q8_0 projections whose .scale the writer folds into their block scales
+  // (TensorRows::ggufScaledQ8_0): a Nemotron-H GGUF's Mamba-2 projections,
+  // which llama.cpp multiplies by their .scale, as converted from NVFP4.
+  void allowScaledQ8_0(bool allow) { scaledQ8_0_ = allow; }
+
 private:
   void reject(const std::string &name, const GgufTensor *tensor) {
     problems_.add(name, tensor ? ggmlTypeName(tensor->type) : "missing");
@@ -419,26 +431,44 @@ private:
   // multiplies a projection's products by its .scale, of one value, or an
   // expert's by its value of an experts tensor's (_exps), one per expert;
   // only NVFP4's native rows hold such a scale, so only theirs is read and a
-  // .scale beside any other tensor is refused as unused. An NVFP4 weight may
-  // also carry an .input_scale of as many values, the activation scale of
-  // NVIDIA's W4A4: a weights-only decode (ours, as llama.cpp's) never reads
-  // it, so it is held to that count and recorded as read, unused; beside any
-  // other tensor, or alone, it is refused as unused too.
-  TensorRows tensorRows(const GgufTensor &tensor, uint64_t count, uint64_t rowBytes, RowOrder order = {}) const {
+  // .scale beside any other tensor is refused as unused, but a Q8_0's where
+  // the family allows it (allowScaledQ8_0). An NVFP4 weight may also carry an
+  // .input_scale of as many values, the activation scale of NVIDIA's W4A4: a
+  // weights-only decode (ours, as llama.cpp's) never reads it, so it is held
+  // to that count and recorded as read, unused; beside any other tensor, or
+  // alone, it is refused as unused too. `format` is the NVFP4 format of
+  // planes narrower than the tensor's rows (quantized's windows), else
+  // imageFormat's.
+  TensorRows tensorRows(const GgufTensor &tensor, uint64_t count, uint64_t rowBytes, RowOrder order = {},
+                        uint32_t format = GGUF_FMT_COUNT) const {
+    const std::string stem = tensor.name.ends_with(".weight") ? tensor.name.substr(0, tensor.name.size() - 7) : "";
     if (tensor.type != ggml::kNVFP4) {
+      // Read beside a Q8_0 where the family allows it; any other is left
+      // unread, so refused as unused.
+      const GgufTensor *scale = stem.empty() || !(tensor.type == ggml::kQ8_0 && scaledQ8_0_)
+                                    ? nullptr
+                                    : file_.find(stem + ".scale");
       if (!count || count * rowBytes != tensor.bytes) throw GgufError("unexpected size for " + tensor.name);
-      return {tensor.name, tensor.type, tensor.offset, count, rowBytes, order, &file_.source(tensor.file)};
+      TensorRows rows{tensor.name, tensor.type, tensor.offset, count, rowBytes, order, &file_.source(tensor.file)};
+      if (scale) {
+        if (scale->type != ggml::kF32 || scale->elements() != 1)
+          throw GgufError(scale->name + " must hold one F32 value for " + tensor.name);
+        problems_.read(*scale);
+        rows.scale = {&file_.source(scale->file), scale->offset, scale->bytes, count};
+        rows.ggufScaledQ8_0 = true;
+      }
+      return rows;
     }
-    const QuantFormat &format = kQuantFormats[GGUF_FMT_NVFP4];
+    const QuantFormat &native =
+        kQuantFormats[format == GGUF_FMT_COUNT ? imageFormat(tensor.type, tensor.columns()) : format];
     const GgmlTypeTraits &blocks = *ggmlTypeTraits(ggml::kNVFP4);
     const uint64_t sourceRowBytes =
-        rowBytes / format.block_bytes * (format.block_elements / blocks.blockElements) * blocks.blockBytes;
-    if (!count || rowBytes % format.block_bytes || count * sourceRowBytes != tensor.bytes)
-      throw GgufError(tensor.name + "'s rows are not whole nvfp4 blocks of " + std::to_string(format.block_elements) +
+        rowBytes / native.block_bytes * (native.block_elements / blocks.blockElements) * blocks.blockBytes;
+    if (!count || rowBytes % native.block_bytes || count * sourceRowBytes != tensor.bytes)
+      throw GgufError(tensor.name + "'s rows are not whole nvfp4 blocks of " + std::to_string(native.block_elements) +
                       " elements");
-    TensorRows rows{tensor.name, QUANT_NVFP4_TYPE, tensor.offset, count, rowBytes, order, &file_.source(tensor.file)};
+    TensorRows rows{tensor.name, native.ggml_type, tensor.offset, count, rowBytes, order, &file_.source(tensor.file)};
     rows.ggufNvfp4RowBytes = sourceRowBytes;
-    const std::string stem = tensor.name.ends_with(".weight") ? tensor.name.substr(0, tensor.name.size() - 7) : "";
     const uint64_t values = stem.ends_with("_exps") ? geometry_.experts : 1;
     // The weight's F32 tensor stem + suffix of `values` values, read, or
     // nullptr without one.
@@ -469,6 +499,7 @@ private:
   const QwenTargetDimensions &geometry_;
   Problems &problems_;
   ImageBuilder image_;
+  bool scaledQ8_0_ = false;
 };
 
 std::string prefix(uint32_t layer) { return "blk." + std::to_string(layer) + "."; }
@@ -625,6 +656,135 @@ struct Qwen4ExpGguf final {
   }
 };
 
+// Nemotron-H's GGUFs (nemotron_h_moe, model/NemotronH.hpp): one block a layer
+// behind its norm, Mamba-2, NoPE attention or a latent MoE, as the layout's
+// block table names them; the head's norm before the logits. Its metadata
+// keys are its own (requireMetadata), and its arrays must name the layout's
+// blocks, expert counts and widths. Tensors keep their GGUF types and order:
+// the Mamba-2 vectors and convolution F32 as stored, the router F32 or BF16.
+struct NemotronHGguf final {
+  static constexpr std::string_view architecture = NemotronHLayout::ggufArchitecture;
+  static constexpr NemotronHLayout kLayout{};
+
+  template <class Expect, class ExpectFloat, class ExpectArray>
+  static void metadata(const Expect &, const ExpectFloat &, const ExpectArray &, const QwenTargetDimensions &) {}
+
+  // Super's GGUFs state its epsilon as attention.layer_norm_epsilon and no
+  // gating function, which llama.cpp takes as sigmoid; they hold an MTP
+  // layer after the target's (nextn_predict_layers), which is never loaded.
+  template <class Expect, class ExpectFloat>
+  static void requireMetadata(const GgufMetadata &metadata, const Expect &expect, const ExpectFloat &expectFloat,
+                              const QwenTargetDimensions &g) {
+    const std::string arch(architecture);
+    const auto present = [&](const char *key) {
+      return metadata.unsignedValue(arch + "." + key) || metadata.floatValue(arch + "." + key);
+    };
+    expect("block_count", g.layers + metadata.unsignedValue(arch + ".nextn_predict_layers").value_or(0));
+    expect("embedding_length", g.hiddenSize);
+    expect("attention.head_count", g.attentionQueryHeads);
+    expect("attention.key_length", g.attentionHeadDimension);
+    expect("attention.value_length", g.attentionHeadDimension);
+    expectFloat(present("attention.layer_norm_rms_epsilon") ? "attention.layer_norm_rms_epsilon"
+                                                            : "attention.layer_norm_epsilon",
+                kLayout.rmsEpsilon);
+    expect("ssm.conv_kernel", kGdnConvolutionTaps);
+    expect("ssm.group_count", g.gdnKeyHeads);
+    expect("ssm.time_step_rank", g.gdnValueHeads);
+    expect("ssm.state_size", g.gdnHeadDimension);
+    expect("ssm.inner_size", kLayout.mambaInnerSize);
+    expect("expert_count", g.experts);
+    expect("expert_shared_feed_forward_length", kLayout.sharedIntermediateSize);
+    expect("expert_shared_count", 1);
+    expect("moe_latent_size", kLayout.moeLatentSize);
+    if (present("expert_gating_func")) expect("expert_gating_func", 2); // sigmoid
+    expect("expert_weights_norm", 1);
+    expectFloat("expert_weights_scale", kLayout.routedScale);
+  }
+
+  // Per layer: feed_forward_length and expert_feed_forward_length the MoE
+  // width, head_count_kv the attention's KV heads and expert_used_count the
+  // experts a MoE takes, each 0 where the layer has none.
+  static void arrays(const GgufFile &file, const QwenTargetDimensions &g) {
+    const std::string arch(architecture);
+    std::string mismatched;
+    // A scalar, as Super's GGUFs state expert_used_count and
+    // expert_feed_forward_length, is every layer's that has one.
+    const auto check = [&](const char *key, auto value) {
+      const auto found = file.numericArray(arch + "." + key);
+      const auto scalar = file.metadata().unsignedValue(arch + "." + key);
+      bool ok = (found && found->size() >= g.layers) || scalar;
+      for (uint32_t layer = 0; ok && layer < g.layers; ++layer)
+        ok = found ? (*found)[layer] == value(layer) : !value(layer) || *scalar == value(layer);
+      if (!ok) mismatched += (mismatched.empty() ? "" : ", ") + std::string(key);
+    };
+    const auto moe = [](uint32_t layer) { return NemotronHLayout::block(layer) == NemotronBlock::Moe; };
+    check("feed_forward_length", [&](uint32_t layer) { return NemotronHLayout::layerExpertWidth(g, layer); });
+    check("expert_feed_forward_length", [&](uint32_t layer) { return NemotronHLayout::layerExpertWidth(g, layer); });
+    check("attention.head_count_kv", [&](uint32_t layer) {
+      return NemotronHLayout::block(layer) == NemotronBlock::Attention ? g.attentionKvHeads : 0;
+    });
+    check("expert_used_count", [&](uint32_t layer) { return moe(layer) ? g.expertsPerToken : 0; });
+    if (!mismatched.empty()) throw GgufError("GGUF metadata does not match the target: " + mismatched);
+  }
+
+  static uint32_t imageType(uint32_t index) {
+    switch (NemotronHLayout::block(index)) {
+    case NemotronBlock::Mamba: return 0;
+    case NemotronBlock::Attention: return 1;
+    case NemotronBlock::Moe: return 4;
+    }
+    return 0;
+  }
+
+  static void layer(Builder &b, const QwenTargetDimensions &g, uint32_t index) {
+    const std::string p = prefix(index);
+    const uint64_t hidden = g.hiddenSize;
+    b.floatNorm(p + "attn_norm.weight", hidden);
+    switch (NemotronHLayout::block(index)) {
+    case NemotronBlock::Mamba: {
+      const uint64_t channels = g.convolutionDimension, heads = g.gdnValueHeads, inner = kLayout.mambaInnerSize;
+      b.allowScaledQ8_0(true);
+      b.quantized(p + "ssm_in.weight", kLayout.mambaInProjectionRows, hidden);
+      b.floatNorm(p + "ssm_conv1d.weight", channels * kGdnConvolutionTaps);
+      b.floatNorm(p + "ssm_conv1d.bias", channels);
+      b.floatNorm(p + "ssm_dt.bias", heads);
+      b.floatNorm(p + "ssm_a", heads);
+      b.floatNorm(p + "ssm_d", heads);
+      b.floatNorm(p + "ssm_norm.weight", inner);
+      b.quantized(p + "ssm_out.weight", hidden, inner);
+      b.allowScaledQ8_0(false);
+      break;
+    }
+    case NemotronBlock::Attention: {
+      const uint64_t kvRows = uint64_t{g.attentionKvHeads} * g.attentionHeadDimension;
+      b.quantized(p + "attn_q.weight", g.attentionWidth, hidden);
+      b.quantized(p + "attn_k.weight", kvRows, hidden);
+      b.quantized(p + "attn_v.weight", kvRows, hidden);
+      b.quantized(p + "attn_output.weight", hidden, g.attentionWidth);
+      break;
+    }
+    case NemotronBlock::Moe: {
+      const uint64_t experts = NemotronHLayout::layerExperts(g, index),
+                     width = NemotronHLayout::layerExpertWidth(g, index), latent = kLayout.moeLatentSize,
+                     shared = kLayout.sharedIntermediateSize;
+      b.floatTensor(p + "ffn_gate_inp.weight", experts, hidden);
+      b.floatNorm(p + "exp_probs_b.bias", experts);
+      b.quantized(p + "ffn_latent_down.weight", latent, hidden);
+      b.ungatedExperts();
+      b.expertTensor(p + "ffn_up_exps.weight", experts * width, latent);
+      b.expertTensor(p + "ffn_down_exps.weight", experts * latent, width);
+      b.quantized(p + "ffn_latent_up.weight", hidden, latent);
+      b.quantized(p + "ffn_up_shexp.weight", shared, hidden);
+      b.quantized(p + "ffn_down_shexp.weight", hidden, shared);
+      break;
+    }
+    }
+  }
+  static void head(Builder &b, const QwenTargetDimensions &g) { b.floatNorm("output_norm.weight", g.hiddenSize); }
+  static void tables(const GgufFile &, const QwenTargetDimensions &, PlanOptions, Problems &,
+                     std::vector<Image> &) {}
+};
+
 // Flint's GGUFs (flint): every layer attends, those sliding_window_pattern
 // names over a sliding window and those rope_pattern names with RoPE, each
 // with its learned sinks after its mixer (attn_sinks, an F32 per query head,
@@ -680,15 +840,21 @@ struct FlintGguf final {
 };
 
 // Calls `use` with what the GGUFs of `architecture` hold: Qwen3.8-Flash-Next's
-// (Qwen4ExpGguf), Flint's (FlintGguf) or the Qwen3.5 hybrid's (HybridGguf).
-// Another architecture is refused, so a layout without a family here fails
-// by name rather than planning as the hybrid.
+// (Qwen4ExpGguf), Nemotron-H's (NemotronHGguf), Flint's (FlintGguf) or the
+// Qwen3.5 hybrid's (HybridGguf). Another architecture is refused, so a layout
+// without a family here fails by name rather than planning as the hybrid.
 template <class Use> decltype(auto) withFamily(std::string_view architecture, Use &&use) {
   if (architecture == Qwen4ExpGguf::architecture) return use(Qwen4ExpGguf{});
+  if (architecture == NemotronHGguf::architecture) return use(NemotronHGguf{});
   if (architecture == FlintGguf::architecture) return use(FlintGguf{});
   if (std::ranges::find(HybridGguf::architectures, architecture) == HybridGguf::architectures.end())
     throw GgufError("no GGUF family plans architecture " + std::string(architecture));
   return use(HybridGguf{});
+}
+
+template <class Family> uint32_t layerImageType(const QwenTargetDimensions &g, uint32_t index) {
+  if constexpr (std::is_same_v<Family, NemotronHGguf>) return NemotronHGguf::imageType(index);
+  else return g.isFullAttentionLayer(index) ? 1u : 0u;
 }
 
 // The images of a target from a GGUF of Family (planImages).
@@ -698,7 +864,7 @@ std::vector<Image> familyImages(const GgufFile &file, const QwenTargetDimensions
   std::vector<Image> images;
   for (uint32_t index = 0; index < g.layers; ++index) {
     Builder layer(file, g, problems, "layer-" + std::to_string(index) + ".bin", index,
-                  g.isFullAttentionLayer(index) ? 1u : 0u, options);
+                  layerImageType<Family>(g, index), options);
     Family::layer(layer, g, index);
     images.push_back(layer.finish());
   }
@@ -743,10 +909,9 @@ void requireRotation(const GgufFile &file, const QwenTargetDimensions &g, const 
 
 std::vector<StreamedExperts> streamedExperts(std::span<const Image> layers) {
   std::vector<StreamedExperts> result;
-  for (const Image &layer : layers) {
-    if (!layer.experts) throw GgufError("a target layer's experts do not stream");
-    result.push_back(*layer.experts);
-  }
+  for (const Image &layer : layers)
+    if (layer.experts) result.push_back(*layer.experts);
+  if (result.empty()) throw GgufError("no target layer's experts stream");
   return result;
 }
 
@@ -894,6 +1059,12 @@ void requireMetadata(const GgufFile &file, std::string_view architecture, const 
     text << " (expected " << value << ')';
     mismatched += text.str();
   };
+  if (architecture == NemotronHGguf::architecture) {
+    NemotronHGguf::requireMetadata(metadata, expect, expectFloat, geometry);
+    if (!mismatched.empty()) throw GgufError("GGUF metadata does not match the target: " + mismatched);
+    NemotronHGguf::arrays(file, geometry);
+    return;
+  }
   // An array, named alone, that `matches` takes.
   const auto expectArray = [&](const char *key, const auto &matches) {
     const std::optional<std::span<const double>> values = file.numericArray(arch + "." + key);
@@ -954,7 +1125,7 @@ StreamedRows tableRows(const GgufFile &file, const std::string &name, uint64_t c
   if (!quantizedType(tensor.type) || tensor.type == ggml::kNVFP4)
     throw GgufError("a table of type " + ggmlTypeName(tensor.type) + " does not stream: " + name);
   if (tensor.columns() != columns || !tensor.rows()) throw GgufError("unexpected shape for " + name);
-  const uint32_t format = imageFormat(tensor.type);
+  const uint32_t format = imageFormat(tensor.type, tensor.columns());
   const uint64_t rowBytes = storedRowBytes(tensor);
   if (!rowBytes || rowBytes > UINT32_MAX || tensor.rows() * rowBytes != tensor.bytes)
     throw GgufError("unexpected size for " + name);

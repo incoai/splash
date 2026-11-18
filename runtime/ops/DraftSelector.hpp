@@ -130,6 +130,12 @@ struct DraftCodebooks final {
 // and a sampled lane's its draws, which its verify rows' rejection sampling
 // tests. A greedy tree of one child a row and no chain is the draft's most
 // likely chain.
+// A selector batch's parameters (DraftSelector::requireBuffers).
+struct DraftSelectorBatch final {
+  SelectorBatchParams params;
+  DraftTreeParams tree;
+};
+
 class DraftSelector final {
 public:
   explicit DraftSelector(uint32_t vocabulary);
@@ -147,6 +153,19 @@ public:
   // numbered in preorder, and the step's rows past them of no lane.
   static void addVerifyRows(metal::CommandGraph &graph, const DraftSelectorBuffers &buffers, const StepRows &step,
                             float floor = 0.0F);
+
+  // add's checks of every buffer but the selector hidden rows and the
+  // codebooks, for a batch of these lanes; returns its params.
+  [[nodiscard]] DraftSelectorBatch requireBuffers(const DraftSelectorBuffers &buffers, DraftVocabulary vocabulary,
+                                                  std::span<const DraftTreeLane> lanes) const;
+  // add's first and last steps, for a selector that scores the candidates'
+  // edges itself (ops::LiLiCorr): each proposal position's shard partials of
+  // its sixteen most likely draft tokens; then the trees grown over the edge
+  // tables that follow the shard partials in partialValues, by the
+  // candidates and their unary scores.
+  void addTopCandidates(metal::CommandGraph &graph, const DraftSelectorBuffers &buffers,
+                        const DraftSelectorBatch &batch) const;
+  void addTree(metal::CommandGraph &graph, const DraftSelectorBuffers &buffers, const DraftSelectorBatch &batch) const;
 
 private:
   uint32_t vocabulary_ = 0;

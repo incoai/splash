@@ -104,14 +104,15 @@ inline splash::metal::MetalBuffer bfloatBuffer(splash::metal::MetalBackend &back
 }
 
 // A block of `shape`: its router, shared expert scalar gate (none without
-// shape.sharedGate), routed experts' and shared expert's gate, up and down,
-// the shared expert's shape.sharedSlices slices in the order the kernels read
-// them (ops::BlockExpertProjection), their weights with expert e in slot e of
-// one chunk of the routed segments (ops::residentExpertChunks), and the
-// formats of the six projections.
+// shape.sharedGate), selection bias (a SigmoidBiased router's), routed
+// experts' and shared expert's gate (none for ReluSquared experts), up and
+// down, the shared expert's shape.sharedSlices slices in the order the
+// kernels read them (ops::BlockExpertProjection), their weights with expert e
+// in slot e of one chunk of the routed segments (ops::residentExpertChunks),
+// and the formats of the six projections.
 struct Model {
   splash::ops::MoeShape shape;
-  Tensor router, sharedGate;
+  Tensor router, sharedGate, bias;
   std::array<Tensor, 3> routed;   // gate, up, down: experts * N rows
   std::array<Tensor, 3> shared;   // sharedSlices * N rows
   splash::ops::BlockMoeWeights weights;
@@ -146,15 +147,18 @@ inline Model makeModel(splash::metal::MetalBackend &backend, const splash::ops::
     m.formats[1] = m.formats[0];
     m.formats[4] = m.formats[3];
   }
-  m.router = floating(backend, shape.experts, hidden, 0.05f);
+  m.router = floating(backend, shape.experts, shape.routerInput(), 0.05f);
   if (shape.sharedGate) m.sharedGate = floating(backend, 1, hidden, 0.05f);
+  if (shape.router == splash::ops::MoeRouter::SigmoidBiased) m.bias = floating(backend, 1, shape.experts, 0.01f);
   for (int p = 0; p < 3; ++p) {
+    if (p == 0 && shape.activation == splash::ops::MoeActivation::ReluSquared) continue;
     m.routed[p] = quantized(backend, m.formats[p], shape.experts * n[p], k[p]);
-    m.shared[p] = quantized(backend, m.formats[3 + p], shape.sharedSlices * n[p], k[p]);
+    if (shape.sharedSlices) m.shared[p] = quantized(backend, m.formats[3 + p], shape.sharedSlices * n[p], k[p]);
   }
   splash::ops::BlockMoeWeights gguf;
   gguf.router = m.router.segment;
   gguf.sharedScalarGate = m.sharedGate.segment;
+  gguf.selectionBias = m.bias.segment.plane0;
   gguf.gate = {m.routed[0].segment, m.shared[0].segment};
   gguf.up = {m.routed[1].segment, m.shared[1].segment};
   gguf.down = {m.routed[2].segment, m.shared[2].segment};
@@ -180,6 +184,7 @@ inline splash::ops::BlockMoeWeights chunkedWeights(splash::metal::MetalBackend &
   std::array<uint64_t, MOE_EXPERT_CHUNK_ADDRESSES> slotBytes{};
   for (uint32_t z = 0; z < 3; ++z) {
     const splash::ops::QuantizedSegment &routed = m.routed[z].segment;
+    if (!routed.outputSize) continue;
     const QuantFormat &format = kQuantFormats[routed.formatId];
     const uint64_t groups = uint64_t{routed.outputSize / slots} * (routed.inputSize / 32);
     slotBytes[3 * z] = groups * format.plane0_bytes;
@@ -201,13 +206,19 @@ inline splash::ops::BlockMoeWeights chunkedWeights(splash::metal::MetalBackend &
         std::memcpy(static_cast<uint8_t *>(chunk.contents()) + at[entry],
                     static_cast<const uint8_t *>(resident[entry].contents()) + first * slotBytes[entry],
                     held * slotBytes[entry]);
+    const size_t base = planes.size();
     for (size_t z = 0; z < 3; ++z) {
+      if (!slotBytes[3 * z]) {   // an ungated block's gate, named by up's views below
+        planes.insert(planes.end(), 3, {});
+        continue;
+      }
       const splash::metal::MetalBuffer meta = backend.view(chunk, at[3 * z + 2], held * slotBytes[3 * z + 2]);
       planes.push_back(backend.view(chunk, at[3 * z], held * slotBytes[3 * z]));
       planes.push_back(slotBytes[3 * z + 1] ? backend.view(chunk, at[3 * z + 1], held * slotBytes[3 * z + 1])
                                             : meta);
       planes.push_back(meta);
     }
+    if (!slotBytes[0]) std::copy_n(planes.begin() + base + 3, 3, planes.begin() + base);
   }
   splash::ops::BlockMoeWeights weights = m.weights;
   weights.chunks = splash::ops::ExpertChunks::of(std::move(planes), floorSlots, chunkSlots, slots,
@@ -215,18 +226,22 @@ inline splash::ops::BlockMoeWeights chunkedWeights(splash::metal::MetalBackend &
   return weights;
 }
 
-// The model's six formats, "gate/up/down/shared gate/shared up/shared down".
+// The model's six formats, "gate/up/down/shared gate/shared up/shared down",
+// "-" for a projection it lacks.
 inline std::string formatNames(const Model &m) {
   std::string names;
-  for (const gguf_reference::Fmt format : m.formats)
-    names += std::string(names.empty() ? "" : "/") + gguf_reference::fmtName(format);
+  for (size_t i = 0; i < m.formats.size(); ++i) {
+    const Tensor &tensor = i < 3 ? m.routed[i] : m.shared[i - 3];
+    names += std::string(i ? "/" : "") + (tensor.rows ? gguf_reference::fmtName(m.formats[i]) : "-");
+  }
   return names;
 }
 
-// A step's buffers, and the fp32 values of its input and residual rows.
+// A step's buffers, and the fp32 values of its input, residual and router
+// input rows (MoeShape::routerInputSize; none without).
 struct Buffers {
   splash::ops::MoeBuffers moe;
-  std::vector<float> input, residual;
+  std::vector<float> input, residual, routerInput;
 };
 
 // The scratch `plan` runs in, zeroed.

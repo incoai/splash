@@ -147,7 +147,7 @@ inline void checkGolden(const Goldens &hashes, const std::string &name, std::spa
 // random finite bf16s; NVFP4's and FP8's blocks as makeNative draws them.
 inline std::vector<uint8_t> fixture(Fmt f, uint32_t rows, uint32_t K, uint32_t seed) {
   std::mt19937 rng(seed);
-  if (f == gguf_reference::NVFP4 || f == gguf_reference::FP8) return gguf_reference::makeNative(f, rows, K, rng);
+  if (gguf_reference::nvfp4(f) || f == gguf_reference::FP8) return gguf_reference::makeNative(f, rows, K, rng);
   if (gguf_reference::affine(f)) {
     std::vector<uint8_t> native((size_t)rows * gguf_reference::rowBytes(f, K));
     for (auto &b : native) b = (uint8_t)rng();
@@ -166,7 +166,8 @@ inline std::vector<uint8_t> fixture(Fmt f, uint32_t rows, uint32_t K, uint32_t s
 
 // The GGUF tensor type of a format's tensors: its table type, or llama.cpp's
 // NVFP4 for NVFP4, whose native rows the loader builds from it; none for the
-// loader's other formats (MLX affine, FP8).
+// loader's other formats (MLX affine, FP8, and NVFP4G64, which llama.cpp's
+// NVFP4 loads as only when its rows are not whole 256s: checkGgufNvfp4).
 inline std::optional<uint32_t> ggufType(uint32_t format) {
   if (format == GGUF_FMT_NVFP4) return model::ggml::kNVFP4;
   if (quant_loader_format(format)) return std::nullopt;

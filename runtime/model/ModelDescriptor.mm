@@ -5,6 +5,7 @@
 #include "WeightStore.hpp"
 #include "metal/abi/DraftAttention.h"
 #include "metal/abi/ExecutionGeometry.h"
+#include "metal/abi/LiLiCorr.h"
 #include "metal/abi/PagedAttention.h"
 #include "ops/MoE.hpp"
 
@@ -673,8 +674,14 @@ DFlashDraftLayout readDraftLayout(NSDictionary *draft, const QwenTargetDimension
                   {"num_attention_heads", SPLASH_DRAFT_QUERY_HEADS},
                   {"num_key_value_heads", SPLASH_DRAFT_KV_HEADS},
                   {"head_dim", SPLASH_DRAFT_HEAD_DIMENSION},
-                  {"sliding_window", ExecutionLimits::draftContextTokens},
                   {"rms_norm_eps", SPLASH_RMS_EPSILON}});
+  // The positions a query row sees: the ring's, or a LiLiCorr draft's 1024,
+  // whose attention may add a sink logit per query head.
+  const uint32_t slidingWindow = requireWhole(draft[@"sliding_window"], "draft config sliding_window");
+  if (slidingWindow != ExecutionLimits::draftContextTokens && slidingWindow != 1024)
+    throw std::invalid_argument("draft config sliding_window is neither " +
+                                std::to_string(ExecutionLimits::draftContextTokens) + " nor 1024");
+  const bool attentionSinks = [draft[@"attention_sink_bias"] isEqual:@YES];
   requireBooleans(draft, "draft config",
                   {{"is_causal", false},
                    {"attention_bias", false},
@@ -718,20 +725,35 @@ DFlashDraftLayout readDraftLayout(NSDictionary *draft, const QwenTargetDimension
     if (targetLayers.back() >= target.layers)
       throw std::invalid_argument("draft config target_layer_ids names a layer past the target's");
   }
-  const DFlashDraftLayout layout =
+  DFlashDraftLayout layout =
       draftLayout(target.hiddenSize, target.vocabularySize,
                   requireWhole(draft[@"num_hidden_layers"], "draft config num_hidden_layers"),
                   requireWhole(draft[@"intermediate_size"], "draft config intermediate_size"),
                   requireNumber(rope[@"rope_theta"], "draft config rope_parameters rope_theta").floatValue,
                   targetLayers);
+  layout.slidingWindow = slidingWindow;
+  layout.attentionSinks = attentionSinks;
+  // A LiLiCorr selector (metal/abi/LiLiCorr.h) in place of the codebooks.
+  if (flash[@"projector_type"]) {
+    requireEqual(requireString(flash, @"projector_type", "draft config projector_type"), "lilicorr",
+                 "checkpoint", "draft config dflash_config projector_type");
+    requireNumbers(flash, "checkpoint", "draft config dflash_config",
+                   {{"lilicorr_candidate_topk", SPLASH_LILICORR_CANDIDATES},
+                    {"lilicorr_hidden_size", SPLASH_LILICORR_HIDDEN},
+                    {"lilicorr_num_heads", SPLASH_LILICORR_HEADS},
+                    {"lilicorr_num_layers", SPLASH_LILICORR_LAYERS}});
+    layout.lilicorr = true;
+  }
   return layout;
 }
 
 // The vision tower's config, config.json's vision_config, which the
 // installer derives from a GGUF's mmproj too: the tower the layout describes,
-// over RGB patches of two frames, without deepstack layers.
+// over RGB patches of two frames (RADIO's one, with erf GELU), without
+// deepstack layers.
 void validateVisionConfig(NSDictionary *vision, const ops::VisionLayout &layout,
                           TargetSource source) {
+  const bool radio = ops::isRadioVision(layout);
   requireNumbers(vision, sourceName(source), "vision config",
                  {{"depth", layout.depth},
                   {"hidden_size", layout.hiddenSize},
@@ -740,10 +762,10 @@ void validateVisionConfig(NSDictionary *vision, const ops::VisionLayout &layout,
                   {"out_hidden_size", layout.outputHiddenSize},
                   {"patch_size", layout.patchSize},
                   {"spatial_merge_size", layout.spatialMerge},
-                  {"temporal_patch_size", 2},
+                  {"temporal_patch_size", radio ? 1U : 2U},
                   {"in_channels", ops::kImageChannels},
                   {"num_position_embeddings", layout.positionGridSide * layout.positionGridSide}});
-  requireEqual(requireString(vision, @"hidden_act", "vision config hidden_act"), "gelu_pytorch_tanh",
+  requireEqual(requireString(vision, @"hidden_act", "vision config hidden_act"), radio ? "gelu" : "gelu_pytorch_tanh",
                sourceName(source), "vision config hidden_act");
   if (requireArray(vision, @"deepstack_visual_indexes", "vision config deepstack_visual_indexes").count)
     throw std::invalid_argument("vision deepstack layers are unsupported");
@@ -803,10 +825,16 @@ ModelDescriptor describeSourceModel(std::string name, std::string_view targetFor
     if (draft && layout.draftChoosesMaskToken()) layout.maskToken = draftMaskToken(draft, layout);
     if (draft) dflashLayout = readDraftLayout(draft, layout);
   }, *target);
-  ModelDescriptor result = makeModelDescriptor(std::move(name), *target, dflashLayout,
-                                               {.outputHiddenSize = std::visit(
-                                                    [](const auto &layout) { return layout.hiddenSize; }, *target)},
-                                               targetSource, visionSource);
+  // Nemotron-H's tower is RADIO, every other family's Qwen3.5's; each
+  // projects into its text model's width.
+  ops::VisionLayout vision =
+      std::holds_alternative<NemotronHLayout>(*target) ? ops::kRadioVisionLayout : ops::VisionLayout{};
+  vision.outputHiddenSize = std::visit([](const auto &layout) { return layout.hiddenSize; }, *target);
+  // RADIO's final norm is its mmproj's (install/gguf.py radio_vision_config).
+  if (ops::isRadioVision(vision))
+    vision.finalNorm = [config[@"vision_config"][@"final_norm"] isEqual:@YES];
+  ModelDescriptor result =
+      makeModelDescriptor(std::move(name), *target, dflashLayout, vision, targetSource, visionSource);
   if (result.hasVision())
     validateVisionConfig(requireObject(config, @"vision_config", "vision config"), result.vision,
                          result.targetSource);
@@ -842,7 +870,7 @@ ModelDescriptor makeModelDescriptor(std::string name, TargetLayout target,
   std::visit(
       [&](const auto &layout) {
         result.capabilities = {layout.vocabularySize,
-                               layout.nativeContextTokens, sparseKvShape(layout)};
+                               layout.servedContextTokens({}), sparseKvShape(layout)};
         result.targetKvLayout = layout.kvLayout();
         result.stateLayout = {layout.gdnStateLayout(), draft.stateLayout()};
       },
@@ -856,7 +884,7 @@ bool ModelDescriptor::valid() const noexcept {
       !capabilities.maximumContextTokens ||
       !targetKvLayout.valid() || !stateLayout.valid() ||
       stateLayout.draft != draft.stateLayout() ||
-      vision.outputHiddenSize != draft.hiddenSize) {
+      (draft.present() && vision.outputHiddenSize != draft.hiddenSize)) {
     return false;
   }
   return std::visit(
@@ -871,12 +899,13 @@ bool ModelDescriptor::valid() const noexcept {
                  capabilities.maximumContextTokens <= layout.yarnContextTokens)) &&
                capabilities.sparseKv == sparseKvShape(layout) &&
                (!capabilities.sparseKv || capabilities.sparseKv->blockTokens == SPLASH_ATTENTION_BLOCK_TOKENS) &&
-               layout.hiddenSize == draft.hiddenSize &&
-               draft.targetLayerCount && draft.targetLayerCount <= ExecutionLimits::maximumDraftTargetLayers &&
-               draft.targetLayers[draft.targetLayerCount - 1] < layout.layers &&
-               // A family whose drafts choose the mask token holds its draft's.
-               (!layout.draftChoosesMaskToken() ||
-                (layout.maskToken >= layout.firstDraftMaskToken && layout.maskToken <= layout.lastDraftMaskToken)) &&
+               (draft == DFlashDraftLayout{} ||
+                (layout.hiddenSize == draft.hiddenSize && draft.targetLayerCount &&
+                 draft.targetLayerCount <= ExecutionLimits::maximumDraftTargetLayers &&
+                 draft.targetLayers[draft.targetLayerCount - 1] < layout.layers &&
+                 // A family whose drafts choose the mask token holds its draft's.
+                 (!layout.draftChoosesMaskToken() ||
+                  (layout.maskToken >= layout.firstDraftMaskToken && layout.maskToken <= layout.lastDraftMaskToken)))) &&
                layout.kvLayout() == targetKvLayout &&
                layout.gdnStateLayout() == stateLayout.target;
       },
@@ -888,7 +917,7 @@ ModelDescriptor servedFor(ModelDescriptor model, uint32_t contextTokens) {
     throw std::invalid_argument("the target's RoPE is already scaled");
   std::visit(
       [&](const auto &layout) {
-        if (contextTokens <= layout.nativeContextTokens)
+        if (contextTokens <= layout.servedContextTokens({}))
           return;
         if (contextTokens > layout.yarnContextTokens)
           throw std::invalid_argument(
@@ -926,11 +955,13 @@ ModelDescriptor inspectModelRoot(const std::filesystem::path &root) {
     const std::string targetFormat = requireString(record, @"target_format", "target format");
     const std::string visionFormat = requireString(record, @"vision_format", "vision format");
     NSDictionary *config = readObject(root / "config.json", "upstream model config");
-    // Every family decodes with its DFlash2 draft, in draft/.
-    if (!std::filesystem::exists(root / "draft"))
-      throw std::invalid_argument("the model's root holds no draft/ for its DFlash2 draft");
-    NSDictionary *draft = readObject(root / "draft" / "config.json", "draft config");
+    // A model decodes with its DFlash2 draft when it has one, in draft/
+    // (DFlashDraftLayout::present).
+    const bool hasDraft = std::filesystem::exists(root / "draft");
+    NSDictionary *draft = hasDraft ? readObject(root / "draft" / "config.json", "draft config") : nil;
     ModelDescriptor result = describeSourceModel(std::move(name), targetFormat, visionFormat, config, draft);
+    if (!hasDraft && !std::holds_alternative<NemotronHLayout>(result.target))
+      throw std::invalid_argument("the model's root holds no draft/ for its DFlash2 draft");
     result.sourceIdentity = std::move(sourceIdentity);
     if (!result.valid()) throw std::invalid_argument("incompatible target and draft model");
     return result;

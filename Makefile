@@ -205,7 +205,8 @@ $(HOST_STEP_LIB): $(HOST_STEP_SOURCE) | $(BUILD)
 ENGINE_BUILD := $(BUILD)/engine
 ENGINE_LIBRARY := $(ENGINE_BUILD)/libsplash.a
 ENGINE_LINKFLAGS := -framework Foundation -framework Metal -framework IOKit \
-	-framework IOSurface
+	-framework IOSurface -framework AVFoundation -framework CoreMedia \
+	-framework CoreVideo -framework VideoToolbox
 ENGINE_DEPFLAGS := -MMD -MP
 # Configuration belongs to each successful output, not to a shared timestamp:
 # macOS make can treat a new stamp and an old binary in the same second as equal.
@@ -264,6 +265,8 @@ ENGINE_CPP_SOURCES := \
 	runtime/ops/Linear.cpp \
 	runtime/ops/LinearGguf.cpp \
 	runtime/ops/KernelSelection.cpp \
+	runtime/ops/Mamba2.cpp \
+	runtime/ops/LiLiCorr.cpp \
 	runtime/ops/MoE.cpp \
 	runtime/ops/Normalization.cpp \
 	runtime/ops/HyperConnection.cpp \
@@ -326,6 +329,8 @@ ENGINE_CPP_SOURCES := \
 	runtime/model/Qwen4Exp.cpp \
 	runtime/model/Qwen4Steps.cpp \
 	runtime/model/Qwen4ExpTarget.cpp \
+	runtime/model/NemotronH.cpp \
+	runtime/model/NemotronHTarget.cpp \
 	runtime/model/Flint.cpp \
 	runtime/model/QwenVision.cpp \
 	runtime/model/VisionPreparation.cpp \

@@ -16,7 +16,7 @@ from dataclasses import dataclass, fields
 from enum import IntEnum, IntFlag
 from typing import TypeAlias
 
-PROTOCOL_VERSION = 14
+PROTOCOL_VERSION = 15
 # A frame is its header, the magic, the protocol version, the frame type and
 # the payload length, then the payload.
 FRAME_HEADER_BYTES = 16
@@ -45,7 +45,7 @@ NO_PARENT = 0xFFFFFFFF
 # The most words of a mask response's forced tokens: a row and a token for as
 # many tokens as a request simulates, after each of its rows.
 MAX_FORCED_WORDS = 2 * (MAX_SIMULATION_TOKENS + 1) * MAX_SIMULATION_TOKENS
-MAX_IMAGE_SPANS = 64
+MAX_IMAGE_SPANS = 256
 MAX_MASK_WORDS = 1 << 20
 
 _MAGIC = b"SPLH"
@@ -53,7 +53,7 @@ _HEADER = struct.Struct("<4sHHQ")
 # Replay can update the integer deadlines without decoding sampling floats.
 _REQUEST_HEAD = struct.Struct("<QBBQQ")
 _REQUEST = struct.Struct(_REQUEST_HEAD.format + "IIIffIffffQIIIQQIII")
-_IMAGE_SPAN = struct.Struct("<IIIIQQ")
+_IMAGE_SPAN = struct.Struct("<IIIIQQIII")
 # Cancel and Stop: one request id.
 _REQUEST_END = struct.Struct("<Q")
 # Request id, mask request id, mask words, forced token words.
@@ -81,7 +81,7 @@ assert (
 )
 assert _HEADER.size == FRAME_HEADER_BYTES
 assert _REQUEST.size == 114
-assert _IMAGE_SPAN.size == 32
+assert _IMAGE_SPAN.size == 44
 assert _READY.size == 21
 assert _START.size == 16
 assert _DONE.size == 62
@@ -246,6 +246,11 @@ class ImageSpan:
     """One image in the prompt: its placeholder token run, the patch grid of
     the resized pixels, and a 128-bit digest of that content. Placeholder
     token ids are identical for every image, so cache identity keys on spans.
+    A video's tubelet is one span of two frames, its pixels both frames'.
+    A pruned video (text_tokens > 0) is one span over all its tubelets: its
+    first text_tokens tokens are the text between them, the rest the rows EVS
+    keeps; its pixels are the tubelets', then a u32 per tubelet, how many of
+    those text tokens precede its rows (runtime/model/Model.hpp ImageSpan).
     """
 
     offset: int
@@ -254,10 +259,14 @@ class ImageSpan:
     grid_width: int
     digest_lo: int
     digest_hi: int
+    frames: int = 1
+    tubelets: int = 1
+    text_tokens: int = 0
 
     @property
     def pixel_bytes(self) -> int:
-        return self.grid_height * 16 * self.grid_width * 16 * 3
+        grid = self.grid_height * 16 * self.grid_width * 16 * 3 * self.frames
+        return self.tubelets * (grid + 4) if self.text_tokens else grid
 
 
 @dataclass(slots=True, frozen=True)
@@ -745,6 +754,7 @@ def _payload_length_issue(
 
 
 def _image_spans_check(request: RequestFrame, prompt_tokens: int) -> None:
+    pixels = _bytes(request.image_pixels, "image pixels")
     previous_end = 0
     pixel_bytes = 0
     for span in request.image_spans:
@@ -754,6 +764,8 @@ def _image_spans_check(request: RequestFrame, prompt_tokens: int) -> None:
         grid_width = _u32(span.grid_width, "image grid width")
         _u64(span.digest_lo, "image digest")
         _u64(span.digest_hi, "image digest")
+        if span.frames not in (1, 2):
+            raise ValueError("image span frames must be 1 or 2")
         if (
             grid_height < 2
             or grid_width < 2
@@ -762,7 +774,27 @@ def _image_spans_check(request: RequestFrame, prompt_tokens: int) -> None:
             or grid_height * grid_width > MAX_IMAGE_PATCHES
         ):
             raise ValueError("image grid must be even-sided and within the patch limit")
-        if tokens != (grid_height // 2) * (grid_width // 2):
+        rows = (grid_height // 2) * (grid_width // 2)
+        tubelets = _u32(span.tubelets, "image span tubelets")
+        text_tokens = _u32(span.text_tokens, "image span text tokens")
+        if text_tokens:
+            if (
+                span.frames != 2
+                or not tubelets
+                or not rows <= tokens - text_tokens <= rows * tubelets
+            ):
+                raise ValueError(
+                    "a pruned video keeps between one tubelet's rows and all of them"
+                )
+            cuts = pixel_bytes + span.pixel_bytes - 4 * tubelets
+            if cuts + 4 * tubelets > len(pixels):
+                raise ValueError("image pixels do not match the image grids")
+            text_cuts = struct.unpack_from(f"<{tubelets}I", pixels, cuts)
+            if list(text_cuts) != sorted(text_cuts) or text_cuts[-1] > text_tokens:
+                raise ValueError(
+                    "a pruned video's text cuts must be ordered within its text"
+                )
+        elif tubelets != 1 or tokens != rows:
             raise ValueError("image span tokens must equal the merged grid size")
         if offset < previous_end or offset + tokens > prompt_tokens:
             raise ValueError(
@@ -770,7 +802,7 @@ def _image_spans_check(request: RequestFrame, prompt_tokens: int) -> None:
             )
         previous_end = offset + tokens
         pixel_bytes += span.pixel_bytes
-    if len(_bytes(request.image_pixels, "image pixels")) != pixel_bytes:
+    if len(pixels) != pixel_bytes:
         raise ValueError("image pixels do not match the image grids")
 
 
@@ -979,6 +1011,9 @@ def _request_frame(request: RequestFrame) -> bytearray:
             span.grid_width,
             span.digest_lo,
             span.digest_hi,
+            span.frames,
+            span.tubelets,
+            span.text_tokens,
         )
     # A bytearray copies a slice assignment's source first; its view does not.
     with memoryview(frame) as view:

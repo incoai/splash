@@ -588,7 +588,7 @@ void checkRepack(MetalBackend &backend, const std::filesystem::path &directory, 
   const uint32_t stride = rowBytes(f, windows * K), windowBytes = rowBytes(f, K);
   std::vector<uint8_t> native = fixture(f, shape.rows, windows * K, seed);
   // llama.cpp's NVFP4 without a .scale tensor: g is 1.
-  if (blockNvfp4) setTensorScales(native, NVFP4, windows * K, [](uint32_t) { return 1.0f; });
+  if (blockNvfp4) setTensorScales(native, f, windows * K, [](uint32_t) { return 1.0f; });
   const std::vector<uint8_t> ordered = orderedRows(native, stride, shape.order);
   std::vector<uint8_t> windowRows;
   for (uint32_t window = 0; window < windows; ++window)
@@ -607,7 +607,7 @@ void checkRepack(MetalBackend &backend, const std::filesystem::path &directory, 
   const auto inputPath = directory / "repack-source";
   try {
     std::vector<uint8_t> input(kSourceOffset, 0);
-    const std::vector<uint8_t> stored = blockNvfp4 ? blockNvfp4Rows(native) : native;
+    const std::vector<uint8_t> stored = blockNvfp4 ? blockNvfp4Rows(native, f) : native;
     input.insert(input.end(), stored.begin(), stored.end());
     splash::test::writeFile(inputPath, input);
     model::WeightSource source(inputPath);
@@ -678,6 +678,9 @@ void checkExecutor(MetalBackend &backend, const std::filesystem::path &directory
   checkRepack(backend, directory, Q80, {256, widerThanStaging(Q80), {}, 2}, 743);
   checkRepack(backend, directory, NVFP4, {2048, 512, {}, 2}, 744, true);
   checkRepack(backend, directory, NVFP4, {768, 512, {256, 16, 8, 4}, 3}, 745, true);
+  // llama.cpp's NVFP4 rows not whole 256s, as NVFP4G64's (Nemotron 3.5 Super's 2688-input down experts).
+  checkRepack(backend, directory, NVFP4G64, {192, 320, {}}, 746, true);
+  checkRepack(backend, directory, NVFP4G64, {2048, 320, {}, 2}, 747, true);
 }
 
 // Each MLX fixture tensor through the production writer, read from a
@@ -867,7 +870,8 @@ void checkFloatSources(MetalBackend &backend, const std::filesystem::path &direc
 // reads it (blockNvfp4Values), and projections made from reference native
 // rows (blockNvfp4Rows) prepare into those rows' planes with their .scale's g:
 // a dense FFN projection and the GDN's grouped qkv rows with one value, the
-// MoE's gate experts with one per expert. A .scale of another count, or
+// MoE's gate experts with one per expert, and its down experts, whose 320
+// inputs are not whole 256s, into NVFP4G64's. A .scale of another count, or
 // beside a weight of another type, is refused.
 void checkGgufNvfp4(MetalBackend &backend, const std::filesystem::path &directory) {
   std::mt19937 rng(41);
@@ -891,22 +895,36 @@ void checkGgufNvfp4(MetalBackend &backend, const std::filesystem::path &director
   for (const bool moe : {false, true}) {
     SmallTarget target = smallTarget(moe);
     const model::QwenTargetDimensions &g = target.geometry;
+    if (moe) {   // experts of 320: Q8_0 but the NVFP4 tensors below
+      target.geometry.expertIntermediateSize = 320;
+      target.tensors = targetTensors(g, {{"attn_qkv.weight", kQ8_0}, {"attn_gate.weight", kQ8_0},
+                                         {"ssm_out.weight", kQ8_0}, {"ffn_gate_exps.weight", kQ8_0},
+                                         {"ffn_up_exps.weight", kQ8_0}, {"ffn_down_exps.weight", kQ8_0},
+                                         {"ffn_gate_shexp.weight", kQ8_0}, {"ffn_up_shexp.weight", kQ8_0},
+                                         {"ffn_down_shexp.weight", kQ8_0}, {"output.weight", kQ8_0},
+                                         {"token_embd.weight", kQ8_0}});
+      randomize(target.tensors, 40);
+    }
     const uint32_t valueRows = g.gdnValueHeads * g.gdnHeadDimension;
     std::vector<Converted> tensors =
         moe ? std::vector<Converted>{{"blk.0.ffn_gate_exps.weight", g.experts * g.expertIntermediateSize, g.hiddenSize,
-                                      g.experts}}
+                                      g.experts},
+                                     {"blk.0.ffn_down_exps.weight", g.experts * g.hiddenSize,
+                                      g.expertIntermediateSize, g.experts}}
             : std::vector<Converted>{{"blk.0.ffn_up.weight", g.intermediateSize, g.hiddenSize, 1},
                                      {"blk.0.attn_qkv.weight", g.convolutionDimension, g.hiddenSize, 1,
                                       {g.convolutionDimension - valueRows, g.gdnHeadDimension, g.gdnKeyHeads,
                                        g.gdnValueHeads / g.gdnKeyHeads}}};
+    // The format llama.cpp's NVFP4 rows of c.columns inputs load as.
+    const auto format = [](const Converted &c) { return c.columns % 256 ? NVFP4G64 : NVFP4; };
     for (Converted &c : tensors) {
-      c.native = makeNative(NVFP4, c.rows, c.columns, rng);
+      c.native = makeNative(format(c), c.rows, c.columns, rng);
       std::vector<float> scales(c.scales);
       for (float &scale : scales) scale = std::uniform_real_distribution<float>(0.5f, 2.0f)(rng);
-      setTensorScales(c.native, NVFP4, c.columns, [&](uint32_t r) { return scales[r / (c.rows / c.scales)]; });
+      setTensorScales(c.native, format(c), c.columns, [&](uint32_t r) { return scales[r / (c.rows / c.scales)]; });
       Tensor &tensor = tensorNamed(target.tensors, c.name);
       tensor.type = model::ggml::kNVFP4;
-      tensor.data = blockNvfp4Rows(c.native);
+      tensor.data = blockNvfp4Rows(c.native, format(c));
       std::vector<uint8_t> values(scales.size() * 4);
       std::memcpy(values.data(), scales.data(), values.size());
       target.tensors.push_back({c.name.substr(0, c.name.size() - 7) + ".scale", {c.scales}, 0, values});
@@ -923,12 +941,12 @@ void checkGgufNvfp4(MetalBackend &backend, const std::filesystem::path &director
     const auto prepared = preparedImages(backend, path, g);
     for (const Converted &c : tensors) {
       const model::gguf::Repack *planes = repackOf(images[0], c.name);
-      const Packed expected =
-          repack(NVFP4, orderedRows(c.native, rowBytes(NVFP4, c.columns), c.order), c.rows, c.columns, nullptr);
-      check(planes && planes->format == GGUF_FMT_NVFP4 &&
+      const Fmt f = format(c);
+      const Packed expected = repack(f, orderedRows(c.native, rowBytes(f, c.columns), c.order), c.rows, c.columns, nullptr);
+      check(planes && planes->format == f &&
                 slice(prepared[0], planes->plane0, expected.w0.size()) == expected.w0 &&
                 slice(prepared[0], planes->meta, expected.meta.size()) == expected.meta,
-            "llama.cpp NVFP4 " + c.name + " prepares into the planes of its NVFP4 rows, its .scale as g");
+            "llama.cpp NVFP4 " + c.name + " prepares into the planes of its " + fmtName(f) + " rows, its .scale as g");
     }
     if (!moe) {
       const model::gguf::Copy *copy = copyOf(images.back(), "token_embd.weight");

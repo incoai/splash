@@ -219,6 +219,11 @@ def check_capabilities(tokenizer, chat_format, ready):
             raise TokenizerContractError(
                 f"tokenizer must encode the image placeholder {pad!r} as one token"
             )
+        for tag in (chat_format.image_open, chat_format.image_close):
+            if tag and len(tokenizer.encode(tag, add_special_tokens=False)) != 1:
+                raise TokenizerContractError(
+                    f"tokenizer must encode the image tag {tag!r} as one token"
+                )
 
 
 def _grammar_error(error):

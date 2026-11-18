@@ -265,6 +265,36 @@ def parse_queue_size(value):
     return size
 
 
+def parse_video_fps(value):
+    try:
+        fps = float(value)
+    except ValueError:
+        fps = 0.0
+    if not 0 < fps <= 30:
+        raise argparse.ArgumentTypeError("must be a frame rate above 0 and at most 30")
+    return fps
+
+
+def parse_video_max_frames(value):
+    try:
+        frames = int(value)
+    except ValueError:
+        frames = 0
+    if not 1 <= frames <= 256:
+        raise argparse.ArgumentTypeError("must be between 1 and 256 frames")
+    return frames
+
+
+def parse_video_pruning(value):
+    try:
+        rate = float(value)
+    except ValueError:
+        rate = -1.0
+    if not 0 <= rate < 1:
+        raise argparse.ArgumentTypeError("must be at least 0 and below 1")
+    return rate
+
+
 def parse_decode_share(value):
     try:
         share = float(value)
@@ -506,7 +536,7 @@ SERVE_OPTIONS = (
             "native window a model with YaRN turns it on, which is static and "
             "changes answers at every length, so pass more than the native "
             "window only when a request needs it (default: auto, the native "
-            "window when memory holds it)",
+            "window, at most 1010000, when memory holds it)",
         ),
         engine=EngineArgument(0, text=_auto_text, required=True),
     ),
@@ -775,6 +805,39 @@ SERVE_OPTIONS = (
             "--max-image-patches", text=lambda pixels: str(images.max_patches(pixels))
         ),
         needs="vision",
+    ),
+    ServeOption(
+        "--video-fps",
+        "requests",
+        dict(
+            type=parse_video_fps,
+            default=images.VIDEO_FPS,
+            metavar="FPS",
+            help="frames sampled per second of a video, for models that take "
+            f"video (default: {images.VIDEO_FPS:g})",
+        ),
+    ),
+    ServeOption(
+        "--video-max-frames",
+        "requests",
+        dict(
+            type=parse_video_max_frames,
+            default=images.VIDEO_MAX_FRAMES,
+            metavar="FRAMES",
+            help="most frames sampled from a video, spread over all of it "
+            f"(default: {images.VIDEO_MAX_FRAMES})",
+        ),
+    ),
+    ServeOption(
+        "--video-pruning",
+        "requests",
+        dict(
+            type=parse_video_pruning,
+            default=images.VIDEO_PRUNING,
+            metavar="RATE",
+            help="share of a video's frame tokens dropped as least changed "
+            f"from the frames before (EVS; 0 keeps all; default: {images.VIDEO_PRUNING:g})",
+        ),
     ),
     ServeOption(
         "--request-timeout",

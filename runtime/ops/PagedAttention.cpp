@@ -38,6 +38,9 @@ uint32_t tileParts(uint32_t queryHeads, kv::Layout layout) {
 // - gated: projection rows that hold each query head's output gate after its
 //   queries, by whose sigmoid the reduce multiplies the attention rows it
 //   writes (Qwen3.5's); without, it writes them as they are;
+// - qkNorms: an RMS norm of each query and key head before RoPE (every
+//   family's but Nemotron-H's); without, the projection binds no norms and
+//   keeps the heads as projected;
 // - sinks: a learned sink per query head, which every reduce adds;
 // - rotaryPairs: the pairs its RoPE rotates, and unrotated: a projection
 //   without RoPE (NoPE) as well, for an AttentionVariant that is not rotated;
@@ -53,6 +56,7 @@ struct CompiledAttention final {
   uint32_t headDimension;
   kv::Reads reads;
   bool gated;
+  bool qkNorms;
   bool sinks;
   uint32_t rotaryPairs;
   bool unrotated;
@@ -61,11 +65,13 @@ struct CompiledAttention final {
   std::string_view commitSuffix;
 };
 constexpr std::array kCompiledAttention{
-    CompiledAttention{24, 4, 256, kv::Reads::EveryPage, true, false, 32, false, 0, "", ""},
-    CompiledAttention{16, 2, 256, kv::Reads::EveryPage, true, false, 32, false, 0, "_kv2_g8", "_kv2_g8"},
-    CompiledAttention{32, 2, 256, kv::Reads::EveryPage, true, false, 32, false, 0, "_kv2_g16", "_kv2_g8"},
-    CompiledAttention{24, 2, 256, kv::Reads::SelectedBlocks, true, false, 32, false, 0, "_kv2_g12", "_kv2_vt"},
-    CompiledAttention{32, 4, 128, kv::Reads::EveryPage, false, true, 64, true, 512, "_kv4_g8_d128", "_kv4_d128"},
+    CompiledAttention{24, 4, 256, kv::Reads::EveryPage, true, true, false, 32, false, 0, "", ""},
+    CompiledAttention{16, 2, 256, kv::Reads::EveryPage, true, true, false, 32, false, 0, "_kv2_g8", "_kv2_g8"},
+    CompiledAttention{32, 2, 256, kv::Reads::EveryPage, true, true, false, 32, false, 0, "_kv2_g16", "_kv2_g8"},
+    CompiledAttention{24, 2, 256, kv::Reads::SelectedBlocks, true, true, false, 32, false, 0, "_kv2_g12", "_kv2_vt"},
+    CompiledAttention{32, 4, 128, kv::Reads::EveryPage, false, true, true, 64, true, 512, "_kv4_g8_d128", "_kv4_d128"},
+    // Nemotron-H's: ungated, no q/k norms, no sinks, every layer NoPE.
+    CompiledAttention{32, 2, 128, kv::Reads::EveryPage, false, false, false, 0, true, 0, "_kv2_g16_d128", "_kv2_d128"},
 };
 
 // Whether a compiled geometry's pages are a layout's: its KV heads, head
@@ -146,9 +152,10 @@ uint32_t attentionSplits(uint32_t tiles, uint64_t pages, uint32_t windowTokens, 
 }
 
 // One dispatch normalizes both the queries and the keys, so their norms must
-// share a stored type.
-std::string qkNormKernel(std::string_view name, const NormWeights &queryNorm,
+// share a stored type; a geometry without q/k norms binds neither.
+std::string qkNormKernel(std::string_view name, const CompiledAttention &compiled, const NormWeights &queryNorm,
                          const NormWeights &keyNorm, uint32_t headDimension) {
+  if (!compiled.qkNorms) return std::string(name);
   std::string kernel = normKernel(name, queryNorm, headDimension);
   if (normKernel(name, keyNorm, headDimension) != kernel)
     throw std::invalid_argument("query and key norms differ in type");
@@ -275,7 +282,8 @@ std::vector<metal::MetalBuffer> projectionBindings(const CompiledAttention &comp
                                                    metal::MetalBuffer ropeCos, metal::MetalBuffer ropeSin,
                                                    metal::MetalBuffer queries,
                                                    std::span<const metal::MetalBuffer> pageTables) {
-  std::vector<metal::MetalBuffer> bindings{std::move(packed), queryNorm.buffer, keyNorm.buffer};
+  std::vector<metal::MetalBuffer> bindings{std::move(packed)};
+  if (compiled.qkNorms) bindings.insert(bindings.end(), {queryNorm.buffer, keyNorm.buffer});
   if (variant.rotated) {
     const uint64_t bytes = rows * compiled.rotaryPairs * sizeof(float);
     requireBytes(ropeCos, bytes, "attention RoPE cosine");
@@ -446,6 +454,9 @@ void PagedAttention::addProjection(metal::CommandGraph &graph, metal::MetalBuffe
                                    std::span<const kv::ChunkedPrefillParams> sequences, const AttentionRows &rows,
                                    uint32_t queryHeads, kv::Layout layout, AttentionVariant variant) {
   const CompiledAttention &kernel = compiledAttention(queryHeads, layout, variant);
+  // A geometry of no rotary pairs (every layer NoPE) compiles no rotation.
+  if (variant.rotated && !kernel.rotaryPairs)
+    throw std::invalid_argument("no attention kernel for the layer's variant");
   const CommandRows command = commandRows(sequences, layout);
   if (pageTables.size() != sequences.size())
     throw std::invalid_argument("a q/k projection takes a page table per sequence");
@@ -459,7 +470,7 @@ void PagedAttention::addProjection(metal::CommandGraph &graph, metal::MetalBuffe
   bindings.push_back(rows.layout);
   graph.add(qkNormKernel(kernelName(kernelFormat(layout) + "_qkv",
                                     std::string(kernel.suffix) + (variant.rotated ? "" : "_nope")),
-                         queryNorm, keyNorm, layout.headDimension),
+                         kernel, queryNorm, keyNorm, layout.headDimension),
             std::move(bindings), everyRow(sequences, command, rows, layer),
             rowGroups(queryHeads + layout.kvHeads, command, sequences.size()), {layout.headDimension, 1, 1});
 }

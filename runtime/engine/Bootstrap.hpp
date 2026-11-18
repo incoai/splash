@@ -168,6 +168,7 @@ public:
     [[nodiscard]] NativeRuntime &nativeLoop() noexcept {
         return *nativeLoop_;
     }
+    [[nodiscard]] const RuntimeBootstrapReport &report() const noexcept { return report_; }
 
     // Ends the start: sends Ready and begins serving. It throws when Ready
     // cannot be sent or serving cannot begin, which ends the process: the

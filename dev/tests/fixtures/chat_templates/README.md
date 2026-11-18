@@ -19,3 +19,9 @@ not templates distributed with the runtime.
   (revision `20468edfc38ab43d6914cc88b08cbecb05d0fc62`) holds byte for byte.
   The chat format tests (`dev/tests/server/test_chat_formats.py`) render it
   too.
+- `bolt.jinja`: embedded `tokenizer.chat_template` of
+  `NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB.gguf` in
+  `nvidia/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB-GGUF` (revision
+  `e0fecb69cb3e5e4c5e8a056fa2aec98c78e91246`), file SHA-256
+  `91d63363e782c8a3d5f4be42816eba8e0d42dd2530bd07a7d0d2dc440599af75`.
+  The image tests (`dev/tests/server/test_images.py`) render it.

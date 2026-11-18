@@ -54,6 +54,8 @@ TEST_STAGED_KV_STORE(test_staged_kv_store_bf16, 4, 256, bfloat, false)
 TEST_STAGED_KV_STORE(test_staged_kv_store_bf16_kv2_g8, 2, 256, bfloat, false)
 TEST_STAGED_KV_STORE(test_staged_kv_store_q8_kv4_d128, 4, 128, int8_t, false)
 TEST_STAGED_KV_STORE(test_staged_kv_store_bf16_kv4_d128, 4, 128, bfloat, false)
+TEST_STAGED_KV_STORE(test_staged_kv_store_q8_kv2_d128, 2, 128, int8_t, false)
+TEST_STAGED_KV_STORE(test_staged_kv_store_bf16_kv2_d128, 2, 128, bfloat, false)
 TEST_STAGED_KV_STORE(test_staged_kv_store_q8_kv2_vt, 2, 256, int8_t, true)
 TEST_STAGED_KV_STORE(test_staged_kv_store_bf16_kv2_vt, 2, 256, bfloat, true)
 #undef TEST_STAGED_KV_STORE

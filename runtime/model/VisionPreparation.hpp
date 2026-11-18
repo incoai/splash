@@ -1,7 +1,8 @@
 #pragma once
 
 // The image of a vision tower (MDFV0001, every tensor BF16), as
-// model/VisionLoader.cpp plans it from an MLX checkpoint or a GGUF mmproj, and
+// model/VisionLoader.cpp plans it from an MLX checkpoint or a GGUF mmproj
+// (Qwen3.5's tower from either, RADIO's from a nemotron_omni mmproj), and
 // its writer. A BF16 tensor is copied; an F32 or F16 tensor is converted only
 // when every value is exactly a BF16, and loading fails otherwise.
 
@@ -29,6 +30,9 @@ struct Section {
   bool patch = false; // the patch embedding, whose rows the writer reorders
   uint64_t offset = 0;
   std::vector<Input> inputs{};
+  // Placed right after the previous section, unaligned, which it continues
+  // into one tensor (RADIO's q, k and v rows, stored apart in the mmproj).
+  bool follows = {};
 };
 
 // The header (magic, block count, file kind 0) in a 16 KiB block, then

@@ -468,8 +468,12 @@ void checkGdnWidths() {
   withoutGates.packedGdnWidth = shipped.convolutionDimension + shipped.attentionWidth;
   rejects([&] { sizeArenas(withoutGates); }, "invalid model runtime geometry",
           "packed GDN rows without the gates reached arena sizing");
-  // Every family's layout, the 122B's among them, passes the layout check.
-  model::forEachFamily([](const auto &family) { model::requireQwenLayout(family); });
+  // Every hybrid family's layout, the 122B's among them, passes the layout
+  // check; Nemotron-H's single-block layers load without it
+  // (loadNemotronHWeights).
+  model::forEachFamily([](const auto &family) {
+    if (!family.singleBlockLayers()) model::requireQwenLayout(family);
+  });
   // A layout without GDN layers sets none of the GDN dimensions.
   auto strayGdn = model::FlintLayout{};
   strayGdn.gdnKeyHeads = 16;

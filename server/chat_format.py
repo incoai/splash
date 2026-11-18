@@ -129,8 +129,22 @@ class ChatFormat:
     # cached prompt's tokens (tokenization.PromptTokenizer).
     message_boundary: str
     # The template's placeholder for one image, one token, which the server
-    # widens to the image's tokens; None for a template without one.
+    # widens to the image's tokens, between image_open and image_close where
+    # the family's processor wraps them; None for a template without one.
     image_pad: str | None
+    image_open: str = ""
+    image_close: str = ""
+    # Where the template's source writes image_pad for an image, as opposed to
+    # testing a message's text for it (frontend._render_image_tokens).
+    image_sites: tuple[str, ...] = ("<|image_pad|>",)
+    # How its processor resizes an image (images.RESIZE_RULES).
+    image_resize: str = "qwen"
+    # The token the template writes for a video, which the server widens to
+    # its tubelets as the processor labels them (images.prepare_video), and
+    # where the template's source writes it; none where the family takes no
+    # video.
+    video_pad: str = ""
+    video_sites: tuple[str, ...] = ()
 
     @property
     def reasoning_switch(self):
@@ -174,4 +188,26 @@ FLINT = ChatFormat(
     call_syntax=GLM_ARGS,
     message_boundary="<|assistant|>",
     image_pad=None,
+)
+# Nemotron-H's (Nemotron 3.5 Bolt, runtime/model/NemotronH.hpp): </s>
+# and the turn end <|im_end|> as stop tokens, and a
+# ChatML template that opens the think block by enable_thinking and lays a
+# call out as Qwen's do. Its template writes <image> for an image, which its
+# processor (processing.py) widens between <img> and </img>; the template
+# also tests a message's text for <image>. It writes <video> for a video,
+# which the processor widens to one labeled <img> run per two frames.
+NEMOTRON = ChatFormat(
+    stop_tokens=("</s>", "<|im_end|>"),
+    think_end_id=13,
+    think_start_id=None,
+    call_open_id=14,
+    call_syntax=QWEN_XML,
+    message_boundary="<|im_end|>",
+    image_pad="<image>",
+    image_open="<img>",
+    image_close="</img>",
+    image_sites=("+ '<image>'", "'><image>'"),
+    image_resize="nemotron",
+    video_pad="<video>",
+    video_sites=("+ '<video>'",),
 )

@@ -484,7 +484,7 @@ std::array<uint8_t, 32> parseSha256(std::string_view value) {
 
 void requireLoadedModel(const model::LoadedModel &loaded) {
   if (!loaded.targetActualAllocatedBytes() ||
-      !loaded.draft.actualAllocatedBytes ||
+      (loaded.descriptor.draft.present() && !loaded.draft.actualAllocatedBytes) ||
       (loaded.descriptor.hasVision() && !loaded.vision.actualAllocatedBytes) ||
       loaded.manifestFingerprintSha256.empty() ||
       loaded.targetManifestFingerprint().empty()) {
@@ -702,7 +702,7 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
   // weights load and again once the files open.
   model::CompositeStateLayout stateLayout = config.model.stateLayout;
   stateLayout.target.format = config.stateFormat;
-  stateLayout.target.cachedCodes = !config.exactCachedStates;
+  stateLayout.target.cachedCodes = stateLayout.target.cachedCodes && !config.exactCachedStates;
   const uint64_t stateBytes = stateLayout.cachedBytes();
   const bool automaticDisk = config.cacheDisk.automatic;
   const uint64_t cacheDiskBytes = automaticDisk ? kAutomaticCacheDiskBytes : config.cacheDisk.bytes;
@@ -838,10 +838,12 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
   // files give: whatever streams, its projections are those of its formats.
   const auto planArenas = [&](const model::QwenTargetGeometry &target) {
     try {
+      const uint64_t selectorBytes = model::plannedSelectorBytes(*backend, config.modelRoot, config.model, operators);
       const auto arenas = [&](model::StreamedParts parts) {
         const model::ModelMemoryPlan streamed = model::plannedRuntimeMemory(
             config.model, target, operators, config.kvFormat, config.stateFormat, parts);
-        return streamed.sharedPrefillPlannedAllocatedBytes + streamed.sharedDecodePlannedAllocatedBytes;
+        return streamed.sharedPrefillPlannedAllocatedBytes + streamed.sharedDecodePlannedAllocatedBytes +
+               selectorBytes;
       };
       for (const bool table : {false, true}) {
         const uint64_t tableRowBytes = table ? streamable.tableRowBytes : 0;

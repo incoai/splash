@@ -47,6 +47,7 @@ BlockIdentity blockImageIdentity(uint64_t blockBegin, uint32_t blockTokens,
       lo = mix(lo, value);
       hi = mix(hi, ~value);
     }
+    span.foldVideoIdentity(lo, hi, mix);
     identity = {lo, hi};
   }
   return identity;

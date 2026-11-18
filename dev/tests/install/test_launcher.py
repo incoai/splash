@@ -674,6 +674,10 @@ class LauncherTests(unittest.TestCase):
             "--mmproj",
             "--chat-template-file",
             "--reasoning-effort",
+            # CLI-only video options, which the desktop app does not offer.
+            "--video-fps",
+            "--video-max-frames",
+            "--video-pruning",
         }
         self.assertIn("--max-memory", flags)
         table = Path(launcher.__file__).resolve().parents[1] / (

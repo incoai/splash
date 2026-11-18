@@ -1,11 +1,17 @@
 import io
 import unittest
+from dataclasses import replace
 from unittest import mock
 
-from dev.tests.server_fixtures import READY, console_written, unprepared_hold
+from dev.tests.server_fixtures import (
+    READY,
+    console_written,
+    engine_ready,
+    unprepared_hold,
+)
 from server import constraints as generation_constraints
 from server import server
-from server.chat_format import QWEN
+from server.chat_format import NEMOTRON, QWEN
 
 
 class TokenizerContractTests(unittest.TestCase):
@@ -101,6 +107,27 @@ class TokenizerContractTests(unittest.TestCase):
             generation_constraints.TokenizerContractError, "EOS token"
         ):
             generation_constraints.check_capabilities(tokenizer, QWEN, READY)
+
+    def test_image_tags_must_each_be_one_token_when_serving_images(self):
+        tokenizer = self.tokenizer()
+        vocabulary = tokenizer.get_vocab()
+        vocabulary |= {"<|image_pad|>": 1, "<img>": 2, "</img>": 3}
+        chat_format = replace(
+            QWEN, image_open=NEMOTRON.image_open, image_close=NEMOTRON.image_close
+        )
+        ready = engine_ready(vision=True)
+        generation_constraints.check_capabilities(tokenizer, chat_format, ready)
+        for tag in ("<img>", "</img>"):
+            with self.subTest(tag=tag):
+                tokenizer.encode.side_effect = lambda text, _tag=tag, **_: (
+                    [1, 2] if text == _tag else [vocabulary[text]]
+                )
+                with self.assertRaisesRegex(
+                    generation_constraints.TokenizerContractError, "image tag"
+                ):
+                    generation_constraints.check_capabilities(
+                        tokenizer, chat_format, ready
+                    )
 
     def test_startup_rejects_tokenizer_before_starting_the_native_worker(self):
         args = server.parse_args(["model", "--model", "owner/model"])

@@ -109,6 +109,8 @@ TEST_GGUF_ROTATION := $(ENGINE_TEST_BUILD)/gguf-rotation
 TEST_GGUF_MOE := $(ENGINE_TEST_BUILD)/gguf-moe
 TEST_GGUF_MOE_E512 := $(ENGINE_TEST_BUILD)/gguf-moe-e512
 TEST_GGUF_MOE_SIGMOID := $(ENGINE_TEST_BUILD)/gguf-moe-sigmoid
+TEST_GGUF_MOE_NEMOTRON := $(ENGINE_TEST_BUILD)/gguf-moe-nemotron
+TEST_GGUF_MOE_NEMOTRON_E512 := $(ENGINE_TEST_BUILD)/gguf-moe-nemotron-e512
 TEST_EXPERT_STORE := $(ENGINE_TEST_BUILD)/expert-store
 TEST_KV_BLOCK_CACHE := $(ENGINE_TEST_BUILD)/kv-block-cache
 TEST_KV_HISTORY_STREAM := $(ENGINE_TEST_BUILD)/kv-history-stream
@@ -167,16 +169,20 @@ TEST_DRAFT_VOCABULARY := $(ENGINE_TEST_BUILD)/draft-vocabulary
 TEST_COMMAND_LIMITS := $(ENGINE_TEST_BUILD)/command-limits
 TEST_ATTENTION_PLAN := $(ENGINE_TEST_BUILD)/paged-attention-plan
 TEST_ATTENTION_VARIANTS := $(ENGINE_TEST_BUILD)/attention-variants
+TEST_NORMALIZATION := $(ENGINE_TEST_BUILD)/normalization
+TEST_MAMBA2 := $(ENGINE_TEST_BUILD)/mamba2
 TEST_ROPE_TABLES := $(ENGINE_TEST_BUILD)/rope-tables
 TEST_LINEAR_PLAN := $(ENGINE_TEST_BUILD)/linear-plan
 TEST_DFLASH_BATCH_CONTROL_TEST := $(ENGINE_TEST_BUILD)/dflash-batch-control
 TEST_DRAFT_ATTENTION_TEST := $(ENGINE_TEST_BUILD)/draft-attention
 TEST_GDN_DECODE_TEST := $(ENGINE_TEST_BUILD)/gdn-decode
 TEST_DRAFT_SELECTOR_TEST := $(ENGINE_TEST_BUILD)/draft-selector
+TEST_LILICORR_TEST := $(ENGINE_TEST_BUILD)/lilicorr
 TEST_TARGET_SAMPLING_TEST := $(ENGINE_TEST_BUILD)/target-sampling
 TEST_TARGET_SAMPLING_WIDE_TEST := $(ENGINE_TEST_BUILD)/target-sampling-16
 TEST_VISION_METAL_TEST := $(ENGINE_TEST_BUILD)/vision-metal
 TEST_VISION_ATTENTION_TEST := $(ENGINE_TEST_BUILD)/vision-attention
+TEST_VISION_RADIO_TEST := $(ENGINE_TEST_BUILD)/vision-radio
 TEST_BACKEND_BENCHMARK := $(ENGINE_TEST_BUILD)/backend-benchmark
 TEST_DECODE_PROFILE := $(ENGINE_TEST_BUILD)/decode-profile
 TEST_TEACHER_LOGITS := $(ENGINE_TEST_BUILD)/teacher-logits
@@ -281,6 +287,8 @@ TEST_METAL_TARGETS := $(TEST_DRAFT_PREPARATION) \
 	$(TEST_GGUF_MOE) \
 	$(TEST_GGUF_MOE_E512) \
 	$(TEST_GGUF_MOE_SIGMOID) \
+	$(TEST_GGUF_MOE_NEMOTRON) \
+	$(TEST_GGUF_MOE_NEMOTRON_E512) \
 	$(TEST_EXPERT_STORE) \
 	$(TEST_KV_BLOCK_CACHE) \
 	$(TEST_KV_HISTORY_STREAM) \
@@ -288,6 +296,8 @@ TEST_METAL_TARGETS := $(TEST_DRAFT_PREPARATION) \
 	$(TEST_GGUF_PREPARATION) \
 	$(TEST_ATTENTION_PLAN) \
 	$(TEST_ATTENTION_VARIANTS) \
+	$(TEST_NORMALIZATION) \
+	$(TEST_MAMBA2) \
 	$(TEST_ROPE_TABLES) \
 	$(TEST_LINEAR_PLAN) \
 	$(TEST_RESOURCES_TEST) \
@@ -304,10 +314,12 @@ TEST_METAL_TARGETS := $(TEST_DRAFT_PREPARATION) \
 	$(TEST_DRAFT_ATTENTION_TEST) \
 	$(TEST_GDN_DECODE_TEST) \
 	$(TEST_DRAFT_SELECTOR_TEST) \
+	$(TEST_LILICORR_TEST) \
 	$(TEST_TARGET_SAMPLING_TEST) \
 	$(TEST_TARGET_SAMPLING_WIDE_TEST) \
 	$(TEST_VISION_METAL_TEST) \
 	$(TEST_VISION_ATTENTION_TEST) \
+	$(TEST_VISION_RADIO_TEST) \
 	$(TEST_METAL_BACKEND_TEST) \
 	$(TEST_HANDOFF_TEST) \
 	$(TEST_PRESSURE_SERVING) \
@@ -475,6 +487,20 @@ $(TEST_GGUF_MOE_SIGMOID): dev/tests/engine/gguf_moe_test.mm \
 $(TEST_GGUF_MOE_SIGMOID): ENGINE_TEST_CXXFLAGS += -DGGUF_MOE_HIDDEN=256 -DGGUF_MOE_INTERMEDIATE=512 \
 		-DGGUF_MOE_EXPERTS=256 -DGGUF_MOE_TOP_K=6 -DGGUF_MOE_ROUTER=SigmoidNormalized \
 		-DGGUF_MOE_SHARED_SLICES=2 -DGGUF_MOE_SHARED_GATE=false
+# The same test at Nemotron-H's latent MoE: 240 or 496 experts, 9 per token by
+# a biased sigmoid router scaled by 5 on rows of 512, ungated ReLU^2 experts
+# of width 512 or 640 at hidden 256, no shared expert and no residual.
+NEMOTRON_MOE_FLAGS := -DGGUF_MOE_HIDDEN=256 -DGGUF_MOE_TOP_K=9 -DGGUF_MOE_ROUTER=SigmoidBiased \
+		-DGGUF_MOE_SHARED_SLICES=0 -DGGUF_MOE_SHARED_GATE=false -DGGUF_MOE_ACTIVATION=ReluSquared \
+		-DGGUF_MOE_ROUTER_INPUT=512 -DGGUF_MOE_ROUTED_SCALE=5.0f -DGGUF_MOE_RESIDUAL=false
+$(TEST_GGUF_MOE_NEMOTRON): dev/tests/engine/gguf_moe_test.mm \
+		$(ENGINE_LIBRARY) $(LIB)
+$(TEST_GGUF_MOE_NEMOTRON): ENGINE_TEST_CXXFLAGS += $(NEMOTRON_MOE_FLAGS) -DGGUF_MOE_INTERMEDIATE=512 \
+		-DGGUF_MOE_EXPERTS=240
+$(TEST_GGUF_MOE_NEMOTRON_E512): dev/tests/engine/gguf_moe_test.mm \
+		$(ENGINE_LIBRARY) $(LIB)
+$(TEST_GGUF_MOE_NEMOTRON_E512): ENGINE_TEST_CXXFLAGS += $(NEMOTRON_MOE_FLAGS) -DGGUF_MOE_INTERMEDIATE=640 \
+		-DGGUF_MOE_EXPERTS=496
 $(TEST_EXPERT_STORE): dev/tests/engine/expert_store_test.mm \
 		$(ENGINE_LIBRARY) $(LIB)
 $(TEST_KV_BLOCK_CACHE): dev/tests/engine/kv_block_cache_test.mm \
@@ -493,6 +519,10 @@ $(TEST_ATTENTION_VARIANTS): dev/tests/engine/attention_variants_metal_test.mm \
 		$(ENGINE_LIBRARY) $(TEST_PRODUCTION_LIB)
 $(TEST_ROPE_TABLES): dev/tests/engine/rope_tables_metal_test.mm \
 		$(ENGINE_LIBRARY) $(LIB)
+$(TEST_NORMALIZATION): dev/tests/engine/normalization_metal_test.mm \
+		$(ENGINE_LIBRARY) $(LIB)
+$(TEST_MAMBA2): dev/tests/engine/mamba2_metal_test.mm \
+		$(ENGINE_LIBRARY) $(LIB)
 $(TEST_LINEAR_PLAN): dev/tests/engine/linear_plan_test.mm \
 		$(ENGINE_LIBRARY) $(LIB)
 $(TEST_DFLASH_BATCH_CONTROL_TEST): dev/tests/engine/dflash_batch_control_metal_test.mm \
@@ -503,6 +533,8 @@ $(TEST_GDN_DECODE_TEST): dev/tests/engine/gdn_decode_metal_test.mm \
 		$(ENGINE_LIBRARY) $(LIB)
 $(TEST_DRAFT_SELECTOR_TEST): dev/tests/engine/draft_selector_metal_test.mm \
 		$(ENGINE_LIBRARY) $(LIB)
+$(TEST_LILICORR_TEST): dev/tests/engine/lilicorr_metal_test.mm \
+		$(ENGINE_LIBRARY) $(LIB)
 $(TEST_TARGET_SAMPLING_TEST): dev/tests/engine/target_sampling_metal_test.mm \
 		$(ENGINE_LIBRARY) $(LIB)
 # The same test over lanes of a verify block's 16 rows.
@@ -510,6 +542,8 @@ $(TEST_TARGET_SAMPLING_WIDE_TEST): dev/tests/engine/target_sampling_metal_test.m
 		$(ENGINE_LIBRARY) $(LIB)
 $(TEST_TARGET_SAMPLING_WIDE_TEST): ENGINE_TEST_CXXFLAGS += -DTARGET_SAMPLING_LANE_ROWS=16
 $(TEST_VISION_ATTENTION_TEST): dev/tests/engine/vision_attention_metal_test.mm \
+		$(ENGINE_LIBRARY) $(LIB)
+$(TEST_VISION_RADIO_TEST): dev/tests/engine/vision_radio_metal_test.mm \
 		$(ENGINE_LIBRARY) $(LIB)
 $(TEST_Q8_METAL_TEST): dev/tests/engine/q8_paged_kv_metal_test.mm
 $(TEST_Q8_STORAGE_TEST): dev/tests/engine/q8_page_storage_test.mm \
@@ -548,12 +582,13 @@ $(TEST_MODEL_CONFIGURATION) $(TEST_DRAFT_PREPARATION) $(TEST_GGUF_PROJECTION) $(
 		$(TEST_BOOTSTRAP_TEST) $(TEST_RESOURCES_TEST) \
 		$(TEST_KV_PAGE_TIER_TEST) $(TEST_QWEN_STATE_TEST) $(TEST_Q8_ATTENTION_TEST) \
 		$(TEST_Q8_PREFILL_TEST) $(TEST_GGUF_MOE) $(TEST_GGUF_MOE_E512) $(TEST_GGUF_MOE_SIGMOID) \
+		$(TEST_GGUF_MOE_NEMOTRON) $(TEST_GGUF_MOE_NEMOTRON_E512) \
 		$(TEST_EXPERT_STORE) $(TEST_KV_BLOCK_CACHE) $(TEST_KV_HISTORY_STREAM) $(TEST_QWEN4_KERNELS) \
 		$(TEST_GDN_METAL_TEST) $(TEST_STATE_CODEC_TEST) $(TEST_ATTENTION_PLAN) $(TEST_LINEAR_PLAN) \
 		$(TEST_DFLASH_BATCH_CONTROL_TEST) $(TEST_DRAFT_ATTENTION_TEST) \
-		$(TEST_GDN_DECODE_TEST) $(TEST_DRAFT_SELECTOR_TEST) \
-		$(TEST_TARGET_SAMPLING_TEST) $(TEST_TARGET_SAMPLING_WIDE_TEST) $(TEST_VISION_ATTENTION_TEST) \
-		$(TEST_Q8_METAL_TEST) $(TEST_Q8_STORAGE_TEST) $(TEST_ATTENTION_VARIANTS) $(TEST_ROPE_TABLES) \
+		$(TEST_GDN_DECODE_TEST) $(TEST_DRAFT_SELECTOR_TEST) $(TEST_LILICORR_TEST) \
+		$(TEST_TARGET_SAMPLING_TEST) $(TEST_TARGET_SAMPLING_WIDE_TEST) $(TEST_VISION_ATTENTION_TEST) $(TEST_VISION_RADIO_TEST) \
+		$(TEST_Q8_METAL_TEST) $(TEST_Q8_STORAGE_TEST) $(TEST_ATTENTION_VARIANTS) $(TEST_ROPE_TABLES) $(TEST_NORMALIZATION) $(TEST_MAMBA2) \
 		$(TEST_METAL_BACKEND_TEST) $(TEST_HANDOFF_TEST) $(TEST_PRESSURE_SERVING) $(TEST_VISION_ENCODER_TEST) \
 		$(TEST_MODEL_RUNTIME_ORACLE) \
 		$(TEST_DECODE_PROFILE) $(TEST_TEACHER_LOGITS) $(TEST_ATTENTION_SWEEP) \
@@ -718,6 +753,8 @@ test-engine-metal: $(TEST_METAL_TARGETS)
 	$(METAL_TEST_ENV) $(TEST_GGUF_MOE) $(TEST_PRODUCTION_LIB)
 	$(METAL_TEST_ENV) $(TEST_GGUF_MOE_E512) $(TEST_PRODUCTION_LIB)
 	$(METAL_TEST_ENV) $(TEST_GGUF_MOE_SIGMOID) $(TEST_PRODUCTION_LIB)
+	$(METAL_TEST_ENV) $(TEST_GGUF_MOE_NEMOTRON) $(TEST_PRODUCTION_LIB)
+	$(METAL_TEST_ENV) $(TEST_GGUF_MOE_NEMOTRON_E512) $(TEST_PRODUCTION_LIB)
 	$(METAL_TEST_ENV) $(TEST_EXPERT_STORE) $(LIB)
 	$(METAL_TEST_ENV) $(TEST_KV_BLOCK_CACHE) $(LIB)
 	$(METAL_TEST_ENV) $(TEST_KV_HISTORY_STREAM) $(LIB)
@@ -726,6 +763,8 @@ test-engine-metal: $(TEST_METAL_TARGETS)
 	$(METAL_TEST_ENV) $(TEST_ATTENTION_PLAN) $(TEST_PRODUCTION_LIB)
 	$(METAL_TEST_ENV) $(TEST_ATTENTION_VARIANTS) $(TEST_PRODUCTION_LIB)
 	$(METAL_TEST_ENV) $(TEST_ROPE_TABLES) $(LIB)
+	$(METAL_TEST_ENV) $(TEST_NORMALIZATION) $(LIB)
+	$(METAL_TEST_ENV) $(TEST_MAMBA2) $(LIB)
 	$(METAL_TEST_ENV) $(TEST_LINEAR_PLAN) $(LIB)
 	$(METAL_TEST_ENV) $(TEST_RESOURCES_TEST) $(LIB)
 	$(METAL_TEST_ENV) $(TEST_KV_PAGE_TIER_TEST) $(TEST_METAL_BACKEND_LIB)
@@ -741,10 +780,12 @@ test-engine-metal: $(TEST_METAL_TARGETS)
 	$(METAL_TEST_ENV) $(TEST_DRAFT_ATTENTION_TEST) $(LIB)
 	$(METAL_TEST_ENV) $(TEST_GDN_DECODE_TEST) $(LIB)
 	$(METAL_TEST_ENV) $(TEST_DRAFT_SELECTOR_TEST) $(LIB)
+	$(METAL_TEST_ENV) $(TEST_LILICORR_TEST) $(LIB)
 	$(METAL_TEST_ENV) $(TEST_TARGET_SAMPLING_TEST) $(LIB)
 	$(METAL_TEST_ENV) $(TEST_TARGET_SAMPLING_WIDE_TEST) $(LIB)
 	$(METAL_TEST_ENV) $(TEST_VISION_METAL_TEST) $(LIB)
 	$(METAL_TEST_ENV) $(TEST_VISION_ATTENTION_TEST) $(LIB)
+	$(METAL_TEST_ENV) $(TEST_VISION_RADIO_TEST) $(LIB)
 	$(METAL_TEST_ENV) $(TEST_METAL_BACKEND_TEST) $(TEST_METAL_BACKEND_LIB)
 	$(METAL_TEST_ENV) $(TEST_HANDOFF_TEST) $(TEST_METAL_BACKEND_LIB)
 	$(METAL_TEST_ENV) $(TEST_PRESSURE_SERVING) $(LIB)
@@ -753,6 +794,8 @@ test-engine-metal: $(TEST_METAL_TARGETS)
 # The vision fixture is named after the installed model's family, which its
 # model.json records. Nothing is printed when the installation serves no
 # vision (vision_format none: --language-only, or a GGUF without an mmproj).
+# The second oracle run keeps the state in bf16 where the family's state takes
+# it (install/families.py), and in fp32 otherwise.
 # ORACLE_ARGS: options every run of the runtime oracle takes besides its own,
 # as the oracle takes them (model_runtime_oracle_test.mm), an option given
 # twice taking its later value. A block-sparse target's spill check runs in
@@ -775,16 +818,24 @@ ORACLE_ARGS ?=
 VISION_FIXTURE_FAMILY := import json, pathlib, sys; \
 	model = json.loads((pathlib.Path(sys.argv[1]) / "model.json").read_text()); \
 	print("" if model["vision_format"] == "none" else model["family"].lower())
+ORACLE_STATE_FORMAT := import json, pathlib, sys; \
+	from install import families; \
+	model = json.loads((pathlib.Path(sys.argv[1]) / "model.json").read_text()); \
+	print("bf16" if "bf16" in families.named(model["family"]).state_formats else "fp32")
 test-real: preflight $(TARGET) $(TEST_MODEL_RUNTIME_ORACLE) \
 		$(TEST_VISION_ENCODER_TEST) $(LIB)
 	family=$$($(BUILD_ID_PYTHON) -c '$(VISION_FIXTURE_FAMILY)' "$(MODEL_ROOT)") && \
 		if test -n "$$family"; then \
 			$(METAL_TEST_ENV) $(TEST_VISION_ENCODER_TEST) $(LIB) "$(MODEL_ROOT)" \
-				dev/tests/fixtures/vision-parity/$$family; \
+				dev/tests/fixtures/vision-parity/$$family && \
+			if test -d dev/tests/fixtures/vision-parity/$$family-video; then \
+				$(METAL_TEST_ENV) $(TEST_VISION_ENCODER_TEST) $(LIB) "$(MODEL_ROOT)" \
+					dev/tests/fixtures/vision-parity/$$family-video; fi; \
 		else echo "vision parity: skipped, the installation serves text only"; fi
 	$(TEST_MODEL_RUNTIME_ORACLE) $(LIB) "$(MODEL_ROOT)" --ane-ffn-share 0 $(ORACLE_ARGS)
-	$(TEST_MODEL_RUNTIME_ORACLE) $(LIB) "$(MODEL_ROOT)" --ane-ffn-share 0 --state-format bf16 \
-		--spill-buffers 2 $(ORACLE_ARGS)
+	state=$$($(PYTHON) -c '$(ORACLE_STATE_FORMAT)' "$(MODEL_ROOT)") && \
+		$(TEST_MODEL_RUNTIME_ORACLE) $(LIB) "$(MODEL_ROOT)" --ane-ffn-share 0 --state-format $$state \
+			--spill-buffers 2 $(ORACLE_ARGS)
 	$(TEST_MODEL_RUNTIME_ORACLE) $(LIB) "$(MODEL_ROOT)" --spill-tokens 32768 --spill-window 64 $(ORACLE_ARGS)
 
 .PHONY: benchmark-backend \

@@ -163,10 +163,12 @@ static inline void gguf_repack_group(device const uchar *row, uint fmt, uint G, 
       for (uint i = 0; i < f.meta_bytes; ++i) meta[i] = blk[i];
       break;
     }
-    case GGUF_FMT_NVFP4: {   // {E4M3 scales[16], g, codes[128]}: element e of group j in bits 4 (e % 2) of codes[16 j + e / 2]
-      for (uint e = 0; e < 32; ++e) lo[quant_slot(e)] = (blk[QUANT_NVFP4_CODES + 16 * j + e / 2] >> (4 * (e % 2))) & 15;
+    case GGUF_FMT_NVFP4: case GGUF_FMT_NVFP4G64: {   // {E4M3 scales[16 | 4], g, codes[128 | 32]}, the meta unit
+                                                     // then the codes: element e of group j in bits 4 (e % 2) of
+                                                     // codes[16 j + e / 2]
+      for (uint e = 0; e < 32; ++e) lo[quant_slot(e)] = (blk[f.meta_bytes + 16 * j + e / 2] >> (4 * (e % 2))) & 15;
       gguf_store_bits(lo, 4, out0);
-      if (j == 0) for (uint i = 0; i < QUANT_NVFP4_CODES; ++i) meta[i] = blk[i];   // the scales and g
+      if (j == 0) for (uint i = 0; i < f.meta_bytes; ++i) meta[i] = blk[i];   // the scales and g
       break;
     }
     case GGUF_FMT_FP8: {   // {g, E4M3 values[256]}

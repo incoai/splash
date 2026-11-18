@@ -69,7 +69,7 @@ class UpstreamTest(unittest.TestCase):
         return output.getvalue(), warnings.getvalue()
 
     def test_every_family_names_its_own_draft_repository(self):
-        repos = [family.draft_repo for family in families.FAMILIES]
+        repos = [family.draft_repo for family in families.FAMILIES if family.draft_repo]
         for repo in repos:
             with self.subTest(repo=repo):
                 self.assertEqual(models.validate_repo_id(repo), repo)
@@ -91,11 +91,12 @@ class UpstreamTest(unittest.TestCase):
                     family,
                 )
 
-        # Qwen3.8-Flash-Next and Flint load from a GGUF: the config the
-        # installer derives from it and its header name the family, with and
-        # without its draft (Flint's flat config, its release's keys, and a
-        # test draft naming one of its reserved tokens as its mask), and
-        # another family's draft is refused.
+        # Qwen3.8-Flash-Next, Flint and Nemotron 3.5 Bolt and Super load from a
+        # GGUF: the config the installer derives from it and its header name
+        # the family, with and without its draft (Flint's flat config, its
+        # release's keys, and a test draft naming one of its reserved tokens
+        # as its mask; Bolt's, the config converted from its LiLiCorr GGUF),
+        # and another family's draft is refused.
         def headers(family):
             directory = self.root / family.name / "target"
             directory.mkdir(parents=True, exist_ok=True)
@@ -130,6 +131,24 @@ class UpstreamTest(unittest.TestCase):
                 configs / "config.json",
                 draft=draft_dir(self.root / "draft", DENSE) / "config.json",
                 **gguf_check,
+            )
+        # Nemotron's per-layer top-k is in no tensor's shape: a Bolt header
+        # taking 8 experts where the layout takes 9 is refused by its arrays.
+        bolt = families.named("Nemotron-3.5-Bolt")
+        values = fixture(family=bolt)
+        key = "nemotron_h_moe.expert_used_count"
+        values[key] = [8 if count else 0 for count in values[key]]
+        directory = self.root / "bolt-top-k" / "target"
+        directory.mkdir(parents=True)
+        write_target(directory / "model.gguf", values, tensor_table(bolt))
+        with self.assertRaisesRegex(
+            models.ModelError, "does not match the target: expert_used_count"
+        ):
+            upstream.check_model(
+                "gguf",
+                "none",
+                CONFIGS / bolt.name.lower() / "config.json",
+                gguf_headers=directory,
             )
         # A differing size or model type is another model, whatever the
         # repository is called; the engine names it. A field a family's

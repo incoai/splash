@@ -493,6 +493,27 @@ class ProtocolPythonTests(unittest.TestCase):
                     lambda invalid=invalid: p.serialize_message(invalid),
                 )
 
+    def test_pruned_video_text_cuts_are_ordered_within_its_text(self):
+        span = p.ImageSpan(0, 3, 2, 2, 1, 2, frames=2, tubelets=2, text_tokens=1)
+        grids = bytes(span.pixel_bytes - 8)
+
+        def request(*cuts):
+            return replace(
+                example_request(),
+                prompt_tokens=tuple(range(span.tokens + 1)),
+                image_spans=(span,),
+                image_pixels=grids + struct.pack("<2I", *cuts),
+            )
+
+        p.serialize_message(request(0, 1))
+        for cuts in ((1, 0), (0, 2)):
+            with self.subTest(cuts=cuts):
+                self.assert_protocol_error(
+                    p.FailureClass.REQUEST_ERROR,
+                    p.IssueCode.INVALID_COUNT,
+                    lambda cuts=cuts: p.serialize_message(request(*cuts)),
+                )
+
     def test_request_frame_copies_pixels_once(self):
         span = p.ImageSpan(1, 56 * 48, 112, 96, 1, 2)
         request = replace(
@@ -769,11 +790,11 @@ class ProtocolPythonTests(unittest.TestCase):
             1,
         )
         self.assertEqual(
-            struct.unpack_from("<IIIIQQ", wire, span_offset),
-            (1, 1, 2, 2, 0x1111222233334444, 0x5555666677778888),
+            struct.unpack_from("<IIIIQQIII", wire, span_offset),
+            (1, 1, 2, 2, 0x1111222233334444, 0x5555666677778888, 1, 1, 0),
         )
         # The thinking end tokens follow the pixels.
-        self.assertEqual(wire[span_offset + 32 : -8], image.image_pixels)
+        self.assertEqual(wire[span_offset + 44 : -8], image.image_pixels)
         self.assertEqual(decode_client(wire), image)
 
     def test_thinking_budget_follows_the_cache_salt(self):

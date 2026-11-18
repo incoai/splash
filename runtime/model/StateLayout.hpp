@@ -104,7 +104,9 @@ struct GdnStateLayout final {
 // One ring of SPLASH_DRAFT_SLIDING_WINDOW slots per KV head for the keys and
 // one for the values of every draft layer, and the context window the rings
 // are computed from: the draft's context row (contextWidth values) of each
-// slot, in 4-bit codes (metal/abi/DraftAttention.h).
+// slot, in 4-bit codes (metal/abi/DraftAttention.h). A LiLiCorr draft's
+// rings also keep its anchor: the context row (anchorWidth bf16 values) of the
+// last position they hold, which its selector reads.
 struct DraftStateLayout final {
   static constexpr uint32_t bfloat16Bytes = 2;
 
@@ -112,6 +114,7 @@ struct DraftStateLayout final {
   uint32_t kvHeads = 0;
   uint32_t headDimension = 0;
   uint32_t contextWidth = 0;
+  uint32_t anchorWidth = 0;
 
   [[nodiscard]] constexpr bool valid() const noexcept {
     return layers && kvHeads && headDimension && contextWidth &&
@@ -121,8 +124,13 @@ struct DraftStateLayout final {
     return uint64_t{kvHeads} * SPLASH_DRAFT_SLIDING_WINDOW * headDimension *
            bfloat16Bytes;
   }
+  // In whole host pages, as the rings are, so that the rings' bytes are
+  // those their buffer takes.
+  [[nodiscard]] constexpr uint64_t anchorBytes() const noexcept {
+    return alignUp(uint64_t{anchorWidth} * bfloat16Bytes);
+  }
   [[nodiscard]] constexpr uint64_t ringBytes() const noexcept {
-    return uint64_t{layers} * 2 * tensorBytes();
+    return uint64_t{layers} * 2 * tensorBytes() + anchorBytes();
   }
   [[nodiscard]] constexpr uint64_t windowBytes() const noexcept {
     return draft_context_window_bytes(contextWidth);
@@ -141,8 +149,10 @@ struct CompositeStateLayout final {
   GdnStateLayout target;
   DraftStateLayout draft;
 
+  // A target without a draft has no rings and no context window: an empty
+  // draft layout (DFlashDraftLayout::present).
   [[nodiscard]] constexpr bool valid() const noexcept {
-    return target.valid() && draft.valid();
+    return target.valid() && (draft == DraftStateLayout{} || draft.valid());
   }
   [[nodiscard]] constexpr uint64_t laneBytes() const noexcept {
     return kLaneGdnCells * target.cellBytes() + draft.ringBytes() +

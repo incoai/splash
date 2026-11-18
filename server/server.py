@@ -1373,6 +1373,12 @@ def main():
                 f"{args.model} is not prepared as a model of a family this "
                 "release serves: prepare it again"
             )
+        if args.state_format not in family.state_formats:
+            raise ModelError(
+                f"{args.model} keeps its recurrent state in "
+                f"{' or '.join(family.state_formats)} only: serve it without "
+                f"--state-format {args.state_format}"
+            )
         if args.reasoning_effort is not None and not (
             family.chat_format.reasoning_switch
         ):
@@ -1473,6 +1479,10 @@ def main():
             chat_format=family.chat_format,
             sampling_defaults=asdict(family.sampling),
             max_image_pixels=args.max_image_pixels,
+            video_decoder=args.binary,
+            video_fps=args.video_fps,
+            video_max_frames=args.video_max_frames,
+            video_pruning=args.video_pruning,
             thinking_codec=thinking_codec,
             response_store=dialects.responses.ResponseStore(),
             served_model_names=args.served_model_name,

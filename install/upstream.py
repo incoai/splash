@@ -18,12 +18,13 @@ from __future__ import annotations
 import json
 import os
 import re
+import struct
 import tempfile
 from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 
-from . import assembly, families, gguf, hub, models
+from . import assembly, dflash_gguf, families, gguf, hub, models
 
 # The tokenizer files an MLX target may supply, linked when present.
 TOKENIZER_FILES = (
@@ -419,7 +420,7 @@ def gguf_target(repo, names, scratch, *, projector=None):
     if projector is not None and family.vision:
         name, vision_header = projector(repo)
         try:
-            _validate_processor(gguf.processor_config(vision_header))
+            _validate_processor(gguf.processor_config(vision_header), family)
             config.write_bytes(
                 models.json_bytes(gguf.model_config(headers[0], vision_header))
             )
@@ -460,7 +461,7 @@ def mlx_target(repo, language_only):
         # The text passed, so a refusal of the tower's processor, shards or
         # configuration refuses the vision alone.
         try:
-            _validate_processor(_image_processor(repo))
+            _validate_processor(_image_processor(repo), family)
             shards = _weight_files(repo, VISION_TOWER)
         except models.ModelError as error:
             raise models.VisionError(str(error)) from None
@@ -543,18 +544,37 @@ def _safetensors_tensors(repo, name):
     return set(header) - {"__metadata__"}
 
 
-def _validate_processor(config):
-    """Splash prepares images one way (server/images.py): 16-pixel patches in
-    two temporal slices, merged 2x2 and normalized to [-1, 1]. A processor
-    configuration asking for another is rejected before any download; it is
-    not installed, since nothing reads it."""
-    expected = {
+def _f32(values):
+    return [struct.unpack("<f", struct.pack("<f", value))[0] for value in values]
+
+
+# How Splash prepares a family's images (server/images.py, by its chat
+# format's image_resize), 16-pixel patches merged 2x2: Qwen's in two temporal
+# slices normalized to [-1, 1]; Nemotron Omni's in one, with CLIP's
+# normalization as its GGUF projector stores it, in float32.
+PROCESSORS = {
+    "qwen": {
         "patch_size": 16,
         "temporal_patch_size": 2,
         "merge_size": 2,
         "image_mean": [0.5, 0.5, 0.5],
         "image_std": [0.5, 0.5, 0.5],
-    }
+    },
+    "nemotron": {
+        "patch_size": 16,
+        "temporal_patch_size": 1,
+        "merge_size": 2,
+        "image_mean": _f32([0.48145466, 0.4578275, 0.40821073]),
+        "image_std": _f32([0.26862954, 0.26130258, 0.27577711]),
+    },
+}
+
+
+def _validate_processor(config, family):
+    """Splash prepares a family's images one way (PROCESSORS). A processor
+    configuration asking for another is rejected before any download; it is
+    not installed, since nothing reads it."""
+    expected = PROCESSORS[family.chat_format.image_resize]
     if any(config.get(key) != value for key, value in expected.items()):
         raise models.ModelError("unsupported vision preprocessing configuration")
 
@@ -818,6 +838,9 @@ def publish(models_root, link, record, files):
             )
             files = files | derived
             records |= _file_records(previous, derived.values())
+        derived = assembly.derived_draft(models_root, files, records)
+        files = files | derived
+        records |= _file_records(previous, derived.values())
         record["files"] = {name: records[path] for name, path in sorted(files.items())}
         # A new installation requires its pins before it is published; its
         # older pins are retired once it is, in the repositories the
@@ -873,6 +896,12 @@ def _changes(installed, family, draft):
         "metadata"
     ] != assembly.metadata_key(installed["files"]):
         changes.append("the GGUF metadata adapter changed")
+    key = assembly.draft_key(installed["files"])
+    if (
+        key
+        and f"/.metadata/{key}/" not in installed["files"]["draft/config.json"]["path"]
+    ):
+        changes.append("the draft converter changed")
     return changes
 
 
@@ -949,6 +978,9 @@ def draft_files(repo, target):
     download only once the engine accepts its configuration with the
     target's (check_model)."""
     family = target.family
+    ggufs = sorted(n for n in repo.files if "/" not in n and n.endswith(".gguf"))
+    if "config.json" not in repo.files and len(ggufs) == 1:
+        return _gguf_draft(repo, ggufs[0], target)
     try:
         if "config.json" not in repo.files:
             raise models.ModelError("no config.json")
@@ -958,7 +990,13 @@ def draft_files(repo, target):
             f"{repo.name} does not contain a DFlash2 checkpoint for {family.name}"
             f" ({error})"
         ) from error
-    config = repo.file("config.json")
+    _check_draft(repo, target, repo.file("config.json"))
+    mask = {DRAFT_MASK_EMBEDDING} & set(repo.files)
+    downloaded = repo.download({"config.json", *weights, *mask})
+    return {"draft/" + name: path for name, path in downloaded.items()}
+
+
+def _check_draft(repo, target, config):
     try:
         check_model(
             target.format,
@@ -969,9 +1007,24 @@ def draft_files(repo, target):
         )
     except models.ModelError as error:
         raise models.ModelError(
-            f"{repo.name}'s draft configuration is incompatible with {family.name}: "
-            f"{error}"
+            f"{repo.name}'s draft configuration is incompatible with "
+            f"{target.family.name}: {error}"
         ) from error
-    mask = {DRAFT_MASK_EMBEDDING} & set(repo.files)
-    downloaded = repo.download({"config.json", *weights, *mask})
-    return {"draft/" + name: path for name, path in downloaded.items()}
+
+
+def _gguf_draft(repo, name, target):
+    """A draft released as a LiLiCorr GGUF, the one GGUF of repo: its
+    configuration, derived from its header, checked before the download;
+    publish derives its checkpoint (assembly.derived_draft)."""
+    with repo.open(name) as stream:
+        header = gguf.Metadata(stream, tensors=True)
+    try:
+        config = dflash_gguf.config_bytes(header)
+    except models.ModelError as error:
+        raise models.ModelError(f"{repo.name}'s {name}: {error}") from error
+    with tempfile.TemporaryDirectory(prefix="splash-draft-") as scratch:
+        path = Path(scratch) / "config.json"
+        path.write_bytes(config)
+        _check_draft(repo, target, path)
+    downloaded = repo.download({name})
+    return {"draft/" + name: downloaded[name]}

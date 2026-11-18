@@ -407,10 +407,10 @@ class StatusRouteTests(HarnessTestCase):
                         model["limits"],
                         {
                             "request_bytes": serve_options.DEFAULT_MAX_REQUEST_BYTES,
-                            "images": 64,
+                            "images": 256,
                             "image_bytes": 32 * 1024 * 1024,
                             "pdf_bytes": 64 * 1024 * 1024,
-                            "pdf_pages": 64,
+                            "pdf_pages": 256,
                         },
                     )
                     status, _, detail = harness.request(

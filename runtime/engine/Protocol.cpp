@@ -337,7 +337,7 @@ std::optional<ProtocolIssue> validateRequest(const RequestFrame &request,
   }
   if (auto error = imageSpansValidationError(request.imageSpans,
                                              request.promptTokens.size(),
-                                             request.imagePixels.size())) {
+                                             request.imagePixels)) {
     return invalid(IssueCode::InvalidCount, std::string(*error));
   }
   if (request.generationPromptTokens >= request.promptTokens.size()) {
@@ -838,7 +838,8 @@ ProtocolResult<ClientMessage> decodeRequest(std::vector<uint8_t> &&payload,
     if (!reader.u32(span.offset) || !reader.u32(span.tokens) ||
         !reader.u32(span.gridHeight) || !reader.u32(span.gridWidth) ||
         !reader.u64(span.digestLo) || !reader.u64(span.digestHi) ||
-        !checkedAdd(pixelBytes, span.pixelBytes(), pixelBytes)) {
+        !reader.u32(span.frames) || !reader.u32(span.tubelets) ||
+        !reader.u32(span.textTokens) || !checkedAdd(pixelBytes, span.pixelBytes(), pixelBytes)) {
       return failure<ClientMessage>(
           requestIssue(IssueCode::InvalidPayloadLength, request.requestId,
                        "image span payload is malformed"));

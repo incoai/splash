@@ -5,12 +5,14 @@
 #include "WeightStore.hpp"
 #include "ops/DraftAttention.hpp"
 #include "ops/DraftSelector.hpp"
+#include "ops/LiLiCorr.hpp"
 #include "ops/ExecutionPlans.hpp"
 #include "ops/Linear.hpp"
 #include "ops/Normalization.hpp"
 
 #include <cstdint>
 #include <array>
+#include <optional>
 #include <memory>
 #include <span>
 #include <string_view>
@@ -23,6 +25,9 @@ struct DFlashDraftRingLayer final {
   metal::MetalBuffer keys;
   // V is [head][dimension][ring_position].
   metal::MetalBuffer values;
+  // A LiLiCorr draft's anchor (DraftStateLayout::anchorBytes), on its first
+  // layer only.
+  metal::MetalBuffer anchor;
 };
 
 // A lane's draft rings: every draft layer's keys and values of the last
@@ -85,13 +90,26 @@ struct DFlashDraftLayout final {
   float rotaryTheta = 0.0F;
   uint32_t selectorRank = 0;
   uint32_t kvHeads = 0;
+  // The positions a query row sees (sliding_window): the ring's window, or
+  // 1024 for a LiLiCorr draft, whose attention also has a sink logit per
+  // query head (attention_sink_bias).
+  uint32_t slidingWindow = SPLASH_DRAFT_SLIDING_WINDOW;
+  bool attentionSinks = false;
+  // A LiLiCorr draft (Bolt's): its selector is a small network over each
+  // position's eight best candidates (LiLiCorrWeights) instead of codebooks.
+  bool lilicorr = false;
   // The target layers whose output rows the draft reads, ascending: the
   // first targetLayerCount of targetLayers, targetHiddenSize() values a row.
   std::array<uint32_t, ExecutionLimits::maximumDraftTargetLayers> targetLayers{};
   uint32_t targetLayerCount = 0;
 
+  // A model without a draft (Nemotron-H) has the empty layout: its runtime
+  // verifies only each lane's anchor row, and nothing reads or writes the
+  // draft's state.
+  [[nodiscard]] constexpr bool present() const noexcept { return layers != 0; }
   [[nodiscard]] constexpr DraftStateLayout stateLayout() const noexcept {
-    return {layers, kvHeads, attentionHeadDimension, hiddenSize};
+    if (!present()) return {};
+    return {layers, kvHeads, attentionHeadDimension, hiddenSize, lilicorr ? hiddenSize : 0};
   }
   [[nodiscard]] constexpr std::span<const uint32_t> targetLayerIds() const noexcept {
     return {targetLayers.data(), targetLayerCount};
@@ -101,7 +119,7 @@ struct DFlashDraftLayout final {
   [[nodiscard]] constexpr ops::DraftAttentionShape attentionShape() const noexcept {
     return {hiddenSize, dynamicSize, qkvSize, attentionSize,
             attentionSize / attentionHeadDimension, kvHeads,
-            attentionHeadDimension};
+            attentionHeadDimension, slidingWindow};
   }
   // The key and value columns of the fused QKV projection, all the context
   // writers read.
@@ -164,6 +182,8 @@ struct DFlashContextBuffers final {
                          ExecutionLimits::maximumBatchWidth>> persistentKeys;
   std::vector<std::array<metal::MetalBuffer,
                          ExecutionLimits::maximumBatchWidth>> persistentValues;
+  // A LiLiCorr draft's lanes' anchor rows (DFlashDraftRingLayer::anchor).
+  std::array<metal::MetalBuffer, ExecutionLimits::maximumBatchWidth> anchors{};
   // Each lane's context window, which keeps the rows the lane retained as
   // its rings do; none for a lane whose decode leaves its window behind
   // (Model::capturesInDecode).
@@ -209,6 +229,8 @@ struct DFlashDraftLayerWeights final {
   ops::Projection qkvProjection;
   metal::MetalBuffer queryNorm;
   metal::MetalBuffer keyNorm;
+  // bf16 [query heads], with attentionSinks.
+  metal::MetalBuffer sinks;
   ops::Projection outputProjection;
   ops::NormWeights postAttentionNorm;
   metal::MetalBuffer mlpConvolution;
@@ -230,6 +252,8 @@ struct DFlashDraftWeights final {
   // The mask token's BF16 embedding the checkpoint ships, or none
   // (kDraftMaskEmbedding).
   metal::MetalBuffer maskEmbedding;
+  // A LiLiCorr draft's selector, in place of the projection and codebooks.
+  std::optional<ops::LiLiCorrWeights> lilicorr;
   std::vector<WeightFileRecord> files;
   uint64_t actualAllocatedBytes = 0;
 };
@@ -313,8 +337,19 @@ public:
   // A step's draft layers and its logits over its vocabulary, then its
   // proposals from them.
   void addDecode(metal::CommandGraph &graph, DFlashDecodeBuffers buffers, const DFlashDraftStep &step) const;
+  // A LiLiCorr draft's selection also reads addDecode's final hidden rows,
+  // the target's token table and each lane's anchor row (ops::LiLiCorr).
   void addSelection(metal::CommandGraph &graph, const ops::DraftSelectorBuffers &buffers,
-                    const DFlashDraftStep &step) const;
+                    const DFlashDraftStep &step, const metal::MetalBuffer &finalHidden = {},
+                    const ops::EmbeddingWeights *tokenEmbedding = nullptr,
+                    std::span<const metal::MetalBuffer> anchorRows = {}) const;
+  [[nodiscard]] bool lilicorr() const noexcept { return weights_.lilicorr.has_value(); }
+  // The bytes of a LiLiCorr selector's scratch (allocateLiLiCorr) for
+  // `weights`, each buffer's in whole host pages; zero without one. The
+  // memory plan charges them to shared decode.
+  [[nodiscard]] static uint64_t liLiCorrBytes(const DFlashDraftWeights &weights, const ops::ExecutionPlans &operators);
+  // What allocateLiLiCorr allocated, as Metal counts it.
+  [[nodiscard]] uint64_t allocatedLiLiCorrBytes() const noexcept;
   // Sets each of `lanes` lanes' mask rows of the draft input `rows` (all but
   // its anchor's, row 0 of its draftQueryRows) to the mask embedding the
   // checkpoint ships; without one they keep the target table's row.
@@ -336,6 +371,7 @@ private:
   // buffers' hidden rows, written to the spans' rings.
   void addContextKv(metal::CommandGraph &graph, const DFlashPrefillBuffers &buffers,
                     uint32_t rows, std::span<const DFlashPrefillSpan> spans) const;
+  void allocateLiLiCorr();
 
   // The head of the logits over `vocabulary`.
   [[nodiscard]] const ops::Projection &head(ops::DraftVocabulary vocabulary) const;
@@ -351,6 +387,8 @@ private:
   // Each layer's key and value rows of its QKV projection, views of its
   // planes, which the context writers project with.
   std::vector<ops::Projection> contextKvProjections_;
+  // A LiLiCorr selector's scratch for the widest batch.
+  std::optional<ops::LiLiCorrScratch> lilicorr_;
 };
 
 } // namespace splash::model

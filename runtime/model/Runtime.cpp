@@ -314,6 +314,11 @@ struct Runtime::Impl {
     uint64_t digestHi = 0;
     uint32_t gridHeight = 0;
     uint32_t gridWidth = 0;
+    uint32_t frames = 1;
+    // A pruned video's layout: its rows depend on more than its pixels.
+    uint32_t tokens = 0;
+    uint32_t tubelets = 1;
+    uint32_t textTokens = 0;
 
     bool operator==(const ImageKey &) const = default;
   };
@@ -332,6 +337,9 @@ struct Runtime::Impl {
   struct ImageRows final {
     ImageKey key;
     MetalBuffer pixels;
+    // A pruned video's encoded tubelets, text rows and EVS flags until its
+    // encode completes (pruningBytes).
+    MetalBuffer pruning;
     MetalBuffer embeddings;
     bool encoding = false;
     bool encoded = false;
@@ -548,7 +556,9 @@ struct Runtime::Impl {
   ModelTelemetry counters;
   ops::Sampling sampling;
   std::unique_ptr<QwenTarget> targetModel;
-  DFlashDraft draftModel;
+  // None for a model without a draft (DFlashDraftLayout::present): each
+  // cycle then verifies only its lanes' anchors.
+  std::optional<DFlashDraft> draftModel;
   // The acceptance model and costs a decode cycle's rows follow
   // (--verify-rows auto): its step's rows, by the costs the start measures
   // (StepCosts), each of which a lane holds it verifies, or for a target
@@ -723,8 +733,6 @@ struct Runtime::Impl {
                                                 geometry.prefillChunks);
                         },
                         value.model.target)),
-        draftModel(value.model.draft, value.backend, operators, targetModel->vocabularyProjection(),
-                   geometry.target.draftVocabulary),
         aneFfn(value.aneFfn), blockCache(value.blockCache), historyStream(value.historyStream),
         limits(splash::model::commandLimits(geometry, aneFfn ? aneFfn->minimumRows() : 0)) {
     if (states.layout() != model.stateLayout(states.layout().target.format, states.layout().target.cachedCodes) ||
@@ -732,8 +740,19 @@ struct Runtime::Impl {
       throw std::invalid_argument(
           "model runtime resources do not match the loaded model");
     }
+    if (value.model.draft.layout.present())
+      draftModel.emplace(value.model.draft, value.backend, operators, targetModel->vocabularyProjection(),
+                         geometry.target.draftVocabulary);
     prefillArena = std::make_unique<PrefillArena>(backend, geometry, operators);
     decodeArena = std::make_unique<DecodeArena>(backend, geometry, operators);
+    // Without a draft each cycle's trees grow from the anchors alone, but the
+    // tree kernel still reads every candidate table: zeros, so that what it
+    // computes of them, which no row takes, is finite.
+    if (!draftModel)
+      for (const DecodeTensor tensor : {DecodeTensor::Candidates, DecodeTensor::Unary, DecodeTensor::TopPartialValues}) {
+        const MetalBuffer table = decodeArena->batchSlice(tensor, kLaneCount);
+        std::memset(table.contents(), 0, table.sizeBytes());
+      }
     penaltyTable =
         decodeArena->batchSlice(DecodeTensor::PenaltyState, kLaneCount);
     // A decode step's classes, up to the rows a step runs in one pass: a
@@ -749,7 +768,7 @@ struct Runtime::Impl {
     if (model.expertStore())
       mostStepRows = std::min(kDecodeStepRows, ExpertStore::cycleRows());
     stepClasses = operators.decodeRowClasses(mostStepRows, moe);
-    if (value.verifyRows == VerifyRows::Auto) {
+    if (value.verifyRows == VerifyRows::Auto && draftModel) {
       verifyBudget.emplace();
       if (model.expertStore()) {
         costLine.emplace(stepClasses);
@@ -850,12 +869,39 @@ struct Runtime::Impl {
   }
 
   uint64_t embeddingBytes(const ImageSpan &span) const {
-    return uint64_t{ops::Vision::embeddingRows(span.grid())} *
+    return uint64_t{span.pruned() ? span.tokens : ops::Vision::embeddingRows(span.grid())} *
            geometry.target.hiddenSize * sizeof(uint16_t);
   }
 
+  ops::VideoPruningShape pruningShape(const ImageSpan &span) const noexcept {
+    return {span.tubelets, span.grid(), geometry.target.hiddenSize, span.keptRows(), span.textTokens};
+  }
+
+  // A pruned video's encoded tubelets, its text rows, then its EVS
+  // dissimilarities and keep flags; nothing for any other span.
+  std::array<uint64_t, 4> pruningLayout(const ImageSpan &span) const noexcept {
+    if (!span.pruned()) return {};
+    const uint64_t row = uint64_t{geometry.target.hiddenSize} * sizeof(uint16_t);
+    const uint64_t flags = ops::VideoPruning::flagBytes(pruningShape(span));
+    return {uint64_t{span.tubelets} * ops::Vision::embeddingRows(span.grid()) * row,
+            uint64_t{span.textTokens} * row, flags, flags};
+  }
+
+  uint64_t pruningBytes(const ImageSpan &span) const noexcept {
+    uint64_t bytes = 0;
+    for (const uint64_t part : pruningLayout(span)) bytes += part;
+    return bytes;
+  }
+
+  // The pixels the engine stages: a pruned video's also hold its text's
+  // token ids, after its cuts.
+  static uint64_t stagedPixelBytes(const ImageSpan &span) noexcept {
+    return span.pixelBytes() + uint64_t{span.textTokens} * sizeof(uint32_t);
+  }
+
   static ImageKey imageKey(const ImageSpan &span) noexcept {
-    return {span.digestLo, span.digestHi, span.gridHeight, span.gridWidth};
+    return {span.digestLo, span.digestHi, span.gridHeight, span.gridWidth, span.frames,
+            span.tokens, span.tubelets, span.textTokens};
   }
 
   // The rows of an identical image that something still holds, moved to the
@@ -1080,7 +1126,7 @@ struct Runtime::Impl {
         rows = std::make_shared<ImageRows>();
         rows->key = imageKey(span);
         imageRows.insert_or_assign(rows->key, rows);
-        bytes += span.pixelBytes() + embeddingBytes(span);
+        bytes += stagedPixelBytes(span) + embeddingBytes(span) + pruningBytes(span);
       } else if (rows->embeddings && std::ranges::find(shared, rows) == shared.end()) {
         shared.push_back(rows);
       }
@@ -1103,9 +1149,15 @@ struct Runtime::Impl {
         if (image.rows && !image.rows->embeddings) {
           ImageRows &rows = *image.rows;
           rows.pixels = backend.allocateBuffer(
-              span.pixelBytes(), BufferStorage::Shared, "image pixels");
-          std::memcpy(contents<uint8_t>(rows.pixels, "image pixels"), pixels,
-                      static_cast<size_t>(span.pixelBytes()));
+              stagedPixelBytes(span), BufferStorage::Shared, "image pixels");
+          uint8_t *staged = contents<uint8_t>(rows.pixels, "image pixels");
+          std::memcpy(staged, pixels, static_cast<size_t>(span.pixelBytes()));
+          // A pruned video's text is its span's first prompt tokens.
+          if (span.pruned()) {
+            std::memcpy(staged + span.pixelBytes(), request.prompt.data() + span.offset,
+                        size_t{span.textTokens} * sizeof(uint32_t));
+            rows.pruning = backend.allocateBuffer(pruningBytes(span), BufferStorage::Private, "video pruning");
+          }
           rows.embeddings = backend.allocateBuffer(
               embeddingBytes(span), BufferStorage::Private, "image embeddings");
         }
@@ -1153,7 +1205,10 @@ struct Runtime::Impl {
       if (!rows.encoded && !rows.encoding) {
         if (!vision)
           throw std::logic_error("image request has no vision encoder");
-        vision->encode(encodes, image.span.grid(), rows.pixels, rows.embeddings);
+        if (image.span.pruned())
+          encodePrunedVideo(encodes, image.span, rows);
+        else
+          vision->encode(encodes, image.span.grid(), rows.pixels, rows.embeddings);
         rows.encoding = true;
         ++counters.imageEncodes;
       }
@@ -1164,6 +1219,30 @@ struct Runtime::Impl {
           {rowBegin + static_cast<uint32_t>(begin - chunkBegin), width, 0},
           static_cast<uint32_t>(end - begin), width);
     }
+  }
+
+  // A pruned video's tubelets one by one into its staging rows, its text's
+  // token rows, then EVS from them into its span's rows.
+  void encodePrunedVideo(CommandGraph &encodes, const ImageSpan &span, ImageRows &rows) {
+    const ops::ImageGrid grid = span.grid();
+    const auto layout = pruningLayout(span);
+    std::array<MetalBuffer, 4> parts;
+    uint64_t cursor = 0;
+    for (size_t part = 0; part < parts.size(); ++part) {
+      parts[part] = backend.view(rows.pruning, cursor, layout[part]);
+      cursor += layout[part];
+    }
+    const uint64_t tubeletRows = layout[0] / span.tubelets;
+    for (uint32_t tubelet = 0; tubelet < span.tubelets; ++tubelet)
+      vision->encode(encodes, grid, backend.view(rows.pixels, tubelet * grid.pixelBytes(), grid.pixelBytes()),
+                     backend.view(parts[0], tubelet * tubeletRows, tubeletRows));
+    const uint64_t cuts = uint64_t{span.tubelets} * grid.pixelBytes();
+    targetModel->addEmbedding(encodes,
+                              backend.view(rows.pixels, span.pixelBytes(), uint64_t{span.textTokens} * sizeof(uint32_t)),
+                              parts[1], span.textTokens);
+    ops::VideoPruning::add(encodes, pruningShape(span), parts[0], parts[1],
+                           backend.view(rows.pixels, cuts, uint64_t{span.tubelets} * sizeof(uint32_t)), parts[2],
+                           parts[3], rows.embeddings);
   }
 
   // The request's next 64 random bits: splitmix64 of its seed and counter.
@@ -1305,14 +1384,21 @@ struct Runtime::Impl {
                      uint32_t draftRows, MetalBuffer targetCos,
                      MetalBuffer targetSin, MetalBuffer draftCos,
                      MetalBuffer draftSin) const {
+    MetalBuffer draftFrequencies = prefillArena->get(PrefillTensor::DraftInverseFrequencies);
+    if (!draftModel) {
+      // No draft rows: the kernel writes none, the target's buffers stand in.
+      draftFrequencies = prefillArena->get(PrefillTensor::TargetInverseFrequencies);
+      draftCos = targetCos;
+      draftSin = targetSin;
+    }
     ops::RoPE::addTables(
         graph, std::move(targetPositions), std::move(draftPositions),
         prefillArena->get(PrefillTensor::TargetInverseFrequencies),
-        prefillArena->get(PrefillTensor::DraftInverseFrequencies),
+        std::move(draftFrequencies),
         std::move(targetCos), std::move(targetSin), std::move(draftCos),
         std::move(draftSin),
         {.target_rows = targetRows,
-         .draft_rows = draftRows,
+         .draft_rows = draftModel ? draftRows : 0,
          .target_scale = geometry.target.ropeScaling.attentionFactor()},
         kPrefillRows, geometry.target.rotaryPairs);
   }
@@ -1953,11 +2039,12 @@ struct Runtime::Impl {
   // Computes a restored lane's draft rings from its context window.
   void addDraftRebuild(CommandGraph &graph, uint32_t lane,
                        const Request::DraftRebuild &rebuild) const {
+    if (!draftModel) return;
     auto p = [&](PrefillTensor tensor) { return prefillArena->get(tensor, 0); };
     ops::RoPE::addDraftRangeTables(graph, p(PrefillTensor::DraftInverseFrequencies),
                                    p(PrefillTensor::DraftRopeCos), p(PrefillTensor::DraftRopeSin),
                                    rebuild.rows, rebuild.begin, kPrefillRows);
-    draftModel.addContextRebuild(graph, draftPrefillBuffers(*prefillArena, 0), states.window(lane),
+    draftModel->addContextRebuild(graph, draftPrefillBuffers(*prefillArena, 0), states.window(lane),
                                  states.draft(lane), rebuild.rows, rebuild.begin);
   }
 
@@ -2072,7 +2159,7 @@ struct Runtime::Impl {
   // takes the lane's window.
   void addDraftContext(CommandGraph &graph, std::span<const PrefillChunk> chunks, uint32_t index) {
     const PrefillChunk &chunk = chunks[index];
-    if (!chunk.capturedRows) return;
+    if (!draftModel || !chunk.capturedRows) return;
     std::array<DFlashPrefillSpan, kLaneCount * 2> spans{};
     uint32_t spanCount = 0;
     std::vector<DFlashWindowCapture> windowCaptures;
@@ -2100,7 +2187,7 @@ struct Runtime::Impl {
           }
         }
     }
-    draftModel.addContextPrefill(graph, draftPrefillBuffers(*prefillArena, index), chunk.capturedRows,
+    draftModel->addContextPrefill(graph, draftPrefillBuffers(*prefillArena, index), chunk.capturedRows,
                                  std::span(spans).first(spanCount), windowCaptures);
   }
 
@@ -2351,8 +2438,11 @@ struct Runtime::Impl {
   }
 
   // A target whose commit writes auxiliary state after every retained row
-  // has none of a fold's rows alone to give.
-  bool capturesInDecode() const noexcept { return !geometry.target.stateLayout.auxiliaryBytes; }
+  // has none of a fold's rows alone to give, nor has Nemotron-H's Mamba-2
+  // (single-block layers), which GDN's fold does not compute.
+  bool capturesInDecode() const noexcept {
+    return !geometry.target.stateLayout.auxiliaryBytes && !geometry.target.singleBlockLayers();
+  }
 
   // The state a decode item captures, at most one: at the page boundary
   // past the lane's position that a verify block's rows may reach within the
@@ -2413,7 +2503,8 @@ struct Runtime::Impl {
   // Lanes of storage a draft step of `lanes` lanes binds: its own
   // projections' and the target's vocabulary head's, which it shares.
   uint32_t draftStorageLanes(uint32_t lanes) const {
-    return std::max(targetModel->headStorageLanes(lanes), draftModel.decodeStorageLanes(lanes));
+    return draftModel ? std::max(targetModel->headStorageLanes(lanes), draftModel->decodeStorageLanes(lanes))
+                      : targetModel->headStorageLanes(lanes);
   }
 
   // The cycle's step (`step`): each lane's tree of the draft's proposals and
@@ -2477,8 +2568,13 @@ struct Runtime::Impl {
       // whose tokens the target selects (proposeForcedChain); a constrained
       // lane's grammar finds each row's mask along the row's path
       // (ConstrainedDecodeTicket).
-      tree.children = proposals[lane].forced ? 0 : SPLASH_TREE_CHILDREN;
-      tree.chain = std::min(proposals[lane].chain, tree.depth);
+      // Nemotron-H's Mamba-2 scans a chain alone (ops::Mamba2::addDecode): a
+      // lane takes its draft's one best child a row and no host chain beside
+      // it, which would branch.
+      // ponytail: chains alone; a tree-aware Mamba-2 scan to verify trees.
+      const bool chains = geometry.target.singleBlockLayers();
+      tree.children = proposals[lane].forced ? 0 : chains ? 1 : SPLASH_TREE_CHILDREN;
+      tree.chain = chains && !proposals[lane].forced ? 0 : std::min(proposals[lane].chain, tree.depth);
       entry.lookupChain.resize(std::min<size_t>(entry.lookupChain.size(), tree.chain));
       // Its draft steps' estimates are its policy's acceptance model's, a
       // sampled lane's learned from its verify rows' rejection sampling. A
@@ -2493,9 +2589,6 @@ struct Runtime::Impl {
         tree.noise = entry.cycleNoise;
       }
     }
-    const DFlashDraftStep draft = draftModel.step(std::span(cacheLengths).first(lanes),
-                                                  std::span(tokens).first(lanes), std::span(trees).first(lanes));
-    draftModel.addDecode(graph, std::move(buffers), draft);
     const ops::DraftSelectorBuffers selection{
         d(DecodeTensor::Logits),          d(DecodeTensor::TopPartialIds),   d(DecodeTensor::TopPartialValues),
         d(DecodeTensor::Candidates),      d(DecodeTensor::Unary),           d(DecodeTensor::SelectorHidden),
@@ -2504,7 +2597,24 @@ struct Runtime::Impl {
         d(DecodeTensor::DraftTreeDraws),  d(DecodeTensor::DraftTreeNext),   d(DecodeTensor::DraftTreeCaps),
         d(DecodeTensor::InputTokens),     d(DecodeTensor::TreeRows),        d(DecodeTensor::LaneLayout),
         d(DecodeTensor::VerifySources)};
-    draftModel.addSelection(graph, selection, draft);
+    if (!draftModel) {
+      // No draft: each lane's tree is its anchor alone (depth 0), which the
+      // tree kernel grows over the zeroed candidate tables (Impl's start).
+      const ops::DraftSelector anchorsOnly(geometry.target.vocabularySize);
+      anchorsOnly.addTree(graph, selection, anchorsOnly.requireBuffers(selection, {}, std::span(trees).first(lanes)));
+      ops::DraftSelector::addVerifyRows(graph, selection, step, floor);
+      return;
+    }
+    const DFlashDraftStep draft = draftModel->step(std::span(cacheLengths).first(lanes),
+                                                  std::span(tokens).first(lanes), std::span(trees).first(lanes));
+    draftModel->addDecode(graph, std::move(buffers), draft);
+    // A LiLiCorr draft's lanes' anchor rows (DFlashDraftRingLayer::anchor).
+    std::array<MetalBuffer, kLaneCount> anchorRows{};
+    if (draftModel->lilicorr())
+      for (uint32_t lane = 0; lane < lanes; ++lane)
+        anchorRows[lane] = states.draft(laneEntry(entries, lane).stateLane)[0].anchor;
+    draftModel->addSelection(graph, selection, draft, d(DecodeTensor::DraftFinalHidden),
+                             &targetModel->tokenEmbedding(), std::span(anchorRows).first(lanes));
     ops::DraftSelector::addVerifyRows(graph, selection, step, floor);
   }
 
@@ -2743,6 +2853,7 @@ struct Runtime::Impl {
         entries.size() != items.size()) {
       throw std::invalid_argument("invalid draft state commit batch");
     }
+    if (!draftModel) return;
     const uint32_t lanes = static_cast<uint32_t>(entries.size());
     const uint32_t storage = draftStorageLanes(lanes);
     auto d = [&](DecodeTensor tensor) {
@@ -2767,7 +2878,10 @@ struct Runtime::Impl {
     buffers.retainedRows = d(DecodeTensor::RetainedRows);
     buffers.laneRows = d(DecodeTensor::LaneLayout);
     bindDraftRings(entries, buffers.persistentKeys, buffers.persistentValues);
-    draftModel.addContextCommit(graph, std::move(buffers), std::span(startPositions).first(lanes), step);
+    if (draftModel->lilicorr())
+      for (uint32_t lane = 0; lane < lanes; ++lane)
+        buffers.anchors[lane] = states.draft(laneEntry(entries, lane).stateLane)[0].anchor;
+    draftModel->addContextCommit(graph, std::move(buffers), std::span(startPositions).first(lanes), step);
   }
 
   void encodeBatchAcceptance(CommandGraph &graph,
@@ -3778,6 +3892,7 @@ Runtime::prefillAsync(const BatchPlan &plan,
           rows.encoding = false;
           rows.encoded = true;
           rows.pixels = MetalBuffer{};
+          rows.pruning = MetalBuffer{};
         }
         // Its last row is injected: the cache owns the rows from now on, so
         // reclaim can free them while the request decodes.
@@ -3898,7 +4013,10 @@ Runtime::decodeAsync(const BatchPlan &plan,
     const ops::SamplingPolicy policy = Impl::samplingPolicy(entry);
     const std::optional<ops::ThinkingCutoff> &cutoff = policy.thinkingCutoff;
     const uint32_t left = impl_->verifyBudget ? remaining : kDecodeRows;
-    depths[lane] = std::min({left, kDecodeRows, cutoff && cutoff->row ? cutoff->row + 1 : kDecodeRows}) - 1;
+    // Without a draft, the anchor alone.
+    depths[lane] = impl_->draftModel
+                       ? std::min({left, kDecodeRows, cutoff && cutoff->row ? cutoff->row + 1 : kDecodeRows}) - 1
+                       : 0;
     proposals[lane] = impl_->proposeChain(entry, lane, policy, depths[lane]);
     curves[lane] = impl_->laneCurve(entry, proposals[lane], depths[lane]);
     // The rows the lane holds: its anchor and its tree to its depth, or, for
@@ -3954,10 +4072,12 @@ Runtime::decodeAsync(const BatchPlan &plan,
   impl_->addRopeTables(draft, {}, 0, impl_->decodeArena->batchSlice(DecodeTensor::DraftPositions, width),
                        width * kDecodeRows, {}, {}, impl_->decodeArena->batchSlice(DecodeTensor::DraftRopeCos, width),
                        impl_->decodeArena->batchSlice(DecodeTensor::DraftRopeSin, width));
-  impl_->encodeBatchEmbedding(draft, DecodeTensor::DraftInputTokens,
-                              impl_->decodeArena->batchSlice(DecodeTensor::DraftHidden0, width), width,
-                              width * kDraftRows);
-  impl_->draftModel.addMaskRows(draft, impl_->decodeArena->batchSlice(DecodeTensor::DraftHidden0, width), width);
+  if (impl_->draftModel) {
+    impl_->encodeBatchEmbedding(draft, DecodeTensor::DraftInputTokens,
+                                impl_->decodeArena->batchSlice(DecodeTensor::DraftHidden0, width), width,
+                                width * kDraftRows);
+    impl_->draftModel->addMaskRows(draft, impl_->decodeArena->batchSlice(DecodeTensor::DraftHidden0, width), width);
+  }
   impl_->encodeDraftBatchGraph(draft, entries, {logicalPositions.data(), width}, {depths.data(), width},
                                std::span(proposals).first(width), step, choice.floor);
   std::shared_ptr<SpilledKvReads> reads = impl_->decodeReads(items);
@@ -4544,8 +4664,9 @@ WarmupStepResult Runtime::warmupCompositeStateRestore() {
 
 ModelMemoryActual Runtime::actualRuntimeMemory() const {
   const QwenTargetScratchBytes target = impl_->targetModel->allocatedScratchBytes();
+  const uint64_t lilicorr = impl_->draftModel ? impl_->draftModel->allocatedLiLiCorrBytes() : 0;
   return {impl_->states.actualAllocatedBytes(), impl_->prefillArena->bytes() + target.prefill,
-          impl_->decodeArena->bytes() + target.decode, impl_->states.stagingBytes()};
+          impl_->decodeArena->bytes() + target.decode + lilicorr, impl_->states.stagingBytes()};
 }
 
 ModelTelemetry Runtime::telemetry() const noexcept {
@@ -4608,8 +4729,12 @@ ModelMemoryPlan plannedRuntimeMemory(const LoadedModel &model,
                                      kv::Format kvFormat,
                                      ops::GdnStateFormat stateFormat, StreamedParts parts) {
   requireCompatibleModel(model);
-  return memoryPlanOf(model.descriptor, stateFormat, RuntimeGeometry::from(model, kvFormat, stateFormat, parts),
-                      operators);
+  ModelMemoryPlan plan = memoryPlanOf(model.descriptor, stateFormat,
+                                      RuntimeGeometry::from(model, kvFormat, stateFormat, parts), operators);
+  // A LiLiCorr selector's scratch, which the files' plan takes from
+  // plannedSelectorBytes.
+  plan.sharedDecodePlannedAllocatedBytes += DFlashDraft::liLiCorrBytes(model.draft, operators);
+  return plan;
 }
 
 ModelMemoryPlan plannedRuntimeMemory(const ModelDescriptor &descriptor, const QwenTargetGeometry &target,

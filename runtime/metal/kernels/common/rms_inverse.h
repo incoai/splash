@@ -2,16 +2,19 @@
 
 #include "metal/abi/KernelABI.h"
 
-// The epsilon of every RMS norm.
+// The epsilon of every RMS norm, and of the plain norms' _e5 kernels
+// (Nemotron-H's), which take E5.
 constant constexpr float kRmsEpsilon = SPLASH_RMS_EPSILON;
+constant constexpr float kRmsEpsilonE5 = SPLASH_RMS_EPSILON_E5;
 
 // The inverse RMS of `width` values from each thread's sum of squares,
 // reduced per simdgroup and then over the first Simdgroups simdgroups, in
-// order, by thread 0, and returned to every thread. `reductions` holds a
+// order, by thread 0, and returned to every thread, of kRmsEpsilon, or with
+// E5 of kRmsEpsilonE5. `reductions` holds a
 // partial per simdgroup. This and row_squares keep the source order of their
 // float additions (reassociate(off), scoped to their bodies), whichever file
 // includes them.
-template <ushort Simdgroups = 8>
+template <ushort Simdgroups = 8, bool E5 = false>
 inline float rms_inverse_of_sums(float sum, uint width, threadgroup float *reductions,
                                  uint thread_index, uint lane, uint simd_group) {
 #pragma clang fp reassociate(off)
@@ -23,7 +26,7 @@ inline float rms_inverse_of_sums(float sum, uint width, threadgroup float *reduc
     float total = 0.0f;
     for (uint i = 0; i < Simdgroups; ++i)
       total += reductions[i];
-    reductions[0] = rsqrt(total / width + kRmsEpsilon);
+    reductions[0] = rsqrt(total / width + (E5 ? kRmsEpsilonE5 : kRmsEpsilon));
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
   return reductions[0];
@@ -44,9 +47,10 @@ inline float row_squares(Row row, uint width, uint thread_index) {
 
 // Inverse RMS of one row, reduced across the 256-thread group and returned to
 // every thread.
+template <bool E5 = false>
 inline float rms_inverse(device const bfloat *row_input, uint width,
                          threadgroup float *reductions, uint thread_index,
                          uint lane, uint simd_group) {
-  return rms_inverse_of_sums(row_squares(row_input, width, thread_index), width, reductions,
-                             thread_index, lane, simd_group);
+  return rms_inverse_of_sums<8, E5>(row_squares(row_input, width, thread_index), width, reductions,
+                                    thread_index, lane, simd_group);
 }

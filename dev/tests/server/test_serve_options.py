@@ -236,6 +236,19 @@ OPTIONS = {
         {str(images.MIN_PIXELS): images.MIN_PIXELS, "1048576": 1048576},
         (str(images.MIN_PIXELS - 1), str(images.MAX_PIXELS + 1), "-1", "many"),
     ),
+    "--video-fps": values(
+        "--video-fps",
+        {"1": 1.0, "0.5": 0.5, "30": 30.0},
+        ("0", "-1", "31", "nan", "fast"),
+    ),
+    "--video-max-frames": values(
+        "--video-max-frames", {"1": 1, "256": 256}, ("0", "257", "1.5", "many")
+    ),
+    "--video-pruning": values(
+        "--video-pruning",
+        {"0.7": 0.7, "0.5": 0.5, "0": 0.0},
+        ("1", "-0.1", "nan", "half"),
+    ),
     "--request-timeout": values(
         "--request-timeout",
         {"3600": 3600.0, "0.5": 0.5, "90s": 90.0, "30M": 1800.0, "1.5h": 5400.0},

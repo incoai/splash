@@ -182,7 +182,10 @@ kernel void draft_context_window_commit(
 // splits and no tile reads past the ring. Each split runs an online softmax
 // over its tiles, the last split adds the eight current rows, and the
 // unnormalized fp32 accumulator with its row maxima and sums lands in
-// `partial` for the fixed-order reduce.
+// `partial` for the fixed-order reduce. A row sees the keys of the last
+// Visible positions, its own among them; Visible is at most the ring's
+// window (a LiLiCorr draft sees 1024 of a 2048-slot ring).
+template <uint Visible>
 inline void draft_attention_split_phase(
     device bfloat *queries, device bfloat *keys, device bfloat *values,
     device bfloat *query_keys, device bfloat *query_values,
@@ -194,8 +197,9 @@ inline void draft_attention_split_phase(
                    D = SPLASH_DRAFT_HEAD_DIMENSION, TileK = 64;
   constexpr uint Rows = SPLASH_DRAFT_QUERY_ROWS, Window = SPLASH_DRAFT_SLIDING_WINDOW,
                  Splits = SPLASH_DRAFT_ATTENTION_SPLITS;
+  static_assert(Visible <= Window, "a row sees at most the ring's window");
   uint common_start =
-      cache_length >= Window - 1 ? cache_length - (Window - 1) : 0;
+      cache_length >= Visible - 1 ? cache_length - (Visible - 1) : 0;
   uint old_count = cache_length - common_start;
   uint physical_start = common_start % Window;
   // Live tiles: [0, wrapped) when the window wraps, then [resume, tail_end);
@@ -265,7 +269,7 @@ inline void draft_attention_split_phase(
       uint proposal_row = matrix_row % Rows;
       uint query_position = cache_length + proposal_row;
       uint row_start =
-          query_position >= Window - 1 ? query_position - (Window - 1) : 0;
+          query_position >= Visible - 1 ? query_position - (Visible - 1) : 0;
       uint hidden_prefix = row_start - common_start;
       float local_scores[4];
       float tile_max = -INFINITY;
@@ -473,6 +477,48 @@ inline void draft_attention_reduce_phase(device const float *partials,
     destination[i] = bfloat(accumulated[i] / total);
 }
 
+// draft_attention_reduce_phase with each query head's sink logit joining its
+// rows' softmax denominators as a key of no value (a LiLiCorr draft's);
+// `sinks` holds one logit per query head. A function of its own, so the
+// reduce without sinks keeps its AIR.
+inline void draft_attention_reduce_sinks_phase(device const float *partials,
+                                               device bfloat *output,
+                                               device const bfloat *sinks,
+                                               uint kv_head,
+                                               uint thread_index) {
+  constexpr uint M = SPLASH_DRAFT_ATTENTION_ROWS, D = SPLASH_DRAFT_HEAD_DIMENSION,
+                 Rows = SPLASH_DRAFT_QUERY_ROWS,
+                 QHeads = SPLASH_DRAFT_QUERY_HEADS, Stride = M * D + 2 * M,
+                 Splits = SPLASH_DRAFT_ATTENTION_SPLITS;
+  constexpr uint Chunk = D / 8;
+  uint row = thread_index / 8;
+  uint dim = (thread_index % 8) * Chunk;
+  uint proposal_row = row % Rows;
+  uint query_head = kv_head * (M / Rows) + row / Rows;
+  const float sink = float(sinks[query_head]);
+  float maximum = sink;
+  for (uint split = 0; split < Splits; ++split)
+    maximum = max(maximum, partials[split * Stride + M * D + row]);
+  float total = fast::exp(sink - maximum);
+  float accumulated[Chunk];
+  for (uint i = 0; i < Chunk; ++i)
+    accumulated[i] = 0.0f;
+  for (uint split = 0; split < Splits; ++split) {
+    device const float *partial = partials + split * Stride;
+    float split_max = partial[M * D + row];
+    if (split_max == -INFINITY)
+      continue;
+    float scale = fast::exp(split_max - maximum);
+    total += scale * partial[M * D + M + row];
+    for (uint i = 0; i < Chunk; ++i)
+      accumulated[i] += scale * partial[row * D + dim + i];
+  }
+  device bfloat *destination =
+      output + (proposal_row * QHeads + query_head) * D + dim;
+  for (uint i = 0; i < Chunk; ++i)
+    destination[i] = bfloat(accumulated[i] / total);
+}
+
 kernel void draft_conv(device const bfloat *input [[buffer(0)]],
                        device const bfloat *dynamic [[buffer(1)]],
                        device const bfloat *base [[buffer(2)]],
@@ -528,6 +574,7 @@ kernel void draft_attention_qkv(
 // ring tiles of its head and the last one adds the eight current rows.
 // Partials follow the grouped queries in the same allocation, one 32 x 130
 // fp32 block per (lane, head, split).
+template <uint Visible>
 kernel void draft_attention_bf16_split(
     device bfloat *queries [[buffer(0)]],
     device bfloat *keys0 [[buffer(1)]], device bfloat *keys1 [[buffer(2)]],
@@ -559,7 +606,7 @@ kernel void draft_attention_bf16_split(
       ((batch * KVHeads + group.x) * SPLASH_DRAFT_ATTENTION_SPLITS + group.z) *
           PartialFloats;
   threadgroup float workspace[AttentionM * AttentionN + 3 * AttentionM];
-  draft_attention_split_phase(
+  draft_attention_split_phase<Visible>(
       queries + batch * Rows * Attention + group.x * AttentionM * HeadDim,
       keys + group.x * Window * HeadDim, values + group.x * Window * HeadDim,
       query_keys + batch * KVHeads * Rows * HeadDim + group.x * Rows * HeadDim,
@@ -571,6 +618,19 @@ kernel void draft_attention_bf16_split(
       workspace + AttentionM * AttentionN + 2 * AttentionM, thread_index,
       lane, simd_group);
 }
+
+template [[host_name("draft_attention_bf16_split")]] kernel void
+draft_attention_bf16_split<SPLASH_DRAFT_SLIDING_WINDOW>(
+    device bfloat *, device bfloat *, device bfloat *, device bfloat *,
+    device bfloat *, device bfloat *, device bfloat *, device bfloat *,
+    device bfloat *, device bfloat *, device bfloat *,
+    constant DraftAttentionBatchParams &, uint3, uint, uint, uint);
+template [[host_name("draft_attention_bf16_split_window1024")]] kernel void
+draft_attention_bf16_split<1024>(
+    device bfloat *, device bfloat *, device bfloat *, device bfloat *,
+    device bfloat *, device bfloat *, device bfloat *, device bfloat *,
+    device bfloat *, device bfloat *, device bfloat *,
+    constant DraftAttentionBatchParams &, uint3, uint, uint, uint);
 
 kernel void draft_attention_bf16_reduce(
     device bfloat *queries [[buffer(0)]],
@@ -590,4 +650,25 @@ kernel void draft_attention_bf16_reduce(
           PartialFloats;
   draft_attention_reduce_phase(partials, queries + batch * Rows * Attention,
                                group.x, thread_index);
+}
+
+kernel void draft_attention_bf16_reduce_sinks(
+    device bfloat *queries [[buffer(0)]],
+    device const bfloat *sinks [[buffer(1)]],
+    constant DraftAttentionBatchParams &params [[buffer(2)]],
+    uint2 group [[threadgroup_position_in_grid]],
+    uint thread_index [[thread_index_in_threadgroup]]) {
+  constexpr uint AttentionM = SPLASH_DRAFT_ATTENTION_ROWS, KVHeads = SPLASH_DRAFT_KV_HEADS;
+  constexpr ulong Rows = SPLASH_DRAFT_QUERY_ROWS;
+  constexpr ulong Attention = SPLASH_DRAFT_ATTENTION_WIDTH;
+  constexpr ulong HeadDim = SPLASH_DRAFT_HEAD_DIMENSION;
+  constexpr ulong PartialFloats = AttentionM * HeadDim + 2 * AttentionM;
+  uint batch = group.y;
+  device const float *partials =
+      reinterpret_cast<device const float *>(queries +
+                                             params.lanes * Rows * Attention) +
+      (batch * KVHeads + group.x) * SPLASH_DRAFT_ATTENTION_SPLITS *
+          PartialFloats;
+  draft_attention_reduce_sinks_phase(partials, queries + batch * Rows * Attention,
+                                     sinks, group.x, thread_index);
 }

@@ -74,6 +74,9 @@
 // draft's configurations must state. Unsuffixed, so the host compares a
 // configuration's double with it exactly and the kernels take it as a float.
 #define SPLASH_RMS_EPSILON 1e-6
+// The epsilon of Nemotron-H's hidden-state norms, which the plain norms
+// (ops::Normalization, their _e5 kernels) compute as well.
+#define SPLASH_RMS_EPSILON_E5 1e-5
 // Plain norms of at most SPLASH_STAGED_NORM_ROWS rows of at most
 // SPLASH_STAGED_NORM_WIDTH columns run norm_rms_staged, whose 1024-thread
 // groups hold a row in threadgroup memory: the region where it beats norm_rms

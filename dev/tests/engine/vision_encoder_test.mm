@@ -170,6 +170,8 @@ int main(int argc, char **argv) {
       ImageGrid grid;
       std::ifstream gridFile(fixture + "/grid.txt");
       gridFile >> grid.height >> grid.width;
+      // A third value is a video tubelet's frame count.
+      if (!(gridFile >> grid.frames)) grid.frames = 1;
       if (!grid.valid())
         throw std::runtime_error("fixture grid is invalid");
       const std::vector<uint8_t> pixelBytes = readFile(fixture + "/pixels.bin");
@@ -199,9 +201,9 @@ int main(int argc, char **argv) {
       std::printf("embedding SHA-256: %s\n", digest.c_str());
       const Parity parity =
           compare(first, expected, descriptor.vision.outputHiddenSize);
-      std::printf("grid %ux%u: relative_error %.4f max_abs %.4f "
+      std::printf("grid %ux%ux%u: relative_error %.4f max_abs %.4f "
                   "worst_row_error %.4f gpu %.2f ms\n",
-                  grid.height, grid.width, parity.relativeError,
+                  grid.height, grid.width, grid.frames, parity.relativeError,
                   parity.maxAbsolute, parity.worstRowError, gpuSeconds * 1e3);
       // The tower's bf16 activations drift ~1-2.5% relative from fp32 over
       // 27 blocks, by the tower and how the shaders are compiled; that is the

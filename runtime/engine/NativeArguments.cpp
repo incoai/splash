@@ -93,11 +93,9 @@ std::filesystem::path requireModelRoot(std::string_view argument) {
       std::filesystem::canonical(std::filesystem::path(argument), error);
   if (error || !std::filesystem::is_directory(root, error))
     throw ModelRootError("MODEL_DIRECTORY must name an existing directory");
-  for (const char *role : {"target", "draft"}) {
-    if (!std::filesystem::is_directory(root / role, error))
-      throw ModelRootError(
-          "MODEL_DIRECTORY must hold the model's target/ and draft/ directories");
-  }
+  // A model may have no draft/; the descriptor refuses a family that needs one.
+  if (!std::filesystem::is_directory(root / "target", error))
+    throw ModelRootError("MODEL_DIRECTORY must hold the model's target/ directory");
   return root;
 }
 

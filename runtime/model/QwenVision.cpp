@@ -29,6 +29,41 @@ ops::VisionNorm readNorm(WeightFile &file, uint32_t width,
   return {file.section(bytes, label), file.section(bytes, label)};
 }
 
+// A bf16 tensor of rows x columns values.
+metal::MetalBuffer readTensor(WeightFile &file, uint32_t rows, uint32_t columns, std::string_view label) {
+  return file.section(checkedMultiply<WeightStoreError>(
+                          checkedMultiply<WeightStoreError>(rows, columns, "vision tensor elements"), kBFloat16Bytes,
+                          "vision tensor bytes"),
+                      label);
+}
+
+// RADIO's tensors in the order VisionLoader.cpp plans them (planRadio): no
+// patch or merger biases, the prefix tokens after the positions, the
+// merger's RMS weight alone, and the video patch embedding last.
+void readRadio(WeightFile &file, const ops::VisionLayout &layout, ops::VisionWeights &tensors) {
+  tensors.patchEmbedding = {readTensor(file, layout.hiddenSize, layout.patchDimension, "patch-embed"), {}};
+  tensors.positionTable =
+      readTensor(file, layout.positionGridSide * layout.positionGridSide, layout.hiddenSize, "position-table");
+  tensors.prefixTokens = readTensor(file, layout.prefixTokens, layout.hiddenSize, "prefix-tokens");
+  for (uint32_t blockIndex = 0; blockIndex < layout.depth; ++blockIndex) {
+    ops::VisionBlock block;
+    block.norm1 = readNorm(file, layout.hiddenSize, "norm1");
+    block.qkv = readAffine(file, 3 * layout.hiddenSize, layout.hiddenSize, "qkv");
+    block.projection = readAffine(file, layout.hiddenSize, layout.hiddenSize, "proj");
+    block.norm2 = readNorm(file, layout.hiddenSize, "norm2");
+    block.upProjection = readAffine(file, layout.intermediateSize, layout.hiddenSize, "fc1");
+    block.downProjection = readAffine(file, layout.hiddenSize, layout.intermediateSize, "fc2");
+    tensors.blocks.push_back(std::move(block));
+  }
+  if (layout.finalNorm) tensors.finalNorm = readNorm(file, layout.hiddenSize, "final-norm");
+  tensors.mergerNorm = {readTensor(file, layout.mergedHiddenSize, 1, "merger-norm"), {}};
+  tensors.mergerUpProjection = {
+      readTensor(file, layout.mergerIntermediateSize, layout.mergedHiddenSize, "merger-fc1"), {}};
+  tensors.mergerDownProjection = {
+      readTensor(file, layout.outputHiddenSize, layout.mergerIntermediateSize, "merger-fc2"), {}};
+  tensors.videoPatchEmbedding = {readTensor(file, layout.hiddenSize, 2 * layout.patchDimension, "video-patch-embed"), {}};
+}
+
 QwenVisionWeights readVision(metal::MetalBackend &backend, WeightImages &images,
                              ImagePlan image, const ops::VisionLayout &layout) {
   const uint64_t allocationBaseline = backend.memoryStats().allocatedBytes;
@@ -37,6 +72,13 @@ QwenVisionWeights readVision(metal::MetalBackend &backend, WeightImages &images,
   result.tensors.blocks.reserve(layout.depth);
 
   WeightFile file = images.load(std::move(image));
+  if (ops::isRadioVision(layout)) {
+    readRadio(file, layout, result.tensors);
+    file.finish();
+    result.files.push_back(file.record());
+    result.actualAllocatedBytes = metal::allocationDelta(allocationBaseline, backend.memoryStats().allocatedBytes);
+    return result;
+  }
   result.tensors.patchEmbedding =
       readAffine(file, layout.hiddenSize, layout.patchDimension, "patch-embed");
   result.tensors.positionTable = file.section(

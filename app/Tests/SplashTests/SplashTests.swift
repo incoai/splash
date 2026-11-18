@@ -230,6 +230,8 @@ struct ServeSettingsTests {
         #expect(!ContextLength.message(Self.flint).contains("YaRN"))
         #expect(ContextLength.message(Self.moe).contains("at most 1,010,000. Past the model’s own window, 256K, it stretches it with YaRN"))
         #expect(ContextLength.message(.unknown).contains("YaRN"))
+        let super_ = ModelFamily(unusable: [], contextTokens: 1_048_576, maxContextTokens: 1_010_000)
+        #expect(ContextLength.message(super_).hasSuffix("at most 1,010,000."))
     }
 
     /// The context menu offers the lengths the model picked serves, 1M tokens where YaRN stretches

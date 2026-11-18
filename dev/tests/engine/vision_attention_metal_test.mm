@@ -1,5 +1,6 @@
-// vision_attention (kernels/shared/vision.metal) against an fp64 reference,
-// row by row. Token counts fall below, on and past its 32-row query tile and
+// vision_attention and vision_attention_d80 (kernels/shared/vision.metal),
+// Qwen3.5's heads of 72 and RADIO's of 80, against an fp64 reference, row by
+// row. Token counts fall below, on and past its 32-row query tile and
 // 128-key tile, up to 4,100 (33 key tiles, the last of four keys), and each
 // runs three kinds of input: random queries, keys and values; keys whose
 // scores rise tile by tile, so every row rescales its running output at
@@ -26,6 +27,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <functional>
 #include <future>
 #include <iostream>
 #include <random>
@@ -43,12 +45,18 @@ using splash::test::floatToBf16;
 using splash::test::require;
 
 constexpr splash::ops::VisionLayout kTower{};
+static_assert(kTower.heads == splash::ops::kRadioVisionLayout.heads);
 constexpr uint32_t kHeads = kTower.heads;
-constexpr uint32_t kHeadDimension = kTower.headDimension;
-// The encoder's query and key rows hold the head dimension padded with
-// zeros to the 16 a matmul's K extent takes, and every tensor's tokens are
-// padded to whole key tiles (ops/Vision.cpp).
-constexpr uint32_t kQkDimension = 80;
+// A kernel's heads. The encoder's query and key rows hold the head dimension
+// padded with zeros to the 16 a matmul's K extent takes, and every tensor's
+// tokens are padded to whole key tiles (ops/Vision.cpp).
+struct Geometry final {
+  const char *kernel;
+  uint32_t headDimension;
+  uint32_t qkDimension;
+};
+constexpr Geometry kGeometries[] = {{"vision_attention", kTower.headDimension, 80},
+                                    {"vision_attention_d80", splash::ops::kRadioVisionLayout.headDimension, 80}};
 constexpr uint32_t kKeyTile = 128;
 constexpr uint16_t kNan = 0x7FC0;
 
@@ -93,9 +101,10 @@ struct Tensor final {
 // which a query's first dimension of one turns into scores that rise by 0.7
 // to 1.2 from tile to tile, more than the spread of the small rest. Wide
 // inputs scale each query row, key and value by its own power of two.
-void fill(Kind kind, uint32_t tokens, uint32_t padded, const Tensor &queries, const Tensor &keys,
+void fill(const Geometry &g, Kind kind, uint32_t tokens, uint32_t padded, const Tensor &queries, const Tensor &keys,
           const Tensor &values) {
-  std::mt19937 random(0x7a11 + tokens * 3 + static_cast<uint32_t>(kind));
+  std::mt19937 random(0x7a11 + tokens * 3 + static_cast<uint32_t>(kind) +
+                       (g.headDimension - kTower.headDimension) * 7919);
   std::normal_distribution<float> normal(0.0F, 1.0F);
   std::uniform_int_distribution<int> step(6, 10), queryExponent(-3, 3), keyExponent(-4, 3),
       valueExponent(-8, 8);
@@ -105,13 +114,13 @@ void fill(Kind kind, uint32_t tokens, uint32_t padded, const Tensor &queries, co
   for (uint32_t head = 0; head < kHeads; ++head) {
     for (uint32_t token = 0; token < padded; ++token) {
       const uint64_t row = uint64_t{head} * padded + token;
-      uint16_t *query = queries.data() + row * kQkDimension;
-      uint16_t *key = keys.data() + row * kQkDimension;
-      uint16_t *value = values.data() + row * kHeadDimension;
+      uint16_t *query = queries.data() + row * g.qkDimension;
+      uint16_t *key = keys.data() + row * g.qkDimension;
+      uint16_t *value = values.data() + row * g.headDimension;
       if (token >= tokens) {
-        std::fill_n(query, kQkDimension, floatToBf16(16.0F));
-        std::fill_n(key, kQkDimension, floatToBf16(16.0F));
-        std::fill_n(value, kHeadDimension, floatToBf16(1024.0F));
+        std::fill_n(query, g.qkDimension, floatToBf16(16.0F));
+        std::fill_n(key, g.qkDimension, floatToBf16(16.0F));
+        std::fill_n(value, g.headDimension, floatToBf16(1024.0F));
         continue;
       }
       float queryScale = 1.4F, keyScale = 1.4F, valueScale = 1.0F;
@@ -122,9 +131,9 @@ void fill(Kind kind, uint32_t tokens, uint32_t padded, const Tensor &queries, co
         keyScale = std::ldexp(1.0F, keyExponent(random));
         valueScale = std::ldexp(1.0F, valueExponent(random));
       }
-      std::fill_n(query, kQkDimension, uint16_t{0});
-      std::fill_n(key, kQkDimension, uint16_t{0});
-      for (uint32_t dimension = 0; dimension < kHeadDimension; ++dimension) {
+      std::fill_n(query, g.qkDimension, uint16_t{0});
+      std::fill_n(key, g.qkDimension, uint16_t{0});
+      for (uint32_t dimension = 0; dimension < g.headDimension; ++dimension) {
         query[dimension] = floatToBf16(normal(random) * queryScale);
         key[dimension] = floatToBf16(normal(random) * keyScale);
         value[dimension] = floatToBf16(normal(random) * valueScale);
@@ -153,39 +162,39 @@ struct HeadCheck final {
 // scores (80 products, the scale and the maximum subtracted) change each
 // probability by up to 2 epsilon; and fp32 sums over the keys and the
 // rescales add a few units of 2^-24 per key.
-HeadCheck checkHead(Kind kind, uint32_t tokens, uint32_t padded, float scale, uint32_t head,
+HeadCheck checkHead(const Geometry &g, Kind kind, uint32_t tokens, uint32_t padded, float scale, uint32_t head,
                     const uint16_t *queries, const uint16_t *keys, const uint16_t *values,
                     const uint16_t *output) {
   HeadCheck check;
   const uint64_t first = uint64_t{head} * padded;
-  std::vector<double> q(uint64_t{tokens} * kQkDimension), k(q.size());
-  std::vector<double> v(uint64_t{tokens} * kHeadDimension);
+  std::vector<double> q(uint64_t{tokens} * g.qkDimension), k(q.size());
+  std::vector<double> v(uint64_t{tokens} * g.headDimension);
   for (uint64_t index = 0; index < q.size(); ++index) {
-    q[index] = bf16ToFloat(queries[first * kQkDimension + index]);
-    k[index] = bf16ToFloat(keys[first * kQkDimension + index]);
+    q[index] = bf16ToFloat(queries[first * g.qkDimension + index]);
+    k[index] = bf16ToFloat(keys[first * g.qkDimension + index]);
   }
   for (uint64_t index = 0; index < v.size(); ++index)
-    v[index] = bf16ToFloat(values[first * kHeadDimension + index]);
+    v[index] = bf16ToFloat(values[first * g.headDimension + index]);
   double largestKey = 0.0;
   for (uint32_t key = 0; key < tokens; ++key) {
     double squares = 0.0;
-    for (uint32_t dimension = 0; dimension < kQkDimension; ++dimension)
-      squares += k[uint64_t{key} * kQkDimension + dimension] * k[uint64_t{key} * kQkDimension + dimension];
+    for (uint32_t dimension = 0; dimension < g.qkDimension; ++dimension)
+      squares += k[uint64_t{key} * g.qkDimension + dimension] * k[uint64_t{key} * g.qkDimension + dimension];
     largestKey = std::max(largestKey, std::sqrt(squares));
   }
 
-  std::vector<double> logits(tokens), sums(kHeadDimension), magnitudes(kHeadDimension);
+  std::vector<double> logits(tokens), sums(g.headDimension), magnitudes(g.headDimension);
   for (uint32_t row = 0; row < tokens; ++row) {
-    const double *query = q.data() + uint64_t{row} * kQkDimension;
+    const double *query = q.data() + uint64_t{row} * g.qkDimension;
     double queryNorm = 0.0;
-    for (uint32_t dimension = 0; dimension < kQkDimension; ++dimension)
+    for (uint32_t dimension = 0; dimension < g.qkDimension; ++dimension)
       queryNorm += query[dimension] * query[dimension];
     queryNorm = std::sqrt(queryNorm);
     double maximum = -INFINITY, largestLogit = 0.0;
     for (uint32_t key = 0; key < tokens; ++key) {
-      const double *keyRow = k.data() + uint64_t{key} * kQkDimension;
+      const double *keyRow = k.data() + uint64_t{key} * g.qkDimension;
       double partial[8] = {};
-      for (uint32_t dimension = 0; dimension < kQkDimension; dimension += 8)
+      for (uint32_t dimension = 0; dimension < g.qkDimension; dimension += 8)
         for (uint32_t lane = 0; lane < 8; ++lane)
           partial[lane] += query[dimension + lane] * keyRow[dimension + lane];
       const double dot = ((partial[0] + partial[1]) + (partial[2] + partial[3])) +
@@ -210,18 +219,18 @@ HeadCheck checkHead(Kind kind, uint32_t tokens, uint32_t padded, float scale, ui
     double total = 0.0;
     for (uint32_t key = 0; key < tokens; ++key) {
       const double probability = std::exp(logits[key] - maximum);
-      const double *value = v.data() + uint64_t{key} * kHeadDimension;
+      const double *value = v.data() + uint64_t{key} * g.headDimension;
       total += probability;
-      for (uint32_t dimension = 0; dimension < kHeadDimension; ++dimension) {
+      for (uint32_t dimension = 0; dimension < g.headDimension; ++dimension) {
         sums[dimension] += probability * value[dimension];
         magnitudes[dimension] += probability * std::fabs(value[dimension]);
       }
     }
     const double epsilon =
-        scale * kQkDimension * 0x1p-24 * queryNorm * largestKey + 0x1p-22 * largestLogit;
+        scale * g.qkDimension * 0x1p-24 * queryNorm * largestKey + 0x1p-22 * largestLogit;
     const double relative = 0x1p-8 + 2.5 * epsilon + (2.0 * tokens + 512.0) * 0x1p-24 + 0x1p-17;
-    const uint16_t *actual = output + (first + row) * kHeadDimension;
-    for (uint32_t dimension = 0; dimension < kHeadDimension; ++dimension) {
+    const uint16_t *actual = output + (first + row) * g.headDimension;
+    for (uint32_t dimension = 0; dimension < g.headDimension; ++dimension) {
       const double expected = sums[dimension] / total;
       const double bound = relative * (magnitudes[dimension] / total + std::fabs(expected));
       const double observed = bf16ToFloat(actual[dimension]);
@@ -243,25 +252,25 @@ HeadCheck checkHead(Kind kind, uint32_t tokens, uint32_t padded, float scale, ui
 
 // One image of `tokens` patches: the encoder's attention dispatch over
 // tensors at their extents, checked head by head.
-void runCase(MetalBackend &backend, Kind kind, uint32_t tokens) {
+void runCase(MetalBackend &backend, const Geometry &g, Kind kind, uint32_t tokens) {
   const uint32_t padded = (tokens + kKeyTile - 1) / kKeyTile * kKeyTile;
   const uint64_t rows = uint64_t{kHeads} * padded;
-  const Tensor queries(backend, rows, kQkDimension), keys(backend, rows, kQkDimension);
-  const Tensor values(backend, rows, kHeadDimension), output(backend, rows, kHeadDimension);
-  fill(kind, tokens, padded, queries, keys, values);
-  const VisionAttentionParams params{tokens, padded, 1.0F / std::sqrt(static_cast<float>(kHeadDimension))};
+  const Tensor queries(backend, rows, g.qkDimension), keys(backend, rows, g.qkDimension);
+  const Tensor values(backend, rows, g.headDimension), output(backend, rows, g.headDimension);
+  fill(g, kind, tokens, padded, queries, keys, values);
+  const VisionAttentionParams params{tokens, padded, 1.0F / std::sqrt(static_cast<float>(g.headDimension))};
   CommandGraph graph;
-  graph.add("vision_attention", {queries.view, keys.view, values.view, output.view}, params,
+  graph.add(g.kernel, {queries.view, keys.view, values.view, output.view}, params,
             {(tokens + SPLASH_VISION_ATTENTION_ROWS - 1) / SPLASH_VISION_ATTENTION_ROWS, kHeads, 1},
             {SPLASH_VISION_ATTENTION_THREADS, 1, 1});
   static_cast<void>(backend.submitCommandAsync(graph.dispatches()).wait());
 
-  const std::string label = std::string(kindName(kind)) + " tokens " + std::to_string(tokens);
+  const std::string label = std::string(g.kernel) + " " + kindName(kind) + " tokens " + std::to_string(tokens);
   require(queries.tailIntact() && keys.tailIntact() && values.tailIntact() && output.tailIntact(),
           label + ": a write reached past a tensor's extent");
   std::vector<std::future<HeadCheck>> checks;
   for (uint32_t head = 0; head < kHeads; ++head)
-    checks.push_back(std::async(std::launch::async, checkHead, kind, tokens, padded, params.scale, head,
+    checks.push_back(std::async(std::launch::async, checkHead, std::cref(g), kind, tokens, padded, params.scale, head,
                                 queries.data(), keys.data(), values.data(), output.data()));
   double worst = 0.0;
   uint32_t worstHead = 0, worstRow = 0;
@@ -278,7 +287,7 @@ void runCase(MetalBackend &backend, Kind kind, uint32_t tokens) {
   }
   require(kind != Kind::Rising || !steadyTiles,
           label + ": " + std::to_string(steadyTiles) + " row tiles of rising keys kept their maximum");
-  std::printf("vision_attention %s: worst error %.3f of its bound (head %u row %u)\n", label.c_str(), worst,
+  std::printf("%s: worst error %.3f of its bound (head %u row %u)\n", label.c_str(), worst,
               worstHead, worstRow);
 }
 
@@ -289,9 +298,10 @@ int main(int argc, char **argv) {
     try {
       require(argc == 2, "usage: vision-attention METALLIB");
       MetalBackend backend(argv[1]);
-      for (const uint32_t tokens : {4U, 24U, 36U, 124U, 128U, 132U, 144U, 260U, 4100U})
-        for (const Kind kind : {Kind::Random, Kind::Rising, Kind::Wide})
-          runCase(backend, kind, tokens);
+      for (const Geometry &g : kGeometries)
+        for (const uint32_t tokens : {4U, 24U, 36U, 124U, 128U, 132U, 144U, 260U, 4100U})
+          for (const Kind kind : {Kind::Random, Kind::Rising, Kind::Wide})
+            runCase(backend, g, kind, tokens);
       std::cout << "vision_attention_metal_test: PASS\n";
       return 0;
     } catch (const std::exception &error) {

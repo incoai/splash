@@ -10,7 +10,7 @@ from server import protocol as wire
 
 _HEADER = struct.Struct("<4sHHQ")
 _REQUEST = struct.Struct("<QBBQQIIIffIffffQIIIQQIII")
-_IMAGE_SPAN = struct.Struct("<IIIIQQ")
+_IMAGE_SPAN = struct.Struct("<IIIIQQIII")
 _MASK_RESPONSE = struct.Struct("<QQII")
 _ID = struct.Struct("<Q")
 

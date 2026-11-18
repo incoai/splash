@@ -87,7 +87,8 @@ void requireCompiledShape(DraftAttentionShape shape) {
                                      SPLASH_DRAFT_ATTENTION_WIDTH,
                                      SPLASH_DRAFT_QUERY_HEADS,
                                      SPLASH_DRAFT_KV_HEADS,
-                                     SPLASH_DRAFT_HEAD_DIMENSION};
+                                     SPLASH_DRAFT_HEAD_DIMENSION,
+                                     shape.window == 1024 ? 1024U : kWindow};
   if (!shape.hiddenSize || shape.hiddenSize % SPLASH_DRAFT_CONVOLUTION_GROUP || shape != compiled)
     throw std::invalid_argument("unsupported compiled draft attention shape");
 }
@@ -198,10 +199,15 @@ void DraftAttention::addDecode(
                      buffers.persistentValues);
   bindings.push_back(buffers.queryKeys);
   bindings.push_back(buffers.queryValues);
-  graph.add("draft_attention_bf16_split", std::move(bindings), params,
-            {shape.kvHeads, lanes, kSplits});
-  graph.add("draft_attention_bf16_reduce", {buffers.groupedQueries}, params,
-            {shape.kvHeads, lanes, 1});
+  graph.add(shape.window == kWindow ? "draft_attention_bf16_split" : "draft_attention_bf16_split_window1024",
+            std::move(bindings), params, {shape.kvHeads, lanes, kSplits});
+  if (buffers.sinks) {
+    requireBytes(buffers.sinks, uint64_t{shape.queryHeads} * sizeof(uint16_t), "draft attention sinks");
+    graph.add("draft_attention_bf16_reduce_sinks", {buffers.groupedQueries, buffers.sinks}, params,
+              {shape.kvHeads, lanes, 1});
+  } else {
+    graph.add("draft_attention_bf16_reduce", {buffers.groupedQueries}, params, {shape.kvHeads, lanes, 1});
+  }
 }
 
 void DraftAttention::addContextPrefill(

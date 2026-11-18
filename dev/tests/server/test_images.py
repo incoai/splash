@@ -5,11 +5,15 @@ import io
 import json
 import random
 import struct
+import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
+from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
+
+from tokenizers import Tokenizer, models
 
 from dev.tests.server_fixtures import (
     FOREVER,
@@ -28,9 +32,10 @@ from dev.tests.server_fixtures import (
     responses_body,
 )
 from server import chat_messages, documents, errors, images
+from server import frontend as request_frontend
 from server import protocol as native_wire
 from server import server as api
-from server.chat_format import QWEN
+from server.chat_format import NEMOTRON, QWEN
 from server.dialects import anthropic as anthropic_dialect
 from server.dialects import responses as responses_dialect
 
@@ -80,6 +85,74 @@ class SmartResizeTest(unittest.TestCase):
                     self.assertEqual(height % images.FACTOR, 0)
                     self.assertEqual(width % images.FACTOR, 0)
                     self.assertLessEqual(height * width, cap)
+
+
+class NemotronResizeTest(unittest.TestCase):
+    def test_patch_counts_follow_nemotron_omni_processor(self):
+        # Values from the processor's _compute_target_patches, whose rounding
+        # gives a whole odd count of patches one more (48 px: 4 patches).
+        for (height, width), expected in (
+            ((512, 512), (512, 512)),
+            ((448, 448), (512, 512)),
+            ((48, 48), (512, 512)),
+            ((190, 1352), (224, 1376)),
+            ((3000, 4000), (1600, 2112)),
+        ):
+            with self.subTest(shape=(height, width)):
+                self.assertEqual(
+                    images.nemotron_resize(height, width, images.MAX_PIXELS), expected
+                )
+
+    def test_serving_cap_bounds_the_budget_and_overrides_the_minimum(self):
+        self.assertEqual(images.nemotron_resize(448, 448, 65_536), (256, 256))
+        self.assertEqual(images.nemotron_resize(48, 48, 65_536), (64, 64))
+        # NVIDIA's processor's minimum gives 26x40 patches here, over a budget of 1028.
+        self.assertEqual(images.nemotron_resize(16, 36, 1028 * 256), (416, 608))
+
+    def test_sides_stay_merge_aligned_inside_the_budget(self):
+        rng = random.Random(7)
+        shapes = [(rng.randint(1, 8000), rng.randint(1, 8000)) for _ in range(300)]
+        for shape in shapes:
+            if max(shape) / min(shape) > 200:
+                continue
+            for cap in (images.MIN_PIXELS, 1028 * 256, images.MAX_PIXELS):
+                with self.subTest(shape=shape, cap=cap):
+                    height, width = images.nemotron_resize(*shape, cap)
+                    self.assertEqual(height % images.FACTOR, 0)
+                    self.assertEqual(width % images.FACTOR, 0)
+                    patches = height * width // images.PATCH**2
+                    self.assertLessEqual(
+                        patches,
+                        min(images.max_patches(cap), images.NEMOTRON_MAX_PATCHES),
+                    )
+
+    def test_float_resize_rounds_once(self):
+        import numpy as np
+        from PIL import Image
+
+        rng = np.random.default_rng(3)
+        source = Image.fromarray(rng.integers(0, 256, (37, 53, 3), dtype=np.uint8))
+        resized = np.asarray(images.resize_float(source, 96, 64))
+        expected = np.stack(
+            [
+                np.asarray(
+                    channel.convert("F").resize((96, 64), Image.Resampling.BICUBIC)
+                )
+                for channel in source.split()
+            ],
+            -1,
+        )
+        self.assertEqual(resized.shape, (64, 96, 3))
+        self.assertTrue((resized == np.clip(np.floor(expected + 0.5), 0, 255)).all())
+
+    def test_prepare_resizes_by_the_family_rule(self):
+        prepared = images.prepare(png_bytes(48, 48), images.MAX_PIXELS, "nemotron")
+        self.assertEqual((prepared.grid_height, prepared.grid_width), (32, 32))
+        cache = images.ImageCache()
+        payload = png_bytes(64, 64)
+        qwen = cache.prepare(payload, images.MAX_PIXELS)
+        nemotron = cache.prepare(payload, images.MAX_PIXELS, "nemotron")
+        self.assertEqual((qwen.grid_height, nemotron.grid_height), (16, 32))
 
 
 class PrepareTest(unittest.TestCase):
@@ -318,6 +391,321 @@ class ImageRequestTest(HarnessTestCase):
         )
         self.assertEqual(harness.app.images.stats()["entries"], 1)
         self.assertEqual(runtime.requests[1].frame.image_spans, request.image_spans)
+
+    @staticmethod
+    def nemotron_tokenizer():
+        """Byte-level BPE, as PromptTokenizer requires, with Nemotron's turn
+        and image tokens added."""
+        from tokenizers import AddedToken, decoders, pre_tokenizers, trainers
+        from transformers import PreTrainedTokenizerFast
+
+        backend = Tokenizer(models.BPE())
+        backend.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=False)
+        backend.decoder = decoders.ByteLevel()
+        backend.train_from_iterator(
+            ["user assistant system Compare And? Done"],
+            trainers.BpeTrainer(
+                vocab_size=300,
+                initial_alphabet=pre_tokenizers.ByteLevel.alphabet(),
+                show_progress=False,
+            ),
+        )
+        backend.add_special_tokens(
+            [
+                AddedToken(text, normalized=False, lstrip=False, rstrip=False)
+                for text in (
+                    "<|im_start|>",
+                    "<|im_end|>",
+                    NEMOTRON.image_pad,
+                    NEMOTRON.image_open,
+                    NEMOTRON.image_close,
+                )
+            ]
+        )
+        return PreTrainedTokenizerFast(tokenizer_object=backend)
+
+    @staticmethod
+    def nemotron_app(tokenizer, max_context):
+        """A frontend of just what rendering a Nemotron prompt reads."""
+        from server.latency import LatencyMetrics
+        from server.tokenization import PromptTokenizer
+
+        app = object.__new__(request_frontend.Frontend)
+        app.tokenizer = tokenizer
+        app.chat_format = NEMOTRON
+        app.latencies = LatencyMetrics()
+        app.prompt_tokenizer = PromptTokenizer(
+            tokenizer, NEMOTRON.message_boundary, max_context
+        )
+        app.backend = SimpleNamespace(
+            runtime=SimpleNamespace(
+                capabilities=SimpleNamespace(max_context_tokens=max_context)
+            )
+        )
+        return app
+
+    @staticmethod
+    def render(app, messages, source, videos=(), count=None):
+        """As _render_prompt renders: the prompt's tokens, its text, and
+        each image's pad among the tokens."""
+        from server.tokenization import unquoted
+
+        if videos:
+            source = app._video_source(source)
+        rendered = app._apply_chat_template(messages, source, {})
+        if videos:
+            rendered = app._expand_videos(rendered, videos)
+        tokens = app.prompt_tokenizer.encode(rendered)
+        pad_id = app.tokenizer.convert_tokens_to_ids(NEMOTRON.image_pad)
+        if count is None:
+            count = tokens.count(pad_id)
+        return tokens, app._image_positions(tokens, count), unquoted(rendered)
+
+    def test_nemotron_images_mark_template_sites_and_wrap_pads(self):
+        tokenizer = self.nemotron_tokenizer()
+        fixtures_dir = Path(__file__).resolve().parents[1] / "fixtures"
+        source = (fixtures_dir / "chat_templates/bolt.jinja").read_text()
+        template = {"tokenize": True, "return_dict": False, "chat_template": source}
+        app = self.nemotron_app(tokenizer, 1024)
+        image = {"type": "image_url", "image_url": {"url": "unused"}}
+        messages = [
+            # Text quoting the placeholder is not an image.
+            {"role": "system", "content": "Read <image> literally"},
+            # Several images in a message are numbered: <image 1><image>...
+            {
+                "role": "user",
+                "content": [image, image, {"type": "text", "text": "Compare"}],
+            },
+            {"role": "assistant", "content": "Done"},
+            {"role": "user", "content": [image, {"type": "text", "text": "And?"}]},
+        ]
+        baseline = tokenizer.apply_chat_template(messages, **template)
+        pad, image_open, image_close = tokenizer.convert_tokens_to_ids(
+            [NEMOTRON.image_pad, NEMOTRON.image_open, NEMOTRON.image_close]
+        )
+        # The tokenizer alone reads the system message's <image> as a pad too.
+        self.assertEqual(baseline.count(pad), 4)
+        tokens, positions, rendered = self.render(app, messages, source, count=3)
+        self.assertEqual(tokenizer.decode(tokens), rendered)
+        self.assertIn("<image 1><image><image 2><image>Compare", rendered)
+        self.assertEqual(positions, [i for i, t in enumerate(tokens) if t == pad])
+        prepared = [
+            SimpleNamespace(
+                tokens=4,
+                grid_height=4,
+                grid_width=4,
+                digest_lo=i,
+                digest_hi=0,
+                pixels=bytes([i]),
+                frames=1,
+            )
+            for i in (1, 2, 3)
+        ]
+        expanded, spans, _ = app._expand_image_pads(tokens, prepared, positions)
+        expected = list(tokens)
+        for position in reversed(positions):
+            expected[position : position + 1] = [image_open, *[pad] * 4, image_close]
+        self.assertEqual(expanded, expected)
+        # The count a request is checked against includes each image's tags.
+        self.assertEqual(app._image_token_count(tokens, prepared), len(expected))
+        self.assertEqual(
+            [span.offset for span in spans],
+            [position + 1 + 5 * i for i, position in enumerate(positions)],
+        )
+        # Text that quotes the placeholder reaches the template quoted, so the
+        # template still writes the message's image, and the quote stays text.
+        quoting = [
+            {"role": "user", "content": [image, {"type": "text", "text": "<image>"}]}
+        ]
+        tokens, positions, rendered = self.render(app, quoting, source, count=1)
+        self.assertEqual(rendered.count("<image>"), 2)
+        self.assertEqual(tokens.count(pad), 1)
+        with self.assertRaisesRegex(api.APIError, "image count"):
+            self.render(app, quoting, source, count=2)
+
+    def test_images_resize_as_their_familys_processor_does(self):
+        image = SimpleNamespace(tokens=4, pixels=b"\x00")
+        for chat_format in (QWEN, NEMOTRON):
+            with self.subTest(resize=chat_format.image_resize):
+                app = object.__new__(request_frontend.Frontend)
+                app.chat_format = chat_format
+                app.max_image_pixels = 1 << 20
+                app.images = mock.Mock(request_batch=type("Batch", (list,), {}))
+                app.images.prepare.return_value = image
+                app._check_image_request_size = mock.Mock()
+                part = {"type": "image_url", "image_url": {"url": "unused"}}
+                with mock.patch.object(
+                    request_frontend.image_input, "decode_data_url", return_value=b""
+                ):
+                    prepared = app._prepare_images(
+                        [{"role": "user", "content": [part]}],
+                        deadline=time.monotonic() + 60,
+                    )
+                self.assertEqual(prepared, [image])
+                app.images.prepare.assert_called_once_with(
+                    b"", 1 << 20, chat_format.image_resize
+                )
+
+    def test_nemotron_videos_widen_to_labeled_tubelets(self):
+        """As Nemotron Omni's processor widens <video>: each tubelet's label,
+        then its run, the runs a line apart; spans carry both frames."""
+        tokenizer = self.nemotron_tokenizer()
+        fixtures_dir = Path(__file__).resolve().parents[1] / "fixtures"
+        source = (fixtures_dir / "chat_templates/bolt.jinja").read_text()
+        app = self.nemotron_app(tokenizer, 4096)
+        video = {"type": "video_url", "video_url": {"url": "unused"}}
+        image = {"type": "image_url", "image_url": {"url": "unused"}}
+        messages = [
+            {
+                "role": "user",
+                "content": [video, image, {"type": "text", "text": "What changed?"}],
+            }
+        ]
+        labels = images._frame_labels([0, 30, 60], 30.0)
+        self.assertEqual(
+            labels,
+            (
+                "Frame 1 sampled at 0.00 seconds and frame 2 sampled at 0.99 seconds: ",
+                "Frame 3 sampled at 1.98 seconds: ",
+            ),
+        )
+        tokens, positions, rendered = self.render(
+            app, messages, source, [labels], count=3
+        )
+        self.assertIn(
+            f"{labels[0]}<image>\n{labels[1]}<image><image>What changed?", rendered
+        )
+        tubelet = SimpleNamespace(
+            tokens=4,
+            grid_height=4,
+            grid_width=4,
+            digest_lo=1,
+            digest_hi=0,
+            pixels=bytes(2),
+            frames=2,
+        )
+        picture = SimpleNamespace(
+            tokens=4,
+            grid_height=4,
+            grid_width=4,
+            digest_lo=2,
+            digest_hi=0,
+            pixels=bytes(1),
+            frames=1,
+        )
+        expanded, spans, _ = app._expand_image_pads(
+            tokens, [tubelet, tubelet, picture], positions
+        )
+        self.assertEqual([span.frames for span in spans], [2, 2, 1])
+        self.assertEqual(tokenizer.decode(expanded).count(f"{NEMOTRON.image_open}"), 3)
+        with self.assertRaisesRegex(api.APIError, "video count"):
+            app._expand_videos(
+                app._apply_chat_template(messages, app._video_source(source), {}), []
+            )
+
+    def test_pruned_video_folds_into_one_span(self):
+        """EVS folds a video's tubelets into one span: the text between them,
+        then the kept rows; later spans shift and the cuts follow the pixels."""
+        app = object.__new__(request_frontend.Frontend)
+        tubelet = SimpleNamespace(tokens=4)
+        prepared = [tubelet, tubelet, SimpleNamespace(tokens=4)]
+        # label, <img>, 4 pads, </img>, \n, label, <img>, 4 pads, </img>, text, image
+        expanded = [100, 10, 1, *[0] * 4, 2, 11, 12, 1, *[0] * 4, 2, 99, 1, *[0] * 4, 2]
+        spans = [
+            native_wire.ImageSpan(offset, 4, 4, 4, lo, 0, frames)
+            for offset, lo, frames in ((3, 1, 2), (11, 2, 2), (18, 3, 1))
+        ]
+
+        def prune(rate):
+            app.video_pruning = rate
+            return app._prune_videos(
+                expanded, spans, [b"a", b"b", b"c"], prepared, [(0, 2)], 0
+            )
+
+        tokens, folded, pixels = prune(0.5)
+        self.assertEqual(
+            tokens, [100, 10, 1, 2, 11, 12, 1, *[0] * 4, 2, 99, 1, *[0] * 4, 2]
+        )
+        video, picture = folded
+        self.assertEqual(
+            (
+                video.offset,
+                video.tokens,
+                video.frames,
+                video.tubelets,
+                video.text_tokens,
+            ),
+            (3, 8, 2, 2, 4),
+        )
+        self.assertEqual((picture.offset, picture.tokens, picture.tubelets), (14, 4, 1))
+        self.assertEqual(pixels, [b"ab" + struct.pack("<2I", 0, 4), b"c"])
+        # The first tubelet always stays, and the digest covers the kept count.
+        self.assertEqual(prune(0.75)[1][0].tokens, 4 + 4)
+        lighter = prune(0.2)[1][0]
+        self.assertEqual(lighter.tokens, 4 + 6)
+        self.assertNotEqual(lighter.digest_lo, video.digest_lo)
+        # The rows hold the text's embeddings: another label of the same
+        # length, as another timestamp, is another span.
+        expanded[9] = 13
+        self.assertNotEqual(prune(0.5)[1][0].digest_lo, video.digest_lo)
+        app.video_pruning = 0
+        self.assertEqual(app._kept_rows(prepared, 0, 2), 8)
+
+    def test_a_slow_video_decoder_reports_its_time_limit(self):
+        import os
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as directory:
+            decoder = Path(directory) / "splash"
+            decoder.write_text("#!/bin/sh\nexec sleep 5\n")
+            os.chmod(decoder, 0o755)
+            with self.assertRaisesRegex(images.ImageError, "longer than 0.5 seconds"):
+                images.prepare_video(b"", str(decoder), 1.0, 128, 0.5)
+
+    def test_video_size_is_the_coded_frames_not_the_track_header(self):
+        """The track header says 128.89 wide (MVBench's scene clips do this);
+        the frames decode 128 wide, as OpenCV reads them."""
+        root = Path(__file__).resolve().parents[3]
+        binary = root / "build/splash"
+        if not binary.exists():
+            self.skipTest("needs build/splash")
+        clip = root / "dev/tests/fixtures/videos/tkhd_wider_than_coded.mp4"
+        video = images.prepare_video(clip.read_bytes(), str(binary), 1.0, 128, 30.0)
+        self.assertEqual(len(video.tubelets), 1)
+
+    def test_sampled_frames_decode_as_a_full_decode_does(self):
+        """H.264 with B-frames and 2.5 s open GOPs, sampled each second: the
+        decoder skips the runs no sampled frame needs, and a sampled frame just
+        before a sync frame starts a GOP earlier. The hash is a full decode's."""
+        import hashlib
+        import subprocess
+
+        root = Path(__file__).resolve().parents[3]
+        binary = root / "build/splash"
+        if not binary.exists():
+            self.skipTest("needs build/splash")
+        clip = root / "dev/tests/fixtures/videos/open_gop_bframes.mp4"
+        output = subprocess.run(
+            [binary, "video-frames", clip, "1", "128"], capture_output=True, check=True
+        ).stdout
+        self.assertEqual(
+            hashlib.sha256(output).hexdigest(),
+            "cfcd36debd1f836fb013044d50050209cfe547c6cb8dcdb036f9e882d4977d15",
+        )
+
+    def test_video_frames_resize_as_the_processor_does(self):
+        # _compute_target_patches_video: 1024 patches, sides even.
+        for (height, width), patches in {
+            (1080, 1920): (24, 42),
+            (512, 512): (32, 32),
+            (1920, 1080): (42, 24),
+            (480, 640): (28, 36),
+            (100, 4000): (4, 202),
+        }.items():
+            self.assertEqual(
+                images.video_resize(height, width),
+                (patches[0] * 16, patches[1] * 16),
+            )
 
     def test_image_size_is_checked_before_pixel_concatenation(self):
         app = self.harness(FakeRuntime(), tokenizer=ImagePadTokenizer()).app
@@ -588,6 +976,24 @@ class ImageRequestTest(HarnessTestCase):
         pad = app.tokenizer.convert_tokens_to_ids(QWEN.image_pad)
         with self.assertRaisesRegex(api.APIError, "context window"):
             app._expand_image_pads([pad], [image], [0])
+
+    def test_video_context_counts_the_rows_pruning_keeps(self):
+        app = self.harness(FakeRuntime(), tokenizer=ImagePadTokenizer()).app
+        # Ten tubelets hold 2.5 contexts; the 30% EVS keeps, 0.75 of one.
+        rows = app.max_context // 4
+        tubelet = SimpleNamespace(tokens=rows, pixels=b"")
+        video = SimpleNamespace(tubelets=[tubelet] * 10, labels=())
+        messages = [{"content": [{"type": "video_url", "video_url": {"url": "x"}}]}]
+        app.video_decoder = "splash"
+        with (
+            mock.patch.object(images, "decode_data_url"),
+            mock.patch.object(app.images, "prepare_video", return_value=video),
+        ):
+            app.video_pruning = 0.7
+            self.assertEqual(len(app._prepare_images(messages, FOREVER)), 10)
+            app.video_pruning = 0
+            with self.assertRaisesRegex(api.APIError, "context"):
+                app._prepare_images(messages, FOREVER)
 
     def test_image_preparation_stops_at_aggregate_budget(self):
         app = self.harness(FakeRuntime()).app

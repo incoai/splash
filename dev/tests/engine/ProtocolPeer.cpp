@@ -114,6 +114,9 @@ FrameType write(Writer &out, const RequestFrame &request) {
     out.u32(span.gridWidth);
     out.u64(span.digestLo);
     out.u64(span.digestHi);
+    out.u32(span.frames);
+    out.u32(span.tubelets);
+    out.u32(span.textTokens);
   }
   out.raw(request.imagePixels);
   out.words(request.scoreTokens);

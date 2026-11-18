@@ -28,8 +28,10 @@ DENSE = families.named("Qwen3.8-27B")
 MOE = families.named("Qwen3.6-35B-A3B")
 FLASH_NEXT = families.named("Qwen3.8-Flash-Next")
 FLINT = families.named("Flint")
+BOLT = families.named("Nemotron-3.5-Bolt")
+SUPER = families.named("Nemotron-3.5-Super")
 # The families whose targets the engine loads from a GGUF only.
-GGUF_ONLY = (FLASH_NEXT, FLINT)
+GGUF_ONLY = (FLASH_NEXT, FLINT, BOLT, SUPER)
 MODEL = "mlx-community/Qwen3.8-27B-4bit"
 # An MLX config.json (of a GGUF_ONLY family, the one the installer derives
 # from its GGUF), a DFlash2 draft config and, of Qwen3.6-35B-A3B and the
@@ -130,7 +132,10 @@ def tensor_table(family=MOE):
     unsloth/Qwen3.6-35B-A3B-GGUF's Qwen3.6-35B-A3B-UD-Q4_K_M.gguf (revision
     a483e9e6cbd595906af30beda3187c2663a1118c), Qwen3.8-Flash-Next's the three
     parts of unsloth/Qwen3.8-Flash-Next-GGUF's UD-IQ3_XXS (revision
-    766911a6b7369840a91dbcd95f9f997acaab6cd6), whose headers alone were read."""
+    766911a6b7369840a91dbcd95f9f997acaab6cd6), Nemotron 3.5 Bolt's
+    nvidia/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB-GGUF's, Nemotron 3.5 Super's
+    ggml-org's NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4.gguf, whose
+    headers alone were read."""
     return [
         (name, extents, GGML[kind])
         for name, (kind, extents) in family_config(family, "gguf-tensors.json").items()
@@ -328,7 +333,10 @@ def fake_hub(test, cache, *, target=DENSE, commit="a" * 40):
     fake = FakeHub(test, cache)
     fake.publish(MODEL, commit, lambda p: mlx_target(p, target))
     for family in families.FAMILIES:
-        fake.publish(family.draft_repo, DRAFT_COMMIT, lambda p: draft_dir(p, family))
+        if family.draft_repo:
+            fake.publish(
+                family.draft_repo, DRAFT_COMMIT, lambda p: draft_dir(p, family)
+            )
     return fake
 
 

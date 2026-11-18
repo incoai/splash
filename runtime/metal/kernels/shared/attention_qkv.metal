@@ -64,6 +64,30 @@
         SPLASH_LANE_BINDING(group.z, page_table0, page_table1, page_table2, page_table3), layout, params,     \
         reductions, normalized, maxima, group, thread_index, lane, simd_group);                              \
   }
+// A geometry without q/k norms (Nemotron-H's) binds neither norms nor
+// tables: no RoPE and no output gate either.
+#define ATTENTION_QKV_UNNORMED(Name, QHeads, KHeads, HeadDim, CacheElement)                                   \
+  kernel void Name(                                                                                          \
+      device const bfloat *qkv [[buffer(0)]],                                                                \
+      device bfloat *queries [[buffer(1)]],                                                                  \
+      device const SplashKvPage *page_table0 [[buffer(2)]],                                                  \
+      device const SplashKvPage *page_table1 [[buffer(3)]],                                                  \
+      device const SplashKvPage *page_table2 [[buffer(4)]],                                                  \
+      device const SplashKvPage *page_table3 [[buffer(5)]],                                                  \
+      device const SplashLaneRows *layout [[buffer(6)]],                                                     \
+      constant SplashAttentionParams &params [[buffer(7)]],                                                  \
+      uint3 group [[threadgroup_position_in_grid]],                                                          \
+      uint thread_index [[thread_index_in_threadgroup]],                                                     \
+      uint lane [[thread_index_in_simdgroup]],                                                               \
+      uint simd_group [[simdgroup_index_in_threadgroup]]) {                                                  \
+    threadgroup float reductions[HeadDim / 32];                                                              \
+    threadgroup bfloat normalized[HeadDim];                                                                  \
+    SPLASH_STORE_MAXIMA_##CacheElement(HeadDim)                                                              \
+    full_qkv_storage_phase<QHeads, KHeads, HeadDim, 0, false, bfloat, CacheElement, false, false>(           \
+        qkv, nullptr, nullptr, nullptr, nullptr, queries,                                                    \
+        SPLASH_LANE_BINDING(group.z, page_table0, page_table1, page_table2, page_table3), layout, params,     \
+        reductions, normalized, maxima, group, thread_index, lane, simd_group);                              \
+  }
 // Each geometry's instances for its pages' formats and the norm types its
 // families store: bf16 (an MLX target's) and F32, or F32 alone for
 // Qwen3.8-Flash-Next's (_kv2_g12, whose pages hold token-major values) and
@@ -85,6 +109,11 @@ ATTENTION_QKV_FORMATS(_kv2_g16_f32, 32, 2, 256, 32, true, float, false)
 ATTENTION_QKV_FORMATS(_kv4_g8_d128_f32, 32, 4, 128, 64, false, float, false)
 ATTENTION_QKV_NOPE(attention_q8_qkv_kv4_g8_d128_nope_f32, 32, 4, 128, false, float, int8_t, false)
 ATTENTION_QKV_NOPE(attention_bf16_qkv_kv4_g8_d128_nope_f32, 32, 4, 128, false, float, bfloat, false)
+// Two KV heads of 128 dimensions without q/k norms, RoPE or an output gate
+// (Nemotron 3.5 Bolt's and Super's).
+ATTENTION_QKV_UNNORMED(attention_q8_qkv_kv2_g16_d128_nope, 32, 2, 128, int8_t)
+ATTENTION_QKV_UNNORMED(attention_bf16_qkv_kv2_g16_d128_nope, 32, 2, 128, bfloat)
+#undef ATTENTION_QKV_UNNORMED
 #undef ATTENTION_QKV_FORMATS
 #undef ATTENTION_QKV_NOPE
 #undef ATTENTION_QKV

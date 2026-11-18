@@ -111,6 +111,7 @@ PAGED_ATTENTION_SPLIT(attention_q8_split_kv2_g16, 2, 16, 256, 0, int8_t, false)
 // of the 512 keys before each row.
 PAGED_ATTENTION_SPLIT(attention_q8_split_kv4_g8_d128, 4, 8, 128, 0, int8_t, false)
 PAGED_ATTENTION_SPLIT(attention_q8_split_kv4_g8_d128_w512, 4, 8, 128, 512, int8_t, false)
+PAGED_ATTENTION_SPLIT(attention_q8_split_kv2_g16_d128, 2, 16, 128, 0, int8_t, false)
 // INT8 query codes against the INT8 keys, where a split reads enough pages
 // (AttentionCalibration::int8QueriesFromPages).
 PAGED_ATTENTION_SPLIT(attention_q8q_split, 4, 6, 256, 0, int8_t, true)
@@ -118,12 +119,14 @@ PAGED_ATTENTION_SPLIT(attention_q8q_split_kv2_g8, 2, 8, 256, 0, int8_t, true)
 PAGED_ATTENTION_SPLIT(attention_q8q_split_kv2_g16, 2, 16, 256, 0, int8_t, true)
 PAGED_ATTENTION_SPLIT(attention_q8q_split_kv4_g8_d128, 4, 8, 128, 0, int8_t, true)
 PAGED_ATTENTION_SPLIT(attention_q8q_split_kv4_g8_d128_w512, 4, 8, 128, 512, int8_t, true)
+PAGED_ATTENTION_SPLIT(attention_q8q_split_kv2_g16_d128, 2, 16, 128, 0, int8_t, true)
 // BF16 shares the page loop and reduction, without quantization scales.
 PAGED_ATTENTION_SPLIT(attention_bf16_split, 4, 6, 256, 0, bfloat, false)
 PAGED_ATTENTION_SPLIT(attention_bf16_split_kv2_g8, 2, 8, 256, 0, bfloat, false)
 PAGED_ATTENTION_SPLIT(attention_bf16_split_kv2_g16, 2, 16, 256, 0, bfloat, false)
 PAGED_ATTENTION_SPLIT(attention_bf16_split_kv4_g8_d128, 4, 8, 128, 0, bfloat, false)
 PAGED_ATTENTION_SPLIT(attention_bf16_split_kv4_g8_d128_w512, 4, 8, 128, 512, bfloat, false)
+PAGED_ATTENTION_SPLIT(attention_bf16_split_kv2_g16_d128, 2, 16, 128, 0, bfloat, false)
 #undef PAGED_ATTENTION_SPLIT
 
 // Bindings: the partials and statistics, the projection's packed rows (a
@@ -181,6 +184,8 @@ PAGED_ATTENTION_SPLIT(attention_bf16_split_kv4_g8_d128_w512, 4, 8, 128, 512, bfl
 PAGED_ATTENTION_REDUCE(attention_reduce, 4, 6, 256, 0, true)
 PAGED_ATTENTION_REDUCE(attention_reduce_kv2_g8, 2, 8, 256, 0, true)
 PAGED_ATTENTION_REDUCE(attention_reduce_kv2_g16, 2, 16, 256, 0, true)
+// Nemotron-H's layers have no output gate (nor sinks).
+PAGED_ATTENTION_REDUCE(attention_reduce_kv2_g16_d128, 2, 16, 128, 0, false)
 // Flint's layers have no output gate.
 PAGED_ATTENTION_SINK_REDUCE(attention_reduce_kv4_g8_d128_sinks, 4, 8, 128, 0, false)
 PAGED_ATTENTION_SINK_REDUCE(attention_reduce_kv4_g8_d128_w512_sinks, 4, 8, 128, 512, false)

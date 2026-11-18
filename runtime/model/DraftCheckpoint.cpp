@@ -1,5 +1,6 @@
 #include "model/DraftCheckpoint.hpp"
 #include "metal/abi/DraftAttention.h"
+#include "metal/abi/LiLiCorr.h"
 #include "model/DFlashDraft.hpp"
 #include "model/GgufPreparation.hpp"
 
@@ -70,6 +71,7 @@ gguf::Image layerImage(const SafetensorsCheckpoint &checkpoint, const DFlashDraf
                hidden);
   b.stored(attention + "q_norm.weight", {layout.attentionHeadDimension});
   b.stored(attention + "k_norm.weight", {layout.attentionHeadDimension});
+  if (layout.attentionSinks) b.stored(attention + "sinks", {layout.attentionSize / layout.attentionHeadDimension});
   b.projection({{attention + "o_proj", hidden}}, layout.attentionSize);
   b.stored(prefix + "post_attention_layernorm.weight", {hidden});
   convolution(prefix + "mlp_conv");
@@ -86,10 +88,46 @@ gguf::Image modelImage(const SafetensorsCheckpoint &checkpoint, const DFlashDraf
   b.projection({{"fc", hidden}}, layout.targetHiddenSize());
   b.stored("hidden_norm.weight", {hidden});
   b.stored("norm.weight", {hidden});
-  b.projection({{selector + "hidden_projection", layout.selectorRank}}, hidden);
-  b.stored(selector + "predecessor_codebook", {layout.vocabularySize, layout.selectorRank});
-  b.stored(selector + "successor_codebook", {layout.vocabularySize, layout.selectorRank});
+  if (!layout.lilicorr) {
+    b.projection({{selector + "hidden_projection", layout.selectorRank}}, hidden);
+    b.stored(selector + "predecessor_codebook", {layout.vocabularySize, layout.selectorRank});
+    b.stored(selector + "successor_codebook", {layout.vocabularySize, layout.selectorRank});
+  }
   if (checkpoint.find(kDraftMaskEmbedding)) b.stored(std::string(kDraftMaskEmbedding), {hidden});
+  if (layout.lilicorr) {
+    // In loadDFlashDraftWeights' order (readLiLiCorr).
+    constexpr uint64_t width = SPLASH_LILICORR_HIDDEN;
+    const auto linear = [&](const std::string &name, uint64_t rows, uint64_t columns) {
+      b.projection({{"lilicorr." + name, rows}}, columns);
+      b.stored("lilicorr." + name + ".bias", {rows});
+    };
+    linear("token_proj", width, hidden);
+    linear("pass_proj", width, hidden);
+    linear("context_proj", width, hidden);
+    b.stored("lilicorr.feature_norm.weight", {SPLASH_LILICORR_FEATURES});
+    b.stored("lilicorr.feature_norm.bias", {SPLASH_LILICORR_FEATURES});
+    b.stored("lilicorr.feature_up.weight", {width, SPLASH_LILICORR_FEATURES});
+    b.stored("lilicorr.feature_up.bias", {width});
+    linear("feature_down", width, width);
+    b.stored("lilicorr.slot_embedding", {SPLASH_DRAFT_PROPOSAL_TOKENS, width});
+    b.stored("lilicorr.rank_embedding", {SPLASH_LILICORR_CANDIDATES, width});
+    b.stored("lilicorr.attention_bias", {SPLASH_LILICORR_HEADS, SPLASH_LILICORR_NODES, SPLASH_LILICORR_NODES});
+    for (uint32_t i = 0; i < SPLASH_LILICORR_LAYERS; ++i) {
+      const std::string prefix = "layers." + std::to_string(i) + ".";
+      b.stored("lilicorr." + prefix + "attn_norm", {width});
+      linear(prefix + "in_proj", 3 * width, width);
+      linear(prefix + "out_proj", width, width);
+      b.stored("lilicorr." + prefix + "mlp_norm", {width});
+      linear(prefix + "up", SPLASH_LILICORR_MLP, width);
+      linear(prefix + "down", width, SPLASH_LILICORR_MLP);
+    }
+    b.stored("lilicorr.output_norm", {width});
+    b.stored("lilicorr.anchor_norm", {width});
+    linear("factor_proj", width, 3 * width);
+    linear("out_head", width, width);
+    linear("in_head", width, width);
+    linear("anchor_out_head", width, width);
+  }
   return b.finish();
 }
 

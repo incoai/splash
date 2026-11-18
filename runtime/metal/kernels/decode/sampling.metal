@@ -1,4 +1,5 @@
 #include "metal/abi/KernelABI.h"
+#include "metal/abi/LiLiCorr.h"
 #include "metal/kernels/common/split_reduce.h"
 
 // The rows of the target policy. A greedy lane takes each row's argmax. A
@@ -1350,6 +1351,69 @@ kernel void draft_select_edges(
       score = simd_sum(score);
       if (lane == 0)
         table[predecessor_index * Candidates + first_candidate + j] = score;
+    }
+  }
+}
+
+// The LiLiCorr selector's candidates (metal/abi/LiLiCorr.h): one group of
+// 1024 threads per proposal row merges its shard partials as
+// draft_select_edges does, keeps the sixteen candidates for draft_select_tree, of
+// which the first eight have unary 0 and the rest -inf (lilicorr_scores
+// writes their edges), writes those eight's ids, and their features' layer
+// norm and MLP up projection with SiLU, a bf16 row of SPLASH_LILICORR_HIDDEN
+// values per candidate.
+kernel void lilicorr_candidates(
+    device const uint *partial_ids [[buffer(0)]],
+    device const float *partial_values [[buffer(1)]],
+    device uint *candidates [[buffer(2)]], device float *unary [[buffer(3)]],
+    device const float *lse [[buffer(4)]], device uint *ids [[buffer(5)]],
+    device const bfloat *norm_weight [[buffer(6)]],
+    device const bfloat *norm_bias [[buffer(7)]],
+    device const bfloat *up [[buffer(8)]],
+    device const bfloat *up_bias [[buffer(9)]],
+    device bfloat *features [[buffer(10)]],
+    uint row [[threadgroup_position_in_grid]],
+    uint thread_index [[thread_index_in_threadgroup]],
+    uint threads [[threads_per_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]]) {
+  constexpr uint K = SPLASH_DRAFT_CANDIDATES;
+  constexpr uint C = SPLASH_LILICORR_CANDIDATES;
+  constexpr uint F = SPLASH_LILICORR_FEATURES;
+  constexpr uint W = SPLASH_LILICORR_HIDDEN;
+  threadgroup float normalized[C][F];
+  if (simd_group == 0) {
+    float value;
+    uint token;
+    top16_merge_shards(partial_ids, partial_values, row, lane, value, token);
+    if (lane < K) {
+      candidates[row * K + lane] = token;
+      unary[row * K + lane] = lane < C ? 0.0f : -INFINITY;
+    }
+    const float best = simd_broadcast(value, 0);
+    if (lane < C) {
+      ids[row * C + lane] = token;
+      const float log_p = value - lse[row];
+      const float f[F] = {log_p, exp(log_p), value - best, float(lane) / float(C - 1), lane == 0 ? 1.0f : 0.0f};
+      float mean = 0.0f;
+      for (uint k = 0; k < F; ++k) mean += f[k];
+      mean /= F;
+      float variance = 0.0f;
+      for (uint k = 0; k < F; ++k) variance += (f[k] - mean) * (f[k] - mean);
+      const float inverse = rsqrt(variance / F + SPLASH_LILICORR_FEATURE_EPSILON);
+      for (uint k = 0; k < F; ++k)
+        normalized[lane][k] = (f[k] - mean) * inverse * float(norm_weight[k]) + float(norm_bias[k]);
+    }
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  for (uint j = thread_index; j < W; j += threads) {
+    float w[F];
+    for (uint k = 0; k < F; ++k) w[k] = float(up[j * F + k]);
+    const float b = float(up_bias[j]);
+    for (uint c = 0; c < C; ++c) {
+      float v = b;
+      for (uint k = 0; k < F; ++k) v += w[k] * normalized[c][k];
+      features[(ulong(row) * C + c) * W + j] = bfloat(v / (1.0f + exp(-v)));
     }
   }
 }

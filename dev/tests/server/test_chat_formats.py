@@ -898,12 +898,14 @@ class ServedFamilyTests(unittest.TestCase):
     """main() reads its output in the chat format of the family the model was
     installed as, which its assembly records, and serves no other."""
 
-    def main(self, family):
+    def main(self, family, **args):
         runtime = mock.Mock()
         runtime.capabilities = fixtures.engine_ready(131072)
         tokenizer = object()
         with (
-            mock.patch.object(api, "parse_args", return_value=fixtures.main_args()),
+            mock.patch.object(
+                api, "parse_args", return_value=fixtures.main_args(**args)
+            ),
             fixtures.unprepared_hold(family),
             mock.patch.object(api, "load_thinking_key", return_value=None),
             mock.patch.object(
@@ -964,6 +966,15 @@ class ServedFamilyTests(unittest.TestCase):
             "is not prepared as a model of a family this release serves",
             started.status.call_args_list[-1].args[0],
         )
+
+    def test_a_state_format_the_family_does_not_keep_is_refused(self):
+        started = self.main("Nemotron-3.5-Bolt", state_format="bf16")
+        started.runtime_type.assert_not_called()
+        self.assertIn(
+            "keeps its recurrent state in fp32 only",
+            started.status.call_args_list[-1].args[0],
+        )
+        self.main("Qwen3.8-27B", state_format="bf16").runtime_type.assert_called_once()
 
 
 if __name__ == "__main__":

@@ -154,8 +154,11 @@ struct ExpertStoreOptions final {
 class ExpertStore final : public ops::MoeExpertStream, public WeightMemory {
 public:
   // Allocates the chunks, the staging and the slot tables, and reads the
-  // experts of the sizes of one block. Throws std::invalid_argument when a
-  // block's experts differ from `shape`, when options.memoryBytes, less
+  // experts of the sizes of one block. `shape` is every block's but for its
+  // experts and width, which its down projection gives (Nemotron-H's blocks
+  // differ in both): its experts the most of any block's and its width the
+  // widest. Throws std::invalid_argument when a block's experts do not fit
+  // `shape`, when options.memoryBytes, less
   // the staging and tables (fixedBytes), holds fewer slots than a block's
   // experts of each streamed size and every expert of a size of one block,
   // when a streamed size's slots would take more than MOE_EXPERT_MAX_CHUNKS

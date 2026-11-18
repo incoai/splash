@@ -137,6 +137,13 @@ void testFamilies(const std::filesystem::path &fixtures) {
               flashDescriptor.targetSource == model::TargetSource::Gguf &&
               flashDescriptor.draft == test::flashNextDraft(),
           "a GGUF Qwen3.8-Flash-Next made another descriptor");
+  // Nemotron 3.5 Bolt's, with the LiLiCorr draft the installer converts.
+  const model::ModelDescriptor boltDescriptor =
+      inspect(mlxModel(fixtures, "nemotron-3.5-bolt").with(&SourceModel::record, R"("mlx-affine")", R"("gguf")"));
+  require(std::holds_alternative<model::NemotronHLayout>(boltDescriptor.target) &&
+              boltDescriptor.targetSource == model::TargetSource::Gguf &&
+              boltDescriptor.draft == test::nemotronBoltDraft(),
+          "a GGUF Nemotron 3.5 Bolt made another descriptor");
   // Its KV pages also hold the QSA indexer's pooled keys and its states the
   // PLE convolution's history and the indexer's pending keys, which another
   // family's do not.

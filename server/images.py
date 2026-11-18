@@ -8,9 +8,13 @@ resent in chat history.
 import base64
 import hashlib
 import io
+import json
 import math
 import struct
+import subprocess
+import tempfile
 import threading
+import time
 from dataclasses import dataclass
 
 from .lru import LRUCache
@@ -27,6 +31,20 @@ MAX_PIXELS = 4_194_304
 MAX_SOURCE_PIXELS = 32 * 1024 * 1024
 MAX_IMAGE_BYTES = 32 * 1024 * 1024
 IMAGE_FORMATS = ("JPEG", "PNG", "WEBP", "GIF")
+# Nemotron Omni's processor (Nemotron 3.5 Bolt): each image's patches
+# within these bounds.
+NEMOTRON_MIN_PATCHES = 1024
+NEMOTRON_MAX_PATCHES = 13312
+# Its video frames: about this many patches each, two frames to a tubelet.
+VIDEO_TARGET_PATCHES = 1024
+VIDEO_TUBELET = 2
+# Sampling as vLLM's Nemotron loader does it, at the model card's 1080p limits.
+VIDEO_FPS = 1.0
+VIDEO_MAX_FRAMES = 128
+# EVS: the share of a video's tubelet rows dropped as least changed from the
+# tubelet before (config.json video_pruning_rate, which HF applies).
+VIDEO_PRUNING = 0.7
+MAX_VIDEO_BYTES = 256 * 1024 * 1024
 
 
 class ImageError(ValueError):
@@ -44,6 +62,8 @@ class PreparedImage:
     pixels: bytes
     digest_lo: int
     digest_hi: int
+    # A video's tubelet holds two frames, one after the other, in one grid.
+    frames: int = 1
 
     @property
     def tokens(self) -> int:
@@ -51,20 +71,20 @@ class PreparedImage:
         return (self.grid_height // MERGE) * (self.grid_width // MERGE)
 
 
-def decode_data_url(url) -> bytes:
+def decode_data_url(url, kind="image", limit=MAX_IMAGE_BYTES) -> bytes:
     if not isinstance(url, str) or not url.startswith("data:"):
-        raise ImageError("only data: image URLs are supported")
+        raise ImageError(f"only data: {kind} URLs are supported")
     header, _, encoded = url.partition(",")
     if ";base64" not in header:
-        raise ImageError("image data URLs must be base64-encoded")
-    if len(encoded) > MAX_IMAGE_BYTES * 4 // 3 + 4:
-        raise ImageError("image exceeds the size limit")
+        raise ImageError(f"{kind} data URLs must be base64-encoded")
+    if len(encoded) > limit * 4 // 3 + 4:
+        raise ImageError(f"{kind} exceeds the size limit")
     try:
         raw = base64.b64decode(encoded, validate=True)
     except (ValueError, TypeError) as error:
-        raise ImageError("image data URL is not valid base64") from error
-    if len(raw) > MAX_IMAGE_BYTES:
-        raise ImageError("image exceeds the size limit")
+        raise ImageError(f"{kind} data URL is not valid base64") from error
+    if len(raw) > limit:
+        raise ImageError(f"{kind} exceeds the size limit")
     return raw
 
 
@@ -103,16 +123,106 @@ def smart_resize(height: int, width: int, max_pixels: int) -> tuple[int, int]:
     return h_bar, w_bar
 
 
-def prepare(payload: bytes, max_pixels: int = MAX_PIXELS) -> PreparedImage:
+def nemotron_resize(height: int, width: int, max_pixels: int) -> tuple[int, int]:
+    """Nemotron Omni's _compute_target_patches: about one patch per 16 pixels,
+    scaled down into the patch budget or up to its minimum, then each side
+    rounded to whole merge units. The serving cap bounds the budget and, as
+    in smart_resize, takes precedence over the minimum."""
+    if height <= 0 or width <= 0:
+        raise ImageError("image dimensions must be positive")
+    if not MIN_PIXELS <= max_pixels <= MAX_PIXELS:
+        raise ImageError("invalid image pixel budget")
+    if max(height, width) / min(height, width) > 200:
+        raise ImageError("absolute aspect ratio must be smaller than 200")
+    budget = min(max_patches(max_pixels), NEMOTRON_MAX_PATCHES)
+    # NVIDIA's processor's own rounding, ties to even: a whole odd count of patches
+    # gains one.
+    rows, cols = round(height / PATCH + 0.5), round(width / PATCH + 0.5)
+    factor = min(math.sqrt(budget / (rows * cols)), 1.0)
+    rows, cols = math.floor(factor * rows), math.floor(factor * cols)
+    if budget > NEMOTRON_MIN_PATCHES and rows * cols < NEMOTRON_MIN_PATCHES:
+        up = math.sqrt(NEMOTRON_MIN_PATCHES / (rows * cols))
+        rows, cols = math.ceil(up * rows), math.ceil(up * cols)
+    if rows % MERGE:
+        if (rows + MERGE - rows % MERGE) * cols <= budget:
+            rows += MERGE - rows % MERGE
+        else:
+            rows = max(MERGE, rows - rows % MERGE)
+    if cols % MERGE:
+        if rows * (cols + MERGE - cols % MERGE) <= budget:
+            cols += MERGE - cols % MERGE
+        else:
+            cols = max(MERGE, cols - cols % MERGE)
+    # The minimum's ceilings can overshoot a budget just above it.
+    while rows * cols > budget:
+        if rows >= cols:
+            rows -= MERGE
+        else:
+            cols -= MERGE
+    return rows * PATCH, cols * PATCH
+
+
+def video_resize(height: int, width: int) -> tuple[int, int]:
+    """Nemotron Omni's _compute_target_patches_video: VIDEO_TARGET_PATCHES
+    patches at the frame's aspect ratio, each side rounded up to whole merge
+    units where that stays within them, else both down."""
+    aspect = width / max(height, 1)
+    rows = max(round(math.sqrt(VIDEO_TARGET_PATCHES / aspect)), 1)
+    cols = max(round(math.sqrt(VIDEO_TARGET_PATCHES * aspect)), 1)
+    up_rows, up_cols = rows + rows % MERGE, cols + cols % MERGE
+    if up_rows * up_cols <= VIDEO_TARGET_PATCHES:
+        rows, cols = up_rows, up_cols
+    else:
+        rows, cols = max(MERGE, rows - rows % MERGE), max(MERGE, cols - cols % MERGE)
+    return rows * PATCH, cols * PATCH
+
+
+def resize_rgb(image, width: int, height: int):
+    from PIL import Image
+
+    return image.resize((width, height), Image.Resampling.BICUBIC)
+
+
+def resize_float(image, width: int, height: int):
+    """Antialiased bicubic on float pixels, rounded once: within 0.03 levels
+    of torch's interpolate(antialias=True), which Nemotron Omni's processor
+    resizes with. Pillow's RGB path rounds between its passes, up to 4 levels
+    off it."""
+    from PIL import Image
+
+    return Image.merge(
+        "RGB",
+        [
+            channel.convert("F")
+            .resize((width, height), Image.Resampling.BICUBIC)
+            .point(lambda value: value + 0.5)
+            .convert("L")  # Truncates and clamps: rounds half up.
+            for channel in image.split()
+        ],
+    )
+
+
+# Each family's resize rule (ChatFormat.image_resize): its target size, and
+# how it resizes to it.
+RESIZE_RULES = {
+    "qwen": (smart_resize, resize_rgb),
+    "nemotron": (nemotron_resize, resize_float),
+}
+
+
+def prepare(
+    payload: bytes, max_pixels: int = MAX_PIXELS, rule: str = "qwen"
+) -> PreparedImage:
     """Decode, convert to RGB, resize into the grid, and digest the pixels."""
     from PIL import Image, ImageOps
 
+    target, resize = RESIZE_RULES[rule]
     try:
         with Image.open(io.BytesIO(payload), formats=IMAGE_FORMATS) as decoded:
             if decoded.height * decoded.width > MAX_SOURCE_PIXELS:
                 raise ImageError("source image exceeds the pixel limit")
             stored = decoded.size
-            height, width = smart_resize(decoded.height, decoded.width, max_pixels)
+            height, width = target(decoded.height, decoded.width, max_pixels)
             try:
                 # Cameras store the sensor's orientation and an EXIF tag that
                 # turns it upright for display; show the model the upright one.
@@ -130,7 +240,7 @@ def prepare(payload: bytes, max_pixels: int = MAX_PIXELS) -> PreparedImage:
             else:
                 image = decoded.convert("RGB")
             if (image.height, image.width) != (height, width):
-                image = image.resize((width, height), Image.Resampling.BICUBIC)
+                image = resize(image, width, height)
             pixels = image.tobytes()
     except ImageError:
         raise
@@ -140,6 +250,119 @@ def prepare(payload: bytes, max_pixels: int = MAX_PIXELS) -> PreparedImage:
     digest = hashlib.sha256(struct.pack("<II", grid_height, grid_width) + pixels)
     digest_lo, digest_hi = struct.unpack_from("<QQ", digest.digest())
     return PreparedImage(grid_height, grid_width, pixels, digest_lo, digest_hi)
+
+
+@dataclass(frozen=True, slots=True)
+class PreparedVideo:
+    """A video's tubelets, each one image of two frames, and the label the
+    processor writes before each."""
+
+    tubelets: tuple[PreparedImage, ...]
+    labels: tuple[str, ...]
+
+
+def _frame_labels(indices, source_fps):
+    """Nemotron Omni's processor's: each tubelet's frames by number and
+    time, the time truncated to whole milliseconds of a frame first."""
+    frame_ms = int(1000.0 / source_fps)
+    labels = []
+    for start in range(0, len(indices), VIDEO_TUBELET):
+        parts = [
+            f"{'frame' if index > start else 'Frame'} {index + 1} sampled at "
+            f"{int(indices[index]) * frame_ms / 1000.0:.2f} seconds"
+            for index in range(start, min(start + VIDEO_TUBELET, len(indices)))
+        ]
+        labels.append(" and ".join(parts) + ": ")
+    return tuple(labels)
+
+
+def _video_timeout(seconds: float) -> ImageError:
+    return ImageError(
+        f"video took longer than {seconds:g} seconds to decode; "
+        "send a shorter or lower-resolution clip"
+    )
+
+
+def prepare_video(
+    payload: bytes, decoder: str, fps: float, max_frames: int, seconds: float
+) -> PreparedVideo:
+    """Decode a video in a disposable `decoder` process (splash video-frames),
+    resize its sampled frames as the processor does and pair them into
+    tubelets, the last frame repeated where their count is odd."""
+    from PIL import Image
+
+    deadline = time.monotonic() + seconds
+    # AVFoundation reads the container by its extension; .mp4 also opens a
+    # QuickTime movie.
+    with tempfile.NamedTemporaryFile(suffix=".mp4") as source:
+        source.write(payload)
+        source.flush()
+        process = subprocess.Popen(
+            [decoder, "video-frames", source.name, repr(fps), str(max_frames)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+        )
+        # The pipe blocks; a timer ends a decoder that outlives its time.
+        expired = threading.Event()
+        timer = threading.Timer(seconds, lambda: (expired.set(), process.kill()))
+        timer.start()
+        try:
+            header = json.loads(process.stdout.readline(4096) or b"null")
+            if not isinstance(header, dict):
+                raise ImageError(
+                    "video could not be decoded; MP4 and QuickTime are supported"
+                )
+            width, height = header["width"], header["height"]
+            indices, source_fps = header["indices"], header["fps"]
+            if not (
+                0 < width * height <= MAX_SOURCE_PIXELS
+                and 0 < len(indices) <= max_frames
+                and source_fps > 0
+            ):
+                raise ImageError("video exceeds the decoder's limits")
+            grid = video_resize(height, width)
+            frames = []
+            for _ in indices:
+                raw = process.stdout.read(width * height * 3)
+                if len(raw) != width * height * 3:
+                    raise ImageError("video could not be decoded")
+                frame = Image.frombytes("RGB", (width, height), raw)
+                if (height, width) != grid:
+                    frame = resize_float(frame, grid[1], grid[0])
+                frames.append(frame.tobytes())
+            if process.wait() != 0:
+                raise ImageError("video could not be decoded")
+        except (KeyError, TypeError, ValueError) as error:
+            # A killed decoder's output ends early: say why.
+            if expired.is_set():
+                raise _video_timeout(seconds) from error
+            if isinstance(error, ImageError):
+                raise
+            raise ImageError("video could not be decoded") from error
+        finally:
+            timer.cancel()
+            if process.poll() is None:
+                process.kill()
+            process.wait()
+            process.stdout.close()
+        if expired.is_set() or time.monotonic() > deadline:
+            raise _video_timeout(seconds)
+    if len(frames) % VIDEO_TUBELET:
+        frames.append(frames[-1])
+    grid_height, grid_width = grid[0] // PATCH, grid[1] // PATCH
+    tubelets = []
+    for start in range(0, len(frames), VIDEO_TUBELET):
+        pixels = b"".join(frames[start : start + VIDEO_TUBELET])
+        digest = hashlib.sha256(
+            struct.pack("<III", grid_height, grid_width, VIDEO_TUBELET) + pixels
+        )
+        digest_lo, digest_hi = struct.unpack_from("<QQ", digest.digest())
+        tubelets.append(
+            PreparedImage(
+                grid_height, grid_width, pixels, digest_lo, digest_hi, VIDEO_TUBELET
+            )
+        )
+    return PreparedVideo(tuple(tubelets), _frame_labels(indices, source_fps))
 
 
 class PreparedImages(list):
@@ -187,15 +410,36 @@ class ImageCache:
     def request_batch(self):
         return PreparedImages(self)
 
-    def prepare(self, payload: bytes, max_pixels: int) -> PreparedImage:
-        key = hashlib.sha256(struct.pack("<I", max_pixels) + payload).digest()
+    def prepare(
+        self, payload: bytes, max_pixels: int, rule: str = "qwen"
+    ) -> PreparedImage:
+        key = hashlib.sha256(
+            struct.pack("<I", max_pixels) + rule.encode() + b"\0" + payload
+        ).digest()
         with self._lock:
             cached = self._entries.get(key)
         if cached is not None:
             return cached
-        prepared = prepare(payload, max_pixels)
+        prepared = prepare(payload, max_pixels, rule)
         with self._lock:
             self._entries.put(key, prepared, len(prepared.pixels))
+        return prepared
+
+    def prepare_video(
+        self, payload: bytes, decoder: str, fps: float, max_frames: int, seconds: float
+    ) -> PreparedVideo:
+        """A video resent in a conversation's history decodes once."""
+        key = hashlib.sha256(
+            struct.pack("<dI", fps, max_frames) + b"video\0" + payload
+        ).digest()
+        with self._lock:
+            cached = self._entries.get(key)
+        if cached is not None:
+            return cached
+        prepared = prepare_video(payload, decoder, fps, max_frames, seconds)
+        size = sum(len(tubelet.pixels) for tubelet in prepared.tubelets)
+        with self._lock:
+            self._entries.put(key, prepared, size)
         return prepared
 
     def stats(self) -> dict:

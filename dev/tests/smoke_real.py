@@ -720,7 +720,8 @@ def run_text_only(port: int, model: str, nonce: str) -> None:
 
 
 # A tool whose only valid call is {"value": "ok"}. Strict, so that its
-# arguments are generated to its schema.
+# arguments are generated to its schema: Nemotron 3.5 Bolt otherwise writes
+# the request's nonce as the value.
 PROBE_TOOL = {
     "type": "function",
     "function": {

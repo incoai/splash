@@ -1,6 +1,7 @@
 #pragma once
 
 #include "metal/CommandGraph.hpp"
+#include "metal/abi/ExecutionGeometry.h"
 #include "ops/Linear.hpp"
 
 #include <cstdint>
@@ -12,10 +13,13 @@ namespace splash::ops {
 // The per-channel multipliers of an RMS norm as stored: bf16 in an MLX
 // target and the draft, F32 in a GGUF, which keeps its norms unquantized as
 // llama.cpp does. Every kernel that reads them widens them to fp32, so the type only
-// selects the kernel variant that loads them (normKernel).
+// selects the kernel variant that loads them (normKernel). Their norm's
+// epsilon is SPLASH_RMS_EPSILON, or SPLASH_RMS_EPSILON_E5 for the F32 norms
+// of the plain RMS norm alone (Normalization::addRms).
 struct NormWeights final {
   metal::MetalBuffer buffer;
   bool float32 = false;
+  double epsilon = SPLASH_RMS_EPSILON;
 
   [[nodiscard]] constexpr uint64_t bytes(uint32_t width) const noexcept {
     return uint64_t{width} * (float32 ? 4 : 2);
@@ -23,7 +27,8 @@ struct NormWeights final {
 };
 
 // The variant of kernel `name` that loads `weights`: `name` for bf16,
-// `name`_f32 for F32. Throws unless the buffer holds `width` multipliers.
+// `name`_f32 for F32. Throws unless the buffer holds `width` multipliers of
+// the default epsilon.
 [[nodiscard]] std::string normKernel(std::string_view name, const NormWeights &weights,
                                      uint32_t width);
 

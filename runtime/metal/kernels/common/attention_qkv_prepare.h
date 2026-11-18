@@ -22,9 +22,10 @@
 // K head's key and its V head's value go to the row's page slot through the
 // sequence's page table (`page_table`, its binding, SPLASH_LANE_BINDING), as
 // the layer's pages store them (splash_store_kv_slot), before any tile of
-// the attention reads them.
+// the attention reads them. Without Normed (a geometry with no q/k norms,
+// Nemotron-H's) each head is kept as projected, and no norm is read.
 template <uint QHeads, uint KHeads, uint HeadDim, uint RotaryPairs, bool Gated, class W, typename CacheElement,
-          bool ValuesTokenMajor>
+          bool ValuesTokenMajor, bool Normed = true>
 inline void full_qkv_storage_phase(
     device const bfloat *qkv, device const W *q_norm,
     device const W *k_norm, device const float *rope_cos,
@@ -56,13 +57,17 @@ inline void full_qkv_storage_phase(
             : qkv + packed * PackedStride + QWidth + head_index * HeadDim;
   device const W *weight = query ? q_norm : k_norm;
 
-  float element = float(source[thread_index]);
   const bfloat value = query ? bfloat(0.0f) : source[KWidth + thread_index];
-  const float inverse = rms_inverse_of_sums<HeadDim / 32>(element * element, HeadDim,
-                                                          reductions, thread_index, lane,
-                                                          simd_group);
-  normalized[thread_index] =
-      bfloat(element * inverse * float(weight[thread_index]));
+  if (Normed) {
+    float element = float(source[thread_index]);
+    const float inverse = rms_inverse_of_sums<HeadDim / 32>(element * element, HeadDim,
+                                                            reductions, thread_index, lane,
+                                                            simd_group);
+    normalized[thread_index] =
+        bfloat(element * inverse * float(weight[thread_index]));
+  } else {
+    normalized[thread_index] = source[thread_index];
+  }
   threadgroup_barrier(mem_flags::mem_threadgroup);
   // The thread's dimension of the head: a rotated pair's first or second
   // half, or the rest as normalized.

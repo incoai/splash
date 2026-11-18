@@ -126,9 +126,10 @@ prefillTensorBytes(const RuntimeGeometry &geometry,
   for (const auto &projection : geometry.target.prefillProjections)
     linear.include(operators.linear().scratchSize(projection, kPrefillRows));
   const auto &draft = geometry.draft;
-  for (const ops::ProjectionShape projection :
-       {ops::ProjectionShape{draft.hiddenSize, draft.targetHiddenSize()}, {draft.contextKvSize(), draft.hiddenSize}})
-    linear.include(operators.draftLinear().scratchSize(projection, kPrefillRows));
+  if (draft.present())
+    for (const ops::ProjectionShape projection :
+         {ops::ProjectionShape{draft.hiddenSize, draft.targetHiddenSize()}, {draft.contextKvSize(), draft.hiddenSize}})
+      linear.include(operators.draftLinear().scratchSize(projection, kPrefillRows));
   put(PrefillTensor::LinearPartials, linear.partials);
   put(PrefillTensor::LinearCounters, linear.counters);
   put(PrefillTensor::LinearTable, linear.input);
@@ -162,15 +163,18 @@ uint64_t plannedPrefillBytes(const RuntimeGeometry &geometry,
 }
 
 uint64_t gdnTapeSlotBytes(const RuntimeGeometry &geometry) noexcept {
-  return uint64_t{geometry.target.stateLayout.layers} *
-         ops::gdnTapeLayerBytes(geometry.target.gdnShape());
+  const QwenTargetGeometry &target = geometry.target;
+  return uint64_t{target.stateLayout.layers} *
+         (target.singleBlockLayers() ? mamba2TapeLayerBytes(target)
+                                     : ops::gdnTapeLayerBytes(target.gdnShape()));
 }
 std::array<uint64_t, decodeTensorCount>
 decodeTensorBytes(const RuntimeGeometry &geometry,
                   const ops::ExecutionPlans &operators) {
   std::array<uint64_t, decodeTensorCount> result{};
-  const auto draftWorkspace =
-      operators.draftAttentionWorkspacePerLane(geometry.draft.attentionShape());
+  const auto draftWorkspace = geometry.draft.present()
+                                  ? operators.draftAttentionWorkspacePerLane(geometry.draft.attentionShape())
+                                  : ops::DraftAttentionWorkspace{};
   const auto samplingWorkspace = ops::Sampling::workspace(kDecodeRows);
   const auto selectorWorkspace = ops::DraftSelector::workspace(kDraftProposalTokens);
   auto put = [&](DecodeTensor tensor, uint64_t bytes) {
@@ -297,6 +301,7 @@ ops::LinearScratchSize DecodeArena::linearScratchSize(
   // the draft among them, and the draft's context projections.
   for (const auto &p : geometry.target.decodeProjections)
     result.include(operators.linear().scratchSize(p, kDecodeStepRows));
+  if (!d.present()) return result;
   for (const ops::ProjectionShape shape :
        {ops::ProjectionShape{d.hiddenSize, d.targetHiddenSize()}, {d.contextKvSize(), d.hiddenSize}})
     result.include(operators.draftLinear().scratchSize(shape, kDecodeStepRows));

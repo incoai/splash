@@ -1,5 +1,6 @@
 import contextlib
 import io
+import json
 import shutil
 import struct
 import tempfile
@@ -31,7 +32,7 @@ from dev.tests.installer_fixtures import (
     write_gguf,
     write_target,
 )
-from install import assembly, gguf, hub, models, upstream
+from install import assembly, families, gguf, hub, models, upstream
 
 GGUF_REPO = "unsloth/Qwen3.6-35B-A3B-GGUF"
 
@@ -350,6 +351,105 @@ class GgufMetadataTests(unittest.TestCase):
                 self.assertRaisesRegex(models.ModelError, reason),
             ):
                 gguf.vision_config(self.metadata(values))
+
+    def test_vision_config_of_radio_reads_its_position_table(self):
+        values = vision_fixture() | {
+            "clip.projector_type": "nemotron_omni",
+            "clip.vision.block_count": 32,
+            "clip.vision.embedding_length": 1280,
+            "clip.vision.feed_forward_length": 5120,
+            "clip.vision.projection_dim": 4096,
+            "clip.vision.projector.scale_factor": 2,
+            "clip.vision.image_size": 512,
+        }
+
+        def config(shape):
+            path = fixture_files.write_gguf(
+                self.root / "radio.gguf",
+                values,
+                [("v.position_embd.weight", shape, 0, b"")],
+            )
+            return gguf.vision_config(gguf.Metadata(path, tensors=True))
+
+        # A 128 x 128 table, whatever image_size (512) says.
+        self.assertEqual(
+            config([1280, 16384]),
+            {
+                "depth": 32,
+                "hidden_size": 1280,
+                "num_heads": 16,
+                "intermediate_size": 5120,
+                "out_hidden_size": 4096,
+                "patch_size": 16,
+                "spatial_merge_size": 2,
+                "temporal_patch_size": 1,
+                "in_channels": 3,
+                "num_position_embeddings": 16384,
+                "hidden_act": "gelu",
+                "deepstack_visual_indexes": [],
+            },
+        )
+        for shape in ([1152, 16384], [16384], [1280, 128, 128]):
+            with (
+                self.subTest(shape=shape),
+                self.assertRaisesRegex(
+                    models.ModelError, "invalid GGUF vision position grid"
+                ),
+            ):
+                config(shape)
+        # Super's table states a third extent of 1, and its tower ends in
+        # v.post_ln; Bolt's has neither, so it carries no final_norm.
+        self.assertEqual(config([1280, 16384, 1]), config([1280, 16384]))
+        self.assertNotIn("final_norm", config([1280, 16384]))
+        path = fixture_files.write_gguf(
+            self.root / "radio.gguf",
+            values,
+            [
+                ("v.position_embd.weight", [1280, 16384, 1], 0, b""),
+                ("v.post_ln.weight", [1280], 0, b""),
+            ],
+        )
+        self.assertIs(
+            gguf.vision_config(gguf.Metadata(path, tensors=True))["final_norm"], True
+        )
+        # The metadata an installation derives reads the table too.
+        config([1280, 16384])
+        target = write_gguf(self.root / "target.gguf", fixture())
+        derived = json.loads(
+            gguf.derived_files(target, self.root / "radio.gguf")["config.json"]
+        )
+        self.assertEqual(derived["vision_config"]["num_position_embeddings"], 16384)
+
+    def test_radio_processor_is_nemotron_omnis(self):
+        values = vision_fixture() | {
+            "clip.projector_type": "nemotron_omni",
+            "clip.vision.projector.scale_factor": 2,
+            "clip.vision.image_mean": [0.48145466, 0.4578275, 0.40821073],
+            "clip.vision.image_std": [0.26862954, 0.26130258, 0.27577711],
+        }
+        families_by_name = {family.name: family for family in families.FAMILIES}
+        nemotron = families_by_name["Nemotron-3.5-Bolt"]
+        qwen = families_by_name["Qwen3.8-27B"]
+
+        def processor(values):
+            path = fixture_files.write_gguf(
+                self.root / "radio.gguf",
+                values,
+                [("v.position_embd.weight", [1152, 16384], 0, b"")],
+            )
+            return gguf.processor_config(gguf.Metadata(path, tensors=True))
+
+        # As float32, as the projector stores them.
+        upstream._validate_processor(processor(values), nemotron)
+        for family, values in (
+            (qwen, values),
+            (nemotron, values | {"clip.vision.image_mean": [0.5] * 3}),
+        ):
+            with (
+                self.subTest(family=family.name),
+                self.assertRaisesRegex(models.ModelError, "unsupported vision"),
+            ):
+                upstream._validate_processor(processor(values), family)
 
     def derived(self, models_root, path):
         """The metadata derived from a target GGUF, as installations derive

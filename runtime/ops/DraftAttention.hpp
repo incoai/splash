@@ -17,6 +17,9 @@ struct DraftAttentionShape final {
   uint32_t queryHeads = 0;
   uint32_t kvHeads = 0;
   uint32_t headDimension = 0;
+  // The positions a query row sees, its own among them: the ring's window,
+  // or 1024 (LiLiCorr).
+  uint32_t window = SPLASH_DRAFT_SLIDING_WINDOW;
 
   bool operator==(const DraftAttentionShape &) const = default;
 };
@@ -79,6 +82,9 @@ struct DraftDecodeAttentionBuffers final {
   std::span<const metal::MetalBuffer> persistentValues;
   metal::MetalBuffer queryKeys;
   metal::MetalBuffer queryValues;
+  // bf16 [query heads]: each head's sink logit, a key of no value in its
+  // softmax; none without.
+  metal::MetalBuffer sinks = {};
 };
 
 class DraftAttention final {

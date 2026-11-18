@@ -75,6 +75,32 @@ namespace bf16 fp32 8325839c2ceddbcfc4bed783e2c8078b
 state bf16 cell 59179008 lane 146472960 cached 35586048
 namespace int8 bf16 c1558e67db3c3430234d2d25815bf17f
 namespace bf16 bf16 8325839c2ceddbcfc4bed783e2c8078b
+family Nemotron-3.5-Bolt
+facts experts 1 recurrent-state 1 ple-table 0 sparse-kv 0 dense-ffn 0 context 262144..262144
+kv layers 8 heads 2 dimension 128 index 0
+kv int8 page 135168 index-page 0 alignment 256 extents 512..1280
+kv int8 extent-pages 1:0 31:0 32:0 63:0 64:0 127:0 128:0 129:0 255:0 256:0 257:0 511:0 512:512 1000:768 4095:768 4096:1024 10000:768 65535:768 65536:1024 100000:768 262144:1024 1000000:768
+kv bf16 page 262144 index-page 0 alignment 4 extents 256..768
+kv bf16 extent-pages 1:0 31:0 32:0 63:0 64:0 127:0 128:0 129:0 255:0 256:256 257:256 511:508 512:512 1000:500 4095:372 4096:512 10000:500 65535:508 65536:512 100000:500 262144:512 1000000:500
+state fp32 cell 170393600 lane 387465216 cached 175112192
+namespace int8 fp32 bf7b2ef5573fc32f13e4b1e0e81d78cb
+namespace bf16 fp32 ce91e7acdb0077a91c635e76b4db2f8c
+state bf16 cell 86507520 lane 219693056 cached 91226112
+namespace int8 bf16 ff83617cac498ddebe857a77f21e9bbf
+namespace bf16 bf16 219340260b0f44a85d9cb0f7346fd0e1
+family Nemotron-3.5-Super
+facts experts 1 recurrent-state 1 ple-table 0 sparse-kv 0 dense-ffn 0 context 1048576..1010000
+kv layers 8 heads 2 dimension 128 index 0
+kv int8 page 135168 index-page 0 alignment 256 extents 512..1280
+kv int8 extent-pages 1:0 31:0 32:0 63:0 64:0 127:0 128:0 129:0 255:0 256:0 257:0 511:0 512:512 1000:768 4095:768 4096:1024 10000:768 65535:768 65536:1024 100000:768 262144:1024 1000000:768
+kv bf16 page 262144 index-page 0 alignment 4 extents 256..768
+kv bf16 extent-pages 1:0 31:0 32:0 63:0 64:0 127:0 128:0 129:0 255:0 256:256 257:256 511:508 512:512 1000:500 4095:372 4096:512 10000:500 65535:508 65536:512 100000:500 262144:512 1000000:500
+state fp32 cell 170393600 lane 387465216 cached 175112192
+namespace int8 fp32 bf7b2ef5573fc32f13e4b1e0e81d78cb
+namespace bf16 fp32 ce91e7acdb0077a91c635e76b4db2f8c
+state bf16 cell 86507520 lane 219693056 cached 91226112
+namespace int8 bf16 ff83617cac498ddebe857a77f21e9bbf
+namespace bf16 bf16 219340260b0f44a85d9cb0f7346fd0e1
 family Flint
 facts experts 1 recurrent-state 0 ple-table 0 sparse-kv 0 dense-ffn 0 context 262144..262144
 kv layers 49 heads 4 dimension 128 index 0 window 512 layers 0xdddddddddddc

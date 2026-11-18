@@ -14,6 +14,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <functional>
 #include <limits>
 #include <memory>
@@ -164,7 +165,17 @@ struct ModelRequest final {
 // merged 2x2 patch group, row-major over the merged grid), the patch grid of
 // the image's resized pixels, and a 128-bit digest of that content.
 // Placeholder token ids are identical for every image, so cache identity keys
-// on the digest as well as the tokens.
+// on the digest as well as the tokens. A video's tubelet is a span of two
+// frames: its pixels hold both, one after the other, and its tokens one grid's.
+//
+// A pruned video (textTokens > 0) is one span over all its tubelets, from its
+// first tubelet's rows to its last's, of the same grid. Its first textTokens
+// prompt tokens are the text between the tubelets in order (each tubelet's
+// close, the next one's label and open); the rest are placeholders for the
+// tokens*-textTokens tubelet rows EVS keeps. Its pixels are the tubelets'
+// pixels, then a u32 per tubelet: how many of those text tokens precede its
+// rows. The engine lays the kept rows and the text out as the processor
+// would have (ops::VideoPruning).
 struct ImageSpan final {
   uint32_t offset = 0;
   uint32_t tokens = 0;
@@ -172,41 +183,80 @@ struct ImageSpan final {
   uint32_t gridWidth = 0;
   uint64_t digestLo = 0;
   uint64_t digestHi = 0;
+  uint32_t frames = 1;
+  uint32_t tubelets = 1;
+  uint32_t textTokens = 0;
 
   [[nodiscard]] uint32_t end() const noexcept { return offset + tokens; }
   [[nodiscard]] ops::ImageGrid grid() const noexcept {
-    return {gridHeight, gridWidth};
+    return {gridHeight, gridWidth, frames};
   }
+  [[nodiscard]] bool pruned() const noexcept { return textTokens != 0; }
+  // The tubelet rows a pruned video keeps.
+  [[nodiscard]] uint32_t keptRows() const noexcept { return tokens - textTokens; }
   [[nodiscard]] uint64_t pixelBytes() const noexcept {
-    return grid().pixelBytes();
+    return pruned() ? uint64_t{tubelets} * (grid().pixelBytes() + sizeof(uint32_t)) : grid().pixelBytes();
+  }
+  // Folds into a block identity's two chains (engine::blockImageIdentity)
+  // what a video adds: its tubelet's frames, and a pruned video's layout. An
+  // image adds nothing; its identity is as before videos.
+  void foldVideoIdentity(uint64_t &lo, uint64_t &hi, auto mix) const noexcept {
+    if (frames != 1) {
+      lo = mix(lo, frames);
+      hi = mix(hi, ~uint64_t{frames});
+    }
+    if (pruned()) {
+      const uint64_t layout = (uint64_t{tubelets} << 32) | textTokens;
+      lo = mix(lo, layout);
+      hi = mix(hi, ~layout);
+    }
   }
   bool operator==(const ImageSpan &) const = default;
 };
 
 // The first rule a request's image spans break, or none: each covers a valid
-// grid within the patch limit with one token per merged patch group, the
-// runs are sorted, disjoint and inside the prompt, and the pixels are the
-// grids' own.
+// grid within the patch limit with one token per merged patch group (a
+// pruned video: its text, then between one tubelet's rows and all of them,
+// each tubelet's text at or after the one before), the runs are sorted,
+// disjoint and inside the prompt, and the pixels are the grids' own.
 [[nodiscard]] inline std::optional<std::string_view>
 imageSpansValidationError(std::span<const ImageSpan> spans, size_t promptTokens,
-                          uint64_t pixelBytes) noexcept {
+                          std::span<const uint8_t> pixels) noexcept {
   uint64_t previousEnd = 0;
   uint64_t gridPixelBytes = 0;
   for (const ImageSpan &span : spans) {
     const ops::ImageGrid grid = span.grid();
     if (!grid.valid() || grid.patches() > ops::kMaximumImagePatches)
       return "image grid must be even-sided and within the patch limit";
-    if (span.tokens != grid.mergedTokens())
+    if (!span.pruned() && (span.tubelets != 1 || span.tokens != grid.mergedTokens()))
       return "image span tokens must equal the merged grid size";
+    if (span.pruned()) {
+      const uint64_t rows = grid.mergedTokens();
+      if (span.frames != 2 || !span.tubelets ||
+          span.tokens <= span.textTokens || span.keptRows() < rows ||
+          span.keptRows() > rows * span.tubelets)
+        return "a pruned video keeps between one tubelet's rows and all of them";
+      const uint64_t cuts = gridPixelBytes + uint64_t{span.tubelets} * grid.pixelBytes();
+      if (cuts + uint64_t{span.tubelets} * sizeof(uint32_t) > pixels.size())
+        return "image pixels do not match the image grids";
+      uint32_t previous = 0;
+      for (uint32_t tubelet = 0; tubelet < span.tubelets; ++tubelet) {
+        uint32_t cut = 0;
+        std::memcpy(&cut, pixels.data() + cuts + tubelet * sizeof(uint32_t), sizeof(cut));
+        if (cut < previous || cut > span.textTokens)
+          return "a pruned video's text cuts must be ordered within its text";
+        previous = cut;
+      }
+    }
     const uint64_t end = uint64_t{span.offset} + span.tokens;
     if (span.offset < previousEnd || end > promptTokens) {
       return "image spans must be sorted, non-overlapping runs inside the "
              "prompt";
     }
     previousEnd = end;
-    gridPixelBytes += grid.pixelBytes();
+    gridPixelBytes += span.pixelBytes();
   }
-  if (pixelBytes != gridPixelBytes)
+  if (pixels.size() != gridPixelBytes)
     return "image pixels do not match the image grids";
   return std::nullopt;
 }

@@ -164,10 +164,11 @@ struct QwenTargetGeometry final : QwenTargetDimensions {
   }
   // The layout itself was checked by requireQwenLayout when the target
   // loaded. The draft reads 1 to ExecutionLimits::maximumDraftTargetLayers
-  // of its layers, ascending. A target without GDN layers has no GDN shape.
-  // The projection lists hold every projection the weights dispatch, which
-  // each have sizes; a target with dense FFNs, a MoE target's leading layers
-  // too, holds their gate and up projections.
+  // of its layers, ascending; Nemotron-H, which has no draft, none. A target
+  // without GDN layers has no GDN shape. The projection lists hold every
+  // projection the weights dispatch, which each have sizes; a target with
+  // dense FFNs, a MoE target's leading layers too, holds their gate and up
+  // projections.
   [[nodiscard]] bool valid() const noexcept {
     const auto sized = [](const std::vector<ops::ProjectionShape> &shapes) {
       return !shapes.empty() && std::all_of(shapes.begin(), shapes.end(), [](const auto &shape) {
@@ -175,13 +176,21 @@ struct QwenTargetGeometry final : QwenTargetDimensions {
       });
     };
     const auto captured = [&] {
-      if (!captureLayerCount || captureLayerCount > ExecutionLimits::maximumDraftTargetLayers) return false;
+      // A target of single-block layers (Nemotron-H) serves without a draft.
+      if (!captureLayerCount) return singleBlockLayers();
+      if (captureLayerCount > ExecutionLimits::maximumDraftTargetLayers) return false;
       const auto ids = captureLayers();
       return std::ranges::adjacent_find(ids, std::ranges::greater_equal{}) == ids.end() && ids.back() < layers;
     };
     const bool dense = intermediateSize && sized(gateUpProjections);
-    return captured() && stateLayout.layers + kvLayout.attentionLayers == layers &&
-           (!stateLayout.layers || gdnShape().valid()) &&
+    // A target of single-block layers (Nemotron-H) has FFN-only layers and
+    // Mamba-2 recurrent layers, whose shape ops::Mamba2 checks.
+    const bool mixers = singleBlockLayers()
+                            ? stateLayout.layers == recurrentLayerCount() &&
+                                  kvLayout.attentionLayers == attentionLayerCount()
+                            : stateLayout.layers + kvLayout.attentionLayers == layers &&
+                                  (!stateLayout.layers || gdnShape().valid());
+    return captured() && mixers &&
            kvLayout.kvHeads == attentionKvHeads &&
            kvLayout.headDimension == attentionHeadDimension &&
            sized(prefillProjections) && sized(decodeProjections) &&
@@ -452,6 +461,8 @@ public:
 
   [[nodiscard]] const ops::Projection &
   vocabularyProjection() const noexcept;
+  // The target's token table, which a LiLiCorr draft's selector reads.
+  [[nodiscard]] const ops::EmbeddingWeights &tokenEmbedding() const noexcept;
   // Lanes of storage, a draft's block of rows each, the vocabulary
   // projection binds over a draft step of `lanes` lanes, which runs the
   // target's head: its tile may hold more rows than the step's

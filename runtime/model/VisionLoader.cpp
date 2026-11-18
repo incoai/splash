@@ -15,43 +15,91 @@ namespace {
 using vision::Plan;
 using vision::Section;
 
+// RADIO's sections, in the order QwenVision.cpp reads them, from a
+// nemotron_omni mmproj (no MLX source): the patch embedding (already in the
+// image's [channel, patch-row, patch-col] order, no bias), positions, prefix
+// tokens, each block's with its q, k and v weights and biases each one
+// tensor (bindMmproj fuses them for an mmproj that does), the final norm if
+// the layout has one, the merger's RMS weight and two projections, without
+// biases, and last the video patch embedding (two frames' [channel,
+// patch-row, patch-col] in a row, frame-major, also as stored).
+void planRadio(const ops::VisionLayout &l, std::vector<Section> &sections) {
+  const auto add = [&](std::string gguf, uint32_t rows, uint32_t columns = 1, bool follows = false) {
+    Section section{"", std::move(gguf), rows, columns, rows, columns};
+    section.follows = follows;
+    sections.push_back(std::move(section));
+  };
+  const auto affine = [&](const std::string &gguf, uint32_t rows, uint32_t columns) {
+    add(gguf + ".weight", rows, columns);
+    add(gguf + ".bias", rows);
+  };
+  const auto norm = [&](const std::string &gguf) {
+    add(gguf + ".weight", l.hiddenSize);
+    add(gguf + ".bias", l.hiddenSize);
+  };
+  add("v.patch_embd.weight", l.hiddenSize, l.patchDimension);
+  add("v.position_embd.weight", l.positionGridSide * l.positionGridSide, l.hiddenSize);
+  add("v.class_embd", l.prefixTokens, l.hiddenSize);
+  for (uint32_t i = 0; i < l.depth; ++i) {
+    const auto gguf = "v.blk." + std::to_string(i) + ".";
+    norm(gguf + "ln1");
+    for (const char *part : {"weight", "bias"})
+      for (const char *head : {"q", "k", "v"})
+        add(gguf + "attn_" + head + "." + part, l.hiddenSize, part[0] == 'w' ? l.hiddenSize : 1, *head != 'q');
+    affine(gguf + "attn_out", l.hiddenSize, l.hiddenSize);
+    norm(gguf + "ln2");
+    affine(gguf + "ffn_up", l.intermediateSize, l.hiddenSize);
+    affine(gguf + "ffn_down", l.hiddenSize, l.intermediateSize);
+  }
+  if (l.finalNorm) norm("v.post_ln");
+  add("mm.model.mlp.0.weight", l.mergedHiddenSize);
+  add("mm.model.mlp.1.weight", l.mergerIntermediateSize, l.mergedHiddenSize);
+  add("mm.model.mlp.3.weight", l.outputHiddenSize, l.mergerIntermediateSize);
+  add("v.patch_embd.weight.1", l.hiddenSize, 2 * l.patchDimension);
+}
+
 // The sections of layout, in file order, placed after the header block.
 Plan plan(const ops::VisionLayout &l) {
   Plan result{l.depth, l.patchSize, 0, {}};
   auto &sections = result.sections;
-  const auto add = [&](std::string mlx, std::string gguf, uint32_t rows, uint32_t columns = 1,
-                       uint32_t paddedRows = 0, uint32_t paddedColumns = 0) {
-    sections.push_back({"vision_tower." + mlx, std::move(gguf), rows, columns, paddedRows ? paddedRows : rows,
-                        paddedColumns ? paddedColumns : columns});
-  };
-  const auto affine = [&](const std::string &mlx, const std::string &gguf, uint32_t rows, uint32_t columns,
-                          uint32_t paddedRows = 0, uint32_t paddedColumns = 0) {
-    add(mlx + ".weight", gguf + ".weight", rows, columns, paddedRows, paddedColumns);
-    add(mlx + ".bias", gguf + ".bias", rows, 1, paddedRows);
-  };
-  const auto norm = [&](const std::string &mlx, const std::string &gguf) {
-    add(mlx + ".weight", gguf + ".weight", l.hiddenSize);
-    add(mlx + ".bias", gguf + ".bias", l.hiddenSize);
-  };
-  affine("patch_embed.proj", "v.patch_embd", l.hiddenSize, l.patchDimension);
-  sections.front().patch = true;
-  add("pos_embed.weight", "v.position_embd.weight", l.positionGridSide * l.positionGridSide, l.hiddenSize);
-  for (uint32_t i = 0; i < l.depth; ++i) {
-    const auto mlx = "blocks." + std::to_string(i) + ".", gguf = "v.blk." + std::to_string(i) + ".";
-    norm(mlx + "norm1", gguf + "ln1");
-    affine(mlx + "attn.qkv", gguf + "attn_qkv", 3 * l.hiddenSize, l.hiddenSize);
-    affine(mlx + "attn.proj", gguf + "attn_out", l.hiddenSize, l.hiddenSize);
-    norm(mlx + "norm2", gguf + "ln2");
-    affine(mlx + "mlp.linear_fc1", gguf + "ffn_up", l.intermediateSize, l.hiddenSize, l.paddedIntermediateSize);
-    affine(mlx + "mlp.linear_fc2", gguf + "ffn_down", l.hiddenSize, l.intermediateSize, 0, l.paddedIntermediateSize);
+  if (ops::isRadioVision(l)) {
+    planRadio(l, sections);
+  } else {
+    const auto add = [&](std::string mlx, std::string gguf, uint32_t rows, uint32_t columns = 1,
+                         uint32_t paddedRows = 0, uint32_t paddedColumns = 0) {
+      sections.push_back({"vision_tower." + mlx, std::move(gguf), rows, columns, paddedRows ? paddedRows : rows,
+                          paddedColumns ? paddedColumns : columns});
+    };
+    const auto affine = [&](const std::string &mlx, const std::string &gguf, uint32_t rows, uint32_t columns,
+                            uint32_t paddedRows = 0, uint32_t paddedColumns = 0) {
+      add(mlx + ".weight", gguf + ".weight", rows, columns, paddedRows, paddedColumns);
+      add(mlx + ".bias", gguf + ".bias", rows, 1, paddedRows);
+    };
+    const auto norm = [&](const std::string &mlx, const std::string &gguf) {
+      add(mlx + ".weight", gguf + ".weight", l.hiddenSize);
+      add(mlx + ".bias", gguf + ".bias", l.hiddenSize);
+    };
+    affine("patch_embed.proj", "v.patch_embd", l.hiddenSize, l.patchDimension);
+    sections.front().patch = true;
+    add("pos_embed.weight", "v.position_embd.weight", l.positionGridSide * l.positionGridSide, l.hiddenSize);
+    for (uint32_t i = 0; i < l.depth; ++i) {
+      const auto mlx = "blocks." + std::to_string(i) + ".", gguf = "v.blk." + std::to_string(i) + ".";
+      norm(mlx + "norm1", gguf + "ln1");
+      affine(mlx + "attn.qkv", gguf + "attn_qkv", 3 * l.hiddenSize, l.hiddenSize);
+      affine(mlx + "attn.proj", gguf + "attn_out", l.hiddenSize, l.hiddenSize);
+      norm(mlx + "norm2", gguf + "ln2");
+      affine(mlx + "mlp.linear_fc1", gguf + "ffn_up", l.intermediateSize, l.hiddenSize, l.paddedIntermediateSize);
+      affine(mlx + "mlp.linear_fc2", gguf + "ffn_down", l.hiddenSize, l.intermediateSize, 0, l.paddedIntermediateSize);
+    }
+    norm("merger.norm", "v.post_ln");
+    affine("merger.linear_fc1", "mm.0", l.mergedHiddenSize, l.mergedHiddenSize);
+    affine("merger.linear_fc2", "mm.2", l.outputHiddenSize, l.mergedHiddenSize);
   }
-  norm("merger.norm", "v.post_ln");
-  affine("merger.linear_fc1", "mm.0", l.mergedHiddenSize, l.mergedHiddenSize);
-  affine("merger.linear_fc2", "mm.2", l.outputHiddenSize, l.mergedHiddenSize);
-  uint64_t at = kWeightFileAlignment;
+  uint64_t at = kWeightFileAlignment, end = at;
   for (auto &s : sections) {
-    s.offset = at;
-    at = alignWeightOffset(at + uint64_t(s.storedRows) * s.storedColumns * kBFloat16Bytes);
+    s.offset = s.follows ? end : at;
+    end = s.offset + uint64_t(s.storedRows) * s.storedColumns * kBFloat16Bytes;
+    at = alignWeightOffset(end);
   }
   result.bytes = at;
   return result;
@@ -128,18 +176,72 @@ void requireMmprojMetadata(const GgufFile &gguf, const ops::VisionLayout &layout
     throw WeightStoreError("vision deepstack layers are unsupported");
 }
 
+// The metadata of a clip nemotron_omni mmproj of RADIO's layout: its image
+// normalization the CLIP mean and std the kernels compile, as the f32 values
+// the GGUF holds.
+void requireRadioMetadata(const GgufFile &gguf, const ops::VisionLayout &layout) {
+  const GgufMetadata &metadata = gguf.metadata();
+  if (metadata.architecture() != "clip" || metadata.stringValue("clip.projector_type") != "nemotron_omni")
+    throw WeightStoreError("unsupported vision GGUF architecture");
+  for (const auto &[key, expected] : std::initializer_list<std::pair<const char *, uint64_t>>{
+           {"clip.vision.projection_dim", layout.outputHiddenSize},
+           {"clip.vision.patch_size", layout.patchSize},
+           {"clip.vision.embedding_length", layout.hiddenSize},
+           {"clip.vision.feed_forward_length", layout.intermediateSize},
+           {"clip.vision.block_count", layout.depth},
+           {"clip.vision.attention.head_count", layout.heads},
+           {"clip.vision.projector.scale_factor", layout.spatialMerge},
+           {"clip.use_gelu", 1}})
+    if (metadata.unsignedValue(key) != expected) throw WeightStoreError(std::string("vision metadata mismatch: ") + key);
+  const auto epsilon = metadata.floatValue("clip.vision.attention.layer_norm_epsilon");
+  if (!epsilon || !std::isfinite(*epsilon) || std::abs(*epsilon - float(SPLASH_VISION_NORM_EPSILON)) > 1e-12)
+    throw WeightStoreError("vision LayerNorm epsilon mismatch");
+  constexpr float mean[3] = {0.48145466F, 0.4578275F, 0.40821073F}, deviation[3] = {0.26862954F, 0.26130258F,
+                                                                                      0.27577711F};
+  for (const auto &[key, expected] : {std::pair{"clip.vision.image_mean", mean}, std::pair{"clip.vision.image_std",
+                                                                                          deviation}}) {
+    const auto values = gguf.numericArray(key);
+    if (!values || values->size() != 3 || !std::equal(values->begin(), values->end(), expected,
+                                                      [](double x, float y) { return float(x) == y; }))
+      throw WeightStoreError("vision image normalization mismatch");
+  }
+}
+
 // GGUF: a qwen3vl_merger mmproj describing this tower, all of whose tensors
 // preparation uses. The patch embedding is one [channel, patch-row,
 // patch-col] weight per temporal frame (v.patch_embd.weight and .weight.1).
+// A nemotron_omni mmproj describes RADIO (requireRadioMetadata); its patch
+// embedding is one frame's, and v.patch_embd.weight.1 a video tubelet's two
+// frames (six channels). Its q, k and v may be one attn_qkv tensor (llama.cpp's
+// converter for Super), which then fills the three sections they follow in;
+// its position table may carry a trailing extent of 1.
 void bindMmproj(const GgufFile &gguf, const ops::VisionLayout &layout, Plan &plan) {
-  requireMmprojMetadata(gguf, layout);
+  const bool radio = ops::isRadioVision(layout);
+  if (radio) requireRadioMetadata(gguf, layout);
+  else requireMmprojMetadata(gguf, layout);
+  if (radio && gguf.find("v.blk.0.attn_qkv.weight")) {
+    std::erase_if(plan.sections, [](Section &s) {
+      const auto at = s.gguf.find(".attn_");
+      if (at == std::string::npos || s.gguf.size() < at + 8) return false;
+      const char head = s.gguf[at + 6];
+      if (head == 'q' && s.gguf[at + 7] == '.') {
+        s.gguf.replace(at + 6, 1, "qkv");
+        s.rows *= 3;
+        s.storedRows *= 3;
+      }
+      return (head == 'k' || head == 'v') && s.gguf[at + 7] == '.';
+    });
+  }
   const uint64_t p = layout.patchSize;
   std::set<std::string, std::less<>> used;
   for (auto &s : plan.sections) {
     for (uint32_t frame = 0; frame < (s.patch ? 2u : 1u); ++frame) {
       std::string name = s.gguf + (frame ? ".1" : "");
-      const GgufTensor &t = gguf.require(name);
+      GgufTensor t = gguf.require(name);
+      while (t.dims.size() > 2 && t.dims.back() == 1) t.dims.pop_back();
+      const bool radioPatch = radio && (&s == &plan.sections.front() || s.gguf == "v.patch_embd.weight.1");
       const std::vector<uint64_t> shape = s.patch          ? std::vector<uint64_t>{p, p, 3, s.rows}
+                                          : radioPatch     ? std::vector<uint64_t>{p, p, s.columns / (p * p), s.rows}
                                           : s.columns == 1 ? std::vector<uint64_t>{s.rows}
                                                            : std::vector<uint64_t>{s.columns, s.rows};
       if (t.dims != shape) throw WeightStoreError("vision tensor shape mismatch: " + name);
@@ -176,7 +278,9 @@ VisionLoader::VisionLoader(const std::filesystem::path &directory, VisionSource 
   auto planned = std::make_shared<Planned>();
   planned->layout = layout;
   planned->plan = plan(layout);
-  if (source == VisionSource::Safetensors) {
+  if (source == VisionSource::Safetensors && ops::isRadioVision(layout)) {
+    throw WeightStoreError("RADIO's vision tower loads from a GGUF mmproj only");
+  } else if (source == VisionSource::Safetensors) {
     planned->checkpoint = std::make_unique<SafetensorsCheckpoint>(directory);
     bindCheckpoint(*planned->checkpoint, layout, planned->plan);
   } else if (source == VisionSource::Gguf) {
@@ -203,16 +307,17 @@ ImagePlan VisionLoader::image() const {
 uint64_t visionImageBytes(const ops::VisionLayout &layout) { return plan(layout).bytes; }
 
 // The writer relies on the patch embedding's width, two frames of RGB
-// patches, and on padding that only adds rows or columns.
+// patches (RADIO's one), and on padding that only adds rows or columns.
 void requireVisionLayout(const ops::VisionLayout &layout) {
+  const uint32_t frames = ops::isRadioVision(layout) ? 1 : 2;
   if (!layout.depth || !layout.hiddenSize || !layout.patchDimension || !layout.intermediateSize ||
       !layout.paddedIntermediateSize || !layout.mergedHiddenSize || !layout.outputHiddenSize || !layout.heads ||
       !layout.headDimension || !layout.positionGridSide || !layout.patchSize || !layout.spatialMerge ||
       layout.heads * layout.headDimension != layout.hiddenSize ||
       layout.paddedIntermediateSize < layout.intermediateSize ||
       layout.mergedHiddenSize != layout.hiddenSize * layout.spatialMerge * layout.spatialMerge ||
-      layout.patchDimension != 3 * 2 * layout.patchSize * layout.patchSize)
-    throw WeightStoreError("Qwen vision layout is inconsistent");
+      layout.patchDimension != 3 * frames * layout.patchSize * layout.patchSize)
+    throw WeightStoreError("vision layout is inconsistent");
 }
 
 } // namespace splash::model

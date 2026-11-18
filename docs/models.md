@@ -265,7 +265,10 @@ values as `.scale`) plays no part, as in Model Optimizer's targets; beside any
 other weight, or alone, it is refused. It loads as Model Optimizer's NVFP4 does
 ([Model Optimizer targets](#model-optimizer-targets)): four blocks make one
 256-element NVFP4 block, whose meta unit holds the `.scale` value as its `g`
-(1 without one), at 4.625 bits per weight for the file's 4.5.
+(1 without one), at 4.625 bits per weight for the file's 4.5. A tensor whose
+rows are not whole 256s (Nemotron 3.5 Super's routed down projection, 2688
+inputs) loads as NVFP4G64 instead: each block_nvfp4 one 64-element block with
+its own `g`, at 5 bits per weight, every value as NVFP4's.
 
 Q2_0 is GGUF tensor type 42, `block_q2_0`, as in the GSQ-RCO GGUFs:
 2-bit codes q worth d (q - 1) with one half d per 64 weights. Its planes are

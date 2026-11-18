@@ -32,6 +32,7 @@ INSTALL_FILES = (
     "local.py",
     "cached.py",
     "gguf.py",
+    "dflash_gguf.py",
     "requirements.txt",
     "suggested-models.tsv",
 )

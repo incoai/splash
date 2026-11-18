@@ -3,6 +3,7 @@
 #include "DFlashDraft.hpp"
 #include "Flint.hpp"
 #include "Model.hpp"
+#include "NemotronH.hpp"
 #include "Qwen3_6Moe.hpp"
 #include "Qwen3_8.hpp"
 #include "Qwen4Exp.hpp"
@@ -20,14 +21,14 @@
 
 namespace splash::model {
 
-using TargetLayout = std::variant<Qwen3_8Layout, Qwen3_6MoeLayout, Qwen4ExpLayout, FlintLayout>;
+using TargetLayout = std::variant<Qwen3_8Layout, Qwen3_6MoeLayout, Qwen4ExpLayout, NemotronHLayout, FlintLayout>;
 
 // The families Splash serves, values of the layout types TargetLayout holds,
 // one type for each architecture's code. A family of an architecture is one
 // more value here. Refusals name them in this order, and a config's model type
 // finds its family among those of its type in it (describeSourceModel).
 inline constexpr std::tuple kFamilies{Qwen3_8Layout{}, Qwen3_6MoeLayout{}, kQwen3_5_122BLayout, Qwen4ExpLayout{},
-                                      FlintLayout{}};
+                                      NemotronHLayout{}, kNemotronSuperLayout, FlintLayout{}};
 
 // Calls `use` with each family's layout, in kFamilies' order.
 template <class Use> constexpr void forEachFamily(Use use) {

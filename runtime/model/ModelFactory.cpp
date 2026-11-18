@@ -12,6 +12,7 @@
 
 #include <array>
 #include <functional>
+#include <optional>
 #include <stdexcept>
 #include <string_view>
 #include <vector>
@@ -24,8 +25,8 @@ void requireCompatibleModel(const LoadedModel &model) {
       !std::visit(
           [&](const auto &target) {
             return model.descriptor.target == TargetLayout{target.layout} &&
-                   target.layout.vocabularySize ==
-                       model.draft.layout.vocabularySize;
+                   (!model.draft.layout.present() ||
+                    target.layout.vocabularySize == model.draft.layout.vocabularySize);
           },
           model.target)) {
     throw std::invalid_argument(
@@ -59,6 +60,11 @@ TargetWeights readTarget(metal::MetalBackend &backend, const Qwen3_6MoeLayout &l
 TargetWeights readTarget(metal::MetalBackend &backend, const Qwen4ExpLayout &layout,
                          const QwenTargetFiles &files) {
   return loadQwen4ExpWeights(backend, layout, files);
+}
+
+TargetWeights readTarget(metal::MetalBackend &backend, const NemotronHLayout &layout,
+                         const QwenTargetFiles &files) {
+  return loadNemotronHWeights(backend, layout, files);
 }
 
 TargetWeights readTarget(metal::MetalBackend &backend, const FlintLayout &layout, const QwenTargetFiles &files) {
@@ -128,6 +134,16 @@ QwenTargetGeometry plannedTargetGeometry(metal::MetalBackend &backend, const std
       [&](const auto &weights) { return qwenTargetGeometry(weights, descriptor.draft.targetLayerIds()); }, target);
 }
 
+uint64_t plannedSelectorBytes(metal::MetalBackend &backend, const std::filesystem::path &root,
+                              const ModelDescriptor &descriptor, const ops::ExecutionPlans &operators) {
+  if (!descriptor.draft.present() || !descriptor.draft.lilicorr) return 0;
+  // Released as plannedTargetGeometry's: only the projections' formats count.
+  WeightImages images(backend, descriptor.sourceIdentity);
+  images.release();
+  DraftCheckpointLoader files(backend, images, root / "draft", descriptor.draft);
+  return DFlashDraft::liLiCorrBytes(loadDFlashDraftWeights(backend, files, descriptor.draft), operators);
+}
+
 LoadedModel loadModel(metal::MetalBackend &backend,
                               const std::filesystem::path &root,
                               const ModelDescriptor &descriptor,
@@ -141,9 +157,10 @@ LoadedModel loadModel(metal::MetalBackend &backend,
   // Every source's metadata is checked before the first image is written:
   // the vision tower's and the draft's here, the target's by its loader.
   const auto vision = planVisionLoader(root, result.descriptor);
-  DraftCheckpointLoader draft(backend, images, root / "draft", result.descriptor.draft);
+  std::optional<DraftCheckpointLoader> draft;
+  if (result.descriptor.draft.present()) draft.emplace(backend, images, root / "draft", result.descriptor.draft);
   result.target = loadTarget(backend, images, root, result.descriptor, options);
-  result.draft = loadDFlashDraftWeights(backend, draft, result.descriptor.draft);
+  if (draft) result.draft = loadDFlashDraftWeights(backend, *draft, result.descriptor.draft);
   result.vision = loadVisionWeights(backend, images, vision.get());
 
   std::vector<WeightFileRecord> records(result.targetFiles().begin(),

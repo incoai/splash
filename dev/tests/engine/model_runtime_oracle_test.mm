@@ -258,15 +258,16 @@ metal::AllocationAdmission governedFor(MemoryGovernor &governor, std::string nee
 }
 
 // The texts the checks run, in the target's tokenizer and chat format: the
-// Qwen families' (one tokenizer) or Flint's. Each family's chat prompts end
-// where its assistant reasons, in an open think block (Flint's model opens
-// one itself; the prompt opens it as Qwen's template does), and the
-// vocabulary sizes the constraint masks.
+// Qwen families' (one tokenizer), Flint's or Nemotron-H's. Each family's chat
+// prompts end where its assistant reasons, in an open think block (Flint's
+// model opens one itself; the prompt opens it as Qwen's and Nemotron-H's
+// templates do), and the vocabulary sizes the constraint masks.
 struct OracleTokens final {
   uint32_t vocabulary = 0;
   // "List every prime number between 1 and 60, then check each one by trial
-  // division before you answer." from the user, which both Qwen models and
-  // Flint think through for well over the tokens the thinking tests decode.
+  // division before you answer." from the user, which the Qwen models, Flint
+  // and Nemotron 3.5 Bolt think through for well over the tokens the
+  // thinking tests decode.
   std::vector<uint32_t> thinkingPrompt;
   // The tokenizer's </think>, and the ends the thinking tests close thinking
   // with: the close alone, and "Considering the limited time, I have to give
@@ -322,10 +323,34 @@ const OracleTokens kFlintTokens{
     // <|user|>...<|assistant|><think></think>
     .productionSeed = {150003, 3201, 29915, 497,  220,  16,   11,    3758, 1218, 1067,   299,    869,    5095,  1060, 358,
                        260,    618,  1507,  13,   27110, 2843, 361, 4495, 220,  905,    13,     150004, 150006, 150007}};
+const OracleTokens kNemotronHTokens{
+    .vocabulary = 131072,
+    // Its template opens with a system block, empty without a system message:
+    // <|im_start|>system\n<|im_end|>\n<|im_start|>user\n...<|im_end|>\n
+    // <|im_start|>assistant\n<think>\n
+    .thinkingPrompt = {10, 25708, 1010, 11, 1010, 10, 3263, 1010, 2525, 3387, 8156, 2782, 2396, 1032, 1049,
+                       1321, 1032, 1054, 1048, 1044, 2430, 4206, 2744, 1925, 1536, 12290, 11368, 3066, 1636,
+                       4832, 1046, 11, 1010, 10, 1503, 19464, 1010, 12, 1010},
+    .thinkEnd = 13,
+    .thinkingEnds = {std::vector<uint32_t>{13},
+                     std::vector<uint32_t>{111436, 1278, 8031, 2142, 1044, 1362, 1736, 1317, 5628, 1278, 5097,
+                                           4057, 1408, 1278, 11483, 7655, 3246, 1626, 13}},
+    // <|im_start|>system\n...<|im_end|>\n<|im_start|>user\nHello<|im_end|>\n
+    // <|im_start|>assistant\n<think>\n
+    .samplingSeed = {10, 25708, 1010, 57653, 1302, 8267, 1395, 2016, 1317, 2460, 24871, 1046, 13980, 3648,
+                     21966, 2645, 1278, 6255, 1044, 20930, 3844, 31215, 1044, 3369, 54237, 37393, 1044, 1321,
+                     54628, 2033, 113791, 1044, 37487, 1044, 1321, 49871, 1294, 1278, 2778, 4832, 1046, 11,
+                     1010, 10, 3263, 1010, 22177, 11, 1010, 10, 1503, 19464, 1010, 12, 1010},
+    // ...<|im_start|>assistant\n<think></think>
+    .productionSeed = {10, 25708, 1010, 11, 1010, 10, 3263, 1010, 6669, 40022, 1562, 1032, 1049, 1044, 9664,
+                       2744, 2782, 1321, 2246, 7846, 2564, 1408, 1261, 1875, 3110, 1046, 97685, 4570, 1636,
+                       8132, 1032, 1050, 1048, 1048, 1046, 11, 1010, 10, 1503, 19464, 1010, 12, 13}};
 // The target's texts (oracleTokens), which main chooses before any check
 // runs; the Qwen families' until then.
 const OracleTokens *targetTokens = &kQwenTokens;
 [[nodiscard]] const OracleTokens &oracleTokens(const model::ModelDescriptor &descriptor) {
+  if (std::holds_alternative<model::NemotronHLayout>(descriptor.target))
+    return kNemotronHTokens;
   return std::holds_alternative<model::FlintLayout>(descriptor.target) ? kFlintTokens : kQwenTokens;
 }
 

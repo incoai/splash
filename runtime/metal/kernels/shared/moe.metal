@@ -159,6 +159,76 @@ MOE_ROUTE_SELECT_UNGATED_ENTRY(moe_route_select_f32_sigmoid_s2, SPLASH_MOE_EXPER
 #undef MOE_ROUTE_SELECT_ENTRY
 #undef MOE_ROUTE_SELECT_BODY
 
+// The biased sigmoid router (ops::MoeRouter::SigmoidBiased, Nemotron-H's):
+// expert e's probability is sigmoid(score e), the top_k experts are the
+// highest probabilities plus the block's F32 selection bias (descending, then
+// ascending id), and their weights are their unbiased probabilities over the
+// sum of those, at least 2^-14, times params.scale, summed in rank order
+// (llama.cpp build_moe_ffn, its sigmoid gating with norm_w and w_scale). No
+// shared expert. One row per threadgroup, a thread per expert slot.
+template <uint Slots>
+inline void moe_route_select_biased(device const float *scores, device const float *bias, device uint *selected,
+                                    device float *routing_weights, constant MoeBiasedRouteParams &params, uint row,
+                                    uint thread_index, uint simd_lane, uint simd_group,
+                                    threadgroup float *probabilities, threadgroup float *chosen) {
+  constexpr uint ExpertsPerLane = Slots / 32;
+  if (row >= params.rows)
+    return;
+  probabilities[thread_index] =
+      thread_index < params.experts ? splash_sigmoid(scores[ulong(row) * Slots + thread_index]) : 0.0f;
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (simd_group != 0)
+    return;
+  const ulong row_routes = ulong(row) * params.top_k;
+  float lane_scores[ExpertsPerLane];
+  for (uint slot = 0; slot < ExpertsPerLane; ++slot) {
+    const uint e = simd_lane + 32 * slot;
+    lane_scores[slot] = e < params.experts ? probabilities[e] + bias[e] : -numeric_limits<float>::infinity();
+  }
+  for (uint rank = 0; rank < params.top_k; ++rank) {
+    float best = -numeric_limits<float>::infinity();
+    uint best_slot = 0;
+    for (uint slot = 0; slot < ExpertsPerLane; ++slot) {
+      if (lane_scores[slot] > best) {
+        best = lane_scores[slot];
+        best_slot = slot;
+      }
+    }
+    const float row_best = simd_max(best);
+    const uint candidate = best == row_best ? simd_lane + 32 * best_slot : 0xFFFFFFFFu;
+    const uint winner = simd_min(candidate);
+    if (candidate == winner)
+      lane_scores[best_slot] = -numeric_limits<float>::infinity();
+    if (simd_lane == 0) {
+      chosen[rank] = probabilities[winner];
+      selected[row_routes + rank] = winner;
+    }
+  }
+  simdgroup_barrier(mem_flags::mem_threadgroup);
+  float total = 0.0f;
+  for (uint rank = 0; rank < params.top_k; ++rank)
+    total += chosen[rank];
+  const float scale = params.scale / max(total, 6.103515625e-5f);
+  for (uint rank = simd_lane; rank < params.top_k; rank += 32)
+    routing_weights[row_routes + rank] = chosen[rank] * scale;
+}
+#define MOE_ROUTE_SELECT_BIASED_ENTRY(Name, Slots)                                                          \
+  kernel void Name(device const float *scores [[buffer(0)]], device const float *bias [[buffer(1)]],        \
+                   device uint *selected [[buffer(2)]], device float *routing_weights [[buffer(3)]],        \
+                   constant MoeBiasedRouteParams &params [[buffer(4)]],                                     \
+                   uint group [[threadgroup_position_in_grid]],                                             \
+                   uint thread_index [[thread_index_in_threadgroup]],                                       \
+                   uint simd_lane [[thread_index_in_simdgroup]],                                            \
+                   uint simd_group [[simdgroup_index_in_threadgroup]]) {                                    \
+    threadgroup float probabilities[Slots];                                                                 \
+    threadgroup float chosen[Slots];                                                                        \
+    moe_route_select_biased<Slots>(scores, bias, selected, routing_weights, params, group, thread_index,   \
+                                   simd_lane, simd_group, probabilities, chosen);                           \
+  }
+MOE_ROUTE_SELECT_BIASED_ENTRY(moe_route_select_f32_sigmoid_bias_s0, SPLASH_MOE_EXPERT_SLOTS)
+MOE_ROUTE_SELECT_BIASED_ENTRY(moe_route_select_f32_e512_sigmoid_bias_s0, SPLASH_MOE_WIDE_EXPERT_SLOTS)
+#undef MOE_ROUTE_SELECT_BIASED_ENTRY
+
 // Whether a verified grouping leaves routed route `route` out: its row lies
 // in no lane's rows, which no lane verifies (MoeGroupParams).
 template <uint Shared, bool Verified>
@@ -336,6 +406,10 @@ MOE_GROUP_ROUTES_VERIFIED_ENTRY(moe_group_routes_verified, SPLASH_MOE_EXPERT_SLO
 MOE_GROUP_ROUTES_VERIFIED_ENTRY(moe_group_routes_verified_e512, SPLASH_MOE_WIDE_EXPERT_SLOTS, 1)
 MOE_GROUP_ROUTES_ENTRY(moe_group_routes_s2, SPLASH_MOE_EXPERT_SLOTS, 2)
 MOE_GROUP_ROUTES_VERIFIED_ENTRY(moe_group_routes_verified_s2, SPLASH_MOE_EXPERT_SLOTS, 2)
+MOE_GROUP_ROUTES_ENTRY(moe_group_routes_s0, SPLASH_MOE_EXPERT_SLOTS, 0)
+MOE_GROUP_ROUTES_ENTRY(moe_group_routes_e512_s0, SPLASH_MOE_WIDE_EXPERT_SLOTS, 0)
+MOE_GROUP_ROUTES_VERIFIED_ENTRY(moe_group_routes_verified_s0, SPLASH_MOE_EXPERT_SLOTS, 0)
+MOE_GROUP_ROUTES_VERIFIED_ENTRY(moe_group_routes_verified_e512_s0, SPLASH_MOE_WIDE_EXPERT_SLOTS, 0)
 #undef MOE_GROUP_ROUTES_VERIFIED_ENTRY
 #undef MOE_GROUP_ROUTES_ENTRY
 #undef MOE_GROUP_ROUTES_BODY
@@ -389,4 +463,38 @@ kernel void moe_combine(
                                  dimension]);
   }
   output[ulong(row) * params.hidden_size + dimension] = bfloat(value);
+}
+
+// moe_combine without a residual (ops::MoeBuffers::residual empty): the
+// weighted sum of each row's routes alone.
+kernel void moe_combine_routed(
+    device const bfloat *expert_output [[buffer(0)]],
+    device const uint *route_rows [[buffer(1)]],
+    device const float *routing_weights [[buffer(2)]],
+    device bfloat *output [[buffer(3)]],
+    constant MoeCombineParams &params [[buffer(4)]],
+    uint2 group [[threadgroup_position_in_grid]],
+    uint thread_index [[thread_index_in_threadgroup]]) {
+  uint row = group.x;
+  uint dimension = group.y * 256 + thread_index;
+  if (row >= params.rows || dimension >= params.hidden_size)
+    return;
+  float value = 0.0f;
+  ulong route = ulong(row) * params.routes_per_row;
+  for (uint slot = 0; slot < params.routes_per_row; ++slot) {
+    const uint grouped = route_rows[route + slot];
+    if (grouped == ~0u)
+      continue;
+    value += routing_weights[route + slot] *
+             float(expert_output[ulong(grouped) * params.hidden_size +
+                                 dimension]);
+  }
+  output[ulong(row) * params.hidden_size + dimension] = bfloat(value);
+}
+
+// The ReLU^2 activation (ops::MoeActivation::ReluSquared) in place on bf16
+// up projections: bf16(max(x, 0)^2). A thread per element.
+kernel void relu_squared(device bfloat *values [[buffer(0)]], uint element [[thread_position_in_grid]]) {
+  const float v = max(float(values[element]), 0.0f);
+  values[element] = bfloat(v * v);
 }

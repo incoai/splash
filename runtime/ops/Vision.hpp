@@ -8,10 +8,11 @@
 
 namespace splash::ops {
 
-// A vision tower's geometry. The defaults are the one tower the kernels are
-// specialized for, Qwen3.5's 27 blocks; outputHiddenSize, the width of the
-// text model its merger projects into, is each family's, stated beside its
-// target (Qwen3_8.hpp, Qwen3_6Moe.hpp).
+// A vision tower's geometry. The kernels compile two (kCompiledVision,
+// Vision.cpp): the defaults, Qwen3.5's 27 blocks, and kRadioVisionLayout,
+// Nemotron 3.5 Bolt's RADIO. outputHiddenSize, the width of the text model
+// its merger projects into, is each family's, stated beside its target
+// (Qwen3_8.hpp, Qwen3_6Moe.hpp).
 struct VisionLayout final {
   uint32_t depth = 27;
   uint32_t hiddenSize = 1152;
@@ -25,9 +26,29 @@ struct VisionLayout final {
   uint32_t positionGridSide = 48;
   uint32_t patchSize = 16;
   uint32_t spatialMerge = 2;
+  // Learned tokens the tower attends with the patches and drops before the
+  // merger (RADIO's cls and registers).
+  uint32_t prefixTokens = 0;
+  // The merger's up-projection width.
+  uint32_t mergerIntermediateSize = 4608;
+  // RADIO's final LayerNorm (v.post_ln) on the residual before the merger
+  // (Nemotron 3.5 Super's tower; Bolt's has none).
+  bool finalNorm = false;
 
   bool operator==(const VisionLayout &) const = default;
 };
+
+// RADIO (C-RADIO ViT-H/16): 32 blocks 1280 wide, 16 heads of 80, MLP 5120,
+// single-frame 768-value patches, a 128x128 position table, 10 prefix tokens,
+// and a merger of RMS norm, 5120 -> 20480, ReLU squared, -> output.
+inline constexpr VisionLayout kRadioVisionLayout{
+    32, 1280, 768, 5120, 5120, 5120, 0, 16, 80, 128, 16, 2, 10, 20480};
+// Whether a layout is RADIO's, whatever text model it projects into.
+[[nodiscard]] constexpr bool isRadioVision(VisionLayout layout) noexcept {
+  layout.outputHiddenSize = 0;
+  layout.finalNorm = false;
+  return layout == kRadioVisionLayout;
+}
 
 struct VisionAffine final {
   metal::MetalBuffer weight;
@@ -48,14 +69,21 @@ struct VisionBlock final {
   VisionAffine downProjection;
 };
 
+// bf16 weights. RADIO's patch embedding and merger have no biases (their bias
+// buffers stay empty), and its merger norm is an RMS weight per merged value
+// (mergerNorm.weight, no bias).
 struct VisionWeights final {
   VisionLayout layout;
   VisionAffine patchEmbedding;
   metal::MetalBuffer positionTable;
   std::vector<VisionBlock> blocks;
   VisionNorm mergerNorm;
+  VisionNorm finalNorm = {}; // RADIO's, when its layout has one
+  // RADIO's video patch embedding, two frames of patches wide (no bias).
+  VisionAffine videoPatchEmbedding = {};
   VisionAffine mergerUpProjection;
   VisionAffine mergerDownProjection;
+  metal::MetalBuffer prefixTokens = {};
 };
 
 // Input geometry shared by the frontend and runtime: RGB patch size and the
@@ -69,13 +97,15 @@ inline constexpr uint32_t kMaximumImagePatches = 16384;
          kImagePatchPixels * kImageChannels;
 }
 // Patch-grid sides are multiples of the 2x2 spatial merge. Each merged token
-// covers four patches and follows row-major order over the merged grid.
+// covers four patches and follows row-major order over the merged grid. A
+// video's tubelet is two frames of one grid, encoded into one grid's tokens.
 struct ImageGrid final {
   uint32_t height = 0; // patches
   uint32_t width = 0;
+  uint32_t frames = 1;
 
   [[nodiscard]] bool valid() const noexcept {
-    return height >= 2 && width >= 2 && height % 2 == 0 && width % 2 == 0;
+    return height >= 2 && width >= 2 && height % 2 == 0 && width % 2 == 0 && (frames == 1 || frames == 2);
   }
   // Exact for any sides, so a grid past a patch limit cannot wrap under it.
   [[nodiscard]] uint64_t patches() const noexcept {
@@ -85,7 +115,7 @@ struct ImageGrid final {
     return (height / 2) * (width / 2);
   }
   [[nodiscard]] uint64_t pixelBytes() const noexcept {
-    return imagePixelBytes(height, width);
+    return imagePixelBytes(height, width) * frames;
   }
 };
 
@@ -154,8 +184,36 @@ private:
 
   const VisionWeights &model_;
   uint32_t maximumPatches_ = 0;
+  bool radio_ = false;
   metal::MetalBuffer arena_;
+  // The bias of RADIO's bias-free GEMMs, zero for the widest of them: the
+  // arena's end, which scratchBytes counts.
+  metal::MetalBuffer zeros_;
   metal::MetalBuffer scratch_[static_cast<uint32_t>(Scratch::Count)];
+};
+
+// EVS over a pruned video's tubelets (model::ImageSpan::pruned), from their
+// encoded rows (Vision::encode, Vision::embeddingRows(grid) rows apart) and
+// the bf16 rows of the text between them to the span's rows: the `kept`
+// least redundant tubelet rows in order, each tubelet's after the text that
+// precedes it (`cuts`, a u32 per tubelet), as the processor drops the pruned
+// rows of the prompt it widened.
+struct VideoPruningShape final {
+  uint32_t tubelets = 0;
+  ImageGrid grid;
+  uint32_t width = 0;
+  uint32_t kept = 0;
+  uint32_t textTokens = 0;
+};
+
+class VideoPruning final {
+public:
+  // The f32 dissimilarities and u32 keep flags, one per tubelet row.
+  [[nodiscard]] static uint64_t flagBytes(const VideoPruningShape &shape) noexcept;
+  static void add(metal::CommandGraph &graph, const VideoPruningShape &shape,
+                  const metal::MetalBuffer &encoded, const metal::MetalBuffer &text,
+                  const metal::MetalBuffer &cuts, const metal::MetalBuffer &dissimilarity,
+                  const metal::MetalBuffer &keep, const metal::MetalBuffer &output);
 };
 
 } // namespace splash::ops

@@ -25,7 +25,11 @@ The paths an assembly links, and what reads each:
                          the DFlash2 checkpoint (ModelDescriptor.mm,
                          DraftCheckpoint.cpp), with the mask token's
                          embedding, draft/mask_embedding.safetensors, when
-                         the release ships one
+                         the release ships one; or, for a draft released as
+                         a LiLiCorr GGUF, draft/<name>.gguf, which
+                         the engine does not read, and the checkpoint
+                         derived from it (models/.metadata/<key>,
+                         dflash_gguf.py)
   vision/<shard>         the MLX shards holding vision_tower.*
                          (VisionLoader.cpp, through SafetensorsCheckpoint.mm)
   vision/mmproj.gguf     the GGUF vision projector (VisionLoader.cpp)
@@ -40,7 +44,7 @@ import shutil
 import tempfile
 from pathlib import Path
 
-from . import families, gguf, hub, models
+from . import dflash_gguf, families, gguf, hub, models
 
 GGUF_VISION = "vision/mmproj.gguf"
 TARGET_FORMATS = ("mlx-affine", "gguf")
@@ -392,6 +396,69 @@ def is_held(assembly: Path) -> bool:
     except OSError:
         return False
     return False
+
+
+DRAFT_FILES = ("config.json", "model.safetensors")
+
+
+def _draft_input(files):
+    """The assembly path of the draft GGUF the draft checkpoint is derived
+    from, or None for a draft released as a checkpoint."""
+    names = [n for n in files if n.startswith("draft/") and n.endswith(".gguf")]
+    if len(names) > 1:
+        raise models.ModelError("a draft is one GGUF file")
+    return names[0] if names else None
+
+
+def draft_key(file_records):
+    """The .metadata entry this release derives the draft checkpoint into
+    from an assembly's draft GGUF, given each assembly path's file record;
+    None without one. The converter is part of the derivation."""
+    name = _draft_input(file_records)
+    if name is None:
+        return None
+    source = file_records[name]
+    identity = {
+        "draft": {"bytes": source["bytes"], "digest": source["digest"]},
+        "converter": models.sha256(Path(dflash_gguf.__file__)),
+    }
+    return hashlib.sha256(models.json_bytes(identity)).hexdigest()
+
+
+def derived_draft(models_root: Path, files, records):
+    """The files, by assembly path, of the draft checkpoint derived from the
+    draft GGUF among files (assembly path -> source file), if any: derived
+    once, and again when its entry is damaged. records maps each source file
+    to its record (file_record). Call it under the installation lock."""
+    name = _draft_input(files)
+    if name is None:
+        return {}
+    source, recorded = files[name], records[files[name]]
+
+    def write(stage):
+        dflash_gguf.write_checkpoint(source, stage)
+        if file_record(source, recorded) != recorded:
+            raise models.ModelError("draft GGUF changed while converting it")
+        hashes = {}
+        for derived in DRAFT_FILES:
+            with (stage / derived).open("rb+") as stream:
+                os.fsync(stream.fileno())
+            hashes[derived] = models.sha256(stage / derived)
+        _write_durably(stage / "files.json", models.json_bytes(hashes))
+
+    entry = models_root / ".metadata" / draft_key({name: recorded})
+    _reuse_or_write(entry, write, _check_draft)
+    return {"draft/" + derived: entry / derived for derived in DRAFT_FILES}
+
+
+def _check_draft(entry):
+    """Raise unless a draft entry holds its files as its files.json lists them."""
+    hashes = models.read_json(entry / "files.json")
+    if set(hashes) != set(DRAFT_FILES):
+        raise models.ModelError("invalid derived draft record")
+    for name in DRAFT_FILES:
+        if models.sha256(entry / name) != hashes[name]:
+            raise models.ModelError("derived draft changed: " + name)
 
 
 def collect_garbage(models_root: Path, *, updating=False) -> int:

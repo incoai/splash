@@ -8,6 +8,8 @@
 #include "engine/NativeArguments.hpp"
 #include "model/ModelDescriptor.hpp"
 
+#import <AVFoundation/AVFoundation.h>
+#import <VideoToolbox/VideoToolbox.h>
 #include <IOKit/pwr_mgt/IOPMLib.h>
 #include <dispatch/dispatch.h>
 #include <mach-o/dyld.h>
@@ -17,6 +19,8 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cmath>
+#include <cstdio>
 #include <cerrno>
 #include <csignal>
 #include <chrono>
@@ -24,7 +28,9 @@
 #include <cstdlib>
 #include <filesystem>
 #include <limits.h>
+#include <map>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -158,6 +164,7 @@ void printUsage(std::string_view executable) {
   writeStderrLine("       " + command + " model-check mlx-affine none|safetensors CONFIG [DRAFT_CONFIG]");
   writeStderrLine("       " + command + " model-check gguf none|gguf CONFIG GGUF_HEADERS [DRAFT_CONFIG]");
   writeStderrLine("       " + command + " device-check");
+  writeStderrLine("       " + command + " video-frames VIDEO FPS MAX_FRAMES");
   writeStderrLine("       " + command + " families");
 }
 
@@ -476,6 +483,240 @@ int checkModel(int argc, char **argv) {
   return 0;
 }
 
+// The frames vLLM's Nemotron loader samples: uniform over the clip, at most
+// FPS per second and MAX_FRAMES, by index into its frames in presentation
+// order. The server runs this in a disposable process, since the video is
+// untrusted. stdout: one JSON line (width, height, source fps, frame count,
+// sampled indices), then each sampled frame's RGB rows.
+// Decoding is software: the hardware decoder waits indefinitely for memory
+// while a large model holds most of it wired (Super on 64 GB), and software
+// decodes 1080p H.264 at about 300 frames a second.
+// ponytail: ignores the track's rotation; portrait phone clips come out sideways.
+int extractVideoFrames(int argc, char **argv) {
+  if (argc != 5)
+    throw engine::UsageError("video-frames takes the video, the sampling fps and the frame cap");
+  const double fps = std::atof(argv[3]);
+  const long cap = std::atol(argv[4]);
+  if (!(fps > 0) || cap < 1)
+    throw engine::UsageError("video-frames needs a positive fps and frame cap");
+  AVURLAsset *asset = [AVURLAsset
+      URLAssetWithURL:[NSURL fileURLWithPath:[NSString stringWithUTF8String:argv[2]]]
+              options:nil];
+  __block AVAssetTrack *track = nil;
+  dispatch_semaphore_t loaded = dispatch_semaphore_create(0);
+  [asset loadTracksWithMediaType:AVMediaTypeVideo
+               completionHandler:^(NSArray<AVAssetTrack *> *tracks, NSError *) {
+                 track = tracks.firstObject;
+                 dispatch_semaphore_signal(loaded);
+               }];
+  dispatch_semaphore_wait(loaded, DISPATCH_TIME_FOREVER);
+  AVAssetTrack *const video = track;
+  if (!video)
+    throw std::runtime_error("the video has no video track");
+  // Its compressed samples, in decode order.
+  const auto samples = [&] {
+    NSError *error = nil;
+    AVAssetReader *reader = [AVAssetReader assetReaderWithAsset:asset error:&error];
+    AVAssetReaderTrackOutput *output =
+        [AVAssetReaderTrackOutput assetReaderTrackOutputWithTrack:video outputSettings:nil];
+    if (!reader || ![reader canAddOutput:output])
+      throw std::runtime_error("the video cannot be decoded");
+    [reader addOutput:output];
+    if (![reader startReading])
+      throw std::runtime_error("the video cannot be decoded");
+    return std::pair{reader, output};
+  };
+  // Every frame's presentation time, after the track's edits, as the decoder
+  // reports it, in the track's time scale: the decoder's own may differ, and
+  // the container's frame count is an estimate.
+  const int32_t scale = video.naturalTimeScale > 0 ? video.naturalTimeScale : 600;
+  const auto tick = [scale](CMTime time) {
+    return CMTimeConvertScale(time, scale, kCMTimeRoundingMethod_RoundHalfAwayFromZero).value;
+  };
+  std::vector<int64_t> times;
+  // The decoded frames' size, as OpenCV reads it: the track's naturalSize is
+  // the display size from the track header, which can be off by a fraction
+  // (568.9 for 568 coded) or scaled by the pixel aspect ratio.
+  CMVideoDimensions dimensions{0, 0};
+  // Per sample buffer, in decode order: whether decoding can start there, and
+  // its earliest presentation time; per frame, the buffer that holds it.
+  std::vector<bool> sync;
+  std::vector<int64_t> earliest;
+  std::map<int64_t, size_t> holder;
+  {
+    auto [reader, output] = samples();
+    while (CMSampleBufferRef sample = [output copyNextSampleBuffer]) {
+      if (CMFormatDescriptionRef format = CMSampleBufferGetFormatDescription(sample); format && !dimensions.width)
+        dimensions = CMVideoFormatDescriptionGetDimensions(format);
+      const CMItemCount count = CMSampleBufferGetNumSamples(sample);
+      std::vector<CMSampleTimingInfo> timing(static_cast<size_t>(count));
+      int64_t first = INT64_MAX;
+      if (count && CMSampleBufferGetOutputSampleTimingInfoArray(sample, count, timing.data(), nullptr) == noErr)
+        for (const CMSampleTimingInfo &info : timing) {
+          // An hour at 240 fps is 864,000; past that, refuse before the
+          // per-frame tables grow with an untrusted file.
+          if (times.size() == 1'000'000)
+            throw std::runtime_error("the video has too many frames");
+          times.push_back(tick(info.presentationTimeStamp));
+          holder.emplace(times.back(), sync.size());
+          first = std::min(first, times.back());
+        }
+      CFArrayRef attachments = CMSampleBufferGetSampleAttachmentsArray(sample, false);
+      const auto notSync = attachments && CFArrayGetCount(attachments)
+          ? static_cast<CFBooleanRef>(CFDictionaryGetValue(
+                static_cast<CFDictionaryRef>(CFArrayGetValueAtIndex(attachments, 0)), kCMSampleAttachmentKey_NotSync))
+          : nullptr;
+      sync.push_back(!(notSync && CFBooleanGetValue(notSync)));
+      earliest.push_back(first);
+      CFRelease(sample);
+    }
+    if (reader.status != AVAssetReaderStatusCompleted)
+      throw std::runtime_error("the video cannot be decoded");
+  }
+  std::sort(times.begin(), times.end());
+  // A frame is found by its time alone, so two frames may not share one.
+  if (std::adjacent_find(times.begin(), times.end()) != times.end())
+    throw std::runtime_error("the video has frames sharing a presentation time");
+  const long total = static_cast<long>(times.size());
+  const double sourceFps = video.nominalFrameRate;
+  // Each side alone first: the container's size is untrusted and the
+  // product could overflow.
+  if (total < 1 || !(sourceFps >= 0.1) || !(dimensions.width >= 1 && dimensions.width <= 16384) ||
+      !(dimensions.height >= 1 && dimensions.height <= 16384))
+    throw std::runtime_error("the video has no frames, no frame rate or an unsupported size");
+  const long width = dimensions.width;
+  const long height = dimensions.height;
+  if (width * height > 4096L * 4096L)
+    throw std::runtime_error("the video has no frames, no frame rate or an unsupported size");
+  // vLLM's VideoBackend: min(cap, frames, floor(duration * fps)) frames at
+  // np.linspace(0, frames - 1, n, dtype=int). The rate is a float's, 30 fps
+  // as 30.000002: the floor allows for it, as OpenCV's exact 30/1 would.
+  // Compared as doubles: an odd rate would overflow a long.
+  const long count = static_cast<long>(std::max(1.0, std::min({static_cast<double>(cap),
+      static_cast<double>(total), std::floor(static_cast<double>(total) / sourceFps * fps + 1e-4)})));
+  std::vector<long> indices(count);
+  const double step = count > 1 ? static_cast<double>(total - 1) / static_cast<double>(count - 1) : 0;
+  for (long i = 0; i < count; ++i)
+    indices[i] = count > 1 && i + 1 == count ? total - 1 : static_cast<long>(static_cast<double>(i) * step);
+  std::string header = "{\"width\":" + std::to_string(width) + ",\"height\":" + std::to_string(height) +
+      ",\"fps\":" + std::to_string(sourceFps) + ",\"frames\":" + std::to_string(total) + ",\"indices\":[";
+  for (long i = 0; i < count; ++i)
+    header += (i ? "," : "") + std::to_string(indices[i]);
+  header += "]}\n";
+  std::fwrite(header.data(), 1, header.size(), stdout);
+
+  // Decoded frames arrive in decode order; each sampled one waits here until
+  // those before it in presentation order are written.
+  struct Output {
+    std::map<int64_t, size_t> wanted; // presentation time -> output position
+    std::map<size_t, std::vector<uint8_t>> pending;
+    size_t next = 0;
+    long width = 0, height = 0;
+    bool failed = false;
+    // The handler may run on a decoder thread while this one reads.
+    std::mutex lock;
+  } out;
+  for (size_t i = 0; i < indices.size(); ++i)
+    out.wanted.emplace(times[static_cast<size_t>(indices[i])], i);
+  // Only the buffers a sampled frame needs: from the sync buffer before it,
+  // or the one before that when the frame shows earlier than its sync buffer
+  // (a leading picture of an open GOP), through its own. An hour at 30 fps
+  // decodes 128 short runs instead of 100,000 frames.
+  std::vector<bool> needed(sync.size(), false);
+  for (const auto &[time, position] : out.wanted) {
+    const size_t own = holder.at(time);
+    size_t start = own;
+    while (start > 0 && !sync[start])
+      --start;
+    if (time < earliest[start] && start > 0)
+      for (--start; start > 0 && !sync[start]; --start) {
+      }
+    for (size_t b = start; b <= own; ++b)
+      needed[b] = true;
+  }
+  out.width = width, out.height = height;
+  Output *const state = &out;
+  VTDecompressionSessionRef session = nullptr;
+  auto [reader, output] = samples();
+  size_t buffer = 0;
+  bool skipped = false;
+  while (CMSampleBufferRef sample = [output copyNextSampleBuffer]) {
+    // The file changed between the passes: decode everything rather than guess.
+    const bool wanted = buffer >= needed.size() || needed[buffer];
+    ++buffer;
+    if (!wanted) {
+      skipped = true;
+      CFRelease(sample);
+      continue;
+    }
+    // After a gap, let the frames the decoder holds for reordering out first.
+    if (skipped && session) {
+      VTDecompressionSessionFinishDelayedFrames(session);
+      VTDecompressionSessionWaitForAsynchronousFrames(session);
+    }
+    skipped = false;
+    CMFormatDescriptionRef format = CMSampleBufferGetFormatDescription(sample);
+    if (format && CMSampleBufferGetNumSamples(sample)) {
+      if (!session) {
+        NSDictionary *software =
+            @{(id)kVTVideoDecoderSpecification_EnableHardwareAcceleratedVideoDecoder : @NO};
+        NSDictionary *pixels = @{(id)kCVPixelBufferPixelFormatTypeKey : @(kCVPixelFormatType_32BGRA)};
+        if (VTDecompressionSessionCreate(nullptr, format, (__bridge CFDictionaryRef)software,
+                                         (__bridge CFDictionaryRef)pixels, nullptr, &session) != noErr) {
+          CFRelease(sample);
+          throw std::runtime_error("the video's codec is not supported");
+        }
+      }
+      VTDecompressionSessionDecodeFrameWithOutputHandler(
+          session, sample, 0, nullptr,
+          ^(OSStatus status, VTDecodeInfoFlags, CVImageBufferRef image, CMTime time, CMTime) {
+            const std::lock_guard guard(state->lock);
+            const auto wanted = state->wanted.find(tick(time));
+            if (wanted == state->wanted.end())
+              return;
+            if (status != noErr || !image ||
+                static_cast<long>(CVPixelBufferGetWidth(image)) != state->width ||
+                static_cast<long>(CVPixelBufferGetHeight(image)) != state->height) {
+              state->failed = true;
+              return;
+            }
+            std::vector<uint8_t> rgb(static_cast<size_t>(state->width * state->height * 3));
+            CVPixelBufferLockBaseAddress(image, kCVPixelBufferLock_ReadOnly);
+            const auto *base = static_cast<const uint8_t *>(CVPixelBufferGetBaseAddress(image));
+            const size_t stride = CVPixelBufferGetBytesPerRow(image);
+            for (long y = 0; y < state->height; ++y)
+              for (long x = 0; x < state->width; ++x) {
+                const uint8_t *bgra = base + y * stride + x * 4;
+                uint8_t *pixel = rgb.data() + (y * state->width + x) * 3;
+                pixel[0] = bgra[2], pixel[1] = bgra[1], pixel[2] = bgra[0];
+              }
+            CVPixelBufferUnlockBaseAddress(image, kCVPixelBufferLock_ReadOnly);
+            state->pending.emplace(wanted->second, std::move(rgb));
+            for (auto ready = state->pending.find(state->next); ready != state->pending.end();
+                 ready = state->pending.find(state->next)) {
+              std::fwrite(ready->second.data(), 1, ready->second.size(), stdout);
+              state->pending.erase(ready);
+              ++state->next;
+            }
+          });
+    }
+    CFRelease(sample);
+    const std::lock_guard guard(out.lock);
+    if (out.failed || out.next == indices.size())
+      break;
+  }
+  if (session) {
+    VTDecompressionSessionFinishDelayedFrames(session);
+    VTDecompressionSessionWaitForAsynchronousFrames(session);
+    VTDecompressionSessionInvalidate(session);
+    CFRelease(session);
+  }
+  [reader cancelReading];
+  if (out.failed || out.next != indices.size())
+    throw std::runtime_error("the video could not be decoded to its counted frames");
+  return std::fflush(stdout) == 0 ? 0 : static_cast<int>(engine::NativeProcessExit::IoFailure);
+}
+
 // What each family's layout gives the options a start takes
 // (model::familyFacts), as JSON by family, which the installer reports to the
 // app (install/families.py).
@@ -512,6 +753,8 @@ int main(int argc, char **argv) {
         return splash::checkModel(argc, argv);
       if (command == "families")
         return splash::printFamilies(argc);
+      if (command == "video-frames")
+        return splash::extractVideoFrames(argc, argv);
       if (command == "serve-native")
         return splash::serveNative(argc, argv);
       throw splash::engine::UsageError(command.empty() ? std::string("expected a command")
