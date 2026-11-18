@@ -67,7 +67,7 @@ private:
 // target while a lane holds a floor (growTowardTarget), which its floors may
 // take it past. With no lane reading above the floors (none holds one, or
 // the target is no more than the floor) its extents cost only their rebuild:
-// after the last Spill lane ends they are up to 975 MiB nothing reads.
+// after the last Spill lane ends they are up to 1,755 MiB nothing reads.
 class HotBlocksPool final : public ElasticPool {
 public:
   explicit HotBlocksPool(KvBlockCache &cache) noexcept : cache_(cache) {}

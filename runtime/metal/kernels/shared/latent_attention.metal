@@ -434,7 +434,7 @@ kernel void latent_ring_update(device const bfloat *ring_in [[buffer(0)]], devic
                                uint tid [[thread_index_in_threadgroup]]) {
   const uint d = tid * 4;
   if (slot >= p.ring || d >= kDim) return;
-  const uint kept = p.retained ? min(retained[p.lane], p.rows) : p.rows, end = p.committed + kept;
+  const uint kept = p.retained ? min(uint(popcount(retained[p.lane])), p.rows) : p.rows, end = p.committed + kept;
   device const bfloat *from = ring_in + ulong(slot) * kDim;
   if (end) {
     const uint last = end - 1, back = (last + p.ring - slot) % p.ring;
@@ -449,9 +449,38 @@ kernel void latent_ring_update(device const bfloat *ring_in [[buffer(0)]], devic
 kernel void latent_open_commit(device const float *kv [[buffer(0)]], device const float *gate [[buffer(1)]],
                                device float *open [[buffer(2)]], device const uint *retained [[buffer(3)]],
                                constant LatentOpenParams &p [[buffer(4)]], uint d [[thread_position_in_grid]]) {
-  const uint kept = retained[p.lane];
+  const uint kept = popcount(retained[p.lane]);
   if (d >= p.width || !((p.committed + kept) & 1)) return;
   const ulong row = ulong(kept) * p.width;
   open[d] = kv[row + d];
   open[p.width + d] = gate[row + d];
+}
+
+// A decode step's rows between its packed layout and lanes of p.stride rows
+// (LatentLaneRowsParams): a thread per word of a row of the lanes' rows.
+kernel void latent_lane_rows(device const uint *from [[buffer(0)]], device uint *to [[buffer(1)]],
+                             device const SplashLaneRows *packed [[buffer(2)]], device uint *counts [[buffer(3)]],
+                             device SplashLaneRows *strided [[buffer(4)]], device uint *positions [[buffer(5)]],
+                             device uint *groups [[buffer(6)]], constant LatentLaneRowsParams &p [[buffer(7)]],
+                             uint2 at [[thread_position_in_grid]]) {
+  const uint word = at.x, row = at.y, lane = row / p.stride, i = row % p.stride;
+  if (word >= p.words || lane >= p.lanes) return;
+  const SplashLaneRows layout = packed[lane];
+  if (!p.gather) {
+    if (i < layout.rows) to[ulong(layout.first + i) * p.words + word] = from[ulong(row) * p.words + word];
+    return;
+  }
+  to[ulong(row) * p.words + word] = from[ulong(layout.first + (i < layout.rows ? i : 0)) * p.words + word];
+  if (word) return;
+  const uint committed = p.committed[lane];
+  positions[row] = committed + i;
+  for (uint kind = 0; kind < 2; ++kind) {
+    const uint ratio = 2 - kind;
+    device uint *lane_groups = groups + ulong(lane * 2 + kind) * p.group_stride;
+    lane_groups[i] = (committed / ratio + i) * ratio;
+    if (i + 1 == p.stride) lane_groups[p.stride] = (committed / ratio + p.stride) * ratio;
+  }
+  if (i) return;
+  counts[lane] = layout.rows;
+  strided[lane] = {lane * p.stride, layout.rows};
 }

@@ -36,7 +36,10 @@
 //   block scratch of a piece of the indexer's rows;
 // - DSpark's Markov step (kernels/decode/dspark.metal): each lane's token,
 //   the argmax of its logits plus its Markov bias, the lower id among ties,
-//   its confidence and its draft distribution;
+//   and its confidence; and its trees, each lane's chain of its proposals or
+//   of a host chain, with their estimates;
+// - a decode step's rows between its packed layout and DeepSeek-V4.1's lanes
+//   (latent_lane_rows), with their positions and groups' positions;
 // - the Engram: the host's hash of each token's table rows against the
 //   reference's engram_hashes (products past int64 that wrap, negative ones
 //   that Python's modulo takes), and the gate of the projected value into
@@ -46,8 +49,9 @@
 //   nothing elsewhere; the indexer's scores and the attention through the
 //   page table bitwise those of pools of the same keys; a step's key lists
 //   of its ring and its own latents; the ring after a step's rows, all of a
-//   prefill's or a verify lane's retained ones; and a paired source's open
-//   group after a verify, where its retained rows leave one.
+//   prefill's or a decode lane's retained ones, a chain's row mask; and a
+//   paired source's open group after a decode step, where its retained rows
+//   leave one.
 // With `bench`, it times the kernels at the model's shapes instead: a decode
 // row and a prefill chunk of 256 rows, the indexer and the selection at
 // contexts of 8K to 128K tokens.
@@ -56,6 +60,7 @@
 #include "../../../runtime/metal/CommandGraph.hpp"
 #include "../../../runtime/metal/MetalBackend.hpp"
 #include "../../../runtime/model/EngramHash.hpp"
+#include "../../../runtime/ops/DSparkMarkov.hpp"
 #include "../../../runtime/ops/Engram.hpp"
 #include "../../../runtime/ops/LatentAttention.hpp"
 #include "../../../runtime/ops/LatentIndex.hpp"
@@ -70,11 +75,14 @@
 #include "metal/abi/LatentIndex.h"
 #include "metal/abi/LatentRotation.h"
 #include "metal/abi/ManifoldHyperConnection.h"
+#include "metal/abi/Sampling.h"
+#include "metal/abi/VerifyTree.h"
 
 #import <Foundation/Foundation.h>
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -610,12 +618,11 @@ void streamMeanTest(MetalBackend &backend) {
 // three lanes over the model's vocabulary: each lane's token, the argmax of
 // its row's logits plus its bias, the lower id of two tied tokens; its
 // confidence, the sigmoid of the head's dot with the row's pre-sum of the
-// streams rounded to bf16 and the Markov embedding; its draft distribution,
-// the token alone; and at the block's last step the positions past it, its
-// token at confidence zero. Nothing else is written.
+// streams rounded to bf16 and the Markov embedding, at its place `position`
+// of the lane's proposals. Nothing else is written.
 void markovStepTest(MetalBackend &backend, uint32_t position) {
   constexpr uint32_t lanes = 3, laneRows = 8, vocabulary = 129280, rank = 256, block = 5;
-  constexpr uint32_t proposals = SPLASH_DRAFT_PROPOSAL_TOKENS, candidates = SPLASH_DRAFT_CANDIDATES;
+  constexpr uint32_t proposals = SPLASH_DRAFT_PROPOSAL_TOKENS;
   constexpr uint32_t rows = lanes * laneRows, sentinel = 0xAAAAAAAAu;
   std::mt19937 rng(41 + position);
   std::vector<float> logits = randoms(rng, size_t(rows) * vocabulary, 4.0f);
@@ -635,24 +642,18 @@ void markovStepTest(MetalBackend &backend, uint32_t position) {
   MetalBuffer markovBuffer = upload(backend, markov), weightBuffer = upload(backend, weights);
   MetalBuffer tokens = upload(backend, std::vector<uint32_t>(lanes * proposals, sentinel));
   MetalBuffer confidence = upload(backend, std::vector<float>(lanes * proposals, -1.0f));
-  MetalBuffer ids = upload(backend, std::vector<uint32_t>(lanes * proposals * candidates, sentinel));
-  MetalBuffer probabilities = upload(backend, std::vector<float>(lanes * proposals * candidates, -1.0f));
   MetalBuffer previous = upload(backend, std::vector<uint32_t>(lanes, sentinel));
   const DSparkStepParams params{lanes, vocabulary, kHidden, rank, block, position, laneRows};
   CommandGraph graph;
   graph.add("dspark_markov_step",
-            {logitBuffer, biasBuffer, streamBuffer, mixBuffer, markovBuffer, weightBuffer, tokens, confidence, ids,
-             probabilities, previous},
+            {logitBuffer, biasBuffer, streamBuffer, mixBuffer, markovBuffer, weightBuffer, tokens, confidence, previous},
             params, {lanes, 1, 1}, {DSPARK_STEP_THREADS, 1, 1});
   run(backend, graph);
   const std::vector<uint32_t> gotTokens = download<uint32_t>(tokens, lanes * proposals);
   const std::vector<float> gotConfidence = download<float>(confidence, lanes * proposals);
-  const std::vector<uint32_t> gotIds = download<uint32_t>(ids, lanes * proposals * candidates);
-  const std::vector<float> gotProbabilities = download<float>(probabilities, lanes * proposals * candidates);
   const std::vector<uint32_t> gotPrevious = download<uint32_t>(previous, lanes);
-  bool tokensOk = true, confidenceOk = true, distributionOk = true, untouched = true;
+  bool tokensOk = true, confidenceOk = true, untouched = true;
   double worst = 0.0;
-  const uint32_t end = position + 1 == block ? proposals : position + 1;
   for (uint32_t lane = 0; lane < lanes; ++lane) {
     const size_t row = size_t(lane) * laneRows + position;
     uint32_t want = 0;
@@ -674,24 +675,160 @@ void markovStepTest(MetalBackend &backend, uint32_t position) {
     tokensOk = tokensOk && gotPrevious[lane] == want;
     for (uint32_t at = 0; at < proposals; ++at) {
       const size_t index = size_t(lane) * proposals + at;
-      if (at < position || at >= end) {
+      if (at != position) {
         untouched = untouched && gotTokens[index] == sentinel && gotConfidence[index] == -1.0f;
         continue;
       }
       tokensOk = tokensOk && gotTokens[index] == want;
-      const double wantConfidence = at == position ? sigmoidScore : 0.0;
-      worst = std::max(worst, std::fabs(gotConfidence[index] - wantConfidence));
-      for (uint32_t c = 0; c < candidates; ++c)
-        distributionOk = distributionOk && gotIds[index * candidates + c] == want &&
-                         gotProbabilities[index * candidates + c] == (c ? 0.0f : 1.0f);
+      worst = std::max(worst, std::fabs(gotConfidence[index] - sigmoidScore));
     }
   }
   confidenceOk = worst <= 1e-5;
   const std::string step = "DSpark Markov step " + std::to_string(position) + " of " + std::to_string(block);
   check(tokensOk, step + ": each lane's token the argmax of its logits plus its bias, the lower of tied ones");
   check(confidenceOk, step + ": the confidence head's sigmoid within 1e-5 (" + scientific(worst) + ")");
-  check(distributionOk, step + ": the draft distribution the token alone");
   check(untouched, step + ": no other proposal position written");
+}
+
+// DSpark's trees (dspark_tree) of three lanes: lane 0 the chain of its
+// block's proposals, its draft probabilities their confidences and each
+// row's estimate the product of the calibrated chances along its path; lane
+// 1 the same, no deeper than its depth of 2; lane 2 a host chain of 4
+// tokens, of no draft probability, estimated at its rates' products. Every
+// row a chain's (each row's parent the row before it), drawing no children,
+// its cap 1; nothing past a lane's rows is written.
+void dsparkTreeTest(MetalBackend &backend) {
+  constexpr uint32_t lanes = 3, block = 5, rows = SPLASH_TARGET_VERIFY_ROWS, proposals = SPLASH_DRAFT_PROPOSAL_TOKENS;
+  constexpr uint32_t chainTokens = SPLASH_TREE_CHAIN_TOKENS, agreements = SPLASH_TREE_AGREEMENTS;
+  constexpr uint32_t sentinel = 0xAAAAAAAAu;
+  std::vector<uint32_t> tokens(lanes * proposals), chain(lanes * chainTokens, 0);
+  std::vector<float> confidence(lanes * proposals), rates(lanes * chainTokens * agreements, 0.5f);
+  for (uint32_t i = 0; i < tokens.size(); ++i) tokens[i] = 1000 + i, confidence[i] = 0.1f + 0.1f * float(i % proposals);
+  for (uint32_t i = 0; i < chainTokens; ++i) {
+    chain[2 * chainTokens + i] = 500 + i;
+    rates[(2 * chainTokens + i) * agreements + agreements - 1] = 0.9f - 0.1f * float(i);
+  }
+  DSparkTreeParams params{.lanes = lanes, .block = block, .anchor = {7, 8, 9}, .depth = {15, 2, 15}, .chain = {0, 0, 4}};
+  for (uint32_t lane = 0; lane < lanes; ++lane) {
+    params.slope[lane] = 0.8f + 0.1f * float(lane);
+    for (uint32_t p = 0; p < proposals; ++p) params.intercept[lane][p] = 0.1f * float(p) - 0.2f;
+  }
+  MetalBuffer tokenBuffer = upload(backend, tokens), confidenceBuffer = upload(backend, confidence);
+  MetalBuffer chainBuffer = upload(backend, chain), rateBuffer = upload(backend, rates);
+  MetalBuffer treeTokens = upload(backend, std::vector<uint32_t>(lanes * rows, sentinel));
+  MetalBuffer trees = upload(backend, std::vector<uint32_t>(lanes * rows * 2, sentinel));
+  MetalBuffer scores = upload(backend, std::vector<float>(lanes * rows * 2, -7.0f));
+  MetalBuffer sizes = upload(backend, std::vector<uint32_t>(lanes, sentinel));
+  MetalBuffer draws = upload(backend, std::vector<uint8_t>(lanes * rows * SPLASH_TREE_CHILDREN, 0x11));
+  MetalBuffer caps = upload(backend, std::vector<float>(lanes * rows, -7.0f));
+  CommandGraph graph;
+  ops::DSparkMarkov::addTrees(graph,
+                              {tokenBuffer, confidenceBuffer, chainBuffer, rateBuffer, treeTokens, trees, scores,
+                               sizes, draws, caps},
+                              params);
+  run(backend, graph);
+  const auto gotTokens = download<uint32_t>(treeTokens, lanes * rows);
+  const auto gotTrees = download<uint32_t>(trees, lanes * rows * 2);
+  const auto gotScores = download<float>(scores, lanes * rows * 2);
+  const auto gotSizes = download<uint32_t>(sizes, lanes);
+  const auto gotDraws = download<uint8_t>(draws, lanes * rows * SPLASH_TREE_CHILDREN);
+  const auto gotCaps = download<float>(caps, lanes * rows);
+  const std::array<uint32_t, lanes> want{1 + block, 1 + 2, 1 + 4};
+  bool shape = gotSizes[0] == want[0] && gotSizes[1] == want[1] && gotSizes[2] == want[2], values = true;
+  double worst = 0.0;
+  for (uint32_t lane = 0; lane < lanes; ++lane) {
+    double estimate = 1.0;
+    for (uint32_t row = 0; row < rows; ++row) {
+      const size_t at = size_t(lane) * rows + row;
+      if (row >= want[lane]) {
+        shape = shape && gotTokens[at] == sentinel && gotCaps[at] == -7.0f;
+        continue;
+      }
+      const SplashTreeRow tree = std::bit_cast<SplashTreeRow>(std::array{gotTrees[2 * at], gotTrees[2 * at + 1]});
+      shape = shape && tree.ancestors == (2u << row) - 1 && tree.depth == row &&
+              tree.parent == (row ? row - 1 : SPLASH_TREE_ROOT) && gotCaps[at] == 1.0f;
+      for (uint32_t child = 0; child < SPLASH_TREE_CHILDREN; ++child)
+        shape = shape && gotDraws[at * SPLASH_TREE_CHILDREN + child] == 0xff;
+      uint32_t token = params.anchor[lane];
+      double q = 1.0;
+      if (row && lane == 2) {
+        token = chain[2 * chainTokens + row - 1];
+        q = -1.0;
+        estimate *= rates[(2 * chainTokens + row - 1) * agreements + agreements - 1];
+      } else if (row) {
+        const size_t proposal = size_t(lane) * proposals + row - 1;
+        token = tokens[proposal];
+        q = confidence[proposal];
+        estimate /= 1.0 + std::exp(-(params.slope[lane] * std::log(q / (1.0 - q)) + params.intercept[lane][row - 1]));
+      }
+      values = values && gotTokens[at] == token && gotScores[2 * at] == float(q);
+      worst = std::max(worst, std::fabs(gotScores[2 * at + 1] - estimate));
+    }
+  }
+  check(shape, "DSpark trees: each lane a chain of its rows, no deeper than its depth, drawing no children");
+  check(values && worst <= 1e-5,
+        "DSpark trees: the proposals' or the host chain's tokens, probabilities and estimates (" + scientific(worst) +
+            ")");
+}
+
+// A decode step's rows between its packed layout and lanes of four rows
+// (latent_lane_rows): two lanes of 3 and 1 rows packed, then a row of no
+// lane; gathered, each lane's rows from its first, its first again past
+// them, its row count, that layout, each row's position and each lane's
+// groups' positions; scattered back, each lane's rows to their packed rows
+// alone.
+void laneRowsTest(MetalBackend &backend) {
+  constexpr uint32_t lanes = 2, stride = 4, words = 3, groupStride = 9;
+  const std::vector<SplashLaneRows> packed{{0, 3}, {3, 1}};
+  std::vector<uint32_t> from(5 * words);
+  for (uint32_t i = 0; i < from.size(); ++i) from[i] = 100 + i;
+  const std::array<uint32_t, lanes> committed{10, 7};
+  MetalBuffer layout = upload(backend, packed), source = upload(backend, from);
+  MetalBuffer gathered = upload(backend, std::vector<uint32_t>(lanes * stride * words, 0));
+  MetalBuffer counts = upload(backend, std::vector<uint32_t>(lanes, 0));
+  MetalBuffer strided = upload(backend, std::vector<SplashLaneRows>(lanes));
+  MetalBuffer positions = upload(backend, std::vector<uint32_t>(lanes * stride, 0));
+  MetalBuffer groups = upload(backend, std::vector<uint32_t>(lanes * 2 * groupStride, 0));
+  MetalBuffer back = upload(backend, std::vector<uint32_t>(5 * words, 0xEEu));
+  CommandGraph graph;
+  ops::LatentAttention::addLaneRows(graph, source, gathered,
+                                    {.packed = layout,
+                                     .counts = counts,
+                                     .strided = strided,
+                                     .positions = positions,
+                                     .groups = groups,
+                                     .groupStride = groupStride},
+                                    committed, stride, words, true);
+  ops::LatentAttention::addLaneRows(graph, gathered, back, {.packed = layout}, committed, stride, words, false);
+  run(backend, graph);
+  const auto got = download<uint32_t>(gathered, lanes * stride * words);
+  const auto gotCounts = download<uint32_t>(counts, lanes);
+  const auto gotLayout = download<SplashLaneRows>(strided, lanes);
+  const auto gotPositions = download<uint32_t>(positions, lanes * stride);
+  const auto gotGroups = download<uint32_t>(groups, lanes * 2 * groupStride);
+  const auto gotBack = download<uint32_t>(back, 5 * words);
+  bool rows = true, layoutOk = true, backOk = true;
+  for (uint32_t lane = 0; lane < lanes; ++lane) {
+    layoutOk = layoutOk && gotCounts[lane] == packed[lane].rows && gotLayout[lane].first == lane * stride &&
+               gotLayout[lane].rows == packed[lane].rows;
+    for (uint32_t i = 0; i < stride; ++i) {
+      const uint32_t source = packed[lane].first + (i < packed[lane].rows ? i : 0);
+      for (uint32_t w = 0; w < words; ++w)
+        rows = rows && got[(lane * stride + i) * words + w] == from[source * words + w];
+      layoutOk = layoutOk && gotPositions[lane * stride + i] == committed[lane] + i;
+    }
+    for (uint32_t kind = 0; kind < 2; ++kind) {
+      const uint32_t ratio = 2 - kind;
+      for (uint32_t g = 0; g <= stride; ++g)
+        layoutOk = layoutOk && gotGroups[(lane * 2 + kind) * groupStride + g] == (committed[lane] / ratio + g) * ratio;
+    }
+  }
+  for (uint32_t row = 0; row < 5; ++row)
+    for (uint32_t w = 0; w < words; ++w)
+      backOk = backOk && gotBack[row * words + w] == (row < 4 ? from[row * words + w] : 0xEEu);
+  check(rows, "lane rows: each lane's packed rows gathered into its own, its first past them");
+  check(layoutOk, "lane rows: each lane's row count, layout, positions and groups' positions");
+  check(backOk, "lane rows: each lane's rows scattered back to their packed rows alone");
 }
 
 void latentRotationTest(MetalBackend &backend, const std::string &name, const ops::LatentRotationShape &shape,
@@ -989,9 +1126,10 @@ void pagedLatentTest(MetalBackend &backend, uint32_t rows) {
   check(std::memcmp(fromPages.contents(), fromPools.contents(), outBytes) == 0,
         at + "latent attention bitwise the pooled attention over the same keys");
 
-  // The ring after the step: all its rows (a prefill's), a verify lane's
-  // three retained ones, and a prefill's 300 rows from the start.
-  std::vector<uint32_t> retained{rows, 3, 0, 0};
+  // The ring after the step: all its rows (a prefill's), a decode lane's
+  // three retained ones (its chain's row mask), and a prefill's 300 rows from
+  // the start.
+  std::vector<uint32_t> retained{0, 0b111, 0, 0};
   MetalBuffer retainedBuffer = upload(backend, retained);
   const auto ringAfter = [&](const std::vector<uint16_t> &before, const std::vector<uint16_t> &latents,
                              uint32_t from, uint32_t kept) {
@@ -1026,7 +1164,7 @@ void pagedLatentTest(MetalBackend &backend, uint32_t rows) {
   MetalBuffer kvBuffer = upload(backend, kv), gateBuffer = upload(backend, gate);
   const std::vector<float> stale(size_t(2) * kLatent, 7.0f);
   MetalBuffer open = upload(backend, stale), closed = upload(backend, stale);
-  retained = {0, 2, 3, 0};
+  retained = {0, 0b11, 0b111, 0};
   MetalBuffer commitRetained = upload(backend, retained);
   {
     CommandGraph graph;
@@ -1433,6 +1571,8 @@ int main(int argc, const char *argv[]) {
       // A step inside DSpark's block, and its last.
       markovStepTest(backend, 2);
       markovStepTest(backend, 4);
+      dsparkTreeTest(backend);
+      laneRowsTest(backend);
       compressTest(backend, 1, 2, false);
       compressTest(backend, 37, 2, false);
       compressTest(backend, 5, 1, false);

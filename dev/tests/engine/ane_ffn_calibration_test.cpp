@@ -68,6 +68,26 @@ void testBandwidth() {
           "the ANE's fraction was not clamped to none or all of the bandwidth");
 }
 
+// A split layer timed at another share fits u again where the GPU's part takes the longer there, and T passes through
+// it: here 17 at 0.25 against G 15 and A 10, u = 0.2. Where the ANE's part takes the longer there, it says nothing of u.
+// On the M5 Max, whose ANE's part takes the longer at the low share by default (int8 activations), the low share
+// leaves u at none, and the fit chooses 6 of Qwen3.8-27B's 34 units; the split layer of 6 units, 13.84 ms against G's
+// 13.18, gives u = 0.065, which chooses the 7 a sweep of given shares found fastest (6 prefills 1.4-1.5% slower).
+void testRefit() {
+  const Model lines = fit({0.25, 15, 15}, {0.75, 5, 30});
+  const Model refitted = refit(lines, 0.25, 17);
+  require(near(refitted.u, 0.2) && near(refitted(0.25), 17) && near(refitted(0.5), 20),
+          "the bandwidth's term was not fitted at the share timed");
+  require(refit(refitted, 0.5, 30).u == refitted.u && refit(lines, 0.5, 30).u == 0.0,
+          "a split layer where the ANE's part takes the longer fitted the bandwidth's term");
+  const Timing low{14.0 / 34, 9.9673, 23.929}, high{27.0 / 34, 4.7526, 46.034};
+  const Model m5Max = fit(low, high);
+  require(m5Max.u == 0.0 && choose(m5Max, 15.834, 34, 33) == 6u, "the M5 Max's low share fitted u or chose not 6");
+  const Model atSix = refit(m5Max, 6.0 / 34, 13.84);
+  require(atSix.u > 0.06 && atSix.u < 0.07 && choose(atSix, 15.834, 34, 33) == 7u,
+          "the M5 Max's split layer at 6 units did not choose 7");
+}
+
 // T is least at the units where the GPU's part, slowed by the bandwidth, meets the ANE's, and the units chosen are
 // those whose T, or T a unit either way, is least at its longest: G(s) = 20 - 20 s and A(s) = 40 s meet at s = 1/3,
 // where of 10 units 3 (G 14, A 12; 16 a unit either way) beat 2 (G 16; 18 below) and 4 (A 16; 20 above), and of 100
@@ -187,24 +207,48 @@ void testMinimumRows() {
     rejects([&] { static_cast<void>(minimumRows(timings)); }, "not those of its functions", what + " were taken");
 }
 
-// A calibration as a line of text comes back as it was, and one of no split as none; a line of another tag or
-// version, with more or fewer fields, units without least rows or the GPU alone out of order or unusable is not one.
+// A split takes no chunk longer than another where it splits every chunk the other splits, each in at most 2% longer:
+// one faster at the most rows and alike elsewhere, one 1.25% slower at every function, and one whose 640-row function
+// takes 5.3 ms against 5.5, splitting from 533 rows against 553, do; one 3% slower at 1024 rows does not, nor one whose
+// 640-row function takes 6.0 ms, which splits from 603 rows and leaves chunks of 553 to 602 rows to the GPU alone, nor
+// one that splits none.
+void testSlowerNowhere() {
+  const ChunkTimings incumbent = functions(0.8, {{640, 5.5}});
+  require(slowerNowhere(incumbent, incumbent) && slowerNowhere(functions(0.8, {{640, 5.5}, {2048, 15.0}}), incumbent) &&
+              slowerNowhere(functions(0.81, {{640, 5.5}}), incumbent) &&
+              slowerNowhere(functions(0.8, {{640, 5.3}}), incumbent),
+          "a split no chunk of which took longer was refused");
+  require(!slowerNowhere(functions(0.8, {{640, 5.5}, {1024, 0.824 * gpuAt(1024)}}), incumbent) &&
+              !slowerNowhere(functions(0.8, {{640, 6.0}, {2048, 15.0}}), incumbent) &&
+              !slowerNowhere(functions(0.8, {{2048, 21.0}}), incumbent),
+          "a split that took chunks longer was taken");
+}
+
+// A calibration as a line of text comes back as it was, its refusals too, and one of no split as none with its
+// refusals; a line of another tag or version, with more or fewer fields, units without least rows, the GPU alone out
+// of order or unusable, more refusals than kRefusals or a split beside kRefusals is not one.
 void testCalibrationText() {
-  const Calibration made{8, 655, {{{512, 5.25}, {2048, 19.375}}}};
+  const Calibration made{8, 655, {{{512, 5.25}, {2048, 19.375}}}, 1};
   const std::optional<Calibration> back = Calibration::parse(made.text());
   require(back && back->aneUnits == 8 && back->minimumRows == 655 && back->gpu[0].rows == 512 &&
-              back->gpu[0].milliseconds == 5.25 && back->gpu[1].rows == 2048 && back->gpu[1].milliseconds == 19.375,
+              back->gpu[0].milliseconds == 5.25 && back->gpu[1].rows == 2048 &&
+              back->gpu[1].milliseconds == 19.375 && back->refusals == 1,
           "a calibration did not come back as it was: " + made.text());
-  const std::optional<Calibration> none = Calibration::parse(Calibration{}.text());
-  require(none && !none->aneUnits && !none->minimumRows, "a calibration of no split did not come back");
-  for (const std::string_view line : {"", "ane-ffn-calibration-0 8 655 512 5.25 2048 19.375",
-                                      "ane-ffn-calibration-1 8 655 512 5.25 2048",
-                                      "ane-ffn-calibration-1 8 655 512 5.25 2048 19.375 1",
-                                      "ane-ffn-calibration-1 8 0 512 5.25 2048 19.375",
-                                      "ane-ffn-calibration-1 0 655 0 0 0 0",
-                                      "ane-ffn-calibration-1 8 655 2048 19.375 512 5.25",
-                                      "ane-ffn-calibration-1 8 655 512 0 2048 19.375",
-                                      "ane-ffn-calibration-1 8 655 512 nan 2048 19.375"})
+  const std::optional<Calibration> none = Calibration::parse(Calibration{}.text()),
+                                   refused = Calibration::parse(Calibration{.refusals = 2}.text());
+  require(none && !none->aneUnits && !none->minimumRows && !none->refusals && refused && !refused->aneUnits &&
+              refused->refusals == 2,
+          "a calibration of no split did not come back");
+  for (const std::string_view line : {"", "ane-ffn-calibration-1 8 655 512 5.25 2048 19.375",
+                                      "ane-ffn-calibration-2 8 655 512 5.25 2048 19.375",
+                                      "ane-ffn-calibration-2 8 655 512 5.25 2048 19.375 0 1",
+                                      "ane-ffn-calibration-2 8 0 512 5.25 2048 19.375 0",
+                                      "ane-ffn-calibration-2 0 655 0 0 0 0 0",
+                                      "ane-ffn-calibration-2 8 655 2048 19.375 512 5.25 0",
+                                      "ane-ffn-calibration-2 8 655 512 0 2048 19.375 0",
+                                      "ane-ffn-calibration-2 8 655 512 nan 2048 19.375 0",
+                                      "ane-ffn-calibration-2 0 0 0 0 0 0 3",
+                                      "ane-ffn-calibration-2 8 655 512 5.25 2048 19.375 2"})
     require(!Calibration::parse(line), "\"" + std::string(line) + "\" was taken for a calibration");
 }
 
@@ -260,6 +304,7 @@ int main() {
   try {
     testFit();
     testBandwidth();
+    testRefit();
     testChoice();
     testUnusable();
     testMostUnits();
@@ -267,6 +312,7 @@ int main() {
     testUsable();
     testNearestUnits();
     testMinimumRows();
+    testSlowerNowhere();
     testCalibrationText();
     testBreaker();
     std::cout << "ane ffn calibration tests passed\n";

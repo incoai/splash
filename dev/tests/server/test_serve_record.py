@@ -24,18 +24,22 @@ class ServeRecordTests(unittest.TestCase):
         """A later phase before ready, a step of the warm-up, a refusal or a
         failure that cannot be recorded is a warning line of its own, naming
         the record and the system's error, and raises nothing: the start, or
-        the failure it records, stays as it was."""
+        the failure it records, stays as it was. So do the records of a
+        server that was ready, of its engine's relaunch and of that engine
+        serving: the server serves on."""
         for path, reason in self.unwritable:
             for write in (
                 partial(serve_record.entered, phase="loading"),
                 partial(serve_record.warming, steps_done=3, steps=9),
+                serve_record.recovering,
+                serve_record.recovered,
                 partial(
                     serve_record.failed,
                     failure=serve_record.failure(serve_record.PORT, "in use"),
                 ),
             ):
                 with (
-                    self.subTest(path=path.name, write=write.func.__name__),
+                    self.subTest(path=path.name, write=getattr(write, "func", write)),
                     mock.patch("sys.stderr", io.StringIO()) as log,
                 ):
                     write(path)

@@ -42,6 +42,7 @@
 #include "metal/abi/LatentIndex.h"
 #include "metal/abi/LatentRotation.h"
 #include "metal/abi/ManifoldHyperConnection.h"
+#include "ops/LaneRows.hpp"
 #include "ops/MoE.hpp"
 #include "ops/Normalization.hpp"
 #include "ops/Weights.hpp"
@@ -287,9 +288,16 @@ class WeightFile;
                                                          metal::MetalBackend &backend,
                                                          const ops::ExecutionPlans &operators,
                                                          uint32_t prefillChunks);
-[[nodiscard]] QwenTargetScratchBytes qwenTargetScratchBytes(const DeepSeek41Weights &weights,
+[[nodiscard]] QwenTargetScratchBytes qwenTargetScratchBytes(const DeepSeek41Layout &layout,
                                                             const QwenTargetGeometry &geometry,
                                                             uint32_t prefillChunks, uint64_t tableRowBytes);
+// The rows of each lane of a decode step `step` in DeepSeek-V4.1's own layout
+// of its lanes' rows (DeepSeek41Target): its lane cap, the most rows its
+// packed layout gives a lane, whatever rows the step takes, so that a lane's
+// rows are computed alike whether a draft proposes them or not (a step's
+// projections and MoE plans follow its rows). DSpark's commit reads the
+// target's captured rows so.
+[[nodiscard]] constexpr uint32_t deepSeek41LaneStride(const ops::StepRows &step) noexcept { return step.laneCap; }
 // The Engram rows a step stages and the read-ahead may have queued
 // (SparseRowStoreOptions::stageRows and prefetchRows).
 [[nodiscard]] SparseRowStoreOptions streamedTableRows(const DeepSeek41Layout &layout);

@@ -13,14 +13,16 @@
 //
 // A decode cycle drafts each lane's block, its anchor and the noise rows
 // after it (the target's embedding of its mask token, DSpark's noise token):
-// its layers on the decode plans of the step's lanes, the target's head, and
-// the Markov head's chain with its confidences (dspark_markov_step), a
-// proposal each, which the target verifies as a DFlash2 draft's. Its scratch
-// is its own (scratchBytes).
+// its layers over the lanes' blocks, the target's head, and the Markov head's
+// chain with its confidences (dspark_markov_step), a proposal each, which is
+// the lane's tree, a chain the target verifies (dspark_tree). Its scratch is
+// its own (scratchBytes).
 
 #include "model/DFlashDraft.hpp"
 #include "model/DSpark.hpp"
+#include "ops/DraftSelector.hpp"
 #include "ops/ExecutionPlans.hpp"
+#include "ops/LaneRows.hpp"
 #include "ops/ManifoldHyperConnection.hpp"
 #include "ops/MoE.hpp"
 
@@ -35,36 +37,24 @@ namespace splash::model {
 // What a decode cycle's draft binds of the runtime's arenas.
 struct DSparkDecodeBuffers final {
   // bf16 [lanes][SPLASH_DRAFT_QUERY_ROWS][hidden]: each lane's block rows'
-  // embeddings, its anchor's first; uint32 the rows' positions.
+  // embeddings, its anchor's first.
   metal::MetalBuffer input;
-  metal::MetalBuffer positions;
   // fp32 [lanes][SPLASH_DRAFT_QUERY_ROWS][vocabulary]: the rows' logits.
   metal::MetalBuffer logits;
   // Each layer's ring keys of each lane.
   std::vector<std::array<metal::MetalBuffer, ExecutionLimits::maximumBatchWidth>> rings;
 };
 
-// What a decode cycle's proposals take (ops::DraftSelectorBuffers'): the
-// logits addDecode wrote, and the proposals, their confidences and the
-// draft distribution acceptance reads.
-struct DSparkSelectionBuffers final {
-  metal::MetalBuffer logits;
-  metal::MetalBuffer proposedTokens;
-  metal::MetalBuffer confidence;
-  metal::MetalBuffer candidates;
-  metal::MetalBuffer proposalProbabilities;
-};
-
-// What a decode cycle's context commit binds: the verify's captured rows
-// (bf16 [lanes][SPLASH_TARGET_VERIFY_ROWS][target layers * hidden]), the
-// rows their projection and norm pass through, the rows' positions, each
-// lane's retained rows and its rings.
+// What a decode cycle's context commit binds: the step's captured rows,
+// each lane's from row lane * deepSeek41LaneStride(step) on (bf16 [rows]
+// [target layers * hidden], DeepSeek41Target's layout), the rows their
+// projection and norm pass through, each lane's retained rows (a chain's row
+// mask, QwenTargetCommitBuffers::retainedRows) and its rings.
 struct DSparkCommitBuffers final {
   metal::MetalBuffer captured;
   metal::MetalBuffer projected;
   metal::MetalBuffer hidden;
-  metal::MetalBuffer positions;
-  metal::MetalBuffer retainedCounts;
+  metal::MetalBuffer retainedRows;
   std::vector<std::array<metal::MetalBuffer, ExecutionLimits::maximumBatchWidth>> rings;
 };
 
@@ -96,21 +86,27 @@ public:
   void addContextRebuild(metal::CommandGraph &graph, const DFlashPrefillBuffers &buffers,
                          const metal::MetalBuffer &window, std::span<const DFlashDraftRingLayer> ring, uint32_t rows,
                          uint32_t startPosition, uint32_t lane) const;
-  // Each lane's rings after its retained rows of a verify, from position
-  // startPositions[lane] on.
+  // Each lane's rings after its retained rows of a decode step `step`, from
+  // position startPositions[lane] on (the positions addDecode wrote).
   void addContextCommit(metal::CommandGraph &graph, const DSparkCommitBuffers &buffers,
-                        std::span<const uint32_t> startPositions) const;
+                        std::span<const uint32_t> startPositions, const ops::StepRows &step) const;
 
-  // Lanes of storage its projections bind of the arenas in a decode step or
-  // context commit of `lanes` lanes (ops::Linear::decodeStorageRows).
+  // Lanes of storage of SPLASH_DRAFT_QUERY_ROWS its projections bind of the
+  // arenas in a decode step of `lanes` lanes (ops::Linear::storageRows).
   [[nodiscard]] uint32_t decodeStorageLanes(uint32_t lanes) const;
   // Each lane's block through the layers and the target's head, its first
-  // cacheLengths[lane] positions in its rings.
+  // cacheLengths[lane] positions in its rings; it writes the positions of
+  // its blocks' rows, and of the commit's rows of the cycle's step `step`.
   void addDecode(metal::CommandGraph &graph, const DSparkDecodeBuffers &buffers,
-                 std::span<const uint32_t> cacheLengths) const;
-  // After addDecode: each lane's proposals from its anchor.
-  void addSelection(metal::CommandGraph &graph, const DSparkSelectionBuffers &buffers,
-                    std::span<const uint32_t> anchors) const;
+                 std::span<const uint32_t> cacheLengths, const ops::StepRows &step) const;
+  // After addDecode: each lane's tree (`lanes`, each an anchor, its depth,
+  // and the calibration of its draft rows' estimates; DSparkTreeParams) in
+  // the selector's tree buffers: the chain of its proposals, or where
+  // `children` is none the chain of its first `chain` host chain tokens
+  // (`tree.chainTokens` and `chainRates`), which a grammar or a thinking end
+  // forces or a lookup proposes in its place.
+  void addSelection(metal::CommandGraph &graph, const ops::DraftSelectorBuffers &tree,
+                    std::span<const ops::DraftTreeLane> lanes) const;
 
   // A lane's ring keys hold the ring of `ringSlots` latents in their first
   // slots.

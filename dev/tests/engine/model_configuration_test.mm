@@ -1040,8 +1040,7 @@ void testFlint(const std::filesystem::path &fixtures) {
 // DeepSeek-V4.1-Flash's DSpark as the runtime sizes it (dsparkDraftLayout):
 // its own layers and block, its target's widths and vocabulary, its latent as
 // one KV head and the target layers it reads, none of a DFlash2 draft's
-// sizes; a cycle retains its anchor and each proposal of its block, a
-// DFlash2 draft's all eight rows and a model without a draft its anchor.
+// sizes.
 void testDSpark() {
   model::DSparkLayout dspark;
   dspark.layers.layers = 3;
@@ -1060,9 +1059,6 @@ void testDSpark() {
           "DSpark's runtime layout was not its target's widths and its own block");
   require(layout.stateLayout() == model::DraftStateLayout{3, 1, 512, 5120} && layout.stateLayout().valid(),
           "DSpark's lane state was not three rings of one latent head and its context window");
-  require(layout.retainedRows() == 6 && test::flintDraft().retainedRows() == 8 &&
-              model::DFlashDraftLayout{}.retainedRows() == 1,
-          "a cycle's retained rows were not its anchor's and its draft's proposals'");
 }
 
 int main(int argc, char **argv) {

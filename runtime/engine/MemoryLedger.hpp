@@ -104,6 +104,9 @@ struct ClaimSpec final {
   // No lane yields for it, so short of what it lacks it takes what the
   // order gives (MemoryLedger::free).
   bool lone = false;
+  // A Host claim's pass while a start the host refused waits: short of
+  // critical pressure, only it takes certain reuse (takeRights).
+  bool forRefusedStart = false;
 };
 
 // Claims take ids from 1 up, never again: 64 bits never run out.
@@ -243,12 +246,19 @@ struct TakeRights final {
 // lane; a need the host refused from its own lane, in place; the host from
 // every lane while macOS's pressure is above normal, for its deficit under
 // its warning as for its margin under its critical pressure; no other claim.
-// Certain reuse, which a request rebuilds at its whole prefill, goes to
-// in-service work; a start and optional work take the resume point but never
-// a queued chain, since a running lane beats a queued one and a new request
-// does not. The host waits for writes short of critical pressure and never
-// for landings, which its pass's target is net of; at critical pressure it
-// is Immediate but takes the store, certain reuse and units in use. No pool
+// Certain reuse, a queued request's chain or the resume point, goes to every
+// claim but a pool's growth, which takes none of it, optional work, which
+// takes the resume point alone, and the host's pass short of critical
+// pressure with no start it refused waiting, which takes none: the KV of the
+// lanes in service is the only cache no claim takes outside them, as in vLLM
+// (blocks no running request holds stay free to evict, in LRU order) and
+// SGLang (only running requests lock their radix paths), and a start written
+// to the SSD cache first, where the tier takes the write, costs its request
+// a read-back, not its prefill. Kept from starts, queued chains made
+// sessions arriving together take turns (#758). The host waits for writes
+// short of critical pressure and never for landings, which its pass's target
+// is net of; at critical pressure it is Immediate but takes the store and
+// units in use. No pool
 // unit for a claim below a lane in service, since the pools serve every
 // lane, and none for a pool's growth. The pooled buffers the next lane
 // starts from go to in-service KV that can wait, last of all: the memory

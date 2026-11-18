@@ -16,6 +16,7 @@
 #endif
 
 #include "metal/abi/KvExtent.h"
+#include "metal/abi/VerifyTree.h"
 
 // The latent width the kernels are compiled for (head_dim).
 #define LATENT_ATTENTION_DIM 512u
@@ -95,7 +96,8 @@ static_assert(sizeof(LatentAttentionKeysParams) == 40,
 // position before `end` with p % ring == s, the step's latent p - committed
 // where p is at or past `committed`, else the ring's before the step. `end`
 // is committed + rows, or, `retained`, committed plus the step's retained
-// rows of lane `lane` (a buffer of them, at most `rows`).
+// rows of lane `lane` (a buffer of a row mask a lane, metal/abi/VerifyTree.h,
+// of a chain: its set bits count them, at most `rows`).
 struct LatentRingParams {
   uint32_t committed;
   uint32_t rows;
@@ -107,7 +109,8 @@ struct LatentRingParams {
 static_assert(sizeof(LatentRingParams) == 20, "latent ring parameters are 20 bytes on both sides");
 
 // The open group of a paired KV source after a verify's retained rows
-// (latent_open_commit): with committed + retained odd, the fp32 kv and gate
+// (latent_open_commit, a row mask a lane of a chain, as LatentRingParams
+// reads it): with committed + retained odd, the fp32 kv and gate
 // projections of position committed + retained - 1, row `retained` of the
 // step's, whose row 0 is the position before the step's first; left as they
 // were otherwise.
@@ -118,3 +121,26 @@ struct LatentOpenParams {
 };
 
 static_assert(sizeof(LatentOpenParams) == 12, "latent open group parameters are 12 bytes on both sides");
+
+// A decode step's rows between the packed layout its proposer writes
+// (SplashLaneRows, metal/abi/VerifyTree.h) and DeepSeek-V4.1's lanes of
+// `stride` rows each, lane l's from row l * stride (latent_lane_rows), of
+// `words` 32-bit words a row. Gathering (`gather`), row i of lane l takes
+// the packed row first + i of its lane, its first where the lane holds fewer
+// rows, and the lanes' rows are written as such a layout of stride rows a
+// lane, with each lane's row count apart (uint32), and each row's position,
+// committed[l] + i, and of each lane its groups' positions, of pairs and of
+// single tokens (group_stride entries each, from (lane * 2 + kind) *
+// group_stride): (committed[l] / ratio + g) * ratio for g up to stride.
+// Scattering, lane l's first rows its packed layout holds go back to their
+// packed rows.
+struct LatentLaneRowsParams {
+  uint32_t lanes;
+  uint32_t stride;
+  uint32_t words;
+  uint32_t gather;
+  uint32_t group_stride;
+  uint32_t committed[SPLASH_MAXIMUM_BATCH_WIDTH];
+};
+
+static_assert(sizeof(LatentLaneRowsParams) == 20 + 4 * SPLASH_MAXIMUM_BATCH_WIDTH, "latent lane rows parameters are 36 bytes on both sides");

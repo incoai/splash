@@ -1122,7 +1122,7 @@ void testDiskQuotaKeepsTheOnlyCopyAQueuedRequestRestores() {
 // take finds as freeDiskSpace does.
 void testAFullTemporaryQuotaStillDemotesByReplacingItsOldestCopy() {
   test::TestKvTier tier;
-  auto budget = std::make_shared<model::DiskBudget>(2 * tier.slotBytes());
+  auto budget = std::make_shared<model::DiskBudget>(2 * tier.slotBytes(kv::PageForm::Full));
   tier.budget = budget;
   Prefixes prefixes(&tier, true, budget);
   auto control = std::make_shared<TransferControl>();
@@ -1142,7 +1142,7 @@ void testAFullTemporaryQuotaStillDemotesByReplacingItsOldestCopy() {
     require(step(), "the cache did not leave RAM");
   const uint64_t demotions = tier.demotions;
   const uint64_t diskBlocks = prefixes.cache.snapshot().kvTier.diskBlocks;
-  require(budget->usedBytes() + tier.slotBytes() > budget->limitBytes() && diskBlocks == 2 &&
+  require(budget->usedBytes() + tier.slotBytes(kv::PageForm::Full) > budget->limitBytes() && diskBlocks == 2 &&
               !prefixes.cache.stateResident(prefixes.blocks[2]),
           "the quota was not full of two disk-only leaves beside a state on disk");
   const uint32_t freePages = prefixes.pool.freePageCount();
@@ -1223,7 +1223,7 @@ void testALeafWhoseWriteFindsNoSlotGoesWithItsSubtree() {
 void testAWaitingClaimDemotesAWholeChainRunAtOnce() {
   test::TestKvTier tier;
   tier.transferLimit = 64;
-  auto budget = std::make_shared<model::DiskBudget>(16 * tier.slotBytes());
+  auto budget = std::make_shared<model::DiskBudget>(16 * tier.slotBytes(kv::PageForm::Full));
   tier.budget = budget;
   test::TestKvStorage storage{12, 100, 4};
   KvPool pool{storage, 4};
@@ -1267,8 +1267,9 @@ void testAWaitingClaimDemotesAWholeChainRunAtOnce() {
   cache.checkInvariants();
 }
 
-// Certain reuse per claim class: Start and Optional take the resume point but never a
-// queued chain; Growth takes neither; InService takes them oldest first.
+// Certain reuse per claim class: Optional takes the resume point but never a queued chain;
+// Growth takes neither; Start and InService take them oldest first, as vLLM and SGLang
+// evict any block no running request holds.
 void testCertainReuseByClass() {
   struct Case final {
     ClaimSpec spec;
@@ -1276,10 +1277,12 @@ void testCertainReuseByClass() {
     bool keepsQueued;
     bool keepsResumePoint;
   };
-  for (const Case each : {Case{{.cls = ClaimClass::Start}, true, true, false},
+  for (const Case each : {Case{{.cls = ClaimClass::Start}, true, false, true},
                           Case{{.cls = ClaimClass::Optional, .requestId = 1, .timing = NeedTiming::Immediate}, true, true, false},
                           Case{{.cls = ClaimClass::Growth, .timing = NeedTiming::Immediate}, false, true, true},
-                          Case{{.cls = ClaimClass::InService}, true, false, true}}) {
+                          Case{{.cls = ClaimClass::InService}, true, false, true},
+                          Case{{.cls = ClaimClass::Host}, false, true, true},
+                          Case{{.cls = ClaimClass::Host, .forRefusedStart = true}, true, false, true}}) {
     Prefixes prefixes;
     for (const uint64_t block : prefixes.blocks)
       prefixes.cache.publishCompositeState(block, std::make_shared<TestState>(100), false);
@@ -1485,6 +1488,48 @@ void testPromotionNeverDropsAUniqueState() {
                 stats.evictions == evictions && fixture.cache.stateResident(fixture.blocks[1]),
             onDisk ? "a refused promotion took the RAM of a state with a disk copy"
                    : "a refused promotion dropped a state's only copy");
+  }
+}
+
+// An opportunistic reply's state frees for nothing: of the oldest
+// checkpoint, the first claim takes its RAM copy with no write, before that
+// of a state the SSD holds. Kept, it is written as any checkpoint, after that
+// RAM copy. No claim takes the newer checkpoint or the resume point.
+void testOpportunisticReplyGoesWithoutAWrite() {
+  for (const bool kept : {false, true}) {
+    CacheFixture fixture;
+    auto control = std::make_shared<TransferControl>();
+    control->ready = true;
+    fixture.cache.publishCompositeState(fixture.blocks[2], std::make_shared<TieredState>(control), false);
+    require(test::stateStep(fixture.cache).gave() && fixture.cache.pollTransfers(), "the state was not written");
+    fixture.cache.publishCompositeState(fixture.blocks[2], std::make_shared<TieredState>(control), false);
+    publishReusable(fixture, fixture.blocks[3], std::make_shared<TieredState>(control));
+    fixture.cache.publishCompositeState(fixture.blocks[0], std::make_shared<TieredState>(control), true);
+    fixture.cache.markReply(fixture.cache.checkpointState(fixture.blocks[0]));
+    if (kept)
+      fixture.cache.keepReply(fixture.cache.checkpointState(fixture.blocks[0]));
+    fixture.cache.publishCompositeState(fixture.blocks[1], std::make_shared<TieredState>(control), true);
+    const uint64_t offloads = fixture.cache.snapshot().stateCache.offloads;
+    // A pool's growth by one state's buffers, which keeps the resume point.
+    engine::MemoryLedger ledger;
+    ledger.addSource(fixture.cache);
+    ledger.setBufferBytes([&control](uint32_t states, bool, bool) { return control->poolBytes(states); });
+    const auto grow = [&] {
+      const engine::ClaimId claim = ledger.open({.cls = ClaimClass::Growth, .timing = NeedTiming::Immediate});
+      const FreeResult freed = ledger.free(claim, {.bytes = 100}, 0, MemoryPressure::Normal);
+      ledger.close(claim);
+      return freed.outcome == FreeOutcome::Met;
+    };
+    require(grow() && fixture.cache.stateResident(fixture.blocks[0]) == kept &&
+                fixture.cache.stateResident(fixture.blocks[2]) != kept,
+            kept ? "a kept reply's state went before a state that frees for nothing"
+                 : "an opportunistic reply's state did not go first");
+    require(grow() && !fixture.cache.stateResident(fixture.blocks[0]) &&
+                !fixture.cache.stateResident(fixture.blocks[2]) && fixture.cache.stateResident(fixture.blocks[1]) &&
+                fixture.cache.stateResident(fixture.blocks[3]),
+            "the second claim did not take the other of the two alone");
+    require(fixture.cache.snapshot().stateCache.offloads - offloads == (kept ? 1U : 0U),
+            kept ? "a kept reply's state went without a write" : "an opportunistic reply's state was written");
   }
 }
 
@@ -1857,7 +1902,7 @@ void testQuotaWithoutTheKvTier() {
   KvPool pool{storage, 4};
   engine::Cache cache(pool, nullptr, budget);
   model::SlotFile states(size, budget);
-  auto slot = states.acquire();
+  auto slot = states.acquire(size);
   std::vector<std::byte> source(size, std::byte{1}), restored(size);
   require(slot && states.write(slot, {source}, {})->wait() &&
               states.read(slot, {restored}, {})->wait(),
@@ -1921,7 +1966,7 @@ void testTierOnlyAddsToTierOff() {
 void testAMemoryClaimForAPageTakesACachedPageInPlace() {
   test::TestKvTier tier;
   tier.transferLimit = 64;
-  auto budget = std::make_shared<model::DiskBudget>(16 * tier.slotBytes());
+  auto budget = std::make_shared<model::DiskBudget>(16 * tier.slotBytes(kv::PageForm::Full));
   tier.budget = budget;
   test::TestKvStorage storage{12, 100, 4};
   KvPool pool{storage, 4};
@@ -2404,7 +2449,7 @@ void testLimitBelowASlotMakesNoRoom() {
           "the deepest page the state needs was not written");
   tier.complete();
   require(fixture.cache.pollTransfers(), "the page did not land");
-  budget->setLimitBytes(tier.slotBytes() - 1);
+  budget->setLimitBytes(tier.slotBytes(kv::PageForm::Full) - 1);
   static_cast<void>(test::evictStep(fixture.cache));
   const CacheSnapshot held = fixture.cache.snapshot();
   require(tier.demotions == 1 && !held.kvTier.diskBlocks && !fixture.lookup(129).state,
@@ -5711,8 +5756,9 @@ void testPeekHasNoSideEffects() {
   require(units && observe() == before, "the walk changed the cache");
 }
 
-// The resume point and wanted chains come in their place to in-service work, the resume point alone
-// to a start; Growth and a host below Critical are never offered them.
+// The resume point and wanted chains come in their place to in-service work, a start and the host's pass
+// for a start it refused, as vLLM and SGLang evict any block no running request holds; Growth and the
+// host's pass for its margin alone are never offered them.
 void testResumePointAndWantedChainsAreCertainReuse() {
   test::TestKvStorage storage{16, 100, 1};
   KvPool pool{storage, 16};
@@ -5733,8 +5779,8 @@ void testResumePointAndWantedChainsAreCertainReuse() {
   CacheProbe probe = cache.probe(wanted, {});
   cache.setWantedChains({probe.restoredChain()});
   // The units and pages a claim of the class is offered.
-  const auto offered = [&](ClaimClass cls, const Need &need) {
-    const VictimQuery query = test::query({.cls = cls}, need);
+  const auto offered = [&](const ClaimSpec &spec, const Need &need) {
+    const VictimQuery query = test::query(spec, need);
     std::pair<uint32_t, uint32_t> units;
     for (std::optional<engine::Victim> victim = cache.peek(query, nullptr); victim;
          victim = cache.peek(query, &*victim)) {
@@ -5744,16 +5790,19 @@ void testResumePointAndWantedChainsAreCertainReuse() {
     return units;
   };
   // Prompt 1's state (wanted), prompt 2's and prompt 3's (the resume point).
-  require(offered(ClaimClass::InService, {.stateBuffers = 1}).first == 3,
-          "in-service work was not offered the resume point and the wanted chain's state");
-  require(offered(ClaimClass::Start, {.stateBuffers = 1}).first == 2,
-          "a start was not offered the resume point alone of certain reuse");
-  // Growth and a host pass short of critical pressure leave them: a page
-  // need's units free prompt 2's pages alone, its state and then its
-  // leaves, and a device need's units every extent but theirs.
-  for (const ClaimClass cls : {ClaimClass::Host, ClaimClass::Growth})
-    require(offered(cls, {.stateBuffers = 1}).first == 1 && offered(cls, {.pages = 1}).second == 2,
-            "a claim that may take nothing of certain reuse was offered some, or not the rest");
+  for (const ClaimSpec spec : {ClaimSpec{.cls = ClaimClass::InService}, ClaimSpec{.cls = ClaimClass::Start},
+                               ClaimSpec{.cls = ClaimClass::Host, .forRefusedStart = true}})
+    require(offered(spec, {.stateBuffers = 1}).first == 3,
+            "a claim of class " + std::to_string(static_cast<int>(spec.cls)) +
+                " was not offered the resume point and the wanted chain's state");
+  require(offered({.cls = ClaimClass::Host}, {.stateBuffers = 1}).first == 1,
+          "the host's pass for its margin alone was offered certain reuse");
+  // Growth leaves them: a page need's units free prompt 2's pages alone,
+  // its state and then its leaves, and a device need's units every extent
+  // but theirs.
+  require(offered({.cls = ClaimClass::Growth}, {.stateBuffers = 1}).first == 1 &&
+              offered({.cls = ClaimClass::Growth}, {.pages = 1}).second == 2,
+          "growth was offered certain reuse, or not the rest");
   const ClaimSpec growth{.cls = ClaimClass::Growth, .timing = NeedTiming::Immediate};
   require(test::freeFromCache(cache, growth, {.pages = 2}).outcome == FreeOutcome::Met,
           "growth did not take what is not of certain reuse");
@@ -5764,7 +5813,7 @@ void testResumePointAndWantedChainsAreCertainReuse() {
               !cache.probe(other, {}).cachedTokens(),
           "growth's memory reclaims took the wanted chain or the resume point");
   cache.setWantedChains({});
-  require(offered(ClaimClass::Growth, {.stateBuffers = 1}).first == 1,
+  require(offered({.cls = ClaimClass::Growth}, {.stateBuffers = 1}).first == 1,
           "a chain no request waits for any more stayed of certain reuse");
 }
 
@@ -6891,6 +6940,7 @@ int main() {
     testDemotionCostsNoSecondState();
     testPromotionIdentityAndDenial();
     testPromotionNeverDropsAUniqueState();
+    testOpportunisticReplyGoesWithoutAWrite();
     testRepublicationKeepsTheDiskCopy();
     testLostStatesAreCounted();
     testDiskReplacementSpansStatesAndKv();

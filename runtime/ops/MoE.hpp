@@ -3,6 +3,7 @@
 #include "metal/CommandGraph.hpp"
 #include "metal/abi/ExecutionGeometry.h"
 #include "metal/abi/MoE.h"
+#include "ops/LaneRows.hpp"
 #include "ops/Linear.hpp"
 
 #include <algorithm>
@@ -213,7 +214,6 @@ struct MoeScratch;
 struct MoeBuffers;
 class MoePlan;
 class MoeExpertStream;
-enum class MoePhase : uint8_t { Prefill, Decode };
 
 // The weights of one sparse MoE block, which the loaded model owns. The
 // router is a float segment in the format its checkpoint holds it (a GGUF's
@@ -262,13 +262,13 @@ struct MoeLoadPart final {
 
 // Routed experts that stream into the slots of a store (model::ExpertStore),
 // which owns the blocks' slot tables. addLoad adds, after the grouping of
-// block `block`'s steps `parts` (all of one phase) and before the expert
-// passes that read the load slot table, what makes the experts their tiles
-// name resident and both tables name their slots; it may read a step's input
-// (MoeBuffers::input). Several steps' parts load the union of their experts
-// at once. `beside` adds the dispatches that run while the load reads
-// (metal::EventStep::beside): they may read the slots of the experts the
-// grouping found resident, which the load leaves as they are, through its
+// block `block`'s steps `parts` and before the expert passes that read the
+// load slot table, what makes the experts their tiles name resident and both
+// tables name their slots; it may read a step's input and the rows it routes
+// (MoeBuffers::input, laneRows). Several steps' parts load the union of
+// their experts at once. `beside` adds the dispatches that run while the load
+// reads (metal::EventStep::beside): they may read the slots of the experts
+// the grouping found resident, which the load leaves as they are, through its
 // copy of the slot table (MoeScratch::expertSlots).
 class MoeExpertStream {
 public:
@@ -277,9 +277,10 @@ public:
                        const std::function<void()> &beside = {}) const = 0;
 };
 
-// Grouped-row scratch. Routes are sorted by expert into tiles of tileRows
-// rows; every routed expert may leave one partially filled tile and no tile
-// is empty, and each shared slice fills one tile per tileRows rows.
+// The tiles of a step's routes, sorted by expert into tiles of at most
+// tileRows routes: every routed expert may leave one partially filled tile
+// and no tile is empty, and each shared slice fills one tile per tileRows
+// rows.
 [[nodiscard]] constexpr uint32_t moeMaximumTiles(uint32_t rows, MoeShape shape,
                                                  uint32_t tileRows) noexcept {
   const uint32_t routed = rows * shape.expertsPerToken;
@@ -306,11 +307,14 @@ struct MoeScratch final {
   // rows * routesPerToken() routes: expert ids and fp32 routing weights.
   metal::MetalBuffer selectedExperts;
   metal::MetalBuffer routingWeights;
-  // Sized by moeMaximumTiles(): tile descriptors, the tile count with the
-  // expert passes' grids (MoeTileCount), the route at each grouped row,
-  // each route's grouped row, and the grouped rows' inputs, intermediates and
-  // outputs. The router parks its fp32 scores in groupedInput until the
-  // gather claims it.
+  // The tile descriptors, at most moeMaximumTiles(), and the tile count with
+  // the expert passes' grids (MoeTileCount). Then the grouped rows, one per
+  // route, each tile's following the tile before it's (MoeTileDescriptor):
+  // the route at each grouped row, each route's grouped row, and the grouped
+  // rows' inputs, intermediates and outputs, whatever the tile; the inputs
+  // and intermediates hold tileRows - 1 rows more, which a last tile's matmul
+  // may read past its live rows (moe_expert_slab.h). The router parks its
+  // fp32 scores in groupedInput until the gather claims it.
   metal::MetalBuffer tileDescriptors;
   metal::MetalBuffer tileCount;
   metal::MetalBuffer groupedRoutes;
@@ -353,13 +357,13 @@ inline constexpr auto kMoeWorkspaceFields = [] {
 
 // The tile applies to grouping, gather and the expert passes together;
 // changing it never changes the physical rows in a command. Plans run their
-// passes on M8 tiles, or on M32 tiles to prefill (selectMoe).
+// passes on M8 tiles, or on M32 tiles where their routes average more than
+// a row per expert (selectMoe).
 enum class MoeExpertTile : uint8_t { M8 = 8, M32 = 32 };
 
 // The device's policy for a MoE plan, which the execution plans derive.
 struct MoeConfig final {
-  // M8 for decode plans; a prefill plan's by its routes per expert
-  // (selectMoe).
+  // A plan's by its routes per expert (selectMoe).
   MoeExpertTile expertTile = MoeExpertTile::M8;
   // The router's float tile; the execution plans derive it from the device,
   // the plan's rows and the router's format (selectFloatTile).
@@ -372,7 +376,6 @@ class MoePlan final {
 public:
   [[nodiscard]] MoeShape shape() const noexcept { return shape_; }
   [[nodiscard]] uint32_t rows() const noexcept { return rows_; }
-  [[nodiscard]] MoePhase phase() const noexcept { return phase_; }
   [[nodiscard]] MoeConfig configuration() const noexcept { return config_; }
   [[nodiscard]] uint32_t tileRows() const noexcept {
     return static_cast<uint32_t>(config_.expertTile);
@@ -384,11 +387,10 @@ public:
 
 private:
   friend struct MoE;
-  MoePlan(MoeShape shape, uint32_t rows, MoeConfig config, MoePhase phase);
+  MoePlan(MoeShape shape, uint32_t rows, MoeConfig config);
 
   MoeShape shape_;
   uint32_t rows_;
-  MoePhase phase_;
   MoeConfig config_;
   uint32_t maximumTiles_;
   MoeWorkspace workspace_;
@@ -399,28 +401,35 @@ struct MoeBuffers final {
   metal::MetalBuffer residual;
   metal::MetalBuffer output;
   MoeScratch scratch;
-  // A verify step's lanes' verify rows, a uint32 per lane (the draft
-  // selector's, ops::DraftSelector::addVerifyRows): its routing routes each lane's verify
-  // rows alone (moe_group_routes_verified*), and a streamed load predicts the
-  // next block's experts from them. Empty, every row routes.
-  metal::MetalBuffer verifyRows;
+  // A decode step's `lanes` lanes: each lane's rows of the step, a
+  // SplashLaneRows a lane, as the draft selector lays them out on the device
+  // (ops::DraftSelector::addVerifyRows). Its routing routes its lanes' rows
+  // alone, no row of no lane (moe_group_routes_verified*), and a streamed
+  // load predicts the next MoE block's experts from the rows it routes. A
+  // prompt chunk has no lanes: every row routes.
+  uint32_t lanes = 0;
+  metal::MetalBuffer laneRows;
 };
 
 // Routes and executes grouped experts from immutable weight views.
 struct MoE final {
-  [[nodiscard]] static MoePlan prefillPlan(MoeShape shape, uint32_t rows, MoeConfig config);
-  [[nodiscard]] static MoePlan decodePlan(MoeShape shape, uint32_t lanes, MoeConfig config);
+  // The plan of a step of 1 to SPLASH_PREFILL_TOKEN_BUDGET rows.
+  [[nodiscard]] static MoePlan plan(MoeShape shape, uint32_t rows, MoeConfig config);
   // A step's routing (addRouting: the router, the selection and the
   // grouping into tiles), the load of its streamed experts, and its routed
-  // work (addRouted: the gather, the expert passes and the combine). add runs
-  // the gather and the passes over the tiles of experts resident before the
-  // load beside it (MoeExpertStream::addLoad), the rest after it. Steps that
-  // share a load run their routings, one load of the union, then their
-  // routed work, each in its own scratch.
-  static void add(metal::CommandGraph &graph, const MoeBuffers &buffers,
-                  const BlockMoeWeights &weights, const MoePlan &plan);
+  // work (the gather, the expert passes and the combine). A streamed block's
+  // runs the gather and the passes over the tiles of experts resident before
+  // the load beside it (addResident, as MoeExpertStream::addLoad's `beside`),
+  // the rest after it (addRouted); a resident block's runs all of it after
+  // the routing (addRouted). Steps that share a load (a prefill group's
+  // chunks, QwenTarget::addPrefillLayers) run their routings, one load of
+  // the union beside the first step's resident work, then each step's work
+  // through its combine before the next step's: they share the scratch their
+  // gathers and passes write, all but their routing.
   static void addRouting(metal::CommandGraph &graph, const MoeBuffers &buffers,
                          const BlockMoeWeights &weights, const MoePlan &plan);
+  static void addResident(metal::CommandGraph &graph, const MoeBuffers &buffers,
+                          const BlockMoeWeights &weights, const MoePlan &plan);
   static void addRouted(metal::CommandGraph &graph, const MoeBuffers &buffers,
                         const BlockMoeWeights &weights, const MoePlan &plan);
   // The routing of `rows` rows of `input` by a block's `router` and

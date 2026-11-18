@@ -407,7 +407,10 @@ void testSubtreeThroughChurn() {
           "subtree churn leaked a block or a page reference");
 }
 
-struct FakeSlot final : engine::KvDiskSlot {};
+// A copy that takes 100 of the quota.
+struct FakeSlot final : engine::KvDiskSlot {
+  uint64_t bytes() const noexcept override { return 100; }
+};
 
 // On random trees, as blocks, states, holders, transfers, waiting chains and the resume point change, the counts the
 // cache keeps give what its rule names (pageReach): for a walk's reasons `mask`, a resident block frees now unless
@@ -882,7 +885,7 @@ void testRequestsHoldTheirBlocks() {
     cache.setSlot(root.id, std::make_shared<FakeSlot>());
     cache.setSlot(leaf.id, std::make_shared<FakeSlot>());
     require(cache.held(root.id) == spill && cache.held(leaf.id) == spill &&
-                cache.heldCopies() == (spill ? 2u : 0u) && cache.diskCandidate(true).has_value() == !spill &&
+                cache.heldCopyBytes() == (spill ? 200u : 0u) && cache.diskCandidate(true).has_value() == !spill &&
                 cache.evictionCandidate(0).has_value() == !spill,
             "a block a request holds was not held, or held without a spill policy");
     // A second reference keeps the mark when the first goes.
@@ -891,11 +894,11 @@ void testRequestsHoldTheirBlocks() {
     require(cache.held(leaf.id) == spill, "a block lost its mark while a request still held its page");
     cache.unholdPage(acquired.pages[0]);
     cache.unholdPage(acquired.pages[1]);
-    require(!cache.held(root.id) && !cache.held(leaf.id) && cache.heldCopies() == 0 &&
+    require(!cache.held(root.id) && !cache.held(leaf.id) && cache.heldCopyBytes() == 0 &&
                 cache.diskCandidate(true).has_value() && cache.evictionCandidate(0).value().id == leaf.id,
             "a block nothing holds did not rejoin the orders");
     cache.holdPage(acquired.pages[1]);
-    require(cache.held(leaf.id) == spill && cache.heldCopies() == (spill ? 1u : 0u),
+    require(cache.held(leaf.id) == spill && cache.heldCopyBytes() == (spill ? 100u : 0u),
             "a request's new reference did not hold the block");
     if (spill)
       rejects([&] { cache.erase(leaf.id); }, "cannot evict a referenced KV cache block",
@@ -1088,7 +1091,7 @@ void testWritersAndTheContentOfABlock() {
                 !cache.kvCopied(leaf.id) && cache.diskBlocks() == 2,
             "a disk-only block a writer filled gave its copy up, or took it for a copy of the page");
     const auto redundant = cache.diskCandidate(true);
-    require(cache.held(leaf.id) == spill && cache.heldCopies() == (spill ? 1u : 0u) && redundant &&
+    require(cache.held(leaf.id) == spill && cache.heldCopyBytes() == (spill ? 100u : 0u) && redundant &&
                 redundant->id == (spill ? leaf.id : root.id),
             "a copy of another command's K/V beside a held page was active KV, or quota could not take it");
     cache.checkInvariants();
@@ -1100,7 +1103,7 @@ void testWritersAndTheContentOfABlock() {
                 !cache.kvCopied(leaf.id),
             "a disk-only block a writer filled again took its copy for one of the page");
     cache.setSlot(leaf.id, std::make_shared<FakeSlot>());
-    require(cache.kvCopied(leaf.id) && cache.rewrites() == 1 && cache.heldCopies() == (spill ? 2u : 0u),
+    require(cache.kvCopied(leaf.id) && cache.rewrites() == 1 && cache.heldCopyBytes() == (spill ? 200u : 0u),
             "a copy of the page did not replace the copy of another command's K/V as active KV");
     for (const uint32_t held : {acquired.pages[0], acquired.pages[1], writer.pages[0]})
       cache.unholdPage(held);

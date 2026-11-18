@@ -123,6 +123,39 @@ class KernelIdentityTests(unittest.TestCase):
         status, lines = self.run_main(baseline, retyped)
         self.assertEqual((status, lines[0]), (1, "different: moe_expert"))
 
+    def test_struct_names_are_compared_in_order(self):
+        # A kernel's parameter struct and a quoted one, which the library's
+        # linker names after the first module's struct of the same layout: a
+        # struct of that layout added elsewhere renames them.
+        module = (
+            'source_filename = "gguf_decode"\n\n'
+            "%struct.{0} = type {{ i32, i32, i32, i32, i32 }}\n"
+            '%"struct.{1}" = type {{ {2} }}\n\n'
+            'define void @gguf_decode(%struct.{0} addrspace(2)* %0, %"struct.{1}"* %1) {{\n'
+            "  %3 = getelementptr inbounds %struct.{0}, %struct.{0} addrspace(2)* %0, i64 0, i32 2\n"
+            "  ret void\n}}\n"
+        )
+        baseline = {
+            "gguf_decode": module.format(
+                "GgufDecodeParams", "FmtQ2K::Meta", "half, half"
+            )
+        }
+        renamed = {
+            "gguf_decode": module.format(
+                "GgufColumnParams", "FmtQ4K::Meta", "half, half"
+            )
+        }
+        status, lines = self.run_main(baseline, renamed)
+        self.assertEqual((status, lines[0]), (0, "identical: gguf_decode"))
+        # Another layout is another function.
+        relaid = {
+            "gguf_decode": module.format(
+                "GgufDecodeParams", "FmtQ2K::Meta", "half, float"
+            )
+        }
+        status, lines = self.run_main(baseline, relaid)
+        self.assertEqual((status, lines[0]), (1, "different: gguf_decode"))
+
     def test_by_default_kernels_named_for_other_paths_are_left_out(self):
         baseline = {
             name: MODULE.format(name)

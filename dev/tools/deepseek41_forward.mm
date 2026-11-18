@@ -49,6 +49,7 @@
 #include "model/DeepSeek41.hpp"
 #include "model/EngramHash.hpp"
 #include "model/ExpertStore.hpp"
+#include "tests/engine/MoeStep.hpp"
 #include "model/GgufFile.hpp"
 #include "model/GgufTarget.hpp"
 #include "model/SparseRowStore.hpp"
@@ -214,8 +215,8 @@ public:
     // plans.
     ops::LinearScratchSize size{}, decodeSize{};
     const auto include = [&](const ops::Projection &p) {
-      size.include(operators_.linear().prefillScratchSize(p.shape()));
-      decodeSize.include(operators_.linear().decodeScratchSize(p.shape()));
+      size.include(operators_.linear().scratchSize(p.shape(), model::ExecutionLimits::prefillTokenBudget));
+      decodeSize.include(operators_.linear().scratchSize(p.shape(), model::ExecutionLimits::targetVerifyRows));
     };
     for (const model::DeepSeek41LayerWeights &layer : weights.layers) {
       for (const ops::Projection *p : {&layer.queryA, &layer.queryB, &layer.kv, &layer.outputB}) include(*p);
@@ -227,7 +228,7 @@ public:
                       zeroed(size.rotated)};
     decodeScratch_ = {zeroed(decodeSize.input), zeroed(decodeSize.sums), zeroed(decodeSize.partials),
                       zeroed(decodeSize.counters), zeroed(decodeSize.rotated)};
-    verifyRows_ = upload(std::vector<uint32_t>{1});
+    verifyRows_ = upload(std::vector<SplashLaneRows>{{0, 1}});
     const char *kernels = std::getenv("DEEPSEEK41_DECODE_KERNELS");
     decodeKernels_ = !kernels || std::string_view(kernels) != "0";
     const char *rounding = std::getenv("DEEPSEEK41_KV_ROUNDING");
@@ -253,7 +254,7 @@ public:
     for (auto &[bytes, buffer] : taken_) free_.emplace(bytes, std::move(buffer));
     taken_.clear();
     pooled_ = lane;
-    verifyRows_ = upload(std::vector<uint32_t>{rows_});
+    verifyRows_ = upload(std::vector<SplashLaneRows>{{0, rows_}});
     if (!rows_ || past_ + rows_ > capacity_)
       throw std::runtime_error("the sequence holds " + std::to_string(capacity_) + " tokens");
     std::vector<uint32_t> positions(rows_);
@@ -484,7 +485,7 @@ public:
     const uint32_t hidden = layout_.hiddenSize, R = rows_;
     MetalBuffer mixes = alloc(uint64_t{pad(R)} * MHC_MIXES * 4), x = alloc(uint64_t{pad(R)} * hidden * 2);
     MetalBuffer residual = zeroed(uint64_t{pad(R)} * hidden * 2), out = alloc(uint64_t{pad(R)} * hidden * 2);
-    const ops::MoePlan plan = decode_ ? operators_.moeDecode(moeShape_, moeRouterFormat_, 1) : operators_.moePrefill(moeShape_, moeRouterFormat_, R);
+    const ops::MoePlan plan = operators_.moe(moeShape_, moeRouterFormat_, R);
     ops::MoeScratch scratch;
     for (const ops::MoeScratchField &field : ops::kMoeScratchFields)
       scratch.*field.buffer = zeroed(plan.workspace().*field.bytes);
@@ -492,7 +493,15 @@ public:
     ops::ManifoldHyperConnection::addMix(graph, streams_, layer.ffnMix.fn, layer.ffnMix.scale, layer.ffnMix.base,
                                          chunks_, mixes, mhc_, R);
     ops::ManifoldHyperConnection::addPreNorm(graph, streams_, attentionMixes_, layer.ffnNorm.buffer, x, mhc_, R);
-    ops::MoE::add(graph, {x, residual, out, scratch, decode_ ? verifyRows_ : MetalBuffer{}}, layer.ffn, plan);
+    // A decode step routes its lane's rows, as the target's do.
+    splash::test::addMoeStep(graph,
+                             {.input = x,
+                              .residual = residual,
+                              .output = out,
+                              .scratch = scratch,
+                              .lanes = decode_ ? 1u : 0u,
+                              .laneRows = decode_ ? verifyRows_ : MetalBuffer{}},
+                             layer.ffn, plan);
     routes_.push_back(scratch.selectedExperts);
     ops::ManifoldHyperConnection::addPost(graph, streams_, out, mixes, mhc_, R);
 
@@ -549,16 +558,11 @@ private:
     return rounds_ ? rounding : ops::LatentRounding::None;
   }
 
-  // A projection of the step's rows: a decode plan of one lane in a decode
-  // step, else prefill chunks.
+  // A projection of the step's rows, on the plans of its rows, as the
+  // target's (a decode step's on its own scratch).
   void project(metal::CommandGraph &graph, const MetalBuffer &input, const ops::Projection &projection,
                const MetalBuffer &output, uint32_t rows) {
-    const ops::Linear &linear = operators_.linear();
-    if (decode_)
-      static_cast<void>(linear.add(graph, {.input = input, .output = output, .scratch = decodeScratch_}, projection,
-                                   linear.decodePlan(projection, 1)));
-    else
-      linear.addPrefill(graph, input, projection, output, rows, linearScratch_);
+    operators_.linear().addProjection(graph, input, projection, output, rows, decode_ ? decodeScratch_ : linearScratch_);
   }
 
   // A float (BF16) projection into fp32 rows: a prefill projection writes
@@ -671,8 +675,8 @@ public:
     next_ = 0;
     ops::LinearScratchSize decode{}, prefill{};
     const auto include = [&](const ops::Projection &p) {
-      decode.include(operators_.linear().decodeScratchSize(p.shape()));
-      prefill.include(operators_.linear().prefillScratchSize(p.shape()));
+      decode.include(operators_.linear().scratchSize(p.shape(), model::ExecutionLimits::draftQueryRows));
+      prefill.include(operators_.linear().scratchSize(p.shape(), model::ExecutionLimits::prefillTokenBudget));
     };
     for (const model::DeepSeek41LayerWeights &layer : weights.layers) {
       for (const ops::Projection *p : {&layer.queryA, &layer.queryB, &layer.kv, &layer.outputB}) include(*p);
@@ -705,11 +709,11 @@ public:
     MetalBuffer projected = alloc(uint64_t{pad(rows)} * hidden * 2), main = alloc(uint64_t{pad(rows)} * hidden * 2);
     MetalBuffer raw = alloc(uint64_t{pad(rows)} * latent * 2), latents = alloc(uint64_t{pad(rows)} * latent * 2);
     metal::CommandGraph graph;
-    operators_.linear().addPrefill(graph, mainHidden, weights_.mainProjection, projected, rows, prefillScratch_);
+    operators_.linear().addProjection(graph, mainHidden, weights_.mainProjection, projected, rows, prefillScratch_);
     ops::Normalization::addRms(graph, projected, weights_.mainNorm, main, hidden, rows);
     for (size_t index = 0; index < weights_.layers.size(); ++index) {
       const model::DeepSeek41LayerWeights &layer = weights_.layers[index];
-      operators_.linear().addPrefill(graph, main, layer.kv, raw, rows, prefillScratch_);
+      operators_.linear().addProjection(graph, main, layer.kv, raw, rows, prefillScratch_);
       ops::LatentRotation::add(graph, raw, false, layer.kvNorm.buffer, freqs_, positionBuffer, latents,
                                {1, latent, layout_.rotaryPairs, false, ops::LatentRounding::Fp8, true, d_.normEpsilon},
                                rows);
@@ -741,7 +745,7 @@ public:
       for (uint32_t j = 0; j < B; ++j) indices[size_t(r) * keyStride + filled + j] = (ring + j) | LATENT_ATTENTION_WINDOW_KEY;
     }
     const MetalBuffer indexBuffer = upload(indices), countBuffer = upload(counts);
-    const MetalBuffer verifyRows = upload(std::vector<uint32_t>{B});
+    const MetalBuffer verifyRows = upload(std::vector<SplashLaneRows>{{0, B}});
     MetalBuffer streams = zeroed(uint64_t{rows} * MHC_STREAMS * hidden * 4);
     MetalBuffer embedding = alloc(uint64_t{rows} * hidden * 2), chunks = alloc(ops::ManifoldHyperConnection::mixScratchBytes(mhc_, B));
     std::vector<float> first(size_t(B) * MHC_MIXES, 0.0f);
@@ -750,7 +754,7 @@ public:
     metal::CommandGraph graph;
     ops::Embedding::add(graph, tokenBuffer, target_.tokenEmbedding, embedding, B);
     ops::ManifoldHyperConnection::addInit(graph, embedding, streams, mhc_, B);
-    const ops::MoePlan plan = operators_.moeDecode(moeShape_, moeRouterFormat_, 1);
+    const ops::MoePlan plan = operators_.moe(moeShape_, moeRouterFormat_, B);
     for (const model::DeepSeek41LayerWeights &layer : weights_.layers) {
       const size_t index = &layer - weights_.layers.data();
       MetalBuffer mixes = alloc(uint64_t{rows} * MHC_MIXES * 4), x = alloc(uint64_t{rows} * hidden * 2);
@@ -801,7 +805,14 @@ public:
       ops::ManifoldHyperConnection::addMix(graph, streams, layer.ffnMix.fn, layer.ffnMix.scale, layer.ffnMix.base,
                                            chunks, ffnMixes, mhc_, B);
       ops::ManifoldHyperConnection::addPreNorm(graph, streams, mixes, layer.ffnNorm.buffer, y, mhc_, B);
-      ops::MoE::add(graph, {y, residual, ffnOut, scratch, verifyRows}, layer.ffn, plan);
+      splash::test::addMoeStep(graph,
+                               {.input = y,
+                                .residual = residual,
+                                .output = ffnOut,
+                                .scratch = scratch,
+                                .lanes = 1,
+                                .laneRows = verifyRows},
+                               layer.ffn, plan);
       ops::ManifoldHyperConnection::addPost(graph, streams, ffnOut, ffnMixes, mhc_, B);
       previous = ffnMixes;
     }
@@ -851,12 +862,11 @@ public:
   }
 
 private:
-  // A projection of a block's rows on the decode plans of one lane.
+  // A projection of a block's rows, on the plans of a draft's block.
   void project(metal::CommandGraph &graph, const MetalBuffer &input, const ops::Projection &projection,
                const MetalBuffer &output) {
-    const ops::Linear &linear = operators_.linear();
-    static_cast<void>(linear.add(graph, {.input = input, .output = output, .scratch = decodeScratch_}, projection,
-                                 linear.decodePlan(projection, 1)));
+    operators_.linear().addProjection(graph, input, projection, output, model::ExecutionLimits::draftQueryRows,
+                                      decodeScratch_);
   }
   template <class T> MetalBuffer upload(const std::vector<T> &values) {
     MetalBuffer buffer = alloc(values.size() * sizeof(T));

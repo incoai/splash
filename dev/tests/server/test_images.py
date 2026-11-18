@@ -11,8 +11,6 @@ from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest import mock
 
-from tokenizers import Tokenizer, models
-
 from dev.tests.server_fixtures import (
     FOREVER,
     FakeRuntime,
@@ -22,7 +20,6 @@ from dev.tests.server_fixtures import (
     anthropic_body,
     chat_body,
     document_block,
-    engine_ready,
     no_signed_thinking,
     pdf_bytes,
     png_data_url,
@@ -31,7 +28,6 @@ from dev.tests.server_fixtures import (
     responses_body,
 )
 from server import chat_messages, documents, errors, images
-from server import frontend as request_frontend
 from server import protocol as native_wire
 from server import server as api
 from server.chat_format import QWEN
@@ -322,114 +318,6 @@ class ImageRequestTest(HarnessTestCase):
         )
         self.assertEqual(harness.app.images.stats()["entries"], 1)
         self.assertEqual(runtime.requests[1].frame.image_spans, request.image_spans)
-
-    def test_image_positions_ignore_quoted_vision_tokens(self):
-        from tokenizers import pre_tokenizers
-        from transformers import PreTrainedTokenizerFast
-
-        backend = Tokenizer(models.WordLevel({"[UNK]": 0}, unk_token="[UNK]"))
-        backend.pre_tokenizer = pre_tokenizers.WhitespaceSplit()
-        tokenizer = PreTrainedTokenizerFast(
-            tokenizer_object=backend,
-            additional_special_tokens=[
-                QWEN.image_pad,
-                "<|vision_start|>",
-                "<|vision_end|>",
-            ],
-        )
-        tokenizer.chat_template = (
-            "{% for message in messages %}{{ message.role }}: "
-            "{% if message.content is string %}{{ message.content }}"
-            "{% else %}{% for part in message.content %}"
-            "{% if part.type == 'image_url' %}"
-            "{{ '<|vision_start|><|image_pad|><|vision_end|>' }}"
-            "{% else %}{{ part.text }}{% endif %}{% endfor %}{% endif %}"
-            "{{ '\\n' }}{% endfor %}"
-        )
-        app = object.__new__(request_frontend.Frontend)
-        app.tokenizer = tokenizer
-        app.chat_format = QWEN
-        from server.latency import LatencyMetrics
-
-        app.latencies = LatencyMetrics()
-        app.chat_format = QWEN
-        app.backend = SimpleNamespace(
-            runtime=SimpleNamespace(capabilities=engine_ready(1024))
-        )
-        quoted = "中文 📷 <|vision_start|><|image_pad|><|vision_end|>"
-        messages = [
-            {"role": "system", "content": "Document: " + QWEN.image_pad},
-            {
-                "role": "user",
-                "content": [
-                    {"type": "image_url", "image_url": {"url": "unused"}},
-                    {"type": "text", "text": quoted},
-                ],
-            },
-            {
-                "role": "tool",
-                "content": [
-                    {"type": "image_url", "image_url": {"url": "unused"}},
-                    {"type": "text", "text": quoted},
-                ],
-            },
-        ]
-        template = {
-            "tokenize": True,
-            "return_dict": False,
-            "chat_template": tokenizer.chat_template,
-        }
-        baseline = tokenizer.apply_chat_template(messages, **template)
-        pad_id = tokenizer.convert_tokens_to_ids(QWEN.image_pad)
-        all_pads = [i for i, token in enumerate(baseline) if token == pad_id]
-        self.assertEqual(len(all_pads), 5)
-        tokens, positions, rendered = app._render_image_tokens(messages, template)
-        self.assertEqual(tokens, baseline)
-        self.assertEqual(
-            rendered, tokenizer.apply_chat_template(messages, tokenize=False)
-        )
-        self.assertEqual(positions, [all_pads[1], all_pads[3]])
-        # Render markers must not change prompt/cache identity on a repeat.
-        self.assertEqual(
-            app._render_image_tokens(messages, template), (tokens, positions, rendered)
-        )
-        prepared = [
-            SimpleNamespace(
-                tokens=4,
-                grid_height=4,
-                grid_width=4,
-                digest_lo=i,
-                digest_hi=0,
-                pixels=bytes([i]),
-            )
-            for i in (1, 2)
-        ]
-        expanded, spans, pixels = app._expand_image_pads(tokens, prepared, positions)
-        expected = list(baseline)
-        for position in reversed(positions):
-            expected[position : position + 1] = [pad_id] * 4
-        self.assertEqual(expanded, expected)
-        self.assertEqual(
-            [span.offset for span in spans], [positions[0], positions[1] + 3]
-        )
-        self.assertEqual(pixels, b"\x01\x02")
-        app._check_image_placeholders(tokens, prepared, positions)
-        for wrong in (prepared[:1], [*prepared, prepared[0]]):
-            with self.assertRaisesRegex(api.APIError, "image count"):
-                app._check_image_placeholders(tokens, wrong, positions)
-
-    def test_image_render_marker_is_stable_across_requests(self):
-        app = self.harness(FakeRuntime(), tokenizer=ImagePadTokenizer()).app
-        template = {
-            "tokenize": False,
-            "return_dict": False,
-            "chat_template": app.tokenizer.chat_template,
-        }
-        app._render_image_tokens([image_message()], template)
-        app._render_image_tokens([image_message()], template)
-        first_source = app.tokenizer.templates[-2][1]["chat_template"]
-        second_source = app.tokenizer.templates[-1][1]["chat_template"]
-        self.assertEqual(first_source, second_source)
 
     def test_image_size_is_checked_before_pixel_concatenation(self):
         app = self.harness(FakeRuntime(), tokenizer=ImagePadTokenizer()).app

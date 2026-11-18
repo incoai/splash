@@ -57,11 +57,10 @@ def prepare_local_model(
     vision projector named mmproj.
     draft: the directory of a DFlash2 draft (config.json and safetensors
     weights) trained for the target's family, or "none" (models.NO_DRAFT)
-    to decode one token a cycle without one, as a family no draft is
-    released for does. Without one, the draft released for the family is
-    taken from the Hugging Face cache (HF_HUB_CACHE), at the commit last
-    recorded there for its default branch, as `hf download REPO` and
-    `splash serve` record it.
+    to decode without one, as a family no draft is released for does.
+    Without one, the draft released for the family is taken from the Hugging
+    Face cache (HF_HUB_CACHE), at the commit last recorded there for its
+    default branch, as `hf download REPO` and `splash serve` record it.
     mmproj: a GGUF target's vision projector, a GGUF file, with which it
     serves images; a GGUF target serves text only without one, as one of a
     family without a vision tower (Flint) always does. An MLX target's

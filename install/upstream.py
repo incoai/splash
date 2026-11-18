@@ -937,8 +937,9 @@ def _changes(installed, family, draft):
 
 class NoDraft:
     """The draft source of an installation without a draft (--draft-model
-    none, or a family no draft is released for), which decodes one token a
-    cycle: no files, and recorded as the draft repository models.NO_DRAFT."""
+    none, or a family no draft is released for), whose cycles verify the
+    host's chains alone: no files, and recorded as the draft repository
+    models.NO_DRAFT."""
 
     name = models.NO_DRAFT
     revision = None

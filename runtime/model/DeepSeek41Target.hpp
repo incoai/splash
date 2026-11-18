@@ -17,13 +17,23 @@
 // the groups their indexer selects, through the sequence's page table
 // (ops::LatentAttention, ops::LatentIndex). A prefill writes each
 // sequence's state after its rows, and each state it captures, as it goes; a
-// verify leaves it to its commit, which writes the state after each lane's
-// retained rows from the step's latents and projections.
+// decode step leaves it to its commit, which writes the state after each
+// lane's retained rows from the step's latents and projections.
+//
+// A decode step runs through its own layer loop (addPrefill with a decode
+// chunk), its lanes' rows a chain each (DSpark's proposals, or a host chain
+// beside none: each row's path every earlier row of its lane, as the ring
+// and the open groups assume), in a layout of its own: lane l's rows from
+// row l * deepSeek41LaneStride(step), which addVerifyInput gathers from the
+// packed layout the step's proposer wrote, with each row's position, each
+// lane's row count, past which its rows attend nothing and route no expert,
+// and its groups' positions. Its head reads the final norm's rows scattered
+// back to the packed layout.
 //
 // Its step scratch beside the runtime's arenas: per prefill chunk what lives
 // across its layers (its streams, mixes, the indexers' selections and the
 // candidate layer's blocks, its staged Engram rows and its MoE output), the
-// work of a layer shared by the chunks in tiles of rows, and a verify's.
+// work of a layer shared by the chunks in tiles of rows, and a decode step's.
 
 #include "model/DeepSeek41.hpp"
 #include "ops/ManifoldHyperConnection.hpp"
@@ -51,21 +61,18 @@ public:
   // Each lane's prior tokens, which the GPU hashes its verify rows' Engram
   // rows of.
   void prepareVerifyLane(uint32_t lane, uint64_t position, const QwenTargetRequest &request) override;
-  // The GPU hashes the verify rows' Engram rows, and a host step of the
-  // command stages them from the tables' file before the verify gathers
-  // them.
-  void addVerifyInput(metal::CommandGraph &graph, metal::MetalBuffer draftInput, metal::MetalBuffer proposals,
-                      metal::MetalBuffer verifyInput, uint32_t lanes) const override;
-  void addVerify(metal::CommandGraph &graph, QwenTargetVerifyBuffers buffers, const kv::PageStorage &kv,
-                 SpilledKvReads &spilled, std::span<const kv::ChunkedPrefillParams> chunks,
-                 uint32_t lanes) const override;
+  // The step's rows in the target's own layout, and the Engram rows the GPU
+  // hashes of them, which a host step of the command stages from the
+  // tables' file before the step gathers them.
+  void addVerifyInput(metal::CommandGraph &graph, const QwenVerifyInput &input) const override;
   // The hidden rows are the final norm's of the last mix, which the head
   // reads as they are.
   void addHeadBatch(metal::CommandGraph &graph, metal::MetalBuffer hidden, metal::MetalBuffer finalHidden,
-                    metal::MetalBuffer logits, uint32_t lanes, ops::LinearScratch scratch) const override;
+                    metal::MetalBuffer logits, uint32_t rows, ops::LinearScratch scratch) const override;
   // Each lane's rings and open groups after its retained rows, from the
-  // verify's latents and projections.
-  void addStateCommit(metal::CommandGraph &graph, QwenTargetCommitBuffers buffers, uint32_t lanes) const override;
+  // step's latents and projections.
+  void addStateCommit(metal::CommandGraph &graph, QwenTargetCommitBuffers buffers,
+                      const ops::StepRows &step) const override;
 
   // The step scratch a target of `layout` keeps, whose prefill commands run
   // up to `prefillChunks` chunks and whose Engram rows stage rows of
@@ -78,15 +85,18 @@ private:
   struct Scratch;
   struct Rows;
 
-  // A chunk's or a verify's rows through a layer's Engram and attention
-  // (the FFN's mix, routing and experts are addPrefill's and addVerify's),
-  // a verify's projections through the decode plans of `lanes` lanes.
+  // A chunk's or a decode step's rows through a layer's Engram and attention
+  // (the FFN's mix, routing and experts are addPrefill's and addDecode's).
   void addEngram(metal::CommandGraph &graph, const Scratch &s, const ops::LinearScratch &linear, bool decode,
-                 uint32_t lanes, uint32_t index, uint32_t rows, uint32_t staged) const;
+                 uint32_t index, uint32_t rows, uint32_t staged) const;
   void addAttention(metal::CommandGraph &graph, const Scratch &s, const ops::LinearScratch &linear, bool decode,
-                    uint32_t lanes, uint32_t index, std::span<const Rows> sequences, uint32_t rows,
+                    uint32_t index, std::span<const Rows> sequences, uint32_t rows,
                     const metal::MetalBuffer &normalized, const metal::MetalBuffer &previousMixes,
                     std::span<const SplashKvLayer> kvLayers) const;
+  // A decode step's forward (addPrefill with a decode chunk).
+  [[nodiscard]] std::vector<metal::MetalBuffer> addDecode(metal::CommandGraph &graph,
+                                                          const QwenTargetPrefillChunk &chunk,
+                                                          const kv::PageStorage &kv) const;
   void addSourceGroups(metal::CommandGraph &graph, const Scratch &s, uint32_t index, const Rows &sequence,
                        const metal::MetalBuffer &normalized, std::span<const SplashKvLayer> kvLayers) const;
   void addIndexer(metal::CommandGraph &graph, const Scratch &s, uint32_t index, const Rows &sequence, uint32_t begin,
@@ -96,11 +106,9 @@ private:
   // file while this one runs (Qwen4Steps::readAhead): each lane's prompt
   // after its last sequence of `chunks`, a command's chunks of rows at most.
   void readAhead(std::span<const QwenTargetPrefillChunk> chunks) const;
-  // The rows' projection through ops::Linear: a prefill's chunks of up to
-  // `rows` rows, or a verify's decode plan of `lanes` lanes.
+  // The rows' projection through ops::Linear, on the plans of `rows` rows.
   void project(metal::CommandGraph &graph, metal::MetalBuffer input, const ops::Projection &projection,
-               metal::MetalBuffer output, uint32_t rows, bool decode, uint32_t lanes,
-               const ops::LinearScratch &linear) const;
+               metal::MetalBuffer output, uint32_t rows, const ops::LinearScratch &linear) const;
   // The KV source of layer `index`: the last compressor layer at or before
   // it, by its index among them, and its ratio.
   [[nodiscard]] uint32_t sourceOf(uint32_t index) const;
@@ -136,8 +144,8 @@ private:
   // Each KV source's layer (the compressor layers, ascending).
   std::vector<uint32_t> sources_;
   std::vector<uint32_t> pairedOf_;
-  // The scratch of each prefill chunk and of the verify, and the lanes'
-  // positions a verify was prepared for.
+  // The scratch of each prefill chunk and of the decode step, and the lanes'
+  // positions a decode step was prepared for.
   std::vector<Scratch> prefill_;
   std::unique_ptr<Scratch> verify_;
   std::array<uint64_t, ExecutionLimits::maximumBatchWidth> preparedPositions_{};

@@ -69,7 +69,9 @@ job, with its output appended to a log in `~/Library/Logs/Splash`:
 `install/models.py --model ID prepare --json-progress` downloads a model, and
 `splash serve --model ID --port PORT --offline` serves an installed one, with
 the launch options picked in the app that differ from the server's defaults,
-ready once that process's serve record says it is; while the engine warms up,
+ready once that process's [serve record](server.md#serve-record) says it is,
+or that it already starts a failed engine again, which the Server shows as
+recovering; while the engine warms up,
 the record counts its steps, and the Server shows them with why the first
 start after an update takes a couple of minutes
 ([Warmup and pipelines](internals.md#warmup-and-pipelines)); stopping
@@ -91,9 +93,10 @@ memory with its download size and a few words about the model, and starts
 coding agents with `splash AGENT --port PORT`, typed into a new terminal of the
 window's drawer in the folder the agents work in, the last one chosen, whose
 environment holds the running server's API key. Its launch options are every option `splash serve` takes but the
-ones of one model (`--revision`, `--draft-model`, `--mmproj`) and the ones it
-sets itself, from one table (`LaunchOption.all`) the tests hold to `splash
-serve --help`. It offers a model only those its family can use, and passes
+ones of one model (`--revision`, `--draft-model`, `--mmproj`,
+`--chat-template-file`), the ones it
+sets itself and `--reasoning-effort`, which it leaves to the command line,
+from one table (`LaunchOption.all`) the tests hold to `splash serve --help`. It offers a model only those its family can use, and passes
 no other: at launch it runs `install/families.py`, which reports for each
 family it serves, from the engine's `families` command and the options' own
 needs (`ServeOption.needs`), the options none of its models can use and the
@@ -137,8 +140,21 @@ model or with the context length on Auto. Its chat is its own, not the chat page
 own in that folder's `Attachments`, so a conversation outlives a switch of
 models. A message attaches images and PDFs, a PDF shown by its name and pages,
 where the model takes them, and is held back where the limits `/v1/models`
-gives leave them out; one the server refuses goes back to the composer, with
-why. A chat takes the title the model sums its first exchange up
+gives leave them out. Each chat keeps its own draft, the new chat too; New Chat
+takes along a draft the open chat's context cannot hold, as the composer says to
+start a new chat for it, unless the new chat holds a draft of its own. A
+message is its chat's once the server takes it, which
+it does by starting its response: until then the chat's file and its place in
+the list stay as they were, and a new chat is no conversation yet, listed,
+written and opened only once the server has taken its first message, which
+stays in the new chat's composer meanwhile as it was sent, Stop in Send's place.
+A message the server refuses, that never reaches it or that is stopped before
+it is taken changes no chat, and is in its chat's draft again, or still, with
+why unless it was stopped, never joined to another chat's, its chat open again
+where another was opened meanwhile. A quit keeps
+a later message in its chat, its answer stopped. One that fails
+after stays in its chat, its answer saying why. A chat
+takes the title the model sums its first exchange up
 in, asked in the background without thinking. The list puts the pinned chats
 first, the last pinned at the top, then the others by day; a chat's menu, at
 its row's end or its title in the toolbar, pins, renames and deletes it, and

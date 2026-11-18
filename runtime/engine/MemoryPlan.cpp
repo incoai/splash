@@ -171,7 +171,7 @@ std::optional<uint64_t> minimumRequiredBytes(uint64_t fixedBytes,
   uint64_t runwayBytes = 0;
   uint64_t dynamicBytes = 0;
   uint64_t result = 0;
-  if (!checkedMultiply(layout.bytesPerModelPage(),
+  if (!checkedMultiply(layout.bytesPerModelPage() + kv::kPageTokens * model::kLookupIndexTokenBytes,
                        kvRunwayPages(layout.minimumExtentPages()), runwayBytes) ||
       !checkedAdd(laneStateBytes, runwayBytes, dynamicBytes) ||
       !checkedAdd(fixedBytes, dynamicBytes, result))
@@ -199,10 +199,11 @@ uint64_t kvPagesBytes(const kv::Layout &layout, uint64_t pages, uint32_t floorPa
 }
 
 uint64_t kvPagesWithin(const kv::Layout &layout, uint64_t bytes, uint32_t floorPages, uint32_t extentPages) noexcept {
+  const uint64_t index = uint64_t{kv::kPageTokens} * model::kLookupIndexTokenBytes;
   const auto whole = [&](uint64_t room, kv::PageForm form) {
-    return room / (extentPages * layout.bytesPerModelPage(form)) * extentPages;
+    return room / (extentPages * (layout.bytesPerModelPage(form) + index)) * extentPages;
   };
-  const uint64_t floorBytes = kvPagesBytes(layout, floorPages, floorPages, extentPages);
+  const uint64_t floorBytes = kvPagesBytes(layout, floorPages, floorPages, extentPages) + floorPages * index;
   if (!layout.slimmable() || bytes < floorBytes) return whole(bytes, kv::PageForm::Full);
   return floorPages + whole(bytes - floorBytes, kv::PageForm::Slim);
 }

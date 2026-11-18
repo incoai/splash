@@ -25,8 +25,8 @@ TOOL_CALL_CLOSE = "</tool_call>"
 DSML = "｜DSML｜"
 # The placeholder DeepSeek's template writes for an image.
 DEEPSEEK_IMAGE = "<｜deepseek_image｜>"
-# The reasoning efforts a request or --default-reasoning-effort may name,
-# least first.
+# The reasoning efforts a request, --reasoning-effort or
+# --default-reasoning-effort may name, least first.
 REASONING_EFFORTS = ("none", "minimal", "low", "medium", "high", "xhigh", "max")
 
 
@@ -235,8 +235,11 @@ class ChatFormat:
     # The placeholder the template writes for an image where it refuses any
     # message whose text holds it, as DeepSeek's does: a page or file an agent
     # read that quotes it would fail every later request of the conversation.
-    # Requests render the template with a marker of their own in its place
-    # (frontend.py). None where the template refuses no such text.
+    # Startup requires the tokenizer to add it as a token
+    # (constraints.validate_tokenizer), so that the quoting of a request's
+    # text (tokenization.PromptTokenizer.quote) breaks it up there and the
+    # template never finds it in a message. None where the template refuses
+    # no such text.
     refused_placeholder: str | None = None
 
     @property

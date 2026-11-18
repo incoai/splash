@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <stdexcept>
 #include <utility>
+#include <vector>
 
 namespace splash::ops {
 
@@ -141,6 +142,34 @@ void LatentAttention::addOpenCommit(metal::CommandGraph &graph, metal::MetalBuff
   requireBytes(open, uint64_t{2} * width * sizeof(float), "latent open group");
   graph.add("latent_open_commit", {std::move(kv), std::move(gate), std::move(open), std::move(retained)},
             LatentOpenParams{committed, width, lane}, {(width + 63) / 64, 1, 1}, {64, 1, 1});
+}
+
+void LatentAttention::addLaneRows(metal::CommandGraph &graph, metal::MetalBuffer from, metal::MetalBuffer to,
+                                  const LaneRows &layout, std::span<const uint32_t> committed, uint32_t stride,
+                                  uint32_t words, bool gather) {
+  const auto lanes = static_cast<uint32_t>(committed.size());
+  if (!lanes || lanes > SPLASH_MAXIMUM_BATCH_WIDTH || !stride || stride > SPLASH_TARGET_VERIFY_ROWS || !words ||
+      (gather && layout.groupStride < stride + 1))
+    throw std::invalid_argument("invalid latent lane rows");
+  const uint64_t rows = uint64_t{lanes} * stride, rowBytes = uint64_t{words} * sizeof(uint32_t);
+  requireBytes(layout.packed, lanes * sizeof(SplashLaneRows), "latent lane rows layout");
+  requireBytes(gather ? to : from, rows * rowBytes, "latent lane rows");
+  LatentLaneRowsParams params{lanes, stride, words, gather ? 1u : 0u, layout.groupStride, {}};
+  std::copy(committed.begin(), committed.end(), params.committed);
+  std::vector<metal::MetalBuffer> bindings{std::move(from), std::move(to), layout.packed};
+  if (gather) {
+    requireBytes(layout.counts, lanes * sizeof(uint32_t), "latent lane row counts");
+    requireBytes(layout.strided, lanes * sizeof(SplashLaneRows), "latent lane rows layout");
+    requireBytes(layout.positions, rows * sizeof(uint32_t), "latent lane row positions");
+    requireBytes(layout.groups, uint64_t{lanes} * 2 * layout.groupStride * sizeof(uint32_t),
+                 "latent lane group positions");
+    bindings.insert(bindings.end(), {layout.counts, layout.strided, layout.positions, layout.groups});
+  } else {
+    // A scatter writes the rows alone: the layout stands for the rest, unread.
+    bindings.insert(bindings.end(), 4, layout.packed);
+  }
+  graph.add("latent_lane_rows", std::move(bindings), params,
+            {static_cast<uint32_t>((words + 63) / 64), static_cast<uint32_t>(rows), 1}, {64, 1, 1});
 }
 
 } // namespace splash::ops

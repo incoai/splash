@@ -53,9 +53,10 @@ production code. Before release,
 compare full-model greedy outputs at the same prompts, cached prefixes and
 batch schedule against the base. Repeat seeded sampled requests within each
 build, and explicitly check base-versus-candidate seeded output when preserving
-a drafting policy. Run a MoE target with `--verify-rows all` for these
-comparisons: the verify budget its cycles otherwise follow makes greedy and
-seeded outputs vary from run to run ([Drafts](models.md#drafts)). These are measured
+a drafting policy. Run with `--verify-rows all` for these comparisons: the
+measured costs, and the cost of history and the acceptance learned while
+serving, which a cycle's rows otherwise follow, make
+greedy and seeded outputs vary from run to run ([Drafts](models.md#drafts)). These are measured
 gates, not a guarantee across arbitrary compiler versions or GPUs.
 
 The values the native runtime holds constant (the Metal command timeout, the
@@ -250,6 +251,22 @@ instead of mixing two versions. A start logs `Weights loaded in N s.`; loading
 reads the sources at about the speed of the disk that holds them
 ([upstream loading](../dev/benchmarks/upstream-loading.md#loading-time)).
 
+A start plans its memory before the weights load, and its arenas rest on
+the target's formats ([memory and context](server.md#memory-and-context)), so it
+first reads the target from its images unwritten: `WeightImages` loaded while
+released reserves each image, a buffer of no memory whose views are handles
+of their sizes, and the image's file reads the bytes its readers parse, its
+header and descriptors, from the image's plan (`gguf::Image::fills`). The
+target's loader and readers run as for a load and give every projection its
+formats and sizes (`model::plannedTargetGeometry`): the routed experts read
+with their layers' reserved images, which make no store, and a table that
+may stream streams through its smallest row cache, as its whole image may
+exceed the largest buffer, which a reservation is held to as well. The read
+writes nothing and holds no memory once done; while it runs, only the tables
+its readers fill on the host, the resident experts' slot table and a rotated
+GGUF's signs, a page each. A restore writes an image loaded while released
+as one released after it loaded.
+
 At load time the engine validates the GGUF metadata, including the data
 alignment (`general.alignment`, a power of two of 8 or more, as the GGUF spec
 requires: the repack reads blocks as words) and the rotary embedding and norm
@@ -390,8 +407,8 @@ the Qwen readers.
 Every source loads into block planes: `Projection`, `BlockMoeWeights` and
 `EmbeddingWeights` (`runtime/ops/Weights.hpp`, `MoE.hpp`) hold them whatever
 the source container, and represent different operator contracts. Arena
-sizing collects each projection's shape and reserves the vocabulary head only
-for decode.
+sizing collects each projection's shape and reserves the vocabulary head, and
+the draft's view of its rows ([Drafts](models.md#drafts)), only for decode.
 
 ## Kernels
 
@@ -416,10 +433,11 @@ the exact rule.
 A prefill command's last layer outputs only the rows something reads: one row
 per sequence, its last (the head's input and the finiteness check), unless the
 draft reads that layer. Every row still writes its KV. The tile that holds each
-read row attends as a chunk of its own on the chunk's split count
-(`PagedAttention::prefillTail`), and its gate, o-projection, norm and FFN run
-on the read rows compacted, on the chunk's projection tile kinds and K splits
-(`Linear::prefillPlan` of a chunk's rows), so a dense target's read rows keep
+read row attends on its sequence's split count and kernels
+(`PagedAttention::lastTiles`), its reduce writes the read rows compacted
+(`AttentionOutput::Last`), and its o-projection, norm and FFN run on them,
+on the chunk's projection configurations
+(`Linear::plan` of a chunk's rows), so a dense target's read rows keep
 their bits where the GPU runs the layer. A MoE block runs the plan of the read
 rows, whose routes then see
 fewer rows of their experts and sum in another order (abi/MoE.h), so a MoE
@@ -428,6 +446,109 @@ about 1e-8, against about 1e-3 between the same prompts at other batch widths.
 The Neural Engine split, which takes whole chunks, leaves the read rows to the
 GPU, so in a chunk it takes their last FFN rounds as the GPU's alone. On a
 16-core M5 Pro this takes about 2% off the 35B's prefill of 8K tokens.
+
+A decode step's rows are laid out on the GPU by its draft's selector
+(`ops::DraftSelector::addVerifyRows`): each lane's first row among the step's
+packed rows and its row count (`SplashLaneRows`, `DecodeTensor::LaneLayout`),
+the best rows of the lanes' trees that the step holds, every one of which the
+lane verifies. The host fixes only the step's rows and a lane's most
+(`ops::StepRows`, `ops::verifyLaneCap`), which the grids span; where the
+trees hold fewer rows than the step, its rows past the lanes' belong to no
+lane, which no kernel selects, attends, retains or routes through the MoE
+experts, and which carry lane 0's anchor, as the embedding gathers by token
+(the projections compute them unread, as a tile's spare rows). The step's
+token selection and its penalties and thinking cutoffs, acceptance and the
+draft's context commit read the layout on the GPU and take a lane's rows; the
+first token after a prompt is selected from, and written at, the lane's one
+row, whose layout its selection writes first (`decode_sample_first_rows`), and
+Qwen3.8-Flash-Next's n-gram hash reads it too, hashing a row's n-grams along
+its path and a row of no lane's as lane 0's anchor's, so that the PLE gathers
+valid table rows for it, which a streamed table stages already; so do the GDN
+decode, the target's attention (`ops::AttentionRows`),
+Qwen3.8-Flash-Next's block indexer (its projection, pool, selection and
+commit) and PLE convolution and commit, one dispatch for every lane on grids
+up to the lane cap (`ops::LayoutRows`), a prompt chunk's projection and
+convolution by the layout its host writes, and a MoE step's verified routing
+(`ops::MoeBuffers::laneRows`). A decode step holds the rows the host chose
+for its cycle before encoding it (`model::StepCosts::choose`): the T, from
+a row a lane to sixteen, with the most expected accepted tokens over the cost
+of a step of T rows, from each lane's chances (its draft's rows' estimates in
+its last cycle and its host chain's) and the cost the start measured for the
+class of steps T falls in (`ops::ExecutionPlans::decodeRowClasses`) plus, for
+each of the step's passes over a thousand tokens of a lane's history, the
+cost k its cycles fit (`model::StepCosts::observeContext`); a lane
+holds at most eight of them unless the lanes' chances give one lane more, and
+sixteen then, which the selector packs in lane order.
+
+A decode step's target forward is the prompt forward (`QwenTarget::addPrefill`
+over a chunk whose `decode` names the step's own buffers,
+`QwenTargetDecodeBuffers`): its lanes are the chunk's sequences, each of the
+cycle's lane cap of rows at most, which the layout places, its rows the
+step's, through the same layer loop (`addPrefillLayers`), plans by its rows,
+attention, dense FFN and MoE load and passes (a decode step's load serves a
+group of one step). It differs where the work does: its GDN layers run the
+decode scan from each lane's state along its tree into its tape, where a
+prompt sequence scans its rows from its states into theirs; its attention
+over spilled K/V reads the lists those reads locate, where a prompt
+sequence's reads staging; its MoE routes its lanes' rows alone; every
+row is read, so the forward's end runs the head over every row and the draft
+captures every row of the layers it reads; and the Neural Engine split takes
+prompt chunks alone. Norms and producers write each projection's input as its
+plan takes it, the register tile's table on the decode tiles, a prompt
+chunk's as a decode step's. A
+lane's verify block is a tree (`metal/abi/VerifyTree.h`, a row's parent,
+depth and ancestors' mask), which the draft's selector writes with
+each row's token, its verify input: a row's penalties count the draft tokens
+of its path, a thinking cutoff applies by depth, acceptance follows from the
+anchor the child whose token is its row's selection, and the draft's context
+commit takes the retained path's rows in order (the mask acceptance writes,
+`DecodeTensor::RetainedRows`). The draft's own block stays eight rows a lane,
+and a lane's draft RoPE rows hold its verify block's positions, the first eight
+of which the draft's rows take and the context commit one a retained row. The
+target's RoPE rows of a cycle follow the selector's layout: after it, each
+packed row's at its lane's anchor position plus the row's depth
+(`ops::RoPE::addTreeTables`, `rope_build_tree_tables`), as `rope_build_tables`
+makes a row at that position, bit for bit (`rope-tables`), so a tree row off
+its lane's first chain rotates at its own position; the cycle's start builds
+the draft's rows alone.
+
+A lane's verify block holds up to 16 rows (`SPLASH_TARGET_VERIFY_ROWS`): its
+anchor and the rows proposed after it, a tree, each row's place in it (its
+ancestors, parent and depth, `metal/abi/VerifyTree.h`) one entry per packed
+row, as many as the cycle's step gives the lane (above). What
+a cycle may hold follows the block's 16 rows: the KV it writes past the context
+(`SPLASH_SPECULATIVE_SCRATCH_TOKENS`, 15), the KV the engine holds for a lane's
+cycle and its reply captures, a block-sparse target's verify rows
+(`SparseKvShape::verifyRows`), and the decode arena: a step's 64 packed rows,
+which `DecodeArena::rows` views by a lane's `ops::LaneRows`, and the MoE plan of
+every step of 1 to 64 rows (`ExecutionPlans::moeWorkspace`), past 32 rows on
+32-row expert tiles (the 35B's: 5.2 MiB). The
+GDN decode (`verify_gdn_fused`) reads each lane's block from the device
+(`SplashLaneRows`) and its rows' tree. A chain's rows run the sequential
+delta-rule scan; a tree's rows each read the state before the block along
+their own path, the row's query carried up the path to the anchor (output =
+S z + the sum of each path row's value times its coefficient), with no state
+per row, and every row's convolution reads its path's tokens. Every row goes
+to the lane's tape, and the lane's next step folds the path it accepted, a
+row mask, into the state. Its kernels hold eight rows of a lane's block and of
+its pending path (`SPLASH_GDN_NARROW_ROWS`), or sixteen (`_r16`) for a step
+whose lanes may hold more (`ops::verifyLaneCap`) or one of whose lanes has a
+pending path of more, as a step of eight rows a lane after one of sixteen may
+(`ops::GDN::addDecode`); a pending path of at most eight rows runs on the
+8-row kernels whichever of its block's sixteen rows it holds. Over a layer's
+8-row chains the 16-row kernels took 13-19% longer (DRAM-cold, an M6), for
+their threadgroup memory. Attention
+stores a block's K/V at the slots of its rows, so that siblings never
+collide, and attends a tree row (`SplashAttentionParams::trees`, the dense and
+the sparse splits alike) to its position's window of the history (the
+anchor's position plus its depth) and, of its block, its ancestors and
+itself; a row of a block's second tile reads its ancestors' K/V from the
+slots the q/k projection wrote before the attention. After acceptance the cycle moves
+each lane's accepted path's K/V to the slots of their depths in every
+attention layer (`ops::PagedAttention::addPathCommit`, reading acceptance's
+`RetainedRows`), which moves nothing for a chain's path. Qwen3.8-Flash-Next's
+block indexer reads the same layout and keeps each row to its path
+([Sparse attention](#sparse-attention)).
 
 ### Kernel selection
 
@@ -466,56 +587,79 @@ every plan on every device). The KV cache keeps `--kv-format` either way.
 
 The rules:
 
-1. *Projection, prefill.* A chunk of up to `stagedPrefillRows` rows (64 on
-   Apple10 and on Apple9 GPUs of 10 cores or fewer, 32 on larger Apple9 GPUs)
-   runs the staged tile at its rows' height (8, 16, 32 or 64) with
-   `stagedSplits`; a longer one runs the 128-row prefill tile, unsplit, or,
-   with int8 activations on, on a row with `prefillInt8` (Apple10 and Apple11)
-   the [int8-activation tile](#int8-activation-prefill) where it takes every
-   quantized segment. A projection of several segments and no epilogue runs
-   them in one dispatch on the staged tile, in prefill as in decode, and those
-   of each format in one on the 128-row prefill tile; the int8 tile runs a
-   GEMM dispatch per segment beside the quantization of its input, which a
-   SwiGLU's gate and up share. (The segments of a format in one dispatch
-   took the 27B's fused inputs 6-11% less time at 65-128 rows but 1-3% more
-   at 512-2048, 12-core M6.)
-2. *Projection, decode.* The register tile runs where it takes every quantized
-   segment and the unit's `FormatClass` (`GridLookup`: IQ3_XXS, the IQ2 formats
-   and IQ1; `GridLookupOrQ2K`; `UnderFourBits`; `FourBitsOrMore`) is below its
-   `RegisterBoundary`: 4 x column tiles x lanes < belowQuarters x cores, a
-   one-pass-eligible gate/up pair's column tiles counting both tensors'. It
-   splits by `registerSplits`. Otherwise the staged tile runs, split by
+1. *Projection, past the decode tiles.* A plan's rows pick its tile, whatever
+   command runs it. A plan of more rows than the decode tiles hold (64) runs
+   the 128-row prefill tile, unsplit, or, with int8 activations on, on a row
+   with `prefillInt8` (Apple10 and Apple11) the
+   [int8-activation tile](#int8-activation-prefill) where it takes every
+   quantized segment. A gate/up pair runs there as a gate plan and an up plan
+   that applies silu(gate) (`Linear::addSwiGlu`). A projection of several
+   segments and no epilogue runs those of each format in one dispatch on the
+   128-row prefill tile; the int8 tile runs
+   a GEMM dispatch per segment beside the quantization of its input, which a
+   SwiGLU's gate and up share. (The segments of a format in one dispatch took
+   the 27B's fused inputs 6-11% less time at 65-128 rows but 1-3% more at
+   512-2048, 12-core M6.)
+2. *Projection, decode tiles.* A plan of up to 64 rows, a decode step's or a
+   prompt chunk's, runs them, its rows in table tiles of 8 (the last padded,
+   `tableTiles`). The decode tiles hold a step of four lanes of 16 on the
+   staged tile's heights; the register tile holds up to its four table tiles
+   (`kMaximumRegisterRows`, 32 rows), a one-pass gate/up pair up to
+   `kMaximumPairRows` (32) and the int8 tiles 16 or 32 rows
+   (`kMaximumInt8Rows`), and a plan past any of them runs the staged tile in
+   bf16 activations, a pair in two passes. A plan of at most `GGUF_COLUMN_ROWS` (2) rows runs the column
+   tile on every device (`kernels/decode/linear_gguf_column.metal`): each lane
+   one column of a GEMV in registers over those rows alone (the MoE expert
+   tiles' column tile, `kernels/common/gguf_column_tile.h`), eight simdgroups
+   of a threadgroup splitting K and adding their parts in order, a gate/up
+   pair of one format in one pass; on the M5 Max a [2048 x 6144] af4g64
+   projection at one row takes 18.4 us on the column tile and 28 us on the
+   staged tile. Otherwise the register tile runs where it takes every
+   quantized segment and the unit's `FormatClass` (`GridLookup`: IQ3_XXS, the
+   IQ2 formats and IQ1; `GridLookupOrQ2K`; `UnderFourBits`; `FourBitsOrMore`)
+   is below its `RegisterBoundary`: 4 x column tiles x table tiles <
+   belowQuarters x cores, a one-pass-eligible gate/up pair's column tiles
+   counting both tensors'. It splits by `registerSplits`. Otherwise the staged
+   tile runs at the fewest of 8, 16, 32, 48 or 64 rows that hold the plan's, split by
    `stagedSplits` (the Apple10 wave law also picks one or two passes for a
    pair of one format from `onePassFromCores`), its walks spread from
-   `spreadFromCores`, and one unsplit lane on the 16-row tile below
-   `sixteenRowBelowBits16` sixteenths of a bit per weight, and from there
-   under the wave law where its grid runs in as many waves of that tile as of
-   the 8-row tile, `sixteenRowWaves` at most; a pair's only where both its
-   tensors' own plans take it. A unit stages only where every quantized
+   `spreadFromCores`, and a plan of one table tile unsplit on the 16-row tile
+   below `sixteenRowBelowBits16` sixteenths of a bit per weight, and from
+   there under the wave law where its grid runs in as many waves of that tile
+   as of the 8-row tile, `sixteenRowWaves` at most; a pair's only where both
+   its tensors' own plans take it. A unit stages only where every quantized
    segment's class does: dense measurements were taken per projection. With
    int8 activations on, a unit whose quantized segments are all rotated in a
    format the int8 decode tiles take (`UnitFormats::decodeInt8Takes`: PQ2_0)
-   runs a staged plan of at least `decodeInt8FromRows` rows (16 on Apple10 and
-   Apple11, one lane's 16-row plan among them; never on Apple9) whose K splits
-   keep whole PQ2_0 blocks on those tiles, at the plan's splits and passes.
+   runs a staged plan that stores at least `decodeInt8FromRows` rows (16 on
+   Apple10 and Apple11, a 16-row plan among them; never on Apple9) whose K
+   splits keep whole PQ2_0 blocks on those tiles, at the plan's splits and
+   passes; their shortest height is 16 rows and their tallest 32.
 3. *Float projection.* The accelerator tile runs where the device has one,
    from `minimumRows` rows and a grid of its tiles of at least half the class's
    half tiles per core for BF16 values, F32 values or a quantized format's rows.
 4. *MoE.* Every GPU runs the experts on the staged tile, on 8-row tiles
-   while a prefill chunk's routes average at most one row per expert and
-   32-row tiles beyond. One plan per step serves every block, so its router
-   follows rule 3 in the format of most blocks' routers (`ops::moeRouterFormat`).
+   while a step's routes average at most one row per expert (a decode step's
+   of up to 32 rows of every family) and 32-row tiles beyond. One plan per
+   step serves every block, so its router follows rule 3 in the format of
+   most blocks' routers (`ops::moeRouterFormat`). Either tile's grouped rows
+   are the step's routes', packed (`ops::MoeScratch`).
 5. *Attention.* The kernels follow how a layout reads its pages
-   (`kv::Layout::reads`, below). A dense prefill tile takes one history split
-   per `AttentionCalibration::prefillPagesPerSplit` pages its rows read (32,
-   and 64 on Apple9 GPUs of 10 cores or fewer, where 32 made one measured case
-   slower than the shared splits), between the splits shared out over the
-   chunk's tiles and the longest chunk's tiles' ceiling (`PagedAttention.cpp`);
-   a sparse tile reads its list's blocks and keeps the shared splits. With
-   int8 activations on, over INT8 pages a dense split scores INT8 queries
-   (`q8q`) from `AttentionCalibration::int8QueriesFromPages` pages a split of
-   the longest tile or lane reads (8 on Apple10; never on Apple9, whose matrix
-   operations share the FP32 pipe); a verify's lanes share the choice.
+   (`kv::Layout::reads`, below). A sequence of one tile, a decode lane's of
+   up to 8 rows, takes one history split per 16 pages its rows read, between
+   32 and 128. Each tile of a longer sequence, a decode lane's of 9 to 16
+   rows too (two tiles), takes one per
+   `AttentionCalibration::pagesPerSplit` pages its rows read (32, and
+   64 on Apple9 GPUs of 10 cores or fewer, where 32 made one measured case
+   slower than the shared splits), at least 32 shared out over the
+   sequence's tiles and at most 32, nor 256 over its tiles (`PagedAttention.cpp`
+   `attentionSplits`): as many as a tile alone takes made sequences of two to
+   four tiles slower. A sparse sequence of more than one tile reads its
+   lists' blocks and keeps the shared splits. With int8
+   activations on, over INT8 pages a dense split scores INT8 queries (`q8q`)
+   from `AttentionCalibration::int8QueriesFromPages` pages a split of the
+   command's longest tile reads (8 on Apple10; never on Apple9, whose matrix
+   operations share the FP32 pipe); a command's sequences share the choice.
 
 The register-against-staged boundaries are measured table entries, not a
 cost model: the wave law, which describes the Apple10 staged tiles, does not
@@ -548,9 +692,9 @@ every projection
 
 - a prefill of the most rows, 2048, and one of each class of chunk whose
   projections run kernels of their own, of its fewest rows
-  (`ExecutionPlans::prefillRowClasses`): each staged tile height a chunk takes,
-  from 1, 9, 17 and, where `stagedPrefillRows` is 64, 33 rows, and the prefill
-  tile, from a row past `stagedPrefillRows`. These need no memory the first
+  (`ExecutionPlans::prefillRowClasses`): each decode tile and height a chunk
+  takes, from 1 (the column tile), 3, 9, 17, 25, 33 and 49 rows, and the
+  prefill tile, from 65 rows. These need no memory the first
   did not, and are required as it is. Every other kernel choice a chunk's
   rows make today has one threshold (the float tiles, the MoE expert and
   router tiles, the staged norm, the hyper-connection norm's quarters, and the
@@ -662,10 +806,10 @@ written slice of the input at once; the MoE experts, prefill, Apple9 and fewer c
 lockstep. There a dense gate/up pair whose tensors share their format may also decode in one
 dispatch (`LinearConfig::oneGateUpPass`), each simdgroup staging both tensors' columns, where
 the staged split law below takes it. Its output is bitwise the two passes' at the same K split;
-where its split differs from the two passes', its sums are reassociated. A step of three request
-lanes runs the 32-row tile over four lanes of storage. On Apple10 one lane runs the 16-row tile
-over two lanes of storage (`LinearConfig::sixteenRows`), its padding lane computed and
-discarded, where its staged plan is unsplit, and an unsplit gate/up pair, in one pass or two,
+where its split differs from the two passes', its sums are reassociated. A plan of 17 to 32 rows
+(three request lanes among them) runs the 32-row tile. On Apple10 a plan of one table tile
+(at most 8 rows, one lane's) runs the 16-row tile (`LinearConfig::sixteenRows`), its padding
+rows computed and discarded, where its staged plan is unsplit, and an unsplit gate/up pair, in one pass or two,
 where both its tensors' own plans do, since they size its storage: the lane's rows are bitwise
 the 8-row tile's, and a wave of most formats takes less time (MPP computes 16-row fragments).
 Below four and a half bits per weight (`sixteenRowBelowBits16`) a lane runs it whatever the
@@ -692,16 +836,16 @@ splits K most (the 35B's, the 122B's and Flash-Next's output projections, 1 to 1
 per core unsplit, in four or eight partitions) the 16-row tile takes 4-36% more time than the
 8-row tile at the same split on a 32-core M5 Max (IQ3_XXS, IQ2_XS and Q2_K, and IQ4_XS where it
 stages), against 2-8% less at 4 to 20 threadgroups per core on the M6 and 7% less to 2% more on
-the 27B's 5120-column projections in four on the M5 Max. Prefill runs the staged kernels on
-every class: the 128-row prefill tile (`LinearTile::GgufPrefill`; on Apple10 and Apple11 the
-[int8-activation tile](#int8-activation-prefill) where it takes the weights), and the staged
-tile for chunks of up to 32 rows. On Apple10 and on Apple9 GPUs of 10 cores or fewer chunks of
-33 to 64 rows run the staged tile's 64-row height too, which reads the weights once where the
-prefill tile costs about as much for 33 rows as for 64 (on the 10-core M4 12-22% less time than
-the prefill tile). A fused projection's staged chunk runs its segments in one dispatch, as
-decode does: a dispatch costs about 0.045 ms however narrow, and at 8 to 32 rows one dispatch
-takes 16-56% less time than one per segment on the 32-core M5 Max and 3-11% less on the 10-core
-M4 for the 27B attention and 35B GDN inputs.
+the 27B's 5120-column projections in four on the M5 Max. A prompt chunk runs the plans of its
+rows like any other command: those of up to 64 rows these decode tiles (the staged tile of its
+rows ran a 17408 x 5120 Q4_K chunk 1.8-2.9x faster than the prefill tile, 16-core M5 Pro, and at
+33 to 64 rows, where the prefill tile costs about as much for 33 rows as for 64, 12-22% less
+time on the 10-core M4); past them the 128-row prefill tile (`LinearTile::GgufPrefill`; on
+Apple10 and Apple11 the [int8-activation tile](#int8-activation-prefill) where it takes the
+weights). A fused projection's staged plan runs its segments in one dispatch: a dispatch costs
+about 0.045 ms however narrow, and at 8 to 32 rows one dispatch takes 16-56% less time than one
+per segment on the 32-core M5 Max and 3-11% less on the 10-core M4 for the 27B attention and 35B
+GDN inputs.
 
 Apple10's staged tile splits K across threadgroups, and runs a gate/up pair in one pass or two,
 by one wave law (`WaveLaw`, `runtime/ops/KernelSelection.cpp`), for decode steps and short
@@ -715,7 +859,11 @@ least `following`'s, since it starts as the one before drains. Each threadgroup 
 columns of a K step of the projection's bits per weight (`ProjectionShape::weightBits16`, the
 most a format stores where the formats are unknown, which bounds the scratch), and a split
 grid's threadgroups each also store their fp32 partials of the tile's rows, which the last
-partition reads back. The constants come from sweeps of 2 to 40 threadgroups per core on the
+partition to arrive at the tile's counter reads back (`kernels/common/split_reduce.h`, which
+the register tile's splits and the sampled draw's vocabulary ranges share): every thread
+fences its stores at device scope before its threadgroup arrives, and every thread of the
+last one fences again before it reads, since a barrier orders memory for its own threadgroup
+alone. The constants come from sweeps of 2 to 40 threadgroups per core on the
 32-core M5 Max, the 20-core M5 Pro and the 12-core M6 (`gguf-projection-benchmark`, which times
 a gate/up pair in both pass modes; MLX 4-bit and six GGUF formats at 2048 and 5120 inputs,
 gate/up pairs in MLX 4-bit): time per byte steps up past 10 and 16 threadgroups per core at one
@@ -781,7 +929,11 @@ out as column windows (`gguf::TensorRows::windows`), so slice s's rows of each p
 slice s - 1's (`moe_gguf_segment`). The select kernel names the routing's select suffix
 (`moe_route_select_f32_sigmoid_s2`), the grouping and expert passes its slices suffix
 (`moe_group_routes_s2`, `moe_expert_gguf_m8_down_s2`); the softmax router's one gated slice is the
-unsuffixed instances. The expert passes launch the live tiles alone: the grouping kernel writes each
+unsuffixed instances. The grouping packs the tiles' rows, a grouped row per route, each tile's after
+the tile before it's (`MoeTileDescriptor::first_row`): a tile's 8-, 16- or 32-row matmul reads past
+its live rows into the next tile's, or past the last tile into the `tileRows - 1` rows the scratch
+holds past the routes', and stores its live rows alone.
+The expert passes launch the live tiles alone: the grouping kernel writes each
 pass's grid with the tile count, and the pass reads it as an indirect dispatch
 (`ComputeDispatch::indirectThreadgroups`). They find a routed expert through the block's slot table
 and the chunks that hold its slots (`ops::ExpertChunks`): slot s below floor_slots is at place s of
@@ -794,13 +946,15 @@ block's the expert store's floor and elastic chunks of its size (`model/ExpertCh
 [Streamed experts](server.md#streamed-experts)). The staged tile runs gate and up in one pass, a
 gate and an up simdgroup on the same columns, bitwise the two passes' intermediate; the simdgroups
 share one pair table where gate and up share their routed and their shared formats.
-An expert's only tile of at most `MOE_GGUF_COLUMN_ROWS` live rows runs on the column tile
+An expert's only tile of at most `GGUF_COLUMN_ROWS` live rows runs on the column tile
 (`kernels/common/gguf_column_tile.h`) rather than the staged one, and the two sum a row's
 products in different orders: a route's output depends on how many rows the step routes to its
 expert, so decode results of GGUF MoE targets, the 35B's included, are not invariant to the
-batch (`kernels/common/moe_expert_slab.h`). Under the default `--verify-rows auto`, which rows a
-decode step routes also follows the verify budget ([Drafts](models.md#drafts)), which learns
-from timing and earlier requests, so a MoE target's decode results can differ between runs of
+batch (`kernels/common/moe_expert_slab.h`). Under the default `--verify-rows auto`, a decode
+step's rows also follow the step costs the start measured on the Mac, the cost of passes over
+history its cycles fit (`model::StepCosts::observeContext`; a streamed-expert target's, the
+cost line its cycles fit, `model::CostLine`) and the acceptance the verify budget learns from
+earlier requests ([Drafts](models.md#drafts)), so decode results can differ between runs of
 one request.
 The float router, QSA indexer and alpha/beta projections run in `kernels/shared/gguf_float.metal`,
 which runs two projections of one input in one dispatch where they take the same tile (the
@@ -872,17 +1026,15 @@ up in one pass `gguf_decode_<format>_m<rows>_gate_up`, and
 leading inputs of wider rows), the register ones `gguf_decode_sg_<format>_l<lanes>_<e>`, and the
 experts' gate and up in one pass `moe_expert_gguf_m<rows>_gate_up` and their down pass
 `moe_expert_gguf_m<rows>_down`; the fused projections run
-`gguf_decode_fused_m<rows>` and `gguf_decode_sg_fused_l<lanes>` in decode and, on Apple10 and on
-Apple9 GPUs of 10 cores or fewer, in prefill chunks of 33 to 64 rows (`gguf_decode_fused_m64`),
-and in longer prefill chunks one `gguf_prefill_<format>_a` per format over that format's
-segments (or, on the int8-activation tile, `gguf_prefill_int8_quantize` and one
+`gguf_decode_fused_m<rows>` and `gguf_decode_sg_fused_l<lanes>` in decode and in prefill chunks
+of up to 64 rows, and in longer prefill chunks one `gguf_prefill_<format>_a` per format over that
+format's segments (or, on the int8-activation tile, `gguf_prefill_int8_quantize` and one
 `gguf_prefill_int8_<format>_a` per segment). A `gguf_decode_fused_m<rows>` pipeline decodes
 its segments' formats alone, and a `moe_expert_gguf_m<rows>` pipeline its pass's routed and
 shared formats alone, which specialize it as Metal function constants
 (`ComputeDispatch::constants`, a pipeline per name and values), so its first use compiles a
-loop for each of those formats rather than for all 44. The norm, GDN, attention-gate and
-attention-gather variants that also write the register kernels' input table carry `table16` in
-their names. The epilogue kinds of both GGUF families are in `kernels/common/gguf_tile.h`, the
+loop for each of those formats rather than for all 44. The norm, GDN and attention-reduce
+variants that also write the register kernels' input table carry `table16` in their names. The epilogue kinds of both GGUF families are in `kernels/common/gguf_tile.h`, the
 SiLU and sigmoid every kernel shares in `kernels/common/activation.h`, and the MMA helpers every
 register kernel uses, GGUF or fp32, in `kernels/common/sgmatrix.h`.
 
@@ -913,11 +1065,13 @@ format's up and the prefill tiles, each output inside the fp64 bound of
 `GgufFormatReference.hpp`, the one-pass gate/up bitwise against the two passes at the same K
 split, one lane on the staged 16-row tile bitwise against the 8-row tile, and, where the device
 row takes int8 activations, rotated PQ2_0 on the int8 tiles within the fp32 rounding of the exact
-products of their codes, lanes and pass modes bitwise, and a non-finite input's row alone not
-finite; and
+products of their codes, lanes and pass modes bitwise, a non-finite input's row alone not
+finite, and a plan of one or two rows on the column tile in every format and in fused
+triples within the bound, the rows past its own unread and unwritten; and
 `gguf-moe`: the float projections on both float tiles and the MoE layer on every GGUF
 plan, the staged 8- and 32-row tiles, in every format as each routed and shared expert tensor,
-against fp64, bitwise against the full grids and two gate/up passes, and with the experts in
+against fp64, bitwise against the full grids and two gate/up passes, a decode step routing its
+lanes' rows alone, no row of no lane, and with the experts in
 permuted slots across a floor chunk and elastic chunks of other, few slots, the last of fewer,
 bitwise as in one chunk, and in an expert store's slots of one size across such chunks, bitwise
 as in their own layout, and refuses floor and elastic chunks one unit short, slots narrower than
@@ -965,24 +1119,46 @@ the repack of streamed experts into their slots (`moe_expert_load`, 1 to 32 jobs
 into an image (`gguf_repack`) in the streamed formats, each plane checked bytewise against the
 reference repack.
 
-Target attention runs the geometries of `kCompiledAttention` (`runtime/ops/PagedAttention.cpp`):
+Target attention runs once a layer for every sequence of a command, a decode step's lanes as a
+prompt chunk's sequences (`ops::PagedAttention`, `SplashAttentionSequence`): one q/k projection
+over all their rows, each sequence's queries staged after the one before it, and a split and a
+reduce for each run of sequences whose tiles' splits fit the workspace (`ops::AttentionPlan`),
+each sequence's split count its own bound's and history's. Every kernel
+reads a sequence's rows from the command's layout (`ops::AttentionRows`, a `SplashLaneRows` a
+sequence): a prompt chunk's as its host writes them (`PrefillTensor::LaneLayout`), a decode step's
+as its selector writes them on the device (`DecodeTensor::LaneLayout`), each within its bound, its
+chunk's `chunk_tokens` (a prompt sequence's rows, a decode lane's cap), which sizes everything
+the host lays out for it: its staging, page table, tiles of 8 rows, partial slots and lists. The
+per-row kernel (q/k norm and RoPE) takes a grid of each sequence's rows up to the largest bound, a
+threadgroup reading its sequence's layout entry once, and a row or tile past its sequence's rows
+writes nothing. The projection's K-head threadgroups also store their row's key
+and value in its page slot through the sequence's page table (`splash_store_kv_slot`: INT8 at a
+scale per row and head of the largest magnitude over 127, or BF16 as it is), so the attention
+reads every row's K/V from the pages with no store of its own: the projection's kernels are
+compiled for each page format (`attention_q8_qkv…`, `attention_bf16_qkv…`). It
+runs the geometries of `kCompiledAttention` (`runtime/ops/PagedAttention.cpp`):
 query heads over KV heads of a head dimension (`_d128` in the names of 128-wide heads' kernels;
 256 is unnamed) in a value order, each compiled with the variants its layers take, which a layer
 selects with an `ops::AttentionVariant`. Its queries and keys are rotated by the geometry's
 RoPE, or not (NoPE: `qkv…_nope`, which binds no tables); and each row attends its whole history,
 or a window of the keys before it (`…_w512`: a row at position p attends p − 512 to p). A
 windowed split and reduce start at the page of their tile's first row's window start
-(`splash_attention_first_page`), each row masking the keys before its own, and a windowed verify
-lane's or prefill tile's splits stop at the 18 pages such a window reads
+(`splash_attention_first_page`), each row masking the keys before its own, and a windowed tile's
+splits stop at the 18 pages such a window reads
 (`kv::windowAttentionPages`). Over INT8 pages each dense split kernel (`…q8_split…`) also has a
 `…q8q_split…` entry, `q8q` for INT8 queries: it quantizes its tile's queries once (absmax / 127
 per row, by the int8-activation rule) and scores them against the INT8 keys (kernel selection,
 rule 5). A geometry
 with learned sinks (`reduce…_sinks`) binds the layer's, an F32 per query head, to the reduce,
-which adds each to its row's softmax after the splits, in their order, as a key with no value;
-one without an output gate (`gather`) gives the out-projection its attention rows as they are.
+which adds each to its row's softmax after the splits, in their order, as a key with no value.
+Each reduce writes its rows as the out-projection's input (`ops::AttentionOutputRows`,
+`splash_attention_output_row`): each row of a geometry with an output gate times the sigmoid of
+its query head's gate in its packed row, of one without as it is, at its packed row, or of a
+prefill's last layer each sequence's last row alone as row s; and where the out-projection reads
+a table (`…_table16`), the table and its sums too. No attention row is staged, and no gate runs.
 The RoPE tables are of the target geometry's pairs (`rope_build_tables`, or
-`rope_build_tables_p64` for 64). `make test-engine-metal` runs `attention-variants`, every
+`rope_build_tables_p64` for 64; a decode cycle's `rope_build_tree_tables*`). `make test-engine-metal`
+runs `attention-variants`, every
 variant through the production encoders against fp64, and
 `make benchmark-attention-sweep ATTENTION_SWEEP_ARGS='--shapes flint-window,flint-full'` times
 Flint's two kinds of layers with their sinks: a window of 512 keys with RoPE, and the whole
@@ -1062,15 +1238,41 @@ simdgroup from ballots (`kernels/shared/block_indexer.metal`). The pending keys,
 the raw keys of the up to 3 tokens of the block a sequence has not completed,
 are its state's (after the PLE history in a state cell,
 `QwenTargetDimensions::indexerPendingBytes`): a prefill writes them after its
-rows and at each state it captures, and a verify's commit after the rows the
-lane retained, so a block a rejected row completed is pooled again by the
-next step from the committed tokens. No page holds a raw key. Queries and
+rows and at each state it captures, and a verify's commit after the path the
+lane accepted. No page holds a raw key. Queries and
 pooled keys rotate by the same target RoPE row (`target_rope_pair`, the
 queries' from the step's tables, a pooled key's at its block's first token),
 with YaRN's frequencies and attention factor when YaRN is on. A row's
 scores and bitmap cover every block of the window the model serves; a prefill
 chunk scores its rows in batches that keep the native window's score scratch,
 256 rows at 256K, 64 at 1,010,000.
+
+A prompt's rows are committed as they run, so the blocks they complete go
+into the index. A verify lane is a block of rows from its anchor, a chain or a
+tree whose layout the step's proposer writes on the device (`SplashLaneRows`,
+`SplashTreeRow`), which the verify's indexer kernels read
+(`ops::BlockIndexer::addTreePool`, `addTreeSelect`): a row's position is the
+anchor's plus its depth, so siblings share positions, and a block one of its
+rows completes holds that row's path's tokens. The row pools it from its path
+(its parents' raw keys back to the anchor, then the pending keys) into its own
+block key, and nothing enters the index during the verify. A row scores the
+blocks complete before the anchor from the index, and the blocks its path
+completes from its path's rows' block keys, in a tile of the same MPP product
+whose keys are the lane's rows' block keys; MPP gives a product's element the
+same bits wherever it sits in the tile (qwen4-kernels checks it on Apple9 to
+11), so a chain's rows score and select bit for bit what its tokens decoded
+one a step would. A row's bitmap names the
+blocks of K/V slots it reads: below the anchor's block the blocks it selects,
+from there on the blocks of the slots of its path's rows in blocks it attends,
+which its row mask names (`ops::AttentionBlocks::rowMasks`, a bit per row of
+its lane), and the sparse split keeps a tree row inside those blocks to its
+ancestors that its row mask holds. Since the anchor's block holds the slots of
+the lane's first rows, whose positions fall in it whatever their depths, its
+bit is that block's own. Once acceptance has written each lane's path
+(`RetainedRows`), one commit (`block_indexer_commit`) writes the block keys of
+the path's rows that complete a block into every layer's index and the lane's
+pending keys after the path, so a block a rejected row completed is pooled
+again by a later step from the committed tokens.
 
 A layout whose attention reads the blocks its index selects
 (`kv::Layout::reads`, `Reads::SelectedBlocks`, which the family layout sets
@@ -1082,7 +1284,7 @@ index, and only its pages can spill (`kv::Layout::spillable`). It runs
 kernels compiled for 24 query heads over two KV heads (Qwen3.8-Flash-Next's):
 a query row attends only to the blocks of 4 tokens its block mask names
 within its causal history, the mask a bitmap per row over the history's
-blocks (`metal/abi/PagedAttention.h`). The rows of a tile (a verify lane's 8,
+blocks (`metal/abi/PagedAttention.h`). The rows of a tile (8 of a verify lane's,
 or 8 of a prefill chunk's) attend through one list, the union of
 their blocks in block order, each entry a block and the rows of the tile that
 attend it (`attention_block_lists`, `ops::PagedAttention::addBlockLists`).
@@ -1106,8 +1308,10 @@ selections make, and `pages`), and `--qsa indexer` the indexer itself before
 them; each case reports the mean entries of its lists.
 
 Where some of a verify's listed blocks are on the SSD, a host step after the
-layer's selection resolves each lane's list through the hot block cache
-(`KvBlockCache::addResolve`) into a location per entry: the block's place in
+layer's selection resolves each lane's lists, one a tile of its rows at the
+step's lane cap, the lanes' one after another and a tile past a lane's rows
+empty, through the hot block cache (`KvBlockCache::addResolve`) into a
+location per entry: the block's place in
 the cache, or `SPLASH_ATTENTION_PAGED` for a block its page holds. The located
 split (`AttentionBlocks::locations` and `locationPages`) reads each block where
 its location says, and a command none of whose lanes reads spilled KV encodes
@@ -1160,10 +1364,27 @@ follows:
   (`LatentAttention::SplitKeys`), and the groups through the sequence's page
   table. A prefill stores each source's groups as its rows complete them, of
   the open group's projections too, and writes the rings and open group after
-  its rows and at each state capture. A verify stores the groups of all its
-  rows, which the next step's rows overwrite where they were not retained, and
-  leaves the state to its commit, which writes each lane's rings and open
-  groups after its retained rows from the step's latents and projections.
+  its rows and at each state capture. A decode step stores the groups of all
+  its rows, which the next step's rows overwrite where they were not retained,
+  and leaves the state to its commit, which writes each lane's rings and open
+  groups after its retained rows (the row mask its acceptance wrote, a chain's
+  first rows) from the step's latents and projections.
+- A decode step runs through the target's own layer loop (`addPrefill` with a
+  decode chunk), as main's targets do, over lanes whose rows are chains: each
+  row's path is every earlier row of its lane, which the ring and the open
+  groups assume. Its proposer packs the step's rows on the device
+  (`ops::DraftSelector::addVerifyRows`); the target gathers them into lanes of
+  the step's lane cap of rows each (`deepSeek41LaneStride`,
+  `LatentAttention::addLaneRows`), with their positions and each lane's row
+  count, past which its rows attend nothing and route no expert, and scatters
+  its final norm's rows back for the head. A lane's rows so run alike whether
+  a draft proposed them or not. DSpark's tree is the chain of its proposals
+  (`dspark_tree`), its confidences their draft probabilities, or a host chain
+  in their place: the tokens a grammar or a thinking end forces, or a lookup
+  chain where its chances promise more than DSpark's last tree; without a
+  draft a lane's tree is its anchor and its host chain. Neither draws
+  children, so a sampled row draws from the target's distribution and a lane
+  keeps a proposal where it is that draw.
 - A prefill runs a layer's queries, attention and output projections in tiles
   of 256 rows, each sequence's rows of a tile through its indexer in pieces
   whose scores of every group fit 64 MiB. Its indexer layers wait for the
@@ -1175,12 +1396,10 @@ follows:
   values, in 8x8 simdgroup matrices (`latent_attention_scores_mma`,
   `latent_attention_values_mma`: bf16 products and fp32 weights summed in
   fp32), 6.7 times faster at 256 rows than the passes a decode's few rows
-  take, which split their keys into parts instead. The model has no draft: a decode
-  cycle verifies each lane's anchor alone, and attends its anchor's row
-  alone, as the rows after it repeat it.
+  take, which split their keys into parts instead.
 - The runtime's arenas hold no paged attention's scratch for it
   (`QwenTargetGeometry::pagedAttention`): the target keeps its own, a
-  prefill chunk's and a verify's, beside them (`qwenTargetScratchBytes`).
+  prefill chunk's and a decode step's, beside them (`qwenTargetScratchBytes`).
 - The Engram layers' table rows stream from the split GGUF's last part, one
   table of every Engram layer's heads whose hash the metadata states; each
   layer's offsets count from its own first row, where the metadata's
@@ -1188,8 +1407,8 @@ follows:
   ([PLE table streaming](server.md#ple-table-streaming), the same `SparseRowStore`): a
   prefill hashes its rows' n-grams on the host and stages their rows before
   its command, and reads the next command's rows ahead while it runs; a
-  verify hashes them on the GPU from each lane's prior tokens and stages them
-  in a host step of its command. They never load whole: `--ple-memory off` is
+  decode step hashes them on the GPU from each lane's prior tokens and its
+  gathered rows and stages them in a host step of its command. They never load whole: `--ple-memory off` is
   refused (`StreamedPart::streamsOnly`).
 
 ## Neural Engine prefill
@@ -1238,8 +1457,10 @@ then makes of it: a split that failed leaves the GPU alone at the same context,
 and the memory the split would hold stays with the KV cache. Every start of a
 model on a Mac that takes one calibration so serves the same context; one
 calibrated anew may serve another, after the split lost to the GPU alone, which
-forgets the calibration (below), after a start whose calibration failed and
-left none, or once macOS cleared the directory that keeps it. The server's
+forgets the calibration (below), after the Neural Engine refused a remembered
+split, which leaves the next start to calibrate again (below), after a start
+whose calibration failed and left none, or once macOS cleared the directory
+that keeps it. The server's
 relaunch of the engine after a failure keeps the first engine's context
 whatever it calibrates: the server passes that context
 (`serve-native --relaunch-context`) beside the first engine's `MAX_CONTEXT`,
@@ -1273,24 +1494,50 @@ staged. It fits `T(s) = max(A(s), G(s) + u·A(s))`
 timings; A, the ANE's part, proportional to its channels through the split
 layer at 0.8, where the ANE's part takes the longer on every Mac measured; and
 u the bandwidth the ANE's part takes from the GPU's beside it, the split
-layer's excess over G at 0.4 where G takes the longer there (on the M6 the
-GPU's part runs a tenth to a third longer beside the ANE's). It takes the units
+layer's excess over G where G takes the longer (on the M6 the GPU's part runs
+a tenth to a third longer beside the ANE's at 0.4). It takes the units
 whose T, or T a unit either way, is least at its longest, since the timings can
 put T's least a unit off: a unit past where the ANE's part takes the longer
 costs the ANE's time per unit, a unit short of it the GPU's, and on an M5 Max
 and an M5 Pro the ANE's is the longer (1.7 ms a unit of the full-chunk layer
 against 0.6 and 1.1 ms), on an M6 the GPU's (1.9 against 1.2 ms), all with
-`--activations bf16`. On Qwen3.8-27B that takes 8 of the 34 units on an M5
-Max, 14-15 on an M5 Pro and 25-26 on an M6 with `--activations bf16`, the best
-each Mac's sweeps measured. By default the int8-activation tile makes the
-GPU's part faster, so the split takes fewer: 10 on a 20-core M5 Pro (the M5
-Max and M6 unmeasured). The split runs if T there gains 5% on the GPU alone. A
+`--activations bf16`. It fits u at 0.4, then again at the units it chose,
+nearest T's least, from their split's full-chunk layer timed as the fit's were,
+on the same four layers (a mixed quantization can give the model's first
+layers other formats than the rest's, which would bias u); where that fit
+chooses other units, their split is prepared
+and timed in turn, and serves if it splits every chunk the first splits, none
+of them more than 2% longer, the first otherwise, as where the refit's split
+cannot be timed or the other split prepared (a first split that does not
+prepare again leaves that start the GPU alone and the calibration of the first
+units remembered for the next): the refit took Qwen3.8-27B
+UD-Q4_K_M from 9 of its 34 units to 10
+on an M5 Max, whose full chunk prefilled 1.5-2.0% faster but which split
+chunks from 780 rows against 575, so that chunks of 640 and 672 rows ran 12%
+slower, and 9 serve. Where the ANE's part takes the longer already
+at 0.4, as on a 32-core M5 Max by default, 0.4 leaves u at none and T short of
+its least comes out too short: half the calibrations of Qwen3.8-27B took 6
+units, which prefill chunks of 1,024 to 2,016 rows 1.4-1.5% slower than 7,
+while the split layer of 6 units (13.8 ms against G's 13.2: u = 0.06) chooses
+7. On Qwen3.8-27B the calibration takes 8 of the 34 units on an M5 Max, 14-15
+on an M5 Pro and 25-26 on an M6 with `--activations bf16`, the best each Mac's
+sweeps measured. By default the int8-activation tile makes the GPU's part
+faster, so the split takes fewer: 10 on a 20-core M5 Pro and 7 on a 32-core M5
+Max (the M6 unmeasured). The split runs if T there gains 5% on the GPU alone. A
 start calibrates the split once for a Mac, a model, a macOS version, an engine
 build, `--activations` and the most units its memory plan holds, and remembers
 what it found (`remembered-*` in the cache directory below): the units, the
 least chunk and the GPU alone's layer at 512 and 2048 rows, or that no split
 gains enough. Later starts take it untimed: they build the split, check it as
 below and serve, in 0.6 s on an M5 Max, 0.9 s on an M5 Pro and 1.4 s on an M6.
+Beside it the start keeps how often the Neural Engine refused a split
+(`ane::Refused`: its service did not compile, load or run the program, or the
+check below failed): the first refusal of a remembered split leaves the next
+start to calibrate again, and the second, of a split calibrated, remembered or
+calibrated again, leaves the GPU alone, uncalibrated, until the key changes.
+Any other failure to build the split, as Metal refusing memory, keeps the
+calibration: that start runs the GPU alone, and the log says what the next
+start does.
 Across many starts over hours of prefill on those three Macs the timings chose
 the same units within their noise, while timing every start cost 3-8 s, and a
 start whose timings strayed could change the share, each share compiling a
@@ -1303,10 +1550,17 @@ ANE's output filled with NaN first so that rows it leaves unwritten show,
 against the leading rows of a full chunk on the GPU alone, which computes every
 row alike whatever the chunk's rows. The outputs must be finite and differ from
 the GPU's by at most 10% of what the ANE adds over the GPU's part; int8 leaves
-2.5-2.8% on Qwen3.8-27B. A start that calibrates then times the GPU's FFN layer
-alone at 512 and 2048 rows and the split layer of every function as above, and
-splits the chunks from the least rows from which every larger chunk's split
-layer takes at most 2% longer than the GPU's at the chunk's rows. Every row
+2.5-2.8% on Qwen3.8-27B. A start that calibrates first times the GPU's FFN
+layer alone at 512 and 2048 rows and the split layer of every function, on a
+split of its own over the four layers the fit timed, as many to a command, so
+that the splits it compares are timed where it fitted them; and it splits the
+chunks from the least rows from which every larger chunk's split layer takes at
+most 2% longer than the GPU's at the chunk's rows. Six calibrations of
+Qwen3.8-27B MLX 4-bit on the Studio (M5 Max) timed each function's split layer
+within a range of 3.2% of its mean for the median function, 6.1% at most,
+where over the model's first layers, about 4,096 rows of layers to a command,
+it was 3.6% and 10.9%; both chose 7 units, from 822-1,028 rows against
+816-1,313. Every row
 count is checked, since a batch's chunk sums its lanes' rows: an evaluation
 costs the ANE its function's rows, which a chunk pads up to, and the functions
 do not cost it in proportion to their rows (on an M5 Max 640 rows take 93% of
@@ -1367,7 +1621,8 @@ on Qwen3.8-27B); `splash serve --disable-ane` keeps the FFN on the GPU, and
 `ane-ffn-calibration`, the fit, the choice, the least chunk, a calibration's
 line of text and the breaker on timings it is given, also under the sanitizers,
 and `ane-ffn-startup`, each outcome of a start on a model it plays, a
-remembered calibration among them, the automatic context, the same in each
+remembered calibration and one whose fit at the units it chose moves them among
+them, the automatic context, the same in each
 where the split may run, and a relaunch's, which holds the first engine's
 context where a calibration made anew would serve another.
 `make test-engine-metal` runs `ane-ffn`: its kernels
@@ -1660,9 +1915,15 @@ Every claim walks one order. A unit the claim's rights (`TakeRights`) do not
 take is skipped, not a stop:
 
 1. Idle state buffers beyond those the next lane starts from, and those
-   too under macOS's critical pressure.
-2. Cached units that free memory now (copied, dead or needing no write), in
-   the cache's one order (`Cache::walkFor`).
+   too under macOS's critical pressure. Qwen's pool keeps a lane's buffers
+   for the next start only while no lane is in service: beside one that is,
+   whose own the next start takes once it ends, it keeps none, since a lane's
+   cells serve no cached state (after two concurrent chats at a 22 GB limit
+   another lane's kept beside one in service left 22 cached 4K-token chats
+   where 24 fit).
+2. Cached units that free memory now (copied, dead or needing no write, a
+   reply's opportunistic state among them), in the cache's one order
+   (`Cache::walkFor`).
 3. Caches the model rebuilds on use: the vision encoder's scratch, images'
    encoded rows, idle history staging, and the hot block cache while no lane
    reads above its floor.
@@ -1727,12 +1988,24 @@ again, on Qwen3.8-Flash-Next a pass of the routed experts, which stream, and 14
 cuts made a 237K-token prompt past the memory wall 8% slower to its first token.
 
 The resume point is the newest ordinary state in RAM (`StateCache::resumePoint`),
-the one a conversation's next turn most likely resumes from. A claim of no
-certain reuse passes over it; one with it takes it in its recency order, and
-so does the host's pass under critical pressure. Every state a reclaim takes
-from RAM is written to the SSD cache first while the tier takes the write, so
-a resume point that goes keeps its SSD copy: its next turn starts with a
-restore read rather than a prefill.
+the one a conversation's next turn most likely resumes from; the chains queued
+requests will restore are of certain reuse too. Only the KV of the lanes in
+service is never taken: every other claim takes certain reuse in its recency
+order, starts and the host's pass among them, but a pool's growth, which takes
+none, and optional work, which takes the resume point alone. That is vLLM's
+rule, whose cached blocks no running request references stay in its free queue
+and go in LRU order as blocks are allocated, and SGLang's, whose radix cache
+locks only running requests' paths and evicts unlocked leaves; kept from starts
+and the host's pass, queued chains made sessions arriving together take turns
+(#758). The host's own pass takes certain reuse only while a start it refused
+waits, or at critical pressure: a pass for its margin alone, which other
+applications' growth asks for, keeps it with the SSD cache or without, so an
+idle conversation's next turn finds it in RAM. Every state a reclaim takes
+from RAM, but a reply's opportunistic state
+(below), is written to the SSD cache first while the tier takes the write, with
+the KV it restores through, so a resume point or a queued chain that goes keeps
+its SSD copy: its turn starts with a restore read rather than a prefill. With
+no SSD cache it is dropped and prefilled again, as in vLLM.
 
 The engine's own optional work (the Index runway's refill with no Spill lane in
 service, trims with no lane in service) takes no unit at all: its rights are the
@@ -1764,7 +2037,7 @@ target with an SSD cache that takes writes), else 0.85 of its slots;
 `--expert-memory` sets it exactly. The stores are sized before the start
 knows whether the run spills; a store above its smallest size laid out for a
 spill the final plan does not make loads again at 0.85, while one at its
-smallest size is all its floor at either share (`holdsStores` in
+smallest size is all its floor at either share (`keepsFloor` in
 `runtime/engine/RuntimeResources.mm`). No claim takes the store below its
 floor.
 After the host's pass a pool grows one unit, an elastic store chunk of about
@@ -1830,13 +2103,23 @@ run can spill, a Resident lane, decoding or between the commands of its
 prefill, whose own KV growth the engine's limit refuses converts itself to
 Spill when its eligible pages (`Cache::convertiblePages`) times a Full page
 less an Index page, less the first lane's hot block floor
-(`Model::hotFloorBytes`), cover the missing bytes: about 46K tokens on
+(`Model::hotFloorBytes`), cover the missing bytes: about 62K tokens on
 Qwen3.8-Flash-Next. It needs the SSD cache's quota for its pages and a free
 page in the Index runway, an extent kept while spilling is possible
-(`Engine::spillLanded`). Its claim then waits for its copies and releases its
-pages as they land (below), and it follows the Spill rules ([KV on the
-SSD](server.md#kv-on-the-ssd)): a prefill goes on as a Spill lane's, its
-later commands planned in that shape. No other claim converts a lane.
+(`Engine::spillLanded`). The conversion's take then releases its pages as a
+Spill lane's (below, `Engine::EngineVictims::take`): at once those whose copies
+landed, a chain it restored or the copies written ahead, so the lane runs in
+the command it converts for; its claim waits only for the copies its
+conversion starts, and releases those pages as they land, which a decoding
+lane's next prefill unit waits for up to the time of a unit ([prefill and
+decode scheduling](#prefill-and-decode-scheduling)). Waiting for the
+claim's retry instead, a decoding lane beside a prefill in passes lost the
+decode command after a pass and its gap held two passes, 1,066 ms against the
+838 ms of one pass and a decode command in engine-sim's Studio churn, where
+the cache had copied every page of its history. It then follows the Spill
+rules ([KV on the SSD](server.md#kv-on-the-ssd)): a prefill goes on as a
+Spill lane's, its later commands planned in that shape. No other claim
+converts a lane.
 
 **Releases** (`Engine::EngineVictims::releases`, `Cache::releasePages`). A Spill
 lane writes each committed page to the SSD cache and keeps it Full, so it
@@ -1859,14 +2142,14 @@ pages, whose Full extents then leave and whose bytes refill the Index runway: a
 page frees its Full bytes less its Index page's, so a growth's 108.5 MB extent
 and a prefill's 40 MB of staging release 512 pages, two extents, on
 Qwen3.8-Flash-Next. Its take gives the claim what it frees net of those reads,
-as its count does: taken gross, a claim of two lanes' releases kept a 390 MiB
+as its count does: taken gross, a claim of two lanes' releases kept a hot block
 floor less for each than it counted. Where the lane's pages run short of a
 whole extent, the free Full pages compaction gathers with them complete it
 (`Cache::releaseBeside`): those of the extents that hold pages, less those the
 claim's attempt takes, and none where the pages only the cache holds would
 complete an extent with them, which its reclaims or its demotions as they land
 count then. Counted without them, a lane on a finished lane's prefix, its 511
-releasable pages beside 3 free ones, lacked the 390 MiB hot block floor it gets
+releasable pages beside 3 free ones, lacked the hot block floor it gets
 alone. It moves pages only where the runway's
 first moves empty a Full extent, and only as many extents of them as compaction
 can empty, since a page in transfer pins its extent (`Cache::releaseMoves`):
@@ -1900,7 +2183,7 @@ count as memory on its way back. `/status` counts the releases that freed what
 they were for and their pages (`kv_spill.releases`, `released_pages`).
 
 **Hot block cache** (`HotBlocksPool`, `runtime/model/ModelPools.hpp`). The
-floor, 4,096 slots a layer for each decoding lane that holds one and 4,096 more,
+floor, 8,192 slots a layer for each decoding lane that holds one and 4,096 more,
 in whole extents, is taken all or none as a lane holding Index pages decodes
 (`KvBlockCache::reserveLane`). The cache grows toward `--sparse-kv-memory` only
 while a lane holds a floor, and is a rebuilt cache while no lane reads above the
@@ -1966,7 +2249,8 @@ units that free now past an uncopied one before it waits for that unit's
 write, which stays at the head for copies ahead of need to make.
 
 Reclaim writes every state it evicts to the SSD cache, checkpoints and points
-a conversation went on from too, and the SSD cache keeps them by its own LRU.
+a conversation went on from too, but a reply's opportunistic state, which it
+drops, and the SSD cache keeps them by its own LRU.
 A state's write copies it into the one staging buffer, so while no other write
 holds that buffer its RAM frees at once, and with it the blocks of its chain
 that already have a copy; a claim that cannot wait takes it too. What frees
@@ -2055,9 +2339,10 @@ restarting while the long request works (below).
 `/status` shows it: `admission.held_behind_refusal` counts the wanted starts
 held back untried (above), `memory_governor.growth_allowed` and
 `host_headroom_bytes` show whether
-and how far the host lets the engine grow, and `state.idle_gdn_cells`,
+and how far the host lets the engine grow, `state.idle_gdn_cells`,
 `idle_draft_rings` and `idle_context_windows` count the pooled lane buffers a
-start can take. A request's `timeout`, or `--request-timeout`, bounds the wait.
+start can take, and `idle_cached_cells` the pooled cells a captured state
+takes. A request's `timeout`, or `--request-timeout`, bounds the wait.
 
 After a suspension, suspended requests resume before new work of their priority
 or below, one at a time, higher priority first and then in the order they
@@ -2068,7 +2353,12 @@ refused, or waits for scheduling, no suspended request resumes. When every
 lane is taken, or a new request's start is refused memory that no copy being
 written to disk is about to free, the resident of the lowest priority below it
 is suspended for it (`cache.priority_suspensions` in `/status`) and resumes
-once a lane and its memory are free. A new request below the priority of a running lane neither
+once a lane and its memory are free. A request that takes a lane starts in it
+at once: the next command is its prompt's, before any more work of the lanes
+that remain, and a command between its passes that the suspension gave up runs
+again only after it (on a 32-core M5 Max a Foreground prompt under four
+Background decodes starts 63 ms sooner at the 27B's command times, 25 ms at
+the 35B's). A new request below the priority of a running lane neither
 starts nor takes a lane until no lane of that priority runs, since it could not
 run before.
 
@@ -2095,7 +2385,10 @@ growth into free room.
 
 A request keeps its reusable model state at the last whole 32-token page before
 its generation prompt, the text a chat template appends to open the reply: the
-next turn may render it differently, so a follow-up resumes from there.
+next turn may render it differently, so a follow-up resumes from there. When it
+ends, it also keeps one at the last whole page of the tokens its reply holds KV
+of (below), where a follow-up whose prompt renders the reply back token for
+token resumes instead.
 
 Until the request ends, suspended or not, that replay point is in use, and so is
 the KV it restores through. When the last request using it ends, the point
@@ -2160,40 +2453,144 @@ system prompt, resumes there instead of from the start. It stays only if the
 replay state fits beside it; refused memory, the replay state takes its buffers
 rather than another lane's checkpoint. With the SSD cache it costs a write as
 well: reclaim takes checkpoints first and writes the states it evicts to the
-SSD, this one too (153 MiB for 27B), and one published straight to the SSD,
+SSD, this one too (47 MiB for 27B), and one published straight to the SSD,
 when no RAM slot took it, stays there. These writes draw on the SSD cache's
 write budget when one is set, which drops them while it is spent, a suspended
 request's own too, and a full quota makes room for one by dropping the oldest
 copy, perhaps an older conversation's restore point.
 
-A cached state holds the target's GDN cell and the draft's context window, not
-the draft's rings: the context row of each of the 2048 positions the rings
-cover, from which every draft layer computes its keys and values, in 4-bit
-codes over groups of 64 values with each group's fp16 scale and minimum
+A cached state holds a cached cell of the target's GDN state and the draft's
+context window, not the draft's rings. The cached cell
+(`GdnStateLayout::cachedCellBytes`) keeps every layer's convolution rows and
+the auxiliary state as a lane's cell does, and each layer's recurrent state as
+int8 codes, each block of 32 values of a value row with a bf16 scale, the
+block's largest magnitude over 127 (`ops::StateCodec`): 38 MiB of the 27B's 47
+MiB state, where the FP32 state takes 144 MiB. The codes are made once as a
+state is captured and decoded once as it is restored, so the running state
+keeps its format; the relative error of a decoded state is 0.8 to 0.9% on the
+27B, 35B and Qwen3.8-Flash-Next alike. A block that holds NaN or an infinity
+gets a NaN scale and restores as NaN, every value of it, so a state that was
+not finite never comes back as one that is. A row's scale fits GDN, whose decay is per
+head: a scale per key column, across rows of very different size, had 2.4
+times the error and 6 to 10 times the effect on the next-token distributions.
+Lanes and cached states pool their cells apart (`QwenBufferPool`): a cached
+state's eviction returns a cached cell and a window, never a lane's cell, so
+`statesToActivate` counts states only for windows, and `idleBufferBytes` a
+cached cell's bytes for each.
+
+The window is the context row of each of the 2048 positions the rings cover,
+from which every draft layer computes its keys and values, in 4-bit codes over
+groups of 64 values with each group's fp16 scale and minimum
 (`DraftStateLayout::windowBytes`: 5.6 MiB for 27B and 2.25 MiB for 35B, where
 the rings take 40 and 48 MiB). Prefill keeps a lane's window beside its rings;
 a restore that continues the rings computes them from the window again at the
 start of the request's first prefill chunk (`DFlashDraft::addContextRebuild`).
-Decode writes the rings alone, so states are published only in prefill. A
-prefill chunk writes each state it captures inside its rows
+A prefill chunk captures each state at a row of its rows
 (`ModelBatchItem::stateCaptures`) into buffers reserved before it runs: every
-GDN layer's dispatches stop there to store the state and go on from it, and
-the state's window is a copy of the lane's as the chunk finds it plus the
-chunk's rows before the boundary, since the chunk's later rows take the slots
-of the state's oldest rows in the lane's window. A state at the chunk's end is
-copied from the lane after it. A target without GDN layers keeps no GDN state:
-its cells have no bytes, every lane and state shares one empty cell that holds
-no memory, so a lane holds the draft's rings and window and a cached state the
-window alone, and `state.idle_gdn_cells` stays 0.
+GDN layer's dispatches stop at a state inside the rows, store its convolution
+rows in the state's cell and go on from them, while the recurrent state goes
+on in the lane's cell in place, and a dispatch of the codec stores the codes
+of the state the layer reached there; the state's window is a copy of the
+lane's as the chunk finds it plus the chunk's rows before the boundary, since
+the chunk's later rows take the slots of the state's oldest rows in the lane's
+window. A state at the end of a lane's rows in the chunk takes its codes the
+same way; the rest of a state at the command's end is copied from the lane
+after it (`QwenStateStorage::copyBeside`). `snapshot` and a state written
+straight from a lane to the SSD run one command of the codec, and a restore
+one of its decode, between commands: a restore from RAM decodes the cached
+cell into the lane's, and one from the SSD reads the slot into the lane's other
+cell, which the lane's next transition writes before it reads it, and decodes
+it from there, its promoted RAM copy taking the codes as they came.
+
+Decode keeps each lane's window current with its rings too, and a cycle whose
+retained rows may reach the next whole page reserves that page's state, in one
+attempt that frees nothing for it (`Engine::reserveReplyCapture`); refused, the
+cycle captures none. A decode step leaves the rows it retains on the lane's tape
+for the lane's next step to fold into the GDN state, so the cycle folds the rows
+before the page alone and stores the result's codes in the state's cell
+(`ops::GDN::addFold`: the next step's arithmetic, then the codec's, so the
+codes are bit for bit those the codec makes of the state the next step holds;
+it reads the 27B's 144 MiB state and writes 38 MiB, where a fold into a lane's
+cell and the codec after it would move 470 MiB), and the state's window is a
+copy of the lane's plus those rows' context; the completion seals the state only
+where the lane retained those rows. Both writes are one function of the runtime
+(`encodeDecodeCaptures`), which names the rows a lane retained: the path of its
+rows its acceptance wrote, whose first rows before the page both take. Each such state is a rolling
+checkpoint of the reply that retires the one before it, which a preempted lane
+resumes from once its KV holds a token past it, and the last, once the request
+ends, is the reply's state: the point a next request whose prompt renders the
+reply back token for token resumes from, that of a reply cancelled or ended by a
+stop sequence too, as far as the prompt renders it back. The prompt's replay
+point stays the point its conversation resumes from, the one reclaim keeps as
+the resume point and the SSD cache copies ahead, which a retry or a next prompt
+that renders the reply otherwise resumes from.
+
+A reply's state is opportunistic (`StateCache::markReply`): reclaim takes it
+among the units that free for nothing, a checkpoint first in the cache's order,
+and never writes it to the SSD, as only a next prompt that renders the reply
+back resumes there, and a running reply's is replaced a page on. A capture at a
+page that holds a checkpoint already, a peer's prefill checkpoint or the state
+an identical earlier turn kept, reuses it as it is. A chat client
+that sends no reasoning back never renders a reasoning reply back: kept as
+ordinary states, the replies of 11 such chats served in turn at a 22 GB limit
+left their follow-ups 1 cached prefix of 22, where 1.6.2 left 18. Each block
+such a state was captured at keeps a mark (`KvCache::noteReply`) while the KV
+cache holds it, the state gone or not, and a request whose start's match
+reaches a marked block renders an earlier reply back (`CacheLookup::rendersReply`),
+as agent clients that send their reasoning back do: its end keeps its own
+reply's last state (`StateCache::keepReply`), a checkpoint reclaim writes as
+any, so its next turn resumes there after a reclaim too, from the SSD; each
+later turn that renders the one before back keeps its own, and one that does
+not leaves its reply's opportunistic again. Only a reply that holds at least
+`WriteBehind::kMinimumTokens` past its prompt's replay point is kept, as a
+shorter one recomputes faster than its state writes: kept, the 384-token
+replies of 12 agent conversations at a 27 GB limit wrote 24% more to the SSD
+to save 2.4% of their prefill. A suspended lane's checkpoints
+stay opportunistic: once they went, the lane replays its reply from its prompt's
+replay point, as one that captured none. A decoding lane's latest state retires
+only once the next is published, beside which its cycle holds that next state's
+reservation, so once the lanes end the pool holds those reservations' cached
+cells beside the lanes' cells (`state.idle_cached_cells` 2 beside
+`idle_gdn_cells` 8 after four lanes' 300-token replies at a 22 GB limit, where
+1.6.2 leaves 8 cells), which a claim takes first (step 1 above). A target
+whose state commit writes auxiliary state after its retained rows
+(Qwen3.8-Flash-Next) captures none in decode (`Model::capturesInDecode`), and
+its decode writes the rings alone. A target without GDN layers keeps no GDN
+state: its cells have no bytes, every lane and state shares one empty cell
+that holds no memory, so a lane holds the draft's rings and window and a
+cached state the window alone, and `state.idle_gdn_cells` and
+`idle_cached_cells` stay 0.
 
 ### Prefill and decode scheduling
+
+A decode cycle is one command in two parts
+(`MetalBackend::submitCommandPartsAsync`): the draft's part goes to the GPU as
+soon as it is encoded, and the target's forward and the verify's commit are
+built, validated and encoded behind it while the GPU runs the draft, which
+takes longer than that host work (2.35 ms of GPU against 0.29 ms on
+Qwen3.6-35B-A3B at one lane, M5 Max; built whole, the cycle took 0.28 ms
+longer, 1.7%). It is one command to the backend's gate and watchdog, and its
+ticket's GPU time runs from the draft's start. The runtime writes every input
+the CPU makes before the draft's part goes: the second part's builder runs
+while the GPU may read, so it writes no buffer (`Runtime::decodeAsync`). A
+second part that cannot be built leaves the command its first part, and the
+backend as healthy as a refused command leaves it.
 
 Greedy, sampled and constrained requests share decode batches; each lane keeps
 its own sampling policy and RNG, and a greedy lane takes the argmax path in any
 batch. A batch with a constrained lane runs its cycle as three commands around
 the host mask exchange: the draft, the target forward while the server computes
-each constrained lane's masks from its proposals, and the selection, in which
-only the constrained lanes read masks. A mask request the server leaves
+each constrained lane's masks, and the selection, in which only the constrained
+lanes read masks. A lane's mask request carries its rows as their tree,
+each row's token and its parent row, and the server's grammar walks it depth
+first in one matcher, consuming a row's token over its parent's state and
+rolling it back after the row's subtree, so each row's mask follows its own
+path; a row whose token the grammar rejects there, and every row below it,
+takes its parent's mask, as the target never accepts it. With the masks come
+the tokens the grammar forces after each row's path, as pairs of a row and a
+token, which the next cycle proposes as its host chain where the path the
+lane retained ends at that row and its anchor begins them
+([Drafts](models.md#drafts)). A mask request the server leaves
 unanswered for 5 s fails that request with the retryable `mask_timeout` (HTTP
 503), so a stalled grammar cannot hold the batch's command.
 
@@ -2284,8 +2681,29 @@ last pass, which commits nothing of it, and a command all of whose requests
 have ended stops at once.
 While requests of the same or a higher priority
 decode (a lane waiting for its token mask is owed nothing), each prefill unit owes them
-decode time, `--decode-share` times its own, before the next one runs. These
-policies do not extend client deadlines.
+decode time, `--decode-share` times its own, before the next one runs. A decoding lane
+whose memory is on its way back, as its own copies are after its conversion to Spill,
+is owed it too: while the prefill owes decode time, the next unit waits for that
+memory where the lane has not decoded since the last unit began, whose gap the unit
+would hold a second unit of, and the wait works the debt off as the lane's decode
+would (`Scheduler::waitsUntil`). It ends at the latest once the last unit has ended
+for as long as it took, or for G where it took longer, as the whole command that ends
+a decoder's own prompt does: a time set as that unit ends, so the wait lasts once for
+a unit, whatever commands run meanwhile, and ends with the lanes it is for (the engine
+asks for its wakeup only while a unit waits). Memory that
+lands during a unit makes the lane wait for the unit's end, so a wait as long as the
+unit moves the lane's next decode by a whole unit, which memory landing that late would
+have cost it anyway, where a shorter wait the memory outlasts adds itself to the lane's
+gap. Nothing the engine measures tells beforehand how long the
+memory takes: the SSD cache keeps no write rate, and a claim's wait does not follow
+what it lacks. In engine-sim's Studio churn a lane whose conversion started 2,321
+copies waited 94 ms for those its release needed, a decode gap of 686 ms where the
+next 471 ms pass made it 1,063 ms, and the waits of five such conversions took 92 to
+94 ms whether their claims lacked 1 MB or 105 MB. With the SSD cache writing at a
+tenth of its rate, the longest gap was 1,543 ms, as with no wait, where waits of the
+235 ms that pass owes made it 1,780 ms: the copies of five of the eight conversions
+outlasted the wait, the GPU idle for the 471 to 474 ms of a pass, and those of three
+landed within it, past the debt. These policies do not extend client deadlines.
 
 ### Resource waits
 
@@ -2377,9 +2795,10 @@ closer than a window share the pages of their tails. The cache keeps it so
   persistent restore point only with Full copies of its tail.
 - Each cut of a request's page table checks that every page from the window
   before its published blocks on is Full, always (`Cache::cutPageTable`).
-- A KV slot holds what its page holds when it is written, and its record
-  names the form (`KvSlotLabel`); a restore allocates that form. A restore
-  point persists its tail Full, as RAM holds it.
+- A KV slot holds what its page holds when it is written, takes that much
+  of the SSD cache's quota ([disk tier](#disk-tier)), and its record names
+  the form (`KvSlotLabel`); a restore allocates that form. A restore point
+  persists its tail Full, as RAM holds it.
 
 So no byte a kernel reads changes: a run with trimming off
 (`--kv-window-trim off`, the native argument validation passes) emits the
@@ -2455,13 +2874,14 @@ settle at (available - floor) / (tiers + 3) of what was available before them,
 and blocks a local snapshot keeps when such a tier frees them cost it at most a
 third more than it freed. Tiers with sizes on one volume take its room in turn,
 down to the floor, with no margin above it: while a local snapshot keeps the
-blocks such a tier frees, each copy it writes in place of another takes a slot
-of free space, and the copies a measure then has it give up free nothing, so
-free space can fall below the floor, as far as a full volume, before the tier
+blocks such a tier frees, each copy it writes in place of another takes what it
+stores of free space, and the copies a measure then has it give up free nothing,
+so free space can fall below the floor, as far as a full volume, before the tier
 has given up every copy it holds or the snapshot goes. A limit below what the
 tier holds is met at the next control pass by giving copies up in the order a
 full quota replaces them, never a copy in transfer or the only copy of a state
-in use, and a limit below one slot makes no room at all. Off a local volume, or
+in use, and a limit below what a copy takes makes no room for it at all. Off a
+local volume, or
 one that cannot be measured, the quota is the limit. A persistent tier's limit
 bounds its whole root, and the tier may use all of it: the other caches nobody
 holds, looked at once at start, count among what it holds, and while the root
@@ -2555,9 +2975,17 @@ refused, and once the quota is full a reclaim writes what it takes, as for any
 victim without a copy, giving up redundant copies, those made ahead among them,
 first. A persistent tier copies every point, whether memory has run short or
 not and in use too, so that a start after a crash takes it back, gives up the
-oldest point for it (below), and refuses one larger than its limit. A clean
-stop writes a persistent tier's waiting points, the newest first; a temporary
-tier's copies go with the process.
+oldest point for it (below), and refuses one larger than its limit, counting
+each of its copies at what its slot takes, those still to write by what their
+pages hold (`Cache::pointFits`). A clean stop writes a persistent tier's
+waiting points, the newest first, then gives up the KV copies no state needs
+(`Cache::closePersistentTier`), which the next start would leave behind, for
+up to 2 s (`supervision::kDrain`: none goes and no punch starts past it, which
+`SlotFile::seal` holds the file's worker to; the next start frees those
+left): the blocks a Spill request wrote through past its
+point, and what is left of the chain of a point the full quota gave up, whose
+copies go only as later writes need room. A temporary tier's copies go with
+the process.
 
 Otherwise writes happen when RAM reclamation selects a victim without a copy.
 States copy through one staging buffer, freeing their RAM immediately. KV
@@ -2607,8 +3035,50 @@ With `--persistent-cache` they are `kv.slots` and `state.slots` in the cache's
 directory, each beside a file of its slots' records, and stay for the next
 start. Otherwise, or when another process holds that directory or it cannot be
 used, they are temporary (`$TMPDIR/splash-cache-*`), unlinked as they are
-created and gone when the engine exits. A full quota of temporary files
-replaces the oldest redundant copy first, then the oldest sole copy, across both
+created and gone when the engine exits. A file's slots are all the size of its
+largest payload, a state or a Full page, each at its index times that size, and
+a slot is acquired for the payload it will hold and counts what it keeps on the
+volume (`SlotFile::quotaBytesFor`): the payload's host pages, which are what
+its write stores and what the write budget charges, so a Slim page's slot
+counts 464 KiB of Flint's 1.59 MiB and the quota holds 3.5 times the Slim
+pages it holds Full ones. The rest of the slot stays a hole, so a file's
+length can pass the quota while its blocks stay within it. The volume does
+not leave it one by itself: APFS allocates the gap before a write that lands
+past what the file held (gaps of 1 to 16 MiB were filled, one of 32 MiB was
+not: 256 payloads of 462 KiB in such slots took 407 MiB, and 116 MiB only once
+each slot had been freed and written again), so a write past the end of what
+the file's slots hold returns the hole before it
+(`SlotFile::Backing::stored`, one `F_PUNCHHOLE`, 14 to 43 us). Nor does it
+keep a hole at the file's end: a write into one has all of it allocated up to
+the write, so when the last slot that holds blocks is freed the file ends with
+the one below that does (`SlotFile::Backing::released`). With both, each
+slot's extents on the volume are its payload's host pages, slot by slot: in a
+3 GiB cache of 6,417 Flint pages, `SEEK_DATA` and `F_LOG2PHYS_EXT` map
+3,202,039,808 bytes of the KV file in 8,175 extents, as many as its slots
+count. The file's `st_blocks` ran 0.5% above that, and all of the difference
+lay past the file's end, where the cache writes nothing. APFS allocates ahead
+of a file that grows by writes spread over time: Slim pages written into new
+slots 60 ms apart, each past the end, kept up to 11.3 MiB beyond it, and
+appends of 1 MiB 100 ms apart 768 KiB. It keeps those blocks after the file
+closes until it drops them on its own; a truncation to the file's own length
+or an `fsync` leaves them, cloning the file drops them. In that cache they
+were 14.5 MiB past the KV file's end and 768 KiB past the state file's, from
+1.1 to 15.8 MiB past the KV file's after each of the ten prompts that filled
+it, and gone within six minutes of the engine's exit; a second run's stayed
+five minutes after it. A file that a few large writes grow keeps more for its
+size: with states of 153 MiB, the 27B's before cached states took int8 codes,
+`state.slots` held 8.4 MiB past its end
+with one state (5.5% of its length), in a cache 1.6.1 wrote and in a fresh one
+alike, and 15.8 MiB with two (5.2%), beside 1.9 MiB past a `kv.slots` of 142
+MiB (1.3%); in another run the two files, 451.5 MiB long together, held 29.6
+MiB more than that (6.5%). These are measurements, not a bound: what APFS keeps
+follows how the file grew. No slot holds them, so the quota does not count them
+and the cache cannot give them back; the limit's rule, which reads the files'
+blocks (`DiskSpace::measure`), counts them as the tier's, as it counts the
+records files (1.2 MiB beside the Flint cache's 3 GiB), which hold no slot
+either. A full
+quota of temporary files replaces the oldest
+redundant copy first, then the oldest sole copy, across both
 KV and states; sole copies of states in use, and the KV they restore through,
 make room only for a copy that is itself in use, and last. A persistent tier
 keeps restore points whole instead, since its redundant copies are what the next
@@ -2629,9 +3099,10 @@ no SSD cache (above). Before reclaim takes a state in RAM, only a spilling
 request's page takes the spilled KV under it, the state first, once nothing else
 is left. A freed slot returns its quota at once and its blocks to the volume
 (`F_PUNCHHOLE`) once its file's IO worker finishes the transfer it is in, so the
-two files together occupy about the live slots instead of each keeping its
-high-water mark; `/status` reports that as `disk.file_bytes` beside
-`disk.used_bytes`. Until the punch the other file can take that quota, so
+two files together occupy about what the live slots count instead of each
+keeping its high-water mark; `/status` reports that as `disk.file_bytes`, what
+the slots whose blocks the files hold count, beside `disk.used_bytes`. Until
+the punch the other file can take that quota, so
 allocated blocks can briefly exceed the limit by the slots freed but not yet
 punched, bounded by the transfer each file's worker is in: about 2% of a 10G
 tier in a 25-minute churn run on an M5 Max. A write that finds the volume full
@@ -2640,8 +3111,20 @@ once and shrinks to the new limit. If the volume still shows room above the
 floor, the write met a limit the measure cannot see, such as a volume quota or a
 disk image whose host is full, or the volume filled and freed again; after a
 second such write the tier keeps within what it holds, with one log line, while
-serving continues. On a volume that cannot punch holes the files keep the blocks
-of freed slots, which the runtime reports once; the limit counts them.
+serving continues. A volume that returns no blocks (`F_PUNCHHOLE` fails, as on
+HFS+ and exFAT, which keep no holes at all) keeps in each slot whatever an
+earlier payload or its own allocation put there, so there every slot counts
+whole: each file asks its volume once as it opens, with a punch past its end,
+a punch that fails later counts the slots acquired after it whole too, and the
+runtime reports it once. The slot whose punch failed keeps its blocks, which
+`disk.file_bytes` goes on counting: what is written there next counts with
+them, the larger of the two, until a punch returns the range
+(`SlotFile::Backing::back`). A hole before a write past the file's end whose
+punch failed counts so too, each slot's range it lies in whole
+(`SlotFile::Backing::stored`). A quota of 16 Full slots then holds 16 Slim pages
+on 24.4 MiB of blocks, where on APFS it holds 56 on 25.4 MiB. The files keep
+the blocks of freed slots there, each up to its high-water mark, and the
+limit's rule counts them as the tier's.
 
 Transfers use `pread`/`pwrite` with `F_NOCACHE`, every one an aligned range.
 Those of the files' IO workers, every write and a state's reads, move whole
@@ -2663,13 +3146,23 @@ back checks the segments it covers: a whole or index restore that fails is a
 miss, and a block or history read that fails is `kv_unreadable` for the
 requests that read it. A KV record of a layout with a sliding window also names
 the form of the page its slot holds (`KvSlotLabel`), and a start takes back
-only the forms it restores.
+only the forms it restores. A slot it takes back counts what one acquired for
+the record's payload does, and as adoption ends every block between one adopted
+payload's host pages and the next one's slot goes back to the volume
+(`SlotFile::finishAdoption`): the slots it leaves behind, and what a file
+whose writer returned no holes holds around its shorter payloads, so such a
+cache, each slot whole on the volume, is taken back as it is and shrinks to its
+payloads' pages at that start (96 slots, two in three Slim: 153 MiB before,
+80 MiB after, every payload matching its record).
 
 `/status` reports the shared quota, its limit, the write budget and KV
 transfers under `disk`. Its cumulative `read_bytes` and `written_bytes` count
 bytes transferred by file IO across KV and state files, including partial or
 cancelled transfers. They exclude
-filesystem metadata and physical SSD write amplification. State transfers appear
+filesystem metadata and physical SSD write amplification. Its write rate,
+`written_last_hour_bytes` and `written_last_day_bytes`, is what the write
+budget counts, the host pages of each write submitted, in the last 60 and
+1,440 minutes of the awake clock (`model::DiskBudget::writeRate`). State transfers appear
 under `state` (`disk_bytes`, `offloads`, `disk_hits`, `disk_promotions`). Cache
 counters include:
 
@@ -2691,19 +3184,18 @@ tokens, the end tokens the engine selects where it runs out, the last of which
 closes thinking, and a second token that also ends it, a call's opening where
 the output may call a tool. The engine counts the thinking tokens it selects,
 and then the end tokens. In the selection where the budget runs out, one small
-dispatch gives that row and those after it the end's tokens, unless a draft
-token before the row ended thinking, and gives a sampled lane's drafted row the
-target probability 1 for a drafted end token and 0 otherwise, so acceptance
+dispatch gives the rows of that depth and deeper the end's tokens, unless a
+draft token on the row's path up to that depth ended thinking, so acceptance
 keeps the draft only where it drafted the end. Once no thinking token is left,
 the end starts at a selection's row 0, before which no draft token can end
-thinking, and a second small dispatch replaces the lane's draft proposals with
-the end tokens left before the verify, so a decode cycle accepts as many of
-them as it verifies; the request's speculation counts leave those proposals
-out. A constrained request's end waits for its grammar: it starts at the first
-row from the cut whose mask admits its first token, the rows before it keeping
-their own selections, which the engine counts as thinking past the budget, and
-it replaces no proposals before it has started, as only the verify reads the
-masks. A selection where no budget runs out dispatches nothing more.
+thinking, and the end tokens left are the lane's proposals, a chain of its
+tree the selector takes before any draft row (none beside it could be
+accepted), so a decode cycle accepts as many of them as it verifies; the
+request's speculation counts leave those proposals out. A constrained request's end waits for its grammar: along each row's path it
+starts at the first of the path's rows from the cut whose mask admits its first
+token, the path's rows before it keeping their own selections, which the engine
+counts as thinking past the budget, and it replaces no proposals before it has
+started, as only the verify reads the masks. A selection where no budget runs out dispatches nothing more.
 
 Requests carry the score-token IDs and Done events the selected f32 logits; the
 server and the engine must speak the same native wire version. Scoring requires
@@ -2725,7 +3217,9 @@ warm-up done of all, and again as each step ends
 ([Warmup and pipelines](#warmup-and-pipelines)), then its Ready event when the
 warm-up is done; the server prints the first engine's Warming and writes it to
 its serve record, where the app shows it as the start's Warming up step and
-its progress.
+its progress. A relaunched engine's Warming goes no further: its warm-up is
+part of the recovery, which the record names as one phase from the failure
+on ([serve record](server.md#serve-record)).
 Ready says what the start serves: its lanes, the context it resolved (a
 relaunch may serve less than the first engine did), whether it admits
 images, and the target's vocabulary, stop

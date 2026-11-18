@@ -211,7 +211,12 @@ _pattern_checks = LRUCache(PATTERN_CHECK_CACHE_BYTES, PATTERN_CHECK_CACHE_SIZE)
 # every token the grammar allows next would otherwise write it until
 # max_tokens, as Qwen models do, most of all under speculative decoding. 64
 # characters still take pretty printing 15 levels deep at four spaces.
-# Whitespace inside strings is content and unbounded.
+# Whitespace inside strings is content and unbounded. Before the output's
+# first token there is none, unless reasoning comes before it, which
+# whitespace sets the answer apart from (_reasoning): allowed there too,
+# Qwen3.8-27B with its draft, asked for {"ok": true} without reasoning, spent
+# all of a 16-token limit on whitespace and returned no JSON, and 38 tokens
+# under a 64-token limit where the answer takes 10.
 MAX_WHITESPACE = 64
 WHITESPACE = rf"[ \t\n\r]{{0,{MAX_WHITESPACE}}}"
 WHITESPACE_RULE = f"WS: /{WHITESPACE}/"
@@ -1074,12 +1079,15 @@ def _reasoning(thinking, chat_format):
     opened a think block (thinking), its text up to the block's close; where
     the model opens one itself, an optional block from its opening to its
     close; otherwise none. Each tag is its token, as the template writes it,
-    and the text between is TEXT, which cannot spell the close."""
+    and the text between is TEXT, which cannot spell the close. The
+    whitespace that sets a constrained answer apart from the reasoning, as
+    the template's blank line after the close does, is the rule's too: an
+    answer no reasoning comes before starts at its first token."""
     close = f"<[{chat_format.think_end_id}]>"
     if thinking:
-        return "think ", f"think: TEXT {close}"
+        return "think ", f"think: TEXT {close} WS"
     if chat_format.think_start_id is not None:
-        return "think? ", f"think: <[{chat_format.think_start_id}]> TEXT {close}"
+        return "think? ", f"think: <[{chat_format.think_start_id}]> TEXT {close} WS"
     return "", None
 
 
@@ -1089,7 +1097,7 @@ def json_grammar(schema, thinking, *, chat_format):
     think, think_rule = _reasoning(thinking, chat_format)
     grammar = [
         "%llguidance {}",
-        f"start: {think}WS %json "
+        f"start: {think}%json "
         + json.dumps(_grammar_compatible_schema(schema), separators=(",", ":")),
     ]
     if think_rule is not None:
@@ -1316,14 +1324,17 @@ def tool_grammar(policy, thinking, response_schema=None, *, chat_format):
     elif syntax.calls_open:
         # One block holds the calls. The text or whitespace before it holds
         # the space the template sets before its opening, and text is lazy,
-        # up to the opening, which a greedy lexeme would run into.
+        # up to the opening, which a greedy lexeme would run into. After the
+        # reasoning the generation prompt opened, that whitespace is its
+        # rule's (_reasoning).
         calls_open = syntax.calls_open.lstrip()
         held = f"{call} {_tags(syntax, syntax.call_end)}"
         if policy.parallel:
             held = f"({held})+"
         block = f"{held} {_tags(syntax, syntax.calls_close)} WS"
         if policy.required or response_schema is not None:
-            body = f"WS {_tags(syntax, calls_open)} {block}"
+            space = "" if thinking else "WS "
+            body = f"{space}{_tags(syntax, calls_open)} {block}"
             if not policy.required:
                 body = f"(({body}) | answer)"
         else:
@@ -1333,8 +1344,8 @@ def tool_grammar(policy, thinking, response_schema=None, *, chat_format):
                 f"{_unspelled(syntax.marker, THINK_END)}"
             )
     elif policy.required or response_schema is not None:
-        # A call comes first, set apart from the reasoning by whitespace.
-        body = f"WS {call} " + (f"(TEXT {call})* TEXT" if policy.parallel else "WS")
+        # A call comes first.
+        body = f"{call} " + (f"(TEXT {call})* TEXT" if policy.parallel else "WS")
         if not policy.required:
             body = f"(({body}) | answer)"
     else:
@@ -1343,7 +1354,7 @@ def tool_grammar(policy, thinking, response_schema=None, *, chat_format):
     main = ["%llguidance {}", f"start: {think}{body}"]
     if response_schema is not None and not policy.required:
         main.append(
-            "answer: WS %json "
+            "answer: %json "
             + json.dumps(
                 _grammar_compatible_schema(response_schema), separators=(",", ":")
             )

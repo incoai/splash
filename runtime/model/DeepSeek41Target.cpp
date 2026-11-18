@@ -22,7 +22,7 @@
 namespace splash::model {
 namespace {
 
-// The rows a decode step verifies of each of its lanes, and the lanes.
+// The most rows of a lane of a decode step, a verify block, and the lanes.
 constexpr uint32_t kVerifyRows = ExecutionLimits::targetVerifyRows;
 constexpr uint32_t kLanes = ExecutionLimits::maximumBatchWidth;
 // The rows of a tile of a prefill chunk's layers' work: whole tiles of the
@@ -67,15 +67,16 @@ struct DeepSeek41Target::Rows {
   // The positions of its groups from its first on (ratio * group), of a
   // paired source's and a single one's.
   std::array<metal::MetalBuffer, 2> groupPositions;
-  // A drafted verify's rows each lane verifies (a uint32 per lane), past
-  // which its rows attend nothing; none for a prefill's.
+  // A decode step's row count of each lane (a uint32 per lane), past which
+  // its rows attend nothing; none for a prefill's.
   metal::MetalBuffer verifyRows;
 };
 
 // A step's scratch: what lives across a chunk's layers, its own; a layer's
-// work, which a prefill's chunks share; and a verify's latents of every
+// work, which a prefill's chunks share; and a decode step's latents of every
 // layer, its paired sources' projections of each lane and its lanes' prior
-// tokens, which live until its commit.
+// tokens, which live until its commit, and its rows in its own layout: their
+// tokens, each lane's row count and that layout (SplashLaneRows a lane).
 struct DeepSeek41Target::Scratch {
   uint32_t rows = 0;
   metal::MetalBuffer streams, attentionMixes, ffnMixes, selected, kept, positions, groupPositions, ffnOut;
@@ -85,15 +86,15 @@ struct DeepSeek41Target::Scratch {
   metal::MetalBuffer qa, qr, q, qRotated, indexQueries, indexRotated, indexWeights, indexScores, blockScores;
   metal::MetalBuffer keyIndices, keyCounts, scores, parts, out, rotatedBack, groupInput, groupOutput, joined;
   metal::MetalBuffer engramRows, engramKv;
-  metal::MetalBuffer layerLatents, sourceKv, sourceGate, prior;
+  metal::MetalBuffer layerLatents, sourceKv, sourceGate, prior, tokens, laneCounts, laneLayout;
 };
 
 namespace {
 
-// The buffers of a scratch of `rows` rows in tiles of `tile` (a verify's one
-// tile), through `allocate(bytes, label)`: with `own`, what lives across a
-// chunk's layers; with `work`, a layer's work; with `verify`, what lives
-// until a verify's commit.
+// The buffers of a scratch of `rows` rows in tiles of `tile` (a decode
+// step's one tile), through `allocate(bytes, label)`: with `own`, what lives
+// across a chunk's layers; with `work`, a layer's work; with `verify`, what
+// lives until a decode step's commit.
 template <class Scratch, class Allocate>
 void layoutScratch(const DeepSeek41Layout &layout, const ops::ManifoldHyperShape &mhc, uint64_t tableRowBytes,
                    Scratch &s, uint32_t rows, uint32_t tile, bool own, bool work, bool verify, Allocate allocate) {
@@ -160,6 +161,9 @@ void layoutScratch(const DeepSeek41Layout &layout, const ops::ManifoldHyperShape
     s.sourceKv = allocate(paired * kLanes * (kVerifyRows + 1) * kLatent * 4, "deepseek41/source-kv");
     s.sourceGate = allocate(paired * kLanes * (kVerifyRows + 1) * kLatent * 4, "deepseek41/source-gate");
     s.prior = allocate(uint64_t{kLanes} * (d.engramNgram - 1) * 4, "deepseek41/prior");
+    s.tokens = allocate(uint64_t{rows} * 4, "deepseek41/tokens");
+    s.laneCounts = allocate(uint64_t{kLanes} * 4, "deepseek41/lane-counts");
+    s.laneLayout = allocate(uint64_t{kLanes} * sizeof(SplashLaneRows), "deepseek41/lane-layout");
   }
 }
 
@@ -282,12 +286,8 @@ metal::MetalBuffer DeepSeek41Target::fromRow(const metal::MetalBuffer &buffer, u
 }
 
 void DeepSeek41Target::project(metal::CommandGraph &graph, metal::MetalBuffer input, const ops::Projection &projection,
-                               metal::MetalBuffer output, uint32_t rows, bool decode, uint32_t lanes,
-                               const ops::LinearScratch &linear) const {
-  if (decode)
-    addDecodeProjection(graph, std::move(input), projection, std::move(output), lanes, linear);
-  else
-    operators_.linear().addPrefill(graph, std::move(input), projection, std::move(output), rows, linear);
+                               metal::MetalBuffer output, uint32_t rows, const ops::LinearScratch &linear) const {
+  operators_.linear().addProjection(graph, std::move(input), projection, std::move(output), rows, linear);
 }
 
 // Each tile of the step's rows: its Engram rows of the layer, gathered from
@@ -295,7 +295,7 @@ void DeepSeek41Target::project(metal::CommandGraph &graph, metal::MetalBuffer in
 // (Qwen4ExpTarget::addPleGather), projected into a key per stream and a
 // value, which the gate adds to the streams.
 void DeepSeek41Target::addEngram(metal::CommandGraph &graph, const Scratch &s, const ops::LinearScratch &linear,
-                                 bool decode, uint32_t lanes, uint32_t index, uint32_t rows, uint32_t staged) const {
+                                 bool decode, uint32_t index, uint32_t rows, uint32_t staged) const {
   const DeepSeek41LayerWeights &layer = weights_.layers[index];
   const uint32_t table = static_cast<uint32_t>(std::popcount(d_.engramLayers & ((uint64_t{1} << index) - 1)));
   const uint32_t hidden = weights_.layout.hiddenSize, perToken = (d_.engramNgram - 1) * d_.engramHeads;
@@ -306,7 +306,7 @@ void DeepSeek41Target::addEngram(metal::CommandGraph &graph, const Scratch &s, c
     const uint32_t n = std::min(tile, rows - begin);
     ops::Embedding::add(graph, rowsOf<uint32_t>(s.engramSlots, table * rows + begin, n, perToken), stagedRows,
                         s.engramRows, n * perToken);
-    project(graph, s.engramRows, layer.engram->kv, s.engramKv, n, decode, lanes, linear);
+    project(graph, s.engramRows, layer.engram->kv, s.engramKv, n, linear);
     ops::Engram::addGate(graph, rowsOf<float>(s.streams, begin, n, MHC_STREAMS * hidden), s.engramKv,
                          engramGates_[table], hidden, d_.normEpsilon, n);
   }
@@ -315,7 +315,7 @@ void DeepSeek41Target::addEngram(metal::CommandGraph &graph, const Scratch &s, c
 // A KV source's groups its rows complete: their latents and index keys into
 // the sequence's pages, of the projections of its rows and, of a paired
 // source, of its open group's first token before them; and the group left
-// open after its rows and at each capture. A verify keeps a paired source's
+// open after its rows and at each capture. A decode step keeps a paired source's
 // projections for its commit (addStateCommit), and writes no state.
 void DeepSeek41Target::addSourceGroups(metal::CommandGraph &graph, const Scratch &s, uint32_t index,
                                        const Rows &sequence, const metal::MetalBuffer &normalized,
@@ -437,7 +437,7 @@ void DeepSeek41Target::addIndexer(metal::CommandGraph &graph, const Scratch &s, 
 // the output's groups and projection into the branch; a prefill's rings
 // after each sequence's rows and captures; and the branch into the streams.
 void DeepSeek41Target::addAttention(metal::CommandGraph &graph, const Scratch &s, const ops::LinearScratch &linear,
-                                    bool decode, uint32_t lanes, uint32_t index, std::span<const Rows> sequences,
+                                    bool decode, uint32_t index, std::span<const Rows> sequences,
                                     uint32_t rows, const metal::MetalBuffer &normalized,
                                     const metal::MetalBuffer &previousMixes,
                                     std::span<const SplashKvLayer> kvLayers) const {
@@ -454,10 +454,10 @@ void DeepSeek41Target::addAttention(metal::CommandGraph &graph, const Scratch &s
   ops::ManifoldHyperConnection::addPreNorm(graph, s.streams, previousMixes, layer.attentionNorm.buffer, normalized,
                                            mhc_, rows);
   // The rows' latents, normed, rotated at their positions and rounded to
-  // FP8; a verify keeps every layer's for its commit.
+  // FP8; a decode step keeps every layer's for its commit.
   const metal::MetalBuffer latents =
       decode ? rowsOf<uint16_t>(s.layerLatents, index * s.rows, s.rows, kLatent) : s.latents;
-  project(graph, normalized, layer.kv, s.latentsRaw, rows, decode, lanes, linear);
+  project(graph, normalized, layer.kv, s.latentsRaw, rows, linear);
   ops::LatentRotation::add(graph, s.latentsRaw, false, layer.kvNorm.buffer, freqs, s.positions, latents,
                            {1, kLatent, pairs, false, ops::LatentRounding::Fp8, true, d_.normEpsilon}, rows);
   if (layer.compressor)
@@ -467,21 +467,15 @@ void DeepSeek41Target::addAttention(metal::CommandGraph &graph, const Scratch &s
   for (uint32_t begin = 0; begin < rows; begin += tile) {
     const uint32_t n = std::min(tile, rows - begin);
     const metal::MetalBuffer positions = rowsOf<uint32_t>(s.positions, begin, n, 1);
-    project(graph, decode ? normalized : fromRow(normalized, begin, hidden, 2), layer.queryA, s.qa, n, decode, lanes,
-            linear);
+    project(graph, decode ? normalized : fromRow(normalized, begin, hidden, 2), layer.queryA, s.qa, n, linear);
     ops::LatentRotation::add(graph, s.qa, false, layer.queryNorm.buffer, freqs, positions, s.qr,
                              {1, d_.queryRank, 0, false, ops::LatentRounding::None, true, d_.normEpsilon}, n);
-    project(graph, s.qr, layer.queryB, s.q, n, decode, lanes, linear);
+    project(graph, s.qr, layer.queryB, s.q, n, linear);
     ops::LatentRotation::add(graph, s.q, false, layer.queryNorm.buffer, freqs, positions, s.qRotated,
                              {heads, kLatent, pairs, false, ops::LatentRounding::None, false, 0.0F}, n);
     for (const Rows &sequence : sequences) {
-      // Without a draft a verify attends a lane's anchor alone, the one row
-      // it retains: the rows after it repeat it, and no row it reads is
-      // theirs (positions past its own).
       const uint32_t first = std::max(sequence.rowBegin, begin);
-      const uint32_t end = decode && !geometry_.captureLayerCount
-                               ? first + 1
-                               : std::min(sequence.rowBegin + sequence.rows, begin + n);
+      const uint32_t end = std::min(sequence.rowBegin + sequence.rows, begin + n);
       if (first >= end) continue;
       const uint32_t count = end - first, at = first - begin;
       // A row reads the groups of its KV source its last indexer selected,
@@ -511,11 +505,10 @@ void DeepSeek41Target::addAttention(metal::CommandGraph &graph, const Scratch &s
     for (uint32_t group = 0; group < d_.outputGroups; ++group) {
       ops::RowCopy::add(graph, s.rotatedBack, {0, width, group * groupWidth}, s.groupInput, {0, groupWidth, 0}, n,
                         groupWidth);
-      project(graph, s.groupInput, layer.outputA[group], s.groupOutput, n, decode, lanes, linear);
+      project(graph, s.groupInput, layer.outputA[group], s.groupOutput, n, linear);
       ops::RowCopy::add(graph, s.groupOutput, {0, rank, 0}, s.joined, {0, joinedWidth, group * rank}, n, rank);
     }
-    project(graph, s.joined, layer.outputB, decode ? s.branch : fromRow(s.branch, begin, hidden, 2), n, decode, lanes,
-            linear);
+    project(graph, s.joined, layer.outputB, decode ? s.branch : fromRow(s.branch, begin, hidden, 2), n, linear);
     // A prefill's indexer layer waits for the host after each
     // kIndexerStepRows of a chunk's rows: the work before a wait is a
     // sixteenth of a command's.
@@ -549,6 +542,11 @@ std::vector<metal::MetalBuffer> DeepSeek41Target::addPrefill(metal::CommandGraph
                                                              const kv::PageStorage &kv, SpilledKvReads &,
                                                              QwenPrefillLayers layers, ops::AneFfn *) {
   const DeepSeek41Layout &layout = weights_.layout;
+  if (chunks.size() == 1 && chunks.front().decode) {
+    if (layers.first || layers.end != layout.layers)
+      throw std::invalid_argument("a DeepSeek-V4.1 decode step runs every layer");
+    return addDecode(graph, chunks.front(), kv);
+  }
   if (chunks.empty() || chunks.size() > prefill_.size() || kv.layers().size() != sources_.size() ||
       layers.first >= layers.end || layers.end > layout.layers)
     throw std::invalid_argument("invalid DeepSeek-V4.1 prefill");
@@ -562,10 +560,11 @@ std::vector<metal::MetalBuffer> DeepSeek41Target::addPrefill(metal::CommandGraph
   for (uint32_t c = 0; c < chunks.size(); ++c) {
     const QwenTargetPrefillChunk &chunk = chunks[c];
     const Scratch &s = prefill_[c];
-    if (chunk.sequences.empty() || chunk.sequences.size() > kLanes || !chunk.rows || chunk.rows > s.rows)
+    if (chunk.decode || chunk.sequences.empty() || chunk.sequences.size() > kLanes || !chunk.rows ||
+        chunk.rows > s.rows)
       throw std::invalid_argument("invalid DeepSeek-V4.1 prefill chunk");
-    plans.push_back(operators_.moePrefill(moeShape_, geometry_.moeRouterFormat, chunk.rows));
-    ffn[c] = {chunk.buffers.normalized, zeros_, s.ffnOut, chunk.buffers.moe, {}};
+    plans.push_back(operators_.moe(moeShape_, geometry_.moeRouterFormat, chunk.rows));
+    ffn[c] = {.input = chunk.buffers.normalized, .residual = zeros_, .output = s.ffnOut, .scratch = chunk.buffers.moe};
     for (uint32_t index = 0; index < chunk.sequences.size(); ++index) {
       const QwenTargetPrefillSequence &sequence = chunk.sequences[index];
       if (!sequence.auxiliaryIn || !sequence.auxiliaryOut || sequence.lane >= kLanes ||
@@ -629,7 +628,7 @@ std::vector<metal::MetalBuffer> DeepSeek41Target::addPrefill(metal::CommandGraph
       const QwenTargetPrefillChunk &chunk = chunks[c];
       const Scratch &s = prefill_[c];
       if (layer.engram)
-        addEngram(graph, s, chunk.buffers.linearScratch, false, 0, index, chunk.rows,
+        addEngram(graph, s, chunk.buffers.linearScratch, false, index, chunk.rows,
                   engramLayers * chunk.rows * perToken);
       if (const auto slot = geometry_.captureSlot(index))
         for (const QwenTargetPrefillSequence &sequence : chunk.sequences)
@@ -640,7 +639,7 @@ std::vector<metal::MetalBuffer> DeepSeek41Target::addPrefill(metal::CommandGraph
                                            MHC_STREAMS * layout.hiddenSize),
                              *slot, chunk.buffers.captured, capture.destinationStart, capture.rows);
           }
-      addAttention(graph, s, chunk.buffers.linearScratch, false, 0, index, sequences[c], chunk.rows,
+      addAttention(graph, s, chunk.buffers.linearScratch, false, index, sequences[c], chunk.rows,
                    chunk.buffers.normalized, index ? s.ffnMixes : firstMixes_, kvLayers);
       ops::ManifoldHyperConnection::addMix(graph, s.streams, layer.ffnMix.fn, layer.ffnMix.scale, layer.ffnMix.base,
                                            s.mixChunks, s.ffnMixes, mhc_, chunk.rows);
@@ -648,9 +647,16 @@ std::vector<metal::MetalBuffer> DeepSeek41Target::addPrefill(metal::CommandGraph
                                                chunk.buffers.normalized, mhc_, chunk.rows);
       ops::MoE::addRouting(graph, ffn[c], layer.ffn, plans[c]);
     }
-    if (layer.ffn.stream) layer.ffn.stream->addLoad(graph, parts, layer.ffn.streamBlock);
+    // A streamed block's load of the union of the chunks' experts, the first
+    // chunk's passes over those resident before it running beside it, each
+    // later chunk's after the chunk before it's (QwenTarget::addPrefillLayers).
+    const bool streams = layer.ffn.stream != nullptr;
+    if (streams)
+      layer.ffn.stream->addLoad(graph, parts, layer.ffn.streamBlock,
+                                [&] { ops::MoE::addResident(graph, ffn[0], layer.ffn, plans[0]); });
     for (uint32_t c = 0; c < chunks.size(); ++c) {
       const Scratch &s = prefill_[c];
+      if (streams && c) ops::MoE::addResident(graph, ffn[c], layer.ffn, plans[c]);
       ops::MoE::addRouted(graph, ffn[c], layer.ffn, plans[c]);
       ops::ManifoldHyperConnection::addPost(graph, s.streams, s.ffnOut, s.ffnMixes, mhc_, chunks[c].rows);
     }
@@ -702,25 +708,37 @@ void DeepSeek41Target::prepareVerifyLane(uint32_t lane, uint64_t position, const
   preparedPositions_[lane] = position;
 }
 
-void DeepSeek41Target::addVerifyInput(metal::CommandGraph &graph, metal::MetalBuffer draftInput,
-                                      metal::MetalBuffer proposals, metal::MetalBuffer verifyInput,
-                                      uint32_t lanes) const {
-  QwenTarget::addVerifyInput(graph, std::move(draftInput), std::move(proposals), verifyInput, lanes);
+void DeepSeek41Target::addVerifyInput(metal::CommandGraph &graph, const QwenVerifyInput &input) const {
+  const ops::StepRows &step = input.step;
+  ops::requireStepRows(step);
   const Scratch &s = *verify_;
+  const uint32_t lanes = step.lanes, stride = deepSeek41LaneStride(step), rows = lanes * stride;
+  // The step's rows in the target's layout, their positions, each lane's row
+  // count and its groups' positions.
+  std::array<uint32_t, kLanes> committed{};
+  for (uint32_t lane = 0; lane < lanes; ++lane) committed[lane] = static_cast<uint32_t>(preparedPositions_[lane]);
+  ops::LatentAttention::addLaneRows(graph, input.tokens, s.tokens,
+                                    {.packed = input.laneRows,
+                                     .counts = s.laneCounts,
+                                     .strided = s.laneLayout,
+                                     .positions = s.positions,
+                                     .groups = s.groupPositions,
+                                     .groupStride = s.rows + 1},
+                                    std::span(committed).first(lanes), stride, 1, true);
   const uint32_t engramLayers = static_cast<uint32_t>(std::popcount(d_.engramLayers));
-  EngramHashParams params{.rows = lanes * kVerifyRows,
-                          .lane_rows = kVerifyRows,
+  EngramHashParams params{.rows = rows,
+                          .lane_rows = stride,
                           .layers = engramLayers,
                           .ngram = d_.engramNgram,
                           .heads = d_.engramHeads,
                           .pad = d_.engramPadToken,
                           .first_rows = {}};
   for (uint32_t table = 0; table < engramLayers; ++table) params.first_rows[table] = weights_.engramFirstRows[table];
-  ops::Engram::addHash(graph, std::move(verifyInput), s.prior, weights_.engramTokenMap, weights_.engramMultipliers,
+  ops::Engram::addHash(graph, s.tokens, s.prior, weights_.engramTokenMap, weights_.engramMultipliers,
                        weights_.engramPrimes, weights_.engramOffsets, s.engramIds, params);
-  // A verify step stages a few rows a lane, most of them cached, so its
+  // A decode step stages a few rows a lane, most of them cached, so its
   // host step is short and keeps the GPU awake (Qwen4Steps::addVerifyInput).
-  const uint64_t count = uint64_t{engramLayers} * params.rows * (d_.engramNgram - 1) * d_.engramHeads;
+  const uint64_t count = uint64_t{engramLayers} * rows * (d_.engramNgram - 1) * d_.engramHeads;
   graph.host(
       [store = weights_.streamedTable, ids = s.engramIds, slots = s.engramSlots, staging = s.engramStaging, count] {
         const uint64_t rowBytes = store->table().rowBytes;
@@ -730,81 +748,104 @@ void DeepSeek41Target::addVerifyInput(metal::CommandGraph &graph, metal::MetalBu
       {}, metal::HostStepGpu::Awake);
 }
 
-void DeepSeek41Target::addVerify(metal::CommandGraph &graph, QwenTargetVerifyBuffers buffers,
-                                 const kv::PageStorage &kv, SpilledKvReads &,
-                                 std::span<const kv::ChunkedPrefillParams> chunks, uint32_t lanes) const {
+// A decode step's rows, in the target's layout (addVerifyInput), from the
+// embedding of their tokens through every layer, as a prompt chunk's, each
+// lane's rows past its count attending nothing and routing no expert; the
+// final norm's rows go back to the packed layout, which the head reads.
+std::vector<metal::MetalBuffer> DeepSeek41Target::addDecode(metal::CommandGraph &graph,
+                                                            const QwenTargetPrefillChunk &chunk,
+                                                            const kv::PageStorage &kv) const {
   const DeepSeek41Layout &layout = weights_.layout;
-  if (!lanes || lanes > kLanes || chunks.size() != lanes || kv.layers().size() != sources_.size())
-    throw std::invalid_argument("invalid DeepSeek-V4.1 verify batch");
+  const QwenTargetDecodeBuffers &d = *chunk.decode;
+  const ops::StepRows &step = d.step;
+  ops::requireStepRows(step);
+  if (chunk.sequences.size() != step.lanes || chunk.rows != step.rows || kv.layers().size() != sources_.size())
+    throw std::invalid_argument("invalid DeepSeek-V4.1 decode step");
   const std::span<const SplashKvLayer> kvLayers = kv.layers();
   const Scratch &s = *verify_;
-  const uint32_t rows = lanes * kVerifyRows;
+  const uint32_t lanes = step.lanes, stride = deepSeek41LaneStride(step), rows = lanes * stride;
   const uint32_t engramLayers = static_cast<uint32_t>(std::popcount(d_.engramLayers));
   std::vector<Rows> sequences;
-  auto *positions = contents<uint32_t>(s.positions);
   for (uint32_t lane = 0; lane < lanes; ++lane) {
-    const uint32_t committed = chunks[lane].committed_tokens;
+    const QwenTargetPrefillSequence &sequence = chunk.sequences[lane];
+    const uint32_t committed = static_cast<uint32_t>(sequence.chunk.committed_tokens);
     if (preparedPositions_[lane] != committed)
-      throw std::logic_error("a DeepSeek-V4.1 verify lane's inputs were prepared for another position");
-    if (!buffers.auxiliary[lane]) throw std::invalid_argument("DeepSeek-V4.1 verify lane without its state");
-    Rows lanes{.rowBegin = lane * kVerifyRows,
-               .rows = kVerifyRows,
+      throw std::logic_error("a DeepSeek-V4.1 decode lane's inputs were prepared for another position");
+    if (!sequence.auxiliaryIn) throw std::invalid_argument("DeepSeek-V4.1 decode lane without its state");
+    Rows lane_{.rowBegin = lane * stride,
+               .rows = stride,
                .committed = committed,
                .lane = lane,
-               .pageTable = buffers.pageTables[lane],
-               .stateIn = buffers.auxiliary[lane]};
-    // With a draft, a lane's rows past those it verifies attend nothing.
-    if (geometry_.captureLayerCount) lanes.verifyRows = buffers.verifyRows;
-    for (uint32_t row = 0; row < kVerifyRows; ++row) positions[lane * kVerifyRows + row] = committed + row;
-    for (uint32_t ratio = 1; ratio <= 2; ++ratio) {
-      lanes.groupPositions[ratio == 2 ? 0 : 1] =
-          rowsOf<uint32_t>(s.groupPositions, (lane * 2 + (ratio == 2 ? 0 : 1)) * (s.rows + 1), kVerifyRows + 1, 1);
-      auto *groups = contents<uint32_t>(lanes.groupPositions[ratio == 2 ? 0 : 1]);
-      for (uint32_t g = 0; g <= kVerifyRows; ++g) groups[g] = (committed / ratio + g) * ratio;
-    }
-    sequences.push_back(lanes);
+               .pageTable = sequence.pageTable,
+               .stateIn = sequence.auxiliaryIn,
+               .verifyRows = s.laneCounts};
+    for (uint32_t kind = 0; kind < 2; ++kind)
+      lane_.groupPositions[kind] = rowsOf<uint32_t>(s.groupPositions, (lane * 2 + kind) * (s.rows + 1), stride + 1, 1);
+    sequences.push_back(lane_);
   }
-  const ops::MoePlan plan = operators_.moeDecode(moeShape_, geometry_.moeRouterFormat, lanes);
-  ops::ManifoldHyperConnection::addInit(graph, buffers.hidden[0], s.streams, mhc_, rows);
+  const ops::MoePlan plan = operators_.moe(moeShape_, geometry_.moeRouterFormat, rows);
+  const ops::MoeBuffers ffn{.input = chunk.buffers.normalized,
+                            .residual = zeros_,
+                            .output = s.ffnOut,
+                            .scratch = chunk.buffers.moe,
+                            .lanes = lanes,
+                            .laneRows = s.laneLayout};
+  const ops::LinearScratch &linear = chunk.buffers.linearScratch;
+  const metal::MetalBuffer hidden = chunk.buffers.hidden[1];
+  addEmbedding(graph, s.tokens, hidden, rows);
+  ops::ManifoldHyperConnection::addInit(graph, hidden, s.streams, mhc_, rows);
   for (uint32_t index = 0; index < layout.layers; ++index) {
     const DeepSeek41LayerWeights &layer = weights_.layers[index];
     if (layer.engram)
-      addEngram(graph, s, buffers.linearScratch, true, lanes, index, rows,
-                engramLayers * rows * (d_.engramNgram - 1) * d_.engramHeads);
+      addEngram(graph, s, linear, true, index, rows, engramLayers * rows * (d_.engramNgram - 1) * d_.engramHeads);
     if (const auto slot = geometry_.captureSlot(index))
-      addStreamCapture(graph, s.streams, *slot, buffers.capturedTargetHidden, 0, rows);
-    addAttention(graph, s, buffers.linearScratch, true, lanes, index, sequences, rows, buffers.normalized,
+      addStreamCapture(graph, s.streams, *slot, d.capturedTargetHidden, 0, rows);
+    addAttention(graph, s, linear, true, index, sequences, rows, chunk.buffers.normalized,
                  index ? s.ffnMixes : firstMixes_, kvLayers);
     ops::ManifoldHyperConnection::addMix(graph, s.streams, layer.ffnMix.fn, layer.ffnMix.scale, layer.ffnMix.base,
                                          s.mixChunks, s.ffnMixes, mhc_, rows);
     ops::ManifoldHyperConnection::addPreNorm(graph, s.streams, s.attentionMixes, layer.ffnNorm.buffer,
-                                             buffers.normalized, mhc_, rows);
-    ops::MoE::add(graph, {buffers.normalized, zeros_, s.ffnOut, buffers.moe, buffers.verifyRows}, layer.ffn, plan);
+                                             chunk.buffers.normalized, mhc_, rows);
+    ops::MoE::addRouting(graph, ffn, layer.ffn, plan);
+    if (layer.ffn.stream) {
+      const ops::MoeLoadPart part{&ffn, &plan};
+      layer.ffn.stream->addLoad(graph, std::span(&part, 1), layer.ffn.streamBlock,
+                                [&] { ops::MoE::addResident(graph, ffn, layer.ffn, plan); });
+    }
+    ops::MoE::addRouted(graph, ffn, layer.ffn, plan);
     ops::ManifoldHyperConnection::addPost(graph, s.streams, s.ffnOut, s.ffnMixes, mhc_, rows);
   }
-  ops::ManifoldHyperConnection::addPreNorm(graph, s.streams, s.ffnMixes, weights_.finalNorm.buffer,
-                                           buffers.finalHidden, mhc_, rows);
-  addDecodeProjection(graph, buffers.finalHidden, weights_.logitsProjection, buffers.logits, lanes,
-                      buffers.linearScratch);
+  ops::ManifoldHyperConnection::addPreNorm(graph, s.streams, s.ffnMixes, weights_.finalNorm.buffer, hidden, mhc_,
+                                           rows);
+  std::array<uint32_t, kLanes> committed{};
+  ops::LatentAttention::addLaneRows(graph, hidden, d.finalHidden, {.packed = chunk.buffers.laneRows},
+                                    std::span(committed).first(lanes), stride, layout.hiddenSize / 2, false);
+  // The head computes each row as the plan of the lanes' rows does, as the
+  // layers did, whatever rows the packed layout holds.
+  operators_.linear().addProjection(graph, d.finalHidden, weights_.logitsProjection, d.logits, step.rows, linear,
+                                    rows);
+  return {d.finalHidden};
 }
 
 void DeepSeek41Target::addHeadBatch(metal::CommandGraph &graph, metal::MetalBuffer hidden, metal::MetalBuffer,
-                                    metal::MetalBuffer logits, uint32_t lanes, ops::LinearScratch scratch) const {
-  addDecodeProjection(graph, std::move(hidden), vocabularyProjection(), std::move(logits), lanes, scratch);
+                                    metal::MetalBuffer logits, uint32_t rows, ops::LinearScratch scratch) const {
+  project(graph, std::move(hidden), vocabularyProjection(), std::move(logits), rows, scratch);
 }
 
 void DeepSeek41Target::addStateCommit(metal::CommandGraph &graph, QwenTargetCommitBuffers buffers,
-                                      uint32_t lanes) const {
-  QwenTarget::addStateCommit(graph, buffers, lanes);
+                                      const ops::StepRows &step) const {
+  QwenTarget::addStateCommit(graph, buffers, step);
   const Scratch &s = *verify_;
-  const uint32_t window = weights_.layout.slidingWindow;
-  for (uint32_t lane = 0; lane < lanes; ++lane) {
+  const uint32_t window = weights_.layout.slidingWindow, stride = deepSeek41LaneStride(step);
+  // Each lane's retained rows are the path its acceptance wrote, a chain's
+  // first rows (QwenTargetCommitBuffers::retainedRows).
+  for (uint32_t lane = 0; lane < step.lanes; ++lane) {
     const uint32_t committed = static_cast<uint32_t>(preparedPositions_[lane]);
     for (uint32_t layer = 0; layer < weights_.layout.layers; ++layer)
       ops::LatentAttention::addRingUpdate(
           graph, ring(buffers.auxiliaryIn[lane], layer),
-          rowsOf<uint16_t>(s.layerLatents, layer * s.rows + lane * kVerifyRows, kVerifyRows, kLatent),
-          ring(buffers.auxiliaryOut[lane], layer), buffers.retainedCounts, committed, kVerifyRows, window, lane);
+          rowsOf<uint16_t>(s.layerLatents, layer * s.rows + lane * stride, stride, kLatent),
+          ring(buffers.auxiliaryOut[lane], layer), buffers.retainedRows, committed, stride, window, lane);
     for (uint32_t source = 0; source < sources_.size(); ++source) {
       if (ratioOf(source) == 1) continue;
       const uint32_t paired = pairedOf_[source];
@@ -812,7 +853,7 @@ void DeepSeek41Target::addStateCommit(metal::CommandGraph &graph, QwenTargetComm
       const uint64_t at = (uint64_t{paired} * kLanes + lane) * laneBytes;
       ops::LatentAttention::addOpenCommit(graph, backend_.view(s.sourceKv, at, laneBytes),
                                           backend_.view(s.sourceGate, at, laneBytes),
-                                          openGroup(buffers.auxiliaryOut[lane], paired), buffers.retainedCounts,
+                                          openGroup(buffers.auxiliaryOut[lane], paired), buffers.retainedRows,
                                           committed, kLatent, lane);
     }
   }
@@ -840,12 +881,11 @@ std::unique_ptr<QwenTarget> makeQwenTarget(const DeepSeek41Weights &weights, con
   return std::make_unique<DeepSeek41Target>(weights, geometry, backend, operators, prefillChunks);
 }
 
-QwenTargetScratchBytes qwenTargetScratchBytes(const DeepSeek41Weights &weights, const QwenTargetGeometry &,
+QwenTargetScratchBytes qwenTargetScratchBytes(const DeepSeek41Layout &layout, const QwenTargetGeometry &,
                                               uint32_t prefillChunks, uint64_t tableRowBytes) {
-  const DeepSeek41Dimensions &d = weights.layout.deepseek;
-  return DeepSeek41Target::scratchBytes(
-      weights.layout, {weights.layout.hiddenSize, d.sinkhornIterations, d.hcEpsilon, d.normEpsilon}, prefillChunks,
-      tableRowBytes);
+  const DeepSeek41Dimensions &d = layout.deepseek;
+  return DeepSeek41Target::scratchBytes(layout, {layout.hiddenSize, d.sinkhornIterations, d.hcEpsilon, d.normEpsilon},
+                                        prefillChunks, tableRowBytes);
 }
 
 // A step stages the Engram rows of its rows, every Engram layer's at once

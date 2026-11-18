@@ -340,8 +340,8 @@ private:
     bool constrained_ = true;
   };
   // The host claim's pass: up to `target` of what it may take at the
-  // host's pressure now.
-  [[nodiscard]] FreeResult hostPass(uint64_t target);
+  // host's pressure now, for a start it refused when `forRefusedStart`.
+  [[nodiscard]] FreeResult hostPass(uint64_t target, bool forRefusedStart);
   // Room under the limit beside what is charged and being allocated.
   [[nodiscard]] uint64_t roomBytes() const noexcept;
   // HostRule::sample at a fresh sample of the host.

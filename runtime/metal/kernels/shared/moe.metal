@@ -212,157 +212,142 @@ MOE_ROUTE_SELECT_BIASED_ENTRY(moe_route_select_f32_e512_sqrtsoftplus_s1, SPLASH_
 #undef MOE_ROUTE_SELECT_ENTRY
 #undef MOE_ROUTE_SELECT_BODY
 
-// Whether a verified grouping leaves routed route `route` out: its row is
-// past its lane's verify rows (MoeGroupParams).
+// Whether a verified grouping leaves routed route `route` out: its row lies
+// in no lane's rows, which no lane verifies (MoeGroupParams).
 template <uint Shared, bool Verified>
-inline bool moe_unverified_route(device const uint *verify_rows,
-                                 constant MoeGroupParams &params, uint route) {
+inline bool moe_unverified_route(device const SplashLaneRows *lane_rows, constant MoeGroupParams &params,
+                                 uint route) {
   if (!Verified)
     return false;
   const uint row = route / (params.top_k + Shared);
-  return row % params.lane_rows >= verify_rows[row / params.lane_rows];
+  for (uint lane = 0; lane < params.lanes; ++lane)
+    // Wraps past the rows for a row before the lane's.
+    if (row - lane_rows[lane].first < lane_rows[lane].rows)
+      return false;
+  return true;
 }
 
-// Sorts one command's routes by expert. Tile t covers grouped rows
-// [t * tile_rows, (t + 1) * tile_rows) of a single expert; the rows past
-// that expert's last route that its last tile's matmul reads
-// (moe_matmul_rows) carry the route ~0u. One threadgroup covers all routes
-// and thread e owns expert e's count, offsets and tile descriptors. The
-// tiles of experts the slot table holds come first, then the shared slices',
-// slice after slice, each slice's holding every row in order, then those of
+// Sorts one command's routes by expert into tiles of at most tile_rows routes
+// of one expert, a grouped row per route, each tile's rows following the tile
+// before it's (MoeTileDescriptor). One threadgroup covers all routes and
+// thread e owns expert e's count, tiles and first grouped row. The tiles of
+// experts the slot table holds come first, then the shared slices', slice
+// after slice, each slice's holding every row in order, then those of
 // experts it marks MOE_SLOT_ABSENT. It writes the tile count with the expert
 // passes' grids (MoeTileCount) and a streamed block's slot table into
 // expert_slots (ops::MoeScratch::expertSlots). Slots threads, one per expert
-// slot. A Verified grouping routes each lane's verify rows alone
-// (MoeGroupParams).
+// slot. A Verified grouping routes its lanes' rows alone (MoeGroupParams).
 template <uint Slots, uint Shared, bool Verified>
 inline void moe_group_routes_phase(
     device const uint *selected, device MoeTileDescriptor *tiles, device MoeTileCount *tile_count,
     device uint *grouped_routes, device uint *route_rows, device const uint *slots, device uint *expert_slots,
-    device const uint *verify_rows,
+    device const SplashLaneRows *lane_rows,
     constant MoeGroupParams &params, uint thread_index, uint simd_lane, uint simd_group,
-    threadgroup atomic_uint *counts, threadgroup atomic_uint *cursors, threadgroup uint *tile_offsets,
-    threadgroup uint *simd_totals, threadgroup uint *simd_absent) {
+    threadgroup atomic_uint *counts, threadgroup atomic_uint *cursors, threadgroup uint *first_rows,
+    threadgroup uint4 *simd_totals) {
   const uint routes_per_row = params.top_k + Shared;
   const uint routes = params.rows * routes_per_row;
   // A streamed grouping's slot, loaded before the counting: copied for the
-  // passes beside the load, its absent bit parked in tile_offsets until the
+  // passes beside the load, its absent bit parked in first_rows until the
   // counts are in.
   uint slot = 0;
   if (params.streamed && thread_index < params.experts) {
     slot = slots[thread_index];
     expert_slots[thread_index] = slot;
   }
-  tile_offsets[thread_index] = slot & MOE_SLOT_ABSENT;
+  first_rows[thread_index] = slot & MOE_SLOT_ABSENT;
   atomic_store_explicit(&counts[thread_index], 0u, memory_order_relaxed);
   atomic_store_explicit(&cursors[thread_index], 0u, memory_order_relaxed);
   threadgroup_barrier(mem_flags::mem_threadgroup);
   for (uint route = thread_index; route < routes; route += Slots) {
     if (moe_shared_slice(route % routes_per_row, params.top_k) >= Shared &&
-        !moe_unverified_route<Shared, Verified>(verify_rows, params, route)) {
+        !moe_unverified_route<Shared, Verified>(lane_rows, params, route)) {
       atomic_fetch_add_explicit(&counts[selected[route]], 1u,
                                 memory_order_relaxed);
     }
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
 
-  uint count = atomic_load_explicit(&counts[thread_index], memory_order_relaxed);
-  uint expert_tiles = (count + params.tile_rows - 1) / params.tile_rows;
-  const bool absent = tile_offsets[thread_index];
-  uint prefix = simd_prefix_exclusive_sum(absent ? 0u : expert_tiles);
-  uint absent_prefix = simd_prefix_exclusive_sum(absent ? expert_tiles : 0u);
-  if (simd_lane == 31) {
-    simd_totals[simd_group] = prefix + (absent ? 0u : expert_tiles);
-    simd_absent[simd_group] = absent_prefix + (absent ? expert_tiles : 0u);
-  }
+  const uint count = atomic_load_explicit(&counts[thread_index], memory_order_relaxed);
+  const uint expert_tiles = (count + params.tile_rows - 1) / params.tile_rows;
+  const bool absent = first_rows[thread_index];
+  // The tiles and rows of the experts before this one: the resident
+  // experts' (x, z) and the absent ones' (y, w).
+  const uint4 own = absent ? uint4(0, expert_tiles, 0, count) : uint4(expert_tiles, 0, count, 0);
+  uint4 prefix = simd_prefix_exclusive_sum(own);
+  if (simd_lane == 31)
+    simd_totals[simd_group] = prefix + own;
   threadgroup_barrier(mem_flags::mem_threadgroup);
-  uint routed_tiles = 0, absent_tiles = 0;
+  uint4 total = 0;
   for (uint group = 0; group < Slots / 32; ++group) {
-    if (group < simd_group) {
+    if (group < simd_group)
       prefix += simd_totals[group];
-      absent_prefix += simd_absent[group];
-    }
-    routed_tiles += simd_totals[group];
-    absent_tiles += simd_absent[group];
+    total += simd_totals[group];
   }
   const uint shared_tiles =
       (params.rows + params.tile_rows - 1) / params.tile_rows;
-  const uint resident = routed_tiles + Shared * shared_tiles;
-  const uint tile_offset = absent ? resident + absent_prefix : prefix;
-  tile_offsets[thread_index] = tile_offset;
+  const uint resident = total.x + Shared * shared_tiles;
+  // The shared slices' rows follow the resident experts', and the absent
+  // experts' theirs.
+  const uint shared_first_row = total.z;
+  const uint tile_offset = absent ? resident + prefix.y : prefix.x;
+  const uint first_row = absent ? shared_first_row + Shared * params.rows + prefix.w : prefix.z;
+  first_rows[thread_index] = first_row;
   for (uint tile = 0; tile < expert_tiles; ++tile) {
     tiles[tile_offset + tile] = MoeTileDescriptor{
-        thread_index, min(params.tile_rows, count - tile * params.tile_rows)};
-  }
-  if (expert_tiles) {
-    const uint last = tile_offset + expert_tiles - 1;
-    const uint live = count - (expert_tiles - 1) * params.tile_rows;
-    for (uint row = tile_offset * params.tile_rows + count;
-         row < last * params.tile_rows + moe_matmul_rows(live, params.tile_rows);
-         ++row)
-      grouped_routes[row] = ~0u;
+        thread_index, min(params.tile_rows, count - tile * params.tile_rows),
+        first_row + tile * params.tile_rows};
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
   for (uint route = thread_index; route < routes; route += Slots) {
     if (moe_shared_slice(route % routes_per_row, params.top_k) < Shared)
       continue;
-    if (moe_unverified_route<Shared, Verified>(verify_rows, params, route)) {
+    if (moe_unverified_route<Shared, Verified>(lane_rows, params, route)) {
       route_rows[route] = ~0u;
       continue;
     }
-    uint expert = selected[route];
-    uint slot =
-        atomic_fetch_add_explicit(&cursors[expert], 1u, memory_order_relaxed);
-    uint row = tile_offsets[expert] * params.tile_rows + slot;
+    const uint expert = selected[route];
+    const uint row = first_rows[expert] +
+                     atomic_fetch_add_explicit(&cursors[expert], 1u, memory_order_relaxed);
     grouped_routes[row] = route;
     route_rows[route] = row;
   }
 
-  const uint shared_base = routed_tiles * params.tile_rows;
-  const uint shared_rows =
-      (shared_tiles - 1) * params.tile_rows +
-      moe_matmul_rows(params.rows - (shared_tiles - 1) * params.tile_rows,
-                      params.tile_rows);
+  // Slice s's tiles and grouped rows follow slice s - 1's.
   for (uint tile = thread_index; tile < shared_tiles; tile += Slots) {
     for (uint slice = 0; slice < Shared; ++slice)
-      tiles[routed_tiles + slice * shared_tiles + tile] = MoeTileDescriptor{
+      tiles[total.x + slice * shared_tiles + tile] = MoeTileDescriptor{
           params.experts + slice,
-          min(params.tile_rows, params.rows - tile * params.tile_rows)};
+          min(params.tile_rows, params.rows - tile * params.tile_rows),
+          shared_first_row + slice * params.rows + tile * params.tile_rows};
   }
-  // Slice s's grouped rows follow slice s - 1's tiles.
-  for (uint row = thread_index; row < shared_rows; row += Slots) {
-    if (row < params.rows) {
-      for (uint slice = 0; slice < Shared; ++slice) {
-        const uint route = row * routes_per_row + params.top_k + slice;
-        const uint grouped = shared_base + slice * shared_tiles * params.tile_rows + row;
-        grouped_routes[grouped] = route;
-        route_rows[route] = grouped;
-      }
-    } else {
-      for (uint slice = 0; slice < Shared; ++slice)
-        grouped_routes[shared_base + slice * shared_tiles * params.tile_rows + row] = ~0u;
+  for (uint row = thread_index; row < params.rows; row += Slots) {
+    for (uint slice = 0; slice < Shared; ++slice) {
+      const uint route = row * routes_per_row + params.top_k + slice;
+      const uint grouped = shared_first_row + slice * params.rows + row;
+      grouped_routes[grouped] = route;
+      route_rows[route] = grouped;
     }
   }
   if (thread_index == 0) {
-    const uint live = resident + absent_tiles;
+    const uint live = resident + total.y;
     *tile_count = MoeTileCount{live, resident,
                                {params.gate_up_columns, live, 1}, {params.down_columns, live, 1},
                                {params.gate_up_columns, resident, 1}, {params.down_columns, resident, 1},
-                               {params.gate_up_columns, absent_tiles, 1},
-                               {params.down_columns, absent_tiles, 1}};
+                               {params.gate_up_columns, total.y, 1},
+                               {params.down_columns, total.y, 1}};
   }
 }
 
-#define MOE_GROUP_ROUTES_BODY(Slots, Shared, Verified, verify_rows)            \
+#define MOE_GROUP_ROUTES_BODY(Slots, Shared, Verified, lane_rows)             \
     threadgroup atomic_uint counts[Slots];                                     \
     threadgroup atomic_uint cursors[Slots];                                    \
-    threadgroup uint tile_offsets[Slots];                                      \
-    threadgroup uint simd_totals[Slots / 32];                                  \
-    threadgroup uint simd_absent[Slots / 32];                                  \
+    threadgroup uint first_rows[Slots];                                        \
+    threadgroup uint4 simd_totals[Slots / 32];                                 \
     moe_group_routes_phase<Slots, Shared, Verified>(                           \
         selected, tiles, tile_count, grouped_routes, route_rows, slots,        \
-        expert_slots, verify_rows, params, thread_index, simd_lane,            \
-        simd_group, counts, cursors, tile_offsets, simd_totals, simd_absent);
+        expert_slots, lane_rows, params, thread_index, simd_lane, simd_group,  \
+        counts, cursors, first_rows, simd_totals);
 #define MOE_GROUP_ROUTES_ENTRY(Name, Slots, Shared)                            \
   kernel void Name(                                                            \
       device const uint *selected [[buffer(0)]],                               \
@@ -378,8 +363,8 @@ inline void moe_group_routes_phase(
       uint simd_group [[simdgroup_index_in_threadgroup]]) {                    \
     MOE_GROUP_ROUTES_BODY(Slots, Shared, false, nullptr)                       \
   }
-// A verify step's grouping, which routes each lane's verify rows alone
-// (MoeGroupParams), the uint per lane the draft selector wrote.
+// A grouping of a decode step, which routes its lanes' rows alone
+// (MoeGroupParams), as the draft selector laid them out.
 #define MOE_GROUP_ROUTES_VERIFIED_ENTRY(Name, Slots, Shared)                   \
   kernel void Name(                                                            \
       device const uint *selected [[buffer(0)]],                               \
@@ -389,12 +374,12 @@ inline void moe_group_routes_phase(
       device uint *route_rows [[buffer(4)]],                                   \
       device const uint *slots [[buffer(5)]],                                  \
       device uint *expert_slots [[buffer(6)]],                                 \
-      device const uint *verify_rows [[buffer(7)]],                            \
+      device const SplashLaneRows *lane_rows [[buffer(7)]],                    \
       constant MoeGroupParams &params [[buffer(8)]],                           \
       uint thread_index [[thread_index_in_threadgroup]],                       \
       uint simd_lane [[thread_index_in_simdgroup]],                            \
       uint simd_group [[simdgroup_index_in_threadgroup]]) {                    \
-    MOE_GROUP_ROUTES_BODY(Slots, Shared, true, verify_rows)                    \
+    MOE_GROUP_ROUTES_BODY(Slots, Shared, true, lane_rows)                      \
   }
 // Each for the shared slices of a compiled routing, under its slices suffix
 // (ops::kCompiledMoeRoutings), on the expert slots of its selection.
@@ -408,12 +393,10 @@ MOE_GROUP_ROUTES_VERIFIED_ENTRY(moe_group_routes_verified_s2, SPLASH_MOE_EXPERT_
 #undef MOE_GROUP_ROUTES_ENTRY
 #undef MOE_GROUP_ROUTES_BODY
 
-// Copies each grouped row's input so every expert tile is a dense matrix,
-// over the rows the staged expert passes read (moe_staged_rows): padding rows
-// among them are zero and their outputs are never read. Threadgroup (tile,
-// part) copies the part's 256 columns of the tile's rows, eight rows at once,
-// each thread eight columns (16 bytes, rows of whole 256 columns starting
-// 16-byte aligned) of one row.
+// Copies each grouped row's input so every expert tile is a dense matrix of
+// its live rows. Threadgroup (tile, part) copies the part's 256 columns of
+// the tile's rows, eight rows at once, each thread eight columns (16 bytes,
+// rows of whole 256 columns starting 16-byte aligned) of one row.
 kernel void moe_gather_rows(device const bfloat *input [[buffer(0)]],
                             device const uint *grouped_routes [[buffer(1)]],
                             device const MoeTileDescriptor *tiles [[buffer(2)]],
@@ -424,15 +407,13 @@ kernel void moe_gather_rows(device const bfloat *input [[buffer(0)]],
                             uint thread_index [[thread_index_in_threadgroup]]) {
   if (group.x >= *tile_count)
     return;
+  const MoeTileDescriptor tile = tiles[group.x];
   const uint column = group.y * 256 + (thread_index % 32) * 8;
-  const uint rows = moe_staged_rows(tiles, group.x, params.tile_rows);
-  for (uint local = thread_index / 32; local < rows; local += 8) {
-    const uint row = group.x * params.tile_rows + local;
+  for (uint row = tile.first_row + thread_index / 32; row < tile.first_row + tile.rows; row += 8) {
     const uint route = grouped_routes[row];
     *reinterpret_cast<device uint4 *>(grouped_input + ulong(row) * params.input_size + column) =
-        route == ~0u ? uint4(0)
-                     : *reinterpret_cast<device const uint4 *>(
-                           input + ulong(route / params.routes_per_row) * params.input_size + column);
+        *reinterpret_cast<device const uint4 *>(input + ulong(route / params.routes_per_row) * params.input_size +
+                                                column);
   }
 }
 

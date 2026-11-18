@@ -802,7 +802,7 @@ class RequestContractTests(HarnessTestCase):
 
     def test_mask_byte_payload_round_trips(self):
         response = wire.MaskResponseFrame(
-            1, 2, array.array("I", (0, 1, 0xFFFFFFFF, 42)).tobytes()
+            1, 2, array.array("I", (0, 1, 0xFFFFFFFF, 42)).tobytes(), (0, 7, 3, 9)
         )
         encoded = wire.serialize_message(response)
         ((decoded, raw),) = native_peer.ClientFrameReader().feed(encoded)

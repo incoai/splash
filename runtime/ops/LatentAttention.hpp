@@ -12,6 +12,7 @@
 #include "metal/abi/LatentAttention.h"
 
 #include <cstdint>
+#include <span>
 
 namespace splash::ops {
 
@@ -81,7 +82,8 @@ struct LatentAttention final {
   // (LatentRingParams), each of `ring` slots of LATENT_ATTENTION_DIM bf16
   // values: of ringIn, the ring before the step, and the step's latents
   // `step` of positions from `committed` on, up to `rows` of them or, with
-  // `retained` (uint32 per lane), as many as lane `lane` retained.
+  // `retained` (a chain's row mask per lane), as many as lane `lane`
+  // retained.
   static void addRingUpdate(metal::CommandGraph &graph, metal::MetalBuffer ringIn, metal::MetalBuffer step,
                             metal::MetalBuffer ringOut, metal::MetalBuffer retained, uint32_t committed,
                             uint32_t rows, uint32_t ring, uint32_t lane = 0);
@@ -93,6 +95,25 @@ struct LatentAttention final {
   static void addOpenCommit(metal::CommandGraph &graph, metal::MetalBuffer kv, metal::MetalBuffer gate,
                             metal::MetalBuffer open, metal::MetalBuffer retained, uint32_t committed, uint32_t width,
                             uint32_t lane);
+  // A decode step's rows of `words` 32-bit words between the packed layout
+  // `packed` (SplashLaneRows a lane, as its proposer writes it) and lanes of
+  // `stride` rows from row lane * stride (LatentLaneRowsParams): gathering,
+  // `from` packed into `to` laid out so, each lane's row count into
+  // `counts`, that layout into `strided`, each row's position from
+  // committed[lane] into `positions` and each lane's groups' positions into
+  // `groups` (`groupStride` a kind); else `from` laid out so back into `to`
+  // packed, the rows of each lane's packed layout alone.
+  struct LaneRows final {
+    metal::MetalBuffer packed;
+    metal::MetalBuffer counts{};
+    metal::MetalBuffer strided{};
+    metal::MetalBuffer positions{};
+    metal::MetalBuffer groups{};
+    uint32_t groupStride = 0;
+  };
+  static void addLaneRows(metal::CommandGraph &graph, metal::MetalBuffer from, metal::MetalBuffer to,
+                          const LaneRows &layout, std::span<const uint32_t> committed, uint32_t stride,
+                          uint32_t words, bool gather);
   // The parts the values pass splits each of `rows` rows' keys into.
   [[nodiscard]] static uint32_t splits(uint32_t rows) noexcept;
   // The bytes of the sums over parts of the keys `rows` rows take.

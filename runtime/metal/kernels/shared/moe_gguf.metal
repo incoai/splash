@@ -66,10 +66,10 @@ __attribute__((noinline)) void moe_gate_up_column(device bfloat *x, uint rows, u
                                                   uint origin, uint simd_lane, threadgroup half2 *table, bool up,
                                                   threadgroup bfloat *gate, device bfloat *output, ulong out,
                                                   float swiglu_limit) {
-  float sums[MOE_GGUF_COLUMN_ROWS];
+  float sums[GGUF_COLUMN_ROWS];
   moe_formats<4>()(s.format, [&](auto f) {
-    column_dot<decltype(f), MOE_GGUF_COLUMN_ROWS>(x, rows, K, s.w0, s.w1, s.meta, origin + simd_lane, 0, K / 32, table,
-                                                  sums);
+    column_dot<decltype(f), GGUF_COLUMN_ROWS>(x, rows, K, s.w0, s.w1, s.meta, origin + simd_lane, 0, K / 32, table,
+                                              sums);
   });
   if (!up)
     for (uint row = 0; row < rows; ++row) gate[row * GGUF_STAGED_COLUMNS + simd_lane] = bfloat(sums[row]);
@@ -133,8 +133,8 @@ kernel void moe_expert_gguf_gate_up(device bfloat *input [[buffer(0)]],
   const MoeGgufSegment s = up ? us : gs;
   threadgroup half2 *table = tl + (Tables == 2 && up ? kQuantPairTableEntries : 0);
   const uint K = p.input_size, N = p.output_size;
-  device bfloat *x = input + ulong(t) * Rows * K;
-  const ulong out = ulong(t) * Rows * N;
+  device bfloat *x = input + ulong(tile.first_row) * K;
+  const ulong out = ulong(tile.first_row) * N;
   const uint origin = group.x * GGUF_STAGED_COLUMNS;
   threadgroup half *my = stage + simd_group * kStagedSimdgroupStage;
   threadgroup bfloat *gate = reinterpret_cast<threadgroup bfloat *>(stage);
@@ -153,7 +153,7 @@ kernel void moe_expert_gguf_gate_up(device bfloat *input [[buffer(0)]],
     });
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (up)
-      for (uint row = 0; row < R; ++row)
+      for (uint row = 0; row < tile.rows; ++row)
         output[out + ulong(row) * N + origin + simd_lane] =
             bfloat(splash_swiglu(float(park[row * GGUF_STAGED_COLUMNS + simd_lane]),
                                  float(gate[row * GGUF_STAGED_COLUMNS + simd_lane]), p.swiglu_limit));

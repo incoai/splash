@@ -18,7 +18,7 @@
 // pins the bytes both sides agree on.
 namespace splash::protocol {
 
-inline constexpr uint16_t kProtocolVersion = 13;
+inline constexpr uint16_t kProtocolVersion = 14;
 // A frame is its header, the magic "SPLH", the u16 protocol version, the
 // u16 FrameType and the u64 payload length, then the payload.
 inline constexpr size_t kFrameHeaderBytes = 16;
@@ -192,7 +192,8 @@ struct RequestFrame {
 // The other payloads, in wire order; counts precede what they count, and
 // the variable parts come last:
 //   Cancel         u64 requestId
-//   MaskResponse   u64 requestId, u64 maskRequestId, u32 count, u32 words
+//   MaskResponse   u64 requestId, u64 maskRequestId, u32 count, u32 forced
+//                  count, u32 words, u32 forced tokens
 //   StatusRequest  u64 correlationId
 //   ReleaseRequest u64 correlationId
 //   Stop           u64 requestId
@@ -203,7 +204,7 @@ struct RequestFrame {
 //   PromptProgress u64 requestId, u32 processedTokens, u64 elapsedMicros
 //   Tokens         u64 requestId, u32 sequenceOffset, u32 count, u32 tokens
 //   MaskRequest    u64 requestId, u64 maskRequestId, u32 wordsPerMask,
-//                  u32 count, u32 simulation tokens
+//                  u32 count, u32 simulation tokens, u32 their parents
 //   Done           u64 requestId, u8 reason, u8 bounded, u32 promptTokens,
 //                  u32 completionTokens, u64 prefillMicros, u64 decodeMicros,
 //                  u64 wallMicros, u32 deduplicatedTokens, u32 draftedTokens,
@@ -226,6 +227,9 @@ struct MaskResponseFrame {
   uint64_t requestId = 0;
   uint64_t maskRequestId = 0;
   std::vector<uint32_t> maskWords;
+  // Pairs of a mask row and a token the grammar forces after the row's
+  // path, the rows ascending and each row's tokens in order.
+  std::vector<uint32_t> forcedTokens;
 
   bool operator==(const MaskResponseFrame &) const = default;
 };
@@ -279,8 +283,8 @@ struct ReadyEvent {
   // generation (its layout's vocabularySize and stopTokens).
   uint32_t vocabularySize = 0;
   std::vector<uint32_t> stopTokens{};
-  // The rows of one mask request: before the anchor and after each draft
-  // query row (ProtocolLimits::maxSimulationTokens + 1).
+  // The rows of one mask request: before the anchor and after each of a
+  // verify block's rows (ProtocolLimits::maxSimulationTokens + 1).
   uint32_t maskRows = 0;
 
   bool operator==(const ReadyEvent &) const = default;
@@ -316,10 +320,12 @@ struct MaskRequestEvent {
   uint64_t maskRequestId = 0;
   uint32_t wordsPerMask = 0;
   std::vector<uint32_t> simulationTokens;
+  // Each token's parent among them, kNoMaskParent for the first.
+  std::vector<uint32_t> parents;
 
-  // Rows describe the constraint state before and after each simulated
-  // token. Empty input is the initial-anchor request (one row); verification
-  // passes [pending_anchor, draft...] and therefore requires len + 1 rows.
+  // Rows describe the constraint state before the first simulated token and
+  // after each token's path. Empty input is the initial-anchor request (one
+  // row); verification passes its block's tree and requires len + 1 rows.
   bool operator==(const MaskRequestEvent &) const = default;
 };
 

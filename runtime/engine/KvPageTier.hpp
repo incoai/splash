@@ -32,7 +32,8 @@ namespace splash::engine {
 // so that one kind never starves another and reclaim always keeps a quarter.
 // A page's slot holds what the page holds as it is written: a Full page
 // whole, a Slim page its first regions and its index
-// (kv::SlotFormat::payloadBytes). Reads go to the SSD readers beside the
+// (kv::SlotFormat::payloadBytes), and takes that much of the quota
+// (model::SlotFile::quotaBytesFor). Reads go to the SSD readers beside the
 // worker (model::readKvCopy): a restore is a task of a background batch that
 // reads what its page's form holds, the index alone, a Slim page's payload
 // or all of it, into memory of its own and scatters it into the page. The
@@ -54,6 +55,7 @@ public:
              std::shared_ptr<const model::SlotFile> owner)
         : slot(std::move(held)), file(std::move(owner)) {}
     [[nodiscard]] uint64_t id() const noexcept override { return slot->id(); }
+    [[nodiscard]] uint64_t bytes() const noexcept override { return slot->bytes(); }
     [[nodiscard]] std::optional<std::span<const std::byte>>
     readAt(uint64_t offset, uint64_t bytes, std::span<std::byte> buffer) const noexcept override {
       return file->readAt(*slot, offset, bytes, buffer);
@@ -81,7 +83,9 @@ public:
   BasicKvPageTier(const BasicKvPageTier &) = delete;
   BasicKvPageTier &operator=(const BasicKvPageTier &) = delete;
 
-  [[nodiscard]] uint64_t slotBytes() const noexcept override { return file_->slotBytes(); }
+  [[nodiscard]] uint64_t slotBytes(kv::PageForm form) const override {
+    return file_->quotaBytesFor(format_.payloadBytes(form));
+  }
   [[nodiscard]] bool writable() const noexcept override { return file_->writable(); }
   [[nodiscard]] bool persistent() const noexcept override { return file_->persistent(); }
   void label(const std::shared_ptr<KvDiskSlot> &slot, std::vector<std::byte> label) override;
@@ -90,7 +94,8 @@ public:
   [[nodiscard]] std::shared_ptr<KvDiskSlot> adopt(const model::SlotRecord &record);
   [[nodiscard]] bool canDemote(WriteClass write) const noexcept override;
   [[nodiscard]] bool canRestore() const noexcept override { return restores_ < kRestores; }
-  [[nodiscard]] std::shared_ptr<KvDiskSlot> acquireSlot(model::DiskBudget::Draw draw) override;
+  [[nodiscard]] std::shared_ptr<KvDiskSlot> acquireSlot(kv::PageForm form,
+                                                        model::DiskBudget::Draw draw) override;
   [[nodiscard]] std::unique_ptr<KvTransfer>
   demote(uint32_t page, std::shared_ptr<KvDiskSlot> slot, WriteClass write,
          std::function<void()> completion) override;
@@ -231,8 +236,9 @@ template <class Pages> bool BasicKvPageTier<Pages>::canDemote(WriteClass write) 
 }
 
 template <class Pages>
-std::shared_ptr<KvDiskSlot> BasicKvPageTier<Pages>::acquireSlot(model::DiskBudget::Draw draw) {
-  auto slot = file_->acquire(draw);
+std::shared_ptr<KvDiskSlot> BasicKvPageTier<Pages>::acquireSlot(kv::PageForm form,
+                                                                model::DiskBudget::Draw draw) {
+  auto slot = file_->acquire(format_.payloadBytes(form), draw);
   if (!slot)
     return {};
   return std::make_shared<DiskSlot>(std::move(slot), file_);

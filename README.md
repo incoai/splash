@@ -76,8 +76,9 @@ automatically:
 
 Splash also serves DeepSeek-V4.1-Flash
 (`ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF:IQ1_M`), which has no
-DFlash2 draft and decodes one token a cycle. Its IQ1_M build (120.7 GB)
-streams its routed experts from the SSD, and its Engram tables, the last
+DFlash2 draft, so it decodes without one unless `--draft-model` names its
+own. Its IQ1_M build (120.7 GB) streams its routed experts from the SSD, and
+its Engram tables, the last
 part of its split GGUF that its variants share (110.6 GB), always stream;
 it reads llama.cpp's layout of these files (b11870 and newer). A 48 GB Mac serves
 it at 8–11 tokens per second. With `--draft-model
@@ -132,6 +133,7 @@ window. To set your own limits or cache options, add these to `splash serve`:
 | `--language-only` | Skip vision; serve text only. |
 | `--kv-format bf16` | Use BF16 KV cache. Default: 8-bit (INT8). |
 | `--state-format bf16` | Use BF16 recurrent states, half the size. Default: FP32. |
+| `--cached-states exact` | Cache recurrent states unquantized. Default: 8-bit (INT8). |
 | `--activations bf16` | Use BF16 activations. Default: auto. |
 | `--disable-ane` | Prefill on the GPU alone. Default: the 27B also uses the Neural Engine. |
 | `--max-cache-disk 16G` | Cap the SSD cache (default: auto, up to 32 GiB; `0` turns it off). |

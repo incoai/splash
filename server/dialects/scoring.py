@@ -52,7 +52,7 @@ from ..errors import (
     remaining_request_time,
 )
 from ..protocol import MAX_SCORE_TOKENS
-from ..tokenization import tokenizable
+from ..tokenization import tokenizable, unquoted
 
 LETTERS = "ABCDEFGHIJKLMNOP"
 DIRECT_SYSTEM = (
@@ -211,11 +211,16 @@ def encode_prompt(
     `admit` receives the prompt token count before that pass and
     `checkpoint` runs once per slot inside it; either may raise to abandon
     preparation.
+
+    The messages hold what the request sent, so the template renders them
+    quoted and the prompt encodes by its marks (PromptTokenizer): evidence
+    that spells a turn's end stays evidence. The text returned is the one
+    the model reads, without them.
     """
     tokenizer = prompt_tokenizer.tokenizer
     rendered = render_chat_template(
         tokenizer,
-        messages,
+        prompt_tokenizer.quote(messages),
         {
             "chat_template": chat_template,
             "tokenize": False,
@@ -229,9 +234,8 @@ def encode_prompt(
     )
     if chat_format.think_start_id is not None:
         rendered += THINK_START + THINK_END
-    prompt = tokenizable(rendered)
-    head, tail = prompt_tokenizer.split(prompt)
-    tail_ids = list(tokenizer.encode(tail, add_special_tokens=False))
+    head, tail = prompt_tokenizer.split(tokenizable(rendered))
+    tail_ids = prompt_tokenizer.tokens(tail)
     ids = head + tail_ids
     if not ids:
         raise ScoringUnsupported("the tokenizer produced an empty prompt")
@@ -248,12 +252,11 @@ def encode_prompt(
     admit(len(ids))
     for label, token in zip(labels, slots):
         checkpoint()
-        encoded = tokenizer.encode(tail + label, add_special_tokens=False)
-        if encoded != tail_ids + [token]:
+        if prompt_tokenizer.tokens(tail + label) != tail_ids + [token]:
             raise ScoringUnsupported(
                 f"answer boundary changes tokenization for slot {label!r}"
             )
-    return ids, slots, prompt
+    return ids, slots, unquoted(tokenizable(rendered))
 
 
 def judgment_response(model, row, job, result, prompt_sha256):
@@ -596,9 +599,7 @@ def _encode_score_prompt(app, messages, labels, admit, checkpoint, what):
     try:
         return encode_prompt(
             app.prompt_tokenizer,
-            # A scoring prompt holds no image, so the template writes no
-            # placeholder whose marker it would get back.
-            app.request_source(app.chat_templates.select(None).source),
+            app.chat_templates.select(None).source,
             messages,
             labels,
             chat_format=app.chat_format,

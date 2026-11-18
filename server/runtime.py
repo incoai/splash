@@ -142,7 +142,10 @@ class MaskComputationFailed(EngineRuntimeError):
         return MaskComputationFailed(*self.args, retryable=self.retryable)
 
 
-MaskProvider: TypeAlias = Callable[[wire.MaskRequestEvent], bytes]
+# A mask request's masks and its forced tokens (wire.MaskResponseFrame).
+MaskProvider: TypeAlias = Callable[
+    [wire.MaskRequestEvent], tuple[bytes, tuple[int, ...]]
+]
 EventCallback: TypeAlias = Callable[["RuntimeCall", wire.EngineEvent], None]
 CompletionCallback: TypeAlias = Callable[["RuntimeCall"], None]
 # The failure, the seconds the engine served, the fingerprints of the requests
@@ -1404,7 +1407,7 @@ class MultiplexedRuntime:
 
         def compute():
             if call.end_requested or call.done:
-                return b""
+                return b"", ()
             return provider(event)
 
         try:
@@ -1418,20 +1421,20 @@ class MultiplexedRuntime:
             try:
                 if call.end_requested or call.done:
                     return
-                result = completed.result()
+                masks, forced = completed.result()
                 expected = 4 * event.words_per_mask * event.mask_rows
-                if not isinstance(result, bytes):
+                if not isinstance(masks, bytes):
                     raise ValueError(
-                        f"mask provider returned {type(result).__name__}; "
+                        f"mask provider returned {type(masks).__name__}; "
                         f"expected {expected} bytes"
                     )
-                if len(result) != expected:
+                if len(masks) != expected:
                     raise ValueError(
-                        f"mask provider returned {len(result)} bytes; "
+                        f"mask provider returned {len(masks)} bytes; "
                         f"expected {expected}"
                     )
                 response = wire.MaskResponseFrame(
-                    call.request_id, event.mask_request_id, result
+                    call.request_id, event.mask_request_id, masks, forced
                 )
                 encoded = wire.serialize_message(response)
                 if call.end_requested or call.done:

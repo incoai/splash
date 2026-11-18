@@ -104,7 +104,7 @@ const char *writesGatedName(DiskWritesGate gate) noexcept {
 }
 
 // What the streamed stores count by, in the order of their uses
-// (model::SparseRowUse, and ops::MoePhase for model::ExpertStoreStats::uses).
+// (model::SparseRowUse, and model::ExpertStoreStats::uses).
 constexpr std::string_view kStreamedUses[] = {"prefill", "decode"};
 static_assert(std::size(kStreamedUses) == model::kSparseRowUses);
 // The causes of decode gaps past the bound, by GapCause.
@@ -482,6 +482,7 @@ void writeState(json::Writer &w, const CacheSnapshot &resources, const model::Mo
         .field("allocated_bytes", telemetry.stateAllocatedBytes)
         .field("active_lanes", resources.activeRequests)
         .field("idle_gdn_cells", telemetry.idleGdnCells)
+        .field("idle_cached_cells", telemetry.idleCachedCells)
         .field("idle_draft_rings", telemetry.idleDraftRings)
         .field("idle_context_windows", telemetry.idleContextWindows)
         .field("publications", state.publications)
@@ -514,6 +515,8 @@ void writeDisk(json::Writer &w, const engine::EngineSnapshot &core) {
         .field("writes_deferred_ms", tier.writesDeferredMicroseconds / 1000.0)
         .field("read_bytes", tier.readBytes)
         .field("written_bytes", tier.writtenBytes)
+        .field("written_last_hour_bytes", tier.writeRate.hourBytes)
+        .field("written_last_day_bytes", tier.writeRate.dayBytes)
         .field("kv_blocks", tier.diskBlocks)
         .field("kv_bytes", tier.diskBytes)
         .field("kv_demotions", tier.demotions)
@@ -795,9 +798,9 @@ std::string runtimeStatusJson(const StatusStart &start, const StatusSample &samp
           .field("resets", executorTelemetry.draftStateResets);
     });
     // The rows decode cycles verify (--verify-rows): auto where the verify
-    // budget chooses them, all where they are every row up to each lane's
-    // retention limit, anchor without a draft.
-    w.field("verify_rows", executorTelemetry.verifyBudget ? "auto" : executorTelemetry.drafts ? "all" : "anchor");
+    // budget chooses them, all where they are every row of a draft's block a
+    // lane up to each lane's retention limit.
+    w.field("verify_rows", executorTelemetry.verifyBudget ? "auto" : "all");
     w.key("model_timing");
     writeModelTiming(w, executorTelemetry);
     w.object("constraint_masks", [&] {

@@ -6,6 +6,9 @@
 #else
 #include <stdint.h>
 #endif
+#include "metal/abi/ExecutionGeometry.h"
+#include "metal/abi/Gguf.h"
+#include "metal/abi/VerifyTree.h"
 
 // The expert slots of the routing kernels (ops::MoE): a row's router scores
 // take this many floats, the block's experts first, and the select and
@@ -31,45 +34,48 @@ static_assert(sizeof(MoeRouteParams) == 20,
 
 // Every row carries top_k routed experts followed by the slices of the shared
 // expert, ids `experts` on, whose routing weight is the sigmoid of the
-// block's scalar gate or 1 (ops::MoeShape). Routes are sorted by expert: tile
-// t covers grouped rows [t * tile_rows, (t + 1) * tile_rows) of one expert;
-// padding rows carry the route ~0u.
+// block's scalar gate or 1 (ops::MoeShape). Routes are sorted by expert into
+// tiles of at most tile_rows routes of one expert: a tile covers grouped rows
+// [first_row, first_row + rows), each tile's following the tile before it's,
+// a grouped row per route.
 //
 // Written by grouping kernels; the host uses this layout to size storage.
 struct MoeTileDescriptor {
   uint32_t expert;
   uint32_t rows;
+  uint32_t first_row;
 };
 
-static_assert(sizeof(MoeTileDescriptor) == 8,
-              "MoE tile descriptors are 8 bytes on both sides");
+static_assert(sizeof(MoeTileDescriptor) == 12,
+              "MoE tile descriptors are 12 bytes on both sides");
 
 // The staged GGUF expert passes (kernels/shared/moe_gguf.metal) run an
-// expert's only tile of at most this many live rows on the column tile, which
-// reads those rows alone, and every other tile on the staged tile's matmuls
-// (moe_column_tile): a route's output depends on its expert's rows in the
-// step.
-#define MOE_GGUF_COLUMN_ROWS 2u
+// expert's only tile of at most GGUF_COLUMN_ROWS live rows on the column tile
+// (metal/abi/Gguf.h), which reads those rows alone, and every other tile on
+// the staged tile's matmuls (moe_column_tile): a route's output depends on its
+// expert's rows in the step.
 
 // Whether the staged expert passes run tile t of `tiles`, the grouping's
 // MoeTileDescriptors (on the GPU in device memory), on the column tile: at
-// most MOE_GGUF_COLUMN_ROWS live rows, its expert's only tile. The kernels,
+// most GGUF_COLUMN_ROWS live rows, its expert's only tile. The kernels,
 // the MoE test's expected tile kinds and the MoE benchmark's share of column
 // tiles all ask this.
 template <typename Tiles>
 inline bool moe_column_tile(Tiles tiles, uint32_t t) {
-  return tiles[t].rows <= MOE_GGUF_COLUMN_ROWS && (t == 0 || tiles[t - 1].expert != tiles[t].expert);
+  return tiles[t].rows <= GGUF_COLUMN_ROWS && (t == 0 || tiles[t - 1].expert != tiles[t].expert);
 }
 
 // The column tiles of the gate/up and down passes, whose grids the grouping
-// writes (MoeTileCount). A verify step's grouping
-// (moe_group_routes_verified*) routes only each lane's verify rows (the draft
-// selector's, SelectorBatchParams): row r is row r % lane_rows of lane
-// r / lane_rows, and the routed routes of a row past its lane's verify rows
-// stay out of every tile with the route row ~0u, which the combine skips. The
-// other groupings route every row and ignore lane_rows. Only a streamed
-// grouping, of a step whose passes run around its load, reads the block's
-// slot table (MoeTileCount) and copies it for the passes beside the load.
+// writes (MoeTileCount). A verified grouping (moe_group_routes_verified*) of a
+// decode step of `lanes` lanes routes only its lanes' rows, lane_rows[l] as
+// the draft selector laid them out on the device
+// (ops::DraftSelector::addVerifyRows), which its lanes verify: the routed
+// routes of a row of no lane stay out of every tile with the route row ~0u,
+// which the combine skips, so that its hidden state, which nothing reads,
+// costs no expert's work, nor on a streamed store an expert's load. The other
+// groupings route every row. Only a streamed grouping, of a step whose passes
+// run around its load, reads the MoE block's slot table (MoeTileCount) and
+// copies it for the passes beside the load.
 struct MoeGroupParams {
   uint32_t rows;
   uint32_t top_k;
@@ -77,8 +83,8 @@ struct MoeGroupParams {
   uint32_t experts;
   uint32_t gate_up_columns;
   uint32_t down_columns;
-  uint32_t lane_rows;
   uint32_t streamed;
+  uint32_t lanes;
 };
 
 static_assert(sizeof(MoeGroupParams) == 32,
@@ -131,13 +137,12 @@ inline uint32_t moe_end_tile(Count count, uint32_t tiles) {
 #define MOE_SLOT_ABSENT 0x80000000u
 
 struct MoeGatherParams {
-  uint32_t tile_rows;
   uint32_t input_size;
   uint32_t routes_per_row;
 };
 
-static_assert(sizeof(MoeGatherParams) == 12,
-              "MoE gather parameters are 12 bytes on both sides");
+static_assert(sizeof(MoeGatherParams) == 8,
+              "MoE gather parameters are 8 bytes on both sides");
 
 // The routed experts of a MoE block sit in slots, which chunks hold: the
 // floor chunk, chunk 0, holds the first floor_slots slots, a store size's
