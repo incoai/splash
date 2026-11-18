@@ -250,7 +250,7 @@ struct TranscriptTests {
         #expect(position.top == 0 && position.bottom > 0 && position.latest)
         // Which glides there over 0.4 s, and the conversation follows again.
         _ = try await webView.callAsyncJavaScript("document.getElementById('latest').click()", contentWorld: .page)
-        position = try await settled(scrolled, seconds: 2) { $0.top == $0.bottom }
+        position = try await settled(scrolled, seconds: 2) { $0.top == $0.bottom && !$0.latest }
         #expect(position.top == position.bottom && !position.latest)
         // A message sent scrolls to it, wherever the reader was.
         _ = try await webView.callAsyncJavaScript("scrollTo(0, 0)", contentWorld: .page)
