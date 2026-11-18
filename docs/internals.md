@@ -1121,8 +1121,8 @@ channel (`runtime/ops/AneFfn.cpp`), from the least rows startup finds the split
 faster at (below). The GPU runs the leading
 channels on its prefill kernels, its down projection reading a view of the
 leading inputs of down's rows (`Projection::leadingInputs`) through instances
-of the residual kernels of their own (`<kernel>_leading_inputs`), which run
-the residual kernel's tile on the weight planes advanced past the inputs the
+of the plain or residual kernels of their own (`<kernel>_leading_inputs`), which run
+the kernel's tile on the weight planes advanced past the inputs the
 view leaves unread, or, on the int8-activation tile, through that tile's
 stride over the planes' rows. The Neural Engine runs the rest as one W8A8
 program, Hadamard-rotated int8 activations and per-row int8 weights
@@ -1137,7 +1137,11 @@ IOSurfaces and adds the ANE's partial down projection to its own. Shared
 events order each evaluation between the GPU's packing and that join inside
 the one prefill command (`metal::EventStep`); each signal ends a Metal command
 buffer, so the queue holds 512. MoE targets, the mixers and decode stay on the
-GPU.
+GPU. A clamped SwiGLU clips gate above its threshold before SiLU and up on
+both sides before the product. The ANE clips up in units of its factored
+token scale, which the fp32 join restores; the clamp is part of the
+calibration key. A family with a post-FFN norm joins the two plain down
+projections before that norm and the residual add, as Ripple does.
 
 Startup decides the split on the loaded model before it allocates the KV cache
 (`runtime/engine/AneFfnStartup.cpp`), once it has built the memory governor,

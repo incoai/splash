@@ -1,6 +1,7 @@
 #include "Ripple.hpp"
 
 #include "QwenTargetLoader.hpp"
+#include "ops/AneFfn.hpp"
 #include "ops/Embedding.hpp"
 #include "ops/PagedAttention.hpp"
 #include "ops/RowCopy.hpp"
@@ -192,20 +193,17 @@ void RippleTarget::addVerifyMixer(VerifyStep &step, const QwenAttentionWeights &
 // around it: the FFN reads the norm of the residual the post-attention norm
 // made, and its output's norm adds back to that residual, which the
 // attention's norm and add made.
-void RippleTarget::addPrefillFfn(PrefillStep &step, const RippleLayerWeights &layer, metal::MetalBuffer ffnIn,
+void RippleTarget::addPrefillFfn(PrefillStep &step, uint32_t index, const RippleLayerWeights &layer, metal::MetalBuffer ffnIn,
                                  metal::MetalBuffer output) const {
   const QwenTargetPrefillBuffers &b = step.buffers;
   const ops::Linear &linear = operators_.linear();
   ops::Normalization::addRms(step.graph, ffnIn, layer.ffnNorm, b.normalized, geometry_.hiddenSize, step.outputRows());
-  const auto prepared = linear.add(step.graph,
-      {.input = b.normalized, .output = b.denseGateScratch, .scratch = b.linearScratch},
-      layer.ffn.gate, linear.prefillPlan(layer.ffn.gate, step.outputRows(), ops::LinearEpilogue::None, step.rows));
-  linear.add(step.graph,
-             {.input = b.normalized, .output = b.denseIntermediate, .gateScratch = b.denseGateScratch,
-              .scratch = b.linearScratch, .prepared = prepared, .clamp = geometry_.swigluClamp},
-             layer.ffn.up, linear.prefillPlan(layer.ffn.up, step.outputRows(),
-                                             ops::LinearEpilogue::ClampedUpWithGate, step.rows));
-  linear.addPrefill(step.graph, b.denseIntermediate, layer.ffn.down, output, step.outputRows(), b.linearScratch, step.rows);
+  if (step.aneFfn && step.readRows.empty())
+    step.aneFfn->add(step.graph, index, b.ffn(), {}, output, step.rows);
+  else
+    linear.addPrefillSwiGlu(step.graph,
+                           {&layer.ffn.gate, &layer.ffn.up, &layer.ffn.down, geometry_.swigluClamp},
+                           b.ffn(), {}, output, step.outputRows(), step.rows);
   ops::Normalization::addRms(step.graph, output, layer.postFfnNorm, b.normalized, geometry_.hiddenSize, step.outputRows());
   ops::ValueMix::sum(step.graph, b.normalized, ffnIn, output, step.outputRows(), geometry_.hiddenSize);
 }
@@ -229,12 +227,13 @@ void RippleTarget::addVerifyFfn(VerifyStep &step, const RippleLayerWeights &laye
   ops::ValueMix::sum(step.graph, b.normalized, ffnIn, output, step.rows, geometry_.hiddenSize);
 }
 
-// The geometry of a Ripple target's projections: its dense FFNs' gate and up
-// run as one gate/up plan each, and its layers keep no MoE blocks.
-void includeFamilyProjections(QwenTargetGeometry &geometry, const RippleWeights &weights) {
+// The family verifies one native draft block per lane.
+void includeFamilyProjections(QwenTargetGeometry &geometry, const RippleWeights &) {
   geometry.verifyRows = SPLASH_DRAFT_BLOCK_ROWS_LIMIT;
-  for (const RippleLayerWeights &layer : weights.layers)
-    includeDenseFfn(geometry, layer.ffn.projections());
+}
+
+std::optional<ops::SwiGluProjections> denseFfn(const RippleLayerWeights &layer) noexcept {
+  return layer.ffn.projections();
 }
 
 const ops::BlockMoeWeights *qwenMoeBlock(const RippleLayerWeights &) noexcept { return nullptr; }
@@ -274,8 +273,6 @@ std::vector<metal::MetalBuffer> RippleTarget::addPrefill(metal::CommandGraph &gr
                                                          std::span<const QwenTargetPrefillChunk> chunks,
                                                          const kv::PageStorage &kv, SpilledKvReads &spilled,
                                                          QwenPrefillLayers layers, ops::AneFfn *aneFfn) {
-  if (aneFfn)
-    throw std::invalid_argument("Ripple's FFN does not split to the Neural Engine");
   std::vector<PrefillStep> steps = prefillSteps(graph, chunks, kv, spilled, layers, aneFfn);
   return addPrefillLayers(std::span(steps), *this, layers);
 }
@@ -297,7 +294,7 @@ void RippleTarget::addPrefillLayer(PrefillStep &step, uint32_t index) const {
   ops::Normalization::addRms(step.graph, b.attentionOutput, layer.postAttentionNorm, b.normalized,
                              geometry_.hiddenSize, step.outputRows());
   ops::ValueMix::sum(step.graph, b.normalized, residual, b.attentionOutput, step.outputRows(), geometry_.hiddenSize);
-  addPrefillFfn(step, layer, b.attentionOutput, step.readRows.empty() ? output : input);
+  addPrefillFfn(step, index, layer, b.attentionOutput, step.readRows.empty() ? output : input);
 }
 
 const ops::BlockMoeWeights *RippleTarget::moe(uint32_t) const noexcept { return nullptr; }

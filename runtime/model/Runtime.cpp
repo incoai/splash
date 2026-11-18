@@ -3840,18 +3840,16 @@ ModelTelemetry Runtime::telemetry() const noexcept {
 }
 
 std::vector<ops::SwiGluProjections> aneFfnLayers(const LoadedModel &model) {
-  // The split computes an unclamped silu(gate) * up, which a family whose
-  // SwiGLU clamps (Ripple's) may not run: no layers for it.
-  if (std::visit([](const QwenHybridLayout &layout) { return layout.swigluClamp > 0.0F; },
-                 model.descriptor.target))
-    return {};
+  const float clamp = std::visit([](const QwenHybridLayout &layout) { return layout.swigluClamp; },
+                                 model.descriptor.target);
   return std::visit(
-      [](const auto &weights) {
+      [clamp](const auto &weights) {
         std::vector<ops::SwiGluProjections> layers;
         for (const auto &layer : weights.layers) {
           const std::optional<ops::SwiGluProjections> dense = denseFfn(layer);
           if (!dense) return std::vector<ops::SwiGluProjections>{};
           layers.push_back(*dense);
+          layers.back().clamp = clamp;
         }
         return layers;
       },

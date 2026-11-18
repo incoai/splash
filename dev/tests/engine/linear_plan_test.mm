@@ -1441,12 +1441,12 @@ void leadingInputViews(metal::MetalBackend &backend) {
   const auto refuses = [&](const Projection &view, const LinearPlan &plan) {
     metal::CommandGraph graph;
     rejects([&] { (void)linear.add(graph, buffersOf(plan), view, plan); },
-            "a view of leading inputs runs only the quantized prefill residual tiles",
+            "a view of leading inputs runs only the quantized plain or residual prefill tiles",
             "a view of leading inputs ran on a plan without its instance");
     require(graph.empty(), "a refused view of leading inputs encoded a dispatch");
   };
   refuses(gguf, linear.decodePlan(gguf, 1, LinearEpilogue::Residual));
-  for (const LinearEpilogue epilogue : {LinearEpilogue::None, LinearEpilogue::UpWithGate})
+  for (const LinearEpilogue epilogue : {LinearEpilogue::UpWithGate, LinearEpilogue::ClampedUpWithGate})
     refuses(gguf, residualPrefill({.tile = LinearTile::GgufPrefill}, epilogue));
   refuses(gguf, Linear::plan({{n, k}, 32, LinearPhase::Prefill, LinearEpilogue::Residual},
                              {.tile = LinearTile::GgufStaged}, FloatOutput::BFloat16));

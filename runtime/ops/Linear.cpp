@@ -52,15 +52,16 @@ constexpr uint64_t rotatedBytes(uint32_t width, uint64_t rows) noexcept { return
 
 // Throws if `p` is a view of the leading inputs of wider weight rows
 // (Projection::leadingInputs) that `plan` has no kernel instance for: only the
-// prefill residual tiles of quantized segments (GgufPrefill's
+// plain or residual prefill tiles of quantized segments (GgufPrefill's
 // leadingInputsInstance, GgufPrefillInt8's plane stride), unrotated, read one.
 void requireLeadingInputs(const LinearPlan &plan, const Projection &p) {
   if (!p.planeInputs()) return;
   const LinearWorkload w = plan.workload();
   const LinearTile tile = plan.configuration().tile;
-  if (w.phase != LinearPhase::Prefill || w.epilogue != LinearEpilogue::Residual ||
+  if (w.phase != LinearPhase::Prefill ||
+      (w.epilogue != LinearEpilogue::Residual && w.epilogue != LinearEpilogue::None) ||
       (tile != LinearTile::GgufPrefill && tile != LinearTile::GgufPrefillInt8) || p.rotation)
-    throw std::invalid_argument("a view of leading inputs runs only the quantized prefill residual tiles");
+    throw std::invalid_argument("a view of leading inputs runs only the quantized plain or residual prefill tiles");
 }
 
 // Throws unless views of `p`'s planes can stand for it (takesPlaneViews).
@@ -299,9 +300,13 @@ void Linear::addPrefillSwiGlu(metal::CommandGraph &graph, const SwiGluProjection
                                        *ffn.gate, prefillPlan(*ffn.gate, rows, LinearEpilogue::None, chunkRows));
   add(graph,
       {.input = b.normalized, .output = b.intermediate, .gateScratch = b.gateScratch, .scratch = b.scratch,
-       .prepared = normalized},
-      *ffn.up, prefillPlan(*ffn.up, rows, LinearEpilogue::UpWithGate, chunkRows));
-  addPrefillResidual(graph, b.intermediate, *ffn.down, residual, output, rows, b.scratch, chunkRows);
+       .prepared = normalized, .clamp = ffn.clamp},
+      *ffn.up, prefillPlan(*ffn.up, rows, ffn.clamp > 0.0F ? LinearEpilogue::ClampedUpWithGate
+                                                        : LinearEpilogue::UpWithGate, chunkRows));
+  if (residual)
+    addPrefillResidual(graph, b.intermediate, *ffn.down, residual, output, rows, b.scratch, chunkRows);
+  else
+    addPrefill(graph, b.intermediate, *ffn.down, output, rows, b.scratch, chunkRows);
 }
 
 } // namespace splash::ops

@@ -1294,16 +1294,18 @@ void prefillInt8(MetalBackend &backend, const Linear &linear) {
                                                                              : MetalBuffer{},
                                                upload(backend, planes.meta))}});
     const Projection view = Projection(N, K, BlockWeights{{whole.segment}}).leadingInputs(kLeading);
-    const LinearPlan plan = Linear::plan({{N, kLeading}, kChunk, LinearPhase::Prefill, LinearEpilogue::Residual},
-                                         kInt8, FloatOutput::BFloat16);
-    const uint32_t storage = plan.storageRows();
-    const std::vector<uint16_t> x = storageRows(activations(Inputs::Dense, storage, kLeading), kLeading, kChunk,
-                                                storage);
-    const std::vector<uint16_t> aux = storageRows(residuals(storage, N), N, storage, storage);
-    const std::string label = std::string(fmtName(f)) + " int8 leading inputs";
-    if (run(backend, linear, plan, view, nullptr, x, aux, kPoisonNaN, N, label).output !=
-        run(backend, linear, plan, compact, nullptr, x, aux, kPoisonNaN, N, label).output)
-      fail(label + ": differs from the repacked leading inputs");
+    for (const LinearEpilogue epilogue : {LinearEpilogue::None, LinearEpilogue::Residual}) {
+      const LinearPlan plan = Linear::plan({{N, kLeading}, kChunk, LinearPhase::Prefill, epilogue},
+                                           kInt8, FloatOutput::BFloat16);
+      const uint32_t storage = plan.storageRows();
+      const std::vector<uint16_t> x = storageRows(activations(Inputs::Dense, storage, kLeading), kLeading, kChunk,
+                                                  storage);
+      const std::vector<uint16_t> aux = storageRows(residuals(storage, N), N, storage, storage);
+      const std::string label = std::string(fmtName(f)) + " int8 leading inputs";
+      if (run(backend, linear, plan, view, nullptr, x, aux, kPoisonNaN, N, label).output !=
+          run(backend, linear, plan, compact, nullptr, x, aux, kPoisonNaN, N, label).output)
+        fail(label + ": differs from the repacked leading inputs");
+    }
   }
   // af4g64 and af5g64 segments fused, as a mixed 4/5-bit MLX quantization does.
   for (const uint32_t K : {1024u, 5120u}) {
@@ -1410,18 +1412,20 @@ void leadingInputs(MetalBackend &backend, const Linear &linear) {
                                                                              : MetalBuffer{},
                                                upload(backend, planes.meta))}});
     const Projection view = Projection(N, K, BlockWeights{{whole.segment}}).leadingInputs(kLeading);
-    const LinearWorkload w{{N, kLeading}, kChunk, LinearPhase::Prefill, LinearEpilogue::Residual};
-    const LinearPlan plan = Linear::plan(w, {.tile = LinearTile::GgufPrefill}, FloatOutput::BFloat16);
-    const uint32_t storage = plan.storageRows();
-    const std::vector<uint16_t> x = storageRows(activations(Inputs::Dense, storage, kLeading), kLeading, kChunk,
-                                                storage);
-    const std::vector<uint16_t> aux = storageRows(residuals(storage, N), N, storage, storage);
-    const std::string label = std::string(fmtName(fi)) + " leading inputs";
-    const Outcome expected = run(backend, linear, plan, compact, nullptr, x, aux, kPoisonNaN, N, label);
-    const Outcome got = run(backend, linear, plan, view, nullptr, x, aux, kPoisonNaN, N, label);
-    if (got.output != expected.output) fail(label + ": differs from the repacked leading inputs");
+    for (const LinearEpilogue epilogue : {LinearEpilogue::None, LinearEpilogue::Residual}) {
+      const LinearWorkload w{{N, kLeading}, kChunk, LinearPhase::Prefill, epilogue};
+      const LinearPlan plan = Linear::plan(w, {.tile = LinearTile::GgufPrefill}, FloatOutput::BFloat16);
+      const uint32_t storage = plan.storageRows();
+      const std::vector<uint16_t> x = storageRows(activations(Inputs::Dense, storage, kLeading), kLeading, kChunk,
+                                                  storage);
+      const std::vector<uint16_t> aux = storageRows(residuals(storage, N), N, storage, storage);
+      const std::string label = std::string(fmtName(fi)) + " leading inputs";
+      const Outcome expected = run(backend, linear, plan, compact, nullptr, x, aux, kPoisonNaN, N, label);
+      const Outcome got = run(backend, linear, plan, view, nullptr, x, aux, kPoisonNaN, N, label);
+      if (got.output != expected.output) fail(label + ": differs from the repacked leading inputs");
+    }
   }
-  section("leading inputs: " + std::to_string(FMT_COUNT) + " formats' residual prefill over a view of 512 of 1024 "
+  section("leading inputs: " + std::to_string(FMT_COUNT) + " formats' plain and residual prefill over a view of 512 of 1024 "
           "inputs equal to them repacked");
 }
 

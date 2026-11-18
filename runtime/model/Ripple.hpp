@@ -118,6 +118,8 @@ struct RippleLayerWeights final {
 
 using RippleWeights = QwenTargetWeights<RippleLayout, RippleLayerWeights>;
 
+[[nodiscard]] std::optional<ops::SwiGluProjections> denseFfn(const RippleLayerWeights &layer) noexcept;
+
 class RippleTarget final : public QwenTarget {
 public:
   RippleTarget(const RippleWeights &weights, const QwenTargetGeometry &geometry,
@@ -156,7 +158,7 @@ private:
                       ops::PreparedInput normalized, BlockOutput output) const;
   // The block's dense SwiGLU, whose activations clamp, and the norms and adds
   // of its post-norm arrangement.
-  void addPrefillFfn(PrefillStep &step, const RippleLayerWeights &layer, metal::MetalBuffer ffnIn,
+  void addPrefillFfn(PrefillStep &step, uint32_t index, const RippleLayerWeights &layer, metal::MetalBuffer ffnIn,
                      metal::MetalBuffer output) const;
   void addVerifyFfn(VerifyStep &step, const RippleLayerWeights &layer, metal::MetalBuffer ffnIn,
                     metal::MetalBuffer output) const;

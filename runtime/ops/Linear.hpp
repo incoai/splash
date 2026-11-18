@@ -172,11 +172,13 @@ struct LinearScratch final {
   // (ProjectionShape::rotated), sized by decode/prefillScratchSize(shape).rotated.
   metal::MetalBuffer rotated{};
 };
-// One layer's SwiGLU projections: down(silu(gate x) * up x).
+// One layer's SwiGLU projections, optionally clamping gate above and up on
+// both sides before their product; zero leaves them unclamped.
 struct SwiGluProjections final {
   const Projection *gate = nullptr;
   const Projection *up = nullptr;
   const Projection *down = nullptr;
+  float clamp = 0.0F;
 };
 // A prefill chunk's buffers of its dense FFN: the normalized rows, gate's
 // output, the intermediate rows and the linear scratch.
@@ -338,7 +340,8 @@ public:
                           metal::MetalBuffer residual, metal::MetalBuffer output, uint32_t rows,
                           LinearScratch scratch, uint32_t chunkRows = 0) const;
   // output = residual + down(silu(gate x) * up x) of `rows` normalized rows;
-  // up takes what gate's plan leaves of x in the scratch table.
+  // an empty residual leaves just the down projection. Up takes what gate's
+  // plan leaves of x in the scratch table; ffn.clamp applies before SwiGLU.
   void addPrefillSwiGlu(metal::CommandGraph &graph, const SwiGluProjections &ffn, const PrefillFfnBuffers &buffers,
                         metal::MetalBuffer residual, metal::MetalBuffer output, uint32_t rows,
                         uint32_t chunkRows = 0) const;
