@@ -23,14 +23,25 @@ inline void gguf_store_sums(thread Acc &acc, uint splits, uint split, device coh
                             device atomic_uint *counter, uint stride, uint column0, uint thread_index,
                             threadgroup uint *arrival, Store store) {
   if (splits == 1) { gguf_elements(acc, store); return; }
-  // Instrumented out-of-line closures must own the reduction indices,
-  // rather than retaining references into the caller's stack.
-  const auto at = [=](uint s, uint row, uint column) { return (ulong(s) * Rows + row) * stride + column0 + column; };
-  gguf_elements(acc, [=](uint row, uint column, float v) { partials[at(split, row, column)] = v; });
+  // Access coherent partials directly; only completed scalar sums enter the callback.
+#pragma unroll
+  for (ushort i = 0; i < acc.get_capacity(); ++i) {
+    if (!acc.is_valid_element(i)) continue;
+    const auto index = acc.get_multidimensional_index(i);
+    const ulong at = ulong(index[1]) * stride + column0 + index[0];
+    partials[ulong(split) * Rows * stride + at] = acc[i];
+  }
   if (!split_arrive_last(counter, splits, thread_index, arrival)) return;
-  gguf_elements(acc, [=](uint row, uint column, float v) {
-    store(row, column, split_sum(v, split, splits, [=](uint s) { return partials[at(s, row, column)]; }));
-  });
+#pragma unroll
+  for (ushort i = 0; i < acc.get_capacity(); ++i) {
+    if (!acc.is_valid_element(i)) continue;
+    const auto index = acc.get_multidimensional_index(i);
+    const ulong at = ulong(index[1]) * stride + column0 + index[0];
+    float sum = 0.0f;
+    for (uint s = 0; s < splits; ++s)
+      sum += s == split ? float(acc[i]) : partials[ulong(s) * Rows * stride + at];
+    store(index[1], index[0], sum);
+  }
   split_release(counter, thread_index);
 }
 // A gate/up pair's sums over every K partition, stored as bf16(up) * silu(bf16(gate)). One partition stores its own;
@@ -59,15 +70,13 @@ inline void gguf_store_gate_up(thread Acc &gate, thread Acc &up, uint splits, ui
     }
     return;
   }
-  const auto at = [=](uint s, uint row, uint column) {
-    return (ulong(s) * Rows + row) * (2 * stride) + column0 + column;
-  };
 #pragma unroll
   for (ushort i = 0; i < gate.get_capacity(); ++i) {
     if (!gate.is_valid_element(i)) continue;
     const auto index = gate.get_multidimensional_index(i);
-    partials[at(split, index[1], index[0])] = gate[i];
-    partials[at(split, index[1], index[0]) + stride] = up[i];
+    const ulong at = (ulong(split) * Rows + index[1]) * (2 * stride) + column0 + index[0];
+    partials[at] = gate[i];
+    partials[at + stride] = up[i];
   }
   if (!split_arrive_last(counter, splits, lane, arrival)) return;
 #pragma unroll
@@ -75,9 +84,13 @@ inline void gguf_store_gate_up(thread Acc &gate, thread Acc &up, uint splits, ui
     if (!gate.is_valid_element(i)) continue;
     const auto index = gate.get_multidimensional_index(i);
     const uint row = index[1], column = index[0];
-    const float g = split_sum(float(gate[i]), split, splits, [=](uint s) { return partials[at(s, row, column)]; });
-    const float u = split_sum(float(up[i]), split, splits,
-                              [=](uint s) { return partials[at(s, row, column) + stride]; });
+    const ulong at = ulong(row) * (2 * stride) + column0 + column;
+    float g = 0.0f, u = 0.0f;
+    for (uint s = 0; s < splits; ++s) {
+      const ulong slot = ulong(s) * Rows * (2 * stride) + at;
+      g += s == split ? float(gate[i]) : partials[slot];
+      u += s == split ? float(up[i]) : partials[slot + stride];
+    }
     output[out(row, column)] = value(g, u);
   }
   split_release(counter, lane);

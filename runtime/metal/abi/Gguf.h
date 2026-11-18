@@ -97,7 +97,7 @@ struct GgufPrefillLeadingParams {
   uint32_t plane_input_size;
 };
 static_assert(sizeof(GgufPrefillLeadingParams) == 24,
-              "GGUF leading-input prefill parameters are 20 bytes on both sides");
+              "GGUF leading-input prefill parameters are 24 bytes on both sides");
 // The plain prefill kernels (gguf_prefill_<format>_a): up to three column segments of the kernel's format in one
 // dispatch, tiles in segment order, as a fused decode dispatch takes them; a single tensor is one segment.
 struct GgufPrefillSegmentsParams {

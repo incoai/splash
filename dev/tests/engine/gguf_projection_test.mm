@@ -1103,6 +1103,18 @@ void decodeInt8(MetalBackend &backend, const Linear &linear, uint32_t nativeRows
                            const std::vector<uint16_t> &x, const std::vector<uint16_t> &aux, uint32_t poison,
                            uint32_t covered, const std::string &label) {
     const Outcome out = run(backend, linear, plan, p, gate, x, aux, poison, covered, label);
+    // Repeated two-pass projections must preserve the gate and output,
+    // including instrumented runs with recycled scratch allocations.
+    if (nativeRows == kLaneRows && plan.workload().rows == 2 * nativeRows &&
+        plan.workload().epilogue == LinearEpilogue::ClampedGateUp &&
+        plan.configuration().splits == 8 && plan.configuration().spread &&
+        !plan.configuration().oneGateUpPass) {
+      for (uint32_t repeat = 1; repeat < 1024; ++repeat) {
+        const Outcome again = run(backend, linear, plan, p, gate, x, aux, poison, covered, label);
+        if (again.gate != out.gate || again.output != out.output)
+          fail(label + ": a repeated two-pass projection differs");
+      }
+    }
     if (std::none_of(out.pipelines.begin(), out.pipelines.end(),
                      [](const std::string &name) { return name.starts_with("gguf_decode_int8_"); }))
       fail(label + ": runs no int8 tile");
