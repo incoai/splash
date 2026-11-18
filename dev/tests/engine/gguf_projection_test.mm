@@ -603,15 +603,22 @@ void decodeTile(MetalBackend &backend, const Linear &linear, LinearTile tile, bo
             const uint32_t storage = plan.storageRows(), rows = wl.rows;
             const std::string label = what + " L=" + std::to_string(lanes);
             const std::vector<uint16_t> aux = storageRows(residual, columns, rows, storage);
-            const Outcome out = run(backend, linear, plan, up, gated, storageRows(x, K, rows, storage), aux,
-                                    kPoisonFinite, N, label);
-            checkValues(out, within(dots, staged), within(gateDots, staged), aux, wl, rows, N, label);
-            if (epilogue == LinearEpilogue::None)
-              floatOutput(backend, linear, Linear::plan(wl, config(tile, splits, spread), FloatOutput::Float32), up,
-                          storageRows(x, K, rows, storage), out, within(dots, staged), N, label);
-            for (uint32_t lane = 0; lane < lanes; ++lane)
-              if (!sameRows(out.output, lane * kLaneRows, lanesAlone[lane].output, 0, kLaneRows, columns))
-                fail(label + ": lane " + std::to_string(lane) + " differs from its one-lane projection");
+            // Stress the wide two-pass case against its independent row references.
+            const uint32_t repeats = staged && spread && w.format == Fmt(GGUF_FMT_Q3K) && K == 2304 &&
+                                             inputs == Inputs::Dense && epilogue == LinearEpilogue::GateUp &&
+                                             splits == 2 && lanes == 8
+                                         ? 512u : 1u;
+            for (uint32_t repetition = 0; repetition < repeats; ++repetition) {
+              const Outcome out = run(backend, linear, plan, up, gated, storageRows(x, K, rows, storage), aux,
+                                      kPoisonFinite, N, label);
+              checkValues(out, within(dots, staged), within(gateDots, staged), aux, wl, rows, N, label);
+              if (epilogue == LinearEpilogue::None)
+                floatOutput(backend, linear, Linear::plan(wl, config(tile, splits, spread), FloatOutput::Float32), up,
+                            storageRows(x, K, rows, storage), out, within(dots, staged), N, label);
+              for (uint32_t lane = 0; lane < lanes; ++lane)
+                if (!sameRows(out.output, lane * kLaneRows, lanesAlone[lane].output, 0, kLaneRows, columns))
+                  fail(label + ": lane " + std::to_string(lane) + " differs from its one-lane projection");
+            }
           }
         }
     }
