@@ -192,6 +192,13 @@ loadModel(metal::MetalBackend &backend,
                                                        uint64_t streamedTableBytes,
                                                        std::shared_ptr<SsdReaders> readers);
 
+// The scratch of the LiLiCorr selector of `descriptor`'s draft, from its
+// files before the model loads (DFlashDraft::liLiCorrBytes); zero without
+// one. The stores are planned beside it, as the loaded model's plan holds it.
+[[nodiscard]] uint64_t plannedSelectorBytes(metal::MetalBackend &backend, const std::filesystem::path &root,
+                                            const ModelDescriptor &descriptor,
+                                            const ops::ExecutionPlans &operators);
+
 // The FFN layers of a target whose every layer's FFN is dense (denseFfn),
 // which the prefill FFN's Neural Engine split (ops::AneFfn) may take; none
 // for another target.

@@ -7,7 +7,6 @@
 #include "engine/DiskLabels.hpp"
 #include "metal/abi/ExecutionGeometry.h"
 #include "metal/abi/PagedAttention.h"
-#include "model/DFlashDraft.hpp"
 #include "model/ExpertStore.hpp"
 #include "model/ModelSizing.hpp"
 #include "model/RuntimeArenas.hpp"
@@ -839,10 +838,12 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
   // files give: whatever streams, its projections are those of its formats.
   const auto planArenas = [&](const model::QwenTargetGeometry &target) {
     try {
+      const uint64_t selectorBytes = model::plannedSelectorBytes(*backend, config.modelRoot, config.model, operators);
       const auto arenas = [&](model::StreamedParts parts) {
         const model::ModelMemoryPlan streamed = model::plannedRuntimeMemory(
             config.model, target, operators, config.kvFormat, config.stateFormat, parts);
-        return streamed.sharedPrefillPlannedAllocatedBytes + streamed.sharedDecodePlannedAllocatedBytes;
+        return streamed.sharedPrefillPlannedAllocatedBytes + streamed.sharedDecodePlannedAllocatedBytes +
+               selectorBytes;
       };
       for (const bool table : {false, true}) {
         const uint64_t tableRowBytes = table ? streamable.tableRowBytes : 0;
@@ -958,12 +959,8 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
     // loaded: one quantity from two sources, which a start requires equal,
     // for the K/V in memory and where it spills, rather than serve stores
     // sized for another model's arenas.
-    // A LiLiCorr selector's scratch counts only in the loaded model's plan
-    // (model::plannedRuntimeMemory), which the files' plan leaves out.
-    const uint64_t selectorBytes = model::DFlashDraft::liLiCorrBytes(loaded.draft, operators);
     const auto requirePlanned = [&](uint64_t planned, const model::ModelMemoryPlan &as, const char *runtime) {
-      const uint64_t loadedBytes =
-          as.sharedPrefillPlannedAllocatedBytes + as.sharedDecodePlannedAllocatedBytes - selectorBytes;
+      const uint64_t loadedBytes = as.sharedPrefillPlannedAllocatedBytes + as.sharedDecodePlannedAllocatedBytes;
       if (planned != loadedBytes)
         throw RuntimeResourcesError(RuntimeResourceStage::MemoryPlanning,
                                     std::string("the arenas of ") + runtime + " that the model's files planned, " +

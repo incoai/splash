@@ -4731,8 +4731,8 @@ ModelMemoryPlan plannedRuntimeMemory(const LoadedModel &model,
   requireCompatibleModel(model);
   ModelMemoryPlan plan = memoryPlanOf(model.descriptor, stateFormat,
                                       RuntimeGeometry::from(model, kvFormat, stateFormat, parts), operators);
-  // ponytail: a LiLiCorr selector's scratch counts only here, where its
-  // weights are loaded; the descriptor's plan below leaves out its few MiB.
+  // A LiLiCorr selector's scratch, which the files' plan takes from
+  // plannedSelectorBytes.
   plan.sharedDecodePlannedAllocatedBytes += DFlashDraft::liLiCorrBytes(model.draft, operators);
   return plan;
 }

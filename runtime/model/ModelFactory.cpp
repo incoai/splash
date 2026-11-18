@@ -134,6 +134,16 @@ QwenTargetGeometry plannedTargetGeometry(metal::MetalBackend &backend, const std
       [&](const auto &weights) { return qwenTargetGeometry(weights, descriptor.draft.targetLayerIds()); }, target);
 }
 
+uint64_t plannedSelectorBytes(metal::MetalBackend &backend, const std::filesystem::path &root,
+                              const ModelDescriptor &descriptor, const ops::ExecutionPlans &operators) {
+  if (!descriptor.draft.present() || !descriptor.draft.lilicorr) return 0;
+  // Released as plannedTargetGeometry's: only the projections' formats count.
+  WeightImages images(backend, descriptor.sourceIdentity);
+  images.release();
+  DraftCheckpointLoader files(backend, images, root / "draft", descriptor.draft);
+  return DFlashDraft::liLiCorrBytes(loadDFlashDraftWeights(backend, files, descriptor.draft), operators);
+}
+
 LoadedModel loadModel(metal::MetalBackend &backend,
                               const std::filesystem::path &root,
                               const ModelDescriptor &descriptor,
