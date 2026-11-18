@@ -519,10 +519,9 @@ int main(int argc, char **argv) {
       sequence.tokens = tokens;
       sequence.request = QwenTargetRequest{
           tokens, [](uint64_t logical) { return std::array<uint32_t, 3>{uint32_t(logical), uint32_t(logical), uint32_t(logical)}; }};
-      sequence.attentionStride = (kRows + kv::kPageTokens - 1) / kv::kPageTokens * kv::kPageTokens;
-      sequence.queryOffset = 0;
-      sequence.kvOffset = 0;
-      sequence.chunk = ops::PagedAttention::prefillParams(0, kRows, sequence.attentionStride, 1);
+
+
+      sequence.chunk = ops::PagedAttention::chunkParams(0, kRows, (sequence.rows + splash::kv::kPageTokens - 1) / splash::kv::kPageTokens * splash::kv::kPageTokens, 1);
       MetalBuffer table = backend.allocateBuffer(sizeof(SplashKvPage), BufferStorage::Shared, "page table");
       pages.writeEntries(pageIds, 0, table);
       sequence.pageTable = table;
@@ -531,6 +530,7 @@ int main(int argc, char **argv) {
       chunk.buffers = buffers;
       chunk.sequences = {&sequence, 1};
       chunk.rows = kRows;
+      *static_cast<SplashLaneRows *>(buffers.laneRows.contents()) = {0, kRows};
 
       SpilledKvReads spilled;
       const std::vector<MetalBuffer> finalHidden =
@@ -552,7 +552,7 @@ int main(int argc, char **argv) {
       // Every row's head, so the comparison holds all four positions.
       for (uint32_t row = 0; row < kRows; ++row)
         ops::RowCopy::add(graph, finalHidden[0], {row, kHidden, 0}, headInput, {row, kHidden, 0}, 1, kHidden);
-      target->addHeadBatch(graph, headInput, finalHidden0, logitsBuffer, 1, kVerifyRows,
+      target->addHeadBatch(graph, headInput, finalHidden0, logitsBuffer, kVerifyRows,
                            decodeArena.linearScratch());
     static_cast<void>(backend.submitCommandAsync(graph.dispatches()).wait());
     return logitsBuffer;
@@ -620,12 +620,13 @@ int main(int argc, char **argv) {
         sequence.request = {ids[c], [](uint64_t pos) {
           return std::array<uint32_t,3>{uint32_t(pos),uint32_t(pos),uint32_t(pos)};
         }};
-        sequence.attentionStride = kv::kPageTokens;
-        sequence.chunk = ops::PagedAttention::prefillParams(0, kRows, sequence.attentionStride, 1);
+
+        sequence.chunk = ops::PagedAttention::chunkParams(0, kRows, (sequence.rows + splash::kv::kPageTokens - 1) / splash::kv::kPageTokens * splash::kv::kPageTokens, 1);
         sequence.pageTable = backend.allocateBuffer(sizeof(SplashKvPage), BufferStorage::Shared, "group page");
         const std::vector<uint32_t> page{c * extent};
         pages.writeEntries(page, 0, sequence.pageTable);
-        chunks[c] = {b, {&sequence, 1}, kRows};
+        *static_cast<SplashLaneRows *>(b.laneRows.contents()) = {0, kRows};
+        chunks[c] = {b, {&sequence, 1}, kRows, nullptr};
         if (!together) outputs[c] = target->addPrefill(graph, {&chunks[c], 1}, pages, reads, {0,kLayers})[0];
       }
       if (together) {
@@ -642,7 +643,7 @@ int main(int argc, char **argv) {
         normalizedHeads[c] = backend.allocateBuffer(heads[c].sizeBytes(), BufferStorage::Shared, "group norm");
         results[c] = backend.allocateBuffer(uint64_t{headRows} * kVocab * 4, BufferStorage::Shared, "group logits");
         ops::RowCopy::add(graph, outputs[c], {0,kHidden,0}, heads[c], {0,kHidden,0}, kRows, kHidden);
-        target->addHeadBatch(graph, heads[c], normalizedHeads[c], results[c], 1, headRows, decodeArena.linearScratch());
+        target->addHeadBatch(graph, heads[c], normalizedHeads[c], results[c], headRows, decodeArena.linearScratch());
       }
       static_cast<void>(backend.submitCommandAsync(graph.dispatches()).wait());
       std::vector<std::vector<float>> copied(count, std::vector<float>(kRows * kVocab));
@@ -674,7 +675,6 @@ int main(int argc, char **argv) {
     auto verifyGeometry = geometry;
     verifyGeometry.draft = splash::model::draftLayout(kHidden, kVocab, 1, kIntermediate, kTheta,
                                                        targetLayers, SPLASH_DRAFT_VARIANTS[1]);
-    verifyGeometry.target.verifyRows = 16;
     const model::DecodeArena verifyArena(backend, verifyGeometry, operators);
     auto verifyTarget = std::visit([&](const auto &weights) {
       return makeQwenTarget(weights, verifyGeometry.target, backend, operators, 1);
@@ -682,34 +682,16 @@ int main(int argc, char **argv) {
     for (const auto [lanes, blockRows] : {std::pair{1u, 1u}, std::pair{1u, 16u}, std::pair{2u, 16u},
                                          std::pair{3u, 16u}, std::pair{4u, 16u}}) {
       CommandGraph graph;
-      const uint32_t storage = verifyTarget->decodeStorageLanes(lanes);
-      auto d = [&](model::DecodeTensor tensor) { return verifyArena.batchSlice(tensor, storage); };
-      model::QwenTargetVerifyBuffers b;
-      b.linearScratch = verifyArena.linearScratch();
-      b.hidden = {d(model::DecodeTensor::Hidden0), d(model::DecodeTensor::Hidden1)};
-      b.normalized = d(model::DecodeTensor::Normalized);
-      b.denseIntermediate = d(model::DecodeTensor::Intermediate);
-      b.denseGateScratch = verifyArena.gateScratch();
-      b.fullPacked = d(model::DecodeTensor::FullPacked);
-      b.fullQueries = d(model::DecodeTensor::FullQueries);
-      b.fullAttention = d(model::DecodeTensor::FullAttention);
-      b.attentionPartials = d(model::DecodeTensor::AttentionPartials);
-      b.attentionStatistics = d(model::DecodeTensor::AttentionStatistics);
-      b.attentionHidden = d(model::DecodeTensor::AttentionHidden);
-      b.attentionOutput = d(model::DecodeTensor::AttentionOutput);
-      b.ropeCos = d(model::DecodeTensor::RopeCos);
-      b.ropeSin = d(model::DecodeTensor::RopeSin);
-      b.capturedTargetHidden = d(model::DecodeTensor::CapturedTargetHidden);
-      b.finalHidden = d(model::DecodeTensor::FinalHidden);
-      b.logits = d(model::DecodeTensor::Logits);
-      std::vector<MetalBuffer> keys(kLayers), values_(kLayers);
-      for (uint32_t layer = 0; layer < kLayers; ++layer) {
-        keys[layer] = verifyArena.attentionBatchSlice(model::DecodeTensor::ChunkKeysBase, layer, storage);
-        values_[layer] = verifyArena.attentionBatchSlice(model::DecodeTensor::ChunkValuesBase, layer, storage);
-      }
-      b.chunkKeys = keys;
-      b.chunkValues = values_;
-      std::vector<kv::ChunkedPrefillParams> chunks(lanes);
+      auto b = model::decodeBuffers(verifyArena);
+      model::QwenTargetDecodeBuffers decode;
+      decode.step = {lanes, lanes * blockRows, ops::verifyLaneCap(lanes * blockRows, lanes)};
+      decode.tree = verifyArena.batchSlice(model::DecodeTensor::TreeRows, lanes);
+      decode.capturedTargetHidden = verifyArena.batchSlice(model::DecodeTensor::CapturedTargetHidden, lanes);
+      decode.finalHidden = verifyArena.batchSlice(model::DecodeTensor::FinalHidden, lanes);
+      decode.logits = verifyArena.batchSlice(model::DecodeTensor::Logits, lanes);
+      auto *layout = static_cast<SplashLaneRows *>(b.laneRows.contents());
+      auto *tree = static_cast<ops::TreeRow *>(decode.tree.contents());
+      std::vector<QwenTargetPrefillSequence> sequences(lanes);
       std::vector<uint32_t> positions, input;
       std::vector<std::vector<std::vector<double>>> expectedLanes;
       for (uint32_t lane = 0; lane < lanes; ++lane) {
@@ -720,10 +702,15 @@ int main(int argc, char **argv) {
         }
         expectedLanes.push_back(reference.logits(ids));
         input.insert(input.end(), ids.begin(), ids.end());
-        b.pageTables[lane] = verifyArena.get(lane, model::DecodeTensor::PageTable);
+        auto &sequence = sequences[lane];
+        sequence.lane = lane;
+        sequence.pageTable = verifyArena.get(lane, model::DecodeTensor::PageTable);
+        layout[lane] = {lane * blockRows, blockRows};
+        for (uint32_t row = 0; row < blockRows; ++row)
+          tree[lane * blockRows + row] = {(1u << (row + 1)) - 1, row ? uint16_t(row - 1) : uint16_t(SPLASH_TREE_ROOT), uint16_t(row)};
         const std::vector<uint32_t> page{lane * extent};
-        pages.writeEntries(page, 0, b.pageTables[lane]);
-        chunks[lane] = ops::PagedAttention::prefillParams(0, blockRows, kv::kVerifyChunkStride, 1);
+        pages.writeEntries(page, 0, sequence.pageTable);
+        sequence.chunk = ops::PagedAttention::chunkParams(0, decode.step.laneCap, kv::kPageTokens, 1);
       }
       std::vector<float> inv(kPairs);
       for (uint32_t pair = 0; pair < kPairs; ++pair) inv[pair] = std::pow(kTheta, -float(pair) / kPairs);
@@ -734,9 +721,10 @@ int main(int argc, char **argv) {
                            {.target_rows = lanes * blockRows, .draft_rows = 0, .target_scale = 1.0F}, lanes * blockRows, kPairs);
       verifyTarget->addEmbedding(graph, upload(backend, input, "verify tokens"), b.hidden[0], lanes * blockRows);
       SpilledKvReads spilled;
-      verifyTarget->addVerify(graph, b, pages, spilled, chunks, lanes, blockRows);
+      const QwenTargetPrefillChunk chunk{b, sequences, lanes * blockRows, &decode};
+      static_cast<void>(verifyTarget->addPrefill(graph, {&chunk, 1}, pages, spilled, {0, kLayers}));
       static_cast<void>(backend.submitCommandAsync(graph.dispatches()).wait());
-      const auto *actual = static_cast<const float *>(b.logits.contents());
+      const auto *actual = static_cast<const float *>(decode.logits.contents());
       for (uint32_t lane = 0; lane < lanes; ++lane)
         for (uint32_t row = 0; row < blockRows; ++row) {
           double scale = 0;

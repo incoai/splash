@@ -493,10 +493,10 @@ struct Chunk {
 Chunk chunk(MetalBackend &backend, uint32_t rows) {
   const auto bf16Rows = [&](uint32_t width) { return test::sharedBuffer(backend, uint64_t{rows} * width * 2); };
   // Chunks of at least kMinimumRows rows take no split scratch, but where the family runs the int8 prefill tile its
-  // codes and scales (Linear::prefillScratchSize).
+  // codes and scales (Linear::scratchSize).
   const Linear linear(backend.capabilities(), Int8Activations::On);
-  LinearScratchSize size = linear.prefillScratchSize({kIntermediate, kHidden});
-  size.include(linear.prefillScratchSize({kHidden, kIntermediate}));
+  LinearScratchSize size = linear.scratchSize({kIntermediate, kHidden}, SPLASH_PREFILL_TOKEN_BUDGET);
+  size.include(linear.scratchSize({kHidden, kIntermediate}, SPLASH_PREFILL_TOKEN_BUDGET));
   const auto bytes = [&](uint64_t count) { return count ? test::sharedBuffer(backend, count) : MetalBuffer{}; };
   return {{bf16Rows(kHidden), bf16Rows(kIntermediate), bf16Rows(kIntermediate),
            {.input = bytes(size.input), .sums = bytes(size.sums)}},
@@ -532,7 +532,7 @@ Forward forward(MetalBackend &backend, const Linear &linear, const Model &model,
     if (splits)
       split->add(graph, layer, ffn, residual, output, rows);
     else
-      linear.addPrefillSwiGlu(graph, model.layers[layer], ffn, residual, output, rows);
+      linear.addSwiGlu(graph, model.layers[layer], ffn, residual, output, rows);
   }
   Forward result;
   const auto start = AwakeClock::now();

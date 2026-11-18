@@ -1,5 +1,6 @@
 #include "metal/abi/KernelABI.h"
 #include "metal/kernels/common/draft_context_kv.h"
+#include "metal/kernels/common/draft_context_window.h"
 #include "metal/kernels/common/lane_bindings.h"
 #include "metal/kernels/common/rms_inverse.h"
 
@@ -121,24 +122,47 @@ inline void draft_context_kv_commit_phase(
     device bfloat *keys0, device bfloat *keys1, device bfloat *keys2,
     device bfloat *keys3, device bfloat *values0, device bfloat *values1,
     device bfloat *values2, device bfloat *values3,
-    device const uint *retained, constant DraftContextBatchParams &params,
-    uint group, uint thread_index, uint lane, uint simd_group,
+    device const uint *retained, device const SplashLaneRows *lane_rows,
+    constant DraftContextBatchParams &params, uint2 group, uint thread_index, uint lane, uint simd_group,
     threadgroup float *reductions, threadgroup bfloat *normalized) {
   constexpr uint KVHeads = SPLASH_DRAFT_KV_HEADS;
-  // A context row's keys and values (draft_context_kv_phase).
   constexpr uint RowWidth = 2 * KVHeads * SPLASH_DRAFT_HEAD_DIMENSION;
-  constexpr uint RopeLaneStride = Rows * SPLASH_DRAFT_ROPE_PAIRS;
-  uint batch = group / (Rows * KVHeads);
-  uint task = group % (Rows * KVHeads);
+  constexpr uint RopeLaneStride = SPLASH_TARGET_VERIFY_ROWS * SPLASH_DRAFT_ROPE_PAIRS;
+  const uint batch = group.y, row = group.x / KVHeads;
+  uint path = retained[batch];
+  if (row >= min(uint(popcount(path)), lane_rows[batch].rows)) return;
+  for (uint earlier = 0; earlier < row; ++earlier) path &= path - 1;
   device bfloat *keys = SPLASH_LANE_BINDING(batch, keys0, keys1, keys2, keys3);
   device bfloat *values = SPLASH_LANE_BINDING(batch, values0, values1, values2, values3);
+  const ulong rope = ulong(batch) * RopeLaneStride + row * SPLASH_DRAFT_ROPE_PAIRS;
   draft_context_kv_phase<Window, Rotated>(
-      context_kv + ulong(batch) * Rows * RowWidth, k_norm,
-      rope_cos + ulong(batch) * RopeLaneStride,
-      rope_sin + ulong(batch) * RopeLaneStride, keys, values,
-      params.start_position[batch], min(retained[batch], Rows), task,
-      thread_index, lane, simd_group, reductions, normalized);
+      context_kv + (ulong(lane_rows[batch].first) + ctz(path)) * RowWidth, k_norm,
+      rope_cos + rope, rope_sin + rope, keys, values, params.start_position[batch] + row,
+      1, group.x % KVHeads, thread_index, lane, simd_group, reductions, normalized);
 }
+
+// A retained path is packed by logical position into the draft's rolling context.
+template <uint Window>
+kernel void draft_context_window_commit(
+    device const bfloat *context [[buffer(0)]], device uchar *window [[buffer(1)]],
+    device const uint *retained_rows [[buffer(2)]], device const SplashLaneRows *lane_rows [[buffer(3)]],
+    constant DraftContextWindowParams &params [[buffer(4)]],
+    uint group [[threadgroup_position_in_grid]], uint lane [[thread_index_in_simdgroup]],
+    uint simd [[simdgroup_index_in_threadgroup]]) {
+  DraftContextGroup at;
+  if (!draft_context_group<Window>(params, group, simd, at)) return;
+  uint path = retained_rows[0];
+  if (at.row >= min(uint(popcount(path)), lane_rows[0].rows)) return;
+  for (uint earlier = 0; earlier < at.row; ++earlier) path &= path - 1;
+  draft_context_store<Window>(context + (ulong(lane_rows[0].first) + ctz(path) - at.row) * params.width,
+                              window, params, at, lane);
+}
+#define WINDOW_COMMIT(W, S) \
+  template [[host_name("draft_context_window_commit" S)]] kernel decltype(draft_context_window_commit<W>) draft_context_window_commit<W>;
+WINDOW_COMMIT(2048, "")
+WINDOW_COMMIT(4096, "_kv8_h2_d128_w4096_s8")
+WINDOW_COMMIT(16384, "_kv8_h2_d128_w16384_s8")
+#undef WINDOW_COMMIT
 
 // One split of the attention of one (lane, KV head, head group): the group's
 // query rows over the live ring tiles of its head. The live window occupies
@@ -414,9 +438,9 @@ inline void draft_attention_split_phase(
 // Fixed-order combine of one (lane, head, head group)'s split partials into
 // the normalized bf16 rows, so the result does not depend on which split
 // finished first or on how many lanes ran.
-template <uint M, uint Splits>
+template <uint M, uint Splits, uint Rows, uint QHeads>
 inline void draft_attention_reduce_phase(device const float *partials,
-                                         device bfloat *output,
+                                         device bfloat *output, uint first_head,
                                          uint thread_index) {
   constexpr uint D = SPLASH_DRAFT_HEAD_DIMENSION,
                  Stride = M * D + 2 * M;
@@ -444,7 +468,7 @@ inline void draft_attention_reduce_phase(device const float *partials,
         accumulated[i] += scale * partial[row * D + dim + i];
     }
     for (uint i = 0; i < Chunk; ++i)
-      output[row * D + dim + i] = bfloat(accumulated[i] / total);
+      output[((row % Rows) * QHeads + first_head + row / Rows) * D + dim + i] = bfloat(accumulated[i] / total);
   }
 }
 
@@ -508,7 +532,7 @@ inline void draft_attention_reorder_phase(device const bfloat *grouped,
     constexpr ulong Packed =                                                   \
         (queryHeads)*HeadDim + 2 * KVHeads * HeadDim;                          \
     constexpr ulong Attention = (queryHeads)*HeadDim;                          \
-    constexpr ulong RopeStride = Rows * SPLASH_DRAFT_ROPE_PAIRS;               \
+    constexpr ulong RopeStride = SPLASH_TARGET_VERIFY_ROWS * SPLASH_DRAFT_ROPE_PAIRS;               \
     uint batch = group.y;                                                      \
     threadgroup float reductions[8];                                           \
     threadgroup bfloat head[SPLASH_DRAFT_HEAD_DIMENSION];                      \
@@ -533,9 +557,10 @@ inline void draft_attention_reorder_phase(device const bfloat *grouped,
       device bfloat *values1 [[buffer(9)]],                                    \
       device bfloat *values2 [[buffer(10)]],                                   \
       device bfloat *values3 [[buffer(11)]],                                   \
-      device const uint *retained [[buffer(12)]],                              \
-      constant DraftContextBatchParams &params [[buffer(13)]],                 \
-      uint group [[threadgroup_position_in_grid]],                             \
+      device const uint *retained [[buffer(12)]], \
+      device const SplashLaneRows *lane_rows [[buffer(13)]],                              \
+      constant DraftContextBatchParams &params [[buffer(14)]],                 \
+      uint2 group [[threadgroup_position_in_grid]],                             \
       uint thread_index [[thread_index_in_threadgroup]],                       \
       uint lane [[thread_index_in_simdgroup]],                                 \
       uint simd_group [[simdgroup_index_in_threadgroup]]) {                    \
@@ -543,7 +568,7 @@ inline void draft_attention_reorder_phase(device const bfloat *grouped,
     threadgroup bfloat splash_normalized[SPLASH_DRAFT_HEAD_DIMENSION];         \
     draft_context_kv_commit_phase<(window), (rows), (rotated)>(                           \
         context_kv, k_norm, rope_cos, rope_sin, keys0, keys1, keys2, keys3,    \
-        values0, values1, values2, values3, retained, params, group,           \
+        values0, values1, values2, values3, retained, lane_rows, params, group,           \
         thread_index, lane, simd_group, splash_reductions, splash_normalized); \
   }
 
@@ -636,10 +661,9 @@ inline void draft_attention_reorder_phase(device const bfloat *grouped,
             queries + params.lanes * Rows * Attention) +                       \
         ((batch * SPLASH_DRAFT_KV_HEADS + head) * HeadGroups + head_group) *   \
             (splits)*PartialFloats;                                            \
-    draft_attention_reduce_phase<M, (splits)>(                                 \
+    draft_attention_reduce_phase<M, (splits), Rows, (queryHeads)>(                                 \
         partials,                                                              \
-        queries + batch * Rows * Attention + head * HeadRows * HeadDim +       \
-            head_group * M * HeadDim,                                          \
+        queries + batch * Rows * Attention, head * (HeadRows / Rows) + head_group * (M / Rows),                                          \
         thread_index);                                                         \
   }
 

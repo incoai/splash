@@ -70,6 +70,7 @@ SERVER_FILES = (
     "connections.py",
     "origins.py",
     "serve_options.py",
+    "unix_socket.py",
     "thinking.py",
     "schema_validation.py",
     "crash_trace.py",

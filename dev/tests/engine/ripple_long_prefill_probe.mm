@@ -159,18 +159,17 @@ int main(int argc, char **argv) {
             [](uint64_t logical) {
               return std::array<uint32_t, 3>{uint32_t(logical), uint32_t(logical), uint32_t(logical)};
             }};
-        sequence.attentionStride =
-          (rows + splash::kv::kPageTokens - 1) / splash::kv::kPageTokens * splash::kv::kPageTokens;
-        sequence.queryOffset = 0;
-        sequence.kvOffset = 0;
-        sequence.chunk = ops::PagedAttention::prefillParams(
-            position, rows, sequence.attentionStride,
+
+
+        sequence.chunk = ops::PagedAttention::chunkParams(
+            position, rows, (sequence.rows + splash::kv::kPageTokens - 1) / splash::kv::kPageTokens * splash::kv::kPageTokens,
             (position + rows + splash::kv::kPageTokens - 1) / splash::kv::kPageTokens);
         sequence.pageTable = table;
         QwenTargetPrefillChunk modelChunk;
         modelChunk.buffers = buffers;
         modelChunk.sequences = {&sequence, 1};
         modelChunk.rows = rows;
+        *static_cast<SplashLaneRows *>(buffers.laneRows.contents()) = {0, rows};
 
         ops::RoPE::addTables(graph, positionBuffer, none, buffers.ropeInverseFrequencies, none,
                              buffers.ropeCos, buffers.ropeSin, none, none,

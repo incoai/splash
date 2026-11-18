@@ -20,10 +20,10 @@
 // touched itself, and holds at least as many slots per layer as the lanes
 // that hold a floor select blocks (laneSlots each, reserveLane), so a resolve
 // always places every block it reads. Its memory is whole extents of the
-// pool's pages: the floors of the lanes that hold one, required(n) = (n + 1)
-// laneSlots slots for n of them, then, while any does, one extent at a time
-// toward the planned target; an idle reclaim gives back what is above the
-// floors.
+// pool's pages: the floors of the lanes that hold one, required(n) slots for
+// n of them (SparseKvShape::requiredSlots: n laneSlots and a spare), then,
+// while any does, one extent at a time toward the planned target; an idle
+// reclaim gives back what is above the floors.
 //
 // A block that cannot be read (twice) leaves zeros in its slot, which is
 // freed, and fails every lane that listed it (takeFailures), not the
@@ -53,9 +53,9 @@
 namespace splash::model {
 
 struct KvBlockCacheOptions final {
-  // The slots per layer one decoding lane's rows select at most
-  // (SparseKvShape::verifyRows x selectedBlocks).
-  uint32_t laneSlots = 0;
+  // The target's sparse attention, whose shape gives the slots a layer the
+  // floors of its decoding lanes hold (SparseKvShape::requiredSlots).
+  SparseKvShape shape;
   // The size the memory plan gives the cache, which it grows toward when
   // lanes hold floors.
   uint64_t targetBytes = 0;
@@ -75,24 +75,25 @@ public:
   ~KvBlockCache();
   KvBlockCache(const KvBlockCache &) = delete;
   KvBlockCache &operator=(const KvBlockCache &) = delete;
-  // The page table a cache of a pool's `layout`, `laneSlots` and
+  // The page table a cache of a pool's `layout`, `shape` and
   // `targetBytes` (KvBlockCacheOptions) maps its pages through, which it
   // allocates as it is built and holds until it goes: an entry for each page
   // of the most extents it holds, its target's or the floors of every lane at
   // once, in whole host pages, as Metal allocates them, in whichever extent
   // size the pool takes (kv::Layout::mostOverExtents), so that the memory
   // plan, made before the pool's, counts it (KvSpillPlan::tableBytes);
-  // 32,768 bytes for Qwen3.8-Flash-Next's ten 256-page extents of int8 KV.
-  [[nodiscard]] static constexpr uint64_t tableBytes(const kv::Layout &layout, uint32_t laneSlots,
+  // 49,152 bytes for Qwen3.8-Flash-Next's eighteen 256-page extents of int8 KV.
+  [[nodiscard]] static constexpr uint64_t tableBytes(const kv::Layout &layout, const SparseKvShape &shape,
                                                      uint64_t targetBytes) {
     return layout.mostOverExtents([&](uint32_t extentPages) {
-      return alignUp(mostPages(layout, extentPages, laneSlots, targetBytes) * sizeof(SplashKvPage));
+      return alignUp(mostPages(layout, extentPages, shape, targetBytes) * sizeof(SplashKvPage));
     });
   }
 
   // Between commands. The floor of the lane, whose request decodes over
-  // Index pages: the cache grows to required(n), (n + 1) laneSlots per
-  // layer for the n lanes that hold one, or is refused with nothing changed.
+  // Index pages: the cache grows to required(n) slots a layer for the n
+  // lanes that hold one (SparseKvShape::requiredSlots), or is refused with
+  // nothing changed.
   // releaseLane() gives it back when the request ends or is suspended.
   [[nodiscard]] ModelMemoryAdmission reserveLane(uint32_t stateLane);
   void releaseLane(uint32_t stateLane) noexcept;
@@ -120,13 +121,14 @@ public:
   [[nodiscard]] uint64_t floorBytes(uint32_t lanes) const noexcept;
 
   // After `layer`'s block lists: a host step that resolves the entries of
-  // lane l's list, whose pages' sources are lanes[l] (null for a lane none
-  // of whose pages holds only its index), writes their locations to
+  // lane l's lists, the `laneLists` lists of its tiles from blocks.list + l x
+  // laneLists on, whose pages' sources are lanes[l] (null for a lane none of
+  // whose pages holds only its index), writes their locations to
   // `locations` (an array of the lists' shape) and counts into `stats`.
   // Returns the lists with their locations, for the located split.
   [[nodiscard]] ops::AttentionBlocks addResolve(metal::CommandGraph &graph, uint32_t layer,
                                                 std::span<const std::shared_ptr<const KvPageSources>> lanes,
-                                                const ops::AttentionBlocks &blocks,
+                                                const ops::AttentionBlocks &blocks, uint32_t laneLists,
                                                 const metal::MetalBuffer &locations,
                                                 std::shared_ptr<KvReadStats> stats);
   // Once the command completed: the blocks its resolves could not read, each
@@ -139,23 +141,24 @@ public:
   [[nodiscard]] KvBlockCacheStats stats() const;
 
 private:
-  // A cache's extents: those of the floors of `lanes` lanes, (lanes + 1)
-  // laneSlots slots a layer at 2^SPLASH_ATTENTION_LOCATION_BLOCK_BITS a page;
-  // those of a target of `targetBytes`; and the pages of the most it holds,
-  // its target's or the floors of every lane at once.
-  [[nodiscard]] static constexpr uint32_t floorExtents(uint32_t lanes, uint32_t laneSlots,
+  // A cache's extents: those of the floors of `lanes` lanes,
+  // shape.requiredSlots(lanes) slots a layer at
+  // 2^SPLASH_ATTENTION_LOCATION_BLOCK_BITS a page; those of a target of
+  // `targetBytes`; and the pages of the most it holds, its target's or the
+  // floors of every lane at once.
+  [[nodiscard]] static constexpr uint32_t floorExtents(uint32_t lanes, const SparseKvShape &shape,
                                                        uint32_t extentPages) noexcept {
     const uint64_t extentSlots = uint64_t{extentPages} << SPLASH_ATTENTION_LOCATION_BLOCK_BITS;
-    return lanes ? static_cast<uint32_t>(((uint64_t{lanes} + 1) * laneSlots + extentSlots - 1) / extentSlots) : 0;
+    return static_cast<uint32_t>((shape.requiredSlots(lanes) + extentSlots - 1) / extentSlots);
   }
   [[nodiscard]] static constexpr uint32_t targetExtents(const kv::Layout &layout, uint32_t extentPages,
                                                         uint64_t targetBytes) noexcept {
     return static_cast<uint32_t>(targetBytes / (uint64_t{extentPages} * layout.kvBytesPerModelPage()));
   }
   [[nodiscard]] static constexpr uint64_t mostPages(const kv::Layout &layout, uint32_t extentPages,
-                                                    uint32_t laneSlots, uint64_t targetBytes) noexcept {
+                                                    const SparseKvShape &shape, uint64_t targetBytes) noexcept {
     return uint64_t{std::max(targetExtents(layout, extentPages, targetBytes),
-                             floorExtents(ExecutionLimits::maximumBatchWidth, laneSlots, extentPages))} *
+                             floorExtents(ExecutionLimits::maximumBatchWidth, shape, extentPages))} *
            extentPages;
   }
 

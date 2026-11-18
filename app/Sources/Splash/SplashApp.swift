@@ -49,7 +49,7 @@ struct SplashCommands: Commands {
             Button("New Chat") {
                 inWindow {
                     state.section = .chat
-                    state.chats.newChat()
+                    state.newChat()
                     state.draft.focus()
                 }
             }

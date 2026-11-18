@@ -5,36 +5,49 @@
 // and the operators sized by these, check the contracts between them.
 #define SPLASH_DRAFT_QUERY_ROWS 8u
 #define SPLASH_DRAFT_PROPOSAL_TOKENS 7u
-#define SPLASH_TARGET_VERIFY_ROWS 8u
-// The longest draft block the engine serves (the trained proposal length of
-// the longest compiled draft variant): capacity bounds, independent of the
-// eight-row physical attention tiles. Target projections consume the native
-// verify block together.
+// Capacity of the longest compiled draft variant, independent of a target tree.
 #define SPLASH_DRAFT_BLOCK_ROWS_LIMIT 16u
 #define SPLASH_DRAFT_BLOCK_PROPOSALS_LIMIT (SPLASH_DRAFT_BLOCK_ROWS_LIMIT - 1u)
+// The most rows of a lane's verify block: its anchor's and the rows proposed
+// after it, a chain or a tree of them (metal/abi/VerifyTree.h), which may
+// hold more rows than the draft's block: alternatives beside the draft's
+// proposals, and chains deeper than them. Every target kernel of a verify
+// takes blocks of 1 to this many rows a lane. Sixteen: a replay of 17,432
+// served cycles estimated trees of up to 16 rows a lane, the draft's
+// proposals with lookup branches, to decode 28% faster than the draft's
+// eight rows on Qwen3.8-27B. A decode cycle's bounds follow it: the KV a
+// lane's block writes past the context (SPLASH_SPECULATIVE_SCRATCH_TOKENS),
+// the KV the engine holds for a lane's cycle and the decode arena's rows.
+#define SPLASH_TARGET_VERIFY_ROWS 16u
+// The rows of a lane's verify block and of its pending path that the narrow
+// GDN decode kernels hold (kernels/decode/gdn.metal, those without _r16, which
+// hold SPLASH_TARGET_VERIFY_ROWS): a draft's block, a chain or a tree. A step
+// takes them when none of its lanes may hold more rows (ops::verifyLaneCap)
+// and none of its pending paths holds more (ops::GDN::addDecode).
+#define SPLASH_GDN_NARROW_ROWS 8u
 // The KV ceiling: four times the targets' native window of 262,144 tokens,
 // which holds the most context YaRN serves them
 // (QwenTargetDimensions::yarnContextTokens).
 #define SPLASH_MAXIMUM_CONTEXT_TOKENS 1048576u
+// The KV slots past the context a decode cycle writes: a lane's block at the
+// context's last position stores its rows from there, 15 past it.
 #define SPLASH_SPECULATIVE_SCRATCH_TOKENS                                  \
-  (SPLASH_DRAFT_BLOCK_PROPOSALS_LIMIT)
+  (SPLASH_TARGET_VERIFY_ROWS - 1u)
 #define SPLASH_MAXIMUM_PHYSICAL_KV_TOKENS                                  \
   (SPLASH_MAXIMUM_CONTEXT_TOKENS + SPLASH_SPECULATIVE_SCRATCH_TOKENS)
 #define SPLASH_MAXIMUM_BATCH_WIDTH 4u
 #define SPLASH_PREFILL_TOKEN_BUDGET 2048u
 #define SPLASH_DRAFT_SLIDING_WINDOW 2048u
 #define SPLASH_TARGET_KV_BLOCK_TOKENS 32u
-// Rows per KV head (and per query group) of one lane's verify chunk staging:
-// one KV block, which holds the lane's SPLASH_TARGET_VERIFY_ROWS rows.
-#define SPLASH_VERIFY_CHUNK_STRIDE SPLASH_TARGET_KV_BLOCK_TOKENS
-#define SPLASH_PREFILL_ATTENTION_TILE_ROWS 8u
-#define SPLASH_PREFILL_ATTENTION_MAXIMUM_SPLITS 32u
+// Attention runs a sequence's rows in tiles of this many, each over at most
+// SPLASH_ATTENTION_MAXIMUM_SPLITS history splits (ops::PagedAttention).
+#define SPLASH_ATTENTION_TILE_ROWS 8u
+#define SPLASH_ATTENTION_MAXIMUM_SPLITS 128u
 // Draft attention deals the live ring tiles of one (lane, KV head)
 // round-robin to this many groups, the last of which also attends the eight
 // current rows. Fixed rather than derived from the GPU so the combine order,
 // and with it the rounding, is the same on every machine and lane count.
 #define SPLASH_DRAFT_ATTENTION_SPLITS 4u
-#define SPLASH_VERIFY_ATTENTION_MAXIMUM_SPLITS 128u
 #define SPLASH_TARGET_SAMPLING_SHARDS 16u
 // Threads of each group that selects a sampled row over the whole
 // vocabulary (decode_sample_vocabulary*); a bracket of at most this many

@@ -480,6 +480,28 @@ public:
   [[nodiscard]] CommandTicket
   submitCommandAsync(std::span<const ComputeDispatch> dispatches,
                      CommandCompletion completion = {});
+  // A command in two parts, of a caller whose first work can go before the
+  // rest is built: `first`, which has no event steps, is encoded into a
+  // command buffer and committed, and then `rest` gives the command's other
+  // part, which is prepared and encoded after it as a command's is, so the
+  // GPU runs the first part while the host builds, validates and encodes the
+  // second. It is one command to the gate, the watchdog and its ticket, whose
+  // GPU time runs from the first part's start to the second's end, and
+  // whose wall time holds the building of the second. `rest` runs once, on
+  // the submitting thread, while the GPU may run the first part: it reads
+  // nothing that part writes, writes no 128-byte line of a buffer that part
+  // uses (the GPU's cache line, as a host step's work beside its dispatches,
+  // EventStep), and submits nothing; what its command points at stays until
+  // this returns. Where `rest` throws, or its command is refused as a
+  // command is before any of it is encoded, the command is its first part
+  // alone: this waits for that part to end and then throws the reason, the
+  // completion not notified and nothing left in flight, so a caller's
+  // mistake in the second part costs the backend no more than in a command
+  // built whole. An encoding that fails later is any command's (the backend
+  // is then unhealthy).
+  [[nodiscard]] CommandTicket
+  submitCommandPartsAsync(const Command &first, const std::function<Command()> &rest,
+                          CommandCompletion completion = {});
 
   // Startup: compiles now the pipelines a later submission of these
   // dispatches would compile. Validates them as submission does and throws

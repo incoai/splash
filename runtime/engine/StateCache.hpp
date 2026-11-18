@@ -177,6 +177,14 @@ public:
   // false only when the matching checkpoint is pinned; absent, replaced and
   // upgraded publications already satisfy the postcondition.
   bool retireCheckpointState(StateCheckpoint checkpoint) noexcept;
+  // The matching checkpoint is a reply's state, which its decode captured:
+  // opportunistic, a reclaim frees its RAM copy with no write and never
+  // writes it, as a next prompt resumes there only if it renders the reply
+  // back token for token. keepReply makes it a checkpoint a reclaim writes
+  // as any, once its request has shown its conversation does render replies
+  // back. A reuse by another publication, or a use, ends either.
+  void markReply(StateCheckpoint checkpoint) noexcept;
+  void keepReply(StateCheckpoint checkpoint) noexcept;
   // The matching checkpoint is pinned: retireCheckpointState refuses it.
   [[nodiscard]] bool checkpointPinned(StateCheckpoint checkpoint) const noexcept;
   // An unfinished request's conversation resumes from the state at this
@@ -247,8 +255,8 @@ public:
   [[nodiscard]] bool pinned(uint64_t kvBlock) const noexcept;
   // When the state at this block was last used; 0 without one.
   [[nodiscard]] uint64_t lastUsed(uint64_t kvBlock) const noexcept;
-  // A reclaim of the state at this block writes it: it has no disk copy and
-  // the tier takes its write.
+  // A reclaim of the state at this block writes it: it has no disk copy, is
+  // no opportunistic reply's (markReply), and the tier takes its write.
   [[nodiscard]] bool reclaimWrites(uint64_t kvBlock) const noexcept;
   // Whether the tier takes the write of a writable RAM copy not in use, or
   // in use, now: CompositeState::canOffload, which answers alike for every
@@ -322,12 +330,15 @@ private:
   friend class CompositeStateLease;
   friend class StateUse;
 
+  // A reply's state (markReply), opportunistic until its request keeps it.
+  enum class Reply : uint8_t { None, Opportunistic, Kept };
   struct Entry {
     std::shared_ptr<const CompositeState> ram;
     std::shared_ptr<const CompositeState> disk;
     uint32_t pins = 0;
     uint64_t lastUsed = 0;
     bool checkpoint = false;
+    Reply reply = Reply::None;
     bool invalid = false;
     uint64_t publication = 0;
     RecencyOrder::Node ramNode;
@@ -347,6 +358,11 @@ private:
   // The order's oldest entry, or the next after `after`.
   [[nodiscard]] static std::optional<CacheEvictionCandidate>
   oldestOf(const RecencyOrder &order, const std::optional<CacheEvictionCandidate> &after) noexcept;
+  // A RAM copy that leaves through a write while the tier takes one: a
+  // writable one without a disk copy, but an opportunistic reply's.
+  [[nodiscard]] static bool writer(const Entry &entry) noexcept {
+    return entry.ram && !entry.disk && entry.ram->writable() && entry.reply != Reply::Opportunistic;
+  }
   [[nodiscard]] static const std::shared_ptr<const CompositeState> &
   copy(const Entry &entry) noexcept {
     return entry.ram ? entry.ram : entry.disk;
@@ -414,7 +430,7 @@ private:
   RecencyOrder inUse_;
   // Of each, the writable RAM copies without a disk copy
   // (CompositeState::writable), which leave through a write while the tier
-  // takes one.
+  // takes one (writer).
   RecencyOrder ordinaryWrites_;
   RecencyOrder checkpointWrites_;
   RecencyOrder inUseWrites_;

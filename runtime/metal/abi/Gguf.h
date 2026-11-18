@@ -14,11 +14,10 @@
 // The int8 prefill tile's activation group is the MLX weight group of 64
 // inputs (GGUF_PREFILL_INT8_GROUP).
 #define GGUF_TILE_COLUMNS 64u
-// Decode tile of the staged kernels, which also runs prefill chunks of up to
-// 32 rows (64 on Apple10 and on Apple9 GPUs of 10 cores or fewer): two
-// simdgroups, each staging its own
-// GGUF_STAGED_COLUMNS columns GGUF_STAGED_STEP inputs at a time over 8, 16,
-// 32 or 64 rows.
+// Decode tile of the staged kernels, which runs plans of up to 64 rows, a
+// decode step's or a prompt chunk's alike: two simdgroups, each staging its
+// own GGUF_STAGED_COLUMNS columns GGUF_STAGED_STEP inputs at a time over 8,
+// 16, 32, 48 or 64 rows.
 #define GGUF_STAGED_COLUMNS 32u
 #define GGUF_STAGED_STEP 32u
 #define GGUF_STAGED_THREADS (GGUF_TILE_COLUMNS / GGUF_STAGED_COLUMNS * 32u)
@@ -43,11 +42,31 @@ inline constexpr uint32_t gguf_int8_gate_up_simdgroups(uint32_t rows) { return r
 // Apple9 register tile: four simdgroups of GGUF_REGISTER_COLUMNS columns.
 #define GGUF_REGISTER_COLUMNS 16u
 #define GGUF_REGISTER_THREADS (GGUF_TILE_COLUMNS / GGUF_REGISTER_COLUMNS * 32u)
+// Column tile (kernels/common/gguf_column_tile.h): a GEMV of at most
+// GGUF_COLUMN_ROWS live rows in registers, which the MoE expert tiles run for
+// an expert's only tile of that many rows and ops::Linear for a decode step of
+// that many live rows (kernels/decode/linear_gguf_column.metal):
+// GGUF_COLUMN_SPLITS simdgroups of 32 columns, one a lane, each summing its
+// part of K.
+#define GGUF_COLUMN_ROWS 2u
+#define GGUF_COLUMN_SPLITS 8u
+#define GGUF_COLUMN_THREADS (GGUF_COLUMN_SPLITS * 32u)
+struct GgufColumnParams {
+  uint32_t rows;        // live rows, 1 to GGUF_COLUMN_ROWS
+  uint32_t input_size;  // K
+  uint32_t out_stride;  // columns of a destination row
+  uint32_t out_offset;  // first destination column of the tensor
+  uint32_t format;      // the tensor's GGUF_FMT_*, a one-pass gate/up's both tensors'
+};
+static_assert(sizeof(GgufColumnParams) == 20, "GGUF column parameters are 20 bytes on both sides");
 
 // The register tile's activations, Table16 (kernels/common/gguf_sgmatrix.h):
 // per eight-row tile of `width` inputs, the X^T table of width * 8 bfloat,
 // then the fp32 chain seeds [width / 16][8 rows] and sums [width / 32][8
 // rows]. Each 64-input span holds these values, seeds and sums per tile.
+// A table tile holds GGUF_TABLE16_ROWS rows, the rows the register tile
+// computes together; a plan's rows fill whole tiles, the last padded.
+#define GGUF_TABLE16_ROWS 8u
 #define GGUF_TABLE16_SPAN_INPUTS 64u
 #define GGUF_TABLE16_SPAN_VALUES 512u
 #define GGUF_TABLE16_SPAN_SEEDS 32u
@@ -140,11 +159,11 @@ inline constexpr uint64_t gguf_prefill_int8_scale_bytes(uint32_t k, uint64_t sto
   return uint64_t(k / GGUF_PREFILL_INT8_GROUP) * storage * 8u;
 }
 
-// Decode tiles: the register tile, which Apple9 runs but for the projections
-// it stages (ops/LinearGguf.cpp, apple9Stages), and the staged tile, which
-// runs every other decode and prefill chunks of up to 32 rows (64 on
-// Apple10). One tensor per
-// dispatch, over the dispatch's tiles (grid.x) and K partitions (grid.y).
+// Decode tiles: the register tile, of plans of up to 32 rows where the
+// device's calibration takes it (RegisterBoundary, ops/KernelCalibration.hpp),
+// and the staged tile, of the other plans of up to 64 rows, a decode step's
+// or a prompt chunk's. One tensor per dispatch, over the dispatch's tiles
+// (grid.x) and K partitions (grid.y).
 struct GgufDecodeParams {
   uint32_t input_size;  // K
   uint32_t splits;      // K partitions; 1 = no cross-threadgroup reduction

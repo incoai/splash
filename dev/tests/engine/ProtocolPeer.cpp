@@ -132,7 +132,9 @@ FrameType write(Writer &out, const MaskResponseFrame &response) {
   out.u64(response.requestId);
   out.u64(response.maskRequestId);
   out.u32(static_cast<uint32_t>(response.maskWords.size()));
+  out.u32(static_cast<uint32_t>(response.forcedTokens.size()));
   out.words(response.maskWords);
+  out.words(response.forcedTokens);
   return FrameType::MaskResponse;
 }
 
@@ -206,7 +208,9 @@ EngineEvent decodeEvent(FrameType type, Reader &in) {
     event.requestId = in.u64();
     event.maskRequestId = in.u64();
     event.wordsPerMask = in.u32();
-    event.simulationTokens = in.words(in.u32());
+    const uint32_t count = in.u32();
+    event.simulationTokens = in.words(count);
+    event.parents = in.words(count);
     return event;
   }
   case FrameType::Done: {

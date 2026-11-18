@@ -262,7 +262,7 @@ public:
   // generated nothing yet is cancelled; an unknown id is ignored.
   void stop(uint64_t requestId);
   void failRequest(uint64_t requestId, LaneOutcome outcome, std::string message);
-  void provideMask(uint64_t requestId, std::span<const uint32_t> words);
+  void provideMask(uint64_t requestId, std::span<const uint32_t> words, std::span<const uint32_t> forced);
   void setCompletionNotifier(std::function<void()> notifier);
 
   // While the weights are released or being restored (weightsHeld), a tick
@@ -513,6 +513,12 @@ private:
     std::vector<StateBoundary> stateBoundaries;
     size_t stateBoundaryCursor = 0;
     StateCheckpoint latestCheckpoint;
+    // Its prompt rendered an earlier reply back token for token, its start's
+    // match reaching a block that reply's state was captured at
+    // (CacheLookup::rendersReply): its conversation's next prompt is likely
+    // to render its own reply back, so its end keeps that reply's last state
+    // (Cache::keepReply).
+    bool rendersReplies = false;
     // The block of the prompt's replay boundary, where the conversation's
     // next turn resumes: its state is in use from the moment the request
     // reaches, reuses or restores it until the request ends, suspended or not.
@@ -826,6 +832,15 @@ private:
   void publishReachedStateBoundaries(
       Request &request, uint32_t promptProcessed, std::span<const LaneCapture> captures,
       std::span<const std::shared_ptr<const CompositeState>> states, double nowMilliseconds);
+  // Publishes the state of a boundary the lane reached, or reuses the one
+  // cached there: `state`, captured, or without one taken from the lane
+  // (fromLane) or written from it to the disk tier; `recycled` when its
+  // buffers took room reclaimed from cache. The lane's recovery point
+  // retires as the boundary's kind has it. False when the state was
+  // refused.
+  bool publishStateBoundary(Request &request, Request::StateBoundary objective,
+                            std::shared_ptr<const CompositeState> state, bool recycled,
+                            bool fromLane, double nowMilliseconds);
   // Takes what the plan's lanes need to run it as planned, and returns
   // Runnable with its items and captures; or, when that changed what the
   // plan was made from, Replan, the lanes refused added to `excluded`, a
@@ -866,6 +881,13 @@ private:
   // only if the pin has gone by then. Null buffers when refused.
   [[nodiscard]] Reservation reserveCapture(Request &request, StateClass kind, uint32_t tokens,
                                            bool followsCheckpoint, bool supersedes);
+  // Reserves the buffers of the state a decoding lane captures in its next
+  // cycle (Model::capturesInDecode): at the next page past the tokens it
+  // holds, when the rows it may retain reach it. Its claim is a
+  // checkpoint's, in one attempt: refused, the cycle captures none, and
+  // nothing is freed for one.
+  void reserveReplyCapture(Request &request, std::vector<StateCapture> &states,
+                           std::vector<LaneCapture> &captures, bool supersedes);
   // The claim of a state's buffers of class `kind`: the prompt's replay
   // point, the state the request's next turn resumes from, is work in
   // service that may wait for memory on its way back and reaches what is in
@@ -889,7 +911,9 @@ private:
   // passes, on a target that can spill with the tier open and its quota
   // holding the lane's pages, and only where the pages it would spill free,
   // net of the first lane's hot block floor its decode reads, cover what the
-  // claim lacks; its claim's retries release its pages as their copies land.
+  // claim lacks; its take releases at once its pages whose copies landed,
+  // as a release does, and its claim's retries the rest as their copies
+  // land.
   // The command between its passes gives back the buffers of the states it
   // would capture, which the model's pool releases at once; its lanes that
   // ended are left to settleEndedBetweenPasses. Last, for in-service KV
@@ -956,7 +980,8 @@ private:
   // holds(now) counts the time since the last tick
   // to what held each then; holderOf names what holds one as the engine is
   // now, by precedence: a prefill command in flight with its rows, its claim
-  // waiting, a decode command, another prefill command, the rest. Before a
+  // waiting, a decode command, another prefill command, the next prefill
+  // unit's wait for a decoder (unitWait_), the rest. Before a
   // request's first tokens, firstTokens sends what held it.
   void holds(double nowMilliseconds) noexcept;
   [[nodiscard]] TtftPart holderOf(const Request &request) const;
@@ -1004,8 +1029,8 @@ private:
   // (`restoring`) counted; false when it cannot (no SSD cache, the tier
   // closed, its quota short, or a lane already Spill) or must not: a lane
   // of the command between its passes, which reads all its lanes' history
-  // from memory. Its claim's retries release its pages as their copies land
-  // (EngineVictims::releases).
+  // from memory. Its claim releases its pages whose copies landed at once,
+  // and its retries the rest as their copies land (EngineVictims::take).
   [[nodiscard]] bool convertToSpill(Request &request);
   // What a lane does about memory it could not get. Pending memory returns
   // by itself: the lane waits (the ledger finds it, its own lanes' owed
@@ -1102,7 +1127,7 @@ private:
   // reaches its first state boundary first; what lies past it follows once
   // that state has its buffers (reserveCaptures).
   [[nodiscard]] static uint64_t workEndOf(const Request &active, const BatchItem &scheduled,
-                                          bool prefill, uint32_t decodeRows) noexcept;
+                                          bool prefill) noexcept;
   // Beside a lane of its command that ended, a lane gives that command up in
   // place of its suspension; the next tick plans again either way.
   [[nodiscard]] Prepared yieldLane(Request &lane, uint64_t workEnd,
@@ -1306,6 +1331,14 @@ private:
   PassCommand passCommand_{scheduler_, [this](uint64_t id) { return requests_.at(id).pendingEnd.has_value(); }};
   // When the latest command retired, until a tick finds nothing to do.
   std::optional<double> busySinceMilliseconds_;
+  // The next prefill unit's wait for a decoder whose memory lands
+  // (Scheduler::waitsUntil), as the last tick left it: since the tick that
+  // began it, until the scheduler's bound, when the loop wakes. Every tick
+  // takes it and decides again (tick), so it lasts no longer than the wait.
+  struct UnitWait final {
+    double since = 0.0, until = 0.0;
+  };
+  std::optional<UnitWait> unitWait_;
   // The lanes admit() has obtained so far, including those it gave back when
   // the attempt's pages were refused (Request::admission).
   uint64_t admissions_ = 0;

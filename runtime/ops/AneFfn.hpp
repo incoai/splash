@@ -46,7 +46,7 @@ public:
   // The GPU part's down projection is a view of leading inputs, which only
   // the plain or residual prefill tiles (GgufPrefill, GgufPrefillInt8) run: no chunk
   // the split takes stages.
-  static_assert(kMinimumRows > kMaximumStagedPrefillRows, "the split's chunks run the prefill residual tiles");
+  static_assert(kMinimumRows > kMaximumDecodeTileRows, "the split's chunks run the prefill residual tiles");
 
   // The ANE takes `aneUnits` of the units() of intermediate channels, and
   // the GPU the rest through `linear`'s prefill plans. The program is
@@ -107,9 +107,9 @@ public:
   // encodes them, commit() and its completion check; each against the
   // leading rows of a full chunk on the GPU, which computes every row alike
   // whatever the chunk's rows. Returns the largest error of what the ANE
-  // adds to the GPU's part (AneFfn.cpp). Throws if an output is not finite,
-  // that error exceeds its bound or the ANE's work fails, which stops the
-  // split.
+  // adds to the GPU's part (AneFfn.cpp). Throws ane::Refused if an output is
+  // not finite, that error exceeds its bound or the ANE's work fails, which
+  // stops the split.
   [[nodiscard]] double verify(std::span<const SwiGluProjections> layers, const PrefillFfnBuffers &ffn,
                               const std::array<metal::MetalBuffer, 2> &hidden);
 

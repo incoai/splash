@@ -92,13 +92,18 @@ class CacheInfo:
 @dataclass(frozen=True)
 class ReasoningRequest:
     """How a chat request asked to reason: the reasoning effort it sent, None
-    when absent; the effort its template rendered with, the server's default
-    for an absent one and None for the template's own; and its
-    chat_template_kwargs enable_thinking, None when unset."""
+    when absent; the effort its template rendered with, the server's own
+    where it sets every request's, else the server's default for an absent
+    one and None for the template's own; its chat_template_kwargs
+    enable_thinking, None when unset or when the server's effort replaced
+    it; and the effort its chat_template_kwargs set, which the template
+    renders over the others, None when unset, when the server's effort
+    replaced it or when the template does not read it."""
 
     sent: str | None
     effort: str | None
     enable_thinking: bool | None
+    template: str | None = None
 
 
 @dataclass
@@ -447,6 +452,12 @@ class NativeBackend:
         # Called once relaunching has stopped for good, with stop_reason,
         # without the lock: the server then exits (server.main).
         self.on_stopped: Callable[[str], None] | None = None
+        # Who follows the engine (follow), what it was last told, and the
+        # lock one caller at a time reads the engine's state and tells it
+        # under.
+        self.follower: Callable[[bool], None] | None = None
+        self.told_recovering = False
+        self.telling = threading.Lock()
         # Why the engine cannot serve: its failure, the last failed restart or
         # why restarts stopped.
         self.engine_error = None
@@ -491,6 +502,7 @@ class NativeBackend:
                 self.restart_due = time.monotonic() + delay
             stopped = self.stop_reason
             self._ensure_recovery_locked()
+        self._tell()
         print_status(f"{event} · {failure.message}", error=True)
         if stopped is not None:
             print_status(f"Engine stopped · {stopped}", error=True)
@@ -543,6 +555,35 @@ class NativeBackend:
             + "Start the Splash server again after fixing the cause."
         )
 
+    def follow(self, follower):
+        """Tell `follower` whether the engine is recovering, True from an
+        engine's failure until the engine relaunched in its place serves,
+        each time that changes from now on, and at once of a failure before
+        now. It is called without the backend's lock, on the thread the
+        change came on, which may be the failed engine's reader: it must not
+        block. A backend that closes or stops relaunching tells it no more:
+        the server's end is the server's to say."""
+        with self.telling:
+            self.follower = follower
+        self._tell()
+
+    def _tell(self):
+        """Tell the follower whether a relaunch is owed, where that differs
+        from what it was last told. A failure sets it on the thread that saw
+        the failure and a relaunch clears it on the recovery worker, so the
+        two may come in either order: each reads the state and tells it under
+        one lock, and the last word told is then of the latest change. One
+        that waits for the lock returns once the word before it was told."""
+        with self.telling:
+            with self.lock:
+                if self.closing or self.stop_reason is not None:
+                    return
+                recovering = self.restart_due is not None
+            if self.follower is None or recovering == self.told_recovering:
+                return
+            self.told_recovering = recovering
+            self.follower(recovering)
+
     def _stop_restarting_locked(self, message):
         """Stop relaunching for good: the server exits once _failed has said
         why (on_stopped)."""
@@ -589,6 +630,10 @@ class NativeBackend:
                     self.recovery = None
                     return
             if due is not None:
+                # The failure's thread tells the follower too, but this
+                # worker, started under the lock before that thread tells it,
+                # may come first: no relaunch begins before it is told.
+                self._tell()
                 if not self.wakeup.wait(max(0.0, due - time.monotonic())):
                     self._relaunch(due)
                 continue
@@ -655,6 +700,7 @@ class NativeBackend:
             if self.restart_due == due:
                 self.restart_due = None
             self.refresh_due = True
+        self._tell()
 
     def _recovery_retry_after_locked(self):
         """The Retry-After of a refusal while the engine restarts: the seconds
@@ -825,11 +871,12 @@ class NativeBackend:
             return None
 
         def provide(event):
-            # runtime sends the simulated context sequence, not merely draft
-            # proposals: [] for the initial mask, then [pending anchor,
-            # draft...] for verification. TokenConstraint returns the mask
-            # before the first simulated token and after each token.
-            return job.constraint.masks(event.simulation_tokens)
+            # runtime sends the simulated context, not merely draft
+            # proposals: nothing for the initial mask, then a verify block's
+            # tree, the pending anchor its root. TokenConstraint returns the
+            # mask before the first simulated token and after each token's
+            # path, and the tokens the grammar forces after each.
+            return job.constraint.masks(event.simulation_tokens, event.parents)
 
         return provide
 
@@ -1060,6 +1107,7 @@ class NativeBackend:
                     "sent_effort": job.reasoning.sent,
                     "effort": job.reasoning.effort,
                     "enable_thinking": job.reasoning.enable_thinking,
+                    "template_effort": job.reasoning.template,
                     "thinking": job.thinking,
                 }
             self._log(record)
@@ -1282,6 +1330,9 @@ class NativeBackend:
             self.closing = True
             for state in self.active.values():
                 state.shutdown_requested = True
+        # A word being told ends before close returns, and none follows it.
+        with self.telling:
+            pass
         self.wakeup.set()
         try:
             # Fails every call and a relaunch in progress, and stops the

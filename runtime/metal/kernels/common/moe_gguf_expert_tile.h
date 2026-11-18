@@ -11,9 +11,9 @@ template <class Formats>
 __attribute__((noinline)) void moe_expert_column(uint format, device bfloat *x, uint rows, uint input_size,
                                                  device uchar *w0, device uchar *w1, device uchar *meta, uint column,
                                                  threadgroup half2 *tl, uint thread_index,
-                                                 thread float (&sums)[MOE_GGUF_COLUMN_ROWS], Formats formats) {
-  column_dot_any<MOE_GGUF_COLUMN_ROWS>(format, x, rows, input_size, w0, w1, meta, column, 0, input_size / 32, tl,
-                                       thread_index, GGUF_STAGED_THREADS, sums, formats);
+                                                 thread float (&sums)[GGUF_COLUMN_ROWS], Formats formats) {
+  column_dot_any<GGUF_COLUMN_ROWS>(format, x, rows, input_size, w0, w1, meta, column, 0, input_size / 32, tl,
+                                   thread_index, GGUF_STAGED_THREADS, sums, formats);
 }
 
 // A GGUF expert pass of projection Projection (metal/abi/MoE.h: 0 gate, 1 up, 2 down) over the grouped tiles: the
@@ -25,11 +25,11 @@ __attribute__((noinline)) void moe_expert_column(uint format, device bfloat *x, 
 // steps, short prefill chunks) or 32-row tiles (longer chunks, ops::selectMoe), where a tile runs the 8-, 16- or
 // 32-row matmul that holds its live rows (moe_live_rows): an expert's last tile is mostly partial, so on the 35B's
 // prefill routes 32-row tiles take 17-30% less time than 64-row ones. An expert's only tile of at most
-// MOE_GGUF_COLUMN_ROWS live rows runs the column tile instead (kernels/common/gguf_column_tile.h, moe_column_tile),
+// GGUF_COLUMN_ROWS live rows runs the column tile instead (kernels/common/gguf_column_tile.h, moe_column_tile),
 // each lane one of the simdgroup's columns over the live rows: routes spread over many experts leave most decode tiles
 // at one or two rows, where the staged tile's padded matmul steps bound it. store(o, v) writes the output element o of
-// the fp32 sum v; `formats` switches to the formats the pass decodes (moe_gguf.metal's moe_formats, every format for
-// gguf-moe's reference).
+// the fp32 sum v, which it rounds to bf16 first: a partial staged tile hands it the sum it parked as bf16. `formats`
+// switches to the formats the pass decodes (moe_gguf.metal's moe_formats, every format for gguf-moe's reference).
 template <ushort Rows, uint Shared, uint Projection, class Store, class Formats = any_quant_format>
 inline void moe_gguf_expert_tile(device bfloat *input, device const MoeTileDescriptor *tiles,
                                  device const uint *tile_count, device uchar *sw0, device uchar *sw1,
@@ -43,11 +43,11 @@ inline void moe_gguf_expert_tile(device bfloat *input, device const MoeTileDescr
   const MoeGgufSegment s =
       moe_gguf_segment<Shared>(tile.expert, p.experts, p.input_size, p.output_size, p.routed_format, p.shared_format,
                                slots, chunks, p.floor_slots, p.chunk_slots, Projection, sw0, sw1, smeta);
-  device bfloat *x = input + ulong(t) * Rows * p.input_size;
-  const ulong out = ulong(t) * Rows * p.output_size;
+  device bfloat *x = input + ulong(tile.first_row) * p.input_size;
+  const ulong out = ulong(tile.first_row) * p.output_size;
   const uint origin = group.x * GGUF_TILE_COLUMNS + simd_group * GGUF_STAGED_COLUMNS;
   if (moe_column_tile(tiles, t)) {
-    float sums[MOE_GGUF_COLUMN_ROWS];
+    float sums[GGUF_COLUMN_ROWS];
     moe_expert_column(s.format, x, tile.rows, p.input_size, s.w0, s.w1, s.meta, origin + simd_lane, tl,
                       simd_group * 32 + simd_lane, sums, formats);
     for (uint row = 0; row < tile.rows; ++row) store(out + ulong(row) * p.output_size + origin + simd_lane, sums[row]);
@@ -61,9 +61,24 @@ inline void moe_gguf_expert_tile(device bfloat *input, device const MoeTileDescr
     staged_accumulate_any<R, GGUF_STAGED_COLUMNS, GGUF_STAGED_STEP>(s.format, x, s.w0, s.w1, s.meta, p.input_size, origin, my, tl,
                                             simd_group * 32 + simd_lane, simd_lane, 0, p.input_size / GGUF_STAGED_STEP, 0, acc,
                                             formats);
-    gguf_elements(acc, [&](uint row, uint column, float v) {
-      store(out + ulong(row) * p.output_size + origin + column, v);
-    });
+    // A tile of R live rows stores its sums as they are. A partial tile parks
+    // them as bf16 in the simdgroup's stage, which its walk no longer reads,
+    // and each lane stores its column of the live rows. On the down pass of a
+    // 35B 2048-row chunk (16-core M5 Pro), a guard on each element's row took
+    // 17% more time, and parking every tile 2%.
+    if (tile.rows == R) {
+      gguf_elements(acc, [&](uint row, uint column, float v) {
+        store(out + ulong(row) * p.output_size + origin + column, v);
+      });
+      return;
+    }
+    static_assert(R * GGUF_STAGED_COLUMNS * sizeof(bfloat) <= kStagedSimdgroupStage * sizeof(half),
+                  "the sums fit a stage");
+    threadgroup bfloat *park = reinterpret_cast<threadgroup bfloat *>(my);
+    gguf_elements(acc, [&](uint row, uint column, float v) { park[row * GGUF_STAGED_COLUMNS + column] = bfloat(v); });
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint row = 0; row < tile.rows; ++row)
+      store(out + ulong(row) * p.output_size + origin + simd_lane, float(park[row * GGUF_STAGED_COLUMNS + simd_lane]));
   };
   moe_live_rows<Rows>(tile.rows, run);
 }

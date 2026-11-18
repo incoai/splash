@@ -111,10 +111,10 @@ int main(int argc, char **argv) {
                      BlockWeights{std::vector{QuantizedSegment::floats(kValueRows, kHidden, weightBuffer)}});
     const Projection placed = Projection::placed(kPacked, kFusedRows, std::move(value));
 
-    const uint32_t lanes = 1;
+    const uint32_t rows = SPLASH_DRAFT_QUERY_ROWS;
     CommandGraph project;
     const Linear linear(backend.capabilities(), splash::ops::Int8Activations::Off);
-    const LinearPlan plan = linear.decodePlan(placed, lanes);
+    const LinearPlan plan = linear.plan(placed, rows);
     const LinearScratchSize size = plan.scratchSize();
     const auto zeros = [&](uint64_t bytes, const char *label) {
       MetalBuffer buffer = backend.allocateBuffer(std::max<uint64_t>(bytes, 16), BufferStorage::Shared, label);

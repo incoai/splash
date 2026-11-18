@@ -1,5 +1,6 @@
 #include "engine/CacheDirectory.hpp"
 #include "AwakeClock.hpp"
+#include "InterruptedCall.hpp"
 
 #include <fcntl.h>
 #include <sys/file.h>
@@ -53,9 +54,7 @@ private:
 // A namespace's name (CacheDirectory::kNamespaceDigits).
 bool namespaceName(std::string_view name) noexcept {
   return name.size() == CacheDirectory::kNamespaceDigits &&
-         std::all_of(name.begin(), name.end(), [](char character) {
-           return (character >= '0' && character <= '9') || (character >= 'a' && character <= 'f');
-         });
+         name.find_first_not_of("0123456789abcdef") == std::string_view::npos;
 }
 
 // Its files are trusted as this process's own, so nobody else may write
@@ -69,9 +68,10 @@ bool owned(int directory) noexcept {
 // Makes the directory at path (0700) when missing and opens it; empty when
 // it was removed between the two.
 std::optional<Descriptor> openDirectory(const std::filesystem::path &path, const char *what) {
-  if (::mkdir(path.c_str(), 0700) < 0 && errno != EEXIST)
+  if (retryInterrupted([&] { return ::mkdir(path.c_str(), 0700); }) < 0 && errno != EEXIST)
     fail(what);
-  Descriptor directory(::open(path.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW));
+  Descriptor directory(retryInterrupted(
+      [&] { return ::open(path.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW); }));
   if (directory.get() < 0) {
     if (errno == ENOENT)
       return std::nullopt;
@@ -139,11 +139,16 @@ CacheDirectory::open(const std::filesystem::path &root, std::string_view cacheNa
                      std::chrono::milliseconds lockWait, const std::function<bool()> &cancelled) {
   if (!namespaceName(cacheNamespace))
     throw std::invalid_argument("a cache namespace is 32 lowercase hex digits");
-  if (root.has_parent_path())
-    std::filesystem::create_directories(root.parent_path());
+  // A signal can interrupt the mkdir of a parent as it can the root's.
+  std::error_code made;
+  if (root.has_parent_path() && retryInterrupted([&] {
+        std::filesystem::create_directories(root.parent_path(), made);
+        errno = made.value();
+        return made ? -1 : 0;
+      }) < 0)
+    throw std::filesystem::filesystem_error("create_directories", root.parent_path(), made);
   if (!openDirectory(root, "open cache root"))
-    throw std::system_error(std::make_error_code(std::errc::no_such_file_or_directory),
-                            "open cache root");
+    throw std::system_error(ENOENT, std::generic_category(), "open cache root");
   const std::filesystem::path path = root / cacheNamespace;
   // A restarting server's new engine can race the end of the old one.
   const auto deadline = AwakeClock::now() + lockWait;
@@ -156,9 +161,9 @@ CacheDirectory::open(const std::filesystem::path &root, std::string_view cacheNa
     // can take its directory away before this one opens it or makes its
     // lock there: the next turn makes it again, empty.
     std::optional<Descriptor> directory = openDirectory(path, "open cache directory");
-    Descriptor lock(directory ? ::openat(directory->get(), kLock,
-                                         O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW, 0600)
-                              : -1);
+    Descriptor lock(directory ? retryInterrupted([&] {
+      return ::openat(directory->get(), kLock, O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW, 0600);
+    }) : -1);
     if (lock.get() < 0) {
       if (directory && errno != ENOENT)
         fail("open cache directory lock");
@@ -283,15 +288,19 @@ void CacheDirectory::close() {
   unmark(kServing);
 }
 
+// A signal can interrupt the open and each fsync as it can the directories'.
 void CacheDirectory::mark(const char *name) {
-  Descriptor file(::openat(directory_, name, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC | O_NOFOLLOW,
-                           0600));
-  if (file.get() < 0 || ::fsync(file.get()) < 0 || ::fsync(directory_) < 0)
+  Descriptor file(retryInterrupted([&] {
+    return ::openat(directory_, name, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC | O_NOFOLLOW, 0600);
+  }));
+  if (file.get() < 0 || retryInterrupted([&] { return ::fsync(file.get()); }) < 0 ||
+      retryInterrupted([&] { return ::fsync(directory_); }) < 0)
     fail("mark cache directory");
 }
 
 void CacheDirectory::unmark(const char *name) {
-  if ((::unlinkat(directory_, name, 0) < 0 && errno != ENOENT) || ::fsync(directory_) < 0)
+  if ((::unlinkat(directory_, name, 0) < 0 && errno != ENOENT) ||
+      retryInterrupted([&] { return ::fsync(directory_); }) < 0)
     fail("unmark cache directory");
 }
 

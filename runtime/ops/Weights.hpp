@@ -6,6 +6,7 @@
 #include <compare>
 #include <cstddef>
 #include <cstdint>
+#include <initializer_list>
 #include <stdexcept>
 #include <utility>
 #include <vector>
@@ -55,22 +56,22 @@ struct ProjectionShape final {
   bool rotated = false;
   // The Apple9 register tile takes all its quantized segments
   // (quant_register_tensor); a projection with one it does not take stages
-  // whatever its rows (Linear::decodeStorageRows, decodeScratchSize).
+  // whatever its rows (Linear::storageRows, scratchSize).
   bool registerFormats = true;
   // The FormatClass of its quantized segments, whose RegisterBoundary row
-  // bounds the register tile (Linear::decodeStorageRows).
+  // bounds the register tile (Linear::storageRows).
   FormatClass formatClass = FormatClass::FourBitsOrMore;
   // The bits per weight its quantized segments store together, its float
   // ones aside, in sixteenths, rounded down; 0 where it has none or they are
   // unknown, which Apple10's staged split law takes for the most a format
   // stores as it weighs a split's partials against the weights. The bits,
-  // with the wave law from 4.5, decide whether one lane runs the 16-row tile,
-  // never at 0 (KernelSelection.cpp).
+  // with the wave law from 4.5, decide whether a plan of one table tile of
+  // rows runs the 16-row tile, never at 0 (KernelSelection.cpp).
   uint32_t weightBits16 = 0;
   // The int8 prefill tile takes all its quantized segments
   // (quant_prefill_int8_format), of which it has one at least; a shape that
   // names no formats bounds a projection the tile takes
-  // (Linear::prefillScratchSize).
+  // (Linear::scratchSize).
   bool prefillInt8Formats = true;
   auto operator<=>(const ProjectionShape &) const = default;
 };
@@ -204,14 +205,21 @@ public:
             weights ? uint32_t(128 * bytes / weights) : 0, weights && prefillInt8Formats};
   }
 
-  // Views of a projection of one unrotated quantized tensor (Linear.cpp):
-  // over the leading `rows` rows of its planes, whole QUANT_TILE_ROWS tiles;
-  // or over the leading `inputs` inputs of each of its rows, whole quant
+  // Rows [first, first + count) of a projection's weights.
+  struct RowRange final {
+    uint32_t first = 0;
+    uint32_t count = 0;
+  };
+  // Views of a projection of one tensor (Linear.cpp): over the rows of
+  // `ranges`, whole QUANT_TILE_ROWS tiles of them (an empty range holds
+  // none), which become its output columns in order and multiply its input,
+  // rotation and destination as it does; or, of an unrotated quantized
+  // tensor, over the leading `inputs` inputs of each of its rows, whole quant
   // groups and meta units, which reads its planes as they are (planeInputs()).
-  [[nodiscard]] Projection leadingRows(const metal::MetalBackend &backend, uint32_t rows) const;
+  [[nodiscard]] Projection rows(const metal::MetalBackend &backend, std::initializer_list<RowRange> ranges) const;
   [[nodiscard]] Projection leadingInputs(uint32_t inputs) const;
-  // Whether those views take it: its own planes, not a view, of one
-  // unrotated quantized tensor.
+  // Whether the view of leading inputs takes it: its own planes, not a view,
+  // of one unrotated quantized tensor.
   [[nodiscard]] bool takesPlaneViews() const noexcept;
   // The inputs each row of the weight planes holds when the projection reads
   // only their first inputSize, a view of leadingInputs(); zero for

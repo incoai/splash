@@ -276,6 +276,7 @@ ENGINE_CPP_SOURCES := \
 	runtime/ops/RowCopy.cpp \
 	runtime/ops/ValueMix.cpp \
 	runtime/ops/Sampling.cpp \
+	runtime/ops/StateCodec.cpp \
 	runtime/ops/Vision.cpp \
 	runtime/metal/DeviceCapabilities.cpp \
 	runtime/engine/MemoryPlan.cpp \
@@ -318,7 +319,9 @@ ENGINE_CPP_SOURCES := \
 	runtime/model/GgufPreparation.cpp \
 	runtime/model/SlotRecycler.cpp \
 	runtime/model/ExpertStore.cpp \
+	runtime/model/StepCosts.cpp \
 	runtime/model/VerifyBudget.cpp \
+	runtime/model/LookupProposals.cpp \
 	runtime/model/Qwen3_6Moe.cpp \
 	runtime/model/Qwen3_8.cpp \
 	runtime/model/Qwen4Exp.cpp \
@@ -441,7 +444,8 @@ PRODUCTION_AIR_CONFIG := $(METAL_CONFIG_DIGEST)-$(KERNEL_HEADER_NAMES_DIGEST)
 PRODUCTION_LIB_CONFIG := $(PRODUCTION_AIR_CONFIG)-$(KERNEL_SOURCE_NAMES_DIGEST)
 TEST_KERNEL_CONFIG := $(TEST_CONFIG_DIGEST)-$(KERNEL_HEADER_NAMES_DIGEST)
 TEST_KERNEL_CONFIG_TARGETS := $(TEST_Q8_KERNEL_AIRS) $(TEST_RESIDENCY_AIR) \
-	$(TEST_Q8_ATTENTION_LIB) $(TEST_GGUF_DEQUANT_AIR) $(TEST_GGUF_DEQUANT_LIB) $(TEST_GGUF_MOE_AIR)
+	$(TEST_Q8_ATTENTION_LIB) $(TEST_GGUF_DEQUANT_AIR) $(TEST_GGUF_DEQUANT_LIB) $(TEST_GGUF_MOE_AIR) \
+	$(TEST_ATTENTION_STORE_AIR)
 TEST_CONFIG_TARGETS := $(filter-out $(TEST_KERNEL_CONFIG_TARGETS),$(TEST_CONFIG_TARGETS))
 
 $(PRODUCTION_CONFIG_TARGETS): BUILD_CONFIG := $(CONFIG_DIGEST)

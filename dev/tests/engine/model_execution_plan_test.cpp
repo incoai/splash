@@ -140,21 +140,21 @@ void checkGateUpLayers() {
     const auto scratch = model::DecodeArena::linearScratchSize(geometry, plans);
     for (uint32_t lanes = 1; lanes <= model::kLaneCount; ++lanes) {
       const auto plan = plans.linear().plan({{up.outputSize, up.inputSize}, lanes * model::kDecodeRows,
-          ops::LinearPhase::Decode, ops::LinearEpilogue::GateUp}, up);
+          ops::LinearEpilogue::GateUp}, up);
       const auto required = plan.scratchSize();
       require(scratch.input >= required.input && scratch.sums >= required.sums &&
                   scratch.partials >= required.partials && scratch.counters >= required.counters,
               "the decode arena is below a gate/up layer's scratch");
       require(model::DecodeArena::gateScratchBytes(geometry, plans) >= plan.gateScratchBytes(),
               "the gate/up workspace is too small");
-      // The F16 and Q8_0 pair stages, at rows the decode storage of the
-      // target's projections holds (QwenTarget::decodeStorageLanes).
-      const auto pair = plans.linear().decodePlan(mixed.upProjection, lanes, ops::LinearEpilogue::GateUp,
-                                                  &mixed.gateProjection);
+      // The F16 and Q8_0 pair stages, at rows the storage of the target's
+      // projections over a step's rows holds (ops::Linear::storageRows).
+      const auto pair = plans.linear().plan(mixed.upProjection, lanes * model::kDecodeRows,
+                                            ops::LinearEpilogue::GateUp, &mixed.gateProjection);
       const auto paired = pair.scratchSize();
       uint32_t storage = 0;
       for (const auto &shape : geometry.target.decodeProjections)
-        storage = std::max(storage, plans.linear().decodeStorageRows(lanes * model::kDecodeRows, shape));
+        storage = std::max(storage, plans.linear().storageRows(lanes * model::kDecodeRows, shape));
       require(pair.configuration().tile == ops::LinearTile::GgufStaged && pair.storageRows() <= storage,
               "a gate/up pair with an F16 gate did not stage within the decode storage");
       require(scratch.input >= paired.input && scratch.sums >= paired.sums && scratch.partials >= paired.partials &&
@@ -165,7 +165,7 @@ void checkGateUpLayers() {
     const auto sizes = model::prefillTensorBytes(geometry, plans);
     for (uint32_t rows : {1U, 8U, 17U, 32U, 33U, 48U, 64U}) {
       const auto required = plans.linear().plan({{up.outputSize, up.inputSize}, rows,
-          ops::LinearPhase::Prefill, ops::LinearEpilogue::None}, up).scratchSize();
+          ops::LinearEpilogue::None}, up).scratchSize();
       require(sizes[uint32_t(model::PrefillTensor::LinearPartials)] >= required.partials &&
                   sizes[uint32_t(model::PrefillTensor::LinearCounters)] >= required.counters,
               "the short-prefill split scratch is too small");
@@ -176,8 +176,10 @@ void checkGateUpLayers() {
 // The prefill arena holds the int8 prefill tile's codes and scales of a full
 // chunk of the target's widest projection the tile takes, wherever the family
 // runs it with int8 activations on, and none for the draft, which prefills on
-// the bf16 tiles: a GGUF target holds none, and Qwen3.8-27B MLX 4-bit its down
-// projection's (17408 inputs), not its draft's context projection's (25600).
+// the bf16 tiles, beside the tables of its plans of up to 32 rows on the
+// decode tiles (Apple9's register tile): a GGUF target holds those tables
+// alone, and Qwen3.8-27B MLX 4-bit its down projection's codes (17408 inputs),
+// not its draft's context projection's (25600).
 void checkPrefillInt8Scratch() {
   for (uint32_t family : {9U, 10U, 11U})
     for (const ops::Int8Activations setting : {ops::Int8Activations::On, ops::Int8Activations::Off}) {
@@ -185,57 +187,101 @@ void checkPrefillInt8Scratch() {
       device.appleGpuFamily = family;
       device.gpuCoreCount = 20;
       const ops::ExecutionPlans plans(device, setting);
-      // The arena's codes and scales for `loaded`.
+      // The arena's codes and scales for `loaded`, and the tables of its plans
+      // on the decode tiles.
       const auto int8Scratch = [&](const model::LoadedModel &loaded) {
         const auto sizes = model::prefillTensorBytes(
             model::RuntimeGeometry::from(loaded, kv::Format::Int8, ops::GdnStateFormat::Float32), plans);
         return std::pair{sizes[uint32_t(model::PrefillTensor::LinearTable)],
                          sizes[uint32_t(model::PrefillTensor::LinearSums)]};
       };
+      const auto tables = [&](const model::LoadedModel &loaded) {
+        const auto geometry = model::RuntimeGeometry::from(loaded, kv::Format::Int8, ops::GdnStateFormat::Float32);
+        ops::LinearScratchSize bound;
+        for (const auto &shape : geometry.target.prefillProjections)
+          bound.include(plans.linear().scratchSize(shape, ops::kMaximumDecodeTileRows));
+        const auto &draft = geometry.draft;
+        for (const ops::ProjectionShape shape : {ops::ProjectionShape{draft.hiddenSize, draft.targetHiddenSize()},
+                                                 {draft.contextKvSize(), draft.hiddenSize}})
+          bound.include(plans.draftLinear().scratchSize(shape, ops::kMaximumDecodeTileRows));
+        return std::pair{bound.input, bound.sums};
+      };
       for (const model::LoadedModel &gguf :
            {loadedModel<model::Qwen3_8Weights>(), loadedModel<model::Qwen3_6MoeWeights>()})
-        require(int8Scratch(gguf) == std::pair<uint64_t, uint64_t>{},
-                "the prefill arena of a GGUF target holds int8 prefill scratch");
+        require(int8Scratch(gguf) == tables(gguf), "the prefill arena of a GGUF target holds int8 prefill scratch");
       const uint32_t down = model::Qwen3_8Layout{}.intermediateSize;
-      const auto [table, sums] =
-          int8Scratch(loadedModel<model::Qwen3_8Weights>({}, test::qwen3_8Draft(), GGUF_FMT_AF4G64));
+      const model::LoadedModel mlx = loadedModel<model::Qwen3_8Weights>({}, test::qwen3_8Draft(), GGUF_FMT_AF4G64);
+      const auto [table, sums] = int8Scratch(mlx);
+      const auto [decodeTable, decodeSums] = tables(mlx);
       const bool int8 = family >= 10 && setting == ops::Int8Activations::On;
-      require(table == (int8 ? gguf_prefill_int8_table_bytes(down, SPLASH_PREFILL_TOKEN_BUDGET) : 0) &&
-                  sums == (int8 ? gguf_prefill_int8_scale_bytes(down, SPLASH_PREFILL_TOKEN_BUDGET) : 0),
+      require(table == std::max<uint64_t>(decodeTable, int8 ? gguf_prefill_int8_table_bytes(down, SPLASH_PREFILL_TOKEN_BUDGET) : 0) &&
+                  sums == std::max<uint64_t>(decodeSums, int8 ? gguf_prefill_int8_scale_bytes(down, SPLASH_PREFILL_TOKEN_BUDGET) : 0),
               "the prefill arena of an MLX target holds other int8 prefill scratch than its down projection's");
     }
 }
 
 // One decode arena serves every lane count, and a staged plan's partials
 // grow with its rows. The arena must hold every lane's plan of every target
-// and draft projection at the measured core counts.
+// projection and the draft's context projections, over a lane's most rows,
+// and of the draft's own and of its head over its subset of the vocabulary
+// (DFlashDraft), over its block's, at the measured core counts and an M3
+// Ultra's 80: there the register tile splits K for the subset head's 2,322
+// column tiles and not for the whole head's 3,880, whose plan takes no
+// partials.
 void checkLaneScratch(const model::LoadedModel &loaded) {
   const auto geometry = model::RuntimeGeometry::from(loaded, kv::Format::Int8, ops::GdnStateFormat::Float32);
   const auto &d = geometry.draft;
-  std::vector<ops::LinearMatrix> matrices{
-      {d.dynamicSize, d.hiddenSize}, {d.qkvSize, d.hiddenSize}, {d.contextKvSize(), d.hiddenSize},
-      {d.hiddenSize, d.attentionSize},
-      {d.intermediateSize, d.hiddenSize}, {d.hiddenSize, d.intermediateSize},
-      {d.selectorRank, d.hiddenSize}, {d.hiddenSize, d.targetHiddenSize()}};
-  for (const auto &p : geometry.target.decodeProjections) matrices.push_back({p.outputSize, p.inputSize});
+  const auto &target = geometry.target;
+  // Each matrix with the rows a lane gives it.
+  std::vector<std::pair<ops::LinearMatrix, uint32_t>> matrices{
+      {{d.dynamicSize, d.hiddenSize}, model::kDraftRows},       {{d.qkvSize, d.hiddenSize}, model::kDraftRows},
+      {{d.hiddenSize, d.attentionSize}, model::kDraftRows},     {{d.intermediateSize, d.hiddenSize}, model::kDraftRows},
+      {{d.hiddenSize, d.intermediateSize}, model::kDraftRows},  {{d.selectorRank, d.hiddenSize}, model::kDraftRows},
+      {{d.contextKvSize(), d.hiddenSize}, model::kDecodeRows}, {{d.hiddenSize, d.targetHiddenSize()}, model::kDecodeRows},
+      {{target.draftVocabulary.columns(target.vocabularySize), target.hiddenSize}, model::kDraftRows}};
+  for (const auto &p : target.decodeProjections)
+    matrices.push_back({{p.outputSize, p.inputSize}, model::kDecodeRows});
   for (uint32_t family : {9U, 10U, 11U})
-    for (uint32_t cores : {12U, 20U, 40U}) {
+    for (uint32_t cores : {12U, 20U, 40U, 80U}) {
       DeviceCapabilities device;
       device.appleGpuFamily = family;
       device.gpuCoreCount = cores;
       const ops::ExecutionPlans plans(device, ops::Int8Activations::On);
       const auto scratch = model::DecodeArena::linearScratchSize(geometry, plans);
-      for (const auto matrix : matrices)
+      for (const auto &[matrix, laneRows] : matrices)
         for (uint32_t lanes = 1; lanes <= model::kLaneCount; ++lanes)
           for (auto epilogue : {ops::LinearEpilogue::None, ops::LinearEpilogue::Residual,
-                                ops::LinearEpilogue::GateUp, ops::LinearEpilogue::ClampedGateUp}) {
-            const auto need = plans.linear().plan({matrix, lanes * model::kDecodeRows,
-                ops::LinearPhase::Decode, epilogue}).scratchSize();
+                                ops::LinearEpilogue::GateUp}) {
+            const auto need = plans.linear().plan({matrix, lanes * laneRows, epilogue}).scratchSize();
             require(scratch.input >= need.input && scratch.sums >= need.sums && scratch.partials >= need.partials &&
                         scratch.counters >= need.counters,
                     "decode arena scratch below a lane's plan");
           }
     }
+}
+
+// A decode step of any rows its lanes may give it, up to four lanes of a
+// verify block's 16, finds its MoE plan's workspace in the decode arena: past
+// 32 rows the 35B's and the 122B's plans take 32-row expert tiles, whose 274
+// tiles at 64 rows a bound of four lanes of 8 rows did not hold.
+void checkDecodeStepMoe(const model::LoadedModel &loaded) {
+  const auto geometry = model::RuntimeGeometry::from(loaded, kv::Format::Int8, ops::GdnStateFormat::Float32);
+  for (uint32_t family : {9U, 10U, 11U}) {
+    DeviceCapabilities device;
+    device.appleGpuFamily = family;
+    device.gpuCoreCount = 20;
+    const ops::ExecutionPlans plans(device, ops::Int8Activations::On);
+    const model::TargetRows step = model::decodeTargetRows(geometry, plans);
+    require(step.rows == model::kLaneCount * model::ExecutionLimits::targetVerifyRows,
+            "the decode arena does not hold four lanes of a verify block's rows");
+    for (uint32_t rows = 1; rows <= step.rows; ++rows) {
+      const ops::MoeWorkspace need =
+          plans.moe(geometry.target.moeBlockShape(), geometry.target.moeRouterFormat, rows).workspace();
+      for (const auto field : ops::kMoeWorkspaceFields)
+        require(step.moe.*field >= need.*field,
+                "the decode arena does not hold the MoE plan of a step of " + std::to_string(rows) + " rows");
+    }
+  }
 }
 
 // The decode arena's plan counts each buffer it allocates in whole host
@@ -302,9 +348,9 @@ void checkIndexTables() {
 // A runtime whose K/V spills (one given the readers of spilled K/V,
 // model::RuntimeContext) runs its prefill commands as groups, which read an
 // attention layer's spilled history once each, and its decode arena holds
-// where its verify's listed blocks are: a lane's list, 8 rows of 512 blocks
-// and the block of each row's tail. The K/V of a target without a block
-// index cannot spill.
+// where its verify's listed blocks are: a lane's list, a verify block's 16
+// rows of 512 blocks and the block of each row's tail. The K/V of a target
+// without a block index cannot spill.
 void checkSpilledKvGeometry() {
   const auto flash = loadedModel<model::Qwen4ExpWeights>();
   const auto resident = model::RuntimeGeometry::from(flash, kv::Format::Int8, ops::GdnStateFormat::Float32);
@@ -314,7 +360,7 @@ void checkSpilledKvGeometry() {
               spilled.prefillChunks == model::kPrefillGroupChunks && spilled.spilledKv == test::sparseKvShape(),
           "a runtime's prefill groups do not follow whether its K/V spills");
   require(!decodeBytes(resident, model::DecodeTensor::Locations) &&
-              decodeBytes(spilled, model::DecodeTensor::Locations) == uint64_t{8} * (512 + 1) * sizeof(uint32_t),
+              decodeBytes(spilled, model::DecodeTensor::Locations) == uint64_t{16} * (512 + 1) * sizeof(uint32_t),
           "a runtime's decode arena does not hold its spilled blocks' locations exactly when its K/V spills");
   for (const model::LoadedModel &loaded :
        {loadedModel<model::Qwen3_8Weights>(), loadedModel<model::Qwen3_6MoeWeights>()})
@@ -356,11 +402,16 @@ void checkArenasWithoutGdnLayers() {
   };
   using model::DecodeTensor;
   using model::PrefillTensor;
-  constexpr std::array gdnPrefill{PrefillTensor::GdnPacked, PrefillTensor::GdnQueries, PrefillTensor::GdnKeys,
-                                  PrefillTensor::GdnValues, PrefillTensor::GdnDecay, PrefillTensor::GdnBeta,
-                                  PrefillTensor::Recurrent, PrefillTensor::GdnHidden, PrefillTensor::GdnOutput,
-                                  PrefillTensor::GroupCell};
-  constexpr std::array gdnDecode{DecodeTensor::GdnHidden, DecodeTensor::GdnOutput, DecodeTensor::GdnTape};
+  using model::TargetTensor;
+  constexpr std::array gdnTarget{TargetTensor::GdnPacked, TargetTensor::GdnQueries, TargetTensor::GdnKeys,
+                                 TargetTensor::GdnValues, TargetTensor::GdnDecay,   TargetTensor::GdnBeta,
+                                 TargetTensor::Recurrent, TargetTensor::GdnHidden,  TargetTensor::GdnOutput};
+  constexpr std::array gdnPrefill{PrefillTensor::GroupCell};
+  constexpr std::array gdnDecode{DecodeTensor::GdnTape};
+  for (const auto rows : {model::prefillTargetRows, model::decodeTargetRows})
+    require(withoutGdn(model::targetTensorBytes(hybrid.target, rows(hybrid, plans)),
+                       model::targetTensorBytes(attentionOnly.target, rows(attentionOnly, plans)), gdnTarget),
+            "the target step tensors without GDN layers are not a hybrid's without its GDN scratch");
   require(withoutGdn(model::prefillTensorBytes(hybrid, plans), model::prefillTensorBytes(attentionOnly, plans),
                      gdnPrefill),
           "the prefill arena without GDN layers is not a hybrid's without its GDN scratch");
@@ -434,6 +485,29 @@ void checkGdnWidths() {
           "an inconsistent dense layout was accepted");
 }
 
+// A family's drafts' subset of its vocabulary (draftVocabulary) lies in it,
+// whole tiles of its head's rows, or the layout is refused before loading,
+// rather than its logits width wrapping: the Qwen subset over a vocabulary
+// of 1,024 tokens, a part of half a tile and parts that cross. The whole
+// vocabulary fits any.
+void checkDraftVocabulary() {
+  const model::Qwen3_8Layout shipped;
+  auto small = shipped;
+  small.vocabularySize = 1024;
+  rejects([&] { model::requireQwenLayout(small); }, "Qwen target layout is inconsistent",
+          "a subset past the vocabulary was accepted");
+  small.draftVocabulary = {};
+  model::requireQwenLayout(small);
+  auto halfTile = shipped;
+  halfTile.draftVocabulary.leading += QUANT_TILE_ROWS / 2;
+  rejects([&] { model::requireQwenLayout(halfTile); }, "Qwen target layout is inconsistent",
+          "a subset of part of a tile was accepted");
+  auto crossed = shipped;
+  crossed.draftVocabulary = {512, 448};
+  rejects([&] { model::requireQwenLayout(crossed); }, "Qwen target layout is inconsistent",
+          "a subset whose parts cross was accepted");
+}
+
 } // namespace
 
 // A prefill chunk's attention plan follows the history its chunk committed:
@@ -446,11 +520,13 @@ void checkPrefillAttentionHistory() {
   device.appleGpuFamily = 10;
   device.gpuCoreCount = 20;
   const ops::ExecutionPlans plans(device, ops::Int8Activations::On);
-  model::QwenTargetPrefillSequence sequence;
-  sequence.rows = 300;
+  const uint32_t heads = geometry.target.attentionQueryHeads;
+  const kv::Layout &layout = geometry.target.kvLayout;
   const auto splitsAfter = [&](uint32_t history) {
-    sequence.chunk.committed_tokens = history;
-    return model::prefillAttentionPlan(plans, geometry.target, sequence).splits;
+    const std::array chunk{ops::PagedAttention::chunkParams(history, 300, 320, (history + 300 + 31) / 32)};
+    return plans.attention(chunk, heads, layout, plans.sequenceAttentionWorkspace(heads, layout))
+        .sequences()[0]
+        .splits;
   };
   require(splitsAfter(65'536) > splitsAfter(0), "a chunk's attention plan does not follow its history");
 }
@@ -461,6 +537,7 @@ int main() {
     checkUnsizedProjection();
     checkCaptureLayers();
     checkGdnWidths();
+    checkDraftVocabulary();
     checkGateUpLayers();
     checkYarnGeometry();
     checkIndexTables();
@@ -472,6 +549,9 @@ int main() {
     checkLaneScratch(loadedModel<model::Qwen3_6MoeWeights>(model::kQwen3_5_122BLayout, test::qwen3_5_122BDraft()));
     checkDecodeArenaPages(loadedModel<model::Qwen3_8Weights>());
     checkDecodeArenaPages(loadedModel<model::Qwen3_6MoeWeights>());
+    checkDecodeStepMoe(loadedModel<model::Qwen3_6MoeWeights>());
+    checkDecodeStepMoe(loadedModel<model::Qwen3_6MoeWeights>(model::kQwen3_5_122BLayout, test::qwen3_5_122BDraft()));
+    checkDecodeStepMoe(loadedModel<model::Qwen4ExpWeights>());
     std::cout << "model execution plans: PASS (three paired geometries)\n";
   } catch (const std::exception &error) {
     std::cerr << error.what() << '\n';

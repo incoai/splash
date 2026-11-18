@@ -117,10 +117,9 @@ MetalBuffer prefill(MetalBackend &backend, LoadedModel &model, QwenTarget *targe
     sequence.request = QwenTargetRequest{
         std::span<const uint32_t>(tokens),
         [](uint64_t logical) { return std::array<uint32_t, 3>{uint32_t(logical), uint32_t(logical), uint32_t(logical)}; }};
-    sequence.attentionStride = (sequence.rows + kv::kPageTokens - 1) / kv::kPageTokens * kv::kPageTokens;
-    sequence.queryOffset = 0;
-    sequence.kvOffset = 0;
-    sequence.chunk = ops::PagedAttention::prefillParams(0, sequence.rows, sequence.attentionStride,
+
+
+    sequence.chunk = ops::PagedAttention::chunkParams(0, sequence.rows, (sequence.rows + splash::kv::kPageTokens - 1) / splash::kv::kPageTokens * splash::kv::kPageTokens,
                                                         static_cast<uint32_t>(pageIds.size()));
     MetalBuffer table =
         backend.allocateBuffer(pageIds.size() * sizeof(SplashKvPage), BufferStorage::Shared, "page table");
@@ -131,6 +130,7 @@ MetalBuffer prefill(MetalBackend &backend, LoadedModel &model, QwenTarget *targe
     chunk.buffers = buffers;
     chunk.sequences = {&sequence, 1};
     chunk.rows = sequence.rows;
+    *static_cast<SplashLaneRows *>(buffers.laneRows.contents()) = {0, sequence.rows};
 
     SpilledKvReads spilled;
     const std::vector<MetalBuffer> finalHidden =
@@ -147,7 +147,7 @@ MetalBuffer prefill(MetalBackend &backend, LoadedModel &model, QwenTarget *targe
     logits = backend.allocateBuffer(uint64_t{kVerifyRows} * kVocab * 4, BufferStorage::Shared, "logits");
     splash::ops::RowCopy::add(graph, finalHidden[0], {sequence.rows - 1, kHidden, 0}, headInput, {0, kHidden, 0}, 1,
                               kHidden);
-    target->addHeadBatch(graph, headInput, finalHidden0, logits, 1, kVerifyRows, decodeArena.linearScratch());
+    target->addHeadBatch(graph, headInput, finalHidden0, logits, kVerifyRows, decodeArena.linearScratch());
     static_cast<void>(backend.submitCommandAsync(graph.dispatches()).wait());
     seconds.push_back(std::chrono::duration<double>(std::chrono::steady_clock::now() - began).count());
   }

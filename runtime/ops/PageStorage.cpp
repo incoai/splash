@@ -159,7 +159,11 @@ void PageStorage::clearPages(std::span<const uint32_t> pages) {
 uint32_t PageStorage::indexOffset(uint32_t layer) const {
     if (!layout_.indexDimension || layer >= layout_.attentionLayers)
         throw std::out_of_range("KV layer has no index region");
-    return static_cast<uint32_t>(uint64_t{extentPages_} * layer * layout_.indexBytesPerLayerPage());
+    return layer * indexLayerBytes();
+}
+
+uint32_t PageStorage::indexLayerBytes() const noexcept {
+    return static_cast<uint32_t>(uint64_t{extentPages_} * layout_.indexBytesPerLayerPage());
 }
 
 PageForm PageStorage::form(uint32_t page) const { return allocatedExtent(page).form; }

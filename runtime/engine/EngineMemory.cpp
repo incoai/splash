@@ -263,7 +263,7 @@ uint32_t Engine::nextCommandPages(const Request &active) const {
   const uint64_t end =
       scheduler_.phase(id) == Phase::Prefill
           ? std::min<uint64_t>(scheduler_.promptProcessed(id) + model_.commandLimits().commandRows, active.promptTokens)
-          : active.exactTokens.size() + 2 * model_.draftRows();
+          : active.exactTokens.size() + model::ExecutionLimits::targetVerifyRows;
   return static_cast<uint32_t>((end + KvCache::pageTokens - 1) / KvCache::pageTokens);
 }
 
@@ -313,7 +313,7 @@ Engine::InMemory Engine::inMemory(const Request &active, const ClaimSpec &spec) 
     return {.admission = SpillAdmission::Waiting};
   // Alone, the KV memory holds bounds its output where it holds a token past
   // the prompt and the rows past it that the decode step verifies
-  // (workEndOf): a lane of T tokens takes the KV of T + 7 at its last step.
+  // (workEndOf): a lane of T tokens takes the KV of T + 15 at its last step.
   const uint64_t rows = model::ExecutionLimits::targetVerifyRows - 1;
   if (room.heldTokens > active.exactTokens.size() + rows)
     return {.admission = SpillAdmission::Resident, .tokens = room.heldTokens - rows};
@@ -609,8 +609,7 @@ std::optional<Engine::Denied> Engine::reserveReads(Request &active, const BatchI
   const auto memory = allocate([&] { return model_.reserveSpilledReads(id, need); }, spec, Refusal::Waits);
   if (memory.admission.granted())
     return std::nullopt;
-  return Denied{id, workEndOf(active, scheduled, plan.prefill, model_.draftRows()),
-                    memory.denial, std::nullopt,
+  return Denied{id, workEndOf(active, scheduled, plan.prefill), memory.denial, std::nullopt,
                 plan.prefill ? "prefill history staging" : "hot KV cache"};
 }
 
@@ -785,6 +784,32 @@ uint32_t Engine::reserveCaptures(Request &active, const BatchItem &item,
     }
   }
   return end - start;
+}
+
+void Engine::reserveReplyCapture(Request &active, std::vector<StateCapture> &states,
+                                 std::vector<LaneCapture> &captures, bool supersedes) {
+  if (!model_.capturesInDecode())
+    return;
+  // A cycle retains rows from the tokens the lane holds on, a verify block's
+  // most at most and none past its output limit: one reserved for a page they
+  // cannot reach would hold a state's buffers, 153 MiB for 27B, for nothing.
+  const auto held = static_cast<uint32_t>(active.exactTokens.size());
+  const uint32_t page = (held / KvCache::pageTokens + 1) * KvCache::pageTokens;
+  const uint32_t output = active.outputLimit - (held - active.promptTokens);
+  if (page - held > std::min(model::ExecutionLimits::targetVerifyRows, output))
+    return;
+  std::shared_ptr<StateReservation> buffers;
+  static_cast<void>(allocate(
+      [&] {
+        metal::AllocationFailure refusal = metal::AllocationFailure::None;
+        buffers = model_.reserveState(active.request.id, page, refusal);
+        return StateBuffers{.ok = buffers != nullptr, .allocationFailure = refusal};
+      },
+      stateClaim(active, StateClass::Checkpoint, supersedes), Refusal::SettledOnce));
+  if (buffers) {
+    states.push_back({page, std::move(buffers)});
+    captures.push_back({page});
+  }
 }
 
 ClaimSpec Engine::stateClaim(const Request &active, StateClass kind, bool supersedes) const {
@@ -1034,8 +1059,8 @@ std::vector<Victim> Engine::EngineVictims::conversions(const VictimQuery &query)
   const Engine &engine = engine_;
   std::vector<Victim> units;
   // Only the claimant's own lane converts (TakeRights::convertLane). Its
-  // claim's retries release its pages into the Index runway, so with none
-  // free nothing converts.
+  // claim releases its pages into the Index runway, so with none free
+  // nothing converts.
   const uint64_t id = query.rights.convertLane;
   if (!id || !engine.config_.spill.capable || engine.cache_.spillGate() != SpillGate::Open ||
       !engine.cache_.freePages(kv::PageForm::Index))
@@ -1058,7 +1083,7 @@ std::vector<Victim> Engine::EngineVictims::conversions(const VictimQuery &query)
   // The gate: the pages it would spill (Full pages no Resident request
   // holds) free Full - Index bytes each; less the first lane's hot block
   // floor its decode then reads through, they must cover what the claim
-  // lacks. On Flash-Next a lane converts from about 46K tokens.
+  // lacks. On Flash-Next a lane converts from about 62K tokens.
   const uint64_t pages = engine.cache_.convertiblePages(id);
   const uint64_t freed = pages * geometry.releasedPageBytes();
   const uint64_t reads = engine.model_.hotFloorBytes(1);
@@ -1133,14 +1158,26 @@ FreeResult Engine::EngineVictims::take(const VictimQuery &query, const Victim &v
     if (const uint64_t bytes = engine.model_.releaseIdleBuffer(keepLaneStart))
       return {FreeOutcome::Met, bytes};
     return {};
-  case VictimKind::Conversion:
-    // Its Full pages as peek counted them, which the claim's retries
-    // release once their copies land.
-    if (engine.convertToSpill(engine.request(victim.key)))
-      return {.outcome = FreeOutcome::Pending,
-              .laterBytes = victim.bytes,
-              .pages = query.need.form == victim.form ? victim.pages : 0};
-    return {};
+  case VictimKind::Conversion: {
+    // Converted, the lane's pages free memory as any Spill lane's do, by
+    // their release (below): at once those whose copies landed, as a chain
+    // it restored has them where the cache wrote that point behind (2,464
+    // of a churn lane's 2,464 pages in engine-sim), so the lane runs in the
+    // command it converts for. Waiting for the claim's retry instead cost it
+    // that command and its decode gap a prefill pass more: 1,066 ms against
+    // the 838 ms of one pass and a decode command. Short of copies the claim
+    // waits for those its conversion starts, its Full pages as peek counted
+    // them, which its retries release once they land.
+    if (!engine.convertToSpill(engine.request(victim.key)))
+      return {};
+    for (const Victim &unit : releases(query))
+      if (unit.key == victim.key && !unit.later)
+        if (const FreeResult released = take(query, unit); released.gave())
+          return released;
+    return {.outcome = FreeOutcome::Pending,
+            .laterBytes = victim.bytes,
+            .pages = query.need.form == victim.form ? victim.pages : 0};
+  }
   case VictimKind::Release: {
     // Pages whose copies land free nothing yet: the claim waits for them.
     if (victim.later)
@@ -1151,8 +1188,8 @@ FreeResult Engine::EngineVictims::take(const VictimQuery &query, const Victim &v
     // In place, the pages the claim lacks still. Else what it lacks still in
     // bytes and the first reads of the lanes the pages give Index pages
     // beside it, in whole extents (Cache::releaseMoves), each page freeing
-    // its Full bytes less its Index page's: four extents of pages for a
-    // 390 MiB hot block floor, the free Full pages beside completing the
+    // its Full bytes less its Index page's: six extents of pages for a
+    // 585 MiB hot block floor, the free Full pages beside completing the
     // last where the lane's pages run short (Cache::releaseBeside).
     const bool inPlace = victim.pages != 0;
     uint32_t pages = std::min(query.lackingPages, victim.pages);
@@ -1186,8 +1223,8 @@ FreeResult Engine::EngineVictims::take(const VictimQuery &query, const Victim &v
               id, {engine.scheduler_.phase(id) == Phase::Prefill ? WorkKind::Prefill : WorkKind::Decode,
                    engine.nextCommandPages(engine.requests_.at(id))}));
     // What it frees net of the first reads it gave the lanes, as its count
-    // is: taken gross, a claim of two lanes' releases kept a 390 MiB hot
-    // block floor less for each than it counted. In place an extent more
+    // is: taken gross, a claim of two lanes' releases kept a hot block
+    // floor less for each than it counted. In place an extent more
     // may leave beside the claim's pages (inPlaceMoves).
     const uint64_t created = saturatingSubtract(reads, engine.readsShortfall(releasable.holders));
     const uint64_t freed = saturatingSubtract(saturatingSubtract(before, engine.cache_.allocatedBytes()), created);

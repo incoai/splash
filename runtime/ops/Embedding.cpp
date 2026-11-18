@@ -5,6 +5,7 @@
 #include "metal/abi/Gguf.h"
 #include "ops/BufferExtent.hpp"
 
+#include <algorithm>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -46,31 +47,9 @@ void Embedding::add(metal::CommandGraph &graph, metal::MetalBuffer tokens,
             {(rows * table.inputSize + 255) / 256, 1, 1}, {256, 1, 1});
 }
 
-void Embedding::addVerifyInput(metal::CommandGraph &graph,
-                               metal::MetalBuffer draftInputTokens,
-                               metal::MetalBuffer proposedTokens,
-                               metal::MetalBuffer verifyInputTokens,
-                                 uint32_t vocabulary, uint32_t lanes,
-                               uint32_t rows) {
-  if (!vocabulary || !lanes || lanes > SPLASH_MAXIMUM_BATCH_WIDTH ||
-      !rows || rows > SPLASH_DRAFT_BLOCK_ROWS_LIMIT)
-    throw std::invalid_argument("invalid verify input batch");
-  // A lane's anchor is row 0 of its draft input rows.
-  requireBytes(draftInputTokens, rowBytes(lanes, rows, 1, sizeof(uint32_t)), "draft input token");
-  requireBytes(proposedTokens, uint64_t{lanes} * (rows - 1) * sizeof(uint32_t), "proposed token");
-  requireBytes(verifyInputTokens, uint64_t{lanes} * rows * sizeof(uint32_t), "verify input token");
-  const VerifyInputBatchParams params{vocabulary, rows};
-  graph.add("verify_input_tokens",
-            {std::move(draftInputTokens), std::move(proposedTokens),
-             std::move(verifyInputTokens)},
-            params, {uint64_t{lanes} * rows, 1, 1},
-            {1, 1, 1});
-}
-
 void Embedding::addDraftMaskRows(metal::CommandGraph &graph, metal::MetalBuffer mask, metal::MetalBuffer rowsBuffer,
                                  uint32_t width, uint32_t lanes, uint32_t rows) {
-  if (!width || !lanes || lanes > SPLASH_MAXIMUM_BATCH_WIDTH ||
-      !rows || rows > SPLASH_DRAFT_BLOCK_ROWS_LIMIT)
+  if (!width || !lanes || lanes > SPLASH_MAXIMUM_BATCH_WIDTH || !rows || rows > SPLASH_DRAFT_BLOCK_ROWS_LIMIT)
     throw std::invalid_argument("invalid draft mask rows");
   requireBytes(mask, uint64_t{width} * sizeof(uint16_t), "draft mask embedding");
   requireBytes(rowsBuffer, uint64_t{lanes} * rows * width * sizeof(uint16_t), "draft input row");

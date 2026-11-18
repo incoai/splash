@@ -1,6 +1,7 @@
 #pragma once
 
 #include "model/ModelFactory.hpp"
+#include "model/VerifyBudget.hpp"
 
 #include <cstdint>
 #include <memory>
@@ -10,6 +11,7 @@
 namespace splash::model {
 
 class PrefillArena;
+class DecodeArena;
 
 class RuntimeInstrumentation;
 
@@ -56,6 +58,7 @@ public:
   decode(const BatchPlan &plan, std::span<const ModelBatchItem> items);
   [[nodiscard]] std::shared_ptr<StateReservation>
   reserveState(uint64_t requestId, uint32_t tokens, metal::AllocationFailure &refusal) override;
+  [[nodiscard]] bool capturesInDecode() const noexcept override;
   [[nodiscard]] std::shared_ptr<const CompositeState>
   snapshot(uint64_t requestId) override;
   [[nodiscard]] bool canSnapshotToDisk(bool inUse) const noexcept override;
@@ -67,7 +70,7 @@ public:
   [[nodiscard]] ModelMemoryAdmission reserveSpilledReads(uint64_t requestId, SpilledReadNeed need) override;
   [[nodiscard]] uint64_t releaseIdleBuffer(bool keepLane) noexcept override;
   [[nodiscard]] std::optional<std::string>
-  provideMask(uint64_t requestId, std::span<const uint32_t> words) override;
+  provideMask(uint64_t requestId, std::span<const uint32_t> words, std::span<const uint32_t> forced) override;
   void end(uint64_t requestId) override;
 
   [[nodiscard]] WarmupStepResult warmupPrefill(uint32_t rows) override;
@@ -87,6 +90,9 @@ private:
   [[nodiscard]] uint32_t residentLane(uint64_t requestId) const;
   void finishRestore(uint64_t requestId, uint32_t boundary, bool restoreDraft);
   void prepareWarmupDecode(uint64_t requestId, uint32_t anchor);
+  // The step costs of `width` lanes on this machine (StepCosts::measure),
+  // from passes of a cycle of each of their points, and their spread.
+  double measureDecodeSteps(uint32_t width);
   [[nodiscard]] StateAdmission beginAt(const ModelRequest &request,
                                        uint32_t stateLane);
   [[nodiscard]] std::unique_ptr<ModelBatchTicket>
@@ -105,4 +111,5 @@ private:
   // for tests that assemble a prefill command directly (model/Runtime.cpp).
   [[nodiscard]] QwenTargetPrefillBuffers prefillBuffers(const PrefillArena &arena,
                                                         uint32_t chunk);
+[[nodiscard]] QwenTargetPrefillBuffers decodeBuffers(const DecodeArena &arena);
 } // namespace splash::model

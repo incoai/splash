@@ -16,8 +16,7 @@
 //    (ffn_clamp_threshold), and a norm after it (post_ffw_norm).
 //  - Token embeddings the square root of the hidden size scales
 //    (embed_scale), which the value residual's mix shares.
-// Its weights load from a GGUF only. Its target (model/RippleTarget) and
-// weights load are to land; loading refuses until then.
+// Its weights load from a GGUF only; prefill and decode share the target forward.
 
 #include "QwenHybridLayout.hpp"
 #include "QwenTarget.hpp"
@@ -126,19 +125,12 @@ public:
                metal::MetalBackend &backend, const ops::ExecutionPlans &operators);
   ~RippleTarget() override;
 
-  [[nodiscard]] QwenTargetScratchBytes allocatedScratchBytes() const noexcept override;
   [[nodiscard]] std::vector<metal::MetalBuffer> addPrefill(metal::CommandGraph &graph,
                                                            std::span<const QwenTargetPrefillChunk> chunks,
                                                            const kv::PageStorage &kv, SpilledKvReads &spilled,
                                                            QwenPrefillLayers layers, ops::AneFfn *aneFfn) override;
-  void addVerify(metal::CommandGraph &graph, QwenTargetVerifyBuffers buffers, const kv::PageStorage &kv,
-                 SpilledKvReads &spilled, std::span<const kv::ChunkedPrefillParams> chunks,
-                 uint32_t lanes, uint32_t blockRows) const override;
   void addHeadBatch(metal::CommandGraph &graph, metal::MetalBuffer hidden, metal::MetalBuffer finalHidden,
-                    metal::MetalBuffer logits, uint32_t lanes, uint32_t rows,
-                    ops::LinearScratch scratch) const override;
-  void addEmbedding(metal::CommandGraph &graph, metal::MetalBuffer tokens, metal::MetalBuffer hidden,
-                    uint32_t rows) const override;
+                    metal::MetalBuffer logits, uint32_t rows, ops::LinearScratch scratch) const override;
 
 private:
   // The shared prefill's layer loop runs the family's (QwenTarget::addPrefillLayers).
@@ -153,36 +145,18 @@ private:
   // The mixers of the family's split value: the fused projection's rows and
   // the placed value projection's, whose input the block's mix computes.
   void addPrefillMixer(PrefillStep &step, const QwenAttentionWeights &mixer,
-                       const metal::MetalBuffer &lambda) const;
-  void addVerifyMixer(VerifyStep &step, const QwenAttentionWeights &mixer, const metal::MetalBuffer &lambda,
-                      ops::PreparedInput normalized, BlockOutput output) const;
+                       const metal::MetalBuffer &lambda, ops::PreparedInput normalized) const;
   // The block's dense SwiGLU, whose activations clamp, and the norms and adds
   // of its post-norm arrangement.
   void addPrefillFfn(PrefillStep &step, uint32_t index, const RippleLayerWeights &layer, metal::MetalBuffer ffnIn,
                      metal::MetalBuffer output) const;
-  void addVerifyFfn(VerifyStep &step, const RippleLayerWeights &layer, metal::MetalBuffer ffnIn,
-                    metal::MetalBuffer output) const;
-  // The mixer's split dispatches of a verify's normalized rows.
-  void addVerifyProjectionPair(VerifyStep &step, const QwenAttentionWeights &mixer,
-                               const metal::MetalBuffer &lambda, ops::PreparedInput normalized) const;
-
   const RippleWeights &weights_;
-  // A verify batch's immutable scaled embeddings, copied before its first
-  // layer. Prefill chunks keep theirs in the arena.
-  metal::MetalBuffer embedRows_;
 };
 
 [[nodiscard]] RippleWeights loadRippleWeights(metal::MetalBackend &backend, RippleLayout layout,
                                               const QwenTargetFiles &files);
-// Its layers' dense FFNs, which the geometry takes whole (the shared MoE
-// hook sees none), and its target (Ripple.cpp, whose making is to land).
-void includeFamilyProjections(QwenTargetGeometry &geometry, const RippleWeights &weights);
+// The shared MoE hook sees no block in a layer with a dense FFN.
 [[nodiscard]] const ops::BlockMoeWeights *qwenMoeBlock(const RippleLayerWeights &layer) noexcept;
-// The family's prefill scratch: the scaled embedding rows the blocks mix
-// back in (RippleTarget's embed rows), which the target allocates itself.
-[[nodiscard]] QwenTargetScratchBytes qwenTargetScratchBytes(const RippleWeights &weights,
-                                                            const QwenTargetGeometry &geometry, uint32_t,
-                                                            uint64_t);
 [[nodiscard]] std::unique_ptr<QwenTarget> makeQwenTarget(const RippleWeights &weights,
                                                          const QwenTargetGeometry &geometry,
                                                          metal::MetalBackend &backend,

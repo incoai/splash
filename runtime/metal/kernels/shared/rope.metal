@@ -47,6 +47,39 @@ ROPE_BUILD_TABLES(rope_build_tables, SPLASH_TARGET_ROPE_PAIRS)
 ROPE_BUILD_TABLES(rope_build_tables_p64, 64u)
 #undef ROPE_BUILD_TABLES
 
+// The target rows of a decode step's packed rows (RopeTreeParams), as
+// rope_build_tables makes a row at the same position: group (row, lane) of
+// TargetPairs threads, a pair each, computes the lane's row at its anchor's
+// position plus the row's depth, on every axis alike (a decode row is text),
+// into the row's place among the packed rows. A row past its lane's rows, or
+// a lane whose rows run past the step's, writes nothing.
+#define ROPE_BUILD_TREE_TABLES(Name, TargetPairs)                              \
+  kernel void Name(                                                            \
+      device const SplashLaneRows *layout [[buffer(0)]],                       \
+      device const SplashTreeRow *tree [[buffer(1)]],                          \
+      device const float *target_inverse_frequencies [[buffer(2)]],            \
+      device float *target_cosine [[buffer(3)]],                               \
+      device float *target_sine [[buffer(4)]],                                 \
+      constant RopeTreeParams &params [[buffer(5)]],                           \
+      uint2 group [[threadgroup_position_in_grid]],                            \
+      uint pair [[thread_index_in_threadgroup]]) {                             \
+    const uint row = group.x, lane = group.y;                                  \
+    if (lane >= params.lanes || pair >= TargetPairs)                           \
+      return;                                                                  \
+    const SplashLaneRows rows = layout[lane];                                  \
+    if (row >= rows.rows || ulong(rows.first) + rows.rows > params.rows)       \
+      return;                                                                  \
+    const uint packed = rows.first + row;                                      \
+    const float2 rope = target_rope_pair(                                      \
+        uint3(params.anchors[lane] + tree[packed].depth),                      \
+        target_inverse_frequencies, pair, params.target_scale);                \
+    target_cosine[ulong(packed) * TargetPairs + pair] = rope.x;                \
+    target_sine[ulong(packed) * TargetPairs + pair] = rope.y;                  \
+  }
+ROPE_BUILD_TREE_TABLES(rope_build_tree_tables, SPLASH_TARGET_ROPE_PAIRS)
+ROPE_BUILD_TREE_TABLES(rope_build_tree_tables_p64, 64u)
+#undef ROPE_BUILD_TREE_TABLES
+
 // The draft table rows of rope_build_tables for consecutive positions.
 kernel void rope_build_draft_range_tables(
     device const float *draft_inverse_frequencies [[buffer(0)]],

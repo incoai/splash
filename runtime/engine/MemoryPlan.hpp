@@ -30,7 +30,7 @@ inline constexpr uint64_t kGiB = 1024ULL * 1024 * 1024;
 }
 
 // What one request needs at the least: the fixed bytes, one lane's state and
-// the KV runway in the layout's smallest extents; nullopt on overflow.
+// the KV runway (smallest extents, lookup index too); nullopt on overflow.
 [[nodiscard]] std::optional<uint64_t>
 minimumRequiredBytes(uint64_t fixedBytes, uint64_t laneStateBytes,
                      const kv::Layout &layout) noexcept;
@@ -178,7 +178,6 @@ struct ModelMemoryProfile final {
   // its routed experts stream (model::kPrefillGroupChunks chunks), zero for
   // a chunk's. A windowed layout's lane keeps them Full (kvWindowFloorPages).
   uint32_t commandPages = 0;
-  uint32_t speculativeTokens = SPLASH_DRAFT_PROPOSAL_TOKENS;
 
   [[nodiscard]] std::optional<std::string> validationError() const;
   [[nodiscard]] uint64_t fixedRuntimeBytes() const;

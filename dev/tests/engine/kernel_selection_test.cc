@@ -7,7 +7,8 @@
 // every plan line to diff them. With int8 activations off every plan must be
 // its golden plan in bf16 activations (int8ActivationsOff). It also checks
 // that startup warmup's prefill chunks select every plan a prefill chunk
-// selects, with int8 activations on and off (warmupCovers).
+// selects, with int8 activations on and off (warmupCovers), and that a
+// decode step of any rows selects its class's plans (decodeClassesHold).
 //
 //   kernel-selection <golden>            compare against the golden
 //   kernel-selection --write <golden>    write it
@@ -15,8 +16,10 @@
 #include "TestChecks.hpp"
 #include "model/ModelDescriptor.hpp"
 #include "ops/AneFfn.hpp"
+#include "ops/BlockIndexer.hpp"
 #include "ops/ExecutionPlans.hpp"
 #include "ops/KernelSelection.hpp"
+#include "ops/LaneRows.hpp"
 
 #include "metal/abi/Gguf.h"
 #include "metal/abi/QuantFormat.h"
@@ -228,6 +231,8 @@ std::string describe(const LinearScratchSize &s) {
 }
 
 constexpr uint32_t kPrefillRows[] = {1, 8, 9, 16, 17, 24, 32, 33, 48, 64, 65, 128, 512, 2048};
+constexpr uint32_t kWideDecodeRows[] = {40, 48, 56, 64};
+static_assert(kWideDecodeRows[std::size(kWideDecodeRows) - 1] == kMaximumDecodeTileRows);
 
 void projections(Golden &golden, const std::string &name, const ExecutionPlans &plans) {
   const Linear &linear = plans.linear();
@@ -248,15 +253,24 @@ void projections(Golden &golden, const std::string &name, const ExecutionPlans &
       const Projection gate = projection(c, set, 1);
       for (uint32_t lanes = 1; lanes <= SPLASH_MAXIMUM_BATCH_WIDTH; ++lanes)
         for (const auto epilogue : {LinearEpilogue::None, LinearEpilogue::Residual, LinearEpilogue::GateUp}) {
-          const LinearWorkload w{{c.n, c.k}, lanes * SPLASH_TARGET_VERIFY_ROWS, LinearPhase::Decode, epilogue};
+          const LinearWorkload w{{c.n, c.k}, lanes * SPLASH_DRAFT_QUERY_ROWS, epilogue};
           decode.add(set.name + " lanes " + std::to_string(lanes) + " e" + std::to_string(unsigned(epilogue)) +
                      ": " + attempt([&] {
                        return describe(linear.plan(w, *p, epilogue == LinearEpilogue::GateUp ? &gate : nullptr));
                      }));
         }
+      // The decode tiles' plans past a decode step of four lanes of 8, up to their 64 rows.
+      for (const uint32_t rows : kWideDecodeRows)
+        for (const auto epilogue : {LinearEpilogue::None, LinearEpilogue::Residual, LinearEpilogue::GateUp}) {
+          const LinearWorkload w{{c.n, c.k}, rows, epilogue};
+          decode.add(set.name + " rows " + std::to_string(rows) + " e" + std::to_string(unsigned(epilogue)) + ": " +
+                     attempt([&] {
+                       return describe(linear.plan(w, *p, epilogue == LinearEpilogue::GateUp ? &gate : nullptr));
+                     }));
+        }
       for (const uint32_t rows : kPrefillRows)
         for (const auto epilogue : {LinearEpilogue::None, LinearEpilogue::Residual, LinearEpilogue::UpWithGate}) {
-          const LinearWorkload w{{c.n, c.k}, rows, LinearPhase::Prefill, epilogue};
+          const LinearWorkload w{{c.n, c.k}, rows, epilogue};
           prefill.add(set.name + " rows " + std::to_string(rows) + " e" + std::to_string(unsigned(epilogue)) +
                       ": " + attempt([&] { return describe(linear.plan(w, *p)); }));
         }
@@ -264,14 +278,20 @@ void projections(Golden &golden, const std::string &name, const ExecutionPlans &
       // (rotatedUnit).
       if (rotatedUnit(c, set)) {
         Group &int8 = golden.group(name, "projection-decode-int8", c.name);
-        for (uint32_t lanes = 1; lanes <= SPLASH_MAXIMUM_BATCH_WIDTH; ++lanes)
+        std::vector<uint32_t> lines;
+        for (uint32_t lanes = 1; lanes <= SPLASH_MAXIMUM_BATCH_WIDTH; ++lanes) lines.push_back(lanes);
+        lines.insert(lines.end(), std::begin(kWideDecodeRows), std::end(kWideDecodeRows));
+        for (const uint32_t line : lines)
           for (const auto epilogue : {LinearEpilogue::None, LinearEpilogue::Residual, LinearEpilogue::GateUp}) {
-            const LinearWorkload w{{c.n, c.k}, lanes * SPLASH_TARGET_VERIFY_ROWS, LinearPhase::Decode, epilogue};
+            // Lanes of 8 rows up to a decode step's four, then the decode tiles' plans of more rows.
+            const bool lanes = line <= SPLASH_MAXIMUM_BATCH_WIDTH;
+            const LinearWorkload w{{c.n, c.k}, lanes ? line * SPLASH_DRAFT_QUERY_ROWS : line, epilogue};
             const bool pair = epilogue == LinearEpilogue::GateUp;
             const std::array<const Projection *, 2> units{&*p, pair ? &gate : nullptr};
             const std::array<UnitFormats, 2> tensors{int8Formats(std::span(&units[0], 1)),
                                                      int8Formats(std::span(&units[1], 1))};
-            int8.add("lanes " + std::to_string(lanes) + " e" + std::to_string(unsigned(epilogue)) + ": " +
+            int8.add((lanes ? "lanes " : "rows ") + std::to_string(line) + " e" + std::to_string(unsigned(epilogue)) +
+                     ": " +
                      attempt([&] {
                        const LinearConfig config = selectProjection(
                            plans.calibration(), plans.linear().int8Activations(), w, int8Formats(units),
@@ -288,11 +308,12 @@ void projections(Golden &golden, const std::string &name, const ExecutionPlans &
         std::string line = set.name + (rotated ? " rotated" : "") + ":";
         for (uint32_t lanes = 1; lanes <= SPLASH_MAXIMUM_BATCH_WIDTH; ++lanes)
           line += " storage " + attempt([&] {
-            return std::to_string(linear.decodeStorageRows(lanes * SPLASH_TARGET_VERIFY_ROWS, shape));
+            return std::to_string(linear.storageRows(lanes * SPLASH_DRAFT_QUERY_ROWS, shape));
           });
-        line += " decode " + attempt([&] { return describe(linear.decodeScratchSize(shape)); });
-        line += " prefill " + attempt([&] { return describe(linear.prefillScratchSize(shape)); });
-        line += " gate-up " + attempt([&] { return std::to_string(plans.gateUpWorkspace(shape)); });
+        line += " decode " + attempt([&] { return describe(linear.scratchSize(shape, kMaximumDecodeTileRows)); });
+        line += " prefill " + attempt([&] { return describe(linear.scratchSize(shape, SPLASH_PREFILL_TOKEN_BUDGET)); });
+        line += " gate-up " +
+                attempt([&] { return std::to_string(plans.gateUpWorkspace(shape, kMaximumDecodeTileRows)); });
         shapes.add(line);
       }
     }
@@ -303,13 +324,13 @@ void projections(Golden &golden, const std::string &name, const ExecutionPlans &
         matrix.add("lanes " + std::to_string(lanes) + " e" + std::to_string(unsigned(epilogue)) + ": " +
                    attempt([&] {
                      return describe(linear.plan(
-                         {{c.n, c.k}, lanes * SPLASH_TARGET_VERIFY_ROWS, LinearPhase::Decode, epilogue}));
+                         {{c.n, c.k}, lanes * SPLASH_DRAFT_QUERY_ROWS, epilogue}));
                    }));
     for (const uint32_t rows : kPrefillRows)
       for (const auto epilogue : {LinearEpilogue::None, LinearEpilogue::Residual, LinearEpilogue::UpWithGate})
         matrix.add("rows " + std::to_string(rows) + " e" + std::to_string(unsigned(epilogue)) + ": " +
                    attempt([&] {
-                     return describe(linear.plan({{c.n, c.k}, rows, LinearPhase::Prefill, epilogue}));
+                     return describe(linear.plan({{c.n, c.k}, rows, epilogue}));
                    }));
   }
 }
@@ -409,15 +430,13 @@ void moePlans(Golden &golden, const std::string &name, const ExecutionPlans &pla
       Group &workspace = golden.group(name, "moe-workspace", f);
       for (uint32_t lanes = 1; lanes <= SPLASH_MAXIMUM_BATCH_WIDTH; ++lanes)
         decode.add(set.name + " lanes " + std::to_string(lanes) + ": " +
-                   attempt([&] { return describe(plans.moeDecode(shape, routerFormat, lanes)); }));
+                   attempt([&] { return describe(plans.moe(shape, routerFormat, lanes * 8)); }));
       for (uint32_t rows = 1; rows <= SPLASH_PREFILL_TOKEN_BUDGET; rows += rows < 128 ? 1 : 16)
         prefill.add(set.name + " rows " + std::to_string(rows) + ": " +
-                    attempt([&] { return describe(plans.moePrefill(shape, routerFormat, rows)); }));
+                    attempt([&] { return describe(plans.moe(shape, routerFormat, rows)); }));
       for (const uint32_t rows : {64U, 512U, uint32_t{SPLASH_PREFILL_TOKEN_BUDGET}})
-        workspace.add(set.name + " prefill " + std::to_string(rows) + ":" +
-                      attempt([&] { return describe(plans.moePrefillWorkspace(shape, routerFormat, rows)); }));
-      workspace.add(set.name + " decode per lane:" +
-                    attempt([&] { return describe(plans.moeDecodeWorkspacePerLane(shape, routerFormat)); }));
+        workspace.add(set.name + " up to " + std::to_string(rows) + " rows:" +
+                      attempt([&] { return describe(plans.moeWorkspace(shape, routerFormat, rows)); }));
     }
   });
 }
@@ -430,19 +449,38 @@ std::string describe(const metal::DispatchSize &size) {
 std::string describe(const AttentionWorkspace &workspace) {
   return std::to_string(workspace.partialsBytes) + "/" + std::to_string(workspace.statisticsBytes);
 }
-std::string describe(const PrefillAttentionPlan &plan) {
-  return plan.splitPipeline + " " + plan.reducePipeline + " tiles " + std::to_string(plan.tiles) + " splits " +
-         std::to_string(plan.splits) + " groups " + describe(plan.splitGroups) + " " + describe(plan.reduceGroups) +
-         " workspace " + describe(plan.workspace) + " sparse " + std::to_string(plan.sparse) + " sinks " +
+std::string describe(const AttentionPlan &plan) {
+  std::string line = plan.splitPipeline() + " " + plan.reducePipeline() + " splits ";
+  for (const AttentionPlan::Sequence &sequence : plan.sequences())
+    line += std::to_string(sequence.splits) + (&sequence == &plan.sequences().back() ? "" : ",");
+  for (const AttentionPlan::Dispatch &dispatch : plan.dispatches())
+    line += " [" + std::to_string(dispatch.sequences) + " tiles " + std::to_string(dispatch.tiles) + " groups " +
+            describe(plan.splitGroups(dispatch)) + " " + describe(plan.reduceGroups(dispatch)) + "]";
+  return line + " workspace " + describe(plan.workspace()) + " sparse " + std::to_string(plan.sparse) + " sinks " +
          std::to_string(plan.sinks);
 }
-std::string describe(const VerifyAttentionPlan &plan) {
-  std::string splits;
-  for (const uint32_t s : plan.laneSplits) splits += std::to_string(s) + ",";
-  return plan.splitPipeline + " " + plan.reducePipeline + " splits " + splits + std::to_string(plan.splits) +
-         " groups " + describe(plan.splitGroups) + " " + describe(plan.reduceGroups) + " workspace " +
-         describe(plan.workspace) + " sparse " + std::to_string(plan.sparse) + " sinks " +
-         std::to_string(plan.sinks);
+
+// A sequence of `rows` rows after `history` tokens, staged in whole KV
+// blocks.
+kv::ChunkedPrefillParams sequenceOf(uint32_t history, uint32_t rows) {
+  return PagedAttention::chunkParams(history, rows, (rows + kv::kPageTokens - 1) / kv::kPageTokens * kv::kPageTokens,
+                                     (history + rows + kv::kPageTokens - 1) / kv::kPageTokens);
+}
+// The plan of a prompt chunk of one sequence, in a prompt chunk's workspace,
+// and of a decode step's lanes of 8 rows after each of `histories`, in
+// theirs.
+AttentionPlan chunkPlan(const ExecutionPlans &plans, uint32_t rows, uint32_t history, uint32_t heads,
+                        const kv::Layout &layout, AttentionVariant v) {
+  const std::array sequence{sequenceOf(history, rows)};
+  return plans.attention(sequence, heads, layout, plans.sequenceAttentionWorkspace(heads, layout), v);
+}
+AttentionPlan stepPlan(const ExecutionPlans &plans, std::span<const uint32_t> histories, uint32_t heads,
+                       const kv::Layout &layout, AttentionVariant v) {
+  std::vector<kv::ChunkedPrefillParams> lanes;
+  for (const uint32_t history : histories) lanes.push_back(sequenceOf(history, SPLASH_DRAFT_QUERY_ROWS));
+  const AttentionWorkspace lane = plans.laneAttentionWorkspace(heads, layout);
+  return plans.attention(lanes, heads, layout,
+                         {lane.partialsBytes * histories.size(), lane.statisticsBytes * histories.size()}, v);
 }
 
 // The rows and the tokens of history the attention plans are planned at.
@@ -487,24 +525,22 @@ void attentionPlans(Golden &golden, const std::string &name, const ExecutionPlan
           for (const uint32_t history : kAttentionHistories)
             prefill.add(variant + " rows " + std::to_string(rows) + " history " + std::to_string(history) + ": " +
                         attempt([&] {
-                          return describe(
-                              plans.prefillAttention(rows, history, family.attentionQueryHeads, layout, v));
+                          return describe(chunkPlan(plans, rows, history, family.attentionQueryHeads, layout, v));
                         }));
         for (uint32_t lanes = 1; lanes <= SPLASH_MAXIMUM_BATCH_WIDTH; ++lanes)
           for (const uint32_t history : kAttentionHistories) {
             const std::vector<uint32_t> each = verifyHistories(lanes, history);
             verify.add(variant + " lanes " + std::to_string(lanes) + " history " + std::to_string(history) + ": " +
                        attempt([&] {
-                         return describe(plans.verifyAttention(lanes, family.attentionQueryHeads, layout, each, v));
+                         return describe(stepPlan(plans, each, family.attentionQueryHeads, layout, v));
                        }));
           }
       }
-      for (const uint32_t rows : {1U, 256U, uint32_t{SPLASH_PREFILL_TOKEN_BUDGET}})
-        workspace.add(fmt + " prefill " + std::to_string(rows) + ": " + attempt([&] {
-                        return describe(plans.prefillAttentionWorkspace(rows, family.attentionQueryHeads, layout));
-                      }));
-      workspace.add(fmt + " verify per lane: " + attempt([&] {
-                      return describe(plans.verifyAttentionWorkspacePerLane(family.attentionQueryHeads, layout));
+      workspace.add(fmt + " prefill chunk: " + attempt([&] {
+                      return describe(plans.sequenceAttentionWorkspace(family.attentionQueryHeads, layout));
+                    }));
+      workspace.add(fmt + " decode per lane: " + attempt([&] {
+                      return describe(plans.laneAttentionWorkspace(family.attentionQueryHeads, layout));
                     }));
     }
   });
@@ -580,7 +616,7 @@ Int8Paths int8ActivationsOff(const std::string &name, const ExecutionPlans &on, 
       const std::string label = c.name + " " + set.name;
       for (uint32_t lanes = 1; lanes <= SPLASH_MAXIMUM_BATCH_WIDTH; ++lanes)
         for (const auto epilogue : {LinearEpilogue::None, LinearEpilogue::Residual, LinearEpilogue::GateUp}) {
-          const LinearWorkload w{{c.n, c.k}, lanes * SPLASH_TARGET_VERIFY_ROWS, LinearPhase::Decode, epilogue};
+          const LinearWorkload w{{c.n, c.k}, lanes * SPLASH_DRAFT_QUERY_ROWS, epilogue};
           const Projection *g = epilogue == LinearEpilogue::GateUp ? &gate : nullptr;
           compare(configuration([&] { return on.linear().plan(w, *p, g); }),
                   configuration([&] { return off.linear().plan(w, *p, g); }), label + " decode");
@@ -602,14 +638,19 @@ Int8Paths int8ActivationsOff(const std::string &name, const ExecutionPlans &on, 
         }
       for (const uint32_t rows : kPrefillRows)
         for (const auto epilogue : {LinearEpilogue::None, LinearEpilogue::Residual, LinearEpilogue::UpWithGate}) {
-          const LinearWorkload w{{c.n, c.k}, rows, LinearPhase::Prefill, epilogue};
+          const LinearWorkload w{{c.n, c.k}, rows, epilogue};
           compare(configuration([&] { return on.linear().plan(w, *p); }),
                   configuration([&] { return off.linear().plan(w, *p); }), label + " prefill");
         }
-      const std::string bound = attempt([&] { return describe(off.linear().prefillScratchSize(p->shape())); });
+      // The bound holds the decode tiles' tables of its plans of up to 64
+      // rows either way, and the int8 codes and scales with them on.
+      const std::string bound =
+          attempt([&] { return describe(off.linear().scratchSize(p->shape(), SPLASH_PREFILL_TOKEN_BUDGET)); });
       expect(bound == attempt([&] {
-               LinearScratchSize bf16Bound = on.linear().prefillScratchSize(p->shape());
-               bf16Bound.input = bf16Bound.sums = 0;
+               LinearScratchSize bf16Bound = on.linear().scratchSize(p->shape(), SPLASH_PREFILL_TOKEN_BUDGET);
+               const LinearScratchSize tables = on.linear().scratchSize(p->shape(), kMaximumDecodeTileRows);
+               bf16Bound.input = tables.input;
+               bf16Bound.sums = tables.sums;
                return describe(bf16Bound);
              }),
              label + "'s prefill bound " + bound + " is not its bound with them on less the int8 codes and scales");
@@ -630,13 +671,13 @@ Int8Paths int8ActivationsOff(const std::string &name, const ExecutionPlans &on, 
       for (const AttentionVariant &v : attentionVariants(family)) {
         for (const uint32_t rows : kAttentionRows)
           for (const uint32_t history : kAttentionHistories)
-            compareLines(attempt([&] { return describe(on.prefillAttention(rows, history, heads, layout, v)); }),
-                         attempt([&] { return describe(off.prefillAttention(rows, history, heads, layout, v)); }));
+            compareLines(attempt([&] { return describe(chunkPlan(on, rows, history, heads, layout, v)); }),
+                         attempt([&] { return describe(chunkPlan(off, rows, history, heads, layout, v)); }));
         for (uint32_t lanes = 1; lanes <= SPLASH_MAXIMUM_BATCH_WIDTH; ++lanes)
           for (const uint32_t history : kAttentionHistories) {
             const std::vector<uint32_t> each = verifyHistories(lanes, history);
-            compareLines(attempt([&] { return describe(on.verifyAttention(lanes, heads, layout, each, v)); }),
-                         attempt([&] { return describe(off.verifyAttention(lanes, heads, layout, each, v)); }));
+            compareLines(attempt([&] { return describe(stepPlan(on, each, heads, layout, v)); }),
+                         attempt([&] { return describe(stepPlan(off, each, heads, layout, v)); }));
           }
       }
     }
@@ -657,7 +698,7 @@ void int8ActivationsOff() {
       const std::array<const Projection *, 1> unit{&p};
       for (const uint32_t rows : {16u, 32u, 48u, 64u}) {
         const auto config = selectProjection(on.calibration(), Int8Activations::On,
-                                            {{n, k}, rows, LinearPhase::Decode}, int8Formats(unit));
+                                            {{n, k}, rows}, int8Formats(unit));
         test::require(config.decodeInt8 == (family >= 10 && rows <= 32),
                       name + ": PQ2 decode must use the faster activation format at " + std::to_string(rows));
       }
@@ -675,12 +716,17 @@ void int8ActivationsOff() {
 
 // The rows and history of the first prefill chunk, of 1 to 2048 rows after
 // each of `histories`, whose `select(rows, history)` no warmup chunk's is (a
-// chunk of each of `warm` rows, from no history); nothing when there is none.
+// chunk of each of `warm` rows, from no history and, of a target that serves
+// `context` tokens, after the longest history before it); nothing when there
+// is none.
 template <class Select>
-std::optional<std::pair<uint32_t, uint32_t>> unwarmed(std::span<const uint32_t> warm,
+std::optional<std::pair<uint32_t, uint32_t>> unwarmed(std::span<const uint32_t> warm, uint32_t context,
                                                       std::span<const uint32_t> histories, const Select &select) {
   std::set<decltype(select(1U, 0U))> warmed;
-  for (const uint32_t rows : warm) warmed.insert(select(rows, 0U));
+  for (const uint32_t rows : warm) {
+    warmed.insert(select(rows, 0U));
+    if (context >= rows) warmed.insert(select(rows, context - rows));
+  }
   for (uint32_t rows = 1; rows <= SPLASH_PREFILL_TOKEN_BUDGET; ++rows)
     for (const uint32_t history : histories)
       if (!warmed.contains(select(rows, history))) return std::pair{rows, history};
@@ -689,24 +735,29 @@ std::optional<std::pair<uint32_t, uint32_t>> unwarmed(std::span<const uint32_t> 
 
 // Startup warmup runs a prefill chunk of the fewest rows of each class
 // (ExecutionPlans::prefillRowClasses) and one of the most, from no history,
-// and a chunk whose plans none of them selects creates its kernels while its
-// request waits: 19 s for the 27B's cold 17-row chunk on a 16-core Apple9
-// plan. So every plan a chunk of 1 to 2048 rows selects is a warmup chunk's:
-// its projections' tile and staged height, whole and of its one read row
-// (Linear::prefillPlan), with the Neural Engine split from any of its least
-// rows or without it; its float tiles; its MoE blocks' expert and router
-// tiles; and after each of kAttentionHistories, its attention's kernels. Adds each
-// that is not to `misses`. It checks one matrix shape and the columns of
-// kFloatColumns; the other kernels a chunk's rows pick, the staged norm and
-// the hyper-connection norm's quarters (single thresholds today, whose sides
-// the chunks of one row and of the most take) and those of GDN, the draft and
-// vision, only the backend's count of pipelines created while serving checks.
+// and creates the kernels of each after the longest history the target
+// serves before it (Runtime::warmupPrefill); a chunk whose plans none of them
+// selects creates its kernels while its request waits: 19 s for the 27B's
+// cold 17-row chunk on a 16-core Apple9 plan. So every plan a chunk of 1 to
+// 2048 rows selects is a warmup chunk's: its projections' tile and staged
+// height, whole and of its one read row (Linear::plan), with the Neural
+// Engine split from any of its least rows or without it; its float tiles; its
+// MoE blocks' expert and router tiles; and after each of kAttentionHistories,
+// its attention's kernels and whether its block indexer selects its rows'
+// blocks (BlockIndexer::sparse: Flash-Next's prompt past 2,048 tokens, whose
+// kernels a verify does not run). Adds each that is not to `misses`. It
+// checks one matrix shape and the columns of kFloatColumns; the other kernels
+// a chunk's rows pick, the staged norm and the hyper-connection norm's
+// quarters (single thresholds today, whose sides the chunks of one row and of
+// the most take) and those of GDN, the draft and vision, only the backend's
+// count of pipelines created while serving checks.
 void warmupCovers(const std::string &name, const ExecutionPlans &plans, std::vector<std::string> &misses) {
   std::vector<uint32_t> warm = plans.prefillRowClasses();
   warm.push_back(SPLASH_PREFILL_TOKEN_BUDGET);
   constexpr uint32_t noHistory[] = {0};
-  const auto check = [&](const std::string &what, std::span<const uint32_t> histories, const auto &select) {
-    if (const auto chunk = unwarmed(warm, histories, select))
+  const auto check = [&](const std::string &what, std::span<const uint32_t> histories, const auto &select,
+                         uint32_t context = 0) {
+    if (const auto chunk = unwarmed(warm, context, histories, select))
       misses.push_back(name + " " + what + ": no warmup chunk selects the plan of " + std::to_string(chunk->first) +
                        " rows after " + std::to_string(chunk->second) + " tokens");
   };
@@ -735,8 +786,8 @@ void warmupCovers(const std::string &name, const ExecutionPlans &plans, std::vec
     for (const auto epilogue : {LinearEpilogue::None, LinearEpilogue::Residual, LinearEpilogue::UpWithGate}) {
       std::vector<uint32_t> whole(SPLASH_PREFILL_TOKEN_BUDGET + 1), read(SPLASH_PREFILL_TOKEN_BUDGET + 1);
       for (uint32_t rows = 1; rows <= SPLASH_PREFILL_TOKEN_BUDGET; ++rows) {
-        whole[rows] = tile(linear.prefillPlan(*p, rows, epilogue));
-        read[rows] = tile(linear.prefillPlan(*p, 1, epilogue, rows));
+        whole[rows] = tile(linear.plan(*p, rows, epilogue));
+        read[rows] = tile(linear.plan(*p, 1, epilogue, nullptr, rows));
       }
       const std::string what = "projection " + set.name + " e" + std::to_string(unsigned(epilogue));
       check(what, noHistory, [&](uint32_t rows, uint32_t) { return whole[rows]; });
@@ -760,7 +811,7 @@ void warmupCovers(const std::string &name, const ExecutionPlans &plans, std::vec
         if (std::ranges::find(seen, routerFormat) != seen.end()) continue;
         seen.push_back(routerFormat);
         const auto config = [&](uint32_t rows) {
-          return selectMoe(plans.calibration(), shape, routerFormat, rows, MoePhase::Prefill);
+          return selectMoe(plans.calibration(), shape, routerFormat, rows);
         };
         check("moe experts " + f + " " + set.name, noHistory,
               [&](uint32_t rows, uint32_t) { return config(rows).expertTile; });
@@ -775,10 +826,79 @@ void warmupCovers(const std::string &name, const ExecutionPlans &plans, std::vec
         check("attention " + f + (format == kv::Format::Int8 ? " int8" : " bf16") + " window " +
                   std::to_string(v.windowTokens) + (v.rotated ? " rope" : " nope"),
               kAttentionHistories, [&](uint32_t rows, uint32_t history) {
-                const PrefillAttentionPlan plan =
-                    plans.prefillAttention(rows, history, family.attentionQueryHeads, layout, v);
-                return plan.splitPipeline + " " + plan.reducePipeline;
+                const AttentionPlan plan = chunkPlan(plans, rows, history, family.attentionQueryHeads, layout, v);
+                return plan.splitPipeline() + " " + plan.reducePipeline();
               });
+    }
+    if (const uint32_t top = family.indexerTopBlocks)
+      check("block indexer " + f, kAttentionHistories,
+            [&](uint32_t rows, uint32_t history) { return BlockIndexer::sparse(history, rows, top); },
+            family.nativeContextTokens);
+  });
+}
+
+// ---- Decode classes ---------------------------------------------------------
+
+// The choice of a cycle's rows prices a class of decode steps by a step of its
+// last rows, and the start creates that step's kernels alone
+// (ExecutionPlans::decodeRowClasses, model::StepCosts): so a step of any rows,
+// up to a verify block a lane, selects what a step of its class's last rows
+// does, of every kernel a step's rows pick: its projections' tile and staged
+// height in each set of formats the plans tell apart, its float tiles, and a
+// MoE target's expert and router tiles. Adds each class that holds a change
+// to `misses`.
+void decodeClassesHold(const std::string &name, const ExecutionPlans &plans, std::vector<std::string> &misses) {
+  constexpr uint32_t most = SPLASH_MAXIMUM_BATCH_WIDTH * SPLASH_TARGET_VERIFY_ROWS;
+  const auto check = [&](const std::string &what, std::span<const uint32_t> classes, const auto &select) {
+    for (size_t i = 0; i < classes.size(); ++i) {
+      const uint32_t last = i + 1 < classes.size() ? classes[i + 1] - 1 : most;
+      for (uint32_t rows = classes[i]; rows < last; ++rows)
+        if (select(rows) != select(last)) {
+          misses.push_back(name + " " + what + ": a step of " + std::to_string(rows) +
+                           " rows selects another plan than its class's last, " + std::to_string(last));
+          return;
+        }
+    }
+  };
+  const std::vector<uint32_t> dense = plans.decodeRowClasses(most, std::nullopt);
+  const Linear &linear = plans.linear();
+  const auto tile = [](const LinearPlan &plan) {
+    const LinearTile t = plan.configuration().tile;
+    return uint32_t(t) << 8 | (t == LinearTile::GgufStaged || t == LinearTile::GgufRegister ? plan.storageRows() : 0);
+  };
+  std::vector<UnitFormats> units;
+  for (const FormatSet &set : formatSets()) {
+    std::optional<Projection> p;
+    try {
+      p.emplace(projection(projectionCases().front(), set));
+    } catch (const std::exception &) {
+      continue;
+    }
+    const Projection *unit = &*p;
+    const UnitFormats formats = unitFormats(std::span(&unit, 1));
+    if (std::ranges::find(units, formats) != units.end()) continue;
+    units.push_back(formats);
+    for (const auto epilogue : {LinearEpilogue::None, LinearEpilogue::Residual, LinearEpilogue::UpWithGate})
+      check("projection " + set.name + " e" + std::to_string(unsigned(epilogue)), dense,
+            [&](uint32_t rows) { return tile(linear.plan(*p, rows, epilogue)); });
+  }
+  for (const uint32_t format : kFloatFormats)
+    for (const uint32_t columns : kFloatColumns)
+      check("float tile " + formatName(format) + " columns " + std::to_string(columns), dense,
+            [&](uint32_t rows) { return linear.ggufFloatTile(rows, columns, format); });
+  model::forEachFamily([&](const auto &family) {
+    if (family.ffnKind != model::QwenFfnKind::SparseMoe) return;
+    const std::string f(family.family);
+    const MoeShape shape = family.moeBlockShape();
+    std::vector<uint32_t> seen;
+    for (const MoeFormatSet &set : moeFormatSets()) {
+      const uint32_t routerFormat = routerFormatOf(moeBlocks(shape, set));
+      if (std::ranges::find(seen, routerFormat) != seen.end()) continue;
+      seen.push_back(routerFormat);
+      const std::vector<uint32_t> classes = plans.decodeRowClasses(most, std::pair{shape, routerFormat});
+      const auto config = [&](uint32_t rows) { return selectMoe(plans.calibration(), shape, routerFormat, rows); };
+      check("moe experts " + f + " " + set.name, classes, [&](uint32_t rows) { return config(rows).expertTile; });
+      check("moe router " + f + " " + set.name, classes, [&](uint32_t rows) { return config(rows).ggufRouterTile; });
     }
   });
 }
@@ -833,9 +953,8 @@ void dumpLines(const Golden &golden, const std::string &directory) {
 
 } // namespace
 
-// Sub-block decode rows must bypass the register calibration, which is
-// indexed by complete eight-row groups. In particular a one-token target
-// decode must not read the entry before its boundary table.
+// Every short decode plan holds its live rows, including the column tile
+// for one token and the register tile of whole eight-row groups.
 void subBlockDecodeRows() {
   for (const auto [family, cores] : kDevices) {
     const auto calibration = KernelCalibration::of(device(family, cores));
@@ -843,10 +962,10 @@ void subBlockDecodeRows() {
       for (const auto epilogue : {LinearEpilogue::None, LinearEpilogue::GateUp,
                                  LinearEpilogue::ClampedGateUp}) {
         const auto config = selectProjection(calibration, Int8Activations::Off,
-                                             {{1024, 5120}, rows, LinearPhase::Decode, epilogue},
+                                             {{1024, 5120}, rows, epilogue},
                                              {.registerTakes = true, .weightBits16 = 64, .oneFormat = true});
-        test::require(config.tile == LinearTile::GgufStaged,
-                      "sub-block decode indexed the register boundary");
+        test::require(Linear::plan({{1024, 5120}, rows, epilogue}, config, FloatOutput::BFloat16).storageRows() >= rows,
+                      "a short decode plan dropped live rows");
       }
   }
 }
@@ -856,7 +975,7 @@ void smallPrefillBoundary() {
   const auto picks = [&](uint32_t family, uint32_t cores, uint32_t rows, uint32_t columns,
                          const UnitFormats &unit) {
     return selectProjection(KernelCalibration::of(device(family, cores)), Int8Activations::On,
-                            {{columns, 5120}, rows, LinearPhase::Prefill}, unit).prefill64Rows;
+                            {{columns, 5120}, rows}, unit).prefill64Rows;
   };
   test::require(picks(10, 40, 65, 119 * 64, formats) && picks(10, 40, 128, 119 * 64, formats),
                 "low-occupancy Q4/Q5 prefill missed the small tile");
@@ -918,6 +1037,17 @@ int main(int argc, char **argv) {
     }
     std::cout << "PASS kernel selection: warmup's prefill chunks select every plan of " << std::size(kDevices)
               << " devices, int8 activations on and off\n";
+    for (const auto [family, cores] : kDevices)
+      for (const Int8Activations int8 : {Int8Activations::On, Int8Activations::Off})
+        decodeClassesHold(std::to_string(family) + "," + std::to_string(cores) +
+                              (int8 == Int8Activations::On ? " int8" : " bf16"),
+                          ExecutionPlans(device(family, cores), int8), misses);
+    if (!misses.empty()) {
+      for (size_t i = 0; i < misses.size() && i < 40; ++i) std::cerr << misses[i] << '\n';
+      throw std::runtime_error(std::to_string(misses.size()) + " decode step classes hold a kernel change");
+    }
+    std::cout << "PASS kernel selection: every decode step selects its class's last step's plans on "
+              << std::size(kDevices) << " devices, int8 activations on and off\n";
     return 0;
   } catch (const std::exception &error) {
     std::cerr << "FAIL kernel selection: " << error.what() << '\n';

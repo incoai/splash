@@ -110,14 +110,15 @@ StartupRetryWindow::retryUntil(const RuntimeBootstrapReport &failure,
 }
 
 protocol::ProtocolLimits protocolLimitsFor(
-    const model::ModelCapabilities &capabilities, uint32_t maxContext, uint32_t draftRows) noexcept {
+    const model::ModelCapabilities &capabilities, uint32_t maxContext, uint32_t) noexcept {
   protocol::ProtocolLimits limits;
   limits.maxPromptTokens = maxContext;
   limits.maxLogicalOutputTokens = maxContext;
-  limits.maxTokenBatch = draftRows + 1;
-  limits.maxSimulationTokens = draftRows;
+  limits.maxTokenBatch = model::ExecutionLimits::maximumStepTokens;
+  // A mask row at a lane's anchor and after each of its verify rows' tokens.
+  limits.maxSimulationTokens = model::ExecutionLimits::targetVerifyRows;
   limits.maxMaskWords = model::maskWordsPerToken(capabilities.vocabularySize) *
-                        (draftRows + 1);
+                        (model::ExecutionLimits::targetVerifyRows + 1);
   return limits;
 }
 

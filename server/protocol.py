@@ -16,7 +16,7 @@ from dataclasses import dataclass, fields
 from enum import IntEnum, IntFlag
 from typing import TypeAlias
 
-PROTOCOL_VERSION = 14
+PROTOCOL_VERSION = 15
 # A frame is its header, the magic, the protocol version, the frame type and
 # the payload length, then the payload.
 FRAME_HEADER_BYTES = 16
@@ -40,6 +40,11 @@ MAX_PROMPT_TOKENS = 1 << 20
 MAX_LOGICAL_OUTPUT_TOKENS = 1 << 20
 MAX_TOKEN_BATCH = 4096
 MAX_SIMULATION_TOKENS = 32
+# The parent of a mask request's first simulation token, its tree's root.
+NO_PARENT = 0xFFFFFFFF
+# The most words of a mask response's forced tokens: a row and a token for as
+# many tokens as a request simulates, after each of its rows.
+MAX_FORCED_WORDS = 2 * (MAX_SIMULATION_TOKENS + 1) * MAX_SIMULATION_TOKENS
 MAX_IMAGE_SPANS = 64
 MAX_MASK_WORDS = 1 << 20
 
@@ -51,7 +56,8 @@ _REQUEST = struct.Struct(_REQUEST_HEAD.format + "IIIffIffffQIIIQQIIII")
 _IMAGE_SPAN = struct.Struct("<IIIIQQ")
 # Cancel and Stop: one request id.
 _REQUEST_END = struct.Struct("<Q")
-_MASK_RESPONSE = struct.Struct("<QQI")
+# Request id, mask request id, mask words, forced token words.
+_MASK_RESPONSE = struct.Struct("<QQII")
 _STATUS_REQUEST = struct.Struct("<Q")
 _RELEASE_REQUEST = struct.Struct("<Q")
 # Concurrent requests, context, vision, vocabulary, mask rows, stop count.
@@ -323,6 +329,12 @@ class MaskResponseFrame:
     mask_request_id: int
     # Little-endian uint32 words, words_per_mask per mask row.
     mask_words: bytes
+    # Pairs of a mask row and a token the grammar forces after the row's
+    # path, the rows ascending and each row's tokens in order, at most as
+    # many a row as a request simulates (Ready's mask_rows less one), which
+    # keeps a response within the words the engine takes (Protocol.cpp's
+    # forcedWords).
+    forced_tokens: tuple[int, ...]
 
 
 @dataclass(slots=True, frozen=True)
@@ -359,8 +371,8 @@ class ReadyEvent:
     # Requests may carry image spans; false for a model serving without vision.
     vision: bool
     # The target's logit rows a token mask covers; the rows of one mask
-    # request, before the anchor and after each draft query row; and the
-    # tokens that end generation.
+    # request, before the anchor and after each of a verify block's rows; and
+    # the tokens that end generation.
     vocabulary_size: int
     mask_rows: int
     stop_token_ids: tuple[int, ...]
@@ -394,14 +406,19 @@ class MaskRequestEvent:
     mask_request_id: int
     words_per_mask: int
     simulation_tokens: tuple[int, ...]
+    # Each token's parent, the index of the token before it on its path;
+    # the first token's is NO_PARENT. A parent comes before its child.
+    parents: tuple[int, ...]
 
     @property
     def mask_rows(self) -> int:
-        """Rows before and after each simulated context token.
+        """Rows before the first simulated token and after each token's path.
 
         The initial request carries no tokens and therefore has one row. A
-        verify request carries ``(pending_anchor, *draft_proposals)``; its
-        target-logit rows consume masks beginning at row one.
+        verify request carries its verify block's tree: its rows' tokens in
+        preorder, the pending anchor first, each with its parent row; its
+        target-logit rows consume masks beginning at row one, a row's mask
+        the one after its own path.
         """
         return len(self.simulation_tokens) + 1
 
@@ -670,7 +687,10 @@ def _payload_bounds(frame_type: FrameType) -> tuple[int, int]:
         case FrameType.CANCEL | FrameType.STOP:
             bounds = (_REQUEST_END.size, _REQUEST_END.size)
         case FrameType.MASK_RESPONSE:
-            bounds = (_MASK_RESPONSE.size, _MASK_RESPONSE.size + MAX_MASK_WORDS * 4)
+            bounds = (
+                _MASK_RESPONSE.size,
+                _MASK_RESPONSE.size + (MAX_MASK_WORDS + MAX_FORCED_WORDS) * 4,
+            )
         case FrameType.STATUS_REQUEST:
             bounds = (_STATUS_REQUEST.size, _STATUS_REQUEST.size)
         case FrameType.RELEASE_REQUEST:
@@ -686,9 +706,10 @@ def _payload_bounds(frame_type: FrameType) -> tuple[int, int]:
         case FrameType.TOKENS:
             bounds = (_TOKENS.size, _TOKENS.size + MAX_TOKEN_BATCH * 4)
         case FrameType.MASK_REQUEST:
+            # A token and its parent each.
             bounds = (
                 _MASK_REQUEST.size,
-                _MASK_REQUEST.size + MAX_SIMULATION_TOKENS * 4,
+                _MASK_REQUEST.size + MAX_SIMULATION_TOKENS * 8,
             )
         case FrameType.DONE:
             bounds = (_DONE.size, _DONE.size + MAX_SCORE_TOKENS * 4)
@@ -1003,15 +1024,29 @@ def _mask_response_frame(response: MaskResponseFrame) -> bytearray:
         _fail_request(IssueCode.INVALID_REQUEST_ID, str(error), request_id)
     try:
         mask = _mask_payload(response.mask_words)
+        forced = _words(response.forced_tokens, "forced tokens").tobytes()
         if not mask or len(mask) // 4 > MAX_MASK_WORDS:
             raise ValueError("mask response word count exceeds its limit")
+        if len(forced) // 4 > MAX_FORCED_WORDS or len(forced) % 8:
+            raise ValueError(
+                "mask response forced tokens are not pairs within their limit"
+            )
     except ValueError as error:
         _fail_request(IssueCode.LIMIT_EXCEEDED, str(error), request_id)
-    frame = _frame(FrameType.MASK_RESPONSE, _MASK_RESPONSE.size + len(mask))
-    _MASK_RESPONSE.pack_into(
-        frame, FRAME_HEADER_BYTES, request_id, mask_request_id, len(mask) // 4
+    frame = _frame(
+        FrameType.MASK_RESPONSE, _MASK_RESPONSE.size + len(mask) + len(forced)
     )
-    frame[FRAME_HEADER_BYTES + _MASK_RESPONSE.size :] = mask
+    _MASK_RESPONSE.pack_into(
+        frame,
+        FRAME_HEADER_BYTES,
+        request_id,
+        mask_request_id,
+        len(mask) // 4,
+        len(forced) // 4,
+    )
+    start = FRAME_HEADER_BYTES + _MASK_RESPONSE.size
+    frame[start : start + len(mask)] = mask
+    frame[start + len(mask) :] = forced
     return frame
 
 
@@ -1252,13 +1287,25 @@ def _decode_event(frame: Frame) -> EngineEvent:
         request_id, mask_request_id, words_per_mask, count = _MASK_REQUEST.unpack_from(
             payload
         )
-        tokens = _tail(
-            payload, _MASK_REQUEST.size, count, "I", "simulation token", request_id
+        values = _tail(
+            payload, _MASK_REQUEST.size, 2 * count, "I", "simulation token", request_id
         )
+        tokens, parents = values[:count], values[count:]
         if not request_id or not mask_request_id:
             _fatal(
                 IssueCode.INVALID_REQUEST_ID,
                 "mask request ids must be non-zero",
+                request_id,
+            )
+        # The first token is the tree's root, and every other follows one
+        # before it.
+        if parents and (
+            parents[0] != NO_PARENT
+            or any(parent >= row for row, parent in enumerate(parents) if row)
+        ):
+            _fatal(
+                IssueCode.INVALID_CONSTRAINT,
+                "mask request tokens are not a tree whose parents come first",
                 request_id,
             )
         if not words_per_mask:
@@ -1273,7 +1320,9 @@ def _decode_event(frame: Frame) -> EngineEvent:
                 "mask request output would exceed the mask limit",
                 request_id,
             )
-        return MaskRequestEvent(request_id, mask_request_id, words_per_mask, tokens)
+        return MaskRequestEvent(
+            request_id, mask_request_id, words_per_mask, tokens, parents
+        )
     if frame_type is FrameType.DONE:
         (
             request_id,

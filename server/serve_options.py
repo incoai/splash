@@ -15,7 +15,7 @@ from dataclasses import dataclass
 from decimal import Decimal
 from pathlib import Path
 
-from . import images, origins
+from . import images, origins, unix_socket
 from .chat_format import REASONING_EFFORTS
 from .http_security import validate_api_key
 from .protocol import MAX_THINKING_END_TOKENS
@@ -196,6 +196,12 @@ def parse_cache_dir(value):
     return Path(value).expanduser().absolute()
 
 
+def parse_chat_template_file(value):
+    if not value.strip():
+        raise argparse.ArgumentTypeError("must name a Jinja chat template file")
+    return Path(value).expanduser().absolute()
+
+
 def parse_request_size(value):
     try:
         size = parse_max_memory(value)
@@ -289,6 +295,16 @@ def parse_served_model_name(value):
     ):
         raise argparse.ArgumentTypeError(
             "model alias must be a non-empty name without whitespace or URL delimiters"
+        )
+    return value
+
+
+def parse_host(value):
+    """An address to bind, which the bind checks, or unix:PATH with the path
+    of a UNIX socket."""
+    if unix_socket.path(value) == "":
+        raise argparse.ArgumentTypeError(
+            "unix: needs the socket's path, such as unix:/tmp/splash.sock"
         )
     return value
 
@@ -416,11 +432,12 @@ SERVE_OPTIONS = (
         "--host",
         "network",
         dict(
+            type=parse_host,
             default="127.0.0.1",
             metavar="ADDRESS",
             help="HTTP bind address (default: 127.0.0.1; 0.0.0.0 for all IPv4 "
-            "interfaces); clients use an IP address, localhost or a name given "
-            "with --allowed-host",
+            "interfaces; unix:PATH for a UNIX socket); clients use an IP "
+            "address, localhost or a name given with --allowed-host",
         ),
     ),
     ServeOption(
@@ -556,10 +573,25 @@ SERVE_OPTIONS = (
         dict(
             choices=("fp32", "bf16"),
             default="fp32",
-            help="recurrent state storage (default: fp32); bf16 halves each "
-            "state, so memory and the SSD cache hold about twice as many",
+            help="recurrent state storage of running requests (default: fp32); "
+            "bf16 halves each one's state, and cached states store int8 codes "
+            "in either format unless --cached-states exact",
         ),
         engine=EngineArgument("--state-format"),
+        needs="recurrent_state",
+    ),
+    ServeOption(
+        "--cached-states",
+        "memory",
+        dict(
+            choices=("int8", "exact"),
+            default="int8",
+            help="recurrent state storage of cached states (default: int8): int8 "
+            "codes take about a quarter of an fp32 state, and a restored state "
+            "can differ at near ties; exact keeps --state-format's, so a "
+            "restore is exact",
+        ),
+        engine=EngineArgument("--cached-states"),
         needs="recurrent_state",
     ),
     ServeOption(
@@ -661,6 +693,21 @@ SERVE_OPTIONS = (
         ),
     ),
     ServeOption(
+        "--reasoning-effort",
+        "api",
+        dict(
+            type=parse_reasoning_effort,
+            metavar="EFFORT",
+            help="effort of every Chat, Responses and Messages request, whatever "
+            "the request asks: "
+            + ", ".join(REASONING_EFFORTS[:-1])
+            + f" or {REASONING_EFFORTS[-1]}; none turns thinking off (default: "
+            "SPLASH_REASONING_EFFORT, else each request's own)",
+        ),
+        environment="SPLASH_REASONING_EFFORT",
+        needs="reasoning_switch",
+    ),
+    ServeOption(
         "--default-reasoning-effort",
         "api",
         dict(
@@ -700,6 +747,17 @@ SERVE_OPTIONS = (
         ),
         environment="SPLASH_THINKING_END_TEXT",
         needs="thinking_budget",
+    ),
+    ServeOption(
+        "--chat-template-file",
+        "api",
+        dict(
+            type=parse_chat_template_file,
+            default=None,
+            metavar="FILE",
+            help="a Jinja chat template to render every request with, in place "
+            "of the model's own; read once at startup (default: the model's)",
+        ),
     ),
     ServeOption(
         "--max-request-size",
@@ -795,14 +853,16 @@ SERVE_OPTIONS = (
         dict(
             choices=("auto", "all"),
             default="auto",
-            help="rows of each draft block decode verifies: all verifies every "
-            "row, so a MoE model's greedy and seeded outputs repeat as a dense "
-            "model's do (default: auto, where a verify budget learned from "
-            "earlier cycles chooses a MoE model's rows, which is faster but "
-            "lets those outputs differ from run to run)",
+            help="rows each decode cycle verifies: all verifies every row of "
+            "a draft's block a lane, so greedy and seeded outputs repeat "
+            "(default: auto, where each cycle takes the step of the most "
+            "expected accepted tokens per cost, by the costs the Mac measured "
+            "at a start and the cost of a long history and the acceptance "
+            "learned from earlier cycles, or, on a model whose experts "
+            "stream, the rows worth their time by its cycles' cost line, "
+            "which is faster but lets those outputs differ from run to run)",
         ),
         engine=EngineArgument("--verify-rows"),
-        needs="experts",
     ),
     ServeOption(
         "--allow-idle-sleep",
@@ -852,6 +912,12 @@ def check_serve_arguments(parser, args):
         )
     if args.cache_dir is not None and not args.persistent_cache:
         parser.error("--cache-dir needs --persistent-cache")
+    if args.reasoning_effort is not None and args.default_reasoning_effort is not None:
+        parser.error(
+            "--default-reasoning-effort (SPLASH_DEFAULT_REASONING_EFFORT) sets "
+            "the effort of requests that set none, and --reasoning-effort "
+            "(SPLASH_REASONING_EFFORT) leaves none: it sets every request's"
+        )
 
 
 def serve_argv(args):

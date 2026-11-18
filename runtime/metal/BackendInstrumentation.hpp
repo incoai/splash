@@ -37,6 +37,13 @@ public:
   static void setDispatchProfiling(MetalBackend &backend, bool enabled);
   [[nodiscard]] static std::vector<DispatchTiming>
   takeDispatchProfile(MetalBackend &backend);
+  // While set, a command in two parts (MetalBackend::submitCommandPartsAsync)
+  // sends nothing ahead: its second part is encoded behind its first in the
+  // same buffer, and the GPU starts only once both are encoded, as it starts
+  // a command built whole. For comparing the two: they run the same
+  // dispatches in the same order, and the host does the same work for both.
+  // Profiling runs the first part's dispatches and then the second's.
+  static void submitPartsWhole(MetalBackend &backend, bool enabled);
   // Whether awake host steps spin (HostStepGpu::Awake): the backend's check
   // that a GPU spin sees the CPU end it, run now unless one decided; nothing
   // while no check decided (every spin started after its release, the GPU

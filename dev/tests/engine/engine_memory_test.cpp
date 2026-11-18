@@ -1313,6 +1313,9 @@ void testStartsAdmittedBesideALaneInServiceDoNotExtendItsWait() {
   engine::Cache cache(pool, &tier, test::ampleDiskBudget());
   Executor executor;
   executor.decodeFinishes = false;
+  // The start's decode captures no state, whose write to the tier would land
+  // as progress for the lane's wait (Engine::tick).
+  executor.decodeStateCaptures = false;
   Events events;
   engine::Engine engine(test::engineConfig({.maxContext = 102400}), cache, executor, events);
   guardReleases(storage, engine);
@@ -1664,7 +1667,8 @@ void testWhatFreesNowKeepsALaneWaitingForTheRest() {
 }
 
 void testRequiredWorkDoesNotReserveAnExtraPage() {
-  for (uint32_t promptTokens : {1U, 24U}) {
+  // The longer prompt's verify block of the most rows ends at the page's end.
+  for (uint32_t promptTokens : {1U, KvCache::pageTokens - model::ExecutionLimits::targetVerifyRows}) {
     test::TestKvStorage storage(2, 4096, 1);
     storage.budgetPages = 1;
     KvPool pool(storage, 0);
@@ -2987,8 +2991,11 @@ void testDecodePreemptionReplaysCommittedHistoryWithoutRepeatingOutput() {
   Events events;
   engine::Engine engine(test::engineConfig(), resources, executor, events);
   guardReleases(storage, engine);
+  // Each lane's prompt and its verify block of the most rows fill its page:
+  // its first token needs the next.
+  constexpr uint32_t prompt = KvCache::pageTokens - model::ExecutionLimits::targetVerifyRows;
   for (uint64_t id : {250, 251}) {
-    auto value = request(id, std::vector<uint32_t>(24, id));
+    auto value = request(id, std::vector<uint32_t>(prompt, id));
     value.maxNewTokens = 4;
     value.returnProgress = true;
     engine.submit(std::move(value));
@@ -3021,10 +3028,10 @@ void testDecodePreemptionReplaysCommittedHistoryWithoutRepeatingOutput() {
               events.completedCount == 3 && events.failedCount == 0 &&
               events.capacityExhaustedCount == 0,
           "decode preemption did not finish all original/new requests");
-  require(events.progress.at(250) == std::vector<uint32_t>({0, 24}) &&
-              events.progress.at(251) == std::vector<uint32_t>({0, 24}),
+  require(events.progress.at(250) == std::vector<uint32_t>({0, prompt}) &&
+              events.progress.at(251) == std::vector<uint32_t>({0, prompt}),
           "decode recovery reported generated history as prompt progress");
-  std::vector<uint32_t> committedHistory(24, preempted);
+  std::vector<uint32_t> committedHistory(prompt, preempted);
   committedHistory.push_back(42);
   // The newly admitted request also yields once because the recovering
   // continuation has reserved both pages. Neither replays generated output.
@@ -3034,8 +3041,8 @@ void testDecodePreemptionReplaysCommittedHistoryWithoutRepeatingOutput() {
           "replay omitted or duplicated committed generated history");
   require(events.outputs.at(250) == std::vector<uint32_t>(4, 42) &&
               events.outputs.at(251) == std::vector<uint32_t>(4, 42) &&
-              events.usage.at(250) == std::pair<uint32_t, uint32_t>{24, 4} &&
-              events.usage.at(251) == std::pair<uint32_t, uint32_t>{24, 4} &&
+              events.usage.at(250) == std::pair<uint32_t, uint32_t>{prompt, 4} &&
+              events.usage.at(251) == std::pair<uint32_t, uint32_t>{prompt, 4} &&
               events.startIds.size() == 3 &&
               events.maskRequests.empty() &&
               engine.snapshot().cacheHits == 0 && engine.snapshot().coldMisses == 3,
@@ -3406,15 +3413,16 @@ void testPreemptedDecodeRestoresItsResidentCompositeState() {
     engine.submit(std::move(value));
   }
   // Lookups keep both prompts' states at 64 resident while the lanes contend
-  // for pages: the preempted lane then resumes from its own.
+  // for pages: the preempted lane then resumes from its own. A lane's verify
+  // block of 16 rows needs its fourth page at its 16th token, a history of 81.
   const std::vector<CacheLookup> held = runUntilStatesHeld(engine, resources, {260, 261});
   for (double now = 100; now < 400 && !idle(engine); ++now)
     static_cast<void>(engine.tick(now));
   require(idle(engine) && executor.suspensions == 1 &&
               executor.resumptions == 1 && executor.restored == 64 &&
               executor.resumedPrompts.size() == 1 &&
-              executor.resumedPrompts.front().size() == 89 &&
-              engine.snapshot().resourceReplayTokens == 25,
+              executor.resumedPrompts.front().size() == 81 &&
+              engine.snapshot().resourceReplayTokens == 17,
           "preempted decode did not use its cached state plus exact suffix");
   require(events.completedCount == 2 && events.failedCount == 0 &&
               events.capacityExhaustedCount == 0 && events.startIds.size() == 2 &&
@@ -3440,7 +3448,7 @@ void testPreemptedDecodeReplayBoundaryIgnoresTheGenerationPrompt() {
   guardReleases(storage, engine);
   for (uint64_t id : {262, 263}) {
     auto value = request(id, std::vector<uint32_t>(65, id));
-    // Long enough to move the boundary if it applied to the 89-token history
+    // Long enough to move the boundary if it applied to the 81-token history
     // too: the prompt's state lands at 32, the history's at 64.
     value.generationPromptTokens = 30;
     value.maxNewTokens = 30;
@@ -3451,13 +3459,13 @@ void testPreemptedDecodeReplayBoundaryIgnoresTheGenerationPrompt() {
     static_cast<void>(engine.tick(now));
   require(idle(engine) && executor.suspensions == 1 &&
               executor.resumedPrompts.size() == 1 &&
-              executor.resumedPrompts.front().size() == 89 &&
+              executor.resumedPrompts.front().size() == 81 &&
               events.completedCount == 2,
-          "the decode was not preempted after 24 generated tokens");
+          "the decode was not preempted after 16 generated tokens");
   // Prompt tokens are the request id.
   const DraftContextPlan &plan =
       executor.plans.at(executor.resumedPrompts.front().front());
-  require(executor.restored == 32 && plan.replayEnd == 89 &&
+  require(executor.restored == 32 && plan.replayEnd == 81 &&
               plan.boundaries.size() == 2 && plan.boundaries[0].boundary == 64,
           "the resumed decode's replay boundary applied its generation prompt");
 }
@@ -5180,7 +5188,7 @@ void testRestoreCompletesWhileAConstrainedLaneDecodes() {
   auto step = [&](double now) {
     static_cast<void>(engine.tick(now));
     for (; answered < events.maskRequests.size(); ++answered)
-      engine.provideMask(events.maskRequests[answered].first, mask);
+      engine.provideMask(events.maskRequests[answered].first, mask, {});
     tier.complete();
   };
   EngineRequest decoding = constrainedRequest(1, 1e9);
@@ -5212,6 +5220,9 @@ void testRunningRequestKeepsItsReplayPoint() {
   engine::Cache resources(pool, nullptr, nullptr);
   Executor executor(2);
   executor.decodeFinishes = false;
+  // Its decode captures no state (Model::capturesInDecode): the point its
+  // next turn resumes from is its prompt's replay point.
+  executor.decodeStateCaptures = false;
   Events events;
   engine::Engine engine(test::engineConfig(), resources, executor, events);
   guardReleases(storage, engine);
@@ -5260,17 +5271,21 @@ void testSuspendedRequestKeepsItsReplayPoint() {
   engine::Cache resources(pool, nullptr, nullptr);
   Executor executor(3);
   executor.decodeFinishes = false;
+  // Its decode captures no state (Model::capturesInDecode): the point the
+  // suspended lane resumes from is its prompt's replay point.
+  executor.decodeStateCaptures = false;
   Events events;
   GovernedHost host;
   EngineConfig config = host.connect({});
   engine::Engine engine(config, resources, executor, events);
   guardReleases(storage, engine);
   double now = 1;
-  // Every lane needs its next page at the same step: the shortest history
-  // yields, the next one finishes first.
-  const std::vector<uint32_t> first(81, 1);
+  // Every lane needs its next page at the same step, where its verify block's
+  // 16 rows reach past its last: the shortest history yields, the next one
+  // finishes first.
+  const std::vector<uint32_t> first(73, 1);
   const std::vector<std::pair<std::vector<uint32_t>, uint32_t>> lanes{
-      {first, 40}, {std::vector<uint32_t>(113, 2), 20}, {std::vector<uint32_t>(145, 3), 210}};
+      {first, 40}, {std::vector<uint32_t>(105, 2), 20}, {std::vector<uint32_t>(137, 3), 210}};
   for (uint64_t id = 1; id <= lanes.size(); ++id) {
     auto value = request(id, lanes[id - 1].first);
     value.maxNewTokens = lanes[id - 1].second;
@@ -5358,8 +5373,9 @@ void testResumedLaneKeepsThePromptReplayPoint() {
   require(resources.snapshot().stateCache.checkpointEntries == 0 &&
               resources.probe(history, {}).cachedTokens() == 32,
           "the history's point outlasted the prompt's");
-  // A shrink that keeps the resume point keeps the prompt's point.
-  while (test::takeStep(resources, {.cls = ClaimClass::Host}, {.bytes = 1}).gave()) {
+  // A shrink that keeps the resume point, a pool's growth's, keeps the
+  // prompt's point.
+  while (test::takeStep(resources, {.cls = ClaimClass::Growth}, {.bytes = 1}).gave()) {
   }
   // The next turn keeps the text before the generation prompt.
   std::vector<uint32_t> next(35, static_cast<uint32_t>(id));
@@ -5394,15 +5410,16 @@ void testRestoredHistoryCheckpointStaysDisposable() {
                                         : metal::AllocationFailure::EngineBudget;
   };
   auto value = request(1, std::vector<uint32_t>(65, 5));
-  // The prompt's replay point lands at 32; a history of 89 tokens ends at 64.
+  // The prompt's replay point lands at 32; a history of 81 tokens ends at 64.
   value.generationPromptTokens = 30;
   value.maxNewTokens = 30;
   value.priority = RequestPriority::Background;
   engine.submit(std::move(value));
   double now = 1;
   tickUntil(engine, now, [&] { return !events.outputs[1].empty(); }, "the lane did not decode");
-  // The page its 24th token needs is refused: the lane yields with a history
-  // of 89 tokens, resumes from the prompt's point and checkpoints at 64.
+  // The page its 16th token's verify block needs is refused: the lane yields
+  // with a history of 81 tokens, resumes from the prompt's point and
+  // checkpoints at 64.
   hostPressure(true);
   tickUntil(engine, now, [&] { return executor.suspensions == 1; }, "the lane was not suspended");
   hostPressure(false);
@@ -5418,7 +5435,7 @@ void testRestoredHistoryCheckpointStaysDisposable() {
   hostPressure(false);
   tickUntil(engine, now, [&] { return idle(engine); }, "the requests did not finish");
   const std::vector<uint32_t> history = executor.resumedPrompts.back();
-  require(executor.resumptions == 2 && executor.restored == 32 + 64 && history.size() == 89 &&
+  require(executor.resumptions == 2 && executor.restored == 32 + 64 && history.size() == 81 &&
               events.completedCount == 2 &&
               resources.snapshot().stateCache.checkpointEntries == 1,
           "the lane did not resume from its history's checkpoint, or made it ordinary");

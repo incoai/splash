@@ -121,6 +121,11 @@ struct DraftContextParams {
 static_assert(sizeof(DraftContextParams) == 8,
               "Draft context prefill parameters are 8 bytes on both sides");
 
+// The context commit of each lane's retained rows (the mask acceptance
+// writes, AcceptBatchParams) of its lane rows (SplashLaneRows): the context
+// rows among the block's target rows, the path's i-th at position
+// start_position[l] + i, rotated by the lane's RoPE row i (a lane's RoPE rows
+// are its verify block's positions, SPLASH_TARGET_VERIFY_ROWS a lane).
 struct DraftContextBatchParams {
   uint32_t start_position[SPLASH_MAXIMUM_BATCH_WIDTH];
 };

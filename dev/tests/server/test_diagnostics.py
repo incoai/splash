@@ -15,9 +15,11 @@ from dev.tests.server_fixtures import (
     FakeRuntime,
     HarnessTestCase,
     StalledConsole,
+    TemplateTokenizer,
     chat_body,
     console_written,
     full_pipe,
+    reasoning_template,
 )
 from server import diagnostics
 from server import server as api
@@ -245,6 +247,7 @@ class DiagnosticsTests(HarnessTestCase):
                             "sent_effort": None,
                             "effort": None,
                             "enable_thinking": None,
+                            "template_effort": None,
                             "thinking": True,
                             **reasoning,
                         },
@@ -269,6 +272,29 @@ class DiagnosticsTests(HarnessTestCase):
             ),
             " · effort xhigh · enable_thinking false · thinking off\n",
         )
+        # The effort the server sets for every request follows the one sent.
+        self.assertEqual(
+            line(sent_effort="high", effort="none", thinking=False),
+            " · effort high → none · thinking off\n",
+        )
+        # The effort chat_template_kwargs set is the one the template renders,
+        # over the one sent and the server's default (#777).
+        self.assertEqual(
+            line(template_effort="low", enable_thinking=True),
+            " · effort low (chat_template_kwargs) · enable_thinking true · thinking on\n",
+        )
+        self.assertEqual(
+            line(effort="high", template_effort="low"),
+            " · effort low (chat_template_kwargs) · thinking on\n",
+        )
+        self.assertEqual(
+            line(sent_effort="medium", effort="medium", template_effort="low"),
+            " · effort medium → low (chat_template_kwargs) · thinking on\n",
+        )
+        self.assertEqual(
+            line(sent_effort="low", effort="low", template_effort="low"),
+            " · effort low (chat_template_kwargs) · thinking on\n",
+        )
 
     def test_started_records_carry_chat_reasoning_options(self):
         records = []
@@ -281,6 +307,8 @@ class DiagnosticsTests(HarnessTestCase):
             chat_body(),
             chat_body(reasoning_effort="none"),
             chat_body(chat_template_kwargs={"enable_thinking": False}),
+            chat_body(chat_template_kwargs={"reasoning_effort": "medium"}),
+            chat_body(chat_template_kwargs={"reasoning_effort": "unheard-of"}),
         ):
             status, _, payload = harness.request("POST", "/v1/chat/completions", body)
             self.assertEqual(status, 200, payload)
@@ -296,23 +324,85 @@ class DiagnosticsTests(HarnessTestCase):
                     "sent_effort": None,
                     "effort": "low",
                     "enable_thinking": None,
+                    "template_effort": None,
                     "thinking": True,
                 },
                 {
                     "sent_effort": "none",
                     "effort": "none",
                     "enable_thinking": None,
+                    "template_effort": None,
                     "thinking": False,
                 },
                 {
                     "sent_effort": None,
                     "effort": "low",
                     "enable_thinking": False,
+                    "template_effort": None,
                     "thinking": False,
+                },
+                # The template reads only enable_thinking: the effort the
+                # kwargs set is none it rendered with.
+                {
+                    "sent_effort": None,
+                    "effort": "low",
+                    "enable_thinking": None,
+                    "template_effort": None,
+                    "thinking": True,
+                },
+                {
+                    "sent_effort": None,
+                    "effort": "low",
+                    "enable_thinking": None,
+                    "template_effort": None,
+                    "thinking": True,
                 },
                 None,
             ],
         )
+
+    def test_the_started_line_names_the_kwargs_effort_where_the_template_reads_it(
+        self,
+    ):
+        """The reasoning_effort a request's chat_template_kwargs set is the
+        effort the Started line names where the template reads it, and the
+        server's default where it reads only enable_thinking, which renders
+        by that default alone (the line named the kwargs' effort there too,
+        `effort medium (chat_template_kwargs)`)."""
+        body = chat_body(chat_template_kwargs={"reasoning_effort": "medium"})
+        for template, said in (
+            (None, "effort absent → low · thinking on"),
+            (
+                reasoning_template(efforts=["none", "low", "medium"]),
+                "effort medium (chat_template_kwargs) · thinking on",
+            ),
+        ):
+            records = []
+            harness = self.harness(
+                FakeRuntime(),
+                request_logger=records.append,
+                default_reasoning_effort="low",
+                **(
+                    {}
+                    if template is None
+                    else {"tokenizer": TemplateTokenizer(template)}
+                ),
+            )
+            status, _, payload = harness.request("POST", "/v1/chat/completions", body)
+            self.assertEqual(status, 200, payload)
+            (started,) = (
+                record for record in records if record["outcome"] == "started"
+            )
+            with (
+                self.subTest(said=said),
+                mock.patch.object(api.time, "strftime", return_value="19:03:32"),
+                mock.patch("sys.stdout", new_callable=io.StringIO) as output,
+            ):
+                printed(started)
+                self.assertEqual(
+                    "effort " + output.getvalue().partition(" · effort ")[2],
+                    f"{said}\n",
+                )
 
     def test_console_shows_the_tool_block_signature(self):
         record = {

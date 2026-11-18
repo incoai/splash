@@ -445,8 +445,8 @@ AneFfn::AneFfn(metal::MetalBackend &backend, const Linear &linear, std::span<con
 
   for (const SwiGluProjections &source : layers)
     layers_.push_back({{Planes(*source.gate), Planes(*source.up), Planes(*source.down)},
-                       source.gate->leadingRows(backend_, shape_.gpu),
-                       source.up->leadingRows(backend_, shape_.gpu),
+                       source.gate->rows(backend_, {{0, shape_.gpu}}),
+                       source.up->rows(backend_, {{0, shape_.gpu}}),
                        source.down->leadingInputs(shape_.gpu)});
 
   const std::vector<Input> inputs = programInputs(shape_, memory_);
@@ -583,7 +583,7 @@ void AneFfn::encode(metal::CommandGraph &graph, uint32_t layer, const PrefillFfn
   }
   const uint64_t ready = ane ? handoff_.next() : 0;
   if (ane) graph.signal(handoff_.event(), ready);
-  linear_.addPrefillSwiGlu(graph, {&current.gate, &current.up, &current.down, shape_.clamp}, ffn, residual, output, rows);
+  linear_.addSwiGlu(graph, {&current.gate, &current.up, &current.down, shape_.clamp}, ffn, residual, output, rows);
   if (layer + 1 < layers_.size()) addWeights(graph, layer + 1, set ^ 1);
   const uint64_t done = ane ? handoff_.next() : 0;
   if (ane) graph.wait(handoff_.event(), done);
@@ -724,14 +724,14 @@ double AneFfn::verify(std::span<const SwiGluProjections> layers, const PrefillFf
     for (uint32_t layer = 0; layer < count; ++layer) {
       const metal::MetalBuffer &residual = hidden[layer & 1], &output = hidden[(layer & 1) ^ 1];
       if (way == Way::Gpu)
-        linear_.addPrefillSwiGlu(graph, layers[layer], ffn, residual, output, rows);
+        linear_.addSwiGlu(graph, layers[layer], ffn, residual, output, rows);
       else
         encode(graph, layer, ffn, residual, output, rows, way == Way::Split ? Parts::Both : Parts::Gpu);
     }
     if (way == Way::Split) {
       static_cast<void>(commit(graph, {}).wait());
       if (!completed())
-        throw std::runtime_error("ANE FFN split of " + std::to_string(rows) + " rows failed (" + reason() + ")");
+        throw ane::Refused("ANE FFN split of " + std::to_string(rows) + " rows failed (" + reason() + ")");
     } else {
       static_cast<void>(backend_.submitCommandAsync(graph.command()).wait());
     }
@@ -749,7 +749,7 @@ double AneFfn::verify(std::span<const SwiGluProjections> layers, const PrefillFf
     const std::vector<float> split = forward(Way::Split, count, rows);
     const auto fail = [&](const std::string &why) {
       handoff_.retire("its output of " + std::to_string(rows) + " rows " + why);
-      throw std::runtime_error("ANE FFN split's output of " + std::to_string(rows) + " rows " + why);
+      throw ane::Refused("ANE FFN split's output of " + std::to_string(rows) + " rows " + why);
     };
     double difference = 0.0, contribution = 0.0;
     for (size_t i = 0; i < split.size(); ++i) {

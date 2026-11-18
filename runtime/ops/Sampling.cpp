@@ -5,7 +5,6 @@
 #include "ops/BufferExtent.hpp"
 
 #include <algorithm>
-#include <bit>
 #include <limits>
 #include <optional>
 #include <stdexcept>
@@ -32,32 +31,25 @@ void requireVocabulary(std::span<const uint32_t> tokens, size_t vocabulary) {
     throw std::invalid_argument("penalty token is outside the vocabulary");
 }
 
-// The thinking cutoffs of a selection of `rows` rows per lane, the first
-// `draftedRows` of them drafted and their masks from mask row `maskRow` on,
-// and the lanes up to the last one it cuts and up to the last one whose end
-// replaces draft proposals, 0 where it cuts none.
+// The thinking cutoffs of a selection of up to `laneCap` rows a lane, their
+// masks from mask row `maskRow` on, and the lanes up to the last one it cuts,
+// 0 where it cuts none.
 struct ThinkingCutoffs final {
   ThinkingCutoffParams params{};
   uint32_t cutLanes = 0;
-  uint32_t draftingLanes = 0;
 };
 
-ThinkingCutoffs thinkingCutoffs(std::span<const SamplingPolicy> policies, uint32_t vocabulary, uint32_t rows,
-                                uint32_t draftedRows, uint32_t maskRow) {
+ThinkingCutoffs thinkingCutoffs(std::span<const SamplingPolicy> policies, uint32_t vocabulary, uint32_t laneCap,
+                                uint32_t maskRow) {
   ThinkingCutoffs cutoffs;
   ThinkingCutoffParams &params = cutoffs.params;
   params.vocabulary = vocabulary;
-  params.rows = rows;
-  params.drafted_rows = draftedRows;
-  params.lane_rows = rows;
   params.mask_words = (vocabulary + 31) / 32;
   params.mask_row = maskRow;
   for (uint32_t lane = 0; lane < policies.size(); ++lane) {
     const SamplingPolicy &policy = policies[lane];
-    if (policy.samples())
-      params.sampling_mask |= uint32_t{1} << lane;
     const std::optional<ThinkingCutoff> &cutoff = policy.thinkingCutoff;
-    params.row[lane] = cutoff ? cutoff->row : rows;
+    params.row[lane] = cutoff ? cutoff->row : laneCap;
     if (cutoff && !cutoff->markers.empty()) {
       const TokenAutomaton markers(cutoff->markers);
       if (!markers.valid(vocabulary) || markers.terminal(cutoff->markerState))
@@ -65,9 +57,7 @@ ThinkingCutoffs thinkingCutoffs(std::span<const SamplingPolicy> policies, uint32
       params.automaton_mask |= 1u << lane;
       params.marker_state[lane] = cutoff->markerState;
       if (markers.opened(cutoff->markerState)) params.opened_mask |= 1u << lane;
-    } else if (params.row[lane] >= rows) {
-      continue;
-    }
+    } else if (params.row[lane] >= laneCap) continue;
     if (cutoff->end.empty())
       throw std::invalid_argument("a thinking cutoff has no end");
     if (cutoff->waitsForMask) {
@@ -79,14 +69,13 @@ ThinkingCutoffs thinkingCutoffs(std::span<const SamplingPolicy> policies, uint32
         throw std::invalid_argument("a thinking end that waits for a mask starts outside the vocabulary");
       params.waiting_mask |= uint32_t{1} << lane;
     }
-    // The rows from the cutoff's on take as many of its end as they hold.
-    params.count[lane] = static_cast<uint32_t>(std::min<size_t>(cutoff->end.size(), cutoff->markers.empty() ? rows - cutoff->row : rows));
+    // The rows from the cutoff's on take as many of its end as a lane's rows
+    // hold.
+    params.count[lane] = static_cast<uint32_t>(std::min<size_t>(cutoff->end.size(), cutoff->markers.empty() ? laneCap - cutoff->row : laneCap));
     std::copy_n(cutoff->end.begin(), params.count[lane], params.tokens[lane]);
     params.close[lane] = cutoff->end.back();
     params.also_ends[lane] = cutoff->alsoEnds;
     cutoffs.cutLanes = lane + 1;
-    if (cutoff->replacedProposals(draftedRows))
-      cutoffs.draftingLanes = lane + 1;
   }
   return cutoffs;
 }
@@ -138,28 +127,17 @@ void Sampling::countPenaltyTokens(std::span<uint32_t> words,
     ++words[token];
 }
 
-Sampling::Sampling(uint32_t vocabulary, uint32_t draftCandidates, uint32_t verifyRows)
-    : vocabulary_(vocabulary), draftCandidates_(draftCandidates),
-      maskWords_((vocabulary + 31) / 32), verifyRows_(verifyRows) {
-  if (!vocabulary)
+Sampling::Sampling(uint32_t vocabulary, uint32_t candidates, uint32_t draftRows)
+    : vocabulary_(vocabulary), draftCandidates_(candidates), draftRows_(draftRows), maskWords_((vocabulary + 31) / 32) {
+  if (!vocabulary || (candidates != 16 && candidates != 32) || (draftRows != 8 && draftRows != 16))
     throw std::invalid_argument("invalid sampling geometry");
-  if (draftCandidates_ != SPLASH_DRAFT_CANDIDATES && draftCandidates_ != 32)
-    throw std::invalid_argument("invalid draft candidate count");
-  if (verifyRows_ < SPLASH_TARGET_VERIFY_ROWS ||
-      verifyRows_ > SPLASH_DRAFT_BLOCK_ROWS_LIMIT)
-    throw std::invalid_argument("invalid draft block rows");
 }
 
-void Sampling::addPenalties(metal::CommandGraph &graph,
-                            std::span<const SamplingPolicy> policies,
-                            const SamplingBuffers &buffers,
-                            const PenaltyTable &table, uint32_t rowOffset,
-                            bool verify) const {
+SamplingPenaltyParams Sampling::penaltyParams(std::span<const SamplingPolicy> policies,
+                                              const SamplingBuffers &buffers, const PenaltyTable &table,
+                                              const TargetRows &rows) const {
   SamplingPenaltyParams params{};
   params.vocabulary = vocabulary_;
-  params.rows = verify ? verifyRows_ : 1;
-  params.lane_rows = verifyRows_;
-  params.row_offset = rowOffset;
   const uint64_t rowBytes = uint64_t{vocabulary_} * sizeof(uint32_t);
   for (uint32_t lane = 0; lane < policies.size(); ++lane) {
     const SamplingPenalties &penalties = policies[lane].penalties;
@@ -170,7 +148,7 @@ void Sampling::addPenalties(metal::CommandGraph &graph,
       throw std::invalid_argument("penalized lane has no penalty table row");
     requireBytes(table.words, (uint64_t{table.rows[lane]} + 1) * rowBytes, "penalty table");
     const uint32_t entry = params.entries++;
-    params.logits_lane[entry] = lane;
+    params.lane[entry] = lane;
     params.table_row[entry] = table.rows[lane];
     params.repetition[entry] = penalties.repetition;
     // 1 / 2^-149 overflows; the saturated inverse keeps the product finite.
@@ -179,71 +157,88 @@ void Sampling::addPenalties(metal::CommandGraph &graph,
     params.presence[entry] = penalties.presence;
     params.frequency[entry] = penalties.frequency;
   }
+  // A lane's rows read their tree rows, and its rows after its first their
+  // draft tokens.
+  if (params.entries) {
+    requireBytes(buffers.treeRows, rows.end * sizeof(TreeRow), "verify tree row");
+    if (rows.laneCap > 1)
+      requireBytes(buffers.inputTokens, rows.end * sizeof(uint32_t), "verify input token");
+  }
+  return params;
+}
+
+void Sampling::addPenalties(metal::CommandGraph &graph, const SamplingBuffers &buffers, const PenaltyTable &table,
+                            const SamplingPenaltyParams &params) const {
   if (!params.entries)
     return;
-  // Entries follow the lanes, so the last one's lane is the highest.
-  const uint64_t lanes = uint64_t{params.logits_lane[params.entries - 1]} + 1;
-  if (verify)
-    requireBytes(buffers.inputTokens, lanes * verifyRows_ * sizeof(uint32_t), "verify input token");
-  const metal::DispatchSize groups{
-      (vocabulary_ + kPenaltyThreads - 1) / kPenaltyThreads, params.entries, 1};
-  if (!verify) {
-    graph.add("decode_sample_penalize", {buffers.logits, table.words}, params,
-              groups, {kPenaltyThreads, 1, 1});
-    return;
-  }
-  graph.add("decode_sample_penalize_verify",
-            {buffers.logits, table.words, buffers.inputTokens}, params, groups,
+  graph.add("decode_sample_penalize",
+            {buffers.logits, table.words, buffers.inputTokens, buffers.treeRows, buffers.laneRows},
+            params, {(vocabulary_ + kPenaltyThreads - 1) / kPenaltyThreads, params.entries, 1},
             {kPenaltyThreads, 1, 1});
 }
 
 void Sampling::addInitial(metal::CommandGraph &graph,
                           std::span<const SamplingPolicy> policies,
-                          SamplingBuffers buffers, uint32_t rowOffset,
+                          SamplingBuffers buffers, std::span<const uint32_t> rows,
                           const StopTokens &stopTokens,
                           const PenaltyTable &penalties) const {
-  if (policies.empty() || policies.size() > kMaximumLanes)
+  if (policies.empty() || policies.size() > kMaximumLanes || rows.size() != policies.size())
     throw std::invalid_argument("invalid sampling batch width");
-  if (rowOffset >= verifyRows_)
-    throw std::invalid_argument("invalid initial sampling row");
-  const TargetSamplingParams params =
-      selection(policies, buffers,
-                {1, rowOffset, 0, SPLASH_UNIFORM_INITIAL, 0, verifyRows_}, stopTokens);
-  addPenalties(graph, policies, buffers, penalties, rowOffset, false);
-  addSelection(graph, params, policies, buffers);
+  const uint32_t lanes = static_cast<uint32_t>(rows.size());
+  SampleFirstRowsParams first{};
+  uint64_t end = 0;
+  for (uint32_t lane = 0; lane < lanes; ++lane) {
+    first.row[lane] = rows[lane];
+    end = std::max(end, uint64_t{rows[lane]} + 1);
+  }
+  // A lane's one row reads its mask row 0.
+  const TargetRows selected{end, 1, 0};
+  const TargetSamplingParams params = selection(policies, buffers, selected, stopTokens);
+  const SamplingPenaltyParams penalized = penaltyParams(policies, buffers, penalties, selected);
+  // Each lane's one row is its tree's root.
+  requireBytes(buffers.treeRows, end * sizeof(TreeRow), "verify tree row");
+  graph.add("decode_sample_first_rows", {buffers.laneRows, buffers.treeRows}, first, {lanes, 1, 1}, {1, 1, 1});
+  addPenalties(graph, buffers, penalties, penalized);
+  addSelection(graph, params, policies, buffers, selected);
 }
 
 void Sampling::addVerify(metal::CommandGraph &graph,
                          std::span<const SamplingPolicy> policies,
-                         SamplingBuffers buffers, const StopTokens &stopTokens,
+                         SamplingBuffers buffers, const StepRows &step,
+                         const StopTokens &stopTokens,
                          const PenaltyTable &penalties) const {
-  if (policies.empty() || policies.size() > kMaximumLanes)
+  requireStepRows(step);
+  if (policies.size() != step.lanes)
     throw std::invalid_argument("invalid sampling batch width");
-  // Verify row r of a lane reads mask row r + 1 and, below the last row,
-  // follows draft token r; every row draws with the lane's correction
-  // uniform.
-  const TargetSamplingParams params =
-      selection(policies, buffers,
-                {verifyRows_, 0, 1, SPLASH_UNIFORM_CORRECTION, verifyRows_ - 1, verifyRows_},
-                stopTokens);
-  addPenalties(graph, policies, buffers, penalties, 0, true);
-  addSelection(graph, params, policies, buffers);
+  // Verify row r of a lane reads mask row r + 1, and a sampled one tests its
+  // draft's children.
+  const TargetRows selected{step.rows, step.laneCap, 1, true};
+  const TargetSamplingParams params = selection(policies, buffers, selected, stopTokens);
+  addPenalties(graph, buffers, penalties, penaltyParams(policies, buffers, penalties, selected));
+  addSelection(graph, params, policies, buffers, selected);
 }
 
 TargetSamplingParams Sampling::selection(std::span<const SamplingPolicy> policies,
                                          const SamplingBuffers &buffers, const TargetRows &rows,
                                          const StopTokens &stopTokens) const {
+  // A lane's rows are those its mask rows, its uniforms and the cutoff's end
+  // tokens hold.
+  if (!rows.laneCap || rows.laneCap > SPLASH_TARGET_VERIFY_ROWS || rows.end > std::numeric_limits<uint32_t>::max())
+    throw std::invalid_argument("a lane's rows are out of range");
   TargetSamplingParams params{};
   params.vocabulary = vocabulary_;
   params.mask_words = maskWords_;
-  params.rows = rows.rows;
-  params.lane_rows = rows.laneRows ? rows.laneRows : verifyRows_;
-  params.logits_row = rows.logitsRow;
   params.mask_row = rows.maskRow;
-  params.uniform = rows.uniform;
-  params.drafted_rows = rows.draftedRows;
+  params.trees = rows.trees ? 1 : 0;
+  params.draft_positions = draftRows_ - 1;
   std::ranges::copy(stopTokens.ids, params.stop_tokens);
-  for (uint32_t lane = 0; lane < policies.size(); ++lane) {
+  // The rows each policy's kernels reach, up to the last that reads each
+  // buffer: the logits and output tokens of every lane, a workspace the
+  // workspace() of the selection's rows where a lane of its kind selects, a
+  // constrained lane's mask rows, and a sampled lane's uniform of each row.
+  const uint32_t lanes = static_cast<uint32_t>(policies.size());
+  uint64_t maskEnd = 0, uniformEnd = 0;
+  for (uint32_t lane = 0; lane < lanes; ++lane) {
     const SamplingPolicy &policy = policies[lane];
     if (policy.samples()) {
       params.top_k[lane] = effectiveTopK(policy, vocabulary_);
@@ -251,178 +246,124 @@ TargetSamplingParams Sampling::selection(std::span<const SamplingPolicy> policie
       params.top_p[lane] = policy.topP;
       params.min_p[lane] = policy.minP;
       params.sampling_mask |= uint32_t{1} << lane;
+      // A verify row's child tests follow the lane's draw uniforms.
+      uniformEnd = uint64_t{lane} * SPLASH_SAMPLING_UNIFORMS +
+                   (rows.trees ? SPLASH_TARGET_VERIFY_ROWS + uint64_t{rows.laneCap} * SPLASH_TREE_CHILDREN
+                               : rows.laneCap);
     }
-    if (policy.constrained)
+    if (policy.constrained) {
       params.constrained_mask |= uint32_t{1} << lane;
+      const uint64_t maskRows = uint64_t{lane} * (SPLASH_TARGET_VERIFY_ROWS + 1) + rows.maskRow + rows.laneCap;
+      maskEnd = maskRows * maskWords_;
+    }
     if (policy.excludesStopTokens)
       params.exclude_stop_mask |= uint32_t{1} << lane;
   }
-  // Selected row s is row s % rows of lane s / rows (metal/abi/Sampling.h),
-  // and the kernels of a lane's policy reach that lane's rows: each buffer
-  // holds the rows up to the last lane that reads it, a workspace the
-  // workspace() of those rows.
-  const uint64_t lanes = policies.size();
-  const uint64_t greedyLanes = std::bit_width(((uint32_t{1} << lanes) - 1) & ~params.sampling_mask);
-  const uint64_t sampledLanes = std::bit_width(params.sampling_mask);
-  const uint64_t constrainedLanes = std::bit_width(params.constrained_mask);
-  const auto rowsWorkspace = [&](uint64_t policyLanes) {
-    return policyLanes ? workspace(static_cast<uint32_t>(policyLanes * rows.rows)) : SamplingWorkspace{};
-  };
-  const SamplingWorkspace greedy = rowsWorkspace(greedyLanes), sampled = rowsWorkspace(sampledLanes);
-  requireBytes(buffers.logits,
-               ((lanes - 1) * params.lane_rows + rows.logitsRow + rows.rows) * vocabulary_ * sizeof(float),
-               "sampling logits");
-  if (constrainedLanes)
-    requireBytes(buffers.constraintMasks,
-                 ((constrainedLanes - 1) * (params.lane_rows + 1) + rows.maskRow + rows.rows) * maskWords_ *
-                     sizeof(uint32_t),
-                 "constraint mask");
-  requireBytes(buffers.outputTokens, lanes * rows.rows * sizeof(uint32_t), "sampled token");
+  const uint64_t end = rows.end;
+  const uint32_t all = (uint32_t{1} << lanes) - 1;
+  const SamplingWorkspace none{}, every = workspace(static_cast<uint32_t>(end));
+  const SamplingWorkspace &greedy = params.sampling_mask == all ? none : every;
+  const SamplingWorkspace &sampled = params.sampling_mask ? every : none;
+  requireBytes(buffers.logits, end * vocabulary_ * sizeof(float), "sampling logits");
+  requireBytes(buffers.constraintMasks, maskEnd * sizeof(uint32_t), "constraint mask");
+  requireBytes(buffers.outputTokens, end * sizeof(uint32_t), "sampled token");
+  requireBytes(buffers.laneRows, uint64_t{lanes} * sizeof(LaneRows), "sampling lane rows");
   requireBytes(buffers.argmaxValues, greedy.argmaxValuesBytes, "argmax value");
   requireBytes(buffers.argmaxIndices, greedy.argmaxIndicesBytes, "argmax index");
   requireBytes(buffers.partialMasses, sampled.partialMassesBytes, "sampling mass");
   requireBytes(buffers.vocabularyRows, sampled.vocabularyRowsBytes, "sampling vocabulary row");
   requireBytes(buffers.vocabularyRanges, sampled.vocabularyRangesBytes, "sampling vocabulary range");
   requireBytes(buffers.vocabularyArrivals, sampled.vocabularyArrivalsBytes, "sampling arrival");
-  if (sampledLanes) {
-    const uint64_t last = sampledLanes - 1, drafted = std::min(rows.rows, rows.draftedRows);
-    requireBytes(buffers.uniforms, (last * SPLASH_SAMPLING_UNIFORMS + rows.uniform + 1) * sizeof(float),
-                 "sampling uniform");
-    // A drafted row reads its draft token, the next verify input row, and
-    // its proposal position's candidates.
-    if (drafted) {
-      requireBytes(buffers.inputTokens, (last * rows.rows + drafted + 1) * sizeof(uint32_t), "verify input token");
-      const uint64_t candidates =
-          (last * (verifyRows_ - 1) + drafted) * draftCandidates_;
-      requireBytes(buffers.draftCandidates, candidates * sizeof(uint32_t), "draft candidate");
-      requireBytes(buffers.draftProbabilities, candidates * sizeof(float), "draft probability");
-    }
+  requireBytes(buffers.uniforms, uniformEnd * sizeof(float), "sampling uniform");
+  if (params.trees && params.sampling_mask) {
+    const uint64_t treeRows = uint64_t{lanes} * SPLASH_TARGET_VERIFY_ROWS;
+    requireBytes(buffers.treeRows, end * sizeof(TreeRow), "verify tree row");
+    requireBytes(buffers.verifySources, end * sizeof(uint32_t), "verify source");
+    requireBytes(buffers.candidates,
+                 uint64_t{lanes} * (draftRows_ - 1) * draftCandidates_ * sizeof(uint32_t),
+                 "draft candidate");
+    requireBytes(buffers.treeDraws, treeRows * SPLASH_TREE_CHILDREN, "draft tree draw");
+    requireBytes(buffers.treeNext, treeRows * draftCandidates_ * sizeof(float), "draft tree next");
   }
   return params;
 }
 
 void Sampling::addSelection(metal::CommandGraph &graph, const TargetSamplingParams &params,
-                            std::span<const SamplingPolicy> policies, const SamplingBuffers &buffers) const {
-  // Greedy and sampled lanes run their own kernels, each over the selected
-  // rows of every lane; the groups of the other kind's lanes return at once.
+                            std::span<const SamplingPolicy> policies, const SamplingBuffers &buffers,
+                            const TargetRows &rows) const {
+  // Greedy and sampled lanes run their own kernels, each over a grid of a
+  // lane's rows by lanes; the groups of the other kind's lanes, and those
+  // past a lane's rows, return at once.
   const uint32_t lanes = static_cast<uint32_t>(policies.size());
-  const uint64_t selected = uint64_t{lanes} * params.rows;
+  const uint32_t most = rows.laneCap;
   if (params.sampling_mask != (uint32_t{1} << lanes) - 1) {
     graph.add("decode_sample_argmax_sharded",
-              {buffers.logits, buffers.constraintMasks, buffers.argmaxValues,
-               buffers.argmaxIndices},
-              params, {selected * kTargetShards, 1, 1});
+              {buffers.logits, buffers.constraintMasks, buffers.argmaxValues, buffers.argmaxIndices,
+               buffers.laneRows},
+              params, {most * kTargetShards, lanes, 1});
     graph.add("decode_sample_argmax_reduce",
-              {buffers.argmaxValues, buffers.argmaxIndices,
-               buffers.outputTokens},
-              params, {selected, 1, 1}, {32, 1, 1});
+              {buffers.argmaxValues, buffers.argmaxIndices, buffers.outputTokens, buffers.laneRows}, params,
+              {most, lanes, 1}, {32, 1, 1});
   }
   if (params.sampling_mask) {
     graph.add("decode_sample_mass_sharded",
-              {buffers.logits, buffers.constraintMasks, buffers.partialMasses},
-              params, {selected * kTargetShards, 1, 1});
+              {buffers.logits, buffers.constraintMasks, buffers.partialMasses, buffers.laneRows}, params,
+              {most * kTargetShards, lanes, 1});
     graph.add("decode_sample_vocabulary_search",
-              {buffers.logits, buffers.constraintMasks, buffers.partialMasses,
-               buffers.vocabularyRows},
-              params, {selected, 1, 1}, {kVocabularyThreads, 1, 1});
-    graph.add(draftCandidates_ == 32 ? "decode_sample_vocabulary_draw_k32"
-                                     : "decode_sample_vocabulary_draw",
-              {buffers.logits, buffers.constraintMasks, buffers.vocabularyRows,
-               buffers.inputTokens, buffers.draftCandidates,
-               buffers.draftProbabilities, buffers.uniforms,
-               buffers.outputTokens, buffers.vocabularyRanges,
-               buffers.vocabularyArrivals},
-              params, {selected * kVocabularyGroups, 1, 1},
-              {kVocabularyThreads, 1, 1});
+              {buffers.logits, buffers.constraintMasks, buffers.partialMasses, buffers.vocabularyRows,
+               buffers.laneRows},
+              params, {most, lanes, 1}, {kVocabularyThreads, 1, 1});
+    graph.add(draftCandidates_ == 32 ? "decode_sample_vocabulary_draw_k32" : "decode_sample_vocabulary_draw",
+              {buffers.logits, buffers.constraintMasks, buffers.vocabularyRows, buffers.uniforms,
+               buffers.outputTokens, buffers.vocabularyRanges, buffers.vocabularyArrivals, buffers.laneRows,
+               buffers.treeRows, buffers.verifySources, buffers.candidates, buffers.treeDraws, buffers.treeNext},
+              params, {most * kVocabularyGroups, lanes, 1}, {kVocabularyThreads, 1, 1});
   }
   // Only a selection that reaches a lane's thinking cutoff dispatches it.
-  const ThinkingCutoffs cutoffs =
-      thinkingCutoffs(policies, vocabulary_, params.rows, params.drafted_rows, params.mask_row);
+  const ThinkingCutoffs cutoffs = thinkingCutoffs(policies, vocabulary_, rows.laneCap, params.mask_row);
   if (!cutoffs.cutLanes)
     return;
-  // A cut lane reads its draft tokens up to its drafted rows' last; a lane
+  // A cut lane's rows after its first read their tokens and tree rows; a lane
   // whose end waits for its mask, a constrained one, reads its mask rows,
   // which selection() checked.
-  requireBytes(buffers.inputTokens,
-               (uint64_t{cutoffs.cutLanes - 1} * params.rows + params.drafted_rows + 1) * sizeof(uint32_t),
-               "verify input token");
+  if (rows.laneCap > 1) {
+    requireBytes(buffers.inputTokens, rows.end * sizeof(uint32_t), "verify input token");
+    requireBytes(buffers.treeRows, rows.end * sizeof(TreeRow), "verify tree row");
+  }
   graph.add("decode_sample_thinking_cutoff",
-            {buffers.inputTokens, buffers.constraintMasks, buffers.outputTokens, buffers.vocabularyRows},
+            {buffers.inputTokens, buffers.constraintMasks, buffers.treeRows, buffers.outputTokens, buffers.laneRows},
             cutoffs.params, {lanes, 1, 1}, {1, 1, 1});
   for (uint32_t lane = 0; lane < kMaximumLanes; ++lane)
-      graph.bytes(5 + lane, lane < policies.size() && policies[lane].thinkingCutoff
-                                ? policies[lane].thinkingCutoff->markers : std::span<const uint32_t>{});
+    graph.bytes(6 + lane, lane < policies.size() && policies[lane].thinkingCutoff
+                              ? policies[lane].thinkingCutoff->markers : std::span<const uint32_t>{});
 }
 
-void Sampling::addThinkingDrafts(metal::CommandGraph &graph, std::span<const SamplingPolicy> policies,
-                                 metal::MetalBuffer proposedTokens) const {
-  if (policies.empty() || policies.size() > kMaximumLanes)
-    throw std::invalid_argument("invalid sampling batch width");
-  // The cutoffs of the verify that follows (addVerify), whose masks the
-  // drafts do not read.
-  const ThinkingCutoffs cutoffs =
-      thinkingCutoffs(policies, vocabulary_, verifyRows_, verifyRows_ - 1, 1);
-  if (!cutoffs.draftingLanes)
-    return;
-  // Such a lane writes its own proposals.
-  requireBytes(proposedTokens, uint64_t{cutoffs.draftingLanes} * (verifyRows_ - 1) * sizeof(uint32_t),
-               "proposed token");
-  graph.add("decode_draft_thinking_cutoff", {std::move(proposedTokens)}, cutoffs.params, {policies.size(), 1, 1},
-            {1, 1, 1});
-}
-
-void Sampling::addAcceptance(
-    metal::CommandGraph &graph, AcceptanceBuffers buffers,
-    std::span<const uint32_t> maximumRetained,
-    std::span<const SamplingPolicy> policies,
-    const StopTokens &stopTokens) const {
-  if (maximumRetained.empty() || maximumRetained.size() != policies.size() ||
-      maximumRetained.size() > kMaximumLanes)
+void Sampling::addAcceptance(metal::CommandGraph &graph, AcceptanceBuffers buffers, const StepRows &step,
+                             std::span<const uint32_t> maximumRetained, const StopTokens &stopTokens) const {
+  requireStepRows(step);
+  if (maximumRetained.size() != step.lanes)
     throw std::invalid_argument("invalid DFlash acceptance batch");
-  const uint32_t lanes = static_cast<uint32_t>(maximumRetained.size());
+  const uint32_t lanes = step.lanes;
   AcceptBatchParams params{};
   std::ranges::copy(stopTokens.ids, params.stop_tokens);
+  // A lane retains at most its rows.
   for (uint32_t lane = 0; lane < lanes; ++lane) {
-    if (!maximumRetained[lane] ||
-        maximumRetained[lane] > verifyRows_)
+    if (!maximumRetained[lane] || maximumRetained[lane] > step.laneCap)
       throw std::invalid_argument("invalid DFlash retention limit");
     params.remaining[lane] = maximumRetained[lane];
-    if (policies[lane].samples())
-      params.sampling_mask |= uint32_t{1} << lane;
   }
-  // A lane reads its draft's tokens and its verify rows' tokens, the latter
-  // up to the longer of the draft and its retention limit; a sampling lane
-  // also its draft's candidates and their probabilities, its rows' target
-  // probabilities and its acceptance uniforms (metal/abi/Sampling.h).
-  const uint64_t kProposals = verifyRows_ - 1;
-  requireBytes(buffers.proposedTokens, lanes * kProposals * sizeof(uint32_t), "proposed token");
-  requireBytes(buffers.outputTokens,
-               (uint64_t{lanes - 1} * verifyRows_ + std::max<uint64_t>(kProposals, maximumRetained.back())) *
-                   sizeof(uint32_t),
-               "target token");
+  // A lane reads its rows' tokens, tree rows and selections.
+  const uint64_t end = step.rows;
+  requireBytes(buffers.inputTokens, end * sizeof(uint32_t), "verify input token");
+  requireBytes(buffers.treeRows, end * sizeof(TreeRow), "verify tree row");
+  requireBytes(buffers.outputTokens, end * sizeof(uint32_t), "target token");
   requireBytes(buffers.retainedCounts, lanes * sizeof(uint32_t), "retained count");
   requireBytes(buffers.acceptedCounts, lanes * sizeof(uint32_t), "accepted count");
-  requireBytes(buffers.verifyRows, lanes * sizeof(uint32_t), "verify rows");
-  if (const uint64_t sampledLanes = std::bit_width(params.sampling_mask)) {
-    const uint64_t candidates = sampledLanes * kProposals * draftCandidates_;
-    requireBytes(buffers.candidates, candidates * sizeof(uint32_t), "draft candidate");
-    requireBytes(buffers.proposalProbabilities, candidates * sizeof(float), "draft probability");
-    requireBytes(buffers.targetVocabularyRows,
-                 ((sampledLanes - 1) * verifyRows_ + kProposals) * sizeof(TargetVocabularyRow),
-                 "target vocabulary row");
-    requireBytes(buffers.uniforms,
-                 ((sampledLanes - 1) * SPLASH_SAMPLING_UNIFORMS + SPLASH_UNIFORM_ACCEPTANCE + kProposals) *
-                     sizeof(float),
-                 "acceptance uniform");
-  }
-  params.proposal_tokens = static_cast<uint32_t>(kProposals);
-  params.verify_rows = verifyRows_;
-  graph.add(draftCandidates_ == 32 ? "decode_accept_dflash_k32"
-                                   : "decode_accept_dflash",
-            {buffers.proposedTokens, buffers.candidates,
-             buffers.proposalProbabilities, buffers.targetVocabularyRows,
-             buffers.uniforms, buffers.outputTokens, buffers.retainedCounts,
-             buffers.acceptedCounts, buffers.verifyRows},
+  requireBytes(buffers.retainedRows, lanes * sizeof(uint32_t), "retained rows");
+  requireBytes(buffers.laneRows, lanes * sizeof(LaneRows), "lane rows");
+  graph.add("decode_accept_tree",
+            {buffers.inputTokens, buffers.treeRows, buffers.outputTokens, buffers.retainedCounts,
+             buffers.acceptedCounts, buffers.retainedRows, buffers.laneRows},
             params, {lanes, 1, 1}, {1, 1, 1});
 }
 

@@ -36,7 +36,7 @@ void run(metal::MetalBackend &backend, uint32_t window, bool rotated, uint32_t l
   const auto qkv = allocate(count * shape.qkvSize * 2);
   const auto queries = allocate(plan.workspace().groupedQueriesBytes);
   const auto saved = allocate(count * Width * 2);
-  const auto reordered = allocate(count * Width * 2);
+  const auto laneRows = allocate(lanes * sizeof(SplashLaneRows));
   const auto queryKeys = allocate(plan.workspace().queryKeysBytes);
   const auto queryValues = allocate(plan.workspace().queryValuesBytes);
   const auto norm = allocate(Dim * 2);
@@ -59,7 +59,8 @@ void run(metal::MetalBackend &backend, uint32_t window, bool rotated, uint32_t l
     values[lane] = allocate(uint64_t{window} * KvWidth * 2);
     positions[lane] = 2 * window + 31 + lane;
     lengths[lane] = positions[lane] + Rows;
-    static_cast<uint32_t *>(retained.contents())[lane] = Rows;
+    static_cast<uint32_t *>(retained.contents())[lane] = (1u << Rows) - 1;
+    static_cast<SplashLaneRows *>(laneRows.contents())[lane] = {lane * Rows, Rows};
   }
   for (uint32_t lane = lanes; lane < 4; ++lane) {
     keys[lane] = keys[lanes - 1];
@@ -68,9 +69,8 @@ void run(metal::MetalBackend &backend, uint32_t window, bool rotated, uint32_t l
   metal::CommandGraph graph;
   ops::DraftAttention::addPrepare(graph, {qkv, queries, norm, norm, cosine, sine, queryKeys, queryValues}, plan);
   ops::RowCopy::add(graph, queries, {0, Width, 0}, saved, {0, Width, 0}, count, Width);
-  ops::DraftAttention::addContextCommit(graph, context, norm, cosine, sine, keys, values, retained, positions, shape);
+  ops::DraftAttention::addContextCommit(graph, context, norm, cosine, sine, keys, values, retained, laneRows, positions, {lanes, lanes * Rows, Rows}, shape);
   ops::DraftAttention::addDecode(graph, {queries, keys, values, queryKeys, queryValues}, lengths, plan);
-  ops::DraftAttention::addReorder(graph, queries, reordered, plan);
   static_cast<void>(backend.submitCommandAsync(graph.dispatches()).wait());
 
   for (uint32_t lane = 0; lane < lanes; ++lane)
@@ -145,11 +145,9 @@ void run(metal::MetalBackend &backend, uint32_t window, bool rotated, uint32_t l
                 : value(queryValues, ((uint64_t{lane} * KvHeads + kvHead) * Dim + dim) * Rows + token - old);
             expected += scores[token] / mass * v;
           }
-          const float got = value(queries, query + dim);
+          const float got = value(queries, (uint64_t{lane} * Rows + row) * Width + head * Dim + dim);
           require(std::isfinite(got) && std::fabs(got - expected) < 0.00005 + 0.03 * std::fabs(expected),
                   "draft attention diverged from its retained-history reference");
-          require(value(reordered, (uint64_t{lane} * Rows + row) * Width + head * Dim + dim) == got,
-                  "sixteen-row draft reorder crossed a lane boundary");
         }
       }
 }

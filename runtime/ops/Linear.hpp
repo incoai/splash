@@ -3,6 +3,7 @@
 #include "metal/DeviceCapabilities.hpp"
 #include "metal/CommandGraph.hpp"
 #include "metal/abi/ExecutionGeometry.h"
+#include "metal/abi/Gguf.h"
 #include "ops/KernelCalibration.hpp"
 #include "ops/Weights.hpp"
 
@@ -66,62 +67,74 @@ struct LinearMatrix final {
 // (Projection::leadingInputs), or of its inputSize when that is 0.
 void requireSegmentPlanes(const QuantizedSegment &segment, std::string_view what, uint32_t planeInputs = 0);
 
-enum class LinearPhase : uint8_t { Prefill, Decode };
-enum class LinearEpilogue : uint8_t {
-  None,
-  Residual,
-  GateUp,
-  UpWithGate,
-  // The gated product with both activations clamped at the dispatch's
-  // clamp (a family whose SwiGLU clamps): the decode pair's up pass and
-  // the prefill up pass read the unclamped gate scratch and clamp as they
-  // apply it. The one-pass gate/up pair does not run clamped: its two-pass
-  // fallback's scratch costs a gated intermediate's round trip.
-  ClampedGateUp,
-  ClampedUpWithGate
-};
+// A gate/up pair runs as one plan, GateUp, on the decode tiles; past them, as
+// a gate plan and an up plan that applies silu(gate), UpWithGate
+// (Linear::addSwiGlu), which the column tile does not run.
+enum class LinearEpilogue : uint8_t { None, Residual, GateUp, UpWithGate, ClampedGateUp, ClampedUpWithGate };
 // The tiles run 64 columns per threadgroup; a one-pass gate/up
 // (LinearConfig::oneGateUpPass) runs 32 columns of both tensors per
 // threadgroup of one simdgroup. The staged tiles, GgufStaged and GgufPrefill,
 // dequantize the weights into threadgroup memory for matmul2d.
-// GgufStaged: the two-simdgroup staged tile of 8, 16 or 32 rows (decode, and
-// prefill chunks of up to 32 rows, or the 64-row tile up to
-// ProjectionCalibration::stagedPrefillRows), each simdgroup staging its own
-// columns, with optional K splits. GgufPrefill: the 128-row shared-stage
-// prefill tile (64 rows under LinearConfig::prefill64Rows).
+// GgufStaged: the two-simdgroup staged tile of 8, 16, 32, 48 or 64 rows, each
+// simdgroup staging its own columns, with optional K splits. GgufPrefill: the
+// 128-row shared-stage prefill tile.
 // GgufRegister: the exact register tile on bf16 8x8 matrix operations
-// (Apple9), over an activation table, every request lane in one threadgroup,
-// optional K splits.
-// GgufPrefillInt8: prefill chunks of MLX affine 4- and 5-bit g64 weights
-// (quant_prefill_int8_format) in int8 activations, quantized per row and
-// 64-input group into the scratch table, against the weights' exact codes
+// (Apple9), over an activation table, all the plan's rows in one threadgroup,
+// up to kMaximumRegisterRows, optional K splits.
+// GgufPrefillInt8: plans past the decode tiles of MLX affine 4- and 5-bit g64
+// weights (quant_prefill_int8_format) in int8 activations, quantized per row
+// and 64-input group into the scratch table, against the weights' exact codes
 // (kernels/prefill/gguf_prefill_int8.metal); not exact, unsplit, the prefill
 // tile's storage rows.
-enum class LinearTile : uint8_t { GgufStaged, GgufPrefill, GgufRegister, GgufPrefillInt8 };
-// The decode tiles hold at most a full decode batch.
-inline constexpr uint32_t kMaximumDecodeTileRows =
-    SPLASH_MAXIMUM_BATCH_WIDTH * SPLASH_DRAFT_BLOCK_ROWS_LIMIT;
-// The staged tile's tallest height, which holds prefill chunks of up to this
-// many rows (ProjectionCalibration::stagedPrefillRows).
-inline constexpr uint32_t kMaximumStagedPrefillRows = 64;
-// The staged decode tile that holds `rows` rows: MPP computes 16-row
-// fragments, so the tile holds 8, 16 or 32 rows and a three-lane step runs
-// the 32-row tile over four lanes of storage (a one-lane step may run the
-// 16-row tile over two, LinearConfig::sixteenRows); a prefill chunk of 33 to
-// 64 rows runs the 64-row tile.
-[[nodiscard]] constexpr uint32_t stagedTileRows(uint32_t rows) noexcept {
-  return rows <= 8 ? 8 : rows <= 16 ? 16 : rows <= 32 ? 32 : 64;
+// GgufColumn: a plan of at most GGUF_COLUMN_ROWS rows as a GEMV in registers,
+// each lane one column, reading those rows alone
+// (kernels/decode/linear_gguf_column.metal); unsplit across threadgroups, a
+// gate/up pair of one format in one pass.
+enum class LinearTile : uint8_t { GgufStaged, GgufPrefill, GgufRegister, GgufPrefillInt8, GgufColumn };
+// The decode tiles (the staged tile's 8- to 64-row heights, the register and
+// column tiles) hold a plan of up to 64 rows, a decode step of four lanes of
+// 16; a plan of more rows runs the prefill tiles (selectProjection).
+inline constexpr uint32_t kMaximumDecodeTileRows = 64;
+// The register tile computes its rows in groups of an activation table's tile
+// (Table16, metal/abi/Gguf.h): a plan of r rows stores ⌈r / 8⌉ of them, at
+// most four (its kernels' lanes), so it holds plans of up to 32 rows.
+[[nodiscard]] constexpr uint32_t tableTiles(uint32_t rows) noexcept {
+  return (rows + GGUF_TABLE16_ROWS - 1) / GGUF_TABLE16_ROWS;
 }
-// The rows a staged plan of `rows` rows stores: its tile's, or 16 for one
-// lane on the 16-row tile (LinearConfig::sixteenRows).
-[[nodiscard]] constexpr uint32_t stagedStorageRows(uint32_t rows, bool sixteenRows) noexcept {
-  return sixteenRows ? 16 : stagedTileRows(rows);
+inline constexpr uint32_t kMaximumRegisterRows = SPLASH_MAXIMUM_BATCH_WIDTH * GGUF_TABLE16_ROWS;
+// A one-pass gate/up pair's simdgroup holds both tensors' sums of every row:
+// up to 32 rows (kernels/shared/gguf_linear.metal); a plan of more runs the
+// pair in two passes.
+inline constexpr uint32_t kMaximumPairRows = 64;
+// The int8 decode tiles' simdgroups hold their int32 and fp32 sums of every
+// row up to 32 rows; a plan of more keeps bf16 activations on the staged tile
+// (kernels/shared/gguf_linear.metal).
+inline constexpr uint32_t kMaximumInt8Rows = 64;
+// Keep the automatic policy at the upstream calibrated width; wider tiles
+// remain available to explicit plans and their numerical qualification.
+inline constexpr uint32_t kMaximumInt8PolicyRows = 32;
+// The staged tile that holds `rows` rows: MPP computes 16-row fragments, so
+// the tile holds 8, 16, 32, 48 or 64 rows, the fewest that hold the plan's (24
+// rows run the 32-row tile, 40 the 48-row tile; a plan of at most 8 may run
+// the 16-row tile, LinearConfig::sixteenRows).
+[[nodiscard]] constexpr uint32_t stagedTileRows(uint32_t rows) noexcept {
+  return rows <= 8 ? 8 : rows <= 16 ? 16 : rows <= 32 ? 32 : rows <= 48 ? 48 : 64;
+}
+// The rows a staged plan of `rows` rows stores: its tile's, or 16 for a plan
+// on the 16-row tile (LinearConfig::sixteenRows) or on the int8 tiles, whose
+// heights are 16, 32 and 64 (LinearConfig::decodeInt8).
+[[nodiscard]] constexpr uint32_t stagedStorageRows(uint32_t rows, bool sixteenRows, bool decodeInt8 = false) noexcept {
+  if (decodeInt8) return rows <= 16 ? 16 : rows <= 32 ? 32 : 64;
+  return sixteenRows ? std::max(16u, stagedTileRows(rows)) : stagedTileRows(rows);
 }
 
+// `rows` rows of a matrix through an epilogue. The rows pick the plan's tile
+// (selectProjection), whatever computes them: a plan stores at least its rows
+// (LinearPlan::storageRows), and the rows past them are padding that its tiles
+// may compute and no reader reads.
 struct LinearWorkload final {
   LinearMatrix matrix;
   uint32_t rows = 0;
-  LinearPhase phase = LinearPhase::Decode;
   LinearEpilogue epilogue = LinearEpilogue::None;
   auto operator<=>(const LinearWorkload &) const = default;
 };
@@ -136,18 +149,20 @@ struct LinearConfig final {
   // own step (kernels/common/gguf_staged_tile.h) instead of every tile at the
   // partition's first; no other tile spreads.
   bool spread = false;
-  // GgufStaged gate/up decode: gate and up in one dispatch whose simdgroups
-  // each stage both tensors' 32 columns (gguf_decode_<format>_m<rows>_gate_up,
-  // gate and up in one format), instead of a gate pass and an up pass.
+  // GgufStaged gate/up on a decode tile: gate and up in one dispatch whose
+  // simdgroups each stage both tensors' 32 columns
+  // (gguf_decode_<format>_m<rows>_gate_up, gate and up in one format), instead
+  // of a gate pass and an up pass; a GgufColumn gate/up always.
   bool oneGateUpPass = false;
-  // GgufStaged one-lane decode: the 16-row tile over two lanes of storage
-  // (LinearPlan::storageRows), whose padding lane's rows it computes and
-  // discards, instead of the 8-row tile.
+  // GgufStaged plan of at most 8 rows: the 16-row tile (LinearPlan::
+  // storageRows), whose padding rows it computes and discards, instead of the
+  // 8-row tile.
   bool sixteenRows = false;
-  // GgufStaged decode of rotated PQ2_0 segments in int8 activations: the
-  // rotated input as int8 rows, one scale per row and rotation block
-  // (gguf_rotate_int8), into the int8 tiles (gguf_decode_int8_pq20_m<rows>_*)
-  // at the plan's storage rows, splits, spread and passes.
+  // GgufStaged plan on a decode tile of rotated PQ2_0 segments in int8
+  // activations: the rotated input as int8 rows, one scale per row and
+  // rotation block (gguf_rotate_int8), into the int8 tiles
+  // (gguf_decode_int8_pq20_m<rows>_*) at the plan's storage rows, splits,
+  // spread and passes.
   bool decodeInt8 = false;
   // GgufPrefill: four 16-row simdgroups instead of four 32-row ones.
   // Storage keeps its 128-row extent; twice as many 64-row tiles run.
@@ -158,7 +173,7 @@ struct LinearConfig final {
   bool operator==(const LinearConfig &) const = default;
 };
 
-// Reused serially within one decode command stream. Counters are zeroed at
+// Reused serially within one command stream. Counters are zeroed at
 // allocation and restored by each completed split dispatch. Never share this
 // workspace between concurrent command streams.
 struct LinearScratch final {
@@ -169,7 +184,7 @@ struct LinearScratch final {
   metal::MetalBuffer partials;
   metal::MetalBuffer counters;
   // The bf16 input rows a rotated projection's quantized segments read
-  // (ProjectionShape::rotated), sized by decode/prefillScratchSize(shape).rotated.
+  // (ProjectionShape::rotated), sized by scratchSize(shape, rows).rotated.
   metal::MetalBuffer rotated{};
 };
 // One layer's SwiGLU projections, optionally clamping gate above and up on
@@ -199,8 +214,8 @@ struct LinearScratchSize final {
   }
 };
 
-// The activation layout a decode plan reads: the producer's bf16 rows, or an
-// X^T table with fp32 row sums in LinearScratch that a producer can emit
+// The activation layout a plan reads: the producer's bf16 rows, or an X^T
+// table with fp32 row sums in LinearScratch that a producer can emit
 // alongside its ordinary output; or the int8 prefill tile's codes, which only
 // that tile writes, for a next plan over the same rows (a SwiGLU's up after
 // its gate).
@@ -215,8 +230,9 @@ enum class LinearInput : uint8_t {
 }
 [[nodiscard]] uint64_t tableSumsBytes(LinearInput layout, uint32_t width, uint64_t rows) noexcept;
 // Throws unless `scratch` holds the `layout` table a producer writes for `rows`
-// rows of `width` inputs: a table layout, whole lanes of rows and whole
-// 64-input spans.
+// rows of `width` inputs: a table layout, whole 64-input spans, and the table
+// tiles that hold the rows (tableTiles), whose padding rows no producer
+// writes.
 void requireTableScratch(const LinearScratch &scratch, LinearInput layout, uint32_t width, uint32_t rows);
 // The kernel name suffix of a producer that writes the `layout` table:
 // "_table16", or none for Plain.
@@ -290,31 +306,23 @@ public:
   // The plan of `workload` for the projection, into its destination type; a gate/up plan also runs `gate`.
   [[nodiscard]] LinearPlan plan(LinearWorkload workload, const Projection &projection,
                                 const Projection *gate = nullptr) const;
-  // Rows of storage a decode step of `rows` rows binds for a projection of
-  // `shape`: the most storageRows of its decode plans, a one-pass gate/up
-  // pair's among them.
-  [[nodiscard]] uint32_t decodeStorageRows(uint32_t rows, ProjectionShape shape) const;
-  // The plans of this projection's matrix. A decode plan's input() is the
-  // layout its producer writes. A prefill plan of `rows` rows of a chunk of
-  // `chunkRows` (0: `rows`) takes the chunk's tile kind and K splits, at the
-  // staged height of its own rows, which compute each row as the chunk's plan
-  // does.
-  [[nodiscard]] LinearPlan prefillPlan(const Projection &projection, uint32_t rows,
-                                       LinearEpilogue epilogue, uint32_t chunkRows = 0) const;
-  [[nodiscard]] LinearPlan decodePlan(const Projection &projection, uint32_t lanes,
-                                      LinearEpilogue epilogue = LinearEpilogue::None,
-                                      const Projection *gate = nullptr,
-                                      uint32_t rows = 0) const;
-  // The scratch of every decode plan of a projection of `shape`: each lane
-  // count, the None, Residual and GateUp epilogues and every tile the device
-  // may run them on, and the rotated rows of a full decode batch.
-  [[nodiscard]] LinearScratchSize decodeScratchSize(ProjectionShape shape, uint32_t rowsPerLane = SPLASH_TARGET_VERIFY_ROWS) const;
-  // The scratch of every prefill chunk and epilogue of a projection of
-  // `shape`: the split partials and counters of the chunks that run the
-  // staged tile (LinearGguf.cpp), the rotated rows of a full chunk, and where
-  // the device runs the int8 prefill tile on the shape's formats, its codes
-  // and scales of a full chunk.
-  [[nodiscard]] LinearScratchSize prefillScratchSize(ProjectionShape shape) const;
+  // The projection's plan of `rows` rows (its input() the layout its
+  // producer writes); a gate/up plan also runs `gate`. A plan of `rows` rows
+  // of a chunk of `chunkRows` (0: `rows`) takes the chunk's configuration at
+  // its own rows' height, which computes each row as the chunk's plan does.
+  [[nodiscard]] LinearPlan plan(const Projection &projection, uint32_t rows,
+                                LinearEpilogue epilogue = LinearEpilogue::None, const Projection *gate = nullptr,
+                                uint32_t chunkRows = 0) const;
+  // Rows of storage a step of `rows` rows binds for a projection of `shape`:
+  // the most storageRows of its plans, a one-pass gate/up pair's among them.
+  [[nodiscard]] uint32_t storageRows(uint32_t rows, ProjectionShape shape) const;
+  // The scratch of every plan of up to `rows` rows of a projection of
+  // `shape`, every epilogue and every tile the device may run them on: the
+  // register tile's table and the split partials and counters of the decode
+  // and staged tiles, the rotated rows of `rows` rows, and where the device
+  // runs the int8 prefill tile on the shape's formats, its codes and scales of
+  // `rows` rows.
+  [[nodiscard]] LinearScratchSize scratchSize(ProjectionShape shape, uint32_t rows, bool clampedGateUp = false) const;
   // The tile of a float projection of `rows` rows into `outputSize` columns
   // of rows in `formatId` (QuantizedSegment::rows) on this device
   // (selectFloatTile).
@@ -329,22 +337,26 @@ public:
                     const Projection *gate = nullptr) const;
 
   // The projections of `rows` rows through their own matrix, on the plans of
-  // a chunk of `chunkRows` rows (prefillPlan). `scratch` holds the partials
-  // and counters of split plans (the chunks the staged tile runs,
-  // ProjectionCalibration::stagedPrefillRows); reused serially within one
-  // command stream, as in decode.
-  void addPrefill(metal::CommandGraph &graph, metal::MetalBuffer input, const Projection &projection,
-                  metal::MetalBuffer output, uint32_t rows, LinearScratch scratch = {},
-                  uint32_t chunkRows = 0) const;
-  void addPrefillResidual(metal::CommandGraph &graph, metal::MetalBuffer input, const Projection &projection,
-                          metal::MetalBuffer residual, metal::MetalBuffer output, uint32_t rows,
-                          LinearScratch scratch, uint32_t chunkRows = 0) const;
-  // output = residual + down(silu(gate x) * up x) of `rows` normalized rows;
-  // an empty residual leaves just the down projection. Up takes what gate's
-  // plan leaves of x in the scratch table; ffn.clamp applies before SwiGLU.
-  void addPrefillSwiGlu(metal::CommandGraph &graph, const SwiGluProjections &ffn, const PrefillFfnBuffers &buffers,
-                        metal::MetalBuffer residual, metal::MetalBuffer output, uint32_t rows,
-                        uint32_t chunkRows = 0) const;
+  // a chunk of `chunkRows` rows (plan). `scratch` holds what the plans need
+  // beside their buffers: a table they prepare, partials and counters of a
+  // split; reused serially within one command stream.
+  void addProjection(metal::CommandGraph &graph, metal::MetalBuffer input, const Projection &projection,
+                     metal::MetalBuffer output, uint32_t rows, LinearScratch scratch = {},
+                     uint32_t chunkRows = 0) const;
+  void addResidualProjection(metal::CommandGraph &graph, metal::MetalBuffer input, const Projection &projection,
+                             metal::MetalBuffer residual, metal::MetalBuffer output, uint32_t rows,
+                             LinearScratch scratch, uint32_t chunkRows = 0) const;
+  // output = residual + down(silu(gate x) * up x) of `rows` normalized rows:
+  // one gate/up plan where the chunk's rows run the decode tiles, otherwise a
+  // gate plan and an up plan that takes what gate's plan leaves of x in the
+  // scratch table; `normalized` describes what its producer wrote of the
+  // first plan's input (swiGluInput).
+  void addSwiGlu(metal::CommandGraph &graph, const SwiGluProjections &ffn, const PrefillFfnBuffers &buffers,
+                 metal::MetalBuffer residual, metal::MetalBuffer output, uint32_t rows, uint32_t chunkRows = 0,
+                 PreparedInput normalized = {}) const;
+  // The layout the producer of a SwiGLU's normalized rows writes for its first
+  // plan (addSwiGlu).
+  [[nodiscard]] LinearInput swiGluInput(const SwiGluProjections &ffn, uint32_t rows, uint32_t chunkRows = 0) const;
 
 private:
   // The partials and counters a dispatch of `splits` K partitions binds: the
@@ -367,6 +379,8 @@ private:
   void addGgufRegister(metal::CommandGraph &graph, const LinearBuffers &buffers,
                        const Projection &projection, const LinearPlan &plan,
                        const Projection *gate) const;
+  void addGgufColumn(metal::CommandGraph &graph, const LinearBuffers &buffers, const Projection &projection,
+                     const LinearPlan &plan, const Projection *gate) const;
   void addGgufFloatSegments(metal::CommandGraph &graph, const LinearBuffers &buffers,
                             const Projection &projection, const LinearPlan &plan) const;
   KernelCalibration calibration_;

@@ -142,11 +142,12 @@ inline void project(device const bfloat *input, FloatProjection<T> projection, c
     const auto b0 = next[0].values(), b1 = next[1].values();
     if (step + 1 < last) load(step + 1, next);
     const uint run = step * 8 + l.fn;
+    // Fragments past the live rows are skipped with continue, not ended with break: after a break the later fragments'
+    // MMAs sit under a loop exit the compiler cannot prove uniform (live is the same across the threadgroup, which it
+    // cannot know), and there one of a simdgroup's sums for the last fragment came out zero or another fragment's under
+    // shader validation (gguf-moe float-stress).
 #pragma unroll
     for (uint f = 0; f < kFragments; ++f) {
-      // Independent guards keep the four fragment indices unrolled. The
-      // early-exit form corrupts native-row MMA results under M5 shader
-      // validation once all 32 rows are active.
       if (f * 8 >= live) continue;
       const uint row = f * 8 + l.fm;
       device const uchar *x = reinterpret_cast<device const uchar *>(input + ulong(row0 + row) * K);
