@@ -180,10 +180,47 @@ QUANT_FORMATS(GGUF_DECODE_FORMAT)
 #undef GGUF_DECODE_ROWS
 #undef GGUF_DECODE
 
+// A wide pair gives each simdgroup one tensor rather than sharing both
+// accumulators. The gate's rounded values meet the up's only at the store;
+// the 64-row Q4_K/Q5_K pair takes about 11% less time on a 40-core M5 Max.
+template <ushort Rows, bool Clamped, class Acc>
+inline void gguf_store_pair_tensor(thread Acc &acc, uint splits, uint split,
+                                   device coherent(device) float *partials, device atomic_uint *counter,
+                                   uint stride, uint column0, uint thread_index, threadgroup uint *arrival,
+                                   threadgroup float *gate, device bfloat *output, float clamp) {
+  const uint tensor = thread_index / 32;
+  const auto at = [=](uint s, uint row, uint column) {
+    return (ulong(s) * Rows + row) * (2 * stride) + column0 + column + tensor * stride;
+  };
+  if (splits > 1) {
+    gguf_elements(acc, [=](uint row, uint column, float value) { partials[at(split, row, column)] = value; });
+    if (!split_arrive_last(counter, splits, thread_index, arrival)) return;
+#pragma unroll
+    for (ushort i = 0; i < acc.get_capacity(); ++i) {
+      if (!acc.is_valid_element(i)) continue;
+      const auto index = acc.get_multidimensional_index(i);
+      acc[i] = split_sum(float(acc[i]), split, splits,
+                          [=](uint s) { return partials[at(s, index[1], index[0])]; });
+    }
+  }
+  if (!tensor)
+    gguf_elements(acc, [=](uint row, uint column, float value) {
+      gate[row * GGUF_STAGED_COLUMNS + column] = float(bfloat(value));
+    });
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (tensor)
+    gguf_elements(acc, [=](uint row, uint column, float value) {
+      float g = gate[row * GGUF_STAGED_COLUMNS + column], u = float(bfloat(value));
+      if constexpr (Clamped) { g = min(g, clamp); u = metal::clamp(u, -clamp, clamp); }
+      output[ulong(row) * stride + column0 + column] = bfloat(u * splash_silu(g));
+    });
+  if (splits > 1) split_release(counter, thread_index);
+}
+
 // Gate/up in one dispatch, where gate and up share their format (ops::Linear, LinearConfig::oneGateUpPass): grid
-// (32-column tiles, K partitions). Each simdgroup holds at most 1024 values of each accumulator; the first stages
-// both tensors' 32 columns
-// (gguf_staged_pair_steps), so the per-step latency of a tile's chain serves both tensors. Each walks from the step its
+// (32-column tiles, K partitions). Up to 32 rows, one simdgroup stages both tensors' 32 columns
+// (gguf_staged_pair_steps), so the per-step latency of a tile's chain serves both tensors. At 64 rows, each of the
+// two simdgroups owns one tensor and meets the other at the final store. Each walks from the step its
 // 64-column tile walks from in the two passes, so at the same K split gate and up are the bits of the gate pass's and
 // of the up pass's sums, and the output is bf16(up) * silu(bf16(gate)) as the up pass writes it (gguf_store_gate_up).
 template <class F, ushort Rows, bool Clamped = false>
@@ -197,6 +234,24 @@ kernel void gguf_decode_gate_up(device bfloat *input [[buffer(0)]], device uchar
   constexpr ushort Simdgroups = gguf_gate_up_simdgroups(Rows);
   threadgroup half2 tl[F::Kind == QuantCodebook ? kQuantPairTableEntries : 1];
   quant_pair_table<F>(tl, thread_index, Simdgroups * GGUF_GATE_UP_THREADS);
+  if constexpr (Rows == 64) {
+    threadgroup half stages[kStagedStages];
+    threadgroup float gateValues[Rows * GGUF_STAGED_COLUMNS];
+    threadgroup uint arrival;
+    const uint tensor = thread_index / 32, lane = thread_index % 32;
+    const uint per = p.input_size / GGUF_STAGED_STEP / p.splits, sb = group.y * per, se = sb + per,
+               origin = group.x * GGUF_STAGED_COLUMNS, column0 = p.out_offset + origin;
+    threadgroup half *stage = stages + tensor * kStagedSimdgroupStage;
+    auto acc = staged_accumulator<Rows, GGUF_STAGED_COLUMNS, GGUF_STAGED_STEP>(input, p.input_size, stage);
+    gguf_zero(acc);
+    staged_accumulate<F, Rows, GGUF_STAGED_COLUMNS, GGUF_STAGED_STEP>(
+        input, tensor ? uw0 : gw0, tensor ? uw1 : gw1, tensor ? umeta : gmeta, p.input_size, origin,
+        stage, tl, lane, sb, se, staged_first_step(group.x / 2, sb, se, p.spread), acc);
+    gguf_store_pair_tensor<Rows, Clamped>(acc, p.splits, group.y, partials,
+        counters + column0 / GGUF_STAGED_COLUMNS, p.out_stride, column0, thread_index, &arrival,
+        gateValues, output, p.clamp);
+    return;
+  }
   threadgroup half stage[2 * GGUF_STAGED_COLUMNS * GGUF_STAGED_STEP];
   threadgroup uint arrival;
   const uint per = p.input_size / GGUF_STAGED_STEP / p.splits, sb = group.y * per, se = sb + per,
