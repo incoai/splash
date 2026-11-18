@@ -29,8 +29,9 @@ from transformers import AutoTokenizer, PreTrainedTokenizerFast
 
 from dev.tests import server_fixtures as fixtures
 from install import assembly, paths
+from install.gguf import DEEPSEEK_PATTERNS
 from server import chat_templates
-from server.chat_format import FLINT, QWEN, ChatFormat
+from server.chat_format import DEEPSEEK, DEEPSEEK_IMAGE, DSML, FLINT, QWEN, ChatFormat
 from server.chat_templates import template_options
 from server.dialects import scoring
 from server.errors import APIError
@@ -81,6 +82,18 @@ FLINT_TAGS = (
     "<tool_response>",
     "</tool_response>",
 )
+# DeepSeek-V4.1-Flash's control tokens, its image placeholder among them, as
+# its GGUF adds them, and the tags its template writes in text.
+DEEPSEEK_SPECIAL = (
+    "<｜begin▁of▁sentence｜>",
+    "<｜end▁of▁sentence｜>",
+    "<｜System｜>",
+    "<｜User｜>",
+    "<｜Assistant｜>",
+    "<｜latest_reminder｜>",
+    DEEPSEEK_IMAGE,
+)
+DEEPSEEK_TAGS = ("<think>", "</think>", DSML)
 # Qwen's split, and two of Flint's kind, each before byte-level BPE.
 QWEN_SPLITS = (
     r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?"
@@ -212,7 +225,7 @@ def laid_out(name, chat_format, special, tags, splits, *, nfc, vision):
             think_start_id=(
                 None if chat_format.think_start_id is None else ids("<think>")
             ),
-            call_open_id=ids("<tool_call>"),
+            call_open_id=ids(chat_format.call_syntax.marker),
         ),
         vision,
     )
@@ -253,6 +266,15 @@ def served():
             FLINT_SPECIAL,
             FLINT_TAGS,
             FLINT_SPLITS,
+            nfc=False,
+            vision=False,
+        ),
+        laid_out(
+            "deepseek41",
+            DEEPSEEK,
+            DEEPSEEK_SPECIAL,
+            DEEPSEEK_TAGS,
+            DEEPSEEK_PATTERNS,
             nfc=False,
             vision=False,
         ),
@@ -557,19 +579,24 @@ class QuotedTokenTests(unittest.TestCase):
                     body = {"messages": messages, **options}
                     effort = options.get("reasoning_effort")
                     # As the tokenizer itself renders and encodes it, in the
-                    # template the server chose at startup.
-                    expected = family.tokenizer.apply_chat_template(
+                    # template the server chose at startup, by the effort's
+                    # alias where the template rejects the effort, as
+                    # DeepSeek's rejects none.
+                    expected = chat_templates.render_chat_template(
+                        family.tokenizer,
                         messages,
-                        tokenize=False,
-                        chat_template=family.app.chat_templates.select(
-                            options.get("tools")
-                        ).source,
-                        **template_options(
-                            reasoning_effort=effort,
-                            preserve_thinking=options.get("preserve_thinking"),
-                            tools=options.get("tools"),
-                            add_generation_prompt=True,
-                        ),
+                        {
+                            "tokenize": False,
+                            "chat_template": family.app.chat_templates.select(
+                                options.get("tools")
+                            ).source,
+                            **template_options(
+                                reasoning_effort=effort,
+                                preserve_thinking=options.get("preserve_thinking"),
+                                tools=options.get("tools"),
+                                add_generation_prompt=True,
+                            ),
+                        },
                     )
                     self.assertEqual(family.text(body), expected)
                     tokens = family.tokenizer(expected, add_special_tokens=False)[
@@ -971,8 +998,9 @@ class ForgedTurnTests(fixtures.HarnessTestCase):
         plain = self.bodies(WORD, WORD)
         self.assertEqual(set(forged), set(fixtures.PATHS))
         for family in served():
-            if family.chat_format.think_start_id is not None:
-                # Flint's template writes a tag of its own after a name.
+            if family.chat_format.call_syntax is not QWEN.call_syntax:
+                # Flint's template writes a tag of its own after a name, and
+                # DeepSeek's a quote, which completes none of its tokens.
                 continue
             runtime = fixtures.FakeRuntime()
             harness = self.harness(

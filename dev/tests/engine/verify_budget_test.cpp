@@ -286,6 +286,31 @@ void fitsTheLabels() {
               " against " + std::to_string(cold.intercepts[0]) + ")");
 }
 
+// A draft's own prior (DSpark's): both policies' models start from it, and
+// their refits are held to it, not to kPrior: a handful of labels stays near
+// it.
+void aDraftsOwnPrior() {
+  VerifyBudget budget(VerifyBudget::kDSparkPrior);
+  require(budget.acceptance(false) == VerifyBudget::kDSparkPrior &&
+              budget.acceptance(true) == VerifyBudget::kDSparkPrior,
+          "the budget did not start from its prior");
+  VerifyBudget::Lane lane{false, {}};
+  for (uint32_t position = 0; position < 3; ++position)
+    lane.labels.push_back({position, 0.4F, position == 0});
+  for (uint32_t cycle = 0; cycle < VerifyBudget::kRefitCycles; ++cycle) budget.observe(std::array{lane});
+  const auto labels = budget.labels(false);
+  require(budget.acceptance(false) ==
+                  VerifyBudget::fit(labels, VerifyBudget::kDSparkPrior, VerifyBudget::kDSparkPrior) &&
+              budget.acceptance(false) != VerifyBudget::fit(labels, VerifyBudget::kDSparkPrior),
+          "the refit was not held to the budget's prior");
+  require(budget.acceptance(true) == VerifyBudget::kDSparkPrior, "a greedy refit moved the sampled lanes' model");
+  const std::vector<VerifyBudget::Label> few{{0, 2.0F, false}, {1, -1.0F, true}, {0, 0.5F, true}};
+  const VerifyBudget::Acceptance shrunk =
+      VerifyBudget::fit(few, VerifyBudget::kDSparkPrior, VerifyBudget::kDSparkPrior);
+  require(std::fabs(shrunk.intercepts[2] - VerifyBudget::kDSparkPrior.intercepts[2]) < 0.05,
+          "a few labels moved an intercept they do not reach from the prior");
+}
+
 void invalidInputs() {
   VerifyBudget budget;
   const VerifyBudget::Lane lane;
@@ -1161,6 +1186,7 @@ int main() {
     treeLabelsOfAWalk();
     policiesFitApart();
     fitsTheLabels();
+    aDraftsOwnPrior();
     invalidInputs();
     replaysMedian();
     risingPoints();

@@ -26,7 +26,7 @@ if __name__ == "__main__" and not __package__:
     __package__ = "install"
 
 from server import serve_options
-from server.chat_format import FLINT, QWEN, ChatFormat
+from server.chat_format import DEEPSEEK, FLINT, QWEN, ChatFormat
 
 from . import models
 
@@ -46,6 +46,9 @@ QWEN_SAMPLING = SamplingDefaults(temperature=1.0, top_p=0.95, top_k=20)
 # What Flint's GGUF release states (general.sampling.temp, top_p, top_k),
 # which are Qwen's numbers.
 FLINT_SAMPLING = SamplingDefaults(temperature=1.0, top_p=0.95, top_k=20)
+# What DeepSeek publishes with its models: temperature 1.0, top_p 1.0, and no
+# top_k.
+DEEPSEEK_SAMPLING = SamplingDefaults(temperature=1.0, top_p=1.0, top_k=0)
 
 
 @dataclass(frozen=True)
@@ -55,8 +58,10 @@ class ModelFamily:
     name: str
     # The repository of the DFlash2 draft released for the family, as its
     # release publishes it (config.json and BF16 safetensors). Installations
-    # follow its default branch as they follow the target's.
-    draft_repo: str
+    # follow its default branch as they follow the target's. None while no
+    # draft is released for the family: an installation decodes without one
+    # unless --draft-model names one.
+    draft_repo: str | None
     # How the family's model reasons and calls tools, and the tokens it
     # shares with the engine (server/chat_format.py).
     chat_format: ChatFormat
@@ -66,6 +71,10 @@ class ModelFamily:
     # loads from the target repository unless --language-only. The models of
     # a family without one serve text only, whatever their repository holds.
     vision: bool = True
+    # Whether the family's drafts are DSpark GGUFs, the one dspark*.gguf file
+    # of a repository or a local file (DeepSeek-V4.1-Flash's own drafter),
+    # rather than DFlash2 checkpoints.
+    dspark: bool = False
 
 
 FAMILIES = (
@@ -86,6 +95,17 @@ FAMILIES = (
     ),
     # It has no vision tower.
     ModelFamily("Flint", "incoai/Flint-DFlash2", FLINT, FLINT_SAMPLING, vision=False),
+    # Splash serves its text alone, and an installation decodes without its
+    # DSpark drafter unless --draft-model names one (its 8 GB of weights
+    # beside the target's).
+    ModelFamily(
+        "DeepSeek-V4.1-Flash",
+        None,
+        DEEPSEEK,
+        DEEPSEEK_SAMPLING,
+        vision=False,
+        dspark=True,
+    ),
 )
 
 

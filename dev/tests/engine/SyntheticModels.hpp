@@ -65,10 +65,12 @@ inline PlannedModel plannedModel() {
 }
 
 // A model under root whose weights load, which nothing but the host
-// refuses: `name` names its descriptor and build.
+// refuses: `name` names its descriptor and build; without `draft`, installed
+// without its draft (--draft-model none).
 inline engine::RuntimeResourcesConfig loadableConfig(const char *metallibPath, const std::filesystem::path &root,
-                                                     const std::string &name) {
-  const PlannedModel planned = plannedModel();
+                                                     const std::string &name, bool draft = true) {
+  PlannedModel planned = plannedModel();
+  if (!draft) planned.draft = {};
   static_cast<void>(test::writeSyntheticModel(root, planned.target, planned.draft, planned.vision));
   engine::RuntimeResourcesConfig config;
   config.metallibPath = metallibPath;

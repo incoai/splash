@@ -1,4 +1,5 @@
 #include "ModelFactory.hpp"
+#include "model/DSparkDraft.hpp"
 #include "model/DraftCheckpoint.hpp"
 #include "model/ExpertStore.hpp"
 #include "model/GgufTarget.hpp"
@@ -12,6 +13,7 @@
 
 #include <array>
 #include <functional>
+#include <optional>
 #include <stdexcept>
 #include <string_view>
 #include <vector>
@@ -20,12 +22,12 @@ namespace splash::model {
 
 void requireCompatibleModel(const LoadedModel &model) {
   if (!model.descriptor.valid() ||
-      model.descriptor.draft != model.draft.layout ||
+      model.descriptor.draft != model.draft.layout || model.descriptor.draft.dspark() != model.dspark.has_value() ||
       !std::visit(
           [&](const auto &target) {
             return model.descriptor.target == TargetLayout{target.layout} &&
-                   target.layout.vocabularySize ==
-                       model.draft.layout.vocabularySize;
+                   (!model.draft.layout.present() ||
+                    target.layout.vocabularySize == model.draft.layout.vocabularySize);
           },
           model.target)) {
     throw std::invalid_argument(
@@ -63,6 +65,10 @@ TargetWeights readTarget(metal::MetalBackend &backend, const Qwen4ExpLayout &lay
 
 TargetWeights readTarget(metal::MetalBackend &backend, const FlintLayout &layout, const QwenTargetFiles &files) {
   return loadFlintWeights(backend, layout, files);
+}
+
+TargetWeights readTarget(metal::MetalBackend &backend, const DeepSeek41Layout &layout, const QwenTargetFiles &files) {
+  return loadDeepSeek41Weights(backend, layout, files);
 }
 
 } // namespace
@@ -117,15 +123,30 @@ TargetWeights loadTarget(metal::MetalBackend &backend, WeightImages &images, con
 
 QwenTargetGeometry plannedTargetGeometry(metal::MetalBackend &backend, const std::filesystem::path &root,
                                          const ModelDescriptor &descriptor, uint64_t streamedTableBytes,
-                                         std::shared_ptr<SsdReaders> readers) {
+                                         std::shared_ptr<SsdReaders> readers,
+                                         const ops::ExecutionPlans *operators) {
   if (!descriptor.valid()) throw std::invalid_argument("model descriptor is invalid");
   // Released before the first image, the images load reserved.
   WeightImages images(backend, descriptor.sourceIdentity);
   images.release();
   const TargetWeights target = loadTarget(backend, images, root, descriptor,
                                           {.streamedTableBytes = streamedTableBytes, .readers = std::move(readers)});
-  return std::visit(
+  QwenTargetGeometry geometry = std::visit(
       [&](const auto &weights) { return qwenTargetGeometry(weights, descriptor.draft.targetLayerIds()); }, target);
+  const auto *deepseek = std::get_if<DeepSeek41Weights>(&target);
+  if (operators && deepseek && descriptor.draft.dspark()) {
+    const std::optional<std::filesystem::path> path = findDSparkGguf(root / "draft");
+    const auto *layout = std::get_if<DeepSeek41Layout>(&descriptor.target);
+    if (!path || !layout) throw std::invalid_argument("a DSpark draft serves DeepSeek-V4.1 from its GGUF in draft/");
+    DSparkLayout dspark;
+    {
+      const OpenGguf file(std::vector<std::filesystem::path>{*path});
+      dspark = readDSparkLayout(file.file(), *layout);
+    }
+    const DSparkWeights weights = loadDSparkWeights(backend, images, *path, dspark);
+    geometry.draftScratchBytes = DSparkDraft::scratchBytes(weights, deepseek->logitsProjection, *operators);
+  }
+  return geometry;
 }
 
 LoadedModel loadModel(metal::MetalBackend &backend,
@@ -141,9 +162,31 @@ LoadedModel loadModel(metal::MetalBackend &backend,
   // Every source's metadata is checked before the first image is written:
   // the vision tower's and the draft's here, the target's by its loader.
   const auto vision = planVisionLoader(root, result.descriptor);
-  DraftCheckpointLoader draft(backend, images, root / "draft", result.descriptor.draft);
+  std::optional<DraftCheckpointLoader> draft;
+  if (result.descriptor.draft.dflash())
+    draft.emplace(backend, images, root / "draft", result.descriptor.draft);
   result.target = loadTarget(backend, images, root, result.descriptor, options);
-  result.draft = loadDFlashDraftWeights(backend, draft, result.descriptor.draft);
+  if (draft)
+    result.draft = loadDFlashDraftWeights(backend, *draft, result.descriptor.draft);
+  if (result.descriptor.draft.dspark()) {
+    // DSpark, every expert loading with its layer, its images the model's
+    // draft/ components.
+    const auto *target = std::get_if<DeepSeek41Layout>(&result.descriptor.target);
+    const std::optional<std::filesystem::path> path = findDSparkGguf(root / "draft");
+    if (!target || !path) throw std::invalid_argument("a DSpark draft serves DeepSeek-V4.1 from its GGUF in draft/");
+    DSparkLayout layout;
+    {
+      const OpenGguf file(std::vector<std::filesystem::path>{*path});
+      layout = readDSparkLayout(file.file(), *target);
+    }
+    if (dsparkDraftLayout(layout) != result.descriptor.draft)
+      throw std::invalid_argument("the DSpark GGUF in draft/ is not the draft the model was described with");
+    const uint64_t before = backend.memoryStats().allocatedBytes;
+    result.dspark.emplace(loadDSparkWeights(backend, images, *path, layout));
+    result.draft.layout = result.descriptor.draft;
+    result.draft.files = result.dspark->files;
+    result.draft.actualAllocatedBytes = metal::allocationDelta(before, backend.memoryStats().allocatedBytes);
+  }
   result.vision = loadVisionWeights(backend, images, vision.get());
 
   std::vector<WeightFileRecord> records(result.targetFiles().begin(),

@@ -1211,6 +1211,104 @@ void testAReplyCaptureAfterTheWarmupsCreatesNothing(const char *metallibPath) {
           "a cycle that captured a reply's state after the start's warmups created pipelines: " + log);
 }
 
+// A model installed without a draft (--draft-model none) starts, warms up and
+// decodes, its cycles verifying each lane's anchor and the chain its prompt
+// proposes: a prompt that repeats a run of tokens proposes the run's
+// continuation, which its lane verifies beside its anchor. Greedy and sampled
+// lanes decode together, and a reply's capture at its page folds its state;
+// after the start's warmups no cycle creates a pipeline. Its decode state
+// holds no draft rings, and no start measures step costs: without a draft a
+// cycle verifies its chains whole.
+void testADraftlessModelDecodes(const char *metallibPath) {
+  const test::TemporaryDirectory root("splash-draftless");
+  RuntimeResourcesConfig config = loadableConfig(metallibPath, root.path(), "draftless-test", false);
+  require(!config.model.draft.present(), "the draftless model has a draft");
+  std::unique_ptr<RuntimeResources> resources;
+  const std::string started = test::capturedStderr([&] { resources = RuntimeResources::create(config, 0); });
+  require(started.find("Decode cycles verify every row of the host chains.") != std::string::npos,
+          "the draftless start did not say how its cycles verify: " + started);
+  const EngineMemoryBreakdown &budget = resources->memoryPlan().breakdown();
+  std::unique_ptr<model::RuntimeModel> runtime;
+  require(static_cast<bool>(resources->memoryGovernor().allocationAdmission()(
+              budget.sharedPrefillBytes + budget.sharedDecodeBytes,
+              [&] { runtime = model::createRuntime(resources->modelContext()); })),
+          "the draftless runtime's arenas were refused");
+  const KvPool::RunwayHold runway(resources->kvPool());
+  std::string log = test::capturedStderr([&] {
+    static_cast<void>(runtime->warmupPrefill(model::ExecutionLimits::prefillTokenBudget));
+    for (const uint32_t rows : resources->modelContext().operators.prefillRowClasses())
+      static_cast<void>(runtime->warmupPrefill(rows));
+    for (uint32_t width = 1; width <= 2; ++width) static_cast<void>(runtime->warmupDecodeBatch(width));
+  });
+  require(log.find("Decode step costs") == std::string::npos, "a draftless start measured step costs: " + log);
+  metal::MetalBackend &backend = resources->backend();
+  backend.beginServing();
+  // Two lanes on the runway's pages, each prompt a run of tokens twice, eight
+  // short of a page, the first lane's reply's state captured at the page.
+  std::vector<uint32_t> prompt;
+  for (uint32_t repeat = 0; repeat < 2; ++repeat)
+    for (uint32_t token = 0; token < kv::kPageTokens / 2 - 4; ++token) prompt.push_back(100 + token);
+  const auto tokens = static_cast<uint32_t>(prompt.size());
+  auto &executor = dynamic_cast<model::Runtime &>(*runtime);
+  const std::array<uint64_t, 2> ids{741, 742};
+  // Each lane's pages hold its prompt, its 32 tokens and a verify block past
+  // them.
+  const uint32_t lanePages = (tokens + 32 + 2 * model::ExecutionLimits::targetVerifyRows + kv::kPageTokens - 1) /
+                             kv::kPageTokens;
+  std::array<std::vector<uint32_t>, 2> pages;
+  for (uint32_t lane = 0; lane < 2; ++lane)
+    for (uint32_t page = 0; page < lanePages; ++page) pages[lane].push_back(lane * lanePages + page);
+  uint32_t cycles = 0, outputs = 0;
+  bool captured = false;
+  log = test::capturedStderr([&] {
+    for (uint32_t lane = 0; lane < 2; ++lane) {
+      ModelRequest request{.id = ids[lane], .prompt = prompt, .maxNewTokens = 64};
+      if (lane) request.sampling.temperature = 1.0F;
+      executor.beginColdRequest(request, lane);
+      ModelBatchItem chunk{.requestId = ids[lane], .tokenCount = tokens, .pageTable = pages[lane],
+                           .pageTableRevision = 1};
+      chunk.inputTokens = prompt;
+      const auto prefilled = executor.prefill({.kind = WorkKind::Prefill, .items = {{ids[lane], tokens}}},
+                                              std::span<const ModelBatchItem>(&chunk, 1));
+      require(prefilled.size() == 1 && prefilled[0].failure.empty() && prefilled[0].outputTokens.empty(),
+              "a draftless prompt failed or ended it");
+    }
+    std::array<uint64_t, 2> positions{tokens, tokens};
+    while (positions[0] < tokens + 32) {
+      std::array<ModelBatchItem, 2> items;
+      for (uint32_t lane = 0; lane < 2; ++lane)
+        items[lane] = {.requestId = ids[lane], .logicalPosition = positions[lane], .pageTable = pages[lane],
+                       .pageTableRevision = 1};
+      // The first lane's reply captures its state at the page boundary
+      // after its prompt, once its cycle may reach it.
+      const uint32_t boundary = (tokens / kv::kPageTokens + 1) * kv::kPageTokens;
+      std::shared_ptr<StateReservation> reservation;
+      if (!captured && positions[0] < boundary &&
+          positions[0] + model::ExecutionLimits::targetVerifyRows >= boundary) {
+        metal::AllocationFailure refusal;
+        reservation = executor.reserveState(ids[0], boundary, refusal);
+        require(reservation != nullptr, "the draftless reply's state was refused");
+        items[0].stateCaptures.push_back({boundary, reservation});
+      }
+      auto decoded = executor.decode({.kind = WorkKind::Decode, .items = {{ids[0], 0}, {ids[1], 0}}}, items);
+      require(decoded.size() == 2, "a draftless cycle lost a lane");
+      for (uint32_t lane = 0; lane < 2; ++lane) {
+        require(decoded[lane].failure.empty() && !decoded[lane].outputTokens.empty(),
+                "a draftless cycle failed or decoded nothing: " + decoded[lane].failure);
+        positions[lane] += decoded[lane].outputTokens.size() - decoded[lane].outputTokensWithoutKv;
+        outputs += static_cast<uint32_t>(decoded[lane].outputTokens.size());
+      }
+      captured = captured || !decoded[0].capturedStates.empty();
+      ++cycles;
+    }
+    for (const uint64_t id : ids) executor.end(id);
+  });
+  require(cycles > 0 && outputs >= 2 * cycles, "the draftless lanes decoded no token a cycle: " + log);
+  require(captured || !runtime->capturesInDecode(), "the draftless reply captured no state at its page: " + log);
+  require(backend.pipelinesCreatedWhileServing() == 0,
+          "a draftless cycle after the start's warmups created pipelines: " + log);
+}
+
 // The engine reserves a state to capture in decode at a page up to a verify
 // block's rows ahead (Engine::reserveReplyCapture), not knowing the rows the
 // runtime gives the lane in a cycle. A cycle of 8 rows a lane given a page 12
@@ -2272,6 +2370,7 @@ int main(int argc, char **argv) {
       testALongRequestAfterTheWarmupsCreatesNothing(argv[1]);
       testAReplyCaptureAfterTheWarmupsCreatesNothing(argv[1]);
       testADecodeCapturePastItsCycleWaits(argv[1]);
+      testADraftlessModelDecodes(argv[1]);
       testWriteBudgetOnlyWhenSet(argv[1]);
       testStaleCachesGoAtEveryStart(argv[1]);
       testMadeCacheRootStaysOutOfBackups(argv[1]);

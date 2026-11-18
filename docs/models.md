@@ -207,6 +207,30 @@ mixes the parts of several names is refused (`upstream.split_order`, and
 installer copies each part's header under the part's name, and the engine's
 check reads them so.
 
+A DeepSeek-V4.1 target (`deepseek41`) in llama.cpp's layout (b11870 and
+newer) keeps its Engram tables, `per_layer_token_embd` with every Engram
+layer's heads, as the last part of its split GGUF, which every variant of a
+repository shares as one file of its own name
+(`DeepSeek-V4.1-Flash-Engram-IQ4_NL.gguf`, ISTA-DASLab's), beside parts 1 to
+N - 1 of each. Where a split GGUF at the root, or in a local folder, lacks
+its last part, the installer reads the headers of the other root GGUFs, none
+a split's part or a projector, and takes the one whose `split.no`,
+`split.count` and `split.tensors.count` make it that part
+(`upstream.shared_last_part`, `gguf.last_part`); it installs in `target/`
+under the name the other parts imply (`-0000N-of-0000N.gguf`), and a link of
+that name beside them, as llama.cpp's instructions make, serves as well. The
+Engram hash lies in the first part's metadata (`deepseek41.engram.token_map`
+and the `ple.*` arrays). The installer refuses the layout ISTA-DASLab
+published until October 27, 2026, its Engram tables in a file the backbone
+names (`deepseek41.engram.file`): install the repository's current revision,
+or convert local files with its `convert_ds41_upstream.py`. Its compressors'
+and indexers' projections load as the MoE router does, F32, BF16 or any of
+the linears' quantized formats (not F16) as stored: the published
+quantizations store them as BF16 or, as ggml-org's Q2_K and unsloth's
+UD-Q4_K_XL do, as Q8_0, and orcarouter's abliterated Mix-256G three
+compressor gates as Q5_K. Its Engram tables load as IQ4_NL alone, so
+unsloth's F8_E4M3 Engram part is refused.
+
 BF16 and F16 are formats of the image like the quantized ones, for the tensors
 a quantized file keeps unquantized: UD-Q8_K_XL keeps the 27B's attention
 projections and LM head and some of the 35B-A3B's projections and experts in
@@ -296,16 +320,31 @@ inputs (next-token KL 2.8e-4 against bf16, 13-16% less time a decode cycle on a
 
 ## Drafts
 
-Every model decodes with a DFlash2 draft. Each family names the repository
+A model decodes with a DFlash2 draft. Each family names the repository
 of the DFlash2 checkpoint trained for it (`families.FAMILIES`), which holds
 it as the release publishes it: `config.json` and BF16 `model.safetensors`
 (or the shards its index names), and `mask_embedding.safetensors` when the
-release ships its mask token's embedding. Installation downloads only those files and follows the repository's default
-branch as it follows the target's ([Revisions](server.md#revisions)); `--draft-model`
-accepts another repository, followed the same way, or a local directory that
-holds them. A checkpoint is installed only when the engine accepts its
-configuration with the target's (its `model-check`), so a draft of another
-architecture never replaces one that loads.
+release ships its mask token's embedding; a family whose draft is not released
+yet names none, and its installation has none unless `--draft-model` names
+one. Installation downloads only those files and follows the repository's
+default branch as it follows the target's ([Revisions](server.md#revisions));
+`--draft-model` accepts another repository, followed the same way, or a local
+directory that holds them. A checkpoint is installed only when the engine
+accepts its configuration with the target's (its `model-check`), so a draft of
+another architecture never replaces one that loads.
+
+`--draft-model none` installs the target without a draft, as an installation
+of a family without a released draft is. Each decode cycle of such a model
+verifies its lanes' anchors and the chains the host proposes for them, a
+prompt-lookup chain or the tokens a grammar forces, where a lane has one; a
+lane without one emits one token a cycle. No start measures step costs for
+such a model: a cycle verifies its lanes' chains whole, or the rows its cost
+line's floor passes where the target's experts stream, and `/status` reports
+`verify_rows` as `--verify-rows` set it. No draft weights, rings or context windows
+take memory, and a cached state holds the target's state alone; prefill keeps
+the draft context plan's bookkeeping and computes nothing for it. A family
+whose target keeps no state of its own (Flint) does not run without a draft
+yet.
 
 A draft's `config.json` states its layers, intermediate size, rotary base and
 the target layers whose outputs it reads (`dflash_config.target_layer_ids`,
@@ -533,6 +572,55 @@ Qwen3.6-35B-A3B UD-Q4_K_M. Flint's vocabulary mixes its scripts through all
 its tokens (its first 98,304 hold 98.1% of English text's tokens and 88.5% of
 Russian text's), so its drafts propose from all of them.
 
+DeepSeek-V4.1-Flash decodes with its own block drafter, DSpark, when
+`--draft-model` names it: the one `dspark*.gguf` at the root of a repository
+(unsloth's `unsloth/DeepSeek-V4.1-Flash-1017-GGUF` holds
+`dspark-DeepSeek-V4.1-Flash-1017-Q8_0.gguf`, 8.0 GB), or a local GGUF of any
+name, installed as `draft/<name>.gguf` (`upstream.dspark_files`); without it
+a cycle verifies each lane's anchor and the chain the host proposes for it, if
+any, as under `--draft-model none`. The GGUF (architecture `dflash`,
+`model/DSpark.hpp`) holds three of the family's layers, of window attention
+alone and 128 experts each (top 3, MXFP4), the projection and norm of its view
+of the target's rows (`fc`, `enc.output_norm`), its output norm, a Markov head
+of rank 256 and a confidence head; it borrows the target's token table and
+head, and the engine checks it against the target when the model loads
+(`readDSparkLayout`). For each row DSpark reads, the target writes the mean of
+its four streams at the input of DSpark's target layers (37, 38 and 39), which
+DSpark projects and norms into the context row its rings' latents are computed
+from (`DSparkDraft`). A cycle drafts a block of five rows, the anchor and four
+noise tokens (the target's embedding of the GGUF's
+`tokenizer.ggml.mask_token_id`, 128799, which becomes the target's mask
+token), whose rows attend each other and their lane's ring of the last 128
+positions; the target's head gives their logits, and the Markov head's chain
+from the anchor proposes each row's token, the argmax of its logits plus the
+bias it projects from the embedding of the token before it, at the confidence
+of the sigmoid of the confidence head's score (`dspark_markov_step`). Its
+proposals are a lane's tree, a chain (`dspark_tree`): each row's draft
+probability is its confidence, and none draws children, so a sampled row draws
+from the target's distribution and its lane keeps a proposal where it is that
+draw. A host chain takes the chain's place: the tokens a grammar or a thinking
+end forces, or a prompt-lookup chain where its chances promise more tokens
+than DSpark's last tree's. A cycle verifies at most its anchor and the five
+proposals, the rows the selector lays out as for a DFlash2 draft; the target
+gathers them into lanes of the step's lane cap of rows each
+(`LatentAttention::addLaneRows`), and its attention skips a lane's rows past
+its count (`LatentAttention::SplitKeys::limits`), which route no expert. A lane's state is DFlash2's:
+DSpark's three rings in the first 128 slots of their layers' ring keys, and
+the context window of its 4-bit context rows, which a cached state keeps and a
+restore computes the rings from. Its 8 GB stay resident beside the target and
+leave the target's experts that much less memory: on a 48 GB M4 Pro they got
+17.5 GiB instead of 25.5 GiB, and greedy prose of 128 tokens decoded at 11.6
+tokens per second over five runs (10.96 to 12.32) against 10.8 without DSpark
+(10.66 to 10.84), the budget verifying about 1.5 proposals a cycle and the
+target accepting 68-80% of them; with a decode step's load split around its
+resident experts' passes and its experts' repack writing whole tiles
+([Streamed experts](server.md#streamed-experts)), 13.15 (12.67 to 13.47) against 10.8.
+Its own work takes about 10 ms of a cycle. Its cycles' verify budget starts
+from a prior of its own (`VerifyBudget::kDSparkPrior`, slope 0.82, its
+proposals' intercepts 0 to 0.4), the fit of its labels, as the budget's prior
+from Qwen's DFlash2 drafts underrates its later proposals by 0.6 to 1.2 in
+logit until its own labels outweigh it.
+
 ## Vision
 
 Vision comes from the target repository: MLX's `vision_tower.*` tensors (or
@@ -592,8 +680,10 @@ ranks, control/user-defined token types, BOS/EOS/padding IDs and template text
 come from that file; the supported profiles supply the pre-tokenization
 algorithms: `gpt2/qwen35` NFC and Qwen's split, `gpt2/flint` Flint's three
 splits (digits in runs of up to three, runs of Han and kana, then o200k's
-pattern) without a normalizer, each before byte-level BPE, as the release's
-own tokenizer.json has them. Unknown profiles, malformed metadata
+pattern) without a normalizer, and `gpt2/joyai-llm` DeepSeek-V4.1's (digits in
+runs of up to three, runs of Han and kana, then its punctuation, letter and
+space pattern) without a normalizer, each before byte-level BPE, as the
+release's own tokenizer.json has them. Unknown profiles, malformed metadata
 and automatic BOS/EOS insertion are rejected, with no cross-repository
 fallback; GGUF sidecar tokenizer/config files do not override embedded metadata.
 Model geometry is translated from the same metadata, subtracting any declared
@@ -635,12 +725,13 @@ the template wrote for an image. A prompt that quotes nothing encodes as the
 tokenizer encodes it, token for token.
 
 The template renders marked text as any other text, so it finds no tag in a
-request either. Three templates read tags there, and none does once the tag
+request either. Four templates read tags there, and none does once the tag
 is quoted: Qwen's take a user message that is one
 `<tool_response>…</tool_response>` block for a tool's result where they look
 for the last question, Qwen3.6's split an assistant's content at `</think>`,
-and Flint's deletes `<think>` and `</think>` from a message and rewrites its
-role tokens. Each stays the text the client sent. A client sends an
+Flint's deletes `<think>` and `</think>` from a message and rewrites its
+role tokens, and DeepSeek-V4.1's refuses a message or reasoning whose text
+holds its image placeholder `<｜deepseek_image｜>`. Each stays the text the client sent. A client sends an
 assistant's reasoning as `reasoning_content` and a tool's result as a `tool`
 message, which the template frames itself. Flint's template also deletes
 U+0000 from a message, which would write whole a token the text spelled around
@@ -750,20 +841,39 @@ format of the family its installation found, which the assembly records:
   `<tool_call>NAME<arg_key>K</arg_key><arg_value>V</arg_value></tool_call>`,
   each tag a token; `<|end_of_text|>`, `<|user|>`, `<|observation|>` and
   `<|developer|>` stop.
+- DeepSeek-V4.1-Flash's (`DEEPSEEK`): the generation prompt opens the think
+  block where the request thinks and closes it where it does not; calls are
+  DSML (`DEEPSEEK_DSML`), one block
+  after the text, `<｜DSML｜ calls>`, an `<｜DSML｜ invoke name="NAME">` for each
+  call and a `<｜DSML｜ parameter name="K" string="true|false">V</｜DSML｜
+  parameter>` for each argument, whose `string` says whether the value is text
+  or JSON; `<｜end▁of▁sentence｜>` stops.
 
 A format holds the model's vocabulary and the engine's stop tokens, which are
 its target layout's; the tokens of `</think>`, of `<think>` where the model
-opens its reasoning itself, and of `<tool_call>`; the call syntax; and the
-special token after which prompt tokenization reuses a cached prompt's tokens,
-`<|im_end|>` or `<|assistant|>`. Startup checks that the tokenizer encodes each
-as the format has it, and that it can keep its added tokens out of a request's
-text ([tokenizer and chat templates](#tokenizer-and-chat-templates)). Grammars
-write reasoning and calls as the format lays
+opens its reasoning itself, and of the marker each call's opening holds,
+`<tool_call>` or DSML's `｜DSML｜`; the call syntax; and the special token
+after which prompt tokenization reuses a cached prompt's tokens,
+`<|im_end|>`, `<|assistant|>` or `<｜Assistant｜>`. Startup checks that the
+tokenizer encodes each as the format has it, and that it can keep its added
+tokens out of a request's text ([tokenizer and chat
+templates](#tokenizer-and-chat-templates)). DeepSeek's also names the image
+placeholder its template refuses in any message's text, `<｜deepseek_image｜>`,
+which startup requires the tokenizer to add, as DeepSeek's GGUF does: a
+request's text never spells an added token to the template, so a page, file
+or tool result that quotes the placeholder renders as its characters and does
+not fail every later request of its conversation. DSML names the separator,
+`::`, before which the template reads a name's namespace and which it refuses
+in a name more than once: a tool whose name holds it twice returns 400, and a
+history call of such a name, which a model may write where no grammar holds it
+to the tools, stays text. Grammars write reasoning and calls as the format lays
 them out: Flint's optional think block may come before any constrained output,
 and its tags, which the grammar compiler takes as tokens rather than text, are
-written as their tokens. A model that opens its reasoning itself closes it
-before a call, so a `<tool_call>` inside its think block is reasoning, as
-Flint's own parser reads it.
+written as their tokens. DSML's tags are text, its `｜DSML｜` a token that text
+outside calls cannot spell; the text before its block is lazy up to the
+block's opening, which a greedy lexeme would run into. A model that closes its
+reasoning before a call, as Flint's and DeepSeek's do, reads a call's opening
+inside its think block as reasoning, as their own parsers read it.
 
 Flint's template renders as shipped: its roles, the tools block it adds before
 the first message that is not a system message, each assistant turn's

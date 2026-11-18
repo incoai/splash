@@ -11,7 +11,7 @@
 // of 1, and a row's chance its own times its parent's (DraftTreeParams):
 // greedy lanes fit theirs to the last kLabels labels of their trees' rows,
 // sampled lanes, whose drawn children their verify rows' rejection sampling
-// accepts, apart.
+// accepts, apart, each under a prior (kPrior, or a draft's own).
 #include "metal/abi/ExecutionGeometry.h"
 #include "ops/LaneRows.hpp"
 
@@ -51,6 +51,14 @@ public:
   // accepts them at (over tenths of the chance), where a fit of those rows
   // pooled over both targets gives 0.016 and 0.008.
   static constexpr Acceptance kPrior{0.7F, {0.0F, -0.35F, -0.8F, -0.75F, -0.75F, -0.85F, -0.45F}};
+  // DeepSeek-V4.1-Flash's DSpark, whose confidence is the sigmoid of its
+  // confidence head's score: the fit of 1371 labels of its cycles on a 48 GB
+  // M4 Pro (prose, chat and arithmetic), its five proposals' positions;
+  // the two past its block keep kPrior's, which no label reaches.
+  static constexpr Acceptance kDSparkPrior{0.82F, {0.0F, 0.29F, 0.4F, 0.2F, -0.16F, -0.85F, -0.45F}};
+
+  // Cycles whose acceptance model starts from `prior`, and is held to it.
+  explicit VerifyBudget(const Acceptance &prior = kPrior) : prior_(prior), acceptance_{prior, prior} {}
 
   // A label: a draft row at proposal position `position` (its depth less
   // one), whose draft probability had logit `feature`, under a parent its
@@ -94,9 +102,10 @@ public:
   // The labels kept of the lanes that sample, or of the greedy ones, oldest
   // first.
   [[nodiscard]] std::vector<Label> labels(bool samples) const;
-  // The maximum a posteriori model of `labels` under the prior, by damped
+  // The maximum a posteriori model of `labels` under `prior`, by damped
   // Newton steps from `start`.
-  [[nodiscard]] static Acceptance fit(std::span<const Label> labels, const Acceptance &start);
+  [[nodiscard]] static Acceptance fit(std::span<const Label> labels, const Acceptance &start,
+                                      const Acceptance &prior = kPrior);
   // A lane's chances for a cycle's choice of rows (StepCosts): the estimates
   // that the target accepts each row its tree would add past its anchor,
   // best first, no more of them than its tree's `depth` (its output left
@@ -114,6 +123,7 @@ public:
                                                       uint32_t depth);
 
 private:
+  Acceptance prior_ = kPrior;
   // The greedy lanes', then the sampled ones'.
   std::array<Acceptance, 2> acceptance_{kPrior, kPrior};
   std::array<std::vector<Label>, 2> labels_;

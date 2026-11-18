@@ -91,7 +91,10 @@ U+0000 in any of them reaches the model as U+FFFD, as a lone surrogate does: a
 template may delete the character, and with it what kept a tag apart. A
 history tool call whose `arguments` are not a JSON object,
 such as one the output limit cut, is kept as text, so the conversation
-continues. `n` other than 1 and `logprobs: true` return 400.
+continues, and so is one whose name the chat template refuses, as DeepSeek's
+refuses a name that holds `::` more than once: a model that calls tools
+freely may call one by any name, and the call returns as written.
+`n` other than 1 and `logprobs: true` return 400.
 
 `POST /v1/completions` serves OpenAI's legacy text completions. `prompt` is one
 string, which the loaded tokenizer encodes as a raw prompt, adding its own
@@ -498,9 +501,12 @@ syntax ([chat formats](models.md#chat-formats)). In Qwen's XML a call opens at
 `\n</parameter>\n` where the next parameter, `</function>` or `</tool_call>`
 follows; in Flint's GLM tags a call opens at `<tool_call>`, the function's name
 follows it up to the first tag, and a value ends at `</arg_value>` where the
-next `<arg_key>` or `</tool_call>` follows. A value may hold the tags in any
-other order, as a file an agent writes may. Tags written otherwise are text.
-Besides:
+next `<arg_key>` or `</tool_call>` follows; in DeepSeek's DSML a call opens at
+`<｜DSML｜ invoke name="`, its name ends at the quote, a parameter's name ends
+at `" string="true">` or `" string="false">`, and a value ends at
+`</｜DSML｜ parameter>` and the newline where the next parameter or
+`</｜DSML｜ invoke>` follows. A value may hold the tags in any other order, as
+a file an agent writes may. Tags written otherwise are text. Besides:
 
 - names lose the space around them; an opening that names no function, or a
   name too long to be one, opens no call and reads as the text the model
@@ -517,11 +523,15 @@ Besides:
   as a `tool_use` block's `input` in a Messages history, five levels into the
   body;
 - a call's opening also ends the reasoning where a call may follow, but for a
-  model that opens its reasoning itself, as Flint does, which closes it before
-  a call.
+  model that closes its reasoning before a call, as Flint's and DeepSeek's do;
+- DeepSeek's block of calls, `<｜DSML｜ calls>` to `</｜DSML｜ calls>`, is dropped
+  from the content with the blank line its template sets before it, and a value
+  marked `string="false"` reads as the JSON it spells where its schema gives it
+  no type (a declared type decides as for any family).
 
 `dev/tests/server/test_tool_call_reading.py` holds model outputs with the calls
-and content they read as, and `dev/tests/server/test_chat_formats.py` Flint's.
+and content they read as, `dev/tests/server/test_chat_formats.py` Flint's and
+`dev/tests/server/test_deepseek_format.py` DeepSeek's.
 
 A strict tool's schema is checked against its JSON Schema dialect on arrival,
 and every tool's arguments are framed through schema composition and local
@@ -557,6 +567,10 @@ A tool's name is written in its calls' tags and read back from them, so it
 holds 1 to 256 characters in Unicode NFC, which a tokenizer such as Qwen's
 keeps text in, other than `<`, `>`, line breaks and lone surrogates, and does
 not start or end with whitespace; a `tool_reference` names a tool the same way.
+Where DeepSeek's DSML lays the calls out, a tool's name also holds neither
+`｜DSML｜`, which opens each of its tags, nor the quote a function's name ends
+at, nor `::` more than once, as its template reads the text before the first
+`::` as the tool's namespace; the 400 names the tool.
 A Chat tool or named `tool_choice` that gives no `type` is a function. A
 Responses `namespace` function goes by `namespace__name`. Hosted search is
 unsupported; configure client-owned tools such as MCP.
@@ -747,7 +761,7 @@ fields; additional fields may be added:
 | `memory_plan.budget.host_held_back_bytes` | The expert store's chunks above its floor, which it started without and the memory ledger grows into as the host allows ([memory and context](server.md#memory-and-context)): no memory at the start, but among the fixed bytes, so that the context and the KV the plan holds are the limit's |
 | `ane_ffn.state`, `share`, `minimum_rows`, `reason` | The prefill FFN's [Neural Engine split](internals.md#neural-engine-prefill): `split` while it serves, at `share` of the FFN's channels over chunks of `minimum_rows` rows or more; `off` when the start left the GPU alone (`share` and `minimum_rows` 0); `stopped` once it stopped while serving, until the engine restarts. `reason` is the start's outcome, or why the split stopped |
 | `ane_ffn.split_commands`, `evaluations`, `ane_ms`, `reruns` | Prefill commands the split ran since engine start, the Neural Engine's evaluations in them and its milliseconds over them (each evaluation's from the GPU's signal to start it to its report); and the chunks the GPU ran again alone after the split's work for them failed |
-| `verify_rows` | The rows decode cycles verify ([drafts](models.md#drafts), `--verify-rows`): `auto` where each cycle's step is the one of the most expected accepted tokens per measured cost, with what its cycles show a long history adds to it, every row of which its lanes' trees fill is verified, or, where the target's experts stream, each cycle verifies the rows whose chance of a token is worth their time by its cycles' cost line (the default), `all` where each verifies every row of a draft's block a lane, whatever output the lane has left (`--verify-rows all`) |
+| `verify_rows` | The rows decode cycles verify ([drafts](models.md#drafts), `--verify-rows`): `auto` where each cycle's step is the one of the most expected accepted tokens per measured cost, with what its cycles show a long history adds to it, every row of which its lanes' trees fill is verified, or, where the target's experts stream, each cycle verifies the rows whose chance of a token is worth their time by its cycles' cost line (the default), `all` where each verifies every row of a draft's block a lane, whatever output the lane has left (`--verify-rows all`). A model without a draft (`--draft-model none`) reports the same two: its cycles verify each lane's anchor and the chain the host proposes for it |
 | `model_timing.prefill.last_gpu_ms`, `total_gpu_ms` | GPU time of the last prefill command, and of all since engine start, warmup included: each from its first Metal command buffer's start to its last one's end, so with the Neural Engine split it spans the GPU's waits on the Neural Engine; a chunk's image encodes, a command of their own ahead of it, add theirs, as a chunk run again adds the rerun's |
 | `metrics.decode_tokens_per_second` | Aggregate native decode throughput, not a request's end-to-end rate |
 | `metrics.decode_wall_ms` | Total wall time of the decode commands on the GPU, from submission to completion |

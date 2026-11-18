@@ -317,7 +317,8 @@ void writeSyntheticCheckpoints(const std::filesystem::path &root, const Layout &
                                                                                 : std::pair{4u, 64u};
   };
   writeSyntheticShard(root / "target" / "model.safetensors", mlxTargetTensors(target, releaseBits));
-  writeSyntheticShard(root / "draft" / "model.safetensors", draftTensors(draft));
+  // A model installed without a draft has no draft/.
+  if (draft.present()) writeSyntheticShard(root / "draft" / "model.safetensors", draftTensors(draft));
 }
 
 // Writes an installed MLX model of these layouts under root: its checkpoints
@@ -333,7 +334,8 @@ SyntheticAccounting writeSyntheticModel(const std::filesystem::path &root, const
   for (const model::gguf::Image &image :
        model::safetensors::planImages(model::SafetensorsCheckpoint(root / "target"), target))
     targetBytes += image.bytes;
-  return {targetBytes, model::draftImageBytes(root / "draft", draft), model::visionImageBytes(vision)};
+  return {targetBytes, draft.present() ? model::draftImageBytes(root / "draft", draft) : 0,
+          model::visionImageBytes(vision)};
 }
 
 } // namespace splash::test

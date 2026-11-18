@@ -10,9 +10,9 @@ These documents run from using Splash to working on it:
 - [Models](models.md): the model formats Splash loads, drafts, vision, chat
   templates, local model files and Splash packages.
 - [Internals](internals.md): the code's boundaries, installation, weight
-  loading, kernels, sparse attention, Neural Engine prefill, host steps,
-  residency, admission and eviction, sliding windows, the disk tier, the native
-  protocol, and failures.
+  loading, kernels, sparse attention, latent attention, Neural Engine prefill,
+  host steps, residency, admission and eviction, sliding windows, the disk
+  tier, the native protocol, and failures.
 - [Validate](validate.md): the checks, the release check and local benchmarks.
 - [Package](package.md): the release archive and bottle, the desktop app, its
   updates and releases, and private test releases.

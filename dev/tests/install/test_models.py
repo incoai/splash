@@ -136,6 +136,18 @@ class InstallerTest(unittest.TestCase):
         args = installer.parse_args(["--model", self.MODEL_ID, "prepare"])
         self.assertEqual((args.command, args.model), ("prepare", self.MODEL_ID))
 
+    def test_draft_model_none_selects_its_own_installation(self):
+        args = installer.parse_args(
+            ["--model", self.MODEL_ID, "--draft-model", installer.NO_DRAFT, "prepare"]
+        )
+        self.assertEqual(args.draft_model, installer.NO_DRAFT)
+        alone = installer.Selection.of(
+            self.root, self.MODEL_ID, draft_model=installer.NO_DRAFT
+        )
+        self.assertNotEqual(
+            alone.link, installer.Selection.of(self.root, self.MODEL_ID).link
+        )
+
     def test_prepare_json_progress_has_downloads_report_their_progress(self):
         reporting = []
         base = ["--models", str(self.root), "--model", self.MODEL_ID, "prepare"]

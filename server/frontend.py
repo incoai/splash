@@ -15,7 +15,7 @@ from . import images as image_input
 from . import protocol as wire
 from . import request_fields
 from .backend import Job, ReasoningRequest
-from .chat_format import REASONING_EFFORTS, THINK_END, THINK_START, TOOL_CALL_OPEN
+from .chat_format import REASONING_EFFORTS, THINK_END, THINK_START
 from .chat_messages import normalize_messages, template_messages
 from .chat_templates import (
     LATER_SYSTEM_UNSUPPORTED,
@@ -664,6 +664,7 @@ class Frontend:
             body.get("tool_choice"),
             body.get("parallel_tool_calls", True),
             tool_namespaces,
+            syntax=self.chat_format.call_syntax,
         )
         response_schema, response_validator = normalize_response_format(
             body.get("response_format")
@@ -671,7 +672,8 @@ class Frontend:
         # PDFs render only once the whole request is checked: a render holds
         # the one PDF worker for up to 30 s.
         messages = template_messages(
-            render_files(messages, deadline=deadline, without_slot=without_slot)
+            render_files(messages, deadline=deadline, without_slot=without_slot),
+            syntax=self.chat_format.call_syntax,
         )
         return Prompt(
             messages,
@@ -918,18 +920,17 @@ class Frontend:
         )
 
     def _call_openings(self, policy, thinking):
-        """The tokens that begin each strict tool's call, after the close of
-        the reasoning the generation prompt opened. Its parameter names may
-        come next, so a tool with more of them than the parser admits fails
-        there."""
+        """The tokens that begin each strict tool's call as a turn's first,
+        after the close of the reasoning the generation prompt opened. Its
+        parameter names may come next, so a tool with more of them than the
+        parser admits fails there."""
         chat_format = self.chat_format
         reasoning = [chat_format.think_end_id] if thinking else []
         return [
             (
                 reasoning
                 + self._tokenize(
-                    TOOL_CALL_OPEN + chat_format.call_syntax.function_opening(name),
-                    add_special_tokens=False,
+                    chat_format.call_syntax.opening(name), add_special_tokens=False
                 )["input_ids"],
                 f"tool {name} has too many parameters to constrain",
             )

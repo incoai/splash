@@ -2,6 +2,7 @@
 
 #include "ops/Vision.hpp"
 #include "DFlashDraft.hpp"
+#include "DSpark.hpp"
 #include "ExpertChunkLayout.hpp"
 #include "ModelDescriptor.hpp"
 #include "Qwen3_6Moe.hpp"
@@ -32,7 +33,8 @@ class QwenStateStorage;
 class SsdReaders;
 class VisionLoader;
 
-using TargetWeights = std::variant<Qwen3_8Weights, Qwen3_6MoeWeights, Qwen4ExpWeights, FlintWeights>;
+using TargetWeights =
+    std::variant<Qwen3_8Weights, Qwen3_6MoeWeights, Qwen4ExpWeights, FlintWeights, DeepSeek41Weights>;
 
 // How a model loads beside its descriptor: with streamedTableBytes, the rows
 // of a table the target's GGUF holds (model/ModelSizing.hpp) stream from its
@@ -58,18 +60,17 @@ struct LoadedModel final {
   // The memory of every image the weights below are views of.
   std::shared_ptr<WeightImages> images;
   TargetWeights target;
+  // The draft's layout, files and memory; a DFlash2 draft's weights there,
+  // DSpark's in dspark (DFlashDraftLayout::kind).
   DFlashDraftWeights draft;
+  std::optional<DSparkWeights> dspark;
   QwenVisionWeights vision;
   std::string manifestFingerprintSha256;
 
   [[nodiscard]] const std::string &name() const noexcept {
     return descriptor.name;
   }
-  [[nodiscard]] kv::Layout targetKvLayout(kv::Format format) const noexcept {
-    auto layout = descriptor.targetKvLayout;
-    layout.format = format;
-    return layout;
-  }
+  [[nodiscard]] kv::Layout targetKvLayout(kv::Format format) const noexcept { return descriptor.kvLayout(format); }
   [[nodiscard]] CompositeStateLayout stateLayout(ops::GdnStateFormat format, bool cachedCodes = true) const noexcept {
     auto layout = descriptor.stateLayout;
     layout.target.format = format;
@@ -185,12 +186,15 @@ loadModel(metal::MetalBackend &backend,
 // to too (Flash-Next Q2_0's largest, 743 MiB, of an M5 Max's 21 GiB); with
 // `streamedTableBytes`, its table streams through a row cache of that many
 // bytes on `readers`, as its whole image may exceed that buffer (Flash-Next's
-// 27,466 MiB).
+// 27,466 MiB). With `operators`, a draft that keeps scratch of its own
+// (DSpark's) reads its images so too, and the geometry holds that scratch
+// (QwenTargetGeometry::draftScratchBytes).
 [[nodiscard]] QwenTargetGeometry plannedTargetGeometry(metal::MetalBackend &backend,
                                                        const std::filesystem::path &root,
                                                        const ModelDescriptor &descriptor,
                                                        uint64_t streamedTableBytes,
-                                                       std::shared_ptr<SsdReaders> readers);
+                                                       std::shared_ptr<SsdReaders> readers,
+                                                       const ops::ExecutionPlans *operators = nullptr);
 
 // The FFN layers of a target whose every layer's FFN is dense (denseFfn),
 // which the prefill FFN's Neural Engine split (ops::AneFfn) may take; none

@@ -30,11 +30,15 @@ std::array<uint64_t, targetTensorCount> targetTensorBytes(const QwenTargetGeomet
   put(TargetTensor::GdnHidden, bytesFor<uint16_t>(gdnRows * target.attentionWidth));
   put(TargetTensor::Intermediate, bytesFor<uint16_t>(rows * target.intermediateSize));
   put(TargetTensor::FullPacked, bytesFor<uint16_t>(rows * target.packedFullWidth));
+  // The paged attention's scratch, which a target whose attention runs on
+  // its own scratch has none of (QwenTargetGeometry::pagedAttention).
+  const uint64_t attentionRows = target.pagedAttention() ? rows : 0;
   put(TargetTensor::FullQueries,
-      bytesFor<uint16_t>(uint64_t{target.attentionQueryHeads} * stagedRows * target.attentionHeadDimension));
+      bytesFor<uint16_t>(uint64_t{target.attentionQueryHeads} * (attentionRows ? stagedRows : 0) *
+                         target.attentionHeadDimension));
   put(TargetTensor::AttentionPartials, shape.attention.partialsBytes);
   put(TargetTensor::AttentionStatistics, shape.attention.statisticsBytes);
-  put(TargetTensor::AttentionHidden, bytesFor<uint16_t>(rows * target.attentionWidth));
+  put(TargetTensor::AttentionHidden, bytesFor<uint16_t>(attentionRows * target.attentionWidth));
   // The rows a mixer adds its output to, which the FFN adds to.
   if (target.mixersAddToHidden()) {
     put(TargetTensor::GdnOutput, bytesFor<uint16_t>(gdnRows * target.hiddenSize));
@@ -59,7 +63,9 @@ TargetRows prefillTargetRows(const RuntimeGeometry &geometry, const ops::Executi
                    .chunks = geometry.prefillChunks,
                    // Any one sequence's splits: a chunk's sequences share the
                    // workspace in turn where they do not fit together.
-                   .attention = operators.sequenceAttentionWorkspace(target.attentionQueryHeads, target.kvLayout),
+                   .attention = target.pagedAttention()
+                                    ? operators.sequenceAttentionWorkspace(target.attentionQueryHeads, target.kvLayout)
+                                    : ops::AttentionWorkspace{},
                    .moe = {}};
   if (target.ffnKind == QwenFfnKind::SparseMoe)
     shape.moe = operators.moeWorkspace(target.moeBlockShape(), target.moeRouterFormat, kPrefillRows);
@@ -71,7 +77,9 @@ TargetRows decodeTargetRows(const RuntimeGeometry &geometry, const ops::Executio
   // Every lane's tiles at the most splits, so a step's lanes attend in one
   // dispatch whatever their histories, and the MoE plan of every step of up
   // to its most rows.
-  const ops::AttentionWorkspace lane = operators.laneAttentionWorkspace(target.attentionQueryHeads, target.kvLayout);
+  const ops::AttentionWorkspace lane = target.pagedAttention()
+                                           ? operators.laneAttentionWorkspace(target.attentionQueryHeads, target.kvLayout)
+                                           : ops::AttentionWorkspace{};
   TargetRows shape{.rows = kDecodeStepRows,
                    .chunks = 1,
                    .attention = {lane.partialsBytes * kLaneCount, lane.statisticsBytes * kLaneCount},
@@ -126,9 +134,10 @@ prefillTensorBytes(const RuntimeGeometry &geometry,
   for (const auto &projection : geometry.target.prefillProjections)
     linear.include(operators.linear().scratchSize(projection, kPrefillRows));
   const auto &draft = geometry.draft;
-  for (const ops::ProjectionShape projection :
-       {ops::ProjectionShape{draft.hiddenSize, draft.targetHiddenSize()}, {draft.contextKvSize(), draft.hiddenSize}})
-    linear.include(operators.draftLinear().scratchSize(projection, kPrefillRows));
+  if (draft.dflash())
+    for (const ops::ProjectionShape projection :
+         {ops::ProjectionShape{draft.hiddenSize, draft.targetHiddenSize()}, {draft.contextKvSize(), draft.hiddenSize}})
+      linear.include(operators.draftLinear().scratchSize(projection, kPrefillRows));
   put(PrefillTensor::LinearPartials, linear.partials);
   put(PrefillTensor::LinearCounters, linear.counters);
   put(PrefillTensor::LinearTable, linear.input);
@@ -169,8 +178,10 @@ std::array<uint64_t, decodeTensorCount>
 decodeTensorBytes(const RuntimeGeometry &geometry,
                   const ops::ExecutionPlans &operators) {
   std::array<uint64_t, decodeTensorCount> result{};
-  const auto draftWorkspace =
-      operators.draftAttentionWorkspacePerLane(geometry.draft.attentionShape());
+  // A model without a DFlash2 draft has no draft attention, nor its scratch.
+  const ops::DraftAttentionWorkspace draftWorkspace =
+      geometry.draft.dflash() ? operators.draftAttentionWorkspacePerLane(geometry.draft.attentionShape())
+                              : ops::DraftAttentionWorkspace{};
   const auto samplingWorkspace = ops::Sampling::workspace(kDecodeRows);
   const auto selectorWorkspace = ops::DraftSelector::workspace(kDraftProposalTokens);
   auto put = [&](DecodeTensor tensor, uint64_t bytes) {
@@ -297,6 +308,10 @@ ops::LinearScratchSize DecodeArena::linearScratchSize(
   // the draft among them, and the draft's context projections.
   for (const auto &p : geometry.target.decodeProjections)
     result.include(operators.linear().scratchSize(p, kDecodeStepRows));
+  // DSpark's projections run on scratch of its own (DSparkDraft), and a model
+  // without a draft has none.
+  if (!d.dflash())
+    return result;
   for (const ops::ProjectionShape shape :
        {ops::ProjectionShape{d.hiddenSize, d.targetHiddenSize()}, {d.contextKvSize(), d.hiddenSize}})
     result.include(operators.draftLinear().scratchSize(shape, kDecodeStepRows));

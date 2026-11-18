@@ -423,10 +423,11 @@ void reportStreamedStores(const model::LoadedModel &loaded, const model::Streama
 
 // The rows the target's decode cycles verify (--verify-rows), and why: those
 // its cycles' cost line's floor passes where its experts stream
-// (model::CostLine).
-void reportVerifyRows(model::VerifyRows rows, bool streamed) {
-  if (rows == model::VerifyRows::All)
-    logLine("Decode cycles verify every row of the draft's block (--verify-rows all).");
+// (model::CostLine). Without a draft a lane's rows are its anchor and the
+// chain its prompt or grammar proposes, whole where no cost line prices them.
+void reportVerifyRows(model::VerifyRows rows, bool streamed, bool drafts) {
+  if (rows == model::VerifyRows::All || (!drafts && !streamed))
+    logLine("Decode cycles verify every row of the ", drafts ? "draft's block (--verify-rows all)." : "host chains.");
   else
     logLine("Decode cycles verify the rows ",
             streamed ? "their cost line's floor passes" : "of the step their measured costs choose",
@@ -484,7 +485,7 @@ std::array<uint8_t, 32> parseSha256(std::string_view value) {
 
 void requireLoadedModel(const model::LoadedModel &loaded) {
   if (!loaded.targetActualAllocatedBytes() ||
-      !loaded.draft.actualAllocatedBytes ||
+      (loaded.descriptor.draft.present() && !loaded.draft.actualAllocatedBytes) ||
       (loaded.descriptor.hasVision() && !loaded.vision.actualAllocatedBytes) ||
       loaded.manifestFingerprintSha256.empty() ||
       loaded.targetManifestFingerprint().empty()) {
@@ -734,8 +735,7 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
   // (model::plannedTargetGeometry), so the weights load once, with the
   // stores the plan gives. It rests too on the SSD cache's room for active KV
   // and whether its KV file opened.
-  kv::Layout kvLayout = config.model.targetKvLayout;
-  kvLayout.format = config.kvFormat;
+  kv::Layout kvLayout = config.model.kvLayout(config.kvFormat);
   // How the KV tier lays a page out in its slot, and so the slots' size.
   const kv::SlotFormat kvFormat(kvLayout);
   const uint64_t kvSlotBytes = model::SlotFile::slotBytesFor(kvFormat.payloadBytes());
@@ -792,7 +792,7 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
          .requestedContextTokens = requestedContextTokens,
          .relaunchContextTokens = config.relaunchContext,
          .experts = {streamable.expertBytes, streamable.expertMinimumBytes, experts},
-         .table = {streamable.tableBytes, streamable.tableMinimumBytes, table},
+         .table = {streamable.tableBytes, streamable.tableMinimumBytes, table, streamable.tableStreamsOnly},
          .tableShareBytes = streamable.tableShareBytes,
          .hotCacheBytes = config.sparseKvMemory,
          .sparseKv = config.model.capabilities.sparseKv,
@@ -874,6 +874,8 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
     streamable = model::streamableWeights(
         config.modelRoot, config.model,
         {.streamExperts = true, .streamTable = config.pleMemory.mode != StreamedSetting::Mode::Off});
+    if (streamable.tableStreamsOnly && config.pleMemory.mode == StreamedSetting::Mode::Off)
+      throw RuntimeResourcesError(RuntimeResourceStage::Configuration, "--ple-memory off: the table only streams");
     if (!streamable.tableRefusal.empty()) {
       if (config.pleMemory.mode == StreamedSetting::Mode::Size)
         throw RuntimeResourcesError(RuntimeResourceStage::Configuration,
@@ -887,7 +889,7 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
     // A table that may stream streams through its smallest row cache while
     // the target's files give its geometry.
     planArenas(model::plannedTargetGeometry(*backend, config.modelRoot, config.model,
-                                            streamable.tableBytes ? streamable.tableMinimumBytes : 0, readers));
+                                            streamable.tableBytes ? streamable.tableMinimumBytes : 0, readers, &operators));
     // Refuse a model that cannot fit before loading its weights: beside them
     // the plan needs at least their arenas, the runtime reserves, one lane's
     // state, the KV runway, the streamed stores at their smallest or at the
@@ -1042,7 +1044,7 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
   };
 
   ready();
-  reportVerifyRows(config.verifyRows, loaded.expertStore() != nullptr);
+  reportVerifyRows(config.verifyRows, loaded.expertStore() != nullptr, loaded.descriptor.draft.present());
 
   // The automatic tier keeps its staging only where the plan holds the model
   // and the requested context beside it, the parts as they load, or where
