@@ -1517,10 +1517,12 @@ void leadingInputViews(metal::MetalBackend &backend) {
   };
   const Projection gguf = ggufView(wideSegment);
   const LinearPlan ggufPlan = residualPrefill({.tile = LinearTile::GgufPrefill}, LinearEpilogue::Residual);
-  {
+  for (const LinearEpilogue epilogue : {LinearEpilogue::None, LinearEpilogue::Residual}) {
+    const LinearPlan plan = residualPrefill({.tile = LinearTile::GgufPrefill}, epilogue);
     metal::CommandGraph graph;
-    (void)linear.add(graph, buffersOf(ggufPlan), gguf, ggufPlan);
-    const std::string kernel = leadingInputsInstance("gguf_prefill_q5k_r");
+    (void)linear.add(graph, buffersOf(plan), gguf, plan);
+    const std::string kernel = leadingInputsInstance(epilogue == LinearEpilogue::None
+                                                        ? "gguf_prefill_q5k_a" : "gguf_prefill_q5k_r");
     const GgufPrefillLeadingParams params{{k, rows, n, 0, std::numeric_limits<float>::infinity()}, wide};
     require(graph.dispatches().size() == 1, "a view of leading inputs did not encode one dispatch");
     const metal::ComputeDispatch &dispatch = graph.dispatches()[0];
@@ -1560,7 +1562,7 @@ void leadingInputViews(metal::MetalBackend &backend) {
     require(graph.empty(), "a refused view of leading inputs encoded a dispatch");
   };
   refuses(gguf, linear.plan(gguf, 8, LinearEpilogue::Residual));
-  for (const LinearEpilogue epilogue : {LinearEpilogue::None, LinearEpilogue::UpWithGate})
+  for (const LinearEpilogue epilogue : {LinearEpilogue::UpWithGate, LinearEpilogue::ClampedUpWithGate})
     refuses(gguf, residualPrefill({.tile = LinearTile::GgufPrefill}, epilogue));
   refuses(gguf, Linear::plan({{n, k}, 32, LinearEpilogue::Residual},
                              {.tile = LinearTile::GgufStaged}, FloatOutput::BFloat16));
