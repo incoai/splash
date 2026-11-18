@@ -187,8 +187,8 @@ struct ServeSettingsTests {
         #expect(settings.differs(from: other, model: "a/b", family: .unknown))
         // The card leaves them out, and the bands of parts left empty.
         #expect(LaunchOptions.options(.memory, for: Self.flint).map(\.flag)
-            == ["--kv-format", "--kv-window-trim", "--expert-memory"])
-        #expect(LaunchOptions.options(.memory, for: .unknown).count == 7)
+            == ["--kv-format", "--expert-memory"])
+        #expect(LaunchOptions.options(.memory, for: .unknown).count == 6)
     }
 
     /// A context length longer than the model picked serves stays kept for a model that serves it,

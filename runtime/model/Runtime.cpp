@@ -1,4 +1,3 @@
-#include <iostream>
 #include "model/Runtime.hpp"
 #ifdef SPLASH_RUNTIME_INSTRUMENTATION
 #include "metal/abi/GDN.h"
@@ -2074,10 +2073,9 @@ struct Runtime::Impl {
   // (Runtime::warmupDecodeBatch). The lanes' inputs are prepared for that
   // history; the next decode prepares its own.
   void prepareLongestVerify(std::span<Request *const> entries) {
-    const uint32_t rows = kDecodeRows;
-    const uint32_t history = geometry.target.contextTokens() - rows;
+    const uint32_t history = geometry.target.contextTokens() - kDecodeRows;
     const std::vector<uint32_t> tokens(history);
-    const std::vector<uint32_t> pages((history + rows + kv::kPageTokens - 1) / kv::kPageTokens);
+    const std::vector<uint32_t> pages((history + kDecodeRows + kv::kPageTokens - 1) / kv::kPageTokens);
     std::vector<ModelBatchItem> items(entries.size());
     for (uint32_t lane = 0; lane < entries.size(); ++lane) {
       QwenTargetRequest request = targetRequest(*entries[lane]);
@@ -2339,9 +2337,8 @@ struct Runtime::Impl {
       if (ends) {
         const auto [c, s] = parts[lane].back();
         const PrefillSequence &last = chunks[c].sequences[s];
-        const MetalBuffer &ring = finalHidden[c];
         const MetalBuffer lastRow =
-            prefillU16(ring, last.rowBegin + last.part.tokenCount - 1, 1, geometry.target.hiddenSize);
+            prefillU16(finalHidden[c], last.rowBegin + last.part.tokenCount - 1, 1, geometry.target.hiddenSize);
         if (const auto selection = finishPrompt(graph, *entries[lane], items[lane], lastRow, lane))
           selections[selectionCount++] = *selection;
         outputs.lastRows[lane] = lastRow;
@@ -3734,10 +3731,6 @@ Runtime::prefillAsync(const BatchPlan &plan,
       if (!finite[lane]) {
         // The chunk's state is not committed; the engine ends the request.
         entry.resultInvalid = true;
-        std::cerr << "splash: prefill row not finite: request " << entry.id
-                  << " logical " << item.logicalPosition << " .. "
-                  << nextLength << " of " << entry.promptTokens
-                  << " prompt tokens\n";
         results.push_back({.requestId = entry.id,
                            .consumedPromptTokens = item.tokenCount,
                            .failure = "target prefill row is not finite"});

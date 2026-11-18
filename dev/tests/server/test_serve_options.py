@@ -107,9 +107,6 @@ OPTIONS = {
         },
         ("", " "),
     ),
-    "--kv-window-trim": values(
-        "--kv-window-trim", {"on": "on", "off": "off"}, ("", "yes", "ON")
-    ),
     "--kv-format": values("--kv-format", {"int8": "int8", "bf16": "bf16"}, ("fp16",)),
     "--state-format": values(
         "--state-format", {"fp32": "fp32", "bf16": "bf16"}, ("fp16", "int8")

@@ -50,7 +50,6 @@
 #include <array>
 #include <charconv>
 #include <chrono>
-#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <filesystem>
@@ -122,8 +121,8 @@ std::vector<uint32_t> pageRange(uint32_t first, uint32_t count) {
 // producing tokens instead of a stop token right after prefill. The user text
 // repeats one sentence, "Write a detailed, multi-paragraph essay about the
 // history of the Roman Empire. ", until the prompt reaches the requested
-// length, and the generation prompt keeps thinking enabled. Its tokens are the
-// target's tokenizer's: the Qwen families' (one tokenizer) or Flint's.
+// length. Qwen and Flint keep the baseline's empty think block; Ripple
+// opens its own reasoning. Tokens follow each target's tokenizer.
 struct ChatTokens final {
   std::vector<uint32_t> userHeader;
   std::vector<uint32_t> sentence;
@@ -133,14 +132,14 @@ const ChatTokens kQwenChat{
     // <|im_start|>user\n
     .userHeader = {248045, 846, 198},
     .sentence = {7734, 264, 11346, 11, 7072, 12, 26829, 8627, 883, 279, 3712, 314, 279, 12386, 19825, 13, 220},
-    // <|im_end|>\n<|im_start|>assistant\n<think>\n
-    .assistantHeader = {248046, 198, 248045, 74455, 198, 248068, 198}};
+    // <|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n
+    .assistantHeader = {248046, 198, 248045, 74455, 198, 248068, 271, 248069, 271}};
 const ChatTokens kFlintChat{
     // <|user|>
     .userHeader = {150003},
     .sentence = {7421, 260, 7426, 11, 4519, 12, 41088, 6369, 762, 269, 3476, 297, 269, 10831, 18381, 13, 220},
-    // <|assistant|> (the model opens its reasoning)
-    .assistantHeader = {150004}};
+    // <|assistant|><think></think>
+    .assistantHeader = {150004, 150006, 150007}};
 
 const ChatTokens kRippleChat{
     // <|im_start|>user\n
@@ -293,7 +292,7 @@ struct Lane final {
 // How each lane's request answers: greedy or sampled, under a thinking
 // budget or none, and within its output budget.
 struct Answer final {
-  SamplingParameters sampling{.temperature = 1.0F, .topP = 0.95F, .topK = 20};
+  SamplingParameters sampling;
   std::optional<ThinkingBudget> thinking;
   uint32_t tokens = kAnswerTokens;
 };
@@ -432,15 +431,6 @@ int main(int argc, char **argv) {
           throw std::invalid_argument(std::string(option) + " requires a value");
         if (option == "--prompt-tokens") {
           promptTokens = parseCount(argv[index + 1], "--prompt-tokens");
-          textOptions = true;
-        } else if (option == "--temperature" || option == "--top-p") {
-          const float value = std::stof(argv[index + 1]);
-          if (!std::isfinite(value) || value <= 0 || (option == "--top-p" && value > 1))
-            throw std::invalid_argument("sampling temperature and top-p must be positive; top-p at most one");
-          if (option == "--temperature") answer.sampling.temperature = value; else answer.sampling.topP = value;
-          textOptions = true;
-        } else if (option == "--top-k") {
-          answer.sampling.topK = parseCount(argv[index + 1], "--top-k");
           textOptions = true;
         } else if (option == "--cycles")
           cycles = parseCount(argv[index + 1], "--cycles");
