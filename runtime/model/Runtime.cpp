@@ -248,6 +248,7 @@ QwenTargetPrefillBuffers prefillBuffersFor(const PrefillArena &arena, uint32_t c
   QwenTargetPrefillBuffers buffers;
   buffers.linearScratch = prefillScratch(arena);
   buffers.hidden = {arena.get(PrefillTensor::Hidden0, chunk), arena.get(PrefillTensor::Hidden1, chunk)};
+  buffers.embeddings = arena.get(PrefillTensor::EmbeddingRows, chunk);
   buffers.normalized = arena.get(PrefillTensor::Normalized, chunk);
   buffers.captured = arena.get(PrefillTensor::Captured, chunk);
   buffers.gdnPacked = arena.get(PrefillTensor::GdnPacked);

@@ -186,6 +186,7 @@ template <class T> constexpr uint64_t bytesFor(uint64_t elements) noexcept {
 enum class PrefillTensor : uint32_t {
   Hidden0,
   Hidden1,
+  EmbeddingRows,
   InputTokens,
   Normalized,
   Captured,
@@ -256,6 +257,7 @@ constexpr Tensor moeScratchTensor(size_t field) noexcept {
   switch (tensor) {
   case PrefillTensor::Hidden0:
   case PrefillTensor::Hidden1:
+  case PrefillTensor::EmbeddingRows:
   case PrefillTensor::InputTokens:
   case PrefillTensor::TargetPositions:
   case PrefillTensor::RopeCos:

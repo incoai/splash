@@ -142,7 +142,7 @@ private:
   // The shared prefill's layer loop runs the family's (QwenTarget::addPrefillLayers).
   friend class QwenTarget;
 
-  void addPrefillBegin(PrefillStep &) const {}
+  void addPrefillBegin(PrefillStep &step) const;
   [[nodiscard]] bool attends(uint32_t) const { return true; }
   void addPrefillLayer(PrefillStep &step, uint32_t index) const;
   [[nodiscard]] const ops::BlockMoeWeights *moe(uint32_t index) const noexcept;
@@ -165,9 +165,8 @@ private:
                                const metal::MetalBuffer &lambda, ops::PreparedInput normalized) const;
 
   const RippleWeights &weights_;
-  // The block's clamp, one F32 the clamped FFN epilogues read, and the scaled
-  // token embedding rows, which every block's mix reads back and the gather
-  // writes once.
+  // A verify batch's immutable scaled embeddings, copied before its first
+  // layer. Prefill chunks keep theirs in the arena.
   metal::MetalBuffer embedRows_;
 };
 

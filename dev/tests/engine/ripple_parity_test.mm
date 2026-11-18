@@ -590,6 +590,73 @@ int main(int argc, char **argv) {
     }
     std::sort(deltas.begin(), deltas.end());
     const Delta &worst = deltas.front();
+    // A group's chunks keep distinct immutable embeddings through every
+    // layer and across pass boundaries, as spilled-KV prefill requires.
+    auto groupGeometry = geometry;
+    groupGeometry.prefillChunks = model::kPrefillGroupChunks;
+    const model::PrefillArena groupArena(backend, groupGeometry, operators);
+    const auto grouped = [&](uint32_t count, bool together, bool splitPasses) {
+      CommandGraph graph;
+      std::vector<std::vector<uint32_t>> ids(count);
+      std::vector<QwenTargetPrefillSequence> sequences(count);
+      std::vector<QwenTargetPrefillChunk> chunks(count);
+      std::vector<MetalBuffer> outputs(count), heads(count), normalizedHeads(count), results(count);
+      const auto none = backend.allocateBuffer(4, BufferStorage::Shared, "unbound");
+      std::vector<float> inv(kPairs);
+      for (uint32_t pair = 0; pair < kPairs; ++pair) inv[pair] = std::pow(kTheta, -float(pair) / kPairs);
+      const auto positions = upload(backend, {0,0,0,1,1,1,2,2,2,3,3,3}, "group positions");
+      const auto inverse = uploadFloats(backend, inv, "group inverse frequencies");
+      SpilledKvReads reads;
+      for (uint32_t c = 0; c < count; ++c) {
+        const auto b = model::prefillBuffers(groupArena, c);
+        for (uint32_t row = 0; row < kRows; ++row) ids[c].push_back((row * 13 + c * 37) % kVocab);
+        ops::RoPE::addTables(graph, positions, none, inverse, none, b.ropeCos, b.ropeSin, none, none,
+                             {.target_rows = kRows, .draft_rows = 0, .target_scale = 1.0F}, kRows, kPairs);
+        target->addEmbedding(graph, upload(backend, ids[c], "group tokens"), b.hidden[0], kRows);
+        auto &sequence = sequences[c];
+        sequence.lane = c;
+        sequence.rows = kRows;
+        sequence.tokens = ids[c];
+        sequence.request = {ids[c], [](uint64_t pos) {
+          return std::array<uint32_t,3>{uint32_t(pos),uint32_t(pos),uint32_t(pos)};
+        }};
+        sequence.attentionStride = kv::kPageTokens;
+        sequence.chunk = ops::PagedAttention::prefillParams(0, kRows, sequence.attentionStride, 1);
+        sequence.pageTable = backend.allocateBuffer(sizeof(SplashKvPage), BufferStorage::Shared, "group page");
+        const std::vector<uint32_t> page{c * extent};
+        pages.writeEntries(page, 0, sequence.pageTable);
+        chunks[c] = {b, {&sequence, 1}, kRows};
+        if (!together) outputs[c] = target->addPrefill(graph, {&chunks[c], 1}, pages, reads, {0,kLayers})[0];
+      }
+      if (together) {
+        if (splitPasses) {
+          const auto partial = target->addPrefill(graph, chunks, pages, reads, {0,1});
+          require(partial.empty(), "a partial group returned final hidden rows");
+        }
+        outputs = target->addPrefill(graph, chunks, pages, reads, {splitPasses ? 1u : 0u,kLayers});
+      }
+      constexpr uint32_t headRows = SPLASH_TARGET_VERIFY_ROWS;
+      for (uint32_t c = 0; c < count; ++c) {
+        heads[c] = backend.allocateBuffer(uint64_t{headRows} * kHidden * 2, BufferStorage::Shared, "group head");
+        std::memset(heads[c].contents(), 0, heads[c].sizeBytes());
+        normalizedHeads[c] = backend.allocateBuffer(heads[c].sizeBytes(), BufferStorage::Shared, "group norm");
+        results[c] = backend.allocateBuffer(uint64_t{headRows} * kVocab * 4, BufferStorage::Shared, "group logits");
+        ops::RowCopy::add(graph, outputs[c], {0,kHidden,0}, heads[c], {0,kHidden,0}, kRows, kHidden);
+        target->addHeadBatch(graph, heads[c], normalizedHeads[c], results[c], 1, headRows, decodeArena.linearScratch());
+      }
+      static_cast<void>(backend.submitCommandAsync(graph.dispatches()).wait());
+      std::vector<std::vector<float>> copied(count, std::vector<float>(kRows * kVocab));
+      for (uint32_t c = 0; c < count; ++c)
+        std::memcpy(copied[c].data(), results[c].contents(), copied[c].size() * sizeof(float));
+      return copied;
+    };
+    for (const uint32_t count : {2u,3u,4u}) {
+      const auto separate = grouped(count,false,false);
+      require(separate[0] != separate[1], "group fixture has indistinguishable chunk logits");
+      for (const bool passes : {false,true})
+        require(grouped(count,true,passes) == separate,
+                "grouped prefill changed a chunk's logits, chunks " + std::to_string(count));
+    }
     // The same final row through the shared tail optimization, with the
     // actual draft tap before the final layer, must preserve its logits.
     auto tailGeometry = geometry;

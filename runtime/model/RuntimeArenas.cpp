@@ -17,6 +17,9 @@ prefillTensorBytes(const RuntimeGeometry &geometry,
       bytesFor<uint16_t>(uint64_t{kPrefillRows} * geometry.target.hiddenSize));
   put(PrefillTensor::Hidden1,
       bytesFor<uint16_t>(uint64_t{kPrefillRows} * geometry.target.hiddenSize));
+  if (geometry.target.valueResidual)
+    put(PrefillTensor::EmbeddingRows,
+        bytesFor<uint16_t>(uint64_t{kPrefillRows} * geometry.target.hiddenSize));
   put(PrefillTensor::InputTokens, bytesFor<uint32_t>(kPrefillRows));
   put(PrefillTensor::Normalized,
       bytesFor<uint16_t>(uint64_t{kPrefillRows} * geometry.target.hiddenSize));

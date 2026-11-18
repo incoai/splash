@@ -264,6 +264,9 @@ struct QwenTargetPrefillBuffers final {
   // Split projections of the chunks the staged tile runs (LinearGguf.cpp).
   ops::LinearScratch linearScratch{};
   std::array<metal::MetalBuffer, 2> hidden;
+  // Immutable scaled embeddings a value-residual mixer reads in every layer,
+  // kept per chunk while grouped prefill advances the chunks together.
+  metal::MetalBuffer embeddings;
   metal::MetalBuffer normalized;
   metal::MetalBuffer captured;
   metal::MetalBuffer gdnPacked;

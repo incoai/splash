@@ -78,7 +78,7 @@ void RippleTarget::addPrefillMixer(PrefillStep &step, const QwenAttentionWeights
     return rowsOf<float>(buffer, sequence.rowBegin, sequence.rows, width);
   };
   linear.addPrefill(step.graph, b.normalized, mixer.inputProjection, b.fullPacked, step.rows, b.linearScratch);
-  ops::ValueMix::add(step.graph, b.normalized, embedRows_, lambda, b.denseIntermediate, step.rows,
+  ops::ValueMix::add(step.graph, b.normalized, b.embeddings, lambda, b.denseIntermediate, step.rows,
                      geometry_.hiddenSize);
   linear.addPrefill(step.graph, b.denseIntermediate, mixer.valueProjection, b.fullPacked, step.rows,
                     b.linearScratch);
@@ -246,27 +246,28 @@ RippleTarget::RippleTarget(const RippleWeights &weights, const QwenTargetGeometr
   // The family's SwiGLU clamp, one F32 the clamped FFN epilogues read.
   if (!(geometry_.swigluClamp > 0.0F))
     throw std::invalid_argument("Ripple's SwiGLU clamp is not a positive threshold");
-  // The scaled token embedding rows, which every block's mix reads back: a
-  // prefill chunk's or a verify batch's, written once per gather.
-  embedRows_ = backend.allocateBuffer(uint64_t{SPLASH_PREFILL_TOKEN_BUDGET} * geometry_.hiddenSize * 2,
+  // A verify block's immutable scaled embeddings; prefill keeps each
+  // chunk's in its own arena slice while the chunks advance together.
+  embedRows_ = backend.allocateBuffer(uint64_t{ExecutionLimits::maximumBatchWidth} * geometry_.verifyRows *
+                                      geometry_.hiddenSize * 2,
                                       metal::BufferStorage::Shared, "ripple embeddings");
 }
 
 RippleTarget::~RippleTarget() = default;
 
 QwenTargetScratchBytes RippleTarget::allocatedScratchBytes() const noexcept {
-  return {embedRows_.sizeBytes(), 0};
+  return {0, embedRows_.sizeBytes()};
 }
 
 void RippleTarget::addEmbedding(metal::CommandGraph &graph, metal::MetalBuffer tokens,
                                 metal::MetalBuffer hidden, uint32_t rows) const {
-  // The gather writes the scaled rows the blocks mix back in, and the block
-  // input reads their copy. A vision family's image rows would write the
-  // block input's placeholders after the copy; the family serves text only.
-  ops::Embedding::add(graph, std::move(tokens), weightsBase_.tokenEmbedding, embedRows_, rows,
+  ops::Embedding::add(graph, std::move(tokens), weightsBase_.tokenEmbedding, hidden, rows,
                       geometry_.embeddingScale);
-  ops::RowCopy::add(graph, embedRows_, {0, geometry_.hiddenSize, 0}, hidden, {0, geometry_.hiddenSize, 0},
-                    rows, geometry_.hiddenSize);
+}
+
+void RippleTarget::addPrefillBegin(PrefillStep &step) const {
+  ops::RowCopy::add(step.graph, step.buffers.hidden[0], {0, geometry_.hiddenSize, 0},
+                    step.buffers.embeddings, {0, geometry_.hiddenSize, 0}, step.rows, geometry_.hiddenSize);
 }
 
 std::vector<metal::MetalBuffer> RippleTarget::addPrefill(metal::CommandGraph &graph,
@@ -320,6 +321,8 @@ void RippleTarget::addVerify(metal::CommandGraph &graph, QwenTargetVerifyBuffers
   if (blockRows > geometry_.verifyRows || chunks.front().row_base)
     throw std::invalid_argument("Ripple verify requires one complete target traversal");
   step.rows = lanes * blockRows;
+  ops::RowCopy::add(graph, buffers.hidden[0], {0, geometry_.hiddenSize, 0}, embedRows_,
+                    {0, geometry_.hiddenSize, 0}, step.rows, geometry_.hiddenSize);
   for (uint32_t index = 0; index < geometry_.layers; ++index) {
     const RippleLayerWeights &layer = weights_.layers[index];
     const metal::MetalBuffer input = buffers.hidden[index & 1], output = buffers.hidden[(index & 1) ^ 1];
@@ -353,9 +356,9 @@ void RippleTarget::addHeadBatch(metal::CommandGraph &graph, metal::MetalBuffer h
 
 QwenTargetScratchBytes qwenTargetScratchBytes(const RippleWeights &, const QwenTargetGeometry &geometry,
                                               uint32_t, uint64_t) {
-  // The target's own scratch in the prefill path: the scaled embedding rows
-  // the blocks mix back in (RippleTarget's embed rows).
-  return {uint64_t{ExecutionLimits::prefillTokenBudget} * geometry.hiddenSize * 2, 0};
+  // The verify batch's immutable scaled embeddings; prefill's belong to
+  // its arena so grouped chunks keep disjoint rows.
+  return {0, uint64_t{ExecutionLimits::maximumBatchWidth} * geometry.verifyRows * geometry.hiddenSize * 2};
 }
 
 std::unique_ptr<QwenTarget> makeQwenTarget(const RippleWeights &weights, const QwenTargetGeometry &geometry,
