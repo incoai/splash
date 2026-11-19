@@ -1,4 +1,5 @@
 #include "ops/Sampling.hpp"
+#include "TokenAutomaton.hpp"
 
 #include "metal/abi/Sampling.h"
 #include "ops/BufferExtent.hpp"
@@ -49,8 +50,14 @@ ThinkingCutoffs thinkingCutoffs(std::span<const SamplingPolicy> policies, uint32
     const SamplingPolicy &policy = policies[lane];
     const std::optional<ThinkingCutoff> &cutoff = policy.thinkingCutoff;
     params.row[lane] = cutoff ? cutoff->row : laneCap;
-    if (params.row[lane] >= laneCap)
-      continue;
+    if (cutoff && !cutoff->markers.empty()) {
+      const TokenAutomaton markers(cutoff->markers);
+      if (!markers.valid(vocabulary) || markers.terminal(cutoff->markerState))
+        throw std::invalid_argument("invalid thinking marker automaton or state");
+      params.automaton_mask |= 1u << lane;
+      params.marker_state[lane] = cutoff->markerState;
+      if (markers.opened(cutoff->markerState)) params.opened_mask |= 1u << lane;
+    } else if (params.row[lane] >= laneCap) continue;
     if (cutoff->end.empty())
       throw std::invalid_argument("a thinking cutoff has no end");
     if (cutoff->waitsForMask) {
@@ -64,7 +71,7 @@ ThinkingCutoffs thinkingCutoffs(std::span<const SamplingPolicy> policies, uint32
     }
     // The rows from the cutoff's on take as many of its end as a lane's rows
     // hold.
-    params.count[lane] = static_cast<uint32_t>(std::min<size_t>(cutoff->end.size(), laneCap - cutoff->row));
+    params.count[lane] = static_cast<uint32_t>(std::min<size_t>(cutoff->end.size(), cutoff->markers.empty() ? laneCap - cutoff->row : laneCap));
     std::copy_n(cutoff->end.begin(), params.count[lane], params.tokens[lane]);
     params.close[lane] = cutoff->end.back();
     params.also_ends[lane] = cutoff->alsoEnds;
@@ -120,9 +127,9 @@ void Sampling::countPenaltyTokens(std::span<uint32_t> words,
     ++words[token];
 }
 
-Sampling::Sampling(uint32_t vocabulary)
-    : vocabulary_(vocabulary), maskWords_((vocabulary + 31) / 32) {
-  if (!vocabulary)
+Sampling::Sampling(uint32_t vocabulary, uint32_t candidates, uint32_t draftRows)
+    : vocabulary_(vocabulary), draftCandidates_(candidates), draftRows_(draftRows), maskWords_((vocabulary + 31) / 32) {
+  if (!vocabulary || (candidates != 16 && candidates != 32) || (draftRows != 8 && draftRows != 16))
     throw std::invalid_argument("invalid sampling geometry");
 }
 
@@ -223,6 +230,7 @@ TargetSamplingParams Sampling::selection(std::span<const SamplingPolicy> policie
   params.mask_words = maskWords_;
   params.mask_row = rows.maskRow;
   params.trees = rows.trees ? 1 : 0;
+  params.draft_positions = draftRows_ - 1;
   std::ranges::copy(stopTokens.ids, params.stop_tokens);
   // The rows each policy's kernels reach, up to the last that reads each
   // buffer: the logits and output tokens of every lane, a workspace the
@@ -272,10 +280,10 @@ TargetSamplingParams Sampling::selection(std::span<const SamplingPolicy> policie
     requireBytes(buffers.treeRows, end * sizeof(TreeRow), "verify tree row");
     requireBytes(buffers.verifySources, end * sizeof(uint32_t), "verify source");
     requireBytes(buffers.candidates,
-                 uint64_t{lanes} * SPLASH_DRAFT_PROPOSAL_TOKENS * SPLASH_DRAFT_CANDIDATES * sizeof(uint32_t),
+                 uint64_t{lanes} * (draftRows_ - 1) * draftCandidates_ * sizeof(uint32_t),
                  "draft candidate");
     requireBytes(buffers.treeDraws, treeRows * SPLASH_TREE_CHILDREN, "draft tree draw");
-    requireBytes(buffers.treeNext, treeRows * SPLASH_DRAFT_CANDIDATES * sizeof(float), "draft tree next");
+    requireBytes(buffers.treeNext, treeRows * draftCandidates_ * sizeof(float), "draft tree next");
   }
   return params;
 }
@@ -305,7 +313,7 @@ void Sampling::addSelection(metal::CommandGraph &graph, const TargetSamplingPara
               {buffers.logits, buffers.constraintMasks, buffers.partialMasses, buffers.vocabularyRows,
                buffers.laneRows},
               params, {most, lanes, 1}, {kVocabularyThreads, 1, 1});
-    graph.add("decode_sample_vocabulary_draw",
+    graph.add(draftCandidates_ == 32 ? "decode_sample_vocabulary_draw_k32" : "decode_sample_vocabulary_draw",
               {buffers.logits, buffers.constraintMasks, buffers.vocabularyRows, buffers.uniforms,
                buffers.outputTokens, buffers.vocabularyRanges, buffers.vocabularyArrivals, buffers.laneRows,
                buffers.treeRows, buffers.verifySources, buffers.candidates, buffers.treeDraws, buffers.treeNext},
@@ -325,6 +333,9 @@ void Sampling::addSelection(metal::CommandGraph &graph, const TargetSamplingPara
   graph.add("decode_sample_thinking_cutoff",
             {buffers.inputTokens, buffers.constraintMasks, buffers.treeRows, buffers.outputTokens, buffers.laneRows},
             cutoffs.params, {lanes, 1, 1}, {1, 1, 1});
+  for (uint32_t lane = 0; lane < kMaximumLanes; ++lane)
+    graph.bytes(6 + lane, lane < policies.size() && policies[lane].thinkingCutoff
+                              ? policies[lane].thinkingCutoff->markers : std::span<const uint32_t>{});
 }
 
 void Sampling::addAcceptance(metal::CommandGraph &graph, AcceptanceBuffers buffers, const StepRows &step,

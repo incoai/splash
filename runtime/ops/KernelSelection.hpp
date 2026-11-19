@@ -35,6 +35,8 @@ struct UnitFormats final {
   // The int8 prefill tile takes every quantized segment, of which there is
   // one at least (quant_prefill_int8_format).
   bool prefillInt8Takes = false;
+  // The 64-row prefill kernels currently cover Q4_K and Q5_K alone.
+  bool prefill64Takes = false;
   bool operator==(const UnitFormats &) const = default;
 };
 // The formats of the projections of a plan (a gate/up plan's up and gate).

@@ -47,10 +47,13 @@ using test::rejects;
 using test::require;
 using test::ulpBf16;
 
-constexpr uint32_t kQueryHeads = 32, kKvHeads = 4, kGroup = kQueryHeads / kKvHeads, kHeadDimension = 128;
+constexpr uint32_t kHeadDimension = 128;
+uint32_t kQueryHeads = 32, kKvHeads = 4, kGroup = kQueryHeads / kKvHeads;
+bool hasSinks = true;
 // The geometry among the families' (TestFamilies.hpp): Flint's.
-constexpr test::AttentionGeometry kGeometry{kQueryHeads, kKvHeads, kHeadDimension, kv::Reads::EveryPage};
-constexpr uint32_t kWindow = 512, kRotaryPairs = kHeadDimension / 2;
+test::AttentionGeometry kGeometry{kQueryHeads, kKvHeads, kHeadDimension, kv::Reads::EveryPage};
+uint32_t kWindow = 512;
+constexpr uint32_t kRotaryPairs = kHeadDimension / 2;
 constexpr uint32_t kPageTokens = kv::kPageTokens;
 // A lane of the narrow cap's rows (a decode lane of up to eight), one
 // attention tile.
@@ -60,7 +63,7 @@ constexpr uint32_t kLaneRows = ops::kNarrowLaneRows;
 constexpr uint32_t kLayer = 1;
 // The two variants a layer of the geometry takes: rotated over a window, and
 // unrotated over its whole history.
-constexpr ops::AttentionVariant kWindowed{.rotated = true, .windowTokens = kWindow};
+ops::AttentionVariant kWindowed{.rotated = true, .windowTokens = kWindow};
 constexpr ops::AttentionVariant kWhole{.rotated = false, .windowTokens = 0};
 // Sinks below, at and above the scores, and one above every score, which
 // leaves its rows' outputs tiny but exact: query head h takes kSinks[h % 4]
@@ -175,9 +178,10 @@ Case makeCase(metal::MetalBackend &backend, kv::Format format, bool int8Queries,
   const std::vector<uint32_t> ids = HostKvExtents::mixedPages(spread, allPages, histories[0] + rows + lanes);
   Case data{layoutOf(format), variant, int8Queries, lanes, rows, histories,
             HostKvExtents(backend, layoutOf(format, kLayer + 1), spread.extentPages, spread.extents),
-            {}, {}, {}, 0, zeroed(backend, kQueryHeads * sizeof(float))};
+            {}, {}, {}, 0, hasSinks ? zeroed(backend, kQueryHeads * sizeof(float)) : metal::MetalBuffer{}};
   data.layer = data.pool.layer(kLayer);
-  for (uint32_t head = 0; head < kQueryHeads; ++head) contents<float>(data.sinks)[head] = sinkOf(head);
+  if (hasSinks)
+    for (uint32_t head = 0; head < kQueryHeads; ++head) contents<float>(data.sinks)[head] = sinkOf(head);
   const bool quantized = format == kv::Format::Int8;
   const uint32_t nan = ids.back();
   for (uint32_t tensor = SPLASH_KV_KEYS; tensor <= SPLASH_KV_VALUE_SCALES; ++tensor) {
@@ -242,6 +246,7 @@ struct Staging final {
   metal::MetalBuffer keys, values, queries, output;
   // Each lane's rows of the command, lane after lane (SplashLaneRows).
   metal::MetalBuffer layout;
+  metal::MetalBuffer packed;
 
   [[nodiscard]] uint64_t queryIndex(uint32_t lane, uint32_t head, uint32_t row, uint32_t dimension) const {
     return (((uint64_t{lane} * kKvHeads + head / kGroup) * stride + row) * kGroup + head % kGroup) * kHeadDimension +
@@ -261,7 +266,8 @@ Staging stage(metal::MetalBackend &backend, const Case &data, uint32_t first, ui
                   zeroed(backend, kvElements * 2),
                   zeroed(backend, kvElements * kGroup * 2),
                   zeroed(backend, kvElements * kGroup * 2),
-                  zeroed(backend, uint64_t{data.lanes} * sizeof(SplashLaneRows))};
+                  zeroed(backend, uint64_t{data.lanes} * sizeof(SplashLaneRows)),
+                  hasSinks ? metal::MetalBuffer{} : zeroed(backend, uint64_t{data.lanes} * rows * (2 * kQueryHeads + 2 * kKvHeads) * kHeadDimension * 2)};
   for (uint32_t lane = 0; lane < data.lanes; ++lane) {
     contents<SplashLaneRows>(staging.layout)[lane] = {lane * rows, rows};
     for (uint32_t row = 0; row < rows; ++row) {
@@ -324,7 +330,7 @@ struct Reference final {
 Reference reference(const Case &data, const StoredKv &kv, uint32_t lane, uint32_t row, uint32_t head) {
   const uint32_t position = data.histories[lane] + row, kvHead = head / kGroup;
   const uint32_t start = windowStart(data.variant, position);
-  const double sink = contents<float>(data.sinks)[head];
+  const double sink = data.sinks ? contents<float>(data.sinks)[head] : -std::numeric_limits<double>::infinity();
   std::array<double, kHeadDimension> queries{};
   for (uint32_t dimension = 0; dimension < kHeadDimension; ++dimension)
     queries[dimension] = query(lane, head, row, dimension);
@@ -353,8 +359,8 @@ Reference reference(const Case &data, const StoredKv &kv, uint32_t lane, uint32_
     const double weight = scores[token - start] / denominator;
     const double *values = &kv.values[kv.index(kvHead, token, 0)];
     for (uint32_t dimension = 0; dimension < kHeadDimension; ++dimension) {
-      result.output[dimension] += weight * values[dimension];
-      result.mass[dimension] += weight * std::fabs(values[dimension]);
+      result.output[dimension] += (hasSinks ? 1.0 : 0.5) * weight * values[dimension];
+      result.mass[dimension] += (hasSinks ? 1.0 : 0.5) * weight * std::fabs(values[dimension]);
     }
   }
   return result;
@@ -467,7 +473,7 @@ std::pair<metal::CommandGraph, ops::PreparedInput> encode(const Case &data, cons
   for (uint32_t lane = 0; lane < data.lanes; ++lane) histories.push_back({data.layer, data.tables[lane]});
   const ops::PreparedInput prepared =
       ops::PagedAttention::addAttention(graph, plan, staging.queries, partials, statistics, sequences, histories,
-                                        rows, output ? *output : ops::AttentionOutputRows{{}, staging.output},
+                                        rows, output ? *output : ops::AttentionOutputRows{staging.packed, staging.output},
                                         data.sinks);
   return {std::move(graph), prepared};
 }
@@ -479,17 +485,18 @@ void checkPlan(const Case &data, const Staging &staging, const ops::AttentionPla
                const metal::CommandGraph &graph) {
   const std::string window = data.variant.windowTokens ? "_w" + std::to_string(data.variant.windowTokens) : "";
   const std::string format = data.layout.format == kv::Format::Int8 ? "q8" : "bf16";
-  require(plan.sinks &&
+  const std::string geometry = "_kv" + std::to_string(kKvHeads) + "_g" + std::to_string(kGroup) + "_d128";
+  require(plan.sinks == hasSinks &&
               plan.splitPipeline() ==
-                  "attention_" + (data.int8Queries ? std::string("q8q") : format) + "_split_kv4_g8_d128" + window &&
-              plan.reducePipeline() == "attention_reduce_kv4_g8_d128" + window + "_sinks",
+                  "attention_" + (data.int8Queries ? std::string("q8q") : format) + "_split" + geometry + window &&
+              plan.reducePipeline() == "attention_reduce" + geometry + window + (hasSinks ? "_sinks" : ""),
           "the plan names another variant's kernels");
   const auto &dispatches = graph.dispatches();
-  require(dispatches.size() == 3 && dispatches[0].pipelineName == "test_staged_kv_store_" + format + "_kv4_d128" &&
+  require(dispatches.size() == 3 && dispatches[0].pipelineName == "test_staged_kv_store_" + format + "_kv" + std::to_string(kKvHeads) + "_d128" &&
               dispatches[0].threadsPerThreadgroup.x == kHeadDimension &&
-              dispatches[2].threadsPerThreadgroup.x == kHeadDimension && dispatches[2].buffers.size() == 8 &&
+              dispatches[2].threadsPerThreadgroup.x == kHeadDimension && dispatches[2].buffers.size() == (hasSinks ? 8 : 7) &&
               dispatches[2].buffers[3].buffer.sameView(staging.output) &&
-              dispatches[2].buffers[7].buffer.sameView(data.sinks),
+              (!hasSinks || dispatches[2].buffers[7].buffer.sameView(data.sinks)),
           "the store and reduce run a thread per dimension, the reduce with the sinks");
   for (uint32_t lane = 0; lane < data.lanes; ++lane)
     require(plan.sequences()[lane].splits == test::attentionSplits(staging.rows, data.histories[lane] + staging.first,
@@ -618,8 +625,8 @@ Reference treeReference(const Case &data, const StoredKv &kv, uint32_t lane, con
     const double weight = scores[i] / denominator;
     const double *values = &kv.values[kv.index(kvHead, tokens[i], 0)];
     for (uint32_t dimension = 0; dimension < kHeadDimension; ++dimension) {
-      result.output[dimension] += weight * values[dimension];
-      result.mass[dimension] += weight * std::fabs(values[dimension]);
+      result.output[dimension] += (hasSinks ? 1.0 : 0.5) * weight * values[dimension];
+      result.mass[dimension] += (hasSinks ? 1.0 : 0.5) * weight * std::fabs(values[dimension]);
     }
   }
   return result;
@@ -1097,7 +1104,7 @@ void checkRopeTables(metal::MetalBackend &backend) {
 // writes the same rows and the table the projection's own preparation
 // writes of them.
 void checkOutputRows(metal::MetalBackend &backend) {
-  constexpr uint32_t kWidth = kQueryHeads * kHeadDimension;
+  const uint32_t kWidth = kQueryHeads * kHeadDimension;
   for (const bool lanesOfEight : {false, true}) {
     const uint32_t lanes = lanesOfEight ? 3 : 1, rows = lanesOfEight ? kLaneRows : 37;
     const Case data = makeCase(backend, kv::Format::Int8, false, kWindowed, lanes, rows,
@@ -1153,12 +1160,32 @@ void checkOutputRows(metal::MetalBackend &backend) {
   std::cout << "ungated output rows: every row, last rows and Table16 of a chunk and of lanes PASS\n";
 }
 
+// Ripple uses the same attention operators over 80 query heads, and its
+// native 16-row verify block is encoded with these prefill tiles.
+void checkRipplePrefill(metal::MetalBackend &backend) {
+  kQueryHeads = 80; kKvHeads = 8; kGroup = 10; kWindow = 1023; hasSinks = false;
+  kGeometry = {kQueryHeads, kKvHeads, kHeadDimension, kv::Reads::EveryPage};
+  kWindowed.windowTokens = kWindow;
+  for (const auto &[format, int8Queries] : {std::pair{kv::Format::Int8, false}, std::pair{kv::Format::Int8, true},
+                                           std::pair{kv::Format::BFloat16, false}}) {
+    for (const auto variant : {kWindowed, kWhole})
+      for (const uint32_t history : {0U, 1023U, 1024U, 4097U})
+        for (const uint32_t rows : {1U, 16U, 33U})
+          checkPrefill(backend, format, int8Queries, variant, history, rows);
+    checkPrefill(backend, format, int8Queries, kWindowed, 4103, 2048, {509});
+    checkPrefill(backend, format, int8Queries, kWhole, 1025, 257, {16, 129});
+  }
+  std::cout << "Ripple attention: BF16/INT8 KV, BF16/INT8 queries, full NoPE and sliding prefill/native16 PASS" << std::endl;
+}
+
 } // namespace
 
 int main(int argc, char **argv) {
   try {
-    require(argc == 2, "usage: attention-variants METALLIB");
+    require(argc == 2 || (argc == 3 && std::string_view(argv[2]) == "--ripple"),
+            "usage: attention-variants METALLIB [--ripple]");
     metal::MetalBackend backend(argv[1]);
+    if (argc == 3) { checkRipplePrefill(backend); return 0; }
     checkPlans(backend);
     checkRopeTables(backend);
     for (const bool rotated : {true, false})
@@ -1203,6 +1230,7 @@ int main(int argc, char **argv) {
       checkWindowWithinHistory(backend, format, int8Queries);
     }
     for (const bool int8Queries : {false, true}) checkNonFiniteQueries(backend, int8Queries);
+    checkRipplePrefill(backend);
     std::cout << "attention variants: PASS\n";
   } catch (const std::exception &error) {
     std::cerr << "attention variants: FAIL: " << error.what() << '\n';

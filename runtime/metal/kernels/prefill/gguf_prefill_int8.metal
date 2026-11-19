@@ -185,7 +185,7 @@ inline void prefill_int8_tile(device const char *codes, device const float2 *sca
       const int m = m_base + i * kInt8FragM + ((e & 7) >> 2) * 8;
       if (m >= M) continue;
       const ulong o = ulong(m) * p.out_stride + p.out_offset + n_run + (e & 3) + 16 * (e >> 3);
-      output[o] = gguf_epilogue<Ep>(cf[i][e], aux, o);
+      output[o] = gguf_epilogue<Ep>(cf[i][e], aux, o, p.clamp);
     }
 }
 
@@ -211,7 +211,7 @@ inline void prefill_int8_tile(device const char *codes, device const float2 *sca
   }
 #define GGUF_PREFILL_INT8_FORMAT(B, f)                                                                                 \
   GGUF_PREFILL_INT8_KERNEL(B, f, a, EpNone) GGUF_PREFILL_INT8_KERNEL(B, f, r, EpResidual)                              \
-  GGUF_PREFILL_INT8_KERNEL(B, f, g, EpUpWithGate)
+  GGUF_PREFILL_INT8_KERNEL(B, f, g, EpUpWithGate) GGUF_PREFILL_INT8_KERNEL(B, f, c, EpClampedUpWithGate)
 GGUF_PREFILL_INT8_FORMAT(4, af4g64)
 GGUF_PREFILL_INT8_FORMAT(5, af5g64)
 #undef GGUF_PREFILL_INT8_FORMAT

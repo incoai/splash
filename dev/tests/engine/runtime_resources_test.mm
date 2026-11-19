@@ -139,7 +139,7 @@ uint64_t residentAllowanceBytes(const RuntimeResourcesConfig &config) {
   kv::Layout layout = config.model.targetKvLayout;
   layout.format = config.kvFormat;
   const uint64_t tokens = std::min<uint64_t>(config.model.capabilities.maximumContextTokens, 65'536) +
-                          model::ExecutionLimits::speculativeScratchTokens;
+                          config.model.draft.rows - 1;
   const uint64_t pages = (tokens + kv::kPageTokens - 1) / kv::kPageTokens;
   uint64_t budget = pages;
   while (kvCapacityPagesFor(layout, budget) < pages) ++budget;
@@ -552,8 +552,8 @@ void testPersistentCacheNamespace() {
   RuntimeCacheIdentity windowed = dense, otherWindow = dense, otherLayers = dense;
   windowed.kvLayout.windowTokens = otherLayers.kvLayout.windowTokens = 512;
   otherWindow.kvLayout.windowTokens = 1024;
-  windowed.kvLayout.windowedLayers = otherWindow.kvLayout.windowedLayers = 0b1100;
-  otherLayers.kvLayout.windowedLayers = 0b0110;
+  windowed.kvLayout.windowedLayers = otherWindow.kvLayout.windowedLayers = splash::kv::LayerMask{0b1100};
+  otherLayers.kvLayout.windowedLayers = splash::kv::LayerMask{0b0110};
   const std::string windowName = persistentCacheNamespace(windowed, model.stateLayout);
   require(windowName != name && persistentCacheNamespace(otherWindow, model.stateLayout) != windowName &&
               persistentCacheNamespace(otherLayers, model.stateLayout) != windowName,

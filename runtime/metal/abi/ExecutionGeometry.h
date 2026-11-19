@@ -5,6 +5,9 @@
 // and the operators sized by these, check the contracts between them.
 #define SPLASH_DRAFT_QUERY_ROWS 8u
 #define SPLASH_DRAFT_PROPOSAL_TOKENS 7u
+// Capacity of the longest compiled draft variant, independent of a target tree.
+#define SPLASH_DRAFT_BLOCK_ROWS_LIMIT 16u
+#define SPLASH_DRAFT_BLOCK_PROPOSALS_LIMIT (SPLASH_DRAFT_BLOCK_ROWS_LIMIT - 1u)
 // The most rows of a lane's verify block: its anchor's and the rows proposed
 // after it, a chain or a tree of them (metal/abi/VerifyTree.h), which may
 // hold more rows than the draft's block: alternatives beside the draft's

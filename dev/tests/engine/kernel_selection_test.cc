@@ -220,6 +220,7 @@ std::string describe(const LinearPlan &plan) {
        << c.oneGateUpPass << " sixteen " << c.sixteenRows << " storage " << plan.storageRows() << " input "
        << unsigned(plan.input()) << " scratch " << s.input << "/" << s.sums << "/" << s.partials << "/"
        << s.counters << "/" << s.rotated << " gate " << plan.gateScratchBytes();
+  if (c.prefill64Rows) line << " prefill64";
   return line.str();
 }
 
@@ -491,7 +492,7 @@ template <class Family> std::vector<AttentionVariant> attentionVariants(const Fa
   std::vector<AttentionVariant> variants;
   const kv::Layout base = family.kvLayout();
   for (uint32_t a = 0; a < base.attentionLayers; ++a) {
-    const AttentionVariant v{.rotated = a >= 64 || !(family.unrotatedLayers >> a & 1),
+    const AttentionVariant v{.rotated = !family.unrotatedLayers.test(a),
                              .windowTokens = base.windowed(a) ? base.windowTokens : 0};
     if (std::find(variants.begin(), variants.end(), v) == variants.end()) variants.push_back(v);
   }
@@ -692,6 +693,16 @@ void int8ActivationsOff() {
     const std::string name = std::to_string(family) + "," + std::to_string(cores);
     const ExecutionPlans on(device(family, cores), Int8Activations::On),
         off(device(family, cores), Int8Activations::Off);
+    for (const auto [n, k] : {std::pair{40960u, 5120u}, std::pair{5120u, 40960u}}) {
+      const Projection p = projection({"wide-pq2", n, k, 1}, {"pq2", {GGUF_FMT_PQ20}});
+      const std::array<const Projection *, 1> unit{&p};
+      for (const uint32_t rows : {16u, 32u, 48u, 64u}) {
+        const auto config = selectProjection(on.calibration(), Int8Activations::On,
+                                            {{n, k}, rows}, int8Formats(unit));
+        test::require(config.decodeInt8 == (family >= 10 && rows <= 32),
+                      name + ": PQ2 decode must use the faster activation format at " + std::to_string(rows));
+      }
+    }
     const Int8Paths paths = int8ActivationsOff(name, on, off);
     const bool int8 = family >= 10;
     if ((paths.prefillTile > 0) != int8 || (paths.decode > 0) != int8 || (paths.queries > 0) != int8)
@@ -751,13 +762,15 @@ void warmupCovers(const std::string &name, const ExecutionPlans &plans, std::vec
                        " rows after " + std::to_string(chunk->second) + " tokens");
   };
   const Linear &linear = plans.linear();
-  // A projection plan's tile, and a staged tile's height, which names its kernels.
+  // The tile and row height that name its kernels, including both prefill variants.
   const auto tile = [](const LinearPlan &plan) {
-    const LinearTile t = plan.configuration().tile;
-    return uint32_t(t) << 8 | (t == LinearTile::GgufStaged ? plan.storageRows() : 0);
+    const LinearConfig c = plan.configuration();
+    const uint32_t rows = c.tile == LinearTile::GgufStaged ? plan.storageRows()
+                          : c.tile == LinearTile::GgufPrefill ? (c.prefill64Rows ? 64u : 128u) : 0u;
+    return uint32_t(c.tile) << 8 | rows;
   };
-  // Of one matrix, whose shape the tile a chunk's rows pick does not follow,
-  // in each set of formats the plans tell apart.
+  // A low-column-count matrix exercises both prefill row heights where the
+  // device selects them, in every set of formats the plans tell apart.
   std::vector<UnitFormats> units;
   for (const FormatSet &set : formatSets()) {
     std::optional<Projection> p;
@@ -940,8 +953,43 @@ void dumpLines(const Golden &golden, const std::string &directory) {
 
 } // namespace
 
+// Every short decode plan holds its live rows, including the column tile
+// for one token and the register tile of whole eight-row groups.
+void subBlockDecodeRows() {
+  for (const auto [family, cores] : kDevices) {
+    const auto calibration = KernelCalibration::of(device(family, cores));
+    for (uint32_t rows = 1; rows < SPLASH_TARGET_VERIFY_ROWS; ++rows)
+      for (const auto epilogue : {LinearEpilogue::None, LinearEpilogue::GateUp,
+                                 LinearEpilogue::ClampedGateUp}) {
+        const auto config = selectProjection(calibration, Int8Activations::Off,
+                                             {{1024, 5120}, rows, epilogue},
+                                             {.registerTakes = true, .weightBits16 = 64, .oneFormat = true});
+        test::require(Linear::plan({{1024, 5120}, rows, epilogue}, config, FloatOutput::BFloat16).storageRows() >= rows,
+                      "a short decode plan dropped live rows");
+      }
+  }
+}
+
+void smallPrefillBoundary() {
+  const UnitFormats formats{.prefill64Takes = true};
+  const auto picks = [&](uint32_t family, uint32_t cores, uint32_t rows, uint32_t columns,
+                         const UnitFormats &unit) {
+    return selectProjection(KernelCalibration::of(device(family, cores)), Int8Activations::On,
+                            {{columns, 5120}, rows}, unit).prefill64Rows;
+  };
+  test::require(picks(10, 40, 65, 119 * 64, formats) && picks(10, 40, 128, 119 * 64, formats),
+                "low-occupancy Q4/Q5 prefill missed the small tile");
+  test::require(!picks(10, 40, 64, 5120, formats) && !picks(10, 40, 129, 5120, formats) &&
+                    !picks(10, 40, 128, 120 * 64, formats) && !picks(10, 20, 128, 512, formats) &&
+                    !picks(9, 40, 128, 512, formats) && !picks(11, 40, 128, 512, formats) &&
+                    !picks(10, 40, 128, 5120, {}),
+                "small prefill tile escaped its measured device, format or occupancy boundary");
+}
+
 int main(int argc, char **argv) {
   try {
+    subBlockDecodeRows();
+    smallPrefillBoundary();
     std::optional<std::string> dump, golden, write;
     for (int i = 1; i < argc; ++i) {
       const std::string arg = argv[i];

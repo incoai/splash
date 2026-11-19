@@ -1,5 +1,6 @@
 #pragma once
 
+#include "TokenAutomaton.hpp"
 #include "metal/abi/ExecutionGeometry.h"
 #include "ops/LaneRows.hpp"
 #include "ops/PagedKv.hpp"
@@ -121,12 +122,18 @@ struct ThinkingBudget final {
   uint32_t tokens = 0;
   std::vector<uint32_t> end;
   uint32_t alsoEnds = 0;
+  std::vector<uint32_t> markers{};
 
   // Why the target cannot end thinking with this budget: no end tokens, or
   // one before the last that would end thinking itself. Null when it can.
-  [[nodiscard]] const char *unusable() const noexcept {
+  [[nodiscard]] const char *unusable(uint32_t vocabulary = 0xffffffffu) const noexcept {
     if (end.empty())
       return "a thinking budget needs end tokens";
+    if (end.size() > 64) return "thinking end token count must be in [1, 64]";
+    if (alsoEnds >= vocabulary || std::any_of(end.begin(), end.end(), [=](uint32_t token) { return token >= vocabulary; }))
+      return "thinking end token is out of vocabulary";
+    if (!markers.empty())
+      return TokenAutomaton(markers).valid(vocabulary) ? nullptr : "invalid thinking marker automaton";
     if (std::any_of(end.begin(), end.end() - 1,
                     [&](uint32_t token) { return token == end.back() || token == alsoEnds; }))
       return "only the last thinking end token may end thinking";
@@ -298,7 +305,8 @@ struct DispatchDraftCapturePlan final {
 // there.
 [[nodiscard]] DraftContextPlan
 planDraftContext(uint32_t replayBegin, uint32_t replayEnd,
-                 std::span<const uint32_t> materializationBoundaries);
+                 std::span<const uint32_t> materializationBoundaries,
+                 uint32_t draftWindow);
 
 [[nodiscard]] DispatchDraftCapturePlan
 draftCaptureSpansForDispatch(const DraftContextPlan &plan,
@@ -911,6 +919,12 @@ public:
   // buffers, and no value when no number of states does (a buffer no cached
   // state holds, such as Qwen's draft rings).
   [[nodiscard]] virtual std::optional<uint32_t> statesToActivate() const noexcept { return 0; }
+  // The draft ring's slots the served model's draft keeps (its compiled
+  // variant's window), which its context plans and length checks read. A
+  // model that does not state its ring keeps the shipped drafts'.
+  [[nodiscard]] virtual uint32_t draftWindow() const noexcept {
+    return SPLASH_DRAFT_SLIDING_WINDOW;
+  }
   // The bytes releaseIdleBuffer(keepLane), called until it gives none,
   // releases once the cache has let go of `evictedStates` more cached states,
   // whose buffers return to the pool: the pooled buffers, beyond those the

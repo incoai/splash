@@ -204,9 +204,12 @@ void sampling() {
   }
   rejects([] { (void)Sampling::workspace(0); }, "invalid sampling workspace row count",
           "a sampling workspace of no rows was sized");
-  rejects([] { (void)DraftSelector::workspace(0); },
+  rejects([] { (void)DraftSelector::workspace(0, SPLASH_DRAFT_CANDIDATES); },
           "invalid draft selector workspace position count",
           "a draft selector workspace of no positions was sized");
+  rejects([] { (void)DraftSelector::workspace(1, 0); },
+          "invalid draft selector candidate count",
+          "a draft selector workspace of no candidates was sized");
   // A family's stop tokens fill the places the kernels compare, those past
   // its list with SPLASH_NO_TOKEN, which is no stop token.
   using splash::ops::StopTokens;

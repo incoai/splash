@@ -855,15 +855,15 @@ void ggufPlans() {
       [&] {
         (void)Linear::plan(down, {.tile = LinearTile::GgufStaged, .oneGateUpPass = true}, FloatOutput::BFloat16);
       },
-      "only a staged or column block gate/up of up to 32 rows runs gate and up in one pass",
+      "only a staged or column block gate/up of up to 64 rows runs gate and up in one pass",
       "a residual plan ran gate/up in one pass");
   rejects(
       [&] {
         (void)Linear::plan({{17408, 5120}, kMaximumPairRows + 1, LinearEpilogue::GateUp},
                            {.tile = LinearTile::GgufStaged, .oneGateUpPass = true}, FloatOutput::BFloat16);
       },
-      "only a staged or column block gate/up of up to 32 rows runs gate and up in one pass",
-      "a gate/up pair of 33 rows ran in one pass");
+      "invalid linear workload",
+      "a gate/up pair past the decode tile ran in one pass");
   // The 16-row tile holds a plan of at most 8 rows on the staged tile only.
   for (const auto &[w, config] :
        {std::pair{down, LinearConfig{.tile = LinearTile::GgufRegister, .sixteenRows = true}},
@@ -872,8 +872,8 @@ void ggufPlans() {
     rejects([&] { (void)Linear::plan(w, config, FloatOutput::BFloat16); },
             "only a staged block plan of at most 8 rows runs the 16-row tile",
             "the 16-row tile took more rows than 8 or another tile");
-  // Int8 activations run on a staged plan of the int8 tiles' 16 to 32 stored rows whose K splits keep whole PQ2_0
-  // blocks: not on the register tile, past 32 rows, or 16 splits of 5120 inputs (160 groups, no multiple of 16 blocks
+  // Int8 activations run on a staged plan of the int8 tiles' 16 to 64 stored rows whose K splits keep whole PQ2_0
+  // blocks: not on the register tile, past 64 rows, or 16 splits of 5120 inputs (160 groups, no multiple of 16 blocks
   // of 4).
   for (const auto &[w, config] :
        {std::pair{LinearWorkload{down.matrix, 16, LinearEpilogue::Residual},
@@ -883,8 +883,13 @@ void ggufPlans() {
         {LinearWorkload{{5120, 5120}, 16, LinearEpilogue::None},
          LinearConfig{.tile = LinearTile::GgufStaged, .splits = 16, .decodeInt8 = true}}})
     rejects([&] { (void)Linear::plan(w, config, FloatOutput::BFloat16); },
-            "only a staged block plan of up to 32 rows of whole PQ2_0 blocks per split runs int8 activations",
+            "only a staged block plan of up to 64 rows of whole PQ2_0 blocks per split runs int8 activations",
             "int8 activations took another tile, rows past the int8 tiles' or a split of a PQ2_0 block");
+  for (const uint32_t rows : {48u, 64u})
+    require(Linear::plan({down.matrix, rows, LinearEpilogue::Residual},
+                         {.tile = LinearTile::GgufStaged, .decodeInt8 = true}, FloatOutput::BFloat16)
+                    .storageRows() == 64,
+            "a wide int8 plan did not select the compiled 64-row tile");
   // A plan of fewer rows on the int8 tiles stores their 16.
   require(Linear::plan(down, {.tile = LinearTile::GgufStaged, .decodeInt8 = true}, FloatOutput::BFloat16)
                   .storageRows() == 16,
@@ -1512,11 +1517,13 @@ void leadingInputViews(metal::MetalBackend &backend) {
   };
   const Projection gguf = ggufView(wideSegment);
   const LinearPlan ggufPlan = residualPrefill({.tile = LinearTile::GgufPrefill}, LinearEpilogue::Residual);
-  {
+  for (const LinearEpilogue epilogue : {LinearEpilogue::None, LinearEpilogue::Residual}) {
+    const LinearPlan plan = residualPrefill({.tile = LinearTile::GgufPrefill}, epilogue);
     metal::CommandGraph graph;
-    (void)linear.add(graph, buffersOf(ggufPlan), gguf, ggufPlan);
-    const std::string kernel = leadingInputsInstance("gguf_prefill_q5k_r");
-    const GgufPrefillLeadingParams params{{k, rows, n, 0}, wide};
+    (void)linear.add(graph, buffersOf(plan), gguf, plan);
+    const std::string kernel = leadingInputsInstance(epilogue == LinearEpilogue::None
+                                                        ? "gguf_prefill_q5k_a" : "gguf_prefill_q5k_r");
+    const GgufPrefillLeadingParams params{{k, rows, n, 0, std::numeric_limits<float>::infinity()}, wide};
     require(graph.dispatches().size() == 1, "a view of leading inputs did not encode one dispatch");
     const metal::ComputeDispatch &dispatch = graph.dispatches()[0];
     require(dispatch.pipelineName == kernel && dispatch.bytes.size() == 1 &&
@@ -1550,12 +1557,12 @@ void leadingInputViews(metal::MetalBackend &backend) {
   const auto refuses = [&](const Projection &view, const LinearPlan &plan) {
     metal::CommandGraph graph;
     rejects([&] { (void)linear.add(graph, buffersOf(plan), view, plan); },
-            "a view of leading inputs runs only the quantized prefill residual tiles",
+            "a view of leading inputs runs only the quantized plain or residual prefill tiles",
             "a view of leading inputs ran on a plan without its instance");
     require(graph.empty(), "a refused view of leading inputs encoded a dispatch");
   };
   refuses(gguf, linear.plan(gguf, 8, LinearEpilogue::Residual));
-  for (const LinearEpilogue epilogue : {LinearEpilogue::None, LinearEpilogue::UpWithGate})
+  for (const LinearEpilogue epilogue : {LinearEpilogue::UpWithGate, LinearEpilogue::ClampedUpWithGate})
     refuses(gguf, residualPrefill({.tile = LinearTile::GgufPrefill}, epilogue));
   refuses(gguf, Linear::plan({{n, k}, 32, LinearEpilogue::Residual},
                              {.tile = LinearTile::GgufStaged}, FloatOutput::BFloat16));

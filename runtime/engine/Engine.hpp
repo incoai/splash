@@ -65,8 +65,9 @@ struct EngineConfig final {
   // only where one layer of a group, or a cut at its floor rows, does
   // (Scheduler). Finite and positive.
   double decodeGapMilliseconds = 500.0;
-  // The prefill checkpoint interval and the resource wait limit.
-  uint32_t prefillCheckpointTokens = kPrefillCheckpointTokens;
+  // Zero derives the checkpoint interval from two served draft windows,
+  // rounded to whole KV pages.
+  uint32_t prefillCheckpointTokens = 0;
   double resourceWaitTimeoutMilliseconds = kResourceWaitTimeoutMilliseconds;
   // The governor that admits the engine's memory and whose ledger holds
   // the requests' claims on it (ClaimHandle), which connectToGovernor sets.

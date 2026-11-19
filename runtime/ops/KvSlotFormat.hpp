@@ -125,8 +125,13 @@ std::vector<std::span<const std::byte>> SlotFormat::transferSpans(const Pages &p
     const std::vector<std::span<std::byte>> spans = pages.spans(page);
     return {spans.begin(), spans.end()};
   }
+  // A page of a lesser form holds the first regions' layers alone (a Slim
+  // page's windowed layers' K/V was trimmed, whose slot bytes keep what a
+  // Full copy of the page wrote): the transfer spans those layers alone.
+  const uint32_t regions = layout_.regions(pages.form(page));
   std::vector<LayerSpans> layers(layout_.attentionLayers);
-  for (uint32_t layer = 0; layer < layout_.attentionLayers; ++layer) layers[layer] = pages.layerSpans(page, layer);
+  for (uint32_t layer = 0; layer < layout_.attentionLayers; ++layer)
+    if (layout_.region(layer) < regions) layers[layer] = pages.layerSpans(page, layer);
   return recordOrder(pages.indexSpans(page), layers);
 }
 
@@ -140,7 +145,9 @@ void SlotFormat::scatterPage(std::span<const std::byte> payload, const Pages &pa
   }
   const SlotRange index = indexRange();
   scatterIndex(payload.subspan(index.offset, index.bytes), pages.indexSpans(page));
+  const uint32_t regions = layout_.regions(pages.form(page));
   for (uint32_t layer = 0; layer < layout_.attentionLayers; ++layer) {
+    if (layout_.region(layer) >= regions) continue;
     const SlotRange records = layerRange(layer);
     scatterLayer(payload.subspan(records.offset, records.bytes), pages.layerSpans(page, layer));
   }

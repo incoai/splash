@@ -7,6 +7,7 @@ from llguidance import LLMatcher, LLTokenizer
 from llguidance.hf import from_tokenizer as guidance_tokenizer
 from llguidance.numpy import allocate_token_bitmask, fill_next_token_bitmask
 
+from . import runtime as engine_runtime
 from .chat_format import THINK_END, THINK_START, TOOL_CALL_OPEN
 from .errors import APIError, ConstraintError
 from .lru import LRUCache
@@ -151,7 +152,7 @@ def validate_tokenizer(tokenizer, chat_format):
     """Before the engine starts, refuse a tokenizer that does not encode the
     tags chat_format reads the model's output by as that format has them:
     the close of thinking, the model's own opening of it where the model
-    opens it, and a call's opening must each be the format's token, and
+    opens it, and a call's opening must be its format's token or round-trip text tag, and
     each stop text one token (check_capabilities checks which stop tokens,
     once the engine names them). Refuse too one whose added tokens the
     server could not keep out of the text a client sent
@@ -169,6 +170,20 @@ def validate_tokenizer(tokenizer, chat_format):
     if chat_format.think_start_id is not None:
         expected[THINK_START] = chat_format.think_start_id
     for token, token_id in expected.items():
+        if token_id is None:
+            # The template's tag is text the tokenizer splits (Ripple's), which
+            # the output's decoding matches: the tokenizer must encode it and
+            # decode it back unchanged, so that a match in the decoded stream
+            # is the tag the template wrote.
+            encoded = tokenizer(token, add_special_tokens=False)["input_ids"]
+            if (
+                not encoded
+                or tokenizer.decode(encoded, skip_special_tokens=True) != token
+            ):
+                raise engine_runtime.EngineUnhealthy(
+                    f"tokenizer must encode {token!r} and decode it back as text"
+                )
+            continue
         if vocabulary.get(token) != token_id or tokenizer.encode(
             token, add_special_tokens=False
         ) != [token_id]:

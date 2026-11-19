@@ -64,10 +64,11 @@ struct TargetSamplingParams {
   // Whether the rows are a decode step's verify rows, whose sampled rows test
   // the children their draft drew (SPLASH_SAMPLING_UNIFORMS).
   uint32_t trees;
+  uint32_t draft_positions;
 };
 
-static_assert(sizeof(TargetSamplingParams) == 108,
-              "Target sampling parameters are 108 bytes on both sides");
+static_assert(sizeof(TargetSamplingParams) == 112,
+              "Target sampling parameters are 112 bytes on both sides");
 
 // The selection of each lane's first token after its prompt from its one row
 // of the logits, row[l]: decode_sample_first_rows writes the lane rows
@@ -169,10 +170,13 @@ struct ThinkingCutoffParams {
   // The token that closes thinking, the last of the lane's end.
   uint32_t close[SPLASH_MAXIMUM_BATCH_WIDTH];
   uint32_t also_ends[SPLASH_MAXIMUM_BATCH_WIDTH];
+  uint32_t automaton_mask;
+  uint32_t marker_state[SPLASH_MAXIMUM_BATCH_WIDTH];
+  uint32_t opened_mask;
   uint32_t tokens[SPLASH_MAXIMUM_BATCH_WIDTH][SPLASH_TARGET_VERIFY_ROWS];
 };
 
-static_assert(sizeof(ThinkingCutoffParams) == 80 + 16 * SPLASH_TARGET_VERIFY_ROWS,
+static_assert(sizeof(ThinkingCutoffParams) == 104 + 16 * SPLASH_TARGET_VERIFY_ROWS,
               "Thinking cutoff parameters are the same size on both sides");
 
 // The batched selector and acceptance kernels' grids cover exactly the
@@ -181,6 +185,12 @@ static_assert(sizeof(ThinkingCutoffParams) == 80 + 16 * SPLASH_TARGET_VERIFY_ROW
 // vocabulary's (ops::DraftVocabulary): column c is token c below `leading`
 // and token c - leading + trailing from there; the codebooks hold a row of
 // each of the `vocabulary` tokens.
+// The larger selector keeps its lattice in the partial-values buffer after the edge tables.
+inline constexpr uint64_t draft_tree_lattice_bytes(uint32_t candidates) {
+  return candidates == 32 ? 4 + uint64_t{SPLASH_DRAFT_BLOCK_PROPOSALS_LIMIT} * candidates *
+                                 (sizeof(uint32_t) + candidates * sizeof(float) + 4u) : 0;
+}
+
 struct SelectorBatchParams {
   uint32_t anchor[SPLASH_MAXIMUM_BATCH_WIDTH];
   uint32_t lanes;
@@ -188,10 +198,12 @@ struct SelectorBatchParams {
   uint32_t columns;
   uint32_t leading;
   uint32_t trailing;
+  uint32_t rows;
+  uint32_t positions;
 };
 
-static_assert(sizeof(SelectorBatchParams) == 36,
-              "Draft selector parameters are 36 bytes on both sides");
+static_assert(sizeof(SelectorBatchParams) == 44,
+              "Draft selector parameters are 44 bytes on both sides");
 
 // The most tokens a host chain proposes: a verify block's rows after its
 // anchor.
@@ -245,14 +257,15 @@ struct DraftTreeParams {
   uint32_t chain[SPLASH_MAXIMUM_BATCH_WIDTH];
   uint32_t children[SPLASH_MAXIMUM_BATCH_WIDTH];
   uint32_t lanes;
+  uint32_t positions;
   float slope[SPLASH_MAXIMUM_BATCH_WIDTH];
-  float intercept[SPLASH_MAXIMUM_BATCH_WIDTH][SPLASH_DRAFT_PROPOSAL_TOKENS];
+  float intercept[SPLASH_MAXIMUM_BATCH_WIDTH][SPLASH_DRAFT_BLOCK_PROPOSALS_LIMIT];
   float temperature[SPLASH_MAXIMUM_BATCH_WIDTH];
   uint32_t noise[SPLASH_MAXIMUM_BATCH_WIDTH][2];
 };
 
-static_assert(sizeof(DraftTreeParams) == 244,
-              "Draft tree parameters are 244 bytes on both sides");
+static_assert(sizeof(DraftTreeParams) == 376,
+              "Draft tree parameters are 376 bytes on both sides");
 
 // The rows of a decode cycle (draft_verify_rows): the `rows` rows of its
 // step's plan (ops::StepRows), laid out over its lanes' trees

@@ -15,6 +15,7 @@ unsloth/Qwen3.8-27B-GGUF:UD-IQ3_XXS	Qwen3.8-27B	24	16	Strongest at this size, sl
 ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF:IQ3_S	Qwen3.8-Flash-Next	96	86	Most capable
 ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF:Q2_0	Qwen3.8-Flash-Next	64	69	Most capable
 unsloth/flint-GGUF:UD-Q4_K_XL	Flint	48	26	Text only
+AtomicChat/Ripple-65B-Preview-GGUF:AD-Q4_K_M	Ripple-65B-Preview	64	49	Dense text reasoning
 unsloth/Ornith-1.5-122B-GGUF:UD-Q4_K_XL	Ornith-1.5-122B	128	82	Largest model
 ornith-ai/Ornith-1.5-122B-MLX-4bit	Ornith-1.5-122B	128	71	Largest model
 prism-ml/Ternary-Bonsai-2-27B-gguf:PQ2_0	Ternary-Bonsai-2-27B	24	12	Smallest download

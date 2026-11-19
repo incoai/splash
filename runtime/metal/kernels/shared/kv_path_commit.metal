@@ -71,4 +71,6 @@ PAGED_ATTENTION_PATH_COMMIT(attention_q8_commit_kv4_d128, 4, 128, int8_t, false)
 PAGED_ATTENTION_PATH_COMMIT(attention_bf16_commit_kv4_d128, 4, 128, bfloat, false)
 PAGED_ATTENTION_PATH_COMMIT(attention_q8_commit_kv2_vt, 2, 256, int8_t, true)
 PAGED_ATTENTION_PATH_COMMIT(attention_bf16_commit_kv2_vt, 2, 256, bfloat, true)
+PAGED_ATTENTION_PATH_COMMIT(attention_q8_commit_kv8_d128, 8, 128, int8_t, false)
+PAGED_ATTENTION_PATH_COMMIT(attention_bf16_commit_kv8_d128, 8, 128, bfloat, false)
 #undef PAGED_ATTENTION_PATH_COMMIT

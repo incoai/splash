@@ -15,6 +15,7 @@ std::array<uint64_t, targetTensorCount> targetTensorBytes(const QwenTargetGeomet
   // Each of a chunk's sequences stages its rows in whole KV blocks
   // (ops::PagedAttention), the last of each block's rows unused.
   const uint64_t stagedRows = rows + uint64_t{kLaneCount} * (kTileRows - 1);
+  if (target.valueResidual) put(TargetTensor::EmbeddingRows, bytesFor<uint16_t>(rows * target.hiddenSize));
   put(TargetTensor::Hidden0, bytesFor<uint16_t>(rows * target.hiddenSize));
   put(TargetTensor::Hidden1, bytesFor<uint16_t>(rows * target.hiddenSize));
   put(TargetTensor::Normalized, bytesFor<uint16_t>(rows * target.hiddenSize));
@@ -105,18 +106,19 @@ prefillTensorBytes(const RuntimeGeometry &geometry,
       bytesFor<float>(geometry.target.rotaryPairs));
   put(PrefillTensor::DraftInverseFrequencies,
       bytesFor<float>(geometry.draftRotaryPairs()));
+  const uint64_t draftContextRows = std::max(kPrefillRows, geometry.draft.window);
   put(PrefillTensor::ContextProjected,
-      bytesFor<uint16_t>(uint64_t{kPrefillRows} * geometry.draft.hiddenSize));
+      bytesFor<uint16_t>(uint64_t{draftContextRows} * geometry.draft.hiddenSize));
   put(PrefillTensor::ContextHidden,
-      bytesFor<uint16_t>(uint64_t{kPrefillRows} * geometry.draft.hiddenSize));
+      bytesFor<uint16_t>(uint64_t{draftContextRows} * geometry.draft.hiddenSize));
   put(PrefillTensor::ContextKv,
-      bytesFor<uint16_t>(uint64_t{kPrefillRows} *
+      bytesFor<uint16_t>(uint64_t{draftContextRows} *
                          geometry.draft.contextKvSize()));
   put(PrefillTensor::DraftRopeCos,
-      bytesFor<float>(uint64_t{kPrefillRows} *
+      bytesFor<float>(uint64_t{draftContextRows} *
                       geometry.draftRotaryPairs()));
   put(PrefillTensor::DraftRopeSin,
-      bytesFor<float>(uint64_t{kPrefillRows} *
+      bytesFor<float>(uint64_t{draftContextRows} *
                       geometry.draftRotaryPairs()));
   // The split partials and counters, the rotated rows, the register tile's
   // tables of the plans of up to 32 rows and the int8 tile's codes and scales
@@ -125,6 +127,9 @@ prefillTensorBytes(const RuntimeGeometry &geometry,
   ops::LinearScratchSize linear;
   for (const auto &projection : geometry.target.prefillProjections)
     linear.include(operators.linear().scratchSize(projection, kPrefillRows));
+  if (geometry.target.swigluClamp > 0)
+    for (const auto &projection : geometry.target.gateUpProjections)
+      linear.include(operators.linear().scratchSize(projection, kPrefillRows, true));
   const auto &draft = geometry.draft;
   for (const ops::ProjectionShape projection :
        {ops::ProjectionShape{draft.hiddenSize, draft.targetHiddenSize()}, {draft.contextKvSize(), draft.hiddenSize}})
@@ -169,10 +174,15 @@ std::array<uint64_t, decodeTensorCount>
 decodeTensorBytes(const RuntimeGeometry &geometry,
                   const ops::ExecutionPlans &operators) {
   std::array<uint64_t, decodeTensorCount> result{};
+  // The rows a decode batch covers: the whole draft block the served
+  // variant proposes (the shipped drafts' 8, a 16-row variant's 16).
+  const uint32_t blockRows = geometry.draft.rows;
+  const uint32_t blockProposals = blockRows - 1;
   const auto draftWorkspace =
-      operators.draftAttentionWorkspacePerLane(geometry.draft.attentionShape());
+      operators.draftAttentionWorkspacePerLane(geometry.draft.attentionShape(), blockRows);
   const auto samplingWorkspace = ops::Sampling::workspace(kDecodeRows);
-  const auto selectorWorkspace = ops::DraftSelector::workspace(kDraftProposalTokens);
+  const auto selectorWorkspace =
+      ops::DraftSelector::workspace(blockProposals, geometry.draft.candidates, blockRows);
   auto put = [&](DecodeTensor tensor, uint64_t bytes) {
     auto &size = result[static_cast<uint32_t>(tensor)];
     size = std::max(size, bytes);
@@ -221,7 +231,7 @@ decodeTensorBytes(const RuntimeGeometry &geometry,
   put(DecodeTensor::AcceptedCount, sizeof(uint32_t));
   put(DecodeTensor::LaneLayout, sizeof(ops::LaneRows));
   // The draft's own rows: its block's, kDraftRows a lane.
-  const uint64_t d = kDraftRows;
+  const uint64_t d = blockRows;
   put(DecodeTensor::DraftInputTokens, bytesFor<uint32_t>(d));
   for (uint32_t index = 0; index < 2; ++index) {
     put(static_cast<DecodeTensor>(
@@ -257,7 +267,7 @@ decodeTensorBytes(const RuntimeGeometry &geometry,
   put(DecodeTensor::DraftTrees, bytesFor<ops::TreeRow>(v));
   put(DecodeTensor::DraftTreeScores, bytesFor<float>(2 * v));
   put(DecodeTensor::DraftTreeDraws, bytesFor<uint8_t>(v * SPLASH_TREE_CHILDREN));
-  put(DecodeTensor::DraftTreeNext, bytesFor<float>(v * SPLASH_DRAFT_CANDIDATES));
+  put(DecodeTensor::DraftTreeNext, bytesFor<float>(v * geometry.draft.candidates));
   put(DecodeTensor::DraftTreeCaps, bytesFor<float>(v));
   put(DecodeTensor::DraftTreeSizes, sizeof(uint32_t));
   put(DecodeTensor::ChainTokens, bytesFor<uint32_t>(SPLASH_TREE_CHAIN_TOKENS));
@@ -297,6 +307,9 @@ ops::LinearScratchSize DecodeArena::linearScratchSize(
   // the draft among them, and the draft's context projections.
   for (const auto &p : geometry.target.decodeProjections)
     result.include(operators.linear().scratchSize(p, kDecodeStepRows));
+  if (geometry.target.swigluClamp > 0)
+    for (const auto &p : geometry.target.gateUpProjections)
+      result.include(operators.linear().scratchSize(p, kDecodeStepRows, true));
   for (const ops::ProjectionShape shape :
        {ops::ProjectionShape{d.hiddenSize, d.targetHiddenSize()}, {d.contextKvSize(), d.hiddenSize}})
     result.include(operators.draftLinear().scratchSize(shape, kDecodeStepRows));
@@ -305,7 +318,7 @@ ops::LinearScratchSize DecodeArena::linearScratchSize(
        {d.qkvSize, d.hiddenSize}, {d.hiddenSize, d.attentionSize},
        {d.intermediateSize, d.hiddenSize}, {d.hiddenSize, d.intermediateSize},
        {d.selectorRank, d.hiddenSize}})
-    result.include(operators.draftLinear().scratchSize(shape, kLaneCount * kDraftRows));
+    result.include(operators.draftLinear().scratchSize(shape, kLaneCount * d.rows));
   return result;
 }
 

@@ -51,12 +51,22 @@ struct QwenGdnWeights final {
 
 struct QwenAttentionWeights final {
   ops::Projection inputProjection;
+  // A mixer whose value projection reads its own mixed input (Ripple's value
+  // residual): the fused projection carries the queries, their gate and the
+  // keys alone, and this carries the value rows, which the mixed input
+  // projects through. Empty for a mixer whose fused projection carries the
+  // value rows with the queries'.
+  ops::Projection valueProjection;
   ops::NormWeights queryNorm;
   ops::NormWeights keyNorm;
   ops::Projection outputProjection;
   // The layer's learned sinks, an F32 per query head, of a geometry whose
   // attention adds them (ops::AttentionPlan::sinks); none otherwise.
   metal::MetalBuffer sinks{};
+
+  [[nodiscard]] bool splitsValue() const noexcept {
+    return valueProjection.outputSize != 0;
+  }
 };
 
 using QwenMixerWeights = std::variant<QwenGdnWeights, QwenAttentionWeights>;
@@ -139,7 +149,7 @@ struct QwenTargetGeometry final : QwenTargetDimensions {
   // the RoPE of the target's pairs unless unrotatedLayers names it, and over
   // the window of kvLayout where that names it.
   [[nodiscard]] constexpr ops::AttentionVariant attentionVariant(uint32_t attention) const noexcept {
-    return {.rotated = attention >= 64 || !(unrotatedLayers >> attention & 1),
+    return {.rotated = !unrotatedLayers.test(attention),
             .windowTokens = kvLayout.windowed(attention) ? kvLayout.windowTokens : 0};
   }
   [[nodiscard]] constexpr std::span<const uint32_t>
@@ -236,7 +246,9 @@ struct QwenTargetPrefillSequence final {
   std::span<const metal::MetalBuffer> convolutionOut;
   std::span<const metal::MetalBuffer> recurrentIn;
   std::span<const metal::MetalBuffer> recurrentOut;
-  std::array<QwenTargetPrefillCapture, 2> captures{};
+  // The chunk's draft capture spans, one per assistant turn the chunk's
+  // rows cover: a long conversation's chunk holds many.
+  std::vector<QwenTargetPrefillCapture> captures;
   uint32_t captureCount = 0;
   // In row order, each inside (0, rows): a cached state's cell, whose
   // recurrent views are codes (ops::StateCodec).
@@ -254,6 +266,9 @@ struct QwenTargetPrefillBuffers final {
   // Split projections of the chunks the staged tile runs (LinearGguf.cpp).
   ops::LinearScratch linearScratch{};
   std::array<metal::MetalBuffer, 2> hidden;
+  // Immutable scaled embeddings a value-residual mixer reads in every layer,
+  // kept per chunk while grouped prefill advances the chunks together.
+  metal::MetalBuffer embeddings;
   metal::MetalBuffer normalized;
   metal::MetalBuffer captured;
   metal::MetalBuffer gdnPacked;
@@ -394,6 +409,8 @@ template <class Layer> [[nodiscard]] std::optional<ops::SwiGluProjections> dense
 // of one.
 template <class Mixer> void includeMixer(QwenTargetGeometry &geometry, const Mixer &mixer) {
   geometry.include(mixer.inputProjection);
+  if constexpr (requires { mixer.splitsValue(); })
+    if (mixer.splitsValue()) geometry.include(mixer.valueProjection);
   geometry.include(mixer.outputProjection);
 }
 inline void includeMixer(QwenTargetGeometry &geometry, const QwenMixerWeights &mixer) {
@@ -458,7 +475,7 @@ public:
   // (LinearPlan::storageRows; a three-lane step on the staged tile runs its
   // 32-row tile over four lanes). The head still processes the step's lanes;
   // padding rows read stale activations and write results no row reads.
-  [[nodiscard]] uint32_t headStorageLanes(uint32_t lanes) const;
+  [[nodiscard]] uint32_t headStorageLanes(uint32_t lanes, uint32_t draftRows = ExecutionLimits::draftQueryRows) const;
   // A prefill command of one or more chunks (a prefill group), run layer by
   // layer: a layer of each chunk in turn, then the next layer, so that a
   // layer whose experts stream loads the union of the chunks' experts once.
@@ -511,6 +528,9 @@ public:
   virtual void addVerifyInput(metal::CommandGraph &graph, const QwenVerifyInput &input) const;
   void addEmbedding(metal::CommandGraph &graph, metal::MetalBuffer tokens,
                     metal::MetalBuffer hidden, uint32_t rows) const;
+  // The draft borrows token-table rows before the target embedding scale.
+  void addDraftEmbedding(metal::CommandGraph &graph, metal::MetalBuffer tokens,
+                         metal::MetalBuffer hidden, uint32_t rows) const;
   // The commit after acceptance of a decode step (`step`, whose lanes' rows
   // the layout places, QwenTargetCommitBuffers::laneRows): in the step's
   // command after its forward, or for constrained decoding in the next
@@ -671,6 +691,9 @@ protected:
                        BlockOutput output) const;
   void addPrefillMixer(PrefillStep &step, const QwenAttentionWeights &mixer, ops::PreparedInput normalized,
                        BlockOutput output, std::span<const ops::AttentionBlocks> blocks = {}) const;
+  // Attention from already projected packed Q/K/V rows, shared by split-value mixers.
+  void addPrefillAttention(PrefillStep &step, const QwenAttentionWeights &mixer, BlockOutput output,
+                           std::span<const ops::AttentionBlocks> blocks = {}) const;
   // The FFNs of a layer whose residual is one row of hiddenSize values: each
   // reads the RMS norm `norm` of the mixer's `residual` rows and adds its
   // output to them into `output`. A dense SwiGLU, in a prefill on the

@@ -957,6 +957,9 @@ void testContract() {
   require(chunkedPrefillValidationError(params) == "page_table_too_short",
           "short page table was accepted");
 
+  // The speculative scratch holds the longest served block's proposals past
+  // the logical ceiling; the boundary is the last committed position whose
+  // whole block fits it.
   ChunkedPrefillParams finalCycle{
       splash::kv::kMaximumLogicalTokens - 1,
       SPLASH_TARGET_VERIFY_ROWS,

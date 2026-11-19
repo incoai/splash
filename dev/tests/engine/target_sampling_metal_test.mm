@@ -35,6 +35,7 @@
 #include "metal/MetalBackend.hpp"
 #include "ops/DraftSelector.hpp"
 #include "ops/Embedding.hpp"
+#include "TokenAutomaton.hpp"
 #include "ops/LaneRows.hpp"
 #include "ops/Sampling.hpp"
 
@@ -81,10 +82,15 @@ constexpr uint32_t kMaskRows = SPLASH_TARGET_VERIFY_ROWS + 1;
 // A lane's tree rows (the selector's draws and next probabilities of each),
 // and the uniforms before its child tests: a verify block's.
 constexpr uint32_t kBlock = SPLASH_TARGET_VERIFY_ROWS;
-constexpr uint32_t kPositions = SPLASH_DRAFT_PROPOSAL_TOKENS;
+#ifndef TARGET_SAMPLING_CANDIDATES
+#define TARGET_SAMPLING_CANDIDATES SPLASH_DRAFT_CANDIDATES
+#define TARGET_SAMPLING_DRAFT_ROWS SPLASH_DRAFT_QUERY_ROWS
+#endif
+constexpr uint32_t kDraftRows = TARGET_SAMPLING_DRAFT_ROWS;
+constexpr uint32_t kPositions = kDraftRows - 1;
 constexpr uint32_t kLanes = SPLASH_MAXIMUM_BATCH_WIDTH;
 constexpr uint32_t kUniforms = SPLASH_SAMPLING_UNIFORMS;
-constexpr uint32_t kCandidates = SPLASH_DRAFT_CANDIDATES;
+constexpr uint32_t kCandidates = TARGET_SAMPLING_CANDIDATES;
 constexpr uint32_t kChildren = SPLASH_TREE_CHILDREN;
 constexpr float kFloatMax = std::numeric_limits<float>::max();
 // Both stop tokens sit below every spike of fillRow; their other places are
@@ -135,10 +141,10 @@ MetalBuffer filled(MetalBackend &backend, uint64_t bytes, uint8_t value) {
 }
 
 // Each of `lanes` lanes' verify block: its kRows rows at lane x kRows.
-std::vector<LaneRows> blocks(size_t lanes) {
+std::vector<LaneRows> blocks(size_t lanes, uint32_t rowCount = kRows) {
   std::vector<LaneRows> result;
   for (uint32_t lane = 0; lane < lanes; ++lane)
-    result.push_back({lane * kRows, kRows});
+    result.push_back({lane * rowCount, rowCount});
   return result;
 }
 
@@ -228,8 +234,9 @@ struct Batch final {
   }
 };
 
-Batch makeBatch(MetalBackend &backend, uint32_t vocabulary, uint32_t lanes) {
-  const uint32_t rows = lanes * kRows;
+Batch makeBatch(MetalBackend &backend, uint32_t vocabulary, uint32_t lanes, uint32_t blockRows = kRows,
+                uint32_t candidates = kCandidates) {
+  const uint32_t rows = lanes * blockRows;
   const auto space = Sampling::workspace(rows);
   return {SamplingBuffers{
               allocate(backend, uint64_t{rows} * vocabulary * sizeof(float)),
@@ -242,15 +249,15 @@ Batch makeBatch(MetalBackend &backend, uint32_t vocabulary, uint32_t lanes) {
               allocate(backend, space.argmaxValuesBytes),
               allocate(backend, space.argmaxIndicesBytes),
               allocate(backend, uint64_t{rows} * sizeof(uint32_t)),
-              chainTree(backend, blocks(lanes)),
+              chainTree(backend, blocks(lanes, blockRows)),
               allocate(backend, space.vocabularyRangesBytes),
               allocate(backend, space.vocabularyArrivalsBytes),
               allocate(backend, uint64_t{lanes} * sizeof(LaneRows)),
               // No row tests children unless a test gives it some.
               filled(backend, uint64_t{rows} * sizeof(uint32_t), 0xff),
-              allocate(backend, uint64_t{lanes} * kPositions * kCandidates * sizeof(uint32_t)),
+              allocate(backend, uint64_t{lanes} * kPositions * candidates * sizeof(uint32_t)),
               filled(backend, uint64_t{lanes} * kBlock * kChildren, 0xff),
-              allocate(backend, uint64_t{lanes} * kBlock * kCandidates * sizeof(float))},
+              allocate(backend, uint64_t{lanes} * kBlock * candidates * sizeof(float))},
           vocabulary, rows};
 }
 
@@ -462,6 +469,38 @@ void requireInitialDraw(const Batch &batch, uint32_t lane, uint32_t row,
               batch.uniforms()[lane * kUniforms], target.ambiguousMass, label);
 }
 
+// Initial selection reads one row of each family's block. Give every row a
+// disjoint distribution so a compacted lane stride cannot select another's.
+void initialBlockLanes(MetalBackend &backend) {
+  constexpr uint32_t vocabulary = 1003;
+  constexpr std::array<float, kLanes> uniforms{0.1F, 0.75F, 0.98F, 0.45F};
+  for (const uint32_t blockRows : {8U, 16U}) {
+    const uint32_t candidates = blockRows == 16 ? 32 : kCandidates;
+    Sampling sampling(vocabulary, candidates, blockRows);
+    for (uint32_t lanes = 1; lanes <= kLanes; ++lanes) {
+      const Batch batch = makeBatch(backend, vocabulary, lanes, blockRows, candidates);
+      std::fill_n(batch.logits(), uint64_t{batch.rows} * vocabulary, -std::numeric_limits<float>::infinity());
+      std::vector<SamplingPolicy> policies(lanes, {.topK = 3, .temperature = 1.0F, .topP = 1.0F});
+      for (uint32_t row = 0; row < batch.rows; ++row)
+        for (uint32_t choice = 0; choice < 3; ++choice)
+          batch.row(row)[3 + 3 * row + choice] = 2.0F - choice;
+      for (uint32_t lane = 0; lane < lanes; ++lane)
+        batch.uniforms()[lane * kUniforms + 0] = uniforms[lane];
+      for (const uint32_t offset : {0U, 3U, blockRows - 1}) {
+        batch.poison();
+        CommandGraph graph;
+        sampling.addInitial(graph, policies, batch.buffers, initialRows(lanes, offset, blockRows), kStopTokens, {});
+        static_cast<void>(backend.submitCommandAsync(graph.dispatches()).wait());
+        for (uint32_t lane = 0; lane < lanes; ++lane)
+          requireInitialDraw(batch, lane, lane * blockRows + offset,
+              referenceDistribution(batch.row(lane * blockRows + offset), vocabulary, policies[lane]),
+              "initial block " + std::to_string(blockRows) + " B" + std::to_string(lanes) +
+                  " lane " + std::to_string(lane));
+      }
+    }
+  }
+}
+
 std::span<uint32_t> tableRow(const MetalBuffer &table, uint32_t vocabulary,
                              uint32_t row) {
   return {static_cast<uint32_t *>(table.contents()) + uint64_t{row} * vocabulary,
@@ -548,7 +587,7 @@ const std::array<SamplingPolicy, kLanes> kMixedPolicies{
 void penalties(MetalBackend &backend, uint32_t vocabulary, uint32_t lanes,
                bool argmaxPath, uint32_t &changedSelections) {
   Random random(0x70656e + uint64_t{vocabulary} * 8 + lanes * 2 + argmaxPath);
-  Sampling sampling(vocabulary);
+  Sampling sampling(vocabulary, kCandidates, kDraftRows);
   const Batch batch = makeBatch(backend, vocabulary, lanes);
   const MetalBuffer table = penaltyTable(backend, vocabulary);
   for (uint32_t row = 0; row < batch.rows; ++row) {
@@ -707,7 +746,7 @@ void speculativeExactness(MetalBackend &backend, uint32_t samplingMask) {
   const std::array<SamplingPenalties, lanes> penalties{
       SamplingPenalties{1.2F, 2.0F, 2.0F}, SamplingPenalties{1.0F, 1.5F, 0.0F}};
   Random random(0x73706563 + samplingMask);
-  Sampling sampling(vocabulary);
+  Sampling sampling(vocabulary, kCandidates, kDraftRows);
   const Batch batch = makeBatch(backend, vocabulary, lanes);
   const MetalBuffer table = penaltyTable(backend, vocabulary);
   const AcceptanceBuffers acceptance = acceptanceBuffers(backend, batch, lanes);
@@ -796,7 +835,7 @@ void extremes(MetalBackend &backend) {
   constexpr uint32_t vocabulary = 1003;
   constexpr uint32_t kSaturated = 50;
   constexpr uint32_t kTopK = 20;
-  Sampling sampling(vocabulary);
+  Sampling sampling(vocabulary, kCandidates, kDraftRows);
   const Batch batch = makeBatch(backend, vocabulary, 1);
   const MetalBuffer table = allocate(backend, uint64_t{kLanes} * vocabulary * 4);
   const std::span<uint32_t> words = tableRow(table, vocabulary, 2);
@@ -883,7 +922,7 @@ void extremes(MetalBackend &backend) {
 // row's token, tree row and selection.
 void bufferExtents(MetalBackend &backend) {
   constexpr uint32_t vocabulary = 1003, lanes = 3;
-  const Sampling sampling(vocabulary);
+  const Sampling sampling(vocabulary, kCandidates, kDraftRows);
   const Batch batch = makeBatch(backend, vocabulary, lanes);
   const MetalBuffer table = penaltyTable(backend, vocabulary);
   const uint64_t logitsRow = uint64_t{vocabulary} * 4, maskRow = uint64_t{batch.maskWords()} * 4;
@@ -1007,7 +1046,7 @@ void bufferExtents(MetalBackend &backend) {
 // encodes nothing.
 void invalidPenalties(MetalBackend &backend) {
   constexpr uint32_t vocabulary = 1003;
-  Sampling sampling(vocabulary);
+  Sampling sampling(vocabulary, kCandidates, kDraftRows);
   const Batch batch = makeBatch(backend, vocabulary, 1);
   const MetalBuffer table = penaltyTable(backend, vocabulary);
   const SamplingPolicy penalized{1, 0.0F, 1.0F, false, false,
@@ -1080,7 +1119,7 @@ void sampledRows(MetalBackend &backend, uint32_t vocabulary, uint32_t lanes,
                  bool minP) {
   Random random(0x77696465 + uint64_t{vocabulary} * 8 + lanes +
                 (minP ? 64 : 0));
-  Sampling sampling(vocabulary);
+  Sampling sampling(vocabulary, kCandidates, kDraftRows);
   const Batch batch = makeBatch(backend, vocabulary, lanes);
   const SamplingPolicy narrow{20, 0.9F, 0.95F, false};
   const SamplingPolicy disabled{0, 1.0F, 0.95F, false};
@@ -1203,7 +1242,7 @@ void sampledRows(MetalBackend &backend, uint32_t vocabulary, uint32_t lanes,
 // are poisoned, so a missing argmax or draw cannot pass by reading old data.
 void mixedVerify(MetalBackend &backend, uint32_t lanes, uint32_t samplingMask) {
   constexpr uint32_t vocabulary = 1003;
-  Sampling sampling(vocabulary);
+  Sampling sampling(vocabulary, kCandidates, kDraftRows);
   const Batch batch = makeBatch(backend, vocabulary, lanes);
   batch.poison();
   Random random(9831 + lanes);
@@ -1273,7 +1312,7 @@ void packedLanes(MetalBackend &backend) {
   policies[2].thinkingCutoff = ThinkingCutoff{0, end, vocabulary - 5};
   policies[3].thinkingCutoff = ThinkingCutoff{3, end, vocabulary - 5};
   const auto stops = shardEdgeStopTokens(vocabulary);
-  Sampling sampling(vocabulary);
+  Sampling sampling(vocabulary, kCandidates, kDraftRows);
   const MetalBuffer table = penaltyTable(backend, vocabulary);
   Random random(0x7061636b);
 
@@ -1374,7 +1413,7 @@ void packedLanes(MetalBackend &backend) {
 void unconstrainedRowsIgnoreMasks(MetalBackend &backend) {
   constexpr uint32_t vocabulary = 1003;
   constexpr uint32_t lanes = 2;
-  Sampling sampling(vocabulary);
+  Sampling sampling(vocabulary, kCandidates, kDraftRows);
   const std::array<SamplingPolicy, lanes> policies{
       SamplingPolicy{},
       SamplingPolicy{
@@ -1417,7 +1456,7 @@ void unconstrainedRowsIgnoreMasks(MetalBackend &backend) {
 // their values, which decide the argmax among equal integer parts: reading
 // them rounded would pick the lowest id instead.
 void targetTop1(MetalBackend &backend, uint32_t vocabulary, uint32_t lanes) {
-  Sampling sampling(vocabulary);
+  Sampling sampling(vocabulary, kCandidates, kDraftRows);
   const Batch batch = makeBatch(backend, vocabulary, lanes);
   const uint32_t words = batch.maskWords();
   for (uint32_t row = 0; row < batch.rows; ++row)
@@ -1513,7 +1552,7 @@ void targetTop1(MetalBackend &backend, uint32_t vocabulary, uint32_t lanes) {
 // pads its other places with SPLASH_NO_TOKEN, which excludes no token.
 void excludedStopTokens(MetalBackend &backend, uint32_t vocabulary) {
   const auto stops = shardEdgeStopTokens(vocabulary);
-  Sampling sampling(vocabulary);
+  Sampling sampling(vocabulary, kCandidates, kDraftRows);
   const Batch batch = makeBatch(backend, vocabulary, kLanes);
   const auto best = [&](uint32_t row) {
     return 5 + row * 7919 % (vocabulary - 8);
@@ -1642,6 +1681,90 @@ void excludedStopTokens(MetalBackend &backend, uint32_t vocabulary) {
 // still fails. The end of a constrained lane that waits for its mask starts
 // at the first row from its cutoff's on whose mask admits the end's first
 // token, the rows before keeping their own selections, and proposes nothing.
+void automatonThinkingCutoffs(MetalBackend &backend) {
+  constexpr uint32_t vocabulary = 512, states = 4, classes = 11;
+  const std::array<std::string_view, 10> pieces{"[", "[\n", "[[", "]", "]\n", "]]\n", "body", " > ", "body]]tail", "junk"};
+  std::vector<uint32_t> program{states, classes, 2, 4, 5, 0, 10, 0};
+  program.resize(8 + (states * classes + 3) / 4);
+  for (uint32_t state = 0; state < states; ++state)
+    for (uint32_t kind = 0; kind < classes; ++kind) {
+      uint32_t next = state;
+      for (const char c : kind ? pieces[kind - 1] : std::string_view("ordinary")) {
+        if (next >= states) break;
+        if (next < 2) next = c == '[' ? next + 1 : 5;
+        else if (c == ']') next = next == 3 ? 4 : 3;
+        else next = 2;
+      }
+      const uint32_t index = state * classes + kind;
+      program[8 + index / 4] |= next << (8 * (index % 4));
+    }
+  const uint32_t offsets = program.size();
+  program.resize(offsets + states);
+  program[offsets + 2] = program.size(); program.insert(program.end(), {2, 23, 23});
+  program[offsets + 3] = program.size(); program.insert(program.end(), {1, 23});
+  program[7] = program.size();
+  for (uint32_t i = 0; i < pieces.size(); ++i) program.push_back(((20 + i) << 8) | (i + 1));
+  const splash::TokenAutomaton automaton(program);
+  require(automaton.valid(vocabulary), "the marker fixture is invalid");
+  const std::vector<uint32_t> end{23, 23};
+  // Reuse allocation layouts: instrumented program reads must stay stable.
+  for (uint32_t repeat = 0; repeat < 8; ++repeat)
+  for (const uint32_t block : {8u, 16u})
+    for (uint32_t lanes = 1; lanes <= 4; ++lanes)
+      for (uint32_t scenario = 0; scenario < 7; ++scenario) {
+        Sampling sampling(vocabulary, SPLASH_DRAFT_CANDIDATES, block);
+        const auto batch = makeBatch(backend, vocabulary, lanes, block);
+        std::vector<SamplingPolicy> policies(lanes, SamplingPolicy{1, 0.8F});
+        for (uint32_t lane = 0; lane < lanes; ++lane) {
+          auto cutoff = ThinkingCutoff{2, end, 0};
+          cutoff.markers = program; cutoff.markerState = 0; cutoff.opened = false;
+          std::vector<uint32_t> proposed(block, 26);
+          if (scenario == 0) { proposed[0] = 22; }
+          if (scenario == 1) { cutoff.markerState = 2; cutoff.row = 7; proposed[1] = 23; proposed[2] = 24; }
+          if (scenario == 2) { cutoff.row = 0; }
+          if (scenario == 3) { cutoff.markerState = 3; cutoff.row = 0; cutoff.end = std::span(end).last(1); }
+          if (scenario == 4) { cutoff.markerState = 2; cutoff.row = 9; }
+          if (scenario == 5) { cutoff.markerState = 1; proposed[0] = 21; }
+          if (scenario == 6) { cutoff.markerState = 2; cutoff.row = 2; proposed[1] = 23; }
+          cutoff.opened = automaton.opened(cutoff.markerState);
+          policies[lane].thinkingCutoff = cutoff;
+          auto *input = static_cast<uint32_t *>(batch.buffers.inputTokens.contents());
+          input[lane * block] = 26;
+          for (uint32_t row = 0; row < block; ++row) {
+            if (row + 1 < block) input[lane * block + row + 1] = proposed[row];
+            std::fill(batch.row(lane * block + row), batch.row(lane * block + row) + vocabulary, -10.0F);
+            batch.row(lane * block + row)[40 + row] = 10.0F;
+          }
+        }
+        std::vector<LaneRows> rows;
+        for (uint32_t lane = 0; lane < lanes; ++lane) rows.push_back({lane * block, block});
+        writeChains(batch.buffers.treeRows, rows);
+        const auto step = layOut(batch.buffers, rows);
+        auto uncut = policies;
+        for (auto &policy : uncut) policy.thinkingCutoff.reset();
+        CommandGraph reference;
+        sampling.addVerify(reference, uncut, batch.buffers, step, StopTokens{500}, {});
+        static_cast<void>(backend.submitCommandAsync(reference.dispatches()).wait());
+        for (uint32_t lane = 0; lane < lanes; ++lane)
+          for (uint32_t row = 0; row < block; ++row)
+            require(batch.outputTokens()[lane * block + row] == 40 + row, "marker fixture's uncut selection is wrong");
+        CommandGraph graph;
+        sampling.addVerify(graph, policies, batch.buffers, step, StopTokens{500}, {});
+        static_cast<void>(backend.submitCommandAsync(graph.dispatches()).wait());
+        const auto *tokens = static_cast<const uint32_t *>(batch.buffers.outputTokens.contents());
+        const uint32_t at = scenario == 0 || scenario == 5 ? 3 : scenario == 3 ? 0 : scenario == 4 ? 9 : scenario == 6 ? 2 : block;
+        const uint32_t count = scenario == 3 || scenario == 6 ? 1 : 2;
+        for (uint32_t lane = 0; lane < lanes; ++lane)
+          for (uint32_t row = 0; row < block; ++row)
+            require(tokens[lane * block + row] == (row >= at && row < at + count ? 23 : 40 + row),
+                    "a BPE marker cutoff selected the wrong row or suffix: block " + std::to_string(block) +
+                        " lanes " + std::to_string(lanes) + " scenario " + std::to_string(scenario) +
+                        " lane " + std::to_string(lane) + " row " + std::to_string(row) +
+                        " got " + std::to_string(tokens[lane * block + row]) +
+                        " expected " + std::to_string(row >= at && row < at + count ? 23 : 40 + row));
+      }
+}
+
 void thinkingCutoffs(MetalBackend &backend, uint32_t vocabulary) {
   const auto stops = shardEdgeStopTokens(vocabulary);
   const uint32_t close = vocabulary - 3, alsoEnds = vocabulary - 5;
@@ -1654,7 +1777,7 @@ void thinkingCutoffs(MetalBackend &backend, uint32_t vocabulary) {
       end.push_back(vocabulary - 6 - index % 5);
     end.push_back(close);
   }
-  Sampling sampling(vocabulary);
+  Sampling sampling(vocabulary, kCandidates, kDraftRows);
   const Batch batch = makeBatch(backend, vocabulary, kLanes);
   // Each row's best token, far above the rest, unless the row prefers top.
   const auto best = [&](uint32_t row) { return 5 + row * 7919 % (vocabulary - 16); };
@@ -1746,9 +1869,11 @@ void thinkingCutoffs(MetalBackend &backend, uint32_t vocabulary) {
     const auto mismatch = std::ranges::mismatch(drafts, rows.first(kDrafts));
     return mismatch.in1 == drafts.end() ? kRows : uint32_t(mismatch.in1 - drafts.begin()) + 1;
   };
+  uint32_t verifyCase = 0;
   const auto verifyLanes = [&](CommandGraph &verify, std::span<const SamplingPolicy> policies,
                                const std::array<std::array<uint32_t, kRows>, kLanes> &expected,
                                const std::array<std::array<uint32_t, kDrafts>, kLanes> &drafts) {
+    ++verifyCase;
     std::fill(uniforms, uniforms + kLanes * kUniforms, 0.5F);
     sampling.addVerify(verify, policies, batch.buffers, layOut(batch.buffers, blocks(policies.size())), stops, {});
     require(cutoffDispatches(verify) == 1, "a verify with cutoffs dispatched them other than once");
@@ -1756,8 +1881,21 @@ void thinkingCutoffs(MetalBackend &backend, uint32_t vocabulary) {
     static_cast<void>(backend.submitCommandAsync(verify.dispatches()).wait());
     const auto *retained = static_cast<const uint32_t *>(acceptance.retainedCounts.contents());
     for (uint32_t lane = 0; lane < kLanes; ++lane) {
-      require(retained[lane] == retainedRows(drafts[lane], expected[lane]),
-              "a lane retained the wrong tokens at its cutoff");
+      const uint32_t wanted = retainedRows(drafts[lane], expected[lane]);
+      if (retained[lane] != wanted) {
+        std::string details = "thinking cutoff case=" + std::to_string(verifyCase) +
+            " lane=" + std::to_string(lane) + " row=" +
+            std::to_string(policies[lane].thinkingCutoff->row) + " end=" +
+            std::to_string(policies[lane].thinkingCutoff->end.size()) + " waiting=" +
+            std::to_string(policies[lane].thinkingCutoff->waitsForMask) + " retained=" +
+            std::to_string(retained[lane]) + " expected=" + std::to_string(wanted) + " tokens=";
+        for (uint32_t row = 0; row < kRows; ++row) details += std::to_string(tokens[lane * kRows + row]) + ",";
+        details += " expected_tokens=";
+        for (uint32_t token : expected[lane]) details += std::to_string(token) + ",";
+        details += " drafts=";
+        for (uint32_t token : drafts[lane]) details += std::to_string(token) + ",";
+        throw std::runtime_error(details);
+      }
       for (uint32_t row = 0; row < retained[lane]; ++row)
         require(tokens[lane * kRows + row] == expected[lane][row], "a lane's tokens missed its thinking cutoff");
     }
@@ -1987,7 +2125,7 @@ void thinkingCutoffs(MetalBackend &backend, uint32_t vocabulary) {
 // the first one cut has none.
 void ties(MetalBackend &backend) {
   constexpr uint32_t vocabulary = 248320;
-  Sampling sampling(vocabulary);
+  Sampling sampling(vocabulary, kCandidates, kDraftRows);
   const Batch batch = makeBatch(backend, vocabulary, 1);
   const MetalBuffer table = allocate(backend, uint64_t{kLanes} * vocabulary * 4);
   const std::array<uint32_t, 1> tableRows{1};
@@ -2074,7 +2212,7 @@ void onlyTheMostLikelyIsGreedy() {
 // from both sides: one has its probability, the other none.
 void minPCuts(MetalBackend &backend) {
   constexpr uint32_t vocabulary = 4096;
-  Sampling sampling(vocabulary);
+  Sampling sampling(vocabulary, kCandidates, kDraftRows);
   const Batch batch = makeBatch(backend, vocabulary, 1);
   struct Class final {
     uint32_t first;
@@ -2151,7 +2289,7 @@ void speculativeWholeVocabulary(MetalBackend &backend) {
   constexpr uint32_t lanes = 4;
   constexpr std::array<uint32_t, lanes> kWrongAt{2, kPositions, 4, 6};
   Random random(0x77686f6c);
-  Sampling sampling(vocabulary);
+  Sampling sampling(vocabulary, kCandidates, kDraftRows);
   const Batch batch = makeBatch(backend, vocabulary, lanes);
   const std::vector<SamplingPolicy> policies{
       {0, 1.0F, 1.0F, false},
@@ -2234,7 +2372,7 @@ void speculativeWholeVocabulary(MetalBackend &backend) {
 // of the temperature alone once took thousands and stalled the batch.
 void extremeSearches(MetalBackend &backend) {
   constexpr uint32_t vocabulary = 248320;
-  Sampling sampling(vocabulary);
+  Sampling sampling(vocabulary, kCandidates, kDraftRows);
   const Batch batch = makeBatch(backend, vocabulary, 1);
   const MetalBuffer table = allocate(backend, uint64_t{kLanes} * vocabulary * 4);
   const std::array<uint32_t, 1> tableRows{2};
@@ -2314,7 +2452,7 @@ void extremeSearches(MetalBackend &backend) {
 void nonFiniteRowsSelectTheSentinel(MetalBackend &backend) {
   constexpr uint32_t vocabulary = 1003;
   constexpr uint32_t kSentinel = 0xFFFFFFFFU;
-  Sampling sampling(vocabulary);
+  Sampling sampling(vocabulary, kCandidates, kDraftRows);
   const Batch batch = makeBatch(backend, vocabulary, 1);
   const AcceptanceBuffers acceptance = acceptanceBuffers(backend, batch, 1);
   Random random(0x6e616e);
@@ -2392,7 +2530,7 @@ void treeSelections(MetalBackend &backend) {
   const uint32_t close = vocabulary - 3, alsoEnds = vocabulary - 5;
   const std::array<uint32_t, 2> end{vocabulary - 6, close};
   constexpr std::array<uint32_t, kRows> parents{0, 0, 0, 1, 1, 2, 5, 5};
-  Sampling sampling(vocabulary);
+  Sampling sampling(vocabulary, kCandidates, kDraftRows);
   const Batch batch = makeBatch(backend, vocabulary, 2);
   auto *tree = static_cast<TreeRow *>(batch.buffers.treeRows.contents());
   Random random(0x70617468);
@@ -2616,7 +2754,7 @@ void recursiveRejectionSampling() {
   };
   double worst = 0.0;
   for (uint32_t trial = 0; trial < 300; ++trial) {
-    std::vector<double> p(24);
+    std::vector<double> p(kCandidates + 8);
     dirichlet(p, trial % 5);
     Children children;
     std::vector<uint32_t> tokens(p.size());
@@ -2746,7 +2884,7 @@ void setChildren(const Batch &batch, uint32_t lane, uint32_t row, uint32_t depth
 // threshold or the policy's cut is ambiguous.
 void childTests(MetalBackend &backend) {
   constexpr uint32_t vocabulary = 1003;
-  Sampling sampling(vocabulary);
+  Sampling sampling(vocabulary, kCandidates, kDraftRows);
   const Batch batch = makeBatch(backend, vocabulary, kLanes);
   const MetalBuffer table = penaltyTable(backend, vocabulary);
   const std::array<uint32_t, kLanes> tableRows{};
@@ -2851,7 +2989,7 @@ void childTests(MetalBackend &backend) {
 // rounding of its threshold.
 void dominantChild(MetalBackend &backend) {
   constexpr uint32_t vocabulary = 1003;
-  Sampling sampling(vocabulary);
+  Sampling sampling(vocabulary, kCandidates, kDraftRows);
   const Batch batch = makeBatch(backend, vocabulary, kLanes);
   const MetalBuffer table = penaltyTable(backend, vocabulary);
   const std::array<uint32_t, kLanes> tableRows{};
@@ -2911,7 +3049,7 @@ void dominantChild(MetalBackend &backend) {
 // candidates, one count a row.
 void keptCandidatesAlone(MetalBackend &backend) {
   constexpr uint32_t vocabulary = 1003;
-  Sampling sampling(vocabulary);
+  Sampling sampling(vocabulary, kCandidates, kDraftRows);
   const Batch batch = makeBatch(backend, vocabulary, kLanes);
   const MetalBuffer table = penaltyTable(backend, vocabulary);
   const std::array<uint32_t, kLanes> tableRows{};
@@ -3055,7 +3193,7 @@ bool followsDistribution(const std::vector<uint32_t> &counts, const std::vector<
 // on one candidate, which fp32 holds as 1.
 void childTestsOnTrees(MetalBackend &backend, const SamplingPolicy &policy, bool peaked, uint32_t walked) {
   constexpr uint32_t vocabulary = 1003, kRuns = 1500, kTreeRows = 7;
-  Sampling sampling(vocabulary);
+  Sampling sampling(vocabulary, kCandidates, kDraftRows);
   const Batch batch = makeBatch(backend, vocabulary, kLanes);
   const MetalBuffer table = penaltyTable(backend, vocabulary);
   const std::array<uint32_t, kLanes> tableRows{};
@@ -3165,7 +3303,7 @@ void childTestsOnTrees(MetalBackend &backend, const SamplingPolicy &policy, bool
 void childTestsUnderAFloor(MetalBackend &backend, const SamplingPolicy &policy, bool ownDraws) {
   constexpr uint32_t vocabulary = 1003, kRuns = 1500, kTreeRows = 3;
   constexpr float kFloor = 0.15F;
-  Sampling sampling(vocabulary);
+  Sampling sampling(vocabulary, kCandidates, kDraftRows);
   const Batch batch = makeBatch(backend, vocabulary, kLanes);
   const MetalBuffer table = penaltyTable(backend, vocabulary);
   const std::array<uint32_t, kLanes> tableRows{};
@@ -3297,10 +3435,10 @@ void childTestsUnderAFloor(MetalBackend &backend, const SamplingPolicy &policy, 
 // one with probability 4.7e-4 (the chi-square tail past nu + 5 sqrt(2 nu)),
 // all five below 2.4e-3; the seeds are fixed, so a passing run repeats.
 void childTestsOfTheSelectorsDraws(MetalBackend &backend, const SamplingPolicy &policy) {
-  constexpr uint32_t vocabulary = 1003, kRuns = 1500, kTreeRows = 3, kDraftRows = SPLASH_DRAFT_QUERY_ROWS;
+  constexpr uint32_t vocabulary = 1003, kRuns = 1500, kTreeRows = 3;
   constexpr uint32_t kRank = SPLASH_DRAFT_SELECTOR_RANK;
-  Sampling sampling(vocabulary);
-  const DraftSelector selector(vocabulary);
+  Sampling sampling(vocabulary, kCandidates, kDraftRows);
+  const DraftSelector selector(vocabulary, kCandidates, kDraftRows);
   const Batch batch = makeBatch(backend, vocabulary, kLanes);
   const MetalBuffer table = penaltyTable(backend, vocabulary);
   const std::array<uint32_t, kLanes> tableRows{};
@@ -3311,7 +3449,7 @@ void childTestsOfTheSelectorsDraws(MetalBackend &backend, const SamplingPolicy &
   // probabilities, at position 1 the children's shared ones at the first
   // child's, every other token far below. bf16 edge factors of 0.1 at most,
   // so that a child's next probabilities follow its own predecessor.
-  const auto workspace = DraftSelector::workspace(kLanes * kPositions);
+  const auto workspace = DraftSelector::workspace(kLanes * kPositions, kCandidates, kDraftRows);
   const auto bfloat = [&](uint64_t count) {
     MetalBuffer buffer = allocate(backend, count * sizeof(uint16_t));
     auto *values = static_cast<uint16_t *>(buffer.contents());
@@ -3540,8 +3678,14 @@ void penaltyLifecycle() {
 int main(int argc, char **argv) {
   std::string stage = "setup";
   try {
+    if (argc == 3 && std::string_view(argv[2]) == "--markers") {
+      MetalBackend backend(argv[1]);
+      automatonThinkingCutoffs(backend);
+      std::cout << "target marker cutoffs: PASS\n";
+      return 0;
+    }
     if (argc != 2)
-      throw std::invalid_argument("usage: target-sampling METALLIB");
+      throw std::invalid_argument("usage: target-sampling METALLIB [--markers]");
     stage = "penalty words";
     penaltyWords();
     stage = "penalty lifecycle";
@@ -3551,6 +3695,8 @@ int main(int argc, char **argv) {
     stage = "recursive rejection sampling";
     recursiveRejectionSampling();
     MetalBackend backend(argv[1]);
+    stage = "initial block lanes";
+    initialBlockLanes(backend);
     stage = "invalid penalties";
     invalidPenalties(backend);
     stage = "buffer extents";
@@ -3617,6 +3763,7 @@ int main(int argc, char **argv) {
       stage = "thinking cutoffs, vocabulary " + std::to_string(vocabulary);
       thinkingCutoffs(backend, vocabulary);
     }
+    automatonThinkingCutoffs(backend);
     for (uint32_t lanes = 1; lanes <= kLanes; ++lanes) {
       for (uint32_t mask = 0; mask < (1U << lanes); ++mask) {
         stage = "mixed verify B" + std::to_string(lanes) + ", sampling mask " +

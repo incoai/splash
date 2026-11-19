@@ -23,15 +23,20 @@ ExecutionPlans::ExecutionPlans(const DeviceCapabilities &device, Int8Activations
 // 19 s for the 27B's cold 17-row chunk on a 16-core Apple9 plan.
 std::vector<uint32_t> ExecutionPlans::prefillRowClasses() const {
   std::vector<uint32_t> first;
-  std::pair<LinearTile, uint32_t> last{};
+  const std::array<UnitFormats, 2> units{{{}, {.prefill64Takes = true}}};
+  std::array<std::pair<LinearTile, uint32_t>, units.size()> last{};
   for (uint32_t rows = 1; rows <= SPLASH_PREFILL_TOKEN_BUDGET; ++rows) {
-    const LinearPlan plan = linear_.plan({{GGUF_TILE_COLUMNS, GGUF_TILE_COLUMNS}, rows});
-    const LinearTile tile = plan.configuration().tile;
-    // Only the staged and register tiles' kernels are named by their height.
-    const bool named = tile == LinearTile::GgufStaged || tile == LinearTile::GgufRegister;
-    const std::pair key{tile, named ? plan.storageRows() : 0};
-    if (first.empty() || key != last) first.push_back(rows);
-    last = key;
+    const LinearWorkload workload{{GGUF_TILE_COLUMNS, GGUF_TILE_COLUMNS}, rows};
+    bool changed = first.empty();
+    for (size_t index = 0; index < units.size(); ++index) {
+      const auto config = selectProjection(calibration(), linear_.int8Activations(), workload, units[index]);
+      const LinearPlan plan = Linear::plan(workload, config, FloatOutput::BFloat16);
+      const bool named = config.tile == LinearTile::GgufStaged || config.tile == LinearTile::GgufRegister;
+      const std::pair key{config.tile, named ? plan.storageRows() : config.prefill64Rows ? GGUF_PREFILL_ROWS / 2 : 0};
+      changed |= key != last[index];
+      last[index] = key;
+    }
+    if (changed) first.push_back(rows);
   }
   return first;
 }
@@ -71,8 +76,8 @@ AttentionPlan ExecutionPlans::attention(std::span<const kv::ChunkedPrefillParams
 }
 
 DraftAttentionPlan ExecutionPlans::draftAttention(DraftAttentionShape shape,
-                                                 uint32_t lanes) const {
-  return DraftAttention::plan(shape, lanes);
+                                                 uint32_t lanes, uint32_t rows) const {
+  return DraftAttention::plan(shape, lanes, rows);
 }
 
 MoePlan ExecutionPlans::moe(MoeShape shape, uint32_t routerFormat, uint32_t rows) const {
@@ -90,8 +95,8 @@ AttentionWorkspace ExecutionPlans::laneAttentionWorkspace(uint32_t queryHeads, k
 // The draft workspace is linear in the lanes: one lane's is every width's
 // share.
 DraftAttentionWorkspace ExecutionPlans::draftAttentionWorkspacePerLane(
-    DraftAttentionShape shape) const {
-  return DraftAttention::plan(shape, 1).workspace();
+    DraftAttentionShape shape, uint32_t rows) const {
+  return DraftAttention::plan(shape, 1, rows).workspace();
 }
 
 MoeWorkspace ExecutionPlans::moeWorkspace(MoeShape shape, uint32_t routerFormat, uint32_t maximumRows) const {

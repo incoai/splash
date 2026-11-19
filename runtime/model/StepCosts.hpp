@@ -180,7 +180,7 @@ public:
   // A cycle's step under --verify-rows all: a draft's block a lane, no more
   // than each lane holds (`holds`, its anchor and the rows past it it may
   // verify), at the narrow cap, so that its outputs repeat.
-  [[nodiscard]] static ops::StepRows block(std::span<const uint32_t> holds);
+  [[nodiscard]] static ops::StepRows block(std::span<const uint32_t> holds, uint32_t draftRows = kNarrowCap);
   // A forced step of `rows` rows over `lanes` lanes, a row a lane to a
   // verify block's, at `laneCap` where given (the start's measured points,
   // RuntimeInstrumentation::forceStepRows), else at the cap its rows need

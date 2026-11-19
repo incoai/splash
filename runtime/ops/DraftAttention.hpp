@@ -1,6 +1,7 @@
 #pragma once
 
 #include "metal/CommandGraph.hpp"
+#include "metal/abi/DraftAttention.h"
 #include "metal/abi/ExecutionGeometry.h"
 #include "ops/LaneRows.hpp"
 
@@ -17,6 +18,11 @@ struct DraftAttentionShape final {
   uint32_t queryHeads = 0;
   uint32_t kvHeads = 0;
   uint32_t headDimension = 0;
+  // The ring length and convolution taps of the compiled variant the shape
+  // runs on, the shipped drafts' unless a variant's config states otherwise.
+  uint32_t window = SPLASH_DRAFT_SLIDING_WINDOW;
+  uint32_t convolutionTaps = SPLASH_DRAFT_CONVOLUTION_TAPS;
+  bool rotated = true;
 
   bool operator==(const DraftAttentionShape &) const = default;
 };
@@ -37,14 +43,24 @@ class DraftAttentionPlan final {
 public:
   [[nodiscard]] DraftAttentionShape shape() const noexcept { return shape_; }
   [[nodiscard]] uint32_t lanes() const noexcept { return lanes_; }
+  // The rows a cycle drafts (the compiled variant's block; the ABI's 8
+  // unless the served draft's variant states more).
+  [[nodiscard]] uint32_t rows() const noexcept { return rows_; }
+  // The compiled draft geometry the plan runs on (metal/abi/DraftAttention.h).
+  [[nodiscard]] const SplashDraftVariant &variant() const noexcept {
+    return *variant_;
+  }
   [[nodiscard]] DraftAttentionWorkspace workspace() const noexcept;
 
 private:
-  DraftAttentionPlan(DraftAttentionShape shape, uint32_t lanes)
-      : shape_(shape), lanes_(lanes) {}
+  DraftAttentionPlan(DraftAttentionShape shape, const SplashDraftVariant &variant,
+                     uint32_t lanes, uint32_t rows)
+      : shape_(shape), variant_(&variant), lanes_(lanes), rows_(rows) {}
 
   DraftAttentionShape shape_;
+  const SplashDraftVariant *variant_;
   uint32_t lanes_;
+  uint32_t rows_;
 
   friend class DraftAttention;
 };
@@ -84,7 +100,8 @@ struct DraftDecodeAttentionBuffers final {
 class DraftAttention final {
 public:
   [[nodiscard]] static DraftAttentionPlan plan(DraftAttentionShape shape,
-                                               uint32_t lanes);
+                                               uint32_t lanes,
+                                               uint32_t rows = SPLASH_DRAFT_QUERY_ROWS);
 
   static void addConvolution(metal::CommandGraph &graph,
                              DraftConvolutionBuffers buffers,
@@ -126,12 +143,13 @@ public:
   // `width` values the slot's keys and values are computed from, in 4-bit
   // codes of 64-value groups with each group's fp16 scale and minimum
   // (metal/abi/DraftAttention.h). Positions map to slots as in the rings.
-  [[nodiscard]] static uint64_t contextWindowBytes(uint32_t width);
+  [[nodiscard]] static uint64_t contextWindowBytes(uint32_t width, uint32_t window = SPLASH_DRAFT_SLIDING_WINDOW);
   // Stores `rows` context rows in the slots of positions startPosition on.
   static void addWindowStore(metal::CommandGraph &graph,
                              metal::MetalBuffer context,
                              metal::MetalBuffer window, uint32_t rows,
-                             uint32_t startPosition, uint32_t width);
+                             uint32_t startPosition, uint32_t width,
+                             const SplashDraftVariant &variant = SPLASH_DRAFT_VARIANTS[0]);
   // Stores the first `rows` (at most a verify block's) of the context rows a
   // lane retained of its rows of a decode step of `contextRows` context rows
   // (`retained`, its acceptance's mask of them, metal/abi/VerifyTree.h, among
@@ -143,12 +161,19 @@ public:
                               metal::MetalBuffer retained,
                               metal::MetalBuffer laneRows,
                               uint32_t contextRows, uint32_t rows,
-                              uint32_t startPosition, uint32_t width);
+                              uint32_t startPosition, uint32_t width,
+                             const SplashDraftVariant &variant = SPLASH_DRAFT_VARIANTS[0]);
   // Loads the rows of positions startPosition on back into `rows` rows.
   static void addWindowLoad(metal::CommandGraph &graph,
                             metal::MetalBuffer window,
                             metal::MetalBuffer context, uint32_t rows,
-                            uint32_t startPosition, uint32_t width);
+                            uint32_t startPosition, uint32_t width,
+                            const SplashDraftVariant &variant);
 };
+
+// The compiled draft geometry a shape runs on; invalid_argument when no
+// compiled variant's kernels serve it.
+[[nodiscard]] const SplashDraftVariant &draftVariant(
+    const DraftAttentionShape &shape);
 
 } // namespace splash::ops

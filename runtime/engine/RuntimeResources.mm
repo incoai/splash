@@ -555,8 +555,11 @@ std::string persistentCacheNamespace(const RuntimeCacheIdentity &identity,
   // A sliding window (kv::Layout::windowTokens), which also orders a page's
   // regions in its slot (kv::Layout::region) and labels a slot with its
   // page's form (KvSlotLabel). A layout without one keeps the line it had.
-  if (kv.windowedLayers)
-    canonical << " window " << kv.windowTokens << " layers 0x" << std::hex << kv.windowedLayers << std::dec;
+  if (!kv.windowedLayers.empty()) {
+    canonical << " window " << kv.windowTokens << " layers 0x" << std::hex << kv.windowedLayers.words[0];
+    if (kv.windowedLayers.words[1]) canonical << "/" << kv.windowedLayers.words[1];
+    canonical << std::dec;
+  }
   // How a slot holds a page; nothing for the spans' order, so the caches
   // written before slots had another order stay valid.
   canonical << KvPageTier::slotFormatToken(kv) << '\n'
@@ -575,8 +578,14 @@ std::string persistentCacheNamespace(const RuntimeCacheIdentity &identity,
   if (gdn.auxiliaryBytes) canonical << " auxiliary " << gdn.auxiliaryBytes;
   canonical << '\n'
             << "draft " << draft.layers << ' ' << draft.kvHeads << ' ' << draft.headDimension << ' '
-            << SPLASH_DRAFT_SLIDING_WINDOW << '\n'
+            << draft.window << '\n'
             << "context " << draft.contextWidth << " q4 " << SPLASH_DRAFT_CONTEXT_GROUP << '\n';
+  if (draft.slidingWindow || !draft.unrotatedLayers.empty()) {
+    canonical << "draft layers";
+    for (uint32_t layer = 0; layer < draft.layers; ++layer)
+      canonical << ' ' << draft.layerWindow(layer) << (draft.unrotatedLayers.test(layer) ? 'n' : 'r');
+    canonical << '\n';
+  }
   // Without YaRN the line is left out, so the caches written before it
   // existed stay valid. The factor takes the digits that read back as the
   // same double, so no two factors share a namespace.
@@ -1129,7 +1138,7 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
                                                  .deferWrites = readers->criticalBusyProbe()};
     const model::SlotFile::Options stateFileOptions{.deferWrites = readers->criticalBusyProbe()};
     DiskTier disk = openDiskTier(config, cacheNamespace, stateStagingBytes ? cacheDiskBytes : 0, kvSlotBytes,
-                                 kvSlotLabelBytes(kvLayout.windowedLayers != 0), kvFileOptions, stateBytes,
+                                 kvSlotLabelBytes(!kvLayout.windowedLayers.empty()), kvFileOptions, stateBytes,
                                  stateFileOptions, config.relaunchContext && memoryPlan.breakdown().kvSpill.enabled);
     if (memoryPlan.breakdown().kvSpill.enabled) {
       kvFileOpen = disk.kv != nullptr;
@@ -1223,7 +1232,7 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
     // A windowed layout's pages give up their windowed layers' K/V where
     // they can (kv::Layout::slimmable), unless --kv-window-trim off.
     std::optional<CacheWindowPolicy> windowPolicy;
-    if (kvLayout.windowedLayers)
+    if (!kvLayout.windowedLayers.empty())
       windowPolicy = CacheWindowPolicy{.windowPages = kvLayout.windowPages(),
                                        .trim = kvLayout.slimmable() && config.kvWindowTrim};
     auto cache = std::make_unique<engine::Cache>(*kvPool, kvTier.get(), disk.budget, spillPolicy, windowPolicy);

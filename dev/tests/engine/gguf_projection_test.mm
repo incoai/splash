@@ -34,6 +34,7 @@
 //   64-input coefficient units, which two partitions split into one and two.
 // Every run leaves the padding columns past its segments, the guard bands past its buffers and its counters as they
 // were. The token gather (ops::Embedding) of every format's rows as stored is checked here too.
+#include <iostream>
 #include "GgufFormatReference.hpp"
 #include "LinearNumerics.hpp"
 #include "TestBuffers.hpp"
@@ -81,10 +82,10 @@ namespace {
 
 constexpr uint32_t kLaneRows = 8, kMaximumLanes = 4, kMaximumRows = kLaneRows * kMaximumLanes;
 // The staged tile's lanes of 8 rows, to the decode tiles' 64 rows; the register tile, the one-pass pair and the int8
-// tiles hold kMaximumLanes (kMaximumRegisterRows, kMaximumPairRows, kMaximumInt8Rows).
+// tiles also test sixteen-row lanes up to 64 rows (kMaximumPairRows, kMaximumInt8Rows).
 constexpr uint32_t kMaximumStagedLanes = kMaximumDecodeTileRows / kLaneRows;
-static_assert(kMaximumRows == kMaximumRegisterRows && kMaximumRows == kMaximumPairRows &&
-              kMaximumRows == kMaximumInt8Rows);
+static_assert(kMaximumRows == kMaximumRegisterRows && kMaximumRows <= kMaximumPairRows &&
+              kMaximumRows <= kMaximumInt8Rows);
 // Every K split a plan takes: the powers of two up to the largest.
 constexpr uint32_t kSplits[] = {1, 2, 4, 8, 16};
 static_assert(kSplits[std::size(kSplits) - 1] == LinearConfig::kMaximumSplits);
@@ -114,7 +115,7 @@ void fail(const std::string &what) {
   ++failures;
 }
 void section(const std::string &what) {
-  std::cout << what << (sectionFailures ? " FAIL (" + std::to_string(sectionFailures) + " failures)" : " ok") << '\n';
+  std::cout << what << (sectionFailures ? " FAIL (" + std::to_string(sectionFailures) + " failures)" : " ok") << std::endl;
   sectionFailures = 0;
 }
 
@@ -125,6 +126,8 @@ const char *epilogueName(LinearEpilogue e) {
     case LinearEpilogue::Residual: return "residual";
     case LinearEpilogue::GateUp: return "gate/up";
     case LinearEpilogue::UpWithGate: return "up-with-gate";
+    case LinearEpilogue::ClampedGateUp: return "clamped gate/up";
+    case LinearEpilogue::ClampedUpWithGate: return "clamped up-with-gate";
   }
   return "?";
 }
@@ -252,6 +255,12 @@ double siluError(double gate) {
   return (2 * (3 + std::floor(2 * t)) + 2 * std::log(2.0) * t + 1 + 2 * 2.5) * 0x1p-24;
 }
 double silu(double g) { return g / (1 + std::exp(-g)); }
+// The clamp a clamped epilogue applies to one activation: to the sum's
+// interval, elementwise.
+Interval clamped(Interval v, float limit) {
+  return {std::clamp(v.lo, double(-limit), double(limit)),
+          std::clamp(v.hi, double(-limit), double(limit))};
+}
 // fl(bf16(up) * silu_gate(gate)): the corners of bf16(up)'s interval times silu's. The fast-math division is only
 // bounded for divisors up to 2^126, which 1 + exp2(t) exceeds from t = 126, and the kernels' fp32 flushes values below
 // its normal range to zero: there either factor, and a product below that range, may be zero.
@@ -338,12 +347,20 @@ struct Operands {
       : input(bfloats(backend, x)), aux(bfloats(backend, auxiliary)),
         output(backend, uint64_t{plan.storageRows()} * plan.workload().matrix.outputSize * 2, 0xFF),
         gate(backend, plan.gateScratchBytes(), 0xFF) {
-    if (plan.workload().epilogue == LinearEpilogue::UpWithGate) gate = bfloats(backend, auxiliary);
+    if (plan.workload().epilogue == LinearEpilogue::UpWithGate ||
+        plan.workload().epilogue == LinearEpilogue::ClampedUpWithGate) gate = bfloats(backend, auxiliary);
   }
   [[nodiscard]] LinearBuffers bindings(const LinearPlan &plan, const Scratch &scratch) const {
-    const bool residual = plan.workload().epilogue == LinearEpilogue::Residual;
-    return {.input = input.view, .output = output.view, .residual = residual ? aux.view : MetalBuffer{},
-            .gateScratch = gate.view, .scratch = scratch.bindings()};
+    const LinearEpilogue epilogue = plan.workload().epilogue;
+    const bool residual = epilogue == LinearEpilogue::Residual;
+    const bool clamped = epilogue == LinearEpilogue::ClampedGateUp ||
+                         epilogue == LinearEpilogue::ClampedUpWithGate;
+    return {.input = input.view,
+            .output = output.view,
+            .residual = residual ? aux.view : MetalBuffer{},
+            .gateScratch = gate.view,
+            .scratch = scratch.bindings(),
+            .clamp = clamped ? 20.0F : std::numeric_limits<float>::infinity()};
   }
 };
 
@@ -379,9 +396,19 @@ Outcome run(MetalBackend &backend, const Linear &linear, const LinearPlan &plan,
     }
   static_cast<void>(backend.submitCommandAsync(graph.dispatches()).wait());
   if (!scratch.intact() || !o.input.intact() || !o.aux.intact() || !o.output.intact() || !o.gate.intact())
-    fail(label + ": a counter is not reset or a write past a buffer");
+    {
+      fail(label + ": a counter is not reset or a write past a buffer");
+      std::cout << "  guards: table=" << scratch.table.intact() << " sums=" << scratch.sums.intact()
+                << " partials=" << scratch.partials.intact() << " counters=" << scratch.counters.intact()
+                << " rotated=" << scratch.rotated.intact() << " input=" << o.input.intact()
+                << " output=" << o.output.intact() << " gate=" << o.gate.intact() << '\n';
+      const auto *counts = static_cast<const uint32_t *>(scratch.counters.view.contents());
+      for (uint32_t i = 0, shown = 0; i < scratch.counters.bytes / 4 && shown < 8; ++i)
+        if (counts[i]) { std::cout << "  counter " << i << " = " << counts[i] << '\n'; ++shown; }
+    }
   Outcome out{o.output.halves(),
-              plan.workload().epilogue == LinearEpilogue::GateUp ? o.gate.halves() : std::vector<uint16_t>{}, {}};
+              (plan.workload().epilogue == LinearEpilogue::GateUp ||
+               plan.workload().epilogue == LinearEpilogue::ClampedGateUp) ? o.gate.halves() : std::vector<uint16_t>{}, {}};
   for (const ComputeDispatch &dispatch : graph.dispatches()) out.pipelines.push_back(dispatch.pipelineName);
   const uint32_t columns = plan.workload().matrix.outputSize;
   for (const std::vector<uint16_t> *rows : {&out.output, &out.gate})
@@ -420,6 +447,18 @@ void checkValues(const Outcome &out, const Want &want, const Want &gate, const s
           check("the gate", i, out.gate[i], gate(i));
           check("the output", i, out.output[i], withGate(p, bf16ToFloat(out.gate[i])));
           break;
+        // The clamped epilogues clamp both activations at the plan's
+        // threshold before the silu and the product; the gate scratch holds
+        // its unclamped sums.
+        case LinearEpilogue::ClampedUpWithGate:
+          check("the output", i, out.output[i],
+                withGate(clamped(p, 20.0F), std::min(bf16ToFloat(aux[i]), 20.0F)));
+          break;
+        case LinearEpilogue::ClampedGateUp:
+          check("the gate", i, out.gate[i], gate(i));
+          check("the output", i, out.output[i],
+                withGate(clamped(p, 20.0F), std::min(bf16ToFloat(out.gate[i]), 20.0F)));
+          break;
       }
     }
   if (outside) fail(label + ": " + std::to_string(outside) + " values outside the fp64 bound; " + first);
@@ -428,7 +467,7 @@ void checkValues(const Outcome &out, const Want &want, const Want &gate, const s
 // The fp32 destination of `plan` (the logits) over the input rows `x` of `bf16`, the run of its bf16 plan: every
 // value of the active rows and covered columns rounds to that run's output bit for bit and lies within its interval
 // before the rounding; the padding columns, guards and counters stay as they were.
-void floatOutput(MetalBackend &backend, const Linear &linear, const LinearPlan &plan, const Projection &p,
+void floatOutputOnce(MetalBackend &backend, const Linear &linear, const LinearPlan &plan, const Projection &p,
                  const std::vector<uint16_t> &x, const Outcome &bf16, const Want &want, uint32_t covered,
                  const std::string &label) {
   const uint32_t columns = plan.workload().matrix.outputSize;
@@ -457,6 +496,19 @@ void floatOutput(MetalBackend &backend, const Linear &linear, const LinearPlan &
     wrong += floatToBf16(value) != bf16.output[i] || !(value >= bound.lo && value <= bound.hi);
   }
   if (wrong) fail(label + " fp32: " + std::to_string(wrong) + " values differ from the bf16 run or their interval");
+}
+
+// Reusing instrumented parameter bindings must preserve both the FP32
+// values and the poison guards, not merely succeed on the first dispatch.
+void floatOutput(MetalBackend &backend, const Linear &linear, const LinearPlan &plan, const Projection &p,
+                 const std::vector<uint16_t> &x, const Outcome &bf16, const Want &want, uint32_t covered,
+                 const std::string &label) {
+  const uint32_t repeats = plan.configuration().tile == LinearTile::GgufStaged && plan.configuration().spread &&
+                                  plan.configuration().splits == 2 && plan.workload().rows == 16 &&
+                                  plan.workload().matrix.inputSize == 2304 && covered == 512
+                              ? 32 : 1;
+  for (uint32_t repeat = 0; repeat < repeats; ++repeat)
+    floatOutputOnce(backend, linear, plan, p, x, bf16, want, covered, label);
 }
 
 bool sameRows(const std::vector<uint16_t> &a, uint64_t aRow, const std::vector<uint16_t> &b, uint64_t bRow,
@@ -551,15 +603,22 @@ void decodeTile(MetalBackend &backend, const Linear &linear, LinearTile tile, bo
             const uint32_t storage = plan.storageRows(), rows = wl.rows;
             const std::string label = what + " L=" + std::to_string(lanes);
             const std::vector<uint16_t> aux = storageRows(residual, columns, rows, storage);
-            const Outcome out = run(backend, linear, plan, up, gated, storageRows(x, K, rows, storage), aux,
-                                    kPoisonFinite, N, label);
-            checkValues(out, within(dots, staged), within(gateDots, staged), aux, wl, rows, N, label);
-            if (epilogue == LinearEpilogue::None)
-              floatOutput(backend, linear, Linear::plan(wl, config(tile, splits, spread), FloatOutput::Float32), up,
-                          storageRows(x, K, rows, storage), out, within(dots, staged), N, label);
-            for (uint32_t lane = 0; lane < lanes; ++lane)
-              if (!sameRows(out.output, lane * kLaneRows, lanesAlone[lane].output, 0, kLaneRows, columns))
-                fail(label + ": lane " + std::to_string(lane) + " differs from its one-lane projection");
+            // Stress the wide two-pass case against its independent row references.
+            const uint32_t repeats = staged && spread && w.format == Fmt(GGUF_FMT_Q3K) && K == 2304 &&
+                                             inputs == Inputs::Dense && epilogue == LinearEpilogue::GateUp &&
+                                             splits == 2 && lanes == 8
+                                         ? 512u : 1u;
+            for (uint32_t repetition = 0; repetition < repeats; ++repetition) {
+              const Outcome out = run(backend, linear, plan, up, gated, storageRows(x, K, rows, storage), aux,
+                                      kPoisonFinite, N, label);
+              checkValues(out, within(dots, staged), within(gateDots, staged), aux, wl, rows, N, label);
+              if (epilogue == LinearEpilogue::None)
+                floatOutput(backend, linear, Linear::plan(wl, config(tile, splits, spread), FloatOutput::Float32), up,
+                            storageRows(x, K, rows, storage), out, within(dots, staged), N, label);
+              for (uint32_t lane = 0; lane < lanes; ++lane)
+                if (!sameRows(out.output, lane * kLaneRows, lanesAlone[lane].output, 0, kLaneRows, columns))
+                  fail(label + ": lane " + std::to_string(lane) + " differs from its one-lane projection");
+            }
           }
         }
     }
@@ -748,17 +807,18 @@ void gateUpPairs(MetalBackend &backend, const Linear &linear, LinearTile tile) {
 // Gate/up in one pass (LinearConfig::oneGateUpPass) on the staged tile, gate and up in each format ([768, K]), and in
 // Q4_K and MLX 4-bit at the 27B's [17408, 5120]: at every lane count, K split the tile takes and walk, and for one
 // lane on the 16-row tile too, bitwise the output of the gate and up passes, whatever the partials held before.
-void oneGateUpPass(MetalBackend &backend, const Linear &linear, bool spread) {
+void oneGateUpPass(MetalBackend &backend, const Linear &linear, bool spread,
+                    uint32_t nativeRows = kLaneRows, LinearEpilogue epilogue = LinearEpilogue::GateUp) {
   uint32_t mostSplits = 1;
   const auto pairs = [&](Fmt f, uint32_t N, uint32_t K, uint32_t columns, std::span<const uint32_t> lanes) {
     const Tensor g = tensor(backend, f, N, K), u = tensor(backend, f, N, K);
     const Projection gate = projection({&g}, columns), up = projection({&u}, columns);
-    const std::vector<float> x = activations(Inputs::Dense, kMaximumRows, K);
+    const std::vector<float> x = activations(Inputs::Dense, nativeRows * kMaximumLanes, K);
     for (const uint32_t splits : kSplits) {
       if (!takesSplits(LinearTile::GgufStaged, f, K, splits)) continue;
       mostSplits = std::max(mostSplits, splits);
       for (const uint32_t l : lanes) {
-        const LinearWorkload wl = decode({columns, K}, l, LinearEpilogue::GateUp);
+        const LinearWorkload wl{{columns, K}, l * nativeRows, epilogue};
         LinearConfig c = config(LinearTile::GgufStaged, splits, spread);
         const LinearPlan twoPasses = Linear::plan(wl, c, FloatOutput::BFloat16);
         c.oneGateUpPass = true;
@@ -766,11 +826,20 @@ void oneGateUpPass(MetalBackend &backend, const Linear &linear, bool spread) {
         const std::string label = std::string(fmtName(f)) + " " + std::to_string(N) + "x" + std::to_string(K) +
                                   " S=" + std::to_string(splits) + " L=" + std::to_string(l);
         const std::vector<uint16_t> rows = storageRows(x, K, wl.rows, onePass.storageRows());
-        const Outcome two = run(backend, linear, twoPasses, up, &gate, rows, {}, kPoisonNaN, N, label + " two passes");
-        const Outcome one = run(backend, linear, onePass, up, &gate, rows, {}, kPoisonFinite, N, label);
-        if (!sameRows(one.output, 0, two.output, 0, wl.rows, columns)) fail(label + ": differs from the two passes");
+        const auto compare = [&] {
+          const Outcome two = run(backend, linear, twoPasses, up, &gate, rows, {}, kPoisonNaN, N, label + " two passes");
+          const Outcome one = run(backend, linear, onePass, up, &gate, rows, {}, kPoisonFinite, N, label);
+          if (!sameRows(one.output, 0, two.output, 0, wl.rows, columns)) fail(label + ": differs from the two passes");
+          return two;
+        };
+        const Outcome two = compare();
+        // Instrumented reductions must overwrite poisoned partials on every
+        // reuse, including the two split counts that exposed stale NaNs.
+        if (spread && f == Q4K && N == 768 && nativeRows == kLaneRows && l == 2 &&
+            (splits == 2 || splits == 8))
+          for (uint32_t repeat = 1; repeat < 512; ++repeat) static_cast<void>(compare());
         // One lane on the 16-row tile, over a padding lane of NaN rows.
-        if (l > 1) continue;
+        if (l > 1 || nativeRows != kLaneRows) continue;
         c.sixteenRows = true;
         const LinearPlan sixteen = Linear::plan(wl, c, FloatOutput::BFloat16);
         const Outcome wide = run(backend, linear, sixteen, up, &gate, storageRows(x, K, wl.rows, sixteen.storageRows()),
@@ -784,7 +853,8 @@ void oneGateUpPass(MetalBackend &backend, const Linear &linear, bool spread) {
   constexpr uint32_t kAllLanes[] = {1, 2, 3, 4}, kEndLanes[] = {1, kMaximumLanes};
   for (int fi = 0; fi < FMT_COUNT; ++fi) pairs(Fmt(fi), 768, K, 768 + kPadding, kAllLanes);
   for (const Fmt f : {Q4K, Fmt(GGUF_FMT_AF4G64)}) pairs(f, 17408, 5120, 17408, kEndLanes);
-  section(walkName(LinearTile::GgufStaged, spread) + " one-pass gate/up: " + std::to_string(FMT_COUNT) +
+  section(walkName(LinearTile::GgufStaged, spread) + " " + std::to_string(nativeRows) +
+          " rows per lane " + epilogueName(epilogue) + " one-pass gate/up: " + std::to_string(FMT_COUNT) +
           " formats at 768x" + std::to_string(K) + ", 1-4 lanes, and Q4_K and MLX 4-bit at 17408x5120, 1 and 4 lanes, "
           "S 1-" + std::to_string(mostSplits) + ", one lane on the 16-row tile too, bitwise the two passes");
 }
@@ -1017,7 +1087,8 @@ Want int8Bound(const Int8Products &p, uint32_t K, uint32_t splits) {
   return [&p, e](uint64_t i) { return Interval{p.value[i] - e * p.magnitude[i], p.value[i] + e * p.magnitude[i]}; };
 }
 
-void decodeInt8(MetalBackend &backend, const Linear &linear) {
+void decodeInt8(MetalBackend &backend, const Linear &linear, uint32_t nativeRows = kLaneRows) {
+  const uint32_t maximumRows = kMaximumLanes * nativeRows;
   const bool int8Tiles = linear.calibration().projection.decodeInt8FromRows != kNever;
   uint32_t ran = 0, production = 0;
   // A rotated projection of `parts` and its sign buffer.
@@ -1039,6 +1110,18 @@ void decodeInt8(MetalBackend &backend, const Linear &linear) {
                            const std::vector<uint16_t> &x, const std::vector<uint16_t> &aux, uint32_t poison,
                            uint32_t covered, const std::string &label) {
     const Outcome out = run(backend, linear, plan, p, gate, x, aux, poison, covered, label);
+    // Repeated two-pass projections must preserve the gate and output,
+    // including instrumented runs with recycled scratch allocations.
+    if (nativeRows == kLaneRows && plan.workload().rows == 2 * nativeRows &&
+        plan.workload().epilogue == LinearEpilogue::ClampedGateUp &&
+        plan.configuration().splits == 8 && plan.configuration().spread &&
+        !plan.configuration().oneGateUpPass) {
+      for (uint32_t repeat = 1; repeat < 1024; ++repeat) {
+        const Outcome again = run(backend, linear, plan, p, gate, x, aux, poison, covered, label);
+        if (again.gate != out.gate || again.output != out.output)
+          fail(label + ": a repeated two-pass projection differs");
+      }
+    }
     if (std::none_of(out.pipelines.begin(), out.pipelines.end(),
                      [](const std::string &name) { return name.starts_with("gguf_decode_int8_"); }))
       fail(label + ": runs no int8 tile");
@@ -1053,33 +1136,33 @@ void decodeInt8(MetalBackend &backend, const Linear &linear) {
     const Tensor up = tensor(backend, PQ20, N, K), gateTensor = tensor(backend, PQ20, N, K);
     const Projection p = rotatedProjection({&up}, columns, signBuffer),
                      gate = rotatedProjection({&gateTensor}, columns, signBuffer);
-    const std::vector<float> x = int8Inputs(kMaximumRows, K, signs);
-    const std::vector<float> residual = residuals(kMaximumRows, columns);
-    const Int8Products d = int8Products({&up}, columns, x, kMaximumRows, signs),
-                       g = int8Products({&gateTensor}, columns, x, kMaximumRows, signs);
-    for (const LinearEpilogue epilogue : {LinearEpilogue::None, LinearEpilogue::Residual, LinearEpilogue::GateUp}) {
-      const Projection *gated = epilogue == LinearEpilogue::GateUp ? &gate : nullptr;
+    const std::vector<float> x = int8Inputs(maximumRows, K, signs);
+    const std::vector<float> residual = residuals(maximumRows, columns);
+    const Int8Products d = int8Products({&up}, columns, x, maximumRows, signs),
+                       g = int8Products({&gateTensor}, columns, x, maximumRows, signs);
+    for (const LinearEpilogue epilogue : {LinearEpilogue::None, LinearEpilogue::Residual, LinearEpilogue::GateUp, LinearEpilogue::ClampedGateUp}) {
+      const Projection *gated = (epilogue == LinearEpilogue::GateUp || epilogue == LinearEpilogue::ClampedGateUp) ? &gate : nullptr;
       for (const uint32_t splits : kSplits) {
         if (!decodeInt8TakesSplits(K, splits)) continue;
         for (const bool spread : {false, true}) {
           std::vector<uint16_t> oneLane;
           for (uint32_t lanes = 1; lanes <= kMaximumLanes; ++lanes) {
-            const LinearWorkload w = decode({columns, K}, lanes, epilogue);
+            const LinearWorkload w{{columns, K}, lanes * nativeRows, epilogue};
             // One lane on the 16-row tile: the int8 tiles hold 16 or 32 rows.
             LinearConfig c{.tile = LinearTile::GgufStaged, .splits = splits, .spread = spread,
-                           .sixteenRows = lanes == 1, .decodeInt8 = true};
+                           .sixteenRows = nativeRows == kLaneRows && lanes == 1, .decodeInt8 = true};
             const LinearPlan plan = Linear::plan(w, c, FloatOutput::BFloat16);
             const uint32_t storage = plan.storageRows();
             const std::vector<uint16_t> rows = storageRows(x, K, w.rows, storage),
                                         aux = storageRows(residual, columns, w.rows, storage);
             const std::string label = std::string("int8 pq2_0 ") + epilogueName(epilogue) + " lanes " +
-                                      std::to_string(lanes) + " S" + std::to_string(splits) + (spread ? " spread" : "");
+                                      std::to_string(lanes) + " native rows " + std::to_string(nativeRows) + " S" + std::to_string(splits) + (spread ? " spread" : "");
             const Outcome out = runInt8(plan, p, gated, rows, aux, kPoisonNaN, N, label);
             checkValues(out, int8Bound(d, K, splits), int8Bound(g, K, splits), aux, w, w.rows, N, label);
             if (lanes == 1) oneLane = out.output;
-            if (!sameRows(out.output, 0, oneLane, 0, kLaneRows, columns))
+            if (!sameRows(out.output, 0, oneLane, 0, nativeRows, columns))
               fail(label + ": the first lane differs from one lane alone");
-            if (epilogue == LinearEpilogue::GateUp) {
+            if (epilogue == LinearEpilogue::GateUp || epilogue == LinearEpilogue::ClampedGateUp) {
               c.oneGateUpPass = true;
               const Outcome pair = runInt8(Linear::plan(w, c, FloatOutput::BFloat16), p, &gate, rows, aux,
                                            kPoisonFinite, N, label + " one pass");
@@ -1106,15 +1189,15 @@ void decodeInt8(MetalBackend &backend, const Linear &linear) {
     const std::vector<const Tensor *> parts{&a, &b, &c3};
     const uint32_t covered = segmentColumns(parts), columns = covered + kPadding;
     const Projection p = rotatedProjection(parts, columns, signBuffer);
-    const std::vector<float> x = int8Inputs(kMaximumRows, K, signs);
-    const Int8Products d = int8Products(parts, columns, x, kMaximumRows, signs);
+    const std::vector<float> x = int8Inputs(maximumRows, K, signs);
+    const Int8Products d = int8Products(parts, columns, x, maximumRows, signs);
     for (uint32_t lanes = 1; lanes <= kMaximumLanes; ++lanes)
       for (const auto [splits, spread] : {std::pair{1u, false}, std::pair{8u, true}}) {
-        const LinearWorkload w = decode({columns, K}, lanes, LinearEpilogue::None);
+        const LinearWorkload w{{columns, K}, lanes * nativeRows, LinearEpilogue::None};
         const LinearConfig c{.tile = LinearTile::GgufStaged, .splits = splits, .spread = spread,
-                             .sixteenRows = lanes == 1, .decodeInt8 = true};
+                             .sixteenRows = nativeRows == kLaneRows && lanes == 1, .decodeInt8 = true};
         const LinearPlan plan = Linear::plan(w, c, FloatOutput::BFloat16);
-        const std::string label = "int8 fused lanes " + std::to_string(lanes) + " S" + std::to_string(splits);
+        const std::string label = "int8 fused lanes " + std::to_string(lanes) + " native rows " + std::to_string(nativeRows) + " S" + std::to_string(splits);
         const Outcome out =
             runInt8(plan, p, nullptr, storageRows(x, K, w.rows, plan.storageRows()), {}, kPoisonNaN, covered, label);
         checkValues(out, int8Bound(d, K, splits), {}, {}, w, w.rows, covered, label);
@@ -1139,7 +1222,7 @@ void decodeInt8(MetalBackend &backend, const Linear &linear) {
       const LinearConfig c = plan.configuration();
       if (!c.decodeInt8) continue;
       const std::string label = "int8 production " + std::to_string(N) + "x" + std::to_string(K) + " lanes " +
-                                std::to_string(lanes) + " S" + std::to_string(c.splits);
+                                std::to_string(lanes) + " native rows " + std::to_string(nativeRows) + " S" + std::to_string(c.splits);
       if (!int8Tiles) {
         fail(label + ": a device row of no int8 activations took them");
         continue;
@@ -1164,7 +1247,7 @@ void decodeInt8(MetalBackend &backend, const Linear &linear) {
     const MetalBuffer signBuffer = signsOf(K, signs);
     const Tensor t = tensor(backend, PQ20, N, K);
     const Projection p = rotatedProjection({&t}, N, signBuffer);
-    const LinearWorkload w = decode({N, K}, kMaximumLanes, LinearEpilogue::Residual);
+    const LinearWorkload w{{N, K}, maximumRows, LinearEpilogue::Residual};
     const std::vector<float> x = activations(Inputs::Dense, w.rows, K), residual = residuals(w.rows, N);
     std::vector<float> poisoned = x;
     poisoned[uint64_t{kNaNRow} * K + 2 * GGUF_ROTATION_BLOCK + 5] = std::numeric_limits<float>::quiet_NaN();
@@ -1233,8 +1316,10 @@ void prefillInt8(MetalBackend &backend, const Linear &linear) {
     std::vector<float> x = activations(Inputs::Dense, storage, K);
     if (outliers)
       for (uint32_t r = 0; r < storage; ++r) x[uint64_t{r} * K + (r * 97 + 13) % K] = r % 2 ? -kOutlier : kOutlier;
-    const std::vector<float> auxiliary = epilogue == LinearEpilogue::Residual
+    std::vector<float> auxiliary = epilogue == LinearEpilogue::Residual
         ? residuals(storage, columns) : activations(Inputs::Dense, storage, columns);
+    if (epilogue == LinearEpilogue::ClampedUpWithGate)
+      for (float &value : auxiliary) value = bf16(value * 64);
     const std::vector<uint16_t> aux = storageRows(auxiliary, columns, storage, storage);
     const std::vector<Dot> dots = products(parts, columns, x, rows);
     // The inputs as the codes of the int8-activation rule (test::int8Block) stand for them.
@@ -1265,6 +1350,7 @@ void prefillInt8(MetalBackend &backend, const Linear &linear) {
     // The output of products `d` through the epilogue.
     const auto output = [&](double d, double a) {
       if (epilogue == LinearEpilogue::Residual) return d + a;
+      if (epilogue == LinearEpilogue::ClampedUpWithGate) return std::clamp(d, -20.0, 20.0) * silu(std::min(a, 20.0));
       return epilogue == LinearEpilogue::UpWithGate ? d * silu(a) : d;
     };
     double err2 = 0, base2 = 0, ref2 = 0, rounded2 = 0;
@@ -1274,7 +1360,8 @@ void prefillInt8(MetalBackend &backend, const Linear &linear) {
         const uint64_t i = uint64_t{r} * columns + c;
         const double got = bf16ToFloat(out.output[i]), tile = bf16ToFloat(base.output[i]), a = bf16ToFloat(aux[i]),
                      want = output(dots[i].value, a),
-                     scale = epilogue == LinearEpilogue::UpWithGate ? want : dots[i].value;
+                     scale = (epilogue == LinearEpilogue::UpWithGate || epilogue == LinearEpilogue::ClampedUpWithGate)
+                         ? want : dots[i].value;
         if (!std::isfinite(got)) {
           ++nonfinite;
           continue;
@@ -1313,7 +1400,7 @@ void prefillInt8(MetalBackend &backend, const Linear &linear) {
     for (const uint32_t K : {1024u, 5120u}) {
       const Tensor t = tensor(backend, f, 1024, K);
       const Projection p = projection({&t}, t.N);
-      for (const LinearEpilogue e : {LinearEpilogue::None, LinearEpilogue::Residual, LinearEpilogue::UpWithGate})
+      for (const LinearEpilogue e : {LinearEpilogue::None, LinearEpilogue::Residual, LinearEpilogue::UpWithGate, LinearEpilogue::ClampedUpWithGate})
         for (const uint32_t rows : {168u, 136u, 65u})
           for (const bool outliers : {false, true}) chunk(p, {&t}, e, rows, outliers, fmtName(f));
       // 600 rows: 19 row tiles, whose walk takes a block of 16 down each column tile, then one of 3.
@@ -1473,7 +1560,7 @@ void leadingInputs(MetalBackend &backend, const Linear &linear) {
     const Outcome got = run(backend, linear, plan, view, nullptr, x, aux, kPoisonNaN, N, label);
     if (got.output != expected.output) fail(label + ": differs from the repacked leading inputs");
   }
-  section("leading inputs: " + std::to_string(FMT_COUNT) + " formats' residual prefill over a view of 512 of 1024 "
+  section("leading inputs: " + std::to_string(FMT_COUNT) + " formats' plain and residual prefill over a view of 512 of 1024 "
           "inputs equal to them repacked");
 }
 
@@ -1677,7 +1764,7 @@ void tokenGather(MetalBackend &backend) {
     const Guarded ids(backend, tokens.size() * sizeof(uint32_t), 0), output(backend, tokens.size() * kHidden * 2, 0xFF);
     std::memcpy(ids.view.contents(), tokens.data(), ids.bytes);
     CommandGraph graph;
-    Embedding::add(graph, ids.view, table, output.view, uint32_t(tokens.size()));
+    Embedding::add(graph, ids.view, table, output.view, uint32_t(tokens.size()), 1.0F);
     static_cast<void>(backend.submitCommandAsync(graph.dispatches()).wait());
     if (!output.intact()) fail(std::string(fmtName(f)) + " gather writes past its output");
     const std::vector<uint16_t> got = output.halves();
@@ -1699,7 +1786,7 @@ void tokenGather(MetalBackend &backend) {
     const Guarded ids(backend, tokens.size() * sizeof(uint32_t), 0), output(backend, tokens.size() * hidden * 2, 0xFF);
     std::memcpy(ids.view.contents(), tokens.data(), ids.bytes);
     CommandGraph graph;
-    Embedding::add(graph, ids.view, table, output.view, uint32_t(tokens.size()));
+    Embedding::add(graph, ids.view, table, output.view, uint32_t(tokens.size()), 1.0F);
     static_cast<void>(backend.submitCommandAsync(graph.dispatches()).wait());
     if (!output.intact()) fail(name + " gather writes past its output");
     const std::vector<uint16_t> got = output.halves();
@@ -1831,6 +1918,36 @@ void gatherExtents(MetalBackend &backend) {
           "extent and refused one element short");
 }
 
+// Both row heights must write identical live rows and leave row/column
+// padding intact, including partial final simdgroups and fused format groups.
+void prefill64(MetalBackend &backend, const Linear &linear) {
+  constexpr uint32_t K = 512;
+  const Tensor q4 = tensor(backend, Q4K, 512, K), q5 = tensor(backend, Q5K, 512, K);
+  for (const std::vector<const Tensor *> &parts : {std::vector<const Tensor *>{&q4},
+                                                 std::vector<const Tensor *>{&q5},
+                                                 std::vector<const Tensor *>{&q4, &q5, &q4}}) {
+    const uint32_t covered = segmentColumns(parts), columns = covered + 64;
+    const Projection p = projection(parts, columns);
+    for (const uint32_t rows : {1u, 65u, 92u, 126u, 128u, 129u})
+      for (const auto ep : {LinearEpilogue::None, LinearEpilogue::Residual,
+                            LinearEpilogue::UpWithGate, LinearEpilogue::ClampedUpWithGate}) {
+        const LinearWorkload w{{columns, K}, rows, ep};
+        const auto standard = Linear::plan(w, {.tile = LinearTile::GgufPrefill}, FloatOutput::BFloat16);
+        const auto small = Linear::plan(w, {.tile = LinearTile::GgufPrefill, .prefill64Rows = true},
+                                        FloatOutput::BFloat16);
+        const auto x = storageRows(activations(Inputs::Dense, rows, K), K, rows, standard.storageRows());
+        const auto aux = storageRows(residuals(rows, columns), columns, rows, standard.storageRows());
+        const std::string label = "64-row prefill " + std::to_string(rows) + " " + epilogueName(ep);
+        const auto a = run(backend, linear, standard, p, nullptr, x, aux, kPoisonNaN, covered, label);
+        const auto b = run(backend, linear, small, p, nullptr, x, aux, kPoisonNaN, covered, label);
+        if (!sameRows(a.output, 0, b.output, 0, rows, columns)) fail(label + ": differs from 128-row tile");
+        for (uint64_t i = uint64_t{(rows + 15) / 16 * 16} * columns; i < b.output.size(); ++i)
+          if (b.output[i] != kUnwritten) { fail(label + ": writes row padding"); break; }
+      }
+  }
+  section("64-row prefill: Q4_K/Q5_K, fused formats, all epilogues and partial tiles match 128 rows bitwise");
+}
+
 int main(int argc, char **argv) {
   @autoreleasepool {
     if (argc != 2) {
@@ -1848,9 +1965,15 @@ int main(int argc, char **argv) {
       decodeTile(backend, linear, LinearTile::GgufStaged, true, decodeInputs(true), tileFormats(LinearTile::GgufStaged));
       columnTile(backend, linear);
       fusedDecode(backend, linear, LinearTile::GgufStaged, true);
-      for (const bool spread : {false, true}) oneGateUpPass(backend, linear, spread);
+      for (const bool spread : {false, true}) {
+        oneGateUpPass(backend, linear, spread);
+        oneGateUpPass(backend, linear, spread, 16);
+        oneGateUpPass(backend, linear, spread, 16, LinearEpilogue::ClampedGateUp);
+      }
       prefill(backend, linear, 1024, tileFormats(LinearTile::GgufStaged));
+      prefill64(backend, linear);
       decodeInt8(backend, linear);
+      decodeInt8(backend, linear, 16);
       prefillInt8(backend, linear);
       leadingInputs(backend, linear);
       rowViews(backend, linear);

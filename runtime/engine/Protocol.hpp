@@ -18,7 +18,7 @@
 // pins the bytes both sides agree on.
 namespace splash::protocol {
 
-inline constexpr uint16_t kProtocolVersion = 14;
+inline constexpr uint16_t kProtocolVersion = 15;
 // A frame is its header, the magic "SPLH", the u16 protocol version, the
 // u16 FrameType and the u64 payload length, then the payload.
 inline constexpr size_t kFrameHeaderBytes = 16;
@@ -138,9 +138,10 @@ validateLimits(const ProtocolLimits &limits);
 //  102 u32 thinkingBudget.tokens, kNoThinkingBudget for none
 //  106 u32 thinking end token count, u32 thinkingBudget.alsoEnds, zero
 //      without a budget
+//  114 u32 tokenizer marker program word count
 // then the prompt tokens, the 32-byte image spans, the image pixels, the
-// score tokens and the thinking end tokens.
-inline constexpr uint64_t kRequestFixedBytes = 114;
+// score tokens, thinking end tokens and marker program words.
+inline constexpr uint64_t kRequestFixedBytes = 118;
 inline constexpr uint32_t kNoThinkingBudget = 0xFFFFFFFFU;
 // A thinking budget's end holds 1 to this many tokens.
 inline constexpr uint32_t kMaximumThinkingEndTokens = 64;

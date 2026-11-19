@@ -591,10 +591,10 @@ enum ContextLength {
         "Past the model’s own window\(window.map { ", \(figure($0))," } ?? "") it stretches it with YaRN, which changes answers at every length."
     }
 
-    /// The most context `splash serve` takes, its MAX_YARN_CONTEXT_TOKENS, which a test holds this
+    /// The most context `splash serve` takes, its MAX_CONTEXT_TOKENS, which a test holds this
     /// to (ServeSettingsTests); dev/tests/install/test_families.py holds that to the most any
     /// family serves.
-    static let ceiling = 1_010_000
+    static let ceiling = 1_048_576
 
     /// A length typed as `--max-context` takes it: a token count, with K for 1024 tokens or M for
     /// a million, up to `ceiling`; nil for anything else.

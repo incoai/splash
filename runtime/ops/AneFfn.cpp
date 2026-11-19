@@ -93,6 +93,9 @@ const char *AneFfn::unsupported(std::span<const SwiGluProjections> layers) {
   if (intermediate % kChannelUnit || intermediate < 2 * kChannelUnit)
     return "ANE FFN split needs two or more whole rotation blocks of intermediate channels";
   for (const SwiGluProjections &layer : layers) {
+    if (!std::isfinite(layer.clamp) || layer.clamp < 0.0F || float(_Float16(layer.clamp)) != layer.clamp ||
+        layer.clamp != layers.front().clamp)
+      return "ANE FFN split needs one finite nonnegative fp16 clamp across its layers";
     for (const Projection *projection : {layer.gate, layer.up, layer.down})
       if (!projection->takesPlaneViews())
         return "ANE FFN split needs unrotated quantized projections";
@@ -116,7 +119,8 @@ std::string AneFfn::calibrationKey(std::span<const SwiGluProjections> layers, co
     for (const Projection *projection : {layer.gate, layer.up, layer.down})
       key += " " + std::to_string(projection->outputSize) + "x" + std::to_string(projection->inputSize) + ":g" +
              std::to_string(projection->blocks().segments.front().formatId);
-  return key + " int8-activations " + (linear.int8Activations() == Int8Activations::On ? "on" : "off");
+  return key + " clamp " + std::to_string(std::bit_cast<uint32_t>(layers.front().clamp)) +
+         " int8-activations " + (linear.int8Activations() == Int8Activations::On ? "on" : "off");
 }
 
 namespace {
@@ -225,6 +229,7 @@ AneFfn::Shape AneFfn::shapeOf(std::span<const SwiGluProjections> layers, uint32_
   shape.hidden = layers.front().gate->inputSize;
   shape.intermediate = layers.front().gate->outputSize;
   shape.layers = static_cast<uint32_t>(layers.size());
+  shape.clamp = layers.front().clamp;
   shape.gpu = gpuChannels(shape.intermediate, aneUnits);
   shape.ane = shape.intermediate - shape.gpu;
   shape.inputSegments = segments(shape.hidden);
@@ -355,11 +360,20 @@ std::string AneFfn::function(const Shape &shape, std::span<const Input> inputs, 
   // gate pre-activations are about 0.1 differed from the GPU alone by 6.5%
   // RMS, through its tanh by 1.6%.
   f16("gt", channels, rows, "mul(x = gs, y = tx_t)");
-  f16("gh", channels, rows, "mul(x = gt, y = " + fp16(0.5) + ")");
+  if (shape.clamp > 0.0F) {
+    f16("gc", channels, rows, "minimum(x = gt, y = " + fp16(shape.clamp) + ")");
+    // Up's token scale stays factored out until the fp32 join. Clamp in
+    // those units: restoring up first can overflow fp16 before clipping.
+    f16("limit", 1, rows, "real_div(x = " + fp16(shape.clamp) + ", y = tx_t)");
+    f16("lower", 1, rows, "mul(x = limit, y = " + fp16(-1.0) + ")");
+    f16("ul", channels, rows, "maximum(x = us, y = lower)");
+    f16("uc", channels, rows, "minimum(x = ul, y = limit)");
+  }
+  f16("gh", channels, rows, "mul(x = " + std::string(shape.clamp > 0.0F ? "gc" : "gt") + ", y = " + fp16(0.5) + ")");
   f16("th", channels, rows, "tanh(x = gh)");
   f16("tp", channels, rows, "add(x = th, y = " + fp16(1.0) + ")");
   f16("silu", channels, rows, "mul(x = gh, y = tp)");
-  f16("h", channels, rows, "mul(x = silu, y = us)");
+  f16("h", channels, rows, "mul(x = silu, y = " + std::string(shape.clamp > 0.0F ? "uc" : "us") + ")");
   line("tensor<fp16, [1, " + c + ", 1, " + r + "]> h4 = reshape(x = h, shape = tensor<int32, [4]>([1, " + c + ", 1, " +
        r + "]))");
   line("tensor<fp16, [" + c + ", " + block +
@@ -569,7 +583,7 @@ void AneFfn::encode(metal::CommandGraph &graph, uint32_t layer, const PrefillFfn
   }
   const uint64_t ready = ane ? handoff_.next() : 0;
   if (ane) graph.signal(handoff_.event(), ready);
-  linear_.addSwiGlu(graph, {&current.gate, &current.up, &current.down}, ffn, residual, output, rows);
+  linear_.addSwiGlu(graph, {&current.gate, &current.up, &current.down, shape_.clamp}, ffn, residual, output, rows);
   if (layer + 1 < layers_.size()) addWeights(graph, layer + 1, set ^ 1);
   const uint64_t done = ane ? handoff_.next() : 0;
   if (ane) graph.wait(handoff_.event(), done);

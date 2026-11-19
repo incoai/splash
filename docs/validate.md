@@ -59,6 +59,31 @@ does, and `REVISION`, `DRAFT_MODEL` and `LANGUAGE_ONLY=1` as its `--revision`,
 | `test-pressure-real` | the installation on this checkout's own server under `PRESSURE_ARGS` (default `--max-memory 18G`), which must make it stream its routed experts, with the [serving benchmark](#serving-benchmark)'s three churn clients for `PRESSURE_MINUTES` (default 5), checked on its own by [`check.py run`](#serving-benchmark) on G4, G8, G9, Store, Churn (its load window and every client served) and First token; results in `build/release/<model>/pressure` |
 | `release-check` | one model on this Mac ([Release check](#release-check)) |
 
+`test-real` retains the native token fixtures for token-tag families. For
+text-marker models, `dev/tests/engine/run_model_runtime_oracle.py` derives
+prompts, the template's reasoning close and marker programs from the installed
+tokenizer. Its sampled non-recurrent checks compare retained speculative
+logits with target-only forwards of the same histories, check interrupted
+replay and the pending token, and exercise one, two and four lanes. Reasoning
+checks cover model-opened blocks, partial closes, grammar-delayed budgets,
+closes spanning cycles and prompt lookup. Grouped and layer-passed prefill
+and restoration after the full retained window wraps use the shared checks.
+The fixture hash is printed with the native run's results.
+
+For an installation of Ripple's preview GGUF:
+
+```sh
+make test-real MODEL=AtomicChat/Ripple-65B-Preview-GGUF:AD-Q4_K_M
+```
+
+Set `ORACLE_ARGS="--kv-format bf16"` to check BF16 KV as well. The restoration
+check fills and wraps the drafter's retained window; this does not qualify
+the model's full context limit.
+
+The decode and context scenarios in `benchmark-backend` still use a Qwen
+prompt and reject incompatible vocabularies before loading weights. They
+are not a Ripple performance qualification.
+
 `test-agent-real` and `test-release-real` first run the tests
 `dev/tests/install/test_clients.py` has of the installed OpenCode, Codex and Pi
 among the selected clients, which need no model.

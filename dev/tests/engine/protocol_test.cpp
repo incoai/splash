@@ -31,6 +31,7 @@ using splash::kNoMaskParent;
 using splash::RequestIgnoreEndOfSequence;
 using splash::SamplingParameters;
 using splash::ThinkingBudget;
+using splash::TokenAutomaton;
 using splash::engine::EngineFinishReason;
 using splash::engine::RequestPriority;
 using splash::model::ExecutionLimits;
@@ -74,7 +75,7 @@ constexpr size_t generationPrompt = scoreCount + 4;
 constexpr size_t flags = generationPrompt + 4;
 constexpr size_t cacheSalt = flags + 4;
 constexpr size_t thinkingBudget = cacheSalt + 16;
-static_assert(thinkingBudget + 12 == kRequestFixedBytes);
+static_assert(thinkingBudget + 16 == kRequestFixedBytes);
 } // namespace request_offset
 
 uint32_t loadU32(const std::vector<uint8_t> &bytes, size_t offset) {
@@ -1003,6 +1004,30 @@ void testThinkingBudget() {
     if (!end.empty())
       invalid.thinkingBudget->end.back() = 248069;
     expectRequestIssue(test, invalid, IssueCode::InvalidCount);
+  }
+  // An anchored opening followed by a two-class body/close: token 10
+  // opens, token 11 closes, and ordinary tokens leave the body open.
+  const std::vector<uint32_t> markers{2, 3, 1, 2, 3, 0, 2, 14,
+                                      0x01030103, 0x00000201, 0, 12, 1, 11,
+                                      (10 << 8) | 1, (11 << 8) | 2};
+  const TokenAutomaton automaton(markers);
+  CHECK(test, automaton.valid(32) && automaton.advance(0, 10) == 1 &&
+                  automaton.advance(1, 12) == 1 && automaton.advance(1, 11) == 2 &&
+                  automaton.advance(0, 12) == 3);
+  RequestFrame marked = exampleRequest();
+  marked.thinkingBudget = ThinkingBudget{0, {11}, 0, markers};
+  CHECK(test, roundTrip(marked) == marked);
+  for (size_t size = 0; size < markers.size(); ++size)
+    CHECK(test, !TokenAutomaton(std::span(markers).first(size)).valid(32));
+  for (const auto [word, value] : std::array<std::pair<uint32_t, uint32_t>, 16>{
+           {{0, 65}, {1, 0}, {1, 257}, {2, 2}, {3, 1}, {4, 4}, {5, 2},
+            {6, 0xffffffffu}, {7, 0xffffffffu}, {8, 0x01030104}, {11, 0},
+            {11, 15}, {12, 65}, {13, 0xffffffffu}, {14, 10 << 8}, {15, (9 << 8) | 2}}}) {
+    auto invalid = markers;
+    invalid[word] = value;
+    CHECK(test, !TokenAutomaton(invalid).valid(32));
+    marked.thinkingBudget->markers = std::move(invalid);
+    expectRequestIssue(test, marked, IssueCode::InvalidCount);
   }
   RequestFrame score = exampleScoreRequest();
   score.thinkingBudget = ThinkingBudget{0, {248069}, 248069};

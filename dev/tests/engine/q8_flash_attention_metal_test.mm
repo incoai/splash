@@ -83,6 +83,8 @@ const std::vector<Shape> kShapes = [] {
     if (geometry.reads == splash::kv::Reads::EveryPage)
       shapes.push_back({geometry.kvHeads, geometry.queryHeads / geometry.kvHeads, geometry.reads, true});
   }
+  // Ripple's heads of 128 over ten query heads each: the only Parts=2,
+  // non-power-of-two GQA group (the parity gate caught its prefill).
   return shapes;
 }();
 
@@ -102,6 +104,9 @@ uint32_t laneSplits(uint32_t history) {
 }
 
 void testContract() {
+  // The speculative scratch holds the longest served block's proposals past
+  // the logical ceiling (SPLASH_DRAFT_BLOCK_PROPOSALS_LIMIT); the boundary
+  // is the last committed position whose whole block fits it.
   ChunkedPrefillParams finalCycle{
       splash::kv::kMaximumLogicalTokens - 1, SPLASH_TARGET_VERIFY_ROWS, kStride,
       (splash::kv::kMaximumPhysicalTokens + kPageTokens - 1) / kPageTokens};

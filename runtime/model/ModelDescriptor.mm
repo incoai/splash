@@ -241,7 +241,8 @@ std::optional<SizeDifference> sizeDifference(NSDictionary *text, const QwenHybri
       {"hidden_size", target.hiddenSize},
       {"num_hidden_layers", target.layers},
       {"vocab_size", target.vocabularySize},
-      {"max_position_embeddings", target.nativeContextTokens},
+      {"max_position_embeddings",
+       target.configNativeContextTokens ? target.configNativeContextTokens : target.nativeContextTokens},
       {"num_attention_heads", target.attentionQueryHeads},
       {"num_key_value_heads", target.attentionKvHeads},
       {"head_dim", target.attentionHeadDimension}};
@@ -323,10 +324,10 @@ void requireWholes(NSArray *values, std::span<const uint32_t> expected, std::str
 }
 
 // The layers of `mask` among `layers`, a bit each, in order.
-std::vector<uint32_t> layersOf(uint64_t mask, uint32_t layers) {
+std::vector<uint32_t> layersOf(const kv::LayerMask &mask, uint32_t layers) {
   std::vector<uint32_t> result;
-  for (uint32_t layer = 0; layer < layers && layer < 64; ++layer)
-    if (mask >> layer & 1) result.push_back(layer);
+  for (uint32_t layer = 0; layer < layers; ++layer)
+    if (mask.test(layer)) result.push_back(layer);
   return result;
 }
 
@@ -667,13 +668,71 @@ DFlashDraftLayout readDraftLayout(NSDictionary *draft, const QwenTargetDimension
   if (architectures.count != 1 ||
       ![architectures[0] isEqual:@"DFlash2DraftModel"])
     throw std::invalid_argument("draft is not a DFlash2 model");
+  NSDictionary *flash =
+      requireObject(draft, @"dflash_config", "draft config dflash_config");
+  // The draft's attention geometry names the compiled draft variant whose
+  // kernels run it (metal/abi/DraftAttention.h): the one its five numbers
+  // are, and a config near one is refused by the first number that differs
+  // from it, as the sizes are; one near none is refused with the variants
+  // this build serves. The block may be longer than the compiled rows, but
+  // its selector must match the compiled candidate width exactly.
+  struct DraftGeometryKey final {
+    const char *key;
+    uint32_t SplashDraftVariant::*field;
+    NSDictionary *source;
+  };
+  const std::initializer_list<DraftGeometryKey> geometryKeys{
+      {"num_attention_heads", &SplashDraftVariant::query_heads, draft},
+      {"num_key_value_heads", &SplashDraftVariant::kv_heads, draft},
+      {"head_dim", &SplashDraftVariant::head_dimension, draft},
+      {"sliding_window", &SplashDraftVariant::window, draft},
+      {"conv_kernel_size", &SplashDraftVariant::convolution_taps, flash}};
+  const SplashDraftVariant *variant = nullptr;
+  size_t matched = 0;
+  std::string mismatch;
+  std::string supported;
+  for (const SplashDraftVariant &compiled : SPLASH_DRAFT_VARIANTS) {
+    size_t agreed = 0;
+    std::string difference;
+    for (const DraftGeometryKey &key : geometryKeys) {
+      const uint32_t found = requireWhole(key.source[@(key.key)], std::string("draft config ") + key.key);
+      if (found == compiled.*key.field) {
+        ++agreed;
+        continue;
+      }
+      if (difference.empty())
+        difference = std::string("draft config ") + key.key + " mismatch: checkpoint " +
+                     std::to_string(found) + ", runtime " + std::to_string(compiled.*key.field);
+    }
+    if (agreed == geometryKeys.size()) {
+      variant = &compiled;
+      break;
+    }
+    if (mismatch.empty() || agreed > matched) {
+      matched = agreed;
+      mismatch = difference;
+    }
+    supported += (supported.empty() ? "" : ", ") + std::to_string(compiled.query_heads) + " query heads over " +
+                 std::to_string(compiled.kv_heads) + " KV heads of " +
+                 std::to_string(compiled.head_dimension) + ", a ring of " +
+                 std::to_string(compiled.window) + ", " +
+                 std::to_string(compiled.convolution_taps) + "-tap convolutions, " +
+                 std::to_string(compiled.rows) + "-row proposals of " +
+                 std::to_string(compiled.candidates) + " candidates";
+  }
+  if (!variant)
+    throw std::invalid_argument(mismatch.empty()
+                                    ? "draft config attention geometry is not a compiled draft variant (" +
+                                          supported + ")"
+                                    : mismatch);
+  const uint32_t blockSize =
+      requireWhole(flash[@"block_size"], "draft config dflash_config block_size");
+  if (blockSize < variant->rows)
+    throw std::invalid_argument("draft config dflash_config block_size is less than the " +
+                                std::to_string(variant->rows) + " rows a cycle drafts");
   requireNumbers(draft, "checkpoint", "draft config",
                  {{"hidden_size", target.hiddenSize},
                   {"vocab_size", target.vocabularySize},
-                  {"num_attention_heads", SPLASH_DRAFT_QUERY_HEADS},
-                  {"num_key_value_heads", SPLASH_DRAFT_KV_HEADS},
-                  {"head_dim", SPLASH_DRAFT_HEAD_DIMENSION},
-                  {"sliding_window", ExecutionLimits::draftContextTokens},
                   {"rms_norm_eps", SPLASH_RMS_EPSILON}});
   requireBooleans(draft, "draft config",
                   {{"is_causal", false},
@@ -686,21 +745,11 @@ DFlashDraftLayout readDraftLayout(NSDictionary *draft, const QwenTargetDimension
   requireEqual(requireString(rope, @"rope_type",
                              "draft config rope_parameters rope_type"),
                "default", "checkpoint", "draft config rope_parameters rope_type");
-  NSDictionary *flash =
-      requireObject(draft, @"dflash_config", "draft config dflash_config");
   requireNumbers(flash, "checkpoint", "draft config dflash_config",
                  {{"conv_group_size", SPLASH_DRAFT_CONVOLUTION_GROUP},
-                  {"conv_kernel_size", SPLASH_DRAFT_CONVOLUTION_TAPS},
                   {"selector_rank", SPLASH_DRAFT_SELECTOR_RANK},
-                  {"selector_top_k", SPLASH_DRAFT_CANDIDATES},
+                  {"selector_top_k", variant->candidates},
                   {"mask_token_id", target.maskToken}});
-  // The block it was trained to fill: the kernels' rows or more, of which a
-  // cycle drafts the first (Ornith-1.5-122B's fills 16). Its weights have no
-  // part of the block's length.
-  if (requireWhole(flash[@"block_size"], "draft config dflash_config block_size") <
-      ExecutionLimits::draftQueryRows)
-    throw std::invalid_argument("draft config dflash_config block_size is less than the " +
-                                std::to_string(ExecutionLimits::draftQueryRows) + " rows a cycle drafts");
   // How a target layer's output row becomes the hidden values the draft reads
   // of it, as the draft was trained (target_hidden_reduction): a
   // hyper-connected target's streams by their mean (Qwen4ExpTarget's
@@ -718,12 +767,42 @@ DFlashDraftLayout readDraftLayout(NSDictionary *draft, const QwenTargetDimension
     if (targetLayers.back() >= target.layers)
       throw std::invalid_argument("draft config target_layer_ids names a layer past the target's");
   }
-  const DFlashDraftLayout layout =
+  DFlashDraftLayout layout =
       draftLayout(target.hiddenSize, target.vocabularySize,
                   requireWhole(draft[@"num_hidden_layers"], "draft config num_hidden_layers"),
                   requireWhole(draft[@"intermediate_size"], "draft config intermediate_size"),
                   requireNumber(rope[@"rope_theta"], "draft config rope_parameters rope_theta").floatValue,
-                  targetLayers);
+                  targetLayers, *variant);
+  if (draft[@"layer_types"]) {
+    NSArray *types = requireArray(draft, @"layer_types", "draft config layer_types");
+    if (types.count != layout.layers || layout.layers > 128)
+      throw std::invalid_argument("draft config layer_types must name every layer");
+    for (uint32_t layer = 0; layer < layout.layers; ++layer) {
+      if ([types[layer] isEqual:@"full_attention"])
+        layout.fullAttentionLayers.set(layer, true);
+      else if (![types[layer] isEqual:@"sliding_attention"])
+        throw std::invalid_argument("draft config layer_types has an unsupported attention type");
+    }
+    layout.slidingWindow = layout.window;
+    // Full layers use the variant's retention policy independently of the
+    // sliding rings; snapshots keep the shared retained context once.
+    for (uint32_t layer = 0; layer < layout.layers; ++layer)
+      if (layout.fullAttentionLayers.test(layer)) layout.window = std::max(layout.window, variant->full_window);
+    if (layout.window == layout.slidingWindow) {
+      layout.slidingWindow = 0;
+      layout.fullAttentionLayers = {};
+    }
+  }
+  if (draft[@"no_rope_layers"]) {
+    for (id value : requireArray(draft, @"no_rope_layers", "draft config no_rope_layers")) {
+      const uint32_t layer = requireWhole(value, "draft config no_rope_layers index");
+      if (layer >= layout.layers || layer >= 128)
+        throw std::invalid_argument("draft config no_rope_layers names a layer past the draft");
+      layout.unrotatedLayers.set(layer, true);
+    }
+  }
+  for (uint32_t layer = 0; layer < layout.layers; ++layer)
+    static_cast<void>(ops::draftVariant(layout.attentionShape(layer)));
   return layout;
 }
 

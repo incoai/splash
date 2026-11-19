@@ -32,6 +32,21 @@ UNUSABLE = {
         "--thinking-token-budget",
         "--thinking-end-text",
     },
+    # Ripple decides its reasoning per turn; a thinking budget the server
+    # reads through the decoded stream, the efforts its template leaves to
+    # the model. No vision tower, no GDN state, and the budget's verify rows
+    # the 16-row block caps.
+    "Ripple-65B": {
+        "--language-only",
+        "--state-format",
+        "--cached-states",
+        "--reasoning-effort",
+        "--expert-memory",
+        "--ple-memory",
+        "--sparse-kv-memory",
+        "--default-reasoning-effort",
+        "--max-image-pixels",
+    },
 }
 
 
@@ -46,19 +61,25 @@ class OptionReportTests(unittest.TestCase):
             UNUSABLE,
         )
         # Flint serves its native window alone; YaRN stretches the others'.
+        # Ripple's release serves its native window too: the two million its
+        # config claims are the config's, not the family's served window.
         self.assertEqual(
             {
                 name: (family["context_tokens"], family["max_context_tokens"])
                 for name, family in report.items()
             },
             {
-                name: (262144, 262144 if name == "Flint" else 1010000)
+                name: (
+                    (1048576, 1048576)
+                    if name == "Ripple-65B"
+                    else (262144, 262144 if name == "Flint" else 1010000)
+                )
                 for name in UNUSABLE
             },
         )
         # --max-context takes at most the most context any family serves.
         self.assertEqual(
-            serve_options.MAX_YARN_CONTEXT_TOKENS,
+            serve_options.MAX_CONTEXT_TOKENS,
             max(facts["max_context_tokens"] for facts in engine_facts.values()),
         )
 

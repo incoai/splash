@@ -74,9 +74,13 @@ using splash::test::bf16ToFloat;
 using splash::test::chainRow;
 using splash::test::floatToBf16;
 
-constexpr uint32_t kRows = SPLASH_DRAFT_QUERY_ROWS;
-constexpr uint32_t kPositions = SPLASH_DRAFT_PROPOSAL_TOKENS;
-constexpr uint32_t kCandidates = SPLASH_DRAFT_CANDIDATES;
+#ifndef DRAFT_SELECTOR_CANDIDATES
+#define DRAFT_SELECTOR_CANDIDATES SPLASH_DRAFT_CANDIDATES
+#define DRAFT_SELECTOR_ROWS SPLASH_DRAFT_QUERY_ROWS
+#endif
+constexpr uint32_t kRows = DRAFT_SELECTOR_ROWS;
+constexpr uint32_t kPositions = kRows - 1;
+constexpr uint32_t kCandidates = DRAFT_SELECTOR_CANDIDATES;
 constexpr uint32_t kRank = SPLASH_DRAFT_SELECTOR_RANK;
 constexpr uint32_t kLanes = SPLASH_MAXIMUM_BATCH_WIDTH;
 constexpr uint32_t kBlock = SPLASH_TARGET_VERIFY_ROWS;
@@ -224,7 +228,7 @@ Fixture makeFixture(MetalBackend &backend, uint32_t vocabulary, uint32_t lanes, 
   f.lanes = lanes;
   f.subset = subset;
   const uint32_t rows = lanes * kRows, columns = subset.columns(vocabulary);
-  const auto workspace = DraftSelector::workspace(lanes * kPositions);
+  const auto workspace = DraftSelector::workspace(lanes * kPositions, kCandidates, kRows);
   f.logits = allocate(backend, uint64_t{rows} * columns * sizeof(float));
   auto *logitRows = static_cast<float *>(f.logits.contents());
   for (uint32_t row = 0; row < rows; ++row)
@@ -582,7 +586,7 @@ void chainCase(MetalBackend &backend, uint32_t vocabulary, uint32_t lanes, Draft
   const uint32_t columns = tokens.columns(vocabulary);
   const std::array patterns{Pattern::Peaked, Pattern::Uniform, Pattern::Ties, Pattern::Sparse};
   const Fixture f = makeFixture(backend, vocabulary, lanes, random, patterns, 0.1F, tokens);
-  const DraftSelector selector(vocabulary);
+  const DraftSelector selector(vocabulary, kCandidates, kRows);
   std::vector<DraftTreeLane> trees;
   for (uint32_t lane = 0; lane < lanes; ++lane)
     trees.push_back({random.next() % vocabulary, kBlock - 1, 0, 1});
@@ -663,7 +667,7 @@ void treesMatchTheReference(MetalBackend &backend) {
     Random random(0x74726565 + trial);
     const uint32_t lanes = 1 + trial % kLanes;
     const Fixture f = makeFixture(backend, vocabulary, lanes, random, patterns, 0.4F);
-    const DraftSelector selector(vocabulary);
+    const DraftSelector selector(vocabulary, kCandidates, kRows);
     DraftCalibration calibrated;
     calibrated.slope = 0.7F;
     for (uint32_t position = 0; position < kPositions; ++position)
@@ -672,7 +676,8 @@ void treesMatchTheReference(MetalBackend &backend) {
     std::vector<Chain> chains(lanes);
     for (uint32_t lane = 0; lane < lanes; ++lane) {
       const uint32_t children = 2 + (trial + lane) % 3;
-      const uint32_t depth = (trial + lane) % 4 == 3 ? 2 + (trial + lane) % 3 : kBlock - 1;
+      // Brute-force branching paths stop at seven positions; chainCase checks all fifteen.
+      const uint32_t depth = (trial + lane) % 4 == 3 ? 2 + (trial + lane) % 3 : std::min(kPositions, 7U);
       const uint32_t chain = (trial + lane) % 3 == 0 ? 0 : 1 + random.next() % kChain;
       // Greedy lanes, and lanes sampling at temperatures 0.7 and 1.
       const float temperature = std::array{0.0F, 0.7F, 1.0F}[(trial / 2 + lane) % 3];
@@ -735,7 +740,7 @@ void nonFiniteRowDrawsNothing(MetalBackend &backend) {
               std::numeric_limits<float>::quiet_NaN());
   std::fill_n(static_cast<uint16_t *>(f.buffers.selectorHidden.contents()) + uint64_t{kNonFinite + 1} * kRank, kRank,
               uint16_t{0x7fc0});
-  const DraftSelector selector(vocabulary);
+  const DraftSelector selector(vocabulary, kCandidates, kRows);
   run(backend, selector, f, std::array{DraftTreeLane{7, kBlock - 1, 0, kChildren, DraftCalibration{}, 0.7F, 0x5eed}});
   bool none = f.rowCount(0) > 1;
   for (uint32_t row = 0; row < f.rowCount(0); ++row) {
@@ -758,7 +763,7 @@ void sampledChildrenDistribution(MetalBackend &backend) {
   // Flat rows, whose candidates share their mass.
   const std::array patterns{Pattern::Uniform};
   const Fixture f = makeFixture(backend, vocabulary, kLanes, random, patterns, 0.4F);
-  const DraftSelector selector(vocabulary);
+  const DraftSelector selector(vocabulary, kCandidates, kRows);
   for (const auto &[children, temperature] : {std::pair{1U, 0.7F}, std::pair{2U, 1.0F}}) {
     std::vector<std::map<std::vector<uint32_t>, uint32_t>> counts(kLanes);
     for (uint32_t runs = 0; runs < kRuns; ++runs) {
@@ -840,7 +845,7 @@ void lowTemperatureDraws(MetalBackend &backend) {
       for (uint32_t i = 0; i < kCandidates; ++i)
         values[(37 * (lane + 1) + 61 * i) % vocabulary] = i == 0 && lane % 2 ? 7.0F : 5.0F;
     }
-  const DraftSelector selector(vocabulary);
+  const DraftSelector selector(vocabulary, kCandidates, kRows);
   std::vector<DraftTreeLane> trees;
   for (uint32_t lane = 0; lane < kLanes; ++lane)
     trees.push_back({7, kBlock - 1, 0, kChildren, DraftCalibration{}, 0.01F, treeHash(lane + 1)});
@@ -875,7 +880,7 @@ void forcedChain(MetalBackend &backend) {
   Random random(0x666f7263);
   const std::array patterns{Pattern::Peaked};
   const Fixture f = makeFixture(backend, vocabulary, 2, random, patterns, 0.1F);
-  const DraftSelector selector(vocabulary);
+  const DraftSelector selector(vocabulary, kCandidates, kRows);
   const std::array<uint32_t, 3> end{vocabulary - 6, vocabulary - 7, vocabulary - 3};
   for (uint32_t lane = 0; lane < 2; ++lane) {
     std::copy(end.begin(), end.end(), f.chainTokens(lane));
@@ -909,9 +914,9 @@ void chainRowsTheDraftJoins(MetalBackend &backend) {
     require(trial < 64, "the reference found too few unambiguous joined chains");
     Random random(0x6a6f696e + trial);
     const Fixture f = makeFixture(backend, vocabulary, 2, random, patterns, 0.4F);
-    const DraftSelector selector(vocabulary);
-    std::array trees{DraftTreeLane{random.next() % vocabulary, kBlock - 1, kPositions, 2},
-                     DraftTreeLane{random.next() % vocabulary, kBlock - 1, kPositions, 2}};
+    const DraftSelector selector(vocabulary, kCandidates, kRows);
+    std::array trees{DraftTreeLane{random.next() % vocabulary, kBlock - 1, std::min(kPositions, 7U), 2},
+                     DraftTreeLane{random.next() % vocabulary, kBlock - 1, std::min(kPositions, 7U), 2}};
     run(backend, selector, f, trees);
     std::array<Chain, 2> chains;
     bool chainFirst = true;
@@ -921,14 +926,14 @@ void chainRowsTheDraftJoins(MetalBackend &backend) {
       // identity: the chain's first row comes first below its rate.
       chainFirst = chainFirst && l.q[0][0][l.ranked[0][0][0]] < kRate - 0.002;
       uint32_t predecessor = 0;
-      for (uint32_t d = 0; d < kPositions; ++d) {
+      for (uint32_t d = 0; d < std::min(kPositions, 7U); ++d) {
         const uint32_t index = l.ranked[d][predecessor][0];
         chains[lane].tokens.push_back(l.ids[d][index]);
         chains[lane].rates.push_back({kRate, kRate, kRate, kRate});
         predecessor = index;
       }
       std::copy(chains[lane].tokens.begin(), chains[lane].tokens.end(), f.chainTokens(lane));
-      std::fill_n(f.chainRates(lane), kPositions * kAgreements, kRate);
+      std::fill_n(f.chainRates(lane), std::min(kPositions, 7U) * kAgreements, kRate);
     }
     if (!chainFirst)
       continue;
@@ -963,7 +968,7 @@ void siblingsShareTheirParent(MetalBackend &backend) {
   Random random(0x73686172);
   const std::array patterns{Pattern::Uniform};
   const Fixture f = makeFixture(backend, vocabulary, 1, random, patterns, 0.1F);
-  const DraftSelector selector(vocabulary);
+  const DraftSelector selector(vocabulary, kCandidates, kRows);
   DraftCalibration flat;
   flat.slope = 0.0F;
   flat.intercepts.fill(std::log(0.3F / 0.7F));
@@ -996,7 +1001,7 @@ void chainCountsAgainstItsSiblings(MetalBackend &backend) {
   Random random(0x63686169);
   const std::array patterns{Pattern::Uniform};
   const Fixture f = makeFixture(backend, vocabulary, 2, random, patterns, 0.1F);
-  const DraftSelector selector(vocabulary);
+  const DraftSelector selector(vocabulary, kCandidates, kRows);
   DraftCalibration flat;
   flat.slope = 0.0F;
   flat.intercepts.fill(std::log(0.01F / 0.99F));
@@ -1373,7 +1378,7 @@ void bufferExtents(MetalBackend &backend) {
   Random random(0x657874);
   const std::array patterns{Pattern::Peaked};
   const Fixture f = makeFixture(backend, vocabulary, lanes, random, patterns, 0.1F);
-  const DraftSelector selector(vocabulary);
+  const DraftSelector selector(vocabulary, kCandidates, kRows);
   const std::array trees{DraftTreeLane{1, 3, 0, 2}, DraftTreeLane{2, kBlock - 1, 2, 1},
                          DraftTreeLane{3, kBlock - 1, 0, 4}};
   const uint64_t candidates = uint64_t{lanes} * kPositions * kCandidates;
@@ -1383,7 +1388,7 @@ void bufferExtents(MetalBackend &backend) {
            {&DraftSelectorBuffers::logits, uint64_t{lanes} * kRows * vocabulary * 4, 4, "draft logits"},
            {&DraftSelectorBuffers::partialIds, candidates * SPLASH_DRAFT_SAMPLING_SHARDS * 4, 4,
             "draft selector partial id"},
-           {&DraftSelectorBuffers::partialValues, candidates * (SPLASH_DRAFT_SAMPLING_SHARDS + kCandidates) * 4, 4,
+           {&DraftSelectorBuffers::partialValues, DraftSelector::workspace(lanes * kPositions, kCandidates, kRows).partialValuesBytes, 4,
             "draft selector partial value"},
            {&DraftSelectorBuffers::candidates, candidates * 4, 4, "draft candidate"},
            {&DraftSelectorBuffers::unary, candidates * 4, 4, "draft candidate score"},
@@ -1440,13 +1445,14 @@ void bufferExtents(MetalBackend &backend) {
 }
 
 void invalidRequests(MetalBackend &backend) {
-  rejects([] { DraftSelector(0); }, "invalid draft selector vocabulary",
+  rejects([] { DraftSelector(0, SPLASH_DRAFT_CANDIDATES); },
+          "invalid draft selector vocabulary",
           "a selector over no vocabulary was accepted");
   constexpr uint32_t vocabulary = 1024;
   Random random(0x696e76);
   const std::array patterns{Pattern::Peaked};
   const Fixture f = makeFixture(backend, vocabulary, 2, random, patterns, 0.1F);
-  const DraftSelector selector(vocabulary);
+  const DraftSelector selector(vocabulary, kCandidates, kRows);
   CommandGraph graph;
   const auto add = [&](std::span<const DraftTreeLane> lanes) {
     selector.add(graph, f.buffers, f.codebooks, {}, lanes);

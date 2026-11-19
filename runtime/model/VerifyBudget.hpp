@@ -24,7 +24,7 @@ namespace splash::model {
 
 class VerifyBudget final {
 public:
-  static constexpr uint32_t kPositions = SPLASH_DRAFT_PROPOSAL_TOKENS;
+  static constexpr uint32_t kPositions = SPLASH_DRAFT_BLOCK_PROPOSALS_LIMIT;
   // A lane's most rows, a verify block's (ops::verifyLaneCap).
   static constexpr uint32_t kBlockRows = SPLASH_TARGET_VERIFY_ROWS;
   static constexpr uint32_t kLanes = SPLASH_MAXIMUM_BATCH_WIDTH;

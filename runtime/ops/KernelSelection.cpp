@@ -162,16 +162,19 @@ LinearConfig bf16Projection(const KernelCalibration &calibration, LinearWorkload
   const auto [n, k] = w.matrix;
   const ProjectionCalibration &p = calibration.projection;
   const uint32_t cores = calibration.cores;
-  if (w.rows > kMaximumDecodeTileRows) return {.tile = LinearTile::GgufPrefill};
+  if (w.rows > kMaximumDecodeTileRows)
+    return {.tile = LinearTile::GgufPrefill,
+            .prefill64Rows = unit.prefill64Takes && w.rows <= 128 && cores >= p.smallPrefillFromCores &&
+                            n / GGUF_TILE_COLUMNS < uint64_t{p.smallPrefillColumnTilesPerCore} * cores};
   const uint32_t tiles = tableTiles(w.rows);
-  const bool gateUp = w.epilogue == LinearEpilogue::GateUp,
-             onePass = gateUp && unit.oneFormat && cores >= p.onePassFromCores && w.rows <= kMaximumPairRows;
+  const bool gateUp = w.epilogue == LinearEpilogue::GateUp || w.epilogue == LinearEpilogue::ClampedGateUp,
+             onePass = gateUp && unit.oneFormat && cores >= p.onePassFromCores && (w.rows <= 32 || (w.epilogue == LinearEpilogue::ClampedGateUp && w.rows > 48 && w.rows <= kMaximumPairRows));
   // A plan of at most GGUF_COLUMN_ROWS rows runs the column tile, which reads
   // them alone, a gate/up pair of one format in one pass: the staged and
   // register tiles compute every row of their tiles. A [2048 x 6144] af4g64
   // projection at one row takes 18.4 us on it, 28 us on the staged tile (M5
   // Max). Its one gate/up form is the pair in one pass.
-  if (w.rows <= GGUF_COLUMN_ROWS && w.epilogue != LinearEpilogue::UpWithGate && (!gateUp || unit.oneFormat))
+  if (w.epilogue != LinearEpilogue::ClampedGateUp && w.epilogue != LinearEpilogue::ClampedUpWithGate && w.rows <= GGUF_COLUMN_ROWS && w.epilogue != LinearEpilogue::UpWithGate && (!gateUp || unit.oneFormat))
     return {.tile = LinearTile::GgufColumn, .oneGateUpPass = gateUp};
   if (unit.registerTakes &&
       registers(p.decodeRegister, unit.formatClass, tiles, (onePass ? 2 : 1) * uint64_t{n / GGUF_TILE_COLUMNS},
@@ -201,11 +204,13 @@ UnitFormats unitFormats(std::span<const Projection *const> projections) noexcept
   UnitFormats unit;
   FormatClassifier classes;
   uint32_t bits = 0, count = 0;
-  bool decodeInt8 = true, prefillInt8 = true, quantized = false;
+  bool decodeInt8 = true, prefillInt8 = true, prefill64 = true, quantized = false;
   for (const Projection *p : projections) {
     if (!p) continue;
+    prefill64 &= !p->planeInputs();
     bits += p->shape().weightBits16, ++count;
     for (const QuantizedSegment &s : p->blocks().segments) {
+      prefill64 &= s.formatId == GGUF_FMT_Q4K || s.formatId == GGUF_FMT_Q5K;
       if (s.isFloat()) continue;
       unit.registerTakes &= quant_register_tensor(s.formatId, s.inputSize);
       classes.add(s.formatId);
@@ -216,6 +221,7 @@ UnitFormats unitFormats(std::span<const Projection *const> projections) noexcept
   }
   unit.decodeInt8Takes = quantized && decodeInt8;
   unit.prefillInt8Takes = quantized && prefillInt8;
+  unit.prefill64Takes = quantized && prefill64;
   unit.formatClass = classes.formatClass();
   unit.weightBits16 = count ? bits / count : 0;
   if (projections.size() == 2 && projections[0] && projections[1]) {
@@ -245,7 +251,7 @@ SplitChoice splitsFor(const SplitLaw &law, uint32_t n, uint32_t k, uint32_t rows
 // a plan on the prefill tile runs the int8 prefill tile where the row has
 // prefillInt8 and the tile takes the unit, and a staged plan that stores at
 // least decodeInt8FromRows rows (a 16-row plan counts 16), at most the int8
-// tiles' kMaximumInt8Rows, and whose K splits keep whole PQ2_0 blocks runs
+// policy's kMaximumInt8PolicyRows, and whose K splits keep whole PQ2_0 blocks runs
 // the int8 decode tiles where they take the unit, at the plan's rows, splits
 // and passes.
 LinearConfig selectProjection(const KernelCalibration &calibration, Int8Activations int8Activations,
@@ -258,7 +264,7 @@ LinearConfig selectProjection(const KernelCalibration &calibration, Int8Activati
   const uint32_t storage = stagedStorageRows(w.rows, config.sixteenRows);
   config.decodeInt8 = config.tile == LinearTile::GgufStaged && unit.decodeInt8Takes &&
                       decodeInt8TakesSplits(w.matrix.inputSize, config.splits) &&
-                      storage >= p.decodeInt8FromRows && storage <= kMaximumInt8Rows;
+                      storage >= p.decodeInt8FromRows && storage <= kMaximumInt8PolicyRows;
   return config;
 }
 
@@ -277,7 +283,7 @@ std::vector<LinearConfig> decodeConfigurations(const KernelCalibration &calibrat
   std::vector<LinearConfig> configurations{bf16Projection(calibration, w, {.registerTakes = registerTakes}, {})};
   if (registers(p.decodeRegister, FormatClass::FourBitsOrMore, tableTiles(w.rows), n / GGUF_TILE_COLUMNS, cores))
     configurations.push_back(staged(p, n, k, w.rows, 0, cores, Passes::Two));
-  if (w.epilogue == LinearEpilogue::GateUp && cores >= p.onePassFromCores && w.rows <= kMaximumPairRows)
+  if ((w.epilogue == LinearEpilogue::GateUp || w.epilogue == LinearEpilogue::ClampedGateUp) && cores >= p.onePassFromCores && (w.rows <= 32 || (w.epilogue == LinearEpilogue::ClampedGateUp && w.rows > 48 && w.rows <= kMaximumPairRows)))
     configurations.push_back(staged(p, n, k, w.rows, 0, cores, Passes::One));
   return configurations;
 }

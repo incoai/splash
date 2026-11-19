@@ -1,4 +1,6 @@
 #include "TestChecks.hpp"
+#include "DraftRingView.hpp"
+#include "metal/abi/ExecutionGeometry.h"
 #include "model/Model.hpp"
 #include "benchmarks/PrefillWork.hpp"
 #include "engine/Engine.hpp"
@@ -20,7 +22,7 @@ using splash::test::rejects;
 using splash::test::require;
 
 DraftContextPlan activePlan(uint32_t replayBegin, uint32_t replayEnd) {
-  return planDraftContext(replayBegin, replayEnd, {});
+  return planDraftContext(replayBegin, replayEnd, {}, SPLASH_DRAFT_SLIDING_WINDOW);
 }
 
 DraftContextPlan
@@ -28,7 +30,8 @@ cachedPlan(uint32_t replayBegin, uint32_t replayEnd,
            std::initializer_list<uint32_t> materializationBoundaries) {
   return planDraftContext(
       replayBegin, replayEnd,
-      {materializationBoundaries.begin(), materializationBoundaries.size()});
+      {materializationBoundaries.begin(), materializationBoundaries.size()},
+      SPLASH_DRAFT_SLIDING_WINDOW);
 }
 
 // The rows a plan captures for the boundaries of one purpose.
@@ -124,6 +127,72 @@ void testBenchmarkWorkIncludesRecoveryPoints() {
               expectedDraftContextRows(2048, interval) == 2048 &&
               expectedDraftContextRows(10000, interval, 9984) == 16,
           "benchmark changed disabled, short, or exact-hit draft work");
+}
+
+void testWideBenchmarkWork() {
+  using benchmark::defaultCheckpointTokens;
+  using benchmark::expectedDraftContextRows;
+  require(defaultCheckpointTokens(2048) == 4096 &&
+              defaultCheckpointTokens(16384) == 32768,
+          "benchmark checkpoint interval ignored model retention");
+  require(expectedDraftContextRows(10000, 32768, 0, 16384) == 10000 &&
+              expectedDraftContextRows(14096, 32768, 9984, 16384) == 4112,
+          "wide-window benchmark clipped a short prompt or restored suffix");
+  // 16K at 32768, another 16K at 49984, then 16 rows to prompt end.
+  require(expectedDraftContextRows(50000, 32768, 0, 16384) == 32784 &&
+              expectedDraftContextRows(50000, 0, 0, 16384) == 16400,
+          "wide-window benchmark miscounted recovery or final replay rows");
+  const std::array<uint32_t, 1> replay{14080};
+  require(planDraftContext(9984, 14096, replay, 16384).restoresDraftState &&
+              !planDraftContext(9984, 14096, replay, 2048).restoresDraftState,
+          "4K benchmark suffix ignored whether restored draft rows are still needed");
+}
+
+void testLayerRingViews() {
+  constexpr uint32_t heads = 2, dimensions = 3;
+  const auto encoded = [](uint64_t position, uint32_t head, uint32_t dimension) {
+    return static_cast<uint16_t>((position * 17 + head * 7 + dimension) % 65521);
+  };
+  // Fill each physical ring by writing an entire logical history. The view
+  // must return only the latest rows, even when another layer retains more.
+  for (uint32_t window : {2048U, 4096U, 16384U}) {
+    for (uint32_t end : {0U, 17U, window, window + 37, 2 * window + 11, 50000U}) {
+      std::vector<uint16_t> keys(heads * dimensions * window), values(keys.size());
+      for (uint32_t position = 0; position < end; ++position)
+        for (uint32_t head = 0; head < heads; ++head)
+          for (uint32_t dimension = 0; dimension < dimensions; ++dimension) {
+            const auto value = encoded(position, head, dimension);
+            keys[(head * window + position % window) * dimensions + dimension] = value;
+            values[(head * dimensions + dimension) * window + position % window] = value ^ 0xffff;
+          }
+      for (uint32_t retained : {64U, 2048U, 16384U}) {
+        const uint32_t count = std::min({end, retained, window});
+        const uint32_t base = end - std::min(end, retained);
+        const test::DraftRingView view(keys, values, heads, dimensions, window, base, end);
+        require(view.size() == uint64_t{heads} * count * dimensions,
+                "layer ring exposed overwritten or unfilled rows");
+        uint64_t index = 0;
+        for (uint32_t head = 0; head < heads; ++head)
+          for (uint32_t position = end - count; position < end; ++position)
+            for (uint32_t dimension = 0; dimension < dimensions; ++dimension, ++index) {
+              const auto value = encoded(position, head, dimension);
+              require(view.position(index) == position && view.key(index) == value &&
+                          view.value(index) == (value ^ 0xffff),
+                      "layer ring view changed logical order or physical layout");
+            }
+        rejects([&] { (void)view.key(view.size()); }, "outside retained rows",
+                "layer ring accepted an out-of-range logical index");
+      }
+      rejects([&] {
+        test::DraftRingView view(std::span(keys).first(keys.size() - 1), values,
+                                 heads, dimensions, window, 0, end);
+      }, "smaller than its layer window", "undersized key ring was accepted");
+      rejects([&] {
+        test::DraftRingView view(keys, std::span(values).first(values.size() - 1),
+                                 heads, dimensions, window, 0, end);
+      }, "smaller than its layer window", "undersized value ring was accepted");
+    }
+  }
 }
 
 void testJunctionDistancesAndReservation() {
@@ -316,6 +385,8 @@ int main() {
     testPartialHit();
     testFinalFullBlockBound();
     testBenchmarkWorkIncludesRecoveryPoints();
+    testWideBenchmarkWork();
+    testLayerRingViews();
     testJunctionDistancesAndReservation();
     testJunctionAndLatestReplayAreBothMaterialized();
     testCompactDispatchCaptures();

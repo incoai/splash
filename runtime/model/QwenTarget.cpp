@@ -81,8 +81,7 @@ const ops::Projection &QwenTarget::vocabularyProjection() const noexcept {
   return weightsBase_.logitsProjection;
 }
 
-uint32_t QwenTarget::headStorageLanes(uint32_t lanes) const {
-  constexpr uint32_t laneRows = ExecutionLimits::draftQueryRows;
+uint32_t QwenTarget::headStorageLanes(uint32_t lanes, uint32_t laneRows) const {
   return std::max(lanes * laneRows,
                   operators_.linear().storageRows(lanes * laneRows, vocabularyProjection().shape())) /
          laneRows;
@@ -101,7 +100,12 @@ void QwenTarget::addEmbedding(metal::CommandGraph &graph,
                               metal::MetalBuffer hidden,
                               uint32_t rows) const {
   ops::Embedding::add(graph, std::move(tokens), weightsBase_.tokenEmbedding, std::move(hidden),
-                      rows);
+                      rows, geometry_.embeddingScale);
+}
+
+void QwenTarget::addDraftEmbedding(metal::CommandGraph &graph, metal::MetalBuffer tokens,
+                                  metal::MetalBuffer hidden, uint32_t rows) const {
+  ops::Embedding::add(graph, std::move(tokens), weightsBase_.tokenEmbedding, std::move(hidden), rows);
 }
 
 void QwenTarget::addStateCommit(metal::CommandGraph &, QwenTargetCommitBuffers buffers,
@@ -264,21 +268,28 @@ void QwenTarget::addPrefillMixer(PrefillStep &step, const QwenAttentionWeights &
                                  BlockOutput output, std::span<const ops::AttentionBlocks> blocks) const {
   const QwenTargetPrefillBuffers &b = step.buffers;
   const ops::Linear &linear = operators_.linear();
+  if (!step.readRows.empty() && !output.residual)
+    throw std::logic_error("a Qwen prefill layer that outputs its read rows alone has no residual rows");
+  linear.add(step.graph,
+             {.input = b.normalized, .output = b.fullPacked, .scratch = b.linearScratch,
+              .prepared = std::move(normalized)},
+             mixer.inputProjection, linear.plan(mixer.inputProjection, step.rows));
+  addPrefillAttention(step, mixer, std::move(output), blocks);
+}
+
+void QwenTarget::addPrefillAttention(PrefillStep &step, const QwenAttentionWeights &mixer,
+                                     BlockOutput output, std::span<const ops::AttentionBlocks> blocks) const {
+  const QwenTargetPrefillBuffers &b = step.buffers;
+  const ops::Linear &linear = operators_.linear();
   const uint32_t layer = step.attentionLayer++;
   const ops::AttentionVariant variant = geometry_.attentionVariant(layer);
   if (!blocks.empty() && blocks.size() != step.sequences.size())
     throw std::invalid_argument("Qwen attention blocks do not match its sequences");
   // A layer that outputs its read rows alone adds its output to their
   // residual rows, which it gathers.
-  if (!step.readRows.empty() && !output.residual)
-    throw std::logic_error("a Qwen prefill layer that outputs its read rows alone has no residual rows");
   const std::span<const kv::ChunkedPrefillParams> sequences = step.attentionSequences();
   const ops::AttentionRows rows{b.laneRows, step.rows, step.decode ? step.decode->tree : metal::MetalBuffer{}};
   const std::span<const metal::MetalBuffer> pageTables = std::span(step.pageTables).first(sequences.size());
-  linear.add(step.graph,
-             {.input = b.normalized, .output = b.fullPacked, .scratch = b.linearScratch,
-              .prepared = std::move(normalized)},
-             mixer.inputProjection, linear.plan(mixer.inputProjection, step.rows));
   // The q/k projection stores each row's key and value in its page slot.
   ops::PagedAttention::addProjection(step.graph, b.fullPacked, mixer.queryNorm, mixer.keyNorm, b.ropeCos, b.ropeSin,
                                      b.fullQueries, step.kvLayers[layer], pageTables, sequences, rows,
@@ -334,7 +345,7 @@ void QwenTarget::addPrefillMixer(PrefillStep &step, const QwenAttentionWeights &
   // The read rows' residual rows, gathered into the normalized rows the
   // input projection has read.
   metal::MetalBuffer residual = std::move(output.residual);
-  if (lastRows) {
+  if (lastRows && residual) {
     for (uint32_t row = 0; row < step.readRows.size(); ++row)
       ops::RowCopy::add(step.graph, residual, {step.readRows[row], geometry_.hiddenSize, 0}, b.normalized,
                         {row, geometry_.hiddenSize, 0}, 1, geometry_.hiddenSize);

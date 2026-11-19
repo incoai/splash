@@ -29,8 +29,9 @@ and model-card `base_model` fields play no part. Families of one model type,
 Qwen3.6-35B-A3B and Qwen3.5-122B-A10B (`qwen3_5_moe_text`, GGUF `qwen35moe`),
 are told apart by their sizes, and a fine-tune of either, such as
 Ornith-1.5-35B-A3B or Ornith-1.5-122B, is its family. A layout type
-(`Qwen3_8.hpp`, `Qwen3_6Moe.hpp`, `Qwen4Exp.hpp`, `Flint.hpp` in
-`runtime/model/`) is an architecture, whose code its families share, and each
+(`Qwen3_8.hpp`, `Qwen3_6Moe.hpp`, `Qwen4Exp.hpp`, `Flint.hpp`,
+`Ripple.hpp` in `runtime/model/`) is an architecture, whose code its
+families share, and each
 family is a value of it in one list, `model::kFamilies` (`ModelDescriptor.hpp`):
 another size of an architecture is one more value there, built by the
 constructor from a `QwenHybridLayout` its layout type gains with its second
@@ -49,6 +50,12 @@ Flint's values key by key (its widths, router, window, `layer_types`,
 An MLX target must declare `quantization` in `config.json` in formats it loads
 ([MLX targets](#mlx-targets)). Every start checks the configuration again.
 Remote Python code is not loaded.
+
+Ripple-65B-Preview loads from a GGUF through the same installer and native
+runtime. Its target uses sliding RoPE attention and full attention without
+RoPE, scaled embeddings, value mixing and clamped SwiGLU. Its serving context
+is capped at 1,048,576 tokens. Its model opens its own reasoning block; the
+shared APIs split reasoning and JSON tool calls and support thinking budgets.
 
 ```bash
 splash serve --model mlx-community/Qwen3.6-35B-A3B-4bit
@@ -313,13 +320,18 @@ ascending, at most eight); its hidden size, vocabulary and mask token are its
 target's (Flint's vocabulary keeps no mask token: a Flint draft chooses one of
 its reserved special tokens, 150019 to 150143, as its
 `dflash_config.mask_token_id`, which the target's layout then holds,
-`QwenTargetDimensions::firstDraftMaskToken`), and its attention (32 query and
-8 KV heads of 128), selector (rank 256, 16 candidates) and 2048-token window are
-those the kernels are built for, and its block at least their 8 rows, of which a
-cycle drafts the first (the Qwen3.5-122B-A10B draft was trained to fill 16;
-`readDraftLayout` in `ModelDescriptor.mm`); the kernels take any hidden width of
-whole 16-channel convolution groups. A draft's rows after its anchor read the
-target's token table row of the mask token, unless its release ships that
+`QwenTargetDimensions::firstDraftMaskToken`). The usual compiled draft has
+32 query heads, 8 KV heads of dimension 128, a rank-256 selector with 16
+candidates and a 2048-token window. Ripple's compiled variant has 80 query
+heads, 32 selector candidates and a 16-row block: its four sliding layers
+retain 4096 RoPE positions, and its full layer retains 16384 positions without
+RoPE. The context window and KV rings follow each layer's attention shape.
+`readDraftLayout` in `ModelDescriptor.mm` validates the checkpoint against its
+variant; the kernels take any hidden width of whole 16-channel convolution
+groups. Draft inputs borrow the target's token-table rows before any
+target-specific embedding scale. Ripple scales its own inputs by the square
+root of its hidden size; the draft reads the raw rows (`QwenTarget::addDraftEmbedding`).
+A draft's rows after its anchor read the target's token table row of the mask token, unless its release ships that
 token's BF16 embedding, which they read instead (`DFlashDraft::addMaskRows`):
 `mask_embedding.safetensors`, one tensor `mask_embedding` of the hidden size.
 A quantized table can lose the row: Qwen3.5-122B-A10B's is of order 1e-6,
@@ -327,8 +339,7 @@ below what the fp16 block scales of Q8_0 and the K-quants hold, so its GGUFs
 read zeros there: on an M5 Max serving unsloth/Ornith-1.5-122B-GGUF:UD-Q4_K_XL
 with every row verified, its draft accepted 2.3 tokens a cycle on code
 without the embedding, 4.7 with it. Every family loads and runs its draft
-alike: a decode cycle drafts eight rows, the anchor and seven proposal
-positions, and the target verifies a tree of the draft's candidates at those
+alike: a decode cycle drafts its variant's block, usually eight rows (the anchor and seven proposal positions), or Ripple's sixteen rows, and the target verifies a tree of the draft's candidates at those
 positions and of its host chain (below), as many of its rows as the cycle's
 step gives the lane, up to sixteen (`ops::DraftSelector::addVerifyRows`), no
 more of them, and none deeper, than the lane may still retain: the tokens its

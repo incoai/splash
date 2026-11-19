@@ -1451,6 +1451,7 @@ def main():
             tokenizer,
             request_logger=print_request,
             thinking_end=thinking_end,
+            chat_format=family.chat_format,
         )
         # A server that serves nothing more stops as on SIGTERM and exits
         # ENGINE_STOPPED_STATUS below.

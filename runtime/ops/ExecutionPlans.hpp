@@ -56,7 +56,7 @@ public:
                                         kv::Layout layout, AttentionWorkspace capacity,
                                         AttentionVariant variant = {}) const;
   [[nodiscard]] DraftAttentionPlan draftAttention(
-      DraftAttentionShape shape, uint32_t lanes) const;
+      DraftAttentionShape shape, uint32_t lanes, uint32_t rows = SPLASH_DRAFT_QUERY_ROWS) const;
   // The plan of a step of `rows` rows of a MoE target's blocks, whose
   // routers are in `routerFormat` (moeRouterFormat).
   [[nodiscard]] MoePlan moe(MoeShape shape, uint32_t routerFormat, uint32_t rows) const;
@@ -70,7 +70,7 @@ public:
   [[nodiscard]] AttentionWorkspace sequenceAttentionWorkspace(uint32_t queryHeads, kv::Layout layout) const;
   [[nodiscard]] AttentionWorkspace laneAttentionWorkspace(uint32_t queryHeads, kv::Layout layout) const;
   [[nodiscard]] DraftAttentionWorkspace draftAttentionWorkspacePerLane(
-      DraftAttentionShape shape) const;
+      DraftAttentionShape shape, uint32_t rows = SPLASH_DRAFT_QUERY_ROWS) const;
   // The workspace of every MoE step of 1 to `maximumRows` rows, not just the
   // most: a prompt chunk's, and a decode step's of its lanes' packed rows.
   [[nodiscard]] MoeWorkspace moeWorkspace(MoeShape shape, uint32_t routerFormat, uint32_t maximumRows) const;

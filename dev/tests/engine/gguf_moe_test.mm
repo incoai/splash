@@ -318,7 +318,7 @@ QuantizedSegment gatheredValues(MetalBackend &backend, Fmt f, uint32_t N, uint32
   const MetalBuffer values = backend.allocateBuffer(uint64_t{N} * K * 4, BufferStorage::Shared, "gguf-floats");
   CommandGraph graph;
   graph.add(std::string("gguf_embed_f32_") + kQuantFormats[f].name, {idBuffer, rows, values},
-            GgufEmbedParams{N, N, K}, {(N * K + 255) / 256, 1, 1}, {256, 1, 1});
+            GgufEmbedParams{N, N, K, 1.0F}, {(N * K + 255) / 256, 1, 1}, {256, 1, 1});
   static_cast<void>(backend.submitCommandAsync(graph.dispatches()).wait());
   return QuantizedSegment::floats(N, K, values);
 }
@@ -345,7 +345,7 @@ int nativeRowWeights(MetalBackend &backend) {
         const QuantizedSegment quantized = QuantizedSegment::rows(f, N, K, rows);
         for (const FloatTile tile : {FloatTile::Simdgroup, FloatTile::NeuralAccelerator}) {
           const bool accelerator = tile == FloatTile::NeuralAccelerator;
-          for (const uint32_t count : {1u, 7u, 16u, 33u, 263u, 2048u}) {
+          for (const uint32_t count : {1u, 7u, 16u, 32u, 33u, 65u, 263u, 2048u}) {
             if (count == 2048 && (K != 2048 || N != 256)) continue;
             if (accelerator && count < 16) continue;
             const MetalBuffer input = bfloatBuffer(backend, activations(uint64_t{count} * K), "float-input");

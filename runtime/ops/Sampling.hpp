@@ -45,11 +45,14 @@ struct ThinkingCutoff final {
   std::span<const uint32_t> end{};
   uint32_t alsoEnds = 0;
   bool waitsForMask = false;
+  bool opened = true;
+  std::span<const uint32_t> markers{};
+  uint32_t markerState = 0;
 
   // How many of the lane's proposals, from the first, the end makes: tokens
   // the draft did not propose.
   [[nodiscard]] uint32_t replacedProposals() const noexcept {
-    return row || waitsForMask ? 0 : static_cast<uint32_t>(std::min<size_t>(end.size(), SPLASH_TREE_CHAIN_TOKENS));
+    return row || waitsForMask || (!markers.empty() && !opened) ? 0 : static_cast<uint32_t>(std::min<size_t>(end.size(), SPLASH_TREE_CHAIN_TOKENS));
   }
 };
 
@@ -162,7 +165,8 @@ struct AcceptanceBuffers final {
 // tokens. The draft's own selector is ops::DraftSelector.
 class Sampling final {
 public:
-  explicit Sampling(uint32_t vocabulary);
+  explicit Sampling(uint32_t vocabulary, uint32_t candidates = SPLASH_DRAFT_CANDIDATES,
+                    uint32_t draftRows = SPLASH_DRAFT_QUERY_ROWS);
 
   // Exact scratch/output bytes for the fixed precompiled sampling ABI, for a
   // selection whose lanes' rows end before row `rows` (the workspaces are
@@ -252,6 +256,8 @@ private:
                     const TargetRows &rows) const;
 
   uint32_t vocabulary_ = 0;
+  uint32_t draftCandidates_ = SPLASH_DRAFT_CANDIDATES;
+  uint32_t draftRows_ = SPLASH_DRAFT_QUERY_ROWS;
   uint32_t maskWords_ = 0;
 };
 

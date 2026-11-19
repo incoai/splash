@@ -96,6 +96,9 @@ struct ProjectionCalibration final {
   // (UnitFormats::prefillInt8Takes) run that tile, where the family's int8
   // matmul is faster than its bf16 one.
   bool prefillInt8;
+  // The 64-row Q4_K/Q5_K prefill tile where the 128-row grid has too few
+  // column tiles per core. Other formats retain their measured tile.
+  uint32_t smallPrefillFromCores, smallPrefillColumnTilesPerCore;
 };
 
 struct FloatTileCalibration final {
@@ -247,6 +250,8 @@ inline constexpr ProjectionCalibration kApple9Projection{
     // activations in decode and prefill, end to end unmeasured.
     .decodeInt8FromRows = kNever,
     .prefillInt8 = false,
+    .smallPrefillFromCores = kNever,
+    .smallPrefillColumnTilesPerCore = 0,
 };
 inline constexpr ProjectionCalibration kApple10Projection{
     .registerSplits = TierLaw{kRegisterTiers},
@@ -263,6 +268,10 @@ inline constexpr ProjectionCalibration kApple10Projection{
     // shapes in af4g64 and af5g64 at 65-2048 rows (M5 Max, M5 Pro and M6,
     // measured).
     .prefillInt8 = true,
+    // M5 Max: at 65-128 rows, low column counts leave the 128-row tile
+    // short of independent threadgroups. 64-row tiles double that grid.
+    .smallPrefillFromCores = 40,
+    .smallPrefillColumnTilesPerCore = 3,
 };
 
 // Apple11 takes Apple10's row but for the 16-row lane from 4.5 bits: the M6's
@@ -272,6 +281,7 @@ inline constexpr ProjectionCalibration kApple10Projection{
 inline constexpr ProjectionCalibration kApple11Projection = [] {
   ProjectionCalibration row = kApple10Projection;
   row.sixteenRowWaves = 0;
+  row.smallPrefillFromCores = kNever;
   return row;
 }();
 

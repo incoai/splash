@@ -179,10 +179,10 @@ void StepCosts::recall(uint32_t lanes, std::string_view line) {
     points[point].milliseconds = costs[point];
 }
 
-ops::StepRows StepCosts::block(std::span<const uint32_t> holds) {
-  ops::StepRows step{.lanes = uint32_t(holds.size()), .rows = 0, .laneCap = kNarrowCap};
+ops::StepRows StepCosts::block(std::span<const uint32_t> holds, uint32_t draftRows) {
+  ops::StepRows step{.lanes = uint32_t(holds.size()), .rows = 0, .laneCap = draftRows};
   for (const uint32_t held : holds)
-    step.rows += std::min(held, kNarrowCap);
+    step.rows += std::min(held, draftRows);
   ops::requireStepRows(step);
   return step;
 }

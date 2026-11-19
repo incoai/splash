@@ -67,7 +67,7 @@ struct DraftSelectorBuffers final {
 // logit(estimate) = slope * logit(q) + intercepts[p] (DraftTreeParams).
 struct DraftCalibration final {
   float slope = 1.0F;
-  std::array<float, SPLASH_DRAFT_PROPOSAL_TOKENS> intercepts{};
+  std::array<float, SPLASH_DRAFT_BLOCK_PROPOSALS_LIMIT> intercepts{};
 };
 
 // How one lane's tree grows (DraftTreeParams): from its anchor, over a
@@ -132,10 +132,14 @@ struct DraftCodebooks final {
 // likely chain.
 class DraftSelector final {
 public:
-  explicit DraftSelector(uint32_t vocabulary);
+  explicit DraftSelector(uint32_t vocabulary, uint32_t candidates = SPLASH_DRAFT_CANDIDATES,
+                         uint32_t rows = SPLASH_DRAFT_QUERY_ROWS);
+  [[nodiscard]] uint32_t rows() const noexcept { return rows_; }
+  [[nodiscard]] uint32_t positions() const noexcept { return rows_ - 1; }
 
   // Exact scratch/output bytes for that many proposal positions.
-  [[nodiscard]] static DraftSelectorWorkspace workspace(uint32_t positions);
+  [[nodiscard]] static DraftSelectorWorkspace workspace(uint32_t positions, uint32_t candidates = SPLASH_DRAFT_CANDIDATES,
+                                                        uint32_t rows = SPLASH_DRAFT_QUERY_ROWS);
 
   // Proposals from `vocabulary`'s tokens, whose logits rows buffers.logits
   // holds.
@@ -150,6 +154,8 @@ public:
 
 private:
   uint32_t vocabulary_ = 0;
+  uint32_t candidates_ = SPLASH_DRAFT_CANDIDATES;
+  uint32_t rows_ = SPLASH_DRAFT_QUERY_ROWS;
 };
 
 } // namespace splash::ops

@@ -121,8 +121,8 @@ std::vector<uint32_t> pageRange(uint32_t first, uint32_t count) {
 // producing tokens instead of a stop token right after prefill. The user text
 // repeats one sentence, "Write a detailed, multi-paragraph essay about the
 // history of the Roman Empire. ", until the prompt reaches the requested
-// length, and the answer follows an empty think block. Its tokens are the
-// target's tokenizer's: the Qwen families' (one tokenizer) or Flint's.
+// length. Qwen and Flint keep the baseline's empty think block; Ripple
+// opens its own reasoning. Tokens follow each target's tokenizer.
 struct ChatTokens final {
   std::vector<uint32_t> userHeader;
   std::vector<uint32_t> sentence;
@@ -141,8 +141,16 @@ const ChatTokens kFlintChat{
     // <|assistant|><think></think>
     .assistantHeader = {150004, 150006, 150007}};
 
+const ChatTokens kRippleChat{
+    // <|im_start|>user\n
+    .userHeader = {100264, 882, 198},
+    .sentence = {3923, 374, 279, 6864, 315, 9822, 30, 83017, 701, 33811, 11, 1243, 4320, 27851, 13, 198},
+    // <|im_end|>\n<|im_start|>assistant\n (the model opens its reasoning)
+    .assistantHeader = {100265, 198, 100264, 78191, 198}};
+
 std::vector<uint32_t> chatPrompt(const model::ModelDescriptor &descriptor, uint32_t tokens) {
   const ChatTokens &chat =
+      std::holds_alternative<model::RippleLayout>(descriptor.target) ? kRippleChat :
       std::holds_alternative<model::FlintLayout>(descriptor.target) ? kFlintChat : kQwenChat;
   if (tokens < chat.userHeader.size() + chat.assistantHeader.size() + 1)
     throw std::invalid_argument("prompt is too short for a chat request");

@@ -61,7 +61,7 @@ gguf::Image layerImage(const SafetensorsCheckpoint &checkpoint, const DFlashDraf
   const std::string attention = prefix + "self_attn.";
   const uint64_t hidden = layout.hiddenSize, kv = uint64_t{layout.kvHeads} * layout.attentionHeadDimension;
   const auto convolution = [&](const std::string &name) {
-    b.stored(name + ".base_kernel", {SPLASH_DRAFT_CONVOLUTION_STAGES, SPLASH_DRAFT_CONVOLUTION_TAPS, hidden});
+    b.stored(name + ".base_kernel", {SPLASH_DRAFT_CONVOLUTION_STAGES, layout.convolutionTaps, hidden});
     b.projection({{name + ".kernel_projection", layout.dynamicSize}}, hidden);
   };
   b.stored(prefix + "input_layernorm.weight", {hidden});

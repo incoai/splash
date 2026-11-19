@@ -272,6 +272,14 @@ TEST_CPU_TARGETS := $(TEST_SLOT_FILE) $(TEST_SPARSE_ROW_STORE) $(TEST_SSD_READER
 	$(TEST_JSON_WRITER) \
 	$(TEST_Q8_CPU_TEST)
 
+TEST_DRAFT_SELECTOR_32 := $(ENGINE_TEST_BUILD)/draft-selector-32
+TEST_TARGET_SAMPLING_32 := $(ENGINE_TEST_BUILD)/target-sampling-32
+TEST_RIPPLE_VALUE_MIX := $(ENGINE_TEST_BUILD)/ripple-value-mix
+TEST_RIPPLE_LOAD := $(ENGINE_TEST_BUILD)/ripple-load
+TEST_RIPPLE_CHAIN := $(ENGINE_TEST_BUILD)/ripple-chain
+TEST_RIPPLE_PARITY := $(ENGINE_TEST_BUILD)/ripple-parity
+TEST_RIPPLE_DRAFT := $(ENGINE_TEST_BUILD)/ripple-draft
+
 TEST_METAL_TARGETS := $(TEST_DRAFT_PREPARATION) \
 	$(TEST_GGUF_PROJECTION) \
 	$(TEST_ANE_FFN) \
@@ -306,6 +314,8 @@ TEST_METAL_TARGETS := $(TEST_DRAFT_PREPARATION) \
 	$(TEST_DRAFT_SELECTOR_TEST) \
 	$(TEST_TARGET_SAMPLING_TEST) \
 	$(TEST_TARGET_SAMPLING_WIDE_TEST) \
+	$(TEST_DRAFT_SELECTOR_32) $(TEST_TARGET_SAMPLING_32) \
+	$(TEST_RIPPLE_VALUE_MIX) $(TEST_RIPPLE_LOAD) $(TEST_RIPPLE_CHAIN) $(TEST_RIPPLE_PARITY) $(TEST_RIPPLE_DRAFT) \
 	$(TEST_VISION_METAL_TEST) \
 	$(TEST_VISION_ATTENTION_TEST) \
 	$(TEST_METAL_BACKEND_TEST) \
@@ -377,6 +387,7 @@ $(TEST_KV_PAGE_CACHE_TEST): runtime/engine/KvPool.cpp \
 		dev/tests/engine/kv_page_cache_test.cpp
 $(TEST_DRAFT_CONTEXT_PLAN_TEST): runtime/model/DraftContextPlan.cpp \
 		dev/benchmarks/PrefillWork.hpp \
+		dev/tests/engine/DraftRingView.hpp \
 		dev/tests/engine/draft_context_plan_test.cpp
 $(TEST_METRICS_TEST): $(BACKEND_CONTROL_SOURCES) \
 		runtime/engine/MemoryGovernor.cpp runtime/engine/MemoryLedger.cpp \
@@ -522,6 +533,7 @@ $(TEST_PRESSURE_SERVING): dev/tests/engine/pressure_serving_test.mm \
 $(TEST_VISION_ENCODER_TEST): dev/tests/engine/vision_encoder_test.mm \
 		$(ENGINE_LIBRARY)
 $(TEST_MODEL_RUNTIME_ORACLE): dev/tests/engine/model_runtime_oracle_test.mm \
+		dev/tests/engine/DraftRingView.hpp \
 		dev/tools/LoadOptions.hpp \
 		$(ENGINE_INSTRUMENTED_METAL_OBJECT) $(ENGINE_INSTRUMENTED_ANE_OBJECT) \
 		$(ENGINE_INSTRUMENTED_RUNTIME_OBJECT) $(ENGINE_LIBRARY) $(LIB) $(BUILD_ID_HEADER)
@@ -743,6 +755,13 @@ test-engine-metal: $(TEST_METAL_TARGETS)
 	$(METAL_TEST_ENV) $(TEST_DRAFT_SELECTOR_TEST) $(LIB)
 	$(METAL_TEST_ENV) $(TEST_TARGET_SAMPLING_TEST) $(LIB)
 	$(METAL_TEST_ENV) $(TEST_TARGET_SAMPLING_WIDE_TEST) $(LIB)
+	$(METAL_TEST_ENV) $(TEST_DRAFT_SELECTOR_32) $(LIB)
+	$(METAL_TEST_ENV) $(TEST_TARGET_SAMPLING_32) $(LIB)
+	$(METAL_TEST_ENV) $(TEST_RIPPLE_VALUE_MIX) $(LIB)
+	$(METAL_TEST_ENV) $(TEST_RIPPLE_LOAD) $(LIB)
+	$(METAL_TEST_ENV) $(TEST_RIPPLE_CHAIN) $(LIB)
+	$(METAL_TEST_ENV) $(TEST_RIPPLE_PARITY) $(LIB)
+	$(METAL_TEST_ENV) $(TEST_RIPPLE_DRAFT) $(LIB)
 	$(METAL_TEST_ENV) $(TEST_VISION_METAL_TEST) $(LIB)
 	$(METAL_TEST_ENV) $(TEST_VISION_ATTENTION_TEST) $(LIB)
 	$(METAL_TEST_ENV) $(TEST_METAL_BACKEND_TEST) $(TEST_METAL_BACKEND_LIB)
@@ -782,10 +801,10 @@ test-real: preflight $(TARGET) $(TEST_MODEL_RUNTIME_ORACLE) \
 			$(METAL_TEST_ENV) $(TEST_VISION_ENCODER_TEST) $(LIB) "$(MODEL_ROOT)" \
 				dev/tests/fixtures/vision-parity/$$family; \
 		else echo "vision parity: skipped, the installation serves text only"; fi
-	$(TEST_MODEL_RUNTIME_ORACLE) $(LIB) "$(MODEL_ROOT)" --ane-ffn-share 0 $(ORACLE_ARGS)
-	$(TEST_MODEL_RUNTIME_ORACLE) $(LIB) "$(MODEL_ROOT)" --ane-ffn-share 0 --state-format bf16 \
+	$(PYTHON) dev/tests/engine/run_model_runtime_oracle.py $(TEST_MODEL_RUNTIME_ORACLE) $(LIB) "$(MODEL_ROOT)" --ane-ffn-share 0 $(ORACLE_ARGS)
+	$(PYTHON) dev/tests/engine/run_model_runtime_oracle.py $(TEST_MODEL_RUNTIME_ORACLE) $(LIB) "$(MODEL_ROOT)" --ane-ffn-share 0 --state-format bf16 \
 		--spill-buffers 2 $(ORACLE_ARGS)
-	$(TEST_MODEL_RUNTIME_ORACLE) $(LIB) "$(MODEL_ROOT)" --spill-tokens 32768 --spill-window 64 $(ORACLE_ARGS)
+	$(PYTHON) dev/tests/engine/run_model_runtime_oracle.py $(TEST_MODEL_RUNTIME_ORACLE) $(LIB) "$(MODEL_ROOT)" --spill-tokens 32768 --spill-window 64 $(ORACLE_ARGS)
 
 .PHONY: benchmark-backend \
 	benchmark-decode-profile benchmark-attention-sweep \
@@ -1017,3 +1036,49 @@ test-sanitizers-metal:
 	$(METAL_TSAN_TEST_ENV) $(METAL_TSAN_BUILD)/engine-tests/expert-store $(METAL_TSAN_BUILD)/splash.metallib
 	$(METAL_TSAN_TEST_ENV) $(METAL_TSAN_BUILD)/engine-tests/metal-backend \
 		$(METAL_TSAN_BUILD)/engine-tests/metal-backend.metallib --filter behaviour/
+
+# The Ripple family's engine tests: the tiny model's load and parity gates
+# and the draft kernels' batch control. Real-model checks use the shared
+# model-runtime oracle and HTTP smoke targets (docs/validate.md).
+
+
+$(TEST_RIPPLE_VALUE_MIX): BUILD_CONFIG := $(TEST_CONFIG_DIGEST)
+$(TEST_RIPPLE_LOAD): BUILD_CONFIG := $(TEST_CONFIG_DIGEST)
+$(TEST_RIPPLE_CHAIN): BUILD_CONFIG := $(TEST_CONFIG_DIGEST)
+$(TEST_RIPPLE_DRAFT): BUILD_CONFIG := $(TEST_CONFIG_DIGEST)
+$(TEST_RIPPLE_PARITY): BUILD_CONFIG := $(TEST_CONFIG_DIGEST)
+
+$(TEST_RIPPLE_VALUE_MIX): dev/tests/engine/ripple_value_mix_test.mm \
+		$(ENGINE_LIBRARY) $(LIB) | $(ENGINE_TEST_BUILD)
+	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) -fobjc-arc $< \
+		$(ENGINE_LIBRARY) $(ENGINE_LINKFLAGS) -o $@
+
+$(TEST_RIPPLE_PARITY): dev/tests/engine/ripple_parity_test.mm \
+		$(ENGINE_LIBRARY) $(LIB) | $(ENGINE_TEST_BUILD)
+	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) -fobjc-arc $< \
+		$(ENGINE_LIBRARY) $(ENGINE_LINKFLAGS) -o $@
+
+$(TEST_RIPPLE_DRAFT): dev/tests/engine/ripple_draft_test.mm \
+		$(ENGINE_LIBRARY) $(LIB) | $(ENGINE_TEST_BUILD)
+	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) -fobjc-arc $< \
+		$(ENGINE_LIBRARY) $(ENGINE_LINKFLAGS) -o $@
+
+$(TEST_RIPPLE_CHAIN): dev/tests/engine/ripple_chain_test.mm \
+		$(ENGINE_LIBRARY) $(LIB) | $(ENGINE_TEST_BUILD)
+	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) -fobjc-arc $< \
+		$(ENGINE_LIBRARY) $(ENGINE_LINKFLAGS) -o $@
+
+$(TEST_RIPPLE_LOAD): dev/tests/engine/ripple_load_test.mm \
+		$(ENGINE_LIBRARY) $(LIB) | $(ENGINE_TEST_BUILD)
+	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) -fobjc-arc $< \
+		$(ENGINE_LIBRARY) $(ENGINE_LINKFLAGS) -o $@
+
+
+$(TEST_DRAFT_SELECTOR_32): BUILD_CONFIG := $(TEST_CONFIG_DIGEST)
+$(TEST_TARGET_SAMPLING_32): BUILD_CONFIG := $(TEST_CONFIG_DIGEST)
+$(TEST_DRAFT_SELECTOR_32): dev/tests/engine/draft_selector_metal_test.mm $(ENGINE_LIBRARY) $(LIB) | $(ENGINE_TEST_BUILD)
+	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) -fobjc-arc -DDRAFT_SELECTOR_CANDIDATES=32 -DDRAFT_SELECTOR_ROWS=16 $< \
+		$(ENGINE_LIBRARY) $(ENGINE_LINKFLAGS) -o $@
+$(TEST_TARGET_SAMPLING_32): dev/tests/engine/target_sampling_metal_test.mm $(ENGINE_LIBRARY) $(LIB) | $(ENGINE_TEST_BUILD)
+	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) -fobjc-arc -DTARGET_SAMPLING_CANDIDATES=32 -DTARGET_SAMPLING_DRAFT_ROWS=16 -DTARGET_SAMPLING_LANE_ROWS=16 $< \
+		$(ENGINE_LIBRARY) $(ENGINE_LINKFLAGS) -o $@

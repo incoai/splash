@@ -112,18 +112,19 @@ void checkMaskEmbedding(MetalBackend &backend, const std::filesystem::path &root
   check(draft.maskEmbedding && bytesOf(model::contentsOf(draft.maskEmbedding)) == mask,
         "the draft reads the mask embedding as shipped");
   // Two lanes of poisoned draft input rows.
-  const uint32_t lanes = 2, rows = lanes * SPLASH_DRAFT_QUERY_ROWS;
+  const uint32_t lanes = 2, rows = lanes * layout.rows;
   const auto input =
       backend.allocateBuffer(rows * rowBytes, splash::metal::BufferStorage::Shared, "draft input rows");
   std::memset(input.contents(), 0xA5, rows * rowBytes);
   splash::metal::CommandGraph graph;
-  ops::Embedding::addDraftMaskRows(graph, draft.maskEmbedding, input, layout.hiddenSize, lanes);
+  ops::Embedding::addDraftMaskRows(graph, draft.maskEmbedding, input, layout.hiddenSize, lanes,
+                                   layout.rows);
   (void)backend.submitCommandAsync(graph.dispatches()).wait();
   const std::vector<uint8_t> written = bytesOf(model::contentsOf(input));
   bool set = true;
   for (uint32_t row = 0; row < rows; ++row) {
     const auto begin = written.begin() + row * rowBytes;
-    set = set && (row % SPLASH_DRAFT_QUERY_ROWS
+    set = set && (row % layout.rows
                       ? std::equal(mask.begin(), mask.end(), begin)
                       : std::all_of(begin, begin + rowBytes, [](uint8_t byte) { return byte == 0xA5; }));
   }

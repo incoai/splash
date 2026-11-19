@@ -43,6 +43,8 @@ model::DFlashDraftLayout draftOf(std::string_view family) {
     return test::flashNextDraft();
   if (family == model::FlintLayout{}.family)
     return test::flintDraft();
+  if (family == model::RippleLayout{}.family)
+    return test::rippleDraft();
   throw std::logic_error(std::string(family) + " has no draft to take its values with");
 }
 
@@ -75,8 +77,8 @@ std::string familyValues() {
         << own.contextTokens << ".." << own.maximumContextTokens << '\n'
         << "kv layers " << kv.attentionLayers << " heads " << kv.kvHeads << " dimension " << kv.headDimension
         << " index " << kv.indexDimension << (kv.valuesTokenMajor ? " values-token-major" : "");
-    if (kv.windowedLayers)
-      out << " window " << kv.windowTokens << " layers 0x" << std::hex << kv.windowedLayers << std::dec;
+    if (!kv.windowedLayers.empty())
+      out << " window " << kv.windowTokens << " layers 0x" << std::hex << kv.windowedLayers.words[0] << std::dec;
     out << '\n';
     for (const kv::Format format : {kv::Format::Int8, kv::Format::BFloat16}) {
       kv::Layout layout = kv;

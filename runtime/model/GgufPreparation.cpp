@@ -568,7 +568,7 @@ void writeDecoded(metal::MetalBackend &backend, const metal::MetalBuffer &image,
     const uint64_t count = std::min(run, rows.rows - first);
     readRows(rows, first, count, 0, rows.rowBytes, static_cast<uint8_t *>(input.contents()));
     const GgufEmbedParams params{static_cast<uint32_t>(count), static_cast<uint32_t>(count),
-                                 static_cast<uint32_t>(columns)};
+                                 static_cast<uint32_t>(columns), 1.0F};
     const metal::MetalBuffer output = backend.view(image, copy.destination + first * columns * sizeof(float),
                                                    count * columns * sizeof(float));
     static_cast<void>(backend.submit({std::string("gguf_embed_f32_") + format.name,

@@ -85,6 +85,9 @@ ATTENTION_QKV_FORMATS(_kv2_g16_f32, 32, 2, 256, 32, true, float, false)
 ATTENTION_QKV_FORMATS(_kv4_g8_d128_f32, 32, 4, 128, 64, false, float, false)
 ATTENTION_QKV_NOPE(attention_q8_qkv_kv4_g8_d128_nope_f32, 32, 4, 128, false, float, int8_t, false)
 ATTENTION_QKV_NOPE(attention_bf16_qkv_kv4_g8_d128_nope_f32, 32, 4, 128, false, float, bfloat, false)
+ATTENTION_QKV_FORMATS(_kv8_g10_d128_f32, 80, 8, 128, 64, true, float, false)
+ATTENTION_QKV_NOPE(attention_q8_qkv_kv8_g10_d128_nope_f32, 80, 8, 128, true, float, int8_t, false)
+ATTENTION_QKV_NOPE(attention_bf16_qkv_kv8_g10_d128_nope_f32, 80, 8, 128, true, float, bfloat, false)
 #undef ATTENTION_QKV_FORMATS
 #undef ATTENTION_QKV_NOPE
 #undef ATTENTION_QKV

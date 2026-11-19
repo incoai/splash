@@ -1,5 +1,6 @@
 #include "AwakeClock.hpp"
 #include "ChainRows.hpp"
+#include "DraftRingView.hpp"
 #include "LinearNumerics.hpp"
 #include "PenaltyReference.hpp"
 #include "StateCodecReference.hpp"
@@ -32,6 +33,8 @@
 #include "ops/Sampling.hpp"
 #include "ops/Vision.hpp"
 #include "tools/LoadOptions.hpp"
+
+#import <Foundation/Foundation.h>
 
 #include <algorithm>
 #include <array>
@@ -282,6 +285,8 @@ struct OracleTokens final {
   // line. Continue until you reach 200." from the user, answered without
   // thinking: an empty think block.
   std::vector<uint32_t> productionSeed;
+  std::vector<uint32_t> markers{}, openedMarkers{}, longMarkers{}, opening{}, filler{}, markerClose{};
+  SamplingParameters sampling{};
 
   [[nodiscard]] uint32_t maskWords() const noexcept { return (vocabulary + 31) / 32; }
 };
@@ -326,7 +331,69 @@ const OracleTokens kFlintTokens{
 // runs; the Qwen families' until then.
 const OracleTokens *targetTokens = &kQwenTokens;
 [[nodiscard]] const OracleTokens &oracleTokens(const model::ModelDescriptor &descriptor) {
-  return std::holds_alternative<model::FlintLayout>(descriptor.target) ? kFlintTokens : kQwenTokens;
+  const auto &tokens = std::holds_alternative<model::FlintLayout>(descriptor.target) ? kFlintTokens : kQwenTokens;
+  require(tokens.vocabulary == descriptor.capabilities.vocabularySize,
+          "model-runtime oracle has no token fixture for this vocabulary");
+  return tokens;
+}
+
+OracleTokens readOracleTokens(const std::filesystem::path &path, uint32_t vocabulary) {
+  require(std::filesystem::file_size(path) <= (1u << 20), "oracle token fixture is too large");
+  NSData *data = [NSData dataWithContentsOfFile:[NSString stringWithUTF8String:path.c_str()]];
+  id value = data ? [NSJSONSerialization JSONObjectWithData:data options:0 error:nullptr] : nil;
+  require([value isKindOfClass:[NSDictionary class]], "oracle token fixture is not a JSON object");
+  NSDictionary *object = value;
+  const auto number = [&](NSString *key) -> double {
+    id item = object[key];
+    require([item isKindOfClass:[NSNumber class]], "oracle token fixture number is missing");
+    const double result = [item doubleValue];
+    require(std::isfinite(result), "oracle token fixture number is not finite");
+    return result;
+  };
+  require(number(@"vocabulary") == vocabulary, "oracle token fixture vocabulary differs from the model");
+  const auto words = [&](NSString *key, uint32_t limit) {
+    id array = object[key];
+    require([array isKindOfClass:[NSArray class]] && [array count] && [array count] <= limit,
+            "oracle token fixture array is missing or oversized");
+    std::vector<uint32_t> result;
+    for (id item in array) {
+      require([item isKindOfClass:[NSNumber class]], "oracle token fixture word is not a number");
+      const double word = [item doubleValue];
+      require(word >= 0 && word <= UINT32_MAX && std::floor(word) == word,
+              "oracle token fixture word is not uint32");
+      result.push_back(static_cast<uint32_t>(word));
+    }
+    return result;
+  };
+  OracleTokens result;
+  result.vocabulary = vocabulary;
+  result.thinkingPrompt = words(@"thinking_prompt", 4096);
+  result.samplingSeed = words(@"sampling_seed", 4096);
+  result.productionSeed = words(@"production_seed", 4096);
+  result.thinkingEnds = {words(@"thinking_end", 64), words(@"long_end", 64)};
+  result.thinkEnd = result.thinkingEnds[0].back();
+  result.markers = words(@"thinking_markers", TokenAutomaton::maximumWords);
+  result.openedMarkers = words(@"opened_markers", TokenAutomaton::maximumWords);
+  result.longMarkers = words(@"long_markers", TokenAutomaton::maximumWords);
+  result.opening = words(@"opening", 64);
+  result.filler = words(@"filler", 64);
+  result.markerClose = words(@"marker_close", 64);
+  for (const auto *tokens : {&result.thinkingPrompt, &result.samplingSeed, &result.productionSeed,
+                             &result.thinkingEnds[0], &result.thinkingEnds[1], &result.opening, &result.filler,
+                             &result.markerClose})
+    require(std::ranges::all_of(*tokens, [=](uint32_t token) { return token < vocabulary; }),
+            "oracle token fixture has an out-of-vocabulary token");
+  require(TokenAutomaton(result.markers).valid(vocabulary) &&
+              TokenAutomaton(result.openedMarkers).valid(vocabulary) &&
+              TokenAutomaton(result.longMarkers).valid(vocabulary), "invalid oracle marker fixture");
+  result.sampling.temperature = number(@"temperature");
+  result.sampling.topP = number(@"top_p");
+  const double topK = number(@"top_k");
+  require(topK >= 0 && topK <= vocabulary && std::floor(topK) == topK, "invalid oracle top_k");
+  result.sampling.topK = static_cast<uint32_t>(topK);
+  require(!result.sampling.validationError() && result.sampling.temperature > 0,
+          "oracle fixture needs valid sampled reasoning");
+  return result;
 }
 
 struct Similarity final {
@@ -467,18 +534,19 @@ CommittedState committedState(const model::Runtime &executor, const model::QwenS
   // A ring's keys are [head][slot][dimension] and its values [head][dimension]
   // [slot]; position p is slot p % window.
   const auto layout = states.layout().draft;
-  constexpr uint32_t window = model::ExecutionLimits::draftContextTokens;
-  for (const auto &ring : states.draft(lane)) {
-    const uint16_t *keys = bfloatContents(ring.keys, "draft keys");
-    const uint16_t *values = bfloatContents(ring.values, "draft values");
+  const auto &rings = states.draft(lane);
+  for (uint32_t layer = 0; layer < rings.size(); ++layer) {
+    const auto &ring = rings[layer];
+    const test::DraftRingView rows(
+        {bfloatContents(ring.keys, "draft keys"), ring.keys.sizeBytes() / sizeof(uint16_t)},
+        {bfloatContents(ring.values, "draft values"), ring.values.sizeBytes() / sizeof(uint16_t)},
+        layout.kvHeads, layout.headDimension, layout.layerWindow(layer),
+        metadata.lengths.draftBase, metadata.lengths.draftEnd());
     std::vector<uint16_t> keyRows, valueRows;
-    for (uint32_t head = 0; head < layout.kvHeads; ++head)
-      for (uint64_t position = metadata.lengths.draftBase; position < metadata.lengths.draftEnd(); ++position)
-        for (uint32_t dimension = 0; dimension < layout.headDimension; ++dimension) {
-          const uint64_t slot = position % window;
-          keyRows.push_back(keys[(uint64_t{head} * window + slot) * layout.headDimension + dimension]);
-          valueRows.push_back(values[(uint64_t{head} * layout.headDimension + dimension) * window + slot]);
-        }
+    for (uint64_t index = 0; index < rows.size(); ++index) {
+      keyRows.push_back(rows.key(index));
+      valueRows.push_back(rows.value(index));
+    }
     state.rings.push_back(std::move(keyRows));
     state.rings.push_back(std::move(valueRows));
   }
@@ -521,6 +589,7 @@ EngineRequest makeRequest(uint64_t id, std::vector<uint32_t> prompt,
   result.id = id;
   result.prompt = std::move(prompt);
   result.maxNewTokens = maximumNewTokens;
+  result.sampling = targetTokens->sampling;
   return result;
 }
 
@@ -578,7 +647,7 @@ void restoreActivePrefix(model::Runtime &executor, uint64_t requestId,
                          const std::shared_ptr<const CompositeState> &state) {
   require(!executor.beginRestore(requestId, boundary, state, true, {}),
           "resident restore returned a read");
-  executor.setDraftContextPlan(requestId, planDraftContext(boundary, promptTokens, {}));
+  executor.setDraftContextPlan(requestId, planDraftContext(boundary, promptTokens, {}, executor.draftWindow()));
 }
 
 // Passes a lane's GDN state through the codes a cached state stores it as
@@ -880,25 +949,20 @@ StateSamples sampleCommittedState(const metal::MetalBackend &backend,
   }
   const auto &lengths = states.metadata(lane).lengths;
   const auto layout = states.layout().draft;
-  constexpr uint32_t window = model::ExecutionLimits::draftContextTokens;
-  const uint64_t elements = uint64_t{layout.kvHeads} * lengths.draftLength *
-                            layout.headDimension;
-  const uint64_t stride = std::max<uint64_t>(1, elements / 65536);
+  const uint32_t window = layout.window;
   const auto &ring = states.draft(lane);
   for (uint32_t layer = 0; layer < ring.size(); ++layer) {
-    const auto *keys = bfloatContents(ring[layer].keys, "draft keys");
-    const auto *values = bfloatContents(ring[layer].values, "draft values");
+    const test::DraftRingView rows(
+        {bfloatContents(ring[layer].keys, "draft keys"), ring[layer].keys.sizeBytes() / sizeof(uint16_t)},
+        {bfloatContents(ring[layer].values, "draft values"), ring[layer].values.sizeBytes() / sizeof(uint16_t)},
+        layout.kvHeads, layout.headDimension, layout.layerWindow(layer),
+        lengths.draftBase, lengths.draftEnd());
+    const uint64_t stride = std::max<uint64_t>(1, rows.size() / 65536);
     std::vector<float> keySamples, valueSamples, capturedKeys, capturedValues;
-    for (uint64_t index = 0; index < elements; index += stride) {
-      const uint32_t dimension = index % layout.headDimension;
-      const uint32_t position = (index / layout.headDimension) % lengths.draftLength;
-      const uint32_t head = index / (uint64_t{layout.headDimension} * lengths.draftLength);
-      const uint32_t ring = (lengths.draftBase + position) % window;
-      const bool captured = lengths.draftBase + position >= capturedFrom;
-      (captured ? capturedKeys : keySamples).push_back(test::bf16ToFloat(
-          keys[(uint64_t{head} * window + ring) * layout.headDimension + dimension]));
-      (captured ? capturedValues : valueSamples).push_back(test::bf16ToFloat(
-          values[(uint64_t{head} * layout.headDimension + dimension) * window + ring]));
+    for (uint64_t index = 0; index < rows.size(); index += stride) {
+      const bool captured = rows.position(index) >= capturedFrom;
+      (captured ? capturedKeys : keySamples).push_back(test::bf16ToFloat(rows.key(index)));
+      (captured ? capturedValues : valueSamples).push_back(test::bf16ToFloat(rows.value(index)));
     }
     result.emplace_back("draft_key_" + std::to_string(layer), std::move(keySamples));
     result.emplace_back("draft_value_" + std::to_string(layer), std::move(valueSamples));
@@ -921,7 +985,7 @@ StateSamples sampleCommittedState(const metal::MetalBackend &backend,
       const uint64_t offset = index % rowBytes;
       samples.push_back(bytes[offset < codeBytes
                                   ? slot * codeBytes + offset
-                                  : draft_context_codes_bytes(layout.contextWidth) +
+                                  : draft_context_codes_bytes(layout.contextWidth, window) +
                                         slot * groupBytes + (offset - codeBytes)]);
     }
     result.emplace_back("context_window", std::move(samples));
@@ -1122,7 +1186,7 @@ void requireImageRowsAfterReclaim(model::Runtime &executor,
   const StateAdmission admission = executor.begin(request.modelView());
   require(admission.granted(), "straddling image request was not admitted");
   executor.setDraftContextPlan(
-      request.id, planDraftContext(0, static_cast<uint32_t>(prompt.size()), {}));
+      request.id, planDraftContext(0, static_cast<uint32_t>(prompt.size()), {}, executor.draftWindow()));
   prefillChunk(executor, request.id, 0,
                std::span<const uint32_t>(prompt).first(64), pages, ImageEncodes{backend, true});
   const ImageSpan &span = request.images.front();
@@ -1256,7 +1320,7 @@ void requireRepeatedImagePlacements(model::Runtime &executor,
   const uint32_t lane = *admitted.lane;
   const std::vector<uint32_t> pages = pageRange(120, 4);
   const std::array<uint32_t, 1> checkpoints{64};
-  executor.setDraftContextPlan(request.id, planDraftContext(0, prompt.size(), checkpoints));
+  executor.setDraftContextPlan(request.id, planDraftContext(0, prompt.size(), checkpoints, executor.draftWindow()));
   const uint64_t encodes = executor.telemetry().imageEncodes;
   prefillChunk(executor, request.id, 0,
                std::span<const uint32_t>(prompt).first(64), pages, ImageEncodes{backend, true});
@@ -1302,23 +1366,29 @@ void requireRepeatedImagePlacements(model::Runtime &executor,
 void requireFullWindowRestore(model::Runtime &executor,
                               const metal::MetalBackend &backend,
                               model::QwenStateStorage &states) {
-  constexpr uint32_t window = model::ExecutionLimits::draftContextTokens;
-  constexpr uint32_t boundary = window + 64;
+  const uint32_t window = executor.draftWindow();
+  const uint32_t boundary = window + 64;
   std::vector<uint32_t> prompt(boundary + 64);
   for (uint32_t index = 0; index < prompt.size(); ++index)
     prompt[index] = 1 + index;
   const std::span<const uint32_t> tokens(prompt);
   const std::vector<uint32_t> pages = pageRange(0, prompt.size() / kv::kPageTokens);
   EngineRequest request = makeRequest(104, prompt, 1);
+  request.maxNewTokens = 0;
+  for (uint32_t index = 0; index < 16; ++index) request.scoreTokens.push_back(1000 + 37 * index);
   beginCold(executor, request, 0);
   const std::array<uint32_t, 1> checkpoints{boundary};
-  executor.setDraftContextPlan(request.id, planDraftContext(0, prompt.size(), checkpoints));
-  prefillChunk(executor, request.id, 0, tokens.first(window), pages);
+  executor.setDraftContextPlan(request.id, planDraftContext(0, prompt.size(), checkpoints, executor.draftWindow()));
+  for (uint32_t begin = 0; begin < window;) {
+    const uint32_t count = std::min(window - begin, executor.commandLimits().commandRows);
+    prefillChunk(executor, request.id, begin, tokens.subspan(begin, count), pages);
+    begin += count;
+  }
   prefillChunk(executor, request.id, window, tokens.subspan(window, boundary - window), pages);
   auto checkpoint = executor.snapshot(request.id);
   require(checkpoint != nullptr, "full-window checkpoint allocation failed");
   decodeLane(states, 0);
-  prefillChunk(executor, request.id, boundary, tokens.subspan(boundary), pages);
+  const auto cold = prefillChunk(executor, request.id, boundary, tokens.subspan(boundary), pages);
   const auto expected = sampleCommittedState(backend, states, 0, boundary);
   executor.end(request.id);
   // With the idle rings reclaimed, the restored lane's rings hold none of the
@@ -1328,7 +1398,9 @@ void requireFullWindowRestore(model::Runtime &executor,
   request.id = 105;
   beginCold(executor, request, 0);
   restoreActivePrefix(executor, request.id, prompt.size(), boundary, checkpoint);
-  prefillChunk(executor, request.id, boundary, tokens.subspan(boundary), pages);
+  const auto restored = prefillChunk(executor, request.id, boundary, tokens.subspan(boundary), pages);
+  require(!cold.scoreLogits.empty() && cold.scoreLogits == restored.scoreLogits,
+          "full-window restoration changed the target's continuation logits");
   compareCommittedSamples(expected, sampleCommittedState(backend, states, 0, boundary), true);
   executor.end(request.id);
   std::cout << "full_window_restore=PASS\n";
@@ -1347,7 +1419,7 @@ StateBytes restoredBytes(model::Runtime &executor, const model::QwenStateStorage
                          uint32_t boundary, const std::shared_ptr<const CompositeState> &state) {
   beginCold(executor, makeRequest(probe, {prompt.begin(), prompt.end()}, 1), lane);
   require(!executor.beginRestore(probe, boundary, state, true, {}), "resident restore returned a read");
-  const uint32_t window = std::min(boundary, model::ExecutionLimits::draftContextTokens);
+  const uint32_t window = std::min(boundary, executor.draftWindow());
   require(states.metadata(lane).lengths ==
               model::QwenLogicalLengths{boundary, boundary - window, window, boundary},
           "a captured state's lengths are not those of its boundary");
@@ -1357,13 +1429,13 @@ StateBytes restoredBytes(model::Runtime &executor, const model::QwenStateStorage
 }
 
 // The rows of the positions a context window holds at `boundary`, the last
-// 2048 before it (slot position % 2048): each slot's codes, then its group
+// `slots` before it (slot position % slots): each slot's codes, then its group
 // parameters. The window's other slots hold nothing a restore reads.
-std::vector<uint8_t> windowRows(const std::vector<uint8_t> &window, uint32_t width, uint64_t boundary) {
-  constexpr uint64_t slots = model::ExecutionLimits::draftContextTokens;
+std::vector<uint8_t> windowRows(const std::vector<uint8_t> &window, uint32_t width, uint64_t boundary,
+                                uint64_t slots) {
   const uint64_t codeBytes = width / 2;
   const uint64_t groupBytes = uint64_t{width} / SPLASH_DRAFT_CONTEXT_GROUP * 4;
-  const uint64_t parameters = draft_context_codes_bytes(width);
+  const uint64_t parameters = draft_context_codes_bytes(width, slots);
   std::vector<uint8_t> rows;
   for (uint64_t position = boundary - std::min(boundary, slots); position < boundary; ++position) {
     const auto codes = window.begin() + static_cast<std::ptrdiff_t>((position % slots) * codeBytes);
@@ -1382,12 +1454,11 @@ std::vector<uint8_t> windowRows(const std::vector<uint8_t> &window, uint32_t wid
 // found it.
 uint64_t requireCapturedWindow(const std::vector<uint8_t> &captured, const std::vector<uint8_t> &before,
                            const std::vector<uint8_t> &after, uint32_t width, uint64_t end,
-                           uint64_t boundary, const std::string &label) {
-  constexpr uint64_t window = model::ExecutionLimits::draftContextTokens;
+                           uint64_t boundary, const std::string &label, uint64_t window) {
   const uint64_t codeBytes = width / 2;
   const uint64_t groupBytes = uint64_t{width} / SPLASH_DRAFT_CONTEXT_GROUP * 4;
   // Every slot's codes come first, then every slot's group parameters.
-  const uint64_t parameters = draft_context_codes_bytes(width);
+  const uint64_t parameters = draft_context_codes_bytes(width, window);
   uint64_t found = 0;
   for (uint64_t position = boundary - std::min(boundary, window); position < boundary; ++position) {
     const uint64_t slot = position % window;
@@ -1466,14 +1537,14 @@ void requireStatesCapturedInsideCommands(model::Runtime &executor, const metal::
   };
 
   beginCold(executor, scoring(401, shorter), 0);
-  executor.setDraftContextPlan(401, planDraftContext(0, end, boundaries));
+  executor.setDraftContextPlan(401, planDraftContext(0, end, boundaries, executor.draftWindow()));
   prefill(401, 0, shorter.first(split), plainPages);
   const auto [plain, plainSplit] = prefill(401, split, shorter.subspan(split), plainPages);
   // A score request, which no decode cycle reads a lookup index of, has
   // none.
   requireLookupIndex(executor, 401, {}, "a score request's prompt");
   beginCold(executor, scoring(402, shorter), 1);
-  executor.setDraftContextPlan(402, planDraftContext(0, end, boundaries));
+  executor.setDraftContextPlan(402, planDraftContext(0, end, boundaries, executor.draftWindow()));
   prefill(402, 0, shorter.first(split), capturingPages);
   const std::vector<uint8_t> before = bytesOf(states.window(1));
   // A fault armed for an evaluation past these stops the split inside the
@@ -1502,9 +1573,12 @@ void requireStatesCapturedInsideCommands(model::Runtime &executor, const metal::
     capturedBytes.push_back(restoredBytes(executor, states, 410, 3, tokens, capturedAt[index], capturing.capturedStates[index]));
   // Below 2048 the command's rows from 2048 on take the first slots; past it
   // the ring wraps.
-  require(requireCapturedWindow(capturedBytes[0].window, before, after, width, end, firstCaptured, "captured at 1024") == 64 &&
-              requireCapturedWindow(capturedBytes[1].window, before, after, width, end, secondCaptured, "captured at 2080") == 32 &&
-              requireCapturedWindow(capturedBytes[2].window, before, after, width, end, end, "captured at 2112") == 0,
+  require(requireCapturedWindow(capturedBytes[0].window, before, after, width, end, firstCaptured, "captured at 1024",
+                                  executor.draftWindow()) == 64 &&
+              requireCapturedWindow(capturedBytes[1].window, before, after, width, end, secondCaptured, "captured at 2080",
+                                  executor.draftWindow()) == 32 &&
+              requireCapturedWindow(capturedBytes[2].window, before, after, width, end, end, "captured at 2112",
+                                  executor.draftWindow()) == 0,
           "captured windows took the wrong positions from the lane's window before the command");
   require(std::memcmp(before.data(), after.data(), uint64_t{64} * width / 2) != 0,
           "the command left the slots it overwrote as they were");
@@ -1519,20 +1593,20 @@ void requireStatesCapturedInsideCommands(model::Runtime &executor, const metal::
   beginCold(executor, scoring(403, tokens), 2);
   restoreActivePrefix(executor, 403, longer, secondCaptured, capturing.capturedStates[1]);
   const std::array<uint32_t, 1> resumedBoundary{end};
-  executor.setDraftContextPlan(403, planDraftContext(secondCaptured, longer, resumedBoundary));
+  executor.setDraftContextPlan(403, planDraftContext(secondCaptured, longer, resumedBoundary, executor.draftWindow()));
   const std::vector<uint8_t> resumedBefore = bytesOf(states.window(2));
   const ModelStepResult resumed =
       prefill(403, secondCaptured, tokens.subspan(secondCaptured), resumedPages, resumedBoundary).first;
   const StateBytes resumedCaptured =
       restoredBytes(executor, states, 410, 3, tokens, end, resumed.capturedStates.front());
   require(requireCapturedWindow(resumedCaptured.window, resumedBefore, bytesOf(states.window(2)), width, longer, end,
-                            "captured after a restore") == 32,
+                                "captured after a restore", executor.draftWindow()) == 32,
           "the window captured after a restore took the wrong positions from the restored window");
 
   // The same restore from the state of commands that ended at 1024 and
   // 2080, where a bf16 state was rounded as the captured states rounded it.
   beginCold(executor, makeRequest(404, prompt, 1), 0);
-  executor.setDraftContextPlan(404, planDraftContext(0, longer, boundaries));
+  executor.setDraftContextPlan(404, planDraftContext(0, longer, boundaries, executor.draftWindow()));
   const std::vector<uint32_t> teacherPages = table({prefix, pageRange(15, 50)});
   prefill(404, 0, tokens.first(split), teacherPages);
   const bool teacherSplit = prefill(404, split, tokens.subspan(split, firstCaptured - split), teacherPages).second;
@@ -1563,7 +1637,7 @@ void requireStatesCapturedInsideCommands(model::Runtime &executor, const metal::
   };
   const auto [capturedConvolution, capturedRecurrent] = similar(0, 3);
   executor.end(410);
-  executor.setDraftContextPlan(405, planDraftContext(secondCaptured, longer, resumedBoundary));
+  executor.setDraftContextPlan(405, planDraftContext(secondCaptured, longer, resumedBoundary, executor.draftWindow()));
   const ModelStepResult fromEnded =
       prefill(405, secondCaptured, tokens.subspan(secondCaptured), table({teacherPages, {119, 120}}), resumedBoundary)
           .first;
@@ -1659,7 +1733,7 @@ void requirePrefillGroupMatchesItsChunks(model::Runtime &executor, const kv::Pag
   // Every captured state holds a whole draft window (planDraftContext).
   const auto start = [&](uint64_t id, bool image) {
     beginCold(executor, image ? withImage(scoring(id)) : scoring(id), 0);
-    executor.setDraftContextPlan(id, planDraftContext(0, rows, capturedAt));
+    executor.setDraftContextPlan(id, planDraftContext(0, rows, capturedAt, executor.draftWindow()));
   };
   const uint32_t width = states.layout().draft.contextWidth;
   const auto oneLane = [&](bool image) {
@@ -1699,7 +1773,8 @@ void requirePrefillGroupMatchesItsChunks(model::Runtime &executor, const kv::Pag
       const std::string at = std::to_string(capturedAt[index]);
       require(left.cell == right.cell, "the GDN cell of the state " + which + " captured at " + at +
                                            " differs from its chunks'");
-      require(windowRows(left.window, width, capturedAt[index]) == windowRows(right.window, width, capturedAt[index]),
+      require(windowRows(left.window, width, capturedAt[index], executor.draftWindow()) ==
+                windowRows(right.window, width, capturedAt[index], executor.draftWindow()),
               "the window of the state " + which + " captured at " + at + " differs from its chunks'");
     }
   };
@@ -1757,7 +1832,7 @@ void requirePrefillGroupMatchesItsChunks(model::Runtime &executor, const kv::Pag
     const model::QwenLogicalLengths lengths = states.metadata(lane).lengths;
     return LaneState{std::move(scores), std::move(bytes), lengths,
                      bytesOf(states.current(lane).stateBase), committedState(executor, states, lane).rings,
-                     windowRows(bytesOf(states.window(lane)), width, lengths.targetTokens)};
+                     windowRows(bytesOf(states.window(lane)), width, lengths.targetTokens, executor.draftWindow())};
   };
   const auto startLanes = [&](std::array<uint64_t, 2> ids) {
     for (uint32_t lane = 0; lane < 2; ++lane) {
@@ -1765,7 +1840,7 @@ void requirePrefillGroupMatchesItsChunks(model::Runtime &executor, const kv::Pag
       EngineRequest request = makeRequest(ids[lane], {prompt.begin(), prompt.begin() + laneRows}, 0);
       request.scoreTokens = scoring(ids[lane]).scoreTokens;
       beginCold(executor, request, lane);
-      executor.setDraftContextPlan(ids[lane], planDraftContext(0, laneRows, {}));
+      executor.setDraftContextPlan(ids[lane], planDraftContext(0, laneRows, {}, executor.draftWindow()));
     }
   };
   startLanes({511, 512});
@@ -1854,7 +1929,7 @@ void requirePrefillPassesMatchWhole(model::Runtime &executor, const kv::PageStor
         request.imagePixels[index] = static_cast<uint8_t>(index * 13 + 7);
     }
     beginCold(executor, request, 0);
-    executor.setDraftContextPlan(id, planDraftContext(0, rows, capturedAt));
+    executor.setDraftContextPlan(id, planDraftContext(0, rows, capturedAt, executor.draftWindow()));
     ModelStepResult last;
     {
       ModelBatchItem item = withRevision({id, 0, rows, pageTable});
@@ -1892,7 +1967,7 @@ void requirePrefillPassesMatchWhole(model::Runtime &executor, const kv::PageStor
     executor.end(id);
     for (size_t index = 0; index < capturedAt.size(); ++index) {
       StateBytes state = restoredBytes(executor, states, 540, 1, tokens, capturedAt[index], last.capturedStates[index]);
-      state.window = windowRows(state.window, width, capturedAt[index]);
+      state.window = windowRows(state.window, width, capturedAt[index], executor.draftWindow());
       result.captured.push_back(std::move(state));
     }
     return result;
@@ -1944,7 +2019,7 @@ void requirePrefillPassesMatchWhole(model::Runtime &executor, const kv::PageStor
       for (uint32_t option = 0; option < model::ExecutionLimits::maximumScoreOptions; ++option)
         request.scoreTokens.push_back(1000 + 37 * option);
       beginCold(executor, request, lane);
-      executor.setDraftContextPlan(ids[lane], planDraftContext(0, laneRows, laneCaptures[lane]));
+      executor.setDraftContextPlan(ids[lane], planDraftContext(0, laneRows, laneCaptures[lane], executor.draftWindow()));
       plan.items.push_back({ids[lane], laneRows});
       ModelBatchItem item = withRevision({ids[lane], 0, laneRows, lanePages[lane]});
       item.inputTokens = tokens.first(laneRows);
@@ -1989,7 +2064,7 @@ void requirePrefillPassesMatchWhole(model::Runtime &executor, const kv::PageStor
       run.lengths = states.metadata(lane).lengths;
       run.cell = bytesOf(states.current(lane).stateBase);
       run.rings = committedState(executor, states, lane).rings;
-      run.windowRows = windowRows(bytesOf(states.window(lane)), width, run.lengths.targetTokens);
+      run.windowRows = windowRows(bytesOf(states.window(lane)), width, run.lengths.targetTokens, executor.draftWindow());
     }
     for (const uint64_t id : ids)
       executor.end(id);
@@ -1997,7 +2072,7 @@ void requirePrefillPassesMatchWhole(model::Runtime &executor, const kv::PageStor
       for (size_t index = 0; index < laneCaptures[lane].size(); ++index) {
         const uint32_t boundary = laneCaptures[lane][index];
         StateBytes state = restoredBytes(executor, states, 560, 0, tokens, boundary, last[lane].capturedStates[index]);
-        state.window = windowRows(state.window, width, boundary);
+        state.window = windowRows(state.window, width, boundary, executor.draftWindow());
         runs[lane].captured.push_back(std::move(state));
       }
     return runs;
@@ -2094,7 +2169,7 @@ void requireCapturesOutliveTheirItems(model::Runtime &executor,
   const std::vector<uint32_t> secondPages = pageRange(120, tokens / kv::kPageTokens);
   const auto submit = [&](uint64_t id, const std::vector<uint32_t> &pages) {
     beginCold(executor, makeRequest(id, prompt, 1), 0);
-    executor.setDraftContextPlan(id, planDraftContext(0, tokens, std::span(boundaries).first(1)));
+    executor.setDraftContextPlan(id, planDraftContext(0, tokens, std::span(boundaries).first(1), executor.draftWindow()));
     ModelBatchItem item = withRevision({id, 0, tokens, pages});
     item.inputTokens = prompt;
     for (const uint32_t boundary : boundaries) {
@@ -2170,7 +2245,7 @@ void requireDecodeCaptureMatchesTheLane(model::Runtime &executor, model::QwenSta
     EngineRequest request = makeRequest(id, tokens, 64);
     request.flags = RequestIgnoreEndOfSequence;
     beginCold(executor, request, 0);
-    executor.setDraftContextPlan(id, planDraftContext(0, length, {}));
+    executor.setDraftContextPlan(id, planDraftContext(0, length, {}, executor.draftWindow()));
     const ModelStepResult prefilled = prefillChunk(executor, id, 0, tokens, decodePages);
     require(prefilled.failure.empty() && prefilled.outputTokens.empty(),
             "a decode capture's prompt ended right after prefill");
@@ -2274,7 +2349,7 @@ void requireDecodeCaptureMatchesTheLane(model::Runtime &executor, model::QwenSta
 
   // For the record: a prefill of the same tokens captured at the same page.
   beginCold(executor, makeRequest(431, through, 1), 1);
-  executor.setDraftContextPlan(431, planDraftContext(0, boundary, {}));
+  executor.setDraftContextPlan(431, planDraftContext(0, boundary, {}, executor.draftWindow()));
   requireOpen(prefillChunk(executor, 431, 0, std::span(through).first(prompt), prefillPages), "decode capture");
   const std::array<uint32_t, 1> end{boundary};
   ModelStepResult rest =
@@ -2681,6 +2756,8 @@ decodeConstrainedTogether(model::Runtime &executor, std::span<const uint64_t> id
               "a constrained joint decode accepted more draft tokens than it drafted");
       JointDecode &decoded = generated[lanes[index]];
       decoded.drafts.emplace_back(decoded.tokens.size(), results[index].draftedTokens);
+      decoded.lookups.push_back(static_cast<uint32_t>(
+          model::RuntimeInstrumentation::lookupChain(executor, ids[lanes[index]]).size()));
       decoded.tokens.insert(decoded.tokens.end(), results[index].outputTokens.begin(),
                             results[index].outputTokens.end());
       decoded.cycles.resize(decoded.tokens.size(), cycle);
@@ -2933,7 +3010,7 @@ void requireConcurrentRequestsShareOneEncode(model::Runtime &executor,
   for (uint32_t lane = 0; lane < 2; ++lane) {
     const EngineRequest &request = lane ? second : first;
     executor.setDraftContextPlan(
-        request.id, planDraftContext(0, static_cast<uint32_t>(request.prompt.size()), {}));
+        request.id, planDraftContext(0, static_cast<uint32_t>(request.prompt.size()), {}, executor.draftWindow()));
     const auto tokens = static_cast<uint32_t>(request.prompt.size());
     plan.items.push_back({request.id, tokens});
     items[lane] =
@@ -3038,14 +3115,14 @@ void requireSuspendedLaneKeepsItsRows(model::Runtime &executor,
   const StateAdmission admission = executor.begin(request.modelView());
   require(admission.granted(), "suspended image request was not admitted");
   executor.setDraftContextPlan(
-      request.id, planDraftContext(0, static_cast<uint32_t>(prompt.size()), {}));
+      request.id, planDraftContext(0, static_cast<uint32_t>(prompt.size()), {}, executor.draftWindow()));
   const uint64_t encodes = executor.telemetry().imageEncodes;
   prefillChunk(executor, request.id, 0, prompt.first(32), pages, ImageEncodes{backend, true});
   executor.suspend(request.id);
   const StateAdmission resumed = executor.resume(request.modelView());
   require(resumed.granted(), "suspended image request did not resume");
   executor.setDraftContextPlan(
-      request.id, planDraftContext(0, static_cast<uint32_t>(prompt.size()), {}));
+      request.id, planDraftContext(0, static_cast<uint32_t>(prompt.size()), {}, executor.draftWindow()));
   prefillChunk(executor, request.id, 0, prompt, pages, ImageEncodes{backend, false});
   require(executor.telemetry().imageEncodes == encodes + 1,
           "a resumed lane encoded its image again");
@@ -3066,7 +3143,7 @@ void requireInjectedRowsBecomeReclaimable(model::Runtime &executor,
   const StateAdmission admission = executor.begin(request.modelView());
   require(admission.granted(), "reclaimable image request was not admitted");
   executor.setDraftContextPlan(
-      request.id, planDraftContext(0, static_cast<uint32_t>(request.prompt.size()), {}));
+      request.id, planDraftContext(0, static_cast<uint32_t>(request.prompt.size()), {}, executor.draftWindow()));
   prefillChunk(executor, request.id, 0, request.prompt, pageRange(120, 4),
                ImageEncodes{backend, true});
   const model::ModelTelemetry injected = executor.telemetry();
@@ -3105,7 +3182,7 @@ void requireCoveredImagesAreNotStaged(model::Runtime &executor,
   const StateAdmission producer = executor.begin(request.modelView());
   require(producer.granted(), "covered image producer was not admitted");
   const std::array<uint32_t, 2> checkpoints{32, 64};
-  executor.setDraftContextPlan(request.id, planDraftContext(0, prompt.size(), checkpoints));
+  executor.setDraftContextPlan(request.id, planDraftContext(0, prompt.size(), checkpoints, executor.draftWindow()));
   prefillChunk(executor, request.id, 0, std::span<const uint32_t>(prompt).first(32), pages);
   std::shared_ptr<const CompositeState> beforeImage = executor.snapshot(request.id);
   prefillChunk(executor, request.id, 32,
@@ -3181,7 +3258,7 @@ void requireRefusedStartKeepsItsRows(model::Runtime &executor,
   const std::vector<uint32_t> pages = pageRange(120, 4);
   const StateAdmission admitted = executor.begin(cached.modelView());
   require(admitted.granted(), "refused-start fixture was not admitted");
-  executor.setDraftContextPlan(cached.id, planDraftContext(0, prompt.size(), {}));
+  executor.setDraftContextPlan(cached.id, planDraftContext(0, prompt.size(), {}, executor.draftWindow()));
   prefillChunk(executor, cached.id, 0,
                std::span<const uint32_t>(prompt).first(64), pages, ImageEncodes{backend, true});
 
@@ -3264,7 +3341,7 @@ void requirePoolReleaseTakesOneUnit(model::Runtime &executor,
     request.imagePixels[index] = static_cast<uint8_t>(index * 9 + 4);
   const StateAdmission admission = executor.begin(request.modelView());
   require(admission.granted(), "two-image request was not admitted");
-  executor.setDraftContextPlan(request.id, planDraftContext(0, prompt.size(), {}));
+  executor.setDraftContextPlan(request.id, planDraftContext(0, prompt.size(), {}, executor.draftWindow()));
   prefillChunk(executor, request.id, 0, prompt, pageRange(120, 4), ImageEncodes{backend, true});
   executor.end(request.id);
   while (executor.releaseIdleBuffer(false)) {
@@ -3317,7 +3394,7 @@ void requireEncoderFitsItsImages(model::Runtime &executor,
   const uint64_t encodes = executor.telemetry().imageEncodes;
   for (const EngineRequest *request : {&small, &smaller, &large}) {
     executor.setDraftContextPlan(
-        request->id, planDraftContext(0, static_cast<uint32_t>(request->prompt.size()), {}));
+        request->id, planDraftContext(0, static_cast<uint32_t>(request->prompt.size()), {}, executor.draftWindow()));
     prefillChunk(executor, request->id, 0, request->prompt, pageRange(120, 4));
     executor.end(request->id);
   }
@@ -3367,7 +3444,7 @@ void requireReplayPointKeepsItsImageRows(model::Runtime &executor,
   const StateAdmission first = executor.begin(request.modelView());
   require(first.granted(), "replay point image request was not admitted");
   const std::array<uint32_t, 1> boundary{64};
-  executor.setDraftContextPlan(request.id, planDraftContext(0, prompt.size(), boundary));
+  executor.setDraftContextPlan(request.id, planDraftContext(0, prompt.size(), boundary, executor.draftWindow()));
   prefillChunk(executor, request.id, 0,
                std::span<const uint32_t>(prompt).first(64), pages, ImageEncodes{backend, true});
   std::shared_ptr<const CompositeState> replayPoint = executor.snapshot(request.id);
@@ -3423,7 +3500,7 @@ void requireCapturedStateKeepsItsImageRows(model::Runtime &executor,
   const std::vector<uint32_t> pages = pageRange(120, 4);
   require(executor.begin(request.modelView()).granted(), "captured state image request was not admitted");
   const std::array<uint32_t, 1> boundary{64};
-  executor.setDraftContextPlan(request.id, planDraftContext(0, prompt.size(), boundary));
+  executor.setDraftContextPlan(request.id, planDraftContext(0, prompt.size(), boundary, executor.draftWindow()));
   std::shared_ptr<const CompositeState> captured =
       prefillChunk(executor, request.id, 0, prompt, pages, ImageEncodes{backend, true}, boundary)
           .capturedStates.front();
@@ -5951,15 +6028,281 @@ void warmupEos(model::RuntimeContext context, model::LoadedModel &model) {
             << " decode_stop=" << decodeStop << '\n';
 }
 
+// The non-recurrent contract: target-only forwards check every retained
+// speculative row against its actual history, rather than another draft.
+void requireSampledTargetRows(model::Runtime &executor, const metal::MetalBackend &backend,
+                              const model::QwenStateStorage &states, uint32_t verifyRows) {
+  struct Control { std::vector<uint32_t> history; std::vector<float> logits; };
+  std::vector<Control> controls;
+  const uint32_t vocabulary = targetTokens->vocabulary;
+  EngineRequest request = makeRequest(9100, targetTokens->samplingSeed, 96);
+  request.flags = RequestIgnoreEndOfSequence;
+  request.sampling.seed = 42;
+  request.thinkingBudget = ThinkingBudget{80, targetTokens->thinkingEnds[0], 0, targetTokens->markers};
+  const auto pages = pageRange(0, 16);
+  beginCold(executor, request, 0);
+  requireOpen(prefillChunk(executor, request.id, 0, request.prompt, pages), "sampled target-row fixture");
+  model::RuntimeInstrumentation::captureTargetLogits(executor, true);
+  model::RuntimeInstrumentation::forceStepRows(executor, verifyRows);
+  std::vector<uint32_t> history = request.prompt;
+  uint32_t widest = 0, accepted = 0;
+  for (uint32_t cycle = 0; cycle < 4; ++cycle) {
+    const auto result = decodeOne(executor, request.id, history.size(), pages);
+    require(result.failure.empty() && !result.outputTokens.empty() && !result.finished &&
+                result.outputTokensWithoutKv == 0 && result.acceptedDraftTokens <= result.draftedTokens,
+            "sampled speculative cycle failed or violated output accounting");
+    auto logits = model::RuntimeInstrumentation::takeTargetLogits(executor);
+    require(logits.size() == 1, "speculative target rows were not captured");
+    const uint32_t rows = model::RuntimeInstrumentation::lastVerifyRows(executor, 0);
+    const uint32_t retained = model::RuntimeInstrumentation::lastRetainedRows(executor, 0);
+    require(logits[0].size() == uint64_t{rows} * vocabulary &&
+                std::popcount(retained) == static_cast<int>(result.outputTokens.size()),
+            "speculative retained rows do not describe the emitted path");
+    widest = std::max(widest, rows);
+    accepted += result.acceptedDraftTokens;
+    size_t emitted = 0;
+    for (uint32_t path = retained; path; path &= path - 1, ++emitted) {
+      history.push_back(result.outputTokens.at(emitted));
+      const uint32_t row = std::countr_zero(path);
+      const auto begin = logits[0].begin() + uint64_t{row} * vocabulary;
+      controls.push_back({history, {begin, begin + vocabulary}});
+    }
+    require(states.metadata(0).lengths.targetTokens == history.size(),
+            "speculative commit retained a different number of target positions");
+  }
+  require(widest == verifyRows,
+          "sampled oracle did not exercise the model's full verification width");
+  require(accepted != 0, "sampled oracle exercised no accepted draft proposal");
+  // Interrupt a replay, resume again, then compare with a cold execution of
+  // exactly the same history. Policy state remains request-owned.
+  request.prompt = history;
+  const auto pendingBefore = model::RuntimeInstrumentation::pendingToken(executor, request.id);
+  require(pendingBefore.has_value(), "sampled request has no pending anchor before preemption");
+  executor.suspend(request.id);
+  require(!states.metadata(0).assigned(), "suspension retained a state lane");
+  auto admission = executor.resume(request.modelView());
+  require(admission.granted(), "sampled replay admission failed");
+  executor.setDraftContextPlan(request.id, planDraftContext(0, history.size(), {}, executor.draftWindow()));
+  prefillChunk(executor, request.id, 0, std::span(history).first(16), pages);
+  executor.suspend(request.id);
+  admission = executor.resume(request.modelView());
+  require(admission.granted(), "interrupted replay admission failed");
+  executor.setDraftContextPlan(request.id, planDraftContext(0, history.size(), {}, executor.draftWindow()));
+  requireOpen(prefillChunk(executor, request.id, 0, history, pages), "sampled replay");
+  require(model::RuntimeInstrumentation::pendingToken(executor, request.id) == pendingBefore,
+          "sampled preemption changed its already-selected pending token");
+  const auto replayed = sampleCommittedState(backend, states, *admission.lane);
+  const auto continued = decodeOne(executor, request.id, history.size(), pages);
+  require(continued.failure.empty() && !continued.outputTokens.empty() &&
+              continued.outputTokens.front() == *pendingBefore,
+          "interrupted sampled replay could not continue decoding");
+  executor.end(request.id);
+  model::RuntimeInstrumentation::forceStepRows(executor, std::nullopt);
+
+  double leastCosine = 1, largestAbsolute = 0;
+  for (size_t index = 0; index < controls.size(); ++index) {
+    EngineRequest teacher = request;
+    teacher.id = 9200 + index;
+    teacher.prompt = controls[index].history;
+    beginCold(executor, teacher, 0);
+    requireOpen(prefillChunk(executor, teacher.id, 0, teacher.prompt, pages), "target-only teacher");
+    auto raw = model::RuntimeInstrumentation::takeTargetLogits(executor);
+    require(raw.size() == 1 && raw[0].size() == vocabulary, "teacher target logits were not captured");
+    SimilarityAccumulator compared;
+    for (uint32_t token = 0; token < vocabulary; ++token) {
+      require(std::isfinite(raw[0][token]) && std::isfinite(controls[index].logits[token]),
+              "target-row oracle found non-finite logits");
+      compared.add(raw[0][token], controls[index].logits[token]);
+    }
+    leastCosine = std::min(leastCosine, compared.result().cosine);
+    largestAbsolute = std::max(largestAbsolute, compared.result().maximumAbsolute);
+    require(compared.result().cosine > .999,
+            "speculative row " + std::to_string(index) + " at history " +
+                std::to_string(teacher.prompt.size()) + " differs from its teacher: cosine=" +
+                std::to_string(compared.result().cosine) + " max_abs=" +
+                std::to_string(compared.result().maximumAbsolute));
+    if (index + 1 == controls.size())
+      compareCommittedSamples(replayed, sampleCommittedState(backend, states, 0));
+    executor.end(teacher.id);
+  }
+  model::RuntimeInstrumentation::captureTargetLogits(executor, false);
+  std::cout << "sampled_target_rows=PASS rows=" << controls.size() << " widest=" << widest
+            << " accepted=" << accepted << " least_cosine=" << leastCosine
+            << " maximum_absolute=" << largestAbsolute
+            << " replay=interrupted_and_cold_control\n";
+}
+
+void requireTextMarkerBudgets(model::Runtime &executor, uint32_t verifyRows) {
+  require(!targetTokens->markers.empty(), "text-marker oracle needs tokenizer-derived markers");
+  uint32_t cases = 0;
+  for (uint32_t rows : {1U, verifyRows}) {
+    model::RuntimeInstrumentation::forceStepRows(executor, rows);
+    // Exhaust the budget inside a naturally selected close. The remaining
+    // suffix must complete that marker, rather than start a second close.
+    for (uint32_t prefix = 1; prefix < targetTokens->markerClose.size(); ++prefix) {
+      const std::array<uint64_t, 1> ids{9299};
+      const std::array<std::vector<uint32_t>, 1> pages{pageRange(0, 8)};
+      const auto &end = targetTokens->markerClose;
+      auto request = makeRequest(ids[0], targetTokens->thinkingPrompt, 32);
+      request.constraint = ConstraintMode::TokenMask;
+      request.flags = RequestIgnoreEndOfSequence;
+      request.thinkingBudget = ThinkingBudget{prefix, targetTokens->thinkingEnds[0], 0, targetTokens->openedMarkers};
+      beginCold(executor, request, 0);
+      const auto initial = prefillChunk(executor, request.id, 0, request.prompt, pages[0]);
+      require(initial.failure.empty() && initial.nextDecodeStage == DecodeStage::ApplyInitialMask,
+              "partial reasoning-close fixture lost its initial mask");
+      const auto mask = [&](size_t, uint32_t position) {
+        return position < prefix ? singletonMasks(std::span(end).subspan(position, 1))
+                                 : std::vector<uint32_t>(targetTokens->maskWords(), ~0U);
+      };
+      const auto generated = decodeConstrainedTogether(executor, ids, request.prompt.size(), pages,
+                                                       end.size() + 4, mask);
+      require(generated[0].tokens.size() > end.size() &&
+                  std::ranges::equal(end, std::span(generated[0].tokens).first(end.size())),
+              "budget exhaustion inside a reasoning close repeated or corrupted its prefix");
+      executor.end(request.id);
+      ++cases;
+    }
+    for (bool modelOpened : {false, true}) {
+      for (bool longEnd : {false, true}) {
+        if (modelOpened && longEnd) continue;
+        const auto &prompt = modelOpened ? targetTokens->samplingSeed : targetTokens->thinkingPrompt;
+        const auto &end = targetTokens->thinkingEnds[longEnd];
+        const auto &markers = modelOpened ? targetTokens->markers
+                             : longEnd ? targetTokens->longMarkers : targetTokens->openedMarkers;
+        const uint32_t opening = modelOpened ? targetTokens->opening.size() : 0;
+        for (uint32_t delay : {0U, 3U}) {
+          const std::array<uint64_t, 3> ids{9300, 9301, 9302};
+          const std::array<uint32_t, 3> budgets{0, 5, 17};
+          const std::array<std::vector<uint32_t>, 3> pages{
+              pageRange(0, 8), pageRange(8, 8), pageRange(16, 8)};
+          for (size_t lane = 0; lane < ids.size(); ++lane) {
+            auto request = makeRequest(ids[lane], prompt, 96);
+            request.constraint = ConstraintMode::TokenMask;
+            request.flags = RequestIgnoreEndOfSequence;
+            request.thinkingBudget = ThinkingBudget{budgets[lane], end, 0, markers};
+            beginCold(executor, request, lane);
+            const auto first = prefillChunk(executor, request.id, 0, prompt, pages[lane]);
+            require(first.failure.empty() && first.nextDecodeStage == DecodeStage::ApplyInitialMask,
+                    "text-marker request lost its initial grammar mask");
+          }
+          const auto mask = [&](size_t lane, uint32_t position) {
+            if (position < opening)
+              return singletonMasks(std::span(targetTokens->opening).subspan(position, 1));
+            const uint32_t body = position - opening;
+            if (body < budgets[lane] + delay) {
+              const uint32_t token = targetTokens->filler[body % targetTokens->filler.size()];
+              return singletonMasks(std::span(&token, 1));
+            }
+            return std::vector<uint32_t>(targetTokens->maskWords(), ~0U);
+          };
+          const uint32_t count = opening + budgets.back() + delay + end.size() + 4;
+          const auto generated = decodeConstrainedTogether(executor, ids, prompt.size(), pages, count, mask);
+          for (size_t lane = 0; lane < ids.size(); ++lane) {
+            const auto &tokens = generated[lane].tokens;
+            const uint32_t at = opening + budgets[lane] + delay;
+            require(tokens.size() > at + end.size() &&
+                        std::ranges::equal(end, std::span(tokens).subspan(at, end.size())),
+                    "reasoning budget did not emit its complete text close after the grammar admitted it");
+            const TokenAutomaton machine(markers);
+            uint32_t state = machine.initial();
+            size_t closed = 0;
+            for (; closed < tokens.size(); ++closed) {
+              state = machine.advance(state, tokens[closed]);
+              if (machine.terminal(state)) break;
+            }
+            require(state == markers[3] && closed == at + end.size() - 1,
+                    "reasoning marker closed at the wrong token or lost the model-opened block");
+            executor.end(ids[lane]);
+            ++cases;
+          }
+        }
+      }
+    }
+  }
+  model::RuntimeInstrumentation::forceStepRows(executor, std::nullopt);
+  std::cout << "text_marker_budgets=PASS cases=" << cases
+            << " (sampled, B3, narrow/full rows, model-opened, multi-cycle close, grammar delay)\n";
+}
+
+void requireSampledBatches(model::Runtime &executor) {
+  const std::array<uint64_t, 4> ids{9400, 9401, 9402, 9403};
+  const std::array<std::vector<uint32_t>, 4> pages{
+      pageRange(0, 8), pageRange(8, 8), pageRange(16, 8), pageRange(24, 8)};
+  for (uint32_t lanes : {1U, 2U, 4U}) {
+    for (uint32_t lane = 0; lane < lanes; ++lane) {
+      auto prompt = targetTokens->thinkingPrompt;
+      prompt.push_back(targetTokens->filler.at(lane));
+      auto request = makeRequest(ids[lane], std::move(prompt), 64);
+      request.flags = RequestIgnoreEndOfSequence;
+      request.sampling.seed = 42 + lane;
+      beginCold(executor, request, lane);
+      requireOpen(prefillChunk(executor, request.id, 0, request.prompt, pages[lane]), "sampled batch fixture");
+    }
+    const auto generated = decodeTogether(executor, std::span(ids).first(lanes),
+        targetTokens->thinkingPrompt.size() + 1, std::span(pages).first(lanes), 16);
+    for (uint32_t lane = 0; lane < lanes; ++lane) {
+      require(generated[lane].tokens.size() >= 16 &&
+                  std::ranges::all_of(generated[lane].tokens,
+                      [](uint32_t token) { return token < targetTokens->vocabulary; }),
+              "sampled batch lost progress or returned an invalid token");
+      executor.end(ids[lane]);
+    }
+    std::cout << "sampled_batch=PASS lanes=" << lanes << '\n';
+  }
+}
+
+void requireTextMarkerLookup(model::Runtime &executor, uint32_t verifyRows) {
+  auto prompt = targetTokens->thinkingPrompt;
+  for (uint32_t repeat = 0; repeat < 8; ++repeat)
+    prompt.insert(prompt.end(), targetTokens->filler.begin(), targetTokens->filler.end());
+  auto request = makeRequest(9500, prompt, 64);
+  request.flags = RequestIgnoreEndOfSequence;
+  request.constraint = ConstraintMode::TokenMask;
+  request.thinkingBudget = ThinkingBudget{96, targetTokens->thinkingEnds[0], 0, targetTokens->openedMarkers};
+  const auto pages = pageRange(0, 8);
+  beginCold(executor, request, 0);
+  const auto initial = prefillChunk(executor, request.id, 0, prompt, pages);
+  require(initial.failure.empty() && initial.nextDecodeStage == DecodeStage::ApplyInitialMask,
+          "lookup reasoning fixture lost its initial mask");
+  // Only the anchor is forced. The verify masks admit the whole vocabulary,
+  // so no grammar-forced chain can replace the prompt lookup being checked.
+  provideMask(executor, request.id, singletonMasks(std::span(targetTokens->filler).first(1)));
+  const auto selected = decodeOne(executor, request.id, prompt.size(), pages, DecodeStage::ApplyInitialMask);
+  require(selected.failure.empty() && selected.outputTokens.empty(), "lookup anchor selection failed");
+  model::RuntimeInstrumentation::forceStepRows(executor, verifyRows);
+  BatchPlan plan{.kind = WorkKind::Decode, .items = {{request.id, 0}}, .decodeStage = DecodeStage::Regular};
+  const std::array<ModelBatchItem, 1> items{withRevision({request.id, prompt.size(), 0, pages})};
+  auto pending = beginMaskedDecode(executor, plan, items);
+  require(pending.maskRequests.size() == 1, "lookup verification lost its mask request");
+  const uint32_t lookedUp = model::RuntimeInstrumentation::lookupChain(executor, request.id).size();
+  require(lookedUp != 0, "repeated prompt exercised no lookup proposal");
+  const auto &asked = pending.maskRequests[0];
+  provideMask(executor, request.id,
+              std::vector<uint32_t>((asked.simulationTokens.size() + 1) * targetTokens->maskWords(), ~0U));
+  const auto result = finishMaskedDecode(std::move(pending)).front();
+  require(result.failure.empty() && !result.outputTokens.empty() &&
+              result.outputTokens.front() == targetTokens->filler[0] &&
+              result.acceptedDraftTokens <= result.draftedTokens,
+          "lookup verification changed its anchor or failed its sampled lane");
+  executor.end(request.id);
+  model::RuntimeInstrumentation::forceStepRows(executor, std::nullopt);
+  std::cout << "text_marker_lookup=PASS proposed=" << lookedUp
+            << " emitted=" << result.outputTokens.size() << '\n';
+}
+
 } // namespace
 
 int main(int argc, char **argv) {
+  std::cout << std::unitbuf;
   try {
     bool imagesOnly = false, warmupEosOnly = false, prefillGroupsOnly = false, spillOnly = false;
     SpillOptions spill;
     kv::Format format = kv::Format::Int8;
     ops::GdnStateFormat stateFormat = ops::GdnStateFormat::Float32;
     std::optional<double> givenAneFfnShare;
+    std::optional<std::filesystem::path> tokenFixture;
+    std::optional<OracleTokens> preparedTokens;
     // --max-context TOKENS: the model served for that context, as splash
     // serve's option serves it: with YaRN past the native window
     // (model::servedFor).
@@ -5983,7 +6326,7 @@ int main(int argc, char **argv) {
     model::ModelLoadOptions loadOptions;
     if (argc < 3)
       fail("usage: model-runtime-oracle METALLIB MODEL_ROOT [--kv-format int8|bf16] [--state-format fp32|bf16] "
-           "[--cached-states int8|exact] "
+           "[--cached-states int8|exact] [--token-fixture JSON] "
            "[--ane-ffn-share SHARE] [--ane-ffn-fault EVALUATION] [--ple-memory SIZE] "
            "[--expert-memory SIZE] [--max-context TOKENS] [--spill-tokens N] [--spill-window PAGES] "
            "[--spill-buffers 1|2] [--images-only | --warmup-eos-only | --prefill-groups-only | --spill-only]");
@@ -5993,6 +6336,7 @@ int main(int argc, char **argv) {
       else if (option == "--warmup-eos-only") warmupEosOnly = true;
       else if (option == "--prefill-groups-only") prefillGroupsOnly = true;
       else if (option == "--spill-only") spillOnly = true;
+      else if (option == "--token-fixture" && i + 1 < argc) tokenFixture = argv[++i];
       else if ((option == "--spill-tokens" || option == "--spill-window" || option == "--spill-buffers") &&
                i + 1 < argc) {
         const char *value = argv[++i];
@@ -6047,7 +6391,10 @@ int main(int argc, char **argv) {
         EngineMemoryPolicy::hostAvailableReserveBytes(device.physicalMemoryBytes);
     const std::filesystem::path modelRoot(argv[2]);
     const auto descriptor = model::servedFor(model::inspectModelRoot(modelRoot), maxContext);
-    targetTokens = &oracleTokens(descriptor);
+    if (tokenFixture) {
+      preparedTokens = readOracleTokens(*tokenFixture, descriptor.capabilities.vocabularySize);
+      targetTokens = &*preparedTokens;
+    } else targetTokens = &oracleTokens(descriptor);
     // Production's weight byte count with a different bound. Production checks
     // it only against the Metal hard budget, then guards host headroom at every
     // Metal operation while loading. This oracle has no such guard, so the
@@ -6134,9 +6481,11 @@ int main(int argc, char **argv) {
     // block index the decoded index fixture's, in whole extents of the size
     // the memory plan would pick for it.
     const kv::Layout kvLayout = model.targetKvLayout(format);
-    const uint32_t budgetPages = std::max({128U, kvLayout.minimumExtentPages(),
+    const uint32_t windowPages = (model.descriptor.draft.window + 128 + kv::kPageTokens - 1) / kv::kPageTokens;
+    const uint32_t initialPages = std::max({128U, kvLayout.minimumExtentPages(),
                                            model.expertStore() ? kGroupFixtureRows / kv::kPageTokens : 0U,
                                            kvLayout.indexDimension ? kDecodedIndexPages : 0U});
+    const uint32_t budgetPages = std::max(initialPages, windowPages);
     const uint32_t extentPages = kvLayout.extentPagesFor(budgetPages);
     const uint32_t pageCount = (budgetPages + extentPages - 1) / extentPages * extentPages;
     // What the checks on this pool hold at once beside the plan's fixed
@@ -6151,6 +6500,14 @@ int main(int argc, char **argv) {
     constexpr uint64_t kMostCachedStates = 6;
     const model::CompositeStateLayout stateLayout = model.stateLayout(stateFormat, !exactCachedStates);
     const uint64_t pageBytes = kvLayout.bytesPerModelPage();
+    const uint32_t initialExtents = (initialPages + extentPages - 1) / extentPages;
+    std::cout << "oracle_memory target=" << model.targetActualAllocatedBytes()
+              << " draft=" << model.draft.actualAllocatedBytes
+              << " prefill_arena=" << executorPlan.sharedPrefillPlannedAllocatedBytes
+              << " decode_arena=" << executorPlan.sharedDecodePlannedAllocatedBytes
+              << " lane=" << stateLayout.laneBytes() << " cached=" << stateLayout.cachedBytes()
+              << " initial_kv=" << uint64_t{initialExtents} * extentPages * pageBytes
+              << " full_window_kv=" << uint64_t{pageCount} * pageBytes << '\n';
     const uint64_t checksBytes = model::ExecutionLimits::maximumBatchWidth * stateLayout.laneBytes() +
                                  kMostCachedStates * stateLayout.cachedBytes() + uint64_t{pageCount} * pageBytes;
     const auto checksContext = static_cast<uint32_t>(
@@ -6234,9 +6591,8 @@ int main(int argc, char **argv) {
           return {};
         };
     kv::PageStorage pages(backend, governed, kvLayout, pageCount, extentPages);
-    // The oracle's requests address pages directly, without a pool, so every
-    // extent is allocated up front.
-    for (uint32_t extent = 0; extent < pageCount / extentPages; ++extent)
+    // Short checks need their pages, not the later full-window fixture's.
+    for (uint32_t extent = 0; extent < initialExtents; ++extent)
       require(static_cast<bool>(pages.allocateExtent(extent)),
               "oracle KV extent is unavailable");
     model::QwenStateStorage states(backend,
@@ -6334,6 +6690,23 @@ int main(int argc, char **argv) {
                    "whole)\n";
       return 0;
     }
+    if (!states.layout().target.layers && !targetTokens->markers.empty()) {
+      requireSampledTargetRows(executor, backend, states, model.descriptor.draft.rows);
+      requireTextMarkerBudgets(executor, model.descriptor.draft.rows);
+      requireSampledBatches(executor);
+      requireTextMarkerLookup(executor, model.descriptor.draft.rows);
+      requirePrefillGroupMatchesItsChunks(executor, pages, states, samplingSeedTokens, false);
+      requirePrefillPassesMatchWhole(executor, pages, states, samplingSeedTokens, false);
+      releaseIdle(executor);
+      for (uint32_t extent = 0; extent < pageCount / extentPages; ++extent)
+        if (!pages.isAllocated(extent * extentPages))
+          require(static_cast<bool>(pages.allocateExtent(extent)), "full-window KV extent is unavailable");
+      requireFullWindowRestore(executor, backend, states);
+      std::cout << "PASS model-runtime-oracle model=" << model.name()
+                << " (sampled non-recurrent target, speculative rows, reasoning markers,"
+                   " interrupted replay, grouped/passed prefill and full-window restore)\n";
+      return 0;
+    }
     // A natural token pattern: a run of zero tokens can make the target select
     // a stop token right after prefill, which leaves no decode cycle to test.
     std::vector<uint32_t> prompt128(128);
@@ -6347,7 +6720,7 @@ int main(int argc, char **argv) {
     prefillChunk(executor, 1, 0, prompt128, pageTable);
     require(states.metadata(0).lengths.targetTokens == 128 &&
                 states.metadata(0).lengths.hasCompleteDraftWindow(
-                    model::ExecutionLimits::draftContextTokens),
+                    executor.draftWindow()),
             "prefill state length mismatch");
 
     const uint64_t predictedPromptSnapshotBytes =
@@ -6369,7 +6742,7 @@ int main(int argc, char **argv) {
     require(states.metadata(0).lengths.targetTokens ==
                     128 + decoded.outputTokens.size() &&
                 states.metadata(0).lengths.hasCompleteDraftWindow(
-                    model::ExecutionLimits::draftContextTokens),
+                    executor.draftWindow()),
             "decode committed length mismatch");
 
     std::cout << "TOKENS";
@@ -7909,7 +8282,7 @@ int main(int argc, char **argv) {
         }
         stateLane = resume();
         const uint32_t length = static_cast<uint32_t>(sequence.prompt.size());
-        executor.setDraftContextPlan(sequence.id, planDraftContext(0, length, {}));
+        executor.setDraftContextPlan(sequence.id, planDraftContext(0, length, {}, executor.draftWindow()));
         if (repeatDuringReplay) {
           requireOpen(prefillChunk(executor, sequence.id, 0,
                                    std::span(sequence.prompt).first(32),
@@ -7921,7 +8294,7 @@ int main(int argc, char **argv) {
                   "repeated preemption retained its state buffers");
           requireLookupIndex(executor, sequence.id, {}, "a suspension during a replay");
           stateLane = resume();
-          executor.setDraftContextPlan(sequence.id, planDraftContext(0, length, {}));
+          executor.setDraftContextPlan(sequence.id, planDraftContext(0, length, {}, executor.draftWindow()));
         }
         ModelStepResult replay = prefillChunk(
             executor, sequence.id, 0, sequence.prompt, pageTable);
@@ -8217,7 +8590,7 @@ int main(int argc, char **argv) {
         prompt[index] = samplingSeedTokens[index % samplingSeedTokens.size()];
       const std::array<uint32_t, 1> checkpoints{1024};
       const DraftContextPlan plan = planDraftContext(
-          0, static_cast<uint32_t>(prompt.size()), checkpoints);
+          0, static_cast<uint32_t>(prompt.size()), checkpoints, executor.draftWindow());
       uint64_t capturedRows = 0;
       uint64_t resets = 0;
       for (const DraftCaptureSpan &span : plan.captureSpans) {
@@ -8283,7 +8656,7 @@ int main(int argc, char **argv) {
       require(!executor.beginRestore(93, 128, state, false, {}),
               "resident restore returned a read");
       executor.setDraftContextPlan(
-          93, planDraftContext(128, static_cast<uint32_t>(extended.size()), {}));
+          93, planDraftContext(128, static_cast<uint32_t>(extended.size()), {}, executor.draftWindow()));
       BatchPlan plan{.kind = WorkKind::Prefill,
                      .items = {{93, 100}},
                      .decodeStage = DecodeStage::Regular};

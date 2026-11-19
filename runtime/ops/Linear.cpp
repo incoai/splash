@@ -23,7 +23,7 @@ void validate(LinearWorkload w) {
   if (!w.matrix.outputSize || w.matrix.outputSize % 64 || !w.matrix.inputSize || w.matrix.inputSize % 64)
     throw std::invalid_argument("invalid linear matrix");
   if (!w.rows || w.rows > SPLASH_PREFILL_TOKEN_BUDGET ||
-      (w.epilogue == LinearEpilogue::GateUp && w.rows > kMaximumDecodeTileRows))
+      ((w.epilogue == LinearEpilogue::GateUp || w.epilogue == LinearEpilogue::ClampedGateUp) && w.rows > kMaximumDecodeTileRows))
     throw std::invalid_argument("invalid linear workload");
 }
 
@@ -34,15 +34,15 @@ constexpr uint64_t rotatedBytes(uint32_t width, uint64_t rows) noexcept { return
 
 // Throws if `p` is a view of the leading inputs of wider weight rows
 // (Projection::leadingInputs) that `plan` has no kernel instance for: only the
-// prefill residual tiles of quantized segments (GgufPrefill's
+// plain or residual prefill tiles of quantized segments (GgufPrefill's
 // leadingInputsInstance, GgufPrefillInt8's plane stride), unrotated, read one.
 void requireLeadingInputs(const LinearPlan &plan, const Projection &p) {
   if (!p.planeInputs()) return;
   const LinearWorkload w = plan.workload();
   const LinearTile tile = plan.configuration().tile;
-  if (w.epilogue != LinearEpilogue::Residual || (tile != LinearTile::GgufPrefill && tile != LinearTile::GgufPrefillInt8) ||
+  if ((w.epilogue != LinearEpilogue::Residual && w.epilogue != LinearEpilogue::None) || (tile != LinearTile::GgufPrefill && tile != LinearTile::GgufPrefillInt8) ||
       p.rotation)
-    throw std::invalid_argument("a view of leading inputs runs only the quantized prefill residual tiles");
+    throw std::invalid_argument("a view of leading inputs runs only the quantized plain or residual prefill tiles");
 }
 
 // Throws unless a view of `p`'s leading inputs can stand for it (takesPlaneViews).
@@ -137,7 +137,10 @@ uint64_t LinearPlan::gateScratchBytes() const noexcept {
   // Gate/up runs as a gate pass into the gate scratch and an up-with-gate
   // pass, but in one pass (LinearConfig::oneGateUpPass).
   const bool needed = workload_.epilogue == LinearEpilogue::UpWithGate ||
-                      (workload_.epilogue == LinearEpilogue::GateUp && !config_.oneGateUpPass);
+                      workload_.epilogue == LinearEpilogue::ClampedUpWithGate ||
+                      ((workload_.epilogue == LinearEpilogue::GateUp ||
+                        workload_.epilogue == LinearEpilogue::ClampedGateUp) &&
+                       !config_.oneGateUpPass);
   return needed ? uint64_t{storageRows()} * workload_.matrix.outputSize * 2 : 0;
 }
 
@@ -183,7 +186,8 @@ LinearPlan Linear::plan(LinearWorkload w, const Projection &p, const Projection 
   const std::array<const Projection *, 2> projections{&p, gate};
   // A gate/up pair's 16-row tile follows its tensors' own formats.
   std::array<UnitFormats, 2> tensors{};
-  const bool pair = w.epilogue == LinearEpilogue::GateUp && gate;
+  const bool pair =
+      (w.epilogue == LinearEpilogue::GateUp || w.epilogue == LinearEpilogue::ClampedGateUp) && gate;
   if (pair) tensors = {unitFormats(std::span(&projections[0], 1)), unitFormats(std::span(&projections[1], 1))};
   LinearPlan plan(w,
                   selectProjection(calibration_, int8Activations_, w, unitFormats(projections),
@@ -204,7 +208,7 @@ LinearPlan Linear::plan(const Projection &p, uint32_t rows, LinearEpilogue epilo
   return part;
 }
 
-LinearScratchSize Linear::scratchSize(ProjectionShape shape, uint32_t rows) const {
+LinearScratchSize Linear::scratchSize(ProjectionShape shape, uint32_t rows, bool clampedGateUp) const {
   if (!rows || rows > SPLASH_PREFILL_TOKEN_BUDGET) throw std::invalid_argument("invalid linear scratch rows");
   LinearScratchSize bound;
   // Split scratch and tables grow with the rows of the decode tiles, each
@@ -212,8 +216,9 @@ LinearScratchSize Linear::scratchSize(ProjectionShape shape, uint32_t rows) cons
   // split (LinearGguf.cpp).
   const LinearMatrix matrix{shape.outputSize, shape.inputSize};
   for (uint32_t count = 1; count <= std::min(rows, kMaximumDecodeTileRows); ++count)
-    for (const auto epilogue : {LinearEpilogue::None, LinearEpilogue::Residual, LinearEpilogue::GateUp})
-      bound.include(ggufDecodeScratchSize({matrix, count, epilogue}, shape.registerFormats));
+    for (const auto epilogue : {LinearEpilogue::None, LinearEpilogue::Residual, LinearEpilogue::GateUp, LinearEpilogue::ClampedGateUp})
+      if (epilogue != LinearEpilogue::ClampedGateUp || clampedGateUp)
+        bound.include(ggufDecodeScratchSize({matrix, count, epilogue}, shape.registerFormats));
   // A plan stores at most its rows' tiles: the decode tiles' up to
   // kMaximumDecodeTileRows, the prefill tiles' whole 128-row tiles.
   static_assert(SPLASH_PREFILL_TOKEN_BUDGET % GGUF_PREFILL_ROWS == 0, "the prefill tiles cover the budget exactly");
@@ -240,7 +245,8 @@ PreparedInput Linear::add(metal::CommandGraph &graph, LinearBuffers b,
     const Projection &p, const LinearPlan &selected, const Projection *gate) const {
   const LinearWorkload w = selected.workload();
   const auto [n, k] = w.matrix;
-  if ((w.epilogue == LinearEpilogue::GateUp) != (gate != nullptr))
+  if ((w.epilogue == LinearEpilogue::GateUp || w.epilogue == LinearEpilogue::ClampedGateUp) !=
+      (gate != nullptr))
     throw std::invalid_argument("a gate/up plan takes a gate projection and no other plan does");
   requireLeadingInputs(selected, p);
   if (gate) requireLeadingInputs(selected, *gate);
@@ -284,7 +290,7 @@ void Linear::addResidualProjection(metal::CommandGraph &graph, metal::MetalBuffe
 // of some of its rows computes them as the chunk's does.
 LinearInput Linear::swiGluInput(const SwiGluProjections &ffn, uint32_t rows, uint32_t chunkRows) const {
   if ((chunkRows ? chunkRows : rows) <= kMaximumDecodeTileRows)
-    return plan(*ffn.up, rows, LinearEpilogue::GateUp, ffn.gate, chunkRows).input();
+    return plan(*ffn.up, rows, ffn.clamp > 0 ? LinearEpilogue::ClampedGateUp : LinearEpilogue::GateUp, ffn.gate, chunkRows).input();
   return plan(*ffn.gate, rows, LinearEpilogue::None, nullptr, chunkRows).input();
 }
 void Linear::addSwiGlu(metal::CommandGraph &graph, const SwiGluProjections &ffn, const PrefillFfnBuffers &b,
@@ -293,18 +299,19 @@ void Linear::addSwiGlu(metal::CommandGraph &graph, const SwiGluProjections &ffn,
   if ((chunkRows ? chunkRows : rows) <= kMaximumDecodeTileRows) {
     add(graph,
         {.input = b.normalized, .output = b.intermediate, .gateScratch = b.gateScratch, .scratch = b.scratch,
-         .prepared = normalized},
-        *ffn.up, plan(*ffn.up, rows, LinearEpilogue::GateUp, ffn.gate, chunkRows), ffn.gate);
+         .prepared = normalized, .clamp = ffn.clamp},
+        *ffn.up, plan(*ffn.up, rows, ffn.clamp > 0 ? LinearEpilogue::ClampedGateUp : LinearEpilogue::GateUp, ffn.gate, chunkRows), ffn.gate);
   } else {
     normalized = add(graph,
                      {.input = b.normalized, .output = b.gateScratch, .scratch = b.scratch, .prepared = normalized},
                      *ffn.gate, plan(*ffn.gate, rows, LinearEpilogue::None, nullptr, chunkRows));
     add(graph,
         {.input = b.normalized, .output = b.intermediate, .gateScratch = b.gateScratch, .scratch = b.scratch,
-         .prepared = normalized},
-        *ffn.up, plan(*ffn.up, rows, LinearEpilogue::UpWithGate, nullptr, chunkRows));
+         .prepared = normalized, .clamp = ffn.clamp},
+        *ffn.up, plan(*ffn.up, rows, ffn.clamp > 0 ? LinearEpilogue::ClampedUpWithGate : LinearEpilogue::UpWithGate, nullptr, chunkRows));
   }
-  addResidualProjection(graph, b.intermediate, *ffn.down, residual, output, rows, b.scratch, chunkRows);
+  add(graph, {.input = b.intermediate, .output = output, .residual = residual, .scratch = b.scratch},
+      *ffn.down, plan(*ffn.down, rows, residual ? LinearEpilogue::Residual : LinearEpilogue::None, nullptr, chunkRows));
 }
 
 } // namespace splash::ops

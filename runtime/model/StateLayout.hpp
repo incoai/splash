@@ -6,6 +6,7 @@
 #include "metal/abi/GDN.h"
 #include "ops/GDN.hpp"
 #include "ops/StateCodec.hpp"
+#include "ops/PagedKv.hpp"
 
 #include <algorithm>
 #include <array>
@@ -112,20 +113,31 @@ struct DraftStateLayout final {
   uint32_t kvHeads = 0;
   uint32_t headDimension = 0;
   uint32_t contextWidth = 0;
+  // The ring slots the draft's geometry keeps (the compiled draft variant's
+  // window, the shipped drafts' unless another's config states one).
+  uint32_t window = SPLASH_DRAFT_SLIDING_WINDOW;
+  uint32_t slidingWindow = 0;
+  kv::LayerMask fullAttentionLayers{};
+  kv::LayerMask unrotatedLayers{};
+
+  [[nodiscard]] constexpr uint32_t layerWindow(uint32_t layer) const noexcept {
+    return slidingWindow && !fullAttentionLayers.test(layer) ? slidingWindow : window;
+  }
 
   [[nodiscard]] constexpr bool valid() const noexcept {
-    return layers && kvHeads && headDimension && contextWidth &&
+    return layers && kvHeads && headDimension && contextWidth && window &&
            contextWidth % SPLASH_DRAFT_CONTEXT_GROUP == 0;
   }
-  [[nodiscard]] constexpr uint64_t tensorBytes() const noexcept {
-    return uint64_t{kvHeads} * SPLASH_DRAFT_SLIDING_WINDOW * headDimension *
-           bfloat16Bytes;
+  [[nodiscard]] constexpr uint64_t tensorBytes(uint32_t layer = 0) const noexcept {
+    return uint64_t{kvHeads} * layerWindow(layer) * headDimension * bfloat16Bytes;
   }
   [[nodiscard]] constexpr uint64_t ringBytes() const noexcept {
-    return uint64_t{layers} * 2 * tensorBytes();
+    uint64_t bytes = 0;
+    for (uint32_t layer = 0; layer < layers; ++layer) bytes += 2 * tensorBytes(layer);
+    return bytes;
   }
   [[nodiscard]] constexpr uint64_t windowBytes() const noexcept {
-    return draft_context_window_bytes(contextWidth);
+    return draft_context_window_bytes(contextWidth, window);
   }
 
   bool operator==(const DraftStateLayout &) const = default;

@@ -16,7 +16,7 @@ from dataclasses import dataclass, fields
 from enum import IntEnum, IntFlag
 from typing import TypeAlias
 
-PROTOCOL_VERSION = 14
+PROTOCOL_VERSION = 15
 # A frame is its header, the magic, the protocol version, the frame type and
 # the payload length, then the payload.
 FRAME_HEADER_BYTES = 16
@@ -52,7 +52,7 @@ _MAGIC = b"SPLH"
 _HEADER = struct.Struct("<4sHHQ")
 # Replay can update the integer deadlines without decoding sampling floats.
 _REQUEST_HEAD = struct.Struct("<QBBQQ")
-_REQUEST = struct.Struct(_REQUEST_HEAD.format + "IIIffIffffQIIIQQIII")
+_REQUEST = struct.Struct(_REQUEST_HEAD.format + "IIIffIffffQIIIQQIIII")
 _IMAGE_SPAN = struct.Struct("<IIIIQQ")
 # Cancel and Stop: one request id.
 _REQUEST_END = struct.Struct("<Q")
@@ -80,7 +80,7 @@ assert (
     and sys.byteorder == "little"
 )
 assert _HEADER.size == FRAME_HEADER_BYTES
-assert _REQUEST.size == 114
+assert _REQUEST.size == 118
 assert _IMAGE_SPAN.size == 32
 assert _READY.size == 21
 assert _START.size == 16
@@ -271,6 +271,7 @@ class ThinkingBudget:
     tokens: int
     end: tuple[int, ...]
     also_ends: int
+    markers: tuple[int, ...] = ()
 
 
 # The request frame's thinking budget tokens without one.
@@ -884,7 +885,9 @@ def _validated_request(
                     f"thinking end token count must be in [1, {MAX_THINKING_END_TOKENS}]"
                 )
             # Thinking ends where its end does, and nowhere inside it.
-            if end[-1] in end[:-1] or also_ends in end[:-1]:
+            if len(_words(thinking.markers, "thinking marker program")) > 1024:
+                raise ValueError("thinking marker program exceeds 4096 bytes")
+            if not thinking.markers and (end[-1] in end[:-1] or also_ends in end[:-1]):
                 raise ValueError("only the last thinking end token may end thinking")
         except (AttributeError, ValueError) as error:
             _fail_request(IssueCode.INVALID_COUNT, str(error), request_id)
@@ -937,7 +940,13 @@ def _request_frame(request: RequestFrame) -> bytearray:
     pixels_offset = spans_offset + _IMAGE_SPAN.size * len(request.image_spans)
     scores_offset = pixels_offset + len(request.image_pixels)
     end_offset = scores_offset + 4 * len(scores)
-    payload_bytes = end_offset + 4 * len(end) - FRAME_HEADER_BYTES
+    markers = (
+        _words(request.thinking_budget.markers, "thinking marker program")
+        if request.thinking_budget
+        else array.array("I")
+    )
+    markers_offset = end_offset + 4 * len(end)
+    payload_bytes = markers_offset + 4 * len(markers) - FRAME_HEADER_BYTES
     if issue := _payload_length_issue(FrameType.REQUEST, payload_bytes):
         _fail_request(issue.code, issue.message, request.request_id)
     frame = _frame(FrameType.REQUEST, payload_bytes)
@@ -960,12 +969,13 @@ def _request_frame(request: RequestFrame) -> bytearray:
         request.cache_salt & 0xFFFFFFFFFFFFFFFF,
         request.cache_salt >> 64,
         *(
-            (_NO_THINKING_BUDGET, 0, 0)
+            (_NO_THINKING_BUDGET, 0, 0, 0)
             if request.thinking_budget is None
             else (
                 request.thinking_budget.tokens,
                 len(end),
                 request.thinking_budget.also_ends,
+                len(markers),
             )
         ),
     )
@@ -985,7 +995,8 @@ def _request_frame(request: RequestFrame) -> bytearray:
         view[prompt_offset:spans_offset] = memoryview(prompt).cast("B")
         view[pixels_offset:scores_offset] = request.image_pixels
         view[scores_offset:end_offset] = memoryview(scores).cast("B")
-        view[end_offset:] = memoryview(end).cast("B")
+        view[end_offset:markers_offset] = memoryview(end).cast("B")
+        view[markers_offset:] = memoryview(markers).cast("B")
     return frame
 
 

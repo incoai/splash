@@ -213,6 +213,7 @@ template <class T> constexpr uint64_t bytesFor(uint64_t elements) noexcept {
 // its command's sequences, sized by their rows: a prompt chunk's, or a decode
 // step's lanes' (TargetArena).
 enum class TargetTensor : uint32_t {
+  EmbeddingRows,
   Hidden0,
   Hidden1,
   Normalized,
@@ -268,6 +269,7 @@ struct TargetRows final {
 // after another's (QwenTarget::addPrefillLayers).
 [[nodiscard]] constexpr bool targetGroupTensor(TargetTensor tensor) noexcept {
   switch (tensor) {
+  case TargetTensor::EmbeddingRows:
   case TargetTensor::Hidden0:
   case TargetTensor::Hidden1:
   case TargetTensor::RopeCos:
@@ -763,7 +765,7 @@ public:
     // its block's. Sparse target FFNs use their own route-major arena tensors,
     // but must not remove the draft's scratch.
     const uint64_t draft = operators.gateUpWorkspace({geometry.draft.intermediateSize, geometry.draft.hiddenSize},
-                                                     kLaneCount * kDraftRows);
+                                                     kLaneCount * geometry.draft.rows);
     uint64_t target = 0;
     for (const auto &p : geometry.target.gateUpProjections)
       target = std::max(target, operators.gateUpWorkspace(p, kDecodeStepRows));

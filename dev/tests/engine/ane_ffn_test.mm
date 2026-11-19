@@ -49,6 +49,7 @@
 #include <bit>
 #include <chrono>
 #include <cmath>
+#include <limits>
 #include <condition_variable>
 #include <cstdint>
 #include <cstring>
@@ -375,6 +376,7 @@ struct Model {
   std::string name;
   std::vector<Projection> projections;
   std::vector<SwiGluProjections> layers;
+  bool addResidual = true;
 };
 // The layers over the model's projections, which stay where they are.
 Model withLayers(Model model) {
@@ -446,6 +448,15 @@ void takes(const Model &mlx, const Model &gguf) {
   if (const char *reason = AneFfn::unsupported(narrow)) fail(std::string("the split refuses a hidden size of 4096: ") + reason);
   if (!AneFfn::unsupported(uneven)) fail("the split takes a hidden size of 4608, which ane_ffn_rotate does not");
   if (!AneFfn::unsupported(mixed)) fail("the split takes layers of two shapes");
+  std::vector<SwiGluProjections> clamped = mlx.layers;
+  for (SwiGluProjections &layer : clamped) layer.clamp = 20.0F;
+  if (AneFfn::unsupported(clamped)) fail("the split refuses clamped layers");
+  clamped[0].clamp = 0.0F;
+  if (!AneFfn::unsupported(clamped)) fail("the split takes layers of two clamps");
+  for (const float clamp : {-1.0F, std::numeric_limits<float>::infinity(), 65536.0F, 0x1p-30F, 1.0001F}) {
+    for (SwiGluProjections &layer : clamped) layer.clamp = clamp;
+    if (!AneFfn::unsupported(clamped)) fail("the split takes a clamp fp16 does not hold");
+  }
   if (AneFfn::units(mlx.layers) != kIntermediate / 512) fail("the split moves other units than 512 channels");
   // Units that leave the GPU or the ANE no channels.
   for (const uint32_t aneUnits : {0u, AneFfn::units(mlx.layers)})
@@ -465,6 +476,9 @@ void keys(const DeviceCapabilities &device, const Model &mlx, const Model &gguf)
       AneFfn::calibrationKey(gguf.layers, on) == AneFfn::calibrationKey(gguf.layers, off))
     fail("int8 activations on and off share a calibration key");
   if (mlxOn == AneFfn::calibrationKey(gguf.layers, on)) fail("two models' layers share a calibration key");
+  std::vector<SwiGluProjections> clamped = mlx.layers;
+  for (SwiGluProjections &layer : clamped) layer.clamp = 20.0F;
+  if (mlxOn == AneFfn::calibrationKey(clamped, on)) fail("two activation clamps share a calibration key");
   test::rejects([&] { static_cast<void>(AneFfn::calibrationKey({}, on)); }, "ANE FFN split has no layers",
                 "layers the split does not take have a calibration key");
   section("keys: a calibration's key holds its layers and the int8-activation setting");
@@ -513,7 +527,8 @@ Forward forward(MetalBackend &backend, const Linear &linear, const Model &model,
   const bool splits = split && split->splits(rows);
   if (split) static_cast<void>(split->begin());
   for (uint32_t layer = 0; layer < kLayers; ++layer) {
-    const MetalBuffer &residual = hidden[layer & 1], &output = hidden[(layer & 1) ^ 1];
+    const MetalBuffer residual = model.addResidual ? hidden[layer & 1] : MetalBuffer{};
+    const MetalBuffer &output = hidden[(layer & 1) ^ 1];
     if (splits)
       split->add(graph, layer, ffn, residual, output, rows);
     else
@@ -557,7 +572,7 @@ std::unique_ptr<AneFfn> splitOf(MetalBackend &backend, const Model &model) {
   const std::vector<Projection> copies = model.projections;
   std::vector<SwiGluProjections> layers;
   for (uint32_t layer = 0; layer < kLayers; ++layer)
-    layers.push_back({&copies[3 * layer], &copies[3 * layer + 1], &copies[3 * layer + 2]});
+    layers.push_back({&copies[3 * layer], &copies[3 * layer + 1], &copies[3 * layer + 2], model.layers[layer].clamp});
   return std::make_unique<AneFfn>(backend, Linear(backend.capabilities(), Int8Activations::On), layers, kAneUnits,
                                   nullptr);
 }
@@ -877,6 +892,20 @@ void split(MetalBackend &backend) {
   const Chunk buffers = chunk(backend, AneFfn::kMaximumRows);
   split(backend, linear, mlx, buffers);
   split(backend, linear, gguf, buffers);
+  using namespace gguf_reference;
+  Model clamped = blockModel(backend, "clamped GGUF, plain down",
+                            {{{Q4K, Q4K, Q5K}, {Q5K, Q5K, Q4K}, {Q4K, Q4K, Q5K}}});
+  clamped.addResidual = false;
+  for (SwiGluProjections &layer : clamped.layers) layer.clamp = 0.125F;
+  split(backend, linear, clamped, buffers);
+  idle(backend, linear, clamped, buffers);
+  stops(backend, linear, clamped, buffers, {.failingEvaluation = 2}, "a clamped layer's evaluation failed",
+        AneFfn::kMinimumRows, "an evaluation failed");
+  section("clamped plain down: idle reload and GPU replay after an evaluation fails");
+  const Forward clipped = forward(backend, linear, clamped, nullptr, buffers, AneFfn::kMinimumRows);
+  for (SwiGluProjections &layer : clamped.layers) layer.clamp = 0.0F;
+  const Forward unclipped = forward(backend, linear, clamped, nullptr, buffers, AneFfn::kMinimumRows);
+  if (difference(unclipped, clipped).first < 0.2) fail("the clamped fixture does not exercise clipping");
   misbound(backend, mlx, buffers);
   refusals(backend, mlx, buffers);
   quietRows(backend, linear, mlx, buffers);

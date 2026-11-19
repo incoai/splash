@@ -6,12 +6,12 @@
 #include <algorithm>
 #include <cmath>
 #include <stdexcept>
+#include <string>
 
 namespace splash::ops {
 namespace {
 
 constexpr uint32_t kShards = SPLASH_DRAFT_SAMPLING_SHARDS;
-constexpr uint32_t kPositions = SPLASH_DRAFT_PROPOSAL_TOKENS;
 // Each position's group scores its 16 x 16 edge table eight edges per
 // simdgroup task; eight simdgroups balance the seven-group B1 dispatch
 // against the 28 groups of B4 (wider groups speed up B1 and slow down B4).
@@ -19,18 +19,25 @@ constexpr uint32_t kEdgeThreads = 256;
 
 } // namespace
 
-DraftSelector::DraftSelector(uint32_t vocabulary) : vocabulary_(vocabulary) {
+DraftSelector::DraftSelector(uint32_t vocabulary, uint32_t candidates, uint32_t rows)
+    : vocabulary_(vocabulary), candidates_(candidates), rows_(rows) {
+  if ((candidates != 16 && candidates != 32) || (rows != 8 && rows != 16) || (candidates == 16 && rows != 8))
+    throw std::invalid_argument("invalid draft selector geometry");
   if (!vocabulary)
     throw std::invalid_argument("invalid draft selector vocabulary");
 }
 
-DraftSelectorWorkspace DraftSelector::workspace(uint32_t positions) {
-  if (!positions)
+DraftSelectorWorkspace DraftSelector::workspace(uint32_t positions, uint32_t candidateCount, uint32_t rows) {
+  if (candidateCount != 16 && candidateCount != 32)
+    throw std::invalid_argument("invalid draft selector candidate count");
+  if (!positions || (rows != 8 && rows != 16))
     throw std::invalid_argument("invalid draft selector workspace position count");
-  const uint64_t candidates = uint64_t{positions} * SPLASH_DRAFT_CANDIDATES;
+  const uint64_t candidates = uint64_t{positions} * candidateCount;
   // The partial values are followed by each position's 16 x 16 edge table.
   return {candidates * kShards * sizeof(uint32_t),
-          candidates * (kShards + SPLASH_DRAFT_CANDIDATES) * sizeof(float),
+          candidates * (kShards + candidateCount) * sizeof(float) +
+              ((positions + rows - 2) / (rows - 1)) *
+                  draft_tree_lattice_bytes(candidateCount),
           candidates * sizeof(uint32_t), candidates * sizeof(float)};
 }
 
@@ -43,7 +50,10 @@ void DraftSelector::add(metal::CommandGraph &graph, const DraftSelectorBuffers &
     throw std::invalid_argument("a draft's tokens lie in its vocabulary");
   const uint32_t count = static_cast<uint32_t>(lanes.size());
   const uint32_t columns = vocabulary.columns(vocabulary_);
+  const uint32_t kPositions = positions();
   SelectorBatchParams params{};
+  params.rows = rows_;
+  params.positions = kPositions;
   params.lanes = count;
   params.vocabulary = vocabulary_;
   params.columns = columns;
@@ -51,6 +61,7 @@ void DraftSelector::add(metal::CommandGraph &graph, const DraftSelectorBuffers &
   params.trailing = vocabulary.trailing;
   DraftTreeParams tree{};
   tree.lanes = count;
+  tree.positions = kPositions;
   for (uint32_t lane = 0; lane < count; ++lane) {
     const DraftTreeLane &l = lanes[lane];
     // A tree's rows hold its anchor and every row's path below it, a verify
@@ -75,15 +86,15 @@ void DraftSelector::add(metal::CommandGraph &graph, const DraftSelectorBuffers &
   }
   // A lane's proposal positions take rows 1-7 of its eight query rows of the
   // logits and the selector hidden rows; its tree takes a verify block's rows.
-  const DraftSelectorWorkspace workspace = DraftSelector::workspace(count * kPositions);
-  const uint64_t queryRows = uint64_t{count} * SPLASH_DRAFT_QUERY_ROWS;
+  const DraftSelectorWorkspace workspace = DraftSelector::workspace(kPositions, candidates_, rows_);
+  const uint64_t queryRows = uint64_t{count} * rows_;
   const uint64_t codebook = uint64_t{vocabulary_} * SPLASH_DRAFT_SELECTOR_RANK * 2;
   const uint64_t treeRows = uint64_t{count} * SPLASH_TARGET_VERIFY_ROWS;
   requireBytes(buffers.logits, queryRows * columns * sizeof(float), "draft logits");
-  requireBytes(buffers.partialIds, workspace.partialIdsBytes, "draft selector partial id");
-  requireBytes(buffers.partialValues, workspace.partialValuesBytes, "draft selector partial value");
-  requireBytes(buffers.candidates, workspace.candidatesBytes, "draft candidate");
-  requireBytes(buffers.unary, workspace.unaryBytes, "draft candidate score");
+  requireBytes(buffers.partialIds, workspace.partialIdsBytes * count, "draft selector partial id");
+  requireBytes(buffers.partialValues, workspace.partialValuesBytes * count, "draft selector partial value");
+  requireBytes(buffers.candidates, workspace.candidatesBytes * count, "draft candidate");
+  requireBytes(buffers.unary, workspace.unaryBytes * count, "draft candidate score");
   requireBytes(buffers.selectorHidden, queryRows * SPLASH_DRAFT_SELECTOR_RANK * 2, "draft selector hidden");
   requireBytes(codebooks.predecessor, codebook, "draft predecessor codebook");
   requireBytes(codebooks.successor, codebook, "draft successor codebook");
@@ -97,12 +108,13 @@ void DraftSelector::add(metal::CommandGraph &graph, const DraftSelectorBuffers &
   requireBytes(buffers.treeScores, treeRows * 2 * sizeof(float), "draft tree score");
   requireBytes(buffers.treeSizes, uint64_t{count} * sizeof(uint32_t), "draft tree size");
   requireBytes(buffers.treeDraws, treeRows * SPLASH_TREE_CHILDREN, "draft tree draw");
-  requireBytes(buffers.treeNext, treeRows * SPLASH_DRAFT_CANDIDATES * sizeof(float), "draft tree next");
+  requireBytes(buffers.treeNext, treeRows * candidates_ * sizeof(float), "draft tree next");
   requireBytes(buffers.treeCaps, treeRows * sizeof(float), "draft tree cap");
-  graph.add("draft_select_top16_sharded",
+  const std::string suffix = candidates_ == 32 ? "_k32" : "";
+  graph.add("draft_select_top16_sharded" + suffix,
             {buffers.logits, buffers.partialIds, buffers.partialValues},
             params, {uint64_t{count} * kPositions * kShards, 1, 1});
-  graph.add("draft_select_edges",
+  graph.add("draft_select_edges" + suffix,
             {buffers.partialIds, buffers.partialValues, buffers.candidates,
              buffers.unary, buffers.selectorHidden, codebooks.predecessor,
              codebooks.successor},
@@ -110,11 +122,11 @@ void DraftSelector::add(metal::CommandGraph &graph, const DraftSelectorBuffers &
             {kEdgeThreads, 1, 1});
   // A group's threads take the lattice's rows, one a position and
   // predecessor, before its first thread grows the tree.
-  graph.add("draft_select_tree",
+  graph.add("draft_select_tree" + suffix,
             {buffers.candidates, buffers.unary, buffers.partialValues, buffers.chainTokens, buffers.chainRates,
              buffers.treeTokens, buffers.trees, buffers.treeScores, buffers.treeSizes, buffers.treeDraws,
              buffers.treeNext, buffers.treeCaps},
-            tree, {count, 1, 1}, {kPositions * SPLASH_DRAFT_CANDIDATES, 1, 1});
+            tree, {count, 1, 1}, {kPositions * candidates_, 1, 1});
 }
 
 void DraftSelector::addVerifyRows(metal::CommandGraph &graph, const DraftSelectorBuffers &buffers,

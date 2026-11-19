@@ -44,7 +44,7 @@ public:
   static_assert(kMaximumRows >= kMinimumRows && (kMaximumRows - kMinimumRows) % kProgramStep == 0,
                 "the functions cover the chunks the split takes");
   // The GPU part's down projection is a view of leading inputs, which only
-  // the prefill residual tiles (GgufPrefill, GgufPrefillInt8) run: no chunk
+  // the plain or residual prefill tiles (GgufPrefill, GgufPrefillInt8) run: no chunk
   // the split takes stages.
   static_assert(kMinimumRows > kMaximumDecodeTileRows, "the split's chunks run the prefill residual tiles");
 
@@ -162,6 +162,7 @@ private:
   // ANE takes.
   struct Shape final {
     uint32_t hidden = 0, intermediate = 0, layers = 0, gpu = 0, ane = 0;
+    float clamp = 0.0F;
     std::vector<uint32_t> inputSegments, downSegments;
   };
   // A staging set of the ANE's int8 weights: gate's and up's rows over each

@@ -1,5 +1,6 @@
 #pragma once
 
+#include "metal/abi/ExecutionGeometry.h"
 #include "engine/Engine.hpp"
 #include "model/Model.hpp"
 #include "ops/PagedKv.hpp"
@@ -21,7 +22,8 @@ inline uint64_t draftContextRows(const DraftContextPlan &plan) {
 // engine's rolling recovery points and final reusable replay state.
 inline uint64_t expectedDraftContextRows(uint32_t promptTokens,
                                          uint32_t checkpointTokens,
-                                         uint32_t restoredTokens = 0) {
+                                         uint32_t restoredTokens = 0,
+                                         uint32_t draftWindow = SPLASH_DRAFT_SLIDING_WINDOW) {
   if (!promptTokens)
     return 0;
   const uint32_t replayBoundary =
@@ -30,8 +32,12 @@ inline uint64_t expectedDraftContextRows(uint32_t promptTokens,
       engine::plannedCheckpoints(restoredTokens, replayBoundary, checkpointTokens);
   if (replayBoundary > restoredTokens)
     boundaries.push_back(replayBoundary);
-  return draftContextRows(
-      planDraftContext(restoredTokens, promptTokens, boundaries));
+  return draftContextRows(planDraftContext(restoredTokens, promptTokens, boundaries,
+                                           draftWindow));
+}
+
+inline uint32_t defaultCheckpointTokens(uint32_t draftWindow) {
+  return (2u * draftWindow + kv::kPageTokens - 1) / kv::kPageTokens * kv::kPageTokens;
 }
 
 } // namespace splash::benchmark

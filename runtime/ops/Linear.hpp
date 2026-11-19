@@ -70,7 +70,7 @@ void requireSegmentPlanes(const QuantizedSegment &segment, std::string_view what
 // A gate/up pair runs as one plan, GateUp, on the decode tiles; past them, as
 // a gate plan and an up plan that applies silu(gate), UpWithGate
 // (Linear::addSwiGlu), which the column tile does not run.
-enum class LinearEpilogue : uint8_t { None, Residual, GateUp, UpWithGate };
+enum class LinearEpilogue : uint8_t { None, Residual, GateUp, UpWithGate, ClampedGateUp, ClampedUpWithGate };
 // The tiles run 64 columns per threadgroup; a one-pass gate/up
 // (LinearConfig::oneGateUpPass) runs 32 columns of both tensors per
 // threadgroup of one simdgroup. The staged tiles, GgufStaged and GgufPrefill,
@@ -103,13 +103,16 @@ inline constexpr uint32_t kMaximumDecodeTileRows = 64;
 }
 inline constexpr uint32_t kMaximumRegisterRows = SPLASH_MAXIMUM_BATCH_WIDTH * GGUF_TABLE16_ROWS;
 // A one-pass gate/up pair's simdgroup holds both tensors' sums of every row:
-// up to 32 rows (kernels/shared/gguf_linear.metal); a plan of more runs the
-// pair in two passes.
-inline constexpr uint32_t kMaximumPairRows = 32;
+// up to 64 rows (kernels/shared/gguf_linear.metal). Automatic selection
+// retains the calibrated 32-row bound except for the wide clamped pair.
+inline constexpr uint32_t kMaximumPairRows = 64;
 // The int8 decode tiles' simdgroups hold their int32 and fp32 sums of every
-// row up to 32 rows; a plan of more keeps bf16 activations on the staged tile
-// (kernels/shared/gguf_linear.metal).
-inline constexpr uint32_t kMaximumInt8Rows = 32;
+// row up to 64 rows (kernels/shared/gguf_linear.metal). Automatic selection
+// keeps the calibrated 32-row bound.
+inline constexpr uint32_t kMaximumInt8Rows = 64;
+// Keep the automatic policy at the upstream calibrated width; wider tiles
+// remain available to explicit plans and their numerical qualification.
+inline constexpr uint32_t kMaximumInt8PolicyRows = 32;
 // The staged tile that holds `rows` rows: MPP computes 16-row fragments, so
 // the tile holds 8, 16, 32, 48 or 64 rows, the fewest that hold the plan's (24
 // rows run the 32-row tile, 40 the 48-row tile; a plan of at most 8 may run
@@ -119,9 +122,10 @@ inline constexpr uint32_t kMaximumInt8Rows = 32;
 }
 // The rows a staged plan of `rows` rows stores: its tile's, or 16 for a plan
 // on the 16-row tile (LinearConfig::sixteenRows) or on the int8 tiles, whose
-// shortest height is 16 (LinearConfig::decodeInt8).
+// heights are 16, 32 and 64 (LinearConfig::decodeInt8).
 [[nodiscard]] constexpr uint32_t stagedStorageRows(uint32_t rows, bool sixteenRows, bool decodeInt8 = false) noexcept {
-  return sixteenRows || decodeInt8 ? std::max(16u, stagedTileRows(rows)) : stagedTileRows(rows);
+  if (decodeInt8) return rows <= 16 ? 16 : rows <= 32 ? 32 : 64;
+  return sixteenRows ? std::max(16u, stagedTileRows(rows)) : stagedTileRows(rows);
 }
 
 // `rows` rows of a matrix through an epilogue. The rows pick the plan's tile
@@ -160,6 +164,9 @@ struct LinearConfig final {
   // (gguf_decode_int8_pq20_m<rows>_*) at the plan's storage rows, splits,
   // spread and passes.
   bool decodeInt8 = false;
+  // GgufPrefill: four 16-row simdgroups instead of four 32-row ones.
+  // Storage keeps its 128-row extent; twice as many 64-row tiles run.
+  bool prefill64Rows = false;
   [[nodiscard]] constexpr bool validSplits() const noexcept {
     return splits && splits <= kMaximumSplits && !(splits & (splits - 1));
   }
@@ -180,11 +187,13 @@ struct LinearScratch final {
   // (ProjectionShape::rotated), sized by scratchSize(shape, rows).rotated.
   metal::MetalBuffer rotated{};
 };
-// One layer's SwiGLU projections: down(silu(gate x) * up x).
+// One layer's SwiGLU projections, optionally clamping gate above and up on
+// both sides before their product; zero leaves them unclamped.
 struct SwiGluProjections final {
   const Projection *gate = nullptr;
   const Projection *up = nullptr;
   const Projection *down = nullptr;
+  float clamp = 0.0F;
 };
 // A prefill chunk's buffers of its dense FFN: the normalized rows, gate's
 // output, the intermediate rows and the linear scratch.
@@ -271,6 +280,9 @@ struct LinearBuffers final {
   // What the scratch table holds (for example after fused RMSNorm). A plan
   // that reads a table prepares one unless this describes its input.
   PreparedInput prepared{};
+  // The clamped epilogues' threshold, which their params carry to the
+  // kernels; infinity clamps nothing.
+  float clamp = std::numeric_limits<float>::infinity();
 };
 
 // Whether plans may round activations to int8 where an int8-activation path
@@ -310,7 +322,7 @@ public:
   // and staged tiles, the rotated rows of `rows` rows, and where the device
   // runs the int8 prefill tile on the shape's formats, its codes and scales of
   // `rows` rows.
-  [[nodiscard]] LinearScratchSize scratchSize(ProjectionShape shape, uint32_t rows) const;
+  [[nodiscard]] LinearScratchSize scratchSize(ProjectionShape shape, uint32_t rows, bool clampedGateUp = false) const;
   // The tile of a float projection of `rows` rows into `outputSize` columns
   // of rows in `formatId` (QuantizedSegment::rows) on this device
   // (selectFloatTile).
