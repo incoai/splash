@@ -1939,8 +1939,8 @@ void testSingletonCapacityFailureTerminatesCleanly() {
   require(events.completedCount == 0 && events.failedCount == 1 &&
               events.capacityExhaustedCount == 1 && idle(engine),
           "B1 capacity failure did not emit exactly one terminal event");
-  // It names the limits that would fit it: --max-memory only lowers the
-  // budget, so a larger one only where one lowered it.
+  // It names the limits that would fit it: a smaller --max-context, or a
+  // larger --max-memory where one lowered the budget.
   require(events.failureDetails[0].first.ends_with(
               ": restart the server with a smaller --max-context, or with a larger --max-memory "
               "where one lowered it"),

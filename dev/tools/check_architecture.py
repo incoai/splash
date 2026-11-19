@@ -226,9 +226,10 @@ NOTE_ALLOWANCE: dict[str, int] = {
     "dev/tests/engine/timing_profile_test.cpp": 1,
 }
 # runtime/engine's production lines: the budget only goes down, unless the
-# owner raises it. 30,643 is 1.7.0's 30,594 and 49 more, for the SSD cache's
-# off reason and its reads in /status and a request's reuse in usage.
-ENGINE_LINE_BUDGET = 30_643
+# owner raises it. 30,655 is 1.7.0's 30,594 and 61 more, for the SSD cache's
+# off reason and its reads in /status, a request's reuse in usage and the
+# automatic budget's unwired tenth.
+ENGINE_LINE_BUDGET = 30_655
 C_LIKE_SUFFIXES = SOURCE_SUFFIXES | {".swift"}
 HASH_COMMENT_SUFFIXES = {"", ".sh", ".bash", ".fish", ".mk", ".yml", ".yaml", ".toml"}
 C_LIKE_COMMENT = re.compile(

@@ -200,16 +200,28 @@ struct EngineMemoryPolicy {
                : minimumWorkingSetMarginBytes;
   }
 
+  // The automatic budget leaves this share of the Mac's memory unwired. At
+  // their default wired limit, the 16, 24, 36, 48 and 64 GB Macs measured
+  // leave 32, 30, 25, 24 and 21%, a 128 GB Mac about 12%; larger Macs were
+  // not measured. A 128 GB M5 Max whose `iogpu.wired_limit_mb` was raised,
+  // the engine and two other GPU processes wiring 96% of its memory,
+  // stalled 91 s in the kernel and panicked (#735).
+  static constexpr uint32_t unwiredFloorPercent = 10;
+
+  // The recommendation less the margin; automatically also no more than the
+  // Mac's memory less the unwired floor. An explicit `maximumMemoryBytes`
+  // is the user's, capped by the recommendation alone.
   [[nodiscard]] static constexpr uint64_t
   hardBudgetBytes(uint64_t recommendedWorkingSetBytes,
-                  uint64_t maximumMemoryBytes) noexcept {
+                  uint64_t maximumMemoryBytes, uint64_t physicalMemoryBytes) noexcept {
     const uint64_t margin = workingSetMarginBytes(recommendedWorkingSetBytes);
-    const uint64_t automatic = recommendedWorkingSetBytes > margin
-                                   ? recommendedWorkingSetBytes - margin
-                                   : 0;
-    return maximumMemoryBytes && maximumMemoryBytes < automatic
-               ? maximumMemoryBytes
-               : automatic;
+    const uint64_t recommended = recommendedWorkingSetBytes > margin
+                                     ? recommendedWorkingSetBytes - margin
+                                     : 0;
+    if (maximumMemoryBytes)
+      return maximumMemoryBytes < recommended ? maximumMemoryBytes : recommended;
+    const uint64_t floored = physicalMemoryBytes - physicalMemoryBytes / 100 * unwiredFloorPercent;
+    return floored < recommended ? floored : recommended;
   }
 
   // A bounded host cushion, independent of the engine's Metal capacity.

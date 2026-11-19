@@ -511,8 +511,9 @@ SERVE_OPTIONS = (
             type=parse_max_memory,
             default=None,
             metavar="SIZE",
-            help="Metal memory budget, e.g. 28G; it can only lower the automatic "
-            "budget (default: auto)",
+            help="Metal memory budget in place of the automatic one, e.g. 28G, up "
+            "to the GPU's recommended working set less a margin (default: auto, "
+            "which also leaves a tenth of the Mac's memory unwired)",
         ),
         engine=EngineArgument(1, text=_auto_text, required=True),
     ),

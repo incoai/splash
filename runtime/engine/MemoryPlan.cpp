@@ -401,7 +401,7 @@ evaluateEngineMemoryPlan(const DeviceCapabilities &device,
                     std::move(breakdown))};
   }
   breakdown.hardBudgetBytes = EngineMemoryPolicy::hardBudgetBytes(
-      breakdown.recommendedWorkingSetBytes, maximumMemoryBytes);
+      breakdown.recommendedWorkingSetBytes, maximumMemoryBytes, breakdown.physicalMemoryBytes);
 
   breakdown.kvPageBytes = model.targetKvLayout.bytesPerModelPage();
   breakdown.fixedRuntimeBytes = model.fixedRuntimeBytes();
