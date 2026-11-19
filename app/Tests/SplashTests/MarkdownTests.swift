@@ -29,4 +29,18 @@ extension TranscriptTests {
             """, as: String.self)
         #expect(aligns == "left,right,center,left")
     }
+
+    /// Bold beside Chinese text shows bold: asterisks whose inner side is punctuation, a full-width
+    /// bracket, and whose outer side is a Chinese character kept as asterisks by CommonMark's rule,
+    /// which wants a space or punctuation there. Emphasis in English, and asterisks that mark
+    /// nothing, stay as they were.
+    @Test func boldBesideChineseTextShowsBold() async throws {
+        let shown = try await drawn("""
+            const box = document.createElement('div')
+            markdown.draw(box, '信号量允许**指定数量（N）**的线程同时访问，而**“互斥锁”**只允许一个。\\n\\nA **bold** word, 2 * 3 * 4, and **（括号）**开头。')
+            return [[...box.querySelectorAll('strong')].map(e => e.textContent).join('|'), box.textContent]
+            """, as: [String].self)
+        #expect(shown?.first == "指定数量（N）|“互斥锁”|bold|（括号）")
+        #expect(shown?.last.map { !$0.contains("**") && $0.contains("2 * 3 * 4") } == true, "\(shown ?? [])")
+    }
 }

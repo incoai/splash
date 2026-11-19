@@ -39,7 +39,32 @@ const markdown = (() => {
     };
   }
 
+  // Chinese, Japanese and Korean text, and its punctuation, the full-width forms among it.
+  const cjk = /[\u2E80-\u303F\u3040-\u30FF\u3400-\u4DBF\u4E00-\u9FFF\uAC00-\uD7AF\uF900-\uFAFF\uFE30-\uFE4F\uFF00-\uFFEF]/;
+
+  // Emphasis beside Chinese, Japanese and Korean text. CommonMark lets asterisks whose inner side
+  // is punctuation open or close only where their outer side is a space or punctuation, which
+  // text written without spaces has neither of: by that rule alone "允许**指定数量（N）**的线程"
+  // keeps its asterisks (a mutex explained in Chinese). An outer side that is such a character
+  // counts as the space it would be in a language that writes them. Asterisks alone: an
+  // underscore inside a word marks nothing in any language.
+  function emphasisBesideCJK(parser) {
+    const State = parser.inline.State;
+    const scan = State.prototype.scanDelims;
+    State.prototype.scanDelims = function (start, canSplitWord) {
+      const found = scan.call(this, start, canSplitWord);
+      if (this.src.charCodeAt(start) !== 0x2A) return found;
+      const before = start > 0 ? this.src[start - 1] : ' ';
+      const after = start + found.length < this.posMax ? this.src[start + found.length] : ' ';
+      const space = character => /\s/.test(character);
+      if (!found.can_open && !space(after) && cjk.test(before)) found.can_open = true;
+      if (!found.can_close && !space(before) && cjk.test(after)) found.can_close = true;
+      return found;
+    };
+  }
+
   function configured(parser) {
+    emphasisBesideCJK(parser);
     parser.core.ruler.push('splash', state => {
       let cell = false;
       for (const token of state.tokens) {
