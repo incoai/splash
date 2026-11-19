@@ -290,7 +290,9 @@ int repackTiming(MetalBackend &backend, uint32_t rounds) {
         columns{c.hidden, c.hidden, c.intermediate};
     std::array<std::vector<std::vector<uint8_t>>, 3> native;
     std::array<std::vector<Packed>, 3> planes;
+    // A job's sources: one staged plane a projection, its native rows.
     MoeExpertLoadParams params{};
+    params.source_planes = 1;
     uint64_t expertBytes = 0;
     for (uint32_t z = 0; z < 3; ++z) {
       const QuantFormat &f = kQuantFormats[formats[z]];
@@ -299,7 +301,13 @@ int repackTiming(MetalBackend &backend, uint32_t rounds) {
         native[z].push_back(makeNative(formats[z], rows[z], columns[z], local));
         planes[z].push_back(repack(formats[z], native[z].back(), rows[z], columns[z], nullptr));
       }
-      params.projections[z] = {formats[z], rows[z], columns[z], rowBytes(formats[z], columns[z]),
+      // Native rows staged, no stored planes (MoeExpertLoadProjection::stored_bytes).
+      params.projections[z] = {formats[z],
+                               rows[z],
+                               columns[z],
+                               rowBytes(formats[z], columns[z]),
+                               {0, 0, 0},
+                               0,
                                {uint64_t{rows[z]} * G * f.plane0_bytes, uint64_t{rows[z]} * G * f.plane1_bytes,
                                 uint64_t{rows[z]} * (G / f.meta_groups) * f.meta_bytes}};
       expertBytes += native[z][0].size();

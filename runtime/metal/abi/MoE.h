@@ -238,30 +238,40 @@ static_assert(sizeof(MoeGgufGateUpParams) == 40,
 
 // One projection (gate, up or down) of the experts a load writes into their
 // slots (moe_expert_load, model/ExpertStore.cpp): rows x columns in `format`,
-// job j's native rows of row_bytes each staged from wherever the job's source
-// names, and its plane0, plane1 and meta planes slot_bytes[i] bytes per slot
-// in the regions of the slot's chunk.
+// job j's rows staged from wherever the job's sources name, and its plane0,
+// plane1 and meta planes slot_bytes[i] bytes per slot in the regions of the
+// slot's chunk. The rows are staged as native rows of row_bytes each, or,
+// where stored_bytes[0] is not 0, as the planes an MLX affine or mxfp4
+// tensor stores them in, stored_bytes[p] bytes a row of plane p: its codes,
+// scales and biases (model/GgufPreparation.hpp storedPlanes).
 struct MoeExpertLoadProjection {
   uint32_t format;
   uint32_t rows;
   uint32_t columns;
   uint32_t row_bytes;
+  uint32_t stored_bytes[3];
+  uint32_t reserved;
   uint64_t slot_bytes[3];
 };
 
-static_assert(sizeof(MoeExpertLoadProjection) == 40,
-              "MoE expert load projections are 40 bytes on both sides");
+static_assert(sizeof(MoeExpertLoadProjection) == 56,
+              "MoE expert load projections are 56 bytes on both sides");
 
-// The gate, up and down projections of one load, and the slots of the floor
-// chunk and of each elastic chunk.
+// The gate, up and down projections of one load, the slots of the floor
+// chunk and of each elastic chunk, and the staged planes a job's sources
+// name of each projection (1, or 3 where a projection is staged as stored
+// planes): source s of job j's projection z is sources[(3 j + z) *
+// source_planes + s].
 struct MoeExpertLoadParams {
   struct MoeExpertLoadProjection projections[3];
   uint32_t floor_slots;
   uint32_t chunk_slots;
+  uint32_t source_planes;
+  uint32_t reserved;
 };
 
-static_assert(sizeof(MoeExpertLoadParams) == 128,
-              "MoE expert load parameters are 128 bytes on both sides");
+static_assert(sizeof(MoeExpertLoadParams) == 184,
+              "MoE expert load parameters are 184 bytes on both sides");
 
 // The threads of a moe_expert_load threadgroup, and the 32-wide K groups of a
 // row it repacks: its QUANT_TILE_ROWS rows' pairs of a span of

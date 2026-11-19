@@ -862,6 +862,26 @@ void checkMlxSources(MetalBackend &backend, const std::filesystem::path &directo
                 windowHolds(windowStep.meta, windowed.meta),
             name + ": planes of its two column windows");
     }
+    // A streamed expert's load reads an affine or mxfp4 tensor's planes as
+    // the checkpoint stores them (storedPlanes), and builds an nvfp4 one's
+    // native rows; a permuted tensor's rows are built too.
+    model::gguf::Repack exact = step;
+    exact.rows = rows;
+    const auto stored = model::storedPlanes(exact);
+    const auto fileHolds = [&](const model::PlaneRows &plane, const std::vector<uint8_t> &bytes) {
+      if (!plane.file || plane.rowBytes * rows != bytes.size()) return false;
+      std::vector<uint8_t> read(bytes.size());
+      plane.file->readFile(plane.offset, read);
+      return read == bytes;
+    };
+    if (f == gguf_reference::NVFP4)
+      check(!stored, name + ": no planes read as stored");
+    else
+      check(stored && fileHolds((*stored)[0], tensor.weight) && fileHolds((*stored)[1], tensor.scales) &&
+                (tensor.affine() ? fileHolds((*stored)[2], tensor.biases) : !(*stored)[2].rowBytes),
+            name + ": its planes as the checkpoint stores them");
+    exact.sources.front().order = {0, 1, 1, 1};
+    check(!model::storedPlanes(exact), name + ": permuted rows have no stored planes");
     // By value: MLX writes an mxfp4 code of -0 as -0, the kernels as +0.
     std::vector<float> expectedValues(tensor.values.size() / 4), values(expectedValues.size());
     std::memcpy(expectedValues.data(), tensor.values.data(), tensor.values.size());

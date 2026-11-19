@@ -355,6 +355,8 @@ void MoE::addExpertLoad(metal::CommandGraph &graph, const metal::MetalBuffer &st
                         const metal::MetalBuffer &sources, const MoeExpertLoadParams &params, uint32_t jobs,
                         const metal::IndirectGrid &grid) {
   if (chunks.empty()) throw std::invalid_argument("MoE expert chunks have no slots");
+  if (params.source_planes != 1 && params.source_planes != 3)
+    throw std::invalid_argument("a MoE expert load's jobs name 1 or 3 staged planes a projection");
   MoeExpertLoadParams load = params;
   load.floor_slots = chunks.floorSlots();
   load.chunk_slots = chunks.chunkSlots();

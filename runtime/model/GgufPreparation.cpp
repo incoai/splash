@@ -92,6 +92,19 @@ std::vector<float> tensorScales(const gguf::TensorRows &rows, uint64_t start, ui
   return result;
 }
 
+// The bytes of a native block of a quantized safetensors tensor's format
+// from its codes tensor and from its scales tensor; an affine tensor's
+// biases take as many as its scales.
+struct StoredBlock final {
+  uint64_t codes = 0, scales = 0;
+};
+StoredBlock storedBlock(uint32_t id, const QuantFormat &format) {
+  const bool affine = quant_affine_format(id);
+  return {format.block_bytes -
+              (affine ? 4 : id == GGUF_FMT_NVFP4 ? QUANT_NVFP4_CODES : id == GGUF_FMT_FP8 ? QUANT_FP8_VALUES : 1),
+          affine ? 2u : id == GGUF_FMT_NVFP4 ? QUANT_NVFP4_G : id == GGUF_FMT_FP8 ? 0u : 1u};
+}
+
 // Native bytes [column, column + span) of `count` source rows of a quantized
 // safetensors tensor from source row `start` on, back to back, read from its
 // tensors: per native block an affine tensor's scale, bias and codes; an
@@ -105,12 +118,8 @@ void readSafetensorsRows(const gguf::TensorRows &rows, uint64_t start, uint64_t 
   const QuantFormat &format = nativeFormat(rows);
   const uint32_t id = gguf_format_of(rows.type);
   const bool affine = quant_affine_format(id);
-  // Bytes of a native block from the scales tensor (its biases take as many
-  // as its scales) and from the codes tensor.
   const uint64_t block = format.block_bytes, groups = rows.rowBytes / block;
-  const uint64_t scaleBytes = affine ? 2 : id == GGUF_FMT_NVFP4 ? QUANT_NVFP4_G : id == GGUF_FMT_FP8 ? 0 : 1;
-  const uint64_t codes =
-      block - (affine ? 4 : id == GGUF_FMT_NVFP4 ? QUANT_NVFP4_CODES : id == GGUF_FMT_FP8 ? QUANT_FP8_VALUES : 1);
+  const auto [codes, scaleBytes] = storedBlock(id, format);
   if (column % block || span % block)
     throw GgufError("quantized safetensors rows are read by whole blocks: " + rows.name);
   // One read of each tensor per run of rows when they are read whole, else per row.
@@ -667,6 +676,29 @@ std::optional<FileRows> storedRepackRows(const gguf::Repack &repack, uint64_t fi
     start += tensor.rows;
   }
   throw GgufError("repack rows are out of bounds");
+}
+
+std::optional<std::array<PlaneRows, 3>> storedPlanes(const gguf::Repack &repack) {
+  if (repack.sources.size() != 1) return std::nullopt;
+  const gguf::TensorRows &rows = repack.sources.front();
+  const uint32_t id = gguf_format_of(rows.type);
+  if (rowReader(rows) != RowReader::Safetensors || !(quant_affine_format(id) || id == GGUF_FMT_MXFP4) ||
+      rows.order.from != UINT64_MAX ||
+      rows.windows != 1 || rows.rows != repack.rows ||
+      rows.rowBytes != ggufRowBytes(kQuantFormats[repack.format], repack.columns))
+    return std::nullopt;
+  const QuantFormat &format = nativeFormat(rows);
+  const StoredBlock block = storedBlock(id, format);
+  const uint64_t blocks = rows.rowBytes / format.block_bytes;
+  // Plane rows of `bytes` a native block, row 0 the tensor's row rows.first.
+  const auto plane = [&](const SourceTensor *tensor, uint64_t bytes) {
+    if (!tensor || !bytes) return PlaneRows{};
+    return PlaneRows{tensor->file, tensor->file->dataOffset() + tensor->offset + rows.first * blocks * bytes,
+                     blocks * bytes};
+  };
+  const gguf::SafetensorsSource &source = rows.safetensors;
+  return std::array{plane(source.codes, block.codes), plane(source.scales, block.scales),
+                    plane(source.biases, quant_affine_format(id) ? block.scales : 0)};
 }
 
 void writeGgufImage(metal::MetalBackend &backend, const metal::MetalBuffer &image, const gguf::Image &plan) {

@@ -439,10 +439,12 @@ struct MoE final {
                         const metal::MetalBuffer &selected, const metal::MetalBuffer &routingWeights, uint32_t rows,
                         MoeShape shape, FloatTile routerTile);
   // A streamed experts' load (MoeExpertStream::addLoad): the gate, up and
-  // down projections of up to `jobs` experts, job j's projection z's native
-  // rows in `staging` from sources[3j + z] (bytes) on, repacked into the
-  // planes of slot slots[j] of `chunks` as `params` lays them out (its
-  // floor_slots and chunk_slots the chunks'). The host step before it writes
+  // down projections of up to `jobs` experts, job j's projection z staged in
+  // `staging` as native rows or as the planes its checkpoint stores, plane s
+  // from sources[(3j + z) * params.source_planes + s] (bytes) on
+  // (MoeExpertLoadParams), repacked into the planes of slot slots[j] of
+  // `chunks` as `params` lays them out (its floor_slots and chunk_slots the
+  // chunks'). The host step before it writes
   // the sources, the slots and the grid (expertLoadGroups threadgroups, the
   // jobs it staged, 3) into `grid`. Any slot may be written, so the dispatch
   // reaches every chunk.
