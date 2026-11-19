@@ -60,6 +60,7 @@
 #include <filesystem>
 #include <fstream>
 #include <functional>
+#include <initializer_list>
 #include <iostream>
 #include <memory>
 #include <set>
@@ -109,6 +110,13 @@ constexpr MoeShape kShapes[] = {{1024, 16, 4, 512},
                                  .router = splash::ops::MoeRouter::SigmoidNormalized,
                                  .sharedSlices = 2,
                                  .sharedGate = false}};
+
+// Qwen3.8-Flash-Next's expert itself, hidden 2560 and 640 wide, in its Q2_0
+// (with fewer experts): a row's 80 and 20 groups are spans of the expert
+// load's (MOE_EXPERT_LOAD_SPAN) and parts of one, which the shapes above, of
+// 8 to 32 groups, are not. Rows are whole tiles at every shape: a valid
+// MoeShape's hidden and intermediate sizes are multiples of 64.
+constexpr MoeShape kFlashNextExperts{2560, 16, 4, 640};
 
 // Memory a store gets past the slots a test asks for, less than any slot
 // takes: the store, which takes the most slots its memory holds, takes
@@ -320,10 +328,11 @@ bool slotsHoldTheirExperts(const Model &m, const BlockMoeWeights &streamed, cons
   return true;
 }
 
-int streamedExperts(MetalBackend &backend, const MoeShape &shape, const std::filesystem::path &directory) {
+int streamedExperts(MetalBackend &backend, const MoeShape &shape, const std::filesystem::path &directory,
+                    std::initializer_list<Fmt> formatList = {IQ2S, IQ3S, IQ3XXS, Q4K, Q80, IQ4NL, MXFP4, Q20}) {
   int failures = 0;
   uint64_t decodePrefetched = 0;
-  for (const Fmt f : {IQ2S, IQ3S, IQ3XXS, Q4K, Q80, IQ4NL, MXFP4}) {
+  for (const Fmt f : formatList) {
     const Model m = makeModel(backend, shape, f, true);
     const std::string formats = formatNames(m);
     ExpertFile file(m, directory / "experts.bin");
@@ -1811,6 +1820,9 @@ int main(int argc, const char *argv[]) {
                     streamedChunkLimit(backend, shape, directory.path()) +
                     streamedSourceChanges(argv[1], shape, directory.path());
       }
+      printf("%u experts, top %u, hidden %u, %u wide:\n", kFlashNextExperts.experts, kFlashNextExperts.expertsPerToken,
+             kFlashNextExperts.hiddenSize, kFlashNextExperts.expertIntermediateSize);
+      failures += streamedExperts(backend, kFlashNextExperts, directory.path(), {Q20});
       if (failures) {
         std::cerr << "expert_store_test: " << failures << " failures\n";
         return 1;

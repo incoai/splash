@@ -263,9 +263,12 @@ struct MoeExpertLoadParams {
 static_assert(sizeof(MoeExpertLoadParams) == 128,
               "MoE expert load parameters are 128 bytes on both sides");
 
-// The threads of a moe_expert_load threadgroup, each of which repacks one
-// (row, 32-wide K group) pair.
+// The threads of a moe_expert_load threadgroup, and the 32-wide K groups of a
+// row it repacks: its QUANT_TILE_ROWS rows' pairs of a span of
+// MOE_EXPERT_LOAD_SPAN groups, the threads of a row taking every
+// (MOE_EXPERT_LOAD_THREADS / QUANT_TILE_ROWS)-th.
 #define MOE_EXPERT_LOAD_THREADS 256u
+#define MOE_EXPERT_LOAD_SPAN 32u
 
 struct MoeCombineParams {
   uint32_t rows;

@@ -343,9 +343,10 @@ void MoE::addRoutes(metal::CommandGraph &graph, const metal::MetalBuffer &input,
 
 uint32_t MoE::expertLoadGroups(const MoeExpertLoadParams &params) noexcept {
   uint64_t groups = 0;
+  // A row tile's spans of groups each (moe_expert_load).
   for (const MoeExpertLoadProjection &projection : params.projections)
-    groups = std::max(groups, (uint64_t{projection.rows} * (projection.columns / 32) + MOE_EXPERT_LOAD_THREADS - 1) /
-                                  MOE_EXPERT_LOAD_THREADS);
+    groups = std::max(groups, (uint64_t{projection.rows} + QUANT_TILE_ROWS - 1) / QUANT_TILE_ROWS *
+                                  ((projection.columns / 32 + MOE_EXPERT_LOAD_SPAN - 1) / MOE_EXPERT_LOAD_SPAN));
   return static_cast<uint32_t>(groups);
 }
 
