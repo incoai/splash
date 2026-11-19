@@ -13,17 +13,20 @@
 
 #include <filesystem>
 #include <memory>
+#include <string_view>
 #include <vector>
 
 namespace splash::model {
 
 class SafetensorsTargetLoader final {
 public:
-  // Plans every image of the checkpoint in directory once. With expert
+  // Plans every image of the checkpoint in directory once, of the family
+  // whose GGUFs are of `architecture` (safetensors::planImages). With expert
   // memory (experts.memoryBytes), a MoE target's routed experts stream
   // (streamedExperts()) instead of loading with their layers.
   SafetensorsTargetLoader(metal::MetalBackend &backend, WeightImages &images, const std::filesystem::path &directory,
-                          const QwenTargetDimensions &geometry, ExpertStoreOptions experts = {});
+                          const QwenTargetDimensions &geometry, std::string_view architecture,
+                          ExpertStoreOptions experts = {});
   SafetensorsTargetLoader(const SafetensorsTargetLoader &) = delete;
   SafetensorsTargetLoader &operator=(const SafetensorsTargetLoader &) = delete;
 
@@ -33,7 +36,8 @@ public:
   // Whether its images hold F32 norms (safetensors::float32Norms).
   [[nodiscard]] bool float32Norms() const noexcept { return float32Norms_; }
   // Whether the routed experts stream, then the store's options and every
-  // layer's experts, which read the checkpoint's open files.
+  // MoE layer's experts (a block each, those of the leading dense layers'
+  // none), which read the checkpoint's open files.
   [[nodiscard]] bool streamsExperts() const noexcept { return experts_.memoryBytes != 0; }
   [[nodiscard]] const ExpertStoreOptions &expertStoreOptions() const noexcept { return experts_; }
   [[nodiscard]] StreamedBlocks streamedExperts() const;
@@ -50,6 +54,7 @@ private:
   metal::MetalBackend &backend_;
   WeightImages &images_;
   std::shared_ptr<Planned> planned_;
+  uint32_t layers_ = 0, firstMoeLayer_ = 0;
   bool float32Norms_ = false;
   ExpertStoreOptions experts_;
 };

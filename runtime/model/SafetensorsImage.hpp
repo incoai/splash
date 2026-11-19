@@ -8,8 +8,8 @@
 // tensors hold: MLX affine (metal/abi/QuantFormat.h), mxfp4 or nvfp4 as MLX
 // infers it, or NVFP4 or FP8 as the other two store them: projections and
 // experts as planes, a quantized token table as native rows. An unquantized
-// token table is copied as its bf16 rows. Norms are bf16 as MLX stores
-// them, or the F32 1 + w of the w transformers stores; the convolution and
+// token table is copied as its bf16 rows. Norms are bf16 as stored, or the
+// F32 1 + w of a w stored 1 below (float32Norms); the convolution and
 // dt_bias are copied as stored, and the GDN decay is
 // float(-exp(double(A_log))). The MoE router keeps the format it is stored
 // in, as native rows when quantized, which the float projection decodes; the
@@ -36,28 +36,35 @@ namespace splash::model::safetensors {
 inline constexpr std::string_view kMlxAffineFormats = "affine 2, 3, 4, 5, 6 or 8 bits in groups of 32, 64 or 128";
 inline constexpr std::string_view kMlxFloatFormats = "mxfp4 or nvfp4";
 
-// The names a checkpoint's language-model modules take: MLX's (mlx-lm,
-// mlx-vlm: language_model.model.*, the routed experts stacked under
-// mlp.switch_mlp), or transformers' (as NVIDIA's Model Optimizer keeps them:
-// model.language_model.*, lm_head, each routed expert a module mlp.experts.<e>
-// of its own), whose RMSNorm weights are stored 1 below the weights the norm
-// multiplies by, but the GDN's gated norm's.
-enum class ModuleNames : uint8_t { Mlx, Transformers };
+// The names a checkpoint's language-model modules take: mlx-vlm's
+// (language_model.model.*, language_model.lm_head) or mlx-lm's (model.*,
+// lm_head), the routed experts of both stacked under mlp.switch_mlp; or
+// transformers' (as NVIDIA's Model Optimizer keeps them:
+// model.language_model.*, lm_head, each routed expert a module
+// mlp.experts.<e> of its own).
+enum class ModuleNames : uint8_t { Mlx, MlxLm, Transformers };
 
-// The names the checkpoint's tensors take: transformers' when it holds
-// lm_head.weight (or compressed-tensors' NVFP4 lm_head.weight_packed).
+// The names the checkpoint's tensors take, by where its token table is:
+// language_model.model.embed_tokens (mlx-vlm's), model.language_model.
+// (transformers') or model.embed_tokens (mlx-lm's).
 [[nodiscard]] ModuleNames moduleNames(const SafetensorsCheckpoint &checkpoint);
 
-// Whether the images hold the norms as F32, as they hold a checkpoint's of
-// transformers names (their 1 + w, the GDN's gated norm widened), rather than
-// MLX's bf16 norms as stored.
-[[nodiscard]] constexpr bool float32Norms(ModuleNames names) noexcept { return names == ModuleNames::Transformers; }
+// Whether the images hold the norms as F32 rather than bf16 as stored, by
+// the names and the family whose GGUFs are of `architecture`: a checkpoint's whose RMSNorm weights are
+// stored 1 below the weights the norm multiplies by as their F32 1 + w, but
+// the GDN's gated norm's widened (transformers' checkpoints of the Qwen3.5
+// hybrid), and Flint's widened, as its GGUF's are; an MLX hybrid's, which
+// mlx-lm stores shifted to the multipliers, as stored.
+[[nodiscard]] bool float32Norms(ModuleNames names, std::string_view architecture);
 
-// The layers' images, then the head's and the embedding's. The checkpoint
-// outlives them: their rows read its tensors.
+// The layers' images, then the head's and the embedding's, of a target of
+// `geometry`, its norms as float32Norms holds them for `architecture` (its
+// layout's ggufArchitecture), the sections those its GGUF walk writes
+// (model/GgufImage.hpp), in their order. The checkpoint outlives them: their
+// rows read its tensors.
 [[nodiscard]] std::vector<gguf::Image> planImages(const SafetensorsCheckpoint &checkpoint,
                                                   const QwenTargetDimensions &geometry,
-                                                  gguf::PlanOptions options = {});
+                                                  std::string_view architecture, gguf::PlanOptions options = {});
 
 // The modules the images read only quantized, in their order and by `names`:
 // the layers' projections, the routed experts' (as a configuration names
@@ -65,7 +72,7 @@ enum class ModuleNames : uint8_t { Mlx, Transformers };
 // the shared expert's, and the head. planImages refuses a checkpoint holding
 // one unquantized, and the configuration check one its config.json states
 // unquantized (model/ModelDescriptor.mm). The router, the shared-expert gate,
-// GDN alpha and beta and the token table are not among them.
+// GDN alpha and beta, Flint's sinks and the token table are not among them.
 [[nodiscard]] std::vector<std::string> quantizedModules(const QwenTargetDimensions &geometry, ModuleNames names);
 
 } // namespace splash::model::safetensors

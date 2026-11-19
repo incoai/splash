@@ -93,7 +93,7 @@ StreamableWeights streamableWeights(const std::filesystem::path &root, const Mod
         }
         const SafetensorsCheckpoint checkpoint(directory);
         return targetWeights(
-            layout, [&](gguf::PlanOptions options) { return safetensors::planImages(checkpoint, layout, options); },
+            layout, [&](gguf::PlanOptions options) { return safetensors::planImages(checkpoint, layout, layout.ggufArchitecture, options); },
             streams);
       },
       descriptor.target);

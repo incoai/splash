@@ -10,6 +10,7 @@
 #include "metal/abi/QuantFormat.h"
 #include "model/DFlashDraft.hpp"
 #include "model/DraftCheckpoint.hpp"
+#include "model/Flint.hpp"
 #include "model/SafetensorsImage.hpp"
 #include "model/SafetensorsTarget.hpp"
 #include "model/VisionLoader.hpp"
@@ -18,6 +19,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
+#include <type_traits>
 #include <string>
 #include <utility>
 #include <vector>
@@ -114,7 +116,11 @@ inline std::vector<SyntheticTensor> draftTensors(const model::DFlashDraftLayout 
 // The tensors of an MLX target of layout as mlx-lm saves it, which
 // model/SafetensorsImage.cpp reads: bf16 norms, convolution, A_log and
 // dt_bias, and each quantized module's codes, scales and biases in the bits
-// and group size quantization(module) gives, as MLX packs them.
+// and group size quantization(module) gives, as MLX packs them. A Qwen
+// hybrid's names are mlx-vlm's (language_model.*); Flint's mlx-lm's (model.*,
+// lm_head), with its bf16 sinks and router, its leading dense layers and a
+// shared expert of its slices without a gate, as mlx-community's Flint holds
+// them.
 template <class Layout, class Quantization>
 std::vector<SyntheticTensor> mlxTargetTensors(const Layout &layout, Quantization quantization) {
   std::vector<SyntheticTensor> result;
@@ -130,19 +136,22 @@ std::vector<SyntheticTensor> mlxTargetTensors(const Layout &layout, Quantization
     bfloat16(module + ".scales", shape(columns / group));
     bfloat16(module + ".biases", shape(columns / group));
   };
+  constexpr bool flint = std::is_same_v<Layout, model::FlintLayout>;
+  const std::string language = flint ? "model." : "language_model.model.";
   const uint64_t hidden = layout.hiddenSize;
   for (uint32_t layer = 0; layer < layout.layers; ++layer) {
-    const std::string prefix = "language_model.model.layers." + std::to_string(layer) + ".";
+    const std::string prefix = language + "layers." + std::to_string(layer) + ".";
     bfloat16(prefix + "input_layernorm.weight", {hidden});
     if (layout.isFullAttentionLayer(layer)) {
       const std::string attention = prefix + "self_attn.";
       const uint64_t kv = uint64_t{layout.attentionKvHeads} * layout.attentionHeadDimension;
-      quantized(attention + "q_proj", 2ull * layout.attentionWidth, hidden);
+      quantized(attention + "q_proj", (layout.attentionGate ? 2ull : 1ull) * layout.attentionWidth, hidden);
       quantized(attention + "k_proj", kv, hidden);
       quantized(attention + "v_proj", kv, hidden);
       bfloat16(attention + "q_norm.weight", {layout.attentionHeadDimension});
       bfloat16(attention + "k_norm.weight", {layout.attentionHeadDimension});
       quantized(attention + "o_proj", hidden, layout.attentionWidth);
+      if (flint) bfloat16(attention + "softmax_offset", {layout.attentionQueryHeads});
     } else {
       const std::string gdn = prefix + "linear_attn.";
       quantized(gdn + "in_proj_qkv", layout.convolutionDimension, hidden);
@@ -162,18 +171,19 @@ std::vector<SyntheticTensor> mlxTargetTensors(const Layout &layout, Quantization
       quantized(projections + "up_proj", width, hidden, experts);
       quantized(projections + "down_proj", hidden, width, experts);
     };
-    if (layout.ffnKind == model::QwenFfnKind::SparseMoe) {
-      quantized(mlp + "gate", layout.experts, hidden);
+    if (layout.isMoeLayer(layer)) {
+      if (flint) bfloat16(mlp + "gate.weight", {layout.experts, hidden});
+      else quantized(mlp + "gate", layout.experts, hidden);
       ffn(mlp + "switch_mlp.", layout.expertIntermediateSize, layout.experts);
-      ffn(mlp + "shared_expert.", layout.expertIntermediateSize, 1);
-      quantized(mlp + "shared_expert_gate", 1, hidden);
+      ffn(mlp + "shared_expert.", uint64_t{layout.sharedExpertSlices} * layout.expertIntermediateSize, 1);
+      if (layout.sharedExpertGate) quantized(mlp + "shared_expert_gate", 1, hidden);
     } else {
       ffn(mlp, layout.intermediateSize, 1);
     }
   }
-  bfloat16("language_model.model.norm.weight", {hidden});
-  quantized("language_model.lm_head", layout.vocabularySize, hidden);
-  quantized("language_model.model.embed_tokens", layout.vocabularySize, hidden);
+  bfloat16(language + "norm.weight", {hidden});
+  quantized(flint ? "lm_head" : "language_model.lm_head", layout.vocabularySize, hidden);
+  quantized(language + "embed_tokens", layout.vocabularySize, hidden);
   return result;
 }
 
@@ -331,7 +341,8 @@ SyntheticAccounting writeSyntheticModel(const std::filesystem::path &root, const
   writeSyntheticShard(root / "vision" / "model.safetensors", visionTensors(vision));
   uint64_t targetBytes = 0;
   for (const model::gguf::Image &image :
-       model::safetensors::planImages(model::SafetensorsCheckpoint(root / "target"), target))
+       model::safetensors::planImages(model::SafetensorsCheckpoint(root / "target"), target,
+                                      target.ggufArchitecture))
     targetBytes += image.bytes;
   return {targetBytes, model::draftImageBytes(root / "draft", draft), model::visionImageBytes(vision)};
 }

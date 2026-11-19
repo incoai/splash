@@ -60,6 +60,9 @@ struct QwenTargetDimensions {
   // after its queries, by whose sigmoid the attention's output rows multiply
   // (Qwen3.5's attn_output_gate); else it holds the queries alone.
   bool attentionGate = true;
+  // Whether each attention layer holds a learned sink per query head, which
+  // its reduce adds (Flint's).
+  bool attentionSinks = false;
   // The rotated dimension pairs of each attention head and their RoPE base.
   uint32_t rotaryPairs = 0;
   float rotaryTheta = 0.0F;

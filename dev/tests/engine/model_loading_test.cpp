@@ -2,11 +2,13 @@
 #include "TestBuffers.hpp"
 #include "TestChecks.hpp"
 #include "TestCheckpoint.hpp"
+#include "model/Flint.hpp"
 #include "model/GgufImage.hpp"
 #include "model/GgufImageLayout.hpp"
 #include "model/ModelFactory.hpp"
 #include "model/ModelSizing.hpp"
 #include "model/SafetensorsImage.hpp"
+#include "model/SafetensorsTarget.hpp"
 #include "model/WeightImages.hpp"
 #include "model/WeightLayout.hpp"
 #include "model/WeightSource.hpp"
@@ -40,6 +42,8 @@
 namespace {
 
 using splash::model::DFlashDraftLayout;
+using splash::model::FlintLayout;
+using splash::model::FlintWeights;
 using splash::model::ModelDescriptor;
 using splash::model::WeightFile;
 using splash::model::WeightFileRecord;
@@ -959,7 +963,7 @@ void testSyntheticFloatModel(MetalBackend &backend, const std::filesystem::path 
     // weight_scale_2 and FP8 weight_scale, g of the tensor; compressed-tensors'
     // weight_global_scale, 1 / g, and its bf16 FP8 weight_scale, each row's g.
     const splash::model::SafetensorsCheckpoint safetensors(root / "target");
-    const std::vector<splash::model::gguf::Image> images = splash::model::safetensors::planImages(safetensors, target);
+    const std::vector<splash::model::gguf::Image> images = splash::model::safetensors::planImages(safetensors, target, target.ggufArchitecture);
     const auto rowsOf = [&](const std::string &module) {
         for (const splash::model::gguf::Image &image : images)
             for (const splash::model::gguf::Repack &repack : image.repacks)
@@ -1006,7 +1010,7 @@ void testSyntheticFloatMoeModel(MetalBackend &backend, const std::filesystem::pa
     }
     const splash::model::SafetensorsCheckpoint safetensors(root / "target");
     uint32_t stacks = 0;
-    for (const splash::model::gguf::Image &image : splash::model::safetensors::planImages(safetensors, target))
+    for (const splash::model::gguf::Image &image : splash::model::safetensors::planImages(safetensors, target, target.ggufArchitecture))
         for (const splash::model::gguf::Repack &repack : image.repacks) {
             if (repack.sources.empty() || repack.sources.front().name.find(".experts.") == std::string::npos) continue;
             ++stacks;
@@ -1086,6 +1090,101 @@ void testSyntheticBlockMoeModel(MetalBackend &backend, const std::filesystem::pa
             "streamableWeights is not what an MLX block MoE target loads");
 }
 
+// An MLX Flint (mlx-community's, of mlx-lm's names) loads as the block images
+// its GGUF's do: every layer's ungated attention with its sinks, the bf16
+// values widened to the F32 the attention reads, its norms widened to the F32
+// its GGUF's hold, for which alone its kernel shapes are compiled,
+// the leading layers' dense FFN and the others' MoE of 3-bit experts, its
+// bf16 router as stored and its shared expert two slices of the routed
+// width, without a gate; its streamed experts are the MoE layers' alone, and
+// streamableWeights plans the bytes it loads.
+void testSyntheticFlintModel(MetalBackend &backend, const std::filesystem::path &root) {
+    FlintLayout target;
+    target.layers = 4;
+    target.hiddenSize = 256;
+    target.vocabularySize = 256;
+    target.attentionWidth = 512; // four query heads of 128
+    target.attentionQueryHeads = 4;
+    target.attentionKvHeads = 1;
+    target.attentionHeadDimension = 128;
+    target.packedFullWidth = 512 + 2 * 128;
+    target.slidingWindow = 33;
+    target.slidingLayers = 0b0110;
+    target.unrotatedLayers = 0b1001;
+    target.firstDraftMaskToken = 240;
+    target.lastDraftMaskToken = 255;
+    target.maskToken = 240;
+    target.stopTokens = {1, 2};
+    target.intermediateSize = 256;
+    target.experts = 8;
+    target.expertsPerToken = 2;
+    target.expertIntermediateSize = 256;
+    target.leadingDenseLayers = 2;
+    const auto bitsAndGroup = [](const std::string &module) {
+        return module.find(".switch_mlp.") != std::string::npos ? std::pair{3u, 64u}
+               : module.ends_with("embed_tokens")                 ? std::pair{8u, 64u}
+                                                                  : std::pair{4u, 64u};
+    };
+    std::vector<SyntheticTensor> tensors = splash::test::mlxTargetTensors(target, bitsAndGroup);
+    // Each query head's sink a bf16 value of its own: head h's h + 1.5.
+    const auto sinkOf = [](uint32_t head) { return static_cast<float>(head) + 1.5F; };
+    for (SyntheticTensor &tensor : tensors)
+        if (tensor.name.ends_with("softmax_offset"))
+            for (uint32_t head = 0; head < target.attentionQueryHeads; ++head) {
+                const float value = sinkOf(head);
+                uint32_t bits;
+                std::memcpy(&bits, &value, sizeof bits);
+                tensor.data.push_back(static_cast<uint8_t>(bits >> 16));
+                tensor.data.push_back(static_cast<uint8_t>(bits >> 24));
+            }
+    const ModelDescriptor descriptor = writeBlockModel(root, target, tensors);
+    const uint64_t planned = splash::model::streamableWeights(root, descriptor, {}).loadedBytes;
+    const auto model = loadModel(backend, root, descriptor);
+    const auto &weights = std::get<FlintWeights>(model.target);
+    const uint32_t af4g64 = quant_affine_format_of(4, 64), af3g64 = quant_affine_format_of(3, 64);
+    for (uint32_t index = 0; index < target.layers; ++index) {
+        const auto &layer = weights.layers[index];
+        const auto &attention = std::get<QwenAttentionWeights>(layer.mixer);
+        const auto *sinks = static_cast<const float *>(attention.sinks.contents());
+        bool widened = attention.sinks.sizeBytes() >= target.attentionQueryHeads * sizeof(float);
+        for (uint32_t head = 0; widened && head < target.attentionQueryHeads; ++head)
+            widened = sinks[head] == sinkOf(head);
+        require(widened && segmentFormats(attention.inputProjection) ==
+                               std::vector<uint32_t>{af4g64, af4g64, af4g64} &&
+                    attention.inputProjection.outputSize == target.packedFullWidth && layer.inputNorm.float32 &&
+                    layer.postAttentionNorm.float32 && attention.queryNorm.float32,
+                "an MLX Flint layer did not read its ungated attention, its F32 sinks and its F32 norms");
+        const splash::ops::BlockMoeWeights *moe = splash::model::qwenMoeBlock(layer);
+        require((moe != nullptr) == (index >= target.leadingDenseLayers) &&
+                    splash::model::denseFfn(layer).has_value() == (index < target.leadingDenseLayers),
+                "an MLX Flint layer did not read its dense FFN or its MoE");
+        if (!moe) continue;
+        require(moe->gate.routed.formatId == af3g64 && moe->down.routed.formatId == af3g64 &&
+                    moe->router.isFloat() && moe->router.formatId == GGUF_FMT_BF16 &&
+                    moe->down.shared.formatId == af4g64,
+                "an MLX Flint MoE did not keep its 3-bit experts, its bf16 router and its shared expert");
+    }
+    require(declaredBytes(weights.files) + declaredBytes(model.draft.files) == planned,
+            "streamableWeights is not what an MLX Flint loads");
+    const splash::model::SafetensorsCheckpoint safetensors(root / "target");
+    const std::vector<splash::model::gguf::Image> images =
+        splash::model::safetensors::planImages(safetensors, target, target.ggufArchitecture);
+    const auto repackOf = [&](uint32_t layer, const std::string &module) -> const splash::model::gguf::Repack * {
+        for (const splash::model::gguf::Repack &repack : images[layer].repacks)
+            if (!repack.sources.empty() && repack.sources.front().name == module) return &repack;
+        return nullptr;
+    };
+    const auto *down = repackOf(2, "model.layers.2.mlp.shared_expert.down_proj");
+    require(down && down->rows == 2 * target.hiddenSize && down->columns == target.expertIntermediateSize &&
+                down->sources.size() == 2 && down->sources[0].windows == 2 && down->sources[1].window == 1,
+            "an MLX Flint's shared expert down projection is not two slices of the routed width");
+    splash::model::WeightImages streamedImages(backend, "sources");
+    splash::model::SafetensorsTargetLoader streamed(backend, streamedImages, root / "target", target,
+                                                     target.ggufArchitecture, {.memoryBytes = 64ull << 20});
+    require(streamed.streamedExperts().blocks.size() == target.layers - target.leadingDenseLayers,
+            "an MLX Flint's streamed experts are not its MoE layers'");
+}
+
 int main(int argc, const char *argv[]) {
     if (argc != 3) {
         std::cerr << "usage: model_loading_test <test.metallib> <splash.metallib>\n";
@@ -1105,6 +1204,7 @@ int main(int argc, const char *argv[]) {
         testSyntheticModel(production, temporary.path() / "model");
         testSyntheticBlockModel(production, temporary.path() / "block-model");
         testSyntheticBlockMoeModel(production, temporary.path() / "block-moe-model");
+        testSyntheticFlintModel(production, temporary.path() / "flint-model");
         for (const auto checkpoint : {splash::test::FloatCheckpoint::ModelOptimizer,
                                       splash::test::FloatCheckpoint::CompressedTensors}) {
             const std::string at = checkpoint == splash::test::FloatCheckpoint::ModelOptimizer ? "model-optimizer"

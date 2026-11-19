@@ -428,7 +428,9 @@ uint32_t ggufRoutedExperts(NSDictionary *text, const QwenHybridLayout &target) {
 // each projection and the head), so before any weight download; any other
 // module's, such as the router's, the shared-expert gate's, GDN alpha's and
 // beta's or the token table's, which the images read unquantized too, is
-// accepted.
+// accepted. A config does not say which names its checkpoint's tensors take
+// (safetensors::moduleNames reads them from the tensors), so a module is
+// looked up by mlx-vlm's names and by mlx-lm's.
 void requireMlxQuantization(NSDictionary *quantization, const QwenTargetDimensions &geometry) {
   const auto require = [](NSDictionary *entry, const std::string &label, bool module) {
     NSString *mode = entry[@"mode"] ?: @"affine";
@@ -449,12 +451,13 @@ void requireMlxQuantization(NSDictionary *quantization, const QwenTargetDimensio
   for (NSString *module in quantization)
     if ([quantization[module] isKindOfClass:[NSDictionary class]])
       require(quantization[module], "quantization " + std::string(module.UTF8String ?: ""), true);
-  for (const std::string &module : safetensors::quantizedModules(geometry, safetensors::ModuleNames::Mlx)) {
-    id entry = quantization[@(module.c_str())];
-    if (entry && ![entry isKindOfClass:[NSDictionary class]])
-      throw std::invalid_argument("quantization " + module +
-                                  " is unquantized; Splash loads quantized MLX projections");
-  }
+  for (const safetensors::ModuleNames names : {safetensors::ModuleNames::Mlx, safetensors::ModuleNames::MlxLm})
+    for (const std::string &module : safetensors::quantizedModules(geometry, names)) {
+      id entry = quantization[@(module.c_str())];
+      if (entry && ![entry isKindOfClass:[NSDictionary class]])
+        throw std::invalid_argument("quantization " + module +
+                                    " is unquantized; Splash loads quantized MLX projections");
+    }
 }
 
 // The projections a configuration names for a layer's routed experts
@@ -624,7 +627,8 @@ void requireCompressedTensorsQuantization(NSDictionary *quantization, const Qwen
   if (![ignoreEntries isKindOfClass:[NSArray class]])
     throw std::invalid_argument("quantization_config ignore must be an array");
   const ModuleMatcher ignore(ignoreEntries, "quantization_config ignore");
-  for (const std::string &module : safetensors::quantizedModules(geometry, safetensors::ModuleNames::Transformers)) {
+  for (const std::string &module :
+       safetensors::quantizedModules(geometry, safetensors::ModuleNames::Transformers)) {
     const std::vector<std::string> names =
         module.ends_with(".experts") ? expertProjections(module, geometry) : std::vector<std::string>{module};
     for (const std::string &name : names)
@@ -639,15 +643,15 @@ void requireCompressedTensorsQuantization(NSDictionary *quantization, const Qwen
 // quantization_config of Model Optimizer or compressed-tensors. A checkpoint
 // with none of them holds BF16 weights, or another method's that a
 // transformers quantization_config states (GPTQ, AWQ, ...).
-void requireQuantization(NSDictionary *config, const QwenTargetDimensions &geometry) {
+template <class Layout> void requireQuantization(NSDictionary *config, const Layout &layout) {
   NSDictionary *mlxQuantization = config[@"quantization"];
-  if ([mlxQuantization isKindOfClass:[NSDictionary class]]) return requireMlxQuantization(mlxQuantization, geometry);
+  if ([mlxQuantization isKindOfClass:[NSDictionary class]]) return requireMlxQuantization(mlxQuantization, layout);
   NSDictionary *quantization = config[@"quantization_config"];
   if ([quantization isKindOfClass:[NSDictionary class]]) {
     if ([quantization[@"quant_method"] isEqual:@"modelopt"])
-      return requireModelOptimizerQuantization(quantization, geometry);
+      return requireModelOptimizerQuantization(quantization, layout);
     if ([quantization[@"quant_method"] isEqual:@"compressed-tensors"])
-      return requireCompressedTensorsQuantization(quantization, geometry);
+      return requireCompressedTensorsQuantization(quantization, layout);
   }
   throw std::invalid_argument("this model requires an MLX checkpoint (" + std::string(safetensors::kMlxAffineFormats) +
                               ", " + std::string(safetensors::kMlxFloatFormats) +
