@@ -99,20 +99,25 @@ void testStateWithoutACacheSlotGoesToDisk() {
           "the prefix was not restored from the disk state");
   // A rolling checkpoint denied a cache slot goes to disk like any state,
   // and stays there beside the replay state of the same prompt, as the
-  // prompt's last checkpoint.
+  // prompt's last checkpoints: its tail at 7936, denied one inside its
+  // command, ends it there to go to disk from the lane beside the one at
+  // 4096. That moves the replay point at 8192 from a command's end into the
+  // next command, which it ends too: two capture cuts.
+  const uint64_t cuts = counters.captureCuts;
   engine.submit(request(4, std::vector<uint32_t>(2 * kPrefillCheckpointTokens + 1, 4)));
   runUntilIdle(engine);
   counters = engine.snapshot();
-  require(counters.checkpointPublications == 1 &&
-              counters.checkpointPublicationFailures == 0 &&
-              counters.diskStatePublications == 3 && executor.diskSnapshots == 3 &&
-              counters.resources.stateCache.checkpointEntries == 1 &&
+  require(counters.checkpointPublications == 2 &&
+              counters.checkpointPublicationFailures == 0 && counters.captureCuts == cuts + 2 &&
+              counters.diskStatePublications == 4 && executor.diskSnapshots == 4 &&
+              counters.resources.stateCache.checkpointEntries == 2 &&
               counters.resources.stateCache.checkpointRetirements == 0 &&
               events.completedCount == 4 && events.failedCount == 0,
           "the checkpoint did not go to disk and stay there");
 }
 
-// A state already on disk at the same block is deduplicated, not written again.
+// A state already on disk at the same block is deduplicated, not written again: the prompt's tail
+// checkpoint and its replay state are each written once.
 void testStateAlreadyOnDiskIsDeduplicated() {
   test::TestKvStorage storage(512, 4096, 4);
   KvPool pool(storage, 0);
@@ -137,9 +142,9 @@ void testStateAlreadyOnDiskIsDeduplicated() {
               executor.prefillRows == 2 * prompt.size(),
           "both lanes did not compute the prompt");
   const auto counters = engine.snapshot();
-  require(executor.diskSnapshots == 1 && counters.diskStatePublications == 1 &&
-              counters.replayStatePublications == 1 &&
-              counters.deduplicatedStatePublications == 1,
+  require(executor.diskSnapshots == 2 && counters.diskStatePublications == 2 &&
+              counters.replayStatePublications == 1 && counters.checkpointPublications == 1 &&
+              counters.deduplicatedStatePublications == 2,
           "a state already on disk was counted as written");
 }
 
@@ -206,7 +211,9 @@ void testFailedFinalStateKeepsTheDiskCheckpoint() {
     Events events;
     engine::Engine engine(test::engineConfig(), cache, executor, events);
     guardReleases(storage, engine);
-    const std::vector<uint32_t> prompt(2 * kPrefillCheckpointTokens + 1, 65);
+    // A checkpoint at 4096, the replay point at 6272: too near it for a tail
+    // checkpoint, which would replace it.
+    const std::vector<uint32_t> prompt(6273, 65);
     EngineRequest decoding = request(610, prompt);
     decoding.maxNewTokens = 64;
     engine.submit(decoding);
@@ -308,7 +315,8 @@ void testDiskCheckpointStaysUntilItsSuccessorIsPublished() {
 }
 
 // No checkpoint is planned within a prefill chunk of the replay boundary; one a chunk or more away
-// is published, in RAM or on disk, beside the replay state.
+// is published, in RAM or on disk, beside the replay state, and so is the tail checkpoint 256 before
+// it when no checkpoint is.
 void testNoCheckpointWithinAChunkOfTheReplayBoundary() {
   const uint32_t chunk = model::ExecutionLimits::prefillTokenBudget;
   for (bool denyRam : {false, true}) {
@@ -327,14 +335,16 @@ void testNoCheckpointWithinAChunkOfTheReplayBoundary() {
       engine.submit(request(1, prompt));
       runUntilIdle(engine);
       const auto counters = engine.snapshot();
-      const uint64_t checkpoint = remaining >= chunk;
-      require(counters.checkpointPublications == checkpoint &&
+      const std::vector<uint32_t> atCheckpoint(kPrefillCheckpointTokens + 1, 71);
+      require((cache.probe(atCheckpoint, {}).cachedTokens() == kPrefillCheckpointTokens) ==
+                      (remaining >= chunk) &&
+                  counters.checkpointPublications == 1 &&
                   counters.checkpointPublicationFailures == 0 &&
                   counters.replayStatePublications == 1 &&
                   counters.replayStatePublicationFailures == 0 &&
-                  executor.diskSnapshots == (denyRam ? 1 + checkpoint : 0) &&
-                  counters.resources.stateCache.entries == 1 + checkpoint &&
-                  counters.resources.stateCache.checkpointEntries == checkpoint &&
+                  executor.diskSnapshots == (denyRam ? 2 : 0) &&
+                  counters.resources.stateCache.entries == 2 &&
+                  counters.resources.stateCache.checkpointEntries == 1 &&
                   events.completedCount == 1 && events.failedCount == 0,
               "a checkpoint within a chunk of the replay boundary was planned or the final "
               "state was lost");
@@ -348,8 +358,8 @@ void testNoCheckpointWithinAChunkOfTheReplayBoundary() {
   }
 }
 
-// A lane cancelled past a skipped near-final checkpoint resumes from the checkpoint before it, in
-// RAM or on disk.
+// A lane cancelled past a skipped near-final checkpoint resumes from the tail checkpoint beside
+// the checkpoint before it, in RAM or on disk.
 void testSkippedCheckpointKeepsPreviousRecoveryPoint() {
   for (bool disk : {false, true}) {
     test::TestKvStorage storage(512, 4096, 4);
@@ -364,36 +374,39 @@ void testSkippedCheckpointKeepsPreviousRecoveryPoint() {
     Events events;
     engine::Engine engine(test::engineConfig(), cache, executor, events);
     guardReleases(storage, engine);
+    // Checkpoints at 4096 and the tail's at 7968, the replay point at 8224. On
+    // disk the tail, refused RAM, ends its command to be taken from the lane,
+    // which the next command takes past 8192.
     const std::vector<uint32_t> prompt(2 * kPrefillCheckpointTokens + 33, 73);
+    const uint32_t tail = 2 * kPrefillCheckpointTokens + 32 - kTrimmedTailTokens;
+    const uint32_t cancelAt = disk ? tail : 2 * kPrefillCheckpointTokens;
     engine.submit(request(1, prompt));
     for (uint32_t step = 0; step < 128; ++step) {
       static_cast<void>(engine.tick(step + 1));
-      if (!engine.commandInFlight() &&
-          executor.requests.at(1).position == 2 * kPrefillCheckpointTokens)
+      if (!engine.commandInFlight() && executor.requests.at(1).position == cancelAt)
         break;
     }
     const auto before = engine.snapshot();
-    require(!engine.commandInFlight() &&
-                executor.requests.at(1).position == 2 * kPrefillCheckpointTokens &&
+    require(!engine.commandInFlight() && executor.requests.at(1).position == cancelAt &&
                 std::none_of(executor.plans.at(1).boundaries.begin(),
                              executor.plans.at(1).boundaries.end(),
                              [](const DraftBoundaryPlan &boundary) {
                                return boundary.boundary == 2 * kPrefillCheckpointTokens;
                              }) &&
-                before.checkpointPublications == 1 &&
+                before.checkpointPublications == 2 &&
                 before.checkpointPublicationFailures == 0 &&
-                before.resources.stateCache.checkpointEntries == 1 &&
+                before.resources.stateCache.checkpointEntries == 2 &&
                 before.resources.stateCache.checkpointRetirements == 0 &&
-                executor.diskSnapshots == (disk ? 1 : 0),
+                before.captureCuts == (disk ? 1 : 0) && executor.diskSnapshots == (disk ? 2 : 0),
             "a near-final checkpoint was planned or replaced its predecessor");
     engine.cancel(1);
     runUntilIdle(engine);
     engine.submit(request(2, prompt));
     runUntilIdle(engine);
-    require(events.starts.back() == kPrefillCheckpointTokens &&
+    require(events.starts.back() == tail &&
                 engine.snapshot().cancelled == 1 && engine.snapshot().completed == 1 &&
                 events.failedCount == 0 &&
-                cache.snapshot().stateCache.checkpointEntries == 1,
+                cache.snapshot().stateCache.checkpointEntries == 2,
             "cancellation after a skipped checkpoint lost the earlier recovery point");
   }
 }
@@ -588,6 +601,105 @@ void tickBesideALaneAhead(engine::Engine &engine, test::TestKvTier &tier, double
     tier.complete();
     static_cast<void>(engine.tick(++now));
   }
+}
+
+// A request's last rolling checkpoint, kept beside its tail checkpoint, is secondary: a persistent
+// tier copies it behind the replay point, once, and the tail stays in RAM alone.
+void testKeptRollingCheckpointIsWrittenBehind() {
+  test::TestKvStorage storage{1024, 4096, 4};
+  KvPool pool{storage, 0};
+  test::TestKvTier tier(true);
+  tier.transferLimit = 64;
+  tier.capacity = 512;
+  engine::Cache cache(pool, &tier, test::ampleDiskBudget());
+  Executor executor;
+  executor.keptTier = std::make_shared<OffloadControl>();
+  executor.keptTier->ready = true;
+  Events events;
+  engine::Engine engine(test::engineConfig({.maxContext = 102400}), cache, executor, events);
+  guardReleases(storage, engine);
+  const uint64_t diskBytes = cache.snapshot().stateCache.diskBytes;
+  // A checkpoint at 4096, the tail's at 8736, the replay point at 8992.
+  std::vector<uint32_t> prompt(9000);
+  std::iota(prompt.begin(), prompt.end(), 1);
+  engine.submit(request(1, prompt));
+  double now = 1;
+  tickUntil(engine, now, [&] { return idle(engine); }, "the request did not finish");
+  const std::vector<uint32_t> kept(prompt.begin(), prompt.begin() + 4097);
+  const std::vector<uint32_t> tail(prompt.begin(), prompt.begin() + 8737);
+  const auto blockOf = [&](const std::vector<uint32_t> &tokens) {
+    return cache.lookup(tokens, {}).state->kvBlock();
+  };
+  require(engine.snapshot().writeBehind.waiting == 2 && cache.secondaryCheckpoint(blockOf(kept)) &&
+              !cache.secondaryCheckpoint(blockOf(tail)),
+          "the kept rolling checkpoint was not queued behind the replay point as secondary");
+  now += WriteBehind::kDelayMilliseconds;
+  for (uint32_t step = 0; step < 256 && engine.snapshot().writeBehind.durable < 2; ++step) {
+    tier.complete();
+    static_cast<void>(engine.tick(++now));
+  }
+  require(engine.snapshot().writeBehind.durable == 2 && engine.snapshot().writeBehind.waiting == 0 &&
+              cache.snapshot().stateCache.diskBytes == diskBytes + 2 * 64,
+          "the kept rolling checkpoint and the replay point were not each written once, or the tail was");
+}
+
+// A kept rolling checkpoint queued as a secondary point, made ordinary since and published again as
+// an ordinary point, keeps its one queue entry and is still written behind.
+void testSecondaryPointMadeOrdinaryIsStillWrittenBehind() {
+  test::TestKvStorage storage{256, 4096, 4};
+  KvPool pool{storage, 0};
+  test::TestKvTier tier(true);
+  tier.capacity = 256;
+  engine::Cache cache(pool, &tier, test::ampleDiskBudget());
+  WriteBehind writeBehind(cache);
+  const auto control = std::make_shared<OffloadControl>();
+  control->ready = true;
+  const std::vector<uint32_t> prompt(4096, 3);
+  cache.beginRequest(1);
+  require(cache.ensureTokens(1, prompt.size()).granted(), "the point's KV was not granted");
+  const uint64_t block = test::publishBlocks(cache, 1, prompt, static_cast<uint32_t>(prompt.size()));
+  cache.publishCompositeState(block, std::make_shared<test::KeptState>(control), true);
+  cache.endRequest(1);
+  cache.markSecondaryCheckpoint(block);
+  writeBehind.published(block, 4096, 0, true);
+  require(cache.reuseStoredState(block) && !cache.secondaryCheckpoint(block),
+          "the secondary checkpoint was not made ordinary");
+  writeBehind.published(block, 4096, 1);
+  for (uint32_t step = 0; step < 256 && !writeBehind.snapshot().durable; ++step) {
+    tier.complete();
+    static_cast<void>(cache.pollTransfers());
+    static_cast<void>(writeBehind.run(WriteBehind::kDelayMilliseconds + step, 0, false));
+  }
+  require(writeBehind.snapshot().durable == 1 && writeBehind.snapshot().unneeded == 0 &&
+              writeBehind.snapshot().waiting == 0,
+          "a secondary point made ordinary was given up instead of written");
+}
+
+// While the one state write is in flight the SSD refuses another, so a tail checkpoint refused RAM
+// inside its command is dropped instead of ending the command for a write that cannot start.
+void testTailIsDroppedWhileAStateWriteIsInFlight() {
+  test::TestKvStorage storage(1024, 4096, 4);
+  KvPool pool(storage, 0);
+  engine::Cache cache(pool, nullptr, nullptr);
+  Executor executor;
+  executor.deniedReservations = 1000;
+  executor.stateTier = std::make_shared<OffloadControl>();
+  Events events;
+  engine::Engine engine(test::engineConfig(), cache, executor, events);
+  guardReleases(storage, engine);
+  engine.submit(request(1, std::vector<uint32_t>(65, 1)));
+  runUntilIdle(engine);
+  require(engine.snapshot().diskStatePublications == 1 && cache.stateWriting(),
+          "the first state's write did not stay in flight");
+  // Its replay point, at 64 of 65 tokens, ended its command to go to disk.
+  const uint64_t cuts = engine.snapshot().captureCuts;
+  // Its tail checkpoint at 7936 lies inside the command [6144, 8192), its
+  // checkpoint at 4096 and its replay point at 8192 at commands' ends.
+  engine.submit(request(2, std::vector<uint32_t>(2 * kPrefillCheckpointTokens + 1, 2)));
+  runUntilIdle(engine);
+  require(engine.snapshot().captureCuts == cuts && executor.prefillChunks.at(2) == 5 &&
+              events.completedCount == 2 && events.failedCount == 0,
+          "a tail the SSD could not take ended its command");
 }
 
 // A replay point is copied behind its request: a persistent tier's after its delay, a temporary
@@ -2311,6 +2423,9 @@ std::span<const test::TestCase> diskTests() {
       {"testWaitingLaneAlwaysNamesAWakeup", testWaitingLaneAlwaysNamesAWakeup},
       {"testReplayPointsAreWrittenBehind", testReplayPointsAreWrittenBehind},
       {"testReplyStateLeavesTheReplayPointWrittenBehind", testReplyStateLeavesTheReplayPointWrittenBehind},
+      {"testKeptRollingCheckpointIsWrittenBehind", testKeptRollingCheckpointIsWrittenBehind},
+      {"testSecondaryPointMadeOrdinaryIsStillWrittenBehind", testSecondaryPointMadeOrdinaryIsStillWrittenBehind},
+      {"testTailIsDroppedWhileAStateWriteIsInFlight", testTailIsDroppedWhileAStateWriteIsInFlight},
       {"testFinishedConversationsLeaveAtOnce", testFinishedConversationsLeaveAtOnce},
       {"testCopiesAheadWaitForALaneRefusedBesideOthers", testCopiesAheadWaitForALaneRefusedBesideOthers},
       {"testCopiesAheadWaitNoLongerThanTheWaitsLimit", testCopiesAheadWaitNoLongerThanTheWaitsLimit},

@@ -254,6 +254,7 @@ bool StateCache::checkpointPinned(StateCheckpoint checkpoint) const noexcept {
 
 void StateCache::makeOrdinary(uint64_t kvBlock, Entry &entry) {
   kv_.noteState(kvBlock);
+  entry.secondary = false;
   if (!entry.checkpoint)
     return;
   --checkpointEntries_;
@@ -286,6 +287,52 @@ uint64_t StateCache::resumePoint() const noexcept {
 bool StateCache::ordinary(uint64_t kvBlock) const noexcept {
   const auto found = entries_.find(kvBlock);
   return found != entries_.end() && !found->second.invalid && !found->second.checkpoint;
+}
+
+void StateCache::markSecondary(uint64_t kvBlock) noexcept {
+  const auto found = entries_.find(kvBlock);
+  if (found == entries_.end() || found->second.invalid || !found->second.checkpoint ||
+      found->second.secondary)
+    return;
+  found->second.secondary = true;
+  reindex(kvBlock, found->second);
+}
+
+void StateCache::clearSecondary(uint64_t kvBlock) noexcept {
+  const auto found = entries_.find(kvBlock);
+  if (found == entries_.end() || !found->second.secondary)
+    return;
+  found->second.secondary = false;
+  reindex(kvBlock, found->second);
+}
+
+void StateCache::markBranchPoint(uint64_t kvBlock) noexcept {
+  if (const auto found = entries_.find(kvBlock); found != entries_.end() && !found->second.invalid)
+    found->second.branchPoint = true;
+}
+
+void StateCache::recordBranchPoint(uint64_t kvBlock, uint64_t branchPoint) noexcept {
+  if (const auto found = entries_.find(kvBlock); found != entries_.end() && !found->second.branchPoint)
+    found->second.branchParent = branchPoint;
+}
+
+uint64_t StateCache::branchPointOf(uint64_t kvBlock) const noexcept {
+  const auto found = entries_.find(kvBlock);
+  if (found == entries_.end() || found->second.invalid)
+    return 0;
+  return found->second.branchPoint ? kvBlock : found->second.branchParent;
+}
+
+void StateCache::retireBranchPoint(uint64_t kvBlock) noexcept {
+  const auto found = entries_.find(kvBlock);
+  if (found == entries_.end() || !found->second.branchPoint || found->second.pins || inUse(kvBlock))
+    return;
+  static_cast<void>(erase(kvBlock, true));
+}
+
+bool StateCache::secondary(uint64_t kvBlock) const noexcept {
+  const auto found = entries_.find(kvBlock);
+  return found != entries_.end() && !found->second.invalid && found->second.secondary;
 }
 
 uint64_t StateCache::bytes(uint64_t kvBlock) const noexcept {

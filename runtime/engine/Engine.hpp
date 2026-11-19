@@ -32,6 +32,13 @@ inline constexpr uint32_t kPrefillCheckpointTokens =
 static_assert(kPrefillCheckpointTokens >= model::ExecutionLimits::draftContextTokens &&
                   kPrefillCheckpointTokens % KvCache::pageTokens == 0,
               "a prefill checkpoint interval spans a draft window and whole KV pages");
+// A checkpoint sits this many tokens before a prompt's replay boundary
+// (addTailCheckpoint): an agent's next turn that rewrites the tail of this
+// prompt's last message, as one trims a ~60-token status block, restores
+// within this distance of where it diverges.
+inline constexpr uint32_t kTrimmedTailTokens = 256;
+static_assert(kTrimmedTailTokens % KvCache::pageTokens == 0,
+              "a tail checkpoint sits on a KV page boundary");
 // How long a request waits for memory before it fails, and a resident
 // drain lasts, by default.
 inline constexpr double kResourceWaitTimeoutMilliseconds = 30000.0;
@@ -394,6 +401,9 @@ private:
       // leaves the last one cached when its own state fits beside it.
       // Otherwise a state a later request resumes from.
       bool disposable = false;
+      // The tail checkpoint addTailCheckpoint planned, which retires no
+      // checkpoint before it.
+      bool tail = false;
     };
 
     EngineRequest request;
@@ -518,6 +528,19 @@ private:
     // to render its own reply back, so its end keeps that reply's last state
     // (Cache::keepReply).
     bool rendersReplies = false;
+    // The boundary of latestCheckpoint, which keptCheckpoint records.
+    uint32_t latestCheckpointTokens = 0;
+    // latestCheckpoint is the tail checkpoint this request published.
+    bool latestCheckpointTail = false;
+    // The rolling checkpoint the tail checkpoint kept, secondary, which the
+    // replay point's publication queues on the write-behind; secondary no
+    // more if the request ends before that.
+    StateCheckpoint keptCheckpoint;
+    uint32_t keptCheckpointTokens = 0;
+    // The block of the newest restored checkpoint kept as a branch point on
+    // this request's chain (completeAdmission), which its states record, so
+    // a conversation keeps one at a time; 0 for none.
+    uint64_t branchPoint = 0;
     // The block of the prompt's replay boundary, where the conversation's
     // next turn resumes: its state is in use from the moment the request
     // reaches, reuses or restores it until the request ends, suspended or not.
@@ -770,6 +793,13 @@ private:
   // replayStateBoundary while the lane replays only its prompt.
   [[nodiscard]] static uint32_t
   promptReplayBoundary(const Request &request) noexcept;
+  // Where the tail checkpoint sits, kTrimmedTailTokens before the prompt's
+  // replay boundary (addTailCheckpoint); 0 for a prompt too short for one.
+  [[nodiscard]] static uint32_t tailBoundary(const Request &request) noexcept;
+  // The lane's checkpoint is the tail checkpoint it published, which the
+  // ledger keeps: the replay point takes its buffers only once the ledger
+  // freed nothing for its own.
+  [[nodiscard]] static bool holdsTailCheckpoint(const Request &request) noexcept;
   [[nodiscard]] static uint32_t sharedPrefillBoundary(const Request &left,
                                                       const Request &right);
   // An unstarted request waits while a resident producer has yet to publish
@@ -795,6 +825,11 @@ private:
   [[nodiscard]] DraftContextPlan
   configureDraftStatePlan(Request &request, uint32_t stateBoundary,
                           uint32_t junctionBoundary);
+  // Plans a disposable checkpoint kTrimmedTailTokens before the prompt's
+  // replay boundary, for a next turn that rewrites this prompt's tail, a
+  // prefill chunk or more past the state planned before it (or
+  // `stateBoundary`). It retires no checkpoint before it.
+  void addTailCheckpoint(Request &request, uint32_t stateBoundary);
   // Plans a state at `tokens`, past `after` and no later than the replay
   // boundary, keeping the plan in order; a boundary planned both ways is
   // reusable. A new one needs a whole draft window: unless the lane's draft
@@ -877,9 +912,13 @@ private:
   // later one follows the state before it in the command. A checkpoint whose
   // predecessor a reader pins takes only the pool or the admission too:
   // refused, its command ends at it, and apply publishes it from the lane
-  // only if the pin has gone by then. Null buffers when refused.
+  // only if the pin has gone by then. Null buffers when refused. The tail
+  // checkpoint (`tail`), and the replay point that follows it as the lane's
+  // checkpoint, take what the ledger frees all the same: the tail is worth
+  // the lane's recovery point, and refused, it is dropped unless the SSD
+  // can take it from the lane.
   [[nodiscard]] Reservation reserveCapture(Request &request, StateClass kind, uint32_t tokens,
-                                           bool followsCheckpoint, bool supersedes);
+                                           bool followsCheckpoint, bool supersedes, bool tail);
   // Reserves the buffers of the state a decoding lane captures in its next
   // cycle (Model::capturesInDecode): at the next page past the tokens it
   // holds, when the rows it may retain reach it. Its claim is a
@@ -887,6 +926,10 @@ private:
   // nothing is freed for one.
   void reserveReplyCapture(Request &request, std::vector<StateCapture> &states,
                            std::vector<LaneCapture> &captures, bool supersedes);
+  // Pins the lane's recovery checkpoint, its latestCheckpoint, while a claim
+  // made before its command ends lets the ledger free: no reclaim takes it
+  // until the lease goes. One lease per such claim, at most one a prompt.
+  [[nodiscard]] std::optional<CompositeStateLease> keepRecoveryPoint(const Request &request);
   // The claim of a state's buffers of class `kind`: the prompt's replay
   // point, the state the request's next turn resumes from, is work in
   // service that may wait for memory on its way back and reaches what is in

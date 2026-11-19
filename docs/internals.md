@@ -2349,19 +2349,50 @@ Higher-priority work does not wait for a lower-priority producer. `/status` expo
 
 Long prefill uses disposable rolling checkpoints every 4096 tokens; none is
 planned within one prefill chunk (2048 tokens) of where the request resumes or
-of its replay boundary. Each retires only once the next one or a junction is
-published, which takes its buffers, when memory refuses others, only after its
-command has completed: a request whose command is cancelled, expires or fails
-keeps it, and a retry resumes there. One only on the SSD retires when that
-state lands.
+of its replay boundary. One more sits 256 tokens before the replay boundary
+when that lies a prefill chunk or more past the state before it: an agent's
+next turn often rewrites the tail of this prompt's last message (one client
+trims a ~60-token status block), and restores there instead of up to a
+checkpoint interval back. A lane resumed past its prompt plans none. The tail
+retires no checkpoint: the last rolling one stays for another conversation of
+the same system prompt or a rewrite below the tail, so a request keeps at most
+its last rolling checkpoint, its tail and its replay state at rest, one state
+more than without the tail, reclaimed oldest first. That kept rolling
+checkpoint is secondary, as the tail and the replay state cover the
+conversation's next turn: a reclaim lets its RAM copy go at once without a
+write, before an ordinary state or the expert store, and the write-behind
+queues it after the replay point, so it is often on the SSD by then. At most
+one async state write a request (47 MiB for the 27B), only when the kept
+checkpoint changed; the tail is not written behind. A lane that takes it as
+its recovery point, or a request that ends before its replay point queues it,
+makes it a checkpoint like any again. Its capture takes what the ledger frees
+for it; still refused memory, it ends its command to go to the SSD from the
+lane, or, with no SSD to take it or while the one state write is in flight, is
+dropped rather than end its command. Each other checkpoint retires only once
+the next one or a junction is published, which takes its buffers, when memory
+refuses others, only after its command has completed: a request whose command
+is cancelled, expires or fails keeps it, and a retry resumes there. One only on
+the SSD retires when that state lands. A request restored from a checkpoint
+where its prompt leaves another branch of cached history, too near for a
+junction of its own (2048 tokens), keeps that checkpoint as a junction: its own
+rolling checkpoints do not retire it, and the next turn that parts there
+restores from it. The states published past it record it, and the next such
+branch point of the conversation retires it, so a conversation keeps one; a
+lane resumed after suspension keeps none.
 The last stays cached once the replay point is published: a later request that
 shares the prompt up to it, such as another conversation with the same long
 system prompt, resumes there instead of from the start. It stays only if the
-replay state fits beside it; refused memory, the replay state takes its buffers
-rather than another lane's checkpoint. With the SSD cache it costs a write as
-well: reclaim takes checkpoints first and writes the states it evicts to the
-SSD, this one too (47 MiB for 27B), and one published straight to the SSD,
-when no RAM slot took it, stays there. These writes draw on the SSD cache's
+replay state fits beside it; refused memory, the replay state takes the lane's
+checkpoint's buffers rather than another lane's checkpoint. The tail's it takes
+last: the ledger first frees for the replay state's claim, the oldest
+checkpoints first, so an older one goes, to the SSD when it can. A claim that
+lets the ledger free before its command ends, the tail's or the replay state's
+beside it, pins the lane's recovery checkpoint for its pass, so a command that
+fails still resumes there. That costs at most one ledger pass and one pin a
+request, at its prompt's end. With the SSD cache it costs a write as well:
+reclaim takes checkpoints first and writes the states it evicts to the SSD,
+this one too (47 MiB for 27B), and one published straight to the SSD, when no
+RAM slot took it, stays there. These writes draw on the SSD cache's
 write budget when one is set, which drops them while it is spent, a suspended
 request's own too, and a full quota makes room for one by dropping the oldest
 copy, perhaps an older conversation's restore point.

@@ -422,8 +422,28 @@ public:
   // tier's writes. A point is unneeded unless it is still the newest of its
   // conversation (newestPoint). Every point is refused once a file stopped
   // taking writes, and one larger than the room it may take (pointFits) or
-  // given up to make room for itself.
-  [[nodiscard]] PersistStatus persist(uint64_t block);
+  // given up to make room for itself. A `secondary` point
+  // (StateCache::markSecondary) is copied while it stays secondary too.
+  [[nodiscard]] PersistStatus persist(uint64_t block, bool secondary = false);
+  // A request's last rolling checkpoint, kept beside its tail checkpoint:
+  // see StateCache::markSecondary.
+  void markSecondaryCheckpoint(uint64_t block) noexcept { states_.markSecondary(block); }
+  void clearSecondaryCheckpoint(uint64_t block) noexcept { states_.clearSecondary(block); }
+  // A conversation's branch point: see StateCache::markBranchPoint.
+  void markBranchPoint(uint64_t block) noexcept { states_.markBranchPoint(block); }
+  void recordBranchPoint(uint64_t block, uint64_t branchPoint) noexcept {
+    states_.recordBranchPoint(block, branchPoint);
+  }
+  [[nodiscard]] uint64_t branchPointOf(uint64_t block) const noexcept {
+    return states_.branchPointOf(block);
+  }
+  void retireBranchPoint(uint64_t block) noexcept { states_.retireBranchPoint(block); }
+  // The one state write is in flight: a state published to disk now is
+  // refused.
+  [[nodiscard]] bool stateWriting() const noexcept { return states_.writing(); }
+  [[nodiscard]] bool secondaryCheckpoint(uint64_t block) const noexcept {
+    return kv_.contains(block) && states_.secondary(block);
+  }
   // The block holds a restore point a conversation still resumes from: an
   // ordinary state with no ordinary state below it, or with ordinary states
   // on more than one of its branches, which no single conversation went on
@@ -794,6 +814,11 @@ public:
   // The request holding the handle is unfinished and its conversation
   // resumes from the state at this block: see StateCache::useState.
   [[nodiscard]] StateUse useState(uint64_t kvBlock) { return states_.useState(kvBlock); }
+  // Pins the state at this block, when there is one, out of every victim
+  // choice until the lease ends.
+  [[nodiscard]] std::optional<CompositeStateLease> pinState(uint64_t kvBlock) {
+    return states_.acquireDeepest(std::span<const uint64_t>(&kvBlock, 1));
+  }
   // A state at this block is in use, published or yet to be: its writes
   // pass the disk tier's write budget.
   [[nodiscard]] bool stateInUse(uint64_t kvBlock) const noexcept { return states_.inUse(kvBlock); }
