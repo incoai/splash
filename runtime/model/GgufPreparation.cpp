@@ -314,27 +314,47 @@ void readGgufNvfp4Rows(const gguf::TensorRows &rows, uint64_t start, uint64_t co
   }
 }
 
+// Source rows [start, start + run) of `rows`, bytes [column, column + span)
+// of each, back to back, by the tensor's reader.
+void readSourceRows(const gguf::TensorRows &rows, uint64_t start, uint64_t run, uint64_t column, uint64_t span,
+                    uint8_t *out) {
+  switch (rowReader(rows)) {
+  case RowReader::Stored: rows.file->readData(rows.offset + start * rows.rowBytes + column, {out, run * span}); break;
+  case RowReader::Safetensors: readSafetensorsRows(rows, start, run, column, span, out); break;
+  case RowReader::GgufNvfp4: readGgufNvfp4Rows(rows, start, run, column, span, out); break;
+  case RowReader::QuantizedBfloat16: quantizeRows(rows, start, run, column, span, out); break;
+  case RowReader::QuantizedGgufFloat: quantizeQ8_0Rows(rows, start, run, column, span, out); break;
+  }
+}
+
 // Image rows [first, first + count) of `rows`, bytes [column, column + span)
-// of each, back to back, from their column window on. Consecutive whole
-// source rows are read together.
+// of each, back to back, from their column window on. Consecutive source rows
+// are read together where the bytes wanted are a whole window of each: a
+// windowed tensor's as whole rows, whose window is copied out. Read a window
+// at a time, Flint's shared expert down projection (47 layers of two windows
+// of 2,048 rows) took 192,846 reads from its UD-Q4_K_XL GGUF and 580,819 from
+// its MLX checkpoint (64 GB M5 Pro, 11-19). A column piece of a wide row is
+// read row by row, as whole rows would multiply the bytes read.
 void readRows(const gguf::TensorRows &rows, uint64_t first, uint64_t count, uint64_t column, uint64_t span,
               uint8_t *to) {
   if (!validWindow(rows) || first > rows.rows || count > rows.rows - first || column > rows.imageRowBytes() ||
       span > rows.imageRowBytes() - column)
     throw GgufError("prepared weight rows are out of bounds");
+  const bool wholeWindows = span == rows.imageRowBytes();
   column += rows.window * rows.imageRowBytes();
+  std::vector<uint8_t> wholeRows;
   for (uint64_t row = 0; row < count;) {
     const uint64_t start = sourceRow(rows, first + row);
     uint64_t run = 1;
-    if (span == rows.rowBytes)
+    if (wholeWindows)
       while (row + run < count && sourceRow(rows, first + row + run) == start + run) ++run;
     uint8_t *out = to + row * span;
-    switch (rowReader(rows)) {
-    case RowReader::Stored: rows.file->readData(rows.offset + start * rows.rowBytes + column, {out, run * span}); break;
-    case RowReader::Safetensors: readSafetensorsRows(rows, start, run, column, span, out); break;
-    case RowReader::GgufNvfp4: readGgufNvfp4Rows(rows, start, run, column, span, out); break;
-    case RowReader::QuantizedBfloat16: quantizeRows(rows, start, run, column, span, out); break;
-    case RowReader::QuantizedGgufFloat: quantizeQ8_0Rows(rows, start, run, column, span, out); break;
+    if (wholeWindows && span != rows.rowBytes) {
+      wholeRows.resize(run * rows.rowBytes);
+      readSourceRows(rows, start, run, 0, rows.rowBytes, wholeRows.data());
+      for (uint64_t r = 0; r < run; ++r) std::memcpy(out + r * span, wholeRows.data() + r * rows.rowBytes + column, span);
+    } else {
+      readSourceRows(rows, start, run, column, span, out);
     }
     row += run;
   }

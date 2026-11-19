@@ -827,6 +827,41 @@ void checkMlxSources(MetalBackend &backend, const std::filesystem::path &directo
               holds(step.meta, expected.meta),
           name + ": planes from its codes and scales");
     check(holds(nativeAt, native), name + ": the token gather's native rows");
+    // The tensor as two column windows (a shared expert's down projection in
+    // its slices): window 1's rows after window 0's, from whole rows read.
+    if ((K / 2) % model::ggufColumnUnit(layout) == 0) {
+      const uint64_t stride = rowBytes(f, K), half = rowBytes(f, K / 2);
+      std::vector<uint8_t> windowRows;
+      for (uint64_t window = 0; window < 2; ++window)
+        for (uint64_t row = 0; row < rows; ++row) {
+          const auto at = native.begin() + static_cast<std::ptrdiff_t>(row * stride + window * half);
+          windowRows.insert(windowRows.end(), at, at + static_cast<std::ptrdiff_t>(half));
+        }
+      windowRows.resize(size_t(2 * QUANT_TILE_ROWS) * half, 0);
+      const Packed windowed = repack(f, windowRows, 2 * QUANT_TILE_ROWS, K / 2, nullptr);
+      model::gguf::ImageBuilder windowBuilder("mlx-windows.bin", 0, 0);
+      model::gguf::Repack windowPlanes = windowBuilder.planes(f, 2 * QUANT_TILE_ROWS, K / 2, "m");
+      for (uint32_t window = 0; window < 2; ++window) {
+        model::gguf::TensorRows slice = source;
+        slice.windows = 2;
+        slice.window = window;
+        windowPlanes.sources.push_back(slice);
+      }
+      const model::gguf::Repack windowStep = windowPlanes;
+      windowBuilder.repack(std::move(windowPlanes));
+      const model::gguf::Image windowPlan = windowBuilder.finish();
+      const auto windowImage = backend.allocateBuffer(windowPlan.bytes, splash::metal::BufferStorage::Shared,
+                                                      "mlx-windows-image");
+      model::writeGgufImage(backend, windowImage, windowPlan);
+      const auto written = model::contentsOf(windowImage);
+      const auto windowHolds = [&](uint64_t at, const std::vector<uint8_t> &bytes) {
+        return at + bytes.size() <= written.size() && std::equal(bytes.begin(), bytes.end(), written.begin() + at);
+      };
+      check(windowHolds(windowStep.plane0, windowed.w0) &&
+                (!layout.plane1_bytes || windowHolds(windowStep.plane1, windowed.w1)) &&
+                windowHolds(windowStep.meta, windowed.meta),
+            name + ": planes of its two column windows");
+    }
     // By value: MLX writes an mxfp4 code of -0 as -0, the kernels as +0.
     std::vector<float> expectedValues(tensor.values.size() / 4), values(expectedValues.size());
     std::memcpy(expectedValues.data(), tensor.values.data(), tensor.values.size());
