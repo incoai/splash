@@ -9,6 +9,18 @@
 // production Metal library, and checks the bf16 embeddings against the fp32
 // numpy reference. It then verifies determinism, a second grid through the
 // same scratch arena, and reports the encode time of a 64x64-patch image.
+// The embeddings' SHA-256 of the fixture and of synthetic grids must equal
+// those FIXTURE_DIR/embedding_digests.txt pins (embedding_digests.apple9.txt
+// on Apple9), a line `GRID SHA-256` each, where it pins them: a change that
+// keeps the tower's arithmetic keeps its bits. A family's vision weights,
+// GGUF or MLX, are its upstream bf16 values, so one family's pins hold for
+// each. Under MTL_SHADER_VALIDATION the shaders compile to other bits, so a
+// validated run prints the digests and says it compares none; the fp32 parity
+// holds either way (test-real runs both). The pins were taken and confirmed
+// without validation on Apple10 GPUs of 16, 20 and 32 cores and on Apple11.
+// Apple9 rounds the same kernels otherwise and has pins of its own, taken on
+// a 10-core M4 for Qwen3.6-35B-A3B, the one family whose tower a Mac of that
+// family here holds.
 
 #include "LinearNumerics.hpp"
 #include "TestChecks.hpp"
@@ -25,10 +37,12 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <iostream>
 #include <limits>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -132,6 +146,38 @@ void verifyComparison() {
   }
 }
 
+std::string embeddingDigest(const std::vector<float> &embeddings) {
+  return splash::model::weightDigest(
+      {reinterpret_cast<const uint8_t *>(embeddings.data()), embeddings.size() * sizeof(float)});
+}
+
+// The digests the GPU family's file pins, by grid name; none without it.
+std::map<std::string, std::string> pinnedDigests(const std::string &fixture, uint32_t appleGpuFamily) {
+  std::map<std::string, std::string> pinned;
+  std::ifstream file(fixture + (appleGpuFamily == 9 ? "/embedding_digests.apple9.txt" : "/embedding_digests.txt"));
+  std::string grid, digest;
+  while (file >> grid >> digest) pinned[grid] = digest;
+  return pinned;
+}
+
+// Whether Metal's shader validation is on, which compiles the tower's shaders
+// to other bits: under it the embeddings of a 32-core M5 Max and of a 16-core
+// M5 Pro differ from the pins in every digest, and without it they match.
+bool shaderValidation() {
+  const char *value = std::getenv("MTL_SHADER_VALIDATION");
+  return value && *value && std::strcmp(value, "0") != 0;
+}
+
+// Whether every grid's digest equals its pin, where the fixture pins them;
+// under shader validation none is compared.
+bool digestsMatch(const std::map<std::string, std::string> &digests,
+                  const std::map<std::string, std::string> &pinned, bool validation) {
+  return pinned.empty() || validation || std::ranges::all_of(digests, [&](const auto &entry) {
+           const auto found = pinned.find(entry.first);
+           return found != pinned.end() && found->second == entry.second;
+         });
+}
+
 std::vector<uint8_t> syntheticPixels(ImageGrid grid) {
   const uint32_t height = grid.height * 16, width = grid.width * 16;
   std::vector<uint8_t> pixels(uint64_t{height} * width * 3);
@@ -194,9 +240,13 @@ int main(int argc, char **argv) {
       const std::vector<float> first =
           encodeOnce(backend, encoder, grid, pixels,
                      model.tensors.layout.outputHiddenSize, &gpuSeconds);
-      const std::string digest = splash::model::weightDigest(
-          {reinterpret_cast<const uint8_t *>(first.data()), first.size() * sizeof(float)});
-      std::printf("embedding SHA-256: %s\n", digest.c_str());
+      // The fixture's and synthetic grids' embeddings, by grid name.
+      std::map<std::string, std::string> digests{{"fixture", embeddingDigest(first)}};
+      for (const ImageGrid synthetic : {ImageGrid{6, 8}, ImageGrid{16, 24}, ImageGrid{32, 32}, ImageGrid{64, 64}}) {
+        MetalBuffer syntheticBuffer = upload(backend, syntheticPixels(synthetic), "synthetic pixels");
+        digests[std::to_string(synthetic.height) + "x" + std::to_string(synthetic.width)] = embeddingDigest(
+            encodeOnce(backend, encoder, synthetic, syntheticBuffer, model.tensors.layout.outputHiddenSize, nullptr));
+      }
       const Parity parity =
           compare(first, expected, descriptor.vision.outputHiddenSize);
       std::printf("grid %ux%u: relative_error %.4f max_abs %.4f "
@@ -209,6 +259,19 @@ int main(int argc, char **argv) {
       // at most 0.018 for the 27B, against 0.15; a corrupted row is off by
       // about its whole norm.
       bool pass = parity.relativeError < 0.03 && parity.worstRowError < 0.15;
+      const std::map<std::string, std::string> pinned = pinnedDigests(fixture, backend.capabilities().appleGpuFamily);
+      const bool validation = shaderValidation();
+      if (validation && !pinned.empty())
+        std::printf("embedding digests: not compared with the pins under MTL_SHADER_VALIDATION\n");
+      for (const auto &[name, digest] : digests) {
+        const auto found = pinned.find(name);
+        std::printf("embedding digest %s %s%s\n", name.c_str(), digest.c_str(),
+                    pinned.empty()                                     ? " (none pinned)"
+                    : validation                                       ? ""
+                    : found != pinned.end() && found->second == digest ? " (pinned)"
+                                                                       : " (DIFFERS from the pinned)");
+      }
+      if (!digestsMatch(digests, pinned, validation)) pass = false;
 
       const std::vector<float> second =
           encodeOnce(backend, encoder, grid, pixels,

@@ -753,6 +753,10 @@ test-engine-metal: $(TEST_METAL_TARGETS)
 # The vision fixture is named after the installed model's family, which its
 # model.json records. Nothing is printed when the installation serves no
 # vision (vision_format none: --language-only, or a GGUF without an mmproj).
+# vision-encoder runs twice: under shader validation, where it holds the fp32
+# parity on real shapes and compares no embedding digests (validation
+# compiles the shaders to other bits), and without it, where it compares the
+# fixture's pinned digests too.
 # ORACLE_ARGS: options every run of the runtime oracle takes besides its own,
 # as the oracle takes them (model_runtime_oracle_test.mm), an option given
 # twice taking its later value. A block-sparse target's spill check runs in
@@ -780,6 +784,8 @@ test-real: preflight $(TARGET) $(TEST_MODEL_RUNTIME_ORACLE) \
 	family=$$($(BUILD_ID_PYTHON) -c '$(VISION_FIXTURE_FAMILY)' "$(MODEL_ROOT)") && \
 		if test -n "$$family"; then \
 			$(METAL_TEST_ENV) $(TEST_VISION_ENCODER_TEST) $(LIB) "$(MODEL_ROOT)" \
+				dev/tests/fixtures/vision-parity/$$family && \
+			$(TEST_VISION_ENCODER_TEST) $(LIB) "$(MODEL_ROOT)" \
 				dev/tests/fixtures/vision-parity/$$family; \
 		else echo "vision parity: skipped, the installation serves text only"; fi
 	$(TEST_MODEL_RUNTIME_ORACLE) $(LIB) "$(MODEL_ROOT)" --ane-ffn-share 0 $(ORACLE_ARGS)
