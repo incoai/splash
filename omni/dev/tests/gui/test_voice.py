@@ -1,7 +1,9 @@
 """The voice chat's servers (gui/voice.py) and the page's routes for them."""
 
 import http.client
+import itertools
 import json
+import math
 import os
 import stat
 import tempfile
@@ -125,6 +127,27 @@ class SelectionTests(unittest.TestCase):
                 self.assertEqual(
                     (chosen[voice.ASR].max_memory, chosen[voice.TTS].max_memory),
                     (asr, tts),
+                )
+
+    def test_the_page_computes_the_language_models_memory_as_the_server(self):
+        # The page recomputes the default as the speech choices change, from
+        # the catalog's memory, as voice.default_llm_memory does.
+        with mock.patch.object(voice, "total_memory_gib", return_value=48):
+            memory = voice.catalog()["memory"]
+            asr = [c.model for c in session.CHECKPOINTS if c.task == session.ASR]
+            tts = [c.model for c in session.CHECKPOINTS if c.task == session.TTS]
+            for asr_model, tts_model, draft in itertools.product(
+                asr, tts, (True, False)
+            ):
+                speech = memory["speech_gib"]
+                gib = math.floor(
+                    memory["budget_gib"]
+                    - speech[asr_model]["draft" if draft else "plain"]
+                    - speech[tts_model]["plain"]
+                )
+                page = f"{gib}G" if gib >= memory["minimum_llm_gib"] else None
+                self.assertEqual(
+                    page, voice.default_llm_memory(asr_model, tts_model, draft)
                 )
 
     def test_the_language_model_takes_what_the_speech_servers_leave(self):

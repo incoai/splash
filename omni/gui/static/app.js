@@ -355,12 +355,37 @@ const setup = {
       // Fill the rest once: later renders keep what was typed.
       form.dataset.voiceFilled = "1";
       form.splash.value = saved.splash || "";
-      form.llm_max_memory.value = saved.llm_max_memory ?? (catalog.defaults.llm_max_memory || "");
+      form.llm_max_memory.value = saved.llm_max_memory ?? this.voiceLlmMemory();
+      form.dataset.llmMemoryAuto = this.voiceLlmMemory();
       for (const role of ["asr", "tts", "llm"]) form[`${role}_port`].value = saved[`${role}_port`] || catalog.defaults.ports[role];
       form.voice_speculative.checked = saved.speculative !== false;
     }
     form.splash.placeholder = catalog.splash || "path to splash";
     $("#splash-hint").textContent = catalog.splash ? `Found: ${catalog.splash}` : "Not found on this Mac.";
+  },
+  /** The language model's --max-memory beside the chosen speech servers,
+   * as the server computes it (voice.default_llm_memory); "" for Splash's
+   * own budget. */
+  voiceLlmMemory() {
+    const form = this.form();
+    const memory = this.voiceCatalog && this.voiceCatalog.memory;
+    if (!memory || memory.budget_gib == null) return "";
+    const speech = (id, draft) => {
+      const entry = memory.speech_gib[id];
+      return entry ? entry[draft ? "draft" : "plain"] : null;
+    };
+    const asr = speech(form.asr_model.value, form.voice_speculative.checked);
+    const tts = speech(form.tts_model.value, false);
+    if (asr == null || tts == null) return "";
+    const gib = Math.floor(memory.budget_gib - asr - tts);
+    return gib >= memory.minimum_llm_gib ? `${gib}G` : "";
+  },
+  /** Follow the speech choices with the language model's memory, unless it
+   * was typed: a value other than the one last filled in. */
+  followVoiceMemory() {
+    const form = this.form();
+    if (!this.voiceCatalog || form.llm_max_memory.value.trim() !== (form.dataset.llmMemoryAuto ?? "")) return;
+    form.llm_max_memory.value = form.dataset.llmMemoryAuto = this.voiceLlmMemory();
   },
   renderSummary() {
     const task = this.task();
@@ -2377,6 +2402,7 @@ function bind() {
       setup.renderBusy();
     }
     if (event.target.name === "task" || event.target.name === "variant") setup.renderModels();
+    if (["asr_model", "tts_model", "voice_speculative"].includes(event.target.name)) setup.followVoiceMemory();
     setup.save();
     setup.renderSummary();
     setup.renderBusy();

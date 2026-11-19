@@ -173,17 +173,27 @@ def speech_memory_gib(task, model, speculative=False):
     return SPEECH_MEMORY_GIB[(task, precision)]
 
 
-def default_llm_memory(asr_model=None, tts_model=None, speculative=True):
-    """Splash's --max-memory beside the two speech servers: the GPU's share
-    of the Mac's memory less their budgets and a margin, or None (Splash's
-    own budget) when that is unknown or too little."""
+def gpu_budget_gib():
+    """What the three servers may take together: the GPU's share of the
+    Mac's memory less the margin, or None when the memory is unknown."""
     total = total_memory_gib()
     if total is None:
         return None
     share = GPU_SHARE[0] if total >= 36 else GPU_SHARE[1]
+    return total * share - GPU_MARGIN_GIB
+
+
+def default_llm_memory(asr_model=None, tts_model=None, speculative=True):
+    """Splash's --max-memory beside the two speech servers: what
+    gpu_budget_gib leaves after their budgets, or None (Splash's own budget)
+    when that is unknown or too little. The page computes the same from the
+    catalog's memory (catalog)."""
+    budget = gpu_budget_gib()
+    if budget is None:
+        return None
     speech = speech_memory_gib(ASR, asr_model or DEFAULT_ASR, speculative)
     speech += speech_memory_gib(TTS, tts_model or DEFAULT_TTS)
-    budget = int(total * share - speech - GPU_MARGIN_GIB)
+    budget = int(budget - speech)
     return f"{budget}G" if budget >= MINIMUM_LLM_GIB else None
 
 
@@ -277,6 +287,21 @@ def catalog():
             LLM: DEFAULT_LLM,
             "ports": DEFAULT_PORTS,
             "llm_max_memory": default_llm_memory(),
+        },
+        # What the page recomputes the language model's default from as
+        # the speech models and the draft change (default_llm_memory).
+        "memory": {
+            "budget_gib": gpu_budget_gib(),
+            "minimum_llm_gib": MINIMUM_LLM_GIB,
+            "speech_gib": {
+                checkpoint.model: {
+                    "plain": speech_memory_gib(checkpoint.task, checkpoint.model),
+                    "draft": speech_memory_gib(
+                        checkpoint.task, checkpoint.model, speculative=True
+                    ),
+                }
+                for checkpoint in session.CHECKPOINTS
+            },
         },
     }
 
