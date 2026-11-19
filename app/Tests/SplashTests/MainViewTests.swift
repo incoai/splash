@@ -130,7 +130,7 @@ private final class FakeServer {
         let runtime = try FakeRuntime("splash-fake-server", launcher: "stepped_server")
         root = runtime.root
         port = runtime.port
-        state = runtime.state(keychain: Keychain(service: "Splash Tests"))
+        state = runtime.state()
     }
 
     /// Lets the launcher go on past the step that waits for `name`.

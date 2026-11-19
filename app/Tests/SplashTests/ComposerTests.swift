@@ -126,7 +126,7 @@ struct ComposerTests {
         let fake = try FakeRuntime("splash-composer-stage", launcher: "stepped_server")
         // Installed, as a model that runs is, so that its name opens the models' menu.
         try fake.install("example/Model")
-        let state = fake.state(keychain: Keychain(service: "Splash Tests"))
+        let state = fake.state()
         defer {
             state.quit()
             try? FileManager.default.removeItem(at: fake.root)

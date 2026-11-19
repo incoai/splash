@@ -28,7 +28,7 @@ struct ServerScreenTests {
             "kind": "memory_budget", "bound": "max_memory", "message": "x", "required_bytes": 1 << 30, "budget_bytes": 1}}))
         sys.exit(1)
         """.write(to: fake.root.appending(path: "install/launcher.py"), atomically: true, encoding: .utf8)
-        let state = fake.state(keychain: Keychain(service: "Splash Tests"))
+        let state = fake.state()
         defer { state.quit() }
         await state.launch()
         state.options["--port"] = String(fake.port)
@@ -64,7 +64,7 @@ extension ServerScreenTests {
         while pathlib.Path("\(hold.path)").exists():
             time.sleep(0.02)
         """.write(to: fake.root.appending(path: "install/models.py"), atomically: true, encoding: .utf8)
-        let state = fake.state(keychain: Keychain(service: "Splash Tests"))
+        let state = fake.state()
         defer { state.quit() }
         await state.launch()
         state.options["--port"] = String(fake.port)
@@ -109,7 +109,7 @@ extension ServerScreenTests {
     @Test func aRequestsRowFollowsTheEngineBackAndEndsWithItsStatus() async throws {
         let fake = try FakeRuntime("splash-request-rows", launcher: "stepped_server")
         defer { try? FileManager.default.removeItem(at: fake.root) }
-        let state = fake.state(keychain: Keychain(service: "Splash Tests"))
+        let state = fake.state()
         defer { state.quit() }
         func signal(_ name: String, _ text: String = "") throws {
             try text.write(to: fake.root.appending(path: name), atomically: true, encoding: .utf8)
@@ -200,7 +200,7 @@ extension ServerScreenTests {
         record.write_text(json.dumps({"pid": os.getpid(), "phase": "failed", "failure": {"kind": "model", "message": "x"}}))
         sys.exit(1)
         """.write(to: fake.root.appending(path: "install/launcher.py"), atomically: true, encoding: .utf8)
-        let state = fake.state(keychain: Keychain(service: "Splash Tests"))
+        let state = fake.state()
         defer { state.quit() }
         await state.launch()
         state.options["--port"] = String(fake.port)
@@ -265,7 +265,7 @@ extension ServerScreenTests {
         for (model, family, gigabytes) in models {
             try fake.install(model, family: family, bytes: Format.gigabytes(gigabytes))
         }
-        let state = fake.state(keychain: Keychain(service: "Splash Tests"))
+        let state = fake.state()
         await state.launch()
         return state
     }
@@ -716,7 +716,7 @@ extension ServerScreenTests {
         try "print('\(Self.realisticFamilies)')".write(to: fake.root.appending(path: "install/families.py"), atomically: true, encoding: .utf8)
         // An installer that downloads until the test ends.
         try "import time\nwhile True:\n    time.sleep(0.05)\n".write(to: fake.root.appending(path: "install/models.py"), atomically: true, encoding: .utf8)
-        let state = fake.state(keychain: Keychain(service: "Splash Tests"))
+        let state = fake.state()
         defer { state.quit() }
         await state.launch()
         try await waitFor(!state.findingCachedModels, "the look through the cache")

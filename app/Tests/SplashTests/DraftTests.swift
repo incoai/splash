@@ -106,7 +106,7 @@ struct DraftTests {
         open = gone
         draft.text = "Of a chat deleted elsewhere"
         draft.save()
-        let state = fake.state(keychain: Keychain(service: "Splash Tests"))
+        let state = fake.state()
         defer { state.quit() }
         await state.launch()
         #expect(state.draft.chats == [a])

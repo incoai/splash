@@ -86,7 +86,7 @@ extension ChatScreenTests {
     @Test func sendMovesWithTheComposer() async throws {
         let fake = try FakeRuntime("splash-chat-send", launcher: "chat_server")
         defer { try? FileManager.default.removeItem(at: fake.root) }
-        let state = fake.state(keychain: Keychain(service: "Splash Tests"))
+        let state = fake.state()
         defer { state.quit() }
         await state.launch()
         state.server.start("example/Model", settings: ServeSettings(values: ["--port": String(fake.port)]))
@@ -604,7 +604,7 @@ extension ChatScreenTests {
         }
         // Installed, as a model that runs is, so that its name opens the models' menu.
         try fake.install("example/Model")
-        let state = fake.state(keychain: Keychain(service: "Splash Tests"))
+        let state = fake.state()
         await state.launch()
         state.server.start("example/Model", settings: ServeSettings(values: ["--port": String(fake.port)]))
         try await waitFor(state.server.phase == .ready, "ready")
@@ -942,7 +942,7 @@ extension ChatScreenTests {
         try JSONEncoder().encode(conversation).write(to: fake.chats.appending(path: "\(conversation.id.uuidString).json"))
         let model = "example/A-Model-Whose-Name-Is-Long-Enough-To-Fill-The-Server-Button-GGUF:Q4"
         try fake.install(model)
-        let state = fake.state(keychain: Keychain(service: "Splash Tests"))
+        let state = fake.state()
         defer { state.quit() }
         await state.launch()
         for step in ["loaded", "warm"] { FileManager.default.createFile(atPath: fake.root.appending(path: step).path, contents: nil) }

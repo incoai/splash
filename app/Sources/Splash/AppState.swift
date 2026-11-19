@@ -104,8 +104,10 @@ final class AppState {
     /// The model to pick once the latest listing has it (`refresh`).
     @ObservationIgnored private var picking: String?
 
-    init(runtime: Runtime, folders: Folders = .user, keychain: Keychain = .app, defaults: UserDefaults = .standard,
-         shell: @escaping () -> Shell = { .login }) {
+    /// The app on `runtime`, writing in `folders`, its API key in `keychain`, its settings in
+    /// `defaults`, its terminals running `shell`: none has a default, so that the app names the
+    /// user's at its one call site (`AppDelegate`) and no test reaches them by leaving one out.
+    init(runtime: Runtime, folders: Folders, keychain: Keychain, defaults: UserDefaults, shell: @escaping () -> Shell) {
         self.runtime = runtime
         self.keychain = keychain
         self.defaults = defaults

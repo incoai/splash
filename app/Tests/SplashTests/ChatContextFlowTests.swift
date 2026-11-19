@@ -596,7 +596,7 @@ private final class ContextFixture {
         try JSONEncoder().encode(history).write(to: runtime.chats.appending(path: "\(history.id).json"))
         root = runtime.root
         port = runtime.port
-        state = runtime.state(keychain: Keychain(service: "Splash Context Tests"))
+        state = runtime.state()
         state.chats.selection = history.id
     }
 

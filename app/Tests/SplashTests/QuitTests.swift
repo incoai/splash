@@ -43,7 +43,7 @@ struct QuitTests {
         let fake = try FakeRuntime("splash-quit", launcher: "stepped_server")
         defer { try? FileManager.default.removeItem(at: fake.root) }
         let model = "a/First-GGUF:Q4"
-        let state = fake.state(keychain: Keychain(service: "Splash Tests"))
+        let state = fake.state()
         defer { state.quit() }
         await state.launch()
         state.options["--port"] = String(fake.port)
