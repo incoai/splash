@@ -96,9 +96,12 @@ public:
   }
   // Where a layer's index region (Layout::indexDimension), the pooled keys of
   // every page, sits in every extent's index plane, in bytes: what an index
-  // table's entries reach (writeIndexEntries). std::out_of_range without an
-  // index or for a layer past the layout.
+  // table's entries reach (writeIndexEntries), layer times indexLayerBytes().
+  // std::out_of_range without an index or for a layer past the layout.
   [[nodiscard]] uint32_t indexOffset(uint32_t layer) const;
+  // The bytes of one layer's index region in an extent's index plane, which
+  // the regions fill in layer order; zero without an index.
+  [[nodiscard]] uint32_t indexLayerBytes() const noexcept;
 
   // What the page holds: its extent's form. std::logic_error for a page
   // whose extent is not allocated.

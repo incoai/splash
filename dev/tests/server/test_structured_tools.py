@@ -133,7 +133,7 @@ class StructuredToolGrammarTest(unittest.TestCase):
         # text and further calls.
         for text in (
             ANSWER,
-            " \n" + ANSWER + "\t",
+            ANSWER + "\t",
             CALL,
             CALL + "\n" + OTHER_CALL,
             CALL + "\nDone.",
@@ -149,9 +149,16 @@ class StructuredToolGrammarTest(unittest.TestCase):
             ANSWER + ANSWER,
             ANSWER + CALL,
             "explanation" + CALL,
+            # With no reasoning before it, either starts at its first token.
+            " \n" + ANSWER,
+            "\n" + CALL,
         ):
             with self.subTest(text=text):
                 self.assert_not_complete(text)
+        # After reasoning, whitespace sets either apart from it.
+        for text in (ANSWER, "\n\n" + ANSWER, "\n\n" + CALL):
+            with self.subTest(reasoned=text):
+                self.assert_complete("Think.</think>" + text, thinking=True)
 
     def test_required_and_named_tool_choice_exclude_json(self):
         for choice in (
@@ -166,16 +173,20 @@ class StructuredToolGrammarTest(unittest.TestCase):
         )
 
     def test_required_and_named_calls_follow_the_reasoning_directly(self):
-        # Reasoning stays free; after it only whitespace may precede a call.
+        # Reasoning stays free; after it only whitespace may precede a call,
+        # and with no reasoning nothing may: the call is the first token.
         named = {"type": "function", "function": {"name": "lookup"}}
         for choice in ("required", named):
             for thinking, reasoning in ((False, ""), (True, "Look it up.</think>")):
                 settings = {"choice": choice, "thinking": thinking, "schema": None}
                 with self.subTest(choice=choice, thinking=thinking):
-                    for text in (CALL, "\n\n" + CALL, CALL + "\n"):
+                    for text in (CALL, CALL + "\n"):
                         self.assert_complete(reasoning + text, **settings)
                     for text in ("", "plain answer", "Sure. " + CALL):
                         self.assert_not_complete(reasoning + text, **settings)
+                    self.assertEqual(
+                        self.accepts(reasoning + "\n\n" + CALL, **settings), thinking
+                    )
         # A required choice may call several tools, with text between and
         # after them; a named one calls exactly once.
         for text in (CALL + "\n" + OTHER_CALL, CALL + " Next. " + CALL + " Done."):
@@ -361,20 +372,31 @@ class StructuredToolGrammarTest(unittest.TestCase):
         # A model preferring whitespace to every token the grammar allows next
         # must write one of them within 64 characters; strings keep theirs.
         bound = tool_schema.MAX_WHITESPACE
+        chat_format = replace(QWEN, think_end_id=self.tokenizer.token_to_id("</think>"))
         for spaces, complete in ((bound, True), (bound + 1, False)):
             with self.subTest(spaces=spaces):
                 pad = " " * spaces
-                for text in ("{" + pad + '"answer":42}', pad + ANSWER):
-                    self.assertEqual(self.accepts(text), complete, text)
-                grammar = tool_schema.json_grammar(SCHEMA, False, chat_format=QWEN)
-                matcher = LLMatcher(self.guidance, grammar)
-                tokens = self.tokenizer.encode("{" + pad + '"answer":42}').ids
+                self.assertEqual(self.accepts("{" + pad + '"answer":42}'), complete)
+                # After reasoning, as much sets the answer apart from it.
                 self.assertEqual(
-                    matcher.validate_tokens(tokens) == len(tokens)
-                    and matcher.consume_tokens(tokens)
-                    and matcher.is_accepting(),
+                    self.accepts("Think.</think>" + pad + ANSWER, thinking=True),
                     complete,
                 )
+                for thinking, text in (
+                    (False, "{" + pad + '"answer":42}'),
+                    (True, "Think.</think>" + pad + ANSWER),
+                ):
+                    grammar = tool_schema.json_grammar(
+                        SCHEMA, thinking, chat_format=chat_format
+                    )
+                    matcher = LLMatcher(self.guidance, grammar)
+                    tokens = self.tokenizer.encode(text).ids
+                    self.assertEqual(
+                        matcher.validate_tokens(tokens) == len(tokens)
+                        and matcher.consume_tokens(tokens)
+                        and matcher.is_accepting(),
+                        complete,
+                    )
         self.assert_complete('{"answer":42,"marker":"' + " " * 200 + '"}')
         # A strict tool's JSON value is bounded alike.
         body = {"type": "object", "additionalProperties": True}
@@ -723,8 +745,8 @@ class StructuredToolGrammarTest(unittest.TestCase):
         cases = (
             ({}, False, True, None),
             ({"tool_choice": "none"}, False, True, "TEXT"),
-            ({"tool_choice": "required"}, True, True, f"WS {both} (TEXT {both})* TEXT"),
-            ({"tool_choice": named}, True, False, "WS (call_0) WS"),
+            ({"tool_choice": "required"}, True, True, f"{both} (TEXT {both})* TEXT"),
+            ({"tool_choice": named}, True, False, "(call_0) WS"),
             ({"parallel_tool_calls": False}, False, False, f"TEXT ({both} WS)?"),
         )
         for extra, required, parallel, start in cases:

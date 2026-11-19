@@ -16,6 +16,10 @@
 
 namespace splash::model {
 
+namespace gguf {
+struct Fill;
+} // namespace gguf
+
 class WeightStoreError : public std::runtime_error {
 public:
   using std::runtime_error::runtime_error;
@@ -47,13 +51,18 @@ struct WeightFileRecord final {
 }
 
 // The file of a loaded image (WeightImages): its header checked, its
-// sections read in order as aligned views of the image's buffer.
+// sections read in order as aligned views of the image's buffer. An image
+// reserved without memory (one WeightImages loads while released) gives views
+// that are handles of no memory, and the bytes its readers parse on the
+// host, its header and descriptors, are those its plan writes there
+// (`planned`, gguf::Image::fills): its weights' layout is read at no memory.
 class WeightFile final {
 public:
   WeightFile(metal::MetalBackend &backend, metal::MetalBuffer image,
              std::string relativePath, std::string_view expectedMagic,
              uint32_t expectedLayer, uint32_t expectedType,
-             uint64_t declaredBytes, std::string contentIdentity);
+             uint64_t declaredBytes, std::string contentIdentity,
+             std::shared_ptr<const std::vector<gguf::Fill>> planned = {});
   ~WeightFile();
 
   WeightFile(const WeightFile &) = delete;
@@ -63,6 +72,10 @@ public:
 
   [[nodiscard]] metal::MetalBuffer section(uint64_t bytes,
                                             std::string_view label);
+  // The next section, of `bytes` bytes, as a reader parses it on the host:
+  // the image's bytes, or, while it holds no memory, those its plan writes
+  // there.
+  [[nodiscard]] std::span<const uint8_t> read(uint64_t bytes, std::string_view label);
   // Requires the sections read to cover the whole file.
   void finish();
   [[nodiscard]] const WeightFileRecord &record() const noexcept;

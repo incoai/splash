@@ -10,21 +10,30 @@ using namespace metal;
 // returns the counter to zero for the next dispatch. The result does not
 // depend on scheduling, and no threadgroup waits for another.
 
-// True in every thread of the threadgroup that arrives last.
+// True in every thread of the threadgroup that arrives last. A store reaches
+// another threadgroup's load only between two device-scope fences, the
+// storing thread's after it and the loading thread's before it: a fence
+// orders the accesses of the thread that runs it, and a barrier's memory
+// flags those of its own threadgroup alone. So every thread fences its
+// partials, the first barrier holds thread zero's arrival until all have,
+// and every thread of the threadgroup whose arrival counted all the others
+// fences again before it reads theirs. With no fence, half of 8e10 reads of
+// another split's partials were of an earlier dispatch's (32-core M5 Max,
+// tiles of 32 to 128 threads in 2 and 8 splits); with these, none, as with
+// thread zero's alone, which Metal does not promise the other threads.
 inline bool split_arrive_last(device atomic_uint *counter, uint splits,
                               uint thread_index, threadgroup uint *arrival) {
-  // Every writer publishes its partials before thread zero signals arrival.
-  // The device-scope fences pair through the counter.
-  threadgroup_barrier(mem_flags::mem_device);
-  if (thread_index == 0) {
-    atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst,
-                        thread_scope_device);
+  atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst,
+                      thread_scope_device);
+  threadgroup_barrier(mem_flags::mem_none);
+  if (thread_index == 0)
     *arrival = atomic_fetch_add_explicit(counter, 1u, memory_order_relaxed);
-    atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst,
-                        thread_scope_device);
-  }
-  threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);
-  return *arrival == splits - 1;
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (*arrival != splits - 1)
+    return false;
+  atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst,
+                      thread_scope_device);
+  return true;
 }
 
 // The splits' partials added in split order: `own` for split `self`,

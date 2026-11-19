@@ -710,6 +710,7 @@ void run(const std::string &metallib) {
         kv::PageStorage indexed(backend, governor.allocationAdmission(), layout, 2 * extent, extent);
         require(indexed.allocateExtent(0) && indexed.allocateExtent(1) && indexed.indexOffset(0) == 0 &&
                     indexed.indexOffset(11) == uint64_t{11} * extent * 2048 &&
+                    indexed.indexLayerBytes() == uint64_t{extent} * 2048 &&
                     uint64_t{extent} * layout.kvBytesPerModelPage() % kv::kExtentRegionAlignmentBytes == 0 &&
                     indexed.indexOffset(1) % kv::kExtentRegionAlignmentBytes == 0,
                 "a QSA index region is misplaced");

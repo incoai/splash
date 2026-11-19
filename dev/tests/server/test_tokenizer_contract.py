@@ -21,6 +21,10 @@ class TokenizerContractTests(unittest.TestCase):
             get_vocab=mock.Mock(return_value=vocabulary),
             encode=mock.Mock(side_effect=lambda text, **_: [vocabulary[text]]),
             eos_token_id=248046,
+            # A fast backend that adds no token: nothing to keep from text.
+            backend_tokenizer=mock.Mock(
+                get_added_tokens_decoder=mock.Mock(return_value={})
+            ),
         )
 
     def test_padded_model_vocabulary_need_not_have_a_token_at_every_index(self):
@@ -55,6 +59,28 @@ class TokenizerContractTests(unittest.TestCase):
         tokenizer.encode.side_effect = None
         with self.assertRaisesRegex(
             generation_constraints.TokenizerContractError, "native token"
+        ):
+            generation_constraints.validate_tokenizer(tokenizer, QWEN)
+
+    def test_added_tokens_the_server_cannot_quote_are_rejected(self):
+        tokenizer = self.tokenizer()
+        tokenizer.backend_tokenizer = None
+        with self.assertRaisesRegex(
+            generation_constraints.TokenizerContractError, "fast tokenizer"
+        ):
+            generation_constraints.validate_tokenizer(tokenizer, QWEN)
+        tokenizer = self.tokenizer()
+        tokenizer.backend_tokenizer.get_added_tokens_decoder.return_value = {
+            248046: mock.Mock(
+                content="<|im_end|>",
+                normalized=False,
+                lstrip=False,
+                rstrip=True,
+                single_word=False,
+            )
+        }
+        with self.assertRaisesRegex(
+            generation_constraints.TokenizerContractError, "literal text"
         ):
             generation_constraints.validate_tokenizer(tokenizer, QWEN)
 

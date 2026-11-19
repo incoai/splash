@@ -1,5 +1,7 @@
 # A launcher that serves as a ready `splash serve` does: it counts prompts and answers each,
-# and writes what it was asked to the runtime's folder (ChatContextFlowTests).
+# and writes what it was asked to the runtime's folder (ChatContextFlowTests). While a file
+# `hold` is in that folder, it holds a message before it takes or refuses it, and makes `held`
+# there, so that a test can look at the app while the server has yet to answer.
 import json
 import os
 import runpy
@@ -80,6 +82,9 @@ class Handler(BaseHTTPRequestHandler):
         # A title, which the app asks for once a first exchange is answered, streams nothing.
         if not body.get("stream"):
             return self.reply({"choices": [{"message": {"content": "A Title"}}]})
+        while (root / "hold").exists():
+            (root / "held").touch()
+            time.sleep(0.01)
         # A message the server refuses, as one over its limits.
         if words(body["messages"][-1]["content"]) == "refuse this":
             return self.reply({"error": {"message": "Request body too large"}}, 413)

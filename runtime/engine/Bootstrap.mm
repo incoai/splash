@@ -115,9 +115,10 @@ protocol::ProtocolLimits protocolLimitsFor(
   limits.maxPromptTokens = maxContext;
   limits.maxLogicalOutputTokens = maxContext;
   limits.maxTokenBatch = model::ExecutionLimits::maximumStepTokens;
-  limits.maxSimulationTokens = model::ExecutionLimits::draftQueryRows;
+  // A mask row at a lane's anchor and after each of its verify rows' tokens.
+  limits.maxSimulationTokens = model::ExecutionLimits::targetVerifyRows;
   limits.maxMaskWords = model::maskWordsPerToken(capabilities.vocabularySize) *
-                        (model::ExecutionLimits::draftQueryRows + 1);
+                        (model::ExecutionLimits::targetVerifyRows + 1);
   return limits;
 }
 

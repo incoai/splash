@@ -7,7 +7,9 @@
 #include "ops/PagedAttention.hpp"
 
 #include <cstdint>
+#include <optional>
 #include <span>
+#include <utility>
 #include <vector>
 
 namespace splash::ops {
@@ -34,34 +36,47 @@ public:
   // projection, float and MoE tile a chunk of any rows selects, and its
   // prefill attention after each history it plans.
   [[nodiscard]] std::vector<uint32_t> prefillRowClasses() const;
+  // The fewest rows of each class of decode step of up to `mostRows` rows,
+  // at most a verify block a lane, whose kernels it picks by its rows: its
+  // projections' tile and staged height, as prefillRowClasses walks them, a
+  // float projection's tile (selectFloatTile), and a MoE target's expert
+  // tile (selectMoe) where `moe` names its blocks' shape and router format.
+  // A decode step's attention and GDN kernels follow its lane cap, not its
+  // rows; its norms and heads follow its projections' plans. The choice of a
+  // cycle's rows prices a class by a step of its last rows
+  // (model::StepCosts), and the start creates that step's kernels alone, so
+  // a class holds no kernel change; kernel-selection checks the tiles and
+  // heights that would.
+  [[nodiscard]] std::vector<uint32_t> decodeRowClasses(uint32_t mostRows,
+                                                       std::optional<std::pair<MoeShape, uint32_t>> moe) const;
 
-  [[nodiscard]] PrefillAttentionPlan prefillAttention(
-      uint32_t rows, uint32_t historyTokens, uint32_t queryHeads, kv::Layout layout,
-      AttentionVariant variant = {}) const;
-  [[nodiscard]] VerifyAttentionPlan verifyAttention(
-      uint32_t lanes, uint32_t queryHeads, kv::Layout layout,
-      std::span<const uint32_t> historyTokens, AttentionVariant variant = {}) const;
+  // The attention of a command's sequences (PagedAttention::plan) whose
+  // dispatches fit `capacity`, the workspace bound to it.
+  [[nodiscard]] AttentionPlan attention(std::span<const kv::ChunkedPrefillParams> sequences, uint32_t queryHeads,
+                                        kv::Layout layout, AttentionWorkspace capacity,
+                                        AttentionVariant variant = {}) const;
   [[nodiscard]] DraftAttentionPlan draftAttention(
       DraftAttentionShape shape, uint32_t lanes) const;
-  // The plans of a MoE target's blocks, whose routers are in `routerFormat`
-  // (moeRouterFormat).
-  [[nodiscard]] MoePlan moePrefill(MoeShape shape, uint32_t routerFormat, uint32_t rows) const;
-  [[nodiscard]] MoePlan moeDecode(MoeShape shape, uint32_t routerFormat, uint32_t lanes) const;
+  // The plan of a step of `rows` rows of a MoE target's blocks, whose
+  // routers are in `routerFormat` (moeRouterFormat).
+  [[nodiscard]] MoePlan moe(MoeShape shape, uint32_t routerFormat, uint32_t rows) const;
 
-  // Bounds cover every row count up to the requested maximum, not just that
-  // one. Decode arenas use a per-lane stride of
-  // max_B ceil(requiredBytes(B)/B), independently for each scratch field.
-  [[nodiscard]] AttentionWorkspace prefillAttentionWorkspace(
-      uint32_t maximumRows, uint32_t queryHeads, kv::Layout layout) const;
-  [[nodiscard]] AttentionWorkspace verifyAttentionWorkspacePerLane(
-      uint32_t queryHeads, kv::Layout layout) const;
+  // The attention workspace that holds any one sequence's partials, a
+  // prompt chunk's; and a decode lane's, the most split slots a lane of up to
+  // a verify block's rows takes: one tile at the most splits, which a lane of
+  // two tiles' 32 splits each stays within (PagedAttention.cpp,
+  // attentionSplits), so that a step's lanes, their workspaces added, attend
+  // in one dispatch.
+  [[nodiscard]] AttentionWorkspace sequenceAttentionWorkspace(uint32_t queryHeads, kv::Layout layout) const;
+  [[nodiscard]] AttentionWorkspace laneAttentionWorkspace(uint32_t queryHeads, kv::Layout layout) const;
   [[nodiscard]] DraftAttentionWorkspace draftAttentionWorkspacePerLane(
       DraftAttentionShape shape) const;
-  [[nodiscard]] MoeWorkspace moePrefillWorkspace(
-      MoeShape shape, uint32_t routerFormat, uint32_t maximumRows) const;
-  [[nodiscard]] MoeWorkspace moeDecodeWorkspacePerLane(MoeShape shape, uint32_t routerFormat) const;
-  // This scratch is one whole-command buffer, not a per-lane arena field.
-  [[nodiscard]] uint64_t gateUpWorkspace(ProjectionShape shape) const;
+  // The workspace of every MoE step of 1 to `maximumRows` rows, not just the
+  // most: a prompt chunk's, and a decode step's of its lanes' packed rows.
+  [[nodiscard]] MoeWorkspace moeWorkspace(MoeShape shape, uint32_t routerFormat, uint32_t maximumRows) const;
+  // The gate scratch of every gate/up plan of 1 to `maximumRows` rows of a
+  // pair of `shape`: one whole-command buffer, not a per-lane arena field.
+  [[nodiscard]] uint64_t gateUpWorkspace(ProjectionShape shape, uint32_t maximumRows) const;
 
 private:
   Linear linear_;

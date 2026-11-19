@@ -56,7 +56,9 @@ def byte_tokenizer(template):
 class BoundaryCountingTokenizer(CharTokenizer):
     """Counts whole-prompt tokenizations: one to prepare the prompt plus
     one per answer-slot boundary check. An optional clock advances on each
-    of them so a test can expire a deadline inside the boundary pass."""
+    of them so a test can expire a deadline inside the boundary pass. A
+    frontend's startup probe encodes the generation prompts, which this
+    tokenizer renders as its whole prompt, so a test counts from `serving`."""
 
     def __init__(self, clock=None, step=0.0):
         super().__init__()
@@ -77,6 +79,12 @@ class BoundaryCountingTokenizer(CharTokenizer):
             if self.clock is not None:
                 self.clock[0] += self.step
         return super().encode(text, **kwargs)
+
+    def serving(self, app):
+        """`app`, the frontend or harness built over this tokenizer, with
+        the count at zero."""
+        self.prompt_encodes = 0
+        return app
 
 
 class JudgmentTests(HarnessTestCase):
@@ -280,7 +288,9 @@ class JudgmentTests(HarnessTestCase):
     def test_judgment_deadline_stops_the_slot_boundary_pass(self):
         clock = [100.0]
         tokenizer = BoundaryCountingTokenizer(clock, 0.5)
-        app = make_frontend(tokenizer, None, "test-model", 8192, 10, 2, vision=True)
+        app = tokenizer.serving(
+            make_frontend(tokenizer, None, "test-model", 8192, 10, 2, vision=True)
+        )
         body = judgment_body(
             options=[
                 {"id": f"opt{index}", "description": f"case {index}"}
@@ -304,7 +314,9 @@ class JudgmentTests(HarnessTestCase):
 
     def test_client_disconnect_stops_the_slot_boundary_pass(self):
         tokenizer = BoundaryCountingTokenizer()
-        app = make_frontend(tokenizer, None, "test-model", 8192, 10, 2, vision=True)
+        app = tokenizer.serving(
+            make_frontend(tokenizer, None, "test-model", 8192, 10, 2, vision=True)
+        )
         body = judgment_body(
             options=[
                 {"id": f"opt{index}", "description": f"case {index}"}
@@ -323,7 +335,9 @@ class JudgmentTests(HarnessTestCase):
 
     def test_judgment_context_budget_precedes_the_slot_boundary_pass(self):
         tokenizer = BoundaryCountingTokenizer()
-        app = make_frontend(tokenizer, None, "test-model", 8, 10, 2, vision=True)
+        app = tokenizer.serving(
+            make_frontend(tokenizer, None, "test-model", 8, 10, 2, vision=True)
+        )
         with self.assertRaises(api.APIError) as error:
             scoring.prepare_judgment(
                 app,
@@ -518,7 +532,9 @@ class JudgmentTests(HarnessTestCase):
 
         runtime = FakeRuntime()
         tokenizer = PaddedPromptTokenizer()
-        harness = self.harness(runtime, tokenizer=tokenizer, max_context=700_000)
+        harness = tokenizer.serving(
+            self.harness(runtime, tokenizer=tokenizer, max_context=700_000)
+        )
         status, _, payload = harness.request(
             "POST",
             "/v1/systemone",

@@ -1,5 +1,6 @@
 #pragma once
 
+#include "model/Model.hpp"
 #include "model/SlotFile.hpp"
 
 #include <cstddef>
@@ -8,10 +9,6 @@
 #include <memory>
 #include <vector>
 
-namespace splash::model {
-class KvCopy;
-} // namespace splash::model
-
 namespace splash::engine {
 
 // One slot of the disk tier holding a KV page; releasing the last handle
@@ -19,6 +16,9 @@ namespace splash::engine {
 class KvDiskSlot {
 public:
   virtual ~KvDiskSlot() = default;
+  // What the slot takes of the tier's quota while it is held
+  // (model::SlotFile::Slot::bytes).
+  [[nodiscard]] virtual uint64_t bytes() const noexcept = 0;
 };
 
 // One KV page moving between its pool page and the disk tier, read from the
@@ -47,7 +47,11 @@ enum class WriteClass : uint8_t { Reclaim, Persist, Spill };
 class KvTier {
 public:
   virtual ~KvTier() = default;
-  [[nodiscard]] virtual uint64_t slotBytes() const noexcept = 0;
+  // What a slot acquired now for a page of the form, Full or Slim, takes of
+  // the quota (model::SlotFile::quotaBytesFor of what the slot stores of
+  // such a page): a Full page's is the largest, and the size of the file's
+  // slots.
+  [[nodiscard]] virtual uint64_t slotBytes(kv::PageForm form) const = 0;
   // False once its file stopped taking writes (model::SlotFile::writable);
   // existing copies stay readable.
   [[nodiscard]] virtual bool writable() const noexcept = 0;
@@ -63,13 +67,16 @@ public:
   [[nodiscard]] virtual bool canDemote(WriteClass write) const noexcept = 0;
   // Engine-thread admission probe, before building a restore's arguments.
   [[nodiscard]] virtual bool canRestore() const noexcept = 0;
-  // Null when the tier is at its limit for the draw (model::DiskBudget::
-  // reserve).
-  [[nodiscard]] virtual std::shared_ptr<KvDiskSlot> acquireSlot(model::DiskBudget::Draw draw) = 0;
+  // A slot for a page of the form, Full or Slim, as demote() writes it.
+  // Null when the tier's limit for the draw has no room for it
+  // (model::DiskBudget::reserve).
+  [[nodiscard]] virtual std::shared_ptr<KvDiskSlot> acquireSlot(kv::PageForm form,
+                                                                model::DiskBudget::Draw draw) = 0;
   // Starts writing what the page holds, its K/V (kv::PageForm::Full) or
-  // that of the layers no window bounds (Slim), which its slot then holds.
-  // Null when the tier takes no more writes of the class for now; the
-  // caller waits while transfers are in flight.
+  // that of the layers no window bounds (Slim), which its slot, one
+  // acquired for the page's form, then holds. Null when the tier takes no
+  // more writes of the class for now; the caller waits while transfers are
+  // in flight.
   [[nodiscard]] virtual std::unique_ptr<KvTransfer>
   demote(uint32_t page, std::shared_ptr<KvDiskSlot> slot, WriteClass write,
          std::function<void()> completion) = 0;

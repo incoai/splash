@@ -1,5 +1,6 @@
 #pragma once
 
+#include "MoeStep.hpp"
 #include "TestBuffers.hpp"
 #include "metal/CommandGraph.hpp"
 #include "ops/MoE.hpp"
@@ -20,7 +21,7 @@ inline void requireMoeExtents(metal::MetalBackend &backend, const ops::MoeBuffer
   constexpr std::array<uint64_t, ops::kMoeScratchFields.size()> elements{4, 4, sizeof(MoeTileDescriptor), 4, 4,
                                                                           4, 4, 2, 2, 2};
   const auto encode = [&](metal::CommandGraph &graph, const ops::MoeBuffers &changed) {
-    ops::MoE::add(graph, changed, weights, plan);
+    addMoeStep(graph, changed, weights, plan);
   };
   for (size_t index = 0; index < ops::kMoeScratchFields.size(); ++index) {
     const ops::MoeScratchField &field = ops::kMoeScratchFields[index];

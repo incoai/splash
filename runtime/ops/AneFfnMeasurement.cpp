@@ -14,12 +14,12 @@ namespace {
 
 // The shares calibration times the split at.
 constexpr std::array<double, 2> kTimedShares{0.4, 0.8};
-// The layers time() spreads over the model; each of its commands takes all
-// but the last, which gives the last one's next weights to stage.
+// The layers time() and chunks() spread over the model; each of their
+// commands takes all but the last, which gives the last one's next weights
+// to stage.
 constexpr uint32_t kSampledLayers = 5;
-// The rows of layers of each command chunks() times, and the runs of each
-// command.
-constexpr uint32_t kCommandRows = 2 * AneFfn::kMaximumRows, kRuns = 3;
+// The runs of each command.
+constexpr uint32_t kRuns = 3;
 
 // The median of kRuns of `run`'s milliseconds, which passes over a first run
 // that wires a function.
@@ -66,10 +66,10 @@ double Measurement::layer(std::span<const SwiGluProjections> layers, uint32_t co
     if (split && !split->begin()) throw std::runtime_error("ANE FFN split stopped (" + split->reason() + ")");
     for (uint32_t index = 0; index < count; ++index) {
       if (split) {
-        linear_.addPrefillSwiGlu(graph, layers[index], ffn_, hidden_[0], hidden_[1], rows);
+        linear_.addSwiGlu(graph, layers[index], ffn_, hidden_[0], hidden_[1], rows);
         split->add(graph, index, ffn_, hidden_[1], hidden_[0], rows);
       } else {
-        linear_.addPrefillSwiGlu(graph, layers[index], ffn_, hidden_[1], hidden_[0], rows);
+        linear_.addSwiGlu(graph, layers[index], ffn_, hidden_[1], hidden_[0], rows);
       }
     }
     const auto start = AwakeClock::now();
@@ -109,40 +109,51 @@ double Measurement::gpuPart(std::span<const SwiGluProjections> layers, AneFfn &s
   return usable((command(count) - command(1)) / (count - 1));
 }
 
+std::vector<SwiGluProjections> Measurement::sampled() const {
+  // A model of fewer layers times some twice.
+  std::vector<SwiGluProjections> layers;
+  for (uint32_t index = 0; index < kSampledLayers; ++index)
+    layers.push_back(layers_[index * (layers_.size() - 1) / (kSampledLayers - 1)]);
+  return layers;
+}
+
 Timings Measurement::time() {
   const uint32_t units = AneFfn::units(layers_);
-  // A model of fewer layers times some twice.
-  std::vector<SwiGluProjections> sampled;
-  for (uint32_t index = 0; index < kSampledLayers; ++index)
-    sampled.push_back(layers_[index * (layers_.size() - 1) / (kSampledLayers - 1)]);
-  constexpr uint32_t kRows = AneFfn::kMaximumRows, kCount = kSampledLayers - 1;
   Timings timings;
-  timings.gpuAlone = layer(sampled, kCount, kRows);
-  const auto measure = [&](double share) {
-    const uint32_t aneUnits = nearestUnits(share, units);
-    AneFfn split(backend_, linear_, sampled, aneUnits, interrupted_, std::array{kRows});
-    return Timing{static_cast<double>(aneUnits) / units, gpuPart(sampled, split),
-                  layer(sampled, kCount, kRows, &split, timings.gpuAlone)};
-  };
-  timings.low = measure(kTimedShares[0]);
-  timings.high = measure(kTimedShares[1]);
+  timings.gpuAlone = layer(sampled(), kSampledLayers - 1, AneFfn::kMaximumRows);
+  timings.low = time(nearestUnits(kTimedShares[0], units), timings.gpuAlone);
+  timings.high = time(nearestUnits(kTimedShares[1], units), timings.gpuAlone);
   return timings;
 }
 
-ChunkTimings Measurement::chunks(AneFfn &split) {
+Timing Measurement::time(uint32_t aneUnits, double gpuAlone) {
+  const std::vector<SwiGluProjections> layers = sampled();
+  constexpr uint32_t kRows = AneFfn::kMaximumRows;
+  AneFfn split(backend_, linear_, layers, aneUnits, interrupted_, std::array{kRows});
+  return Timing{static_cast<double>(aneUnits) / AneFfn::units(layers_), gpuPart(layers, split),
+                layer(layers, kSampledLayers - 1, kRows, &split, gpuAlone)};
+}
+
+// On the layers time() timed, as many to a command, so that the splits
+// calibration compares (slowerNowhere) are timed where it fitted them. Six
+// calibrations of Qwen3.8-27B MLX 4-bit on an M5 Max timed each function's
+// split layer within a range of 6.1% of its mean (3.2% the median function)
+// this way, against 10.9% (3.6%) over the model's first layers at about
+// 4,096 rows of layers to a command, and chose the same 7 units from about
+// the same least rows (842 the median against 833).
+ChunkTimings Measurement::chunks(uint32_t aneUnits) {
+  const std::vector<SwiGluProjections> layers = sampled();
+  AneFfn split(backend_, linear_, layers, aneUnits, interrupted_);
   std::vector<uint32_t> rows;
   for (const AneFfn::Evaluation &evaluation : split.evaluations_) rows.push_back(evaluation.rows);
-  // About kCommandRows rows of layers to a command, more layers of fewer rows.
-  const auto count = [&](uint32_t chunk) {
-    return static_cast<uint32_t>(std::clamp<size_t>(kCommandRows / chunk, 1, layers_.size() - 1));
-  };
-  const auto gpu = [&](uint32_t chunk) { return ChunkTimings::Gpu{chunk, layer(layers_, count(chunk), chunk)}; };
+  constexpr uint32_t kCount = kSampledLayers - 1;
+  const auto gpu = [&](uint32_t chunk) { return ChunkTimings::Gpu{chunk, layer(layers, kCount, chunk)}; };
   ChunkTimings timings{{gpu(rows.front()), gpu(rows.back())}, {}};
   const auto &[low, high] = timings.gpu;
   const double slope = (high.milliseconds - low.milliseconds) / (high.rows - low.rows);
   for (size_t function = rows.size(); function-- > 0;)
     timings.functions.push_back({function ? rows[function - 1] + 1 : rows.front(), rows[function],
-                                 layer(layers_, count(rows[function]), rows[function], &split,
+                                 layer(layers, kCount, rows[function], &split,
                                        low.milliseconds + slope * (rows[function] - low.rows))});
   return timings;
 }

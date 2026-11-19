@@ -33,7 +33,9 @@ class SparseRowStore;
 // keyLayerRows rows apart, which its commit reads), scores of scoreRows rows
 // of scoreStride each, block bitmaps of maskWords words per row, and the
 // block lists of the attention's tiles of rows (listStride entries each,
-// ops::AttentionBlocks) with their counts. A streamed PLE
+// ops::AttentionBlocks) with their counts; a decode step's also its rows'
+// block keys of every attention layer (as its raw keys) and row masks
+// (ops::BlockIndexer::addTreePool, addTreeSelect). A streamed PLE
 // table's step also stages each distinct row it gathers once (pleStaging)
 // and each row id's row there (pleSlots).
 struct Qwen4Scratch final {
@@ -59,6 +61,8 @@ struct Qwen4Scratch final {
   metal::MetalBuffer qsaMask;
   metal::MetalBuffer qsaLists;
   metal::MetalBuffer qsaListCounts;
+  metal::MetalBuffer qsaBlockKeys;
+  metal::MetalBuffer qsaRowMasks;
   uint32_t scoreRows = 0;
   uint32_t scoreStride = 0;
   uint32_t maskWords = 0;
@@ -81,8 +85,9 @@ struct Qwen4Blocks final {
   uint32_t count = 0;
 };
 
-// The QSA blocks a verify step's lanes complete: lane l's counts[l] records
-// from record l * laneRecords of `records`.
+// The QSA blocks a verify step's lanes may complete: lane l's counts[l]
+// records from record l * laneRecords of `records`, those a path of a verify
+// block's most rows completes from the lane's position.
 struct Qwen4LaneBlocks final {
   metal::MetalBuffer records;
   std::array<uint32_t, ExecutionLimits::maximumBatchWidth> counts{};
@@ -117,11 +122,12 @@ public:
   // stage finishes them for all of its chunks.
   void readAhead(std::span<const QwenTargetPrefillChunk> chunks);
 
-  // The scratch of a decode step's first `rows` rows (the target's storage
-  // rows of the step, QwenTarget::decodeStorageLanes).
+  // The scratch of a decode step's first `rows` rows, which a step's forward
+  // takes at its most rows, a verify block's a lane (Qwen4ExpTarget).
   [[nodiscard]] Qwen4Scratch verifyScratch(uint32_t rows) const;
   // Writes batch lane `lane`'s inputs of its verify rows from `position` on:
-  // the tokens before them and the QSA blocks they complete.
+  // the tokens before them and the records of the QSA blocks a path of a
+  // verify block's most rows from it may complete.
   void prepareVerifyLane(uint32_t lane, uint64_t position, const QwenTargetRequest &request);
   // The blocks prepareVerifyLane wrote for each lane of a step, whose rows
   // start at positions[lane].
@@ -132,13 +138,13 @@ public:
   // state cell's auxiliary state.
   [[nodiscard]] metal::MetalBuffer qsaPending(const metal::MetalBuffer &auxiliary, uint32_t layer,
                                               uint32_t layers = 1) const;
-  // The GPU's PLE rows of `lanes` lanes' verify rows, from their tokens and
-  // the tokens before each lane's, and, when the table streams, the host step
+  // The GPU's PLE rows of a verify step's rows, each from its token and the
+  // tokens before it on its path, and, when the table streams, the host step
   // that stages them.
-  void addVerifyInput(metal::CommandGraph &graph, metal::MetalBuffer tokens, uint32_t lanes) const;
-  // The PLE rows of batch lane `lane`'s verify rows of the last step, each
-  // row's heads' in order.
-  [[nodiscard]] std::vector<uint32_t> verifyPleRows(uint32_t lane) const;
+  void addVerifyInput(metal::CommandGraph &graph, const QwenVerifyInput &input) const;
+  // The PLE rows of a lane's rows of the last step (`rows`), each row's
+  // heads' in order.
+  [[nodiscard]] std::vector<uint32_t> verifyPleRows(const ops::LaneRows &rows) const;
 
 private:
   // A scratch tensor placed in its buffer (Qwen4Steps.cpp tensors()).

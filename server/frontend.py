@@ -35,7 +35,7 @@ from .errors import (
 from .latency import LatencyMetrics
 from .metrics import is_finite_number
 from .output import MAX_STOP_CHARACTERS
-from .tokenization import PromptTokenizer, tokenizable
+from .tokenization import PromptTokenizer, tokenizable, unquoted
 from .tool_schema import (
     ToolPolicy,
     json_grammar,
@@ -98,10 +98,6 @@ def accepts_sampling(name, value):
 COMPLETION_DEFAULT_MAX_TOKENS = 16
 
 
-# A stable marker lets repeated image requests reuse the compiled template.
-IMAGE_RENDER_MARKER = f"__splash_image_{secrets.token_hex(16)}__"
-
-
 def _generation_prompt(probed, rendered, tokens):
     """Whether the generation prompt opens a think block, and how many of the
     prompt's last tokens it is (zero where they differ from its tokens).
@@ -136,6 +132,10 @@ class Prompt:
     template_kwargs: dict = field(default_factory=dict)
     # The reasoning effort the request sent; None where it sent none.
     sent_effort: str | None = None
+    # The reasoning effort its chat_template_kwargs set, which the template
+    # renders over the others; None where they set none Splash names, or the
+    # template reads none (ChatTemplate.reads_effort).
+    template_effort: str | None = None
 
 
 @dataclass
@@ -181,6 +181,7 @@ class Frontend:
         max_image_pixels=image_input.MAX_PIXELS,
         served_model_names=(),
         announce_served_name=False,
+        reasoning_effort=None,
         default_reasoning_effort=None,
         default_thinking_token_budget=None,
         sampling_defaults=None,
@@ -216,6 +217,10 @@ class Frontend:
         # configured from data[0] (splash <client>) requests the name it gets
         # back. Every name stays accepted.
         self.model_names = tuple(dict.fromkeys((self.response_model, model, *names)))
+        # The effort the server gives every chat request in place of whatever
+        # the request says of reasoning (--reasoning-effort); None where each
+        # request's own, or the default below, decides.
+        self.reasoning_effort = reasoning_effort
         if (
             default_reasoning_effort is not None
             and default_reasoning_effort not in REASONING_EFFORTS
@@ -275,12 +280,21 @@ class Frontend:
         return ["text", "image", "pdf"] if self.vision else ["text"]
 
     @property
+    def reasoning_switch(self):
+        """Whether a request's reasoning effort or enable_thinking turns the
+        model's reasoning on and off, as /status reports: where the family's
+        model leaves that to its prompt (ChatFormat.reasoning_switch) and the
+        server has not set every request's effort itself."""
+        return self.chat_format.reasoning_switch and self.reasoning_effort is None
+
+    @property
     def reasoning(self):
         """What /v1/models reports of reasoning: the default template's
         (ChatTemplate.reasoning), with the server's default effort in place of
         the template's own, named by the listed effort it renders like; no
-        efforts for a model that decides itself whether to reason."""
-        if not self.chat_format.reasoning_switch:
+        efforts where a request's effort decides nothing (reasoning_switch),
+        so that a client offers none."""
+        if not self.reasoning_switch:
             return {"thinks": None, "efforts": [], "default": None}
         template = self.chat_templates.select(None)
         reasoning = dict(template.reasoning)
@@ -295,7 +309,8 @@ class Frontend:
         status["capabilities"] = {"max_context_tokens": self.max_context}
         status["vision"] = self.vision
         status["input_modalities"] = self.input_modalities
-        status["reasoning_switch"] = self.chat_format.reasoning_switch
+        status["reasoning_switch"] = self.reasoning_switch
+        status["reasoning_effort"] = self.reasoning_effort
         status["chat_template"] = self.chat_templates.status()
         with self.preparation_lock:
             status["frontend"] = {
@@ -371,53 +386,6 @@ class Frontend:
         )
         if frame_bytes > wire.MAX_FRAME_PAYLOAD_BYTES:
             raise APIError(400, "images exceed the request size limit")
-
-    def _render_image_tokens(self, messages, template):
-        """Track placeholders emitted by the template, not quoted in input text.
-
-        A temporary render marker is removed before tokenization, so the pinned
-        template's final text and token IDs remain unchanged. Token offsets tie
-        each real image to its placeholder even when a coding agent has read
-        documentation or source containing literal vision tokens.
-        """
-        pad = self.chat_format.image_pad
-        rendered = self._apply_chat_template(
-            messages,
-            {
-                **template,
-                "tokenize": False,
-                "chat_template": template["chat_template"].replace(
-                    pad, IMAGE_RENDER_MARKER
-                ),
-            },
-        )
-        parts = rendered.split(IMAGE_RENDER_MARKER)
-        image_offsets = set()
-        offset = 0
-        for part in parts[:-1]:
-            offset += len(part)
-            image_offsets.add((offset, offset + len(pad)))
-            offset += len(pad)
-        rendered = pad.join(parts)
-        encoded = self._tokenize(
-            rendered,
-            add_special_tokens=False,
-            return_offsets_mapping=True,
-        )
-        positions = [
-            index
-            for index, span in enumerate(encoded["offset_mapping"])
-            if tuple(span) in image_offsets
-        ]
-        return list(encoded["input_ids"]), positions, rendered
-
-    def _check_image_placeholders(self, prompt_tokens, prepared, positions):
-        """The rendered template holds one placeholder token per image."""
-        pad_id = self.tokenizer.convert_tokens_to_ids(self.chat_format.image_pad)
-        if len(positions) != len(prepared) or any(
-            prompt_tokens[position] != pad_id for position in positions
-        ):
-            raise APIError(400, "image count does not match the rendered template")
 
     @staticmethod
     def _image_token_count(prompt_tokens, prepared):
@@ -680,6 +648,16 @@ class Frontend:
             raise APIError(
                 400, "chat_template_kwargs enable_thinking must be a boolean"
             )
+        if self.reasoning_effort is not None:
+            # The server's effort is every request's, as though each had sent
+            # it and nothing else of reasoning: it replaces the request's
+            # effort, its enable_thinking, which would outrank an effort, and
+            # a reasoning_effort among its template variables, which would
+            # outrank Splash's own. It follows the request's own checks, so a
+            # malformed field is refused as without it.
+            reasoning_effort, enable_thinking = self.reasoning_effort, None
+            template_kwargs.pop("reasoning_effort", None)
+        template_effort = template_kwargs.get("reasoning_effort")
         messages = normalize_messages(body.get("messages"), vision=self.vision)
         tools, tool_policy = normalize_tools(
             body.get("tools"),
@@ -706,15 +684,33 @@ class Frontend:
             enable_thinking,
             template_kwargs,
             body.get("reasoning_effort"),
+            template_effort
+            if template_effort in REASONING_EFFORTS
+            and self.chat_templates.select(tools).reads_effort
+            else None,
         )
 
     def _tokenize(self, text, **options):
         with self.latencies.measure("tokenization"):
             return self.tokenizer(tokenizable(text), **options)
 
-    def _apply_chat_template(self, messages, template):
+    def _apply_chat_template(self, messages, source, options):
+        """The prompt the template `source` renders from the request's
+        messages and template variables, each quoted (PromptTokenizer.quote)
+        as text a client sent: what a message, a tool definition or a
+        variable spells is never the template's own tag."""
         with self.latencies.measure("template"):
-            return render_chat_template(self.tokenizer, messages, template)
+            quote = self.prompt_tokenizer.quote
+            return render_chat_template(
+                self.tokenizer,
+                quote(messages),
+                {
+                    "tokenize": False,
+                    "return_dict": False,
+                    "chat_template": source,
+                    **{name: quote(value) for name, value in options.items()},
+                },
+            )
 
     def _render_prompt(
         self, prompt, deadline, *, check_context=True, add_generation_prompt=True
@@ -722,10 +718,7 @@ class Frontend:
         chat_template = self.chat_templates.select(prompt.tools)
         if not chat_template.accepts(prompt.messages):
             raise APIError(400, LATER_SYSTEM_UNSUPPORTED)
-        template = {
-            "tokenize": False,
-            "return_dict": False,
-            "chat_template": chat_template.source,
+        options = {
             **template_options(
                 reasoning_effort=prompt.reasoning_effort,
                 preserve_thinking=prompt.preserve_thinking,
@@ -740,17 +733,12 @@ class Frontend:
                 prompt.messages, deadline, check_context=check_context
             )
         remaining_request_time(deadline)
-        positions = []
         try:
-            if images:
-                tokens, positions, rendered = self._render_image_tokens(
-                    prompt.messages, template
-                )
-                self._check_image_placeholders(tokens, images, positions)
-            else:
-                rendered = self._apply_chat_template(prompt.messages, template)
-                with self.latencies.measure("tokenization"):
-                    tokens = self.prompt_tokenizer.encode(rendered)
+            rendered = self._apply_chat_template(
+                prompt.messages, chat_template.source, options
+            )
+            with self.latencies.measure("tokenization"):
+                tokens = self.prompt_tokenizer.encode(rendered)
         except APIError:
             raise
         except Exception as error:
@@ -769,15 +757,28 @@ class Frontend:
                 error=True,
             )
             # The client reads a template's own refusal, such as a system
-            # message it does not take; other errors may carry internals, and
+            # message it does not take, with what it names of the request
+            # as the request sent it; other errors may carry internals, and
             # the log keeps no request content.
-            reason = f": {error}" if isinstance(error, TemplateError) else ""
+            reason = (
+                f": {unquoted(str(error))}" if isinstance(error, TemplateError) else ""
+            )
             raise APIError(400, f"messages could not be rendered{reason}") from error
+        # The text the model reads; the marks said how it encodes.
+        rendered = unquoted(rendered)
+        # Text a client sent encodes as no added token, so each pad among the
+        # tokens is one the template wrote for an image.
+        positions = []
+        if images:
+            pad_id = self.tokenizer.convert_tokens_to_ids(self.chat_format.image_pad)
+            positions = [index for index, token in enumerate(tokens) if token == pad_id]
+            if len(positions) != len(images):
+                raise APIError(400, "image count does not match the rendered template")
         remaining_request_time(deadline)
         thinking, generation_prompt_tokens = False, 0
         if add_generation_prompt:
             thinking, generation_prompt_tokens = _generation_prompt(
-                chat_template.generation_prompt(template), rendered, tokens
+                chat_template.generation_prompt(options), rendered, tokens
             )
         return RenderedPrompt(
             rendered, tokens, images, positions, thinking, generation_prompt_tokens
@@ -895,7 +896,10 @@ class Frontend:
             flags,
             thinking=thinking,
             reasoning=ReasoningRequest(
-                prompt.sent_effort, prompt.reasoning_effort, prompt.enable_thinking
+                prompt.sent_effort,
+                prompt.reasoning_effort,
+                prompt.enable_thinking,
+                prompt.template_effort,
             ),
             chat_format=self.chat_format,
             thinking_token_budget=(

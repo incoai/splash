@@ -194,6 +194,142 @@ void testConversionSpillsAHistoryWithCopies() {
           "the lane whose history had copies did not spill them when it converted");
 }
 
+// The same lane runs in the command it converts for: its pages whose copies landed release in its conversion's
+// take, so its command leaves the tick in flight. Left to its claim's next retry, the lane sat that command out, and
+// beside a prefill in passes the next pass ran first: a decode gap of 1,066 ms against the 838 ms of a pass and a
+// decode command in engine-sim's churn.
+void testAConversionWithCopiesRunsInTheCommandItConvertsFor() {
+  Spilling spill(400, false, 2'000, 0, {4}, {}, {.limitBytes = 2'000});
+  spill.engine.submit(Spilling::prompt(1, 1, 10, 4'096));
+  spill.runUntil([&] { return spill.events.outputs.contains(1); }, "the first turn did not decode");
+  for (int step = 0; step < 50; ++step) {
+    static_cast<void>(spill.engine.tick(spill.now++));
+    spill.tier.complete();
+  }
+  spill.engine.cancel(1);
+  spill.runUntilIdle();
+  spill.storage.budgetPages = 14;
+  spill.engine.submit(Spilling::prompt(2, 1, 10, 120));
+  // Checked after each tick, the one in which the lane converted.
+  std::optional<bool> ran;
+  spill.runUntil(
+      [&] {
+        if (spill.engine.snapshot().spill.converted == 1)
+          ran = spill.engine.commandInFlight();
+        return ran.has_value();
+      },
+      "the lane did not convert at the wall");
+  require(*ran, "the lane that converted did not run in the command it converted for");
+  spill.runUntilIdle();
+  require(spill.events.usage.contains(2) && spill.events.usage.at(2).second == 120,
+          "the converted lane did not decode its whole output");
+}
+
+// Decoder 1 beside prompt 2, each command 10 ms: the decoder's step right after a unit of the prompt meets the
+// memory wall, where it converts to Spill owing its copies, none of which lands, so the prompt's next unit waits for
+// them (Scheduler::waitsUntil) up to the 10 ms the unit took. Returns the time of the tick that converted it.
+double convertBesideAPrompt(Spilling &spill) {
+  // Each decode step commits a page of tokens, so each after the first needs a page more.
+  spill.model.decodeTokens = KvCache::pageTokens;
+  spill.model.commandTimes = [](const BatchPlan &, std::span<const ModelBatchItem>) {
+    return test::CommandTimes{.wallMilliseconds = 10.0};
+  };
+  EngineRequest decoder = request(1, std::vector<uint32_t>(7 * KvCache::pageTokens + 25, 1));
+  decoder.maxNewTokens = 4'000;
+  decoder.deadlineMilliseconds = 1e9;
+  EngineRequest prompt = request(2, std::vector<uint32_t>(512 + 12 * 2048, 2));
+  prompt.deadlineMilliseconds = 1e9;
+  spill.engine.submit(std::move(decoder));
+  spill.engine.submit(std::move(prompt));
+  // The wall stands once a unit of the prompt is in flight, its pages allocated, and no Full page is free.
+  double converted = 0.0;
+  uint64_t units = 0;
+  for (uint32_t step = 0; step < 200 && !spill.engine.snapshot().spill.converted; ++step) {
+    converted = spill.now;
+    static_cast<void>(spill.engine.tick(spill.now++));
+    const uint64_t planned = spill.engine.snapshot().scheduler.prefillBatches;
+    if (planned > units && planned >= 2 && spill.engine.commandInFlight() &&
+        !spill.pool.freePageCount(kv::PageForm::Full))
+      spill.storage.budgetPages =
+          static_cast<uint32_t>(spill.storage.allocatedBytes() / spill.storage.bytesPerPage(kv::PageForm::Full));
+    units = planned;
+  }
+  const std::optional<double> wakeup = spill.engine.nextWakeupMilliseconds();
+  require(spill.engine.snapshot().spill.converted == 1 && !spill.engine.commandInFlight() && wakeup &&
+              *wakeup > converted && *wakeup <= converted + 10.0,
+          "the prompt's next unit did not wait, for at most the 10 ms its last one took, for the decoder that "
+          "converted owing its copies");
+  return converted;
+}
+
+// The wait of a prompt's unit for a decoder whose memory lands ends with the lanes it was for: both cancelled during
+// it, the idle engine asks for no wakeup. It asked for the wait's end, a time in the past, until the next command
+// committed, so its loop polled with no timeout for as long as it stayed idle.
+void testAUnitsWaitEndsWithItsLanes() {
+  Spilling spill(400, false, 1'000'000, 0, {4}, {}, {}, false, {.count = 2048});
+  static_cast<void>(convertBesideAPrompt(spill));
+  spill.engine.cancel(1);
+  spill.engine.cancel(2);
+  static_cast<void>(spill.engine.tick(spill.now));
+  std::optional<double> wakeup = spill.engine.nextWakeupMilliseconds();
+  require(!wakeup || *wakeup > spill.now, "the wait's end outlived its lanes: the engine asks to be woken at once");
+  spill.runUntilIdle();
+  for (uint32_t step = 0; step < 50; ++step) {
+    static_cast<void>(spill.engine.tick(spill.now++));
+    spill.tier.complete();
+  }
+  wakeup = spill.engine.nextWakeupMilliseconds();
+  require(idle(spill.engine) && !wakeup,
+          "an idle engine asks to be woken at " + std::to_string(wakeup.value_or(0.0)) + " ms, now " +
+              std::to_string(spill.now));
+}
+
+// The wait runs out with the copies still on their way, and its unit, refused its pages at the wall, cannot run
+// either: the engine asks for no wakeup at a time already past while it waits for the copies, 200 ms here. It asked
+// for the wait's end after 89 of the 98 ticks that did nothing, until the decoder's retry committed a command.
+void testAUnitsWaitRunsOutWithoutACommand() {
+  Spilling spill(400, false, 1'000'000, 0, {4}, {}, {}, false, {.count = 2048});
+  static_cast<void>(convertBesideAPrompt(spill));
+  uint32_t idleTicks = 0, past = 0;
+  for (uint32_t step = 0; step < 200; ++step) {
+    const bool progressed = spill.engine.tick(spill.now);
+    const std::optional<double> wakeup = spill.engine.nextWakeupMilliseconds();
+    const bool nothing = !progressed && !spill.engine.commandInFlight();
+    idleTicks += nothing;
+    past += nothing && wakeup && *wakeup <= spill.now;
+    spill.now += 1.0;
+  }
+  require(idleTicks > 50 && !past,
+          "after " + std::to_string(past) + " of " + std::to_string(idleTicks) +
+              " ticks that did nothing the engine asked to be woken at a time already past");
+  // The wall goes and the copies land: the decoder goes on.
+  spill.storage.budgetPages = 4'096;
+  spill.engine.cancel(2);
+  spill.runUntil([&] { return spill.events.outputs[1].size() >= 400; },
+                 "the decoder did not go on once its copies landed");
+  spill.engine.cancel(1);
+  spill.runUntilIdle();
+}
+
+// The prompt's TTFT shows its unit's wait for the decoder whose memory lands (TtftPart::UnitWait), all of it, which
+// it counted as the rest's idle time.
+void testAUnitsWaitCountsInItsPromptsTtft() {
+  Spilling spill(400, false, 1'000'000, 0, {4}, {}, {}, false, {.count = 2048});
+  const double converted = convertBesideAPrompt(spill);
+  const double waitEnd = *spill.engine.nextWakeupMilliseconds();
+  for (; spill.now <= waitEnd; spill.now += 1.0)
+    static_cast<void>(spill.engine.tick(spill.now));
+  spill.storage.budgetPages = 4'096;
+  spill.runUntil([&] { return !spill.events.outputs[2].empty(); }, "the prompt did not answer once the wall went");
+  const double counted = spill.events.ttftParts.at(2)[static_cast<size_t>(TtftPart::UnitWait)];
+  require(counted >= waitEnd - converted,
+          "the prompt's TTFT counted " + std::to_string(counted) + " ms of its unit's " +
+              std::to_string(waitEnd - converted) + " ms wait for the decoder");
+  spill.engine.cancel(1);
+  spill.engine.cancel(2);
+  spill.runUntilIdle();
+}
+
 // A converted lane preempted and resumed stays Spill under its output limit when the quota holds its
 // projection; a quota short of it bounds the resume, and the bound and the end at it count as the
 // converted lane's.
@@ -281,9 +417,9 @@ KvMode kvMode(const Spilling &spill, uint64_t id) {
 }
 
 // Flash-Next's proportions: 256-page extents, 423,936 B Full and 24,576 B Index pages, a 390 MiB hot
-// block floor, and a dense history and tail window of a page each. Its page ids hold every extent the
-// lanes reach, so memory limits the pool and never the ids, as production's hold every extent the limit
-// could hold of Index pages: 8,192 held 32 extents, and the runway's refill failed for ids.
+// block floor (its 8-row lanes'), and a dense history and tail window of a page each. Its page ids hold
+// every extent the lanes reach, so memory limits the pool and never the ids, as production's hold every
+// extent the limit could hold of Index pages: 8,192 held 32 extents, and the runway's refill failed for ids.
 struct FlashNextLanes {
   static constexpr Spilling::Pages kPages{.count = 65'536, .fullBytes = 423'936, .indexBytes = 24'576};
   Spilling spill{16'384, false, 0, 200'000, Spilling::Extent{256}, {}, {}, false, kPages};
@@ -690,7 +826,7 @@ void testALoneStartMemoryCannotHoldIsRefusedAtItsStart() {
 // A start alone that cannot spill, whose prompt memory holds but not its projection, starts Resident
 // under the bound of the KV memory holds, as the quota bounds a Spill start's output, and ends at it with
 // Length: memory holds eight Full extents, 2,048 pages, of the 2,056 the 64K prompt and its 300 tokens of
-// output project, and so 56 tokens of output with the 7 rows past them its last decode step verifies.
+// output project, and so 48 tokens of output with the 15 rows past them its last decode step may verify.
 // The parent refused it at its start.
 void testALoneStartTakesMemorysBound() {
   for (const Unspillable way : kUnspillable) {
@@ -702,7 +838,7 @@ void testALoneStartTakesMemorysBound() {
     const SpillRequestsSnapshot counts = spill.engine.snapshot().spill;
     require(spill.events.completedCount == 1 && spill.events.failures.empty() && counts.resident == 1 &&
                 counts.spill == 0 && counts.bounded == 1 && counts.lengthEnds == 1 &&
-                spill.model.outputLimits.at(1) == 56 && spill.events.usage.at(1).second == 56 &&
+                spill.model.outputLimits.at(1) == 48 && spill.events.usage.at(1).second == 48 &&
                 spill.events.boundedIds == std::vector<uint64_t>{1},
             "a start alone whose prompt memory holds did not start Resident and end at memory's bound" +
                 unspillable(way) + failureDetail(spill.events));
@@ -719,7 +855,7 @@ void testAResumeKeepsMemorysBound() {
   background.priority = RequestPriority::Background;
   spill.engine.submit(std::move(background));
   spill.runUntil([&] { return spill.events.outputs[1].size() >= 10; }, "the request did not decode");
-  require(spill.model.outputLimits.at(1) == 56, "the request did not start under memory's bound");
+  require(spill.model.outputLimits.at(1) == 48, "the request did not start under memory's bound");
   // A Normal start is refused memory while it is resident, which suspends it.
   spill.model.beginGrowthBlocked = [&] {
     return spill.model.lastBeginId == 2 && spill.model.requests.at(1).resident;
@@ -731,7 +867,7 @@ void testAResumeKeepsMemorysBound() {
   spill.model.resumeDenied = false;
   spill.runUntilIdle();
   require(spill.model.resumptions == 1 && spill.events.completedCount == 2 && spill.events.failures.empty() &&
-              spill.model.outputLimits.at(1) == 56 && spill.events.usage.at(1).second == 56 &&
+              spill.model.outputLimits.at(1) == 48 && spill.events.usage.at(1).second == 48 &&
               spill.events.boundedIds == std::vector<uint64_t>{1},
           "a resume lost the bound memory set at its start: limit " +
               std::to_string(spill.model.outputLimits.at(1)) + failureDetail(spill.events));
@@ -769,7 +905,7 @@ void testALoneStartMemoryCannotHoldTakesTheQuotasBound() {
 }
 
 // A start alone within the context the memory plan advertises starts. At the resident bound
-// (ContextBounds::resident: 65,529 tokens, eight of Flash-Next's Full extents), in the room the plan
+// (ContextBounds::resident: 65,521 tokens, eight of Flash-Next's Full extents), in the room the plan
 // leaves those extents past its lane's buffers, which a warmup left pooled, and its Index runway, and in
 // that room and up to an extent less a byte more, a prompt with 32 tokens of output that fills it and
 // cannot spill (its quota short, its tier closed or its write budget spent) starts Resident and decodes
@@ -781,7 +917,7 @@ void testALoneStartWithinTheResidentContextStarts() {
   constexpr uint64_t extent = 256 * FlashNextLanes::kPages.fullBytes, lane = 276'496'384;
   for (const uint64_t slack : {uint64_t{0}, extent / 2, extent - 1})
     for (const Unspillable way : kUnspillable) {
-      Spilling spill{1'000, false, 0, 65'529, Spilling::Extent{256}, {}, {}, true, FlashNextLanes::kPages};
+      Spilling spill{1'000, false, 0, 65'521, Spilling::Extent{256}, {}, {}, true, FlashNextLanes::kPages};
       spill.model.laneFootprintBytes = lane;
       spill.host.memory.hold("states", lane);
       spill.model.heldStateBytes = lane;
@@ -789,7 +925,7 @@ void testALoneStartWithinTheResidentContextStarts() {
       const uint64_t limit = test::GovernorLimits{}.limitBytes;
       spill.host.memory.hold("limit", limit - std::min(limit, spill.host.memory.total() + 8 * extent + slack));
       cannotSpill(spill, way);
-      EngineRequest alone = request(1, std::vector<uint32_t>(65'497, 1));
+      EngineRequest alone = request(1, std::vector<uint32_t>(65'489, 1));
       alone.maxNewTokens = 32;
       spill.engine.submit(std::move(alone));
       spill.runUntilIdle();
@@ -3661,7 +3797,7 @@ void testNoReleaseOfAPageALaneBetweenItsPassesHolds() {
   lanes.startSpill(Spilling::prompt(1, 1, 2'046, 4'096));
   lanes.decode(1, 4);
   // Lane 2's prompt is lane 1's and 2,048 pages more: it holds lane 1's pages and prefills the rest in passes. Lane 1
-  // then decodes eight tokens a step, its verify rows', so its growth meets the wall within four steps.
+  // then decodes sixteen tokens a step, its verify block's most, so its growth meets the wall within two steps.
   lanes.startSpill(Spilling::prompt(2, 1, 4'094, 8));
   spill.model.decodeTokens = model::ExecutionLimits::targetVerifyRows;
   spill.runUntil([&] { return between() && !spill.engine.commandInFlight(); },
@@ -4526,6 +4662,11 @@ std::span<const test::TestCase> spillTests() {
       {"testSpillCommitmentCoversTheChainWithoutCopies", testSpillCommitmentCoversTheChainWithoutCopies},
       {"testConversionCommitsTheHistoryWithoutCopies", testConversionCommitsTheHistoryWithoutCopies},
       {"testConversionSpillsAHistoryWithCopies", testConversionSpillsAHistoryWithCopies},
+      {"testAConversionWithCopiesRunsInTheCommandItConvertsFor",
+       testAConversionWithCopiesRunsInTheCommandItConvertsFor},
+      {"testAUnitsWaitEndsWithItsLanes", testAUnitsWaitEndsWithItsLanes},
+      {"testAUnitsWaitRunsOutWithoutACommand", testAUnitsWaitRunsOutWithoutACommand},
+      {"testAUnitsWaitCountsInItsPromptsTtft", testAUnitsWaitCountsInItsPromptsTtft},
       {"testAConvertedLaneResumesUnderTheSpillRules", testAConvertedLaneResumesUnderTheSpillRules},
       {"testAConvertedLanesMovesReleaseTheExtentsTheyEmpty", testAConvertedLanesMovesReleaseTheExtentsTheyEmpty},
       {"testALongDecodingLaneConvertsItselfAtTheWall", testALongDecodingLaneConvertsItselfAtTheWall},

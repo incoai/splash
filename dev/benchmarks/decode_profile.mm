@@ -2,7 +2,7 @@
 //
 //   decode-profile METALLIB MODEL_ROOT [--prompt-tokens N] [--cycles K] [--kv-format int8|bf16]
 //                  [--state-format fp32|bf16] [--expert-memory SIZE] [--ple-memory SIZE]
-//                  [--dispatch-list FILE] [--verify-rows auto|all]
+//                  [--dispatch-list FILE] [--verify-rows auto|all] [--step-rows T] [--attribute on|off]
 //   decode-profile METALLIB MODEL_ROOT --images HxW[,HxW...] [--cycles K]
 //
 // Drives the real model runtime with Metal dispatch profiling enabled, so
@@ -12,13 +12,25 @@
 // the gap between the sum of parts and the fused command shows how much a
 // cycle pays in dispatch boundaries rather than kernel work. --dispatch-list
 // writes the attributed B1 cycles' dispatches in order, one line each: index,
-// pipeline and GPU microseconds.
+// pipeline and GPU microseconds. A lane whose answer ends begins it again
+// between cycles, untimed. --prompt FILE[,FILE...] takes each lane's prompt
+// from a file of token ids, lane i the (i mod n)th of n files, as a served
+// width's lanes read different text; --widths N profiles B1 through BN.
+// --step-rows has every decode step take T
+// rows (at most 16 and at least one a lane: RuntimeInstrumentation::
+// forceStepRows), for the cost of a step by its rows; --attribute off times
+// the fused cycles alone and the prompt's fused prefill. --answer-tokens
+// sizes each lane's pages too. --block-plans on has a streamed-expert
+// target's cycles plan a draft's block a lane at their floor
+// (RuntimeInstrumentation::planBlocks), for what the larger class's kernels
+// cost a cycle.
 // With --images it profiles the vision encoder instead, loading only the
 // model's vision role: K encodes of a synthetic image per patch grid (height
 // x width in patches), fused and then attributed.
 
 #include "engine/Types.hpp"
 #include "model/Runtime.hpp"
+#include "model/RuntimeInstrumentation.hpp"
 #include "ops/PageStorage.hpp"
 #include "ops/Vision.hpp"
 #include "metal/BackendInstrumentation.hpp"
@@ -41,8 +53,10 @@
 #include <cstdint>
 #include <cstdio>
 #include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <map>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -140,6 +154,19 @@ std::vector<uint32_t> chatPrompt(const model::ModelDescriptor &descriptor, uint3
   return prompt;
 }
 
+// "Count upward from 1, writing each number and its English name on a new
+// line. Continue until you reach 200." from the user, answered without
+// thinking: an answer of near-certain chains, where a lookup has nothing to
+// copy at first.
+std::vector<uint32_t> countingPrompt(const model::ModelDescriptor &descriptor) {
+  if (std::holds_alternative<model::FlintLayout>(descriptor.target))
+    return {150003, 3201, 29915, 497, 220, 16, 11, 3758, 1218, 1067, 299, 869, 5095, 1060, 358,
+            260, 618, 1507, 13, 27110, 2843, 361, 4495, 220, 905, 13, 150004, 150006, 150007};
+  return {248045, 846, 198, 2427, 38453, 494, 220, 16, 11, 4237, 1754, 1324, 321, 1141,
+          6163, 803, 383, 264, 491, 1500, 13, 14569, 2980, 488, 5372, 220, 17, 15,
+          15, 13, 248046, 198, 248045, 74455, 198, 248068, 271, 248069, 271};
+}
+
 uint32_t parseCount(std::string_view text, std::string_view label) {
   uint32_t value = 0;
   auto result = std::from_chars(text.data(), text.data() + text.size(), value);
@@ -235,6 +262,9 @@ void profileImages(metal::MetalBackend &backend,
   }
 }
 
+// A lane's output budget, unless --answer-tokens gives another.
+constexpr uint32_t kAnswerTokens = 256;
+
 struct Lane final {
   uint64_t id = 0;
   uint32_t stateLane = 0;
@@ -242,14 +272,34 @@ struct Lane final {
   std::vector<uint32_t> pages;
   // The pages never change, so the page table keeps its first revision.
   uint64_t pageTableRevision = 1;
+  // The tokens of its answer so far, its cycles, and its output budget.
+  uint32_t answered = 0;
+  uint32_t answerCycles = 0;
+  uint32_t budget = kAnswerTokens;
+  // Its answer ended in the last cycle, at a stop token or its output
+  // budget: it begins again before the next.
+  bool finished = false;
+};
+
+// How each lane's request answers: greedy or sampled, under a thinking
+// budget or none, and within its output budget.
+struct Answer final {
+  SamplingParameters sampling;
+  std::optional<ThinkingBudget> thinking;
+  uint32_t tokens = kAnswerTokens;
 };
 
 void prefill(model::Runtime &executor, Lane &lane,
-             std::span<const uint32_t> prompt) {
+             std::span<const uint32_t> prompt, const Answer &answer) {
   EngineRequest request;
   request.id = lane.id;
   request.prompt.assign(prompt.begin(), prompt.end());
-  request.maxNewTokens = 256;
+  request.maxNewTokens = answer.tokens;
+  lane.budget = answer.tokens;
+  request.sampling = answer.sampling;
+  request.thinkingBudget = answer.thinking;
+  lane.answered = 0;
+  lane.answerCycles = 0;
   executor.beginColdRequest(request.modelView(), lane.stateLane);
   uint32_t offset = 0;
   while (offset < prompt.size()) {
@@ -280,6 +330,14 @@ struct CycleTiming final {
   uint64_t tokens = 0;
 };
 
+// Each answer's first two cycles, a lane's: its place among the active lanes,
+// the cycle of its answer, the rows it verified and the tokens it retained
+// (decode-profile --step-log on), until profileWidth prints them.
+struct AnswerCycle final {
+  uint32_t lane = 0, cycle = 0, rows = 0, tokens = 0;
+};
+std::vector<AnswerCycle> answerCycles;
+
 CycleTiming decodeCycle(metal::MetalBackend &backend,
                         model::Runtime &executor,
                         std::span<Lane> lanes) {
@@ -302,8 +360,12 @@ CycleTiming decodeCycle(metal::MetalBackend &backend,
     tokens += results[index].outputTokens.size();
     if (!results[index].failure.empty())
       throw std::runtime_error(results[index].failure);
-    if (results[index].finished)
-      throw std::runtime_error("the answer ended before profiling finished");
+    lanes[index].answered += static_cast<uint32_t>(results[index].outputTokens.size());
+    if (++lanes[index].answerCycles <= 2)
+      answerCycles.push_back({static_cast<uint32_t>(index), lanes[index].answerCycles,
+                              results[index].draftedTokens + 1,
+                              static_cast<uint32_t>(results[index].outputTokens.size())});
+    lanes[index].finished = results[index].finished || lanes[index].answered == lanes[index].budget;
     lanes[index].position += results[index].outputTokens.size() -
                              results[index].outputTokensWithoutKv;
   }
@@ -322,13 +384,18 @@ int main(int argc, char **argv) {
         std::cerr << "usage: decode-profile METALLIB MODEL_ROOT "
                      "[--prompt-tokens N] [--cycles K] [--kv-format int8|bf16] "
                      "[--state-format fp32|bf16] [--expert-memory SIZE] [--ple-memory SIZE] "
-                     "[--dispatch-list FILE] [--verify-rows auto|all]\n"
+                     "[--dispatch-list FILE] [--verify-rows auto|all] [--step-rows T] [--attribute on|off] [--widths N] "
+                     "[--warmups on|off] [--prompt chat|counting|FILE[,FILE...]] [--step-log on|off] "
+                     "[--block-plans on|off] "
+                     "[--temperature T [--seed S]] [--thinking-budget TOKENS] [--answer-tokens N]\n"
                      "       decode-profile METALLIB MODEL_ROOT "
                      "--images HxW[,HxW...] [--cycles K]\n";
         return 2;
       }
       uint32_t promptTokens = 512;
       uint32_t cycles = 4;
+      // The widest width profiled, B1 through it.
+      uint32_t widths = 4;
       kv::Format format = kv::Format::Int8;
       ops::GdnStateFormat stateFormat = ops::GdnStateFormat::Float32;
       std::vector<ops::ImageGrid> grids;
@@ -337,6 +404,19 @@ int main(int argc, char **argv) {
       bool textOptions = false;
       std::string dispatchList;
       model::VerifyRows verifyRows = model::VerifyRows::Auto;
+      std::optional<uint32_t> stepRows;
+      bool attribute = true;
+      // The start's decode warmups, which measure the step costs (StepCosts);
+      // the counting prompt, or a file's token ids; and each cycle's choice
+      // of its rows.
+      bool warmups = false, counting = false, stepLog = false, blockPlans = false;
+      // A file of token ids a lane, lane i the (i mod n)th of n.
+      std::vector<std::filesystem::path> promptFiles;
+      // Sampled answers at Qwen's recommended top-k 20 and top-p 0.95, and a
+      // thinking budget the answers think under from an open thinking block.
+      Answer answer;
+      answer.sampling.seed = 1000;
+      std::optional<uint32_t> thinkingTokens;
       for (int index = 3; index < argc; index += 2) {
         const std::string_view option(argv[index]);
         if (index + 1 >= argc)
@@ -346,6 +426,12 @@ int main(int argc, char **argv) {
           textOptions = true;
         } else if (option == "--cycles")
           cycles = parseCount(argv[index + 1], "--cycles");
+        else if (option == "--widths") {
+          widths = parseCount(argv[index + 1], "--widths");
+          if (widths > 4)
+            throw std::invalid_argument("--widths takes 1 to 4");
+          textOptions = true;
+        }
         else if (option == "--kv-format") {
           const std::string_view value(argv[index + 1]);
           if (value != "int8" && value != "bf16")
@@ -366,9 +452,51 @@ int main(int argc, char **argv) {
             throw std::invalid_argument("--verify-rows takes auto or all");
           verifyRows = value == "all" ? model::VerifyRows::All : model::VerifyRows::Auto;
           textOptions = true;
+        } else if (option == "--warmups" || option == "--step-log" || option == "--block-plans") {
+          const std::string_view value(argv[index + 1]);
+          if (value != "on" && value != "off")
+            throw std::invalid_argument(std::string(option) + " takes on or off");
+          (option == "--warmups" ? warmups : option == "--step-log" ? stepLog : blockPlans) = value == "on";
+          textOptions = true;
+        } else if (option == "--prompt") {
+          const std::string_view value(argv[index + 1]);
+          counting = value == "counting";
+          if (value != "chat" && !counting)
+            for (size_t start = 0; start <= value.size();) {
+              const size_t comma = std::min(value.find(',', start), value.size());
+              promptFiles.emplace_back(std::string(value.substr(start, comma - start)));
+              start = comma + 1;
+            }
+          textOptions = true;
+        } else if (option == "--temperature") {
+          answer.sampling.temperature = std::stof(argv[index + 1]);
+          if (!(answer.sampling.temperature > 0.0F))
+            throw std::invalid_argument("--temperature takes a positive temperature");
+          answer.sampling.topK = 20;
+          answer.sampling.topP = 0.95F;
+          textOptions = true;
+        } else if (option == "--seed") {
+          answer.sampling.seed = std::stoull(argv[index + 1]);
+          textOptions = true;
+        } else if (option == "--answer-tokens") {
+          answer.tokens = parseCount(argv[index + 1], "--answer-tokens");
+          textOptions = true;
+        } else if (option == "--thinking-budget") {
+          thinkingTokens = parseCount(argv[index + 1], "--thinking-budget");
+          textOptions = true;
+        } else if (option == "--attribute") {
+          const std::string_view value(argv[index + 1]);
+          if (value != "on" && value != "off")
+            throw std::invalid_argument("--attribute takes on or off");
+          attribute = value == "on";
+          textOptions = true;
+        } else if (option == "--step-rows") {
+          stepRows = parseCount(argv[index + 1], "--step-rows");
+          textOptions = true;
         } else if (option == "--dispatch-list") {
           dispatchList = argv[index + 1];
           textOptions = true;
+
         } else if (option == "--images")
           grids = parseGrids(argv[index + 1]);
         else
@@ -391,9 +519,9 @@ int main(int argc, char **argv) {
           model::loadModel(backend, root, model::inspectModelRoot(root), loadOptions);
       ops::ExecutionPlans operators(backend.capabilities(), ops::Int8Activations::On);
 
-      // Enough Page32 pages for four lanes of prompt plus generated rows.
+      // Enough Page32 pages for each width's lanes of prompt plus generated rows.
       const uint32_t pagesPerLane =
-          (promptTokens + 256 + model::ExecutionLimits::targetVerifyRows) /
+          (promptTokens + std::max(answer.tokens, kAnswerTokens) + model::ExecutionLimits::targetVerifyRows) /
               kv::kPageTokens +
           2;
       // Whole extents of the largest size the pool rule picks, as a large
@@ -401,7 +529,7 @@ int main(int argc, char **argv) {
       const kv::Layout kvLayout = model.targetKvLayout(format);
       const uint32_t extentPages = kvLayout.maximumExtentPages();
       const uint32_t pageCount =
-          (pagesPerLane * 4 + extentPages - 1) / extentPages * extentPages;
+          (pagesPerLane * widths + extentPages - 1) / extentPages * extentPages;
       MemoryGovernor governor(
           backend, backend.capabilities().recommendedMaxWorkingSetBytes, 1, 1,
           queryHostMemory, 0);
@@ -420,6 +548,22 @@ int main(int argc, char **argv) {
       model::RuntimeContext context{backend, model, pages, states, operators};
       context.verifyRows = verifyRows;
       model::Runtime executor(context);
+      if (warmups) {
+        for (uint32_t width = 1; width <= 4; ++width) {
+          // A start's decode warmup of the lane count, which measures its
+          // classes' costs, and the costs it measured.
+          const auto started = std::chrono::steady_clock::now();
+          static_cast<void>(executor.warmupDecodeBatch(width));
+          std::printf("B%u decode warmup: %.2f s\n", width,
+                      std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count());
+          for (const model::StepCosts::Point &point : model::RuntimeInstrumentation::stepPoints(executor, width))
+            std::printf("B%u step class %u-%u rows, lane cap %u: %.2f ms\n", width, point.first, point.last,
+                        point.cap, point.milliseconds);
+        }
+        static_cast<void>(model::RuntimeInstrumentation::takeStepChoices(executor));
+      }
+      model::RuntimeInstrumentation::forceStepRows(executor, stepRows);
+      model::RuntimeInstrumentation::planBlocks(executor, blockPlans);
 
       std::printf("device %s, %u prompt tokens, %u cycles per width, %s state\n",
                   backend.capabilities().deviceName.c_str(), promptTokens,
@@ -430,33 +574,101 @@ int main(int argc, char **argv) {
         lanes[index] = {index + 1, index, 0,
                         pageRange(index * pagesPerLane, pagesPerLane)};
       }
-      const std::vector<uint32_t> prompt = chatPrompt(model.descriptor, promptTokens);
+      std::vector<std::vector<uint32_t>> prompts{
+          counting ? countingPrompt(model.descriptor) : chatPrompt(model.descriptor, promptTokens)};
+      if (!promptFiles.empty()) {
+        prompts.clear();
+        for (const std::filesystem::path &file : promptFiles) {
+          std::ifstream input(file);
+          std::vector<uint32_t> &ids = prompts.emplace_back();
+          for (uint32_t id = 0; input >> id;)
+            ids.push_back(id);
+          if (ids.empty() || !input.eof())
+            throw std::invalid_argument("--prompt reads files of token ids");
+          if (ids.size() > promptTokens)
+            throw std::invalid_argument("--prompt-tokens holds no lane's prompt of " + file.string());
+        }
+      }
+      // Lane `index`'s prompt.
+      const auto promptOf = [&](uint32_t index) -> std::vector<uint32_t> & { return prompts[index % prompts.size()]; };
+      std::vector<uint32_t> &prompt = prompts.front();
+      // Under a thinking budget a Qwen answer thinks: a prompt's empty
+      // thinking block stays open, and the budget's end is "\n\n</think>".
+      if (thinkingTokens) {
+        if (std::holds_alternative<model::FlintLayout>(model.descriptor.target))
+          throw std::invalid_argument("--thinking-budget takes a Qwen target");
+        constexpr uint32_t kThinkEnd = 248069, kBlankLines = 271;
+        if (prompt.size() >= 2 && prompt[prompt.size() - 2] == kThinkEnd && prompt.back() == kBlankLines)
+          prompt.resize(prompt.size() - 2);
+        answer.thinking = ThinkingBudget{*thinkingTokens, {kBlankLines, kThinkEnd}, kThinkEnd};
+      }
 
       // Warm prefill and B1 decode with real work before measuring.
-      prefill(executor, lanes[0], prompt);
+      prefill(executor, lanes[0], prompt, answer);
       static_cast<void>(decodeCycle(backend, executor, std::span<Lane>(&lanes[0], 1)));
       executor.end(lanes[0].id);
 
       // Prefill: fused timing first, then the attributed replay. Both cover
       // every chunk of the prompt.
       const double prefillBefore = executor.telemetry().totalPrefillGpuSeconds;
-      prefill(executor, lanes[0], prompt);
+      prefill(executor, lanes[0], prompt, answer);
       const double prefillFused =
           executor.telemetry().totalPrefillGpuSeconds - prefillBefore;
-      executor.end(lanes[0].id);
-      BackendInstrumentation::setDispatchProfiling(backend, true);
-      prefill(executor, lanes[0], prompt);
-      BackendInstrumentation::setDispatchProfiling(backend, false);
-      Table prefillTable;
-      accumulate(prefillTable,
-                 BackendInstrumentation::takeDispatchProfile(backend));
-      print("prefill " + std::to_string(promptTokens) + " rows", prefillTable,
-            1.0, prefillFused);
+      if (attribute) {
+        executor.end(lanes[0].id);
+        BackendInstrumentation::setDispatchProfiling(backend, true);
+        prefill(executor, lanes[0], prompt, answer);
+        BackendInstrumentation::setDispatchProfiling(backend, false);
+        Table prefillTable;
+        accumulate(prefillTable,
+                   BackendInstrumentation::takeDispatchProfile(backend));
+        print("prefill " + std::to_string(prompt.size()) + " rows", prefillTable,
+              1.0, prefillFused);
+      } else {
+        std::printf("== prefill %zu rows: %.2f ms fused ==\n", prompt.size(), prefillFused * 1e3);
+      }
 
+      // A cycle of the active lanes, then, untimed, the prompt again of each
+      // lane whose answer it ended.
+      const auto cycleOf = [&](std::span<Lane> active) {
+        const CycleTiming timing = decodeCycle(backend, executor, active);
+        for (Lane &lane : active)
+          if (lane.finished) {
+            executor.end(lane.id);
+            prefill(executor, lane, promptOf(lane.stateLane), answer);
+            lane.finished = false;
+          }
+        return timing;
+      };
       auto profileWidth = [&](const char *title, std::span<Lane> active) {
         std::vector<CycleTiming> fused;
+        static_cast<void>(model::RuntimeInstrumentation::takeStepChoices(executor));
+        answerCycles.clear();
         for (uint32_t cycle = 0; cycle < cycles; ++cycle)
-          fused.push_back(decodeCycle(backend, executor, active));
+          fused.push_back(cycleOf(active));
+        if (stepLog)
+          for (const AnswerCycle &answer : answerCycles)
+            std::printf("%s answer cycle: lane %u, cycle %u, rows %u, tokens %u\n", title, answer.lane, answer.cycle,
+                        answer.rows, answer.tokens);
+        if (stepLog)
+          for (const auto &choice : model::RuntimeInstrumentation::takeStepChoices(executor)) {
+            std::printf("%s step: %u rows at lane cap %u (expected %.3f, cost %.2f ms), verified %u, "
+                        "retained %u, wall %.2f ms, gpu %.2f ms, k %.4f, floor %.4f\n",
+                        title, choice.rows, choice.laneCap, choice.expected, choice.cost, choice.verified,
+                        choice.retained, choice.wallMilliseconds, choice.gpuMilliseconds, choice.contextCost,
+                        choice.floor);
+          }
+        // The cycles in the order they ran, and their mean: a greedy prompt
+        // runs the same cycle sequence every time, so two builds compare
+        // cycle by cycle; the median alone may pick a different cycle.
+        double fusedSum = 0.0;
+        std::printf("\n%s: fused gpu ms in order:", title);
+        for (const CycleTiming &timing : fused) {
+          std::printf(" %.2f", timing.gpuSeconds * 1e3);
+          fusedSum += timing.gpuSeconds;
+        }
+        std::printf("\n%s: mean fused gpu %.3f ms\n", title,
+                    fusedSum * 1e3 / double(fused.size()));
         std::sort(fused.begin(), fused.end(),
                   [](const CycleTiming &left, const CycleTiming &right) {
                     return left.gpuSeconds < right.gpuSeconds;
@@ -472,9 +684,11 @@ int main(int argc, char **argv) {
                     title, median.gpuSeconds * 1e3, median.wallSeconds * 1e3,
                     static_cast<unsigned long long>(median.commands), tokens / fused.size(),
                     wall * 1e3 / tokens);
+        if (!attribute)
+          return;
         BackendInstrumentation::setDispatchProfiling(backend, true);
         for (uint32_t cycle = 0; cycle < cycles; ++cycle)
-          static_cast<void>(decodeCycle(backend, executor, active));
+          static_cast<void>(cycleOf(active));
         BackendInstrumentation::setDispatchProfiling(backend, false);
         const std::vector<metal::DispatchTiming> timings =
             BackendInstrumentation::takeDispatchProfile(backend);
@@ -492,14 +706,14 @@ int main(int argc, char **argv) {
       };
       profileWidth("B1 decode cycle", std::span<Lane>(&lanes[0], 1));
       // Add one lane at a time so M16 and M24 paths are measured too.
-      for (uint32_t index = 1; index < lanes.size(); ++index) {
-        prefill(executor, lanes[index], prompt);
+      for (uint32_t index = 1; index < widths; ++index) {
+        prefill(executor, lanes[index], promptOf(index), answer);
         const std::string title = "B" + std::to_string(index + 1) + " decode cycle";
         profileWidth(title.c_str(), std::span<Lane>(lanes.data(), index + 1));
       }
 
-      for (Lane &lane : lanes)
-        executor.end(lane.id);
+      for (uint32_t index = 0; index < widths; ++index)
+        executor.end(lanes[index].id);
       return 0;
     } catch (const std::exception &error) {
       std::cerr << "decode-profile: " << error.what() << '\n';

@@ -81,7 +81,15 @@ in `reasoning_content`, beside `content`, in the message and in each stream
 delta, and an assistant message sent back may carry its `reasoning_content`
 (or `reasoning` text). Message content may hold Responses' `input_text`,
 `output_text` and `input_image` parts too, and a `refusal` part, an assistant's
-refusal, is text. A history tool call whose `arguments` are not a JSON object,
+refusal, is text. What a request sends is text to the model, never one of its
+control tokens: a `<tool_call>`, `<think>` or `<|im_end|>` that a message, a
+tool result, a call or a tool definition spells reaches the model as those
+characters, in every API, and so does one that a text only begins, such as a
+call's name ending in `<|im_end|` before the `>` the template writes after it
+([tokenizer and chat templates](models.md#tokenizer-and-chat-templates)). A
+U+0000 in any of them reaches the model as U+FFFD, as a lone surrogate does: a
+template may delete the character, and with it what kept a tag apart. A
+history tool call whose `arguments` are not a JSON object,
 such as one the output limit cut, is kept as text, so the conversation
 continues. `n` other than 1 and `logprobs: true` return 400.
 
@@ -123,10 +131,11 @@ found; a system message's `tool_addition` and `tool_removal` blocks change
 them in order: a `tool_definition` adds a tool or replaces the one of its name,
 and a removed tool is left out until a later block adds it again),
 `tool_choice` (`auto`, `any`, `tool` or `none`, with
-`disable_parallel_tool_use`), `stop_sequences`, `temperature`, `top_p`, `top_k`,
-`thinking`, `output_config` and Chat's `chat_template_kwargs`, whose
-`enable_thinking` outranks `thinking`. Otherwise a request reasons only when
-`thinking` sets it: `{"type": "enabled", "budget_tokens": N}` and
+`disable_parallel_tool_use`), `stop_sequences`, the [sampling](#sampling)
+fields, of which Anthropic defines `temperature`, `top_p` and `top_k`, Chat's
+`ignore_eos`, `thinking`, `output_config` and Chat's `chat_template_kwargs`,
+whose `enable_thinking` outranks `thinking`. Otherwise a request reasons only
+when `thinking` sets it: `{"type": "enabled", "budget_tokens": N}` and
 `{"type": "adaptive"}` reason at `output_config.effort`, one of `low`, `medium`,
 `high` (the default), `xhigh` and `max`, while `{"type": "disabled"}` and an
 omitted `thinking` do not. Enabled thinking requires `budget_tokens`, an integer
@@ -149,6 +158,9 @@ Splash makes no other edit, so the model reads the conversation as sent.
 and returns `{"prompt":"..."}` using the same template as generation.
 `add_generation_prompt` defaults to true. Image prompts retain textual placeholders;
 raw tokenization does not account for image embeddings (use `count_tokens` for that).
+Nor does it tell a tag a message quotes, which the prompt encodes as text, from
+the template's own: `/tokenize` reads both as the token, so the tokens of a
+returned prompt are the request's only where it quotes none.
 Both endpoints run without inference and share bounded preparation capacity with
 `count_tokens`; they can inspect prompts larger than the serving context limit.
 
@@ -217,14 +229,15 @@ the connections it holds cannot exhaust it.
 
 ## Sampling
 
-Chat, text completions and Responses sample with `temperature` (default 1.0, in
-[0, 2]), `top_p` (0.95), `top_k` (20, a positive integer, 0 or -1), `min_p` (0,
-in [0, 1]), `presence_penalty` and `frequency_penalty` (0, in [-2, 2]) and
-`repetition_penalty` (1, positive). The defaults of `temperature`, `top_p` and
-`top_k` are the ones the served model's family publishes (Qwen's, and the same
-numbers in Flint's GGUF release); the publishers set no penalties, so Qwen's
-recommended `presence_penalty` of 1.5 for non-thinking use must be sent
-explicitly. Each field that is out of range returns 400 naming it. As in vLLM, a
+Chat, text completions, Responses and Messages sample with `temperature`
+(default 1.0, in [0, 2]), `top_p` (0.95), `top_k` (20, a positive integer, 0 or
+-1), `min_p` (0, in [0, 1]), `presence_penalty` and `frequency_penalty` (0, in
+[-2, 2]) and `repetition_penalty` (1, positive). The defaults of `temperature`,
+`top_p` and `top_k` are the ones the served model's family publishes (Qwen's,
+and the same numbers in Flint's GGUF release); the publishers set no
+penalties, so Qwen's recommended `presence_penalty` of 1.5 for non-thinking use
+must be sent explicitly. Each field that is out of range returns 400 naming it,
+on every route. As in vLLM, a
 nonzero temperature below 0.01 samples at 0.01, and the penalties rewrite the
 raw logits before temperature, for greedy requests too: repetition divides a
 positive logit and multiplies a negative one for every token of the prompt or of
@@ -238,19 +251,29 @@ the Qwen templates that includes the tool-call syntax every tool-enabled system
 prompt carries, earlier tool calls and reasoning, and the `<think>` markers of
 the generation prompt, so a `repetition_penalty` above 1 can delay tool calls
 and the end of reasoning and change names copied from the context. Anthropic
-Messages defines no penalties and no `min_p`.
+defines no penalties and no `min_p` for Messages; Splash's Messages takes
+them and `logit_bias` as Chat does, with the same 400 for a bad value, so that
+a client whose requests go only to Messages can set them too.
 
 In vLLM's order, after temperature `min_p` first drops every token less
 likely than `min_p` times the most likely one, `top_k` then keeps the most
 likely of the rest, every one when it is 0 or -1 or past the vocabulary, and
 `top_p` then the fewest of those whose probabilities, renormalized over them,
 sum past it. All three apply to the whole vocabulary, exactly, for the first
-token, the verified draft positions and their corrections alike: the sampler
-sums each row's softmax denominator, finds where its distribution ends
-without sorting the vocabulary, and draws over every token the distribution
-keeps. vLLM itself refuses a nonzero `min_p` with speculative decoding; here
-it is one more cut of the target distribution, which acceptance and
-correction read as they read the others, so sampling stays exact. A request
+token and every verified draft position alike: the sampler sums each row's
+softmax denominator, finds where its distribution ends without sorting the
+vocabulary, and draws over every token the distribution keeps, each verify row
+with uniforms of its own. A verify row tests the draft tokens its draft drew
+there, in the order drawn, keeping draft token i with probability
+min(1, p_i / q_i) of the target's and the draft's probabilities after the
+ones before it (the target's residual after each rejection), and draws from
+the last residual where it keeps none ([Drafts](models.md#drafts)); a decode
+cycle keeps a draft token only where the row before it selected that token,
+and then the selection of the last row it keeps, so every token it emits is a
+draw from the target. vLLM itself refuses a nonzero
+`min_p` with speculative decoding; here it is one more cut of the target
+distribution, which the draws read as they read the others, so sampling stays
+exact. A request
 that keeps only its most likely token, at a `min_p` of 1 or a `top_k` of 1,
 decodes greedily, its draft's proposals too: it selects what sampling would
 but for equally likely tokens, of which it takes the lowest id.
@@ -270,20 +293,21 @@ change the batch and the chunking, and chunk boundaries also come from the
 cached boundary a request resumes from, from a boundary another request waits to
 resume from, and from one whose state, or the KV past it, memory could not hold.
 With `--state-format bf16` the state is also rounded at each state a chunk
-captures (a replay point, junction or checkpoint). So on a dense target, or a
-MoE target under `--verify-rows all`, a greedy or seeded request repeats its
-output when it runs alone with the same cached prefixes; alongside other
+captures (a replay point, junction or checkpoint). So under `--verify-rows
+all` a greedy or seeded request repeats its output when it runs alone with the
+same cached prefixes; alongside other
 requests, or with other prefixes cached, it can differ. A request's own repeat
 is such a case: served from the prefix cache, it computes only the rows past the
 state its first run cached, so its output can differ from that run's, which
 computed the whole prompt; repeats meant to match each take a `cache_salt` of
-their own (below). By default a MoE target's decode cycles verify the rows the
-verify budget chooses ([Drafts](models.md#drafts)), which follow the machine's
-timing and the requests served before, and a row's MoE result depends on which
-rows share its expert tiles: there the same greedy (temperature 0) or seeded
-request can give different text from run to run even alone on an idle server, as
-on other engines that batch requests, while sampled outputs keep their exact
-distribution. A request that restores nothing can still read cached KV: once a
+their own (below). By default a decode cycle's rows follow the step costs the
+Mac measured, and the cost of a long history and the acceptance learned from
+the requests served before
+([Drafts](models.md#drafts)), and a row's result depends on the rows its step holds
+(on a MoE target, on which rows share its expert tiles too): the same greedy
+(temperature 0) or seeded request can give different text from run to run even
+alone on an idle server, as on other engines that batch requests, while sampled
+outputs keep their exact distribution. A request that restores nothing can still read cached KV: once a
 command completes, each block it filled whose prefix, tokens and identity
 (images and cache salt) match a cached block is swapped for that block's page,
 which another command computed, and its later commands read it. A request
@@ -323,10 +347,11 @@ of a long request's KV ([KV on the SSD](server.md#kv-on-the-ssd)). An
 invalid value returns 400 naming the field the request sent. Messages refuses
 a final assistant message (prefill) with 400; `count_tokens` still counts it.
 
-Chat and text completions accept `"ignore_eos":true` (default false), as vLLM
-and llama.cpp do: the model never selects its own stop tokens, and a draft
-proposal of one is rejected, so generation runs to its output budget and
-finishes with `length` unless a `stop` string ends it first. Benchmarks use it
+Chat, text completions, Responses and Messages accept `"ignore_eos":true`
+(default false), as vLLM and llama.cpp do: the model never selects its own
+stop tokens, and a draft proposal of one is rejected, so generation runs to its
+output budget and finishes with `length` (Messages' `max_tokens`) unless a stop
+string ends it first. Benchmarks use it
 to generate a fixed number of tokens. Constrained tool calls, output under
 `tool_choice: "none"` and structured output generate under a grammar, which
 decides where the output ends, so combining them with `ignore_eos` returns 400.
@@ -350,6 +375,35 @@ Responses `cache_write_tokens` is 0: clients price cache writes apart from the
 rest of the uncached input, and the prefix cache keeps a prompt as prefill
 computes it, at no cost of its own. So uncached input is `input_tokens` less
 `cached_tokens`, as in Messages, which reports no `cache_creation_input_tokens`.
+
+Every API keeps a response's state where its generation ended: at the last
+32-token page boundary, counted from the start of the prompt, that the prompt
+and its generated tokens reach, beside the state before its generation prompt.
+A next request whose prompt renders that reply back token for token resumes
+there and prefills only what follows that boundary: a Chat client that sends the
+assistant message back as it came, a Responses client that continues with
+`previous_response_id` or sends the output items back, a Messages client that
+sends the assistant turn back. The template decides what it renders: Qwen3.8's
+renders an earlier turn's reasoning by default, Qwen3.6's only after the last
+user message (an agent's tool loop) or with `preserve_thinking`, so a reply
+that reasoned resumes there only when its reasoning is sent back and rendered.
+A next prompt that renders the reply otherwise, as one that leaves out its
+reasoning or a text the model generated as tokens the text does not encode to
+(`Any` `where` for `Anywhere`), resumes from the state before the generation
+prompt. A response cancelled, failed or ended by a `stop` sequence keeps the
+state at the last boundary its generation crossed, which a next prompt that
+renders back the text up to it resumes from. Qwen3.8-Flash-Next keeps no such
+state ([internals](internals.md#replay-points-and-checkpoints)).
+
+Such a state is opportunistic: memory that runs short drops it first, and the
+SSD cache never writes it, so a client that never sends a reply back as it came
+costs the cache nothing. A request whose prompt renders an earlier reply back,
+as far as a page that reply's state was kept at, whether memory still holds that
+state or not, shows that its conversation renders replies back: its own reply's
+state is kept when the reply holds at least 2048 tokens past its prompt's state
+(fewer prefill again faster than their state writes), and memory that runs short
+writes it to the SSD cache as any checkpoint, so the next turn resumes after the
+reply under memory pressure too, and so is the state of each later such turn.
 
 Chat and text completions include a llama-server-style `timings` object, both in
 non-streaming responses and in the final finish-reason chunk of a stream,
@@ -521,6 +575,14 @@ reference a remote document, and cannot combine `unevaluatedProperties` with
 final output; it does not inject formatting instructions into the prompt.
 Clients should describe their output requirements in their own messages.
 
+The JSON is the answer's first token where no reasoning comes before it, so a
+small output limit is spent on the value; after reasoning, up to 64 whitespace
+characters may set it apart, as the template's blank line after `</think>`
+does. Between the value's own tokens the model may write up to 64 whitespace
+characters, which takes pretty printing 15 levels deep at four spaces;
+whitespace inside strings is content and unbounded. A required or named tool
+call starts the same way.
+
 ## Images and PDFs
 
 Images arrive inline as base64 `data:` URLs: Chat `image_url` parts, Responses
@@ -624,8 +686,9 @@ an empty think block, `<think></think>`, and the answer slots are read after it,
 where its answer starts. Besides the row it takes `model`, `timeout`,
 `priority` and `cache_salt` as the generation APIs do ([request
 fields](#request-fields)); other generation controls return errors rather than
-silently changing the scoring protocol. SemIf-derived code retains its MIT
-notice in `server/dialects/scoring.py`.
+silently changing the scoring protocol. A row's text is text to the model, as a
+message's is: evidence that spells `<|im_end|>` ends no turn. SemIf-derived code
+retains its MIT notice in `server/dialects/scoring.py`.
 
 `POST /v1/systemone` requires the served `model`, a string/object/array `state`,
 and a nonempty `questions` map, and takes `cache_salt` as the generation APIs
@@ -676,6 +739,7 @@ fields; additional fields may be added:
 | `streamed_table` | While the PLE table streams, the [streamed PLE table](server.md#ple-table-streaming)'s cache, stages, reads and prefetches; `null` otherwise |
 | `streamed_experts` | While routed experts stream, the [streamed experts](server.md#streamed-experts)' store: its bytes at its cap and floor, its live chunks and those at the cap, the chunks it gave back and took back, its live chunks' bytes and slots and its resident experts, per use its loads, reads, read-ahead and host-step round trips, and its failure; `null` otherwise |
 | `kv_spill` | While a block-sparse target's KV can go to the SSD, its [KV on the SSD](server.md#kv-on-the-ssd): the requests that started in each mode, converted to `spill`, had their output bounded (once per request, at its start or a resume) or ended at that bound (and of those, the converted ones: `converted_bounded`, `converted_length_ends`), and were refused for the quota, the write budget or a closed tier, and the starts waiting for the quota (`requests`); the pages that hold only their index and those whose KV is on the SSD; the write-through of spilling requests' pages; page moves (`spill_moves`), and of those the releases that gave a spilling request's pages' memory back for a claim and their pages (`releases`, `released_pages`); rewrites and restores; the quota of KV in service; the hot block cache's memory, hits, reads and host steps (`block_cache`; `read` over `resolves` is the blocks a layer's step missed on average) and the history streams' reads, how long each layer's took (`read_ms`, whose total gives with `bytes` the streams' bandwidth) and staging (`history_stream`); absent for a target whose KV stays in memory, whose plan's `memory_plan.budget.kv_spill` is `null` |
+| `disk.written_last_hour_bytes`, `written_last_day_bytes` | The [SSD cache](server.md#ssd-cache)'s write rate: the bytes its writes took over the last hour and the last day the Mac was awake, in the host pages each write stores, as `--max-cache-disk-writes` counts them, with a write budget or without. Each window ends now and is exact to a minute; an engine that started less than an hour or a day ago has written all of its count |
 | `disk.write_behind.waiting`, `durable`, `unneeded`, `refused` | The restore points the [SSD cache](server.md#ssd-cache) copies ahead: those queued for their copies, the one being copied among them (`waiting`), and since engine start those copied (`durable`), gone on from first (`unneeded`) and not copied for want of room or a file that takes writes (`refused`). An idle engine can report points waiting. Without `--persistent-cache` a point is copied only while a reclaim has reached cached KV or a state with no copy on the SSD within the last minute, 10 s after its publication once its request has ended; otherwise it waits for memory to run short, which may never happen, and is not work the engine owes. With it each point is written once it falls due, 10 s after its publication at the earliest, and at a clean stop (up to 6 s), so there `waiting` is SSD work still to come and drains by itself |
 | `kv.window` | For a target with sliding-window layers, its [windows](internals.md#sliding-windows): the `window_pages` a row's window and a state's tail keep Full, whether pages past every window give up their windowed layers' K/V (`trim`, off with the native `--kv-window-trim off`), the pool's `full_pages` and `slim_pages` in use and the Slim extents' `slim_bytes`, the `pinned_blocks` states' tails hold, the `trimmed_pages` since engine start, the `upgrades` of blocks that took the page of a writer that computed them again, and the `refused_states` whose tail was not Full; absent for other targets |
 | `memory_plan.budget.kv_window` | For a target whose pages give up a window's layers, a Slim page's `slim_page_bytes` and the `floor_pages` a lane keeps Full, by which one request's KV capacity is counted; absent for other targets |
@@ -683,14 +747,14 @@ fields; additional fields may be added:
 | `memory_plan.budget.host_held_back_bytes` | The expert store's chunks above its floor, which it started without and the memory ledger grows into as the host allows ([memory and context](server.md#memory-and-context)): no memory at the start, but among the fixed bytes, so that the context and the KV the plan holds are the limit's |
 | `ane_ffn.state`, `share`, `minimum_rows`, `reason` | The prefill FFN's [Neural Engine split](internals.md#neural-engine-prefill): `split` while it serves, at `share` of the FFN's channels over chunks of `minimum_rows` rows or more; `off` when the start left the GPU alone (`share` and `minimum_rows` 0); `stopped` once it stopped while serving, until the engine restarts. `reason` is the start's outcome, or why the split stopped |
 | `ane_ffn.split_commands`, `evaluations`, `ane_ms`, `reruns` | Prefill commands the split ran since engine start, the Neural Engine's evaluations in them and its milliseconds over them (each evaluation's from the GPU's signal to start it to its report); and the chunks the GPU ran again alone after the split's work for them failed |
-| `verify_rows` | The rows of a draft block decode cycles verify ([drafts](models.md#drafts), `--verify-rows`): `auto` where the verify budget chooses them (a MoE target under the default), `all` where they verify every row the output limit leaves (a dense target, or `--verify-rows all`) |
+| `verify_rows` | The rows decode cycles verify ([drafts](models.md#drafts), `--verify-rows`): `auto` where each cycle's step is the one of the most expected accepted tokens per measured cost, with what its cycles show a long history adds to it, every row of which its lanes' trees fill is verified, or, where the target's experts stream, each cycle verifies the rows whose chance of a token is worth their time by its cycles' cost line (the default), `all` where each verifies every row of a draft's block a lane, whatever output the lane has left (`--verify-rows all`) |
 | `model_timing.prefill.last_gpu_ms`, `total_gpu_ms` | GPU time of the last prefill command, and of all since engine start, warmup included: each from its first Metal command buffer's start to its last one's end, so with the Neural Engine split it spans the GPU's waits on the Neural Engine; a chunk's image encodes, a command of their own ahead of it, add theirs, as a chunk run again adds the rerun's |
 | `metrics.decode_tokens_per_second` | Aggregate native decode throughput, not a request's end-to-end rate |
 | `metrics.decode_wall_ms` | Total wall time of the decode commands on the GPU, from submission to completion |
 | `metrics.decode_cycle_ms` | Total engine time of the decode commands, each from the previous command's completion (or its plan after idleness) to its own: the GPU command plus the host work between commands |
 | `metrics.decode_gap_ms` | Every interval a request saw between two of its token events after its first, since engine start, undivided by the tokens an event carries (`itl_ms` divides it): what a streaming client waits between chunks, whatever the engine ran meanwhile. `p50`, `p95` and `p99` within a factor of two, `max` exact, `total` and `samples` |
 | `metrics.decode_gap_causes` | The decode gaps since engine start longer than the bound the scheduler sizes contended prefill work by (`scheduler.decode_gap_target_ms`), each counted once under the first cause that held in it: `prefill_unit` (a prefill command or pass ran), `claim_wait` (the lane's memory claim waited for memory on its way back, or to retry what the host refused), `ssd_read` (the decode command that ended it read from the SSD: experts the store missed, or spilled K/V), `pool_release` (a pool gave a unit back), `replan` (a plan was made again) or `other`, each with its `gaps` and their `ms`; and of the gaps a prefill unit caused, the time those units took (`prefill_ms`) |
-| `metrics.ttft_parts_ms` | Each request's time to its first token since engine start, split by what held it, each interval counted once by precedence, the parts of a request summing to its native TTFT: `own_prefill` (a prefill command in flight carried its prompt's rows), `claim_wait` (its memory claim waited for memory on its way back, or to retry what the host refused), `decode` (a decode command ran), `other_prefill` (another request's prefill command ran) and `rest` (the host, admission, idle), each in the shape of `metrics.decode_gap_ms`. The native log has one line per request at its first token with the same five parts |
+| `metrics.ttft_parts_ms` | Each request's time to its first token since engine start, split by what held it, each interval counted once by precedence, the parts of a request summing to its native TTFT: `own_prefill` (a prefill command in flight carried its prompt's rows), `claim_wait` (its memory claim waited for memory on its way back, or to retry what the host refused), `decode` (a decode command ran), `other_prefill` (another request's prefill command ran), `unit_wait` (the next prefill unit waited, with nothing running, for a decoder whose memory was on its way back, at most as long as the last unit took) and `rest` (the host, admission, idle), each in the shape of `metrics.decode_gap_ms`. The native log has one line per request at its first token with the same six parts |
 | `scheduler.decode_gap_target_ms`, `contended_prefill_ms` | The decode gap the scheduler sizes contended prefill work by, and the wall time of each prefill unit (a command, or one pass of it) that ran while a request of its priority or a higher one decoded, in the shape of `metrics.decode_gap_ms`, its `p50`, `p95` and `p99` within a millisecond and never above `max` |
 | `scheduler.prefill_units`, `pass_commands`, `abandoned_pass_commands`, `bound_cuts`, `index_page_conflicts`, `replans` | Since engine start: the prefill units run; the commands that ran in passes over the model's layers, and those a superseding plan abandoned between passes; the contended plans whose leader was cut to fewer rows than it would run alone; the plans that left out a request that could have joined them because the command already held the most requests whose history may have pages only on the SSD that the model reads in one command; and the plans prepared again because a request's memory was refused or held back, a state capture cut its rows, or its KV converted to `spill` |
 | `memory_governor.host_telemetry` | The host's memory as macOS counts it, beside the governor's estimate, which no rule acts on: the engine process's `phys_footprint_bytes` and the part of them macOS holds `compressed_bytes`, the host's `file_backed_bytes` (its file cache, active and inactive alike) and `inactive_bytes` (its inactive and speculative pages, file-backed and anonymous alike: macOS splits neither queue), and the file cache macOS keeps however short memory is (`filecache_min_bytes`, `vm.vm_page_filecache_min`); `null` where macOS does not report it |
@@ -704,7 +768,8 @@ fields; additional fields may be added:
 | `maximum_context_tokens` | Declared context limit; available memory may limit admission |
 | `thermal_state` | The Mac's thermal state as macOS reports it: `nominal`, `fair`, `serious` or `critical`. As the Mac heats, its CPU and GPU clocks drop and prefill and decode slow down, on some Macs already at `fair`; readiness ignores it. The engine samples it twice a second and logs each change (`Thermal state: fair → serious`) |
 | `vision`, `input_modalities` | Whether image and PDF input is accepted; `false` and `["text"]` for a model serving without vision |
-| `reasoning_switch` | Whether a request's reasoning effort or `enable_thinking` turns the model's reasoning on and off ([default reasoning effort](server.md#default-reasoning-effort)): `true` for the Qwen families, `false` for Flint, whose model decides each turn |
+| `reasoning_switch` | Whether a request's reasoning effort or `enable_thinking` turns the model's reasoning on and off ([default reasoning effort](server.md#default-reasoning-effort)): `true` for the Qwen families, `false` for Flint, whose model decides each turn, and under `--reasoning-effort`, where the server sets every request's effort |
+| `reasoning_effort` | The effort `--reasoning-effort` gives every request, whatever it asks; `null` without the option |
 | `chat_template.later_system` | `native`, `patched` or `unsupported`: how system messages after the first render (per name for named templates) |
 | `transport.recovering`, `transport.stopped`, `transport.error` | The engine is restarting, or Splash stopped restarting it after a failure a restart would meet again, or after 6 failures in a row, and the server is exiting ([engine restarts](server.md#engine-restarts-and-sleep)); `error` names its failure, the last failed restart, or why restarts stopped |
 | `capabilities.max_context_tokens` | The context the server serves now: the latest engine's, which a restart whose plan holds less may lower until a later one regains it |
@@ -721,7 +786,8 @@ until the pressure lifts.
 `GET /metrics` exports in Prometheus text format the `requests`,
 `memory_actual` and `metrics` fields above, the status's scheduler, KV, cache,
 admission and image counts, the SSD cache's quota, limit, use, volume space,
-write budget, what holds its writes back and the bytes it read and wrote, and
+write budget, what holds its writes back, the bytes it read and wrote and those
+it wrote over the last hour and day, and
 readiness, memory pressure and thermal state. It also exports the decode gaps,
 the scheduler's gap target, contended prefill units, bound cuts, index page
 conflicts and replans, the memory ledger's owed and claimed bytes and per account
@@ -761,11 +827,12 @@ cannot avoid model prefill.
 
 Exact-prefix caching reuses model work while the server runs, and across
 restarts with `--persistent-cache` ([persistent cache](server.md#persistent-cache)).
-Text requests also reuse tokenized history at literal message-end boundaries
-when the tokenizer supports independent encoding there. This process-local cache
-retains the newest prefix of up to sixteen conversations, in storage sized for
-four prompts of the served context however Python stores their text (24 bytes a
-token); it falls back to full encoding for other tokenizer pipelines.
+Chat requests also reuse tokenized history at literal message-end boundaries,
+with images and with tags a message quotes as without, where the family's
+boundary is one added token of the tokenizer and no other holds it. This
+process-local cache retains the newest prefix of up to sixteen conversations,
+in storage sized for four prompts of the served context however Python stores
+their text (24 bytes a token).
 `/status.tokenizer_cache` reports its usage: `hits` and `misses` count the
 prompts long enough to look up (4,096 characters through their last message
 end) that found a cached prefix and that did not, and `evictions` the prefixes

@@ -10,6 +10,7 @@
 #include <memory>
 #include <optional>
 #include <span>
+#include <stdexcept>
 #include <vector>
 
 namespace splash::test {
@@ -123,6 +124,17 @@ inline engine::FreeResult releaseStep(engine::Cache &cache, engine::ReclaimClass
 }
 inline engine::FreeResult stateStep(engine::Cache &cache, engine::ReclaimClass reach = engine::ReclaimClass::Ordinary) {
   return takeStep(cache, {.cls = engine::ClaimClass::InService, .reach = reach}, {.stateBuffers = 1});
+}
+// Every state's buffers a claim of `spec` takes of the cache, a state at a
+// time as the ledger frees one for it (freeFromCache), until one gives
+// nothing: Pending once a write it waits for starts. Returns the states
+// taken.
+inline uint32_t takeStates(engine::Cache &cache, const engine::ClaimSpec &spec) {
+  uint32_t taken = 0;
+  while (freeFromCache(cache, spec, {.stateBuffers = 1}).gave())
+    if (++taken > cache.snapshot().stateCache.entries + 1000)
+      throw std::logic_error("taking states did not end");
+  return taken;
 }
 
 } // namespace splash::test

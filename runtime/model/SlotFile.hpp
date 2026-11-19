@@ -4,6 +4,7 @@
 #include "Checked.hpp"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -22,12 +23,15 @@ namespace splash::model {
 
 // The disk one cache tier may use, shared by every slot file of the tier.
 // Reservations and releases come from the engine thread and from whoever
-// drops the last handle of a slot. The budget bounds live slots by its
-// limit: the quota at most, and less while the volume the files live on
-// leaves less (engine::DiskSpace sets it). A limit below what the tier holds
-// is met by the cache giving copies up (Cache::keepDiskLimit), so live slots
-// can exceed it for a while, as slots a persistent file adopted can. A freed
-// slot returns its bytes at once but its blocks only when its file's worker
+// drops the last handle of a slot. A slot counts what it keeps on the volume
+// (SlotFile::quotaBytesFor): the host pages its write stores, which the write
+// budget charges too, so a KV page that kept 14 of its 49 layers counts 464
+// KiB of its 1.59 MiB slot. The budget bounds live slots by its limit: the
+// quota at most, and less while the volume the files live on leaves less
+// (engine::DiskSpace sets it). A limit below what the tier holds is met by
+// the cache giving copies up (Cache::keepDiskLimit), so live slots can exceed
+// it for a while, as slots a persistent file adopted can. A freed slot
+// returns its bytes at once but its blocks only when its file's worker
 // punches them, after the transfer that worker is in, so the files' blocks
 // can briefly exceed the limit by the slots freed but not yet punched.
 //
@@ -187,6 +191,27 @@ public:
   // reach the disk (WriteBehind::flush).
   void lift() noexcept { lifted_ = true; }
 
+  // The write rate: what the tier's writes took over the last hour and the
+  // last day, counted as the write budget counts them, in the host pages
+  // each write stores and on its clock, with a write budget or without. The
+  // day's bytes are what a write budget would have had to cover, so they
+  // are the number to set one from and to hold against the drive's rated
+  // endurance; the hour's are what the load of the moment writes, 24 times
+  // which projects a day before one has passed. The cumulative count alone
+  // (writtenBytes) says neither without a second reading and the time
+  // between them: a deployment that read its count after 22 h found 1.85 TB,
+  // 7 times its quota a day. Each window ends now and is exact to a minute
+  // of the clock; a process younger than a window has written all of its
+  // count. Engine thread.
+  struct WriteRate final {
+    uint64_t hourBytes = 0;
+    uint64_t dayBytes = 0;
+  };
+  [[nodiscard]] WriteRate writeRate() const noexcept {
+    const uint64_t minute = minuteAt(clock_());
+    return {chargedWithin(kHourMinutes, minute), chargedWithin(kDayMinutes, minute)};
+  }
+
   // A write of the tier found its volume full (ENOSPC, EDQUOT). The worker
   // that met it only reports it: its file goes on, and what the engine
   // admits does not change until it measures the volume
@@ -210,9 +235,11 @@ public:
   [[nodiscard]] uint64_t writtenBytes() const noexcept {
     return written_.load(std::memory_order_relaxed);
   }
-  // Bytes the budget's files hold on disk, counting each slot written since
-  // its blocks last went back as a whole slot, though a shorter payload
-  // stores only its own pages.
+  // Bytes the budget's files hold on disk: for each slot's range, what the
+  // slot written there since its blocks last went back counts
+  // (SlotFile::quotaBytesFor), the most of them where a punch failed between
+  // two, and the whole range where it lies in a hole a write past the
+  // file's end left whose punch failed.
   [[nodiscard]] uint64_t fileBytes() const noexcept {
     return file_.load(std::memory_order_relaxed);
   }
@@ -226,15 +253,37 @@ private:
   friend class SlotFile;
   static constexpr double kDayMilliseconds = 86'400'000.0;
 
+  static constexpr double kMinuteMilliseconds = 60'000.0;
+  static constexpr uint64_t kHourMinutes = 60;
+  static constexpr uint64_t kDayMinutes = 1440;
+
   // The balance at `now` on the budget's clock.
   [[nodiscard]] double balanceAt(double now) const noexcept {
     return std::min(burstBytes_, balance_ + refillPerMillisecond_ * (now - balanceTime_));
   }
+  [[nodiscard]] static uint64_t minuteAt(double now) noexcept {
+    return static_cast<uint64_t>(now / kMinuteMilliseconds);
+  }
+  // What was charged in the `minutes` minutes of the clock that end with
+  // `minute`. The minutes after the last charge took nothing: their places
+  // still hold what was charged a day before them.
+  [[nodiscard]] uint64_t chargedWithin(uint64_t minutes, uint64_t minute) const noexcept {
+    uint64_t bytes = 0;
+    for (uint64_t ago = minute - chargedMinute_; ago < minutes && ago <= minute; ++ago)
+      bytes += charged_[(minute - ago) % kDayMinutes];
+    return bytes;
+  }
   // The host pages a write stores, as SlotFile::write submits it.
   void charge(uint64_t bytes) noexcept {
+    const double now = clock_();
+    const uint64_t minute = minuteAt(now);
+    // The minutes since the last charge took nothing.
+    for (uint64_t idle = chargedMinute_ + 1; idle <= minute && idle - chargedMinute_ <= kDayMinutes; ++idle)
+      charged_[idle % kDayMinutes] = 0;
+    chargedMinute_ = minute;
+    charged_[minute % kDayMinutes] += bytes;
     if (!refillPerMillisecond_)
       return;
-    const double now = clock_();
     balance_ = balanceAt(now) - static_cast<double>(bytes);
     balanceTime_ = now;
   }
@@ -259,6 +308,11 @@ private:
   double balance_ = 0.0;
   double balanceTime_ = 0.0;
   bool lifted_ = false;
+  // The write rate, on the engine thread: what each of the last day's
+  // minutes of the clock was charged, a minute's at its number modulo the
+  // day's, and the minute of the last charge.
+  std::array<uint64_t, kDayMinutes> charged_{};
+  uint64_t chargedMinute_ = 0;
 };
 
 // One slot a persistent file keeps from an earlier process, as its record
@@ -295,6 +349,17 @@ struct SlotRecord final {
 // file-size limit fails a write rather than killing the process, a file
 // ignores SIGXFSZ from its construction on.
 //
+// A slot is acquired for a payload and takes of the quota what it keeps on
+// the volume (quotaBytesFor): the payload's host pages, the rest of the slot
+// left a hole. The volume does not leave it one by itself: a write past what
+// the file held has the hole before it allocated (APFS filled gaps of 1 to
+// 16 MiB, so 256 payloads of 462 KiB in 1.59 MiB slots took 407 MiB until
+// their slots were freed and written again, then 116 MiB), so such a write
+// returns that hole, and a file ends with its last slot that holds blocks,
+// since a hole at its end is allocated whole under a write into it. A
+// volume that returns no blocks keeps whole slots, and there a slot counts
+// whole.
+//
 // A temporary file is unlinked at once and gone with the process. A
 // persistent file stays, with a record file beside it: one fixed-size record
 // per slot, written by the worker after the slot's write has landed, from
@@ -321,10 +386,18 @@ public:
     uint32_t labelBytes = 0;
   };
 
-  // The slot that holds payloadBytes: writes zero the rest of its page.
+  // The host pages a payload of payloadBytes fills, in bytes: what a write of
+  // it stores, zeros to the end of its last page, and the size of the slots
+  // of a file whose largest payload it is.
   [[nodiscard]] static constexpr uint64_t slotBytesFor(uint64_t payloadBytes) noexcept {
     return alignUp(payloadBytes);
   }
+  // What a slot holding a payload of payloadBytes takes of the quota, the
+  // blocks it keeps on the volume: the payload's host pages while the volume
+  // returns blocks, the whole slot once a punch failed, as on a volume that
+  // has no holes (HFS+, exFAT), where the slot keeps what an earlier payload
+  // or the volume itself stored around the payload.
+  [[nodiscard]] uint64_t quotaBytesFor(uint64_t payloadBytes) const noexcept;
 
   // How a file's slots are written, beside their size and persistence.
   struct Options final {
@@ -353,12 +426,16 @@ public:
     // Unique in the process, from acquire() or adopt(): a slot is written
     // once while held, so the id names the bytes of one write.
     [[nodiscard]] uint64_t id() const noexcept { return id_; }
+    // What the slot takes of the quota while it is held (quotaBytesFor of
+    // the payload it was acquired for or adopted with).
+    [[nodiscard]] uint64_t bytes() const noexcept { return bytes_; }
 
   private:
     friend class SlotFile;
     Slot(std::shared_ptr<Backing> backing, uint32_t index);
     std::shared_ptr<Backing> backing_;
     uint32_t index_;
+    uint64_t bytes_ = 0;
     uint64_t id_;
     // Set by the worker, which runs a file's operations in submission
     // order, once a write landed; read beside it too (readAt), which then
@@ -409,9 +486,11 @@ public:
   ~SlotFile();
   SlotFile(const SlotFile &) = delete;
   SlotFile &operator=(const SlotFile &) = delete;
-  // Null when the live slots are at the budget's limit for the draw
-  // (DiskBudget::reserve).
-  [[nodiscard]] std::shared_ptr<Slot> acquire(DiskBudget::Draw draw = DiskBudget::Draw::Cache);
+  // A slot for a payload of payloadBytes, at most a slot's. Null when the
+  // budget's limit for the draw has no room for what it takes
+  // (quotaBytesFor, DiskBudget::reserve).
+  [[nodiscard]] std::shared_ptr<Slot> acquire(uint64_t payloadBytes,
+                                              DiskBudget::Draw draw = DiskBudget::Draw::Cache);
   [[nodiscard]] uint64_t slotBytes() const noexcept;
   // False once a write has failed for another reason than a full volume;
   // complete slots stay readable.
@@ -429,14 +508,17 @@ public:
   // opened: empty for a temporary or a new one.
   [[nodiscard]] const std::vector<SlotRecord> &records() const noexcept { return records_; }
   // Takes back the slot a record names, before finishAdoption(). It counts
-  // against the budget even past its capacity, so that the caller can give
-  // up what the quota no longer holds; its reads fail unless what they
-  // cover matches the record.
+  // against the budget as a slot acquired for the record's payload does,
+  // even past the capacity, so that the caller can give up what the quota
+  // no longer holds; its reads fail unless what they cover matches the
+  // record.
   [[nodiscard]] std::shared_ptr<Slot> adopt(const SlotRecord &record);
-  // Ends adoption: every slot not adopted is freed, its record cleared and
-  // its blocks returned. A record that cannot be cleared stays, reported,
-  // until its slot is reused; its punched payload fails any later check.
-  // acquire() needs it in a persistent file.
+  // Ends adoption: every slot not adopted is freed and its record cleared,
+  // and every block no adopted payload holds goes back, those slots' and
+  // what the volume kept around a shorter payload, as the files of a
+  // process that returned no such hole hold it. A record that cannot be
+  // cleared stays, reported, until its slot is reused; its punched payload
+  // fails any later check. acquire() needs it in a persistent file.
   void finishAdoption();
   // Keeps the label in the slot's record once the write submitted before it
   // has landed; a slot whose write failed gets no record. A label is the
@@ -445,17 +527,20 @@ public:
   // Flushes the slots and records written so far to the drive.
   [[nodiscard]] std::shared_ptr<Operation> synchronize(std::function<void()> completion);
   // The process is ending: a slot dropped from now on keeps its blocks and
-  // its record for the next one.
-  void seal() noexcept;
-  // The spans total at most one slot, a write's exactly the segments in a
-  // file of several, and stay valid until the operation is ready. A write
-  // stores them in order from the start of the slot, zeros the rest of their
-  // last host page, and takes those pages from the write budget as it is
-  // submitted; a read fills them from the start of the slot, at most those
-  // pages and exactly the payload while an adopted slot is not yet trusted,
-  // and fails otherwise. A write is null once the file accepts no further
-  // writes, as acquire() is null at the limit; the write budget never makes
-  // it null.
+  // its record for the next one, which frees them (finishAdoption), and so
+  // does one whose punch has not started by `punchesEnd`, the earliest any
+  // seal gave: the worker starts no punch past it, so that an operation
+  // after the punches waits past it for one punch at most.
+  void seal(AwakeClock::time_point punchesEnd = AwakeClock::time_point::max()) noexcept;
+  // The spans total at most one slot, a write's no more host pages than its
+  // slot was acquired for and exactly the segments in a file of several, and
+  // stay valid until the operation is ready. A write stores them in order
+  // from the start of the slot, zeros the rest of their last host page, and
+  // takes those pages from the write budget as it is submitted; a read fills
+  // them from the start of the slot, at most those pages and exactly the
+  // payload while an adopted slot is not yet trusted, and fails otherwise. A
+  // write is null once the file accepts no further writes, as acquire() is
+  // null at the limit; the write budget never makes it null.
   [[nodiscard]] std::shared_ptr<Operation> write(
       std::shared_ptr<Slot> slot, std::vector<std::span<const std::byte>> source,
       std::function<void()> completion);
@@ -494,6 +579,9 @@ private:
   // each starts the worker last.
   void prepare(uint64_t slotBytes, std::shared_ptr<DiskBudget> budget, const Options &options);
   void uncache();
+  // Once the slot file is open, before any slot counts: whether its volume
+  // returns blocks (quotaBytesFor).
+  void askVolume();
   // Stops the file's writes; true for the call that stopped them.
   static bool stop(Backing &backing) noexcept;
   // Opens a persistent file and reads its records, or empties it when it
@@ -511,8 +599,9 @@ private:
   std::unique_ptr<std::byte, Free> buffer_;
   std::thread worker_;
   std::vector<SlotRecord> records_;
-  // Indices adopted until finishAdoption().
-  std::vector<bool> adopted_;
+  // Until finishAdoption(): the host pages of the payload each index was
+  // adopted with, in bytes; zero for one not adopted.
+  std::vector<uint64_t> adopted_;
 };
 
 } // namespace splash::model

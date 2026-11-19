@@ -719,11 +719,13 @@ def run_text_only(port: int, model: str, nonce: str) -> None:
     print("text-only media refusal: PASS", flush=True)
 
 
-# A tool whose only valid call is {"value": "ok"}.
+# A tool whose only valid call is {"value": "ok"}. Strict, so that its
+# arguments are generated to its schema.
 PROBE_TOOL = {
     "type": "function",
     "function": {
         "name": "record_probe",
+        "strict": True,
         "description": "Record the fixed smoke-test value.",
         "parameters": {
             "type": "object",
@@ -802,7 +804,7 @@ def run(port: int, model: str) -> None:
     require(calls[0].get("function", {}).get("name") == "record_probe", "wrong tool")
     require(
         json.loads(calls[0]["function"]["arguments"]) == {"value": "ok"},
-        "wrong tool arguments",
+        f"wrong strict tool arguments: {calls!r}",
     )
     print("tool protocol: PASS", flush=True)
 
@@ -992,9 +994,9 @@ def run_sampling(port: int, model: str, switch: bool = True) -> None:
     penalized greedy, sampled and constrained requests finish side by side with
     an unpenalized one and with sampled ones whose top_k keeps every token or
     which min_p cuts. Greedy output repeats only where decode cycles verify
-    every row (/status verify_rows all), so on a MoE target, whose rows the
-    verify budget chooses unless it serves with --verify-rows all, the two
-    greedy comparisons are left out."""
+    every row of a draft's block a lane (/status verify_rows all): where the
+    measured costs choose their rows, unless the server serves with
+    --verify-rows all, the two greedy comparisons are left out."""
     repeats = runtime_status(port)["verify_rows"] == "all"
     prompt = "Name the days of the week, three times over, separated by commas."
     penalized = chat_body(

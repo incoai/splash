@@ -3,8 +3,8 @@
 // scan (output rows and the fp32 state it hands to decode), and the gated
 // output norm, for both compiled head layouts and ragged token counts that
 // leave partial scan blocks and single-token chunks. The scan over a bf16
-// state is checked against the fp32 scan, and a prefill that captures states
-// inside its rows against the same rows split there.
+// state is checked against the fp32 scan, and a prefill that caches states
+// inside its rows and at their end against the same rows split there.
 #include "../../../runtime/metal/CommandGraph.hpp"
 #include "../../../runtime/metal/MetalBackend.hpp"
 #include "../../../runtime/ops/GDN.hpp"
@@ -13,6 +13,7 @@
 
 #include "LinearNumerics.hpp"
 #include "NormReference.hpp"
+#include "StateCodecReference.hpp"
 #include "TestFamilies.hpp"
 
 #import <Foundation/Foundation.h>
@@ -517,7 +518,8 @@ void runBfloatStateCase(MetalBackend &backend, const GdnShape &shape,
 }
 
 // A lane of a ragged prefill command: its rows among the command's and the
-// rows after which it captures its state.
+// rows after which it caches its state, the last of which may be its rows'
+// end.
 struct RaggedLane final {
   uint32_t rowBegin = 0;
   uint32_t tokens = 0;
@@ -525,7 +527,7 @@ struct RaggedLane final {
 };
 
 // One run of a ragged command: the command's row buffers and each lane's
-// final state and, where the run captures them, the states inside its rows.
+// final state and, where the run caches them, the states inside its rows.
 struct RaggedRun final {
   GdnPrefillBuffers rows;
   std::vector<MetalBuffer> convolution;
@@ -533,19 +535,21 @@ struct RaggedRun final {
   std::vector<std::vector<GdnPrefillCapture>> captures;
 };
 
-// A prefill that captures states inside its rows runs the prepare and scan
-// dispatches once per run between them, chaining the state through the captured
-// ones, and the gate once: ragged lanes in one command, each from the shared
-// starting state, capturing one to three states at rows off the sixteen-token
-// scan block, with segments of one and two rows. Each captured state is the state
-// a prefill split there stores, byte for byte, convolution carry and
-// recurrent state, and the whole command equals the split; with an fp32
+// A prefill that caches states inside its rows runs the prepare and scan
+// dispatches once per run between them, chaining the state through its own
+// output, and the gate once, each cached state's codes following the run
+// that ends at it: ragged lanes in one command, each from the shared
+// starting state, caching one to three states at rows off the sixteen-token
+// scan block, with segments of one and two rows, one also at its rows' end.
+// Each cached state is the state a prefill split there stores, convolution
+// carry byte for byte and its recurrent state's codes as the CPU makes them
+// of the split's state, and the whole command equals the split; with an fp32
 // state, whose segments are invisible, it also equals the single pass.
 void runCapturedStatesCase(MetalBackend &backend, const GdnShape &shape, GdnStateFormat format) {
   const std::string label = "vh" + std::to_string(shape.valueHeads) + " " +
                             std::string(splash::ops::formatName(format)) + " captured states: ";
   const std::vector<RaggedLane> lanes{
-      {0, 37, {17}}, {37, 1000, {1, 333, 998}}, {1037, 611, {300, 302}}, {1648, 400, {}}};
+      {0, 37, {17}}, {37, 1000, {1, 333, 998, 1000}}, {1037, 611, {300, 302}}, {1648, 400, {}}};
   const uint32_t tokens = 2048;
   GdnPrefillBuffers source = randomPrefill(backend, shape, tokens);
   const uint64_t elements = source.recurrentIn.sizeBytes() / 4;
@@ -557,6 +561,8 @@ void runCapturedStatesCase(MetalBackend &backend, const GdnShape &shape, GdnStat
       data<uint16_t>(narrow)[i] = toBf16(data<float>(source.recurrentIn)[i]);
     source.recurrentIn = narrow;
   }
+  const uint32_t stateRows = shape.valueHeads * kHeadDim;
+  const uint64_t codesBytes = state_codec_layer_bytes(stateRows, kHeadDim);
   const uint64_t keyBytes = uint64_t{shape.keyHeads} * kHeadDim * 2;
   const uint64_t valueBytes = uint64_t{shape.valueHeads} * kHeadDim * 2;
   const auto run = [&] {
@@ -595,23 +601,28 @@ void runCapturedStatesCase(MetalBackend &backend, const GdnShape &shape, GdnStat
   uint64_t dispatches = 0;
   for (size_t lane = 0; lane < lanes.size(); ++lane) {
     const RaggedLane &ragged = lanes[lane];
-    for (RaggedRun *target : {&captured, &split})
-      for (uint32_t row : ragged.captures)
-        target->captures[lane].push_back(
-            {row, shared(backend, carriedBytes, "captured conv"), shared(backend, stateBytes, "captured state")});
+    // The split's states are the running ones, the command's their codes.
+    for (uint32_t row : ragged.captures) {
+      captured.captures[lane].push_back(
+          {row, shared(backend, carriedBytes, "captured conv"), shared(backend, codesBytes, "captured codes")});
+      split.captures[lane].push_back(
+          {row, shared(backend, carriedBytes, "split conv"), shared(backend, stateBytes, "split state")});
+    }
     GDN::addPrefill(capturing, backend,
                     rows(captured, ragged.rowBegin, ragged.tokens, source.convolutionIn, source.recurrentIn,
                          captured.convolution[lane], captured.recurrent[lane]),
                     shape, ragged.tokens, format, GdnHeadOrder::Grouped, captured.captures[lane]);
-    dispatches += 2 * (ragged.captures.size() + 1) + 1;
+    const bool atEnd = !ragged.captures.empty() && ragged.captures.back() == ragged.tokens;
+    dispatches += 2 * (ragged.captures.size() - (atEnd ? 1 : 0) + 1) + 1 + ragged.captures.size();
     GDN::addPrefill(whole, backend,
                     rows(single, ragged.rowBegin, ragged.tokens, source.convolutionIn, source.recurrentIn,
                          single.convolution[lane], single.recurrent[lane]),
                     shape, ragged.tokens, format, GdnHeadOrder::Grouped);
     MetalBuffer convolution = source.convolutionIn, recurrent = source.recurrentIn;
     uint32_t begin = 0;
-    for (size_t part = 0; part <= ragged.captures.size(); ++part) {
-      const bool last = part == ragged.captures.size();
+    const size_t splitParts = ragged.captures.size() - (atEnd ? 1 : 0) + 1;
+    for (size_t part = 0; part < splitParts; ++part) {
+      const bool last = part + 1 == splitParts;
       const uint32_t end = last ? ragged.tokens : ragged.captures[part];
       const MetalBuffer convolutionOut = last ? split.convolution[lane] : split.captures[lane][part].convolution;
       const MetalBuffer recurrentOut = last ? split.recurrent[lane] : split.captures[lane][part].recurrent;
@@ -625,7 +636,7 @@ void runCapturedStatesCase(MetalBackend &backend, const GdnShape &shape, GdnStat
     }
   }
   require(capturing.dispatches().size() == dispatches,
-          label + "a captured state does not add one prepare and one scan");
+          label + "a cached state does not add one prepare and one scan inside the rows, and one quantize");
   submit(capturing);
   submit(whole);
   submit(parts);
@@ -646,14 +657,47 @@ void runCapturedStatesCase(MetalBackend &backend, const GdnShape &shape, GdnStat
       same(got.recurrent[lane], want.recurrent[lane], "recurrent state differs from " + against);
     }
   };
+  // The codes the CPU makes of a split's state, widened from bf16.
+  const auto codesOf = [&](const MetalBuffer &state) {
+    std::vector<float> values(elements);
+    for (uint64_t i = 0; i < elements; ++i)
+      values[i] = format == GdnStateFormat::Float32 ? data<float>(state)[i]
+                                                    : static_cast<float>(fromBf16(data<uint16_t>(state)[i]));
+    return splash::test::stateCodesReference(values.data(), stateRows, kHeadDim);
+  };
   for (size_t lane = 0; lane < lanes.size(); ++lane)
     for (size_t index = 0; index < lanes[lane].captures.size(); ++index) {
-      const std::string where = " of lane " + std::to_string(lane) + " at row " +
-                                std::to_string(lanes[lane].captures[index]);
-      same(captured.captures[lane][index].convolution, split.captures[lane][index].convolution,
-           "captured convolution carry differs from the split's" + where);
-      same(captured.captures[lane][index].recurrent, split.captures[lane][index].recurrent,
-           "captured recurrent state differs from the split's" + where);
+      const uint32_t row = lanes[lane].captures[index];
+      const std::string where = " of lane " + std::to_string(lane) + " at row " + std::to_string(row);
+      const bool end = row == lanes[lane].tokens;
+      if (!end)
+        same(captured.captures[lane][index].convolution, split.captures[lane][index].convolution,
+             "cached convolution carry differs from the split's" + where);
+      const std::vector<uint8_t> codes = codesOf(end ? split.recurrent[lane] : split.captures[lane][index].recurrent);
+      require(std::memcmp(captured.captures[lane][index].recurrent.contents(), codes.data(), codes.size()) == 0,
+              label + "cached codes differ from the CPU's of the split's state" + where);
+    }
+  // A cached state in the running format (--cached-states exact) captures
+  // the split's state as it is, byte for byte.
+  RaggedRun exact = run();
+  exact.captures.resize(lanes.size());
+  CommandGraph exactCapturing;
+  for (size_t lane = 0; lane < lanes.size(); ++lane) {
+    for (uint32_t row : lanes[lane].captures)
+      exact.captures[lane].push_back(
+          {row, shared(backend, carriedBytes, "exact conv"), shared(backend, stateBytes, "exact state")});
+    GDN::addPrefill(exactCapturing, backend,
+                    rows(exact, lanes[lane].rowBegin, lanes[lane].tokens, source.convolutionIn, source.recurrentIn,
+                         exact.convolution[lane], exact.recurrent[lane]),
+                    shape, lanes[lane].tokens, format, GdnHeadOrder::Grouped, exact.captures[lane], false);
+  }
+  submit(exactCapturing);
+  for (size_t lane = 0; lane < lanes.size(); ++lane)
+    for (size_t index = 0; index < lanes[lane].captures.size(); ++index) {
+      const bool end = lanes[lane].captures[index] == lanes[lane].tokens;
+      same(exact.captures[lane][index].recurrent, end ? split.recurrent[lane] : split.captures[lane][index].recurrent,
+           "an exact cached state differs from the split's state of lane " + std::to_string(lane) + " at row " +
+               std::to_string(lanes[lane].captures[index]));
     }
   sameRows(captured, split, "the split");
   if (format == GdnStateFormat::Float32)
@@ -717,8 +761,9 @@ void bufferExtents(MetalBackend &backend, const GdnShape &shape, bool float32,
   const uint64_t valueRows = tokens * valueWidth * 2;
   const uint64_t stateElement = splash::ops::elementBytes(format);
   const uint64_t state = valueWidth * kHeadDim * stateElement;
+  const uint64_t codes = state_codec_layer_bytes(static_cast<uint32_t>(valueWidth), kHeadDim);
   const uint64_t carried = uint64_t{kCarried} * shape.convolutionDimension * 2;
-  const GdnPrefillCapture capture{17, shared(backend, carried, "captured conv"), shared(backend, state, "captured state")};
+  const GdnPrefillCapture capture{17, shared(backend, carried, "captured conv"), shared(backend, codes, "captured codes")};
   const auto encode = [&](CommandGraph &graph, const GdnPrefillBuffers &changed,
                           const GdnPrefillCapture &capture) {
     GDN::addPrefill(graph, backend, changed, shape, tokens, format, GdnHeadOrder::Grouped, {&capture, 1});
@@ -762,7 +807,7 @@ void bufferExtents(MetalBackend &backend, const GdnShape &shape, bool float32,
   for (const auto &[member, bytes, element, what] :
        std::initializer_list<std::tuple<MetalBuffer GdnPrefillCapture::*, uint64_t, uint64_t, const char *>>{
            {&GdnPrefillCapture::convolution, carried, 2, "GDN captured convolution state"},
-           {&GdnPrefillCapture::recurrent, state, stateElement, "GDN captured recurrent state"}})
+           {&GdnPrefillCapture::recurrent, codes, 2, "GDN captured recurrent codes"}})
     splash::test::requireExtent(backend, capture.*member, bytes, element, what,
                                 [&](CommandGraph &graph, const MetalBuffer &buffer) {
                                   GdnPrefillCapture changed = capture;

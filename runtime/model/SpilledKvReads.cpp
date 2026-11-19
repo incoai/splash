@@ -32,13 +32,13 @@ SpilledKvReads::~SpilledKvReads() {
 bool SpilledKvReads::active() const noexcept { return cache_ || stream_; }
 
 ops::AttentionBlocks SpilledKvReads::verify(metal::CommandGraph &graph, uint32_t layer,
-                                            const ops::AttentionBlocks &blocks) {
+                                            const ops::AttentionBlocks &blocks, uint32_t laneLists) {
   if (!cache_) throw std::logic_error("only a decode command's reads of spilled K/V resolve blocks");
   if (!running_) {
     stats_ = std::make_shared<KvReadStats>();
     running_ = true;
   }
-  return cache_->addResolve(graph, layer, sources_, blocks, locations_, stats_);
+  return cache_->addResolve(graph, layer, sources_, blocks, laneLists, locations_, stats_);
 }
 
 // The sequence's first chunk of the command begins the stream, and its first

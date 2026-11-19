@@ -53,6 +53,8 @@ struct NativeArguments final {
   std::filesystem::path cacheRoot;
   kv::Format kvFormat = kv::Format::Int8;
   ops::GdnStateFormat stateFormat = ops::GdnStateFormat::Float32;
+  // --cached-states exact: cached states keep stateFormat, not codes.
+  bool exactCachedStates = false;
   double decodeShare = EngineConfig{}.decodeShare;
   uint32_t maxImagePatches = ops::kMaximumImagePatches;
   // --idle-release SECONDS|off, infinite for off.

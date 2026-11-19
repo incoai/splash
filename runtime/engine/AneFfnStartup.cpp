@@ -16,6 +16,7 @@ namespace splash::engine {
 namespace {
 
 namespace ane_ffn = ops::ane_ffn;
+using Calibration = ane_ffn::Calibration;
 using Kind = AneFfnOutcome::Kind;
 
 // `tokens` with its thousands grouped, as the server prints a context.
@@ -179,6 +180,11 @@ AneFfnStart decide(const AneFfnModel &model, const AneFfnSetting &setting, Reque
     return AneFfnStart{std::move(prepared.split), std::move(plan.plan),
                        {Kind::Split, reason.str(), automaticWith(aneUnits), without}};
   };
+  // This Mac's calibration as recalled; what the next start does once this one tried to remember `record`.
+  std::optional<Calibration> calibration;
+  const auto keep = [&](const Calibration &record) {
+    return Calibration::nextStart(model.remember(maxAneUnits, record) ? record : calibration);
+  };
   try {
     if (given) {
       AneFfnPrepared prepared = model.prepare(*given, false);
@@ -202,39 +208,107 @@ AneFfnStart decide(const AneFfnModel &model, const AneFfnSetting &setting, Reque
       return gpuAloneServing(Kind::NoGain, std::move(reason));
     };
 
-    std::optional<ane_ffn::Calibration> calibration = model.recall(maxAneUnits);
+    // Why `step` failed on a backend that serves and in a start that goes on,
+    // or none, and whether the Neural Engine refused the split.
+    bool refusal = false;
+    const auto failure = [&](const auto &step) -> std::optional<std::string> {
+      try {
+        step();
+        return std::nullopt;
+      } catch (const ane::Interrupted &) {
+        throw;
+      } catch (const std::exception &error) {
+        if ((cancelled && cancelled()) || !model.healthy()) throw;
+        refusal = dynamic_cast<const ane::Refused *>(&error);
+        return error.what();
+      }
+    };
+    calibration = model.recall(maxAneUnits);
     if (calibration && calibration->aneUnits &&
         (calibration->aneUnits > maxAneUnits || calibration->minimumRows < ops::AneFfn::kMinimumRows ||
          calibration->minimumRows > ops::AneFfn::kMaximumRows))
       calibration.reset();
-    if (calibration) {
+    if (calibration && (calibration->aneUnits || calibration->refusals != 1)) {
       assumed = calibration->aneUnits;
       if (!calibration->aneUnits)
-        return gpuAloneServing(Kind::NoGain, "no Neural Engine split beat it by enough when this Mac calibrated it");
-      AneFfnPrepared prepared = model.prepare(calibration->aneUnits, false);
+        return gpuAloneServing(calibration->refusals ? Kind::Unavailable : Kind::NoGain, calibration->withoutSplit());
+      // The Neural Engine's refusal counts in the split's place; another failure keeps it.
+      AneFfnPrepared prepared;
+      if (const auto reason = failure([&] { prepared = model.prepare(calibration->aneUnits, false); }))
+        return gpuAloneServing(Kind::Unavailable, "its remembered share's split was not prepared: " + *reason + "; " +
+                                                      keep(refusal ? ane_ffn::refused(calibration) : *calibration));
       take(prepared, *calibration);
       return serve(std::move(prepared), calibration->aneUnits, calibration->minimumRows, "",
                    "set up as calibrated before");
     }
 
     const ane_ffn::Timings timings = model.time();
-    const std::optional<uint32_t> chosen =
-        ane_ffn::choose(ane_ffn::fit(timings.low, timings.high), timings.gpuAlone, model.units, maxAneUnits);
-    if (!chosen)
+    const auto choice = [&](const ane_ffn::Model &fitted) {
+      return ane_ffn::choose(fitted, timings.gpuAlone, model.units, maxAneUnits);
+    };
+    const ane_ffn::Model fitted = ane_ffn::fit(timings.low, timings.high);
+    const std::optional<uint32_t> first = choice(fitted);
+    if (!first)
       return noGain("no Neural Engine split beats its " + fixed(timings.gpuAlone) + layer +
                     " by enough (calibrated in " + seconds() + ")");
-    AneFfnPrepared prepared = model.prepare(*chosen, true);
+    const auto timedSplit = [&](uint32_t aneUnits) {
+      AneFfnPrepared split = model.prepare(aneUnits, true);
+      if (split.chunks.functions.empty()) throw std::logic_error("the split's chunks were not timed");
+      return split;
+    };
+    // The split's full chunk at the first units, timed nearest T's least as
+    // the fit's were and on their layers, before their split is prepared, so
+    // no two splits are held at once, fits u again (ane_ffn::refit); the
+    // units that model chooses serve where their split is prepared and takes
+    // no chunk longer (ane_ffn::slowerNowhere), else the first ones, whose
+    // split prepared: a refit whose split cannot be timed or prepared, on a
+    // backend that serves and in a start that goes on, says nothing against
+    // them, and a first split that does not prepare again leaves this start
+    // the GPU alone and the next its calibration. Either ended the start with
+    // the GPU alone, nothing remembered, so that every start calibrated again
+    // and ended so.
+    const auto refitting = [&](const char *failed, const auto &step) {
+      if (const std::optional<std::string> reason = failure(step))
+        logLine("The Neural Engine FFN split's refitted share was not ", failed, " (", *reason,
+                "); its first share serves.");
+    };
+    std::optional<uint32_t> refitted;
+    refitting("found", [&] {
+      refitted = choice(ane_ffn::refit(fitted, static_cast<double>(*first) / model.units,
+                                       model.timeAt(*first, timings.gpuAlone).split));
+    });
+    AneFfnPrepared prepared = timedSplit(*first);
+    uint32_t chosen = *first;
+    std::optional<std::string> unprepared;
+    if (refitted && *refitted != *first) {
+      const ane_ffn::ChunkTimings firstChunks = std::move(prepared.chunks);
+      prepared.split.reset();
+      std::optional<AneFfnPrepared> candidate;
+      refitting("prepared", [&] { candidate = timedSplit(*refitted); });
+      if (candidate && ane_ffn::slowerNowhere(candidate->chunks, firstChunks)) {
+        prepared = std::move(*candidate);
+        chosen = *refitted;
+      } else {
+        candidate.reset();
+        unprepared = failure([&] { prepared = model.prepare(*first, false); });
+        prepared.chunks = firstChunks;
+      }
+    }
     const ane_ffn::ChunkTimings &chunks = prepared.chunks;
-    if (chunks.functions.empty()) throw std::logic_error("the split's chunks were not timed");
     const std::string timed =
         fixed(chunks.functions.front().split) + layer + " against " + fixed(chunks.gpu[1].milliseconds);
     const std::optional<uint32_t> minimumRows = ane_ffn::minimumRows(chunks);
     if (!minimumRows)
       return noGain("no chunk of the Neural Engine split beats it by enough, " + timed + " (calibrated in " +
                     seconds() + ")");
-    const ane_ffn::Calibration made{*chosen, *minimumRows, chunks.gpu};
+    const Calibration made{chosen, *minimumRows, chunks.gpu, calibration ? calibration->refusals : 0};
+    if (unprepared) {
+      assumed = chosen;
+      return gpuAloneServing(Kind::Unavailable, "its calibrated share's split was not prepared again: " + *unprepared +
+                                                    "; " + keep(refusal ? ane_ffn::refused(calibration, made) : made));
+    }
     take(prepared, made);
-    AneFfnStart start = serve(std::move(prepared), *chosen, *minimumRows, ": " + timed + " on the GPU alone",
+    AneFfnStart start = serve(std::move(prepared), chosen, *minimumRows, ": " + timed + " on the GPU alone",
                               "calibrated");
     model.remember(maxAneUnits, made);
     return start;
@@ -242,7 +316,8 @@ AneFfnStart decide(const AneFfnModel &model, const AneFfnSetting &setting, Reque
     throw;
   } catch (const std::exception &error) {
     if ((cancelled && cancelled()) || !model.healthy()) throw;
-    return gpuAloneServing(Kind::Unavailable, error.what());
+    if (given || !dynamic_cast<const ane::Refused *>(&error)) return gpuAloneServing(Kind::Unavailable, error.what());
+    return gpuAloneServing(Kind::Unavailable, error.what() + ("; " + keep(ane_ffn::refused(calibration))));
   }
 }
 
