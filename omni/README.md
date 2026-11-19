@@ -114,7 +114,7 @@ Memory and lanes are sized automatically. To change them, add these to
 | --- | --- |
 | `--port 8001` | Listen on another port (default: 8000). |
 | `--lanes 4` | Requests decoded together (default: 8). |
-| `--max-memory 8G` | Cap Metal memory to leave room for other applications. |
+| `--max-memory 8G` | Cap Metal memory to leave room for other applications; a model that does not fit is refused. |
 | `--no-draft-model` | Transcribe without the draft (1.2 GiB less memory). |
 | `--disable-ane` | Run on the GPU alone, without the Neural Engine. |
 | `--offline` | Never contact the Hugging Face Hub. |

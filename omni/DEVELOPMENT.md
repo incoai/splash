@@ -187,12 +187,16 @@ blobs and `.incomplete` files in its cache folder.
 
 `gui/voice.py` runs voice chat's servers as a `VoiceStack` of three
 `ServerSession`s: Qwen3-ASR and Qwen3-TTS, each a `splash-omni serve` with
-few lanes (2 and 4) and `--max-memory 4G`, and a language model served by
+few lanes (2 and 4) and the `--max-memory` its model takes there
+(`speech_memory_gib`: 5G for 4-bit speech, 7G for bf16; 5G and 7G for
+transcription, 8G and 10G with the DFlash draft, so the draft fits), and a
+language model served by
 Splash: `splash serve --model M --language-only --idle-release off`, with
 the model's DFlash2 draft directory as `--draft-model`, `--offline` when
 both are in the Hub cache, and a `--max-memory` that leaves the speech
 servers room (`default_llm_memory`: the GPU's share of the Mac's memory,
-less 8 GiB for speech and a 1.5 GiB margin; 26G on a 48 GB Mac). `splash`
+less the two speech budgets and a 1.5 GiB margin; 21G on a 48 GB Mac with
+the default 4-bit models and the draft, 24G without it). `splash`
 is found as `$SPLASH_BIN`, else as the launcher of the Splash checkout that
 holds Splash Omni (`../splash`), else on the PATH; a path given on the page
 may also name the runtime of the Splash desktop app
@@ -267,7 +271,7 @@ recording fake AudioContext, and the resampler, segmenter and WAV encoder.
 | `--revision`, `--offline` | Install a named commit; never contact the Hub (a model already here starts without it either way). |
 | `--port`, `--host` | Listen address (default `127.0.0.1:8000`). |
 | `--lanes N` | Concurrent requests decoded in lock step (default 8; TTS at most 16, ASR at most 32). |
-| `--max-memory 28G` | Cap Metal memory; sizes the KV page pool after the weights. |
+| `--max-memory 28G` | Cap Metal memory; sizes the KV page pool after the weights. A model that does not fit, at the smallest pool (1 GiB), is refused, with what it takes. |
 | `--idle-release 10m` | Accepted for compatibility; the audio engine keeps its weights loaded. |
 | `--disable-ane` | The GPU alone. Transcription: by default a 4-bit model's prefill chunks of 160 tokens or more split their FFN with the Neural Engine; speech: by default the codec's convolution stack runs on the Neural Engine (`OMNI_DISABLE_ANE=1` also turns both off, `OMNI_CODEC_ANE=0` the codec's). See [Neural Engine prefill](#neural-engine-prefill) and [Neural Engine codec](#neural-engine-codec). |
 | `--draft-model PATH_OR_ID` | Transcription: speculative decoding with this draft model (a directory, or a repository ID, downloaded into the Hugging Face cache if missing). Default: the DFlash draft `wilsonzheng0327/Qwen3-ASR-1.7B-dflash` for Qwen3-ASR-1.7B (4-bit or bf16), none for other models. A DFlash draft (z-lab or Speculators checkpoint format) reads the served model's hidden states and proposes a block of tokens in one forward; a Qwen3-ASR-0.6B checkpoint drafts one token per forward. The served model verifies the proposals in one forward; transcripts stay its greedy ones (a near-tie may flip, as between batch sizes). With the default draft: 4-bit 2.0x audio s/s one request at a time, 1.3x long-form, 1.1x at 8; bf16 2.9x, 1.7x and 1.4x. About 1.2 GiB more memory and 0.7 GB of disk. See [DFlash draft](docs/omni-performance.md#round-21-a-dflash-draft) and, for the 0.6B, [round 7](docs/omni-performance.md#round-7-speculative-asr-with-a-qwen3-asr-06b-draft). |

@@ -33,8 +33,18 @@ DEFAULT_PORTS = {ASR: 8031, TTS: 8032, LLM: 8033}
 # each sizes its KV page pool to whatever budget the weights leave, which
 # would take the memory the language model needs.
 DEFAULT_LANES = {ASR: 2, TTS: 4}
-SPEECH_MEMORY = "4G"
-SPEECH_MEMORY_GIB = 4
+# Each speech server's --max-memory in GiB, by task and precision: what its
+# engine takes with those lanes and its smallest KV pool, which it refuses to
+# exceed (4-bit speech 4.1 GiB, bf16 6.6; transcription 4.1 and 6.3), and for
+# transcription with its DFlash draft the budget the engine fits the draft
+# in (7.3 and 9.4; M5 Pro, the engine's own figures).
+SPEECH_MEMORY_GIB = {
+    (TTS, "4bit"): 5,
+    (TTS, "bf16"): 7,
+    (ASR, "4bit"): 5,
+    (ASR, "bf16"): 7,
+}
+DRAFT_MEMORY_GIB = {"4bit": 8, "bf16": 10}
 DEFAULT_ASR = "mlx-community/Qwen3-ASR-1.7B-4bit"
 DEFAULT_TTS = "mlx-community/Qwen3-TTS-12Hz-1.7B-CustomVoice-4bit"
 # The models Splash serves (its README's table), the GGUF variant first.
@@ -155,7 +165,15 @@ def total_memory_gib():
         return None
 
 
-def default_llm_memory():
+def speech_memory_gib(task, model, speculative=False):
+    """A speech server's --max-memory in GiB (SPEECH_MEMORY_GIB)."""
+    precision = "bf16" if model.endswith("-bf16") else "4bit"
+    if task == ASR and speculative:
+        return DRAFT_MEMORY_GIB[precision]
+    return SPEECH_MEMORY_GIB[(task, precision)]
+
+
+def default_llm_memory(asr_model=None, tts_model=None, speculative=True):
     """Splash's --max-memory beside the two speech servers: the GPU's share
     of the Mac's memory less their budgets and a margin, or None (Splash's
     own budget) when that is unknown or too little."""
@@ -163,7 +181,9 @@ def default_llm_memory():
     if total is None:
         return None
     share = GPU_SHARE[0] if total >= 36 else GPU_SHARE[1]
-    budget = int(total * share - 2 * SPEECH_MEMORY_GIB - GPU_MARGIN_GIB)
+    speech = speech_memory_gib(ASR, asr_model or DEFAULT_ASR, speculative)
+    speech += speech_memory_gib(TTS, tts_model or DEFAULT_TTS)
+    budget = int(total * share - speech - GPU_MARGIN_GIB)
     return f"{budget}G" if budget >= MINIMUM_LLM_GIB else None
 
 
@@ -268,28 +288,42 @@ def _port(body, role):
     return port
 
 
+def _speech_memory(task, model, speculative=False):
+    """speech_memory_gib as --max-memory spells it; for a model that is not
+    a string, None, which the selection refuses by its own rule."""
+    if not isinstance(model, str):
+        return None
+    return f"{speech_memory_gib(task, model, speculative is True)}G"
+
+
 def selections(body):
     """The three servers a start request names; SelectionError for a setup
     that cannot start."""
     if not isinstance(body, dict):
         raise session.SelectionError("the setup must be a JSON object")
+    asr_model = body.get("asr_model", DEFAULT_ASR)
+    tts_model = body.get("tts_model", DEFAULT_TTS)
+    speculative = body.get("speculative", True)
     asr = session.Selection.from_request(
         {
             "task": session.ASR,
-            "model": body.get("asr_model", DEFAULT_ASR),
+            "model": asr_model,
             "port": _port(body, ASR),
-            "speculative": body.get("speculative", True),
+            "speculative": speculative,
             "lanes": body.get("asr_lanes", DEFAULT_LANES[ASR]),
-            "max_memory": body.get("speech_max_memory", SPEECH_MEMORY),
+            "max_memory": body.get(
+                "speech_max_memory",
+                _speech_memory(ASR, asr_model, speculative),
+            ),
         }
     )
     tts = session.Selection.from_request(
         {
             "task": session.TTS,
-            "model": body.get("tts_model", DEFAULT_TTS),
+            "model": tts_model,
             "port": _port(body, TTS),
             "lanes": body.get("tts_lanes", DEFAULT_LANES[TTS]),
-            "max_memory": body.get("speech_max_memory", SPEECH_MEMORY),
+            "max_memory": body.get("speech_max_memory", _speech_memory(TTS, tts_model)),
         }
     )
     model = body.get("llm_model", DEFAULT_LLM)
@@ -301,7 +335,10 @@ def selections(body):
             "the splash command was not found: run Splash Omni from a Splash "
             "checkout, set SPLASH_BIN, or give its path"
         )
-    max_memory = body.get("llm_max_memory", default_llm_memory())
+    max_memory = body.get(
+        "llm_max_memory",
+        default_llm_memory(asr.model, tts.model, asr.speculative),
+    )
     if isinstance(max_memory, str):
         max_memory = max_memory.strip() or None
     if max_memory is not None:

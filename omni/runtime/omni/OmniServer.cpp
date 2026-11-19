@@ -43,6 +43,29 @@ uint64_t packedLimit(uint64_t budget, uint64_t weightBytes) {
   return budget > reserved ? budget - reserved : 0;
 }
 
+// The KV page pool: what the budget leaves after `reserved`, at most
+// `ceilingBytes` and at least the `floorPages` the engine takes.
+uint32_t kvPages(uint64_t budget, uint64_t reserved, uint32_t floorPages, uint64_t ceilingBytes) {
+  const uint64_t left = budget > reserved ? budget - reserved : 0;
+  return static_cast<uint32_t>(std::max<uint64_t>(std::min(left, ceilingBytes) / OMNI_PAGE_BYTES, floorPages));
+}
+
+// The smallest KV pool the engines take, in pages of 128 KiB: 1 GiB, room
+// for a request of the longest speech (about 4,800 pages: 28 layers of up
+// to 5,500 positions) beside a few short ones.
+constexpr uint32_t kFloorPages = 8192;
+
+double gibibytes(uint64_t bytes) { return bytes / double(uint64_t{1} << 30); }
+
+// The bytes of a checkpoint's safetensors files, which its weights take
+// loaded, give or take a few percent.
+uint64_t checkpointBytes(const std::filesystem::path &directory) {
+  uint64_t bytes = 0;
+  for (const auto &entry : std::filesystem::directory_iterator(directory))
+    if (entry.path().extension() == ".safetensors") bytes += std::filesystem::file_size(entry.path());
+  return bytes;
+}
+
 // Frames read from the input, complete.
 struct InputFrame final {
   protocol::FrameType type;
@@ -220,11 +243,9 @@ LoadedEngine loadEngine(const ServerOptions &options) {
     // VoiceDesign and CustomVoice prompts lead with an instruction.
     if (c.type != TtsModelType::Base) config.maxInstructionTokens = protocol::kMaximumInstructionTokens;
     config.maxFrames = 4096;
-    // KV pages from what the budget leaves after the weights and ~1.5 GiB
-    // of arenas and codec workspace, at most 8 GiB.
-    const uint64_t reserved = weightBytes + (uint64_t{3} << 30);
-    const uint64_t kvBytes = budget > reserved ? std::min<uint64_t>(budget - reserved, uint64_t{8} << 30) : uint64_t{1} << 30;
-    config.kvPages = static_cast<uint32_t>(std::max<uint64_t>(kvBytes / OMNI_PAGE_BYTES, 2048));
+    // KV pages from what the budget leaves after the weights and up to
+    // 3 GiB of arenas and codec workspace, at most 8 GiB.
+    config.kvPages = kvPages(budget, weightBytes + (uint64_t{3} << 30), kFloorPages, uint64_t{8} << 30);
     engine.ttsModel = std::make_unique<TtsModel>(*engine.backend, std::move(ttsWeights), c, config.textRows(), engine.lanes);
     engine.codec = std::make_unique<ops::omni::CodecDecoder>(*engine.backend, std::move(codecWeights), config.maxChunkFrames);
     config.aneCodec = !options.disableAne;
@@ -248,44 +269,43 @@ LoadedEngine loadEngine(const ServerOptions &options) {
     // Or a DFlash draft (about 0.55 GB of bf16 layers), which reads the
     // target's hidden states and needs no tower.
     std::optional<AsrDFlashDraft> dflash;
-    if (!options.draftModel.empty() && isDFlashDraft(options.draftModel)) {
-      const DFlashDraftConfig dflashConfig = readDFlashDraftConfig(options.draftModel, c);
-      dflash = AsrDFlashDraft{dflashConfig, loadDFlashDraftWeights(*engine.backend, *engine.images,
-                                                                   weightsDirectory(options.draftModel), dflashConfig)};
-      const uint64_t needed =
-          engine.backend->memoryStats().allocatedBytes + (uint64_t{4} << 30) + aneBytes + draftWorkspaceBytes;
+    // A draft serves only where the budget fits it beside the weights, the
+    // ~3 GiB of arenas and workspace, its own workspace and the smallest KV
+    // pool the engine takes; otherwise lanes decode plainly, as without one.
+    // Its weights are counted from its checkpoint before they load: loaded
+    // weights stay for the engine's life (model::WeightImages).
+    const bool dflashDraft = !options.draftModel.empty() && isDFlashDraft(options.draftModel);
+    bool draftFits = !options.draftModel.empty();
+    if (draftFits) {
+      const uint64_t needed = engine.backend->memoryStats().allocatedBytes +
+                              checkpointBytes(weightsDirectory(options.draftModel)) + (uint64_t{3} << 30) +
+                              uint64_t{kFloorPages} * OMNI_PAGE_BYTES + aneBytes + draftWorkspaceBytes;
       if (needed > budget) {
-        dflash.reset();
+        draftFits = false;
         char line[256];
         std::snprintf(line, sizeof line,
-                      "Speculative decoding: off; the memory budget of %.2f GiB cannot fit the DFlash draft (%.2f GiB "
+                      "Speculative decoding: off; the memory budget of %.2f GiB cannot fit the %sdraft (%.2f GiB "
                       "needed).",
-                      budget / double(uint64_t{1} << 30), needed / double(uint64_t{1} << 30));
+                      gibibytes(budget), dflashDraft ? "DFlash " : "", gibibytes(needed));
         log(line);
       }
+    }
+    if (dflashDraft) {
+      const DFlashDraftConfig dflashConfig = readDFlashDraftConfig(options.draftModel, c);
+      if (draftFits)
+        dflash = AsrDFlashDraft{dflashConfig, loadDFlashDraftWeights(*engine.backend, *engine.images,
+                                                                     weightsDirectory(options.draftModel), dflashConfig)};
     } else if (!options.draftModel.empty()) {
       const OmniConfig draftConfig = readOmniConfig(options.draftModel);
       if (draftConfig.kind != ModelKind::Asr) throw std::runtime_error("the draft model is not a transcription model");
-      const std::filesystem::path draftWeights = weightsDirectory(options.draftModel);
-      AsrTextWeights draftText =
-          loadAsrTextWeights(*engine.backend, *engine.images, draftWeights, *draftConfig.asr, draftConfig.quantized);
-      const model::SafetensorsCheckpoint draftCheckpoint(draftWeights);
-      draft = AsrDraftModel{*draftConfig.asr, std::move(draftText),
-                            ops::omni::loadAudioEncoderWeights(*engine.backend, draftCheckpoint, draftConfig.asr->encoder)};
-      // The draft serves only where the budget fits it beside the weights,
-      // the ~3 GiB of arenas and workspace, its own workspace and the
-      // smallest KV pool the engine takes (1 GiB); otherwise lanes decode
-      // plainly, as without one.
-      const uint64_t needed =
-          engine.backend->memoryStats().allocatedBytes + (uint64_t{4} << 30) + aneBytes + draftWorkspaceBytes;
-      if (needed > budget) {
-        draft.reset();
-        char line[256];
-        std::snprintf(line, sizeof line,
-                      "Speculative decoding: off; the memory budget of %.2f GiB cannot fit the draft (%.2f GiB "
-                      "needed).",
-                      budget / double(uint64_t{1} << 30), needed / double(uint64_t{1} << 30));
-        log(line);
+      if (draftFits) {
+        const std::filesystem::path draftWeights = weightsDirectory(options.draftModel);
+        AsrTextWeights draftText =
+            loadAsrTextWeights(*engine.backend, *engine.images, draftWeights, *draftConfig.asr, draftConfig.quantized);
+        const model::SafetensorsCheckpoint draftCheckpoint(draftWeights);
+        draft = AsrDraftModel{*draftConfig.asr, std::move(draftText),
+                              ops::omni::loadAudioEncoderWeights(*engine.backend, draftCheckpoint,
+                                                                 draftConfig.asr->encoder)};
       }
     }
     (void)packDenseWeights(*engine.backend, textWeights, packedLimit(budget, engine.backend->memoryStats().allocatedBytes));
@@ -299,8 +319,7 @@ LoadedEngine loadEngine(const ServerOptions &options) {
     config.speculativeLanes = options.speculativeLanes;
     const uint64_t reserved =
         weightBytes + (uint64_t{3} << 30) + aneBytes + (draft || dflash ? draftWorkspaceBytes : 0);
-    const uint64_t kvBytes = budget > reserved ? std::min<uint64_t>(budget - reserved, uint64_t{12} << 30) : uint64_t{1} << 30;
-    config.kvPages = static_cast<uint32_t>(std::max<uint64_t>(kvBytes / OMNI_PAGE_BYTES, 4096));
+    config.kvPages = kvPages(budget, reserved, kFloorPages, uint64_t{12} << 30);
     engine.asr =
         std::make_unique<AsrEngine>(*engine.backend, c, std::move(textWeights), std::move(tower), config, std::move(draft),
                                     std::move(dflash));
@@ -312,9 +331,19 @@ LoadedEngine loadEngine(const ServerOptions &options) {
     engine.maxContext = ops::omni::audioTokens(config.maxAudioSeconds * 100) + 256 + config.maxTokens;
   }
   const double seconds = std::chrono::duration<double>(Clock::now() - t0).count();
+  const uint64_t allocated = engine.backend->memoryStats().allocatedBytes;
   char line[256];
+  // --max-memory is a cap: a model that does not fit in it, at the smallest
+  // KV pool the engine takes, is refused rather than served over it.
+  if (options.maxMemoryBytes && allocated > options.maxMemoryBytes) {
+    std::snprintf(line, sizeof line,
+                  "--max-memory %.2f GiB is below the %.2f GiB this model takes with %u lanes; raise it, or "
+                  "lower --lanes",
+                  gibibytes(options.maxMemoryBytes), gibibytes(allocated), engine.lanes);
+    throw std::runtime_error(line);
+  }
   std::snprintf(line, sizeof line, "Weights loaded in %.1f s; %.2f GiB allocated; %u lanes.", seconds,
-                engine.backend->memoryStats().allocatedBytes / double(uint64_t{1} << 30), engine.lanes);
+                gibibytes(allocated), engine.lanes);
   log(line);
   const auto waited = Clock::now();
   const metal::LibraryPipelines pipelines = engine.backend->waitForLibraryPipelines();

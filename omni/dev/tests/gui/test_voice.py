@@ -93,6 +93,57 @@ class SelectionTests(unittest.TestCase):
                     voice.selections(body)
                 self.assertIn(message, str(refused.exception))
 
+    def test_speech_servers_take_the_memory_their_models_need(self):
+        # The engine refuses a --max-memory its model does not fit in, and
+        # fits the DFlash draft only where the budget holds it.
+        cases = (
+            ({}, "8G", "5G"),
+            ({"speculative": False}, "5G", "5G"),
+            (
+                {
+                    "asr_model": "mlx-community/Qwen3-ASR-1.7B-bf16",
+                    "tts_model": "mlx-community/Qwen3-TTS-12Hz-1.7B-Base-bf16",
+                },
+                "10G",
+                "7G",
+            ),
+            (
+                {
+                    "asr_model": "mlx-community/Qwen3-ASR-1.7B-bf16",
+                    "speculative": False,
+                },
+                "7G",
+                "5G",
+            ),
+            ({"speech_max_memory": "12G"}, "12G", "12G"),
+        )
+        for change, asr, tts in cases:
+            with self.subTest(change=change):
+                chosen = voice.selections(
+                    {"splash": self.splash, "llm_max_memory": "30G", **change}
+                )
+                self.assertEqual(
+                    (chosen[voice.ASR].max_memory, chosen[voice.TTS].max_memory),
+                    (asr, tts),
+                )
+
+    def test_the_language_model_takes_what_the_speech_servers_leave(self):
+        # 48 GiB: the GPU's three quarters, 36 GiB, less both speech budgets
+        # and the 1.5 GiB margin.
+        with mock.patch.object(voice, "total_memory_gib", return_value=48):
+            self.assertEqual(voice.default_llm_memory(), "21G")
+            self.assertEqual(voice.default_llm_memory(speculative=False), "24G")
+            chosen = voice.selections(
+                {
+                    "splash": self.splash,
+                    "asr_model": "mlx-community/Qwen3-ASR-1.7B-bf16",
+                    "tts_model": "mlx-community/Qwen3-TTS-12Hz-1.7B-Base-bf16",
+                }
+            )
+            self.assertEqual(chosen[voice.LLM].max_memory, "17G")
+        with mock.patch.object(voice, "total_memory_gib", return_value=16):
+            self.assertIsNone(voice.default_llm_memory())
+
     def test_splash_is_found_by_environment_then_checkout_then_path(self):
         checkout = Path(self.directory.name) / "checkout"
         (checkout / "omni").mkdir(parents=True)
