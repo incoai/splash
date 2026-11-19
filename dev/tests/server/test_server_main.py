@@ -883,6 +883,7 @@ class ServerMainTests(unittest.TestCase):
                 api.engine_runtime, "MultiplexedRuntime", return_value=runtime
             ),
             mock.patch.object(api, "NativeBackend", return_value=backend),
+            mock.patch.object(api, "ConstraintFactory"),
             mock.patch.object(api, "FrontendServer", return_value=server),
             mock.patch.object(api.signal, "signal"),
             mock.patch("sys.stderr", new_callable=io.StringIO) as stderr,
@@ -985,6 +986,7 @@ class ServerMainTests(unittest.TestCase):
             mock.patch.object(
                 api.engine_runtime, "MultiplexedRuntime", side_effect=runtime
             ),
+            mock.patch.object(api, "ConstraintFactory"),
             mock.patch.object(api, "FrontendServer", return_value=server),
             mock.patch.object(api.signal, "signal"),
             mock.patch("sys.stderr", new_callable=io.StringIO) as stderr,
@@ -1024,6 +1026,8 @@ class ServerMainTests(unittest.TestCase):
         served = models / ".resolved/assembly"
         served.mkdir(parents=True)
         (served / "model.json").write_text("{}")
+        (served / "draft").mkdir()
+        (served / "draft/config.json").write_text('{"vocab_size": 248320}')
         link = models / "owner/model"
         link.parent.mkdir()
         link.symlink_to(served, target_is_directory=True)

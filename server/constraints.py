@@ -190,6 +190,15 @@ def validate_tokenizer(tokenizer, chat_format):
             )
 
 
+def stop_token_ids(tokenizer, chat_format):
+    """The tokens the tokenizer encodes the chat format's stop texts as, one
+    each (validate_tokenizer), which the engine's Ready must state too."""
+    return tuple(
+        tokenizer.encode(stop, add_special_tokens=False)[0]
+        for stop in chat_format.stop_tokens
+    )
+
+
 def check_capabilities(tokenizer, chat_format, ready):
     """Once the engine is Ready, refuse a tokenizer that does not fit what it
     serves: its vocabulary must fit the engine's, its stop texts encode as
@@ -203,10 +212,7 @@ def check_capabilities(tokenizer, chat_format, ready):
         raise TokenizerContractError(
             "tokenizer vocabulary does not fit the native model"
         )
-    stops = tuple(
-        tokenizer.encode(stop, add_special_tokens=False)[0]
-        for stop in chat_format.stop_tokens
-    )
+    stops = stop_token_ids(tokenizer, chat_format)
     if sorted(stops) != sorted(ready.stop_token_ids):
         raise TokenizerContractError(
             f"the tokenizer encodes the stop texts {chat_format.stop_tokens} as "
@@ -241,16 +247,28 @@ class ConstraintFactory:
     CACHE_SIZE = 32
     CACHE_SOURCE_BYTES = 8 * 1024 * 1024
 
-    def __init__(self, tokenizer, ready):
-        # The engine's Ready, whose vocabulary, stop tokens and mask rows its
-        # constraints are sized by.
-        self.ready = ready
-        self.tokenizer = guidance_tokenizer(
+    @staticmethod
+    def table(tokenizer, chat_format, vocabulary):
+        """llguidance's table of `tokenizer`, which every grammar's masks
+        cover: the installation's `vocabulary` (assembly.vocabulary) and the
+        chat format's stop tokens. The server builds it while the engine
+        loads its weights (server.main): it takes 0.82 s on a 32-core M5
+        Max."""
+        return guidance_tokenizer(
             tokenizer,
-            n_vocab=ready.vocabulary_size,
-            eos_token=list(ready.stop_token_ids),
+            n_vocab=vocabulary,
+            eos_token=list(stop_token_ids(tokenizer, chat_format)),
             slices=LLTokenizer.json_slices(),
         )
+
+    def __init__(self, table, ready):
+        # The engine's Ready, whose vocabulary, stop tokens and mask rows its
+        # constraints are sized by, and the table built before it (table) of
+        # the installation's vocabulary, which the engine checks against its
+        # own as it loads; its stop tokens are those check_capabilities found
+        # the Ready's.
+        self.ready = ready
+        self.tokenizer = table
         # Compiled matchers by grammar, within a budget of grammar bytes.
         self.cache = LRUCache(self.CACHE_SOURCE_BYTES, self.CACHE_SIZE)
         self.lock = threading.Lock()

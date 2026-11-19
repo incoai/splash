@@ -1912,6 +1912,24 @@ class UpstreamTest(unittest.TestCase):
         self.assertEqual(self.remove(first), 0)
         self.assertEqual(blob_bytes(self.cache, MODEL), size)
 
+    def test_an_installations_vocabulary_is_its_drafts(self):
+        """The server builds its grammars' table of it before the engine is
+        Ready (server.main)."""
+        fake_hub(self, self.cache)
+        chosen = selection(self.root)
+        self.prepare(chosen)
+        self.assertEqual(
+            assembly.vocabulary(chosen.link),
+            family_config(DENSE, "draft/config.json")["vocab_size"],
+        )
+        broken = self.root / "broken"
+        (broken / "draft").mkdir(parents=True)
+        for config in ("{", "{}", '{"vocab_size": "248320"}', '{"vocab_size": 0}'):
+            with self.subTest(config=config):
+                (broken / "draft/config.json").write_text(config)
+                with self.assertRaises(models.ModelError):
+                    assembly.vocabulary(broken)
+
     def test_a_recorded_path_that_climbs_out_of_its_snapshot_is_never_freed(self):
         fake = fake_hub(self, self.cache)
         chosen = selection(self.root)

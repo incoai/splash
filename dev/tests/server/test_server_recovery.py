@@ -1334,6 +1334,7 @@ class ServerRecoveryTests(HarnessTestCase):
                             process_factory=factory, **options
                         ),
                     ),
+                    mock.patch.object(api, "ConstraintFactory"),
                     mock.patch.object(api, "FrontendServer"),
                     mock.patch.object(api.signal, "signal"),
                     mock.patch("sys.stdout", new_callable=io.StringIO),

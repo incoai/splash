@@ -440,6 +440,7 @@ class ThinkingEndTextTests(unittest.TestCase):
                 **{"return_value.wait_ready.return_value": False},
             ) as native,
             mock.patch.object(server, "NativeBackend") as backend,
+            mock.patch.object(server, "ConstraintFactory"),
             mock.patch("sys.stderr", new_callable=io.StringIO) as stderr,
             mock.patch("sys.stdout", new_callable=io.StringIO),
             self.assertRaises(SystemExit) as raised,

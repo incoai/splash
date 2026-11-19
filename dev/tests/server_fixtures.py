@@ -951,10 +951,11 @@ def main_args(**overrides):
 def unprepared_hold(family="Qwen3.8-27B"):
     """main()'s hold of its model directory, for a test of a directory Splash
     did not prepare: the directory as it is, held by nothing, and a model of
-    `family` by its family's name."""
+    `family` by its family's name, of the Qwen families' vocabulary."""
     with (
         mock.patch.object(api.assembly, "hold", side_effect=lambda path: (path, None)),
         mock.patch.object(api.assembly, "family", return_value=families.named(family)),
+        mock.patch.object(api.assembly, "vocabulary", return_value=248320),
     ):
         yield
 

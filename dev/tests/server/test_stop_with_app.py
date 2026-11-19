@@ -110,6 +110,7 @@ class StopWithAppTest(unittest.TestCase):
                 api.engine_runtime, "MultiplexedRuntime", return_value=runtime
             ),
             mock.patch.object(api, "NativeBackend", return_value=backend),
+            mock.patch.object(api, "ConstraintFactory"),
             mock.patch.object(api, "print_status"),
         ):
             api.main()
