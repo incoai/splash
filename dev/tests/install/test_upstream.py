@@ -24,7 +24,6 @@ from dev.tests.installer_fixtures import (
     DRAFT_COMMIT,
     FLINT,
     GGUF_CONFIGS,
-    GGUF_ONLY,
     MODEL,
     MOE,
     PROCESSOR,
@@ -83,8 +82,6 @@ class UpstreamTest(unittest.TestCase):
         # The engine's check (its model-check command), with and without the
         # draft, of each family an MLX checkpoint serves.
         for family in families.FAMILIES:
-            if family in GGUF_ONLY:
-                continue
             config = mlx_target(self.root / family.name, family) / "config.json"
             draft = draft_dir(self.root / family.name / "draft", family)
             vision = "safetensors" if family.vision else "none"

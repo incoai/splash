@@ -111,7 +111,7 @@ template <class Runs> [[nodiscard]] std::vector<bool> normsOfFamilies(Runs runs)
   using model::safetensors::ModuleNames;
   bool bfloat16 = false;
   model::forEachFamily([&](const auto &family) {
-    if (!family.loadsSafetensors || !runs(family)) return;
+    if (!runs(family)) return;
     for (const ModuleNames names : {ModuleNames::Mlx, ModuleNames::MlxLm, ModuleNames::Transformers})
       bfloat16 = bfloat16 || !model::safetensors::float32Norms(names, family.ggufArchitecture);
   });

@@ -8,7 +8,8 @@ namespace splash::model {
 // attention's sinks, the norm before its FFN and the FFN: a leading layer's
 // dense gate, up and down, another's MoE block (readMoeBlock), whose blocks
 // are the MoE layers' in order (GgufImage.cpp FlintGguf, and
-// SafetensorsImage.cpp FlintWalk for an MLX checkpoint).
+// SafetensorsImage.cpp layer, by the geometry's attentionSinks, for an MLX
+// checkpoint).
 FlintWeights loadFlintWeights(metal::MetalBackend &backend, FlintLayout layout, const QwenTargetFiles &files) {
   return loadQwenTarget<FlintWeights>(
       backend, layout, files, [&](auto &loader, const BlockTargetFormat &format, const MoeExperts &experts) {

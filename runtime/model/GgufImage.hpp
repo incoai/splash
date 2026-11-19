@@ -144,7 +144,9 @@ struct StreamedExperts {
 };
 // Where a table's rows are in its GGUF (tableRows), for reading them from the
 // file (model/SparseRowStore.hpp) instead of loading the table's image: the
-// rows exactly as the image would hold them.
+// rows exactly as the image would hold them. A safetensors table's rows are
+// those its image's copies read (model/SafetensorsTarget.hpp streamTable),
+// its file and offset 0.
 struct StreamedRows final {
   std::string tensor;
   uint32_t file = 0;   // the part of a split GGUF that holds it
@@ -201,6 +203,11 @@ struct PlanOptions {
 // for BF16's and F16's, which hold any width; throws for rows of no such
 // width.
 [[nodiscard]] uint64_t decodedColumns(const TensorRows &rows);
+
+// The header type of the image of a table a family adds (Qwen3.8-Flash-Next's
+// PLE table, ple.bin), beside the layers' 0 and 1 (GDN and full attention)
+// and the head's 2, which both planners give it.
+inline constexpr uint32_t kTableImageType = 3;
 
 // Lays out one image: its header block, then 16 KiB-aligned sections, each a
 // descriptor, copied rows or a quantized tensor's planes. The planners of a

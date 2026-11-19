@@ -782,7 +782,7 @@ void testConfigurationCheck(const std::filesystem::path &fixtures) {
     require(at != std::string::npos, "the config has no " + std::string(from));
     return json.replace(at, from.size(), to);
   };
-  // Qwen3.8-Flash-Next loads from a GGUF only; its metadata also states the
+  // Qwen3.8-Flash-Next from a GGUF: its metadata also states the
   // hyper-connections, the QSA indexer and the PLE n-gram embedding.
   const std::string flashConfig = text(fixtures / "qwen3.8-flash-next" / "config.json");
   const GgufHeaders flashHeaders = ggufHeaders(model::Qwen4ExpLayout{});
@@ -805,8 +805,15 @@ void testConfigurationCheck(const std::filesystem::path &fixtures) {
   rejects([&] { static_cast<void>(check("gguf", "none", flashConfig, flashHeaders, otherReduction)); },
           "draft config dflash_config target_hidden_reduction mismatch: checkpoint none, runtime stream_mean",
           "a draft of another reduction was accepted");
+  // mlx-community's MLX checkpoint (its quantization trimmed to a few
+  // layers' entries) is the family too, with its vision tower; the GGUF's
+  // config, which holds the sizes alone, is no MLX checkpoint's.
+  const std::string flashMlxConfig = text(fixtures / "qwen3.8-flash-next" / "mlx-config.json");
+  require(check("mlx-affine", "safetensors", flashMlxConfig, std::nullopt, flashDraft) == "Qwen3.8-Flash-Next" &&
+              check("mlx-affine", "none", flashMlxConfig, std::nullopt, std::nullopt) == "Qwen3.8-Flash-Next",
+          "Qwen3.8-Flash-Next's MLX config was not found to be its family");
   rejects([&] { static_cast<void>(check("mlx-affine", "none", flashConfig, std::nullopt, std::nullopt)); },
-          "Qwen3.8-Flash-Next loads from a GGUF only", "Qwen3.8-Flash-Next was accepted from MLX");
+          "text config", "Qwen3.8-Flash-Next's GGUF config was accepted as an MLX checkpoint's");
   // Its scalars and its arrays, each layer's QSA compress ratio and the PLE
   // layer, are the planner's.
   std::vector<int32_t> ratios(48, 0);

@@ -76,10 +76,6 @@ bool routerType(uint32_t type) { return floatProjectionType(type) || (quantizedT
 // decode to it.
 bool floatRowType(uint32_t type) { return floatProjectionType(type) || type == ggml::kQ8_0; }
 
-// The header type of the image of a table a family adds (planImages), beside
-// the layers' 0 and 1 (GDN and full attention) and the head's 2.
-constexpr uint32_t kTableImageType = 3;
-
 // A repack of a [rows, columns] tensor in format, of no image section yet;
 // throws unless the shape is whole plane tiles.
 Repack tiledRepack(uint32_t format, uint64_t rows, uint64_t columns, const std::string &name) {

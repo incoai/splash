@@ -35,9 +35,9 @@ std::string headName(ModuleNames names) { return names == ModuleNames::Mlx ? "la
 // and shapes its target reads.
 class Builder {
 public:
-  // `norms` is how the image holds the norms (a family walk's norms()):
-  // None as stored (bf16), or the F32 values WidenToFloat32 or CenteredNorm
-  // makes of them.
+  // `norms` is how the image holds the norms (normConversion): None as
+  // stored (bf16), or the F32 values WidenToFloat32 or CenteredNorm makes of
+  // them.
   Builder(const SafetensorsCheckpoint &checkpoint, const QwenTargetDimensions &geometry, ModuleNames names,
           Conversion norms, std::string name, uint32_t layer, uint32_t type, gguf::PlanOptions options = {})
       : checkpoint_(checkpoint), geometry_(geometry), names_(names), norms_(norms),
@@ -160,10 +160,64 @@ public:
     floatRows(module, rows, columns, image_.section(bytes));
   }
 
-  // An F32 vector the kernels read, of its bf16 values widened (Flint's
-  // attention sinks, bf16 in mlx-community/flint-mixed-3-4bit).
-  void floatVector(const std::string &name, uint64_t elements) {
-    const SourceTensor &tensor = require(name, {"BF16"}, {elements});
+  // The F32 values of a [rows, columns] module in a section of their own,
+  // without a descriptor (Qwen3.8-Flash-Next's hyper-connection injection
+  // weights, which its mix reads as rows).
+  void floatValues(const std::string &module, uint64_t rows, uint64_t columns) {
+    floatRows(module, rows, columns, image_.section(rows * columns * sizeof(float)));
+  }
+
+  // Rows [first, first + rows) of a quantized [allRows, columns] module as
+  // their native rows after their descriptor, which the float projection
+  // decodes in fp32 (Qwen3.8-Flash-Next's QSA indexer, which runs float
+  // segments: its queries' and key's rows, which one module index_qk_proj
+  // holds).
+  void nativeRows(const std::string &module, uint64_t allRows, uint64_t first, uint64_t rows, uint64_t columns) {
+    TensorRows source = requireQuantized(module, allRows, columns);
+    source.first = first;
+    source.rows = rows;
+    image_.descriptor(source.type, rows, columns, {}, {rows * source.rowBytes, 0, 0}, module);
+    image_.copy(std::move(source));
+  }
+
+  // A table of `columns` values a row stored as the quantized modules
+  // `stem` 0, 1, ... (each its rows' share, in order, as
+  // Qwen3.8-Flash-Next's PLE table split into split_ngram_parts shards), as
+  // their format's native rows, back to back after their descriptor; with
+  // `stream`, rows that stream from the checkpoint instead
+  // (gguf::Image::streamedRows), the copies naming where each shard is.
+  void shardedTable(const std::string &stem, uint64_t columns, bool stream) {
+    std::vector<TensorRows> shards;
+    for (uint32_t shard = 0;; ++shard) {
+      const std::string module = stem + std::to_string(shard);
+      const SourceTensor *codes = checkpoint_.find(module + ".weight");
+      if (!codes) break;
+      if (codes->shape.empty()) throw WeightStoreError("source tensor type or shape does not match: " + module);
+      shards.push_back(requireQuantized(module, codes->shape.front(), columns));
+      if (shards.back().type != shards.front().type)
+        throw WeightStoreError(module + " is in another format than the table's first shard");
+    }
+    if (shards.empty()) throw WeightStoreError("missing source tensor: " + stem + "0.weight");
+    uint64_t rows = 0;
+    for (const TensorRows &shard : shards) rows += shard.rows;
+    const uint64_t rowBytes = shards.front().rowBytes;
+    image_.descriptor(shards.front().type, rows, columns, {}, {rows * rowBytes, 0, 0}, stem);
+    uint64_t destination = image_.section(rows * rowBytes);
+    for (const TensorRows &shard : shards) {
+      image_.copyAt(destination, shard, Conversion::None);
+      destination += shard.rows * rowBytes;
+    }
+    if (stream)
+      streamedRows_ = gguf::StreamedRows{stem, 0, 0, rows, static_cast<uint32_t>(rowBytes),
+                                         gguf_format_of(shards.front().type)};
+  }
+
+  // F32 values the kernels read, of a tensor's bf16 values widened (Flint's
+  // attention sinks, Qwen3.8-Flash-Next's PLE convolution [channels][taps], as
+  // MLX's [channels, taps, 1] holds it; bf16 in every checkpoint of them known:
+  // mlx-community/flint-mixed-3-4bit, Qwen3.8-Flash-Next-4bit and -OptiQ-2bit).
+  void floatVector(const std::string &name, std::vector<uint64_t> shape) {
+    const SourceTensor &tensor = require(name, {"BF16"}, shape);
     image_.copy(rows(name, tensor, ggml::kBF16, 1, tensor.bytes), Conversion::WidenToFloat32);
   }
 
@@ -181,7 +235,11 @@ public:
     image_.copy(rows(module + ".weight", table, ggml::kBF16, vocabulary, table.bytes / vocabulary));
   }
 
-  [[nodiscard]] gguf::Image finish() { return image_.finish(); }
+  [[nodiscard]] gguf::Image finish() {
+    gguf::Image image = image_.finish();
+    image.streamedRows = streamedRows_;
+    return image;
+  }
 
 private:
   const SourceTensor &require(const std::string &name, std::initializer_list<std::string_view> dtypes,
@@ -329,6 +387,7 @@ private:
   const ModuleNames names_;
   const Conversion norms_;
   gguf::ImageBuilder image_;
+  std::optional<gguf::StreamedRows> streamedRows_;
 };
 
 // Plans nothing, and names the modules a walk of the images reads only
@@ -351,7 +410,10 @@ struct QuantizedModules {
   void alphaBeta(const std::string &, const std::string &) {}
   void router(const std::string &, uint64_t, uint64_t) {}
   void floatTensor(const std::string &, uint64_t, uint64_t) {}
-  void floatVector(const std::string &, uint64_t) {}
+  void floatVector(const std::string &, std::vector<uint64_t>) {}
+  void floatValues(const std::string &, uint64_t, uint64_t) {}
+  void nativeRows(const std::string &, uint64_t, uint64_t, uint64_t, uint64_t) {}
+  void shardedTable(const std::string &, uint64_t, bool) {}
   void embedding(const std::string &) {}
 
   ModuleNames names;
@@ -412,16 +474,52 @@ template <class Walk> void ffn(Walk &b, const QwenTargetDimensions &g, const std
   }
 }
 
-// A layer: a norm before its mixer and its FFN, its attention's learned sinks
-// after the mixer where its geometry holds them (attentionSinks: Flint's
-// self_attn.softmax_offset, one per query head, widened to the F32 the GGUF's
-// attn_sinks hold); and before the head, the final norm.
+// One hyper-connection mix (model/Qwen4Exp.hpp Qwen4HyperWeights): its norm,
+// down and up projections and, when it injects, its injection weights as F32
+// rows.
+template <class Walk> void hyper(Walk &b, const QwenTargetDimensions &g, const std::string &stem, bool inject) {
+  const uint64_t streams = g.streamWidth();
+  b.norm(stem + "hc_norm", streams);
+  b.projection(stem + "input_mix_weight_down", g.hyperRank, streams);
+  b.projection(stem + "input_mix_weight_up", streams, g.hyperRank);
+  if (inject) b.floatValues(stem + "block_inject_weight", g.hyperConnections, streams);
+}
+
+// A layer, by what its geometry holds: before its mixer and its FFN a norm,
+// or a hyper-connection mix where the residual is hyper-connected
+// (Qwen3.8-Flash-Next's); after the mixer its attention's learned sinks
+// (attentionSinks: Flint's self_attn.softmax_offset, one per query head,
+// widened to the F32 the GGUF's attn_sinks hold) and a full-attention layer's
+// QSA indexer (hasIndexer: its queries and key as the native rows of
+// index_qk_proj, which its float projection runs, and their norms); after the
+// FFN, the PLE layer's projections, norms and convolution.
 template <class Walk> void layer(Walk &b, const QwenTargetDimensions &g, const std::string &p, uint32_t index) {
-  b.norm(p + "input_layernorm", g.hiddenSize);
-  mixer(b, g, p, g.isFullAttentionLayer(index));
-  if (g.attentionSinks) b.floatVector(p + "self_attn.softmax_offset", g.attentionQueryHeads);
-  b.norm(p + "post_attention_layernorm", g.hiddenSize);
+  const bool full = g.isFullAttentionLayer(index);
+  if (g.hyperConnected()) hyper(b, g, p + "attn_hyper_connection.", true);
+  else b.norm(p + "input_layernorm", g.hiddenSize);
+  mixer(b, g, p, full);
+  if (g.attentionSinks) b.floatVector(p + "self_attn.softmax_offset", {g.attentionQueryHeads});
+  if (full && g.hasIndexer()) {
+    const std::string indexer = p + "self_attn.indexer.";
+    const uint64_t queries = uint64_t{g.indexerHeads} * g.indexerHeadDimension;
+    b.nativeRows(indexer + "index_qk_proj", queries + g.indexerHeadDimension, 0, queries, g.hiddenSize);
+    b.nativeRows(indexer + "index_qk_proj", queries + g.indexerHeadDimension, queries, g.indexerHeadDimension,
+                 g.hiddenSize);
+    b.norm(indexer + "q_layernorm", g.indexerHeadDimension);
+    b.norm(indexer + "k_layernorm", g.indexerHeadDimension);
+  }
+  if (g.hyperConnected()) hyper(b, g, p + "mlp_hyper_connection.", true);
+  else b.norm(p + "post_attention_layernorm", g.hiddenSize);
   ffn(b, g, p, index);
+  if (!g.pleWidth() || index != g.pleLayer) return;
+  const std::string ple = p + "ple.";
+  const uint64_t streams = g.streamWidth();
+  b.projection(ple + "key_proj", streams, g.pleWidth());
+  b.projection(ple + "value_proj", g.hiddenSize, g.pleWidth());
+  b.norm(ple + "norm_key", streams);
+  b.norm(ple + "norm_query", streams);
+  b.norm(ple + "norm_conv", streams);
+  b.floatVector(ple + "conv1d.weight", {streams, g.pleConvolutionTaps, 1});
 }
 
 // How the norms load. MLX stores them as the multipliers they are (mlx-lm's
@@ -430,28 +528,42 @@ template <class Walk> void layer(Walk &b, const QwenTargetDimensions &g, const s
 // equal unsloth's GGUF's, its sinks the GGUF's sinks, on the 64 GB M5 Pro)
 // widen to the F32 its GGUF's images hold, as Flint's kernel shapes are
 // compiled for F32 norms alone (dev/tests/engine/TestFamilies.hpp
-// normsOfFamilies).
+// normsOfFamilies). mlx-vlm keeps Qwen3.8-Flash-Next's RMSNorm weights as
+// transformers stores them, 1 below the multiplier, but the GDN's gated norm's:
+// the hyper, PLE, q and indexer norms of mlx-community/Qwen3.8-Flash-Next-4bit
+// are those of ISTA-DASLab's Q2_0 GGUF less 1 exactly, its gated norms and
+// convolution equal (the 48 GB M5 Pro); its images hold them as the GGUF's do, F32.
 Conversion normConversion(ModuleNames names, std::string_view architecture) {
   if (architecture == "flint") return Conversion::WidenToFloat32;
+  if (architecture == "qwen4exp") return Conversion::CenteredNorm;
   return names == ModuleNames::Transformers ? Conversion::CenteredNorm : Conversion::None;
 }
 
-// Walks every image, each through the walker `walker(name, layer, type)`
-// makes, which `done` takes once walked.
+// Walks every image, each through the walker `make(name, layer, type)` makes,
+// which `done` takes once walked: the layers', the head's (before its
+// projection a norm, or the final hyper-connection mix), the embedding's and,
+// where the geometry has a PLE layer, its table's (ple.bin: the table split
+// into shards, shardedTable), whose rows stream with streamTable.
 template <class Make, class Done>
-void walkImages(const QwenTargetDimensions &g, ModuleNames names, Make make, Done done) {
+void walkImages(const QwenTargetDimensions &g, ModuleNames names, bool streamTable, Make make, Done done) {
   for (uint32_t index = 0; index < g.layers; ++index) {
     auto b = make("layer-" + std::to_string(index) + ".bin", index, g.isFullAttentionLayer(index) ? 1u : 0u);
     layer(b, g, modelPrefix(names) + "layers." + std::to_string(index) + ".", index);
     done(b);
   }
   auto head = make("head.bin", g.layers, 2u);
-  head.norm(modelPrefix(names) + "norm", g.hiddenSize);
+  if (g.hyperConnected()) hyper(head, g, modelPrefix(names) + "hyper_connection_mixer.", false);
+  else head.norm(modelPrefix(names) + "norm", g.hiddenSize);
   head.projection(headName(names), g.vocabularySize, g.hiddenSize);
   done(head);
   auto embedding = make("embedding.bin", g.vocabularySize, g.hiddenSize);
   embedding.embedding(modelPrefix(names) + "embed_tokens");
   done(embedding);
+  if (!g.pleWidth()) return;
+  auto table = make("ple.bin", g.pleLayer, gguf::kTableImageType);
+  table.shardedTable(layerPrefix(names, g.pleLayer) + "ple.ple_embedding.ngram_embedding.shards.", g.pleHeadDimension,
+                     streamTable);
+  done(table);
 }
 
 } // namespace
@@ -464,6 +576,10 @@ ModuleNames moduleNames(const SafetensorsCheckpoint &checkpoint) {
                          "model.language_model.embed_tokens or model.embed_tokens");
 }
 
+std::string layerPrefix(ModuleNames names, uint32_t layer) {
+  return modelPrefix(names) + "layers." + std::to_string(layer) + ".";
+}
+
 bool float32Norms(ModuleNames names, std::string_view architecture) {
   return normConversion(names, architecture) != Conversion::None;
 }
@@ -474,7 +590,7 @@ std::vector<gguf::Image> planImages(const SafetensorsCheckpoint &checkpoint, con
   const Conversion norms = normConversion(names, architecture);
   std::vector<gguf::Image> images;
   walkImages(
-      geometry, names,
+      geometry, names, options.streamTable,
       [&](std::string name, uint32_t layer, uint32_t type) {
         return Builder(checkpoint, geometry, names, norms, std::move(name), layer, type, options);
       },
@@ -492,7 +608,7 @@ uint32_t mlxFormat(std::string_view mode, uint32_t bits, uint32_t group) noexcep
 std::vector<std::string> quantizedModules(const QwenTargetDimensions &geometry, ModuleNames names) {
   std::vector<std::string> modules;
   walkImages(
-      geometry, names, [&](std::string, uint32_t, uint32_t) { return QuantizedModules(names); },
+      geometry, names, false, [&](std::string, uint32_t, uint32_t) { return QuantizedModules(names); },
       [&](QuantizedModules &b) { modules.insert(modules.end(), b.modules.begin(), b.modules.end()); });
   return modules;
 }

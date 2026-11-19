@@ -263,7 +263,8 @@ std::optional<SizeDifference> sizeDifference(NSDictionary *text, const QwenHybri
 // holds the rest of what the kernels compute; a GGUF's is what the installer
 // derived from the GGUF's metadata, which the GGUF planner checks
 // (gguf::planImages).
-void validateTextConfig(NSDictionary *text, const QwenHybridLayout &target, TargetSource source) {
+void validateTextConfig(NSDictionary *text, const QwenHybridLayout &target, TargetSource source,
+                        bool statesAttentionGate = true) {
   const std::string_view name = sourceName(source);
   if (const auto difference = sizeDifference(text, target, source)) throw unsupportedModel(difference->difference);
   if (source != TargetSource::Safetensors) return;
@@ -287,8 +288,12 @@ void validateTextConfig(NSDictionary *text, const QwenHybridLayout &target, Targ
                    {{"intermediate_size", target.intermediateSize}});
   requireBooleans(text, "text config",
                   {{"attention_bias", false},
-                   {"attn_output_gate", true},
                    {"tie_word_embeddings", false}});
+  if (statesAttentionGate) requireBooleans(text, "text config", {{"attn_output_gate", true}});
+  // The gate of the GDN's gated norm, where a config names it.
+  if (text[@"output_gate_type"])
+    requireEqual(requireString(text, @"output_gate_type", "text config output_gate_type"),
+                 target.gdnSigmoidGate ? "sigmoid" : "swish", name, "text config output_gate_type");
   requireEqual(requireString(text, @"hidden_act", "text config hidden_act"),
                "silu", name, "text config hidden_act");
   requireLayerTypes(requireArray(text, @"layer_types", "text config layer_types"),
@@ -320,6 +325,36 @@ void requireWholes(NSArray *values, std::span<const uint32_t> expected, std::str
   };
   throw std::invalid_argument(label + " mismatch: " + std::string(source) + " " + text(found) + ", runtime " +
                               text(expected));
+}
+
+// Qwen3.8-Flash-Next's text configuration: the hybrid's (validateTextConfig
+// above) but attn_output_gate, which it leaves unstated (its attention is
+// gated: Qwen4ExpLayout's packedFullWidth), then, where a safetensors config
+// states them (a GGUF's metadata
+// does, which its planner checks), its hyper-connections, its QSA indexer
+// (its heads, head width, one key head, the tokens of a block and the tokens
+// its blocks select), its PLE n-gram embedding (n-grams, heads, convolution,
+// width, its layer by its 1-based id), and the end-of-sequence token its
+// hash reads (Qwen4ExpLayout::pleEosToken).
+void validateTextConfig(NSDictionary *text, const Qwen4ExpLayout &target, TargetSource source) {
+  validateTextConfig(text, static_cast<const QwenHybridLayout &>(target), source, false);
+  if (source != TargetSource::Safetensors) return;
+  requireNumbers(text, sourceName(source), "text config",
+                 {{"hc_count", target.hyperConnections},
+                  {"hc_lowrank", target.hyperRank},
+                  {"indexer_n_heads", target.indexerHeads},
+                  {"indexer_head_dim", target.indexerHeadDimension},
+                  {"indexer_kv_heads", 1},
+                  {"indexer_compress_ratio", target.indexerBlockTokens},
+                  {"indexer_budget", target.indexerTokens()},
+                  {"ngram_size", target.pleNgram},
+                  {"heads_per_ngram", target.pleHeadsPerNgram},
+                  {"ple_conv_kernel_size", target.pleConvolutionTaps},
+                  {"ple_embed_dim", target.pleWidth()},
+                  {"eos_token_id", target.pleEosToken}});
+  const std::array<uint32_t, 1> pleLayers{target.pleLayer + 1};
+  requireWholes(requireArray(text, @"ple_layer_ids", "text config ple_layer_ids"), pleLayers, sourceName(source),
+                "text config ple_layer_ids");
 }
 
 // The layers of `mask` among `layers`, a bit each, in order.
@@ -798,8 +833,6 @@ ModelDescriptor describeSourceModel(std::string name, std::string_view targetFor
   // holds its draft's.
   DFlashDraftLayout dflashLayout;
   std::visit([&](auto &layout) {
-    if (targetSource == TargetSource::Safetensors && !layout.loadsSafetensors)
-      throw std::invalid_argument(std::string(layout.family) + " loads from a GGUF only");
     validateTextConfig(text, layout, targetSource);
     if (targetSource == TargetSource::Safetensors) requireQuantization(config, layout);
     if (targetSource == TargetSource::Gguf && layout.ffnKind == QwenFfnKind::SparseMoe)

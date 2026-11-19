@@ -18,7 +18,6 @@ struct Qwen3_8Layout final : QwenHybridLayout {
   // checkpoint of it loads too.
   static constexpr std::string_view modelType = "qwen3_5_text";
   static constexpr std::string_view ggufArchitecture = "qwen35";
-  static constexpr bool loadsSafetensors = true;
 
   // Qwen3.8-27B's, its first family (kFamilies).
   constexpr Qwen3_8Layout()

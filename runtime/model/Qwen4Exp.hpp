@@ -16,7 +16,7 @@
 //  - A PLE n-gram embedding feeds one GDN layer: the 2- and 3-gram hashes of
 //    every token gather rows of a table of hundreds of millions of rows,
 //    which gate a value added to every stream through a dilated convolution.
-// Its weights load from a GGUF only.
+// Its weights load from a GGUF or an MLX checkpoint (model/SafetensorsImage.hpp).
 
 #include "QwenHybridLayout.hpp"
 #include "QwenTarget.hpp"
@@ -40,11 +40,10 @@ namespace splash::model {
 struct SparseRowStoreOptions;
 
 struct Qwen4ExpLayout final : QwenHybridLayout {
-  // Its config's text model type and its GGUFs' architecture; no safetensors
-  // checkpoint of it loads.
+  // Its config's text model type and its GGUFs' architecture; an MLX
+  // checkpoint of it loads too.
   static constexpr std::string_view modelType = "qwen4_exp_text";
   static constexpr std::string_view ggufArchitecture = "qwen4exp";
-  static constexpr bool loadsSafetensors = false;
   // The PLE n-gram hash's end-of-sequence token, the first stop token, which
   // cuts an n-gram short; and the token it reads at every position of an
   // image, which a prompt holds there (<|image_pad|>, server/frontend.py). A

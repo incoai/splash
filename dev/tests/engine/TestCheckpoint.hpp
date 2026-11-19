@@ -41,7 +41,8 @@ inline void writeSyntheticShard(const std::filesystem::path &path,
   uint64_t offset = 0;
   std::vector<uint64_t> offsets;
   for (const SyntheticTensor &tensor : tensors) {
-    uint64_t bytes = tensor.dtype == "U32" || tensor.dtype == "F32"     ? 4
+    uint64_t bytes = tensor.dtype == "I64"                              ? 8
+                     : tensor.dtype == "U32" || tensor.dtype == "F32"     ? 4
                      : tensor.dtype == "U8" || tensor.dtype == "F8_E4M3" ? 1
                                                                          : 2;
     std::string shape;

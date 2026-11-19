@@ -51,7 +51,6 @@ struct FlintLayout final : QwenHybridLayout {
   static constexpr std::string_view modelType = "flint";
   static constexpr bool flatConfig = true;
   static constexpr std::string_view ggufArchitecture = "flint";
-  static constexpr bool loadsSafetensors = true;
 
   // Flint's, its first family (kFamilies). Its context is the native one:
   // its full layers have no RoPE to stretch.

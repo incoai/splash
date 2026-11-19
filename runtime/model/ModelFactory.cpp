@@ -92,17 +92,17 @@ TargetWeights loadTarget(metal::MetalBackend &backend, WeightImages &images, con
   return std::visit(
       [&](const auto &layout) -> TargetWeights {
         const std::filesystem::path directory = root / "target";
+        // A streamed table's store: its memory and readers here, the rows a
+        // step stages and prefetches from the family.
+        SparseRowStoreOptions table = streamedTableRows(layout);
+        table.cacheBytes = options.streamedTableBytes;
+        table.readers = options.readers;
         switch (descriptor.targetSource) {
         case TargetSource::Safetensors: {
-          SafetensorsTargetLoader loader(backend, images, directory, layout, layout.ggufArchitecture, experts);
+          SafetensorsTargetLoader loader(backend, images, directory, layout, layout.ggufArchitecture, table, experts);
           return readTarget(backend, layout, std::ref(loader));
         }
         case TargetSource::Gguf: {
-          // A streamed table's store: its memory and readers here, the rows
-          // a step stages and prefetches from the family.
-          SparseRowStoreOptions table = streamedTableRows(layout);
-          table.cacheBytes = options.streamedTableBytes;
-          table.readers = options.readers;
           GgufTargetLoader loader(backend, images, findTargetGgufs(directory), layout.ggufArchitecture, layout, table,
                                   experts);
           return readTarget(backend, layout, std::ref(loader));

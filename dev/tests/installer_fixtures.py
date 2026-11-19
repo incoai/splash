@@ -31,8 +31,6 @@ FLINT = families.named("Flint")
 # The families whose config.json fixture is the one the installer derives
 # from their GGUF; an MLX config.json of one is mlx-config.json.
 GGUF_CONFIGS = (FLASH_NEXT, FLINT)
-# The families whose targets the engine loads from a GGUF only.
-GGUF_ONLY = (FLASH_NEXT,)
 MODEL = "mlx-community/Qwen3.8-27B-4bit"
 # An MLX config.json (of a GGUF_CONFIGS family, the one the installer derives
 # from its GGUF, beside its MLX mlx-config.json), a DFlash2 draft config and,

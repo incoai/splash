@@ -49,6 +49,10 @@ enum class ModuleNames : uint8_t { Mlx, MlxLm, Transformers };
 // (transformers') or model.embed_tokens (mlx-lm's).
 [[nodiscard]] ModuleNames moduleNames(const SafetensorsCheckpoint &checkpoint);
 
+// The prefix of layer `layer`'s modules by `names` (language_model.model.layers.N.
+// and the like), for what a family reads beside its images.
+[[nodiscard]] std::string layerPrefix(ModuleNames names, uint32_t layer);
+
 // Whether the images hold the norms as F32 rather than bf16 as stored, by
 // the names and the family whose GGUFs are of `architecture`: a checkpoint's whose RMSNorm weights are
 // stored 1 below the weights the norm multiplies by as their F32 1 + w, but

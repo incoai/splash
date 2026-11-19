@@ -3,6 +3,9 @@
 #include "TestChecks.hpp"
 #include "TestCheckpoint.hpp"
 #include "model/Flint.hpp"
+#include "model/Qwen4Exp.hpp"
+#include "model/SparseRowStore.hpp"
+#include "model/SsdReaders.hpp"
 #include "model/GgufImage.hpp"
 #include "model/GgufImageLayout.hpp"
 #include "model/ModelFactory.hpp"
@@ -44,6 +47,8 @@ namespace {
 using splash::model::DFlashDraftLayout;
 using splash::model::FlintLayout;
 using splash::model::FlintWeights;
+using splash::model::Qwen4ExpLayout;
+using splash::model::Qwen4ExpWeights;
 using splash::model::ModelDescriptor;
 using splash::model::WeightFile;
 using splash::model::WeightFileRecord;
@@ -1180,9 +1185,245 @@ void testSyntheticFlintModel(MetalBackend &backend, const std::filesystem::path 
             "an MLX Flint's shared expert down projection is not two slices of the routed width");
     splash::model::WeightImages streamedImages(backend, "sources");
     splash::model::SafetensorsTargetLoader streamed(backend, streamedImages, root / "target", target,
-                                                     target.ggufArchitecture, {.memoryBytes = 64ull << 20});
+                                                     target.ggufArchitecture, {}, {.memoryBytes = 64ull << 20});
     require(streamed.streamedExperts().blocks.size() == target.layers - target.leadingDenseLayers,
             "an MLX Flint's streamed experts are not its MoE layers'");
+}
+
+// A small Qwen3.8-Flash-Next of mlx-vlm's names and mlx-community's formats
+// (af4g32, its router and shared-expert gate af8g64), its PLE table three
+// shards of 64 rows, its hash the embedding's I64 buffers: two layers, a GDN
+// layer that feeds the PLE and an attention layer with its QSA indexer.
+Qwen4ExpLayout syntheticFlashNext() {
+    Qwen4ExpLayout target;
+    target.layers = 2;
+    target.hiddenSize = 256;
+    target.vocabularySize = 256;
+    target.draftVocabulary = {};
+    target.gdnKeyHeads = 2;
+    target.gdnValueHeads = 2;
+    target.gdnHeadDimension = 128;
+    target.convolutionDimension = 768; // q and k of 2 heads, v of 2
+    target.packedGdnWidth = 768 + 256 + 64; // qkv | z | beta, alpha, to whole 64-column tiles
+    target.attentionWidth = 256; // two query heads of 128
+    target.attentionQueryHeads = 2;
+    target.attentionKvHeads = 1;
+    target.attentionHeadDimension = 128;
+    target.packedFullWidth = 2 * 256 + 2 * 128;
+    target.fullAttentionPeriod = 2; // layer 1
+    target.maskToken = 250;
+    target.stopTokens = {1, 2};
+    target.experts = 8;
+    target.expertsPerToken = 2;
+    target.expertIntermediateSize = 256;
+    target.hyperConnections = 4;
+    target.hyperRank = 64;
+    target.indexerHeads = 2;
+    target.indexerHeadDimension = 64;
+    target.indexerTopBlocks = 2;
+    target.indexerBlockTokens = 4;
+    target.pleLayer = 0;
+    target.pleNgram = 3;
+    target.pleHeadsPerNgram = 2;
+    target.pleHeadDimension = 64;
+    target.pleConvolutionTaps = 4;
+    return target;
+}
+
+constexpr uint32_t kPleShards = 3, kPleShardRows = 64;
+
+// Its tensors: every hyper-connection and PLE norm a stored w of 0.5 (1.5
+// multiplies), the hash's buffers and the table's shards of random codes,
+// scales and biases; zeros elsewhere.
+std::vector<SyntheticTensor> flashNextTensors(const Qwen4ExpLayout &g) {
+    std::vector<SyntheticTensor> result;
+    uint32_t seed = 4000;
+    const auto random = [&](uint64_t bytes) {
+        std::vector<uint8_t> data(bytes);
+        for (uint8_t &byte : data) byte = static_cast<uint8_t>((seed = seed * 1664525u + 1013904223u) >> 24);
+        return data;
+    };
+    const auto bfloat16 = [&](const std::string &name, std::vector<uint64_t> shape, std::vector<uint8_t> data = {}) {
+        result.push_back({name, "BF16", std::move(shape), std::move(data)});
+    };
+    const auto half = [&](uint64_t elements) { // bf16 0.5 each
+        std::vector<uint8_t> data;
+        for (uint64_t i = 0; i < elements; ++i) data.insert(data.end(), {0x00, 0x3F});
+        return data;
+    };
+    const auto quantized = [&](const std::string &module, uint64_t rows, uint64_t columns, uint64_t experts = 1,
+                               bool random32 = false) {
+        const bool wide = module.ends_with(".gate") || module.ends_with("shared_expert_gate");
+        const uint32_t bits = wide ? 8 : 4, group = wide ? 64 : 32;
+        const auto shape = [&](uint64_t last) {
+            return experts > 1 ? std::vector<uint64_t>{experts, rows, last} : std::vector<uint64_t>{rows, last};
+        };
+        const uint64_t codes = rows * columns * bits / 32, groups = rows * columns / group;
+        result.push_back({module + ".weight", "U32", shape(columns * bits / 32), random32 ? random(4 * codes) : std::vector<uint8_t>{}});
+        bfloat16(module + ".scales", shape(columns / group), random32 ? random(2 * groups) : std::vector<uint8_t>{});
+        bfloat16(module + ".biases", shape(columns / group), random32 ? random(2 * groups) : std::vector<uint8_t>{});
+    };
+    const auto int64s = [&](const std::string &name, std::vector<int64_t> values) {
+        std::vector<uint8_t> data(values.size() * sizeof(int64_t));
+        std::memcpy(data.data(), values.data(), data.size());
+        result.push_back({name, "I64", {values.size()}, std::move(data)});
+    };
+    const uint64_t hidden = g.hiddenSize, streams = g.streamWidth();
+    const auto hyper = [&](const std::string &stem, bool inject) {
+        bfloat16(stem + "hc_norm.weight", {streams}, half(streams));
+        quantized(stem + "input_mix_weight_down", g.hyperRank, streams);
+        quantized(stem + "input_mix_weight_up", streams, g.hyperRank);
+        if (inject) quantized(stem + "block_inject_weight", g.hyperConnections, streams);
+    };
+    for (uint32_t layer = 0; layer < g.layers; ++layer) {
+        const std::string p = "language_model.model.layers." + std::to_string(layer) + ".";
+        hyper(p + "attn_hyper_connection.", true);
+        if (g.isFullAttentionLayer(layer)) {
+            const std::string a = p + "self_attn.";
+            quantized(a + "q_proj", 2ull * g.attentionWidth, hidden);
+            quantized(a + "k_proj", 128, hidden);
+            quantized(a + "v_proj", 128, hidden);
+            bfloat16(a + "q_norm.weight", {g.attentionHeadDimension});
+            bfloat16(a + "k_norm.weight", {g.attentionHeadDimension});
+            quantized(a + "o_proj", hidden, g.attentionWidth);
+            quantized(a + "indexer.index_qk_proj", uint64_t{g.indexerHeads + 1} * g.indexerHeadDimension, hidden, 1,
+                      true);
+            bfloat16(a + "indexer.q_layernorm.weight", {g.indexerHeadDimension});
+            bfloat16(a + "indexer.k_layernorm.weight", {g.indexerHeadDimension});
+        } else {
+            const std::string l = p + "linear_attn.";
+            quantized(l + "in_proj_qkv", g.convolutionDimension, hidden);
+            quantized(l + "in_proj_z", g.attentionWidth, hidden);
+            quantized(l + "in_proj_b", g.gdnValueHeads, hidden);
+            quantized(l + "in_proj_a", g.gdnValueHeads, hidden);
+            bfloat16(l + "conv1d.weight", {g.convolutionDimension, splash::model::kGdnConvolutionTaps, 1});
+            bfloat16(l + "A_log", {g.gdnValueHeads});
+            bfloat16(l + "dt_bias", {g.gdnValueHeads});
+            bfloat16(l + "norm.weight", {g.gdnHeadDimension});
+            quantized(l + "out_proj", hidden, g.attentionWidth);
+        }
+        hyper(p + "mlp_hyper_connection.", true);
+        const std::string m = p + "mlp.";
+        quantized(m + "gate", g.experts, hidden);
+        quantized(m + "switch_mlp.gate_proj", g.expertIntermediateSize, hidden, g.experts);
+        quantized(m + "switch_mlp.up_proj", g.expertIntermediateSize, hidden, g.experts);
+        quantized(m + "switch_mlp.down_proj", hidden, g.expertIntermediateSize, g.experts);
+        quantized(m + "shared_expert.gate_proj", g.expertIntermediateSize, hidden);
+        quantized(m + "shared_expert.up_proj", g.expertIntermediateSize, hidden);
+        quantized(m + "shared_expert.down_proj", hidden, g.expertIntermediateSize);
+        quantized(m + "shared_expert_gate", 1, hidden);
+        if (layer != g.pleLayer) continue;
+        const std::string e = p + "ple.";
+        quantized(e + "key_proj", streams, g.pleWidth());
+        quantized(e + "value_proj", hidden, g.pleWidth());
+        for (const char *norm : {"norm_key", "norm_query", "norm_conv"})
+            bfloat16(e + norm + ".weight", {streams}, half(streams));
+        bfloat16(e + "conv1d.weight", {streams, g.pleConvolutionTaps, 1});
+        int64s(e + "ple_embedding.layer_multipliers", {1000003, 999983, 0});
+        int64s(e + "ple_embedding.ngram_heads_offsets", {0, 47, 94, 141});
+        int64s(e + "ple_embedding.ngram_heads_vocab_sizes", {47, 47, 47, 47});
+        for (uint32_t shard = 0; shard < kPleShards; ++shard)
+            quantized(e + "ple_embedding.ngram_embedding.shards." + std::to_string(shard), kPleShardRows,
+                      g.pleHeadDimension, 1, true);
+    }
+    hyper("language_model.model.hyper_connection_mixer.", false);
+    quantized("language_model.lm_head", g.vocabularySize, hidden);
+    quantized("language_model.model.embed_tokens", g.vocabularySize, hidden);
+    return result;
+}
+
+// The af4g32 native row of row `row` of a synthetic module of `columns`
+// inputs: per group of 32 its scale, its bias and its 16 bytes of codes
+// (metal/abi/QuantFormat.h), from the module's tensors as MLX stores them.
+std::vector<uint8_t> af4g32Row(const std::vector<SyntheticTensor> &tensors, const std::string &module, uint64_t row,
+                               uint64_t columns) {
+    const auto data = [&](const std::string &name) -> const std::vector<uint8_t> & {
+        return std::find_if(tensors.begin(), tensors.end(), [&](const SyntheticTensor &t) { return t.name == name; })
+            ->data;
+    };
+    const auto &codes = data(module + ".weight"), &scales = data(module + ".scales"),
+               &biases = data(module + ".biases");
+    const uint64_t groups = columns / 32;
+    std::vector<uint8_t> result;
+    for (uint64_t group = 0; group < groups; ++group) {
+        const uint64_t at = (row * groups + group) * 2, code = (row * groups + group) * 16;
+        result.insert(result.end(), scales.begin() + at, scales.begin() + at + 2);
+        result.insert(result.end(), biases.begin() + at, biases.begin() + at + 2);
+        result.insert(result.end(), codes.begin() + code, codes.begin() + code + 16);
+    }
+    return result;
+}
+
+// An MLX Qwen3.8-Flash-Next loads as the block images its GGUF's do: its
+// hyper-connection and PLE norms, which mlx-vlm keeps 1 below the multiplier,
+// as the F32 1 + w, its indexer's queries and key the rows of index_qk_proj
+// as float segments, its PLE hash from the embedding's buffers and its table
+// from its shards, loaded or streamed: a streamed row is its shard's codes,
+// scales and biases as the af4g32 native row of each group's scale, bias and
+// codes.
+void testSyntheticFlashNext(MetalBackend &backend, const std::filesystem::path &root) {
+    const Qwen4ExpLayout target = syntheticFlashNext();
+    const std::vector<SyntheticTensor> tensors = flashNextTensors(target);
+    splash::test::writeSyntheticShard(root / "target" / "model.safetensors", tensors);
+    splash::model::WeightImages images(backend, "sources");
+    splash::model::SafetensorsTargetLoader loaded(backend, images, root / "target", target, target.ggufArchitecture);
+    const Qwen4ExpWeights weights =
+        splash::model::loadQwen4ExpWeights(backend, target, splash::model::QwenTargetFiles{std::ref(loaded)});
+    const auto first = [](const splash::ops::NormWeights &norm) {
+        return norm.float32 ? static_cast<const float *>(norm.buffer.contents())[0] : -1.0f;
+    };
+    const auto &layer0 = weights.layers[0], &layer1 = weights.layers[1];
+    require(first(layer0.mixerHyper.norm) == 1.5F && first(layer1.ffnHyper.norm) == 1.5F &&
+                first(weights.finalHyper.norm) == 1.5F && layer0.ple && first(layer0.ple->keyNorm) == 1.5F &&
+                first(layer0.ple->convolutionNorm) == 1.5F,
+            "an MLX Flash-Next's hyper-connection and PLE norms are not the F32 1 + w");
+    require(layer1.indexer && layer1.indexer->query.outputSize == target.indexerHeads * target.indexerHeadDimension &&
+                layer1.indexer->key.outputSize == target.indexerHeadDimension &&
+                layer1.indexer->query.blocks().segments.size() == 1 &&
+                layer1.indexer->query.blocks().segments.front().quantizedRows() &&
+                layer1.indexer->key.blocks().segments.front().quantizedRows() && first(layer1.indexer->queryNorm) == 1.0F,
+            "an MLX Flash-Next's indexer is not index_qk_proj's rows as float segments");
+    // The queries are its rows from 0 on, the key its rows from the queries' end on.
+    const std::string qk = "language_model.model.layers.1.self_attn.indexer.index_qk_proj";
+    for (const auto &[projection, row] : {std::pair{&layer1.indexer->query, uint64_t{0}},
+                                          std::pair{&layer1.indexer->key, uint64_t{target.indexerHeads} *
+                                                                              target.indexerHeadDimension}}) {
+        const std::vector<uint8_t> expected = af4g32Row(tensors, qk, row, target.hiddenSize);
+        const auto *rows = static_cast<const uint8_t *>(projection->blocks().segments.front().plane0.contents());
+        require(std::equal(expected.begin(), expected.end(), rows),
+                "an MLX Flash-Next's indexer row " + std::to_string(row) + " of index_qk_proj is not its first");
+    }
+    require(weights.pleHash.multipliers[0] == 1000003 && weights.pleHash.multipliers[1] == 999983 &&
+                weights.pleHash.headOffsets == std::vector<uint32_t>{0, 47, 94, 141} &&
+                weights.pleHash.headVocabularies == std::vector<uint32_t>(4, 47) &&
+                weights.pleHash.tableRows == kPleShards * kPleShardRows && !weights.streamedTable &&
+                weights.pleTable.rows().formatId == quant_affine_format_of(4, 32),
+            "an MLX Flash-Next's PLE hash or table is not its checkpoint's");
+
+    // Streamed, rows across the shards' boundaries.
+    splash::model::WeightImages streamedImages(backend, "sources");
+    splash::model::SafetensorsTargetLoader streaming(
+        backend, streamedImages, root / "target", target, target.ggufArchitecture,
+        {.cacheBytes = 1 << 20, .readers = std::make_shared<splash::model::SsdReaders>(splash::model::kSsdReaders)});
+    const Qwen4ExpWeights streamed =
+        splash::model::loadQwen4ExpWeights(backend, target, splash::model::QwenTargetFiles{std::ref(streaming)});
+    require(streamed.streamedTable && streamed.pleFormat == quant_affine_format_of(4, 32),
+            "an MLX Flash-Next's table did not stream");
+    const uint32_t rowBytes = streamed.streamedTable->table().rowBytes;
+    const std::vector<uint32_t> ids{0, 63, 64, 191, 130};
+    std::vector<uint8_t> rows(ids.size() * rowBytes);
+    std::vector<uint32_t> slots(ids.size());
+    streamed.streamedTable->stage(ids, rows, slots, splash::model::SparseRowUse::Decode);
+    for (size_t index = 0; index < ids.size(); ++index) {
+        const uint32_t shard = ids[index] / kPleShardRows, row = ids[index] % kPleShardRows;
+        const std::vector<uint8_t> expected = af4g32Row(
+            tensors, "language_model.model.layers.0.ple.ple_embedding.ngram_embedding.shards." + std::to_string(shard),
+            row, target.pleHeadDimension);
+        require(expected.size() == rowBytes &&
+                    std::equal(expected.begin(), expected.end(), rows.begin() + uint64_t{slots[index]} * rowBytes),
+                "an MLX Flash-Next's streamed PLE row " + std::to_string(ids[index]) +
+                    " is not its shard's group scales, biases and codes");
+    }
 }
 
 int main(int argc, const char *argv[]) {
@@ -1205,6 +1446,7 @@ int main(int argc, const char *argv[]) {
         testSyntheticBlockModel(production, temporary.path() / "block-model");
         testSyntheticBlockMoeModel(production, temporary.path() / "block-moe-model");
         testSyntheticFlintModel(production, temporary.path() / "flint-model");
+        testSyntheticFlashNext(production, temporary.path() / "flash-next");
         for (const auto checkpoint : {splash::test::FloatCheckpoint::ModelOptimizer,
                                       splash::test::FloatCheckpoint::CompressedTensors}) {
             const std::string at = checkpoint == splash::test::FloatCheckpoint::ModelOptimizer ? "model-optimizer"

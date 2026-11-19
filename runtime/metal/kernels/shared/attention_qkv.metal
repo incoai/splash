@@ -65,10 +65,10 @@
         reductions, normalized, maxima, group, thread_index, lane, simd_group);                              \
   }
 // Each geometry's instances for its pages' formats and the norm types its
-// families store: bf16 (an MLX target's) and F32, or F32 alone for
-// Qwen3.8-Flash-Next's (_kv2_g12, whose pages hold token-major values), which
-// loads from GGUFs only, and Flint's (_kv4_g8_d128), whose MLX images widen its
-// norms to the F32 its GGUFs hold (model/SafetensorsImage.hpp float32Norms).
+// families load: bf16 (an MLX target's) and F32, or F32 alone for
+// Qwen3.8-Flash-Next's (_kv2_g12, whose pages hold token-major values) and
+// Flint's (_kv4_g8_d128), whose MLX images widen their norms to the F32 their
+// GGUFs hold (model/SafetensorsImage.hpp float32Norms).
 #define ATTENTION_QKV_FORMATS(Suffix, QHeads, KHeads, HeadDim, RotaryPairs, Gated, W, ValuesTokenMajor)         \
   ATTENTION_QKV(attention_q8_qkv##Suffix, QHeads, KHeads, HeadDim, RotaryPairs, Gated, W, int8_t,               \
                 ValuesTokenMajor)                                                                            \
