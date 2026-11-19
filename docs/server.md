@@ -148,7 +148,7 @@ Zsh after `compinit`, or `install/completions/splash.fish` for fish.
 Completion suggests commands, the models in `install/suggested-models.tsv`
 (the list the desktop app offers too) and installed models, a GGUF's
 `OWNER/REPO:VARIANT` included, without network access. It also completes local
-paths for `--model-dir`, `--draft-model` and `--mmproj`.
+paths for `--model-dir`, `--draft-model`, `--mmproj` and `--lora`.
 
 ## Server configuration
 
@@ -161,6 +161,7 @@ paths for `--model-dir`, `--draft-model` and `--mmproj`.
 | `--model` | Required | The upstream model, `OWNER/REPO`, or a GGUF's `OWNER/REPO:VARIANT`; with `--model-dir`, the name the API reports. See [upstream model loading](models.md#upstream-model-loading). |
 | `--model-dir` | None | Prepare a local GGUF file or GGUF/MLX model directory without the Hub. See [local model files](models.md#local-model-files). |
 | `--mmproj` | None | A local GGUF target's vision projector; requires `--model-dir`. |
+| `--lora` | None | A local PEFT LoRA adapter directory, applied to the model as it runs; requires `--model-dir`. See [LoRA adapters](models.md#lora-adapters). |
 | `--revision` | Default branch | Select an upstream target branch, tag, or commit. See [revisions](#revisions). |
 | `--draft-model` | The family's released DFlash2 draft | A compatible repository or local directory in its place. See [drafts](models.md#drafts). |
 | `--language-only` | Off | Skip vision loading; image and PDF input is rejected. See [vision](models.md#vision). |

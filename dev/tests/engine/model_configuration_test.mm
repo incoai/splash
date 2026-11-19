@@ -82,13 +82,18 @@ constexpr std::string_view kLargeMoeGgufConfig =
     R"("max_position_embeddings":262144,"num_attention_heads":32,"num_key_value_heads":2,)"
     R"("head_dim":256,"num_experts":256,"num_hidden_layers":48,"vocab_size":248320}})";
 
-// The descriptor inspection makes of model's assembly.
-model::ModelDescriptor inspect(const SourceModel &model) {
+// The descriptor inspection makes of model's assembly, with the LoRA adapter
+// of `adapter`, its adapter_config.json, where one is given.
+model::ModelDescriptor inspect(const SourceModel &model, std::string_view adapter = {}) {
   const test::TemporaryDirectory root("splash-source-model");
   std::filesystem::create_directory(root.path() / "draft");
   test::writeFile(root.path() / "model.json", model.record);
   test::writeFile(root.path() / "config.json", model.config);
   test::writeFile(root.path() / "draft" / "config.json", model.draft);
+  if (!adapter.empty()) {
+    std::filesystem::create_directory(root.path() / "lora");
+    test::writeFile(root.path() / "lora" / "adapter_config.json", adapter);
+  }
   return model::inspectModelRoot(root.path());
 }
 
@@ -1133,10 +1138,61 @@ void testInkling2(const std::filesystem::path &fixtures) {
           "the release's Inkling-2-Mini config made another descriptor as a safetensors target");
 }
 
+// A root's LoRA adapter is a plain PEFT LoRA, whose rank and scale the
+// descriptor takes; a configuration that changes what a module computes is
+// refused by the key that does.
+void testLoraAdapter(const std::filesystem::path &fixtures) {
+  const SourceModel dense = mlxModel(fixtures, "qwen3.8-27b");
+  require(!inspect(dense).lora, "a root without an adapter describes one");
+  // As peft saves a plain adapter: the keys of its variants present, and off.
+  const std::string plain =
+      R"({"peft_type":"LORA","r":32,"lora_alpha":64,"use_dora":false,"use_rslora":false,"bias":"none",)"
+      R"("lora_bias":false,"fan_in_fan_out":false,"rank_pattern":{},"alpha_pattern":{},"modules_to_save":null,)"
+      R"("target_modules":["q_proj","v_proj"],"base_model_name_or_path":"Qwen/Qwen3.8-27B"})";
+  const auto with = [&](std::string_view from, std::string_view to) {
+    std::string text = plain;
+    const size_t at = text.find(from);
+    require(at != std::string::npos, "the adapter config has no " + std::string(from));
+    return text.replace(at, from.size(), to);
+  };
+  require(inspect(dense, plain).lora == model::LoraAdapterLayout{32, 2.0f},
+          "a plain adapter's rank and scale are not its r and lora_alpha / r");
+  // rsLoRA scales by alpha over the rank's root.
+  require(inspect(dense, with(R"("r":32,"lora_alpha":64,"use_dora":false,"use_rslora":false)",
+                              R"("r":16,"lora_alpha":8,"use_dora":false,"use_rslora":true)"))
+                  .lora == model::LoraAdapterLayout{16, 2.0f},
+          "an rsLoRA adapter's scale is not lora_alpha over the root of r");
+  for (const auto &[from, to, key] : std::initializer_list<std::array<std::string_view, 3>>{
+           {R"("use_dora":false)", R"("use_dora":true)", "use_dora"},
+           {R"("bias":"none")", R"("bias":"all")", "bias"},
+           {R"("lora_bias":false)", R"("lora_bias":true)", "lora_bias"},
+           {R"("fan_in_fan_out":false)", R"("fan_in_fan_out":true)", "fan_in_fan_out"},
+           {R"("rank_pattern":{})", R"("rank_pattern":{"q_proj":8})", "rank_pattern"},
+           {R"("alpha_pattern":{})", R"("alpha_pattern":{"q_proj":8})", "alpha_pattern"},
+           {R"("modules_to_save":null)", R"("modules_to_save":["lm_head"])", "modules_to_save"}})
+    rejects([&] { static_cast<void>(inspect(dense, with(from, to))); },
+            "the LoRA adapter sets " + std::string(key) + ", which Splash does not apply",
+            "an adapter with " + std::string(key) + " was accepted");
+  rejects([&] { static_cast<void>(inspect(dense, with(R"("peft_type":"LORA")", R"("peft_type":"LOHA")"))); },
+          "is not a PEFT LoRA", "an adapter of another kind was accepted");
+  for (const std::string_view rank : {R"("r":0,)", R"("r":257,)", R"("r":1.5,)"})
+    rejects([&] { static_cast<void>(inspect(dense, with(R"("r":32,)", rank))); }, "the LoRA adapter's rank is not in",
+            "an adapter of a rank Splash does not take was accepted");
+  rejects([&] { static_cast<void>(inspect(dense, with(R"("lora_alpha":64)", R"("lora_alpha":0)"))); },
+          "its alpha is not positive", "an adapter without a scale was accepted");
+  // The modules are the Qwen layers': a family of other layers takes none.
+  const SourceModel inkling{
+      R"({"version":1,"model":"community/fine-tune","target_format":"gguf","vision_format":"none"})",
+      text(fixtures / "inkling-2-mini" / "config.json"), text(fixtures / "inkling-2-mini" / "draft" / "config.json")};
+  rejects([&] { static_cast<void>(inspect(inkling, plain)); }, "Splash applies no LoRA adapter to Inkling-2-Mini",
+          "an Inkling-2-Mini adapter was accepted");
+}
+
 int main(int argc, char **argv) {
   try {
     if (argc != 2) throw std::invalid_argument("usage: model-configuration FIXTURES");
     testFamilies(argv[1]);
+    testLoraAdapter(argv[1]);
     testSources();
     testOneRulePerValue(argv[1]);
     testQuantization(argv[1]);
@@ -1146,8 +1202,8 @@ int main(int argc, char **argv) {
     testYarn(argv[1]);
     testFlint(argv[1]);
     testInkling2(argv[1]);
-    std::cout << "model configuration: every family, sources, one rule per value, quantization, vision, pruned "
-                 "experts, the installer's check, YaRN, Flint, Inkling-2-Mini PASS\n";
+    std::cout << "model configuration: every family, LoRA adapters, sources, one rule per value, quantization, "
+                 "vision, pruned experts, the installer's check, YaRN, Flint, Inkling-2-Mini PASS\n";
   } catch (const std::exception &error) {
     std::cerr << error.what() << '\n';
     return 1;

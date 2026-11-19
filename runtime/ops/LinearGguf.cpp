@@ -5,6 +5,7 @@
 
 #include "metal/abi/ExecutionGeometry.h"
 #include "metal/abi/Gguf.h"
+#include "metal/abi/Lora.h"
 #include "ops/BufferExtent.hpp"
 #include "ops/KernelSelection.hpp"
 
@@ -337,8 +338,38 @@ void Linear::addGgufStaged(metal::CommandGraph &graph, const LinearBuffers &b,
         for (const QuantizedSegment &s : q->blocks().segments)
           if (s.formatId != segments.front().formatId || (k / 32) % (splits * s.format().meta_groups))
             throw std::invalid_argument("the int8 tiles take segments of one format, whole blocks of it per split");
+  // LoRA corrections (LinearLora), which the gguf_decode_lora_* kernels add.
+  const LinearLora *lora = b.lora;
+  if (lora && std::none_of(lora->terms.begin(), lora->terms.end(), [](const LinearLora::Term &t) { return bool(t.b); }))
+    lora = nullptr;
+  const auto loraTile = [&](uint32_t flags, uint32_t first, uint32_t second, uint32_t third) {
+    return GgufLora{lora->rank, lora->tStride, flags, {first, second, third}};
+  };
+  const auto loraTerm = [&](size_t index, const QuantizedSegment &s) -> const LinearLora::Term * {
+    const LinearLora::Term &term = lora->terms[index];
+    if (!term.b) return nullptr;
+    if (term.outputSize != s.outputSize) throw std::invalid_argument("a LoRA correction does not match its tensor");
+    requireBytes(term.b, uint64_t{s.outputSize} * lora->rank * 2, "LoRA B");
+    return &term;
+  };
+  if (lora) {
+    if (!lora->rank || lora->rank % GGUF_STAGED_STEP || lora->rows > rows)
+      throw std::invalid_argument("invalid LoRA corrections");
+    // The tile's matmul reads every row it holds.
+    requireBytes(lora->t, uint64_t{rows} * lora->tStride * 2, "LoRA t");
+  }
+  // The next single tensor's correction: a gate pass's, then its up pass's.
+  size_t tensorTerm = 0;
   const auto tensor = [&](const QuantizedSegment &s, char epilogue, const metal::MetalBuffer &output,
                           const metal::MetalBuffer &aux) {
+    if (const LinearLora::Term *term = lora && tensorTerm < lora->terms.size() ? loraTerm(tensorTerm++, s) : nullptr) {
+      graph.add("gguf_decode_lora_" + std::string(s.name()) + "_m" + std::to_string(height) + "_" + epilogue,
+                {b.input, s.plane0, s.plane1Slot(), s.meta, output, partials, counters, aux, lora->t, term->b},
+                GgufDecodeLoraParams{{k, splits, n, s.columnOffset, config.spread},
+                                     loraTile(1, term->tOffset, 0, 0)},
+                tileGrid(s.outputSize), {GGUF_STAGED_THREADS, 1, 1});
+      return;
+    }
     graph.add(kernelInstance(decodeKernel(config.decodeInt8, s.name(), height, std::string_view(&epilogue, 1)),
                              plan.destination()),
               {b.input, s.plane0, s.plane1Slot(), s.meta, output, partials, counters, aux},
@@ -360,8 +391,29 @@ void Linear::addGgufStaged(metal::CommandGraph &graph, const LinearBuffers &b,
       graph.specialize(std::array<uint32_t, 4>{0, 0, 0, groups});
       return;
     }
-    graph.add("gguf_decode_fused_m" + std::to_string(height), std::move(bindings), params, tileGrid(segmentColumns(p)),
-              {GGUF_STAGED_THREADS, 1, 1});
+    // Each segment's correction, in dispatch order; a slot without one binds
+    // a B no tile reads.
+    GgufLora tile{};
+    std::vector<metal::MetalBuffer> corrections;
+    if (lora) {
+      tile = loraTile(0, 0, 0, 0);
+      for (size_t i = 0; i < order.size(); ++i)
+        if (const LinearLora::Term *term = loraTerm(size_t(order[i] - segments.data()), *order[i])) {
+          tile.flags |= 1u << i;
+          tile.t_offset[i] = term->tOffset;
+          corrections.resize(kFusedSegments, term->b);
+          corrections[i] = term->b;
+        }
+    }
+    if (tile.flags) {
+      bindings.push_back(lora->t);
+      bindings.insert(bindings.end(), corrections.begin(), corrections.end());
+      // One row group, as the bf16 fused kernel runs.
+      graph.add("gguf_decode_fused_lora_m" + std::to_string(height), std::move(bindings),
+                GgufDecodeFusedLoraParams{params, tile}, tileGrid(segmentColumns(p)), {GGUF_STAGED_THREADS, 1, 1});
+    } else
+      graph.add("gguf_decode_fused_m" + std::to_string(height), std::move(bindings), params,
+                tileGrid(segmentColumns(p)), {GGUF_STAGED_THREADS, 1, 1});
     // The pipeline decodes the segments' formats alone, each once in
     // ascending order and the last repeated to three, so projections of one
     // format set share it (gguf_linear.metal, fused_formats).
@@ -374,6 +426,19 @@ void Linear::addGgufStaged(metal::CommandGraph &graph, const LinearBuffers &b,
   };
   if (config.oneGateUpPass) {
     const auto [g, u] = onePassTensors(p, *gate);
+    const LinearLora::Term *gateTerm = lora ? loraTerm(0, g) : nullptr, *upTerm = lora ? loraTerm(1, u) : nullptr;
+    if (gateTerm || upTerm) {
+      // A slot without a correction binds a B no tile reads.
+      const metal::MetalBuffer &spare = gateTerm ? gateTerm->b : upTerm->b;
+      graph.add("gguf_decode_lora_" + std::string(u.name()) + "_m" + std::to_string(rows) + "_gate_up",
+                {b.input, g.plane0, g.plane1Slot(), g.meta, u.plane0, u.plane1Slot(), u.meta, b.output, partials,
+                 counters, lora->t, gateTerm ? gateTerm->b : spare, upTerm ? upTerm->b : spare},
+                GgufDecodeLoraParams{{k, splits, n, u.columnOffset, config.spread},
+                                     loraTile((gateTerm ? 1u : 0u) | (upTerm ? 2u : 0u),
+                                              gateTerm ? gateTerm->tOffset : 0, upTerm ? upTerm->tOffset : 0, 0)},
+                {u.outputSize / GGUF_STAGED_COLUMNS, splits, 1}, {GGUF_GATE_UP_THREADS, 1, 1});
+      return;
+    }
     graph.add(decodeKernel(config.decodeInt8, u.name(), rows, "gate_up"),
               {b.input, g.plane0, g.plane1Slot(), g.meta, u.plane0, u.plane1Slot(), u.meta, b.output, partials,
                counters},

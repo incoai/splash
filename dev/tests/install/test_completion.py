@@ -331,7 +331,7 @@ class CompletionTests(unittest.TestCase):
         (self.root / "local dir").mkdir()
         (self.root / "local dir/target.gguf").touch()
         for shell in bash_paths():
-            for flag in ("--model-dir", "--draft-model", "--mmproj"):
+            for flag in ("--model-dir", "--draft-model", "--mmproj", "--lora"):
                 # Words as Bash 4 and later split flag= and flag=t.
                 for words in ([flag, "="], [flag, "=", "t"]):
                     with self.subTest(shell=shell, words=words):
@@ -362,7 +362,7 @@ class CompletionTests(unittest.TestCase):
     def test_zsh_completes_local_model_paths_with_spaces(self):
         _, directory = self.layout()
         (self.root / "local target.gguf").touch()
-        for flag in ("--model-dir", "--draft-model", "--mmproj"):
+        for flag in ("--model-dir", "--draft-model", "--mmproj", "--lora"):
             with self.subTest(flag=flag):
                 result = self.shell_tab(
                     directory / "_splash", f"splash serve {flag} local\\ t"
@@ -376,7 +376,7 @@ class CompletionTests(unittest.TestCase):
         _, directory = self.layout()
         target = self.root / "local target.gguf"
         target.touch()
-        for flag in ("--model-dir", "--draft-model", "--mmproj"):
+        for flag in ("--model-dir", "--draft-model", "--mmproj", "--lora"):
             with self.subTest(flag=flag):
                 self.assertEqual(
                     self.fish_complete(

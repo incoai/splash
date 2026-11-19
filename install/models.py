@@ -238,19 +238,22 @@ def selection_link(
     return models / f"{repo_id}{serve_options.VARIANT_SEPARATOR}{variant}"
 
 
-def local_selection_link(models: Path, target, draft, mmproj, language_only) -> Path:
+def local_selection_link(
+    models: Path, target, draft, mmproj, language_only, lora=None
+) -> Path:
     """The selection link of a model prepared from local files (local.py):
     .selections/<hash of its paths and options>, apart from every Hub
-    selection's, whose hashed form is a list."""
-    return _hashed_link(
-        models,
-        {
-            "target": str(target),
-            "draft": draft and str(draft),
-            "mmproj": mmproj and str(mmproj),
-            "language_only": language_only,
-        },
-    )
+    selection's, whose hashed form is a list. A selection without a LoRA
+    adapter hashes as it did before selections had one."""
+    selection = {
+        "target": str(target),
+        "draft": draft and str(draft),
+        "mmproj": mmproj and str(mmproj),
+        "language_only": language_only,
+    }
+    if lora:
+        selection["lora"] = str(lora)
+    return _hashed_link(models, selection)
 
 
 def _hashed_link(models: Path, selection) -> Path:

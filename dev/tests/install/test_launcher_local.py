@@ -177,6 +177,7 @@ class LocalServeTests(unittest.TestCase):
     def test_conflicting_local_options_are_refused_before_setup(self):
         for options, reason in (
             (["--mmproj", "tower.gguf"], "--mmproj requires --model-dir"),
+            (["--lora", "adapter"], "--lora requires --model-dir"),
             (
                 ["--model-dir", "model", "--revision", "main"],
                 "--revision cannot be used with --model-dir",
@@ -242,6 +243,8 @@ class LocalPreparationCommandTests(unittest.TestCase):
                     "/draft",
                     "--mmproj",
                     "/projector",
+                    "--lora",
+                    "/adapter",
                     "--models",
                     "/models",
                 ]
@@ -250,7 +253,7 @@ class LocalPreparationCommandTests(unittest.TestCase):
         self.assertEqual(output.getvalue(), "/prepared/model with spaces\n")
         self.assertEqual(progress.getvalue(), "Preparing the model...\n")
         prepare_model.assert_called_once_with(
-            Path("/target"), "/draft", "/projector", False, Path("/models")
+            Path("/target"), "/draft", "/projector", "/adapter", False, Path("/models")
         )
 
     def test_helper_reports_refusals_and_interruptions_without_a_traceback(self):

@@ -4,6 +4,7 @@
 #include "metal/abi/Gguf.h"
 #include "ops/BufferExtent.hpp"
 #include "ops/KernelSelection.hpp"
+#include "ops/Lora.hpp"
 
 #include <algorithm>
 #include <array>
@@ -107,6 +108,9 @@ Projection Projection::rows(const metal::MetalBackend &backend, std::initializer
     return rowBytes ? backend.view(plane, range.first * rowBytes, range.count * rowBytes) : metal::MetalBuffer{};
   };
   BlockWeights weights;
+  // The tensor's update over each range's rows of B, on the tensor's A.
+  ProjectionLora update = lora;
+  update.segments.clear();
   uint32_t columns = 0;
   for (const RowRange range : ranges) {
     if (range.first % QUANT_TILE_ROWS || range.count % QUANT_TILE_ROWS ||
@@ -129,10 +133,16 @@ Projection Projection::rows(const metal::MetalBackend &backend, std::initializer
     segment.columnOffset = columns;
     columns += range.count;
     weights.segments.push_back(std::move(segment));
+    if (lora)
+      update.segments.push_back({lora.segments.front().b
+                                     ? view(lora.segments.front().b, uint64_t{lora.rank} * sizeof(uint16_t), range)
+                                     : metal::MetalBuffer{},
+                                 lora.segments.front().slot});
   }
   Projection result(columns, inputSize, std::move(weights));
   result.destination = destination;
   result.rotation = rotation;
+  result.lora = std::move(update);
   return result;
 }
 
@@ -265,6 +275,12 @@ LinearScratchSize Linear::scratchSize(ProjectionShape shape, uint32_t rows) cons
                                ? std::max(rows, stagedStorageRows(rows, true))
                                : (rows + GGUF_PREFILL_ROWS - 1) / GGUF_PREFILL_ROWS * GGUF_PREFILL_ROWS;
   if (shape.rotated) bound.rotated = rotatedBytes(shape.inputSize, storage);
+  // A LoRA update's rows t, a gate/up pair's two, and the sums of the plan
+  // whose tile does not add it.
+  if (shape.loraValues) {
+    bound.loraDown = lora::rowsBytes(storage, 2 * shape.loraValues);
+    bound.loraRows = uint64_t{storage} * shape.outputSize * sizeof(uint16_t);
+  }
   // The most rows' plan, whose codes and scales the int8 prefill tile holds
   // where it takes the shape's formats.
   if (rows > kMaximumDecodeTileRows) {
@@ -281,9 +297,17 @@ std::array<metal::MetalBuffer, 2> Linear::splitScratch(const LinearBuffers &buff
   return {buffers.output, buffers.output};
 }
 
-PreparedInput Linear::add(metal::CommandGraph &graph, LinearBuffers b,
-    const Projection &p, const LinearPlan &selected, const Projection *gate) const {
+bool Linear::takesLora(const LinearPlan &plan) const noexcept {
+  const LinearConfig c = plan.configuration();
+  return c.tile == LinearTile::GgufStaged && !c.decodeInt8 && !plan.rotated_ &&
+         plan.destination() == FloatOutput::BFloat16;
+}
+
+PreparedInput Linear::addPlan(metal::CommandGraph &graph, LinearBuffers b, const Projection &p,
+                              const LinearPlan &selected, const Projection *gate) const {
   const LinearWorkload w = selected.workload();
+  if (b.lora && !takesLora(selected))
+    throw std::invalid_argument("only a staged bf16 decode plan adds LoRA corrections to its sums");
   const auto [n, k] = w.matrix;
   if ((w.epilogue == LinearEpilogue::GateUp) != (gate != nullptr))
     throw std::invalid_argument("a gate/up plan takes a gate projection and no other plan does");
@@ -314,6 +338,62 @@ PreparedInput Linear::add(metal::CommandGraph &graph, LinearBuffers b,
   return tiled && selected.input() != LinearInput::Plain ? PreparedInput{b.input, selected.input()} : b.prepared;
 }
 
+PreparedInput Linear::add(metal::CommandGraph &graph, LinearBuffers b, const Projection &p,
+                          const LinearPlan &selected, const Projection *gate) const {
+  if (b.lora) throw std::invalid_argument("a plan's LoRA corrections are its projections' updates");
+  if (!p.lora && !(gate && gate->lora)) return addPlan(graph, std::move(b), p, selected, gate);
+  const LinearWorkload w = selected.workload();
+  if (selected.destination() != FloatOutput::BFloat16)
+    throw std::invalid_argument("a projection with a LoRA update writes bf16 rows");
+  const ProjectionLora *first = gate ? &gate->lora : &p.lora, *second = gate ? &p.lora : nullptr;
+  const std::vector<QuantizedSegment> &segments = p.blocks().segments;
+  LinearLora corrections;
+  if (takesLora(selected) && segments.size() <= corrections.terms.size()) {
+    const LoraRows down = lora::addDown(graph, *this, b.input, w.rows, first, second, b.scratch.loraDown, true);
+    corrections.t = down.t;
+    corrections.tStride = down.stride;
+    corrections.rows = w.rows;
+    corrections.rank = p.lora ? p.lora.rank : gate->lora.rank;
+    // A pair's rows t hold the gate's update first where it has one (lora::addDown).
+    const auto term = [&](const Projection &projection, size_t segment, uint32_t offset) -> LinearLora::Term {
+      if (!projection.lora) return {};
+      if (projection.lora.rank != corrections.rank)
+        throw std::invalid_argument("the LoRA updates of one plan share a rank");
+      const ProjectionLora::Segment &update = projection.lora.segments.at(segment);
+      return {update.b, offset + update.slot * corrections.rank,
+              projection.blocks().segments[segment].outputSize};
+    };
+    if (gate) {
+      corrections.terms[0] = term(*gate, 0, down.offsets[0]);
+      corrections.terms[1] = term(p, 0, down.offsets[gate->lora ? 1 : 0]);
+    } else {
+      for (size_t segment = 0; segment < segments.size(); ++segment)
+        corrections.terms[segment] = term(p, segment, down.offsets[0]);
+    }
+    b.lora = &corrections;
+    return addPlan(graph, std::move(b), p, selected, gate);
+  }
+  if (w.epilogue == LinearEpilogue::None) {
+    const PreparedInput prepared = addPlan(graph, b, p, selected, nullptr);
+    const LoraRows down = lora::addDown(graph, *this, b.input, w.rows, first, nullptr, b.scratch.loraDown, false);
+    lora::addTile(graph, p, down, b.output, {}, b.output, w.rows);
+    return prepared;
+  }
+  if (w.epilogue != LinearEpilogue::Residual)
+    throw std::logic_error("a gate/up pair's LoRA updates on plans that do not add them are addSwiGlu's");
+  // The plan's configuration without its residual, into the scratch's rows.
+  LinearPlan sums({w.matrix, w.rows, LinearEpilogue::None}, selected.configuration(), selected.destination());
+  sums.rotated_ = selected.rotated_;
+  sums.requireConfiguration();
+  LinearBuffers plain = b;
+  plain.output = b.scratch.loraRows;
+  plain.residual = {};
+  const PreparedInput prepared = addPlan(graph, std::move(plain), p, sums, nullptr);
+  const LoraRows down = lora::addDown(graph, *this, b.input, w.rows, first, nullptr, b.scratch.loraDown, false);
+  lora::addTile(graph, p, down, b.scratch.loraRows, b.residual, b.output, w.rows);
+  return prepared;
+}
+
 void Linear::addProjection(metal::CommandGraph &graph, metal::MetalBuffer input, const Projection &p,
                            metal::MetalBuffer output, uint32_t rows, LinearScratch scratch, uint32_t chunkRows) const {
   add(graph, {.input = input, .output = output, .scratch = scratch}, p,
@@ -327,19 +407,44 @@ void Linear::addResidualProjection(metal::CommandGraph &graph, metal::MetalBuffe
 }
 // A chunk's rows decide whether its plans run the pair as one, so that a plan
 // of some of its rows computes them as the chunk's does.
+bool Linear::pairs(const SwiGluProjections &ffn, uint32_t rows, uint32_t chunkRows) const {
+  if ((chunkRows ? chunkRows : rows) > kMaximumDecodeTileRows) return false;
+  if (!ffn.gate->lora && !ffn.up->lora) return true;
+  return takesLora(plan(*ffn.up, rows, LinearEpilogue::GateUp, ffn.gate, chunkRows));
+}
+
+// Past one tile's rows a decode step runs the pair as a gate plan and an up
+// plan on the staged tile's row groups, whose tiles add the updates.
+bool Linear::passesTakeLora(const SwiGluProjections &ffn, uint32_t rows, uint32_t chunkRows) const {
+  return (chunkRows ? chunkRows : rows) > kMaximumDecodeTileRows &&
+         takesLora(plan(*ffn.gate, rows, LinearEpilogue::None, nullptr, chunkRows)) &&
+         takesLora(plan(*ffn.up, rows, LinearEpilogue::UpWithGate, nullptr, chunkRows));
+}
+
 LinearInput Linear::swiGluInput(const SwiGluProjections &ffn, uint32_t rows, uint32_t chunkRows) const {
-  if ((chunkRows ? chunkRows : rows) <= kMaximumDecodeTileRows)
-    return plan(*ffn.up, rows, LinearEpilogue::GateUp, ffn.gate, chunkRows).input();
+  if (pairs(ffn, rows, chunkRows)) return plan(*ffn.up, rows, LinearEpilogue::GateUp, ffn.gate, chunkRows).input();
   return plan(*ffn.gate, rows, LinearEpilogue::None, nullptr, chunkRows).input();
 }
+
 void Linear::addSwiGlu(metal::CommandGraph &graph, const SwiGluProjections &ffn, const PrefillFfnBuffers &b,
                        metal::MetalBuffer residual, metal::MetalBuffer output, uint32_t rows, uint32_t chunkRows,
                        PreparedInput normalized) const {
-  if ((chunkRows ? chunkRows : rows) <= kMaximumDecodeTileRows) {
+  if (pairs(ffn, rows, chunkRows)) {
     add(graph,
         {.input = b.normalized, .output = b.intermediate, .gateScratch = b.gateScratch, .scratch = b.scratch,
          .prepared = normalized},
         *ffn.up, plan(*ffn.up, rows, LinearEpilogue::GateUp, ffn.gate, chunkRows), ffn.gate);
+  } else if ((ffn.gate->lora || ffn.up->lora) && !passesTakeLora(ffn, rows, chunkRows)) {
+    normalized = addPlan(graph,
+                         {.input = b.normalized, .output = b.scratch.loraRows, .scratch = b.scratch,
+                          .prepared = normalized},
+                         *ffn.gate, plan(*ffn.gate, rows, LinearEpilogue::None, nullptr, chunkRows), nullptr);
+    addPlan(graph,
+            {.input = b.normalized, .output = b.intermediate, .scratch = b.scratch, .prepared = normalized},
+            *ffn.up, plan(*ffn.up, rows, LinearEpilogue::None, nullptr, chunkRows), nullptr);
+    const LoraRows down =
+        lora::addDown(graph, *this, b.normalized, rows, &ffn.gate->lora, &ffn.up->lora, b.scratch.loraDown, false);
+    lora::addSwiGluTile(graph, *ffn.gate, *ffn.up, down, b.scratch.loraRows, b.intermediate, b.intermediate, rows);
   } else {
     normalized = add(graph,
                      {.input = b.normalized, .output = b.gateScratch, .scratch = b.scratch, .prepared = normalized},
