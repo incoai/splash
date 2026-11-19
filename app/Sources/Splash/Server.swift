@@ -40,8 +40,8 @@ final class Server {
 
     /// What a start does, as the server's serve record gives it: the server starts, reads the
     /// model's weights into memory, then runs the model once at full size so that its first answer
-    /// comes quickly; the first start after an update also prepares the GPU's programs then, which
-    /// can take a couple of minutes.
+    /// comes quickly; a model's first start on this install, new or updated, also prepares the GPU's
+    /// programs and measures the model's decode steps then, which can take a couple of minutes.
     enum Step: String {
         case starting = "Starting"
         case loading = "Loading weights"
@@ -50,7 +50,7 @@ final class Server {
         /// Why the step can take long, which the window says while it runs; nil for a step that
         /// doesn't.
         var note: String? {
-            self == .warming ? "The first start after an update prepares the GPU and can take a couple of minutes." : nil
+            self == .warming ? "A model's first start after an install or an update prepares the GPU and can take a couple of minutes." : nil
         }
 
         /// The step of a start at `phase`; nil once the start has ended.
