@@ -4,7 +4,6 @@ import threading
 from concurrent.futures import Future, wait
 
 from llguidance import LLMatcher, LLTokenizer
-from llguidance.hf import from_tokenizer as guidance_tokenizer
 from llguidance.numpy import allocate_token_bitmask, fill_next_token_bitmask
 
 from .chat_format import THINK_END, THINK_START, TOOL_CALL_OPEN
@@ -12,6 +11,15 @@ from .errors import APIError, ConstraintError
 from .lru import LRUCache
 from .protocol import NO_PARENT
 from .tokenization import added_tokens
+
+
+def guidance_tokenizer(tokenizer, **options):
+    """llguidance's table of a fast tokenizer (llguidance.hf.from_tokenizer).
+    Imported when a table is built: llguidance.hf imports transformers, which
+    the server imports only once its engine has started (server.main)."""
+    from llguidance.hf import from_tokenizer
+
+    return from_tokenizer(tokenizer, **options)
 
 
 class TokenConstraint:

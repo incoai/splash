@@ -24,8 +24,6 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from urllib.parse import unquote
 
-from transformers import AutoTokenizer
-
 from install import assembly
 from install.models import ModelError
 
@@ -1310,11 +1308,11 @@ class OptionError(Exception):
     """An option the served model's family cannot follow."""
 
 
-def _start_failed(args, error, failure):
-    """End a start that failed, saying why in the log and, for the app, in
-    the launcher's serve record (serve_record)."""
+def _start_failed(error):
+    """End a start that failed, saying why in the log; main says it for the
+    app in the launcher's serve record (serve_record) once the engine has
+    stopped."""
     print_status(f"Error · {error}", error=True)
-    serve_record.failed(args.serve_record, failure)
     raise SystemExit(1) from None
 
 
@@ -1325,6 +1323,10 @@ def main():
     backend = None
     # Why the backend stopped restarting the engine, once it has.
     stopped = None
+    # Why the start failed, which the record says once the engine has stopped
+    # (finally, below): the engine's warm-up, which records its steps from the
+    # reader thread, would otherwise record over it.
+    failure = None
 
     def stop_serving(reason):
         nonlocal stopped
@@ -1399,6 +1401,35 @@ def main():
         if args.chat_template_file is not None:
             custom = read_template_file(args.chat_template_file)
             print_status(f"Chat template file · {args.chat_template_file}")
+
+        def warming(event):
+            # As the warm-up begins and as each of its steps ends: it can take
+            # minutes on the first start after an update, so the console and
+            # the record, which the app shows, say how far it is. It runs on
+            # the reader thread, which must not block (on_warming):
+            # print_status only queues the line for the console's one writer,
+            # which drops it once 1024 lines wait (diagnostics.CONSOLE_LINES).
+            print_status(f"Warming up · {event.steps_done} of {event.steps} steps")
+            serve_record.warming(args.serve_record, event.steps_done, event.steps)
+
+        # The engine starts now and reads its weights while this process
+        # imports the tokenizer's library and loads the tokenizer and the
+        # chat template, which it needs none of: on a 32-core M5 Max, with
+        # the 27B and the 35B, they take 1.2-1.3 s of a 12.2 s start. A
+        # failure here closes the engine (finally, below); one of the
+        # engine's is raised by wait_ready.
+        runtime = engine_runtime.MultiplexedRuntime(
+            _native_command(args, model_root),
+            relaunch_command=lambda first: _native_command(
+                args, model_root, first.max_context_tokens
+            ),
+            pending_limit=args.queue_size,
+        )
+        runtime.on_warming = warming
+        runtime.start()
+        # Imported here, while the engine loads: transformers takes 0.35-0.75 s.
+        from transformers import AutoTokenizer
+
         # A tokenizer the loader cannot read fails with whatever its parsers
         # raise, such as a KeyError for a tokenizer.json without added_tokens:
         # each is the model's.
@@ -1425,25 +1456,6 @@ def main():
             thinking_end = thinking_end_tokens(
                 tokenizer, chat_templates.select(None).thinking_end, family.chat_format
             )
-        runtime = engine_runtime.MultiplexedRuntime(
-            _native_command(args, model_root),
-            relaunch_command=lambda first: _native_command(
-                args, model_root, first.max_context_tokens
-            ),
-            pending_limit=args.queue_size,
-        )
-
-        def warming(event):
-            # As the warm-up begins and as each of its steps ends: it can take
-            # minutes on the first start after an update, so the console and
-            # the record, which the app shows, say how far it is. It runs on
-            # the reader thread, which must not block (on_warming):
-            # print_status only queues the line for the console's one writer,
-            # which drops it once 1024 lines wait (diagnostics.CONSOLE_LINES).
-            print_status(f"Warming up · {event.steps_done} of {event.steps} steps")
-            serve_record.warming(args.serve_record, event.steps_done, event.steps)
-
-        runtime.on_warming = warming
 
         def engine_recovering(recovering):
             # The record follows the engine once the server is ready, for
@@ -1465,7 +1477,9 @@ def main():
         # ENGINE_STOPPED_STATUS below.
         backend.on_stopped = stop_serving
         if not runtime.wait_ready():
-            raise engine_runtime.EngineUnhealthy("native runtime did not become ready")
+            raise engine_runtime.EngineUnhealthy(
+                "native runtime failed after it became ready"
+            )
         # The engine is authoritative for what it serves: it refuses a
         # --max-context it cannot serve.
         served = runtime.capabilities
@@ -1508,24 +1522,25 @@ def main():
         print_status(f"Ready · {args.model} · context {context}{mode} · {address}")
         server.serve_forever()
     except engine_runtime.EngineStartFailed as error:
-        _start_failed(args, error, serve_record.engine_failure(error.event, str(error)))
+        failure = serve_record.engine_failure(error.event, str(error))
+        _start_failed(error)
     except ListenError as error:
-        _start_failed(args, error, serve_record.failure(serve_record.PORT, str(error)))
+        failure = serve_record.failure(serve_record.PORT, str(error))
+        _start_failed(error)
     except OptionError as error:
-        _start_failed(
-            args, error, serve_record.failure(serve_record.CONFIGURATION, str(error))
-        )
+        failure = serve_record.failure(serve_record.CONFIGURATION, str(error))
+        _start_failed(error)
     except (
         ModelError,
         ChatTemplateError,
         ThinkingEndError,
         TokenizerContractError,
     ) as error:
-        _start_failed(args, error, serve_record.failure(serve_record.MODEL, str(error)))
+        failure = serve_record.failure(serve_record.MODEL, str(error))
+        _start_failed(error)
     except (engine_runtime.EngineRuntimeError, ThinkingKeyError, OSError) as error:
-        _start_failed(
-            args, error, serve_record.failure(serve_record.INTERNAL, str(error))
-        )
+        failure = serve_record.failure(serve_record.INTERNAL, str(error))
+        _start_failed(error)
     except serve_record.NotRecorded as error:
         # The record that cannot say ready cannot say why either: the app
         # takes the exit for the failure, which the log words.
@@ -1535,11 +1550,8 @@ def main():
         # An error no clause above names is a bug: the record still names the
         # failure, so that the app reports it instead of a crash, and the
         # traceback reaches the log.
-        serve_record.failed(
-            args.serve_record,
-            serve_record.failure(
-                serve_record.INTERNAL, f"{type(error).__name__}: {error}"
-            ),
+        failure = serve_record.failure(
+            serve_record.INTERNAL, f"{type(error).__name__}: {error}"
         )
         raise
     except KeyboardInterrupt:
@@ -1564,10 +1576,15 @@ def main():
             if backend is not None:
                 print_status("Stopping · releasing engine resources")
                 backend.close()
+            elif runtime is not None:
+                # A start that failed while the engine loaded stops it.
+                runtime.close()
         finally:
             signal.signal(signal.SIGINT, signal.SIG_IGN)
             if server is not None:
                 server.server_close()
+            if failure is not None:
+                serve_record.failed(args.serve_record, failure)
     if stopped is not None:
         serve_record.failed(
             args.serve_record, serve_record.failure(serve_record.STOPPED, stopped)

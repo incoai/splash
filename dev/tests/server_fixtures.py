@@ -474,6 +474,10 @@ class FakeRuntime:
     def pending_count(self):
         return sum(not call.done for call in self.calls)
 
+    def start(self):
+        # The fake starts no engine: wait_ready reads it as the test sets it.
+        pass
+
     def wait_ready(self, timeout=None):
         # The fake starts no engine: it is as ready as the test sets it.
         return self.ready

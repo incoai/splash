@@ -9,6 +9,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
+import transformers
 from llguidance import LLMatcher
 from tokenizers import (
     AddedToken,
@@ -907,7 +908,7 @@ class ServedFamilyTests(unittest.TestCase):
             fixtures.unprepared_hold(family),
             mock.patch.object(api, "load_thinking_key", return_value=None),
             mock.patch.object(
-                api.AutoTokenizer, "from_pretrained", return_value=tokenizer
+                transformers.AutoTokenizer, "from_pretrained", return_value=tokenizer
             ),
             mock.patch.object(api, "validate_tokenizer") as validate,
             mock.patch.object(api, "check_capabilities") as check,
