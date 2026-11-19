@@ -1268,6 +1268,11 @@ DraftContextPlan Engine::configureDraftStatePlan(Request &active,
   }
   if (junctionBoundary >= stateBoundary + kMinimumJunctionGain)
     addStateBoundary(active, stateBoundary, junctionBoundary, false, true);
+  // The head's end, so that the next conversation sharing the head resumes there on first use. An ordinary state,
+  // which a reclaim writes to the SSD as any other.
+  if (const uint32_t head = active.request.headTokens / KvCache::pageTokens * KvCache::pageTokens;
+      head >= stateBoundary + kMinimumJunctionGain)
+    addStateBoundary(active, stateBoundary, head, false, true);
   addStateBoundary(active, stateBoundary, latestReplayBoundary,
                    latestReplayBoundary != promptReplayBoundary(active), true);
   // A resumed lane below its prompt's replay point lost that state; it

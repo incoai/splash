@@ -12,7 +12,7 @@ from transformers import PreTrainedTokenizerFast
 
 from dev.tests import server_fixtures as fixtures
 from server import chat_messages, chat_templates
-from server.chat_format import QWEN, REASONING_EFFORTS
+from server.chat_format import FLINT, QWEN, REASONING_EFFORTS
 from server.chat_templates import (
     LATER_SYSTEM_UNSUPPORTED,
     NATIVE,
@@ -688,6 +688,98 @@ class ChatTemplateFrontendTests(unittest.TestCase):
             job.prompt_tokens[: -job.generation_prompt_tokens],
             app.tokenizer(history, add_special_tokens=False)["input_ids"],
         )
+
+    def test_requests_carry_the_end_of_their_head(self):
+        """A prompt that opens with a system prompt or with tools carries where
+        what the template renders of them ends, in Qwen's one system message
+        or in Flint's two system blocks, so that the engine keeps a state there
+        for the next conversation sharing it; a prompt without them carries
+        none."""
+        first = [
+            {"role": "user", "content": "Hi"},
+            {"role": "assistant", "content": "Hello"},
+            {"role": "user", "content": "Again"},
+        ]
+        other = [{"role": "user", "content": "Something else"}]
+        system = {"role": "system", "content": "Leading instructions"}
+        tool = {
+            "type": "function",
+            "function": {
+                "name": "read",
+                "description": "Reads a file",
+                "parameters": {"type": "object", "properties": {}},
+            },
+        }
+        for template, chat_format, user, special in (
+            ("qwen38_gguf", QWEN, "<|im_start|>user", ("<|im_start|>", "<|im_end|>")),
+            (
+                "flint",
+                FLINT,
+                "<|user|>",
+                ("<|system|>", "<|user|>", "<|assistant|>", "<|observation|>"),
+            ),
+        ):
+            app = fixtures.make_frontend(
+                chat_tokenizer(source(template), *special),
+                None,
+                "test-model",
+                4096,
+                10,
+                2,
+                vision=False,
+                chat_format=chat_format,
+            )
+            for name, head, tools in (
+                ("system", [system], None),
+                ("tools", [], [tool]),
+                ("both", [system], [tool]),
+                ("neither", [], None),
+            ):
+                with self.subTest(template=template, name=name):
+                    bodies = [
+                        {
+                            "model": "test-model",
+                            "messages": head + conversation,
+                            **({"tools": tools} if tools else {}),
+                        }
+                        for conversation in (first, other)
+                    ]
+                    jobs = [
+                        app.prepare(body, deadline=fixtures.FOREVER) for body in bodies
+                    ]
+                    if not head and not tools:
+                        self.assertEqual([job.head_tokens for job in jobs], [0, 0])
+                        continue
+                    # Up to where the user's turn opens.
+                    rendered = app.apply_template(bodies[0], deadline=fixtures.FOREVER)
+                    expected = len(
+                        app.tokenizer(rendered[: rendered.index(user)])["input_ids"]
+                    )
+                    self.assertEqual([job.head_tokens for job in jobs], [expected] * 2)
+                    self.assertEqual(
+                        jobs[0].prompt_tokens[:expected],
+                        jobs[1].prompt_tokens[:expected],
+                    )
+        # A custom template that opens no turn the format's way has no head
+        # to find.
+        tokenizer = chat_tokenizer(source("qwen38_gguf"), "<|im_start|>", "<|im_end|>")
+        app = fixtures.make_frontend(
+            tokenizer,
+            None,
+            "test-model",
+            4096,
+            10,
+            2,
+            vision=False,
+            chat_templates=ChatTemplates(
+                tokenizer, override=CustomChatTemplateTests.CUSTOM
+            ),
+        )
+        job = app.prepare(
+            {"model": "test-model", "messages": [system, *first]},
+            deadline=fixtures.FOREVER,
+        )
+        self.assertEqual(job.head_tokens, 0)
 
     def test_an_agent_loop_extends_the_previous_prompt_and_reply_in_every_api(self):
         """After a tool loop with thinking, the next request of each API,

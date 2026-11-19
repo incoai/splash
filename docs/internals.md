@@ -2405,6 +2405,14 @@ write budget when one is set, which drops them while it is spent, a suspended
 request's own too, and a full quota makes room for one by dropping the oldest
 copy, perhaps an older conversation's restore point.
 
+A prompt's head, its system prompt and tools up to where the template opens
+another message (`head_tokens` in the request frame), gets an ordinary state at
+its end on first prefill when it lies at least a draft window past where the
+request resumes, as a junction must save that much. It is kept and evicted as
+any ordinary state, so the next conversation sharing the head resumes there,
+from RAM or, once a reclaim has written it, from the SSD, instead of
+prefilling the head again.
+
 A cached state holds a cached cell of the target's GDN state and the draft's
 context window, not the draft's rings. The cached cell
 (`GdnStateLayout::cachedCellBytes`) keeps every layer's convolution rows and

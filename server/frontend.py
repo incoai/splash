@@ -95,6 +95,36 @@ class Prompt:
     template_effort: str | None = None
 
 
+def _head_tokens(messages, tools, tokens, openings):
+    """Where the prompt's head ends: its system message and the tools the
+    template renders before any other message, which other conversations of
+    the same agent or app share, end where the first other message opens
+    (ChatFormat.turn_openings, as `openings`' tokens). The engine keeps a
+    state there on first use, so the next conversation resumes past the
+    head rather than prefill it again. Zero without a system message first
+    or tools, and where no turn opens the format's way, as a custom template
+    (--chat-template-file) may write them. A head holds no image: system
+    content is text, and images come in user and tool turns."""
+    system = bool(messages) and messages[0].get("role") == "system"
+    if not (system or tools):
+        return 0
+    end = len(tokens)
+    for ids in openings:
+        index = -1
+        # Its first token found by list.index, the rest checked there: on an
+        # M5 Max a 15,000-token head takes 0.09 ms, where comparing at every
+        # token took 3.1 ms.
+        while True:
+            try:
+                index = tokens.index(ids[0], index + 1, end)
+            except ValueError:
+                break
+            if tuple(tokens[index : index + len(ids)]) == ids:
+                end = index
+                break
+    return 0 if end >= len(tokens) else end
+
+
 @dataclass
 class RenderedPrompt:
     text: str
@@ -104,6 +134,8 @@ class RenderedPrompt:
     thinking: bool
     # Images precede the generation prompt; expanding them keeps this count.
     generation_prompt_tokens: int
+    # Where the head ends (_head_tokens); zero without one.
+    head_tokens: int = 0
 
 
 @dataclass(frozen=True)
@@ -160,6 +192,11 @@ class Frontend:
         # Sized by the first engine's context, which every relaunch asks for.
         self.prompt_tokenizer = PromptTokenizer(
             tokenizer, chat_format.message_boundary, served.max_context_tokens
+        )
+        # The tokens of each of its turn openings, where a prompt's head ends.
+        self.turn_openings = tuple(
+            tuple(tokenizer(text, add_special_tokens=False)["input_ids"])
+            for text in chat_format.turn_openings
         )
         self.backend = backend
         # The model id the engine loaded. /status reports it, so an alias
@@ -737,8 +774,17 @@ class Frontend:
             thinking, generation_prompt_tokens = _generation_prompt(
                 chat_template.generation_prompt(options), rendered, tokens
             )
+        head_tokens = _head_tokens(
+            prompt.messages, prompt.tools, tokens, self.turn_openings
+        )
         return RenderedPrompt(
-            rendered, tokens, images, positions, thinking, generation_prompt_tokens
+            rendered,
+            tokens,
+            images,
+            positions,
+            thinking,
+            generation_prompt_tokens,
+            head_tokens,
         )
 
     def chat_job(
@@ -871,6 +917,7 @@ class Frontend:
             image_owner=prepared_images if prepared_images else None,
             tools_signature=tools_signature,
             generation_prompt_tokens=rendered.generation_prompt_tokens,
+            head_tokens=rendered.head_tokens,
             output_clamped_to_context=requested is not None and max_new < requested,
         )
 

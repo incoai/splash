@@ -986,6 +986,36 @@ void testEndedReplyKeepsItsLastCheckpoint() {
   }
 }
 
+// A conversation whose prompt starts with a head of 3,000 tokens, a system prompt and tools the server marks
+// (headTokens), keeps an ordinary state at the head's end: a second conversation sharing the head, the first to
+// follow, resumes at the head's last whole page. A prompt without a head, or with one shorter than the draft window
+// a state's capture costs (kMinimumJunctionGain), keeps none: the second conversation starts from 0.
+void testASecondConversationResumesAtASharedHead() {
+  for (const uint32_t headTokens : {3000U, 0U, 1024U}) {
+    test::EngineHarness h({.pages = 1024});
+    Events &events = h.events;
+    engine::Engine &engine = h.engine;
+    double now = 1;
+    const auto conversation = [&](uint64_t id, uint32_t seed) {
+      std::vector<uint32_t> prompt(3000);
+      std::iota(prompt.begin(), prompt.end(), 1);
+      prompt.resize(prompt.size() + 1500, seed);
+      EngineRequest result = conversationTurn(id, prompt, 8);
+      result.headTokens = headTokens;
+      return result;
+    };
+    engine.submit(conversation(1, 20'000));
+    tickUntil(h, now, [&] { return idle(engine); }, "the first conversation did not complete");
+    engine.submit(conversation(2, 30'000));
+    tickUntil(h, now, [&] { return idle(engine); }, "the second conversation did not complete");
+    const bool kept = headTokens >= model::ExecutionLimits::draftContextTokens;
+    const uint32_t head = kept ? headTokens / KvCache::pageTokens * KvCache::pageTokens : 0;
+    require(events.starts.back() == head, "head " + std::to_string(headTokens) +
+                                              ": the second conversation resumed from " +
+                                              std::to_string(events.starts.back()) + ", not " + std::to_string(head));
+  }
+}
+
 // A finished request's KV holds part of the budget, so a later request's KV
 // meets the wall as it grows, where each wall test's budget puts it; captured
 // states are OffloadStates from then on, which reclaim may write to the SSD
@@ -2488,6 +2518,7 @@ std::span<const test::TestCase> requestsTests() {
       {"testPreemptedReplyCheckpointIsDropped", testPreemptedReplyCheckpointIsDropped},
       {"testRunningReplyCheckpointIsDropped", testRunningReplyCheckpointIsDropped},
       {"testEndedReplyKeepsItsLastCheckpoint", testEndedReplyKeepsItsLastCheckpoint},
+      {"testASecondConversationResumesAtASharedHead", testASecondConversationResumesAtASharedHead},
       {"testReplyCheckpointsAreNotWrittenAtTheWall", testReplyCheckpointsAreNotWrittenAtTheWall},
       {"testCompletedReplyStateIsDroppedAtTheWall", testCompletedReplyStateIsDroppedAtTheWall},
       {"testRepliesAreKeptOnceAConversationRendersThemBack", testRepliesAreKeptOnceAConversationRendersThemBack},

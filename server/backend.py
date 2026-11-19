@@ -193,6 +193,9 @@ class Job:
     # Trailing prompt tokens of the chat template's generation prompt; zero
     # when unknown.
     generation_prompt_tokens: int = 0
+    # Where the prompt's head (a system prompt and tools) ends; zero without
+    # one (frontend._head_tokens).
+    head_tokens: int = 0
     flags: wire.RequestFlag = wire.RequestFlag(0)
     # The request asked for more output than the context leaves, and
     # max_new_tokens was lowered to what it leaves.
@@ -851,6 +854,7 @@ class NativeBackend:
             flags=job.flags,
             cache_salt=job.cache_salt,
             thinking_budget=self._thinking_budget(job),
+            head_tokens=job.head_tokens,
         )
         return engine_runtime.GenerationRequest(
             frame,
