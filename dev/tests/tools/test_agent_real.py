@@ -1331,6 +1331,7 @@ class AgentRunnerTests(unittest.TestCase):
             ),
             mock.patch.object(agent, "idle_status", return_value=initial),
             mock.patch.object(agent, "ClientRun") as client,
+            mock.patch.object(agent, "run_bugfix", return_value={"result": "pass"}),
         ):
             client.return_value.phases = []
             client.return_value.run.return_value = {}
@@ -1364,6 +1365,100 @@ class AgentRunnerTests(unittest.TestCase):
                         value,
                     ]
                 )
+
+
+# The one-line fix of the bug-fix fixture's seeded bug.
+BUGGY = 'int(fraction or "0")'
+FIXED = 'int(fraction.ljust(2, "0"))'
+
+
+class BugfixTests(unittest.TestCase):
+    def project(self, directory):
+        root = Path(directory) / "project"
+        agent.bugfix_fixture(root)
+        return root
+
+    def fix(self, root, old=BUGGY, new=FIXED):
+        source = root / agent.BUGFIX_SOURCE
+        source.write_text(source.read_text().replace(old, new))
+
+    def test_fixture_fails_as_shipped_and_passes_with_the_one_line_fix(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = self.project(directory)
+            tests = [sys.executable, *agent.TEST_ARGUMENTS]
+            shipped = subprocess.run(tests, cwd=root, capture_output=True, text=True)
+            self.assertIn("FAILED (failures=3)", shipped.stderr)
+            self.assertEqual(agent.bugfix_changes(root), {})
+            self.fix(root)
+            fixed = subprocess.run(tests, cwd=root, capture_output=True, text=True)
+            self.assertEqual(fixed.returncode, 0, fixed.stderr)
+            self.assertEqual(
+                agent.check_bugfix(root, [agent.TEST_COMMAND])["changes"],
+                {agent.BUGFIX_SOURCE: 2},
+            )
+
+    def test_a_correct_fix_written_at_length_passes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = self.project(directory)
+            source = root / agent.BUGFIX_SOURCE
+            text = source.read_text().replace(
+                '    cents = int(whole or "0") * 100 + int(fraction or "0")\n',
+                "    from decimal import Decimal\n"
+                "\n"
+                "    # The amount's own digits, scaled to cents exactly.\n"
+                '    amount = Decimal(f"{whole or 0}.{fraction or 0}")\n'
+                "    scaled = amount * 100\n"
+                "    cents = int(scaled)\n",
+            )
+            source.write_text(text)
+            self.assertGreater(agent.bugfix_changes(root)[agent.BUGFIX_SOURCE], 6)
+            agent.check_bugfix(root, [agent.TEST_COMMAND])
+
+    def test_fix_must_run_the_tests(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = self.project(directory)
+            self.fix(root)
+            with self.assertRaisesRegex(agent.AgentFailure, "execute"):
+                agent.check_bugfix(root, ["ls"])
+
+    def test_fix_must_stay_inside_the_library_module(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = self.project(directory)
+            self.fix(root)
+            # Changed tests, and a second source file.
+            edits = (
+                ("test_cart.py", "1700", "805 + 895"),
+                ("shop/cart.py", '"""A shopping cart', '"""A cart'),
+            )
+            for path, old, new in edits:
+                with self.subTest(path=path):
+                    target = root / path
+                    original = target.read_text()
+                    target.write_text(original.replace(old, new, 1))
+                    with self.assertRaisesRegex(
+                        agent.AgentFailure, "only shop/money.py"
+                    ):
+                        agent.check_bugfix(root, [agent.TEST_COMMAND])
+                    target.write_text(original)
+
+    def test_fix_that_special_cases_the_tests_prices_fails(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = self.project(directory)
+            self.fix(
+                root, new='int({"5": "50", "9": "90"}.get(fraction, fraction or "0"))'
+            )
+            tests = [sys.executable, *agent.TEST_ARGUMENTS]
+            self.assertEqual(
+                subprocess.run(tests, cwd=root, capture_output=True).returncode, 0
+            )
+            with self.assertRaisesRegex(agent.AgentFailure, "held-out amounts"):
+                agent.check_bugfix(root, [agent.TEST_COMMAND])
+
+    def test_unfixed_project_fails(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = self.project(directory)
+            with self.assertRaisesRegex(agent.AgentFailure, "only shop/money.py"):
+                agent.check_bugfix(root, [agent.TEST_COMMAND])
 
 
 if __name__ == "__main__":

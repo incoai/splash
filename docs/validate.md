@@ -75,6 +75,18 @@ that compacts the conversation, whose summary request and the request after it
 share only the system prompt and tools. Replay points of unfinished requests
 evicted during a phase only print a warning.
 
+In both scenarios each client also fixes a seeded bug, in a project and
+session of its own (`bugfix`): the shop package of
+`dev/tests/fixtures/agent_bugfix/project`, whose `money.to_cents` reads "8.5"
+as 805 cents, so that three cart tests fail and the cause is found only by
+running the tests and following the cart into `shop/money.py`. It passes when
+the client ran the test command, changed `shop/money.py` alone by at most 6
+lines, and the project's tests pass, as do amounts the tests do not use. Each
+client tries once; a failure prints what the engine's `/status` says changed
+over the fix (requests completed and failed, restarts, cached prompt tokens
+reused, replay points lost), from which the reader tells an engine fault from
+the model's answer.
+
 `benchmark-backend` and `benchmark-decode-profile` take `MODEL` the same way.
 The models they are run with, one per family and source format:
 
