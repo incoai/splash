@@ -1,9 +1,10 @@
 // GGUF weight preparation on the GPU: every format's planes through the
 // production executor against the CPU reference, the images the loader
 // writes from the small dense and MoE targets, their golden hashes, offsets
-// past 4 GiB, a restore of released images, the target loader's reading of a
-// GGUF, llama.cpp's NVFP4 tensors, and the quantized tensors of MLX, Model
-// Optimizer and compressed-tensors read from a safetensors checkpoint.
+// past 4 GiB, a restore of released images, the writer's chunk order, a load
+// that fails mid-image, the target loader's reading of a GGUF, llama.cpp's
+// NVFP4 tensors, and the quantized tensors of MLX, Model Optimizer and
+// compressed-tensors read from a safetensors checkpoint.
 //   gguf-preparation METALLIB GOLDENS MLX_FIXTURE
 // GOLDENS is dev/tests/fixtures/weight-goldens/goldens.json; its README says
 // how to update it. MLX_FIXTURE is
@@ -22,6 +23,7 @@
 #include <array>
 #include <cstring>
 #include <fstream>
+#include <utility>
 
 using namespace gguf_fixtures;
 using namespace gguf_reference;
@@ -635,10 +637,10 @@ void checkRepack(MetalBackend &backend, const std::filesystem::path &directory, 
     const auto before = backend.memoryStats();
     model::writeGgufImage(backend, image, plan);
     const auto after = backend.memoryStats();
-    check(after.allocatedBytes == before.allocatedBytes, "repack releases its staging buffer");
+    check(after.allocatedBytes == before.allocatedBytes, "repack releases its staging buffers");
     check(after.peakAllocatedBytes <=
-              std::max(before.peakAllocatedBytes, before.allocatedBytes + model::kGgufRepackStagingBytes),
-          "repack staging stays within the repack staging bound");
+              std::max(before.peakAllocatedBytes, before.allocatedBytes + 2 * model::kGgufRepackStagingBytes),
+          "repack staging stays within two repack stagings");
     const auto actual = model::contentsOf(image);
     std::vector<uint8_t> reference(bytes, 0);
     std::copy(expected.w0.begin(), expected.w0.end(), reference.begin() + plane0);
@@ -678,6 +680,102 @@ void checkExecutor(MetalBackend &backend, const std::filesystem::path &directory
   checkRepack(backend, directory, Q80, {256, widerThanStaging(Q80), {}, 2}, 743);
   checkRepack(backend, directory, NVFP4, {2048, 512, {}, 2}, 744, true);
   checkRepack(backend, directory, NVFP4, {768, 512, {256, 16, 8, 4}, 3}, 745, true);
+}
+
+// The writer's chunk order (model::pipelineChunks), with tickets that record
+// what happens to them: chunk i is staged while chunk i - 1's command runs,
+// and that command is waited for before chunk i's is submitted, one in
+// flight. A stage that throws leaves the command in flight to its ticket's
+// destruction (a CommandTicket's waits for the GPU) and submits nothing more.
+void checkPipelineOrder() {
+  std::vector<std::string> events;
+  struct Ticket {
+    std::vector<std::string> *events;
+    size_t chunk;
+    bool ended = false;
+    Ticket(std::vector<std::string> *events, size_t chunk) : events(events), chunk(chunk) {}
+    Ticket(Ticket &&other) noexcept : events(std::exchange(other.events, nullptr)), chunk(other.chunk),
+                                      ended(other.ended) {}
+    Ticket &operator=(Ticket &&) = delete;
+    ~Ticket() {
+      if (events && !ended) events->push_back("destroy " + std::to_string(chunk));
+    }
+    int wait() {
+      ended = true;
+      events->push_back("wait " + std::to_string(chunk));
+      return 0;
+    }
+  };
+  const auto run = [&](size_t count, size_t failing) {
+    events.clear();
+    try {
+      model::pipelineChunks(
+          count,
+          [&](size_t chunk, unsigned buffer) {
+            events.push_back("stage " + std::to_string(chunk) + " in " + std::to_string(buffer));
+            if (chunk == failing) throw std::runtime_error("stage failed");
+          },
+          [&](size_t chunk, unsigned buffer) {
+            events.push_back("submit " + std::to_string(chunk) + " from " + std::to_string(buffer));
+            return Ticket(&events, chunk);
+          });
+    } catch (const std::runtime_error &) {
+      events.push_back("failed");
+    }
+  };
+  run(3, SIZE_MAX);
+  check(events == std::vector<std::string>{"stage 0 in 0", "submit 0 from 0", "stage 1 in 1", "wait 0",
+                                           "submit 1 from 1", "stage 2 in 0", "wait 1", "submit 2 from 0", "wait 2"},
+        "the next chunk is staged while the last chunk's command runs, one command in flight");
+  run(3, 2);
+  check(events == std::vector<std::string>{"stage 0 in 0", "submit 0 from 0", "stage 1 in 1", "wait 0",
+                                           "submit 1 from 1", "stage 2 in 0", "destroy 1", "failed"},
+        "a stage that fails ends the command in flight by its ticket and submits no other");
+  run(0, SIZE_MAX);
+  check(events.empty(), "no chunk, no command");
+}
+
+// A source that ends inside an image's second chunk fails its load while the
+// first chunk's command may still be in flight: the load fails naming the
+// truncation, keeps no image, and gives back the image's memory and both
+// stagings once that command ended.
+void checkFailedLoad(MetalBackend &backend, const std::filesystem::path &directory) {
+  const Fmt f = Q80;
+  const uint32_t rows = 32768, K = 2048; // 71 MB of rows: three chunks of the 32 MiB staging
+  const QuantFormat &layout = kQuantFormats[f];
+  const uint64_t stride = rowBytes(f, K);
+  const std::vector<uint8_t> native = fixture(f, rows, K, 901);
+  const auto path = directory / "truncated-source";
+  std::vector<uint8_t> input(kSourceOffset, 0);
+  input.insert(input.end(), native.begin(), native.begin() + native.size() / 2);
+  splash::test::writeFile(path, input);
+  model::WeightSource source(path);
+  source.setDataOffset(kSourceOffset);
+  const auto planes = model::ggufPlaneBytes(layout, rows, K);
+  auto plan = std::make_shared<model::gguf::Image>();
+  plan->name = "truncated.bin";
+  model::gguf::Repack step;
+  step.format = f;
+  step.rows = rows;
+  step.columns = K;
+  step.plane0 = model::kWeightFileAlignment;
+  step.plane1 = 0;
+  step.meta = model::alignWeightOffset(step.plane0 + planes.plane0);
+  step.sources.push_back({"fixture", layout.ggml_type, 0, rows, stride, {}, &source});
+  plan->repacks.push_back(step);
+  plan->bytes = model::alignWeightOffset(step.meta + planes.meta) + model::kWeightFileAlignment;
+  plan->residentBytes = plan->bytes;
+  model::WeightImages images(backend, "fixture");
+  const uint64_t before = backend.memoryStats().allocatedBytes;
+  std::string error;
+  try {
+    static_cast<void>(model::loadImage(backend, images, "", plan, [] {}));
+  } catch (const std::exception &failure) {
+    error = failure.what();
+  }
+  check(error.find("truncated") != std::string::npos, "a source truncated inside the second chunk fails the load");
+  check(images.contents().empty(), "a load that failed keeps no image");
+  check(backend.memoryStats().allocatedBytes == before, "a load that failed gives back its image and stagings");
 }
 
 // Each MLX fixture tensor through the production writer, read from a
@@ -969,8 +1067,10 @@ int main(int argc, char **argv) {
     const splash::test::TemporaryDirectory directory("splash-gguf-preparation");
     const Goldens hashes = goldens(argv[2], @"gguf_images");
     MetalBackend backend(argv[1]);
-    // First, so that the peak allocation it checks against is its own.
+    checkPipelineOrder();
+    // First of the GPU's, so that the peak allocation it checks against is its own.
     checkExecutor(backend, directory.path());
+    guarded("a load that fails mid-image", [&] { checkFailedLoad(backend, directory.path()); });
     guarded("preparation of the dense target", [&] { checkDense(backend, directory.path(), hashes); });
     guarded("preparation of the MoE target", [&] { checkMoe(backend, directory.path(), hashes); });
     guarded("preparation of BF16 and F16 alpha/beta", [&] { checkFloatAlphaBeta(backend, directory.path()); });

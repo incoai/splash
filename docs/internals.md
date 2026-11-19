@@ -236,9 +236,13 @@ is checked first. A writer writes every byte of its image, zeroing alignment
 and padding, as a new buffer's contents are undefined. Writers read their
 sources uncached (`F_NOCACHE`), so the page cache keeps no second copy of the
 model, on a thread per core (`parallelFor`); a thread stages at most 4 MiB of a
-source at a time, and a GGUF image the rows of one repack, at most 32 MiB
-(`kGgufRepackStagingBytes`), for the `gguf_repack` kernel, which writes the
-planes into the image. Once an image is written, its writer checks that no
+source at a time (1 MiB of a repack's rows, `kChunkReadBytes`, so that a chunk
+keeps enough reads in flight for the disk's rate), and a GGUF image the rows of
+one chunk of a repack, at most 32 MiB (`kGgufRepackStagingBytes`), for the
+`gguf_repack` kernel, which writes
+the planes into the image. An image's writer holds two such stagings and
+stages the next chunk while the GPU writes the last (`pipelineChunks`), so its
+reads do not wait for the GPU. Once an image is written, its writer checks that no
 source file it read was written since it was opened
 (`WeightSource::checkUnchanged`), so a source changed in place fails the load
 instead of mixing two versions. A start logs `Weights loaded in N s.`; loading
