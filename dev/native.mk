@@ -772,15 +772,18 @@ test-engine-metal: $(TEST_METAL_TARGETS)
 # ORACLE_ARGS: options every run of the runtime oracle takes besides its own,
 # as the oracle takes them (model_runtime_oracle_test.mm), an option given
 # twice taking its later value. A block-sparse target's spill check runs in
-# each: by default, with two staging buffers, and at 32K tokens with the
-# cache's default window, so a --spill-tokens here replaces the size of all
-# three. Each stops before its prompts, naming what fits, where the memory
+# each but the last: by default, with two staging buffers, and at 32K tokens
+# with the cache's default window, so a --spill-tokens here replaces the
+# size of each. The last checks a branched lane's path against the
+# same step with its tree's other rows replaced, on a backend that runs every
+# expert tile on the staged tile (--siblings-only). Each stops before its
+# prompts, naming what fits, where the memory
 # plan's limit leaves less than it holds beside the weights: up to 4.3 GB
 # for Qwen3.8-Flash-Next's default checks, and 5.9 GB for its 32K check (on
 # the 24 GB M6, 11-02: the spill runtime's arenas 2.27 GB, four FP32 lane
 # states 1.11 GB, 17 Full extents 1.84 GB, the hot block cache's floor for
-# two lanes 0.61 GB, Index extents and staging). On a 24 GB Mac all three
-# runs take ORACLE_ARGS="--expert-memory 6656M --ple-memory 237M", or
+# two lanes 0.61 GB, Index extents and staging). On a 24 GB Mac every run
+# takes ORACLE_ARGS="--expert-memory 6656M --ple-memory 237M", or
 # "--expert-memory 5632M --ple-memory 237M" where the installation serves
 # vision, whose default checks alone fit only up to about 7700M of experts
 # (docs/validate.md). Without --ple-memory the oracle loads
@@ -804,6 +807,7 @@ test-real: preflight $(TARGET) $(TEST_MODEL_RUNTIME_ORACLE) \
 	$(TEST_MODEL_RUNTIME_ORACLE) $(LIB) "$(MODEL_ROOT)" --ane-ffn-share 0 --state-format bf16 \
 		--spill-buffers 2 $(ORACLE_ARGS)
 	$(TEST_MODEL_RUNTIME_ORACLE) $(LIB) "$(MODEL_ROOT)" --spill-tokens 32768 --spill-window 64 $(ORACLE_ARGS)
+	$(TEST_MODEL_RUNTIME_ORACLE) $(LIB) "$(MODEL_ROOT)" --ane-ffn-share 0 --siblings-only $(ORACLE_ARGS)
 
 .PHONY: benchmark-backend \
 	benchmark-decode-profile benchmark-attention-sweep \

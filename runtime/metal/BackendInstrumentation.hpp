@@ -65,6 +65,14 @@ public:
   // Production defines it nowhere. Throws once the backend has created a
   // pipeline of its cache, which would keep its own.
   static void stageExpertTiles(MetalBackend &backend);
+  // The next command submitted whole (submitCommandAsync) that holds a
+  // dispatch of pipeline `pipeline` runs a host step after the first such
+  // dispatch that copies the views that
+  // dispatch binds at `bindings`, as the work before the step left them.
+  // takeSnapshot() reads and clears the copies, a byte vector a binding (none
+  // until such a command ran), and disarms the step.
+  static void snapshotAfter(MetalBackend &backend, std::string pipeline, std::vector<uint32_t> bindings);
+  [[nodiscard]] static std::vector<std::vector<uint8_t>> takeSnapshot(MetalBackend &backend);
 };
 
 } // namespace splash::metal

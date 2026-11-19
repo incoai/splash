@@ -710,6 +710,9 @@ struct Runtime::Impl {
   // The choices of the cycles the budget sized (RuntimeInstrumentation::
   // takeStepChoices).
   std::vector<RuntimeInstrumentation::StepChoice> stepChoices;
+  // The tokens a constrained request's next cycle gives rows of its tree,
+  // by request (RuntimeInstrumentation::replaceTreeTokens).
+  std::unordered_map<uint64_t, std::vector<std::pair<uint32_t, uint32_t>>> treeTokens;
 #endif
   explicit Impl(RuntimeContext value)
       : backend(value.backend),
@@ -3186,10 +3189,18 @@ struct Runtime::Impl {
           // row's path: the rows' tokens from its first row, its anchor's
           // first, each with its parent row.
           const ops::LaneRows block = impl_.laneRows(lane);
-          const uint32_t *rows =
+          uint32_t *rows =
               contents<uint32_t>(impl_.decodeArena->batchSlice(DecodeTensor::InputTokens, kLaneCount),
                                  "constrained verify rows") +
               block.first;
+#ifdef SPLASH_RUNTIME_INSTRUMENTATION
+          if (const auto replaced = impl_.treeTokens.extract(entry.id))
+            for (const auto &[row, token] : replaced.mapped()) {
+              if (!row || row >= block.rows)
+                throw std::logic_error("a replaced tree token's row is not a row of its lane past the anchor");
+              rows[row] = token;
+            }
+#endif
           const ops::TreeRow *tree =
               contents<ops::TreeRow>(impl_.decodeArena->batchSlice(DecodeTensor::TreeRows, kLaneCount),
                                      "constrained verify tree") +
@@ -4661,6 +4672,11 @@ void RuntimeInstrumentation::forceStepRows(Runtime &runtime, std::optional<uint3
   runtime.impl_->forcedStep.reset();
   if (rows)
     runtime.impl_->forcedStep = Runtime::Impl::ForcedStep{.rows = *rows, .laneCap = std::nullopt, .floor = floor};
+}
+
+void RuntimeInstrumentation::replaceTreeTokens(Runtime &runtime, uint64_t requestId,
+                                               std::vector<std::pair<uint32_t, uint32_t>> tokens) {
+  runtime.impl_->treeTokens[requestId] = std::move(tokens);
 }
 
 void RuntimeInstrumentation::planBlocks(Runtime &runtime, bool enabled) { runtime.impl_->blockPlans = enabled; }

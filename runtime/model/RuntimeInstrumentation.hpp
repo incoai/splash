@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <optional>
 #include <span>
+#include <utility>
 #include <vector>
 
 namespace splash::model {
@@ -48,6 +49,15 @@ public:
   // not teach; none gives the choice back. For measuring steps' costs by
   // their rows, and for steps whose lanes take fewer rows than they hold.
   static void forceStepRows(Runtime &runtime, std::optional<uint32_t> rows, float floor = 0.0F);
+  // The next decode cycle of constrained request `requestId` gives each row
+  // `row` of its lane's tree past the anchor the token `token` of `tokens`
+  // in place of its own: written into the cycle's verify input once its
+  // draft laid out the step's rows (ops::DraftSelector::addVerifyRows),
+  // before its mask request and the target's forward, which both read it;
+  // the tree's rows and their places stay. For checking that a row computes
+  // what its path holds whatever its tree's other rows hold.
+  static void replaceTreeTokens(Runtime &runtime, uint64_t requestId,
+                                std::vector<std::pair<uint32_t, uint32_t>> tokens);
   // Whether a streamed-expert target's later cycles each plan a draft's
   // block a lane, at their floor, whatever class their floor passes the
   // lanes' last chances into (CostLine::choose): for measuring what the
