@@ -30,6 +30,17 @@ extension TranscriptTests {
         #expect(aligns == "left,right,center,left")
     }
 
+    /// A bare web address in an answer is a link, as one written as a link is, by the same rules:
+    /// a web or mail address links, another keeps its text alone; in code it stays text.
+    @Test func aBareAddressIsALink() async throws {
+        let links = try await drawn("""
+            const box = document.createElement('div')
+            markdown.draw(box, 'See https://example.org/a?b=1. Or ftp://example.org/f, a@example.org, `https://in.code/`.')
+            return [...box.querySelectorAll('a')].map(link => link.getAttribute('href')).join(' ')
+            """, as: String.self)
+        #expect(links == "https://example.org/a?b=1 mailto:a@example.org")
+    }
+
     /// Bold beside Chinese text shows bold: asterisks whose inner side is punctuation, a full-width
     /// bracket, and whose outer side is a Chinese character kept as asterisks by CommonMark's rule,
     /// which wants a space or punctuation there. Emphasis in English, and asterisks that mark

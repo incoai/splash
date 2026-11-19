@@ -1,6 +1,7 @@
 // The model's Markdown as the transcript draws it, with the runtime's markdown-it, highlight.js and
 // the web chat's link rules (markdown-links.js), which the app adds to the page before its scripts:
-// no raw HTML, and its line breaks kept.
+// no raw HTML, its line breaks kept, and a bare web address a link, as one written is, by the same
+// rules.
 'use strict';
 
 const markdown = (() => {
@@ -11,7 +12,7 @@ const markdown = (() => {
 
   // None without the link rules too: markdown-it alone draws images, which load by themselves.
   const parser = window.markdownit && window.markdownLinks
-    ? configured(window.markdownit({html: false, breaks: true}).use(window.markdownLinks)) : null;
+    ? configured(window.markdownit({html: false, breaks: true, linkify: true}).use(window.markdownLinks)) : null;
 
   // What highlight.js made of each closed code block, by its language and code, and the HTML of
   // each text drawn whole, by the text, the latest of each up to its bound: a reply that streams
