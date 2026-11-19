@@ -138,6 +138,10 @@ th, td {
 }
 
 th { padding-top: 0; font-weight: 600; }
+:is(th, td).align-right { text-align: right; }
+:is(th, td).align-right > div { margin-left: auto; }
+:is(th, td).align-center { text-align: center; }
+:is(th, td).align-center > div { margin-inline: auto; }
 tbody tr:last-child td { padding-bottom: 0; }
 tbody td { border-top: 1px solid var(--separator); }
 :is(th, td) + :is(th, td) { padding-left: 20px; }

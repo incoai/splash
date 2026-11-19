@@ -75,12 +75,14 @@ const markdown = (() => {
     };
     rules.list_item_close = () => '</div></li>';
     // A table scrolls sideways when it is wider than the reply; its cells wrap at a width of their
-    // own and line up at their start.
+    // own and line up at their start, or where their column's marks say, `--:` at the end and `:-:`
+    // in the middle, by a class: the page's policy refuses markdown-it's style attribute.
     rules.table_open = (tokens, index, options, env, self) => '<div class="table">' + self.renderToken(tokens, index, options);
     rules.table_close = (tokens, index, options, env, self) => self.renderToken(tokens, index, options) + '</div>';
     for (const cell of ['th', 'td']) {
       rules[`${cell}_open`] = (tokens, index, options, env, self) => {
-        tokens[index].attrs = null;
+        const aligned = /text-align:(right|center)/.exec(tokens[index].attrGet('style') ?? '');
+        tokens[index].attrs = aligned ? [['class', `align-${aligned[1]}`]] : null;
         return self.renderToken(tokens, index, options) + '<div>';
       };
       rules[`${cell}_close`] = (tokens, index, options, env, self) => '</div>' + self.renderToken(tokens, index, options);
