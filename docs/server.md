@@ -1305,8 +1305,8 @@ request thinks on until the character is complete, a token or a few, and its
   these rules. Unset, the end is the close the chat template writes after a
   reasoning, which the server probes at startup: a line break then `</think>`
   for Qwen's templates, `</think>` alone for Flint's, and a line break then
-  `</think>` for Ripple's. Budgets also apply when the model opens the reasoning
-  block itself, as Flint and Ripple do. The next request then
+  `</think>` for Ripple's. Budgets also apply to Ripple's model-opened reasoning.
+  The next request then
   renders the close of a reply whose thinking the budget ended as the tokens
   the budget selected, so that its prompt keeps to the reply's tokens through
   the cut and can read the reply's cached KV past it; an end that closes

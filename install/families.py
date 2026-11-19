@@ -128,8 +128,7 @@ def option_report(engine_facts):
         facts = engine | {
             "vision": family.vision,
             "reasoning_switch": family.chat_format.reasoning_switch,
-            "thinking_budget": family.chat_format.reasoning_switch
-            or family.chat_format.model_opens_reasoning,
+            "thinking_budget": family.chat_format.thinking_budget,
         }
         report[family.name] = {
             "unusable": [flag for flag, fact in needs.items() if not facts[fact]],

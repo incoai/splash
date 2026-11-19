@@ -904,7 +904,8 @@ class Frontend:
             chat_format=self.chat_format,
             thinking_token_budget=(
                 budget
-                if (thinking or self.chat_format.model_opens_reasoning)
+                if self.chat_format.thinking_budget
+                and (thinking or self.chat_format.model_opens_reasoning)
                 and budget is not None
                 and budget < max_new
                 else None

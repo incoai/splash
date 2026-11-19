@@ -29,6 +29,8 @@ UNUSABLE = {
         "--max-image-pixels",
         "--reasoning-effort",
         "--default-reasoning-effort",
+        "--thinking-token-budget",
+        "--thinking-end-text",
     },
     # Ripple decides its reasoning per turn; a thinking budget the server
     # reads through the decoded stream, the efforts its template leaves to

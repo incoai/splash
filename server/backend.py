@@ -423,8 +423,10 @@ class NativeBackend:
         # (thinking_end_tokens); None for the close of thinking alone, in
         # each job's chat format.
         self.thinking_end = thinking_end
-        if chat_format is not None and (
-            chat_format.tags_are_text or chat_format.model_opens_reasoning
+        if (
+            chat_format is not None
+            and chat_format.thinking_budget
+            and (chat_format.tags_are_text or chat_format.model_opens_reasoning)
         ):
             _ = self._thinking_markers
         self.active = {}
@@ -929,6 +931,8 @@ class NativeBackend:
         if job.thinking_token_budget is None:
             return None
         chat_format = job.chat_format
+        if not chat_format.thinking_budget:
+            return None
         if chat_format.tags_are_text or chat_format.model_opens_reasoning:
             end = self.thinking_end or tuple(
                 self.tokenizer.encode(THINK_END, add_special_tokens=False)

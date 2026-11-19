@@ -164,7 +164,8 @@ struct ServeSettingsTests {
     /// Flint's options, as the runtime reports its family: no vision, recurrent state, PLE table,
     /// sparse KV, Neural Engine or thinking switch.
     static let flint = ModelFamily(unusable: ["--language-only", "--state-format", "--cached-states", "--ple-memory", "--sparse-kv-memory",
-                                              "--disable-ane", "--max-image-pixels", "--default-reasoning-effort"],
+                                              "--disable-ane", "--max-image-pixels", "--default-reasoning-effort",
+                                              "--thinking-token-budget", "--thinking-end-text"],
                                    contextTokens: 262_144, maxContextTokens: 262_144)
     static let moe = ModelFamily(unusable: ["--ple-memory", "--sparse-kv-memory", "--disable-ane"],
                                  contextTokens: 262_144, maxContextTokens: 1_010_000)

@@ -140,6 +140,9 @@ class ChatFormat:
     # The template's placeholder for one image, one token, which the server
     # widens to the image's tokens; None for a template without one.
     image_pad: str | None
+    # Whether this serving format supports a cutoff of emitted reasoning,
+    # independently of whether the prompt can switch reasoning on or off.
+    thinking_budget: bool
     # Prompt-opened and model-opened reasoning are independent of whether
     # their markers occupy one tokenizer ID or a sequence of ordinary IDs.
     model_opens_reasoning: bool = False
@@ -174,6 +177,7 @@ class ChatFormat:
 # <|endoftext|> and the turn end <|im_end|> as stop tokens, and a generation
 # prompt that opens the think block when the request thinks.
 QWEN = ChatFormat(
+    thinking_budget=True,
     stop_tokens=("<|endoftext|>", "<|im_end|>"),
     think_end_id=248069,
     think_start_id=None,
@@ -187,6 +191,7 @@ QWEN = ChatFormat(
 # that leaves reasoning to the model. Every chat prompt ends with the
 # assistant's role token.
 FLINT = ChatFormat(
+    thinking_budget=False,
     model_opens_reasoning=True,
     stop_tokens=("<|end_of_text|>", "<|user|>", "<|observation|>", "<|developer|>"),
     think_end_id=150007,
@@ -202,6 +207,7 @@ FLINT = ChatFormat(
 # tags as TEXT its tokenizer splits, and lays a call's arguments out as one
 # JSON value.
 RIPPLE = ChatFormat(
+    thinking_budget=True,
     model_opens_reasoning=True,
     reasoning_separator="\n",
     stop_tokens=("<|im_end|>", "<|endoftext|>"),
