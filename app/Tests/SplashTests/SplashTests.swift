@@ -291,6 +291,15 @@ struct ServeSettingsTests {
             == "Splash can’t serve this model: no supported model has this architecture (Llama)")
         #expect(problem(failure("internal"))
             == "It stopped: the engine's words. The log has the details.")
+        // A value the launcher refused, by the title of the launch option that sets it.
+        #expect(problem(failure("configuration", message: "argument --sampling-default: temperature must be a number in [0, 2]"))
+            == "Sampling defaults: temperature must be a number in [0, 2]")
+        #expect(problem(failure("configuration", message: "argument --sampling-default: top_k must be 0 or -1 (disabled) or a positive integer"))
+            == "Sampling defaults: top_k must be 0 or -1 (disabled) or a positive integer")
+        #expect(problem(failure("configuration", message: "argument --max-context: must be 'auto' or a token count up to 1010000"))
+            == "Context length: must be 'auto' or a token count up to 1010000")
+        // One of no launch option stays in the launcher's words.
+        #expect(problem(failure("configuration", message: "argument --no-such-option: x")) == "argument --no-such-option: x")
         // The rest in the engine's words, as its refusal of a MAX_CONTEXT past the model's.
         for kind in ["configuration", "memory_budget", "device"] {
             #expect(problem(failure(kind)) == "the engine's words")

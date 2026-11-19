@@ -379,7 +379,8 @@ final class Server {
     /// needs more memory than the limit set or this Mac gives; the context length set is more than
     /// the memory left, or the SSD cache, holds; other apps hold the memory, GPU memory or port it
     /// needs; an update holds Splash; its files could not be prepared, or Splash cannot serve them;
-    /// a failure of no class, which the log tells more of; else the failure's own message.
+    /// a failure of no class, which the log tells more of; a launch option's value the launcher
+    /// refused, by the option's title; else the failure's own message.
     nonisolated static func problem(_ failure: ServeRecord.Failure, port: Int) -> String {
         switch (failure.kind, failure.bound) {
         case ("memory_budget", "max_memory"):
@@ -412,9 +413,21 @@ final class Server {
             return "Splash can’t serve this model: \(failure.message)"
         case ("internal", _):
             return "It stopped: \(failure.message). The log has the details."
+        case ("configuration", _):
+            return refusedOption(failure.message) ?? failure.message
         default:
             return failure.message
         }
+    }
+
+    /// The launcher's refusal of a value on its command line, as argparse words it, "argument
+    /// --FLAG: MESSAGE", as the title of the launch option that sets FLAG and the message; nil for
+    /// any other message, as the engine's refusal of a context past the model's.
+    nonisolated static func refusedOption(_ message: String) -> String? {
+        guard let refusal = message.wholeMatch(of: /argument (--[a-z0-9-]+): (.+)/),
+              let option = LaunchOption.all.first(where: { $0.flag == refusal.1 })
+        else { return nil }
+        return "\(option.title): \(refusal.2)"
     }
 
     /// Follows this start's server through its start, as its serve record gives it, until it
