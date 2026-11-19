@@ -75,6 +75,9 @@ job, with its output appended to a log in `~/Library/Logs/Splash`:
 `splash serve --model ID --port PORT --offline` serves an installed one, with
 the launch options picked in the app that differ from the server's defaults,
 ready once that process's [serve record](server.md#serve-record) says it is,
+which the app reads in its own home's Application Support, the account's
+whatever `HOME` says, and so runs the runtime's commands with that home as
+their `HOME`, where a packaged runtime keeps its data (`install/paths.py`),
 or that it already starts a failed engine again, which the Server shows as
 recovering; while the engine warms up,
 the record counts its steps, and the Server shows them with why the first

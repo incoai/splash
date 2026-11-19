@@ -208,6 +208,20 @@ struct DrawerTests {
         #expect(runtime.environment["SPLASH_API_KEY"] == nil && runtime.environment["PYTHONNOUSERSITE"] == "1")
     }
 
+    /// The programs the app runs keep their data in the app's own home, which Foundation gives
+    /// whatever HOME says: an app opened with another HOME (open --env HOME=…) gives them its own
+    /// as theirs, so that the serve record a packaged runtime writes in its HOME's Application
+    /// Support is the one the app reads, and a model that is ready shows ready. The terminals keep
+    /// the HOME the app was given, the user's to set.
+    @Test func theProgramsKeepTheirDataInTheAppsHome() {
+        let given = ProcessInfo.processInfo.environment["HOME"]
+        defer { if let given { setenv("HOME", given, 1) } else { unsetenv("HOME") } }
+        setenv("HOME", "/tmp/splash-elsewhere", 1)
+        let runtime = Runtime(root: URL(filePath: "/tmp/runtime"))
+        #expect(runtime.environment["HOME"] == URL.homeDirectory.path && URL.homeDirectory.path != "/tmp/splash-elsewhere")
+        #expect(runtime.userEnvironment["HOME"] == "/tmp/splash-elsewhere")
+    }
+
     /// The programs the app runs get the Hugging Face settings of the user's login shell, as its
     /// startup files make them, an app getting none: the variables the app takes alone, whatever
     /// else the shell prints; none from a shell that doesn't answer in time. No other variable
