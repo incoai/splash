@@ -152,6 +152,21 @@ void checkModelTypes(const std::filesystem::path &root) {
   require(custom.tts->type == TtsModelType::CustomVoice &&
               custom.tts->speakers == std::map<std::string, uint32_t>({{"dylan", 2878}, {"vivian", 3065}}),
           "a CustomVoice model's speakers");
+  require(custom.tts->predictorProjection(), "the 1.7B talker reaches the predictor through small_to_mtp");
+  // Qwen3-TTS-12Hz-0.6B: a talker as wide as the code predictor, which it
+  // feeds without small_to_mtp; other widths are refused.
+  const auto sized = [&](const std::string &talker) {
+    std::string json = ttsConfig(R"("tts_model_type":"custom_voice",)", speakers);
+    const std::string large = R"("hidden_size":2048,"intermediate_size":6144)";
+    json.replace(json.find(large), large.size(), talker);
+    return json;
+  };
+  const OmniConfig small = readConfig(root, sized(R"("hidden_size":1024,"intermediate_size":3072)"));
+  require(small.tts->talker.hidden == 1024 && small.tts->talker.intermediate == 3072 &&
+              !small.tts->predictorProjection(),
+          "the 0.6B talker, without small_to_mtp");
+  rejects([&] { (void)readConfig(root, sized(R"("hidden_size":1536,"intermediate_size":4096)")); },
+          "decoder shape 28x1536x4096 is not a supported model", "a talker of another width accepted");
   rejects([&] { (void)readConfig(root, ttsConfig(R"("tts_model_type":"voice_clone",)", "")); },
           "tts_model_type voice_clone is not a supported model", "an unknown model type accepted");
   rejects([&] { (void)readConfig(root, ttsConfig(R"("tts_model_type":"custom_voice",)", R"("spk_id":{},)")); },

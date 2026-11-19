@@ -35,6 +35,11 @@ _SIZE_UNITS = {
 # model's. About 0.7 GB on disk and 1.2 GiB of memory. Any Qwen3-ASR-0.6B
 # checkpoint still serves as a draft through --draft-model.
 DEFAULT_DRAFT_MODEL = "wilsonzheng0327/Qwen3-ASR-1.7B-dflash"
+# Qwen3-ASR-0.6B's own DFlash draft: the same five layers at the 0.6B's
+# width, reading its layers 2, 14 and 25; about 0.25 GB.
+SMALL_DRAFT_MODEL = "wilsonzheng0327/Qwen3-ASR-0.6B-dflash"
+# The default draft by the transcription decoder's width.
+DEFAULT_DRAFTS = {2048: DEFAULT_DRAFT_MODEL, 1024: SMALL_DRAFT_MODEL}
 # A model ID, as --model takes it: OWNER/REPO, a Hugging Face repository ID
 # by the Hub's rule.
 REPO_ID = re.compile(
@@ -202,22 +207,20 @@ def hub_snapshot(repo_id):
 
 
 def default_draft_model(model_root):
-    """DEFAULT_DRAFT_MODEL when model_root's config.json describes
-    Qwen3-ASR-1.7B (a qwen3_asr model whose decoder is 2048 wide, 4-bit or
-    bf16), else None: speech models and the 0.6B itself have no draft."""
+    """The DFlash draft of the Qwen3-ASR model model_root's config.json
+    describes, by its decoder's width (DEFAULT_DRAFTS: 1.7B or 0.6B, 4-bit
+    or bf16), else None: speech models have no draft."""
     try:
         with open(os.path.join(model_root, "config.json"), encoding="utf-8") as file:
             config = json.load(file)
         text = config["thinker_config"]["text_config"]
         # The engine reads a decoder without hidden_size as the 1.7B's.
-        large = text.get("hidden_size", 2048) == 2048
+        width = text.get("hidden_size", 2048)
     except (OSError, ValueError, TypeError, KeyError, AttributeError):
         return None
-    return (
-        DEFAULT_DRAFT_MODEL
-        if config.get("model_type") == "qwen3_asr" and large
-        else None
-    )
+    if config.get("model_type") != "qwen3_asr" or isinstance(width, bool):
+        return None
+    return DEFAULT_DRAFTS.get(width)
 
 
 def download_model(repo_id):
@@ -510,7 +513,8 @@ SERVE_OPTIONS = (
             "tokens the served model verifies: a directory, or a repository ID, "
             "downloaded into the Hugging Face cache if missing; the transcripts "
             f"stay the served model's (default: {DEFAULT_DRAFT_MODEL} beside "
-            "Qwen3-ASR-1.7B, none for other models)",
+            f"Qwen3-ASR-1.7B, {SMALL_DRAFT_MODEL} beside Qwen3-ASR-0.6B, none "
+            "for speech models)",
         ),
     ),
     ServeOption(

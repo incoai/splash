@@ -98,8 +98,9 @@ TtsModel::TtsModel(metal::MetalBackend &backend, TtsWeights weights, const TtsCo
                                             maxTextRows, "tts fc1");
   fc2_ = std::make_unique<BiasedProjection>(backend, talker_->linear(), weights_.textFc2, weights_.textFc2Bias,
                                             maxTextRows, "tts fc2");
-  smallToMtp_ = std::make_unique<BiasedProjection>(backend, predictor_->linear(), weights_.smallToMtp,
-                                                   weights_.smallToMtpBias, 2 * maxLanes, "tts small_to_mtp");
+  if (config.predictorProjection())
+    smallToMtp_ = std::make_unique<BiasedProjection>(backend, predictor_->linear(), weights_.smallToMtp,
+                                                     weights_.smallToMtpBias, 2 * maxLanes, "tts small_to_mtp");
   const uint32_t capacity = roundUp(maxTextRows, 64);
   textEmbedded_ = zeroed(backend, uint64_t{capacity} * config.textHidden * 2, "tts text embedded");
   fc1Out_ = zeroed(backend, uint64_t{capacity} * config.textHidden * 2, "tts fc1 out");
@@ -113,17 +114,23 @@ TtsModel::TtsModel(metal::MetalBackend &backend, TtsWeights weights, const TtsCo
   // (three lanes would otherwise give six-row chunks).
   const uint32_t chunk = std::bit_floor(std::min(8u, 2 * maxLanes));
   if (vocabulary % chunk) throw std::invalid_argument("the predictor vocabulary is not whole projection chunks");
-  // Eight rows of slack: a decode dispatch writes whole eight-row tiles.
-  projectedTables_ = zeroed(backend, (uint64_t{tables} * vocabulary + 8) * outputWidth * 2, "tts projected tables");
   const uint64_t inputRow = uint64_t{width} * 2, outputRow = uint64_t{outputWidth} * 2;
-  metal::CommandGraph graph;
-  for (uint64_t row = 0; row < uint64_t{tables} * vocabulary; row += chunk)
-    smallToMtp_->add(graph,
-                     backend.view(weights_.predictorEmbeddings, row * inputRow,
-                                  weights_.predictorEmbeddings.sizeBytes() - row * inputRow),
-                     backend.view(projectedTables_, row * outputRow, projectedTables_.sizeBytes() - row * outputRow),
-                     chunk, ops::omni::Activation::None);
-  (void)backend.submitCommandAsync(graph.command()).wait();
+  if (smallToMtp_) {
+    // Eight rows of slack: a decode dispatch writes whole eight-row tiles.
+    projectedTables_ = zeroed(backend, (uint64_t{tables} * vocabulary + 8) * outputWidth * 2, "tts projected tables");
+    metal::CommandGraph graph;
+    for (uint64_t row = 0; row < uint64_t{tables} * vocabulary; row += chunk)
+      smallToMtp_->add(graph,
+                       backend.view(weights_.predictorEmbeddings, row * inputRow,
+                                    weights_.predictorEmbeddings.sizeBytes() - row * inputRow),
+                       backend.view(projectedTables_, row * outputRow, projectedTables_.sizeBytes() - row * outputRow),
+                       chunk, ops::omni::Activation::None);
+    (void)backend.submitCommandAsync(graph.command()).wait();
+  } else {
+    // Without the projection the tables are the predictor's input as
+    // stored: 15 of them, so the 14 read keep a table of slack.
+    projectedTables_ = weights_.predictorEmbeddings;
+  }
   // Sub-steps 1..14 then start the predictor at layer 0's attention: its
   // input norm and QKV projection are a fixed function of the code too.
   // The rows go through the dispatches a decode step of qkvTableRows_
@@ -168,7 +175,10 @@ void TtsModel::addTextProjection(metal::CommandGraph &graph, metal::MetalBuffer 
 
 void TtsModel::addPredictorInput(metal::CommandGraph &graph, metal::MetalBuffer input, metal::MetalBuffer output,
                                  uint32_t rows) const {
-  smallToMtp_->add(graph, std::move(input), std::move(output), rows, ops::omni::Activation::None);
+  if (smallToMtp_) smallToMtp_->add(graph, std::move(input), std::move(output), rows, ops::omni::Activation::None);
+  else
+    ops::omni::Norms::addActivate(graph, std::move(input), std::move(output), uint64_t{rows} * config_.predictor.hidden,
+                                  ops::omni::Activation::None, false);
 }
 
 bool TtsModel::addPredictorCodeInput(metal::CommandGraph &graph, metal::MetalBuffer codes, uint32_t step,

@@ -21,6 +21,7 @@ from server import serve_options
 TTS_4BIT = "mlx-community/Qwen3-TTS-12Hz-1.7B-Base-4bit"
 ASR_4BIT = "mlx-community/Qwen3-ASR-1.7B-4bit"
 ASR_BF16 = "mlx-community/Qwen3-ASR-1.7B-bf16"
+ASR_SMALL = "mlx-community/Qwen3-ASR-0.6B-4bit"
 DRAFT = serve_options.DEFAULT_DRAFT_MODEL
 
 
@@ -45,7 +46,16 @@ class SelectionTests(unittest.TestCase):
         )
         self.assertEqual(
             {c.model for c in session.CHECKPOINTS if c.task == "asr"},
-            {ASR_4BIT, ASR_BF16},
+            {ASR_4BIT, ASR_BF16, ASR_SMALL},
+        )
+        # Each transcription model decodes with the DFlash draft of its size.
+        self.assertEqual(
+            {c.model: c.draft for c in session.CHECKPOINTS if c.task == "asr"},
+            {
+                ASR_4BIT: DRAFT,
+                ASR_BF16: DRAFT,
+                ASR_SMALL: serve_options.SMALL_DRAFT_MODEL,
+            },
         )
 
     def test_speech_models_are_offered_by_type_then_precision(self):
@@ -59,10 +69,15 @@ class SelectionTests(unittest.TestCase):
             "voice_design": "VoiceDesign",
             "custom_voice": "CustomVoice",
         }
-        # Each type at each precision, once; the type is the repository's.
+        # Each 1.7B type at each precision, once, and the 0.6B Base and
+        # CustomVoice at 4-bit (there is no 0.6B VoiceDesign); the type is
+        # the repository's.
         self.assertEqual(
-            sorted((c.variant, c.precision) for c in speech),
-            sorted((v, p) for v in names for p in ("4-bit", "bf16")),
+            sorted((c.size, c.variant, c.precision) for c in speech),
+            sorted(
+                [("1.7B", v, p) for v in names for p in ("4-bit", "bf16")]
+                + [("0.6B", v, "4-bit") for v in ("base", "custom_voice")]
+            ),
         )
         for checkpoint in speech:
             with self.subTest(model=checkpoint.model):
@@ -72,12 +87,16 @@ class SelectionTests(unittest.TestCase):
                 )
                 self.assertEqual(
                     checkpoint.label,
-                    f"Qwen3-TTS 1.7B {names[checkpoint.variant]} · {checkpoint.precision}",
+                    f"Qwen3-TTS {checkpoint.size} {names[checkpoint.variant]} · "
+                    f"{checkpoint.precision}",
                 )
         for checkpoint in session.CHECKPOINTS:
             if checkpoint.task == "asr":
                 self.assertIsNone(checkpoint.variant)
-                self.assertTrue(checkpoint.label.startswith("Qwen3-ASR 1.7B · "))
+                self.assertTrue(
+                    checkpoint.label.startswith(f"Qwen3-ASR {checkpoint.size} · ")
+                )
+                self.assertIn(f"-{checkpoint.size}-", checkpoint.model)
         # No two choices read alike.
         labels = [checkpoint.label for checkpoint in session.CHECKPOINTS]
         self.assertEqual(len(set(labels)), len(labels))
@@ -143,7 +162,7 @@ class SelectionTests(unittest.TestCase):
             for c in session.CHECKPOINTS
             if c.task == "tts" and c.variant != "base"
         ]
-        self.assertEqual(len(voice_models), 4)
+        self.assertEqual(len(voice_models), 5)
         for model in voice_models:
             with self.subTest(model=model):
                 chosen = session.Selection.from_request(
@@ -957,8 +976,15 @@ class PageTests(unittest.TestCase):
         self.assertFalse(by_id[ASR_4BIT]["installed"])
         self.assertTrue(by_id[ASR_4BIT]["cached"])
         self.assertFalse(by_id[ASR_BF16]["cached"])
-        self.assertEqual(catalog["draft"]["id"], DRAFT)
-        self.assertTrue(catalog["draft"]["cached"])
+        self.assertEqual(
+            by_id[ASR_4BIT]["draft"],
+            {"id": DRAFT, "gigabytes": 0.7, "cached": True},
+        )
+        self.assertEqual(
+            by_id[ASR_SMALL]["draft"],
+            {"id": serve_options.SMALL_DRAFT_MODEL, "gigabytes": 0.25, "cached": True},
+        )
+        self.assertIsNone(by_id[TTS_4BIT]["draft"])
         self.assertEqual(catalog["max_lanes"], {"tts": 16, "asr": 32})
         self.assertEqual(
             [variant["id"] for variant in catalog["variants"]],

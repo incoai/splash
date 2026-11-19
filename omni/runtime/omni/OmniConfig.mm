@@ -88,7 +88,10 @@ OmniConfig readTts(NSDictionary *root) {
   else if (type == "custom_voice") tts.type = TtsModelType::CustomVoice;
   else if (type != "base") fail("tts_model_type " + type + " is not a supported model (base, voice_design, custom_voice)");
   NSDictionary *talker = object(root, "talker_config");
-  tts.talker = decoderDims(talker, 2048, 6144, 28);
+  // Qwen3-TTS-12Hz-1.7B, or 0.6B, whose talker is as wide as its code
+  // predictor and so feeds it without the small_to_mtp projection.
+  const bool small = has(talker, "hidden_size") && integer(talker, "hidden_size") == 1024;
+  tts.talker = small ? decoderDims(talker, 1024, 3072, 28) : decoderDims(talker, 2048, 6144, 28);
   tts.talker.vocabulary = integer(talker, "vocab_size");
   tts.talker.headRows = tts.talker.vocabulary; // 3072, whole Q4 tiles
   if (tts.talker.vocabulary != 3072) fail("talker vocabulary is not 3072");

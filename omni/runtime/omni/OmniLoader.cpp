@@ -372,17 +372,21 @@ TtsWeights loadTtsWeights(metal::MetalBackend &backend, model::WeightImages &ima
   {
     ImageSpec spec("predictor-head.bin", "OMPH0001", c.predictor.layers, 1, quantized);
     spec.norm("final_norm", "talker.code_predictor.model.norm.weight", c.predictor.hidden);
-    spec.projection("small_to_mtp", {{"talker.code_predictor.small_to_mtp_projection", c.predictor.hidden}},
-                    c.predictor.hidden, c.talker.hidden);
-    spec.bias("small_to_mtp_bias", "talker.code_predictor.small_to_mtp_projection.bias", c.predictor.hidden);
+    if (c.predictorProjection()) {
+      spec.projection("small_to_mtp", {{"talker.code_predictor.small_to_mtp_projection", c.predictor.hidden}},
+                      c.predictor.hidden, c.talker.hidden);
+      spec.bias("small_to_mtp_bias", "talker.code_predictor.small_to_mtp_projection.bias", c.predictor.hidden);
+    }
     for (uint32_t group = 0; group + 1 < c.codeGroups; ++group)
       spec.projection("lm_head_" + std::to_string(group),
                       {{"talker.code_predictor.lm_head." + std::to_string(group), c.predictorVocabulary}},
                       c.predictorVocabulary, c.predictor.hidden);
     loader.load(std::move(spec), [&](ImageReader &reader) {
       w.predictor.finalNorm = reader.norm("final_norm");
-      w.smallToMtp = reader.projection("small_to_mtp");
-      w.smallToMtpBias = loader.float32(reader.bias("small_to_mtp_bias"), c.predictor.hidden, "small_to_mtp bias");
+      if (c.predictorProjection()) {
+        w.smallToMtp = reader.projection("small_to_mtp");
+        w.smallToMtpBias = loader.float32(reader.bias("small_to_mtp_bias"), c.predictor.hidden, "small_to_mtp bias");
+      }
       for (uint32_t group = 0; group + 1 < c.codeGroups; ++group)
         w.predictorHeads.push_back(reader.projection("lm_head_" + std::to_string(group)));
     });

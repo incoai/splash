@@ -26,6 +26,10 @@ SUPPORTED_MODELS = (
     "mlx-community/Qwen3-TTS-12Hz-1.7B-VoiceDesign-bf16",
     "mlx-community/Qwen3-TTS-12Hz-1.7B-CustomVoice-4bit",
     "mlx-community/Qwen3-TTS-12Hz-1.7B-CustomVoice-bf16",
+    # The 0.6B models, 4-bit: less memory and faster, for a smaller Mac.
+    "mlx-community/Qwen3-TTS-12Hz-0.6B-Base-4bit",
+    "mlx-community/Qwen3-TTS-12Hz-0.6B-CustomVoice-4bit",
+    "mlx-community/Qwen3-ASR-0.6B-4bit",
 )
 
 

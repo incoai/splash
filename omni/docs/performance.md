@@ -173,6 +173,34 @@ scores 1.27% / 1.15% at one stream, 0.82% / 1.09% at four and 0.72% / 0.42%
 at eight, against mlx-audio 0.6.5's 0.91% / 0.42%, 0.72% / 2.30% and
 0.91% / 2.18%.
 
+### The 0.6B models
+
+Qwen3-TTS-12Hz-0.6B-Base-4bit, -0.6B-CustomVoice-4bit and
+Qwen3-ASR-0.6B-4bit, with the 0.6B's own DFlash draft
+(`wilsonzheng0327/Qwen3-ASR-0.6B-dflash`), measured as above on 2026-11-19.
+The 1.7B 4-bit figures beside them are the launch run's.
+
+| | 0.6B 4-bit | 1.7B 4-bit |
+| --- | ---: | ---: |
+| Text to speech · time to first audio | 16 ms | 20 ms |
+| Text to speech · audio s/s, one stream (Base / CustomVoice) | 13.8 / 13.7 | 10.1 |
+| Text to speech · audio s/s, 8 concurrent streams (Base / CustomVoice) | 46.4 / 56.0 | 46.9 |
+| Speech to text · audio s/s, one file at a time | 187.5 (121.4 without draft) | 115.6 |
+| Speech to text · audio s/s, 8 concurrent files | 285.7 (262.1) | 182.0 |
+| Speech to text · audio s/s, long recordings | 316.7 (254.3) | 199 |
+| Speech to text · word error rate | 2.38% | 2.17% |
+
+The draft leaves 194 of the 200 transcripts as decoding without it gives
+them, with the same word error rate. Generated speech, Qwen3-ASR judge (en /
+zh): CustomVoice 1.18% / 0.48% at one stream and 0.18% / 0.54% at eight;
+Base 0.27% / 2.60% at one stream. Base's long passages are its weak point:
+at eight streams one English passage ran on to 120 s and two Mandarin ones
+lost their ends (738% / 6.6%). mlx-audio, serving the same Base checkpoint
+one stream at a time, ran three of the ten long Mandarin passages to its
+327 s limit (0.45% / 985%), so the fault is the model's. Real-weight parity
+with mlx-audio matches the 1.7B's: talker logits cosine 0.99997 (Base) and
+0.99994 (CustomVoice), the predictor's 0.99987 and 0.99946, argmax equal.
+
 ### No caching
 
 Nothing in the server or the engine caches results, KV or audio across

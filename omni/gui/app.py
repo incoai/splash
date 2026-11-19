@@ -67,23 +67,26 @@ def catalog():
                 "id": checkpoint.model,
                 "task": checkpoint.task,
                 "precision": checkpoint.precision,
+                "size": checkpoint.size,
                 "variant": checkpoint.variant,
                 "label": checkpoint.label,
                 "gigabytes": checkpoint.gigabytes,
                 "installed": models.installation_kind(chosen.link) == models.ASSEMBLY,
                 # Where the installer assembles it from without the Hub.
                 "cached": upstream.cached_commit(chosen) is not None,
+                # A transcription model's default draft, which a start with
+                # speculation fetches beside it; None for speech.
+                "draft": checkpoint.draft
+                and {
+                    "id": checkpoint.draft,
+                    "gigabytes": session.DRAFT_GIGABYTES[checkpoint.draft],
+                    "cached": upstream.draft_present(checkpoint.draft),
+                },
             }
         )
-    draft = serve_options.DEFAULT_DRAFT_MODEL
     return {
         "models": entries,
         "variants": [asdict(variant) for variant in session.VARIANTS],
-        "draft": {
-            "id": draft,
-            "gigabytes": session.DRAFT_GIGABYTES,
-            "cached": upstream.draft_present(draft),
-        },
         "defaults": {"port": serve_options.DEFAULT_PORT},
         "max_lanes": session.MAX_LANES,
         "built": paths.BINARY.is_file(),

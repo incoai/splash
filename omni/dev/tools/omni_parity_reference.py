@@ -98,6 +98,13 @@ TOKENS = [
 ]
 
 
+def _small_to_mtp(cp, x):
+    """The code predictor's input: small_to_mtp of the talker's state, which
+    the 0.6B, whose talker is as wide as its predictor, takes as it is."""
+    projection = cp.small_to_mtp_projection
+    return x if projection is None else projection(x)
+
+
 def write(path, header, arrays):
     with open(path, "wb") as f:
         f.write(struct.pack("<" + "I" * len(header), *header))
@@ -130,14 +137,14 @@ def predictor_logits(talker, hidden):
     code_input = mx.concatenate(
         [hidden[:, -1:, :], talker.model.codec_embedding(mx.array([[100]]))], axis=1
     )
-    x = cp.small_to_mtp_projection(code_input)
+    x = _small_to_mtp(cp, code_input)
     from mlx_audio.lm.models.cache import KVCache
 
     code_cache = [KVCache() for _ in cp.model.layers]
     h = cp.model(inputs_embeds=x, cache=code_cache)
     logits0 = np.array(cp.lm_head[0](h[:, -1]).astype(mx.float32))[0]
     c1 = int(np.argmax(logits0))
-    x1 = cp.small_to_mtp_projection(cp.codec_embedding[0](mx.array([[c1]])))
+    x1 = _small_to_mtp(cp, cp.codec_embedding[0](mx.array([[c1]])))
     h1 = cp.model(inputs_embeds=x1, cache=code_cache)
     logits1 = np.array(cp.lm_head[1](h1[:, -1]).astype(mx.float32))[0]
     return logits0, logits1
@@ -300,8 +307,7 @@ def tts_force(model_dir, out, argv):
             for g in range(14)
         ]
         x = mx.concatenate(rows, axis=1)
-        if cp.small_to_mtp_projection is not None:
-            x = cp.small_to_mtp_projection(x)
+        x = _small_to_mtp(cp, x)
         h = cp.model(x)
         heads = mx.concatenate([cp.lm_head[g](h[:, g + 1]) for g in range(15)])
         predictor_logits[n] = np.array(heads.astype(mx.float32))

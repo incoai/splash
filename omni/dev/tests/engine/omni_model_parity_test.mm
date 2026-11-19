@@ -270,7 +270,7 @@ void checkTts(metal::MetalBackend &backend, const std::string &modelDir, const T
   metal::MetalBuffer code = backend.allocateBuffer(4, metal::BufferStorage::Shared, "code");
   static_cast<uint32_t *>(code.contents())[0] = 100;
   ops::omni::Embedding::addGatherRows(graph, rowIndex, talkerArena.selected, predictorInput, 1, 1, c.talker.hidden);
-  ops::omni::Embedding::addGather(graph, code, model.tables().codec, backend.view(predictorInput, 2048 * 2, 2048 * 2), 1,
+  ops::omni::Embedding::addGather(graph, code, model.tables().codec, backend.view(predictorInput, uint64_t{c.talker.hidden} * 2, uint64_t{c.talker.hidden} * 2), 1,
                                   c.codecVocabulary, c.talker.hidden);
   model.addPredictorInput(graph, predictorInput, predictorArena.hidden, 2);
   std::vector<ops::omni::AttentionSequence> predictorDescriptors{{predictorTables.offset(0), predictorTables.stride(), 0, 2, 0, 0}};

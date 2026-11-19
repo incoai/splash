@@ -23,7 +23,7 @@ struct TtsWeights final {
   Qwen3Weights predictor; // no head: the 15 lm_heads below
   Qwen3Projection textFc1, textFc2; // text_projection: fc2(silu(fc1 x + b1)) + b2, 2048 -> 2048 -> 2048
   metal::MetalBuffer textFc1Bias, textFc2Bias; // fp32 [2048]
-  Qwen3Projection smallToMtp;                  // [1024][2048]
+  Qwen3Projection smallToMtp;                  // [1024][2048]; none at 0.6B (TtsConfig::predictorProjection)
   metal::MetalBuffer smallToMtpBias;           // fp32 [1024]
   metal::MetalBuffer textEmbedding;            // bf16 [151936][2048]
   metal::MetalBuffer codecEmbedding;           // bf16 [3072][2048]

@@ -1,7 +1,7 @@
 # Splash Omni design
 
 Splash Omni turns the Splash LLM engine into a TTS/ASR engine for Apple
-silicon. It serves exactly eight models:
+silicon. It serves exactly eleven models:
 
 | Model | Kind | Weights |
 | --- | --- | --- |
@@ -11,9 +11,14 @@ silicon. It serves exactly eight models:
 | `mlx-community/Qwen3-ASR-1.7B-bf16` | ASR | all bf16 |
 | `mlx-community/Qwen3-TTS-12Hz-1.7B-VoiceDesign-4bit`, `-CustomVoice-4bit` | TTS | as Base-4bit, without the speaker encoder |
 | `mlx-community/Qwen3-TTS-12Hz-1.7B-VoiceDesign-bf16`, `-CustomVoice-bf16` | TTS | all bf16, without the speaker encoder |
+| `mlx-community/Qwen3-TTS-12Hz-0.6B-Base-4bit`, `-CustomVoice-4bit` | TTS | as the 1.7B's at 4-bit, the talker 1024 wide (as the code predictor, so no `small_to_mtp` projection) |
+| `mlx-community/Qwen3-ASR-0.6B-4bit` | ASR | as the 1.7B's at 4-bit, the text model 1024 wide, the audio tower 896 wide over 18 layers |
 
 The system is designed around these models: every kernel instance, buffer
-layout and scheduler rule is chosen for their shapes.
+layout and scheduler rule is chosen for their shapes. The 0.6B models share
+the 1.7B's attention (16 query heads over 8 KV heads of 128) and code
+predictor, so the same kernels serve them at their narrower widths;
+Qwen3-ASR-0.6B was already the 1.7B's draft before it was served itself.
 
 ## What is kept from Splash
 

@@ -316,16 +316,19 @@ const setup = {
     }
     const entries = app.catalog.models.filter((model) =>
       model.task === task && (!speech || model.variant === this.variant));
-    // Keep the precision across model types.
+    // Keep the size and precision across model types (VoiceDesign has no
+    // 0.6B: the precision then).
     const precision = chosenEntry ? chosenEntry.precision : "4-bit";
+    const size = chosenEntry ? chosenEntry.size : "1.7B";
     const selected = entries.find((model) => model.id === chosen) ||
+      entries.find((model) => model.size === size && model.precision === precision) ||
       entries.find((model) => model.precision === precision) || entries[0];
     $("#model-choices").replaceChildren(...entries.map((model) =>
       element("label", { title: model.id },
         element("input", { type: "radio", name: "model", value: model.id, checked: model === selected }),
-        element("span", {}, `${model.precision} · ${model.gigabytes} GB`))));
-    const draft = app.catalog.draft;
-    $("#draft-badge").textContent = draft.cached ? "The draft is on this Mac." : `The draft downloads about ${draft.gigabytes} GB once.`;
+        element("span", {}, `${model.size} ${model.precision} · ${model.gigabytes} GB`))));
+    const draft = selected && selected.draft;
+    if (draft) $("#draft-badge").textContent = draft.cached ? "The draft is on this Mac." : `The draft downloads about ${draft.gigabytes} GB once.`;
     const lanes = app.catalog.max_lanes[task];
     form.lanes.max = lanes;
     $("#lanes-hint").textContent = `Requests decoded together; at most ${lanes}.`;
@@ -405,7 +408,8 @@ const setup = {
         const entry = speech.find((model) => model.id === id);
         if (entry && !entry.cached && !entry.installed) gigabytes += entry.gigabytes;
       }
-      if (this.form().voice_speculative.checked && !catalog.speech.draft.cached) gigabytes += catalog.speech.draft.gigabytes;
+      const asr = speech.find((model) => model.id === values.asr);
+      if (this.form().voice_speculative.checked && asr && asr.draft && !asr.draft.cached) gigabytes += asr.draft.gigabytes;
       const llm = catalog.llm_models.find((entry) => entry.id === this.form().llm_model.value);
       const parts = [];
       if (gigabytes > 0) parts.push(`speech models: about ${gigabytes.toFixed(1)} GB`);
@@ -418,9 +422,9 @@ const setup = {
     }
     const values = this.values();
     const model = app.catalog.models.find((entry) => entry.id === values.model);
-    const draft = app.catalog.draft;
+    const draft = model && model.draft;
     const total = (model && !model.cached && !model.installed ? model.gigabytes : 0) +
-      (task === "asr" && values.speculative && !draft.cached ? draft.gigabytes : 0);
+      (task === "asr" && values.speculative && draft && !draft.cached ? draft.gigabytes : 0);
     summary.replaceChildren(
       element("strong", { text: downloadText(total) || "Ready on this Mac" }),
       element("small", { text: model ? model.label : "" }));

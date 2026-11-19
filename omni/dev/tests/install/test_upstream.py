@@ -64,7 +64,7 @@ class UpstreamTest(unittest.TestCase):
         return output.getvalue(), warnings.getvalue()
 
     def test_the_supported_checkpoints_are_the_two_families(self):
-        self.assertEqual(len(families.SUPPORTED_MODELS), 8)
+        self.assertEqual(len(families.SUPPORTED_MODELS), 11)
         for model in families.SUPPORTED_MODELS:
             with self.subTest(model=model):
                 self.assertEqual(models.validate_repo_id(model), model)

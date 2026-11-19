@@ -46,6 +46,9 @@ struct TtsConfig final {
   uint32_t codeGroups = 16;
   uint32_t textVocabulary = 151936;
   uint32_t textHidden = 2048;
+  // Whether the talker's hidden state reaches the code predictor through
+  // small_to_mtp: only where the two widths differ (1.7B).
+  [[nodiscard]] bool predictorProjection() const noexcept { return talker.hidden != predictor.hidden; }
   // Codec-vocabulary ids.
   uint32_t codecPad = 2148, codecBos = 2149, codecEos = 2150;
   uint32_t codecThink = 2154, codecNoThink = 2155, codecThinkBos = 2156, codecThinkEos = 2157;

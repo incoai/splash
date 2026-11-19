@@ -447,7 +447,7 @@ class DraftModelTests(unittest.TestCase):
     def statuses(self):
         return [call.args[0] for call in self.status.call_args_list]
 
-    def test_default_draft_names_only_qwen3_asr_1_7b(self):
+    def test_default_draft_is_the_dflash_draft_of_the_asr_size(self):
         for name, config, expected in (
             ("asr-4bit", self.asr_config(), self.DRAFT),
             ("asr-bf16", self.asr_config(quantized=False), self.DRAFT),
@@ -457,8 +457,14 @@ class DraftModelTests(unittest.TestCase):
                 {"model_type": "qwen3_asr", "thinker_config": {"text_config": {}}},
                 self.DRAFT,
             ),
-            # The 0.6B itself, speech, and what is not a model.
-            ("asr-0.6b", self.asr_config(hidden_size=1024), None),
+            # The 0.6B takes its own draft.
+            (
+                "asr-0.6b",
+                self.asr_config(hidden_size=1024),
+                serve_options.SMALL_DRAFT_MODEL,
+            ),
+            # Speech, another width, and what is not a model.
+            ("asr-wide", self.asr_config(hidden_size=4096), None),
             (
                 "tts",
                 {"model_type": "qwen3_tts", "thinker_config": {"text_config": {}}},
@@ -513,7 +519,8 @@ class DraftModelTests(unittest.TestCase):
         self.cache_draft()
         tts = self.model("tts", {"model_type": "qwen3_tts"})
         small = self.model("asr-0.6b", self.asr_config(hidden_size=1024))
-        for root in (tts, small):
+        wide = self.model("asr-wide", self.asr_config(hidden_size=4096))
+        for root in (tts, wide):
             with self.subTest(root=root.name):
                 self.assertIsNone(self.draft(root))
                 # A draft's settings need a draft.

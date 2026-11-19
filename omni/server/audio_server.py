@@ -351,8 +351,8 @@ def parse_args(argv=None):
 
 def _draft_directory(args, profile):
     """The directory of the draft serve-omni decodes with, or None. By
-    default a Qwen3-ASR-1.7B checkpoint takes serve_options.DEFAULT_DRAFT_MODEL
-    and other models none; --draft-model names another and --no-draft-model
+    default a Qwen3-ASR checkpoint takes its DFlash draft
+    (serve_options.default_draft_model) and speech models none; --draft-model names another and --no-draft-model
     none. A repository ID missing from the Hub cache is downloaded into it:
     the default draft's failure warns and serves without speculation, an
     explicit draft's ends the startup. The engine still serves without a
@@ -371,8 +371,8 @@ def _draft_directory(args, profile):
         for flag in ("--draft-tokens", "--speculative-lanes"):
             if getattr(args, flag[2:].replace("-", "_")) is not None:
                 raise audio_runtime.EngineUnhealthy(
-                    f"{flag} needs a draft model: Qwen3-ASR-1.7B has one by "
-                    "default, other transcription models take --draft-model"
+                    f"{flag} needs a draft model: Qwen3-ASR has one by "
+                    "default, unless --no-draft-model"
                 )
         return None
     if os.path.isdir(name):

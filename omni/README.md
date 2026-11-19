@@ -95,15 +95,21 @@ The VoiceDesign and CustomVoice models choose their voice from
 | Qwen3-TTS-12Hz-1.7B-VoiceDesign | Text to speech in a voice described in words |
 | Qwen3-TTS-12Hz-1.7B-CustomVoice | Text to speech by nine preset speakers, with an optional style |
 | Qwen3-ASR-1.7B | Speech to text |
+| Qwen3-TTS-12Hz-0.6B-Base, -0.6B-CustomVoice | The same at 0.6B, 4-bit only: less memory, faster |
+| Qwen3-ASR-0.6B | Speech to text at 0.6B, 4-bit only |
 
-Each model is served from its MLX checkpoint in 4-bit or bf16, such as
+Each 1.7B model is served from its MLX checkpoint in 4-bit or bf16, such as
 `mlx-community/Qwen3-TTS-12Hz-1.7B-Base-4bit` and
 `mlx-community/Qwen3-ASR-1.7B-bf16`. The 4-bit checkpoints are smaller and
 faster (text to speech runs about twice as fast); bf16 keeps every weight at
-full precision. Both reach nearly the same accuracy. Qwen3-ASR-1.7B decodes speculatively with
-the DFlash draft `wilsonzheng0327/Qwen3-ASR-1.7B-dflash`, downloaded
-automatically (0.7 GB). Transcripts stay the 1.7B model's own. Splash Omni supports only
-these eight checkpoints and refuses others before downloading them.
+full precision. Both reach nearly the same accuracy. The 0.6B models are
+served at 4-bit (`mlx-community/Qwen3-TTS-12Hz-0.6B-Base-4bit`,
+`-0.6B-CustomVoice-4bit`, `mlx-community/Qwen3-ASR-0.6B-4bit`). Qwen3-ASR
+decodes speculatively with a DFlash draft of its size,
+`wilsonzheng0327/Qwen3-ASR-1.7B-dflash` (0.7 GB) or
+`wilsonzheng0327/Qwen3-ASR-0.6B-dflash` (0.25 GB), downloaded
+automatically; transcripts stay the served model's own. Splash Omni supports
+only these eleven checkpoints and refuses others before downloading them.
 
 ## Settings
 

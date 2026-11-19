@@ -117,6 +117,22 @@ class SelectionTests(unittest.TestCase):
                 "7G",
                 "5G",
             ),
+            (
+                {
+                    "asr_model": "mlx-community/Qwen3-ASR-0.6B-4bit",
+                    "tts_model": "mlx-community/Qwen3-TTS-12Hz-0.6B-CustomVoice-4bit",
+                },
+                "6G",
+                "4G",
+            ),
+            (
+                {
+                    "asr_model": "mlx-community/Qwen3-ASR-0.6B-4bit",
+                    "speculative": False,
+                },
+                "3G",
+                "5G",
+            ),
             ({"speech_max_memory": "12G"}, "12G", "12G"),
         )
         for change, asr, tts in cases:

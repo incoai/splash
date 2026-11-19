@@ -33,18 +33,21 @@ DEFAULT_PORTS = {ASR: 8031, TTS: 8032, LLM: 8033}
 # each sizes its KV page pool to whatever budget the weights leave, which
 # would take the memory the language model needs.
 DEFAULT_LANES = {ASR: 2, TTS: 4}
-# Each speech server's --max-memory in GiB, by task and precision: what its
-# engine takes with those lanes and its smallest KV pool, which it refuses to
-# exceed (4-bit speech 4.1 GiB, bf16 6.6; transcription 4.1 and 6.3), and for
-# transcription with its DFlash draft the budget the engine fits the draft
-# in (7.3 and 9.4; M5 Pro, the engine's own figures).
+# Each speech server's --max-memory in GiB, by task, size and precision:
+# what its engine takes with those lanes and its smallest KV pool, which it
+# refuses to exceed (1.7B speech 4.1 GiB at 4-bit, 6.6 at bf16, 0.6B 3.4;
+# transcription 4.1 and 6.3, 0.6B 2.9), and for transcription with its
+# DFlash draft the budget the engine fits the draft in (7.3 and 9.4, 0.6B
+# 6.0; M5 Pro, the engine's own figures).
 SPEECH_MEMORY_GIB = {
-    (TTS, "4bit"): 5,
-    (TTS, "bf16"): 7,
-    (ASR, "4bit"): 5,
-    (ASR, "bf16"): 7,
+    (TTS, "1.7B", "4bit"): 5,
+    (TTS, "1.7B", "bf16"): 7,
+    (TTS, "0.6B", "4bit"): 4,
+    (ASR, "1.7B", "4bit"): 5,
+    (ASR, "1.7B", "bf16"): 7,
+    (ASR, "0.6B", "4bit"): 3,
 }
-DRAFT_MEMORY_GIB = {"4bit": 8, "bf16": 10}
+DRAFT_MEMORY_GIB = {("1.7B", "4bit"): 8, ("1.7B", "bf16"): 10, ("0.6B", "4bit"): 6}
 DEFAULT_ASR = "mlx-community/Qwen3-ASR-1.7B-4bit"
 DEFAULT_TTS = "mlx-community/Qwen3-TTS-12Hz-1.7B-CustomVoice-4bit"
 # The models Splash serves (its README's table), the GGUF variant first.
@@ -168,9 +171,10 @@ def total_memory_gib():
 def speech_memory_gib(task, model, speculative=False):
     """A speech server's --max-memory in GiB (SPEECH_MEMORY_GIB)."""
     precision = "bf16" if model.endswith("-bf16") else "4bit"
+    size = "0.6B" if "-0.6B-" in model else "1.7B"
     if task == ASR and speculative:
-        return DRAFT_MEMORY_GIB[precision]
-    return SPEECH_MEMORY_GIB[(task, precision)]
+        return DRAFT_MEMORY_GIB[(size, precision)]
+    return SPEECH_MEMORY_GIB[(task, size, precision)]
 
 
 def gpu_budget_gib():

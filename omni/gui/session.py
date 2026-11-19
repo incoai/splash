@@ -92,14 +92,28 @@ class Checkpoint:
     gigabytes: float
     # Speech: the model type (VARIANTS); None for transcription.
     variant: str | None = None
+    # The model's size as its name gives it.
+    size: str = "1.7B"
 
     @property
     def label(self):
-        """The name the page shows: model, type and precision, so that no
-        two checkpoints read alike."""
+        """The name the page shows: model, size, type and precision, so that
+        no two checkpoints read alike."""
         if self.task == ASR:
-            return f"Qwen3-ASR 1.7B · {self.precision}"
-        return f"Qwen3-TTS 1.7B {VARIANT[self.variant].name} · {self.precision}"
+            return f"Qwen3-ASR {self.size} · {self.precision}"
+        return f"Qwen3-TTS {self.size} {VARIANT[self.variant].name} · {self.precision}"
+
+    @property
+    def draft(self):
+        """The DFlash draft a transcription model decodes with by default
+        (serve_options.DEFAULT_DRAFTS), None for speech."""
+        if self.task != ASR:
+            return None
+        return (
+            serve_options.SMALL_DRAFT_MODEL
+            if self.size == "0.6B"
+            else serve_options.DEFAULT_DRAFT_MODEL
+        )
 
 
 # families.SUPPORTED_MODELS, by task, model type and precision.
@@ -136,10 +150,22 @@ CHECKPOINTS = (
         4.2,
         CUSTOM_VOICE,
     ),
+    Checkpoint(
+        "mlx-community/Qwen3-TTS-12Hz-0.6B-Base-4bit", TTS, "4-bit", 1.6, BASE, "0.6B"
+    ),
+    Checkpoint(
+        "mlx-community/Qwen3-TTS-12Hz-0.6B-CustomVoice-4bit",
+        TTS,
+        "4-bit",
+        1.6,
+        CUSTOM_VOICE,
+        "0.6B",
+    ),
+    Checkpoint("mlx-community/Qwen3-ASR-0.6B-4bit", ASR, "4-bit", 0.7, size="0.6B"),
 )
 CHECKPOINT = {checkpoint.model: checkpoint for checkpoint in CHECKPOINTS}
-# The default draft of Qwen3-ASR-1.7B (serve_options.DEFAULT_DRAFT_MODEL).
-DRAFT_GIGABYTES = 0.7
+# Each default draft's size on disk (Checkpoint.draft).
+DRAFT_GIGABYTES = upstream.DRAFT_GIGABYTES
 
 assert {c.model for c in CHECKPOINTS} == set(families.SUPPORTED_MODELS)
 
@@ -226,9 +252,10 @@ class Selection:
     @property
     def draft(self):
         """The draft the server decodes with, or None: the default draft of
-        Qwen3-ASR-1.7B unless speculation is off. Speech models have none."""
+        its Qwen3-ASR size unless speculation is off. Speech models have
+        none."""
         if self.task == ASR and self.speculative:
-            return serve_options.DEFAULT_DRAFT_MODEL
+            return CHECKPOINT[self.model].draft
         return None
 
     def downloads(self):

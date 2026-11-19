@@ -24,6 +24,12 @@ from server import serve_options
 
 from . import assembly, families, hub, models
 
+# Each default draft's size on disk, which a start tells before it downloads.
+DRAFT_GIGABYTES = {
+    serve_options.DEFAULT_DRAFT_MODEL: 0.7,
+    serve_options.SMALL_DRAFT_MODEL: 0.25,
+}
+
 # The tokenizer files an MLX target may supply, linked when present.
 TOKENIZER_FILES = (
     "tokenizer.json",
@@ -208,8 +214,8 @@ def prepare(selection):
 
 def fetch_draft(selection):
     """Fetch the draft serve decodes selection's model with by default
-    (serve_options.default_draft_model: Qwen3-ASR-1.7B's DFlash draft)
-    into the Hub cache, beside the installed model.
+    (serve_options.default_draft_model: the DFlash draft of its Qwen3-ASR
+    size) into the Hub cache, beside the installed model.
     Nothing is fetched for other models or a draft already cached whole
     (draft_present). A failure warns: the server tries again at its start
     and otherwise serves without speculative decoding."""
@@ -218,7 +224,7 @@ def fetch_draft(selection):
         return
     print(
         f"Downloading {draft}, the speculative draft of {selection.model} "
-        "(about 0.7 GB; --no-draft-model skips it).",
+        f"(about {DRAFT_GIGABYTES[draft]} GB; --no-draft-model skips it).",
         flush=True,
     )
     try:

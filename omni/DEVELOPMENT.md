@@ -29,9 +29,11 @@ make -j8
 ./splash-omni serve --model mlx-community/Qwen3-TTS-12Hz-1.7B-Base-4bit
 ```
 
-`--model` names one of the eight supported checkpoints:
-`mlx-community/Qwen3-TTS-12Hz-1.7B-{Base,VoiceDesign,CustomVoice}-{4bit,bf16}`
-and `mlx-community/Qwen3-ASR-1.7B-{4bit,bf16}`; any other repository is
+`--model` names one of the eleven supported checkpoints:
+`mlx-community/Qwen3-TTS-12Hz-1.7B-{Base,VoiceDesign,CustomVoice}-{4bit,bf16}`,
+`mlx-community/Qwen3-ASR-1.7B-{4bit,bf16}`,
+`mlx-community/Qwen3-TTS-12Hz-0.6B-{Base,CustomVoice}-4bit` and
+`mlx-community/Qwen3-ASR-0.6B-4bit`; any other repository is
 refused before its weights download, with a message naming these (the
 installer checks the checkpoint's `config.json` with the engine's
 `omni-check`). The first serve sets up
@@ -120,7 +122,7 @@ many, and `/status` counts them under `console.dropped_lines`.
 Source `install/completions/splash-omni.bash` for Bash,
 `install/completions/_splash-omni` for Zsh after `compinit`, or
 `install/completions/splash-omni.fish` for fish. Completion suggests the
-commands (`serve`, `ui`), their options and the eight supported checkpoints
+commands (`serve`, `ui`), their options and the eleven supported checkpoints
 (`install/completions/suggested-models.txt`), without network access.
 
 ### The page (`splash-omni ui`)
@@ -141,7 +143,8 @@ architecture-check` holds it to that (`gui/` imports no `server` module but
 
 The JSON API:
 
-- `GET /api/catalog`: the eight checkpoints and the draft, with whether each
+- `GET /api/catalog`: the eleven checkpoints and each transcription model's
+  default draft, with whether each
   is installed (`install/models/`) or whole in the Hub cache, each
   checkpoint's speech model type (`variant`: `base`, `voice_design`,
   `custom_voice`) and display label, and the model types the page offers
