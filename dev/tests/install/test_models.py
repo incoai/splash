@@ -187,6 +187,23 @@ class InstallerTest(unittest.TestCase):
                 {"event": "error", "kind": "not_found", "message": message},
             )
 
+    def test_a_disk_that_fills_outside_the_download_is_worded_by_its_kind(self):
+        # The installer's own write, as it puts the model together, fails
+        # for want of room: the error event carries the kind a download's
+        # full disk has, which the app words, where it had none.
+        argv = ["--models", str(self.root), "--model", self.MODEL_ID, "prepare"]
+        full = OSError(errno.ENOSPC, "No space left on device")
+        for command in (argv, [*argv[:-1], "remove"]):
+            target = "prepare" if command[-1] == "prepare" else "remove"
+            with (
+                self.subTest(command=target),
+                mock.patch(f"install.upstream.{target}", side_effect=full),
+                contextlib.redirect_stdout(io.StringIO()) as output,
+                contextlib.redirect_stderr(io.StringIO()),
+            ):
+                self.assertEqual(installer.main(command), 1)
+            self.assertEqual(json.loads(output.getvalue())["kind"], "disk")
+
     def test_variant_model_ids_parse_and_name_selection_links(self):
         self.assertEqual(
             installer.split_model_id("owner/repo:UD-Q4_K_M"),

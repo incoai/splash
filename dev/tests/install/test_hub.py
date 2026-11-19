@@ -400,7 +400,9 @@ class PinTest(unittest.TestCase):
 
 class FailureKindTest(unittest.TestCase):
     def test_hub_failures_carry_their_kind(self):
-        """A Hub or network failure says which, as the app words it. A gated
+        """A Hub, network or disk failure says which, as the app words it:
+        a connection that dropped during the download, and a disk that
+        filled after the room check, by the error, not its text. A gated
         repository exists, though huggingface_hub refuses it as a
         RepositoryNotFoundError, and a revision or file the Hub lacks is not
         a missing repository: the message names it."""
@@ -430,6 +432,10 @@ class FailureKindTest(unittest.TestCase):
             (refused(403), "auth"),
             (httpx.ConnectError("no route", request=request), "offline"),
             (httpx.ReadTimeout("slow", request=request), "offline"),
+            (httpx.ReadError("connection reset", request=request), "interrupted"),
+            (httpx.RemoteProtocolError("peer closed", request=request), "interrupted"),
+            (OSError(errno.ENOSPC, "No space left on device"), "disk"),
+            (OSError(errno.EDQUOT, "Disc quota exceeded"), "disk"),
             (OSError(errno.EACCES, "Permission denied"), None),
             (refused(500), None),
         ):

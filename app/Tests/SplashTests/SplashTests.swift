@@ -1450,6 +1450,11 @@ struct OutputTests {
                 + #"needs more than is available in /Users/x/.cache/huggingface/hub"}"#))
             #expect(Installer.problem(disk, model: "a/b:Q4") == said + " Free some space, then try again.")
         }
+        // A disk that filled during the download, and a connection that dropped during it, are
+        // worded by their kind, not the installer's message ("[Errno 28] No space left on device").
+        #expect(try words("disk") == "The disk is full. Free some space, then try again.")
+        #expect(try words("interrupted")
+            == "The connection to Hugging Face dropped during the download. Check the internet connection, then try again.")
         let unclassed = try #require(Installer.Failure(
             line: #"{"event": "error", "kind": null, "message": "cannot install a/b: no supported model"}"#))
         #expect(Installer.problem(unclassed, model: "a/b") == "cannot install a/b: no supported model")

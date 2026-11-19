@@ -448,10 +448,12 @@ def main(argv=None):
         if args.command in ("prepare", "remove"):
             # The app and the launcher word the failure by it, beside any
             # progress and messages.
+            # An OSError of the installer's own, as a disk that fills while
+            # the model is put together, by the kind a download's has.
             kind, details = (
                 (error.kind, error.details)
                 if isinstance(error, ModelError)
-                else (None, {})
+                else (hub.failure_kind(error), {})
             )
             print(
                 json.dumps(

@@ -392,7 +392,7 @@ final class AppState {
                 lines.append("\(model) is answering \(requests == 1 ? "a request" : "\(requests) requests").")
             }
             if let download {
-                lines.append("\(download) is still downloading. If you quit, the download starts over next time.")
+                lines.append("\(download) is still downloading. If you quit, it stops. Download it again later to go on: the files it finished are kept.")
             }
             if programs > 0 {
                 lines.append(programs == 1 ? "A terminal is running a program." : "\(programs) terminals are running programs.")
@@ -406,7 +406,8 @@ final class AppState {
         // and not ended count at once.
         let live = server.requests.count(where: \.running)
         let requests = server.phase == .ready ? max(server.activity.running, live, chats.streaming == nil ? 0 : 1) : 0
-        // A download, or a check's update, starts over; a check that has found nothing loses nothing,
+        // A download, or a check's update, stops, its finished files kept in the Hub cache for the
+        // next ask to go on from; a check that has found nothing loses nothing,
         // and a deletion, quick, ends first.
         let downloading = installer.running && (installer.work == .download || installer.progress != nil)
         return QuitCost(model: server.model.map(displayName(of:)), requests: requests,

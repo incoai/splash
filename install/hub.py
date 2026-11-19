@@ -82,11 +82,15 @@ def reason(error) -> str:
 
 
 def failure_kind(error) -> str | None:
-    """What the app words a Hub or network failure by
-    (models.ModelError.kind): no such repository, no connection or access
-    denied; None for any other, which the app shows by its message, such as
-    a revision or file the repository lacks. A gated repository is access
-    denied, though huggingface_hub refuses it as a RepositoryNotFoundError
+    """What the app words a Hub, network or disk failure by
+    (models.ModelError.kind): no such repository, no connection, a
+    connection that dropped during the download ("interrupted"), access
+    denied, or a disk that filled ("disk", without the figures
+    _require_room gives, as a disk can fill after that check, which counts
+    the purgeable space macOS frees only as it is needed); None for any
+    other, which the app shows by its message, such as a revision or file
+    the repository lacks. A gated repository is access denied, though
+    huggingface_hub refuses it as a RepositoryNotFoundError
     (GatedRepoError)."""
     import httpx
     from huggingface_hub.errors import (
@@ -108,6 +112,10 @@ def failure_kind(error) -> str | None:
         return "auth"
     if isinstance(error, (httpx.ConnectError, httpx.TimeoutException)):
         return "offline"
+    if isinstance(error, (httpx.NetworkError, httpx.RemoteProtocolError)):
+        return "interrupted"
+    if isinstance(error, OSError) and error.errno in (errno.ENOSPC, errno.EDQUOT):
+        return "disk"
     return None
 
 
