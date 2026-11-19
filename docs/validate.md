@@ -59,6 +59,13 @@ does, and `REVISION`, `DRAFT_MODEL` and `LANGUAGE_ONLY=1` as its `--revision`,
 | `test-pressure-real` | the installation on this checkout's own server under `PRESSURE_ARGS` (default `--max-memory 18G`), which must make it stream its routed experts, with the [serving benchmark](#serving-benchmark)'s three churn clients for `PRESSURE_MINUTES` (default 5), checked on its own by [`check.py run`](#serving-benchmark) on G4, G8, G9, Store, Churn (its load window and every client served) and First token; results in `build/release/<model>/pressure` |
 | `release-check` | one model on this Mac ([Release check](#release-check)) |
 
+The native `test-real` oracle has token fixtures for Qwen and Flint; the
+decode and context scenarios in `benchmark-backend` use a Qwen prompt.
+These checks do not yet qualify Ripple with real model weights. They reject
+a fixture/vocabulary mismatch before loading weights. Ripple's committed
+operator and model parity tests run without downloaded weights; its full
+real-model oracle still needs token and reasoning fixtures.
+
 `test-agent-real` and `test-release-real` first run the tests
 `dev/tests/install/test_clients.py` has of the installed OpenCode, Codex and Pi
 among the selected clients, which need no model.

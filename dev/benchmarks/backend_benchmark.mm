@@ -1003,6 +1003,19 @@ int main(int argc, char **argv) {
     bootstrapConfig.nativeLoop.engine.maxContext = maxContext;
     const std::string modelRoot = config.modelRoot.string();
     const auto &capabilities = config.model.capabilities;
+    constexpr std::array<uint32_t, 39> decodeThroughputPrompt{
+        248045, 846,   198,   2427, 38453, 494,   220,   16,
+        11,     4237,  1754,  1324, 321,   1141,  6163,  803,
+        383,    264,   491,   1500, 13,    14569, 2980,  488,
+        5372,   220,   17,    15,   15,    13,    248046, 198,
+        248045, 74455, 198,   248068, 271,  248069, 271};
+    constexpr std::string_view decodeThroughputPromptSha256 =
+        "8c9bac848ac2e727f235beda84f06bac1a9320cc7a014d72da24263d07a3d982";
+    if ((selected.decode || selected.context || selected.exact) &&
+        std::ranges::any_of(decodeThroughputPrompt, [&](uint32_t token) {
+          return token >= capabilities.vocabularySize;
+        }))
+      throw std::invalid_argument("backend benchmark has no decode prompt fixture for this vocabulary");
     // Complete production warmup and memory audit before measuring. A start
     // refused memory the host or Metal may give back, as while the previous
     // engine's memory settles, retries as serve's does (main.mm): within the
@@ -1099,6 +1112,8 @@ int main(int argc, char **argv) {
     engine::EngineConfig engineConfig;
     engineConfig.maxContext = bootstrap->nativeLoop().statusSnapshot().maximumContextTokens;
     engineConfig.vocabularySize = capabilities.vocabularySize;
+    const uint32_t draftWindow = executor->draftWindow();
+    const uint32_t checkpointTokens = benchmark::defaultCheckpointTokens(draftWindow);
     engine::connectToGovernor(engineConfig, resources->memoryGovernor());
     engine::Engine engine(engineConfig, resources->cache(),
                                   *executor, events);
@@ -1112,14 +1127,6 @@ int main(int argc, char **argv) {
     // This executable characterizes one source identity and checks internal
     // invariants; a source-regression claim requires a separately captured
     // baseline report and an explicit comparison outside this process.
-    constexpr std::array<uint32_t, 39> decodeThroughputPrompt{
-        248045, 846,   198,   2427, 38453, 494,   220,   16,
-        11,     4237,  1754,  1324, 321,   1141,  6163,  803,
-        383,    264,   491,   1500, 13,    14569, 2980,  488,
-        5372,   220,   17,    15,   15,    13,    248046, 198,
-        248045, 74455, 198,   248068, 271,  248069, 271};
-    constexpr std::string_view decodeThroughputPromptSha256 =
-        "8c9bac848ac2e727f235beda84f06bac1a9320cc7a014d72da24263d07a3d982";
     std::vector<DecodeThroughputMeasurement> decodeThroughput;
     decodeThroughput.reserve(model::ExecutionLimits::maximumBatchWidth * samples);
     uint64_t requestId = 1;
@@ -1295,7 +1302,7 @@ int main(int argc, char **argv) {
         continuationResult.coldOutputMatch =
             continuationResult.outputTokens == continuationCold.outputTokens;
         if (coldResult.draftContextRows != expectedDraftContextRows(
-                length, engine::kPrefillCheckpointTokens)) {
+                length, checkpointTokens, 0, draftWindow)) {
           throw std::runtime_error(
               "cold prefill performed unnecessary draft-context work");
         }
@@ -1341,12 +1348,17 @@ int main(int argc, char **argv) {
             ((partialBase.size() - 1) / kv::kPageTokens) *
             kv::kPageTokens;
         const uint64_t expectedPartialRows = expectedDraftContextRows(
-            partialPrompt.size(), engine::kPrefillCheckpointTokens,
-            partialBoundary);
+            partialPrompt.size(), checkpointTokens, partialBoundary, draftWindow);
+        const uint32_t replayBoundary =
+            (partialPrompt.size() - 1) / kv::kPageTokens * kv::kPageTokens;
+        const auto checkpoints = engine::plannedCheckpoints(
+            partialBoundary, replayBoundary, checkpointTokens);
+        const uint32_t firstBoundary = checkpoints.empty() ? replayBoundary : checkpoints.front();
+        const bool skipsDraftRestore = firstBoundary - partialBoundary >= draftWindow;
         if (partialSeed.cacheStatus != "miss" ||
             partialHit.cacheStatus != "prefix_hit" ||
             partialHit.matchedTokens != partialBoundary ||
-            partialHit.draftStateRestoreSkipped != 1 ||
+            partialHit.draftStateRestoreSkipped != skipsDraftRestore ||
             partialHit.draftContextRows != expectedPartialRows) {
           throw std::runtime_error(
               "4K partial-hit draft-window oracle failed: seed_status=" +

@@ -387,6 +387,7 @@ $(TEST_KV_PAGE_CACHE_TEST): runtime/engine/KvPool.cpp \
 		dev/tests/engine/kv_page_cache_test.cpp
 $(TEST_DRAFT_CONTEXT_PLAN_TEST): runtime/model/DraftContextPlan.cpp \
 		dev/benchmarks/PrefillWork.hpp \
+		dev/tests/engine/DraftRingView.hpp \
 		dev/tests/engine/draft_context_plan_test.cpp
 $(TEST_METRICS_TEST): $(BACKEND_CONTROL_SOURCES) \
 		runtime/engine/MemoryGovernor.cpp runtime/engine/MemoryLedger.cpp \
@@ -532,6 +533,7 @@ $(TEST_PRESSURE_SERVING): dev/tests/engine/pressure_serving_test.mm \
 $(TEST_VISION_ENCODER_TEST): dev/tests/engine/vision_encoder_test.mm \
 		$(ENGINE_LIBRARY)
 $(TEST_MODEL_RUNTIME_ORACLE): dev/tests/engine/model_runtime_oracle_test.mm \
+		dev/tests/engine/DraftRingView.hpp \
 		dev/tools/LoadOptions.hpp \
 		$(ENGINE_INSTRUMENTED_METAL_OBJECT) $(ENGINE_INSTRUMENTED_ANE_OBJECT) \
 		$(ENGINE_INSTRUMENTED_RUNTIME_OBJECT) $(ENGINE_LIBRARY) $(LIB) $(BUILD_ID_HEADER)

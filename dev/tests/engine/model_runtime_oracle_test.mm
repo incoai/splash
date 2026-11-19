@@ -1,5 +1,6 @@
 #include "AwakeClock.hpp"
 #include "ChainRows.hpp"
+#include "DraftRingView.hpp"
 #include "LinearNumerics.hpp"
 #include "PenaltyReference.hpp"
 #include "StateCodecReference.hpp"
@@ -326,7 +327,10 @@ const OracleTokens kFlintTokens{
 // runs; the Qwen families' until then.
 const OracleTokens *targetTokens = &kQwenTokens;
 [[nodiscard]] const OracleTokens &oracleTokens(const model::ModelDescriptor &descriptor) {
-  return std::holds_alternative<model::FlintLayout>(descriptor.target) ? kFlintTokens : kQwenTokens;
+  const auto &tokens = std::holds_alternative<model::FlintLayout>(descriptor.target) ? kFlintTokens : kQwenTokens;
+  require(tokens.vocabulary == descriptor.capabilities.vocabularySize,
+          "model-runtime oracle has no token fixture for this vocabulary");
+  return tokens;
 }
 
 struct Similarity final {
@@ -467,18 +471,19 @@ CommittedState committedState(const model::Runtime &executor, const model::QwenS
   // A ring's keys are [head][slot][dimension] and its values [head][dimension]
   // [slot]; position p is slot p % window.
   const auto layout = states.layout().draft;
-  const uint32_t window = executor.draftWindow();
-  for (const auto &ring : states.draft(lane)) {
-    const uint16_t *keys = bfloatContents(ring.keys, "draft keys");
-    const uint16_t *values = bfloatContents(ring.values, "draft values");
+  const auto &rings = states.draft(lane);
+  for (uint32_t layer = 0; layer < rings.size(); ++layer) {
+    const auto &ring = rings[layer];
+    const test::DraftRingView rows(
+        {bfloatContents(ring.keys, "draft keys"), ring.keys.sizeBytes() / sizeof(uint16_t)},
+        {bfloatContents(ring.values, "draft values"), ring.values.sizeBytes() / sizeof(uint16_t)},
+        layout.kvHeads, layout.headDimension, layout.layerWindow(layer),
+        metadata.lengths.draftBase, metadata.lengths.draftEnd());
     std::vector<uint16_t> keyRows, valueRows;
-    for (uint32_t head = 0; head < layout.kvHeads; ++head)
-      for (uint64_t position = metadata.lengths.draftBase; position < metadata.lengths.draftEnd(); ++position)
-        for (uint32_t dimension = 0; dimension < layout.headDimension; ++dimension) {
-          const uint64_t slot = position % window;
-          keyRows.push_back(keys[(uint64_t{head} * window + slot) * layout.headDimension + dimension]);
-          valueRows.push_back(values[(uint64_t{head} * layout.headDimension + dimension) * window + slot]);
-        }
+    for (uint64_t index = 0; index < rows.size(); ++index) {
+      keyRows.push_back(rows.key(index));
+      valueRows.push_back(rows.value(index));
+    }
     state.rings.push_back(std::move(keyRows));
     state.rings.push_back(std::move(valueRows));
   }
@@ -881,24 +886,19 @@ StateSamples sampleCommittedState(const metal::MetalBackend &backend,
   const auto &lengths = states.metadata(lane).lengths;
   const auto layout = states.layout().draft;
   const uint32_t window = layout.window;
-  const uint64_t elements = uint64_t{layout.kvHeads} * lengths.draftLength *
-                            layout.headDimension;
-  const uint64_t stride = std::max<uint64_t>(1, elements / 65536);
   const auto &ring = states.draft(lane);
   for (uint32_t layer = 0; layer < ring.size(); ++layer) {
-    const auto *keys = bfloatContents(ring[layer].keys, "draft keys");
-    const auto *values = bfloatContents(ring[layer].values, "draft values");
+    const test::DraftRingView rows(
+        {bfloatContents(ring[layer].keys, "draft keys"), ring[layer].keys.sizeBytes() / sizeof(uint16_t)},
+        {bfloatContents(ring[layer].values, "draft values"), ring[layer].values.sizeBytes() / sizeof(uint16_t)},
+        layout.kvHeads, layout.headDimension, layout.layerWindow(layer),
+        lengths.draftBase, lengths.draftEnd());
+    const uint64_t stride = std::max<uint64_t>(1, rows.size() / 65536);
     std::vector<float> keySamples, valueSamples, capturedKeys, capturedValues;
-    for (uint64_t index = 0; index < elements; index += stride) {
-      const uint32_t dimension = index % layout.headDimension;
-      const uint32_t position = (index / layout.headDimension) % lengths.draftLength;
-      const uint32_t head = index / (uint64_t{layout.headDimension} * lengths.draftLength);
-      const uint32_t ring = (lengths.draftBase + position) % window;
-      const bool captured = lengths.draftBase + position >= capturedFrom;
-      (captured ? capturedKeys : keySamples).push_back(test::bf16ToFloat(
-          keys[(uint64_t{head} * window + ring) * layout.headDimension + dimension]));
-      (captured ? capturedValues : valueSamples).push_back(test::bf16ToFloat(
-          values[(uint64_t{head} * layout.headDimension + dimension) * window + ring]));
+    for (uint64_t index = 0; index < rows.size(); index += stride) {
+      const bool captured = rows.position(index) >= capturedFrom;
+      (captured ? capturedKeys : keySamples).push_back(test::bf16ToFloat(rows.key(index)));
+      (captured ? capturedValues : valueSamples).push_back(test::bf16ToFloat(rows.value(index)));
     }
     result.emplace_back("draft_key_" + std::to_string(layer), std::move(keySamples));
     result.emplace_back("draft_value_" + std::to_string(layer), std::move(valueSamples));
@@ -1302,8 +1302,8 @@ void requireRepeatedImagePlacements(model::Runtime &executor,
 void requireFullWindowRestore(model::Runtime &executor,
                               const metal::MetalBackend &backend,
                               model::QwenStateStorage &states) {
-  constexpr uint32_t window = model::ExecutionLimits::draftContextTokens;
-  constexpr uint32_t boundary = window + 64;
+  const uint32_t window = executor.draftWindow();
+  const uint32_t boundary = window + 64;
   std::vector<uint32_t> prompt(boundary + 64);
   for (uint32_t index = 0; index < prompt.size(); ++index)
     prompt[index] = 1 + index;
@@ -1313,7 +1313,11 @@ void requireFullWindowRestore(model::Runtime &executor,
   beginCold(executor, request, 0);
   const std::array<uint32_t, 1> checkpoints{boundary};
   executor.setDraftContextPlan(request.id, planDraftContext(0, prompt.size(), checkpoints, executor.draftWindow()));
-  prefillChunk(executor, request.id, 0, tokens.first(window), pages);
+  for (uint32_t begin = 0; begin < window;) {
+    const uint32_t count = std::min(window - begin, executor.commandLimits().commandRows);
+    prefillChunk(executor, request.id, begin, tokens.subspan(begin, count), pages);
+    begin += count;
+  }
   prefillChunk(executor, request.id, window, tokens.subspan(window, boundary - window), pages);
   auto checkpoint = executor.snapshot(request.id);
   require(checkpoint != nullptr, "full-window checkpoint allocation failed");
@@ -1357,7 +1361,7 @@ StateBytes restoredBytes(model::Runtime &executor, const model::QwenStateStorage
 }
 
 // The rows of the positions a context window holds at `boundary`, the last
-// 2048 before it (slot position % 2048): each slot's codes, then its group
+// `slots` before it (slot position % slots): each slot's codes, then its group
 // parameters. The window's other slots hold nothing a restore reads.
 std::vector<uint8_t> windowRows(const std::vector<uint8_t> &window, uint32_t width, uint64_t boundary,
                                 uint64_t slots) {
