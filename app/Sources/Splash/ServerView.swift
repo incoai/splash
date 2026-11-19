@@ -209,9 +209,10 @@ private struct ControlBar: View {
         HStack(spacing: 12) {
             StatusMark(look: look, since: server.since)
             VStack(alignment: .leading, spacing: 2) {
+                // At its end, as the Server button cuts the model's name.
                 Text(model.map(state.displayName(of:)) ?? "")
                     .font(.headline)
-                    .truncationMode(.middle)
+                    .truncationMode(.tail)
                 detail
                     .font(.callout)
                     .foregroundStyle(.secondary)

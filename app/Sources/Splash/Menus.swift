@@ -19,9 +19,10 @@ struct MenuBarPanel: View {
             HStack(spacing: 10) {
                 StatusMark(look: state.serverStatus.look, since: server.since)
                 VStack(alignment: .leading, spacing: 1) {
+                    // At its end, as the Server button cuts the model's name.
                     Text(model.map(state.displayName(of:)) ?? "No model running")
                         .font(.headline)
-                        .truncationMode(.middle)
+                        .truncationMode(.tail)
                     if model != nil { Text(state.serverStatus.phrase).font(.callout).foregroundStyle(.secondary) }
                 }
                 .lineLimit(1)

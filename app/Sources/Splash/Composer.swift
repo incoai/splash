@@ -541,7 +541,8 @@ private struct EngineSlot: View {
                 }
                 .font(.callout)
                 .lineLimit(1)
-                .truncationMode(.middle)
+                // At its end, as the Server button cuts the model's name.
+                .truncationMode(.tail)
                 .padding(.horizontal, 8)
                 .padding(.vertical, 4)
                 // The mark, the words and the chevron change places within the slot at once as
