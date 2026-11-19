@@ -850,7 +850,7 @@ struct Runtime::Impl {
   }
 
   uint64_t embeddingBytes(const ImageSpan &span) const {
-    return uint64_t{ops::Vision::embeddingRows(span.grid())} *
+    return uint64_t{span.grid().mergedTokens()} *
            geometry.target.hiddenSize * sizeof(uint16_t);
   }
 

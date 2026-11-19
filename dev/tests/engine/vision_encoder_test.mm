@@ -75,7 +75,7 @@ std::vector<float> encodeOnce(MetalBackend &backend,
                               const Vision &encoder, ImageGrid grid,
                               const MetalBuffer &pixels, uint32_t hiddenSize,
                               double *gpuSeconds) {
-  const uint64_t rows = Vision::embeddingRows(grid);
+  const uint64_t rows = grid.mergedTokens();
   MetalBuffer embeddings = backend.allocateBuffer(
       rows * hiddenSize * sizeof(uint16_t), BufferStorage::Shared,
       "embeddings");

@@ -235,7 +235,7 @@ void profileImages(metal::MetalBackend &backend,
       }
     }
     const metal::MetalBuffer embeddings = backend.allocateBuffer(
-        uint64_t{ops::Vision::embeddingRows(grid)} *
+        uint64_t{grid.mergedTokens()} *
             vision.tensors.layout.outputHiddenSize * sizeof(uint16_t),
         metal::BufferStorage::Private, "image embeddings");
     const auto encode = [&] {

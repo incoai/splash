@@ -983,7 +983,7 @@ void requireAtomicImageAdmission(model::Runtime &executor,
         ops::Vision::scratchBytes(model.vision.tensors.layout,
                                   span.gridHeight * span.gridWidth) +
         span.pixelBytes() +
-        uint64_t{ops::Vision::embeddingRows({span.gridHeight, span.gridWidth})} *
+        uint64_t{span.grid().mergedTokens()} *
             model.vision.tensors.layout.outputHiddenSize * sizeof(uint16_t) +
         states.layout().laneBytes();
     fault.remainingBytes = attemptBytes - 1;
@@ -1191,7 +1191,7 @@ void requireImageRowsAfterReclaim(model::Runtime &executor,
   }
   const ImageSpan &miss = mixed.images.back();
   const uint64_t missingImageBytes = miss.pixelBytes() +
-      uint64_t{ops::Vision::embeddingRows({miss.gridHeight, miss.gridWidth})} *
+      uint64_t{miss.grid().mergedTokens()} *
           model.vision.tensors.layout.outputHiddenSize * sizeof(uint16_t);
   require(executor.begin(mixed.modelView()).granted() &&
               executor.telemetry().imageEmbeddingReuses == reusedBeforeMixed + 1 &&
@@ -3165,7 +3165,7 @@ void requireRefusedStartKeepsItsRows(model::Runtime &executor,
   const uint64_t laneBytes = states.layout().laneBytes();
   const auto imageBytes = [&](const ImageSpan &span) {
     return span.pixelBytes() +
-           uint64_t{ops::Vision::embeddingRows({span.gridHeight, span.gridWidth})} *
+           uint64_t{span.grid().mergedTokens()} *
                model.vision.tensors.layout.outputHiddenSize * sizeof(uint16_t);
   };
   std::vector<uint32_t> prompt(128);
@@ -3250,7 +3250,7 @@ void requirePoolReleaseTakesOneUnit(model::Runtime &executor,
   releaseIdle(executor);
   const uint64_t originalBytes = backend.memoryStats().allocatedBytes;
   const auto rowBytes = [&](const ImageSpan &span) {
-    return uint64_t{ops::Vision::embeddingRows({span.gridHeight, span.gridWidth})} *
+    return uint64_t{span.grid().mergedTokens()} *
            model.vision.tensors.layout.outputHiddenSize * sizeof(uint16_t);
   };
   std::vector<uint32_t> prompt(128);

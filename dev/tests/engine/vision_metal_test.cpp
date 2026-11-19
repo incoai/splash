@@ -18,9 +18,9 @@
 namespace {
 
 using namespace splash;
-using ops::VisionAffine;
+using ops::DenseWeights;
+using ops::LayerNormWeights;
 using ops::VisionBlock;
-using ops::VisionNorm;
 using ops::VisionWeights;
 using test::requireExtent;
 
@@ -35,9 +35,9 @@ void run(metal::MetalBackend &backend) {
       test::sharedBuffer(backend, uint64_t{layout.outputHiddenSize} * merged * kBf16Bytes);
   const auto tensor = [&](uint64_t elements) { return backend.view(storage, 0, elements * kBf16Bytes); };
   const auto affine = [&](uint64_t output, uint64_t input) {
-    return VisionAffine{tensor(output * input), tensor(output)};
+    return DenseWeights{tensor(output * input), tensor(output)};
   };
-  const VisionNorm norm{tensor(hidden), tensor(hidden)};
+  const LayerNormWeights norm{tensor(hidden), tensor(hidden)};
   VisionWeights model;
   model.layout = layout;
   model.patchEmbedding = affine(hidden, layout.patchDimension);
@@ -50,7 +50,7 @@ void run(metal::MetalBackend &backend) {
   model.mergerDownProjection = affine(layout.outputHiddenSize, merged);
   const metal::MetalBuffer pixels = test::sharedBuffer(backend, kGrid.pixelBytes());
   const metal::MetalBuffer embeddings = test::sharedBuffer(
-      backend, uint64_t{ops::Vision::embeddingRows(kGrid)} * layout.outputHiddenSize * kBf16Bytes);
+      backend, uint64_t{kGrid.mergedTokens()} * layout.outputHiddenSize * kBf16Bytes);
   const auto encode = [&](metal::CommandGraph &graph, const VisionWeights &weights, const metal::MetalBuffer &image,
                           const metal::MetalBuffer &output) {
     const ops::Vision vision(backend, weights, kGrid.patches());
@@ -68,7 +68,7 @@ void run(metal::MetalBackend &backend) {
                     encode(graph, changed, pixels, embeddings);
                   });
   };
-  const auto requireAffineExtent = [&](VisionAffine VisionWeights::*member, uint64_t output, uint64_t input,
+  const auto requireAffineExtent = [&](DenseWeights VisionWeights::*member, uint64_t output, uint64_t input,
                                        const std::string &name) {
     requireWeightExtent((model.*member).weight, output * input, name + " weight",
                         [&](VisionWeights &changed, const metal::MetalBuffer &view) { (changed.*member).weight = view; });
@@ -81,7 +81,8 @@ void run(metal::MetalBackend &backend) {
                       [](VisionWeights &changed, const metal::MetalBuffer &view) { changed.positionTable = view; });
   for (const auto &[member, name] : {std::pair{&VisionBlock::norm1, "vision attention norm"},
                                      std::pair{&VisionBlock::norm2, "vision MLP norm"}})
-    for (const auto &[field, part] : {std::pair{&VisionNorm::weight, " weight"}, std::pair{&VisionNorm::bias, " bias"}})
+    for (const auto &[field, part] : {std::pair{&LayerNormWeights::weight, " weight"},
+                                      std::pair{&LayerNormWeights::bias, " bias"}})
       requireWeightExtent(model.blocks.back().*member.*field, hidden, std::string(name) + part,
                           [&](VisionWeights &changed, const metal::MetalBuffer &view) {
                             changed.blocks.back().*member.*field = view;
@@ -93,12 +94,13 @@ void run(metal::MetalBackend &backend) {
         std::tuple{&VisionBlock::downProjection, hidden, uint64_t{layout.paddedIntermediateSize},
                    "vision down projection"}})
     for (const auto &[field, part, elements] :
-         {std::tuple{&VisionAffine::weight, " weight", output * input}, std::tuple{&VisionAffine::bias, " bias", output}})
+         {std::tuple{&DenseWeights::weight, " weight", output * input}, std::tuple{&DenseWeights::bias, " bias", output}})
       requireWeightExtent(model.blocks.back().*member.*field, elements, std::string(name) + part,
                           [&](VisionWeights &changed, const metal::MetalBuffer &view) {
                             changed.blocks.back().*member.*field = view;
                           });
-  for (const auto &[field, part] : {std::pair{&VisionNorm::weight, " weight"}, std::pair{&VisionNorm::bias, " bias"}})
+  for (const auto &[field, part] : {std::pair{&LayerNormWeights::weight, " weight"},
+                                    std::pair{&LayerNormWeights::bias, " bias"}})
     requireWeightExtent(model.mergerNorm.*field, hidden, std::string("vision merger norm") + part,
                         [&](VisionWeights &changed, const metal::MetalBuffer &view) { changed.mergerNorm.*field = view; });
   requireAffineExtent(&VisionWeights::mergerUpProjection, merged, merged, "vision merger up projection");

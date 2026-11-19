@@ -1,4 +1,5 @@
 #include "metal/abi/KernelABI.h"
+#include "metal/abi/Normalization.h"
 #include "metal/kernels/common/gguf_sgmatrix.h"
 #include "metal/kernels/common/rms_inverse.h"
 
@@ -101,6 +102,58 @@ inline void norm_rms_row(device const bfloat *input, device const W *weight,
 NORM_RMS(norm_rms, bfloat)
 NORM_RMS(norm_rms_f32, float)
 #undef NORM_RMS
+
+// LayerNorm with bias of an fp32 row, a tower's residual stream, into bf16
+// (ops/Normalization.hpp, addLayer): fp32 mean and variance over the row,
+// one threadgroup of 256 threads per row.
+kernel void norm_layer(
+    device const float *input [[buffer(0)]],
+    device const bfloat *weight [[buffer(1)]],
+    device const bfloat *bias [[buffer(2)]],
+    device bfloat *output [[buffer(3)]],
+    constant LayerNormParams &params [[buffer(4)]],
+    uint group [[threadgroup_position_in_grid]],
+    uint thread_index [[thread_index_in_threadgroup]],
+    uint simd_lane [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]])
+{
+    threadgroup float reductions[8];
+    device const float *row = input + ulong(group) * params.width;
+    device bfloat *out = output + ulong(group) * params.width;
+
+    float sum = 0.0f;
+    for (uint column = thread_index; column < params.width; column += 256) {
+        sum += row[column];
+    }
+    sum = simd_sum(sum);
+    if (simd_lane == 0) reductions[simd_group] = sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float total = 0.0f;
+    #pragma unroll
+    for (ushort i = 0; i < 8; ++i) total += reductions[i];
+    float mean = total / float(params.width);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float squares = 0.0f;
+    for (uint column = thread_index; column < params.width; column += 256) {
+        float centered = row[column] - mean;
+        squares += centered * centered;
+    }
+    squares = simd_sum(squares);
+    if (simd_lane == 0) reductions[simd_group] = squares;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float variance = 0.0f;
+    #pragma unroll
+    for (ushort i = 0; i < 8; ++i) variance += reductions[i];
+    variance /= float(params.width);
+    float inverse = rsqrt(variance + params.epsilon);
+
+    for (uint column = thread_index; column < params.width; column += 256) {
+        float normalized = (row[column] - mean) * inverse;
+        out[column] = bfloat(normalized * float(weight[column]) +
+                             float(bias[column]));
+    }
+}
 
 // Plain norms of few rows of at most 2048 columns (ops/Normalization.cpp)
 // load each row once into threadgroup memory, a vector per thread of a
