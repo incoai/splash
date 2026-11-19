@@ -337,6 +337,10 @@ struct AnswerCycle final {
   uint32_t lane = 0, cycle = 0, rows = 0, tokens = 0;
 };
 std::vector<AnswerCycle> answerCycles;
+// An FNV-1a digest of every token the timed cycles of a width retained, each
+// lane's in its place, until profileWidth prints it: two builds that lay the
+// same rows (--step-rows) and compute them alike print the same digest.
+uint64_t outputDigest = 0;
 
 CycleTiming decodeCycle(metal::MetalBackend &backend,
                         model::Runtime &executor,
@@ -358,6 +362,9 @@ CycleTiming decodeCycle(metal::MetalBackend &backend,
   uint64_t tokens = 0;
   for (size_t index = 0; index < lanes.size(); ++index) {
     tokens += results[index].outputTokens.size();
+    for (const uint32_t token : results[index].outputTokens)
+      for (const uint64_t word : {uint64_t{index}, uint64_t{token}})
+        outputDigest = (outputDigest ^ word) * 0x100000001b3ULL;
     if (!results[index].failure.empty())
       throw std::runtime_error(results[index].failure);
     lanes[index].answered += static_cast<uint32_t>(results[index].outputTokens.size());
@@ -428,8 +435,8 @@ int main(int argc, char **argv) {
           cycles = parseCount(argv[index + 1], "--cycles");
         else if (option == "--widths") {
           widths = parseCount(argv[index + 1], "--widths");
-          if (widths > 4)
-            throw std::invalid_argument("--widths takes 1 to 4");
+          if (widths > model::ExecutionLimits::maximumBatchWidth)
+            throw std::invalid_argument("--widths takes 1 to the most lanes of a step");
           textOptions = true;
         }
         else if (option == "--kv-format") {
@@ -549,7 +556,7 @@ int main(int argc, char **argv) {
       context.verifyRows = verifyRows;
       model::Runtime executor(context);
       if (warmups) {
-        for (uint32_t width = 1; width <= 4; ++width) {
+        for (uint32_t width = 1; width <= model::ExecutionLimits::maximumBatchWidth; ++width) {
           // A start's decode warmup of the lane count, which measures its
           // classes' costs, and the costs it measured.
           const auto started = std::chrono::steady_clock::now();
@@ -569,7 +576,7 @@ int main(int argc, char **argv) {
                   backend.capabilities().deviceName.c_str(), promptTokens,
                   cycles, std::string(ops::formatName(stateFormat)).c_str());
 
-      std::array<Lane, 4> lanes;
+      std::array<Lane, model::ExecutionLimits::maximumBatchWidth> lanes;
       for (uint32_t index = 0; index < lanes.size(); ++index) {
         lanes[index] = {index + 1, index, 0,
                         pageRange(index * pagesPerLane, pagesPerLane)};
@@ -644,8 +651,10 @@ int main(int argc, char **argv) {
         std::vector<CycleTiming> fused;
         static_cast<void>(model::RuntimeInstrumentation::takeStepChoices(executor));
         answerCycles.clear();
+        outputDigest = 0xcbf29ce484222325ULL;
         for (uint32_t cycle = 0; cycle < cycles; ++cycle)
           fused.push_back(cycleOf(active));
+        std::printf("%s output digest %016llx\n", title, static_cast<unsigned long long>(outputDigest));
         if (stepLog)
           for (const AnswerCycle &answer : answerCycles)
             std::printf("%s answer cycle: lane %u, cycle %u, rows %u, tokens %u\n", title, answer.lane, answer.cycle,
