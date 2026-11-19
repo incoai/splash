@@ -152,6 +152,7 @@ class SmokeRealTests(unittest.TestCase):
                         verify_rows=None,
                         max_image_pixels=None,
                         kv_format="bf16" if absolute else "int8",
+                        cached_states="exact" if absolute else None,
                     )
                     with (
                         mock.patch.object(
@@ -166,6 +167,12 @@ class SmokeRealTests(unittest.TestCase):
                             self.assertEqual(
                                 command[command.index("--kv-format") + 1],
                                 arguments.kv_format,
+                            )
+                            self.assertEqual(
+                                command[command.index("--cached-states") + 1]
+                                if "--cached-states" in command
+                                else None,
+                                arguments.cached_states,
                             )
                             self.assertEqual(
                                 popen.call_args.kwargs["cwd"], smoke_real.ROOT
@@ -195,6 +202,7 @@ class SmokeRealTests(unittest.TestCase):
             verify_rows=None,
             max_image_pixels=None,
             kv_format="int8",
+            cached_states=None,
         )
 
     @contextlib.contextmanager

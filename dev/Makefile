@@ -170,6 +170,12 @@ test-release-real: preflight $(TARGET) agent-preflight verify-build-identity
 	TRANSFORMERS_VERBOSITY=error $(PYTHON) dev/tests/agent_real.py $(AGENT_ARGS) \
 		--http-smoke
 
+# The model whose release-check also runs the persistent cache's smoke with
+# --cached-states exact. One recurrent-state family is enough: the option
+# changes the cached state's format, its cache namespace and its restore
+# path, and no family specialises those.
+EXACT_STATES_MODEL ?= mlx-community/Qwen3.8-27B-4bit
+
 # BASELINE is a checkout whose build/ holds another build's splash.metallib,
 # engine-tests/backend-benchmark and engine-tests/weight-digests: this build
 # is compared with it on this machine in ABBA order, and so are their weight
@@ -253,6 +259,8 @@ release-check: preflight
 	$(MAKE) --no-print-directory test-http-real
 	$(MAKE) --no-print-directory test-http-real \
 		HTTP_SMOKE_ARGS="--persistent-cache --max-cache-disk 8G"
+	$(if $(filter $(EXACT_STATES_MODEL),$(MODEL)),$(MAKE) --no-print-directory test-http-real \
+		HTTP_SMOKE_ARGS="--persistent-cache --max-cache-disk 8G --cached-states exact")
 	$(MAKE) --no-print-directory test-performance-real
 	@test -z "$$(git status --porcelain)" || { \
 		echo "error: release checkout is not clean" >&2; \
