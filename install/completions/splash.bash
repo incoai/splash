@@ -32,7 +32,7 @@ _splash() {
         option=$prev prefix=$cur
     fi
     case $option in
-        --model-dir|--draft-model|--mmproj)
+        --model-dir|--draft-model|--mmproj|--lora)
             # compgen -f run in this shell, unlike the subshell below, has
             # readline treat these candidates as file names: quoted, with a
             # directory's ending in '/'. Bash 3.2 has no compopt, and complete's

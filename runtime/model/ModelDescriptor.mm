@@ -917,6 +917,42 @@ std::vector<FamilyFacts> familyFacts() {
   return facts;
 }
 
+namespace {
+
+// A PEFT LoRA adapter's configuration, of the plain kind Splash applies: one
+// rank and alpha for every module, B (A x) alone. A variant that changes
+// what a module computes (DoRA, a bias, per-module ranks) is refused rather
+// than applied as if it were plain.
+LoraAdapterLayout describeLoraAdapter(NSDictionary *config) {
+  const std::string label = "LoRA adapter config";
+  if (requireString(config, @"peft_type", label + " peft_type") != "LORA")
+    throw std::invalid_argument("the LoRA adapter is not a PEFT LoRA (peft_type)");
+  const auto set = [&](NSString *key) {
+    id value = config[key];
+    if (!value || value == [NSNull null]) return false;
+    if ([value isKindOfClass:[NSNumber class]]) return static_cast<bool>([value boolValue]);
+    if ([value isKindOfClass:[NSString class]]) return ![value isEqualToString:@"none"];
+    if ([value respondsToSelector:@selector(count)]) return [value count] != 0;
+    return true;
+  };
+  for (NSString *key in @[@"use_dora", @"rank_pattern", @"alpha_pattern", @"bias", @"lora_bias", @"fan_in_fan_out",
+                         @"modules_to_save", @"layers_pattern", @"use_qalora", @"trainable_token_indices"])
+    if (set(key))
+      throw std::invalid_argument("the LoRA adapter sets " + std::string(key.UTF8String) +
+                                  ", which Splash does not apply");
+  const double rank = requireNumber(config[@"r"], label + " r").doubleValue;
+  const double alpha = requireNumber(config[@"lora_alpha"], label + " lora_alpha").doubleValue;
+  if (rank < 1 || rank > LoraAdapterLayout::kMaximumRank || rank != std::floor(rank) || !std::isfinite(alpha) ||
+      alpha <= 0)
+    throw std::invalid_argument("the LoRA adapter's rank is not in [1, " +
+                                std::to_string(LoraAdapterLayout::kMaximumRank) + "] or its alpha is not positive");
+  // rsLoRA scales by alpha over the rank's root.
+  const double scale = alpha / (set(@"use_rslora") ? std::sqrt(rank) : rank);
+  return {static_cast<uint32_t>(rank), static_cast<float>(scale)};
+}
+
+} // namespace
+
 ModelDescriptor inspectModelRoot(const std::filesystem::path &root) {
   @autoreleasepool {
     std::string sourceIdentity;
@@ -933,6 +969,8 @@ ModelDescriptor inspectModelRoot(const std::filesystem::path &root) {
     ModelDescriptor result = describeSourceModel(std::move(name), targetFormat, visionFormat, config, draft);
     result.sourceIdentity = std::move(sourceIdentity);
     if (!result.valid()) throw std::invalid_argument("incompatible target and draft model");
+    if (std::filesystem::exists(root / "lora"))
+      result.lora = describeLoraAdapter(readObject(root / "lora" / "adapter_config.json", "LoRA adapter config"));
     return result;
   }
 }

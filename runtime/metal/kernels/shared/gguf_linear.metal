@@ -8,6 +8,7 @@
 // Keep the source order of float operations, which Metal's default fast math lets the compiler reassociate. Set
 // before the includes, so it also holds for the shared format and reduction code compiled here.
 #pragma clang fp reassociate(off)
+#include "metal/abi/Lora.h"
 #include "metal/kernels/common/gguf_staged_tile.h"
 #include "metal/kernels/common/split_reduce.h"
 
@@ -260,6 +261,249 @@ struct fused_formats {
   }
 GGUF_DECODE_FUSED(8) GGUF_DECODE_FUSED(16) GGUF_DECODE_FUSED(32) GGUF_DECODE_FUSED(48) GGUF_DECODE_FUSED(64)
 #undef GGUF_DECODE_FUSED
+
+// ---------------- LoRA (ops::ProjectionLora): the staged decode kernels above with a correction B t in each sum
+// (GgufLora).
+// B t over a tile's columns is the matmul of the rows t = A x, which a dispatch before wrote as bf16, with the
+// columns' rows of B, so the tile adds it as further steps of its accumulation: `rank` more inputs, B staged as half
+// like a step's weights. The sum a tile stores is then the one it would hold with those inputs and weights appended
+// to its own, and its store and epilogue are the plain kernel's. Of a K split, partition 0 adds the correction.
+template <ushort Rows, class Acc>
+inline void gguf_lora_steps(device const bfloat *t, device const bfloat4 *b, GgufLora l, uint index, uint origin,
+                            uint lane, threadgroup half *stage, thread Acc &acc) {
+  constexpr ushort Cols = GGUF_STAGED_COLUMNS, KS = GGUF_STAGED_STEP;
+  auto a = tensor(const_cast<device bfloat *>(t) + l.t_offset[index], dextents<int, 2>{int(l.t_stride), Rows},
+                  array<int, 2>{1, int(l.t_stride)});
+  constexpr auto descriptor = matmul2d_descriptor(Rows, Cols, KS, false, true, false, matmul2d_descriptor::mode::multiply_accumulate);
+  matmul2d<descriptor, execution_simdgroups<1>> operation;
+  tensor<threadgroup half, dextents<int, 2>, tensor_inline> bt(stage, dextents<int, 2>{KS, Cols}, array<int, 2>{1, KS});
+  auto staged = bt.slice<KS, Cols>(0, 0);
+  // Lane l stages column l, as a step's weights are staged.
+  device const bfloat4 *row = b + ulong(origin + lane) * (l.rank / 4);
+  for (uint step = 0; step * KS < l.rank; ++step) {
+#pragma unroll
+    for (ushort i = 0; i < KS / 4; ++i) {
+      const half4 values = half4(float4(row[step * (KS / 4) + i]));
+      threadgroup half *out = stage + lane * KS + 4 * i;
+      out[0] = values.x;
+      out[1] = values.y;
+      out[2] = values.z;
+      out[3] = values.w;
+    }
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+    auto a_slice = a.template slice<KS, Rows>(step * KS, 0);
+    operation.run(a_slice, staged, acc);
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+  }
+}
+// gguf_decode with a correction: the plain, residual and up-with-gate epilogues.
+template <class F, ushort Rows, GgufEpilogue Ep>
+kernel void gguf_decode_lora(device bfloat *input [[buffer(0)]], device uchar *w0 [[buffer(1)]],
+                             device uchar *w1 [[buffer(2)]], device uchar *meta [[buffer(3)]],
+                             device bfloat *output [[buffer(4)]],
+                             device coherent(device) float *partials [[buffer(5)]],
+                             device atomic_uint *counters [[buffer(6)]], device bfloat *aux [[buffer(7)]],
+                             device const bfloat *t [[buffer(8)]], device const bfloat4 *lb [[buffer(9)]],
+                             constant GgufDecodeLoraParams &q [[buffer(10)]],
+                             uint2 group [[threadgroup_position_in_grid]], uint simd_lane [[thread_index_in_simdgroup]],
+                             uint simd_group [[simdgroup_index_in_threadgroup]]) {
+  threadgroup half2 tl[F::Kind == QuantCodebook ? kQuantPairTableEntries : 1];
+  quant_pair_table<F>(tl, simd_group * 32 + simd_lane, GGUF_STAGED_THREADS);
+  threadgroup half stage[kStagedStages];
+  threadgroup uint arrival;
+  const GgufDecodeParams p = q.base;
+  const uint per = p.input_size / GGUF_STAGED_STEP / p.splits, sb = group.y * per, se = sb + per,
+             origin = group.x * GGUF_TILE_COLUMNS + simd_group * GGUF_STAGED_COLUMNS, column0 = p.out_offset + origin;
+  threadgroup half *my = stage + simd_group * kStagedSimdgroupStage;
+  auto acc = staged_accumulator<Rows, GGUF_STAGED_COLUMNS, GGUF_STAGED_STEP>(input, p.input_size, my);
+  gguf_zero(acc);
+  staged_accumulate<F, Rows, GGUF_STAGED_COLUMNS, GGUF_STAGED_STEP>(input, w0, w1, meta, p.input_size, origin, my, tl,
+                                                                    simd_lane, sb, se,
+                                                                    staged_first_step(group.x, sb, se, p.spread), acc);
+  if (group.y == 0) gguf_lora_steps<Rows>(t, lb, q.lora, 0, origin, simd_lane, my, acc);
+  gguf_store_sums<Rows>(acc, p.splits, group.y, partials, counters + p.out_offset / GGUF_TILE_COLUMNS + group.x,
+                        p.out_stride, column0, simd_group * 32 + simd_lane, &arrival,
+                        [&](uint row, uint column, float v) {
+    const ulong o = ulong(row) * p.out_stride + column0 + column;
+    output[o] = gguf_epilogue<Ep, bfloat>(v, aux, o);
+  });
+}
+using GgufDecodeLoraKernel = void(device bfloat *, device uchar *, device uchar *, device uchar *, device bfloat *,
+                                  device coherent(device) float *, device atomic_uint *, device bfloat *,
+                                  device const bfloat *, device const bfloat4 *, constant GgufDecodeLoraParams &,
+                                  uint2, uint, uint);
+#define GGUF_DECODE_LORA(F, f, R, ep, Ep) \
+  template [[host_name("gguf_decode_lora_" #f "_m" #R "_" #ep)]] kernel GgufDecodeLoraKernel gguf_decode_lora<F, R, Ep>;
+#define GGUF_DECODE_LORA_ROWS(F, f, ep, Ep)                                                                       \
+  GGUF_DECODE_LORA(F, f, 8, ep, Ep) GGUF_DECODE_LORA(F, f, 16, ep, Ep) GGUF_DECODE_LORA(F, f, 32, ep, Ep)         \
+  GGUF_DECODE_LORA(F, f, 48, ep, Ep) GGUF_DECODE_LORA(F, f, 64, ep, Ep)
+#define GGUF_DECODE_LORA_FORMAT(F, f)                                                                             \
+  GGUF_DECODE_LORA_ROWS(F, f, a, EpNone) GGUF_DECODE_LORA_ROWS(F, f, r, EpResidual)                               \
+  GGUF_DECODE_LORA_ROWS(F, f, g, EpUpWithGate)
+QUANT_FORMATS(GGUF_DECODE_LORA_FORMAT)
+#undef GGUF_DECODE_LORA_FORMAT
+#undef GGUF_DECODE_LORA_ROWS
+#undef GGUF_DECODE_LORA
+
+// gguf_decode_gate_up with the gate's correction (0) and the up's (1).
+template <class F, ushort Rows>
+kernel void gguf_decode_gate_up_lora(device bfloat *input [[buffer(0)]], device uchar *gw0 [[buffer(1)]],
+                                     device uchar *gw1 [[buffer(2)]], device uchar *gmeta [[buffer(3)]],
+                                     device uchar *uw0 [[buffer(4)]], device uchar *uw1 [[buffer(5)]],
+                                     device uchar *umeta [[buffer(6)]], device bfloat *output [[buffer(7)]],
+                                     device coherent(device) float *partials [[buffer(8)]],
+                                     device atomic_uint *counters [[buffer(9)]],
+                                     device const bfloat *t [[buffer(10)]],
+                                     device const bfloat4 *gb [[buffer(11)]], device const bfloat4 *ub [[buffer(12)]],
+                                     constant GgufDecodeLoraParams &q [[buffer(13)]],
+                                     uint2 group [[threadgroup_position_in_grid]],
+                                     uint lane [[thread_index_in_simdgroup]]) {
+  threadgroup half2 tl[F::Kind == QuantCodebook ? kQuantPairTableEntries : 1];
+  quant_pair_table<F>(tl, lane, GGUF_GATE_UP_THREADS);
+  threadgroup half stage[2 * GGUF_STAGED_COLUMNS * GGUF_STAGED_STEP];
+  threadgroup uint arrival;
+  const GgufDecodeParams p = q.base;
+  const GgufLora l = q.lora;
+  const uint per = p.input_size / GGUF_STAGED_STEP / p.splits, sb = group.y * per, se = sb + per,
+             origin = group.x * GGUF_STAGED_COLUMNS, column0 = p.out_offset + origin;
+  auto gate = staged_accumulator<Rows, GGUF_STAGED_COLUMNS, GGUF_STAGED_STEP>(input, p.input_size, stage);
+  auto up = staged_accumulator<Rows, GGUF_STAGED_COLUMNS, GGUF_STAGED_STEP>(input, p.input_size, stage);
+  gguf_zero(gate);
+  gguf_zero(up);
+  gguf_staged_pair_steps<F, Rows>(input, gw0, gw1, gmeta, uw0, uw1, umeta, p.input_size, origin, stage, tl, lane, sb,
+                                  se, staged_first_step(group.x / 2, sb, se, p.spread), gate, up);
+  if (group.y == 0) {
+    if (l.flags & 1u) gguf_lora_steps<Rows>(t, gb, l, 0, origin, lane, stage, gate);
+    if (l.flags & 2u) gguf_lora_steps<Rows>(t, ub, l, 1, origin, lane, stage, up);
+  }
+  gguf_store_gate_up<Rows>(gate, up, p.splits, group.y, partials,
+                           counters + p.out_offset / GGUF_STAGED_COLUMNS + group.x, p.out_stride, column0, lane,
+                           &arrival, output);
+}
+using GgufDecodeGateUpLoraKernel = void(device bfloat *, device uchar *, device uchar *, device uchar *,
+                                        device uchar *, device uchar *, device uchar *, device bfloat *,
+                                        device coherent(device) float *, device atomic_uint *, device const bfloat *,
+                                        device const bfloat4 *, device const bfloat4 *,
+                                        constant GgufDecodeLoraParams &, uint2, uint);
+#define GGUF_DECODE_GATE_UP_LORA(F, f, R)                                                                         \
+  template [[host_name("gguf_decode_lora_" #f "_m" #R "_gate_up")]] kernel GgufDecodeGateUpLoraKernel            \
+      gguf_decode_gate_up_lora<F, R>;
+#define GGUF_DECODE_GATE_UP_LORA_FORMAT(F, f) \
+  GGUF_DECODE_GATE_UP_LORA(F, f, 8) GGUF_DECODE_GATE_UP_LORA(F, f, 16) GGUF_DECODE_GATE_UP_LORA(F, f, 32)
+QUANT_FORMATS(GGUF_DECODE_GATE_UP_LORA_FORMAT)
+#undef GGUF_DECODE_GATE_UP_LORA_FORMAT
+#undef GGUF_DECODE_GATE_UP_LORA
+
+// gguf_decode_fused_m* with a correction per segment of the dispatch.
+#define GGUF_DECODE_FUSED_LORA(R)                                                                                  \
+  kernel void gguf_decode_fused_lora_m##R(device bfloat *input [[buffer(0)]], GGUF_SEGMENTS,                     \
+                                          device bfloat *output [[buffer(10)]],                                   \
+                                          device coherent(device) float *partials [[buffer(11)]],                 \
+                                          device atomic_uint *counters [[buffer(12)]],                            \
+                                          device const bfloat *t [[buffer(13)]],                                  \
+                                          device const bfloat4 *lba [[buffer(14)]],                               \
+                                          device const bfloat4 *lbb [[buffer(15)]],                               \
+                                          device const bfloat4 *lbc [[buffer(16)]],                               \
+                                          constant GgufDecodeFusedLoraParams &q [[buffer(17)]],                   \
+                                          uint2 group [[threadgroup_position_in_grid]],                           \
+                                          uint simd_lane [[thread_index_in_simdgroup]],                           \
+                                          uint simd_group [[simdgroup_index_in_threadgroup]]) {                   \
+    threadgroup half stage[kStagedStages]; threadgroup half2 tl[kQuantPairTableEntries]; threadgroup uint arrival; \
+    const GgufDecodeFusedParams p = q.base;                                                                       \
+    GGUF_SEGMENT_OF(group.x, p.cols);                                                                             \
+    device const bfloat4 *lb = s == 0 ? lba : s == 1 ? lbb : lbc;                                                 \
+    const uint per = p.input_size / GGUF_STAGED_STEP / p.splits;                                                  \
+    const uint sb = group.y * per, se = sb + per;                                                                 \
+    const uint origin = local * GGUF_TILE_COLUMNS + simd_group * GGUF_STAGED_COLUMNS, column0 = p.offset[s] + origin; \
+    threadgroup half *my = stage + simd_group * kStagedSimdgroupStage;                                            \
+    auto acc = staged_accumulator<R, GGUF_STAGED_COLUMNS, GGUF_STAGED_STEP>(input, p.input_size, my);            \
+    gguf_zero(acc);                                                                                               \
+    staged_accumulate_any<R, GGUF_STAGED_COLUMNS, GGUF_STAGED_STEP>(p.fmt[s], input, w0, w1, meta, p.input_size, origin, my, tl, \
+                                            simd_group * 32 + simd_lane, simd_lane, sb, se,                       \
+                                            staged_first_step(local, sb, se, p.spread), acc, fused_formats());    \
+    if (group.y == 0 && ((q.lora.flags >> s) & 1u)) gguf_lora_steps<R>(t, lb, q.lora, s, origin, simd_lane, my, acc); \
+    gguf_store_sums<R>(acc, p.splits, group.y, partials, counters + p.offset[s] / GGUF_TILE_COLUMNS + local,       \
+                       p.out_stride, column0, simd_group * 32 + simd_lane, &arrival,                              \
+                       [&](uint row, uint column, float v) { output[ulong(row) * p.out_stride + column0 + column] = bfloat(v); }); \
+  }
+GGUF_DECODE_FUSED_LORA(8) GGUF_DECODE_FUSED_LORA(16) GGUF_DECODE_FUSED_LORA(32) GGUF_DECODE_FUSED_LORA(48)
+GGUF_DECODE_FUSED_LORA(64)
+#undef GGUF_DECODE_FUSED_LORA
+
+// A projection's LoRA update where its plan's tile does not add it (Linear::add): the plan writes its sums, rounded,
+// and these kernels add B t to them as the decode tiles do, a matmul of the rows t with the tile's rows of B, before
+// the value that depends on the sum is rounded. Grid (32-column tiles of the update's segment, kLoraTileRows-row
+// tiles of the rows), one simdgroup each; the rows t hold whole tiles of rows.
+constant constexpr ushort kLoraTileRows = 32;
+// A dither of one unit of `base`'s bf16 rounding, a hash of the value's place and the seed, so that it repeats.
+inline float lora_dither(float base, ulong at, uint seed) {
+  const float unit = exp2(floor(log2(max(fabs(base), 1.0e-30f))) - 7.0f);
+  uint h = (uint(at) + 0x9E3779B9u) ^ (seed * 0x85EBCA6Bu);
+  h ^= h >> 16;
+  h *= 0x7FEB352Du;
+  h ^= h >> 15;
+  h *= 0x846CA68Bu;
+  h ^= h >> 16;
+  return (float(h >> 8) * (1.0f / 16777216.0f) - 0.5f) * unit;
+}
+// y = bf16(sums + B t), with the residual rows under LORA_TILE_RESIDUAL; without a correction (lora.flags) the sums
+// alone take them. `sums` may be `y`: each thread reads a value before it writes it. Sums that take no residual were
+// rounded to the grid y is rounded to, on which a correction below half a unit would be lost whole and one above it
+// rounded up whole: LORA_TILE_DITHER rounds with a uniform dither of one unit, which keeps the correction in
+// expectation, as rounding the unrounded sum would.
+kernel void lora_tile(device const bfloat *sums [[buffer(0)]], device const bfloat *t [[buffer(1)]],
+                      device const bfloat4 *b [[buffer(2)]], device const bfloat *residual [[buffer(3)]],
+                      device bfloat *y [[buffer(4)]], constant LoraTileParams &p [[buffer(5)]],
+                      uint2 tile [[threadgroup_position_in_grid]], uint lane [[thread_index_in_simdgroup]]) {
+  threadgroup half stage[GGUF_STAGED_COLUMNS * GGUF_STAGED_STEP];
+  const uint origin = tile.x * GGUF_STAGED_COLUMNS, row0 = tile.y * kLoraTileRows;
+  auto acc = staged_accumulator<kLoraTileRows, GGUF_STAGED_COLUMNS, GGUF_STAGED_STEP>(
+      const_cast<device bfloat *>(t), p.lora.t_stride, stage);
+  gguf_zero(acc);
+  if (p.lora.flags & 1u)
+    gguf_lora_steps<kLoraTileRows>(t + ulong(row0) * p.lora.t_stride, b, p.lora, 0, origin, lane, stage, acc);
+#pragma unroll
+  for (ushort i = 0; i < acc.get_capacity(); ++i) {
+    if (!acc.is_valid_element(i)) continue;
+    const auto index = acc.get_multidimensional_index(i);
+    const uint row = row0 + index[1];
+    if (row >= p.rows) continue;
+    const ulong at = ulong(row) * p.row_stride + p.column + origin + index[0];
+    const float base = float(sums[at]);
+    float sum = base + float(acc[i]);
+    if (p.flags & LORA_TILE_RESIDUAL) sum += float(residual[at]);
+    if (p.flags & LORA_TILE_DITHER) sum += lora_dither(base, at, p.seed);
+    y[at] = bfloat(sum);
+  }
+}
+// The FFN's intermediate rows: h = bf16((up + B t) * silu(gate + B t)), gate and up the rows their plans wrote; `up`
+// may be `h`.
+kernel void lora_swiglu_tile(device const bfloat *gate [[buffer(0)]], device const bfloat *up [[buffer(1)]],
+                             device const bfloat *t [[buffer(2)]], device const bfloat4 *gate_b [[buffer(3)]],
+                             device const bfloat4 *up_b [[buffer(4)]], device bfloat *h [[buffer(5)]],
+                             constant LoraTileParams &p [[buffer(6)]], uint2 tile [[threadgroup_position_in_grid]],
+                             uint lane [[thread_index_in_simdgroup]]) {
+  threadgroup half stage[GGUF_STAGED_COLUMNS * GGUF_STAGED_STEP];
+  const uint origin = tile.x * GGUF_STAGED_COLUMNS, row0 = tile.y * kLoraTileRows;
+  device const bfloat *rows = t + ulong(row0) * p.lora.t_stride;
+  auto g = staged_accumulator<kLoraTileRows, GGUF_STAGED_COLUMNS, GGUF_STAGED_STEP>(
+      const_cast<device bfloat *>(t), p.lora.t_stride, stage);
+  auto u = staged_accumulator<kLoraTileRows, GGUF_STAGED_COLUMNS, GGUF_STAGED_STEP>(
+      const_cast<device bfloat *>(t), p.lora.t_stride, stage);
+  gguf_zero(g);
+  gguf_zero(u);
+  if (p.lora.flags & 1u) gguf_lora_steps<kLoraTileRows>(rows, gate_b, p.lora, 0, origin, lane, stage, g);
+  if (p.lora.flags & 2u) gguf_lora_steps<kLoraTileRows>(rows, up_b, p.lora, 1, origin, lane, stage, u);
+#pragma unroll
+  for (ushort i = 0; i < g.get_capacity(); ++i) {
+    if (!g.is_valid_element(i)) continue;
+    const auto index = g.get_multidimensional_index(i);
+    const uint row = row0 + index[1];
+    if (row >= p.rows) continue;
+    const ulong at = ulong(row) * p.row_stride + p.column + origin + index[0];
+    h[at] = bfloat((float(up[at]) + float(u[i])) * splash_silu(float(gate[at]) + float(g[i])));
+  }
+}
 
 // The prefill kernels: grid (GGUF_PREFILL_ROWS-row tiles of the chunk, column tiles), four simdgroups; the residual
 // and gate kernels run one tensor and read aux at buffer 5.

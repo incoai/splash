@@ -3,6 +3,7 @@
 #include "model/DraftCheckpoint.hpp"
 #include "model/ExpertStore.hpp"
 #include "model/GgufTarget.hpp"
+#include "model/LoraAdapter.hpp"
 #include "model/ModelFactory.hpp"
 #include "model/SafetensorsImage.hpp"
 #include "model/SparseRowStore.hpp"
@@ -98,6 +99,7 @@ StreamableWeights streamableWeights(const std::filesystem::path &root, const Mod
       },
       descriptor.target);
   result.loadedBytes += draftImageBytes(root / "draft", descriptor.draft);
+  if (descriptor.lora) result.loadedBytes += loraAdapterBytes(root / "lora", *descriptor.lora);
   if (descriptor.hasVision()) result.loadedBytes += visionImageBytes(descriptor.vision);
   return result;
 }

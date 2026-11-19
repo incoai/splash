@@ -6,6 +6,7 @@
 #include "metal/abi/ExecutionGeometry.h"
 #include "ops/AneFfnCalibration.hpp"
 #include "ops/Linear.hpp"
+#include "ops/Lora.hpp"
 
 #include <array>
 #include <cstdint>
@@ -75,6 +76,9 @@ public:
 
   // The fraction of intermediate channels the ANE takes.
   [[nodiscard]] double share() const noexcept;
+  // Whether the split adds the layers' LoRA updates (ProjectionLora): every
+  // layer's gate, up and down has one, of one rank (unsupported()).
+  [[nodiscard]] bool takesLora() const noexcept { return shape_.rank != 0; }
   // What Metal allocated for the split, which plannedBytes() bounds.
   [[nodiscard]] uint64_t allocatedBytes() const noexcept { return allocatedBytes_; }
   // The least rows of a chunk the split takes (ane_ffn::minimumRows), from
@@ -162,6 +166,8 @@ private:
   // ANE takes.
   struct Shape final {
     uint32_t hidden = 0, intermediate = 0, layers = 0, gpu = 0, ane = 0;
+    // The rank of the LoRA modules the program takes; 0: none.
+    uint32_t rank = 0;
     std::vector<uint32_t> inputSegments, downSegments;
   };
   // A staging set of the ANE's int8 weights: gate's and up's rows over each
@@ -170,6 +176,8 @@ private:
   struct Weights final {
     std::vector<ane::Surface> gate, up, down;
     ane::Surface gateScale, upScale, downScale;
+    // LoRA: the fp16 rows of gate's and up's B over the ANE's channels.
+    ane::Surface loraGate, loraUp;
   };
   // Everything the split allocates (allocate() in AneFfn.cpp). The chunk's
   // rotated input rows in int8 segments, their per-token scales and the ANE's
@@ -181,6 +189,15 @@ private:
     metal::MetalBuffer signs, rowScales, rotated, status;
     std::vector<ane::Surface> inputs;
     ane::Surface tokenScale, partial;
+    // LoRA (metal/abi/AneFfn.h): every layer's down A over the GPU's
+    // channels as bf16 rows, and over the ANE's rotated as int8 codes
+    // [rank][ane] with their rows' scales in bf16; the GPU's part of down's
+    // t of a chunk in fp32; and the ANE's inputs of gate's t and of up's.
+    metal::MetalBuffer loraLeading, loraCodes, loraRowScales, loraDownGpu;
+    // A chunk's rows t of gate and up (lora::addDown), down's t of both
+    // parts in bf16, and its B t, which the join adds.
+    metal::MetalBuffer loraT, loraDown, loraDelta;
+    ane::Surface loraGate, loraUp;
     std::array<Weights, 2> sets;
   };
   // A projection's weight planes as the ane_ffn kernels bind them: an image
@@ -202,6 +219,9 @@ private:
   struct Layer final {
     std::array<Planes, 3> planes;
     Projection gate, up, down;
+    // With LoRA updates: the rows of gate's and up's B of the ANE's
+    // channels, and down's B.
+    metal::MetalBuffer loraGate, loraUp, loraDown;
   };
   // An input of the ANE program's functions: its name, the surface each
   // weight set binds to it, and the rows and width the functions read of it,
@@ -267,6 +287,13 @@ private:
   uint32_t minimumRows_ = kMinimumRows;
   std::vector<Layer> layers_;
   Memory memory_;
+  // LoRA: each layer's down A over the GPU's channels, and what carries the
+  // ANE's part of down's t back from its rotated A's scale.
+  std::vector<QuantizedSegment> loraLeading_;
+  std::vector<float> loraDownScale_;
+  // Quantizes the layers' down A for the ANE, once the weights' row scales
+  // are computed.
+  void prepareLora(std::span<const SwiGluProjections> layers);
   std::unique_ptr<ane::Program> program_;
   // By rows, ascending.
   std::vector<Evaluation> evaluations_;

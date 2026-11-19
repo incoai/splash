@@ -179,6 +179,11 @@ struct LinearScratch final {
   // The bf16 input rows a rotated projection's quantized segments read
   // (ProjectionShape::rotated), sized by scratchSize(shape, rows).rotated.
   metal::MetalBuffer rotated{};
+  // Of a projection with a LoRA update (ProjectionLora): the rows t = A x of
+  // a plan's input, a gate/up pair's two, and the sums of a plan whose tile
+  // does not add the update, which a kernel after it does (ops/Lora.hpp).
+  metal::MetalBuffer loraDown{};
+  metal::MetalBuffer loraRows{};
 };
 // One layer's SwiGLU projections: down(silu(gate x) * up x).
 struct SwiGluProjections final {
@@ -193,7 +198,7 @@ struct PrefillFfnBuffers final {
   LinearScratch scratch;
 };
 struct LinearScratchSize final {
-  uint64_t input = 0, sums = 0, partials = 0, counters = 0, rotated = 0;
+  uint64_t input = 0, sums = 0, partials = 0, counters = 0, rotated = 0, loraDown = 0, loraRows = 0;
   // Grows each field to hold `other`'s too.
   LinearScratchSize &include(const LinearScratchSize &other) noexcept {
     input = std::max(input, other.input);
@@ -201,6 +206,8 @@ struct LinearScratchSize final {
     partials = std::max(partials, other.partials);
     counters = std::max(counters, other.counters);
     rotated = std::max(rotated, other.rotated);
+    loraDown = std::max(loraDown, other.loraDown);
+    loraRows = std::max(loraRows, other.loraRows);
     return *this;
   }
 };
@@ -261,6 +268,24 @@ private:
   bool rotated_ = false;
 };
 
+// The corrections a staged decode plan adds to its sums, of its projections'
+// LoRA updates (ProjectionLora; gguf_decode_lora_*, metal/abi/Lora.h), which
+// Linear::add gives the plan: a tensor's own, a gate/up pair's gate and up,
+// or a fused projection's per segment, in that order. t holds bf16 rows of
+// tStride values, the tile's storage rows of them, each correction's
+// t = A x from its tOffset in a row, and b its B as bf16 rows
+// [outputSize][rank]; a correction without b is none.
+struct LinearLora final {
+  struct Term final {
+    metal::MetalBuffer b;
+    uint32_t tOffset = 0;
+    uint32_t outputSize = 0;
+  };
+  metal::MetalBuffer t;
+  uint32_t tStride = 0, rank = 0, rows = 0;
+  std::array<Term, 3> terms;
+};
+
 // The plan defines which fields are used and how much scratch they require.
 struct LinearBuffers final {
   metal::MetalBuffer input;
@@ -271,6 +296,8 @@ struct LinearBuffers final {
   // What the scratch table holds (for example after fused RMSNorm). A plan
   // that reads a table prepares one unless this describes its input.
   PreparedInput prepared{};
+  // Linear::add's own: the corrections of a plan whose tile adds them.
+  const LinearLora *lora = nullptr;
 };
 
 // Whether plans may round activations to int8 where an int8-activation path
@@ -290,6 +317,11 @@ public:
   [[nodiscard]] const KernelCalibration &calibration() const noexcept { return calibration_; }
   [[nodiscard]] Int8Activations int8Activations() const noexcept { return int8Activations_; }
 
+  // Whether the plan's tile adds a LoRA update to its sums: the staged decode
+  // tile in bf16 activations over plain rows. Any other plan of an updated
+  // projection writes its sums, and a kernel after it adds the update
+  // (add()).
+  [[nodiscard]] bool takesLora(const LinearPlan &plan) const noexcept;
   [[nodiscard]] LinearPlan plan(LinearWorkload workload) const;
   // The plan of `workload` for the projection, into its destination type; a gate/up plan also runs `gate`.
   [[nodiscard]] LinearPlan plan(LinearWorkload workload, const Projection &projection,
@@ -319,7 +351,13 @@ public:
   // picks it.
   [[nodiscard]] static LinearPlan plan(LinearWorkload workload, LinearConfig config,
                                        FloatOutput destination);
-  // Returns what the scratch table describes after the dispatch.
+  // Returns what the scratch table describes after the dispatch. A
+  // projection's LoRA update (ProjectionLora) is part of it: a plan that
+  // takesLora() adds B t to its sums, t = A x written by a dispatch before
+  // it; any other plan writes its sums as without the update and lora_tile
+  // adds B t to them, with the residual of a residual plan, whose sums go to
+  // the scratch, and with a dither otherwise (ops/Lora.hpp). A gate/up
+  // pair's updates on a plan that does not take them are addSwiGlu's.
   PreparedInput add(metal::CommandGraph &graph, LinearBuffers buffers,
                     const Projection &projection, const LinearPlan &plan,
                     const Projection *gate = nullptr) const;
@@ -338,7 +376,9 @@ public:
   // one gate/up plan where the chunk's rows run the decode tiles, otherwise a
   // gate plan and an up plan that takes what gate's plan leaves of x in the
   // scratch table; `normalized` describes what its producer wrote of the
-  // first plan's input (swiGluInput).
+  // first plan's input (swiGluInput). A gate or up with a LoRA update on
+  // plans that do not take it: a gate plan into the scratch's rows and an up
+  // plan, whose sums lora_swiglu_tile corrects where it multiplies them.
   void addSwiGlu(metal::CommandGraph &graph, const SwiGluProjections &ffn, const PrefillFfnBuffers &buffers,
                  metal::MetalBuffer residual, metal::MetalBuffer output, uint32_t rows, uint32_t chunkRows = 0,
                  PreparedInput normalized = {}) const;
@@ -347,6 +387,13 @@ public:
   [[nodiscard]] LinearInput swiGluInput(const SwiGluProjections &ffn, uint32_t rows, uint32_t chunkRows = 0) const;
 
 private:
+  // add() of the plan alone, with the corrections its tile adds
+  // (LinearBuffers::lora) and no other part of an update.
+  PreparedInput addPlan(metal::CommandGraph &graph, LinearBuffers buffers, const Projection &projection,
+                        const LinearPlan &plan, const Projection *gate) const;
+  // Whether a SwiGLU's gate and up run as one plan: on the decode tiles,
+  // and with a LoRA update only where that plan adds it.
+  [[nodiscard]] bool pairs(const SwiGluProjections &ffn, uint32_t rows, uint32_t chunkRows) const;
   // The partials and counters a dispatch of `splits` K partitions binds: the
   // scratch's, or for one partition, which reads neither, the output.
   [[nodiscard]] static std::array<metal::MetalBuffer, 2> splitScratch(const LinearBuffers &buffers,

@@ -51,7 +51,6 @@ inline FloatProjection<T> float_projection(constant GgufFloatParams &p, uint til
 namespace gguf_float {
 
 constant constexpr uint kFragments = 4;          // 8-row fragments per threadgroup: 32 rows
-constant constexpr uint kRows = 8 * kFragments;
 constant constexpr uint kStep = 64;              // inputs per step: eight runs of 8
 // K parts, one per simdgroup: a router's decode dispatch has few threadgroups (32 to 64), and 8 parts are the
 // fastest there, where 16 take up to 29% longer.
@@ -119,13 +118,15 @@ template <typename F> struct Eight<Native<F>> {
 // weights load a step ahead. Even and odd MMAs accumulate apart, which halves each chain of fp32 sums at no cost in
 // time: at the router's K = 2048 the mean error stays 5.5e-9 of sum |x w| (7.4e-9 with one chain per part). Rows of
 // K (a multiple of 8) start 16-byte aligned in page-aligned buffers.
-template <typename W, typename T>
+// Fragments and Splits are the threadgroup's 8-row fragments and K parts: kFragments and kSplits, or one fragment in
+// more parts for a decode step's few rows (gguf_float_few_*).
+template <typename W, typename T, uint Fragments = kFragments, uint Splits = kSplits>
 inline void project(device const bfloat *input, FloatProjection<T> projection, constant GgufFloatParams &p, uint y,
                     uint sg, uint lane, threadgroup float2 *parts) {
   const sgmatrix::Lane l = sgmatrix::lane_map(lane);
-  const uint K = p.input_size, runs = K / 8, column = projection.tile * 8 + l.fn, row0 = y * kRows;
-  const uint live = min(kRows, p.rows - row0);
-  const uint steps = (K + kStep - 1) / kStep, first = sg * steps / kSplits, last = (sg + 1) * steps / kSplits;
+  const uint K = p.input_size, runs = K / 8, column = projection.tile * 8 + l.fn, row0 = y * (8 * Fragments);
+  const uint live = min(8 * Fragments, p.rows - row0);
+  const uint steps = (K + kStep - 1) / kStep, first = sg * steps / Splits, last = (sg + 1) * steps / Splits;
   device const uchar *w0 = float_row<W>(projection.weights, column, K),
                      *w1 = float_row<W>(projection.weights, column + 1, K);
   const auto load = [&](uint step, thread Eight<W> (&b)[2]) {
@@ -133,9 +134,9 @@ inline void project(device const bfloat *input, FloatProjection<T> projection, c
     b[0] = Eight<W>::load(w0, run * 8, run < runs);
     b[1] = Eight<W>::load(w1, run * 8, run < runs);
   };
-  float2 acc[kFragments][2];
+  float2 acc[Fragments][2];
 #pragma unroll
-  for (uint f = 0; f < kFragments; ++f) acc[f][0] = acc[f][1] = float2(0);
+  for (uint f = 0; f < Fragments; ++f) acc[f][0] = acc[f][1] = float2(0);
   Eight<W> next[2];
   load(first, next);
   for (uint step = first; step < last; ++step) {
@@ -147,7 +148,7 @@ inline void project(device const bfloat *input, FloatProjection<T> projection, c
     // cannot know), and there one of a simdgroup's sums for the last fragment came out zero or another fragment's under
     // shader validation (gguf-moe float-stress).
 #pragma unroll
-    for (uint f = 0; f < kFragments; ++f) {
+    for (uint f = 0; f < Fragments; ++f) {
       if (f * 8 >= live) continue;
       const uint row = f * 8 + l.fm;
       device const uchar *x = reinterpret_cast<device const uchar *>(input + ulong(row0 + row) * K);
@@ -159,12 +160,12 @@ inline void project(device const bfloat *input, FloatProjection<T> projection, c
     }
   }
 #pragma unroll
-  for (uint f = 0; f < kFragments; ++f) parts[(sg * kFragments + f) * 32 + lane] = acc[f][0] + acc[f][1];
+  for (uint f = 0; f < Fragments; ++f) parts[(sg * Fragments + f) * 32 + lane] = acc[f][0] + acc[f][1];
   threadgroup_barrier(mem_flags::mem_threadgroup);
   const uint f = sg, row = f * 8 + l.fm;
-  if (f >= kFragments || row >= live) return;
+  if (f >= Fragments || row >= live) return;
   float2 total = float2(0);
-  for (uint s = 0; s < kSplits; ++s) total += parts[(s * kFragments + f) * 32 + lane];
+  for (uint s = 0; s < Splits; ++s) total += parts[(s * Fragments + f) * 32 + lane];
   device T *out = projection.output + ulong(row0 + row) * projection.out_stride + projection.out_offset + column;
   out[0] = T(total.x);
   out[1] = T(total.y);
@@ -190,6 +191,21 @@ GGUF_FLOAT_KERNEL(gguf_float_f32_bf16, float, bfloat)
 GGUF_FLOAT_KERNEL(gguf_float_f32_f32, float, float)
 GGUF_FLOAT_KERNEL(gguf_float_bf16_bf16, bfloat, bfloat)
 GGUF_FLOAT_KERNEL(gguf_float_bf16_f32, bfloat, float)
+// The projections of a decode step's few rows (a LoRA update's t = A x, ops/Lora.hpp): one 8-row fragment a threadgroup and
+// GGUF_FLOAT_FEW_SPLITS K parts, a simdgroup each, so that the few steps of a part are the dispatch's latency. Grid
+// (the projections' output_size / 8 summed, ceil(rows / 8)), 32 GGUF_FLOAT_FEW_SPLITS threads.
+#define GGUF_FLOAT_FEW_KERNEL(Name, W, T)                                                                      \
+  kernel void Name(device const bfloat *input [[buffer(0)]], device const uchar *weights0 [[buffer(1)]],      \
+                   device T *output0 [[buffer(2)]], device const uchar *weights1 [[buffer(3)]],               \
+                   device T *output1 [[buffer(4)]], constant GgufFloatParams &p [[buffer(5)]],                \
+                   uint2 tg [[threadgroup_position_in_grid]], uint sg [[simdgroup_index_in_threadgroup]],     \
+                   uint lane [[thread_index_in_simdgroup]]) {                                                 \
+    threadgroup float2 parts[GGUF_FLOAT_FEW_SPLITS * 32];                                                      \
+    gguf_float::project<W, T, 1, GGUF_FLOAT_FEW_SPLITS>(                                                       \
+        input, float_projection(p, tg.x, 8, weights0, output0, weights1, output1), p, tg.y, sg, lane, parts); \
+  }
+GGUF_FLOAT_FEW_KERNEL(gguf_float_few_bf16_bf16, bfloat, bfloat)
+#undef GGUF_FLOAT_FEW_KERNEL
 // A quantized format's rows into fp32 (the MoE router's scores), by its kQuantFormats token: gguf_float_<token>_f32.
 #define GGUF_FLOAT_NATIVE(f, F) GGUF_FLOAT_KERNEL(gguf_float_##f##_f32, Native<F>, float)
 GGUF_QUANTIZED_EMBEDDING_FORMATS(GGUF_FLOAT_NATIVE)
