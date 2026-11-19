@@ -7,6 +7,8 @@ import json
 import re
 import shutil
 import stat
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -1352,6 +1354,48 @@ class UpstreamTest(unittest.TestCase):
             output, _ = self.prepare(selection(self.root))
         self.assertIn("is already installed", output)
         self.assertEqual((fake.requests, fake.downloads), ([], []))
+
+    def test_an_offline_start_of_an_installed_model_imports_no_hub_client(self):
+        # As the launcher runs it for every start: the installer finds the
+        # model installed without httpx or the Hub's API, which only a
+        # request needs.
+        fake_hub(self, self.cache)
+        chosen = selection(self.root)
+        self.prepare(chosen)
+        script = (
+            "import json, runpy, sys\n"
+            "try:\n"
+            "    runpy.run_path('install/models.py', run_name='__main__')\n"
+            "except SystemExit as end:\n"
+            "    print(json.dumps({'code': end.code, 'modules': sorted(sys.modules)}))\n"
+        )
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                script,
+                "--models",
+                str(self.root / "models"),
+                "--model",
+                MODEL,
+                "--language-only",
+                "prepare",
+            ],
+            cwd=Path(upstream.__file__).resolve().parents[1],
+            env={
+                "HOME": str(self.root),
+                "HF_HUB_OFFLINE": "1",
+                "HF_HUB_CACHE": str(self.cache),
+            },
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        self.assertIn("is already installed", result.stdout, result.stderr)
+        ended = json.loads(result.stdout.splitlines()[-1])
+        self.assertEqual(ended["code"], 0, result.stderr)
+        self.assertNotIn("httpx", ended["modules"])
+        self.assertNotIn("huggingface_hub.hf_api", ended["modules"])
 
     def test_new_commit_rejected_before_download_keeps_the_installed_one(self):
         fake = fake_hub(self, self.cache)

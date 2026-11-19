@@ -500,8 +500,7 @@ class Repository:
         for the app. unreachable and unreachable_kind, from another repository
         this start, stand for the Hub's answer without a request. A different
         revision is never substituted."""
-        import httpx
-        from huggingface_hub import HfApi, constants
+        from huggingface_hub import constants
 
         if Path(name).is_absolute():
             return cls.local_directory(name)
@@ -517,6 +516,12 @@ class Repository:
         elif unreachable:
             why, kind = unreachable, unreachable_kind
         else:
+            # Only a request needs the client and the Hub's API: an offline
+            # or pinned start of an installed model imports neither (httpx
+            # alone took 67 ms of that start's 0.14 s).
+            import httpx
+            from huggingface_hub import HfApi
+
             try:
                 info = HfApi().model_info(
                     name, revision=revision, files_metadata=True, timeout=HUB_TIMEOUT
