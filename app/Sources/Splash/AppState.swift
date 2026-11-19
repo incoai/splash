@@ -114,7 +114,7 @@ final class AppState {
         modelFiles = Self.keptModelFiles(defaults)
         drawer = Drawer(shell: shell)
         chats = ChatStore(folder: folders.chats)
-        draft = Draft(files: chats.attachments) { [chats] in chats.selection }
+        draft = Draft(files: chats.attachments, kept: chats.drafts) { [chats] in chats.selection }
         server = Server(runtime: runtime, log: folders.logs.appending(path: "server.log"), defaults: defaults)
         installer = Installer(runtime: runtime, log: folders.logs.appending(path: "install.log"), defaults: defaults)
         catalog = Catalog(contentsOf: runtime.suggestedModels)
@@ -258,7 +258,10 @@ final class AppState {
                               message: "Splash can’t run from the disk image. Drag it to your Applications folder, then open it from there.")
             return
         }
-        chats.adoptFiles()
+        // The drafts of chats gone since, deleted by another copy of the app, go, unless a chat
+        // that can't be read, as one a newer app wrote, may be theirs; the others' attachments stay.
+        if chats.readAll { draft.forget(draft.chats.subtracting(chats.conversations.map(\.id))) }
+        chats.adoptFiles(keeping: draft.attachmentFiles)
         runtime.shellSettings.set(await shellSettings.value)
         // Which families the runtime serves, read beside the listing and the stops, and known before
         // the window shows the models, so that it lists from the first only those it offers.

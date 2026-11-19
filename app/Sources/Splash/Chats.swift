@@ -173,6 +173,9 @@ final class ChatStore {
     private let folder: URL
     /// Where the conversations' attachments are kept, a file each (`Attachment.file`).
     nonisolated let attachments: URL
+    /// Where the chats' unsent drafts are kept (`Draft`), a property list, which the conversations'
+    /// JSON files are not taken for.
+    nonisolated let drafts: URL
     private var replying: Task<Void, Never>?
     /// The requests for titles under way, by conversation (`title`).
     @ObservationIgnored private var titling: [UUID: Task<Void, Never>] = [:]
@@ -180,13 +183,14 @@ final class ChatStore {
     /// a conversation with images takes milliseconds to encode and write, which a send and a
     /// reply's end would otherwise wait for.
     private let files = DispatchQueue(label: "ChatStore.files", qos: .utility)
-    /// Whether every conversation's file could be read, so that `adoptFiles` knows each file a
-    /// conversation names.
-    @ObservationIgnored private var readAll = false
+    /// Whether every conversation's file could be read, so that `conversations` is every chat
+    /// kept, and `adoptFiles` knows each file a conversation names.
+    @ObservationIgnored private(set) var readAll = false
 
     init(folder: URL) {
         self.folder = folder
         attachments = folder.appending(path: "Attachments")
+        drafts = folder.appending(path: "Drafts.plist")
         let files = (try? FileManager.default.contentsOfDirectory(at: folder, includingPropertiesForKeys: nil)) ?? []
         let kept = files.filter { $0.pathExtension == "json" }
         let read = kept.compactMap { try? JSONDecoder().decode(Conversation.self, from: Data(contentsOf: $0)) }
@@ -195,19 +199,20 @@ final class ChatStore {
     }
 
     /// Brings the folder to how this app keeps it: the images an earlier app kept inside its
-    /// conversations go into files of their own; then the attachments no conversation names go,
-    /// as those of a draft the app quit with, unless a conversation that can't be read may name
-    /// them. In that order: the removal, off the main thread, would take the moved images for
-    /// strays. The app does it as it launches, before any draft (`AppState.launch`), once it is
-    /// the one Splash that runs, from where it can: a copy that gives way or one on the disk image
-    /// leaves the chats as the app that goes on running reads them.
-    func adoptFiles() {
+    /// conversations go into files of their own; then the attachments no conversation and no kept
+    /// draft (`drafted`, `Draft.attachmentFiles`) names go, as those of a draft being attached as
+    /// the app quit, unless a conversation that can't be read may name them. In that order: the
+    /// removal, off the main thread, would take the moved images for strays. The app does it as it
+    /// launches, before a draft attaches anything new (`AppState.launch`), once it is the one
+    /// Splash that runs, from where it can: a copy that gives way or one on the disk image leaves
+    /// the chats as the app that goes on running reads them.
+    func adoptFiles(keeping drafted: Set<String>) {
         for index in conversations.indices where conversations[index].messages.contains(where: { !$0.images.isEmpty }) {
             conversations[index] = Self.movingImages(of: conversations[index], to: attachments)
             write(conversations[index])
         }
         guard readAll else { return }
-        let named = Set(conversations.flatMap(\.attachmentFiles))
+        let named = Set(conversations.flatMap(\.attachmentFiles)).union(drafted)
         let attachments = attachments
         files.async {
             let stray = ((try? FileManager.default.contentsOfDirectory(at: attachments, includingPropertiesForKeys: nil)) ?? [])
@@ -374,10 +379,10 @@ final class ChatStore {
     }
 
     /// Stops the request under way as the app quits. A later message the server has yet to take
-    /// is its chat's first, as though the server had taken it: its chat shows it, and the
-    /// composer, which gave it up, goes with the app, as would the attachments no chat names
-    /// (`adoptFiles`). A new chat's first message, which the composer still holds, goes with the
-    /// composer, as any draft does, and an answer asked again leaves the earlier one.
+    /// is its chat's first, as though the server had taken it: its chat shows it, and its chat's
+    /// draft, which gave it up, keeps none of it. A new chat's first message, which the composer
+    /// still holds, is kept as the new chat's draft (`Draft.save`) and comes back with it, and an
+    /// answer asked again leaves the earlier one.
     func quit() {
         if pending?.ask == .later { keep() }
         stop()

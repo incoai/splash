@@ -180,9 +180,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         false
     }
 
-    /// The chats' files written before the app ends, a reply stopped as it quit among them, and
-    /// an API key typed into the Keychain.
+    /// The chats' files written before the app ends, a reply stopped as it quit among them, the
+    /// drafts, and an API key typed into the Keychain.
     func applicationWillTerminate(_ notification: Notification) {
+        state.draft.save()
         state.chats.flush()
         state.keepKey()
     }

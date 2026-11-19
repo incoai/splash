@@ -422,7 +422,7 @@ struct ChatContextFlowTests {
             state.chats.flush()
             let next = ChatStore(folder: fixture.root.appending(path: "chats"))
             #expect(next.conversations == [kept])
-            next.adoptFiles()
+            next.adoptFiles(keeping: [])
             next.flush()
             #expect(attachments.allSatisfy { FileManager.default.fileExists(atPath: next.attachments.appending(path: $0.file).path) })
             try fixture.release()

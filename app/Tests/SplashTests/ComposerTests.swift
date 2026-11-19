@@ -200,7 +200,7 @@ struct ComposerTests {
     @Test func imagesAttachAwayFromTheMainThreadInTheirOrder() async throws {
         let files = FileManager.default.temporaryDirectory.appending(path: "splash-draft-\(UUID().uuidString)")
         defer { try? FileManager.default.removeItem(at: files) }
-        let draft = Draft(files: files)
+        let draft = Draft(files: files, kept: files.appending(path: "Drafts.plist")) { nil }
         let photo = try #require(NSImage(data: Self.photo(width: 4032, height: 3024)))
         let picture = try #require(NSImage(data: Showcase.picture))
         draft.attach([photo])

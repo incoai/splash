@@ -145,7 +145,9 @@ model or with the context length on Auto. Its chat is its own, not the chat page
 own in that folder's `Attachments`, so a conversation outlives a switch of
 models. A message attaches images and PDFs, a PDF shown by its name and pages,
 where the model takes them, and is held back where the limits `/v1/models`
-gives leave them out. Each chat keeps its own draft, the new chat too; New Chat
+gives leave them out. Each chat keeps its own draft, the new chat too, kept in
+that folder's `Drafts.plist` a second after the typing pauses and as the app
+quits, so that the drafts come back as the app opens again; New Chat
 takes along a draft the open chat's context cannot hold, as the composer says to
 start a new chat for it, unless the new chat holds a draft of its own. A
 message is its chat's once the server takes it, which
