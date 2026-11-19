@@ -287,7 +287,9 @@ void testOneRulePerValue(const std::filesystem::path &fixtures) {
            {&SourceModel::draft, R"("num_attention_heads": 32)", R"("num_attention_heads": 16)",
             "draft config num_attention_heads mismatch: checkpoint 16, runtime 32"},
            {&SourceModel::draft, R"("selector_top_k": 16)", R"("selector_top_k": 8)",
-            "draft config dflash_config selector_top_k is below the 16 candidates the kernels keep"},
+            "draft config dflash_config selector_top_k mismatch"},
+           {&SourceModel::draft, R"("selector_top_k": 16)", R"("selector_top_k": 32)",
+            "draft config dflash_config selector_top_k mismatch"},
            {&SourceModel::draft, R"("selector_top_k": 16)",
             R"("selector_top_k": 16, "target_hidden_reduction": "stream_mean")",
             "draft config dflash_config target_hidden_reduction mismatch: checkpoint stream_mean, runtime none"},
@@ -1041,9 +1043,8 @@ void testFlint(const std::filesystem::path &fixtures) {
 // holds: the family serves its native window, and the two million tokens its
 // config claims are the config's, not the family's served one. A GGUF's
 // config is held to the sizes every family's holds and its metadata to the
-// family's keys; its draft's selector keeps more candidates than the kernels
-// do, which refuse it until they serve them, and the family names itself
-// without the draft.
+// family's keys; its selector matches the native 32-candidate geometry, and
+// the family names itself without the draft.
 void testRipple(const std::filesystem::path &fixtures) {
   const std::string config = text(fixtures / "ripple-65b" / "config.json");
   const std::string draft = text(fixtures / "ripple-65b" / "draft" / "config.json");
@@ -1064,9 +1065,8 @@ void testRipple(const std::filesystem::path &fixtures) {
   };
   require(check(config, rippleHeaders, std::nullopt) == "Ripple-65B",
           "Ripple's configuration was not found to be its family");
-  // The trained selector keeps more candidates than the kernels do, whose
-  // subset the proposal serves exactly; fewer than the kernels keep cannot
-  // select their list.
+  // The trained selector matches the compiled variant's complete candidate
+  // width; a different width is refused instead of serving a subset.
   const test::TemporaryDirectory rippleRoot("splash-ripple-model");
   test::writeFile(rippleRoot.path() / "model.json",
                   R"({"version":1,"model":"community/fine-tune","target_format":"gguf","vision_format":"none"})");
@@ -1084,15 +1084,16 @@ void testRipple(const std::filesystem::path &fixtures) {
               rippleDescriptor.draft.attentionShape(0).rotated &&
               rippleDescriptor.draft.attentionShape(4).window == 16384 &&
               !rippleDescriptor.draft.attentionShape(4).rotated &&
-              rippleDescriptor.draft.queryHeads == 80,
+              rippleDescriptor.draft.queryHeads == 80 &&
+              rippleDescriptor.draft.rows == 16 && rippleDescriptor.draft.candidates == 32,
           "a Ripple model made another descriptor");
-  for (const uint32_t topK : {8u, 15u}) {
+  for (const uint32_t topK : {8u, 15u, 16u, 31u, 33u, 64u}) {
     std::string truncated = draft;
     const std::string from = R"("selector_top_k": 32)";
     truncated.replace(truncated.find(from), from.size(),
                       R"("selector_top_k": )" + std::to_string(topK));
     rejects([&] { static_cast<void>(check(config, rippleHeaders, truncated)); },
-            "is below the 32 candidates the kernels keep",
+            "draft config dflash_config selector_top_k mismatch",
             "a Ripple draft of " + std::to_string(topK) + " candidates was accepted");
   }
   const SourceModel ripple =

@@ -104,7 +104,7 @@ struct DFlashDraftLayout final {
   uint32_t targetLayerCount = 0;
 
   [[nodiscard]] constexpr DraftStateLayout stateLayout() const noexcept {
-    return {layers, kvHeads, attentionHeadDimension, hiddenSize, window, rows, slidingWindow, fullAttentionLayers,
+    return {layers, kvHeads, attentionHeadDimension, hiddenSize, window, slidingWindow, fullAttentionLayers,
             unrotatedLayers};
   }
   [[nodiscard]] constexpr std::span<const uint32_t> targetLayerIds() const noexcept {

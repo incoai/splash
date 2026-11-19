@@ -202,7 +202,6 @@ static_assert(sizeof(GgufEmbedParams) == 16, "GGUF embedding parameters are 16 b
 // tables and in fp32 as the F32 values load-time widening writes
 // (kernels/shared/embedding.metal, gguf_embed_<kQuantFormats name> and
 // gguf_embed_f32_<name>): every format.
-inline constexpr bool gguf_embedding_format(uint32_t format) { return format < GGUF_FMT_COUNT; }
 
 // Prism ML's input rotation (kernels/shared/gguf_rotation.metal): weights
 // stored for rotated inputs multiply H (D x), H the normalized Walsh-Hadamard

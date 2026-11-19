@@ -674,10 +674,8 @@ DFlashDraftLayout readDraftLayout(NSDictionary *draft, const QwenTargetDimension
   // kernels run it (metal/abi/DraftAttention.h): the one its five numbers
   // are, and a config near one is refused by the first number that differs
   // from it, as the sizes are; one near none is refused with the variants
-  // this build serves. A config whose proposal is longer than its variant's
-  // rows, or that keeps more candidates, is served by the variant as a
-  // subset of its own until the variant of its proposal compiles; a shorter
-  // one the kernels refuse to run at all.
+  // this build serves. The block may be longer than the compiled rows, but
+  // its selector must match the compiled candidate width exactly.
   struct DraftGeometryKey final {
     const char *key;
     uint32_t SplashDraftVariant::*field;
@@ -732,11 +730,6 @@ DFlashDraftLayout readDraftLayout(NSDictionary *draft, const QwenTargetDimension
   if (blockSize < variant->rows)
     throw std::invalid_argument("draft config dflash_config block_size is less than the " +
                                 std::to_string(variant->rows) + " rows a cycle drafts");
-  const uint32_t selectorTopK =
-      requireWhole(flash[@"selector_top_k"], "draft config dflash_config selector_top_k");
-  if (selectorTopK < variant->candidates)
-    throw std::invalid_argument("draft config dflash_config selector_top_k is below the " +
-                                std::to_string(variant->candidates) + " candidates the kernels keep");
   requireNumbers(draft, "checkpoint", "draft config",
                  {{"hidden_size", target.hiddenSize},
                   {"vocab_size", target.vocabularySize},
@@ -755,6 +748,7 @@ DFlashDraftLayout readDraftLayout(NSDictionary *draft, const QwenTargetDimension
   requireNumbers(flash, "checkpoint", "draft config dflash_config",
                  {{"conv_group_size", SPLASH_DRAFT_CONVOLUTION_GROUP},
                   {"selector_rank", SPLASH_DRAFT_SELECTOR_RANK},
+                  {"selector_top_k", variant->candidates},
                   {"mask_token_id", target.maskToken}});
   // How a target layer's output row becomes the hidden values the draft reads
   // of it, as the draft was trained (target_hidden_reduction): a

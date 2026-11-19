@@ -106,9 +106,8 @@ private:
   std::unique_ptr<Impl> impl_;
 };
 
-  // A prefill arena's tensors as the target's prefill commands read them,
-  // for tests that assemble a prefill command directly (model/Runtime.cpp).
-  [[nodiscard]] QwenTargetPrefillBuffers prefillBuffers(const PrefillArena &arena,
-                                                        uint32_t chunk);
+// A prefill arena's tensors as the target's prefill commands read them,
+// for tests that assemble a prefill command directly (model/Runtime.cpp).
+[[nodiscard]] QwenTargetPrefillBuffers prefillBuffers(const PrefillArena &arena, uint32_t chunk);
 [[nodiscard]] QwenTargetPrefillBuffers decodeBuffers(const DecodeArena &arena);
 } // namespace splash::model
