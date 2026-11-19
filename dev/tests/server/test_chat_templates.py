@@ -689,6 +689,228 @@ class ChatTemplateFrontendTests(unittest.TestCase):
             app.tokenizer(history, add_special_tokens=False)["input_ids"],
         )
 
+    def test_an_agent_loop_extends_the_previous_prompt_and_reply_in_every_api(self):
+        """After a tool loop with thinking, the next request of each API,
+        whether it adds a tool result, a user message or a user message with
+        an image (how agent clients such as oh-my-pi send an image a tool
+        read), starts with the previous prompt and the reply the model wrote
+        in it, so the cache reads only what was added. The Qwen3.8 templates
+        keep earlier thinking unless preserve_thinking is false; were earlier
+        turns rendered without it, a new user message would change the prompt
+        from the first reply on and read it all again (#706)."""
+        parameters = {"type": "object", "properties": {"path": {"type": "string"}}}
+        image = fixtures.png_data_url()
+
+        def chat(events):
+            messages = [{"role": "system", "content": "You are an agent."}]
+            for kind, value in events:
+                if kind == "user":
+                    messages.append({"role": "user", "content": value})
+                elif kind == "image":
+                    messages.append(
+                        {
+                            "role": "user",
+                            "content": [
+                                {"type": "text", "text": "Attached image:"},
+                                {"type": "image_url", "image_url": {"url": image}},
+                            ],
+                        }
+                    )
+                elif kind == "call":
+                    messages.append(
+                        {
+                            "role": "assistant",
+                            "content": "",
+                            "reasoning_content": f"Read file {value}.",
+                            "tool_calls": [
+                                {
+                                    "id": f"call_{value}",
+                                    "type": "function",
+                                    "function": {
+                                        "name": "read",
+                                        "arguments": json.dumps(
+                                            {"path": f"{value}.py"}
+                                        ),
+                                    },
+                                }
+                            ],
+                        }
+                    )
+                else:
+                    messages.append(
+                        {
+                            "role": "tool",
+                            "tool_call_id": f"call_{value}",
+                            "content": f"line {value}",
+                        }
+                    )
+            tools = [
+                {
+                    "type": "function",
+                    "function": {"name": "read", "parameters": parameters},
+                }
+            ]
+            return {"messages": messages, "tools": tools}
+
+        def messages_api(events):
+            messages = []
+            for kind, value in events:
+                if kind == "call":
+                    messages.append(
+                        {
+                            "role": "assistant",
+                            "content": [
+                                {"type": "thinking", "thinking": f"Read file {value}."},
+                                {
+                                    "type": "tool_use",
+                                    "id": f"call_{value}",
+                                    "name": "read",
+                                    "input": {"path": f"{value}.py"},
+                                },
+                            ],
+                        }
+                    )
+                    continue
+                if kind == "user":
+                    block = {"type": "text", "text": value}
+                elif kind == "image":
+                    block = {
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": "image/png",
+                            "data": image.split(",", 1)[1],
+                        },
+                    }
+                else:
+                    block = {
+                        "type": "tool_result",
+                        "tool_use_id": f"call_{value}",
+                        "content": f"line {value}",
+                    }
+                if messages and messages[-1]["role"] == "user":
+                    messages[-1]["content"].append(block)
+                else:
+                    messages.append({"role": "user", "content": [block]})
+            body = {
+                "model": "test-model",
+                "system": "You are an agent.",
+                "messages": messages,
+                "tools": [{"name": "read", "input_schema": parameters}],
+                "thinking": {"type": "adaptive"},
+            }
+            return anthropic_dialect.to_chat_prompt(
+                body, thinking_resolver=lambda signature: signature
+            )
+
+        def responses_api(events):
+            items = []
+            for kind, value in events:
+                if kind == "user":
+                    items.append({"type": "message", "role": "user", "content": value})
+                elif kind == "image":
+                    items.append(
+                        {
+                            "type": "message",
+                            "role": "user",
+                            "content": [
+                                {"type": "input_text", "text": "Attached image:"},
+                                {"type": "input_image", "image_url": image},
+                            ],
+                        }
+                    )
+                elif kind == "call":
+                    items += [
+                        {
+                            "type": "reasoning",
+                            "summary": [],
+                            "content": [
+                                {
+                                    "type": "reasoning_text",
+                                    "text": f"Read file {value}.",
+                                }
+                            ],
+                        },
+                        {
+                            "type": "function_call",
+                            "call_id": f"call_{value}",
+                            "name": "read",
+                            "arguments": json.dumps({"path": f"{value}.py"}),
+                        },
+                    ]
+                else:
+                    items.append(
+                        {
+                            "type": "function_call_output",
+                            "call_id": f"call_{value}",
+                            "output": f"line {value}",
+                        }
+                    )
+            body = {
+                "instructions": "You are an agent.",
+                "tools": [
+                    {"type": "function", "name": "read", "parameters": parameters}
+                ],
+            }
+            return responses_dialect.to_chat_body(body, items)[0]
+
+        # A task, two turns of a read call and its result, then the reply
+        # that calls the third read: what the cache holds.
+        loop = [("user", "Fix the test"), ("call", 0), ("result", 0)]
+        loop += [("call", 1), ("result", 1)]
+        previous = [*loop, ("call", 2)]
+        added = {
+            "a tool result": [("result", 2)],
+            "a user message": [("result", 2), ("user", "Also the docs")],
+            "a user image": [("result", 2), ("image", None)],
+        }
+        for name in ("qwen38", "qwen38_gguf"):
+            app = fixtures.make_frontend(
+                chat_tokenizer(
+                    source(name), "<|im_start|>", "<|im_end|>", QWEN.image_pad
+                ),
+                None,
+                "test-model",
+                4096,
+                10,
+                2,
+                vision=True,
+            )
+
+            def tokens(body, *, reply=False):
+                job = app.prepare(
+                    {**body, "model": "test-model", "reasoning_effort": "medium"},
+                    deadline=fixtures.FOREVER,
+                )
+                # Ending in the reply, the conversation is what the cache
+                # holds: its prompt without a next generation prompt.
+                end = len(job.prompt_tokens) - job.generation_prompt_tokens
+                return job.prompt_tokens[:end] if reply else job.prompt_tokens
+
+            # The third reply as the model writes it after the prompt's <think>.
+            reply = app.tokenizer(
+                "Read file 2.\n</think>\n\n<tool_call>\n<function=read>\n"
+                "<parameter=path>\n2.py\n</parameter>\n</function>\n</tool_call>"
+                "<|im_end|>",
+                add_special_tokens=False,
+            )["input_ids"]
+            for api, body in (
+                ("chat", chat),
+                ("messages", messages_api),
+                ("responses", responses_api),
+            ):
+                cached = [*tokens(body(loop)), *reply]
+                with self.subTest(name=name, api=api):
+                    # The template follows the reply's <|im_end|> with a line
+                    # break the model did not write.
+                    rendered = tokens(body(previous), reply=True)
+                    self.assertEqual(rendered[: len(cached)], cached)
+                for label, events in added.items():
+                    with self.subTest(name=name, api=api, added=label):
+                        following = tokens(body(previous + events))
+                        self.assertGreater(len(following), len(cached))
+                        self.assertEqual(following[: len(cached)], cached)
+
     def test_generation_prompts_need_no_turn_marker(self):
         """Whatever a chat format's markers, the generation prompt is what its
         template appends. A template that appends nothing, or renders the
