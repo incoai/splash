@@ -380,9 +380,9 @@ final class AppState {
     }
 
     /// What quitting now would cut off: the requests the model answers, as its last status said
-    /// (`Server.Activity.running`), or the Chat's reply as it streams; a download, which starts
-    /// over next time; and the programs the drawer's terminals run. A model that idles, sleeps,
-    /// starts or switches is no loss: quitting stops it, as it always does.
+    /// (`Server.Activity.running`), or the Chat's reply as it streams; a download, which stops,
+    /// its finished files kept; and the programs the drawer's terminals run. A model that idles,
+    /// sleeps, starts or switches is no loss: quitting stops it, as it always does.
     struct QuitCost {
         var model: String?
         var requests = 0
