@@ -102,6 +102,10 @@ final class Server {
     private(set) var recovering = false
     /// Once ready: the tokens the model's context holds, as the option set it or Auto fitted it.
     private(set) var context: Int?
+    /// Once ready: why the SSD cache the options asked for is off, in the engine's words, as on a
+    /// disk with too little room beyond the space it keeps free (`disk.off_reason`); nil while it
+    /// is on, or set Off.
+    private(set) var cacheOff: String?
     /// Once ready: whether the model takes images and PDFs, which come together (`input_modalities`).
     private(set) var acceptsImages = false
     /// Once ready: what a request to it may carry, as `/v1/models` says.
@@ -260,6 +264,7 @@ final class Server {
         asleep = false
         recovering = false
         context = nil
+        cacheOff = nil
         activity = Activity()
         requests = []
         acceptsImages = false
@@ -460,6 +465,7 @@ final class Server {
         requests = ServedRequest.taking(report.live, taken: report.taken, into: requests)
         // A relaunched engine may serve less context than the first did.
         if let served = report.context { context = served }
+        cacheOff = report.cacheOff
     }
 
     /// What the server's status says: the work it has done, whether it has given the weights back
@@ -470,6 +476,8 @@ final class Server {
         var recovering = false
         /// The tokens of context the server serves now.
         var context: Int?
+        /// Why the SSD cache asked for is off.
+        var cacheOff: String?
         /// The requests the engine works on, as they were at `taken`.
         var live: [LiveRequest] = []
         /// When the engine's requests were as `live` has them, at the earliest: as the status was
@@ -498,6 +506,7 @@ final class Server {
             asleep: status.weights?.released ?? false,
             recovering: status.transport?.recovering ?? false,
             context: status.capabilities?.max_context_tokens,
+            cacheOff: status.disk?.off_reason,
             // A request without the engine's id has none: no line or later status could be told
             // from it.
             live: (status.active_requests ?? []).compactMap { request in
@@ -540,6 +549,7 @@ final class Server {
         }
         struct Cache: Decodable { let reused_tokens: Int? }
         struct Memory: Decodable { let current_bytes: Int64? }
+        struct Disk: Decodable { let off_reason: String? }
         let capabilities: Capabilities?
         let weights: Weights?
         let transport: Transport?
@@ -548,6 +558,7 @@ final class Server {
         let metrics: Metrics?
         let cache: Cache?
         let memory_actual: Memory?
+        let disk: Disk?
     }
 
     private struct ServedModel: Decodable {

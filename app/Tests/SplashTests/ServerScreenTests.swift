@@ -514,6 +514,71 @@ extension ServerScreenTests {
         #expect(shown == 0, "the caution showed in \(shown) of \(going.drawn.count) frames after it went")
     }
 
+    /// The SSD cache the options asked for, off for want of room on the disk, says why under SSD
+    /// Cache while the model runs, and the note goes as it stops. Only serve.log said it, while the
+    /// options went on showing Auto. The page is searched whole, drawn apart from the window, for
+    /// the note's sign; with SPLASH_APP_SNAPSHOTS set, the frames of the note going are kept, light
+    /// and dark, for the sweep.
+    @Test(arguments: [NSAppearance.Name.aqua, .darkAqua]) func theSSDCacheOffSaysWhyWhileTheModelRuns(_ appearance: NSAppearance.Name) async throws {
+        let fake = try FakeRuntime("splash-cache-off", launcher: "stepped_server")
+        defer { try? FileManager.default.removeItem(at: fake.root) }
+        let state = try await Self.launchedWithModels(fake, families: Self.realisticFamilies)
+        defer { state.quit() }
+        state.options["--port"] = String(fake.port)
+        state.selection = "mlx-community/Qwen3.8-27B-4bit"
+        state.start("mlx-community/Qwen3.8-27B-4bit")
+        for step in ["loaded", "warm"] { FileManager.default.createFile(atPath: fake.root.appending(path: step).path, contents: nil) }
+        try await waitFor(state.server.phase == .ready, "ready")
+        // The launch options, Advanced open.
+        let window = await Snapshot.window(GroupedPage(column: 640) { LaunchOptions(advanced: true) }.environment(state),
+                                           size: ServerPictures.size, appearance: appearance)
+        defer { window.orderOut(nil) }
+        pump(0.5)
+        let scroll = try #require(window.contentView?.pageScroll)
+        let document = try #require(scroll.documentView)
+        /// The top, in points from the document's top, of the first row of the whole page, drawn
+        /// apart from the window, that shows the warning sign's yellow; nil where none does.
+        func warning() throws -> CGFloat? {
+            let picture = try #require(document.bitmapImageRepForCachingDisplay(in: document.bounds))
+            document.cacheDisplay(in: document.bounds, to: picture)
+            let scale = CGFloat(picture.pixelsHigh) / document.bounds.height
+            let row = (0..<picture.pixelsHigh).first { y in
+                (0..<picture.pixelsWide).contains { x in
+                    guard let color = picture.colorAt(x: x, y: y)?.usingColorSpace(.sRGB) else { return false }
+                    let (r, g, b) = (color.redComponent * 255, color.greenComponent * 255, color.blueComponent * 255)
+                    return r > 180 && g > 130 && b < r - 100
+                }
+            }
+            return row.map { CGFloat($0) / scale }
+        }
+        let name = appearance == .aqua ? "light" : "dark"
+        func keep(_ step: String, _ change: (before: NSBitmapImageRep, drawn: [(at: Duration, picture: NSBitmapImageRep)], after: NSBitmapImageRep)) {
+            guard let directory = Snapshot.directory else { return }
+            try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            let frames = [("0-before", change.before)] + change.drawn.enumerated().map { ("1-\($0.offset)-\(Int($0.element.at / .milliseconds(1)))ms", $0.element.picture) }
+                + [("2-after", change.after)]
+            for (frame, picture) in frames {
+                try? picture.representation(using: .png, properties: [:])?.write(to: directory.appending(path: "cache-off-\(step)-\(frame)-\(name).png"))
+            }
+        }
+        let none = try warning()
+        #expect(none == nil, "a note showed with the cache on")
+        try "1.3 GiB available on /System/Volumes/Data is too little beyond the 10.0 GiB it keeps free"
+            .write(to: fake.root.appending(path: "cache-off"), atomically: true, encoding: .utf8)
+        // The next status the app asks for, within 2 s, says it.
+        try await waitFor(state.server.cacheOff != nil, "the status's off_reason")
+        pump(0.5)
+        let note = try #require(try warning(), "the cache off said nothing")
+        // The note in the window's middle, for the pictures of its going as the model stops.
+        scroll.scroll(by: note - 250 - scroll.contentView.bounds.minY)
+        pump(0.3)
+        let stop = try await Self.pictures(of: window) { state.stop() }
+        keep("stop", stop)
+        #expect(Self.showsWarning(stop.before, of: window), "the note was not in the window")
+        let left = try warning()
+        #expect(!Self.showsWarning(stop.after, of: window) && left == nil, "the note stayed after the model stopped")
+    }
+
     /// Restore Defaults coming and going moves nothing on the page: the launch options' header
     /// keeps its height. The button is taller than the header's title, and the card under it moved
     /// as it came and went.

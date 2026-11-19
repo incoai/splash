@@ -32,6 +32,11 @@ struct LaunchOptions: View {
                             .padding(.vertical, 6)
                             .background(.quaternary.opacity(0.6), in: .rect(cornerRadius: 6))
                         ForEach(options) { OptionRow(option: $0, family: family) }
+                        // The server running says when the cache its options asked for is off:
+                        // the options show what they ask for, whatever the server made of it.
+                        if section == .cache, state.server.phase == .ready, let off = state.server.cacheOff {
+                            CacheOffNote(reason: off)
+                        }
                     }
                 }
             }
@@ -75,6 +80,21 @@ extension EnvironmentValues {
     /// What the launch option of the row the view is in lacks to apply, while it doesn't
     /// (`LaunchOption.lacks`).
     @Entry var optionRowNeeds: String?
+}
+
+/// Why the server running has the SSD cache off though its options asked for one, in the
+/// engine's words, as on a disk with too little room beyond the space it keeps free.
+private struct CacheOffNote: View {
+    let reason: String
+
+    var body: some View {
+        Label("The model running has the SSD cache off: \(reason).", systemImage: "exclamationmark.triangle.fill")
+            .font(.callout)
+            .foregroundStyle(.secondary)
+            .symbolRenderingMode(.multicolor)
+            .fixedSize(horizontal: false, vertical: true)
+            .frame(maxWidth: .infinity, alignment: .leading)
+    }
 }
 
 /// An option's name, with an info button that shows what it does, and what it needs while it is

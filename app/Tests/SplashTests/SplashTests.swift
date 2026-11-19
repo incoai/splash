@@ -700,6 +700,10 @@ struct ServerTests {
         // While the server starts a failed engine again.
         #expect(Server.report(Data(#"{"transport": {"ready": false, "recovering": true, "stopped": false}}"#.utf8))?.recovering == true)
         #expect(Server.report(Data("not json".utf8)) == nil)
+        // An SSD cache asked for that the disk left off says why; the golden's is on.
+        #expect(report.cacheOff == nil)
+        let off = Server.report(Data(#"{"disk": {"capacity_bytes": 0, "off_reason": "1.3 GiB available on /System/Volumes/Data is too little beyond the 10.0 GiB it keeps free"}}"#.utf8))
+        #expect(off?.cacheOff == "1.3 GiB available on /System/Volumes/Data is too little beyond the 10.0 GiB it keeps free")
     }
 
     /// What a running request does, as the engine's phase gives it, and when it came; one without
