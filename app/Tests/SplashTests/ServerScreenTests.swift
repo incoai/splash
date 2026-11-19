@@ -386,8 +386,12 @@ extension ServerScreenTests {
 extension ServerScreenTests {
     /// The page of `window` drawn through `change`: as drawn before it, ten times after it, each
     /// after `every` seconds of the run loop (30 ms: 0.3 s in all), with how long after, and once it
-    /// has stopped changing, which a slow Mac reaches long after the animations' length.
-    static func pictures(of window: NSWindow, every interval: TimeInterval = 0.03, through change: () -> Void) async throws
+    /// has stopped changing, which a slow Mac reaches long after the animations' length: the whole
+    /// picture, or what `same` compares of two, where the rest of the window never stops changing.
+    /// Each wait for it holds the main thread, at most 10 s.
+    static func pictures(of window: NSWindow, every interval: TimeInterval = 0.03,
+                         same: ((NSBitmapImageRep, NSBitmapImageRep) -> Bool)? = nil,
+                         through change: () -> Void) async throws
         -> (before: NSBitmapImageRep, drawn: [(at: Duration, picture: NSBitmapImageRep)], after: NSBitmapImageRep) {
         let before = try #require(await Snapshot.picture(of: window))
         let start = ContinuousClock.now
@@ -401,8 +405,10 @@ extension ServerScreenTests {
         for _ in 0..<40 {
             pump(0.25)
             let next = try #require(await Snapshot.picture(of: window))
-            if next.bitmapData.map({ Data(bytes: $0, count: next.bytesPerRow * next.pixelsHigh) })
-                == after.bitmapData.map({ Data(bytes: $0, count: after.bytesPerRow * after.pixelsHigh) }) { break }
+            func bytes(_ picture: NSBitmapImageRep) -> Data? {
+                picture.bitmapData.map { Data(bytes: $0, count: picture.bytesPerRow * picture.pixelsHigh) }
+            }
+            if same?(next, after) ?? (bytes(next) == bytes(after)) { break }
             after = next
         }
         return (before, drawn, after)
@@ -463,7 +469,11 @@ extension ServerScreenTests {
         state.options["--port"] = String(fake.port)
         let window = await Self.serverWindow(state, picked: qwen)
         defer { window.orderOut(nil) }
-        let start = try await Self.pictures(of: window) { state.start(qwen) }
+        // Still once the page shows Starting…: the control bar under it goes on moving while the
+        // server starts.
+        let start = try await Self.pictures(of: window, same: { Self.page($0, of: window) == Self.page($1, of: window) }) {
+            state.start(qwen)
+        }
         let before = Self.page(start.before, of: window), after = Self.page(start.after, of: window)
         #expect(state.server.phase == .starting && before != after)
         let between = start.drawn.filter { Self.page($0.picture, of: window) != before && Self.page($0.picture, of: window) != after }.count

@@ -60,9 +60,13 @@ release-app: install-environment all
 	@test -z "$(filter-out 0 1,$(DRY_RUN))" || { echo "set DRY_RUN to 1 for a dry run, or leave it out"; exit 1; }
 	$(PYTHON) dev/tools/release_app.py $(RELEASE_ARGS)
 
-# The app's own tests; the Python ones cover what packages it.
+# The app's own tests, one at a time; the Python ones cover what packages it.
+# A test that pumps the main thread holds every other main-actor test, and the
+# app's own tasks such as following a server's start, until it returns, so beside
+# it they miss their clocks: run in parallel, a different test failed from run
+# to run (M6, 2 of 4 runs).
 check-app:
-	swift test --package-path app
+	swift test --package-path app --no-parallel
 
 # Uploads the built RELEASE_VERSION archive, its checksum, the tester installer
 # and the `latest` pointer to the private Hugging Face repo testers install

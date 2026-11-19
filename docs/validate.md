@@ -8,7 +8,9 @@ make install test-real test-http-real MODEL=mlx-community/Qwen3.8-27B-4bit
 `make check` needs no model weights, but it runs the Metal tests, so it needs a
 Mac that Splash supports: it runs the source checks, `check-native-cpu`,
 `check-native-metal`, `check-native-build`, the Python checks and `check-app`,
-the desktop app's tests (`swift test --package-path app`). `make
+the desktop app's tests (`swift test --package-path app --no-parallel`), one
+at a time, as a test that pumps the main thread holds every other main-actor
+test and the app's own tasks until it returns. `make
 check-native-cpu` builds production and runs native CPU tests without a GPU;
 `make check-native-metal` requires a supported Metal device and runs the kernel
 tests under shader validation, and the Linear pipeline resource check without

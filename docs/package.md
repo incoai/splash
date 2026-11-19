@@ -176,8 +176,8 @@ a terminal runs; one from a script, the system as it logs out, a signal or an
 update quits at once. Its icon is `app/AppIcon.icon`, an Icon Composer document
 `actool` compiles, which needs the full Xcode; its mark, three arcs of water
 springing from a rippled surface, is the menu bar's too (`SplashMark`), and the
-chat page's (`server/favicon.svg`). `swift test --package-path app` runs its
-tests; with `SPLASH_RUNTIME` naming a packaged runtime and `SPLASH_APP_MODELS`
+chat page's (`server/favicon.svg`). `make check-app` runs its tests, one at a
+time; with `SPLASH_RUNTIME` naming a packaged runtime and `SPLASH_APP_MODELS`
 installed models, they also drive the app end to end and, with
 `SPLASH_APP_SNAPSHOTS`, render its windows to that folder.
 
