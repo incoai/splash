@@ -166,14 +166,17 @@ void requireNumbers(NSDictionary *object, std::string_view source, std::string_v
                   std::string(where) + " " + field.key);
 }
 
-// The JSON booleans, never numbers, object holds at the keys.
+// Whether a JSON value is a boolean, never a number.
+bool isBoolean(id value) {
+  return [value isKindOfClass:[NSNumber class]] && CFGetTypeID((__bridge CFTypeRef)value) == CFBooleanGetTypeID();
+}
+
+// The JSON booleans object holds at the keys.
 void requireBooleans(NSDictionary *object, std::string_view where,
                      std::initializer_list<std::pair<const char *, bool>> fields) {
   for (const auto &[key, expected] : fields) {
     id value = object[@(key)];
-    if (![value isKindOfClass:[NSNumber class]] ||
-        CFGetTypeID((__bridge CFTypeRef)value) != CFBooleanGetTypeID() ||
-        [value boolValue] != expected)
+    if (!isBoolean(value) || [value boolValue] != expected)
       throw std::invalid_argument(std::string(where) + " " + key + " must be " +
                                   (expected ? "true" : "false"));
   }
@@ -288,7 +291,7 @@ void validateTextConfig(NSDictionary *text, const QwenHybridLayout &target, Targ
   requireBooleans(text, "text config",
                   {{"attention_bias", false},
                    {"attn_output_gate", true},
-                   {"tie_word_embeddings", false}});
+                   {"tie_word_embeddings", target.tiedEmbeddings}});
   requireEqual(requireString(text, @"hidden_act", "text config hidden_act"),
                "silu", name, "text config hidden_act");
   requireLayerTypes(requireArray(text, @"layer_types", "text config layer_types"),
@@ -655,30 +658,63 @@ void requireQuantization(NSDictionary *config, const QwenTargetDimensions &geome
                               "GGUF");
 }
 
-// A DFlash2 checkpoint's config: the draft's layout. Its attention widths,
-// window, convolutions and selector must be those the draft kernels are built
-// for, and its block at least their rows; its hidden size, vocabulary and
-// mask token the target's; and the target layers it reads (target_layer_ids)
-// some of the target's, ascending. Its layers, intermediate size and rotary
-// base are its own.
+// The causal layers (DFlashDraftLayout::causalLayers) of a DFlash draft of
+// `layers` (1 to 64) layers, as z-lab's reference reads its config: every
+// layer or none by is_causal where it states it, else its sliding layers
+// (layer_types).
+uint64_t draftCausalLayers(NSDictionary *draft, uint32_t layers) {
+  if (id causal = draft[@"is_causal"]) {
+    if (!isBoolean(causal)) throw std::invalid_argument("draft config is_causal must be true or false");
+    return [causal boolValue] ? ~uint64_t{0} >> (64 - layers) : 0;
+  }
+  if (!draft[@"layer_types"]) return 0;
+  NSArray *types = requireArray(draft, @"layer_types", "draft config layer_types");
+  if (types.count != layers)
+    throw std::invalid_argument("draft config layer_types does not name each of its " + std::to_string(layers) +
+                                " layers");
+  uint64_t causal = 0;
+  for (NSUInteger layer = 0; layer < layers; ++layer) {
+    const std::string type = requireText(types[layer], "draft config layer_types " + std::to_string(layer));
+    if (type != "sliding_attention" && type != "full_attention")
+      throw std::invalid_argument("draft config layer_types " + std::to_string(layer) +
+                                  " is neither sliding_attention nor full_attention");
+    if (type == "sliding_attention") causal |= uint64_t{1} << layer;
+  }
+  return causal;
+}
+
+// A DFlash2 or DFlash checkpoint's config: the draft's layout. Its attention
+// widths, window, convolutions and selector must be those the draft kernels
+// are built for, and its block at least their rows; its hidden size,
+// vocabulary and mask token the target's; and the target layers it reads
+// (target_layer_ids) some of the target's, ascending. Its layers,
+// intermediate size and rotary base are its own. A DFlash draft
+// (DFlashDraftLayout::mixesRows) ties its embeddings to the target's, and
+// its window may exceed the rings': the draft attends their last
+// draftContextTokens keys, which past them can lower acceptance but never
+// changes the target's tokens.
 DFlashDraftLayout readDraftLayout(NSDictionary *draft, const QwenTargetDimensions &target) {
   NSArray *architectures =
       requireArray(draft, @"architectures", "draft architectures");
-  if (architectures.count != 1 ||
-      ![architectures[0] isEqual:@"DFlash2DraftModel"])
-    throw std::invalid_argument("draft is not a DFlash2 model");
+  const bool dflash2 = architectures.count == 1 && [architectures[0] isEqual:@"DFlash2DraftModel"];
+  if (!dflash2 && !(architectures.count == 1 && [architectures[0] isEqual:@"DFlashDraftModel"]))
+    throw std::invalid_argument("draft is not a DFlash2 or DFlash model");
   requireNumbers(draft, "checkpoint", "draft config",
                  {{"hidden_size", target.hiddenSize},
                   {"vocab_size", target.vocabularySize},
                   {"num_attention_heads", SPLASH_DRAFT_QUERY_HEADS},
                   {"num_key_value_heads", SPLASH_DRAFT_KV_HEADS},
                   {"head_dim", SPLASH_DRAFT_HEAD_DIMENSION},
-                  {"sliding_window", ExecutionLimits::draftContextTokens},
                   {"rms_norm_eps", SPLASH_RMS_EPSILON}});
-  requireBooleans(draft, "draft config",
-                  {{"is_causal", false},
-                   {"attention_bias", false},
-                   {"tie_word_embeddings", false}});
+  requireBooleans(draft, "draft config", {{"attention_bias", false}, {"tie_word_embeddings", !dflash2}});
+  if (dflash2) {
+    requireNumbers(draft, "checkpoint", "draft config", {{"sliding_window", ExecutionLimits::draftContextTokens}});
+    requireBooleans(draft, "draft config", {{"is_causal", false}});
+  } else if (requireWhole(draft[@"sliding_window"], "draft config sliding_window") <
+             ExecutionLimits::draftContextTokens) {
+    throw std::invalid_argument("draft config sliding_window is less than the " +
+                                std::to_string(ExecutionLimits::draftContextTokens) + " keys the draft attends");
+  }
   requireEqual(requireString(draft, @"hidden_act", "draft config hidden_act"),
                "silu", "checkpoint", "draft config hidden_act");
   NSDictionary *rope =
@@ -688,12 +724,13 @@ DFlashDraftLayout readDraftLayout(NSDictionary *draft, const QwenTargetDimension
                "default", "checkpoint", "draft config rope_parameters rope_type");
   NSDictionary *flash =
       requireObject(draft, @"dflash_config", "draft config dflash_config");
-  requireNumbers(flash, "checkpoint", "draft config dflash_config",
-                 {{"conv_group_size", SPLASH_DRAFT_CONVOLUTION_GROUP},
-                  {"conv_kernel_size", SPLASH_DRAFT_CONVOLUTION_TAPS},
-                  {"selector_rank", SPLASH_DRAFT_SELECTOR_RANK},
-                  {"selector_top_k", SPLASH_DRAFT_CANDIDATES},
-                  {"mask_token_id", target.maskToken}});
+  requireNumbers(flash, "checkpoint", "draft config dflash_config", {{"mask_token_id", target.maskToken}});
+  if (dflash2)
+    requireNumbers(flash, "checkpoint", "draft config dflash_config",
+                   {{"conv_group_size", SPLASH_DRAFT_CONVOLUTION_GROUP},
+                    {"conv_kernel_size", SPLASH_DRAFT_CONVOLUTION_TAPS},
+                    {"selector_rank", SPLASH_DRAFT_SELECTOR_RANK},
+                    {"selector_top_k", SPLASH_DRAFT_CANDIDATES}});
   // The block it was trained to fill: the kernels' rows or more, of which a
   // cycle drafts the first (Ornith-1.5-122B's fills 16). Its weights have no
   // part of the block's length.
@@ -718,12 +755,13 @@ DFlashDraftLayout readDraftLayout(NSDictionary *draft, const QwenTargetDimension
     if (targetLayers.back() >= target.layers)
       throw std::invalid_argument("draft config target_layer_ids names a layer past the target's");
   }
-  const DFlashDraftLayout layout =
+  DFlashDraftLayout layout =
       draftLayout(target.hiddenSize, target.vocabularySize,
                   requireWhole(draft[@"num_hidden_layers"], "draft config num_hidden_layers"),
                   requireWhole(draft[@"intermediate_size"], "draft config intermediate_size"),
                   requireNumber(rope[@"rope_theta"], "draft config rope_parameters rope_theta").floatValue,
-                  targetLayers);
+                  targetLayers, dflash2);
+  if (!dflash2) layout.causalLayers = draftCausalLayers(draft, layout.layers);
   return layout;
 }
 

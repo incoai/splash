@@ -70,6 +70,11 @@ class ModelFamily:
 
 FAMILIES = (
     ModelFamily("Qwen3.8-27B", "incoai/Qwen3.8-27B-DFlash2", QWEN, QWEN_SAMPLING),
+    # Its draft is z-lab's DFlash, and its vision tower is not the one the
+    # vision kernels are built for (ops::VisionLayout), so it serves text.
+    ModelFamily(
+        "Qwen3.5-4B", "z-lab/Qwen3.5-4B-DFlash", QWEN, QWEN_SAMPLING, vision=False
+    ),
     ModelFamily(
         "Qwen3.6-35B-A3B", "incoai/Qwen3.6-35B-A3B-DFlash2", QWEN, QWEN_SAMPLING
     ),

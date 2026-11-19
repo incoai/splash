@@ -16,6 +16,13 @@ ROOT = Path(__file__).resolve().parents[3]
 # engine's facts of its layout and the family's release give them.
 UNUSABLE = {
     "Qwen3.8-27B": {"--expert-memory", "--ple-memory", "--sparse-kv-memory"},
+    "Qwen3.5-4B": {
+        "--language-only",
+        "--max-image-pixels",
+        "--expert-memory",
+        "--ple-memory",
+        "--sparse-kv-memory",
+    },
     "Qwen3.6-35B-A3B": {"--ple-memory", "--sparse-kv-memory", "--disable-ane"},
     "Qwen3.5-122B-A10B": {"--ple-memory", "--sparse-kv-memory", "--disable-ane"},
     "Qwen3.8-Flash-Next": {"--disable-ane"},

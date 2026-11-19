@@ -80,6 +80,8 @@ ATTENTION_QKV_FORMATS(_kv2_g8_f32, 16, 2, 256, 32, true, float, false)
 ATTENTION_QKV_FORMATS(_kv2_g12_f32, 24, 2, 256, 32, true, float, true)
 ATTENTION_QKV_FORMATS(_kv2_g16, 32, 2, 256, 32, true, bfloat, false)
 ATTENTION_QKV_FORMATS(_kv2_g16_f32, 32, 2, 256, 32, true, float, false)
+ATTENTION_QKV_FORMATS(_kv4_g4, 16, 4, 256, 32, true, bfloat, false)
+ATTENTION_QKV_FORMATS(_kv4_g4_f32, 16, 4, 256, 32, true, float, false)
 // Four KV heads of 128 dimensions without an output gate, their whole heads
 // rotated (64 pairs) or unrotated.
 ATTENTION_QKV_FORMATS(_kv4_g8_d128_f32, 32, 4, 128, 64, false, float, false)

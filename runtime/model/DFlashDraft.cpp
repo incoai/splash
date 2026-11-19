@@ -52,18 +52,21 @@ ops::Projection subsetRows(const metal::MetalBackend &backend, const ops::Projec
 } // namespace
 
 DFlashDraftLayout draftLayout(uint32_t hiddenSize, uint32_t vocabularySize, uint32_t layers,
-                              uint32_t intermediateSize, float rotaryTheta, std::span<const uint32_t> targetLayers) {
+                              uint32_t intermediateSize, float rotaryTheta, std::span<const uint32_t> targetLayers,
+                              bool mixesRows) {
   constexpr uint32_t most = ExecutionLimits::maximumDraftTargetLayers;
   if (targetLayers.empty() || targetLayers.size() > most ||
       std::ranges::adjacent_find(targetLayers, std::ranges::greater_equal{}) != targetLayers.end())
     throw std::invalid_argument("a DFlash2 draft reads 1 to " + std::to_string(most) +
                                 " target layers, ascending");
-  if (!layers) throw std::invalid_argument("a DFlash2 draft has at least one layer");
+  // A layer is a bit of causalLayers.
+  if (!layers || layers > 64) throw std::invalid_argument("a DFlash2 draft has 1 to 64 layers");
   // Its projections quantize in groups of 64 columns (DraftCheckpoint.cpp).
   if (!intermediateSize || intermediateSize % 64)
     throw std::invalid_argument("a DFlash2 draft's intermediate size is a positive multiple of 64");
   if (!(rotaryTheta > 0)) throw std::invalid_argument("a DFlash2 draft's rotary theta is positive");
-  DFlashDraftLayout layout{.layers = layers,
+  DFlashDraftLayout layout{.mixesRows = mixesRows,
+                           .layers = layers,
                            .hiddenSize = hiddenSize,
                            .vocabularySize = vocabularySize,
                            .dynamicSize = draft_dynamic_width(hiddenSize),
@@ -173,8 +176,8 @@ const ops::Projection &DFlashDraft::head(ops::DraftVocabulary vocabulary) const 
 
 void DFlashDraft::addSelection(metal::CommandGraph &graph, const ops::DraftSelectorBuffers &buffers,
                                const DFlashDraftStep &step) const {
-  selector_.add(graph, buffers, {weights_.predecessorCodebook, weights_.successorCodebook}, step.vocabulary,
-                step.lanes);
+  const ops::DraftCodebooks codebooks{weights_.predecessorCodebook, weights_.successorCodebook};
+  selector_.add(graph, buffers, weights_.layout.mixesRows ? &codebooks : nullptr, step.vocabulary, step.lanes);
 }
 
 void DFlashDraft::addContextPrefill(
@@ -258,13 +261,17 @@ uint32_t DFlashDraft::decodeStorageLanes(uint32_t lanes) const {
   const auto include = [&](const ops::Projection &p) {
     storageRows = std::max(storageRows, linear.storageRows(rows, p.shape()));
   };
-  for (const DFlashDraftLayerWeights &layer : weights_.layers)
-    for (const ops::Projection *p : {&layer.attentionDynamic, &layer.qkvProjection, &layer.outputProjection,
-                                     &layer.mlpDynamic, &layer.gateProjection, &layer.upProjection,
-                                     &layer.downProjection})
+  for (const DFlashDraftLayerWeights &layer : weights_.layers) {
+    for (const ops::Projection *p : {&layer.qkvProjection, &layer.outputProjection, &layer.gateProjection,
+                                     &layer.upProjection, &layer.downProjection})
       include(*p);
+    if (weights_.layout.mixesRows) {
+      include(layer.attentionDynamic);
+      include(layer.mlpDynamic);
+    }
+  }
   include(weights_.contextProjection);
-  include(weights_.selectorProjection);
+  if (weights_.layout.mixesRows) include(weights_.selectorProjection);
   for (const ops::Projection &p : contextKvProjections_) include(p);
   // Its view of the head's rows, on the target's plans as the head (addDecode).
   storageRows = std::max(storageRows, operators_.linear().storageRows(rows, subsetHead_.shape()));
@@ -291,6 +298,10 @@ void DFlashDraft::addDecode(metal::CommandGraph &graph, DFlashDecodeBuffers buff
     const uint32_t current = layer & 1;
     const uint32_t next = current ^ 1;
     const DFlashDraftLayerWeights &weights = weights_.layers[layer];
+    if (!layout.mixesRows) {
+      addResidualLayer(graph, buffers, weights, attentionPlan, cacheLengths, layer);
+      continue;
+    }
     const ops::LinearPlan attentionDynamicPlan = linear.plan(weights.attentionDynamic, rows);
     const ops::PreparedInput attentionNormalized = ops::Normalization::addRms(
         graph, buffers.hidden[current], weights.inputNorm, buffers.normalized,
@@ -367,10 +378,55 @@ void DFlashDraft::addDecode(metal::CommandGraph &graph, DFlashDecodeBuffers buff
   const ops::PreparedInput afterHead = target.add(
       graph, {.input = buffers.finalHidden, .output = buffers.logits, .scratch = scratch, .prepared = finalHidden},
       vocabularyProjection, headPlan);
+  if (!layout.mixesRows) return;
   linear.add(graph,
              {.input = buffers.finalHidden, .output = buffers.selectorHidden, .scratch = scratch,
               .prepared = afterHead},
              weights_.selectorProjection, linear.plan(weights_.selectorProjection, rows));
+}
+
+// A DFlash layer: its attention's and its FFN's output each added to the
+// residual by their last projection.
+void DFlashDraft::addResidualLayer(metal::CommandGraph &graph, const DFlashDecodeBuffers &buffers,
+                                   const DFlashDraftLayerWeights &weights, const ops::DraftAttentionPlan &attentionPlan,
+                                   std::span<const uint32_t> cacheLengths, uint32_t layer) const {
+  const DFlashDraftLayout &layout = weights_.layout;
+  const uint32_t lanes = static_cast<uint32_t>(cacheLengths.size());
+  const uint32_t rows = lanes * ExecutionLimits::draftQueryRows;
+  const ops::Linear &linear = operators_.draftLinear();
+  const ops::LinearScratch &scratch = buffers.linearScratch;
+  const metal::MetalBuffer &hidden = buffers.hidden[layer & 1];
+  const ops::LinearPlan qkvPlan = linear.plan(weights.qkvProjection, rows);
+  const ops::PreparedInput attentionNormalized = ops::Normalization::addRms(
+      graph, hidden, weights.inputNorm, buffers.normalized, layout.hiddenSize, rows, scratch, qkvPlan.input());
+  linear.add(graph,
+             {.input = buffers.normalized, .output = buffers.proposalQkv, .scratch = scratch,
+              .prepared = attentionNormalized},
+             weights.qkvProjection, qkvPlan);
+  ops::DraftAttention::addPrepare(graph,
+                                  {buffers.proposalQkv, buffers.attention, weights.queryNorm, weights.keyNorm,
+                                   buffers.ropeCos, buffers.ropeSin, buffers.queryKeys, buffers.queryValues},
+                                  attentionPlan);
+  ops::DraftAttention::addDecode(graph,
+                                 {buffers.attention, buffers.persistentKeys[layer], buffers.persistentValues[layer],
+                                  buffers.queryKeys, buffers.queryValues},
+                                 cacheLengths, attentionPlan, layout.causal(layer));
+  linear.add(graph,
+             {.input = buffers.attention, .output = buffers.residual, .residual = hidden, .scratch = scratch},
+             weights.outputProjection, linear.plan(weights.outputProjection, rows, ops::LinearEpilogue::Residual));
+  const ops::LinearPlan gateUpPlan =
+      linear.plan(weights.upProjection, rows, ops::LinearEpilogue::GateUp, &weights.gateProjection);
+  const ops::PreparedInput mlpNormalized =
+      ops::Normalization::addRms(graph, buffers.residual, weights.postAttentionNorm, buffers.normalized,
+                                 layout.hiddenSize, rows, scratch, gateUpPlan.input());
+  linear.add(graph,
+             {.input = buffers.normalized, .output = buffers.intermediate, .gateScratch = buffers.gateScratch,
+              .scratch = scratch, .prepared = mlpNormalized},
+             weights.upProjection, gateUpPlan, &weights.gateProjection);
+  linear.add(graph,
+             {.input = buffers.intermediate, .output = buffers.hidden[(layer & 1) ^ 1], .residual = buffers.residual,
+              .scratch = scratch},
+             weights.downProjection, linear.plan(weights.downProjection, rows, ops::LinearEpilogue::Residual));
 }
 
 void DFlashDraft::addMaskRows(metal::CommandGraph &graph, metal::MetalBuffer rows, uint32_t lanes) const {
@@ -448,11 +504,10 @@ DFlashDraftWeights loadDFlashDraftWeights(metal::MetalBackend &backend,
     WeightFile file = files.layer(layerIndex);
     DFlashDraftLayerWeights layer;
     layer.inputNorm = readNorm(file, layout.hiddenSize, false, "input-norm");
-    layer.attentionConvolution =
-        file.section(convolutionBytes, "attention-convolution");
-    layer.attentionDynamic = readBlockProjection(
-        file, layout.dynamicSize, layout.hiddenSize,
-        "attention-dynamic");
+    if (layout.mixesRows) {
+      layer.attentionConvolution = file.section(convolutionBytes, "attention-convolution");
+      layer.attentionDynamic = readBlockProjection(file, layout.dynamicSize, layout.hiddenSize, "attention-dynamic");
+    }
     layer.qkvProjection = readBlockProjection(
         file, layout.qkvSize, layout.hiddenSize, "qkv");
     layer.queryNorm = file.section(headNormBytes, "query-norm");
@@ -462,9 +517,10 @@ DFlashDraftWeights loadDFlashDraftWeights(metal::MetalBackend &backend,
         "attention-output");
     layer.postAttentionNorm =
         readNorm(file, layout.hiddenSize, false, "post-attention-norm");
-    layer.mlpConvolution = file.section(convolutionBytes, "mlp-convolution");
-    layer.mlpDynamic = readBlockProjection(
-        file, layout.dynamicSize, layout.hiddenSize, "mlp-dynamic");
+    if (layout.mixesRows) {
+      layer.mlpConvolution = file.section(convolutionBytes, "mlp-convolution");
+      layer.mlpDynamic = readBlockProjection(file, layout.dynamicSize, layout.hiddenSize, "mlp-dynamic");
+    }
     layer.gateProjection = readBlockProjection(
         file, layout.intermediateSize, layout.hiddenSize, "mlp-gate");
     layer.upProjection = readBlockProjection(
@@ -483,17 +539,14 @@ DFlashDraftWeights loadDFlashDraftWeights(metal::MetalBackend &backend,
         "context-projection");
     result.hiddenNorm = readNorm(file, layout.hiddenSize, false, "hidden-norm");
     result.finalNorm = readNorm(file, layout.hiddenSize, false, "final-norm");
-    result.selectorProjection = readBlockProjection(
-        file, layout.selectorRank, layout.hiddenSize, "selector");
-    const uint64_t codebookBytes = checkedMultiply<WeightStoreError>(
-        checkedMultiply<WeightStoreError>(layout.vocabularySize,
-                                          layout.selectorRank,
-                                          "draft codebook elements"),
-        kBFloat16Bytes, "draft codebook bytes");
-    result.predecessorCodebook =
-        file.section(codebookBytes, "predecessor-codebook");
-    result.successorCodebook =
-        file.section(codebookBytes, "successor-codebook");
+    if (layout.mixesRows) {
+      result.selectorProjection = readBlockProjection(file, layout.selectorRank, layout.hiddenSize, "selector");
+      const uint64_t codebookBytes = checkedMultiply<WeightStoreError>(
+          checkedMultiply<WeightStoreError>(layout.vocabularySize, layout.selectorRank, "draft codebook elements"),
+          kBFloat16Bytes, "draft codebook bytes");
+      result.predecessorCodebook = file.section(codebookBytes, "predecessor-codebook");
+      result.successorCodebook = file.section(codebookBytes, "successor-codebook");
+    }
     if (files.hasMaskEmbedding())
       result.maskEmbedding = file.section(uint64_t{layout.hiddenSize} * kBFloat16Bytes, "mask-embedding");
     file.finish();

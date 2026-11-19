@@ -35,7 +35,7 @@ DraftSelectorWorkspace DraftSelector::workspace(uint32_t positions) {
 }
 
 void DraftSelector::add(metal::CommandGraph &graph, const DraftSelectorBuffers &buffers,
-                        const DraftCodebooks &codebooks, DraftVocabulary vocabulary,
+                        const DraftCodebooks *codebooks, DraftVocabulary vocabulary,
                         std::span<const DraftTreeLane> lanes) const {
   if (lanes.empty() || lanes.size() > SPLASH_MAXIMUM_BATCH_WIDTH)
     throw std::invalid_argument("invalid draft selector batch");
@@ -84,9 +84,12 @@ void DraftSelector::add(metal::CommandGraph &graph, const DraftSelectorBuffers &
   requireBytes(buffers.partialValues, workspace.partialValuesBytes, "draft selector partial value");
   requireBytes(buffers.candidates, workspace.candidatesBytes, "draft candidate");
   requireBytes(buffers.unary, workspace.unaryBytes, "draft candidate score");
-  requireBytes(buffers.selectorHidden, queryRows * SPLASH_DRAFT_SELECTOR_RANK * 2, "draft selector hidden");
-  requireBytes(codebooks.predecessor, codebook, "draft predecessor codebook");
-  requireBytes(codebooks.successor, codebook, "draft successor codebook");
+  params.unary_only = !codebooks;
+  if (codebooks) {
+    requireBytes(buffers.selectorHidden, queryRows * SPLASH_DRAFT_SELECTOR_RANK * 2, "draft selector hidden");
+    requireBytes(codebooks->predecessor, codebook, "draft predecessor codebook");
+    requireBytes(codebooks->successor, codebook, "draft successor codebook");
+  }
   requireBytes(buffers.chainTokens, uint64_t{count} * SPLASH_TREE_CHAIN_TOKENS * sizeof(uint32_t),
                "draft tree chain token");
   requireBytes(buffers.chainRates,
@@ -104,8 +107,8 @@ void DraftSelector::add(metal::CommandGraph &graph, const DraftSelectorBuffers &
             params, {uint64_t{count} * kPositions * kShards, 1, 1});
   graph.add("draft_select_edges",
             {buffers.partialIds, buffers.partialValues, buffers.candidates,
-             buffers.unary, buffers.selectorHidden, codebooks.predecessor,
-             codebooks.successor},
+             buffers.unary, codebooks ? buffers.selectorHidden : buffers.unary,
+             codebooks ? codebooks->predecessor : buffers.unary, codebooks ? codebooks->successor : buffers.unary},
             params, {uint64_t{count} * kPositions, 1, 1},
             {kEdgeThreads, 1, 1});
   // A group's threads take the lattice's rows, one a position and

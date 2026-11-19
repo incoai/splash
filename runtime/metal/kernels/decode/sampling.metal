@@ -1319,6 +1319,12 @@ kernel void draft_select_edges(
   device float *table = partial_values +
                         ulong(params.lanes) * Positions * Shards * Candidates +
                         ulong(row) * Candidates * Candidates;
+  // A draft without codebooks scores its candidates by their unary scores.
+  if (params.unary_only) {
+    for (uint i = simd_group * 32 + lane; i < Candidates * Candidates; i += threads)
+      table[i] = 0.0f;
+    return;
+  }
   device const bfloat *row_hidden =
       hidden + (ulong(batch) * Rows + position + 1) * Rank;
   for (uint task = simd_group; task < tasks; task += threads / 32) {

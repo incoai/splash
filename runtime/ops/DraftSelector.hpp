@@ -124,7 +124,7 @@ struct DraftCodebooks final {
 // metal/kernels/decode/sampling.metal): each lane keeps the
 // SPLASH_DRAFT_CANDIDATES most likely draft tokens of every proposal
 // position, scores each candidate with its edge from the previous position's
-// candidate, and grows its verify block's rows into a tree over them and its
+// candidate (its unary score alone for a draft without codebooks), and grows its verify block's rows into a tree over them and its
 // host chain, best first by the estimate that the target accepts each row's
 // path (DraftTreeParams), a greedy lane's rows its most likely candidates
 // and a sampled lane's its draws, which its verify rows' rejection sampling
@@ -139,7 +139,7 @@ public:
 
   // Proposals from `vocabulary`'s tokens, whose logits rows buffers.logits
   // holds.
-  void add(metal::CommandGraph &graph, const DraftSelectorBuffers &buffers, const DraftCodebooks &codebooks,
+  void add(metal::CommandGraph &graph, const DraftSelectorBuffers &buffers, const DraftCodebooks *codebooks,
            DraftVocabulary vocabulary, std::span<const DraftTreeLane> lanes) const;
   // After add: the rows of a decode step of `step.lanes` lanes
   // (VerifyRowsParams), the trees' best rows that the step's rows and its

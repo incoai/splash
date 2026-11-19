@@ -60,7 +60,9 @@ gguf::Image layerImage(const SafetensorsCheckpoint &checkpoint, const DFlashDraf
   const std::string prefix = "layers." + std::to_string(layer) + ".";
   const std::string attention = prefix + "self_attn.";
   const uint64_t hidden = layout.hiddenSize, kv = uint64_t{layout.kvHeads} * layout.attentionHeadDimension;
+  // A DFlash draft's layers have no convolutions (DFlashDraftLayout::mixesRows).
   const auto convolution = [&](const std::string &name) {
+    if (!layout.mixesRows) return;
     b.stored(name + ".base_kernel", {SPLASH_DRAFT_CONVOLUTION_STAGES, SPLASH_DRAFT_CONVOLUTION_TAPS, hidden});
     b.projection({{name + ".kernel_projection", layout.dynamicSize}}, hidden);
   };
@@ -86,9 +88,11 @@ gguf::Image modelImage(const SafetensorsCheckpoint &checkpoint, const DFlashDraf
   b.projection({{"fc", hidden}}, layout.targetHiddenSize());
   b.stored("hidden_norm.weight", {hidden});
   b.stored("norm.weight", {hidden});
-  b.projection({{selector + "hidden_projection", layout.selectorRank}}, hidden);
-  b.stored(selector + "predecessor_codebook", {layout.vocabularySize, layout.selectorRank});
-  b.stored(selector + "successor_codebook", {layout.vocabularySize, layout.selectorRank});
+  if (layout.mixesRows) {
+    b.projection({{selector + "hidden_projection", layout.selectorRank}}, hidden);
+    b.stored(selector + "predecessor_codebook", {layout.vocabularySize, layout.selectorRank});
+    b.stored(selector + "successor_codebook", {layout.vocabularySize, layout.selectorRank});
+  }
   if (checkpoint.find(kDraftMaskEmbedding)) b.stored(std::string(kDraftMaskEmbedding), {hidden});
   return b.finish();
 }

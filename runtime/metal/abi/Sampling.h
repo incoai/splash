@@ -188,10 +188,13 @@ struct SelectorBatchParams {
   uint32_t columns;
   uint32_t leading;
   uint32_t trailing;
+  // Nonzero for a draft without codebooks (a DFlash draft's): a candidate's
+  // score is its unary score alone, its edges zero.
+  uint32_t unary_only;
 };
 
-static_assert(sizeof(SelectorBatchParams) == 36,
-              "Draft selector parameters are 36 bytes on both sides");
+static_assert(sizeof(SelectorBatchParams) == 40,
+              "Draft selector parameters are 40 bytes on both sides");
 
 // The most tokens a host chain proposes: a verify block's rows after its
 // anchor.

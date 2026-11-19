@@ -43,7 +43,8 @@ private:
   struct Planned {
     explicit Planned(const std::filesystem::path &directory) : checkpoint(directory) {}
     SafetensorsCheckpoint checkpoint;
-    std::vector<gguf::Image> images; // layers, head, embedding
+    std::vector<gguf::Image> images; // layers, head, embedding (gguf::tableInHead: none)
+    uint32_t layers = 0;
   };
   [[nodiscard]] WeightFile open(size_t index);
 

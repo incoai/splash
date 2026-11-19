@@ -255,9 +255,10 @@ Fixture makeFixture(MetalBackend &backend, uint32_t vocabulary, uint32_t lanes, 
 }
 
 
-void run(MetalBackend &backend, const DraftSelector &selector, const Fixture &f, std::span<const DraftTreeLane> lanes) {
+void run(MetalBackend &backend, const DraftSelector &selector, const Fixture &f, std::span<const DraftTreeLane> lanes,
+         bool unaryOnly = false) {
   CommandGraph graph;
-  selector.add(graph, f.buffers, f.codebooks, f.subset, lanes);
+  selector.add(graph, f.buffers, unaryOnly ? nullptr : &f.codebooks, f.subset, lanes);
   require(graph.dispatches().size() == 3, "draft selector dispatch count changed");
   static_cast<void>(backend.submitCommandAsync(graph.dispatches()).wait());
 }
@@ -577,7 +578,10 @@ void requireTree(const Fixture &f, uint32_t lane, uint32_t anchor, const std::ve
 // probability the largest of its candidates', the chain's confidence. Over
 // `tokens` of the vocabulary the candidates are the tokens of the rows'
 // largest columns.
-void chainCase(MetalBackend &backend, uint32_t vocabulary, uint32_t lanes, DraftVocabulary tokens = {}) {
+// unaryOnly: a draft without codebooks (a DFlash draft's), whose candidates
+// score their unary score alone.
+void chainCase(MetalBackend &backend, uint32_t vocabulary, uint32_t lanes, DraftVocabulary tokens = {},
+               bool unaryOnly = false) {
   Random random(0x5e1ec7 + uint64_t{vocabulary} * 8 + lanes * 2 + uint64_t{tokens.leading} * 16);
   const uint32_t columns = tokens.columns(vocabulary);
   const std::array patterns{Pattern::Peaked, Pattern::Uniform, Pattern::Ties, Pattern::Sparse};
@@ -586,7 +590,7 @@ void chainCase(MetalBackend &backend, uint32_t vocabulary, uint32_t lanes, Draft
   std::vector<DraftTreeLane> trees;
   for (uint32_t lane = 0; lane < lanes; ++lane)
     trees.push_back({random.next() % vocabulary, kBlock - 1, 0, 1});
-  run(backend, selector, f, trees);
+  run(backend, selector, f, trees, unaryOnly);
 
   const auto *hidden = static_cast<const uint16_t *>(f.buffers.selectorHidden.contents());
   const auto *predecessors = static_cast<const uint16_t *>(f.codebooks.predecessor.contents());
@@ -612,7 +616,7 @@ void chainCase(MetalBackend &backend, uint32_t vocabulary, uint32_t lanes, Draft
       for (uint32_t rank = 0; rank < kCandidates; ++rank) {
         const uint32_t candidate = std::min(f.candidates(lane)[position * kCandidates + rank], vocabulary - 1);
         double edge = 0.0;
-        for (uint32_t dim = 0; dim < kRank; ++dim)
+        for (uint32_t dim = 0; dim < (unaryOnly ? 0 : kRank); ++dim)
           edge += double(bf16ToFloat(predecessors[uint64_t{predecessorToken} * kRank + dim])) *
                   bf16ToFloat(hidden[(uint64_t{lane} * kRows + position + 1) * kRank + dim]) *
                   bf16ToFloat(successors[uint64_t{candidate} * kRank + dim]);
@@ -1400,7 +1404,7 @@ void bufferExtents(MetalBackend &backend) {
     requireExtent(backend, f.buffers.*member, bytes, element, what, [&](CommandGraph &graph, const MetalBuffer &buffer) {
       DraftSelectorBuffers changed = f.buffers;
       changed.*member = buffer;
-      selector.add(graph, changed, f.codebooks, {}, trees);
+      selector.add(graph, changed, &f.codebooks, {}, trees);
     });
   // Over a subset, a logits row holds its columns.
   constexpr DraftVocabulary subset{512, 960};
@@ -1408,7 +1412,7 @@ void bufferExtents(MetalBackend &backend) {
                 [&](CommandGraph &graph, const MetalBuffer &buffer) {
                   DraftSelectorBuffers changed = f.buffers;
                   changed.logits = buffer;
-                  selector.add(graph, changed, f.codebooks, subset, trees);
+                  selector.add(graph, changed, &f.codebooks, subset, trees);
                 });
   for (const auto &[member, what] :
        {std::pair{&DraftCodebooks::predecessor, "draft predecessor codebook"},
@@ -1417,7 +1421,7 @@ void bufferExtents(MetalBackend &backend) {
                   [&](CommandGraph &graph, const MetalBuffer &buffer) {
                     DraftCodebooks changed = f.codebooks;
                     changed.*member = buffer;
-                    selector.add(graph, f.buffers, changed, {}, trees);
+                    selector.add(graph, f.buffers, &changed, {}, trees);
                   });
   // draft_verify_rows reads every lane's tree and writes the step's rows.
   const StepRows step{lanes, 2 * lanes + 1, 3};
@@ -1449,14 +1453,14 @@ void invalidRequests(MetalBackend &backend) {
   const DraftSelector selector(vocabulary);
   CommandGraph graph;
   const auto add = [&](std::span<const DraftTreeLane> lanes) {
-    selector.add(graph, f.buffers, f.codebooks, {}, lanes);
+    selector.add(graph, f.buffers, &f.codebooks, {}, lanes);
   };
   rejects([&] { add({}); }, "invalid draft selector batch", "a selection of no lane was accepted");
   const std::array<DraftTreeLane, 5> five{};
   rejects([&] { add(five); }, "invalid draft selector batch", "a selection of five lanes was accepted");
   // Tokens past the vocabulary, a trailing part before the leading one's end, and no tokens.
   for (const DraftVocabulary tokens : {DraftVocabulary{0, 1025}, DraftVocabulary{600, 500}, DraftVocabulary{0, 1024}})
-    rejects([&] { selector.add(graph, f.buffers, f.codebooks, tokens, std::array{DraftTreeLane{1, 3, 0, 1}}); },
+    rejects([&] { selector.add(graph, f.buffers, &f.codebooks, tokens, std::array{DraftTreeLane{1, 3, 0, 1}}); },
             "a draft's tokens lie in its vocabulary", "a draft vocabulary outside the selector's was accepted");
   // A tree deeper than a block's rows, a chain past a block's rows after its
   // anchor and more children than the kernel ranks.
@@ -1496,8 +1500,10 @@ int main(int argc, char **argv) {
     invalidRequests(backend);
     bufferExtents(backend);
     for (const uint32_t vocabulary : {248320U, 1003U, 270005U})
-      for (uint32_t lanes = 1; lanes <= kLanes; ++lanes)
+      for (uint32_t lanes = 1; lanes <= kLanes; ++lanes) {
         chainCase(backend, vocabulary, lanes);
+        chainCase(backend, vocabulary, lanes, {}, true);
+      }
     // Subsets: the Qwen families', one of 555 columns that misalign the
     // vectors, a leading part alone and a trailing part alone.
     for (const auto &[vocabulary, tokens] :

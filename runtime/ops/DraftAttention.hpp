@@ -93,10 +93,11 @@ public:
   static void addPrepare(metal::CommandGraph &graph,
                          DraftPrepareBuffers buffers,
                          const DraftAttentionPlan &plan);
+  // With causal, each draft row attends the draft rows up to its own.
   static void addDecode(metal::CommandGraph &graph,
                         DraftDecodeAttentionBuffers buffers,
                         std::span<const uint32_t> cacheLengths,
-                        const DraftAttentionPlan &plan);
+                        const DraftAttentionPlan &plan, bool causal = false);
   // The context writers. A row of contextKv holds its keys, then its values
   // (kvHeads * headDimension each); its normalized, rotated keys and its
   // values go to its position's slot of the ring.

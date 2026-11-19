@@ -107,6 +107,7 @@ inline void splash_attention_reduce_phase(
 PAGED_ATTENTION_SPLIT(attention_q8_split, 4, 6, 256, 0, int8_t, false)
 PAGED_ATTENTION_SPLIT(attention_q8_split_kv2_g8, 2, 8, 256, 0, int8_t, false)
 PAGED_ATTENTION_SPLIT(attention_q8_split_kv2_g16, 2, 16, 256, 0, int8_t, false)
+PAGED_ATTENTION_SPLIT(attention_q8_split_kv4_g4, 4, 4, 256, 0, int8_t, false)
 // Four KV heads of 128 dimensions over the whole history, and over a window
 // of the 512 keys before each row.
 PAGED_ATTENTION_SPLIT(attention_q8_split_kv4_g8_d128, 4, 8, 128, 0, int8_t, false)
@@ -116,12 +117,14 @@ PAGED_ATTENTION_SPLIT(attention_q8_split_kv4_g8_d128_w512, 4, 8, 128, 512, int8_
 PAGED_ATTENTION_SPLIT(attention_q8q_split, 4, 6, 256, 0, int8_t, true)
 PAGED_ATTENTION_SPLIT(attention_q8q_split_kv2_g8, 2, 8, 256, 0, int8_t, true)
 PAGED_ATTENTION_SPLIT(attention_q8q_split_kv2_g16, 2, 16, 256, 0, int8_t, true)
+PAGED_ATTENTION_SPLIT(attention_q8q_split_kv4_g4, 4, 4, 256, 0, int8_t, true)
 PAGED_ATTENTION_SPLIT(attention_q8q_split_kv4_g8_d128, 4, 8, 128, 0, int8_t, true)
 PAGED_ATTENTION_SPLIT(attention_q8q_split_kv4_g8_d128_w512, 4, 8, 128, 512, int8_t, true)
 // BF16 shares the page loop and reduction, without quantization scales.
 PAGED_ATTENTION_SPLIT(attention_bf16_split, 4, 6, 256, 0, bfloat, false)
 PAGED_ATTENTION_SPLIT(attention_bf16_split_kv2_g8, 2, 8, 256, 0, bfloat, false)
 PAGED_ATTENTION_SPLIT(attention_bf16_split_kv2_g16, 2, 16, 256, 0, bfloat, false)
+PAGED_ATTENTION_SPLIT(attention_bf16_split_kv4_g4, 4, 4, 256, 0, bfloat, false)
 PAGED_ATTENTION_SPLIT(attention_bf16_split_kv4_g8_d128, 4, 8, 128, 0, bfloat, false)
 PAGED_ATTENTION_SPLIT(attention_bf16_split_kv4_g8_d128_w512, 4, 8, 128, 512, bfloat, false)
 #undef PAGED_ATTENTION_SPLIT
@@ -181,6 +184,7 @@ PAGED_ATTENTION_SPLIT(attention_bf16_split_kv4_g8_d128_w512, 4, 8, 128, 512, bfl
 PAGED_ATTENTION_REDUCE(attention_reduce, 4, 6, 256, 0, true)
 PAGED_ATTENTION_REDUCE(attention_reduce_kv2_g8, 2, 8, 256, 0, true)
 PAGED_ATTENTION_REDUCE(attention_reduce_kv2_g16, 2, 16, 256, 0, true)
+PAGED_ATTENTION_REDUCE(attention_reduce_kv4_g4, 4, 4, 256, 0, true)
 // Flint's layers have no output gate.
 PAGED_ATTENTION_SINK_REDUCE(attention_reduce_kv4_g8_d128_sinks, 4, 8, 128, 0, false)
 PAGED_ATTENTION_SINK_REDUCE(attention_reduce_kv4_g8_d128_w512_sinks, 4, 8, 128, 512, false)

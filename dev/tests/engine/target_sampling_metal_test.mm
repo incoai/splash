@@ -3372,7 +3372,7 @@ void childTestsOfTheSelectorsDraws(MetalBackend &backend, const SamplingPolicy &
       lanes.push_back({7, 2, 0, 3, DraftCalibration{}, policy.temperature,
                        uint64_t{random.next()} << 32 | random.next()});
     CommandGraph layout;
-    selector.add(layout, trees, codebooks, DraftVocabulary{}, lanes);
+    selector.add(layout, trees, &codebooks, DraftVocabulary{}, lanes);
     DraftSelector::addVerifyRows(layout, trees, step);
     static_cast<void>(backend.submitCommandAsync(layout.dispatches()).wait());
     // Each row's logits: its tree row's, the anchor's, a child's or a

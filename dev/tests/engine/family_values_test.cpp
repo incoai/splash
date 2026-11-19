@@ -35,6 +35,8 @@ using splash::test::require;
 model::DFlashDraftLayout draftOf(std::string_view family) {
   if (family == model::Qwen3_8Layout{}.family)
     return test::qwen3_8Draft();
+  if (family == model::kQwen3_5_4BLayout.family)
+    return test::qwen3_5_4BDraft();
   if (family == model::Qwen3_6MoeLayout{}.family)
     return test::qwen3_6MoeDraft();
   if (family == model::kQwen3_5_122BLayout.family)

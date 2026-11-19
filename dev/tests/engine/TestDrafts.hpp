@@ -23,6 +23,16 @@ namespace splash::test {
   constexpr std::array<uint32_t, 5> targetLayers{5, 19, 33, 47, 61};
   return model::draftLayout(target.hiddenSize, target.vocabularySize, 5, 17408, 10'000'000.0F, targetLayers);
 }
+// z-lab's DFlash draft of Qwen3.5-4B, without convolutions or a selector:
+// its five sliding layers attend the draft rows causally, its last every one.
+[[nodiscard]] inline model::DFlashDraftLayout qwen3_5_4BDraft() {
+  constexpr model::Qwen3_8Layout target = model::kQwen3_5_4BLayout;
+  constexpr std::array<uint32_t, 8> targetLayers{1, 5, 9, 13, 17, 21, 25, 29};
+  model::DFlashDraftLayout layout = model::draftLayout(target.hiddenSize, target.vocabularySize, 6, 9216,
+                                                       10'000'000.0F, targetLayers, false);
+  layout.causalLayers = 0b011111;
+  return layout;
+}
 [[nodiscard]] inline model::DFlashDraftLayout qwen3_6MoeDraft() {
   constexpr model::Qwen3_6MoeLayout target;
   constexpr std::array<uint32_t, 8> targetLayers{1, 6, 11, 16, 22, 27, 32, 37};
