@@ -53,6 +53,13 @@ struct FloatProjection final {
 // type and tile, so that each one's outputs are those of its own dispatch.
 void addGgufFloat(metal::CommandGraph &graph, metal::MetalBuffer input, std::span<const FloatProjection> projections,
                   uint32_t rows, FloatOutput type);
+// The int8 prefill tile's input (gguf_prefill_int8_quantize): `rows` bf16
+// rows of `inputSize` as int8 codes, a byte an input, and a float2 of scales
+// per GGUF_PREFILL_INT8_GROUP inputs of each row, at row stride
+// `scaleStride` (gguf_prefill_int8_scale_bytes).
+void addGgufPrefillInt8Quantize(metal::CommandGraph &graph, const metal::MetalBuffer &input,
+                                const metal::MetalBuffer &codes, const metal::MetalBuffer &scales, uint32_t inputSize,
+                                uint32_t rows, uint32_t scaleStride);
 
 struct LinearMatrix final {
   uint32_t outputSize = 0;

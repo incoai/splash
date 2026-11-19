@@ -61,6 +61,11 @@ struct MoeShape final {
   MoeRouter router = MoeRouter::Softmax;
   uint32_t sharedSlices = 1;
   bool sharedGate = true;
+  // Whether every block's experts are resident and in formats the int8
+  // prefill tile takes (moeInt8Experts and RuntimeGeometry::from): its prefill
+  // plans then run the int8 passes and size their scratch
+  // (MoeConfig::int8Passes).
+  bool int8Experts = false;
 
   [[nodiscard]] constexpr bool valid() const noexcept {
     // Experts of an intermediate width that fills 64-column tiles, and a
@@ -273,6 +278,10 @@ struct MoeWorkspace final {
   uint64_t groupedInputBytes = 0;
   uint64_t expertIntermediateBytes = 0;
   uint64_t expertOutputBytes = 0;
+  uint64_t inputCodesBytes = 0;
+  uint64_t inputScalesBytes = 0;
+  uint64_t groupedCodesBytes = 0;
+  uint64_t groupedScalesBytes = 0;
   bool operator==(const MoeWorkspace &) const = default;
 };
 
@@ -299,6 +308,13 @@ struct MoeScratch final {
   metal::MetalBuffer groupedInput;
   metal::MetalBuffer expertIntermediate;
   metal::MetalBuffer expertOutput;
+  // The int8 passes' (MoeConfig::int8Passes): the chunk's input rows as int8
+  // codes and their scales per 64 inputs, and the grouped rows' (the input's,
+  // then the intermediate's), a row per route. Empty for plans without them.
+  metal::MetalBuffer inputCodes;
+  metal::MetalBuffer inputScales;
+  metal::MetalBuffer groupedCodes;
+  metal::MetalBuffer groupedScales;
 };
 
 // Each scratch buffer with the workspace field that sizes it, in field order.
@@ -307,7 +323,7 @@ struct MoeScratchField final {
   uint64_t MoeWorkspace::*bytes;
   const char *name;
 };
-inline constexpr std::array<MoeScratchField, 10> kMoeScratchFields{{
+inline constexpr std::array<MoeScratchField, 14> kMoeScratchFields{{
     {&MoeScratch::selectedExperts, &MoeWorkspace::selectedExpertsBytes, "MoE selected experts"},
     {&MoeScratch::routingWeights, &MoeWorkspace::routingWeightsBytes, "MoE routing weights"},
     {&MoeScratch::tileDescriptors, &MoeWorkspace::tileDescriptorsBytes, "MoE tile descriptors"},
@@ -318,6 +334,10 @@ inline constexpr std::array<MoeScratchField, 10> kMoeScratchFields{{
     {&MoeScratch::groupedInput, &MoeWorkspace::groupedInputBytes, "MoE grouped input"},
     {&MoeScratch::expertIntermediate, &MoeWorkspace::expertIntermediateBytes, "MoE expert intermediate"},
     {&MoeScratch::expertOutput, &MoeWorkspace::expertOutputBytes, "MoE expert output"},
+    {&MoeScratch::inputCodes, &MoeWorkspace::inputCodesBytes, "MoE input codes"},
+    {&MoeScratch::inputScales, &MoeWorkspace::inputScalesBytes, "MoE input scales"},
+    {&MoeScratch::groupedCodes, &MoeWorkspace::groupedCodesBytes, "MoE grouped codes"},
+    {&MoeScratch::groupedScales, &MoeWorkspace::groupedScalesBytes, "MoE grouped scales"},
 }};
 static_assert(sizeof(MoeWorkspace) == kMoeScratchFields.size() * sizeof(uint64_t) &&
               sizeof(MoeScratch) == kMoeScratchFields.size() * sizeof(metal::MetalBuffer),
@@ -342,6 +362,9 @@ struct MoeConfig final {
   // The router's float tile; the execution plans derive it from the device,
   // the plan's rows and the router's format (selectFloatTile).
   FloatTile ggufRouterTile = FloatTile::Simdgroup;
+  // A resident block's prefill passes on int8 activations where its expert
+  // projections are af4g64 or af5g64 (MoE::addRouted, moe_int8.metal).
+  bool int8Passes = false;
   bool operator==(const MoeConfig &) const = default;
 };
 

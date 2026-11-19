@@ -41,6 +41,7 @@ void requirePrefillStates(const QwenTargetGeometry &geometry, const QwenTargetPr
 void QwenTargetGeometry::finish(std::span<const ops::BlockMoeWeights *const> moeBlocks,
                                 const ops::Projection &logits) {
   moeRouterFormat = ops::moeRouterFormat(moeBlocks);
+  moeInt8Experts = ops::moeInt8Experts(moeBlocks);
   prefillProjections = decodeProjections;
   include(logits);
   // The draft's head over its subset of the vocabulary: a view of the head's
@@ -173,7 +174,7 @@ QwenTarget::PrefillStep QwenTarget::prefillStep(metal::CommandGraph &graph, cons
     step.windowedAttention.emplace(operators_.attention(step.attentionSequences(), geometry_.attentionQueryHeads,
                                                         geometry_.kvLayout, workspace, {.windowTokens = window}));
   if (geometry_.ffnKind == QwenFfnKind::SparseMoe)
-    step.moe = operators_.moe(geometry_.moeBlockShape(), geometry_.moeRouterFormat, chunk.rows);
+    step.moe = operators_.moe(geometry_.moeShape(), geometry_.moeRouterFormat, chunk.rows);
   if (aneFfn && aneFfn->splits(chunk.rows)) step.aneFfn = aneFfn;
   return step;
 }
@@ -187,7 +188,7 @@ void QwenTarget::planOutputRows(PrefillStep &step, uint32_t index) const {
   for (const QwenTargetPrefillSequence &sequence : step.sequences)
     step.readRows.push_back(sequence.rowBegin + sequence.rows - 1);
   if (step.moe)
-    step.moe = operators_.moe(geometry_.moeBlockShape(), geometry_.moeRouterFormat, step.outputRows());
+    step.moe = operators_.moe(geometry_.moeShape(), geometry_.moeRouterFormat, step.outputRows());
 }
 
 void QwenTarget::addReadRows(const PrefillStep &step, const metal::MetalBuffer &compact,

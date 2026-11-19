@@ -641,7 +641,15 @@ The rules:
    of up to 32 rows of every family) and 32-row tiles beyond. One plan per
    step serves every block, so its router follows rule 3 in the format of
    most blocks' routers (`ops::moeRouterFormat`). Either tile's grouped rows
-   are the step's routes', packed (`ops::MoeScratch`).
+   are the step's routes', packed (`ops::MoeScratch`). With int8 activations
+   on, a prefill chunk whose dense projections run the
+   [int8-activation tile](#int8-activation-prefill) runs its experts on int8
+   passes too where every block's experts are resident and each projection's
+   routed and shared experts share a format the tile takes
+   (`ops::moeInt8Experts`), once its routes average six or more an expert
+   (`ops::selectMoe`, `MoeConfig::int8Passes`): from 192 rows on
+   Qwen3.6-35B-A3B and Qwen3.5-122B-A10B, 256 on Flint's shape and 308 on
+   Qwen3.8-Flash-Next's. Smaller chunks keep the staged passes.
 5. *Attention.* The kernels follow how a layout reads its pages
    (`kv::Layout::reads`, below). A sequence of one tile, a decode lane's of
    up to 8 rows, takes one history split per 16 pages its rows read, between
@@ -692,10 +700,14 @@ every projection
   projections run kernels of their own, of its fewest rows
   (`ExecutionPlans::prefillRowClasses`): each decode tile and height a chunk
   takes, from 1 (the column tile), 3, 9, 17, 25, 33 and 49 rows, and the
-  prefill tile, from 65 rows. These need no memory the first
-  did not, and are required as it is. Every other kernel choice a chunk's
-  rows make today has one threshold (the float tiles, the MoE expert and
-  router tiles, the staged norm, the hyper-connection norm's quarters, and the
+  prefill tile, from 65 rows; and a MoE target's expert passes
+  (`ops::selectMoe`), each a class: the 32-row staged passes from the rows
+  whose routes outnumber its experts (33 on Qwen3.6-35B-A3B and
+  Qwen3.5-122B-A10B, 43 on Flint, 52 on Qwen3.8-Flash-Next), and the int8
+  passes where they run (from 192, 256 and 308 rows). These need no memory
+  the first did not, and are required as it is. Every other kernel choice a
+  chunk's rows make has one threshold (the float tiles, the MoE router's
+  tile, the staged norm, the hyper-connection norm's quarters, and the
   Neural Engine split, which takes no class's first chunk), so the chunks of
   one row and of the most take both sides. `kernel-selection` checks that
   every projection, float and MoE tile a chunk of 1 to 2048 rows selects on
@@ -1200,6 +1212,29 @@ rounded within the bf16 tile's error, also with an outlier input per row, and bo
 it adds over the bf16 tile on dense inputs at 1%, that a fused projection quantizes once and runs a
 GEMM per segment, and an up on its gate's codes bitwise its own run; `gguf-projection-benchmark`
 times it as `prefill int8`.
+
+A MoE target's experts run on the same tile in such a chunk where every block's experts are
+resident and each projection's routed and shared experts share af4g64 or af5g64
+(`ops::moeInt8Experts`; Qwen3.6-35B-A3B MLX 4-bit, not Flint's af3g64 nor a set
+with Q8_0 shared experts): `gguf_prefill_int8_quantize` rounds the chunk's MoE input rows once,
+`moe_gather_int8` copies each route's codes and scales into the grouping's tiles, and
+`moe_expert_int8_<format>_<gate|up|down>` (`kernels/shared/moe_int8.metal`) run the tile over them,
+each tile's expert reached as the staged passes reach it, with the SwiGLU intermediate rounded by the
+same rule before down. A chunk takes these passes once its routes average six or more an expert
+(`ops::selectMoe`, `kInt8PassRoutesPerExpert`): from 192 rows on Qwen3.6-35B-A3B and
+Qwen3.5-122B-A10B (8 of 256 experts), 256 on Flint's shape (6 of 256) and 308 on
+Qwen3.8-Flash-Next's (10 of 512). Below that the int8 passes are not shorter in every run, since
+the int8 tile runs both 16-row fragments of an expert's tile whatever its live rows; from six on
+they are (`gguf-moe-benchmark int8` on a 32-core M5 Max and a 20-core M5 Pro, measured on Apple10
+alone). Decode steps, smaller chunks, streamed experts, GGUF experts and other formats keep the
+staged passes, and Apple9 runs none of the int8 tiles. On the 35B MLX the passes take a 2,048-row
+chunk 9% less time on a 32-core M5 Max and 11% on a 20-core M5 Pro, 32K tokens of context 5% and
+8%. With `--activations bf16` every chunk's experts run the staged passes, bit for bit. Against 1.7.0, whose dense
+projections already round, the next-token KL over 96 prefixes of six greedy transcripts is 1.3e-3
+(the same prefixes scored four at a time: 6.9e-4), the most likely token unchanged at every prefix;
+at 2K and 32K tokens of real text it is about that of a cache hit against a cold prefill (1.7e-2
+against 1.3e-2 at 2K, 6.7e-2 against 6.2e-2 at 32K), and a second turn does not add to it. The
+prefill arena holds the codes, 47 MB at 2,048 rows on the 35B.
 
 ## Sparse attention
 

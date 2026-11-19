@@ -105,6 +105,15 @@ struct QwenTargetGeometry final : QwenTargetDimensions {
   // The format of the sparse MoE blocks' routers, which their plans follow
   // (ops::moeRouterFormat).
   uint32_t moeRouterFormat = ops::QuantizedSegment::kFloat32;
+  // Whether the blocks' experts take the int8 prefill passes: their formats
+  // (ops::moeInt8Experts), and resident (RuntimeGeometry::from).
+  bool moeInt8Experts = false;
+  // The blocks' shape as their plans take it.
+  [[nodiscard]] ops::MoeShape moeShape() const noexcept {
+    ops::MoeShape shape = moeBlockShape();
+    shape.int8Experts = moeInt8Experts;
+    return shape;
+  }
   // The layers whose output rows the DFlash2 draft reads, ascending.
   std::array<uint32_t, ExecutionLimits::maximumDraftTargetLayers> captureLayerValues{};
   uint32_t captureLayerCount = 0;

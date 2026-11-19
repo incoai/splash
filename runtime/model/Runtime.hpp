@@ -66,6 +66,7 @@ public:
   provideMask(uint64_t requestId, std::span<const uint32_t> words, std::span<const uint32_t> forced) override;
   void end(uint64_t requestId) override;
 
+  [[nodiscard]] std::vector<uint32_t> prefillRowClasses() const override;
   [[nodiscard]] WarmupStepResult warmupPrefill(uint32_t rows) override;
   [[nodiscard]] WarmupStepResult
   warmupDecodeBatch(uint32_t width) override;

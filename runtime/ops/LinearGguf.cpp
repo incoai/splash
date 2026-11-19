@@ -429,16 +429,13 @@ void Linear::addGgufPrefillInt8(metal::CommandGraph &graph, const LinearBuffers 
                                 const LinearPlan &plan) const {
   const LinearWorkload w = plan.workload();
   const auto [n, k] = w.matrix;
-  const uint32_t storage = plan.storageRows(), groups = k / GGUF_PREFILL_INT8_GROUP,
+  const uint32_t storage = plan.storageRows(),
                  rowTiles = (w.rows + GGUF_PREFILL_INT8_ROWS - 1) / GGUF_PREFILL_INT8_ROWS;
   for (const QuantizedSegment &s : p.blocks().segments)
     if (!quant_prefill_int8_format(s.formatId))
       throw std::invalid_argument(std::string("the int8 prefill tile does not take ") + s.name() + " weights");
   if (b.prepared.layout != LinearInput::PrefillInt8 || !b.prepared.source.sameView(b.input))
-    graph.add("gguf_prefill_int8_quantize", {b.input, b.scratch.input, b.scratch.sums},
-              GgufPrefillInt8QuantizeParams{k, w.rows, storage},
-              {(groups + GGUF_PREFILL_INT8_QUANTIZE_SIMDGROUPS - 1) / GGUF_PREFILL_INT8_QUANTIZE_SIMDGROUPS, w.rows, 1},
-              {GGUF_PREFILL_INT8_QUANTIZE_SIMDGROUPS * 32, 1, 1});
+    addGgufPrefillInt8Quantize(graph, b.input, b.scratch.input, b.scratch.sums, k, w.rows, storage);
   const std::string epilogue(1, epilogueSuffix(w.epilogue));
   for (const QuantizedSegment &s : p.blocks().segments) {
     const uint32_t columnTiles = s.outputSize / GGUF_TILE_COLUMNS;
@@ -545,6 +542,18 @@ void Linear::addGgufFloatSegments(metal::CommandGraph &graph, const LinearBuffer
 
 FloatTile Linear::ggufFloatTile(uint32_t rows, uint32_t outputSize, uint32_t formatId) const noexcept {
   return selectFloatTile(calibration_, rows, outputSize, formatId);
+}
+
+// A row's GGUF_PREFILL_INT8_QUANTIZE_SIMDGROUPS groups of 64 inputs a
+// threadgroup, a simdgroup a group.
+void addGgufPrefillInt8Quantize(metal::CommandGraph &graph, const metal::MetalBuffer &input,
+                                const metal::MetalBuffer &codes, const metal::MetalBuffer &scales, uint32_t inputSize,
+                                uint32_t rows, uint32_t scaleStride) {
+  const uint32_t groups = inputSize / GGUF_PREFILL_INT8_GROUP;
+  graph.add("gguf_prefill_int8_quantize", {input, codes, scales},
+            GgufPrefillInt8QuantizeParams{inputSize, rows, scaleStride},
+            {(groups + GGUF_PREFILL_INT8_QUANTIZE_SIMDGROUPS - 1) / GGUF_PREFILL_INT8_QUANTIZE_SIMDGROUPS, rows, 1},
+            {GGUF_PREFILL_INT8_QUANTIZE_SIMDGROUPS * 32, 1, 1});
 }
 
 void addGgufFloat(metal::CommandGraph &graph, metal::MetalBuffer input, const QuantizedSegment &weights,

@@ -969,6 +969,10 @@ class RuntimeModel : public Model {
 public:
   ~RuntimeModel() override = default;
 
+  // The fewest rows of each class of prefill chunk whose kernels the start
+  // warms (ops::ExecutionPlans::prefillRowClasses, of the target's MoE
+  // blocks).
+  [[nodiscard]] virtual std::vector<uint32_t> prefillRowClasses() const = 0;
   // Actual rows, not padded dispatch rows; valid range is 1..prefillTokenBudget.
   virtual WarmupStepResult warmupPrefill(uint32_t rows) = 0;
   virtual WarmupStepResult warmupDecodeBatch(uint32_t width) = 0;

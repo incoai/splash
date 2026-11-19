@@ -62,7 +62,7 @@ TargetRows prefillTargetRows(const RuntimeGeometry &geometry, const ops::Executi
                    .attention = operators.sequenceAttentionWorkspace(target.attentionQueryHeads, target.kvLayout),
                    .moe = {}};
   if (target.ffnKind == QwenFfnKind::SparseMoe)
-    shape.moe = operators.moeWorkspace(target.moeBlockShape(), target.moeRouterFormat, kPrefillRows);
+    shape.moe = operators.moeWorkspace(target.moeShape(), target.moeRouterFormat, kPrefillRows);
   return shape;
 }
 
@@ -77,7 +77,7 @@ TargetRows decodeTargetRows(const RuntimeGeometry &geometry, const ops::Executio
                    .attention = {lane.partialsBytes * kLaneCount, lane.statisticsBytes * kLaneCount},
                    .moe = {}};
   if (target.ffnKind == QwenFfnKind::SparseMoe)
-    shape.moe = operators.moeWorkspace(target.moeBlockShape(), target.moeRouterFormat, kDecodeStepRows);
+    shape.moe = operators.moeWorkspace(target.moeShape(), target.moeRouterFormat, kDecodeStepRows);
   return shape;
 }
 

@@ -147,6 +147,7 @@ public:
   }
   void end(uint64_t) override {}
 
+  std::vector<uint32_t> prefillRowClasses() const override { return {}; }
   model::WarmupStepResult warmupPrefill(uint32_t rows) override {
     if (!rows || rows > model::ExecutionLimits::prefillTokenBudget)
       throw std::invalid_argument("invalid prefill warmup rows");

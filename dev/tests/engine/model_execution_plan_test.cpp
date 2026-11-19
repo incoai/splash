@@ -284,6 +284,55 @@ void checkDecodeStepMoe(const model::LoadedModel &loaded) {
   }
 }
 
+// A MoE plan runs its experts' int8 passes only where the block's experts
+// take them (MoeShape::int8Experts), int8 activations are on, the device's
+// dense prefill runs the int8 tile and the chunk has more rows than the
+// decode tiles' 64. The kernel-selection golden pins the plan lines of each
+// device, format set and row count with them on; this checks what it does
+// not hold: experts streamed take no int8 passes, and `--activations bf16`
+// keeps a chunk the passes would take on its staged experts' exact
+// activations, with no int8 scratch.
+void checkMoeInt8Passes(const model::LoadedModel &loaded) {
+  const auto geometry = model::RuntimeGeometry::from(loaded, kv::Format::Int8, ops::GdnStateFormat::Float32);
+  // Experts in the int8 tile's formats take the passes as the start keeps
+  // them resident and not as it streams them, whether the geometry comes
+  // from the files or from the model as it loaded: both go through
+  // RuntimeGeometry::from with the start's streamed parts.
+  for (const bool streamed : {false, true}) {
+    model::QwenTargetGeometry target = geometry.target;
+    target.moeInt8Experts = true;
+    const auto planned = model::RuntimeGeometry::from(loaded.descriptor, loaded.draft.layout, target,
+                                                      kv::Format::Int8, ops::GdnStateFormat::Float32,
+                                                      {.experts = streamed});
+    require(planned.target.moeShape().int8Experts == !streamed,
+            streamed ? "a start that streams its experts plans their int8 passes"
+                     : "a start that keeps its experts resident plans no int8 passes");
+  }
+  for (uint32_t family : {10U, 11U}) {
+    DeviceCapabilities device;
+    device.appleGpuFamily = family;
+    device.gpuCoreCount = 20;
+    const ops::ExecutionPlans plans(device, ops::Int8Activations::Off), int8(device, ops::Int8Activations::On);
+    ops::MoeShape shape = geometry.target.moeBlockShape();
+    shape.int8Experts = true;
+    // Every chunk the passes take with int8 activations on, the largest
+    // among them.
+    uint32_t taken = 0;
+    for (uint32_t rows = 1; rows <= SPLASH_PREFILL_TOKEN_BUDGET; ++rows) {
+      if (!int8.moe(shape, geometry.target.moeRouterFormat, rows).configuration().int8Passes) continue;
+      ++taken;
+      const ops::MoePlan plan = plans.moe(shape, geometry.target.moeRouterFormat, rows);
+      require(!plan.configuration().int8Passes && plan.workspace().groupedCodesBytes == 0,
+              "a MoE plan of Apple" + std::to_string(family) + " with bf16 activations of " +
+                  std::to_string(rows) + " rows runs int8 passes");
+    }
+    require(taken && int8.moe(shape, geometry.target.moeRouterFormat, SPLASH_PREFILL_TOKEN_BUDGET)
+                         .configuration()
+                         .int8Passes,
+            "no chunk of Apple" + std::to_string(family) + " takes the int8 passes with int8 activations on");
+  }
+}
+
 // The decode arena's plan counts each buffer it allocates in whole host
 // pages, as Metal allocates them and the memory ledger charges them: one
 // request's KV capacity rests on it, and a plan of the scratch fields' sum
@@ -550,6 +599,7 @@ int main() {
     checkDecodeArenaPages(loadedModel<model::Qwen3_8Weights>());
     checkDecodeArenaPages(loadedModel<model::Qwen3_6MoeWeights>());
     checkDecodeStepMoe(loadedModel<model::Qwen3_6MoeWeights>());
+    checkMoeInt8Passes(loadedModel<model::Qwen3_6MoeWeights>());
     checkDecodeStepMoe(loadedModel<model::Qwen3_6MoeWeights>(model::kQwen3_5_122BLayout, test::qwen3_5_122BDraft()));
     checkDecodeStepMoe(loadedModel<model::Qwen4ExpWeights>());
     std::cout << "model execution plans: PASS (three paired geometries)\n";

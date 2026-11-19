@@ -16,6 +16,10 @@
 // Each command runs layers of their own routes and buffers over one set of weights larger than the system cache, so a
 // layer streams its experts from DRAM: kDecodeLayers per decode step, kPrefillLayers per prefill chunk. Printed are
 // medians of GPU ms per layer over `rounds` (20) commands.
+//   gguf-moe-benchmark <metallib> int8 [35b|flash-next|flint] [rounds] [gate/up format] [down format] [shared format]
+// - prefill chunks of 64 to 2048 rows routed at random, on the staged expert passes and on the int8 passes
+//   (MoeConfig::int8Passes, MLX affine 4- and 5-bit formats, af4g64 throughout by default), with the routes per
+//   expert, the rows each routed expert takes on average and the passes the plan picks.
 //   gguf-moe-benchmark <metallib> repack [rounds]
 // - the repack of streamed experts into their slots (moe_expert_load) at 1, 2, 4, 8 and 32 jobs, and of a tensor of
 //   32 experts' rows at model preparation (gguf_repack), in each of Q4_K, Q5_K, Q6_K, Q8_0, Q2_0, IQ2_XXS and af4g64
@@ -80,7 +84,7 @@ void allocate(MetalBackend &backend, MoeBuffers &m, const MoePlan &plan) {
 
 enum class Routing { Random, Pooled };
 
-int timing(MetalBackend &backend, const MoeShape &shape, uint32_t rounds, Fmt gateUpFormat, Fmt downFormat,
+int timing(MetalBackend &backend, const MoeShape &shape, uint32_t rounds, bool int8, Fmt gateUpFormat, Fmt downFormat,
            Fmt sharedFormat, bool tiles) {
   const uint32_t H = shape.hiddenSize, I = shape.expertIntermediateSize, E = shape.experts,
                  topK = shape.expertsPerToken;
@@ -198,6 +202,37 @@ int timing(MetalBackend &backend, const MoeShape &shape, uint32_t rounds, Fmt ga
                routing == Routing::Random ? "random" : "pooled", rowsPerExpert(m8, rows), eight, thirtyTwo,
                thirtyTwo / eight, uint32_t(plans.moe(shape, routerFormat, rows).configuration().expertTile));
       }
+    return 0;
+  }
+  if (int8) {
+    const auto passes = [&](uint32_t rows, bool on) {
+      splash::ops::MoeConfig config = plans.moe(shape, routerFormat, rows).configuration();
+      config.int8Passes = on;
+      return MoE::plan(shape, rows, config);
+    };
+    // The plan's passes where every block's experts take them (MoeShape::int8Experts).
+    MoeShape int8Shape = shape;
+    int8Shape.int8Experts = true;
+    static_cast<void>(time(layers(passes(2048, false), Routing::Random)));
+    printf("  rows | routes per expert | rows per routed expert | staged ms | int8 ms | int8/staged | tile | plan\n");
+    for (const uint32_t rows : {64u, 96u, 128u, 160u, 192u, 256u, 320u, 384u, 512u, 768u, 1024u, 2048u}) {
+      const Layers staged = layers(passes(rows, false), Routing::Random);
+      const Layers quantized = layers(passes(rows, true), Routing::Random);
+      const double a = time(staged), b = time(quantized), a2 = time(staged), b2 = time(quantized);
+      const double before = (a + a2) / 2, after = (b + b2) / 2;
+      double perExpert = 0.0;
+      for (const MoeBuffers &buffers : staged.buffers) {
+        const auto *selected = static_cast<const uint32_t *>(buffers.scratch.selectedExperts.contents());
+        std::vector<uint8_t> seen(E, 0);
+        uint32_t distinct = 0;
+        for (uint64_t route = 0; route < uint64_t{rows} * topK; ++route)
+          if (selected[route] < E && !seen[selected[route]]++) ++distinct;
+        perExpert += double(rows) * topK / std::max(distinct, 1u) / staged.buffers.size();
+      }
+      printf("  %4u | %5.2f | %6.2f | %.4f | %.4f | %.3f | M%u | %s\n", rows, double(rows) * topK / E, perExpert,
+             before, after, after / before, uint32_t(passes(rows, false).configuration().expertTile),
+             plans.moe(int8Shape, routerFormat, rows).configuration().int8Passes ? "int8" : "staged");
+    }
     return 0;
   }
   // Prefill chunks first: they also bring the GPU clocks up for the short decode layers.
@@ -399,17 +434,21 @@ int main(int argc, const char *argv[]) {
         return 1;
       }
     }
-    // `tiles` before the shape picks the expert tiles' comparison.
+    // `tiles` or `int8` before the shape picks the expert tiles' or passes' comparison.
     std::vector<const char *> args(argv, argv + argc);
     const bool tiles = args.size() > 2 && std::string(args[2]) == "tiles";
-    if (tiles) args.erase(args.begin() + 2);
+    const bool int8 = args.size() > 2 && std::string(args[2]) == "int8";
+    if (tiles || int8) args.erase(args.begin() + 2);
     const size_t count = args.size();
     const std::string shapeName = count > 2 ? args[2] : "35b";
-    const Fmt gateUp = count > 4 ? fmtNamed(args[4]) : Q4K, down = count > 5 ? fmtNamed(args[5]) : Q5K,
-              shared = count > 6 ? fmtNamed(args[6]) : Q80;
+    // The int8 passes take MLX affine 4- and 5-bit experts alone (quant_prefill_int8_format): int8's are af4g64.
+    const Fmt mlx = Fmt(GGUF_FMT_AF4G64);
+    const Fmt gateUp = count > 4 ? fmtNamed(args[4]) : int8 ? mlx : Q4K,
+              down = count > 5 ? fmtNamed(args[5]) : int8 ? mlx : Q5K,
+              shared = count > 6 ? fmtNamed(args[6]) : int8 ? mlx : Q80;
     if (count < 2 || count > 7 || (shapeName != "35b" && shapeName != "flash-next" && shapeName != "flint") ||
         gateUp == FMT_COUNT || down == FMT_COUNT || shared == FMT_COUNT) {
-      std::cerr << "usage: gguf-moe-benchmark <metallib> [tiles] [35b|flash-next|flint] [rounds] [gate/up format] "
+      std::cerr << "usage: gguf-moe-benchmark <metallib> [tiles|int8] [35b|flash-next|flint] [rounds] [gate/up format] "
                    "[down format] [shared format]\n";
       return 2;
     }
@@ -423,7 +462,7 @@ int main(int argc, const char *argv[]) {
     }
     try {
       MetalBackend backend(args[1]);
-      return timing(backend, shape, count > 3 ? std::stoul(args[3]) : 20, gateUp, down, shared, tiles);
+      return timing(backend, shape, count > 3 ? std::stoul(args[3]) : 20, int8, gateUp, down, shared, tiles);
     } catch (const std::exception &error) {
       std::cerr << "gguf-moe-benchmark: " << error.what() << '\n';
       return 1;

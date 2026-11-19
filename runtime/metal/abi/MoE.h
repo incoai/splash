@@ -184,6 +184,38 @@ struct MoeGgufExpertParams {
 static_assert(sizeof(MoeGgufExpertParams) == 32,
               "MoE GGUF expert parameters are 32 bytes on both sides");
 
+// An int8 expert pass of a prefill chunk (kernels/shared/moe_int8.metal,
+// ops/MoE.cpp): the grouped rows' int8 codes and scales (the dense prefill's
+// rule, per row and 64 inputs, kernels/common/int8_activations.h), a row per
+// route, the scales' row stride, through the af4g64 or af5g64 planes of the
+// tile's expert as MoeGgufExpertParams reaches them.
+struct MoeInt8ExpertParams {
+  uint32_t input_size;
+  uint32_t output_size; // per expert
+  uint32_t experts;
+  uint32_t routed_format;
+  uint32_t shared_format;
+  uint32_t floor_slots;
+  uint32_t chunk_slots;
+  uint32_t tiles; // MOE_TILES_*
+  uint32_t routes;
+};
+
+static_assert(sizeof(MoeInt8ExpertParams) == 36,
+              "MoE int8 expert parameters are 36 bytes on both sides");
+
+// moe_gather_int8: the grouped rows' codes and scales from the chunk's
+// (rows of input_size codes, scales [input_size / 64][rows]).
+struct MoeGatherInt8Params {
+  uint32_t input_size;
+  uint32_t routes_per_row;
+  uint32_t rows;          // the chunk's, its scales' row stride
+  uint32_t routes;        // the grouped rows, their scales' row stride
+};
+
+static_assert(sizeof(MoeGatherInt8Params) == 16,
+              "MoE int8 gather parameters are 16 bytes on both sides");
+
 // The gate and up passes in one (moe_expert_gguf_m<rows>_gate_up[_mixed]):
 // their sizes, expert count, floor and chunk slots, as MoeGgufExpertParams
 // holds them, and each pass's routed and shared formats. Gate reads

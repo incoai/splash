@@ -565,6 +565,9 @@ struct Runtime::Impl {
   // The fewest rows of each class of a decode step's kernels, up to the most
   // rows a step runs in one pass (ops::ExecutionPlans::decodeRowClasses).
   std::vector<uint32_t> stepClasses;
+  // The fewest rows of each class of a prefill chunk's kernels
+  // (ops::ExecutionPlans::prefillRowClasses).
+  std::vector<uint32_t> prefillClasses;
   uint32_t mostStepRows = kDecodeStepRows;
   // The lookup chains' acceptance, which every unconstrained request's
   // cycles teach under --verify-rows auto, greedy and sampled lanes apart.
@@ -745,10 +748,11 @@ struct Runtime::Impl {
     // pricing its rows (CostLine), whose steps end at the classes' last rows.
     std::optional<std::pair<ops::MoeShape, uint32_t>> moe;
     if (geometry.target.ffnKind == QwenFfnKind::SparseMoe)
-      moe.emplace(geometry.target.moeBlockShape(), geometry.target.moeRouterFormat);
+      moe.emplace(geometry.target.moeShape(), geometry.target.moeRouterFormat);
     if (model.expertStore())
       mostStepRows = std::min(kDecodeStepRows, ExpertStore::cycleRows());
     stepClasses = operators.decodeRowClasses(mostStepRows, moe);
+    prefillClasses = operators.prefillRowClasses(moe);
     if (value.verifyRows == VerifyRows::Auto) {
       verifyBudget.emplace();
       if (model.expertStore()) {
@@ -4215,6 +4219,8 @@ void Runtime::prepareWarmupDecode(uint64_t requestId, uint32_t anchor) {
   entry.lookup.append(entry.tokens);
   entry.lookup.append({&anchor, 1});
 }
+
+std::vector<uint32_t> Runtime::prefillRowClasses() const { return impl_->prefillClasses; }
 
 WarmupStepResult Runtime::warmupPrefill(uint32_t rows) {
   if (!rows || rows > kPrefillRows)

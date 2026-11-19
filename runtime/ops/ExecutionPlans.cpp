@@ -15,21 +15,25 @@ ExecutionPlans::ExecutionPlans(const DeviceCapabilities &device, Int8Activations
 // A chunk's rows pick its projections' tile, and a tile's height names its
 // kernels (gguf_decode_<format>_m<rows>_*, the register tile's _l<tiles>), so
 // each tile and height a chunk takes is a class, and the prefill tile one
-// more. Every other kernel a chunk's rows pick today changes once along them
-// (selectFloatTile, selectMoe, the staged norm, the hyper-connection norm's
-// quarters, and the Neural Engine split, which takes no class's first chunk:
+// more; and a MoE target's expert passes (selectMoe: the 8- or 32-row staged
+// passes, or the int8 passes), each a class. Every other kernel a chunk's
+// rows pick today changes once along them (selectFloatTile, a MoE router's
+// among them, the staged norm, the hyper-connection norm's quarters, and the
+// Neural Engine split, which takes no class's first chunk:
 // AneFfn::kMinimumRows), so a chunk of one row and one of the most take both
 // sides. A class no warmup ran created its kernels while its request waited:
 // 19 s for the 27B's cold 17-row chunk on a 16-core Apple9 plan.
-std::vector<uint32_t> ExecutionPlans::prefillRowClasses() const {
+std::vector<uint32_t> ExecutionPlans::prefillRowClasses(std::optional<std::pair<MoeShape, uint32_t>> moe) const {
   std::vector<uint32_t> first;
-  std::pair<LinearTile, uint32_t> last{};
+  std::tuple<LinearTile, uint32_t, MoeExpertTile, bool> last{};
   for (uint32_t rows = 1; rows <= SPLASH_PREFILL_TOKEN_BUDGET; ++rows) {
     const LinearPlan plan = linear_.plan({{GGUF_TILE_COLUMNS, GGUF_TILE_COLUMNS}, rows});
     const LinearTile tile = plan.configuration().tile;
     // Only the staged and register tiles' kernels are named by their height.
     const bool named = tile == LinearTile::GgufStaged || tile == LinearTile::GgufRegister;
-    const std::pair key{tile, named ? plan.storageRows() : 0};
+    MoeConfig config{};
+    if (moe) config = selectMoe(calibration(), linear_.int8Activations(), moe->first, moe->second, rows);
+    const std::tuple key{tile, named ? plan.storageRows() : 0, config.expertTile, config.int8Passes};
     if (first.empty() || key != last) first.push_back(rows);
     last = key;
   }
@@ -54,7 +58,7 @@ std::vector<uint32_t> ExecutionPlans::decodeRowClasses(uint32_t mostRows,
     const LinearTile tile = plan.configuration().tile;
     const bool named = tile == LinearTile::GgufStaged || tile == LinearTile::GgufRegister;
     MoeConfig config{};
-    if (moe) config = selectMoe(calibration(), moe->first, moe->second, rows);
+    if (moe) config = selectMoe(calibration(), linear_.int8Activations(), moe->first, moe->second, rows);
     const std::tuple key{tile, named ? plan.storageRows() : 0, floats.neuralAccelerator && rows >= floats.minimumRows,
                          uint32_t(config.expertTile)};
     if (first.empty() || key != last) first.push_back(rows);
@@ -76,7 +80,7 @@ DraftAttentionPlan ExecutionPlans::draftAttention(DraftAttentionShape shape,
 }
 
 MoePlan ExecutionPlans::moe(MoeShape shape, uint32_t routerFormat, uint32_t rows) const {
-  return MoE::plan(shape, rows, selectMoe(calibration(), shape, routerFormat, rows));
+  return MoE::plan(shape, rows, selectMoe(calibration(), linear_.int8Activations(), shape, routerFormat, rows));
 }
 
 AttentionWorkspace ExecutionPlans::sequenceAttentionWorkspace(uint32_t queryHeads, kv::Layout layout) const {

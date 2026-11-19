@@ -1081,7 +1081,7 @@ void testARestoreAfterTheOtherWarmupsCreatesNothing(const char *metallibPath) {
           "the runtime's arenas were refused");
   const KvPool::RunwayHold runway(resources->kvPool());
   static_cast<void>(runtime->warmupPrefill(model::ExecutionLimits::prefillTokenBudget));
-  for (const uint32_t rows : resources->modelContext().operators.prefillRowClasses())
+  for (const uint32_t rows : runtime->prefillRowClasses())
     static_cast<void>(runtime->warmupPrefill(rows));
   static_cast<void>(runtime->warmupDecodeBatch(1));
   metal::MetalBackend &backend = resources->backend();
@@ -1113,7 +1113,7 @@ void testALongRequestAfterTheWarmupsCreatesNothing(const char *metallibPath) {
           "the runtime's arenas were refused");
   const KvPool::RunwayHold runway(resources->kvPool());
   static_cast<void>(runtime->warmupPrefill(model::ExecutionLimits::prefillTokenBudget));
-  for (const uint32_t rows : resources->modelContext().operators.prefillRowClasses())
+  for (const uint32_t rows : runtime->prefillRowClasses())
     static_cast<void>(runtime->warmupPrefill(rows));
   static_cast<void>(runtime->warmupDecodeBatch(1));
   metal::MetalBackend &backend = resources->backend();
@@ -1173,7 +1173,7 @@ void testAReplyCaptureAfterTheWarmupsCreatesNothing(const char *metallibPath) {
   require(runtime->capturesInDecode(), "the reply capture's model captures no state in decode");
   const KvPool::RunwayHold runway(resources->kvPool());
   static_cast<void>(runtime->warmupPrefill(model::ExecutionLimits::prefillTokenBudget));
-  for (const uint32_t rows : resources->modelContext().operators.prefillRowClasses())
+  for (const uint32_t rows : runtime->prefillRowClasses())
     static_cast<void>(runtime->warmupPrefill(rows));
   static_cast<void>(runtime->warmupDecodeBatch(1));
   metal::MetalBackend &backend = resources->backend();

@@ -110,6 +110,10 @@ struct RuntimeGeometry final {
     result.target.ropeScaling = descriptor.ropeScaling;
     if (parts.kv) result.spilledKv = descriptor.capabilities.sparseKv;
     result.streamedExperts = parts.experts;
+    // Streamed experts run the staged passes on the slots their load fills
+    // (MoE::addRouted), so a start that streams them takes no int8 passes:
+    // the plan from the files and the model as it loaded decide it alike.
+    if (parts.experts) result.target.moeInt8Experts = false;
     if (parts.experts || parts.kv) result.prefillChunks = kPrefillGroupChunks;
     if (!result.target.valid() || !result.draft.stateLayout().valid() ||
         (parts.kv && !result.target.kvLayout.spillable()) ||

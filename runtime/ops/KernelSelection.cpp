@@ -303,6 +303,15 @@ uint32_t moeRouterFormat(std::span<const BlockMoeWeights *const> blocks) noexcep
   return *router && router < routers.end() - 1 ? uint32_t(router - routers.begin()) : QuantizedSegment::kFloat32;
 }
 
+bool moeInt8Experts(std::span<const BlockMoeWeights *const> blocks) noexcept {
+  const auto takes = [](const BlockExpertProjection &p) {
+    return p.routed.formatId == p.shared.formatId && quant_prefill_int8_format(p.routed.formatId);
+  };
+  return !blocks.empty() && std::ranges::all_of(blocks, [&](const BlockMoeWeights *block) {
+    return takes(block->gate) && takes(block->up) && takes(block->down);
+  });
+}
+
 // Every GPU runs the experts on the staged tile: against the register tile, a
 // 35B-shaped layer takes 16-42% less time on a 10-core M4 at one to four
 // decode lanes of random routes; Apple9 GPUs of 11 to 40 cores are
@@ -316,12 +325,34 @@ uint32_t moeRouterFormat(std::span<const BlockMoeWeights *const> blocks) noexcep
 // Qwen3.8-Flash-Next's (10 of 512); either tile's grouped rows are the
 // step's routes (MoeScratch). The router's float tile follows
 // selectFloatTile by its rows' format.
-MoeConfig selectMoe(const KernelCalibration &calibration, const MoeShape &shape, uint32_t routerFormat,
-                    uint32_t rows) noexcept {
+//
+// A chunk's experts run the int8 passes where its dense projections run the
+// int8 prefill tile (int8 activations on, the device's prefillInt8: Apple10,
+// Apple11; more rows than the decode tiles' 64) and the block's experts take
+// it (MoeShape::int8Experts), once its routes average
+// kInt8PassRoutesPerExpert (6) or more an expert: the quantity that drives
+// the passes' cost, not the chunk's rows. Below it the int8 passes are not
+// shorter in every run, as the int8 tile runs both 16-row fragments of an
+// expert's tile whatever its live rows, where the staged passes run 8-, 16-
+// or 32-row matmuls by live rows. gguf-moe-benchmark int8, af4g64 experts,
+// random routes, int8 against staged ms a layer, two runs each on a 32-core
+// M5 Max and a 20-core M5 Pro, the 35B's shape (top 8 of 256) and
+// Flash-Next's (top 10 of 512): up to 5 routes an expert from 3% shorter to
+// 0.7% longer on the M5 Max (the 35B's 4, 1.005 and 1.007; Flash-Next's 3.1,
+// 1.004 twice), 0.3-5.7% shorter on the M5 Pro; from 6 on shorter in every
+// run, by 0.7-3.0% on the M5 Max and 1.5-8.2% on the M5 Pro at 6 to 12, 4-6%
+// at 16 and 15-21% at the 35B's 2,048 rows (64). So the 35B and the 122B (8
+// of 256) take them from 192 rows, Flint (6 of 256) from 256 and Flash-Next
+// (10 of 512) from 308.
+MoeConfig selectMoe(const KernelCalibration &calibration, Int8Activations int8Activations, const MoeShape &shape,
+                    uint32_t routerFormat, uint32_t rows) noexcept {
+  const uint64_t routes = uint64_t{rows} * shape.expertsPerToken;
   MoeConfig config;
-  config.expertTile = uint64_t{rows} * shape.expertsPerToken > shape.experts ? MoeExpertTile::M32
-                                                                              : MoeExpertTile::M8;
+  config.expertTile = routes > shape.experts ? MoeExpertTile::M32 : MoeExpertTile::M8;
   config.ggufRouterTile = selectFloatTile(calibration, rows, shape.experts, routerFormat);
+  config.int8Passes = shape.int8Experts && int8Activations == Int8Activations::On &&
+                      calibration.projection.prefillInt8 && rows > kMaximumDecodeTileRows &&
+                      routes >= uint64_t{kInt8PassRoutesPerExpert} * shape.experts;
   return config;
 }
 

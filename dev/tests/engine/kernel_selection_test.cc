@@ -488,6 +488,13 @@ std::vector<MoeFormatSet> moeFormatSets() {
   sets.push_back({"router-mixed", {{GGUF_FMT_Q4K, GGUF_FMT_Q4K, GGUF_FMT_Q4K, GGUF_FMT_Q4K, f32},
                                    {GGUF_FMT_Q4K, GGUF_FMT_Q4K, GGUF_FMT_Q4K, GGUF_FMT_Q4K, GGUF_FMT_BF16},
                                    {GGUF_FMT_Q4K, GGUF_FMT_Q4K, GGUF_FMT_Q4K, GGUF_FMT_Q4K, GGUF_FMT_BF16}}});
+  // MLX experts: 4- and 5-bit ones take the int8 prefill passes where the
+  // device's plans run int8 activations (moeInt8Experts); 3-bit ones (Flint's)
+  // and 4-bit experts beside other shared experts keep the staged passes.
+  for (const uint32_t bits : {GGUF_FMT_AF3G64, GGUF_FMT_AF4G64, GGUF_FMT_AF5G64})
+    sets.push_back({formatName(bits), std::vector<BlockFormats>(4, {bits, bits, bits, bits, GGUF_FMT_AF8G64})});
+  sets.push_back({"af4g64-shared-q8_0", std::vector<BlockFormats>(4, {GGUF_FMT_AF4G64, GGUF_FMT_AF4G64, GGUF_FMT_AF4G64,
+                                                                      GGUF_FMT_Q80, GGUF_FMT_AF8G64})});
   return sets;
 }
 
@@ -506,18 +513,20 @@ std::vector<BlockMoeWeights> moeBlocks(const MoeShape &shape, const MoeFormatSet
   return blocks;
 }
 
-// The router format of the target's MoE blocks, as its loaded weights give
-// it (QwenTargetGeometry::finish).
-uint32_t routerFormatOf(const std::vector<BlockMoeWeights> &blocks) {
+// The router format of the target's MoE blocks and whether their experts
+// take the int8 prefill passes, as its loaded weights give them
+// (QwenTargetGeometry::finish).
+std::pair<uint32_t, bool> routerFormatOf(const std::vector<BlockMoeWeights> &blocks) {
   std::vector<const BlockMoeWeights *> pointers;
   for (const BlockMoeWeights &block : blocks) pointers.push_back(&block);
-  return moeRouterFormat(pointers);
+  return {moeRouterFormat(pointers), moeInt8Experts(pointers)};
 }
 
 std::string describe(const MoePlan &plan) {
   const MoeConfig c = plan.configuration();
   std::ostringstream line;
-  line << "tile " << unsigned(c.expertTile) << " router " << unsigned(c.ggufRouterTile) << " tiles "
+  line << "tile " << unsigned(c.expertTile) << " router " << unsigned(c.ggufRouterTile) << " int8 " << c.int8Passes
+       << " tiles "
        << plan.maximumTiles() << " workspace";
   for (const auto field : kMoeWorkspaceFields) line << " " << plan.workspace().*field;
   return line.str();
@@ -534,8 +543,9 @@ void moePlans(Golden &golden, const std::string &name, const ExecutionPlans &pla
     if (family.ffnKind != model::QwenFfnKind::SparseMoe) return;
     const std::string f(family.family);
     for (const MoeFormatSet &set : sets) {
-      const MoeShape shape = family.moeBlockShape();
-      const uint32_t routerFormat = routerFormatOf(moeBlocks(shape, set));
+      MoeShape shape = family.moeBlockShape();
+      const auto [routerFormat, int8Experts] = routerFormatOf(moeBlocks(shape, set));
+      shape.int8Experts = int8Experts;
       Group &decode = golden.group(name, "moe-decode", f);
       Group &prefill = golden.group(name, "moe-prefill", f);
       Group &workspace = golden.group(name, "moe-workspace", f);
@@ -703,9 +713,10 @@ struct Int8Paths final {
 // With int8 activations off every plan of the golden's cases is its plan with
 // them on in bf16 activations, and nothing else of it moves: no chunk runs the
 // int8 prefill tile, no decode plan the int8 decode tiles, no attention plan
-// scores INT8 queries and no prefill bound holds int8 codes or scales. MoE and
-// float-tile selection read no setting. Counts the plans with them on that run
-// each path.
+// scores INT8 queries and no prefill bound holds int8 codes or scales. A MoE
+// plan's int8 passes with them off are model_execution_plan_test's
+// (checkMoeInt8Passes); float-tile selection reads no setting. Counts the
+// plans with them on that run each path.
 Int8Paths int8ActivationsOff(const std::string &name, const ExecutionPlans &on, const ExecutionPlans &off) {
   Int8Paths paths;
   const auto expect = [&](bool holds, const std::string &what) {
@@ -855,7 +866,10 @@ std::optional<std::pair<uint32_t, uint32_t>> unwarmed(std::span<const uint32_t> 
 // 2048 rows selects is a warmup chunk's: its projections' tile and staged
 // height, whole and of its one read row (Linear::plan), with the Neural
 // Engine split from any of its least rows or without it; its float tiles; its
-// MoE blocks' expert and router tiles; and after each of kAttentionHistories,
+// MoE blocks' expert passes (the staged tile's height or the int8 passes) and
+// router tile, of the classes of the target's shape, router format and
+// experts' formats (each a kernel of its own, so each warmed by some chunk);
+// and after each of kAttentionHistories,
 // its attention's kernels and whether its block indexer selects its rows'
 // blocks (BlockIndexer::sparse: Flash-Next's prompt past 2,048 tokens, whose
 // kernels a verify does not run). Adds each that is not to `misses`. It
@@ -865,12 +879,16 @@ std::optional<std::pair<uint32_t, uint32_t>> unwarmed(std::span<const uint32_t> 
 // the most take) and those of GDN, the draft and vision, only the backend's
 // count of pipelines created while serving checks.
 void warmupCovers(const std::string &name, const ExecutionPlans &plans, std::vector<std::string> &misses) {
-  std::vector<uint32_t> warm = plans.prefillRowClasses();
-  warm.push_back(SPLASH_PREFILL_TOKEN_BUDGET);
+  const auto warmed = [](std::vector<uint32_t> classes) {
+    classes.push_back(SPLASH_PREFILL_TOKEN_BUDGET);
+    return classes;
+  };
+  const std::vector<uint32_t> warm = warmed(plans.prefillRowClasses(std::nullopt));
   constexpr uint32_t noHistory[] = {0};
   const auto check = [&](const std::string &what, std::span<const uint32_t> histories, const auto &select,
-                         uint32_t context = 0) {
-    if (const auto chunk = unwarmed(warm, context, histories, select))
+                         uint32_t context = 0, std::span<const uint32_t> chunks = {}) {
+    if (const auto chunk = unwarmed(chunks.empty() ? std::span<const uint32_t>(warm) : chunks, context, histories,
+                                    select))
       misses.push_back(name + " " + what + ": no warmup chunk selects the plan of " + std::to_string(chunk->first) +
                        " rows after " + std::to_string(chunk->second) + " tokens");
   };
@@ -915,19 +933,17 @@ void warmupCovers(const std::string &name, const ExecutionPlans &plans, std::vec
   model::forEachFamily([&](const auto &family) {
     const std::string f(family.family);
     if (family.ffnKind == model::QwenFfnKind::SparseMoe) {
-      const MoeShape shape = family.moeBlockShape();
-      std::vector<uint32_t> seen;
       for (const MoeFormatSet &set : moeFormatSets()) {
-        const uint32_t routerFormat = routerFormatOf(moeBlocks(shape, set));
-        if (std::ranges::find(seen, routerFormat) != seen.end()) continue;
-        seen.push_back(routerFormat);
-        const auto config = [&](uint32_t rows) {
-          return selectMoe(plans.calibration(), shape, routerFormat, rows);
-        };
+        MoeShape shape = family.moeBlockShape();
+        const auto [routerFormat, int8Experts] = routerFormatOf(moeBlocks(shape, set));
+        shape.int8Experts = int8Experts;
+        const std::vector<uint32_t> chunks = warmed(plans.prefillRowClasses(std::pair{shape, routerFormat}));
+        const auto config = [&](uint32_t rows) { return plans.moe(shape, routerFormat, rows).configuration(); };
         check("moe experts " + f + " " + set.name, noHistory,
-              [&](uint32_t rows, uint32_t) { return config(rows).expertTile; });
+              [&](uint32_t rows, uint32_t) { return std::pair{config(rows).expertTile, config(rows).int8Passes}; },
+              0, chunks);
         check("moe router " + f + " " + set.name, noHistory,
-              [&](uint32_t rows, uint32_t) { return config(rows).ggufRouterTile; });
+              [&](uint32_t rows, uint32_t) { return config(rows).ggufRouterTile; }, 0, chunks);
       }
     }
     for (const kv::Format format : {kv::Format::Int8, kv::Format::BFloat16}) {
@@ -956,7 +972,7 @@ void warmupCovers(const std::string &name, const ExecutionPlans &plans, std::vec
 // up to a verify block a lane, selects what a step of its class's last rows
 // does, of every kernel a step's rows pick: its projections' tile and staged
 // height in each set of formats the plans tell apart, its float tiles, and a
-// MoE target's expert and router tiles. Adds each class that holds a change
+// MoE target's plan (MoeConfig). Adds each class that holds a change
 // to `misses`.
 void decodeClassesHold(const std::string &name, const ExecutionPlans &plans, std::vector<std::string> &misses) {
   constexpr uint32_t most = SPLASH_MAXIMUM_BATCH_WIDTH * SPLASH_TARGET_VERIFY_ROWS;
@@ -1000,16 +1016,13 @@ void decodeClassesHold(const std::string &name, const ExecutionPlans &plans, std
   model::forEachFamily([&](const auto &family) {
     if (family.ffnKind != model::QwenFfnKind::SparseMoe) return;
     const std::string f(family.family);
-    const MoeShape shape = family.moeBlockShape();
-    std::vector<uint32_t> seen;
     for (const MoeFormatSet &set : moeFormatSets()) {
-      const uint32_t routerFormat = routerFormatOf(moeBlocks(shape, set));
-      if (std::ranges::find(seen, routerFormat) != seen.end()) continue;
-      seen.push_back(routerFormat);
+      MoeShape shape = family.moeBlockShape();
+      const auto [routerFormat, int8Experts] = routerFormatOf(moeBlocks(shape, set));
+      shape.int8Experts = int8Experts;
       const std::vector<uint32_t> classes = plans.decodeRowClasses(most, std::pair{shape, routerFormat});
-      const auto config = [&](uint32_t rows) { return selectMoe(plans.calibration(), shape, routerFormat, rows); };
-      check("moe experts " + f + " " + set.name, classes, [&](uint32_t rows) { return config(rows).expertTile; });
-      check("moe router " + f + " " + set.name, classes, [&](uint32_t rows) { return config(rows).ggufRouterTile; });
+      check("moe plan " + f + " " + set.name, classes,
+            [&](uint32_t rows) { return plans.moe(shape, routerFormat, rows).configuration(); });
     }
   });
 }
