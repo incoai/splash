@@ -92,4 +92,29 @@ extension TranscriptTests {
         // A line of bars that is no table waits while it streams, and draws as the reply ends.
         #expect(Array(counts.dropFirst(15)) == [0, 0, 1, 0, 1, 2], "\(counts)")
     }
+
+    /// A formula shows as the model wrote it, in code's type: \( \), \[ \] and $$ $$ keep their
+    /// backslashes, and their * and _ are no emphasis; a price's $ and a tier's $$$ stay text. A
+    /// block that streams is one from its first line, never a paragraph first; a line of prose
+    /// that only starts with $$ takes its paragraph, not the rest of the reply.
+    @Test func mathShowsAsTheModelWroteIt() async throws {
+        let checks = try await drawn(#"""
+            const box = document.createElement('div')
+            const same = (selector, text) => [...box.querySelectorAll(selector)].map(element => element.textContent)
+              .join('|') === text ? 1 : 0
+            markdown.draw(box, 'So \\(a*b*c_d_e\\) and $$x_1 * y_1$$, for $5 and $10.\n\n\\[\n\\sum_i x_i * y_i\n\\]')
+            const whole = [same('code.math', '\\(a*b*c_d_e\\)|$$x_1 * y_1$$'), same('pre.math', '\\[\n\\sum_i x_i * y_i\n\\]'),
+                           box.querySelectorAll('em').length, box.textContent.includes('for $5 and $10.') ? 1 : 0]
+            const frames = ['Then:\n\n$$', 'Then:\n\n$$\n\\frac{a*b}{c', 'Then:\n\n$$\n\\frac{a*b}{c}\n$$'].map(text => {
+              markdown.draw(box, text, true)
+              return same('pre.math', text.slice('Then:\n\n'.length)) + box.querySelectorAll('em').length * 10
+            })
+            markdown.draw(box, '$$ is the shell process ID.\n\nAnother *paragraph*.')
+            const prose = [box.querySelectorAll('pre.math').length, box.querySelectorAll('em').length]
+            markdown.draw(box, "Joe's ($$) and Luigi's ($$$)")
+            const tiers = [box.querySelectorAll('.math').length, box.textContent.includes("Joe's ($$) and Luigi's ($$$)") ? 1 : 0]
+            return [...whole, ...frames, ...prose, ...tiers]
+            """#) ?? []
+        #expect(checks == [1, 1, 0, 1, 1, 1, 1, 1, 1, 0, 1], "\(checks)")
+    }
 }

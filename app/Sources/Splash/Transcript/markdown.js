@@ -63,8 +63,65 @@ const markdown = (() => {
     };
   }
 
+  // Math as the model wrote it, \( \), \[ \] or $$ $$ around it: the page draws no formulas, and
+  // Markdown takes their backslashes for escapes and their * and _ for emphasis, which breaks
+  // them. Each is its text whole, its marks with it, in code's type; a line that starts with one
+  // is a block of it to the line that ends it, or, while that has not come, to the end of its
+  // paragraph, so that a formula that streams draws as one from its first line. A single $ is
+  // left alone, as prices take it, and so is a $$ with another $ beside it, as a tier of price
+  // writes it ($$$).
+  const mathMarks = [['$$', '$$'], ['\\[', '\\]'], ['\\(', '\\)']];
+
+  // Whether `src` holds `mark` at `at` as a mark: a $$ with no $ beside it, or another mark.
+  const markAt = (src, at, mark) =>
+    src.startsWith(mark, at) && !(mark === '$$' && (src[at - 1] === '$' || src[at + 2] === '$'));
+
+  function math(parser) {
+    parser.inline.ruler.before('escape', 'math', (state, silent) => {
+      const marks = mathMarks.find(([open]) => markAt(state.src, state.pos, open));
+      if (!marks) return false;
+      const [open, close] = marks;
+      const end = state.src.indexOf(close, state.pos + open.length);
+      if (end <= state.pos + open.length || end + close.length > state.posMax) return false;
+      if (!markAt(state.src, end, close)) return false;
+      if (!silent) state.push('math_inline', 'code', 0).content = state.src.slice(state.pos, end + close.length);
+      state.pos = end + close.length;
+      return true;
+    });
+    parser.block.ruler.before('fence', 'math', (state, start, end, silent) => {
+      if (state.sCount[start] - state.blkIndent >= 4) return false;
+      const first = state.src.slice(state.bMarks[start] + state.tShift[start], state.eMarks[start]);
+      const marks = mathMarks.slice(0, 2).find(([open]) => markAt(first, 0, open));
+      if (!marks) return false;
+      const [open, close] = marks;
+      const rest = first.slice(open.length).trimEnd();
+      let closed = rest.endsWith(close);
+      // A formula that ends within its first line, before more of it, is the line's.
+      if (!closed && rest.includes(close)) return false;
+      if (silent) return true;
+      let line = start;
+      while (!closed && ++line < end) {
+        const from = state.bMarks[line] + state.tShift[line], to = state.eMarks[line];
+        // An empty line ends it unclosed, as no formula holds one: a line of prose that only
+        // starts with its mark, as "$$ is the shell's process ID", takes its paragraph, not the
+        // rest of the answer.
+        if (from >= to || state.sCount[line] < state.blkIndent) break;
+        closed = state.src.slice(from, to).trimEnd().endsWith(close);
+      }
+      state.line = closed ? line + 1 : line;
+      const token = state.push('math_block', 'pre', 0);
+      token.content = state.getLines(start, state.line, state.blkIndent, false);
+      token.map = [start, state.line];
+      token.block = true;
+      return true;
+    }, {alt: ['paragraph', 'reference', 'blockquote', 'list']});
+    parser.renderer.rules.math_inline = (tokens, index) => `<code class="math">${escape(tokens[index].content)}</code>`;
+    parser.renderer.rules.math_block = (tokens, index) => `<pre class="math">${escape(tokens[index].content)}</pre>\n`;
+  }
+
   function configured(parser) {
     emphasisBesideCJK(parser);
+    math(parser);
     parser.core.ruler.push('splash', state => {
       let cell = false;
       for (const token of state.tokens) {
