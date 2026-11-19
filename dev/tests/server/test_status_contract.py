@@ -65,6 +65,8 @@ class StatusContractTests(unittest.TestCase):
         self.assertIn('splash_disk_writes_gated{state="budget"} 1', lines)
         self.assertIn('splash_disk_writes_gated{state="no"} 0', lines)
         self.assertIn("splash_disk_read_bytes_total 12345", lines)
+        self.assertIn("splash_disk_spilled_kv_read_bytes_total 559600000", lines)
+        self.assertIn("splash_disk_weights_read_bytes_total 1973022500", lines)
         self.assertIn("splash_disk_written_bytes_total 67890", lines)
         self.assertIn("splash_disk_written_last_hour_bytes 16384", lines)
         self.assertIn("splash_disk_written_last_day_bytes 65536", lines)

@@ -501,9 +501,18 @@ void writeState(json::Writer &w, const CacheSnapshot &resources, const model::Mo
   });
 }
 
-void writeDisk(json::Writer &w, const engine::EngineSnapshot &core) {
+// Of the SSD cache's reads, spilled K/V's; and the streamed weights' reads,
+// which read_bytes does not count: 29 GB in a 50,842-token prompt of
+// Qwen3.6-35B-A3B on a 16 GB M4, where read_bytes stayed 0.
+void writeDisk(json::Writer &w, const engine::EngineSnapshot &core, const StatusSample &sample) {
   const CacheSnapshot &resources = core.resources;
   const auto &tier = resources.kvTier;
+  const std::optional<StatusSample::KvSpill> &spill = sample.kvSpill;
+  const uint64_t spilledKvReadBytes = (spill && spill->blockCache ? spill->blockCache->reads.readBytes : 0) +
+                                      (spill && spill->historyStream ? spill->historyStream->bytes : 0);
+  uint64_t weightsReadBytes = sample.streamedTable ? sample.streamedTable->readBytes : 0;
+  for (size_t use = 0; sample.streamedExperts && use < std::size(kStreamedUses); ++use)
+    weightsReadBytes += sample.streamedExperts->uses[use].readBytes;
   w.object([&] {
     w.field("capacity_bytes", tier.capacityBytes)
         .field("limit_bytes", tier.limitBytes)
@@ -514,6 +523,8 @@ void writeDisk(json::Writer &w, const engine::EngineSnapshot &core) {
         .field("write_budget_bytes", tier.writeBudgetBytes)
         .field("writes_deferred_ms", tier.writesDeferredMicroseconds / 1000.0)
         .field("read_bytes", tier.readBytes)
+        .field("spilled_kv_read_bytes", spilledKvReadBytes)
+        .field("weights_read_bytes", weightsReadBytes)
         .field("written_bytes", tier.writtenBytes)
         .field("written_last_hour_bytes", tier.writeRate.hourBytes)
         .field("written_last_day_bytes", tier.writeRate.dayBytes)
@@ -789,7 +800,7 @@ std::string runtimeStatusJson(const StatusStart &start, const StatusSample &samp
     w.key("state");
     writeState(w, core.resources, executorTelemetry);
     w.key("disk");
-    writeDisk(w, core);
+    writeDisk(w, core, sample);
     w.key("cache");
     writeCache(w, core);
     w.object("draft_context", [&] {
