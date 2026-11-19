@@ -95,7 +95,7 @@ void testRefusedBuffersCostOnlyThatAttempt() {
   Executor executor(1);
   executor.deniedReservations = 100;
   Events events;
-  engine::Engine engine(test::engineConfig({.prefillCheckpointTokens = kPrefillCheckpointTokens}), resources, executor, events);
+  engine::Engine engine(test::engineConfig(), resources, executor, events);
   guardReleases(storage, engine);
   std::vector<uint32_t> prompt(65, 7);
 
@@ -3062,7 +3062,7 @@ void testLongDecodePreemptionPlansTheCurrentReplayBoundary() {
   executor.deniedReservations = std::numeric_limits<uint32_t>::max();
   Events events;
   GovernedHost host;
-  EngineConfig config = test::engineConfig({.prefillCheckpointTokens = kPrefillCheckpointTokens});
+  EngineConfig config = test::engineConfig();
   // Keep the old 4096-token replay boundary distinct from checkpoints.
   config.prefillCheckpointTokens = 8192;
   config = host.connect(std::move(config));

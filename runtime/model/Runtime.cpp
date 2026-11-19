@@ -4107,8 +4107,6 @@ CommandWork Runtime::prefillWork(std::span<const PrefillLane> lanes, uint32_t fi
 
 std::span<ElasticPool *const> Runtime::pools() noexcept { return impl_->pools; }
 
-uint32_t Runtime::draftRows() const noexcept { return impl_->states.layout().draft.rows; }
-
 uint32_t Runtime::draftWindow() const noexcept {
   return impl_->states.layout().draft.window;
 }

@@ -653,8 +653,7 @@ void testDense35BKeepsMainsPlan() {
     require(mains.maximumContextTokens() == context && mains.breakdown().kvCapacityTokens == capacityTokens &&
                 mains.breakdown().contextBounds.bound() != std::string_view("disk") &&
                 test::jsonOf(mains).find("\"kv_spill\":null") != std::string::npos,
-            std::string("the 35B's plan on the ") + mac.name + " is not main's: context=" +
-                std::to_string(mains.maximumContextTokens()) + " capacity=" + std::to_string(mains.breakdown().kvCapacityTokens));
+            std::string("the 35B's plan on the ") + mac.name + " is not main's");
   }
 }
 

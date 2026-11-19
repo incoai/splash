@@ -354,7 +354,6 @@ class StreamingToolCallProjector:
             self._emit_content(self.syntax.call_open + name, events)
             return
         self.state = "arguments"
-        self.arguments_started = False
         self.argument_fragments = []
         self.parameter_count = 0
         self.parameter_names = set()

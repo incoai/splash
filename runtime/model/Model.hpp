@@ -670,15 +670,12 @@ struct ExecutionLimits final {
   // The most rows of a lane's verify block, which every target kernel takes.
   static constexpr uint32_t targetVerifyRows = SPLASH_TARGET_VERIFY_ROWS;
   static constexpr uint32_t draftContextTokens = SPLASH_DRAFT_SLIDING_WINDOW;
-  // The longest ring the compiled draft variants keep (metal/abi/DraftAttention.h):
-  // correctness reads a model's draft layout's window, engine sizing this.
-  static constexpr uint32_t draftWindowLimit = 16384;
   // The most target layers a DFlash2 draft reads (its target_layer_ids).
   static constexpr uint32_t maximumDraftTargetLayers = 8;
   static constexpr uint32_t speculativeScratchTokens = SPLASH_SPECULATIVE_SCRATCH_TOKENS;
   // One step emits at most its retained verify rows plus a terminal anchor
   // (a stop token or the last budgeted token) that never receives a KV row.
-  static constexpr uint32_t maximumStepTokens = SPLASH_DRAFT_BLOCK_ROWS_LIMIT + 1;
+  static constexpr uint32_t maximumStepTokens = targetVerifyRows + 1;
   // Direct finite-option scoring (SemIf/Jev): a score-only request carries
   // 2..255 distinct token ids and returns their raw final-position logits.
   static constexpr uint32_t minimumScoreOptions = 2;
@@ -928,16 +925,6 @@ public:
   [[nodiscard]] virtual uint32_t draftWindow() const noexcept {
     return SPLASH_DRAFT_SLIDING_WINDOW;
   }
-  // The rows a draft cycle drafts and its target verifies (the compiled
-  // variant's block): the draft's proposals are rows 1..rows-1 of its input
-  // and the verify runs all rows through the target. The shipped drafts keep
-  // the ABI's 8-row block; a variant trained for longer blocks returns its
-  // own, which the verify kernels compile a geometry for.
-  [[nodiscard]] virtual uint32_t draftRows() const noexcept {
-    return SPLASH_DRAFT_QUERY_ROWS;
-  }
-  [[nodiscard]] uint32_t draftProposalTokens() const noexcept { return draftRows() - 1; }
-  [[nodiscard]] uint32_t targetVerifyRows() const noexcept { return draftRows(); }
   // The bytes releaseIdleBuffer(keepLane), called until it gives none,
   // releases once the cache has let go of `evictedStates` more cached states,
   // whose buffers return to the pool: the pooled buffers, beyond those the

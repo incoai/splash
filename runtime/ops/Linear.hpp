@@ -103,12 +103,12 @@ inline constexpr uint32_t kMaximumDecodeTileRows = 64;
 }
 inline constexpr uint32_t kMaximumRegisterRows = SPLASH_MAXIMUM_BATCH_WIDTH * GGUF_TABLE16_ROWS;
 // A one-pass gate/up pair's simdgroup holds both tensors' sums of every row:
-// up to 32 rows (kernels/shared/gguf_linear.metal); a plan of more runs the
-// pair in two passes.
+// up to 64 rows (kernels/shared/gguf_linear.metal). Automatic selection
+// retains the calibrated 32-row bound except for the wide clamped pair.
 inline constexpr uint32_t kMaximumPairRows = 64;
 // The int8 decode tiles' simdgroups hold their int32 and fp32 sums of every
-// row up to 32 rows; a plan of more keeps bf16 activations on the staged tile
-// (kernels/shared/gguf_linear.metal).
+// row up to 64 rows (kernels/shared/gguf_linear.metal). Automatic selection
+// keeps the calibrated 32-row bound.
 inline constexpr uint32_t kMaximumInt8Rows = 64;
 // Keep the automatic policy at the upstream calibrated width; wider tiles
 // remain available to explicit plans and their numerical qualification.

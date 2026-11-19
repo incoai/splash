@@ -715,8 +715,7 @@ struct FlintGguf final {
 // Ripple's GGUFs (ricursive): the hybrid's mixer and FFN sections with a
 // norm after each FFN, the packed q holding the gate rows as the Qwen3.5's
 // own do, a value-residual lambda a block, and the 4+1 sliding pattern the
-// layout holds and the file's array states. Its planner is to land; the
-// metadata the installer checks and the arrays the planner reads are here.
+// layout holds and the file's array states.
 struct RippleGguf final {
   static constexpr std::string_view architecture = "ricursive";
 

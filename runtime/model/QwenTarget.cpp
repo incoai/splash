@@ -268,6 +268,8 @@ void QwenTarget::addPrefillMixer(PrefillStep &step, const QwenAttentionWeights &
                                  BlockOutput output, std::span<const ops::AttentionBlocks> blocks) const {
   const QwenTargetPrefillBuffers &b = step.buffers;
   const ops::Linear &linear = operators_.linear();
+  if (!step.readRows.empty() && !output.residual)
+    throw std::logic_error("a Qwen prefill layer that outputs its read rows alone has no residual rows");
   linear.add(step.graph,
              {.input = b.normalized, .output = b.fullPacked, .scratch = b.linearScratch,
               .prepared = std::move(normalized)},
@@ -405,12 +407,12 @@ void QwenTarget::addNormalizedHead(metal::CommandGraph &graph, const ops::NormWe
 
 void QwenTarget::addCapture(metal::CommandGraph &graph, uint32_t slot, metal::MetalBuffer output,
                             uint32_t sourceRow, metal::MetalBuffer captured, uint32_t destinationRow,
-                            uint32_t rows, ops::RowLanes lanes) const {
+                            uint32_t rows) const {
   const uint32_t width = geometry_.hiddenSize, capturedWidth = geometry_.capturedHiddenSize();
   if (slot >= capturedWidth / width)
     throw std::logic_error("Qwen target capture slot past the captured hidden rows");
   ops::RowCopy::add(graph, std::move(output), {sourceRow, width, 0}, std::move(captured),
-                    {destinationRow, capturedWidth, slot * width}, rows, width, lanes);
+                    {destinationRow, capturedWidth, slot * width}, rows, width);
 }
 
 namespace {

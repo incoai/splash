@@ -24,7 +24,6 @@ public:
   // The draft ring's slots the served model's draft keeps (its compiled
   // variant's window), which its context plans and length checks read.
   [[nodiscard]] uint32_t draftWindow() const noexcept override;
-  [[nodiscard]] uint32_t draftRows() const noexcept override;
   [[nodiscard]] uint64_t idleBufferBytes(uint32_t evictedStates, bool afterStart,
                                          bool keepLane) const noexcept override;
   [[nodiscard]] uint64_t startStateBytes() const noexcept override;

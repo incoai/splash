@@ -190,30 +190,29 @@ decodeTensorBytes(const RuntimeGeometry &geometry,
   // A step's packed rows (decodeRowTensor) and a lane's verify block's
   // positions: kDecodeRows a lane.
   const uint64_t r = kDecodeRows;
-  const uint64_t block = r;
   put(DecodeTensor::InputTokens, bytesFor<uint32_t>(r));
   put(DecodeTensor::DraftPositions, bytesFor<uint32_t>(r));
   put(DecodeTensor::ContextProjected,
-      bytesFor<uint16_t>(block * geometry.draft.hiddenSize));
+      bytesFor<uint16_t>(r * geometry.draft.hiddenSize));
   put(DecodeTensor::ContextHidden,
-      bytesFor<uint16_t>(block * geometry.draft.hiddenSize));
+      bytesFor<uint16_t>(r * geometry.draft.hiddenSize));
   put(DecodeTensor::ContextKv,
-      bytesFor<uint16_t>(block * geometry.draft.contextKvSize()));
+      bytesFor<uint16_t>(r * geometry.draft.contextKvSize()));
   put(DecodeTensor::CapturedTargetHidden,
-      bytesFor<uint16_t>(block * geometry.draft.targetHiddenSize()));
+      bytesFor<uint16_t>(r * geometry.draft.targetHiddenSize()));
   put(DecodeTensor::DraftQueryKeys, draftWorkspace.queryKeysBytes);
   put(DecodeTensor::DraftQueryValues, draftWorkspace.queryValuesBytes);
   // A lane's verify block's positions, the first kDraftRows of which its
   // draft's rows take and one a retained row of which its context commit
   // takes, so one RoPE table per lane serves both.
   put(DecodeTensor::DraftRopeCos,
-      bytesFor<float>(block * geometry.draftRotaryPairs()));
+      bytesFor<float>(r * geometry.draftRotaryPairs()));
   put(DecodeTensor::DraftRopeSin,
-      bytesFor<float>(block * geometry.draftRotaryPairs()));
+      bytesFor<float>(r * geometry.draftRotaryPairs()));
   put(DecodeTensor::FinalHidden,
-      bytesFor<uint16_t>(block * geometry.target.hiddenSize));
+      bytesFor<uint16_t>(r * geometry.target.hiddenSize));
   put(DecodeTensor::Logits,
-      bytesFor<float>(block * geometry.target.vocabularySize));
+      bytesFor<float>(r * geometry.target.vocabularySize));
   put(DecodeTensor::ArgmaxValues, samplingWorkspace.argmaxValuesBytes);
   put(DecodeTensor::ArgmaxIndices, samplingWorkspace.argmaxIndicesBytes);
   put(DecodeTensor::TargetPartialMasses, samplingWorkspace.partialMassesBytes);
@@ -224,9 +223,9 @@ decodeTensorBytes(const RuntimeGeometry &geometry,
       samplingWorkspace.vocabularyArrivalsBytes);
   put(DecodeTensor::SamplingUniforms, bytesFor<float>(kSamplingUniformCount));
   put(DecodeTensor::ConstraintMasks,
-      bytesFor<uint32_t>(uint64_t{kDecodeRows + 1} *
+      bytesFor<uint32_t>(uint64_t{ExecutionLimits::maximumStepTokens} *
                          geometry.maskWords()));
-  put(DecodeTensor::OutputTokens, bytesFor<uint32_t>(block));
+  put(DecodeTensor::OutputTokens, bytesFor<uint32_t>(r));
   put(DecodeTensor::RetainedCount, sizeof(uint32_t));
   put(DecodeTensor::RetainedRows, sizeof(uint32_t));
   put(DecodeTensor::AcceptedCount, sizeof(uint32_t));

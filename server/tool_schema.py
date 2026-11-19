@@ -825,18 +825,6 @@ _NAME = _lark_regex(rf"[^<> \t\n\r]([^<>\n\r]{{0,{MAX_NAME_LENGTH - 2}}}[^<> \t\
 _RAW_VALUE = "/(?s:.*)/"
 
 
-def _regex_bytes(text):
-    """`text`'s bytes as regex escapes, so a lexer that holds the spelling
-    for another rule (a suffix stop) reads this one cleanly."""
-    return "".join("\\x%02x" % byte for byte in text.encode())
-
-
-def _regex_bytes(text):
-    """`text`'s bytes as regex escapes, so a lexer that holds the spelling
-    for another rule (a suffix stop) reads this one cleanly."""
-    return "".join("\\x%02x" % byte for byte in text.encode())
-
-
 def _tags(syntax, *tags):
     """Tags of `syntax` in a row, as a grammar writes them: each as its token
     where the tags are tokens of the family's tokenizer (Flint's), which the

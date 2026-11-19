@@ -323,7 +323,7 @@ inline std::vector<Tensor> tensorTable(const model::QwenTargetDimensions &g, con
       add(p + "ffn_down.weight", {g.intermediateSize, hidden});
     }
     if (ripple) add(p + "post_ffw_norm.weight", {hidden});
-    if (g.hasPle() && layer == g.pleLayer) {
+    if (g.pleNgram && layer == g.pleLayer) {
       add(p + "ple_key.weight", {g.pleWidth(), streams});
       add(p + "ple_value.weight", {g.pleWidth(), hidden});
       add(p + "ple_norm_key.weight", {streams});

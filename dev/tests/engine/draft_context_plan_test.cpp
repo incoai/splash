@@ -111,9 +111,7 @@ void testFinalFullBlockBound() {
 }
 
 void testBenchmarkWorkIncludesRecoveryPoints() {
-  // The shipped drafts' spacing: two of their windows, which the default
-  // derives for a model that keeps their ring.
-  const uint32_t interval = 2 * SPLASH_DRAFT_SLIDING_WINDOW;
+  const uint32_t interval = engine::kPrefillCheckpointTokens;
   using benchmark::expectedDraftContextRows;
   // No checkpoint lies within one prefill chunk of an end: not 8192 before
   // the 10K prompt's replay boundary at 9984, nor 12288 before the 14K

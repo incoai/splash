@@ -633,8 +633,7 @@ constexpr uint32_t decodeTensorCount =
 [[nodiscard]] TargetRows decodeTargetRows(const RuntimeGeometry &geometry, const ops::ExecutionPlans &operators);
 
 // One slot of a state lane's decode tape (DecodeTensor::GdnTape): one step of
-// every GDN layer (ops::GdnTapeLane). A lane holds three: two a 16-row
-// verify's sub-passes leave holding live rows, one for the step at hand.
+// every GDN layer (ops::GdnTapeLane). A lane holds two, one per state parity.
 [[nodiscard]] uint64_t gdnTapeSlotBytes(const RuntimeGeometry &geometry) noexcept;
 
 [[nodiscard]] std::array<uint64_t, decodeTensorCount>
@@ -773,7 +772,8 @@ public:
     return std::max(target, draft);
   }
 
-  // The pending and next tape alternate with the lane's two state cells.
+  // The offset in batchSlice(DecodeTensor::GdnTape, kLaneCount) of state
+  // lane `stateLane`'s tape slot of parity `parity`.
   [[nodiscard]] uint64_t gdnTapeSlot(uint32_t stateLane, uint32_t parity) const {
     if (stateLane >= kLaneCount || parity > 1)
       throw std::out_of_range("invalid GDN tape slot");

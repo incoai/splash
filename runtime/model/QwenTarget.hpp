@@ -13,7 +13,6 @@
 #include "ops/MoE.hpp"
 #include "ops/Normalization.hpp"
 #include "ops/PagedAttention.hpp"
-#include "ops/RowCopy.hpp"
 
 #include <algorithm>
 #include <array>
@@ -714,11 +713,9 @@ protected:
   // Copies `rows` rows of a layer's output rows, from row `sourceRow` of
   // `output`, into capture slot `slot` of the captured hidden rows from row
   // `destinationRow`: the draft's capture of a layer whose output is one row
-  // of hiddenSize values. A verify sub-pass's rows scatter into the lanes'
-  // whole-block rows with `lanes` (rows per lane, lane stride).
+  // of hiddenSize values.
   void addCapture(metal::CommandGraph &graph, uint32_t slot, metal::MetalBuffer output, uint32_t sourceRow,
-                  metal::MetalBuffer captured, uint32_t destinationRow, uint32_t rows,
-                  ops::RowLanes lanes = {}) const;
+                  metal::MetalBuffer captured, uint32_t destinationRow, uint32_t rows) const;
   // Before prefill layer `index`: the target's last layer, an attention
   // layer the draft does not read, outputs each sequence's last row alone,
   // all the runtime reads of it (addPrefill), its MoE on a plan of those rows

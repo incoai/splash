@@ -217,13 +217,11 @@ void DFlashDraft::addContextPrefill(
                                         ops::draftVariant(layout.attentionShape()));
   };
   for (const DFlashPrefillSpan &span : spans)
-    if (!getenv("SPLASH_NO_DRAFT_WINDOW"))
-      store(span.compactRow, span.rows, span.startPosition, span.window);
+    store(span.compactRow, span.rows, span.startPosition, span.window);
   // Only the window: a cached state keeps no rings.
   for (const DFlashWindowCapture &capture : windowCaptures)
     store(capture.compactRow, capture.rows, capture.startPosition, capture.window);
-  if (!getenv("SPLASH_NO_DRAFT_KV"))
-    addContextKv(graph, buffers, rows, spans);
+  addContextKv(graph, buffers, rows, spans);
 }
 
 void DFlashDraft::addContextRebuild(metal::CommandGraph &graph,

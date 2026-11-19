@@ -547,10 +547,14 @@ std::string persistentCacheNamespace(const RuntimeCacheIdentity &identity,
             // Dimension-major values add nothing, so dense layouts keep the
             // caches they wrote.
             << (kv.valuesTokenMajor ? " values-token-major" : "");
-  // Pooled index keys: change this identity when pooling, normalization or rotation changes.
+  // A block index's pooled keys (kv::Layout::indexDimension), bf16, one a
+  // block of SPLASH_ATTENTION_BLOCK_TOKENS tokens. A change to how a block's
+  // key is pooled, normalized or rotated changes this line.
   if (kv.indexDimension)
     canonical << " index " << kv.indexDimension << " bf16 block " << SPLASH_ATTENTION_BLOCK_TOKENS;
-  // Sliding windows order the page's regions and its slot label; dense layouts keep their identity.
+  // A sliding window (kv::Layout::windowTokens), which also orders a page's
+  // regions in its slot (kv::Layout::region) and labels a slot with its
+  // page's form (KvSlotLabel). A layout without one keeps the line it had.
   if (!kv.windowedLayers.empty()) {
     canonical << " window " << kv.windowTokens << " layers 0x" << std::hex << kv.windowedLayers.words[0];
     if (kv.windowedLayers.words[1]) canonical << "/" << kv.windowedLayers.words[1];
@@ -582,7 +586,9 @@ std::string persistentCacheNamespace(const RuntimeCacheIdentity &identity,
       canonical << ' ' << draft.layerWindow(layer) << (draft.unrotatedLayers.test(layer) ? 'n' : 'r');
     canonical << '\n';
   }
-  // Native RoPE keeps its identity. A YaRN factor round-trips exactly, so distinct factors never share it.
+  // Without YaRN the line is left out, so the caches written before it
+  // existed stay valid. The factor takes the digits that read back as the
+  // same double, so no two factors share a namespace.
   if (const model::RopeScaling &rope = identity.ropeScaling; rope.yarn())
     canonical << "rope yarn " << std::setprecision(std::numeric_limits<double>::max_digits10) << rope.factor
               << ' ' << rope.originalContextTokens << '\n';
