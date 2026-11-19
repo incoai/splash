@@ -3490,7 +3490,11 @@ void requireBatchedLanesMatchReordered(model::Runtime &executor, const model::Qw
       tokens[index] = seed[(index + 11 * request) % seed.size()];
     return tokens;
   };
-  const auto pages = [](uint32_t request) { return pageRange(40 + 6 * request, 6); };
+  // Held for the check's lifetime: an item's page table is a view.
+  std::vector<std::vector<uint32_t>> pageTables;
+  for (uint32_t request = 0; request < model::ExecutionLimits::maximumBatchWidth; ++request)
+    pageTables.push_back(pageRange(40 + 6 * request, 6));
+  const auto pages = [&](uint32_t request) -> const std::vector<uint32_t> & { return pageTables[request]; };
   // A batch's tokens per request and cycle, and each request's committed
   // state.
   struct Batch final {
