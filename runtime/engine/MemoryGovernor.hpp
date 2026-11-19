@@ -202,6 +202,8 @@ public:
   // does. A refusal records what the claim lacks (need).
   [[nodiscard]] metal::AllocationAdmission allocationAdmission() noexcept;
   void setPressure(MemoryPressure pressure) noexcept;
+  // Released weights and no request, set at each pass (Engine::collectLandings): the host is owed the cache.
+  void setReleased(bool released) noexcept { released_ = released; }
   // What the governor makes of a fresh sample of the host. Reading it
   // changes nothing: the host's band moves only with the samples a
   // reservation or the control pass takes, so /status does not move
@@ -340,8 +342,8 @@ private:
     bool constrained_ = true;
   };
   // The host claim's pass: up to `target` of what it may take at the
-  // host's pressure now, for a start it refused when `forRefusedStart`.
-  [[nodiscard]] FreeResult hostPass(uint64_t target, bool forRefusedStart);
+  // host's pressure now, for memory it is owed when `owed` (ClaimSpec::owed).
+  [[nodiscard]] FreeResult hostPass(uint64_t target, bool owed);
   // Room under the limit beside what is charged and being allocated.
   [[nodiscard]] uint64_t roomBytes() const noexcept;
   // HostRule::sample at a fresh sample of the host.
@@ -396,6 +398,8 @@ private:
   // nothing to take (the band's waiver).
   double nextHostPassMilliseconds_ = 0.0;
   bool bandWaived_ = false;
+  bool released_ = false;
+  uint64_t releasedLanding_ = 0;  // what was on its way back after the released engine's last pass
   // The latest control pass's clock, or the start growth's.
   double clockMilliseconds_ = 0.0;
   // Pools' growth the host's counters may not show yet (unseenGrowthBytes):

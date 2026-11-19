@@ -876,7 +876,7 @@ void testTakeRightsTable() {
        {.units = true, .waitsForWrites = true, .waitsForLandings = false, .inUse = false, .certainReuse = Reuse::None,
         .reserves = Reserves::None, .rebuiltPools = true, .storeAboveFloor = false, .passCommand = false,
         .convertLane = 0}},
-      {"the host with a deficit for a start it refused", rights({.cls = ClaimClass::Host, .forRefusedStart = true}),
+      {"the host with a deficit for a start it refused", rights({.cls = ClaimClass::Host, .owed = true}),
        {.units = true, .waitsForWrites = true, .waitsForLandings = false, .inUse = false, .certainReuse = Reuse::All,
         .reserves = Reserves::None, .rebuiltPools = true, .storeAboveFloor = false, .passCommand = false,
         .convertLane = 0}},

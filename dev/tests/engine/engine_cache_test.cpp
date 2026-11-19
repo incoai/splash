@@ -1282,7 +1282,7 @@ void testCertainReuseByClass() {
                           Case{{.cls = ClaimClass::Growth, .timing = NeedTiming::Immediate}, false, true, true},
                           Case{{.cls = ClaimClass::InService}, true, false, true},
                           Case{{.cls = ClaimClass::Host}, false, true, true},
-                          Case{{.cls = ClaimClass::Host, .forRefusedStart = true}, true, false, true}}) {
+                          Case{{.cls = ClaimClass::Host, .owed = true}, true, false, true}}) {
     Prefixes prefixes;
     for (const uint64_t block : prefixes.blocks)
       prefixes.cache.publishCompositeState(block, std::make_shared<TestState>(100), false);
@@ -5791,7 +5791,7 @@ void testResumePointAndWantedChainsAreCertainReuse() {
   };
   // Prompt 1's state (wanted), prompt 2's and prompt 3's (the resume point).
   for (const ClaimSpec spec : {ClaimSpec{.cls = ClaimClass::InService}, ClaimSpec{.cls = ClaimClass::Start},
-                               ClaimSpec{.cls = ClaimClass::Host, .forRefusedStart = true}})
+                               ClaimSpec{.cls = ClaimClass::Host, .owed = true}})
     require(offered(spec, {.stateBuffers = 1}).first == 3,
             "a claim of class " + std::to_string(static_cast<int>(spec.cls)) +
                 " was not offered the resume point and the wanted chain's state");

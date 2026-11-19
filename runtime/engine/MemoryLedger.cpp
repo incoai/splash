@@ -105,7 +105,7 @@ TakeRights takeRights(const ClaimSpec &spec, const Need &need, MemoryPressure pr
           .waitsForWrites = waits,
           .waitsForLandings = waits && !host,
           .inUse = (inService && waits && spec.reach == ReclaimClass::InUse) || hostCritical,
-          .certainReuse = spec.cls == ClaimClass::Growth || (host && !critical && !spec.forRefusedStart) ? Reuse::None
+          .certainReuse = spec.cls == ClaimClass::Growth || (host && !critical && !spec.owed) ? Reuse::None
                           : spec.cls == ClaimClass::Optional ? Reuse::ResumePoint
                                                              : Reuse::All,
           .reserves = critical || inService || spec.cls == ClaimClass::Start ? Reserves::NextExtent : Reserves::None,

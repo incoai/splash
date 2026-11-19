@@ -664,6 +664,77 @@ void testAHostPassForItsMarginAloneKeepsCertainReuse() {
   }
 }
 
+// An engine whose weights are released owes the host its cache: its control passes take the cached chain, certain
+// reuse too, which with the SSD cache is written there first, until the cache holds next to nothing; the next turn
+// restores the chain from the SSD cache once its weights are back, and without it prefills the chain again. While
+// the weights are held the same passes keep the chain (testAHostPassForItsMarginAloneKeepsCertainReuse).
+void testAReleasedEngineGivesBackItsCache() {
+  for (const bool tiered : {true, false}) {
+    test::Weights weights;
+    HarnessOptions options{.pages = 256, .memory = test::FakeMemory::Config{}};
+    options.engine.weights = WeightResidencyConfig{
+        .weights = &weights, .admit = [](uint64_t, const std::function<void()> &allocate) -> metal::AllocationResult {
+          allocate();
+          return {};
+        }};
+    if (tiered)
+      options.tier = test::TierOptions{.capacity = 256, .transferLimit = 8};
+    test::EngineHarness harness(std::move(options));
+    harness.model.laneFootprintBytes = 64 * 1024;
+    if (tiered) {
+      harness.model.keptTier = std::make_shared<test::OffloadControl>();
+      harness.model.keptTier->ready = true;
+    }
+    // The control pass as the transport runs it, at a command-free point (MemoryControl::run).
+    const auto step = [&] {
+      if (!harness.engine.commandInFlight()) {
+        harness.engine.collectLandings(harness.now());
+        static_cast<void>(harness.governor->controlPass(harness.now()));
+      }
+      // A tick that writes back a part of the weights changes nothing the harness's progress check reads: the
+      // clock moves after every tick.
+      static_cast<void>(harness.tick());
+      harness.advanceTo(harness.now() + 1.0);
+      if (harness.tier)
+        harness.tier->complete();
+      harness.model.restoreControl->ready = true;
+    };
+    test::FakeMemory &memory = *harness.memory;
+    const std::vector<uint32_t> chain(1025, 5);
+    harness.engine.submit(harness.request(1, chain));
+    harness.runUntilIdle();
+    for (const double end = harness.now() + 3000.0; harness.now() < end;)
+      step();
+    const uint32_t kept = harness.pool.snapshot().pagesPrefix;
+    const uint64_t keptKv = memory.held("kv");
+    require(kept != 0 && (!tiered || harness.tier->writes.empty()),
+            "with its weights held, the idle engine's passes did not keep its cache in RAM: " +
+                std::to_string(kept) + " pages cached");
+    require(harness.engine.releaseWeights(harness.now()), "the idle engine's weights were not released");
+    for (const double end = harness.now() + 3000.0; harness.now() < end;)
+      step();
+    // What stays is no cache: the empty extent the next request starts from, and the model's pooled lane buffers.
+    const KvPoolSnapshot pool = harness.pool.snapshot();
+    require(pool.pagesPrefix == 0 && memory.held("kv") <= 4 * 4096 && (!tiered || !harness.tier->writes.empty()),
+            std::string(tiered ? "with" : "without") + " the SSD cache, the released engine kept its cache: " +
+                std::to_string(pool.pagesPrefix) + " cached pages, kv " + std::to_string(memory.held("kv")) + " of " +
+                std::to_string(keptKv) + " bytes, writes " +
+                std::to_string(harness.tier ? harness.tier->writes.size() : 0));
+    std::vector<uint32_t> next = chain;
+    next.push_back(6);
+    harness.engine.submit(harness.request(2, next));
+    for (int each = 0; each < 20'000 && !idle(harness.engine); ++each)
+      step();
+    require(idle(harness.engine) && !weights.released(), "the next turn did not finish on restored weights");
+    const auto at = std::ranges::find(harness.events.startIds, 2);
+    const uint32_t start =
+        at == harness.events.startIds.end() ? 0 : harness.events.starts[static_cast<size_t>(at - harness.events.startIds.begin())];
+    require(start == (tiered ? 1024u : 0u) && (!tiered || harness.tier->restores != 0),
+            std::string(tiered ? "with" : "without") + " the SSD cache, the next turn started at " +
+                std::to_string(start) + ", restores " + std::to_string(harness.tier ? harness.tier->restores : 0));
+  }
+}
+
 // A request that has not started ranks by the work its start restores: a cold start neither outranks a lane in
 // prefill of its priority nor holds room that lane waits for.
 void testAStartRanksByTheWorkItHolds() {
@@ -1545,6 +1616,7 @@ std::span<const test::TestCase> rulesTests() {
       {"testAStartTakesAQueuedChainItsRequestRestoresLater", testAStartTakesAQueuedChainItsRequestRestoresLater},
       {"testAHostRefusedStartBesideALaneTakesAQueuedChain", testAHostRefusedStartBesideALaneTakesAQueuedChain},
       {"testAHostPassForItsMarginAloneKeepsCertainReuse", testAHostPassForItsMarginAloneKeepsCertainReuse},
+      {"testAReleasedEngineGivesBackItsCache", testAReleasedEngineGivesBackItsCache},
       {"testAStartRanksByTheWorkItHolds", testAStartRanksByTheWorkItHolds},
       {"testCopiesAheadForRegrowthStayWithinAUnit", testCopiesAheadForRegrowthStayWithinAUnit},
       {"testALaneAPlanLeavesOutWaitsForItsCommandNotOnItsClaim",
