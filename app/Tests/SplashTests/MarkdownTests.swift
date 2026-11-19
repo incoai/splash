@@ -43,4 +43,24 @@ extension TranscriptTests {
         #expect(shown?.first == "指定数量（N）|“互斥锁”|bold|（括号）")
         #expect(shown?.last.map { !$0.contains("**") && $0.contains("2 * 3 * 4") } == true, "\(shown ?? [])")
     }
+
+    /// A table of a narrow first column and two wide ones cut the first's header, Feature, after
+    /// its sixth letter, as the page wraps anywhere. No column is narrower than its longest word:
+    /// the header is on one line, as the one-letter cells under it are.
+    @Test func aTablesColumnIsNeverNarrowerThanItsLongestWord() async throws {
+        let heights = try await drawn("""
+            const box = document.createElement('div')
+            // As narrow as the chat's column at the window's least size, where the two wide
+            // columns take the room (the property, as the page's policy refuses a style attribute).
+            box.style.width = '520px'
+            document.body.append(box)
+            const wide = "Annotations are evaluated lazily, which speeds a module's import. ".repeat(3)
+            markdown.draw(box, `| Feature | Python 3.14 | Python 3.15 |\\n|---|---|---|\\n| 1 | ${wide} | ${wide} |\\n| 2 | ${wide} | ${wide} |`)
+            const heights = [box.querySelector('th > div').getBoundingClientRect().height,
+                             box.querySelector('td > div').getBoundingClientRect().height]
+            box.remove()
+            return heights
+            """, as: [Double].self) ?? []
+        #expect(heights.count == 2 && heights[0] > 0 && heights[0] == heights[1], "\(heights)")
+    }
 }

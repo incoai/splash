@@ -124,7 +124,9 @@ pre code {
   background: none;
 }
 
-/* Tables at the width their cells need, a cell wrapping at 320 pt, rows apart by a rule. */
+/* Tables at the width their cells need, a cell wrapping at 320 pt, rows apart by a rule. A column
+   is never narrower than its longest word, which the page's wrapping anywhere would let the table
+   cut to fit, a short header over three letters and one under them: a table too wide scrolls. */
 .table { overflow-x: auto; }
 
 /* Each cell draws its own rule, once, where collapsed borders would draw the translucent
@@ -145,7 +147,7 @@ th { padding-top: 0; font-weight: 600; }
 tbody tr:last-child td { padding-bottom: 0; }
 tbody td { border-top: 1px solid var(--separator); }
 :is(th, td) + :is(th, td) { padding-left: 20px; }
-:is(th, td) > div { max-width: 320px; }
+:is(th, td) > div { max-width: 320px; overflow-wrap: break-word; }
 
 /* Code's colors, the system's own, after Xcode's. */
 .hljs-comment, .hljs-quote { color: var(--secondary); }
