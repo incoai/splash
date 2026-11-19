@@ -591,11 +591,26 @@ class Repository:
             f"{self.name}/{name}", "rb", revision=self.revision, block_size=8 << 20
         )
 
-    def download(self, names):
+    def missing(self, names):
+        """(bytes, blob ID) of each of names whose blob the Hub cache lacks:
+        what a download of names fetches."""
+        if self.paths is not None:
+            return []
+        blobs = folder(self.name) / "blobs"
+        return [
+            (size, blob)
+            for size, blob in (self.sizes[n] for n in names if n in self.sizes)
+            if not (blob and (blobs / blob).exists())
+        ]
+
+    def download(self, names, *, reserve=0):
         """Each of names -> its local path, downloading what the cache lacks.
-        Before a download, the partial files killed ones left in the
-        repository's blobs folder are removed. Ctrl+C stops the wait for it
-        at once (_interruptible)."""
+        reserve is the bytes of the downloads that follow this one into the
+        Hub cache, which its room check counts too, so that a disk without
+        room for all of them refuses the first (_require_room). Before a
+        download, the partial files killed ones left in the repository's
+        blobs folder are removed. Ctrl+C stops the wait for it at once
+        (_interruptible)."""
         for name in names:
             self._require(name)
         if self.paths is not None:
@@ -603,16 +618,11 @@ class Repository:
         from huggingface_hub import snapshot_download
 
         blobs = folder(self.name) / "blobs"
-        # (bytes, blob ID) of each file whose blob the cache lacks.
-        fetch = [
-            (size, blob)
-            for size, blob in (self.sizes[n] for n in names if n in self.sizes)
-            if not (blob and (blobs / blob).exists())
-        ]
+        fetch = self.missing(names)
         total = sum(size for size, _ in fetch)
         if fetch:
             _remove_abandoned_downloads(blobs)
-            _require_room(self.name, blobs, total)
+            _require_room(blobs, total + reserve)
             print(
                 f"Fetching {len(fetch)} file(s), {total / 1e9:.2f} GB, "
                 f"from {self.name}@{self.revision[:12]}; cached files are reused.",
@@ -722,17 +732,21 @@ def _publish(path, content):
             pending.unlink(missing_ok=True)
 
 
-def _require_room(repo_id, blobs, needed):
+def _require_room(blobs, needed):
     """Refuse a download of needed bytes into the blobs folder that its volume
     has no room for, before it fills the disk: the Hub cache can be on
-    another volume (HF_HOME, HF_HUB_CACHE) than the home folder."""
+    another volume (HF_HOME, HF_HUB_CACHE) than the home folder. The refusal
+    is of kind "disk", with the bytes needed and available, which the app
+    words; its message, with the cache's path, is for the log."""
     existing = next(p for p in (blobs, *blobs.parents) if p.exists())
     available = _available_bytes(existing)
     if needed > available:
         raise models.ModelError(
-            f"not enough disk space for {repo_id}: the download needs "
+            f"not enough disk space: the installation needs "
             f"{needed / 1e9:.2f} GB and {available / 1e9:.2f} GB is available "
-            f"in {blobs.parent.parent}"
+            f"in {blobs.parent.parent}",
+            kind="disk",
+            details={"needed": needed, "available": available},
         )
 
 

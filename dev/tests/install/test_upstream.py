@@ -1663,17 +1663,20 @@ class UpstreamTest(unittest.TestCase):
         with contextlib.redirect_stdout(io.StringIO()):
             return upstream.remove(chosen)
 
-    def run_installer(self, *arguments):
+    def run_installer(self, *arguments, language_only=True):
         """models.main's status, JSON events and warnings, for arguments after
-        the models root and MODEL, text only."""
+        the models root and MODEL, text only unless language_only is
+        False."""
         argv = ["--models", str(self.root / "models"), "--model", MODEL]
+        if language_only:
+            argv.append("--language-only")
         with (
             mock.patch.object(hub, "json_progress", False),
             mock.patch("huggingface_hub.utils.disable_progress_bars"),
             contextlib.redirect_stdout(io.StringIO()) as output,
             contextlib.redirect_stderr(io.StringIO()) as warnings,
         ):
-            status = models.main([*argv, "--language-only", *arguments])
+            status = models.main([*argv, *arguments])
         events = [
             json.loads(line)
             for line in output.getvalue().splitlines()
@@ -1919,6 +1922,51 @@ class UpstreamTest(unittest.TestCase):
         self.prepare(plain)
         self.prepare(text_only)
         self.assertEqual(upstream._selections_of(plain), [text_only.link, plain.link])
+
+    def test_a_download_the_disk_has_no_room_for_is_refused_for_the_whole_model(self):
+        # The draft downloads first, and its check counts the target's files
+        # too, each once: the shard that holds the tower and a text tensor is
+        # linked under both target/ and vision/. Freeing what the refusal
+        # names is enough, and no more, so a second try does not stop again
+        # at the target. The error event says so in numbers, classed for the
+        # app.
+        fake = fake_hub(self, self.cache)
+
+        def shared_shard(root):
+            vision_target(root)
+            index = root / "model.safetensors.index.json"
+            shards = json.loads(index.read_text())["weight_map"]
+            shards["language_model.embed_tokens.weight"] = (
+                "model-00001-of-00002.safetensors"
+            )
+            index.write_text(json.dumps({"weight_map": shards}))
+
+        fake.publish(MODEL, "d" * 40, shared_shard)
+        with mock.patch.object(hub, "_available_bytes", lambda path: 0):
+            status, events, _ = self.run_installer("prepare", language_only=False)
+        self.assertEqual(status, 1)
+        [event] = events
+        needed = event["needed"]
+        self.assertEqual(
+            {k: event[k] for k in ("event", "kind", "available")},
+            {"event": "error", "kind": "disk", "available": 0},
+        )
+        self.assertFalse([d for d in fake.downloads if d.endswith(".safetensors")])
+        with mock.patch.object(hub, "_available_bytes", lambda path: needed - 1):
+            status, events, _ = self.run_installer("prepare", language_only=False)
+        self.assertEqual((status, events[0]["needed"]), (1, needed))
+        fake.downloads.clear()
+        with mock.patch.object(hub, "_available_bytes", lambda path: needed):
+            status, _, _ = self.run_installer("prepare", language_only=False)
+        self.assertEqual(status, 0)
+        # What it downloaded, each file once, is what it needed.
+        commits = {MODEL: "d" * 40, DENSE.draft_repo: DRAFT_COMMIT}
+        fetched = 0
+        for download in fake.downloads:
+            owner, name, file = download.split("/", 2)
+            repo = f"{owner}/{name}"
+            fetched += (fake.remote / repo / commits[repo] / file).stat().st_size
+        self.assertEqual(needed, fetched)
 
     def test_the_remove_command_reports_the_bytes_freed(self):
         fake_hub(self, self.cache)

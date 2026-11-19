@@ -764,14 +764,19 @@ def _install(selection, repo, installed, draft=None):
         )
         if draft is None:
             draft = _resolve_draft(target.family, selection, installed, repo)
-        draft, files = _draft(target, installed, draft)
+        # The target's files download after the draft's, which makes room for
+        # both first. A file the assembly links at two paths, such as a shard
+        # holding the tower and text tensors, downloads once.
+        names = set(target.files.values())
+        following = sum(size for size, _ in repo.missing(names))
+        draft, files = _draft(target, installed, draft, following)
         vision = "disabled" if target.vision_format == "none" else "enabled"
         print(
             f"Installing {selection.model} as {target.family.name} ({target.format}); "
             f"draft {draft.name}; vision {vision}.",
             flush=True,
         )
-        downloaded = repo.download(set(target.files.values()))
+        downloaded = repo.download(names)
     files |= {path: downloaded[name] for path, name in target.files.items()}
     publish(
         selection.models_root,
@@ -909,17 +914,18 @@ def _resolve_draft(family, selection, installed, target):
         )
 
 
-def _draft(target, installed, draft):
+def _draft(target, installed, draft, following=0):
     """The draft repository and its downloaded files, by assembly path: draft,
     as this start resolved it, when it is not the installed draft, or else
     the installed one, which is kept too when draft cannot be fetched
-    (downloaded and checked for the target)."""
+    (downloaded and checked for the target). following is the bytes of the
+    downloads after it (Repository.download's reserve)."""
     family = target.family
     recorded = installed and installed["sources"]["draft"]
     if draft.identity() != recorded:
         try:
             with hub.as_model_errors(f"cannot fetch the {family.name} draft"):
-                return draft, draft_files(draft, target)
+                return draft, draft_files(draft, target, following)
         except models.ModelError as error:
             if not recorded:
                 raise
@@ -928,7 +934,7 @@ def _draft(target, installed, draft):
                 f"keeping the installed one: {error}"
             )
     repo = assembly.source(installed, "draft")
-    return repo, draft_files(repo, target)
+    return repo, draft_files(repo, target, following)
 
 
 def _answered(repo):
@@ -942,12 +948,13 @@ def _at(repo):
     return f"{repo.name}@{repo.revision[:12]}" if repo.revision else repo.name
 
 
-def draft_files(repo, target):
+def draft_files(repo, target, following=0):
     """The DFlash2 draft in repo for target's family, downloaded, by assembly
     path: config.json, the safetensors weights and the mask embedding when
     shipped (DRAFT_MASK_EMBEDDING), at the repository's root. The weights
     download only once the engine accepts its configuration with the
-    target's (check_model)."""
+    target's (check_model); following is the bytes of the downloads after
+    them (Repository.download's reserve)."""
     family = target.family
     try:
         if "config.json" not in repo.files:
@@ -973,5 +980,5 @@ def draft_files(repo, target):
             f"{error}"
         ) from error
     mask = {DRAFT_MASK_EMBEDDING} & set(repo.files)
-    downloaded = repo.download({"config.json", *weights, *mask})
+    downloaded = repo.download({"config.json", *weights, *mask}, reserve=following)
     return {"draft/" + name: path for name, path in downloaded.items()}

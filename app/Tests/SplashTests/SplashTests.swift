@@ -1438,6 +1438,18 @@ struct OutputTests {
         #expect(try words("auth")
             == "Hugging Face refused access to a/b. Sign in with an account that can read it (hf auth login) and, "
                 + "if the model asks, accept its terms at huggingface.co/a/b, then try again.")
+        // A disk without room is worded by its numbers, not by the message, which names the
+        // repository downloading (the draft, first) and the cache's path for the log: what it
+        // needs and how much more than is free, which read apart even where what is free rounds
+        // to what it needs.
+        for (needed, available, said) in [(3_870_000_000, 310_000_000, "It needs 3.9 GB of disk space, 3.6 GB more than is free."),
+                                           (4_040_000_000, 3_960_000_000, "It needs 4.0 GB of disk space, 80 MB more than is free."),
+                                           (25_400_000_000, 24_600_000_000, "It needs 25 GB of disk space, 800 MB more than is free.")] {
+            let disk = try #require(Installer.Failure(line: #"{"event": "error", "kind": "disk", "needed": \#(needed), "#
+                + #""available": \#(available), "message": "not enough disk space for incoai/b-DFlash2: the installation "#
+                + #"needs more than is available in /Users/x/.cache/huggingface/hub"}"#))
+            #expect(Installer.problem(disk, model: "a/b:Q4") == said + " Free some space, then try again.")
+        }
         let unclassed = try #require(Installer.Failure(
             line: #"{"event": "error", "kind": null, "message": "cannot install a/b: no supported model"}"#))
         #expect(Installer.problem(unclassed, model: "a/b") == "cannot install a/b: no supported model")
