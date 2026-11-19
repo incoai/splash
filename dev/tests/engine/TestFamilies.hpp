@@ -1,6 +1,7 @@
 #pragma once
 
 #include "model/ModelDescriptor.hpp"
+#include "model/SafetensorsImage.hpp"
 #include "metal/abi/KvExtent.h"
 #include "ops/GDN.hpp"
 #include "ops/KernelCalibration.hpp"
@@ -101,13 +102,19 @@ template <class Family> [[nodiscard]] AttentionGeometry attentionGeometry(const 
 }
 
 // The norms the families that `runs` takes store, as ops::NormWeights::float32
-// values: bf16 first where one of them loads safetensors, whose MLX
-// checkpoints store bf16 norms, then F32, as every family's GGUFs store them.
-// The kernels of a shape that only GGUF-only families run (Qwen3.8-Flash-Next's
-// and Flint's) are compiled for F32 norms alone.
+// values: bf16 first where one of them loads an MLX checkpoint whose images
+// keep its bf16 norms under some naming (safetensors::float32Norms), then F32,
+// as every family's GGUFs store them. The kernels of a shape that only
+// families of F32 norms run (Qwen3.8-Flash-Next's, and Flint's, whose MLX
+// images widen its norms to F32) are compiled for F32 norms alone.
 template <class Runs> [[nodiscard]] std::vector<bool> normsOfFamilies(Runs runs) {
+  using model::safetensors::ModuleNames;
   bool bfloat16 = false;
-  model::forEachFamily([&](const auto &family) { bfloat16 = bfloat16 || (family.loadsSafetensors && runs(family)); });
+  model::forEachFamily([&](const auto &family) {
+    if (!family.loadsSafetensors || !runs(family)) return;
+    for (const ModuleNames names : {ModuleNames::Mlx, ModuleNames::MlxLm, ModuleNames::Transformers})
+      bfloat16 = bfloat16 || !model::safetensors::float32Norms(names, family.ggufArchitecture);
+  });
   return bfloat16 ? std::vector<bool>{false, true} : std::vector<bool>{true};
 }
 // The norms the families of a GDN shape store.
