@@ -917,7 +917,7 @@ int main(int argc, char **argv) {
                    "[--scenario NAME[,NAME...]] [--ane-ffn-share SHARE "
                    "[--ane-ffn-minimum-rows ROWS]] [--max-context TOKENS] "
                    "[--activations auto|bf16] [--verify-rows all|auto] "
-                   "[--logits DIR [--logits-from DIR] [--logits-width LANES]]\n"
+                   "[--logits DIR [--logits-from DIR] [--logits-width LANES] [--logits-cache evict|keep]]\n"
                    "  NAME: decode, partial, short, transcripts, context, exact, logits or resume "
                    "(default: decode,partial,context)\n"
                    "  SHARE: the prefill FFN's Neural Engine share in [0, 1) "
@@ -934,7 +934,10 @@ int main(int argc, char **argv) {
                    "  DIR: the logits scenario's dump, and the earlier dump whose "
                    "prefixes it scores (default: its own greedy transcripts')\n"
                    "  LANES: the score requests the logits scenario runs at once "
-                   "(default: 1)\n";
+                   "(default: 1)\n"
+                   "  --logits-cache: keep leaves the cache between score requests, so that "
+                   "a prefix that extends an earlier one resumes from its KV as a "
+                   "conversation's next turn does (default: evict, each cold)\n";
       return 2;
     }
     uint32_t samples = 1;
@@ -947,6 +950,7 @@ int main(int argc, char **argv) {
     model::VerifyRows verifyRows = model::VerifyRows::All;
     std::optional<std::filesystem::path> logitsDirectory, logitsFrom;
     uint32_t logitsWidth = 1;
+    bool logitsKeepCache = false;
     bool logitsOptions = false;
     for (int index = 3; index < argc; index += 2) {
       if (index + 1 >= argc)
@@ -981,6 +985,12 @@ int main(int argc, char **argv) {
         logitsOptions = true;
         if (logitsWidth > model::ExecutionLimits::maximumBatchWidth)
           throw std::invalid_argument("--logits-width exceeds the batch width");
+      } else if (option == "--logits-cache") {
+        const std::string_view value(argv[index + 1]);
+        if (value != "evict" && value != "keep")
+          throw std::invalid_argument("--logits-cache takes evict or keep");
+        logitsKeepCache = value == "keep";
+        logitsOptions = true;
       } else {
         throw std::invalid_argument("unknown benchmark option");
       }
@@ -988,7 +998,7 @@ int main(int argc, char **argv) {
     if (selected.logits != logitsDirectory.has_value())
       throw std::invalid_argument("the logits scenario and --logits go together");
     if (logitsOptions && !logitsDirectory)
-      throw std::invalid_argument("--logits-from and --logits-width need --logits");
+      throw std::invalid_argument("--logits-from, --logits-width and --logits-cache need --logits");
     if (progressPath)
       progress = std::make_unique<ProgressJournal>(*progressPath, samples);
 
@@ -1461,7 +1471,8 @@ int main(int argc, char **argv) {
     // real requests (TranscriptPrompts.hpp), 256 answer tokens each, 16
     // prefixes into each answer, or after the prefixes an earlier dump
     // scored: score-only requests whose score tokens are the vocabulary, each
-    // cold, logitsWidth at once so that they prefill beside each other.
+    // cold (or after the earlier ones' KV, --logits-cache keep), logitsWidth
+    // at once so that they prefill beside each other.
     if (selected.logits) {
       constexpr uint32_t kAnswerTokens = 256, kPrefixes = 16;
       LogitDump dump;
@@ -1493,7 +1504,8 @@ int main(int argc, char **argv) {
       std::ofstream logits(*logitsDirectory / "logits.f32", std::ios::binary | std::ios::trunc);
       for (size_t first = 0; first < dump.records.size(); first += logitsWidth) {
         const size_t count = std::min<size_t>(logitsWidth, dump.records.size() - first);
-        evictAllCache(resources->cache());
+        if (!first || !logitsKeepCache)
+          evictAllCache(resources->cache());
         for (size_t offset = 0; offset < count; ++offset) {
           const auto [sequence, prefix] = dump.records[first + offset];
           EngineRequest request;
@@ -1506,6 +1518,9 @@ int main(int argc, char **argv) {
         }
         driver.untilIdle();
         for (size_t offset = 0; offset < count; ++offset) {
+          if (logitsKeepCache)
+            std::cerr << "backend-benchmark: logits record " << first + offset << " resumed from "
+                      << events.get(requestId + offset).matchedTokens << " cached tokens\n";
           const std::vector<float> row = events.takeOptionLogits(requestId + offset);
           if (row.size() != vocabulary.size())
             throw std::runtime_error("a score request returned no row of the vocabulary");
