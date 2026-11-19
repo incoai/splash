@@ -110,8 +110,6 @@ TtsEngine::TtsEngine(metal::MetalBackend &backend, TtsModel &model, ops::omni::C
   historyStride_ = config.maxReferenceFrames + config.maxFrames;
   const uint32_t talkerBlocks =
       (textRows_ + config.maxReferenceFrames + config.maxFrames + OMNI_PAGE_TOKENS - 1) / OMNI_PAGE_TOKENS;
-  pool_ = std::make_unique<KvPagePool>(backend, config.kvPages);
-  memoryBytes_ += uint64_t{config.kvPages} * OMNI_PAGE_BYTES;
   talkerTables_ = std::make_unique<LanePageTables>(backend, lanes, c.talker.layers, talkerBlocks);
   predictorTables_ = std::make_unique<LanePageTables>(backend, lanes, c.predictor.layers, 1);
   const Qwen3Decoder &talker = model.talker(), &predictor = model.predictor();
@@ -126,13 +124,11 @@ TtsEngine::TtsEngine(metal::MetalBackend &backend, TtsModel &model, ops::omni::C
                                                   true);
   memoryBytes_ += talkerPrefill_->bytes() + talkerDecode_->bytes() + predictorPrefill_->bytes() + predictorDecode_->bytes();
   for (uint32_t i = 0; i < lanes; ++i) {
-    lanes_.push_back(std::make_unique<Lane>(*pool_, *talkerTables_, *predictorTables_, i));
     streams_.push_back(std::make_unique<ops::omni::CodecStream>(backend, codec.weights(), config.maxChunkFrames));
     memoryBytes_ += streams_.back()->bytes();
   }
   const uint32_t hidden = c.talker.hidden;
   textPool_ = zeroed(backend, uint64_t{lanes} * roundUp(textRows_, 64) * hidden * 2, memoryBytes_, "tts text pool");
-  textTokens_ = zeroed(backend, uint64_t{lanes} * roundUp(textRows_, 64) * 4, memoryBytes_, "tts text tokens");
   positions_ = zeroed(backend, uint64_t{SPLASH_PREFILL_TOKEN_BUDGET} * sizeof(OmniPromptPosition), memoryBytes_, "tts positions");
   stepCodes_ = zeroed(backend, uint64_t{lanes} * OMNI_CODE_GROUPS * 4, memoryBytes_, "tts step codes");
   trailingRows_ = zeroed(backend, uint64_t{lanes} * 4, memoryBytes_, "tts trailing rows");
@@ -181,6 +177,13 @@ TtsEngine::TtsEngine(metal::MetalBackend &backend, TtsModel &model, ops::omni::C
       codecPlacement_ += std::string(" (the Neural Engine refused the codec: ") + error.what() + ")";
     }
   }
+  // The KV pool last, from what the budget leaves (kvPagesFor), and the
+  // lanes over it.
+  config_.kvPages = config.kvPagesFor ? config.kvPagesFor(backend.memoryStats().allocatedBytes) : config.kvPages;
+  pool_ = std::make_unique<KvPagePool>(backend, config_.kvPages);
+  memoryBytes_ += uint64_t{config_.kvPages} * OMNI_PAGE_BYTES;
+  for (uint32_t i = 0; i < lanes; ++i)
+    lanes_.push_back(std::make_unique<Lane>(*pool_, *talkerTables_, *predictorTables_, i));
 }
 
 TtsEngine::~TtsEngine() {
@@ -408,6 +411,17 @@ TtsPrompt ttsPrompt(const TtsConfig &c, const TtsRequest &request) {
 
 // The prompt of a request (docs/omni-design.md, TTS pipeline): the text rows
 // projected in one go per lane, then the positions over them.
+namespace {
+// The pages of a lane's talker positions and its predictor's block.
+uint32_t lanePages(const TtsConfig &model, uint32_t positions) {
+  return (positions + OMNI_PAGE_TOKENS - 1) / OMNI_PAGE_TOKENS * model.talker.layers + model.predictor.layers;
+}
+} // namespace
+
+uint32_t TtsEngine::minimumPages(const TtsConfig &model, const TtsEngineConfig &config) noexcept {
+  return lanePages(model, config.textRows() + config.maxReferenceFrames + std::min(config.maxFrames, kMinimumPoolFrames) + 1);
+}
+
 void TtsEngine::admit(EventSink &sink) {
   const TtsConfig &c = model_.config();
   const uint32_t hidden = c.talker.hidden;
@@ -455,6 +469,26 @@ void TtsEngine::admit(EventSink &sink) {
     const uint32_t textFrames =
         static_cast<uint32_t>(std::min<uint64_t>(std::max<uint64_t>(paced, kMinimumDefaultFrames), config_.maxFrames));
     lane.maxFrames = std::min(lane.request.maxFrames ? lane.request.maxFrames : textFrames, config_.maxFrames);
+    // A pool below one request of this prompt and these frames (a tight
+    // --max-memory) shortens the request to what the pool holds alone.
+    const uint32_t poolPositions =
+        (pool_->pageCount() - c.predictor.layers) / c.talker.layers * OMNI_PAGE_TOKENS;
+    if (poolPositions <= promptRows + 1) {
+      sink.onError(lane.request.id, "engine_busy", "the request's text needs more KV memory than this server's --max-memory leaves");
+      continue;
+    }
+    lane.maxFrames = std::min(lane.maxFrames, poolPositions - promptRows - 1);
+    // The pages it may need to its end, taken now so that no admitted request
+    // runs out of them: it waits for them while others run.
+    if (lanePages(c, promptRows + lane.maxFrames + 1) > pool_->freePages()) {
+      // An idle engine has its whole pool free; it cannot wait for pages.
+      if (!activeLanes() && admitted.empty()) {
+        sink.onError(lane.request.id, "engine_busy", "no KV pages left");
+        continue;
+      }
+      queue_.push_front(std::move(lane.request));
+      break;
+    }
     lane.chunkFrames = std::clamp<uint32_t>(lane.request.chunkFrames ? lane.request.chunkFrames : 25, 1, config_.maxChunkFrames);
     lane.nextChunk = std::min(std::max(config_.firstChunkFrames, 1u), lane.chunkFrames);
     lane.promptTokens = promptRows;
@@ -479,7 +513,7 @@ void TtsEngine::admit(EventSink &sink) {
     lane.rng.seed(lane.request.seed ? lane.request.seed : 0x9E3779B97F4A7C15ull ^ lane.request.id);
     lane.started = Clock::now();
     lane.decodeMicros = std::chrono::microseconds{0};
-    if (!lane.talkerKv.reserve(promptRows + 1) || !lane.predictorKv.reserve(OMNI_CODE_GROUPS)) {
+    if (!lane.talkerKv.reserve(promptRows + lane.maxFrames + 1) || !lane.predictorKv.reserve(OMNI_CODE_GROUPS)) {
       sink.onError(lane.request.id, "engine_busy", "no KV pages left");
       lane.talkerKv.release();
       continue;
@@ -488,10 +522,8 @@ void TtsEngine::admit(EventSink &sink) {
     sink.onStart(lane.request.id, lane.index);
     // Text tokens into the lane's region and their projection.
     const uint32_t base = lane.index * textStride;
-    std::memcpy(at<uint32_t>(textTokens_) + base, tokens.data(), tokens.size() * 4);
-    model_.addTextProjection(graph, backend_.view(textTokens_, uint64_t{base} * 4, uint64_t{textStride} * 4),
-                             backend_.view(textPool_, uint64_t{base} * hidden * 2, uint64_t{textStride} * hidden * 2),
-                             static_cast<uint32_t>(tokens.size()));
+    model_.addTextProjection(graph, lane.index, tokens,
+                             backend_.view(textPool_, uint64_t{base} * hidden * 2, uint64_t{textStride} * hidden * 2));
     const uint64_t referenceBase = uint64_t{lane.index} * config_.maxReferenceFrames;
     for (OmniPromptPosition position : prompt.positions) {
       position.text_row += int32_t(base);

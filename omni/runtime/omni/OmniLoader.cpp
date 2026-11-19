@@ -7,6 +7,11 @@
 #include "model/WeightStore.hpp"
 #include "ops/Omni.hpp"
 
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
 #include <cstdlib>
 #include <cstring>
 #include <memory>
@@ -340,6 +345,7 @@ TtsWeights loadTtsWeights(metal::MetalBackend &backend, model::WeightImages &ima
   TtsWeights w;
   w.talker.dims = c.talker;
   w.predictor.dims = c.predictor;
+  w.textEmbedding = HostTable(root, "talker.model.text_embedding.weight", c.textVocabulary, c.textHidden);
   Loader loader(backend, images, root, "tts");
   loadDecoderLayers(loader, backend, w.talker, "tts", "OMTK0001", "talker.model.", quantized);
   {
@@ -361,10 +367,8 @@ TtsWeights loadTtsWeights(metal::MetalBackend &backend, model::WeightImages &ima
   }
   {
     ImageSpec spec("talker-embeddings.bin", "OMTE0001", c.talker.layers, 2, quantized);
-    spec.table("text_embedding", "talker.model.text_embedding", c.textVocabulary, c.textHidden);
     spec.table("codec_embedding", "talker.model.codec_embedding", c.codecVocabulary, c.talker.hidden);
     loader.load(std::move(spec), [&](ImageReader &reader) {
-      w.textEmbedding = reader.table("text_embedding");
       w.codecEmbedding = reader.table("codec_embedding");
     });
   }
@@ -474,6 +478,48 @@ DFlashDraftWeights loadDFlashDraftWeights(metal::MetalBackend &backend, model::W
     w.decoder.dims.headRows = w.decoder.dims.vocabulary = c.draftVocabulary;
   }
   return w;
+}
+
+HostTable::HostTable(const std::filesystem::path &directory, std::string_view name, uint32_t rows, uint32_t width)
+    : rows_(rows), width_(width) {
+  const model::SafetensorsCheckpoint checkpoint(directory);
+  const model::SourceTensor &tensor = checkpoint.require(name);
+  if (tensor.dtype != "BF16" || tensor.shape != std::vector<uint64_t>{rows, width})
+    throw std::runtime_error(std::string(name) + " is not bf16 [" + std::to_string(rows) + "][" + std::to_string(width) +
+                             "]");
+  const int descriptor = ::open(tensor.file->path().c_str(), O_RDONLY | O_CLOEXEC);
+  if (descriptor < 0) throw std::runtime_error("cannot open " + tensor.file->path().string());
+  struct stat status {};
+  const bool stated = ::fstat(descriptor, &status) == 0;
+  const auto bytes = static_cast<size_t>(status.st_size);
+  void *address = stated && bytes ? ::mmap(nullptr, bytes, PROT_READ, MAP_SHARED, descriptor, 0) : MAP_FAILED;
+  ::close(descriptor);
+  if (address == MAP_FAILED) throw std::runtime_error("cannot map " + tensor.file->path().string());
+  // A request reads scattered rows: read ahead none of their neighbours. The
+  // table's pages are read into the file cache in the background, so a
+  // first request finds its rows there (about 3 ms of page faults for a
+  // hundred rows read from the disk); the system may evict them, and they
+  // are no Metal memory.
+  (void)::madvise(address, bytes, MADV_RANDOM);
+  mapping_ = std::shared_ptr<const uint8_t>(static_cast<const uint8_t *>(address),
+                                            [bytes](const uint8_t *mapped) { ::munmap(const_cast<uint8_t *>(mapped), bytes); });
+  const uint64_t start = tensor.file->dataOffset() + tensor.offset;
+  if (start > bytes || tensor.bytes > bytes - start || tensor.bytes != uint64_t{rows} * width * 2)
+    throw std::runtime_error(std::string(name) + " lies outside its file");
+  data_ = mapping_.get() + start;
+  const auto page = static_cast<uint64_t>(::getpagesize());
+  const uint64_t first = start / page * page;
+  (void)::madvise(const_cast<uint8_t *>(mapping_.get()) + first, start + tensor.bytes - first, MADV_WILLNEED);
+}
+
+void HostTable::copyRows(std::span<const uint32_t> indices, void *destination) const {
+  const size_t rowBytes = size_t{width_} * 2;
+  auto *out = static_cast<uint8_t *>(destination);
+  for (const uint32_t index : indices) {
+    if (index >= rows_) throw std::invalid_argument("a table row is out of range");
+    std::memcpy(out, data_ + size_t{index} * rowBytes, rowBytes);
+    out += rowBytes;
+  }
 }
 
 uint64_t packDenseWeights(metal::MetalBackend &backend, TtsWeights &weights, uint64_t limit) {

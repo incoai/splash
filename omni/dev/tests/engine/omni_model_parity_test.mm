@@ -239,8 +239,6 @@ void checkTts(metal::MetalBackend &backend, const std::string &modelDir, const T
   const std::vector<OmniPromptPosition> &positions = prompt.positions;
   const uint32_t L = static_cast<uint32_t>(positions.size());
   require(L == length && textTokens.size() <= 128, "reference shape mismatch: engine " + std::to_string(L) + " rows, reference " + std::to_string(length));
-  metal::MetalBuffer tokens = backend.allocateBuffer(128 * 4, metal::BufferStorage::Shared, "tokens");
-  std::memcpy(tokens.contents(), textTokens.data(), textTokens.size() * 4);
   metal::MetalBuffer textRows = backend.allocateBuffer(128 * 2048 * 2, metal::BufferStorage::Shared, "text rows");
   metal::MetalBuffer positionBuffer = backend.allocateBuffer(L * sizeof(OmniPromptPosition), metal::BufferStorage::Shared, "positions");
   std::memcpy(positionBuffer.contents(), positions.data(), L * sizeof(OmniPromptPosition));
@@ -259,7 +257,7 @@ void checkTts(metal::MetalBackend &backend, const std::string &modelDir, const T
   Qwen3Decoder::uploadTables(talkerArena, attention);
   static_cast<uint32_t *>(talkerArena.logitRows.contents())[0] = L - 1;
   metal::CommandGraph graph;
-  model.addTextProjection(graph, tokens, textRows, static_cast<uint32_t>(textTokens.size()));
+  model.addTextProjection(graph, 0, textTokens, textRows);
   ops::omni::Embedding::addPromptAssemble(graph, positionBuffer, textRows, static_cast<uint32_t>(textTokens.size()),
                                           model.tables(), {}, {}, 0, talkerArena.hidden, L);
   talker.addForward(graph, talkerArena, talkerKv, {&attention, 1});
@@ -444,8 +442,6 @@ void runTtsForce(metal::MetalBackend &backend, const std::string &modelDir, cons
     std::memset(buffer.contents(), 0, bytes);
     return buffer;
   };
-  metal::MetalBuffer tokens = shared(uint64_t{poolRows} * 4, "tokens");
-  std::memcpy(tokens.contents(), prompt.tokens.data(), textRows * 4);
   metal::MetalBuffer textPool = shared(uint64_t{poolRows} * hidden * 2, "text pool");
   metal::MetalBuffer positions = shared(uint64_t{L} * sizeof(OmniPromptPosition), "positions");
   std::memcpy(positions.contents(), prompt.positions.data(), L * sizeof(OmniPromptPosition));
@@ -509,7 +505,7 @@ void runTtsForce(metal::MetalBackend &backend, const std::string &modelDir, cons
   const auto t0 = std::chrono::steady_clock::now();
   {
     metal::CommandGraph graph;
-    model.addTextProjection(graph, tokens, textPool, textRows);
+    model.addTextProjection(graph, 0, std::span<const uint32_t>(prompt.tokens.data(), textRows), textPool);
     ops::omni::Embedding::addPromptAssemble(graph, positions, textPool, poolRows, model.tables(), {}, {}, 0,
                                             talkerPrefill.hidden, L);
     std::vector<ops::omni::AttentionSequence> descriptors{{talkerTables.offset(0), talkerTables.stride(), 0, L, 0, 0}};

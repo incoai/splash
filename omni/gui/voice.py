@@ -35,19 +35,19 @@ DEFAULT_PORTS = {ASR: 8031, TTS: 8032, LLM: 8033}
 DEFAULT_LANES = {ASR: 2, TTS: 4}
 # Each speech server's --max-memory in GiB, by task, size and precision:
 # what its engine takes with those lanes and its smallest KV pool, which it
-# refuses to exceed (1.7B speech 4.1 GiB at 4-bit, 6.6 at bf16, 0.6B 3.4;
-# transcription 4.1 and 6.3, 0.6B 2.9), and for transcription with its
-# DFlash draft the budget the engine fits the draft in (7.3 and 9.4, 0.6B
-# 6.0; M5 Pro, the engine's own figures).
+# refuses to exceed (speech 2.6 GiB at 1.7B 4-bit, 5.1 at bf16, 1.9 at 0.6B;
+# transcription 2.9, 5.2 and 1.8), and for transcription with its DFlash
+# draft the budget the engine fits the draft in (4.1, 6.7 and 2.8; M5 Pro,
+# the engine's own figures), each rounded up.
 SPEECH_MEMORY_GIB = {
-    (TTS, "1.7B", "4bit"): 5,
-    (TTS, "1.7B", "bf16"): 7,
-    (TTS, "0.6B", "4bit"): 4,
-    (ASR, "1.7B", "4bit"): 5,
-    (ASR, "1.7B", "bf16"): 7,
-    (ASR, "0.6B", "4bit"): 3,
+    (TTS, "1.7B", "4bit"): 3,
+    (TTS, "1.7B", "bf16"): 6,
+    (TTS, "0.6B", "4bit"): 2,
+    (ASR, "1.7B", "4bit"): 3,
+    (ASR, "1.7B", "bf16"): 6,
+    (ASR, "0.6B", "4bit"): 2,
 }
-DRAFT_MEMORY_GIB = {("1.7B", "4bit"): 8, ("1.7B", "bf16"): 10, ("0.6B", "4bit"): 6}
+DRAFT_MEMORY_GIB = {("1.7B", "4bit"): 5, ("1.7B", "bf16"): 7, ("0.6B", "4bit"): 3}
 DEFAULT_ASR = "mlx-community/Qwen3-ASR-1.7B-4bit"
 DEFAULT_TTS = "mlx-community/Qwen3-TTS-12Hz-1.7B-CustomVoice-4bit"
 # The models Splash serves (its README's table), the GGUF variant first.

@@ -74,6 +74,9 @@ struct TtsEngineConfig final {
   uint32_t maxInstructionTokens = 0;
   uint32_t maxFrames = 2048;      // frames per request (12.5 per second)
   uint32_t kvPages = 16384;       // 128 KiB each: 2 GiB
+  // Or the pool's pages from the bytes allocated once everything else is:
+  // the engine creates the pool last, from what its budget leaves.
+  std::function<uint32_t(uint64_t allocatedBytes)> kvPagesFor;
   uint32_t maxChunkFrames = 100;  // frames decoded per codec pass (the stream's capacity)
   // The first chunks of a request are small so audio starts early: a chunk
   // is due at firstChunkFrames frames, the next at twice that, and so on up
@@ -140,6 +143,12 @@ public:
   bool tick(EventSink &sink);
   [[nodiscard]] bool idle() const noexcept;
   [[nodiscard]] uint32_t activeLanes() const noexcept;
+  // The smallest KV pool: one request of the longest prompt and
+  // kMinimumPoolFrames frames. A pool below one request of the longest
+  // prompt and maxFrames frames (a tight --max-memory) shortens what a
+  // request may speak to what it holds.
+  static constexpr uint32_t kMinimumPoolFrames = 1024; // 82 s
+  [[nodiscard]] static uint32_t minimumPages(const TtsConfig &model, const TtsEngineConfig &config) noexcept;
   [[nodiscard]] uint32_t queued() const noexcept { return static_cast<uint32_t>(queue_.size()); }
   [[nodiscard]] uint64_t memoryBytes() const noexcept { return memoryBytes_; }
   // Where the codec's convolutions run, and why not on the Neural Engine.
@@ -205,7 +214,6 @@ private:
   std::deque<TtsRequest> queue_;
   // Step buffers (rows in active-lane order).
   metal::MetalBuffer textPool_;        // bf16 [lanes][textRows][2048]: prompt text rows and trailing rows
-  metal::MetalBuffer textTokens_;      // u32 [lanes][textRows]
   metal::MetalBuffer positions_;       // OmniPromptPosition [prefill rows]
   metal::MetalBuffer stepCodes_;       // u32 [lanes][16]: last frame per row
   metal::MetalBuffer trailingRows_;    // u32 [lanes]

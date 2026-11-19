@@ -191,15 +191,16 @@ blobs and `.incomplete` files in its cache folder.
 `gui/voice.py` runs voice chat's servers as a `VoiceStack` of three
 `ServerSession`s: Qwen3-ASR and Qwen3-TTS, each a `splash-omni serve` with
 few lanes (2 and 4) and the `--max-memory` its model takes there
-(`speech_memory_gib`: 5G for 4-bit speech, 7G for bf16; 5G and 7G for
-transcription, 8G and 10G with the DFlash draft, so the draft fits), and a
+(`speech_memory_gib`: 3G for 1.7B 4-bit speech, 6G for bf16, 2G for 0.6B;
+3G, 6G and 2G for transcription, 5G, 7G and 3G with the DFlash draft, so
+the draft fits), and a
 language model served by
 Splash: `splash serve --model M --language-only --idle-release off`, with
 the model's DFlash2 draft directory as `--draft-model`, `--offline` when
 both are in the Hub cache, and a `--max-memory` that leaves the speech
 servers room (`default_llm_memory`: the GPU's share of the Mac's memory,
-less the two speech budgets and a 1.5 GiB margin; 21G on a 48 GB Mac with
-the default 4-bit models and the draft, 24G without it). `splash`
+less the two speech budgets and a 1.5 GiB margin; 26G on a 48 GB Mac with
+the default 4-bit models and the draft, 28G without it). `splash`
 is found as `$SPLASH_BIN`, else as the launcher of the Splash checkout that
 holds Splash Omni (`../splash`), else on the PATH; a path given on the page
 may also name the runtime of the Splash desktop app
@@ -274,14 +275,14 @@ recording fake AudioContext, and the resampler, segmenter and WAV encoder.
 | `--revision`, `--offline` | Install a named commit; never contact the Hub (a model already here starts without it either way). |
 | `--port`, `--host` | Listen address (default `127.0.0.1:8000`). |
 | `--lanes N` | Concurrent requests decoded in lock step (default 8; TTS at most 16, ASR at most 32). |
-| `--max-memory 28G` | Cap Metal memory; sizes the KV page pool after the weights. A model that does not fit, at the smallest pool (1 GiB), is refused, with what it takes. |
+| `--max-memory 28G` | Cap Metal memory; the KV page pool takes what the weights and workspace leave. A model that does not fit at the smallest pool (one request of the longest prompt) is refused, with what it takes: 4-bit, 1.7B transcription 2.6 GiB at one lane (2.9 at two; 4.1 with the DFlash draft), 1.7B speech 2.5 (2.6 at four lanes), 0.6B 1.6 and 1.8. Under a cap, a request waits for the KV pages it may need, and a speech request may speak only what the pool holds alone. |
 | `--idle-release 10m` | Accepted for compatibility; the audio engine keeps its weights loaded. |
 | `--disable-ane` | The GPU alone. Transcription: by default a 4-bit model's prefill chunks of 160 tokens or more split their FFN with the Neural Engine; speech: by default the codec's convolution stack runs on the Neural Engine (`OMNI_DISABLE_ANE=1` also turns both off, `OMNI_CODEC_ANE=0` the codec's). See [Neural Engine prefill](#neural-engine-prefill) and [Neural Engine codec](#neural-engine-codec). |
-| `--draft-model PATH_OR_ID` | Transcription: speculative decoding with this draft model (a directory, or a repository ID, downloaded into the Hugging Face cache if missing). Default: the DFlash draft `wilsonzheng0327/Qwen3-ASR-1.7B-dflash` for Qwen3-ASR-1.7B (4-bit or bf16), none for other models. A DFlash draft (z-lab or Speculators checkpoint format) reads the served model's hidden states and proposes a block of tokens in one forward; a Qwen3-ASR-0.6B checkpoint drafts one token per forward. The served model verifies the proposals in one forward; transcripts stay its greedy ones (a near-tie may flip, as between batch sizes). With the default draft: 4-bit 2.0x audio s/s one request at a time, 1.3x long-form, 1.1x at 8; bf16 2.9x, 1.7x and 1.4x. About 1.2 GiB more memory and 0.7 GB of disk. See [DFlash draft](docs/omni-performance.md#round-21-a-dflash-draft) and, for the 0.6B, [round 7](docs/omni-performance.md#round-7-speculative-asr-with-a-qwen3-asr-06b-draft). |
+| `--draft-model PATH_OR_ID` | Transcription: speculative decoding with this draft model (a directory, or a repository ID, downloaded into the Hugging Face cache if missing). Default: the DFlash draft of the model's size, `wilsonzheng0327/Qwen3-ASR-1.7B-dflash` for Qwen3-ASR-1.7B (4-bit or bf16) and `wilsonzheng0327/Qwen3-ASR-0.6B-dflash` for Qwen3-ASR-0.6B; none for speech models. A DFlash draft (z-lab or Speculators checkpoint format) reads the served model's hidden states and proposes a block of tokens in one forward; a Qwen3-ASR-0.6B checkpoint drafts one token per forward. The served model verifies the proposals in one forward; transcripts stay its greedy ones (a near-tie may flip, as between batch sizes). With the default draft: 4-bit 2.0x audio s/s one request at a time, 1.3x long-form, 1.1x at 8; bf16 2.9x, 1.7x and 1.4x. About 1.2 GiB more memory and 0.7 GB of disk. See [DFlash draft](docs/omni-performance.md#round-21-a-dflash-draft) and, for the 0.6B, [round 7](docs/omni-performance.md#round-7-speculative-asr-with-a-qwen3-asr-06b-draft). |
 | `--no-draft-model` | Transcription: decode plainly, without the default draft (no download, about 1.2 GiB less memory). |
 | `--draft-tokens K` | Tokens the draft proposes per lane and round, at most: 1-15 (a DFlash draft: its block size less one, 7 for the default draft, each round choosing the count that saves the most; a 0.6B draft: 5 for a 4-bit model, 7 for bf16); fewer when several lanes speculate. |
 | `--speculative-lanes N` | Speculate while at most N requests decode, 1-8 (a DFlash draft: 8, where its rounds save time over plain steps; a 0.6B draft: 1 for a 4-bit model, 8 for bf16, where the rounds of the requests decoding pay for their drafts). |
-| `--segment-seconds S` | Transcription: audio longer than S seconds (default 30) is cut at quiet points into about one segment per lane, decoded concurrently; 0 sends up to 20 minutes as one request. |
+| `--segment-seconds S` | Transcription: audio longer than S seconds (default 30) is cut at quiet points into about one segment per lane, decoded concurrently; 0 sends up to 2 minutes as one request, cutting longer audio there. Requests carry at most 2 minutes, the engine's limit. |
 | `--queue-size`, `--request-timeout`, `--max-request-size` | HTTP admission, as in Splash. |
 | `--api-key`, `--allowed-host`, `--allowed-origin` | Authentication and origin checks, as in Splash. |
 | `--served-model-name` | An extra name the model answers to. |
@@ -385,8 +386,9 @@ How the server handles them:
   resampled to 16 kHz, channels averaged), up to two hours. Audio longer
   than `--segment-seconds` (30) is cut at the quietest 100 ms within 5 s
   before each boundary, into about one segment per lane, decoded
-  concurrently and joined; `--segment-seconds 0` sends up to 20 minutes as
-  one request. Each request carries the chat prefix and suffix tokens (with
+  concurrently and joined; `--segment-seconds 0` sends up to 2 minutes as
+  one request (the engine's limit, `audio_io.MAX_REQUEST_SECONDS`), cutting
+  longer audio there. Each request carries the chat prefix and suffix tokens (with
   a forced `language X<asr_text>`) and the samples, and the server parses
   the language and text from the tokens it streams back.
 

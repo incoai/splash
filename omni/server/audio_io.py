@@ -35,10 +35,12 @@ from .errors import APIError
 
 ASR_SAMPLE_RATE = 16_000
 TTS_SAMPLE_RATE = 24_000
-# What one transcription request may carry (audio_protocol.MAX_SAMPLES), and
-# what an upload may decode to in all: longer audio is refused rather than
-# held as hours of float32 samples.
-MAX_REQUEST_SECONDS = 20 * 60
+# What one transcription request carries at most, the engine's limit
+# (AsrEngineConfig::maxAudioSeconds, from which its audio workspace and its
+# smallest KV pool follow): longer audio is cut into segments of at most this,
+# at quiet points. And what an upload may decode to in all: longer audio is
+# refused rather than held as hours of float32 samples.
+MAX_REQUEST_SECONDS = 2 * 60
 MAX_UPLOAD_SECONDS = 2 * 60 * 60
 # Long audio is cut near each request boundary, at the quietest 100 ms
 # window within 5 s before it, so a request ends between words. Audio longer

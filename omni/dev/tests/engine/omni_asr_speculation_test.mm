@@ -241,12 +241,13 @@ struct Fixture {
 
   // An engine without a draft, or with the target as its draft (an exact
   // one) or a draft that disagrees on every fourth token.
-  std::unique_ptr<AsrEngine> engine(bool draft, bool exact, uint32_t draftTokens, uint32_t speculativeLanes) {
+  std::unique_ptr<AsrEngine> engine(bool draft, bool exact, uint32_t draftTokens, uint32_t speculativeLanes,
+                                    uint32_t kvPages = 1024) {
     AsrEngineConfig config;
     config.lanes = 4;
     config.maxAudioSeconds = 1;
     config.maxTokens = 128;
-    config.kvPages = 1024;
+    config.kvPages = kvPages;
     config.neuralEngine = false;
     config.draftTokens = draftTokens;
     config.speculativeLanes = speculativeLanes;
@@ -284,6 +285,17 @@ void testFormat(metal::MetalBackend &backend, bool affine) {
   for (uint64_t id = 1; id <= kRequests.size(); ++id) {
     require(plain.tokens.at(id).size() == kRequests[id - 1].maxTokens, format + ": plain decoding stopped early");
     require(plain.done.at(id) == DoneReason::Length, format + ": plain decoding did not end at its limit");
+  }
+
+  // A pool that holds the largest request alone (61 + 3 prompt tokens, 128
+  // tokens and a round's 64 rows: 8 pages a layer): every request waits for
+  // the pages it may need, so each still runs to its limit, none cut short
+  // or refused for want of pages.
+  {
+    const uint32_t layers = testConfig(fixture.stopTokens).decoder.layers;
+    const Collector small = run(*fixture.engine(false, false, 0, 0, 8 * layers), allAtOnce());
+    require(small.done.size() == kRequests.size(), format + " pool of one request: a request did not finish");
+    requireSame(plain, small, format + " pool of one request");
   }
 
   // The target's own weights as the draft: every proposal holds.

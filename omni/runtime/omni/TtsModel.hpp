@@ -15,6 +15,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <span>
 
 namespace splash::omni {
 
@@ -55,10 +56,13 @@ public:
   [[nodiscard]] uint32_t maxTextRows() const noexcept { return maxTextRows_; }
   [[nodiscard]] uint32_t maxLanes() const noexcept { return maxLanes_; }
 
-  // tokens (u32 [rows]) -> output (bf16 [rows][2048], capacity whole 64-row
-  // tiles): fc2(silu(fc1(text_embedding[token]) + b1)) + b2.
-  void addTextProjection(metal::CommandGraph &graph, metal::MetalBuffer tokens, metal::MetalBuffer output,
-                         uint32_t rows) const;
+  // tokens -> output (bf16 [rows][talker width], capacity whole 64-row
+  // tiles): fc2(silu(fc1(text_embedding[token]) + b1)) + b2. The rows of
+  // text_embedding are copied on the host, now, into lane `lane`'s region,
+  // which the command reads: a lane's next request writes it only once the
+  // lane is free.
+  void addTextProjection(metal::CommandGraph &graph, uint32_t lane, std::span<const uint32_t> tokens,
+                         metal::MetalBuffer output) const;
   // input (bf16 [rows][2048]) -> output (bf16 [rows][1024]): the code
   // predictor's input projection with its bias. Rows at most 2 * maxLanes.
   void addPredictorInput(metal::CommandGraph &graph, metal::MetalBuffer input, metal::MetalBuffer output,

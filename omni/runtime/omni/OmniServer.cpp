@@ -15,6 +15,7 @@
 #include <cstdio>
 #include <cstring>
 #include <deque>
+#include <functional>
 #include <mutex>
 #include <thread>
 
@@ -43,17 +44,21 @@ uint64_t packedLimit(uint64_t budget, uint64_t weightBytes) {
   return budget > reserved ? budget - reserved : 0;
 }
 
-// The KV page pool: what the budget leaves after `reserved`, at most
-// `ceilingBytes` and at least the `floorPages` the engine takes.
-uint32_t kvPages(uint64_t budget, uint64_t reserved, uint32_t floorPages, uint64_t ceilingBytes) {
-  const uint64_t left = budget > reserved ? budget - reserved : 0;
-  return static_cast<uint32_t>(std::max<uint64_t>(std::min(left, ceilingBytes) / OMNI_PAGE_BYTES, floorPages));
+// What an engine allocates once its pool is made, kept out of the pool: a
+// margin over the buffers of its first requests.
+constexpr uint64_t kPoolMargin = uint64_t{64} << 20;
+
+// The KV page pool, made last (kvPagesFor): what the budget leaves after
+// everything else the engine allocated, at most `ceilingBytes` and at least
+// the `floorPages` the engine takes.
+std::function<uint32_t(uint64_t)> kvPagesFor(uint64_t budget, uint32_t floorPages, uint64_t ceilingBytes) {
+  return [=](uint64_t allocated) {
+    const uint64_t reserved = allocated + kPoolMargin;
+    const uint64_t left = budget > reserved ? budget - reserved : 0;
+    return static_cast<uint32_t>(std::max<uint64_t>(std::min(left, ceilingBytes) / OMNI_PAGE_BYTES, floorPages));
+  };
 }
 
-// The smallest KV pool the engines take, in pages of 128 KiB: 1 GiB, room
-// for a request of the longest speech (about 4,800 pages: 28 layers of up
-// to 5,500 positions) beside a few short ones.
-constexpr uint32_t kFloorPages = 8192;
 
 double gibibytes(uint64_t bytes) { return bytes / double(uint64_t{1} << 30); }
 
@@ -236,7 +241,6 @@ LoadedEngine loadEngine(const ServerOptions &options) {
     ops::omni::CodecDecoderWeights codecWeights =
         ops::omni::loadCodecDecoderWeights(*engine.backend, weights / "speech_tokenizer");
     (void)packDenseWeights(*engine.backend, ttsWeights, packedLimit(budget, engine.backend->memoryStats().allocatedBytes));
-    const uint64_t weightBytes = engine.backend->memoryStats().allocatedBytes;
     TtsEngineConfig config;
     config.lanes = engine.lanes;
     config.maxTextTokens = 1024;
@@ -245,11 +249,14 @@ LoadedEngine loadEngine(const ServerOptions &options) {
     config.maxFrames = 4096;
     // KV pages from what the budget leaves after the weights and up to
     // 3 GiB of arenas and codec workspace, at most 8 GiB.
-    config.kvPages = kvPages(budget, weightBytes + (uint64_t{3} << 30), kFloorPages, uint64_t{8} << 30);
+    config.kvPagesFor = kvPagesFor(budget, TtsEngine::minimumPages(c, config), uint64_t{8} << 30);
     engine.ttsModel = std::make_unique<TtsModel>(*engine.backend, std::move(ttsWeights), c, config.textRows(), engine.lanes);
     engine.codec = std::make_unique<ops::omni::CodecDecoder>(*engine.backend, std::move(codecWeights), config.maxChunkFrames);
     config.aneCodec = !options.disableAne;
     engine.tts = std::make_unique<TtsEngine>(*engine.backend, *engine.ttsModel, *engine.codec, config);
+    // The Neural Engine's codec program, built above, was the last reader of
+    // the fp32 copies of the convolutions the GPU runs in fp16.
+    engine.codec->releaseFloatCopies();
     log("Speech: " + engine.tts->codecPlacement() + ".");
     engine.maxContext = config.textRows() + config.maxReferenceFrames + config.maxFrames;
   } else {
@@ -258,11 +265,11 @@ LoadedEngine loadEngine(const ServerOptions &options) {
     AsrTextWeights textWeights = loadAsrTextWeights(*engine.backend, *engine.images, weights, c, engine.config.quantized);
     const model::SafetensorsCheckpoint checkpoint(weights);
     ops::omni::AudioEncoderWeights tower = ops::omni::loadAudioEncoderWeights(*engine.backend, checkpoint, c.encoder);
-    // The Neural Engine split's resident int8 weights and surfaces take about
-    // 0.3 GiB of an affine checkpoint (ops::AneFfn); a draft's arenas, tower
-    // workspace and audio rows about 0.5 GiB.
-    const uint64_t aneBytes = !options.disableAne && engine.config.quantized ? uint64_t{1} << 29 : 0;
-    const uint64_t draftWorkspaceBytes = uint64_t{1} << 29;
+    // The engine's arenas, tower workspace and audio rows, the Neural Engine
+    // split's int8 weights and a draft's own arenas take at most 1.25 GiB
+    // beside the weights and the KV pool (1.21 GiB for Qwen3-ASR-1.7B-4bit
+    // with its DFlash draft at 32 lanes, 1.08 at 2).
+    constexpr uint64_t workspaceBytes = uint64_t{5} << 28;
     // The draft's weights (for Qwen3-ASR-0.6B-4bit about 0.7 GiB with its
     // bf16 tower), read like the target's.
     std::optional<AsrDraftModel> draft;
@@ -270,16 +277,33 @@ LoadedEngine loadEngine(const ServerOptions &options) {
     // target's hidden states and needs no tower.
     std::optional<AsrDFlashDraft> dflash;
     // A draft serves only where the budget fits it beside the weights, the
-    // ~3 GiB of arenas and workspace, its own workspace and the smallest KV
-    // pool the engine takes; otherwise lanes decode plainly, as without one.
+    // workspace and the smallest KV pool the engine takes with it; otherwise
+    // lanes decode plainly, as without one.
     // Its weights are counted from its checkpoint before they load: loaded
     // weights stay for the engine's life (model::WeightImages).
+    AsrEngineConfig config;
+    config.lanes = engine.lanes;
+    config.maxAudioSeconds = 120;
+    config.maxTokens = 4096;
+    config.neuralEngine = !options.disableAne;
+    config.draftTokens = options.draftTokens;
+    config.speculativeLanes = options.speculativeLanes;
     const bool dflashDraft = !options.draftModel.empty() && isDFlashDraft(options.draftModel);
+    std::optional<DFlashDraftConfig> dflashConfig;
+    std::optional<OmniConfig> draftConfig;
+    if (dflashDraft) dflashConfig = readDFlashDraftConfig(options.draftModel, c);
+    else if (!options.draftModel.empty()) {
+      draftConfig = readOmniConfig(options.draftModel);
+      if (draftConfig->kind != ModelKind::Asr) throw std::runtime_error("the draft model is not a transcription model");
+    }
+    const uint32_t draftLayers =
+        dflashConfig ? dflashConfig->decoder.layers : draftConfig ? draftConfig->asr->decoder.layers : 0;
     bool draftFits = !options.draftModel.empty();
     if (draftFits) {
       const uint64_t needed = engine.backend->memoryStats().allocatedBytes +
-                              checkpointBytes(weightsDirectory(options.draftModel)) + (uint64_t{3} << 30) +
-                              uint64_t{kFloorPages} * OMNI_PAGE_BYTES + aneBytes + draftWorkspaceBytes;
+                              checkpointBytes(weightsDirectory(options.draftModel)) +
+                              uint64_t{AsrEngine::minimumPages(c, config, draftLayers)} * OMNI_PAGE_BYTES +
+                              workspaceBytes + kPoolMargin;
       if (needed > budget) {
         draftFits = false;
         char line[256];
@@ -290,36 +314,24 @@ LoadedEngine loadEngine(const ServerOptions &options) {
         log(line);
       }
     }
-    if (dflashDraft) {
-      const DFlashDraftConfig dflashConfig = readDFlashDraftConfig(options.draftModel, c);
-      if (draftFits)
-        dflash = AsrDFlashDraft{dflashConfig, loadDFlashDraftWeights(*engine.backend, *engine.images,
-                                                                     weightsDirectory(options.draftModel), dflashConfig)};
-    } else if (!options.draftModel.empty()) {
-      const OmniConfig draftConfig = readOmniConfig(options.draftModel);
-      if (draftConfig.kind != ModelKind::Asr) throw std::runtime_error("the draft model is not a transcription model");
-      if (draftFits) {
-        const std::filesystem::path draftWeights = weightsDirectory(options.draftModel);
-        AsrTextWeights draftText =
-            loadAsrTextWeights(*engine.backend, *engine.images, draftWeights, *draftConfig.asr, draftConfig.quantized);
-        const model::SafetensorsCheckpoint draftCheckpoint(draftWeights);
-        draft = AsrDraftModel{*draftConfig.asr, std::move(draftText),
-                              ops::omni::loadAudioEncoderWeights(*engine.backend, draftCheckpoint,
-                                                                 draftConfig.asr->encoder)};
-      }
+    if (dflashConfig && draftFits)
+      dflash = AsrDFlashDraft{*dflashConfig, loadDFlashDraftWeights(*engine.backend, *engine.images,
+                                                                    weightsDirectory(options.draftModel), *dflashConfig)};
+    if (draftConfig && draftFits) {
+      const std::filesystem::path draftWeights = weightsDirectory(options.draftModel);
+      AsrTextWeights draftText =
+          loadAsrTextWeights(*engine.backend, *engine.images, draftWeights, *draftConfig->asr, draftConfig->quantized);
+      const model::SafetensorsCheckpoint draftCheckpoint(draftWeights);
+      draft = AsrDraftModel{*draftConfig->asr, std::move(draftText),
+                            ops::omni::loadAudioEncoderWeights(*engine.backend, draftCheckpoint,
+                                                               draftConfig->asr->encoder)};
     }
     (void)packDenseWeights(*engine.backend, textWeights, packedLimit(budget, engine.backend->memoryStats().allocatedBytes));
-    const uint64_t weightBytes = engine.backend->memoryStats().allocatedBytes;
-    AsrEngineConfig config;
-    config.lanes = engine.lanes;
-    config.maxAudioSeconds = 1200;
-    config.maxTokens = 4096;
-    config.neuralEngine = !options.disableAne;
-    config.draftTokens = options.draftTokens;
-    config.speculativeLanes = options.speculativeLanes;
-    const uint64_t reserved =
-        weightBytes + (uint64_t{3} << 30) + aneBytes + (draft || dflash ? draftWorkspaceBytes : 0);
-    config.kvPages = kvPages(budget, reserved, kFloorPages, uint64_t{12} << 30);
+    config.kvPagesFor = kvPagesFor(budget,
+                                   AsrEngine::minimumPages(c, config, dflash ? dflash->config.decoder.layers
+                                                                       : draft ? draft->config.decoder.layers
+                                                                               : 0),
+                                   uint64_t{12} << 30);
     engine.asr =
         std::make_unique<AsrEngine>(*engine.backend, c, std::move(textWeights), std::move(tower), config, std::move(draft),
                                     std::move(dflash));

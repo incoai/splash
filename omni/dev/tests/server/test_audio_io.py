@@ -237,7 +237,7 @@ class ParallelSegmentTests(unittest.TestCase):
             self.assertEqual(left.end, right.start)
 
     def test_short_audio_and_disabled_segmenting_stay_whole(self):
-        # Never shorter than the minimum, and 0 or one lane keeps 20 minutes.
+        # Never shorter than the minimum, and 0 or one lane keeps the request maximum.
         self.assertEqual(audio_io.parallel_segment_seconds(40.0, 8), 30.0)
         self.assertEqual(
             audio_io.parallel_segment_seconds(300.0, 8, 0.0),

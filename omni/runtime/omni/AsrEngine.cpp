@@ -278,8 +278,6 @@ AsrEngine::AsrEngine(metal::MetalBackend &backend, const AsrConfig &config, AsrT
   // rows beyond them.
   const uint32_t maxContext = maxAudioTokens_ + 256 + engineConfig.maxTokens + 2 * OMNI_MAXIMUM_LANES;
   const uint32_t blocks = (maxContext + OMNI_PAGE_TOKENS - 1) / OMNI_PAGE_TOKENS;
-  pool_ = std::make_unique<KvPagePool>(backend, engineConfig.kvPages);
-  memoryBytes_ += uint64_t{engineConfig.kvPages} * OMNI_PAGE_BYTES;
   // A model's decoder, tower and arenas; its audio rows hold the longest
   // audio it encodes, or a batch's rows.
   const auto build = [&](const AsrConfig &modelConfig, AsrTextWeights modelWeights,
@@ -382,8 +380,6 @@ AsrEngine::AsrEngine(metal::MetalBackend &backend, const AsrConfig &config, AsrT
     const uint32_t speculating = engineConfig.speculativeLanes ? engineConfig.speculativeLanes : kMaximumSpeculativeLanes;
     engineConfig_.speculativeLanes = std::min({speculating, kMaximumSpeculativeLanes, verifyRows_ / 2, lanes});
   }
-  LanePageTables *draftTables = draft_ ? draft_->tables.get() : dflash_ ? dflash_->tables.get() : nullptr;
-  for (uint32_t i = 0; i < lanes; ++i) lanes_.push_back(std::make_unique<Lane>(*pool_, *target_->tables, draftTables, i));
   mel_ = zeroed(backend, uint64_t{maxMelFrames_} * kMelBins * 4, memoryBytes_, "asr mel");
   tokens_ = zeroed(backend, uint64_t{SPLASH_PREFILL_TOKEN_BUDGET} * 4, memoryBytes_, "asr tokens");
   // The identity over every audio row, so a prefill chunk can gather any
@@ -404,6 +400,14 @@ AsrEngine::AsrEngine(metal::MetalBackend &backend, const AsrConfig &config, AsrT
   const char *disabled = std::getenv("OMNI_DISABLE_ANE");
   if (engineConfig.neuralEngine && !(disabled && std::string_view(disabled) == "1") && target_->decoder->affine())
     enableNeuralEngine();
+  // The KV pool last, from what the budget leaves (kvPagesFor), and the
+  // lanes over it.
+  engineConfig_.kvPages =
+      engineConfig.kvPagesFor ? engineConfig.kvPagesFor(backend.memoryStats().allocatedBytes) : engineConfig.kvPages;
+  pool_ = std::make_unique<KvPagePool>(backend, engineConfig_.kvPages);
+  memoryBytes_ += uint64_t{engineConfig_.kvPages} * OMNI_PAGE_BYTES;
+  LanePageTables *draftTables = draft_ ? draft_->tables.get() : dflash_ ? dflash_->tables.get() : nullptr;
+  for (uint32_t i = 0; i < lanes; ++i) lanes_.push_back(std::make_unique<Lane>(*pool_, *target_->tables, draftTables, i));
 }
 
 void AsrEngine::enableNeuralEngine() {
@@ -719,6 +723,40 @@ static uint32_t promptTokensOf(const AsrRequest &request) {
   return static_cast<uint32_t>(request.prefix.size() + audio + request.suffix.size());
 }
 
+// A request's output is at most 64 tokens and 16 per second of its audio:
+// speech transcribes to about 3 a second (Mandarin about 5), so a transcript
+// ends well within it, and a decoding loop stops there rather than at the
+// engine's maximum.
+constexpr uint32_t kOutputTokens = 64, kOutputTokensPerSecond = 16;
+static uint32_t outputLimit(uint64_t samples, uint32_t maxTokens) {
+  // A request without audio is no transcript: the engine's maximum.
+  if (!samples) return maxTokens;
+  const uint64_t limit = kOutputTokens + (kOutputTokensPerSecond * samples + kMelSampleRate - 1) / kMelSampleRate;
+  return static_cast<uint32_t>(std::min<uint64_t>(limit, maxTokens));
+}
+static uint32_t requestMaxTokens(const AsrRequest &request, uint32_t engineMaxTokens) {
+  const uint32_t asked = request.maxTokens ? std::min(request.maxTokens, engineMaxTokens) : engineMaxTokens;
+  return std::min(asked, outputLimit(request.samples.size(), engineMaxTokens));
+}
+// The positions a lane holds at most: its prompt, its output and the rows of
+// a round past its last token (the slack the page tables keep).
+constexpr uint32_t kRoundRows = 2 * OMNI_MAXIMUM_LANES;
+static uint32_t lanePages(uint32_t tokens, uint32_t layers) {
+  return (tokens + kRoundRows + OMNI_PAGE_TOKENS - 1) / OMNI_PAGE_TOKENS * layers;
+}
+static uint32_t requestPages(const AsrRequest &request, uint32_t engineMaxTokens, uint32_t layers) {
+  return lanePages(promptTokensOf(request) + requestMaxTokens(request, engineMaxTokens), layers);
+}
+
+uint32_t AsrEngine::minimumPages(const AsrConfig &config, const AsrEngineConfig &engineConfig,
+                                 uint32_t draftLayers) noexcept {
+  const uint64_t samples = uint64_t{engineConfig.maxAudioSeconds} * kMelSampleRate;
+  // The chat prefix and suffix take at most 256 positions (maxContext).
+  const uint32_t tokens = ops::omni::audioTokens(engineConfig.maxAudioSeconds * (kMelSampleRate / kMelHop)) + 256 +
+                          outputLimit(samples, engineConfig.maxTokens);
+  return lanePages(tokens, config.decoder.layers + draftLayers);
+}
+
 // The features of a lane the draft may take later: none without a draft or
 // for audio longer than the draft's tower takes.
 void AsrEngine::keepFeatures(Lane &lane, std::vector<float> features) {
@@ -944,11 +982,14 @@ bool AsrEngine::admitBatch(EventSink &sink) {
   std::vector<Lane *> free;
   for (auto &lane : lanes_)
     if (!lane->active) free.push_back(lane.get());
-  uint32_t total = 0;
+  uint32_t total = 0, pages = 0;
   size_t count = 0;
   while (count < queue_.size() && count < free.size()) {
     const uint32_t tokens = promptTokensOf(queue_[count]);
     if (total + tokens > SPLASH_PREFILL_TOKEN_BUDGET) break;
+    // Each takes the pages it may need to its end now (admit).
+    pages += requestPages(queue_[count], engineConfig_.maxTokens, config_.decoder.layers);
+    if (pages > pool_->freePages()) break;
     total += tokens;
     ++count;
   }
@@ -976,12 +1017,12 @@ bool AsrEngine::admitBatch(EventSink &sink) {
     lane.promptTokens = static_cast<uint32_t>(request.prefix.size() + audioTokens + request.suffix.size());
     lane.committed = 0;
     lane.generated = 0;
-    lane.maxTokens = request.maxTokens ? std::min(request.maxTokens, engineConfig_.maxTokens) : engineConfig_.maxTokens;
+    lane.maxTokens = requestMaxTokens(request, engineConfig_.maxTokens);
     lane.finished = false;
     lane.decodeMicros = std::chrono::microseconds{0};
     lane.tokens.clear();
     lane.draftDropped = false;
-    if (!lane.kv.reserve(lane.promptTokens + 1)) {
+    if (!lane.kv.reserve(lane.promptTokens + lane.maxTokens + kRoundRows)) {
       sink.onError(request.id, "engine_busy", "no KV pages left");
       lane.kv.release();
       continue;
@@ -1086,6 +1127,17 @@ void AsrEngine::admit(EventSink &sink) {
       break;
     }
   if (!free) return;
+  // The pages the request may need to its end, taken at admission so that no
+  // admitted request runs out of them: it waits for them while others run,
+  // and is refused only where the pool cannot hold it at all.
+  if (requestPages(queue_.front(), engineConfig_.maxTokens, config_.decoder.layers) > pool_->freePages()) {
+    if (activeLanes()) return;
+    const AsrRequest refused = std::move(queue_.front());
+    queue_.pop_front();
+    sink.onError(refused.id, "engine_busy",
+                 "the request's audio needs more KV memory than this server's --max-memory leaves");
+    return;
+  }
   // Features and audio tokens. Audio shorter than one hop yields no frames;
   // such a request has no audio rows. The CPU computes the features while
   // a step queued past the last request's end may still run, which then
@@ -1105,12 +1157,12 @@ void AsrEngine::admit(EventSink &sink) {
   lane.promptTokens = promptTokens;
   lane.committed = 0;
   lane.generated = 0;
-  lane.maxTokens = request.maxTokens ? std::min(request.maxTokens, engineConfig_.maxTokens) : engineConfig_.maxTokens;
+  lane.maxTokens = requestMaxTokens(request, engineConfig_.maxTokens);
   lane.finished = false;
   lane.decodeMicros = std::chrono::microseconds{0};
   lane.tokens.clear();
   lane.draftDropped = false;
-  if (!lane.kv.reserve(promptTokens + 1)) {
+  if (!lane.kv.reserve(promptTokens + lane.maxTokens + kRoundRows)) {
     sink.onError(request.id, "engine_busy", "no KV pages left");
     lane.kv.release();
     return;

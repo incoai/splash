@@ -697,6 +697,18 @@ void testRandomDecoder(metal::MetalBackend &backend) {
                 [&](metal::CommandGraph &g, const metal::MetalBuffer &view) { decoder.addDecode(g, view, frames, output); });
   requireExtent(backend, output, size_t(samples) * 4, 4, "codec output",
                 [&](metal::CommandGraph &g, const metal::MetalBuffer &view) { decoder.addDecode(g, codeBuffer, frames, view); });
+
+  // Without the fp32 copies of the convolutions it runs in fp16 the decode
+  // is the same, bit for bit, and those copies' memory is free.
+  const uint64_t before = backend.memoryStats().allocatedBytes;
+  decoder.releaseFloatCopies();
+  require(backend.memoryStats().allocatedBytes < before, "releasing the fp32 copies freed no memory");
+  metal::MetalBuffer released = sharedBuffer(backend, size_t(samples) * 4);
+  metal::CommandGraph releasedGraph;
+  decoder.addDecode(releasedGraph, codeBuffer, frames, released);
+  run(backend, releasedGraph);
+  require(readBack(released, samples) == got, "the decode changed without the fp32 copies");
+  std::cout << "random decoder without fp32 copies ok\n";
 }
 
 // ------------------------------------------------- the decoder, real weights

@@ -234,6 +234,10 @@ public:
   [[nodiscard]] static uint64_t workspaceBytes(const CodecDims &dims, uint32_t maximumFrames);
   [[nodiscard]] uint32_t maximumFrames() const noexcept { return maximumFrames_; }
   [[nodiscard]] const CodecDecoderWeights &weights() const noexcept { return weights_; }
+  // Releases the fp32 weights of every convolution the GPU runs from its
+  // fp16 copy: the Neural Engine's program reads them when it is built,
+  // nothing after. Those convolutions then have their fp16 copy alone.
+  void releaseFloatCopies();
   // codes: u32 [frames][quantizers]; output: fp32 [frames * samplesPerFrame].
   void addDecode(metal::CommandGraph &graph, metal::MetalBuffer codes, uint32_t frames, metal::MetalBuffer output);
   // The next `frames` (1 .. the stream's and the decoder's maximum) of the

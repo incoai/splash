@@ -125,6 +125,21 @@ Memory and lanes are sized automatically. To change them, add these to
 | `--disable-ane` | Run on the GPU alone, without the Neural Engine. |
 | `--offline` | Never contact the Hugging Face Hub. |
 
+Without `--max-memory` a server takes what the Mac's memory allows for its
+cache of concurrent requests. The least each 4-bit model runs in:
+
+| Model | One request at a time | With the draft |
+| --- | ---: | ---: |
+| Qwen3-ASR-1.7B | 2.6 GB | 4.1 GB |
+| Qwen3-ASR-0.6B | 1.6 GB | 2.8 GB |
+| Qwen3-TTS-12Hz-1.7B | 2.5 GB | |
+| Qwen3-TTS-12Hz-0.6B | 1.8 GB | |
+
+Under a tight cap, requests wait for memory rather than fail. A speech
+request of the longest length (5.5 minutes) needs about 0.7 GB more than
+the least: below that, a single request speaks only as long as the cap
+holds (at least 80 seconds).
+
 The server listens on localhost without authentication by default. See
 `./splash-omni serve --help` for access control and the other options.
 [Server options](DEVELOPMENT.md#server-options)

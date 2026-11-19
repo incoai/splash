@@ -37,6 +37,7 @@
 #include <array>
 #include <chrono>
 #include <cstdint>
+#include <functional>
 #include <deque>
 #include <memory>
 #include <optional>
@@ -60,9 +61,15 @@ struct AsrRequest final {
 
 struct AsrEngineConfig final {
   uint32_t lanes = 8;
-  uint32_t maxAudioSeconds = 1200;
+  // A request's audio: the server cuts longer audio into segments of at
+  // most this (audio_io.MAX_REQUEST_SECONDS); the tower's workspace and the
+  // smallest KV pool follow from it.
+  uint32_t maxAudioSeconds = 120;
   uint32_t maxTokens = 4096;
   uint32_t kvPages = 32768; // 128 KiB each: 4 GiB
+  // Or the pool's pages from the bytes allocated once everything else is:
+  // the engine creates the pool last, from what its budget leaves.
+  std::function<uint32_t(uint64_t allocatedBytes)> kvPagesFor;
   // Whether prefill chunks of an affine checkpoint split their FFN with the
   // Neural Engine (ops::AneFfn); OMNI_DISABLE_ANE=1 also turns it off.
   bool neuralEngine = true;
@@ -122,6 +129,11 @@ public:
   [[nodiscard]] bool idle() const noexcept;
   [[nodiscard]] uint32_t activeLanes() const noexcept;
   [[nodiscard]] uint32_t queued() const noexcept { return static_cast<uint32_t>(queue_.size()); }
+  // The KV pages one request of the longest audio takes at most, with a
+  // draft of `draftLayers` layers following it: the smallest pool in which
+  // every admitted request runs to its end (a request waits for its pages).
+  [[nodiscard]] static uint32_t minimumPages(const AsrConfig &config, const AsrEngineConfig &engineConfig,
+                                             uint32_t draftLayers) noexcept;
   [[nodiscard]] uint64_t memoryBytes() const noexcept { return memoryBytes_; }
   [[nodiscard]] bool speculative() const noexcept { return draft_ != nullptr || dflash_ != nullptr; }
   [[nodiscard]] bool dflash() const noexcept { return dflash_ != nullptr; }

@@ -68,6 +68,19 @@ reads it). A sequence owns a page table `[layer][block] -> page index` in a
 GPU buffer. INT8 KV is not implemented; the contexts are short (TTS a few
 thousand frames at most, ASR at most ~2000 tokens per request).
 
+The pool is made last, once every other buffer is allocated, from what the
+memory budget leaves (at most 8 GiB for speech, 12 for transcription). A
+request takes, at admission, the pages it may need to its end: its prompt
+and its most output (speech: the frames its text allows; transcription:
+64 tokens and 16 a second of its audio, and a round's 64 rows). A request
+the free pages cannot hold waits at the head of the queue while others
+run, so no admitted request runs out of pages, and none is refused while
+another runs. The smallest pool is one request of the longest prompt:
+transcription's longest audio is 2 minutes (the server cuts longer audio
+there), and speech's longest request 1,024 frames (82 s); a pool below one
+request of the most frames (4,096) shortens what a request may speak to
+what the pool holds alone, which only a tight `--max-memory` gives.
+
 The code predictor's KV is a single page per (lane, layer): its context is
 at most 16 positions and is reset every talker step. It runs through the same
 attention kernels, so the "MTP" (code predictor) decode path is the talker's
@@ -110,6 +123,14 @@ copy of the weights (docs/omni-performance.md, round 13) the
 must be a multiple of 64 and N of 64.
 
 ## TTS pipeline
+
+Memory beside the weights and the KV pool: the text embedding (151,936 x
+2,048 bf16, 0.6 GB) is read on the host through a read-only mapping of its
+checkpoint file (`HostTable`), each request's rows copied into its lane's
+region of the projection's input, so only the rows read are resident, as
+file cache. The codec's convolutions the GPU runs in fp16 keep only that
+copy once the Neural Engine's codec program, which reads their fp32
+weights, is built (`CodecDecoder::releaseFloatCopies`).
 
 1. Prompt assembly (host builds per-position descriptors, `ttsPrompt`;
    GPU assembles embeddings): role tokens through `text_projection` (fc1,
@@ -348,8 +369,10 @@ New client frames:
   `<|audio_start|>`), u32 suffix tokens (from `<|audio_end|>` to the end of
   the assistant prefix, plus any forced `language X<asr_text>`), and f32
   samples [sample_count] at 16 kHz mono. The engine inserts the audio
-  embeddings between prefix and suffix; audio longer than 20 minutes is
-  refused (the server splits long audio).
+  embeddings between prefix and suffix; the frame takes up to 20 minutes,
+  the engine up to 2 (`AsrEngineConfig::maxAudioSeconds`) and refuses
+  longer audio (the server cuts long audio into requests of at most 2
+  minutes).
 
 New engine frames:
 

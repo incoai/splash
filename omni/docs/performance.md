@@ -201,6 +201,33 @@ one stream at a time, ran three of the ten long Mandarin passages to its
 with mlx-audio matches the 1.7B's: talker logits cosine 0.99997 (Base) and
 0.99994 (CustomVoice), the predictor's 0.99987 and 0.99946, argmax equal.
 
+### Memory
+
+The least Metal memory each model starts in, by the engine's own refusal of
+a lower `--max-memory` (M5 Pro, 2026-11-19), before and after sizing its
+buffers to what it serves: the TTS text embedding read on the host, the
+codec's fp32 copies released, transcription requests of at most 2 minutes
+(the server cuts longer audio there), and a KV pool as small as one request
+of the longest prompt, every request taking the pages it may need at
+admission.
+
+| GiB | Before | After |
+| --- | ---: | ---: |
+| Qwen3-ASR-1.7B-4bit, one lane, GPU alone | 3.78 | 2.60 |
+| Qwen3-ASR-1.7B-4bit, two lanes / with its DFlash draft | 4.06 / 7.41 | 2.87 / 4.13 |
+| Qwen3-ASR-0.6B-4bit, one lane, GPU alone | 2.76 | 1.64 |
+| Qwen3-ASR-0.6B-4bit, two lanes / with its DFlash draft | 2.90 / 5.99 | 1.78 / 2.79 |
+| Qwen3-ASR-1.7B-bf16, two lanes / with its DFlash draft | 6.34 / 9.4 | 5.15 / 6.71 |
+| Qwen3-TTS-12Hz-1.7B-CustomVoice-4bit, one lane / four | 4.06 / 4.13 | 2.46 / 2.56 |
+| Qwen3-TTS-12Hz-0.6B-CustomVoice-4bit, one lane / four | 3.38 / 3.44 | 1.79 / 1.87 |
+| Qwen3-TTS-12Hz-1.7B-CustomVoice-bf16, four lanes | 6.61 | 5.05 |
+
+Without `--max-memory` nothing else changes: the speed and accuracy of the
+launch tables are the same (transcription 115.0 / 183.3 / 198.9 audio s/s,
+WER 2.17%; speech 19.5 ms to first audio, 10.25 audio s/s). Under the voice
+chat's caps every request of 8 concurrent ones completes, waiting for its
+pages where the pool is full.
+
 ### No caching
 
 Nothing in the server or the engine caches results, KV or audio across

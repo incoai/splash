@@ -499,7 +499,8 @@ SERVE_OPTIONS = (
             metavar="SECONDS",
             help="transcription: audio longer than this is cut at quiet points "
             "into about one segment per lane, none shorter, decoded concurrently "
-            "(default 30; 0 decodes up to 20 minutes as one request)",
+            "(default 30; 0 decodes up to 2 minutes as one request, cutting "
+            "longer audio there)",
         ),
     ),
     ServeOption(

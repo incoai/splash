@@ -68,7 +68,11 @@ void requireConv(const CodecConv &conv, const char *what) {
       !conv.taps || !conv.dilation)
     throw std::invalid_argument(std::string(what) + ": codec convolutions take input channels in multiples of 32 and "
                                                     "output channels in multiples of 4");
-  requireBytes(conv.weight, uint64_t{conv.taps} * conv.inputChannels * conv.outputChannels * 4, "codec conv weight");
+  // The fp32 weights, or only the fp16 copy the kernel reads once the fp32
+  // are released (CodecDecoder::releaseFloatCopies).
+  const uint64_t taps = uint64_t{conv.taps} * conv.inputChannels * conv.outputChannels;
+  if (conv.weight) requireBytes(conv.weight, taps * 4, "codec conv weight");
+  else requireBytes(conv.weightHalf, taps * 2, "codec conv weight fp16");
   if (conv.bias) requireBytes(conv.bias, uint64_t{conv.outputChannels} * 4, "codec conv bias");
 }
 
@@ -154,13 +158,15 @@ void addConv(metal::CommandGraph &graph, const CodecConv &conv, const ConvCall &
   params.output_stride = outputStride;
   params.flags = flags;
   params.history_rows = call.history.rows();
-  const metal::MetalBuffer bias = conv.bias ? conv.bias : conv.weight;
-  const metal::MetalBuffer residual = call.residual ? call.residual : call.output;
-  const metal::MetalBuffer scale = call.scale ? call.scale : conv.weight;
-  const metal::MetalBuffer history = call.history.history ? call.history.history->rows[call.history.phase] : call.input.buffer;
   const bool half = static_cast<bool>(conv.weightHalf);
+  const metal::MetalBuffer weight = half ? conv.weightHalf : conv.weight;
+  // Unused bindings take a buffer of the call's own.
+  const metal::MetalBuffer bias = conv.bias ? conv.bias : weight;
+  const metal::MetalBuffer residual = call.residual ? call.residual : call.output;
+  const metal::MetalBuffer scale = call.scale ? call.scale : weight;
+  const metal::MetalBuffer history = call.history.history ? call.history.history->rows[call.history.phase] : call.input.buffer;
   graph.add(half ? "omni_codec_conv_half" : "omni_codec_conv",
-            {call.input.buffer, half ? conv.weightHalf : conv.weight, bias, residual, scale, call.output, history}, params,
+            {call.input.buffer, weight, bias, residual, scale, call.output, history}, params,
             {ceilDiv(call.rows, OMNI_CODEC_CONV_TILE_ROWS), ceilDiv(n, OMNI_CODEC_CONV_TILE_COLUMNS), 1},
             {OMNI_CODEC_CONV_THREADS, 1, 1});
   addHistoryUpdate(graph, call.history, call.input);
@@ -432,6 +438,12 @@ uint64_t CodecDecoder::workspaceBytes(const CodecDims &dims, uint32_t maximumFra
       uint64_t{maximumFrames} * (2 * dims.hidden + 3 * attention + attention + 3 * dims.intermediate) * 4;
   const uint64_t rings = uint64_t{dims.layers} * 2 * maximumFrames * attention * 4;
   return 3 * largestTensorBytes(dims, maximumFrames) + small + rings;
+}
+
+void CodecDecoder::releaseFloatCopies() {
+  weights_.forEachConv([](CodecConv &conv) {
+    if (conv.weightHalf) conv.weight = {};
+  });
 }
 
 CodecDecoder::CodecDecoder(metal::MetalBackend &backend, CodecDecoderWeights weights, uint32_t maximumFrames)

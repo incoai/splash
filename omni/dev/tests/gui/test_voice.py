@@ -99,39 +99,39 @@ class SelectionTests(unittest.TestCase):
         # The engine refuses a --max-memory its model does not fit in, and
         # fits the DFlash draft only where the budget holds it.
         cases = (
-            ({}, "8G", "5G"),
-            ({"speculative": False}, "5G", "5G"),
+            ({}, "5G", "3G"),
+            ({"speculative": False}, "3G", "3G"),
             (
                 {
                     "asr_model": "mlx-community/Qwen3-ASR-1.7B-bf16",
                     "tts_model": "mlx-community/Qwen3-TTS-12Hz-1.7B-Base-bf16",
                 },
-                "10G",
                 "7G",
+                "6G",
             ),
             (
                 {
                     "asr_model": "mlx-community/Qwen3-ASR-1.7B-bf16",
                     "speculative": False,
                 },
-                "7G",
-                "5G",
+                "6G",
+                "3G",
             ),
             (
                 {
                     "asr_model": "mlx-community/Qwen3-ASR-0.6B-4bit",
                     "tts_model": "mlx-community/Qwen3-TTS-12Hz-0.6B-CustomVoice-4bit",
                 },
-                "6G",
-                "4G",
+                "3G",
+                "2G",
             ),
             (
                 {
                     "asr_model": "mlx-community/Qwen3-ASR-0.6B-4bit",
                     "speculative": False,
                 },
+                "2G",
                 "3G",
-                "5G",
             ),
             ({"speech_max_memory": "12G"}, "12G", "12G"),
         )
@@ -170,8 +170,8 @@ class SelectionTests(unittest.TestCase):
         # 48 GiB: the GPU's three quarters, 36 GiB, less both speech budgets
         # and the 1.5 GiB margin.
         with mock.patch.object(voice, "total_memory_gib", return_value=48):
-            self.assertEqual(voice.default_llm_memory(), "21G")
-            self.assertEqual(voice.default_llm_memory(speculative=False), "24G")
+            self.assertEqual(voice.default_llm_memory(), "26G")
+            self.assertEqual(voice.default_llm_memory(speculative=False), "28G")
             chosen = voice.selections(
                 {
                     "splash": self.splash,
@@ -179,7 +179,7 @@ class SelectionTests(unittest.TestCase):
                     "tts_model": "mlx-community/Qwen3-TTS-12Hz-1.7B-Base-bf16",
                 }
             )
-            self.assertEqual(chosen[voice.LLM].max_memory, "17G")
+            self.assertEqual(chosen[voice.LLM].max_memory, "21G")
         with mock.patch.object(voice, "total_memory_gib", return_value=16):
             self.assertIsNone(voice.default_llm_memory())
 

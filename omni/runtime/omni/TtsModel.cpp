@@ -102,7 +102,7 @@ TtsModel::TtsModel(metal::MetalBackend &backend, TtsWeights weights, const TtsCo
     smallToMtp_ = std::make_unique<BiasedProjection>(backend, predictor_->linear(), weights_.smallToMtp,
                                                      weights_.smallToMtpBias, 2 * maxLanes, "tts small_to_mtp");
   const uint32_t capacity = roundUp(maxTextRows, 64);
-  textEmbedded_ = zeroed(backend, uint64_t{capacity} * config.textHidden * 2, "tts text embedded");
+  textEmbedded_ = zeroed(backend, uint64_t{maxLanes} * capacity * config.textHidden * 2, "tts text embedded");
   fc1Out_ = zeroed(backend, uint64_t{capacity} * config.textHidden * 2, "tts fc1 out");
   // Sub-steps 1..14 feed the predictor small_to_mtp(table[step - 1][code]):
   // a fixed function of the code, so project every table row once here,
@@ -164,12 +164,15 @@ TtsModel::TtsModel(metal::MetalBackend &backend, TtsWeights weights, const TtsCo
   }
 }
 
-void TtsModel::addTextProjection(metal::CommandGraph &graph, metal::MetalBuffer tokens, metal::MetalBuffer output,
-                                 uint32_t rows) const {
+void TtsModel::addTextProjection(metal::CommandGraph &graph, uint32_t lane, std::span<const uint32_t> tokens,
+                                 metal::MetalBuffer output) const {
+  const auto rows = static_cast<uint32_t>(tokens.size());
   if (!rows || rows > maxTextRows_) throw std::invalid_argument("text projection rows exceed the model's capacity");
-  ops::omni::Embedding::addGather(graph, std::move(tokens), weights_.textEmbedding, textEmbedded_, rows,
-                                  config_.textVocabulary, config_.textHidden);
-  fc1_->add(graph, textEmbedded_, fc1Out_, rows, ops::omni::Activation::Silu);
+  if (lane >= maxLanes_) throw std::invalid_argument("text projection lane out of range");
+  const uint64_t region = uint64_t{roundUp(maxTextRows_, 64)} * config_.textHidden * 2;
+  weights_.textEmbedding.copyRows(tokens, static_cast<uint8_t *>(textEmbedded_.contents()) + lane * region);
+  const metal::MetalBuffer embedded = backend_->view(textEmbedded_, lane * region, region);
+  fc1_->add(graph, embedded, fc1Out_, rows, ops::omni::Activation::Silu);
   fc2_->add(graph, fc1Out_, std::move(output), rows, ops::omni::Activation::None);
 }
 
