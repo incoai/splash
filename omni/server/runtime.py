@@ -1033,6 +1033,16 @@ class MultiplexedRuntime:
             if generation != self._generation or self._terminal_error is not None:
                 return
             if self._ready_message is None:
+                # An engine whose start failed sends why in place of its
+                # ReadyEvent, then exits: the start ends with that reason.
+                if (
+                    isinstance(message, wire.ErrorEvent)
+                    and message.failure_class is wire.FailureClass.ENGINE_UNHEALTHY
+                    and message.request_id == 0
+                ):
+                    raise EngineUnhealthy(
+                        message.message.decode("utf-8", errors="replace")
+                    )
                 raise ProtocolFatal("native event arrived before ReadyEvent")
         self._dispatch_event(generation, message)
 

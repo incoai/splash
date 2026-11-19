@@ -636,6 +636,61 @@ class ServerRecoveryTests(AudioHarnessTestCase):
         self.assertIn("bad_magic", line)
         self.assertIsNotNone(factory.processes[0].poll())
 
+    def test_startup_ends_with_the_failure_its_engine_reports(self):
+        # An engine whose start fails (a --max-memory below what its model
+        # takes) sends why in place of its ReadyEvent; any other event before
+        # Ready still breaks the protocol.
+        reason = (
+            "--max-memory 1.00 GiB is below the 4.06 GiB this model takes "
+            "with 2 lanes; raise it, or lower --lanes"
+        )
+        cases = (
+            (wire.FailureClass.ENGINE_UNHEALTHY, 0, reason, f"Error · {reason}"),
+            (
+                wire.FailureClass.REQUEST_ERROR,
+                7,
+                "no such request",
+                "Error · native event arrived before ReadyEvent",
+            ),
+        )
+        runtime_type = audio_runtime.AudioRuntime
+        for failure, request_id, message, expected in cases:
+            factory = FakeFactory(
+                initial_output=native_peer.serialize_audio_event(
+                    wire.ErrorEvent(
+                        failure, request_id, False, b"start_failed", message.encode()
+                    )
+                ),
+                audio=True,
+            )
+            with (
+                self.subTest(failure=failure),
+                mock.patch.object(
+                    audio_server, "parse_args", return_value=audio_main_args()
+                ),
+                mock.patch.object(
+                    audio_server.ModelProfile, "load", return_value=TTS_PROFILE
+                ),
+                mock.patch.object(
+                    audio_server.AutoTokenizer, "from_pretrained", return_value=object()
+                ),
+                mock.patch.object(
+                    audio_server.audio_runtime,
+                    "AudioRuntime",
+                    side_effect=lambda _command, **options: runtime_type(
+                        process_factory=factory, **options
+                    ),
+                ),
+                mock.patch.object(audio_server, "AudioServer"),
+                mock.patch.object(audio_server.signal, "signal"),
+                mock.patch("sys.stdout", new_callable=io.StringIO),
+                mock.patch("sys.stderr", new_callable=io.StringIO) as stderr,
+                self.assertRaisesRegex(SystemExit, "1"),
+            ):
+                audio_server.main()
+            (line,) = stderr.getvalue().splitlines()
+            self.assertTrue(line.endswith(expected), line)
+
     def test_restarted_native_must_match_the_original_ready_event(self):
         for restarted in (
             AUDIO_READY,

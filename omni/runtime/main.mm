@@ -6,6 +6,7 @@
 
 #include "StderrLine.hpp"
 #include "metal/MetalBackend.hpp"
+#include "omni/OmniProtocol.hpp"
 #include "omni/OmniServer.hpp"
 
 #import <Foundation/Foundation.h>
@@ -14,6 +15,7 @@
 #include <unistd.h>
 
 #include <atomic>
+#include <cerrno>
 #include <csignal>
 #include <cstdio>
 #include <filesystem>
@@ -60,6 +62,17 @@ int checkDevice() {
   return EX_SOFTWARE;
 }
 
+// Writes all of a frame to stdout; a reader that has gone loses it.
+void writeFrame(const std::vector<uint8_t> &frame) {
+  size_t written = 0;
+  while (written < frame.size()) {
+    const ssize_t n = ::write(STDOUT_FILENO, frame.data() + written, frame.size() - written);
+    if (n < 0 && errno == EINTR) continue;
+    if (n <= 0) return;
+    written += static_cast<size_t>(n);
+  }
+}
+
 std::atomic<bool> shutdownRequested{false};
 void onSignal(int) { shutdownRequested = true; }
 
@@ -85,8 +98,20 @@ int serveOmni(int argc, char **argv) {
       options.idleReleaseSeconds = v == "off" ? 0.0 : std::stod(v);
     } else throw UsageError("unknown serve-omni option " + std::string(flag));
   }
-  if (const auto message = metal::probeDeviceCapabilities().validationMessage()) throw std::runtime_error(*message);
-  omni::LoadedEngine engine = omni::loadEngine(options);
+  std::optional<omni::LoadedEngine> loaded;
+  try {
+    if (const auto message = metal::probeDeviceCapabilities().validationMessage()) throw std::runtime_error(*message);
+    loaded.emplace(omni::loadEngine(options));
+  } catch (const std::exception &error) {
+    // A start that fails reports why on stderr, as any failure does, and then
+    // in place of its ReadyEvent, as an engine failure the server ends the
+    // start with: otherwise the server sees only the protocol end.
+    writeStderrLine(std::string("error: ") + error.what());
+    writeFrame(omni::protocol::errorFrame(omni::protocol::FailureClass::EngineUnhealthy, false, 0, "start_failed",
+                                          error.what()));
+    return EX_SOFTWARE;
+  }
+  omni::LoadedEngine &engine = *loaded;
   std::signal(SIGTERM, onSignal);
   std::signal(SIGINT, onSignal);
   std::signal(SIGHUP, onSignal);
