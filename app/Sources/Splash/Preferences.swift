@@ -476,6 +476,13 @@ extension LaunchOption {
             help: "Replies and the model list give the first served model name rather than the model’s own.",
             section: .api, kind: .toggle(on: true),
             requires: [Requirement("Needs a served model name.") { $0["--served-model-name"] != nil }]),
+        LaunchOption(
+            flag: "--sampling-default", title: "Sampling defaults",
+            help: "The value of a sampling setting for requests that set none, as name=value, such as temperature=0.7.",
+            section: .api,
+            kind: .text(Value(prompt: "temperature=0.7",
+                              message: "Name=value pairs, split at commas, each name one of \(samplingNames.formatted(.list(type: .or))); top_k a whole number.",
+                              parse: { samplingDefaults($0) }), list: true)),
     ]
 
     private static let requests: [LaunchOption] = [
@@ -545,6 +552,22 @@ extension LaunchOption {
                   let value = text.trimmingCharacters(in: .whitespaces).lowercased()
                   return value.wholeMatch(of: /\d+[smh]?/) != nil ? value : nil
               })
+    }
+
+    /// The sampling settings server/serve_options.py's `parse_sampling_default` takes.
+    private static let samplingNames = ["temperature", "top_p", "top_k", "presence_penalty", "frequency_penalty", "repetition_penalty", "min_p"]
+
+    /// `text` as name=value pairs split at commas and spaces, each a sampling setting and a number,
+    /// a whole one for top_k, as the server parses them, or nil for anything else. The server
+    /// refuses a value out of a setting's range as it starts.
+    private static let samplingDefaults: @Sendable (String) -> String? = { text in
+        let pairs = items(text)
+        let valid = pairs.allSatisfy { pair in
+            let parts = pair.split(separator: "=", maxSplits: 1, omittingEmptySubsequences: false)
+            guard parts.count == 2, samplingNames.contains(String(parts[0])) else { return false }
+            return parts[0] == "top_k" ? Int(parts[1]) != nil : Double(parts[1]) != nil
+        }
+        return !pairs.isEmpty && valid ? pairs.joined(separator: ", ") : nil
     }
 
     private static let whole: @Sendable (String) -> String? = { Int($0.trimmingCharacters(in: .whitespaces)).flatMap { $0 > 0 ? String($0) : nil } }

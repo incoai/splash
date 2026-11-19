@@ -903,6 +903,7 @@ def main_args(**overrides):
             "served_model_name": [],
             "announce_served_name": False,
             "reasoning_effort": None,
+            "sampling_default": [],
             "default_reasoning_effort": None,
             "thinking_token_budget": None,
             "thinking_end_text": None,

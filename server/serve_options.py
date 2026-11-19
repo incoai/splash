@@ -15,10 +15,10 @@ from dataclasses import dataclass
 from decimal import Decimal
 from pathlib import Path
 
-from . import images, origins, unix_socket
+from . import images, origins, request_fields, unix_socket
 from .chat_format import REASONING_EFFORTS
 from .http_security import validate_api_key
-from .protocol import MAX_THINKING_END_TOKENS
+from .protocol import MAX_THINKING_END_TOKENS, SAMPLING_FIELDS
 
 # The most context --max-context takes: the most any family serves
 # (QwenTargetDimensions::maximumContextTokens(), as the engine's families
@@ -340,6 +340,28 @@ def parse_reasoning_effort(value):
             f"must be one of {', '.join(REASONING_EFFORTS)}"
         )
     return value
+
+
+def parse_sampling_default(value):
+    """A --sampling-default NAME=VALUE as (name, number), a number a request
+    may set (request_fields.sampling_refusal): `splash serve` refuses one
+    before it downloads anything. The app's Sampling defaults field
+    (LaunchOption.samplingDefaults) takes the same names and forms, and
+    leaves the ranges to this check."""
+    name, separator, number = value.partition("=")
+    if not separator or name not in SAMPLING_FIELDS:
+        raise argparse.ArgumentTypeError(
+            f"must be NAME=VALUE, NAME one of {', '.join(SAMPLING_FIELDS)}"
+        )
+    try:
+        parsed = int(number) if name == "top_k" else float(number)
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f"{name} must be {'an integer' if name == 'top_k' else 'a number'}"
+        ) from None
+    if (refusal := request_fields.sampling_refusal(name, parsed)) is not None:
+        raise argparse.ArgumentTypeError(refusal)
+    return name, parsed
 
 
 def parse_thinking_token_budget(value):
@@ -681,6 +703,23 @@ SERVE_OPTIONS = (
             "it first in /v1/models; /status keeps the loaded model ID (needs "
             "--served-model-name)",
         ),
+    ),
+    ServeOption(
+        "--sampling-default",
+        "api",
+        dict(
+            action="append",
+            default=[],
+            type=parse_sampling_default,
+            metavar="NAME=VALUE",
+            help="the value of a sampling parameter for requests that set "
+            "none (repeatable): "
+            + ", ".join(SAMPLING_FIELDS)
+            + " (default: the served family's published sampling for "
+            "temperature, top_p and top_k, else the value that leaves the "
+            "logits unchanged)",
+        ),
+        text=lambda item: f"{item[0]}={item[1]}",
     ),
     ServeOption(
         "--reasoning-effort",

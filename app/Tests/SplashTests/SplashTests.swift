@@ -376,6 +376,12 @@ struct ServeSettingsTests {
         #expect(try custom("--idle-release").parse("45M") == "45m")
         #expect(try custom("--port").parse("0") == nil)
         #expect(try custom("--served-model-name").parse("gpt-4o,  o3 ") == "gpt-4o, o3")
+        // The sampling defaults the server takes (parse_sampling_default): a setting it names, top_k
+        // a whole number; a value out of range is the server's to refuse.
+        let sampling = try custom("--sampling-default")
+        #expect(sampling.parse("temperature=0.7  top_k=20,min_p=0") == "temperature=0.7, top_k=20, min_p=0")
+        #expect(sampling.parse("top_k=-1") == "top_k=-1" && sampling.parse("top_p=5") == "top_p=5")
+        #expect(["temp=0.7", "top_k=0.5", "top_k=", "=0.7", "temperature=0.7=1", "temperature", ""].allSatisfy { sampling.parse($0) == nil })
         // A value typed in is one the option takes, as kept and read back: every example, and the
         // menu's choices.
         for option in LaunchOption.all {

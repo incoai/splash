@@ -255,6 +255,16 @@ defines no penalties and no `min_p` for Messages; Splash's Messages takes
 them and `logit_bias` as Chat does, with the same 400 for a bad value, so that
 a client whose requests go only to Messages can set them too.
 
+`--sampling-default NAME=VALUE` (repeatable) sets the value a sampling field
+takes when a request leaves it out, in place of the default above. A value
+the request sends still wins, and of two pairs for one name the last wins.
+`splash serve` refuses a value a request may not set before it downloads
+anything, with the words of the request's 400.
+
+```sh
+splash serve --model mlx-community/Qwen3.8-27B-4bit --sampling-default temperature=0.6 --sampling-default presence_penalty=1.5
+```
+
 In vLLM's order, after temperature `min_p` first drops every token less
 likely than `min_p` times the most likely one, `top_k` then keeps the most
 likely of the rest, every one when it is 0 or -1 or past the vocabulary, and

@@ -1238,6 +1238,13 @@ def parse_args(argv=None):
     return args
 
 
+def _sampling_defaults(family, args):
+    """What a request gets for each sampling field it leaves out: the
+    family's published sampling, with --sampling-default's values over it,
+    the last of a name winning."""
+    return {**asdict(family.sampling), **dict(args.sampling_default)}
+
+
 def _native_command(args, model_root, relaunch_context=None):
     """The engine's command line serving model_root, a relaunch's with
     `relaunch_context`, the context the first engine served. A relaunch is
@@ -1473,7 +1480,7 @@ def main():
             constraint_factory=ConstraintFactory(tokenizer, served),
             chat_templates=chat_templates,
             chat_format=family.chat_format,
-            sampling_defaults=asdict(family.sampling),
+            sampling_defaults=_sampling_defaults(family, args),
             max_image_pixels=args.max_image_pixels,
             thinking_codec=thinking_codec,
             response_store=dialects.responses.ResponseStore(),
