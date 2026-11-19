@@ -1,0 +1,428 @@
+{
+  "summary": {
+    "en": 0.005434782608695652,
+    "zh": 0.015105740181268883
+  },
+  "items": [
+    {
+      "id": "en_short_01",
+      "lang": "en",
+      "whisper": "The train leaves at dawn tomorrow.",
+      "error_rate": 0.0,
+      "audio_s": 1.92
+    },
+    {
+      "id": "en_short_02",
+      "lang": "en",
+      "whisper": "Please close the window before you go.",
+      "error_rate": 0.0,
+      "audio_s": 2.0
+    },
+    {
+      "id": "en_short_03",
+      "lang": "en",
+      "whisper": "She painted the old fence bright blue",
+      "error_rate": 0.0,
+      "audio_s": 2.16
+    },
+    {
+      "id": "en_short_04",
+      "lang": "en",
+      "whisper": "Our garden really needs rain this week.",
+      "error_rate": 0.0,
+      "audio_s": 2.48
+    },
+    {
+      "id": "en_short_05",
+      "lang": "en",
+      "whisper": "He forgot his keys on the kitchen table.",
+      "error_rate": 0.0,
+      "audio_s": 2.16
+    },
+    {
+      "id": "en_short_06",
+      "lang": "en",
+      "whisper": "The library opens early on weekdays.",
+      "error_rate": 0.0,
+      "audio_s": 2.8
+    },
+    {
+      "id": "en_short_07",
+      "lang": "en",
+      "whisper": "We watched the storm roll over the hills.",
+      "error_rate": 0.0,
+      "audio_s": 2.48
+    },
+    {
+      "id": "en_short_08",
+      "lang": "en",
+      "whisper": "Fresh bread smells wonderful in the morning.",
+      "error_rate": 0.0,
+      "audio_s": 2.24
+    },
+    {
+      "id": "en_short_09",
+      "lang": "en",
+      "whisper": "The cat sleeps under the warm radiator.",
+      "error_rate": 0.0,
+      "audio_s": 2.4
+    },
+    {
+      "id": "en_short_10",
+      "lang": "en",
+      "whisper": "Turn left just after the second bridge.",
+      "error_rate": 0.0,
+      "audio_s": 2.16
+    },
+    {
+      "id": "en_medium_01",
+      "lang": "en",
+      "whisper": "When the lights went out across the valley, the neighbors gathered on the porch with candles\n and told stories until the power finally returned.",
+      "error_rate": 0.0,
+      "audio_s": 8.32
+    },
+    {
+      "id": "en_medium_02",
+      "lang": "en",
+      "whisper": "The museum's new exhibit traces the history of navigation, from simple star charts to the satellite systems that guide ships and aircraft today.",
+      "error_rate": 0.0,
+      "audio_s": 8.4
+    },
+    {
+      "id": "en_medium_03",
+      "lang": "en",
+      "whisper": "After months of careful planning,\n the small bakery opened its doors on a quiet street corner\n and sold out of everything before noon.",
+      "error_rate": 0.0,
+      "audio_s": 9.2
+    },
+    {
+      "id": "en_medium_04",
+      "lang": "en",
+      "whisper": "My grandmother kept a journal of every garden she planted, noting which seeds thrived in\n clay soil and which ones needed sandy ground.",
+      "error_rate": 0.0,
+      "audio_s": 8.0
+    },
+    {
+      "id": "en_medium_05",
+      "lang": "en",
+      "whisper": "The orchestra rehearsed the final movement three times, adjusting the tempo until the conductor was satisfied with the balance between strings and brass.",
+      "error_rate": 0.0,
+      "audio_s": 8.96
+    },
+    {
+      "id": "en_medium_06",
+      "lang": "en",
+      "whisper": "Scientists at the research station recorded unusually warm temperatures this winter,\n which may explain why the migrating birds arrived several weeks early.",
+      "error_rate": 0.0,
+      "audio_s": 9.2
+    },
+    {
+      "id": "en_medium_07",
+      "lang": "en",
+      "whisper": "If you follow the river path past the old mill,\n you will reach a wooden footbridge that leads directly into the village square.",
+      "error_rate": 0.0,
+      "audio_s": 6.88
+    },
+    {
+      "id": "en_medium_08",
+      "lang": "en",
+      "whisper": "The software update fixed the login problem,\n but several users reported that the new settings page\n loads slowly on older phones.",
+      "error_rate": 0.0,
+      "audio_s": 8.96
+    },
+    {
+      "id": "en_medium_09",
+      "lang": "en",
+      "whisper": "Every Saturday, the farmer's market fills the parking lot with stalls of honey, cheese, flowers, and vegetables grown within a few miles of town.",
+      "error_rate": 0.041666666666666664,
+      "audio_s": 7.52
+    },
+    {
+      "id": "en_medium_10",
+      "lang": "en",
+      "whisper": "The detective studied the muddy footprints by the gate\n and concluded that the visitor had arrived\n long before the rain stopped.",
+      "error_rate": 0.0,
+      "audio_s": 7.2
+    },
+    {
+      "id": "en_long_01",
+      "lang": "en",
+      "whisper": "The lighthouse keeper had lived alone on the island for nearly twenty years,\n and in all that time he had never once missed lighting the lamp at dusk.\n Supply boats came twice a month, bringing flour, lamp oil, newspapers,\n and the occasional letter from his sister on the mainland.\n He read every page slowly, savoring the news of a world that seemed to grow more distant with each passing season,\n then folded the papers neatly and stacked them beside the stove for kindling.",
+      "error_rate": 0.0,
+      "audio_s": 27.44
+    },
+    {
+      "id": "en_long_02",
+      "lang": "en",
+      "whisper": "Learning to cook well is mostly a matter of patience and attention.\n Begin with a few simple dishes and repeat them until the steps feel natural,\n paying close attention to how the onions change color as they soften and how the sauce thickens\n as it reduces. Taste constantly and adjust the salt in small amounts. Over time you will stop\n measuring everything and begin to trust your senses, which is exactly when cooking stops\n feeling like work and starts feeling like play.",
+      "error_rate": 0.0,
+      "audio_s": 26.08
+    },
+    {
+      "id": "en_long_03",
+      "lang": "en",
+      "whisper": "The city council met on Tuesday evening to discuss the proposed bicycle lanes along the main avenue.\n Supporters argued that the lanes would reduce traffic, improve air quality, and make the downtown area safer for families,\n while several shop owners worried about losing parking spaces in front of their stores.\n After two hours of public comment, the council voted to approve a one-year trial on the northern half of the avenue and to review the results next spring.",
+      "error_rate": 0.0,
+      "audio_s": 23.2
+    },
+    {
+      "id": "en_long_04",
+      "lang": "en",
+      "whisper": "Astronomers announced the discovery of a small, rocky planet orbiting a dim red star about 40 light-years from Earth.\n The planet completes one orbit every 11 days and receives roughly the same amount of starlight that Earth receives from the Sun,\n placing it inside the region where liquid water could exist.\n The team plans to use a large space telescope to search for signs of an atmosphere,\n though they caution that it will take years to gather enough data to draw firm conclusions.",
+      "error_rate": 0.023809523809523808,
+      "audio_s": 25.52
+    },
+    {
+      "id": "en_long_05",
+      "lang": "en",
+      "whisper": "On the first morning of the hike, the trail climbed steadily through a forest of tall pines whose needles muffled every footstep.\n By midday, the trees thinned out and gave way to open meadows dotted with wildflowers,\n and the wind carried the faint sound of cowbells from a distant pasture.\n We stopped beside a cold stream to refill our bottles and eat bread and cheese,\n then pushed on toward the ridge, where the view stretched all the way to the glaciers in the north.",
+      "error_rate": 0.0,
+      "audio_s": 26.72
+    },
+    {
+      "id": "en_long_06",
+      "lang": "en",
+      "whisper": "The old bookshop on the corner survived for decades by refusing to specialize.\n Its shelves held cookbooks next to poetry, repair manuals next to novels, and maps of\n countries that no longer existed.\n The owner knew most of her customers by name and could often guess what they wanted before\n they asked.\n When the building was finally sold, the neighborhood organized a farewell party, and people lined\n up around the block to buy one last book and say goodbye.",
+      "error_rate": 0.0,
+      "audio_s": 26.32
+    },
+    {
+      "id": "en_long_07",
+      "lang": "en",
+      "whisper": "Modern weather forecasting depends on an enormous network of instruments, including ground stations,\n ocean buoys, weather balloons, aircraft sensors, and satellites that photograph the entire planet\n every few minutes. All of this data flows into supercomputers that run physical models of the\n atmosphere, dividing it into millions of small cells and calculating how temperature, pressure,\n and humidity will change over the coming days. The forecast you see on your phone is the result\n of this global effort.",
+      "error_rate": 0.0,
+      "audio_s": 24.96
+    },
+    {
+      "id": "en_long_08",
+      "lang": "en",
+      "whisper": "My uncle restored an old wooden sailboat in his backyard over the course of three summers.\n He replaced the rotten planks one by one, sanded the hull until it was smooth as glass,\n and sewed a new set of sails on an ancient machine that had belonged to his mother.\n When the boat finally touched the water, the whole family gathered on the dock,\n and he sailed it across the bay with a grin that nobody had seen on his face in years.",
+      "error_rate": 0.0,
+      "audio_s": 22.32
+    },
+    {
+      "id": "en_long_09",
+      "lang": "en",
+      "whisper": "The committee reviewed the proposal for a new community center and raised several practical questions.\n Who would manage the building during evenings and weekends?\n How would the heating costs be covered in winter?\n Could the gymnasium be shared with the local school without creating scheduling conflicts?\n The architect promised to return with revised drawings in a detailed budget,\n and the chair reminded everyone that the funding application was due at the end of the month.",
+      "error_rate": 0.013333333333333334,
+      "audio_s": 26.48
+    },
+    {
+      "id": "en_long_10",
+      "lang": "en",
+      "whisper": "Honey bees communicate the location of food through a remarkable dance performed on the vertical surface of the comb.\n A returning forager walks in a short straight line while waggling her body, then circles back and repeats the movement.\n The angle of the line relative to gravity indicates the direction of the food in relation to the sun, and the duration of the waggle indicates the distance.\n Other bees follow the dance closely, and then fly out to find the flowers themselves.",
+      "error_rate": 0.024691358024691357,
+      "audio_s": 23.44
+    },
+    {
+      "id": "zh_short_01",
+      "lang": "zh",
+      "whisper": "明天早上,火车准时出发。",
+      "error_rate": 0.0,
+      "audio_s": 2.32
+    },
+    {
+      "id": "zh_short_02",
+      "lang": "zh",
+      "whisper": "请在离开前关好窗户",
+      "error_rate": 0.0,
+      "audio_s": 2.08
+    },
+    {
+      "id": "zh_short_03",
+      "lang": "zh",
+      "whisper": "他把旧篱笆刷成了蓝色",
+      "error_rate": 0.1,
+      "audio_s": 2.24
+    },
+    {
+      "id": "zh_short_04",
+      "lang": "zh",
+      "whisper": "花园这周需要一场雨",
+      "error_rate": 0.0,
+      "audio_s": 2.08
+    },
+    {
+      "id": "zh_short_05",
+      "lang": "zh",
+      "whisper": "他把钥匙忘在了餐桌上,",
+      "error_rate": 0.0,
+      "audio_s": 2.16
+    },
+    {
+      "id": "zh_short_06",
+      "lang": "zh",
+      "whisper": "图书馆工作日开门很早",
+      "error_rate": 0.0,
+      "audio_s": 2.16
+    },
+    {
+      "id": "zh_short_07",
+      "lang": "zh",
+      "whisper": "我们看着暴风雨越过山丘",
+      "error_rate": 0.0,
+      "audio_s": 3.36
+    },
+    {
+      "id": "zh_short_08",
+      "lang": "zh",
+      "whisper": "清晨的面包香气真好闻",
+      "error_rate": 0.0,
+      "audio_s": 2.24
+    },
+    {
+      "id": "zh_short_09",
+      "lang": "zh",
+      "whisper": "猫咪睡在温暖的暖气旁",
+      "error_rate": 0.0,
+      "audio_s": 3.04
+    },
+    {
+      "id": "zh_short_10",
+      "lang": "zh",
+      "whisper": "过了第二座桥,向左转。",
+      "error_rate": 0.0,
+      "audio_s": 3.76
+    },
+    {
+      "id": "zh_medium_01",
+      "lang": "zh",
+      "whisper": "山谷里停电的那个晚上\n邻居们点着蜡烛聚在门廊上讲故事\n一直到电力恢复才各自回家",
+      "error_rate": 0.0,
+      "audio_s": 8.48
+    },
+    {
+      "id": "zh_medium_02",
+      "lang": "zh",
+      "whisper": "博物馆的新展览讲述了航海的历史\n从简单的星图一直到今天引导船只和飞机的卫星系统",
+      "error_rate": 0.0,
+      "audio_s": 8.08
+    },
+    {
+      "id": "zh_medium_03",
+      "lang": "zh",
+      "whisper": "经过几个月的精心筹备,这家小面包店在安静的街角开张了,还没到中午,东西就全部卖光了。",
+      "error_rate": 0.0,
+      "audio_s": 9.36
+    },
+    {
+      "id": "zh_medium_04",
+      "lang": "zh",
+      "whisper": "外婆为她种过的每一个花园都写了日记,记下哪些种子在年土里长得好,哪些需要杀制土壤。",
+      "error_rate": 0.07894736842105263,
+      "audio_s": 8.72
+    },
+    {
+      "id": "zh_medium_05",
+      "lang": "zh",
+      "whisper": "乐团把最后一个乐章排练了三遍,不断调整速度,直到指挥对弦乐和同管的平衡感到满意。",
+      "error_rate": 0.02702702702702703,
+      "audio_s": 9.6
+    },
+    {
+      "id": "zh_medium_06",
+      "lang": "zh",
+      "whisper": "科研站的科学家记录到今年冬天气温异常偏高\n这或许可以解释候鸟为什么提前了几周到达",
+      "error_rate": 0.0,
+      "audio_s": 9.12
+    },
+    {
+      "id": "zh_medium_07",
+      "lang": "zh",
+      "whisper": "如果你沿着河边小路走过老墨房,就会看到一座木桥,\n过桥后直接通向村子的广场。",
+      "error_rate": 0.058823529411764705,
+      "audio_s": 8.08
+    },
+    {
+      "id": "zh_medium_08",
+      "lang": "zh",
+      "whisper": "软件更新修复了登录问题\n但有几位用户反映新的设置页面\n在旧手机上打开得很慢",
+      "error_rate": 0.0,
+      "audio_s": 6.56
+    },
+    {
+      "id": "zh_medium_09",
+      "lang": "zh",
+      "whisper": "每个星期六,农贸市场把停车场摆满了摊位,有蜂蜜、奶酪、鲜花和附近农场种的蔬菜。",
+      "error_rate": 0.0,
+      "audio_s": 10.08
+    },
+    {
+      "id": "zh_medium_10",
+      "lang": "zh",
+      "whisper": "侦探仔细研究了大门旁泥地上的脚印\n断定来访者早在雨停之前很久就已经到了",
+      "error_rate": 0.0,
+      "audio_s": 7.12
+    },
+    {
+      "id": "zh_long_01",
+      "lang": "zh",
+      "whisper": "首塔人独自在岛上生活了将近20年\n这么多年来他从未错过一次黄昏点灯\n补给船每月来两次\n带来面粉、灯油、报纸\n偶尔还有妹妹从大陆寄来的信\n她慢慢地读完每一页\n细细品味那个似乎一季比一季遥远的世界\n然后把报纸叠得整整齐齐\n堆在炉子旁边当引火的柴",
+      "error_rate": 0.03636363636363636,
+      "audio_s": 26.56
+    },
+    {
+      "id": "zh_long_02",
+      "lang": "zh",
+      "whisper": "学会做饭主要靠耐心和专注\n先从几道简单的菜开始\n反复练习直到每个步骤都变得自然\n仔细观察洋葱变软时颜色如何变化\n酱汁收干时如何变稠\n要不停地尝味道\n一点一点地调整颜量\n时间久了你就不再需要称量每样东西\n而是开始相信自己的感觉\n到那时做饭就不再像工作\n而更像是一种游戏",
+      "error_rate": 0.008130081300813009,
+      "audio_s": 29.92
+    },
+    {
+      "id": "zh_long_03",
+      "lang": "zh",
+      "whisper": "市议会星期二晚上开会讨论在主干道上修建自行车道的提案\n支持者认为车道可以缓解交通,改善空气质量,让市中心对家庭更安全\n而几位店主则担心店门口的停车位会减少\n经过两个小时的公众发言,议会投票通过了在大道北半段实行一年的方案\n并决定明年春天再评估结果",
+      "error_rate": 0.008620689655172414,
+      "audio_s": 23.84
+    },
+    {
+      "id": "zh_long_04",
+      "lang": "zh",
+      "whisper": "天文学家宣布发现了一颗围绕暗红色恒星运行的小型岩石行星\n距离地球大约40光年\n这颗行星每11天绕恒星一周\n接收到的光照与地球从太阳获得的差不多\n正好处在液态水可能存在的区域\n研究团队计划用大型空间望远镜寻找大气层的迹象\n但他们也提醒说\n要收集足够的数据得出可靠结论还需要很多年",
+      "error_rate": 0.030534351145038167,
+      "audio_s": 28.0
+    },
+    {
+      "id": "zh_long_05",
+      "lang": "zh",
+      "whisper": "徒步的第一天早上\n山路在高大的松林中平稳地向上延伸\n松针盖住了每一个脚步声\n到了中午树木渐渐稀疏\n开阔的草垫上点缀着野花\n风里传来远处牧场隐约的牛林声\n我们在一条冰凉的小溪边亭下\n灌满水壶吃了面包和奶酪\n然后继续向山脊进发\n从那里可以一直望到北边的冰川",
+      "error_rate": 0.02564102564102564,
+      "audio_s": 26.48
+    },
+    {
+      "id": "zh_long_06",
+      "lang": "zh",
+      "whisper": "街角那家旧书店靠着不专营任何一类书籍而生存了几十年\n书架上 石谱挨着诗籍 修理手册挨着小说\n还有一些早已不存在的国家的地图\n店主认识大多数顾客的名字\n常常在他们开口之前就能猜到他们想要什么\n当这栋楼最终被卖掉时\n街坊们组织了一场告别聚会\n人们排着长队绕过街区\n只为买最后一本书 道一声再见",
+      "error_rate": 0.015037593984962405,
+      "audio_s": 27.92
+    },
+    {
+      "id": "zh_long_07",
+      "lang": "zh",
+      "whisper": "现在天气预报依赖一个庞大的仪器网络,包括地面观测站,海洋浮标,探空气球,飞机传感器,以及每隔几分钟就拍摄整个地球的卫星。\n所有这些数据汇入超级计算机,运行大气的物理模型,把大气分成数百万个小格子。\n计算未来几天温度、气压和湿度会如何变化,你在手机上看到的天气预报正是这项全球协作的成果。",
+      "error_rate": 0.007751937984496124,
+      "audio_s": 24.48
+    },
+    {
+      "id": "zh_long_08",
+      "lang": "zh",
+      "whisper": "我叔叔花了三个夏天在后院里修复一艘旧木帆船,他把腐烂的船板一块一块换掉,把船体打磨得像玻璃一样光滑,还用他母亲留下的一台老缝纫机缝了一套新帆。\n当船终于下水的时候,全家人聚在码头上,他驾着船驶过海湾,脸上露出了多年来没人见过的笑容。",
+      "error_rate": 0.0,
+      "audio_s": 22.88
+    },
+    {
+      "id": "zh_long_09",
+      "lang": "zh",
+      "whisper": "委员会审议了新建社区中心的提案,并提出了几个实际的问题。\n晚上和周末谁来管理这栋楼?\n冬天的取暖费用怎么解决?\n体育馆能否与当地学校共用而不产生排期冲突?\n建筑师承诺带着修改后的图纸和详细预算再来。\n主席提醒大家,资金申请的截止日期是月底。",
+      "error_rate": 0.0,
+      "audio_s": 19.84
+    },
+    {
+      "id": "zh_long_10",
+      "lang": "zh",
+      "whisper": "蜜蜂通过在蜂巢垂直表面上跳的一种奇妙舞蹈来传递食物的位置\n采蜜归来的公蜂一边摆动身体一边沿直线走一小段\n然后绕回起点重复这个动作\n直线相对于重力的角度表示食物相对于太阳的方向\n摆动持续的时间则表示距离\n其他蜜蜂紧紧跟着这只舞\n然后飞出去自己寻找那些花朵",
+      "error_rate": 0.016666666666666666,
+      "audio_s": 22.88
+    }
+  ]
+}

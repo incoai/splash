@@ -1,0 +1,29 @@
+{
+  "description": "Held-out TTS prompts, never used for tuning or earlier benchmarks: 4 each of en/zh x short/medium/long. 'units' = words (en) or characters (zh). Used to check that results on tts_prompts.json are not an artifact of repeated inputs.",
+  "prompts": [
+    {"id": "ho_en_short_01", "lang": "en", "length": "short", "text": "Please close the window before you leave.", "units": 7},
+    {"id": "ho_en_short_02", "lang": "en", "length": "short", "text": "The kettle whistled in the empty kitchen.", "units": 7},
+    {"id": "ho_en_short_03", "lang": "en", "length": "short", "text": "Our flight was delayed by two hours.", "units": 7},
+    {"id": "ho_en_short_04", "lang": "en", "length": "short", "text": "He planted tomatoes along the fence.", "units": 6},
+    {"id": "ho_en_medium_01", "lang": "en", "length": "medium", "text": "The museum opens a new exhibit on ancient navigation next month, featuring star charts, wooden compasses and a replica of a small sailing boat.", "units": 24},
+    {"id": "ho_en_medium_02", "lang": "en", "length": "medium", "text": "After the storm passed, volunteers spent the whole weekend clearing branches from the park and repairing the damaged footbridge.", "units": 19},
+    {"id": "ho_en_medium_03", "lang": "en", "length": "medium", "text": "If you want the bread to rise properly, keep the dough somewhere warm and give it at least an hour before baking.", "units": 22},
+    {"id": "ho_en_medium_04", "lang": "en", "length": "medium", "text": "The committee will review every application carefully and announce the scholarship winners at the end of the spring term.", "units": 19},
+    {"id": "ho_en_long_01", "lang": "en", "length": "long", "text": "Every autumn the small fishing village holds a festival to celebrate the end of the season. Boats are decorated with lanterns, children run between stalls selling roasted chestnuts, and the oldest sailors tell stories about storms they survived decades ago. Visitors come from the nearby towns, and for one evening the quiet harbor becomes the busiest place on the coast.", "units": 62},
+    {"id": "ho_en_long_02", "lang": "en", "length": "long", "text": "Learning a musical instrument as an adult is slower than it is for children, but it has its own rewards. Adults tend to practice with more purpose, they understand why certain exercises matter, and they often enjoy the music they choose to play. The hardest part is usually patience: progress comes in small steps, and the first few months can feel frustrating before everything starts to fall into place.", "units": 70},
+    {"id": "ho_en_long_03", "lang": "en", "length": "long", "text": "The engineers tested the bridge by driving loaded trucks across it one at a time while sensors recorded how much the steel beams bent. The measurements matched their calculations closely, and only one joint needed extra reinforcement. A week later the city opened the bridge to traffic, and commuters on the east side saved almost twenty minutes each morning.", "units": 60},
+    {"id": "ho_en_long_04", "lang": "en", "length": "long", "text": "When the library introduced evening hours, nobody expected how popular they would become. Students used the quiet tables to study after work, retired neighbors joined a weekly reading circle, and parents brought their children for storytelling on Thursday nights. Within a year the evening visitors outnumbered those who came during the day, and the library hired two more staff members.", "units": 62},
+    {"id": "ho_zh_short_01", "lang": "zh", "length": "short", "text": "请把窗户关好再出门。", "units": 9},
+    {"id": "ho_zh_short_02", "lang": "zh", "length": "short", "text": "今天的晚饭是面条。", "units": 8},
+    {"id": "ho_zh_short_03", "lang": "zh", "length": "short", "text": "火车晚点了半个小时。", "units": 9},
+    {"id": "ho_zh_short_04", "lang": "zh", "length": "short", "text": "他在院子里种了花。", "units": 8},
+    {"id": "ho_zh_medium_01", "lang": "zh", "length": "medium", "text": "博物馆下个月将举办一场关于古代航海的展览，展出星图、罗盘和一艘小帆船的复制品。", "units": 37},
+    {"id": "ho_zh_medium_02", "lang": "zh", "length": "medium", "text": "暴风雨过后，志愿者们花了整个周末清理公园里的树枝，并修好了被损坏的小桥。", "units": 35},
+    {"id": "ho_zh_medium_03", "lang": "zh", "length": "medium", "text": "如果想让面包发得好，就要把面团放在温暖的地方，至少等一个小时再烤。", "units": 31},
+    {"id": "ho_zh_medium_04", "lang": "zh", "length": "medium", "text": "评审委员会会认真审阅每一份申请，并在春季学期结束时公布奖学金的获得者。", "units": 34},
+    {"id": "ho_zh_long_01", "lang": "zh", "length": "long", "text": "每年秋天，这个小渔村都会举办一个节日来庆祝捕鱼季的结束。渔船上挂满了灯笼，孩子们在摊位之间跑来跑去，买烤栗子吃，年纪最大的老水手们讲述几十年前经历过的风暴。附近城镇的游客也纷纷赶来，在这一个晚上，安静的港口变成了海岸上最热闹的地方。", "units": 118},
+    {"id": "ho_zh_long_02", "lang": "zh", "length": "long", "text": "成年人学习乐器比孩子慢，但也有自己的收获。成年人练习时目的更明确，明白每个练习的意义，也往往更喜欢自己选择演奏的音乐。最难的通常是耐心：进步是一点一点来的，最初几个月可能会让人感到沮丧，然后一切才慢慢变得顺利起来。", "units": 108},
+    {"id": "ho_zh_long_03", "lang": "zh", "length": "long", "text": "工程师们让装满货物的卡车一辆接一辆地驶过大桥，同时用传感器记录钢梁弯曲的程度。测量结果与他们的计算非常接近，只有一个连接处需要额外加固。一周以后，城市正式开放了这座桥，住在东边的上班族每天早上能节省将近二十分钟。", "units": 109},
+    {"id": "ho_zh_long_04", "lang": "zh", "length": "long", "text": "图书馆开始在晚上开放时，没有人想到会这么受欢迎。下班后的学生在安静的桌子旁学习，退休的邻居们参加每周一次的读书会，父母们在周四晚上带孩子来听故事。不到一年，晚上来的读者就超过了白天，图书馆又新招了两名工作人员。", "units": 108}
+  ]
+}

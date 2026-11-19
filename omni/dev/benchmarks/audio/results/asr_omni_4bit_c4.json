@@ -1,0 +1,532 @@
+{
+ "task": "asr",
+ "engine": "omni",
+ "model": "mlx-community/Qwen3-ASR-1.7B-4bit",
+ "concurrency": 4,
+ "timestamp": "2026-10-08T12:48:50",
+ "host": {
+  "machine": "arm64",
+  "macos": "26.6.2",
+  "python": "3.12.13",
+  "chip": "Apple M5 Pro",
+  "mem_bytes": "51539607552"
+ },
+ "config": {
+  "set": "subset",
+  "language": "English",
+  "data_dir": "data",
+  "warmup": 1,
+  "base_url": "http://127.0.0.1:8772"
+ },
+ "summary": {
+  "n": 30,
+  "errors": 0,
+  "wall_s": 2.888690000050701,
+  "latency_ms": {
+   "n": 30,
+   "mean": 368.768172354127,
+   "p50": 303.626750013791,
+   "p90": 653.3862169831992,
+   "p95": 789.5575525588354,
+   "min": 98.68995798751712,
+   "max": 990.4179169097915
+  },
+  "audio_s_total": 340.005,
+  "rtfx": {
+   "n": 30,
+   "mean": 29.38584293160902,
+   "p50": 29.185290808732354,
+   "p90": 42.4771410939402,
+   "p95": 46.52623292644187,
+   "min": 11.338114966250691,
+   "max": 50.044027623474534
+  },
+  "rtfx_median": 29.185290808732354,
+  "rtfx_aggregate": 30.733400682736995,
+  "throughput_audio_s_per_s": 117.70214179923506,
+  "wer": 0.026285714285714287,
+  "peak_memory_gb": null
+ },
+ "items": [
+  {
+   "latency_s": 0.225262040970847,
+   "language": null,
+   "status": 200,
+   "error": null,
+   "extra": {
+    "start_offset_s": 0.00012166600208729506
+   },
+   "transcript": "Whatever appealed to her sense of beauty was straightway transferred to paper or canvas.",
+   "id": "4992-41797-0011",
+   "set": "subset",
+   "duration": 5.445,
+   "reference": "WHATEVER APPEALED TO HER SENSE OF BEAUTY WAS STRAIGHTWAY TRANSFERRED TO PAPER OR CANVAS",
+   "rtfx": 24.17184882340954,
+   "wer": 0.0
+  },
+  {
+   "latency_s": 0.22528945899102837,
+   "language": null,
+   "status": 200,
+   "error": null,
+   "extra": {
+    "start_offset_s": 0.00020554102957248688
+   },
+   "transcript": "It is necessary, therefore, that he should comply. The king frowned.",
+   "id": "7127-75946-0007",
+   "set": "subset",
+   "duration": 4.755,
+   "reference": "IT IS NECESSARY THEREFORE THAT HE SHOULD COMPLY THE KING FROWNED",
+   "rtfx": 21.1061805612013,
+   "wer": 0.0
+  },
+  {
+   "latency_s": 0.4780036669690162,
+   "language": null,
+   "status": 200,
+   "error": null,
+   "extra": {
+    "start_offset_s": 0.0002978330012410879
+   },
+   "transcript": "It is probable that the relation of the ideas to God, or of God to the world, was differently conceived by him at different times of his life.",
+   "id": "2961-960-0013",
+   "set": "subset",
+   "duration": 10.575,
+   "reference": "IT IS PROBABLE THAT THE RELATION OF THE IDEAS TO GOD OR OF GOD TO THE WORLD WAS DIFFERENTLY CONCEIVED BY HIM AT DIFFERENT TIMES OF HIS LIFE",
+   "rtfx": 22.123261244113976,
+   "wer": 0.0
+  },
+  {
+   "latency_s": 0.15042579197324812,
+   "language": null,
+   "status": 200,
+   "error": null,
+   "extra": {
+    "start_offset_s": 0.0003320410614833236
+   },
+   "transcript": "But that is Caffar's knife.",
+   "id": "6930-81414-0016",
+   "set": "subset",
+   "duration": 2.16,
+   "reference": "BUT THAT IS KAFFAR'S KNIFE",
+   "rtfx": 14.359239673367561,
+   "wer": 0.2
+  },
+  {
+   "latency_s": 0.4665337080368772,
+   "language": null,
+   "status": 200,
+   "error": null,
+   "extra": {
+    "start_offset_s": 0.15114808303769678
+   },
+   "transcript": "But this frequenter of the heights of air, for all his savage valor, was troubled at the leaping waves and the tossing foam of these mad rapids. He did not understand them.",
+   "id": "7176-88083-0018",
+   "set": "subset",
+   "duration": 10.45,
+   "reference": "BUT THIS FREQUENTER OF THE HEIGHTS OF AIR FOR ALL HIS SAVAGE VALOR WAS TROUBLED AT THE LEAPING WAVES AND THE TOSSING FOAM OF THESE MAD RAPIDS HE DID NOT UNDERSTAND THEM",
+   "rtfx": 22.399238940252474,
+   "wer": 0.0
+  },
+  {
+   "latency_s": 0.19210049998946488,
+   "language": null,
+   "status": 200,
+   "error": null,
+   "extra": {
+    "start_offset_s": 0.22580933303106576
+   },
+   "transcript": "Save me, masters! But you startled me. Rarely.",
+   "id": "61-70970-0030",
+   "set": "subset",
+   "duration": 3.24,
+   "reference": "SAVE ME MASTERS BUT YOU STARTLED ME RARELY",
+   "rtfx": 16.866171614221138,
+   "wer": 0.0
+  },
+  {
+   "latency_s": 0.9904179169097915,
+   "language": null,
+   "status": 200,
+   "error": null,
+   "extra": {
+    "start_offset_s": 0.2259367910446599
+   },
+   "transcript": "But there is always a stronger sense of life when the sun is brilliant after rain, and now he is pouring down his beams and making sparkles among the wet straw, and lighting up every patch of vivid green moss on the red tiles of the cowshed, and turning even the muddy water that is hurrying along the channel to the drain, into a mirror, for the yellow billed ducks, who are seizing the opportunity of getting a drink. With as much body in it as possible.",
+   "id": "2094-142345-0008",
+   "set": "subset",
+   "duration": 31.65,
+   "reference": "BUT THERE IS ALWAYS A STRONGER SENSE OF LIFE WHEN THE SUN IS BRILLIANT AFTER RAIN AND NOW HE IS POURING DOWN HIS BEAMS AND MAKING SPARKLES AMONG THE WET STRAW AND LIGHTING UP EVERY PATCH OF VIVID GREEN MOSS ON THE RED TILES OF THE COW SHED AND TURNING EVEN THE MUDDY WATER THAT IS HURRYING ALONG THE CHANNEL TO THE DRAIN INTO A MIRROR FOR THE YELLOW BILLED DUCKS WHO ARE SEIZING THE OPPORTUNITY OF GETTING A DRINK WITH AS MUCH BODY IN IT AS POSSIBLE",
+   "rtfx": 31.95620703101913,
+   "wer": 0.022727272727272728
+  },
+  {
+   "latency_s": 0.4444428749848157,
+   "language": null,
+   "status": 200,
+   "error": null,
+   "extra": {
+    "start_offset_s": 0.41815250006038696
+   },
+   "transcript": "Before this travesty on the administration of law could be brought before the court of last resort, and there met with the reversal and rebuke it deserved, men were imprisoned under sentence of many years' duration.",
+   "id": "4077-13754-0013",
+   "set": "subset",
+   "duration": 12.87,
+   "reference": "BEFORE THIS TRAVESTY ON THE ADMINISTRATION OF LAW COULD BE BROUGHT BEFORE THE COURT OF LAST RESORT AND THERE MEET WITH THE REVERSAL AND REBUKE IT DESERVED MEN WERE IMPRISONED UNDER SENTENCES OF MANY YEARS DURATION",
+   "rtfx": 28.957602257522296,
+   "wer": 0.05555555555555555
+  },
+  {
+   "latency_s": 0.2700924590462819,
+   "language": null,
+   "status": 200,
+   "error": null,
+   "extra": {
+    "start_offset_s": 0.4788051660871133
+   },
+   "transcript": "Of this second letter, also she spoke, and told me that it contained an invitation for her to go and see the poet, if ever she visited the lakes.",
+   "id": "3575-170457-0030",
+   "set": "subset",
+   "duration": 8.945,
+   "reference": "OF THIS SECOND LETTER ALSO SHE SPOKE AND TOLD ME THAT IT CONTAINED AN INVITATION FOR HER TO GO AND SEE THE POET IF EVER SHE VISITED THE LAKES",
+   "rtfx": 33.118288572681784,
+   "wer": 0.0
+  },
+  {
+   "latency_s": 0.09868995798751712,
+   "language": null,
+   "status": 200,
+   "error": null,
+   "extra": {
+    "start_offset_s": 0.617904041078873
+   },
+   "transcript": "Voltaire picked up something from the ground and looked at it.",
+   "id": "6930-81414-0019",
+   "set": "subset",
+   "duration": 3.38,
+   "reference": "VOLTAIRE PICKED UP SOMETHING FROM THE GROUND AND LOOKED AT IT",
+   "rtfx": 34.24867199181017,
+   "wer": 0.0
+  },
+  {
+   "latency_s": 0.20506054197903723,
+   "language": null,
+   "status": 200,
+   "error": null,
+   "extra": {
+    "start_offset_s": 0.7168044580612332
+   },
+   "transcript": "I have my own reasons, Mr. Marshall.",
+   "id": "6829-68769-0047",
+   "set": "subset",
+   "duration": 2.325,
+   "reference": "I HAVE MY OWN REASONS MISTER MARSHALL",
+   "rtfx": 11.338114966250691,
+   "wer": 0.14285714285714285
+  },
+  {
+   "latency_s": 0.7462025419808924,
+   "language": null,
+   "status": 200,
+   "error": null,
+   "extra": {
+    "start_offset_s": 0.7491020830348134
+   },
+   "transcript": "Beholding it, Hester was constrained to rush towards the child, to pursue the little elf in the flight which she invariably began, to snatch her to her bosom with a close pressure and earnest kisses, not so much from overflowing love as to assure herself that Pearl was flesh and blood, and not utterly delusive.",
+   "id": "1221-135766-0011",
+   "set": "subset",
+   "duration": 21.345,
+   "reference": "BEHOLDING IT HESTER WAS CONSTRAINED TO RUSH TOWARDS THE CHILD TO PURSUE THE LITTLE ELF IN THE FLIGHT WHICH SHE INVARIABLY BEGAN TO SNATCH HER TO HER BOSOM WITH A CLOSE PRESSURE AND EARNEST KISSES NOT SO MUCH FROM OVERFLOWING LOVE AS TO ASSURE HERSELF THAT PEARL WAS FLESH AND BLOOD AND NOT UTTERLY DELUSIVE",
+   "rtfx": 28.604834209404995,
+   "wer": 0.0
+  },
+  {
+   "latency_s": 0.27203579200431705,
+   "language": null,
+   "status": 200,
+   "error": null,
+   "extra": {
+    "start_offset_s": 0.8628444580826908
+   },
+   "transcript": "They constitute two different orders of facts, which correspond to each other, which are always interlaced, and which often bring forth results.",
+   "id": "4507-16021-0034",
+   "set": "subset",
+   "duration": 11.27,
+   "reference": "THEY CONSTITUTE TWO DIFFERENT ORDERS OF FACTS WHICH CORRESPOND TO EACH OTHER WHICH ARE ALWAYS INTERLACED AND WHICH OFTEN BRING FORTH RESULTS",
+   "rtfx": 41.428372042386066,
+   "wer": 0.0
+  },
+  {
+   "latency_s": 0.3646251249592751,
+   "language": null,
+   "status": 200,
+   "error": null,
+   "extra": {
+    "start_offset_s": 0.9220264999894425
+   },
+   "transcript": "Besides members of parliament who were excluded, many officers unwilling to serve under the new generals threw up their commissions and unwarily facilitated the project of putting the army entirely into the hands of that faction.",
+   "id": "8224-274381-0014",
+   "set": "subset",
+   "duration": 17.88,
+   "reference": "BESIDES MEMBERS OF PARLIAMENT WHO WERE EXCLUDED MANY OFFICERS UNWILLING TO SERVE UNDER THE NEW GENERALS THREW UP THEIR COMMISSIONS AND UNWARILY FACILITATED THE PROJECT OF PUTTING THE ARMY ENTIRELY INTO THE HANDS OF THAT FACTION",
+   "rtfx": 49.03666471693911,
+   "wer": 0.0
+  },
+  {
+   "latency_s": 0.5884367079706863,
+   "language": null,
+   "status": 200,
+   "error": null,
+   "extra": {
+    "start_offset_s": 1.1350837079808116
+   },
+   "transcript": "In December 1888, Mr. W. J. Jenks read an interesting paper before the American Institute of Electrical Engineers, on the six years of practical experience had up to that time with the meter, then more generally in use than any other.",
+   "id": "2300-131720-0033",
+   "set": "subset",
+   "duration": 17.605,
+   "reference": "IN DECEMBER EIGHTEEN EIGHTY EIGHT MISTER W J JENKS READ AN INTERESTING PAPER BEFORE THE AMERICAN INSTITUTE OF ELECTRICAL ENGINEERS ON THE SIX YEARS OF PRACTICAL EXPERIENCE HAD UP TO THAT TIME WITH THE METER THEN MORE GENERALLY IN USE THAN ANY OTHER",
+   "rtfx": 29.91825588297088,
+   "wer": 0.09302325581395349
+  },
+  {
+   "latency_s": 0.11252137494739145,
+   "language": null,
+   "status": 200,
+   "error": null,
+   "extra": {
+    "start_offset_s": 1.2166666249977425
+   },
+   "transcript": "I don't want to stand around and look on.",
+   "id": "237-134500-0029",
+   "set": "subset",
+   "duration": 2.065,
+   "reference": "I DON'T WANT TO STAND AROUND AND LOOK ON",
+   "rtfx": 18.352068671090056,
+   "wer": 0.0
+  },
+  {
+   "latency_s": 0.13439933396875858,
+   "language": null,
+   "status": 200,
+   "error": null,
+   "extra": {
+    "start_offset_s": 1.2870036660460755
+   },
+   "transcript": "Hawkin there shall be your constant companion, friend farmer.",
+   "id": "5142-33396-0037",
+   "set": "subset",
+   "duration": 3.575,
+   "reference": "HAKON THERE SHALL BE YOUR CONSTANT COMPANION FRIEND FARMER",
+   "rtfx": 26.599834198813937,
+   "wer": 0.1111111111111111
+  },
+  {
+   "latency_s": 0.29139212507288903,
+   "language": null,
+   "status": 200,
+   "error": null,
+   "extra": {
+    "start_offset_s": 1.3293800830142573
+   },
+   "transcript": "You must see, Lieutenant. I should think that we are not so near the coast of Algeria as you imagined.",
+   "id": "5105-28241-0016",
+   "set": "subset",
+   "duration": 6.285,
+   "reference": "YOU MUST SEE LIEUTENANT I SHOULD THINK THAT WE ARE NOT SO NEAR THE COAST OF ALGERIA AS YOU IMAGINED",
+   "rtfx": 21.56887389605284,
+   "wer": 0.0
+  },
+  {
+   "latency_s": 0.4539245000341907,
+   "language": null,
+   "status": 200,
+   "error": null,
+   "extra": {
+    "start_offset_s": 1.4216051250696182
+   },
+   "transcript": "This nobleman's character, though celebrated for political courage and conduct, was very low for military prowess, and after some skirmishes in which he was worsted, he here allowed Montrose to escape him.",
+   "id": "8224-274381-0006",
+   "set": "subset",
+   "duration": 16.98,
+   "reference": "THIS NOBLEMAN'S CHARACTER THOUGH CELEBRATED FOR POLITICAL COURAGE AND CONDUCT WAS VERY LOW FOR MILITARY PROWESS AND AFTER SOME SKIRMISHES IN WHICH HE WAS WORSTED HE HERE ALLOWED MONTROSE TO ESCAPE HIM",
+   "rtfx": 37.407101839008526,
+   "wer": 0.0
+  },
+  {
+   "latency_s": 0.6430732919834554,
+   "language": null,
+   "status": 200,
+   "error": null,
+   "extra": {
+    "start_offset_s": 1.495532000088133
+   },
+   "transcript": "Then again, there was no known way to lubricate an engine for continuous running, and Mr. Edison informed me that as a marine engine started before the ship left New York and continued running until it reached its home port, so an engine for his purposes must produce light at all times.",
+   "id": "2300-131720-0016",
+   "set": "subset",
+   "duration": 20.015,
+   "reference": "THEN AGAIN THERE WAS NO KNOWN WAY TO LUBRICATE AN ENGINE FOR CONTINUOUS RUNNING AND MISTER EDISON INFORMED ME THAT AS A MARINE ENGINE STARTED BEFORE THE SHIP LEFT NEW YORK AND CONTINUED RUNNING UNTIL IT REACHED ITS HOME PORT SO AN ENGINE FOR HIS PURPOSES MUST PRODUCE LIGHT AT ALL TIMES",
+   "rtfx": 31.123979567347565,
+   "wer": 0.019230769230769232
+  },
+  {
+   "latency_s": 0.10274441703222692,
+   "language": null,
+   "status": 200,
+   "error": null,
+   "extra": {
+    "start_offset_s": 1.62100129108876
+   },
+   "transcript": "I shudder as I recall these monsters to my remembrance.",
+   "id": "260-123286-0017",
+   "set": "subset",
+   "duration": 3.975,
+   "reference": "I SHUDDER AS I RECALL THESE MONSTERS TO MY REMEMBRANCE",
+   "rtfx": 38.688233529547375,
+   "wer": 0.0
+  },
+  {
+   "latency_s": 0.420032124966383,
+   "language": null,
+   "status": 200,
+   "error": null,
+   "extra": {
+    "start_offset_s": 1.7238051660824567
+   },
+   "transcript": "But first, I will tell you that for many years I have longed for a servant to help me with the housework and to cook the meals and wash the dishes.",
+   "id": "1284-1180-0026",
+   "set": "subset",
+   "duration": 8.29,
+   "reference": "BUT FIRST I WILL TELL YOU THAT FOR MANY YEARS I HAVE LONGED FOR A SERVANT TO HELP ME WITH THE HOUSEWORK AND TO COOK THE MEALS AND WASH THE DISHES",
+   "rtfx": 19.73658562583394,
+   "wer": 0.0
+  },
+  {
+   "latency_s": 0.315861374954693,
+   "language": null,
+   "status": 200,
+   "error": null,
+   "extra": {
+    "start_offset_s": 1.7238859999924898
+   },
+   "transcript": "Its origin was small, a germ, an insignificant seed, hardly to be thought of as likely to arouse opposition.",
+   "id": "4077-13751-0001",
+   "set": "subset",
+   "duration": 8.745,
+   "reference": "ITS ORIGIN WAS SMALL A GERM AN INSIGNIFICANT SEED HARDLY TO BE THOUGHT OF AS LIKELY TO AROUSE OPPOSITION",
+   "rtfx": 27.686196203174184,
+   "wer": 0.0
+  },
+  {
+   "latency_s": 0.8250298339407891,
+   "language": null,
+   "status": 200,
+   "error": null,
+   "extra": {
+    "start_offset_s": 1.8757632500492036
+   },
+   "transcript": "Yesterday you were trembling for a health that is dear to you. Today you fear for your own. Tomorrow it will be anxiety about money. The day after tomorrow the diatribe of a slanderer. The day after that the misfortune of some friend. Then the prevailing weather. Then something that has been broken or lost. Then a pleasure with which your conscience and your. Vertebral column reproach you. Again, the course of public affairs.",
+   "id": "4507-16021-0047",
+   "set": "subset",
+   "duration": 34.955,
+   "reference": "YESTERDAY YOU WERE TREMBLING FOR A HEALTH THAT IS DEAR TO YOU TO DAY YOU FEAR FOR YOUR OWN TO MORROW IT WILL BE ANXIETY ABOUT MONEY THE DAY AFTER TO MORROW THE DIATRIBE OF A SLANDERER THE DAY AFTER THAT THE MISFORTUNE OF SOME FRIEND THEN THE PREVAILING WEATHER THEN SOMETHING THAT HAS BEEN BROKEN OR LOST THEN A PLEASURE WITH WHICH YOUR CONSCIENCE AND YOUR VERTEBRAL COLUMN REPROACH YOU AGAIN THE COURSE OF PUBLIC AFFAIRS",
+   "rtfx": 42.36816483718655,
+   "wer": 0.07792207792207792
+  },
+  {
+   "latency_s": 0.34100591705646366,
+   "language": null,
+   "status": 200,
+   "error": null,
+   "extra": {
+    "start_offset_s": 2.039906374993734
+   },
+   "transcript": "Therefore, I feel myself quite able, as president of this republic, to receive you with the courtesy due to the servants of a friendly ally.",
+   "id": "8455-210777-0038",
+   "set": "subset",
+   "duration": 10.03,
+   "reference": "THEREFORE I FEEL MYSELF QUITE ABLE AS PRESIDENT OF THIS REPUBLIC TO RECEIVE YOU WITH A COURTESY DUE TO THE SERVANTS OF A FRIENDLY ALLY",
+   "rtfx": 29.412979359942412,
+   "wer": 0.04
+  },
+  {
+   "latency_s": 0.4705727909458801,
+   "language": null,
+   "status": 200,
+   "error": null,
+   "extra": {
+    "start_offset_s": 2.1388540000189096
+   },
+   "transcript": "Habit is a concept involving the occurrence of similar events at different times. If the behaviorist feels confident that there is such a phenomenon as habit, that can only be because he trusts his memory when it assures him that there have been other times.",
+   "id": "8230-279154-0007",
+   "set": "subset",
+   "duration": 15.905,
+   "reference": "HABIT IS A CONCEPT INVOLVING THE OCCURRENCE OF SIMILAR EVENTS AT DIFFERENT TIMES IF THE BEHAVIOURIST FEELS CONFIDENT THAT THERE IS SUCH A PHENOMENON AS HABIT THAT CAN ONLY BE BECAUSE HE TRUSTS HIS MEMORY WHEN IT ASSURES HIM THAT THERE HAVE BEEN OTHER TIMES",
+   "rtfx": 33.799234265181326,
+   "wer": 0.022222222222222223
+  },
+  {
+   "latency_s": 0.5941967499675229,
+   "language": null,
+   "status": 200,
+   "error": null,
+   "extra": {
+    "start_offset_s": 2.1441091659944504
+   },
+   "transcript": "This compulsion leads Nemo into ugly contradictions. He is a fighter for freedom, yet all who board his ship are imprisoned there for good. He works to save lives, both human and animal, yet he himself creates a holocaust. He detests imperialism, yet he lays personal claim to the South Pole.",
+   "id": "8463-294825-0009",
+   "set": "subset",
+   "duration": 20.005,
+   "reference": "THIS COMPULSION LEADS NEMO INTO UGLY CONTRADICTIONS HE'S A FIGHTER FOR FREEDOM YET ALL WHO BOARD HIS SHIP ARE IMPRISONED THERE FOR GOOD HE WORKS TO SAVE LIVES BOTH HUMAN AND ANIMAL YET HE HIMSELF CREATES A HOLOCAUST HE DETESTS IMPERIALISM YET HE LAYS PERSONAL CLAIM TO THE SOUTH POLE",
+   "rtfx": 33.66729959578778,
+   "wer": 0.04
+  },
+  {
+   "latency_s": 0.18914845900144428,
+   "language": null,
+   "status": 200,
+   "error": null,
+   "extra": {
+    "start_offset_s": 2.3811040830332786
+   },
+   "transcript": "And it is made of mother's best yarn, and she knitted it herself, and everybody wants to get it away from me.",
+   "id": "7021-85628-0018",
+   "set": "subset",
+   "duration": 8.22,
+   "reference": "AND IT IS MADE OF MOTHER'S BEST YARN AND SHE KNITTED IT HERSELF AND EVERYBODY WANTS TO GET IT AWAY FROM ME",
+   "rtfx": 43.45792740472306,
+   "wer": 0.0
+  },
+  {
+   "latency_s": 0.17276924999896437,
+   "language": null,
+   "status": 200,
+   "error": null,
+   "extra": {
+    "start_offset_s": 2.570447291014716
+   },
+   "transcript": "Come, we'll have our coffee in the other room, and you can smoke.",
+   "id": "4446-2273-0019",
+   "set": "subset",
+   "duration": 3.115,
+   "reference": "COME WE'LL HAVE OUR COFFEE IN THE OTHER ROOM AND YOU CAN SMOKE",
+   "rtfx": 18.02982880355545,
+   "wer": 0.0
+  },
+  {
+   "latency_s": 0.27875454199966043,
+   "language": null,
+   "status": 200,
+   "error": null,
+   "extra": {
+    "start_offset_s": 2.6096379160881042
+   },
+   "transcript": "We believe in a literal resurrection and an actual hereafter, in which future states shall be recognized every sanctified and authorized relationship existing here on earth, of parent and child, brother and sister, husband and wife.",
+   "id": "4077-13754-0007",
+   "set": "subset",
+   "duration": 13.95,
+   "reference": "WE BELIEVE IN A LITERAL RESURRECTION AND AN ACTUAL HEREAFTER IN WHICH FUTURE STATE SHALL BE RECOGNIZED EVERY SANCTIFIED AND AUTHORIZED RELATIONSHIP EXISTING HERE ON EARTH OF PARENT AND CHILD BROTHER AND SISTER HUSBAND AND WIFE",
+   "rtfx": 50.044027623474534,
+   "wer": 0.027777777777777776
+  }
+ ]
+}

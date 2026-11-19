@@ -383,16 +383,25 @@ def split_prose(name: str, text: str) -> tuple[str, str]:
     return " ".join(code), "\n".join(comment.group() for comment in comments)
 
 
+# Splash Omni, a project of its own in omni/ whose paths are relative to that
+# folder; its own dev/tools/check_architecture.py checks it.
+OMNI = "omni/"
+
+
 def repository_files() -> list[str]:
     """The checkout's files that git does not ignore, which leaves out builds,
-    downloaded models and tokens."""
+    downloaded models and tokens, and Splash Omni's (OMNI)."""
     listing = subprocess.run(
         ["git", "ls-files", "-z", "--cached", "--others", "--exclude-standard"],
         cwd=ROOT,
         capture_output=True,
         check=True,
     ).stdout.decode()
-    return sorted(name for name in listing.split("\0") if (ROOT / name).is_file())
+    return sorted(
+        name
+        for name in listing.split("\0")
+        if (ROOT / name).is_file() and not name.startswith(OMNI)
+    )
 
 
 def note_references(

@@ -1,0 +1,1274 @@
+{
+ "task": "tts",
+ "engine": "omni",
+ "model": "mlx-community/Qwen3-TTS-12Hz-1.7B-CustomVoice-4bit",
+ "concurrency": 8,
+ "timestamp": "2026-10-21T00:24:09",
+ "host": {
+  "machine": "arm64",
+  "macos": "26.6.2",
+  "python": "3.12.13",
+  "chip": "Apple M5 Pro",
+  "mem_bytes": "51539607552"
+ },
+ "config": {
+  "streaming_interval": 0.32,
+  "lang_code": "auto",
+  "voice": "vivian",
+  "instructions": null,
+  "response_format": "pcm",
+  "warmup": 1,
+  "prompts": "dev/benchmarks/audio/tts_prompts.json",
+  "extra": null,
+  "batch_mode": "server",
+  "base_url": "http://127.0.0.1:8100"
+ },
+ "summary": {
+  "n": 60,
+  "errors": 0,
+  "wall_s": 32.643885541998316,
+  "ttfa_ms": {
+   "n": 60,
+   "mean": 37.930334019862734,
+   "p50": 32.79233349894639,
+   "p90": 71.30600829550531,
+   "p95": 71.58011905121384,
+   "min": 20.044167002197355,
+   "max": 71.85883398051374
+  },
+  "latency_s": {
+   "n": 60,
+   "mean": 3.903005864599739,
+   "p50": 2.5495050629979232,
+   "p90": 9.639041004489991,
+   "p95": 10.535138737176021,
+   "min": 0.4499949589953758,
+   "max": 10.972219666000456
+  },
+  "audio_s_total": 1334.08,
+  "audio_s": {
+   "n": 60,
+   "mean": 22.234666666666666,
+   "p50": 14.120000000000001,
+   "p90": 54.888,
+   "p95": 59.856,
+   "min": 2.32,
+   "max": 62.08
+  },
+  "rtf": {
+   "n": 60,
+   "mean": 0.185193362446219,
+   "p50": 0.1789033786390954,
+   "p90": 0.21152556506263467,
+   "p95": 0.21676328814551052,
+   "min": 0.12975741399079882,
+   "max": 0.22888418416793382
+  },
+  "rtf_median": 0.1789033786390954,
+  "rtf_aggregate": 0.17553696320759202,
+  "throughput_audio_s_per_s": 40.86768403484402,
+  "peak_memory_gb": null
+ },
+ "items": [
+  {
+   "ttfa_s": 0.07175970799289644,
+   "total_s": 0.796214207977755,
+   "audio_s": 3.92,
+   "sample_rate": 24000,
+   "num_bytes": 188160,
+   "num_chunks": 48,
+   "audio_path": "bench-audio/tts_omni_customvoice-4bit_c8/en_short_01.wav",
+   "status": 200,
+   "error": null,
+   "extra": {
+    "start_offset_s": 0.00011995900422334671
+   },
+   "rtf": 0.20311586938208037,
+   "id": "en_short_01",
+   "lang": "en",
+   "length": "short",
+   "units": 6,
+   "text": "The train leaves at dawn tomorrow."
+  },
+  {
+   "ttfa_s": 0.07185883398051374,
+   "total_s": 0.5493220420030411,
+   "audio_s": 2.4,
+   "sample_rate": 24000,
+   "num_bytes": 115200,
+   "num_chunks": 30,
+   "audio_path": "bench-audio/tts_omni_customvoice-4bit_c8/en_short_02.wav",
+   "status": 200,
+   "error": null,
+   "extra": {
+    "start_offset_s": 0.0002527089964132756
+   },
+   "rtf": 0.22888418416793382,
+   "id": "en_short_02",
+   "lang": "en",
+   "length": "short",
+   "units": 7,
+   "text": "Please close the window before you go."
+  },
+  {
+   "ttfa_s": 0.07176645801519044,
+   "total_s": 1.0038796669978183,
+   "audio_s": 5.04,
+   "sample_rate": 24000,
+   "num_bytes": 241920,
+   "num_chunks": 62,
+   "audio_path": "bench-audio/tts_omni_customvoice-4bit_c8/en_short_03.wav",
+   "status": 200,
+   "error": null,
+   "extra": {
+    "start_offset_s": 0.00034283401328139007
+   },
+   "rtf": 0.19918247361067823,
+   "id": "en_short_03",
+   "lang": "en",
+   "length": "short",
+   "units": 7,
+   "text": "She painted the old fence bright blue."
+  },
+  {
+   "ttfa_s": 0.020044167002197355,
+   "total_s": 0.5603039999841712,
+   "audio_s": 2.88,
+   "sample_rate": 24000,
+   "num_bytes": 138240,
+   "num_chunks": 36,
+   "audio_path": "bench-audio/tts_omni_customvoice-4bit_c8/en_short_04.wav",
+   "status": 200,
+   "error": null,
+   "extra": {
+    "start_offset_s": 0.00042029202450066805
+   },
+   "rtf": 0.1945499999945039,
+   "id": "en_short_04",
+   "lang": "en",
+   "length": "short",
+   "units": 7,
+   "text": "Our garden really needs rain this week."
+  },
+  {
+   "ttfa_s": 0.0715706670016516,
+   "total_s": 0.47759450000012293,
+   "audio_s": 2.48,
+   "sample_rate": 24000,
+   "num_bytes": 119040,
+   "num_chunks": 31,
+   "audio_path": "bench-audio/tts_omni_customvoice-4bit_c8/en_short_05.wav",
+   "status": 200,
+   "error": null,
+   "extra": {
+    "start_offset_s": 0.0005185840127523988
+   },
+   "rtf": 0.19257842741940442,
+   "id": "en_short_05",
+   "lang": "en",
+   "length": "short",
+   "units": 8,
+   "text": "He forgot his keys on the kitchen table."
+  },
+  {
+   "ttfa_s": 0.07149791700066999,
+   "total_s": 1.0390575829951558,
+   "audio_s": 5.2,
+   "sample_rate": 24000,
+   "num_bytes": 249600,
+   "num_chunks": 64,
+   "audio_path": "bench-audio/tts_omni_customvoice-4bit_c8/en_short_06.wav",
+   "status": 200,
+   "error": null,
+   "extra": {
+    "start_offset_s": 0.000576250022277236
+   },
+   "rtf": 0.19981876596060688,
+   "id": "en_short_06",
+   "lang": "en",
+   "length": "short",
+   "units": 6,
+   "text": "The library opens early on weekdays."
+  },
+  {
+   "ttfa_s": 0.07141408300958574,
+   "total_s": 0.5488521250081249,
+   "audio_s": 2.56,
+   "sample_rate": 24000,
+   "num_bytes": 122880,
+   "num_chunks": 32,
+   "audio_path": "bench-audio/tts_omni_customvoice-4bit_c8/en_short_07.wav",
+   "status": 200,
+   "error": null,
+   "extra": {
+    "start_offset_s": 0.0006675420154351741
+   },
+   "rtf": 0.21439536133129877,
+   "id": "en_short_07",
+   "lang": "en",
+   "length": "short",
+   "units": 8,
+   "text": "We watched the storm roll over the hills."
+  },
+  {
+   "ttfa_s": 0.07129399999394082,
+   "total_s": 1.5840516249882057,
+   "audio_s": 8.0,
+   "sample_rate": 24000,
+   "num_bytes": 384000,
+   "num_chunks": 97,
+   "audio_path": "bench-audio/tts_omni_customvoice-4bit_c8/en_short_08.wav",
+   "status": 200,
+   "error": null,
+   "extra": {
+    "start_offset_s": 0.0008092500211205333
+   },
+   "rtf": 0.19800645312352572,
+   "id": "en_short_08",
+   "lang": "en",
+   "length": "short",
+   "units": 7,
+   "text": "Fresh bread smells wonderful in the morning."
+  },
+  {
+   "ttfa_s": 0.03202133299782872,
+   "total_s": 0.8496668330044486,
+   "audio_s": 3.92,
+   "sample_rate": 24000,
+   "num_bytes": 188160,
+   "num_chunks": 48,
+   "audio_path": "bench-audio/tts_omni_customvoice-4bit_c8/en_short_09.wav",
+   "status": 200,
+   "error": null,
+   "extra": {
+    "start_offset_s": 0.47843400001875125
+   },
+   "rtf": 0.21675174311337975,
+   "id": "en_short_09",
+   "lang": "en",
+   "length": "short",
+   "units": 7,
+   "text": "The cat sleeps under the warm radiator."
+  },
+  {
+   "ttfa_s": 0.034249500022269785,
+   "total_s": 0.5730283330194652,
+   "audio_s": 2.56,
+   "sample_rate": 24000,
+   "num_bytes": 122880,
+   "num_chunks": 32,
+   "audio_path": "bench-audio/tts_omni_customvoice-4bit_c8/en_short_10.wav",
+   "status": 200,
+   "error": null,
+   "extra": {
+    "start_offset_s": 0.5498268340015784
+   },
+   "rtf": 0.2238391925857286,
+   "id": "en_short_10",
+   "lang": "en",
+   "length": "short",
+   "units": 7,
+   "text": "Turn left just after the second bridge."
+  },
+  {
+   "ttfa_s": 0.03413000001455657,
+   "total_s": 2.564053917012643,
+   "audio_s": 14.32,
+   "sample_rate": 24000,
+   "num_bytes": 687360,
+   "num_chunks": 173,
+   "audio_path": "bench-audio/tts_omni_customvoice-4bit_c8/en_medium_01.wav",
+   "status": 200,
+   "error": null,
+   "extra": {
+    "start_offset_s": 0.5499070000078063
+   },
+   "rtf": 0.17905404448412313,
+   "id": "en_medium_01",
+   "lang": "en",
+   "length": "medium",
+   "units": 24,
+   "text": "When the lights went out across the valley, the neighbors gathered on the porch with candles and told stories until the power finally returned."
+  },
+  {
+   "ttfa_s": 0.05485074999160133,
+   "total_s": 2.9302207919827197,
+   "audio_s": 16.24,
+   "sample_rate": 24000,
+   "num_bytes": 779520,
+   "num_chunks": 196,
+   "audio_path": "bench-audio/tts_omni_customvoice-4bit_c8/en_medium_02.wav",
+   "status": 200,
+   "error": null,
+   "extra": {
+    "start_offset_s": 0.5608716249989811
+   },
+   "rtf": 0.18043231477726107,
+   "id": "en_medium_02",
+   "lang": "en",
+   "length": "medium",
+   "units": 23,
+   "text": "The museum's new exhibit traces the history of navigation, from simple star charts to the satellite systems that guide ships and aircraft today."
+  },
+  {
+   "ttfa_s": 0.03536050001275726,
+   "total_s": 2.8626985830196645,
+   "audio_s": 16.0,
+   "sample_rate": 24000,
+   "num_bytes": 768000,
+   "num_chunks": 193,
+   "audio_path": "bench-audio/tts_omni_customvoice-4bit_c8/en_medium_03.wav",
+   "status": 200,
+   "error": null,
+   "extra": {
+    "start_offset_s": 0.7966592920129187
+   },
+   "rtf": 0.17891866143872903,
+   "id": "en_medium_03",
+   "lang": "en",
+   "length": "medium",
+   "units": 23,
+   "text": "After months of careful planning, the small bakery opened its doors on a quiet street corner and sold out of everything before noon."
+  },
+  {
+   "ttfa_s": 0.0350338330026716,
+   "total_s": 2.0195299170154613,
+   "audio_s": 11.6,
+   "sample_rate": 24000,
+   "num_bytes": 556800,
+   "num_chunks": 141,
+   "audio_path": "bench-audio/tts_omni_customvoice-4bit_c8/en_medium_04.wav",
+   "status": 200,
+   "error": null,
+   "extra": {
+    "start_offset_s": 1.0045682089985348
+   },
+   "rtf": 0.1740974066392639,
+   "id": "en_medium_04",
+   "lang": "en",
+   "length": "medium",
+   "units": 23,
+   "text": "My grandmother kept a journal of every garden she planted, noting which seeds thrived in clay soil and which ones needed sandy ground."
+  },
+  {
+   "ttfa_s": 0.03578937501879409,
+   "total_s": 2.9754280420020223,
+   "audio_s": 16.64,
+   "sample_rate": 24000,
+   "num_bytes": 798720,
+   "num_chunks": 201,
+   "audio_path": "bench-audio/tts_omni_customvoice-4bit_c8/en_medium_05.wav",
+   "status": 200,
+   "error": null,
+   "extra": {
+    "start_offset_s": 1.0398996669973712
+   },
+   "rtf": 0.17881178137031384,
+   "id": "en_medium_05",
+   "lang": "en",
+   "length": "medium",
+   "units": 23,
+   "text": "The orchestra rehearsed the final movement three times, adjusting the tempo until the conductor was satisfied with the balance between strings and brass."
+  },
+  {
+   "ttfa_s": 0.033070749981561676,
+   "total_s": 2.686011666984996,
+   "audio_s": 15.36,
+   "sample_rate": 24000,
+   "num_bytes": 737280,
+   "num_chunks": 186,
+   "audio_path": "bench-audio/tts_omni_customvoice-4bit_c8/en_medium_06.wav",
+   "status": 200,
+   "error": null,
+   "extra": {
+    "start_offset_s": 1.1230980420077685
+   },
+   "rtf": 0.17487055123600234,
+   "id": "en_medium_06",
+   "lang": "en",
+   "length": "medium",
+   "units": 22,
+   "text": "Scientists at the research station recorded unusually warm temperatures this winter, which may explain why the migrating birds arrived several weeks early."
+  },
+  {
+   "ttfa_s": 0.033748583984561265,
+   "total_s": 1.8776933749904856,
+   "audio_s": 10.96,
+   "sample_rate": 24000,
+   "num_bytes": 526080,
+   "num_chunks": 133,
+   "audio_path": "bench-audio/tts_omni_customvoice-4bit_c8/en_medium_07.wav",
+   "status": 200,
+   "error": null,
+   "extra": {
+    "start_offset_s": 1.3284232919977512
+   },
+   "rtf": 0.1713223882290589,
+   "id": "en_medium_07",
+   "lang": "en",
+   "length": "medium",
+   "units": 23,
+   "text": "If you follow the river path past the old mill, you will reach a wooden footbridge that leads directly into the village square."
+  },
+  {
+   "ttfa_s": 0.03163458299241029,
+   "total_s": 2.322140540985856,
+   "audio_s": 13.2,
+   "sample_rate": 24000,
+   "num_bytes": 633600,
+   "num_chunks": 160,
+   "audio_path": "bench-audio/tts_omni_customvoice-4bit_c8/en_medium_08.wav",
+   "status": 200,
+   "error": null,
+   "extra": {
+    "start_offset_s": 1.5851923340233043
+   },
+   "rtf": 0.17591973795347396,
+   "id": "en_medium_08",
+   "lang": "en",
+   "length": "medium",
+   "units": 21,
+   "text": "The software update fixed the login problem, but several users reported that the new settings page loads slowly on older phones."
+  },
+  {
+   "ttfa_s": 0.03181104199029505,
+   "total_s": 3.1147444589878432,
+   "audio_s": 17.6,
+   "sample_rate": 24000,
+   "num_bytes": 844800,
+   "num_chunks": 213,
+   "audio_path": "bench-audio/tts_omni_customvoice-4bit_c8/en_medium_09.wav",
+   "status": 200,
+   "error": null,
+   "extra": {
+    "start_offset_s": 3.0245981250191107
+   },
+   "rtf": 0.17697411698794563,
+   "id": "en_medium_09",
+   "lang": "en",
+   "length": "medium",
+   "units": 24,
+   "text": "Every Saturday the farmers market fills the parking lot with stalls of honey, cheese, flowers, and vegetables grown within a few miles of town."
+  },
+  {
+   "ttfa_s": 0.029997458012076095,
+   "total_s": 1.8878844580031,
+   "audio_s": 10.72,
+   "sample_rate": 24000,
+   "num_bytes": 514560,
+   "num_chunks": 130,
+   "audio_path": "bench-audio/tts_omni_customvoice-4bit_c8/en_medium_10.wav",
+   "status": 200,
+   "error": null,
+   "extra": {
+    "start_offset_s": 3.1183157920022495
+   },
+   "rtf": 0.176108624813722,
+   "id": "en_medium_10",
+   "lang": "en",
+   "length": "medium",
+   "units": 21,
+   "text": "The detective studied the muddy footprints by the gate and concluded that the visitor had arrived long before the rain stopped."
+  },
+  {
+   "ttfa_s": 0.03208087501116097,
+   "total_s": 10.972219666000456,
+   "audio_s": 62.08,
+   "sample_rate": 24000,
+   "num_bytes": 2979840,
+   "num_chunks": 746,
+   "audio_path": "bench-audio/tts_omni_customvoice-4bit_c8/en_long_01.wav",
+   "status": 200,
+   "error": null,
+   "extra": {
+    "start_offset_s": 3.2064481250126846
+   },
+   "rtf": 0.17674322915593518,
+   "id": "en_long_01",
+   "lang": "en",
+   "length": "long",
+   "units": 83,
+   "text": "The lighthouse keeper had lived alone on the island for nearly twenty years, and in all that time he had never once missed lighting the lamp at dusk. Supply boats came twice a month, bringing flour, lamp oil, newspapers, and the occasional letter from his sister on the mainland. He read every page slowly, savoring the news of a world that seemed to grow more distant with each passing season, then folded the papers neatly and stacked them beside the stove for kindling."
+  },
+  {
+   "ttfa_s": 0.03364458301803097,
+   "total_s": 8.377572541998234,
+   "audio_s": 48.16,
+   "sample_rate": 24000,
+   "num_bytes": 2311680,
+   "num_chunks": 579,
+   "audio_path": "bench-audio/tts_omni_customvoice-4bit_c8/en_long_02.wav",
+   "status": 200,
+   "error": null,
+   "extra": {
+    "start_offset_s": 3.4915585000126157
+   },
+   "rtf": 0.17395291823086034,
+   "id": "en_long_02",
+   "lang": "en",
+   "length": "long",
+   "units": 82,
+   "text": "Learning to cook well is mostly a matter of patience and attention. Begin with a few simple dishes and repeat them until the steps feel natural, paying close attention to how the onions change color as they soften and how the sauce thickens as it reduces. Taste constantly and adjust the salt in small amounts. Over time you will stop measuring everything and begin to trust your senses, which is exactly when cooking stops feeling like work and starts feeling like play."
+  },
+  {
+   "ttfa_s": 0.03248695802176371,
+   "total_s": 7.773365750006633,
+   "audio_s": 44.96,
+   "sample_rate": 24000,
+   "num_bytes": 2158080,
+   "num_chunks": 541,
+   "audio_path": "bench-audio/tts_omni_customvoice-4bit_c8/en_long_03.wav",
+   "status": 200,
+   "error": null,
+   "extra": {
+    "start_offset_s": 3.6598141670110635
+   },
+   "rtf": 0.1728951456852009,
+   "id": "en_long_03",
+   "lang": "en",
+   "length": "long",
+   "units": 79,
+   "text": "The city council met on Tuesday evening to discuss the proposed bicycle lanes along the main avenue. Supporters argued that the lanes would reduce traffic, improve air quality, and make the downtown area safer for families, while several shop owners worried about losing parking spaces in front of their stores. After two hours of public comment, the council voted to approve a one year trial on the northern half of the avenue and to review the results next spring."
+  },
+  {
+   "ttfa_s": 0.03150416701100767,
+   "total_s": 10.641562208998948,
+   "audio_s": 60.16,
+   "sample_rate": 24000,
+   "num_bytes": 2887680,
+   "num_chunks": 723,
+   "audio_path": "bench-audio/tts_omni_customvoice-4bit_c8/en_long_04.wav",
+   "status": 200,
+   "error": null,
+   "extra": {
+    "start_offset_s": 3.8095322090084665
+   },
+   "rtf": 0.17688766969745592,
+   "id": "en_long_04",
+   "lang": "en",
+   "length": "long",
+   "units": 84,
+   "text": "Astronomers announced the discovery of a small rocky planet orbiting a dim red star about forty light years from Earth. The planet completes one orbit every eleven days and receives roughly the same amount of starlight that Earth receives from the sun, placing it inside the region where liquid water could exist. The team plans to use a large space telescope to search for signs of an atmosphere, though they caution that it will take years to gather enough data to draw firm conclusions."
+  },
+  {
+   "ttfa_s": 0.03242525001405738,
+   "total_s": 10.577084165997803,
+   "audio_s": 59.84,
+   "sample_rate": 24000,
+   "num_bytes": 2872320,
+   "num_chunks": 719,
+   "audio_path": "bench-audio/tts_omni_customvoice-4bit_c8/en_long_05.wav",
+   "status": 200,
+   "error": null,
+   "extra": {
+    "start_offset_s": 3.9076681250007823
+   },
+   "rtf": 0.17675608566172799,
+   "id": "en_long_05",
+   "lang": "en",
+   "length": "long",
+   "units": 84,
+   "text": "On the first morning of the hike, the trail climbed steadily through a forest of tall pines whose needles muffled every footstep. By midday the trees thinned out and gave way to open meadows dotted with wildflowers, and the wind carried the faint sound of cowbells from a distant pasture. We stopped beside a cold stream to refill our bottles and eat bread and cheese, then pushed on toward the ridge, where the view stretched all the way to the glaciers in the north."
+  },
+  {
+   "ttfa_s": 0.03130595802213065,
+   "total_s": 7.195846125017852,
+   "audio_s": 42.0,
+   "sample_rate": 24000,
+   "num_bytes": 2016000,
+   "num_chunks": 505,
+   "audio_path": "bench-audio/tts_omni_customvoice-4bit_c8/en_long_06.wav",
+   "status": 200,
+   "error": null,
+   "extra": {
+    "start_offset_s": 4.015711584012024
+   },
+   "rtf": 0.17132966964328217,
+   "id": "en_long_06",
+   "lang": "en",
+   "length": "long",
+   "units": 79,
+   "text": "The old bookshop on the corner survived for decades by refusing to specialize. Its shelves held cookbooks next to poetry, repair manuals next to novels, and maps of countries that no longer existed. The owner knew most of her customers by name and could often guess what they wanted before they asked. When the building was finally sold, the neighborhood organized a farewell party, and people lined up around the block to buy one last book and say goodbye."
+  },
+  {
+   "ttfa_s": 0.03659337499993853,
+   "total_s": 10.532931083027506,
+   "audio_s": 58.88,
+   "sample_rate": 24000,
+   "num_bytes": 2826240,
+   "num_chunks": 708,
+   "audio_path": "bench-audio/tts_omni_customvoice-4bit_c8/en_long_07.wav",
+   "status": 200,
+   "error": null,
+   "extra": {
+    "start_offset_s": 5.006617167004151
+   },
+   "rtf": 0.17888809583946172,
+   "id": "en_long_07",
+   "lang": "en",
+   "length": "long",
+   "units": 77,
+   "text": "Modern weather forecasting depends on an enormous network of instruments, including ground stations, ocean buoys, weather balloons, aircraft sensors, and satellites that photograph the entire planet every few minutes. All of this data flows into supercomputers that run physical models of the atmosphere, dividing it into millions of small cells and calculating how temperature, pressure, and humidity will change over the coming days. The forecast you see on your phone is the result of this global effort."
+  },
+  {
+   "ttfa_s": 0.03243633301462978,
+   "total_s": 6.01608750000014,
+   "audio_s": 34.24,
+   "sample_rate": 24000,
+   "num_bytes": 1643520,
+   "num_chunks": 412,
+   "audio_path": "bench-audio/tts_omni_customvoice-4bit_c8/en_long_08.wav",
+   "status": 200,
+   "error": null,
+   "extra": {
+    "start_offset_s": 6.139918542001396
+   },
+   "rtf": 0.17570349007009753,
+   "id": "en_long_08",
+   "lang": "en",
+   "length": "long",
+   "units": 83,
+   "text": "My uncle restored an old wooden sailboat in his backyard over the course of three summers. He replaced the rotten planks one by one, sanded the hull until it was smooth as glass, and sewed a new set of sails on an ancient machine that had belonged to his mother. When the boat finally touched the water, the whole family gathered on the dock, and he sailed it across the bay with a grin that nobody had seen on his face in years."
+  },
+  {
+   "ttfa_s": 0.03250654198927805,
+   "total_s": 9.63428704199032,
+   "audio_s": 53.12,
+   "sample_rate": 24000,
+   "num_bytes": 2549760,
+   "num_chunks": 639,
+   "audio_path": "bench-audio/tts_omni_customvoice-4bit_c8/en_long_09.wav",
+   "status": 200,
+   "error": null,
+   "extra": {
+    "start_offset_s": 11.212488999997731
+   },
+   "rtf": 0.1813683554591551,
+   "id": "en_long_09",
+   "lang": "en",
+   "length": "long",
+   "units": 75,
+   "text": "The committee reviewed the proposal for a new community center and raised several practical questions. Who would manage the building during evenings and weekends? How would the heating costs be covered in winter? Could the gymnasium be shared with the local school without creating scheduling conflicts? The architect promised to return with revised drawings and a detailed budget, and the chair reminded everyone that the funding application was due at the end of the month."
+  },
+  {
+   "ttfa_s": 0.036099999997531995,
+   "total_s": 9.55218599998625,
+   "audio_s": 52.4,
+   "sample_rate": 24000,
+   "num_bytes": 2515200,
+   "num_chunks": 630,
+   "audio_path": "bench-audio/tts_omni_customvoice-4bit_c8/en_long_10.wav",
+   "status": 200,
+   "error": null,
+   "extra": {
+    "start_offset_s": 11.434090791997733
+   },
+   "rtf": 0.18229362595393608,
+   "id": "en_long_10",
+   "lang": "en",
+   "length": "long",
+   "units": 81,
+   "text": "Honeybees communicate the location of food through a remarkable dance performed on the vertical surface of the comb. A returning forager walks in a short straight line while waggling her body, then circles back and repeats the movement. The angle of the line relative to gravity indicates the direction of the food in relation to the sun, and the duration of the waggle indicates the distance. Other bees follow the dance closely and then fly out to find the flowers themselves."
+  },
+  {
+   "ttfa_s": 0.031616584019502625,
+   "total_s": 1.0234827499953099,
+   "audio_s": 5.36,
+   "sample_rate": 24000,
+   "num_bytes": 257280,
+   "num_chunks": 66,
+   "audio_path": "bench-audio/tts_omni_customvoice-4bit_c8/zh_short_01.wav",
+   "status": 200,
+   "error": null,
+   "extra": {
+    "start_offset_s": 11.870148709014757
+   },
+   "rtf": 0.1909482742528563,
+   "id": "zh_short_01",
+   "lang": "zh",
+   "length": "short",
+   "units": 11,
+   "text": "明天早上火车准时出发。"
+  },
+  {
+   "ttfa_s": 0.032132874999661,
+   "total_s": 0.4499949589953758,
+   "audio_s": 2.32,
+   "sample_rate": 24000,
+   "num_bytes": 111360,
+   "num_chunks": 29,
+   "audio_path": "bench-audio/tts_omni_customvoice-4bit_c8/zh_short_02.wav",
+   "status": 200,
+   "error": null,
+   "extra": {
+    "start_offset_s": 12.15654370901757
+   },
+   "rtf": 0.19396334439455853,
+   "id": "zh_short_02",
+   "lang": "zh",
+   "length": "short",
+   "units": 10,
+   "text": "请在离开前关好窗户。"
+  },
+  {
+   "ttfa_s": 0.03291045798687264,
+   "total_s": 0.5879882919834927,
+   "audio_s": 2.88,
+   "sample_rate": 24000,
+   "num_bytes": 138240,
+   "num_chunks": 36,
+   "audio_path": "bench-audio/tts_omni_customvoice-4bit_c8/zh_short_03.wav",
+   "status": 200,
+   "error": null,
+   "extra": {
+    "start_offset_s": 12.60685583401937
+   },
+   "rtf": 0.20416260138315717,
+   "id": "zh_short_03",
+   "lang": "zh",
+   "length": "short",
+   "units": 11,
+   "text": "她把旧篱笆刷成了蓝色。"
+  },
+  {
+   "ttfa_s": 0.032638125005178154,
+   "total_s": 0.6149930000246968,
+   "audio_s": 3.12,
+   "sample_rate": 24000,
+   "num_bytes": 149760,
+   "num_chunks": 39,
+   "audio_path": "bench-audio/tts_omni_customvoice-4bit_c8/zh_short_04.wav",
+   "status": 200,
+   "error": null,
+   "extra": {
+    "start_offset_s": 12.893973666999955
+   },
+   "rtf": 0.19711314103355668,
+   "id": "zh_short_04",
+   "lang": "zh",
+   "length": "short",
+   "units": 10,
+   "text": "花园这周需要一场雨。"
+  },
+  {
+   "ttfa_s": 0.03290816702065058,
+   "total_s": 0.572666250023758,
+   "audio_s": 2.88,
+   "sample_rate": 24000,
+   "num_bytes": 138240,
+   "num_chunks": 36,
+   "audio_path": "bench-audio/tts_omni_customvoice-4bit_c8/zh_short_05.wav",
+   "status": 200,
+   "error": null,
+   "extra": {
+    "start_offset_s": 13.195155916997464
+   },
+   "rtf": 0.19884244792491598,
+   "id": "zh_short_05",
+   "lang": "zh",
+   "length": "short",
+   "units": 11,
+   "text": "他把钥匙忘在了餐桌上。"
+  },
+  {
+   "ttfa_s": 0.032690584019292146,
+   "total_s": 0.5647821670281701,
+   "audio_s": 2.8,
+   "sample_rate": 24000,
+   "num_bytes": 134400,
+   "num_chunks": 35,
+   "audio_path": "bench-audio/tts_omni_customvoice-4bit_c8/zh_short_06.wav",
+   "status": 200,
+   "error": null,
+   "extra": {
+    "start_offset_s": 13.509323709004093
+   },
+   "rtf": 0.20170791679577504,
+   "id": "zh_short_06",
+   "lang": "zh",
+   "length": "short",
+   "units": 11,
+   "text": "图书馆工作日开门很早。"
+  },
+  {
+   "ttfa_s": 0.036465249984757975,
+   "total_s": 0.6964546669914853,
+   "audio_s": 3.36,
+   "sample_rate": 24000,
+   "num_bytes": 161280,
+   "num_chunks": 42,
+   "audio_path": "bench-audio/tts_omni_customvoice-4bit_c8/zh_short_07.wav",
+   "status": 200,
+   "error": null,
+   "extra": {
+    "start_offset_s": 13.768156209000153
+   },
+   "rtf": 0.20727817469984683,
+   "id": "zh_short_07",
+   "lang": "zh",
+   "length": "short",
+   "units": 12,
+   "text": "我们看着暴风雨越过山丘。"
+  },
+  {
+   "ttfa_s": 0.03363250000984408,
+   "total_s": 0.5901927910163067,
+   "audio_s": 2.72,
+   "sample_rate": 24000,
+   "num_bytes": 130560,
+   "num_chunks": 34,
+   "audio_path": "bench-audio/tts_omni_customvoice-4bit_c8/zh_short_08.wav",
+   "status": 200,
+   "error": null,
+   "extra": {
+    "start_offset_s": 14.074444166995818
+   },
+   "rtf": 0.2169826437559951,
+   "id": "zh_short_08",
+   "lang": "zh",
+   "length": "short",
+   "units": 11,
+   "text": "清晨的面包香气真好闻。"
+  },
+  {
+   "ttfa_s": 0.034410207998007536,
+   "total_s": 0.6428675419883803,
+   "audio_s": 3.04,
+   "sample_rate": 24000,
+   "num_bytes": 145920,
+   "num_chunks": 38,
+   "audio_path": "bench-audio/tts_omni_customvoice-4bit_c8/zh_short_09.wav",
+   "status": 200,
+   "error": null,
+   "extra": {
+    "start_offset_s": 14.179842792014824
+   },
+   "rtf": 0.21146958618038825,
+   "id": "zh_short_09",
+   "lang": "zh",
+   "length": "short",
+   "units": 11,
+   "text": "猫咪睡在温暖的暖气旁。"
+  },
+  {
+   "ttfa_s": 0.03270287500345148,
+   "total_s": 0.593682250007987,
+   "audio_s": 2.8,
+   "sample_rate": 24000,
+   "num_bytes": 134400,
+   "num_chunks": 35,
+   "audio_path": "bench-audio/tts_omni_customvoice-4bit_c8/zh_short_10.wav",
+   "status": 200,
+   "error": null,
+   "extra": {
+    "start_offset_s": 14.452024625003105
+   },
+   "rtf": 0.21202937500285252,
+   "id": "zh_short_10",
+   "lang": "zh",
+   "length": "short",
+   "units": 10,
+   "text": "过了第二座桥向左转。"
+  },
+  {
+   "ttfa_s": 0.05599775002337992,
+   "total_s": 2.1714068340079393,
+   "audio_s": 12.0,
+   "sample_rate": 24000,
+   "num_bytes": 576000,
+   "num_chunks": 145,
+   "audio_path": "bench-audio/tts_omni_customvoice-4bit_c8/zh_medium_01.wav",
+   "status": 200,
+   "error": null,
+   "extra": {
+    "start_offset_s": 14.464801666996209
+   },
+   "rtf": 0.1809505695006616,
+   "id": "zh_medium_01",
+   "lang": "zh",
+   "length": "medium",
+   "units": 40,
+   "text": "山谷里停电的那个晚上，邻居们点着蜡烛聚在门廊上讲故事，一直到电力恢复才各自回家。"
+  },
+  {
+   "ttfa_s": 0.03529450000496581,
+   "total_s": 2.423238292016322,
+   "audio_s": 13.28,
+   "sample_rate": 24000,
+   "num_bytes": 637440,
+   "num_chunks": 161,
+   "audio_path": "bench-audio/tts_omni_customvoice-4bit_c8/zh_medium_02.wav",
+   "status": 200,
+   "error": null,
+   "extra": {
+    "start_offset_s": 14.485471874999348
+   },
+   "rtf": 0.1824727629530363,
+   "id": "zh_medium_02",
+   "lang": "zh",
+   "length": "medium",
+   "units": 40,
+   "text": "博物馆的新展览讲述了航海的历史，从简单的星图一直到今天引导船只和飞机的卫星系统。"
+  },
+  {
+   "ttfa_s": 0.03300545801175758,
+   "total_s": 2.1134439579909667,
+   "audio_s": 11.84,
+   "sample_rate": 24000,
+   "num_bytes": 568320,
+   "num_chunks": 143,
+   "audio_path": "bench-audio/tts_omni_customvoice-4bit_c8/zh_medium_03.wav",
+   "status": 200,
+   "error": null,
+   "extra": {
+    "start_offset_s": 14.664985334005905
+   },
+   "rtf": 0.1785003342897776,
+   "id": "zh_medium_03",
+   "lang": "zh",
+   "length": "medium",
+   "units": 41,
+   "text": "经过几个月的精心筹备，这家小面包店在安静的街角开张了，还没到中午东西就全部卖光了。"
+  },
+  {
+   "ttfa_s": 0.03114274999825284,
+   "total_s": 2.7848002910031937,
+   "audio_s": 15.76,
+   "sample_rate": 24000,
+   "num_bytes": 756480,
+   "num_chunks": 191,
+   "audio_path": "bench-audio/tts_omni_customvoice-4bit_c8/zh_medium_04.wav",
+   "status": 200,
+   "error": null,
+   "extra": {
+    "start_offset_s": 14.823085875017568
+   },
+   "rtf": 0.17670052607888284,
+   "id": "zh_medium_04",
+   "lang": "zh",
+   "length": "medium",
+   "units": 41,
+   "text": "外婆为她种过的每一个花园都写了日记，记下哪些种子在黏土里长得好，哪些需要沙质土壤。"
+  },
+  {
+   "ttfa_s": 0.032448000012664124,
+   "total_s": 3.068857458012644,
+   "audio_s": 17.44,
+   "sample_rate": 24000,
+   "num_bytes": 837120,
+   "num_chunks": 211,
+   "audio_path": "bench-audio/tts_omni_customvoice-4bit_c8/zh_medium_05.wav",
+   "status": 200,
+   "error": null,
+   "extra": {
+    "start_offset_s": 15.046006792021217
+   },
+   "rtf": 0.17596659736311032,
+   "id": "zh_medium_05",
+   "lang": "zh",
+   "length": "medium",
+   "units": 40,
+   "text": "乐团把最后一个乐章排练了三遍，不断调整速度，直到指挥对弦乐和铜管的平衡感到满意。"
+  },
+  {
+   "ttfa_s": 0.030296582990558818,
+   "total_s": 2.821199333004188,
+   "audio_s": 16.0,
+   "sample_rate": 24000,
+   "num_bytes": 768000,
+   "num_chunks": 193,
+   "audio_path": "bench-audio/tts_omni_customvoice-4bit_c8/zh_medium_06.wav",
+   "status": 200,
+   "error": null,
+   "extra": {
+    "start_offset_s": 15.540388584020548
+   },
+   "rtf": 0.17632495831276174,
+   "id": "zh_medium_06",
+   "lang": "zh",
+   "length": "medium",
+   "units": 41,
+   "text": "科研站的科学家记录到今年冬天气温异常偏高，这或许可以解释候鸟为什么提前了几周到达。"
+  },
+  {
+   "ttfa_s": 0.03257720900001004,
+   "total_s": 2.5349562089832034,
+   "audio_s": 13.92,
+   "sample_rate": 24000,
+   "num_bytes": 668160,
+   "num_chunks": 168,
+   "audio_path": "bench-audio/tts_omni_customvoice-4bit_c8/zh_medium_07.wav",
+   "status": 200,
+   "error": null,
+   "extra": {
+    "start_offset_s": 16.636681250005495
+   },
+   "rtf": 0.18210892305913817,
+   "id": "zh_medium_07",
+   "lang": "zh",
+   "length": "medium",
+   "units": 37,
+   "text": "如果你沿着河边小路走过老磨坊，就会看到一座木桥，过桥后直接通向村子的广场。"
+  },
+  {
+   "ttfa_s": 0.03219483298016712,
+   "total_s": 1.8838501249847468,
+   "audio_s": 10.4,
+   "sample_rate": 24000,
+   "num_bytes": 499200,
+   "num_chunks": 126,
+   "audio_path": "bench-audio/tts_omni_customvoice-4bit_c8/zh_medium_08.wav",
+   "status": 200,
+   "error": null,
+   "extra": {
+    "start_offset_s": 16.778802292014007
+   },
+   "rtf": 0.1811394350946872,
+   "id": "zh_medium_08",
+   "lang": "zh",
+   "length": "medium",
+   "units": 37,
+   "text": "软件更新修复了登录问题，但有几位用户反映新的设置页面在旧手机上打开得很慢。"
+  },
+  {
+   "ttfa_s": 0.029895624989876524,
+   "total_s": 2.158438499987824,
+   "audio_s": 12.08,
+   "sample_rate": 24000,
+   "num_bytes": 579840,
+   "num_chunks": 146,
+   "audio_path": "bench-audio/tts_omni_customvoice-4bit_c8/zh_medium_09.wav",
+   "status": 200,
+   "error": null,
+   "extra": {
+    "start_offset_s": 16.91121870902134
+   },
+   "rtf": 0.17867868377382648,
+   "id": "zh_medium_09",
+   "lang": "zh",
+   "length": "medium",
+   "units": 39,
+   "text": "每个星期六，农贸市场把停车场摆满了摊位，有蜂蜜、奶酪、鲜花和附近农场种的蔬菜。"
+  },
+  {
+   "ttfa_s": 0.03208933302084915,
+   "total_s": 2.7483371249982156,
+   "audio_s": 15.36,
+   "sample_rate": 24000,
+   "num_bytes": 737280,
+   "num_chunks": 186,
+   "audio_path": "bench-audio/tts_omni_customvoice-4bit_c8/zh_medium_10.wav",
+   "status": 200,
+   "error": null,
+   "extra": {
+    "start_offset_s": 17.608381084020948
+   },
+   "rtf": 0.17892819824207135,
+   "id": "zh_medium_10",
+   "lang": "zh",
+   "length": "medium",
+   "units": 36,
+   "text": "侦探仔细研究了大门旁泥地上的脚印，断定来访者早在雨停之前很久就已经到了。"
+  },
+  {
+   "ttfa_s": 0.03155712501029484,
+   "total_s": 6.746536291000666,
+   "audio_s": 38.96,
+   "sample_rate": 24000,
+   "num_bytes": 1870080,
+   "num_chunks": 469,
+   "audio_path": "bench-audio/tts_omni_customvoice-4bit_c8/zh_long_01.wav",
+   "status": 200,
+   "error": null,
+   "extra": {
+    "start_offset_s": 18.11534220899921
+   },
+   "rtf": 0.17316571588810745,
+   "id": "zh_long_01",
+   "lang": "zh",
+   "length": "long",
+   "units": 121,
+   "text": "守塔人独自在岛上生活了将近二十年，这么多年来他从未错过一次黄昏点灯。补给船每月来两次，带来面粉、灯油、报纸，偶尔还有妹妹从大陆寄来的信。他慢慢地读完每一页，细细品味那个似乎一季比一季遥远的世界，然后把报纸叠得整整齐齐，堆在炉子旁边当引火的柴。"
+  },
+  {
+   "ttfa_s": 0.031567541998811066,
+   "total_s": 9.681826666987035,
+   "audio_s": 55.68,
+   "sample_rate": 24000,
+   "num_bytes": 2672640,
+   "num_chunks": 670,
+   "audio_path": "bench-audio/tts_omni_customvoice-4bit_c8/zh_long_02.wav",
+   "status": 200,
+   "error": null,
+   "extra": {
+    "start_offset_s": 18.362055750010768
+   },
+   "rtf": 0.17388338123180738,
+   "id": "zh_long_02",
+   "lang": "zh",
+   "length": "long",
+   "units": 134,
+   "text": "学会做饭主要靠耐心和专注。先从几道简单的菜开始，反复练习直到每个步骤都变得自然，仔细观察洋葱变软时颜色如何变化，酱汁收干时如何变稠。要不停地尝味道，一点一点地调整盐量。时间久了你就不再需要称量每样东西，而是开始相信自己的感觉，到那时做饭就不再像工作，而更像是一种游戏。"
+  },
+  {
+   "ttfa_s": 0.03155187499942258,
+   "total_s": 8.321561583987204,
+   "audio_s": 48.0,
+   "sample_rate": 24000,
+   "num_bytes": 2304000,
+   "num_chunks": 577,
+   "audio_path": "bench-audio/tts_omni_customvoice-4bit_c8/zh_long_03.wav",
+   "status": 200,
+   "error": null,
+   "extra": {
+    "start_offset_s": 18.663007584022125
+   },
+   "rtf": 0.17336586633306675,
+   "id": "zh_long_03",
+   "lang": "zh",
+   "length": "long",
+   "units": 124,
+   "text": "市议会星期二晚上开会讨论在主干道上修建自行车道的提案。支持者认为车道可以缓解交通、改善空气质量，让市中心对家庭更安全；而几位店主则担心店门口的停车位会减少。经过两个小时的公众发言，议会投票通过了在大道北半段试行一年的方案，并决定明年春天再评估结果。"
+  },
+  {
+   "ttfa_s": 0.032506666000699624,
+   "total_s": 9.39634633300011,
+   "audio_s": 54.0,
+   "sample_rate": 24000,
+   "num_bytes": 2592000,
+   "num_chunks": 649,
+   "audio_path": "bench-audio/tts_omni_customvoice-4bit_c8/zh_long_04.wav",
+   "status": 200,
+   "error": null,
+   "extra": {
+    "start_offset_s": 19.07009287501569
+   },
+   "rtf": 0.17400641357407612,
+   "id": "zh_long_04",
+   "lang": "zh",
+   "length": "long",
+   "units": 139,
+   "text": "天文学家宣布发现了一颗围绕暗红色恒星运行的小型岩石行星，距离地球大约四十光年。这颗行星每十一天绕恒星一周，接收到的光照与地球从太阳获得的差不多，正好处在液态水可能存在的区域。研究团队计划用大型空间望远镜寻找大气层的迹象，但他们也提醒说，要收集足够的数据得出可靠结论还需要很多年。"
+  },
+  {
+   "ttfa_s": 0.034602624975377694,
+   "total_s": 9.486132833000738,
+   "audio_s": 54.8,
+   "sample_rate": 24000,
+   "num_bytes": 2630400,
+   "num_chunks": 659,
+   "audio_path": "bench-audio/tts_omni_customvoice-4bit_c8/zh_long_05.wav",
+   "status": 200,
+   "error": null,
+   "extra": {
+    "start_offset_s": 19.172113709006226
+   },
+   "rtf": 0.1731046137408894,
+   "id": "zh_long_05",
+   "lang": "zh",
+   "length": "long",
+   "units": 129,
+   "text": "徒步的第一天早上，山路在高大的松林中平稳地向上延伸，松针盖住了每一个脚步声。到了中午，树木渐渐稀疏，开阔的草甸上点缀着野花，风里传来远处牧场隐约的牛铃声。我们在一条冰凉的小溪边停下，灌满水壶，吃了面包和奶酪，然后继续向山脊进发，从那里可以一直望到北边的冰川。"
+  },
+  {
+   "ttfa_s": 0.034040165977785364,
+   "total_s": 10.11114416597411,
+   "audio_s": 60.8,
+   "sample_rate": 24000,
+   "num_bytes": 2918400,
+   "num_chunks": 731,
+   "audio_path": "bench-audio/tts_omni_customvoice-4bit_c8/zh_long_06.wav",
+   "status": 200,
+   "error": null,
+   "extra": {
+    "start_offset_s": 20.357252875022823
+   },
+   "rtf": 0.16630171325615314,
+   "id": "zh_long_06",
+   "lang": "zh",
+   "length": "long",
+   "units": 145,
+   "text": "街角那家旧书店靠着不专营任何一类书籍而生存了几十年。书架上，食谱挨着诗集，修理手册挨着小说，还有一些早已不存在的国家的地图。店主认识大多数顾客的名字，常常在他们开口之前就能猜到他们想要什么。当这栋楼最终被卖掉时，街坊们组织了一场告别聚会，人们排着长队绕过街区，只为买最后一本书，道一声再见。"
+  },
+  {
+   "ttfa_s": 0.0328817919944413,
+   "total_s": 6.793285416992148,
+   "audio_s": 39.12,
+   "sample_rate": 24000,
+   "num_bytes": 1877760,
+   "num_chunks": 471,
+   "audio_path": "bench-audio/tts_omni_customvoice-4bit_c8/zh_long_07.wav",
+   "status": 200,
+   "error": null,
+   "extra": {
+    "start_offset_s": 20.847644209017744
+   },
+   "rtf": 0.17365249020941076,
+   "id": "zh_long_07",
+   "lang": "zh",
+   "length": "long",
+   "units": 142,
+   "text": "现代天气预报依赖一个庞大的仪器网络，包括地面观测站、海洋浮标、探空气球、飞机传感器，以及每隔几分钟就拍摄整个地球的卫星。所有这些数据汇入超级计算机，运行大气的物理模型，把大气分成数百万个小格子，计算未来几天温度、气压和湿度会如何变化。你在手机上看到的天气预报，正是这项全球协作的成果。"
+  },
+  {
+   "ttfa_s": 0.03041012500762008,
+   "total_s": 7.4275157500233036,
+   "audio_s": 42.88,
+   "sample_rate": 24000,
+   "num_bytes": 2058240,
+   "num_chunks": 516,
+   "audio_path": "bench-audio/tts_omni_customvoice-4bit_c8/zh_long_08.wav",
+   "status": 200,
+   "error": null,
+   "extra": {
+    "start_offset_s": 20.98711045901291
+   },
+   "rtf": 0.17321631879718524,
+   "id": "zh_long_08",
+   "lang": "zh",
+   "length": "long",
+   "units": 115,
+   "text": "我叔叔花了三个夏天在后院里修复一艘旧木帆船。他把腐烂的船板一块一块换掉，把船体打磨得像玻璃一样光滑，还用他母亲留下的一台老缝纫机缝了一套新帆。当船终于下水的时候，全家人聚在码头上，他驾着船驶过海湾，脸上露出了多年来没人见过的笑容。"
+  },
+  {
+   "ttfa_s": 0.03360266701201908,
+   "total_s": 5.017428041988751,
+   "audio_s": 29.44,
+   "sample_rate": 24000,
+   "num_bytes": 1413120,
+   "num_chunks": 355,
+   "audio_path": "bench-audio/tts_omni_customvoice-4bit_c8/zh_long_09.wav",
+   "status": 200,
+   "error": null,
+   "extra": {
+    "start_offset_s": 24.86255158399581
+   },
+   "rtf": 0.17042894164363964,
+   "id": "zh_long_09",
+   "lang": "zh",
+   "length": "long",
+   "units": 115,
+   "text": "委员会审议了新建社区中心的提案，并提出了几个实际的问题。晚上和周末谁来管理这栋楼？冬天的取暖费用怎么解决？体育馆能否与当地学校共用而不产生排期冲突？建筑师承诺带着修改后的图纸和详细预算再来，主席提醒大家，资金申请的截止日期是月底。"
+  },
+  {
+   "ttfa_s": 0.032062208018032834,
+   "total_s": 5.657423249998828,
+   "audio_s": 43.6,
+   "sample_rate": 24000,
+   "num_bytes": 2092800,
+   "num_chunks": 525,
+   "audio_path": "bench-audio/tts_omni_customvoice-4bit_c8/zh_long_10.wav",
+   "status": 200,
+   "error": null,
+   "extra": {
+    "start_offset_s": 26.985407209023833
+   },
+   "rtf": 0.12975741399079882,
+   "id": "zh_long_10",
+   "lang": "zh",
+   "length": "long",
+   "units": 127,
+   "text": "蜜蜂通过在蜂巢垂直表面上跳的一种奇妙舞蹈来传递食物的位置。采蜜归来的工蜂一边摆动身体一边沿直线走一小段，然后绕回起点重复这个动作。直线相对于重力的角度表示食物相对于太阳的方向，摆动持续的时间则表示距离。其他蜜蜂紧紧跟着这支舞，然后飞出去自己寻找那些花朵。"
+  }
+ ]
+}

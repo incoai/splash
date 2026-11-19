@@ -1,0 +1,484 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Splash Omni</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%23e38365'/%3E%3Cpath d='M6 16h3l2-6 3 12 3-9 2 6 2-3h5' fill='none' stroke='white' stroke-width='2.4' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">
+    <svg class="logo" viewBox="0 0 32 32" aria-hidden="true"><rect width="32" height="32" rx="8"/><path d="M6 16h3l2-6 3 12 3-9 2 6 2-3h5"/></svg>
+    <span>Splash Omni</span>
+  </div>
+  <div class="topbar-status">
+    <span id="server-pill" class="pill" hidden><span class="dot"></span><span id="server-pill-text"></span></span>
+  </div>
+  <nav class="topbar-actions">
+    <button type="button" id="btn-stop" class="ghost" title="Stop the server and choose another task" hidden>Stop</button>
+  </nav>
+</header>
+
+<main>
+  <!-- Setup: the task, its few choices, and Advanced settings for the rest. -->
+  <section id="view-setup" class="view" hidden>
+    <div class="hero">
+      <h1>Speech, on your Mac</h1>
+      <p>Read text aloud, transcribe audio, or talk with an assistant. The models run on this Mac's GPU, so nothing you say or type leaves it.</p>
+    </div>
+    <form id="setup-form" class="setup" novalidate autocomplete="off">
+      <div class="tasks" role="radiogroup" aria-label="Task">
+        <label class="task-card" data-task="tts">
+          <input type="radio" name="task" value="tts" checked>
+          <span class="task-body">
+            <span class="task-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M4 10v4M8 7v10M12 4v16M16 7v10M20 10v4"/></svg></span>
+            <strong>Text to speech</strong>
+            <small>Turn writing into natural speech that starts playing right away.</small>
+          </span>
+        </label>
+        <label class="task-card" data-task="asr">
+          <input type="radio" name="task" value="asr">
+          <span class="task-body">
+            <span class="task-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M12 3a3 3 0 0 0-3 3v5a3 3 0 0 0 6 0V6a3 3 0 0 0-3-3z"/><path d="M5.5 11a6.5 6.5 0 0 0 13 0M12 17.5V21"/></svg></span>
+            <strong>Transcription</strong>
+            <small>Transcribe recordings and videos, or caption speech live, in 30 languages.</small>
+          </span>
+        </label>
+        <label class="task-card" data-task="voice">
+          <input type="radio" name="task" value="voice">
+          <span class="task-body">
+            <span class="task-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M20 12a8 8 0 0 1-11.6 7.1L4 20l1-4.4A8 8 0 1 1 20 12z"/><path d="M9 11v2M12 9.5v5M15 11v2"/></svg></span>
+            <strong>Voice chat</strong>
+            <small>Talk with an AI assistant that listens and answers out loud.</small>
+          </span>
+        </label>
+      </div>
+
+      <div class="card setup-card">
+        <!-- Text to speech: the kind of voice. -->
+        <div class="setup-section" id="variant-section">
+          <span class="section-label">Voice</span>
+          <div class="choices three" id="variant-choices"></div>
+        </div>
+        <!-- Transcription: what it does, nothing to choose. -->
+        <div class="setup-section" id="asr-section" hidden>
+          <span class="section-label">Model</span>
+          <p class="section-text" id="asr-model-text">Qwen3-ASR 1.7B understands 30 languages and detects which one is spoken. Files can be hours long; live captions follow the microphone.</p>
+        </div>
+        <!-- Voice chat: the assistant's language model, served by Splash. -->
+        <div class="setup-section" id="voice-section" hidden>
+          <div class="setup-section" id="voice-ready">
+            <label class="field">
+              <span class="section-label">Assistant</span>
+              <select name="llm_model"></select>
+            </label>
+            <p class="section-text">Speech recognition, the assistant and speech run as three local servers. The assistant's model is served by <a href="https://github.com/incoai/splash" target="_blank" rel="noopener">Splash</a>; about 48 GB of memory is recommended.</p>
+          </div>
+          <!-- Without Splash: where voice chat finds it. -->
+          <div class="install-panel" id="splash-install" hidden>
+            <span class="install-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M12 4v11M7 10l5 5 5-5M5 20h14"/></svg></span>
+            <div class="install-text">
+              <strong>Voice chat needs Splash</strong>
+              <p class="section-text">Splash runs the assistant's language model on this Mac. Splash Omni uses the <code>splash</code> command of the Splash checkout it lives in; run it from one, or give the command's path under Advanced settings.</p>
+            </div>
+            <div class="install-actions">
+              <a class="button ghost" href="https://github.com/incoai/splash" target="_blank" rel="noopener">About Splash</a>
+            </div>
+          </div>
+        </div>
+
+        <div class="start-row" id="start-row">
+          <div id="download-summary" class="download-summary"></div>
+          <button type="submit" class="primary large" id="btn-start">Start</button>
+        </div>
+        <p class="warning" id="port-warning" role="status" hidden></p>
+        <p class="error" id="setup-error" role="alert" hidden></p>
+
+        <details class="advanced" id="advanced">
+          <summary>Advanced settings</summary>
+          <!-- Text to speech and transcription: `splash-omni serve`'s options. -->
+          <div class="advanced-body" id="advanced-speech">
+            <div class="field wide">
+              <span class="field-label">Precision</span>
+              <div class="segmented" id="model-choices" role="radiogroup" aria-label="Precision"></div>
+              <small>4-bit is smaller and faster; bf16 keeps the full-precision weights.</small>
+            </div>
+            <div class="field wide" id="speculation-row">
+              <label class="switch"><input type="checkbox" name="speculative" checked><span class="track"></span><span>Speculative decoding</span></label>
+              <small>A small DFlash draft proposes several tokens at once and the main model checks them: the same transcripts, faster. <span id="draft-badge"></span></small>
+            </div>
+            <label class="field">
+              <span class="field-label">Port</span>
+              <input type="number" name="port" min="1" max="65535" value="8000" inputmode="numeric">
+              <small>The API listens on 127.0.0.1.</small>
+            </label>
+            <label class="field">
+              <span class="field-label">Lanes</span>
+              <input type="number" name="lanes" min="1" max="32" placeholder="8 (default)" inputmode="numeric">
+              <small id="lanes-hint">Requests decoded together.</small>
+            </label>
+            <label class="field">
+              <span class="field-label">Memory limit</span>
+              <input type="text" name="max_memory" placeholder="auto" spellcheck="false">
+              <small>Such as 28G; can only lower the automatic budget.</small>
+            </label>
+            <div class="field wide checks">
+              <label class="check"><input type="checkbox" name="disable_ane"> <span>Don't use the Neural Engine<small>Run on the GPU alone (<code>--disable-ane</code>).</small></span></label>
+              <label class="check"><input type="checkbox" name="offline"> <span>Offline<small>Start an installed model without contacting Hugging Face.</small></span></label>
+            </div>
+            <div class="field wide command"><span class="field-label">Command</span><code id="command-preview"></code></div>
+            <div class="field wide">
+              <button type="button" class="ghost" id="btn-connect">Use a server that is already running…</button>
+            </div>
+          </div>
+          <!-- Voice chat: the three servers. -->
+          <div class="advanced-body" id="advanced-voice" hidden>
+            <label class="field"><span class="field-label">Speech recognition model</span><select name="asr_model"></select></label>
+            <label class="field"><span class="field-label">Speech model</span><select name="tts_model"></select></label>
+            <div class="field wide">
+              <label class="switch"><input type="checkbox" name="voice_speculative" checked><span class="track"></span><span>Speculative transcription</span></label>
+              <small>A small DFlash draft proposes tokens for the 1.7B model.</small>
+            </div>
+            <label class="field"><span class="field-label">Assistant memory</span><input name="llm_max_memory" placeholder="auto" spellcheck="false"><small>Splash's <code>--max-memory</code>, leaving room for speech.</small></label>
+            <label class="field"><span class="field-label">Splash command</span><input name="splash" placeholder="splash" spellcheck="false"><small id="splash-hint"></small></label>
+            <label class="field"><span class="field-label">Speech recognition port</span><input name="asr_port" inputmode="numeric"></label>
+            <label class="field"><span class="field-label">Speech port</span><input name="tts_port" inputmode="numeric"></label>
+            <label class="field"><span class="field-label">Assistant port</span><input name="llm_port" inputmode="numeric"></label>
+          </div>
+        </details>
+      </div>
+    </form>
+
+    <div class="card connect" id="connect-panel" hidden>
+      <h2>Use a running server</h2>
+      <p class="muted">Any OpenAI-compatible speech server: another Splash Omni, mlx-audio, sglang-omni. Requests go to its <code>/v1/audio/speech</code> and <code>/v1/audio/transcriptions</code>; options it does not support have no effect.</p>
+      <div class="inline-form">
+        <input type="url" id="connect-url" value="http://127.0.0.1:8000" spellcheck="false" aria-label="Server base URL">
+        <button type="button" class="primary" id="btn-connect-go">Open</button>
+        <button type="button" class="ghost" id="btn-connect-cancel">Cancel</button>
+      </div>
+    </div>
+  </section>
+
+  <!-- Progress: the download, the server's start and its readiness. -->
+  <section id="view-progress" class="view" hidden>
+    <div class="card progress-card">
+      <h1 id="progress-title">Starting</h1>
+      <p class="muted" id="progress-model"></p>
+      <ol class="steps" id="steps">
+        <li data-step="prepare"><span class="bullet"></span>Prepare</li>
+        <li data-step="download"><span class="bullet"></span>Download</li>
+        <li data-step="load"><span class="bullet"></span>Load model</li>
+        <li data-step="ready"><span class="bullet"></span>Ready</li>
+      </ol>
+      <p class="detail" id="progress-detail"></p>
+      <div id="downloads" class="downloads"></div>
+      <p class="error" id="progress-error" role="alert" hidden></p>
+      <div class="actions">
+        <button type="button" class="ghost" id="btn-cancel">Cancel</button>
+        <button type="button" class="ghost" id="btn-back" hidden>Back</button>
+        <button type="button" class="ghost" id="btn-use-running" hidden>Use the server already on this port</button>
+      </div>
+      <details id="log-details">
+        <summary>Details</summary>
+        <p class="command"><code id="progress-command"></code></p>
+        <pre id="log" class="log"></pre>
+      </details>
+    </div>
+  </section>
+
+  <!-- Run: requests to the server's API. -->
+  <section id="view-run" class="view" hidden>
+    <div class="run-head">
+      <div>
+        <h1 id="run-title">Text to speech</h1>
+        <p class="muted" id="run-subtitle"></p>
+      </div>
+      <div class="tabs" role="tablist" id="run-tabs">
+        <button type="button" role="tab" id="tab-tts" data-tab="tts" aria-selected="true">Text to speech</button>
+        <button type="button" role="tab" id="tab-asr" data-tab="asr" aria-selected="false">Files</button>
+        <button type="button" role="tab" id="tab-live" data-tab="live" aria-selected="false">Live</button>
+      </div>
+    </div>
+
+    <div class="panel" id="panel-tts" role="tabpanel" aria-labelledby="tab-tts">
+      <div class="columns">
+        <div class="card column">
+          <div class="voice-box" id="tts-voice-box">
+            <div class="label-row">
+              <span class="field-label">Voice</span>
+              <span class="model-type" id="tts-model-type"></span>
+            </div>
+            <label class="field" id="tts-speaker-row" hidden>
+              <span class="field-label">Speaker <span class="tag" id="tts-speaker-tag">required</span></span>
+              <select id="tts-speaker"></select>
+            </label>
+            <label class="field" id="tts-voice-row" hidden>
+              <span class="field-label">Voice name <span class="tag">optional</span></span>
+              <input type="text" id="tts-voice" placeholder="(server default)" spellcheck="false" autocomplete="off">
+            </label>
+            <div class="field" id="tts-instructions-row" hidden>
+              <div class="label-row">
+                <label for="tts-instructions" class="field-label"><span id="tts-instructions-label">Description</span> <span class="tag" id="tts-instructions-tag">required</span></label>
+                <span class="muted" id="tts-instructions-count"></span>
+              </div>
+              <textarea id="tts-instructions" class="prompt" rows="3" spellcheck="true"></textarea>
+              <small id="tts-instructions-hint"></small>
+              <div class="examples" id="tts-examples" aria-label="Examples"></div>
+            </div>
+            <p class="note" id="tts-base-note" hidden>This model chooses a natural voice by itself. To pick a speaker or describe a voice, start another voice type.</p>
+          </div>
+
+          <div class="label-row">
+            <label for="tts-text" class="field-label">Text</label>
+            <span class="muted" id="tts-count"></span>
+          </div>
+          <textarea id="tts-text" class="autogrow" rows="7" spellcheck="true" placeholder="Type or paste the text to speak."></textarea>
+          <div class="paragraph-row" id="tts-paragraph-row">
+            <div class="toggle-row">
+              <label class="switch"><input type="checkbox" id="tts-paragraphs"><span class="track"></span><span>Paragraph mode</span></label>
+              <span class="muted" id="tts-paragraph-count"></span>
+            </div>
+            <small>Separate paragraphs with an empty line to generate them in parallel: long texts finish much sooner.</small>
+          </div>
+
+          <div class="quick-row">
+            <label class="field"><span class="field-label">Language</span>
+              <select id="tts-language"></select></label>
+            <label class="field" title="Played faster at the same pitch"><span class="field-label">Speed</span>
+              <input type="number" id="tts-speed" step="0.05" min="0.5" max="3" value="1.5"></label>
+            <div class="actions">
+              <button type="button" class="primary large" id="tts-go">Speak</button>
+              <button type="button" class="ghost" id="tts-stop" disabled>Stop</button>
+            </div>
+          </div>
+
+          <details class="params" id="tts-params">
+            <summary>Advanced</summary>
+            <label class="check" id="tts-chunks-row" hidden title="A long single request grows quieter as it goes (the model's own behaviour); chunks of about 25 s that continue the first keep the voice and the level."><input type="checkbox" id="tts-chunks" checked> <span>Speak a long text in chunks that continue the first (keeps the level)</span></label>
+            <p class="note" id="paragraph-note" hidden>Paragraphs separated by a blank line are sent as separate requests and played in order; the first starts playing as soon as it arrives. <span id="paragraph-note-anchor">Once the first is generated, the others are sent at the same time as its continuations, so they keep its voice, pace and loudness.</span><span id="paragraph-note-plain">They are sent at the same time; every request carries the same <span id="paragraph-note-controls">system prompt</span> and one seed, which keeps the voice close across paragraphs.</span></p>
+            <p class="note" id="paragraph-unavailable" hidden>Paragraph mode is not offered for the Base model: it has no fixed voice, so each paragraph would sound like a different speaker. The whole text is sent as one request.</p>
+            <div class="fields compact">
+              <label class="field"><span class="field-label">Temperature</span>
+                <input type="number" id="tts-temperature" step="0.05" min="0" placeholder="0.9"></label>
+              <label class="field"><span class="field-label">Top-k</span>
+                <input type="number" id="tts-top_k" step="1" min="0" placeholder="50"></label>
+              <label class="field"><span class="field-label">Top-p</span>
+                <input type="number" id="tts-top_p" step="0.05" min="0.01" max="1" placeholder="1.0"></label>
+              <label class="field"><span class="field-label">Repetition penalty</span>
+                <input type="number" id="tts-repetition_penalty" step="0.01" min="0.01" placeholder="1.05"></label>
+              <label class="field"><span class="field-label">Seed</span>
+                <input type="number" id="tts-seed" step="1" min="0" placeholder="random"></label>
+              <label class="field"><span class="field-label">Max frames</span>
+                <input type="number" id="tts-max_frames" step="1" min="0" placeholder="auto"></label>
+              <label class="field"><span class="field-label">Chunk frames</span>
+                <input type="number" id="tts-chunk_frames" step="1" min="0" placeholder="1,2,4,8,16,25"></label>
+              <label class="field"><span class="field-label">Response format</span>
+                <select id="tts-format"><option value="wav">wav</option><option value="pcm">pcm (24 kHz int16)</option></select></label>
+            </div>
+            <div class="checks row-checks">
+              <label class="check"><input type="checkbox" id="tts-stream" checked> <span>Stream<small>Receive audio as it is generated.</small></span></label>
+              <label class="check"><input type="checkbox" id="tts-autoplay" checked> <span>Play as it arrives</span></label>
+              <label class="check" id="tts-shared-seed-row"><input type="checkbox" id="tts-shared-seed" checked> <span>One seed for every paragraph</span></label>
+            </div>
+            <p class="note">Blank fields use the server's defaults. The code predictor samples with the same temperature, top-k and top-p. Max frames: 12.5 per second of audio. Chunk frames: a fixed chunk size instead of the growing schedule. Speed: the model speaks slowly, so the page plays (and saves) its audio faster at the same pitch; 1 keeps the model's own pace.</p>
+          </details>
+        </div>
+
+        <div class="card column output">
+          <h2>Listen</h2>
+          <div class="player" id="tts-player" data-state="empty">
+            <button type="button" class="play" id="tts-play" aria-label="Play" disabled><span class="play-icon" aria-hidden="true"></span></button>
+            <div class="timeline" id="tts-timeline" role="slider" tabindex="0" aria-label="Playback position" aria-valuemin="0" aria-valuemax="0" aria-valuenow="0">
+              <div class="timeline-received" id="tts-received"></div>
+              <div class="timeline-generating" id="tts-generating"></div>
+              <div class="timeline-played" id="tts-played"></div>
+              <div class="timeline-head" id="tts-head"></div>
+            </div>
+            <span class="player-time" id="tts-time">0:00.0 / 0:00.0</span>
+          </div>
+          <p class="player-caption muted" id="tts-progress"></p>
+          <div class="output-actions">
+            <a id="tts-download" class="button ghost" download="speech.wav" hidden>Download WAV</a>
+            <span class="muted" id="tts-seed-used"></span>
+          </div>
+          <p class="status" id="tts-status" role="status"></p>
+          <div class="metrics" id="tts-metrics" hidden>
+            <div class="metric"><span class="metric-label">First audio</span><span class="metric-value" data-metric="first">–</span><span class="metric-sub" data-metric="first-sub"></span></div>
+            <div class="metric"><span class="metric-label">Total time</span><span class="metric-value" data-metric="total">–</span><span class="metric-sub" data-metric="total-sub"></span></div>
+            <div class="metric"><span class="metric-label">Audio</span><span class="metric-value" data-metric="audio">–</span><span class="metric-sub" data-metric="audio-sub"></span></div>
+            <div class="metric"><span class="metric-label" title="Audio seconds per second of wall time">Speed</span><span class="metric-value" data-metric="speed">–</span><span class="metric-sub" data-metric="speed-sub"></span></div>
+          </div>
+          <div class="table-wrap" id="tts-segments-wrap" hidden>
+            <table class="segments">
+              <thead><tr><th>#</th><th>Paragraph</th><th>First audio</th><th>Done</th><th>Audio</th><th>Status</th></tr></thead>
+              <tbody id="tts-segments"></tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="panel" id="panel-asr" role="tabpanel" aria-labelledby="tab-asr" hidden>
+      <div class="columns">
+        <div class="card column">
+          <div class="dropzone" id="asr-drop" tabindex="0">
+            <input type="file" id="asr-file" accept="audio/*,video/*,.wav,.mp3,.m4a,.aac,.flac,.ogg,.opus,.aif,.aiff,.caf,.wma,.amr,.mp4,.m4v,.mov,.mkv,.webm,.avi" hidden>
+            <div class="dropzone-body">
+              <span class="dropzone-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M12 16V4M7 9l5-5 5 5M4 16v3a1 1 0 0 0 1 1h14a1 1 0 0 0 1-1v-3"/></svg></span>
+              <strong>Drop an audio or video file</strong>
+              <span class="muted">MP3, M4A, WAV, FLAC and more; MP4, MOV or another video's soundtrack.</span>
+              <div class="dropzone-actions">
+                <button type="button" class="ghost" id="asr-choose">Choose a file</button>
+                <button type="button" class="ghost" id="asr-record"><span class="rec-dot"></span><span id="asr-record-label">Record</span></button>
+                <button type="button" class="ghost" id="asr-use-tts" hidden>Use the last speech output</button>
+              </div>
+            </div>
+          </div>
+          <div class="file-info" id="asr-file-info" hidden>
+            <span id="asr-file-name"></span>
+            <span class="muted" id="asr-file-meta"></span>
+          </div>
+          <audio id="asr-preview" controls preload="auto" hidden></audio>
+          <div class="quick-row">
+            <label class="field"><span class="field-label">Language</span>
+              <select id="asr-language"></select></label>
+            <div class="actions">
+              <button type="button" class="primary large" id="asr-go" disabled>Transcribe</button>
+              <button type="button" class="ghost" id="asr-stop" disabled>Stop</button>
+            </div>
+          </div>
+          <details class="params" id="asr-params">
+            <summary>Advanced</summary>
+            <div class="fields compact">
+              <label class="field"><span class="field-label">Response format</span>
+                <select id="asr-format"><option value="json">json</option><option value="text">text</option><option value="verbose_json">verbose_json</option></select></label>
+            </div>
+          </details>
+        </div>
+
+        <div class="card column output">
+          <h2>Transcript</h2>
+          <textarea id="asr-text" class="autogrow" rows="7" readonly placeholder="The transcript appears here."></textarea>
+          <div class="output-actions">
+            <button type="button" class="ghost" id="asr-copy" disabled>Copy</button>
+          </div>
+          <p class="status" id="asr-status" role="status"></p>
+          <div class="metrics" id="asr-metrics" hidden>
+            <div class="metric"><span class="metric-label">Total time</span><span class="metric-value" data-metric="total">–</span><span class="metric-sub" data-metric="total-sub"></span></div>
+            <div class="metric"><span class="metric-label">Audio</span><span class="metric-value" data-metric="audio">–</span><span class="metric-sub" data-metric="audio-sub"></span></div>
+            <div class="metric"><span class="metric-label" title="Audio seconds per second of wall time">Speed</span><span class="metric-value" data-metric="speed">–</span><span class="metric-sub" data-metric="speed-sub"></span></div>
+            <div class="metric"><span class="metric-label">Language</span><span class="metric-value small" data-metric="language">–</span><span class="metric-sub" data-metric="language-sub"></span></div>
+          </div>
+          <details id="asr-raw-details" hidden>
+            <summary>Response</summary>
+            <pre id="asr-raw" class="log"></pre>
+          </details>
+        </div>
+      </div>
+    </div>
+
+    <div class="panel" id="panel-live" role="tabpanel" aria-labelledby="tab-live" hidden>
+      <div class="columns">
+        <div class="card column">
+          <p class="muted live-intro">Speak, and every pause becomes a line of text. Lines appear while you talk and settle when you stop.</p>
+          <div class="live-controls">
+            <button type="button" class="primary large" id="live-toggle"><span class="rec-dot"></span><span id="live-toggle-label">Start listening</span></button>
+            <label class="field live-language"><span class="field-label">Language</span>
+              <select id="live-language"></select></label>
+          </div>
+          <div class="meter" aria-hidden="true"><div class="meter-fill" id="live-meter"></div><div class="meter-threshold" id="live-threshold"></div></div>
+          <small id="live-level">Input level –</small>
+
+          <details class="params" id="live-params">
+            <summary>Advanced</summary>
+            <div class="field live-source">
+              <span class="field-label">Source</span>
+              <div class="segmented" role="radiogroup" aria-label="Source">
+                <label><input type="radio" name="live-source" value="mic" checked><span>Microphone</span></label>
+                <label><input type="radio" name="live-source" value="file"><span>Audio file in real time</span></label>
+              </div>
+              <div class="live-file" id="live-file-row" hidden>
+                <input type="file" id="live-file" accept="audio/*,video/*,.wav,.mp3,.m4a,.aac,.flac,.ogg,.opus,.aif,.aiff,.caf,.wma,.amr,.mp4,.m4v,.mov,.mkv,.webm,.avi" hidden>
+                <button type="button" class="ghost" id="live-choose">Choose a file</button>
+                <button type="button" class="ghost" id="live-use-tts" hidden>Use the last speech output</button>
+                <span class="muted" id="live-file-name">No file chosen</span>
+                <label class="check"><input type="checkbox" id="live-play-file" checked> <span>Play it aloud</span></label>
+              </div>
+            </div>
+            <div class="fields compact">
+              <label class="field"><span class="field-label">Pause that ends a line</span>
+                <input type="number" id="live-silence" step="50" min="100" max="5000" value="700"><small>milliseconds</small></label>
+              <label class="field"><span class="field-label">Longest utterance</span>
+                <input type="number" id="live-max" step="1" min="2" max="60" value="15"><small>seconds; then cut and continued</small></label>
+              <label class="field"><span class="field-label">Speech threshold</span>
+                <input type="number" id="live-threshold-db" step="1" min="-90" max="0" placeholder="auto"><small>dBFS; auto follows the background</small></label>
+              <label class="field"><span class="field-label">Partial every</span>
+                <input type="number" id="live-partial-ms" step="100" min="300" max="5000" value="1000"><small>milliseconds of speech</small></label>
+            </div>
+            <div class="checks row-checks">
+              <label class="check"><input type="checkbox" id="live-partials" checked> <span>Live partials<small>Send the growing utterance for a provisional line.</small></span></label>
+              <label class="check"><input type="checkbox" id="live-cleanup" checked> <span>Echo cancellation and noise suppression<small>The browser's microphone processing.</small></span></label>
+            </div>
+            <p class="note">Each line is an ordinary request to <code>/v1/audio/transcriptions</code> (16 kHz mono WAV), cut by voice activity detection; while you speak, the utterance so far is sent about once a second for a provisional line.</p>
+          </details>
+        </div>
+
+        <div class="card column output">
+          <h2>Transcript</h2>
+          <div class="live-transcript" id="live-transcript" aria-live="polite">
+            <p class="muted live-empty" id="live-empty">Press Start listening and speak; each pause ends a line.</p>
+          </div>
+          <div class="output-actions">
+            <button type="button" class="ghost" id="live-copy" disabled>Copy</button>
+            <button type="button" class="ghost" id="live-clear" disabled>Clear</button>
+          </div>
+          <p class="status" id="live-status" role="status"></p>
+          <div class="metrics" id="live-metrics" hidden>
+            <div class="metric"><span class="metric-label">Lines</span><span class="metric-value" data-metric="count">–</span><span class="metric-sub" data-metric="count-sub"></span></div>
+            <div class="metric"><span class="metric-label">Last latency</span><span class="metric-value" data-metric="last">–</span><span class="metric-sub" data-metric="last-sub"></span></div>
+            <div class="metric"><span class="metric-label">Median latency</span><span class="metric-value" data-metric="median">–</span><span class="metric-sub" data-metric="median-sub"></span></div>
+            <div class="metric"><span class="metric-label">Listening</span><span class="metric-value" data-metric="time">–</span><span class="metric-sub" data-metric="time-sub"></span></div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <details class="card endpoint" id="endpoint-card">
+      <summary>
+        <span class="endpoint-title">API</span>
+        <code id="endpoint-summary"></code>
+        <span id="endpoint-status" class="muted"></span>
+      </summary>
+      <div class="fields endpoint-fields">
+        <label class="field wide">
+          <span class="field-label">Base URL</span>
+          <input type="url" id="ep-base" spellcheck="false">
+          <small>Point the page at any OpenAI-compatible server to compare it with the same requests.</small>
+        </label>
+        <label class="field">
+          <span class="field-label">Model name</span>
+          <input type="text" id="ep-model" list="ep-models" spellcheck="false" placeholder="(server default)">
+          <datalist id="ep-models"></datalist>
+        </label>
+        <label class="field">
+          <span class="field-label">API key</span>
+          <input type="password" id="ep-key" autocomplete="off" placeholder="(none)">
+        </label>
+        <div class="field checks">
+          <label class="check"><input type="checkbox" id="ep-proxy" checked> <span>Through this page's proxy<small>Forwards requests unchanged, so servers without CORS work and timing headers are readable.</small></span></label>
+        </div>
+        <div class="field">
+          <span class="field-label">&nbsp;</span>
+          <button type="button" id="ep-check" class="ghost">Check server</button>
+        </div>
+      </div>
+    </details>
+  </section>
+</main>
+<script src="/static/logic.js"></script>
+<script src="/static/app.js"></script>
+</body>
+</html>

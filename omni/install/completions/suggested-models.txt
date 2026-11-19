@@ -1,0 +1,8 @@
+mlx-community/Qwen3-ASR-1.7B-4bit
+mlx-community/Qwen3-ASR-1.7B-bf16
+mlx-community/Qwen3-TTS-12Hz-1.7B-Base-4bit
+mlx-community/Qwen3-TTS-12Hz-1.7B-Base-bf16
+mlx-community/Qwen3-TTS-12Hz-1.7B-CustomVoice-4bit
+mlx-community/Qwen3-TTS-12Hz-1.7B-CustomVoice-bf16
+mlx-community/Qwen3-TTS-12Hz-1.7B-VoiceDesign-4bit
+mlx-community/Qwen3-TTS-12Hz-1.7B-VoiceDesign-bf16

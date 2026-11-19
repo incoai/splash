@@ -1,0 +1,138 @@
+{
+ "task": "asr",
+ "engine": "whisper.cpp",
+ "model": "large-v3-turbo",
+ "model_info": {
+  "label": "whisper-large-v3-turbo f16 (ggml, Metal)",
+  "runtime": "whisper.cpp v1.9.5 whisper-server, ggml Metal backend",
+  "model_file": "ggml-large-v3-turbo.bin",
+  "model_bytes": 1624555275,
+  "quantization": "f16",
+  "decoding": "server defaults: greedy (best_of 2), temperature 0 with fallback, timestamps on, flash attention on",
+  "note": "whisper-server serializes requests (global mutex): concurrency 1 only."
+ },
+ "concurrency": 1,
+ "timestamp": "2026-10-08T05:10:40",
+ "host": {
+  "machine": "arm64",
+  "macos": "26.6.2",
+  "python": "3.12.13",
+  "chip": "Apple M5 Pro",
+  "mem_bytes": "51539607552"
+ },
+ "config": {
+  "set": "longform",
+  "language": "English",
+  "data_dir": "data",
+  "warmup": 1,
+  "base_url": "http://127.0.0.1:53786",
+  "server_cmd": [
+   "refs/whisper.cpp/build/bin/whisper-server",
+   "-m",
+   "refs/whisper-models/ggml-large-v3-turbo.bin",
+   "--host",
+   "127.0.0.1",
+   "--port",
+   "53786",
+   "--inference-path",
+   "/v1/audio/transcriptions"
+  ],
+  "whisper_language": "en"
+ },
+ "summary": {
+  "n": 4,
+  "errors": 0,
+  "wall_s": 13.558625791920349,
+  "latency_ms": {
+   "n": 4,
+   "mean": 3388.7188852240797,
+   "p50": 3262.8224579966627,
+   "p90": 5631.073212297633,
+   "p95": 5743.635043641552,
+   "min": 1173.033749917522,
+   "max": 5856.196874985471
+  },
+  "audio_s_total": 746.755,
+  "rtfx": {
+   "n": 4,
+   "mean": 52.93375516032938,
+   "p50": 51.84068231941109,
+   "p90": 59.21609764641326,
+   "p95": 60.7629075579384,
+   "min": 45.74393853303181,
+   "max": 62.309717469463536
+  },
+  "rtfx_median": 51.84068231941109,
+  "rtfx_aggregate": 55.091247259849105,
+  "throughput_audio_s_per_s": 55.076009284436104,
+  "wer": 0.0263724434876211,
+  "peak_memory_gb": null,
+  "server_startup_s": 0.507965249940753
+ },
+ "items": [
+  {
+   "latency_s": 1.173033749917522,
+   "language": null,
+   "status": 200,
+   "error": null,
+   "extra": {
+    "start_offset_s": 9.720795787870884e-05
+   },
+   "transcript": "Young Fitzuth had been commanded to his mother's chamber so soon as he had come out from his converse with the squire.\n There befell an anxious interview, Mistress Fitzuth arguing for and against the squire's project in a breath.\n Most of all Robin thought of his father. What would he counsel?\n If, for a whim, you beggar yourself, I cannot stay you.\n But take it whilst I live, and wear Montfichet's shield in the days when my eyes can be rejoiced by so brave a sight,\n for you will never disgrace our Dutch and I warrant me.\n The lad had checked him then.\n Never that, sir, he had said.\n He was in deep converse with the clerk, and entered the hall holding him by the arm.\n Now to bed, boy.\n Tis late, and I go myself within a short space.\n Dismiss your squire, Robin, and bid me goodean.\n As any in England, I would say, said Gamewell proudly.\n That is, in his day.\n Yet he will teach you a few tricks when morning is come",
+   "id": "long60_a",
+   "set": "longform",
+   "duration": 60.995,
+   "reference": "YOUNG FITZOOTH HAD BEEN COMMANDED TO HIS MOTHER'S CHAMBER SO SOON AS HE HAD COME OUT FROM HIS CONVERSE WITH THE SQUIRE THERE BEFELL AN ANXIOUS INTERVIEW MISTRESS FITZOOTH ARGUING FOR AND AGAINST THE SQUIRE'S PROJECT IN A BREATH MOST OF ALL ROBIN THOUGHT OF HIS FATHER WHAT WOULD HE COUNSEL IF FOR A WHIM YOU BEGGAR YOURSELF I CANNOT STAY YOU BUT TAKE IT WHILST I LIVE AND WEAR MONTFICHET'S SHIELD IN THE DAYS WHEN MY EYES CAN BE REJOICED BY SO BRAVE A SIGHT FOR YOU WILL NE'ER DISGRACE OUR SCUTCHEON I WARRANT ME THE LAD HAD CHECKED HIM THEN NEVER THAT SIR HE HAD SAID HE WAS IN DEEP CONVERSE WITH THE CLERK AND ENTERED THE HALL HOLDING HIM BY THE ARM NOW TO BED BOY TIS LATE AND I GO MYSELF WITHIN A SHORT SPACE DISMISS YOUR SQUIRE ROBIN AND BID ME GOOD E E N AS ANY IN ENGLAND I WOULD SAY SAID GAMEWELL PROUDLY THAT IS IN HIS DAY YET HE WILL TEACH YOU A FEW TRICKS WHEN MORNING IS COME",
+   "rtfx": 51.99765139262929,
+   "wer": 0.05084745762711865
+  },
+  {
+   "latency_s": 1.4198602499673143,
+   "language": null,
+   "status": 200,
+   "error": null,
+   "extra": {
+    "start_offset_s": 1.1734632919542491
+   },
+   "transcript": "it was one of the masterly and charming stories of dumas the elder in five minutes i was in a new world and my melancholy room was full of the liveliest french company the sound of an imperative and uncompromising bell recalled me in due time to the regions of reality\n ambrose met me at the bottom of the stairs and showed me the way to the supper room she signed to me with a ghostly solemnity to take the vacant place on the left of her father the door opened again while i was still studying the two brothers without i honestly confess being very favorably impressed by either of them\n a new member of the family circle who instantly attracted my attention entered the room a little cracked that in the popular phrase was my impression of the stranger who now made his appearance in the supper room\n mr meddicroft the elder having not spoken one word thus far himself introduced the newcomer to me with a side glance at his sons which had something like defiance in it a glance which as i was sorry to notice was returned with the defiance on their side by the two young men\n philip le frank this is my overlooker mr jago said the old man formally presenting us",
+   "id": "long60_b",
+   "set": "longform",
+   "duration": 64.95,
+   "reference": "IT WAS ONE OF THE MASTERLY AND CHARMING STORIES OF DUMAS THE ELDER IN FIVE MINUTES I WAS IN A NEW WORLD AND MY MELANCHOLY ROOM WAS FULL OF THE LIVELIEST FRENCH COMPANY THE SOUND OF AN IMPERATIVE AND UNCOMPROMISING BELL RECALLED ME IN DUE TIME TO THE REGIONS OF REALITY AMBROSE MET ME AT THE BOTTOM OF THE STAIRS AND SHOWED ME THE WAY TO THE SUPPER ROOM SHE SIGNED TO ME WITH A GHOSTLY SOLEMNITY TO TAKE THE VACANT PLACE ON THE LEFT OF HER FATHER THE DOOR OPENED AGAIN WHILE I WAS STILL STUDYING THE TWO BROTHERS WITHOUT I HONESTLY CONFESS BEING VERY FAVORABLY IMPRESSED BY EITHER OF THEM A NEW MEMBER OF THE FAMILY CIRCLE WHO INSTANTLY ATTRACTED MY ATTENTION ENTERED THE ROOM A LITTLE CRACKED THAT IN THE POPULAR PHRASE WAS MY IMPRESSION OF THE STRANGER WHO NOW MADE HIS APPEARANCE IN THE SUPPER ROOM MISTER MEADOWCROFT THE ELDER HAVING NOT SPOKEN ONE WORD THUS FAR HIMSELF INTRODUCED THE NEWCOMER TO ME WITH A SIDE GLANCE AT HIS SONS WHICH HAD SOMETHING LIKE DEFIANCE IN IT A GLANCE WHICH AS I WAS SORRY TO NOTICE WAS RETURNED WITH THE DEFIANCE ON THEIR SIDE BY THE TWO YOUNG MEN PHILIP LEFRANK THIS IS MY OVERLOOKER MISTER JAGO SAID THE OLD MAN FORMALLY PRESENTING US",
+   "rtfx": 45.74393853303181,
+   "wer": 0.022935779816513763
+  },
+  {
+   "latency_s": 5.856196874985471,
+   "language": null,
+   "status": 200,
+   "error": null,
+   "extra": {
+    "start_offset_s": 2.5936396669130772
+   },
+   "transcript": "In every way, they sought to undermine the authority of St. Paul.\n They said to the Galatians,\n You have no right to think highly of Paul.\n He was the last to turn to Christ.\n Paul came later and is beneath us.\n Indeed, he persecuted the Church of Christ for a long time.\n Do you suppose that God, for the sake of a few Lutheran heretics,\n would disown his entire church?\n Against these boasting false apostles,\n Paul boldly defends his apostolic authority in ministry.\n As the ambassador of a government is honored for his office,\n and not for his private person,\n so the minister of Christ should exalt his office,\n in order to gain authority among men.\n Paul takes pride in his ministry,\n not to his own praise, but to the praise of God.\n Paul, an apostle, not of men, etc.\n Either he calls ministers through the agency of men,\n or he calls them directly as he called the prophets and apostles.\n Paul declares that the false apostles were called or sent neither by men nor by man.\n The most they could claim is that they were sent by others.\n He mentions the apostles first because they were appointed directly by God.\n The call is not to be taken lightly.\n For a person to possess knowledge is not enough.\n It spoils one's best work.\n When I was a young man, I thought Paul was making too much of his call.\n I did not then realize the importance of the ministry.\n I knew nothing of the doctrine of faith because we were taught sophistry instead of certainty,\n and nobody understood spiritual boasting.\n This is no sinful pride.\n It is holy pride.\n And God the Father who raised him from the dead.\n The clause seems superfluous on first sight.\n These perverters of the righteousness of Christ resist the Father and the Son and the works of them both.\n In this whole epistle, Paul treats of the resurrection of Christ.\n By his resurrection, Christ won the victory over law, sin, flesh, world, devil, death, hell, and every evil.\n Verse 2\n And all the brethren which are with me.\n This should go far in shutting the mouths of the false apostles.\n Although the brethren with me are not apostles like myself,\n yet they are all of one mind with me, think, write, and teach as I do.\n They do not go where the enemies of the gospel predominate.\n They go where the Christians are.\n Why do they not invade the Catholic provinces and preach their doctrine to godless princes,\n bishops, and doctors, as we have done by the help of God?\n We look for that reward which eye hath not seen, nor ear heard,\n neither hath entered into the heart of man.\n Not all the Galatians had become perverted.\n These means cannot be contaminated.\n They remain divine regardless of men's opinion.\n Wherever the means of grace are found, there is the Holy Church,\n even though Antichrist reigns there.\n So much for the title of the epistle,\n now follows the greeting of the apostle.\n Verse 3\n Grace be to you, and peace from God the Father,\n and from our Lord Jesus Christ.\n The terms of grace and peace are common terms with Paul,\n and are now pretty well understood.\n The greeting of the apostle is refreshing.\n Grace involves the remission of sins,\n peace, and a happy conscience.\n The world brands this a pernicious doctrine.\n Experience proves this.\n However, the grace and peace of God will.\n Men should not speculate about the nature of God.\n Was it not enough to say from God the Father?\n To do so is to lose God altogether,\n because God becomes intolerable\n when we seek to measure and to comprehend His infinite majesty.\n He came down to earth, lived among men,\n suffered, was crucified, and then He died,\n standing clearly before us,\n so that our hearts and eyes may fasten upon Him.\n Embrace Him, and forget about the nature of God.\n Did not Christ Himself say,\n I am the way, and the truth, and the life?\n No man cometh unto the Father but by me?\n When you argue about the nature of God,\n apart from the question of justification,\n you may be as profound as you like.\n We are to hear Christ,\n who has been appointed by the Father as our divine teacher.\n At the same time,\n Paul confirms our creed,\n that Christ is very God.\n That Christ is very God,\n is apparent in that Paul ascribes to Him\n divine powers equally with the Father,\n as for instance,\n the power to dispense grace and peace.\n To bestow peace and grace\n lies in the province of God,\n who alone can create these blessings.\n The angels cannot.\n Otherwise, Paul should have written,\n Grace from God the Father,\n and peace from our Lord Jesus Christ.\n The Arians took Christ for a noble and perfect creature,\n superior even to the angels,\n because by Him,\n God created heaven and earth.",
+   "id": "long300_a",
+   "set": "longform",
+   "duration": 302.67,
+   "reference": "IN EVERY WAY THEY SOUGHT TO UNDERMINE THE AUTHORITY OF SAINT PAUL THEY SAID TO THE GALATIANS YOU HAVE NO RIGHT TO THINK HIGHLY OF PAUL HE WAS THE LAST TO TURN TO CHRIST PAUL CAME LATER AND IS BENEATH US INDEED HE PERSECUTED THE CHURCH OF CHRIST FOR A LONG TIME DO YOU SUPPOSE THAT GOD FOR THE SAKE OF A FEW LUTHERAN HERETICS WOULD DISOWN HIS ENTIRE CHURCH AGAINST THESE BOASTING FALSE APOSTLES PAUL BOLDLY DEFENDS HIS APOSTOLIC AUTHORITY AND MINISTRY AS THE AMBASSADOR OF A GOVERNMENT IS HONORED FOR HIS OFFICE AND NOT FOR HIS PRIVATE PERSON SO THE MINISTER OF CHRIST SHOULD EXALT HIS OFFICE IN ORDER TO GAIN AUTHORITY AMONG MEN PAUL TAKES PRIDE IN HIS MINISTRY NOT TO HIS OWN PRAISE BUT TO THE PRAISE OF GOD PAUL AN APOSTLE NOT OF MEN ET CETERA EITHER HE CALLS MINISTERS THROUGH THE AGENCY OF MEN OR HE CALLS THEM DIRECTLY AS HE CALLED THE PROPHETS AND APOSTLES PAUL DECLARES THAT THE FALSE APOSTLES WERE CALLED OR SENT NEITHER BY MEN NOR BY MAN THE MOST THEY COULD CLAIM IS THAT THEY WERE SENT BY OTHERS HE MENTIONS THE APOSTLES FIRST BECAUSE THEY WERE APPOINTED DIRECTLY BY GOD THE CALL IS NOT TO BE TAKEN LIGHTLY FOR A PERSON TO POSSESS KNOWLEDGE IS NOT ENOUGH IT SPOILS ONE'S BEST WORK WHEN I WAS A YOUNG MAN I THOUGHT PAUL WAS MAKING TOO MUCH OF HIS CALL I DID NOT THEN REALIZE THE IMPORTANCE OF THE MINISTRY I KNEW NOTHING OF THE DOCTRINE OF FAITH BECAUSE WE WERE TAUGHT SOPHISTRY INSTEAD OF CERTAINTY AND NOBODY UNDERSTOOD SPIRITUAL BOASTING THIS IS NO SINFUL PRIDE IT IS HOLY PRIDE AND GOD THE FATHER WHO RAISED HIM FROM THE DEAD THE CLAUSE SEEMS SUPERFLUOUS ON FIRST SIGHT THESE PERVERTERS OF THE RIGHTEOUSNESS OF CHRIST RESIST THE FATHER AND THE SON AND THE WORKS OF THEM BOTH IN THIS WHOLE EPISTLE PAUL TREATS OF THE RESURRECTION OF CHRIST BY HIS RESURRECTION CHRIST WON THE VICTORY OVER LAW SIN FLESH WORLD DEVIL DEATH HELL AND EVERY EVIL VERSE TWO AND ALL THE BRETHREN WHICH ARE WITH ME THIS SHOULD GO FAR IN SHUTTING THE MOUTHS OF THE FALSE APOSTLES ALTHOUGH THE BRETHREN WITH ME ARE NOT APOSTLES LIKE MYSELF YET THEY ARE ALL OF ONE MIND WITH ME THINK WRITE AND TEACH AS I DO THEY DO NOT GO WHERE THE ENEMIES OF THE GOSPEL PREDOMINATE THEY GO WHERE THE CHRISTIANS ARE WHY DO THEY NOT INVADE THE CATHOLIC PROVINCES AND PREACH THEIR DOCTRINE TO GODLESS PRINCES BISHOPS AND DOCTORS AS WE HAVE DONE BY THE HELP OF GOD WE LOOK FOR THAT REWARD WHICH EYE HATH NOT SEEN NOR EAR HEARD NEITHER HATH ENTERED INTO THE HEART OF MAN NOT ALL THE GALATIANS HAD BECOME PERVERTED THESE MEANS CANNOT BE CONTAMINATED THEY REMAIN DIVINE REGARDLESS OF MEN'S OPINION WHEREVER THE MEANS OF GRACE ARE FOUND THERE IS THE HOLY CHURCH EVEN THOUGH ANTICHRIST REIGNS THERE SO MUCH FOR THE TITLE OF THE EPISTLE NOW FOLLOWS THE GREETING OF THE APOSTLE VERSE THREE GRACE BE TO YOU AND PEACE FROM GOD THE FATHER AND FROM OUR LORD JESUS CHRIST THE TERMS OF GRACE AND PEACE ARE COMMON TERMS WITH PAUL AND ARE NOW PRETTY WELL UNDERSTOOD THE GREETING OF THE APOSTLE IS REFRESHING GRACE INVOLVES THE REMISSION OF SINS PEACE AND A HAPPY CONSCIENCE THE WORLD BRANDS THIS A PERNICIOUS DOCTRINE EXPERIENCE PROVES THIS HOWEVER THE GRACE AND PEACE OF GOD WILL MEN SHOULD NOT SPECULATE ABOUT THE NATURE OF GOD WAS IT NOT ENOUGH TO SAY FROM GOD THE FATHER TO DO SO IS TO LOSE GOD ALTOGETHER BECAUSE GOD BECOMES INTOLERABLE WHEN WE SEEK TO MEASURE AND TO COMPREHEND HIS INFINITE MAJESTY HE CAME DOWN TO EARTH LIVED AMONG MEN SUFFERED WAS CRUCIFIED AND THEN HE DIED STANDING CLEARLY BEFORE US SO THAT OUR HEARTS AND EYES MAY FASTEN UPON HIM EMBRACE HIM AND FORGET ABOUT THE NATURE OF GOD DID NOT CHRIST HIMSELF SAY I AM THE WAY AND THE TRUTH AND THE LIFE NO MAN COMETH UNTO THE FATHER BUT BY ME WHEN YOU ARGUE ABOUT THE NATURE OF GOD APART FROM THE QUESTION OF JUSTIFICATION YOU MAY BE AS PROFOUND AS YOU LIKE WE ARE TO HEAR CHRIST WHO HAS BEEN APPOINTED BY THE FATHER AS OUR DIVINE TEACHER AT THE SAME TIME PAUL CONFIRMS OUR CREED THAT CHRIST IS VERY GOD THAT CHRIST IS VERY GOD IS APPARENT IN THAT PAUL ASCRIBES TO HIM DIVINE POWERS EQUALLY WITH THE FATHER AS FOR INSTANCE THE POWER TO DISPENSE GRACE AND PEACE TO BESTOW PEACE AND GRACE LIES IN THE PROVINCE OF GOD WHO ALONE CAN CREATE THESE BLESSINGS THE ANGELS CANNOT OTHERWISE PAUL SHOULD HAVE WRITTEN GRACE FROM GOD THE FATHER AND PEACE FROM OUR LORD JESUS CHRIST THE ARIANS TOOK CHRIST FOR A NOBLE AND PERFECT CREATURE SUPERIOR EVEN TO THE ANGELS BECAUSE BY HIM GOD CREATED HEAVEN AND EARTH",
+   "rtfx": 51.68371324619289,
+   "wer": 0.007281553398058253
+  },
+  {
+   "latency_s": 5.105784666026011,
+   "language": null,
+   "status": 200,
+   "error": null,
+   "extra": {
+    "start_offset_s": 8.451175624970347
+   },
+   "transcript": "Though thrown into prison for this enterprise and detained some time, he was not discouraged,\n but still continued by his countenance and protection to infuse spirit into the distressed\n royalists. Among other persons of distinction who united themselves to him was Lord Napier of\n Murchiston, son of the famous inventor of the logarithms, the person to whom the title of\n a great man is more justly due than to any other whom his country ever produced. While the former\n foretold that the Scottish Covenanters were secretly forming a union with the English Parliament,\n and inculcated the necessity of preventing them by some vigorous undertaking, the latter\n still insisted that every such attempt would precipitate them into measures to which otherwise\n they were not perhaps inclined. The King's ears were now open to Montrose's councils, who proposed\n none but the boldest and most daring, agreeably to the desperate state of the royal cause in Scotland.\n Five hundred men more, who had been levied by the Covenanters, were persuaded to embrace the\n royal cause, and with this combined force he hastened to attack Lord Elko, who lay at Perth with an army\n of six thousand men, assembled upon the first news of the Irish invasion. Dreading the superior power of\n Argyll, who, having joined his vassals to a force levied by the public, was approaching with a considerable\n army. Montrose hastened northward in order to rouse again the Marquis of Huntley and the Gordons, who,\n having before hastily taken arms, had been instantly suppressed by the Covenanters. This nobleman's character,\n though celebrated for political courage and conduct, was very low for military prowess,\n and after some skirmishes in which he was worsted, he here allowed Montrose to escape him.\n By quick marches through these inaccessible mountains, that general freed himself from the superior forces of the Covenanters.\n With these and some reinforcements of the Athol men and MacDonalds, whom he had recalled,\n Montrose fell suddenly upon Argyll's country, and let loose upon it all the rage of war, carrying off the cattle, burning the houses, and putting the inhabitants to the sword.\n This severity by which Montrose sullied his victories was the result of private animosity against the chieftain, as much as of zeal for the public cause.\n Argyll, collecting three thousand men, marched in quest of the enemy, who had retired with their plunder,\n and he lay at Innerlochie, supposing himself still at a considerable distance from them.\n By a quick and unexpected march, Montrose hastened to Innerlochie,\n and presented himself in order of battle before the surprised but not affrightened Covenanters.\n His conduct and presence of mind in this emergence appeared conspicuous.\n Montrose, weak in cavalry, here lined his troops of horse with infantry,\n and after putting the enemy's horse to rout, fell with united force upon their foot,\n who were entirely cut in pieces, though with the loss of the gallant Lord Gordon on the part of the Royalists.\n From the same men new regiments and new companies were formed,\n different officers appointed,\n and the whole military force put into such hands as the independents could rely on.\n Besides members of Parliament who were excluded,\n many officers unwilling to serve under the new generals\n threw up their commissions,\n and unwarily facilitated the project of putting the army\n entirely into the hands of that faction.\n Though the discipline of the former Parliamentary Army was not contemptible,\n a more exact plan was introduced,\n and rigorously executed by these new commanders.\n Valour, indeed, was very generally diffused over the one party as well as the other.\n During this period discipline also was attained by the forces of the Parliament,\n but the perfection of the military art in concerting the general plans of action\n and the operations of the field\n seems still on both sides to have been in a great measure wanting.\n The military art in concerting the general plans of action and the operations of the field,",
+   "id": "long300_b",
+   "set": "longform",
+   "duration": 318.14,
+   "reference": "THOUGH THROWN INTO PRISON FOR THIS ENTERPRISE AND DETAINED SOME TIME HE WAS NOT DISCOURAGED BUT STILL CONTINUED BY HIS COUNTENANCE AND PROTECTION TO INFUSE SPIRIT INTO THE DISTRESSED ROYALISTS AMONG OTHER PERSONS OF DISTINCTION WHO UNITED THEMSELVES TO HIM WAS LORD NAPIER OF MERCHISTON SON OF THE FAMOUS INVENTOR OF THE LOGARITHMS THE PERSON TO WHOM THE TITLE OF A GREAT MAN IS MORE JUSTLY DUE THAN TO ANY OTHER WHOM HIS COUNTRY EVER PRODUCED WHILE THE FORMER FORETOLD THAT THE SCOTTISH COVENANTERS WERE SECRETLY FORMING A UNION WITH THE ENGLISH PARLIAMENT AND INCULCATED THE NECESSITY OF PREVENTING THEM BY SOME VIGOROUS UNDERTAKING THE LATTER STILL INSISTED THAT EVERY SUCH ATTEMPT WOULD PRECIPITATE THEM INTO MEASURES TO WHICH OTHERWISE THEY WERE NOT PERHAPS INCLINED THE KING'S EARS WERE NOW OPEN TO MONTROSE'S COUNSELS WHO PROPOSED NONE BUT THE BOLDEST AND MOST DARING AGREEABLY TO THE DESPERATE STATE OF THE ROYAL CAUSE IN SCOTLAND FIVE HUNDRED MEN MORE WHO HAD BEEN LEVIED BY THE COVENANTERS WERE PERSUADED TO EMBRACE THE ROYAL CAUSE AND WITH THIS COMBINED FORCE HE HASTENED TO ATTACK LORD ELCHO WHO LAY AT PERTH WITH AN ARMY OF SIX THOUSAND MEN ASSEMBLED UPON THE FIRST NEWS OF THE IRISH INVASION DREADING THE SUPERIOR POWER OF ARGYLE WHO HAVING JOINED HIS VASSALS TO A FORCE LEVIED BY THE PUBLIC WAS APPROACHING WITH A CONSIDERABLE ARMY MONTROSE HASTENED NORTHWARDS IN ORDER TO ROUSE AGAIN THE MARQUIS OF HUNTLEY AND THE GORDONS WHO HAVING BEFORE HASTILY TAKEN ARMS HAD BEEN INSTANTLY SUPPRESSED BY THE COVENANTERS THIS NOBLEMAN'S CHARACTER THOUGH CELEBRATED FOR POLITICAL COURAGE AND CONDUCT WAS VERY LOW FOR MILITARY PROWESS AND AFTER SOME SKIRMISHES IN WHICH HE WAS WORSTED HE HERE ALLOWED MONTROSE TO ESCAPE HIM BY QUICK MARCHES THROUGH THESE INACCESSIBLE MOUNTAINS THAT GENERAL FREED HIMSELF FROM THE SUPERIOR FORCES OF THE COVENANTERS WITH THESE AND SOME REENFORCEMENTS OF THE ATHOLEMEN AND MACDONALDS WHOM HE HAD RECALLED MONTROSE FELL SUDDENLY UPON ARGYLE'S COUNTRY AND LET LOOSE UPON IT ALL THE RAGE OF WAR CARRYING OFF THE CATTLE BURNING THE HOUSES AND PUTTING THE INHABITANTS TO THE SWORD THIS SEVERITY BY WHICH MONTROSE SULLIED HIS VICTORIES WAS THE RESULT OF PRIVATE ANIMOSITY AGAINST THE CHIEFTAIN AS MUCH AS OF ZEAL FOR THE PUBLIC CAUSE ARGYLE COLLECTING THREE THOUSAND MEN MARCHED IN QUEST OF THE ENEMY WHO HAD RETIRED WITH THEIR PLUNDER AND HE LAY AT INNERLOCHY SUPPOSING HIMSELF STILL AT A CONSIDERABLE DISTANCE FROM THEM BY A QUICK AND UNEXPECTED MARCH MONTROSE HASTENED TO INNERLOCHY AND PRESENTED HIMSELF IN ORDER OF BATTLE BEFORE THE SURPRISED BUT NOT AFFRIGHTENED COVENANTERS HIS CONDUCT AND PRESENCE OF MIND IN THIS EMERGENCE APPEARED CONSPICUOUS MONTROSE WEAK IN CAVALRY HERE LINED HIS TROOPS OF HORSE WITH INFANTRY AND AFTER PUTTING THE ENEMY'S HORSE TO ROUT FELL WITH UNITED FORCE UPON THEIR FOOT WHO WERE ENTIRELY CUT IN PIECES THOUGH WITH THE LOSS OF THE GALLANT LORD GORDON ON THE PART OF THE ROYALISTS FROM THE SAME MEN NEW REGIMENTS AND NEW COMPANIES WERE FORMED DIFFERENT OFFICERS APPOINTED AND THE WHOLE MILITARY FORCE PUT INTO SUCH HANDS AS THE INDEPENDENTS COULD RELY ON BESIDES MEMBERS OF PARLIAMENT WHO WERE EXCLUDED MANY OFFICERS UNWILLING TO SERVE UNDER THE NEW GENERALS THREW UP THEIR COMMISSIONS AND UNWARILY FACILITATED THE PROJECT OF PUTTING THE ARMY ENTIRELY INTO THE HANDS OF THAT FACTION THOUGH THE DISCIPLINE OF THE FORMER PARLIAMENTARY ARMY WAS NOT CONTEMPTIBLE A MORE EXACT PLAN WAS INTRODUCED AND RIGOROUSLY EXECUTED BY THESE NEW COMMANDERS VALOR INDEED WAS VERY GENERALLY DIFFUSED OVER THE ONE PARTY AS WELL AS THE OTHER DURING THIS PERIOD DISCIPLINE ALSO WAS ATTAINED BY THE FORCES OF THE PARLIAMENT BUT THE PERFECTION OF THE MILITARY ART IN CONCERTING THE GENERAL PLANS OF ACTION AND THE OPERATIONS OF THE FIELD SEEMS STILL ON BOTH SIDES TO HAVE BEEN IN A GREAT MEASURE WANTING",
+   "rtfx": 62.309717469463536,
+   "wer": 0.04538341158059468
+  }
+ ]
+}
