@@ -201,6 +201,8 @@ static_assert(sizeof(GgufRotationParams) == 4, "GGUF rotation parameters are 4 b
 // W_p[n][k] for rows r < rows, W_p the values as stored
 // ([output_size[p]][input_size]).
 #define GGUF_FLOAT_PROJECTIONS 2u
+// K parts of the projections of few rows (gguf_float_few_*), a simdgroup each.
+#define GGUF_FLOAT_FEW_SPLITS 32u
 struct GgufFloatParams {
   uint32_t rows;
   uint32_t input_size;                          // K, a multiple of 8

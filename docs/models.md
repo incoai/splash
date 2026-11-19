@@ -799,7 +799,9 @@ implicitly.
 one, a GGUF serves text only. An MLX target uses its own vision tower unless
 `--language-only` is set. `--revision` cannot be combined with `--model-dir`,
 and `--mmproj` requires `--model-dir` and cannot be combined with
-`--language-only`. Files are linked, and each start prepares them again under
+`--language-only`. `--lora` names the directory of a
+[LoRA adapter](#lora-adapters) for the target and requires `--model-dir`
+too. Files are linked, and each start prepares them again under
 the same validation, publication and lifetime rules described below.
 
 An application that downloads models itself prepares them for the server
@@ -842,6 +844,8 @@ model's source options (`--revision`, `--draft-model`, `--language-only`,
   one, a GGUF target serves text only, and a target of a family without a
   vision tower refuses one. An MLX target serves images with the tower in
   its checkpoint unless `language_only=True`.
+- `lora`: the directory of a PEFT LoRA adapter trained for the target
+  ([LoRA adapters](#lora-adapters)), which the engine applies as it runs.
 - `models_dir`: where prepared models are kept, Splash's own models
   directory by default ([files Splash writes](server.md#files-splash-writes)).
 
@@ -867,6 +871,46 @@ Nothing else in `install/` is public, nor is the layout of the prepared
 directory, which is the server's and the engine's of the release that
 prepared it: after an upgrade, prepare again, as `splash serve` installs at
 every start.
+
+## LoRA adapters
+
+`splash serve --model-dir PATH --lora DIR` serves the target with the PEFT
+LoRA adapter in `DIR`, its `adapter_config.json` and
+`adapter_model.safetensors` as `peft` saves them:
+
+```sh
+splash serve --model local/qwen-coder \
+  --model-dir /models/Qwen3.8-27B-4bit \
+  --lora /models/my-adapter
+```
+
+The engine applies the adapter as it runs instead of merging it into the
+weights: a quantized weight cannot take an update smaller than its own
+rounding, so each adapted projection computes `W x + (alpha / r) B (A x)`
+with `W` as quantized and `A` and `B` in BF16. The adapter is part of the
+prepared model, as a projector is: its digest is in the assembly's record, so
+a retrained adapter is another model with its own SSD cache entries, and
+serving another adapter, or none, takes a restart with another `--lora`.
+
+An adapter is one for the served target's architecture: its modules are the
+layers' `self_attn.q_proj`, `k_proj`, `v_proj` and `o_proj` and, on a target
+with a dense FFN, `mlp.gate_proj`, `up_proj` and `down_proj`, each of the
+projection's shape, in F32, F16 or BF16. A layer whose mixer is not an
+attention has no `self_attn` modules, and a MoE layer's FFN none. The engine
+refuses at startup an adapter with a tensor of any other name, a module that
+does not match its projection, and a configuration that changes what a module
+computes: DoRA, a bias, `modules_to_save`, per-module ranks or alphas
+(`rank_pattern`, `alpha_pattern`) and `fan_in_fan_out`. rsLoRA's scale,
+`alpha / sqrt(r)`, is applied. An adapter trained on the unquantized model
+runs on any quantization of it, GGUF or MLX; an adapter trained with a chat
+template of its own needs that template too
+([custom chat templates](#custom-chat-templates)).
+
+An adapter costs its own size in memory at BF16, about 300 MB at rank 32 on
+every module of Qwen3.8-27B, with up to 100 MB of prefill scratch, and
+some speed: on a 20-core M5 Pro with Qwen3.8-27B MLX 4-bit and that adapter a
+decode cycle takes 3% longer and a 9K-token prompt prefills 5% slower
+([how it runs](internals.md#lora-updates)).
 
 ## Splash packages
 

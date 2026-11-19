@@ -236,7 +236,11 @@ def _prepare_local_model(args):
         "--models",
         str(paths.MODELS),
     ]
-    for flag, value in (("--draft-model", args.draft_model), ("--mmproj", args.mmproj)):
+    for flag, value in (
+        ("--draft-model", args.draft_model),
+        ("--mmproj", args.mmproj),
+        ("--lora", args.lora),
+    ):
         if value is not None:
             command = [*command, flag, value]
     if args.language_only:
@@ -718,6 +722,13 @@ def parse_args(argv=None):
         help="local GGUF vision projector (requires --model-dir)",
     )
     model.add_argument(
+        "--lora",
+        type=_local_path,
+        metavar="DIR",
+        help="local PEFT LoRA adapter directory, applied to the model as it runs "
+        "(requires --model-dir)",
+    )
+    model.add_argument(
         "--revision",
         metavar="REVISION",
         help="model branch, tag or commit (default: the repository's default branch)",
@@ -780,6 +791,8 @@ def parse_args(argv=None):
                 )
         elif args.mmproj is not None:
             parser.error("--mmproj requires --model-dir")
+        elif args.lora is not None:
+            parser.error("--lora requires --model-dir")
         if args.mmproj is not None and args.language_only:
             parser.error("--mmproj cannot be used with --language-only")
         serve_options.check_serve_arguments(parser, args)

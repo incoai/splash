@@ -136,6 +136,11 @@ const SourceTensor *SafetensorsCheckpoint::find(std::string_view name) const noe
   const auto found = impl_->tensors.find(name);
   return found == impl_->tensors.end() ? nullptr : &found->second;
 }
+std::vector<std::string_view> SafetensorsCheckpoint::names() const {
+  std::vector<std::string_view> names;
+  for (const auto &[name, tensor] : impl_->tensors) names.push_back(name);
+  return names;
+}
 const SourceTensor &SafetensorsCheckpoint::require(std::string_view name) const {
   const SourceTensor *tensor = find(name);
   if (!tensor) throw WeightStoreError("missing source tensor: " + std::string(name));

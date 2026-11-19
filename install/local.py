@@ -38,14 +38,20 @@ import tempfile
 from contextlib import redirect_stdout
 from pathlib import Path
 
-from . import hub, models, paths, upstream
+from . import assembly, hub, models, paths, upstream
 from .models import ModelError
 
 __all__ = ["ModelError", "prepare_local_model"]
 
 
 def prepare_local_model(
-    target, draft=None, *, mmproj=None, language_only=False, models_dir=paths.MODELS
+    target,
+    draft=None,
+    *,
+    mmproj=None,
+    lora=None,
+    language_only=False,
+    models_dir=paths.MODELS,
 ):
     """Prepare the target and its DFlash2 draft for the server, and return
     the directory the server loads, an absolute pathlib.Path.
@@ -65,6 +71,12 @@ def prepare_local_model(
     family without a vision tower (Flint) always does. An MLX target's
     vision tower is in its checkpoint, and it serves images unless
     language_only.
+    lora: the directory of a PEFT LoRA adapter trained for the target
+    (adapter_config.json and adapter_model.safetensors), which the engine
+    applies to the target's projections as it runs, the quantized weights
+    unchanged. Its modules are those of the layers' attention and dense FFN
+    projections (q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj,
+    down_proj) at one rank; the engine refuses any other when it loads.
     language_only: serve text only.
     models_dir: where prepared models are kept, Splash's own models
     directory by default. Preparations there run one at a time, beside the
@@ -89,21 +101,22 @@ def prepare_local_model(
     """
     target = _path(target)
     try:
-        return _prepare_paths(target, draft, mmproj, language_only, models_dir)
+        return _prepare_paths(target, draft, mmproj, lora, language_only, models_dir)
     except ModelError as error:
         raise type(error)(f"cannot prepare {target}: {error}") from None
 
 
-def _prepare_paths(target, draft, mmproj, language_only, models_dir):
+def _prepare_paths(target, draft, mmproj, lora, language_only, models_dir):
     """prepare_local_model of an absolute target, whose ModelError gives the
     reason alone."""
     draft = None if draft is None else _path(draft)
     mmproj = None if mmproj is None else _path(mmproj)
+    lora = None if lora is None else _path(lora)
     models_root = Path(models_dir).expanduser().resolve()
-    return _prepare(target, draft, mmproj, language_only, models_root)
+    return _prepare(target, draft, mmproj, lora, language_only, models_root)
 
 
-def _prepare(target, draft, mmproj, language_only, models_root):
+def _prepare(target, draft, mmproj, lora, language_only, models_root):
     """prepare_local_model, of its paths made absolute."""
     if mmproj and language_only:
         raise ModelError(
@@ -119,16 +132,31 @@ def _prepare(target, draft, mmproj, language_only, models_root):
         raise ModelError(
             f"mmproj {mmproj} is not a file: a vision projector is a GGUF file"
         )
+    adapter = _lora_files(lora) if lora else {}
     link = models.local_selection_link(
-        models_root, target, draft, mmproj, language_only
+        models_root, target, draft, mmproj, language_only, lora
     )
     with tempfile.TemporaryDirectory(prefix="splash-target-") as scratch:
         source, inspected = _inspect(target, mmproj, language_only, Path(scratch))
         repo = _draft(inspected.family, draft)
         files = upstream.draft_files(repo, inspected)
     files |= {path: source.paths[name] for path, name in inspected.files.items()}
+    files |= adapter
     record = upstream.assembly_record(str(target), inspected, source, repo)
     return upstream.publish(models_root, link, record, files)
+
+
+def _lora_files(lora):
+    """The assembly's files of the PEFT LoRA adapter in the directory lora
+    (assembly.LORA_FILES), which the engine checks as it loads them."""
+    files = {"lora/" + name: lora / name for name in assembly.LORA_FILES}
+    missing = [path.name for path in files.values() if not path.is_file()]
+    if missing:
+        raise ModelError(
+            f"lora {lora} is not a PEFT LoRA adapter's directory: it holds no "
+            + " and no ".join(missing)
+        )
+    return files
 
 
 def _path(value) -> Path:
@@ -284,6 +312,7 @@ def _main(argv=None):
     parser.add_argument("--models", type=Path, default=paths.MODELS)
     parser.add_argument("--draft-model")
     parser.add_argument("--mmproj")
+    parser.add_argument("--lora")
     parser.add_argument("--language-only", action="store_true")
     args = parser.parse_args(argv)
     try:
@@ -293,6 +322,7 @@ def _main(argv=None):
                 _path(args.target),
                 args.draft_model,
                 args.mmproj,
+                args.lora,
                 args.language_only,
                 args.models,
             )

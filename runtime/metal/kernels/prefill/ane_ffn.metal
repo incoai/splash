@@ -256,7 +256,7 @@ kernel void ane_ffn_join(device bfloat *output [[buffer(0)]],
     staged[j][position.x] = float(value);
   }
   if (position.y == 0) {
-    const half intermediate = partial[params.hidden * params.stride + token], input = token_scale[token];
+    const half intermediate = partial[params.scale_row * params.stride + token], input = token_scale[token];
     finite &= !(chunk && (ane_ffn_not_finite(intermediate) || ane_ffn_not_finite(input)));
     scale[position.x] = float(intermediate) * float(input);
   }
@@ -266,5 +266,89 @@ kernel void ane_ffn_join(device bfloat *output [[buffer(0)]],
     if (row + j >= params.rows) continue;
     const uint index = (row + j) * params.hidden + channel + position.x;
     output[index] = bfloat(float(output[index]) + staged[position.x][j] * scale[j]);
+  }
+}
+
+// ---------------- LoRA beside the split (metal/abi/AneFfn.h).
+// The ANE's input of a module's rows t, over each token's scale.
+kernel void ane_ffn_lora_inputs(device const bfloat *t [[buffer(0)]],
+                                device const half *token_scale [[buffer(1)]],
+                                device half *packed [[buffer(2)]],
+                                constant AneFfnLoraInputParams &params [[buffer(3)]],
+                                uint index [[thread_position_in_grid]]) {
+  const uint token = index / params.rank, j = index % params.rank;
+  if (token >= params.rows) return;
+  const float value = float(t[ulong(token) * params.source_stride + params.source_offset + j]) * params.scale /
+                      float(token_scale[token]);
+  packed[j * params.stride + token] = half(clamp(value, -65504.0f, 65504.0f));
+}
+
+// A layer's int8 codes of down's rotated A into a staging set's weights.
+kernel void ane_ffn_lora_codes(device const char *source [[buffer(0)]],
+                               device char *rows [[buffer(1)]],
+                               constant AneFfnLoraRowsParams &params [[buffer(2)]],
+                               uint2 at [[thread_position_in_grid]]) {
+  if (at.x >= params.width || at.y >= params.rows) return;
+  rows[ulong(params.row + at.y) * params.stride + params.column + at.x] =
+      source[ulong(at.y) * params.source_stride + params.source_offset + at.x];
+}
+// Gate's and up's rows of B, and the row scales of down's rotated A, into a staging set.
+kernel void ane_ffn_lora_rows(device const bfloat *source [[buffer(0)]],
+                              device uchar *rows [[buffer(1)]],
+                              constant AneFfnLoraRowsParams &params [[buffer(2)]],
+                              uint2 at [[thread_position_in_grid]]) {
+  if (at.x >= params.width || at.y >= params.rows) return;
+  device half *row = (device half *)(rows + ulong(params.row + at.y) * params.stride);
+  row[params.column + at.x] =
+      half(float(source[ulong(at.y) * params.source_stride + params.source_offset + at.x]) * params.scale);
+}
+
+// Down's t of the chunk: the GPU's part plus the ANE's.
+kernel void ane_ffn_lora_down(device const float *gpu [[buffer(0)]],
+                              device const half *partial [[buffer(1)]],
+                              device const half *token_scale [[buffer(2)]],
+                              device bfloat *t [[buffer(3)]],
+                              device atomic_uint *status [[buffer(4)]],
+                              constant AneFfnLoraDownParams &params [[buffer(5)]],
+                              uint index [[thread_position_in_grid]]) {
+  const uint token = index / params.rank, j = index % params.rank;
+  if (token >= params.rows) return;
+  const half value = partial[(params.hidden + j) * params.stride + token],
+             intermediate = partial[(params.hidden + params.rank) * params.stride + token], input = token_scale[token];
+  if (ane_ffn_not_finite(value) || ane_ffn_not_finite(intermediate) || ane_ffn_not_finite(input))
+    atomic_store_explicit(status, 1u, memory_order_relaxed);
+  t[index] = bfloat(gpu[index] + float(value) * float(intermediate) * float(input) * params.scale);
+}
+
+// ane_ffn_join with down's correction delta [rows][hidden] added before the output is rounded.
+kernel void ane_ffn_join_lora(device bfloat *output [[buffer(0)]],
+                              device const half *partial [[buffer(1)]],
+                              device const half *token_scale [[buffer(2)]],
+                              device atomic_uint *status [[buffer(3)]],
+                              device const bfloat *delta [[buffer(4)]],
+                              constant AneFfnJoinParams &params [[buffer(5)]],
+                              uint2 tile [[threadgroup_position_in_grid]],
+                              uint2 position [[thread_position_in_threadgroup]]) {
+  threadgroup float staged[ANE_FFN_TILE][ANE_FFN_TILE + 1];
+  threadgroup float scale[ANE_FFN_TILE];
+  const uint row = tile.x * ANE_FFN_TILE, channel = tile.y * ANE_FFN_TILE, token = row + position.x;
+  const bool chunk = token < params.rows;
+  bool finite = true;
+  for (uint j = position.y; j < ANE_FFN_TILE; j += ANE_FFN_TILE_ROWS) {
+    const half value = partial[(channel + j) * params.stride + token];
+    finite &= !(chunk && ane_ffn_not_finite(value));
+    staged[j][position.x] = float(value);
+  }
+  if (position.y == 0) {
+    const half intermediate = partial[params.scale_row * params.stride + token], input = token_scale[token];
+    finite &= !(chunk && (ane_ffn_not_finite(intermediate) || ane_ffn_not_finite(input)));
+    scale[position.x] = float(intermediate) * float(input);
+  }
+  if (!finite) atomic_store_explicit(status, 1u, memory_order_relaxed);
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  for (uint j = position.y; j < ANE_FFN_TILE; j += ANE_FFN_TILE_ROWS) {
+    if (row + j >= params.rows) continue;
+    const uint index = (row + j) * params.hidden + channel + position.x;
+    output[index] = bfloat(float(output[index]) + staged[position.x][j] * scale[j] + float(delta[index]));
   }
 }

@@ -5,6 +5,7 @@
 #include <filesystem>
 #include <memory>
 #include <string_view>
+#include <vector>
 
 namespace splash::model {
 
@@ -19,6 +20,8 @@ public:
   ~SafetensorsCheckpoint();
   [[nodiscard]] const SourceTensor *find(std::string_view name) const noexcept;
   [[nodiscard]] const SourceTensor &require(std::string_view name) const;
+  // Every tensor's name, in order.
+  [[nodiscard]] std::vector<std::string_view> names() const;
   void checkUnchanged() const;
 private:
   struct Impl;

@@ -263,6 +263,7 @@ ENGINE_CPP_SOURCES := \
 	runtime/ops/GDN.cpp \
 	runtime/ops/Linear.cpp \
 	runtime/ops/LinearGguf.cpp \
+	runtime/ops/Lora.cpp \
 	runtime/ops/KernelSelection.cpp \
 	runtime/ops/MoE.cpp \
 	runtime/ops/Normalization.cpp \
@@ -334,6 +335,7 @@ ENGINE_CPP_SOURCES := \
 	runtime/model/QwenTargetLoader.cpp \
 	runtime/model/DFlashDraft.cpp \
 	runtime/model/ModelFactory.cpp \
+	runtime/model/LoraAdapter.cpp \
 	runtime/model/ModelSizing.cpp \
 	runtime/model/SlotFile.cpp \
 	runtime/model/KvCopyRead.cpp \

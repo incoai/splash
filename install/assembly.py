@@ -29,6 +29,10 @@ The paths an assembly links, and what reads each:
   vision/<shard>         the MLX shards holding vision_tower.*
                          (VisionLoader.cpp, through SafetensorsCheckpoint.mm)
   vision/mmproj.gguf     the GGUF vision projector (VisionLoader.cpp)
+  lora/adapter_config.json, lora/adapter_model.safetensors
+                         a PEFT LoRA adapter the engine applies to the
+                         target as it runs (ModelDescriptor.mm,
+                         LoraAdapter.cpp)
 """
 
 from __future__ import annotations
@@ -43,6 +47,7 @@ from pathlib import Path
 from . import families, gguf, hub, models
 
 GGUF_VISION = "vision/mmproj.gguf"
+LORA_FILES = ("adapter_config.json", "adapter_model.safetensors")
 TARGET_FORMATS = ("mlx-affine", "gguf")
 VISION_FORMATS = ("none", "safetensors", "gguf")
 RECORD_KEYS = {

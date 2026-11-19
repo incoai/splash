@@ -73,6 +73,11 @@ struct ProjectionShape final {
   // names no formats bounds a projection the tile takes
   // (Linear::scratchSize).
   bool prefillInt8Formats = true;
+  // The values of a row of its LoRA update's t = A x (ProjectionLora::values);
+  // 0 without one. The linear scratch holds the rows t and, for a plan whose
+  // tile does not add the update, the plan's sums before it
+  // (Linear::scratchSize).
+  uint32_t loraValues = 0;
   auto operator<=>(const ProjectionShape &) const = default;
 };
 
@@ -153,6 +158,33 @@ struct BlockWeights final {
   std::vector<QuantizedSegment> segments;
 };
 
+// A LoRA adapter's update of a projection: a segment's output columns add
+// B (A x) of the projection's input x, B with the adapter's alpha / rank in
+// it. `a` holds the A of the projection's tensors one after another, bf16
+// rows [slots * rank][inputSize], so that one dispatch computes every t = A x
+// of an input; a segment names its tensor's slot, and segments that are
+// views of one tensor's rows share it. Every module of an adapter has the
+// one rank, padded with zeros to whole steps of the staged tile
+// (GGUF_STAGED_STEP), whose matmul adds B t (Linear::add). Without an update
+// the rank is 0.
+struct ProjectionLora final {
+  struct Segment final {
+    // bf16 rows [the segment's outputSize][rank]; none: no update.
+    metal::MetalBuffer b;
+    uint32_t slot = 0;
+  };
+  uint32_t rank = 0;
+  uint32_t slots = 0;
+  QuantizedSegment a;
+  // One per segment of the projection.
+  std::vector<Segment> segments;
+  // Tells the dither of this projection's rows from another's (lora_tile).
+  uint32_t seed = 0;
+  [[nodiscard]] explicit operator bool() const noexcept { return rank != 0; }
+  // The values of a row of t.
+  [[nodiscard]] uint32_t values() const noexcept { return slots * rank; }
+};
+
 // A projection of outputSize x inputSize. Its segments tile its leading
 // output columns in order: each takes every input and starts where the
 // previous one ends; the columns past the last are padding. A default value
@@ -187,7 +219,7 @@ public:
       bytes += n * s.format().block_bytes / s.format().block_elements;
     }
     return {outputSize, inputSize, static_cast<bool>(rotation), registerFormats, classes.formatClass(),
-            weights ? uint32_t(128 * bytes / weights) : 0, weights && prefillInt8Formats};
+            weights ? uint32_t(128 * bytes / weights) : 0, weights && prefillInt8Formats, lora.values()};
   }
 
   // Rows [first, first + count) of a projection's weights.
@@ -201,6 +233,9 @@ public:
   // rotation and destination as it does; or, of an unrotated quantized
   // tensor, over the leading `inputs` inputs of each of its rows, whole quant
   // groups and meta units, which reads its planes as they are (planeInputs()).
+  // A view of rows keeps the tensor's LoRA update over its rows; a view of
+  // leading inputs has none, its caller adding the update's share of the
+  // inputs it leaves out as well.
   [[nodiscard]] Projection rows(const metal::MetalBackend &backend, std::initializer_list<RowRange> ranges) const;
   [[nodiscard]] Projection leadingInputs(uint32_t inputs) const;
   // Whether the view of leading inputs takes it: its own planes, not a view,
@@ -218,6 +253,10 @@ public:
   // the bf16 plan.
   FloatOutput destination = FloatOutput::BFloat16;
   InputRotation rotation;
+  // The projection's LoRA update, which Linear adds wherever it runs the
+  // projection; a loader attaches it (one ProjectionLora::Segment per
+  // segment).
+  ProjectionLora lora;
 
 private:
   BlockWeights weights_;

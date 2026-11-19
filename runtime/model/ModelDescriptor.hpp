@@ -42,6 +42,17 @@ template <class Use> constexpr void forEachFamily(Use use) {
 enum class TargetSource : uint8_t { Safetensors = 1, Gguf };
 enum class VisionSource : uint8_t { Safetensors = 1, Gguf, None };
 
+// A LoRA adapter the model's root holds beside its target, in lora/
+// (model/LoraAdapter.hpp): every module has `rank`, and its update is
+// `scale` B (A x), the adapter's lora_alpha over its rank.
+struct LoraAdapterLayout final {
+  uint32_t rank = 0;
+  float scale = 0.0f;
+  // The most rank an adapter may have.
+  static constexpr uint32_t kMaximumRank = 256;
+  bool operator==(const LoraAdapterLayout &) const = default;
+};
+
 // A model's metadata, validated before its weight buffers are loaded. The
 // engine consumes capabilities; model loading consumes the concrete layouts.
 struct ModelDescriptor final {
@@ -63,6 +74,8 @@ struct ModelDescriptor final {
   // The target's RoPE scaling (servedFor), which stretches the window
   // capabilities states beyond the layout's native one.
   RopeScaling ropeScaling;
+  // The target's LoRA adapter, if its root holds one.
+  std::optional<LoraAdapterLayout> lora;
 
   // A model installed with --language-only has no vision tower: it loads no
   // vision weights and serves no image requests.
