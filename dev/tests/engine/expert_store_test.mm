@@ -377,13 +377,13 @@ bool slotsHoldTheirExperts(const Model &m, const BlockMoeWeights &streamed, cons
 
 // A format of experts and whether an MLX checkpoint stores them (its stored planes) rather than a GGUF.
 using StreamedFormat = std::pair<int, bool>;
-// GGUF experts, then an MLX checkpoint's: affine gate and up in 4, 3, 2 and 8 bits (and down in the next affine
-// format that fits), and mxfp4's.
+// GGUF experts, then an MLX checkpoint's: affine gate and up in 4 bits in groups of 32 and of 64 (mlx-lm's
+// default), 3, 2 and 8 bits (and down in the next affine format that fits), and mxfp4's.
 int streamedExperts(MetalBackend &backend, const MoeShape &shape, const std::filesystem::path &directory,
                     std::initializer_list<StreamedFormat> formatList = {
                         {IQ2S, false}, {IQ3S, false}, {IQ3XXS, false}, {Q4K, false}, {Q80, false}, {IQ4NL, false},
-                        {MXFP4, false}, {Q20, false}, {GGUF_FMT_AF4G32, true}, {GGUF_FMT_AF3G64, true},
-                        {GGUF_FMT_AF2G64, true}, {GGUF_FMT_AF8G32, true}, {MXFP4, true}}) {
+                        {MXFP4, false}, {Q20, false}, {GGUF_FMT_AF4G32, true}, {GGUF_FMT_AF4G64, true},
+                        {GGUF_FMT_AF3G64, true}, {GGUF_FMT_AF2G64, true}, {GGUF_FMT_AF8G32, true}, {MXFP4, true}}) {
   int failures = 0;
   uint64_t decodePrefetched = 0;
   for (const auto [f, mlx] : formatList) {
@@ -1529,6 +1529,58 @@ int streamedStartsAtItsFloor(MetalBackend &backend, const MoeShape &shape, const
 // one admission, and regrows bring them back to their caps. Every block's decode steps and
 // prefill chunks give the resident experts' bits at every step, their slots
 // holding their planes, the size of one block reading nothing.
+// Two MLX layouts in one streamed store, their blocks in turn as a checkpoint
+// of mixed bit widths by layer holds them (mlx-community's
+// Qwen3.8-Flash-Next-OptiQ-2bit: affine 2-bit in most layers, 4-bit in the
+// rest), each read as its stored planes into places sized for the larger
+// layout: every block's streamed experts compute what its resident ones do,
+// and every routed expert's slot holds its planes, over decode steps and
+// prefill chunks whose loads evict the other blocks' experts and read the
+// next block ahead across layouts.
+int streamedMlxLayouts(MetalBackend &backend, const MoeShape &shape, const std::filesystem::path &directory) {
+  const Model low = makeModel(backend, shape, GGUF_FMT_AF2G64, true), high = makeModel(backend, shape, GGUF_FMT_AF4G64, true);
+  ExpertFile lowFile(low, directory / "low.bin", true), highFile(high, directory / "high.bin", true);
+  StreamedBlocks blocks = lowFile.blocks;
+  blocks.blocks = {lowFile.blocks.blocks[0], highFile.blocks.blocks[0], lowFile.blocks.blocks[1],
+                   highFile.blocks.blocks[1]};
+  blocks.checks.push_back(highFile.blocks.checks.front());
+  const Model *models[] = {&low, &high, &low, &high};
+  const uint64_t slots = shape.experts + 3;
+  ExpertStore store(backend, blocks, shape,
+                    storeOptions(arenaBytes(low, slots) + arenaBytes(high, slots) + kSpareBytes, blocks, shape));
+  growToCap(store);
+  std::array<BlockMoeWeights, 4> streamed{low.weights, high.weights, low.weights, high.weights};
+  for (uint32_t block = 0; block < 4; ++block) store.bind(block, streamed[block]);
+  Buffers b;
+  int failures = 0;
+  const StepPlan plans[] = {decodeStep(shape, 1), decodeStep(shape, 4), prefillStep(shape, 27),
+                            decodeStep(shape, 3), prefillStep(shape, 9), shortLanesStep(shape),
+                            decodeStep(shape, 2), prefillStep(shape, 64)};
+  for (const StepPlan &step : plans)
+    for (uint32_t block = 0; block < 4; ++block) {
+      const bool prefill = !step.lanes;
+      if (block == 0 || prefill) freshRows(backend, b, shape);
+      const std::string label = std::string("MLX af2g64/af4g64 blocks ") + (prefill ? "prefill rows=" : "decode rows=") +
+                                std::to_string(step.plan.rows()) + " block " + std::to_string(block);
+      const std::vector<uint16_t> want = runWeights(backend, models[block]->weights, b, step);
+      const std::vector<uint16_t> got = runWeights(backend, streamed[block], b, step);
+      if (got != want) {
+        printf("  %s: streamed experts' output differs from the resident experts' FAIL\n", label.c_str());
+        ++failures;
+      } else if (!slotsHoldTheirExperts(*models[block], streamed[block], b, step.plan)) {
+        printf("  %s: a routed expert's slot differs from its reference planes FAIL\n", label.c_str());
+        ++failures;
+      }
+    }
+  if (!store.stats().failure.empty()) {
+    printf("  MLX af2g64/af4g64 blocks: the store failed: %s FAIL\n", store.stats().failure.c_str());
+    ++failures;
+  }
+  printf("%-26s streamed decode B1-4, prefill 9/27/64 over four blocks of two layouts, bitwise the resident experts' "
+         "%s\n", "MLX af2g64/af4g64", failures ? "FAIL" : "ok");
+  return failures;
+}
+
 int streamedElasticSizes(MetalBackend &backend, const MoeShape &shape, const std::filesystem::path &directory) {
   using splash::model::ExpertChunkLayout;
   const Model big = makeModel(backend, shape, Q80, true), small = makeModel(backend, shape, Q5K, true),
@@ -1878,6 +1930,7 @@ int main(int argc, const char *argv[]) {
                     streamedElastic(backend, shape, directory.path()) +
                     streamedPool(backend, shape, directory.path()) +
                     streamedElasticSizes(backend, shape, directory.path()) +
+                    streamedMlxLayouts(backend, shape, directory.path()) +
                     streamedStartsAtItsFloor(backend, shape, directory.path()) +
                     streamedSkippedLoadAfterShrink(argv[1], shape, directory.path()) +
                     streamedChunkLimit(backend, shape, directory.path()) +
