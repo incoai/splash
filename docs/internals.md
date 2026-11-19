@@ -146,8 +146,8 @@ files they leave. A launcher run without writing bytecode (`-B` or
 `PYTHONDONTWRITEBYTECODE`) sets `PYTHONDONTWRITEBYTECODE=1` in its environment
 before `serve` starts anything, so the installer and the server write none
 either, nor do the server's PDF workers, which start with `-B` and no
-environment, and a packaged runtime inside a signed app never gains
-`__pycache__`.
+environment, and a packaged runtime inside a signed app gains no bytecode
+beside what it ships.
 
 `hub.Repository.resolve` alone decides whether a start asks the Hub
 ([Revisions](server.md#revisions)), each request within `hub.HUB_TIMEOUT`:

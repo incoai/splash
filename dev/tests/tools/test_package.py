@@ -1,6 +1,7 @@
 import contextlib
 import fcntl
 import hashlib
+import importlib.util
 import io
 import json
 import os
@@ -76,7 +77,7 @@ class PackageTests(unittest.TestCase):
                     mock.patch("sys.stdout"),
                 ):
                     package.main(["--version", version, "--macos-min", "26.4"])
-                self.assertEqual(run.call_count, 4)
+                self.assertEqual(run.call_count, 5)
                 with tarfile.open(
                     root / f"dist/splash-{version}-arm64-macos26.tar.gz"
                 ) as archive:
@@ -194,7 +195,7 @@ class PackageTests(unittest.TestCase):
                 json.loads((stage / "release.json").read_text())["version"], "test"
             )
 
-    def test_runtime_keeps_the_interpreter_and_no_script_or_bytecode(self):
+    def test_runtime_keeps_the_interpreter_no_script_and_its_own_bytecode(self):
         # The release archive and Splash.app ship the stage as it is: neither
         # filters it, and the app's signature seals it.
         with tempfile.TemporaryDirectory() as temporary:
@@ -217,6 +218,8 @@ class PackageTests(unittest.TestCase):
                 ),
             )
 
+            compile_for_real = subprocess.run
+
             def run(command, **options):
                 # pip installs a console script naming the stage, and its own
                 # run leaves bytecode.
@@ -227,6 +230,9 @@ class PackageTests(unittest.TestCase):
                     cache = stage / library / "site-packages/pip/__pycache__"
                     cache.mkdir(parents=True)
                     (cache / "__init__.cpython-313.pyc").write_bytes(b"")
+                # The compiler runs, with this interpreter for the stage's.
+                if "compileall" in command:
+                    return compile_for_real([sys.executable, *command[1:]], **options)
                 return subprocess.CompletedProcess(command, 0)
 
             with (
@@ -240,9 +246,21 @@ class PackageTests(unittest.TestCase):
                 {"python3", "python3.13"},
             )
             self.assertTrue((stage / library / "os.py").is_file())
-            self.assertEqual(list(stage.rglob("__pycache__")), [])
+            # The bytecode the stage holds is its sources' alone, compiled
+            # anew, each checked by no time stamp or hash (flags 0b01), which
+            # an installer's copy would otherwise make stale.
+            self.assertEqual(
+                {
+                    pyc: int.from_bytes(pyc.read_bytes()[4:8], "little")
+                    for pyc in stage.rglob("*.pyc")
+                },
+                {
+                    Path(importlib.util.cache_from_source(source)): 0b01
+                    for source in stage.rglob("*.py")
+                },
+            )
             # The smoke tests run the stage as Splash does, writing no bytecode.
-            pip, *smoke = (call.args[0] for call in runs.call_args_list)
+            pip, *smoke, _ = (call.args[0] for call in runs.call_args_list)
             self.assertEqual(pip[1:4], ["-m", "pip", "install"])
             self.assertEqual(len(smoke), 3)
             for command in smoke:

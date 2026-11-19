@@ -40,8 +40,13 @@ bottle on a supported Mac without developer tools; building from the source tree
 is not an installation check.
 
 The runtime package allowlists engine, Python, server and launcher files; tests,
-benchmarks and developer documents are excluded. User model links survive
-upgrades; downloads remain in the Hugging Face cache.
+benchmarks and developer documents are excluded. It ships its modules'
+bytecode, compiled at the build, as the runtime writes none and each process
+would otherwise compile what it imports (a one-shot `splash --version` starts
+in 47 ms instead of 170, the server's imports take 0.53 s instead of 1.14); it
+is checked by no time stamp, as the signed runtime's sources never change, and
+each build writes the same bytes. User model links survive upgrades; downloads
+remain in the Hugging Face cache.
 
 ## Desktop app
 
