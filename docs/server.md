@@ -456,7 +456,9 @@ cache](#kv-on-the-ssd) holds it names its lane, tokens and
 ### PLE table streaming
 
 Qwen3.8-Flash-Next's PLE n-gram table (`per_layer_token_embd.weight`, 320M rows
-of 160 values, 28.8 GB in IQ4_NL; other row widths come from GGUF metadata)
+of 160 values, 28.8 GB in IQ4_NL; other row widths come from GGUF metadata;
+an MLX checkpoint's is its shards `ple.ple_embedding.ngram_embedding.shards.N`
+of quantized rows, each row read as its codes, scales and biases)
 is read by a handful of rows per token: 16 per position, eight heads each of
 the 2- and 3-gram hashes of the token and the tokens before it. With
 `--ple-memory auto`, the default ([memory and context](#memory-and-context)),
@@ -582,6 +584,19 @@ off` loads every expert, as a SIZE that holds them all does.
   staging (`F_NOCACHE`, widened to whole 16 KiB pages, which the kernel reads
   without the buffer cache: an M5 Pro reads 460 KiB pieces from four threads
   at 9.3 GB/s instead of 8.1, with less than half the CPU).
+- An MLX checkpoint's experts are read the same way as the checkpoint stores
+  them: each projection's codes, scales and biases, nine ranges an expert,
+  and the repack kernel builds the slot's planes from them, bitwise those of
+  the expert loaded whole. Experts a checkpoint stores otherwise (NVFP4 or FP8
+  with a tensor scale, rows the image permutes) are built on the CPU. At the
+  engine's 32 readers an SSD reads these ranges by their bytes: one range an
+  expert reads within 3-12% of nine on a 48 GB M5 Pro and a 24 GB M6, so an
+  MLX target streams at its experts' bytes, 3.1 MB an expert for
+  `mlx-community/Qwen3.8-Flash-Next-4bit` against 1.4 MB for the Q2_0 GGUF.
+  That checkpoint serves by its Hub name (`splash serve --model
+  mlx-community/Qwen3.8-Flash-Next-4bit`, its DFlash2 draft chosen as for the
+  GGUF), its experts and PLE table streamed by default on a Mac that cannot
+  hold its 104 GB.
 - While the GPU repacks a round or runs a layer, the next round's experts or
   the next block's likely experts are read ahead: those the next block's
   router picks from this block's input in a load of a cycle's rows; after a
