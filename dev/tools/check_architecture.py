@@ -229,7 +229,8 @@ NOTE_ALLOWANCE: dict[str, int] = {
 # owner raises it. 30,671 is 1.7.0's 30,594 and 77 more, for the SSD cache's
 # off reason, its reads and a request's reuse in /status and usage, the
 # automatic budget's unwired tenth and a state at a prompt's head.
-ENGINE_LINE_BUDGET = 30_671
+# 30,672: +1 for forgetting a lane count's remembered step costs.
+ENGINE_LINE_BUDGET = 30_672
 C_LIKE_SUFFIXES = SOURCE_SUFFIXES | {".swift"}
 HASH_COMMENT_SUFFIXES = {"", ".sh", ".bash", ".fish", ".mk", ".yml", ".yaml", ".toml"}
 C_LIKE_COMMENT = re.compile(

@@ -96,6 +96,9 @@ public:
   // The classes of `lanes` lanes' steps and their measured costs
   // (StepCosts::points); none without --verify-rows auto.
   [[nodiscard]] static std::vector<StepCosts::Point> stepPoints(const Runtime &runtime, uint32_t lanes);
+  // The level check of the tables its start recalled: their largest step of
+  // the first warmup's lanes over that step's median now (none without one).
+  [[nodiscard]] static std::optional<double> levelRatio(const Runtime &runtime);
   // While capturing, each command that selects first tokens or verifies
   // copies the rows lastLogits returns, as the target's forward wrote them
   // before the policy rewrites them in place: for each of its batch lanes,

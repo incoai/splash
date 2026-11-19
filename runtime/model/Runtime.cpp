@@ -44,6 +44,7 @@
 #include <numeric>
 #include <optional>
 #include <span>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -562,6 +563,11 @@ struct Runtime::Impl {
   // Keeping the step costs this start measures on this Mac, beside those
   // earlier starts did (RuntimeContext::recallStepCosts).
   std::function<void(uint32_t lanes, std::string_view line)> rememberStepCosts;
+  std::function<void(uint32_t lanes)> forgetStepCosts;
+  // Whether a decode warmup ran, the first of which checks the level of the
+  // tables an earlier start measured (StepCosts::kStale), and whether this
+  // start measured a table, whose set replaces the kept one.
+  bool warmedUp = false, measuredSteps = false;
   // The fewest rows of each class of a decode step's kernels, up to the most
   // rows a step runs in one pass (ops::ExecutionPlans::decodeRowClasses).
   std::vector<uint32_t> stepClasses;
@@ -710,6 +716,9 @@ struct Runtime::Impl {
   // The choices of the cycles the budget sized (RuntimeInstrumentation::
   // takeStepChoices).
   std::vector<RuntimeInstrumentation::StepChoice> stepChoices;
+  // The level check's remembered cost of its step over its median now
+  // (RuntimeInstrumentation::levelRatio; none without a check).
+  std::optional<double> levelRatio;
   // The tokens a constrained request's next cycle gives rows of its tree,
   // by request (RuntimeInstrumentation::replaceTreeTokens).
   std::unordered_map<uint64_t, std::vector<std::pair<uint32_t, uint32_t>>> treeTokens;
@@ -778,6 +787,7 @@ struct Runtime::Impl {
       }
     }
     rememberStepCosts = std::move(value.rememberStepCosts);
+    forgetStepCosts = std::move(value.forgetStepCosts);
     if (ExpertStore *store = model.expertStore())
       pools.push_back(&expertPool.emplace(*store));
     if (blockCache) {
@@ -4307,7 +4317,7 @@ WarmupStepResult Runtime::warmupPrefill(uint32_t rows) {
 // along, so that no point always runs first after the prompts: the first
 // pass's first touch of a buffer or an expert's pages, and a cycle slowed by
 // other work on the GPU (an app's rendering), move no point.
-double Runtime::measureDecodeSteps(uint32_t width) {
+void Runtime::measureDecodeSteps(uint32_t width) {
   constexpr uint64_t firstId = std::numeric_limits<uint64_t>::max() - 120;
   const std::vector<ops::StepRows> steps = impl_->stepCosts->steps(width);
   const auto answer = static_cast<uint32_t>(steps.size()) * ExecutionLimits::targetVerifyRows;
@@ -4365,7 +4375,7 @@ double Runtime::measureDecodeSteps(uint32_t width) {
     throw;
   }
   impl_->forcedStep = forced;
-  return impl_->stepCosts->measure(width, replays);
+  impl_->stepCosts->measure(width, replays);
 }
 
 WarmupStepResult Runtime::warmupDecodeBatch(uint32_t width) {
@@ -4378,18 +4388,34 @@ WarmupStepResult Runtime::warmupDecodeBatch(uint32_t width) {
   // by each request's state lane, so plan lane k runs on state lane
   // maximumBatchWidth - 1 - k and batching never assumes lanes 0..width-1.
   const auto stateLane = [](uint32_t lane) { return ExecutionLimits::maximumBatchWidth - 1 - lane; };
+  // The kept tables are one start's, of one lane up to the widths it warmed
+  // (Bootstrap: those its memory affords). A start that measures a lane
+  // count, one it has no table for or every one where its check found the
+  // tables stale, measures every width it warms and replaces the kept set,
+  // remembered tables included (below). Its first decode warmup checks the
+  // level of the tables it recalled: kReplays steps of its lane count's
+  // largest after the warmup's own cycle, in its lanes (StepCosts::kStale),
+  // which ignore the stop tokens as the measurement's lanes do, so that no
+  // replay follows a lane's end.
+  const bool first = !std::exchange(impl_->warmedUp, true);
+  const bool checking = first && impl_->stepCosts && impl_->stepCosts->measured(width);
+  const uint32_t lanePages = checking ? StepCosts::lanePages(StepCosts::kReplays) : 1;
   double wallSeconds = 0.0;
   std::vector<WarmupLaneResult> lanes;
   std::array<std::vector<uint32_t>, ExecutionLimits::maximumBatchWidth> pages;
+  bool stale = false;
   try {
     for (uint32_t lane = 0; lane < width; ++lane) {
       std::vector<uint32_t> warmupPrompt{lane};
       ModelRequest request;
       request.id = firstId + lane;
       request.prompt = warmupPrompt;
-      request.maxNewTokens = 16;
+      // The warmup's cycle and the check's replays, each at most a verify
+      // block and its anchor.
+      request.maxNewTokens = checking ? (2 + StepCosts::kReplays) * ExecutionLimits::targetVerifyRows : 16;
+      if (checking) request.flags = RequestIgnoreEndOfSequence;
       beginColdRequest(request, stateLane(lane));
-      pages[lane] = {5 + lane};
+      for (uint32_t page = 0; page < lanePages; ++page) pages[lane].push_back(5 + lane * lanePages + page);
       requireRunwayPages(impl_->kvPages, pages[lane]);
       BatchPlan prefillPlan{.kind = WorkKind::Prefill,
                             .items = {{request.id, 1}},
@@ -4448,28 +4474,67 @@ WarmupStepResult Runtime::warmupDecodeBatch(uint32_t width) {
     // A reply's state is captured in decode at the page its retained rows
     // reach, by a fold no prompt or warmup cycle runs.
     impl_->prepareCapturePipelines(0, stateLane(0));
+    std::array<uint64_t, ExecutionLimits::maximumBatchWidth> positions{};
     for (uint32_t lane = 0; lane < width; ++lane) {
+      positions[lane] = 1 + decoded[lane].outputTokens.size() - decoded[lane].outputTokensWithoutKv;
       lanes.push_back({std::move(decoded[lane]),
                        impl_->request(firstId + lane).pendingToken,
                        impl_->states.metadata(stateLane(lane)).lengths.targetTokens});
-      end(firstId + lane);
     }
+    if (checking) {
+      const ops::StepRows step = impl_->stepCosts->steps(width).back();
+      impl_->forcedStep = Impl::ForcedStep{step.rows, step.laneCap};
+      std::vector<double> replays;
+      for (uint32_t replay = 0; replay < StepCosts::kReplays; ++replay) {
+        for (uint32_t lane = 0; lane < width; ++lane) items[lane] = warmupItem(firstId + lane, positions[lane], 0, pages[lane]);
+        const auto started = AwakeClock::now();
+        const std::vector<ModelStepResult> checked = decode(plan, items);
+        replays.push_back(std::chrono::duration<double, std::milli>(AwakeClock::now() - started).count());
+        requireLanesSucceeded(checked);
+        for (uint32_t lane = 0; lane < width; ++lane)
+          positions[lane] += checked[lane].outputTokens.size() - checked[lane].outputTokensWithoutKv;
+      }
+      const double level = impl_->stepCosts->level(width, replays);
+      stale = StepCosts::stale(level);
+      const double table = impl_->stepCosts->points(width).back().milliseconds;
+#ifdef SPLASH_RUNTIME_INSTRUMENTATION
+      impl_->levelRatio = level;
+#endif
+      std::ostringstream times;
+      times << std::fixed << std::setprecision(2);
+      for (const double ms : replays) times << (times.tellp() > 0 ? " " : "") << ms;
+      logLine("Decode step costs as an earlier start measured them, checked: a step of ", step.rows, " rows over ",
+              width, width == 1 ? " lane" : " lanes", " takes ", times.str(), " ms, the table's ", std::fixed,
+              std::setprecision(2), table, " ms",
+              stale ? ", more than a fifth above its median: measuring them again" : "");
+    }
+    for (uint32_t lane = 0; lane < width; ++lane) end(firstId + lane);
   } catch (...) {
     for (uint32_t lane = 0; lane < width; ++lane)
       end(firstId + lane);
     throw;
   }
+  if (stale)
+    impl_->stepCosts->forget();
   // The steps' costs, which no earlier start of this model and build on this
-  // Mac measured and remembered, for later starts where steady
-  // (StepCosts::kSteadySpread).
+  // Mac measured and remembered (or whose level a check found stale), for
+  // later starts. The first a start measures replaces the kept set: every
+  // table goes, and the widths it warmed before this one are measured too.
+  const auto measure = [&](uint32_t lanes) {
+    measureDecodeSteps(lanes);
+    logLine("Decode step costs of ", lanes, lanes == 1 ? " lane" : " lanes", " measured: ",
+            impl_->stepCosts->text(lanes));
+    if (impl_->rememberStepCosts)
+      impl_->rememberStepCosts(lanes, impl_->stepCosts->text(lanes));
+  };
   if (impl_->stepCosts && !impl_->stepCosts->measured(width)) {
-    const double spread = measureDecodeSteps(width);
-    const bool steady = spread <= StepCosts::kSteadySpread;
-    logLine("Decode step costs of ", width, width == 1 ? " lane" : " lanes", " measured, medians within ", std::fixed,
-            std::setprecision(1), 100.0 * spread, "% of their fastest replays",
-            steady ? "" : ", too far apart to keep for later starts", ": ", impl_->stepCosts->text(width));
-    if (steady && impl_->rememberStepCosts)
-      impl_->rememberStepCosts(width, impl_->stepCosts->text(width));
+    if (!std::exchange(impl_->measuredSteps, true)) {
+      impl_->stepCosts->forget();
+      for (uint32_t lanes = 1; lanes <= ExecutionLimits::maximumBatchWidth && impl_->forgetStepCosts; ++lanes)
+        impl_->forgetStepCosts(lanes);
+      for (uint32_t lanes = 1; lanes < width; ++lanes) measure(lanes);
+    }
+    measure(width);
   }
   return {"real B" + std::to_string(width) + " draft/verify/commit decode",
           wallSeconds, std::move(lanes)};
@@ -4690,6 +4755,10 @@ std::vector<StepCosts::Point> RuntimeInstrumentation::stepPoints(const Runtime &
     return {};
   const std::span<const StepCosts::Point> points = runtime.impl_->stepCosts->points(lanes);
   return {points.begin(), points.end()};
+}
+
+std::optional<double> RuntimeInstrumentation::levelRatio(const Runtime &runtime) {
+  return runtime.impl_->levelRatio;
 }
 
 void RuntimeInstrumentation::captureTargetLogits(Runtime &runtime, bool enabled) {

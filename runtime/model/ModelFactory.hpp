@@ -136,9 +136,11 @@ struct RuntimeContext final {
   // What a start keeps of the step costs its decode warmups measure on this
   // Mac (Runtime::warmupDecodeBatch, StepCosts::text): the line a lane
   // count's were remembered as, if any, which the runtime reads when it is
-  // made, and remembering one; neither where every start measures them.
+  // made, remembering one and forgetting one; none where every start
+  // measures them.
   std::function<std::optional<std::string>(uint32_t lanes)> recallStepCosts{};
   std::function<void(uint32_t lanes, std::string_view line)> rememberStepCosts{};
+  std::function<void(uint32_t lanes)> forgetStepCosts{};
 };
 
 // What the step costs a start's decode warmups measure follow

@@ -36,6 +36,7 @@
 #include <string>
 #include <string_view>
 #include <tuple>
+#include <utility>
 #include <vector>
 
 using splash::model::CostLine;
@@ -404,11 +405,12 @@ void risingPoints() {
 }
 
 // A point's cost is the median of its replays: a replay five times as slow
-// moves no point and leaves the measurement's spread none; two replays of a
-// point a tenth past its third, as a MoE target's routing moves them, leave
-// it steady (StepCosts::kSteadySpread), and two 30% past it, as other work
-// slows them, do not; an even count's is the mean of its middle two; and a
-// lane count is measured once every point has a cost.
+// moves no point; an even count's is the mean of its middle two; and a lane
+// count is measured once every point has a cost. A measured table is stale
+// where its largest step costs more than StepCosts::kStale past the median
+// of that step's replays now (a table measured on a busy Mac), and stays
+// where it costs that or less (now slower: other work only slows a step);
+// forgetting leaves every lane count unmeasured.
 void replaysMedian() {
   StepCosts costs(kClasses, 64, false);
   for (uint32_t lanes = 1; lanes <= StepCosts::kLanes; ++lanes) {
@@ -418,24 +420,29 @@ void replaysMedian() {
     for (size_t point = 0; point < points; ++point)
       for (uint32_t replay = 0; replay < StepCosts::kReplays; ++replay)
         replays[replay][point] = (10.0 + double(point)) * (replay == point % StepCosts::kReplays ? 5.0 : 1.0);
-    const double spread = costs.measure(lanes, replays);
+    costs.measure(lanes, replays);
     require(costs.measured(lanes), "a measured lane count was not measured");
     for (size_t point = 0; point < points; ++point)
       require(costs.points(lanes)[point].milliseconds == 10.0 + double(point),
               "a slow replay moved the cost of a point of " + std::to_string(lanes) + " lanes");
-    require(spread == 0.0, "a slow replay spread a measurement of " + std::to_string(lanes) + " lanes");
-    for (const double slower : {1.1, 1.3}) {
-      std::vector<std::vector<double>> slowed(StepCosts::kReplays, std::vector<double>(points, 10.0));
-      slowed[1].back() = slowed[2].back() = 10.0 * slower;
-      const double apart = costs.measure(lanes, slowed);
-      require(std::abs(apart - (slower - 1.0)) < 1e-9 && (apart <= StepCosts::kSteadySpread) == (slower < 1.2),
-              "two replays " + std::to_string(slower) + " times their third's spread a measurement " +
-                  std::to_string(apart));
+    const double largest = 10.0 + double(points - 1);
+    for (const auto &[now, stale] : std::initializer_list<std::pair<double, bool>>{
+             {largest, false}, {largest / 1.19, false}, {largest / 1.21, true}, {largest * 3.0, false}}) {
+      // One fast replay and one five times as slow leave the median at `now`.
+      const std::array<double, StepCosts::kReplays> check{now * 5.0, now, now / 2.0};
+      require(StepCosts::stale(costs.level(lanes, check)) == stale, "a table " + std::to_string(largest / now) +
+                                                                       " times its largest step now was judged " +
+                                                                       (stale ? "current" : "stale"));
     }
     costs.measure(lanes,
                   std::vector<std::vector<double>>{std::vector<double>(points, 4.0), std::vector<double>(points, 6.0)});
     require(costs.points(lanes).front().milliseconds == 5.0, "two replays' median is not their mean");
   }
+  costs.forget();
+  for (uint32_t lanes = 1; lanes <= StepCosts::kLanes; ++lanes)
+    require(!costs.measured(lanes), "a forgotten table stayed measured");
+  rejects([&] { static_cast<void>(costs.level(1, std::array<double, 1>{1.0})); }, "invalid level check",
+          "an unmeasured table's level was checked");
 }
 
 // The step of a measured table, by brute force over every T the lanes'
