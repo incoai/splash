@@ -2668,6 +2668,10 @@ size_t BackendInstrumentation::cachedPipelines(const MetalBackend &backend) {
     return backend.impl_->pipelines.size();
 }
 
+bool BackendInstrumentation::hasFunction(const MetalBackend &backend, std::string_view name) {
+    return [backend.impl_->library.functionNames containsObject:checkedNSString(name, "function name")];
+}
+
 uint64_t BackendInstrumentation::lastCommandBuffers(const MetalBackend &backend) {
     return backend.impl_->lastCommandBuffers;
 }

@@ -291,6 +291,7 @@ TEST_METAL_TARGETS := $(TEST_DRAFT_PREPARATION) \
 	$(TEST_GGUF_PREPARATION) \
 	$(TEST_ATTENTION_PLAN) \
 	$(TEST_ATTENTION_VARIANTS) \
+	$(TEST_KERNEL_SELECTION) \
 	$(TEST_ROPE_TABLES) \
 	$(TEST_LINEAR_PLAN) \
 	$(TEST_RESOURCES_TEST) \
@@ -424,7 +425,7 @@ $(TEST_OPERATOR_WORKSPACE): dev/tests/engine/operator_workspace_test.cc \
 $(TEST_EXECUTION_PLANS): dev/tests/engine/execution_plans_test.cc \
 		$(ENGINE_LIBRARY)
 $(TEST_KERNEL_SELECTION): dev/tests/engine/kernel_selection_test.cc \
-		$(ENGINE_LIBRARY)
+		$(ENGINE_INSTRUMENTED_METAL_OBJECT) $(ENGINE_LIBRARY)
 $(TEST_MODEL_EXECUTION_PLANS): dev/tests/engine/model_execution_plan_test.cpp \
 		$(ENGINE_LIBRARY)
 $(TEST_DRAFT_VOCABULARY): dev/tests/engine/draft_vocabulary_test.cpp $(ENGINE_LIBRARY)
@@ -734,6 +735,7 @@ test-engine-metal: $(TEST_METAL_TARGETS)
 	$(TEST_QWEN4_KERNELS) $(LIB) bitwise
 	$(METAL_TEST_ENV) $(TEST_ATTENTION_PLAN) $(TEST_PRODUCTION_LIB)
 	$(METAL_TEST_ENV) $(TEST_ATTENTION_VARIANTS) $(TEST_PRODUCTION_LIB)
+	$(METAL_TEST_ENV) $(TEST_KERNEL_SELECTION) --library $(LIB) dev/tests/engine/kernel_selection_golden.txt
 	$(METAL_TEST_ENV) $(TEST_ROPE_TABLES) $(LIB)
 	$(METAL_TEST_ENV) $(TEST_LINEAR_PLAN) $(LIB)
 	$(METAL_TEST_ENV) $(TEST_RESOURCES_TEST) $(LIB)

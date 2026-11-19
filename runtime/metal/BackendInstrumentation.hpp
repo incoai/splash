@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace splash::metal {
@@ -25,6 +26,9 @@ public:
   // Commands that passed the submission gate since construction.
   [[nodiscard]] static uint64_t submittedCommands(const MetalBackend &backend);
   [[nodiscard]] static size_t cachedPipelines(const MetalBackend &backend);
+  // Whether the library holds function `name`, which a pipeline of that name
+  // needs, looked up without compiling anything.
+  [[nodiscard]] static bool hasFunction(const MetalBackend &backend, std::string_view name);
   // The Metal command buffers the last command submitted takes: one, and one
   // more per buffer its event steps add, which the queue holds 512 of.
   [[nodiscard]] static uint64_t lastCommandBuffers(const MetalBackend &backend);

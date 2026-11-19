@@ -108,6 +108,9 @@ void addDecodeTensor(const LinearBuffers &b, LinearEpilogue epilogue, const Quan
   }
   const std::vector<QuantizedSegment> &gates = gate->blocks().segments;
   if (gates.size() != 1) throw std::invalid_argument("block gate/up takes single tensors");
+  // The gate pass runs the tile's kernel of the gate's format, which F32 or
+  // BF16 rows have none of: no source instantiates gguf_decode_f32_m8_a.
+  if (gates.front().isFloat()) throw std::invalid_argument("float segments take no epilogue");
   tensor(gates.front(), epilogueSuffix(LinearEpilogue::None), b.gateScratch, b.gateScratch);
   tensor(segment, epilogueSuffix(LinearEpilogue::UpWithGate), b.output, b.gateScratch);
 }
