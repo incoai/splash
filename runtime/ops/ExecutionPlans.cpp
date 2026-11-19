@@ -10,7 +10,8 @@
 namespace splash::ops {
 
 ExecutionPlans::ExecutionPlans(const DeviceCapabilities &device, Int8Activations int8Activations)
-    : linear_(device, int8Activations), draftLinear_(device, Int8Activations::Off) {}
+    : linear_(device, int8Activations), draftLinear_(device, Int8Activations::Off),
+      halfAttention_(device.appleGpuFamily < 9) {}
 
 // A chunk's rows pick its projections' tile, and a tile's height names its
 // kernels (gguf_decode_<format>_m<rows>_*, the register tile's _l<tiles>), so
@@ -67,7 +68,7 @@ AttentionPlan ExecutionPlans::attention(std::span<const kv::ChunkedPrefillParams
                                         kv::Layout layout, AttentionWorkspace capacity,
                                         AttentionVariant variant) const {
   return PagedAttention::plan(sequences, queryHeads, layout, calibration().attention, linear_.int8Activations(),
-                              capacity, variant);
+                              capacity, variant, halfAttention_);
 }
 
 DraftAttentionPlan ExecutionPlans::draftAttention(DraftAttentionShape shape,

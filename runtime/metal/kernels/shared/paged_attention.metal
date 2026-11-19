@@ -12,15 +12,16 @@
 
 // Split: KV heads (and each one's tile parts, splash_attention_tile_part)
 // vary first, then the dispatch's tiles, then history splits. A tile's
-// sequence names its page table among the bindings.
+// sequence names its page table among the bindings. T, the queries' and the
+// probabilities' type, is bfloat, or half on Apple8 (the _h entries).
 template <uint KVHeads, uint QueryHeadsPerKVHead, uint HeadDim, uint Window, typename CacheElement,
-          bool Int8Queries>
+          bool Int8Queries, typename T>
 inline void splash_attention_split_phase(
-    device bfloat *queries, device float *partials, device float *statistics,
+    device T *queries, device float *partials, device float *statistics,
     device const SplashKvPage *page_table0, device const SplashKvPage *page_table1,
     device const SplashKvPage *page_table2, device const SplashKvPage *page_table3,
     device const SplashTreeRow *tree, device const SplashLaneRows *layout, constant SplashAttentionParams &params,
-    threadgroup float *scores, threadgroup bfloat *probabilities,
+    threadgroup float *scores, threadgroup T *probabilities,
     threadgroup float *row_max, threadgroup float *row_sum, threadgroup float *previous_scale,
     threadgroup atomic_uint *rescale, uint3 group, uint thread_index) {
   constexpr uint Parts = SPLASH_ATTENTION_TILE_PARTS(QueryHeadsPerKVHead);
@@ -77,9 +78,9 @@ inline void splash_attention_reduce_phase(
       group.x * QueryHeadsPerKVHead + fused_row % QueryHeadsPerKVHead, thread_index, place.writes, pairs);
 }
 
-#define PAGED_ATTENTION_SPLIT(Name, Heads, Group, HeadDim, Window, CacheElement, Int8Queries)                   \
+#define PAGED_ATTENTION_SPLIT(Name, Heads, Group, HeadDim, Window, CacheElement, Int8Queries, T)                \
   kernel void Name(                                                                                           \
-      device bfloat *queries [[buffer(0)]],                                                                   \
+      device T *queries [[buffer(0)]],                                                                        \
       device float *partials [[buffer(1)]],                                                                   \
       device float *statistics [[buffer(2)]],                                                                 \
       device const SplashKvPage *page_table0 [[buffer(3)]],                                                   \
@@ -94,36 +95,43 @@ inline void splash_attention_reduce_phase(
     constexpr uint M = Group * SPLASH_ATTENTION_TILE_ROWS / SPLASH_ATTENTION_TILE_PARTS(Group);               \
     constexpr uint N = SplashKvPageTokens;                                                                    \
     alignas(16) threadgroup float scores[M * N];                                                              \
-    alignas(16) threadgroup bfloat probabilities[M * N];                                                      \
+    alignas(16) threadgroup T probabilities[M * N];                                                           \
     threadgroup float row_max[M];                                                                             \
     threadgroup float row_sum[M];                                                                             \
     threadgroup float previous_scale[M];                                                                      \
     threadgroup atomic_uint rescale;                                                                          \
-    splash_attention_split_phase<Heads, Group, HeadDim, Window, CacheElement, Int8Queries>(                   \
+    splash_attention_split_phase<Heads, Group, HeadDim, Window, CacheElement, Int8Queries, T>(                \
         queries, partials, statistics, page_table0, page_table1, page_table2, page_table3, tree, layout,     \
         params, scores, probabilities, row_max, row_sum, previous_scale, &rescale, group, thread_index);      \
   }
 
-PAGED_ATTENTION_SPLIT(attention_q8_split, 4, 6, 256, 0, int8_t, false)
-PAGED_ATTENTION_SPLIT(attention_q8_split_kv2_g8, 2, 8, 256, 0, int8_t, false)
-PAGED_ATTENTION_SPLIT(attention_q8_split_kv2_g16, 2, 16, 256, 0, int8_t, false)
+PAGED_ATTENTION_SPLIT(attention_q8_split, 4, 6, 256, 0, int8_t, false, bfloat)
+PAGED_ATTENTION_SPLIT(attention_q8_split_kv2_g8, 2, 8, 256, 0, int8_t, false, bfloat)
+PAGED_ATTENTION_SPLIT(attention_q8_split_kv2_g16, 2, 16, 256, 0, int8_t, false, bfloat)
 // Four KV heads of 128 dimensions over the whole history, and over a window
 // of the 512 keys before each row.
-PAGED_ATTENTION_SPLIT(attention_q8_split_kv4_g8_d128, 4, 8, 128, 0, int8_t, false)
-PAGED_ATTENTION_SPLIT(attention_q8_split_kv4_g8_d128_w512, 4, 8, 128, 512, int8_t, false)
+PAGED_ATTENTION_SPLIT(attention_q8_split_kv4_g8_d128, 4, 8, 128, 0, int8_t, false, bfloat)
+PAGED_ATTENTION_SPLIT(attention_q8_split_kv4_g8_d128_w512, 4, 8, 128, 512, int8_t, false, bfloat)
+// Apple8 attends with half queries and probabilities (the _h names): its
+// matmul2d runs half operands about twice as fast as bfloat ones.
+PAGED_ATTENTION_SPLIT(attention_q8_split_h, 4, 6, 256, 0, int8_t, false, half)
+PAGED_ATTENTION_SPLIT(attention_q8_split_h_kv2_g8, 2, 8, 256, 0, int8_t, false, half)
+PAGED_ATTENTION_SPLIT(attention_q8_split_h_kv2_g16, 2, 16, 256, 0, int8_t, false, half)
+PAGED_ATTENTION_SPLIT(attention_q8_split_h_kv4_g8_d128, 4, 8, 128, 0, int8_t, false, half)
+PAGED_ATTENTION_SPLIT(attention_q8_split_h_kv4_g8_d128_w512, 4, 8, 128, 512, int8_t, false, half)
 // INT8 query codes against the INT8 keys, where a split reads enough pages
 // (AttentionCalibration::int8QueriesFromPages).
-PAGED_ATTENTION_SPLIT(attention_q8q_split, 4, 6, 256, 0, int8_t, true)
-PAGED_ATTENTION_SPLIT(attention_q8q_split_kv2_g8, 2, 8, 256, 0, int8_t, true)
-PAGED_ATTENTION_SPLIT(attention_q8q_split_kv2_g16, 2, 16, 256, 0, int8_t, true)
-PAGED_ATTENTION_SPLIT(attention_q8q_split_kv4_g8_d128, 4, 8, 128, 0, int8_t, true)
-PAGED_ATTENTION_SPLIT(attention_q8q_split_kv4_g8_d128_w512, 4, 8, 128, 512, int8_t, true)
+PAGED_ATTENTION_SPLIT(attention_q8q_split, 4, 6, 256, 0, int8_t, true, bfloat)
+PAGED_ATTENTION_SPLIT(attention_q8q_split_kv2_g8, 2, 8, 256, 0, int8_t, true, bfloat)
+PAGED_ATTENTION_SPLIT(attention_q8q_split_kv2_g16, 2, 16, 256, 0, int8_t, true, bfloat)
+PAGED_ATTENTION_SPLIT(attention_q8q_split_kv4_g8_d128, 4, 8, 128, 0, int8_t, true, bfloat)
+PAGED_ATTENTION_SPLIT(attention_q8q_split_kv4_g8_d128_w512, 4, 8, 128, 512, int8_t, true, bfloat)
 // BF16 shares the page loop and reduction, without quantization scales.
-PAGED_ATTENTION_SPLIT(attention_bf16_split, 4, 6, 256, 0, bfloat, false)
-PAGED_ATTENTION_SPLIT(attention_bf16_split_kv2_g8, 2, 8, 256, 0, bfloat, false)
-PAGED_ATTENTION_SPLIT(attention_bf16_split_kv2_g16, 2, 16, 256, 0, bfloat, false)
-PAGED_ATTENTION_SPLIT(attention_bf16_split_kv4_g8_d128, 4, 8, 128, 0, bfloat, false)
-PAGED_ATTENTION_SPLIT(attention_bf16_split_kv4_g8_d128_w512, 4, 8, 128, 512, bfloat, false)
+PAGED_ATTENTION_SPLIT(attention_bf16_split, 4, 6, 256, 0, bfloat, false, bfloat)
+PAGED_ATTENTION_SPLIT(attention_bf16_split_kv2_g8, 2, 8, 256, 0, bfloat, false, bfloat)
+PAGED_ATTENTION_SPLIT(attention_bf16_split_kv2_g16, 2, 16, 256, 0, bfloat, false, bfloat)
+PAGED_ATTENTION_SPLIT(attention_bf16_split_kv4_g8_d128, 4, 8, 128, 0, bfloat, false, bfloat)
+PAGED_ATTENTION_SPLIT(attention_bf16_split_kv4_g8_d128_w512, 4, 8, 128, 512, bfloat, false, bfloat)
 #undef PAGED_ATTENTION_SPLIT
 
 // Bindings: the partials and statistics, the projection's packed rows (a

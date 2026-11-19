@@ -153,7 +153,8 @@ LinearPlan::LinearPlan(LinearWorkload w, LinearConfig config, FloatOutput destin
 }
 
 Linear::Linear(const DeviceCapabilities &device, Int8Activations int8Activations) noexcept
-    : calibration_(KernelCalibration::of(device)), int8Activations_(int8Activations) {}
+    : calibration_(KernelCalibration::of(device)), int8Activations_(int8Activations),
+      halfPrefillInput_(device.appleGpuFamily < 9) {}
 
 uint32_t Linear::storageRows(uint32_t rows, ProjectionShape shape) const {
   // The None and Residual plans share a tile; a gate/up pair of one format
@@ -220,7 +221,10 @@ LinearScratchSize Linear::scratchSize(ProjectionShape shape, uint32_t rows) cons
   const uint32_t storage = rows <= kMaximumDecodeTileRows
                                ? std::max(rows, stagedStorageRows(rows, true))
                                : (rows + GGUF_PREFILL_ROWS - 1) / GGUF_PREFILL_ROWS * GGUF_PREFILL_ROWS;
-  if (shape.rotated) bound.rotated = rotatedBytes(shape.inputSize, storage);
+  // The half copy of a prefill tile's rows on Apple8 (LinearGguf.cpp) takes
+  // the rotated rows' buffer, the same size.
+  if (shape.rotated || (halfPrefillInput_ && rows > kMaximumDecodeTileRows))
+    bound.rotated = rotatedBytes(shape.inputSize, storage);
   // The most rows' plan, whose codes and scales the int8 prefill tile holds
   // where it takes the shape's formats.
   if (rows > kMaximumDecodeTileRows) {

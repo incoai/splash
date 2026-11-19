@@ -175,9 +175,11 @@ constant uint SplashAttentionLanesPerRow = 4;
 // window, its position the anchor's plus its `depth`, and of the block's
 // rows those its `ancestors` hold, itself among them; only a page that
 // holds rows of the block tests them.
-template <uint QueryHeadsPerKVHead, uint RowsPerTile, uint Window, bool Quantized, typename Score>
+// P: the probabilities type, bfloat, or half on Apple8, whose matmul2d runs
+// half operands about twice as fast as bfloat ones.
+template <uint QueryHeadsPerKVHead, uint RowsPerTile, uint Window, bool Quantized, typename Score, typename P>
 inline void splash_attention_page_softmax(
-    threadgroup const Score *scores, float score_scale, threadgroup bfloat *probabilities,
+    threadgroup const Score *scores, float score_scale, threadgroup P *probabilities,
     threadgroup float *row_max, threadgroup float *row_sum,
     threadgroup float *previous_scale, threadgroup atomic_uint *rescale,
     device const float4 *key_scales, device const float4 *value_scales,
@@ -278,10 +280,12 @@ inline void splash_attention_page_softmax(
                     seen[5] ? probability[5] * high_scales.y : 0.0f,
                     seen[6] ? probability[6] * high_scales.z : 0.0f,
                     seen[7] ? probability[7] * high_scales.w : 0.0f);
-  threadgroup bfloat4 *probabilities4 = reinterpret_cast<threadgroup bfloat4 *>(
+  // Half probabilities (Apple8, P = half) hold the bf16 values, exactly from
+  // 2^-17 up, so PV products are bf16 ones.
+  threadgroup vec<P, 4> *probabilities4 = reinterpret_cast<threadgroup vec<P, 4> *>(
       probabilities + fused_row * N + column);
-  probabilities4[0] = bfloat4(low);
-  probabilities4[1] = bfloat4(high);
+  probabilities4[0] = vec<P, 4>(bfloat4(low));
+  probabilities4[1] = vec<P, 4>(bfloat4(high));
 }
 
 // The tile's queries as INT8 codes with one scale per fused row, by the
@@ -336,13 +340,16 @@ inline float splash_attention_query_codes(device const bfloat *queries, device i
 // A tree's tile (SplashAttentionTree) masks each row to its path's rows of
 // the block; its K/V, the store's, sit at the slots of their rows before
 // any tile runs, so a row of a later tile reads its ancestors' from them.
+// Q and P, the queries' and the probabilities' types, are bfloat, or half on
+// Apple8, whose matmul2d runs half operands about twice as fast as bfloat
+// ones (its queries converted before the split, PagedAttention.cpp).
 template <uint KVHeads, uint QueryHeadsPerKVHead, uint RowsPerTile, uint HeadDim,
-          uint Window, typename CacheElement, bool Int8Queries>
+          uint Window, typename CacheElement, bool Int8Queries, typename Q, typename P>
 inline void splash_paged_attention_tile(
-    device bfloat *tile_queries, device const SplashKvPage *page_table,
+    device Q *tile_queries, device const SplashKvPage *page_table,
     SplashKvLayer kv, uint kv_head, uint committed_tokens, uint active_rows, uint splits,
     uint split, device float *partials, device float *statistics, ulong slot,
-    threadgroup float *scores, threadgroup bfloat *probabilities,
+    threadgroup float *scores, threadgroup P *probabilities,
     threadgroup float *row_max, threadgroup float *row_sum,
     threadgroup float *previous_scale, threadgroup atomic_uint *rescale,
     SplashAttentionTree tree, uint thread_index) {
@@ -363,7 +370,8 @@ inline void splash_paged_attention_tile(
     return;
   uint page_end = min(pages, page_begin + per_split);
   static_assert(Quantized || !Int8Queries, "INT8 queries take INT8 keys");
-  using QueryElement = conditional_t<Int8Queries, int8_t, bfloat>;
+  static_assert(!Int8Queries || is_same<Q, bfloat>::value, "INT8 queries quantize bf16 ones");
+  using QueryElement = conditional_t<Int8Queries, int8_t, Q>;
   using Score = conditional_t<Int8Queries, int, float>;
   device QueryElement *queries;
   float score_scale = splash_attention_scale<HeadDim>();
@@ -393,7 +401,7 @@ inline void splash_paged_attention_tile(
   auto qt = tensor(queries, dextents<int, 2>{D, M}, array<int, 2>{1, D});
   auto st = tensor(page_score_tile, dextents<int, 2>{N, M}, array<int, 2>{1, N});
   auto pt = tensor(probabilities, dextents<int, 2>{N, M}, array<int, 2>{1, N});
-  auto p0 = pt.slice<N, M>(0, 0);
+  auto p0 = pt.template slice<N, M>(0, 0);
   auto key_type = tensor(static_cast<device CacheElement *>(nullptr),
                          dextents<int, 2>{D, N}, array<int, 2>{1, D});
   auto value_type = tensor(static_cast<device CacheElement *>(nullptr),

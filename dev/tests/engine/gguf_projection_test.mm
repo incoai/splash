@@ -305,7 +305,8 @@ std::vector<uint16_t> storageRows(const std::vector<float> &x, uint32_t width, u
 
 // A plan's split scratch, as LinearPlan::scratchSize sizes it (the largest of several plans that share it), and a
 // rotated projection's rotated rows, which start NaN (bytes 0xFF: NaN bf16 values, int8 codes -1 and NaN scales),
-// as the padding rows of a plan's storage that no rotation writes are read.
+// as the padding rows of a plan's storage that no rotation writes are read; a prefill plan's rotated rows' buffer is
+// also Apple8's half input (Linear::scratchSize).
 struct Scratch {
   Guarded table, sums, partials, counters, rotated;
   Scratch(MetalBackend &backend, LinearScratchSize size)
@@ -327,6 +328,10 @@ struct Scratch {
 LinearScratchSize scratchSize(const Linear &linear, const LinearPlan &plan, const Projection &p) {
   LinearScratchSize size = plan.scratchSize();
   if (p.rotation) size.rotated = linear.scratchSize(p.shape(), kMaximumDecodeTileRows).rotated;
+  // Apple8's prefill tiles read a half copy of their rows in the rotated rows' buffer, as the runtime sizes it for
+  // the tiles' storage (a plan of a chunk's last rows stores a whole 128-row tile).
+  if (plan.configuration().tile == LinearTile::GgufPrefill)
+    size.rotated = std::max(size.rotated, linear.scratchSize(p.shape(), plan.storageRows()).rotated);
   return size;
 }
 // One projection's buffers for a plan: its input and auxiliary rows (the residual, or the gate an up-with-gate
@@ -364,6 +369,17 @@ Outcome run(MetalBackend &backend, const Linear &linear, const LinearPlan &plan,
   scratch.poison(poison);
   CommandGraph graph;
   static_cast<void>(linear.add(graph, o.bindings(plan, scratch), p, plan, gate));
+  // Apple8's prefill tiles read the half copy of their rows (LinearGguf.cpp), the other families' the bf16 rows.
+  if (plan.configuration().tile == LinearTile::GgufPrefill) {
+    const bool apple8 = backend.capabilities().appleGpuFamily < 9;
+    for (const ComputeDispatch &dispatch : graph.dispatches()) {
+      const std::string &name = dispatch.pipelineName;
+      if (name.rfind("gguf_prefill_", 0) || name == "gguf_prefill_input_half") continue;
+      const bool half = name.find("_h_leading_inputs") != std::string::npos ||
+                        (name.size() > 2 && name.compare(name.size() - 2, 2, "_h") == 0);
+      if (half != apple8) fail(label + ": " + name + (apple8 ? " reads bf16 rows on Apple8" : " reads half rows"));
+    }
+  }
   // A spread plan's dispatches past a rotated projection's rotation are staged decode tiles, each binding its
   // parameters with spread set.
   if (plan.configuration().spread)

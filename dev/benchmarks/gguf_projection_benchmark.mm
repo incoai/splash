@@ -385,12 +385,14 @@ int main(int argc, char **argv) {
         auto *x = static_cast<__bf16 *>(input.contents());
         for (uint64_t i = 0; i < rows * K; ++i) x[i] = __bf16(unit(rng));
       }
-      // A rotated projection's rotated rows, as production sizes them.
+      // A rotated projection's rotated rows, as production sizes them; Apple8's prefill tiles read their half input
+      // there too (Linear::scratchSize sizes it for every prefill plan there).
       const ProjectionShape shape = ring.front().shape();
-      const LinearScratch scratch{
-          zeros(size.input), zeros(size.sums), zeros(size.partials), zeros(size.counters),
-          rotated ? zeros(prefill ? linear.scratchSize(shape, SPLASH_PREFILL_TOKEN_BUDGET).rotated : linear.scratchSize(shape, kMaximumDecodeTileRows).rotated)
-                  : MetalBuffer{}};
+      const uint64_t rotatedBytes = prefill ? linear.scratchSize(shape, SPLASH_PREFILL_TOKEN_BUDGET).rotated
+                                    : rotated ? linear.scratchSize(shape, kMaximumDecodeTileRows).rotated
+                                              : 0;
+      const LinearScratch scratch{zeros(size.input), zeros(size.sums), zeros(size.partials), zeros(size.counters),
+                                  zeros(rotatedBytes)};
       // The register tile's table, prepared by its widest plan, whose plans of fewer rows read its leading tiles.
       PreparedInput table;
       const Case *widest = nullptr;

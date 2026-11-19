@@ -256,6 +256,13 @@ void requireQueries(const metal::MetalBuffer &queries, const CommandRows &rows, 
   requireBytes(queries, rows.rowBytes(uint64_t{group} * layout.headDimension, reach), "attention query");
 }
 
+// The bytes the Apple8 split kernels read as half, converted in place:
+// bytes / 8 threads of four values each.
+void addHalfQueries(metal::CommandGraph &graph, const metal::MetalBuffer &queries, uint64_t bytes) {
+  const uint32_t count = static_cast<uint32_t>(bytes / 8);
+  graph.add("gguf_prefill_input_half", {queries, queries}, count, {(count + 255) / 256, 1, 1}, {256, 1, 1});
+}
+
 // A packed projection row: every query head's q and, gated, its gate, then
 // the K and V heads. The gates read each row's query heads only.
 uint64_t packedWidth(const CompiledAttention &compiled) {
@@ -351,7 +358,7 @@ metal::DispatchSize AttentionPlan::reduceGroups(const Dispatch &dispatch) const 
 AttentionPlan PagedAttention::plan(std::span<const kv::ChunkedPrefillParams> sequences, uint32_t queryHeads,
                                    kv::Layout layout, const AttentionCalibration &calibration,
                                    Int8Activations int8Activations, AttentionWorkspace capacity,
-                                   AttentionVariant variant) {
+                                   AttentionVariant variant, bool halfOperands) {
   const CompiledAttention &kernel = compiledAttention(queryHeads, layout, variant);
   static_cast<void>(commandRows(sequences, layout));
   const AttentionWorkspace slot = attentionWorkspace(slotRows(queryHeads), layout.headDimension);
@@ -379,8 +386,12 @@ AttentionPlan PagedAttention::plan(std::span<const kv::ChunkedPrefillParams> seq
   const std::string suffix = splitSuffix(kernel, variant);
   const bool int8Queries = !sparse && int8Activations == Int8Activations::On && layout.format == kv::Format::Int8 &&
                            splitReads >= calibration.int8QueriesFromPages;
-  plan.splitPipeline_ =
-      kernelName((int8Queries ? "q8q" : kernelFormat(layout)) + (sparse ? "_sparse" : "_split"), suffix);
+  // Apple8 reads half queries and probabilities over INT8 pages: its _split_h
+  // entries, never a sparse one, whose values are another layout.
+  plan.halfQueries_ = halfOperands && !sparse && !int8Queries && layout.format == kv::Format::Int8;
+  plan.splitPipeline_ = kernelName((int8Queries ? "q8q" : kernelFormat(layout)) +
+                                       (sparse ? "_sparse" : plan.halfQueries_ ? "_split_h" : "_split"),
+                                   suffix);
   if (sparse) plan.locatedSplitPipeline_ = kernelName(kernelFormat(layout) + "_sparse_located", kernel.suffix);
   plan.reducePipeline_ =
       kernelName(sparse ? "sparse_reduce" : "reduce", suffix + (kernel.sinks ? "_sinks" : ""));
@@ -492,6 +503,13 @@ PreparedInput PagedAttention::addAttention(metal::CommandGraph &graph, const Att
   const uint32_t group = plan.queryHeads / plan.layout.kvHeads;
   const uint32_t tileRows = kv::attentionTiles(command.last.chunk_tokens) * kv::kAttentionTileRows;
   requireQueries(queries, command, group, plan.layout, tileRows);
+  // Apple8's split reads the queries as half: the bytes the tiles read,
+  // converted in place, each thread its own four values (the kernel of
+  // kernels/shared/gguf_linear.metal, which saturates finite values past
+  // half's range and passes NaN and infinities). Nothing reads them back:
+  // each layer's projection stages its own.
+  if (plan.halfQueries())
+    addHalfQueries(graph, queries, command.rowBytes(uint64_t{group} * plan.layout.headDimension, tileRows));
   // The reduce writes every row as its packed row, or each sequence's last
   // as row s of a plan of its last tiles, gating it by its packed row's gate
   // where the geometry has one, and the out-projection's table of the rows
