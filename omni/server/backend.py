@@ -73,6 +73,10 @@ class NativeBackend:
         self.fatal_error = None
         # Set by close() to cut a relaunch's backoff short.
         self.wakeup = threading.Event()
+        # Called once relaunching has stopped for good, after the console
+        # says why: the server stops serving and exits, so that what
+        # supervises it decides whether to start it again.
+        self.on_stopped = None
         # Why the engine cannot serve: its failure, the last failed restart or
         # why restarts stopped.
         self.engine_error = None
@@ -116,7 +120,7 @@ class NativeBackend:
                         if trace
                         else "Set SPLASH_CRASH_TRACE=1 to record a crash trace. "
                     )
-                    + "Restart the Splash server after fixing the cause."
+                    + "The server exits; start it again after fixing the cause."
                 )
             else:
                 self.restart_due = time.monotonic() + delay
@@ -125,6 +129,8 @@ class NativeBackend:
         print_status(f"{event} · {error}", error=True)
         if stopped is not None:
             print_status(f"Engine stopped · {stopped}", error=True)
+            if self.on_stopped is not None:
+                self.on_stopped()
 
     def _restart_delay_locked(self, served_seconds):
         """Seconds until the relaunch a failure owes; None once a crash loop

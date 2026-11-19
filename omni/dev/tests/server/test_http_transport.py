@@ -894,6 +894,39 @@ class HttpTransportTests(AudioHarnessTestCase):
         with self.assertRaisesRegex(RuntimeError, "without acquisition"):
             admission.release()
 
+    def test_accepted_connections_probe_a_vanished_client(self):
+        # A non-streaming request reads nothing from its client until it
+        # ends; keepalive is what finds a client that vanished silently.
+        harness = self.harness()
+        seen = []
+        setup = http_server.FrontendHandler.setup
+
+        def recording_setup(handler):
+            setup(handler)
+            seen.append(
+                [
+                    handler.connection.getsockopt(level, option)
+                    for level, option, _ in http_server.TCP_KEEPALIVE_OPTIONS
+                ]
+            )
+
+        with mock.patch.object(http_server.FrontendHandler, "setup", recording_setup):
+            self.assertEqual(harness.request("GET", "/health")[0], 200)
+        # macOS reads SO_KEEPALIVE back as its flag's value, not 1.
+        ((keepalive, *timing),) = seen
+        self.assertTrue(keepalive)
+        self.assertEqual(
+            timing, [value for _, _, value in http_server.TCP_KEEPALIVE_OPTIONS[1:]]
+        )
+
+    def test_a_keepalive_timeout_reads_as_a_disconnect(self):
+        handler = http_server.FrontendHandler.__new__(http_server.FrontendHandler)
+        handler.connection = mock.Mock()
+        handler.connection.recv.side_effect = TimeoutError(60, "Operation timed out")
+        with mock.patch.object(http_server.select, "poll") as poll:
+            poll.return_value.poll.return_value = [(3, 1)]
+            self.assertTrue(handler._client_disconnected())
+
 
 if __name__ == "__main__":
     unittest.main()

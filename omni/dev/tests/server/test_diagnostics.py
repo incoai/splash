@@ -77,6 +77,7 @@ class DiagnosticsTests(AudioHarnessTestCase):
 
         with mock.patch("sys.stdout", new_callable=io.StringIO) as output:
             audio_backend.print_audio_request(record)
+            self.assertTrue(diagnostics.CONSOLE.flush(5))
         line = output.getvalue()
         self.assertRegex(line, r"^\d{2}:\d{2}:\d{2} Done · text [^\n]*\n$")
         self.assertNotIn("request_id", line)
@@ -123,6 +124,7 @@ class DiagnosticsTests(AudioHarnessTestCase):
                 mock.patch("sys.stdout", new_callable=io.StringIO) as output,
             ):
                 audio_backend.print_audio_request(record)
+                self.assertTrue(diagnostics.CONSOLE.flush(5))
                 self.assertEqual(output.getvalue(), line)
 
     def test_console_cancellation_without_audio_or_latency(self):
@@ -130,6 +132,7 @@ class DiagnosticsTests(AudioHarnessTestCase):
             audio_backend.print_audio_request(
                 {"outcome": "cancelled", "kind": "speech", "text_tokens": 32}
             )
+            self.assertTrue(diagnostics.CONSOLE.flush(5))
         line = output.getvalue()
         self.assertIn("Cancelled · text 32 tokens · audio 0.0s", line)
         self.assertNotIn("realtime", line)
@@ -149,10 +152,40 @@ class DiagnosticsTests(AudioHarnessTestCase):
                     "request_id": 123,
                 }
             )
+            self.assertTrue(diagnostics.CONSOLE.flush(5))
         self.assertRegex(
             errors.getvalue(), r"^\d{2}:\d{2}:\d{2} Error · limit_exceeded\n$"
         )
         self.assertEqual(output.getvalue(), "")
+
+    def test_a_console_that_stops_reading_never_blocks_a_caller(self):
+        # A log reader that stops draining blocks the console's writes; the
+        # requests and engine listeners that print must not wait with it.
+        released = threading.Event()
+
+        class Stalled(io.StringIO):
+            def write(self, text):
+                released.wait()
+                return super().write(text)
+
+        stalled = Stalled()
+        before = diagnostics.CONSOLE.stats()["dropped_lines"]
+        extra = 10
+
+        def print_lines():
+            for line in range(diagnostics.CONSOLE_LINES + extra):
+                diagnostics.print_status(f"line {line}")
+
+        printer = threading.Thread(target=print_lines)
+        with mock.patch("sys.stdout", stalled), mock.patch("sys.stderr", stalled):
+            printer.start()
+            printer.join(5)
+            self.assertFalse(printer.is_alive(), "print_status waited on the console")
+            dropped = diagnostics.CONSOLE.stats()["dropped_lines"] - before
+            self.assertGreaterEqual(dropped, extra - 1)
+            released.set()
+            self.assertTrue(diagnostics.CONSOLE.flush(10))
+        self.assertIn(f"Warning · {dropped} console lines dropped", stalled.getvalue())
 
     def test_concurrent_console_lines_stay_whole(self):
         # Status lines on stdout and errors on stderr, both on one unbuffered
@@ -166,8 +199,9 @@ class DiagnosticsTests(AudioHarnessTestCase):
             ]
             self.addCleanup(lambda: [stream.close() for stream in streams])
 
+            # Fewer lines than the console holds: none is dropped.
             def write(worker):
-                for line in range(300):
+                for line in range(100):
                     diagnostics.print_status(
                         f"worker {worker} line {line}", error=worker % 2 == 1
                     )
@@ -183,9 +217,10 @@ class DiagnosticsTests(AudioHarnessTestCase):
                     worker.start()
                 for worker in workers:
                     worker.join()
+                self.assertTrue(diagnostics.CONSOLE.flush(5))
             log.seek(0)
             lines = log.read().decode().splitlines()
-        self.assertEqual(len(lines), 8 * 300)
+        self.assertEqual(len(lines), 8 * 100)
         for line in lines:
             self.assertRegex(line, r"^\d{2}:\d{2}:\d{2} worker \d line \d+$")
 

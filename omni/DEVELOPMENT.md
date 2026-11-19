@@ -93,13 +93,27 @@ weights.
 
 An engine that fails is restarted at once. If it fails again within 60 s of
 starting, the next restart waits 5 s; after a third such failure (failed
-restarts count) the server stops restarting it, and requests get
-500 `engine_failed` until the server is restarted. Its message names the
-crash trace when `SPLASH_CRASH_TRACE=1` recorded one
+restarts count) the server stops restarting it: requests in service get
+500 `engine_failed`, and the server exits with status 69 (`EX_UNAVAILABLE`),
+so that what supervises it (launchd's `KeepAlive`, a service manager)
+decides whether to start it again; set a restart interval there for a cause
+the next start would meet again. The message names the crash trace when
+`SPLASH_CRASH_TRACE=1` recorded one
 ([crash traces](#failures-and-crash-traces)). Meanwhile requests get 503
 `engine_recovering`, whose message names the last failure. An engine whose
 loop leaves a status request unanswered for 30 seconds while requests are
 pending is failed and restarted by the same rules (`server/backend.py`, `server/runtime.py`).
+
+### Clients and the console
+
+A client that vanishes without closing its connection (a sleeping laptop, a
+dropped network) is found by TCP keepalive, 60 s after its last data, and
+its request is cancelled as for a disconnect; a non-streaming request
+otherwise reads nothing from its client until it ends. The server's console
+lines are written by one thread of their own (`server/diagnostics.py`), so a
+console whose reader stops draining, such as a stalled log pipe, delays no
+request: past 1,024 waiting lines they are dropped, the next line says how
+many, and `/status` counts them under `console.dropped_lines`.
 
 ### Shell completion
 

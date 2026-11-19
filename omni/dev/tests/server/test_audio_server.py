@@ -38,7 +38,7 @@ from dev.tests.audio_fixtures import (
     transcription_upload,
     wav_upload,
 )
-from server import audio_frontend, audio_io, audio_server, serve_options
+from server import audio_frontend, audio_io, audio_server, diagnostics, serve_options
 from server import audio_protocol as audio_wire
 from server import runtime as engine_runtime
 
@@ -409,6 +409,7 @@ class SpeechRequestTests(AudioHarnessTestCase):
         self.assertEqual(records[0]["streamed"], FRAME)
         with mock.patch("sys.stdout", new_callable=io.StringIO) as stdout:
             audio_server.print_audio_request(records[0])
+            self.assertTrue(diagnostics.CONSOLE.flush(5))
         self.assertIn("Done · text", stdout.getvalue())
 
 
@@ -1463,6 +1464,42 @@ class AudioMainTests(unittest.TestCase):
         self.assertEqual(
             handlers, {signal.SIGTERM: signal.SIG_IGN, signal.SIGINT: signal.SIG_IGN}
         )
+
+    def test_main_exits_unavailable_once_the_engine_stops_for_good(self):
+        # A supervisor (launchd's KeepAlive) restarts a server that exits; one
+        # that stays up refusing every request with engine_failed it never
+        # would.
+        runtime = mock.Mock()
+        runtime.readiness = audio_wire.ReadyEvent(4, 8192, audio_wire.ModelKind.TTS)
+        runtime.wait_ready.return_value = True
+        server = mock.Mock(server_port=8000)
+        backend = mock.Mock()
+        server.serve_forever.side_effect = lambda: backend.on_stopped()
+        with (
+            mock.patch.object(
+                audio_server, "parse_args", return_value=audio_main_args()
+            ),
+            mock.patch.object(
+                audio_server.ModelProfile, "load", return_value=TTS_PROFILE
+            ),
+            mock.patch.object(
+                audio_server.AutoTokenizer, "from_pretrained", return_value=object()
+            ),
+            mock.patch.object(
+                audio_server.audio_runtime, "AudioRuntime", return_value=runtime
+            ),
+            mock.patch.object(audio_server, "AudioBackend", return_value=backend),
+            mock.patch.object(audio_server, "AudioFrontend"),
+            mock.patch.object(audio_server, "AudioServer", return_value=server),
+            mock.patch.object(audio_server.signal, "signal"),
+            mock.patch.object(audio_server, "print_status"),
+            self.assertRaises(SystemExit) as exited,
+        ):
+            audio_server.main()
+        self.assertEqual(exited.exception.code, 69)
+        self.assertTrue(wait_until(lambda: server.shutdown.called))
+        backend.close.assert_called_once_with()
+        server.server_close.assert_called_once_with()
 
     def test_parse_args_takes_the_shared_options(self):
         args = audio_server.parse_args(

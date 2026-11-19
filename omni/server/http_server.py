@@ -21,7 +21,7 @@ from urllib.parse import unquote
 from . import json_codec, serve_options
 from .backend import remaining_request_time
 from .connections import ConnectionSlots, HttpAdmission, RequestBodyReservation
-from .diagnostics import log_unexpected, print_status
+from .diagnostics import CONSOLE, log_unexpected, print_status
 from .errors import (
     OPENAI_ERRORS,
     RETRY_STATUSES,
@@ -43,6 +43,17 @@ from .origins import ANY_ORIGIN
 # --max-request-size) bytes, so two of the largest requests always fit.
 DEFAULT_REQUEST_BODY_BUDGET = 512 * 1024 * 1024
 HTTP_IO_TIMEOUT = 30.0
+# A client that vanishes without closing (a sleeping laptop, a dropped
+# network) sends nothing a non-streaming request reads, which may run for
+# minutes; keepalive probes the idle connection and drops it 60 s after its
+# last data (30 s idle, then 3 probes 10 s apart), and the request is
+# cancelled as for a disconnect.
+TCP_KEEPALIVE_OPTIONS = (
+    (socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1),
+    (socket.IPPROTO_TCP, socket.TCP_KEEPALIVE, 30),
+    (socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 10),
+    (socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 3),
+)
 HTTP_UPLOAD_BYTES_PER_SECOND = 512 * 1024
 # Native events wake a waiting request at once; this only bounds how late a
 # client disconnect is noticed.
@@ -124,6 +135,8 @@ class FrontendHandler(BaseHTTPRequestHandler):
         self._unread_body = 0
         super().setup()
         self.connection.settimeout(HTTP_IO_TIMEOUT)
+        for level, option, value in TCP_KEEPALIVE_OPTIONS:
+            self.connection.setsockopt(level, option, value)
 
     def finish(self):
         if self._unread_body:
@@ -493,7 +506,8 @@ class FrontendHandler(BaseHTTPRequestHandler):
             )
         except BlockingIOError:
             return False
-        except ConnectionError:
+        except (ConnectionError, TimeoutError):
+            # A connection keepalive dropped fails its read with ETIMEDOUT.
             return True
 
     def _guarded_stream(self, job, run, send_error):
@@ -605,6 +619,7 @@ class FrontendServer(HTTPServer):
             "max_request_bytes": self.max_request_bytes,
             "connections": self.connections.stats(),
         }
+        status["console"] = CONSOLE.stats()
         return status
 
     def server_activate(self):

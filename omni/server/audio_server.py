@@ -15,6 +15,7 @@ import math
 import os
 import signal
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -23,7 +24,7 @@ from transformers import AutoTokenizer
 from . import audio_io, audio_runtime, json_codec, serve_options
 from .audio_backend import AudioBackend, print_audio_request
 from .audio_frontend import AudioFrontend, ModelProfile, parse_multipart
-from .diagnostics import print_status
+from .diagnostics import CONSOLE, print_status
 from .errors import APIError
 from .http_server import (
     NATIVE_START_TIMEOUT,
@@ -45,6 +46,13 @@ AUDIO_ROUTES = {
 # SPLASH_AUDIO_TRACE=1 prints each transcription's instants on stderr
 # (dev/tools/omni_request_trace.py joins them with the engine's).
 TRACE = os.environ.get("SPLASH_AUDIO_TRACE") == "1"
+# The status of a server that stopped relaunching its engine, apart from a
+# stop's 0 and a failed start's 1: what supervises the server, as launchd's
+# KeepAlive does, decides whether to start it again. 69 is sysexits'
+# EX_UNAVAILABLE.
+ENGINE_STOPPED_STATUS = os.EX_UNAVAILABLE
+# How long an exiting server waits for its last console lines to be written.
+CONSOLE_FLUSH_SECONDS = 2.0
 _CONTENT_TYPES = {"wav": "audio/wav", "pcm": "audio/pcm"}
 
 
@@ -421,6 +429,8 @@ def main():
     server = None
     runtime = None
     backend = None
+    # Set once the backend stops relaunching its engine for good.
+    engine_stopped = threading.Event()
     # A server started in the background from a non-interactive shell inherits
     # SIGINT as ignored and Python then leaves it alone; install both stop
     # signals explicitly so scripts and supervisors can interrupt it.
@@ -466,6 +476,16 @@ def main():
             pending_limit=args.queue_size,
         )
         backend = AudioBackend(runtime, request_logger=print_audio_request)
+
+        def stop_serving():
+            # From the thread that saw the last failure, which may be one
+            # serving a request: shutdown waits for serve_forever to return.
+            engine_stopped.set()
+            threading.Thread(
+                target=server.shutdown, name="splash-engine-stopped", daemon=True
+            ).start()
+
+        backend.on_stopped = stop_serving
         if not runtime.wait_ready():
             raise audio_runtime.EngineUnhealthy("native runtime did not become ready")
         readiness = runtime.readiness
@@ -500,6 +520,8 @@ def main():
             f"{readiness.max_concurrent_requests} lanes · {address}"
         )
         server.serve_forever()
+        if engine_stopped.is_set():
+            raise SystemExit(ENGINE_STOPPED_STATUS)
     except audio_runtime.EngineRuntimeError as error:
         print_status(f"Error · {error}", error=True)
         raise SystemExit(1) from None
@@ -525,6 +547,8 @@ def main():
             signal.signal(signal.SIGINT, signal.SIG_IGN)
             if server is not None:
                 server.server_close()
+            # The console's writer is a daemon thread: give it the last lines.
+            CONSOLE.flush(CONSOLE_FLUSH_SECONDS)
 
 
 if __name__ == "__main__":

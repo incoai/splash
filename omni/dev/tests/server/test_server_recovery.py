@@ -157,6 +157,23 @@ class ServerRecoveryTests(AudioHarnessTestCase):
         self.assertEqual(json.loads(payload)["error"]["code"], "engine_failed")
         self.assertEqual(runtime.startup_calls, 2)
 
+    def test_the_server_is_told_once_relaunching_stops(self):
+        runtime = RecoveringRuntime()
+        backend = self.harness(runtime).backend
+        stopped = []
+        backend.on_stopped = lambda: stopped.append(backend.fatal_error)
+        with (
+            mock.patch.object(backend_api, "RESTART_BACKOFF_SECONDS", 0.0),
+            mock.patch.object(backend_api, "print_status"),
+        ):
+            for _ in range(backend_api.CRASH_LOOP_LIMIT - 1):
+                runtime.fail(backend, served=1.0)
+                self.relaunched(runtime, backend)
+                self.assertEqual(stopped, [])
+            runtime.fail(backend, served=1.0)
+        self.assertEqual(len(stopped), 1)
+        self.assertIn("The server exits", stopped[0])
+
     def test_full_window_of_service_resets_the_crash_count(self):
         runtime = RecoveringRuntime()
         backend = self.backend(runtime)
