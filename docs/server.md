@@ -866,7 +866,10 @@ keep on the volume by the same count (`file_bytes`),
 `write_budget_bytes`, the bytes the next state's write not in use may take
 now, and `writes_deferred_ms`, how long writes held back for SSD reads a step
 waited for. Without a write budget `writes_gated` is
-never `budget` and `write_budget_bytes` is 0. `written_last_hour_bytes` and
+never `budget` and `write_budget_bytes` is 0. A cache the start asked for that
+is off, as on a volume with too little room beyond the space it keeps free,
+reports why in `off_reason`, the words of its `SSD cache off` line; absent
+while it is on, or set Off. `written_last_hour_bytes` and
 `written_last_day_bytes` are the cache's write rate: what its writes took over
 the last hour and the last day the Mac was awake, counted as the write budget
 counts them, with a budget or without. The day's bytes are the number to set

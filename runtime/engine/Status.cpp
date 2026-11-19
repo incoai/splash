@@ -528,6 +528,9 @@ void writeDisk(json::Writer &w, const engine::EngineSnapshot &core) {
         .field("persistent", resources.persistent)
         .field("kv_copies", tier.copies)
         .field("kv_copy_failures", tier.copyFailures);
+    // Why the SSD cache the start asked for is off; absent while it is on, or set Off.
+    if (!tier.offReason.empty())
+      w.field("off_reason", tier.offReason);
     w.object("taken_back", [&] {
       w.field("states", resources.adoption.states)
           .field("kv_blocks", resources.adoption.blocks)

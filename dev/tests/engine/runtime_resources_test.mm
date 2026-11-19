@@ -1345,6 +1345,8 @@ void testAutomaticTierYieldsToTheContext(const char *metallibPath) {
   RuntimeResourcesConfig config = loadableConfig(metallibPath, root.path(), "automatic-test");
   config.diskVolume = reading(localVolume(500 * kGiB));
   uint64_t minimumRequired = 0;
+  // The status's off_reason of the last start.
+  std::string offReason;
   const auto start = [&](uint32_t requestedContextTokens, uint32_t &contextTokens,
                          bool &tier) {
     return test::capturedStderr([&] {
@@ -1352,6 +1354,7 @@ void testAutomaticTierYieldsToTheContext(const char *metallibPath) {
       contextTokens = resources->memoryPlan().maximumContextTokens();
       minimumRequired = resources->memoryPlan().breakdown().minimumRequiredBytes;
       tier = resources->cache().snapshot().kvTier.capacityBytes != 0;
+      offReason = resources->cache().snapshot().kvTier.offReason;
     });
   };
   uint32_t without = 0, with = 0, yielded = 0;
@@ -1365,13 +1368,14 @@ void testAutomaticTierYieldsToTheContext(const char *metallibPath) {
   require(!tier && without, "a start without the SSD cache had one, or no context");
   config.cacheDisk = {.automatic = true};
   static_cast<void>(start(0, with, tier));
-  require(tier && with < without,
+  require(tier && with < without && offReason.empty(),
           "the automatic tier did not start, or its staging cost the plan no context");
   const std::string off = start(without, yielded, tier);
-  require(!tier && yielded == without &&
-              off.find("SSD cache off: the memory plan cannot hold a " + std::to_string(without) +
-                       "-token context beside its state staging") != std::string::npos,
-          "the automatic tier kept staging the requested context needs");
+  const std::string reason =
+      "the memory plan cannot hold a " + std::to_string(without) + "-token context beside its state staging";
+  require(!tier && yielded == without && off.find("SSD cache off: " + reason) != std::string::npos &&
+              offReason == reason,
+          "the automatic tier kept staging the requested context needs, or its status did not say why");
 }
 
 // The automatic tier's staging is decided by memory alone, so a start serves
@@ -1388,7 +1392,7 @@ void testAutomaticContextIgnoresTheVolume(const char *metallibPath) {
     uint32_t context = 0, planContext = 0;
     uint64_t staging = 0, minimumRequired = 0;
     bool tier = false, persistent = false;
-    std::string log;
+    std::string log, offReason;
   };
   const auto start = [&] {
     Started started;
@@ -1401,6 +1405,7 @@ void testAutomaticContextIgnoresTheVolume(const char *metallibPath) {
       const CacheSnapshot cache = resources->cache().snapshot();
       started.tier = cache.kvTier.capacityBytes != 0;
       started.persistent = cache.persistent;
+      started.offReason = cache.kvTier.offReason;
     });
     return started;
   };
@@ -1420,7 +1425,7 @@ void testAutomaticContextIgnoresTheVolume(const char *metallibPath) {
   config.diskVolume = reading(localVolume(500 * kGiB));
   const Started room = start();
   require(!off.tier && room.tier && room.staging == config.model.stateLayout.cachedBytes() &&
-              room.context == room.planContext && room.context < off.context,
+              room.context == room.planContext && room.context < off.context && room.offReason.empty(),
           "the automatic tier did not start beside its staging, or the staging cost no context");
   // A cached state in the running format (--cached-states exact) stages and
   // counts as a lane's cell and window, more than its codes.
@@ -1444,9 +1449,10 @@ void testAutomaticContextIgnoresTheVolume(const char *metallibPath) {
     config.diskVolume = reading(volume);
     const Started refused = start();
     require(!refused.tier && refused.staging == room.staging && refused.context == room.context &&
-                refused.planContext == room.planContext && offOnce(refused, reason),
+                refused.planContext == room.planContext && offOnce(refused, reason) &&
+                refused.offReason.find(reason) == 0,
             "a volume without room changed the automatic context, or did not leave the tier off "
-            "once (" + reason + ")");
+            "once, saying why in its status (" + reason + ")");
   }
   // A persistent cache's root without room leaves the tier temporary files;
   // with no room for those either, it is off.

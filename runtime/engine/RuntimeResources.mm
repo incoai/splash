@@ -197,6 +197,8 @@ struct DiskTier final {
   std::shared_ptr<model::SlotFile> kv;
   PersistentCacheFiles persistent;
   std::unique_ptr<DiskSpace> space;
+  // Why it is off though it had a quota (its "SSD cache off" line).
+  std::string offReason;
 };
 
 // Opens the tier's files where the disk takes them, with `quotaBytes` (none
@@ -249,23 +251,22 @@ DiskTier openDiskTier(const RuntimeResourcesConfig &config, const std::string &c
                                             config.cancelled);
       tier.states = tier.persistent.states;
     }
-    std::optional<std::string> off;
     if (!tier.states && temporaryRefusal) {
       if (rootRefusal)
-        off = "for its root, " + *rootRefusal + "; for temporary files, " + *temporaryRefusal;
+        tier.offReason = "for its root, " + *rootRefusal + "; for temporary files, " + *temporaryRefusal;
       else
-        off = config.persistentCache ? "for temporary files, " + *temporaryRefusal : *temporaryRefusal;
+        tier.offReason = config.persistentCache ? "for temporary files, " + *temporaryRefusal : *temporaryRefusal;
     } else if (!tier.states) {
       if (rootRefusal)
         logLine("Persistent cache off: ", *rootRefusal, "; the SSD cache keeps temporary files.");
       try {
         tier.states = std::make_shared<model::SlotFile>(stateSlotBytes, tier.budget, stateOptions);
       } catch (const std::exception &error) {
-        off = error.what();
+        tier.offReason = error.what();
       }
     }
-    if (off) {
-      logLine("SSD cache off: ", *off, "; the state staging the plan set aside stays unused.");
+    if (!tier.offReason.empty()) {
+      logLine("SSD cache off: ", tier.offReason, "; the state staging the plan set aside stays unused.");
       tier.budget.reset();
     }
   }
@@ -710,16 +711,17 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
   // size. It is the backend's like every other, so the governor charges it
   // beside the weights and the plan sets it aside before it sizes KV.
   uint64_t stateStagingBytes = 0;
+  // The tier turns off before the engine's plan is made with it, saying why.
+  std::string diskOffReason;
+  const auto diskOff = [&](std::string_view reason) {
+    logLine("SSD cache off: ", reason, "; no state staging is set aside.");
+    diskOffReason = reason;
+    stateStagingBytes = 0;
+  };
   if (cacheDiskBytes >= model::SlotFile::slotBytesFor(stateBytes))
     stateStagingBytes = stateBytes;
   else if (cacheDiskBytes)
-    logLine("SSD cache off: its quota holds no state of ", mebibytes(stateBytes),
-            " MiB; no state staging is set aside.");
-  // The automatic tier turns off before the engine's plan is made with it.
-  const auto diskOff = [&](std::string_view reason) {
-    logLine("SSD cache off: ", reason, "; no state staging is set aside.");
-    stateStagingBytes = 0;
-  };
+    diskOff("its quota holds no state of " + std::to_string(mebibytes(stateBytes)) + " MiB");
   // The one pool of SSD readers, which the model's streamed weights and the
   // reads of the KV the tier holds share. It goes after the model and the
   // tier, which read on it.
@@ -1229,6 +1231,8 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
     auto cache = std::make_unique<engine::Cache>(*kvPool, kvTier.get(), disk.budget, spillPolicy, windowPolicy);
     if (disk.space)
       cache->setDiskMeasure([space = disk.space.get()] { space->measure(); });
+    if (!disk.budget && cacheDiskBytes)
+      cache->setDiskOff(disk.offReason.empty() ? diskOffReason : disk.offReason);
     // A target that can spill holds one empty Index extent from the start
     // (the plan's indexRunwayBytes, one extent): a lane's first conversion
     // lands its pages there at the memory wall, where no allocation is

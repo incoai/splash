@@ -484,6 +484,9 @@ std::vector<std::pair<const char *, StatusInputs>> statusVariants() {
   resident.sample.streamedTable.reset();
   resident.sample.streamedExperts.reset();
   resident.sample.engine.resources.kvTier.writesGated = engine::DiskWritesGate::No;
+  // An SSD cache the start asked for that its volume left off says why.
+  resident.sample.engine.resources.kvTier.offReason =
+      "1.3 GiB available on /System/Volumes/Data is too little beyond the 10.0 GiB it keeps free";
   resident.sample.metalHealthy = false;
   resident.sample.metalFailureReason = "command buffer \"decode\" failed:\n\tGPU timeout";
   resident.sample.pipelinesCreatedWhileServing = 2;
