@@ -737,6 +737,10 @@ struct ServerTests {
         #expect(report.cacheOff == nil)
         let off = Server.report(Data(#"{"disk": {"capacity_bytes": 0, "off_reason": "1.3 GiB available on /System/Volumes/Data is too little beyond the 10.0 GiB it keeps free"}}"#.utf8))
         #expect(off?.cacheOff == "1.3 GiB available on /System/Volumes/Data is too little beyond the 10.0 GiB it keeps free")
+        // A concurrency limit past four says what it costs in context; the golden's four costs none.
+        #expect(report.lanesCost == nil)
+        let lanes = Server.report(Data(#"{"capabilities": {"max_context_tokens": 180224}, "memory_plan": {"maximum_context_tokens": 196608, "budget": {"maximum_batch_width": 8, "default_lanes_context_tokens": 262144}}}"#.utf8))
+        #expect(lanes?.lanesCost == Server.LanesCost(lanes: 8, context: 180224, defaultContext: 262144))
     }
 
     /// What a running request does, as the engine's phase gives it, and when it came; one without

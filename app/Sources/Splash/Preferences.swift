@@ -344,7 +344,7 @@ extension LaunchOption {
                                         text: { String($0.dropLast()) }, title: { "\($0.dropLast()) GB" }))),
         LaunchOption(
             flag: "--max-concurrent-requests", title: "Concurrency limit",
-            help: "How many requests the model answers at the same time. More give many chats or agents more words a second together, each a little slower, and take memory, which can stream more of the model from the disk or leave less context.",
+            help: "How many requests the model answers at the same time. More give many chats or agents more words a second together, each a little slower, and take memory, which can stream more of the model from the disk or leave less context: where it leaves less, the app says how much while the model runs.",
             section: .main,
             kind: .choice(standard: "4", choices: [1, 2, 3, 5, 6, 7, 8].map { (String($0), String($0)) }, custom: nil)),
         LaunchOption(

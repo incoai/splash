@@ -106,6 +106,8 @@ final class Server {
     /// disk with too little room beyond the space it keeps free (`disk.off_reason`); nil while it
     /// is on, or set Off.
     private(set) var cacheOff: String?
+    /// What the server running pays in context for its concurrency limit, where it pays any.
+    private(set) var lanesCost: LanesCost?
     /// Once ready: whether the model takes images and PDFs, which come together (`input_modalities`).
     private(set) var acceptsImages = false
     /// Once ready: what a request to it may carry, as `/v1/models` says.
@@ -265,6 +267,7 @@ final class Server {
         recovering = false
         context = nil
         cacheOff = nil
+        lanesCost = nil
         activity = Activity()
         requests = []
         acceptsImages = false
@@ -479,6 +482,15 @@ final class Server {
         // A relaunched engine may serve less context than the first did.
         if let served = report.context { context = served }
         cacheOff = report.cacheOff
+        lanesCost = report.lanesCost
+    }
+
+    /// The requests a server answers at once past the default's, the context it serves with them
+    /// and the context the default's four would leave (`memory_plan.budget`).
+    struct LanesCost: Equatable {
+        var lanes: Int
+        var context: Int
+        var defaultContext: Int
     }
 
     /// What the server's status says: the work it has done, whether it has given the weights back
@@ -491,6 +503,8 @@ final class Server {
         var context: Int?
         /// Why the SSD cache asked for is off.
         var cacheOff: String?
+        /// What its concurrency limit costs in context, where it costs any.
+        var lanesCost: LanesCost?
         /// The requests the engine works on, as they were at `taken`.
         var live: [LiveRequest] = []
         /// When the engine's requests were as `live` has them, at the earliest: as the status was
@@ -520,6 +534,12 @@ final class Server {
             recovering: status.transport?.recovering ?? false,
             context: status.capabilities?.max_context_tokens,
             cacheOff: status.disk?.off_reason,
+            // The context it serves, against what four lanes would serve.
+            lanesCost: status.memory_plan?.budget.flatMap { budget in
+                guard let lanes = budget.maximum_batch_width, let more = budget.default_lanes_context_tokens,
+                      more > 0, let context = status.capabilities?.max_context_tokens else { return nil }
+                return LanesCost(lanes: lanes, context: context, defaultContext: more)
+            },
             // A request without the engine's id has none: no line or later status could be told
             // from it.
             live: (status.active_requests ?? []).compactMap { request in
@@ -563,6 +583,13 @@ final class Server {
         struct Cache: Decodable { let reused_tokens: Int? }
         struct Memory: Decodable { let current_bytes: Int64? }
         struct Disk: Decodable { let off_reason: String? }
+        struct MemoryPlan: Decodable {
+            struct Budget: Decodable {
+                let maximum_batch_width: Int?
+                let default_lanes_context_tokens: Int?
+            }
+            let budget: Budget?
+        }
         let capabilities: Capabilities?
         let weights: Weights?
         let transport: Transport?
@@ -570,6 +597,7 @@ final class Server {
         let active_requests: [Request]?
         let metrics: Metrics?
         let cache: Cache?
+        let memory_plan: MemoryPlan?
         let memory_actual: Memory?
         let disk: Disk?
     }

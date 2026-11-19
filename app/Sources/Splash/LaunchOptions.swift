@@ -15,6 +15,10 @@ struct LaunchOptions: View {
         let family = state.family(of: state.selection)
         GroupedSection {
             ForEach(Self.options(.main, for: family)) { OptionRow(option: $0, family: family) }
+            // What the model running pays in context for answering more requests at once than four.
+            if state.server.phase == .ready, let cost = state.server.lanesCost {
+                LanesCostNote(cost: cost)
+            }
             DisclosureRow(title: "Advanced", open: $advanced)
                 .background(ViewAnchor { row.view = $0 })
                 .onChange(of: advanced) { if advanced { row.scrollToTop() } else { row.stop() } }
@@ -80,6 +84,20 @@ extension EnvironmentValues {
     /// What the launch option of the row the view is in lacks to apply, while it doesn't
     /// (`LaunchOption.lacks`).
     @Entry var optionRowNeeds: String?
+}
+
+/// What the server running pays in context for a concurrency limit past four.
+private struct LanesCostNote: View {
+    let cost: Server.LanesCost
+
+    var body: some View {
+        Label("The model running answers \(cost.lanes) requests at once, which leaves \(ContextLength.title(cost.context)) of context; 4 would leave \(ContextLength.title(cost.defaultContext)).",
+              systemImage: "info.circle")
+            .font(.callout)
+            .foregroundStyle(.secondary)
+            .fixedSize(horizontal: false, vertical: true)
+            .frame(maxWidth: .infinity, alignment: .leading)
+    }
 }
 
 /// Why the server running has the SSD cache off though its options asked for one, in the
