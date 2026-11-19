@@ -151,6 +151,30 @@ template <uint HeadDim> constexpr float splash_attention_scale() {
   return HeadDim == 256 ? 0.0625f : 0.08838834764831845f;
 }
 
+// The pages [begin, end) that every row of a tile sees wholly, so that their
+// softmax tests no token: from the first page at or past the window start of
+// the tile's last row (every row's window starts at or before it), to the
+// page holding the tile's first row, below which every row sees every key, or
+// a tree's anchor, from which a block's rows are masked by path (a lane's
+// second tile starts past its anchor). FlashInfer's prefill masks only its
+// iterations from mask_iteration on, and llama.cpp's fa_tensor.metal skips
+// the mask of blocks it classed unmasked. Measured on an M5 Pro with 16 GPU
+// cores (attention-sweep, INT8 KV, 32K and 98K): the 35B's split 1.4-3.9%
+// faster in prefill and verify, the 27B's prefill 2.3% and its 16-row lanes'
+// verify 0.7-1.5%; output bits unchanged.
+struct SplashAttentionWholePages {
+  uint begin;
+  uint end;
+};
+
+template <uint Window>
+inline SplashAttentionWholePages splash_attention_whole_pages(uint first_position, uint active_rows, bool tree,
+                                                              uint anchor) {
+  constexpr uint N = SplashKvPageTokens;
+  const uint last_start = splash_attention_window_start<Window>(first_position + active_rows - 1);
+  return {(last_start + N - 1) / N, (tree ? anchor : first_position) / N};
+}
+
 // The lanes of one fused row in the page loop: the softmax's, eight of a
 // page's tokens each, and the query quantization's, so that each lane holds
 // its own row's query scale.
@@ -175,7 +199,9 @@ constant uint SplashAttentionLanesPerRow = 4;
 // window, its position the anchor's plus its `depth`, and of the block's
 // rows those its `ancestors` hold, itself among them; only a page that
 // holds rows of the block tests them.
-template <uint QueryHeadsPerKVHead, uint RowsPerTile, uint Window, bool Quantized, typename Score>
+// Masked false is a page every row of the tile sees wholly
+// (splash_attention_whole_pages): its tokens are all seen, untested.
+template <uint QueryHeadsPerKVHead, uint RowsPerTile, uint Window, bool Quantized, bool Masked, typename Score>
 inline void splash_attention_page_softmax(
     threadgroup const Score *scores, float score_scale, threadgroup bfloat *probabilities,
     threadgroup float *row_max, threadgroup float *row_sum,
@@ -196,30 +222,36 @@ inline void splash_attention_page_softmax(
     return;
   const uint fused_row = thread_index / LanesPerRow;
   const uint column = thread_index % LanesPerRow * TokensPerLane;
-  const uint query_row = fused_row / QueryHeadsPerKVHead;
-  const uint causal_end =
-      committed_tokens + min(query_row, active_rows - 1) + 1;
-  // The row sees the tokens of [start, its causal end): its window's, or
-  // with no window its whole history's. Tokens and limit count from start,
-  // so one unsigned comparison tests both ends: a token before start wraps
-  // past every limit.
-  const uint start = splash_attention_window_start<Window>(tree ? anchor + depth : causal_end - 1);
-  const uint limit = min(visible_tokens, causal_end) - start;
-  const uint token = token_start + column - start;
-  // Bit j: the lane's token j is a row of the tree's block off the row's
-  // path, which it does not see.
-  uint off_path = 0;
-  if (tree && token_start + N > anchor) {
-#pragma unroll
-    for (uint j = 0; j < TokensPerLane; ++j) {
-      const uint slot = token_start + column + j;
-      off_path |= uint(slot >= anchor && !((ancestors >> min(slot - anchor, 31u)) & 1u)) << j;
-    }
-  }
   bool seen[TokensPerLane];
+  if constexpr (Masked) {
+    const uint query_row = fused_row / QueryHeadsPerKVHead;
+    const uint causal_end =
+        committed_tokens + min(query_row, active_rows - 1) + 1;
+    // The row sees the tokens of [start, its causal end): its window's, or
+    // with no window its whole history's. Tokens and limit count from start,
+    // so one unsigned comparison tests both ends: a token before start wraps
+    // past every limit.
+    const uint start = splash_attention_window_start<Window>(tree ? anchor + depth : causal_end - 1);
+    const uint limit = min(visible_tokens, causal_end) - start;
+    const uint token = token_start + column - start;
+    // Bit j: the lane's token j is a row of the tree's block off the row's
+    // path, which it does not see.
+    uint off_path = 0;
+    if (tree && token_start + N > anchor) {
 #pragma unroll
-  for (uint j = 0; j < TokensPerLane; ++j)
-    seen[j] = token + j < limit && !((off_path >> j) & 1u);
+      for (uint j = 0; j < TokensPerLane; ++j) {
+        const uint slot = token_start + column + j;
+        off_path |= uint(slot >= anchor && !((ancestors >> min(slot - anchor, 31u)) & 1u)) << j;
+      }
+    }
+#pragma unroll
+    for (uint j = 0; j < TokensPerLane; ++j)
+      seen[j] = token + j < limit && !((off_path >> j) & 1u);
+  } else {
+#pragma unroll
+    for (uint j = 0; j < TokensPerLane; ++j)
+      seen[j] = true;
+  }
   threadgroup const vec<Score, 4> *scores4 =
       reinterpret_cast<threadgroup const vec<Score, 4> *>(scores + fused_row * N + column);
   const uint vector = column / 4;
@@ -424,6 +456,8 @@ inline void splash_paged_attention_tile(
       running[index] = 0.0f;
   }
 
+  const SplashAttentionWholePages whole =
+      splash_attention_whole_pages<Window>(committed_tokens, active_rows, in_tree, tree.anchor);
   for (uint page = page_begin; page < page_end; ++page) {
     const SplashKvPageTensors<CacheElement> tensors =
         addressing.page(page_table[page]);
@@ -442,11 +476,18 @@ inline void splash_paged_attention_tile(
     if (thread_index == 0)
       atomic_store_explicit(rescale, 0u, memory_order_relaxed);
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    splash_attention_page_softmax<QueryHeadsPerKVHead, RowsPerTile, Window, Quantized>(
-        page_score_tile, score_scale, probabilities, row_max, row_sum, previous_scale, rescale,
-        reinterpret_cast<device const float4 *>(key_scales),
-        reinterpret_cast<device const float4 *>(value_scales), token_start,
-        visible_tokens, committed_tokens, active_rows, in_tree, tree.anchor, ancestors, depth, thread_index);
+    if (page >= whole.begin && page < whole.end)
+      splash_attention_page_softmax<QueryHeadsPerKVHead, RowsPerTile, Window, Quantized, false>(
+          page_score_tile, score_scale, probabilities, row_max, row_sum, previous_scale, rescale,
+          reinterpret_cast<device const float4 *>(key_scales),
+          reinterpret_cast<device const float4 *>(value_scales), token_start,
+          visible_tokens, committed_tokens, active_rows, in_tree, tree.anchor, ancestors, depth, thread_index);
+    else
+      splash_attention_page_softmax<QueryHeadsPerKVHead, RowsPerTile, Window, Quantized, true>(
+          page_score_tile, score_scale, probabilities, row_max, row_sum, previous_scale, rescale,
+          reinterpret_cast<device const float4 *>(key_scales),
+          reinterpret_cast<device const float4 *>(value_scales), token_start,
+          visible_tokens, committed_tokens, active_rows, in_tree, tree.anchor, ancestors, depth, thread_index);
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (atomic_load_explicit(rescale, memory_order_relaxed)) {
 #pragma unroll
