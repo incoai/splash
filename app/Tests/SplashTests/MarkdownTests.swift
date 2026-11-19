@@ -63,4 +63,33 @@ extension TranscriptTests {
             """, as: [Double].self) ?? []
         #expect(heights.count == 2 && heights[0] > 0 && heights[0] == heights[1], "\(heights)")
     }
+
+    /// A table that streams shows as a table from its first frame: its header line, alone or with
+    /// part of the line of dashes under it, is a paragraph to the parser, and drew as text with
+    /// its bars before the table took its place. It waits until it is one; what is no table after
+    /// all draws as the reply ends.
+    @Test func aTableThatStreamsNeverShowsItsBars() async throws {
+        let counts = try await drawn("""
+            const box = document.createElement('div')
+            // Of each text as it streams: how many tables it draws, whether a bar shows, and how
+            // many blocks; then the last text, whole.
+            const stream = (text, live = true) => {
+              markdown.draw(box, text, live)
+              return [box.querySelectorAll('table').length, box.textContent.includes('|') ? 1 : 0, box.children.length]
+            }
+            const texts = ['Here they are:\\n\\n| File | Si', 'Here they are:\\n\\n| File | Size |\\n',
+                           'Here they are:\\n\\n| File | Size |\\n|--', 'Here they are:\\n| File | Size |\\n|:--|',
+                           'Here they are:\\n\\n| File | Size |\\n|---|---|\\n| a.py | 1 K',
+                           'Then:\\n\\n|x| is its size']
+            return [...texts.flatMap(text => stream(text)), ...stream(texts[5], false)]
+            """) ?? []
+        // The header alone, with its line's end, and with part of the dashes: the sentence, no bar.
+        #expect(Array(counts.prefix(9)) == [0, 0, 1, 0, 0, 1, 0, 0, 1], "\(counts)")
+        // Under a sentence with no empty line between: the sentence still, no bar.
+        #expect(Array(counts.dropFirst(9).prefix(3)) == [0, 0, 1], "\(counts)")
+        // The table once the dashes have a cell for each of the header's, its row as it comes.
+        #expect(Array(counts.dropFirst(12).prefix(3)) == [1, 0, 2], "\(counts)")
+        // A line of bars that is no table waits while it streams, and draws as the reply ends.
+        #expect(Array(counts.dropFirst(15)) == [0, 0, 1, 0, 1, 2], "\(counts)")
+    }
 }

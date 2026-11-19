@@ -161,7 +161,13 @@ const markdown = (() => {
   // level, after a blank line and at the column's start, and no list item, as a list goes on past
   // a blank line. A line that might still become an item, "1" or "-", counts as one. Also whether
   // the text ends in a fence that is still open: one that reaches its end with no closing line,
-  // all of its lines but the first being its code.
+  // all of its lines but the first being its code. And where what draws of it ends: before a table
+  // that only begins at its end, a line that starts with a bar, alone or with as much of the line
+  // under it, the one of dashes, as has come. Until that line has a cell for each of the header's
+  // the two are a paragraph to the parser, which a reply that streams would draw as text, bars and
+  // dashes, then again as the table. They wait for it; a line of bars that never becomes a table
+  // draws as the reply ends. The last block is the same parsed from `start` as from the cut, as
+  // what comes before the cut draws alone.
   function scan(text, start) {
     const rest = text.slice(start);
     let tokens = [];
@@ -173,13 +179,16 @@ const markdown = (() => {
     let cut = start;
     let at = start;
     let blank = false;
-    let number = 0;
-    // The lines as the text breaks them, which the parser numbers alike, and an empty one after them.
+    // The lines as the text breaks them, which the parser numbers alike, and an empty one after
+    // them, and where each starts in `text`.
+    const lines = [];
+    const starts = [];
     for (const [line] of rest.matchAll(/[^\r\n]*(?:\r\n?|\n|$)/g)) {
-      if (blank && blocks.has(number) && /^\S/.test(line) && !/^([-+*]|\d{1,9}[.)]?)(\s|$)/.test(line)) cut = at;
+      if (blank && blocks.has(lines.length) && /^\S/.test(line) && !/^([-+*]|\d{1,9}[.)]?)(\s|$)/.test(line)) cut = at;
       blank = line.trim() === '';
+      lines.push(line);
+      starts.push(at);
       at += line.length;
-      number++;
     }
     // The fence's code lines: its content ends each with a line break, but the last one where the
     // text ends mid-line. It reaches the end of the text as the parser counts its lines, which
@@ -187,14 +196,26 @@ const markdown = (() => {
     // counts them once each \r\n or \r is a \n, as `parse` makes it.
     const fence = tokens.findLast(token => token.type === 'fence');
     const code = fence?.content === '' ? 0 : fence?.content.replace(/\n$/, '').split('\n').length;
-    const lines = fence ? new parser.block.State(rest.replace(/\r\n?/g, '\n'), parser, {}, []).lineMax : 0;
-    return {cut, open: fence?.map[1] === lines && fence.map[1] - fence.map[0] === code + 1};
+    const lineMax = fence ? new parser.block.State(rest.replace(/\r\n?/g, '\n'), parser, {}, []).lineMax : 0;
+    const open = fence?.map[1] === lineMax && fence.map[1] - fence.map[0] === code + 1;
+    // The table that only begins at the end, in the last block, a paragraph.
+    const last = tokens.findLast(token => token.level === 0 && token.map);
+    let end = text.length;
+    if (last?.type === 'paragraph_open') {
+      const bars = line => /^ {0,3}\|/.test(line);
+      const line = last.map[1] - 1;
+      const under = line > last.map[0] && bars(lines[line - 1]) && /^ {0,3}[|:\- ]+\s*$/.test(lines[line]);
+      const from = under ? line - 1 : bars(lines[line]) ? line : -1;
+      if (from >= 0) end = starts[from];
+    }
+    return {cut, open, end};
   }
 
   // Draws `text` into `container` as Markdown. Whole, it changes only the nodes that differ from
   // what the container shows, so that a reply drawn again keeps its selection and its place. While
   // it streams, `live`, what it has finished, up to where `scan` cuts it, stays as it was drawn,
-  // and only the rest is drawn again: each frame draws the end of a reply, never all of it.
+  // and only the rest is drawn again: each frame draws the end of a reply, never all of it, and
+  // not yet a table that only begins there (`scan`).
   function draw(container, text, live = false) {
     container.wanted = undefined;
     const last = container.markdown;
@@ -210,9 +231,9 @@ const markdown = (() => {
       return;
     }
     const kept = last?.live && text.startsWith(last.frozen) ? last : {frozen: '', count: 0};
-    const {cut, open} = scan(text, kept.frozen.length);
+    const {cut, open, end} = scan(text, kept.frozen.length);
     const finished = cut > kept.frozen.length ? nodes(render(text.slice(kept.frozen.length, cut))) : [];
-    replace(container, kept.count, [...finished, ...nodes(render(text.slice(cut), open))]);
+    replace(container, kept.count, [...finished, ...nodes(render(text.slice(cut, end), open))]);
     container.markdown = {text, live, frozen: text.slice(0, cut), count: kept.count + finished.length};
   }
 
