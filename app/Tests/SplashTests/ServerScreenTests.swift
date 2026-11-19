@@ -384,17 +384,17 @@ extension ServerScreenTests {
 }
 
 extension ServerScreenTests {
-    /// The page of `window` drawn through `change`: as drawn before it, every 30 ms or so for 0.3 s
-    /// after it, each with how long after, and once it has stopped changing, which a slow Mac
-    /// reaches long after the animations' length.
-    static func pictures(of window: NSWindow, through change: () -> Void) async throws
+    /// The page of `window` drawn through `change`: as drawn before it, ten times after it, each
+    /// after `every` seconds of the run loop (30 ms: 0.3 s in all), with how long after, and once it
+    /// has stopped changing, which a slow Mac reaches long after the animations' length.
+    static func pictures(of window: NSWindow, every interval: TimeInterval = 0.03, through change: () -> Void) async throws
         -> (before: NSBitmapImageRep, drawn: [(at: Duration, picture: NSBitmapImageRep)], after: NSBitmapImageRep) {
         let before = try #require(await Snapshot.picture(of: window))
         let start = ContinuousClock.now
         change()
         var drawn: [(at: Duration, picture: NSBitmapImageRep)] = []
         for _ in 0..<10 {
-            pump(0.03)
+            pump(interval)
             drawn.append((ContinuousClock.now - start, try #require(await Snapshot.picture(of: window))))
         }
         var after = try #require(await Snapshot.picture(of: window))
@@ -689,10 +689,12 @@ extension ServerScreenTests {
 
 /// A grouped page of the launch options between sections, the one under them with a red row.
 private struct LaunchOptionsSample: View {
+    var row = ScrollTarget()
+
     var body: some View {
         Group {
             GroupedSection { ForEach(0..<8, id: \.self) { Text("Row \($0)") } }
-            LaunchOptions()
+            LaunchOptions(row: row)
             GroupedSection { Color.red.frame(height: 40) } header: { Text("Below") }
             GroupedSection { ForEach(0..<4, id: \.self) { Text("Last \($0)") } }
         }
@@ -717,7 +719,10 @@ extension ServerScreenTests {
     /// Opening Advanced with the page at its end moves nothing under the launch options up: the
     /// options it opens push the section under them down. The frame after the click drew the
     /// card without Advanced's row, the section under it moved up by the row's height, as the
-    /// switches among the options came in.
+    /// switches among the options came in. The pictures start at the first frame after the
+    /// click's update and come every 5 ms: the scroll to Advanced's first step drew the section
+    /// 14.5 points up in that frame (+25.5 points of scroll, +11 of push), which pictures 30 ms
+    /// apart missed unless other tests' work on the main thread shifted them.
     @Test func openingAdvancedAtThePagesEndMovesNothingUp() async throws {
         let (state, folder) = AppState.forTests()
         defer { try? FileManager.default.removeItem(at: folder) }
@@ -738,16 +743,46 @@ extension ServerScreenTests {
         let frame = row.convert(row.bounds, to: nil)
         let point = NSPoint(x: frame.minX + 40, y: frame.midY)
         let closed = scroll.documentView!.frame.height
-        let change = try await Self.pictures(of: window) {
-            for type in [NSEvent.EventType.leftMouseDown, .leftMouseUp] {
-                window.sendEvent(NSEvent.mouseEvent(with: type, location: point, modifierFlags: [], timestamp: ProcessInfo.processInfo.systemUptime,
-                                                    windowNumber: window.windowNumber, context: nil, eventNumber: 0, clickCount: 1, pressure: 1)!)
-            }
+        let change = try await Self.pictures(of: window, every: 0.005) {
+            Self.click(point, in: window)
+            // The click's update.
+            pump(0)
         }
         let before = try #require(Self.redTop(change.before, of: window))
         let tops = change.drawn.map { Self.redTop($0.picture, of: window) }
         #expect(scroll.documentView!.frame.height > closed + 300, "Advanced opened")
         #expect(tops.allSatisfy { ($0 ?? .infinity) >= before - 1 }, "the section under the disclosure, at \(before), was drawn at \(tops)")
+    }
+
+    /// Closing Advanced before its options have unfolded ends the scroll to them within the time
+    /// an unfolding takes, though the scroll never reaches the options' laid-out place: a display
+    /// link left running would call it each frame for as long as the page showed. With Reduce
+    /// Motion the options open at once, and the link ends within that time too.
+    @Test func closingAdvancedWhileItUnfoldsEndsTheScroll() async throws {
+        let (state, folder) = AppState.forTests()
+        defer { try? FileManager.default.removeItem(at: folder) }
+        let row = ScrollTarget()
+        let window = await Snapshot.window(GroupedPage(column: 640) { LaunchOptionsSample(row: row) }.environment(state),
+                                           size: ServerPictures.size, appearance: .aqua)
+        defer { window.orderOut(nil) }
+        pump(0.3)
+        let anchor = try #require(row.view)
+        let frame = anchor.convert(anchor.bounds, to: nil)
+        let point = NSPoint(x: frame.minX + 40, y: frame.midY)
+        Self.click(point, in: window)
+        pump(0.05)
+        #expect(row.link != nil || Motion.reduced, "opening Advanced started no scroll")
+        Self.click(point, in: window)
+        pump(Motion.settleSpring.settlingDuration)
+        #expect(row.link == nil, "the scroll still ran after Advanced closed")
+    }
+
+    /// A click at `point`, in `window`'s coordinates.
+    static func click(_ point: NSPoint, in window: NSWindow) {
+        for type in [NSEvent.EventType.leftMouseDown, .leftMouseUp] {
+            window.sendEvent(NSEvent.mouseEvent(with: type, location: point, modifierFlags: [], timestamp: ProcessInfo.processInfo.systemUptime,
+                                                windowNumber: window.windowNumber, context: nil, eventNumber: 0, clickCount: 1, pressure: 1)!)
+        }
     }
 }
 
