@@ -34,6 +34,8 @@
 #include "ops/Vision.hpp"
 #include "tools/LoadOptions.hpp"
 
+#import <Foundation/Foundation.h>
+
 #include <algorithm>
 #include <array>
 #include <bit>
@@ -283,6 +285,8 @@ struct OracleTokens final {
   // line. Continue until you reach 200." from the user, answered without
   // thinking: an empty think block.
   std::vector<uint32_t> productionSeed;
+  std::vector<uint32_t> markers{}, openedMarkers{}, longMarkers{}, opening{}, filler{}, markerClose{};
+  SamplingParameters sampling{};
 
   [[nodiscard]] uint32_t maskWords() const noexcept { return (vocabulary + 31) / 32; }
 };
@@ -331,6 +335,65 @@ const OracleTokens *targetTokens = &kQwenTokens;
   require(tokens.vocabulary == descriptor.capabilities.vocabularySize,
           "model-runtime oracle has no token fixture for this vocabulary");
   return tokens;
+}
+
+OracleTokens readOracleTokens(const std::filesystem::path &path, uint32_t vocabulary) {
+  require(std::filesystem::file_size(path) <= (1u << 20), "oracle token fixture is too large");
+  NSData *data = [NSData dataWithContentsOfFile:[NSString stringWithUTF8String:path.c_str()]];
+  id value = data ? [NSJSONSerialization JSONObjectWithData:data options:0 error:nullptr] : nil;
+  require([value isKindOfClass:[NSDictionary class]], "oracle token fixture is not a JSON object");
+  NSDictionary *object = value;
+  const auto number = [&](NSString *key) -> double {
+    id item = object[key];
+    require([item isKindOfClass:[NSNumber class]], "oracle token fixture number is missing");
+    const double result = [item doubleValue];
+    require(std::isfinite(result), "oracle token fixture number is not finite");
+    return result;
+  };
+  require(number(@"vocabulary") == vocabulary, "oracle token fixture vocabulary differs from the model");
+  const auto words = [&](NSString *key, uint32_t limit) {
+    id array = object[key];
+    require([array isKindOfClass:[NSArray class]] && [array count] && [array count] <= limit,
+            "oracle token fixture array is missing or oversized");
+    std::vector<uint32_t> result;
+    for (id item in array) {
+      require([item isKindOfClass:[NSNumber class]], "oracle token fixture word is not a number");
+      const double word = [item doubleValue];
+      require(word >= 0 && word <= UINT32_MAX && std::floor(word) == word,
+              "oracle token fixture word is not uint32");
+      result.push_back(static_cast<uint32_t>(word));
+    }
+    return result;
+  };
+  OracleTokens result;
+  result.vocabulary = vocabulary;
+  result.thinkingPrompt = words(@"thinking_prompt", 4096);
+  result.samplingSeed = words(@"sampling_seed", 4096);
+  result.productionSeed = words(@"production_seed", 4096);
+  result.thinkingEnds = {words(@"thinking_end", 64), words(@"long_end", 64)};
+  result.thinkEnd = result.thinkingEnds[0].back();
+  result.markers = words(@"thinking_markers", TokenAutomaton::maximumWords);
+  result.openedMarkers = words(@"opened_markers", TokenAutomaton::maximumWords);
+  result.longMarkers = words(@"long_markers", TokenAutomaton::maximumWords);
+  result.opening = words(@"opening", 64);
+  result.filler = words(@"filler", 64);
+  result.markerClose = words(@"marker_close", 64);
+  for (const auto *tokens : {&result.thinkingPrompt, &result.samplingSeed, &result.productionSeed,
+                             &result.thinkingEnds[0], &result.thinkingEnds[1], &result.opening, &result.filler,
+                             &result.markerClose})
+    require(std::ranges::all_of(*tokens, [=](uint32_t token) { return token < vocabulary; }),
+            "oracle token fixture has an out-of-vocabulary token");
+  require(TokenAutomaton(result.markers).valid(vocabulary) &&
+              TokenAutomaton(result.openedMarkers).valid(vocabulary) &&
+              TokenAutomaton(result.longMarkers).valid(vocabulary), "invalid oracle marker fixture");
+  result.sampling.temperature = number(@"temperature");
+  result.sampling.topP = number(@"top_p");
+  const double topK = number(@"top_k");
+  require(topK >= 0 && topK <= vocabulary && std::floor(topK) == topK, "invalid oracle top_k");
+  result.sampling.topK = static_cast<uint32_t>(topK);
+  require(!result.sampling.validationError() && result.sampling.temperature > 0,
+          "oracle fixture needs valid sampled reasoning");
+  return result;
 }
 
 struct Similarity final {
@@ -526,6 +589,7 @@ EngineRequest makeRequest(uint64_t id, std::vector<uint32_t> prompt,
   result.id = id;
   result.prompt = std::move(prompt);
   result.maxNewTokens = maximumNewTokens;
+  result.sampling = targetTokens->sampling;
   return result;
 }
 
@@ -1310,6 +1374,8 @@ void requireFullWindowRestore(model::Runtime &executor,
   const std::span<const uint32_t> tokens(prompt);
   const std::vector<uint32_t> pages = pageRange(0, prompt.size() / kv::kPageTokens);
   EngineRequest request = makeRequest(104, prompt, 1);
+  request.maxNewTokens = 0;
+  for (uint32_t index = 0; index < 16; ++index) request.scoreTokens.push_back(1000 + 37 * index);
   beginCold(executor, request, 0);
   const std::array<uint32_t, 1> checkpoints{boundary};
   executor.setDraftContextPlan(request.id, planDraftContext(0, prompt.size(), checkpoints, executor.draftWindow()));
@@ -1322,7 +1388,7 @@ void requireFullWindowRestore(model::Runtime &executor,
   auto checkpoint = executor.snapshot(request.id);
   require(checkpoint != nullptr, "full-window checkpoint allocation failed");
   decodeLane(states, 0);
-  prefillChunk(executor, request.id, boundary, tokens.subspan(boundary), pages);
+  const auto cold = prefillChunk(executor, request.id, boundary, tokens.subspan(boundary), pages);
   const auto expected = sampleCommittedState(backend, states, 0, boundary);
   executor.end(request.id);
   // With the idle rings reclaimed, the restored lane's rings hold none of the
@@ -1332,7 +1398,9 @@ void requireFullWindowRestore(model::Runtime &executor,
   request.id = 105;
   beginCold(executor, request, 0);
   restoreActivePrefix(executor, request.id, prompt.size(), boundary, checkpoint);
-  prefillChunk(executor, request.id, boundary, tokens.subspan(boundary), pages);
+  const auto restored = prefillChunk(executor, request.id, boundary, tokens.subspan(boundary), pages);
+  require(!cold.scoreLogits.empty() && cold.scoreLogits == restored.scoreLogits,
+          "full-window restoration changed the target's continuation logits");
   compareCommittedSamples(expected, sampleCommittedState(backend, states, 0, boundary), true);
   executor.end(request.id);
   std::cout << "full_window_restore=PASS\n";
@@ -2688,6 +2756,8 @@ decodeConstrainedTogether(model::Runtime &executor, std::span<const uint64_t> id
               "a constrained joint decode accepted more draft tokens than it drafted");
       JointDecode &decoded = generated[lanes[index]];
       decoded.drafts.emplace_back(decoded.tokens.size(), results[index].draftedTokens);
+      decoded.lookups.push_back(static_cast<uint32_t>(
+          model::RuntimeInstrumentation::lookupChain(executor, ids[lanes[index]]).size()));
       decoded.tokens.insert(decoded.tokens.end(), results[index].outputTokens.begin(),
                             results[index].outputTokens.end());
       decoded.cycles.resize(decoded.tokens.size(), cycle);
@@ -5958,15 +6028,281 @@ void warmupEos(model::RuntimeContext context, model::LoadedModel &model) {
             << " decode_stop=" << decodeStop << '\n';
 }
 
+// The non-recurrent contract: target-only forwards check every retained
+// speculative row against its actual history, rather than another draft.
+void requireSampledTargetRows(model::Runtime &executor, const metal::MetalBackend &backend,
+                              const model::QwenStateStorage &states, uint32_t verifyRows) {
+  struct Control { std::vector<uint32_t> history; std::vector<float> logits; };
+  std::vector<Control> controls;
+  const uint32_t vocabulary = targetTokens->vocabulary;
+  EngineRequest request = makeRequest(9100, targetTokens->samplingSeed, 96);
+  request.flags = RequestIgnoreEndOfSequence;
+  request.sampling.seed = 42;
+  request.thinkingBudget = ThinkingBudget{80, targetTokens->thinkingEnds[0], 0, targetTokens->markers};
+  const auto pages = pageRange(0, 16);
+  beginCold(executor, request, 0);
+  requireOpen(prefillChunk(executor, request.id, 0, request.prompt, pages), "sampled target-row fixture");
+  model::RuntimeInstrumentation::captureTargetLogits(executor, true);
+  model::RuntimeInstrumentation::forceStepRows(executor, verifyRows);
+  std::vector<uint32_t> history = request.prompt;
+  uint32_t widest = 0, accepted = 0;
+  for (uint32_t cycle = 0; cycle < 4; ++cycle) {
+    const auto result = decodeOne(executor, request.id, history.size(), pages);
+    require(result.failure.empty() && !result.outputTokens.empty() && !result.finished &&
+                result.outputTokensWithoutKv == 0 && result.acceptedDraftTokens <= result.draftedTokens,
+            "sampled speculative cycle failed or violated output accounting");
+    auto logits = model::RuntimeInstrumentation::takeTargetLogits(executor);
+    require(logits.size() == 1, "speculative target rows were not captured");
+    const uint32_t rows = model::RuntimeInstrumentation::lastVerifyRows(executor, 0);
+    const uint32_t retained = model::RuntimeInstrumentation::lastRetainedRows(executor, 0);
+    require(logits[0].size() == uint64_t{rows} * vocabulary &&
+                std::popcount(retained) == static_cast<int>(result.outputTokens.size()),
+            "speculative retained rows do not describe the emitted path");
+    widest = std::max(widest, rows);
+    accepted += result.acceptedDraftTokens;
+    size_t emitted = 0;
+    for (uint32_t path = retained; path; path &= path - 1, ++emitted) {
+      history.push_back(result.outputTokens.at(emitted));
+      const uint32_t row = std::countr_zero(path);
+      const auto begin = logits[0].begin() + uint64_t{row} * vocabulary;
+      controls.push_back({history, {begin, begin + vocabulary}});
+    }
+    require(states.metadata(0).lengths.targetTokens == history.size(),
+            "speculative commit retained a different number of target positions");
+  }
+  require(widest == verifyRows,
+          "sampled oracle did not exercise the model's full verification width");
+  require(accepted != 0, "sampled oracle exercised no accepted draft proposal");
+  // Interrupt a replay, resume again, then compare with a cold execution of
+  // exactly the same history. Policy state remains request-owned.
+  request.prompt = history;
+  const auto pendingBefore = model::RuntimeInstrumentation::pendingToken(executor, request.id);
+  require(pendingBefore.has_value(), "sampled request has no pending anchor before preemption");
+  executor.suspend(request.id);
+  require(!states.metadata(0).assigned(), "suspension retained a state lane");
+  auto admission = executor.resume(request.modelView());
+  require(admission.granted(), "sampled replay admission failed");
+  executor.setDraftContextPlan(request.id, planDraftContext(0, history.size(), {}, executor.draftWindow()));
+  prefillChunk(executor, request.id, 0, std::span(history).first(16), pages);
+  executor.suspend(request.id);
+  admission = executor.resume(request.modelView());
+  require(admission.granted(), "interrupted replay admission failed");
+  executor.setDraftContextPlan(request.id, planDraftContext(0, history.size(), {}, executor.draftWindow()));
+  requireOpen(prefillChunk(executor, request.id, 0, history, pages), "sampled replay");
+  require(model::RuntimeInstrumentation::pendingToken(executor, request.id) == pendingBefore,
+          "sampled preemption changed its already-selected pending token");
+  const auto replayed = sampleCommittedState(backend, states, *admission.lane);
+  const auto continued = decodeOne(executor, request.id, history.size(), pages);
+  require(continued.failure.empty() && !continued.outputTokens.empty() &&
+              continued.outputTokens.front() == *pendingBefore,
+          "interrupted sampled replay could not continue decoding");
+  executor.end(request.id);
+  model::RuntimeInstrumentation::forceStepRows(executor, std::nullopt);
+
+  double leastCosine = 1, largestAbsolute = 0;
+  for (size_t index = 0; index < controls.size(); ++index) {
+    EngineRequest teacher = request;
+    teacher.id = 9200 + index;
+    teacher.prompt = controls[index].history;
+    beginCold(executor, teacher, 0);
+    requireOpen(prefillChunk(executor, teacher.id, 0, teacher.prompt, pages), "target-only teacher");
+    auto raw = model::RuntimeInstrumentation::takeTargetLogits(executor);
+    require(raw.size() == 1 && raw[0].size() == vocabulary, "teacher target logits were not captured");
+    SimilarityAccumulator compared;
+    for (uint32_t token = 0; token < vocabulary; ++token) {
+      require(std::isfinite(raw[0][token]) && std::isfinite(controls[index].logits[token]),
+              "target-row oracle found non-finite logits");
+      compared.add(raw[0][token], controls[index].logits[token]);
+    }
+    leastCosine = std::min(leastCosine, compared.result().cosine);
+    largestAbsolute = std::max(largestAbsolute, compared.result().maximumAbsolute);
+    require(compared.result().cosine > .999,
+            "speculative row " + std::to_string(index) + " at history " +
+                std::to_string(teacher.prompt.size()) + " differs from its teacher: cosine=" +
+                std::to_string(compared.result().cosine) + " max_abs=" +
+                std::to_string(compared.result().maximumAbsolute));
+    if (index + 1 == controls.size())
+      compareCommittedSamples(replayed, sampleCommittedState(backend, states, 0));
+    executor.end(teacher.id);
+  }
+  model::RuntimeInstrumentation::captureTargetLogits(executor, false);
+  std::cout << "sampled_target_rows=PASS rows=" << controls.size() << " widest=" << widest
+            << " accepted=" << accepted << " least_cosine=" << leastCosine
+            << " maximum_absolute=" << largestAbsolute
+            << " replay=interrupted_and_cold_control\n";
+}
+
+void requireTextMarkerBudgets(model::Runtime &executor, uint32_t verifyRows) {
+  require(!targetTokens->markers.empty(), "text-marker oracle needs tokenizer-derived markers");
+  uint32_t cases = 0;
+  for (uint32_t rows : {1U, verifyRows}) {
+    model::RuntimeInstrumentation::forceStepRows(executor, rows);
+    // Exhaust the budget inside a naturally selected close. The remaining
+    // suffix must complete that marker, rather than start a second close.
+    for (uint32_t prefix = 1; prefix < targetTokens->markerClose.size(); ++prefix) {
+      const std::array<uint64_t, 1> ids{9299};
+      const std::array<std::vector<uint32_t>, 1> pages{pageRange(0, 8)};
+      const auto &end = targetTokens->markerClose;
+      auto request = makeRequest(ids[0], targetTokens->thinkingPrompt, 32);
+      request.constraint = ConstraintMode::TokenMask;
+      request.flags = RequestIgnoreEndOfSequence;
+      request.thinkingBudget = ThinkingBudget{prefix, targetTokens->thinkingEnds[0], 0, targetTokens->openedMarkers};
+      beginCold(executor, request, 0);
+      const auto initial = prefillChunk(executor, request.id, 0, request.prompt, pages[0]);
+      require(initial.failure.empty() && initial.nextDecodeStage == DecodeStage::ApplyInitialMask,
+              "partial reasoning-close fixture lost its initial mask");
+      const auto mask = [&](size_t, uint32_t position) {
+        return position < prefix ? singletonMasks(std::span(end).subspan(position, 1))
+                                 : std::vector<uint32_t>(targetTokens->maskWords(), ~0U);
+      };
+      const auto generated = decodeConstrainedTogether(executor, ids, request.prompt.size(), pages,
+                                                       end.size() + 4, mask);
+      require(generated[0].tokens.size() > end.size() &&
+                  std::ranges::equal(end, std::span(generated[0].tokens).first(end.size())),
+              "budget exhaustion inside a reasoning close repeated or corrupted its prefix");
+      executor.end(request.id);
+      ++cases;
+    }
+    for (bool modelOpened : {false, true}) {
+      for (bool longEnd : {false, true}) {
+        if (modelOpened && longEnd) continue;
+        const auto &prompt = modelOpened ? targetTokens->samplingSeed : targetTokens->thinkingPrompt;
+        const auto &end = targetTokens->thinkingEnds[longEnd];
+        const auto &markers = modelOpened ? targetTokens->markers
+                             : longEnd ? targetTokens->longMarkers : targetTokens->openedMarkers;
+        const uint32_t opening = modelOpened ? targetTokens->opening.size() : 0;
+        for (uint32_t delay : {0U, 3U}) {
+          const std::array<uint64_t, 3> ids{9300, 9301, 9302};
+          const std::array<uint32_t, 3> budgets{0, 5, 17};
+          const std::array<std::vector<uint32_t>, 3> pages{
+              pageRange(0, 8), pageRange(8, 8), pageRange(16, 8)};
+          for (size_t lane = 0; lane < ids.size(); ++lane) {
+            auto request = makeRequest(ids[lane], prompt, 96);
+            request.constraint = ConstraintMode::TokenMask;
+            request.flags = RequestIgnoreEndOfSequence;
+            request.thinkingBudget = ThinkingBudget{budgets[lane], end, 0, markers};
+            beginCold(executor, request, lane);
+            const auto first = prefillChunk(executor, request.id, 0, prompt, pages[lane]);
+            require(first.failure.empty() && first.nextDecodeStage == DecodeStage::ApplyInitialMask,
+                    "text-marker request lost its initial grammar mask");
+          }
+          const auto mask = [&](size_t lane, uint32_t position) {
+            if (position < opening)
+              return singletonMasks(std::span(targetTokens->opening).subspan(position, 1));
+            const uint32_t body = position - opening;
+            if (body < budgets[lane] + delay) {
+              const uint32_t token = targetTokens->filler[body % targetTokens->filler.size()];
+              return singletonMasks(std::span(&token, 1));
+            }
+            return std::vector<uint32_t>(targetTokens->maskWords(), ~0U);
+          };
+          const uint32_t count = opening + budgets.back() + delay + end.size() + 4;
+          const auto generated = decodeConstrainedTogether(executor, ids, prompt.size(), pages, count, mask);
+          for (size_t lane = 0; lane < ids.size(); ++lane) {
+            const auto &tokens = generated[lane].tokens;
+            const uint32_t at = opening + budgets[lane] + delay;
+            require(tokens.size() > at + end.size() &&
+                        std::ranges::equal(end, std::span(tokens).subspan(at, end.size())),
+                    "reasoning budget did not emit its complete text close after the grammar admitted it");
+            const TokenAutomaton machine(markers);
+            uint32_t state = machine.initial();
+            size_t closed = 0;
+            for (; closed < tokens.size(); ++closed) {
+              state = machine.advance(state, tokens[closed]);
+              if (machine.terminal(state)) break;
+            }
+            require(state == markers[3] && closed == at + end.size() - 1,
+                    "reasoning marker closed at the wrong token or lost the model-opened block");
+            executor.end(ids[lane]);
+            ++cases;
+          }
+        }
+      }
+    }
+  }
+  model::RuntimeInstrumentation::forceStepRows(executor, std::nullopt);
+  std::cout << "text_marker_budgets=PASS cases=" << cases
+            << " (sampled, B3, narrow/full rows, model-opened, multi-cycle close, grammar delay)\n";
+}
+
+void requireSampledBatches(model::Runtime &executor) {
+  const std::array<uint64_t, 4> ids{9400, 9401, 9402, 9403};
+  const std::array<std::vector<uint32_t>, 4> pages{
+      pageRange(0, 8), pageRange(8, 8), pageRange(16, 8), pageRange(24, 8)};
+  for (uint32_t lanes : {1U, 2U, 4U}) {
+    for (uint32_t lane = 0; lane < lanes; ++lane) {
+      auto prompt = targetTokens->thinkingPrompt;
+      prompt.push_back(targetTokens->filler.at(lane));
+      auto request = makeRequest(ids[lane], std::move(prompt), 64);
+      request.flags = RequestIgnoreEndOfSequence;
+      request.sampling.seed = 42 + lane;
+      beginCold(executor, request, lane);
+      requireOpen(prefillChunk(executor, request.id, 0, request.prompt, pages[lane]), "sampled batch fixture");
+    }
+    const auto generated = decodeTogether(executor, std::span(ids).first(lanes),
+        targetTokens->thinkingPrompt.size() + 1, std::span(pages).first(lanes), 16);
+    for (uint32_t lane = 0; lane < lanes; ++lane) {
+      require(generated[lane].tokens.size() >= 16 &&
+                  std::ranges::all_of(generated[lane].tokens,
+                      [](uint32_t token) { return token < targetTokens->vocabulary; }),
+              "sampled batch lost progress or returned an invalid token");
+      executor.end(ids[lane]);
+    }
+    std::cout << "sampled_batch=PASS lanes=" << lanes << '\n';
+  }
+}
+
+void requireTextMarkerLookup(model::Runtime &executor, uint32_t verifyRows) {
+  auto prompt = targetTokens->thinkingPrompt;
+  for (uint32_t repeat = 0; repeat < 8; ++repeat)
+    prompt.insert(prompt.end(), targetTokens->filler.begin(), targetTokens->filler.end());
+  auto request = makeRequest(9500, prompt, 64);
+  request.flags = RequestIgnoreEndOfSequence;
+  request.constraint = ConstraintMode::TokenMask;
+  request.thinkingBudget = ThinkingBudget{96, targetTokens->thinkingEnds[0], 0, targetTokens->openedMarkers};
+  const auto pages = pageRange(0, 8);
+  beginCold(executor, request, 0);
+  const auto initial = prefillChunk(executor, request.id, 0, prompt, pages);
+  require(initial.failure.empty() && initial.nextDecodeStage == DecodeStage::ApplyInitialMask,
+          "lookup reasoning fixture lost its initial mask");
+  // Only the anchor is forced. The verify masks admit the whole vocabulary,
+  // so no grammar-forced chain can replace the prompt lookup being checked.
+  provideMask(executor, request.id, singletonMasks(std::span(targetTokens->filler).first(1)));
+  const auto selected = decodeOne(executor, request.id, prompt.size(), pages, DecodeStage::ApplyInitialMask);
+  require(selected.failure.empty() && selected.outputTokens.empty(), "lookup anchor selection failed");
+  model::RuntimeInstrumentation::forceStepRows(executor, verifyRows);
+  BatchPlan plan{.kind = WorkKind::Decode, .items = {{request.id, 0}}, .decodeStage = DecodeStage::Regular};
+  const std::array<ModelBatchItem, 1> items{withRevision({request.id, prompt.size(), 0, pages})};
+  auto pending = beginMaskedDecode(executor, plan, items);
+  require(pending.maskRequests.size() == 1, "lookup verification lost its mask request");
+  const uint32_t lookedUp = model::RuntimeInstrumentation::lookupChain(executor, request.id).size();
+  require(lookedUp != 0, "repeated prompt exercised no lookup proposal");
+  const auto &asked = pending.maskRequests[0];
+  provideMask(executor, request.id,
+              std::vector<uint32_t>((asked.simulationTokens.size() + 1) * targetTokens->maskWords(), ~0U));
+  const auto result = finishMaskedDecode(std::move(pending)).front();
+  require(result.failure.empty() && !result.outputTokens.empty() &&
+              result.outputTokens.front() == targetTokens->filler[0] &&
+              result.acceptedDraftTokens <= result.draftedTokens,
+          "lookup verification changed its anchor or failed its sampled lane");
+  executor.end(request.id);
+  model::RuntimeInstrumentation::forceStepRows(executor, std::nullopt);
+  std::cout << "text_marker_lookup=PASS proposed=" << lookedUp
+            << " emitted=" << result.outputTokens.size() << '\n';
+}
+
 } // namespace
 
 int main(int argc, char **argv) {
+  std::cout << std::unitbuf;
   try {
     bool imagesOnly = false, warmupEosOnly = false, prefillGroupsOnly = false, spillOnly = false;
     SpillOptions spill;
     kv::Format format = kv::Format::Int8;
     ops::GdnStateFormat stateFormat = ops::GdnStateFormat::Float32;
     std::optional<double> givenAneFfnShare;
+    std::optional<std::filesystem::path> tokenFixture;
+    std::optional<OracleTokens> preparedTokens;
     // --max-context TOKENS: the model served for that context, as splash
     // serve's option serves it: with YaRN past the native window
     // (model::servedFor).
@@ -5990,7 +6326,7 @@ int main(int argc, char **argv) {
     model::ModelLoadOptions loadOptions;
     if (argc < 3)
       fail("usage: model-runtime-oracle METALLIB MODEL_ROOT [--kv-format int8|bf16] [--state-format fp32|bf16] "
-           "[--cached-states int8|exact] "
+           "[--cached-states int8|exact] [--token-fixture JSON] "
            "[--ane-ffn-share SHARE] [--ane-ffn-fault EVALUATION] [--ple-memory SIZE] "
            "[--expert-memory SIZE] [--max-context TOKENS] [--spill-tokens N] [--spill-window PAGES] "
            "[--spill-buffers 1|2] [--images-only | --warmup-eos-only | --prefill-groups-only | --spill-only]");
@@ -6000,6 +6336,7 @@ int main(int argc, char **argv) {
       else if (option == "--warmup-eos-only") warmupEosOnly = true;
       else if (option == "--prefill-groups-only") prefillGroupsOnly = true;
       else if (option == "--spill-only") spillOnly = true;
+      else if (option == "--token-fixture" && i + 1 < argc) tokenFixture = argv[++i];
       else if ((option == "--spill-tokens" || option == "--spill-window" || option == "--spill-buffers") &&
                i + 1 < argc) {
         const char *value = argv[++i];
@@ -6054,7 +6391,10 @@ int main(int argc, char **argv) {
         EngineMemoryPolicy::hostAvailableReserveBytes(device.physicalMemoryBytes);
     const std::filesystem::path modelRoot(argv[2]);
     const auto descriptor = model::servedFor(model::inspectModelRoot(modelRoot), maxContext);
-    targetTokens = &oracleTokens(descriptor);
+    if (tokenFixture) {
+      preparedTokens = readOracleTokens(*tokenFixture, descriptor.capabilities.vocabularySize);
+      targetTokens = &*preparedTokens;
+    } else targetTokens = &oracleTokens(descriptor);
     // Production's weight byte count with a different bound. Production checks
     // it only against the Metal hard budget, then guards host headroom at every
     // Metal operation while loading. This oracle has no such guard, so the
@@ -6141,9 +6481,11 @@ int main(int argc, char **argv) {
     // block index the decoded index fixture's, in whole extents of the size
     // the memory plan would pick for it.
     const kv::Layout kvLayout = model.targetKvLayout(format);
-    const uint32_t budgetPages = std::max({128U, kvLayout.minimumExtentPages(),
+    const uint32_t windowPages = (model.descriptor.draft.window + 128 + kv::kPageTokens - 1) / kv::kPageTokens;
+    const uint32_t initialPages = std::max({128U, kvLayout.minimumExtentPages(),
                                            model.expertStore() ? kGroupFixtureRows / kv::kPageTokens : 0U,
                                            kvLayout.indexDimension ? kDecodedIndexPages : 0U});
+    const uint32_t budgetPages = std::max(initialPages, windowPages);
     const uint32_t extentPages = kvLayout.extentPagesFor(budgetPages);
     const uint32_t pageCount = (budgetPages + extentPages - 1) / extentPages * extentPages;
     // What the checks on this pool hold at once beside the plan's fixed
@@ -6158,6 +6500,14 @@ int main(int argc, char **argv) {
     constexpr uint64_t kMostCachedStates = 6;
     const model::CompositeStateLayout stateLayout = model.stateLayout(stateFormat, !exactCachedStates);
     const uint64_t pageBytes = kvLayout.bytesPerModelPage();
+    const uint32_t initialExtents = (initialPages + extentPages - 1) / extentPages;
+    std::cout << "oracle_memory target=" << model.targetActualAllocatedBytes()
+              << " draft=" << model.draft.actualAllocatedBytes
+              << " prefill_arena=" << executorPlan.sharedPrefillPlannedAllocatedBytes
+              << " decode_arena=" << executorPlan.sharedDecodePlannedAllocatedBytes
+              << " lane=" << stateLayout.laneBytes() << " cached=" << stateLayout.cachedBytes()
+              << " initial_kv=" << uint64_t{initialExtents} * extentPages * pageBytes
+              << " full_window_kv=" << uint64_t{pageCount} * pageBytes << '\n';
     const uint64_t checksBytes = model::ExecutionLimits::maximumBatchWidth * stateLayout.laneBytes() +
                                  kMostCachedStates * stateLayout.cachedBytes() + uint64_t{pageCount} * pageBytes;
     const auto checksContext = static_cast<uint32_t>(
@@ -6241,9 +6591,8 @@ int main(int argc, char **argv) {
           return {};
         };
     kv::PageStorage pages(backend, governed, kvLayout, pageCount, extentPages);
-    // The oracle's requests address pages directly, without a pool, so every
-    // extent is allocated up front.
-    for (uint32_t extent = 0; extent < pageCount / extentPages; ++extent)
+    // Short checks need their pages, not the later full-window fixture's.
+    for (uint32_t extent = 0; extent < initialExtents; ++extent)
       require(static_cast<bool>(pages.allocateExtent(extent)),
               "oracle KV extent is unavailable");
     model::QwenStateStorage states(backend,
@@ -6339,6 +6688,23 @@ int main(int argc, char **argv) {
       std::cout << "PASS model-runtime-oracle scope=prefill-groups-only model=" << model.name()
                 << " (a prefill group leaves what its chunks' commands leave, and in passes what it leaves "
                    "whole)\n";
+      return 0;
+    }
+    if (!states.layout().target.layers && !targetTokens->markers.empty()) {
+      requireSampledTargetRows(executor, backend, states, model.descriptor.draft.rows);
+      requireTextMarkerBudgets(executor, model.descriptor.draft.rows);
+      requireSampledBatches(executor);
+      requireTextMarkerLookup(executor, model.descriptor.draft.rows);
+      requirePrefillGroupMatchesItsChunks(executor, pages, states, samplingSeedTokens, false);
+      requirePrefillPassesMatchWhole(executor, pages, states, samplingSeedTokens, false);
+      releaseIdle(executor);
+      for (uint32_t extent = 0; extent < pageCount / extentPages; ++extent)
+        if (!pages.isAllocated(extent * extentPages))
+          require(static_cast<bool>(pages.allocateExtent(extent)), "full-window KV extent is unavailable");
+      requireFullWindowRestore(executor, backend, states);
+      std::cout << "PASS model-runtime-oracle model=" << model.name()
+                << " (sampled non-recurrent target, speculative rows, reasoning markers,"
+                   " interrupted replay, grouped/passed prefill and full-window restore)\n";
       return 0;
     }
     // A natural token pattern: a run of zero tokens can make the target select

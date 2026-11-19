@@ -1869,9 +1869,11 @@ void thinkingCutoffs(MetalBackend &backend, uint32_t vocabulary) {
     const auto mismatch = std::ranges::mismatch(drafts, rows.first(kDrafts));
     return mismatch.in1 == drafts.end() ? kRows : uint32_t(mismatch.in1 - drafts.begin()) + 1;
   };
+  uint32_t verifyCase = 0;
   const auto verifyLanes = [&](CommandGraph &verify, std::span<const SamplingPolicy> policies,
                                const std::array<std::array<uint32_t, kRows>, kLanes> &expected,
                                const std::array<std::array<uint32_t, kDrafts>, kLanes> &drafts) {
+    ++verifyCase;
     std::fill(uniforms, uniforms + kLanes * kUniforms, 0.5F);
     sampling.addVerify(verify, policies, batch.buffers, layOut(batch.buffers, blocks(policies.size())), stops, {});
     require(cutoffDispatches(verify) == 1, "a verify with cutoffs dispatched them other than once");
@@ -1879,8 +1881,21 @@ void thinkingCutoffs(MetalBackend &backend, uint32_t vocabulary) {
     static_cast<void>(backend.submitCommandAsync(verify.dispatches()).wait());
     const auto *retained = static_cast<const uint32_t *>(acceptance.retainedCounts.contents());
     for (uint32_t lane = 0; lane < kLanes; ++lane) {
-      require(retained[lane] == retainedRows(drafts[lane], expected[lane]),
-              "a lane retained the wrong tokens at its cutoff");
+      const uint32_t wanted = retainedRows(drafts[lane], expected[lane]);
+      if (retained[lane] != wanted) {
+        std::string details = "thinking cutoff case=" + std::to_string(verifyCase) +
+            " lane=" + std::to_string(lane) + " row=" +
+            std::to_string(policies[lane].thinkingCutoff->row) + " end=" +
+            std::to_string(policies[lane].thinkingCutoff->end.size()) + " waiting=" +
+            std::to_string(policies[lane].thinkingCutoff->waitsForMask) + " retained=" +
+            std::to_string(retained[lane]) + " expected=" + std::to_string(wanted) + " tokens=";
+        for (uint32_t row = 0; row < kRows; ++row) details += std::to_string(tokens[lane * kRows + row]) + ",";
+        details += " expected_tokens=";
+        for (uint32_t token : expected[lane]) details += std::to_string(token) + ",";
+        details += " drafts=";
+        for (uint32_t token : drafts[lane]) details += std::to_string(token) + ",";
+        throw std::runtime_error(details);
+      }
       for (uint32_t row = 0; row < retained[lane]; ++row)
         require(tokens[lane * kRows + row] == expected[lane][row], "a lane's tokens missed its thinking cutoff");
     }
