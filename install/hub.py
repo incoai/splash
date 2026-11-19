@@ -599,6 +599,13 @@ class Repository:
             f"{self.name}/{name}", "rb", revision=self.revision, block_size=8 << 20
         )
 
+    def stored(self, names):
+        """(bytes, blob ID) of each of names the Hub lists: what a download
+        of names comes to, the blobs the Hub cache has and those it lacks."""
+        if self.paths is not None:
+            return []
+        return [self.sizes[n] for n in names if n in self.sizes]
+
     def missing(self, names):
         """(bytes, blob ID) of each of names whose blob the Hub cache lacks:
         what a download of names fetches."""
@@ -607,7 +614,7 @@ class Repository:
         blobs = folder(self.name) / "blobs"
         return [
             (size, blob)
-            for size, blob in (self.sizes[n] for n in names if n in self.sizes)
+            for size, blob in self.stored(names)
             if not (blob and (blobs / blob).exists())
         ]
 
@@ -636,7 +643,7 @@ class Repository:
                 f"from {self.name}@{self.revision[:12]}; cached files are reused.",
                 flush=True,
             )
-        with _download_progress(self.name, blobs, fetch) as counted:
+        with _download_progress(self.name, blobs, self.stored(names), fetch) as counted:
             path = Path(
                 _interruptible(
                     snapshot_download,
@@ -862,36 +869,40 @@ def _interruptible(call, *args, **kwargs):
 
 
 @contextmanager
-def _download_progress(repo_id, blobs, fetch):
-    """With json_progress, report the download in the block of fetch,
-    (bytes, blob ID) pairs in the blobs folder, as JSON lines on stdout,
-    and yield the tqdm class the block's snapshot_download counts with (None
-    without json_progress): done 0 first, then, measured every
-    PROGRESS_INTERVAL, whenever it grew, the bytes received, and done == total
-    once the block succeeds. Received is what the network has brought or what
-    the folder holds of fetch, whichever is more, and at most the total: under
-    Xet a file is written in order from chunks that arrive out of order and
-    wait in memory, so the folder alone can stay at 0 for minutes, then jump."""
+def _download_progress(repo_id, blobs, files, fetch):
+    """With json_progress, report the download in the block of files,
+    (bytes, blob ID) pairs in the blobs folder, of which it fetches those in
+    fetch, as JSON lines on stdout, and yield the tqdm class the block's
+    snapshot_download counts with (None without json_progress): done first
+    the bytes of the files the folder has whole, so that a download started
+    again goes on from what the one before finished, then, measured every
+    PROGRESS_INTERVAL, whenever it grew, those and the bytes received, and
+    done == total once the block succeeds. Received is what the network has
+    brought or what the folder holds of fetch, whichever is more, and at most
+    the total: under Xet a file is written in order from chunks that arrive
+    out of order and wait in memory, so the folder alone can stay at 0 for
+    minutes, then jump."""
     if not (json_progress and fetch):
         yield None
         return
-    total = sum(size for size, _ in fetch)
+    total = sum(size for size, _ in files)
+    had = total - sum(size for size, _ in fetch)
     counted = _network_counter()
     stop = threading.Event()
 
     def measure():
-        done = 0
+        done = had
         while not stop.wait(PROGRESS_INTERVAL):
             held = _blob_bytes(blobs)
             written = sum(min(size, held.get(blob, 0)) for size, blob in fetch)
-            now = min(max(written, counted.received), total)
+            now = had + min(max(written, counted.received), total - had)
             # A partial file renamed to its blob between the listing and its
             # size goes uncounted once, so only growth is reported.
             if now > done:
                 done = now
                 _report_progress(repo_id, done, total)
 
-    _report_progress(repo_id, 0, total)
+    _report_progress(repo_id, had, total)
     thread = threading.Thread(target=measure)
     thread.start()
     try:
