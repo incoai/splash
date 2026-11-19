@@ -117,4 +117,24 @@ extension TranscriptTests {
             """#) ?? []
         #expect(checks == [1, 1, 0, 1, 1, 1, 1, 1, 1, 0, 1], "\(checks)")
     }
+
+    /// A code block's copy button, clicked while its reply streams, keeps its check for its time:
+    /// the block drawn again as the text grows is the same block, the check no part of the text.
+    @Test func aCopiedCheckStaysAsTheReplyStreams() async throws {
+        let checks = try await drawn("""
+            const box = document.createElement('div')
+            document.body.append(box)
+            markdown.draw(box, 'Run:\\n\\n```sh\\nmake', true)
+            const button = box.querySelector('.copy-code')
+            // As its click does (transcript.js).
+            page.copy(button, 'make')
+            markdown.draw(box, 'Run:\\n\\n```sh\\nmake test', true)
+            markdown.draw(box, 'Run:\\n\\n```sh\\nmake test\\n```', true)
+            markdown.draw(box, 'Run:\\n\\n```sh\\nmake test\\n```', false)
+            const kept = box.querySelector('.copy-code')
+            box.remove()
+            return [kept === button ? 1 : 0, kept.classList.contains('copied') ? 1 : 0]
+            """) ?? []
+        #expect(checks == [1, 1], "\(checks)")
+    }
 }

@@ -341,8 +341,12 @@ const markdown = (() => {
       if (node.data !== fresh.data) node.data = fresh.data;
       return;
     }
+    // A copy button's check, which shows for its time once clicked (page.copy), is none of what
+    // the text draws: it stays as the block streams on.
+    const copied = node.classList.contains('copied');
     for (const {name} of [...node.attributes]) if (!fresh.hasAttribute(name)) node.removeAttribute(name);
     for (const {name, value} of fresh.attributes) if (node.getAttribute(name) !== value) node.setAttribute(name, value);
+    if (copied) node.classList.add('copied');
     replace(node, 0, [...fresh.childNodes]);
   }
 
