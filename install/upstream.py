@@ -432,23 +432,32 @@ def gguf_target(repo, names, scratch, *, projector=None):
 
 
 def mlx_target(repo, language_only):
-    """The MLX target in repo, which serves images unless language_only."""
+    """The MLX target in repo, which serves images unless language_only or
+    its family has no vision tower (family.vision), as _gguf_target's."""
     required = {"config.json", "tokenizer.json", "tokenizer_config.json"}
     missing = sorted(required - repo.files)
-    # Serving text only drops the processor requirement and no other.
-    processor = language_only or any(n in repo.files for n in PROCESSOR_FILES)
-    if missing or not processor:
-        # A checkpoint that lacks only the processor can serve text.
-        refusal = models.ModelError if missing else models.VisionError
-        if not processor:
-            missing.append(" or ".join(PROCESSOR_FILES))
+    processor = any(n in repo.files for n in PROCESSOR_FILES)
+
+    def refuse(refusal, missing):
         raise refusal(
             f"target repository {repo.name} is missing: {', '.join(missing)}. "
             "Configuration, tokenizer and processor must come from the target "
             "repository"
         )
+
+    if missing:
+        # Before the family is known, a processor is asked for unless text only.
+        if not (language_only or processor):
+            missing.append(" or ".join(PROCESSOR_FILES))
+        refuse(models.ModelError, missing)
     config = repo.file("config.json")
     family = check_model("mlx-affine", "none", config)
+    # Serving text only drops the processor requirement and no other; so does
+    # a family without a vision tower, which serves text only.
+    vision = not language_only and family.vision
+    if vision and not processor:
+        # A checkpoint that lacks only the processor can serve text.
+        refuse(models.VisionError, [" or ".join(PROCESSOR_FILES)])
     files = {path: "config.json" for path in ("config.json", "tokenizer/config.json")}
     files |= {"tokenizer/" + n: n for n in TOKENIZER_FILES if n in repo.files}
     # The target's shards: those holding a tensor other than the tower's. A
@@ -456,7 +465,7 @@ def mlx_target(repo, language_only):
     # keeps it in a subdirectory).
     files |= {"target/" + n: n for n in _weight_files(repo, exclude=VISION_TOWER)}
     vision_format = "none"
-    if not language_only:
+    if vision:
         # The text passed, so a refusal of the tower's processor, shards or
         # configuration refuses the vision alone.
         try:

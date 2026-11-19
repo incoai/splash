@@ -28,12 +28,16 @@ DENSE = families.named("Qwen3.8-27B")
 MOE = families.named("Qwen3.6-35B-A3B")
 FLASH_NEXT = families.named("Qwen3.8-Flash-Next")
 FLINT = families.named("Flint")
+# The families whose config.json fixture is the one the installer derives
+# from their GGUF; an MLX config.json of one is mlx-config.json.
+GGUF_CONFIGS = (FLASH_NEXT, FLINT)
 # The families whose targets the engine loads from a GGUF only.
-GGUF_ONLY = (FLASH_NEXT, FLINT)
+GGUF_ONLY = (FLASH_NEXT,)
 MODEL = "mlx-community/Qwen3.8-27B-4bit"
-# An MLX config.json (of a GGUF_ONLY family, the one the installer derives
-# from its GGUF), a DFlash2 draft config and, of Qwen3.6-35B-A3B and the
-# GGUF_ONLY families, a GGUF header's architecture metadata built like the
+# An MLX config.json (of a GGUF_CONFIGS family, the one the installer derives
+# from its GGUF, beside its MLX mlx-config.json), a DFlash2 draft config and,
+# of Qwen3.6-35B-A3B and the GGUF_CONFIGS families, a GGUF header's
+# architecture metadata built like the
 # family's (gguf-metadata.json) and a real GGUF's tensor table
 # (gguf-tensors.json), in the family's lower-case name. The native
 # configuration test reads the configs too.
@@ -58,11 +62,13 @@ def family_config(family, name="config.json"):
 
 
 def mlx_target(root, family, *, changes=None):
-    """An MLX repository of family's target: its config.json, with changes
-    to its text_config, tokenizer files and weights."""
+    """An MLX repository of family's target: its MLX config.json, with
+    changes to its text model's keys (text_config, or a flat config's own),
+    tokenizer files and weights."""
     root.mkdir(parents=True, exist_ok=True)
-    target = family_config(family)
-    target["text_config"] |= changes or {}
+    mlx = CONFIGS / family.name.lower() / "mlx-config.json"
+    target = family_config(family, mlx.name if mlx.exists() else "config.json")
+    (target["text_config"] if "text_config" in target else target).update(changes or {})
     (root / "config.json").write_text(json.dumps(target))
     for name in ("tokenizer.json", "tokenizer_config.json", "model.safetensors"):
         (root / name).write_text("{}")

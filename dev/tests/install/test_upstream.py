@@ -20,6 +20,8 @@ from dev.tests.installer_fixtures import (
     CONFIGS,
     DENSE,
     DRAFT_COMMIT,
+    FLINT,
+    GGUF_CONFIGS,
     GGUF_ONLY,
     MODEL,
     MOE,
@@ -83,15 +85,14 @@ class UpstreamTest(unittest.TestCase):
                 continue
             config = mlx_target(self.root / family.name, family) / "config.json"
             draft = draft_dir(self.root / family.name / "draft", family)
+            vision = "safetensors" if family.vision else "none"
             for arguments in ({}, {"draft": draft / "config.json"}):
                 self.assertIs(
-                    upstream.check_model(
-                        "mlx-affine", "safetensors", config, **arguments
-                    ),
+                    upstream.check_model("mlx-affine", vision, config, **arguments),
                     family,
                 )
 
-        # Qwen3.8-Flash-Next and Flint load from a GGUF: the config the
+        # Qwen3.8-Flash-Next and Flint load from a GGUF too: the config the
         # installer derives from it and its header name the family, with and
         # without its draft (Flint's flat config, its release's keys, and a
         # test draft naming one of its reserved tokens as its mask), and
@@ -104,7 +105,7 @@ class UpstreamTest(unittest.TestCase):
             )
             return {"gguf_headers": directory}
 
-        for family in GGUF_ONLY:
+        for family in GGUF_CONFIGS:
             configs = CONFIGS / family.name.lower()
             gguf_check = headers(family)
             for arguments in ({}, {"draft": configs / "draft" / "config.json"}):
@@ -789,20 +790,15 @@ class UpstreamTest(unittest.TestCase):
             "preprocessor_config.json",
         )
         fake = FakeHub(self, self.cache)
+
+        def without(root, missing):
+            mlx_target(root, DENSE)
+            (root / "preprocessor_config.json").write_text(json.dumps(PROCESSOR))
+            (root / missing).unlink()
+
         for missing in required:
             with self.subTest(missing=missing):
-                fake.publish(
-                    "user/custom",
-                    "a" * 40,
-                    lambda p: (
-                        p.mkdir(parents=True, exist_ok=True),
-                        [
-                            (p / name).write_text("{}")
-                            for name in ("model.safetensors", *required)
-                            if name != missing
-                        ],
-                    ),
-                )
+                fake.publish("user/custom", "a" * 40, lambda p: without(p, missing))
                 chosen = selection(self.root, "user/custom", language_only=False)
                 with self.assertRaisesRegex(
                     models.ModelError, "must come from the target repository"
@@ -819,9 +815,26 @@ class UpstreamTest(unittest.TestCase):
                     in str(refused.exception),
                     missing == "preprocessor_config.json",
                 )
-                self.assertEqual(fake.downloads, [])
+                # Without a processor, the config alone is read: its family
+                # says whether it needs one (family.vision).
+                self.assertEqual(
+                    fake.downloads,
+                    ["user/custom/config.json"]
+                    if missing == "preprocessor_config.json"
+                    else [],
+                )
                 self.assertFalse(chosen.models_root.exists())
+                fake.downloads.clear()
                 shutil.rmtree(fake.remote)
+
+        # A checkpoint no family serves is refused for that, processor or not.
+        def unserved(root):
+            without(root, "preprocessor_config.json")
+            (root / "config.json").write_text("{}")
+
+        fake.publish("user/custom", "b" * 40, unserved)
+        with self.assertRaisesRegex(models.ModelError, "no supported model"):
+            self.prepare(selection(self.root, "user/custom", language_only=False))
 
     def test_a_draft_that_ships_its_mask_embedding_installs_it(self):
         # A release may ship its mask token's embedding beside its weights,
@@ -1110,6 +1123,20 @@ class UpstreamTest(unittest.TestCase):
         # Its header was read by range requests, not a download.
         self.assertNotIn("someone/text/model.safetensors", fake.downloads)
         self.assertIn("someone/text/model.safetensors", fake.range_reads)
+
+    def test_a_text_only_familys_mlx_target_installs_without_language_only(self):
+        # Flint has no vision tower (family.vision): its MLX repository holds
+        # no processor, and installs to serve text as its GGUF does, without
+        # --language-only.
+        fake_hub(self, self.cache, target=FLINT)
+        chosen = selection(self.root, language_only=False)
+        self.prepare(chosen)
+        record = json.loads((chosen.link / "model.json").read_text())
+        self.assertEqual(
+            (record["family"], record["target_format"], record["vision_format"]),
+            ("Flint", "mlx-affine", "none"),
+        )
+        self.assertFalse((chosen.link / "vision").exists())
 
     def test_a_cached_file_is_read_from_the_cache(self):
         fake = FakeHub(self, self.cache)
