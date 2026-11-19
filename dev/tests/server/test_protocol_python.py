@@ -168,7 +168,7 @@ def engine_events():
             b"a start command ran out of GPU memory",
         ),
         "warming": p.WarmingEvent(3, 9),
-        "start": p.StartEvent(91, 2, 4096),
+        "start": p.StartEvent(91, 2, 4096, 4160, p.StateSource.DISK, True),
         "prompt_progress": p.PromptProgressEvent(91, 2048, 123456),
         "tokens": p.TokensEvent(91, 17, (10, 11, 12)),
         "mask_request_initial": p.MaskRequestEvent(91, 6, 4, (), ()),

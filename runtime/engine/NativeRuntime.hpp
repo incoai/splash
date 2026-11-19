@@ -156,7 +156,7 @@ private:
   // After a request's terminal event: the engine no longer holds it.
   void ended(uint64_t requestId);
 
-  void started(uint64_t requestId, uint32_t matchedTokens,
+  void started(uint64_t requestId, const engine::StartFound &found,
                uint32_t lane) override;
   void batchCompleted(WorkKind kind, uint32_t width, uint32_t inputTokens,
                       uint32_t outputTokens, uint32_t draftedTokens,

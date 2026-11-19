@@ -279,7 +279,10 @@ def usage_dict(result, job):
         "prompt_tokens": result.prompt_tokens,
         "completion_tokens": result.completion_tokens,
         "total_tokens": result.prompt_tokens + result.completion_tokens,
-        "prompt_tokens_details": {"cached_tokens": result.cache.matched_tokens},
+        "prompt_tokens_details": {
+            "cached_tokens": result.cache.matched_tokens,
+            **result.cache.reuse(),
+        },
         "completion_tokens_details": {"reasoning_tokens": job.reasoning_tokens},
     }
 

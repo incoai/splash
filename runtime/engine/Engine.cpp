@@ -1173,7 +1173,11 @@ void Engine::completeAdmission(Request &active, CacheLookup &lookup,
   }
   scheduler_.resourcesReady(active.request.id, resumeBoundary);
   cache_.recordLookup(lookup);
-  events_.started(active.request.id, resumeBoundary, *active.lane);
+  // A state no RAM holds is the SSD cache's copy (Cache::recordLookup).
+  const StateSource source = !lookup.state ? StateSource::None
+                             : lookup.state->state()->residentBytes() ? StateSource::Memory
+                                                                       : StateSource::Disk;
+  events_.started(active.request.id, {resumeBoundary, lookup.kvBoundary, source, lookup.lostState}, *active.lane);
   if (active.request.returnProgress) {
     active.reportedPromptTokens = resumeBoundary;
     events_.promptProgress(active.request.id, resumeBoundary);

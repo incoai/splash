@@ -22,7 +22,7 @@ Messages requires it.
 | `POST /v1/messages` | Anthropic Messages |
 | `POST /v1/messages/count_tokens` | A Messages request's prompt tokens, images included, as `{"input_tokens": N}`, without inference |
 | `POST /v1/chat/completions/count_tokens` | A Chat request's prompt tokens, images included, as `{"input_tokens": N}`, without inference |
-| `GET /v1/models`, `/v1/models/{id}` | The served model and its aliases, with the context limit, the input it takes (`input_modalities`), what a request may carry (`limits`: `request_bytes`, `images`, `image_bytes`, `pdf_bytes`, `pdf_pages`, as [images and PDFs](#images-and-pdfs) has them) and what reasoning efforts do ([default reasoning effort](server.md#default-reasoning-effort)) |
+| `GET /v1/models`, `/v1/models/{id}` | The served model and its aliases, with the context limit, the input it takes (`input_modalities`), what a request may carry (`limits`: `request_bytes`, `images`, `image_bytes`, `image_aspect`, `pdf_bytes`, `pdf_pages`, as [images and PDFs](#images-and-pdfs) has them) and what reasoning efforts do ([default reasoning effort](server.md#default-reasoning-effort)) |
 | `POST /tokenize`, `/apply-template` | A text's tokens, or a conversation's rendered prompt, without inference |
 | `POST /v1/judgments`, `/v1/systemone` | Scores over fixed answers ([judgment contracts](#judgment-contracts)) |
 | `POST /v1/memory/release` | Gives the weights back now, as the idle release does, when no request is in service; the next request restores them ([explicit release](internals.md#explicit-weights-release)). It takes no body (or `{}`); `200` with `{"released": true, "weights": …}`, `409 engine_busy` while the engine serves a request or restores its weights, `503 engine_busy` when the engine does not answer within 5 s, `503 engine_recovering` or `server_shutdown` while the engine restarts or the server stops, and `500 engine_failed` once the engine has stopped for good, before the server exits |
@@ -375,6 +375,14 @@ Responses `cache_write_tokens` is 0: clients price cache writes apart from the
 rest of the uncached input, and the prefix cache keeps a prompt as prefill
 computes it, at no cost of its own. So uncached input is `input_tokens` less
 `cached_tokens`, as in Messages, which reports no `cache_creation_input_tokens`.
+
+Beside the cached tokens, the same object (Messages: `usage` itself) says what
+the request reused: `prefix_tokens`, how far the cache matched its prompt's KV;
+`state_source`, where the state it resumed from was (`"memory"`, `"disk"` for
+the SSD cache's copy, or null for none); and `lost_state`, true when a matched
+block past that state once held a state that is gone. `cached_tokens` is what
+the request resumed from and did not read again; `prefix_tokens` can go past it
+where no state was kept, the matched KV past the state then read again.
 
 Every API keeps a response's state where its generation ended: at the last
 32-token page boundary, counted from the start of the prompt, that the prompt

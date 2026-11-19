@@ -64,6 +64,14 @@ def thinking_end_tokens(tokenizer, text, chat_format):
     return tokens
 
 
+# A start's state source as usage names it: null for none.
+_STATE_SOURCES = {
+    wire.StateSource.NONE: None,
+    wire.StateSource.MEMORY: "memory",
+    wire.StateSource.DISK: "disk",
+}
+
+
 @dataclass(frozen=True)
 class CacheInfo:
     status: str = "unknown"
@@ -72,6 +80,21 @@ class CacheInfo:
     # Tokens whose KV the request read from cached blocks another request
     # computed, past its cached prefix; known once it is done.
     deduplicated_tokens: int = 0
+    # What its start found beside the cached prefix (wire.StartEvent): how
+    # far the cache matched its prompt's KV, where the state it resumed from
+    # was, and whether a state past it was lost.
+    prefix_tokens: int = 0
+    state_source: str | None = None
+    lost_state: bool = False
+
+    def reuse(self):
+        """The usage fields that say what the request reused, beside each
+        API's cached tokens."""
+        return {
+            "prefix_tokens": self.prefix_tokens,
+            "state_source": self.state_source,
+            "lost_state": self.lost_state,
+        }
 
 
 @dataclass(frozen=True)
@@ -1004,6 +1027,9 @@ class NativeBackend:
                 "hit" if event.matched_prompt_tokens else "miss",
                 event.matched_prompt_tokens,
                 event.lane,
+                prefix_tokens=event.prefix_tokens,
+                state_source=_STATE_SOURCES[event.state_source],
+                lost_state=event.lost_state,
             )
             with self.lock:
                 job.cache = cache

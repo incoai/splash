@@ -263,7 +263,7 @@ const std::vector<std::pair<std::string, EngineEvent>> &engineEvents() {
                         {},
                         "a start command ran out of GPU memory"}},
       {"warming", WarmingEvent{3, 9}},
-      {"start", StartEvent{91, 2, 4096}},
+      {"start", StartEvent{91, 2, 4096, 4160, splash::engine::StateSource::Disk, true}},
       {"prompt_progress", PromptProgressEvent{91, 2048, 123456}},
       {"tokens", TokensEvent{91, 17, {10, 11, 12}}},
       {"mask_request_initial", MaskRequestEvent{91, 6, 4, {}, {}}},

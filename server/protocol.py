@@ -62,7 +62,8 @@ _STATUS_REQUEST = struct.Struct("<Q")
 _RELEASE_REQUEST = struct.Struct("<Q")
 # Concurrent requests, context, vision, vocabulary, mask rows, stop count.
 _READY = struct.Struct("<IIBIII")
-_START = struct.Struct("<QII")
+# Request, lane, matched prompt tokens, prefix tokens, state source, lost state.
+_START = struct.Struct("<QIIIBB")
 _PROMPT_PROGRESS = struct.Struct("<QIQ")
 _TOKENS = struct.Struct("<QII")
 _MASK_REQUEST = struct.Struct("<QQII")
@@ -83,7 +84,7 @@ assert _HEADER.size == FRAME_HEADER_BYTES
 assert _REQUEST.size == 114
 assert _IMAGE_SPAN.size == 32
 assert _READY.size == 21
-assert _START.size == 16
+assert _START.size == 22
 assert _DONE.size == 62
 assert _ERROR.size == 22
 assert _STATUS_JSON.size == 8
@@ -377,12 +378,28 @@ class ReadyEvent:
     stop_token_ids: tuple[int, ...]
 
 
+# Where the state a request resumes from was: none for a cold start, a RAM
+# copy, or the SSD cache's copy alone; the values are runtime/engine/
+# Types.hpp's.
+class StateSource(IntEnum):
+    NONE = 0
+    MEMORY = 1
+    DISK = 2
+
+
 @dataclass(slots=True, frozen=True)
 class StartEvent:
     request_id: int
     lane: int
-    # The cached prefix the request starts from; zero for a cold start.
+    # What the request found in the cache: the tokens of the state it resumes
+    # from, zero for a cold start; the prompt's tokens whose KV the cache
+    # matched, the state's included; where that state was; and whether a
+    # matched block past the state once held a state that is gone from both
+    # tiers.
     matched_prompt_tokens: int
+    prefix_tokens: int = 0
+    state_source: StateSource = StateSource.NONE
+    lost_state: bool = False
 
 
 @dataclass(slots=True, frozen=True)
@@ -1239,12 +1256,20 @@ def _decode_event(frame: Frame) -> EngineEvent:
             kind, bound, required, budget, plan_context, payload[_START_FAILED.size :]
         )
     if frame_type is FrameType.START:
-        request_id, lane, matched = _START.unpack(payload)
+        request_id, lane, matched, prefix, source, lost = _START.unpack(payload)
         if not request_id:
             _fatal(
                 IssueCode.INVALID_REQUEST_ID, "start event request id must be non-zero"
             )
-        return StartEvent(request_id, lane, matched)
+        if source > max(StateSource) or lost > 1:
+            _fatal(
+                IssueCode.INVALID_ENUM_VALUE,
+                "start state source or lost state is invalid",
+                request_id,
+            )
+        return StartEvent(
+            request_id, lane, matched, prefix, StateSource(source), bool(lost)
+        )
     if frame_type is FrameType.PROMPT_PROGRESS:
         request_id, processed, elapsed = _PROMPT_PROGRESS.unpack(payload)
         if not request_id or processed > MAX_PROMPT_TOKENS:

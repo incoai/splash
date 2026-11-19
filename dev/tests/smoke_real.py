@@ -1752,6 +1752,12 @@ def run_persistent_cache(arguments) -> None:
             )
             reused = after["cache"]["reused_tokens"] - before["cache"]["reused_tokens"]
             require(states >= 1, "the next turn restored no state from disk")
+            # Its usage says so: the state it resumed from was the SSD cache's.
+            details = reply["usage"]["prompt_tokens_details"]
+            require(
+                details["state_source"] == "disk" and not details["lost_state"],
+                f"the next turn's usage said {details!r}",
+            )
             # The tail past the restore point's block boundary is recomputed.
             require(
                 min(restored, reused) * 10 >= prompt_tokens * 9,

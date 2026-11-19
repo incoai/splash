@@ -328,6 +328,7 @@ class Plan:
         after_terminal=False,
         matched_tokens=1,
         logits=None,
+        start=None,
     ):
         self.batches = list(batches)
         self.reason = reason
@@ -336,6 +337,13 @@ class Plan:
         self.delay = delay
         self.matched_tokens = matched_tokens
         self.logits = logits
+        # What the start found beside matched_tokens: prefix tokens, state
+        # source and lost state; by default the matched prefix, in RAM.
+        self.start = start or (
+            matched_tokens,
+            wire.StateSource.MEMORY if matched_tokens else wire.StateSource.NONE,
+            False,
+        )
         self.started = threading.Event()
         self.release = threading.Event()
         if not block:
@@ -511,7 +519,7 @@ class FakeRuntime:
         plan.start_release.wait(2)
         if call.done:
             return
-        call.emit(wire.StartEvent(call.request_id, 0, plan.matched_tokens))
+        call.emit(wire.StartEvent(call.request_id, 0, plan.matched_tokens, *plan.start))
         plan.started.set()
         plan.release.wait(2)
         if plan.exception:

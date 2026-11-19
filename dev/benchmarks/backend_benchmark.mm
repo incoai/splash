@@ -79,8 +79,9 @@ public:
     ++batchSequence_;
   }
 
-  void started(uint64_t requestId, uint32_t matchedTokens,
+  void started(uint64_t requestId, const engine::StartFound &found,
                uint32_t) override {
+    const uint32_t matchedTokens = found.matchedPromptTokens;
     Observation &value = observations_[requestId];
     value.cacheStatus = matchedTokens ? "prefix_hit" : "miss";
     value.matchedTokens = matchedTokens;

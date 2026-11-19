@@ -11,6 +11,7 @@
 #include "engine/Engine.hpp"
 
 #include <algorithm>
+#include <ranges>
 #include <array>
 #include <functional>
 #include <limits>
@@ -1649,6 +1650,18 @@ void testRepeatedDiskHitPromotesToMemory() {
   require(executor.diskReads == 1 && cache.snapshot().stateCache.promotions == 1 &&
               cache.snapshot().lookup.stateDiskHits == 1 && events.failedCount == 0,
           "hot restored prefix continued to read from disk");
+  // Each start says where its state was: the first one's on disk, the later ones' in RAM, each as
+  // deep as the prompt's KV it matched.
+  require(events.startsFound.size() == 4 && events.startsFound[0].stateSource == engine::StateSource::Disk &&
+              std::ranges::all_of(events.startsFound | std::views::drop(1),
+                                  [](const engine::StartFound &found) {
+                                    return found.stateSource == engine::StateSource::Memory;
+                                  }) &&
+              std::ranges::all_of(events.startsFound,
+                                  [](const engine::StartFound &found) {
+                                    return found.matchedPromptTokens == 64 && found.prefixTokens == 64 && !found.lostState;
+                                  }),
+          "a start did not say where its state was");
 }
 
 // A failed disk read falls back to the next match, a shallower state in RAM, not a cold start.

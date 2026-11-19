@@ -88,7 +88,13 @@ def _event_payload(event: wire.EngineEvent) -> tuple[wire.FrameType, bytes]:
             )
         case wire.StartEvent():
             return wire.FrameType.START, struct.pack(
-                "<QII", event.request_id, event.lane, event.matched_prompt_tokens
+                "<QIIIBB",
+                event.request_id,
+                event.lane,
+                event.matched_prompt_tokens,
+                event.prefix_tokens,
+                event.state_source,
+                event.lost_state,
             )
         case wire.PromptProgressEvent():
             return wire.FrameType.PROMPT_PROGRESS, struct.pack(

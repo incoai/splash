@@ -409,6 +409,7 @@ class StatusRouteTests(HarnessTestCase):
                             "request_bytes": serve_options.DEFAULT_MAX_REQUEST_BYTES,
                             "images": 64,
                             "image_bytes": 32 * 1024 * 1024,
+                            "image_aspect": 200,
                             "pdf_bytes": 64 * 1024 * 1024,
                             "pdf_pages": 64,
                         },

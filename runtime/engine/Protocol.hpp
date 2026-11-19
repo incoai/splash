@@ -200,7 +200,8 @@ struct RequestFrame {
 //   Ready          u32 maxConcurrentRequests, u32 maxContextTokens, u8 vision,
 //                  u32 vocabularySize, u32 maskRows, u32 stop token count,
 //                  u32 stop tokens
-//   Start          u64 requestId, u32 lane, u32 matchedPromptTokens
+//   Start          u64 requestId, u32 lane, u32 matchedPromptTokens,
+//                  u32 prefixTokens, u8 stateSource, u8 lostState
 //   PromptProgress u64 requestId, u32 processedTokens, u64 elapsedMicros
 //   Tokens         u64 requestId, u32 sequenceOffset, u32 count, u32 tokens
 //   MaskRequest    u64 requestId, u64 maskRequestId, u32 wordsPerMask,
@@ -293,8 +294,11 @@ struct ReadyEvent {
 struct StartEvent {
   uint64_t requestId = 0;
   uint32_t lane = 0;
-  // The cached prefix the request starts from; zero for a cold start.
+  // What the request found in the cache (engine::StartFound).
   uint32_t matchedPromptTokens = 0;
+  uint32_t prefixTokens = 0;
+  engine::StateSource stateSource = engine::StateSource::None;
+  bool lostState = false;
 
   bool operator==(const StartEvent &) const = default;
 };

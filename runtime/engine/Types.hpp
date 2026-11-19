@@ -175,6 +175,21 @@ enum class TtftPart : uint8_t { OwnPrefill, ClaimWait, Decode, OtherPrefill, Uni
 inline constexpr size_t kTtftParts = 6;
 using TtftParts = std::array<double, kTtftParts>;
 
+// Where the state a request resumes from was: none for a cold start, a RAM
+// copy, or the SSD cache's copy alone. The values are on the wire (Start).
+enum class StateSource : uint8_t { None = 0, Memory = 1, Disk = 2 };
+
+// What a request's start found in the cache: the tokens of the state it
+// resumes from, zero for a cold start; the prompt's tokens whose KV the cache
+// matched, the state's included; where that state was; and whether a matched
+// block past the state once held a state that is gone from both tiers.
+struct StartFound {
+  uint32_t matchedPromptTokens = 0;
+  uint32_t prefixTokens = 0;
+  StateSource stateSource = StateSource::None;
+  bool lostState = false;
+};
+
 class EngineEventSink {
 public:
   virtual ~EngineEventSink() = default;
@@ -184,7 +199,7 @@ public:
   // own retirement.
   virtual void batchCompleted(WorkKind, uint32_t, uint32_t, uint32_t,
                               uint32_t, uint32_t, double, double) = 0;
-  virtual void started(uint64_t requestId, uint32_t matchedTokens,
+  virtual void started(uint64_t requestId, const StartFound &found,
                        uint32_t lane) = 0;
   virtual void promptProgress(uint64_t, uint32_t) {}
   // Before a request's first tokens: what held it until then, the rest not

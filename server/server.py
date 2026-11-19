@@ -64,7 +64,7 @@ from .http_security import (
     socket_hosts,
     validate_headers,
 )
-from .images import MAX_IMAGE_BYTES
+from .images import MAX_ASPECT, MAX_IMAGE_BYTES
 from .latency import RequestLatency
 from .metrics import prometheus_metrics
 from .origins import ANY_ORIGIN
@@ -585,12 +585,14 @@ class FrontendHandler(BaseHTTPRequestHandler):
     def _limits(self):
         """What a request may carry, which a client can check an attachment
         against before it sends: its bytes (--max-request-size); its images,
-        a PDF's pages counted among them; an image's bytes; a PDF's bytes,
-        which the request's PDFs share, and its pages."""
+        a PDF's pages counted among them; an image's bytes and its longer
+        side over its shorter; a PDF's bytes, which the request's PDFs share,
+        and its pages."""
         return {
             "request_bytes": self.server.max_request_bytes,
             "images": MAX_IMAGE_SPANS,
             "image_bytes": MAX_IMAGE_BYTES,
+            "image_aspect": MAX_ASPECT,
             "pdf_bytes": MAX_PDF_BYTES,
             "pdf_pages": MAX_PAGES,
         }

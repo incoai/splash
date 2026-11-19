@@ -59,6 +59,9 @@ class ResponsesTests(HarnessTestCase):
                 "input_tokens_details": {
                     "cached_tokens": 1,
                     "cache_write_tokens": 0,
+                    "prefix_tokens": 1,
+                    "state_source": "memory",
+                    "lost_state": False,
                 },
                 "output_tokens": 3,
                 "output_tokens_details": {"reasoning_tokens": 3},
