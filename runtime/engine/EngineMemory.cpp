@@ -1299,6 +1299,7 @@ void Engine::collectLandings(double now) {
   }
   spillLanded(true);
   governor().ledger().setLanes(laneDemandBytes(), highestLanePriority());
+  governor().setReleased(weights_ && idle() && !weights_->held() && !weights_->restoring());
   // The chains requests without a lane restore once they start: admission's
   // probes brought up to date, and for those it has not probed, probes of
   // this pass alone.

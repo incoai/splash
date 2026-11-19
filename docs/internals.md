@@ -342,7 +342,7 @@ between commands, releases the weights when it holds no request and no restore
 is under way, then answers with its status document
 (`NativeRuntime::handleRelease`). Nothing else changes: the next request
 restores the weights as after the idle release (`Weights restored in N s`), the
-prefix cache and the other caches stay as they are, and `--idle-release off`
+cache is given back as after it (who takes what, below), and `--idle-release off`
 does not stop it, so a host that shares the Mac with other memory-heavy work can
 take the weights' memory back on demand instead of on a timer. The server
 answers `200` when the document says the weights are released and not being
@@ -1876,6 +1876,7 @@ every source of units reads (`MemoryLedger::Order`, `Cache::walkFor`):
 | `Optional` of the engine's own, of no request | no | no | no | no | no | no | no | no | no | no |
 | `Growth` | yes | no | no | no | no | no | no | no | no | no |
 | `Host` with a deficit | yes | yes | yes | no | every lane's under warning pressure; none at normal | no | no | no | no | no |
+| `Host` of a released engine | yes | yes | yes | no | none: no lane runs | no | yes | yes | no | no |
 | `Host` under critical pressure | yes | no | yes | no | every lane's | yes | yes | yes | yes | first |
 | A need the host refused | in place | no | yes | no | its own, in place | no | as its class | as its class | no | no |
 
@@ -1907,7 +1908,13 @@ and the host's pass, queued chains made sessions arriving together take turns
 (#758). The host's own pass takes certain reuse only while a start it refused
 waits, or at critical pressure: a pass for its margin alone, which other
 applications' growth asks for, keeps it with the SSD cache or without, so an
-idle conversation's next turn finds it in RAM. Every state a reclaim takes
+idle conversation's next turn finds it in RAM. An engine whose weights are
+released, by the idle release or `POST /v1/memory/release`, keeps nothing for
+that turn, which waits longer for its weights than a restore from the SSD cache
+takes (8.5 s for Qwen3.8-27B at Q8_0): while it holds no request, each control
+pass is the host's pass for the whole cache, certain reuse too
+(`MemoryGovernor::setReleased`), repeated as its writes land, so an idle engine
+gives back its cache as well as its weights. Every state a reclaim takes
 from RAM, but a reply's opportunistic state
 (below), is written to the SSD cache first while the tier takes the write, with
 the KV it restores through, so a resume point or a queued chain that goes keeps

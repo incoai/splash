@@ -439,8 +439,8 @@ bool MemoryGovernor::claimWaiting() const noexcept { return ledger_.claimWaiting
 // idle state buffers) first either way. A pass that freed nothing now or
 // later waits (Pending) while memory lands if its rights wait for writes,
 // else is Short: it found nothing to take.
-FreeResult MemoryGovernor::hostPass(uint64_t target, bool forRefusedStart) {
-  const ClaimSpec spec{.cls = ClaimClass::Host, .forRefusedStart = forRefusedStart};
+FreeResult MemoryGovernor::hostPass(uint64_t target, bool owed) {
+  const ClaimSpec spec{.cls = ClaimClass::Host, .owed = owed};
   const Need need{.bytes = target};
   const MemoryPressure pressure = hostRule_.level();
   const uint64_t found = ledger_.available(spec, need, 0, pressure);
@@ -505,6 +505,14 @@ bool MemoryGovernor::controlPass(double nowMilliseconds) {
     } else if (const uint64_t deficit = hostRule_.deficitBytes(refused, ledger_.returning().landingBytes)) {
       pass = hostPass(std::min(kHostMarginBytes, deficit), refused != 0);
     }
+  }
+  // A released engine keeps nothing for a next turn, which waits for its weights longer than an SSD cache restore
+  // (8.5 s for Qwen3.8-27B at Q8_0): it owes the host the whole cache, certain reuse too, and the pass reruns as
+  // soon as what lands changes, not a settled second later, so the drain goes at the writes' pace.
+  if (const uint64_t landing = ledger_.returning().landingBytes;
+      !pass && released_ && (nowMilliseconds >= nextHostPassMilliseconds_ || landing != releasedLanding_)) {
+    pass = hostPass(std::numeric_limits<uint64_t>::max(), true);
+    releasedLanding_ = ledger_.returning().landingBytes;
   }
   // After the host's claim: growth goes only where the host admits it, so
   // it never competes with what the host takes.

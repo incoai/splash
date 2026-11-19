@@ -104,9 +104,9 @@ struct ClaimSpec final {
   // No lane yields for it, so short of what it lacks it takes what the
   // order gives (MemoryLedger::free).
   bool lone = false;
-  // A Host claim's pass while a start the host refused waits: short of
-  // critical pressure, only it takes certain reuse (takeRights).
-  bool forRefusedStart = false;
+  // A Host claim's pass for what the host is owed, a start it refused or a released engine's cache
+  // (MemoryGovernor::setReleased): short of critical pressure, only it takes certain reuse (takeRights).
+  bool owed = false;
 };
 
 // Claims take ids from 1 up, never again: 64 bits never run out.
