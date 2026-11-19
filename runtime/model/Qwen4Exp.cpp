@@ -22,8 +22,8 @@ namespace {
 constexpr double kMultiplierLimit = 0x1p53, kHeadValueLimit = 0x1p31;
 
 // The sections of one mix, in the image's order (GgufImage.cpp hyperImage).
-Qwen4HyperWeights readHyper(WeightFile &file, const Qwen4ExpLayout &layout, bool inject, const std::string &label) {
-  const BlockTargetFormat format;
+Qwen4HyperWeights readHyper(WeightFile &file, const BlockTargetFormat &format, const Qwen4ExpLayout &layout,
+                            bool inject, const std::string &label) {
   const uint32_t streams = layout.streamWidth();
   Qwen4HyperWeights hyper;
   hyper.norm = format.norm(file, streams, label + "-norm");
@@ -37,8 +37,7 @@ Qwen4HyperWeights readHyper(WeightFile &file, const Qwen4ExpLayout &layout, bool
 // The indexer's projections are float segments (Qwen4ExpTarget.cpp
 // addIndexerProjections): a GGUF's F32 or BF16 values, an MLX checkpoint's
 // native rows.
-Qwen4IndexerWeights readIndexer(WeightFile &file, const Qwen4ExpLayout &layout) {
-  const BlockTargetFormat format;
+Qwen4IndexerWeights readIndexer(WeightFile &file, const BlockTargetFormat &format, const Qwen4ExpLayout &layout) {
   const auto floatProjection = [&](uint32_t outputSize, std::string_view label) {
     ops::QuantizedSegment segment = readFloatSegment(file, label);
     if (segment.outputSize != outputSize || segment.inputSize != layout.hiddenSize)
@@ -184,10 +183,10 @@ Qwen4ExpWeights loadQwen4ExpWeights(metal::MetalBackend &backend, Qwen4ExpLayout
           const bool fullAttention = layout.isFullAttentionLayer(index);
           WeightFile file = loader.layer(index);
           Qwen4ExpLayerWeights &layer = result.layers.emplace_back();
-          layer.mixerHyper = readHyper(file, layout, true, "mixer-hyper");
+          layer.mixerHyper = readHyper(file, format, layout, true, "mixer-hyper");
           layer.mixer = readQwenMixer(file, format, layout, fullAttention);
-          if (fullAttention) layer.indexer = readIndexer(file, layout);
-          layer.ffnHyper = readHyper(file, layout, true, "ffn-hyper");
+          if (fullAttention) layer.indexer = readIndexer(file, format, layout);
+          layer.ffnHyper = readHyper(file, format, layout, true, "ffn-hyper");
           layer.ffn = readMoeBlock(file, layout, experts, index);
           if (index == layout.pleLayer) {
             Qwen4PleWeights ple;
@@ -205,7 +204,7 @@ Qwen4ExpWeights loadQwen4ExpWeights(metal::MetalBackend &backend, Qwen4ExpLayout
         }
         {
           WeightFile file = loader.head();
-          result.finalHyper = readHyper(file, layout, false, "final-hyper");
+          result.finalHyper = readHyper(file, format, layout, false, "final-hyper");
           result.logitsProjection = format.projection(file, layout.vocabularySize, layout.hiddenSize, "logits");
           result.logitsProjection.destination = ops::FloatOutput::Float32;
           file.finish();

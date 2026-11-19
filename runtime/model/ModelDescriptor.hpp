@@ -28,6 +28,9 @@ using TargetLayout = std::variant<Qwen3_8Layout, Qwen3_6MoeLayout, Qwen4ExpLayou
 // finds its family among those of its type in it (describeSourceModel).
 inline constexpr std::tuple kFamilies{Qwen3_8Layout{}, Qwen3_6MoeLayout{}, kQwen3_5_122BLayout, Qwen4ExpLayout{},
                                       FlintLayout{}};
+static_assert(std::apply([](const auto &...family) { return ((family.attentionNormMean > 0.0F) && ...); },
+                         kFamilies),
+              "every family states its attentionNormMean, by which its safetensors checkpoints' norm storage is told");
 
 // Calls `use` with each family's layout, in kFamilies' order.
 template <class Use> constexpr void forEachFamily(Use use) {

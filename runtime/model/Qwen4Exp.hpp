@@ -70,6 +70,8 @@ struct Qwen4ExpLayout final : QwenHybridLayout {
                           .attentionQueryHeads = 24,
                           .attentionKvHeads = 2,
                           .attentionHeadDimension = 256,
+                          .float32NormsOnly = true,
+                          .attentionNormMean = 1.454F,
                           .rotaryPairs = SPLASH_TARGET_ROPE_PAIRS,
                           .rotaryTheta = 10'000'000.0F,
                           .fullAttentionPeriod = 4,

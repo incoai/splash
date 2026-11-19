@@ -12,22 +12,21 @@
 #include <filesystem>
 #include <memory>
 #include <optional>
-#include <string_view>
 #include <vector>
 
 namespace splash::model {
 
 class SafetensorsTargetLoader final : public TargetImages {
 public:
-  // Plans every image of the checkpoint in directory once, of the family
-  // whose GGUFs are of `architecture` (safetensors::planImages). With a
-  // table store (table.cacheBytes), the rows of a table the family adds
-  // stream through it (streamTable()) instead of loading (table()). With
-  // expert memory (experts.memoryBytes), a MoE target's routed experts
-  // stream (streamedExperts()) instead of loading with their layers.
+  // Plans every image of the checkpoint in directory once
+  // (safetensors::planImages). With a table store (table.cacheBytes), the
+  // rows of a table the family adds stream through it (streamTable())
+  // instead of loading (table()). With expert memory (experts.memoryBytes),
+  // a MoE target's routed experts stream (streamedExperts()) instead of
+  // loading with their layers.
   SafetensorsTargetLoader(metal::MetalBackend &backend, WeightImages &images, const std::filesystem::path &directory,
-                          const QwenTargetDimensions &geometry, std::string_view architecture,
-                          SparseRowStoreOptions table = {}, ExpertStoreOptions experts = {});
+                          const QwenTargetDimensions &geometry, SparseRowStoreOptions table = {},
+                          ExpertStoreOptions experts = {});
 
   // The streamed table, its store reading the table's native rows from the
   // checkpoint's open files (readRepackRows over its shards); none when the
@@ -47,8 +46,8 @@ private:
     std::vector<gguf::Image> images;
   };
   SafetensorsTargetLoader(metal::MetalBackend &backend, WeightImages &images, std::shared_ptr<Planned> planned,
-                          const QwenTargetDimensions &geometry, std::string_view architecture,
-                          SparseRowStoreOptions table, ExpertStoreOptions experts);
+                          const QwenTargetDimensions &geometry, SparseRowStoreOptions table,
+                          ExpertStoreOptions experts);
 
   std::shared_ptr<Planned> planned_;
   bool float32Norms_ = false;

@@ -121,12 +121,20 @@ inline std::vector<SyntheticTensor> draftTensors(const model::DFlashDraftLayout 
 // hybrid's names are mlx-vlm's (language_model.*); Flint's mlx-lm's (model.*,
 // lm_head), with its bf16 sinks and router, its leading dense layers and a
 // shared expert of its slices without a gate, as mlx-community's Flint holds
-// them.
+// them. Its norms are stored as their multipliers, as mlx-community's
+// checkpoints of both store them: the attention q and k norms, by which the
+// loader tells (safetensors::normStorage), hold 1.5, nearer every family's
+// mean (1.414 to 1.707) than that mean less 1.
 template <class Layout, class Quantization>
 std::vector<SyntheticTensor> mlxTargetTensors(const Layout &layout, Quantization quantization) {
   std::vector<SyntheticTensor> result;
   const auto bfloat16 = [&](const std::string &name, std::vector<uint64_t> shape) {
     result.push_back({name, "BF16", std::move(shape)});
+  };
+  const auto multipliers = [&](const std::string &name, uint64_t elements) {
+    std::vector<uint8_t> data(elements * 2);
+    for (uint64_t at = 0; at < elements; ++at) data[2 * at + 1] = 0x3F, data[2 * at] = 0xC0; // bf16 1.5
+    result.push_back({name, "BF16", {elements}, std::move(data)});
   };
   const auto quantized = [&](const std::string &module, uint64_t rows, uint64_t columns, uint64_t experts = 1) {
     const auto [bits, group] = quantization(module);
@@ -149,8 +157,8 @@ std::vector<SyntheticTensor> mlxTargetTensors(const Layout &layout, Quantization
       quantized(attention + "q_proj", (layout.attentionGate ? 2ull : 1ull) * layout.attentionWidth, hidden);
       quantized(attention + "k_proj", kv, hidden);
       quantized(attention + "v_proj", kv, hidden);
-      bfloat16(attention + "q_norm.weight", {layout.attentionHeadDimension});
-      bfloat16(attention + "k_norm.weight", {layout.attentionHeadDimension});
+      multipliers(attention + "q_norm.weight", layout.attentionHeadDimension);
+      multipliers(attention + "k_norm.weight", layout.attentionHeadDimension);
       quantized(attention + "o_proj", hidden, layout.attentionWidth);
       if (flint) bfloat16(attention + "softmax_offset", {layout.attentionQueryHeads});
     } else {
@@ -197,7 +205,9 @@ enum class FloatCheckpoint { ModelOptimizer, CompressedTensors };
 
 // The tensors of a target of layout in NVFP4 and FP8, as `checkpoint` saves
 // them, which model/SafetensorsImage.cpp reads by transformers names: bf16
-// norms (each stored 1 below the weight the norm multiplies by), convolution
+// norms (each stored 1 below the weight the norm multiplies by: 0, but the
+// attention q and k norms 0.5, by which the loader tells the storage,
+// nearer the hybrids' 0.49 than their 1.49), convolution
 // [channels, 1, taps], GDN alpha and beta, router, shared-expert gate and
 // token table, each routed expert a module of its own, and each quantized
 // module in the format format(module) gives, its codes and E4M3 scales beside
@@ -236,8 +246,11 @@ std::vector<SyntheticTensor> floatTargetTensors(const Layout &layout, Format for
       quantized(attention + "q_proj", 2ull * layout.attentionWidth, hidden);
       quantized(attention + "k_proj", kv, hidden);
       quantized(attention + "v_proj", kv, hidden);
-      bfloat16(attention + "q_norm.weight", {layout.attentionHeadDimension});
-      bfloat16(attention + "k_norm.weight", {layout.attentionHeadDimension});
+      for (const char *norm : {"q_norm.weight", "k_norm.weight"}) {
+        std::vector<uint8_t> half;
+        for (uint32_t at = 0; at < layout.attentionHeadDimension; ++at) half.insert(half.end(), {0x00, 0x3F});
+        result.push_back({attention + norm, "BF16", {layout.attentionHeadDimension}, std::move(half)});
+      }
       quantized(attention + "o_proj", hidden, layout.attentionWidth);
     } else {
       const std::string gdn = prefix + "linear_attn.";
@@ -342,8 +355,10 @@ SyntheticAccounting writeSyntheticModel(const std::filesystem::path &root, const
   writeSyntheticShard(root / "vision" / "model.safetensors", visionTensors(vision));
   uint64_t targetBytes = 0;
   for (const model::gguf::Image &image :
-       model::safetensors::planImages(model::SafetensorsCheckpoint(root / "target"), target,
-                                      target.ggufArchitecture))
+       [&] {
+         const model::SafetensorsCheckpoint checkpoint(root / "target");
+         return model::safetensors::planImages(checkpoint, target, model::safetensors::normStorage(checkpoint, target));
+       }())
     targetBytes += image.bytes;
   return {targetBytes, model::draftImageBytes(root / "draft", draft), model::visionImageBytes(vision)};
 }

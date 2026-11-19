@@ -35,20 +35,21 @@ private:
 
 SafetensorsTargetLoader::SafetensorsTargetLoader(metal::MetalBackend &backend, WeightImages &images,
                                                  const std::filesystem::path &directory,
-                                                 const QwenTargetDimensions &geometry, std::string_view architecture,
-                                                 SparseRowStoreOptions table, ExpertStoreOptions experts)
-    : SafetensorsTargetLoader(backend, images, std::make_shared<Planned>(directory), geometry, architecture,
-                              std::move(table), experts) {}
+                                                 const QwenTargetDimensions &geometry, SparseRowStoreOptions table,
+                                                 ExpertStoreOptions experts)
+    : SafetensorsTargetLoader(backend, images, std::make_shared<Planned>(directory), geometry, std::move(table),
+                              experts) {}
 
 SafetensorsTargetLoader::SafetensorsTargetLoader(metal::MetalBackend &backend, WeightImages &images,
                                                  std::shared_ptr<Planned> planned,
-                                                 const QwenTargetDimensions &geometry, std::string_view architecture,
-                                                 SparseRowStoreOptions table, ExpertStoreOptions experts)
+                                                 const QwenTargetDimensions &geometry, SparseRowStoreOptions table,
+                                                 ExpertStoreOptions experts)
     : TargetImages(backend, images, std::shared_ptr<std::vector<gguf::Image>>(planned, &planned->images),
                    [planned] { planned->checkpoint.checkUnchanged(); }, geometry, std::move(table), experts),
       planned_(std::move(planned)) {
-  planned_->images = safetensors::planImages(planned_->checkpoint, geometry, architecture, planOptions());
-  float32Norms_ = safetensors::float32Norms(safetensors::moduleNames(planned_->checkpoint), architecture);
+  const safetensors::NormStorage norms = safetensors::normStorage(planned_->checkpoint, geometry);
+  planned_->images = safetensors::planImages(planned_->checkpoint, geometry, norms, planOptions());
+  float32Norms_ = safetensors::float32Norms(norms, geometry);
 }
 
 std::optional<TargetImages::StreamedTable> SafetensorsTargetLoader::streamTable() const {

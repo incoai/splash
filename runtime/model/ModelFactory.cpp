@@ -99,7 +99,7 @@ TargetWeights loadTarget(metal::MetalBackend &backend, WeightImages &images, con
         table.readers = options.readers;
         switch (descriptor.targetSource) {
         case TargetSource::Safetensors: {
-          SafetensorsTargetLoader loader(backend, images, directory, layout, layout.ggufArchitecture, table, experts);
+          SafetensorsTargetLoader loader(backend, images, directory, layout, table, experts);
           return readTarget(backend, layout, std::ref(loader));
         }
         case TargetSource::Gguf: {

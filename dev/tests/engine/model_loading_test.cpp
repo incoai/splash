@@ -887,6 +887,25 @@ void testSyntheticBlockModel(MetalBackend &backend, const std::filesystem::path 
             "language_model.model.layers.0.linear_attn.conv1d.weight",
             "a raw checkpoint's convolution was accepted");
 
+    // The same checkpoint with its attention q and k norms at `value`: nearer
+    // the family's mean less 1 (Qwen3.8-27B's 1.491 less 1), its norms are
+    // stored 1 below their multipliers and load as their F32 1 + w; nearer the
+    // mean, even 0.3 from it, as the multipliers stored.
+    const auto qkNorms = [&](uint16_t value) {
+        std::vector<splash::test::SyntheticTensor> tensors = splash::test::mlxTargetTensors(target, bitsAndGroup);
+        for (splash::test::SyntheticTensor &tensor : tensors)
+            if (tensor.name.ends_with("q_norm.weight") || tensor.name.ends_with("k_norm.weight"))
+                for (uint64_t at = 0; at < tensor.data.size(); at += 2)
+                    tensor.data[at] = value & 0xFF, tensor.data[at + 1] = value >> 8;
+        splash::test::writeSyntheticShard(root / "target" / "model.safetensors", tensors);
+    };
+    qkNorms(0x3F00); // 0.5
+    require(std::get<Qwen3_8Weights>(loadModel(backend, root, descriptor).target).layers[0].inputNorm.float32,
+            "an MLX block target whose norms are stored 1 below their multipliers did not load them as 1 + w");
+    qkNorms(0x3F98); // 1.1875
+    require(!std::get<Qwen3_8Weights>(loadModel(backend, root, descriptor).target).layers[0].inputNorm.float32,
+            "an MLX block target whose q and k norms average 1.1875 did not load its norms as stored");
+
     // An unquantized module: its weight in bf16, without scales and biases.
     const auto unquantized = [&](const std::string &module) {
         std::vector<splash::test::SyntheticTensor> tensors;
@@ -956,19 +975,20 @@ void testSyntheticFloatModel(MetalBackend &backend, const std::filesystem::path 
                 segmentFormats(weights.logitsProjection) == fp8 &&
                 weights.tokenEmbedding.rows().formatId == GGUF_FMT_BF16,
             "a " + name + " target did not keep its modules' formats and its bf16 token table");
-    // Every stored norm weight is zero: 1 + w is 1, the gated norm's w 0.
+    // Every stored norm weight is zero, but the q and k norms' 0.5: 1 + w is 1
+    // (1.5), the gated norm's w 0.
     const auto first = [](const splash::ops::NormWeights &norm) {
         return norm.float32 ? static_cast<const float *>(norm.buffer.contents())[0] : -1.0f;
     };
     require(first(weights.layers[0].inputNorm) == 1.0f && first(weights.layers[0].postAttentionNorm) == 1.0f &&
-                first(attention.queryNorm) == 1.0f && first(attention.keyNorm) == 1.0f &&
+                first(attention.queryNorm) == 1.5f && first(attention.keyNorm) == 1.5f &&
                 first(weights.finalNorm) == 1.0f && first(gdn.mixerNorm) == 0.0f,
             "a " + name + " target's norms are not the F32 1 + w, its gated norm the F32 w");
     // The tensor scale g each convention stores: Model Optimizer's NVFP4
     // weight_scale_2 and FP8 weight_scale, g of the tensor; compressed-tensors'
     // weight_global_scale, 1 / g, and its bf16 FP8 weight_scale, each row's g.
     const splash::model::SafetensorsCheckpoint safetensors(root / "target");
-    const std::vector<splash::model::gguf::Image> images = splash::model::safetensors::planImages(safetensors, target, target.ggufArchitecture);
+    const std::vector<splash::model::gguf::Image> images = splash::model::safetensors::planImages(safetensors, target, splash::model::safetensors::normStorage(safetensors, target));
     const auto rowsOf = [&](const std::string &module) {
         for (const splash::model::gguf::Image &image : images)
             for (const splash::model::gguf::Repack &repack : image.repacks)
@@ -985,6 +1005,17 @@ void testSyntheticFloatModel(MetalBackend &backend, const std::filesystem::path 
             "a " + name + " target's tensor scales are not read as its convention stores them");
     require(declaredBytes(weights.files) + declaredBytes(model.draft.files) == planned,
             "streamableWeights is not what a " + name + " target loads");
+    // Under transformers' names too, the q and k norms tell the storage: at
+    // 1.5, near Qwen3.8-27B's mean, the norms load as the multipliers stored.
+    std::vector<splash::test::SyntheticTensor> multipliers = splash::test::floatTargetTensors(target, format, checkpoint);
+    for (splash::test::SyntheticTensor &tensor : multipliers)
+        if (tensor.name.ends_with("q_norm.weight") || tensor.name.ends_with("k_norm.weight")) {
+            tensor.data.resize(tensor.shape.front() * 2);
+            for (uint64_t at = 0; at < tensor.data.size(); at += 2) tensor.data[at] = 0xC0, tensor.data[at + 1] = 0x3F;
+        }
+    splash::test::writeSyntheticShard(root / "target" / "model.safetensors", multipliers);
+    require(!std::get<Qwen3_8Weights>(loadModel(backend, root, descriptor).target).layers[0].inputNorm.float32,
+            "a " + name + " target whose q and k norms are multipliers did not load its norms as stored");
 }
 
 // A MoE target in NVFP4 and FP8, as Model Optimizer or compressed-tensors
@@ -1015,7 +1046,7 @@ void testSyntheticFloatMoeModel(MetalBackend &backend, const std::filesystem::pa
     }
     const splash::model::SafetensorsCheckpoint safetensors(root / "target");
     uint32_t stacks = 0;
-    for (const splash::model::gguf::Image &image : splash::model::safetensors::planImages(safetensors, target, target.ggufArchitecture))
+    for (const splash::model::gguf::Image &image : splash::model::safetensors::planImages(safetensors, target, splash::model::safetensors::normStorage(safetensors, target)))
         for (const splash::model::gguf::Repack &repack : image.repacks) {
             if (repack.sources.empty() || repack.sources.front().name.find(".experts.") == std::string::npos) continue;
             ++stacks;
@@ -1173,7 +1204,7 @@ void testSyntheticFlintModel(MetalBackend &backend, const std::filesystem::path 
             "streamableWeights is not what an MLX Flint loads");
     const splash::model::SafetensorsCheckpoint safetensors(root / "target");
     const std::vector<splash::model::gguf::Image> images =
-        splash::model::safetensors::planImages(safetensors, target, target.ggufArchitecture);
+        splash::model::safetensors::planImages(safetensors, target, splash::model::safetensors::normStorage(safetensors, target));
     const auto repackOf = [&](uint32_t layer, const std::string &module) -> const splash::model::gguf::Repack * {
         for (const splash::model::gguf::Repack &repack : images[layer].repacks)
             if (!repack.sources.empty() && repack.sources.front().name == module) return &repack;
@@ -1184,10 +1215,23 @@ void testSyntheticFlintModel(MetalBackend &backend, const std::filesystem::path 
                 down->sources.size() == 2 && down->sources[0].windows == 2 && down->sources[1].window == 1,
             "an MLX Flint's shared expert down projection is not two slices of the routed width");
     splash::model::WeightImages streamedImages(backend, "sources");
-    splash::model::SafetensorsTargetLoader streamed(backend, streamedImages, root / "target", target,
-                                                     target.ggufArchitecture, {}, {.memoryBytes = 64ull << 20});
+    splash::model::SafetensorsTargetLoader streamed(backend, streamedImages, root / "target", target, {},
+                                                     {.memoryBytes = 64ull << 20});
     require(streamed.streamedExperts().blocks.size() == target.layers - target.leadingDenseLayers,
             "an MLX Flint's streamed experts are not its MoE layers'");
+    // Its q and k norms at 1.0625, nearer Flint's own mean less 1 (0.707)
+    // than its mean (1.707): its norms are stored 1 below their multipliers,
+    // and its zero input norms load as 1 + w. Read by the Qwen hybrids' means
+    // (0.491 and 1.491), the same value is the multipliers: each family's
+    // storage is told by its own mean.
+    for (SyntheticTensor &tensor : tensors)
+        if (tensor.name.ends_with("q_norm.weight") || tensor.name.ends_with("k_norm.weight"))
+            for (uint64_t at = 0; at < tensor.data.size(); at += 2) tensor.data[at] = 0x88, tensor.data[at + 1] = 0x3F;
+    splash::test::writeSyntheticShard(root / "target" / "model.safetensors", tensors);
+    const auto below = loadModel(backend, root, descriptor);
+    const splash::ops::NormWeights &inputNorm = std::get<FlintWeights>(below.target).layers[0].inputNorm;
+    require(inputNorm.float32 && static_cast<const float *>(inputNorm.buffer.contents())[0] == 1.0f,
+            "an MLX Flint whose q and k norms are stored 1 below its multipliers did not load its norms as 1 + w");
 }
 
 // A small Qwen3.8-Flash-Next of mlx-vlm's names and mlx-community's formats
@@ -1283,8 +1327,9 @@ std::vector<SyntheticTensor> flashNextTensors(const Qwen4ExpLayout &g) {
             quantized(a + "q_proj", 2ull * g.attentionWidth, hidden);
             quantized(a + "k_proj", 128, hidden);
             quantized(a + "v_proj", 128, hidden);
-            bfloat16(a + "q_norm.weight", {g.attentionHeadDimension});
-            bfloat16(a + "k_norm.weight", {g.attentionHeadDimension});
+            // 0.5, nearer Flash-Next's 1.454 less 1 (the storage's) than 1.454.
+            bfloat16(a + "q_norm.weight", {g.attentionHeadDimension}, half(g.attentionHeadDimension));
+            bfloat16(a + "k_norm.weight", {g.attentionHeadDimension}, half(g.attentionHeadDimension));
             quantized(a + "o_proj", hidden, g.attentionWidth);
             quantized(a + "indexer.index_qk_proj", uint64_t{g.indexerHeads + 1} * g.indexerHeadDimension, hidden, 1,
                       true);
@@ -1366,7 +1411,7 @@ void testSyntheticFlashNext(MetalBackend &backend, const std::filesystem::path &
     const std::vector<SyntheticTensor> tensors = flashNextTensors(target);
     splash::test::writeSyntheticShard(root / "target" / "model.safetensors", tensors);
     splash::model::WeightImages images(backend, "sources");
-    splash::model::SafetensorsTargetLoader loaded(backend, images, root / "target", target, target.ggufArchitecture);
+    splash::model::SafetensorsTargetLoader loaded(backend, images, root / "target", target);
     const Qwen4ExpWeights weights =
         splash::model::loadQwen4ExpWeights(backend, target, splash::model::QwenTargetFiles{std::ref(loaded)});
     const auto first = [](const splash::ops::NormWeights &norm) {
@@ -1403,7 +1448,7 @@ void testSyntheticFlashNext(MetalBackend &backend, const std::filesystem::path &
     // Streamed, rows across the shards' boundaries.
     splash::model::WeightImages streamedImages(backend, "sources");
     splash::model::SafetensorsTargetLoader streaming(
-        backend, streamedImages, root / "target", target, target.ggufArchitecture,
+        backend, streamedImages, root / "target", target,
         {.cacheBytes = 1 << 20, .readers = std::make_shared<splash::model::SsdReaders>(splash::model::kSsdReaders)});
     const Qwen4ExpWeights streamed =
         splash::model::loadQwen4ExpWeights(backend, target, splash::model::QwenTargetFiles{std::ref(streaming)});

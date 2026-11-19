@@ -1,11 +1,14 @@
 #include "model/SafetensorsImage.hpp"
 
+#include "model/Bfloat16.hpp"
+
 #include "metal/abi/QuantFormat.h"
 #include "model/StateLayout.hpp"
 #include "model/WeightLayout.hpp"
 #include "model/WeightStore.hpp"
 
 #include <algorithm>
+#include <cmath>
 #include <array>
 #include <initializer_list>
 #include <optional>
@@ -522,23 +525,6 @@ template <class Walk> void layer(Walk &b, const QwenTargetDimensions &g, const s
   b.floatVector(ple + "conv1d.weight", {streams, g.pleConvolutionTaps, 1});
 }
 
-// How the norms load. MLX stores them as the multipliers they are (mlx-lm's
-// conversion adds the 1), held bf16; transformers 1 below them, held as the
-// F32 1 + w. Flint's plain RMS norms (those of mlx-community/flint-mixed-3-4bit
-// equal unsloth's GGUF's, its sinks the GGUF's sinks, on the 64 GB M5 Pro)
-// widen to the F32 its GGUF's images hold, as Flint's kernel shapes are
-// compiled for F32 norms alone (dev/tests/engine/TestFamilies.hpp
-// normsOfFamilies). mlx-vlm keeps Qwen3.8-Flash-Next's RMSNorm weights as
-// transformers stores them, 1 below the multiplier, but the GDN's gated norm's:
-// the hyper, PLE, q and indexer norms of mlx-community/Qwen3.8-Flash-Next-4bit
-// are those of ISTA-DASLab's Q2_0 GGUF less 1 exactly, its gated norms and
-// convolution equal (the 48 GB M5 Pro); its images hold them as the GGUF's do, F32.
-Conversion normConversion(ModuleNames names, std::string_view architecture) {
-  if (architecture == "flint") return Conversion::WidenToFloat32;
-  if (architecture == "qwen4exp") return Conversion::CenteredNorm;
-  return names == ModuleNames::Transformers ? Conversion::CenteredNorm : Conversion::None;
-}
-
 // Walks every image, each through the walker `make(name, layer, type)` makes,
 // which `done` takes once walked: the layers', the head's (before its
 // projection a norm, or the final hyper-connection mix), the embedding's and,
@@ -580,14 +566,49 @@ std::string layerPrefix(ModuleNames names, uint32_t layer) {
   return modelPrefix(names) + "layers." + std::to_string(layer) + ".";
 }
 
-bool float32Norms(ModuleNames names, std::string_view architecture) {
-  return normConversion(names, architecture) != Conversion::None;
+NormStorage normStorage(const SafetensorsCheckpoint &checkpoint, const QwenTargetDimensions &geometry) {
+  const ModuleNames names = moduleNames(checkpoint);
+  double sum = 0.0;
+  uint64_t count = 0;
+  for (uint32_t layer = 0; layer < geometry.layers; ++layer) {
+    if (!geometry.isFullAttentionLayer(layer)) continue;
+    for (const char *norm : {"self_attn.q_norm.weight", "self_attn.k_norm.weight"}) {
+      const std::string name = layerPrefix(names, layer) + norm;
+      const SourceTensor *tensor = checkpoint.find(name);
+      if (!tensor || tensor->dtype != "BF16" || tensor->bytes != uint64_t{geometry.attentionHeadDimension} * 2)
+        throw WeightStoreError("source tensor type or shape does not match: " + name);
+      std::vector<uint16_t> values(geometry.attentionHeadDimension);
+      tensor->read(0, {reinterpret_cast<uint8_t *>(values.data()), values.size() * sizeof(uint16_t)});
+      for (const uint16_t value : values) sum += widenBfloat16(value);
+      count += values.size();
+    }
+  }
+  if (!count) throw WeightStoreError("the checkpoint holds no attention q or k norm to tell its norms' storage by");
+  const double mean = sum / double(count), multipliers = geometry.attentionNormMean, below = multipliers - 1.0;
+  return std::abs(mean - below) < std::abs(mean - multipliers) ? NormStorage::BelowMultipliers
+                                                               : NormStorage::Multipliers;
+}
+
+namespace {
+
+// How norms stored as `norms` says load: stored 1 below their multipliers as
+// the F32 1 + w; else as the multipliers stored, widened to F32 for a
+// geometry whose kernels read F32 norms alone (float32NormsOnly).
+Conversion normConversion(NormStorage norms, const QwenTargetDimensions &geometry) {
+  if (norms == NormStorage::BelowMultipliers) return Conversion::CenteredNorm;
+  return geometry.float32NormsOnly ? Conversion::WidenToFloat32 : Conversion::None;
+}
+
+} // namespace
+
+bool float32Norms(NormStorage norms, const QwenTargetDimensions &geometry) {
+  return normConversion(norms, geometry) != Conversion::None;
 }
 
 std::vector<gguf::Image> planImages(const SafetensorsCheckpoint &checkpoint, const QwenTargetDimensions &geometry,
-                                   std::string_view architecture, gguf::PlanOptions options) {
+                                   NormStorage storage, gguf::PlanOptions options) {
   const ModuleNames names = moduleNames(checkpoint);
-  const Conversion norms = normConversion(names, architecture);
+  const Conversion norms = normConversion(storage, geometry);
   std::vector<gguf::Image> images;
   walkImages(
       geometry, names, options.streamTable,
