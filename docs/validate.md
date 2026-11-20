@@ -286,7 +286,10 @@ partial-prefix request and the cold prefills of short prompts, three samples
 each, in
 `build/release/<owner>--<repo>[--VARIANT]/backend-benchmark.json`;
 `make benchmark-backend MODEL=...` adds the 2K to 128K contexts the memory
-plan holds. The second compares this build with a retained checkout's in ABBA
+plan holds; `backend-benchmark --context-lengths` sets those contexts, and
+`--short-idle SECONDS` leaves the engine idle before each short prompt, so that
+its first tokens are those of a next turn after that pause. The second
+compares this build with a retained checkout's in ABBA
 order, as the release check does ([Release check](#release-check)), and writes
 `backend-regression.json` there. Neither is a comparison with another engine
 or a test of agent task quality.
