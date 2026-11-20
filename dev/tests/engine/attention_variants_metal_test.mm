@@ -11,6 +11,7 @@
 #include "metal/abi/KvExtent.h"
 #include "model/RopeScaling.hpp"
 #include "ops/Linear.hpp"
+#include "ops/PageStorage.hpp"
 #include "ops/PagedAttention.hpp"
 #include "ops/RoPE.hpp"
 #include "ops/KernelCalibration.hpp"
@@ -1156,12 +1157,202 @@ void checkOutputRows(metal::MetalBackend &backend) {
   std::cout << "ungated output rows: every row, last rows and Table16 of a chunk and of lanes PASS\n";
 }
 
+// Both layers of one sequence share the physical page table. Tokens 0 and
+// 31 dominate the synthetic scores until the 1024-key window excludes them.
+void checkMixedAttention(metal::MetalBackend &backend) {
+  constexpr uint32_t queryHeads = 32, end = 1064, extentPages = 2;
+  constexpr uint32_t pageCount = (end + kPageTokens - 1) / kPageTokens;
+  constexpr kv::Layout mixed{.attentionLayers = 2, .kvHeads = 4, .headDimension = 512,
+                            .format = kv::Format::BFloat16, .windowTokens = 1023, .windowedLayers = 1,
+                            .windowKvHeads = 16, .windowHeadDimension = 256};
+  kv::PageStorage storage(backend, [](uint64_t, const auto &allocate) -> metal::AllocationResult {
+    allocate();
+    return {};
+  }, mixed, pageCount + extentPages, extentPages);
+  std::array<uint32_t, pageCount> pages;
+  std::iota(pages.rbegin(), pages.rend(), 0u);
+  for (uint32_t extent = 0; extent < pageCount / extentPages; ++extent)
+    require(bool(storage.allocateExtent(extent)), "mixed BF16 extent allocation failed");
+  require(pages[31] / extentPages != pages[32] / extentPages, "test does not cross a physical extent");
+  const std::array tables{zeroed(backend, pageCount * sizeof(SplashKvPage))};
+  storage.writeEntries(pages, 0, tables[0]);
+  std::array<double, 2> maximumError{};
+  std::array<double, 4> boundaryValues{};
+
+  const auto chunk = [&](uint32_t first, uint32_t rows, bool attend) {
+    const uint32_t stride = (rows + kPageTokens - 1) / kPageTokens * kPageTokens;
+    const std::array sequences{ops::PagedAttention::chunkParams(first, rows, stride, pageCount)};
+    auto rowLayout = zeroed(backend, sizeof(SplashLaneRows));
+    contents<SplashLaneRows>(rowLayout)[0] = {0, rows};
+    const ops::AttentionRows attentionRows{rowLayout, rows};
+    std::array<metal::MetalBuffer, 2> packedRows, queries, outputs;
+    metal::CommandGraph graph;
+    for (uint32_t layer = 0; layer < mixed.attentionLayers; ++layer) {
+      const kv::Layout shape = mixed.layerLayout(layer);
+      const uint32_t dim = shape.headDimension, heads = shape.kvHeads, group = queryHeads / heads;
+      const bool sliding = shape.windowTokens != 0;
+      const uint32_t packedHeads = queryHeads + heads * (sliding ? 2 : 1), pairs = dim / 2;
+      packedRows[layer] = zeroed(backend, uint64_t{rows} * packedHeads * dim * sizeof(uint16_t));
+      const metal::MetalBuffer &packed = packedRows[layer];
+      for (uint32_t row = 0; row < rows; ++row) {
+        const uint32_t position = first + row;
+        for (uint32_t head = 0; head < packedHeads; ++head) {
+          const uint32_t kvHead = head < queryHeads ? head / group : (head - queryHeads) % heads;
+          for (uint32_t d = 0; d < dim; ++d) {
+            const float direction = ((d + kvHead) % 2) ? -1.0f : 1.0f;
+            const float noise = unit(seedOf(24 + layer, position, head, 0, d));
+            const bool marker = position == 0 || position == 31;
+            float value = noise;
+            if (head < queryHeads) value = direction + 0.1f * noise;
+            else if (marker) value = head < queryHeads + heads ? direction : position == 0 ? 1.0f : -1.0f;
+            contents<uint16_t>(packed)[(uint64_t{row} * packedHeads + head) * dim + d] = floatToBf16(value);
+          }
+        }
+      }
+      auto cosine = zeroed(backend, uint64_t{rows} * pairs * sizeof(float));
+      auto sine = zeroed(backend, cosine.sizeBytes());
+      std::fill_n(contents<float>(cosine), uint64_t{rows} * pairs, 1.0f);
+      const auto norm = test::makeNormWeights(backend, dim, true,
+                                              [sliding](uint32_t) { return sliding ? 0.25f : 0.11f; });
+      queries[layer] = zeroed(backend, uint64_t{stride} * queryHeads * dim * sizeof(uint16_t));
+      const ops::AttentionVariant variant{.windowTokens = shape.windowTokens};
+      ops::PagedAttention::addProjection(graph, packed, norm, norm, cosine, sine, queries[layer],
+                                         storage.layers()[layer], tables, sequences, attentionRows,
+                                         queryHeads, shape, variant);
+      if (!attend) continue;
+      const auto plan = ops::PagedAttention::plan(sequences, queryHeads, shape, ops::kApple10Attention,
+          ops::Int8Activations::Off, ops::PagedAttention::workspace(ops::kAttentionSequenceSplits, queryHeads, shape),
+          variant);
+      const auto partials = poisoned(backend, plan.workspace().partialsBytes);
+      const auto statistics = poisoned(backend, plan.workspace().statisticsBytes);
+      outputs[layer] = poisoned(backend, uint64_t{rows} * queryHeads * dim * sizeof(uint16_t));
+      const std::array histories{ops::AttentionHistory{storage.layers()[layer], tables[0]}};
+      static_cast<void>(ops::PagedAttention::addAttention(graph, plan, queries[layer], partials, statistics,
+                       sequences, histories, attentionRows, {{}, outputs[layer]}));
+    }
+    static_cast<void>(backend.submitCommandAsync(graph.dispatches()).wait());
+
+    // Every row's stored key is its projection RMS-normalized times the norm
+    // weight (the RoPE table turns nothing), and its stored value is its
+    // source RMS-normalized without a weight (NormalizeValue): the global
+    // layer's source is the key's projection (SharedKv), the sliding layer's
+    // its own value heads.
+    for (uint32_t layer = 0; layer < mixed.attentionLayers; ++layer) {
+      const kv::Layout shape = mixed.layerLayout(layer);
+      const uint32_t dim = shape.headDimension, heads = shape.kvHeads;
+      const bool sliding = shape.windowTokens != 0;
+      const uint32_t packedHeads = queryHeads + heads * (sliding ? 2 : 1);
+      const double weight = sliding ? 0.25 : 0.11;
+      const auto inverseRms = [dim](const uint16_t *head) {
+        double squares = 0.0;
+        for (uint32_t d = 0; d < dim; ++d) squares += double(bf16ToFloat(head[d])) * bf16ToFloat(head[d]);
+        return 1.0 / std::sqrt(squares / dim + 1e-6);
+      };
+      const auto withinRounding = [](double stored, double expected) {
+        return std::abs(stored - expected) <= std::abs(expected) / 128 + 1e-6;
+      };
+      for (uint32_t row = 0; row < rows; ++row) {
+        const uint32_t position = first + row, slot = position % kPageTokens;
+        const auto spans = storage.layerSpans(pages[position / kPageTokens], layer);
+        const auto *keys = reinterpret_cast<const uint16_t *>(spans[SPLASH_KV_KEYS].data());
+        const auto *values = reinterpret_cast<const uint16_t *>(spans[SPLASH_KV_VALUES].data());
+        for (uint32_t head = 0; head < heads; ++head) {
+          const uint16_t *key = contents<uint16_t>(packedRows[layer]) +
+                                (uint64_t{row} * packedHeads + queryHeads + head) * dim;
+          const uint16_t *value = sliding ? key + uint64_t{heads} * dim : key;
+          const double keyScale = inverseRms(key) * weight, valueScale = inverseRms(value);
+          for (uint32_t d = 0; d < dim; ++d) {
+            const double storedKey = bf16ToFloat(keys[splash_kv_key_element(head, slot, d, dim)]);
+            const double storedValue = bf16ToFloat(values[splash_kv_value_element(head, slot, d, dim)]);
+            require(withinRounding(storedKey, bf16ToFloat(key[d]) * keyScale) &&
+                        withinRounding(storedValue, bf16ToFloat(value[d]) * valueScale),
+                    "mixed attention stored the wrong K/V for layer " + std::to_string(layer) + " at position " +
+                        std::to_string(position));
+          }
+        }
+      }
+    }
+    if (!attend) return;
+
+    for (uint32_t layer = 0; layer < mixed.attentionLayers; ++layer) {
+      const kv::Layout shape = mixed.layerLayout(layer);
+      const uint32_t dim = shape.headDimension, group = queryHeads / shape.kvHeads;
+      using TensorPair = std::array<const uint16_t *, 2>;
+      std::array<TensorPair, pageCount> stored{};
+      const uint32_t firstKey = shape.windowTokens ? first - std::min(first, shape.windowTokens) : 0;
+      for (uint32_t page = firstKey / kPageTokens; page < pageCount; ++page) {
+        const auto spans = storage.layerSpans(pages[page], layer);
+        stored[page] = {reinterpret_cast<const uint16_t *>(spans[SPLASH_KV_KEYS].data()),
+                        reinterpret_cast<const uint16_t *>(spans[SPLASH_KV_VALUES].data())};
+      }
+      for (const uint32_t position : {1022u, 1023u, 1024u, 1025u, 1054u, 1055u, 1056u, 1063u}) {
+        if (position < first || position >= first + rows) continue;
+        const uint32_t row = position - first;
+        const uint32_t start = shape.windowTokens ? position + 1 - std::min(position + 1, 1024u) : 0;
+        for (uint32_t head = 0; head < queryHeads; ++head) {
+          const uint32_t kvHead = head / group;
+          const auto *query = contents<uint16_t>(queries[layer]) +
+                              ((uint64_t{kvHead} * stride + row) * group + head % group) * dim;
+          std::array<double, end> scores;
+          double maxScore = -std::numeric_limits<double>::infinity();
+          for (uint32_t token = start; token <= position; ++token) {
+            const auto *key = stored[token / kPageTokens][0] +
+                              splash_kv_key_element(kvHead, token % kPageTokens, 0, dim);
+            double score = 0.0;
+            for (uint32_t d = 0; d < dim; ++d) score += double(bf16ToFloat(query[d])) * bf16ToFloat(key[d]);
+            scores[token] = score;
+            maxScore = std::max(maxScore, score);
+          }
+          std::array<double, 512> weighted{};
+          double mass = 0.0;
+          for (uint32_t token = start; token <= position; ++token) {
+            const double weight = std::exp(scores[token] - maxScore);
+            const auto *value = stored[token / kPageTokens][1] +
+                                splash_kv_value_element(kvHead, token % kPageTokens, 0, dim);
+            mass += weight;
+            for (uint32_t d = 0; d < dim; ++d) weighted[d] += weight * bf16ToFloat(value[d * kPageTokens]);
+          }
+          const auto *actual = contents<uint16_t>(outputs[layer]) + (uint64_t{row} * queryHeads + head) * dim;
+          for (uint32_t d = 0; d < dim; ++d) {
+            const double error = std::abs(bf16ToFloat(actual[d]) - weighted[d] / mass);
+            require(error < 0.012, "mixed attention differs from FP64 for layer " + std::to_string(layer) +
+                    " at position " + std::to_string(position) + ", error " + std::to_string(error));
+            maximumError[layer] = std::max(maximumError[layer], error);
+          }
+          if (layer == 0 && head == 0) {
+            if (position == 1023 || position == 1024) boundaryValues[position - 1023] = weighted[0] / mass;
+            if (position == 1054 || position == 1055) boundaryValues[position - 1052] = weighted[0] / mass;
+          }
+        }
+      }
+    }
+  };
+
+  chunk(0, 1016, false);
+  chunk(1016, 40, true);
+  const uint32_t expired = pages[0];
+  require(bool(storage.allocateExtent(pageCount / extentPages, kv::PageForm::Slim)), "mixed Slim extent failed");
+  storage.copyPages(std::array{kv::PageCopy{expired, pageCount}});
+  pages[0] = pageCount;
+  storage.writeEntries(pages, 0, tables[0]);
+  storage.clearPages(std::array{expired});
+  chunk(1056, 8, true);
+  require(std::abs(boundaryValues[0] - boundaryValues[1]) > 0.5 &&
+              std::abs(boundaryValues[2] - boundaryValues[3]) > 0.5,
+          "the window did not exclude an influential key at each boundary");
+  std::cout << "mixed BF16 attention 32Q/16KV d256 w1024 and 32Q/4KV d512 global: every row's stored K/V "
+               "within a bf16 step of FP64; positions 1022-1025, 1054-1056, 1063 across Page32 and Slim "
+               "relocation: max abs error "
+            << maximumError[0] << " sliding, " << maximumError[1] << " global PASS\n";
+}
+
 } // namespace
 
 int main(int argc, char **argv) {
   try {
     require(argc == 2, "usage: attention-variants METALLIB");
     metal::MetalBackend backend(argv[1]);
+    checkMixedAttention(backend);
     checkPlans(backend);
     checkRopeTables(backend);
     for (const bool rotated : {true, false})

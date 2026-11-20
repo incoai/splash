@@ -24,7 +24,7 @@
 // the layer's pages store them (splash_store_kv_slot), before any tile of
 // the attention reads them.
 template <uint QHeads, uint KHeads, uint HeadDim, uint RotaryPairs, bool Gated, class W, typename CacheElement,
-          bool ValuesTokenMajor>
+          bool ValuesTokenMajor, bool NormalizeValue = false, bool SharedKv = false>
 inline void full_qkv_storage_phase(
     device const bfloat *qkv, device const W *q_norm,
     device const W *k_norm, device const float *rope_cos,
@@ -35,7 +35,7 @@ inline void full_qkv_storage_phase(
   static_assert(QHeads % KHeads == 0);
   static_assert(2 * RotaryPairs <= HeadDim, "the rotated pairs are dimensions of the head");
   constexpr uint QStride = Gated ? 2 * HeadDim : HeadDim;
-  constexpr uint PackedStride = QHeads * QStride + 2 * KHeads * HeadDim;
+  constexpr uint PackedStride = QHeads * QStride + (SharedKv ? 1 : 2) * KHeads * HeadDim;
   constexpr uint QWidth = QHeads * QStride, KWidth = KHeads * HeadDim;
   const uint sequence_row = group.y;
   constant SplashAttentionSequence &sequence = params.sequence[group.z];
@@ -57,7 +57,7 @@ inline void full_qkv_storage_phase(
   device const W *weight = query ? q_norm : k_norm;
 
   float element = float(source[thread_index]);
-  const bfloat value = query ? bfloat(0.0f) : source[KWidth + thread_index];
+  bfloat value = query ? bfloat(0.0f) : source[(SharedKv ? 0 : KWidth) + thread_index];
   const float inverse = rms_inverse_of_sums<HeadDim / 32>(element * element, HeadDim,
                                                           reductions, thread_index, lane,
                                                           simd_group);
@@ -85,6 +85,13 @@ inline void full_qkv_storage_phase(
                 HeadDim +
             thread_index] = result;
     return;
+  }
+  if constexpr (NormalizeValue) {
+    // Values use the raw projection even when it supplies the keys, with
+    // a unit RMS weight and no rotary transform.
+    const float raw = float(value);
+    value = bfloat(raw * rms_inverse_of_sums<HeadDim / 32>(raw * raw, HeadDim, reductions, thread_index, lane,
+                                                           simd_group));
   }
   splash_store_kv_slot<KHeads, HeadDim, CacheElement, ValuesTokenMajor>(
       page, sequence, params.kv, maxima, head_index, sequence_row, result, value, thread_index, lane, simd_group);

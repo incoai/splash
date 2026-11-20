@@ -5379,6 +5379,40 @@ void testWindowsTrimWhatEveryHolderPassed() {
   full.cache.endRequest(1);
 }
 
+// A 1024-key window includes the row's key. Trim only after publishing the
+// page that puts the first page entirely behind the window.
+void testGemma4WindowKeepsGlobalHistory() {
+  constexpr uint32_t windowKeys = 1024;
+  constexpr uint32_t firstTrim = windowKeys + KvCache::pageTokens;
+  constexpr kv::Layout global{1, 4, 512};
+  constexpr kv::Layout sliding{
+      .attentionLayers = 1, .kvHeads = 16, .headDimension = 256,
+      .windowTokens = windowKeys - 1, .windowedLayers = 1};
+  const uint64_t globalBytes = global.bytesPerLayerPage();
+  test::TestKvStorage storage(64, globalBytes + sliding.bytesPerLayerPage(), 4, 0, globalBytes);
+  KvPool pool(storage, 4);
+  engine::Cache cache(pool, nullptr, nullptr, std::nullopt, CacheWindowPolicy{sliding.windowPages()});
+  const auto prompt = Windowed::prompt(5000, firstTrim / KvCache::pageTokens);
+  cache.beginRequest(1);
+  require(admitTokens(cache, 1, firstTrim + 1).granted(), "Gemma 4 window test pages were refused");
+  const uint32_t firstPage = cache.pageTable(1).pages[0];
+  const uint32_t secondPage = cache.pageTable(1).pages[1];
+  storage.content[firstPage] = 42;
+  for (const uint32_t committed : {windowKeys - 1, windowKeys, firstTrim - 1}) {
+    cache.publishCommittedBlocks(1, prompt, committed, {});
+    require(cache.trimWindows() == 0 && pool.form(firstPage) == kv::PageForm::Full,
+            "a page still inside the Gemma 4 window was trimmed");
+  }
+  cache.publishCommittedBlocks(1, prompt, firstTrim, {});
+  require(cache.trimWindows() == 1, "the passed page did not leave the Gemma 4 window");
+  const auto table = cache.cutPageTable(1);
+  require(pool.form(table.pages[0]) == kv::PageForm::Slim && storage.content[table.pages[0]] == 42 &&
+              table.pages[1] == secondPage && pool.form(secondPage) == kv::PageForm::Full,
+          "trimming lost global history or touched the next page");
+  cache.checkInvariants();
+  cache.endRequest(1);
+}
+
 // A writer recomputing trimmed or untrimmed blocks keeps its own pages; reads are the same with
 // trimming on or off.
 void testWritersKeepTheirPagesTrimmedOrNot() {
@@ -7097,6 +7131,7 @@ int main() {
     testUnreadableCopyLeavesWithItsHolders();
     testPoisonedBlockLeavesOnceItsWriteLands();
     testWindowsTrimWhatEveryHolderPassed();
+    testGemma4WindowKeepsGlobalHistory();
     testWritersKeepTheirPagesTrimmedOrNot();
     testStateTailsPinTheirWindows();
     testStatesNeedTheirTailFull();

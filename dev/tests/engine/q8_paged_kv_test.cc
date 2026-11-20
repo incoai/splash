@@ -136,6 +136,35 @@ void testLayouts() {
           "the last value element is not the layer page's last");
 }
 
+// A Page32 of a Gemma 4 31B layer, with each geometry stored on its own.
+void testGemma4PageShapes() {
+  const auto checkPage = [](Layout layout, uint32_t elements, uint32_t int8ScaleBytes) {
+    const uint32_t elementBytes = layout.format == Format::BFloat16 ? 2 : 1;
+    const uint32_t dataBytes = elements * elementBytes;
+    const uint32_t scaleBytes = layout.format == Format::Int8 ? int8ScaleBytes : 0;
+    require(layout.valid() && layout.dataBytesPerLayerPage() == dataBytes &&
+                layout.scaleBytesPerLayerPage() == scaleBytes &&
+                layout.bytesPerLayerPage() == 2 * (dataBytes + scaleBytes),
+            "a Gemma 4 KV page has the wrong footprint");
+
+    const uint32_t lastHead = layout.kvHeads - 1;
+    const uint32_t lastDimension = layout.headDimension - 1;
+    const uint64_t lastKey = splash_kv_key_element(lastHead, kPageTokens - 1, lastDimension, layout.headDimension);
+    const uint64_t lastValue = splash_kv_value_element(lastHead, kPageTokens - 1, lastDimension, layout.headDimension);
+    for (const uint32_t tensor : {SPLASH_KV_KEYS, SPLASH_KV_VALUES}) {
+      const uint64_t last = tensor == SPLASH_KV_KEYS ? lastKey : lastValue;
+      const uint64_t firstPage = splash_kv_offset(2, dataBytes, scaleBytes, 0, tensor, 0);
+      const uint64_t nextPage = splash_kv_offset(2, dataBytes, scaleBytes, 0, tensor, 1);
+      require(firstPage + (last + 1) * elementBytes == nextPage,
+              "a Gemma 4 KV tensor does not end at the next page's first slot");
+    }
+  };
+  for (const Format format : {Format::Int8, Format::BFloat16}) {
+    checkPage(Layout{1, 4, 512, format}, 65'536, 512);
+    checkPage(Layout{1, 16, 256, format}, 131'072, 2048);
+  }
+}
+
 void testBFloat16() {
   for (float value : {0.0f, -0.0f, 1.0f, -3.5f, 1.0e-20f, 65504.0f}) {
     float roundTrip = bfloat16ToFloat(floatToBFloat16(value));
@@ -227,6 +256,7 @@ int main() {
     testByteAccounting();
     testWindows();
     testLayouts();
+    testGemma4PageShapes();
     testBFloat16();
     testQuantization(kPageTokens);
     testQuantization(17);

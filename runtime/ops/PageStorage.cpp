@@ -34,14 +34,11 @@ PageStorage::PageStorage(metal::MetalBackend &backend,
         throw std::invalid_argument(
             "KV page pool is not a whole number of extents");
     }
-    // splash_kv_offset places an extent's regions one after another; a
-    // layer's is the one Layout::region orders it at.
-    const auto data = static_cast<uint32_t>(layout_.dataBytesPerLayerPage());
-    const auto scale = static_cast<uint32_t>(layout_.scaleBytesPerLayerPage());
     regionLayers_.resize(layout_.attentionLayers);
     for (uint32_t layer = 0; layer < layout_.attentionLayers; ++layer) {
-        layers_.push_back(splash_kv_layer(extentPages_, data, scale, layout_.region(layer)));
-        regionLayers_[layout_.region(layer)] = layer;
+        const uint32_t region = layout_.region(layer);
+        layers_.push_back({extentPages_, static_cast<uint32_t>(extentPages_ * layout_.kvBytesBeforeRegion(region))});
+        regionLayers_[region] = layer;
     }
     extents_.resize(pageCount_ / extentPages_);
 }
@@ -225,7 +222,7 @@ std::vector<std::span<std::byte>> PageStorage::spans(uint32_t page) const {
 
 std::vector<std::span<std::byte>> PageStorage::spans(uint32_t page, uint32_t regions) const {
     std::vector<std::span<std::byte>> result;
-    result.reserve(size_t{regions} * (layout_.scaleBytesPerLayerPage() ? 4 : 2) +
+    result.reserve(size_t{regions} * (layout_.format == Format::Int8 ? 4 : 2) +
                    (layout_.indexDimension ? layout_.attentionLayers : 0));
     for (uint32_t region = 0; region < regions; ++region) {
         for (const std::span<std::byte> tensor : layerSpans(page, regionLayers_[region])) {
@@ -246,13 +243,14 @@ std::array<std::span<std::byte>, 4> PageStorage::layerSpans(uint32_t page, uint3
     if (layout_.region(layer) >= layout_.regions(extent.form))
         throw std::logic_error("KV page " + std::to_string(page) + " holds no windowed layer's K/V");
     auto *contents = static_cast<std::byte *>(extent.buffer.contents());
-    const auto data = static_cast<uint32_t>(layout_.dataBytesPerLayerPage());
-    const auto scale = static_cast<uint32_t>(layout_.scaleBytesPerLayerPage());
+    const Layout shape = layout_.layerLayout(layer);
+    const auto data = static_cast<uint32_t>(shape.dataBytesPerLayerPage());
+    const auto scale = static_cast<uint32_t>(shape.scaleBytesPerLayerPage());
     const uint32_t index = page % extentPages_;
     std::array<std::span<std::byte>, 4> result;
     for (uint32_t tensor = SPLASH_KV_KEYS; tensor <= SPLASH_KV_VALUE_SCALES; ++tensor) {
         result[tensor] = {
-            contents + splash_kv_offset(extentPages_, data, scale, layout_.region(layer), tensor, index),
+            contents + layers_[layer].offset + splash_kv_offset(extentPages_, data, scale, 0, tensor, index),
             splash_kv_page_bytes(data, scale, tensor)};
     }
     return result;
