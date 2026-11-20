@@ -11,14 +11,15 @@
 // The fused (unprofiled) GPU time of the same work is reported alongside, so
 // the gap between the sum of parts and the fused command shows how much a
 // cycle pays in dispatch boundaries rather than kernel work. --dispatch-list
-// writes the attributed B1 cycles' dispatches in order, one line each: index,
-// pipeline and GPU microseconds. A lane whose answer ends begins it again
-// between cycles, untimed. --prompt FILE[,FILE...] takes each lane's prompt
+// writes the attributed cycles' dispatches in order, one line each: index,
+// pipeline and GPU microseconds, B1's to FILE and Bn's to FILE.Bn. A lane
+// whose answer ends begins it again between cycles, untimed. --prompt FILE[,FILE...] takes each lane's prompt
 // from a file of token ids, lane i the (i mod n)th of n files, as a served
 // width's lanes read different text; --widths N profiles B1 through BN.
 // --step-rows has every decode step take T
 // rows (at most 16 and at least one a lane: RuntimeInstrumentation::
-// forceStepRows), for the cost of a step by its rows; --attribute off times
+// forceStepRows), for the cost of a step by its rows; --lane-rows R has
+// every width's steps take R rows a lane; --attribute off times
 // the fused cycles alone and the prompt's fused prefill. --answer-tokens
 // sizes each lane's pages too. --block-plans on has a streamed-expert
 // target's cycles plan a draft's block a lane at their floor
@@ -393,7 +394,8 @@ int main(int argc, char **argv) {
         std::cerr << "usage: decode-profile METALLIB MODEL_ROOT "
                      "[--prompt-tokens N] [--cycles K] [--kv-format int8|bf16] "
                      "[--state-format fp32|bf16] [--expert-memory SIZE] [--ple-memory SIZE] "
-                     "[--dispatch-list FILE] [--verify-rows auto|all] [--step-rows T] [--attribute on|off] [--widths N] "
+                     "[--dispatch-list FILE] [--verify-rows auto|all] [--step-rows T] [--lane-rows R] [--activations auto|bf16] [--attribute on|off] "
+                     "[--widths N] "
                      "[--warmups on|off] [--prompt chat|counting|FILE[,FILE...]] [--step-log on|off] "
                      "[--block-plans on|off] "
                      "[--temperature T [--seed S]] [--thinking-budget TOKENS] [--answer-tokens N]\n"
@@ -414,6 +416,12 @@ int main(int argc, char **argv) {
       std::string dispatchList;
       model::VerifyRows verifyRows = model::VerifyRows::Auto;
       std::optional<uint32_t> stepRows;
+      // Rows a lane every step takes at every width (--lane-rows), in place
+      // of one count of rows for every width (--step-rows).
+      std::optional<uint32_t> laneRows;
+      // The engine's --activations: auto (int8 where the plans take it) or
+      // bf16 (none: a decode step's attention queries stay bf16).
+      ops::Int8Activations int8Activations = ops::Int8Activations::On;
       bool attribute = true;
       // The start's warmups (its prefill of the most rows and of each row class, with the pipelines they create,
       // and its decode warmups, which measure the step costs, StepCosts);
@@ -503,6 +511,17 @@ int main(int argc, char **argv) {
         } else if (option == "--step-rows") {
           stepRows = parseCount(argv[index + 1], "--step-rows");
           textOptions = true;
+        } else if (option == "--activations") {
+          const std::string_view value(argv[index + 1]);
+          if (value != "auto" && value != "bf16")
+            throw std::invalid_argument("--activations takes auto or bf16");
+          int8Activations = value == "auto" ? ops::Int8Activations::On : ops::Int8Activations::Off;
+          textOptions = true;
+        } else if (option == "--lane-rows") {
+          laneRows = parseCount(argv[index + 1], "--lane-rows");
+          if (*laneRows > model::ExecutionLimits::targetVerifyRows)
+            throw std::invalid_argument("--lane-rows takes 1 to a verify block's rows");
+          textOptions = true;
         } else if (option == "--dispatch-list") {
           dispatchList = argv[index + 1];
           textOptions = true;
@@ -527,7 +546,7 @@ int main(int argc, char **argv) {
       loadOptions.readers = std::make_shared<model::SsdReaders>(model::kSsdReaders);
       model::LoadedModel model =
           model::loadModel(backend, root, model::inspectModelRoot(root), loadOptions);
-      ops::ExecutionPlans operators(backend.capabilities(), ops::Int8Activations::On);
+      ops::ExecutionPlans operators(backend.capabilities(), int8Activations);
 
       // Enough Page32 pages for each width's lanes of prompt plus generated rows.
       const uint32_t pagesPerLane =
@@ -666,6 +685,8 @@ int main(int argc, char **argv) {
         return timing;
       };
       auto profileWidth = [&](const char *title, std::span<Lane> active) {
+        if (laneRows)
+          model::RuntimeInstrumentation::forceStepRows(executor, *laneRows * static_cast<uint32_t>(active.size()));
         std::vector<CycleTiming> fused;
         static_cast<void>(model::RuntimeInstrumentation::takeStepChoices(executor));
         answerCycles.clear();
@@ -719,9 +740,11 @@ int main(int argc, char **argv) {
         BackendInstrumentation::setDispatchProfiling(backend, false);
         const std::vector<metal::DispatchTiming> timings =
             BackendInstrumentation::takeDispatchProfile(backend);
-        if (!dispatchList.empty() && active.size() == 1) {
-          FILE *file = std::fopen(dispatchList.c_str(), "w");
-          if (!file) throw std::runtime_error("cannot write " + dispatchList);
+        if (!dispatchList.empty()) {
+          const std::string path =
+              active.size() == 1 ? dispatchList : dispatchList + ".B" + std::to_string(active.size());
+          FILE *file = std::fopen(path.c_str(), "w");
+          if (!file) throw std::runtime_error("cannot write " + path);
           for (size_t index = 0; index < timings.size(); ++index)
             std::fprintf(file, "%zu %s %.2f\n", index, timings[index].pipelineName.c_str(),
                          timings[index].gpuSeconds * 1e6);
