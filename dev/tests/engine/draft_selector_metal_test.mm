@@ -1452,8 +1452,8 @@ void invalidRequests(MetalBackend &backend) {
     selector.add(graph, f.buffers, f.codebooks, {}, lanes);
   };
   rejects([&] { add({}); }, "invalid draft selector batch", "a selection of no lane was accepted");
-  const std::array<DraftTreeLane, 5> five{};
-  rejects([&] { add(five); }, "invalid draft selector batch", "a selection of five lanes was accepted");
+  const std::array<DraftTreeLane, kLanes + 1> tooMany{};
+  rejects([&] { add(tooMany); }, "invalid draft selector batch", "a selection of more lanes than a batch was accepted");
   // Tokens past the vocabulary, a trailing part before the leading one's end, and no tokens.
   for (const DraftVocabulary tokens : {DraftVocabulary{0, 1025}, DraftVocabulary{600, 500}, DraftVocabulary{0, 1024}})
     rejects([&] { selector.add(graph, f.buffers, f.codebooks, tokens, std::array{DraftTreeLane{1, 3, 0, 1}}); },
@@ -1469,9 +1469,9 @@ void invalidRequests(MetalBackend &backend) {
   for (const DraftCalibration &bad : {slope, intercept})
     rejects([&] { add(std::array{DraftTreeLane{1, 3, 0, 1}, DraftTreeLane{1, 3, 0, 1, bad}}); },
             "invalid draft tree calibration", "an invalid calibration was accepted");
-  // Steps of no lane or five, of no cap or one past a block's rows, and of
+  // Steps of no lane or one past a batch, of no cap or one past a block's rows, and of
   // fewer rows than their anchors or more than their caps hold.
-  for (const StepRows &bad : {StepRows{0, 1, 1}, StepRows{5, 5, 1}, StepRows{2, 4, 0}, StepRows{2, 4, kBlock + 1},
+  for (const StepRows &bad : {StepRows{0, 1, 1}, StepRows{kLanes + 1, kLanes + 1, 1}, StepRows{2, 4, 0}, StepRows{2, 4, kBlock + 1},
                               StepRows{2, 1, 2}, StepRows{2, 5, 2}})
     rejects([&] { DraftSelector::addVerifyRows(graph, f.buffers, bad); }, "invalid decode step rows",
             "impossible step rows were encoded");

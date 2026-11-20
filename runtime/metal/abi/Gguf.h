@@ -14,10 +14,14 @@
 // The int8 prefill tile's activation group is the MLX weight group of 64
 // inputs (GGUF_PREFILL_INT8_GROUP).
 #define GGUF_TILE_COLUMNS 64u
-// Decode tile of the staged kernels, which runs plans of up to 64 rows, a
-// decode step's or a prompt chunk's alike: two simdgroups, each staging its
-// own GGUF_STAGED_COLUMNS columns GGUF_STAGED_STEP inputs at a time over 8,
-// 16, 32, 48 or 64 rows.
+// Decode tile of the staged kernels, which runs plans of up to
+// GGUF_STAGED_ROWS rows, a decode step's or a prompt chunk's alike: two
+// simdgroups, each staging its own GGUF_STAGED_COLUMNS columns
+// GGUF_STAGED_STEP inputs at a time over 8, 16, 32, 48 or 64 rows
+// (GGUF_ROW_GROUP_ROWS); a plan of more rows runs two row groups of the tile of
+// half its rows in one dispatch, grid.z (ops::stagedRowGroups).
+#define GGUF_ROW_GROUP_ROWS 64u
+#define GGUF_STAGED_ROWS (2u * GGUF_ROW_GROUP_ROWS)
 #define GGUF_STAGED_COLUMNS 32u
 #define GGUF_STAGED_STEP 32u
 #define GGUF_STAGED_THREADS (GGUF_TILE_COLUMNS / GGUF_STAGED_COLUMNS * 32u)
@@ -152,8 +156,9 @@ inline constexpr uint64_t gguf_prefill_int8_scale_bytes(uint32_t k, uint64_t sto
 // Decode tiles: the register tile, of plans of up to 32 rows where the
 // device's calibration takes it (RegisterBoundary, ops/KernelCalibration.hpp),
 // and the staged tile, of the other plans of up to 64 rows, a decode step's
-// or a prompt chunk's. One tensor per dispatch, over the dispatch's tiles
-// (grid.x) and K partitions (grid.y).
+// or a prompt chunk's, and of a decode step's of 65 to 128 rows in two row
+// groups (ops::stagedRowGroups). One tensor per dispatch, over the dispatch's
+// tiles (grid.x), K partitions (grid.y) and row groups (grid.z).
 struct GgufDecodeParams {
   uint32_t input_size;  // K
   uint32_t splits;      // K partitions; 1 = no cross-threadgroup reduction

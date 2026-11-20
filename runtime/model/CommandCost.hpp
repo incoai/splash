@@ -5,6 +5,8 @@
 // formulas behind the counts are the model's own (model/WorkFormulas.hpp), and no value is a time the model
 // guesses.
 
+#include "metal/abi/ExecutionGeometry.h"
+
 #include <cstdint>
 #include <limits>
 #include <span>
@@ -34,7 +36,9 @@ struct CommandLimits final {
                                  // (Scheduler), which the runtime does not refuse
   uint32_t lanesPastChunk = 1;   // lanes whose rows may run past a chunk as the lanes fill the chunks in order: 1
                                  // with GDN state, whose prefill group has one scratch cell for the state between a
-                                 // lane's parts (ExecutionLimits::prefillTokenBudget), else maximumBatchWidth
+                                 // lane's parts (ExecutionLimits::prefillTokenBudget), else every lane
+  uint32_t lanes = SPLASH_DEFAULT_LANES;  // the most requests the runtime runs at once, the lanes its start chose
+                                 // and its arenas hold (QwenTargetGeometry::lanes)
   uint32_t indexPageLanes = 0;   // lanes of one prefill command whose history may hold Index pages while it runs:
                                  // 1 with the readers (KvHistoryStream), 0 for K/V that does not spill
   bool streamsWeights = false;   // the target's weights stream from the SSD (ExpertStore): its commands run in

@@ -66,12 +66,13 @@ using SplitLaw = std::variant<TierLaw, WaveLaw>;
 
 // Register tile against the staged tile for a plan of `tiles` table tiles
 // (8 rows each, a decode lane's verify rows where it was measured), one to
-// four, the most the register tile holds (Linear.hpp, kMaximumRegisterRows),
-// by the unit's FormatClass: register where 4 * columnTiles * tiles <
-// belowQuarters * cores (in quarter threadgroups per core); kAlways where it
-// takes the formats whatever the grid, 0 never.
+// four (kRegisterTableTiles), the most the register tile holds (Linear.hpp,
+// kMaximumRegisterRows), by the unit's FormatClass: register where
+// 4 * columnTiles * tiles < belowQuarters * cores (in quarter threadgroups
+// per core); kAlways where it takes the formats whatever the grid, 0 never.
+inline constexpr uint32_t kRegisterTableTiles = 4;
 struct RegisterBoundary final {
-  std::array<std::array<uint32_t, SPLASH_MAXIMUM_BATCH_WIDTH>, kFormatClasses> belowQuarters;
+  std::array<std::array<uint32_t, kRegisterTableTiles>, kFormatClasses> belowQuarters;
 };
 
 struct ProjectionCalibration final {

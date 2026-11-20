@@ -136,7 +136,7 @@ void testLanesPastAChunkAreTheModels() {
   const model::CommandLimits stateless{.commandRows = 4 * kChunk,
                                        .layers = 48,
                                        .maximumPasses = 48,
-                                       .lanesPastChunk = model::ExecutionLimits::maximumBatchWidth,
+                                       .lanesPastChunk = model::ExecutionLimits::defaultLanes,
                                        .indexPageLanes = 1};
   requireKeeps(prefill({3000, 2000}), "two lanes past a chunk broke a rule where the model runs them", stateless);
   requireKeeps(prefill({kChunk + 1, kChunk, kChunk}),

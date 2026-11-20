@@ -59,9 +59,9 @@ public:
   static void replaceTreeTokens(Runtime &runtime, uint64_t requestId,
                                 std::vector<std::pair<uint32_t, uint32_t>> tokens);
   // Whether a streamed-expert target's later cycles each plan a draft's
-  // block a lane, at their floor, whatever class their floor passes the
-  // lanes' last chances into (CostLine::choose): for measuring what the
-  // larger class's kernels cost a cycle.
+  // block a lane within its store's round, at their floor, whatever class
+  // their floor passes the lanes' last chances into (CostLine::choose): for
+  // measuring what the larger class's kernels cost a cycle.
   static void planBlocks(Runtime &runtime, bool enabled);
   // A decode cycle's choice of its step (StepCosts::choose) and what it
   // weighed: its rows and lane cap, the chances its lanes' curves held

@@ -393,15 +393,15 @@ the price at which a row's chance of a token is worth its time. A cycle
 applies the floor twice. Before it runs, the host applies it to the lanes'
 chances, which pick only the kernels that run: the step is the last rows of
 the kernel class that holds the rows the floor passes, no fewer than a
-draft's block in all and at most one a lane. After its draft, the device
-applies it to the trees' own
+draft's block in all and at most one a lane and the store's round of 32
+rows. After its draft, the device applies it to the trees' own
 estimates, which pick the rows: the lanes verify the step's rows at or above
 the floor, and the others belong to no lane and route no expert
 (`VerifyRowsParams`). Before the line's first sample the floor is its seed's,
-and every 32nd cycle of a lane count verifies a draft's block a lane, which
-keeps the line's rows spread. `--verify-rows all` has every cycle's step verify
-every row of a draft's block a lane, so that greedy and seeded outputs
-repeat. The startup log says which rows the cycles
+and every 32nd cycle of a lane count verifies a draft's block a lane within
+the round, which keeps the line's rows spread. `--verify-rows all` has every
+cycle's step verify every row of a draft's block a lane, so that greedy and
+seeded outputs repeat. The startup log says which rows the cycles
 verify and why, and `/status` reports it as `verify_rows`. The selector grows
 each lane's verify rows into a tree over its candidates (`draft_select_tree`):
 from the anchor, best first by the estimate that the target accepts a row's

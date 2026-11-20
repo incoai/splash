@@ -54,7 +54,7 @@ using splash::test::requireExtent;
 
 // A lane's block in runWidth: its anchor and its draft's proposals.
 constexpr uint32_t kBlock = kProposals + 1;
-constexpr std::array<uint32_t, kLanes> kAllRows{kBlock, kBlock, kBlock, kBlock};
+constexpr std::array<uint32_t, kLanes> kAllRows{kBlock, kBlock, kBlock, kBlock, kBlock, kBlock, kBlock, kBlock};
 // The stop token runWidth places, in the last place the kernel compares.
 constexpr uint32_t kStopToken = 248044;
 constexpr StopTokens kFourStops{248046, 150001, 150003, kStopToken};
@@ -426,9 +426,9 @@ int main(int argc, char **argv) {
     if (argc != 2)
       throw std::invalid_argument("usage: dflash-batch-control METALLIB");
     MetalBackend backend(argv[1]);
-    constexpr std::array<uint32_t, kLanes> lowerAccepted{0, 1, 2, 3};
-    constexpr std::array<uint32_t, kLanes> upperAccepted{4, 5, 6, 7};
-    constexpr std::array<uint32_t, kLanes> fullRemaining{8, 8, 8, 8};
+    constexpr std::array<uint32_t, kLanes> lowerAccepted{0, 1, 2, 3, 0, 1, 2, 3};
+    constexpr std::array<uint32_t, kLanes> upperAccepted{4, 5, 6, 7, 4, 5, 6, 7};
+    constexpr std::array<uint32_t, kLanes> fullRemaining{8, 8, 8, 8, 8, 8, 8, 8};
     for (uint32_t width = 1; width <= kLanes; ++width) {
       runWidth(backend, width, lowerAccepted, fullRemaining);
       runWidth(backend, width, upperAccepted, fullRemaining);
@@ -437,8 +437,8 @@ int main(int argc, char **argv) {
     // Output limits and stop tokens shorten the committed prefix without
     // changing the physical eight-row graph: a lane whose limit or stop token
     // cuts its seven accepted proposals counts those it retains.
-    constexpr std::array<uint32_t, kLanes> allAccepted{7, 7, 7, 7};
-    constexpr std::array<uint32_t, kLanes> shortRemaining{1, 2, 3, 8};
+    constexpr std::array<uint32_t, kLanes> allAccepted{7, 7, 7, 7, 7, 7, 7, 7};
+    constexpr std::array<uint32_t, kLanes> shortRemaining{1, 2, 3, 8, 4, 5, 6, 7};
     runWidth(backend, kLanes, allAccepted, shortRemaining, 3, 3);
     // SPLASH_NO_TOKEN, which pads a list of two stop tokens, is no stop token
     // where acceptance retains it: a row with no selectable logit selects it,
@@ -448,18 +448,22 @@ int main(int argc, char **argv) {
              StopTokens{248044, 248046});
     // A lane walks only its rows, where the rows past them to the next lane's
     // are of no lane, below its budget or above it.
-    constexpr std::array<uint32_t, kLanes> fewRows{2, 3, 5, 1};
+    constexpr std::array<uint32_t, kLanes> fewRows{2, 3, 5, 1, 4, 8, 6, 7};
     runWidth(backend, kLanes, allAccepted, fullRemaining, kLanes, 0, fewRows);
     runWidth(backend, kLanes, lowerAccepted, shortRemaining, kLanes, 0, fewRows);
     testRowCopy(backend);
     // Lanes of 5, 6, 1 and 6 rows from rows 0, 5, 11 and 12 at the narrow
     // cap, and of 16, 5, 9 and 12 from rows 0, 16, 21 and 30 at a verify
     // block's.
-    packedLanes(backend, {{{{0, 5}, {5, 6}, {11, 1}, {12, 6}}}, {3, 7, 0, 5}, {5, 8, 1, 4}, 20, kRows});
-    packedLanes(backend, {{{{0, 16}, {16, 5}, {21, 9}, {30, 12}}},
-                          {14, 3, 0, 9},
-                          {16, 5, 9, 7},
-                          44,
+    packedLanes(backend, {{{{0, 5}, {5, 6}, {11, 1}, {12, 6}, {18, 3}, {21, 8}, {29, 2}, {31, 4}}},
+                          {3, 7, 0, 5, 2, 6, 1, 3},
+                          {5, 8, 1, 4, 3, 8, 2, 4},
+                          37,
+                          kRows});
+    packedLanes(backend, {{{{0, 16}, {16, 5}, {21, 9}, {30, 12}, {42, 3}, {45, 7}, {52, 1}, {53, 8}}},
+                          {14, 3, 0, 9, 2, 6, 0, 7},
+                          {16, 5, 9, 7, 3, 7, 1, 8},
+                          63,
                           SPLASH_TARGET_VERIFY_ROWS});
     for (const uint32_t rows : {kRows, SPLASH_TARGET_VERIFY_ROWS})
       treeAcceptance(backend, rows);

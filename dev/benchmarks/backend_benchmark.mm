@@ -1067,7 +1067,13 @@ int main(int argc, char **argv) {
     if (progress)
       progress->identity(identity);
 
-    // These warmups run after serving began, and widths 2-4 each add a lane.
+    // The lanes this start runs (RuntimeResourcesConfig::lanes): every width
+    // below warms, decodes and is reported.
+    const uint32_t lanes = resources->memoryPlan().breakdown().maximumBatchWidth;
+    if (logitsWidth > lanes)
+      throw std::invalid_argument("--logits-width exceeds the lanes this start runs");
+
+    // These warmups run after serving began, and widths past one each add a lane.
     // They are lanes alone in service, which the engine passes through the
     // host's margins allocation by allocation once nothing in place meets
     // one; a warmup retries none, so like a start's warmup they run inside a
@@ -1091,10 +1097,8 @@ int main(int argc, char **argv) {
                          prefillWarmup.wallSeconds * 1000.0,
                          prefillWarmupGpuMilliseconds, 0.0);
     }
-    std::array<double, model::ExecutionLimits::maximumBatchWidth>
-        decodeWarmupWall{};
-    std::array<double, model::ExecutionLimits::maximumBatchWidth>
-        decodeWarmupGpu{};
+    std::vector<double> decodeWarmupWall(lanes);
+    std::vector<double> decodeWarmupGpu(lanes);
     std::vector<std::string> performanceFailures;
     for (uint32_t width = 1; width <= decodeWarmupWall.size(); ++width) {
       decodeWarmupWall[width - 1] =
@@ -1132,14 +1136,12 @@ int main(int argc, char **argv) {
     constexpr std::string_view decodeThroughputPromptSha256 =
         "8c9bac848ac2e727f235beda84f06bac1a9320cc7a014d72da24263d07a3d982";
     std::vector<DecodeThroughputMeasurement> decodeThroughput;
-    decodeThroughput.reserve(model::ExecutionLimits::maximumBatchWidth * samples);
+    decodeThroughput.reserve(size_t{lanes} * samples);
     uint64_t requestId = 1;
     if (selected.decode) {
       for (uint32_t sample = 0; sample < samples; ++sample) {
-        for (uint32_t offset = 0;
-             offset < model::ExecutionLimits::maximumBatchWidth; ++offset) {
-          const uint32_t width =
-              1 + (sample + offset) % model::ExecutionLimits::maximumBatchWidth;
+        for (uint32_t offset = 0; offset < lanes; ++offset) {
+          const uint32_t width = 1 + (sample + offset) % lanes;
           evictAllCache(resources->cache());
           decodeThroughput.push_back(runDecodeThroughput(
               engine, driver, *executor, events, progress.get(), requestId,
@@ -1615,7 +1617,7 @@ int main(int argc, char **argv) {
               << ",\"geometry\":{\"prefill_rows\":"
               << model::ExecutionLimits::prefillTokenBudget
               << ",\"verify_rows\":" << model::ExecutionLimits::draftQueryRows
-              << ",\"batch_width\":" << model::ExecutionLimits::maximumBatchWidth
+              << ",\"batch_width\":" << lanes
               << ",\"kv_block_tokens\":"
               << kv::kPageTokens
               << "},\"start_wait_ms\":" << startWaitMilliseconds

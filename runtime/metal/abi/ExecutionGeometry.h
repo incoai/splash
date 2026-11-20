@@ -32,7 +32,19 @@
   (SPLASH_TARGET_VERIFY_ROWS - 1u)
 #define SPLASH_MAXIMUM_PHYSICAL_KV_TOKENS                                  \
   (SPLASH_MAXIMUM_CONTEXT_TOKENS + SPLASH_SPECULATIVE_SCRATCH_TOKENS)
-#define SPLASH_MAXIMUM_BATCH_WIDTH 4u
+// The most lanes of a decode step, the most requests a runtime may be started
+// to run at once (--max-concurrent-requests). A step is ragged, so its lanes
+// share its rows: past a lane's eighth row its rows hold few tokens (a replay
+// of chat cycles on Qwen3.6-35B-A3B: 64 rows hold 13.3 tokens over four
+// lanes, 25.0 over eight), while a lane costs what about five rows do (1.6 to
+// 2.7 ms a cycle on a 36 GB M5 Max, Qwen3.6-35B-A3B and Qwen3.8-27B). Eight
+// is the most the kernels' lane bindings hold (kernels/common/lane_bindings.h).
+#define SPLASH_MAXIMUM_BATCH_WIDTH 8u
+// The lanes a runtime runs unless its start asks for others: Splash 1.7.0's
+// four, whose memory and context a default start keeps. More
+// lanes cost each a lane state, its arenas' share and, past four, context
+// where memory is short; a start says what they cost (RuntimeResources).
+#define SPLASH_DEFAULT_LANES 4u
 #define SPLASH_PREFILL_TOKEN_BUDGET 2048u
 #define SPLASH_DRAFT_SLIDING_WINDOW 2048u
 #define SPLASH_TARGET_KV_BLOCK_TOKENS 32u

@@ -659,15 +659,16 @@ Dispatch dispatch(id<MTLDevice> device, id<MTLCommandQueue> queue,
   [encoder setBuffer:queries offset:0 atIndex:0];
   [encoder setBuffer:partials offset:0 atIndex:1];
   [encoder setBuffer:statistics offset:0 atIndex:2];
-  for (uint32_t index = 3; index < 7; ++index)
+  constexpr NSUInteger kTables = SPLASH_MAXIMUM_BATCH_WIDTH;
+  for (NSUInteger index = 3; index < 3 + kTables; ++index)
     [encoder setBuffer:data.pageTableBuffer offset:0 atIndex:index];
   // A split binds the tree rows, or without them another buffer of the
   // dispatch, then the layout, and a sparse split the lists, their counts and
   // the row masks, or without lists another buffer of the dispatch, of which
   // it reads nothing.
-  [encoder setBuffer:tree offset:0 atIndex:7];
-  [encoder setBuffer:layout offset:0 atIndex:8];
-  NSUInteger paramsIndex = 9;
+  [encoder setBuffer:tree offset:0 atIndex:3 + kTables];
+  [encoder setBuffer:layout offset:0 atIndex:4 + kTables];
+  NSUInteger paramsIndex = 5 + kTables;
   if (shape.sparse()) {
     [encoder setBuffer:blocks.lists offset:0 atIndex:paramsIndex++];
     [encoder setBuffer:blocks.counts offset:0 atIndex:paramsIndex++];

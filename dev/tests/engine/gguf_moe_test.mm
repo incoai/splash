@@ -515,7 +515,7 @@ int floatPairs(MetalBackend &backend) {
 // columns on the 35B, 96 on the 27B): the float projection writes the float
 // segment's columns, the quantized kernels the others bit for bit as without
 // it, and the padding past the last segment stays unwritten; decode through
-// both GGUF decode families (register, staged) at one to four lanes, and
+// both GGUF decode families (register, staged) at one lane to a full batch, and
 // prefill, where a one-core device takes the neural accelerator float tile
 // from 16 rows.
 int floatSegments(MetalBackend &backend, uint32_t floatColumns) {
@@ -532,7 +532,7 @@ int floatSegments(MetalBackend &backend, uint32_t floatColumns) {
     DeviceCapabilities device = backend.capabilities();
     device.appleGpuFamily = family;
     if (cores) device.gpuCoreCount = cores;
-    const Linear linear(device, splash::ops::Int8Activations::On);
+    const Linear linear(device, splash::ops::Int8Activations::On, splash::ops::StepKind::Prefill);
     const auto check = [&](uint32_t rows, uint32_t storage, const std::string &label,
                            const std::function<void(CommandGraph &, MetalBuffer, const Projection &, MetalBuffer)> &add) {
       const std::vector<float> x = activations(uint64_t{storage} * K);
@@ -576,7 +576,7 @@ int floatSegments(MetalBackend &backend, uint32_t floatColumns) {
                            zeros(backend, std::max<uint64_t>(size.counters, 16), "scratch-counters")};
     };
     const LinearMatrix matrix{N, K};
-    for (uint32_t lanes = 1; lanes <= 4; ++lanes) {
+    for (uint32_t lanes = 1; lanes <= SPLASH_MAXIMUM_BATCH_WIDTH; ++lanes) {
       const LinearPlan plan = linear.plan({matrix, lanes * 8, LinearEpilogue::None}, full);
       const LinearScratch scratch = scratchFor(plan);
       check(lanes * 8, plan.storageRows(), "decode B" + std::to_string(lanes),
@@ -594,8 +594,8 @@ int floatSegments(MetalBackend &backend, uint32_t floatColumns) {
             });
     }
   }
-  printf("float segment: fused Q8_0|Q4_K|F32 (%u float columns) decode B1-4 (register, staged) and prefill "
-         "1/24/33/263 rows, both float tiles %s\n", floatColumns, failures ? "FAIL" : "ok");
+  printf("float segment: fused Q8_0|Q4_K|F32 (%u float columns) decode B1-%u (register, staged) and prefill "
+         "1/24/33/263 rows, both float tiles %s\n", floatColumns, SPLASH_MAXIMUM_BATCH_WIDTH, failures ? "FAIL" : "ok");
   return failures;
 }
 
@@ -610,21 +610,26 @@ int floatOnlyChain(MetalBackend &backend) {
   const Projection blocks(N, K, splash::ops::BlockWeights{{q4k.segment}});
   DeviceCapabilities device = backend.capabilities();
   device.appleGpuFamily = 9;
-  const Linear linear(device, splash::ops::Int8Activations::On);
+  const Linear linear(device, splash::ops::Int8Activations::On, splash::ops::StepKind::Prefill);
   int failures = 0;
-  for (uint32_t lanes = 1; lanes <= 4; ++lanes) {
+  for (uint32_t lanes = 1; lanes <= SPLASH_MAXIMUM_BATCH_WIDTH; ++lanes) {
     const uint64_t rows = lanes * 8, bytes = rows * N * 2;
     const LinearPlan plan = linear.plan(blocks, lanes * SPLASH_DRAFT_QUERY_ROWS);
     const LinearScratchSize size = plan.scratchSize();
     const LinearScratch scratch{zeros(backend, size.input, "chain-table"), zeros(backend, size.sums, "chain-sums"),
                                 zeros(backend, size.partials, "chain-partials"),
                                 zeros(backend, size.counters, "chain-counters")};
-    const MetalBuffer input = bfloatBuffer(backend, activations(rows * K), "chain-input");
-    const MetalBuffer scores = zeros(backend, bytes, "chain-scores"), chained = zeros(backend, bytes, "chain-output"),
-                      alone = zeros(backend, bytes, "chain-reference");
+    // The buffers hold the plans' rows, whose tiles may hold more rows than
+    // the step.
+    const LinearPlan floatPlan = linear.plan(floats, lanes * SPLASH_DRAFT_QUERY_ROWS);
+    const uint64_t storage = std::max(plan.storageRows(), floatPlan.storageRows()), storageBytes = storage * N * 2;
+    const MetalBuffer input = bfloatBuffer(backend, activations(storage * K), "chain-input");
+    const MetalBuffer scores = zeros(backend, storageBytes, "chain-scores"),
+                      chained = zeros(backend, storageBytes, "chain-output"),
+                      alone = zeros(backend, storageBytes, "chain-reference");
     CommandGraph graph, reference;
     const PreparedInput prepared =
-        linear.add(graph, {.input = input, .output = scores, .scratch = scratch}, floats, linear.plan(floats, lanes * SPLASH_DRAFT_QUERY_ROWS));
+        linear.add(graph, {.input = input, .output = scores, .scratch = scratch}, floats, floatPlan);
     static_cast<void>(
         linear.add(graph, {.input = input, .output = chained, .scratch = scratch, .prepared = prepared}, blocks, plan));
     static_cast<void>(backend.submitCommandAsync(graph.dispatches()).wait());
@@ -635,8 +640,8 @@ int floatOnlyChain(MetalBackend &backend) {
       ++failures;
     }
   }
-  printf("float-only projection: a register plan chained after it prepares its own table, B1-4 %s\n",
-         failures ? "FAIL" : "ok");
+  printf("float-only projection: a register plan chained after it prepares its own table, B1-%u %s\n",
+         SPLASH_MAXIMUM_BATCH_WIDTH, failures ? "FAIL" : "ok");
   return failures;
 }
 
@@ -1198,7 +1203,7 @@ void bufferExtents(MetalBackend &backend) {
 int int8Experts(MetalBackend &backend) {
   int failures = 0;
   const bool runs =
-      splash::ops::Linear(backend.capabilities(), splash::ops::Int8Activations::On).calibration().projection.prefillInt8;
+      splash::ops::Linear(backend.capabilities(), splash::ops::Int8Activations::On, splash::ops::StepKind::Prefill).calibration().projection.prefillInt8;
   if (!runs)
     printf("int8 passes: not run here (the device's family does not run the int8 prefill tile); every plan keeps the "
            "staged passes\n");
@@ -1319,18 +1324,18 @@ int moe(MetalBackend &backend) {
       Stats stats;
       MoeRun widest;
       uint32_t compared = 0, acrossKinds = 0;
-      // The rows of a run that differ from the four-lane dispatch's where their routes ran the same tile kinds.
+      // The rows of a run that differ from the widest dispatch's where their routes ran the same tile kinds.
       const auto compareWidest = [&](const MoeRun &run, const std::string &label) {
         const RowComparison c =
             compareRows(run, widest, uint32_t(std::min(run.output.size(), widest.output.size()) / kHidden));
         compared += c.compared;
         acrossKinds += c.acrossKinds;
         if (c.differ) {
-          printf("  %s: %u rows differ from the four-lane dispatch FAIL\n", label.c_str(), c.differ);
+          printf("  %s: %u rows differ from the widest dispatch FAIL\n", label.c_str(), c.differ);
           ++failures;
         }
       };
-      for (uint32_t lanes = 4; lanes >= 1; --lanes) {
+      for (uint32_t lanes = SPLASH_MAXIMUM_BATCH_WIDTH; lanes >= 1; --lanes) {
         const MoePlan plan = MoE::plan(shape, lanes * SPLASH_DRAFT_QUERY_ROWS, MoeConfig{MoeExpertTile::M8});
         const std::string label = formats + " staged decode B" + std::to_string(lanes);
         const MoeRun run = runPlan(backend, m, b, plan, products, stats, label);
@@ -1351,9 +1356,10 @@ int moe(MetalBackend &backend) {
         const std::string label = formats + " staged prefill rows=" + std::to_string(chunk);
         compareWidest(runPlan(backend, m, b, plan, products, stats, label), label);
       }
-      printf("%-20s staged   decode B1-4, prefill 263/27/9/8: gate/up %.2f%% and down %.2f%% of outputs differ from "
+      printf("%-20s staged   decode B1-%u, prefill 263/27/9/8: gate/up %.2f%% and down %.2f%% of outputs differ from "
              "bf16(fp64), errors at most %.1e/%.1e of sum|x w|, %u rows compared bitwise, %u across tile kinds %s\n",
-             formats.c_str(), 100.0 * stats.gateUpFlips / (stats.outputs / 2), 100.0 * stats.downFlips / stats.outputs,
+             formats.c_str(), SPLASH_MAXIMUM_BATCH_WIDTH, 100.0 * stats.gateUpFlips / (stats.outputs / 2),
+             100.0 * stats.downFlips / stats.outputs,
              stats.gateUpWorst, stats.downWorst, compared, acrossKinds, failures > before ? "FAIL" : "ok");
       prefill32(m, products, formats);
     }
@@ -1442,7 +1448,7 @@ int routingLoads(MetalBackend &backend) {
 // A router of a quantized format's native rows, as an MLX checkpoint's
 // quantized router loads, routes as the F32 values the token gather decodes
 // from them: the same experts, routing weights and outputs bit for bit, in
-// decode at one to four lanes and in prefill with the router on each float
+// decode at one lane to a full batch and in prefill with the router on each float
 // tile.
 int nativeRouter(MetalBackend &backend) {
   const MoeShape shape = kShape;
@@ -1475,7 +1481,7 @@ int nativeRouter(MetalBackend &backend) {
         QuantizedSegment::rows(f, kExperts, kHidden, upload(backend, native.data(), native.size(), "router-rows"));
     const QuantizedSegment values = gatheredValues(backend, f, kExperts, kHidden, rows.plane0);
     std::vector<std::pair<std::string, MoePlan>> plans;
-    for (uint32_t lanes = 1; lanes <= 4; ++lanes)
+    for (uint32_t lanes = 1; lanes <= SPLASH_MAXIMUM_BATCH_WIDTH; ++lanes)
       plans.emplace_back("decode B" + std::to_string(lanes),
                          MoE::plan(shape, lanes * SPLASH_DRAFT_QUERY_ROWS, MoeConfig{}));
     for (const FloatTile tile : {FloatTile::Simdgroup, FloatTile::NeuralAccelerator})
@@ -1493,9 +1499,9 @@ int nativeRouter(MetalBackend &backend) {
                kQuantFormats[f].name, label.c_str());
         ++formatFailures;
       }
-    printf("%-20s %s router: decode B1-4, prefill 263/33/16 on both float tiles route and output as its F32 "
+    printf("%-20s %s router: decode B1-%u, prefill 263/33/16 on both float tiles route and output as its F32 "
            "values bit for bit %s\n",
-           formatNames(m).c_str(), kQuantFormats[f].name, formatFailures ? "FAIL" : "ok");
+           formatNames(m).c_str(), kQuantFormats[f].name, SPLASH_MAXIMUM_BATCH_WIDTH, formatFailures ? "FAIL" : "ok");
     failures += formatFailures;
   }
   return failures;
@@ -1537,14 +1543,15 @@ int permutedSlots(MetalBackend &backend) {
     return std::vector<uint16_t>(output, output + uint64_t{plan.rows()} * kHidden);
   };
   int failures = 0;
-  for (const MoePlan &plan : {MoE::plan(shape, 4 * SPLASH_DRAFT_QUERY_ROWS, MoeConfig{MoeExpertTile::M8}),
+  for (const MoePlan &plan : {MoE::plan(shape, SPLASH_MAXIMUM_BATCH_WIDTH * SPLASH_DRAFT_QUERY_ROWS,
+                                        MoeConfig{MoeExpertTile::M8}),
                               MoE::plan(shape, kMaximumRows, MoeConfig{MoeExpertTile::M32})})
     if (run(m, plan) != run(permuted, plan)) {
       printf("  permuted slots, %u rows: the output differs from the identity table's FAIL\n", plan.rows());
       ++failures;
     }
-  printf("%-20s staged   permuted slot table, decode B4 and prefill %u: %s\n", formatNames(m).c_str(), kMaximumRows,
-         failures ? "FAIL" : "ok");
+  printf("%-20s staged   permuted slot table, decode B%u and prefill %u: %s\n", formatNames(m).c_str(),
+         SPLASH_MAXIMUM_BATCH_WIDTH, kMaximumRows, failures ? "FAIL" : "ok");
   return failures;
 }
 
@@ -1552,8 +1559,8 @@ int permutedSlots(MetalBackend &backend) {
 // into a floor chunk of kMultiChunkFloorSlots slots and elastic chunks of
 // kMultiChunkSlots, the last of fewer, in slots permuted by sigma across the
 // floor and elastic chunks as permutedSlots permutes them, give the
-// output of the one chunk and identity table bit for bit, in decode B1-B4
-// and prefill 33 and 263 (column tiles in decode, and gate and up in one pass
+// output of the one chunk and identity table bit for bit, in decode of one
+// lane to a full batch and prefill 33 and 263 (column tiles in decode, and gate and up in one pass
 // in their own formats and in the gate's), each in the first formats and in
 // Q5_K's, whose formats have a second plane, so every chunk's plane1 regions
 // are read.
@@ -1590,7 +1597,7 @@ int chunkedSlots(MetalBackend &backend) {
       chunked.slotTable = table;
       chunked.router = floatSegment(backend, router, kExperts, kHidden);
       std::vector<MoePlan> plans;
-      for (uint32_t lanes = 1; lanes <= 4; ++lanes)
+      for (uint32_t lanes = 1; lanes <= SPLASH_MAXIMUM_BATCH_WIDTH; ++lanes)
         plans.push_back(MoE::plan(shape, lanes * SPLASH_DRAFT_QUERY_ROWS, MoeConfig{MoeExpertTile::M8}));
       for (const uint32_t rows : {33u, kMaximumRows})
         plans.push_back(MoE::plan(shape, rows, MoeConfig{MoeExpertTile::M32}));
@@ -1600,8 +1607,9 @@ int chunkedSlots(MetalBackend &backend) {
           printf("  chunked slots, %u rows: the output differs from one chunk's FAIL\n", plan.rows());
           ++tileFailures;
         }
-      printf("%-20s staged   a floor of %u slots and chunks of %u, permuted slots, decode B1-4 and prefill 33/%u: %s\n",
-             formatNames(m).c_str(), kMultiChunkFloorSlots, kMultiChunkSlots, kMaximumRows,
+      printf("%-20s staged   a floor of %u slots and chunks of %u, permuted slots, decode B1-%u and prefill 33/%u: "
+             "%s\n",
+             formatNames(m).c_str(), kMultiChunkFloorSlots, kMultiChunkSlots, SPLASH_MAXIMUM_BATCH_WIDTH, kMaximumRows,
              tileFailures ? "FAIL" : "ok");
       failures += tileFailures;
     }
@@ -1620,10 +1628,11 @@ int chunkedSlots(MetalBackend &backend) {
 // The rows and the router are the case's own, so those kinds are: every row
 // routes experts 0 to kTopK - 2 and, but for each lane's first row, which
 // takes expert kTopK + lane alone (the column tile in both runs), expert
-// kTopK - 1, whose tiles stay staged in both runs. The steps: four lanes of
-// 8, 5, 2 and 1 rows packed from row 0 of a step of 32, its last 16 rows of no
-// lane; and lanes of 6, 2, 3 and 1 rows at rows 2, 10, 18 and 21 of a step of
-// 26, the rows around them of no lane.
+// kTopK - 1, whose tiles stay staged in both runs. The steps: a full batch's
+// lanes of 8, 5, 2, 1, 7, 3, 8 and 1 rows packed from row 0 of a step of 64,
+// its last 29 rows of no lane; and lanes of 6, 2, 3, 1, 4, 5, 1 and 7 rows at
+// rows 2, 10, 18, 21, 26, 33, 40 and 50 of a step of 60, the rows around them
+// of no lane.
 int laneRowsRoute(MetalBackend &backend, const std::string &name, uint32_t rows,
                   const std::vector<SplashLaneRows> &lanes) {
   const MoeShape shape = kShape;
@@ -1649,7 +1658,7 @@ int laneRowsRoute(MetalBackend &backend, const std::string &name, uint32_t rows,
   // step.
   std::vector<SplashLaneRows> every;
   for (uint32_t first = 0; first < rows; first += 8) every.push_back({first, std::min(8u, rows - first)});
-  if (every.size() > SPLASH_MAXIMUM_BATCH_WIDTH) throw std::logic_error("a step of more rows than four lanes of 8");
+  if (every.size() > SPLASH_MAXIMUM_BATCH_WIDTH) throw std::logic_error("a step of more rows than the most lanes of 8");
   // Inputs within 0.25 of zero, which score an expert at most 1, and a row's
   // route k at 1 - k / (2 kTopK), which scores its expert above 2.
   std::mt19937 generator(0x5e1);
@@ -1848,10 +1857,10 @@ int main(int argc, const char *argv[]) {
                            nativePairs(backend) + floatPairs(backend) +
                            floatSegments(backend, 64) + floatSegments(backend, 96) + floatOnlyChain(backend) +
                            moe(backend) + routingLoads(backend) + nativeRouter(backend) + permutedSlots(backend) +
-                           laneRowsRoute(backend, "lanes of 8/5/2/1 rows, 16 of no lane", 32,
-                                         {{0, 8}, {8, 5}, {13, 2}, {15, 1}}) +
-                           laneRowsRoute(backend, "rows of no lane around lanes of 6/2/3/1", 26,
-                                         {{2, 6}, {10, 2}, {18, 3}, {21, 1}}) +
+                           laneRowsRoute(backend, "lanes of 8/5/2/1/7/3/8/1 rows, 29 of no lane", 64,
+                                         {{0, 8}, {8, 5}, {13, 2}, {15, 1}, {16, 7}, {23, 3}, {26, 8}, {34, 1}}) +
+                           laneRowsRoute(backend, "rows of no lane around lanes of 6/2/3/1/4/5/1/7", 60,
+                                         {{2, 6}, {10, 2}, {18, 3}, {21, 1}, {26, 4}, {33, 5}, {40, 1}, {50, 7}}) +
                            chunkedSlots(backend) + int8Experts(backend) + stagedTiles(backend, argv[1]);
       if (failures) {
         std::cerr << "gguf_moe_test: " << failures << " failures\n";

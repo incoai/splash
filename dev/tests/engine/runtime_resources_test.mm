@@ -145,7 +145,7 @@ uint64_t residentAllowanceBytes(const RuntimeResourcesConfig &config) {
   while (kvCapacityPagesFor(layout, budget) < pages) ++budget;
   const uint64_t index = kv::kPageTokens * model::kLookupIndexTokenBytes;
   return kvPagesBytes(layout, budget, kvWindowFloorPages(layout, 0), layout.extentPagesFor(budget)) + budget * index -
-         kvRunwayPages(layout.minimumExtentPages()) * (layout.bytesPerModelPage() + index);
+         kvRunwayPages(layout.minimumExtentPages(), model::ExecutionLimits::defaultLanes) * (layout.bytesPerModelPage() + index);
 }
 
 // The runtime memory a start plans of a model of `config` before its weights
@@ -469,13 +469,13 @@ uint64_t minimumBytes(const RuntimeResourcesConfig &config) {
   const ops::ExecutionPlans operators(backend.capabilities(), config.int8Activations);
   const model::ModelMemoryPlan arenas = model::plannedRuntimeMemory(
       config.model, model::plannedTargetGeometry(backend, config.modelRoot, config.model, 0, nullptr), operators,
-      config.kvFormat, config.stateFormat, {});
+      config.kvFormat, config.stateFormat, {}, model::ExecutionLimits::defaultLanes);
   return minimumRequiredBytes(model::streamableWeights(config.modelRoot, config.model, {}).loadedBytes +
                                   arenas.sharedPrefillPlannedAllocatedBytes +
                                   arenas.sharedDecodePlannedAllocatedBytes + model::kPipelineReserveBytes +
                                   model::kRuntimeOverheadReserveBytes,
                               config.model.stateLayout.laneBytes(),
-                              config.model.targetKvLayout)
+                              config.model.targetKvLayout, model::ExecutionLimits::defaultLanes)
       .value();
 }
 
@@ -1809,7 +1809,7 @@ void testDecodeArenaHoldsAStepsPackedRows(const char *metallibPath) {
   const auto geometry = model::RuntimeGeometry::from(loaded, kv::Format::Int8, ops::GdnStateFormat::Float32);
   const ops::ExecutionPlans operators(backend.capabilities(), ops::Int8Activations::On);
   const model::DecodeArena arena(backend, geometry, operators);
-  constexpr uint32_t kStepRows = model::kLaneCount * model::ExecutionLimits::targetVerifyRows;
+  constexpr uint32_t kStepRows = 64;
   const auto at = [](const metal::MetalBuffer &buffer) { return static_cast<const std::byte *>(buffer.contents()); };
   // A lane's rows after lanes of 16 and 5.
   constexpr ops::LaneRows lane{21, 11};
@@ -1822,7 +1822,7 @@ void testDecodeArenaHoldsAStepsPackedRows(const char *metallibPath) {
       {model::DecodeTensor::FinalHidden, hiddenRow},
       {model::DecodeTensor::CapturedTargetHidden, uint64_t{geometry.target.capturedHiddenSize()} * sizeof(uint16_t)}};
   for (const auto &[tensor, row] : rowTensors) {
-    const metal::MetalBuffer step = arena.batchSlice(tensor, model::kLaneCount);
+    const metal::MetalBuffer step = arena.all(tensor);
     const metal::MetalBuffer rows = arena.rows(tensor, lane);
     require(step.sizeBytes() == kStepRows * row && arena.rows(tensor, {0, kStepRows}).sizeBytes() == step.sizeBytes() &&
                 at(rows) == at(step) + lane.first * row && rows.sizeBytes() == lane.rows * row,
@@ -2061,6 +2061,8 @@ void testDenseRuntimeBoundary(const char *metallibPath) {
                                                            .layers = layers,
                                                            .maximumPasses = layers,
                                                            .lanesPastChunk = 1,
+                                                           .lanes =
+                                                               resources->memoryPlan().breakdown().maximumBatchWidth,
                                                            .indexPageLanes = 0,
                                                            .attentionPairs = kLayerPairs},
           "a resident dense runtime's command limits are not a chunk in a pass a layer, with the per-layer bound");
@@ -2093,6 +2095,8 @@ void testStreamedRuntimeBoundary(RuntimeResourcesConfig moe) {
                                                            .layers = kMoeLayers,
                                                            .maximumPasses = kMoeLayers,
                                                            .lanesPastChunk = 1,
+                                                           .lanes =
+                                                               resources->memoryPlan().breakdown().maximumBatchWidth,
                                                            .indexPageLanes = 0,
                                                            .streamsWeights = true,
                                                            .attentionPairs = kLayerPairs},
@@ -2156,6 +2160,8 @@ void testSpilledRuntimeBoundary(const char *metallibPath) {
                                                            .layers = layers,
                                                            .maximumPasses = layers,
                                                            .lanesPastChunk = 1,
+                                                           .lanes =
+                                                               resources->memoryPlan().breakdown().maximumBatchWidth,
                                                            .indexPageLanes = 1,
                                                            .streamsWeights = streamsExperts,
                                                            .attentionPairs = kLayerPairs},

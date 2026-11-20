@@ -754,7 +754,7 @@ void testAResendStartsBesideARefusedLongerPrompt() {
   harness.model.maximumLanes = 0;
   served.submit(1, prompt(1, 30'000), kTokensPerCommand);
   static_cast<void>(harness.tick());
-  harness.model.maximumLanes = model::ExecutionLimits::maximumBatchWidth;
+  harness.model.maximumLanes = model::ExecutionLimits::defaultLanes;
   harness.memory->hold("limit", harness.governor->snapshot().headroomBytes - 32);
   ledger.addSource(landing);
   served.submit(2, prompt(2, 45'000), kTokensPerCommand);
@@ -789,10 +789,10 @@ void testAResendStartsBesideARefusedLongerPrompt() {
 // conversations, cached but for their last rows, while a 38,133-token prompt
 // nothing caches waits. Each command that serves the resends runs a few
 // hundred rows, yet the cold prompt waits behind at most
-// K = maximumBatchWidth - 1 prefill commands that serve later arrivals, then
+// K = defaultLanes - 1 prefill commands that serve later arrivals, then
 // takes the next lane that frees and leads.
 void testAColdPromptStartsWithinTheOvertakesAmidCachedResends() {
-  constexpr uint32_t kWorkers = 8, kOutput = 64, kOvertakes = model::ExecutionLimits::maximumBatchWidth - 1;
+  constexpr uint32_t kWorkers = 8, kOutput = 64, kOvertakes = model::ExecutionLimits::defaultLanes - 1;
   TimedHarness served(test::k35BStudio18G);
   test::EngineHarness &harness = served.harness;
   uint64_t nextId = 1;

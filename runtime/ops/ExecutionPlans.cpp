@@ -10,7 +10,9 @@
 namespace splash::ops {
 
 ExecutionPlans::ExecutionPlans(const DeviceCapabilities &device, Int8Activations int8Activations)
-    : linear_(device, int8Activations), draftLinear_(device, Int8Activations::Off) {}
+    : linear_(device, int8Activations, StepKind::Prefill), decodeLinear_(device, int8Activations, StepKind::Decode),
+      draftLinear_(device, Int8Activations::Off, StepKind::Prefill),
+      draftDecodeLinear_(device, Int8Activations::Off, StepKind::Decode) {}
 
 // A chunk's rows pick its projections' tile, and a tile's height names its
 // kernels (gguf_decode_<format>_m<rows>_*, the register tile's _l<tiles>), so
@@ -32,7 +34,8 @@ std::vector<uint32_t> ExecutionPlans::prefillRowClasses(std::optional<std::pair<
     // Only the staged and register tiles' kernels are named by their height.
     const bool named = tile == LinearTile::GgufStaged || tile == LinearTile::GgufRegister;
     MoeConfig config{};
-    if (moe) config = selectMoe(calibration(), linear_.int8Activations(), moe->first, moe->second, rows);
+    if (moe)
+      config = selectMoe(calibration(), linear_.int8Activations(), StepKind::Prefill, moe->first, moe->second, rows);
     const std::tuple key{tile, named ? plan.storageRows() : 0, config.expertTile, config.int8Passes};
     if (first.empty() || key != last) first.push_back(rows);
     last = key;
@@ -49,16 +52,17 @@ std::vector<uint32_t> ExecutionPlans::prefillRowClasses(std::optional<std::pair<
 std::vector<uint32_t> ExecutionPlans::decodeRowClasses(uint32_t mostRows,
                                                        std::optional<std::pair<MoeShape, uint32_t>> moe) const {
   if (mostRows > SPLASH_MAXIMUM_BATCH_WIDTH * SPLASH_TARGET_VERIFY_ROWS)
-    throw std::invalid_argument("a decode step holds at most a verify block a lane");
+    throw std::invalid_argument("a decode step holds at most a verify block of each of the most lanes");
   const FloatTileCalibration &floats = calibration().floatTile;
   std::vector<uint32_t> first;
   std::tuple<LinearTile, uint32_t, bool, uint32_t> last{};
   for (uint32_t rows = 1; rows <= mostRows; ++rows) {
-    const LinearPlan plan = linear_.plan({{GGUF_TILE_COLUMNS, GGUF_TILE_COLUMNS}, rows});
+    const LinearPlan plan = decodeLinear_.plan({{GGUF_TILE_COLUMNS, GGUF_TILE_COLUMNS}, rows});
     const LinearTile tile = plan.configuration().tile;
     const bool named = tile == LinearTile::GgufStaged || tile == LinearTile::GgufRegister;
     MoeConfig config{};
-    if (moe) config = selectMoe(calibration(), linear_.int8Activations(), moe->first, moe->second, rows);
+    if (moe)
+      config = selectMoe(calibration(), linear_.int8Activations(), StepKind::Decode, moe->first, moe->second, rows);
     const std::tuple key{tile, named ? plan.storageRows() : 0, floats.neuralAccelerator && rows >= floats.minimumRows,
                          uint32_t(config.expertTile)};
     if (first.empty() || key != last) first.push_back(rows);
@@ -79,8 +83,8 @@ DraftAttentionPlan ExecutionPlans::draftAttention(DraftAttentionShape shape,
   return DraftAttention::plan(shape, lanes);
 }
 
-MoePlan ExecutionPlans::moe(MoeShape shape, uint32_t routerFormat, uint32_t rows) const {
-  return MoE::plan(shape, rows, selectMoe(calibration(), linear_.int8Activations(), shape, routerFormat, rows));
+MoePlan ExecutionPlans::moe(MoeShape shape, uint32_t routerFormat, uint32_t rows, StepKind step) const {
+  return MoE::plan(shape, rows, selectMoe(calibration(), linear_.int8Activations(), step, shape, routerFormat, rows));
 }
 
 AttentionWorkspace ExecutionPlans::sequenceAttentionWorkspace(uint32_t queryHeads, kv::Layout layout) const {
@@ -98,22 +102,28 @@ DraftAttentionWorkspace ExecutionPlans::draftAttentionWorkspacePerLane(
   return DraftAttention::plan(shape, 1).workspace();
 }
 
-MoeWorkspace ExecutionPlans::moeWorkspace(MoeShape shape, uint32_t routerFormat, uint32_t maximumRows) const {
+MoeWorkspace ExecutionPlans::moeWorkspace(MoeShape shape, uint32_t routerFormat, uint32_t maximumRows,
+                                          StepKind step) const {
   // Validate the bound before iterating; every row is included even if a
   // future grouped layout's largest field is not monotone in row count.
-  MoeWorkspace bound = moe(shape, routerFormat, maximumRows).workspace();
+  MoeWorkspace bound = moe(shape, routerFormat, maximumRows, step).workspace();
   for (uint32_t rows = 1; rows <= maximumRows; ++rows) {
-    const MoeWorkspace required = moe(shape, routerFormat, rows).workspace();
+    const MoeWorkspace required = moe(shape, routerFormat, rows, step).workspace();
     for (const auto field : kMoeWorkspaceFields) bound.*field = std::max(bound.*field, required.*field);
   }
   return bound;
 }
 
+// The gate scratch of the plan Linear::addSwiGlu runs over each rows of a
+// decode step: the pair's up to one row group's rows, past them the
+// up-with-gate pass's on the row groups, whose gate rows a pass of their own
+// writes.
 uint64_t ExecutionPlans::gateUpWorkspace(ProjectionShape shape, uint32_t maximumRows) const {
   uint64_t bound = 0;
   for (uint32_t rows = 1; rows <= maximumRows; ++rows) {
-    const LinearWorkload workload{{shape.outputSize, shape.inputSize}, rows, LinearEpilogue::GateUp};
-    bound = std::max(bound, linear_.plan(workload).gateScratchBytes());
+    const LinearEpilogue epilogue = rows <= kMaximumDecodeTileRows ? LinearEpilogue::GateUp : LinearEpilogue::UpWithGate;
+    bound = std::max(bound,
+                     decodeLinear_.plan({{shape.outputSize, shape.inputSize}, rows, epilogue}).gateScratchBytes());
   }
   return bound;
 }

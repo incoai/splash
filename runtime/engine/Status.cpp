@@ -610,7 +610,7 @@ void writeModelTiming(json::Writer &w, const model::ModelTelemetry &telemetry) {
   });
 }
 
-void writeScheduler(json::Writer &w, const engine::EngineSnapshot &core) {
+void writeScheduler(json::Writer &w, const engine::EngineSnapshot &core, uint32_t lanes) {
   const auto &scheduler = core.scheduler;
   w.object([&] {
     w.field("queued", scheduler.queued)
@@ -624,7 +624,7 @@ void writeScheduler(json::Writer &w, const engine::EngineSnapshot &core) {
         .field("prefill_rows", scheduler.prefillRows)
         .field("decode_batches", scheduler.decodeBatches);
     w.object("decode_batches_by_width", [&] {
-      for (uint32_t width = 1; width <= model::ExecutionLimits::maximumBatchWidth; ++width)
+      for (uint32_t width = 1; width <= lanes; ++width)
         w.key("b" + std::to_string(width)).value(scheduler.decodeBatchesByWidth[width - 1]);
     });
     w.field("decode_gap_target_ms", scheduler.decodeGapTargetMilliseconds).key("contended_prefill_ms");
@@ -706,11 +706,11 @@ void writeMetrics(json::Writer &w, const RuntimeMetricsSnapshot &metrics, const 
 }
 
 // Each warmup step, whether it ran, and the steps memory kept from running.
-void writeWarmup(json::Writer &w, const WarmupReport &warmup) {
+void writeWarmup(json::Writer &w, const WarmupReport &warmup, uint32_t lanes) {
   std::vector<std::pair<std::string, WarmupStepStatus>> steps{
       {"prefill_" + std::to_string(model::ExecutionLimits::prefillTokenBudget), warmup.maximumPrefill},
       {"prefill_row_classes", warmup.prefillRowClasses}};
-  for (uint32_t width = 1; width <= model::ExecutionLimits::maximumBatchWidth; ++width)
+  for (uint32_t width = 1; width <= lanes; ++width)
     steps.emplace_back("decode_b" + std::to_string(width), warmup.decodeBatches[width - 1]);
   steps.emplace_back("composite_state_restore", warmup.compositeStateRestore);
   w.object([&] {
@@ -835,7 +835,7 @@ std::string runtimeStatusJson(const StatusStart &start, const StatusSample &samp
           .field("rows_bytes", executorTelemetry.imageRowsBytes);
     });
     w.key("scheduler");
-    writeScheduler(w, core);
+    writeScheduler(w, core, plan.breakdown().maximumBatchWidth);
     w.key("active_requests");
     writeActiveRequests(w, core, sample.kvSpill.has_value());
     w.object("requests", [&] {
@@ -847,7 +847,7 @@ std::string runtimeStatusJson(const StatusStart &start, const StatusSample &samp
     w.key("metrics");
     writeMetrics(w, sample.metrics, core);
     w.key("warmup");
-    writeWarmup(w, start.warmup);
+    writeWarmup(w, start.warmup, plan.breakdown().maximumBatchWidth);
     w.object("metal", [&] {
       w.field("healthy", sample.metalHealthy)
           .field("failure_reason", sample.metalFailureReason)

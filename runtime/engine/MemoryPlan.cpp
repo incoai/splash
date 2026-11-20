@@ -167,12 +167,12 @@ void writeBudget(json::Writer &w, const EngineMemoryBreakdown &budget) {
 
 std::optional<uint64_t> minimumRequiredBytes(uint64_t fixedBytes,
                                              uint64_t laneStateBytes,
-                                             const kv::Layout &layout) noexcept {
+                                             const kv::Layout &layout, uint32_t lanes) noexcept {
   uint64_t runwayBytes = 0;
   uint64_t dynamicBytes = 0;
   uint64_t result = 0;
   if (!checkedMultiply(layout.bytesPerModelPage() + kv::kPageTokens * model::kLookupIndexTokenBytes,
-                       kvRunwayPages(layout.minimumExtentPages()), runwayBytes) ||
+                       kvRunwayPages(layout.minimumExtentPages(), lanes), runwayBytes) ||
       !checkedAdd(laneStateBytes, runwayBytes, dynamicBytes) ||
       !checkedAdd(fixedBytes, dynamicBytes, result))
     return std::nullopt;
@@ -373,6 +373,7 @@ evaluateEngineMemoryPlan(const DeviceCapabilities &device,
       model.footprint.runtime.sharedPrefillPlannedAllocatedBytes;
   breakdown.sharedDecodeBytes =
       model.footprint.runtime.sharedDecodePlannedAllocatedBytes;
+  breakdown.maximumBatchWidth = model.footprint.runtime.lanes;
   breakdown.pipelineReserveBytes = model::kPipelineReserveBytes;
   breakdown.runtimeOverheadReserveBytes = model::kRuntimeOverheadReserveBytes;
   breakdown.stateStagingBytes = model.footprint.stateStagingBytes;
@@ -410,8 +411,8 @@ evaluateEngineMemoryPlan(const DeviceCapabilities &device,
           ? breakdown.hardBudgetBytes - breakdown.fixedRuntimeBytes
           : 0;
   const std::optional<uint64_t> required =
-      minimumRequiredBytes(breakdown.fixedRuntimeBytes,
-                           breakdown.laneStateBytes, model.targetKvLayout);
+      minimumRequiredBytes(breakdown.fixedRuntimeBytes, breakdown.laneStateBytes, model.targetKvLayout,
+                           breakdown.maximumBatchWidth);
   if (!required) {
     return {std::nullopt,
             failure(BudgetErrorCode::ArithmeticOverflow,

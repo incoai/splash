@@ -415,7 +415,8 @@ int main(int argc, char **argv) {
       model::VerifyRows verifyRows = model::VerifyRows::Auto;
       std::optional<uint32_t> stepRows;
       bool attribute = true;
-      // The start's decode warmups, which measure the step costs (StepCosts);
+      // The start's warmups (its prefill of the most rows and of each row class, with the pipelines they create,
+      // and its decode warmups, which measure the step costs, StepCosts);
       // the counting prompt, or a file's token ids; and each cycle's choice
       // of its rows.
       bool warmups = false, counting = false, stepLog = false, blockPlans = false;
@@ -556,9 +557,24 @@ int main(int argc, char **argv) {
                                       model.stateLayout(stateFormat), nullptr);
       model::RuntimeContext context{backend, model, pages, states, operators};
       context.verifyRows = verifyRows;
+      // The lanes a start runs that profiles its widths: the default's, or
+      // more as --max-concurrent-requests asks.
+      context.lanes = std::max(widths, model::ExecutionLimits::defaultLanes);
       model::Runtime executor(context);
       if (warmups) {
-        for (uint32_t width = 1; width <= model::ExecutionLimits::maximumBatchWidth; ++width) {
+        // A start's prefill warmups (Bootstrap): the prefill of the most rows,
+        // then a chunk of each row class, and the pipelines they created.
+        const auto prefillStarted = std::chrono::steady_clock::now();
+        static_cast<void>(executor.warmupPrefill(model::ExecutionLimits::prefillTokenBudget));
+        const size_t mostPipelines = BackendInstrumentation::cachedPipelines(backend);
+        const auto classesStarted = std::chrono::steady_clock::now();
+        for (const uint32_t rows : executor.prefillRowClasses()) static_cast<void>(executor.warmupPrefill(rows));
+        std::printf("prefill warmups: most rows %.2f s, %zu row classes %.2f s, pipelines %zu then %zu\n",
+                    std::chrono::duration<double>(classesStarted - prefillStarted).count(),
+                    executor.prefillRowClasses().size(),
+                    std::chrono::duration<double>(std::chrono::steady_clock::now() - classesStarted).count(),
+                    mostPipelines, BackendInstrumentation::cachedPipelines(backend));
+        for (uint32_t width = 1; width <= context.lanes; ++width) {
           // A start's decode warmup of the lane count, which measures its
           // classes' costs, and the costs it measured.
           const auto started = std::chrono::steady_clock::now();

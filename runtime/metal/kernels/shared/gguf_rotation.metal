@@ -56,17 +56,25 @@ kernel void gguf_rotate(device const bfloat *input [[buffer(0)]], device const c
 
 // The int8 rows of the int8 decode tiles (metal/abi/Gguf.h GgufRotationInt8Params): gguf_rotate's bf16 values H (D x),
 // each rotation block of a row quantized by the int8-activation rule (kernels/common/int8_activations.h), in the
-// tiles' stage order (gguf_decode_int8_position), the scales after the p.rows int8 rows. Grid (width /
-// GGUF_ROTATION_BLOCK, rows).
+// tiles' stage order (gguf_decode_int8_position), each row group's p.rows rows (ops::int8RowGroups) their codes then
+// their scales. Grid (width / GGUF_ROTATION_BLOCK, rows of a group, row groups), as the int8 tiles' row groups, which
+// function constant 0 gives (the host sets it on every dispatch): a pipeline of one group takes no group offsets (on a
+// 20-core M5 Pro they took a Ternary-Bonsai 16-row cycle's rotations 1.73 ms against 1.7.0's 1.58-1.69).
+constant uint kInt8RowGroups [[function_constant(0)]];
 kernel void gguf_rotate_int8(device const bfloat *input [[buffer(0)]], device const char *signs [[buffer(1)]],
                              device uchar *output [[buffer(2)]], constant GgufRotationInt8Params &p [[buffer(3)]],
-                             uint2 group [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
+                             uint3 group [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
                              uint lane [[thread_index_in_simdgroup]],
                              uint simd_group [[simdgroup_index_in_threadgroup]]) {
   threadgroup float values[GGUF_ROTATION_BLOCK];
   threadgroup float peak[GGUF_ROTATION_THREADS / 32];
   threadgroup uint simd_finite[GGUF_ROTATION_THREADS / 32];
   const uint K = p.width, column = group.x * GGUF_ROTATION_BLOCK;
+  // Row group z: its rows' inputs, and their int8 rows and scales, in a pipeline of several.
+  if (kInt8RowGroups > 1) {
+    input += ulong(group.z) * p.rows * K;
+    output += group.z * gguf_rotation_int8_bytes(K, p.rows);
+  }
   const ulong row = ulong(group.y) * K + column;
   float4 v;
   bool finite = true;

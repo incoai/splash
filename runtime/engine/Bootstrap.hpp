@@ -113,11 +113,10 @@ inline constexpr auto kStartupMemoryRecoveryPoll = std::chrono::seconds(1);
 protocolLimitsFor(const model::ModelCapabilities &capabilities,
                   uint32_t maxContext) noexcept;
 
-// What a model served under `engine` and `limits` (protocolLimitsFor)
-// announces in Ready.
+// What a model served under `engine` and `limits` (protocolLimitsFor) on `lanes` lanes announces in Ready.
 [[nodiscard]] protocol::ReadyEvent readyEventFor(
     const model::ModelDescriptor &model, const EngineConfig &engine,
-    const protocol::ProtocolLimits &limits);
+    const protocol::ProtocolLimits &limits, uint32_t lanes);
 
 struct RuntimeBootstrapConfig {
     RuntimeResourcesConfig resources;

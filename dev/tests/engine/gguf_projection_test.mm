@@ -794,7 +794,8 @@ void oneGateUpPass(MetalBackend &backend, const Linear &linear, bool spread) {
 // simdgroups skip their matmuls, though not the barriers of the stage they share, and leave the rows from 192 or 160
 // unwritten. Chunks of up to 32 rows run the decode tiles, whose rows equal the 128-row tiles' bitwise without K
 // splits and lie within fp64 with them; chunks of 33-64 rows run the 48- and 64-row tiles, alike, and also at eight
-// partitions, which the split law takes for some shapes, where K takes them. Every chunk's last 1 and 4 rows, on its
+// partitions, which the split law takes for some shapes, where K takes them, and chunks of 65-128 rows the tiles' two
+// row groups of 48 or 64 rows (65 and 97 rows with a padded second group), alike. Every chunk's last 1 and 4 rows, on its
 // tile and splits at their own height, equal its rows bitwise. Each of `formats` ([1024, K]) at each epilogue, and a
 // fused projection at its segments' column offsets.
 void prefill(MetalBackend &backend, const Linear &linear, uint32_t K, const std::vector<Fmt> &formats) {
@@ -849,7 +850,7 @@ void prefill(MetalBackend &backend, const Linear &linear, uint32_t K, const std:
         fail(name + ": simdgroups past the chunk write their rows");
       if (tileOutput.empty()) tileOutput = whole.output;
     }
-    for (const uint32_t rows : {8u, 16u, 24u, 32u, 33u, 40u, 48u, 57u, 64u})
+    for (const uint32_t rows : {8u, 16u, 24u, 32u, 33u, 40u, 48u, 57u, 64u, 65u, 96u, 97u, 128u})
       for (const uint32_t splits : {1u, splitChunk, 8u}) {
         if (splits == 8 && (rows <= 32 || (K / 32) % 8))
           continue;
@@ -864,11 +865,13 @@ void prefill(MetalBackend &backend, const Linear &linear, uint32_t K, const std:
         lastRows(plan, out, name);
         if (splits == 1 && !sameRows(out.output, 0, tileOutput, 0, rows, columns))
           fail(name + ": differs from the 128-row tiles");
-        // A fused chunk runs its segments in one dispatch, each segment's columns bitwise its own chunk's at the
-        // same split.
+        // A fused chunk runs its segments in one dispatch up to one tile's rows and in one each on the row groups
+        // past them, each segment's columns bitwise its own chunk's at the same split.
         if (parts.size() > 1) {
-          if (out.pipelines.size() != 1)
-            fail(name + ": ran " + std::to_string(out.pipelines.size()) + " dispatches, not one");
+          const size_t dispatches = rows <= kMaximumDecodeTileRows ? 1 : parts.size();
+          if (out.pipelines.size() != dispatches)
+            fail(name + ": ran " + std::to_string(out.pipelines.size()) + " dispatches, not " +
+                 std::to_string(dispatches));
           uint32_t offset = 0;
           for (const Tensor *t : parts) {
             const LinearWorkload alone{{t->N, K}, rows, epilogue};
@@ -900,8 +903,8 @@ void prefill(MetalBackend &backend, const Linear &linear, uint32_t K, const std:
   }
   section("prefill: " + std::to_string(formats.size()) + " formats, K " + std::to_string(K) +
           ", plain/residual/up-with-gate and fused segments, 128-row tiles over 168- and 136-row chunks and chunks of "
-          "8-64 rows (S 1 and " + std::to_string(splitChunk) + (K / 32 % 8 ? "" : ", and 8 past 32 rows") +
-          ") within fp64, equal to the 128-row tiles; a fused chunk in one dispatch, bitwise its segments' own; a "
+          "8-128 rows (S 1 and " + std::to_string(splitChunk) + (K / 32 % 8 ? "" : ", and 8 past 32 rows") +
+          ") within fp64, equal to the 128-row tiles; a fused chunk in one dispatch up to 64 rows, bitwise its segments' own; a "
           "chunk's last rows alone bitwise the chunk's");
 }
 
@@ -1587,7 +1590,7 @@ void splitVisibility(MetalBackend &backend, const Linear &linear, LinearTile til
     DeviceCapabilities device;
     device.appleGpuFamily = family;
     device.gpuCoreCount = cores;
-    const Linear policy(device, Int8Activations::On);
+    const Linear policy(device, Int8Activations::On, StepKind::Prefill);
     const LinearConfig a = policy.plan(workloads[0], weights[0][0]).configuration();
     const LinearConfig b = policy.plan(workloads[1], weights[1][0]).configuration();
     if (a.tile == tile && b.tile == tile && std::max(a.splits, b.splits) > 1) splitPairs.insert({a.splits, b.splits});
@@ -1839,7 +1842,7 @@ int main(int argc, char **argv) {
     }
     try {
       MetalBackend backend(argv[1]);
-      const Linear linear(backend.capabilities(), Int8Activations::On);
+      const Linear linear(backend.capabilities(), Int8Activations::On, StepKind::Prefill);
       for (const LinearTile tile : {LinearTile::GgufRegister, LinearTile::GgufStaged}) {
         decodeTile(backend, linear, tile, false, decodeInputs(false), tileFormats(tile));
         fusedDecode(backend, linear, tile, false);

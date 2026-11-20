@@ -49,7 +49,9 @@ DeviceCapabilities simulatedDevice(uint32_t family, uint32_t cores) {
   device.gpuCoreCount = cores;
   return device;
 }
-Linear gpu(uint32_t family, uint32_t cores) { return Linear(simulatedDevice(family, cores), Int8Activations::On); }
+Linear gpu(uint32_t family, uint32_t cores, StepKind step = StepKind::Prefill) {
+  return Linear(simulatedDevice(family, cores), Int8Activations::On, step);
+}
 
 // Throws naming the rule a plan broke and the plan.
 [[noreturn]] void broke(const char *rule, uint32_t family, uint32_t cores, LinearWorkload w) {
@@ -138,6 +140,29 @@ void apple9StagesPastTheRegisterTile() {
     }
 }
 
+// A decode step's plans of 65 to 128 rows run the staged tile's two row
+// groups (stagedRowGroups) at its rows, on every device family, unsplit or
+// split by the device's law, and past 128 rows the prefill tile; a prefill
+// chunk's plans of those rows keep 1.7.0's prefill tiles (StepKind).
+void decodeStepsRunRowGroups() {
+  const Projection down = blockProjection(5120, 17408, 1), gdn = blockProjection(16640, 5120, 1);
+  for (const auto [family, cores] : {std::pair{9U, 10U}, {10U, 16U}, {10U, 32U}, {11U, 12U}})
+    for (const Projection *p : {&down, &gdn})
+      for (const uint32_t rows : {65U, 80U, 81U, 96U, 97U, 112U, 113U, 128U, 129U}) {
+        const LinearWorkload w{{p->outputSize, p->inputSize}, rows, LinearEpilogue::Residual};
+        const LinearPlan step = gpu(family, cores, StepKind::Decode).plan(w, *p),
+                         chunk = gpu(family, cores).plan(w, *p);
+        const bool groups = rows <= kMaximumStagedRows;
+        if (step.configuration().tile != (groups ? LinearTile::GgufStaged : LinearTile::GgufPrefill) ||
+            (groups && step.storageRows() != stagedTileRows(rows)) ||
+            chunk.configuration().tile != LinearTile::GgufPrefill)
+          broke("decode step row groups", family, cores, w);
+      }
+  static_assert(stagedTileRows(65) == 96 && stagedTileRows(96) == 96 && stagedTileRows(97) == 128 &&
+                    stagedTileRows(128) == 128,
+                "row groups of 48 rows at 65-96, of 64 at 97-128");
+}
+
 // A plan of some of a chunk's rows (Linear::plan with chunkRows) takes the
 // chunk's configuration at its own rows' height, in no more scratch than the
 // chunk's; rows past the chunk's are refused, on a Q4_K projection and on an
@@ -182,7 +207,7 @@ void prefillInt8Rule() {
   const std::array<uint32_t, 3> mixedFormats{GGUF_FMT_AF4G64, GGUF_FMT_AF5G64, GGUF_FMT_Q4K};
   const Projection mixed = blockProjection(12288, 5120, mixedFormats);
   for (const auto [family, cores] : {std::pair{9U, 10U}, {9U, 40U}, {10U, 16U}, {10U, 32U}, {11U, 12U}}) {
-    const Linear linear = gpu(family, cores), bf16(simulatedDevice(family, cores), Int8Activations::Off);
+    const Linear linear = gpu(family, cores), bf16(simulatedDevice(family, cores), Int8Activations::Off, StepKind::Prefill);
     const ProjectionCalibration &law = linear.calibration().projection;
     const bool int8 = family >= 10;
     require(law.prefillInt8 == int8 && bf16.calibration().projection.prefillInt8 == int8,
@@ -374,10 +399,10 @@ void ggufPlans() {
                 prefill.scratchSize().partials == (splits > 1 ? splitPartialsBytes(prefill) : 0),
             "GGUF tile rows and splits");
   }
-  // The staged tile runs plans of at most 64 rows.
-  const LinearWorkload longPrefill{{5120, 17408}, 65, LinearEpilogue::None};
+  // The staged tile runs plans of at most 128 rows, two row groups.
+  const LinearWorkload longPrefill{{5120, 17408}, 129, LinearEpilogue::None};
   rejects([&] { (void)Linear::plan(longPrefill, {.tile = LinearTile::GgufStaged}, FloatOutput::BFloat16); },
-          "the staged block tile runs plans of up to 64 rows", "the staged tile took a plan past 64 rows");
+          "the staged block tile runs plans of up to 128 rows", "the staged tile took a plan past 128 rows");
   rejects([&] { (void)Linear::plan(down, {.tile = LinearTile::GgufStaged, .splits = 3}, FloatOutput::BFloat16); },
           "staged block splits take whole 32-input groups", "the staged tile split K three ways");
   // The arena bound, of the shape without its formats, covers every plan on
@@ -872,19 +897,18 @@ void ggufPlans() {
     rejects([&] { (void)Linear::plan(w, config, FloatOutput::BFloat16); },
             "only a staged block plan of at most 8 rows runs the 16-row tile",
             "the 16-row tile took more rows than 8 or another tile");
-  // Int8 activations run on a staged plan of the int8 tiles' 16 to 32 stored rows whose K splits keep whole PQ2_0
-  // blocks: not on the register tile, past 32 rows, or 16 splits of 5120 inputs (160 groups, no multiple of 16 blocks
-  // of 4).
-  for (const auto &[w, config] :
-       {std::pair{LinearWorkload{down.matrix, 16, LinearEpilogue::Residual},
-                  LinearConfig{.tile = LinearTile::GgufRegister, .decodeInt8 = true}},
-        {LinearWorkload{down.matrix, kMaximumInt8Rows + 1, LinearEpilogue::Residual},
-         LinearConfig{.tile = LinearTile::GgufStaged, .decodeInt8 = true}},
+  // Int8 activations run on a staged plan whose K splits keep whole PQ2_0 blocks, past the int8 tiles' 32 rows in
+  // row groups of them (int8RowGroups): not on the register tile, past the staged tile's 128 rows, or 16 splits of
+  // 5120 inputs (160 groups, no multiple of 16 blocks of 4).
+  for (const auto &[w, config, expected] :
+       {std::tuple{LinearWorkload{down.matrix, 16, LinearEpilogue::Residual},
+                   LinearConfig{.tile = LinearTile::GgufRegister, .decodeInt8 = true}, "runs int8 activations"},
+        {LinearWorkload{down.matrix, kMaximumStagedRows + 1, LinearEpilogue::Residual},
+         LinearConfig{.tile = LinearTile::GgufStaged, .decodeInt8 = true}, "plans of up to 128 rows"},
         {LinearWorkload{{5120, 5120}, 16, LinearEpilogue::None},
-         LinearConfig{.tile = LinearTile::GgufStaged, .splits = 16, .decodeInt8 = true}}})
-    rejects([&] { (void)Linear::plan(w, config, FloatOutput::BFloat16); },
-            "only a staged block plan of up to 32 rows of whole PQ2_0 blocks per split runs int8 activations",
-            "int8 activations took another tile, rows past the int8 tiles' or a split of a PQ2_0 block");
+         LinearConfig{.tile = LinearTile::GgufStaged, .splits = 16, .decodeInt8 = true}, "runs int8 activations"}})
+    rejects([&] { (void)Linear::plan(w, config, FloatOutput::BFloat16); }, expected,
+            "int8 activations took another tile, rows past the staged tile's or a split of a PQ2_0 block");
   // A plan of fewer rows on the int8 tiles stores their 16.
   require(Linear::plan(down, {.tile = LinearTile::GgufStaged, .decodeInt8 = true}, FloatOutput::BFloat16)
                   .storageRows() == 16,
@@ -1238,7 +1262,7 @@ void producerTableContract(metal::MetalBackend &backend) {
                    recurrent = uint64_t{shape.valueHeads} * shape.headDimension * shape.headDimension * 4;
     const GdnStateStrides strides{carried, recurrent, carried, GdnStateFormat::Float32};
     const metal::MetalBuffer state = allocate(backend, carried + recurrent);
-    const std::array<metal::MetalBuffer, SPLASH_MAXIMUM_BATCH_WIDTH> states{state, state, state, state};
+    const std::array<metal::MetalBuffer, SPLASH_MAXIMUM_BATCH_WIDTH> states{state, state, state, state, state, state, state, state};
     GdnDecodeBuffers buffers;
     buffers.packed = allocate(backend, kRows * shape.packedWidth * 2);
     buffers.convolutionWeights = allocate(backend, shape.convolutionDimension * 4 * 2);
@@ -1329,7 +1353,7 @@ void decodeInt8Setting(metal::MetalBackend &backend) {
   constexpr uint32_t n = 8192, k = 5120;
   Projection rotated(n, k, BlockWeights{{segmentPlanes(backend, GGUF_FMT_PQ20, n, k)}});
   rotated.rotation.signs = allocate(backend, k);
-  const Linear on = gpu(10, 16), off(simulatedDevice(10, 16), Int8Activations::Off);
+  const Linear on = gpu(10, 16), off(simulatedDevice(10, 16), Int8Activations::Off, StepKind::Prefill);
   bool int8 = false;
   for (uint32_t lanes = 1; lanes <= SPLASH_MAXIMUM_BATCH_WIDTH; ++lanes) {
     LinearConfig config = on.plan(rotated, lanes * SPLASH_DRAFT_QUERY_ROWS).configuration();
@@ -1692,6 +1716,7 @@ int main(int argc, char **argv) {
     ggufCoreLaws();
     floatOutputPlans();
     apple9StagesPastTheRegisterTile();
+    decodeStepsRunRowGroups();
     chunkRowPlans();
     prefillInt8Rule();
     if (std::string_view(argv[1]) == "--cpu") {

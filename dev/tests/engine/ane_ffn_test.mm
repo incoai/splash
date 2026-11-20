@@ -457,9 +457,9 @@ void takes(const Model &mlx, const Model &gguf) {
 // A calibration is remembered under the layers' shapes and formats and the int8 activations the GPU's part plans with
 // (AneFfn::calibrationKey): each setting and each model's layers have a key of their own, and a key repeats.
 void keys(const DeviceCapabilities &device, const Model &mlx, const Model &gguf) {
-  const Linear on(device, Int8Activations::On), off(device, Int8Activations::Off);
+  const Linear on(device, Int8Activations::On, StepKind::Prefill), off(device, Int8Activations::Off, StepKind::Prefill);
   const std::string mlxOn = AneFfn::calibrationKey(mlx.layers, on);
-  if (mlxOn != AneFfn::calibrationKey(mlx.layers, Linear(device, Int8Activations::On)))
+  if (mlxOn != AneFfn::calibrationKey(mlx.layers, Linear(device, Int8Activations::On, StepKind::Prefill)))
     fail("a calibration key does not repeat");
   if (mlxOn == AneFfn::calibrationKey(mlx.layers, off) ||
       AneFfn::calibrationKey(gguf.layers, on) == AneFfn::calibrationKey(gguf.layers, off))
@@ -480,7 +480,7 @@ Chunk chunk(MetalBackend &backend, uint32_t rows) {
   const auto bf16Rows = [&](uint32_t width) { return test::sharedBuffer(backend, uint64_t{rows} * width * 2); };
   // Chunks of at least kMinimumRows rows take no split scratch, but where the family runs the int8 prefill tile its
   // codes and scales (Linear::scratchSize).
-  const Linear linear(backend.capabilities(), Int8Activations::On);
+  const Linear linear(backend.capabilities(), Int8Activations::On, StepKind::Prefill);
   LinearScratchSize size = linear.scratchSize({kIntermediate, kHidden}, SPLASH_PREFILL_TOKEN_BUDGET);
   size.include(linear.scratchSize({kHidden, kIntermediate}, SPLASH_PREFILL_TOKEN_BUDGET));
   const auto bytes = [&](uint64_t count) { return count ? test::sharedBuffer(backend, count) : MetalBuffer{}; };
@@ -558,7 +558,7 @@ std::unique_ptr<AneFfn> splitOf(MetalBackend &backend, const Model &model) {
   std::vector<SwiGluProjections> layers;
   for (uint32_t layer = 0; layer < kLayers; ++layer)
     layers.push_back({&copies[3 * layer], &copies[3 * layer + 1], &copies[3 * layer + 2]});
-  return std::make_unique<AneFfn>(backend, Linear(backend.capabilities(), Int8Activations::On), layers, kAneUnits,
+  return std::make_unique<AneFfn>(backend, Linear(backend.capabilities(), Int8Activations::On, StepKind::Prefill), layers, kAneUnits,
                                   nullptr);
 }
 
@@ -615,7 +615,7 @@ void split(MetalBackend &backend, const Linear &linear, const Model &model, cons
 // unwritten, which verify() fails, and the split stops.
 void misbound(MetalBackend &backend, const Model &model, const Chunk &chunk) {
   ane::ProgramInstrumentation::arm({.swappedBinding = {"ffn640", "ffn512"}});
-  AneFfn split(backend, Linear(backend.capabilities(), Int8Activations::On), model.layers, kAneUnits, nullptr);
+  AneFfn split(backend, Linear(backend.capabilities(), Int8Activations::On, StepKind::Prefill), model.layers, kAneUnits, nullptr);
   test::rejects([&] { static_cast<void>(split.verify(model.layers, chunk.ffn, chunk.hidden)); },
                 "split of 640 rows failed", "verify() passed a function bound to another's procedure");
   if (!split.retired() || split.splits(AneFfn::kMaximumRows)) fail("a split that failed verify() did not stop");
@@ -624,7 +624,7 @@ void misbound(MetalBackend &backend, const Model &model, const Chunk &chunk) {
 
 // Layers added out of order and buffers short of a chunk's rows are refused before anything is encoded.
 void refusals(MetalBackend &backend, const Model &model, const Chunk &chunk) {
-  AneFfn split(backend, Linear(backend.capabilities(), Int8Activations::On), model.layers, kAneUnits, nullptr);
+  AneFfn split(backend, Linear(backend.capabilities(), Int8Activations::On, StepKind::Prefill), model.layers, kAneUnits, nullptr);
   constexpr uint32_t kRows = AneFfn::kMinimumRows;
   const auto &[ffn, hidden] = chunk;
   CommandGraph graph;
@@ -870,7 +870,7 @@ void loses(MetalBackend &backend, const Linear &linear, const Model &model, cons
 // The split of the MLX and the GGUF model over normalized rows of normal values, and the numerics of rows the ANE's
 // fp16 barely holds.
 void split(MetalBackend &backend) {
-  const Linear linear(backend.capabilities(), Int8Activations::On);
+  const Linear linear(backend.capabilities(), Int8Activations::On, StepKind::Prefill);
   const Model mlx = mlxModel(backend), gguf = ggufModel(backend);
   takes(mlx, gguf);
   keys(backend.capabilities(), mlx, gguf);
@@ -893,7 +893,7 @@ void split(MetalBackend &backend) {
 // evaluation that signals the event below its value leaves it there.
 void faults(MetalBackend &backend) {
   using Faults = ane::ProgramInstrumentation::Faults;
-  const Linear linear(backend.capabilities(), Int8Activations::On);
+  const Linear linear(backend.capabilities(), Int8Activations::On, StepKind::Prefill);
   const Model model = mlxModel(backend);
   const Chunk buffers = chunk(backend, AneFfn::kMaximumRows);
   fillRows(buffers, AneFfn::kMaximumRows, [](uint64_t) { return 1.0f; });
@@ -922,7 +922,7 @@ void faults(MetalBackend &backend) {
   // A program that does not load again after the idle release.
   ane::ProgramInstrumentation::arm({.failingLoad = true});
   const auto split =
-      std::make_unique<AneFfn>(backend, Linear(backend.capabilities(), Int8Activations::On), model.layers, kAneUnits,
+      std::make_unique<AneFfn>(backend, Linear(backend.capabilities(), Int8Activations::On, StepKind::Prefill), model.layers, kAneUnits,
                                nullptr);
   if (!split->release()) fail("a failed reload: the program was not unloaded");
   split->restore();

@@ -147,12 +147,12 @@ void testMinimumRequiredBytesIsThePlans() {
     profile.targetKvLayout.format = format;
     const EngineMemoryPlan plan = test::requireMemoryPlan(device(), profile);
     const EngineMemoryBreakdown &budget = plan.breakdown();
-    require(minimumRequiredBytes(budget.fixedRuntimeBytes, budget.laneStateBytes,
-                                 profile.targetKvLayout) == budget.minimumRequiredBytes,
+    require(minimumRequiredBytes(budget.fixedRuntimeBytes, budget.laneStateBytes, profile.targetKvLayout,
+                                 budget.maximumBatchWidth) == budget.minimumRequiredBytes,
             "the minimum differs from the plan's");
   }
-  require(!minimumRequiredBytes(std::numeric_limits<uint64_t>::max(), 1,
-                                model().targetKvLayout),
+  require(!minimumRequiredBytes(std::numeric_limits<uint64_t>::max(), 1, model().targetKvLayout,
+                                model::ExecutionLimits::defaultLanes),
           "an overflowing minimum was not refused");
 }
 

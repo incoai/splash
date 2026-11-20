@@ -124,10 +124,10 @@ protocol::ProtocolLimits protocolLimitsFor(
 
 protocol::ReadyEvent readyEventFor(const model::ModelDescriptor &model,
                                    const EngineConfig &engine,
-                                   const protocol::ProtocolLimits &limits) {
+                                   const protocol::ProtocolLimits &limits, uint32_t lanes) {
   const std::span<const uint32_t> stops = std::visit(
       [](const auto &layout) { return layout.stopTokens.tokens(); }, model.target);
-  return {.maxConcurrentRequests = model::ExecutionLimits::maximumBatchWidth,
+  return {.maxConcurrentRequests = lanes,
           .maxContextTokens = engine.maxContext,
           .vision = engine.maxImagePatches != 0,
           .vocabularySize = model.capabilities.vocabularySize,
@@ -252,7 +252,7 @@ RuntimeBootstrapReport ServingRuntime::requireWarmup(
   // Its steps: the prefill of the most rows, one of each row class, each
   // decode width and the state restore, each counted done as it ends.
   protocol::WarmingEvent warming{.steps = static_cast<uint32_t>(prefillRowClasses.size()) +
-                                          model::ExecutionLimits::maximumBatchWidth + 2};
+                                          memoryPlan.breakdown().maximumBatchWidth + 2};
   progress(warming);
   const auto ended = [&] {
     ++warming.stepsDone;
@@ -320,12 +320,11 @@ RuntimeBootstrapReport ServingRuntime::requireWarmup(
     // Startup exercises only widths that fit this budget. This is not a
     // serving concurrency limit: the engine still admits lanes dynamically.
     const uint32_t affordableWidth = static_cast<uint32_t>(std::min<uint64_t>(
-        model::ExecutionLimits::maximumBatchWidth,
+        budget.maximumBatchWidth,
         (budget.dynamicBudgetBytes -
-         kvRunwayPages(budget.kvExtentPages) * budget.kvPageBytes) /
+         kvRunwayPages(budget.kvExtentPages, budget.maximumBatchWidth) * budget.kvPageBytes) /
             budget.laneStateBytes));
-    for (uint32_t width = 1;
-         width <= model::ExecutionLimits::maximumBatchWidth; ++width) {
+    for (uint32_t width = 1; width <= budget.maximumBatchWidth; ++width) {
       if (width > affordableWidth ||
           (width > 1 && report.warmup.decodeBatches[width - 2] ==
                             WarmupStepStatus::MemoryLimited)) {
@@ -467,7 +466,8 @@ std::unique_ptr<ServingRuntime> ServingRuntime::start(
   const protocol::ProtocolLimits limits = protocolLimitsFor(
       config.resources.model.capabilities, config.nativeLoop.engine.maxContext);
   const protocol::ReadyEvent ready =
-      readyEventFor(config.resources.model, config.nativeLoop.engine, limits);
+      readyEventFor(config.resources.model, config.nativeLoop.engine, limits,
+                    resources->memoryPlan().breakdown().maximumBatchWidth);
   std::unique_ptr<NativeRuntime> nativeLoop;
   try {
     connectToGovernor(config.nativeLoop.engine, resources->memoryGovernor());

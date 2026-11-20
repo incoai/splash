@@ -27,10 +27,10 @@
 namespace splash::model {
 
 inline constexpr uint32_t kLaneCount = ExecutionLimits::maximumBatchWidth;
-// The most rows of a decode lane, its verify block's, and the most packed
-// rows of a decode step, kDecodeRows a lane: what the decode arena holds.
+// The most rows of a decode lane, its verify block's. A decode step's packed
+// rows, its lanes' together, are at most QwenTargetGeometry::stepRows: what
+// the decode arena holds.
 inline constexpr uint32_t kDecodeRows = ExecutionLimits::targetVerifyRows;
-inline constexpr uint32_t kDecodeStepRows = kLaneCount * kDecodeRows;
 // The rows of a decode lane's draft block (its query rows), the first of a
 // verify block's positions.
 inline constexpr uint32_t kDraftRows = ExecutionLimits::draftQueryRows;
@@ -78,29 +78,36 @@ struct RuntimeGeometry final {
     return from(model, kvFormat, stateFormat, StreamedParts::loaded(model));
   }
   [[nodiscard]] static RuntimeGeometry from(const LoadedModel &model, kv::Format kvFormat,
-                                            ops::GdnStateFormat stateFormat, StreamedParts parts) {
+                                            ops::GdnStateFormat stateFormat, StreamedParts parts,
+                                            uint32_t lanes = ExecutionLimits::defaultLanes) {
     const DFlashDraftLayout &draft = model.draft.layout;
     return from(model.descriptor, draft,
                 std::visit([&](const auto &weights) { return qwenTargetGeometry(weights, draft.targetLayerIds()); },
                            model.target),
-                kvFormat, stateFormat, parts);
+                kvFormat, stateFormat, parts, lanes);
   }
   // The same with a cached state's form as `states`, a runtime's state
   // storage's, holds it (GdnStateLayout::cachedCodes).
   [[nodiscard]] static RuntimeGeometry from(const LoadedModel &model, kv::Format kvFormat,
-                                            const GdnStateLayout &states, StreamedParts parts) {
-    RuntimeGeometry result = from(model, kvFormat, states.format, parts);
+                                            const GdnStateLayout &states, StreamedParts parts,
+                                            uint32_t lanes = ExecutionLimits::defaultLanes) {
+    RuntimeGeometry result = from(model, kvFormat, states.format, parts, lanes);
     result.target.stateLayout.cachedCodes = states.cachedCodes;
     return result;
   }
   // The geometry of a model of `descriptor` whose draft is of `draft` and
   // whose target's weights give `target` (qwenTargetGeometry, as they loaded
   // or as their files plan them, plannedTargetGeometry), with `parts`
-  // streaming.
+  // streaming, of a runtime of `lanes` lanes, one to
+  // ExecutionLimits::maximumBatchWidth.
   [[nodiscard]] static RuntimeGeometry from(const ModelDescriptor &descriptor, const DFlashDraftLayout &draft,
                                             QwenTargetGeometry target, kv::Format kvFormat,
-                                            ops::GdnStateFormat stateFormat, StreamedParts parts) {
+                                            ops::GdnStateFormat stateFormat, StreamedParts parts,
+                                            uint32_t lanes = ExecutionLimits::defaultLanes) {
+    if (!lanes || lanes > ExecutionLimits::maximumBatchWidth)
+      throw std::invalid_argument("invalid model runtime lanes");
     RuntimeGeometry result;
+    target.lanes = lanes;
     result.draft = draft;
     result.target = std::move(target);
     result.target.kvLayout = descriptor.targetKvLayout;
@@ -157,6 +164,7 @@ struct RuntimeGeometry final {
           .maximumPasses = aneFfnRows ? 1u : geometry.target.layers,
           .minimumUnitRows = aneFfnRows ? aneFfnRows : 1u,
           .lanesPastChunk = 1,
+          .lanes = geometry.target.lanes,
           .indexPageLanes = geometry.spilledKv ? 1u : 0u,
           .streamsWeights = geometry.streamedExperts,
           .attentionPairs = denseAttentionPairs(geometry.target.nativeContextTokens - kPrefillRows, kPrefillRows)};
@@ -255,10 +263,11 @@ constexpr Tensor moeScratchTensor(size_t field) noexcept {
 // The commands a TargetArena serves: up to `rows` rows a chunk, of `chunks`
 // chunks (a prefill group's), whose attention's workspace is `attention` and
 // whose MoE blocks' `moe` (the operators' bounds of the plans its commands
-// run), each chunk of at most kLaneCount sequences.
+// run), each chunk of at most `lanes` sequences, the runtime's lanes.
 struct TargetRows final {
   uint32_t rows = 0;
   uint32_t chunks = 1;
+  uint32_t lanes = ExecutionLimits::defaultLanes;
   ops::AttentionWorkspace attention{};
   ops::MoeWorkspace moe{};
 };
@@ -603,8 +612,9 @@ constexpr uint32_t decodeTensorCount =
 // lie in lane order, each lane's from its first row (DecodeTensor::
 // LaneLayout): the target's inputs and outputs, its selection's workspace
 // (indexed by logits row, ops::Sampling::workspace) and the draft's context
-// projections. Each takes kDecodeRows rows a lane, so a step of `lanes`
-// lanes finds all of its rows in their share. The others are a lane's own,
+// projections. Each takes kDecodeRows rows a lane, and a step's plans' storage
+// rows past them (decodeStorageRows), so a step finds all of its rows in
+// them. The others are a lane's own,
 // the draft's block of kDraftRows among them, indexed by batch lane, or by
 // state lane where they say so.
 [[nodiscard]] constexpr bool decodeRowTensor(DecodeTensor tensor) noexcept {
@@ -629,7 +639,23 @@ constexpr uint32_t decodeTensorCount =
     return false;
   }
 }
-
+// The lanes' shares a decode tensor holds for steps of up to `lanes` lanes: a
+// row tensor's storage rows (decodeStorageRows) in shares of kDecodeRows, and
+// each lane's of the others.
+[[nodiscard]] constexpr uint32_t decodeTensorLanes(DecodeTensor tensor, uint32_t lanes) noexcept {
+  return decodeRowTensor(tensor) ? decodeStorageRows(lanes) / kDecodeRows : lanes;
+}
+// The lanes of the decode tensors a draft step of `lanes` lanes binds: its
+// rows, a draft's block a lane, as its own projections and the target's
+// vocabulary head store them, in whole tiles (ops::Linear::storageRows): on
+// some plans one lane's 8 rows take a 16-row tile, three lanes' 24 a 32-row
+// one and five to seven lanes' a 64-row one, two, four and eight lanes.
+// Padding rows read stale activations and write results no row reads.
+[[nodiscard]] uint32_t draftStepLanes(const RuntimeGeometry &geometry, const ops::ExecutionPlans &operators,
+                                      uint32_t lanes);
+// The lanes the decode tensors of a runtime of `geometry` hold: the most a
+// draft step of up to its lanes binds (draftStepLanes), its lanes at least.
+[[nodiscard]] uint32_t decodeArenaLanes(const RuntimeGeometry &geometry, const ops::ExecutionPlans &operators);
 // The target step tensors' shape of a runtime's decode steps: every lane's
 // rows, one chunk.
 [[nodiscard]] TargetRows decodeTargetRows(const RuntimeGeometry &geometry, const ops::ExecutionPlans &operators);
@@ -641,9 +667,9 @@ constexpr uint32_t decodeTensorCount =
 [[nodiscard]] std::array<uint64_t, decodeTensorCount>
 decodeTensorBytes(const RuntimeGeometry &geometry,
                   const ops::ExecutionPlans &operators);
-// A decode tensor is one allocation of every lane's. A row tensor's B1-B4
-// prefixes hold 16/32/48/64 rows, each the most rows of a step of that many
-// lanes. Lanes are never separated by arena-alignment holes; only whole
+// A decode tensor is one allocation of every lane's. A row tensor's prefix
+// of n lanes holds ExecutionLimits::stepRows(n) rows, the most of a step of
+// n lanes. Lanes are never separated by arena-alignment holes; only whole
 // tensor boundaries are aligned. The target step tensors (decodeTargetRows)
 // precede them, at the base's start as a prefill arena's: after the lanes'
 // tensors (297 MiB of the 27B's), the 27B's B1 step's 64 down projections
@@ -666,28 +692,29 @@ public:
       : backend_(backend), geometry_(std::move(geometry)),
         base_(backend_.allocateBuffer(decodeArenaBaseBytes(geometry_, operators), metal::BufferStorage::Shared,
                                       "qwen-shared-decode")),
-        target_(backend_, base_, 0, geometry_.target, decodeTargetRows(geometry_, operators)) {
+        target_(backend_, base_, 0, geometry_.target, decodeTargetRows(geometry_, operators)),
+        held_(decodeArenaLanes(geometry_, operators)) {
     auto sizes = decodeTensorBytes(geometry_, operators);
     uint64_t cursor = TargetArena::bytes(geometry_.target, target_.shape());
     for (uint32_t tensor = 0; tensor < sizes.size(); ++tensor) {
       uint64_t stride = sizes[tensor];
       offsets_[tensor] = cursor;
       sizes_[tensor] = sizes[tensor];
+      const uint32_t shares = decodeTensorLanes(static_cast<DecodeTensor>(tensor), held_);
       if (sizes[tensor]) {
-        for (uint32_t lane = 0; lane < kLaneCount; ++lane) {
+        for (uint32_t lane = 0; lane < shares; ++lane) {
           tensors_[lane][tensor] = backend_.view(
               base_, cursor + uint64_t{lane} * stride, sizes[tensor]);
         }
       }
-      cursor +=
-          alignUp(checkedMultiply(stride, kLaneCount, "decode tensor"));
+      cursor += alignUp(checkedMultiply(stride, shares, "decode tensor"));
     }
     if (cursor != decodeArenaBaseBytes(geometry_, operators))
       throw std::logic_error("decode arena mismatch");
     // Sampled rows' draws return their arrival counts to zero; they start
     // there.
     const metal::MetalBuffer arrivals =
-        batchSlice(DecodeTensor::TargetVocabularyArrivals, kLaneCount);
+        all(DecodeTensor::TargetVocabularyArrivals);
     std::memset(arrivals.contents(), 0, arrivals.sizeBytes());
 
     // Each scratch buffer takes whole host pages (decodeArenaBytes).
@@ -711,14 +738,17 @@ public:
     bytes_ = decodeArenaBytes(geometry_, operators);
   }
 
+  // The lanes the arena holds (QwenTargetGeometry::lanes).
+  [[nodiscard]] uint32_t lanes() const noexcept { return geometry_.target.lanes; }
+
   [[nodiscard]] metal::MetalBuffer get(uint32_t lane, DecodeTensor tensor) const {
-    if (lane >= kLaneCount)
+    if (lane >= geometry_.target.lanes)
       throw std::out_of_range("invalid decode lane");
     return tensors_[lane][static_cast<uint32_t>(tensor)];
   }
 
   [[nodiscard]] metal::MetalBuffer batchSlice(DecodeTensor tensor, uint32_t lanes) const {
-    if (!lanes || lanes > kLaneCount)
+    if (!lanes || lanes > held_)
       throw std::out_of_range("invalid decode batch width");
     const uint32_t index = static_cast<uint32_t>(tensor);
     // Model-specific scratch is represented by an empty buffer.  The
@@ -726,9 +756,10 @@ public:
     // both, so no dummy allocation is needed for the inactive operator.
     if (!sizes_[index])
       return {};
-    return backend_.view(base_, offsets_[index],
-                         uint64_t{lanes} * sizes_[index]);
+    return backend_.view(base_, offsets_[index], uint64_t{decodeTensorLanes(tensor, lanes)} * sizes_[index]);
   }
+  // A tensor's slice of every lane the arena holds.
+  [[nodiscard]] metal::MetalBuffer all(DecodeTensor tensor) const { return batchSlice(tensor, geometry_.target.lanes); }
 
   // The target step tensors of the lanes' rows.
   [[nodiscard]] const TargetArena &target() const noexcept { return target_; }
@@ -740,18 +771,19 @@ public:
     if (!decodeRowTensor(tensor))
       throw std::invalid_argument("a lane's own decode tensor holds no step rows");
     const uint32_t index = static_cast<uint32_t>(tensor);
-    return stepRows(base_, offsets_[index], sizes_[index] * kLaneCount, rows);
+    // A lane's share holds a verify block's rows (decodeTensorBytes).
+    return stepRows(base_, offsets_[index], sizes_[index] / kDecodeRows, rows);
   }
   [[nodiscard]] metal::MetalBuffer rows(TargetTensor tensor, ops::LaneRows rows) const {
     const metal::MetalBuffer whole = target_.get(tensor);
-    return stepRows(whole, 0, whole ? whole.sizeBytes() : 0, rows);
+    return stepRows(whole, 0, whole ? whole.sizeBytes() / target_.shape().rows : 0, rows);
   }
   // The rows of a target row tensor that a step of `lanes` lanes may hold,
-  // kDecodeRows a lane.
+  // kDecodeRows a lane, at most a step's (ExecutionLimits::stepRows).
   [[nodiscard]] metal::MetalBuffer lanesRows(TargetTensor tensor, uint32_t lanes) const {
-    if (!lanes || lanes > kLaneCount)
+    if (!lanes || lanes > geometry_.target.lanes)
       throw std::out_of_range("invalid decode batch width");
-    return rows(tensor, {0, lanes * kDecodeRows});
+    return rows(tensor, {0, ExecutionLimits::stepRows(lanes)});
   }
 
   [[nodiscard]] ops::LinearScratch linearScratch() const { return linearScratch_; }
@@ -767,17 +799,17 @@ public:
     // its block's. Sparse target FFNs use their own route-major arena tensors,
     // but must not remove the draft's scratch.
     const uint64_t draft = operators.gateUpWorkspace({geometry.draft.intermediateSize, geometry.draft.hiddenSize},
-                                                     kLaneCount * kDraftRows);
+                                                     geometry.target.lanes * kDraftRows);
     uint64_t target = 0;
     for (const auto &p : geometry.target.gateUpProjections)
-      target = std::max(target, operators.gateUpWorkspace(p, kDecodeStepRows));
+      target = std::max(target, operators.gateUpWorkspace(p, geometry.target.stepRows()));
     return std::max(target, draft);
   }
 
-  // The offset in batchSlice(DecodeTensor::GdnTape, kLaneCount) of state
+  // The offset in all(DecodeTensor::GdnTape) of state
   // lane `stateLane`'s tape slot of parity `parity`.
   [[nodiscard]] uint64_t gdnTapeSlot(uint32_t stateLane, uint32_t parity) const {
-    if (stateLane >= kLaneCount || parity > 1)
+    if (stateLane >= geometry_.target.lanes || parity > 1)
       throw std::out_of_range("invalid GDN tape slot");
     return (uint64_t{stateLane} * 2 + parity) * gdnTapeSlotBytes(geometry_);
   }
@@ -785,14 +817,13 @@ public:
   [[nodiscard]] uint64_t bytes() const noexcept { return bytes_; }
 
 private:
-  // Rows `rows` of the kDecodeStepRows rows the `bytes` bytes at `offset` of
-  // `buffer` hold, none of no bytes.
-  [[nodiscard]] metal::MetalBuffer stepRows(const metal::MetalBuffer &buffer, uint64_t offset, uint64_t bytes,
+  // Rows `rows` of a step's most rows of `row` bytes each from
+  // `offset` of `buffer`, none of no bytes.
+  [[nodiscard]] metal::MetalBuffer stepRows(const metal::MetalBuffer &buffer, uint64_t offset, uint64_t row,
                                             ops::LaneRows rows) const {
-    if (!rows.rows || uint64_t{rows.first} + rows.rows > kDecodeStepRows)
+    if (!rows.rows || uint64_t{rows.first} + rows.rows > geometry_.target.stepRows())
       throw std::out_of_range("invalid decode step rows");
-    if (!bytes) return {};
-    const uint64_t row = bytes / kDecodeStepRows;
+    if (!row) return {};
     return backend_.view(buffer, offset + rows.first * row, rows.rows * row);
   }
 
@@ -800,6 +831,8 @@ private:
   RuntimeGeometry geometry_;
   metal::MetalBuffer base_;
   TargetArena target_;
+  // The lanes its tensors hold (decodeArenaLanes).
+  uint32_t held_ = 0;
   std::array<std::array<metal::MetalBuffer, decodeTensorCount>, kLaneCount> tensors_{};
   std::array<uint64_t, decodeTensorCount> offsets_{};
   std::array<uint64_t, decodeTensorCount> sizes_{};

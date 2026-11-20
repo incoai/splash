@@ -87,6 +87,18 @@ template <class Layout, class Layer> struct QwenTargetWeights final : QwenTarget
   ops::NormWeights finalNorm;
 };
 
+// The rows every tensor a decode step's plans store rows in holds, for steps
+// of up to `lanes` lanes: the rows the decode tiles store a step of the most
+// rows in (ops::stagedStorageRows), on the staged tile and past one tile's
+// rows on its two row groups: the decode arena's row and target step tensors,
+// and a target's own step scratch (Qwen4Steps).
+[[nodiscard]] constexpr uint32_t decodeStorageRows(uint32_t lanes) noexcept {
+  static_assert(ExecutionLimits::stepRows(SPLASH_MAXIMUM_BATCH_WIDTH) <= ops::kMaximumStagedRows,
+                "the decode tiles hold a decode step of the most lanes");
+  const uint32_t rows = ExecutionLimits::stepRows(lanes);
+  return ops::stagedStorageRows(rows, false);
+}
+
 // Runtime-visible tensor geometry shared by the supported Qwen hybrid
 // targets: the target's dimensions, the layers the draft reads and what its
 // loaded weights add. It describes semantics only; operators remain
@@ -102,6 +114,12 @@ struct QwenTargetGeometry final : QwenTargetDimensions {
       std::ranges::copy(captureLayers, captureLayerValues.begin());
   }
 
+  // The lanes the runtime runs, its concurrency limit, which its arenas
+  // and a target's own scratch hold, as its start chose them
+  // (RuntimeResourcesConfig::lanes).
+  uint32_t lanes = ExecutionLimits::defaultLanes;
+  // The most rows of its decode steps (ExecutionLimits::stepRows).
+  [[nodiscard]] constexpr uint32_t stepRows() const noexcept { return ExecutionLimits::stepRows(lanes); }
   // The format of the sparse MoE blocks' routers, which their plans follow
   // (ops::moeRouterFormat).
   uint32_t moeRouterFormat = ops::QuantizedSegment::kFloat32;
@@ -461,13 +479,6 @@ public:
 
   [[nodiscard]] const ops::Projection &
   vocabularyProjection() const noexcept;
-  // Lanes of storage, a draft's block of rows each, the vocabulary
-  // projection binds over a draft step of `lanes` lanes, which runs the
-  // target's head: its tile may hold more rows than the step's
-  // (LinearPlan::storageRows; a three-lane step on the staged tile runs its
-  // 32-row tile over four lanes). The head still processes the step's lanes;
-  // padding rows read stale activations and write results no row reads.
-  [[nodiscard]] uint32_t headStorageLanes(uint32_t lanes) const;
   // A prefill command of one or more chunks (a prefill group), run layer by
   // layer: a layer of each chunk in turn, then the next layer, so that a
   // layer whose experts stream loads the union of the chunks' experts once.
@@ -696,6 +707,21 @@ protected:
   void addNormalizedHead(metal::CommandGraph &graph, const ops::NormWeights &finalNorm, metal::MetalBuffer hidden,
                          metal::MetalBuffer finalHidden, metal::MetalBuffer logits, uint32_t rows,
                          ops::LinearScratch scratch) const;
+  // The vocabulary head of `rows` rows of `input` into fp32 logits, and the
+  // layout its producer writes (`prepared` describes it). A step of more rows
+  // than one decode tile holds (more than four lanes) runs it in passes of at
+  // most ops::kMaximumDecodeTileRows rows, each reading the weights again: on
+  // a 12-core M6 the 27B's Q6_K head took 19.1 ms at 128 rows in two passes
+  // against 27.0 on the staged tile's two row groups, which took 13.9 against
+  // 17.5 at 96 rows (level or faster on a 20-core M5 Pro and an M4).
+  [[nodiscard]] ops::LinearInput headInput(uint32_t rows) const;
+  void addHead(metal::CommandGraph &graph, metal::MetalBuffer input, metal::MetalBuffer logits, uint32_t rows,
+               ops::LinearScratch scratch, ops::PreparedInput prepared) const;
+  // The plans of a step's projections: a decode step's or a prompt chunk's
+  // (ops::StepKind).
+  [[nodiscard]] const ops::Linear &linear(const PrefillStep &step) const noexcept {
+    return step.decode ? operators_.decodeLinear() : operators_.linear();
+  }
   // Copies `rows` rows of a layer's output rows, from row `sourceRow` of
   // `output`, into capture slot `slot` of the captured hidden rows from row
   // `destinationRow`: the draft's capture of a layer whose output is one row

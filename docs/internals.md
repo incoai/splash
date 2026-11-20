@@ -482,7 +482,8 @@ A decode step's target forward is the prompt forward (`QwenTarget::addPrefill`
 over a chunk whose `decode` names the step's own buffers,
 `QwenTargetDecodeBuffers`): its lanes are the chunk's sequences, each of the
 cycle's lane cap of rows at most, which the layout places, its rows the
-step's, through the same layer loop (`addPrefillLayers`), plans by its rows,
+step's, through the same layer loop (`addPrefillLayers`), plans by its rows
+(a decode step's, which take no int8 prefill path: kernel selection, rule 1),
 attention, dense FFN and MoE load and passes (a decode step's load serves a
 group of one step). It differs where the work does: its GDN layers run the
 decode scan from each lane's state along its tree into its tape, where a
@@ -585,27 +586,48 @@ every plan on every device). The KV cache keeps `--kv-format` either way.
 
 The rules:
 
-1. *Projection, past the decode tiles.* A plan's rows pick its tile, whatever
-   command runs it. A plan of more rows than the decode tiles hold (64) runs
-   the 128-row prefill tile, unsplit, or, with int8 activations on, on a row
-   with `prefillInt8` (Apple10 and Apple11) the
+1. *Projection, past the decode tiles.* A plan's rows and its command, a
+   prefill chunk's or a decode step's (`ops::StepKind`), pick its tile. A
+   plan of more rows than the decode tiles hold for its command (64 for a
+   prefill chunk; 128 for a decode step, two row groups of the staged tile,
+   rule 2) runs the 128-row prefill tile, unsplit. A default start of four
+   lanes meets 65-128 rows only in prefill chunks, where the row groups would
+   change outputs against 1.7.0 wherever the split law splits them and add
+   pipelines to every start: they serve decode steps of five to eight lanes
+   alone. With int8 activations on, a prefill chunk's plan of more than 64
+   rows on a row with `prefillInt8` (Apple10 and Apple11) runs the
    [int8-activation tile](#int8-activation-prefill) where it takes every
-   quantized segment. A gate/up pair runs there as a gate plan and an up plan
-   that applies silu(gate) (`Linear::addSwiGlu`). A projection of several
-   segments and no epilogue runs those of each format in one dispatch on the
-   128-row prefill tile; the int8 tile runs
-   a GEMM dispatch per segment beside the quantization of its input, which a
-   SwiGLU's gate and up share. (The segments of a format in one dispatch took
-   the 27B's fused inputs 6-11% less time at 65-128 rows but 1-3% more at
+   quantized segment. A decode step's plans take no int8 prefill path, the tile nor rule
+   4's int8 passes, whatever its rows (`ops::StepKind`,
+   `ExecutionPlans::decodeLinear`): a request's decode does not round its
+   activations because other requests share its step. A decode step rounds
+   only where its weights do in a chunk of its rows, a rotated PQ2_0 unit on
+   the int8 decode tiles (rule 2). A gate/up pair of more than 64 rows runs as
+   a gate plan and an up plan that applies silu(gate) (`Linear::addSwiGlu`).
+   A projection of several segments and no epilogue runs those of each format
+   in one dispatch on the 128-row prefill tile; the int8 tile runs a GEMM
+   dispatch per segment beside the quantization of its input, which a SwiGLU's
+   gate and up share. (The segments of a format in one dispatch took the
+   27B's fused inputs 6-11% less time at 65-128 rows but 1-3% more at
    512-2048, 12-core M6.)
 2. *Projection, decode tiles.* A plan of up to 64 rows, a decode step's or a
-   prompt chunk's, runs them, its rows in table tiles of 8 (the last padded,
-   `tableTiles`). The decode tiles hold a step of four lanes of 16 on the
-   staged tile's heights; the register tile holds up to its four table tiles
+   prompt chunk's, and a decode step's of up to 128 runs them, its rows in
+   table tiles of 8 (the last padded, `tableTiles`). The decode tiles hold a
+   step of eight lanes of 16: up to 64 rows on the staged tile's heights, past
+   them on two row groups of the tile of half the rows in one dispatch
+   (`ops::stagedRowGroups`: two of 48 rows at 65-96, two of 64 at 97-128),
+   each group with its own split partials, so a row is the bits of its row on
+   any staged height at the plan's split and, unsplit, of the prefill tile. On
+   a 12-core M6 the 27B's [16640 x 5120] af4g64 projection takes 0.80 and
+   1.12 ms there against 1.07 and 1.32 on the prefill tile, and a projection
+   of several segments runs them in one dispatch up to 64 rows and in one each
+   past them; a decode step's vocabulary head keeps passes of at most 64 rows.
+   The register tile holds up to its four table tiles
    (`kMaximumRegisterRows`, 32 rows), a one-pass gate/up pair up to
    `kMaximumPairRows` (32) and the int8 tiles 16 or 32 rows
-   (`kMaximumInt8Rows`), and a plan past any of them runs the staged tile in
-   bf16 activations, a pair in two passes. A plan of at most `GGUF_COLUMN_ROWS` (2) rows runs the column
+   (`kMaximumInt8Rows`, past which they run row groups of them), and a plan
+   past the register tile or the pair runs the staged tile, a pair in two
+   passes. A plan of at most `GGUF_COLUMN_ROWS` (2) rows runs the column
    tile on every device (`kernels/decode/linear_gguf_column.metal`): each lane
    one column of a GEMV in registers over those rows alone (the MoE expert
    tiles' column tile, `kernels/common/gguf_column_tile.h`), eight simdgroups
@@ -632,7 +654,9 @@ The rules:
    runs a staged plan that stores at least `decodeInt8FromRows` rows (16 on
    Apple10 and Apple11, a 16-row plan among them; never on Apple9) whose K
    splits keep whole PQ2_0 blocks on those tiles, at the plan's splits and
-   passes; their shortest height is 16 rows and their tallest 32.
+   passes; their shortest height is 16 rows and their tallest 32. The int8
+   tiles also run row groups of them in one dispatch (`ops::int8RowGroups`,
+   as the staged tile's), which no plan takes yet.
 3. *Float projection.* The accelerator tile runs where the device has one,
    from `minimumRows` rows and a grid of its tiles of at least half the class's
    half tiles per core for BF16 values, F32 values or a quantized format's rows.
@@ -649,7 +673,8 @@ The rules:
    (`ops::moeInt8Experts`), once its routes average six or more an expert
    (`ops::selectMoe`, `MoeConfig::int8Passes`): from 192 rows on
    Qwen3.6-35B-A3B and Qwen3.5-122B-A10B, 256 on Flint's shape and 308 on
-   Qwen3.8-Flash-Next's. Smaller chunks keep the staged passes.
+   Qwen3.8-Flash-Next's. Smaller chunks and every decode step (rule 1) keep
+   the staged passes.
 5. *Attention.* The kernels follow how a layout reads its pages
    (`kv::Layout::reads`, below). A sequence of one tile, a decode lane's of
    up to 8 rows, takes one history split per 16 pages its rows read, between
@@ -1162,7 +1187,7 @@ history without.
 
 ### Int8-activation prefill
 
-On Apple10 and Apple11, which multiply int8 at twice their bf16 rate, a prefill chunk past the
+On Apple10 and Apple11, which multiply int8 at twice their bf16 rate, a prefill chunk past one
 staged tile (more than 64 rows) of a projection whose quantized segments are all MLX affine 4- or
 5-bit in groups of 64 (`af4g64`, `af5g64`) runs `LinearTile::GgufPrefillInt8`
 (`kernels/prefill/gguf_prefill_int8.metal`) instead of the bf16 tile
@@ -2549,9 +2574,11 @@ unanswered for 5 s fails that request with the retryable `mask_timeout` (HTTP
 503), so a stalled grammar cannot hold the batch's command.
 
 Prefill takes the ready lanes of the most urgent priority. Within it a
-request that three prefill commands in a row served later arrivals of its
-priority and not it (`maximumBatchWidth - 1`: the other lanes of a full batch,
-each finishing one short prompt), whether it has a lane or waits for one, is
+request that its runtime's lanes less one prefill commands in a row served
+later arrivals of its priority and not it (three of the default's four lanes:
+the other lanes of a full batch, each finishing one short prompt; none at one
+lane, where every request is overdue and prompts lead in arrival order, never
+the shortest first), whether it has a lane or waits for one, is
 overdue and leads, the oldest first, until a command serves it; otherwise the
 lane of the fewest remaining rows leads, then in submission order. A command
 counts once, whatever its passes, and serves every lane it holds, a joiner

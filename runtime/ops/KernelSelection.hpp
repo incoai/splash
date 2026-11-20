@@ -60,16 +60,17 @@ struct SplitChoice final {
 [[nodiscard]] bool decodeInt8TakesSplits(uint32_t k, uint32_t splits) noexcept;
 // A dense GGUF projection's configuration: the tile, its splits, spread, one
 // pass and sixteen rows, then, with `int8Activations` on, whether it runs in
-// int8 activations. A gate/up decode's `pairTensors` are its up's and gate's
-// own formats, whose plans decide its 16-row tile; none, it runs none.
+// int8 activations, as `step`'s work takes them (int8PrefillPaths). A gate/up
+// decode's `pairTensors` are its up's and gate's own formats, whose plans
+// decide its 16-row tile; none, it runs none.
 [[nodiscard]] LinearConfig selectProjection(const KernelCalibration &calibration, Int8Activations int8Activations,
-                                            LinearWorkload workload, const UnitFormats &unit,
+                                            StepKind step, LinearWorkload workload, const UnitFormats &unit,
                                             std::span<const UnitFormats> pairTensors = {});
 // Every configuration a decode plan of the workload may take on the device
 // when only whether the register tile takes its formats is known (arena
 // bounds). Int8 activations keep a plan's tile, rows and splits, and with them
 // its scratch.
-[[nodiscard]] std::vector<LinearConfig> decodeConfigurations(const KernelCalibration &calibration,
+[[nodiscard]] std::vector<LinearConfig> decodeConfigurations(const KernelCalibration &calibration, StepKind step,
                                                              LinearWorkload workload, bool registerTakes);
 
 // The tile of a float projection of `rows` rows into `outputSize` columns of
@@ -89,9 +90,10 @@ struct SplitChoice final {
 // The routes an expert takes on average from which a chunk's experts run the
 // int8 passes (selectMoe).
 inline constexpr uint32_t kInt8PassRoutesPerExpert = 6;
-// A MoE plan's configuration of `rows` rows, its routers in `routerFormat`,
-// with int8 activations `int8Activations`.
+// A MoE plan's configuration of `rows` rows of `step`'s work, its routers in
+// `routerFormat`, with int8 activations `int8Activations`.
 [[nodiscard]] MoeConfig selectMoe(const KernelCalibration &calibration, Int8Activations int8Activations,
-                                  const MoeShape &shape, uint32_t routerFormat, uint32_t rows) noexcept;
+                                  StepKind step, const MoeShape &shape, uint32_t routerFormat,
+                                  uint32_t rows) noexcept;
 
 } // namespace splash::ops

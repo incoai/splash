@@ -704,7 +704,7 @@ bool Engine::admitQueued(double now) {
   const bool lanesFull =
       std::count_if(requests_.begin(), requests_.end(), [](const auto &entry) {
         return entry.second.lane.has_value();
-      }) >= model::ExecutionLimits::maximumBatchWidth;
+      }) >= model_.commandLimits().lanes;
   bool laneSought = false;
   const auto waitForLane = [&](uint64_t id, Request &active) {
     scheduler_.waitForResources(id);

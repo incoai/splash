@@ -181,11 +181,11 @@ kernel void block_indexer_pool_tree(device const BlockIndexerBlock *blocks [[buf
                                     device const bfloat *pending0 [[buffer(4)]],
                                     device const bfloat *pending1 [[buffer(5)]],
                                     device const bfloat *pending2 [[buffer(6)]],
-                                    device const bfloat *pending3 [[buffer(7)]],
-                                    device const float *key_norm [[buffer(8)]],
-                                    device const float *inverse_frequencies [[buffer(9)]],
-                                    device bfloat *block_keys [[buffer(10)]],
-                                    constant BlockIndexerTreeParams &p [[buffer(11)]],
+                                    device const bfloat *pending3 [[buffer(7)]], device const bfloat *pending4 [[buffer(8)]], device const bfloat *pending5 [[buffer(9)]], device const bfloat *pending6 [[buffer(10)]], device const bfloat *pending7 [[buffer(11)]],
+                                    device const float *key_norm [[buffer(12)]],
+                                    device const float *inverse_frequencies [[buffer(13)]],
+                                    device bfloat *block_keys [[buffer(14)]],
+                                    constant BlockIndexerTreeParams &p [[buffer(15)]],
                                     uint2 group [[threadgroup_position_in_grid]],
                                     uint tid [[thread_index_in_threadgroup]],
                                     uint lane [[thread_index_in_simdgroup]],
@@ -209,7 +209,7 @@ kernel void block_indexer_pool_tree(device const BlockIndexerBlock *blocks [[buf
     path[t] = at;
     if (block.position + t > anchor) at = tree[rows.first + at].parent;
   }
-  device const bfloat *pending = SPLASH_LANE_BINDING(batch, pending0, pending1, pending2, pending3);
+  device const bfloat *pending = SPLASH_LANE_BINDING(batch, pending0, pending1, pending2, pending3, pending4, pending5, pending6, pending7);
   float sum = 0.0f;
   for (uint t = 0; t < kBlock; ++t)
     sum += float(block.position + t >= anchor ? keys[(ulong(rows.first) + path[t]) * kDimension + tid]
@@ -266,16 +266,16 @@ kernel void block_indexer_commit(device const bfloat *keys [[buffer(0)]],
                                  device const bfloat *pending_in0 [[buffer(4)]],
                                  device const bfloat *pending_in1 [[buffer(5)]],
                                  device const bfloat *pending_in2 [[buffer(6)]],
-                                 device const bfloat *pending_in3 [[buffer(7)]],
-                                 device bfloat *pending_out0 [[buffer(8)]],
-                                 device bfloat *pending_out1 [[buffer(9)]],
-                                 device bfloat *pending_out2 [[buffer(10)]],
-                                 device bfloat *pending_out3 [[buffer(11)]],
-                                 device const SplashKvPage *index_table0 [[buffer(12)]],
-                                 device const SplashKvPage *index_table1 [[buffer(13)]],
-                                 device const SplashKvPage *index_table2 [[buffer(14)]],
-                                 device const SplashKvPage *index_table3 [[buffer(15)]],
-                                 constant BlockIndexerCommitParams &p [[buffer(16)]],
+                                 device const bfloat *pending_in3 [[buffer(7)]], device const bfloat *pending_in4 [[buffer(8)]], device const bfloat *pending_in5 [[buffer(9)]], device const bfloat *pending_in6 [[buffer(10)]], device const bfloat *pending_in7 [[buffer(11)]],
+                                 device bfloat *pending_out0 [[buffer(12)]],
+                                 device bfloat *pending_out1 [[buffer(13)]],
+                                 device bfloat *pending_out2 [[buffer(14)]],
+                                 device bfloat *pending_out3 [[buffer(15)]], device bfloat *pending_out4 [[buffer(16)]], device bfloat *pending_out5 [[buffer(17)]], device bfloat *pending_out6 [[buffer(18)]], device bfloat *pending_out7 [[buffer(19)]],
+                                 device const SplashKvPage *index_table0 [[buffer(20)]],
+                                 device const SplashKvPage *index_table1 [[buffer(21)]],
+                                 device const SplashKvPage *index_table2 [[buffer(22)]],
+                                 device const SplashKvPage *index_table3 [[buffer(23)]], device const SplashKvPage *index_table4 [[buffer(24)]], device const SplashKvPage *index_table5 [[buffer(25)]], device const SplashKvPage *index_table6 [[buffer(26)]], device const SplashKvPage *index_table7 [[buffer(27)]],
+                                 constant BlockIndexerCommitParams &p [[buffer(28)]],
                                  uint2 group [[threadgroup_position_in_grid]],
                                  uint tid [[thread_index_in_threadgroup]]) {
   const uint layer = group.x, batch = group.y;
@@ -283,7 +283,7 @@ kernel void block_indexer_commit(device const bfloat *keys [[buffer(0)]],
   const uint path = paths[batch], anchor = p.first_position[batch], end = anchor + popcount(path);
   const ulong first = ulong(layer) * p.layer_rows + lane_rows[batch].first;
   device const SplashKvPage *index_table =
-      SPLASH_LANE_BINDING(batch, index_table0, index_table1, index_table2, index_table3);
+      SPLASH_LANE_BINDING(batch, index_table0, index_table1, index_table2, index_table3, index_table4, index_table5, index_table6, index_table7);
   // The path's rows by depth, the anchor's first.
   uint depth = 0;
   for (uint rest = path; rest; rest &= rest - 1, ++depth)
@@ -301,8 +301,8 @@ kernel void block_indexer_commit(device const bfloat *keys [[buffer(0)]],
   }
   const ulong pending = ulong(layer) * kPending * kDimension;
   indexer_store_pending(keys + first * kDimension, rows,
-                        SPLASH_LANE_BINDING(batch, pending_in0, pending_in1, pending_in2, pending_in3) + pending,
-                        SPLASH_LANE_BINDING(batch, pending_out0, pending_out1, pending_out2, pending_out3) + pending,
+                        SPLASH_LANE_BINDING(batch, pending_in0, pending_in1, pending_in2, pending_in3, pending_in4, pending_in5, pending_in6, pending_in7) + pending,
+                        SPLASH_LANE_BINDING(batch, pending_out0, pending_out1, pending_out2, pending_out3, pending_out4, pending_out5, pending_out6, pending_out7) + pending,
                         anchor, end, tid);
 }
 
@@ -417,9 +417,9 @@ kernel void block_indexer_score_tree(device const bfloat *queries [[buffer(0)]],
                                      device const SplashKvPage *index_table0 [[buffer(4)]],
                                      device const SplashKvPage *index_table1 [[buffer(5)]],
                                      device const SplashKvPage *index_table2 [[buffer(6)]],
-                                     device const SplashKvPage *index_table3 [[buffer(7)]],
-                                     device float *scores [[buffer(8)]],
-                                     constant BlockIndexerTreeParams &p [[buffer(9)]],
+                                     device const SplashKvPage *index_table3 [[buffer(7)]], device const SplashKvPage *index_table4 [[buffer(8)]], device const SplashKvPage *index_table5 [[buffer(9)]], device const SplashKvPage *index_table6 [[buffer(10)]], device const SplashKvPage *index_table7 [[buffer(11)]],
+                                     device float *scores [[buffer(12)]],
+                                     constant BlockIndexerTreeParams &p [[buffer(13)]],
                                      uint3 group [[threadgroup_position_in_grid]],
                                      uint3 groups [[threadgroups_per_grid]],
                                      uint tid [[thread_index_in_threadgroup]]) {
@@ -444,7 +444,7 @@ kernel void block_indexer_score_tree(device const bfloat *queries [[buffer(0)]],
       reinterpret_cast<threadgroup uint4 *>(tile.k)[chunk] = data;
     }
   } else {
-    indexer_load_index(tile, SPLASH_LANE_BINDING(batch, index_table0, index_table1, index_table2, index_table3),
+    indexer_load_index(tile, SPLASH_LANE_BINDING(batch, index_table0, index_table1, index_table2, index_table3, index_table4, index_table5, index_table6, index_table7),
                        p.index_offset, block0, history, tid);
   }
   indexer_tile_products(tile);

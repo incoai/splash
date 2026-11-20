@@ -157,7 +157,7 @@ inline SplashSparseList splash_sparse_list(device const uint *lists, device cons
                                  Located>(                                     \
         queries + tile.offset,                                                 \
         SPLASH_LANE_BINDING(s, page_table0, page_table1, page_table2,          \
-                            page_table3),                                      \
+                            page_table3, page_table4, page_table5, page_table6, page_table7),                                      \
         params.kv, kv_head, tile.first_position, tile.active_rows,             \
         list.entries, list.count, list.locations, LocationPages, Places,       \
         tile.splits, split, partials, statistics, tile.first_slot + split,     \
@@ -177,13 +177,13 @@ inline SplashSparseList splash_sparse_list(device const uint *lists, device cons
       device const SplashKvPage *page_table0 [[buffer(3)]],                    \
       device const SplashKvPage *page_table1 [[buffer(4)]],                    \
       device const SplashKvPage *page_table2 [[buffer(5)]],                    \
-      device const SplashKvPage *page_table3 [[buffer(6)]],                    \
-      device const SplashTreeRow *tree [[buffer(7)]],                          \
-      device const SplashLaneRows *layout [[buffer(8)]],                       \
-      device const uint *lists [[buffer(9)]],                                  \
-      device const uint *counts [[buffer(10)]],                                \
-      device const uint *row_masks [[buffer(11)]],                             \
-      constant SplashAttentionParams &params [[buffer(12)]],                   \
+      device const SplashKvPage *page_table3 [[buffer(6)]], device const SplashKvPage *page_table4 [[buffer(7)]], device const SplashKvPage *page_table5 [[buffer(8)]], device const SplashKvPage *page_table6 [[buffer(9)]], device const SplashKvPage *page_table7 [[buffer(10)]],                    \
+      device const SplashTreeRow *tree [[buffer(11)]],                          \
+      device const SplashLaneRows *layout [[buffer(12)]],                       \
+      device const uint *lists [[buffer(13)]],                                  \
+      device const uint *counts [[buffer(14)]],                                \
+      device const uint *row_masks [[buffer(15)]],                             \
+      constant SplashAttentionParams &params [[buffer(16)]],                   \
       uint3 group [[threadgroup_position_in_grid]],                            \
       uint thread_index [[thread_index_in_threadgroup]]) {                     \
     SPARSE_SPLIT_BODY(Heads, Group, HeadDim, CacheElement, false, nullptr,     \
@@ -201,15 +201,15 @@ inline SplashSparseList splash_sparse_list(device const uint *lists, device cons
       device const SplashKvPage *page_table0 [[buffer(3)]],                    \
       device const SplashKvPage *page_table1 [[buffer(4)]],                    \
       device const SplashKvPage *page_table2 [[buffer(5)]],                    \
-      device const SplashKvPage *page_table3 [[buffer(6)]],                    \
-      device const SplashTreeRow *tree [[buffer(7)]],                          \
-      device const SplashLaneRows *layout [[buffer(8)]],                       \
-      device const uint *lists [[buffer(9)]],                                  \
-      device const uint *counts [[buffer(10)]],                                \
-      device const uint *row_masks [[buffer(11)]],                             \
-      device const uint *locations [[buffer(12)]],                             \
-      device const SplashKvPage *location_pages [[buffer(13)]],                \
-      constant SplashAttentionParams &params [[buffer(14)]],                   \
+      device const SplashKvPage *page_table3 [[buffer(6)]], device const SplashKvPage *page_table4 [[buffer(7)]], device const SplashKvPage *page_table5 [[buffer(8)]], device const SplashKvPage *page_table6 [[buffer(9)]], device const SplashKvPage *page_table7 [[buffer(10)]],                    \
+      device const SplashTreeRow *tree [[buffer(11)]],                          \
+      device const SplashLaneRows *layout [[buffer(12)]],                       \
+      device const uint *lists [[buffer(13)]],                                  \
+      device const uint *counts [[buffer(14)]],                                \
+      device const uint *row_masks [[buffer(15)]],                             \
+      device const uint *locations [[buffer(16)]],                             \
+      device const SplashKvPage *location_pages [[buffer(17)]],                \
+      constant SplashAttentionParams &params [[buffer(18)]],                   \
       uint3 group [[threadgroup_position_in_grid]],                            \
       uint thread_index [[thread_index_in_threadgroup]]) {                     \
     threadgroup uint places[SplashSparseStep<CacheElement>::Blocks];           \

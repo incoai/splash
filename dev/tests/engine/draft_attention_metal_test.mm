@@ -61,7 +61,7 @@ constexpr uint32_t kKvHeads = 8;
 constexpr uint32_t kQueryHeadsPerKv = 4;
 constexpr uint32_t kHeadDim = 128;
 constexpr uint32_t kWindow = 2048;
-constexpr uint32_t kLanes = 4;
+constexpr uint32_t kLanes = SPLASH_MAXIMUM_BATCH_WIDTH;
 // The shipped split count and the fp32 partial one split leaves per (lane,
 // head) behind the grouped queries: 32 rows x (128 + max + sum).
 constexpr uint32_t kSplits = SPLASH_DRAFT_ATTENTION_SPLITS;
@@ -292,7 +292,7 @@ void planGeometry() {
     }
     rejects([&] { (void)DraftAttention::plan(shape, 0); }, "invalid draft batch width",
             "a draft plan of no lanes was accepted");
-    rejects([&] { (void)DraftAttention::plan(shape, 5); }, "invalid draft batch width",
+    rejects([&] { (void)DraftAttention::plan(shape, kLanes + 1); }, "invalid draft batch width",
             "a draft plan wider than a batch was accepted");
   }
   auto unsupported = kShapes[0];
@@ -655,10 +655,11 @@ void packedContextCommit(MetalBackend &backend, DraftAttentionShape shape) {
   constexpr uint16_t kUntouched = 0xC2C2;
   const uint64_t ringElements = uint64_t{kKvHeads} * kWindow * kHeadDim;
   Random random(0x7061636bULL + shape.hiddenSize);
-  const std::array<LaneRows, kLanes> packed{{{0, 5}, {5, 8}, {13, 1}, {14, 6}}};
-  const std::array<uint32_t, kLanes> starts{2044, 0, 4101, 300}, retained{0xF, 0xFF, 0x1, 0x1FF};
+  const std::array<LaneRows, kLanes> packed{{{0, 5}, {5, 8}, {13, 1}, {14, 6}, {20, 3}, {23, 2}, {25, 7}, {32, 4}}};
+  const std::array<uint32_t, kLanes> starts{2044, 0, 4101, 300, 6140, 17, 1023, 8190},
+      retained{0xF, 0xFF, 0x1, 0x1FF, 0x7, 0x3, 0x7F, 0xF};
   const MetalBuffer keyNorm = randomBfloat(backend, kHeadDim, random, "draft key norm");
-  const MetalBuffer kv = randomBfloat(backend, uint64_t{20} * kRowWidth, random, "draft packed kv");
+  const MetalBuffer kv = randomBfloat(backend, uint64_t{36} * kRowWidth, random, "draft packed kv");
   const auto table = [&](bool sine) {
     const uint64_t count = uint64_t{kLanes} * kRopeRows * kHeadDim / 2;
     MetalBuffer result = backend.allocateBuffer(count * sizeof(float), BufferStorage::Shared, "draft rope");
@@ -1111,6 +1112,7 @@ int main(int argc, char **argv) {
       runCase(backend, 4, shape, {512, 513, 1024, 1536});
       runCase(backend, 4, shape, {2046, 2049, 4095, 4096});
       runCase(backend, 2, shape, {8191, 262144, 0, 0});
+      runCase(backend, kLanes, shape, {262137, 4094, 500, 6143, 512, 2049, 0, 8191});
     }
     std::cout << "draft_attention_metal_test: PASS\n";
     return 0;

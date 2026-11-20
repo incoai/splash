@@ -752,6 +752,9 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
   // layout may have.
   const bool kvMaySpill = config.model.capabilities.sparseKv && kvLayout.spillable();
   std::array<std::array<uint64_t, 2>, 2> arenaBytes{}, spillArenaBytes{};
+  // The arenas' lanes, the default's, and the target's geometry that plans them.
+  const uint32_t lanes = model::ExecutionLimits::defaultLanes;
+  model::QwenTargetGeometry plannedTarget;
   // The room for active KV, which only a target whose KV may spill plans
   // with: until the tier's files open, what the volume they will take
   // leaves now, a persistent tier's root, whose caches nobody holds count as
@@ -802,7 +805,8 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
          .kvSlotBytes = kvSlotBytes,
          .stateSlotBytes = model::SlotFile::slotBytesFor(stateBytes),
          .activeLimitBytes = activeLimitBytes,
-         .groupPages = groupPages});
+         .groupPages = groupPages,
+         .lanes = lanes});
   };
   // The plan of the parts as configured, which sizes their stores.
   const auto sizingPlan = [&](uint64_t stagingBytes) {
@@ -842,7 +846,7 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
     try {
       const auto arenas = [&](model::StreamedParts parts) {
         const model::ModelMemoryPlan streamed = model::plannedRuntimeMemory(
-            config.model, target, operators, config.kvFormat, config.stateFormat, parts);
+            config.model, target, operators, config.kvFormat, config.stateFormat, parts, lanes);
         return streamed.sharedPrefillPlannedAllocatedBytes + streamed.sharedDecodePlannedAllocatedBytes;
       };
       for (const bool table : {false, true}) {
@@ -888,8 +892,9 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
                          "routed experts", "load with their layers");
     // A table that may stream streams through its smallest row cache while
     // the target's files give its geometry.
-    planArenas(model::plannedTargetGeometry(*backend, config.modelRoot, config.model,
-                                            streamable.tableBytes ? streamable.tableMinimumBytes : 0, readers));
+    plannedTarget = model::plannedTargetGeometry(*backend, config.modelRoot, config.model,
+                                                 streamable.tableBytes ? streamable.tableMinimumBytes : 0, readers);
+    planArenas(plannedTarget);
     // Refuse a model that cannot fit before loading its weights: beside them
     // the plan needs at least their arenas, the runtime reserves, one lane's
     // state, the KV runway, the streamed stores at their smallest or at the
@@ -917,6 +922,13 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
   // The runtime's lane state and arenas as the model loaded, with its K/V in
   // memory and where it spills.
   model::ModelMemoryPlan modelMemoryPlan, spillModelMemoryPlan;
+  const auto planRuntime = [&] {
+    modelMemoryPlan = model::plannedRuntimeMemory(loaded, operators, config.kvFormat, config.stateFormat,
+                                                  model::StreamedParts::loaded(loaded), lanes);
+    if (kvMaySpill)
+      spillModelMemoryPlan = model::plannedRuntimeMemory(loaded, operators, config.kvFormat, config.stateFormat,
+                                                         model::StreamedParts::loaded(loaded, true), lanes);
+  };
   // Loads the model as loadOptions says, `again` where a store the plan sized
   // is laid out again (below), and plans its runtime memory as it loaded.
   const auto load = [&](bool again) {
@@ -944,11 +956,7 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
                                   error.what());
     }
     try {
-      modelMemoryPlan = model::plannedRuntimeMemory(loaded, operators, config.kvFormat, config.stateFormat,
-                                                    model::StreamedParts::loaded(loaded));
-      if (kvMaySpill)
-        spillModelMemoryPlan = model::plannedRuntimeMemory(loaded, operators, config.kvFormat, config.stateFormat,
-                                                           model::StreamedParts::loaded(loaded, true));
+      planRuntime();
     } catch (const std::exception &error) {
       throw RuntimeResourcesError(
           RuntimeResourceStage::MemoryPlanning,
@@ -1211,7 +1219,7 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
     auto kvPages = std::make_unique<kv::PageStorage>(
         *backend, memoryGovernor->allocationAdmission(), kvLayout,
         static_cast<uint32_t>(poolExtents * budget.kvExtentPages), budget.kvExtentPages);
-    auto kvPool = std::make_unique<KvPool>(*kvPages, model::ExecutionLimits::warmupKvPages);
+    auto kvPool = std::make_unique<KvPool>(*kvPages, model::ExecutionLimits::runwayPages(budget.kvExtentPages, budget.maximumBatchWidth));
     auto stateStorage = std::make_unique<model::QwenStateStorage>(
         *backend, memoryGovernor->allocationAdmission(),
         loaded.stateLayout(config.stateFormat, !config.exactCachedStates), disk.states);
@@ -1258,7 +1266,8 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
           model::KvBlockCacheOptions{.shape = *config.model.capabilities.sparseKv,
                                      .targetBytes = spill.hotTargetBytes,
                                      .readers = readers,
-                                     .format = kvFormat});
+                                     .format = kvFormat,
+                                     .lanes = budget.maximumBatchWidth});
       historyStream = std::make_unique<model::KvHistoryStream>(
           *backend, memoryGovernor->allocationAdmission(), kvLayout, budget.kvExtentPages, readers, kvFormat,
           spill.stagingBuffers);
@@ -1416,7 +1425,8 @@ model::RuntimeContext RuntimeResources::modelContext() {
   return {*backend_, model_, *kvPages_, *stateStorage_, operators_, aneFfn_.get(), blockCache_.get(),
           historyStream_.get(), verifyRows_, [key](uint32_t lanes) { return ane::recall(key + std::to_string(lanes)); },
           [key](uint32_t lanes, std::string_view line) { ane::remember(key + std::to_string(lanes), line); },
-          [key](uint32_t lanes) { ane::forget(key + std::to_string(lanes)); }};
+          [key](uint32_t lanes) { ane::forget(key + std::to_string(lanes)); },
+          memoryPlan_.breakdown().maximumBatchWidth};
 }
 
 EngineSpillConfig RuntimeResources::spillConfig() const noexcept {

@@ -1227,7 +1227,7 @@ void testADeclinedRefusalHoldsNoClaimRoom() {
     harness.model.maximumLanes = 0;
     submit(1, 8193);
     static_cast<void>(harness.tick());
-    harness.model.maximumLanes = model::ExecutionLimits::maximumBatchWidth;
+    harness.model.maximumLanes = model::ExecutionLimits::defaultLanes;
     submit(2, 16385);
     static_cast<void>(harness.tick());
     require(waiting() && harness.engine.resourceWaitSnapshot(harness.now()).memory == 1,

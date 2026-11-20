@@ -173,6 +173,7 @@ int main(int argc, char **argv) {
         CommandGraph graph;
         graph.add("gguf_rotate_int8", {in, signBuffer, backend.view(out, 0, bytes)},
                   GgufRotationInt8Params{width, storage}, {blocks, rows, 1}, {GGUF_ROTATION_THREADS, 1, 1});
+        graph.specialize(std::array<uint32_t, 1>{1});  // one row group
         static_cast<void>(backend.submitCommandAsync(graph.dispatches()).wait());
         const uint8_t *written = static_cast<const uint8_t *>(out.contents());
         // Input k's code of row r, at its stage position, and block b's scale bits of row r.

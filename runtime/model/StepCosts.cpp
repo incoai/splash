@@ -62,7 +62,11 @@ StepCosts::StepCosts(std::span<const uint32_t> classes, uint32_t mostRows, bool 
     throw std::invalid_argument("invalid step classes");
   for (uint32_t lanes = 1; lanes <= kLanes; ++lanes) {
     std::vector<Point> &points = tables_[lanes - 1];
-    const uint32_t most = std::min(lanes * kWideCap, mostRows), narrow = lanes * kNarrowCap;
+    // The narrow cap's last step: a draft's block a lane, or the most rows
+    // where they hold less (the tables of more lanes than a runtime of few
+    // runs, whose steps hold its most rows), where the wide cap's point is
+    // measured too.
+    const uint32_t most = std::min(lanes * kWideCap, mostRows), narrow = std::min(lanes * kNarrowCap, most);
     if (most <= lanes)
       throw std::invalid_argument("a step's most rows hold nothing past its lanes' anchors");
     // A class starts where the kernels change and where the cap does.
@@ -121,9 +125,9 @@ uint32_t StepCosts::lanePages(size_t points) {
                                SPLASH_TARGET_KV_BLOCK_TOKENS);
 }
 
-void StepCosts::requireRunway(uint32_t first, uint32_t runway) const {
-  for (uint32_t lanes = 1; lanes <= kLanes; ++lanes)
-    if (first + lanes * lanePages(table(lanes).size()) > runway)
+void StepCosts::requireRunway(uint32_t first, uint32_t runway, uint32_t lanes) const {
+  for (uint32_t count = 1; count <= lanes; ++count)
+    if (first + count * lanePages(table(count).size()) > runway)
       throw std::logic_error("a lane count's step costs take more pages than the startup runway");
 }
 
@@ -217,8 +221,8 @@ bool StepCosts::measured(uint32_t lanes) const {
 
 double StepCosts::price(uint32_t lanes, uint32_t rows, uint32_t cap) const {
   const std::vector<Point> &points = table(lanes);
-  const uint32_t narrow = lanes * kNarrowCap;
-  // What the wide cap adds at a draft's block a lane, which a narrow class's
+  const uint32_t narrow = std::min(lanes * kNarrowCap, points.back().last);
+  // What the wide cap adds at a draft's block a lane (or the most rows), which a narrow class's
   // step at the wide cap adds to its point (none at one lane, whose narrow
   // steps hold no lane past the narrow cap). The wide cap runs the narrow
   // cap's kernels over more rows a lane, so it adds no less than none: a
@@ -299,14 +303,19 @@ StepCosts::Choice StepCosts::choose(std::span<const std::span<const float>> chan
 
 namespace {
 
-// A cycle's cost at 1, 2, 4 and 8 rows a lane, for one to four lanes (every
-// row costs 1): the mean shape of Qwen3.8-Flash-Next's cycles (resident and
-// with 12 GB of experts) and Qwen3.6-35B-A3B's (resident and with 4 GB),
-// 1.6.2's seed.
+// A cycle's cost at 1, 2, 4 and 8 rows a lane, for one to eight lanes
+// (every row costs 1): the mean shape of Qwen3.8-Flash-Next's cycles
+// (resident and with 12 GB of experts) and Qwen3.6-35B-A3B's (resident and
+// with 4 GB), 1.6.2's seed, which measured one to four lanes; five to eight
+// take four lanes' shape until their own cycles move the line.
 constexpr std::array<std::array<double, 4>, CostLine::kLanes> kSeed{{
     {0.60, 0.69, 0.85, 1.0},
     {0.50, 0.58, 0.74, 1.0},
     {0.45, 0.52, 0.70, 1.0},
+    {0.40, 0.47, 0.67, 1.0},
+    {0.40, 0.47, 0.67, 1.0},
+    {0.40, 0.47, 0.67, 1.0},
+    {0.40, 0.47, 0.67, 1.0},
     {0.40, 0.47, 0.67, 1.0},
 }};
 

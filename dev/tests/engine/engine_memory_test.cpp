@@ -801,6 +801,36 @@ void testOneCommandCapturesSeveralLanesStates() {
           "the states one command captured were not all published");
 }
 
+// A model of the most lanes admits as many requests and the next waits for a
+// lane, a concurrency wait, until one ends.
+void testTheMostLanesAdmitAsMany() {
+  constexpr uint32_t kLanes = model::ExecutionLimits::maximumBatchWidth;
+  test::TestKvStorage storage(256, 4096, 4);
+  KvPool pool(storage, 0);
+  engine::Cache resources(pool, nullptr, nullptr);
+  Executor executor(kLanes);
+  executor.lanes = kLanes;
+  executor.decodeFinishes = false;
+  Events events;
+  engine::Engine engine(test::engineConfig(), resources, executor, events);
+  guardReleases(storage, engine);
+  for (uint64_t id = 1; id <= kLanes + 1; ++id) {
+    auto value = request(id, std::vector<uint32_t>(33, static_cast<uint32_t>(id)));
+    value.maxNewTokens = 100'000;
+    engine.submit(std::move(value));
+  }
+  double now = 1;
+  tickUntil(engine, now, [&] { return executor.requests.size() == kLanes; }, "the engine did not fill its lanes");
+  for (int tick = 0; tick < 20; ++tick) static_cast<void>(engine.tick(now++));
+  require(executor.requests.size() == kLanes && engine.resourceWaitSnapshot(now).concurrency == 1,
+          "a request past the model's lanes was admitted or did not wait for a lane");
+  engine.cancel(1);
+  tickUntil(engine, now, [&] { return executor.requests.contains(kLanes + 1); },
+            "a freed lane did not admit the waiting request");
+  for (uint64_t id = 2; id <= kLanes + 1; ++id) engine.cancel(id);
+  tickUntil(engine, now, [&] { return idle(engine); }, "the requests did not end");
+}
+
 // While every lane is resident a waiting request is a concurrency wait, with no cache probe or admission attempt,
 // and no memory wait counts against its limit.
 void testFullLanesSkipAdmissionAttempts() {
@@ -1383,7 +1413,7 @@ void testLaneAdmittedBeforeARefusalHoldsTheWaitOpen() {
     double now = 1;
     // Occupants in every lane: both requests wait for one until they are
     // cancelled.
-    const uint64_t occupants = lanesFull ? model::ExecutionLimits::maximumBatchWidth : 0;
+    const uint64_t occupants = lanesFull ? model::ExecutionLimits::defaultLanes : 0;
     for (uint64_t id = 1; id <= occupants; ++id) {
       auto occupant = request(id, {static_cast<uint32_t>(id)});
       occupant.maxNewTokens = 1000;
@@ -2167,7 +2197,7 @@ void testARefusedStartHoldsOnlyWhatItLeads() {
 }
 
 // Younger, shorter prompts that lead a refused start overtake it by at most the aging bound: once
-// maximumBatchWidth - 1 commands in a row served them and not it, it leads them and holds them back until it starts.
+// defaultLanes - 1 commands in a row served them and not it, it leads them and holds them back until it starts.
 void testAgingBoundsHowFarShorterArrivalsPassARefusedStart() {
   test::TestKvStorage storage(2048, 4096, 4);
   KvPool pool(storage, 0);
@@ -2195,7 +2225,7 @@ void testAgingBoundsHowFarShorterArrivalsPassARefusedStart() {
     static_cast<void>(engine.tick(now++));
   }
   const auto overtaken = static_cast<uint32_t>(std::ranges::count_if(events.startIds, [](uint64_t id) { return id >= 100; }));
-  const uint32_t bound = model::ExecutionLimits::maximumBatchWidth - 1;
+  const uint32_t bound = model::ExecutionLimits::defaultLanes - 1;
   require(overtaken != 0 && overtaken <= bound && !executor.requests.contains(latest) &&
               engine.resourceWaitSnapshot(now).heldBehindRefusal == 1,
           "shorter prompts overtook the refused start " + std::to_string(overtaken) +
@@ -6469,6 +6499,7 @@ std::span<const test::TestCase> memoryTests() {
       {"testNonFiniteCommandDropsItsCaptures", testNonFiniteCommandDropsItsCaptures},
       {"testDuplicateCaptureIsDropped", testDuplicateCaptureIsDropped},
       {"testOneCommandCapturesSeveralLanesStates", testOneCommandCapturesSeveralLanesStates},
+      {"testTheMostLanesAdmitAsMany", testTheMostLanesAdmitAsMany},
       {"testFullLanesSkipAdmissionAttempts", testFullLanesSkipAdmissionAttempts},
       {"testConcurrencyLimitDoesNotEvictCache", testConcurrencyLimitDoesNotEvictCache},
       {"testHostPressureStillRecyclesLruStateForRefusedBuffers",

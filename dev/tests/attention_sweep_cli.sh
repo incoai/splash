@@ -18,7 +18,7 @@ reject() {
     test ! -s "$work/out"
 }
 
-for value in 0 5 100 -1 4294967296 4294967297 1x '' '1,' ',1' '1,,4'; do
+for value in 0 9 100 -1 4294967296 4294967297 1x '' '1,' ',1' '1,,4'; do
     reject '--lanes requires integers' --lanes "$value"
 done
 for value in 0 -1 4294967296 1x ''; do

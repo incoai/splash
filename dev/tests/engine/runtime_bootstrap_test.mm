@@ -319,7 +319,7 @@ void testBudgetLimitedWarmupTriesOnlyWidthsThatFit() {
     expected.push_back(5);
     require(harness.executor().calls == expected,
             "warmup attempted a decode width that cannot fit the plan");
-    for (uint32_t lane = 0; lane < report.warmup.decodeBatches.size(); ++lane) {
+    for (uint32_t lane = 0; lane < plan.breakdown().maximumBatchWidth; ++lane) {
       require(report.warmup.decodeBatches[lane] ==
                   (lane < width ? WarmupStepStatus::Complete
                                 : WarmupStepStatus::MemoryLimited),
@@ -349,7 +349,7 @@ void testOptionalAllocationFailuresAreMemoryLimited() {
       expected.push_back(5);
       require(harness.executor().calls == expected,
               "bootstrap retried wider batches after allocation denial");
-      for (uint32_t lane = 0; lane < report.warmup.decodeBatches.size(); ++lane) {
+      for (uint32_t lane = 0; lane < plan.breakdown().maximumBatchWidth; ++lane) {
         require(report.warmup.decodeBatches[lane] ==
                     (lane < completedWidth ? WarmupStepStatus::Complete
                                            : WarmupStepStatus::MemoryLimited),
@@ -596,8 +596,8 @@ void testReadyEventForTheServedModel() {
   engine.maxContext = 73721;
   engine.maxImagePatches = 16384;
   const protocol::ReadyEvent vision =
-      readyEventFor(flint, engine, protocolLimitsFor(flint.capabilities, engine.maxContext));
-  require(vision == protocol::ReadyEvent{4, 73721, true, 150144, {150001, 150003, 150005, 150018}, 17},
+      readyEventFor(flint, engine, protocolLimitsFor(flint.capabilities, engine.maxContext), 8);
+  require(vision == protocol::ReadyEvent{8, 73721, true, 150144, {150001, 150003, 150005, 150018}, 17},
           "Ready did not announce what a start serving Flint with images serves");
   model::ModelDescriptor dense;
   dense.target = model::Qwen3_8Layout{};
@@ -605,7 +605,7 @@ void testReadyEventForTheServedModel() {
   engine.maxContext = 262144;
   engine.maxImagePatches = 0;
   const protocol::ReadyEvent text =
-      readyEventFor(dense, engine, protocolLimitsFor(dense.capabilities, engine.maxContext));
+      readyEventFor(dense, engine, protocolLimitsFor(dense.capabilities, engine.maxContext), 4);
   require(text == protocol::ReadyEvent{4, 262144, false, 248320, {248044, 248046}, 17},
           "Ready did not announce what a start serving a model without images serves");
 }

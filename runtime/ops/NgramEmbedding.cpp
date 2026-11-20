@@ -10,6 +10,9 @@
 #include <utility>
 
 namespace splash::ops {
+
+// The kernels bind each lane's buffers, eight (metal/kernels/common/lane_bindings.h).
+static_assert(SPLASH_MAXIMUM_BATCH_WIDTH == 8, "the lane bindings name eight lanes");
 namespace {
 
 constexpr uint32_t kThreads = HYPER_CONNECTION_ROW_THREADS;
@@ -89,7 +92,8 @@ void NgramEmbedding::addConvolution(metal::CommandGraph &graph, metal::MetalBuff
   // nothing.
   metal::MetalBuffer treeRows = inTree ? std::move(tree) : taps;
   graph.add("ngram_embedding_conv",
-            {std::move(convolutionInput), in[0], in[1], in[2], in[3], out[0], out[1], out[2], out[3], std::move(taps),
+            {std::move(convolutionInput), in[0], in[1], in[2], in[3], in[4], in[5], in[6], in[7],
+             out[0], out[1], out[2], out[3], out[4], out[5], out[6], out[7], std::move(taps),
              std::move(gated), std::move(streams), std::move(layout), std::move(treeRows)},
             ngramParams(shape, rows.rows, writeHistory, inTree, rows.sequences),
             {rows.bound + (writeHistory ? shape.history() : 0), groups(shape.width()), rows.sequences},
@@ -127,7 +131,8 @@ void NgramEmbedding::addCommit(metal::CommandGraph &graph, metal::MetalBuffer co
   requireBytes(layout, uint64_t{rows.sequences} * sizeof(SplashLaneRows), "n-gram embedding layout");
   const auto in = laneBindings(historyIn), out = laneBindings(historyOut);
   graph.add("ngram_embedding_commit",
-            {std::move(convolutionInput), in[0], in[1], in[2], in[3], out[0], out[1], out[2], out[3], std::move(paths),
+            {std::move(convolutionInput), in[0], in[1], in[2], in[3], in[4], in[5], in[6], in[7],
+             out[0], out[1], out[2], out[3], out[4], out[5], out[6], out[7], std::move(paths),
              std::move(layout)},
             ngramParams(shape, rows.rows, true, false, rows.sequences),
             {shape.history(), groups(shape.width()), rows.sequences}, {kThreads, 1, 1});

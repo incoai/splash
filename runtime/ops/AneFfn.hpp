@@ -46,7 +46,7 @@ public:
   // The GPU part's down projection is a view of leading inputs, which only
   // the prefill residual tiles (GgufPrefill, GgufPrefillInt8) run: no chunk
   // the split takes stages.
-  static_assert(kMinimumRows > kMaximumDecodeTileRows, "the split's chunks run the prefill residual tiles");
+  static_assert(kMinimumRows > kMaximumStagedRows, "the split's chunks run the prefill residual tiles");
 
   // The ANE takes `aneUnits` of the units() of intermediate channels, and
   // the GPU the rest through `linear`'s prefill plans. The program is
