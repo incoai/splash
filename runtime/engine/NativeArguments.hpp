@@ -56,6 +56,7 @@ struct NativeArguments final {
   // --cached-states exact: cached states keep stateFormat, not codes.
   bool exactCachedStates = false;
   double decodeShare = EngineConfig{}.decodeShare;
+  bool shortPrefillCohorts = false;
   uint32_t maxImagePatches = ops::kMaximumImagePatches;
   // --idle-release SECONDS|off, infinite for off.
   double idleReleaseSeconds = RuntimeResourcesConfig{}.idleReleaseSeconds;

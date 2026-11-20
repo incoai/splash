@@ -34,6 +34,7 @@ struct SchedulerConfig final {
   double decodeShare = 0.5;
   double decodeGapMilliseconds = 500.0;
   model::CommandLimits limits;
+  bool shortPrefillCohorts = false;
 };
 
 struct RequestSpec final {
@@ -153,6 +154,10 @@ public:
   Scheduler(SchedulerConfig config, const model::PrefillWorkSource &work);
 
   void submit(RequestSpec request);
+  // A caller with a free lane may loan a queued short request the normal
+  // tier. A completed long command renews the bounded cohort budget.
+  [[nodiscard]] bool shortPrefillBudgetAvailable() const noexcept;
+  bool sponsorShortPrefill(uint64_t requestId, uint32_t cachedTokens);
   void deferAdmission(uint64_t requestId);
   void waitForResources(uint64_t requestId);
   void waitForPrefix(uint64_t requestId);
@@ -265,6 +270,7 @@ private:
     // again the rows it runs that ran before it, and none it runs that were
     // counted and never ran.
     uint32_t rowsCounted = 0;
+    bool sponsoredShortPrefill = false;
   };
 
   // A prefill lane as planning weighs it.
@@ -333,6 +339,7 @@ private:
   [[nodiscard]] std::vector<Lane> readyLanes(const PlanInputs &in) const;
   [[nodiscard]] std::optional<Planned> planPrefill(std::vector<Lane> ready) const;
   [[nodiscard]] std::optional<BatchPlan> nextPrefill(const PlanInputs &in) const;
+  [[nodiscard]] bool onlySponsoredDecode(const BatchPlan &plan) const;
   [[nodiscard]] std::optional<BatchPlan> nextDecode(std::span<const uint64_t> excluded) const;
   // When `prefill`, which runs as no decode can, stops waiting for decoders
   // whose memory lands; none where it does not wait (waitsUntil).
@@ -372,6 +379,8 @@ private:
   // whose last decode dispatch is no later has not decoded since.
   uint64_t prefillDispatchOrder_ = 0;
   std::optional<WorkKind> lastCommittedKind_;
+  double shortPrefillMilliseconds_ = 0;
+  double shortDecodeRunMilliseconds_ = 0;
   // A prefill command as it ran: its rows, the attention pairs of its
   // heaviest layer, its rows' time over its passes and in its heaviest, and
   // the time a layer of that pass took (each pass's own cost included),

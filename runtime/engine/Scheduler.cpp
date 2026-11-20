@@ -8,6 +8,15 @@ namespace splash::engine {
 namespace {
 
 constexpr uint32_t kChunk = model::ExecutionLimits::prefillTokenBudget;
+constexpr uint32_t kShortPrefillCohortSize = model::ExecutionLimits::maximumBatchWidth - 1;
+constexpr uint32_t kLongPrefillTokens = 8192;
+constexpr uint32_t kShortPrefillTokens = 512;
+// Keep a bounded bank funded by long prefill. Actual GPU command time
+// settles the loan, which can go negative while a bounded cohort finishes.
+constexpr double kShortPrefillGrantMilliseconds = 250.0;
+constexpr double kShortPrefillBankMilliseconds = 1000.0;
+constexpr double kLongWorkCreditShare = 0.35;
+constexpr double kShortDecodeDrainMilliseconds = 1500.0;
 // The fewest rows the pair bound halves a lane's command to.
 constexpr uint32_t kMinimumPrefillRows = 64;
 // The fewest rows a contended cut leaves a unit, or the model's least rows
@@ -128,6 +137,39 @@ void Scheduler::resumeFromResources(uint64_t id, uint32_t processed,
   request.spec.prefillTokens = replayTokens;
   request.phase = Phase::Prefill;
   request.suspended = false;
+}
+
+bool Scheduler::shortPrefillBudgetAvailable() const noexcept {
+  return config_.shortPrefillCohorts && !active_ &&
+         shortPrefillMilliseconds_ >= kShortPrefillGrantMilliseconds;
+}
+
+bool Scheduler::sponsorShortPrefill(uint64_t id, uint32_t cachedTokens) {
+  if (!shortPrefillBudgetAvailable())
+    return false;
+  Request &candidate = get(id);
+  if (candidate.phase != Phase::Queued || candidate.spec.priority != RequestPriority::Background ||
+      cachedTokens >= candidate.spec.prefillTokens ||
+      candidate.spec.prefillTokens - cachedTokens > kShortPrefillTokens)
+    return false;
+  uint32_t outstanding = 0;
+  bool longPrefill = false;
+  for (const auto &[_, resident] : requests_) {
+    outstanding += resident.sponsoredShortPrefill && !terminal(resident.phase);
+    longPrefill |= resident.phase == Phase::Prefill &&
+                   resident.spec.priority == RequestPriority::Normal &&
+                   resident.spec.prefillTokens - resident.promptProcessed >= kLongPrefillTokens;
+  }
+  // Start an empty cohort only when it can fund every short slot. The first
+  // admission spends one grant, leaving the remainder available in this tick.
+  if (!longPrefill || outstanding >= kShortPrefillCohortSize ||
+      (!outstanding && shortPrefillMilliseconds_ < kShortPrefillCohortSize * kShortPrefillGrantMilliseconds) ||
+      highestRunnablePriority() == RequestPriority::Foreground)
+    return false;
+  candidate.spec.priority = RequestPriority::Normal;
+  candidate.sponsoredShortPrefill = true;
+  shortPrefillMilliseconds_ -= kShortPrefillGrantMilliseconds;
+  return true;
 }
 
 void Scheduler::deferAdmission(uint64_t id) {
@@ -341,6 +383,12 @@ bool Scheduler::abandonsPasses(const BatchPlan &plan, const PlanInputs &in) cons
   return in.passes && plan.kind == WorkKind::Prefill && !samePlan(plan, in.passes->plan);
 }
 
+bool Scheduler::onlySponsoredDecode(const BatchPlan &plan) const {
+  return plan.kind == WorkKind::Decode && std::ranges::all_of(plan.items, [&](const BatchItem &item) {
+    return get(item.requestId).sponsoredShortPrefill;
+  });
+}
+
 std::optional<BatchPlan> Scheduler::next(const PlanInputs &in) const {
   if (active_)
     return std::nullopt;
@@ -366,6 +414,16 @@ std::optional<BatchPlan> Scheduler::next(const PlanInputs &in) const {
   // boundaries so equal-priority work cannot starve.
   if (decodeDebtMilliseconds_ > 0.0)
     return decode;
+  // A short batch can finish before forcing another cut into a long prompt.
+  // Count decode time already spent, including time charged to ordinary debt.
+  if (config_.shortPrefillCohorts && !in.passes &&
+      shortDecodeRunMilliseconds_ > 0.0 && shortDecodeRunMilliseconds_ < kShortDecodeDrainMilliseconds &&
+      prefillPriority == RequestPriority::Normal && lastPlanned_ && lastPlanned_->boundCuts &&
+      onlySponsoredDecode(*decode)) {
+    const Request &leader = get(prefill->items.front().requestId);
+    if (!leader.sponsoredShortPrefill && leader.spec.prefillTokens - leader.promptProcessed >= kLongPrefillTokens)
+      return decode;
+  }
   return lastCommittedKind_ == WorkKind::Decode ? std::move(prefill)
                                                  : std::move(decode);
 }
@@ -707,6 +765,29 @@ void Scheduler::complete(const BatchPlan &plan, std::span<const StepResult> resu
   const double wallMilliseconds = sample.wallMilliseconds;
   const bool timed = std::isfinite(wallMilliseconds) && wallMilliseconds > 0.0;
   const bool prefill = plan.kind == WorkKind::Prefill;
+  if (config_.shortPrefillCohorts) {
+    if (prefill)
+      shortDecodeRunMilliseconds_ = 0.0;
+    else if (timed && onlySponsoredDecode(plan))
+      shortDecodeRunMilliseconds_ += wallMilliseconds;
+    else
+      shortDecodeRunMilliseconds_ = kShortDecodeDrainMilliseconds;
+  }
+  if (config_.shortPrefillCohorts && timed) {
+    const bool sponsored = std::ranges::any_of(plan.items, [&](const BatchItem &item) {
+      return get(item.requestId).sponsoredShortPrefill;
+    });
+    if (sponsored) {
+      shortPrefillMilliseconds_ -= wallMilliseconds;
+    } else if (prefill && std::ranges::any_of(plan.items, [&](const BatchItem &item) {
+                 const Request &request = get(item.requestId);
+                 return !terminal(request.phase) && request.spec.priority == RequestPriority::Normal &&
+                        request.spec.prefillTokens - request.promptProcessed >= kLongPrefillTokens;
+               })) {
+      shortPrefillMilliseconds_ = std::min(kShortPrefillBankMilliseconds,
+                                          shortPrefillMilliseconds_ + kLongWorkCreditShare * wallMilliseconds);
+    }
+  }
   for (size_t index = 0; index < results.size(); ++index) {
     const BatchItem &item = plan.items[index];
     const StepResult &result = results[index];
